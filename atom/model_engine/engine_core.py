@@ -62,6 +62,8 @@ logger = logging.getLogger("atom")
 KV_IDLE_DRAIN_INTERVAL_S = 0.001
 # How long a busy loop that finds its engine held sleeps before it looks again.
 HELD_POLL_S = 0.01
+# Longest an idle busy loop waits for input before its periodic work runs again.
+IDLE_WAIT_S = 0.01
 
 # Upper bound on the drain that runs after the loop exits. A peer that died
 # mid-transfer leaves a completion that never arrives; exiting late beats
@@ -573,6 +575,8 @@ class EngineCore:
                     self.scheduler.engine_stats.note_idle(now)
                     if self.has_pending_kv_work():
                         self._advance_idle_kv_transfer()
+                    else:
+                        self._wait_for_input()
         finally:
             try:
                 # Teardown runs even on exceptions so the sender thread/socket
@@ -685,6 +689,13 @@ class EngineCore:
         if not self.input_queue.empty() or not self.utility_queue.empty():
             return
         self._kv_progress_event.wait(KV_IDLE_DRAIN_INTERVAL_S)
+
+    def _wait_for_input(self) -> None:
+        """Sleep until the input thread queues work or `IDLE_WAIT_S` passes: a loop
+        that spun instead would hold the GIL that thread needs to queue it."""
+        self._kv_progress_event.clear()  # before the reads: a later put sets it again
+        if self.input_queue.empty() and self.utility_queue.empty():
+            self._kv_progress_event.wait(IDLE_WAIT_S)
 
     def _postprocess(self, seqs, fwd_out, batch):
         if self._report_backlog:

@@ -12,6 +12,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
+from atom.model_engine.prefix_block_hashes import TokenPrefixChains
 from atom.model_engine.prefix_hash import hash_block_size_for, ship_prompt_hash_chain
 from atom.model_engine.segment_tokenizer import PrefixEncoding, SegmentTokenizer
 from atom.model_engine.sequence import Sequence
@@ -450,9 +451,12 @@ class LLMEngine:
             return num / den if den else 0.0
 
         compressed = totals["compressed_tokens"]
+        chains = self.io_processor.token_prefix_chains
         return {
             "enabled": bool(rank_stats),
             **totals,
+            # This frontend's chain work for token-id prompts, not summed over ranks.
+            "token_prefix_chains": None if chains is None else chains.stats(),
             "hit": rate(totals["cached_tokens"]),
             "compressed_hit": rate(compressed),
             "lost_to_checkpoint": rate(
@@ -665,6 +669,7 @@ class LLMEngine:
 class InputOutputProcessor:
     # Class default: a processor built without `__init__` ships nothing.
     prefix_hash_block_size = 0
+    token_prefix_chains: TokenPrefixChains | None = None
 
     def __init__(self, config, tokenizer, block_size):
         self.config = config
@@ -705,6 +710,11 @@ class InputOutputProcessor:
         if getattr(config, "enable_prefix_caching", False):
             self.prefix_hash_block_size = hash_block_size_for(
                 block_size, config.decode_context_parallel_size
+            )
+            self.token_prefix_chains = TokenPrefixChains(
+                envs.ATOM_TOKENIZE_CACHE_MB << 20,
+                self.prefix_hash_block_size,
+                self._reuse_block_hashes,
             )
 
     @staticmethod
@@ -866,6 +876,9 @@ class InputOutputProcessor:
                 enable_dp_attention=self.config.enable_dp_attention,
             )
         n = max(1, int(getattr(sampling_params, "n", 1)))
+        token_prompt = multimodal_data is None and not isinstance(
+            prompt_or_tokens, (str, PrefixEncoding)
+        )
 
         if isinstance(prompt_or_tokens, str):
             prompt_or_tokens = self.encode_prompt(
@@ -946,12 +959,14 @@ class InputOutputProcessor:
         # Runs in an executor or submit thread, not the event loop. Siblings
         # share a prompt and seed, so one chain serves them all.
         if self.prefix_hash_block_size:
+            block_hashes = (
+                None if prefix_encoding is None else prefix_encoding.block_hashes
+            )
+            chains = self.token_prefix_chains
+            if token_prompt and chains is not None and envs.ATOM_FRONTEND_PREFIX_HASH:
+                block_hashes = chains.block_hashes(seqs[0].token_ids)
             ship_prompt_hash_chain(
-                seqs[0],
-                self.prefix_hash_block_size,
-                block_hashes=(
-                    None if prefix_encoding is None else prefix_encoding.block_hashes
-                ),
+                seqs[0], self.prefix_hash_block_size, block_hashes=block_hashes
             )
             for seq in seqs[1:]:
                 seq.prompt_hash_chain = seqs[0].prompt_hash_chain
