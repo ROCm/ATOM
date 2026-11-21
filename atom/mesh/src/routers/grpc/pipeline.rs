@@ -121,7 +121,11 @@ impl Pipeline {
             Err(e) => return self.record_chat_err(&model, start, e),
         };
         let guards = make_load_guards(&placement, resp_ctx.headers.as_ref());
-        let stream = match self.engine.dispatch(&placement, &mut payload).await {
+        let stream = match self
+            .engine
+            .dispatch_with_tokenizer(&placement, &mut payload, &resp_ctx.tokenizer)
+            .await
+        {
             Ok(s) => s,
             Err(e) => return self.record_chat_err(&model, start, engine_err_to_response(e)),
         };
@@ -176,7 +180,11 @@ impl Pipeline {
             Err(e) => return self.record_generate_err(&model_for_metric, start, e),
         };
         let guards = make_load_guards(&placement, resp_ctx.headers.as_ref());
-        let stream = match self.engine.dispatch(&placement, &mut payload).await {
+        let stream = match self
+            .engine
+            .dispatch_with_tokenizer(&placement, &mut payload, &resp_ctx.tokenizer)
+            .await
+        {
             Ok(s) => s,
             Err(e) => {
                 return self.record_generate_err(
@@ -225,7 +233,7 @@ impl Pipeline {
         let _guards = make_load_guards(&placement, resp_ctx.headers.as_ref());
         let stream = self
             .engine
-            .dispatch(&placement, &mut payload)
+            .dispatch_with_tokenizer(&placement, &mut payload, &resp_ctx.tokenizer)
             .await
             .map_err(engine_err_to_response)?;
 
@@ -329,5 +337,8 @@ fn engine_err_to_response(err: EngineError) -> Response {
             error::service_unavailable("engine_connection_failed", r)
         }
         EngineError::RequestBuildFailed(r) => error::bad_request("engine_request_build_failed", r),
+        EngineError::Http { status, message } => {
+            error::create_error(status, "engine_error", message)
+        }
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! Single mode holds one source; PD mode holds both upstreams. Drop in
 //! either case propagates cancellation downward (single mode → the inner
-//! tonic stream's `AbortOnDropStream`; PD mode → both upstreams' Drop).
+//! source's Drop, which cancels its call; PD mode → both upstreams' Drop).
 
 use std::pin::Pin;
 use std::task::{Context, Poll};

@@ -597,6 +597,58 @@ def test_mesh_build_uses_writable_copy_and_archives_resolved_dependencies(
         assert (source / "Cargo.lock").read_text() == "existing lock"
 
 
+def test_mesh_build_copies_atom_protos_to_their_repository_paths(tmp_path):
+    protos = {
+        "atom/model_engine/zmq_protocol/engine_v1.proto": "engine_v1",
+        "atom/entrypoints/grpc/atom_grpc.proto": "atom.grpc.v1",
+    }
+    repo = tmp_path / "repo"
+    (repo / "atom" / "mesh").mkdir(parents=True)
+    (repo / "atom" / "mesh" / "Cargo.toml").write_text("[package]\n")
+    for path, text in protos.items():
+        (repo / path).parent.mkdir(parents=True, exist_ok=True)
+        (repo / path).write_text(text)
+    binary_dir = tmp_path / "bin"
+    binary_dir.mkdir()
+    seen = tmp_path / "seen.json"
+    cargo = binary_dir / "cargo"
+    # Records every .proto below the root that build.rs reads, two levels above the mesh.
+    cargo.write_text(
+        "#!" + sys.executable + "\n"
+        "import json,sys\nfrom pathlib import Path\n"
+        "args=sys.argv[1:]\n"
+        "if args == ['--version']: print('cargo test-fixture'); sys.exit(0)\n"
+        "mesh=Path(args[args.index('--manifest-path')+1]).parent\n"
+        f"Path({str(seen)!r}).write_text(json.dumps("
+        "{p.relative_to(mesh.parents[1]).as_posix(): p.read_text()"
+        " for p in mesh.parents[1].rglob('*.proto')}))\n"
+        "(mesh/'Cargo.lock').write_text('resolved dependencies')\n"
+        "target=Path(args[args.index('--target-dir')+1])/args[args.index('--profile')+1]\n"
+        "target.mkdir(parents=True, exist_ok=True)\n"
+        "(target/'atomesh').write_text('binary')\n"
+    )
+    cargo.chmod(0o755)
+    subprocess.run(
+        [
+            "bash",
+            str(SCRIPTS.parent / "build_mesh.sh"),
+            str(repo / "atom" / "mesh"),
+            str(tmp_path / "logs"),
+        ],
+        env={
+            **os.environ,
+            "PATH": str(binary_dir) + os.pathsep + os.environ["PATH"],
+            "TMPDIR": str(tmp_path),
+            "ATOMESH_MESH_TARGET_DIR": str(tmp_path / "cache"),
+            "ATOMESH_MESH_SOURCE_COMMIT": "reviewed-commit",
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert json.loads(seen.read_text()) == protos
+
+
 def test_partial_report_remains_downloadable_and_path_traversal_is_rejected(tmp_path):
     stage = load_module("stage_reports")
     results = tmp_path / "results"

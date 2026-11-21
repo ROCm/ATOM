@@ -5,10 +5,11 @@ edition = "2021"
 
 [features]
 default = ["grpc-client"]
-grpc-client = []
+# ATOM's protos (src/atom_engine): engine_v1, and atom.grpc.v1's client and server.
+grpc-client = ["dep:tonic-prost", "dep:tonic-prost-build", "dep:protox"]
 ext-proc = ["dep:prost-types", "dep:tonic-prost", "dep:tonic-prost-build", "dep:protox", "tonic/tls-ring"]
 # The Rust client of the EngineCores (src/atom_engine), off until a caller exists.
-atom-engine = ["dep:zmq", "dep:tonic-prost-build", "dep:protox"]
+atom-engine = ["grpc-client", "dep:zmq"]
 
 [lints.rust]
 unused_qualifications = "warn"

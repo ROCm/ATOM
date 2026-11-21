@@ -2355,3 +2355,116 @@ mod i_route_metrics {
         }
     }
 }
+
+mod j_atom_pd_shared {
+    use std::sync::Arc;
+
+    use serde_json::{json, Value};
+
+    use super::super::backend::atom::{apply_atom_pd_rank_mapping_policy, parse_atom_prefill_info};
+    use crate::config::types::AtomPdRankMappingPolicy as Mapping;
+    use crate::core::{
+        BasicWorkerBuilder, ConnectionMode, DPAwareWorkerBuilder, Worker, WorkerRegistry,
+        WorkerType,
+    };
+
+    const PREFILL: WorkerType = WorkerType::Prefill {
+        bootstrap_port: None,
+    };
+
+    fn dp_worker(base: &str, rank: usize, kind: WorkerType, model: &str) -> Arc<dyn Worker> {
+        let mode = if base.starts_with("grpc") {
+            ConnectionMode::Grpc { port: None }
+        } else {
+            ConnectionMode::Http
+        };
+        // Prefill runs DP4 and decode DP8, so a decode rank can be past prefill's dp_size.
+        let size = if kind == WorkerType::Decode { 8 } else { 4 };
+        let builder = DPAwareWorkerBuilder::new_with_type(base, rank, size, kind);
+        Arc::new(builder.connection_mode(mode).model_id(model).build())
+    }
+
+    fn parse(info: &Value) -> Result<(usize, Option<Value>), String> {
+        parse_atom_prefill_info(info, "http://p/kv_transfer_info", "http://p")
+    }
+
+    #[test]
+    fn idx2idx_moves_prefill_to_the_decode_rank_over_http_and_grpc() {
+        for (p, d) in [("http://p", "http://d"), ("grpc://p", "grpc://d")] {
+            let registry = WorkerRegistry::new();
+            let prefill: Vec<_> = (0..4).map(|r| dp_worker(p, r, PREFILL, "m")).collect();
+            for worker in &prefill {
+                registry.register(worker.clone());
+            }
+            let decode = dp_worker(d, 3, WorkerType::Decode, "m");
+            let pick = |policy| {
+                apply_atom_pd_rank_mapping_policy(policy, &registry, prefill[1].clone(), &decode)
+            };
+            assert_eq!(pick(Mapping::None).url(), format!("{p}@1"));
+            assert_eq!(pick(Mapping::Idx2Idx).url(), format!("{p}@3"));
+        }
+    }
+
+    #[test]
+    fn idx2idx_keeps_the_planned_prefill_when_the_decode_rank_has_no_usable_twin() {
+        let registry = WorkerRegistry::new();
+        let planned = dp_worker("http://p", 1, PREFILL, "m");
+        let unhealthy = dp_worker("http://p", 2, PREFILL, "m");
+        unhealthy.set_healthy(false);
+        for worker in [
+            planned.clone(),
+            unhealthy,
+            dp_worker("http://p", 3, PREFILL, "x"),
+        ] {
+            registry.register(worker);
+        }
+        let non_dp = BasicWorkerBuilder::new("http://d").worker_type(WorkerType::Decode);
+        let mut decodes = vec![Arc::new(non_dp.build()) as Arc<dyn Worker>];
+        // Rank 0 is unregistered, 2 unhealthy, 3 another model's, 4 past prefill's dp_size.
+        decodes.extend([0, 2, 3, 4].map(|r| dp_worker("http://d", r, WorkerType::Decode, "m")));
+        for decode in decodes {
+            let mapped = apply_atom_pd_rank_mapping_policy(
+                Mapping::Idx2Idx,
+                &registry,
+                planned.clone(),
+                &decode,
+            );
+            assert_eq!(mapped.url(), "http://p@1", "decode {}", decode.url());
+        }
+    }
+
+    #[test]
+    fn prefill_info_reads_tp_size_and_the_chunked_template() {
+        let template = json!({
+            "remote_host": "10.0.0.1", "remote_handshake_port": 6301,
+            "remote_pp_size": 1, "block_size": 16, "dcp_size": 1,
+        });
+        let mut info = json!({"tp_size": 4, "dp_size": 2, "kv_role": "kv_producer"});
+        assert_eq!(parse(&info), Ok((4, None)));
+        info["chunked_transfer"] = json!(true);
+        assert_eq!(parse(&info), Ok((4, None)));
+        info["chunked_transfer"] = template.clone();
+        assert_eq!(parse(&info), Ok((4, Some(template))));
+    }
+
+    #[test]
+    fn prefill_info_refuses_a_missing_tp_size_and_a_non_producer() {
+        let cases = [
+            (
+                json!({"kv_role": "kv_producer"}),
+                "Missing tp_size in http://p/kv_transfer_info response",
+            ),
+            (
+                json!({"tp_size": 4, "kv_role": "kv_consumer"}),
+                r#"http://p is not a prefill (kv_role=Some("kv_consumer"), expected kv_producer)"#,
+            ),
+            (
+                json!({"tp_size": 4}),
+                "http://p is not a prefill (kv_role=None, expected kv_producer)",
+            ),
+        ];
+        for (info, error) in cases {
+            assert_eq!(parse(&info), Err(error.to_string()));
+        }
+    }
+}

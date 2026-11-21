@@ -1,5 +1,5 @@
 pub mod app_context;
-#[cfg(feature = "atom-engine")]
+#[cfg(feature = "grpc-client")]
 pub mod atom_engine;
 pub mod cliargs;
 pub mod config;
