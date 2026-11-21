@@ -616,6 +616,8 @@ class TestSchedule:
         sched.finished_recving_kv_req_ids = []
         sched.failed_recving_kv_req_ids = []
         sched._num_parked_remote_kv = 1
+        sched._parked_loads = {}
+        sched._receive_reserve = None
         sched.kv_connector = _Connector()
         sched.block_manager = SimpleNamespace(
             deallocate=lambda value: events.append(("deallocate", value.id))
@@ -1485,6 +1487,8 @@ class TestSchedule:
         sched.waiting = deque()
         sched._partial_prefill_count = 1
         sched._num_parked_remote_kv = 0
+        sched._parked_loads = {}
+        sched._receive_reserve = None
         keep = SimpleNamespace(
             id=1,
             status=SequenceStatus.RUNNING,
@@ -1746,7 +1750,7 @@ def _count_fits(sched, monkeypatch):
     monkeypatch.setattr(
         sched.block_manager,
         "can_allocate_memoized",
-        lambda seq: calls.append(seq) or fit(seq),
+        lambda seq, probe=None: calls.append(seq) or fit(seq, probe),
     )
     return calls
 

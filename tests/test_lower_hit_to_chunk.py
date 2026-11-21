@@ -49,6 +49,8 @@ def test_lowers_an_unaligned_hit_to_the_chunk_floor(seq_factory):
     probe = _probe(5)  # 20 tokens: 4 into the second 16-token chunk
     assert bm.lower_hit_to_chunk(seq, probe, CHUNK, tier_hit=48)
     assert probe.num_cached_blocks == 4  # 16 tokens
+    # `allocate` pins the lowered boundary's image, not the original hit's.
+    assert probe.protected_hash == probe.block_hashes[3]
     # The dropped block is cached-free (or gone): `num_new_blocks` already counts
     # it as one to allocate, so lowering adds no demand.
     assert probe.num_new_blocks == 6

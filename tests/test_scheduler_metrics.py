@@ -389,9 +389,7 @@ def test_cache_tiers_preserve_admitted_reuse_through_snapshots():
 
 @pytest.mark.parametrize("dcp", [1, 2])
 @pytest.mark.parametrize("warm_cache", [False, True])
-def test_pd_consumer_counts_its_own_prefix_once_after_transfer(
-    dcp, warm_cache, monkeypatch
-):
+def test_pd_consumer_counts_its_own_prefix_once_after_transfer(dcp, warm_cache):
     scheduler = Scheduler(
         MockConfig(
             enable_prefix_caching=True,
@@ -405,14 +403,6 @@ def test_pd_consumer_counts_its_own_prefix_once_after_transfer(
         build_connector_meta=lambda: None,
     )
     bm = scheduler.block_manager
-    if dcp > 1:
-        # Keep the real cache matching/publication path, with virtual-block
-        # allocation independent of the GPU-only DCP kernel module.
-        monkeypatch.setattr(
-            bm,
-            "num_pool_blocks",
-            lambda length: (length + bm.hash_block_size - 1) // bm.hash_block_size,
-        )
     prompt = list(range(100, 100 + 4 * bm.hash_block_size))
     if warm_cache:
         seed = Sequence(prompt, block_size=4)

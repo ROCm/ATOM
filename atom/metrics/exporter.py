@@ -528,7 +528,7 @@ class _AtomMetricsCollector:
         )
         deferred = CounterMetricFamily(
             "atom:pd_admission_deferred",
-            "PD requests deferred by a credit limit, counted once per admission wait and limit.",
+            "PD requests deferred by a credit limit or the decode reserve, counted once per admission wait and limit.",
             labels=["dp_rank", "engine_role", "reason"],
         )
         for rank in ranks:
@@ -536,9 +536,11 @@ class _AtomMetricsCollector:
                 continue
             labels = [str(rank["dp_rank"]), rank["engine_role"]]
             admission = rank["pd_admission"]
-            for request_state, count in admission["pending"].items():
+            # Without the controller a rank reports only the reserve's deferrals.
+            for request_state, count in admission.get("pending", {}).items():
                 pending.add_metric([*labels, request_state], count)
-            pending_bytes.add_metric(labels, admission["pending_kv_bytes"])
+            if "pending_kv_bytes" in admission:
+                pending_bytes.add_metric(labels, admission["pending_kv_bytes"])
             for reason, count in admission["deferred"].items():
                 deferred.add_metric([*labels, reason], count)
         yield pending

@@ -14,6 +14,7 @@ from weakref import WeakKeyDictionary
 import numpy as np
 
 from atom.config import Config, DCPConfig
+from atom.distributed.dcp_layout import get_dcp_local_seq_lens
 from atom.distributed.kv_events import (
     MEDIUM_GPU,
     AllBlocksCleared,
@@ -145,12 +146,14 @@ class AdmissionProbe:
     `block_hashes` the chain the probe walked. `num_new_blocks` is the
     free-pool demand the probe's fit check passed, `None` when the probe
     returned before that check. `_fit_joint` re-checks a joint against it and
-    skips the joint without it.
+    skips the joint without it. `protected_hash` is the hit's checkpoint that
+    `allocate` pins, which the fit did not count as reclaimable.
     """
 
     num_cached_blocks: int = -1
     block_hashes: list[int] = field(default_factory=list)
     num_new_blocks: int | None = None
+    protected_hash: int | None = None
 
 
 # Evicted or remapped hashes kept for `_CachedWalk` revalidation; a memo
@@ -769,8 +772,6 @@ class BlockManager:
         """
         if self.dcp_world_size <= 1:
             return (seq_len + self.block_size - 1) // self.block_size
-        from atom.model_ops.dcp_ops import get_dcp_local_seq_lens
-
         local_len = get_dcp_local_seq_lens(
             np.array([seq_len]),
             self.dcp_world_size,
@@ -778,6 +779,18 @@ class BlockManager:
             self.cp_kv_cache_interleave_size,
         )[0]
         return int((local_len + self.block_size - 1) // self.block_size)
+
+    def num_pool_blocks_many(self, seq_lens) -> np.ndarray:
+        """`num_pool_blocks` of each length in `seq_lens`, in one numpy pass."""
+        lens = np.asarray(seq_lens, dtype=np.int64)
+        if self.dcp_world_size > 1:
+            lens = get_dcp_local_seq_lens(
+                lens,
+                self.dcp_world_size,
+                self.dcp_rank,
+                self.cp_kv_cache_interleave_size,
+            )
+        return (lens + self.block_size - 1) // self.block_size
 
     def draft_lookahead_blocks(self, seq_len: int) -> int:
         """Blocks past `num_pool_blocks(seq_len)` that `draft_lookahead` adds.
@@ -1330,6 +1343,7 @@ class BlockManager:
         # walking the hit again.
         if probe is not None:
             probe.num_new_blocks = num_new_blocks
+            probe.protected_hash = protected_hash
         # A direct admission commits its joint boundary here. The scheduler
         # probes first and calls record_allocation only after dependency and
         # budget checks; refused probes avoid the extra LMCache hash walk.
@@ -1511,7 +1525,9 @@ class BlockManager:
             return None
         return walk
 
-    def can_allocate_memoized(self, seq: Sequence) -> int:
+    def can_allocate_memoized(
+        self, seq: Sequence, probe: AdmissionProbe | None = None
+    ) -> int:
         """`can_allocate(seq, record=False)` for the delayer and the DP chunk
         cost, with the walk memoised per seq. The same `_evaluate`, so state
         room, the gates, the replay, checkpoint demand/end, the used hit blocks
@@ -1523,9 +1539,10 @@ class BlockManager:
         `_RECENT_INDEX_CHANGES` since the last check re-walks), no
         `clear_cache`, the first miss still resolves the same (a hit only grows
         by a publish of that hash), and token count and seed are unchanged.
+        A `probe` gets the fit's demand, as `can_allocate`'s does.
         """
         walk_of = self._memoised_walk if self.walk_memo else self._walk_prefix
-        return self._evaluate(seq, walk_of, False, None)
+        return self._evaluate(seq, walk_of, False, None, probe)
 
     def _memoised_walk(self, seq: Sequence) -> _PrefixWalk:
         memo = self._cached_walks.get(seq)
@@ -1721,6 +1738,7 @@ class BlockManager:
             return False
         probe.num_cached_blocks = lowered
         probe.num_new_blocks = demand
+        probe.protected_hash = protected
         return True
 
     def retreat_joint_to_hbm(self, seq: Sequence) -> bool:

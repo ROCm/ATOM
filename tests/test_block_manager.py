@@ -409,7 +409,7 @@ class TestPrefixCaching:
 
 
 class TestPublishLoadedPrefix:
-    def test_dcp_uses_hash_block_granularity(self, seq_factory, monkeypatch):
+    def test_dcp_uses_hash_block_granularity(self, seq_factory):
         cfg = MockConfig(
             num_kvcache_blocks=6,
             kv_cache_block_size=4,
@@ -417,13 +417,6 @@ class TestPublishLoadedPrefix:
             enable_prefix_caching=True,
         )
         bm = BlockManager(cfg)
-        # This test targets loaded-prefix publication, so isolate allocation
-        # from the GPU-only dcp_ops module used to calculate local block counts.
-        monkeypatch.setattr(
-            bm,
-            "num_pool_blocks",
-            lambda seq_len: (seq_len + bm.hash_block_size - 1) // bm.hash_block_size,
-        )
         loaded = seq_factory(list(range(16)))
         bm.allocate(loaded)
 
@@ -838,22 +831,14 @@ class TestDecodeBlockHashing:
 
 class TestRegisterReceivedPrefix:
     @staticmethod
-    def _dcp_block_manager(monkeypatch):
+    def _dcp_block_manager():
         cfg = MockConfig(
             num_kvcache_blocks=12,
             kv_cache_block_size=4,
             decode_context_parallel_size=2,
             enable_prefix_caching=True,
         )
-        bm = BlockManager(cfg)
-        # Allocation normally asks dcp_ops for each rank's local token count.
-        # These scheduler tests only need the equivalent virtual-block count.
-        monkeypatch.setattr(
-            bm,
-            "num_pool_blocks",
-            lambda seq_len: (seq_len + bm.hash_block_size - 1) // bm.hash_block_size,
-        )
-        return bm
+        return BlockManager(cfg)
 
     def test_registers_full_prompt_blocks_enabling_next_turn_hit(
         self, block_manager_prefix, seq_factory
@@ -881,8 +866,8 @@ class TestRegisterReceivedPrefix:
         bm.allocate(a)
         assert bm.register_received_prefix(a) == 2
 
-    def test_dcp_registers_at_hash_block_granularity(self, seq_factory, monkeypatch):
-        bm = self._dcp_block_manager(monkeypatch)
+    def test_dcp_registers_at_hash_block_granularity(self, seq_factory):
+        bm = self._dcp_block_manager()
         assert bm.block_size == 4
         assert bm.hash_block_size == 8
 
@@ -899,7 +884,7 @@ class TestRegisterReceivedPrefix:
     def test_dcp_registers_only_suffix_after_local_cache_hit(
         self, seq_factory, monkeypatch
     ):
-        bm = self._dcp_block_manager(monkeypatch)
+        bm = self._dcp_block_manager()
 
         cached = seq_factory(list(range(16)))
         bm.allocate(cached)

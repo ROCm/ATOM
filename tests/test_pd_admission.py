@@ -3,17 +3,21 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from aiter_stub import stubbed_aiter
 from conftest import MockConfig
 
 from atom.kv_transfer.disaggregation.chunked_prefill import PrefillHandoff
 from atom.kv_transfer.disaggregation.pd_admission import (
+    DecodeGrowthReserve,
     PdAdmissionController,
     ReceivePlan,
 )
 from atom.kv_transfer.disaggregation.types import KVConnectorOutput
-from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
+from atom.model_engine.block_manager import BlockManager
+from atom.model_engine.prefill_delayer import PrefillDecision
+from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler, _HeldGrowth
 from atom.model_engine.sequence import SequenceStatus
 
 
@@ -34,6 +38,7 @@ def build(monkeypatch, mooncake_module, seq_factory):
         prefix=False,
         connector_wrapper=None,
         chunked=False,
+        backend="mooncake",
         **overrides,
     ):
         config = MockConfig(
@@ -47,7 +52,7 @@ def build(monkeypatch, mooncake_module, seq_factory):
             ),
             enable_prefix_caching=prefix,
             kv_transfer_config={
-                "kv_connector": "mooncake",
+                "kv_connector": backend,
                 "kv_role": "kv_consumer",
                 "enable_chunked_transfer": chunked,
                 # By default, exactly one 8-token request (2 blocks) fits.
@@ -60,7 +65,16 @@ def build(monkeypatch, mooncake_module, seq_factory):
         )
         for k, v in overrides.items():
             setattr(config, k, v)
-        connector = mooncake_module.MooncakeConnectorScheduler(config)
+        if backend == "moriio":
+            with stubbed_aiter():
+                moriio = pytest.importorskip(
+                    "atom.kv_transfer.disaggregation.moriio.moriio_connector"
+                )
+            monkeypatch.setattr(moriio, "get_open_port", lambda: 30000)
+            monkeypatch.setattr(moriio, "get_ip", lambda: "127.0.0.1")
+            connector = moriio.MoRIIOConnectorScheduler(config)
+        else:
+            connector = mooncake_module.MooncakeConnectorScheduler(config)
         if connector_wrapper:
             connector = connector_wrapper(connector)
         monkeypatch.setattr(
@@ -123,7 +137,9 @@ def standalone(max_bytes, *, reserve_tokens=None, free_blocks=0):
     connector = SimpleNamespace(pd_receive_block_offset=lambda seq, n, cached: 0)
     block_manager = SimpleNamespace(
         num_pool_blocks=lambda tokens: tokens,
+        num_pool_blocks_many=lambda lengths: np.asarray(lengths),
         draft_lookahead_blocks=lambda tokens: 0,
+        _has_page_units=lambda count, protected_hash=None: count <= free_blocks,
         kv=SimpleNamespace(lookup=lambda h: -1, num_free=free_blocks),
     )
     return PdAdmissionController(
@@ -134,9 +150,14 @@ def standalone(max_bytes, *, reserve_tokens=None, free_blocks=0):
 def try_admit(policy, seq, *, running=()):
     # No local hit: every block of the request is new.
     probe = SimpleNamespace(
-        num_cached_blocks=0, block_hashes=[], num_new_blocks=len(seq)
+        num_cached_blocks=0,
+        block_hashes=[],
+        num_new_blocks=len(seq),
+        protected_hash=None,
     )
-    admitted, plan = policy.check(seq, probe, running=running)
+    admitted, plan = policy.check(
+        seq, probe, held=running, held_blocks=policy.reserve.held_need(running)
+    )
     if admitted:
         policy.commit(seq, plan)
     return admitted
@@ -198,7 +219,10 @@ def test_fraction_uses_physical_pool_bytes(build, fraction):
     sched, _ = build(options=options)
     # 64 blocks of 1024 bytes; the default fraction is 0.15.
     assert sched.pd_admission.max_bytes == int(64 * 1024 * (fraction or 0.15))
-    assert sched.pd_admission.reserve_tokens is None
+    assert (
+        sched.pd_admission.reserve.tokens
+        == sched.pd_admission.reserve.first_decode_tokens
+    )
 
 
 @pytest.mark.parametrize("chunked", [False, True])
@@ -210,7 +234,7 @@ def test_decode_reserve_keeps_room_for_running_requests(build, chunked):
     )
     # Setting one limit drops the default byte budget.
     assert sched.pd_admission.max_bytes is None
-    assert sched.pd_admission.reserve_tokens == 8
+    assert sched.pd_admission.reserve.tokens == 8
     a, b, c = request(), request(), request()
     sched.extend([a, b, c])
     batch, _ = sched.schedule()
@@ -309,20 +333,16 @@ def test_decode_reclaims_cached_blocks_before_preempting(build, seq_factory, chu
     assert not b.block_table
 
 
-def test_decode_reserve_counts_each_growing_request_once():
+def test_decode_reserve_sums_the_held_rows_and_the_candidate():
     policy = standalone(None, reserve_tokens=4, free_blocks=100)
     ready = SizedSeq(id=1, block_table=[1])
-    cancelled = SizedSeq(id=2, block_table=[2])
-    assert try_admit(policy, ready) and try_admit(policy, cancelled)
-    policy.cancel(cancelled)
     nearly_done = SizedSeq(
         id=3, block_table=[3], max_tokens=10, num_completion_tokens=9
     )
     candidate = SizedSeq(id=4, block_table=[4])
-    # READY is pending and already RUNNING: counted once. CANCELLED drains
-    # without decoding. NEARLY_DONE may emit one more token.
-    reserve = policy._growth_reserve(candidate, len(candidate), [ready, nearly_done])
-    assert reserve == 4 + 1 + 4
+    # NEARLY_DONE may emit one more token; the others grow by the reserve.
+    held = policy.reserve.held_need([ready, nearly_done])
+    assert held + policy.reserve.need(candidate, len(candidate)) == 4 + 1 + 4
 
 
 def test_decode_reserve_starts_from_the_blocks_a_request_holds():
@@ -335,7 +355,10 @@ def test_decode_reserve_starts_from_the_blocks_a_request_holds():
     spent = SizedSeq(id=3, block_table=[9, 10, 11], num_tokens=1, max_tokens=1)
     candidate = SizedSeq(id=4, block_table=[12])
     running = [ahead, lagging, spent]
-    assert policy._growth_reserve(candidate, len(candidate), running) == 2 + 5 + 0 + 4
+    reserve = policy.reserve
+    assert reserve.held_need(running) + reserve.need(candidate, len(candidate)) == (
+        2 + 5 + 0 + 4
+    )
 
 
 @pytest.mark.parametrize(
@@ -365,7 +388,7 @@ def test_decode_reserve_counts_the_draft_lookahead_once(
     )
     bm = sched.block_manager
     assert bm.draft_lookahead_blocks(8) == 1
-    assert sched.pd_admission.first_decode_tokens == 8
+    assert sched.pd_admission.reserve.first_decode_tokens == 8
     a, b = request(), request(b_tokens)
     b.max_tokens = b_max_tokens
     sched.extend([a, b])
@@ -419,8 +442,8 @@ def test_decode_reserve_below_a_first_decode_rejected(
     with pytest.raises(ValueError, match="first decode"):
         reserve(first_decode_tokens - 1)
     sched, _ = reserve(first_decode_tokens)
-    assert sched.pd_admission.first_decode_tokens == first_decode_tokens
-    assert sched.pd_admission.reserve_tokens == first_decode_tokens
+    assert sched.pd_admission.reserve.first_decode_tokens == first_decode_tokens
+    assert sched.pd_admission.reserve.tokens == first_decode_tokens
 
 
 @pytest.mark.parametrize("chunked", [False, True])
@@ -922,7 +945,7 @@ def test_a_request_over_both_limits_counts_under_both(build):
             "num_reserved_decode_tokens": 8,
         }
     )
-    assert (sched.pd_admission.max_bytes, sched.pd_admission.reserve_tokens) == (
+    assert (sched.pd_admission.max_bytes, sched.pd_admission.reserve.tokens) == (
         1024,
         8,
     )
@@ -948,35 +971,42 @@ def test_rejected_deferred_request_leaves_no_marker():
     assert not policy._deferred_by
 
 
-def test_admission_state_is_exported_from_the_metrics_snapshot(build):
+def admission_series(sched):
+    """The admission series a scrape serves, through the engine's DP aggregation."""
     from queue import Queue
 
     from atom.metrics.exporter import _AtomMetricsCollector
     from atom.model_engine.engine_utility import EngineUtilityHandler
     from atom.model_engine.llm_engine import LLMEngine
 
-    sched, request = build()
     handler = EngineUtilityHandler(None, Queue(), scheduler=sched)
     exporter = SimpleNamespace(stream_silence=lambda: 0.0, other_processes_gc=list)
+    engine = SimpleNamespace(
+        core_mgr=SimpleNamespace(
+            latest_metrics={0: handler.collect_metrics()},
+            get_dp_router_statistics=dict,
+        )
+    )
+    snapshot = LLMEngine.get_metrics_statistics(engine)
+    return {
+        (sample.name, tuple(sorted(sample.labels.items()))): sample.value
+        for family in _AtomMetricsCollector(exporter)._collect((snapshot, 0, 0.0))
+        for sample in family.samples
+        if sample.name.startswith("atom:pd_admission_")
+    }
+
+
+# A plain `Scheduler` reports no role, which aggregation exports as "default".
+SERIES_LABELS = (("dp_rank", "0"), ("engine_role", "default"))
+
+
+def test_admission_state_is_exported_from_the_metrics_snapshot(build):
+    sched, request = build()
 
     def exported():
-        """The admission series a scrape serves, through the engine's DP aggregation."""
-        engine = SimpleNamespace(
-            core_mgr=SimpleNamespace(
-                latest_metrics={0: handler.collect_metrics()},
-                get_dp_router_statistics=dict,
-            )
-        )
-        snapshot = LLMEngine.get_metrics_statistics(engine)
-        return {
-            (sample.name, tuple(sorted(sample.labels.items()))): sample.value
-            for family in _AtomMetricsCollector(exporter)._collect((snapshot, 0, 0.0))
-            for sample in family.samples
-            if sample.name.startswith("atom:pd_admission_")
-        }
+        return admission_series(sched)
 
-    # A plain `Scheduler` reports no role, which aggregation exports as "default".
-    labels = (("dp_rank", "0"), ("engine_role", "default"))
+    labels = SERIES_LABELS
     pending_bytes = ("atom:pd_admission_pending_kv_bytes", labels)
     deferred = "atom:pd_admission_deferred_total"
     # Cumulative: B deferred once by bytes, never by the free-KV reserve.
@@ -1008,3 +1038,265 @@ def test_admission_state_is_exported_from_the_metrics_snapshot(build):
     assert exported() == pending(cancel_draining=1) | {pending_bytes: 2048, **counters}
     sched._update_from_kv_xfer_finished(KVConnectorOutput(failed_recving={str(b.id)}))
     assert exported() == pending() | {pending_bytes: 0, **counters}
+
+
+def free_kv_deferrals(sched):
+    """The decode reserve's deferrals, wherever this D keeps it."""
+    if sched.pd_admission is None:
+        return sched.receive_reserve_deferred
+    return sched.pd_admission.deferred["free_kv"]
+
+
+# The same reserve with the controller off and with only its byte limit set.
+RESERVE_OWNERS = pytest.mark.parametrize(
+    "options",
+    [{"enabled": False}, {"enabled": True, "max_pending_kv_bytes": 1 << 20}],
+    ids=["no_controller", "controller"],
+)
+
+
+def finish(sched, seq, batch):
+    assert sched.abort_request(seq.id)
+    sched.postprocess([], ScheduledBatchOutput([], [], None, None, None), batch=batch)
+
+
+@RESERVE_OWNERS
+@pytest.mark.parametrize("chunked", [False, True])
+def test_a_receive_leaves_the_held_rows_their_first_decode(build, options, chunked):
+    # Two 2-block prompts in 5 blocks: both fit, but not both first decodes. A
+    # P/D row preempted at its first decode drops its KV and replays its prompt.
+    sched, request = build(options=options, chunked=chunked, num_kvcache_blocks=5)
+    a, b = request(), request()
+    sched.extend([a, b])
+    batch, _ = sched.schedule()
+    assert set(batch.connector_meta_output.reqs_to_recv) == {a.id}
+    assert not b.block_table
+    sched.schedule()
+    assert free_kv_deferrals(sched) == 1
+
+    sched._update_from_kv_xfer_finished(receive_success(a))
+    batch, _ = sched.schedule()
+    assert a.id in batch.req_ids
+    assert not b.block_table
+    assert sched.total_preemptions == 0
+
+    # Once A leaves, B is received, not prefilled here.
+    finish(sched, a, batch)
+    batch, _ = sched.schedule()
+    assert set(batch.connector_meta_output.reqs_to_recv) == {b.id}
+    assert b.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+    assert free_kv_deferrals(sched) == 1
+
+
+@RESERVE_OWNERS
+@pytest.mark.parametrize("chunked", [False, True])
+def test_the_reserve_covers_a_speculative_first_decode(build, options, chunked):
+    sched, request = build(
+        options=options,
+        chunked=chunked,
+        num_kvcache_blocks=7,
+        speculative_config=SimpleNamespace(
+            num_speculative_tokens=3, use_dspark=lambda: True
+        ),
+    )
+    a, b = request(), request()
+    sched.extend([a, b])
+    sched.schedule()
+    # A first decode takes 8 tokens past an 8-token prompt (T0, 3 verify slots,
+    # then a 4-token reach): two more blocks each. One block per held row
+    # would admit B, and A's first decode would then preempt it.
+    assert len(a.block_table) == 2
+    assert not b.block_table
+    sched._update_from_kv_xfer_finished(receive_success(a))
+    batch, _ = sched.schedule()
+    assert a.id in batch.req_ids
+    assert sched.block_manager.draft_writes_allocated(a)
+    assert not b.block_table
+    finish(sched, a, batch)
+    sched.schedule()
+    sched._update_from_kv_xfer_finished(receive_success(b))
+    batch, _ = sched.schedule()
+    assert b.id in batch.req_ids
+    assert sched.total_preemptions == 0
+    assert free_kv_deferrals(sched) == 1
+
+
+def test_the_reserve_sizes_every_row_in_one_pass_at_dcp():
+    # DCP8, 4-token blocks, rank 0: a row of n tokens holds ceil(ceil(n / 8) / 4).
+    bm = BlockManager(
+        MockConfig(
+            num_kvcache_blocks=64, kv_cache_block_size=4, decode_context_parallel_size=8
+        )
+    )
+
+    def pool_blocks(n):
+        local = (n + 7) // 8
+        return (local + 3) // 4
+
+    lengths = [1, 7, 8, 9, 100, 1000, 4097]
+    assert bm.num_pool_blocks_many(lengths).tolist() == [
+        pool_blocks(n) for n in lengths
+    ]
+    rows = [SizedSeq(num_tokens=n, block_table=[0] * pool_blocks(n)) for n in lengths]
+    reserve = DecodeGrowthReserve(bm, tokens=40, first_decode_tokens=8)
+    expected = sum(pool_blocks(n + 40) - pool_blocks(n) for n in lengths)
+    own = reserve.need(rows[0], pool_blocks(lengths[0]))
+    assert own + reserve.held_need(rows[1:]) == expected
+
+
+def test_a_moriio_receive_is_never_deferred_into_a_local_prefill(build):
+    # MoRIIO answers its match query once, so a receive deferred after it would
+    # return as a local prefill into the blocks its RDMA writes.
+    sched, request = build(
+        options={"enabled": False}, backend="moriio", num_kvcache_blocks=5
+    )
+    a, b = request(), request()
+    sched.extend([a, b])
+    for _ in range(3):
+        batch, _ = sched.schedule()
+        receiving = set(batch.connector_meta_output.reqs_to_recv)
+        assert not receiving & set(batch.req_ids)
+    assert a.status == b.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+
+
+def test_a_draining_cancelled_receive_keeps_the_decoder_from_idling(build):
+    sched, request = build(options={"enabled": False}, num_kvcache_blocks=2)
+    seq = request()  # its prompt takes the whole pool
+    probe = SimpleNamespace(num_new_blocks=2, protected_hash=None)
+    assert sched._receive_leaves_decode_room(
+        seq, probe, _HeldGrowth(sched)
+    ), "an idle D may"
+    # A cancelled receive leaves the decode rows but holds its blocks until it drains.
+    sched._parked_loads[99] = SimpleNamespace(status=SequenceStatus.FINISHED)
+    assert not sched._receive_leaves_decode_room(seq, probe, _HeldGrowth(sched))
+
+
+def test_without_the_controller_a_lone_receive_may_take_the_whole_pool(build):
+    # Nothing else is held, so waiting would free nothing.
+    sched, request = build(options={"enabled": False}, num_kvcache_blocks=2)
+    a = request()
+    sched.add(a)
+    batch, _ = sched.schedule()
+    assert set(batch.connector_meta_output.reqs_to_recv) == {a.id}
+    assert free_kv_deferrals(sched) == 0
+
+
+class _GroupDelayer:
+    """The other DP ranks have nothing to prefill: a group prefill tick happens
+    only when this rank reports prefillable work."""
+
+    is_local = False
+    max_queue_ms = None
+
+    def protects_decode(self, running_decode_batch: int) -> bool:
+        return False
+
+    def should_allow_prefill(self, prefillable, **kwargs):
+        return PrefillDecision(allow=True, prefillable_ranks=int(prefillable))
+
+
+@RESERVE_OWNERS
+@pytest.mark.parametrize("chunked", [False, True])
+def test_a_deferred_receive_keeps_no_dp_rank_off_decode(build, options, chunked):
+    sched, request = build(options=options, chunked=chunked, num_kvcache_blocks=5)
+    # A rank in a group prefill tick runs no decode, and with token graphs
+    # every rank joins a peer's prefill.
+    sched.prefill_token_graphs = True
+    sched.set_prefill_delayer(_GroupDelayer())
+    a, b = request(), request()
+    sched.add(a)
+    sched.schedule()
+    sched._update_from_kv_xfer_finished(receive_success(a))
+    sched.add(b)
+    # B fits the pool, not beside A's first decode. Reported prefillable, it
+    # would start a group prefill tick that admits nothing and skips A's
+    # decode, on every tick, while only that decode can free B's room.
+    assert not sched._can_admit_head_prefill()
+    assert sched._probe_local_prefill_work() == (False, 0)
+    assert sched._estimate_prefill_chunk_cost() == 0
+    for _ in range(3):
+        batch, _ = sched.schedule()
+        assert a.id in batch.req_ids
+        assert not b.block_table
+    assert sched.total_preemptions == 0
+
+
+@RESERVE_OWNERS
+def test_a_local_prefill_admitted_between_receives_counts_toward_the_reserve(
+    build, options
+):
+    # One Phase 2 pass over [receive A, local prefill L, receive B]: L runs
+    # from mid-pass, so B must leave A, L and itself room to grow.
+    sched, request = build(options=options, num_kvcache_blocks=8)
+    a, local, b = request(), request(), request()
+    local.kv_transfer_params = None
+    sched.extend([a, local, b])
+    batch, _ = sched.schedule()
+    assert set(batch.connector_meta_output.reqs_to_recv) == {a.id}
+    assert local.id in batch.req_ids
+    assert not b.block_table
+
+
+def _record_fits(sched, monkeypatch):
+    """The probe each `can_allocate_memoized` call gets: None is main's fit."""
+    fits, fit = [], sched.block_manager.can_allocate_memoized
+
+    def recorded(seq, probe=None):
+        fits.append(probe)
+        return fit(seq, probe)
+
+    monkeypatch.setattr(sched.block_manager, "can_allocate_memoized", recorded)
+    return fits
+
+
+@RESERVE_OWNERS
+def test_a_local_prefill_beside_a_reserve_is_probed_as_on_main(
+    build, options, monkeypatch
+):
+    # The reserve checks P/D receives only: where it defers a receive (the
+    # test above), a local prefill of the same size stays prefillable.
+    sched, request = build(options=options, num_kvcache_blocks=5)
+    sched.prefill_token_graphs = True
+    sched.set_prefill_delayer(_GroupDelayer())
+    a, b = request(), request()
+    sched.add(a)
+    sched.schedule()
+    sched._update_from_kv_xfer_finished(receive_success(a))
+    b.kv_transfer_params = None
+    sched.add(b)
+    fits = _record_fits(sched, monkeypatch)
+    assert sched._can_admit_head_prefill()
+    assert sched._probe_local_prefill_work()[0]
+    assert sched._estimate_prefill_chunk_cost() > 0
+    assert fits and all(probe is None for probe in fits)
+
+
+def test_a_moriio_receive_is_probed_as_on_main(build, monkeypatch):
+    # No reserve exists, so the DP probes and the chunk estimate make main's
+    # call and never reach `_head_fit_blocks`.
+    sched, request = build(options={"enabled": False}, backend="moriio")
+    assert sched.pd_admission is None and sched._receive_reserve is None
+    sched.add(request())
+    fits = _record_fits(sched, monkeypatch)
+    monkeypatch.setattr(
+        sched, "_head_fit_blocks", lambda *_: pytest.fail("not main's fit")
+    )
+    sched._can_admit_head_prefill()
+    sched._probe_local_prefill_work()
+    sched._estimate_prefill_chunk_cost()
+    assert fits and all(probe is None for probe in fits)
+
+
+def test_reserve_deferrals_are_exported_without_the_controller(build):
+    sched, request = build(options={"enabled": False}, num_kvcache_blocks=5)
+    deferred = (
+        "atom:pd_admission_deferred_total",
+        (*SERIES_LABELS, ("reason", "free_kv")),
+    )
+    # Exported from 0, so a counter rate sees the first deferral.
+    assert admission_series(sched) == {deferred: 0}
+    a, b = request(), request()
+    sched.extend([a, b])
+    sched.schedule()
+    sched.schedule()
+    assert admission_series(sched) == {deferred: 1}

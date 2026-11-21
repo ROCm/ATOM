@@ -754,7 +754,7 @@ def test_settled_early_owner_keeps_fifo_until_the_head_cannot_allocate(
     monkeypatch.setattr(
         sched.block_manager,
         "can_allocate_memoized",
-        lambda seq: -1 if seq is head else original(seq),
+        lambda seq, probe=None: -1 if seq is head else original(seq, probe),
     )
     sched._prioritize_ready_remote_kv_requests()
     assert list(sched.waiting) == [owner, head]
@@ -786,7 +786,7 @@ def test_a_settled_early_owner_behind_a_runnable_head_does_not_rebuild_waiting(
     monkeypatch.setattr(
         sched.block_manager,
         "can_allocate_memoized",
-        lambda seq: -1 if seq is head else original(seq),
+        lambda seq, probe=None: -1 if seq is head else original(seq, probe),
     )
     sched._prioritize_ready_remote_kv_requests()
     assert Counting.clears == 1
@@ -807,7 +807,7 @@ def test_a_load_in_flight_ahead_of_the_blocked_head_does_not_hide_it(
     monkeypatch.setattr(
         sched.block_manager,
         "can_allocate_memoized",
-        lambda seq: -1 if seq is head else original(seq),
+        lambda seq, probe=None: -1 if seq is head else original(seq, probe),
     )
     sched.waiting.extend([loading, head, done])
     sched.finished_recving_kv_req_ids = [done.id]
