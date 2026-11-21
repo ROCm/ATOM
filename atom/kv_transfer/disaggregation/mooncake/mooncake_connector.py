@@ -563,8 +563,8 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
     def note_scheduled_tokens(
         self, scheduled_seqs: dict[int, Sequence], num_scheduled_tokens: list[int]
     ) -> None:
-        """A chunked prefill's V, final at its first forward (its tier loads are
-        done): the workers get it before that forward publishes a chunk."""
+        """Freeze a chunked prefill's V at its first forward, before the workers send
+        a chunk: every tier load (a later hand-off's too) has marked its blocks."""
         if not self._draft_rows_split:
             return
         for seq in scheduled_seqs.values():

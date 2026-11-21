@@ -1074,6 +1074,14 @@ class BlockManager:
         self.draft_marked_blocks += marked
         return marked
 
+    def mark_received_draft_rows(self, seq: Sequence) -> None:
+        """Mark the blocks a P/D receive wrote below the producer's V."""
+        draft_from = _received_draft_rows_from(seq)
+        if draft_from is not None:
+            start = min(seq.num_cached_tokens, seq.num_prompt_tokens)
+            hbs = self.hash_block_size
+            self.mark_draft_rows_missing(seq, start // hbs * hbs, draft_from)
+
     def draft_rows_from(self, seq: Sequence) -> int:
         """Tokens up to the end of `seq`'s highest block whose draft rows are
         missing (V, sent to a P/D consumer); 0 when every block has them."""
@@ -3703,9 +3711,7 @@ class BlockManager:
         num_full = seq.num_prompt_tokens // hbs
         num_full = min(num_full, len(seq.block_table))
         start = min(seq.num_cached_tokens // hbs, num_full)
-        draft_from = _received_draft_rows_from(seq)
-        if draft_from is not None:
-            self.mark_draft_rows_missing(seq, start * hbs, draft_from)
+        self.mark_received_draft_rows(seq)
         h = self._chain_parent_hash(seq, start)
         if h is None:
             return 0

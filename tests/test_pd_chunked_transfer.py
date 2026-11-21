@@ -2363,7 +2363,8 @@ def test_chunked_v_reaches_the_workers_with_the_first_forward(monkeypatch, seq_f
     c.start_load_kv(sched.build_connector_meta())
     state = c._chunked_prefills["split"]
     assert state.draft_rows_from is None
-    # Its first forward is scheduled: the tier loads are done, so V is final.
+    # Its first forward is scheduled: every block a load leaves without
+    # draft rows is marked by then, so V is final.
     sched.note_scheduled_tokens({seq.id: seq}, [24])
     c.start_load_kv(sched.build_connector_meta())
     assert state.draft_rows_from == 8
@@ -2423,8 +2424,9 @@ def test_a_chunked_send_waits_for_v_before_its_first_write():
     c._notify_transfer_result.assert_called_once_with(req, success=False)
 
 
+@pytest.mark.parametrize("composite", [False, True])
 def test_the_boundary_is_applied_before_the_received_prefix_is_registered(
-    monkeypatch, seq_factory
+    monkeypatch, seq_factory, composite
 ):
     from conftest import MockConfig
 
@@ -2434,6 +2436,9 @@ def test_the_boundary_is_applied_before_the_received_prefix_is_registered(
     sched = Scheduler(MockConfig(num_kvcache_blocks=16, enable_prefix_caching=True))
     sched.block_manager.draft_read_window = DraftReadWindow(window=8, read_page=2)
     connector = sched.kv_connector = scheduler_connector(monkeypatch, False)
+    # A `multi` consumer with an offload tier registers no received prefix,
+    # yet its first decode hashes those blocks.
+    connector.is_offload = composite
     seq = seq_factory(
         list(range(24)),
         kv_transfer_params={

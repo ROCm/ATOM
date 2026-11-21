@@ -5580,6 +5580,10 @@ class Scheduler:
         # Offload/LMCache path skipped — suffix KV not yet computed.
         if prefix_caching and not self._connector_flag("is_offload"):
             bm.register_received_prefix(seq)
+        elif prefix_caching and not self._connector_flag("is_producer"):
+            # A composite with an offload tier registers nothing here, but its
+            # first decode hashes these blocks: V's marks must land first.
+            bm.mark_received_draft_rows(seq)
 
         # Emit BlockStored for the delta blocks so external consumers can track
         # the KV that arrived from the producer.
