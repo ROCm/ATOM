@@ -12,6 +12,8 @@ from atomrl.engine.inference.vllm_fp8_utils import (
     snapshot_model_fingerprints,
 )
 
+from atom.rollout import rdma_protocol
+
 
 def _bucket(name, tensor):
     payload = tensor.contiguous().view(torch.uint8).reshape(-1)
@@ -37,9 +39,13 @@ def test_receive_stream_calls_model_loader_once_across_all_buckets(monkeypatch):
     second = _bucket("second.weight", torch.tensor([3.0]))
     headers = iter(
         [
-            torch.tensor([rdma._CMD_BUCKET, len(first[0]), first[1].numel(), 7]),
-            torch.tensor([rdma._CMD_BUCKET, len(second[0]), second[1].numel(), 7]),
-            torch.tensor([rdma._CMD_END, 0, 0, 7]),
+            torch.tensor(
+                [rdma_protocol.CMD_BUCKET, len(first[0]), first[1].numel(), 7]
+            ),
+            torch.tensor(
+                [rdma_protocol.CMD_BUCKET, len(second[0]), second[1].numel(), 7]
+            ),
+            torch.tensor([rdma_protocol.CMD_END, 0, 0, 7]),
         ]
     )
     broadcasts = iter(
@@ -98,8 +104,8 @@ def _receive_one_bucket(monkeypatch, staging):
     metadata, payload = _bucket("w.weight", torch.tensor([1.0, 2.0, 3.0]))
     headers = iter(
         [
-            torch.tensor([rdma._CMD_BUCKET, len(metadata), payload.numel(), 5]),
-            torch.tensor([rdma._CMD_END, 0, 0, 5]),
+            torch.tensor([rdma_protocol.CMD_BUCKET, len(metadata), payload.numel(), 5]),
+            torch.tensor([rdma_protocol.CMD_END, 0, 0, 5]),
         ]
     )
     broadcasts = iter([torch.tensor(list(metadata), dtype=torch.uint8), payload])
@@ -171,8 +177,10 @@ def test_receive_stream_reports_last_source_tensor_on_loader_failure(monkeypatch
     bucket = _bucket("layers.0.attn.wq_b.weight_scale_inv", torch.ones(2, 3))
     headers = iter(
         [
-            torch.tensor([rdma._CMD_BUCKET, len(bucket[0]), bucket[1].numel(), 7]),
-            torch.tensor([rdma._CMD_END, 0, 0, 7]),
+            torch.tensor(
+                [rdma_protocol.CMD_BUCKET, len(bucket[0]), bucket[1].numel(), 7]
+            ),
+            torch.tensor([rdma_protocol.CMD_END, 0, 0, 7]),
         ]
     )
     broadcasts = iter(
@@ -231,10 +239,17 @@ def _serve_buckets(monkeypatch, weights, version=7):
     buckets = [_bucket(name, tensor) for name, tensor in weights]
     headers = iter(
         [
-            torch.tensor([rdma._CMD_BUCKET, len(metadata), payload.numel(), version])
+            torch.tensor(
+                [
+                    rdma_protocol.CMD_BUCKET,
+                    len(metadata),
+                    payload.numel(),
+                    version,
+                ]
+            )
             for metadata, payload in buckets
         ]
-        + [torch.tensor([rdma._CMD_END, 0, 0, version])]
+        + [torch.tensor([rdma_protocol.CMD_END, 0, 0, version])]
     )
     broadcasts = iter(
         [
@@ -429,7 +444,7 @@ def test_rdma_prequantized_scale_requires_loaded_manifest_entry(monkeypatch):
         [
             torch.tensor(
                 [
-                    rdma._CMD_BUCKET,
+                    rdma_protocol.CMD_BUCKET,
                     len(weight_bucket[0]),
                     weight_bucket[1].numel(),
                     3,
@@ -437,13 +452,13 @@ def test_rdma_prequantized_scale_requires_loaded_manifest_entry(monkeypatch):
             ),
             torch.tensor(
                 [
-                    rdma._CMD_BUCKET,
+                    rdma_protocol.CMD_BUCKET,
                     len(scale_bucket[0]),
                     scale_bucket[1].numel(),
                     3,
                 ]
             ),
-            torch.tensor([rdma._CMD_END, 0, 0, 3]),
+            torch.tensor([rdma_protocol.CMD_END, 0, 0, 3]),
         ]
     )
     broadcasts = iter(
@@ -492,8 +507,10 @@ def test_rdma_stream_mode_remains_authoritative_if_tracker_state_changes(monkeyp
     bucket = _bucket(weight, torch.ones(1))
     headers = iter(
         [
-            torch.tensor([rdma._CMD_BUCKET, len(bucket[0]), bucket[1].numel(), 3]),
-            torch.tensor([rdma._CMD_END, 0, 0, 3]),
+            torch.tensor(
+                [rdma_protocol.CMD_BUCKET, len(bucket[0]), bucket[1].numel(), 3]
+            ),
+            torch.tensor([rdma_protocol.CMD_END, 0, 0, 3]),
         ]
     )
     broadcasts = iter(
