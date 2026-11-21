@@ -546,6 +546,13 @@ def target_layer(E, Ly):
                   x1a=plog(X1A), anw=ltab(fp, Lp, "anw")(), norm_eps=D.RMS_EPS, axn=fptr(fp, "axn")))
     pf_rows(c["wqb"] + i64(b) * (16 * QL), QL, 16, QL, t)
     pf_rows(c["wqb"] + i64(b + CTAS) * (16 * QL), QL, 16, QL, t)
+    if fx.const_expr(not DRS):   # (c1 code size) no index chain in the draft launch (lflags 0)
+        if hx.unlikely(lfl(8)):   # (index layers) stage_iq's weight tile + its scale row, and the iw CTAs' weights_proj
+            # slice -> L2 now, ~8 us before the idx chain reads them (hi's idx.wq_b: its weights in flight before its input)
+            pf_rows(ltab(fp, Ly, "iqw")() + i64(b) * (16 * QL), QL, 16, QL, t)
+            pf_rows(ltab(fp, Ly, "iqws")() + i64(b // 2) * (QL // 32 * 4), QL // 32 * 4, 1, 256, t)
+            if b < IS.IW_SLICES:
+                pf_rows(ltab(fp, Ly, "iww")() + i64(b) * (IS.IW_K * 2), D.HID * 2, IS.HEADS, 384, t)
     if fx.const_expr(not DRS):   # (c1 code size) no Engram kv in the draft launch (lflags 0)
         if hx.unlikely(lfl(128)):   # the next layer's Engram kv
             if (ltab(fp, Ly, "lflags")() & fx.Int64(S.ENG_ENTRY)) == fx.Int64(0):

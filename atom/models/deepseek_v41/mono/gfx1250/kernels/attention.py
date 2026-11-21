@@ -133,14 +133,17 @@ def ld_op(row, kb, l):
     return fx.Vector.from_elements([parts[c][e] for c in range(4) for e in range(4)], I32)
 
 
-def mx_loop(n, fa, fb, D=4):
+def mx_loop(n, fa, fb, D=4, mid=None):
     """n K128 MXFP8 WMMA steps, D operand pairs in flight. Sched barriers keep the D-deep load ring in flight (each refill
-    issued right after the WMMA that freed its slot)."""
+    issued right after the WMMA that freed its slot). mid: issued between the ring's first loads and its first WMMA."""
     A, SA, B, SB = [None] * D, [None] * D, [None] * D, [None] * D
     for i in range(min(D, n)):
         B[i], SB[i] = fb(i)
         A[i], SA[i] = fa(i)
     _sbar()
+    if mid is not None:
+        mid()
+        _sbar()
     c = fx.Vector.filled(8, 0.0, F32)
     for ks in range(0, n, D):
         for i in range(D):

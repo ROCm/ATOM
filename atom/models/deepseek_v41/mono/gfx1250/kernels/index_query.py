@@ -67,9 +67,21 @@ def stage_iq(c):
         fi = fx.max((d - (DIM - 64)) // 2, I32(0))
         odd = (l & 1) == 1
         rows = [mi * 16 + (l // 16) * 8 + i for i in range(8)]
-        rs = [rsq(hx.gload(c["ss"] + i64(r) * 4, F32) / F32(QL) + F32(NORM_EPS)) for r in rows]
-        csn = [rope_cs(c, r, fi) for r in rows]
-        acc = mx_loop(QL // 128, fa, fb)
+        # the epilogue's row loads: the 8 rows are contiguous, so their sums of squares and positions are one vector load
+        # each, issued first; the cos / sin (on the positions) between the GEMV's first ring loads and its first WMMA.
+        # (Per-row loads -- rsq(ss[r]), rope_cs(r) -- ran in the step kernel as 4 + 8 serial round trips before the
+        # GEMV's first WMMA: s_wait_loadcnt 0 / 1 a row under the kernel's register pressure, 9ac662f71 ISA.)
+        ssv = hx.gload(c["ss"] + i64(rows[0]) * 4, F32, 8)
+        pv = hx.gload(c["rpos"] + i64(rows[0]) * 8, fx.Int64, 8)
+        hx.intrin(None, "llvm.amdgcn.sched.barrier", [I32(0)])
+        csn = []
+
+        def cs_loads():
+            csn.extend([(hx.gload(c["rcos"] + (pv[i] * 32 + i64(fi)) * 2, BF16).to(F32),
+                         hx.gload(c["rsin"] + (pv[i] * 32 + i64(fi)) * 2, BF16).to(F32)) for i in range(8)])
+
+        acc = mx_loop(QL // 128, fa, fb, mid=cs_loads)
+        rs = [rsq(ssv[i] / F32(QL) + F32(NORM_EPS)) for i in range(8)]
         for i in range_constexpr(8):
             r = rows[i]
             cvi = acc[i] * rs[i]
