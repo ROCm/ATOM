@@ -85,25 +85,21 @@ impl Served {
         Self::serve(ranks, TEMPLATE, RouterConfig::default()).await
     }
 
-    /// One Core behind a template whose generation prompt opens `<think>`,
-    /// as GLM-5.x and Qwen3.5 do, read by the qwen3 reasoning parser.
-    /// One Core behind the plain template, its replies read by `parser`.
-    async fn reasoning_with(parser: &str) -> Self {
+    /// One Core behind the template whose generation prompt ends on `opener`,
+    /// its replies read by `parser`.
+    async fn reasoning_with(parser: &str, opener: &str) -> Self {
         let config = RouterConfig {
             reasoning_parser: Some(parser.into()),
             ..Default::default()
         };
-        Self::serve(1, TEMPLATE, config).await
+        let template = TEMPLATE.replace("assistant:", &format!("assistant:{opener}"));
+        Self::serve(1, &template, config).await
     }
 
+    /// One Core behind a template whose generation prompt opens `<think>`,
+    /// as GLM-5.x and Qwen3.5 do, read by the qwen3 reasoning parser.
     async fn thinking() -> Self {
-        let template = "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}\
-                        {% if add_generation_prompt %}assistant: <think>\n{% endif %}";
-        let config = RouterConfig {
-            reasoning_parser: Some("qwen3".into()),
-            ..Default::default()
-        };
-        Self::serve(1, template, config).await
+        Self::reasoning_with("qwen3", " <think>\n").await
     }
 
     async fn serve(ranks: usize, chat_template: &str, config: RouterConfig) -> Self {
@@ -169,31 +165,51 @@ impl Served {
             Err(e) => e.response(path),
         }
     }
-}
 
-/// A Core that has answered, with the sequences it was submitted.
-type Answered = (FakeCore, Vec<wire::SubmitItem>);
-
-/// Play every Core in `cores` from its own thread: take one submission and
-/// answer each of its sequences with `answer`, then hand the Core and what it
-/// received back.
-fn answer_each(
-    cores: Vec<FakeCore>,
-    answer: impl Fn(&FakeCore, &wire::SubmitItem) + Send + Sync + Copy + 'static,
-) -> Vec<thread::JoinHandle<Answered>> {
-    cores
-        .into_iter()
-        .map(|core| {
-            thread::spawn(move || {
-                let specs = core.submitted().expect("a submission");
-                for spec in &specs {
-                    answer(&core, spec);
-                }
-                (core, specs)
+    /// `post`, every Core taking one submission and answering each of its
+    /// sequences with `answer`: the response and the sequences submitted.
+    async fn answered(
+        &mut self,
+        path: &str,
+        body: Value,
+        answer: impl Answer,
+    ) -> (Response, Vec<wire::SubmitItem>) {
+        let cores: Vec<_> = std::mem::take(&mut self.cores)
+            .into_iter()
+            .map(|core| {
+                thread::spawn(move || {
+                    let specs = core.submitted().expect("a submission");
+                    specs.iter().for_each(|spec| answer(&core, spec));
+                    (core, specs)
+                })
             })
-        })
-        .collect()
+            .collect();
+        let response = self.post(path, body).await;
+        let mut submitted = Vec::new();
+        for core in cores {
+            let (core, specs) = core.join().unwrap();
+            self.cores.push(core);
+            submitted.extend(specs);
+        }
+        (response, submitted)
+    }
+
+    /// `answered`, its response read as JSON.
+    async fn exchange(
+        &mut self,
+        path: &str,
+        body: Value,
+        answer: impl Answer,
+    ) -> (StatusCode, Value, Vec<wire::SubmitItem>) {
+        let (response, specs) = self.answered(path, body, answer).await;
+        let (status, body) = json_body(response).await;
+        (status, body, specs)
+    }
 }
+
+/// How a fake Core answers a sequence it was submitted.
+trait Answer: Fn(&FakeCore, &wire::SubmitItem) + Send + Sync + Copy + 'static {}
+impl<F: Fn(&FakeCore, &wire::SubmitItem) + Send + Sync + Copy + 'static> Answer for F {}
 
 fn hello_world(core: &FakeCore, spec: &wire::SubmitItem) {
     core.stream(&[(spec.seq_id, &[HELLO], None)]);
@@ -208,6 +224,35 @@ async fn json_body(response: Response) -> (StatusCode, Value) {
     (status, body)
 }
 
+/// A streamed response's chunks, which end on `[DONE]`.
+async fn sse_chunks(response: Response) -> Vec<Value> {
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    let events: Vec<&str> = text
+        .split("\n\n")
+        .filter_map(|e| e.strip_prefix("data: "))
+        .collect();
+    assert_eq!(events.last(), Some(&"[DONE]"), "{text}");
+    events[..events.len() - 1]
+        .iter()
+        .map(|e| serde_json::from_str(e).unwrap())
+        .collect()
+}
+
+/// What the chunks' deltas say in `field`, joined.
+fn joined(chunks: &[Value], field: &str) -> String {
+    chunks
+        .iter()
+        .filter_map(|c| c["choices"][0]["delta"][field].as_str())
+        .collect()
+}
+
+fn assert_idle(core: &FakeCore) {
+    let submitted = FakeCore::recv_on(&core.input, std::time::Duration::from_millis(200));
+    assert!(submitted.is_none(), "the Core got a submission");
+}
+
 fn user_hello(extra: Value) -> Value {
     let mut body = json!({"model": MODEL, "messages": [{"role": "user", "content": "hello"}]});
     body.as_object_mut()
@@ -216,182 +261,136 @@ fn user_hello(extra: Value) -> Value {
     body
 }
 
+const CHAT: &str = "/v1/chat/completions";
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_chat_is_prepared_submitted_and_rendered() {
     let mut served = Served::start(1).await;
-    let core = answer_each(std::mem::take(&mut served.cores), hello_world);
-    let response = served
-        .post("/v1/chat/completions", user_hello(json!({})))
+    let (status, body, specs) = served
+        .exchange(CHAT, user_hello(json!({})), hello_world)
         .await;
-    let (_, specs) = core.into_iter().next().unwrap().join().unwrap();
-
-    let (status, body) = json_body(response).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["choices"][0]["message"]["content"], "hello world");
     assert_eq!(body["choices"][0]["finish_reason"], "stop");
     // `user: hello` `assistant:`, rendered by the template, as the prompt.
-    assert_eq!(
-        specs[0].prompt,
-        test_support::token_bytes(&[3, 5, HELLO, 4, 5]),
-        "the prompt"
-    );
-    assert_eq!(body["usage"]["prompt_tokens"], 5);
-    assert_eq!(body["usage"]["completion_tokens"], 2);
-    // No max_tokens: the deployment's default.
     let [spec] = &specs[..] else {
         panic!("{specs:?}")
     };
+    assert_eq!(spec.prompt, test_support::token_bytes(&[3, 5, HELLO, 4, 5]));
+    assert_eq!(body["usage"]["prompt_tokens"], 5);
+    assert_eq!(body["usage"]["completion_tokens"], 2);
+    // No max_tokens: the deployment's default.
     assert_eq!(spec.sampling.max_tokens, 16);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_streamed_chat_ends_on_done() {
     let mut served = Served::start(1).await;
-    let core = answer_each(std::mem::take(&mut served.cores), hello_world);
-    let response = served
-        .post("/v1/chat/completions", user_hello(json!({"stream": true})))
-        .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    core.into_iter().for_each(|c| drop(c.join().unwrap()));
-
-    let text = String::from_utf8(bytes.to_vec()).unwrap();
-    let events: Vec<&str> = text
-        .split("\n\n")
-        .filter_map(|e| e.strip_prefix("data: "))
-        .collect();
-    assert_eq!(events.last(), Some(&"[DONE]"), "{text}");
-    let chunks: Vec<Value> = events[..events.len() - 1]
-        .iter()
-        .map(|e| serde_json::from_str(e).unwrap())
-        .collect();
+    let body = user_hello(json!({"stream": true, "stream_options": {"include_usage": true}}));
+    let (response, _) = served.answered(CHAT, body, hello_world).await;
+    let chunks = sse_chunks(response).await;
     assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
-    let content: String = chunks
+    assert_eq!(joined(&chunks, "content"), "hello world");
+    assert!(chunks
         .iter()
-        .filter_map(|c| c["choices"][0]["delta"]["content"].as_str())
-        .collect();
-    assert_eq!(content, "hello world");
-    assert!(
-        chunks
-            .iter()
-            .any(|c| c["choices"][0]["finish_reason"] == "stop"),
-        "{text}"
+        .any(|c| c["choices"][0]["finish_reason"] == "stop"));
+    // Its usage carries the cache hit, not ATOM's timing.
+    let usage = chunks
+        .iter()
+        .find_map(|c| c.get("usage").filter(|u| !u.is_null()))
+        .expect("a usage chunk");
+    assert_eq!(usage["prompt_tokens"], 5, "{usage}");
+    assert_eq!(
+        usage["prompt_tokens_details"]["cached_tokens"], 3,
+        "{usage}"
     );
+    assert!(usage.get("ttft_s").is_none(), "{usage}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn siblings_run_on_both_ranks_and_count_the_prompt_once() {
     let mut served = Served::start(2).await;
-    let cores = answer_each(std::mem::take(&mut served.cores), hello_world);
-    let response = served
-        .post(
-            "/v1/chat/completions",
-            user_hello(json!({"n": 2, "temperature": 1.0})),
-        )
-        .await;
-    for core in cores {
-        let (_, specs) = core.join().unwrap();
-        assert_eq!(specs.len(), 1, "one sibling a rank");
-    }
-
-    let (status, body) = json_body(response).await;
+    let body = user_hello(json!({"n": 2, "temperature": 1.0}));
+    let (status, body, specs) = served.exchange(CHAT, body, hello_world).await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    let ranks: Vec<_> = specs.iter().map(|s| s.data_parallel_rank).collect();
+    assert_eq!(ranks, [Some(0), Some(1)], "one sibling a rank");
     let choices = body["choices"].as_array().unwrap();
     assert_eq!(choices.len(), 2);
     assert!(choices
         .iter()
         .all(|c| c["message"]["content"] == "hello world"));
-    assert_eq!(body["usage"]["prompt_tokens"], 5);
-    assert_eq!(body["usage"]["completion_tokens"], 4);
+    // The cache hit and ATOM's timing too.
+    let usage = &body["usage"];
+    assert_eq!(usage["prompt_tokens"], 5, "{usage}");
+    assert_eq!(usage["completion_tokens"], 4, "{usage}");
+    assert_eq!(
+        usage["prompt_tokens_details"]["cached_tokens"], 3,
+        "{usage}"
+    );
+    assert_eq!(usage["num_choices"], 2, "{usage}");
+    for field in ["ttft_s", "tpot_s", "latency_s"] {
+        assert!(usage[field].as_f64().is_some(), "{field}: {usage}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rejection_answers_with_its_codes_status() {
+    let mut served = Served::start(1).await;
     for (code, status) in [
         (reject::INVALID, StatusCode::BAD_REQUEST),
         (reject::OVERLOADED, StatusCode::SERVICE_UNAVAILABLE),
         (reject::INTERNAL, StatusCode::INTERNAL_SERVER_ERROR),
     ] {
-        let mut served = Served::start(1).await;
-        let core = thread::spawn({
-            let core = served.cores.pop().unwrap();
-            move || {
-                let specs = core.submitted().expect("a submission");
-                let refused = wire::Completion {
-                    seq_id: specs[0].seq_id,
-                    leave_reason: "rejected: refused".into(),
-                    reject_code: code,
-                    ..Default::default()
-                };
-                core.send(
-                    kind::ADD,
-                    &wire::Completions {
-                        items: vec![refused],
-                    },
-                );
-                core
-            }
-        });
-        let response = served
-            .post("/v1/chat/completions", user_hello(json!({})))
-            .await;
-        drop(core.join().unwrap());
-        let (got, body) = json_body(response).await;
+        let refuse = move |core: &FakeCore, spec: &wire::SubmitItem| {
+            let refused = wire::Completion {
+                seq_id: spec.seq_id,
+                leave_reason: "rejected: refused".into(),
+                reject_code: code,
+                ..Default::default()
+            };
+            let items = vec![refused];
+            core.send(kind::ADD, &wire::Completions { items });
+        };
+        let (got, body, _) = served.exchange(CHAT, user_hello(json!({})), refuse).await;
         assert_eq!(got, status, "{code:?}: {body}");
         assert!(body.to_string().contains("refused"), "{body}");
     }
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_data_parallel_rank_is_where_the_request_runs() {
-    let mut served = Served::start(2).await;
-    let generate = |rank: i64| {
-        json!({
-            "model": MODEL,
-            "input_ids": [HELLO],
-            "data_parallel_rank": rank,
-        })
-    };
-    let rank1 = served.cores.pop().unwrap();
-    let rank0 = served.cores.pop().unwrap();
-    let serving = answer_each(vec![rank1], hello_world);
-    let response = served.post("/generate", generate(1)).await;
-    let (status, body) = json_body(response).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    // One entry per sequence, as SGLang's `/generate` answers.
-    assert_eq!(body[0]["text"], "hello world");
-    serving.into_iter().for_each(|c| drop(c.join().unwrap()));
-    assert!(
-        FakeCore::recv_on(&rank0.input, std::time::Duration::from_millis(200)).is_none(),
-        "rank 0 got nothing"
-    );
-
-    // Past the last rank, or negative: refused before any Core sees it.
-    for rank in [2, -1] {
-        let response = served.post("/generate", generate(rank)).await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "rank {rank}");
-    }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_completion_gets_its_text_back() {
+async fn a_completion_ignores_what_python_v1_does_not_declare() {
     let mut served = Served::start(1).await;
-    let core = answer_each(std::mem::take(&mut served.cores), |core, spec| {
-        core.stream(&[(spec.seq_id, &[WORLD], Some("max_tokens"))]);
+    let body = json!({
+        "model": MODEL, "prompt": "hello",
+        "max_tokens": 8, "max_completion_tokens": 4,
+        "echo": true, "suffix": "world", "best_of": 3,
+        "logit_bias": {"1": -100.0}, "stream_options": {"include_usage": true},
+        "stop": ["world"],
     });
-    let response = served
-        .post(
-            "/v1/completions",
-            json!({"model": MODEL, "prompt": "hello", "max_tokens": 1}),
-        )
-        .await;
-    drop(core.into_iter().next().unwrap().join().unwrap());
-
-    let (status, body) = json_body(response).await;
+    let (status, body, specs) = served.exchange("/v1/completions", body, hello_world).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["object"], "text_completion");
-    assert_eq!(body["choices"][0]["text"], "world");
-    assert_eq!(body["choices"][0]["finish_reason"], "length");
+    // No echoed prompt, no suffix: the completion alone, its matched stop
+    // string kept, as the Python server leaves it.
+    assert_eq!(body["choices"][0]["text"], "hello world");
+    // `max_completion_tokens` over `max_tokens`, as `get_max_tokens` takes it.
+    assert_eq!(specs[0].sampling.max_tokens, 4);
+    // ATOM's timing, and no cache hit: completions do not report one.
+    let usage = &body["usage"];
+    assert!(usage["ttft_s"].as_f64().unwrap() >= 0.0, "{usage}");
+    assert!(usage["latency_s"].as_f64().unwrap() >= usage["ttft_s"].as_f64().unwrap());
+    assert!(usage.get("prompt_tokens_details").is_none(), "{usage}");
+    assert!(usage.get("num_choices").is_none(), "{usage}");
+
+    let out_of_tokens = |core: &FakeCore, spec: &wire::SubmitItem| {
+        core.stream(&[(spec.seq_id, &[WORLD], Some("max_tokens"))]);
+    };
+    let body = json!({"model": MODEL, "prompt": "hello", "max_tokens": 1});
+    let (_, body, _) = served
+        .exchange("/v1/completions", body, out_of_tokens)
+        .await;
+    assert_eq!(body["choices"][0]["finish_reason"], "length", "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -401,14 +400,10 @@ async fn another_models_name_is_refused() {
         "model": "other",
         "messages": [{"role": "user", "content": "hello"}],
     });
-    let (status, body) = json_body(served.post("/v1/chat/completions", request).await).await;
+    let (status, body) = json_body(served.post(CHAT, request).await).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(body.to_string().contains("model_not_found"), "{body}");
-    assert!(FakeCore::recv_on(
-        &served.cores[0].input,
-        std::time::Duration::from_millis(200)
-    )
-    .is_none());
+    assert_idle(&served.cores[0]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -430,107 +425,13 @@ async fn health_follows_the_cores() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_completion_ignores_what_python_v1_does_not_declare() {
-    let mut served = Served::start(1).await;
-    let core = answer_each(std::mem::take(&mut served.cores), hello_world);
-    let response = served
-        .post(
-            "/v1/completions",
-            json!({
-                "model": MODEL, "prompt": "hello",
-                "max_tokens": 8, "max_completion_tokens": 4,
-                "echo": true, "suffix": "world", "best_of": 3,
-                "logit_bias": {"1": -100.0}, "stream_options": {"include_usage": true},
-            }),
-        )
-        .await;
-    let (_, specs) = core.into_iter().next().unwrap().join().unwrap();
-
-    let (status, body) = json_body(response).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    // No echoed prompt, no suffix: the completion alone.
-    assert_eq!(body["choices"][0]["text"], "hello world");
-    // `max_completion_tokens` over `max_tokens`, as `get_max_tokens` takes it.
-    assert_eq!(specs[0].sampling.max_tokens, 4);
-    // ATOM's timing, and no cache hit: completions do not report one.
-    let usage = &body["usage"];
-    assert!(usage["ttft_s"].as_f64().unwrap() >= 0.0, "{usage}");
-    assert!(usage["latency_s"].as_f64().unwrap() >= usage["ttft_s"].as_f64().unwrap());
-    assert!(usage.get("prompt_tokens_details").is_none(), "{usage}");
-    assert!(usage.get("num_choices").is_none(), "{usage}");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn chat_usage_carries_the_cache_hit_and_timing() {
-    let mut served = Served::start(2).await;
-    let cores = answer_each(std::mem::take(&mut served.cores), hello_world);
-    let response = served
-        .post(
-            "/v1/chat/completions",
-            user_hello(json!({"n": 2, "temperature": 1.0})),
-        )
-        .await;
-    cores.into_iter().for_each(|c| drop(c.join().unwrap()));
-
-    let (status, body) = json_body(response).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let usage = &body["usage"];
-    assert_eq!(usage["prompt_tokens"], 5, "{usage}");
-    assert_eq!(usage["completion_tokens"], 4, "{usage}");
-    assert_eq!(
-        usage["prompt_tokens_details"]["cached_tokens"], 3,
-        "{usage}"
-    );
-    assert_eq!(usage["num_choices"], 2, "{usage}");
-    for field in ["ttft_s", "tpot_s", "latency_s"] {
-        assert!(usage[field].as_f64().is_some(), "{field}: {usage}");
-    }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_streamed_chats_usage_carries_the_cache_hit() {
-    let mut served = Served::start(1).await;
-    let core = answer_each(std::mem::take(&mut served.cores), hello_world);
-    let response = served
-        .post(
-            "/v1/chat/completions",
-            user_hello(json!({"stream": true, "stream_options": {"include_usage": true}})),
-        )
-        .await;
-    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    core.into_iter().for_each(|c| drop(c.join().unwrap()));
-
-    let text = String::from_utf8(bytes.to_vec()).unwrap();
-    let usage = text
-        .split("\n\n")
-        .filter_map(|e| e.strip_prefix("data: "))
-        .filter_map(|e| serde_json::from_str::<Value>(e).ok())
-        .find_map(|c| c.get("usage").filter(|u| !u.is_null()).cloned())
-        .unwrap_or_else(|| panic!("no usage chunk: {text}"));
-    assert_eq!(usage["prompt_tokens"], 5, "{usage}");
-    assert_eq!(
-        usage["prompt_tokens_details"]["cached_tokens"], 3,
-        "{usage}"
-    );
-    assert!(usage.get("ttft_s").is_none(), "{usage}");
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn every_generate_sibling_reports_its_prompt() {
     let mut served = Served::start(2).await;
-    let cores = answer_each(std::mem::take(&mut served.cores), hello_world);
-    let response = served
-        .post(
-            "/generate",
-            json!({
-                "model": MODEL, "input_ids": [HELLO, WORLD],
-                "sampling_params": {"n": 2, "temperature": 1.0},
-            }),
-        )
-        .await;
-    cores.into_iter().for_each(|c| drop(c.join().unwrap()));
-
-    let (status, body) = json_body(response).await;
+    let body = json!({
+        "model": MODEL, "input_ids": [HELLO, WORLD],
+        "sampling_params": {"n": 2, "temperature": 1.0},
+    });
+    let (status, body, _) = served.exchange("/generate", body, hello_world).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let siblings = body.as_array().unwrap();
     assert_eq!(siblings.len(), 2, "{body}");
@@ -539,9 +440,14 @@ async fn every_generate_sibling_reports_its_prompt() {
     }
 }
 
+/// What the Core cannot serve, and what the Python server refuses, is
+/// refused before any Core sees it.
 #[tokio::test(flavor = "multi_thread")]
 async fn what_the_core_cannot_serve_is_refused_not_dropped() {
     let served = Served::start(1).await;
+    let tool =
+        |name: &str| json!({"type": "function", "function": {"name": name, "parameters": {}}});
+    let retrieval = json!({"type": "retrieval", "function": {"name": "get", "parameters": {}}});
     let refusals = [
         (
             "/generate",
@@ -554,19 +460,24 @@ async fn what_the_core_cannot_serve_is_refused_not_dropped() {
             "token_ids_logprob",
         ),
         (
-            "/v1/chat/completions",
+            CHAT,
             user_hello(json!({"kv_transfer_params": {"do_remote_decode": true}})),
             "kv_transfer_params",
         ),
         (
-            "/v1/completions",
-            json!({"model": MODEL, "prompt": "hello", "prompt_token_ids": [HELLO]}),
-            "prompt_token_ids",
+            CHAT,
+            user_hello(json!({"stream_options": {"include_usage": true}})),
+            "stream_options",
         ),
         (
-            "/v1/completions",
-            json!({"model": MODEL, "prompt": "hello", "return_token_ids": true}),
-            "return_token_ids",
+            CHAT,
+            user_hello(json!({"tools": [tool("get"), tool("put"), tool("get")]})),
+            "duplicate tool name: get",
+        ),
+        (
+            CHAT,
+            user_hello(json!({"tools": [retrieval]})),
+            "tools[0].type must be 'function'",
         ),
     ];
     for (path, request, refusal) in refusals {
@@ -574,233 +485,181 @@ async fn what_the_core_cannot_serve_is_refused_not_dropped() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
         assert!(body.to_string().contains(refusal), "{path}: {body}");
     }
-    assert!(FakeCore::recv_on(
-        &served.cores[0].input,
-        std::time::Duration::from_millis(200)
-    )
-    .is_none());
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn requests_the_python_server_refuses_are_refused() {
-    let served = Served::start(1).await;
-    let tool =
-        |name: &str| json!({"type": "function", "function": {"name": name, "parameters": {}}});
-    let chats = [
-        (
-            json!({"stream_options": {"include_usage": true}}),
-            "stream_options",
-        ),
-        (
-            json!({"tools": [tool("get"), tool("put"), tool("get")]}),
-            "duplicate tool name: get",
-        ),
-        (
-            json!({"tools": [{"type": "retrieval", "function": {"name": "get", "parameters": {}}}]}),
-            "tools[0].type must be 'function'",
-        ),
-    ];
-    for (extra, refusal) in chats {
-        let response = served.post("/v1/chat/completions", user_hello(extra)).await;
-        let (status, body) = json_body(response).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert!(body.to_string().contains(refusal), "{body}");
-    }
-    assert!(FakeCore::recv_on(
-        &served.cores[0].input,
-        std::time::Duration::from_millis(200)
-    )
-    .is_none());
+    assert_idle(&served.cores[0]);
 }
 
 /// The reply of a prompt that opened `<think>` starts inside reasoning: what
-/// precedes `</think>` is reasoning, streamed or not.
+/// precedes `</think>` is reasoning.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_prompt_that_opens_reasoning_leaves_the_reply_inside_it() {
-    fn think_then_answer(core: &FakeCore, spec: &wire::SubmitItem) {
+    let think_then_answer = |core: &FakeCore, spec: &wire::SubmitItem| {
         core.stream(&[(spec.seq_id, &[HELLO, THINK_END, WORLD], Some("eos"))]);
-    }
-
+    };
     let mut served = Served::thinking().await;
-    let core = answer_each(std::mem::take(&mut served.cores), think_then_answer);
-    let response = served
-        .post("/v1/chat/completions", user_hello(json!({})))
-        .await;
-    drop(core.into_iter().next().unwrap().join().unwrap());
-    let (status, body) = json_body(response).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let message = &body["choices"][0]["message"];
-    assert_eq!(
-        message["reasoning_content"].as_str().map(str::trim),
-        Some("hello")
-    );
-    assert_eq!(message["content"], "world");
-
-    let mut served = Served::thinking().await;
-    let core = answer_each(std::mem::take(&mut served.cores), think_then_answer);
-    let response = served
-        .post("/v1/chat/completions", user_hello(json!({"stream": true})))
-        .await;
-    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    drop(core.into_iter().next().unwrap().join().unwrap());
-    let text = String::from_utf8(bytes.to_vec()).unwrap();
-    let deltas: Vec<Value> = text
-        .split("\n\n")
-        .filter_map(|e| e.strip_prefix("data: "))
-        .filter(|e| *e != "[DONE]")
-        .map(|e| serde_json::from_str::<Value>(e).unwrap()["choices"][0]["delta"].clone())
-        .collect();
-    let joined =
-        |field: &str| -> String { deltas.iter().filter_map(|d| d[field].as_str()).collect() };
-    assert_eq!(joined("reasoning_content").trim(), "hello", "{text}");
-    assert_eq!(joined("content").trim(), "world", "{text}");
+    let body = user_hello(json!({"stream": true}));
+    let (response, _) = served.answered(CHAT, body, think_then_answer).await;
+    let chunks = sse_chunks(response).await;
+    assert_eq!(joined(&chunks, "reasoning_content").trim(), "hello");
+    assert_eq!(joined(&chunks, "content").trim(), "world");
 }
 
-/// A non-streamed reply longer than the reasoning parser's 64 KiB buffer is
-/// split, not refused with a 500.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_long_non_streamed_reply_is_split_into_reasoning_and_content() {
-    const WORDS: usize = 20_000;
-    fn think_long(core: &FakeCore, spec: &wire::SubmitItem) {
-        let mut ids = vec![HELLO; WORDS];
-        ids.extend([THINK_END, WORLD]);
-        core.stream(&[(spec.seq_id, &ids, Some("eos"))]);
-    }
-
-    let mut served = Served::thinking().await;
-    let core = answer_each(std::mem::take(&mut served.cores), think_long);
-    let response = served
-        .post(
-            "/v1/chat/completions",
-            user_hello(json!({"max_tokens": WORDS + 2})),
-        )
-        .await;
-    drop(core.into_iter().next().unwrap().join().unwrap());
-    let (status, body) = json_body(response).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let message = &body["choices"][0]["message"];
-    let reasoning = message["reasoning_content"].as_str().unwrap();
-    assert!(reasoning.len() > 65536, "{}", reasoning.len());
-    assert_eq!(reasoning.split_whitespace().count(), WORDS);
-    assert_eq!(message["content"], "world");
-}
-
-/// `count` words, `</think>`, then `tail`: a reply past 64 KiB of text.
-fn long_reasoning_then(
-    count: usize,
-    tail: &'static [i32],
-) -> impl Fn(&FakeCore, &wire::SubmitItem) + Send + Sync + Copy + 'static {
-    move |core, spec| {
-        let mut ids = vec![HELLO; count];
-        ids.push(THINK_END);
-        ids.extend(tail);
-        core.stream(&[(spec.seq_id, &ids, Some("eos"))]);
-    }
-}
-
-/// The non-streamed chat `served` answers for `body`, after `answer`.
-async fn answered_chat(
-    mut served: Served,
-    body: Value,
-    answer: impl Fn(&FakeCore, &wire::SubmitItem) + Send + Sync + Copy + 'static,
-) -> Value {
-    let core = answer_each(std::mem::take(&mut served.cores), answer);
-    let response = served.post("/v1/chat/completions", body).await;
-    drop(core.into_iter().next().unwrap().join().unwrap());
-    let (status, body) = json_body(response).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    body["choices"][0]["message"].clone()
-}
-
-/// A string stop makes the stop decoder release text in windows that can
-/// cut `</think>` in two; the long reply is still split at it, and a `<`
-/// ending the reply is kept.
+/// A reply longer than the reasoning parser's 64 KiB buffer is split at its
+/// closer, not refused with a 500: under a string stop, whose decoder releases
+/// text in windows that can cut `</think>` in two (and a `<` ending it is
+/// kept); under MiniMax's parser, whose own `<think>` pushes a reply just
+/// under 64 KiB past it; and under Kimi's, whose markers have no `<` (a
+/// `<think>` is text to it).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_long_reply_is_split_at_its_closer_whatever_the_stop_decoder_releases() {
-    const WORDS: usize = 20_000;
-    let body = user_hello(json!({"max_tokens": WORDS + 3, "stop": ["Question:"]}));
-    let answer = long_reasoning_then(WORDS, &[WORLD, LT]);
-    let message = answered_chat(Served::thinking().await, body, answer).await;
-    assert_eq!(message["content"], "world <");
-    let reasoning = message["reasoning_content"].as_str().unwrap();
-    assert_eq!(reasoning.split_whitespace().count(), WORDS);
-}
-
-/// MiniMax's parser puts its own `<think>` before the reply: a reply just
-/// under 64 KiB overflows the one-shot parse by those 7 bytes and is parsed
-/// whole without the cap instead of answering 500.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_minimax_reply_its_opener_pushes_past_64_kib_is_split() {
-    // 10920 words and their spaces, then ` </think> world`: 65534 bytes.
-    const WORDS: usize = 10_920;
-    let body = user_hello(json!({"max_tokens": WORDS + 2}));
-    let answer = long_reasoning_then(WORDS, &[WORLD]);
-    let message = answered_chat(Served::reasoning_with("minimax").await, body, answer).await;
-    assert_eq!(message["content"], "world");
-    let reasoning = message["reasoning_content"].as_str().unwrap();
-    let reply = reasoning.len() + " </think> world".len();
-    assert!((65_530..=65_536).contains(&reply), "{reply}");
-}
-
-/// Kimi's markers have no `<`: a long reply whose generation prompt opened
-/// `◁think▷` is split at its `◁/think▷` like any other, and a `<think>` is
-/// text to it.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_long_kimi_reply_is_split_at_its_own_closer() {
-    const WORDS: usize = 20_000;
-    let template = "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}\
-                    {% if add_generation_prompt %}assistant: ◁think▷\n{% endif %}";
-    let config = RouterConfig {
-        reasoning_parser: Some("kimi".into()),
-        ..Default::default()
-    };
-    fn answer(core: &FakeCore, spec: &wire::SubmitItem) {
-        let mut ids = vec![HELLO; WORDS];
-        ids.extend([KIMI_END, 6, WORLD]);
-        core.stream(&[(spec.seq_id, &ids, Some("eos"))]);
+    const MINIMAX_WORDS: usize = 10_920;
+    type Row = (
+        &'static str,
+        &'static str,
+        Value,
+        &'static [i32],
+        &'static str,
+        usize,
+    );
+    let rows: [Row; 3] = [
+        (
+            "qwen3",
+            " <think>\n",
+            json!({"stop": ["Question:"]}),
+            &[THINK_END, WORLD, LT],
+            "world <",
+            20_000,
+        ),
+        // 10920 words and their spaces, then ` </think> world`: 65534 bytes.
+        (
+            "minimax",
+            "",
+            json!({}),
+            &[THINK_END, WORLD],
+            "world",
+            MINIMAX_WORDS,
+        ),
+        (
+            "kimi",
+            " ◁think▷\n",
+            json!({}),
+            &[KIMI_END, 6, WORLD],
+            "<think> world",
+            20_000,
+        ),
+    ];
+    fn reply(words: usize, tail: &'static [i32]) -> impl Answer {
+        move |core: &FakeCore, spec: &wire::SubmitItem| {
+            let mut ids = vec![HELLO; words];
+            ids.extend(tail);
+            core.stream(&[(spec.seq_id, &ids, Some("eos"))]);
+        }
     }
-    let body = user_hello(json!({"max_tokens": WORDS + 3}));
-    let message = answered_chat(Served::serve(1, template, config).await, body, answer).await;
-    assert_eq!(message["content"], "<think> world");
-    let reasoning = message["reasoning_content"].as_str().unwrap();
-    assert!(reasoning.len() > 65536, "{}", reasoning.len());
-    assert_eq!(reasoning.split_whitespace().count(), WORDS);
+    for (parser, opener, mut extra, tail, content, words) in rows {
+        extra["max_tokens"] = json!(words + 3);
+        let mut served = Served::reasoning_with(parser, opener).await;
+        let (status, body, _) = served
+            .exchange(CHAT, user_hello(extra), reply(words, tail))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{parser}: {body}");
+        let message = &body["choices"][0]["message"];
+        assert_eq!(message["content"], content, "{parser}");
+        let reasoning = message["reasoning_content"].as_str().unwrap();
+        assert_eq!(reasoning.split_whitespace().count(), words, "{parser}");
+        let bytes = reasoning.len();
+        if words == MINIMAX_WORDS {
+            let reply = bytes + " </think> world".len();
+            assert!((65_530..=65_536).contains(&reply), "{reply}");
+        } else {
+            assert!(bytes > 65_536, "{parser}: {bytes}");
+        }
+    }
 }
 
 /// What only the raw body says, read off it on the way in: `thinking` is
-/// checked, and `data_parallel_rank` picks the Core of a chat.
+/// checked, and `data_parallel_rank` picks the Core of a chat or a generate.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_chats_thinking_and_rank_are_read_off_its_body() {
-    let served = Served::start(1).await;
-    let response = served
-        .post(
-            "/v1/chat/completions",
-            user_hello(json!({"thinking": "on"})),
-        )
+    let mut served = Served::start(2).await;
+    let rank0 = served.cores.remove(0);
+    let ranked = [
+        (
+            CHAT,
+            user_hello(json!({"data_parallel_rank": 1, "thinking": {"type": "enabled"}})),
+        ),
+        (
+            "/generate",
+            json!({"model": MODEL, "input_ids": [HELLO], "data_parallel_rank": 1}),
+        ),
+    ];
+    for (path, body) in ranked {
+        let (status, body, _) = served.exchange(path, body, hello_world).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // A generate answers with one entry per sequence, as SGLang's does.
+        let reply = if path == CHAT {
+            &body["choices"][0]["message"]["content"]
+        } else {
+            &body[0]["text"]
+        };
+        assert_eq!(reply, "hello world", "{path}");
+    }
+    assert_idle(&rank0);
+
+    // Past the last rank, negative or not a number; a thinking not an object.
+    let refused = [
+        json!({"data_parallel_rank": 2}),
+        json!({"data_parallel_rank": -1}),
+        json!({"data_parallel_rank": "1"}),
+        json!({"thinking": "on"}),
+    ];
+    for extra in refused {
+        let (status, body) = json_body(served.post(CHAT, user_hello(extra.clone())).await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{extra}: {body}");
+    }
+    let generate = json!({"model": MODEL, "input_ids": [HELLO], "data_parallel_rank": -1});
+    let response = served.post("/generate", generate).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_idle(&rank0);
+    assert_idle(&served.cores[0]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn forced_acceptance_text_stands_in_for_every_token() {
+    let mut served = Served::serve_model(1, TEMPLATE, RouterConfig::default(), |model| {
+        model.synthetic_token_text = Some("synthetic ".into())
+    })
+    .await;
+    let (status, body, _) = served
+        .exchange(CHAT, user_hello(json!({})), hello_world)
         .await;
-    let (status, body) = json_body(response).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert!(
-        body.to_string().contains("thinking must be an object"),
-        "{body}"
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "synthetic synthetic "
+    );
+    assert_eq!(body["usage"]["completion_tokens"], 2);
+}
+
+/// A chat's stop strings become the token sequences the Core matches, in
+/// order, then its stop token ids, one each; a string with no tokens is
+/// dropped. A matched stop string stays in the reply, as the Python server
+/// leaves it (its engine stops after the stop sequence).
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_strings_and_ids_reach_the_core_as_token_sequences() {
+    let mut served = Served::start(1).await;
+    let body = user_hello(json!({
+        "stop": ["world", "hello world", " "],
+        "stop_token_ids": [THINK_END, LT],
+    }));
+    let (status, body, specs) = served.exchange(CHAT, body, hello_world).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        specs[0].stop_token_sequences,
+        [vec![WORLD], vec![HELLO, WORLD], vec![THINK_END], vec![LT]]
     );
 
-    let mut served = Served::start(2).await;
-    let rank1 = served.cores.pop().unwrap();
-    let rank0 = served.cores.pop().unwrap();
-    let serving = answer_each(vec![rank1], hello_world);
-    let body = user_hello(json!({
-        "data_parallel_rank": 1,
-        "thinking": {"type": "enabled"},
-    }));
-    let (status, body) = json_body(served.post("/v1/chat/completions", body).await).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    let body = user_hello(json!({"stop": ["world"]}));
+    let (_, body, _) = served.exchange(CHAT, body, hello_world).await;
     assert_eq!(body["choices"][0]["message"]["content"], "hello world");
-    serving.into_iter().for_each(|c| drop(c.join().unwrap()));
-    assert!(
-        FakeCore::recv_on(&rank0.input, std::time::Duration::from_millis(200)).is_none(),
-        "rank 0 got nothing"
-    );
 }
 
 /// A history tool call and its result, after `user: hello`.
@@ -815,113 +674,55 @@ fn after_a_tool_call() -> Value {
     ]})
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn history_tool_call_arguments_reach_the_template_as_the_spec_says() {
-    // `hello` where the template got the arguments as a string, `world` where
-    // it got them parsed.
-    let template = "{% for m in messages %}{% if m.tool_calls %}\
-                    {% if m.tool_calls[0].function.arguments is string %}hello {% else %}world {% endif %}\
-                    {% endif %}{% endfor %}assistant:";
-    for (preserve, read_as) in [(true, HELLO), (false, WORLD)] {
-        let mut served = Served::serve_model(1, template, RouterConfig::default(), |model| {
-            model.preserve_tool_call_arguments = preserve
-        })
-        .await;
-        let core = answer_each(std::mem::take(&mut served.cores), hello_world);
-        let (status, body) = json_body(
-            served
-                .post("/v1/chat/completions", after_a_tool_call())
-                .await,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let (_, specs) = core.into_iter().next().unwrap().join().unwrap();
-        assert_eq!(
-            specs[0].prompt,
-            test_support::token_bytes(&[read_as, 4, 5]),
-            "preserve={preserve}"
-        );
-    }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn forced_acceptance_text_stands_in_for_every_token() {
-    let mut served = Served::serve_model(1, TEMPLATE, RouterConfig::default(), |model| {
-        model.synthetic_token_text = Some("synthetic ".into())
-    })
-    .await;
-    let core = answer_each(std::mem::take(&mut served.cores), hello_world);
-    let (status, body) = json_body(
-        served
-            .post("/v1/chat/completions", user_hello(json!({})))
-            .await,
-    )
-    .await;
-    core.into_iter().next().unwrap().join().unwrap();
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(
-        body["choices"][0]["message"]["content"],
-        "synthetic synthetic "
-    );
-    assert_eq!(body["usage"]["completion_tokens"], 2);
-}
-
-/// A chat's stop strings become the token sequences the Core matches, in
-/// order, then its stop token ids, one each; a string with no tokens is
-/// dropped.
-#[tokio::test(flavor = "multi_thread")]
-async fn stop_strings_and_ids_reach_the_core_as_token_sequences() {
-    let mut served = Served::start(1).await;
-    let core = answer_each(std::mem::take(&mut served.cores), hello_world);
-    let body = user_hello(json!({
-        "stop": ["world", "hello world", " "],
-        "stop_token_ids": [THINK_END, LT],
-    }));
-    let (status, body) = json_body(served.post("/v1/chat/completions", body).await).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let (_, specs) = core.into_iter().next().unwrap().join().unwrap();
-    assert_eq!(
-        specs[0].stop_token_sequences,
-        [vec![WORLD], vec![HELLO, WORLD], vec![THINK_END], vec![LT]]
-    );
-}
-
-/// The kwargs a chat is rendered with, as api_server merges them: the
-/// request's over the deployment's defaults, the reasoning switch over both,
-/// and `response_format: text` passed on.
+/// What a chat's template is rendered with: a history tool call's arguments
+/// as the spec says (a string where it preserves them, parsed otherwise), and
+/// the kwargs as api_server merges them (the request's over the deployment's
+/// defaults, the reasoning switch over both, `response_format: text` passed
+/// on).
 #[tokio::test(flavor = "multi_thread")]
 async fn template_kwargs_merge_as_the_python_server_merges_them() {
+    // `hello` where the template got the arguments as a string, `world` where
+    // it got them parsed.
+    let arguments = "{% for m in messages %}{% if m.tool_calls %}\
+                    {% if m.tool_calls[0].function.arguments is string %}hello {% else %}world {% endif %}\
+                    {% endif %}{% endfor %}assistant:";
     // `{{ mode }}`, then `hello` if reasoning is on, `user` if a text
     // response format reached the template.
-    let template = "{{ mode }} {% if enable_thinking %}hello {% endif %}\
-                    {% if response_format is defined %}user {% endif %}assistant:";
+    let kwargs = "{{ mode }} {% if enable_thinking %}hello {% endif %}\
+                  {% if response_format is defined %}user {% endif %}assistant:";
     let cases = [
-        (json!({}), vec![WORLD, 4, 5]),
+        (arguments, true, after_a_tool_call(), vec![HELLO, 4, 5]),
+        (arguments, false, after_a_tool_call(), vec![WORLD, 4, 5]),
+        (kwargs, false, user_hello(json!({})), vec![WORLD, 4, 5]),
         (
-            json!({"chat_template_kwargs": {"mode": "hello"}}),
+            kwargs,
+            false,
+            user_hello(json!({"chat_template_kwargs": {"mode": "hello"}})),
             vec![HELLO, 4, 5],
         ),
         (
-            json!({"thinking": {"type": "enabled"}}),
+            kwargs,
+            false,
+            user_hello(json!({"thinking": {"type": "enabled"}})),
             vec![WORLD, HELLO, 4, 5],
         ),
         (
-            json!({"chat_template_kwargs": {"enable_thinking": true},
-                   "thinking": {"type": "disabled"}}),
+            kwargs,
+            false,
+            user_hello(json!({"chat_template_kwargs": {"enable_thinking": true},
+                              "thinking": {"type": "disabled"}})),
             vec![WORLD, 4, 5],
         ),
         (
-            json!({"chat_template_kwargs": {"enable_thinking": true},
-                   "reasoning_effort": "none"}),
-            vec![WORLD, 4, 5],
-        ),
-        (
-            json!({"response_format": {"type": "text"}}),
+            kwargs,
+            false,
+            user_hello(json!({"response_format": {"type": "text"}})),
             vec![WORLD, 3, 4, 5],
         ),
     ];
-    for (extra, prompt) in cases {
+    for (template, preserve, body, prompt) in cases {
         let mut served = Served::serve_model(1, template, RouterConfig::default(), |model| {
+            model.preserve_tool_call_arguments = preserve;
             model.default_chat_template_kwargs =
                 json!({"mode": "world"}).as_object().unwrap().clone();
             model.reasoning_toggle = Some(crate::atom_engine::spec::ReasoningToggle {
@@ -931,36 +732,13 @@ async fn template_kwargs_merge_as_the_python_server_merges_them() {
             });
         })
         .await;
-        let core = answer_each(std::mem::take(&mut served.cores), hello_world);
-        let body = user_hello(extra.clone());
-        let (status, body) = json_body(served.post("/v1/chat/completions", body).await).await;
-        assert_eq!(status, StatusCode::OK, "{extra}: {body}");
-        let (_, specs) = core.into_iter().next().unwrap().join().unwrap();
+        let what = body.to_string();
+        let (status, body, specs) = served.exchange(CHAT, body, hello_world).await;
+        assert_eq!(status, StatusCode::OK, "{what}: {body}");
         assert_eq!(
             specs[0].prompt,
             test_support::token_bytes(&prompt),
-            "{extra}"
+            "{what}"
         );
     }
-}
-
-/// A matched stop string stays in the reply, as the Python server leaves it
-/// (its engine stops after the stop sequence): chat and completions alike.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_matched_stop_string_stays_in_the_reply() {
-    let mut served = Served::start(1).await;
-    let core = answer_each(std::mem::take(&mut served.cores), hello_world);
-    let body = user_hello(json!({"stop": ["world"]}));
-    let (status, body) = json_body(served.post("/v1/chat/completions", body).await).await;
-    drop(core.into_iter().next().unwrap().join().unwrap());
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["choices"][0]["message"]["content"], "hello world");
-
-    let mut served = Served::start(1).await;
-    let core = answer_each(std::mem::take(&mut served.cores), hello_world);
-    let body = json!({"model": MODEL, "prompt": "hello", "stop": ["world"]});
-    let (status, body) = json_body(served.post("/v1/completions", body).await).await;
-    drop(core.into_iter().next().unwrap().join().unwrap());
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["choices"][0]["text"], "hello world");
 }

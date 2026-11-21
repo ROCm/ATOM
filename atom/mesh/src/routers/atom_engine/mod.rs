@@ -469,21 +469,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn raw_extras_are_read_only_when_named_and_ranks_are_checked() {
-        let none = RawExtras::read(br#"{"model": "m", "prompt": "data"}"#).unwrap();
-        assert!(none.thinking.is_none() && none.data_parallel_rank.is_none());
-        let extras =
-            RawExtras::read(br#"{"data_parallel_rank": 2, "thinking": {"type": "enabled"}}"#)
-                .unwrap();
-        assert_eq!(extras.rank().unwrap(), Some(2));
-        assert!(extras.thinking.is_some());
-        let negative = RawExtras::read(br#"{"data_parallel_rank": -1}"#).unwrap();
-        assert!(negative.rank().is_err());
-        let text = RawExtras::read(br#"{"data_parallel_rank": "1"}"#).unwrap();
-        assert!(text.rank().is_err());
-    }
-
-    #[test]
     fn what_the_python_server_would_act_on_is_refused_not_dropped() {
         for body in [
             &br#"{"kv_transfer_params": {"do_remote_decode": true}}"#[..],

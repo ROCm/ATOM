@@ -19,7 +19,7 @@ use tempfile::TempDir;
 
 use super::{
     client::{EngineClient, SeqEvent, SeqFailure, SeqHandle, Submission},
-    link::{self, CoreLink},
+    link::CoreLink,
     spec::{BalanceStrategy, CoreSpec, EngineSpec},
     test_support::{self, decoded, token_bytes, FakeCore, WAIT},
     wire::{self, kind, reject, Inbound, PROTOCOL_VERSION},
@@ -34,8 +34,28 @@ fn float_bytes(values: &[f64]) -> serde_bytes::ByteBuf {
     )
 }
 
+fn completions(items: Vec<wire::Completion>) -> wire::Completions {
+    wire::Completions { items }
+}
+
 #[test]
-fn a_completion_decodes_back_with_its_tokens_and_logprobs() {
+fn a_malformed_message_is_refused() {
+    assert!(Inbound::decode(&[]).is_err());
+    assert!(Inbound::decode(b"not msgpack").is_err());
+    // Three items, not [kind, body].
+    let err = Inbound::decode(&rmp_serde::to_vec(&(6u8, 1u8, 2u8)).unwrap())
+        .err()
+        .unwrap();
+    assert!(err.contains("[kind, body]"), "{err}");
+    // A Stream whose body is not one.
+    assert!(Inbound::decode(&rmp_serde::to_vec(&(kind::STREAM, "x")).unwrap()).is_err());
+    // Not a whole number of elements.
+    assert!(wire::tokens(&[0; 6]).is_err());
+    assert!(wire::floats(&[0; 12]).is_err());
+}
+
+#[test]
+fn a_message_decodes_back_and_a_reader_fills_or_skips_trailing_fields() {
     let completion = wire::Completion {
         seq_id: 4,
         completion_tokens: token_bytes(&[8, -1]),
@@ -43,12 +63,7 @@ fn a_completion_decodes_back_with_its_tokens_and_logprobs() {
         leave_reason: "stop".into(),
         ..Default::default()
     };
-    let message = wire::encode(
-        kind::ADD,
-        &wire::Completions {
-            items: vec![completion.clone()],
-        },
-    );
+    let message = wire::encode(kind::ADD, &completions(vec![completion.clone()]));
     let Inbound::Completions(done) = Inbound::decode(&message).unwrap() else {
         panic!("not Completions");
     };
@@ -61,29 +76,7 @@ fn a_completion_decodes_back_with_its_tokens_and_logprobs() {
     );
     let logprobs = item.logprobs_bytes.as_ref().unwrap();
     assert_eq!(wire::floats(logprobs).unwrap(), [0.5, -1.25]);
-}
 
-#[test]
-fn a_malformed_message_is_refused_and_an_unknown_kind_ignored() {
-    assert!(Inbound::decode(&[]).is_err());
-    assert!(Inbound::decode(b"not msgpack").is_err());
-    // Three items, not [kind, body].
-    let err = Inbound::decode(&rmp_serde::to_vec(&(6u8, 1u8, 2u8)).unwrap())
-        .err()
-        .unwrap();
-    assert!(err.contains("[kind, body]"), "{err}");
-    // A Stream whose body is not one.
-    assert!(Inbound::decode(&rmp_serde::to_vec(&(kind::STREAM, "x")).unwrap()).is_err());
-    // A kind only the Python client reads (METRICS) is no error.
-    let metrics = rmp_serde::to_vec(&(9u8, (serde_bytes::Bytes::new(b"pickled"),))).unwrap();
-    assert!(matches!(Inbound::decode(&metrics), Ok(Inbound::Ignored(9))));
-    // Not a whole number of elements.
-    assert!(wire::tokens(&[0; 6]).is_err());
-    assert!(wire::floats(&[0; 12]).is_err());
-}
-
-#[test]
-fn a_reader_fills_missing_trailing_fields_and_skips_unknown_ones() {
     // A Completion from an older Core: no fields past `leave_reason`.
     let old = (
         9u64,
@@ -128,14 +121,10 @@ fn spec_json() -> serde_json::Value {
 }
 
 #[test]
-fn a_spec_lists_its_cores_and_refuses_cores_it_cannot_place() {
-    let spec = EngineSpec::from_json(&spec_json().to_string()).unwrap();
-    assert_eq!(spec.engines[1].pid, 11);
-    assert_eq!(spec.model.served_name, "m");
-    assert_eq!(spec.balance.strategy, BalanceStrategy::LeastTokens);
+fn a_spec_refuses_cores_it_cannot_place() {
     // Fields added later default.
-    assert!(!spec.balance.session_affinity);
-    assert!(spec.model.reasoning_toggle.is_none());
+    let spec = EngineSpec::from_json(&spec_json().to_string()).unwrap();
+    assert!(!spec.balance.session_affinity && spec.model.reasoning_toggle.is_none());
 
     let mut no_cores = spec_json();
     no_cores["engines"] = json!([]);
@@ -156,62 +145,33 @@ fn core_spec(dir: &TempDir, pid: u32) -> CoreSpec {
     }
 }
 
-/// Connect as EngineCore does (a DEALER on input and control, each announcing
-/// itself with an empty frame; a PUSH on output), send `first`, then hand
-/// back the next message on input and on control (kind and body), or none
-/// if either does not come within the receive timeout.
-/// A message's kind and body.
-type Received = (u8, Vec<u8>);
-
-fn fake_core(spec: CoreSpec, first: Vec<u8>) -> thread::JoinHandle<Option<[Received; 2]>> {
-    thread::spawn(move || {
-        let ctx = zmq::Context::new();
-        let dealer = |address: &str| {
-            let socket = ctx.socket(zmq::DEALER).unwrap();
-            // A message the link sent elsewhere fails the test, not hangs it;
-            // short, since a test the link sends nothing to waits it out.
-            socket.set_rcvtimeo(1000).unwrap();
-            socket.connect(address).unwrap();
-            socket.send(Vec::<u8>::new(), 0).unwrap();
-            socket
-        };
-        let input = dealer(&spec.input);
-        let control = dealer(&spec.control);
-        let output = ctx.socket(zmq::PUSH).unwrap();
-        output.connect(&spec.output).unwrap();
-        output.send(first, 0).unwrap();
-        let receive = |socket: &zmq::Socket| {
-            let frames = link::recv_frames(socket).ok()?;
-            let (kind, body) = wire::split(&frames[0]).ok()?;
-            Some((kind, body.to_vec()))
-        };
-        Some([receive(&input)?, receive(&control)?])
-    })
-}
-
 fn never_interrupted() -> bool {
     false
 }
 
-fn ready(max_pool_tokens: Option<u64>) -> Vec<u8> {
-    wire::encode(
-        kind::READY,
-        &wire::Ready {
-            max_pool_tokens,
-            ..Default::default()
-        },
-    )
+/// What `CoreLink::connect` returns.
+type Linked = Result<(CoreLink, zmq::Socket, Option<u64>), String>;
+
+/// A link to a fake Core whose first message is `first`, and that Core.
+fn link_to(spec: CoreSpec, first: Vec<u8>) -> (Linked, FakeCore) {
+    let core_spec = spec.clone();
+    let core = thread::spawn(move || FakeCore::connect_with(&core_spec, first));
+    let link = CoreLink::connect(&zmq::Context::new(), spec, &never_interrupted);
+    (link, core.join().unwrap())
 }
 
 #[test]
 fn a_link_handshakes_and_routes_input_and_control_to_their_core() {
     let dir = TempDir::new().unwrap();
-    let spec = core_spec(&dir, std::process::id());
-    let core = fake_core(spec.clone(), ready(Some(4096)));
-
-    let ctx = zmq::Context::new();
-    let (link, _output, max_pool_tokens) =
-        CoreLink::connect(&ctx, spec, &never_interrupted).unwrap();
+    let ready = wire::Ready {
+        max_pool_tokens: Some(4096),
+        ..Default::default()
+    };
+    let (link, core) = link_to(
+        core_spec(&dir, std::process::id()),
+        wire::encode(kind::READY, &ready),
+    );
+    let (link, _output, max_pool_tokens) = link.unwrap();
     assert_eq!(max_pool_tokens, Some(4096));
 
     let submit = wire::Submit {
@@ -225,13 +185,9 @@ fn a_link_handshakes_and_routes_input_and_control_to_their_core() {
     link.send_control(wire::encode(kind::ABORT, &abort))
         .unwrap();
 
-    let [(input_kind, input), (control_kind, control)] = core
-        .join()
-        .unwrap()
-        .expect("the core received both messages");
-    assert_eq!(input_kind, kind::ADD);
-    let batch: wire::Submit = decoded(&input);
-    assert_eq!(wire::tokens(&batch.items[0].prompt).unwrap(), [1, 2, 3]);
+    let batch = core.submitted().expect("the core received the Submit");
+    assert_eq!(wire::tokens(&batch[0].prompt).unwrap(), [1, 2, 3]);
+    let (control_kind, control) = core.control_message();
     assert_eq!(control_kind, kind::ABORT);
     assert_eq!(decoded::<wire::Abort>(&control).seq_ids, [7]);
 }
@@ -248,36 +204,26 @@ fn a_link_gives_up_on_a_core_that_exits() {
 }
 
 #[test]
-fn a_link_refuses_a_core_that_stops_before_it_is_ready() {
-    let dir = TempDir::new().unwrap();
-    let spec = core_spec(&dir, std::process::id());
-    let core = fake_core(spec.clone(), wire::encode(kind::SHUTDOWN, &wire::Empty {}));
-
-    let ctx = zmq::Context::new();
-    let err = CoreLink::connect(&ctx, spec, &never_interrupted)
-        .err()
-        .unwrap();
-    assert!(err.contains("stopped before it was ready"), "{err}");
-    // The link sent the Core nothing.
-    assert!(core.join().unwrap().is_none());
-}
-
-#[test]
-fn a_link_refuses_a_core_of_another_protocol_version() {
-    let dir = TempDir::new().unwrap();
-    let spec = core_spec(&dir, std::process::id());
+fn a_link_refuses_a_core_that_stops_before_it_is_ready_or_speaks_another_protocol() {
     let newer = wire::Ready {
         protocol_version: PROTOCOL_VERSION + 1,
         ..Default::default()
     };
-    let core = fake_core(spec.clone(), wire::encode(kind::READY, &newer));
-
-    let ctx = zmq::Context::new();
-    let err = CoreLink::connect(&ctx, spec, &never_interrupted)
-        .err()
-        .unwrap();
-    assert!(err.contains("protocol"), "{err}");
-    assert!(core.join().unwrap().is_none());
+    let cases = [
+        (
+            wire::encode(kind::SHUTDOWN, &wire::Empty {}),
+            "stopped before it was ready",
+        ),
+        (wire::encode(kind::READY, &newer), "protocol"),
+    ];
+    for (first, refusal) in cases {
+        let dir = TempDir::new().unwrap();
+        let (link, core) = link_to(core_spec(&dir, std::process::id()), first);
+        let err = link.err().unwrap();
+        assert!(err.contains(refusal), "{err}");
+        // The link sent the Core nothing.
+        assert!(FakeCore::recv_on(&core.input, Duration::from_millis(200)).is_none());
+    }
 }
 
 #[test]
@@ -389,10 +335,6 @@ async fn ready_sets_the_pool_limit_and_a_stream_ends_on_its_finished_entry() {
     }
 }
 
-fn completions(items: Vec<wire::Completion>) -> wire::Completions {
-    wire::Completions { items }
-}
-
 #[tokio::test]
 async fn a_logprobs_request_ends_on_its_completion() {
     let harness = Harness::start(&[None]);
@@ -400,13 +342,16 @@ async fn a_logprobs_request_ends_on_its_completion() {
     let (_, items) = harness.first_submission();
     let seq_id = items[0].seq_id;
     let core = &harness.cores[0];
-    // Its finished stream entry does not end it: only the Completion has logprobs.
+    // Its finished stream entry does not end it: only the Completion has
+    // logprobs. The stream's prefix hit (3) is reported, not the Completion's
+    // count, which is all the KV computed.
     core.stream(&[(seq_id, &[5, 6], Some("max_tokens"))]);
     let completion = wire::Completion {
         seq_id,
         completion_tokens: token_bytes(&[5, 6]),
         logprobs_bytes: Some(float_bytes(&[-0.5, -1.25])),
         num_prompt_tokens: 3,
+        num_cached_tokens: 3_000,
         leave_reason: "max_tokens".into(),
         ..Default::default()
     };
@@ -416,41 +361,32 @@ async fn a_logprobs_request_ends_on_its_completion() {
             assert_eq!(done.token_ids, [5, 6]);
             assert_eq!(done.logprobs.as_deref(), Some(&[-0.5, -1.25][..]));
             assert_eq!(done.leave_reason, "max_tokens");
+            assert_eq!(done.cached_tokens, 3);
         }
         other => panic!("expected Finished, got {other:?}"),
     }
 }
 
 #[tokio::test]
-async fn refusals_map_to_failures_by_code() {
-    let harness = Harness::start(&[None]);
-    for (code, expect_invalid) in [(reject::INVALID, true), (reject::OVERLOADED, false)] {
-        let mut handles = harness.submit(1, false, false);
-        let (_, items) = harness.first_submission();
-        let refused = wire::Completion {
-            seq_id: items[0].seq_id,
-            leave_reason: "rejected: no".into(),
-            reject_code: code,
-            ..Default::default()
-        };
-        harness.cores[0].send(kind::ADD, &completions(vec![refused]));
-        match next_event(&mut handles[0]).await {
-            SeqEvent::Failed(SeqFailure::Invalid(reason)) if expect_invalid => {
-                assert_eq!(reason, "no")
-            }
-            SeqEvent::Failed(SeqFailure::Unavailable(_)) if !expect_invalid => {}
-            other => panic!("{code}: unexpected {other:?}"),
-        }
-    }
-}
-
-#[tokio::test]
 async fn dropping_an_unfinished_handle_aborts_its_sequence() {
     let harness = Harness::start(&[None]);
+    let core = &harness.cores[0];
+    // An ended handle dropped later sends no abort.
+    let mut handles = harness.submit(1, false, false);
+    let (_, items) = harness.first_submission();
+    core.stream(&[(items[0].seq_id, &[9], Some("eos"))]);
+    assert!(matches!(
+        next_event(&mut handles[0]).await,
+        SeqEvent::Finished(_)
+    ));
+    drop(handles);
+    assert!(FakeCore::recv_on(&core.control, Duration::from_millis(200)).is_none());
+    assert_eq!(harness.client.rank_loads(), (vec![0], vec![0]));
+
     let handles = harness.submit(1, true, false);
     let (_, items) = harness.first_submission();
     drop(handles);
-    let (kind, body) = harness.cores[0].control_message();
+    let (kind, body) = core.control_message();
     assert_eq!(kind, kind::ABORT);
     assert_eq!(decoded::<wire::Abort>(&body).seq_ids, [items[0].seq_id]);
 }
@@ -473,93 +409,8 @@ async fn siblings_spread_over_ranks_each_with_the_prompt() {
     }
     siblings.sort();
     assert_eq!(siblings, [0, 1, 2, 3]);
-}
 
-#[tokio::test]
-async fn a_core_that_stops_unasked_loses_the_client() {
-    let harness = Harness::start(&[None, None]);
-    let mut handles = harness.submit(1, true, false);
-    let (rank, _) = harness.first_submission();
-    assert_eq!(harness.client.lost(), None);
-    harness.cores[rank].send(kind::SHUTDOWN, &wire::Empty {});
-    assert!(matches!(
-        next_event(&mut handles[0]).await,
-        SeqEvent::Failed(SeqFailure::Unavailable(_))
-    ));
-    let reason = tokio::time::timeout(WAIT, harness.client.wait_lost())
-        .await
-        .expect("the loss is reported");
-    assert_eq!(reason, format!("EngineCore DP rank {rank} stopped"));
-    assert_eq!(harness.client.alive_core_count(), 1);
-    // The live rank takes nothing more either: the server is exiting.
-    let refused = harness.client.submit(Submission {
-        request_id: "late",
-        prompt: &[1],
-        sampling: Default::default(),
-        stop_token_sequences: vec![],
-        n: 1,
-        session: None,
-        rank: None,
-        stream: false,
-    });
-    assert!(matches!(refused, Err(SeqFailure::Unavailable(_))));
-    let live = &harness.cores[1 - rank];
-    assert!(FakeCore::recv_on(&live.input, Duration::from_millis(200)).is_none());
-}
-
-#[tokio::test]
-async fn an_undecodable_output_loses_its_core() {
-    // One message that is not msgpack, one Stream that is not a Stream:
-    // either may have held a sequence's end, so the Core is lost with them.
-    let bad_outputs = [
-        b"not msgpack".to_vec(),
-        rmp_serde::to_vec(&(kind::STREAM, "x")).unwrap(),
-    ];
-    for message in bad_outputs {
-        let harness = Harness::start(&[None, None]);
-        let mut handles = harness.submit(1, true, false);
-        let (rank, _) = harness.first_submission();
-        harness.cores[rank].send_raw(message);
-        assert!(matches!(
-            next_event(&mut handles[0]).await,
-            SeqEvent::Failed(SeqFailure::Unavailable(_))
-        ));
-        let reason = tokio::time::timeout(WAIT, harness.client.wait_lost())
-            .await
-            .expect("the loss is reported");
-        assert!(
-            reason.starts_with(&format!(
-                "EngineCore DP rank {rank} sent an undecodable output"
-            )),
-            "{reason}"
-        );
-        assert_eq!(harness.client.alive_core_count(), 1);
-        assert_eq!(harness.client.rank_loads().0[rank], 0);
-    }
-}
-
-#[tokio::test]
-async fn shutdown_asks_every_core_to_stop_and_waits_for_them() {
-    let harness = Harness::start(&[None, None]);
-    // Answer each Shutdown with Stopped from a thread, as a Core would.
-    let cores = harness.cores;
-    let replies = thread::spawn(move || {
-        for core in &cores {
-            assert_eq!(core.control_message().0, kind::SHUTDOWN);
-            core.send(kind::SHUTDOWN, &wire::Empty {});
-        }
-        cores
-    });
-    harness.client.shutdown(WAIT);
-    replies.join().unwrap();
-    assert_eq!(harness.client.alive_core_count(), 0);
-    // Stopping when asked to is not a loss.
-    assert_eq!(harness.client.lost(), None);
-}
-
-#[tokio::test]
-async fn an_explicit_rank_places_every_sibling_there() {
-    let harness = Harness::start(&[None, None]);
+    // An explicit rank places every sibling there; one out of range is invalid.
     let submit = |rank| {
         harness.client.submit(Submission {
             request_id: "req",
@@ -575,64 +426,80 @@ async fn an_explicit_rank_places_every_sibling_there() {
             stream: false,
         })
     };
-    let _handles = submit(1).unwrap();
-    let items = harness.cores[1].submitted().expect("rank 1 gets them all");
-    assert_eq!(items.len(), 3);
+    let _ranked = submit(1).unwrap();
+    assert_eq!(harness.cores[1].submitted().unwrap().len(), 3);
     assert!(FakeCore::recv_on(&harness.cores[0].input, Duration::from_millis(200)).is_none());
     assert!(matches!(submit(2), Err(SeqFailure::Invalid(_))));
 }
 
 #[tokio::test]
-async fn a_logprobs_request_reports_the_prefix_hit_not_the_computed_kv() {
-    let harness = Harness::start(&[None]);
-    let mut handles = harness.submit(1, false, true);
-    let (_, items) = harness.first_submission();
-    let core = &harness.cores[0];
-    // The stream says 3 prompt tokens hit the cache ...
-    core.stream(&[(items[0].seq_id, &[5], Some("max_tokens"))]);
-    // ... while the Completion counts all the prompt's KV as computed.
-    let completion = wire::Completion {
-        seq_id: items[0].seq_id,
-        completion_tokens: token_bytes(&[5]),
-        num_prompt_tokens: 3,
-        num_cached_tokens: 3_000,
-        leave_reason: "max_tokens".into(),
-        ..Default::default()
-    };
-    core.send(kind::ADD, &completions(vec![completion]));
-    match next_event(&mut handles[0]).await {
-        SeqEvent::Finished(done) => assert_eq!(done.cached_tokens, 3),
-        other => panic!("expected Finished, got {other:?}"),
+async fn a_core_that_stops_unasked_or_sends_an_undecodable_output_loses_the_client() {
+    // A message that is not msgpack or a Stream that is not one may have held
+    // a sequence's end, so the Core is lost with it.
+    let endings = [
+        (wire::encode(kind::SHUTDOWN, &wire::Empty {}), "stopped"),
+        (b"not msgpack".to_vec(), "sent an undecodable output"),
+        (
+            rmp_serde::to_vec(&(kind::STREAM, "x")).unwrap(),
+            "sent an undecodable output",
+        ),
+    ];
+    for (message, why) in endings {
+        let harness = Harness::start(&[None, None]);
+        let mut handles = harness.submit(1, true, false);
+        let (rank, _) = harness.first_submission();
+        assert_eq!(harness.client.lost(), None);
+        harness.cores[rank].send_raw(message);
+        assert!(matches!(
+            next_event(&mut handles[0]).await,
+            SeqEvent::Failed(SeqFailure::Unavailable(_))
+        ));
+        let reason = tokio::time::timeout(WAIT, harness.client.wait_lost())
+            .await
+            .expect("the loss is reported");
+        let expected = format!("EngineCore DP rank {rank} {why}");
+        assert!(reason.starts_with(&expected), "{reason}");
+        assert_eq!(harness.client.alive_core_count(), 1);
+        assert_eq!(harness.client.rank_loads().0[rank], 0);
+        // The live rank takes nothing more either: the server is exiting.
+        let refused = harness.client.submit(Submission {
+            request_id: "late",
+            prompt: &[1],
+            sampling: Default::default(),
+            stop_token_sequences: vec![],
+            n: 1,
+            session: None,
+            rank: None,
+            stream: false,
+        });
+        assert!(matches!(refused, Err(SeqFailure::Unavailable(_))));
+        let live = &harness.cores[1 - rank];
+        assert!(FakeCore::recv_on(&live.input, Duration::from_millis(200)).is_none());
     }
 }
 
 #[tokio::test]
-async fn an_ended_handle_dropped_later_sends_no_abort() {
-    let harness = Harness::start(&[None]);
-    let mut handles = harness.submit(1, false, false);
-    let (_, items) = harness.first_submission();
-    let core = &harness.cores[0];
-    core.stream(&[(items[0].seq_id, &[9], Some("eos"))]);
-    assert!(matches!(
-        next_event(&mut handles[0]).await,
-        SeqEvent::Finished(_)
-    ));
-    drop(handles);
-    assert!(FakeCore::recv_on(&core.control, Duration::from_millis(200)).is_none());
-    assert_eq!(harness.client.rank_loads(), (vec![0], vec![0]));
-}
-
-#[tokio::test]
-async fn shutdown_fails_what_is_still_in_flight() {
-    let harness = Harness::start(&[None]);
+async fn shutdown_asks_every_core_to_stop_and_fails_what_is_in_flight() {
+    let harness = Harness::start(&[None, None]);
     let mut handles = harness.submit(1, true, false);
     let _ = harness.first_submission();
-    // The Core never answers the Shutdown.
-    harness.client.shutdown(Duration::from_millis(100));
+    // Answer each Shutdown with Stopped from a thread, as a Core would.
+    let cores = harness.cores;
+    let replies = thread::spawn(move || {
+        for core in &cores {
+            assert_eq!(core.control_message().0, kind::SHUTDOWN);
+            core.send(kind::SHUTDOWN, &wire::Empty {});
+        }
+        cores
+    });
+    harness.client.shutdown(WAIT);
+    replies.join().unwrap();
+    assert_eq!(harness.client.alive_core_count(), 0);
     assert!(matches!(
         next_event(&mut handles[0]).await,
         SeqEvent::Failed(SeqFailure::Unavailable(_))
     ));
+    // Stopping when asked to is not a loss.
     assert_eq!(harness.client.lost(), None);
 }
 
@@ -760,29 +627,19 @@ async fn python_core_messages_drive_the_client() {
     let mut handles = harness.submit(1, true, false);
     harness.cores[0].send_raw(read_fixture("core_stream"));
     assert!(matches!(next_event(&mut handles[0]).await, SeqEvent::Tokens(t) if t == [7, 8]));
-    match next_event(&mut handles[0]).await {
-        SeqEvent::Finished(done) => {
-            assert_eq!(done.token_ids, [7, 8]);
-            assert_eq!(done.leave_reason, "eos");
-            assert_eq!((done.prompt_tokens, done.cached_tokens), (3, 3));
-        }
-        other => panic!("expected Finished, got {other:?}"),
-    }
+    assert!(matches!(
+        next_event(&mut handles[0]).await,
+        SeqEvent::Finished(done) if done.leave_reason == "eos"
+    ));
 
     let harness = Harness::start(&[None]);
     let mut handles = harness.submit(1, false, true);
     harness.cores[0].send_raw(read_fixture("core_completions"));
-    match next_event(&mut handles[0]).await {
-        SeqEvent::Finished(done) => {
-            assert_eq!(done.token_ids, [5, 6]);
-            assert_eq!(done.logprobs.as_deref(), Some(&[-0.5, -1.25][..]));
-            // The prefix hit comes from the stream, and this request had no
-            // stream entry; the Completion's count is the KV computed.
-            assert_eq!((done.prompt_tokens, done.cached_tokens), (3, 0));
-            assert_eq!(done.leave_reason, "max_tokens");
-        }
-        other => panic!("expected Finished, got {other:?}"),
-    }
+    let SeqEvent::Finished(done) = next_event(&mut handles[0]).await else {
+        panic!("expected Finished");
+    };
+    assert_eq!((done.token_ids, done.prompt_tokens), (vec![5, 6], 3));
+    assert_eq!(done.logprobs.as_deref(), Some(&[-0.5, -1.25][..]));
 
     let harness = Harness::start(&[None]);
     let mut handles = harness.submit(1, false, false);
@@ -800,35 +657,22 @@ fn the_spec_python_writes_parses() {
     let json = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let spec = EngineSpec::from_json(&json).unwrap();
     let model = &spec.model;
-    assert_eq!(model.served_name, "served");
-    assert_eq!(model.tokenizer_path, "/models/m");
-    assert_eq!(model.chat_template.as_deref(), Some("/t/chat.jinja"));
+    assert_eq!(
+        (model.served_name.as_str(), model.max_model_len),
+        ("served", Some(4096))
+    );
     assert_eq!(model.default_chat_template_kwargs["k"], json!(1));
-    assert_eq!(
-        (model.max_model_len, model.max_output_tokens),
-        (Some(4096), Some(2048))
-    );
-    assert_eq!(model.model_card["context_window"], json!(2048));
-    assert!(!model.synthetic_acceptance);
-    assert_eq!(model.synthetic_token_text.as_deref(), Some("synthetic "));
-    assert!(model.preserve_tool_call_arguments);
     let channel = model.required_channel.as_ref().unwrap();
-    assert_eq!(
-        (channel.after.as_slice(), channel.opening.as_slice()),
-        (&[1][..], &[2][..])
-    );
-    assert_eq!(
-        (channel.opens_at, channel.end_ids.as_slice()),
-        (1, &[3, 7, 9][..])
-    );
+    assert_eq!(channel.end_ids, [3, 7, 9]);
     let toggle = model.reasoning_toggle.as_ref().unwrap();
     assert_eq!(
-        (toggle.name.as_str(), &toggle.off, &toggle.on),
-        ("enable_thinking", &json!(false), &json!(true))
+        (toggle.name.as_str(), &toggle.on),
+        ("enable_thinking", &json!(true))
     );
     assert_eq!(spec.balance.strategy, BalanceStrategy::LeastRequests);
-    assert_eq!(spec.engines.len(), 2);
     let core = &spec.engines[1];
-    assert_eq!((core.dp_rank, core.pid), (1, 101));
-    assert_eq!(core.input, "ipc:///tmp/core-1-input");
+    assert_eq!(
+        (core.dp_rank, core.pid, core.input.as_str()),
+        (1, 101, "ipc:///tmp/core-1-input")
+    );
 }

@@ -25,6 +25,15 @@ pub(crate) struct FakeCore {
 
 impl FakeCore {
     fn connect(core: &CoreSpec, max_pool_tokens: Option<u64>) -> Self {
+        let ready = wire::Ready {
+            max_pool_tokens,
+            ..Default::default()
+        };
+        Self::connect_with(core, wire::encode(kind::READY, &ready))
+    }
+
+    /// Connect, with `first` as the first message on output.
+    pub fn connect_with(core: &CoreSpec, first: Vec<u8>) -> Self {
         let ctx = zmq::Context::new();
         let dealer = |address: &str| {
             let socket = ctx.socket(zmq::DEALER).unwrap();
@@ -44,13 +53,7 @@ impl FakeCore {
             output,
             _ctx: ctx,
         };
-        fake.send(
-            kind::READY,
-            &wire::Ready {
-                max_pool_tokens,
-                ..Default::default()
-            },
-        );
+        fake.send_raw(first);
         fake
     }
 

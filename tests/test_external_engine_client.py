@@ -98,32 +98,23 @@ def test_spawns_the_cores_and_exports_their_endpoints_without_connecting(launche
     assert getattr(mgr, "input_sockets", []) == []
     assert mgr.output_threads == []
     assert mgr.is_healthy()
-    mgr.close()
-
-
-def test_close_reaps_the_cores_it_spawned(launched):
-    mgr = CoreManager(_config(dp=2))
+    # It reaps the Cores it spawned.
     mgr.close()
     assert [(p.alive, p.closed) for p in launched] == [(False, True), (False, True)]
     assert not mgr.is_healthy()
 
 
 @pytest.mark.parametrize(
-    "config",
+    "cls, config",
     [
-        _config(dp=1, pp=2),
-        _config(dp=2, multinode=True),
-        _config(dp=1, multinode_tp=True),
+        (CoreManager, _config(dp=1, pp=2)),
+        (CoreManager, _config(dp=2, multinode=True)),
+        (CoreManager, _config(dp=1, multinode_tp=True)),
+        (DisaggCoreManager, _config(dp=1)),
     ],
-    ids=["pipeline_parallel", "multi_node_dp", "multi_node_tp"],
+    ids=["pipeline_parallel", "multi_node_dp", "multi_node_tp", "rapidserve"],
 )
-def test_unsupported_topologies_are_refused_before_spawning(launched, config):
+def test_unsupported_topologies_are_refused_before_spawning(launched, cls, config):
     with pytest.raises(ValueError, match="external engine client"):
-        CoreManager(config)
-    assert launched == []
-
-
-def test_rapidserve_is_refused(launched):
-    with pytest.raises(ValueError, match="external engine client"):
-        DisaggCoreManager(_config(dp=1))
+        cls(config)
     assert launched == []

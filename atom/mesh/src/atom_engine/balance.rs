@@ -159,6 +159,7 @@ mod tests {
         assert_eq!(b.admit(1, 120, Some("s"), Some(other)), Some(other));
         // Moved: the whole prompt is new prefill debt there.
         assert_eq!(b.charges[&1].tokens, 120);
+        // It sticks there over the idle ranks, charged only its growth.
         assert_eq!(b.admit(2, 130, Some("s"), None), Some(other));
         assert_eq!(b.charges[&2].tokens, 10);
         b.mark_dead(other);
@@ -196,17 +197,6 @@ mod tests {
         assert_eq!((b.reqs[0], b.tokens[0]), (1, 0));
         b.release(7);
         assert_eq!((b.reqs[0], b.tokens[0]), (0, 0));
-    }
-
-    #[test]
-    fn session_sticks_and_is_charged_its_growth() {
-        let mut b = balancer(BalanceStrategy::LeastRequests, 4, true);
-        let owner = b.admit(0, 100, Some("s"), None).unwrap();
-        for seq in 1..4 {
-            b.admit(seq, 0, None, None);
-        }
-        assert_eq!(b.admit(9, 130, Some("s"), None), Some(owner));
-        assert_eq!(b.charges[&9].tokens, 30);
     }
 
     #[test]

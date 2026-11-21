@@ -39,51 +39,23 @@ def test_credit_ack_snapshot_does_not_suppress_finished_backlog(monkeypatch):
 def _input_thread_queue(monkeypatch, *, report_backlog):
     """What the Core's input thread queues for one ADD of a request it admits
     and one it refuses (it does not encode: sent refused), then SHUTDOWN."""
-    from contextlib import nullcontext
-
     from aiter_stub import stubbed_aiter
+    from engine_wire_harness import run_input_thread
 
     with stubbed_aiter():
         from atom.model_engine import engine_core as core
-    from atom.model_engine.admission import AdmissionContext
     from atom.model_engine.sequence import Sequence
     from atom.model_engine.zmq_protocol.codec import encode_input
 
     good = Sequence([1, 3, 4], block_size=4, id=1)
     bad = Sequence([1, 3, 4], block_size=4, id=2, dp_session_id="s\ud800")
-    frames = iter(
-        [
-            encode_input(EngineCoreRequestType.ADD, [good, bad]),
-            encode_input(EngineCoreRequestType.SHUTDOWN),
-        ]
+    messages = [
+        encode_input(EngineCoreRequestType.ADD, [good, bad]),
+        encode_input(EngineCoreRequestType.SHUTDOWN),
+    ]
+    engine = run_input_thread(
+        monkeypatch, core, messages, _report_backlog=report_backlog
     )
-    sock = SimpleNamespace(send=lambda _: None, recv=lambda **_: next(frames))
-    monkeypatch.setattr(core, "make_zmq_socket", lambda *a, **kw: nullcontext(sock))
-    monkeypatch.setattr(
-        core.zmq,
-        "Poller",
-        lambda: SimpleNamespace(
-            register=lambda *a: None, poll=lambda: [(sock, core.zmq.POLLIN)]
-        ),
-    )
-    engine = core.EngineCore.__new__(core.EngineCore)
-    engine._kv_progress_event = core.threading.Event()
-    engine.label = "backlog-test"
-    engine.input_queue = Queue()
-    engine.output_queue = Queue()
-    engine._report_backlog = report_backlog
-    engine._admission = AdmissionContext(
-        SimpleNamespace(
-            kv_cache_block_size=4,
-            speculative_config=None,
-            hf_config=SimpleNamespace(model_type="llama"),
-            end_token_ids=(2,),
-            enable_dp_attention=False,
-            kv_transfer_config=None,
-            enable_rapidserve=False,
-        )
-    )
-    engine.process_input_sockets("input", "control")
     queued = []
     while not engine.input_queue.empty():
         queued.append(engine.input_queue.get_nowait())

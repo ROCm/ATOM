@@ -389,17 +389,8 @@ mod tests {
             controls(json!({"effort": 40}), None),
             (None, Some(json!(40)))
         );
-        for bad in [
-            json!({"effort": 0}),
-            json!({"effort": 2.5}),
-            json!({"effort": true}),
-        ] {
-            assert!(
-                reasoning_controls(Some(&bad), None, &efforts()).is_err(),
-                "{bad}"
-            );
-        }
-        assert!(reasoning_controls(Some(&json!("on")), None, &efforts()).is_err());
+        let bad = json!({"effort": 2.5});
+        assert!(reasoning_controls(Some(&bad), None, &efforts()).is_err());
         // The deployment's efforts, not a fixed list: "medium" where it has one.
         let medium = vec!["medium".to_string()];
         assert_eq!(

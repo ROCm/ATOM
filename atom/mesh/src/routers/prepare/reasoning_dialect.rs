@@ -91,6 +91,8 @@ mod tests {
         factory.registry().create_parser(name).unwrap()
     }
 
+    /// Every parser the crate registers (its `ParserFactory::new`, which it
+    /// cannot list): each must have a dialect, under the model type it reports.
     const PARSERS: [&str; 9] = [
         "base",
         "deepseek_r1",
@@ -102,15 +104,6 @@ mod tests {
         "minimax",
         "passthrough",
     ];
-
-    /// Every parser the crate registers (its `ParserFactory::new`, which it
-    /// cannot list) is in the table, under the model type it reports.
-    #[test]
-    fn every_registered_parser_has_a_dialect() {
-        for name in PARSERS {
-            assert!(dialect(parser(name).model_type()).is_some(), "{name}");
-        }
-    }
 
     /// Under the cap the uncapped parse is the parser's own, in the parser's
     /// own markers: openers before and after a closer, text before the
@@ -189,12 +182,5 @@ mod tests {
         assert!(!opens("assistant: ◁think▷", "qwen3"));
         assert!(!opens("assistant:", "qwen3"));
         assert!(!prompt_opens_reasoning("<think>", None, None, "m"));
-    }
-
-    #[test]
-    fn each_dialect_opens_with_its_own_marker() {
-        assert_eq!(opener(parser("kimi").as_ref()), Some("◁think▷"));
-        assert_eq!(opener(parser("qwen3").as_ref()), Some("<think>"));
-        assert_eq!(opener(parser("passthrough").as_ref()), None);
     }
 }

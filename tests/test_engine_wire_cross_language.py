@@ -14,9 +14,9 @@ rewrite is not a pass).
 
 import os
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
+from engine_wire_harness import core_context
 
 from atom.model_engine import admission
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
@@ -73,66 +73,24 @@ def test_core_messages_match_their_fixtures():
         )
 
 
-def test_the_core_fixtures_say_what_the_client_reads():
-    def read(name):
-        return codec.decode_output((FIXTURES / f"{name}.msgpack").read_bytes())
-
-    assert read("core_ready") == (
-        EngineCoreRequestType.READY,
-        {"max_pool_tokens": 4096},
-    )
-    kind, [(seq_id, output)] = read("core_stream")
-    assert (kind, seq_id, output.output_tokens, output.finish_reason) == (
-        EngineCoreRequestType.STREAM,
-        0,
-        [7, 8],
-        "eos",
-    )
-    kind, [done] = read("core_completions")
-    assert (done.id, done.completion_token_ids, done.logprobs) == (
-        0,
-        [5, 6],
-        [-0.5, -1.25],
-    )
-    assert (done.num_prompt_tokens, done.leave_reason) == (3, "max_tokens")
-    kind, [refused] = read("core_rejected")
-    assert refused.rejected and refused.reject_code == m.REJECT_INVALID
-    assert refused.leave_reason == "rejected: ValueError: bad"
-    assert read("core_stopped") == (EngineCoreRequestType.SHUTDOWN, None)
-    assert read("core_metrics") == (EngineCoreRequestType.METRICS, {"mtp": {1: 2}})
-
-
-def core_context():
-    return admission.AdmissionContext(
-        SimpleNamespace(
-            kv_cache_block_size=16,
-            speculative_config=None,
-            enable_dp_attention=False,
-            hf_config=SimpleNamespace(model_type="llama"),
-            end_token_ids=(9,),
-            kv_transfer_config=None,
-            enable_rapidserve=False,
-        )
-    )
-
-
 def test_the_rust_clients_submit_builds_its_sequences():
     kind, items = codec.decode_input((FIXTURES / "client_submit.msgpack").read_bytes())
     assert kind == EngineCoreRequestType.ADD
     assert [item.sibling_index for item in items] == [0, 1]
-    context = core_context()
+    context = core_context(end_token_ids=(9,))
+    channel = RequiredChannel(after=(1,), opening=(2, 3), opens_at=1, end_ids=(4,))
     for item in items:
         assert item.arrive_time > 0
-        params = codec.sampling_params(item)
-        assert params.temperature == pytest.approx(0.7)
-        assert (params.top_k, params.top_p) == (20, pytest.approx(0.9))
-        assert (params.max_tokens, params.max_tokens_is_default) == (64, False)
-        assert params.stop_strings == ["\n\n"]
-        assert (params.n, params.logprobs, params.top_logprobs) == (2, True, 0)
-        assert params.required_channel == RequiredChannel(
-            after=(1,), opening=(2, 3), opens_at=1, end_ids=(4,)
+        assert codec.sampling_params(item) == SamplingParams(
+            temperature=0.7,
+            top_k=20,
+            top_p=0.9,
+            max_tokens=64,
+            stop_strings=["\n\n"],
+            n=2,
+            logprobs=True,
+            required_channel=channel,
         )
-        assert params.json_schema is None
         seq = admission.build_sequence(item, context)
         assert list(seq.token_ids) == [11, 12, 13]
         assert [list(s) for s in seq.stop_token_sequences] == [[5, 6], [7]]

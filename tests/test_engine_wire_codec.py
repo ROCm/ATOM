@@ -11,6 +11,7 @@ import msgspec
 import numpy as np
 import pytest
 import torch
+from engine_wire_harness import core_context as _core_context
 
 from atom.model_engine import admission
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType as T
@@ -25,17 +26,7 @@ END_IDS = (99,)
 
 
 def core_context(**config):
-    fields = {
-        "kv_cache_block_size": 16,
-        "speculative_config": None,
-        "enable_dp_attention": False,
-        "hf_config": SimpleNamespace(model_type="llama"),
-        "end_token_ids": END_IDS,
-        "kv_transfer_config": None,
-        "enable_rapidserve": False,
-        **config,
-    }
-    return admission.AdmissionContext(SimpleNamespace(**fields))
+    return _core_context(**{"end_token_ids": END_IDS, **config})
 
 
 def submitted(*seqs):
@@ -76,7 +67,9 @@ def assert_same_sequence(sent: Sequence, got: Sequence):
             assert theirs == value, name
 
 
-def test_a_submitted_sequence_is_built_as_the_client_built_it():
+def test_a_submitted_sequence_is_built_as_the_client_built_it(monkeypatch):
+    from atom.model_engine import multimodal_runtime
+
     channel = RequiredChannel((1,), (2, 3), 1, (4,)).ending_on(END_IDS)
     params = SamplingParams(
         temperature=0.7,
@@ -87,12 +80,14 @@ def test_a_submitted_sequence_is_built_as_the_client_built_it():
         required_channel=channel,
     )
     media = {"pixel_values": torch.arange(6.0).reshape(2, 3), "spans": ((0, 2), (3, 4))}
+    transfer = {"remote_block_ids": list(range(8192)), "pair": (1, 2)}
     seq = Sequence(
         [5, 6, 7, 8],
         16,
         params,
         [[9, 10], [11]],
         id=42,
+        kv_transfer_params=transfer,
         multimodal_data=media,
         mrope_positions=np.arange(12).reshape(3, 4),
         mrope_position_delta=-2,
@@ -113,26 +108,24 @@ def test_a_submitted_sequence_is_built_as_the_client_built_it():
     seq._atom_trace_carrier = {"traceparent": "00-ab"}
     seq._atom_trace_model, seq._atom_trace_request_id = "model", "rid"
 
+    def no_rehash(data):
+        raise AssertionError("the client's media seed is taken, not recomputed")
+
+    monkeypatch.setattr(multimodal_runtime, "multimodal_cache_seed", no_rehash)
     core = built(seq)
     assert_same_sequence(seq, core)
     assert core.required_channel == channel
     hash(core.required_channel)  # the scheduler keeps it in a set
-    assert core.multimodal_data.keys() == media.keys()
+    assert core.multimodal_data.keys() == media.keys()  # no seed lent into it
     assert torch.equal(core.multimodal_data["pixel_values"], media["pixel_values"])
     assert core.multimodal_data["spans"] == ((0, 2), (3, 4))
     assert np.array_equal(core.mrope_positions, seq.mrope_positions)
     assert core._atom_trace_carrier == {"traceparent": "00-ab"}
-
-
-def test_kv_transfer_params_arrive_exactly():
-    params = {
-        "remote_block_ids": list(range(8192)),
-        "pair": (1, 2),
-        "do_remote_prefill": True,
-        "prefix_cache_hit_tokens": 0,
-    }
-    seq = Sequence([1, 2, 3], 16, SamplingParams(), id=1, kv_transfer_params=params)
-    assert built(seq).kv_transfer_params == params
+    # A seed the media itself carries is the one a sequence keeps.
+    carried = Sequence(
+        [1, 2, 3], 16, multimodal_data={"pixel_values": torch.zeros(1), "cache_seed": 7}
+    )
+    assert built(carried).cache_seed == 7
 
 
 def test_media_tensors_and_arrays_arrive_exactly_and_writable():
@@ -177,39 +170,30 @@ def test_a_finished_sequence_reads_as_it_did():
         seq.logprobs.append(logprob)
     seq.leave_reason = "stop"
     kind, [done] = codec.decode_output(codec.encode_output(T.ADD, [seq]))
-    assert kind == T.ADD
-    assert (done.id, done.completion_token_ids, done.num_completion_tokens) == (
-        61,
-        [100, 101],
-        2,
-    )
-    assert (done.logprobs, done.return_logprobs) == ([-0.5, -1.0], True)
-    assert (done.num_prompt_tokens, done.arrive_time, done.first_token_time) == (
-        2,
-        123.5,
-        124.0,
-    )
-    assert (done.leave_reason, done.rejected, done.prefill_completed) == (
-        "stop",
-        False,
-        False,
-    )
+    read = (done.id, done.completion_token_ids, done.num_completion_tokens)
+    read += (done.logprobs, done.return_logprobs, done.num_prompt_tokens)
+    read += (done.arrive_time, done.first_token_time, done.leave_reason)
+    assert (kind, *read, done.rejected) == (
+        T.ADD, 61, [100, 101], 2, [-0.5, -1.0], True, 2, 123.5, 124.0, "stop", False
+    )  # fmt: skip
     done.leave_time = 125.0  # the client stamps it
-
-
-def test_a_step_reads_as_it_was_sent():
-    outputs = [
-        (42, RequestOutput(42, [100], False, None, None, 3, [(-0.5, 1, 7, -0.1)])),
-        (43, RequestOutput(43, [5], True, "eos", {"k": (1, 2)}, 0, None)),
-    ]
-    kind, got = codec.decode_output(codec.encode_output(T.STREAM, outputs))
-    assert kind == T.STREAM
-    assert got == outputs
 
 
 @pytest.mark.parametrize(
     "kind,payload",
     [
+        (
+            T.STREAM,
+            [
+                (
+                    42,
+                    RequestOutput(
+                        42, [100], False, None, None, 3, [(-0.5, 1, 7, -0.1)]
+                    ),
+                ),
+                (43, RequestOutput(43, [5], True, "eos", {"k": (1, 2)}, 0, None)),
+            ],
+        ),
         (T.READY, {"max_pool_tokens": 4096}),
         (T.READY, {"weight_syncs_unavailable": {"ipc": "no"}}),
         (T.READY, None),
@@ -237,19 +221,25 @@ def test_the_clients_other_messages_read_as_they_were_sent(kind, payload):
     assert codec.decode_input(codec.encode_input(kind, payload)) == (kind, payload)
 
 
-def test_a_ready_of_another_protocol_version_is_refused():
-    newer = msgspec.msgpack.encode(
-        (m.KIND[T.READY], m.Ready(protocol_version=m.PROTOCOL_VERSION + 1))
-    )
-    with pytest.raises(msgspec.DecodeError, match="protocol"):
-        codec.decode_output(newer)
-
-
-def test_an_unknown_kind_or_a_malformed_message_does_not_decode():
-    with pytest.raises(msgspec.DecodeError):
-        codec.decode_input(msgspec.msgpack.encode((200, [])))
-    with pytest.raises(msgspec.DecodeError):
-        codec.decode_output(b"not msgpack")
+@pytest.mark.parametrize(
+    "decode, message, match",
+    [
+        (
+            codec.decode_output,
+            msgspec.msgpack.encode(
+                (m.KIND[T.READY], m.Ready(protocol_version=m.PROTOCOL_VERSION + 1))
+            ),
+            "protocol",
+        ),
+        (codec.decode_input, msgspec.msgpack.encode((200, [])), "kind"),
+        (codec.decode_output, b"not msgpack", ""),
+    ],
+)
+def test_a_message_of_another_version_kind_or_format_does_not_decode(
+    decode, message, match
+):
+    with pytest.raises(msgspec.DecodeError, match=match):
+        decode(message)
 
 
 def test_a_request_that_does_not_encode_is_refused_alone():
@@ -359,26 +349,6 @@ def test_the_core_runs_the_models_own_validation():
     media = Sequence([1, 2, 3], 16, multimodal_data={"pixel_values": torch.zeros(1)})
     with pytest.raises(ValueError, match="no media"):
         built(media, context)
-
-
-def test_the_core_takes_the_clients_media_seed_and_does_not_rehash(monkeypatch):
-    from atom.model_engine import multimodal_runtime
-
-    media = {"pixel_values": torch.zeros(4)}
-    seq = Sequence([1, 2, 3], 16, SamplingParams(), id=2, multimodal_data=media)
-
-    def no_rehash(data):
-        raise AssertionError("the client's seed is taken, not recomputed")
-
-    monkeypatch.setattr(multimodal_runtime, "multimodal_cache_seed", no_rehash)
-    core = built(seq)
-    assert core.cache_seed == seq.cache_seed
-    assert "cache_seed" not in core.multimodal_data
-    # A seed the media itself carries is the one a sequence keeps.
-    carried = Sequence(
-        [1, 2, 3], 16, multimodal_data={"pixel_values": torch.zeros(1), "cache_seed": 7}
-    )
-    assert built(carried).cache_seed == 7
 
 
 @pytest.mark.parametrize("finished", [False, True])

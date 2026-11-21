@@ -16,7 +16,7 @@ from atom.sampling_params import SamplingParams
 
 
 def request(seq_id, *, bad=False, callback=None):
-    seq = Sequence(
+    return Sequence(
         [1, 2, 3],
         16,
         SamplingParams(),
@@ -25,7 +25,6 @@ def request(seq_id, *, bad=False, callback=None):
         dp_session_id="s\ud800" if bad else None,
         stream_callback=callback,
     )
-    return seq
 
 
 def manager(cls=CoreManager):
@@ -35,7 +34,6 @@ def manager(cls=CoreManager):
     mgr.pp_size = 1
     mgr.global_engine_count = mgr.local_engine_count = 1
     mgr._seq_id_to_callback = {}
-    mgr._structured_ids = set()
     mgr.sent = {}
 
     def send(rank, payload):
@@ -49,18 +47,19 @@ def manager(cls=CoreManager):
     return mgr
 
 
-def test_one_request_that_does_not_encode_goes_refused_and_the_rest_go():
-    mgr = manager()
+@pytest.mark.parametrize(
+    "cls, sent",
+    [
+        (CoreManager, {0: [(1, False), (2, True)]}),
+        # Decode rejects it once; prefill never sees it.
+        (DisaggCoreManager, {1: [(1, False), (2, True)], 0: [(1, False)]}),
+    ],
+)
+def test_one_request_that_does_not_encode_goes_refused_and_the_rest_go(cls, sent):
+    mgr = manager(cls)
     mgr.add_request([request(1), request(2, bad=True)])
     # Its Core rejects it, so it ends like any refused request.
-    assert mgr.sent == {0: [(1, False), (2, True)]}
-
-
-def test_disaggregated_prefill_gets_only_what_decode_was_sent_whole():
-    mgr = manager(DisaggCoreManager)
-    mgr.add_request([request(1), request(2, bad=True)])
-    # Decode rejects it once; prefill never sees it.
-    assert mgr.sent == {1: [(1, False), (2, True)], 0: [(1, False)]}
+    assert mgr.sent == sent
 
 
 @pytest.mark.parametrize("cls", [CoreManager, DisaggCoreManager])

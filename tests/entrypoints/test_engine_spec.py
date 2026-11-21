@@ -3,11 +3,21 @@
 
 """The `EngineSpec` the atomesh Rust runtime starts from, and the launch that
 builds it: what Python works out once so Rust serves requests as the Python
-server does."""
+server does.
+
+`launch_mesh` is a PyO3 function (`atom/mesh/src/python.rs`) that takes only
+keyword arguments; a keyword it does not declare is a TypeError at startup,
+which no Rust test sees, so the fake runners here hold the entrypoint to the
+keywords the Rust signature declares.
+"""
 
 import json
+import os
+import re
+import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 
@@ -28,9 +38,28 @@ MESH_NAMES = {
     "dsml",
     "dsml_v41",
 }
+SPEC_FIXTURE = (
+    Path(__file__).parents[1] / "fixtures" / "atom_engine" / "engine_spec.json"
+)
+_PYTHON_RS = Path(__file__).resolve().parents[2] / "atom/mesh/src/python.rs"
 
 
-def fake_engine(speculative=None):
+def build(monkeypatch, *, speculative=None, endpoints=1):
+    """The spec for a fake engine whose template has a reasoning switch, a
+    required channel and string tool-call arguments."""
+    monkeypatch.setattr(
+        engine_spec,
+        "resolve_reasoning_toggle",
+        lambda tok: ("enable_thinking", False, True),
+    )
+    monkeypatch.setattr(
+        engine_spec,
+        "required_call_channel",
+        lambda cls, tok: RequiredChannel(
+            after=(1,), opening=(2,), opens_at=1, end_ids=(7,)
+        ),
+    )
+    monkeypatch.setattr(engine_spec, "preserve_tool_call_arguments", lambda tok: True)
     config = SimpleNamespace(
         model="/models/m",
         max_model_len=4096,
@@ -39,56 +68,53 @@ def fake_engine(speculative=None):
         dp_load_balance="least_requests",
         speculative_config=speculative,
     )
-    return SimpleNamespace(
-        config=config,
-        core_mgr=SimpleNamespace(engine_endpoints=[{"dp_rank": 0}]),
-    )
-
-
-def build(
-    monkeypatch,
-    *,
-    toggle=None,
-    channel=None,
-    speculative=None,
-    preserve=False,
-    synthetic_text=None,
-):
-    monkeypatch.setattr(engine_spec, "resolve_reasoning_toggle", lambda tok: toggle)
-    monkeypatch.setattr(engine_spec, "required_call_channel", lambda cls, tok: channel)
-    monkeypatch.setattr(
-        engine_spec, "preserve_tool_call_arguments", lambda tok: preserve
+    cores = [
+        {
+            "dp_rank": rank,
+            "pid": 100 + rank,
+            "input": f"ipc:///tmp/core-{rank}-input",
+            "control": f"ipc:///tmp/core-{rank}-control",
+            "output": f"ipc:///tmp/core-{rank}-output",
+        }
+        for rank in range(endpoints)
+    ]
+    engine = SimpleNamespace(
+        config=config, core_mgr=SimpleNamespace(engine_endpoints=cores)
     )
     spec = engine_spec.build_engine_spec(
-        fake_engine(speculative),
+        engine,
         object(),
         "served",
         {"k": 1},
         None,
         "/t/chat.jinja",
-        synthetic_text=synthetic_text,
+        synthetic_text="synthetic ",
     )
-    return json.loads(spec)["model"]
+    return json.loads(spec)
 
 
-def test_the_output_cap_and_card_are_the_deployments(monkeypatch):
-    model = build(monkeypatch)
-    # min(max_model_len, max_position_embeddings), as /v1/models reports it.
-    assert model["max_output_tokens"] == 2048
-    assert model["model_card"]["context_window"] == 2048
-    assert model["served_name"] == "served"
-    assert model["chat_template"] == "/t/chat.jinja"
-    assert model["required_channel"] is None
-    assert model["reasoning_toggle"] is None
-    assert model["synthetic_acceptance"] is False
-    assert model["synthetic_token_text"] is None
-    assert model["preserve_tool_call_arguments"] is False
+def test_the_spec_matches_what_rust_parses(monkeypatch):
+    """The spec as Python writes it, kept for `atom_engine::tests` to parse
+    with `EngineSpec::from_json`; `ATOM_UPDATE_FIXTURES=1` rewrites it. It
+    pins every field the decisions hand over: the output cap and card, the
+    reasoning switch, the required channel ending on the engine's end ids too,
+    the named efforts, preserved arguments and the synthetic text."""
+    text = json.dumps(build(monkeypatch, endpoints=2), indent=2, sort_keys=True)
+    text += "\n"
+    if os.environ.get("ATOM_UPDATE_FIXTURES"):
+        SPEC_FIXTURE.write_text(text)
+        pytest.fail(f"rewrote {SPEC_FIXTURE.name}; rerun without ATOM_UPDATE_FIXTURES")
+    assert SPEC_FIXTURE.read_text() == text, (
+        f"{SPEC_FIXTURE.name} is stale: rerun with ATOM_UPDATE_FIXTURES=1, then "
+        "the mesh tests (cargo test --lib atom_engine) against it"
+    )
 
 
-def test_the_python_servers_text_decisions_are_handed_over(monkeypatch):
-    model = build(monkeypatch, preserve=True, synthetic_text="synthetic ")
-    assert model["preserve_tool_call_arguments"] is True
-    assert model["synthetic_token_text"] == "synthetic "
+def test_only_forced_acceptance_withholds_logprobs(monkeypatch):
+    mtp = SimpleNamespace(num_speculative_tokens=3, synthetic_acceptance_rates=None)
+    assert build(monkeypatch, speculative=mtp)["model"]["synthetic_acceptance"] is False
+    forced = SimpleNamespace(num_speculative_tokens=3, synthetic_acceptance_rates=[0.7])
+    assert build(monkeypatch, speculative=forced)["model"]["synthetic_acceptance"]
 
 
 @pytest.mark.parametrize(
@@ -121,244 +147,152 @@ def test_tool_call_arguments_are_preserved_as_the_python_server_decides(
     assert engine_spec.preserve_tool_call_arguments(object()) is preserve
 
 
-def write_checkpoint(directory, files, model_type="llama"):
-    (directory / "config.json").write_text(json.dumps({"model_type": model_type}))
-    for name in files:
-        (directory / name).write_text("")
-    return str(directory)
-
-
-def test_gpt_oss_is_refused(tmp_path):
-    model = write_checkpoint(tmp_path, ["tokenizer.json"], model_type="gpt_oss")
-    with pytest.raises(ValueError, match="harmony"):
-        engine_spec.check_standalone_checkpoint(model)
-
-
-@pytest.mark.parametrize("tiktoken", ["tiktoken.model", "o200k.tiktoken"])
-def test_a_tiktoken_only_tokenizer_is_refused(tmp_path, tiktoken):
-    model = write_checkpoint(tmp_path, [tiktoken, "tokenizer_config.json"])
-    with pytest.raises(ValueError, match="tiktoken"):
-        engine_spec.check_standalone_checkpoint(model)
-
-
-def test_a_tokenizer_json_beside_tiktoken_is_served(tmp_path):
-    # Mesh loads tokenizer.json first, as a tokenizer that renders templates.
-    engine_spec.check_standalone_checkpoint(
-        write_checkpoint(tmp_path, ["tiktoken.model", "tokenizer.json"])
-    )
-
-
-def test_only_forced_acceptance_withholds_logprobs(monkeypatch):
-    mtp = SimpleNamespace(num_speculative_tokens=3, synthetic_acceptance_rates=None)
-    assert build(monkeypatch, speculative=mtp)["synthetic_acceptance"] is False
-    forced = SimpleNamespace(num_speculative_tokens=3, synthetic_acceptance_rates=[0.7])
-    assert build(monkeypatch, speculative=forced)["synthetic_acceptance"] is True
-
-
-def test_the_named_efforts_are_the_python_servers(monkeypatch):
-    from atom.entrypoints.openai.reasoning import VALID_TEMPLATE_EFFORTS
-
-    efforts = build(monkeypatch)["template_efforts"]
-    assert efforts == sorted(VALID_TEMPLATE_EFFORTS)
-
-
-def test_the_reasoning_switch_is_handed_over(monkeypatch):
-    model = build(monkeypatch, toggle=("thinking_mode", "disabled", "enabled"))
-    assert model["reasoning_toggle"] == {
-        "name": "thinking_mode",
-        "off": "disabled",
-        "on": "enabled",
-    }
-
-
-def test_the_required_channel_also_ends_on_the_engines_end_ids(monkeypatch):
-    channel = RequiredChannel(after=(1,), opening=(2, 5), opens_at=1, end_ids=(7,))
-    model = build(monkeypatch, channel=channel)
-    assert model["required_channel"] == {
-        "after": [1],
-        "opening": [2, 5],
-        "opens_at": 1,
-        "end_ids": [3, 7, 9],
-    }
-
-
-SPEC_FIXTURE = (
-    Path(__file__).parents[1] / "fixtures" / "atom_engine" / "engine_spec.json"
+@pytest.mark.parametrize(
+    "model_type, files, refused",
+    [
+        ("gpt_oss", ["tokenizer.json"], "harmony"),
+        ("llama", ["tiktoken.model", "tokenizer_config.json"], "tiktoken"),
+        ("llama", ["o200k.tiktoken", "tokenizer_config.json"], "tiktoken"),
+        # Mesh loads tokenizer.json first, as a tokenizer that renders templates.
+        ("llama", ["tiktoken.model", "tokenizer.json"], None),
+    ],
 )
+def test_a_checkpoint_mesh_cannot_serve_is_refused(
+    tmp_path, model_type, files, refused
+):
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
+    for name in files:
+        (tmp_path / name).write_text("")
+    if refused is None:
+        engine_spec.check_standalone_checkpoint(str(tmp_path))
+        return
+    with pytest.raises(ValueError, match=refused):
+        engine_spec.check_standalone_checkpoint(str(tmp_path))
 
 
-def test_the_spec_matches_what_rust_parses(monkeypatch):
-    """The spec as Python writes it, kept for `atom_engine::tests` to parse
-    with `EngineSpec::from_json`; `ATOM_UPDATE_FIXTURES=1` rewrites it."""
-    import os
-
-    monkeypatch.setattr(
-        engine_spec,
-        "resolve_reasoning_toggle",
-        lambda tok: ("enable_thinking", False, True),
-    )
-    monkeypatch.setattr(
-        engine_spec,
-        "required_call_channel",
-        lambda cls, tok: RequiredChannel(
-            after=(1,), opening=(2,), opens_at=1, end_ids=(7,)
-        ),
-    )
-    engine = fake_engine()
-    engine.core_mgr.engine_endpoints = [
-        {
-            "dp_rank": rank,
-            "pid": 100 + rank,
-            "input": f"ipc:///tmp/core-{rank}-input",
-            "control": f"ipc:///tmp/core-{rank}-control",
-            "output": f"ipc:///tmp/core-{rank}-output",
-        }
-        for rank in range(2)
-    ]
-    monkeypatch.setattr(engine_spec, "preserve_tool_call_arguments", lambda tok: True)
-    spec = json.loads(
-        engine_spec.build_engine_spec(
-            engine,
-            object(),
-            "served",
-            {"k": 1},
-            None,
-            "/t/chat.jinja",
-            synthetic_text="synthetic ",
-        )
-    )
-    text = json.dumps(spec, indent=2, sort_keys=True) + "\n"
-    if os.environ.get("ATOM_UPDATE_FIXTURES"):
-        SPEC_FIXTURE.write_text(text)
-        pytest.fail(f"rewrote {SPEC_FIXTURE.name}; rerun without ATOM_UPDATE_FIXTURES")
-    assert SPEC_FIXTURE.read_text() == text, (
-        f"{SPEC_FIXTURE.name} is stale: rerun with ATOM_UPDATE_FIXTURES=1, then "
-        "the mesh tests (cargo test --lib atom_engine) against it"
-    )
-
-
-def test_a_dialect_mesh_cannot_split_is_refused(monkeypatch):
-    template = "{{ '<mm:think>' }}...{{ '</mm:think>' }}"
+@pytest.mark.parametrize(
+    "template, implicit, parser",
+    [
+        ("<think>{{ x }}</think>", False, "qwen3"),
+        # A template that closes a block it never opens starts in reasoning.
+        ("<think>{{ x }}</think>", True, "deepseek_r1"),
+        ("{{ '<mm:think>' }}...{{ '</mm:think>' }}", False, None),
+    ],
+)
+def test_a_reasoning_dialect_maps_to_a_mesh_parser_or_is_refused(
+    monkeypatch, template, implicit, parser
+):
+    monkeypatch.setattr(engine_spec, "render_probe_prompt", lambda *a, **k: "")
     monkeypatch.setattr(engine_spec, "chat_template_source", lambda tok: template)
-    monkeypatch.setattr(engine_spec, "render_probe_prompt", lambda *a, **k: "")
-    with pytest.raises(ValueError, match="USE_ATOMESH_ENTRYPOINTS=0"):
-        engine_spec.default_reasoning_parser(object())
-
-
-def test_plain_think_maps_to_mesh_parsers(monkeypatch):
-    monkeypatch.setattr(engine_spec, "render_probe_prompt", lambda *a, **k: "")
     monkeypatch.setattr(
-        engine_spec, "chat_template_source", lambda tok: "<think>{{ x }}</think>"
+        engine_spec, "template_opens_reasoning_implicitly", lambda source: implicit
     )
-    assert engine_spec.default_reasoning_parser(object()) == "qwen3"
-    # A template that closes a block it never opens starts in reasoning.
-    monkeypatch.setattr(
-        engine_spec,
-        "template_opens_reasoning_implicitly",
-        lambda source: True,
-    )
-    assert engine_spec.default_reasoning_parser(object()) == "deepseek_r1"
+    if parser is None:
+        with pytest.raises(ValueError, match="USE_ATOMESH_ENTRYPOINTS=0"):
+            engine_spec.default_reasoning_parser(object())
+        return
+    assert engine_spec.default_reasoning_parser(object()) == parser
 
 
 def test_every_atom_tool_format_has_a_mesh_name():
     assert set(engine_spec.MESH_TOOL_PARSERS) == set(PARSERS_BY_NAME)
 
 
-def tool_format(monkeypatch, requested, resolved=None):
+@pytest.mark.parametrize(
+    "requested, resolved, expected",
+    [
+        ("qwen", None, ("qwen", "qwen_xml")),  # ATOM's qwen is mesh's XML parser
+        ("json", None, (None, "json")),  # a mesh-only name binds mesh alone
+        (None, "glm", ("glm", "glm47_moe")),  # unset: the template's format
+        (None, None, (None, None)),  # no format: mesh guesses by model name
+    ],
+)
+def test_a_tool_call_format_binds_both_halves(
+    monkeypatch, requested, resolved, expected
+):
     monkeypatch.setattr(engine_spec, "render_probe_prompt", lambda *a, **k: "")
     monkeypatch.setattr(
         engine_spec,
         "resolve_tool_call_parser",
-        lambda name, *a, **k: PARSERS_BY_NAME.get(name) or resolved,
+        lambda name, *a, **k: PARSERS_BY_NAME.get(name)
+        or PARSERS_BY_NAME.get(resolved),
     )
-    return engine_spec.tool_call_format(requested, object(), "/m", MESH_NAMES)
-
-
-def test_atoms_qwen_is_meshs_xml_parser(monkeypatch):
-    fmt = tool_format(monkeypatch, "qwen")
-    assert fmt == (PARSERS_BY_NAME["qwen"], "qwen_xml")
-
-
-def test_a_mesh_only_name_binds_mesh_alone(monkeypatch):
-    assert tool_format(monkeypatch, "json") == (None, "json")
-
-
-def test_an_unknown_name_is_refused_before_the_weights_load(monkeypatch):
+    fmt = engine_spec.tool_call_format(requested, object(), "/m", MESH_NAMES)
+    parser, mesh_name = expected
+    assert fmt == (PARSERS_BY_NAME.get(parser), mesh_name)
+    # An unknown name is refused before the weights load.
     with pytest.raises(ValueError, match="unknown"):
-        tool_format(monkeypatch, "qwenn")
-
-
-def test_unset_reads_the_template_and_falls_back_to_mesh(monkeypatch):
-    glm = PARSERS_BY_NAME["glm"]
-    assert tool_format(monkeypatch, None, resolved=glm) == (glm, "glm47_moe")
-    # The template names no format: mesh keeps its guess by model name.
-    assert tool_format(monkeypatch, None) == (None, None)
-
-
-def standalone_args(kv_transfer_config="{}", dp_load_balance="least_requests"):
-    """The EngineArgs fields check_standalone_model reads, as the CLI sets them."""
-    return SimpleNamespace(
-        model="/m",
-        kv_transfer_config=kv_transfer_config,
-        dp_load_balance=dp_load_balance,
-    )
+        engine_spec.tool_call_format("qwenn", object(), "/m", MESH_NAMES)
 
 
 @pytest.mark.parametrize(
-    "transfer",
+    "transfer, dp_load_balance, refused",
     [
-        {"kv_role": "kv_producer"},
-        {"kv_role": "kv_consumer"},
-        {"kv_role": "kv_both"},
+        ({"kv_role": "kv_producer"}, "least_requests", "P/D"),
+        ({"kv_role": "kv_consumer"}, "least_requests", "P/D"),
+        ({"kv_role": "kv_both"}, "least_requests", "P/D"),
         # moriio is the connector a config that names none builds, as a
         # producer when it names no role either.
-        {"kv_connector": "moriio"},
-        {"proxy_ip": "10.0.0.1"},
-        {"kv_connector": "Mooncake", "kv_role": "kv_consumer"},
+        ({"kv_connector": "moriio"}, "least_requests", "P/D"),
+        ({"proxy_ip": "10.0.0.1"}, "least_requests", "P/D"),
+        (
+            {"kv_connector": "Mooncake", "kv_role": "kv_consumer"},
+            "least_requests",
+            "P/D",
+        ),
         # The Agentic-GLM-5.2 recipe's prefill node: the role is the leaf's.
-        {
-            "kv_connector": "multi",
-            "connectors": [
-                {"kv_connector": "mooncake", "kv_role": "kv_producer"},
-                {"kv_connector": "lmcache_offload", "kv_role": "offload"},
-            ],
-        },
+        (
+            {
+                "kv_connector": "multi",
+                "connectors": [
+                    {"kv_connector": "mooncake", "kv_role": "kv_producer"},
+                    {"kv_connector": "lmcache_offload", "kv_role": "offload"},
+                ],
+            },
+            "least_requests",
+            "P/D",
+        ),
+        # A Python-literal config, read as the engine reads it.
+        (
+            "{'kv_connector': 'mooncake', 'kv_role': 'kv_producer'}",
+            "least_requests",
+            "P/D",
+        ),
+        (
+            "{'kv_connector': 'lmcache_offload', 'kv_role': 'kv_both'}",
+            "least_requests",
+            None,
+        ),
+        # An offload tier is no P/D worker, whatever its role.
+        *(
+            (
+                {"kv_connector": "lmcache_offload", "kv_role": role},
+                "least_requests",
+                None,
+            )
+            for role in ("offload", "kv_both", "kv_producer", "kv_consumer")
+        ),
+        ({}, "least_requests", None),
+        ({}, "share_cache", "dp-load-balance"),
+        ({}, "prefix_spread", "dp-load-balance"),
     ],
 )
-def test_a_pd_worker_is_refused(monkeypatch, transfer):
-    monkeypatch.setattr(engine_spec, "load_custom_message_encoder", lambda m: None)
-    with pytest.raises(ValueError, match="P/D"):
-        engine_spec.check_standalone_model(standalone_args(json.dumps(transfer)))
-
-
-def test_a_python_literal_transfer_config_is_read_as_the_engine_reads_it(
-    monkeypatch,
+def test_standalone_refuses_what_rust_cannot_serve(
+    monkeypatch, transfer, dp_load_balance, refused
 ):
     monkeypatch.setattr(engine_spec, "load_custom_message_encoder", lambda m: None)
-    literal = "{'kv_connector': 'mooncake', 'kv_role': 'kv_producer', 'x': True}"
-    with pytest.raises(ValueError, match="P/D"):
-        engine_spec.check_standalone_model(standalone_args(literal))
-    offload = "{'kv_connector': 'lmcache_offload', 'kv_role': 'kv_both'}"
-    engine_spec.check_standalone_model(standalone_args(offload))
-
-
-@pytest.mark.parametrize("strategy", ["share_cache", "prefix_spread"])
-def test_a_dp_placement_rust_does_not_have_is_refused(monkeypatch, strategy):
-    monkeypatch.setattr(engine_spec, "load_custom_message_encoder", lambda m: None)
-    with pytest.raises(ValueError, match="dp-load-balance"):
-        engine_spec.check_standalone_model(standalone_args(dp_load_balance=strategy))
-
-
-@pytest.mark.parametrize("role", ["offload", "kv_both", "kv_producer", "kv_consumer"])
-def test_kv_offload_is_not_a_pd_worker(monkeypatch, role):
-    monkeypatch.setattr(engine_spec, "load_custom_message_encoder", lambda m: None)
-    transfer = {"kv_connector": "lmcache_offload", "kv_role": role}
-    engine_spec.check_standalone_model(standalone_args(json.dumps(transfer)))
-
-
-def test_no_kv_transfer_is_not_a_pd_worker(monkeypatch):
-    monkeypatch.setattr(engine_spec, "load_custom_message_encoder", lambda m: None)
-    engine_spec.check_standalone_model(standalone_args())
+    args = SimpleNamespace(
+        model="/m",
+        kv_transfer_config=(
+            transfer if isinstance(transfer, str) else json.dumps(transfer)
+        ),
+        dp_load_balance=dp_load_balance,
+    )
+    if refused is None:
+        engine_spec.check_standalone_model(args)
+        return
+    with pytest.raises(ValueError, match=refused):
+        engine_spec.check_standalone_model(args)
 
 
 def test_the_template_rust_renders_is_the_one_probed(tmp_path):
@@ -380,78 +314,87 @@ def test_the_template_rust_renders_is_the_one_probed(tmp_path):
     )
 
 
-def test_launch_decides_everything_before_weights_and_reaps_after(monkeypatch):
-    """The refusals run before the Rust runtime is imported, and they and the
-    template, reasoning and tool decisions before the engine (and its weights)
-    load; the Cores are reaped whatever happens."""
+def launch_mesh_keywords() -> set[str]:
+    """The keywords `#[pyo3(signature = (*, ...))]` gives `launch_mesh`."""
+    src = _PYTHON_RS.read_text()
+    match = re.search(
+        r"#\[pyo3\(signature = \(\*, ([^)]*)\)\)\]\s*pub fn launch_mesh\(", src
+    )
+    assert match, "launch_mesh's signature is not where this test reads it"
+    return {param.split("=")[0].strip() for param in match.group(1).split(",")}
+
+
+@pytest.fixture
+def launch(monkeypatch):
+    """`launch_atom_standalone` with each decision stubbed and recorded, in
+    the order it runs, in the list this returns. The runner's `launch_mesh`
+    takes only the keywords the Rust signature declares, then loses a Core."""
     calls = []
-    monkeypatch.setattr(
-        atomesh_server, "check_standalone_model", lambda a: calls.append("check")
-    )
-    monkeypatch.setattr(
-        atomesh_server,
-        "load_tokenizer",
-        lambda a: calls.append("tokenizer") or object(),
-    )
-    monkeypatch.setattr(
-        atomesh_server,
-        "check_standalone_checkpoint",
-        lambda m: calls.append("checkpoint"),
-    )
-    monkeypatch.setattr(
-        atomesh_server, "apply_chat_template", lambda *a: calls.append("template")
-    )
-    monkeypatch.setattr(
-        atomesh_server,
-        "default_reasoning_parser",
-        lambda t: calls.append("reasoning") or "qwen3",
-    )
-    monkeypatch.setattr(
-        atomesh_server,
-        "tool_call_format",
-        lambda *a: calls.append("tools")
-        or engine_spec.ToolCallFormat(None, "qwen_xml"),
-    )
-    engine = SimpleNamespace(close=lambda: calls.append("close"))
 
-    def initialize(args):
-        calls.append("engine")
-        atomesh_server.engine = engine
+    def record(name, result=None):
+        return lambda *a, **k: calls.append(name) or result
 
-    monkeypatch.setattr(atomesh_server, "initialize_engine", initialize)
-    monkeypatch.setattr(atomesh_server, "build_engine_spec", lambda *a, **k: "{}")
+    for name, result in (
+        ("check_standalone_model", None),
+        ("load_tokenizer", object()),
+        ("check_standalone_checkpoint", None),
+        ("apply_chat_template", None),
+        ("default_reasoning_parser", "qwen3"),
+        ("tool_call_format", engine_spec.ToolCallFormat(None, "qwen_xml")),
+        ("build_engine_spec", "spec"),
+    ):
+        monkeypatch.setattr(atomesh_server, name, record(name, result))
     for name in ("tune_gc", "maybe_attach_gc_debug_callback", "freeze_gc_heap"):
         monkeypatch.setattr(atomesh_server, name, lambda *a: None)
+
+    def initialize_engine(args):
+        calls.append("initialize_engine")
+        atomesh_server.engine = SimpleNamespace(close=lambda: calls.append("close"))
+
+    def launch_mesh(**kwargs):
+        unknown = set(kwargs) - launch_mesh_keywords()
+        assert not unknown, f"launch_mesh() takes no {unknown}"
+        calls.append(("launch_mesh", kwargs))
+        raise RuntimeError("core lost")
 
     runner = SimpleNamespace(
         tool_parser_names=lambda: ["qwen_xml"],
         parse_from=lambda args: calls.append(("mesh_args", args))
-        or {"cli_args": {"host": "h", "port": 1}, "server_config": None},
-        launch_mesh=lambda **kw: (_ for _ in ()).throw(RuntimeError("core lost")),
+        or {"cli_args": {"host": "h", "port": 1}, "server_config": "config"},
+        launch_mesh=launch_mesh,
     )
+    monkeypatch.setattr(atomesh_server, "initialize_engine", initialize_engine)
     monkeypatch.setattr(
         atomesh_server,
         "import_atomesh_runner",
-        lambda: calls.append("runtime") or runner,
+        lambda: calls.append("import_atomesh_runner") or runner,
     )
+    return calls
+
+
+def test_launch_decides_everything_before_weights_and_reaps_after(launch):
+    """The refusals run before the Rust runtime is imported, and they and the
+    template, reasoning and tool decisions before the engine (and its weights)
+    load; the spec reaches `launch_mesh`, and the Cores are reaped whatever
+    happens."""
     with pytest.raises(RuntimeError, match="core lost"):
         atomesh_server.launch_atom_standalone(
             ["--model", "/m", "--tool-call-parser", "qwen", "--port", "9"]
         )
-    order = [c for c in calls if isinstance(c, str)]
-    assert order == [
-        "check",
-        "runtime",
-        "tokenizer",
-        "checkpoint",
-        "template",
-        "reasoning",
-        "tools",
-        "engine",
+    assert [c for c in launch if isinstance(c, str)] == [
+        "check_standalone_model",
+        "import_atomesh_runner",
+        "load_tokenizer",
+        "check_standalone_checkpoint",
+        "apply_chat_template",
+        "default_reasoning_parser",
+        "tool_call_format",
+        "initialize_engine",
+        "build_engine_spec",
         "close",
     ]
-    [(_, mesh_args)] = [c for c in calls if isinstance(c, tuple)]
-    assert mesh_args == [
+    calls = dict(c for c in launch if isinstance(c, tuple))
+    assert calls["mesh_args"] == [
         "--port",
         "9",
         "--reasoning-parser",
@@ -459,6 +402,22 @@ def test_launch_decides_everything_before_weights_and_reaps_after(monkeypatch):
         "--tool-call-parser",
         "qwen_xml",
     ]
+    assert calls["launch_mesh"] == {"server_config": "config", "engine_spec": "spec"}
+
+
+def test_a_named_reasoning_parser_is_handed_over_once(launch, monkeypatch):
+    monkeypatch.setattr(
+        atomesh_server,
+        "default_reasoning_parser",
+        lambda t: pytest.fail("the named parser is not read off the template"),
+    )
+    with pytest.raises(RuntimeError, match="core lost"):
+        atomesh_server.launch_atom_standalone(
+            ["--model", "/m", "--reasoning_parser", "step3"]
+        )
+    mesh_args = dict(c for c in launch if isinstance(c, tuple))["mesh_args"]
+    assert mesh_args.count("--reasoning-parser") == 1
+    assert mesh_args[mesh_args.index("--reasoning-parser") + 1] == "step3"
 
 
 def test_the_decided_flags_take_both_spellings_and_need_a_value():
@@ -488,33 +447,52 @@ def test_the_decided_flags_take_both_spellings_and_need_a_value():
             atomesh_server.parse_standalone_args(["--model", "/m", flag])
 
 
-def test_a_named_reasoning_parser_is_handed_over_once(monkeypatch):
-    mesh_args = []
-    monkeypatch.setattr(atomesh_server, "check_standalone_model", lambda a: None)
-    monkeypatch.setattr(atomesh_server, "load_tokenizer", lambda a: object())
-    monkeypatch.setattr(atomesh_server, "check_standalone_checkpoint", lambda m: None)
-    monkeypatch.setattr(atomesh_server, "apply_chat_template", lambda *a: None)
-    monkeypatch.setattr(
-        atomesh_server,
-        "default_reasoning_parser",
-        lambda t: pytest.fail("the named parser is not read off the template"),
+def test_mesh_only_launches_with_keywords_launch_mesh_takes():
+    launched = []
+
+    def launch_mesh(**kwargs):
+        assert set(kwargs) <= launch_mesh_keywords()
+        launched.append(kwargs)
+
+    runner = SimpleNamespace(
+        parse_from=lambda args: {
+            "cli_args": {
+                "host": "127.0.0.1",
+                "port": 8000,
+                "pd_disaggregation": False,
+                "backend": "sglang",
+                "policy": "round_robin",
+            },
+            "server_config": object(),
+            "prefill_urls": [],
+            "decode_urls": [],
+        },
+        launch_mesh=launch_mesh,
     )
-    monkeypatch.setattr(
-        atomesh_server,
-        "tool_call_format",
-        lambda *a: engine_spec.ToolCallFormat(None, None),
-    )
-    monkeypatch.setattr(
-        atomesh_server,
-        "serve_standalone",
-        lambda runner, standalone, tok, args, *rest: mesh_args.extend(args),
-    )
-    monkeypatch.setattr(
-        atomesh_server,
-        "import_atomesh_runner",
-        lambda: SimpleNamespace(tool_parser_names=list),
-    )
-    atomesh_server.launch_atom_standalone(
-        ["--model", "/m", "--reasoning_parser", "step3"]
-    )
-    assert mesh_args == ["--reasoning-parser", "step3"]
+    with (
+        mock.patch.object(sys, "argv", ["atomesh", "mesh-only", "--port", "8000"]),
+        mock.patch.object(atomesh_server, "import_atomesh_runner", return_value=runner),
+    ):
+        atomesh_server.main()
+    assert len(launched) == 1
+
+
+def test_standalone_refuses_before_it_imports_the_rust_runtime():
+    """A model standalone cannot serve is refused even where libmesh is not
+    installed, instead of failing on the import first."""
+    pd = json.dumps({"kv_role": "kv_producer"})
+    with (
+        mock.patch.object(
+            engine_spec, "load_custom_message_encoder", return_value=None
+        ),
+        mock.patch.object(
+            sys, "argv", ["atomesh", "--model", "/m", "--kv-transfer-config", pd]
+        ),
+        mock.patch.object(
+            atomesh_server,
+            "import_atomesh_runner",
+            side_effect=ModuleNotFoundError("atomesh_runner"),
+        ),
+        pytest.raises(ValueError, match="P/D"),
+    ):
+        atomesh_server.main()

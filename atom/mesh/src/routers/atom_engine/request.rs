@@ -280,45 +280,13 @@ mod tests {
     }
 
     fn payload(top_p: f32, top_k: i32) -> GenerationPayload {
-        use crate::routers::prepare::generation_payload::{
-            LogprobConfig, SamplingParams, StopConfig,
+        let request = crate::protocols::chat::ChatCompletionRequest {
+            top_p: Some(top_p),
+            top_k: Some(top_k),
+            ..Default::default()
         };
-        GenerationPayload {
-            request_id: "r".into(),
-            text: String::new(),
-            token_ids: vec![1],
-            sampling: SamplingParams {
-                temperature: 0.5,
-                top_p,
-                top_k,
-                min_p: 0.0,
-                frequency_penalty: 0.0,
-                presence_penalty: 0.0,
-                repetition_penalty: 1.0,
-                max_new_tokens: None,
-                min_new_tokens: 0,
-                n: 1,
-                ignore_eos: false,
-            },
-            stop: StopConfig {
-                stop: None,
-                stop_token_ids: None,
-                skip_special_tokens: true,
-                no_stop_trim: false,
-            },
-            logprob: LogprobConfig {
-                return_logprob: false,
-                top_logprobs_num: 0,
-                logprob_start_len: -1,
-                token_ids_logprob: vec![],
-                input_logprobs: false,
-            },
-            tool_constraints: None,
-            pd_metadata: None,
-            stream: false,
-            return_hidden_states: false,
-            log_metrics: false,
-        }
+        let build = crate::routers::prepare::build_chat_payload;
+        build("r".into(), &request, &request, "", vec![1], None)
     }
 
     #[test]
@@ -354,22 +322,24 @@ mod tests {
     }
 
     #[test]
-    fn an_explicit_max_tokens_is_held_to_the_cap() {
-        let m = model(32768, Some(16384));
-        assert_eq!(max_tokens(&m, Some(16384), 10), Ok(16384));
+    fn max_tokens_is_held_to_the_cap_and_a_default_to_the_context_left() {
+        // (max_model_len, cap, max_tokens, prompt tokens, allowed).
+        let cases = [
+            (32768, Some(16384), Some(16384), 10, Some(16384)),
+            (32768, Some(16384), Some(0), 10, None),
+            (32768, Some(4096), None, 10, Some(4096)),
+            // The default 8192 would overrun the context; it takes what is left.
+            (10000, None, None, 9000, Some(1000)),
+            (10000, None, None, 10000, None),
+        ];
+        for (len, cap, asked, prompt, allowed) in cases {
+            let got = max_tokens(&model(len, cap), asked, prompt);
+            assert_eq!(got.ok(), allowed, "{asked:?} of {len}, cap {cap:?}");
+        }
         assert_eq!(
-            max_tokens(&m, Some(16385), 10),
+            max_tokens(&model(32768, Some(16384)), Some(16385), 10),
             Err("max_tokens must be <= 16384 for this deployment".into())
         );
-        assert!(max_tokens(&m, Some(0), 10).is_err());
-    }
-
-    #[test]
-    fn a_default_max_tokens_shrinks_to_the_cap_and_the_context_left() {
-        assert_eq!(max_tokens(&model(32768, Some(4096)), None, 10), Ok(4096));
-        // 8192 would overrun the context; the default takes what is left.
-        assert_eq!(max_tokens(&model(10000, None), None, 9000), Ok(1000));
-        assert!(max_tokens(&model(10000, None), None, 10000).is_err());
     }
 
     #[test]

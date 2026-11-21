@@ -6,16 +6,14 @@
 import array
 import importlib
 import pickle
-import queue
 import random
 import sys
-import threading
-from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
 from aiter_stub import stubbed_aiter
 from conftest import MockConfig
+from engine_wire_harness import core_context, run_input_thread
 from test_dsv4_state_replay import _bm, _mp_bm, _mp_seq
 from test_state_checkpoint import (
     PAGED_COPY_RUNTIME,
@@ -26,7 +24,6 @@ from test_state_checkpoint import (
     stateful_seq,
 )
 
-from atom.model_engine.admission import AdmissionContext
 from atom.model_engine.block_manager import AdmissionProbe, BlockManager
 from atom.model_engine.prefix_hash import (
     attach_shipped_chains,
@@ -543,27 +540,12 @@ def test_the_chain_rides_beside_the_seqs(monkeypatch, manager):
     else:
         [(rank, frame)] = frames
     core = _real("atom.model_engine.engine_core", monkeypatch)
-    feed = iter([frame, encode_input(core.EngineCoreRequestType.SHUTDOWN)])
-    sock = SimpleNamespace(send=lambda _: None, recv=lambda **_: next(feed))
-    monkeypatch.setattr(core, "make_zmq_socket", lambda *a, **kw: nullcontext(sock))
-    poller = SimpleNamespace(register=lambda *a: None, poll=lambda: [(sock, 1)])
-    monkeypatch.setattr(core.zmq, "Poller", lambda: poller)
-    engine = object.__new__(core.EngineCore)
-    engine._kv_progress_event = threading.Event()
-    engine.label, engine.input_queue = "test", queue.Queue()
-    engine.output_queue = queue.Queue()
-    engine._admission = AdmissionContext(
-        SimpleNamespace(
-            kv_cache_block_size=BLOCK,
-            speculative_config=None,
-            hf_config=SimpleNamespace(model_type="qwen3_5_moe_text"),
-            end_token_ids=(2,),
-            enable_dp_attention=False,
-            kv_transfer_config=None,
-            enable_rapidserve=False,
-        )
+    context = core_context(
+        kv_cache_block_size=BLOCK,
+        hf_config=SimpleNamespace(model_type="qwen3_5_moe_text"),
     )
-    engine.process_input_sockets("input", "control")
+    shutdown = encode_input(core.EngineCoreRequestType.SHUTDOWN)
+    engine = run_input_thread(monkeypatch, core, [frame, shutdown], context=context)
     want = reference_chain(tokens, BLOCK, -1, 10)
     got = engine.input_queue.get_nowait()
     assert [s.prompt_hash_chain.hashes.tolist() for s in got] == [want] * 3

@@ -261,7 +261,6 @@ def _core_manager(prepare=None):
     mgr.structured_request_prepare = prepare
     mgr.broadcast_utility_command = mock.Mock()
     mgr._seq_id_to_callback = {}
-    mgr._structured_ids = set()
     return mgr
 
 

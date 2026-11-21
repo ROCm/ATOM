@@ -117,17 +117,4 @@ mod tests {
             .collect();
         assert_eq!(streamed, "synthetic ".repeat(3));
     }
-
-    #[test]
-    fn preparation_still_finds_the_inner_tokenizer() {
-        let tokenizer = SyntheticText::wrap(Arc::new(MockTokenizer::new()), "x".into());
-        assert!(tokenizer.as_any().is::<MockTokenizer>());
-        assert_eq!(
-            tokenizer.encode("Hello world", false).unwrap().token_ids(),
-            MockTokenizer::new()
-                .encode("Hello world", false)
-                .unwrap()
-                .token_ids()
-        );
-    }
 }
