@@ -58,6 +58,13 @@ def test_hash_changes_with_kv_cache_dtype():
     assert _hash(kv_cache_dtype="bf16") != _hash()
 
 
+def test_hash_changes_with_minimax_m3_swiglu_mxfp8(monkeypatch):
+    monkeypatch.setenv("ATOM_MINIMAX_M3_SWIGLU_MXFP8", "0")
+    disabled = _hash()
+    monkeypatch.setenv("ATOM_MINIMAX_M3_SWIGLU_MXFP8", "1")
+    assert _hash() != disabled
+
+
 def test_hash_ignores_settings_that_stay_out_of_the_graph():
     # These size attention-metadata workspaces, KV pages or the KV pool, all
     # outside the traced graph; changing them must keep the cached artifact.
