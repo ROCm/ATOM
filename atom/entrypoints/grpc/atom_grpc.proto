@@ -1,0 +1,150 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+
+// After editing, rewrite the Python modules: python -m atom.entrypoints.grpc.generate
+
+syntax = "proto3";
+
+package atom.grpc.v1;
+
+import "atom/model_engine/zmq_protocol/engine_v1.proto";
+
+// ATOM's own gRPC service, beside its HTTP server: token ids in, token ids out.
+service AtomEngine {
+  // Streaming: one chunk per engine step, then a complete. Not streaming: one
+  // complete. An error, when there is one, is the last message.
+  rpc Generate(GenerateRequest) returns (stream GenerateResponse);
+  // An unknown or finished request_id is not an error.
+  rpc Abort(AbortRequest) returns (AbortResponse);
+  rpc GetModelInfo(GetModelInfoRequest) returns (GetModelInfoResponse);
+  rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+  // Many requests on one stream: each Frames is one engine_v1 message.
+  rpc Session(stream Frames) returns (stream Frames);
+  // The structured-output fields of a chat sent over the Session, derived as the
+  // HTTP chat route derives them; the request's SamplingParams takes them.
+  rpc PrepareStructuredOutput(PrepareStructuredOutputRequest)
+      returns (PrepareStructuredOutputResponse);
+}
+
+// The version GetServerInfo reports; a client refuses a server with another.
+// A change an older peer could misread bumps CURRENT.
+enum ProtocolVersion {
+  PROTOCOL_VERSION_UNSPECIFIED = 0;
+  PROTOCOL_VERSION_CURRENT = 1;
+}
+
+message GenerateRequest {
+  string request_id = 1;
+  repeated uint32 prompt_token_ids = 2;
+  // Read as the HTTP routes read a request: an absent max_tokens takes their
+  // default, not SamplingParams'.
+  atom.engine.v1.SamplingParams sampling = 3;
+  repeated atom.engine.v1.TokenIds stop_token_sequences = 4;  // the stop strings, tokenized
+  optional string kv_transfer_params_json = 5;  // the HTTP routes' kv_transfer_params
+  optional int32 data_parallel_rank = 6;
+  bool stream = 7;
+  StructuredOutput structured_output = 8;  // absent: no chat-level input, as on /v1/completions
+}
+
+// What ATOM's HTTP chat route derives a chat request's structured output from,
+// for a prompt the client rendered.
+message StructuredOutput {
+  optional string tools_json = 1;  // the top-level tools
+  optional string tool_choice_json = 2;  // a JSON string or object
+  optional string response_format_json = 3;
+  string chat_template_kwargs_json = 4;  // the merged kwargs the prompt was rendered with
+  bool prompt_opens_reasoning = 5;  // the prompt ends in one of reasoning_open_markers
+  // One item per chat message: the tools it declares (Kimi-K3's dynamic tools),
+  // or null. Absent when no message declares any.
+  optional string message_tools_json = 6;
+}
+
+message GenerateResponse {
+  oneof response {
+    GenerateStreamChunk chunk = 1;
+    GenerateComplete complete = 2;
+    GenerateError error = 3;
+  }
+}
+
+message GenerateStreamChunk {
+  repeated uint32 token_ids = 1;  // this engine step's ids, every id of an MTP step
+  uint32 prompt_tokens = 2;
+  uint32 completion_tokens = 3;  // so far, this step's included
+  uint32 cached_tokens = 4;  // the prefix-cache hit, as the HTTP usage reports it
+}
+
+message GenerateComplete {
+  repeated uint32 output_ids = 1;  // every output id, on a non-streaming call only
+  // The engine's own reason, such as stop_<token id>; the HTTP routes map it
+  // with atom.entrypoints.openai.protocol.openai_stop_reason.
+  string finish_reason = 2;
+  uint32 prompt_tokens = 3;
+  uint32 completion_tokens = 4;
+  uint32 cached_tokens = 5;
+  optional string kv_transfer_params_json = 6;  // the engine's output kv_transfer_params
+}
+
+message GenerateError {
+  string message = 1;
+  uint32 http_status = 2;  // the status the HTTP routes answer the same request with
+}
+
+message AbortRequest {
+  string request_id = 1;
+}
+
+message AbortResponse {}
+
+message GetModelInfoRequest {}
+
+message GetModelInfoResponse {
+  string model_path = 1;
+  string tokenizer_path = 2;
+  string served_model_name = 3;
+  uint32 max_context_length = 4;
+  repeated uint32 eos_token_ids = 5;
+  optional string chat_template = 6;  // as --chat-template left it; absent: none
+  string default_chat_template_kwargs_json = 7;  // --default-chat-template-kwargs, a JSON object
+  // A rendered prompt ending in one of these, trailing whitespace aside, opens
+  // a reasoning channel.
+  repeated string reasoning_open_markers = 8;
+}
+
+message GetServerInfoRequest {}
+
+message GetServerInfoResponse {
+  uint32 protocol_version = 1;  // ProtocolVersion.PROTOCOL_VERSION_CURRENT
+  string kv_transfer_info_json = 2;  // the body of /kv_transfer_info
+  string server_info_json = 3;  // the body of /server_info
+}
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  bool healthy = 1;  // false exactly when /health answers 503
+  string message = 2;  // why not, as /health's 503 detail says
+}
+
+// One engine_v1 message: frame 0 its Envelope, then the data frames its
+// BufferRefs point into.
+message Frames {
+  repeated bytes frames = 1;
+}
+
+// The chat's StructuredOutput and the request fields the chat route also reads,
+// each as GenerateRequest's field of the same name carries it.
+message PrepareStructuredOutputRequest {
+  StructuredOutput structured_output = 1;
+  atom.engine.v1.SamplingParams sampling = 2;
+  repeated atom.engine.v1.TokenIds stop_token_sequences = 3;
+  optional string kv_transfer_params_json = 4;
+}
+
+message PrepareStructuredOutputResponse {
+  oneof response {
+    atom.engine.v1.SamplingParams sampling = 1;  // only the fields the chat route derives
+    GenerateError error = 2;
+  }
+}

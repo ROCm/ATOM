@@ -10,7 +10,7 @@ readme = "README.md"
 description = "a lightweight vLLM implementation built from scratch"
 requires-python = ">=3.10"
 dynamic = ["version"]
-dependencies = ["pybind11", "transformers==5.16.1", "zmq", "msgspec", "xxhash", "fastapi>=0.115,<0.137", "psutil", "prometheus_client>=0.25,<0.26", "protobuf", "uvicorn", "uvloop", "aiohttp", "datasets", "einops>=0.7", "openpyxl", "tqdm", "setproctitle", "jsonschema>=4.25,<5"]
+dependencies = ["pybind11", "transformers==5.16.1", "zmq", "msgspec", "xxhash", "fastapi>=0.115,<0.137", "psutil", "prometheus_client>=0.25,<0.26", "grpcio>=1.78.0", "protobuf>=6.31.1,<7", "uvicorn", "uvloop", "aiohttp", "datasets", "einops>=0.7", "openpyxl", "tqdm", "setproctitle", "jsonschema>=4.25,<5"]
 
 [project.optional-dependencies]
 structured-output = ["llguidance==1.9.1", "google-re2>=1.1"]
@@ -92,6 +92,11 @@ atom_sglang = "atom.plugin.sglang.register:register_plugin"
 ".claude/skills/review-pr/lost_review_test.py" = ["ALL"]
 ".claude/skills/review-pr/check_prompts.py" = ["ALL"]
 ".claude/skills/review-pr/scan_index_width.py" = ["ALL"]
+# protoc's modules, committed exactly as atom/entrypoints/grpc/generate.py
+# writes them: no lint fix may rewrite them.
+"atom/entrypoints/grpc/atom_grpc_pb2.py" = ["ALL"]
+"atom/entrypoints/grpc/atom_grpc_pb2_grpc.py" = ["ALL"]
+"atom/model_engine/zmq_protocol/engine_v1_pb2.py" = ["ALL"]
 
 [tool.black]
 # The same exemption, for the same reason: the ruff ignores above do not bind
@@ -115,6 +120,9 @@ atom_sglang = "atom.plugin.sglang.register:register_plugin"
 # (its owner-resolution was substantially rewritten for ATOM, not just
 # renamed, so it is linted normally). Drop this once review-pr re-vendors
 # against a newer aiter commit and the delta is re-audited.
+#
+# protoc's modules are excluded as the ruff ignores above say: generate.py
+# writes them, and black would rewrite them.
 force-exclude = '''
 /(
     atom/models/glm52/mono/kernels
@@ -136,4 +144,6 @@ force-exclude = '''
   | check_prompts
   | scan_index_width
 )\.py$
+| atom/entrypoints/grpc/atom_grpc_pb2(_grpc)?\.py$
+| atom/model_engine/zmq_protocol/engine_v1_pb2\.py$
 '''
