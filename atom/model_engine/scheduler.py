@@ -97,6 +97,8 @@ def defers_output(config, family=None) -> bool:
         return False
     if not kv_config_has_producer(getattr(config, "kv_transfer_config", {}) or {}):
         return True
+    if not envs.ATOM_PD_PRODUCER_DEFER_OUTPUT:
+        return False
     if family is None:
         family = attn_family(get_hf_text_config(config.hf_config))
     return not family.has_recurrent_state
