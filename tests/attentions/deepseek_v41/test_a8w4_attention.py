@@ -405,6 +405,7 @@ def test_native_token_graph_replays_different_request_counts(
         softmax_scale=512**-0.5,
         index_stream=None,
         compress_stream=None,
+        _use_fused_attention=lambda *a: False,
         _fork_compress=lambda *a, **k: False,
         project_qkv=lambda q, kv: (q, kv),
         qk_norm=lambda q, kv: (q, None, kv),
