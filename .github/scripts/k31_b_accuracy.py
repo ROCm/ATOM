@@ -436,6 +436,10 @@ def entry(work):
         GPU_PREFLIGHT_KILL_DOCKER="0",
         GPU_PREFLIGHT_KILL_KFD="0",
     )
+    require(
+        shutil.which("lm_eval") == "/opt/venv/bin/lm_eval",
+        "pinned lm_eval executable unavailable; refuse install",
+    )
     verify_admission(Path("/app/atom-3577"))
     shutil.copytree(work / "data/hf", Path(os.environ["HF_HOME"]))
     report = {

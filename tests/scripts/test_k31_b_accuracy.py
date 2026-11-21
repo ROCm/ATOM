@@ -124,6 +124,13 @@ def test_typed_admission_refuses_legacy_before_native_checks(tmp_path):
         ci.verify_admission(tmp_path)
 
 
+def test_missing_client_fails_before_stock_install_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(ci.os, "environ", {"PATH": "empty"})
+    monkeypatch.setattr(ci.shutil, "which", lambda name: None)
+    with pytest.raises(ValueError, match="refuse install"):
+        ci.entry(tmp_path)
+
+
 def test_real_checker_patch_preserves_full_evaluation(tmp_path):
     for name in ("check_results.py", "verify_inputs.py"):
         source = subprocess.check_output(
