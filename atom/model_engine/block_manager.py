@@ -309,6 +309,9 @@ class BlockManager:
         self._shared_prefix_asked: WeakKeyDictionary[Sequence, int] = (
             WeakKeyDictionary()
         )
+        # Whether asking marks what this rank already holds of the prefix as
+        # just used, so the room made for the copy is not taken from it.
+        self._refresh_local_prefix = envs.ATOM_POOL_REFRESH_LOCAL_PREFIX
         # Per-request cache slot pool. Used by attention types with a
         # stateful per-request buffer (GDN recurrent state, V4 compressor
         # state). The backing tensor is pre-allocated by ModelRunner and
@@ -1462,15 +1465,34 @@ class BlockManager:
         local = 0
         while local < n and get(chain[local]) is not None:
             local += 1
+        if local and self._refresh_local_prefix and self.copies_shared_prefixes:
+            # The copy below needs room, and so do the copies of other waiting
+            # requests: what this rank already holds of the prefix is the
+            # oldest copy of it here, so it would be the first to go, and the
+            # walk would then miss at block 0 with the rest just copied in.
+            self._refresh_cached_blocks([get(h) for h in chain[:local]])
         if local == n:
             return
-        tokens_of = lambda i: self._hash_block_tokens(seq, local + i)
+
+        def tokens_of(i: int):
+            return self._hash_block_tokens(seq, local + i)
+
         if self.kv.async_fetch:
             # Copied in the background; the scheduler holds the sequence back
             # while it is in flight (`shared_prefix_pending`).
             self.kv.fetch_async(seq.id, chain[local:], tokens_of)
             return
         self.kv.fetch(chain[local:], tokens_of)
+
+    def _refresh_cached_blocks(self, block_ids: list[int]) -> None:
+        """Tell the pool these cached blocks were just used: a hold and a
+        release each, which makes them its most recently released blocks and,
+        in a pool that keeps the newest copies of shared content, the copy to
+        keep."""
+        self.kv.claim_many(block_ids)
+        free = self.kv.free
+        for block_id in block_ids:
+            free(block_id)
 
     def shared_prefix_pending(self, seq: Sequence) -> bool:
         """Whether `seq` should wait for its prefix to arrive from other pools.

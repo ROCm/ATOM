@@ -674,6 +674,43 @@ class TestThroughBlockManager:
             assert rank1.kv.is_used(block_id)
             assert rank1.kv.block(block_id).hash != -1
 
+    def test_asking_refreshes_what_this_rank_already_holds_of_the_prefix(
+        self, ranks, seq_factory, monkeypatch
+    ):
+        rank0, rank1 = ranks
+        if not rank1.kv.async_fetch:
+            pytest.skip("the pool copies in the foreground")
+        tokens = list(range(20))
+        # Rank 1 served an earlier, shorter turn; rank 0 the latest one.
+        early = seq_factory(tokens[:8])
+        rank1.allocate(early, 0)
+        rank1.hash_blocks(early, 8)
+        head = list(early.block_table[:2])
+        rank1.deallocate(early)
+        latest = seq_factory(tokens)
+        rank0.allocate(latest, 0)
+        rank0.hash_blocks(latest, len(tokens))
+        settle(rank0.kv)
+        settle(rank1.kv)
+
+        refreshed = []
+        claim_many = rank1.kv.claim_many
+        monkeypatch.setattr(
+            rank1.kv,
+            "claim_many",
+            lambda ids: (refreshed.append(list(ids)), claim_many(ids))[1],
+        )
+        nxt = seq_factory(tokens + [100, 101])
+        assert rank1.shared_prefix_pending(nxt)
+
+        # The two blocks already here were marked used before room was made for
+        # the three copied in, and are free again.
+        assert refreshed == [head]
+        assert not any(rank1.kv.is_used(block_id) for block_id in head)
+        land(rank1, nxt)
+        # The walk hits the head and goes on into what was copied behind it.
+        assert rank1.can_allocate(nxt) > len(head)
+
     def test_the_pool_is_asked_once_per_sequence(self, ranks, seq_factory):
         _, rank1 = ranks
         calls = []

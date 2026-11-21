@@ -1479,6 +1479,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_POOL_PROBED_PENDING": lambda: (
         os.getenv("ATOM_POOL_PROBED_PENDING", "0") == "1"
     ),
+    # A pool the DP ranks share: when a waiting request's prefix is asked for
+    # from other ranks, mark what this rank already holds of it as just used.
+    # Under eviction pressure that part is this rank's oldest copy of the
+    # prefix and would be evicted to make room for the rest.
+    "ATOM_POOL_REFRESH_LOCAL_PREFIX": lambda: (
+        os.getenv("ATOM_POOL_REFRESH_LOCAL_PREFIX", "1") == "1"
+    ),
     # Minimum external-tier hit worth loading, in tokens. None when unset: each
     # tier then uses its own default (`KVConnectorFactory.resolve_min_load_tokens`).
     "OFFLOAD_MIN_LOAD_TOKENS": lambda: _non_negative_or_none(
