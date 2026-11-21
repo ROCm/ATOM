@@ -35,6 +35,8 @@ class PrefillHandoff:
     first_token_id: int  # First output token sampled by P.
     draft_token_ids: tuple[int, ...] = ()  # Drafts for D to verify.
     prefix_cache_hit_tokens: int = 0  # P-side prefix hits for metrics.
+    # V: blocks below it may lack draft rows. None: P writes every draft row.
+    draft_rows_from: int | None = None
 
     @classmethod
     def from_wire(cls, req_id, data):
@@ -44,6 +46,7 @@ class PrefillHandoff:
         first = data.get("first_token_id")
         drafts = data.get("draft_token_ids", [])
         cached = data.get("prefix_cache_hit_tokens", 0)
+        draft_rows_from = data.get("draft_rows_from")
         if type(first) is not int or first < 0:
             raise ValueError("invalid prefill first token")
         if not isinstance(drafts, (list, tuple)) or any(
@@ -52,7 +55,11 @@ class PrefillHandoff:
             raise ValueError("invalid prefill draft tokens")
         if type(cached) is not int or cached < 0:
             raise ValueError("invalid prefill cache hit count")
-        return cls(req_id, first, tuple(drafts), cached)
+        if draft_rows_from is not None and (
+            type(draft_rows_from) is not int or draft_rows_from < 0
+        ):
+            raise ValueError("invalid prefill draft rows boundary")
+        return cls(req_id, first, tuple(drafts), cached, draft_rows_from)
 
 
 class ChunkedPrefill:
@@ -90,6 +97,9 @@ class ChunkedPrefill:
         self.num_ready_blocks = 0  # Published prefix blocks; reads must wait on event.
         self.event: Any = None
         self.handoff: dict | None = None
+        # A split producer's V (`PrefillHandoff.draft_rows_from`), sent with the
+        # prefill's first forward.
+        self.draft_rows_from: int | None = None
         self.cancelled = False
         self.expected_readers = 0  # Total consumers served by this P rank.
         self.completed_readers = 0  # Exited send tasks, including failures.
@@ -132,6 +142,23 @@ class ChunkedPrefill:
                 self.handoff = dict(handoff)
                 self.updated = time.monotonic()
             self.cv.notify_all()
+
+    def set_draft_rows_from(self, draft_rows_from):
+        """Publish V; blocks below it may lack draft rows."""
+        with self.cv:
+            self.draft_rows_from = draft_rows_from
+            self.cv.notify_all()
+
+    def wait_draft_rows_from(self):
+        """Wait for V, raising on cancellation or timeout."""
+        with self.cv:
+            ready = self.cv.wait_for(
+                lambda: self.cancelled or self.draft_rows_from is not None,
+                timeout=self.timeout,
+            )
+            if not ready or self.cancelled:
+                raise RuntimeError("prefill draft rows boundary cancelled or timed out")
+            return self.draft_rows_from
 
     def cancel(self):
         """Cancel waits and new claims; in-flight RDMA must still drain."""

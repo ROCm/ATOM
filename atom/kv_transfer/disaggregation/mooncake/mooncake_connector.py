@@ -106,6 +106,7 @@ from atom.kv_transfer.disaggregation.types import (
 )
 from atom.model_engine.sequence import Sequence, SequenceStatus
 from atom.models.utils import get_pp_indices
+from atom.spec_decode.draft_window_geometry import draft_read_window
 from atom.utils import envs, get_open_port, make_zmq_path, zmq_socket_ctx
 from atom.utils.network import get_ip
 
@@ -471,12 +472,28 @@ def _receive_block_offset(
     return cached
 
 
+def _splits_draft_rows(config: Config, is_producer: bool) -> bool:
+    """Whether this producer's blocks may lack draft rows its decode reads."""
+    return bool(
+        is_producer
+        and envs.ATOM_MOONCAKE_STORE_DRAFT_WINDOW
+        and draft_read_window(config) is not None
+    )
+
+
 class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
+    # The block marks a split producer's V comes from (`bind_block_manager`).
+    _block_manager: Any = None
+    # A producer whose draft reads a window, where tier loads may leave draft
+    # rows unwritten (ATOM_MOONCAKE_STORE_DRAFT_WINDOW): it sends V.
+    _draft_rows_split = False
+
     def __init__(self, config: Config) -> None:
         kv_transfer_config = config.kv_transfer_config
         self.is_producer = (
             kv_transfer_config.get("kv_role", "kv_producer") == "kv_producer"
         )
+        self._draft_rows_split = _splits_draft_rows(config, self.is_producer)
         self.handshake_port = get_open_port()
         self.base_handshake_port = kv_transfer_config.get(
             "handshake_port", DEFAULT_HANDSHAKE_PORT
@@ -526,6 +543,43 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
     @property
     def supports_pd_admission(self) -> bool:
         return not self.is_producer
+
+    def bind_block_manager(self, block_manager: Any) -> None:
+        self._block_manager = block_manager
+
+    def _draft_rows_from(self, seq: Sequence) -> int:
+        """A split producer's V: blocks below it may lack draft rows. Without a
+        block manager to read the marks, every block may."""
+        if self._block_manager is None:
+            return len(seq.block_table) * self.hash_block_size
+        return self._block_manager.draft_rows_from(seq)
+
+    def _draft_read_from(self, seq: Sequence) -> int | None:
+        """The lowest draft row any decode of this receive reads; None when the
+        draft reads them all, so no block may arrive without draft rows."""
+        if self._block_manager is None:
+            return None
+        window = self._block_manager.draft_read_window
+        if window is None:
+            return None
+        return window.first_read_token(seq.num_prompt_tokens)
+
+    def note_scheduled_tokens(
+        self, scheduled_seqs: dict[int, Sequence], num_scheduled_tokens: list[int]
+    ) -> None:
+        """Freeze a chunked prefill's V at its first forward, before the workers send
+        a chunk: every tier load (a later hand-off's too) has marked its blocks."""
+        if not self._draft_rows_split:
+            return
+        for seq in scheduled_seqs.values():
+            params = seq.kv_transfer_params or {}
+            if params.get("chunked_transfer") and "draft_rows_from" not in params:
+                params["draft_rows_from"] = self._draft_rows_from(seq)
+                self._reqs_need_save[seq.id] = (
+                    seq,
+                    list(seq.block_table),
+                    seq.state_slot,
+                )
 
     def _receive_prefix(
         self, seq, num_cached_blocks: int, geometry: tuple[int, int] | None
@@ -731,8 +785,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             # prefix cache. Per-request state (including the SWA ring slot) is
             # not covered by a block-only delta, so it takes a full transfer.
             remote_geometry = self._remote_page_geometry(params)
+            local_hit_blocks = seq.num_cached_tokens // self.hash_block_size
             num_computed_blocks, src_block_skip_factor = self._receive_prefix(
-                seq, seq.num_cached_tokens // self.hash_block_size, remote_geometry
+                seq, local_hit_blocks, remote_geometry
             )
             if remote_geometry is None:
                 logger.warning(
@@ -748,6 +803,10 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                 )
             params["num_computed_blocks"] = num_computed_blocks
             params["src_block_skip_factor"] = src_block_skip_factor
+            # A split producer refuses to write its blocks below V over these,
+            # or to a decode reading below V (`_draft_boundary_fence`).
+            params["local_hit_blocks"] = local_hit_blocks
+            params["draft_read_from"] = self._draft_read_from(seq)
             logger.debug(
                 "[SCHEDULER-CONSUMER] Queued req %s for remote KV recv "
                 "(%d blocks, %d locally cached, dst_slot=%d, src_slot=%d), "
@@ -857,6 +916,11 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             "remote_slot_index": final_state_slot,
             "prefix_cache_hit_tokens": getattr(seq, "prefix_cache_hit_tokens", 0),
         }
+        if self._draft_rows_split:
+            # The consumer echoes it back in its write request; the save's own
+            # copy reaches the workers, which check the echo (`_draft_boundary_fence`).
+            params["draft_rows_from"] = self._draft_rows_from(seq)
+            seq.kv_transfer_params_output["draft_rows_from"] = params["draft_rows_from"]
         logger.debug(
             "[PD-STATE-SLOT] producer-finished transfer_id=%s final_src_slot=%d",
             seq.id,
@@ -950,6 +1014,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                         "prefix_cache_hit_tokens": handoff.prefix_cache_hit_tokens,
                     }
                 )
+                if handoff.draft_rows_from is not None:
+                    # Before `finished_recving`, so `register_received_prefix` reads it.
+                    seq.kv_transfer_params["draft_rows_from"] = handoff.draft_rows_from
         output.received_handoffs.clear()
         for req_id in output.failed_recving:
             self._chunked_receiving.pop(req_id, None)
@@ -1060,6 +1127,8 @@ class MooncakeConnector(KVConnectorBase):
     # ``__init__`` aborted before the matched-rail block; both must fall back to
     # the single shared ``transfer_engine`` instead of raising AttributeError.
     _rail_pool: RailEnginePool | None = None
+    # A producer whose blocks below V may lack draft rows (`_splits_draft_rows`).
+    _draft_rows_split = False
 
     def __init__(self, config: Config) -> None:
         self.tp_rank = get_tp_group().rank_in_group
@@ -1091,6 +1160,7 @@ class MooncakeConnector(KVConnectorBase):
             kv_transfer_config.get("kv_role", "kv_producer") == "kv_producer"
         )
         self.is_consumer = not self.is_producer
+        self._draft_rows_split = _splits_draft_rows(config, self.is_producer)
 
         # Networking config
         self.http_port = kv_transfer_config.get("http_port", 8000)
@@ -1944,6 +2014,8 @@ class MooncakeConnector(KVConnectorBase):
                             )
                             self._chunked_prefills[meta.transfer_id] = state
                             self._chunked_local_ids[req_id] = meta.transfer_id
+                        if meta.draft_rows_from is not None:
+                            state.set_draft_rows_from(meta.draft_rows_from)
                         if meta.prefill_aborted:
                             state.cancel()
                         elif meta.prefill_handoff is not None:
@@ -1959,6 +2031,8 @@ class MooncakeConnector(KVConnectorBase):
                         "block_ids": meta.local_block_ids,
                         "swa_block_ids": meta.local_swa_block_ids,
                         "slot_index": meta.local_slot_index,
+                        # A split producer's V, which a consumer's echo must match.
+                        "draft_rows_from": meta.draft_rows_from,
                     }
                     self._completed_prefills_cv.notify_all()
                 logger.debug(
@@ -2059,6 +2133,11 @@ class MooncakeConnector(KVConnectorBase):
                 "consumer_dcp_size": self.dcp_size,
                 "consumer_dcp_rank": self.dcp_rank,
                 "consumer_dcp_interleave": self.dcp_interleave_size,
+                # For a split producer (`_draft_boundary_fence`): the decode's
+                # lowest draft row read, V echoed when not chunked, its cached blocks.
+                "consumer_draft_read_from": meta.draft_read_from,
+                "draft_rows_from": meta.draft_rows_from,
+                "consumer_hit_blocks": meta.local_hit_blocks,
             }
 
             consumer_staging_pool_idx = -1
@@ -2621,6 +2700,18 @@ class MooncakeConnector(KVConnectorBase):
                 has_slot_data,
             )
 
+            if self._draft_rows_split:
+                # This producer's own V, which the PP branch below would not
+                # wait for; a refusal writes nothing and still ends the send.
+                record = self._wait_for_prefill_data(transfer_id) or {}
+                refusal = self._draft_boundary_fence(
+                    request_data, record.get("draft_rows_from")
+                )
+                if refusal is not None:
+                    logger.error("[PRODUCER] req %s refused: %s", req_id, refusal)
+                    self._notify_transfer_result(request_data, success=False)
+                    self._consumer_served(transfer_id, consumers_per_rank)
+                    return
             request_src_block_ids = request_data.get("src_block_ids")
             final_src_slot = -1
             if has_slot_data:
@@ -2783,42 +2874,7 @@ class MooncakeConnector(KVConnectorBase):
 
             # Notify consumer — all data (blocks + slot state) is written.
             self._notify_transfer_result(request_data, success=True)
-
-            # Track refcount for multi-consumer TP fan-out.
-            all_done = False
-            with self._transfer_refcount_lock:
-                if transfer_id not in self._transfer_refcount:
-                    self._transfer_refcount[transfer_id] = consumers_per_rank
-                self._transfer_refcount[transfer_id] -= 1
-                if self._transfer_refcount[transfer_id] <= 0:
-                    self._transfer_refcount.pop(transfer_id)
-                    all_done = True
-
-            if all_done:
-                if self.pp_size > 1:
-                    if self.pp_rank != 0:
-                        # Stage 0 drops its entry on release, which only it
-                        # receives; nothing here reads this one again.
-                        self._drop_completed_prefill(transfer_id)
-                    # PP-prefill: this stage's write is done, but stage-0 must not
-                    # reuse the shared page until ALL stages finish. Freeing is
-                    # deferred to _record_release (driven by consumer releases).
-                    logger.debug(
-                        "[PRODUCER] stage pp_rank=%d served %d consumers for "
-                        "transfer_id=%s; awaiting release",
-                        self.pp_rank,
-                        consumers_per_rank,
-                        transfer_id,
-                    )
-                else:
-                    with self._completion_lock:
-                        self.done_sending.add(transfer_id)
-                    self._drop_completed_prefill(transfer_id)
-                    logger.debug(
-                        "[PRODUCER] All %d consumers served for transfer_id=%s",
-                        consumers_per_rank,
-                        transfer_id,
-                    )
+            self._consumer_served(transfer_id, consumers_per_rank)
         except Exception:
             logger.exception(
                 "[PRODUCER] transfer FAILED for req %s (transfer_id=%s); "
@@ -2832,6 +2888,80 @@ class MooncakeConnector(KVConnectorBase):
                 logger.exception(
                     "[PRODUCER] failed to notify consumer of transfer failure"
                 )
+
+    def _consumer_served(self, transfer_id: TransferId, consumers_per_rank: int):
+        """Count one consumer rank done with the source; free it after the last
+        one (TP-TP), or leave that to the consumers' releases (PP)."""
+        all_done = False
+        with self._transfer_refcount_lock:
+            if transfer_id not in self._transfer_refcount:
+                self._transfer_refcount[transfer_id] = consumers_per_rank
+            self._transfer_refcount[transfer_id] -= 1
+            if self._transfer_refcount[transfer_id] <= 0:
+                self._transfer_refcount.pop(transfer_id)
+                all_done = True
+
+        if all_done:
+            if self.pp_size > 1:
+                if self.pp_rank != 0:
+                    # Stage 0 drops its entry on release, which only it
+                    # receives; nothing here reads this one again.
+                    self._drop_completed_prefill(transfer_id)
+                # PP-prefill: this stage's write is done, but stage-0 must not
+                # reuse the shared page until ALL stages finish. Freeing is
+                # deferred to _record_release (driven by consumer releases).
+                logger.debug(
+                    "[PRODUCER] stage pp_rank=%d served %d consumers for "
+                    "transfer_id=%s; awaiting release",
+                    self.pp_rank,
+                    consumers_per_rank,
+                    transfer_id,
+                )
+            else:
+                with self._completion_lock:
+                    self.done_sending.add(transfer_id)
+                self._drop_completed_prefill(transfer_id)
+                logger.debug(
+                    "[PRODUCER] All %d consumers served for transfer_id=%s",
+                    consumers_per_rank,
+                    transfer_id,
+                )
+
+    def _draft_boundary_fence(self, request_data: dict, boundary: Any) -> str | None:
+        """Why this consumer must not take a split producer's blocks, whose draft
+        rows below V (`boundary`) may be missing; None when it may."""
+        if not self._draft_rows_split:
+            return None
+        if type(boundary) is not int:
+            return "this producer holds no draft rows boundary for the request"
+        if boundary == 0:
+            return None
+        read_from = request_data["consumer_draft_read_from"]
+        if type(read_from) is not int or boundary > read_from:
+            reads = "every row" if read_from is None else f"from token {read_from}"
+            return (
+                f"the consumer's draft reads {reads}, below this producer's "
+                f"draft rows boundary {boundary}"
+            )
+        # Its cached blocks are shared and indexed: other requests read them
+        # before a mark could land.
+        offset = request_data.get("num_computed_blocks", 0)
+        consumer_block = self.block_size * max(
+            1, request_data.get("consumer_dcp_size", 1)
+        )
+        if offset < request_data["consumer_hit_blocks"] and (
+            boundary > offset * consumer_block
+        ):
+            return (
+                f"a transfer from block {offset} writes blocks below {boundary} "
+                "over the consumer's cached blocks"
+            )
+        echo = request_data["draft_rows_from"]
+        if not request_data.get("chunked_transfer") and (
+            type(echo) is not int or echo != boundary
+        ):
+            return f"the consumer marks below {echo!r}, not this producer's {boundary}"
+        return None
 
     def _acquire_chunked_reader(
         self, state: ChunkedPrefill, request_data: dict
@@ -2949,6 +3079,13 @@ class MooncakeConnector(KVConnectorBase):
             req_id = request_data["request_id"]
             if request_data.get("prompt_digest") != state.prompt_digest:
                 raise ValueError("P/D prompt token IDs differ")
+            draft_rows_from = None
+            if self._draft_rows_split:
+                # Before any write: V arrives with the prefill's first forward.
+                draft_rows_from = state.wait_draft_rows_from()
+                refusal = self._draft_boundary_fence(request_data, draft_rows_from)
+                if refusal is not None:
+                    raise ValueError(refusal)
             src_blocks_per_dst_block = max(
                 1, request_data.get("src_block_skip_factor", 1)
             )
@@ -3024,6 +3161,8 @@ class MooncakeConnector(KVConnectorBase):
                 src_block_offset = src_block_end
                 dst_block_offset += num_chunk_dst_blocks
             handoff = state.wait_handoff()
+            if draft_rows_from is not None:
+                handoff["draft_rows_from"] = draft_rows_from
             if has_slots:
                 prefill_data = {
                     "slot_index": state.slot_index,
