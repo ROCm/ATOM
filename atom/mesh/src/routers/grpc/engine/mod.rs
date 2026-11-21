@@ -48,6 +48,12 @@ pub(crate) trait Dispatcher: Send + Sync {
     ) -> Result<TokenHandle, EngineError> {
         self.dispatch(placement, payload).await
     }
+
+    /// Whether dispatch takes `placement`'s load itself, releasing each worker's
+    /// as its part ends, so the pipeline takes none.
+    fn holds_load(&self, _placement: &PlacementPlan) -> bool {
+        false
+    }
 }
 
 #[async_trait]
@@ -68,14 +74,31 @@ impl Dispatcher for GrpcEngine {
     ) -> Result<TokenHandle, EngineError> {
         GrpcEngine::dispatch_with_tokenizer(self, placement, payload, tokenizer).await
     }
+
+    #[cfg(feature = "grpc-client")]
+    fn holds_load(&self, placement: &PlacementPlan) -> bool {
+        self.atom_pairs.is_some() && atom::pair::atom_pair(placement).is_some()
+    }
 }
 
 #[derive(Clone, Default)]
-pub struct GrpcEngine {}
+pub struct GrpcEngine {
+    /// Runs ATOM pairs; without it, an ATOM pair fails.
+    #[cfg(feature = "grpc-client")]
+    atom_pairs: Option<Arc<atom::pair::AtomPairs>>,
+}
 
 impl GrpcEngine {
     pub fn new() -> Self {
-        Self {}
+        Self::default()
+    }
+
+    /// Runs ATOM pairs through `pairs`, SGLang and vLLM pairs through the dual dispatch.
+    #[cfg(feature = "grpc-client")]
+    pub(crate) fn with_atom_pairs(pairs: atom::pair::AtomPairs) -> Self {
+        Self {
+            atom_pairs: Some(Arc::new(pairs)),
+        }
     }
 
     /// Without a tokenizer, a request with stop strings fails for an ATOM worker;
@@ -104,6 +127,16 @@ impl GrpcEngine {
         payload: &mut GenerationPayload,
         tokenizer: Option<&Arc<dyn Tokenizer>>,
     ) -> Result<TokenHandle, EngineError> {
+        #[cfg(feature = "grpc-client")]
+        if let Some([prefill, decode]) = atom::pair::atom_pair(placement) {
+            let pairs = self.atom_pairs.as_ref().ok_or_else(|| EngineError::Http {
+                status: http::StatusCode::INTERNAL_SERVER_ERROR,
+                message: "an ATOM pair needs the gRPC P/D router".to_string(),
+            })?;
+            return pairs
+                .dispatch(prefill, decode, payload, tokenizer.map(|t| t.as_ref()))
+                .await;
+        }
         match placement {
             PlacementPlan::Single { worker, .. } => {
                 self.dispatch_one(worker, payload, ProtoErrorRole::Worker, tokenizer)

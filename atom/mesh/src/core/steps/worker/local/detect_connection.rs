@@ -35,12 +35,15 @@ async fn try_http_health_check(
     Ok(())
 }
 
-/// Perform gRPC health check with runtime type.
+/// Starts the message of a refusal, which retrying cannot change.
+const REFUSED: &str = "Refused";
+
+/// Perform gRPC health check with runtime type; `Ok(Some(reason))` refuses the worker.
 async fn do_grpc_health_check(
     grpc_url: &str,
     timeout_secs: u64,
     runtime_type: &str,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     let connect_future = GrpcClient::connect(grpc_url, runtime_type);
     let client = tokio::time::timeout(Duration::from_secs(timeout_secs), connect_future)
         .await
@@ -53,15 +56,18 @@ async fn do_grpc_health_check(
         .map_err(|_| "gRPC health check timeout".to_string())?
         .map_err(|e| format!("gRPC health check failed: {}", e))?;
 
-    Ok(())
+    tokio::time::timeout(Duration::from_secs(timeout_secs), client.protocol_refusal())
+        .await
+        .map_err(|_| "gRPC server info timeout".to_string())?
+        .map_err(|e| format!("gRPC server info failed: {}", e))
 }
 
-/// Try gRPC health check (tries SGLang first, then vLLM if not specified).
+/// Try gRPC health check (SGLang, then vLLM, then ATOM if not specified).
 async fn try_grpc_health_check(
     url: &str,
     timeout_secs: u64,
     runtime_type: Option<&str>,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     let grpc_url = if url.starts_with("grpc://") {
         url.to_string()
     } else {
@@ -71,13 +77,14 @@ async fn try_grpc_health_check(
     match runtime_type {
         Some(runtime) => do_grpc_health_check(&grpc_url, timeout_secs, runtime).await,
         None => {
-            // Try SGLang first, then vLLM as fallback
-            if let Ok(()) = do_grpc_health_check(&grpc_url, timeout_secs, "sglang").await {
-                return Ok(());
+            for runtime in ["sglang", "vllm"] {
+                if let Ok(refusal) = do_grpc_health_check(&grpc_url, timeout_secs, runtime).await {
+                    return Ok(refusal);
+                }
             }
-            do_grpc_health_check(&grpc_url, timeout_secs, "vllm")
+            do_grpc_health_check(&grpc_url, timeout_secs, "atom")
                 .await
-                .map_err(|e| format!("gRPC failed (tried SGLang and vLLM): {}", e))
+                .map_err(|e| format!("gRPC failed (tried SGLang, vLLM and ATOM): {}", e))
         }
     }
 }
@@ -119,9 +126,15 @@ impl StepExecutor<LocalWorkerWorkflowData> for DetectConnectionModeStep {
                 debug!("{} detected as HTTP", config.url);
                 ConnectionMode::Http
             }
-            (_, Ok(_)) => {
+            (_, Ok(None)) => {
                 debug!("{} detected as gRPC", config.url);
                 ConnectionMode::Grpc { port: None }
+            }
+            (_, Ok(Some(refusal))) => {
+                return Err(WorkflowError::StepFailed {
+                    step_id: StepId::new("detect_connection_mode"),
+                    message: format!("{REFUSED} {}: {}", config.url, refusal),
+                });
             }
             (Err(http_err), Err(grpc_err)) => {
                 return Err(WorkflowError::StepFailed {
@@ -138,7 +151,7 @@ impl StepExecutor<LocalWorkerWorkflowData> for DetectConnectionModeStep {
         Ok(StepResult::Success)
     }
 
-    fn is_retryable(&self, _error: &WorkflowError) -> bool {
-        true
+    fn is_retryable(&self, error: &WorkflowError) -> bool {
+        !matches!(error, WorkflowError::StepFailed { message, .. } if message.starts_with(REFUSED))
     }
 }

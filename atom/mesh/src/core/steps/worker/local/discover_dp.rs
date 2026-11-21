@@ -9,8 +9,13 @@ use serde::Deserialize;
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use super::discover_metadata::{get_openai_model_id, get_server_info};
-use crate::core::{steps::workflow_data::LocalWorkerWorkflowData, UNKNOWN_MODEL_ID};
+use super::{
+    create_worker::determine_runtime_type,
+    discover_metadata::{get_openai_model_id, get_server_info, ServerInfo},
+};
+use crate::core::{
+    steps::workflow_data::LocalWorkerWorkflowData, worker::RuntimeType, UNKNOWN_MODEL_ID,
+};
 
 static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
     Client::builder()
@@ -61,8 +66,49 @@ async fn get_atom_dp_size(url: &str, api_key: Option<&str>) -> Result<usize, Str
         .ok_or_else(|| format!("No dp_size in response from {}", endpoint))
 }
 
-/// Get DP info for a worker URL.
-pub async fn get_dp_info(url: &str, api_key: Option<&str>) -> Result<DpInfo, String> {
+/// The `/server_info` body that an ATOM gRPC worker's GetServerInfo carries.
+#[cfg(feature = "grpc-client")]
+async fn get_atom_grpc_server_info(url: &str) -> Result<ServerInfo, String> {
+    let grpc_url = format!("grpc://{}", super::strip_protocol(url));
+    let client = crate::routers::grpc::engine::atom::AtomClient::connect(&grpc_url)
+        .await
+        .map_err(|e| format!("Failed to connect to {}: {}", grpc_url, e))?;
+    let response = client
+        .get_server_info()
+        .await
+        .map_err(|e| format!("GetServerInfo failed at {}: {}", grpc_url, e))?;
+    serde_json::from_str(&response.server_info_json)
+        .map_err(|e| format!("Failed to parse GetServerInfo from {}: {}", grpc_url, e))
+}
+
+/// The model id `/server_info` names: its model id, served name or model path's last part.
+fn server_info_model_id(info: ServerInfo) -> Option<String> {
+    info.model_id
+        .filter(|s| !s.is_empty())
+        .or(info.served_model_name.filter(|s| !s.is_empty()))
+        .or_else(|| {
+            info.model_path
+                .and_then(|path| path.split('/').next_back().map(|s| s.to_string()))
+        })
+}
+
+/// Get DP info for a worker URL; an ATOM gRPC worker's comes from GetServerInfo.
+#[cfg_attr(not(feature = "grpc-client"), allow(unused_variables))]
+pub async fn get_dp_info(
+    url: &str,
+    api_key: Option<&str>,
+    atom_grpc: bool,
+) -> Result<DpInfo, String> {
+    #[cfg(feature = "grpc-client")]
+    if atom_grpc {
+        let info = get_atom_grpc_server_info(url).await?;
+        let dp_size = info
+            .dp_size
+            .ok_or_else(|| format!("No dp_size in GetServerInfo from {}", url))?;
+        let model_id = server_info_model_id(info).unwrap_or_else(|| UNKNOWN_MODEL_ID.to_string());
+        return Ok(DpInfo { dp_size, model_id });
+    }
+
     let info = match get_server_info(url, api_key).await {
         Ok(info) => Some(info),
         Err(e) => {
@@ -90,15 +136,7 @@ pub async fn get_dp_info(url: &str, api_key: Option<&str>) -> Result<DpInfo, Str
         dp_size
     };
 
-    let model_id = if let Some(model_id) = info.and_then(|info| {
-        info.model_id
-            .filter(|s| !s.is_empty())
-            .or(info.served_model_name.filter(|s| !s.is_empty()))
-            .or_else(|| {
-                info.model_path
-                    .and_then(|path| path.split('/').next_back().map(|s| s.to_string()))
-            })
-    }) {
+    let model_id = if let Some(model_id) = info.and_then(server_info_model_id) {
         model_id
     } else {
         get_openai_model_id(url, api_key)
@@ -130,7 +168,13 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverDPInfoStep {
 
         debug!("Discovering DP info for {} (DP-aware)", config.url);
 
-        let dp_info = get_dp_info(&config.url, config.api_key.as_deref())
+        let connection_mode =
+            context.data.connection_mode.as_ref().ok_or_else(|| {
+                WorkflowError::ContextValueNotFound("connection_mode".to_string())
+            })?;
+        let atom_grpc =
+            determine_runtime_type(connection_mode, &context.data, config) == RuntimeType::Atom;
+        let dp_info = get_dp_info(&config.url, config.api_key.as_deref(), atom_grpc)
             .await
             .map_err(|e| WorkflowError::StepFailed {
                 step_id: StepId::new("discover_dp_info"),

@@ -43,6 +43,8 @@ pub struct TokenizerConfigRequest {
     pub source: String,
     /// Optional path to chat template file
     pub chat_template_path: Option<String>,
+    /// Chat template content, used when `chat_template_path` is unset
+    pub inline_chat_template: Option<String>,
     /// Optional cache configuration. If provided, wraps tokenizer with CachedTokenizer.
     #[serde(default)]
     pub cache_config: Option<TokenizerCacheConfig>,
@@ -104,6 +106,7 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
         let name = config.name.clone();
         let source = config.source.clone();
         let chat_template = config.chat_template_path.clone();
+        let inline_chat_template = config.inline_chat_template.clone();
         let cache_config = config.cache_config.clone();
         let chats_without_template = app_context.chats_without_template.clone();
 
@@ -116,16 +119,23 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                 let name = name.clone();
                 let source = source.clone();
                 let chat_template = chat_template.clone();
+                let inline_chat_template = inline_chat_template.clone();
                 let cache_cfg = cache_config.clone();
                 let chats_without_template = chats_without_template.clone();
                 async move {
                     // Load base tokenizer
-                    let base_tokenizer = factory::create_tokenizer_async_with_chat_template(
+                    let mut base_tokenizer = factory::create_tokenizer_async_with_chat_template(
                         &source,
                         chat_template.as_deref(),
                     )
                     .await
                     .map_err(|e| format!("Failed to load tokenizer: {}", e))?;
+                    if let (None, Some(template)) = (&chat_template, inline_chat_template) {
+                        Arc::get_mut(&mut base_tokenizer)
+                            .ok_or("the loaded tokenizer is already shared")?
+                            .set_chat_template(template)
+                            .map_err(|e| format!("Failed to set the chat template: {}", e))?;
+                    }
                     probe_chat_render(
                         &chats_without_template,
                         &id,
@@ -366,6 +376,7 @@ mod tests {
                 name: id.clone(),
                 source: source.to_string(),
                 chat_template_path: None,
+                inline_chat_template: None,
                 cache_config: None,
                 fail_on_duplicate: true,
             };
@@ -390,6 +401,7 @@ mod tests {
             name: "test-model".to_string(),
             source: "meta-llama/Llama-2-7b-hf".to_string(),
             chat_template_path: None,
+            inline_chat_template: None,
             cache_config: None,
             fail_on_duplicate: false,
         };
@@ -424,6 +436,7 @@ mod tests {
             name: "test-model".to_string(),
             source: "meta-llama/Llama-2-7b-hf".to_string(),
             chat_template_path: None,
+            inline_chat_template: None,
             cache_config: None,
             fail_on_duplicate: true,
         };
@@ -440,6 +453,7 @@ mod tests {
             name: "test-model".to_string(),
             source: "meta-llama/Llama-2-7b-hf".to_string(),
             chat_template_path: None,
+            inline_chat_template: None,
             cache_config: Some(TokenizerCacheConfig {
                 enable_l0: true,
                 l0_max_entries: 1000,

@@ -44,6 +44,8 @@ struct FakeAtom {
     hold: bool,
     requests: Mutex<Vec<GenerateRequest>>,
     held: Mutex<Option<mpsc::Sender<Reply>>>,
+    /// GetServerInfo's `kv_transfer_info_json`; `{"tp_size":1}` when unset.
+    kv_transfer_info: Option<String>,
 }
 
 impl FakeAtom {
@@ -100,7 +102,10 @@ impl AtomEngine for FakeAtom {
     ) -> Result<Response<GetServerInfoResponse>, Status> {
         Ok(Response::new(GetServerInfoResponse {
             protocol_version: 1,
-            kv_transfer_info_json: r#"{"tp_size":1}"#.into(),
+            kv_transfer_info_json: self
+                .kv_transfer_info
+                .clone()
+                .unwrap_or_else(|| r#"{"tp_size":1}"#.into()),
             server_info_json: r#"{"dp_size":2}"#.into(),
         }))
     }
@@ -434,4 +439,379 @@ async fn the_client_connects_and_reads_health_and_model_and_server_info() {
         (info.protocol_version, info.server_info_json.as_str()),
         (1, r#"{"dp_size":2}"#)
     );
+}
+
+/// ATOM pairs through the gRPC P/D router against in-process P and D instances,
+/// run as ATOM's HTTP P/D router runs them.
+mod pairs {
+    use axum::body::to_bytes;
+    use axum::response::Response as HttpResponse;
+    use serde_json::{json, Value};
+    use tokio::task::JoinHandle;
+    use tokio::time::timeout;
+
+    use super::*;
+    use crate::config::types::{AtomPdRankMappingPolicy, RetryConfig};
+    use crate::core::{WorkerRegistry, WorkerType};
+    use crate::policies::RoundRobinPolicy;
+    use crate::routers::grpc::engine::{atom::pair::AtomPairs, Dispatcher};
+    use crate::routers::grpc::pd_router::GrpcPDRouter;
+    use crate::routers::RouterTrait;
+
+    const PREFILL: WorkerType = WorkerType::Prefill {
+        bootstrap_port: None,
+    };
+    /// Bounds the waits that only stop a hang.
+    const HANG: Duration = Duration::from_secs(60);
+
+    fn template() -> Value {
+        json!({"remote_host": "10.0.0.1", "remote_handshake_port": 6301, "block_size": 16})
+    }
+
+    /// A P instance's `kv_transfer_info`: `tp_size`, and `template` for chunked transfer.
+    fn prefill_info(tp_size: u32, template: Option<Value>) -> Option<Value> {
+        let mut info = json!({"tp_size": tp_size, "kv_role": "kv_producer"});
+        if let Some(template) = template {
+            info["chunked_transfer"] = template;
+        }
+        Some(info)
+    }
+
+    /// A served instance replying with `scripts`, each call held open when `hold`.
+    async fn instance(
+        scripts: Vec<Vec<GenerateResponse>>,
+        hold: bool,
+        info: Option<Value>,
+    ) -> (Arc<FakeAtom>, String) {
+        let fake = Arc::new(FakeAtom {
+            scripts: Mutex::new(scripts.into()),
+            hold,
+            kv_transfer_info: info.map(|info| info.to_string()),
+            ..Default::default()
+        });
+        let url = serve(fake.clone()).await;
+        (fake, url)
+    }
+
+    fn worker(url: &str, kind: WorkerType) -> Arc<dyn Worker> {
+        let worker = BasicWorkerBuilder::new(url)
+            .worker_type(kind)
+            .connection_mode(ConnectionMode::Grpc { port: None })
+            .runtime_type(RuntimeType::Atom)
+            .model_id("m")
+            .build();
+        Arc::new(worker)
+    }
+
+    /// Two url@rank workers of the instance at `url`, sharing one client to it.
+    async fn ranks(url: &str, kind: WorkerType) -> Vec<Arc<dyn Worker>> {
+        let client = GrpcClient::connect(url, "atom").await.unwrap();
+        (0..2)
+            .map(|rank| {
+                let worker = DPAwareWorkerBuilder::new(url, rank, 2)
+                    .worker_type(kind.clone())
+                    .connection_mode(ConnectionMode::Grpc { port: None })
+                    .runtime_type(RuntimeType::Atom)
+                    .grpc_client(client.clone())
+                    .build();
+                Arc::new(worker) as Arc<dyn Worker>
+            })
+            .collect()
+    }
+
+    /// The gRPC P/D router over `workers`, picking P round robin.
+    async fn router(workers: &[Arc<dyn Worker>]) -> GrpcPDRouter {
+        let context = test_mocks::app_context_with_tokenizer_registry(
+            test_mocks::tokenizer_registry_with("m"),
+        );
+        for worker in workers {
+            context.worker_registry.register(worker.clone());
+        }
+        let round_robin = Arc::new(RoundRobinPolicy::new());
+        context.policy_registry.set_prefill_policy(round_robin);
+        GrpcPDRouter::new(&context).await.unwrap()
+    }
+
+    /// A /generate request for prompt [7, 8, 9] with `max_new_tokens` 8, under way.
+    fn start(router: GrpcPDRouter, stream: bool) -> JoinHandle<HttpResponse> {
+        tokio::spawn(async move {
+            let body = generate_body(stream, json!({"max_new_tokens": 8}));
+            router.route_generate(None, &body, Some("m")).await
+        })
+    }
+
+    async fn finish(request: JoinHandle<HttpResponse>) -> HttpResponse {
+        timeout(HANG, request)
+            .await
+            .expect("the request hung")
+            .unwrap()
+    }
+
+    /// Waits for `fake`'s `n`th call, and takes a held call's sender.
+    async fn calls(fake: &FakeAtom, n: usize) -> Option<mpsc::Sender<Reply>> {
+        let arrived = async {
+            while fake.requests.lock().unwrap().len() < n
+                || (fake.hold && fake.held.lock().unwrap().is_none())
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            fake.held.lock().unwrap().take()
+        };
+        timeout(HANG, arrived).await.expect("the call never came")
+    }
+
+    /// P's Complete, with `kv` as its kv_transfer_params.
+    fn prefill_done(kv: Value) -> GenerateResponse {
+        let complete = GenerateComplete {
+            output_ids: vec![5],
+            finish_reason: "max_tokens".into(),
+            kv_transfer_params_json: Some(kv.to_string()),
+            ..Default::default()
+        };
+        GenerateResponse {
+            response: Some(generate_response::Response::Complete(complete)),
+        }
+    }
+
+    fn first(fake: &FakeAtom) -> GenerateRequest {
+        fake.requests.lock().unwrap()[0].clone()
+    }
+
+    fn kv(request: &GenerateRequest) -> Value {
+        serde_json::from_str(request.kv_transfer_params_json.as_deref().unwrap()).unwrap()
+    }
+
+    fn stream_and_max_tokens(request: &GenerateRequest) -> (bool, Option<i64>) {
+        (
+            request.stream,
+            request.sampling.as_ref().unwrap().max_tokens,
+        )
+    }
+
+    async fn output_ids(response: HttpResponse) -> Value {
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice::<Value>(&body).unwrap()[0]["output_ids"].clone()
+    }
+
+    #[tokio::test]
+    async fn relay_sends_decode_once_prefill_completes_with_its_params_enriched() {
+        let params = json!({"remote_host": "10.0.0.1", "remote_block_ids": [3, 4]});
+        let p_script = vec![vec![prefill_done(params)]];
+        let (p, p_url) = instance(p_script, false, prefill_info(2, None)).await;
+        let (d, d_url) = instance(vec![vec![]], true, None).await;
+        let (pw, dw) = (worker(&p_url, PREFILL), worker(&d_url, WorkerType::Decode));
+        let request = start(router(&[pw.clone(), dw.clone()]).await, true);
+
+        let decode_call = calls(&d, 1).await.unwrap();
+        // P's load ended at its Complete, before D was sent.
+        assert_eq!((pw.load(), dw.load()), (0, 1));
+        for reply in [chunk(&[21]), complete(&[], "stop_21")] {
+            decode_call.send(Ok(reply)).await.unwrap();
+        }
+        drop(decode_call);
+        let response = finish(request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!((pw.load(), dw.load()), (0, 0));
+
+        let (prefill, decode) = (first(&p), first(&d));
+        assert_eq!(stream_and_max_tokens(&prefill), (false, Some(1)));
+        let prefill_params = json!({"do_remote_decode": true, "do_remote_prefill": false});
+        assert_eq!(kv(&prefill), prefill_params);
+        assert_eq!(stream_and_max_tokens(&decode), (true, Some(8)));
+        // D has the prompt in its request, so P's enriched params carry no prompt ids.
+        assert_eq!(decode.prompt_token_ids, [7, 8, 9]);
+        let enriched = json!({
+            "remote_host": "10.0.0.1", "remote_block_ids": [3, 4],
+            "remote_dp_size": 1, "remote_tp_size": 2,
+        });
+        assert_eq!(kv(&decode), enriched);
+    }
+
+    #[tokio::test]
+    async fn chunked_sends_both_at_once_and_answers_once_prefill_completes() {
+        let (p, p_url) = instance(vec![vec![]], true, prefill_info(4, Some(template()))).await;
+        let d_script = vec![vec![complete(&[21, 22], "stop_22")]];
+        let (d, d_url) = instance(d_script, false, None).await;
+        let (pw, dw) = (worker(&p_url, PREFILL), worker(&d_url, WorkerType::Decode));
+        let request = start(router(&[pw.clone(), dw.clone()]).await, false);
+
+        // D is sent and answers while P still runs.
+        let prefill_call = calls(&p, 1).await.unwrap();
+        calls(&d, 1).await;
+        assert_eq!((pw.load(), dw.load()), (1, 1));
+        prefill_call
+            .send(Ok(prefill_done(json!({}))))
+            .await
+            .unwrap();
+        assert_eq!(output_ids(finish(request).await).await, json!([21, 22]));
+        assert_eq!((pw.load(), dw.load()), (0, 0));
+
+        let (prefill, decode) = (first(&p), first(&d));
+        let transfer_id = kv(&prefill)["transfer_id"].clone();
+        assert!(transfer_id
+            .as_str()
+            .is_some_and(|id| id.starts_with("xfer-")));
+        let prefill_params = json!({
+            "do_remote_decode": true, "do_remote_prefill": false,
+            "chunked_transfer": true, "transfer_id": transfer_id,
+        });
+        assert_eq!(stream_and_max_tokens(&prefill), (false, Some(1)));
+        assert_eq!(kv(&prefill), prefill_params);
+        // D's params are P's template for the same transfer, enriched.
+        let mut decode_params = template();
+        for (key, value) in [
+            ("chunked_transfer", json!(true)),
+            ("do_remote_prefill", json!(true)),
+            ("do_remote_decode", json!(false)),
+            ("transfer_id", transfer_id),
+            ("remote_dp_size", json!(1)),
+            ("remote_tp_size", json!(4)),
+        ] {
+            decode_params[key] = value;
+        }
+        assert_eq!(kv(&decode), decode_params);
+        assert_eq!(stream_and_max_tokens(&decode), (false, Some(8)));
+        assert_eq!(decode.prompt_token_ids, [7, 8, 9]);
+    }
+
+    #[tokio::test]
+    async fn a_relay_prefill_failure_sends_no_decode_and_ends_as_over_http() {
+        // Every call ends before P's Complete: the HTTP router's 502, after every retry.
+        let (p, p_url) = instance(Vec::new(), false, prefill_info(2, None)).await;
+        let (d, d_url) = instance(Vec::new(), false, None).await;
+        let (pw, dw) = (worker(&p_url, PREFILL), worker(&d_url, WorkerType::Decode));
+        let response = finish(start(router(&[pw.clone(), dw.clone()]).await, false)).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let sent = (
+            p.requests.lock().unwrap().len(),
+            d.requests.lock().unwrap().len(),
+        );
+        assert_eq!(sent, (RetryConfig::default().max_retries as usize, 0));
+        assert_eq!((pw.load(), dw.load()), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn in_chunked_a_prefill_failure_cancels_decode_and_a_decode_refusal_cancels_prefill() {
+        // P fails after D's first token, then while D still waits; then D refuses.
+        for (prefill_fails, d_script) in [
+            (true, vec![chunk(&[21])]),
+            (true, Vec::new()),
+            (false, Vec::new()),
+        ] {
+            let (p, p_url) = instance(vec![vec![]], true, prefill_info(2, Some(template()))).await;
+            let (d, d_url) = instance(vec![d_script], true, None).await;
+            let (pw, dw) = (worker(&p_url, PREFILL), worker(&d_url, WorkerType::Decode));
+            let request = start(router(&[pw.clone(), dw.clone()]).await, true);
+
+            let prefill_call = calls(&p, 1).await.unwrap();
+            let decode_call = calls(&d, 1).await.unwrap();
+            let (failing, other) = if prefill_fails {
+                (prefill_call, decode_call)
+            } else {
+                (decode_call, prefill_call)
+            };
+            failing.send(Ok(error("refused", 400))).await.unwrap();
+            assert_eq!(finish(request).await.status(), StatusCode::BAD_REQUEST);
+            let cancelled = timeout(HANG, other.closed()).await;
+            cancelled.expect("the other call was not cancelled");
+            assert_eq!((pw.load(), dw.load()), (0, 0));
+        }
+    }
+
+    #[tokio::test]
+    async fn each_retry_plans_a_new_pair() {
+        let script = || vec![vec![error("busy", 503)], vec![prefill_done(json!({}))]];
+        let (p1, p1_url) = instance(script(), false, prefill_info(2, None)).await;
+        let (p2, p2_url) = instance(script(), false, prefill_info(2, None)).await;
+        let (d, d_url) = instance(vec![vec![complete(&[21], "eos")]], false, None).await;
+        let workers = [
+            worker(&p1_url, PREFILL),
+            worker(&p2_url, PREFILL),
+            worker(&d_url, WorkerType::Decode),
+        ];
+        let response = finish(start(router(&workers).await, false)).await;
+        assert_eq!(output_ids(response).await, json!([21]));
+
+        // One P fails, then the other, then the first answers; no D goes out before.
+        let mut prefill_calls = [&p1, &p2].map(|p| p.requests.lock().unwrap().len());
+        prefill_calls.sort();
+        assert_eq!(
+            (prefill_calls, d.requests.lock().unwrap().len()),
+            ([1, 2], 1)
+        );
+        assert!(workers.iter().all(|w| w.load() == 0));
+    }
+
+    #[tokio::test]
+    async fn each_rank_takes_its_instances_info_and_idx2idx_runs_prefill_on_decodes_rank() {
+        let (p, p_url) = instance(vec![vec![]], true, prefill_info(4, Some(template()))).await;
+        let (d, d_url) = instance(vec![vec![complete(&[21], "eos")]], false, None).await;
+        let (prefill, decode) = (
+            ranks(&p_url, PREFILL).await,
+            ranks(&d_url, WorkerType::Decode).await,
+        );
+        let registry = Arc::new(WorkerRegistry::new());
+        for worker in prefill.iter().chain(&decode) {
+            registry.register(worker.clone());
+        }
+        let pairs = AtomPairs::new(registry, AtomPdRankMappingPolicy::Idx2Idx)
+            .await
+            .unwrap();
+        // The instance's GetServerInfo gives each of its ranks the TP size and template.
+        let info = pairs.adapter.prefill_info.clone();
+        let urls = [p_url.clone(), format!("{p_url}@0"), format!("{p_url}@1")];
+        assert_eq!(info.tp_sizes, urls.clone().map(|url| (url, 4)).into());
+        assert_eq!(
+            info.chunked_transfer,
+            urls.map(|url| (url, template())).into()
+        );
+
+        let engine = GrpcEngine::with_atom_pairs(pairs);
+        // An SGLang pair keeps the dual dispatch and the pipeline's load guards.
+        let sglang = PlacementPlan::Pair {
+            prefill: test_mocks::mock_http_only_worker("http://p:8000"),
+            decode: test_mocks::mock_http_only_worker("http://d:8000"),
+            prefill_policy: "random",
+            decode_policy: "random",
+        };
+        assert!(!engine.holds_load(&sglang));
+        let dual = engine.dispatch(&sglang, &mut payload(false)).await;
+        assert!(matches!(dual, Err(EngineError::ConnectionAcquireFailed(_))));
+
+        let plan = PlacementPlan::Pair {
+            prefill: prefill[0].clone(),
+            decode: decode[1].clone(),
+            prefill_policy: "random",
+            decode_policy: "random",
+        };
+        assert!(engine.holds_load(&plan));
+        let run = tokio::spawn(async move {
+            let handle = engine.dispatch(&plan, &mut payload(false)).await.unwrap();
+            handle.collect::<Vec<_>>().await
+        });
+        // Idx2idx moved P to rank 1, decode's, and the dispatch holds that rank's load.
+        let prefill_call = calls(&p, 1).await.unwrap();
+        let loads = [&prefill[0], &prefill[1], &decode[1]].map(|w| w.load());
+        assert_eq!(loads, [0, 1, 1]);
+        prefill_call
+            .send(Ok(prefill_done(json!({}))))
+            .await
+            .unwrap();
+        let chunks = timeout(HANG, run)
+            .await
+            .expect("the dispatch hung")
+            .unwrap();
+        assert!(
+            matches!(&chunks[..], [Ok(TokenChunk::Complete { .. })]),
+            "{chunks:?}"
+        );
+        assert!(prefill.iter().chain(&decode).all(|w| w.load() == 0));
+
+        let dp_ranks = (first(&p).data_parallel_rank, first(&d).data_parallel_rank);
+        assert_eq!(dp_ranks, (Some(1), Some(1)));
+        let params = kv(&first(&d));
+        let remote = ["remote_dp_rank", "remote_dp_size", "remote_tp_size"].map(|k| &params[k]);
+        assert_eq!(remote, [&json!(1), &json!(2), &json!(4)]);
+    }
 }

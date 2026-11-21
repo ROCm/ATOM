@@ -166,7 +166,7 @@ fn parse_worker_type(config: &WorkerConfigRequest) -> WorkerType {
         .unwrap_or(WorkerType::Regular)
 }
 
-fn determine_runtime_type(
+pub(super) fn determine_runtime_type(
     connection_mode: &ConnectionMode,
     data: &LocalWorkerWorkflowData,
     config: &WorkerConfigRequest,
