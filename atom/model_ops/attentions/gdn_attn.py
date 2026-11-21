@@ -1316,13 +1316,78 @@ class GDNStateMixin(PoolRowsMixin):
         cols, chunk_slots = self._checkpoint_columns(
             found, batch.total_seqs_num_prefill
         )
+        names = ("rows", "slots", "offs", "is_end", "runtime")
+        if envs.ATOM_PREFILL_EARLY_PREP:
+            out = self._checkpoint_tensors_pinned(cols, chunk_slots, names)
+            if out is not None:
+                return out
 
         def mk(col):
             return torch.as_tensor(np.ascontiguousarray(col), device=self.device)
 
-        names = ("rows", "slots", "offs", "is_end", "runtime")
         out = {name: mk(cols[:, i]) for i, name in enumerate(names)}
         out["chunk_slots"] = mk(chunk_slots)
+        return out
+
+    # Pinned sources for `_checkpoint_tensors_pinned`, one per in-flight use.
+    _CKPT_PINNED_SLOTS = 4
+
+    def _checkpoint_tensors_pinned(self, cols, chunk_slots, names) -> dict | None:
+        """ATOM_PREFILL_EARLY_PREP: `_checkpoint_tensors` without its six
+        pageable `torch.as_tensor(..., device=)` uploads. Each of those is a
+        blocking `hipMemcpyWithStream`, which first waits out every forward
+        still queued on the stream -- on a prefill step with the previous
+        decode in flight, a full drain of the GPU queue before the rest of the
+        step's metadata is even built.
+
+        Same tensors: each one a fresh exact-size device allocation (no
+        aliasing across steps or micro-batches), same int32 values and shape,
+        filled by a non-blocking H2D from a pinned source. The pinned source is
+        a ring slot that is rewritten only after the copy that last read it has
+        run (its event), as `_stage_upload` does. None when the targets do not
+        fit the slot (the caller keeps the pageable path)."""
+        k = int(cols.shape[0])
+        m = int(chunk_slots.shape[0])
+        need = 5 * k + m
+        ring = self.__dict__.get("_ckpt_pinned_ring")
+        if ring is None:
+            runner = self.model_runner
+            cap = 5 * (3 * (runner.max_bs + 1)) + (
+                runner.max_num_batched_tokens // 64 + runner.max_bs + 1
+            )
+            ring = {
+                "cpu": [
+                    torch.empty(cap, dtype=torch.int32, pin_memory=True)
+                    for _ in range(self._CKPT_PINNED_SLOTS)
+                ],
+                "ev": [None] * self._CKPT_PINNED_SLOTS,
+                "next": 0,
+            }
+            self._ckpt_pinned_ring = ring
+        i = ring["next"]
+        host = ring["cpu"][i]
+        if need > host.shape[0]:
+            return None
+        ring["next"] = (i + 1) % self._CKPT_PINNED_SLOTS
+        ev = ring["ev"][i]
+        if ev is not None and not ev.query():
+            ev.synchronize()
+        h = host.numpy()
+        # Column-major: column j of the targets at [j*k, (j+1)*k), then the
+        # per-chunk slot table.
+        h[: 5 * k] = cols.T.reshape(-1)
+        h[5 * k : need] = chunk_slots
+        out = {}
+        for j, name in enumerate(names):
+            dst = torch.empty(k, dtype=torch.int32, device=self.device)
+            dst.copy_(host[j * k : (j + 1) * k], non_blocking=True)
+            out[name] = dst
+        dst = torch.empty(m, dtype=torch.int32, device=self.device)
+        dst.copy_(host[5 * k : need], non_blocking=True)
+        out["chunk_slots"] = dst
+        ev = torch.cuda.Event()
+        ev.record()
+        ring["ev"][i] = ev
         return out
 
     def _staged_checkpoint_targets(
