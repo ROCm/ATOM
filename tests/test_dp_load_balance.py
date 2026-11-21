@@ -9,7 +9,6 @@
 # here works on the CPU-only / mocked CI runner without any sys.modules stub;
 # conftest.py supplies the atom.* / zmq stubs the import chain needs.
 
-import pickle
 from threading import Event, Lock, Thread
 
 import pytest
@@ -20,6 +19,9 @@ from atom.model_engine.engine_core_mgr import (
     DP_LB_STRATEGIES,
     CoreManager,
 )
+from atom.model_engine.zmq_protocol.codec import decode_client_message
+from atom.model_engine.zmq_protocol.requests import IngressRequest
+from atom.sampling_params import SamplingParams
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -42,6 +44,16 @@ class _FakeSeq:
         self.dp_parent_session_id = dp_parent_session_id
         if data_parallel_rank is not None:
             self.data_parallel_rank = data_parallel_rank
+
+
+def _wire_request(seq_id, num_prompt_tokens=1, data_parallel_rank=None):
+    """A request dispatch can actually encode, unlike `_FakeSeq`."""
+    return IngressRequest(
+        id=seq_id,
+        prompt_token_ids=[1] * num_prompt_tokens,
+        sampling_params=SamplingParams(),
+        data_parallel_rank=data_parallel_rank,
+    )
 
 
 def _make_mgr(
@@ -411,13 +423,15 @@ def test_dispatch_sends_explicit_hint_to_exact_engine_rank():
     mgr._rank_reqs = [0, 0, 0, 10]
     mgr._rank_tokens = [0, 0, 0, 10_000]
 
-    seq = _FakeSeq("sticky", num_prompt_tokens=100, data_parallel_rank=3)
+    seq = _wire_request(7, num_prompt_tokens=100, data_parallel_rank=3)
     mgr._dispatch_to_dp_ranks([seq])
 
     assert [len(sock.messages) for sock in mgr.input_sockets] == [0, 0, 0, 1]
-    request_type, dispatched = pickle.loads(mgr.input_sockets[3].messages[0][1])
+    identity, *frames = mgr.input_sockets[3].messages[0]
+    assert identity == b"e3"
+    request_type, dispatched, _ = decode_client_message(frames)
     assert request_type.name == "ADD"
-    assert [item.id for item in dispatched] == [seq.id]
+    assert [item.seq_id for item in dispatched] == [seq.id]
 
 
 def test_invalid_hint_still_supported_via_add_request_validation():
@@ -485,7 +499,7 @@ def test_send_failure_rolls_back_undispatched_charge():
     # NOT successfully handed off were charged but will never emit a finished
     # output to release them. Dispatch must roll those back so routing does not
     # skew permanently; already-sent ranks keep their (legitimate) charge.
-    # dispatch pickles (EngineCoreRequestType.ADD, seqs) with the real enum.
+    # dispatch encodes the batch with the real codec before each send.
     class _FakeSocket:
         def __init__(self, fail=False):
             self.fail = fail
@@ -503,7 +517,7 @@ def test_send_failure_rolls_back_undispatched_charge():
         _FakeSocket(fail=True),
         _FakeSocket(),
     ]
-    seqs = [_FakeSeq(i, num_prompt_tokens=10) for i in range(4)]
+    seqs = [_wire_request(i, num_prompt_tokens=10) for i in range(4)]
     with pytest.raises(RuntimeError):
         mgr._dispatch_to_dp_ranks(seqs)
     # Ranks 0,1 dispatched -> stay charged; ranks 2 (failed) and 3 (never
@@ -561,7 +575,6 @@ def test_decode_bookkeeping_does_not_wait_for_an_unrelated_router_lock():
 
 
 def test_concurrent_store_dispatch_accounts_in_socket_send_order():
-    import pickle
     import time
     from concurrent.futures import ThreadPoolExecutor
     from threading import Event
@@ -574,10 +587,11 @@ def test_concurrent_store_dispatch_accounts_in_socket_send_order():
     mgr._prefix_router = ShareCacheRouter(OffloadTierProfile(True, 0, 256, True), 100)
     first_sent, second_started = Event(), Event()
     order = []
+    names = {1: "first", 2: "second"}
 
-    def send(_rank, payload):
-        _, seqs = pickle.loads(payload)
-        sid = seqs[0].id
+    def send(_rank, frames):
+        _, specs, _ = decode_client_message([bytes(f) for f in frames])
+        sid = names[specs[0].seq_id]
         order.append(("send", sid))
         if sid == "first":
             first_sent.set()
@@ -589,7 +603,7 @@ def test_concurrent_store_dispatch_accounts_in_socket_send_order():
     original = mgr._backlog.note_sent
 
     def account(rank, seqs, seq_load):
-        order.append(("account", seqs[0].id))
+        order.append(("account", names[seqs[0].id]))
         original(rank, seqs, seq_load)
 
     mgr._send_request = send
@@ -598,11 +612,11 @@ def test_concurrent_store_dispatch_accounts_in_socket_send_order():
     def second():
         assert first_sent.wait(2)
         second_started.set()
-        mgr._dispatch_to_dp_ranks([_FakeSeq("second", 20, data_parallel_rank=0)])
+        mgr._dispatch_to_dp_ranks([_wire_request(2, 20, data_parallel_rank=0)])
 
     with ThreadPoolExecutor(2) as pool:
         a = pool.submit(
-            mgr._dispatch_to_dp_ranks, [_FakeSeq("first", 10, data_parallel_rank=0)]
+            mgr._dispatch_to_dp_ranks, [_wire_request(1, 10, data_parallel_rank=0)]
         )
         b = pool.submit(second)
         a.result(timeout=5)
@@ -653,12 +667,18 @@ def _tier_hit(router, chain):
     return router._tier_hit(router._path(chain))
 
 
-def _chain_seq(seq_id, tokens, first_block=0, session=None, hbs=128):
+def _chain_seq(seq_id, tokens, first_block=0, session=None, hbs=128, wire=False):
+    """A seq with a shipped prompt chain; `wire` makes it one dispatch can
+    encode (`_wire_request`) rather than a routing-only `_FakeSeq`."""
     import array
 
     from atom.model_engine.prefix_hash import ShippedChain
 
-    seq = _FakeSeq(seq_id, num_prompt_tokens=tokens, dp_session_id=session)
+    if wire:
+        seq = _wire_request(seq_id, num_prompt_tokens=tokens)
+        seq.dp_session_id = session
+    else:
+        seq = _FakeSeq(seq_id, num_prompt_tokens=tokens, dp_session_id=session)
     blocks = array.array("Q", range(first_block, first_block + tokens // hbs))
     seq.prompt_hash_chain = ShippedChain(hbs, 0, tokens, 0, blocks)
     return seq
@@ -999,13 +1019,13 @@ def test_prefix_spread_tracks_load_through_dispatch():
     mgr = _make_spread_mgr()
     mgr.engine_core_identities = [b"e0", b"e1"]
     mgr.input_sockets = [_SinkSocket(), _SinkSocket()]
-    first = _chain_seq(1, 100_000)
+    first = _chain_seq(1, 100_000, wire=True)
     mgr._dispatch_to_dp_ranks([first])
     (owner,) = [r for r, n in enumerate(mgr._rank_reqs) if n]
     assert mgr._rank_tokens[owner] == 100_000
     mgr._mark_seq_prefill_complete(1)
     mgr._rank_tokens[owner] = 200_000  # backlogged
-    moved = _chain_seq(2, 110_000)
+    moved = _chain_seq(2, 110_000, wire=True)
     mgr._dispatch_to_dp_ranks([moved])
     assert mgr._seq_load[2][0] != owner
     assert _count(mgr, "prefix_moved_total") == 1

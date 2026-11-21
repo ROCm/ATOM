@@ -118,6 +118,21 @@ pub(crate) fn encoder(entry: &TokenizerEntry) -> Arc<dyn Tokenizer> {
     }
 }
 
+/// Load every group's copy now, in parallel, for a pool of `workers` threads,
+/// so no request waits on a load when traffic first arrives.
+pub(crate) fn preload(entry: &TokenizerEntry, workers: usize) {
+    if !entry.tokenizer.as_any().is::<HuggingFaceTokenizer>() {
+        return;
+    }
+    std::thread::scope(|scope| {
+        for group in 0..workers.div_ceil(WORKERS_PER_COPY) {
+            scope.spawn(move || {
+                group_copy(entry, group, || factory::create_tokenizer(&entry.source))
+            });
+        }
+    });
+}
+
 /// Release every group's copy of a removed tokenizer. Requests still encoding
 /// with a copy keep it until they finish.
 pub(crate) fn release_copies(tokenizer_id: &str) {

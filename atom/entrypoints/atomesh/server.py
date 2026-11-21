@@ -1,8 +1,8 @@
-"""Python entrypoint for running Atomesh with a Python-owned engine.
+"""Python entrypoint for Atomesh.
 
-This module intentionally mirrors the engine/tokenizer initialization used by
-``atom.entrypoints.openai.api_server``. The Rust side receives the already
-constructed Python objects and uses them in ``AtomStandaloneRouter``.
+ATOM standalone: Python parses the args, launches the EngineCores and reaps
+them; the Rust runtime (``atom/mesh/src/atom_engine``) is their only client
+and serves HTTP. ``mesh-only``: a plain mesh router.
 """
 
 from __future__ import annotations
@@ -13,13 +13,17 @@ import importlib.util
 import json
 import logging
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from atom.entrypoints.openai.tool_parser.registry import (
-    TOOL_CALL_PARSER_HELP,
-    validate_tool_call_parser,
+from atom.entrypoints.atomesh.engine_spec import (
+    apply_chat_template,
+    build_engine_spec,
+    check_standalone_model,
+    default_reasoning_parser,
+    tool_call_format,
 )
 from atom.utils.gc_utils import (
     freeze_gc_heap,
@@ -90,34 +94,26 @@ def print_version(verbose: bool = False) -> None:
         print("Atomesh Python interface")
 
 
-def initialize_engine(args: argparse.Namespace) -> tuple[Any, Any]:
-    from atom.model_engine.arg_utils import EngineArgs
-    from atom.model_engine.llm_engine import load_tokenizer
+def load_tokenizer(args: argparse.Namespace) -> Any:
+    from atom.model_engine.llm_engine import load_tokenizer as load_model_tokenizer
 
-    global engine, tokenizer
+    global tokenizer
 
     logger.info("Loading tokenizer from %s...", args.model)
-    tokenizer = load_tokenizer(args.model, args.trust_remote_code)
+    tokenizer = load_model_tokenizer(args.model, args.trust_remote_code)
+    return tokenizer
+
+
+def initialize_engine(args: argparse.Namespace) -> Any:
+    from atom.model_engine.arg_utils import EngineArgs
+
+    global engine
 
     logger.info("Initializing engine with model %s...", args.model)
     engine_args = EngineArgs.from_cli_args(args)
-    engine = engine_args.create_engine(tokenizer=tokenizer)
-    return engine, tokenizer
-
-
-def initialize_standalone_service(
-    args: argparse.Namespace,
-    default_chat_template_kwargs: dict[str, Any],
-) -> Any:
-    from atom.entrypoints.atomesh.atom_standalone_service import AtomStandaloneService
-
-    return AtomStandaloneService(
-        engine=engine,
-        tokenizer=tokenizer,
-        model_name=args.model,
-        default_chat_template_kwargs=default_chat_template_kwargs,
-        tool_call_parser=getattr(args, "tool_call_parser", None),
-    )
+    # The Rust runtime connects to the EngineCores; CoreManager only spawns them.
+    engine = engine_args.create_engine(tokenizer=tokenizer, external_engine_client=True)
+    return engine
 
 
 def split_standalone_mesh_args(raw_args: list[str]) -> tuple[list[str], list[str]]:
@@ -141,35 +137,6 @@ def split_standalone_mesh_args(raw_args: list[str]) -> tuple[list[str], list[str
     if port is not None:
         mesh_args.extend(["--port", port])
     return python_args, mesh_args
-
-
-def _is_atom_tool_call_parser(value: str | None) -> bool:
-    """Whether this name is one ATOM's own resolver understands.
-
-    A question, not an assertion: the mesh router answers to a different set
-    of names for the same flag, and neither side owns the other's.
-    """
-    if value is None:
-        return False
-    try:
-        validate_tool_call_parser(value)
-    except ValueError:
-        return False
-    return True
-
-
-def _forward_tool_call_parser(value: str | None) -> list[str]:
-    """Give the mesh router back the flag the Python parser just consumed.
-
-    `--tool-call-parser` has two consumers with two vocabularies: the Rust
-    router declares its own (`cliargs.rs`, sglang spelling) and reads it in
-    `app_context`, and the Python service resolves it to a `ToolCallParser`.
-    Until this entrypoint registered the flag it reached the router as an
-    unrecognised arg and was passed straight through; registering it made
-    `parse_known_args` swallow it, so the router silently lost a setting that
-    had been reaching it. Both need it, so both get it.
-    """
-    return [] if value is None else ["--tool-call-parser", value]
 
 
 def json_object_arg(raw_value: str) -> dict[str, Any]:
@@ -196,14 +163,6 @@ def parse_standalone_args(raw_args: list[str]) -> StandaloneArgs:
     )
     EngineArgs.add_cli_args(parser)
     parser.add_argument(
-        "--tool-call-parser",
-        type=str,
-        # Not "auto": that is what *unset* resolves to anyway, and telling the
-        # two apart is what decides whether the mesh router is told as well.
-        default=None,
-        help=TOOL_CALL_PARSER_HELP,
-    )
-    parser.add_argument(
         "--default-chat-template-kwargs",
         type=json_object_arg,
         default=None,
@@ -214,63 +173,98 @@ def parse_standalone_args(raw_args: list[str]) -> StandaloneArgs:
     )
 
     python_raw_args, mesh_network_args = split_standalone_mesh_args(raw_args)
+    # What Python does not know -- --reasoning-parser and the rest of the
+    # router's flags -- is the mesh router's. `--tool-call-parser` and
+    # `--chat-template` are taken back out in `launch_atom_standalone`.
     engine_args, mesh_args = parser.parse_known_args(python_raw_args)
-    forwarded = engine_args.tool_call_parser
-
-    # Not validated against ATOM's vocabulary here, and that is the point.
-    # This flag has two consumers with disjoint vocabularies: the Rust router
-    # declares its own (`json`, `python`, `xml`, `hermes`) and ATOM's
-    # resolver takes `dsml`, `glm`, `kimi`, `kimi_k3`, `minimax`, `qwen`.
-    # Raising on a name ATOM does not know would kill any existing standalone
-    # deployment launched with a router name -- before this entrypoint
-    # registered the flag at all, those passed straight through.
-    #
-    # So: a name ATOM knows binds ATOM's parser, anything else is the
-    # router's and ATOM falls back to reading the chat template. Either way
-    # the value reaches the router, and the choice is logged.
-    if engine_args.tool_call_parser is not None and not _is_atom_tool_call_parser(
-        engine_args.tool_call_parser
-    ):
-        logger.info(
-            "--tool-call-parser=%r is not one of ATOM's formats, so it is "
-            "forwarded to the mesh router and ATOM reads its own format from "
-            "the chat template.",
-            engine_args.tool_call_parser,
-        )
-        engine_args.tool_call_parser = None
-
     return StandaloneArgs(
         engine_args=engine_args,
-        mesh_args=(
-            mesh_args + mesh_network_args + _forward_tool_call_parser(forwarded)
-        ),
+        mesh_args=mesh_args + mesh_network_args,
         default_chat_template_kwargs=engine_args.default_chat_template_kwargs or {},
     )
 
 
-def launch_atom_standalone(atomesh_runner: Any, raw_args: list[str]) -> None:
+def take_flag(args: list[str], flag: str) -> tuple[list[str], str | None]:
+    """`args` without `flag` (as `flag value` or `flag=value`), and its value."""
+    rest, value, it = [], None, iter(args)
+    for arg in it:
+        if arg == flag:
+            value = next(it, None)
+        elif arg.startswith(flag + "="):
+            value = arg[len(flag) + 1 :]
+        else:
+            rest.append(arg)
+    return rest, value
+
+
+def launch_atom_standalone(raw_args: list[str]) -> None:
     standalone_args = parse_standalone_args(raw_args)
-    parsed_args = atomesh_runner.parse_from(standalone_args.mesh_args)
+    engine_args = standalone_args.engine_args
+    # Refused before the Rust runtime is even imported, as before any weights.
+    check_standalone_model(engine_args)
+    atomesh_runner = import_atomesh_runner()
+    tokenizer = load_tokenizer(engine_args)
+    # The template, reasoning parser and tool-call format are decided here,
+    # against ATOM's own resolvers, and handed to the router decided.
+    mesh_args, template_override = take_flag(
+        standalone_args.mesh_args, "--chat-template"
+    )
+    mesh_args, requested_tool_parser = take_flag(mesh_args, "--tool-call-parser")
+    with tempfile.TemporaryDirectory(prefix="atomesh-") as workdir:
+        chat_template = apply_chat_template(tokenizer, template_override, workdir)
+        if not any(arg.startswith("--reasoning-parser") for arg in mesh_args):
+            mesh_args += ["--reasoning-parser", default_reasoning_parser(tokenizer)]
+        tool_format = tool_call_format(
+            requested_tool_parser,
+            tokenizer,
+            engine_args.model,
+            set(atomesh_runner.tool_parser_names()),
+        )
+        if tool_format.mesh_name is not None:
+            mesh_args += ["--tool-call-parser", tool_format.mesh_name]
+        serve_standalone(
+            atomesh_runner,
+            standalone_args,
+            tokenizer,
+            mesh_args,
+            tool_format.parser,
+            chat_template,
+        )
+
+
+def serve_standalone(
+    atomesh_runner: Any,
+    standalone_args: StandaloneArgs,
+    tokenizer: Any,
+    mesh_args: list[str],
+    tool_parser: Any,
+    chat_template: str | None,
+) -> None:
+    engine_args = standalone_args.engine_args
+    parsed_args = atomesh_runner.parse_from(mesh_args)
     cli_args = parsed_args["cli_args"]
-    initialize_engine(standalone_args.engine_args)
-    standalone_service = initialize_standalone_service(
-        standalone_args.engine_args,
-        standalone_args.default_chat_template_kwargs,
-    )
-
-    # This frontend is the api_server's counterpart -- same tokenizer, same
-    # per-request accumulators -- but it builds its engine itself and never
-    # runs that FastAPI lifespan, so it has to apply the GC policy here.
-    tune_gc()
-    maybe_attach_gc_debug_callback("atomesh")
-    freeze_gc_heap("atomesh")
-
-    print("\033[32mATOM starting...\033[0m")
-    print(f"\033[32mHost: {cli_args['host']}:{cli_args['port']}\033[0m")
-    atomesh_runner.launch_mesh(
-        server_config=parsed_args["server_config"],
-        standalone_service=standalone_service,
-    )
+    initialize_engine(engine_args)
+    try:
+        engine_spec = build_engine_spec(
+            engine,
+            tokenizer,
+            engine_args.served_model_name or engine_args.model,
+            standalone_args.default_chat_template_kwargs,
+            tool_parser,
+            chat_template,
+        )
+        # This process keeps the engine and reaps its Cores while Rust serves.
+        tune_gc()
+        maybe_attach_gc_debug_callback("atomesh")
+        freeze_gc_heap("atomesh")
+        print("\033[32mATOM starting...\033[0m")
+        print(f"\033[32mHost: {cli_args['host']}:{cli_args['port']}\033[0m")
+        atomesh_runner.launch_mesh(
+            server_config=parsed_args["server_config"], engine_spec=engine_spec
+        )
+    finally:
+        # Rust has stopped the EngineCores by now, or died trying; reap them.
+        engine.close()
 
 
 def launch_atomesh(atomesh_runner: Any, raw_args: list[str]) -> None:
@@ -296,10 +290,7 @@ def launch_atomesh(atomesh_runner: Any, raw_args: list[str]) -> None:
     if cli_args["pd_disaggregation"] and decode_urls:
         print(f"Decode nodes: {decode_urls}")
 
-    atomesh_runner.launch_mesh(
-        server_config=parsed_args["server_config"],
-        standalone_service=None,
-    )
+    atomesh_runner.launch_mesh(server_config=parsed_args["server_config"])
 
 
 def main() -> None:
@@ -311,16 +302,11 @@ def main() -> None:
         if arg == "--version-verbose":
             print_version(verbose=True)
             return
-    # `python xxx mesh-only ...` starts mesh routing;
-    # other invocations default to ATOM standalone.
-    use_atom_standalone = "mesh-only" not in raw_args
-    # Import the mesh_python module.
-    atomesh_runner = import_atomesh_runner()
-
-    if use_atom_standalone:
-        launch_atom_standalone(atomesh_runner, raw_args)
+    # `mesh-only` starts a plain mesh router; anything else, ATOM standalone.
+    if "mesh-only" in raw_args:
+        launch_atomesh(import_atomesh_runner(), raw_args)
     else:
-        launch_atomesh(atomesh_runner, raw_args)
+        launch_atom_standalone(raw_args)
 
 
 if __name__ == "__main__":

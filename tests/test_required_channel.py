@@ -33,7 +33,12 @@ from atom.model_engine.scheduler import (
     Scheduler,
 )
 from atom.model_engine.sequence import SequenceType
-from atom.sampling_params import UNCONSTRAINED, RequiredChannel, SamplingParams
+from atom.sampling_params import (
+    UNCONSTRAINED,
+    EngineChannel,
+    RequiredChannel,
+    SamplingParams,
+)
 
 # Kimi-K3's ids for its control tokens and the words between them, as its
 # tokenizer encodes them (checked against /share_nfs/models/moonshotai/Kimi-K3).
@@ -121,7 +126,7 @@ def _engine_io():
     io.has_per_req_cache = False
     io.segment_tokenizer = None
     io.requests = {}
-    io._format_channel = io._required_channel = None
+    io.engine_channel = EngineChannel(io.config)
     return io
 
 
@@ -133,9 +138,10 @@ def test_engine_holds_back_every_id_it_stops_on():
 
     (seq,) = _engine_io().preprocess_fanout([1, 2, 3], params)
 
-    assert seq.required_channel.end_ids == (7, EOS, END_OF_MSG)
-    assert seq.required_channel.after == K3_CHANNEL.after
-    assert seq.required_channel.opening == K3_CHANNEL.opening
+    channel = seq.sampling_params.required_channel
+    assert channel.end_ids == (7, EOS, END_OF_MSG)
+    assert channel.after == K3_CHANNEL.after
+    assert channel.opening == K3_CHANNEL.opening
     assert params.required_channel is K3_CHANNEL  # the caller's is untouched
 
 
@@ -144,7 +150,9 @@ def test_the_engine_builds_its_channel_once_and_shares_it():
     params = SamplingParams(required_channel=K3_CHANNEL)
     (first,) = io.preprocess_fanout([1, 2, 3], params)
     (again,) = io.preprocess_fanout([4, 5], params)
-    assert again.required_channel is first.required_channel
+    assert (
+        again.sampling_params.required_channel is first.sampling_params.required_channel
+    )
 
 
 def test_a_request_naming_another_channel_is_refused_at_admission():
@@ -224,10 +232,6 @@ def test_k3_required_call_needs_tools_to_call():
 # Each chat entrypoint gates the server's channel itself; a site that stops
 # passing it samples a required request unconstrained, and nothing else
 # would notice.
-
-
-class _Submitted(Exception):
-    """Raised by a stub engine once it holds the request's sampling params."""
 
 
 def _k3_chat(tool_choice):
@@ -353,40 +357,6 @@ def test_chat_with_a_response_format_takes_no_tool_call_grammar(monkeypatch):
     body = {**_k3_chat("auto"), "response_format": {"type": "json_object"}}
     params, prepared = _chat_with_grammar(monkeypatch, body, text="{}")
     assert params.json_schema is None and prepared == []
-
-
-@pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("tool_choice", ["required", "auto"])
-def test_atomesh_chat_endpoints_hand_the_channel_to_sampling(
-    monkeypatch, stream, tool_choice
-):
-    standalone = pytest.importorskip(
-        "atom.entrypoints.atomesh.atom_standalone_service", exc_type=ImportError
-    )
-    seen = []
-
-    def submit(_prompt, sampling_params, *_args, **_kw):
-        seen.append(sampling_params)
-        raise _Submitted
-
-    service = standalone.AtomStandaloneService.__new__(standalone.AtomStandaloneService)
-    service.model_name = "m"
-    service.default_chat_template_kwargs = {}
-    service.custom_message_encoder = None
-    service.tool_parser_cls = KimiK3Parser
-    service.required_tool_channel = K3_CHANNEL
-    service.tokenizer = K3Tokenizer()
-    service.engine_service = types.SimpleNamespace(generate=submit, start_stream=submit)
-    monkeypatch.setattr(standalone, "apply_chat_template", lambda *a, **k: "prompt")
-
-    entry = (
-        service.start_chat_completions_stream if stream else service.chat_completions
-    )
-    with pytest.raises(_Submitted):
-        entry(_k3_chat(tool_choice))
-    (sampling_params,) = seen
-    expected = K3_CHANNEL if tool_choice == "required" else None
-    assert sampling_params.required_channel == expected
 
 
 # ── the state machine ────────────────────────────────────────────────────

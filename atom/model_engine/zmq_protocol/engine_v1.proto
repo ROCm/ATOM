@@ -6,20 +6,24 @@
 // This file is the specification: what follows is everything a client in any
 // language needs, beyond the messages themselves, to drive an EngineCore.
 // atom/mesh/build.rs compiles it into the Rust binding
-// (atom/mesh/src/atom_engine/wire.rs).
+// (atom/mesh/src/atom_engine/wire.rs); the Python binding, engine_v1_pb2.py,
+// is checked in beside it: after editing this file, run
+// atom/model_engine/zmq_protocol/generate.py and commit both. codec.py there
+// is the Python codec.
 //
 // ============================================================== SOCKETS ===
 //
 // Each EngineCore has three ZMQ sockets to its one client. The client binds,
 // the Core connects; addresses are ipc:// on one node and tcp:// across nodes.
 //
-//   input    client ROUTER  <- Core DEALER   client -> Core: SubmitBatch only
+//   input    client ROUTER  <- Core DEALER   client -> Core: SubmitBatch,
+//                                            DpPrefixCredit
 //   control  client ROUTER  <- Core DEALER   client -> Core: Abort, Utility,
 //                                            AdminCommand, Shutdown
 //   output   client PULL    <- Core PUSH     Core -> client: everything else
 //
-// input carries requests alone, so a control message never queues behind a
-// large SubmitBatch. A client that writes a socket from several threads
+// input carries requests (and the credit corrections that must follow them),
+// so a control message never queues behind a large SubmitBatch. A client that writes a socket from several threads
 // serializes those writes.
 //
 // Handshake. On connecting, the Core sends one empty frame on input and one on
@@ -86,6 +90,11 @@
 //   * aborting: `Abort` names seq_ids; aborting a finished id is a no-op. An
 //     Abort the Core handles before the Submit it follows (the two ride
 //     different sockets) is held for a while and applied on admission.
+//   * `share_cache` DP routing: the client places a request on an estimated
+//     cached prefix (`RequestSpec.dp_est_cached_tokens`) and may correct that
+//     estimate later (`DpPrefixCredit`); a Core run for it reports its prefill
+//     backlog (`PrefillBacklog`) and the prefix it really reused (`DpReuse`).
+//     A client that does not route this way sends neither and may ignore both.
 //   * structured output: a request whose `SamplingParams.json_schema` is set
 //     must have had its grammar prepared on every rank first (the
 //     `prepare_structured_output` utility); a client that cannot prepare it
@@ -165,11 +174,19 @@ message ValueMap {
   repeated MapEntry entries = 1;  // insertion order is preserved
 }
 
+// A list of ints, packed: KV block ids run to thousands, too many for a
+// Value each.
+message IntList {
+  repeated sint64 items = 1;
+}
+
 // A typed value tree for the dict-shaped fields (multimodal data, KV-transfer
 // params, metrics, admin results). Keeps the distinctions a Python consumer
 // can observe -- tuple vs list, int vs float -- so a decoded value is the
 // value that was encoded. What keys a dict holds is up to the component that
-// owns it; the protocol only carries it.
+// owns it; the protocol only carries it. A sender nests at most 30 containers
+// (list, tuple, map) deep, so a message stays under a parser's recursion limit
+// of 100.
 message Value {
   oneof kind {
     bool null_value = 1;      // set to true; the value is None
@@ -182,6 +199,8 @@ message Value {
     ValueList tuple_value = 8;
     ValueMap map_value = 9;
     Tensor tensor_value = 10;
+    IntList int_list_value = 11;   // a list whose items are all ints
+    IntList int_tuple_value = 12;  // a tuple whose items are all ints
     // Python-only escape hatch: a pickled object the typed kinds cannot
     // express. Non-Python clients never send it.
     BufferRef pickled_value = 15;
@@ -199,6 +218,7 @@ message Envelope {
     Utility utility = 12;
     Shutdown shutdown = 13;
     AdminCommand admin = 14;
+    DpPrefixCredit dp_prefix_credit = 15;
     // Core -> Client
     Ready ready = 20;
     Completions completions = 21;
@@ -208,6 +228,8 @@ message Envelope {
     Rejected rejected = 25;
     Stopped stopped = 26;
     AdminReply admin_reply = 27;
+    PrefillBacklog prefill_backlog = 28;
+    DpReuse dp_reuse = 29;
   }
 }
 
@@ -302,6 +324,9 @@ message RequestSpec {
   double arrive_time = 17;        // client wall clock, seconds
   PromptHashChain prompt_hash_chain = 18;  // absent: the Core hashes the prompt
   TraceContext trace = 19;        // absent: the request is not traced
+  // `share_cache` DP routing's estimate of the prompt prefix this Core holds,
+  // in tokens; 0: none.
+  uint64 dp_est_cached_tokens = 20;
 }
 
 message SubmitBatch {
@@ -338,6 +363,13 @@ message AdminCommand {
 
 message Shutdown {}
 
+// Corrected `dp_est_cached_tokens` of requests already submitted, on input
+// after the SubmitBatch that named them; a parallel pair of columns.
+message DpPrefixCredit {
+  repeated uint64 seq_ids = 1;
+  repeated int64 credits = 2;  // tokens
+}
+
 // ---------------------------------------------------------------- outputs --
 
 // The Core is initialized and serving.
@@ -345,13 +377,17 @@ message Ready {
   // The longest prompt this Core's KV pool can hold, in tokens; absent when
   // the Core does not own the pool (the prefill half of a disaggregated pair).
   optional uint64 max_pool_tokens = 1;
+  // Each weight-sync feature this Core's runners cannot take, with the
+  // reason (`ask_what_runners_cannot_take`); empty when it takes them all.
+  map<string, string> weight_syncs_unavailable = 2;
 }
 
 // A finished sequence, as much of it as a client reads.
 message Completion {
   uint64 seq_id = 1;
   BufferRef completion_token_ids = 2;  // int32
-  BufferRef logprobs = 3;              // float64, one per completion token
+  // float64, one per completion token; absent: the request asked for none.
+  BufferRef logprobs = 3;
   uint32 num_prompt_tokens = 4;
   // Prompt tokens whose KV the Core holds: the whole prompt once prefill is
   // done. Not the prefix-cache hit -- that is StreamBatch.num_cached_tokens.
@@ -364,6 +400,7 @@ message Completion {
   optional string external_request_id = 11;
   optional string parent_request_id = 12;
   uint32 sibling_index = 13;
+  bool prefill_completed = 14;  // the prompt's forward ran to its end
 }
 
 message Completions {
@@ -435,3 +472,20 @@ message Rejected {
 
 // The Core is going away; no message follows.
 message Stopped {}
+
+// A `share_cache` Core's prefill backlog, sent when it changes: sequences
+// admitted so far, prompt tokens still to prefill, and the `DpPrefixCredit`
+// entries applied since the last report (the same columns, echoed).
+message PrefillBacklog {
+  uint64 ingested = 1;
+  uint64 pending_prefill_tokens = 2;
+  repeated uint64 credit_seq_ids = 3;
+  repeated int64 credits = 4;
+}
+
+// Prompt tokens a `share_cache` Core really reused for requests placed on an
+// estimated prefix, sent ahead of their first output.
+message DpReuse {
+  repeated uint64 seq_ids = 1;
+  repeated uint64 reused_tokens = 2;
+}

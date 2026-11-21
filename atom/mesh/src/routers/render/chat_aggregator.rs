@@ -1,7 +1,7 @@
 //! Aggregate a `TokenHandle<TokenChunk>` into a non-streaming
 //! `ChatCompletionResponse`.
 
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
@@ -13,19 +13,25 @@ use crate::{
         chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse},
         common::{FunctionCallResponse, ToolCall, ToolChoice, ToolChoiceValue, Usage},
     },
-    reasoning_parser::ParserFactory as ReasoningParserFactory,
+    reasoning_parser::{
+        ParseError, ParserFactory as ReasoningParserFactory, ParserResult, ReasoningParser,
+    },
     routers::{
         comm::error,
         prepare::{
-            parser_factory_lookup::{check_reasoning_parser_availability, get_reasoning_parser},
-            response_context::{ProtocolRequest, ResponseContext},
+            parser_factory_lookup::{
+                check_reasoning_parser_availability, create_reasoning_parser, get_reasoning_parser,
+            },
+            response_context::{ProtocolRequest, ResponseContext, THINK_OPEN},
             tool_constraints::{
                 generate_tool_call_id, get_history_tool_calls_count, parse_json_schema_response,
             },
         },
-        render::logprob_conversion::token_logprobs_to_chat,
+        render::{
+            atom_usage::{self, AtomUsage},
+            logprob_conversion::token_logprobs_to_chat,
+        },
         token_handle::{
-            engine_error::EngineError,
             token_chunk::{FinishReason, MatchedStop, TokenChunk},
             token_handle::TokenHandle,
         },
@@ -41,8 +47,12 @@ use crate::{
 };
 
 pub async fn process(stream: TokenHandle, ctx: ResponseContext) -> Response {
-    match process_typed(stream, ctx).await {
-        Ok(resp) => axum::Json(resp).into_response(),
+    match aggregate(stream, ctx).await {
+        Ok((resp, None)) => axum::Json(resp).into_response(),
+        Ok((resp, Some(atom))) => match atom.extend_response(&resp, atom_usage::CHAT) {
+            Ok(value) => axum::Json(value).into_response(),
+            Err(e) => error::internal_error("serialize_failed", e.to_string()),
+        },
         Err(resp) => resp,
     }
 }
@@ -51,6 +61,14 @@ pub async fn process_typed(
     stream: TokenHandle,
     ctx: ResponseContext,
 ) -> Result<ChatCompletionResponse, Response> {
+    aggregate(stream, ctx).await.map(|(resp, _)| resp)
+}
+
+/// The response, and ATOM's usage additions where the backend has them.
+async fn aggregate(
+    stream: TokenHandle,
+    ctx: ResponseContext,
+) -> Result<(ChatCompletionResponse, Option<AtomUsage>), Response> {
     let chat_request = match &ctx.original {
         ProtocolRequest::Chat(r) => Arc::clone(r),
         ProtocolRequest::Generate(_) => {
@@ -118,6 +136,7 @@ pub async fn process_typed(
             ctx.reasoning_parser_factory.as_ref(),
             ctx.configured_tool_parser.as_deref(),
             ctx.configured_reasoning_parser.as_deref(),
+            ctx.prompt_opens_reasoning,
         )
         .await;
         match res {
@@ -146,7 +165,7 @@ pub async fn process_typed(
     .maybe_system_fingerprint(weight_version)
     .build();
 
-    Ok(response)
+    Ok((response, AtomUsage::of_completes(&completes)))
 }
 
 async fn collect_completes(mut stream: TokenHandle) -> Result<Vec<TokenChunk>, Response> {
@@ -155,7 +174,7 @@ async fn collect_completes(mut stream: TokenHandle) -> Result<Vec<TokenChunk>, R
         match item {
             Ok(chunk @ TokenChunk::Complete { .. }) => completes.push(chunk),
             Ok(TokenChunk::Partial { .. }) => continue,
-            Err(e) => return Err(engine_error_to_response(e)),
+            Err(e) => return Err(e.into_response()),
         }
     }
     stream.mark_completed();
@@ -176,6 +195,7 @@ async fn process_choice(
     reasoning_parser_factory: Option<&ReasoningParserFactory>,
     configured_tool_parser: Option<&str>,
     configured_reasoning_parser: Option<&str>,
+    prompt_opens_reasoning: bool,
 ) -> Result<ChatChoice, String> {
     let (token_ids, finish_reason, matched_stop, logprobs) = match complete {
         TokenChunk::Complete {
@@ -214,18 +234,19 @@ async fn process_choice(
 
     if reasoning_available {
         if let Some(factory) = reasoning_parser_factory {
-            let pooled =
-                get_reasoning_parser(factory, configured_reasoning_parser, &chat_request.model);
-            let mut parser = pooled.lock().await;
-            match parser.detect_and_parse_reasoning(&processed_text) {
-                Ok(result) => {
-                    if !result.reasoning_text.is_empty() {
-                        reasoning_text = Some(result.reasoning_text);
-                    }
-                    processed_text = result.normal_text;
-                }
-                Err(e) => return Err(format!("Reasoning parsing error: {}", e)),
+            let result = split_reasoning(
+                factory,
+                configured_reasoning_parser,
+                &chat_request.model,
+                &processed_text,
+                prompt_opens_reasoning,
+            )
+            .await
+            .map_err(|e| format!("Reasoning parsing error: {}", e))?;
+            if !result.reasoning_text.is_empty() {
+                reasoning_text = Some(result.reasoning_text);
             }
+            processed_text = result.normal_text;
         }
     }
 
@@ -297,6 +318,110 @@ async fn process_choice(
     })
 }
 
+/// A whole reply split into content and reasoning; `prompt_opens_reasoning`
+/// puts the prompt's opener before it.
+///
+/// `detect_and_parse_reasoning` refuses a text over the parser's
+/// `max_buffer_size` (64 KiB, counting an opener the parser adds itself, as
+/// MiniMax's does); such a reply is split by [`split_in_pieces`] instead.
+async fn split_reasoning(
+    factory: &ReasoningParserFactory,
+    configured: Option<&str>,
+    model: &str,
+    text: &str,
+    prompt_opens_reasoning: bool,
+) -> Result<ParserResult, String> {
+    let opener = prompt_opens_reasoning.then_some(THINK_OPEN);
+    let opened: Cow<str> = match opener {
+        Some(opener) => format!("{opener}{text}").into(),
+        None => text.into(),
+    };
+    {
+        let pooled = get_reasoning_parser(factory, configured, model);
+        let mut parser = pooled.lock().await;
+        match parser.detect_and_parse_reasoning(&opened) {
+            Err(ParseError::BufferOverflow(_)) => {}
+            result => return result.map_err(|e| e.to_string()),
+        }
+    }
+    match create_reasoning_parser(factory, configured, model) {
+        Some(mut parser) => split_in_pieces(parser.as_mut(), &opened),
+        None => Ok(ParserResult::normal(text.to_string())),
+    }
+}
+
+/// The most a piece of [`split_in_pieces`] holds, well under any parser's
+/// `max_buffer_size`.
+const PIECE_MAX_BYTES: usize = 32 * 1024;
+
+/// A `<` this close to the end with no `>` after it may be a tag cut short:
+/// it stays on the piece before it.
+const TAG_TAIL_BYTES: usize = 16;
+
+/// `detect_and_parse_reasoning` for a text of any length, through a fresh
+/// `parser`'s streaming path a piece at a time.
+///
+/// Each `<` starts a piece, so the parser reads every tag whole and at the
+/// head of its piece: the streaming path trims the reasoning before a closer
+/// in the same piece, which here is none. A `<` in the last
+/// [`TAG_TAIL_BYTES`] with no `>` after it stays on the piece before, or the
+/// parser would hold it back as a tag's prefix and drop it. The result is
+/// then trimmed as the one-shot parse trims: reasoning after the opener, to
+/// the end if no closer follows, and the content after the closer.
+fn split_in_pieces(parser: &mut dyn ReasoningParser, text: &str) -> Result<ParserResult, String> {
+    let (mut normal, mut reasoning, mut entered) = (String::new(), String::new(), false);
+    for piece in reasoning_pieces(text) {
+        let result = parser
+            .parse_reasoning_streaming_incremental(piece)
+            .map_err(|e| e.to_string())?;
+        entered |= parser.is_in_reasoning() || !result.reasoning_text.is_empty();
+        normal.push_str(&result.normal_text);
+        reasoning.push_str(&result.reasoning_text);
+    }
+    if !entered {
+        // The one-shot parse hands back a reply without reasoning untouched.
+        return Ok(ParserResult::normal(text.to_string()));
+    }
+    let reasoning = if parser.is_in_reasoning() {
+        reasoning.trim()
+    } else {
+        reasoning.trim_start()
+    };
+    Ok(ParserResult::new(
+        normal.trim().to_string(),
+        reasoning.to_string(),
+    ))
+}
+
+/// `text` cut before each `<` (but one in a short unclosed tail), and every
+/// piece longer than [`PIECE_MAX_BYTES`] cut again at a char boundary.
+fn reasoning_pieces(text: &str) -> Vec<&str> {
+    let tail_start = text.len().saturating_sub(TAG_TAIL_BYTES);
+    let mut cuts: Vec<usize> = text
+        .match_indices('<')
+        .map(|(at, _)| at)
+        .filter(|&at| at > 0 && (at < tail_start || text[at..].contains('>')))
+        .collect();
+    cuts.push(text.len());
+    let mut pieces = Vec::with_capacity(cuts.len());
+    let mut start = 0;
+    for cut in cuts {
+        while cut - start > PIECE_MAX_BYTES {
+            let mut end = start + PIECE_MAX_BYTES;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            pieces.push(&text[start..end]);
+            start = end;
+        }
+        if cut > start {
+            pieces.push(&text[start..cut]);
+        }
+        start = cut;
+    }
+    pieces
+}
+
 async fn parse_tool_calls(
     factory: &ToolParserFactory,
     configured: Option<&str>,
@@ -340,12 +465,14 @@ async fn parse_tool_calls(
     }
 }
 
+/// The siblings share one prompt: it is counted once (each sibling reports
+/// it), their outputs summed.
 fn build_usage(completes: &[TokenChunk]) -> Usage {
     let mut prompt = 0u32;
     let mut completion = 0u32;
     for c in completes {
         if let TokenChunk::Complete { usage, .. } = c {
-            prompt += usage.prompt_tokens;
+            prompt = prompt.max(usage.prompt_tokens);
             completion += usage.completion_tokens;
         }
     }
@@ -368,28 +495,67 @@ fn finish_reason_to_str(r: &FinishReason) -> &'static str {
     }
 }
 
-fn engine_error_to_response(err: EngineError) -> Response {
-    match err {
-        EngineError::Transport(s) => {
-            error::service_unavailable("engine_transport_error", format!("transport error: {}", s))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parser(name: &str) -> Box<dyn ReasoningParser> {
+        ReasoningParserFactory::new()
+            .registry()
+            .create_parser(name)
+            .unwrap()
+    }
+
+    /// Under 64 KiB both parses run: the piecewise one says what the
+    /// one-shot one says, tags, whitespace, a dangling `<` and pieces cut
+    /// inside multi-byte text alike.
+    #[test]
+    fn the_piecewise_split_matches_the_one_shot_parse() {
+        let long_reasoning = format!(
+            "<think>{}</think>\n\n{}",
+            "héllo wörld, 1 < 2 ".repeat(2000),
+            "answer ".repeat(10)
+        );
+        let many_tags = format!("<think>{}</think>c <", "a<b> c</b ".repeat(3000));
+        let texts = [
+            "plain answer",
+            "x < y and z > w",
+            "<think>a b</think> answer",
+            "<think>\n  reasoning with spaces \n</think>\n\n answer  ",
+            "<think>unclosed reasoning  ",
+            "<think>r</think>answer with <b>html</b> and a < b",
+            "<think>r</think>ends with <",
+            "<think>r</think>ends with </",
+            "<think>r <maybe a tag> more</think> x",
+            "<think>word</think>",
+            "reasoning only, the opener in the prompt</think>answer",
+            &long_reasoning,
+            &many_tags,
+        ];
+        for name in ["qwen3", "glm45", "deepseek_r1", "minimax"] {
+            for text in texts {
+                assert!(text.len() < 60_000, "{}", text.len());
+                let one_shot = parser(name).detect_and_parse_reasoning(text).unwrap();
+                let pieces = split_in_pieces(parser(name).as_mut(), text).unwrap();
+                let short = &text[..text.len().min(60)];
+                assert_eq!(
+                    (pieces.normal_text, pieces.reasoning_text),
+                    (one_shot.normal_text, one_shot.reasoning_text),
+                    "{name}: {short:?}"
+                );
+            }
         }
-        EngineError::Prefill(m) => {
-            error::internal_error("engine_prefill_error", format!("prefill error: {}", m))
-        }
-        EngineError::DecodeError(m) => {
-            error::internal_error("engine_decode_error", format!("decode error: {}", m))
-        }
-        EngineError::PrefillEarlyClose => error::internal_error(
-            "engine_prefill_early_close",
-            "prefill stream closed without Complete",
-        ),
-        EngineError::DecodeIncomplete => error::internal_error(
-            "engine_decode_incomplete",
-            "decode stream closed without Complete",
-        ),
-        EngineError::ConnectionAcquireFailed(r) => {
-            error::service_unavailable("engine_connection_failed", r)
-        }
-        EngineError::RequestBuildFailed(r) => error::bad_request("engine_request_build_failed", r),
+    }
+
+    #[test]
+    fn pieces_start_at_tags_and_stay_under_the_cap() {
+        let text = format!("a<think>b</think>{}<x", "é".repeat(PIECE_MAX_BYTES));
+        let pieces = reasoning_pieces(&text);
+        assert_eq!(pieces.concat(), text);
+        assert_eq!(&pieces[..2], ["a", "<think>b"]);
+        assert!(pieces[2].starts_with("</think>é"));
+        assert!(pieces.iter().all(|p| p.len() <= PIECE_MAX_BYTES));
+        // The unclosed `<x` at the end stays on the piece before it.
+        assert!(pieces.last().unwrap().ends_with("é<x"));
     }
 }

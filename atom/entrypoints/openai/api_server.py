@@ -49,10 +49,10 @@ from atom.kv_transfer.disaggregation.mooncake.endpoint import (
     producer_endpoint,
 )
 from atom.model_engine.arg_utils import EngineArgs
-from atom.model_engine.llm_engine import InputOutputProcessor, load_tokenizer
+from atom.model_engine.llm_engine import load_tokenizer
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.segment_tokenizer import PrefixEncoding
-from atom.model_engine.sequence import new_token_ids
+from atom.model_engine.sequence import PER_REQ_CACHE_MODEL_TYPES, new_token_ids
 from atom.multimodal.processing import prepare_multimodal_inputs
 from atom.multimodal.registry import get_native_multimodal_processor
 from atom.observability.tracing import TraceMiddleware, set_request_id
@@ -983,7 +983,7 @@ async def generate_async(
         #   2) Always drop the seq from io_processor.requests. The engine frees
         #      its own KV on finish, but this dict is only cleaned up here for
         #      non-stream requests -- without an unconditional pop, every
-        #      completed non-stream request leaks a Sequence (pending grows
+        #      completed non-stream request leaks an IngressRequest (pending grows
         #      forever). Streaming pops via cleanup_stream instead.
         if seq is not None:
             if not _finished_ok:
@@ -1333,8 +1333,7 @@ def _validate_chunked_receive(params: dict[str, Any] | None) -> None:
     # D's DCP only from a request.
     if (
         cfg.decode_context_parallel_size > 1
-        and cfg.hf_config.model_type
-        in InputOutputProcessor._per_req_cache_model_types()
+        and cfg.hf_config.model_type in PER_REQ_CACHE_MODEL_TYPES
     ):
         raise HTTPException(
             status_code=400,
