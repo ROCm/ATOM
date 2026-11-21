@@ -445,21 +445,19 @@ impl AppContextBuilder {
             .client
             .as_ref()
             .expect("client must be set before load monitor");
-        self.load_monitor = Some(Arc::new(
-            LoadMonitor::new(
-                self.worker_registry
-                    .as_ref()
-                    .expect("worker_registry must be set")
-                    .clone(),
-                self.policy_registry
-                    .as_ref()
-                    .expect("policy_registry must be set")
-                    .clone(),
-                client.clone(),
-                config.load_sample_interval_secs(),
-            )
-            .with_backend(config.backend),
-        ));
+        self.load_monitor = Some(Arc::new(LoadMonitor::new(
+            self.worker_registry
+                .as_ref()
+                .expect("worker_registry must be set")
+                .clone(),
+            self.policy_registry
+                .as_ref()
+                .expect("policy_registry must be set")
+                .clone(),
+            client.clone(),
+            config.backend,
+            config.load_sample_interval_secs(),
+        )));
         self
     }
 

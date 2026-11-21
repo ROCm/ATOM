@@ -298,6 +298,7 @@ pub async fn create_test_context(config: RouterConfig) -> (Arc<AppContext>, Prep
         worker_registry.clone(),
         policy_registry.clone(),
         client.clone(),
+        config.backend,
         config.worker_startup_check_interval_secs,
     )));
 
@@ -382,6 +383,7 @@ pub async fn create_test_context_with_parsers(
         worker_registry.clone(),
         policy_registry.clone(),
         client.clone(),
+        config.backend,
         config.worker_startup_check_interval_secs,
     )));
 
