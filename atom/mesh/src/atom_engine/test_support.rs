@@ -147,6 +147,8 @@ pub(crate) fn model_spec(served_name: &str, tokenizer_path: &str) -> ModelSpec {
         default_max_tokens: 16,
         max_output_tokens: None,
         synthetic_acceptance: false,
+        synthetic_token_text: None,
+        preserve_tool_call_arguments: false,
         model_card: Default::default(),
         required_channel: None,
         reasoning_toggle: None,

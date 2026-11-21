@@ -86,6 +86,7 @@ def test_standalone_launches_with_keywords_launch_mesh_takes():
     with (
         mock.patch.object(atomesh_server, "check_standalone_model"),
         mock.patch.object(atomesh_server, "load_tokenizer"),
+        mock.patch.object(atomesh_server, "check_standalone_checkpoint"),
         mock.patch.object(atomesh_server, "apply_chat_template", return_value=None),
         mock.patch.object(
             atomesh_server, "default_reasoning_parser", return_value="qwen3"

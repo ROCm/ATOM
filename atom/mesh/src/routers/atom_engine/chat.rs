@@ -46,11 +46,16 @@ impl AtomEngineRouter {
             return Err(not_yet("chat logprobs"));
         }
         let mut request = body.clone();
+        let preserve = self.engine.model.preserve_tool_call_arguments;
         for message in &mut request.messages {
-            if let ChatMessage::Assistant {
-                tool_calls: Some(calls),
-                ..
-            } = message
+            // With `preserve` the template takes them as sent (`to_template_dict`).
+            if let (
+                false,
+                ChatMessage::Assistant {
+                    tool_calls: Some(calls),
+                    ..
+                },
+            ) = (preserve, &mut *message)
             {
                 calls
                     .iter_mut()

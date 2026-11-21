@@ -9,6 +9,7 @@ mod chat;
 mod request;
 #[cfg(test)]
 mod router_tests;
+mod synthetic;
 mod token_source;
 
 use request::Admission;
@@ -69,18 +70,23 @@ impl AtomEngineRouter {
         let model = &engine.model;
         let source = model.tokenizer_path.clone();
         let chat_template = model.chat_template.clone();
+        let synthetic_text = model.synthetic_token_text.clone();
         ctx.tokenizer_registry
             .load(
                 &TokenizerRegistry::generate_id(),
                 &model.served_name,
                 &model.tokenizer_path,
                 || async move {
-                    factory::create_tokenizer_async_with_chat_template(
+                    let tokenizer = factory::create_tokenizer_async_with_chat_template(
                         &source,
                         chat_template.as_deref(),
                     )
                     .await
-                    .map_err(|e| format!("Failed to load tokenizer: {e}"))
+                    .map_err(|e| format!("Failed to load tokenizer: {e}"))?;
+                    Ok(match synthetic_text {
+                        Some(text) => synthetic::SyntheticText::wrap(tokenizer, text),
+                        None => tokenizer,
+                    })
                 },
             )
             .await
@@ -114,8 +120,11 @@ impl AtomEngineRouter {
         };
         let request = Arc::new(chat.request);
         let (headers, model_id, app) = (headers.cloned(), self.model_id(), self.ctx.clone());
+        let preserve = self.engine.model.preserve_tool_call_arguments;
         let (payload, ctx) = self
-            .on_prepare_worker(move || prepare::prepare_chat(request, headers, model_id, &app))
+            .on_prepare_worker(move || {
+                prepare::prepare_chat_with(request, headers, model_id, &app, preserve)
+            })
             .await?;
         let stream = self.submit(&payload, &ctx, admission)?;
         Ok(if payload.stream {

@@ -35,6 +35,7 @@
         "text"
       ]
     },
+    "preserve_tool_call_arguments": true,
     "reasoning_toggle": {
       "name": "enable_thinking",
       "off": false,
@@ -56,6 +57,7 @@
     },
     "served_name": "served",
     "synthetic_acceptance": false,
+    "synthetic_token_text": "synthetic ",
     "template_efforts": [
       "high",
       "low",

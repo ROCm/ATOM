@@ -18,6 +18,7 @@ from atom.entrypoints.openai.chat_encoders import (
     load_custom_message_encoder,
     render_probe_prompt,
     resolve_reasoning_toggle,
+    template_needs_tool_call_argument_strings,
 )
 from atom.entrypoints.openai.model_capabilities import deployment_metadata
 from atom.entrypoints.openai.protocol import DEFAULT_MAX_TOKENS
@@ -26,13 +27,16 @@ from atom.entrypoints.openai.reasoning import (
     template_opens_reasoning_implicitly,
 )
 from atom.entrypoints.openai.reasoning_dialects import THINK_END_MARKER, resolve_dialect
+from atom.entrypoints.openai.streaming_dispatch import SYNTHETIC_TOKEN_TEXT
 from atom.entrypoints.openai.tool_parser.registry import (
     PARSERS_BY_NAME,
     required_call_channel,
     resolve_tool_call_parser,
+    template_keeps_tool_call_arguments,
 )
 from atom.kv_transfer.disaggregation.factory import parse_kv_transfer_config
 from atom.kv_transfer.disaggregation.pd_producer import pd_transfer_entries
+from atom.model_loader.weight_utils import local_model_dir
 from atom.utils import envs
 
 # Each ATOM tool-call format (`PARSERS_BY_NAME`) by mesh's name for the same
@@ -42,7 +46,9 @@ MESH_TOOL_PARSERS = {
     "qwen": "qwen_xml",
     "kimi": "kimi",
     "kimi_k3": "kimi_k3",
-    "glm": "glm",
+    # mesh's `glm` is GLM-4.5's, which wants a newline after the call's name;
+    # ATOM's GLM template (4.5 through 5.x) writes none, as glm47_moe reads.
+    "glm": "glm47_moe",
     "minimax": "minimax",
     "dsml": "dsml",
     "dsml_v41": "dsml_v41",
@@ -80,6 +86,56 @@ def check_standalone_model(engine_args: Any) -> None:
             f"server places by (it has {', '.join(_RUST_DP_STRATEGIES)}); serve "
             "it with USE_ATOMESH_ENTRYPOINTS=0."
         )
+
+
+def check_standalone_checkpoint(model: str) -> None:
+    """Refuse, once the tokenizer is in the hub cache and before any weights
+    load, a checkpoint the Rust frontend would serve wrongly: gpt-oss, whose
+    harmony channels mesh has no reader for (it would read them as `<think>`
+    text), and a tokenizer that ships only tiktoken files, which mesh loads as
+    a tokenizer that cannot render a chat template, so every chat 400s."""
+    directory = local_model_dir(model)
+    if not os.path.isdir(directory):
+        return
+    config = os.path.join(directory, "config.json")
+    if os.path.isfile(config):
+        with open(config, encoding="utf-8") as f:
+            model_type = json.load(f).get("model_type")
+        if model_type == "gpt_oss":
+            raise ValueError(
+                f"{model} is gpt-oss, whose harmony format the atomesh standalone "
+                "server cannot read yet; serve it with USE_ATOMESH_ENTRYPOINTS=0."
+            )
+    files = os.listdir(directory)
+    tiktoken = "tiktoken.model" in files or any(
+        name.endswith(".tiktoken") for name in files
+    )
+    if tiktoken and "tokenizer.json" not in files:
+        raise ValueError(
+            f"{model} ships its tokenizer only as tiktoken files, which the atomesh "
+            "standalone server cannot render a chat template with yet; serve it "
+            "with USE_ATOMESH_ENTRYPOINTS=0."
+        )
+
+
+def synthetic_token_text(engine_args: Any) -> str | None:
+    """What a token reads as when forced acceptance makes the text meaningless,
+    decided off the same flags as the Python server (`_setup_stream_dispatch`)."""
+    forced = (
+        engine_args.spec_decode_acceptance_length is not None
+        or engine_args.spec_decode_acceptance_rate is not None
+    )
+    return SYNTHETIC_TOKEN_TEXT if forced else None
+
+
+def preserve_tool_call_arguments(tokenizer: Any) -> bool:
+    """Whether history tool-call arguments reach the template as the strings the
+    client sent, as the Python server decides it: Kimi-K3 renders them
+    verbatim, DeepSeek-R1/V3 refuse a mapping."""
+    probe = render_probe_prompt(tokenizer, None, tools=True)
+    return template_keeps_tool_call_arguments(
+        probe
+    ) or template_needs_tool_call_argument_strings(tokenizer, None)
 
 
 def apply_chat_template(
@@ -194,6 +250,8 @@ def build_engine_spec(
     default_chat_template_kwargs: dict[str, Any],
     tool_parser: type | None,
     chat_template: str | None,
+    *,
+    synthetic_text: str | None = None,
 ) -> str:
     config = engine.config
     toggle = resolve_reasoning_toggle(tokenizer)
@@ -214,6 +272,8 @@ def build_engine_spec(
                 # (`SamplingParams.validate_logprob_options`).
                 "synthetic_acceptance": speculative is not None
                 and speculative.synthetic_acceptance_rates is not None,
+                "synthetic_token_text": synthetic_text,
+                "preserve_tool_call_arguments": preserve_tool_call_arguments(tokenizer),
                 "required_channel": required_channel(tool_parser, tokenizer, config),
                 "reasoning_toggle": (
                     None

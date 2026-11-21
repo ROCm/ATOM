@@ -875,6 +875,8 @@ fn the_spec_python_writes_parses() {
     );
     assert_eq!(model.model_card["context_window"], json!(2048));
     assert!(!model.synthetic_acceptance);
+    assert_eq!(model.synthetic_token_text.as_deref(), Some("synthetic "));
+    assert!(model.preserve_tool_call_arguments);
     let channel = model.required_channel.as_ref().unwrap();
     assert_eq!(
         (channel.after.as_slice(), channel.opening.as_slice()),

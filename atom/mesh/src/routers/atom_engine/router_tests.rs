@@ -13,6 +13,7 @@ use super::AtomEngineRouter;
 use crate::{
     app_context::AppContextBuilder,
     atom_engine::{
+        spec::ModelSpec,
         test_support::{self, FakeCore},
         wire::pb,
         AtomEngine,
@@ -99,13 +100,21 @@ impl Served {
     }
 
     async fn serve(ranks: usize, chat_template: &str, config: RouterConfig) -> Self {
+        Self::serve_model(ranks, chat_template, config, |_| {}).await
+    }
+
+    /// `serve`, with the spec's model as `edit` leaves it.
+    async fn serve_model(
+        ranks: usize,
+        chat_template: &str,
+        config: RouterConfig,
+        edit: impl FnOnce(&mut ModelSpec),
+    ) -> Self {
         let dir = TempDir::new().unwrap();
         let tokenizer = write_tokenizer(dir.path(), chat_template);
-        let spec = test_support::engine_spec(
-            dir.path(),
-            ranks,
-            test_support::model_spec(MODEL, &tokenizer),
-        );
+        let mut model = test_support::model_spec(MODEL, &tokenizer);
+        edit(&mut model);
+        let spec = test_support::engine_spec(dir.path(), ranks, model);
         let (client, cores) = test_support::connect(&spec, &vec![None; ranks]);
         let engine = Arc::new(AtomEngine {
             model: spec.model,
@@ -762,4 +771,67 @@ async fn a_chats_thinking_and_rank_are_read_off_its_body() {
         FakeCore::recv_on(&rank0.input, std::time::Duration::from_millis(200)).is_none(),
         "rank 0 got nothing"
     );
+}
+
+/// A history tool call and its result, after `user: hello`.
+fn after_a_tool_call() -> Value {
+    json!({"model": MODEL, "messages": [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "call_0", "type": "function",
+            "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"},
+        }]},
+        {"role": "tool", "tool_call_id": "call_0", "content": "hello"},
+    ]})
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn history_tool_call_arguments_reach_the_template_as_the_spec_says() {
+    // `hello` where the template got the arguments as a string, `world` where
+    // it got them parsed.
+    let template = "{% for m in messages %}{% if m.tool_calls %}\
+                    {% if m.tool_calls[0].function.arguments is string %}hello {% else %}world {% endif %}\
+                    {% endif %}{% endfor %}assistant:";
+    for (preserve, read_as) in [(true, HELLO), (false, WORLD)] {
+        let mut served = Served::serve_model(1, template, RouterConfig::default(), |model| {
+            model.preserve_tool_call_arguments = preserve
+        })
+        .await;
+        let core = answer_each(std::mem::take(&mut served.cores), hello_world);
+        let (status, body) = json_body(
+            served
+                .post("/v1/chat/completions", after_a_tool_call())
+                .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, _, data) = core.into_iter().next().unwrap().join().unwrap();
+        assert_eq!(
+            data[0],
+            test_support::token_frame(&[read_as, 4, 5]),
+            "preserve={preserve}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn forced_acceptance_text_stands_in_for_every_token() {
+    let mut served = Served::serve_model(1, TEMPLATE, RouterConfig::default(), |model| {
+        model.synthetic_token_text = Some("synthetic ".into())
+    })
+    .await;
+    let core = answer_each(std::mem::take(&mut served.cores), hello_world);
+    let (status, body) = json_body(
+        served
+            .post("/v1/chat/completions", user_hello(json!({})))
+            .await,
+    )
+    .await;
+    core.into_iter().next().unwrap().join().unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "synthetic synthetic "
+    );
+    assert_eq!(body["usage"]["completion_tokens"], 2);
 }

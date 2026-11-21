@@ -23,6 +23,7 @@ MESH_NAMES = {
     "kimi",
     "kimi_k3",
     "glm",
+    "glm47_moe",
     "minimax",
     "dsml",
     "dsml_v41",
@@ -44,11 +45,28 @@ def fake_engine(speculative=None):
     )
 
 
-def build(monkeypatch, *, toggle=None, channel=None, speculative=None):
+def build(
+    monkeypatch,
+    *,
+    toggle=None,
+    channel=None,
+    speculative=None,
+    preserve=False,
+    synthetic_text=None,
+):
     monkeypatch.setattr(engine_spec, "resolve_reasoning_toggle", lambda tok: toggle)
     monkeypatch.setattr(engine_spec, "required_call_channel", lambda cls, tok: channel)
+    monkeypatch.setattr(
+        engine_spec, "preserve_tool_call_arguments", lambda tok: preserve
+    )
     spec = engine_spec.build_engine_spec(
-        fake_engine(speculative), object(), "served", {"k": 1}, None, "/t/chat.jinja"
+        fake_engine(speculative),
+        object(),
+        "served",
+        {"k": 1},
+        None,
+        "/t/chat.jinja",
+        synthetic_text=synthetic_text,
     )
     return json.loads(spec)["model"]
 
@@ -63,6 +81,71 @@ def test_the_output_cap_and_card_are_the_deployments(monkeypatch):
     assert model["required_channel"] is None
     assert model["reasoning_toggle"] is None
     assert model["synthetic_acceptance"] is False
+    assert model["synthetic_token_text"] is None
+    assert model["preserve_tool_call_arguments"] is False
+
+
+def test_the_python_servers_text_decisions_are_handed_over(monkeypatch):
+    model = build(monkeypatch, preserve=True, synthetic_text="synthetic ")
+    assert model["preserve_tool_call_arguments"] is True
+    assert model["synthetic_token_text"] == "synthetic "
+
+
+@pytest.mark.parametrize(
+    "length, rate, text",
+    [(None, None, None), (2.5, None, "synthetic "), (None, 0.7, "synthetic ")],
+)
+def test_synthetic_text_is_decided_off_the_python_servers_flags(length, rate, text):
+    args = SimpleNamespace(
+        spec_decode_acceptance_length=length, spec_decode_acceptance_rate=rate
+    )
+    assert engine_spec.synthetic_token_text(args) == text
+
+
+@pytest.mark.parametrize(
+    "keeps, needs, preserve",
+    [(False, False, False), (True, False, True), (False, True, True)],
+)
+def test_tool_call_arguments_are_preserved_as_the_python_server_decides(
+    monkeypatch, keeps, needs, preserve
+):
+    monkeypatch.setattr(engine_spec, "render_probe_prompt", lambda *a, **k: "probe")
+    monkeypatch.setattr(
+        engine_spec, "template_keeps_tool_call_arguments", lambda probe: keeps
+    )
+    monkeypatch.setattr(
+        engine_spec,
+        "template_needs_tool_call_argument_strings",
+        lambda tok, encoder: needs,
+    )
+    assert engine_spec.preserve_tool_call_arguments(object()) is preserve
+
+
+def write_checkpoint(directory, files, model_type="llama"):
+    (directory / "config.json").write_text(json.dumps({"model_type": model_type}))
+    for name in files:
+        (directory / name).write_text("")
+    return str(directory)
+
+
+def test_gpt_oss_is_refused(tmp_path):
+    model = write_checkpoint(tmp_path, ["tokenizer.json"], model_type="gpt_oss")
+    with pytest.raises(ValueError, match="harmony"):
+        engine_spec.check_standalone_checkpoint(model)
+
+
+@pytest.mark.parametrize("tiktoken", ["tiktoken.model", "o200k.tiktoken"])
+def test_a_tiktoken_only_tokenizer_is_refused(tmp_path, tiktoken):
+    model = write_checkpoint(tmp_path, [tiktoken, "tokenizer_config.json"])
+    with pytest.raises(ValueError, match="tiktoken"):
+        engine_spec.check_standalone_checkpoint(model)
+
+
+def test_a_tokenizer_json_beside_tiktoken_is_served(tmp_path):
+    # Mesh loads tokenizer.json first, as a tokenizer that renders templates.
+    engine_spec.check_standalone_checkpoint(
+        write_checkpoint(tmp_path, ["tiktoken.model", "tokenizer.json"])
+    )
 
 
 def test_only_forced_acceptance_withholds_logprobs(monkeypatch):
@@ -130,9 +213,16 @@ def test_the_spec_matches_what_rust_parses(monkeypatch):
         }
         for rank in range(2)
     ]
+    monkeypatch.setattr(engine_spec, "preserve_tool_call_arguments", lambda tok: True)
     spec = json.loads(
         engine_spec.build_engine_spec(
-            engine, object(), "served", {"k": 1}, None, "/t/chat.jinja"
+            engine,
+            object(),
+            "served",
+            {"k": 1},
+            None,
+            "/t/chat.jinja",
+            synthetic_text="synthetic ",
         )
     )
     text = json.dumps(spec, indent=2, sort_keys=True) + "\n"
@@ -198,7 +288,7 @@ def test_an_unknown_name_is_refused_before_the_weights_load(monkeypatch):
 
 def test_unset_reads_the_template_and_falls_back_to_mesh(monkeypatch):
     glm = PARSERS_BY_NAME["glm"]
-    assert tool_format(monkeypatch, None, resolved=glm) == (glm, "glm")
+    assert tool_format(monkeypatch, None, resolved=glm) == (glm, "glm47_moe")
     # The template names no format: mesh keeps its guess by model name.
     assert tool_format(monkeypatch, None) == (None, None)
 
@@ -302,6 +392,11 @@ def test_launch_decides_everything_before_weights_and_reaps_after(monkeypatch):
         lambda a: calls.append("tokenizer") or object(),
     )
     monkeypatch.setattr(
+        atomesh_server,
+        "check_standalone_checkpoint",
+        lambda m: calls.append("checkpoint"),
+    )
+    monkeypatch.setattr(
         atomesh_server, "apply_chat_template", lambda *a: calls.append("template")
     )
     monkeypatch.setattr(
@@ -322,7 +417,7 @@ def test_launch_decides_everything_before_weights_and_reaps_after(monkeypatch):
         atomesh_server.engine = engine
 
     monkeypatch.setattr(atomesh_server, "initialize_engine", initialize)
-    monkeypatch.setattr(atomesh_server, "build_engine_spec", lambda *a: "{}")
+    monkeypatch.setattr(atomesh_server, "build_engine_spec", lambda *a, **k: "{}")
     for name in ("tune_gc", "maybe_attach_gc_debug_callback", "freeze_gc_heap"):
         monkeypatch.setattr(atomesh_server, name, lambda *a: None)
 
@@ -346,6 +441,7 @@ def test_launch_decides_everything_before_weights_and_reaps_after(monkeypatch):
         "check",
         "runtime",
         "tokenizer",
+        "checkpoint",
         "template",
         "reasoning",
         "tools",
@@ -361,3 +457,62 @@ def test_launch_decides_everything_before_weights_and_reaps_after(monkeypatch):
         "--tool-call-parser",
         "qwen_xml",
     ]
+
+
+def test_the_decided_flags_take_both_spellings_and_need_a_value():
+    parsed = atomesh_server.parse_standalone_args(
+        [
+            "--model",
+            "/m",
+            "--tool_call_parser",
+            "hermes",
+            "--chat_template",
+            "t.jinja",
+            "--reasoning_parser",
+            "step3",
+            "--server_port",
+            "9",
+        ]
+    )
+    args = parsed.engine_args
+    assert (args.tool_call_parser, args.chat_template, args.reasoning_parser) == (
+        "hermes",
+        "t.jinja",
+        "step3",
+    )
+    assert parsed.mesh_args == ["--port", "9"]
+    for flag in ("--tool-call-parser", "--chat-template", "--reasoning-parser"):
+        with pytest.raises(SystemExit):
+            atomesh_server.parse_standalone_args(["--model", "/m", flag])
+
+
+def test_a_named_reasoning_parser_is_handed_over_once(monkeypatch):
+    mesh_args = []
+    monkeypatch.setattr(atomesh_server, "check_standalone_model", lambda a: None)
+    monkeypatch.setattr(atomesh_server, "load_tokenizer", lambda a: object())
+    monkeypatch.setattr(atomesh_server, "check_standalone_checkpoint", lambda m: None)
+    monkeypatch.setattr(atomesh_server, "apply_chat_template", lambda *a: None)
+    monkeypatch.setattr(
+        atomesh_server,
+        "default_reasoning_parser",
+        lambda t: pytest.fail("the named parser is not read off the template"),
+    )
+    monkeypatch.setattr(
+        atomesh_server,
+        "tool_call_format",
+        lambda *a: engine_spec.ToolCallFormat(None, None),
+    )
+    monkeypatch.setattr(
+        atomesh_server,
+        "serve_standalone",
+        lambda runner, standalone, tok, args, *rest: mesh_args.extend(args),
+    )
+    monkeypatch.setattr(
+        atomesh_server,
+        "import_atomesh_runner",
+        lambda: SimpleNamespace(tool_parser_names=lambda: []),
+    )
+    atomesh_server.launch_atom_standalone(
+        ["--model", "/m", "--reasoning_parser", "step3"]
+    )
+    assert mesh_args == ["--reasoning-parser", "step3"]

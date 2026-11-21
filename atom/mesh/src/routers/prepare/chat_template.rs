@@ -34,6 +34,17 @@ pub fn process_chat_messages(
     request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,
 ) -> Result<ProcessedMessages, String> {
+    process_chat_messages_with(request, tokenizer, false)
+}
+
+/// `process_chat_messages`, leaving history tool-call arguments as the strings
+/// the client sent when `preserve_tool_call_arguments`, for templates that
+/// render the string (Kimi-K3) or refuse a mapping (DeepSeek-R1/V3).
+pub fn process_chat_messages_with(
+    request: &ChatCompletionRequest,
+    tokenizer: &dyn Tokenizer,
+    preserve_tool_call_arguments: bool,
+) -> Result<ProcessedMessages, String> {
     let hf_tokenizer = tokenizer
         .as_any()
         .downcast_ref::<HuggingFaceTokenizer>()
@@ -58,7 +69,9 @@ pub fn process_chat_messages(
     let content_format = hf_tokenizer.chat_template_content_format();
     let mut transformed_messages = process_content_format(&request.messages, content_format)?;
 
-    process_tool_call_arguments(&mut transformed_messages)?;
+    if !preserve_tool_call_arguments {
+        process_tool_call_arguments(&mut transformed_messages)?;
+    }
 
     let tools_json: Option<Vec<Value>> = request
         .tools

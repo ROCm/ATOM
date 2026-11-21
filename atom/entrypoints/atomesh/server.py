@@ -21,10 +21,14 @@ from typing import Any
 from atom.entrypoints.atomesh.engine_spec import (
     apply_chat_template,
     build_engine_spec,
+    check_standalone_checkpoint,
     check_standalone_model,
     default_reasoning_parser,
+    synthetic_token_text,
     tool_call_format,
 )
+from atom.entrypoints.openai.tool_parser.registry import TOOL_CALL_PARSER_HELP
+from atom.utils.arg_parser import FlexibleArgumentParser
 from atom.utils.gc_utils import (
     freeze_gc_heap,
     maybe_attach_gc_debug_callback,
@@ -124,7 +128,7 @@ def split_standalone_mesh_args(raw_args: list[str]) -> tuple[list[str], list[str
     HTTP router, matching the Rust CLI behavior. --server-port is accepted for
     compatibility with the classic OpenAI entrypoint and translated to --port.
     """
-    mesh_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    mesh_parser = FlexibleArgumentParser(add_help=False, allow_abbrev=False)
     mesh_parser.add_argument("--host")
     mesh_parser.add_argument("--port")
     mesh_parser.add_argument("--server-port")
@@ -155,7 +159,6 @@ def json_object_arg(raw_value: str) -> dict[str, Any]:
 
 def parse_standalone_args(raw_args: list[str]) -> StandaloneArgs:
     from atom.model_engine.arg_utils import EngineArgs
-    from atom.utils.arg_parser import FlexibleArgumentParser
 
     parser = FlexibleArgumentParser(
         description="Atomesh Python interface",
@@ -172,29 +175,33 @@ def parse_standalone_args(raw_args: list[str]) -> StandaloneArgs:
         ),
     )
 
+    # Decided here against ATOM's own resolvers and handed to the router
+    # decided (`launch_atom_standalone`).
+    parser.add_argument(
+        "--tool-call-parser", type=str, default=None, help=TOOL_CALL_PARSER_HELP
+    )
+    parser.add_argument(
+        "--chat-template",
+        type=str,
+        default=None,
+        help="A chat template file, or the template itself, as the Python server takes.",
+    )
+    parser.add_argument(
+        "--reasoning-parser",
+        type=str,
+        default=None,
+        help="The router's reasoning parser; read off the chat template when unset.",
+    )
+
     python_raw_args, mesh_network_args = split_standalone_mesh_args(raw_args)
-    # What Python does not know -- --reasoning-parser and the rest of the
-    # router's flags -- is the mesh router's. `--tool-call-parser` and
-    # `--chat-template` are taken back out in `launch_atom_standalone`.
+    # What Python does not know -- the rest of the router's flags -- is the
+    # mesh router's.
     engine_args, mesh_args = parser.parse_known_args(python_raw_args)
     return StandaloneArgs(
         engine_args=engine_args,
         mesh_args=mesh_args + mesh_network_args,
         default_chat_template_kwargs=engine_args.default_chat_template_kwargs or {},
     )
-
-
-def take_flag(args: list[str], flag: str) -> tuple[list[str], str | None]:
-    """`args` without `flag` (as `flag value` or `flag=value`), and its value."""
-    rest, value, it = [], None, iter(args)
-    for arg in it:
-        if arg == flag:
-            value = next(it, None)
-        elif arg.startswith(flag + "="):
-            value = arg[len(flag) + 1 :]
-        else:
-            rest.append(arg)
-    return rest, value
 
 
 def launch_atom_standalone(raw_args: list[str]) -> None:
@@ -204,18 +211,20 @@ def launch_atom_standalone(raw_args: list[str]) -> None:
     check_standalone_model(engine_args)
     atomesh_runner = import_atomesh_runner()
     tokenizer = load_tokenizer(engine_args)
+    check_standalone_checkpoint(engine_args.model)
     # The template, reasoning parser and tool-call format are decided here,
     # against ATOM's own resolvers, and handed to the router decided.
-    mesh_args, template_override = take_flag(
-        standalone_args.mesh_args, "--chat-template"
-    )
-    mesh_args, requested_tool_parser = take_flag(mesh_args, "--tool-call-parser")
+    mesh_args = list(standalone_args.mesh_args)
     with tempfile.TemporaryDirectory(prefix="atomesh-") as workdir:
-        chat_template = apply_chat_template(tokenizer, template_override, workdir)
-        if not any(arg.startswith("--reasoning-parser") for arg in mesh_args):
-            mesh_args += ["--reasoning-parser", default_reasoning_parser(tokenizer)]
+        chat_template = apply_chat_template(
+            tokenizer, engine_args.chat_template, workdir
+        )
+        reasoning_parser = engine_args.reasoning_parser or default_reasoning_parser(
+            tokenizer
+        )
+        mesh_args += ["--reasoning-parser", reasoning_parser]
         tool_format = tool_call_format(
-            requested_tool_parser,
+            engine_args.tool_call_parser,
             tokenizer,
             engine_args.model,
             set(atomesh_runner.tool_parser_names()),
@@ -252,6 +261,7 @@ def serve_standalone(
             standalone_args.default_chat_template_kwargs,
             tool_parser,
             chat_template,
+            synthetic_text=synthetic_token_text(engine_args),
         )
         # This process keeps the engine and reaps its Cores while Rust serves.
         tune_gc()

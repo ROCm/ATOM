@@ -29,7 +29,7 @@ pub(crate) mod tool_constraints;
 #[cfg(test)]
 mod tests;
 
-use chat_template::process_chat_messages;
+use chat_template::process_chat_messages_with;
 use generation_payload::{GenerationPayload, LogprobConfig, SamplingParams, StopConfig};
 use response_context::{ProtocolRequest, ResponseContext};
 use stop_decoder_builder::create_stop_decoder;
@@ -68,6 +68,19 @@ pub fn prepare_chat(
     model_id: Option<String>,
     components: &AppContext,
 ) -> Result<(GenerationPayload, ResponseContext), Response> {
+    prepare_chat_with(req, headers, model_id, components, false)
+}
+
+/// `prepare_chat`, with history tool-call arguments left as the strings the
+/// client sent when `preserve_tool_call_arguments` (see
+/// `process_chat_messages_with`).
+pub fn prepare_chat_with(
+    req: Arc<ChatCompletionRequest>,
+    headers: Option<HeaderMap>,
+    model_id: Option<String>,
+    components: &AppContext,
+    preserve_tool_call_arguments: bool,
+) -> Result<(GenerationPayload, ResponseContext), Response> {
     let model_id_str = model_id.as_deref().ok_or_else(|| {
         error!("model_id not set");
         error::internal_error("model_id_not_set", "model_id not set in request")
@@ -76,8 +89,9 @@ pub fn prepare_chat(
 
     let body_ref = filter_chat_request_by_tool_choice(&req);
 
-    let processed = process_chat_messages(&body_ref, &*tokenizer)
-        .map_err(|e| error::bad_request("process_messages_failed", e))?;
+    let processed =
+        process_chat_messages_with(&body_ref, &*tokenizer, preserve_tool_call_arguments)
+            .map_err(|e| error::bad_request("process_messages_failed", e))?;
 
     let encoding = thread_encoder(model_id_str, &components.tokenizer_registry, &tokenizer)
         .encode(&processed.text, false)

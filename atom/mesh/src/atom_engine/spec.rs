@@ -39,6 +39,15 @@ pub struct ModelSpec {
     /// token logprobs (`SamplingParams.validate_logprob_options`).
     #[serde(default)]
     pub synthetic_acceptance: bool,
+    /// What each token reads as under forced acceptance, whose text is
+    /// meaningless (api_server's `synthetic_token_text`); none otherwise.
+    #[serde(default)]
+    pub synthetic_token_text: Option<String>,
+    /// History tool-call arguments reach the template as the strings the
+    /// client sent, not parsed (api_server's `preserve_tool_call_arguments`:
+    /// Kimi-K3 renders them verbatim, DeepSeek-R1/V3 refuse a mapping).
+    #[serde(default)]
+    pub preserve_tool_call_arguments: bool,
     /// What a `tool_choice="required"` request is held to, already ending
     /// on the engine's end ids; none where the tool-call format has none.
     #[serde(default)]
