@@ -1835,6 +1835,10 @@ models:
           eval_concurrency: [64, 256]
 
         - name: minimax-m3-fp4-2p1d-dpa-tp4
+          # Drop these two keys to restore the is_agentic_dpa dp_sticky control.
+          router:
+            prefill_policy: agentic
+            decode_policy: least_load
           topology: 2p1d_dpa
           pd_worker_layout: multi_node
           nodes: "${ATOMESH_2P1D_NODES}"
@@ -2199,8 +2203,11 @@ models:
         # Only plain Mooncake connectors; no LMCache CPU/NVMe offload pool.
         - &dsv4_0813_agentic_dpa_no_offload
           name: ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c128
+          # Drop prefill_policy and decode_policy to restore cache_aware on both sides.
           router:
             policy: cache_aware
+            prefill_policy: agentic
+            decode_policy: least_load
           topology: 1p1d_dpa
           display_topology: 1P1D-DPA-TP8-DSPARK3
           pd_worker_layout: multi_node
