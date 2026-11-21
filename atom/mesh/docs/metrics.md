@@ -153,8 +153,10 @@ With N turns per session and stable workers, the hit rate approaches
 (N - 1) / N, and `rebind` points at worker churn. Under idx2idx a prefill pin
 holds only while decode lands on its rank: with a decode policy that does not
 follow the session, about (D - 1) / D of turns rebind, D being the decode's DP
-size. A router restart makes every session `new` again. Each pool that runs
-`dp_sticky` records its own branches.
+size. A rebind picks the prefill with the fewest live sessions on the decode's
+rank, which can be another instance than the old pin's, where `main` kept the
+instance and remapped only the rank. A router restart makes every session `new`
+again. Each pool that runs `dp_sticky` records its own branches.
 
 ### Worker changes
 
@@ -176,9 +178,9 @@ is outside). A session pinned to another rank is re-pinned and counts as
 offered, and then the remap leaves the selected one in place, as its target on
 the decode's rank is unavailable; a remap therefore takes a health or
 membership change between planning and reservation. Two in-flight requests of
-one session whose decodes land on different ranks also record `rank_mapping`
-without a remap: both rebind the pin, and the one dispatched second finds the
-reassignment taken. A session that moves leaves its KV
+one session also record `rank_mapping` without a remap when either of them
+rebinds the pin: the one dispatched second finds the reassignment taken. A
+session that moves leaves its KV
 cache on the old worker. The HTTP routers and the external-processing PD
 executor record it; gRPC routers do not.
 

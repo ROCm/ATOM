@@ -4,7 +4,8 @@
 //! selected for that session. A new session goes to the worker holding the
 //! fewest live sessions (load breaks ties); requests without a session ID use
 //! minimum-load balancing. A stale mapping is replaced when its worker is no
-//! longer healthy or the session has been idle for too long.
+//! longer healthy or a candidate (another DP rank under idx2idx), or the session
+//! has been idle for too long.
 
 use std::{
     collections::HashMap,

@@ -139,16 +139,10 @@ impl DefaultPlanner {
 
         let hash_ring = self.hash_ring_for(req.model_id);
 
-        let select_decode = || {
-            apply_policy(
-                &decode_candidates,
-                decode_policy.as_ref(),
-                req,
-                hash_ring.clone(),
-            )
-        };
+        let select_decode =
+            |ring| apply_policy(&decode_candidates, decode_policy.as_ref(), req, ring);
         let decode_first = if self.prefill_on_decode_rank {
-            Some(select_decode().await?)
+            Some(select_decode(hash_ring.clone()).await?)
         } else {
             None
         };
@@ -165,7 +159,7 @@ impl DefaultPlanner {
         .await?;
         let decode = match decode_first {
             Some(decode) => decode,
-            None => select_decode().await?,
+            None => select_decode(hash_ring).await?,
         };
         debug!(
             stage = "placement.pair.selected",

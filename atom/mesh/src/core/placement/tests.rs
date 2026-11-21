@@ -778,6 +778,9 @@ mod d_pd_planning {
         let wider = DPAwareWorkerBuilder::new_with_type("http://d", 3, 4, WorkerType::Decode);
         let wider: Arc<dyn Worker> = Arc::new(wider.model_id("m").build());
         assert_eq!(move_to(wider), Idx2Idx::OutOfRange { rank: 3, size: 2 });
+        let at_size = DPAwareWorkerBuilder::new_with_type("http://d", 2, 4, WorkerType::Decode);
+        let at_size: Arc<dyn Worker> = Arc::new(at_size.model_id("m").build());
+        assert_eq!(move_to(at_size), Idx2Idx::OutOfRange { rank: 2, size: 2 });
         let no_dp = make_prefill_http("http://q:8000", "m", None);
         assert_eq!(idx2idx(no_dp.as_ref(), decode(1).as_ref()), Idx2Idx::Keep);
     }

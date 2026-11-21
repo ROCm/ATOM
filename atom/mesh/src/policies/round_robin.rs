@@ -30,15 +30,12 @@ struct Position {
 
 /// Round-robin selection policy
 ///
-/// Selects workers in sequential order, cycling through all healthy workers. Each set
-/// of candidates keeps its own position, so callers that offer different subsets (a
-/// pool's models, ext-proc's subsets, prefill narrowed to the decode's DP rank) do not
-/// skip workers by sharing one.
+/// Selects workers in sequential order, cycling through all healthy workers. Each set of
+/// candidates keeps its own position, so callers offering different subsets (a pool's
+/// models, ext-proc's subsets, prefill on the decode's DP rank) do not skip workers.
 ///
-/// A new set starts at a random position. The map grows only with new sets: a new set
-/// seen [`SWEEP_INTERVAL`] or more after the last sweep drops the sets unused since it,
-/// so a set in use is kept however many there are, and a dropped one loses only its
-/// place in the cycle.
+/// A new set starts at a random position. A new set seen [`SWEEP_INTERVAL`] or more after
+/// the last sweep drops the sets unused since it, so every set in use is kept.
 #[derive(Debug)]
 pub struct RoundRobinPolicy {
     positions: DashMap<u64, Position>,

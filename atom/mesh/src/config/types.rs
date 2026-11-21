@@ -18,15 +18,16 @@ pub enum BackendType {
     Atom,
 }
 
-/// Strategy used by the ATOM PD router to map a selected prefill DP rank to
-/// the selected decode DP rank.
+/// How the ATOM PD router pairs prefill and decode DP ranks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum AtomPdRankMappingPolicy {
     /// Do not rewrite the planner-selected prefill/decode DP ranks.
     #[default]
     #[serde(rename = "none")]
     None,
-    /// Map prefill rank N to decode rank N when both sides expose DP workers.
+    /// Run prefill on the decode's DP rank N when both sides expose DP workers: the
+    /// planner selects decode first and prefill among the workers on rank N, and the
+    /// router moves a prefill selected elsewhere to rank N.
     #[serde(rename = "idx2idx")]
     Idx2Idx,
 }
