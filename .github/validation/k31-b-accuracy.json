@@ -1,0 +1,17 @@
+{
+  "kind": "ci-container-v1",
+  "case": "3577-B-accuracy",
+  "source": "8e354a56986bb6342139b657bb9e45e460171385",
+  "attribution": "#3577-on-fb130",
+  "runner": "linux-atom-do-mi350x-8",
+  "image": "docker.io/rocm/atom-dev@sha256:ea74fa0b05d8c7a062ae235b901cb2b1bc0c169b0a5edd7ca07bfa3b967ca462",
+  "config": "sha256:67f3f06c5b90e86eeb6d25ff9075826d4e97c439ecaf7e8d7ecc41ade75b99d6",
+  "input_manifest": "c6622cc1c775711e65e8f67a1eafdff58519d9b264b79181e962f74c2398db8e",
+  "phase0_receipt": "155fd5f8945d50b29fc09d1bd42c4fdde9116f12d523c0061ccab58b616714b3",
+  "dataset_revision": "740312add88f781978c0658806c59bc2815b9866",
+  "parquets": {
+    "train": "ea82612ea9582142387730c793eb67d3b12849002bc0b7fa6f8efafa7351419d",
+    "test": "ee7b8da9e381df27b9e3f7758a159ab2bdaa4dbaa910546cbbc47e0cb44e4f59"
+  },
+  "seconds": {"dataset": 300, "model": 5100, "postflight": 60}
+}

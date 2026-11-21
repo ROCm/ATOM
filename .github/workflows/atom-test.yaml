@@ -16,6 +16,10 @@ on:
     - cron: '0 16 * * *'
   workflow_dispatch:
     inputs:
+      k31_b_accuracy:
+        description: 'Temporary frozen B-accuracy case; select without k31_phase0'
+        type: boolean
+        default: false
       k31_phase0:
         description: 'CPU-only frozen-input bootstrap and no-device asset inspection; no model execution'
         type: boolean
@@ -44,8 +48,8 @@ concurrency:
   # script) -- so an unrelated label can never cancel running heavy CI. The
   # ci-gate and gate jobs' names repeat this test; keep all three in sync with
   # CI_GATE_LABELS.
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.pull_request.number && 'pr' || github.event_name }}${{ github.event_name == 'pull_request_review' && github.event.review.state != 'approved' && format('-review-{0}', github.run_id) || '' }}${{ github.event_name == 'pull_request' && github.event.action == 'labeled' && !(github.event.label.name == 'ci:atom' || (github.event.label.name == 'ci:full' && !contains(github.event.pull_request.labels.*.name, 'ci:atom'))) && format('-noop-{0}', github.run_id) || '' }}${{ inputs.k31_phase0 && '-k31-phase0' || '' }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'pull_request_review' }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.pull_request.number && 'pr' || github.event_name }}${{ github.event_name == 'pull_request_review' && github.event.review.state != 'approved' && format('-review-{0}', github.run_id) || '' }}${{ github.event_name == 'pull_request' && github.event.action == 'labeled' && !(github.event.label.name == 'ci:atom' || (github.event.label.name == 'ci:full' && !contains(github.event.pull_request.labels.*.name, 'ci:atom'))) && format('-noop-{0}', github.run_id) || '' }}${{ inputs.k31_phase0 && '-k31-phase0' || '' }}${{ inputs.k31_b_accuracy && '-k31-b-accuracy' || '' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'pull_request_review' && !inputs.k31_b_accuracy }}
 
 env:
   ATOM_BASE_IMAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.atom_base_image || 'rocm/atom-dev:latest' }}
@@ -57,7 +61,7 @@ env:
 
 jobs:
   k31-input-bootstrap:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.k31_phase0 }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.k31_phase0 && !inputs.k31_b_accuracy }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -93,7 +97,7 @@ jobs:
           retention-days: 7
 
   k31-asset-preflight:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.k31_phase0 }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.k31_phase0 && !inputs.k31_b_accuracy }}
     needs: [k31-input-bootstrap]
     runs-on: linux-atom-do-mi350x-8
     timeout-minutes: 25
@@ -152,8 +156,71 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+  k31-b-accuracy:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.k31_b_accuracy }}
+    runs-on: linux-atom-do-mi350x-8
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      actions: read
+    env:
+      WORK: ${{ github.workspace }}/k31-b-${{ github.run_id }}-${{ github.run_attempt }}
+      IMAGE: docker.io/rocm/atom-dev@sha256:ea74fa0b05d8c7a062ae235b901cb2b1bc0c169b0a5edd7ca07bfa3b967ca462
+    steps:
+      - name: Require one frozen case
+        if: ${{ inputs.k31_phase0 }}
+        run: echo 'Select k31_b_accuracy without k31_phase0'; exit 2
+      - uses: actions/checkout@v6
+        with:
+          path: control
+          persist-credentials: false
+      - uses: actions/checkout@v6
+        with:
+          ref: 8e354a56986bb6342139b657bb9e45e460171385
+          path: k31-b-${{ github.run_id }}-${{ github.run_attempt }}/source
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          artifact-ids: '14696677294'
+          run-id: '44877831110'
+          github-token: ${{ github.token }}
+          merge-multiple: true
+          path: ${{ env.WORK }}/inputs
+      - uses: actions/download-artifact@v8
+        with:
+          artifact-ids: '14697121673'
+          run-id: '44877831110'
+          github-token: ${{ github.token }}
+          merge-multiple: true
+          path: ${{ env.WORK }}/phase0
+      - name: Bind frozen source, inputs and actual allocation
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(git -C control rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 control/.github/scripts/k31_b_accuracy.py prepare "$WORK"
+          timeout --signal=TERM --kill-after=10s 900s docker pull "$IMAGE" 2>&1 | tee "$WORK/output/pull.log"
+      - name: Run the dedicated containers and check retained results
+        timeout-minutes: 100
+        run: python3 control/.github/scripts/k31_b_accuracy.py execute "$WORK"
+      - name: Recover interrupted container cleanup
+        if: always()
+        timeout-minutes: 5
+        run: python3 control/.github/scripts/k31_b_accuracy.py recover "$WORK"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: k31-b-accuracy-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.WORK }}/output
+            ${{ env.WORK }}/admission.json
+            ${{ env.WORK }}/allocation.json
+            ${{ env.WORK }}/input/prepared-manifest.json
+          if-no-files-found: warn
+          retention-days: 7
+
   ci-gate:
-    if: ${{ !inputs.k31_phase0 }}
+    if: ${{ !inputs.k31_phase0 && !inputs.k31_b_accuracy }}
     # A no-op label run (the -noop- concurrency group above) is named apart from
     # its first job on, so an approval can tell it from the PR group's runs
     # when it looks for a pending run it replaced (CI_GATE_NOOP_JOB).
@@ -203,7 +270,7 @@ jobs:
         run: bash ./.github/scripts/check_heavy_ci_gate.sh
 
   check-signal:
-    if: ${{ !inputs.k31_phase0 && (needs.ci-gate.outputs.should_run == 'true') }}
+    if: ${{ !inputs.k31_phase0 && !inputs.k31_b_accuracy && (needs.ci-gate.outputs.should_run == 'true') }}
     needs: [ci-gate]
     name: Check Pre Checkin Signal
     runs-on: ubuntu-latest
@@ -226,7 +293,7 @@ jobs:
           CHECK_SIGNAL_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
   download_aiter_wheel:
-    if: ${{ !inputs.k31_phase0 && (needs.ci-gate.outputs.should_run == 'true' && needs.check-signal.result == 'success') }}
+    if: ${{ !inputs.k31_phase0 && !inputs.k31_b_accuracy && (needs.ci-gate.outputs.should_run == 'true' && needs.check-signal.result == 'success') }}
     needs: [ci-gate, check-signal]
     name: Download aiter wheel
     runs-on: ubuntu-latest
@@ -247,7 +314,7 @@ jobs:
           retention-days: 7
 
   load-test-models:
-    if: ${{ !inputs.k31_phase0 && (needs.ci-gate.outputs.should_run == 'true') }}
+    if: ${{ !inputs.k31_phase0 && !inputs.k31_b_accuracy && (needs.ci-gate.outputs.should_run == 'true') }}
     needs: [ci-gate]
     name: Load test model configs
     runs-on: ubuntu-latest
@@ -280,7 +347,7 @@ jobs:
 
   offline-smoke-test:
     needs: [ci-gate]
-    if: ${{ !inputs.k31_phase0 && (!cancelled()) }}
+    if: ${{ !inputs.k31_phase0 && !inputs.k31_b_accuracy && (!cancelled()) }}
     # Not behind the approval/label gate: this runs on every PR, unlike the
     # accuracy matrix, which only opens on an approval or a ci:* label. It
     # needs `ci-gate` only so an approval run can take over the check from a
@@ -389,7 +456,7 @@ jobs:
       fail-fast: false
       matrix:
         include: ${{ fromJson(needs.load-test-models.outputs.models_json || '[{"runner":"ubuntu-latest","model_name":"skip"}]') }}
-    if: ${{ !inputs.k31_phase0 && (needs.ci-gate.outputs.should_run == 'true' && needs.download_aiter_wheel.result == 'success' && needs.load-test-models.result == 'success') }}
+    if: ${{ !inputs.k31_phase0 && !inputs.k31_b_accuracy && (needs.ci-gate.outputs.should_run == 'true' && needs.download_aiter_wheel.result == 'success' && needs.load-test-models.result == 'success') }}
     runs-on: ${{ matrix.runner }}
     permissions:
       actions: read
@@ -938,7 +1005,7 @@ jobs:
 
   atom-test-gate:
     name: ${{ ((github.event_name != 'pull_request_review' && !(github.event.action == 'labeled' && !(github.event.label.name == 'ci:atom' || (github.event.label.name == 'ci:full' && !contains(github.event.pull_request.labels.*.name, 'ci:atom'))))) || needs.ci-gate.outputs.should_run == 'true' || needs.ci-gate.outputs.pr_check_takeover == 'true') && 'ATOM Test Gate' || 'ATOM Test Gate not requested' }}
-    if: ${{ !inputs.k31_phase0 && (always()) }}
+    if: ${{ !inputs.k31_phase0 && !inputs.k31_b_accuracy && (always()) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -974,7 +1041,7 @@ jobs:
   accuracy-dashboard:
     name: Update accuracy dashboard
     needs: [atom-test]
-    if: ${{ !inputs.k31_phase0 && (always() && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'schedule')) }}
+    if: ${{ !inputs.k31_phase0 && !inputs.k31_b_accuracy && (always() && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'schedule')) }}
     # Serialize with every other gh-pages push so the auto-push below does not
     # race concurrent deploys (docs / benchmark dashboards) on the gh-pages branch.
     concurrency:

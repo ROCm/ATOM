@@ -306,9 +306,9 @@ def test_workflow_preserves_defaults_and_excludes_all_old_jobs():
         prior = dict(before)
         condition = prior.pop("if", None)
         assert guard == (
-            f"!inputs.k31_phase0 && ({unwrap(condition)})"
+            f"!inputs.k31_phase0 && !inputs.k31_b_accuracy && ({unwrap(condition)})"
             if condition
-            else "!inputs.k31_phase0"
+            else "!inputs.k31_phase0 && !inputs.k31_b_accuracy"
         )
         assert after == prior
     assert new["on"]["workflow_dispatch"]["inputs"]["k31_phase0"]["default"] == "false"
