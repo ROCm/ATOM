@@ -16,6 +16,7 @@ impl ConfigValidator {
         #[cfg(feature = "ext-proc")]
         config.ext_proc.validate(config)?;
         Self::validate_mode(&config.mode)?;
+        Self::validate_encode(config)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_server_settings(config)?;
 
@@ -78,6 +79,28 @@ impl ConfigValidator {
                 if let Some(d_policy) = decode_policy {
                     Self::validate_policy(d_policy)?;
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_encode(config: &RouterConfig) -> ConfigResult<()> {
+        if !config.mode.is_pd_mode() {
+            if !config.encode_urls.is_empty() || config.encode_policy.is_some() {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "Encode workers require prefill-decode mode".to_string(),
+                });
+            }
+            return Ok(());
+        }
+        Self::validate_urls(&config.encode_urls)?;
+        if let Some(policy) = &config.encode_policy {
+            Self::validate_policy(policy)?;
+            if matches!(policy, PolicyConfig::PowerOfTwo { .. }) && config.encode_urls.len() < 2 {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "Power-of-two policy for encode requires at least 2 encode workers"
+                        .to_string(),
+                });
             }
         }
         Ok(())
@@ -663,6 +686,44 @@ mod tests {
         if let Err(e) = result {
             assert!(e.to_string().contains("prefill requires at least 2"));
         }
+    }
+
+    #[test]
+    fn test_validate_encode_urls() {
+        let pd = || RoutingMode::PrefillDecode {
+            prefill_urls: vec![("http://prefill:8000".to_string(), None)],
+            decode_urls: vec!["http://decode:8000".to_string()],
+            prefill_policy: None,
+            decode_policy: None,
+        };
+        let mut config = RouterConfig::new(pd(), PolicyConfig::Random);
+        config.encode_urls = vec!["http://encode:8000".to_string()];
+        config.encode_policy = Some(PolicyConfig::RoundRobin);
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        config.encode_urls = vec!["encode:8000".to_string()];
+        assert!(ConfigValidator::validate(&config).is_err());
+
+        config.encode_urls = vec!["http://encode:8000".to_string()];
+        config.encode_policy = Some(PolicyConfig::PowerOfTwo {
+            load_check_interval_secs: 60,
+        });
+        let err = ConfigValidator::validate(&config).unwrap_err();
+        assert!(err.to_string().contains("encode requires at least 2"));
+
+        let mut regular = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+        regular.encode_urls = vec!["http://encode:8000".to_string()];
+        let err = ConfigValidator::validate(&regular).unwrap_err();
+        assert!(err.to_string().contains("prefill-decode mode"));
+
+        regular.encode_urls.clear();
+        regular.encode_policy = Some(PolicyConfig::RoundRobin);
+        assert!(ConfigValidator::validate(&regular).is_err());
     }
 
     #[test]
