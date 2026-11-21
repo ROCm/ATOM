@@ -386,7 +386,7 @@ def test_the_id_is_released_so_it_can_be_reused_serially():
 
 
 def test_results_are_rpcresult_instances():
-    """The public API's return type, which LumenRL reads .ok/.value/.error off."""
+    """RpcResult is the public return contract for .ok/.value/.error."""
     mgr = _mgr(1)
 
     def broadcast_and_answer(cmd, **kw):

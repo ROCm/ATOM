@@ -1,0 +1,47 @@
+cluster:
+  gpus_per_node: 1
+  num_nodes: 1
+
+policy:
+  model_name: Qwen/Qwen3-0.6B   # Used as teacher/target model
+  training_backend: fsdp2
+  generation_backend: hf
+  max_total_sequence_length: 2048
+  train_global_batch_size: 16
+  train_micro_batch_size: 8
+
+algorithm:
+  name: spec_distill
+  spec_distill:
+    draft_type: dflash
+    loss_type: ce_decay
+    loss_decay_gamma: 7.0
+    num_target_layers: 1
+  teacher:
+    model_name: Qwen/Qwen3-0.6B
+    inference_backend: hf
+  draft:
+    from_scratch: true
+    num_layers: 2
+
+quantization:
+  training:
+    fp8: null
+  rollout_correction:
+    enabled: false
+
+reward:
+  type: function
+  function: math_reward
+  dataset: nvidia/OpenMathInstruct-2
+
+checkpointing:
+  checkpoint_dir: results/spec_distill_dflash
+  save_steps: 50
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 500
+seed: 42

@@ -1,0 +1,13 @@
+---
+description: Lumen project mission and architectural intent
+globs: Lumen/**/*.py,Lumen/**/*.md
+alwaysApply: true
+---
+
+# Lumen Project Mission
+
+Lumen is a drop-in replacement library for NVIDIA TransformerEngine (TE) within Megatron-Core, targeting AMD GPUs (gfx94x / gfx950). Every module, op, and kernel exists to provide feature-equivalent alternatives to TE's interfaces so that Megatron-Core can run on AMD hardware without modifying its own source code. All API design, testing, and feature prioritization should be evaluated against this goal.
+
+## Code Boundary: Lumen vs AITER
+
+New GPU kernels (Triton, CK, ASM) belong in the official ROCm/aiter repository, not in Lumen. Lumen only implements the **dispatch and calling logic** — choosing the right backend, marshalling arguments, and handling fallback. If a feature requires a new kernel, add it to AITER and expose it through AITER's Python API; then call it from Lumen's ops layer via the standard `try_backends()` dispatch.

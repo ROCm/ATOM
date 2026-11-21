@@ -61,17 +61,20 @@ def init_pp_aware_dist_env(
     world_size: int,
     distributed_init_method: str,
     backend: str = "nccl",
+    local_rank: int = -1,
     data_parallel_size: int = 1,
     prefill_context_model_parallel_size: int = 1,
     decode_context_parallel_size: int = 1,
+    disable_custom_all_reduce: bool = False,
 ) -> None:
     """PP-aware distributed init (aiter's init_dist_env pins pp=1)."""
-    set_custom_all_reduce(True)
+    set_custom_all_reduce(not disable_custom_all_reduce)
     init_distributed_environment(
         world_size=world_size,
         rank=global_rank,
         distributed_init_method=distributed_init_method,
         backend=backend,
+        local_rank=local_rank,
         data_parallel_size=1,
     )
     ensure_model_parallel_initialized(

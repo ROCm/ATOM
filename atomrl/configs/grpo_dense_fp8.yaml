@@ -1,0 +1,52 @@
+cluster:
+  gpus_per_node: 1
+  num_nodes: 1
+
+policy:
+  model_name: Qwen/Qwen3-0.6B
+  training_backend: fsdp2
+  generation_backend: atom
+  max_total_sequence_length: 2048
+  train_global_batch_size: 32
+  train_micro_batch_size: 8
+
+algorithm:
+  name: grpo
+  grpo:
+    num_generations: 8
+    kl_coeff: 0.0
+    clip_ratio: 0.2
+
+quantization:
+  rollout:
+    precision: fp8
+    use_deep_gemm: true
+    num_first_layers_in_bf16: 0
+    num_last_layers_in_bf16: 0
+  training:
+    fp8: hybrid
+    fp8_recipe: blockwise
+    fp8_weight_cache: true
+  rollout_correction:
+    enabled: true
+    method: tis
+    clip: 1.5
+
+moe:
+  r3:
+    enabled: false
+
+reward:
+  type: function
+  function: math_reward
+  dataset: nvidia/OpenMathInstruct-2
+
+checkpointing:
+  checkpoint_dir: results/grpo_dense_fp8
+  save_steps: 50
+
+logger:
+  wandb_enabled: false
+
+num_training_steps: 200
+seed: 42

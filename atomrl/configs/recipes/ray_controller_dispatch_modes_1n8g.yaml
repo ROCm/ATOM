@@ -1,0 +1,69 @@
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1
+
+policy:
+  model_name: Qwen/Qwen3-0.6B
+  training_backend: fsdp2
+  generation_backend: atom
+  max_total_sequence_length: 2048
+  train_global_batch_size: 64
+  train_micro_batch_size: 8
+
+algorithm:
+  name: grpo
+  grpo:
+    num_generations: 8
+    # Enable ref-policy path so ref dispatch mode is exercised.
+    kl_coeff: 0.01
+    clip_ratio: 0.2
+    num_ppo_epochs: 1
+    num_mini_batches: 1
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+  rollout_correction:
+    enabled: false
+
+controller:
+  ray:
+    enabled: true
+    fuse_actor_ref: false
+    topology_map:
+      actor: actor
+      ref: ref
+    actor:
+      num_workers: 8
+      dispatch_mode: dp_compute_proto_with_func
+      # Group workers in pairs: [0,1], [2,3], [4,5], [6,7].
+      mesh_mapping: [0, 0, 1, 1, 2, 2, 3, 3]
+      lazy_dispatch_key: actor_pair_mesh
+      detached: false
+      process_on_nodes: [8]
+      max_colocate_count: 1
+    ref:
+      num_workers: 1
+      # Exercise rank-zero dispatch semantics on ref policy.
+      dispatch_mode: rank_zero
+      detached: false
+      process_on_nodes: [1]
+      max_colocate_count: 1
+
+reward:
+  type: function
+  function: math_reward
+  dataset: nvidia/OpenMathInstruct-2
+
+checkpointing:
+  checkpoint_dir: results/ray_controller_dispatch_modes_1n8g
+  save_steps: 50
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 200
+seed: 42
