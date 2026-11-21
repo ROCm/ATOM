@@ -1,0 +1,67 @@
+name: Deploy Documentation
+
+on:
+  push:
+    branches: [main, dev/RL]
+    paths:
+      - 'lumen-docs/**'
+      - '.github/workflows/docs.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'lumen-docs/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r lumen-docs/docs/requirements.txt
+
+      - name: Build Sphinx documentation
+        run: |
+          cd lumen-docs/docs
+          sphinx-build -b html source build/html -W --keep-going
+
+      - name: Assemble site
+        run: |
+          mkdir -p _site
+          cp lumen-docs/site/index.html _site/index.html
+          cp lumen-docs/site/rl.html _site/rl.html
+          cp -r lumen-docs/site/rl _site/rl
+          cp -r lumen-docs/docs/build/html _site/docs
+
+      - name: Upload artifact
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev/RL'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev/RL'
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

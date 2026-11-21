@@ -1,0 +1,47 @@
+cluster:
+  gpus_per_node: 1
+  num_nodes: 1
+
+policy:
+  model_name: Qwen/Qwen3-0.6B
+  training_backend: fsdp2
+  generation_backend: hf
+  max_total_sequence_length: 2048
+  max_response_length: 1024
+  train_global_batch_size: 16
+  train_micro_batch_size: 4
+
+algorithm:
+  name: opd
+  opd:
+    kl_direction: reverse
+    temperature: 1.0
+    opd_coeff: 1.0
+    lazy_logits: true
+    position_weighting: false
+    teacher_micro_batch_size: 4
+  teacher:
+    model_name: Qwen/Qwen3-0.6B  # Use same model for smoke test; swap for real teacher
+    inference_backend: hf
+
+quantization:
+  training:
+    fp8: null
+  rollout_correction:
+    enabled: false
+
+reward:
+  type: function
+  function: math_reward
+  dataset: nvidia/OpenMathInstruct-2
+
+checkpointing:
+  checkpoint_dir: results/opd_dense_bf16
+  save_steps: 50
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 200
+seed: 42

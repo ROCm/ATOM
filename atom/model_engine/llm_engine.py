@@ -254,6 +254,16 @@ class LLMEngine:
     def is_finished(self):
         return not self.io_processor.has_pending_requests()
 
+    def reset_prefix_cache(self) -> bool:
+        """Drop all rank-local KV/prefix-cache state.
+
+        The collective is an engine implementation detail.  Exposing the
+        operation here keeps integrations from reaching through ``core_mgr``
+        or inventing their own worker RPC for a cache reset.
+        """
+        self.core_mgr.broadcast_utility_command_sync("clear_kv_cache")
+        return True
+
     def generate(
         self,
         prompts: list[str],

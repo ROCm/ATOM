@@ -1,0 +1,62 @@
+---
+description: AITER backend constraints and dispatch conventions for Lumen ops
+globs: lumen/ops/**/*.py,tests/ops/**/*.py
+alwaysApply: false
+---
+
+# AITER Backend Constraints
+
+## Dispatch Architecture
+
+Lumen uses `try_backends()` in `lumen/ops/dispatch.py` to fall through backends on failure. It catches `RuntimeError`, `NotImplementedError`, `TypeError`, `ValueError`, Triton `CompilationError`, and `OutOfResources`. Always call `torch.cuda.synchronize()` after GPU kernels to surface asynchronous errors before fallback.
+
+## BF16 GEMM (`gemm_bf16`)
+
+Uses `aiter.tuned_gemm.gemm_a16w16` which internally dispatches: hipBLASLt -> ASM -> skinny -> Triton -> torch.
+
+- **dtype matching**: `tuned_gemm` / `hipb_mm` / `F.linear` require both inputs to have the same dtype. When dequantizing FP8 weights via `weight_fp8.to(bf16) * weight_scale(fp32)`, the result is promoted to FP32. Always cast back: `(weight_fp8.to(target_dtype) * scale).to(target_dtype)`.
+- **Triton `gemm_a16w16` standalone**: BLOCK_SIZE_K >= 128 required on gfx942. `compute_splitk_params` can generate smaller values for small K, causing `CompilationError`. Capping BLOCK_SIZE_M/N to 128 when clamping BLOCK_SIZE_K avoids LDS overflow (gfx942 LDS = 163840 bytes).
+- **ASM kernels**: Require K % 64 == 0 and N % 64 == 0.
+- **TN layout**: All BF16/FP8 GEMM kernels compute Y = A @ W^T. Weight `w` is always (N, K). For backward dgrad, pass `weight.t().contiguous()` as `w`.
+
+## FP8 Quantized GEMM (`dispatch_gemm`)
+
+| scaling_type | Backends (priority order) | Tuning |
+|---|---|---|
+| delayed/dynamic | hipBLASLt -> CK (`gemm_a8w8_CK`) -> Triton | CK reads `a8w8_tuned_gemm.csv` |
+| per_token | Triton only (`gemm_a8w8_per_token_scale`) | No tuned config |
+| blockwise | CK (`gemm_a8w8_blockscale`) -> Triton | CK reads `a8w8_blockscale_tuned_gemm.csv` |
+| mxfp8 | Triton only (`gemm_mxfp8`) | No tuned config |
+
+## FP8 Backward Scale Misalignment
+
+Per-tensor scalar scales (delayed/dynamic) survive weight transposition. Per-token `(N,1)`, blockwise `(N,K/bs)`, and mxfp8 block scales become misaligned after `weight_fp8.t()`, causing kernel crashes. Backward with full FP8 quantization is restricted to `["delayed", "dynamic", "none"]` scaling types.
+
+## Normalization
+
+- **Backward**: Triton backend is preferred when `requires_grad=True` because CK fwd kernels don't save intermediates needed by CK bwd.
+- **Fused norm+quant**: Available for delayed/dynamic/per_token/blockwise/mxfp8 in both LayerNorm and RMSNorm. Each has separate Triton/CK backend probes.
+- **ASM norm**: `layernorm2d_with_add_asm` available for LayerNorm only (no RMSNorm ASM).
+
+## Grouped GEMM
+
+- BF16 path uses `aiter.ops.triton.gmm`.
+- FP8 per-token and mxfp8 use fused MOE GEMM kernels (`moe_gemm_per_token`, `moe_gemm_mxfp8`).
+- Sequential fallback iterates per-group for configs without fused kernel support.
+- wgrad uses `ptgmm` (permuted-tensor GMM).
+
+## Cross Entropy
+
+- Triton kernel uses `BLOCK_SIZE = min(MAX_FUSED_SIZE, next_power_of_2(V))`.
+- `MAX_FUSED_SIZE` is limited by shared memory; very large vocab may need chunking.
+
+## General Rules
+
+- AITER is a pinned runtime dependency; use its public kernel API directly.
+- Use `try_backends()` only for supported implementation fallbacks, never to
+  probe whether the dependency is installed.
+- Never add `_probe_aiter_*`, `find_spec("aiter")`, guarded AITER imports,
+  private AITER attribute access, or copied capability tables.
+- Never copy or optimize an AITER kernel, layout transform, MXFP4 shuffle, or
+  communication primitive in Lumen. Make that change in AITER and call its
+  public API.

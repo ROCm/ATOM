@@ -387,6 +387,13 @@ all flags via `add_cli_args()` and converts them into a `Config` via
 | `--enable-expert-parallel` | | flag | `False` | Enable Expert Parallelism (EP MoE) |
 | `--moe-backend` | | `str` | `"standard"` | MoE implementation; choices: `standard`, `mega`. `mega` runs FlyDSL MegaMoE and requires `--enable-expert-parallel`; with `-sp N` it instead runs the Ulysses SP MXFP4 MoE through AITER `MegaMoeTP` on gfx950, on every step whose native MoE quantizes activations to FP4 (prefill, and decode from 256 global rows), and needs MORI built with `BUILD_CCO_SDMA=ON`. Startup fails when a layer or setting is outside what it serves. Each launch covers at most `min(ceil(max_num_batched_tokens / N), 8192)` local rows |
 | `--torch-profiler-dir` | | `str` | `None` | Directory for torch profiler traces |
+
+### Programmatic distributed option
+
+`Config.disable_custom_all_reduce` defaults to `False`. Set it to `True` when
+constructing an engine to disable AITER's HIP-IPC custom all-reduce and use the
+standard RCCL path. ATOM applies this policy before distributed/model-parallel
+initialization, including the RLHF DP and pipeline-parallel paths.
 | `--enable-dp-attention` | | flag | `False` | Enable DP attention |
 | `--method` | | `str` | `None` | Speculative method; choices: `mtp`, `eagle3`, `dspark` |
 | `--num-speculative-tokens` | | `int` | `1` | Number of speculative tokens per iteration |

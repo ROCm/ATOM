@@ -2,9 +2,10 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+from contextlib import contextmanager
 
 from atom.model_engine.capabilities import EngineCapabilities, WorkerCapabilities
-from atom.model_engine.collective_rpc import RpcResult
+from atom.model_engine.collective_rpc import DISCARD_WEIGHT_SYNC_CMD, RpcResult
 from atom.model_engine.engine_utility import (
     PAUSE_GENERATION_CMD,
     RECEIVE_WEIGHTS_RDMA_CMD,
@@ -99,6 +100,25 @@ class AsyncLLMEngine(LLMEngine):
             )
         workers = [WorkerCapabilities.from_payload(r.value) for r in replies]
         return EngineCapabilities.from_workers(config=self.config, workers=workers)
+
+    @contextmanager
+    def weight_sync_session(self):
+        """Own one atomic bucketed reload and discard it if its sender fails.
+
+        The engine managers fence generation while applying the buckets. The
+        final bucket commits the new weights; any exception between buckets
+        explicitly discards rank-local scratch so a later reload cannot inherit
+        part of this one.
+        """
+        with self.core_mgr.weight_sync_session():
+            try:
+                yield
+            except BaseException as exc:
+                self.core_mgr.broadcast_utility_command_sync(
+                    DISCARD_WEIGHT_SYNC_CMD,
+                    failed_cmd=f"weight_sync_session: {type(exc).__name__}",
+                )
+                raise
 
     def sleep(self, level: int = 1):
         """Release GPU resources.
