@@ -276,6 +276,38 @@ impl PrefixIndex {
             .collect()
     }
 
+    /// The leading blocks of `prefix` the lanes of each of `groups` hold between them, in
+    /// their order: a block counts for a group while any of its lanes holds it. One walk,
+    /// which stops when no group is left.
+    pub(super) fn find_shared(&self, prefix: &[PrefixHash], groups: &[u64]) -> Vec<u32> {
+        let mut depth: Vec<u32> = groups.iter().map(|_| prefix.len() as u32).collect();
+        let mut open: Vec<usize> = (0..groups.len()).collect();
+        let mut walk = Walk::new(self);
+        for &hash in prefix.iter().take(PREFETCH) {
+            walk.prefetch(hash);
+        }
+        for (i, &hash) in prefix.iter().enumerate() {
+            if open.is_empty() {
+                break;
+            }
+            if i % YIELD_BLOCKS == 0 {
+                walk.yield_to_writer();
+            }
+            if let Some(&ahead) = prefix.get(i + PREFETCH) {
+                walk.prefetch(ahead);
+            }
+            let held = walk.get(hash);
+            open.retain(|&group| {
+                let holds = held & groups[group] != 0;
+                if !holds {
+                    depth[group] = i as u32;
+                }
+                holds
+            });
+        }
+        depth
+    }
+
     /// Prefixes, blocks held over all lanes, and slot bytes.
     #[cfg(test)]
     pub(super) fn stats(&self) -> (usize, u32, usize) {
@@ -535,6 +567,41 @@ impl HolderTable {
             prev = Some(prefix);
         }
         Ok(())
+    }
+
+    /// Translates into `ops` a batch for the lane of the blocks a rank shares, which holds
+    /// only blocks the rank does: `events`, of the rank's device tier, already applied to
+    /// its table `rank`, remove blocks here too, and `shared`, of its shared tier, name
+    /// blocks by hash, placed where `rank` holds them. A shared block the rank does not
+    /// hold is dropped as one of an unknown parent.
+    pub(super) fn share(
+        &mut self,
+        rank: &HolderTable,
+        events: &[KvEvent],
+        shared: &[KvEvent],
+        ops: &mut Vec<Op>,
+    ) -> Vec<DropReason> {
+        let mut dropped = Vec::new();
+        let removals = events
+            .iter()
+            .filter(|event| !matches!(event, KvEvent::Stored { .. }));
+        for event in removals.chain(shared) {
+            let KvEvent::Stored { blocks, .. } = event else {
+                let _ = self.apply(event, ops);
+                continue;
+            };
+            for block in blocks {
+                match rank.prefixes.get(&block.hash) {
+                    Some(&prefix) => {
+                        if self.prefixes.insert(block.hash, prefix).is_none() {
+                            ops.push(Op::Store(prefix));
+                        }
+                    }
+                    None => dropped.push(DropReason::UnknownParent),
+                }
+            }
+        }
+        dropped
     }
 
     /// Removes the holder's own blocks, so a clear costs its entries, not the partition's.
