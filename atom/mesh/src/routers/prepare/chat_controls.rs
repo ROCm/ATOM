@@ -2,8 +2,8 @@
 //! whose chat encoder it adapts, so that the router renders their chats to the
 //! prompts ATOM encodes. ATOM picks them by the `model_type` in the
 //! checkpoint's `config.json` (`chat_encoder_adapters._MODEL_ENCODERS`); the
-//! rules are its `reasoning_controls` and the model's encoder hooks, and the
-//! checkpoint's own template reads the kwargs they give.
+//! rules are its `reasoning_controls` and the model's encoder hooks, and
+//! llm-tokenizer's port of the encoder reads the kwargs they give.
 //! `test_requests_tokenize_as_on_atom` checks the router's tokens for
 //! DeepSeek-V4.1-Flash chats against ATOM's.
 
@@ -23,7 +23,7 @@ use crate::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ChatControls {
     /// DeepSeek-V4.1 (`deepseek_v41_encoder`): ATOM encodes its chats with the
-    /// checkpoint's `encoding/encoding.py`, which its template ports.
+    /// checkpoint's `encoding/encoding.py`, which llm-tokenizer ports.
     DeepseekV41,
 }
 
@@ -36,10 +36,9 @@ impl ChatControls {
         }
     }
 
-    /// The prompt ATOM encodes `request` to, rendered with `tokenizer`'s
-    /// template: a 400 where ATOM rejects the chat, and a 501 where the router
-    /// cannot tell the prompt. A server's `--default-chat-template-kwargs` is
-    /// not known here.
+    /// The prompt ATOM encodes `request` to, rendered with `tokenizer`: a 400
+    /// where ATOM rejects the chat, and a 501 where the router cannot tell the
+    /// prompt. A server's `--default-chat-template-kwargs` is not known here.
     pub(crate) fn render(
         self,
         request: &ChatCompletionRequest,
@@ -71,7 +70,7 @@ mod deepseek_v41 {
     ];
 
     /// What the encoder begins a prompt with unless `add_default_bos_token` is
-    /// false, and the template always.
+    /// false, and llm-tokenizer's port always.
     const BOS: &str = "<｜begin▁of▁sentence｜>";
 
     pub(super) fn render(
@@ -79,14 +78,17 @@ mod deepseek_v41 {
         sent: &SentControls,
         tokenizer: &dyn Tokenizer,
     ) -> Result<String, IngressError> {
-        let kwargs = template_kwargs(request, sent).map_err(IngressError::invalid)?;
-        // The encoder renders only the messages after a `context`; the
-        // template does not read it.
+        let mut kwargs = template_kwargs(request, sent).map_err(IngressError::invalid)?;
+        // The encoder renders only the messages after a `context`; the port
+        // does not read it.
         if kwargs.get("context").is_some_and(truthy) {
             return Err(IngressError::new(StatusCode::NOT_IMPLEMENTED, "token_routing_unsupported", "the router does not render a DeepSeek-V4.1 chat after a context; use a policy that does not require exact tokens"));
         }
-        // The template joins the text blocks of a list with blank lines, as
-        // the encoder does.
+        // The port reads the mode from `thinking`, not `thinking_mode`.
+        let thinking = kwargs.get(TOGGLE.0) == Some(&json!(TOGGLE.2));
+        kwargs.insert("thinking".to_string(), json!(thinking));
+        // The port joins the text blocks of a list with blank lines, as the
+        // encoder does.
         let format = Some(ChatTemplateContentFormat::OpenAI);
         let mut prompt = render_chat_messages(request, tokenizer, &kwargs, format)
             .map_err(IngressError::invalid)?

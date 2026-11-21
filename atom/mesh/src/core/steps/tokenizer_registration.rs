@@ -133,16 +133,23 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                     .map_err(|e| format!("Failed to load tokenizer: {}", e))?;
                     let base_tokenizer =
                         with_fastokens(base_tokenizer, &name, &source, &fastokens).await?;
-                    probe_chat_render(
-                        &chats_without_template,
-                        &id,
-                        &name,
-                        &source,
-                        chat_template.as_deref(),
-                    )
-                    .await;
-                    if let Some(controls) = checkpoint_chat_controls(&name, &source).await {
-                        chat_controls.write().insert(id.clone(), controls);
+                    // The router renders a model's chats under its controls
+                    // with every kwarg ATOM's encoder reads, so no default of
+                    // llm-tokenizer's encoder is left to differ.
+                    match checkpoint_chat_controls(&name, &source).await {
+                        Some(controls) => {
+                            chat_controls.write().insert(id.clone(), controls);
+                        }
+                        None => {
+                            probe_chat_render(
+                                &chats_without_template,
+                                &id,
+                                &name,
+                                &source,
+                                chat_template.as_deref(),
+                            )
+                            .await;
+                        }
                     }
                     // fastokens has a cache of its own, off by default:
                     // `--fastokens-segment-cache-mb`.
@@ -158,6 +165,7 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                                 l0_max_entries: cfg.l0_max_entries,
                                 enable_l1: cfg.enable_l1,
                                 l1_max_memory: cfg.l1_max_memory,
+                                ..CacheConfig::default()
                             };
                             Arc::new(CachedTokenizer::new(base_tokenizer, cache_config))
                         }
@@ -278,10 +286,10 @@ async fn probe_chat_render(
 
 /// Whether `tokenizer` renders chats without its Jinja template, as llm-tokenizer
 /// does with the encoders it has built in for the architectures in `config.json`
-/// (DeepSeek V3.2 and V4 in 1.4.2). Such a render ignores `--chat-template`, and
-/// its defaults are not ATOM's: DeepSeek renders chat mode unless `thinking` is
-/// true, where ATOM's encoder renders thinking mode. Replaces the template, so
-/// probe a copy.
+/// (in 2.0.0 DeepSeek V3.2 and V4.1, and V4 without a template of its own).
+/// Such a render ignores `--chat-template`, and its defaults are not ATOM's:
+/// DeepSeek V3.2 and V4 render chat mode unless `thinking` is true, where
+/// ATOM's encoder renders thinking mode. Replaces the template, so probe a copy.
 fn renders_without_template(tokenizer: &mut dyn Tokenizer) -> bool {
     const PROBE: &str = "probe";
     tokenizer.set_chat_template(PROBE.to_string()).is_ok()
@@ -390,13 +398,17 @@ mod tests {
         dir
     }
 
-    /// llm-tokenizer picks its DeepSeek V3.2 and V4 encoders from `config.json`,
-    /// and they ignore the template.
+    /// llm-tokenizer picks its DeepSeek V3.2, V4 and V4.1 encoders from
+    /// `config.json`, and they ignore the template.
     #[test]
     fn test_deepseek_renders_without_template() {
         let mut jinja = HuggingFaceTokenizer::from_file(hf_tokenizer_path()).unwrap();
         assert!(!renders_without_template(&mut jinja));
-        for architecture in ["DeepseekV32ForCausalLM", "DeepseekV4ForCausalLM"] {
+        for architecture in [
+            "DeepseekV32ForCausalLM",
+            "DeepseekV4ForCausalLM",
+            "DeepseekV41ForCausalLM",
+        ] {
             let dir = tokenizer_dir(architecture);
             let path = dir.path().join("tokenizer.json");
             let mut deepseek = HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap();
@@ -440,7 +452,8 @@ mod tests {
 
     /// A tokenizer registers with the reasoning controls ATOM keeps for the
     /// `model_type` in the `config.json` beside it, from its directory or its
-    /// `tokenizer.json`, and removing it drops them.
+    /// `tokenizer.json`, and removing it drops them. HTTP routing tokenizes
+    /// its chats, which llm-tokenizer renders with its V4.1 encoder.
     #[tokio::test]
     async fn test_registration_finds_the_checkpoint_chat_controls() {
         let checkpoint = |model_type: &str| {
@@ -482,6 +495,8 @@ mod tests {
             LoadTokenizerStep.execute(&mut workflow).await.unwrap();
             let found = context.chat_controls.read().get(&id).copied();
             assert_eq!(found, controls, "{}", source.display());
+            let marked = context.chats_without_template.read().contains(&id);
+            assert!(!marked, "{}", source.display());
             ids.push(id);
         }
         remove_tokenizer(&context, &ids[0]).await;
