@@ -1,7 +1,52 @@
-# Qwen3.5-35B-A3B MXFP4 on 4 x MI455X (gfx1250): MLPerf Endpoints agentic, the 2026-11-01 to 11-19 points
+# Qwen3.5-35B-A3B MXFP4 on 4 x MI455X (gfx1250): MLPerf Endpoints agentic, the 2026-11-01 to 11-20 points
 
 How to reproduce the numbers below: the exact code, the settings, the run, and how each number is computed.
 They are 10-minute measurement points, not official results (see [What these numbers are](#what-these-numbers-are)).
+
+## 2026-11-20: c1024 (prefill idle time, decode GEMMs at 513-640 rows, fixed-max prefill attention)
+
+`agentic_20261120.env` on top of `agentic_20261101.env`, `agentic_20261107.env` and `agentic_20261119.env`. Code:
+`alizaidy/gfx1250-qwen-support` (ATOM 1fb8453f6, aiter 524bf4cd6) plus three changes: the aiter decode GEMM configs for
+513-640 rows, the aiter fixed-reference-max 2D prefill (`AITER_UA_2D_FIXED_MAX`) and ATOM `ATOM_PREFILL_EARLY_PREP`.
+Same image, topology, client and metric as the 2026-11-19 section.
+
+c1024 point: `KV=fp8_k4v4pt`, decode interval 4, `PREFILL_TOKENS=16384`, max_num_seqs 320, the 11-18 / 11-19 flags with
+`ATOM_FOLD_QKNORM_QKV_FP4PT=1 ATOM_FOLD_QKNORM_QKV_MAX_M=48` but without the c64-tuned fp4pt split settings (they slow decode
+1.5-4% at 104-127 rows), and
+
+```
+CAPS=[1,2,3,4,5,6,7,8,10,12,14,16,18,20,22,24,26,28,30,32,36,40,44,48,52,56,60,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,224,256,320]
+```
+
+(neutral at c1024: 152.1 vs 151.5 without; listed because every run below used it).
+
+| run | adds | e2e | vs base | tok/s | accuracy |
+|---|---|---:|---:|---:|---|
+| base | the point above with the 11-19 flags | 151.4 | | 87,316 | 0.5685 |
+| bitwise | + split-reduce config, `ATOM_EARLY_PREFILL_SCHEDULE=1`, `ATOM_PREFILL_EARLY_PREP=1` | 153.1 | +1.1% | 87,867 | 0.5695 |
+| + no drain + GEMMs | + `ATOM_STATE_OPS_DRAIN=0`, decode GEMM configs, `ATOM_FUSED_ROUTER_SHARED_EXPERT_MAX_TOKENS=640` | 156.8 | +3.6% | 89,163 | 0.5688 |
+| **final** | + `AITER_UA_2D_FIXED_MAX=1` (`agentic_20261120.env`) | **157.8** | **+4.2%** | 89,655 | 0.566 |
+
+Official-length run of the final settings (`CAP_MIN=600`, 19,616 trajectories, `run_official_host.sh <container> 1024`):
+**e2e 136.6, 86,613 tok/s, accuracy 0.5627** (coding 0.5334, workflow 0.6986), OSL per-turn mean 378.9, 608,677 / 608,677
+requests, 0 errored turns, 44.4 minutes, TTFT p99 / p99.9 1.42 / 1.87 s. The previous official-length c1024 run (11-16 code)
+was e2e 115.7, 77,712 tok/s, accuracy 0.5634, 49.3 minutes.
+
+Notes:
+- c1024 is GPU-work bound in a closed loop: e2e follows completed requests/s (a 1% cut in GPU time per request is ~+1.7%
+  e2e). Scheduling knobs only move time between TTFT and decode: budget / interval points (16k / 4, 24k / 9, 128k / 14,
+  128k / 19; effective interval 14 / 19 / 24 / 29) all scored 150.7-152.6.
+- The effective decode interval at c1024 is 14, not 4: the prefill coalescer probe (`_probe_local_prefill_work`) counts each
+  waiting request's full length (~72k tokens) against the budget, never fills, and fires on the stall bound (4 + 10 ticks).
+- Around every prefill the GPU sat idle ~5.4 ms (~2.1-2.4% of rank time): the scheduler's prefill step, the state-ops drain
+  (`synchronize()` whenever a GDN checkpoint is restored) and pageable checkpoint copies. Early schedule + early prep + no
+  drain remove most of it.
+- Fixed max is the one numerical change (lower rms error than the running max in the kernel tests); without it every
+  change above is bitwise.
+- Under c1024 load the GPUs are power-capped (PPT throttling, sclk ~1.6-1.7 GHz vs ~2.28 idle); kernel speedups measured
+  at idle clocks overstate serving gains.
+- Not used: a windowed MTP draft attention (+1.9% e2e) changes the published drafter's attention, which the MLPerf
+  Endpoints rules (2.9.4, 2.9.6.5) disallow.
 
 ## 2026-11-19: decode folds, early spec-decode metadata, fp4pt V from c64, dense graph sizes at c256 / c384
 
