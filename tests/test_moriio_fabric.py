@@ -290,7 +290,7 @@ class StateWiringTest(unittest.TestCase):
             fabric_branch.index("self._write_pages("),
         )
         self.assertIn(
-            "for session, size, local_offset, remote_offset in state_writes",
+            "for session, sizes, local_offsets, remote_offsets in state_writes",
             fabric_branch,
         )
 
