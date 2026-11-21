@@ -125,6 +125,7 @@ class _Projection(nn.Module):
         self.bias = self.weight_scale = None
         self.params_dtype = torch.bfloat16
         self.native_a8_group_rows = None
+        self.runs_bf16 = False
         self.is_output_padded = False
         self.tp_dim = None
         self.output_size = out_features
