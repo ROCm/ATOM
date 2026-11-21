@@ -751,6 +751,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # A GDN prefill zeroes the speculative tail of its slots' conv window, which
     # it neither reads nor writes, so no checkpoint image carries stale bytes.
     "ATOM_GDN_ZERO_DEAD_CONV": lambda: os.getenv("ATOM_GDN_ZERO_DEAD_CONV", "1") == "1",
+    # A prefill step's eager-path GDN checkpoint targets (`_checkpoint_tensors`)
+    # go up non-blocking from pinned memory instead of six pageable
+    # `torch.as_tensor(..., device=)` copies, each of which drains the stream
+    # (every queued forward) before the step's metadata is built. Same values,
+    # dtypes and shapes in fresh device tensors.
+    "ATOM_PREFILL_EARLY_PREP": lambda: (
+        os.getenv("ATOM_PREFILL_EARLY_PREP", "0") == "1"
+    ),
     # Qwen3-Next / Qwen3.5 GDN prefill without speculative tokens (64 tokens or
     # more): the chunk KKT kernel computes the gates g and beta of its key
     # head's value heads from the in_proj rows, in place of the
