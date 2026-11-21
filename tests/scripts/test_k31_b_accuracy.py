@@ -1,4 +1,7 @@
+import base64
+import hashlib
 import importlib.util
+import io
 import json
 import stat
 import subprocess
@@ -21,6 +24,103 @@ CID = "a" * 64
 
 def write(path, value):
     path.write_text(json.dumps(value))
+
+
+def old_allocation():
+    path = ROOT / ".github/scripts/k31_b_accuracy.py"
+    namespace = {"__file__": str(path), "__name__": "before_allocation_repair"}
+    source = subprocess.check_output(
+        [
+            "git",
+            "show",
+            "d0fa6a7fb5e9b4da3f559fab153aea0567fd7e1f:.github/scripts/k31_b_accuracy.py",
+        ],
+        cwd=ROOT,
+    )
+    exec(  # noqa: S102 -- frozen regression source
+        compile(source, "d0fa", "exec"), namespace
+    )
+    return namespace["allocation"]
+
+
+def test_numeric_producer_group_requires_observed_gid(tmp_path, monkeypatch):
+    monkeypatch.setattr(ci.os, "major", lambda value: 226, raising=False)
+    monkeypatch.setattr(ci.os, "minor", lambda value: value, raising=False)
+    inspect = lambda path: SimpleNamespace(
+        st_mode=stat.S_IFCHR, st_gid=110, st_rdev=128
+    )
+    text = "--group-add 110 " + " ".join(
+        f"--device /dev/dri/renderD{i}" for i in range(128, 185, 8)
+    )
+    with pytest.raises(ValueError, match="unexpected allocation argument"):
+        old_allocation()(text, inspect)
+    assert len(ci.allocation(text, inspect)) == 9
+    for bad in (
+        text.replace("110", "111"),
+        text.replace("110", "root"),
+        text + " --group-add 110",
+        text.replace("--group-add 110", "--group-add=110"),
+    ):
+        with pytest.raises(ValueError):
+            ci.allocation(bad, inspect)
+    source, output = tmp_path / "allocation", tmp_path / "receipt.json"
+    source.write_text(text)
+    current = ci.allocation
+    monkeypatch.setattr(ci, "allocation", lambda value: current(value, inspect))
+    ci.captured_allocation(source, output)
+    assert json.loads(output.read_text())["observed_device_groups"] == [110]
+
+
+def test_parser_failure_retains_exact_input_before_tokenizing(tmp_path, monkeypatch):
+    source, output = tmp_path / "allocation", tmp_path / "receipt.json"
+    raw = b"--unsupported value\n"
+    source.write_bytes(raw)
+    with pytest.raises(ValueError, match="unexpected allocation argument"):
+        old_allocation()(source.read_text())
+    assert not output.exists()
+    split = ci.shlex.split
+
+    def witnessed(text):
+        assert base64.b64decode(json.loads(output.read_text())["raw_base64"]) == raw
+        return split(text)
+
+    monkeypatch.setattr(ci.shlex, "split", witnessed)
+    with pytest.raises(ValueError, match="unexpected allocation argument"):
+        ci.captured_allocation(source, output)
+    report = json.loads(output.read_text())
+    assert report["tokens"] == ["--unsupported", "value"]
+    assert report["phase"] == "parse" and report["error"]["type"] == "ValueError"
+    assert report["captured_sha256"] == hashlib.sha256(raw).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "raw,phase",
+    [(b'"unfinished', "tokenize"), (b"\xff", "decode"), (b"x" * 16385, "read")],
+)
+def test_capture_is_bounded_and_retains_early_refusal(
+    tmp_path, monkeypatch, raw, phase
+):
+    source, output = tmp_path / "allocation", tmp_path / "receipt.json"
+    opened = Path.open
+    sizes = []
+
+    class Bounded(io.BytesIO):
+        def read(self, size=-1):
+            sizes.append(size)
+            assert size == 16385
+            return super().read(size)
+
+    monkeypatch.setattr(
+        Path,
+        "open",
+        lambda path, *a, **k: Bounded(raw) if path == source else opened(path, *a, **k),
+    )
+    with pytest.raises(ValueError):
+        ci.captured_allocation(source, output)
+    report = json.loads(output.read_text())
+    assert sizes == [16385] and report["phase"] == phase
+    assert base64.b64decode(report["raw_base64"]) == raw[:16384]
+    assert report["truncated"] == (len(raw) > 16384) and "tokens" not in report
 
 
 def test_allocated_nodes_and_ambiguous_inputs(monkeypatch):

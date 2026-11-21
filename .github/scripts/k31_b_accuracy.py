@@ -1,6 +1,7 @@
 """Temporary, fixed B-accuracy route. Docker owns each dedicated container."""
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -57,6 +58,13 @@ def command(argv, seconds=30):
 
 def allocation(text, inspect_path=os.stat):
     tokens, paths = shlex.split(text), []
+    groups = []
+    if tokens[:1] == ["--group-add"]:
+        require(
+            len(tokens) > 1 and re.fullmatch(r"[0-9]+", tokens[1]),
+            "non-numeric allocated group",
+        )
+        groups, tokens = [int(tokens[1])], tokens[2:]
     while tokens:
         flag = tokens.pop(0)
         value = (
@@ -86,7 +94,43 @@ def allocation(text, inspect_path=os.stat):
                 "minor": os.minor(node.st_rdev),
             }
         )
+    require(
+        set(groups) <= {node["gid"] for node in result},
+        "declared group not observed on allocated devices",
+    )
     return result
+
+
+def captured_allocation(path, output):
+    limit = 16384
+    report = {"kind": "ci-allocation-input-v1", "path": str(path), "phase": "read"}
+    try:
+        with path.open("rb") as stream:
+            data = stream.read(limit + 1)
+        raw = data[:limit]
+        report.update(
+            captured_bytes=len(raw),
+            captured_sha256=digest(raw),
+            raw_base64=base64.b64encode(raw).decode("ascii"),
+            truncated=len(data) > limit,
+        )
+        save(output, report)
+        require(len(data) <= limit, "allocation input exceeds 16384-byte capture limit")
+        report["phase"] = "decode"
+        text = raw.decode("utf-8")
+        report["phase"] = "tokenize"
+        report["tokens"] = shlex.split(text)
+        save(output, report)
+        report["phase"] = "parse"
+        result = allocation(text)
+        report["observed_device_groups"] = sorted({node["gid"] for node in result})
+        report["phase"] = "accepted"
+        return result
+    except (OSError, ValueError) as error:
+        report["error"] = {"type": type(error).__name__, "message": str(error)}
+        raise
+    finally:
+        save(output, report)
 
 
 def prepare(work):
@@ -140,7 +184,9 @@ def prepare(work):
     subprocess.run(
         ["git", "apply", str(work / "input/B-validation.patch")], cwd=source, check=True
     )
-    nodes = allocation(Path("/etc/podinfo/gha-render-devices").read_text())
+    nodes = captured_allocation(
+        Path("/etc/podinfo/gha-render-devices"), work / "output/allocation-input.json"
+    )
     for node in nodes[1:]:
         device = Path("/sys/class/drm") / Path(node["path"]).name / "device"
         node["pci"] = device.resolve(strict=True).name
@@ -156,6 +202,7 @@ def prepare(work):
         work / "allocation.json",
         {
             "nodes": nodes,
+            "input_receipt_sha256": checksum(work / "output/allocation-input.json"),
             "requested_runner": policy["runner"],
             "job": {
                 k: os.environ.get(k)
