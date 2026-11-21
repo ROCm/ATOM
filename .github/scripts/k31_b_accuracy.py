@@ -98,6 +98,7 @@ def allocation(text, inspect_path=os.stat, permitted_cpus=None):
             "non-numeric allocated group",
         )
         groups, tokens = [int(tokens[1])], tokens[2:]
+        require(groups[0] < 2**32 - 1, "allocated group outside Linux GID range")
     while tokens:
         flag = tokens.pop(0)
         value = (
@@ -127,21 +128,45 @@ def allocation(text, inspect_path=os.stat, permitted_cpus=None):
                 "minor": os.minor(node.st_rdev),
             }
         )
-    require(
-        set(groups) <= {node["gid"] for node in result},
-        "declared group not observed on allocated devices",
-    )
     return {
         "nodes": result,
+        "declared_groups": groups,
         "declared_cpu_set": declared_cpus,
         "permitted_cpu_affinity": sorted(permitted),
         "cpu_affinity": cpus,
     }
 
 
+def observe_device(path, report, output):
+    row = {"path": path}
+    report["devices"].append(row)
+    try:
+        node = os.stat(path)
+        row.update(
+            type=stat.S_IFMT(node.st_mode),
+            mode=oct(stat.S_IMODE(node.st_mode)),
+            uid=node.st_uid,
+            gid=node.st_gid,
+            major=os.major(node.st_rdev),
+            minor=os.minor(node.st_rdev),
+        )
+        return node
+    except OSError as error:
+        row["error"] = {"type": type(error).__name__, "message": str(error)}
+        raise
+    finally:
+        save(output, report)
+
+
 def captured_allocation(path, output):
     limit = 16384
-    report = {"kind": "ci-allocation-input-v1", "path": str(path), "phase": "read"}
+    report = {
+        "kind": "ci-allocation-input-v1",
+        "path": str(path),
+        "phase": "read",
+        "observation_location": "runner_process",
+        "devices": [],
+    }
     try:
         with path.open("rb") as stream:
             data = stream.read(limit + 1)
@@ -163,7 +188,12 @@ def captured_allocation(path, output):
         report["permitted_cpu_affinity"] = sorted(os.sched_getaffinity(0))
         save(output, report)
         report["phase"] = "parse"
-        result = allocation(text, permitted_cpus=report["permitted_cpu_affinity"])
+        result = allocation(
+            text,
+            inspect_path=lambda device: observe_device(device, report, output),
+            permitted_cpus=report["permitted_cpu_affinity"],
+        )
+        report["declared_groups"] = result["declared_groups"]
         report["observed_device_groups"] = sorted(
             {node["gid"] for node in result["nodes"]}
         )
@@ -248,6 +278,7 @@ def prepare(work):
         work / "allocation.json",
         {
             "nodes": nodes,
+            "declared_groups": allocated["declared_groups"],
             "input_receipt_sha256": checksum(work / "output/allocation-input.json"),
             "requested_runner": policy["runner"],
             "job": {
@@ -388,6 +419,84 @@ def device_map(output):
     )
 
 
+def device_groups(allocated):
+    return set(allocated["declared_groups"]) | {
+        node["gid"] for node in allocated["nodes"]
+    }
+
+
+def device_access(admission):
+    output = EVIDENCE / f"device-access-{os.getpid()}.json"
+    report = {
+        "kind": "ci-device-access-v1",
+        "observation_location": "workload_container",
+        "cid": admission["cid"],
+        "uid": os.getuid(),
+        "euid": os.geteuid(),
+        "gid": os.getegid(),
+        "groups": os.getgroups(),
+        "devices": [],
+        "passed": False,
+    }
+    try:
+        save(output, report)
+        allocated = admission["allocation"]
+        nodes = allocated["nodes"]
+        paths = [node["path"] for node in nodes]
+        require(
+            len(paths) == len(set(paths)) == 9
+            and paths[0] == "/dev/kfd"
+            and all(
+                re.fullmatch(r"/dev/dri/renderD[0-9]+", path) for path in paths[1:]
+            ),
+            "device access allowlist differs",
+        )
+        for path in paths:
+            observe_device(path, report, output)
+        requested = device_groups(allocated)
+        require(
+            set(admission["docker"]["HostConfig"]["GroupAdd"])
+            == {str(gid) for gid in requested},
+            "Docker supplementary groups differ",
+        )
+        require(
+            report["uid"] != 0 and report["euid"] != 0,
+            "device access requires the non-root workload UID",
+        )
+        require(
+            set(report["groups"]) | {report["gid"]} == requested | {report["gid"]},
+            "live supplementary groups differ",
+        )
+        for expected, row in zip(nodes, report["devices"]):
+            require(
+                row["type"] == stat.S_IFCHR
+                and (row["major"], row["minor"])
+                == (expected["major"], expected["minor"]),
+                "container device identity differs",
+            )
+            report["checking_device"] = row["path"]
+            fd = os.open(row["path"], os.O_RDWR | os.O_CLOEXEC)
+            try:
+                opened = os.fstat(fd)
+                require(
+                    stat.S_ISCHR(opened.st_mode)
+                    and (os.major(opened.st_rdev), os.minor(opened.st_rdev))
+                    == (row["major"], row["minor"]),
+                    "opened device identity differs",
+                )
+            finally:
+                os.close(fd)
+            row["read_write_open_closed"] = True
+            save(output, report)
+        report["passed"] = True
+    except (OSError, ValueError) as error:
+        report["error"] = {"type": type(error).__name__, "message": str(error)}
+        raise
+    finally:
+        save(output, report)
+    return report
+
+
 def verify_admission(root):
     admission, policy = read(root / "admission.json"), read(POLICY)
     require(
@@ -445,11 +554,6 @@ def verify_admission(root):
         ),
         "device mapping or permissions differ",
     )
-    require(
-        {d["gid"] for d in admission["allocation"]["nodes"]}
-        <= set(os.getgroups()) | {os.getegid()},
-        "device groups missing",
-    )
     for path in (
         Path("/"),
         root / "source",
@@ -485,6 +589,7 @@ def verify_admission(root):
     )
     for name, wanted in read(manifest).items():
         require(checksum(root / "input" / name) == wanted, "prepared input differs")
+    access = device_access(admission)
     admission["observation"] = {
         "namespaces": {
             name: os.readlink(f"/proc/self/ns/{name}")
@@ -495,6 +600,7 @@ def verify_admission(root):
         "uid": os.geteuid(),
         "gid": os.getegid(),
         "groups": os.getgroups(),
+        "device_access": access,
     }
     return admission
 
@@ -662,10 +768,7 @@ def container(kind, work):
         ]
     else:
         flags += [f"--device={d['path']}:{d['path']}:rw" for d in allocated["nodes"]]
-        flags += [
-            f"--group-add={gid}"
-            for gid in sorted({d["gid"] for d in allocated["nodes"]})
-        ]
+        flags += [f"--group-add={gid}" for gid in sorted(device_groups(allocated))]
     if kind == "model":
         for source, target in [
             (work / "source", "source"),

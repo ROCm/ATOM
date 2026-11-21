@@ -56,21 +56,37 @@ def old_allocation(revision="d0fa6a7fb5e9b4da3f559fab153aea0567fd7e1f"):
     return namespace["allocation"]
 
 
-def test_numeric_producer_group_requires_observed_gid(tmp_path, monkeypatch):
+def mock_device_stat(monkeypatch, inspect):
+    original = ci.os.stat
+    monkeypatch.setattr(
+        ci.os,
+        "stat",
+        lambda path, *a, **kw: (
+            inspect(str(path))
+            if str(path).startswith("/dev/")
+            else original(path, *a, **kw)
+        ),
+    )
+
+
+def test_numeric_producer_group_is_a_supplementary_request(tmp_path, monkeypatch):
     monkeypatch.setattr(ci.os, "major", lambda value: 226, raising=False)
     monkeypatch.setattr(ci.os, "minor", lambda value: value, raising=False)
     inspect = lambda path: SimpleNamespace(
-        st_mode=stat.S_IFCHR, st_gid=110, st_rdev=128
+        st_mode=stat.S_IFCHR | 0o660, st_uid=0, st_gid=993, st_rdev=128
     )
     text = "--group-add 110 " + " ".join(
         f"--device /dev/dri/renderD{i}" for i in range(128, 185, 8)
     )
     with pytest.raises(ValueError, match="unexpected allocation argument"):
         old_allocation()(text, inspect)
+    with pytest.raises(ValueError, match="declared group not observed"):
+        old_allocation("a78232615ee3f57b4b149ea9f8ebf471fb4ff06e")(text, inspect)
     assert len(ci.allocation(text, inspect)["nodes"]) == 9
+    assert ci.allocation(text, inspect)["declared_groups"] == [110]
     for bad in (
-        text.replace("110", "111"),
         text.replace("110", "root"),
+        text.replace("110", str(2**32 - 1)),
         text + " --group-add 110",
         text.replace("--group-add 110", "--group-add=110"),
     ):
@@ -78,12 +94,21 @@ def test_numeric_producer_group_requires_observed_gid(tmp_path, monkeypatch):
             ci.allocation(bad, inspect)
     source, output = tmp_path / "allocation", tmp_path / "receipt.json"
     source.write_text(text)
-    current = ci.allocation
-    monkeypatch.setattr(
-        ci, "allocation", lambda value, **kw: current(value, inspect, **kw)
-    )
+    mock_device_stat(monkeypatch, inspect)
+    old_capture = old_allocation(
+        "a78232615ee3f57b4b149ea9f8ebf471fb4ff06e"
+    ).__globals__["captured_allocation"]
+    with pytest.raises(ValueError, match="declared group not observed"):
+        old_capture(source, tmp_path / "old.json")
+    assert "devices" not in json.loads((tmp_path / "old.json").read_text())
     ci.captured_allocation(source, output)
-    assert json.loads(output.read_text())["observed_device_groups"] == [110]
+    report = json.loads(output.read_text())
+    assert report["observed_device_groups"] == [993] and report["declared_groups"] == [
+        110
+    ]
+    assert all(
+        row["mode"] == "0o660" and row["gid"] == 993 for row in report["devices"]
+    )
 
 
 def test_parser_failure_retains_exact_input_before_tokenizing(tmp_path, monkeypatch):
@@ -138,6 +163,146 @@ def test_capture_is_bounded_and_retains_early_refusal(
     assert report["truncated"] == (len(raw) > 16384) and "tokens" not in report
 
 
+@pytest.mark.parametrize("failure", ["type", "stat"])
+def test_runner_device_observation_precedes_refusal(tmp_path, monkeypatch, failure):
+    monkeypatch.setattr(ci.os, "major", lambda value: 226, raising=False)
+    monkeypatch.setattr(ci.os, "minor", lambda value: value, raising=False)
+
+    def inspect(path):
+        if failure == "stat":
+            raise PermissionError("fixture stat refused")
+        return SimpleNamespace(
+            st_mode=stat.S_IFREG | 0o640, st_uid=7, st_gid=993, st_rdev=0
+        )
+
+    mock_device_stat(monkeypatch, inspect)
+    source, output = tmp_path / "allocation", tmp_path / "receipt.json"
+    source.write_text(ACTUAL_ALLOCATION)
+    with pytest.raises((PermissionError, ValueError)):
+        ci.captured_allocation(source, output)
+    report = json.loads(output.read_text())
+    assert report["observation_location"] == "runner_process"
+    assert report["devices"][0]["path"] == "/dev/kfd"
+    if failure == "type":
+        assert (
+            report["devices"][0]["gid"] == 993
+            and report["devices"][0]["mode"] == "0o640"
+        )
+        assert report["devices"][0]["type"] == stat.S_IFREG
+    else:
+        assert report["devices"][0]["error"]["type"] == "PermissionError"
+
+
+@pytest.fixture
+def access_fixture(tmp_path, monkeypatch):
+    paths = ["/dev/kfd", *(f"/dev/dri/renderD{i}" for i in range(128, 185, 8))]
+    monkeypatch.setattr(ci.os, "major", lambda value: value[0], raising=False)
+    monkeypatch.setattr(ci.os, "minor", lambda value: value[1], raising=False)
+    for name, value in {"getuid": 1001, "geteuid": 1001, "getegid": 1001}.items():
+        monkeypatch.setattr(ci.os, name, lambda value=value: value, raising=False)
+    monkeypatch.setattr(ci.os, "getgroups", lambda: [110, 993, 1001], raising=False)
+    monkeypatch.setattr(ci.os, "O_CLOEXEC", 0x80000, raising=False)
+    monkeypatch.setattr(ci, "EVIDENCE", tmp_path)
+
+    def inspect(path):
+        number = (
+            (235, 0) if path == "/dev/kfd" else (226, int(path.rsplit("renderD", 1)[1]))
+        )
+        return SimpleNamespace(
+            st_mode=stat.S_IFCHR | 0o660, st_uid=0, st_gid=110, st_rdev=number
+        )
+
+    mock_device_stat(monkeypatch, inspect)
+    nodes = [
+        {
+            "path": path,
+            "gid": 993,
+            "major": inspect(path).st_rdev[0],
+            "minor": inspect(path).st_rdev[1],
+        }
+        for path in paths
+    ]
+    admission = {
+        "cid": CID,
+        "allocation": {"nodes": nodes, "declared_groups": [110]},
+        "docker": {"HostConfig": {"GroupAdd": ["110", "993"]}},
+    }
+    backing = tmp_path / "fd-backing"
+    backing.write_bytes(b"")
+    opened, closed, calls, state = {}, [], [], {"deny": False, "bad_fstat": False}
+    real_open, real_fstat, real_close = ci.os.open, ci.os.fstat, ci.os.close
+
+    def open_device(path, flags, *a, **kw):
+        if path not in paths:
+            return real_open(path, flags, *a, **kw)
+        calls.append((path, flags))
+        assert flags == ci.os.O_RDWR | ci.os.O_CLOEXEC
+        if state["deny"]:
+            raise PermissionError(13, "fixture open refused", path)
+        fd = real_open(backing, ci.os.O_RDWR)
+        opened[fd] = path
+        return fd
+
+    def fstat_device(fd):
+        if fd not in opened:
+            return real_fstat(fd)
+        node = inspect(opened[fd])
+        if state["bad_fstat"]:
+            node.st_mode = stat.S_IFREG
+        return node
+
+    def close_device(fd):
+        if fd in opened:
+            closed.append(opened.pop(fd))
+        real_close(fd)
+
+    monkeypatch.setattr(ci.os, "open", open_device)
+    monkeypatch.setattr(ci.os, "fstat", fstat_device)
+    monkeypatch.setattr(ci.os, "close", close_device)
+    try:
+        yield admission, opened, closed, calls, state
+    finally:
+        for fd in list(opened):
+            real_close(fd)
+
+
+def test_unprivileged_access_uses_container_observations(access_fixture):
+    admission, opened, closed, calls, _ = access_fixture
+    report = ci.device_access(admission)
+    assert report["passed"] and report["observation_location"] == "workload_container"
+    assert report["euid"] == 1001 and len(closed) == len(calls) == 9 and not opened
+    assert {row["gid"] for row in report["devices"]} == {110}
+    assert all(row["read_write_open_closed"] for row in report["devices"])
+
+
+@pytest.mark.parametrize(
+    "failure", ["root", "missing_live", "extra_live", "docker", "deny", "fstat"]
+)
+def test_unprivileged_access_refuses_and_closes(
+    access_fixture, tmp_path, monkeypatch, failure
+):
+    admission, opened, closed, calls, state = access_fixture
+    if failure == "root":
+        monkeypatch.setattr(ci.os, "geteuid", lambda: 0)
+    elif failure in ("missing_live", "extra_live"):
+        monkeypatch.setattr(
+            ci.os,
+            "getgroups",
+            lambda: [993] if failure == "missing_live" else [110, 993, 555],
+        )
+    elif failure == "docker":
+        admission["docker"]["HostConfig"]["GroupAdd"].append("555")
+    else:
+        state["deny" if failure == "deny" else "bad_fstat"] = True
+    with pytest.raises((PermissionError, ValueError)):
+        ci.device_access(admission)
+    report = json.loads(next(tmp_path.glob("device-access-*.json")).read_text())
+    assert not report["passed"] and len(report["devices"]) == 9 and "error" in report
+    assert not opened
+    assert len(closed) == (1 if failure == "fstat" else 0)
+    assert len(calls) == (1 if failure in ("deny", "fstat") else 0)
+
+
 def test_allocated_nodes_and_ambiguous_inputs(monkeypatch):
     monkeypatch.setattr(ci.os, "major", lambda value: 226, raising=False)
     monkeypatch.setattr(ci.os, "minor", lambda value: value, raising=False)
@@ -167,7 +332,7 @@ def test_actual_cpu_constraint_old_refuses_new_binds(tmp_path, monkeypatch):
     monkeypatch.setattr(ci.os, "major", lambda value: 226, raising=False)
     monkeypatch.setattr(ci.os, "minor", lambda value: value, raising=False)
     inspect = lambda path: SimpleNamespace(
-        st_mode=stat.S_IFCHR, st_gid=992, st_rdev=128
+        st_mode=stat.S_IFCHR | 0o660, st_uid=0, st_gid=992, st_rdev=128
     )
     with pytest.raises(ValueError, match="unexpected allocation argument"):
         old_allocation("39ee6af2b66796ee30277a4c557e87d9a9338846")(
@@ -177,10 +342,7 @@ def test_actual_cpu_constraint_old_refuses_new_binds(tmp_path, monkeypatch):
     assert allocated["cpu_affinity"] == list(range(128))
     assert allocated["permitted_cpu_affinity"] == list(range(256))
     assert allocated["declared_cpu_set"] == "0-127" and len(allocated["nodes"]) == 9
-    current = ci.allocation
-    monkeypatch.setattr(
-        ci, "allocation", lambda value, **kw: current(value, inspect, **kw)
-    )
+    mock_device_stat(monkeypatch, inspect)
     source, output = tmp_path / "allocation", tmp_path / "receipt.json"
     source.write_bytes(ACTUAL_ALLOCATION.encode())
     ci.captured_allocation(source, output)
@@ -271,7 +433,12 @@ def test_containers_use_only_the_bound_cpu_set(tmp_path, monkeypatch, kind):
     (tmp_path / "output").mkdir()
     write(
         tmp_path / "allocation.json",
-        {"nodes": [], "cpu_affinity": [1, 3], "permitted_cpu_affinity": list(range(8))},
+        {
+            "nodes": [{"path": "/dev/kfd", "gid": 993}],
+            "declared_groups": [110],
+            "cpu_affinity": [1, 3],
+            "permitted_cpu_affinity": list(range(8)),
+        },
     )
     monkeypatch.setenv("GITHUB_RUN_ID", "1")
     monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "1")
@@ -286,6 +453,9 @@ def test_containers_use_only_the_bound_cpu_set(tmp_path, monkeypatch, kind):
     assert [arg for arg in calls[0] if arg.startswith("--cpuset-cpus")] == [
         "--cpuset-cpus=1,3"
     ]
+    assert {arg for arg in calls[0] if arg.startswith("--group-add=")} == (
+        set() if kind == "dataset" else {"--group-add=110", "--group-add=993"}
+    )
 
 
 @pytest.mark.parametrize(
@@ -317,7 +487,10 @@ def test_cleanup_requires_exact_cid_and_observed_absence(remove_rc, query_rc, pr
 
 def test_timeout_retains_failure_and_cleans_saved_cid(tmp_path, monkeypatch):
     (tmp_path / "output").mkdir()
-    write(tmp_path / "allocation.json", {"nodes": [], "cpu_affinity": []})
+    write(
+        tmp_path / "allocation.json",
+        {"nodes": [], "declared_groups": [], "cpu_affinity": []},
+    )
     policy = tmp_path / "policy.json"
     write(
         policy,
