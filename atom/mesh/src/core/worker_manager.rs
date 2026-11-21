@@ -225,15 +225,18 @@ async fn fetch_base_loads(
             None => return HashMap::new(),
         };
         let by_rank = parse_dp_inflight(&body);
+        // The engine charges dp_inflight only when it routes among its own DP ranks, so
+        // it stays 0 on a single-engine replica: a worker without a rank reads the
+        // scheduler queues instead.
+        let queued = parse_queued_requests(&body);
         let mut loads = HashMap::new();
         for worker in group {
-            if let Some(rank) = worker.dp_rank() {
-                if let Some(load) = by_rank.get(&rank) {
-                    loads.insert(worker.url().to_string(), *load);
-                }
-            } else if group.len() == 1 && !by_rank.is_empty() {
-                let sum = by_rank.values().sum();
-                loads.insert(worker.url().to_string(), sum);
+            let load = match worker.dp_rank() {
+                Some(rank) => by_rank.get(&rank).copied(),
+                None => queued,
+            };
+            if let Some(load) = load {
+                loads.insert(worker.url().to_string(), load);
             }
         }
         return loads;
@@ -284,34 +287,37 @@ fn sum_num_tokens(json: &Value) -> Option<isize> {
 
 /// `atom:dp_inflight_requests{rank="k"}` values. Lines without a rank label are skipped.
 pub(crate) fn parse_dp_inflight(body: &str) -> HashMap<usize, isize> {
-    let mut loads = HashMap::new();
-    for line in body.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some(rest) = line.strip_prefix("atom:dp_inflight_requests") else {
-            continue;
-        };
+    samples(body, "atom:dp_inflight_requests")
+        .filter_map(|(rest, value)| {
+            let rank = label_value(rest, "rank")?.parse().ok()?;
+            Some((rank, value as isize))
+        })
+        .collect()
+}
+
+/// Requests the instance's scheduler holds across its DP ranks, running or waiting.
+pub(crate) fn parse_queued_requests(body: &str) -> Option<isize> {
+    let gauge = |name| samples(body, name).next().map(|(_, value)| value);
+    let running = gauge("atom:requests_running")?;
+    let waiting = gauge("atom:requests_waiting").unwrap_or(0.0);
+    Some((running + waiting) as isize)
+}
+
+/// The label block and finite value of each `name` sample in a Prometheus text body.
+fn samples<'a>(body: &'a str, name: &'a str) -> impl Iterator<Item = (&'a str, f64)> + 'a {
+    body.lines().filter_map(move |line| {
+        let rest = line.trim().strip_prefix(name)?;
         // `atom:dp_inflight_requests_total` and similar names are different metrics.
-        if rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
-            continue;
+        if rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == ':') {
+            return None;
         }
-        let Some(rank) = label_value(rest, "rank").and_then(|rank| rank.parse().ok()) else {
-            continue;
+        let value = match rest.trim_start().strip_prefix('{') {
+            Some(labelled) => labelled.split_once('}')?.1,
+            None => rest,
         };
-        let Some(value) = line
-            .split_whitespace()
-            .next_back()
-            .and_then(|token| token.parse::<f64>().ok())
-        else {
-            continue;
-        };
-        if value.is_finite() {
-            loads.insert(rank, value as isize);
-        }
-    }
-    loads
+        let value: f64 = value.split_whitespace().next()?.parse().ok()?;
+        value.is_finite().then_some((rest, value))
+    })
 }
 
 fn label_value<'a>(metric_rest: &'a str, name: &str) -> Option<&'a str> {
@@ -353,6 +359,7 @@ impl LoadMonitor {
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
         client: reqwest::Client,
+        backend: BackendType,
         interval_secs: u64,
     ) -> Self {
         let (tx, rx) = watch::channel(HashMap::new());
@@ -361,17 +368,12 @@ impl LoadMonitor {
             worker_registry,
             policy_registry,
             client,
-            backend: BackendType::Sglang,
+            backend,
             interval: Duration::from_secs(interval_secs),
             tx,
             rx,
             monitor_handle: Arc::new(Mutex::new(None)),
         }
-    }
-
-    pub fn with_backend(mut self, backend: BackendType) -> Self {
-        self.backend = backend;
-        self
     }
 
     pub async fn start(&self) {
@@ -445,19 +447,21 @@ impl LoadMonitor {
                 WorkerManager::get_all_worker_loads(&worker_registry, &client, backend).await;
             let loads = cacheable_loads(&result.loads);
 
-            if !loads.is_empty() {
+            // An empty map is published too: loads from an earlier tick are stale, and
+            // power_of_two falls back to its local request count without them.
+            if loads.is_empty() {
+                warn!("No loads fetched from workers");
+            } else {
                 debug!(
                     "Fetched loads from {} workers, updating {} PowerOfTwo policies",
                     loads.len(),
                     power_of_two_policies.len()
                 );
-                for policy in &power_of_two_policies {
-                    policy.update_loads(&loads);
-                }
-                let _ = tx.send(loads);
-            } else {
-                warn!("No loads fetched from workers");
             }
+            for policy in &power_of_two_policies {
+                policy.update_loads(&loads);
+            }
+            let _ = tx.send(loads);
         }
     }
 
@@ -480,6 +484,7 @@ impl Drop for LoadMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::{BasicWorkerBuilder, DPAwareWorkerBuilder};
     use crate::protocols::worker_spec::WorkerLoadInfo;
 
     #[test]
@@ -496,6 +501,67 @@ atom:dp_inflight_requests 13
         assert_eq!(loads.get(&0), Some(&4));
         assert_eq!(loads.get(&1), Some(&9));
         assert_eq!(loads.len(), 2);
+    }
+
+    #[test]
+    fn parse_queued_requests_needs_the_running_gauge() {
+        let body = "atom:requests_running 2.0\n\
+                    atom:requests_waiting_total 7\n\
+                    atom:requests_waiting 3.0\n";
+        assert_eq!(parse_queued_requests(body), Some(5));
+        assert_eq!(parse_queued_requests("atom:requests_waiting 3\n"), None);
+    }
+
+    /// Serves `body` at `/metrics` and returns the server's base URL.
+    async fn metrics_server(body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app =
+            axum::Router::new().route("/metrics", axum::routing::get(move || async move { body }));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        url
+    }
+
+    #[tokio::test]
+    async fn atom_loads_read_each_rank_of_an_instance_and_the_queues_of_one_engine() {
+        let dp = metrics_server(
+            "atom:dp_inflight_requests{rank=\"0\"} 4\n\
+             atom:dp_inflight_requests{rank=\"1\"} 9\n\
+             atom:requests_running 11\n",
+        )
+        .await;
+        // A single-engine replica never charges dp_inflight.
+        let single = metrics_server(
+            "atom:dp_inflight_requests{rank=\"0\"} 0\n\
+             atom:requests_running 2.0\n\
+             atom:requests_waiting 3.0\n",
+        )
+        .await;
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(DPAwareWorkerBuilder::new(&dp, 0, 2).build()),
+            Arc::new(DPAwareWorkerBuilder::new(&dp, 1, 2).build()),
+            Arc::new(BasicWorkerBuilder::new(&single).build()),
+            Arc::new(BasicWorkerBuilder::new("http://127.0.0.1:1").build()),
+        ];
+        let registry = WorkerRegistry::new();
+        for worker in &workers {
+            registry.register(Arc::clone(worker));
+        }
+
+        let result = WorkerManager::get_all_worker_loads(
+            &registry,
+            &reqwest::Client::new(),
+            BackendType::Atom,
+        )
+        .await;
+        let loads: HashMap<&str, isize> = result
+            .loads
+            .iter()
+            .map(|info| (info.worker.as_str(), info.load))
+            .collect();
+        let load = |index: usize| loads[workers[index].url()];
+        assert_eq!((load(0), load(1), load(2), load(3)), (4, 9, 5, -1));
+        assert_eq!((result.successful, result.failed), (3, 1));
     }
 
     #[test]
