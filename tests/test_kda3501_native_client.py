@@ -30,7 +30,7 @@ class NativeClientTest(unittest.TestCase):
                 output_tokens=list(range(first, last)),
                 logprobs=[RECORD] * (last - first),
             )
-            client.receive(sample, records)
+            client.receive(sample, records, [])
         self.assertEqual([row["token"] for row in records], list(range(32)))
         for tokens, rows in (
             ([1], []),
@@ -43,9 +43,11 @@ class NativeClientTest(unittest.TestCase):
                 self.assertRaises(AssertionError),
             ):
                 client.receive(
-                    SimpleNamespace(output_tokens=tokens, logprobs=rows), records.copy()
+                    SimpleNamespace(output_tokens=tokens, logprobs=rows),
+                    records.copy(),
+                    [],
                 )
-        client.receive(SimpleNamespace(output_tokens=[], logprobs=None), [])
+        client.receive(SimpleNamespace(output_tokens=[], logprobs=None), [], [])
 
     def test_saves_exclusively_and_bounds_before_open(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -57,7 +59,7 @@ class NativeClientTest(unittest.TestCase):
                 client.save(path, "large.json", {"value": "x" * 1024**2})
             self.assertFalse((path / "large.json").exists())
 
-    def run_client(self, folder, bad_cache=False):
+    def run_client(self, folder, bad_cache=False, nonfinite=None):
         root = Path(folder)
         proof = {
             "tokens": DATA["tokens"],
@@ -81,6 +83,7 @@ class NativeClientTest(unittest.TestCase):
             True,
             False,
         )
+        engine.callback_errors = []
         engine.get_cache_statistics = lambda **kw: {
             "cached_tokens": engine.cached,
             "offload_tokens": 0,
@@ -102,15 +105,23 @@ class NativeClientTest(unittest.TestCase):
 
         def step():
             ids = list(range(32))
+            scores, records = [-0.1] * 32, [RECORD] * 32
+            if nonfinite is not None:
+                scores[20] = nonfinite
+                records[20] = (nonfinite, *RECORD[1:])
             if len(engine.submissions) > 1:
                 ids[20] = 100
                 engine.cached += 0 if bad_cache else 512
-            engine.callback(SimpleNamespace(output_tokens=ids, logprobs=[RECORD] * 32))
+            # Native CoreManager logs callback errors and still delivers the SDK row.
+            try:
+                engine.callback(SimpleNamespace(output_tokens=ids, logprobs=records))
+            except AssertionError as error:
+                engine.callback_errors.append(repr(error))
             engine.finished = True
             return {
                 0: {
                     "token_ids": ids,
-                    "logprobs": [-0.1] * 32,
+                    "logprobs": scores,
                     "num_tokens_input": 1024,
                     "num_tokens_output": 32,
                     "finish_reason": "max_tokens",
@@ -150,7 +161,10 @@ class NativeClientTest(unittest.TestCase):
                 return_value=DATA["runtime"]["aiter"],
             ),
         ):
-            if bad_cache:
+            if nonfinite is not None:
+                with self.assertRaises((AssertionError, ValueError)):
+                    client.main()
+            elif bad_cache:
                 with self.assertRaises(AssertionError):
                     client.main()
             else:
@@ -182,6 +196,46 @@ class NativeClientTest(unittest.TestCase):
             )
             self.assertTrue((output / "W0.json").exists())
             self.assertFalse((output / "collection.json").exists())
+
+    def test_swallowed_nonfinite_callback_retains_failed_raw_values(self):
+        for value, label in (
+            (math.nan, "NaN"),
+            (math.inf, "Infinity"),
+            (-math.inf, "-Infinity"),
+        ):
+            with self.subTest(value=label), tempfile.TemporaryDirectory() as folder:
+                engine = self.run_client(folder, nonfinite=value)
+                self.assertTrue(engine.closed)
+                self.assertEqual(len(engine.submissions), 1)
+                self.assertEqual(len(engine.callback_errors), 1)
+                output = Path(folder) / "out"
+                for name in ("C0.json", "failure.json"):
+                    self.assertTrue((output / name).exists(), name)
+                    saved = json.loads((output / name).read_text())
+                    self.assertEqual(
+                        saved["outputs"][0]["logprobs"][20], {"nonfinite": label}
+                    )
+                    rejected = saved["rejected_callbacks"]
+                    self.assertEqual(len(rejected), 1)
+                    self.assertEqual(rejected[0]["token"], 20)
+                    self.assertEqual(rejected[0]["record"][0], {"nonfinite": label})
+                    self.assertEqual(len(rejected[0]["record"]), 42)
+                    if name == "failure.json":
+                        self.assertIn("non-finite native callback", saved["error"])
+                self.assertFalse((output / "collection.json").exists())
+                self.assertFalse((output / "W0.json").exists())
+
+    def test_rejected_callback_retention_stops_at_the_first_native_row(self):
+        rejected = []
+        for token in range(64):
+            sample = SimpleNamespace(
+                output_tokens=[token], logprobs=[(math.nan, *RECORD[1:])]
+            )
+            with self.assertRaises(AssertionError):
+                client.receive(sample, [], rejected)
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(rejected[0]["token"], 0)
+        self.assertEqual(len(rejected[0]["record"]), 42)
 
 
 if __name__ == "__main__":

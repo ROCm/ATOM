@@ -11,21 +11,29 @@ from pathlib import Path
 
 
 def save(output, name, data):
+    data = json.loads(
+        json.dumps(data), parse_constant=lambda value: {"nonfinite": value}
+    )
     payload = json.dumps(data, indent=2, allow_nan=False) + "\n"
     assert len(payload.encode()) <= 1024 * 1024, "client record exceeds 1 MiB"
     with (output / name).open("x", encoding="utf-8") as stream:
         stream.write(payload)
 
 
-def receive(sample, records):
+def receive(sample, records, rejected):
     if not sample.output_tokens:
         assert not sample.logprobs
         return
     assert sample.logprobs is not None
     assert len(sample.output_tokens) == len(sample.logprobs)
     for token, row in zip(sample.output_tokens, sample.logprobs, strict=True):
-        assert len(row) == 42 and len(set(row[2::2])) == 20
-        assert all(math.isfinite(float(value)) for value in row)
+        assert len(row) == 42
+        if not all(math.isfinite(float(value)) for value in row):
+            # Keep only the first rejected native row, bounded by its fixed width.
+            if not rejected:
+                rejected.append({"token": int(token), "record": list(row)})
+            raise AssertionError("non-finite native logprob row")
+        assert len(set(row[2::2])) == 20
         top = list(zip(map(int, row[2::2]), map(float, row[3::2]), strict=True))
         records.append(
             {
@@ -82,7 +90,7 @@ def main():
         },
     )
     engine, phase = None, "initializing"
-    records, outputs = [], {}
+    records, outputs, rejected = [], {}, []
     try:
         start = time.monotonic()
         engine = EngineArgs(**data["engine_args"]).create_engine()
@@ -95,7 +103,7 @@ def main():
                 "cache": engine.get_cache_statistics(timeout=10),
                 "mtp": engine.get_mtp_statistics(timeout=10),
             }
-            records, outputs = [], {}
+            records, outputs, rejected = [], {}, []
             params = SamplingParams(**data["sampling"])
             engine.core_mgr.reset_dp_router()
             start_request = time.monotonic()
@@ -104,8 +112,8 @@ def main():
                 engine.add_request(
                     [list(data["tokens"])],
                     params,
-                    stream_callback=lambda sample, target=records: receive(
-                        sample, target
+                    stream_callback=lambda sample, target=records, failures=rejected: receive(
+                        sample, target, failures
                     ),
                 )
             while not engine.is_finished() and (
@@ -130,8 +138,10 @@ def main():
                     "prompt_sha256": data["token_sha256"],
                     "outputs": rows,
                     "records": records,
+                    "rejected_callbacks": rejected,
                 },
             )
+            assert not rejected, "non-finite native callback was rejected"
             assert len(rows) == 1
             row = rows[0]
             assert (
@@ -174,6 +184,7 @@ def main():
                 "error": repr(error),
                 "outputs": list(outputs.values()),
                 "records": records,
+                "rejected_callbacks": rejected,
             },
         )
         raise
