@@ -942,6 +942,7 @@ jobs:
           python-version: '3.12'
       - run: python -m pip install PyYAML==6.0.3
       - run: python -m unittest discover -s tests -p test_kda_stage1_probe.py -v
+      - run: python -m unittest discover -s tests -p test_kda3501_native_client.py -v
       - name: Verify immutable source and job scope
         run: |
           python - <<'PY'
@@ -1015,13 +1016,12 @@ jobs:
         timeout-minutes: 1
         run: |
           set -euo pipefail
-          mkdir -p "$STAGE1_ROOT/src/baseline" "$STAGE1_ROOT/src/candidate" "$STAGE1_ROOT/results"
+          mkdir -p "$STAGE1_ROOT/src/baseline" "$STAGE1_ROOT/results"
           git archive fb1304722a9f79cd16e7383b8b504ccb29851d77 | tar -x -C "$STAGE1_ROOT/src/baseline"
-          git archive 05ce5a39e10fcf3605fbd798870a0a5ab2fe1107 | tar -x -C "$STAGE1_ROOT/src/candidate"
           mapfile -t wheels < <(find "$STAGE1_ROOT/wheels" -name '*.whl')
           test "${#wheels[@]}" = 1
           echo "8813b5f9b81d5e499b728d59dfffbfb736109b052986ea87c10b9f7bbaa420ef  ${wheels[0]}" | sha256sum -c -
-          git show -s --format='%H %P' fb1304722a9f79cd16e7383b8b504ccb29851d77 05ce5a39e10fcf3605fbd798870a0a5ab2fe1107 > "$STAGE1_ROOT/results/source.txt"
+          git show -s --format='%H %P' fb1304722a9f79cd16e7383b8b504ccb29851d77 > "$STAGE1_ROOT/results/source.txt"
           container_minutes=$(( (STAGE1_STARTED + 600 - $(date +%s)) / 60 - 3 ))
           test "$container_minutes" -ge 1
           echo "container_minutes=$container_minutes" >> "$GITHUB_OUTPUT"
@@ -1055,32 +1055,21 @@ jobs:
           docker exec "$CONTAINER_NAME" /opt/venv/bin/python /workspace/.github/scripts/kda_stage1_probe.py assets \
             --output "/workspace/$STAGE1_ROOT/results/inputs.json"
           test "$(( $(date +%s) - STAGE1_STARTED ))" -le 600
-      - name: Capture baseline then candidate and compare
-        timeout-minutes: 72
+      - name: Capture one baseline C0 W0 W1 sequence
+        timeout-minutes: 37
         run: |
           set -euo pipefail
           trap 'docker stop --time 20 "$CONTAINER_NAME" >/dev/null 2>&1 || true' ERR
-          for arm in baseline candidate; do
-            source="/workspace/$STAGE1_ROOT/src/$arm"
-            events="/workspace/$STAGE1_ROOT/results/$arm-events"
-            mkdir -p "$STAGE1_ROOT/results/$arm-events"
-            docker exec -e SETUPTOOLS_SCM_PRETEND_VERSION_FOR_ATOM="0.0.0+stage1.$arm" "$CONTAINER_NAME" \
-              /opt/venv/bin/python -m pip install --no-deps --no-build-isolation -e "$source"
-            docker exec -e PYTHONPATH="$source" -e STAGE1_SOURCE="$source" -e STAGE1_EVENTS="$events" \
-              -e TORCHINDUCTOR_CACHE_DIR="/workspace/$STAGE1_ROOT/compile-$arm" "$CONTAINER_NAME" \
-              timeout --signal=TERM --kill-after=30s 2100s /opt/venv/bin/python \
-              /workspace/.github/scripts/kda_stage1_probe.py capture --arm "$arm" \
-              --inputs "/workspace/$STAGE1_ROOT/results/inputs.json" \
-              --output "/workspace/$STAGE1_ROOT/results/$arm.json" \
-              > "$STAGE1_ROOT/results/$arm.log" 2>&1
-            if [ "$arm" = baseline ]; then
-              docker restart --time 20 "$CONTAINER_NAME" > /dev/null
-            fi
-          done
-          docker exec "$CONTAINER_NAME" /opt/venv/bin/python /workspace/.github/scripts/kda_stage1_probe.py compare \
-            --baseline "/workspace/$STAGE1_ROOT/results/baseline.json" \
-            --candidate "/workspace/$STAGE1_ROOT/results/candidate.json" \
-            --output "/workspace/$STAGE1_ROOT/results/comparison.json"
+          source="/workspace/$STAGE1_ROOT/src/baseline"
+          docker exec -e SETUPTOOLS_SCM_PRETEND_VERSION_FOR_ATOM="0.0.0+stage1.baseline" "$CONTAINER_NAME" \
+            /opt/venv/bin/python -m pip install --no-deps --no-build-isolation -e "$source"
+          docker exec -e PYTHONPATH="$source" -e PR3501_SOURCE="$source" \
+            -e TORCHINDUCTOR_CACHE_DIR="/workspace/$STAGE1_ROOT/compile-baseline" "$CONTAINER_NAME" \
+            timeout --signal=TERM --kill-after=30s 2100s /opt/venv/bin/python -B \
+            /workspace/.github/scripts/kda3501_native_repeat/native_client.py \
+            "/workspace/$STAGE1_ROOT/results/native-repeat" \
+            "/workspace/$STAGE1_ROOT/results/inputs.json" \
+            > "$STAGE1_ROOT/results/baseline.log" 2>&1
       - name: Stop only this diagnostic container
         if: ${{ always() }}
         timeout-minutes: 1
