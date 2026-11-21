@@ -35,6 +35,7 @@ from atom.entrypoints.openai.protocol import (
     STREAM_DONE_MESSAGE,
     TEXT_COMPLETION_OBJECT,
     CompletionRequest,
+    check_media_handoff,
     ended_by_stop,
     openai_stop_reason,
     openai_stop_reason_with_calls,
@@ -1351,7 +1352,7 @@ class AtomStandaloneService:
                 sampling_params,
                 request_id,
                 effective_n,
-                kv_transfer_params=request_data.get("kv_transfer_params"),
+                kv_transfer_params=self._kv_transfer_params(request_data),
                 data_parallel_rank=self._get_data_parallel_rank(request_data),
             )
             if not outputs:
@@ -1392,7 +1393,7 @@ class AtomStandaloneService:
                 sampling_params,
                 request_id,
                 effective_n,
-                kv_transfer_params=request_data.get("kv_transfer_params"),
+                kv_transfer_params=self._kv_transfer_params(request_data),
                 data_parallel_rank=self._get_data_parallel_rank(request_data),
             )
             stream_state = CompletionStreamState(
@@ -1680,6 +1681,13 @@ class AtomStandaloneService:
         else:
             value = getattr(request, field, default)
         return default if value is None else value
+
+    def _kv_transfer_params(self, request_data: dict[str, Any]) -> Any:
+        """The request's handoff metadata, refused (ValueError) out of range."""
+        params = request_data.get("kv_transfer_params")
+        if params:
+            check_media_handoff(params, self.engine.config.max_model_len)
+        return params
 
     def _build_sampling_params(
         self,

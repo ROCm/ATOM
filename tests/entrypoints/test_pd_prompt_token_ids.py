@@ -4,11 +4,14 @@
 """Test prefill prompt-ID responses and decode reuse without tokenizing."""
 
 import asyncio
+import importlib.util
+import pathlib
 from types import SimpleNamespace
 from uuid import UUID
 
 import fastapi.routing
 import httpx
+import numpy as np
 import pytest
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
@@ -19,7 +22,10 @@ from atom.entrypoints.openai.protocol import (
     ChatMessage,
     CompletionRequest,
 )
+from atom.model_engine.multimodal_runtime import multimodal_cache_seed
+from atom.model_engine.sequence import Sequence, SequenceStatus
 from atom.sampling_params import SamplingParams
+from tests.test_scheduler import _ConnectorNamespace
 
 PROMPT_IDS = [101, 102, 103, 104]
 
@@ -325,6 +331,7 @@ def test_generate_async_reads_prompt_ids_from_local_sequence(
                 finished=True,
                 finish_reason="eos",
                 num_cached_tokens=0,
+                kv_transfer_params_output=None,
             )
         )
         return seq
@@ -647,3 +654,496 @@ def test_output_cap_default_presence_reaches_sampling(
     explicit = any(value is not None for value in cap.values())
     assert seen[0].max_tokens_is_default == (not explicit)
     assert seen[0].max_tokens == (512 if explicit else 4096)
+
+
+IMAGE_MESSAGES = [
+    {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Describe the image."},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+        ],
+    }
+]
+# Before the `server` fixture stubs it: the PD tests run the real generator.
+_REAL_GENERATE_ASYNC = api_server.generate_async
+
+
+@pytest.fixture
+def pd_engine(monkeypatch, server):
+    """Real Sequences and the real generators over an engine that hands
+    every prefill off at once."""
+    media = {
+        "pixel_values": np.arange(24, dtype=np.float32).reshape(4, 6),
+        "image_grid_thw": np.array([[1, 2, 2]]),
+    }
+    engine = SimpleNamespace(seqs=[], prepared=[])
+    handoff = {
+        "do_remote_prefill": True,
+        "do_remote_decode": False,
+        "remote_engine_id": "prefill-0",
+        "remote_block_ids": [3, 4],
+    }
+
+    def preprocess(tokens, sampling, stream_callback=None, **kwargs):
+        multimodal_data = kwargs.get("multimodal_data")
+        seq = Sequence(
+            list(tokens),
+            16,
+            sampling,
+            kv_transfer_params=kwargs.get("kv_transfer_params"),
+            multimodal_data=multimodal_data,
+            # As an MRoPE model's `get_mrope_input_positions` returns it.
+            mrope_position_delta=-2 if multimodal_data is not None else 0,
+        )
+        engine.seqs.append(seq)
+        produces = (seq.kv_transfer_params or {}).get("do_remote_decode")
+        stream_callback(
+            SimpleNamespace(
+                output_tokens=[5],
+                logprobs=None,
+                finished=True,
+                finish_reason="stop",
+                num_cached_tokens=0,
+                kv_transfer_params_output=dict(handoff) if produces else None,
+            )
+        )
+        return seq
+
+    def prepare(*_args):
+        engine.prepared.append(_args)
+        return list(PROMPT_IDS), dict(media)
+
+    engine.io_processor = SimpleNamespace(preprocess=preprocess, requests={})
+    engine.core_mgr = SimpleNamespace(add_request=lambda _seqs: None)
+    monkeypatch.setattr(api_server, "engine", engine)
+    monkeypatch.setattr(api_server, "generate_async", _REAL_GENERATE_ASYNC)
+    monkeypatch.setattr(api_server, "_get_multimodal_processor", lambda: object())
+    monkeypatch.setattr(api_server, "_prepare_multimodal_inputs", prepare)
+    monkeypatch.setattr(
+        api_server, "_validate_sequence_context_length", lambda _s, _sp=None: None
+    )
+    monkeypatch.setattr(api_server, "record_nonstream_first_token", lambda: None)
+    engine.media_seed = multimodal_cache_seed(media)
+    return engine
+
+
+def _post_chat(payloads):
+    async def run():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=api_server.app), base_url="http://test"
+        ) as client:
+            return [
+                await client.post("/v1/chat/completions", json=payload)
+                for payload in payloads
+            ]
+
+    return asyncio.run(run())
+
+
+class TestMultimodalPD:
+    def test_decode_reuses_prefill_ids_and_cache_seed(self, pd_engine):
+        prefill_body = {
+            "model": "m",
+            "messages": IMAGE_MESSAGES,
+            "max_tokens": 1,
+            "return_token_ids": True,
+            "kv_transfer_params": {
+                "do_remote_decode": True,
+                "do_remote_prefill": False,
+            },
+        }
+        (prefill,) = _post_chat([prefill_body])
+        assert prefill.status_code == 200, prefill.text
+        kv = prefill.json()["kv_transfer_params"]
+        assert kv["cache_seed"] == pd_engine.media_seed
+        assert kv["mrope_position_delta"] == -2
+
+        # As ATOMesh's relay builds D's body: P's metadata plus its ids.
+        kv["prompt_token_ids"] = prefill.json()["prompt_token_ids"]
+        decode_body = {
+            "model": "m",
+            "messages": IMAGE_MESSAGES,
+            "kv_transfer_params": kv,
+        }
+        (decode,) = _post_chat([decode_body])
+        assert decode.status_code == 200, decode.text
+
+        p_seq, d_seq = pd_engine.seqs
+        assert len(pd_engine.prepared) == 1  # P only
+        assert p_seq.kv_transfer_params["do_remote_decode"] is True
+        assert d_seq.multimodal_data is None
+        assert list(d_seq.token_ids) == PROMPT_IDS
+        assert d_seq.kv_transfer_params["remote_block_ids"] == [3, 4]
+        assert d_seq.cache_seed == p_seq.cache_seed == pd_engine.media_seed
+        assert d_seq.mrope_position_delta == p_seq.mrope_position_delta == -2
+        assert d_seq.media_on_prefill_instance
+        assert not p_seq.media_on_prefill_instance
+
+    def test_decode_without_cache_seed_preprocesses_the_media(self, pd_engine):
+        # As from a prefill instance that hands off no cache seed.
+        kv = {"do_remote_prefill": True, "prompt_token_ids": PROMPT_IDS}
+        (decode,) = _post_chat(
+            [{"model": "m", "messages": IMAGE_MESSAGES, "kv_transfer_params": kv}]
+        )
+        assert decode.status_code == 200, decode.text
+        (seq,) = pd_engine.seqs
+        assert len(pd_engine.prepared) == 1 and seq.multimodal_data is not None
+        assert seq.cache_seed == pd_engine.media_seed
+        assert seq.mrope_position_delta == -2
+        assert not seq.media_on_prefill_instance
+
+    @pytest.mark.parametrize(
+        "key,value",
+        [
+            ("cache_seed", "9"),
+            ("cache_seed", 9.0),
+            ("cache_seed", True),
+            ("cache_seed", None),
+            ("mrope_position_delta", -2.5),
+            ("mrope_position_delta", "-2"),
+        ],
+    )
+    def test_non_integer_handoff_key_is_400_before_enqueue(self, pd_engine, key, value):
+        kv = {"do_remote_prefill": True, "prompt_token_ids": PROMPT_IDS, key: value}
+        (decode,) = _post_chat(
+            [{"model": "m", "messages": IMAGE_MESSAGES, "kv_transfer_params": kv}]
+        )
+        assert decode.status_code == 400, decode.text
+        assert key in decode.text
+        assert pd_engine.seqs == [] and pd_engine.prepared == []
+
+    def test_prefill_without_handoff_returns_no_kv_params(self, pd_engine):
+        (response,) = _post_chat([{"model": "m", "messages": IMAGE_MESSAGES}])
+        assert response.status_code == 200, response.text
+        assert response.json()["kv_transfer_params"] is None
+        assert len(pd_engine.prepared) == 1
+
+    def test_ids_without_remote_prefill_still_preprocess_media(self, pd_engine):
+        (response,) = _post_chat(
+            [
+                {
+                    "model": "m",
+                    "messages": IMAGE_MESSAGES,
+                    "prompt_token_ids": PROMPT_IDS,
+                }
+            ]
+        )
+        assert response.status_code == 200, response.text
+        (seq,) = pd_engine.seqs
+        assert len(pd_engine.prepared) == 1 and seq.multimodal_data is not None
+
+
+IMAGE_DECODE_KV = {
+    "do_remote_prefill": True,
+    "cache_seed": 9,
+    "mrope_position_delta": -2,
+}
+
+
+def _pd_connector(scheduler, **methods):
+    """A P/D consumer's connector, answering the scheduler with `methods`."""
+    scheduler.kv_connector = _ConnectorNamespace(
+        is_producer=False, is_offload=False, **methods
+    )
+
+
+def _received_image_decode(scheduler, seq_factory, **connector):
+    """An image decode leg whose KV has arrived: allocated, parked for the
+    receive and reported finished, as a P/D consumer's connector leaves it."""
+    _pd_connector(scheduler, **connector)
+    seq = seq_factory(list(PROMPT_IDS), kv_transfer_params=dict(IMAGE_DECODE_KV))
+    scheduler.add(seq)
+    bm = scheduler.block_manager
+    assert bm.allocate(seq, bm.can_allocate(seq))
+    seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+    scheduler._count_inflight_load(seq)
+    scheduler.finished_recving_kv_req_ids.append(seq.id)
+    return seq
+
+
+def _image_decode_on_way_in(way_in, scheduler, seq_factory):
+    """An image decode leg about to be admitted along `way_in`."""
+    if way_in == "preempted":
+        # Its receive done and decoding, then preempted; the connector has
+        # nothing left to load for it.
+        seq = _received_image_decode(
+            scheduler,
+            seq_factory,
+            get_num_new_matched_tokens=lambda _seq: (0, False),
+        )
+        scheduler.schedule()
+        seq.append_token(5)
+        scheduler.running.remove(seq)
+        assert scheduler.preempt(seq)
+        return seq
+    seq = seq_factory(list(PROMPT_IDS), kv_transfer_params=dict(IMAGE_DECODE_KV))
+    if way_in == "requeued":
+        # A requeue's second query: moriio answers nothing to load.
+        _pd_connector(scheduler, get_num_new_matched_tokens=lambda _seq: (0, False))
+    elif way_in == "declined_after_alloc":
+        # A tier load asked for, then declined once the blocks are allocated.
+        _pd_connector(
+            scheduler,
+            get_num_new_matched_tokens=lambda _seq: (4, True),
+            update_state_after_alloc=lambda _seq: None,
+            should_park_for_load_after_alloc=lambda _seq: False,
+        )
+    elif way_in == "offload_resume":
+        # The receive settled as an offload load the scheduler resumes.
+        scheduler.kv_connector = _ConnectorNamespace(is_offload=True)
+        bm = scheduler.block_manager
+        assert bm.allocate(seq, bm.can_allocate(seq))
+        seq.num_cached_tokens = 2
+        seq.offload_loaded = True
+    scheduler.add(seq)
+    if way_in == "early_loaded":
+        # An offload tier loads its prefix ahead of admission; it lands.
+        scheduler.kv_connector = _ConnectorNamespace(
+            is_offload=True,
+            supports_early_load=True,
+            lookup_ready=lambda _seq: True,
+            get_num_new_matched_tokens=lambda _seq: (len(PROMPT_IDS), True),
+            should_park_for_load_after_alloc=lambda _seq: True,
+        )
+        scheduler.config.offload_min_load_tokens = 0
+        scheduler.schedule()
+        assert seq.id in scheduler._early_load.entries
+        scheduler.finished_recving_kv_req_ids.append(seq.id)
+    return seq
+
+
+@pytest.mark.parametrize(
+    "way_in",
+    [
+        "no_connector",
+        "requeued",
+        "declined_after_alloc",
+        "offload_resume",
+        "early_loaded",
+        "preempted",
+    ],
+)
+def test_media_dropped_leg_is_never_prefilled_locally(scheduler, seq_factory, way_in):
+    seq = _image_decode_on_way_in(way_in, scheduler, seq_factory)
+    assert seq.media_on_prefill_instance
+
+    scheduled = scheduler.schedule()
+
+    assert scheduled is None or seq.id not in scheduled[1]
+    assert seq.status == SequenceStatus.FINISHED
+    assert seq.leave_reason.startswith("unschedulable:")
+    assert scheduler.take_rejected() == [seq]
+    assert seq not in scheduler.waiting and seq not in scheduler.running
+
+
+@pytest.mark.parametrize(
+    "kv",
+    [
+        {"cache_seed": 9},
+        {"mrope_position_delta": 7},
+        {"do_remote_prefill": True, "mrope_position_delta": 7},
+    ],
+)
+def test_text_request_with_a_handoff_key_prefills_as_text(scheduler, seq_factory, kv):
+    seq = seq_factory(list(PROMPT_IDS), kv_transfer_params=kv)
+    assert not seq.media_on_prefill_instance
+    assert (seq.cache_seed, seq.mrope_position_delta) == (-1, 0)
+    scheduler.add(seq)
+
+    batch, scheduled = scheduler.schedule()
+
+    assert seq.id in scheduled and seq.status == SequenceStatus.RUNNING
+    assert batch.mrope_position_deltas == {}
+
+
+def _decode_batch_of_handed_off_seq(scheduler, seq_factory):
+    """Run a received image decode leg past its first step; return its
+    decode batch."""
+    seq = _received_image_decode(scheduler, seq_factory)
+    assert seq.mrope_positions is None and seq.mrope_position_delta == -2
+    scheduler.schedule()
+    seq.append_token(5)
+    batch, _ = scheduler.schedule()
+    return seq, batch
+
+
+def test_handed_off_mrope_delta_reaches_the_batch(scheduler, seq_factory):
+    seq, batch = _decode_batch_of_handed_off_seq(scheduler, seq_factory)
+    assert batch.mrope_position_deltas == {seq.id: -2}
+
+
+# numpy-only, loaded by path: no AITER or GPU stack.
+_DECODE_LAYOUT = (
+    pathlib.Path(__file__).resolve().parents[2]
+    / "atom/model_ops/attentions/token_layout/decode.py"
+)
+_spec = importlib.util.spec_from_file_location("_decode_layout", _DECODE_LAYOUT)
+decode_layout = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(decode_layout)
+
+
+def test_handed_off_mrope_delta_offsets_decode_positions(scheduler, seq_factory):
+    _, batch = _decode_batch_of_handed_off_seq(scheduler, seq_factory)
+    planes = np.full((3, 1), -1, dtype=np.int64)
+    decode_layout.mrope_decode_positions(
+        batch.req_ids,
+        np.asarray(batch.context_lens),
+        batch.num_scheduled_tokens,
+        batch.mrope_position_deltas,
+        planes,
+    )
+    # The sampled token sits at index 4; P's delta moves it to position 2.
+    assert planes.tolist() == [[2], [2], [2]]
+
+
+def test_text_decode_positions_are_their_indices():
+    planes = np.full((3, 3), -1, dtype=np.int64)
+    decode_layout.mrope_decode_positions([1, 2], [5, 9], [1, 2], {}, planes)
+    assert planes.tolist() == [[4, 7, 8]] * 3
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("n", [1, 2])
+def test_image_decode_takes_pretokenized_branch(monkeypatch, server, stream, n):
+    async def fake_fanout(prompt, _sampling, _rid, **kwargs):
+        server.generate.append((prompt, kwargs))
+        output = {"text": "hi", "finish_reason": "eos", "num_tokens_input": 4}
+        return [{**output, "num_tokens_output": 1} for _ in range(n)]
+
+    async def fake_setup(prompt, _sampling, _rid, **kwargs):
+        server.generate.append((prompt, kwargs))
+        return ([7, 8] if n > 1 else 7), object(), len(PROMPT_IDS)
+
+    def refuse(*_args):
+        raise AssertionError("decode preprocessed the image")
+
+    monkeypatch.setattr(api_server, "generate_async_fanout", fake_fanout)
+    monkeypatch.setattr(api_server, "setup_streaming_request", fake_setup)
+    monkeypatch.setattr(api_server, "setup_streaming_request_fanout", fake_setup)
+    monkeypatch.setattr(api_server, "_prepare_multimodal_inputs", refuse)
+    kv = {"do_remote_prefill": True, "cache_seed": 9, "prompt_token_ids": PROMPT_IDS}
+    request = ChatCompletionRequest(
+        model="m",
+        messages=IMAGE_MESSAGES,
+        temperature=1.0,
+        stream=stream,
+        n=n,
+        kv_transfer_params=kv,
+    )
+
+    asyncio.run(api_server.chat_completions(request, None))
+
+    ((sent, options),) = server.generate
+    assert sent == PROMPT_IDS and options.get("multimodal_data") is None
+    assert options["kv_transfer_params"] == {"do_remote_prefill": True, "cache_seed": 9}
+
+
+MAX_MODEL_LEN = 4096
+OUT_OF_RANGE_HANDOFF = [
+    ("cache_seed", -1),
+    ("cache_seed", -2),
+    ("cache_seed", 2**64),
+    ("cache_seed", "9"),
+    ("cache_seed", None),
+    ("cache_seed", True),
+    ("mrope_position_delta", MAX_MODEL_LEN + 1),
+    ("mrope_position_delta", -MAX_MODEL_LEN - 1),
+    ("mrope_position_delta", 2**63),
+    ("mrope_position_delta", -2.5),
+]
+
+
+@pytest.fixture
+def d_engine(monkeypatch):
+    monkeypatch.setattr(
+        api_server,
+        "engine",
+        SimpleNamespace(
+            config=SimpleNamespace(
+                max_model_len=MAX_MODEL_LEN,
+                tensor_parallel_size=1,
+                pipeline_parallel_size=1,
+            )
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "endpoint", ["chat/completions", "completions", "messages", "responses"]
+)
+@pytest.mark.parametrize("key,value", OUT_OF_RANGE_HANDOFF)
+def test_out_of_range_handoff_key_is_400_on_every_endpoint(
+    monkeypatch, server, d_engine, endpoint, key, value
+):
+    async def unexpected_enqueue(*_args, **_kwargs):
+        pytest.fail("an out-of-range handoff key must be refused before enqueue")
+
+    monkeypatch.setattr(api_server, "setup_streaming_request", unexpected_enqueue)
+    body = {
+        "model": "m",
+        "max_tokens": 2,
+        "kv_transfer_params": {
+            "do_remote_prefill": True,
+            "cache_seed": 9,
+            "prompt_token_ids": PROMPT_IDS,
+            key: value,
+        },
+    }
+    if endpoint == "completions":
+        body["prompt"] = "hi"
+    elif endpoint == "responses":
+        body.pop("max_tokens")
+        body["input"] = "hi"
+    else:
+        body["messages"] = [{"role": "user", "content": "hi"}]
+
+    async def post():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=api_server.app), base_url="http://d"
+        ) as client:
+            return await client.post(f"/v1/{endpoint}", json=body)
+
+    response = asyncio.run(asyncio.wait_for(post(), 5))
+    assert response.status_code == 400, response.text
+    assert key in response.text
+    assert not server.generate and not server.templates
+
+
+@pytest.mark.parametrize(
+    "handoff",
+    [
+        {"cache_seed": 0, "mrope_position_delta": MAX_MODEL_LEN},
+        {"cache_seed": 2**64 - 1, "mrope_position_delta": -MAX_MODEL_LEN},
+    ],
+)
+def test_handoff_keys_at_their_bounds_are_accepted(d_engine, handoff):
+    api_server._validate_kv_transfer_params({"do_remote_prefill": True, **handoff})
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("key,value", OUT_OF_RANGE_HANDOFF)
+def test_standalone_completion_refuses_an_out_of_range_handoff_key(stream, key, value):
+    from unittest.mock import MagicMock
+
+    from atom.entrypoints.atomesh.atom_standalone_service import (
+        AtomStandaloneService,
+    )
+
+    service = object.__new__(AtomStandaloneService)
+    service.model_name = "m"
+    service.engine = SimpleNamespace(
+        config=SimpleNamespace(max_model_len=MAX_MODEL_LEN)
+    )
+    service.engine_service = MagicMock()
+    request = {
+        "model": "m",
+        "prompt": "hi",
+        "kv_transfer_params": {"do_remote_prefill": True, key: value},
+    }
+    start = service.start_completions_stream if stream else service.completions
+
+    # The mesh router answers a ValueError with HTTP 400.
+    with pytest.raises(ValueError, match=key):
+        start(request)
+    assert not service.engine_service.method_calls
