@@ -15,6 +15,7 @@ the gated RMSNorm. It reads the K-major checkpoints of ReplaySSM as they are.
 
 import functools
 import logging
+import os
 
 import torch
 
@@ -215,6 +216,10 @@ def verify(
         layer.dt_bias,
         layer.gated_norm.weight,
     )
+    # Qwen's grouped Q/K projection supplies one key to both value heads.
+    # ReplaySSM stores that key in each value head's history.
+    if os.environ.get("ATOM_GDN_VERIFY_GROUPED_REPLAY", "0") == "1":
+        mx32["grouped_replay_keys"] = True
     _log_dispatch_verify()
     fused_gdn_verify_qkvz(
         *args,
