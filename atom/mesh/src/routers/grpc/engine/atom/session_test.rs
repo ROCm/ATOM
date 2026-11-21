@@ -13,9 +13,10 @@ use tonic::{Request, Response as RpcResponse};
 use super::*;
 use crate::atom_engine::grpc::atom_engine_server::{AtomEngine, AtomEngineServer};
 use crate::atom_engine::grpc::{
-    AbortRequest, AbortResponse, GenerateRequest, GetModelInfoRequest, GetModelInfoResponse,
-    GetServerInfoRequest, GetServerInfoResponse, HealthCheckRequest, HealthCheckResponse,
-    PrepareStructuredOutputRequest, PrepareStructuredOutputResponse,
+    prepare_structured_output_response::Response as Prepared, AbortRequest, AbortResponse,
+    GenerateRequest, GetModelInfoRequest, GetModelInfoResponse, GetServerInfoRequest,
+    GetServerInfoResponse, HealthCheckRequest, HealthCheckResponse, PrepareStructuredOutputRequest,
+    PrepareStructuredOutputResponse,
 };
 use crate::atom_engine::wire::PROTOCOL_VERSION;
 use crate::core::worker::{ConnectionMode, RuntimeType};
@@ -33,9 +34,13 @@ struct Call {
     outbound: mpsc::UnboundedSender<Result<Frames, Status>>,
 }
 
-/// Hands each Session call to the test; serves no other RPC.
+/// Hands each Session call to the test, answers GetServerInfo with its
+/// `kv_transfer_info` and PrepareStructuredOutput with `derived()`; serves no other RPC.
 struct FakeAtom {
     calls: mpsc::UnboundedSender<Call>,
+    kv_transfer_info: String,
+    /// What PrepareStructuredOutput was asked.
+    asked: Mutex<Vec<PrepareStructuredOutputRequest>>,
 }
 
 #[tonic::async_trait]
@@ -80,7 +85,11 @@ impl AtomEngine for FakeAtom {
         &self,
         _: Request<GetServerInfoRequest>,
     ) -> Result<RpcResponse<GetServerInfoResponse>, Status> {
-        Err(Status::unimplemented("get_server_info"))
+        Ok(RpcResponse::new(GetServerInfoResponse {
+            protocol_version: PROTOCOL_VERSION,
+            kv_transfer_info_json: self.kv_transfer_info.clone(),
+            server_info_json: "{}".into(),
+        }))
     }
 
     async fn health_check(
@@ -92,20 +101,51 @@ impl AtomEngine for FakeAtom {
 
     async fn prepare_structured_output(
         &self,
-        _: Request<PrepareStructuredOutputRequest>,
+        request: Request<PrepareStructuredOutputRequest>,
     ) -> Result<RpcResponse<PrepareStructuredOutputResponse>, Status> {
-        Err(Status::unimplemented("prepare_structured_output"))
+        self.asked.lock().push(request.into_inner());
+        Ok(RpcResponse::new(PrepareStructuredOutputResponse {
+            response: Some(Prepared::Sampling(derived())),
+        }))
     }
+}
+
+/// The structured-output fields the fake's PrepareStructuredOutput derives.
+fn derived() -> pb::SamplingParams {
+    pb::SamplingParams {
+        required_channel: Some(pb::RequiredChannel {
+            after: vec![1],
+            opening: vec![2],
+            opens_at: 3,
+            end_ids: vec![4],
+        }),
+        json_schema: Some(r#"{"type":"object"}"#.into()),
+        structured_tool_format: Some("dsml".into()),
+        structured_reasoning_end: "</think>".into(),
+        ..Default::default()
+    }
+}
+
+/// Serves a fake instance on a free local port, its GetServerInfo answering
+/// `kv_transfer_info`: its URL, the fake and its Session calls.
+async fn serve(kv_transfer_info: &str) -> (String, Arc<FakeAtom>, mpsc::UnboundedReceiver<Call>) {
+    let (calls, received) = mpsc::unbounded_channel();
+    let fake = Arc::new(FakeAtom {
+        calls,
+        kv_transfer_info: kv_transfer_info.to_string(),
+        asked: Mutex::default(),
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("grpc://{}", listener.local_addr().unwrap());
+    let router = Server::builder().add_service(AtomEngineServer::from_arc(fake.clone()));
+    tokio::spawn(router.serve_with_incoming(TcpIncoming::from(listener)));
+    (url, fake, received)
 }
 
 /// Serves a fake instance on a free local port: two url@rank workers of it,
 /// sharing one client, and its Session calls.
 async fn instance() -> ([Arc<dyn Worker>; 2], mpsc::UnboundedReceiver<Call>) {
-    let (calls, received) = mpsc::unbounded_channel();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("grpc://{}", listener.local_addr().unwrap());
-    let router = Server::builder().add_service(AtomEngineServer::new(FakeAtom { calls }));
-    tokio::spawn(router.serve_with_incoming(TcpIncoming::from(listener)));
+    let (url, _, received) = serve("{}").await;
     let client = GrpcClient::connect(&url, "atom").await.unwrap();
     let ranks = [0, 1].map(|rank| {
         let worker = DPAwareWorkerBuilder::new(&url, rank, 2)
@@ -125,21 +165,23 @@ async fn opening(
     version: u32,
     submit: impl Future<Output = Result<SessionStream, EngineError>>,
 ) -> (Call, Result<SessionStream, EngineError>) {
-    let answer = async {
-        let call = timeout(HANG, calls.recv()).await.expect("no Session call");
-        let call = call.unwrap();
-        let ready = pb::Envelope {
-            protocol_version: version,
-            body: Some(Body::Ready(pb::Ready::default())),
-        };
-        call.outbound
-            .send(Ok(Frames {
-                frames: vec![ready.encode_to_vec()],
-            }))
-            .unwrap();
-        call
+    tokio::join!(accept(calls, version), submit)
+}
+
+/// The next Session call, answered with a Ready of `version`.
+async fn accept(calls: &mut mpsc::UnboundedReceiver<Call>, version: u32) -> Call {
+    let call = timeout(HANG, calls.recv()).await.expect("no Session call");
+    let call = call.unwrap();
+    let ready = pb::Envelope {
+        protocol_version: version,
+        body: Some(Body::Ready(pb::Ready::default())),
     };
-    tokio::join!(answer, submit)
+    call.outbound
+        .send(Ok(Frames {
+            frames: vec![ready.encode_to_vec()],
+        }))
+        .unwrap();
+    call
 }
 
 /// A request named `id`; the Session sets its seq_id and prompt reference.
@@ -516,4 +558,232 @@ fn seq_ids_stay_below_2_24_and_skip_those_open_requests_hold() {
     // The second search passes the held 2^24 - 1 and 0, wrapping below 2^24.
     let ids = [routes.free_seq_id(), routes.free_seq_id()];
     assert_eq!(ids, [Some(SEQ_IDS - 2), Some(1)]);
+}
+
+/// Requests through the gRPC routers built from a config with `atom_grpc_session`:
+/// a chat alone, then ATOM pairs in relay and in chunked transfer.
+mod routed {
+    use axum::body::to_bytes;
+    use axum::response::Response as HttpResponse;
+    use serde_json::json;
+    use tokio::task::JoinHandle;
+
+    use super::*;
+    use crate::app_context::AppContext;
+    use crate::core::{BasicWorkerBuilder, WorkerType};
+    use crate::protocols::chat::ChatCompletionRequest;
+    use crate::routers::grpc::{
+        engine::atom::request::value, pd_router::GrpcPDRouter, router::GrpcRouter,
+    };
+    use crate::routers::{test_mocks, RouterTrait};
+
+    const PREFILL: WorkerType = WorkerType::Prefill {
+        bootstrap_port: None,
+    };
+
+    fn worker(url: &str, kind: WorkerType) -> Arc<dyn Worker> {
+        let worker = BasicWorkerBuilder::new(url)
+            .worker_type(kind)
+            .connection_mode(ConnectionMode::Grpc { port: None })
+            .runtime_type(RuntimeType::Atom)
+            .model_id("m")
+            .build();
+        Arc::new(worker)
+    }
+
+    /// `context` with `--atom-grpc-session`, `workers` registered.
+    fn over_sessions(
+        mut context: Arc<AppContext>,
+        workers: &[&Arc<dyn Worker>],
+    ) -> Arc<AppContext> {
+        Arc::get_mut(&mut context)
+            .unwrap()
+            .router_config
+            .atom_grpc_session = true;
+        for worker in workers {
+            context.worker_registry.register(Arc::clone(worker));
+        }
+        context
+    }
+
+    /// A /generate request for prompt [7, 8, 9] with `max_new_tokens` 8 through the
+    /// gRPC P/D router over `workers`, under way.
+    async fn generate(workers: &[&Arc<dyn Worker>], stream: bool) -> JoinHandle<HttpResponse> {
+        let registry = test_mocks::tokenizer_registry_with("m");
+        let context = test_mocks::app_context_with_tokenizer_registry(registry);
+        let router = GrpcPDRouter::new(&over_sessions(context, workers))
+            .await
+            .unwrap();
+        let body = json!({
+            "rid": "atom-req", "input_ids": [7, 8, 9], "stream": stream,
+            "sampling_params": {"max_new_tokens": 8},
+        });
+        let body = serde_json::from_value(body).unwrap();
+        tokio::spawn(async move { router.route_generate(None, &body, Some("m")).await })
+    }
+
+    /// `request`'s status and body, once its response has ended.
+    async fn respond(request: JoinHandle<HttpResponse>) -> (StatusCode, String) {
+        let response = timeout(HANG, request).await.expect("the request hung");
+        let response = response.unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    /// The one request `call`'s next SubmitBatch carries, its prompt, and its
+    /// kv_transfer_params as JSON, null when it has none.
+    async fn one_request(call: &mut Call) -> (pb::RequestSpec, Vec<u32>, Json) {
+        let (_, (spec, prompt)) = submitted(call, 1).await.into_iter().next().unwrap();
+        let kv = spec.kv_transfer_params.as_ref().map(json).transpose();
+        (spec, prompt, kv.unwrap().unwrap_or_default())
+    }
+
+    fn max_tokens(spec: &pb::RequestSpec) -> Option<i64> {
+        spec.sampling.as_ref().unwrap().max_tokens
+    }
+
+    #[tokio::test]
+    async fn a_chat_runs_over_the_session_after_atom_prepares_its_structured_output() {
+        let (url, fake, mut calls) = serve("{}").await;
+        let context = test_mocks::app_context_with_hf_tokenizer("m");
+        let context = over_sessions(context, &[&worker(&url, WorkerType::Regular)]);
+        let router = GrpcRouter::new(&context).await.unwrap();
+        let format = json!({"type": "json_schema", "json_schema": {"name": "a", "schema": {}}});
+        let chat = json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "max_completion_tokens": 8, "response_format": format,
+        });
+        let chat: ChatCompletionRequest = serde_json::from_value(chat).unwrap();
+        let request = tokio::spawn(async move { router.route_chat(None, &chat, Some("m")).await });
+
+        let mut call = accept(&mut calls, PROTOCOL_VERSION).await;
+        let (spec, _, _) = one_request(&mut call).await;
+        // ATOM was asked first, with the chat's fields and the request's own.
+        let asked = fake.asked.lock().clone();
+        let [asked] = &asked[..] else {
+            panic!("{asked:?}")
+        };
+        let carried = asked.structured_output.as_ref().unwrap();
+        let carried_format = carried.response_format_json.as_deref().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Json>(carried_format).unwrap(),
+            format
+        );
+        let id = spec.external_request_id.as_deref().unwrap();
+        assert!(id.starts_with("chatcmpl-"), "{id}");
+        assert_eq!(max_tokens(&spec), Some(8));
+        // The RequestSpec's sampling is the request's, with the fields ATOM derived.
+        let derived = derived();
+        let expected = pb::SamplingParams {
+            required_channel: derived.required_channel,
+            json_schema: derived.json_schema,
+            structured_tool_format: derived.structured_tool_format,
+            structured_reasoning_end: derived.structured_reasoning_end,
+            ..asked.sampling.clone().unwrap()
+        };
+        assert_eq!(spec.sampling, Some(expected));
+
+        let ended = done(vec![(completion(spec.seq_id, "eos"), vec![11])]);
+        call.outbound.send(ended).unwrap();
+        let (status, body) = respond(request).await;
+        let body: Json = serde_json::from_str(&body).unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[tokio::test]
+    async fn relay_runs_both_legs_over_the_session_and_decode_once_prefill_completes() {
+        let (p_url, _, mut p_calls) = serve(r#"{"tp_size": 2, "kv_role": "kv_producer"}"#).await;
+        let (d_url, _, mut d_calls) = serve("{}").await;
+        let (pw, dw) = (worker(&p_url, PREFILL), worker(&d_url, WorkerType::Decode));
+        let request = generate(&[&pw, &dw], true).await;
+
+        let mut p_call = accept(&mut p_calls, PROTOCOL_VERSION).await;
+        let (p_spec, p_prompt, p_kv) = one_request(&mut p_call).await;
+        assert_eq!((p_prompt, max_tokens(&p_spec)), (vec![7, 8, 9], Some(1)));
+        let prefill_params = json!({"do_remote_decode": true, "do_remote_prefill": false});
+        assert_eq!(p_kv, prefill_params);
+        // P's Completion carries its params, which D's request takes enriched.
+        let params = json!({"remote_host": "10.0.0.1", "remote_block_ids": [3, 4]});
+        let p_done = pb::Completion {
+            kv_transfer_params_output: Some(value(&params).unwrap()),
+            ..completion(p_spec.seq_id, "max_tokens")
+        };
+        p_call.outbound.send(done(vec![(p_done, vec![5])])).unwrap();
+
+        let mut d_call = accept(&mut d_calls, PROTOCOL_VERSION).await;
+        let (d_spec, d_prompt, d_kv) = one_request(&mut d_call).await;
+        // P's load ended at its Completion, before D was sent.
+        assert_eq!((pw.load(), dw.load()), (0, 1));
+        assert_eq!((d_prompt, max_tokens(&d_spec)), (vec![7, 8, 9], Some(8)));
+        let enriched = json!({
+            "remote_host": "10.0.0.1", "remote_block_ids": [3, 4],
+            "remote_dp_size": 1, "remote_tp_size": 2,
+        });
+        assert_eq!(d_kv, enriched);
+
+        d_call
+            .outbound
+            .send(step(&[(d_spec.seq_id, vec![21], 0)]))
+            .unwrap();
+        let d_done = done(vec![(completion(d_spec.seq_id, "stop_21"), vec![21])]);
+        d_call.outbound.send(d_done).unwrap();
+        let (status, body) = respond(request).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!((pw.load(), dw.load()), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn chunked_runs_both_legs_over_the_session_at_once_and_answers_after_prefill() {
+        let template = json!({"remote_host": "10.0.0.1", "remote_handshake_port": 6301});
+        let info = json!({"tp_size": 4, "kv_role": "kv_producer", "chunked_transfer": template});
+        let (p_url, _, mut p_calls) = serve(&info.to_string()).await;
+        let (d_url, _, mut d_calls) = serve("{}").await;
+        let (pw, dw) = (worker(&p_url, PREFILL), worker(&d_url, WorkerType::Decode));
+        let request = generate(&[&pw, &dw], false).await;
+
+        // Both requests go out before either is answered.
+        let mut p_call = accept(&mut p_calls, PROTOCOL_VERSION).await;
+        let mut d_call = accept(&mut d_calls, PROTOCOL_VERSION).await;
+        let (p_spec, _, p_kv) = one_request(&mut p_call).await;
+        let (d_spec, d_prompt, d_kv) = one_request(&mut d_call).await;
+        let transfer_id = p_kv["transfer_id"].clone();
+        assert!(transfer_id
+            .as_str()
+            .is_some_and(|id| id.starts_with("xfer-")));
+        let prefill_params = json!({
+            "do_remote_decode": true, "do_remote_prefill": false,
+            "chunked_transfer": true, "transfer_id": transfer_id,
+        });
+        assert_eq!((p_kv, max_tokens(&p_spec)), (prefill_params, Some(1)));
+        // D's params are P's template for the same transfer, enriched.
+        let mut decode_params = template;
+        for (key, value) in [
+            ("chunked_transfer", json!(true)),
+            ("do_remote_prefill", json!(true)),
+            ("do_remote_decode", json!(false)),
+            ("transfer_id", transfer_id),
+            ("remote_dp_size", json!(1)),
+            ("remote_tp_size", json!(4)),
+        ] {
+            decode_params[key] = value;
+        }
+        assert_eq!((d_kv, d_prompt), (decode_params, vec![7, 8, 9]));
+        assert_eq!(max_tokens(&d_spec), Some(8));
+
+        // D completes first; the answer waits for P, whose load is still held.
+        let d_done = done(vec![(completion(d_spec.seq_id, "stop_22"), vec![21, 22])]);
+        d_call.outbound.send(d_done).unwrap();
+        assert_eq!((pw.load(), dw.load()), (1, 1));
+        let p_done = done(vec![(completion(p_spec.seq_id, "max_tokens"), vec![5])]);
+        p_call.outbound.send(p_done).unwrap();
+        let (status, body) = respond(request).await;
+        let body: Json = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            (status, &body[0]["output_ids"]),
+            (StatusCode::OK, &json!([21, 22]))
+        );
+        assert_eq!((pw.load(), dw.load()), (0, 0));
+    }
 }

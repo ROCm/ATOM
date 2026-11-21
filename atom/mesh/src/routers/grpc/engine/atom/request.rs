@@ -1,9 +1,15 @@
-//! A `GenerationPayload` as ATOM's GenerateRequest: the sampling fields ATOM's HTTP routes read,
-//! stop strings as token ids, the worker's DP rank and a chat's StructuredOutput.
+//! A `GenerationPayload` as ATOM's GenerateRequest (the sampling fields ATOM's HTTP routes read,
+//! stop ids, DP rank, a chat's StructuredOutput), which the Session sends as a RequestSpec.
+
+use http::StatusCode;
+use serde_json::Value as Json;
 
 use crate::atom_engine::{
     grpc::{self, GenerateRequest},
-    wire::pb::{stop_strings, SamplingParams, StopStrings, StringList, TokenIds},
+    wire::pb::{
+        stop_strings, value::Kind, MapEntry, RequestSpec, SamplingParams, StopStrings, StringList,
+        TokenIds, Value, ValueList, ValueMap,
+    },
 };
 use crate::core::Worker;
 use crate::protocols::common::StringOrArray;
@@ -44,6 +50,60 @@ pub(crate) fn generate_request(
         stream: payload.stream,
         structured_output: payload.structured_output.as_ref().map(structured_output),
     })
+}
+
+/// `request`, its StructuredOutput already prepared, as a RequestSpec and its prompt;
+/// the Session sets the seq_id and the prompt's frame.
+pub(crate) fn request_spec(
+    request: GenerateRequest,
+) -> Result<(RequestSpec, Vec<u32>), EngineError> {
+    let kv_transfer_params = request
+        .kv_transfer_params_json
+        .map(|kv| value(&serde_json::from_str(&kv).map_err(|e| e.to_string())?))
+        .transpose()
+        .map_err(|e| EngineError::Http {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("kv_transfer_params engine_v1 cannot carry: {e}"),
+        })?;
+    let spec = RequestSpec {
+        sampling: request.sampling,
+        stop_token_sequences: request.stop_token_sequences,
+        external_request_id: Some(request.request_id),
+        kv_transfer_params,
+        data_parallel_rank: request.data_parallel_rank.map(i64::from),
+        ..Default::default()
+    };
+    Ok((spec, request.prompt_token_ids))
+}
+
+/// `json` as the engine_v1 Value ATOM's frames codec reads back to it.
+pub(super) fn value(json: &Json) -> Result<Value, String> {
+    let kind = match json {
+        Json::Null => Kind::NullValue(true),
+        Json::Bool(b) => Kind::BoolValue(*b),
+        Json::Number(n) => match (n.as_i64(), n.as_f64().filter(|_| n.is_f64())) {
+            (Some(i), _) => Kind::IntValue(i),
+            (None, Some(f)) => Kind::FloatValue(f),
+            (None, None) => return Err(format!("{n} is outside int64")),
+        },
+        Json::String(s) => Kind::StringValue(s.clone()),
+        Json::Array(items) => Kind::ListValue(ValueList {
+            items: items.iter().map(value).collect::<Result<_, _>>()?,
+        }),
+        Json::Object(map) => {
+            let entry = |(key, item): (&String, &Json)| {
+                Ok(MapEntry {
+                    key: Some(Value {
+                        kind: Some(Kind::StringValue(key.clone())),
+                    }),
+                    value: Some(value(item)?),
+                })
+            };
+            let entries = map.iter().map(entry).collect::<Result<_, String>>()?;
+            Kind::MapValue(ValueMap { entries })
+        }
+    };
+    Ok(Value { kind: Some(kind) })
 }
 
 fn structured_output(carried: &StructuredOutput) -> grpc::StructuredOutput {

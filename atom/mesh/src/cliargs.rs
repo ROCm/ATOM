@@ -496,6 +496,11 @@ pub struct CliArgs {
     #[arg(long, value_enum, default_value_t = Backend::Sglang, alias = "runtime", help_heading = "Backend")]
     pub backend: Backend,
 
+    /// Send every request to an ATOM gRPC worker over one Session per instance,
+    /// rather than a Generate call per request
+    #[arg(long, default_value_t = false, help_heading = "Backend")]
+    pub atom_grpc_session: bool,
+
     // ==================== Control Plane Authentication ====================
     /// API key for worker connections
     #[arg(long, help_heading = "Control Plane Authentication")]
@@ -696,6 +701,10 @@ impl CliArgs {
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
             .build()
+            .map(|config| RouterConfig {
+                atom_grpc_session: self.atom_grpc_session,
+                ..config
+            })
     }
 
     pub fn to_server_config(&self, router_config: RouterConfig) -> ServerConfig {
@@ -818,6 +827,16 @@ mod tests {
             assert_eq!(config.resolved_prepare_pool().unwrap().queue_capacity, 10);
             assert_eq!(config.resolved_max_tokenize_bytes(), 8192);
         }
+    }
+
+    #[test]
+    fn atom_grpc_session_reaches_the_router_config() {
+        let session = |args: &[&str]| {
+            let args = CliArgs::try_parse_from(args).unwrap();
+            args.to_router_config(Vec::new()).unwrap().atom_grpc_session
+        };
+        assert!(!session(&["atomesh"]));
+        assert!(session(&["atomesh", "--atom-grpc-session"]));
     }
 
     #[test]
@@ -946,6 +965,7 @@ impl Default for CliArgs {
             reasoning_parser: None,
             tool_call_parser: None,
             backend: Backend::Sglang,
+            atom_grpc_session: false,
             api_key: None,
             tls_cert_path: None,
             tls_key_path: None,
