@@ -943,6 +943,12 @@ jobs:
       - run: python -m pip install PyYAML==6.0.3
       - run: python -m unittest discover -s tests -p test_kda_stage1_probe.py -v
       - run: python -m unittest discover -s tests -p test_kda3501_native_client.py -v
+      - name: Check temporary checkpoint observer on CPU
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/kda-boundary-source"
+          git archive 07bb9254bfe20609fbeab8fdf1e3af7c4f255892 atom/model_engine/kda_checkpoint_boundary.py tests/test_kda_checkpoint_boundary.py | tar -x -C "$RUNNER_TEMP/kda-boundary-source"
+          python -m unittest discover -s "$RUNNER_TEMP/kda-boundary-source/tests" -p test_kda_checkpoint_boundary.py -v
       - name: Verify immutable source and job scope
         run: |
           python - <<'PY'
@@ -959,8 +965,17 @@ jobs:
           assert git('rev-parse', p.BASE + ':atom') == p.TREES['baseline']
           assert git('rev-parse', p.CANDIDATE + ':atom') == p.TREES['candidate']
           capture = json.loads(pathlib.Path('.github/scripts/kda3501_native_repeat/inputs.json').read_text())
-          assert capture['source'] == p.CANDIDATE and capture['atom_tree'] == p.TREES['candidate']
+          runtime = '07bb9254bfe20609fbeab8fdf1e3af7c4f255892'
+          assert capture['source'] == runtime
+          assert git('rev-parse', runtime + '^') == p.CANDIDATE
+          assert capture['atom_tree'] == git('rev-parse', runtime + ':atom')
+          assert set(git('diff', '--name-only', p.CANDIDATE, runtime).splitlines()) == {
+              'atom/model_engine/kda_checkpoint_boundary.py',
+              'atom/model_engine/model_runner.py',
+              'tests/test_kda_checkpoint_boundary.py',
+          }
           assert capture['engine_args']['num_speculative_tokens'] == 0
+          assert capture['engine_args']['enforce_eager'] is True and capture['engine_args']['level'] == 0
           subprocess.run(['git', 'diff', '--exit-code', p.BASE, 'HEAD', '--', 'atom'], check=True)
           def patch_id(a, b):
               patch = subprocess.check_output(['git', 'diff', a, b, '--', 'atom'])
@@ -1021,11 +1036,11 @@ jobs:
           set -euo pipefail
           mkdir -p "$STAGE1_ROOT/src/candidate" "$STAGE1_ROOT/results"
           cat /sys/module/amdgpu/version > "$STAGE1_ROOT/results/host-amdgpu-version.txt" 2>&1 || true
-          git archive 05ce5a39e10fcf3605fbd798870a0a5ab2fe1107 | tar -x -C "$STAGE1_ROOT/src/candidate"
+          git archive 07bb9254bfe20609fbeab8fdf1e3af7c4f255892 | tar -x -C "$STAGE1_ROOT/src/candidate"
           mapfile -t wheels < <(find "$STAGE1_ROOT/wheels" -name '*.whl')
           test "${#wheels[@]}" = 1
           echo "8813b5f9b81d5e499b728d59dfffbfb736109b052986ea87c10b9f7bbaa420ef  ${wheels[0]}" | sha256sum -c -
-          git show -s --format='%H %P' 05ce5a39e10fcf3605fbd798870a0a5ab2fe1107 > "$STAGE1_ROOT/results/source.txt"
+          git show -s --format='%H %P' 07bb9254bfe20609fbeab8fdf1e3af7c4f255892 > "$STAGE1_ROOT/results/source.txt"
           container_minutes=$(( (STAGE1_STARTED + 600 - $(date +%s)) / 60 - 3 ))
           test "$container_minutes" -ge 1
           echo "container_minutes=$container_minutes" >> "$GITHUB_OUTPUT"
@@ -1075,7 +1090,7 @@ jobs:
             "/workspace/$STAGE1_ROOT/results/inputs.json" \
             > "$STAGE1_ROOT/results/candidate.log" 2>&1
           docker exec -e PYTHONPATH="/workspace/.github/scripts" "$CONTAINER_NAME" \
-            /opt/venv/bin/python -B -c 'import sys; from kda3501_native_repeat.native_client import verify_candidate_origin; verify_candidate_origin(*sys.argv[1:])' \
+            /opt/venv/bin/python -B -c 'import sys; from kda3501_native_repeat.native_client import verify_candidate_origin, verify_checkpoint_observations; verify_candidate_origin(*sys.argv[1:]); verify_checkpoint_observations(*sys.argv[1:])' \
             "/workspace/$STAGE1_ROOT/results/native-repeat" "/workspace/$STAGE1_ROOT/results/candidate.log"
       - name: Stop only this diagnostic container
         if: ${{ always() }}

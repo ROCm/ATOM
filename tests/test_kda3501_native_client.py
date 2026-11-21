@@ -378,5 +378,113 @@ class NativeClientTest(unittest.TestCase):
                 self.assertTrue(log.exists())
 
 
+class ObservationPostcheckTest(unittest.TestCase):
+    def check_records(self, change=None):
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            phases = ("C0", "W0", "W1")
+            origin = {
+                "prefill_steps": {
+                    p: [{"sequence": str(i)}] for i, p in enumerate(phases)
+                }
+            }
+            (directory / "prefill-origin.json").write_text(json.dumps(origin))
+            rows = []
+            for i, phase in enumerate(phases):
+                for rank in range(8):
+                    row = {
+                        "rank": rank,
+                        "event": ("store", "restore_1", "restore_2")[i],
+                        "request_id": str(i),
+                        "prefill": i > 0,
+                        "cached": 512 if i else 1024,
+                        "scheduled": 512 if i else 1,
+                        "unit_ids": list(range(1, 30)),
+                        "layout_id": "kda-paged-state-v1:test:tp=8:spec=0:carry=all",
+                        "image_bytes": 56_171_520,
+                        "op_bytes": 56_171_520,
+                        "slot": 3,
+                        "page_sha256": f"{rank:064x}",
+                    }
+                    if i:
+                        row.update(
+                            identity_matches=True,
+                            page_unchanged=True,
+                            restored_matches_incoming=True,
+                            restored_matches_reference=True,
+                            restored_sha256=row["page_sha256"],
+                            controls_expected=True,
+                            controls={
+                                "read_slot": 3,
+                                "write_slot": 3,
+                                "has_initial_state": True,
+                                "query_start_loc": [0, 512],
+                                "replayssm_cursor": -1,
+                                "position_span": [512, 1023, 512],
+                                "num_prefills": 1,
+                                "num_actual_tokens": 512,
+                            },
+                        )
+                    rows.append((phase, row))
+            if change:
+                change(rows)
+            lines = []
+            for phase in phases:
+                lines.append(f"PR3501 phase {phase} start")
+                lines.extend(
+                    "PR3501_CHECKPOINT " + json.dumps(row, separators=(",", ":"))
+                    for p, row in rows
+                    if p == phase
+                )
+            path = directory / "candidate.log"
+            path.write_text("\n".join(lines) + "\n")
+            client.verify_checkpoint_observations(directory, path)
+            return json.loads((directory / "checkpoint-observations.json").read_text())
+
+    def test_complete_coverage_retains_unequal_state_observations(self):
+        valid = self.check_records()
+        self.assertTrue(valid["all_pages_unchanged"])
+        self.assertLessEqual(valid["logged_bytes"], 65536)
+
+        def unequal(rows):
+            row = rows[15][1]
+            row.update(
+                page_unchanged=False,
+                restored_matches_reference=False,
+                page_sha256="f" * 64,
+                restored_sha256="f" * 64,
+            )
+
+        changed = self.check_records(unequal)
+        self.assertFalse(changed["all_pages_unchanged"])
+        self.assertFalse(changed["all_restored_match_reference"])
+        self.assertTrue(changed["all_restored_match_incoming"])
+
+    def test_controls_are_independently_checked_and_false_is_retained(self):
+        def wrong(rows):
+            rows[-1][1]["controls"]["has_initial_state"] = False
+            rows[-1][1]["controls_expected"] = False
+
+        self.assertFalse(self.check_records(wrong)["all_controls_expected"])
+
+        def false_claim(rows):
+            rows[-1][1]["controls"]["has_initial_state"] = False
+
+        with self.assertRaises(AssertionError):
+            self.check_records(false_claim)
+
+    def test_incomplete_duplicate_wrong_identity_and_oversized_records_refuse(self):
+        changes = (
+            lambda rows: rows.pop(),
+            lambda rows: rows.append(rows[-1]),
+            lambda rows: rows[-1][1]["unit_ids"].reverse(),
+            lambda rows: rows[-1][1].update(padding="x" * 2048),
+            lambda rows: rows[-1][1].update(image_bytes=1),
+        )
+        for change in changes:
+            with self.subTest(change=change), self.assertRaises(AssertionError):
+                self.check_records(change)
+
+
 if __name__ == "__main__":
     unittest.main()

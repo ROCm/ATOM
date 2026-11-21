@@ -92,6 +92,106 @@ def verify_candidate_origin(directory, log_path):
     )
 
 
+def verify_checkpoint_observations(directory, log_path):
+    """Validate bounded all-rank coverage; unequal states remain reported data."""
+    directory, log_path = Path(directory), Path(log_path)
+    assert log_path.stat().st_size <= 16 * 1024**2
+    origin = json.loads((directory / "prefill-origin.json").read_text())
+    prefix, phase, size = "PR3501_CHECKPOINT ", None, 0
+    events = {"C0": "store", "W0": "restore_1", "W1": "restore_2"}
+    ranks = {rank: [] for rank in range(8)}
+    for line in log_path.read_text(encoding="utf-8").splitlines():
+        if line.startswith("PR3501 phase "):
+            phase = line.split()[2]
+        if prefix not in line:
+            continue
+        assert line.startswith(prefix) and phase in events
+        count = len((line + "\n").encode())
+        size += count
+        assert count <= 2048 and size <= 65536, "observer log bound exceeded"
+        row = json.loads(line[len(prefix) :])
+        rank = row["rank"]
+        assert type(rank) is int and rank in ranks
+        assert row["event"] == events[phase]
+        assert row["request_id"] == origin["prefill_steps"][phase][0]["sequence"]
+        assert row["image_bytes"] == row["op_bytes"] == 56_171_520
+        assert row["layout_id"].startswith("kda-paged-state-v1:")
+        assert row["layout_id"].endswith(":tp=8:spec=0:carry=all")
+        assert len(row["unit_ids"]) == len(set(row["unit_ids"])) == 29
+        assert all(type(unit) is int and unit >= 0 for unit in row["unit_ids"])
+        assert type(row["slot"]) is int and row["slot"] >= 0
+        for name in (
+            ("page_sha256",) if phase == "C0" else ("page_sha256", "restored_sha256")
+        ):
+            value = row[name]
+            assert len(value) == 64 and all(c in "0123456789abcdef" for c in value)
+        ranks[rank].append(row)
+        assert len(ranks[rank]) <= 3, "extra observer record"
+    warm = []
+    for records in ranks.values():
+        assert [row["event"] for row in records] == list(
+            events.values()
+        ), "missing rank/event coverage"
+        stored = records[0]
+        for row in records[1:]:
+            assert row["prefill"] is True and row["cached"] == row["scheduled"] == 512
+            for flag in (
+                "identity_matches",
+                "page_unchanged",
+                "restored_matches_incoming",
+                "restored_matches_reference",
+                "controls_expected",
+            ):
+                assert type(row[flag]) is bool
+            assert row["identity_matches"] and all(
+                row[k] == stored[k] for k in ("unit_ids", "layout_id", "op_bytes")
+            ), "checkpoint identity changed"
+            controls = {
+                "read_slot": row["slot"],
+                "write_slot": row["slot"],
+                "has_initial_state": True,
+                "query_start_loc": [0, 512],
+                "replayssm_cursor": -1,
+                "position_span": [512, 1023, 512],
+                "num_prefills": 1,
+                "num_actual_tokens": 512,
+            }
+            assert row["controls_expected"] == (row["controls"] == controls)
+            for flag, left, right in (
+                ("page_unchanged", row["page_sha256"], stored["page_sha256"]),
+                (
+                    "restored_matches_incoming",
+                    row["restored_sha256"],
+                    row["page_sha256"],
+                ),
+                (
+                    "restored_matches_reference",
+                    row["restored_sha256"],
+                    stored["page_sha256"],
+                ),
+            ):
+                assert not row[flag] or left == right
+            warm.append(row)
+    save(
+        directory,
+        "checkpoint-observations.json",
+        {
+            "coverage": "one store and two restores on each of eight ranks",
+            "logged_bytes": size,
+            "records": ranks,
+            "all_pages_unchanged": all(row["page_unchanged"] for row in warm),
+            "all_restored_match_incoming": all(
+                row["restored_matches_incoming"] for row in warm
+            ),
+            "all_restored_match_reference": all(
+                row["restored_matches_reference"] for row in warm
+            ),
+            "all_controls_expected": all(row["controls_expected"] for row in warm),
+            "qualification": "observation coverage only; numerics remain separate; CPU reads synchronize; MLA state is unobserved",
+        },
+    )
+
+
 def main():
     data = json.loads(Path(__file__).with_name("inputs.json").read_text())
     output = Path(sys.argv[1])
