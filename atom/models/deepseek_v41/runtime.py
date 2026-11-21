@@ -2,11 +2,14 @@
 """ModelRunner interface over the V4.1 multimodal backbone."""
 
 import logging
+import os
 
 import torch
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from torch import nn
 
+from atom import plugin_host, plugin_transition
+from atom.config import get_current_atom_config
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.engram.device.staging import EngramStagedRows
 from atom.utils.backends import set_model_tag
@@ -351,9 +354,53 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
     def _late_layers(self, state):
         return SinglePassHCState(*_batched(self.late(*_rows_first(state.fields()))))
 
+    def _transition_forward(self, input_ids, positions, inputs_embeds):
+        """Non-TBO TP4, eager or full-forward graph with the Python backbone."""
+        from aiter.dist.parallel_state import get_tp_group
+
+        cfg = get_current_atom_config()
+        if (cfg.compilation_config.level != 0 or cfg.tensor_parallel_size != 4
+                or cfg.parallel_config.data_parallel_size != 1
+                or cfg.enable_dp_attention or cfg.enable_expert_parallel or cfg.enable_tbo
+                or cfg.prefill_context_parallel_size != 1
+                or cfg.decode_context_parallel_size != 1
+                or cfg.pipeline_parallel_size != 1):
+            return self.backbone(input_ids, positions, inputs_embeds)
+        forward = get_forward_context()
+        group = get_tp_group()
+        if group.world_size != 4 or group.cpu_group is None:
+            return self.backbone(input_ids, positions, inputs_embeds)
+
+        def eligible(pairs):
+            ctx = forward.context
+            captured, bucket = plugin_host._graph_state()
+            # Capture routes by padded capacity; it cannot specialize on
+            # the scheduled row count of a future replay. Native kernels
+            # retain their device-side valid-row handling.
+            if (ctx.is_prefill or (not captured and ctx.scheduled_tokens != input_ids.numel())
+                    or plugin_host._routes("v41.block.ffn", captured, bucket)):
+                return False
+            for src, dst in pairs:
+                if dst >= len(self.layers) or self.layers[dst].engram is not None:
+                    return False
+                moe = self.layers[src].ffn
+                if moe._use_comm_fused_dispatch or moe._use_dual_stream or moe.tp_size != 4:
+                    return False
+            return True
+
+        def agree(token):
+            agreed = [None] * group.world_size
+            torch.distributed.all_gather_object(agreed, token, group=group.cpu_group)
+            return agreed
+
+        with plugin_transition.scope(eligible=eligible, rows=input_ids.numel(), agree=agree):
+            return self.backbone(input_ids, positions, inputs_embeds)
+
     def forward(self, input_ids, positions, inputs_embeds=None):
         """Tensor-only serving entry; guarded ops read the live forward context."""
         if not self.replay:
+            if not torch.compiler.is_compiling() and os.environ.get("ATOM_V41_TRANSITION_AB") == "1":
+                return self._transition_forward(input_ids, positions, inputs_embeds)
             return self.backbone(input_ids, positions, inputs_embeds)
         state = SinglePassHCState(*_batched(self.early(input_ids, inputs_embeds)))
         forward, running_tokens = get_forward_context(), input_ids.numel()

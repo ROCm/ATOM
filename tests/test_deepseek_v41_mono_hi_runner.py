@@ -120,8 +120,10 @@ def test_the_models_head_output_is_recorded_as_the_logits_are(runner_module):
 def test_the_recorded_forward_ends_in_the_head_output(runner_module, phase):
     """``capture_cudagraph``'s recorded forward returns ``_head_output`` (its warmup runs it too): the head is part
     of the recorded forward, as the logits are at TP 1."""
+    # The per-bucket warmup and record live in `_capture_request_bucket_impl`, shared with hot-plug.
     src = textwrap.dedent(
         inspect.getsource(runner_module.ModelRunner.capture_cudagraph)
+        + inspect.getsource(runner_module.ModelRunner._capture_request_bucket_impl)
     )
     if phase == "warmup":
         assert "self._head_output(outputs[:running_tokens], logits_in_graph)" in src

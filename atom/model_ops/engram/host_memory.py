@@ -60,6 +60,7 @@ logger = logging.getLogger("atom")
 
 _PAGE = 4096
 _MADV_DONTNEED = 4
+_MADV_NOHUGEPAGE = 15
 _MADV_POPULATE_READ = 22  # Linux 5.14+; elsewhere EINVAL, and nothing is lost
 _MLOCK_ONFAULT = 1
 # `hipHostRegisterReadOnly`: the GPU only reads the range. Needed for a range
@@ -240,6 +241,10 @@ class _HipHostAllocator:
     base pages. The setting is process-wide, so another thread faulting in
     memory at that moment also gets base pages; that costs it nothing but
     huge-page TLB reach.
+
+    The range is also marked `MADV_NOHUGEPAGE`: a khugepaged collapse moves
+    pages the GPU maps, and amdgpu stalls the process's queues until it has
+    revalidated them (~1 s with a TP8 rank's two 11.4 GiB shards).
     """
 
     def __init__(self, hip, libc):
@@ -251,6 +256,7 @@ class _HipHostAllocator:
         ]
         self._free.argtypes = [ctypes.c_void_p]
         self._prctl = libc.prctl
+        self._madvise = libc.madvise
 
     def alloc(self, nbytes: int) -> int | None:
         was = self._prctl(_PR_GET_THP_DISABLE, 0, 0, 0, 0)
@@ -264,6 +270,9 @@ class _HipHostAllocator:
         if rc != 0 or not ptr.value:
             _clear_hip_error()
             return None
+        start = ptr.value - ptr.value % _PAGE  # the kernel rounds the length up
+        # best effort: a kernel without THP answers EINVAL, and nothing is lost
+        self._madvise(start, ptr.value + nbytes - start, _MADV_NOHUGEPAGE)
         return ptr.value
 
     def free(self, ptr: int) -> None:

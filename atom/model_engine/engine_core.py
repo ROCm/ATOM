@@ -102,6 +102,10 @@ class EngineCore:
         self._ingested_seqs = 0
         self._last_backlog_report: tuple[int, int] | None = None
         self._next_backlog_report = 0.0
+        # The engine's own Config. Utility handlers that gate on a server flag
+        # (`plugin_hotplug`, topology) read it from here; nothing else needs the
+        # reference, and the workers own their own copies.
+        self.config = config
         self._kv_progress_event = threading.Event()
         self.input_queue = queue.Queue[Sequence]()
         self.output_queue = queue.Queue[list[Sequence]]()
@@ -122,6 +126,13 @@ class EngineCore:
         self._rl_weights_inconsistent = False
         # pause_generation .. resume_generation: nothing new is scheduled.
         self._generation_paused = False
+        # The plugin round a benchmark/evaluation run is holding, if any: the
+        # run's id and when it began.  A hot-plug is refused while one is
+        # active instead of swapping the plan under the measurement; these two
+        # attributes are all a round touches, so the scheduler and the model
+        # loop never see it (see engine_utility's round handlers).
+        self.plugin_round_id: str | None = None
+        self.plugin_round_started_at: float | None = None
         self.input_address = input_address
         self.output_address = output_address
         # Control traffic arrives on its own socket so CoreManager can keep the
@@ -573,6 +584,7 @@ class EngineCore:
                     self.scheduler.engine_stats.note_idle(now)
                     if self.has_pending_kv_work():
                         self._advance_idle_kv_transfer()
+                    self._wait_for_work()
         finally:
             try:
                 # Teardown runs even on exceptions so the sender thread/socket
@@ -587,6 +599,15 @@ class EngineCore:
                 self.scheduler.close_kv_connector()
             finally:
                 tracing.shutdown()
+
+    def _wait_for_work(self) -> None:
+        """Block an idle loop, GIL released, until input or KV progress sets the
+        event (at most `KV_IDLE_DRAIN_INTERVAL_S`). A loop spinning in Python
+        lets the socket threads have the GIL only once per
+        `sys.getswitchinterval()` (5ms), so each request's last output sat that
+        long in `output_queue`."""
+        self._kv_progress_event.clear()
+        self._wait_for_kv_progress()
 
     def _process_engine_step(self):
         return self._run_then_publish_kv_events(self._process_engine_step_inner)
