@@ -822,6 +822,8 @@ def test_missing_client_fails_before_stock_install_path(tmp_path, monkeypatch):
         "TORCHINDUCTOR_CACHE_DIR": "/root/.cache/torchinductor",
         "TRITON_CACHE_DIR": "/root/.cache/triton",
         "TORCH_EXTENSIONS_DIR": "/root/.cache/torch_extensions",
+        "AITER_JIT_DIR": "/root/.aiter/jit",
+        "FLYDSL_RUNTIME_CACHE_DIR": "/root/.cache/flydsl",
         "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONUNBUFFERED": "1",
         "HF_HOME": "/root/.cache/huggingface",
@@ -871,7 +873,7 @@ def test_real_getpass_labels_do_not_require_a_passwd_entry(monkeypatch):
 def runtime_cache(tmp_path, monkeypatch):
     home, temporary = tmp_path / "home", tmp_path / "tmp"
     env = {
-        key: str(home) + value[5:] if value.startswith("/root") else value
+        key: str(Path(str(home) + value[5:])) if value.startswith("/root") else value
         for key, value in ci.CACHE_ENV.items()
     }
     env["TMPDIR"] = str(temporary)
@@ -892,12 +894,13 @@ def test_private_runtime_caches_are_writable_without_retained_probes(runtime_cac
     assert all(
         Path(value).is_dir()
         for key, value in env.items()
-        if key not in {"LOGNAME", "USER"}
+        if key not in {"LOGNAME", "USER", "AITER_JIT_DIR"}
     )
+    assert not Path(env["AITER_JIT_DIR"]).exists()
     assert not [path for path in root.rglob("*") if path.is_file()]
 
 
-@pytest.mark.parametrize("key", [*ci.CACHE_ENV, "AITER_JIT_DIR"])
+@pytest.mark.parametrize("key", [*ci.CACHE_ENV, "FLYDSL_RUNTIME_RUN_ONLY"])
 def test_runtime_cache_environment_must_match(runtime_cache, key):
     root, _ = runtime_cache
     ci.os.environ[key] = "/shared"
@@ -927,6 +930,238 @@ def test_cache_escape_and_write_denial_refuse(runtime_cache, monkeypatch):
     monkeypatch.setattr(ci.tempfile, "TemporaryFile", denied)
     with pytest.raises(PermissionError, match="cannot create cache file"):
         ci.verify_runtime_cache()
+
+
+def test_unqualified_bf16_opus_blocks_before_preparation(tmp_path, monkeypatch):
+    assert ci.read(ci.POLICY)["bf16_opus_sha256"] is None
+    monkeypatch.setattr(
+        ci, "verify", lambda *a: pytest.fail("unqualified module reached inputs")
+    )
+    with pytest.raises(
+        ValueError, match="no qualified hash: module_fmha_fwd_bf16_opus"
+    ):
+        ci.prepare(tmp_path)
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.fixture
+def native_fixture(runtime_cache, monkeypatch):
+    root, env = runtime_cache
+    ci.verify_runtime_cache()
+    if sys.platform == "win32":
+        # Match the existing Phase0 fixture: Windows stat/fstat ctime differ.
+        scope = ci.measured_hash.__globals__
+        identity = scope["identity"]
+        monkeypatch.setitem(
+            scope, "identity", lambda *a: dict(identity(*a), ctime_ns=0)
+        )
+    source = root / "package/aiter/jit"
+    source.mkdir(parents=True)
+    names = [
+        Path(p).name
+        for p in ci.read(ci.CONTROL / ".github/validation/k31-phase0.json")[
+            "native_files"
+        ]
+    ]
+    names.append("module_fmha_fwd_bf16_opus.so")
+    for name in names + ["optional_module.so"]:
+        (source / name).write_bytes(name.encode())
+    pins = {name: ci.checksum(source / name) for name in names}
+    (source / "flydsl_cache").mkdir()
+    (source / "flydsl_cache/denied.pkl").write_bytes(b"generated cache")
+    view = Path(env["AITER_JIT_DIR"])
+    monkeypatch.setattr(ci, "NATIVE_SOURCE", source)
+    monkeypatch.setattr(ci, "EVIDENCE", root)
+    monkeypatch.setattr(ci, "native_pins", lambda: pins)
+    aiter_sha = ci.read(ci.POLICY)["aiter"]
+    monkeypatch.setattr(
+        ci, "command", lambda argv: {"returncode": 0, "stdout": aiter_sha}
+    )
+    monkeypatch.setattr(
+        ci.shutil, "copytree", lambda *a, **kw: pytest.fail("whole JIT tree copied")
+    )
+    real_open = Path.open
+
+    def readable(path, *args, **kwargs):
+        assert "flydsl_cache" not in path.parts, "generated cache was accessed"
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", readable)
+    aliases = {}
+    if sys.platform == "win32":
+        # This host lacks symlink privilege. Real hardlinks exercise byte/identity
+        # checks; only Linux symlink metadata is a fixture, not a Linux proof.
+        resolve, is_symlink = Path.resolve, Path.is_symlink
+
+        def link(path, target):
+            ci.os.link(target, path)
+            aliases[path] = target
+
+        monkeypatch.setattr(Path, "symlink_to", link)
+        monkeypatch.setattr(
+            Path,
+            "resolve",
+            lambda path, *a, **kw: aliases.get(path) or resolve(path, *a, **kw),
+        )
+        monkeypatch.setattr(
+            Path, "is_symlink", lambda path: path in aliases or is_symlink(path)
+        )
+    yield root, source, view, pins, aliases
+    for path in (view, view / "build"):
+        if path.exists():
+            path.chmod(0o755)
+
+
+def test_native_view_created_once_then_only_verified(native_fixture, monkeypatch):
+    root, source, view, pins, _ = native_fixture
+    first = ci.native_view(create=True)
+    receipt = (root / "native-view.json").read_bytes()
+    assert set(first["modules"]) == set(pins) | {"optional_module.so"}
+    assert not (view / "flydsl_cache").exists()
+    with pytest.raises(ValueError, match="already initialized"):
+        ci.native_view(create=True)
+    monkeypatch.setattr(
+        Path, "symlink_to", lambda *a: pytest.fail("admission changed aliases")
+    )
+    assert ci.native_view() == first
+    assert (root / "native-view.json").read_bytes() == receipt
+    assert all((view / name).samefile(source / name) for name in first["modules"])
+    assert (
+        not view.stat().st_mode & 0o222 and not (view / "build").stat().st_mode & 0o222
+    )
+
+
+@pytest.mark.parametrize("problem", ["missing", "hash", "unreadable", "source"])
+def test_native_inputs_refuse_without_fallback(native_fixture, monkeypatch, problem):
+    root, source, view, pins, _ = native_fixture
+    name = "module_fmha_fwd_bf16_opus.so"
+    if problem == "missing":
+        (source / name).unlink()
+    elif problem == "hash":
+        pins[name] = "0" * 64
+    elif problem == "unreadable":
+        real_open = Path.open
+
+        def denied(path, *args, **kwargs):
+            if path == source / name:
+                raise PermissionError("required module unreadable")
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", denied)
+    else:
+        monkeypatch.setattr(
+            ci, "command", lambda argv: {"returncode": 1, "stdout": "wrong"}
+        )
+    with pytest.raises((ValueError, PermissionError)):
+        ci.native_view(create=True)
+    assert not view.exists() and not (root / "native-view.json").exists()
+
+
+@pytest.mark.parametrize("problem", ["writable", "extra", "alias", "receipt", "bytes"])
+def test_native_view_drift_refuses(native_fixture, problem):
+    root, source, view, pins, aliases = native_fixture
+    ci.native_view(create=True)
+    if problem == "writable":
+        view.chmod(0o755)
+    elif problem == "extra":
+        view.chmod(0o755)
+        (view / "extra").touch()
+        view.chmod(0o555)
+    elif problem == "alias":
+        view.chmod(0o755)
+        alias = view / next(iter(pins))
+        alias.unlink()
+        aliases.pop(alias, None)
+        alias.write_bytes(b"not the source")
+        view.chmod(0o555)
+    elif problem == "receipt":
+        write(root / "native-view.json", {})
+    else:
+        (source / "optional_module.so").write_bytes(b"changed")
+    with pytest.raises(ValueError):
+        ci.native_view()
+
+
+@pytest.mark.parametrize(
+    "problem", [None, "arch", "missing", "python_path", "ctypes_path", "run_only"]
+)
+def test_normal_native_loading_and_ctypes_selection(
+    native_fixture, monkeypatch, problem
+):
+    _, source, view, pins, _ = native_fixture
+    ci.native_view(create=True)
+    calls = []
+
+    def get_module(name):
+        calls.append(("get_module", name))
+        if problem == "missing" and name == "module_fmha_fwd_bf16_opus":
+            raise ModuleNotFoundError(name)
+        return SimpleNamespace(
+            __file__=str(
+                source / "optional_module.so"
+                if problem == "python_path"
+                else view / (name + ".so")
+            )
+        )
+
+    def ctypes_path(name):
+        calls.append(("build_ctypes_module", name))
+        return str(
+            source / (name + ".so")
+            if problem == "ctypes_path"
+            else view / (name + ".so")
+        )
+
+    core = SimpleNamespace(
+        __file__=str(source / "core.py"),
+        get_gfx_runtime=lambda: "gfx942" if problem == "arch" else "gfx950",
+        get_user_jit_dir=lambda: str(view),
+        get_module=get_module,
+        build_ctypes_module=ctypes_path,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter",
+        SimpleNamespace(__file__=str(source.parent / "__init__.py")),
+    )
+    monkeypatch.setitem(sys.modules, "aiter.jit", SimpleNamespace(core=core))
+    monkeypatch.setitem(
+        sys.modules,
+        "flydsl.utils",
+        SimpleNamespace(
+            env=SimpleNamespace(
+                runtime=SimpleNamespace(
+                    cache_dir=ci.CACHE_ENV["FLYDSL_RUNTIME_CACHE_DIR"],
+                    run_only=problem == "run_only",
+                )
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        ci.ctypes, "CDLL", lambda path: calls.append(("CDLL", Path(path).stem))
+    )
+    if problem:
+        message = {
+            "arch": "native architecture",
+            "missing": "module_fmha_fwd_bf16_opus",
+            "python_path": "native loader selected",
+            "ctypes_path": "native loader selected",
+            "run_only": "FlyDSL private normal-JIT",
+        }[problem]
+        with pytest.raises((ValueError, ModuleNotFoundError), match=message):
+            ci.native_loads()
+        if problem == "missing":
+            assert ("get_module", "module_fmha_fwd_bf16_opus") in calls
+            assert ("CDLL", "module_fmha_fwd_bf16_opus") not in calls
+        else:
+            assert not any(kind == "CDLL" for kind, _ in calls)
+    else:
+        assert set(ci.native_loads()) == set(pins)
+        assert calls == [
+            (kind, Path(name).stem)
+            for name in pins
+            for kind in ("get_module", "build_ctypes_module", "CDLL")
+        ]
 
 
 def test_real_checker_patch_preserves_full_evaluation(tmp_path):

@@ -2,6 +2,7 @@
 
 import argparse
 import base64
+import ctypes
 import json
 import math
 import os
@@ -17,11 +18,13 @@ import time
 from pathlib import Path
 
 from atomesh.numa_exec import parse_cpulist
+from k31_phase0_assets import measured_hash
 from k31_phase0_inputs import digest, require, verify
 
 CONTROL = Path(__file__).resolve().parents[2]
 POLICY = CONTROL / ".github/validation/k31-b-accuracy.json"
 EVIDENCE = Path("/app/atom-3577/evidence/B-accuracy")
+NATIVE_SOURCE = Path("/app/aiter-test/aiter/jit")
 CACHE_ENV = {
     "HOME": "/root",
     "TMPDIR": "/tmp",
@@ -32,6 +35,8 @@ CACHE_ENV = {
     "TORCHINDUCTOR_CACHE_DIR": "/root/.cache/torchinductor",
     "TRITON_CACHE_DIR": "/root/.cache/triton",
     "TORCH_EXTENSIONS_DIR": "/root/.cache/torch_extensions",
+    "AITER_JIT_DIR": "/root/.aiter/jit",
+    "FLYDSL_RUNTIME_CACHE_DIR": "/root/.cache/flydsl",
 }
 
 
@@ -223,6 +228,7 @@ def captured_allocation(path, output):
 
 def prepare(work):
     policy = read(POLICY)
+    native_pins()  # Refuse an unqualified required module before allocation or pull.
     verify(
         work / "inputs/seed",
         CONTROL / ".github/validation/k31-phase0.json",
@@ -422,14 +428,15 @@ def device_map(output):
         == {d["pci"] for d in read("/job/allocation.json")["nodes"] if "pci" in d},
         "HIP allocation differs",
     )
-    save(
-        output,
-        {
-            "devices": devices,
-            "hip": torch.version.hip,
-            "scope": "visible devices; not an observed model-rank map",
-        },
-    )
+    report = {
+        "devices": devices,
+        "hip": torch.version.hip,
+        "scope": "visible devices; not an observed model-rank map",
+    }
+    save(output, report)
+    report["native_modules"] = native_loads()
+    report["native_checks_passed"] = True
+    save(output, report)
 
 
 def device_groups(allocated):
@@ -565,14 +572,155 @@ def isolated_device_access(root, admission):
         telemetry(EVIDENCE / f"post-access-{parent}.json")
 
 
+def native_pins():
+    pins = {
+        Path(path).name: value
+        for path, value in read(CONTROL / ".github/validation/k31-phase0.json")[
+            "native_files"
+        ].items()
+    }
+    pins["module_fmha_fwd_bf16_opus.so"] = read(POLICY)["bf16_opus_sha256"]
+    for name, value in pins.items():
+        require(
+            isinstance(value, str) and re.fullmatch("[0-9a-f]{64}", value),
+            f"required native module has no qualified hash: {name}",
+        )
+    return pins
+
+
+def native_view(create=False):
+    wanted = native_pins()
+    policy = read(POLICY)
+    git = ["git", "-C", str(NATIVE_SOURCE.parents[1])]
+    head = command(git + ["rev-parse", "HEAD"])
+    clean = command(git + ["diff", "--exit-code", "--quiet", "HEAD"])
+    require(
+        head["returncode"] == clean["returncode"] == 0
+        and head["stdout"].strip() == policy["aiter"],
+        "native source differs",
+    )
+    source = sorted(NATIVE_SOURCE.glob("*.so"))
+    require(set(wanted) <= {p.name for p in source}, "required native module missing")
+    modules = {}
+    for path in source:
+        require(
+            re.fullmatch(r"[A-Za-z0-9_]+\.so", path.name) and path.resolve() == path,
+            "ambiguous native source path",
+        )
+        modules[path.name] = measured_hash(path)
+    require(
+        all(modules[name]["sha256"] == value for name, value in wanted.items()),
+        "required native hash differs",
+    )
+    view = Path(CACHE_ENV["AITER_JIT_DIR"])
+    require(
+        view.resolve() == view and view.is_relative_to(Path.home()),
+        "native view escapes HOME",
+    )
+    receipt = EVIDENCE / "native-view.json"
+    if create:
+        require(
+            not view.exists() and not receipt.exists(),
+            "native view already initialized",
+        )
+        view.mkdir(mode=0o700, parents=True)
+        (view / "build").mkdir(mode=0o555)
+        (view / "build").chmod(0o555)
+        for path in source:
+            (view / path.name).symlink_to(path)
+        view.chmod(0o555)
+        save(
+            receipt,
+            {
+                "source": str(NATIVE_SOURCE),
+                "view": str(view),
+                "aiter": policy["aiter"],
+                "modules": modules,
+            },
+        )
+    saved = read(receipt)
+    require(
+        saved
+        == {
+            "source": str(NATIVE_SOURCE),
+            "view": str(view),
+            "aiter": policy["aiter"],
+            "modules": modules,
+        },
+        "native view receipt differs",
+    )
+    require(
+        {p.name for p in view.iterdir()} == set(modules) | {"build"}
+        and not list((view / "build").iterdir())
+        and all(
+            not path.is_symlink() and not path.stat().st_mode & 0o222
+            for path in (view, view / "build")
+        ),
+        "native view or build directory is mutable",
+    )
+    for path in source:
+        alias = view / path.name
+        require(
+            alias.is_symlink() and alias.resolve() == path and alias.samefile(path),
+            "native alias differs",
+        )
+    return saved
+
+
+def native_loads():
+    snapshot = native_view()
+    import aiter
+    from aiter.jit import core
+    from flydsl.utils import env as flydsl_env
+
+    require(
+        Path(aiter.__file__).resolve().parent == NATIVE_SOURCE.parent
+        and Path(core.__file__).resolve() == NATIVE_SOURCE / "core.py",
+        "AITER package origin differs",
+    )
+    require(
+        os.environ.get("AITER_JIT_DIR") == core.get_user_jit_dir() == snapshot["view"],
+        "native JIT selection differs",
+    )
+    architecture = core.get_gfx_runtime()
+    require(
+        architecture == "gfx950",
+        "native architecture unavailable or different",
+    )
+    require(
+        flydsl_env.runtime.cache_dir == CACHE_ENV["FLYDSL_RUNTIME_CACHE_DIR"]
+        and not flydsl_env.runtime.run_only,
+        "FlyDSL private normal-JIT environment differs",
+    )
+    loaded = {}
+    for name in native_pins():
+        path = Path(snapshot["view"]) / name
+        module = core.get_module(Path(name).stem)
+        selected = Path(core.build_ctypes_module(Path(name).stem))
+        require(
+            Path(module.__file__).samefile(path)
+            and selected == path
+            and selected.samefile(NATIVE_SOURCE / name),
+            "native loader selected a different module",
+        )
+        ctypes.CDLL(str(selected))
+        loaded[name] = {
+            "python_origin": module.__file__,
+            "ctypes_path": str(selected),
+            "runtime_architecture": architecture,
+            "source_sha256": snapshot["modules"][name]["sha256"],
+        }
+    return loaded
+
+
 def verify_runtime_cache():
     require(
         all(os.environ.get(key) == value for key, value in CACHE_ENV.items())
-        and "AITER_JIT_DIR" not in os.environ,
+        and "FLYDSL_RUNTIME_RUN_ONLY" not in os.environ,
         "runtime cache environment differs",
     )
     for key in CACHE_ENV:
-        if key in {"LOGNAME", "USER"}:
+        if key in {"LOGNAME", "USER", "AITER_JIT_DIR"}:
             continue
         path = Path(os.environ[key])
         require(
@@ -592,7 +740,7 @@ def verify_runtime_cache():
     return {key: os.environ[key] for key in CACHE_ENV}
 
 
-def verify_admission(root):
+def verify_admission(root, initialize_native=False):
     admission, policy = read(root / "admission.json"), read(POLICY)
     require(
         admission["kind"] == "ci-container-v1" and admission["leg"] == "B-accuracy",
@@ -687,6 +835,7 @@ def verify_admission(root):
     for name, wanted in read(manifest).items():
         require(checksum(root / "input" / name) == wanted, "prepared input differs")
     cache_environment = verify_runtime_cache()
+    native_view(create=initialize_native)
     access = isolated_device_access(root, admission)
     admission["observation"] = {
         "namespaces": {
@@ -748,7 +897,7 @@ def entry(work):
         shutil.which("lm_eval") == "/opt/venv/bin/lm_eval",
         "pinned lm_eval executable unavailable; refuse install",
     )
-    verify_admission(Path("/app/atom-3577"))
+    verify_admission(Path("/app/atom-3577"), initialize_native=True)
     shutil.copytree(work / "data/hf", Path(os.environ["HF_HOME"]))
     report = {
         "kind": "ci-current-assets-v1",
