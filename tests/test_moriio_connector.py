@@ -514,6 +514,25 @@ class ConnectorBehaviourTest(unittest.TestCase):
             conn._verify_state_landed("req")
         self.assertIn("the producer sent no state digest", logs.output[0])
 
+    def test_tensors_no_producer_stage_digested_are_reported_apart(self):
+        """A PP producer's stages merge into one digest; a tensor none of them
+        digested is reported as such, and the rest are still compared."""
+        conn, _ = self.make_connector()
+        conv, _ssm = self.add_state(conn)
+        conn._verify_state_before["req"] = (1, conn._state_digest(1))
+        conv[1] = 0.25
+        conn._write_state_digests["req"] = {"kda.k": conn._state_digest(1)["kda.k"]}
+
+        with self.assertLogs("atom", "INFO") as logs:
+            conn._verify_state_landed("req")
+        self.assertIn(
+            "the producer sent no digest for 1 of 2 state tensors (first kda.v)",
+            logs.output[0],
+        )
+        self.assertIn(
+            "the 1 state tensors the producer digested all match it", logs.output[1]
+        )
+
 
 class FakeEvent:
     """Stands in for torch.cuda.Event; ``done`` is flipped by the test."""
@@ -666,6 +685,7 @@ class WritePathTest(unittest.TestCase):
         conn._released_transfers = collections.OrderedDict()
         conn._write_reports_expected = {}
         conn._write_report_counts = {}
+        conn._stage_digests = {}
         conn._page_consumer_indices = None
         conn._state_tp_split = {}
 
@@ -1229,6 +1249,74 @@ class WritePathTest(unittest.TestCase):
         self.assertIn("the receive wrote into blocks it kept", logs.output[0])
         self.assertIn("roles ['k_scale']", logs.output[0])
         self.assertEqual(conn._verify_page_kept, {})
+
+    def stage_reports(self, consumer, req_id, *, stale=None, unplaced=None):
+        """Two PP stages, each holding one of `consumer`'s PAGE regions (its
+        blocks 10 and 11), push them into the consumer's blocks 6 and 7 and
+        report their digests; `stale` lands one byte wrong in that region,
+        and the stage `unplaced` sends no region index."""
+        for s, view in enumerate(consumer._page_views):
+            stage = object.__new__(self.connector)
+            stage._page_views = [
+                self.torch.randint(0, 256, (16, *view.shape[1:]), dtype=view.dtype)
+            ]
+            stage._page_consumer_indices = [s]
+            view[[6, 7]] = stage._page_views[0][[10, 11]]
+            if s == stale:
+                view[7, 0, 0] ^= 1
+            digest = stage._page_digests([10, 11])
+            if s == unplaced:
+                digest[3] = None
+            consumer._record_write_report(
+                req_id, True, {f"kda{s}.k": 100 + s}, digest, stage=s
+            )
+        consumer._verify_page_dst[req_id] = [6, 7]
+
+    def test_a_pp_receive_is_verified_region_by_region(self):
+        conn = self.fabric(self.make(producer=False), blocks=16)
+        conn._verify_kv = True
+        conn._write_reports_expected = {"d1": 2, "d2": 2, "d3": 2}
+        self.stage_reports(conn, "d1")
+        # Merged once both stages reported: state by name, PAGE by region.
+        self.assertEqual(conn._write_reports, {"d1": True})
+        self.assertEqual(
+            conn._write_state_digests["d1"], {"kda0.k": 100, "kda1.k": 101}
+        )
+        self.assertEqual(sorted(conn._write_page_digests["d1"]["regions"]), [0, 1])
+        self.assertEqual(conn._stage_digests, {})
+        with self.assertLogs("atom", "INFO") as logs:
+            conn._verify_page_landed("d1")
+        self.assertIn(
+            "all 2 PAGE regions of 2 blocks match the producer's 2 stages",
+            logs.output[0],
+        )
+
+        self.stage_reports(conn, "d2", stale=1)
+        with self.assertLogs("atom", "ERROR") as logs:
+            conn._verify_page_landed("d2")
+        self.assertIn(
+            "1 of the 2 PAGE regions the 2 producer stages digested differ",
+            logs.output[0],
+        )
+        self.assertIn("regions [1]", logs.output[0])
+        self.assertIn("roles ['k_scale']", logs.output[0])
+
+        self.stage_reports(conn, "d3", unplaced=0)
+        with self.assertLogs("atom", "ERROR") as logs:
+            conn._verify_page_landed("d3")
+        self.assertIn(
+            "no producer stage digested 1 of this rank's 2 PAGE regions (first [0])",
+            logs.output[0],
+        )
+        self.assertEqual(conn._write_page_digests, {})
+
+    def test_a_single_producers_digests_are_kept_as_sent(self):
+        conn = self.fabric(self.make(producer=False))
+        conn._verify_kv = True
+        conn._record_write_report("d1", True, {"kda.k": 5}, [1, 1, [1], None])
+        self.assertEqual(conn._write_state_digests, {"d1": {"kda.k": 5}})
+        self.assertEqual(conn._write_page_digests, {"d1": [1, 1, [1], None]})
+        self.assertEqual(conn._stage_digests, {})
 
     def test_a_changed_source_reports_the_forwards_after_the_kv_ready_event(self):
         conn = self.make(producer=True)

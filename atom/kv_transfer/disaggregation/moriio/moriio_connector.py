@@ -36,7 +36,6 @@ from atom.kv_transfer.disaggregation.moriio.fabric import (
     desc_fabric_info,
     fabric_state_pool,
     is_fabric_backend,
-    page_digest,
     page_offsets,
     page_region_digests,
     pool_span,
@@ -245,7 +244,11 @@ class MoRIIOConnector(KVConnectorBase):
         # ATOM_MORIIO_VERIFY on the consumer: each pushed request's destination
         # blocks, and the producer's digest of its source blocks.
         self._verify_page_dst: dict[ReqId, list[int]] = {}
-        self._write_page_digests: dict[ReqId, list[Any]] = {}
+        self._write_page_digests: dict[ReqId, list[Any] | dict[str, Any]] = {}
+        # A receive from a PP producer, until every stage has reported: the
+        # stages' state digests by tensor name and PAGE digests by the region's
+        # index here (`_merge_stage_digests`).
+        self._stage_digests: dict[ReqId, dict[str, dict]] = {}
         # The reused prefix blocks a push must leave alone, and their
         # per-region digests before it (`_note_kept_pages`).
         self._verify_page_kept: dict[ReqId, tuple[list[int], list[int]]] = {}
@@ -1186,8 +1189,10 @@ class MoRIIOConnector(KVConnectorBase):
         A receive from a PP producer is one push per stage: it is reported
         once every stage has reported, and succeeds only if all did. A stage
         counts once, so a repeated report cannot complete a receive another
-        stage is still writing. The ATOM_MORIIO_VERIFY digests cover one
-        producer's regions, so they are kept for a receive from a single one.
+        stage is still writing. Under ATOM_MORIIO_VERIFY a single producer's
+        digests are kept as sent; a PP producer's stages each cover their own
+        layers, so theirs are merged (`_merge_stage_digests`) and kept once the
+        last stage has reported.
         """
         with self._write_reports_lock:
             expected = self._write_reports_expected.get(req_id, 1)
@@ -1201,16 +1206,47 @@ class MoRIIOConnector(KVConnectorBase):
                 self._write_report_counts[req_id] = (stages, all_ok)
                 return
             stages, all_ok = stages | {stage}, all_ok and ok
+            verify = self._verify_kv
+            if expected > 1 and verify:
+                self._merge_stage_digests(req_id, state_digest, page_digest)
             if len(stages) < expected:
                 self._write_report_counts[req_id] = (stages, all_ok)
                 return
             self._write_reports_expected.pop(req_id, None)
             self._write_reports[req_id] = all_ok
-            if expected == 1 and self._verify_kv:
+            if expected == 1 and verify:
                 if state_digest is not None:
                     self._write_state_digests[req_id] = state_digest
                 if page_digest is not None:
                     self._write_page_digests[req_id] = page_digest
+            elif verify:
+                merged = self._stage_digests.pop(req_id, None) or {}
+                if merged.get("state"):
+                    self._write_state_digests[req_id] = merged["state"]
+                if merged.get("regions"):
+                    self._write_page_digests[req_id] = {
+                        "regions": merged["regions"],
+                        "stages": expected,
+                    }
+
+    def _merge_stage_digests(
+        self, req_id: ReqId, state_digest: Any, page_digest: Any
+    ) -> None:
+        """Fold one PP stage's verify digests into its receive's.
+
+        The stages hold disjoint layers, so their state tensors and PAGE regions
+        never overlap: the state digests merge by tensor name, the PAGE digests
+        by the region's index on this rank, which a stage sends after its terms
+        (`_page_digests`). A stage that sends no region index cannot be placed,
+        and its PAGE regions are reported as never digested.
+        """
+        merged = self._stage_digests.setdefault(req_id, {"state": {}, "regions": {}})
+        if state_digest:
+            merged["state"].update(state_digest)
+        if page_digest and len(page_digest) > 3 and page_digest[3] is not None:
+            merged["regions"].update(
+                zip((int(r) for r in page_digest[3]), (int(d) for d in page_digest[2]))
+            )
 
     @staticmethod
     def _kept_prefix_blocks(meta: ReqMeta) -> int:
@@ -1915,14 +1951,22 @@ class MoRIIOConnector(KVConnectorBase):
         )
 
     def _page_digests(self, block_ids: list[int]) -> list[Any]:
-        """``[digest, digest of all but the last block, per-region digests]``
-        of ``block_ids``; past the prompt the last block holds slots decode
-        writes itself."""
-        regions = page_region_digests(self._page_views, block_ids)
+        """``[digest, digest of all but the last block, per-region digests,
+        region ids]`` of ``block_ids``; past the prompt the last block holds
+        slots decode writes itself.
+
+        The region ids are the consumer's index of each region on a PP stage
+        (``_page_consumer_indices``), which holds only its own layers' regions:
+        its terms are then weighted as the consumer weights the same regions,
+        and the consumer can place them. None elsewhere: positions.
+        """
+        ids = self._page_consumer_indices
+        regions = page_region_digests(self._page_views, block_ids, ids)
         full = sum(regions)
         if len(block_ids) < 2:
-            return [full, full, regions]
-        return [full, page_digest(self._page_views, block_ids[:-1]), regions]
+            return [full, full, regions, ids]
+        head = sum(page_region_digests(self._page_views, block_ids[:-1], ids))
+        return [full, head, regions, ids]
 
     def _changed_regions(self, before: list[int], after: list[int]) -> str:
         """The regions whose digests differ, as a count and their roles."""
@@ -1976,6 +2020,9 @@ class MoRIIOConnector(KVConnectorBase):
                 "[moriio-verify] req %s: the producer sent no PAGE digest", req_id
             )
             return
+        if isinstance(source, dict):
+            self._verify_stage_pages_landed(req_id, dst, source)
+            return
         landed = self._page_digests(dst)
         if landed[0] != source[0]:
             import torch
@@ -2007,6 +2054,69 @@ class MoRIIOConnector(KVConnectorBase):
                 req_id,
                 len(self._page_regions),
                 len(dst),
+            )
+
+    def _verify_stage_pages_landed(
+        self, req_id: ReqId, dst: list[int], source: dict[str, Any]
+    ) -> None:
+        """`_verify_page_landed` for a PP producer: each stage digested its own
+        layers' regions, keyed by their index here, so the landed blocks are
+        compared region by region, and a region no stage digested is reported
+        as such rather than as a mismatch."""
+        covered = source["regions"]
+        landed = page_region_digests(self._page_views, dst)
+        bad = [
+            rid
+            for rid, d in sorted(covered.items())
+            if rid >= len(landed) or landed[rid] != d
+        ]
+        if bad:
+            import torch
+
+            # Once more with the device idle, as `_verify_page_landed` does
+            torch.cuda.synchronize()
+            time.sleep(0.05)
+            landed = page_region_digests(self._page_views, dst)
+            still = [
+                rid for rid in bad if rid >= len(landed) or landed[rid] != covered[rid]
+            ]
+            logger.error(
+                "[moriio-verify] req %s: %d of the %d PAGE regions the %d producer "
+                "stages digested differ over %d blocks (regions %s, 50 ms later %s; "
+                "roles %s) -- decode will attend over KV that is not the prompt's",
+                req_id,
+                len(bad),
+                len(covered),
+                int(source.get("stages", 0)),
+                len(dst),
+                bad[:12],
+                f"{len(still)} still differ" if still else "all match",
+                sorted(
+                    {
+                        self._page_regions[r][2] or "?"
+                        for r in bad
+                        if r < len(self._page_regions)
+                    }
+                ),
+            )
+        missing = [rid for rid in range(len(landed)) if rid not in covered]
+        if missing:
+            logger.error(
+                "[moriio-verify] req %s: no producer stage digested %d of this "
+                "rank's %d PAGE regions (first %s)",
+                req_id,
+                len(missing),
+                len(landed),
+                missing[:12],
+            )
+        if not bad and not missing:
+            logger.info(
+                "[moriio-verify] req %s: all %d PAGE regions of %d blocks match "
+                "the producer's %d stages",
+                req_id,
+                len(landed),
+                len(dst),
+                int(source.get("stages", 0)),
             )
 
     def _verify_rows_for(self, local_block_ids: list[int], is_mla: bool) -> Any:
@@ -2181,7 +2291,23 @@ class MoRIIOConnector(KVConnectorBase):
                 "[moriio-verify] req %s: the producer sent no state digest", req_id
             )
             return
-        differ = [name for name, value in after.items() if source.get(name) != value]
+        # A PP producer's stages each digest their own layers' tensors: a name
+        # no stage sent is reported as such, not as a mismatch.
+        missing = [name for name in after if name not in source]
+        differ = [
+            name
+            for name, value in after.items()
+            if name in source and source[name] != value
+        ]
+        if missing:
+            logger.error(
+                "[moriio-verify] req %s: the producer sent no digest for %d of %d "
+                "state tensors (first %s)",
+                req_id,
+                len(missing),
+                len(after),
+                missing[0],
+            )
         if differ:
             logger.error(
                 "[moriio-verify] req %s: %d of %d state tensors differ from the "
@@ -2194,6 +2320,13 @@ class MoRIIOConnector(KVConnectorBase):
                 before[differ[0]],
                 after[differ[0]],
                 source.get(differ[0], -1),
+            )
+        elif missing:
+            logger.info(
+                "[moriio-verify] req %s: the %d state tensors the producer "
+                "digested all match it",
+                req_id,
+                len(after) - len(missing),
             )
         else:
             logger.info(
@@ -3298,6 +3431,7 @@ class MoRIIOConnector(KVConnectorBase):
                 self._verify_state_before.pop(req_id, None)
                 with self._write_reports_lock:
                     self._write_state_digests.pop(req_id, None)
+                    self._stage_digests.pop(req_id, None)
         with self._done_sending_lock:
             done_sending, self.done_sending = self.done_sending, set()
         for transfer_id in done_sending:
