@@ -108,9 +108,18 @@ jobs:
         env:
           UNIT_TEST_REPORT: unit-report.xml
         run: bash .github/scripts/run_unit_tests.sh
+      - name: Run MLA K copy interpreter tests
+        run: |
+          # Install after the general suite: Triton changes optional test discovery.
+          pip3 install triton
+          # A broken install fails here instead of skipping the module.
+          python3 -c "import triton"
+          python3 -m pytest tests/test_mla_prefill_k_cat.py -q --junitxml=mla-k-copy-report.xml
       - name: Upload JUnit report
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
         with:
           name: unit-test-report
-          path: unit-report.xml
+          path: |
+            unit-report.xml
+            mla-k-copy-report.xml
