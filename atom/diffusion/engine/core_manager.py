@@ -95,6 +95,14 @@ class DiffusionCoreManager:
         # spawn, never fork: forking a process that has touched CUDA
         # re-initialises the runtime in the child and crashes.
         context = mp.get_context("spawn")
+        # Drop any inherited kineto registration so these GPU workers register
+        # their own (PyTorch 2.12+/rocprofiler-sdk); else torch.profiler sees 0
+        # GPU events.
+        from atom.rocprofiler_register import (
+            drop_inherited_registration_for_children,
+        )
+
+        drop_inherited_registration_for_children()
         for rank in range(self.config.num_gpus):
             process = context.Process(
                 target=DiffusionEngineCore.run_worker,

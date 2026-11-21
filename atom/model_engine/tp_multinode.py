@@ -206,6 +206,13 @@ def serve_remote_tp_ranks(engine_args) -> int:
     config.parallel_config.tensor_parallel_rank = start
 
     ctx = get_mp_context()
+    # Drop any inherited kineto registration so these GPU workers register their
+    # own (PyTorch 2.12+/rocprofiler-sdk); else torch.profiler sees 0 GPU events.
+    from atom.rocprofiler_register import (
+        drop_inherited_registration_for_children,
+    )
+
+    drop_inherited_registration_for_children()
     procs = []
     for rank in ranks:
         label = f"ModelRunner{rank}/{proc_num}"
