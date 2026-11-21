@@ -1,0 +1,78 @@
+model:
+  model_path: /work/models/Qwen-Image/transformer
+  condition_model_path: /work/models/Qwen-Image
+  config_path: ./configs/model_configs/qwen_image/qwen_image_20b.json
+  condition_model_cfg:
+    max_sequence_length: 64
+    height: 256
+    width: 256
+  ops_implementation:
+    attn_implementation: eager
+    rotary_pos_emb_implementation: eager
+
+data:
+  train_path: /work/data/qwen_image_smoke/train.jsonl
+  train_sample: 32
+  dataloader:
+    type: native
+    num_workers: 0
+    drop_last: true
+    pin_memory: false
+    persistent_workers: false
+    use_background_prefetcher: false
+  datasets_type: mapping
+  data_type: diffusion
+  data_transform: dit_online
+  max_seq_len: 4096
+  text_keys: text
+  source_name: Qwen-Image
+  shuffle: false
+  log_sample: true
+
+train:
+  training_task: online_training
+  accelerator:
+    dp_replicate_size: 1
+    ulysses_size: 1
+    enable_async: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: false
+    offload_config:
+      enable_activation: false
+  gradient_checkpointing:
+    enable: true
+  torch_compile:
+    enable: false
+  broadcast_model_weights_from_rank0: true
+  global_batch_size: 8
+  micro_batch_size: 1
+  bsz_warmup_ratio: 0
+  optimizer:
+    type: adamw
+    lr: 1.0e-5
+    lr_warmup_ratio: 0
+    lr_decay_style: constant
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+  init_device: meta
+  enable_full_determinism: false
+  empty_cache_steps: 1
+  max_steps: 2
+  num_train_epochs: 1
+  eval_steps: 0
+  eval_epochs: 0
+  checkpoint:
+    output_dir: /work/outputs/qwen-image-sft-smoke
+    manager: dcp
+    save_steps: 0
+    save_epochs: 0
+    hf_save_steps: 0
+    hf_save_epochs: 0
+    save_hf_weights: false
+  wandb:
+    enable: false
+    project: Qwen-Image
+    name: amd-mi355x-smoke

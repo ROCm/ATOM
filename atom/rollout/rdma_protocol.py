@@ -1,0 +1,5 @@
+"""Public wire constants shared by ATOM's RDMA weight sender and receiver."""
+
+CMD_END = 0
+CMD_BUCKET = 1
+HEADER_WORDS = 4  # command, metadata bytes, payload bytes, version

@@ -64,9 +64,10 @@ def init_pp_aware_dist_env(
     data_parallel_size: int = 1,
     prefill_context_model_parallel_size: int = 1,
     decode_context_parallel_size: int = 1,
+    disable_custom_all_reduce: bool = False,
 ) -> None:
     """PP-aware distributed init (aiter's init_dist_env pins pp=1)."""
-    set_custom_all_reduce(True)
+    set_custom_all_reduce(not disable_custom_all_reduce)
     init_distributed_environment(
         world_size=world_size,
         rank=global_rank,

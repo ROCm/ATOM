@@ -100,7 +100,6 @@ runs:
             /shared_nfs/huggingface_models \
             /shared_nfs/models \
             /it-share/models \
-            /mnt/raid0/pretrained_model \
             /shared/data/WRH/models \
             /data/models \
             /data/pretrained_model; do

@@ -41,15 +41,20 @@ from aiter.dist.parallel_state import get_world_group
 
 from atom.distributed.group_agreement import group_min_each
 from atom.model_engine.collective_rpc import WeightReloadRefused
+from atom.rollout.rdma_protocol import (
+    CMD_BUCKET as _CMD_BUCKET,
+)
+from atom.rollout.rdma_protocol import (
+    CMD_END as _CMD_END,
+)
+from atom.rollout.rdma_protocol import (
+    HEADER_WORDS as _HEADER_WORDS,
+)
 from atom.rollout.weight_bucket import decode_bucket
 from atom.rollout.weight_updater import _discard_sync_state_on_error, _one_update
 from atom.utils.distributed import utils as dist_utils
 
 logger = logging.getLogger("atom")
-
-_CMD_END = 0
-_CMD_BUCKET = 1
-_HEADER_WORDS = 4  # command, metadata bytes, payload bytes, version
 
 # What a header is held to before anything is allocated for it. Metadata is a
 # JSON entry per tensor, which this ceiling holds hundreds of thousands of, and

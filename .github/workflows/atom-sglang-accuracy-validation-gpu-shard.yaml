@@ -170,7 +170,6 @@ jobs:
             /shared/data/WRH/models
             /shared_nfs/models
             /shared_nfs
-            /mnt/raid0/pretrained_model
             /data/pretrained_model
             /data/models
             /models
@@ -232,7 +231,6 @@ jobs:
             for candidate in \
               /shared_nfs/.cache/huggingface \
               /shared_nfs/huggingface \
-              /mnt/raid0/huggingface \
               /data/huggingface \
               /shared/data/WRH/huggingface; do
               if try_hf_cache_root "$candidate"; then

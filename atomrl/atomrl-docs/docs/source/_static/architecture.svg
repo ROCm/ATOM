@@ -1,0 +1,217 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 738" width="960" height="738">
+  <defs>
+    <linearGradient id="bgG" x1="0" y1="0" x2="0.3" y2="1">
+      <stop offset="0%" stop-color="#0f1729"/>
+      <stop offset="100%" stop-color="#0a0e1a"/>
+    </linearGradient>
+    <!-- Layer gradients -->
+    <linearGradient id="violetG" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#2d1f52"/>
+      <stop offset="100%" stop-color="#1a1235"/>
+    </linearGradient>
+    <linearGradient id="blueG" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#132a4a"/>
+      <stop offset="100%" stop-color="#0e1e38"/>
+    </linearGradient>
+    <linearGradient id="cyanG" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0c3a3f"/>
+      <stop offset="100%" stop-color="#091e28"/>
+    </linearGradient>
+    <linearGradient id="emeraldG" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#134e3a"/>
+      <stop offset="100%" stop-color="#0c2a20"/>
+    </linearGradient>
+    <linearGradient id="roseG" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#4a1525"/>
+      <stop offset="100%" stop-color="#2a0e18"/>
+    </linearGradient>
+    <linearGradient id="amberG" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#4a3a12"/>
+      <stop offset="100%" stop-color="#2a2210"/>
+    </linearGradient>
+    <linearGradient id="tealG" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0e3a38"/>
+      <stop offset="100%" stop-color="#092220"/>
+    </linearGradient>
+    <linearGradient id="slateG" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1e2940"/>
+      <stop offset="100%" stop-color="#141c30"/>
+    </linearGradient>
+    <!-- Chip gradient -->
+    <linearGradient id="chipG" x1="0" y1="0" x2="1" y2="0.5">
+      <stop offset="0%" stop-color="#1a2236"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </linearGradient>
+    <!-- Glow filter -->
+    <filter id="gl">
+      <feGaussianBlur stdDeviation="3" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <!-- Arrow markers -->
+    <marker id="aDown" markerWidth="8" markerHeight="6" refX="4" refY="6" orient="auto">
+      <polygon points="0 0, 4 6, 8 0" fill="#4a5568"/>
+    </marker>
+    <marker id="aR3" markerWidth="8" markerHeight="6" refX="4" refY="6" orient="auto">
+      <polygon points="0 0, 4 6, 8 0" fill="#f59e0b"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="960" height="738" rx="16" fill="url(#bgG)"/>
+
+  <!-- Title -->
+  <text x="480" y="36" text-anchor="middle" fill="#22d3ee" font-size="21" font-weight="700" font-family="'Segoe UI', system-ui, sans-serif" letter-spacing="-0.3">AtomRL Architecture</text>
+  <text x="480" y="54" text-anchor="middle" fill="#6b7a96" font-size="11" font-family="'Segoe UI', system-ui, sans-serif">AMD Native Post-Training Framework for LLMs</text>
+
+  <!-- ═══════ LAYER 0: RL ALGORITHMS ═══════ -->
+  <rect x="30" y="68" width="900" height="52" rx="12" fill="url(#violetG)" stroke="#a78bfa" stroke-width="1.2"/>
+  <text x="480" y="85" text-anchor="middle" fill="#a78bfa" font-size="9.5" font-weight="700" font-family="'Segoe UI', system-ui, sans-serif" letter-spacing="2">RL ALGORITHMS  ·  SDDD</text>
+  <!-- Algo chips -->
+  <rect x="105" y="92" width="90" height="22" rx="6" fill="url(#chipG)" stroke="#7c3aed" stroke-width="0.8"/>
+  <text x="150" y="107" text-anchor="middle" fill="#c4b5fd" font-size="12" font-weight="700" font-family="'Segoe UI', system-ui, sans-serif">GRPO</text>
+  <rect x="315" y="92" width="90" height="22" rx="6" fill="url(#chipG)" stroke="#7c3aed" stroke-width="0.8"/>
+  <text x="360" y="107" text-anchor="middle" fill="#c4b5fd" font-size="12" font-weight="700" font-family="'Segoe UI', system-ui, sans-serif">DAPO</text>
+  <rect x="525" y="92" width="90" height="22" rx="6" fill="url(#chipG)" stroke="#7c3aed" stroke-width="0.8"/>
+  <text x="570" y="107" text-anchor="middle" fill="#c4b5fd" font-size="12" font-weight="700" font-family="'Segoe UI', system-ui, sans-serif">PPO</text>
+  <rect x="735" y="92" width="90" height="22" rx="6" fill="url(#chipG)" stroke="#d97706" stroke-width="0.8"/>
+  <text x="780" y="107" text-anchor="middle" fill="#fbbf24" font-size="12" font-weight="700" font-family="'Segoe UI', system-ui, sans-serif">SDDD</text>
+
+  <!-- Arrow down -->
+  <line x1="480" y1="120" x2="480" y2="138" stroke="#4a5568" stroke-width="1.5" stroke-dasharray="4 3"/>
+
+  <!-- ═══════ LAYER 1: ORCHESTRATION ═══════ -->
+  <rect x="30" y="140" width="900" height="72" rx="12" fill="url(#blueG)" stroke="#3b82f6" stroke-width="1.2"/>
+  <text x="480" y="157" text-anchor="middle" fill="#60a5fa" font-size="9.5" font-weight="700" font-family="'Segoe UI', system-ui, sans-serif" letter-spacing="2">ORCHESTRATION  ·  Ray / Mooncake / MORI</text>
+  <!-- Chips -->
+  <rect x="45" y="164" width="118" height="28" rx="7" fill="url(#chipG)" stroke="#2563eb" stroke-width="0.8"/>
+  <text x="104" y="183" text-anchor="middle" fill="#93c5fd" font-size="10.5" font-weight="600" font-family="'Segoe UI', system-ui, sans-serif">RLTrainer</text>
+
+  <rect x="170" y="164" width="118" height="28" rx="7" fill="url(#chipG)" stroke="#2563eb" stroke-width="0.8"/>
+  <text x="229" y="183" text-anchor="middle" fill="#93c5fd" font-size="10.5" font-weight="600" font-family="'Segoe UI', system-ui, sans-serif">AsyncTrainer</text>
+
+  <rect x="295" y="164" width="118" height="28" rx="7" fill="url(#chipG)" stroke="#2563eb" stroke-width="0.8"/>
+  <text x="354" y="183" text-anchor="middle" fill="#93c5fd" font-size="10.5" font-weight="600" font-family="'Segoe UI', system-ui, sans-serif">WorkerGroups</text>
+
+  <rect x="420" y="164" width="118" height="28" rx="7" fill="url(#chipG)" stroke="#2563eb" stroke-width="0.8"/>
+  <text x="479" y="183" text-anchor="middle" fill="#93c5fd" font-size="10.5" font-weight="600" font-family="'Segoe UI', system-ui, sans-serif">MessageQueue</text>
+
+  <rect x="545" y="164" width="118" height="28" rx="7" fill="url(#chipG)" stroke="#2563eb" stroke-width="0.8"/>
+  <text x="604" y="183" text-anchor="middle" fill="#93c5fd" font-size="10.5" font-weight="600" font-family="'Segoe UI', system-ui, sans-serif">WeightSync</text>
+
+  <rect x="670" y="164" width="130" height="28" rx="7" fill="url(#chipG)" stroke="#d97706" stroke-width="0.8"/>
+  <text x="735" y="183" text-anchor="middle" fill="#fbbf24" font-size="10.5" font-weight="600" font-family="'Segoe UI', system-ui, sans-serif">Mooncake / MORI</text>
+
+  <rect x="807" y="164" width="118" height="28" rx="7" fill="url(#chipG)" stroke="#2563eb" stroke-width="0.8"/>
+  <text x="866" y="183" text-anchor="middle" fill="#93c5fd" font-size="10.5" font-weight="600" font-family="'Segoe UI', system-ui, sans-serif">Checkpoint / Log</text>
+
+  <!-- Dispatch / Collect labels -->
+  <text x="240" y="226" text-anchor="middle" fill="#4a5568" font-size="9" font-weight="600" font-family="'Segoe UI', system-ui, sans-serif">dispatch DataProto</text>
+  <line x1="240" y1="230" x2="240" y2="248" stroke="#4a5568" stroke-width="1.5" stroke-dasharray="4 3"/>
+  <text x="720" y="226" text-anchor="middle" fill="#4a5568" font-size="9" font-weight="600" font-family="'Segoe UI', system-ui, sans-serif">collect DataProto</text>
+  <line x1="720" y1="230" x2="720" y2="248" stroke="#4a5568" stroke-width="1.5" stroke-dasharray="4 3"/>
+
+  <!-- ═══════ LAYER 2 LEFT: ATOM INFERENCE ═══════ -->
+  <rect x="30" y="250" width="440" height="170" rx="12" fill="url(#cyanG)" stroke="#22d3ee" stroke-width="1.2"/>
+  <text x="250" y="270" text-anchor="middle" fill="#22d3ee" font-size="9.5" font-weight="700" font-family="'Segoe UI', system-ui, sans-serif" letter-spacing="2">ATOM  ·  INFERENCE ENGINE</text>
+  <!-- Feature chips -->
+  <rect x="45" y="280" width="125" height="44" rx="7" fill="url(#chipG)" stroke="#0891b2" stroke-width="0.8"/>
+  <text x="108" y="298" text-anchor="middle" fill="#67e8f9" font-size="10" font-weight="700" font-family="'Segoe UI', system-ui, sans-serif">FP8 W8A8</text>
+  <text x="108" y="314" text-anchor="middle" fill="#6b7a96" font-size="8.5" font-family="'Segoe UI', system-ui, sans-serif">Blockwise Quant</text>
+
+  <rect x="180" y="280" width="125" height="44" rx="7" fill="url(#chipG)" stroke="#0891b2" stroke-width="0.8"/>
+  <text x="243" y="298" text-anchor="middle" fill="#67e8f9" font-size="10" font-weight="700" font-family="'Segoe UI', system-ui, sans-serif">FP8 KV-Cache</text>
+  <text x="243" y="314" text-anchor="middle" fill="#6b7a96" font-size="8.5" font-family="'Segoe UI', system-ui, sans-serif">QKV Recalibration</text>
+
+  <rect x="315" y="280" width="140" height="44" rx="7" fill="url(#chipG)" stroke="#0891b2" stroke-width="0.8"/>
+  <text x="385" y="298" text-anchor="middle" fill="#67e8f9" font-size="10" font-weight="700" font-family="'Segoe UI', system-ui, sans-serif">MoE EP</text>
+  <text x="385" y="314" text-anchor="middle" fill="#6b7a96" font-size="8.5" font-family="'Segoe UI', system-ui, sans-serif">MORI Dispatch</text>
+
+  <!-- R3 Recorder -->
+  <rect x="45" y="334" width="196" height="36" rx="7" fill="url(#chipG)" stroke="#f59e0b" stroke-width="0.8"/>
+  <text x="143" y="349" text-anchor="middle" fill="#fbbf24" font-size="9.5" font-weight="700" font-family="'Segoe UI', system-ui, sans-serif">Router Recorder (R3)</text>
+  <text x="143" y="363" text-anchor="middle" fill="#6b7a96" font-size="8" font-family="'Segoe UI', system-ui, sans-serif">Capture MoE routing logits</text>
+
+  <!-- Generation -->
+  <rect x="251" y="334" width="206" height="36" rx="7" fill="url(#chipG)" stroke="#6366f1" stroke-width="0.8"/>
+  <text x="354" y="349" text-anchor="middle" fill="#a5b4fc" font-size="9.5" font-weight="700" font-family="'Segoe UI', system-ui, sans-serif">Generation Interface</text>
+  <text x="354" y="363" text-anchor="middle" fill="#6b7a96" font-size="8" font-family="'Segoe UI', system-ui, sans-serif">Batch rollout + sampling</text>
+
+  <!-- ═══════ LAYER 2 RIGHT: LUMEN TRAINING ═══════ -->
+  <rect x="490" y="250" width="440" height="170" rx="12" fill="url(#roseG)" stroke="#fb7185" stroke-width="1.2"/>
+  <text x="710" y="270" text-anchor="middle" fill="#fb7185" font-size="9.5" font-weight="700" font-family="'Segoe UI', system-ui, sans-serif" letter-spacing="2">LUMEN  ·  TRAINING ENGINE</text>
+
+  <rect x="505" y="280" width="125" height="44" rx="7" fill="url(#chipG)" stroke="#e11d48" stroke-width="0.8"/>
+  <text x="568" y="298" text-anchor="middle" fill="#fda4af" font-size="10" font-weight="700" font-family="'Segoe UI', system-ui, sans-serif">FSDP2</text>
+  <text x="568" y="314" text-anchor="middle" fill="#6b7a96" font-size="8.5" font-family="'Segoe UI', system-ui, sans-serif">Full Shard + FP8</text>
+
+  <rect x="640" y="280" width="140" height="44" rx="7" fill="url(#chipG)" stroke="#e11d48" stroke-width="0.8"/>
+  <text x="710" y="298" text-anchor="middle" fill="#fda4af" font-size="10" font-weight="700" font-family="'Segoe UI', system-ui, sans-serif">Megatron-Core</text>
+  <text x="710" y="314" text-anchor="middle" fill="#6b7a96" font-size="8.5" font-family="'Segoe UI', system-ui, sans-serif">TP / PP / EP / DP</text>
+
+  <rect x="790" y="280" width="125" height="44" rx="7" fill="url(#chipG)" stroke="#e11d48" stroke-width="0.8"/>
+  <text x="853" y="298" text-anchor="middle" fill="#fda4af" font-size="10" font-weight="700" font-family="'Segoe UI', system-ui, sans-serif">FP8 Training</text>
+  <text x="853" y="314" text-anchor="middle" fill="#6b7a96" font-size="8.5" font-family="'Segoe UI', system-ui, sans-serif">E4M3 / E5M2</text>
+
+  <!-- R3 Replayer -->
+  <rect x="505" y="334" width="196" height="36" rx="7" fill="url(#chipG)" stroke="#f59e0b" stroke-width="0.8"/>
+  <text x="603" y="349" text-anchor="middle" fill="#fbbf24" font-size="9.5" font-weight="700" font-family="'Segoe UI', system-ui, sans-serif">Router Replayer (R3)</text>
+  <text x="603" y="363" text-anchor="middle" fill="#6b7a96" font-size="8" font-family="'Segoe UI', system-ui, sans-serif">Inject routing distributions</text>
+
+  <!-- MoE GEMM -->
+  <rect x="711" y="334" width="206" height="36" rx="7" fill="url(#chipG)" stroke="#6366f1" stroke-width="0.8"/>
+  <text x="814" y="349" text-anchor="middle" fill="#a5b4fc" font-size="9.5" font-weight="700" font-family="'Segoe UI', system-ui, sans-serif">MoE Grouped GEMM</text>
+  <text x="814" y="363" text-anchor="middle" fill="#6b7a96" font-size="8" font-family="'Segoe UI', system-ui, sans-serif">AITER Fused Experts</text>
+
+  <!-- Arrow down from engines to FP8-RL layer -->
+  <line x1="480" y1="420" x2="480" y2="450" stroke="#4a5568" stroke-width="1.5" stroke-dasharray="4 3"/>
+
+  <!-- ═══════ R3 ARROW: Recorder → below engines → up into Replayer ═══════ -->
+  <!-- Path: down from Recorder bottom, across below both boxes, up into Replayer bottom -->
+  <path d="M 143 370 L 143 428 L 603 428 L 603 370"
+        fill="none" stroke="#f59e0b" stroke-width="2.5" stroke-dasharray="6 3" filter="url(#gl)"/>
+  <polygon points="603,370 598,378 608,378" fill="#f59e0b"/>
+  <!-- Label badge on the horizontal segment -->
+  <rect x="310" y="418" width="130" height="18" rx="4" fill="#1a1235" stroke="#f59e0b" stroke-width="0.8"/>
+  <text x="375" y="431" text-anchor="middle" fill="#fbbf24" font-size="9" font-weight="700" font-family="'Segoe UI', system-ui, sans-serif" letter-spacing="0.5">R3 Routing Replay</text>
+
+  <!-- ═══════ LAYER 3: FP8-RL QUANTIZATION ═══════ -->
+  <rect x="30" y="452" width="900" height="62" rx="12" fill="url(#amberG)" stroke="#f59e0b" stroke-width="1.2"/>
+  <text x="480" y="470" text-anchor="middle" fill="#fbbf24" font-size="9.5" font-weight="700" font-family="'Segoe UI', system-ui, sans-serif" letter-spacing="2">FP8-RL QUANTIZATION STACK</text>
+
+  <rect x="45" y="478" width="190" height="24" rx="6" fill="url(#chipG)" stroke="#d97706" stroke-width="0.8"/>
+  <text x="140" y="495" text-anchor="middle" fill="#fcd34d" font-size="9.5" font-weight="600" font-family="'Segoe UI', system-ui, sans-serif">FP8 Rollout (W8A8)</text>
+
+  <rect x="245" y="478" width="190" height="24" rx="6" fill="url(#chipG)" stroke="#d97706" stroke-width="0.8"/>
+  <text x="340" y="495" text-anchor="middle" fill="#fcd34d" font-size="9.5" font-weight="600" font-family="'Segoe UI', system-ui, sans-serif">FP8 Weight Quantizer</text>
+
+  <rect x="445" y="478" width="190" height="24" rx="6" fill="url(#chipG)" stroke="#d97706" stroke-width="0.8"/>
+  <text x="540" y="495" text-anchor="middle" fill="#fcd34d" font-size="9.5" font-weight="600" font-family="'Segoe UI', system-ui, sans-serif">FP8 KV-Cache Quant</text>
+
+  <rect x="645" y="478" width="275" height="24" rx="6" fill="url(#chipG)" stroke="#d97706" stroke-width="0.8"/>
+  <text x="783" y="495" text-anchor="middle" fill="#fcd34d" font-size="9.5" font-weight="600" font-family="'Segoe UI', system-ui, sans-serif">Rollout Correction (TIS / MIS)</text>
+
+  <!-- Arrow down -->
+  <line x1="480" y1="514" x2="480" y2="534" stroke="#4a5568" stroke-width="1.5" stroke-dasharray="4 3"/>
+
+  <!-- ═══════ LAYER 4: AITER + MORI ═══════ -->
+  <rect x="30" y="536" width="440" height="68" rx="12" fill="url(#emeraldG)" stroke="#34d399" stroke-width="1.2"/>
+  <text x="250" y="556" text-anchor="middle" fill="#34d399" font-size="9.5" font-weight="700" font-family="'Segoe UI', system-ui, sans-serif" letter-spacing="1.5">AITER  ·  KERNEL PROVIDER</text>
+  <text x="250" y="574" text-anchor="middle" fill="#8892a8" font-size="10.5" font-family="'Segoe UI', system-ui, sans-serif">ASM &gt; CK &gt; Triton fallback chain</text>
+  <text x="250" y="590" text-anchor="middle" fill="#8892a8" font-size="10.5" font-family="'Segoe UI', system-ui, sans-serif">Attention · GEMM · MoE · Norm · RoPE</text>
+
+  <rect x="490" y="536" width="440" height="68" rx="12" fill="url(#tealG)" stroke="#2dd4bf" stroke-width="1.2"/>
+  <text x="710" y="556" text-anchor="middle" fill="#2dd4bf" font-size="9.5" font-weight="700" font-family="'Segoe UI', system-ui, sans-serif" letter-spacing="1.5">MORI  ·  COMMUNICATION</text>
+  <text x="710" y="574" text-anchor="middle" fill="#8892a8" font-size="10.5" font-family="'Segoe UI', system-ui, sans-serif">MORI-CCL (AG, RS, AR) + MORI-EP</text>
+  <text x="710" y="590" text-anchor="middle" fill="#8892a8" font-size="10.5" font-family="'Segoe UI', system-ui, sans-serif">Device-side RDMA · FP8 · AINIC · CX-7</text>
+
+  <!-- Arrow down -->
+  <line x1="480" y1="604" x2="480" y2="626" stroke="#4a5568" stroke-width="1.5" stroke-dasharray="4 3"/>
+
+  <!-- ═══════ LAYER 5: HARDWARE ═══════ -->
+  <rect x="30" y="628" width="900" height="56" rx="12" fill="url(#slateG)" stroke="#e11d48" stroke-width="1.2"/>
+  <text x="480" y="647" text-anchor="middle" fill="#fb7185" font-size="9.5" font-weight="700" font-family="'Segoe UI', system-ui, sans-serif" letter-spacing="2">HARDWARE</text>
+  <text x="480" y="670" text-anchor="middle" fill="#e2e8f0" font-size="15" font-weight="700" font-family="'Segoe UI', system-ui, sans-serif">AMD Instinct MI300X / MI355X  ·  ROCm</text>
+
+  <!-- Footer -->
+  <text x="480" y="708" text-anchor="middle" fill="#4a5568" font-size="9.5" font-style="italic" font-family="'Segoe UI', system-ui, sans-serif">All cross-worker communication via DataProto  ·  Ray-orchestrated  ·  AMD-native</text>
+</svg>

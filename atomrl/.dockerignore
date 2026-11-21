@@ -1,0 +1,28 @@
+# Keep .git — submodules use .git/modules/ references that must be preserved.
+# Only exclude .github (CI workflows, not needed at runtime).
+.github
+.pytest_cache
+.mypy_cache
+.ruff_cache
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+dist
+build
+.eggs
+
+output/DAPO/*.log
+output/DAPO/metrics/*.json
+output/DAPO/metrics/*.csv
+output/DAPO/dashboard.html
+
+wandb/
+outputs/
+checkpoints/
+
+atomrl-docs/docs/build/
+_site/
+
+*.egg
+*.so
