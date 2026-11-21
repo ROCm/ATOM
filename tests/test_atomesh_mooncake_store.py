@@ -98,10 +98,61 @@ P_D_PRODUCER = (
 )
 
 
-def free_port():
-    with socket.socket() as sock:
-        sock.bind((HOST, 0))
-        return sock.getsockname()[1]
+# The Store ports a run fixes: owner i's service port is OWNER_PORT + i (28
+# owners at most, or the launcher refuses), pool p's metadata and metrics ports
+# METADATA_PORT and METRICS_PORT + 100 x p. Pool p's master is at the drawn
+# port + 100 x p; no case here starts more than POOLS pools on it.
+OWNER_PORT, METADATA_PORT, METRICS_PORT = 50152, 50180, 50190
+POOLS = 2
+FIXED_PORTS = frozenset(
+    [OWNER_PORT + owner for owner in range(28)]
+    + [
+        base + 100 * pool
+        for base in (METADATA_PORT, METRICS_PORT)
+        for pool in range(POOLS)
+    ]
+)
+
+
+def master_ports(port):
+    """Each pool's master port when the first pool's is ``port``."""
+    return [port + 100 * pool for pool in range(POOLS)]
+
+
+def master_port_is_clear(port):
+    """No pool's master port is out of range or one of the fixed ports."""
+    ports = master_ports(port)
+    return ports[-1] <= 65535 and FIXED_PORTS.isdisjoint(ports)
+
+
+def reusable_socket():
+    sock = socket.socket()
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    return sock
+
+
+def hold_master_ports():
+    """A clear master port, and sockets holding every pool's master port.
+
+    Each is bound with SO_REUSEADDR and not listening: the stub master, which
+    sets SO_REUSEADDR too, still binds and listens on it, while no bind to port
+    0 or connect elsewhere is handed it in the meantime. A pool's port another
+    process holds fails the bind, and the port is drawn again.
+    """
+    while True:
+        held = [reusable_socket()]
+        held[0].bind((HOST, 0))
+        port = held[0].getsockname()[1]
+        try:
+            if master_port_is_clear(port):
+                for other in master_ports(port)[1:]:
+                    held.append(reusable_socket())
+                    held[-1].bind((HOST, other))
+                return port, held
+        except OSError:
+            pass
+        for sock in held:
+            sock.close()
 
 
 def prefixed_lines(stdout, prefix):
@@ -135,7 +186,9 @@ class MooncakeStoreTest(unittest.TestCase):
             (device / "ports/1/state").write_text("4: ACTIVE\n")
             (device / "device").mkdir()
             (device / "device/numa_node").write_text(f"{index // 4}\n")
-        self.master_port = free_port()
+        self.master_port, held = hold_master_ports()
+        for sock in held:
+            self.addCleanup(sock.close)
         self.calls = self.root / "calls"
         self.calls.touch()
         self.path = f"{self.bin_dir}:{os.environ['PATH']}"
@@ -201,9 +254,9 @@ class MooncakeStoreTest(unittest.TestCase):
                 "MODEL_PATH": "/models/m",
                 "HIP_VISIBLE_DEVICES": "0,1,2,3",
                 "ATOMESH_MOONCAKE_MASTER_PORT": str(self.master_port),
-                "ATOMESH_MOONCAKE_METADATA_PORT": "50180",
-                "ATOMESH_MOONCAKE_METRICS_PORT": "50190",
-                "ATOMESH_MOONCAKE_OWNER_PORT": "50152",
+                "ATOMESH_MOONCAKE_METADATA_PORT": str(METADATA_PORT),
+                "ATOMESH_MOONCAKE_METRICS_PORT": str(METRICS_PORT),
+                "ATOMESH_MOONCAKE_OWNER_PORT": str(OWNER_PORT),
                 "MOONCAKE_STORE": "1",
                 **env,
             },
@@ -608,6 +661,40 @@ done
             MOONCAKE_STORE_OWNERS=owners(29),
         )
         self.assertIn("ATOMESH_MOONCAKE_METADATA_PORT + 100 x 0 too", result.stderr)
+
+    def test_every_master_port_the_setup_may_draw_passes_the_port_check(self):
+        # Only a draw in these ranges can put a pool's master port on a fixed
+        # port or past 65535; any other draw passes the check.
+        near_fixed = range(min(FIXED_PORTS) - 100 * (POOLS - 1), max(FIXED_PORTS) + 1)
+        near_top = range(65536 - 100 * POOLS, 65536)
+        drawable = [p for p in [*near_fixed, *near_top] if master_port_is_clear(p)]
+        self.assertTrue(drawable)
+        for env in (
+            {
+                "MOONCAKE_STORE_POOLS": "per_nic",
+                "MOONCAKE_STORE_OWNERS": "0:8:rdma0;0:8:rdma1",
+            },
+            {"MOONCAKE_STORE_OWNERS": ";".join(["0:1"] * 28)},
+        ):
+            with self.subTest(env=env):
+                result = self.run_shell(
+                    "plan_mooncake_store_owners\nplan_mooncake_store_pools\n"
+                    f"for port in {' '.join(map(str, drawable))}; do\n"
+                    "  ATOMESH_MOONCAKE_MASTER_PORT=${port}\n"
+                    '  ( check_mooncake_store_ports ) || echo "REFUSED ${port}"\n'
+                    "done\n",
+                    **env,
+                )
+                self.assertNotIn("REFUSED", result.stdout, result.stderr)
+
+    def test_every_pools_master_port_is_held_from_the_draw_on(self):
+        for port in master_ports(self.master_port):
+            with (
+                self.subTest(port=port),
+                socket.socket() as sock,
+                self.assertRaises(OSError),
+            ):
+                sock.bind((HOST, port))
 
     def test_decode_owners_need_their_own_nodes_and_one_prefill_node(self):
         decode_owners = {"MOONCAKE_STORE_DECODE_OWNERS": "0:8:rdma0"}

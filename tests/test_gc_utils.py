@@ -139,13 +139,26 @@ def test_unfreezing_makes_the_startup_heap_reclaimable_again():
 def test_freezing_twice_is_additive_and_harmless():
     """The disaggregated decode path freezes a second time, once its block pool
     exists -- it is built later in `DecodeEngineCore.__init__`, after the base
-    freeze has already run."""
+    freeze has already run.
+
+    Checked by membership, not by `gc.get_freeze_count()`: that count is
+    process-wide, so another thread dropping objects the first freeze took
+    lowers it by as much as the second freeze adds. `gc.get_objects()` lists
+    only what is not frozen, and only this test holds `later`."""
+
+    def tracked(obj):
+        return any(o is obj for o in gc.get_objects())
+
+    dropped = [[] for _ in range(256)]
     freeze_gc_heap("first")
-    first = gc.get_freeze_count()
+    # What another thread may do at any time: free objects the first freeze
+    # took. The frozen count falls by 257, more than the second freeze adds.
+    del dropped
     later = [object() for _ in range(64)]
+    assert tracked(later), "control: a new list is not frozen yet"
     freeze_gc_heap("second")
 
-    assert gc.get_freeze_count() > first, "the second freeze caught nothing"
+    assert not tracked(later), "the second freeze caught nothing"
     assert len(later) == 64  # and did not disturb what it froze
 
 
