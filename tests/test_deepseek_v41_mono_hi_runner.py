@@ -289,7 +289,7 @@ def test_postprocess_takes_the_heads_verdict_and_the_broadcast_ids(
         prev_batch=None,
         prev_rejected_num=None,
         prev_bonus_num=None,
-        prepare_sampled_ids=lambda *a, **kw: ({7: (3,), 8: (5,), -1: 1}, None),
+        prepare_sampled_ids=lambda *a, **kw: ({7: (3,), 8: (5,), -1: 1}, None, None),
         spec_status_queue=SimpleNamespace(send=lambda t, **kw: sent.append(t)),
         input_ids=SimpleNamespace(gpu=torch.zeros(16, dtype=torch.int32)),
     )

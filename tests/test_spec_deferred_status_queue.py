@@ -146,6 +146,7 @@ def _processor_for(*, kv_config: dict, family: Family) -> tokenIDProcessor:
         ),
         attn_family=family,
         device="cuda",
+        _return_routed_experts=False,
     )
     with (
         mock.patch("atom.model_engine.model_runner.CpuGpuBuffer"),

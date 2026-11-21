@@ -156,3 +156,90 @@ def test_release_kv_cache_leaves_the_indexer_rebindable(monkeypatch):
     assert isinstance(indexer.kv_cache, list)
     assert indexer.kv_cache[0].numel() == 0
     owner.indexer.k_cache.kv_cache[0] = torch.empty(1)  # what waking does
+
+
+def test_release_kv_cache_unbinds_the_routed_experts_capture(monkeypatch):
+    """Sleep frees the capture buffer with the KV cache: its MoE views go with
+    the KV views, and the runner's reference with them."""
+    from atom.model_ops.fused_moe.routed_experts_capturer import (
+        ROUTES_VIEW_ATTR,
+        RoutedExpertsCapturer,
+    )
+
+    capturer = RoutedExpertsCapturer(num_slots=4, num_layers=2, top_k=2, device="cpu")
+    moe = nn.Module()
+    capturer.bind(moe, 1)
+    runner = SimpleNamespace(
+        kv_cache=torch.empty(1),
+        config=SimpleNamespace(num_kvcache_blocks=7),
+        model=nn.Sequential(moe),
+        label="test",
+        _routed_experts_capturer=capturer,
+    )
+    runner._get_models_with_kv = lambda: [runner.model]
+    monkeypatch.setattr(memory_manager, "set_kv_cache_data", lambda _value: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    MemoryManagerMixin._release_kv_cache(runner)
+
+    assert getattr(moe, ROUTES_VIEW_ATTR) is None
+    assert runner._routed_experts_capturer is None
+
+
+def test_wake_rebinds_a_new_routed_experts_capture(monkeypatch):
+    """Wake's `allocate_kv_cache` binds a fresh capturer at the slept block
+    count, and the MoE layer captures into it rather than the freed one.
+
+    The stub mirrors ``ModelRunner._bind_routed_experts_layers`` with plain
+    torch so this lifecycle check runs in CI without aiter. The real bind is
+    covered by ``test_only_tp_rank0_binds_the_capture_buffer``.
+    """
+    from atom.model_ops.fused_moe.routed_experts_capturer import (
+        ROUTES_VIEW_ATTR,
+        RoutedExpertsCapturer,
+    )
+
+    moe = nn.Module()
+    runner = SimpleNamespace(
+        kv_cache=torch.empty(1),
+        config=SimpleNamespace(num_kvcache_blocks=7),
+        model=nn.Sequential(moe),
+        label="test",
+        rank=0,
+        block_size=2,
+        device="cpu",
+    )
+    runner._get_models_with_kv = lambda: [runner.model]
+    allocated = []
+
+    def allocate_kv_cache(num_blocks):
+        # Same steps as ``ModelRunner._bind_routed_experts_layers``; kept
+        # local so this file does not import ``model_runner`` (aiter).
+        allocated.append(num_blocks)
+        capturer = RoutedExpertsCapturer(
+            num_slots=num_blocks * runner.block_size,
+            num_layers=2,
+            top_k=2,
+            device=runner.device,
+        )
+        capturer.bind(moe, 1)
+        runner._routed_experts_capturer = capturer
+
+    runner.allocate_kv_cache = allocate_kv_cache
+    monkeypatch.setattr(memory_manager, "set_kv_cache_data", lambda _value: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (0, 1))
+
+    runner.allocate_kv_cache(7)
+    slept = runner._routed_experts_capturer
+    assert isinstance(slept, RoutedExpertsCapturer)
+
+    MemoryManagerMixin._release_kv_cache(runner)
+    MemoryManagerMixin._resume_kv_cache(runner)
+
+    assert allocated == [7, 7]
+    woken = runner._routed_experts_capturer
+    assert isinstance(woken, RoutedExpertsCapturer) and woken is not slept
+    assert woken.buffer.shape == slept.buffer.shape
+    assert getattr(moe, ROUTES_VIEW_ATTR).data_ptr() == woken.buffer[:, 1].data_ptr()
+    assert runner._kv_cache_num_blocks is None

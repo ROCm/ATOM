@@ -77,6 +77,7 @@ def _atom_config(**overrides):
         "is_multinode_tp": False,
         "enable_tbo": False,
         "enable_tbo_decode": False,
+        "enable_return_routed_experts": False,
         "compilation_config": SimpleNamespace(level=3, cudagraph_mode=None),
         "kv_cache_dtype": "fp8",
         "index_cache_dtype": "bf16",
@@ -138,6 +139,7 @@ def test_the_offload_connector_is_served_under_any_name_the_factory_builds(
         ({"hf_config": SimpleNamespace(**{**_HF, "ple_layer_ids": [3]})}, "PLE layers"),
         # a connector whose kernels can hold the CUs the resident programs wait on
         ({"kv_transfer_config": {"kv_connector": "moriio"}}, "KV connector moriio"),
+        ({"enable_return_routed_experts": True}, "routed-expert capture"),
     ],
 )
 def test_other_deployments_are_refused(native, overrides, reason):

@@ -112,6 +112,37 @@ def test_dummy_forward_participates_in_staging_lifetime():
     )
 
 
+def test_output_less_forward_gathers_routes_before_the_aligning_propose():
+    """The aligning propose rewrites this forward's slot_mapping in place, so
+    the routes of a pure middle chunk must be gathered ahead of it."""
+    method = _method("forward")
+    (gather,) = _attribute_calls(method, "_gather_routed_experts_step")
+    (align,) = [
+        call
+        for call in _attribute_calls(method, "propose_draft_token_ids")
+        if any(kw.arg == "align_only" for kw in call.keywords)
+    ]
+    assert gather.lineno < align.lineno
+
+
+def test_postprocess_gathers_routes_before_the_event_the_token_copy_waits_on():
+    """The token copy waits on `forward_done_event`; a gather queued after its
+    record would race the copy that carries its rows to the host."""
+    method = _method("postprocess")
+    (gather,) = _attribute_calls(method, "_gather_routed_experts_step")
+    records = [
+        call
+        for call in ast.walk(method)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "record"
+        and isinstance(call.func.value, ast.Attribute)
+        and call.func.value.attr == "forward_done_event"
+    ]
+    assert len(records) == 1
+    assert gather.lineno < records[0].lineno
+
+
 def test_draft_lockstep_reads_pipeline_parallel_not_deferred_output():
     """Only PP may be excluded from DP draft lockstep, and only by name.
 

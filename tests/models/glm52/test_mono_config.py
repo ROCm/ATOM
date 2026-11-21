@@ -94,6 +94,7 @@ def _served_tp4_fp8_config(*, speculative_config, compilation_config=None):
         enable_expert_parallel=False,
         enable_tbo=False,
         enable_tbo_decode=False,
+        enable_return_routed_experts=False,
         speculative_config=speculative_config,
         kv_cache_dtype="fp8",
         compilation_config=compilation_config,
@@ -163,6 +164,13 @@ def test_served_deployment_accepts_every_admitted_query_length(
     assert computed == query_length
     atom_config = _served_tp4_fp8_config(speculative_config=speculative_config)
     assert config_refusal(atom_config) is None
+
+
+def test_routed_expert_capture_is_refused():
+    # The layer kernel routes in-kernel and never writes the capture.
+    atom_config = _served_tp4_fp8_mtp4_config()
+    atom_config.enable_return_routed_experts = True
+    assert config_refusal(atom_config) == "routed-expert capture"
 
 
 @pytest.mark.parametrize("num_speculative_tokens", [1, 2])
