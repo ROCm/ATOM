@@ -116,11 +116,11 @@ impl Pipeline {
                 Ok(t) => t,
                 Err(e) => return self.record_chat_err(&model, start, e),
             };
-        let placement = match self.plan_for(&payload, &resp_ctx).await {
+        let mut placement = match self.plan_for(&payload, &resp_ctx).await {
             Ok(p) => p,
             Err(e) => return self.record_chat_err(&model, start, e),
         };
-        let guards = make_load_guards(&placement, resp_ctx.headers.as_ref());
+        let guards = make_load_guards(&mut placement, resp_ctx.headers.as_ref());
         let stream = match self.engine.dispatch(&placement, &mut payload).await {
             Ok(s) => s,
             Err(e) => return self.record_chat_err(&model, start, engine_err_to_response(e)),
@@ -171,11 +171,11 @@ impl Pipeline {
                 Ok(t) => t,
                 Err(e) => return self.record_generate_err(&model_for_metric, start, e),
             };
-        let placement = match self.plan_for(&payload, &resp_ctx).await {
+        let mut placement = match self.plan_for(&payload, &resp_ctx).await {
             Ok(p) => p,
             Err(e) => return self.record_generate_err(&model_for_metric, start, e),
         };
-        let guards = make_load_guards(&placement, resp_ctx.headers.as_ref());
+        let guards = make_load_guards(&mut placement, resp_ctx.headers.as_ref());
         let stream = match self.engine.dispatch(&placement, &mut payload).await {
             Ok(s) => s,
             Err(e) => {
@@ -221,8 +221,8 @@ impl Pipeline {
         }
 
         let (mut payload, resp_ctx) = prepare::prepare_chat(req, headers, model_id, &components)?;
-        let placement = self.plan_for(&payload, &resp_ctx).await?;
-        let _guards = make_load_guards(&placement, resp_ctx.headers.as_ref());
+        let mut placement = self.plan_for(&payload, &resp_ctx).await?;
+        let _guards = make_load_guards(&mut placement, resp_ctx.headers.as_ref());
         let stream = self
             .engine
             .dispatch(&placement, &mut payload)
@@ -282,17 +282,28 @@ impl Pipeline {
     }
 }
 
-fn make_load_guards(plan: &PlacementPlan, headers: Option<&HeaderMap>) -> Vec<WorkerLoadGuard> {
+fn make_load_guards(plan: &mut PlacementPlan, headers: Option<&HeaderMap>) -> Vec<WorkerLoadGuard> {
     match plan {
         PlacementPlan::Single { worker, .. } => {
             vec![WorkerLoadGuard::new(worker.clone(), headers)]
         }
         PlacementPlan::Pair {
-            prefill, decode, ..
-        } => vec![
-            WorkerLoadGuard::new(prefill.clone(), headers),
-            WorkerLoadGuard::new(decode.clone(), headers),
-        ],
+            prefill,
+            decode,
+            prefill_load,
+            decode_load,
+            ..
+        } => {
+            let prefill_guard = match prefill_load.take() {
+                Some(reservation) => WorkerLoadGuard::adopt(reservation),
+                None => WorkerLoadGuard::new(prefill.clone(), headers),
+            };
+            let decode_guard = match decode_load.take() {
+                Some(reservation) => WorkerLoadGuard::adopt(reservation),
+                None => WorkerLoadGuard::new(decode.clone(), headers),
+            };
+            vec![prefill_guard, decode_guard]
+        }
     }
 }
 

@@ -257,6 +257,7 @@ pub mod names {
     pub const WORKER_CONNECTIONS_ACTIVE: &str = "mesh_worker_connections_active";
     pub const WORKER_REQUESTS_ACTIVE: &str = "mesh_worker_requests_active";
     pub const WORKER_PREFILL_TOKENS: &str = "mesh_worker_prefill_tokens";
+    pub const WORKER_DECODE_KV_TOKENS: &str = "mesh_worker_decode_kv_tokens";
     pub const WORKER_HEALTH: &str = "mesh_worker_health";
     pub const WORKER_HEALTH_CHECKS_TOTAL: &str = "mesh_worker_health_checks_total";
     pub const WORKER_SELECTION_TOTAL: &str = "mesh_worker_selection_total";
@@ -433,6 +434,12 @@ pub const METRIC_INVENTORY: &[MetricSpec] = &[
         name: names::WORKER_PREFILL_TOKENS,
         kind: MetricKind::Gauge,
         help: "Prompt tokens charged to a worker (url@rank) whose prefill has not finished; only HTTP P/D prefills and streaming HTTP requests with counted or estimated tokens are charged",
+        status: MetricStatus::Active,
+    },
+    MetricSpec {
+        name: names::WORKER_DECODE_KV_TOKENS,
+        kind: MetricKind::Gauge,
+        help: "KV tokens reserved on a worker (url@rank) from selection until its decode response finishes, including prompt tokens and completion tokens reported in usage frames",
         status: MetricStatus::Active,
     },
     MetricSpec {
