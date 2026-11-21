@@ -34,6 +34,10 @@ from atom.model_ops.layernorm import (
     fused_allreduce_gemma_rms_norm_mxfp8_quant,
     fused_allreduce_gemma_rms_norm_mxfp8_supported,
     fused_allreduce_gemma_rms_norm_quant,
+    sp_allreduce_add_residual,
+    sp_allreduce_supported,
+    sp_fused_allreduce_gemma_rms_norm,
+    sp_fused_allreduce_gemma_rms_norm_mxfp8_quant,
 )
 from atom.model_ops.linear import (
     MergedColumnParallelLinear,
@@ -687,16 +691,32 @@ class MiniMaxM3DecoderLayer(nn.Module):
         # Resolved here, not in forward: the arch probe must stay out of the graph.
         self.mxfp8_fused_ar = fused_allreduce_gemma_rms_norm_mxfp8_supported()
 
+    def sp_ar_capable(self) -> bool:
+        """Whether both of this layer's all-reduce + norms take the sequence-parallel residual
+        ops: bf16 or native-MXFP8 outputs, not the per-token FP8 one."""
+        return not (
+            _linear_consumes_per_token_fp8(self.self_attn.qkv_proj)
+            or (
+                not self.is_moe_layer
+                and _linear_consumes_per_token_fp8(self.mlp.gate_up_proj)
+            )
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         capture_aux: bool = False,
+        sp_ar: bool = False,
     ) -> (
         tuple[torch.Tensor, torch.Tensor]
         | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     ):
+        """``sp_ar``: the residual stream is sequence-parallel at prefill sizes; the model
+        sets it for every layer of a forward or for none."""
+        if sp_ar:
+            return self._forward_sp_ar(positions, hidden_states, residual)
         hidden_states_scale = None
         fuse_input_ar_rmsnorm_quant = _linear_consumes_per_token_fp8(
             self.self_attn.qkv_proj
@@ -772,6 +792,50 @@ class MiniMaxM3DecoderLayer(nn.Module):
             return hidden_states, residual, aux_hidden_state
         return hidden_states, residual
 
+    def _forward_sp_ar(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """forward with the sequence-parallel residual ops (bit-identical normed outputs)."""
+        hidden_states_scale = None
+        mxfp8 = self.mxfp8_fused_ar
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        elif mxfp8 and _linear_consumes_mxfp8(self.self_attn.qkv_proj):
+            hidden_states, hidden_states_scale, residual = (
+                sp_fused_allreduce_gemma_rms_norm_mxfp8_quant(
+                    hidden_states, residual, self.input_layernorm
+                )
+            )
+        else:
+            hidden_states, residual = sp_fused_allreduce_gemma_rms_norm(
+                hidden_states, residual, self.input_layernorm
+            )
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            hidden_states_scale=hidden_states_scale,
+        )
+        if (
+            mxfp8
+            and not self.is_moe_layer
+            and _linear_consumes_mxfp8(self.mlp.gate_up_proj)
+        ):
+            hidden_states, hidden_states_scale, residual = (
+                sp_fused_allreduce_gemma_rms_norm_mxfp8_quant(
+                    hidden_states, residual, self.post_attention_layernorm
+                )
+            )
+            return self.mlp(hidden_states, x_scale=hidden_states_scale), residual
+        hidden_states, residual = sp_fused_allreduce_gemma_rms_norm(
+            hidden_states, residual, self.post_attention_layernorm
+        )
+        ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
+        return ffn(hidden_states), residual
+
     @staticmethod
     def aux_hidden_state(output: tuple) -> torch.Tensor:
         """This layer's output as a DSpark draft reads it: the residual stream
@@ -784,6 +848,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
         """
         hidden_states, residual = output[0], output[1]
         if get_tensor_model_parallel_world_size() > 1:
+            if MiniMaxM3Model.sp_ar_enabled:
+                # The residual may be sequence-parallel (prefill sizes): the op gathers it.
+                return sp_allreduce_add_residual(hidden_states, residual)
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         return hidden_states + residual
 
@@ -791,6 +858,10 @@ class MiniMaxM3DecoderLayer(nn.Module):
 @token_graph
 @support_torch_compile
 class MiniMaxM3Model(nn.Module):
+    # Sequence-parallel residual in effect (decided at construction; read by the DSpark taps,
+    # whose extract is a static method of the layer).
+    sp_ar_enabled: ClassVar[bool] = False
+
     def __init__(
         self,
         atom_config: Config,
@@ -840,6 +911,20 @@ class MiniMaxM3Model(nn.Module):
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
+        # Sequence-parallel residual at prefill sizes: TP only, one PP stage
+        # (the residual crosses no stage boundary), every layer on the bf16 / MXFP8 AR + norm ops,
+        # and no TBO (its micro-batches would interleave the owner-row split).
+        self.sp_ar = bool(
+            sp_allreduce_supported()
+            and get_tensor_model_parallel_world_size() > 1
+            and get_pp_group().world_size == 1
+            and not getattr(atom_config, "enable_tbo", False)
+            and all(
+                isinstance(layer, MiniMaxM3DecoderLayer) and layer.sp_ar_capable()
+                for layer in self.layers
+            )
+        )
+        MiniMaxM3Model.sp_ar_enabled = self.sp_ar
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -864,12 +949,18 @@ class MiniMaxM3Model(nn.Module):
             residual = intermediate_tensors["residual"]
 
         aux_hidden_states: list[torch.Tensor] = []
+        # Eagle3's capture clones the residual stream, which the sequence-parallel one is not.
+        sp_ar = self.sp_ar and not self.aux_hidden_state_layers
         for idx in range(self.start_layer, self.end_layer):
             if idx in self.aux_hidden_state_layers:
                 hidden_states, residual, aux_hidden_state = self.layers[idx](
                     positions, hidden_states, residual, capture_aux=True
                 )
                 aux_hidden_states.append(aux_hidden_state)
+            elif sp_ar:
+                hidden_states, residual = self.layers[idx](
+                    positions, hidden_states, residual, sp_ar=True
+                )
             else:
                 hidden_states, residual = self.layers[idx](
                     positions, hidden_states, residual
@@ -880,9 +971,14 @@ class MiniMaxM3Model(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
-        hidden_states, _ = fused_allreduce_gemma_rms_norm(
-            hidden_states, residual, self.norm
-        )
+        if sp_ar:
+            hidden_states, _ = sp_fused_allreduce_gemma_rms_norm(
+                hidden_states, residual, self.norm
+            )
+        else:
+            hidden_states, _ = fused_allreduce_gemma_rms_norm(
+                hidden_states, residual, self.norm
+            )
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
