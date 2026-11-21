@@ -107,6 +107,8 @@ struct Subscription {
     task: JoinHandle<()>,
     /// The share group of the rank's device pool, if it is in one.
     share: Option<String>,
+    /// Whether the rank keeps some of its blocks private.
+    shares_part: bool,
 }
 
 impl Subscription {
@@ -117,9 +119,16 @@ impl Subscription {
         Some((holder.lane(), self.status.lock().trust == Trust::Exact))
     }
 
-    /// The rank's share group and lane while its stream is followed.
-    fn shared(&self) -> Option<(&str, Lane)> {
-        Some((self.share.as_deref()?, self.events()?.0))
+    /// The rank's share group, its lane and the lane of the blocks its group copies from it,
+    /// all of them unless it keeps some private, while its stream is followed.
+    fn shared(&self) -> Option<(&str, Lane, Lane)> {
+        let (lane, _) = self.events()?;
+        let shared = if self.shares_part {
+            self.holder.as_ref()?.shared_lane()?
+        } else {
+            lane.clone()
+        };
+        Some((self.share.as_deref()?, lane, shared))
     }
 }
 
@@ -159,6 +168,9 @@ pub struct SourceStatus {
     pub dropped_batches: u64,
     /// The rank's blocks in the router's index; null when its partition had no lane left.
     pub indexed_blocks: Option<u64>,
+    /// Those its share group copies from, where it keeps some private; null unless it has
+    /// a lane for them.
+    pub shared_blocks: Option<u64>,
 }
 
 impl KvEventMonitor {
@@ -199,10 +211,19 @@ impl KvEventMonitor {
             ..Default::default()
         }));
         let partition = self.partition(model_id, pool, source.block_size);
-        let holder = partition.hold(status.clone()).map(Arc::new);
         let share = source.share_group();
+        let shares_part = share.is_some() && source.shares_part();
+        let mut holder = partition.hold(status.clone());
+        if shares_part {
+            holder = holder.map(Holder::sharing);
+        }
+        let holder = holder.map(Arc::new);
         match &holder {
-            Some(_) => status.lock().indexed_blocks = Some(0),
+            Some(holder) => {
+                let mut status = status.lock();
+                status.indexed_blocks = Some(0);
+                status.shared_blocks = holder.shared_lane().map(|_| 0);
+            }
             None => warn!(
                 worker,
                 model_id,
@@ -223,6 +244,7 @@ impl KvEventMonitor {
             holder,
             task,
             share,
+            shares_part,
         };
         let earlier = self.subscriptions.insert(worker.into(), subscription);
         if earlier.is_some_and(|earlier| earlier.share.is_some()) {
@@ -341,54 +363,51 @@ impl PrefixMatchProvider for KvEventMonitor {
         if self.share_weight() == 0.0 || self.shared_ranks.load(Ordering::Relaxed) < 2 {
             return None;
         }
-        let ranks: Vec<(String, String, Lane)> = (self.subscriptions.iter())
+        let ranks: Vec<(String, String, Lane, Lane)> = (self.subscriptions.iter())
             .filter_map(|s| {
-                let (share, lane) = s.shared()?;
-                Some((s.key().clone(), share.to_string(), lane))
+                let (share, lane, shared) = s.shared()?;
+                Some((s.key().clone(), share.to_string(), lane, shared))
             })
             .collect();
-        // The lanes of each group's followed ranks, a group's ranks in one partition, and
+        // The lanes each group's followed ranks share, a group's ranks in one partition, and
         // each rank's group.
         let mut groups: Vec<(&str, Vec<Lane>)> = Vec::new();
         let mut group_of = Vec::with_capacity(ranks.len());
-        for (_, share, lane) in &ranks {
+        for (_, share, _, shared) in &ranks {
             let same = |(key, lanes): &(&str, Vec<Lane>)| {
-                key == share && Arc::ptr_eq(&lanes[0].0, &lane.0)
+                key == share && Arc::ptr_eq(&lanes[0].0, &shared.0)
             };
             group_of.push(match groups.iter().position(same) {
                 Some(g) => {
-                    groups[g].1.push(lane.clone());
+                    groups[g].1.push(shared.clone());
                     g
                 }
                 None => {
-                    groups.push((share.as_str(), vec![lane.clone()]));
+                    groups.push((share.as_str(), vec![shared.clone()]));
                     groups.len() - 1
                 }
             });
         }
-        // The workers whose rank shares its group with another, and those groups.
-        let (mut asked, mut wanted) = (Vec::new(), Vec::new());
+        // The workers whose rank shares its group with another, each with its own lane and
+        // those its group shares.
+        let (mut asked, mut lanes) = (Vec::new(), Vec::new());
         for (i, worker) in workers.iter().enumerate() {
             let Some(rank) = ranks.iter().position(|(url, ..)| url == worker.url()) else {
                 continue;
             };
-            let g = group_of[rank];
-            if groups[g].1.len() > 1 {
-                let at = wanted.iter().position(|&w| w == g).unwrap_or_else(|| {
-                    wanted.push(g);
-                    wanted.len() - 1
-                });
-                asked.push((i, at));
+            let group = &groups[group_of[rank]].1;
+            if group.len() > 1 {
+                asked.push(i);
+                lanes.push([group.as_slice(), &[ranks[rank].2.clone()]].concat());
             }
         }
         if asked.is_empty() {
             return None;
         }
-        let lanes: Vec<Vec<Lane>> = wanted.iter().map(|&g| groups[g].1.clone()).collect();
         let held = match_groups(tokens, &lanes);
         let mut shared = device.to_vec();
-        for (i, at) in asked {
-            shared[i] = shared[i].map(|own| own.max(held[at]));
+        for (i, held) in asked.into_iter().zip(held) {
+            shared[i] = shared[i].map(|own| own.max(held));
         }
         Some(shared)
     }
@@ -581,7 +600,7 @@ impl Rank {
             reset,
         );
         if let Some(holder) = &self.holder {
-            holder.write(reset, batch.events).await;
+            holder.write(reset, batch.events, batch.shared).await;
         }
         None
     }
@@ -1213,7 +1232,7 @@ mod tests {
             let subscription = monitor.subscriptions.get(&urls[rank]).unwrap();
             let holder = subscription.holder.clone().unwrap();
             drop(subscription);
-            holder.write(false, vec![stored(blocks)]).await;
+            holder.write(false, vec![stored(blocks)], vec![]).await;
         }
         let workers: Vec<Arc<dyn Worker>> = (urls.iter())
             .map(|url| Arc::new(BasicWorkerBuilder::new(url).build()) as Arc<dyn Worker>)
@@ -1232,6 +1251,50 @@ mod tests {
         monitor.detach(&urls[1]);
         assert_eq!(monitor.shared_ranks.load(Ordering::Relaxed), 2);
         assert_eq!(monitor.shared_tokens(&prompt, &workers, &device), None);
+    }
+
+    /// A rank that keeps some of its blocks private shares with its group only those its
+    /// stream reports in the shared tier.
+    #[tokio::test]
+    async fn a_rank_that_keeps_blocks_private_shares_what_it_reports_shared() {
+        const PEER: &str = "http://127.0.0.1:8000@2";
+        let monitor = KvEventMonitor::start().unwrap();
+        monitor.share_pools(0.9);
+        let endpoint = free_endpoint();
+        let mut publisher = bind(&endpoint).await;
+        let source = |endpoint: &str| KvEventSource {
+            endpoint: endpoint.into(),
+            topic: "kv".into(),
+            block_size: 4,
+            kv_pool: Some(KvPoolReport {
+                backend: "umbp_pool".into(),
+                address: "unix:///a".into(),
+                group: "atom-5f0e3c9a2b7d41e6".into(),
+                share_ratio: 0.5,
+                fetch: true,
+            }),
+            ..Default::default()
+        };
+        monitor.attach(WORKER, "model", "regular", 1, source(&endpoint));
+        monitor.attach(PEER, "model", "regular", 2, source("tcp://127.0.0.1:1"));
+        clear_until(&mut publisher, &monitor, |s| s.last_seq == Some(0)).await;
+        // Of its two blocks, the rank shares the first; another tier is dropped.
+        let events = r#"[
+            {"type": "BlockStored", "block_hashes": [11, 12], "token_ids": [1, 2, 3, 4, 5, 6, 7, 8], "block_size": 4},
+            {"type": "BlockStored", "block_hashes": [11], "token_ids": [], "block_size": 4, "medium": "GPU_SHARED"},
+            {"type": "BlockStored", "block_hashes": [12], "token_ids": [], "block_size": 4, "medium": "CPU"}]"#;
+        publish(&mut publisher, "kv", 1, events, 1).await;
+        let status = status_once(&monitor, |s| s.shared_blocks == Some(1)).await;
+        assert_eq!(status.indexed_blocks, Some(2));
+        let dropped = BTreeMap::from([(DropReason::Tier, 1)]);
+        assert_eq!(status.dropped_events, dropped);
+        let workers: Vec<Arc<dyn Worker>> = [WORKER, PEER]
+            .map(|url| Arc::new(BasicWorkerBuilder::new(url).build()) as Arc<dyn Worker>)
+            .into();
+        let (prompt, device): (Vec<u32>, _) = ((1..=10).collect(), [Some(8), Some(0)]);
+        assert_eq!(monitor.match_workers(&prompt, &workers), device);
+        let shared = monitor.shared_tokens(&prompt, &workers, &device);
+        assert_eq!(shared, Some(vec![Some(8), Some(4)]));
     }
 
     /// A worker is predicted from its registration to its detach: in the partition of its

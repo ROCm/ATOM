@@ -569,6 +569,41 @@ impl HolderTable {
         Ok(())
     }
 
+    /// Translates into `ops` a batch for the lane of the blocks a rank shares, which holds
+    /// only blocks the rank does: `events`, of the rank's device tier, already applied to
+    /// its table `rank`, remove blocks here too, and `shared`, of its shared tier, name
+    /// blocks by hash, placed where `rank` holds them. A shared block the rank does not
+    /// hold is dropped as one of an unknown parent.
+    pub(super) fn share(
+        &mut self,
+        rank: &HolderTable,
+        events: &[KvEvent],
+        shared: &[KvEvent],
+        ops: &mut Vec<Op>,
+    ) -> Vec<DropReason> {
+        let mut dropped = Vec::new();
+        let removals = events
+            .iter()
+            .filter(|event| !matches!(event, KvEvent::Stored { .. }));
+        for event in removals.chain(shared) {
+            let KvEvent::Stored { blocks, .. } = event else {
+                let _ = self.apply(event, ops);
+                continue;
+            };
+            for block in blocks {
+                match rank.prefixes.get(&block.hash) {
+                    Some(&prefix) => {
+                        if self.prefixes.insert(block.hash, prefix).is_none() {
+                            ops.push(Op::Store(prefix));
+                        }
+                    }
+                    None => dropped.push(DropReason::UnknownParent),
+                }
+            }
+        }
+        dropped
+    }
+
     /// Removes the holder's own blocks, so a clear costs its entries, not the partition's.
     pub(super) fn clear(&mut self, ops: &mut Vec<Op>) {
         ops.extend(

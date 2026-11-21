@@ -299,20 +299,22 @@ async fn the_writer_applies_batches_and_frees_released_lanes() {
     let seq: Vec<u32> = (0..10).collect();
     let lanes: Vec<_> = holders[..2].iter().map(|h| Some(h.lane())).collect();
     holders[0]
-        .write(false, vec![stored(0, &seq, 0..2, 4)])
+        .write(false, vec![stored(0, &seq, 0..2, 4)], vec![])
         .await;
     holders[1]
-        .write(false, vec![stored(1, &seq, 0..1, 4)])
+        .write(false, vec![stored(1, &seq, 0..1, 4)], vec![])
         .await;
     settles(match_holders, &seq, &lanes, &[Some(8), Some(4)]).await;
     assert_eq!(status.lock().indexed_blocks, Some(1));
-    holders[0].write(true, vec![stored(0, &seq, 0..1, 4)]).await;
+    holders[0]
+        .write(true, vec![stored(0, &seq, 0..1, 4)], vec![])
+        .await;
     settles(match_holders, &seq, &lanes, &[Some(4), Some(4)]).await;
     let first = KvEvent::Removed {
         hashes: vec![engine_hash(0, &seq[..4])],
     };
     holders[0]
-        .write(false, vec![first, stored(0, &seq, 1..2, 4)])
+        .write(false, vec![first, stored(0, &seq, 1..2, 4)], vec![])
         .await;
     settles(match_holders, &seq, &lanes, &[Some(0), Some(4)]).await;
     let dropped = BTreeMap::from([(DropReason::UnknownParent, 1)]);
@@ -327,6 +329,77 @@ async fn the_writer_applies_batches_and_frees_released_lanes() {
     };
     assert_eq!(holder.lane().1, HolderId(1));
     assert_eq!(match_holders(&seq, &[Some(holder.lane())]), [Some(0)]);
+}
+
+/// A rank's shared lane holds the blocks its shared tier names that the rank holds, until
+/// the tier or the rank lets go of them or the rank is reset; a rank without one drops the
+/// tier.
+#[tokio::test]
+async fn a_shared_lane_holds_what_the_rank_shares_and_holds() {
+    let ttl = Duration::from_secs(120);
+    let partition = Partition::start(4, ttl, &tokio::runtime::Handle::current());
+    let status = Arc::new(Mutex::new(SourceStatus::default()));
+    let holder = partition.hold(status.clone()).unwrap().sharing();
+    let lanes = [holder.shared_lane()];
+    let seq: Vec<u32> = (0..13).collect();
+    let hashes = |blocks: std::ops::Range<usize>| -> Vec<EngineHash> {
+        blocks
+            .map(|b| engine_hash(0, &seq[..(b + 1) * 4]))
+            .collect()
+    };
+    let shared = |hashes: Vec<EngineHash>| KvEvent::Stored {
+        parent: None,
+        blocks: (hashes.into_iter())
+            .map(|hash| StoredBlock {
+                hash,
+                tokens: Arc::from([]),
+            })
+            .collect(),
+    };
+    let removed = |blocks| KvEvent::Removed {
+        hashes: hashes(blocks),
+    };
+    // Of its three blocks, the rank shares the first two, and one it does not hold.
+    let stores = vec![shared(hashes(0..2)), shared(vec![EngineHash(7)])];
+    (holder.write(false, vec![stored(0, &seq, 0..3, 4)], stores)).await;
+    settles(match_holders, &seq, &lanes, &[Some(8)]).await;
+    holder.write(false, vec![], vec![removed(1..2)]).await;
+    settles(match_holders, &seq, &lanes, &[Some(4)]).await;
+    let dropped = BTreeMap::from([(DropReason::UnknownParent, 1)]);
+    assert_eq!(status.lock().dropped_events, dropped);
+    holder.write(false, vec![removed(0..1)], vec![]).await;
+    until(|| status.lock().shared_blocks == Some(0)).await;
+    holder
+        .write(false, vec![], vec![shared(hashes(1..3))])
+        .await;
+    (holder.write(
+        false,
+        vec![stored(0, &seq, 0..1, 4)],
+        vec![shared(hashes(0..1))],
+    ))
+    .await;
+    settles(match_holders, &seq, &lanes, &[Some(12)]).await;
+    holder
+        .write(true, vec![stored(0, &seq, 0..3, 4)], vec![])
+        .await;
+    settles(match_holders, &seq, &lanes, &[Some(0)]).await;
+    assert_eq!(match_holders(&seq, &[Some(holder.lane())]), [Some(12)]);
+    let other = Arc::new(Mutex::new(SourceStatus::default()));
+    let unshared = partition.hold(other.clone()).unwrap();
+    assert!(unshared.shared_lane().is_none());
+    unshared.write(false, vec![], vec![removed(0..1)]).await;
+    let dropped = BTreeMap::from([(DropReason::Tier, 1)]);
+    until(|| other.lock().dropped_events == dropped).await;
+}
+
+async fn until(done: impl Fn() -> bool) {
+    for _ in 0..200 {
+        if done() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("not so after 2 s");
 }
 
 /// A prediction holds the full blocks of each prompt routed, each until a TTL after its

@@ -1,20 +1,35 @@
 //! ATOM's KV event payloads (ROCm/ATOM#3275), encoded as vLLM encodes its own: a batch
 //! is the msgpack array `[ts, events, data_parallel_rank]`, each event a map tagged by
 //! `type`, and fields not read here are ignored. Only the device tier of the
-//! full-attention group 0 is followed. Any other event shape, such as the arrays ATOM
-//! sent before #3275, is dropped as `Decode`.
+//! full-attention group 0 is followed, and the part of it a rank shares. Any other event
+//! shape, such as the arrays ATOM sent before #3275, is dropped as `Decode`.
+
+use std::sync::Arc;
 
 use rmpv::Value;
 
 use super::model::{DropReason, EngineHash, KvEvent, StoredBlock};
+
+/// The tier of the blocks of a rank's device pool its share group copies from, where the
+/// rank keeps the rest private.
+const SHARED_TIER: &str = "GPU_SHARED";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodedBatch {
     pub ts: f64,
     pub dp_rank: Option<u32>,
     pub events: Vec<KvEvent>,
-    /// Why each event missing from `events` was left out.
+    /// The events of the shared tier, which name blocks by hash alone: stored ones carry
+    /// no tokens.
+    pub shared: Vec<KvEvent>,
+    /// Why each event missing from `events` and `shared` was left out.
     pub dropped: Vec<DropReason>,
+}
+
+#[derive(PartialEq)]
+enum Tier {
+    Device,
+    Shared,
 }
 
 /// A payload that is not a batch at all.
@@ -46,38 +61,53 @@ pub fn decode(payload: &[u8], block_size: u32) -> Result<DecodedBatch, DecodeErr
         ts,
         dp_rank,
         events: Vec::with_capacity(events.len()),
+        shared: Vec::new(),
         dropped: Vec::new(),
     };
     for event in events {
         match decode_event(event, block_size) {
-            Ok(event) => batch.events.push(event),
+            Ok((event, Tier::Device)) => batch.events.push(event),
+            Ok((event, Tier::Shared)) => batch.shared.push(event),
             Err(reason) => batch.dropped.push(reason),
         }
     }
     Ok(batch)
 }
 
-fn decode_event(event: &Value, block_size: u32) -> Result<KvEvent, DropReason> {
+fn decode_event(event: &Value, block_size: u32) -> Result<(KvEvent, Tier), DropReason> {
     let Value::Map(fields) = event else {
         return Err(DropReason::Decode);
     };
     let fields = Fields(fields);
-    match fields.get("type").and_then(Value::as_str) {
-        Some("BlockStored") => stored(&fields, block_size),
-        Some("BlockRemoved") => {
-            on_device(&fields)?;
+    let kind = fields.get("type").and_then(Value::as_str);
+    let tier = match kind {
+        Some("BlockStored" | "BlockRemoved" | "AllBlocksCleared") => tier(&fields)?,
+        _ => return Err(DropReason::Decode),
+    };
+    let event = match kind {
+        Some("AllBlocksCleared") => KvEvent::Cleared,
+        Some("BlockStored") if tier == Tier::Device => stored(&fields, block_size)?,
+        _ => {
             full_attention(&fields)?;
-            Ok(KvEvent::Removed {
-                hashes: hashes(&fields)?,
-            })
+            let hashes = hashes(&fields)?;
+            if kind == Some("BlockRemoved") {
+                KvEvent::Removed { hashes }
+            } else {
+                let block = |hash| StoredBlock {
+                    hash,
+                    tokens: Arc::from([]),
+                };
+                KvEvent::Stored {
+                    parent: None,
+                    blocks: hashes.into_iter().map(block).collect(),
+                }
+            }
         }
-        Some("AllBlocksCleared") => on_device(&fields).map(|()| KvEvent::Cleared),
-        _ => Err(DropReason::Decode),
-    }
+    };
+    Ok((event, tier))
 }
 
 fn stored(fields: &Fields, block_size: u32) -> Result<KvEvent, DropReason> {
-    on_device(fields)?;
     full_attention(fields)?;
     // ATOM marks every block of a multimodal prompt with the request's media seed.
     let marked = match fields.get("extra_keys") {
@@ -118,10 +148,11 @@ fn stored(fields: &Fields, block_size: u32) -> Result<KvEvent, DropReason> {
     Ok(KvEvent::Stored { parent, blocks })
 }
 
-/// The device tier is `GPU`, or no medium at all.
-fn on_device(fields: &Fields) -> Result<(), DropReason> {
+/// The device tier is `GPU`, or no medium at all; the shared tier is `GPU_SHARED`.
+fn tier(fields: &Fields) -> Result<Tier, DropReason> {
     match fields.get("medium").map(Value::as_str) {
-        None | Some(Some("GPU")) => Ok(()),
+        None | Some(Some("GPU")) => Ok(Tier::Device),
+        Some(Some(SHARED_TIER)) => Ok(Tier::Shared),
         Some(Some(_)) => Err(DropReason::Tier),
         Some(None) => Err(DropReason::Decode),
     }

@@ -26,7 +26,10 @@ use super::{
     index::{find_matches, HolderTable, Op, PrefixIndex},
     HolderId, PrefixHash,
 };
-use crate::kv_events::{model::KvEvent, SourceStatus};
+use crate::kv_events::{
+    model::{DropReason, KvEvent},
+    SourceStatus,
+};
 
 /// Admitted batches a partition's writer may fall behind by before its ranks wait.
 const QUEUED_BATCHES: usize = 1024;
@@ -58,11 +61,14 @@ pub(crate) struct Partition {
 }
 
 enum Write {
-    /// A rank's admitted batch; `reset` clears what the rank held first.
+    /// A rank's admitted batch; `reset` clears what the rank held first. The events of its
+    /// shared tier go to its `shared` lane, if it has one.
     Batch {
         holder: HolderId,
+        shared: Option<HolderId>,
         reset: bool,
         events: Vec<KvEvent>,
+        shared_events: Vec<KvEvent>,
         status: Arc<Mutex<SourceStatus>>,
     },
     /// The rank is no longer followed: its blocks leave the index and its lane is free.
@@ -111,6 +117,7 @@ impl Partition {
     pub(crate) fn hold(self: &Arc<Self>, status: Arc<Mutex<SourceStatus>>) -> Option<Holder> {
         take(&self.lanes).map(|id| Holder {
             id,
+            shared: None,
             partition: self.clone(),
             status,
         })
@@ -144,6 +151,9 @@ fn take(lanes: &Mutex<u64>) -> Option<HolderId> {
 /// A rank's lane, held while the rank is followed.
 pub(crate) struct Holder {
     id: HolderId,
+    /// The lane of the blocks the rank's pool shares with its share group, where it keeps
+    /// the rest private.
+    shared: Option<HolderId>,
     partition: Arc<Partition>,
     status: Arc<Mutex<SourceStatus>>,
 }
@@ -153,12 +163,25 @@ impl Holder {
         (self.partition.clone(), self.id)
     }
 
-    /// Queues an admitted batch, waiting while the writer is behind.
-    pub(crate) async fn write(&self, reset: bool, events: Vec<KvEvent>) {
+    /// The holder with a lane for the blocks its rank shares, unless all 64 are taken.
+    pub(crate) fn sharing(mut self) -> Self {
+        self.shared = take(&self.partition.lanes);
+        self
+    }
+
+    pub(crate) fn shared_lane(&self) -> Option<Lane> {
+        Some((self.partition.clone(), self.shared?))
+    }
+
+    /// Queues an admitted batch, waiting while the writer is behind: `events` of the rank's
+    /// device tier and `shared` of its shared tier.
+    pub(crate) async fn write(&self, reset: bool, events: Vec<KvEvent>, shared: Vec<KvEvent>) {
         let batch = Write::Batch {
             holder: self.id,
+            shared: self.shared,
             reset,
             events,
+            shared_events: shared,
             status: self.status.clone(),
         };
         // The writer runs as long as the partition does.
@@ -171,11 +194,9 @@ impl Holder {
 impl Drop for Holder {
     fn drop(&mut self) {
         let partition = &self.partition;
-        release(
-            &partition.runtime,
-            &partition.writes,
-            Write::Release(self.id),
-        );
+        for id in std::iter::once(self.id).chain(self.shared) {
+            release(&partition.runtime, &partition.writes, Write::Release(id));
+        }
     }
 }
 
@@ -286,21 +307,43 @@ async fn write(
         match write {
             Write::Batch {
                 holder,
+                shared,
                 reset,
                 events,
+                shared_events,
                 status,
             } => {
                 let table = tables.entry(holder).or_default();
                 if reset {
                     table.clear(&mut ops);
                 }
-                let dropped: Vec<_> = events
+                let mut dropped: Vec<_> = events
                     .iter()
                     .filter_map(|event| table.apply(event, &mut ops).err())
                     .collect();
                 partition.index.apply(holder, &mut ops);
+                let indexed = table.len() as u64;
+                let shared_blocks = match shared {
+                    Some(lane) => {
+                        let mut shares = tables.remove(&lane).unwrap_or_default();
+                        if reset {
+                            shares.clear(&mut ops);
+                        }
+                        let rank = &tables[&holder];
+                        dropped.extend(shares.share(rank, &events, &shared_events, &mut ops));
+                        partition.index.apply(lane, &mut ops);
+                        let blocks = shares.len() as u64;
+                        tables.insert(lane, shares);
+                        Some(blocks)
+                    }
+                    None => {
+                        dropped.extend(shared_events.iter().map(|_| DropReason::Tier));
+                        None
+                    }
+                };
                 let mut status = status.lock();
-                status.indexed_blocks = Some(table.len() as u64);
+                status.indexed_blocks = Some(indexed);
+                status.shared_blocks = shared_blocks;
                 for reason in dropped {
                     *status.dropped_events.entry(reason).or_default() += 1;
                 }
