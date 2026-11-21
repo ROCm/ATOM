@@ -25,19 +25,20 @@ use tracing::{debug, error, info, warn};
 use crate::routers::prepare::inference::InferenceMetadata;
 
 use crate::{
-    config::types::{AtomPdRankMappingPolicy, BackendType, RetryConfig},
+    config::types::{AtomPdRankMappingPolicy, BackendType, RetryConfig, VllmKvConnector},
     core::{
         placement::{
             backend::{
                 atom::{AtomAdapter, AtomPrefillInfo},
                 sglang::SglangAdapter,
                 vllm::{VllmAdapter, VllmPrefillInfo},
+                vllm_moriio::VllmMoriioAdapter,
                 BackendAdapter, PairCtx,
             },
             planner::DefaultPlanner,
             registry_adapters::{PolicyRegistryAdapter, WorkerRegistryAdapter},
             traits::PdPlanner,
-            types::{PlacementPlan, Protocol, RequestDescriptor},
+            types::{AdapterError, PlacementPlan, Protocol, RequestDescriptor},
         },
         RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
@@ -63,6 +64,7 @@ pub struct PDRouter {
     pub client: Client,
     pub retry_config: RetryConfig,
     pub backend: BackendType,
+    pub vllm_kv_connector: VllmKvConnector,
     pub atom_pd_rank_mapping_policy: AtomPdRankMappingPolicy,
     pub planner: Arc<dyn PdPlanner>,
     policies: Arc<PolicyRegistryAdapter>,
@@ -384,6 +386,11 @@ impl PDRouter {
         let mut atom_adapter: Option<Arc<AtomAdapter>> = None;
         let adapter: Arc<dyn BackendAdapter> = match backend {
             BackendType::Sglang => Arc::new(SglangAdapter),
+            BackendType::Vllm
+                if ctx.router_config.vllm_kv_connector == VllmKvConnector::MoriioRead =>
+            {
+                Arc::new(VllmMoriioAdapter)
+            }
             BackendType::Vllm => {
                 let info =
                     Arc::new(Self::fetch_vllm_prefill_info(&worker_registry, &client).await?);
@@ -410,6 +417,7 @@ impl PDRouter {
             client,
             retry_config: ctx.router_config.effective_retry_config(),
             backend,
+            vllm_kv_connector: ctx.router_config.vllm_kv_connector,
             atom_pd_rank_mapping_policy: ctx.router_config.atom_pd_rank_mapping_policy,
             planner,
             policies,
@@ -816,6 +824,20 @@ impl PDRouter {
             Ok(ctx) => ctx,
             Err(error) => return Self::handle_serialization_error(error),
         };
+        // MoRI parses legacy peer addresses embedded in request IDs before explicit
+        // metadata. Own the worker ID so a caller cannot override the selected peer.
+        let mori_headers = (self.backend == BackendType::Vllm
+            && self.vllm_kv_connector == VllmKvConnector::MoriioRead)
+            .then(|| {
+                let mut headers = headers.cloned().unwrap_or_default();
+                let id = self.adapter.correlation_id(&ctx).expect("MoRI transfer ID");
+                headers.insert(
+                    "x-request-id",
+                    HeaderValue::from_str(&id).expect("UUID header"),
+                );
+                headers
+            });
+        let headers = mori_headers.as_ref().or(headers);
         let started = Instant::now();
         let response = match self.backend {
             BackendType::Sglang => {
@@ -838,13 +860,20 @@ impl PDRouter {
             BackendType::Vllm | BackendType::Atom => {
                 let mut decode_body = body.clone();
                 if let Err(error) = self.adapter.inject_prefill_fields(&mut body, &ctx) {
-                    return Self::handle_serialization_error(error);
+                    return match error {
+                        AdapterError::UnsupportedTopology(reason) => {
+                            error::bad_request("unsupported_moriio_request", reason)
+                        }
+                        other => Self::handle_serialization_error(other),
+                    };
                 }
                 if let Err(error) = self.adapter.inject_decode_fields(&mut decode_body, &ctx) {
                     return Self::handle_serialization_error(error);
                 }
                 let correlation = self.adapter.correlation_id(&ctx);
-                if matches!(self.backend, BackendType::Vllm) {
+                if matches!(self.backend, BackendType::Vllm)
+                    && self.vllm_kv_connector == VllmKvConnector::Mooncake
+                {
                     self.dispatch_vllm_mooncake_internal(
                         headers,
                         body,
@@ -856,7 +885,7 @@ impl PDRouter {
                     )
                     .await
                 } else {
-                    self.dispatch_atom_relay_internal(
+                    self.dispatch_metadata_relay_internal(
                         headers,
                         body,
                         decode_body,
@@ -1052,7 +1081,7 @@ impl PDRouter {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn dispatch_atom_relay_internal(
+    async fn dispatch_metadata_relay_internal(
         &self,
         headers: Option<&HeaderMap>,
         prefill_request_json: Value,
@@ -1114,7 +1143,7 @@ impl PDRouter {
             Ok(r) => r,
             Err(e) => {
                 error!(
-                    "ATOM prefill {} request_id={} failed: {}",
+                    "PD prefill {} request_id={} failed: {}",
                     prefill.url(),
                     correlation_for_log,
                     e
@@ -1135,7 +1164,7 @@ impl PDRouter {
                 .await
                 .unwrap_or_else(|_| "<unreadable>".to_string());
             error!(
-                "ATOM prefill {} request_id={} status={} body={}",
+                "PD prefill {} request_id={} status={} body={}",
                 prefill.url(),
                 correlation_for_log,
                 prefill_status,
@@ -1154,7 +1183,7 @@ impl PDRouter {
             Ok(v) => v,
             Err(e) => {
                 error!(
-                    "ATOM prefill {} request_id={} response parse failed: {}",
+                    "PD prefill {} request_id={} response parse failed: {}",
                     prefill.url(),
                     correlation_for_log,
                     e
@@ -1173,7 +1202,7 @@ impl PDRouter {
             Some(v) => v,
             None => {
                 error!(
-                    "ATOM prefill {} request_id={} response missing kv_transfer_params",
+                    "PD prefill {} request_id={} response missing kv_transfer_params",
                     prefill.url(),
                     correlation_for_log
                 );
@@ -1184,35 +1213,41 @@ impl PDRouter {
             }
         };
 
-        let atom_adapter = match self.atom_adapter.as_ref() {
-            Some(a) => a,
-            None => {
-                error!("atom_adapter is None but backend == Atom — programming error");
+        if self.backend == BackendType::Vllm {
+            if let Err(reason) = VllmMoriioAdapter::validate_decode_kv(&kv_params, &ctx) {
+                return error::bad_gateway("invalid_moriio_metadata", reason);
+            }
+        } else {
+            let atom_adapter = match self.atom_adapter.as_ref() {
+                Some(a) => a,
+                None => {
+                    error!("atom_adapter is None but backend == Atom — programming error");
+                    return error::internal_error(
+                        "atom_adapter_missing",
+                        "Internal: ATOM adapter not initialized",
+                    );
+                }
+            };
+            if let Err(e) = atom_adapter.enrich_decode_kv(&mut kv_params, &ctx) {
+                error!(
+                    "ATOM enrich_decode_kv failed for prefill {} request_id={}: {}",
+                    prefill.url(),
+                    correlation_for_log,
+                    e
+                );
                 return error::internal_error(
-                    "atom_adapter_missing",
-                    "Internal: ATOM adapter not initialized",
+                    "enrich_decode_kv_failed",
+                    format!("Failed to enrich decode kv: {}", e),
                 );
             }
-        };
-        if let Err(e) = atom_adapter.enrich_decode_kv(&mut kv_params, &ctx) {
-            error!(
-                "ATOM enrich_decode_kv failed for prefill {} request_id={}: {}",
-                prefill.url(),
+            let carried_ids = AtomAdapter::carry_prompt_token_ids(&prefill_body, &mut kv_params);
+            debug!(
+                "ATOM PD request_id={} carried {} prompt token ids to decode {}",
                 correlation_for_log,
-                e
-            );
-            return error::internal_error(
-                "enrich_decode_kv_failed",
-                format!("Failed to enrich decode kv: {}", e),
+                carried_ids,
+                decode.url()
             );
         }
-        let carried_ids = AtomAdapter::carry_prompt_token_ids(&prefill_body, &mut kv_params);
-        debug!(
-            "ATOM PD request_id={} carried {} prompt token ids to decode {}",
-            correlation_for_log,
-            carried_ids,
-            decode.url()
-        );
 
         let decode_obj = match decode_request_json.as_object_mut() {
             Some(o) => o,
@@ -1248,7 +1283,7 @@ impl PDRouter {
                 error!(
                     decode_url = %decode.url(),
                     error = %e,
-                    "ATOM decode request failed"
+                    "PD decode request failed"
                 );
 
                 return error::bad_gateway(
@@ -1258,7 +1293,7 @@ impl PDRouter {
             }
         };
 
-        self.finish_atom_decode_response(res, context, decode, decode_guard)
+        self.finish_decode_response(res, context, decode, decode_guard)
             .await
     }
 
@@ -1353,11 +1388,11 @@ impl PDRouter {
             Ok(((), res)) => res,
             Err(response) => return response,
         };
-        self.finish_atom_decode_response(res, context, decode, decode_guard)
+        self.finish_decode_response(res, context, decode, decode_guard)
             .await
     }
 
-    async fn finish_atom_decode_response(
+    async fn finish_decode_response(
         &self,
         res: WorkerResponse,
         context: PDRequestContext<'_>,
@@ -1369,7 +1404,7 @@ impl PDRouter {
 
         if !status.is_success() {
             error!(
-                "ATOM decode {} returned error status={}",
+                "PD decode {} returned error status={}",
                 decode.url(),
                 status
             );
@@ -1399,7 +1434,7 @@ impl PDRouter {
                     response
                 }
                 Err(e) => {
-                    error!("Failed to read ATOM decode response: {}", e);
+                    error!("Failed to read decode response: {}", e);
                     error::internal_error("read_response_failed", "Failed to read response")
                 }
             }
@@ -2608,6 +2643,7 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             backend: BackendType::Sglang,
+            vllm_kv_connector: VllmKvConnector::Mooncake,
             atom_pd_rank_mapping_policy: AtomPdRankMappingPolicy::None,
             planner,
             policies,

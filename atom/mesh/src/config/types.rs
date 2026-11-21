@@ -18,6 +18,27 @@ pub enum BackendType {
     Atom,
 }
 
+/// Native vLLM HTTP P/D wire protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum VllmKvConnector {
+    #[default]
+    Mooncake,
+    MoriioRead,
+}
+
+impl std::str::FromStr for VllmKvConnector {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "mooncake" => Ok(Self::Mooncake),
+            "moriio-read" => Ok(Self::MoriioRead),
+            other => Err(format!("unsupported vLLM KV connector: {other}")),
+        }
+    }
+}
+
 /// Strategy used by the ATOM PD router to map a selected prefill DP rank to
 /// the selected decode DP rank.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -63,6 +84,8 @@ pub struct RouterConfig {
     pub mode: RoutingMode,
     #[serde(default)]
     pub backend: BackendType,
+    #[serde(default)]
+    pub vllm_kv_connector: VllmKvConnector,
     #[serde(default)]
     pub connection_mode: ConnectionMode,
     #[serde(default)]
@@ -448,6 +471,7 @@ impl Default for RouterConfig {
                 worker_urls: vec![],
             },
             backend: BackendType::Sglang,
+            vllm_kv_connector: VllmKvConnector::Mooncake,
             policy: PolicyConfig::Random,
             host: "0.0.0.0".to_string(),
             port: 3001,

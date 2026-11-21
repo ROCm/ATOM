@@ -64,4 +64,6 @@ pub enum AdapterError {
     TpSizeMissing { prefill_url: String },
     #[error("PairCtx type does not match adapter")]
     CtxTypeMismatch,
+    #[error("unsupported P/D topology: {0}")]
+    UnsupportedTopology(String),
 }

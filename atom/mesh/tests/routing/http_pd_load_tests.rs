@@ -193,7 +193,7 @@ fn dispatch_with_policy(
                     json!({})
                 };
                 router
-                    .dispatch_atom_relay_internal(
+                    .dispatch_metadata_relay_internal(
                         headers.as_ref(),
                         json!({}),
                         decode_body,
@@ -253,18 +253,26 @@ async fn result(task: JoinHandle<Response>) -> Response {
 struct IngressBackend {
     worker: Arc<dyn Worker>,
     requests: mpsc::UnboundedReceiver<(Value, oneshot::Sender<Response>)>,
+    headers: Arc<parking_lot::Mutex<Vec<HeaderMap>>>,
     task: JoinHandle<()>,
 }
 
 impl IngressBackend {
     async fn start(role: WorkerType) -> Self {
+        Self::start_route(role, "/v1/chat/completions").await
+    }
+
+    async fn start_route(role: WorkerType, route: &str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let (capture, requests) = mpsc::unbounded_channel();
+        let headers = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let captured_headers = headers.clone();
         let app = Router::new().route(
-            "/v1/chat/completions",
-            post(move |body: Bytes| {
+            route,
+            post(move |headers: HeaderMap, body: Bytes| {
                 let capture = capture.clone();
+                captured_headers.lock().push(headers);
                 async move {
                     let (reply, response) = oneshot::channel();
                     capture
@@ -282,6 +290,7 @@ impl IngressBackend {
                     .build(),
             ),
             requests,
+            headers,
             task: tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }),
         }
     }
@@ -291,6 +300,234 @@ impl IngressBackend {
             .await
             .unwrap()
             .unwrap()
+    }
+}
+
+fn moriio_metadata(prefill: &Value) -> Value {
+    json!({"transfer_id": prefill["kv_transfer_params"]["transfer_id"],
+        "do_remote_prefill": true, "do_remote_decode": false,
+        "remote_engine_id": "p", "remote_host": "127.0.0.1",
+        "remote_handshake_port": "6300", "remote_notify_port": 6400,
+        "tp_size": 1, "remote_dp_size": 1, "remote_dp_size_local": 1,
+        "remote_dp_rank": 0, "remote_dp_rank_override": true,
+        "remote_block_ids": [[1,2], [], [3]], "extension": {"keep":true}})
+}
+
+#[tokio::test]
+async fn moriio_batch_requests_are_rejected_before_dispatch() {
+    let mut p = IngressBackend::start(WorkerType::Prefill {
+        bootstrap_port: None,
+    })
+    .await;
+    let mut d = IngressBackend::start(WorkerType::Decode).await;
+    let task = dispatch_moriio(&p, &d, json!({"n": 2}), "/v1/chat/completions");
+    let response = result(task).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    drop(response);
+    assert!(p.requests.try_recv().is_err());
+    assert!(d.requests.try_recv().is_err());
+    wait_load(&p.worker, 0).await;
+    wait_load(&d.worker, 0).await;
+}
+
+fn dispatch_moriio(
+    p: &IngressBackend,
+    d: &IngressBackend,
+    body: Value,
+    route: &'static str,
+) -> JoinHandle<Response> {
+    let mut router = tests::create_test_pd_router();
+    router.backend = BackendType::Vllm;
+    router.vllm_kv_connector = VllmKvConnector::MoriioRead;
+    router.adapter = Arc::new(VllmMoriioAdapter);
+    let placement = router
+        .reserve_pair(
+            PlacementPlan::Pair {
+                prefill: p.worker.clone(),
+                decode: d.worker.clone(),
+                prefill_policy: "random",
+                decode_policy: "random",
+            },
+            None,
+        )
+        .unwrap();
+    tokio::spawn(async move {
+        let context = PDRequestContext {
+            route,
+            is_stream: body["stream"] == true,
+            batch_size: None,
+            return_logprob: false,
+            request_text: None,
+            tokens: None,
+            carries_media: false,
+            model_id: None,
+            headers: None,
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-request-id",
+            HeaderValue::from_static("caller-legacy-mori-address"),
+        );
+        headers.insert("x-session-id", HeaderValue::from_static("session"));
+        router
+            .execute_reserved(Some(&headers), body, context, placement)
+            .await
+    })
+}
+
+#[tokio::test]
+async fn moriio_relays_chat_completions_sse_and_tools_after_prefill() {
+    for route in ["/v1/chat/completions", "/v1/completions"] {
+        for stream in [false, true] {
+            let mut p = IngressBackend::start_route(
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+                route,
+            )
+            .await;
+            let mut d = IngressBackend::start_route(WorkerType::Decode, route).await;
+            let original = json!({"model":"test", "prompt":"hello", "stream":stream,
+                "max_tokens":20, "tools":[{"type":"function","function":{"name":"test"}}]});
+            let task = dispatch_moriio(&p, &d, original.clone(), route);
+            let (prefill, reply) = p.next_request().await;
+            assert_eq!(prefill["max_tokens"], 1);
+            assert_eq!(prefill["stream"], false);
+            assert!(d.requests.try_recv().is_err());
+            let kv = moriio_metadata(&prefill);
+            reply
+                .send(axum::Json(json!({"kv_transfer_params":kv})).into_response())
+                .unwrap();
+            let (decode, reply) = d.next_request().await;
+            let id = prefill["kv_transfer_params"]["transfer_id"]
+                .as_str()
+                .unwrap();
+            for server in [&p, &d] {
+                let headers = server.headers.lock();
+                assert_eq!(headers[0]["x-request-id"], id);
+                assert_eq!(headers[0]["x-session-id"], "session");
+            }
+            let mut expected = original;
+            expected["request_id"] = prefill["kv_transfer_params"]["transfer_id"].clone();
+            expected["kv_transfer_params"] = kv;
+            assert_eq!(decode, expected);
+            wait_load(&p.worker, 0).await;
+            assert_eq!(d.worker.load(), 1);
+            let payload = if stream {
+                "data: {\"choices\":[]}\n\ndata: [DONE]\n\n"
+            } else {
+                "{\"choices\":[]}"
+            };
+            reply
+                .send(
+                    Response::builder()
+                        .header(
+                            CONTENT_TYPE,
+                            if stream {
+                                "text/event-stream"
+                            } else {
+                                "application/json"
+                            },
+                        )
+                        .body(Body::from(payload))
+                        .unwrap(),
+                )
+                .unwrap();
+            let response = result(task).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.into_body().collect().await.unwrap().to_bytes(),
+                payload
+            );
+            wait_load(&d.worker, 0).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn moriio_prefill_error_or_invalid_metadata_never_dispatches_decode() {
+    for status in [StatusCode::BAD_REQUEST, StatusCode::OK] {
+        let mut p = IngressBackend::start(WorkerType::Prefill {
+            bootstrap_port: None,
+        })
+        .await;
+        let mut d = IngressBackend::start(WorkerType::Decode).await;
+        let task = dispatch_moriio(&p, &d, json!({"stream": false}), "/v1/chat/completions");
+        let (_, reply) = p.next_request().await;
+        reply
+            .send((status, axum::Json(json!({"kv_transfer_params":null}))).into_response())
+            .unwrap();
+        let response = result(task).await;
+        assert_eq!(
+            response.status(),
+            if status.is_success() {
+                StatusCode::BAD_GATEWAY
+            } else {
+                status
+            }
+        );
+        drop(response);
+        assert!(d.requests.try_recv().is_err());
+        wait_load(&p.worker, 0).await;
+        wait_load(&d.worker, 0).await;
+    }
+}
+
+#[tokio::test]
+async fn moriio_cancellation_releases_both_reservations_without_dispatching_decode() {
+    let mut p = IngressBackend::start(WorkerType::Prefill {
+        bootstrap_port: None,
+    })
+    .await;
+    let mut d = IngressBackend::start(WorkerType::Decode).await;
+    let task = dispatch_moriio(&p, &d, json!({"stream":true}), "/v1/chat/completions");
+    let (_, reply) = p.next_request().await;
+    task.abort();
+    let _ = task.await;
+    wait_load(&p.worker, 0).await;
+    wait_load(&d.worker, 0).await;
+    assert!(d.requests.try_recv().is_err());
+    // No transport ACK is sent by the router; producer timeout owns this orphan.
+    let _ = reply.send(StatusCode::OK.into_response());
+}
+
+#[tokio::test]
+async fn moriio_decode_error_and_stream_drop_release_reservations() {
+    for failure in [true, false] {
+        let mut p = IngressBackend::start(WorkerType::Prefill {
+            bootstrap_port: None,
+        })
+        .await;
+        let mut d = IngressBackend::start(WorkerType::Decode).await;
+        let task = dispatch_moriio(&p, &d, json!({"stream": true}), "/v1/chat/completions");
+        let (body, reply) = p.next_request().await;
+        reply
+            .send(axum::Json(json!({"kv_transfer_params": moriio_metadata(&body)})).into_response())
+            .unwrap();
+        let (_, reply) = d.next_request().await;
+        if failure {
+            reply
+                .send(
+                    (
+                        StatusCode::BAD_REQUEST,
+                        axum::Json(json!({"error":"decode rejected"})),
+                    )
+                        .into_response(),
+                )
+                .unwrap();
+            let response = result(task).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let _ = response.into_body().collect().await.unwrap();
+        } else {
+            let (response, sender) = stream_response(StatusCode::OK);
+            reply.send(response).unwrap();
+            let response = result(task).await;
+            assert_eq!(d.worker.load(), 1);
+            drop(response);
+            drop(sender);
+        }
+        wait_load(&p.worker, 0).await;
+        wait_load(&d.worker, 0).await;
     }
 }
 

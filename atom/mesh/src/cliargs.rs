@@ -496,6 +496,10 @@ pub struct CliArgs {
     #[arg(long, value_enum, default_value_t = Backend::Sglang, alias = "runtime", help_heading = "Backend")]
     pub backend: Backend,
 
+    /// Native vLLM HTTP P/D connector; MoRI-IO currently supports READ with static workers.
+    #[arg(long, default_value = "mooncake", value_parser = ["mooncake", "moriio-read"], help_heading = "Backend")]
+    pub vllm_kv_connector: String,
+
     // ==================== Control Plane Authentication ====================
     /// API key for worker connections
     #[arg(long, help_heading = "Control Plane Authentication")]
@@ -637,6 +641,13 @@ impl CliArgs {
         builder
             .mode(mode)
             .backend(self.backend.into())
+            .vllm_kv_connector(self.vllm_kv_connector.parse().map_err(|reason| {
+                ConfigError::InvalidValue {
+                    field: "vllm_kv_connector".to_string(),
+                    value: self.vllm_kv_connector.clone(),
+                    reason,
+                }
+            })?)
             .atom_pd_rank_mapping_policy(atom_pd_rank_mapping_policy)
             .policy(policy)
             .connection_mode(connection_mode)
@@ -946,6 +957,7 @@ impl Default for CliArgs {
             reasoning_parser: None,
             tool_call_parser: None,
             backend: Backend::Sglang,
+            vllm_kv_connector: "mooncake".to_string(),
             api_key: None,
             tls_cert_path: None,
             tls_key_path: None,

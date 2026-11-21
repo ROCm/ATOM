@@ -3,6 +3,58 @@ use super::*;
 /// Configuration validator
 pub(crate) struct ConfigValidator;
 
+#[cfg(test)]
+mod moriio_tests {
+    use super::*;
+
+    #[test]
+    fn moriio_requires_native_http_static_pd_without_bootstrap() {
+        let valid = RouterConfig {
+            backend: BackendType::Vllm,
+            vllm_kv_connector: VllmKvConnector::MoriioRead,
+            mode: RoutingMode::PrefillDecode {
+                prefill_urls: vec![("http://p:8000".into(), None)],
+                decode_urls: vec!["http://d:8000".into()],
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate_compatibility(&valid).is_ok());
+        let mut invalid = valid.clone();
+        invalid.backend = BackendType::Atom;
+        assert!(ConfigValidator::validate_compatibility(&invalid).is_err());
+        let mut invalid = valid.clone();
+        invalid.dp_aware = true;
+        assert!(ConfigValidator::validate_compatibility(&invalid).is_err());
+        let mut invalid = valid.clone();
+        invalid.connection_mode = crate::core::ConnectionMode::Grpc { port: None };
+        assert!(ConfigValidator::validate_compatibility(&invalid).is_err());
+        let mut invalid = valid.clone();
+        if let RoutingMode::PrefillDecode {
+            ref mut prefill_urls,
+            ..
+        } = invalid.mode
+        {
+            prefill_urls[0].1 = Some(9000);
+        }
+        assert!(ConfigValidator::validate_compatibility(&invalid).is_err());
+        let mut invalid = valid;
+        if let RoutingMode::PrefillDecode {
+            ref mut decode_urls,
+            ..
+        } = invalid.mode
+        {
+            decode_urls.clear();
+        }
+        assert!(ConfigValidator::validate_compatibility(&invalid).is_err());
+        assert_eq!(
+            RouterConfig::default().vllm_kv_connector,
+            VllmKvConnector::Mooncake
+        );
+    }
+}
+
 impl ConfigValidator {
     pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
         config.resolved_prepare_pool()?;
@@ -321,6 +373,23 @@ impl ConfigValidator {
     }
 
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
+        if config.vllm_kv_connector == VllmKvConnector::MoriioRead {
+            let valid_mode = matches!(
+                &config.mode,
+                RoutingMode::PrefillDecode { prefill_urls, decode_urls, .. }
+                    if !prefill_urls.is_empty() && !decode_urls.is_empty()
+                        && prefill_urls.iter().all(|(_, port)| port.is_none())
+            );
+            if config.backend != BackendType::Vllm
+                || config.connection_mode != crate::core::ConnectionMode::Http
+                || config.dp_aware
+                || !valid_mode
+            {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "MoRI-IO READ requires native vLLM HTTP P/D, DP=1, and prefill URLs without Mooncake bootstrap ports".to_string(),
+                });
+            }
+        }
         {
             if let PolicyConfig::PowerOfTwo { .. } = &config.policy {
                 let worker_count = config.mode.worker_count();
