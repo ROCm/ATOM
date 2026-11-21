@@ -225,7 +225,8 @@ impl LoadBalancingPolicy for DpStickyPolicy {
             return;
         };
         let identity = Self::worker_identity(worker);
-        // Without a reassignment, only rank mapping can move a pinned session.
+        // Without a reassignment, rank mapping moved the pinned session, or another in-flight
+        // request of the session took the reassignment.
         let reason = assignment
             .reassigned
             .take()
