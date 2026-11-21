@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 """Ulysses SP integration for AITER's MegaMoeTP ag_rs kernel.
 
-Enabled by `--moe-backend mega` with `--sequence-parallel-size` > 1.
+Enabled by `--moe-backend mega` with `--sequence-parallel-size` > 1. On pure TP
+(no EP, no SP) it runs the same kernel in its `ar` mode (`TPMegaMoE`).
 `FusedMoE.forward_impl` hands it the row counts it serves, on every MoE layer.
 One runtime is shared by the sequential MoE layers; its collective buffers and
 launch epochs must survive layer/graph boundaries.
@@ -14,6 +15,7 @@ import logging
 import math
 
 import torch
+import torch.nn.functional as F
 
 from atom.distributed.group_agreement import group_max
 
@@ -24,6 +26,17 @@ logger = logging.getLogger("atom")
 MAX_LOCAL_TOKENS = 8192
 # AITER compares int32 launch epochs wrap-safe; reset well before they wrap.
 RESET_LAUNCHES = 1 << 30
+# Pure TP: rows of the largest step served. AITER's small-batch engine holds
+# 2048 local tokens; the big-M path is not graph-capturable.
+MAX_TP_ROWS = 4096
+SP_CONFIG = {"comm_mode": "ag_rs", "comm_dtype": "fp8"}
+TP_CONFIG = {
+    "comm_mode": "ar",
+    "comm_dtype": "bf16",
+    "ar_gather": "bf16",
+    "act_dtype": "auto",
+    "bigm_min_tokens": 0,
+}
 
 
 def local_token_tile(max_num_batched_tokens, world_size):
@@ -40,8 +53,9 @@ def _weights(layer):
     }
 
 
-def _unsupported_layer(layer):
-    """Why MegaMoeTP cannot serve this FusedMoE layer, or None."""
+def _unsupported_layer(layer, reduced=False):
+    """Why MegaMoeTP cannot serve this FusedMoE layer, or None. ``reduced``: its
+    output is all-reduced already (TP MegaMoE), not a partial sum."""
     from aiter import ActivationType, QuantType, dtypes
 
     from atom.model_ops.moe import Mxfp4MoEMethod
@@ -61,11 +75,12 @@ def _unsupported_layer(layer):
     ):
         return "needs MXFP4 FlyDSL experts without Triton MoE, GU interleave or padding"
     if (
-        layer.reduce_results
+        layer.reduce_results != reduced
         or layer.expert_layout.uses_dispatch_remap
         or layer.expert_layout.shared_is_routed
     ):
-        return "needs unreduced experts without dispatch remapping"
+        kind = "reduced" if reduced else "unreduced"
+        return f"needs {kind} experts without dispatch remapping"
     # AITER counts the last expert apart, as the one shared expert.
     if (
         layer.num_fused_shared_experts != 1
@@ -99,6 +114,8 @@ def _unsupported_layer(layer):
 class SPMegaMoE:
     """Shared collective runtime; outputs own their storage across layer calls."""
 
+    name = "SP MegaMoE"
+
     def __init__(self, runtime, layer, num_layers, group):
         self.runtime = runtime
         # The layers share one expert format, so one of them decides for all.
@@ -117,7 +134,7 @@ class SPMegaMoE:
     def _timed_out(self, bits):
         self.failed = True
         raise RuntimeError(
-            f"SP MegaMoE rank {self.runtime.cfg.rank}: a MegaMoeTP wait timed out "
+            f"{self.name} rank {self.runtime.cfg.rank}: a MegaMoeTP wait timed out "
             f"(error bits {bits:#x}); the output of a recent step is invalid."
         )
 
@@ -215,8 +232,52 @@ class SPMegaMoE:
         return out
 
 
+class TPMegaMoE(SPMegaMoE):
+    """Pure TP: every rank holds the same rows, which the kernel's `ar` mode
+    reduces in-launch, so a layer's output is all-reduced on every step (a step
+    kept by the native MoE gets it from ``reduce_results``)."""
+
+    name = "TP MegaMoE"
+
+    def runs(self, rows):
+        return 0 < rows <= self.runtime.max_local_tokens * self.runtime.cfg.world_size
+
+    def before_step(self, rows):
+        # One launch a layer, none on a step that keeps the native MoE.
+        super().before_step(1 if self.runs(rows) else 0)
+
+    def forward(self, layer, hidden_states, router_logits):
+        rows = hidden_states.shape[0]
+        weights, ids = self._route(layer, hidden_states, router_logits)
+        self.runtime.set_weights(**_weights(layer))
+        # `ar` takes a multiple of tp rows; the pad rows are routed nowhere.
+        pad = -rows % self.runtime.cfg.world_size
+        if pad:
+            hidden_states = F.pad(hidden_states, (0, 0, 0, pad))
+            weights = F.pad(weights, (0, 0, 0, pad))
+            ids = F.pad(ids, (0, 0, 0, pad), value=-1)
+        out = torch.empty_like(hidden_states)
+        self.runtime.forward(hidden_states, weights, ids, out=out)
+        return out[:rows]
+
+
+def tp_mega_moe_selected(config):
+    """`--moe-backend mega` on pure TP; EP runs the MoRI MegaMoE."""
+    return (
+        config.moe_backend == "mega"
+        and config.sequence_parallel_size == 1
+        and not config.enable_expert_parallel
+    )
+
+
+def tp_local_token_tile(max_num_batched_tokens, world_size):
+    """Local rows of the largest TP step served."""
+    rows = max(min(MAX_TP_ROWS, max_num_batched_tokens), world_size)
+    return math.ceil(rows / world_size)
+
+
 def _unsupported_config(config):
-    # Config._init_sequence_parallel refuses the rest.
+    # Config._init_sequence_parallel and _init_moe_backend refuse the rest.
     if config.eplb_enable or config.fake_eplb:
         return "needs static expert placement, without EPLB"
     return None
@@ -231,14 +292,14 @@ def _model_layers(model):
     return [module for module in model.modules() if hasattr(module, "sp_mega_moe")]
 
 
-def _plan(config, layers):
+def _plan(config, layers, tp=False):
     """`(hidden, inter, experts, top_k, activation, swiglu_limit)` when MegaMoeTP
     can run every layer, else why not."""
     reason = _unsupported_config(config)
     if reason is not None:
         return reason
     for layer in layers:
-        reason = _unsupported_layer(layer)
+        reason = _unsupported_layer(layer, tp)
         if reason is not None:
             return f"{layer.prefix}: {reason}"
     shapes = {
@@ -257,27 +318,30 @@ def _plan(config, layers):
     return shapes.pop()
 
 
-def _refuse(reason):
-    return RuntimeError(f"--moe-backend mega with Ulysses SP: {reason}")
+def _refuse(reason, mode="Ulysses SP"):
+    return RuntimeError(f"--moe-backend mega with {mode}: {reason}")
 
 
 def initialize_sp_mega_moe(model, config):
     """After weight processing, before warmup/capture.
 
-    Returns the shared backend, or None without `--moe-backend mega` under SP.
-    Raises on every rank when any layer or setting is outside what it serves.
+    Returns the shared backend, or None without `--moe-backend mega` under SP or
+    on pure TP. Raises on every rank when any layer or setting is outside what
+    it serves.
     """
-    from aiter.dist.parallel_state import get_pcp_group
+    from aiter.dist.parallel_state import get_pcp_group, get_tp_group
 
-    if config.moe_backend != "mega" or config.sequence_parallel_size < 2:
+    tp = tp_mega_moe_selected(config)
+    if config.moe_backend != "mega" or not (tp or config.sequence_parallel_size > 1):
         return
+    mode = "TP" if tp else "Ulysses SP"
     layers = _model_layers(model)
     if not layers:
-        raise _refuse("the model has no MoE layers")
-    group = get_pcp_group()
-    plan = _plan(config, layers)
+        raise _refuse("the model has no MoE layers", mode)
+    group = get_tp_group() if tp else get_pcp_group()
+    plan = _plan(config, layers, tp)
     if isinstance(plan, str):
-        raise _refuse(plan)
+        raise _refuse(plan, mode)
     hidden, inter, experts, top_k, activation, swiglu_limit = plan
     from aiter.ops.flydsl.mega_moe_tp import (
         MegaMoeSetupError,
@@ -285,7 +349,8 @@ def initialize_sp_mega_moe(model, config):
         MegaMoeTPConfig,
     )
 
-    max_local_rows = local_token_tile(config.max_num_batched_tokens, group.world_size)
+    tile = tp_local_token_tile if tp else local_token_tile
+    max_local_rows = tile(config.max_num_batched_tokens, group.world_size)
     runtime = None
     try:
         runtime = MegaMoeTP(
@@ -299,9 +364,8 @@ def initialize_sp_mega_moe(model, config):
                 max_local_tokens=max_local_rows,
                 activation=activation,
                 swiglu_limit=swiglu_limit,
-                comm_mode="ag_rs",
-                comm_dtype="fp8",
                 fit_max_local=True,
+                **(TP_CONFIG if tp else SP_CONFIG),
             ),
             **_weights(layers[0]),
             group=group.cpu_group,
@@ -309,22 +373,28 @@ def initialize_sp_mega_moe(model, config):
         )
         # Every remainder of a local tile, so no graph bucket compiles during
         # capture.
-        runtime.prepare_all()
+        if tp:
+            runtime.prepare(range(1, runtime.max_local_tokens + 1))
+        else:
+            runtime.prepare_all()
     except MegaMoeSetupError as exc:
         # AITER raises it on every rank alike, so the collective close() is safe.
         if runtime is not None:
             runtime.close()
-        raise _refuse(f"MegaMoeTP setup failed: {exc}") from exc
+        raise _refuse(f"MegaMoeTP setup failed: {exc}", mode) from exc
     # The big-M warmup leaves a timed-out wait in the sticky bits only.
     bits = group_max(runtime.poll_errors(), group.cpu_group)
     if bits:
         runtime.close()
-        raise _refuse(f"a MegaMoeTP warmup wait timed out (error bits {bits:#x})")
-    backend = SPMegaMoE(runtime, layers[0], len(layers), group.cpu_group)
+        raise _refuse(f"a MegaMoeTP warmup wait timed out (error bits {bits:#x})", mode)
+    backend = (TPMegaMoE if tp else SPMegaMoE)(
+        runtime, layers[0], len(layers), group.cpu_group
+    )
     for layer in layers:
         layer.sp_mega_moe = backend
     logger.info(
-        "SP MegaMoE enabled: %d layers, one shared runtime, tile=%d local tokens.",
+        "%s enabled: %d layers, one shared runtime, tile=%d local tokens.",
+        backend.name,
         len(layers),
         runtime.max_local_tokens,
     )

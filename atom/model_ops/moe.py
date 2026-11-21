@@ -2765,8 +2765,9 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
 def _make_mxfp4_moe_method(
     quant_config: LayerQuantConfig, moe: FusedMoEConfig
 ) -> Mxfp4MoEMethod:
-    # Under SP, `mega` runs SP MegaMoE over the native weights instead.
-    if get_current_atom_config().moe_backend == "mega" and not sp_is_enabled():
+    # Without EP, `mega` runs SP / TP MegaMoE over the native weights instead.
+    config = get_current_atom_config()
+    if config.moe_backend == "mega" and config.enable_expert_parallel:
         return MegaMxfp4MoEMethod(quant_config, moe)
     return Mxfp4MoEMethod(quant_config, moe)
 
@@ -4061,7 +4062,8 @@ class FusedMoE(torch.nn.Module):
         self._validate_moe_backend()
 
     def _validate_moe_backend(self) -> None:
-        if get_current_atom_config().moe_backend != "mega" or sp_is_enabled():
+        config = get_current_atom_config()
+        if config.moe_backend != "mega" or not config.enable_expert_parallel:
             return
         if not isinstance(self.quant_method, MegaMxfp4MoEMethod):
             raise TypeError(

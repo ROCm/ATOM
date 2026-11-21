@@ -22,7 +22,7 @@ def test_mega_method_is_mxfp4_specialization():
 def test_mxfp4_method_selection(monkeypatch, backend_name, sp):
     standard_method = object()
     mega_method = object()
-    config = SimpleNamespace(moe_backend=backend_name)
+    config = SimpleNamespace(moe_backend=backend_name, enable_expert_parallel=not sp)
     monkeypatch.setattr(moe_mod, "get_current_atom_config", lambda: config)
     monkeypatch.setattr(moe_mod, "sp_is_enabled", lambda: sp)
     monkeypatch.setattr(moe_mod, "Mxfp4MoEMethod", lambda *_args: standard_method)
@@ -239,7 +239,9 @@ def test_mega_eplb_views_include_shared_expert():
 
 def test_mega_rejects_the_legacy_shared_expert_fusion(monkeypatch):
     monkeypatch.setattr(
-        moe_mod, "get_current_atom_config", lambda: SimpleNamespace(moe_backend="mega")
+        moe_mod,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(moe_backend="mega", enable_expert_parallel=True),
     )
     layer = SimpleNamespace(
         quant_method=object.__new__(moe_mod.MegaMxfp4MoEMethod),
