@@ -153,10 +153,25 @@ def test_mp_store_and_mooncake_are_the_kv_transfers_admitted():
         validate_runtime_config(
             runtime_config(kv_transfer_config={"kv_connector": "mooncake"})
         )
+    # The shared UMBP L1 pool, like the Store, moves PAGEs and replays state.
+    umbp_pool = {
+        "kv_connector": "umbp_pool",
+        "kv_connector_extra_config": {"address": "unix:///unused"},
+    }
+    validate_runtime_config(
+        runtime_config(
+            kv_transfer_config=umbp_pool,
+            enable_encoder_swa_bounded_replay=True,
+            kv_cache_block_size=256,
+        )
+    )
+    with pytest.raises(ValueError, match="shared UMBP L1 pool without encoder SWA"):
+        validate_runtime_config(runtime_config(kv_transfer_config=umbp_pool))
     for connector in ("lmcache_offload", "moriio"):
         with pytest.raises(
             ValueError,
-            match="KV transfer other than lmcache_mp, mooncake_store or mooncake",
+            match="KV transfer other than lmcache_mp, mooncake_store, mooncake or "
+            "umbp_pool",
         ):
             validate_runtime_config(
                 runtime_config(kv_transfer_config={"kv_connector": connector})
