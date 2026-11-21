@@ -1,6 +1,7 @@
 //! ATOM workers over `atom.grpc.v1`: the client, a payload as a GenerateRequest,
-//! and a Generate stream as `TokenChunk`s.
+//! a Generate stream as `TokenChunk`s, and ATOM's P/D flow for a pair.
 
+pub(crate) mod pair;
 pub(crate) mod request;
 pub(crate) mod stream;
 

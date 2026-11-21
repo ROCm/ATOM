@@ -10,7 +10,7 @@ use tonic::Streaming;
 
 use super::AtomClient;
 use crate::atom_engine::grpc::{
-    generate_response::Response, GenerateComplete, GenerateRequest, GenerateResponse,
+    generate_response::Response, GenerateComplete, GenerateError, GenerateRequest, GenerateResponse,
 };
 use crate::routers::token_handle::engine_error::EngineError;
 use crate::routers::token_handle::token_chunk::{
@@ -73,13 +73,7 @@ impl Stream for AtomStream {
                     logprobs: None,
                 }),
                 Response::Complete(complete) => Ok(complete_chunk(complete)),
-                Response::Error(error) => Err(EngineError::Http {
-                    status: u16::try_from(error.http_status)
-                        .ok()
-                        .and_then(|code| StatusCode::from_u16(code).ok())
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                    message: error.message,
-                }),
+                Response::Error(error) => Err(http_error(error)),
             };
             self.finished = !matches!(item, Ok(TokenChunk::Partial { .. }));
             return Poll::Ready(Some(item));
@@ -92,6 +86,17 @@ impl TokenSource for AtomStream {
     /// Nothing to suppress: a cancelled call is ATOM's abort, and a finished
     /// call has nothing left to cancel.
     fn mark_completed(&mut self) {}
+}
+
+/// A GenerateError, with the status ATOM's HTTP routes answer its request with.
+pub(super) fn http_error(error: GenerateError) -> EngineError {
+    EngineError::Http {
+        status: u16::try_from(error.http_status)
+            .ok()
+            .and_then(|code| StatusCode::from_u16(code).ok())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        message: error.message,
+    }
 }
 
 fn complete_chunk(complete: GenerateComplete) -> TokenChunk {
