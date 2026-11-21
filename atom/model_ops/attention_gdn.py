@@ -5,6 +5,7 @@ import torch
 import triton
 import triton.language as tl
 from aiter.dist.parallel_state import get_tp_group
+from aiter.ops.triton.utils.fast_launch import fast_launch
 from einops import rearrange
 from torch import nn
 
@@ -64,6 +65,9 @@ def fused_gdn_gating_kernel(
     )
 
 
+_fused_gdn_gating = fast_launch(fused_gdn_gating_kernel, by_specialization=True)
+
+
 def fused_gdn_gating(
     A_log: torch.Tensor,
     a: torch.Tensor,
@@ -83,7 +87,7 @@ def fused_gdn_gating(
     grid = (batch, seq_len, triton.cdiv(num_heads, 8))
     g = torch.empty(1, batch, num_heads, dtype=torch.float32, device=a.device)
     beta_output = torch.empty(1, batch, num_heads, dtype=b.dtype, device=b.device)
-    fused_gdn_gating_kernel[grid](
+    _fused_gdn_gating[grid](
         g,
         beta_output,
         A_log,

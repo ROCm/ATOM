@@ -30,6 +30,7 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.flydsl.kernels.mqa_logits import qsa_flydsl_layout
 from aiter.ops.topk import top_k_per_row_prefill
+from aiter.ops.triton.utils.fast_launch import fast_launch
 
 from atom.model_ops.qwen4_exp.ops.qsa_gfx1250 import (
     qsa_gfx1250_supports,
@@ -500,6 +501,11 @@ def _qsa_compressed_slots_kernel(
     tl.store(out_ptr + tokens, tl.where(closes_group, slot // RATIO, -1), mask)
 
 
+_qsa_compressed_slots = fast_launch(
+    _qsa_compressed_slots_kernel, by_specialization=True
+)
+
+
 def qsa_compressed_slots(
     slot_mapping: torch.Tensor,
     logical_positions: torch.Tensor,
@@ -525,7 +531,7 @@ def qsa_compressed_slots(
     if out.ndim != 1 or out.stride(0) != 1:
         raise ValueError("QSA compressed slots output must be contiguous")
     if tokens:
-        _qsa_compressed_slots_kernel[(triton.cdiv(tokens, 256),)](
+        _qsa_compressed_slots[(triton.cdiv(tokens, 256),)](
             slot_mapping,
             logical_positions,
             out,
@@ -597,6 +603,9 @@ def _qsa_mrope_kernel(
     tl.store(dst + dims, result, dims < HEAD_DIM)
 
 
+_qsa_mrope = fast_launch(_qsa_mrope_kernel, by_specialization=True)
+
+
 def qsa_apply_mrope(
     rotary_emb,
     positions: torch.Tensor,
@@ -636,7 +645,7 @@ def qsa_apply_mrope(
         positions.stride(0) if positions.ndim == 2 and positions.shape[0] == 3 else 0
     )
     kv_heads = k.shape[1] if k is not None else 0
-    _qsa_mrope_kernel[(tokens * (heads + kv_heads),)](
+    _qsa_mrope[(tokens * (heads + kv_heads),)](
         q,
         k if k is not None else q,
         out_q,
@@ -711,6 +720,9 @@ def _qsa_store_rows_kernel(
     )
 
 
+_qsa_store_rows = fast_launch(_qsa_store_rows_kernel, by_specialization=True)
+
+
 def qsa_store_rows(
     cache: torch.Tensor,
     slots: torch.Tensor,
@@ -736,7 +748,7 @@ def qsa_store_rows(
 
     flat = cache.view(cache.shape[0] * cache.shape[1], cache.shape[2], cache.shape[3])
     head_dim = values.shape[2]
-    _qsa_store_rows_kernel[(rows, values.shape[1])](
+    _qsa_store_rows[(rows, values.shape[1])](
         flat,
         slots,
         values,
@@ -874,6 +886,9 @@ def _qsa_compress_groups_kernel(
         )
 
 
+_qsa_compress_groups = fast_launch(_qsa_compress_groups_kernel, by_specialization=True)
+
+
 def qsa_compress_groups(
     raw_key_cache: torch.Tensor,
     page_table: torch.Tensor,
@@ -920,7 +935,7 @@ def qsa_compress_groups(
         position_cache = raw_key_cache
         position_strides = (0, 0, 0)
 
-    _qsa_compress_groups_kernel[(rows,)](
+    _qsa_compress_groups[(rows,)](
         raw_key_cache,
         position_cache,
         page_table,
@@ -1297,6 +1312,9 @@ def _expand_selected_groups(
     )
 
 
+_expand_selected = fast_launch(_expand_selected_groups, by_specialization=True)
+
+
 @triton.jit
 def _qsa_paged_mqa_logits_mfma_kernel(
     q_ptr,
@@ -1629,6 +1647,12 @@ _STACKED_DECODE_TILES_GFX1250 = {_FMT_BF16: (4, 64, 2, None)}
 _STACKED_DECODE_PROGRAMS_PER_CU = 8
 
 
+_scorer_mfma = fast_launch(_qsa_paged_mqa_logits_mfma_kernel, by_specialization=True)
+_scorer_stacked = fast_launch(
+    _qsa_paged_mqa_logits_stacked_kernel, by_specialization=True
+)
+
+
 def _stacked_decode_tiles(key_fmt: int) -> tuple[int, int, int, int | None]:
     """(rows per program, column tile, warps, column programs or None)."""
     if _is_gfx1250() and key_fmt in _STACKED_DECODE_TILES_GFX1250:
@@ -1771,9 +1795,7 @@ def qsa_paged_mqa_logits(
         and head_dim & (head_dim - 1) == 0
         and head_dim >= 16
     ):
-        _qsa_paged_mqa_logits_stacked_kernel[
-            (row_programs, min(triton.cdiv(columns, bn), column_programs))
-        ](
+        _scorer_stacked[(row_programs, min(triton.cdiv(columns, bn), column_programs))](
             q,
             compressed_k_cache,
             scale,
@@ -1841,9 +1863,7 @@ def qsa_paged_mqa_logits(
             )
             return logits, visible_groups
         bmt, bn = 16, 128
-        _qsa_paged_mqa_logits_mfma_kernel[
-            (triton.cdiv(q.shape[0], bmt), triton.cdiv(columns, bn))
-        ](
+        _scorer_mfma[(triton.cdiv(q.shape[0], bmt), triton.cdiv(columns, bn))](
             q,
             compressed_k_cache,
             scale,
@@ -2003,7 +2023,7 @@ def qsa_expand_block_indices(
     if block_indices.shape[0] == 0:
         return out
 
-    _expand_selected_groups[(block_indices.shape[0], triton.cdiv(output_width, 128))](
+    _expand_selected[(block_indices.shape[0], triton.cdiv(output_width, 128))](
         block_indices,
         context_lens,
         query_positions,
@@ -2393,6 +2413,9 @@ def _qsa_sparse_paged_gqa_kernel(
 _GQA_TILES = {(True, False): (32, 4, 2, 0), (True, True): (32, 2, 2, 0)}
 
 
+_sparse_paged_gqa = fast_launch(_qsa_sparse_paged_gqa_kernel, by_specialization=True)
+
+
 def qsa_sparse_paged_gqa(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -2494,7 +2517,7 @@ def qsa_sparse_paged_gqa(
         return out.zero_()
     target, partial_max, partial_sum, widths = split_k_buffers(out, kv_splits)
     grid_y = k_cache.shape[2] * num_head_groups
-    _qsa_sparse_paged_gqa_kernel[(q.shape[0], grid_y, kv_splits)](
+    _sparse_paged_gqa[(q.shape[0], grid_y, kv_splits)](
         q,
         k_cache,
         v_cache,

@@ -16,6 +16,7 @@ import torch
 import triton
 import triton.language as tl
 from aiter import QuantType
+from aiter.ops.triton.utils.fast_launch import fast_launch
 
 
 def is_per_token_fp8_linear(linear: torch.nn.Module) -> bool:
@@ -189,13 +190,16 @@ def _gated_pointwise_kernel(
     tl.store(out_ptr + row * WIDTH + cols, result, cols < WIDTH)
 
 
+_gated_pointwise = fast_launch(_gated_pointwise_kernel, by_specialization=True)
+
+
 def scaled_silu(x: torch.Tensor, scale: int) -> torch.Tensor:
     """SiLU(x / scale), retaining the intermediate activation dtype."""
     rows, width = x.shape
     out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
     if rows:
         block = min(1024, triton.next_power_of_2(width))
-        _gated_pointwise_kernel[(rows, triton.cdiv(width, block))](
+        _gated_pointwise[(rows, triton.cdiv(width, block))](
             x,
             x,
             x,
@@ -227,7 +231,7 @@ def sigmoid_mul(
     out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
     if rows:
         block = min(1024, triton.next_power_of_2(width))
-        _gated_pointwise_kernel[(rows, triton.cdiv(width, block))](
+        _gated_pointwise[(rows, triton.cdiv(width, block))](
             x,
             gate,
             residual if residual is not None else x,
@@ -391,6 +395,11 @@ def _sigmoid_rmsnorm_quant_kernel(
     _store_per_token_fp8(out_ptr, scale_ptr, token, offsets, mask, y, FP8_MAX)
 
 
+_sigmoid_rmsnorm_quant = fast_launch(
+    _sigmoid_rmsnorm_quant_kernel, by_specialization=True
+)
+
+
 def sigmoid_rmsnorm_quant(
     x: torch.Tensor,
     gate: torch.Tensor,
@@ -411,7 +420,7 @@ def sigmoid_rmsnorm_quant(
     out = torch.empty((tokens, heads * dim), dtype=quant_dtype, device=x.device)
     scale = torch.empty((tokens, 1), dtype=torch.float32, device=x.device)
     if tokens:
-        _sigmoid_rmsnorm_quant_kernel[(tokens,)](
+        _sigmoid_rmsnorm_quant[(tokens,)](
             x,
             gate,
             weight,
@@ -455,6 +464,9 @@ def _sigmoid_mul_quant_kernel(
     _store_per_token_fp8(out_ptr, scale_ptr, row, row * WIDTH + cols, mask, y, FP8_MAX)
 
 
+_sigmoid_mul_quant = fast_launch(_sigmoid_mul_quant_kernel, by_specialization=True)
+
+
 def sigmoid_mul_quant(
     x: torch.Tensor, gate: torch.Tensor, quant_dtype: torch.dtype
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -470,7 +482,7 @@ def sigmoid_mul_quant(
     out = torch.empty((rows, width), dtype=quant_dtype, device=x.device)
     scale = torch.empty((rows, 1), dtype=torch.float32, device=x.device)
     if rows:
-        _sigmoid_mul_quant_kernel[(rows,)](
+        _sigmoid_mul_quant[(rows,)](
             x,
             gate,
             out,
