@@ -1,5 +1,6 @@
 """The fixed native client retains every raw record and closes on refusal."""
 
+import ast
 import contextlib
 import importlib.util
 import json
@@ -8,9 +9,10 @@ import os
 import sys
 import tempfile
 import unittest
+from dataclasses import dataclass, fields
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 CLIENT = (
     Path(__file__).parents[1] / ".github/scripts/kda3501_native_repeat/native_client.py"
@@ -20,6 +22,66 @@ client = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(client)
 DATA = json.loads(CLIENT.with_name("inputs.json").read_text())
 RECORD = (-0.1, 1) + sum(((i, -0.1 - i) for i in range(20)), ())
+
+
+def native_engine_args(engine):
+    """Real native constructor/kwargs/creation methods; downstream providers are stubs."""
+    source = Path(__file__).parents[1] / "atom/model_engine/arg_utils.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    cls = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "EngineArgs"
+    )
+    cls.body = [
+        node
+        for node in cls.body
+        if isinstance(node, (ast.AnnAssign, ast.Assign))
+        or isinstance(node, ast.FunctionDef)
+        and node.name in ("_get_engine_kwargs", "parallel_config", "create_engine")
+    ]
+
+    def create(model, tokenizer=None, **kwargs):
+        engine.constructor_model, engine.constructor_kwargs = model, kwargs
+        engine.config.speculative_config = kwargs["speculative_config"]
+        return engine
+
+    engine.draft_config = Mock(
+        side_effect=AssertionError("unexpected draft config construction")
+    )
+    config = SimpleNamespace(from_dict=lambda value: value)
+    namespace = {
+        "__name__": __name__,
+        "dataclass": dataclass,
+        "fields": fields,
+        "DP_LB_DEFAULT": "least_requests",
+        "CompilationConfig": SimpleNamespace,
+        "CUDAGraphMode": {"FULL": "FULL"},
+        "SpeculativeConfig": engine.draft_config,
+        "ParallelConfig": SimpleNamespace,
+        "DSparkConfig": config,
+        "DCPConfig": config,
+        "EPLBConfig": config,
+        "LLMEngine": create,
+        "logger": Mock(),
+        "envs": SimpleNamespace(
+            ATOM_KV_OFFLOAD=None, ATOM_KV_OFFLOAD_EXTRA_CONFIG=None
+        ),
+        "kv_offload_connector_config": lambda mode, extra: None,
+        "compose_kv_offload_config": lambda base, offload: base,
+    }
+    parse_sizes = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "parse_size_list"
+    )
+    exec(  # noqa: S102 -- native constructors without importing GPU dependencies
+        compile(
+            ast.Module(body=[parse_sizes, cls], type_ignores=[]), str(source), "exec"
+        ),
+        namespace,
+    )
+    return namespace["EngineArgs"]
 
 
 class NativeClientTest(unittest.TestCase):
@@ -59,7 +121,7 @@ class NativeClientTest(unittest.TestCase):
                 client.save(path, "large.json", {"value": "x" * 1024**2})
             self.assertFalse((path / "large.json").exists())
 
-    def run_client(self, folder, bad_cache=False, nonfinite=None):
+    def run_client(self, folder, bad_cache=False, nonfinite=None, bad_mtp=None):
         root = Path(folder)
         proof = {
             "tokens": DATA["tokens"],
@@ -88,7 +150,13 @@ class NativeClientTest(unittest.TestCase):
             "cached_tokens": engine.cached,
             "offload_tokens": 0,
         }
-        engine.get_mtp_statistics = lambda **kw: {"requests": len(engine.submissions)}
+        engine.get_mtp_statistics = lambda **kw: {
+            "enabled": False,
+            "total_draft_tokens": 0,
+            "total_accepted_tokens": 0,
+            "distribution": {},
+            **(bad_mtp or {}),
+        }
         engine.is_finished = lambda: engine.finished
         engine.close = lambda: setattr(engine, "closed", True)
         engine.core_mgr = SimpleNamespace(
@@ -141,9 +209,7 @@ class NativeClientTest(unittest.TestCase):
             ),
             "triton": SimpleNamespace(__version__=DATA["runtime"]["triton"]),
             "atom.model_engine.arg_utils": SimpleNamespace(
-                EngineArgs=lambda **kwargs: SimpleNamespace(
-                    create_engine=lambda: engine
-                )
+                EngineArgs=native_engine_args(engine)
             ),
         }
         with (
@@ -164,16 +230,23 @@ class NativeClientTest(unittest.TestCase):
             if nonfinite is not None:
                 with self.assertRaises((AssertionError, ValueError)):
                     client.main()
-            elif bad_cache:
+            elif bad_cache or bad_mtp:
                 with self.assertRaises(AssertionError):
                     client.main()
             else:
-                client.main()
+                try:
+                    client.main()
+                except AttributeError as error:
+                    self.fail(f"zero-token native config was not handled: {error}")
         return engine
 
     def test_three_requests_preserve_divergence_and_fresh_params(self):
         with tempfile.TemporaryDirectory() as folder:
             engine = self.run_client(folder)
+            self.assertEqual(DATA["engine_args"]["num_speculative_tokens"], 0)
+            self.assertIsNone(engine.constructor_kwargs["speculative_config"])
+            self.assertNotIn("draft_model", engine.constructor_kwargs)
+            engine.draft_config.assert_not_called()
             self.assertTrue(engine.closed)
             self.assertEqual(len(engine.submissions), 3)
             self.assertEqual(len({id(params) for _, params in engine.submissions}), 3)
@@ -184,6 +257,24 @@ class NativeClientTest(unittest.TestCase):
             self.assertFalse(result["C0_W0_same_ids"])
             self.assertTrue(result["W0_W1_same_ids"])
             self.assertEqual(result["qualification"], "not_assessed")
+
+    def test_active_or_nonzero_mtp_stats_are_retained_and_refused(self):
+        for bad in (
+            {"enabled": True},
+            {"total_draft_tokens": 1},
+            {"total_accepted_tokens": 1},
+            {"distribution": {"0": 1}},
+        ):
+            with self.subTest(stats=bad), tempfile.TemporaryDirectory() as folder:
+                engine = self.run_client(folder, bad_mtp=bad)
+                self.assertTrue(engine.closed)
+                self.assertEqual(len(engine.submissions), 1)
+                output = Path(folder) / "out"
+                saved = json.loads((output / "C0.json").read_text())
+                for key, value in bad.items():
+                    self.assertEqual(saved["before"]["mtp"][key], value)
+                self.assertTrue((output / "failure.json").exists())
+                self.assertFalse((output / "collection.json").exists())
 
     def test_coverage_failure_preserves_phase_and_does_not_retry(self):
         with tempfile.TemporaryDirectory() as folder:

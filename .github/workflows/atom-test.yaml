@@ -1017,6 +1017,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$STAGE1_ROOT/src/baseline" "$STAGE1_ROOT/results"
+          cat /sys/module/amdgpu/version > "$STAGE1_ROOT/results/host-amdgpu-version.txt" 2>&1 || true
           git archive fb1304722a9f79cd16e7383b8b504ccb29851d77 | tar -x -C "$STAGE1_ROOT/src/baseline"
           mapfile -t wheels < <(find "$STAGE1_ROOT/wheels" -name '*.whl')
           test "${#wheels[@]}" = 1

@@ -96,7 +96,7 @@ def main():
         engine = EngineArgs(**data["engine_args"]).create_engine()
         save(output, "initialized.json", {"elapsed_seconds": time.monotonic() - start})
         assert not engine.config.kv_transfer_config
-        assert engine.config.speculative_config.synthetic_acceptance_rates is None
+        assert engine.config.speculative_config is None
         completions = []
         for phase in data["phases"]:
             before = {
@@ -141,6 +141,12 @@ def main():
                     "rejected_callbacks": rejected,
                 },
             )
+            for stats in (before["mtp"], after["mtp"]):
+                assert stats["enabled"] is False
+                assert (
+                    stats["total_draft_tokens"] == stats["total_accepted_tokens"] == 0
+                )
+                assert not stats["distribution"]
             assert not rejected, "non-finite native callback was rejected"
             assert len(rows) == 1
             row = rows[0]

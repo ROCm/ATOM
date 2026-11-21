@@ -18,7 +18,7 @@
     "gpu_memory_utilization": 0.9,
     "state_checkpoint_interval_tokens": -1,
     "method": "dspark",
-    "num_speculative_tokens": 7,
+    "num_speculative_tokens": 0,
     "level": 3,
     "cudagraph_mode": "FULL",
     "kv_transfer_config": "{}"
