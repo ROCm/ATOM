@@ -203,6 +203,7 @@ jobs:
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install "ray[default]>=2.9" "omegaconf>=2.3,<2.4" datasets accelerate \
             safetensors "transformers==5.16.1" triton pyzmq pytest \
+            "tomli>=2; python_version < '3.11'" \
             "megatron-core==0.18.2; python_version >= '3.12'"
           SETUPTOOLS_SCM_PRETEND_VERSION_FOR_ATOM=0.0.0+cpu.ci pip install --no-deps -e .
           pip install --no-deps -e atomrl
@@ -230,6 +231,7 @@ jobs:
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install pytest pyyaml
           SETUPTOOLS_SCM_PRETEND_VERSION_FOR_ATOM=0.0.0+lumen.ci pip install --no-deps -e .
+          pip install --no-deps -e atomrl
       - name: Run CPU-safe Lumen coverage
         run: |
           python -m pytest \
