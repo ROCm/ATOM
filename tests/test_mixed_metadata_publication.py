@@ -141,14 +141,12 @@ def _runner(monkeypatch, slots):
         hf_config=SimpleNamespace(num_attention_heads=8),
     )
     runner.pool_plan = SimpleNamespace(entries={STATE_SLOT_CLASS: 64})
-    runner.tokenID_processor = SimpleNamespace(
-        num_rejected=None, is_deferred_out=slots == 1
-    )
-    runner.tokenID_processor.verify_ctx_lens = tokenIDProcessor.verify_ctx_lens.__get__(
-        runner.tokenID_processor
+    runner.attn_family = SimpleNamespace(has_recurrent_state=False)
+    runner.tokenID_processor = tokenIDProcessor(
+        runner, 32, use_spec=True, num_spec_tokens=1
     )
     runner.forward_vars = {
-        name: CpuGpuBuffer(32, dtype=torch.int32, device=runner.device)
+        name: getattr(runner.tokenID_processor, name)
         for name in ("input_ids", "decode_src", "batch_info")
     }
     runner.forward_vars["positions"] = CpuGpuBuffer(
@@ -195,13 +193,23 @@ def test_idle_v4_decode_publishes_padding_with_previous_spec_status(
 ):
     runner, builder = _runner(monkeypatch, slots)
     previous_rejected = np.array([0, 1, 1], dtype=np.int32)
-    runner.tokenID_processor.num_rejected = previous_rejected
-    batch = ScheduledBatch({}, [], 0, num_spec_step=1)
+    processor = runner.tokenID_processor
+    processor.num_rejected = previous_rejected
+    processor.num_bonus = np.zeros(3, dtype=np.int32)
+    processor.prev_batch = SimpleNamespace(req_ids=[10, 11, 12], is_dummy_run=False)
+    processor.prev_token_ids = torch.zeros(3, dtype=torch.int32, device=runner.device)
+    processor.prev_rejected_num = previous_rejected
+    processor.prev_bonus_num = processor.num_bonus
+    batch = ScheduledBatch({}, [], 0, num_spec_step=1, is_dummy_run=True)
     assert batch.total_seqs_num_decode == 0 and not batch.is_mixed
 
     runner._advance_forward_vars()
     runner._gate_staging_reuse()
     builder.publish_query_metadata(batch.num_scheduled_tokens, 4, 4 * query_width)
+    group = runner.h2d_groups["input_ids"]
+    # prepare_model assembles tokens before attention, rebinding status to
+    # this empty batch instead of carrying the previous rows into metadata.
+    ids = processor.prepare_input_ids(batch, query_width, group)
     metadata, positions = builder.prepare_decode(batch, 4, 4 * query_width, query_width)
     runner._mark_staging_h2d_enqueued()
     runner._record_forward_vars_event()
@@ -210,7 +218,8 @@ def test_idle_v4_decode_publishes_padding_with_previous_spec_status(
     assert metadata.cu_seqlens_q.cpu().tolist() == [0] * 5
     assert positions.cpu().tolist() == [0] * (4 * query_width)
     assert metadata.state_slot_out.cpu().tolist() == [0] * 4
-    assert runner.tokenID_processor.num_rejected is previous_rejected
+    assert ids.numel() == 0
+    assert processor.num_rejected.size == processor.num_bonus.size == 0
     np.testing.assert_array_equal(previous_rejected, [0, 1, 1])
 
 

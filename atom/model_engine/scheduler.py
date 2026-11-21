@@ -491,6 +491,7 @@ class ScheduledBatch:
         self.total_seqs_num = total_seqs_num
         self.total_seqs_num_prefill = total_seqs_num_prefill
         self.total_seqs_num_decode = total_seqs_num_decode
+        self.is_mixed = total_seqs_num_prefill > 0 and total_seqs_num_decode > 0
 
         self.connector_meta_output = connector_meta_output
         self.finished_recving_kv_req_ids: list[int] = []
@@ -619,6 +620,7 @@ class ScheduledBatch:
     _SEGMENT_FIELDS = frozenset(
         (
             "has_prefill",
+            "is_mixed",
             "any_logprobs",
             "logprob_requested",
             "logprob_request_indices",
@@ -719,6 +721,7 @@ class ScheduledBatch:
             result.total_seqs_num - result.total_seqs_num_prefill
         )
         result.has_prefill = result.total_seqs_num_prefill > 0
+        result.is_mixed = result.has_prefill and result.total_seqs_num_decode > 0
         result.total_tokens_num = token_stop - token_start
         result.total_tokens_num_prefill = int(
             result.num_scheduled_tokens[: result.total_seqs_num_prefill].sum()
@@ -736,10 +739,6 @@ class ScheduledBatch:
         result.prefill_gpu_requests = []
         result.detailed_sqsq = result.detailed_sqsk = result.detailed_sk = None
         return result
-
-    @property
-    def is_mixed(self) -> bool:
-        return self.total_seqs_num_prefill > 0 and self.total_seqs_num_decode > 0
 
     def produces_output(self) -> bool:
         """True if this batch yields a token the head must consume.
@@ -1094,9 +1093,7 @@ class Scheduler:
         # What a P/D receive's first decode takes past its prompt: T0 and the
         # `mtp_k` verify slots its handoff appends, then the reach past them
         # that `can_append` checks before the step runs, as decode does below.
-        decode_reach = max(
-            1 + (self.mtp_k if self.use_spec else 0), self.draft_lookahead
-        )
+        decode_reach = max(1 + self.mtp_k, self.draft_lookahead)
         self.pd_admission = PdAdmissionController.from_config(
             config,
             self.kv_connector,
@@ -1552,10 +1549,6 @@ class Scheduler:
         room = max(room, self._balance_min_tokens - batched_tokens)
         return max(min(room, cap_room), 0)
 
-    @property
-    def decode_spec_width(self) -> int:
-        return self.mtp_k if self.use_spec else 0
-
     def _decode_candidates(self):
         """Running rows eligible for decode in this step, in scheduling order."""
         return (
@@ -1568,18 +1561,18 @@ class Scheduler:
     def _budget_for_decodes(self, n_decode, reserved_blocks=0):
         # Zero prevents prefill execution, not transfer completion or reclaiming
         # a settled KV owner. Decode demand is finalized before selecting chunks.
-        if reserved_blocks and not self.block_manager.has_page_units(reserved_blocks):
+        if reserved_blocks and not self.block_manager._has_page_units(reserved_blocks):
             return 0
         budget = self.max_num_batched_tokens
         n_decode = min(n_decode, self.max_num_seqs)
         floor = prefill_floor(budget)
-        reserve = min(n_decode * (self.decode_spec_width + 1), budget - floor)
+        reserve = min(n_decode * (self.mtp_k + 1), budget - floor)
         return budget - max(reserve, 0)
 
     def _mixed_decode_seats(self):
         """Maximum decodes beside a one-token, one-row prefill."""
         return decode_seats(
-            self.max_num_batched_tokens, self.max_num_seqs, self.decode_spec_width + 1
+            self.max_num_batched_tokens, self.max_num_seqs, self.mtp_k + 1
         )
 
     def _prefill_limits(self) -> PrefillLimits:
@@ -1587,7 +1580,7 @@ class Scheduler:
         if not self.enable_mixed_prefill_decode:
             return self._unreserved_prefill_limits
         candidates = list(self._decode_candidates())
-        width = self.decode_spec_width + 1
+        width = self.mtp_k + 1
         # Prefill may use less than its token budget. Protect every decode
         # that could join even a one-token, one-row prefill; the decode loop
         # can spend all remaining tokens. Without prefill, no pages are spent
@@ -1613,7 +1606,7 @@ class Scheduler:
         count = limits.num_decodes
         blocks = limits.reserved_decode_blocks
         seats = self._mixed_decode_seats()
-        width = self.decode_spec_width + 1
+        width = self.mtp_k + 1
         for _ in range(len(self.waiting)):
             seq = self.waiting.popleft()
             if (
@@ -2025,7 +2018,7 @@ class Scheduler:
                 fewest = left
         if fewest is None:
             return None
-        tokens_per_step = 1 + (self.mtp_k if self.use_spec else 0)
+        tokens_per_step = 1 + self.mtp_k
         return -(-fewest // tokens_per_step)
 
     def _oldest_waiting_prefill_age_ms(self) -> float:
@@ -3268,58 +3261,12 @@ class Scheduler:
             self._log_prefill_balance(total_tokens_num_prefill)
 
         if num_seqs_prefill > 0 and not self.enable_mixed_prefill_decode:
-            # A cursor, not a hit count: it starts at the prefix-cache hit and
-            # then advances by each finished chunk, so a chunked prompt logs the
-            # same req_id repeatedly with this climbing by the previous `new`.
-            # Logged as "done" so those repeats don't read as a growing hit.
-            num_cached_tokens_list = [
-                seq.num_cached_tokens for seq in scheduled_seqs.values()
-            ]
-            logger.info(
-                f"Scheduled prefill batch: {num_seqs_prefill} reqs, "
-                f"{total_tokens_num_prefill} new tokens "
-                f"(done: {num_cached_tokens_list}, new: {num_scheduled_tokens}), "
-                f"req_ids: {tuple(scheduled_seqs.keys())}"
+            return self._build_prefill_batch(
+                scheduled_seqs,
+                num_scheduled_tokens,
+                num_seqs_prefill,
+                total_tokens_num_prefill,
             )
-            self.prev_prompt = True
-
-            connector_meta_output = None
-            if self.kv_connector is not None:
-                self._publish_state_loads()
-                self._publish_state_stores()
-                self._note_connector_scheduled_tokens(
-                    scheduled_seqs, num_scheduled_tokens
-                )
-                connector_meta_output = self.kv_connector.build_connector_meta()
-
-            is_final_chunk, next_token_ids = self._settle_prefill_chunks(
-                scheduled_seqs.values(), num_scheduled_tokens, num_cached_tokens_list
-            )
-            self._check_draft_writes_allocated(scheduled_seqs.values())
-
-            prefill_batch = ScheduledBatch(
-                seqs=scheduled_seqs,
-                num_scheduled_tokens=num_scheduled_tokens,
-                total_tokens_num=total_tokens_num_prefill,
-                total_tokens_num_prefill=total_tokens_num_prefill,
-                total_seqs_num=num_seqs_prefill,
-                total_seqs_num_prefill=num_seqs_prefill,
-                connector_meta_output=connector_meta_output,
-                num_cached_tokens=num_cached_tokens_list,
-                is_final_chunk=is_final_chunk,
-                next_token_ids=next_token_ids,
-                state_maintenance_ops=self.block_manager.take_state_maintenance_ops(),
-            )
-            self._consume_state_forks(scheduled_seqs)
-
-            if self.advance_on_schedule:
-                # Advance after batch build (so the batch keeps pre-advance
-                # offsets) so the next schedule() issues the following chunk.
-                self._advance_prefill_on_schedule(
-                    scheduled_seqs.values(), num_scheduled_tokens, is_final_chunk
-                )
-
-            return (prefill_batch, scheduled_seqs)
 
         if group_prefill_tick and not num_seqs_prefill:
             # The group's prefill step, with no prefill of this rank's own: it
@@ -3346,7 +3293,7 @@ class Scheduler:
         num_seqs_decode = 0
         num_decode_tokens = total_tokens_num_prefill
         # anchor + drafts if verifying locally, anchor alone otherwise.
-        spec_width = self.mtp_k if self.use_spec else 0
+        spec_width = self.mtp_k
         tokens_per_decode_seq = spec_width + 1
         num_new_tokens = spec_width + 1
         remote_kv_blocks: set[int] = set()
@@ -3441,10 +3388,11 @@ class Scheduler:
             self.running.extend(seq for seq in mixed_order if seq.id in retained)
             self.running.extend(promoted)
         if num_seqs_prefill:
-            return self._build_mixed_batch(
+            return self._build_prefill_batch(
                 scheduled_seqs,
                 num_scheduled_tokens,
                 num_seqs_prefill,
+                total_tokens_num_prefill,
                 num_seqs_decode,
                 scheduled_spec_decode_tokens,
                 remote_kv_blocks,
@@ -3468,7 +3416,7 @@ class Scheduler:
             total_seqs_num_prefill=num_seqs_prefill,
             total_seqs_num_decode=num_seqs_decode,
             connector_meta_output=connector_meta_output,
-            num_spec_step=self.mtp_k if self.use_spec else 0,
+            num_spec_step=self.mtp_k,
             is_deferred_out=self.is_deferred_out,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             remote_kv_block_ids=sorted(remote_kv_blocks) if remote_kv_blocks else [],
@@ -3486,33 +3434,48 @@ class Scheduler:
         self._consume_state_forks(scheduled_seqs)
         return (decode_batch, scheduled_seqs)
 
-    def _build_mixed_batch(
+    def _build_prefill_batch(
         self,
         scheduled_seqs,
         num_scheduled_tokens,
         num_seqs_prefill,
-        num_seqs_decode,
-        scheduled_spec_decode_tokens,
-        remote_kv_blocks,
-        remote_kv_seq_blocks,
+        total_tokens_num_prefill,
+        num_seqs_decode=0,
+        scheduled_spec_decode_tokens=None,
+        remote_kv_blocks=None,
+        remote_kv_seq_blocks=None,
     ) -> tuple[ScheduledBatch, dict[int, Sequence]]:
-        """Snapshot and settle a mixed-enabled tick carrying prefill rows."""
-        # Recompute prefill/decode token totals from the per-row list. In
-        # mixed batches prefill rows come first (Phase 1 + Phase 2 appended),
-        # decode rows after, so the split is at `num_seqs_prefill`.
-        total_tokens_num_prefill = sum(num_scheduled_tokens[:num_seqs_prefill])
-        total_tokens_num_decode = sum(num_scheduled_tokens[num_seqs_prefill:])
-        total_tokens_num = total_tokens_num_prefill + total_tokens_num_decode
+        """Publish transfers, settle chunks and snapshot a prefill-bearing step.
 
+        The default prefill path passes its already computed token total and
+        uses the original row lists; only mixed steps need segment slices.
+        """
         num_cached_tokens_list = [
             seq.num_cached_tokens for seq in scheduled_seqs.values()
         ]
-
-        # Prefill rows occupy `[:num_seqs_prefill]`: Phase 1/2 put them in
-        # `scheduled_seqs` first and decode scheduling appended after them,
-        # which ScheduledBatch.slice_rows preserves for attention segments.
-        prefill_seqs = list(scheduled_seqs.values())[:num_seqs_prefill]
-
+        if num_seqs_decode:
+            total_tokens_num_decode = sum(num_scheduled_tokens[num_seqs_prefill:])
+            prefill_seqs = list(scheduled_seqs.values())[:num_seqs_prefill]
+            prefill_tokens = num_scheduled_tokens[:num_seqs_prefill]
+            prefill_cached = num_cached_tokens_list[:num_seqs_prefill]
+            logger.info(
+                f"Scheduled mixed batch: {num_seqs_prefill} prefill + "
+                f"{num_seqs_decode} decode, "
+                f"{total_tokens_num_prefill}+{total_tokens_num_decode} tokens"
+            )
+        else:
+            total_tokens_num_decode = 0
+            prefill_seqs = scheduled_seqs.values()
+            prefill_tokens = num_scheduled_tokens
+            prefill_cached = num_cached_tokens_list
+            # done is the chunk cursor, not a growing prefix-cache hit count.
+            logger.info(
+                f"Scheduled prefill batch: {num_seqs_prefill} reqs, "
+                f"{total_tokens_num_prefill} new tokens "
+                f"(done: {num_cached_tokens_list}, new: {num_scheduled_tokens}), "
+                f"req_ids: {tuple(scheduled_seqs.keys())}"
+            )
+        self.prev_prompt = True
         connector_meta_output = None
         if self.kv_connector is not None:
             self._publish_state_loads()
@@ -3520,59 +3483,29 @@ class Scheduler:
             self._note_connector_scheduled_tokens(scheduled_seqs, num_scheduled_tokens)
             connector_meta_output = self.kv_connector.build_connector_meta()
 
-        self.prev_prompt = True
-        if num_seqs_decode:
-            logger.info(
-                f"Scheduled mixed batch: {num_seqs_prefill} prefill + "
-                f"{num_seqs_decode} decode, "
-                f"{total_tokens_num_prefill}+{total_tokens_num_decode} tokens"
-            )
-        else:
-            logger.info(
-                f"Scheduled prefill batch: {num_seqs_prefill} reqs, "
-                f"{total_tokens_num_prefill} new tokens "
-                f"(done: {num_cached_tokens_list}, new: {num_scheduled_tokens}), "
-                f"req_ids: {tuple(scheduled_seqs.keys())}"
-            )
-        # Connector metadata describes transfers already queued. Midstep
-        # checkpoints are reserved afterwards, before the batch snapshot.
+        # Connector metadata describes already queued transfers. Reserve
+        # midstep checkpoints afterwards, before the batch snapshot.
         is_final_chunk, next_token_ids = self._settle_prefill_chunks(
-            prefill_seqs,
-            num_scheduled_tokens[:num_seqs_prefill],
-            num_cached_tokens_list[:num_seqs_prefill],
+            prefill_seqs, prefill_tokens, prefill_cached
         )
-        # Pad out to ONE ENTRY PER ROW. `_record_kv_cache_ready` zips this
-        # against `req_ids` with `strict=True`, and every other list on a
-        # batch is row-aligned, so a prefill-length list here would be both
-        # a crash on a mixed batch and a trap for the next reader. False is
-        # the honest value for a decode row: it is not a prompt chunk, so
-        # it never completes one, and nothing should announce its prefix.
-        is_final_chunk = is_final_chunk + [False] * num_seqs_decode
-        if next_token_ids is not None:
-            # Same row-alignment rule; -1 is this list's own "sampling
-            # supplies it", which is exactly right for a decode row.
-            # (Set only for a drafter that needs the successor token; the
-            # mixed spec path is DSpark, which does not, and the launch
-            # check refuses the others -- but leaving the list short would
-            # make that a positional mismatch rather than a clear refusal.)
-            next_token_ids = next_token_ids + [-1] * num_seqs_decode
-
+        if num_seqs_decode:
+            # Row-aligned markers: a decode never completes a prompt chunk.
+            is_final_chunk += [False] * num_seqs_decode
+            if next_token_ids is not None:
+                next_token_ids += [-1] * num_seqs_decode
         self._check_draft_writes_allocated(scheduled_seqs.values())
         batch = ScheduledBatch(
             seqs=scheduled_seqs,
             num_scheduled_tokens=num_scheduled_tokens,
-            total_tokens_num=total_tokens_num,
+            total_tokens_num=total_tokens_num_prefill + total_tokens_num_decode,
             total_tokens_num_prefill=total_tokens_num_prefill,
             total_tokens_num_decode=total_tokens_num_decode,
             total_seqs_num=num_seqs_prefill + num_seqs_decode,
             total_seqs_num_prefill=num_seqs_prefill,
             total_seqs_num_decode=num_seqs_decode,
             connector_meta_output=connector_meta_output,
-            # A pure-prefill batch verifies nothing: under DP a block drafter
-            # MAX-reduces `num_spec_step + 1`
-            # into the group's query width, so a prefill-only rank reporting
-            # the decode width would widen every decoding peer's step.
-            num_spec_step=(0 if num_seqs_decode == 0 else self.decode_spec_width),
+            # A pure-prefill rank must not widen a DP peer's verify window.
+            num_spec_step=self.mtp_k if num_seqs_decode else 0,
             is_deferred_out=self.is_deferred_out,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             num_cached_tokens=num_cached_tokens_list,
@@ -3583,16 +3516,12 @@ class Scheduler:
             state_maintenance_ops=self.block_manager.take_state_maintenance_ops(),
         )
         self._consume_state_forks(scheduled_seqs)
-
         if self.advance_on_schedule:
-            # After the snapshot, so the batch keeps pre-advance offsets.
+            # Advance only after the batch snapshots the old token cursors.
             self._advance_prefill_on_schedule(
-                prefill_seqs,
-                num_scheduled_tokens[:num_seqs_prefill],
-                is_final_chunk,
+                prefill_seqs, prefill_tokens, is_final_chunk
             )
-
-        return (batch, scheduled_seqs)
+        return batch, scheduled_seqs
 
     @staticmethod
     def _consume_state_forks(scheduled_seqs: dict[int, Sequence]) -> None:
@@ -7101,7 +7030,7 @@ class DecodeScheduler(Scheduler):
             total_tokens_num_decode=total_tokens_num_decode,
             total_seqs_num=len(scheduled_seqs),
             total_seqs_num_decode=len(scheduled_seqs),
-            num_spec_step=self.mtp_k if self.use_spec else 0,
+            num_spec_step=self.mtp_k,
             is_deferred_out=self.is_deferred_out,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             cu_stream_fraction=self.cu_fraction,

@@ -57,10 +57,15 @@ def mixed_profile_shapes(
     ]
 
 
+def _profile_spec_tokens(runner):
+    drafter = getattr(runner, "drafter", None)
+    return 0 if drafter is None else drafter.mtp_k
+
+
 def _profile_lookahead(runner):
     spec = runner.config.speculative_config
     return draft_kv_lookahead(
-        getattr(getattr(runner, "drafter", None), "mtp_k", 0),
+        _profile_spec_tokens(runner),
         block_drafter=spec is not None and spec.use_dspark(),
     )
 
@@ -73,7 +78,7 @@ def _batch(runner, prefill_tokens, decode_seqs, width, *, long_context):
     """
     config = runner.config
     block = runner.block_size
-    full_q = getattr(getattr(runner, "drafter", None), "mtp_k", 0) + 1
+    full_q = _profile_spec_tokens(runner) + 1
     lookahead = _profile_lookahead(runner)
     max_len = config.max_model_len - lookahead
     prefill_lens = []
@@ -137,7 +142,7 @@ def profile_mixed_memory(runner) -> tuple[int, int]:
     This runs before graph capture or request admission, on every TP/DP rank.
     Unlike dummy warmup it executes attention, compressors, MoE and the draft.
     """
-    width = getattr(getattr(runner, "drafter", None), "mtp_k", 0) + 1
+    width = _profile_spec_tokens(runner) + 1
     # q=1 can fit more requests than full-width verification. DSpark still
     # proposes K drafts per request, so that is a different workspace maximum.
     shapes = [

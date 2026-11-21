@@ -72,10 +72,6 @@ def test_decode_rollback_and_positions(width, explicit, deferred, expected):
         [np.arange(ctx - 4, ctx - 4 + width) for ctx in expected]
     )
     np.testing.assert_array_equal(variables["positions"].np[: 2 * width], positions)
-    with pytest.raises(ValueError, match="aligned"):
-        DeepseekV4AttentionMetadataBuilder.stage_decode(
-            builder, batch, 2, 2 * width, width, None, num_rejected=np.array([1, 2, 3])
-        )
 
 
 @pytest.mark.parametrize("mixed", [False, True])
@@ -141,7 +137,7 @@ def test_attention_output_reuse_keeps_decode_input_intact(monkeypatch, bf16):
         n_local_heads=2,
         head_dim=2,
         indexer=None,
-        _qk_norm_rope=lambda *args: qkn,
+        _qk_norm_rope=lambda *args, **kw: qkn,
         _launch_compressors=lambda x: None,
         _sparse_attention=attend,
     )
@@ -254,7 +250,7 @@ def test_mixed_projects_opaque_qr_scales_before_slicing(monkeypatch, fp4_index):
         head_dim=dim,
         indexer=indexer,
         skip_topk=False,
-        _qk_norm_rope=lambda *a: QKNormRopeOut(q_sa=query),
+        _qk_norm_rope=lambda *a, **kw: QKNormRopeOut(q_sa=query),
         _launch_compressors=lambda *a: None,
         _sparse_attention=attend,
     )

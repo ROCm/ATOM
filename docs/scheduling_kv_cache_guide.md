@@ -1,6 +1,6 @@
 # ATOM scheduling & KV cache guide
 
-ATOM (AiTer Optimized Model) uses a prefill-first scheduler with paged KV cache block management to drive LLM inference on AMD ROCm/HIP GPUs. This guide covers the scheduling algorithm, batch construction, block-level KV cache management, prefix caching, postprocessing, speculative decoding integration, and sequence lifecycle.
+ATOM (AiTer Optimized Model) uses a prefill-first scheduler by default (mixed off) with paged KV cache block management to drive LLM inference on AMD ROCm/HIP GPUs. This guide covers the scheduling algorithm, batch construction, block-level KV cache management, prefix caching, postprocessing, speculative decoding integration, and sequence lifecycle.
 
 ## Quick reference
 
@@ -32,7 +32,7 @@ ATOM (AiTer Optimized Model) uses a prefill-first scheduler with paged KV cache 
 
 ## Scheduling algorithm
 
-The scheduler implements a **prefill-first** policy: all waiting (prefill) requests are scheduled before any running (decode) requests. The entry point is `Scheduler.schedule()`, which returns a `(ScheduledBatch, dict[int, Sequence])` tuple or `None` if both queues are empty.
+The scheduler implements a **prefill-first** policy by default (mixed off): all waiting (prefill) requests are scheduled before any running (decode) requests. The entry point is `Scheduler.schedule()`, which returns a `(ScheduledBatch, dict[int, Sequence])` tuple or `None` if both queues are empty.
 
 ### Scheduler initialization
 
@@ -835,9 +835,13 @@ The feature requires chunked prefill and supports DSpark.
 Other attention families, chunked prefill off, M-RoPE, TBO (including decode
 TBO), PCP, DCP, EPLB, TR_HYBRID graph modes, speculative methods other than
 DSpark, and speculative decoding with pipeline parallelism are rejected at
-startup. P/D producers and RapidServe also reject the flag because their
-separate prefill/decode roles do not form native mixed batches. Offload-only
-connector roles are not P/D roles and remain eligible. A lossless draft that would otherwise arm is also rejected with mixed
+startup. RapidServe and P/D producer transports also reject the flag. For
+speculative decoding, any `kv_producer` role (including offload and nested
+MultiConnector entries) is refused using the scheduler's producer predicate:
+profiling must not size a speculative workload that the scheduler disables.
+Save-only offload without speculation remains eligible; its scheduler and
+profile both use one token per decode row. Other backend compatibility checks
+still apply. A lossless draft that would otherwise arm is also rejected with mixed
 scheduling. Merely setting `ATOM_SPEC_LOSSLESS_SAMPLING` does not reject a model
 that keeps greedy drafting or has no drafter; its existing fallback remains.
 Expert parallelism alone does not enable EPLB.
@@ -845,7 +849,7 @@ Expert parallelism alone does not enable EPLB.
 ### Scheduling
 
 Prefill and decode share `max_num_batched_tokens`. A decode row costs
-`decode_spec_width + 1` tokens, including speculative verification. The
+`mtp_k + 1` (the scheduler's effective speculative width) tokens, including speculative verification. The
 scheduler reserves that demand for running decodes. When their append pages
 fit, at least one eighth of the token budget remains for prefill progress;
 otherwise the prefill budget is zero. At high decode load,

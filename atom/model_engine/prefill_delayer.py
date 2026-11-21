@@ -615,7 +615,7 @@ class PrefillDelayer:
             prefill_budget: the prefill tokens one step can admit on this rank
                 after reserving decode work. Mixed scheduling leaves a 1/8 token
                 floor when decode pages fit, or zero under page pressure.
-                None means the whole batch budget.
+                Required even when this rank has no prefillable work.
         """
         # KV + queue-age bounds are gated on this rank actually having prefill to
         # push (firing when this rank can't admit anything would be a no-op).

@@ -750,10 +750,6 @@ class BlockManager:
             count, protected_hash=protected_checkpoint_hash
         )
 
-    def has_page_units(self, count: int) -> bool:
-        """Whether free pages and reclaimable checkpoints cover this demand."""
-        return self._has_page_units(count)
-
     def _ensure_page_units(self, count: int) -> bool:
         if self.paged_state_checkpoints is None:
             return self.kv.has_free(count)

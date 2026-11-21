@@ -9,7 +9,7 @@ must remain effective under python -O, without duplicate per-layer checks.
 
 import ast
 import pathlib
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 
@@ -150,8 +150,14 @@ def _v4_hf():
 
 def _spec(method="dspark", k=7):
     # Not a real SpeculativeConfig: its __post_init__ fetches the draft's HF
-    # config. The validator reads only these two fields.
-    return SimpleNamespace(method=method, num_speculative_tokens=k)
+    # config. Bind its real capability predicate without loading weights.
+    from atom.config import SpeculativeConfig
+
+    spec = SimpleNamespace(
+        method=method, num_speculative_tokens=k, draft_model_hf_config=SimpleNamespace()
+    )
+    spec.use_dspark = MethodType(SpeculativeConfig.use_dspark, spec)
+    return spec
 
 
 def _bind():
@@ -217,28 +223,104 @@ def test_validator_allows_v4_dspark():
     _FakeConfig(hf=_v4_hf(), spec=_spec())._validate_mixed_prefill_decode()
 
 
-@pytest.mark.parametrize("nested", [False, True])
-def test_mixed_refuses_pd_producers_but_allows_offload_roles(nested):
+def _wrap_connectors(entry, depth):
+    for _ in range(depth):
+        entry = {"kv_connector": "multi", "connectors": [entry]}
+    return entry
+
+
+@pytest.mark.parametrize("depth", [0, 1, 2])
+@pytest.mark.parametrize("speculative", [False, True])
+@pytest.mark.parametrize(
+    "entry,pd_producer,disables_spec",
+    [
+        ({"kv_role": "kv_producer"}, True, True),
+        ({"kv_connector": "moriio"}, True, False),
+        ({"kv_connector": " MoonCake "}, True, False),
+        ({"kv_connector": "mooncake", "kv_role": "kv_producer"}, True, True),
+        ({"kv_connector": "mooncake", "kv_role": "kv_consumer"}, False, False),
+        ({"kv_connector": "LMCacheMPConnector", "kv_role": "kv_producer"}, False, True),
+        ({"kv_connector": "mooncake_store", "kv_role": "kv_producer"}, False, True),
+        ({"kv_connector": "lmcache_mp", "kv_role": "kv_both"}, False, False),
+        ({"kv_connector": "lmcache_mp"}, False, False),
+        ({"kv_connector": "mooncake_store", "kv_role": "kv_consumer"}, False, False),
+    ],
+)
+def test_mixed_producer_refusal_matches_the_execution_mode(
+    depth, speculative, entry, pd_producer, disables_spec
+):
     _bind()
-    for name, blocked in [
-        ("moriio", True),
-        ("mooncake", True),
-        ("LMCacheMPConnector", False),
-    ]:
-        entry = {"kv_connector": name, "kv_role": "kv_producer"}
-        transfer = (
-            {"kv_connector": "MultiConnector", "connectors": [entry]}
-            if nested
-            else entry
-        )
-        cfg = _FakeConfig(kv_transfer_config=transfer)
-        if blocked:
-            with pytest.raises(ValueError, match="P/D kv_producer"):
-                cfg._validate_mixed_prefill_decode()
-        else:
+    cfg = _FakeConfig(
+        kv_transfer_config=_wrap_connectors(entry, depth),
+        spec=_spec() if speculative else None,
+    )
+    if pd_producer or (speculative and disables_spec):
+        with pytest.raises(ValueError, match="kv_producer"):
             cfg._validate_mixed_prefill_decode()
-        cfg.enable_mixed_prefill_decode = False
+    else:
         cfg._validate_mixed_prefill_decode()
+    cfg.enable_mixed_prefill_decode = False
+    cfg._validate_mixed_prefill_decode()
+
+
+@pytest.mark.parametrize("name", ["LMCacheMPConnector", "mooncake_store"])
+@pytest.mark.parametrize("depth", [0, 2])
+def test_non_spec_offload_producer_has_matching_profile_and_mixed_step(
+    monkeypatch, name, depth
+):
+    from conftest import MockConfig
+
+    from atom.model_engine.mixed_profile import _profile_spec_tokens
+    from atom.model_engine.scheduler import Scheduler
+    from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
+
+    transfer = _wrap_connectors({"kv_connector": name, "kv_role": "kv_producer"}, depth)
+    _bind()
+    _FakeConfig(kv_transfer_config=transfer)._validate_mixed_prefill_decode()
+    # Test scheduling and profile width, not connector IO or backend compatibility.
+    monkeypatch.setattr("atom.utils.forward_context.get_kvconnector", lambda *a: None)
+    scheduler = Scheduler(
+        MockConfig(kv_transfer_config=transfer, enable_mixed_prefill_decode=True)
+    )
+    decode = Sequence([10] * 4, block_size=4)
+    assert scheduler.block_manager.allocate(decode, 0)
+    decode.num_cached_tokens = 4
+    decode.append_token(11)
+    decode.type = SequenceType.DECODE
+    decode.status = SequenceStatus.RUNNING
+    scheduler.running.append(decode)
+    scheduler.add(Sequence([20] * 4, block_size=4))
+    batch, _ = scheduler.schedule()
+    assert batch.is_mixed and batch.num_spec_step == 0
+    assert scheduler.mtp_k == _profile_spec_tokens(SimpleNamespace()) == 0
+
+
+@pytest.mark.parametrize("speculative", [False, True])
+def test_pd_consumer_with_save_only_offload_uses_speculation_boundary(speculative):
+    _bind()
+    transfer = {
+        "kv_connector": "multi",
+        "connectors": [
+            {"kv_connector": "mooncake", "kv_role": "kv_consumer"},
+            {"kv_connector": "lmcache_mp", "kv_role": "kv_producer"},
+        ],
+    }
+    cfg = _FakeConfig(
+        kv_transfer_config=transfer, spec=_spec() if speculative else None
+    )
+    if speculative:
+        with pytest.raises(ValueError, match="speculative decoding with kv_producer"):
+            cfg._validate_mixed_prefill_decode()
+    else:
+        cfg._validate_mixed_prefill_decode()
+
+
+def test_mixed_allows_embedded_dspark_under_mtp_method():
+    _bind()
+    spec = _spec("mtp")
+    spec.draft_model_hf_config.dspark_block_size = 8
+    assert spec.use_dspark()
+    _FakeConfig(hf=_v4_hf(), spec=spec)._validate_mixed_prefill_decode()
 
 
 def test_mixed_refuses_rapidserve_before_model_loading():
