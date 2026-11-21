@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import ast
+import base64
+import json
+import math
 from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace
@@ -220,7 +223,26 @@ def selection(md, rows, seed, device="cpu"):
     return lengths
 
 
-def reference(q, kv, md, rank, scale):
+def native_fp8_probability_scale(support, q_dtype, kv_dtype):
+    if (
+        q_dtype == kv_dtype == torch.float8_e4m3fn
+        and getattr(support, "arch", None) == "gfx950"
+        and getattr(support, "backend", None) == "asm"
+        and getattr(support, "asm_status", None) == "ok"
+        and getattr(support, "native", None) is True
+        and getattr(support, "supported", None) is True
+        and getattr(support, "kernel_num_heads", None) == 64
+        # AITER's query returns the generated map key: arch + symbol.
+        and getattr(support, "asm_kernel", None)
+        == "gfx950_ZN5aiter43mla_a8w8_qh16_qseqlen4_gqaratio16_lse_v3_psE"
+    ):
+        return 448.0
+    return None
+
+
+def reference(q, kv, md, rank, scale, *, fp8_probability_scale=None):
+    if fp8_probability_scale is not None:
+        assert q.dtype == kv.dtype == torch.float8_e4m3fn
     out = torch.zeros((*q.shape[:2], rank), device=q.device)
     lse = torch.full(q.shape[:2], -torch.inf, device=q.device)
     ptr = md.dcp_sparse_kv_indptr.tolist()
@@ -231,10 +253,119 @@ def reference(q, kv, md, rank, scale):
             )
             scores = torch.einsum("hd,kd->hk", q[row].float(), keys) * scale
             lse[row] = torch.logsumexp(scores, -1)
-            out[row] = torch.einsum(
-                "hk,kd->hd", torch.exp(scores - lse[row, :, None]), keys[:, :rank]
-            )
+            if fp8_probability_scale is None:
+                out[row] = torch.einsum(
+                    "hk,kd->hd", torch.exp(scores - lse[row, :, None]), keys[:, :rank]
+                )
+            else:
+                # ROCm/aiter#6422: round scaled P before PV, retaining the FP32 Z.
+                weights = torch.exp(scores - scores.amax(-1, keepdim=True))
+                denominator = weights.sum(-1, keepdim=True)
+                weights = (
+                    (weights * fp8_probability_scale).to(torch.float8_e4m3fn).float()
+                )
+                value = torch.einsum("hk,kd->hd", weights, keys[:, :rank])
+                out[row] = (
+                    (value / denominator / fp8_probability_scale).bfloat16().float()
+                )
     return out, lse
+
+
+def test_fp8_reference_matches_saved_native_vectors():
+    data = json.loads(
+        Path(__file__).with_name("sparse_mla_fp8_contract.json").read_text()
+    )
+
+    def tensor(name, dtype, width):
+        raw = bytearray(base64.b64decode(data[name]))
+        return (
+            torch.frombuffer(raw, dtype=torch.uint8).view(dtype).reshape(-1, 1, width)
+        )
+
+    q = tensor("q_fp8", torch.float8_e4m3fn, 576)
+    kv = tensor("kv_fp8", torch.float8_e4m3fn, 576)
+    native = tensor("native_bf16", torch.bfloat16, 512).float()
+    md = SimpleNamespace(
+        dcp_sparse_kv_indptr=torch.tensor(data["kv_indptr"], dtype=torch.int32),
+        sparse_kv_indices=torch.tensor(data["kv_indices"], dtype=torch.int32),
+    )
+    original, old_lse = reference(q, kv, md, 512, data["scale"])
+    failures = (~torch.isclose(native, original, atol=0.015, rtol=0.03)).nonzero()
+    assert failures.tolist() == [
+        [row, 0, dim] for row, dim in enumerate(data["failed_dims"])
+    ]
+    torch.testing.assert_close(
+        original[torch.arange(3), 0, data["failed_dims"]],
+        torch.tensor(data["gpu_reference"]),
+        atol=2e-7,
+        rtol=0,
+    )
+    corrected, lse = reference(q, kv, md, 512, data["scale"], fp8_probability_scale=448)
+    torch.testing.assert_close(native, corrected, atol=0.015, rtol=0.03)
+    torch.testing.assert_close(lse, old_lse, atol=0, rtol=0)
+    assert torch.equal(corrected, corrected.bfloat16().float())
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_probability_reference_keeps_default_attention(dtype):
+    q = torch.tensor([[[0, 1]]], dtype=dtype)
+    kv = torch.tensor([[[1, 0]], [[1, -0.5]]], dtype=dtype)
+    md = SimpleNamespace(
+        dcp_sparse_kv_indptr=torch.tensor([0, 2]),
+        sparse_kv_indices=torch.tensor([0, 1]),
+    )
+    out, lse = reference(q, kv, md, 1, 1)
+    torch.testing.assert_close(out, torch.ones(1, 1, 1))
+    torch.testing.assert_close(lse, torch.tensor([[math.log1p(math.exp(-0.5))]]))
+
+
+def test_probability_reference_uses_unrounded_denominator():
+    q = torch.tensor([[[0, 1]]], dtype=torch.float8_e4m3fn)
+    kv = torch.tensor([[[1, 0]], [[1, -0.5]]], dtype=torch.float8_e4m3fn)
+    md = SimpleNamespace(
+        dcp_sparse_kv_indptr=torch.tensor([0, 2]),
+        sparse_kv_indices=torch.tensor([0, 1]),
+    )
+    out, lse = reference(q, kv, md, 1, 1, fp8_probability_scale=448)
+    # 448*exp(-0.5) rounds to 256; the denominator still uses exp(-0.5).
+    expected = torch.tensor((448 + 256) / 448 / (1 + math.exp(-0.5))).bfloat16().float()
+    torch.testing.assert_close(out, expected.expand_as(out), atol=0, rtol=0)
+    torch.testing.assert_close(lse, torch.tensor([[math.log1p(math.exp(-0.5))]]))
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {},
+        {"arch": "gfx942"},
+        {"backend": "hk"},
+        {"backend": "opus"},
+        {"backend": "flydsl_ps1"},
+        {"native": False},
+        {"supported": None},
+        {"asm_status": "unknown"},
+        {"kernel_num_heads": 16},
+        {"asm_kernel": "_ZN5aiter43mla_a8w8_qh16_qseqlen4_gqaratio16_lse_v3_psE"},
+        {"asm_kernel": None},
+    ],
+)
+def test_native_probability_scale_is_route_specific(change):
+    values = {
+        "arch": "gfx950",
+        "backend": "asm",
+        "asm_status": "ok",
+        "native": True,
+        "supported": True,
+        "kernel_num_heads": 64,
+        "asm_kernel": "gfx950_ZN5aiter43mla_a8w8_qh16_qseqlen4_gqaratio16_lse_v3_psE",
+    }
+    values.update(change)
+    support = SimpleNamespace(**values)
+    fp8 = torch.float8_e4m3fn
+    assert native_fp8_probability_scale(support, fp8, fp8) == (None if change else 448)
+    assert native_fp8_probability_scale(support, torch.bfloat16, fp8) is None
+    assert native_fp8_probability_scale(support, fp8, torch.bfloat16) is None
+    assert native_fp8_probability_scale(SimpleNamespace(), fp8, fp8) is None
 
 
 @pytest.mark.parametrize("max_q,rows", [(1, 16), (8, 128), (8, 256)])
@@ -509,7 +640,7 @@ def test_decode_ubatch_publishes_the_plan(runtime):
 def test_native_decode_and_graph_against_direct_attention(
     max_q, rows, dtype, monkeypatch
 ):
-    from aiter import get_mla_metadata_info_v1
+    from aiter import get_mla_decode_shape_support, get_mla_metadata_info_v1
 
     from atom.model_ops import attention_mla
     from atom.model_ops.attentions import aiter_mla
@@ -536,6 +667,14 @@ def test_native_decode_and_graph_against_direct_attention(
     prefix = "sparse_mtp_" if max_q > 1 else ""
     wi = getattr(md, prefix + "work_indptr")
     assert int(wi[-1]) == rows and int((wi[1:] - wi[:-1]).max()) == 1
+    probability_scale = None
+    if dtype == torch.float8_e4m3fn:
+        support = get_mla_decode_shape_support(
+            64, 1, dtype, dtype, persistent=True, return_lse=True, page_size=1
+        )
+        probability_scale = native_fp8_probability_scale(support, dtype, dtype)
+        if probability_scale is not None:
+            assert (getattr(md, prefix + "work_info_set")[:rows, 1] == -1).all()
     monkeypatch.setattr(
         attention_mla,
         "get_mla_metadata_v1",
@@ -556,7 +695,9 @@ def test_native_decode_and_graph_against_direct_attention(
         md.dcp_sparse_kv_indptr.copy_(next_md.dcp_sparse_kv_indptr)
         md.sparse_kv_indices.copy_(next_md.sparse_kv_indices)
         graph.replay()
-        expected, expected_lse = reference(q[:rows], kv, md, 512, layer.scale)
+        expected, expected_lse = reference(
+            q[:rows], kv, md, 512, layer.scale, fp8_probability_scale=probability_scale
+        )
         # Raw empty-rank partials may be NaN; the DCP merge uses owned counts
         # to drop them. Check every live row, including those following empties.
         live = md.dcp_sparse_kv_indptr.diff() > 0
