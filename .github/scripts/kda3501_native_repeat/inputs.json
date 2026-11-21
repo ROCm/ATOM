@@ -19,7 +19,8 @@
     "state_checkpoint_interval_tokens": -1,
     "method": "dspark",
     "num_speculative_tokens": 0,
-    "level": 3,
+    "enforce_eager": true,
+    "level": 0,
     "cudagraph_mode": "FULL",
     "kv_transfer_config": "{}"
   },
