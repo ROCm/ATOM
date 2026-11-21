@@ -1008,3 +1008,60 @@ def test_gfx1250_issue_341_tp4_launch_is_bit_exact(
         previous = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
     torch.cuda.synchronize()
     assert all(torch.equal(a, b) for a, b in zip(tuned, previous))
+
+
+@gpu
+@pytest.mark.parametrize("cache", ["bf16", "fp8"])
+@pytest.mark.parametrize(
+    "prefix", [0, m._AITER_MIN_WIDTH_WITH_EMIT * SPARSE_BLOCK_SIZE]
+)
+def test_chunks_scored_into_one_stale_workspace_select_as_fresh_buffers(cache, prefix):
+    """A long prefill's chunks share one workspace, poisoned between them; both
+    selectors (the prefix decides which) must return what fresh buffers give."""
+    from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
+
+    heads, chunk, chunks = 2, 256, 3
+    width = -(-(prefix + chunks * chunk) // SPARSE_BLOCK_SIZE)
+    ws = LogitsWorkspace(heads * chunk * width, "cuda")
+    fp8 = (
+        torch.float8_e4m3fnuz
+        if m.get_gfx_runtime() == "gfx942"
+        else torch.float8_e4m3fn
+    )
+    for i in range(chunks):
+        kw = _inputs([chunk], [prefix + i * chunk], heads, "cuda")
+        if cache == "fp8":
+            kw["index_kv_cache"] = kw["index_kv_cache"].to(fp8)
+        kw["n_valid_column_per_row"] = m.build_n_valid_column_per_row(
+            kw["cu_seqlens_q"], kw["prefix_lens"], batch=1, total_q=chunk,
+            num_idx_heads=heads, decode_max_q=0,
+        )  # fmt: skip
+        want = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
+        ws.logits(1, ws.capacity).fill_(float("inf"))
+        got = m.minimax_m3_index_topk(
+            **kw, emit_sparse_block_table=True, score_workspace=ws
+        )
+        torch.cuda.synchronize()
+        for fresh, reused in zip(want, got):
+            assert torch.equal(fresh, reused)
+
+
+@gpu
+def test_a_chunk_scored_into_the_workspace_allocates_no_score_buffer():
+    """The per-chunk growth itself: a wider second chunk must not allocate its scores."""
+    from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
+
+    heads, chunk, prefix = 2, 256, m._AITER_MIN_WIDTH * SPARSE_BLOCK_SIZE
+    width = -(-(prefix + 2 * chunk) // SPARSE_BLOCK_SIZE)
+    ws = LogitsWorkspace(heads * chunk * width, "cuda")
+    first, second = (
+        _inputs([chunk], [prefix + i * chunk], heads, "cuda") for i in (0, 1)
+    )
+    m.minimax_m3_index_topk(**first, score_workspace=ws)  # compiles outside the window
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    m.minimax_m3_index_topk(**second, score_workspace=ws)
+    torch.cuda.synchronize()
+    # a fresh score buffer alone is heads * chunk * width fp32
+    assert torch.cuda.max_memory_allocated() - before < heads * chunk * width * 4
