@@ -149,6 +149,8 @@ class NativeClientTest(unittest.TestCase):
         engine.get_cache_statistics = lambda **kw: {
             "cached_tokens": engine.cached,
             "offload_tokens": 0,
+            "checkpoints_kept": int(bool(engine.submissions)),
+            "chunks_cut_for_end": 0,
         }
         engine.get_mtp_statistics = lambda **kw: {
             "enabled": False,
@@ -327,6 +329,53 @@ class NativeClientTest(unittest.TestCase):
         self.assertEqual(len(rejected), 1)
         self.assertEqual(rejected[0]["token"], 0)
         self.assertEqual(len(rejected[0]["record"]), 42)
+
+    def test_candidate_origin_rejects_boundary_cut_or_missing_checkpoint(self):
+        for bad in (
+            None,
+            "boundary_cut",
+            "missing_checkpoint",
+            "cut_counter",
+            "duplicate_phase",
+        ):
+            with self.subTest(bad=bad), tempfile.TemporaryDirectory() as folder:
+                self.run_client(folder)
+                output = Path(folder) / "out"
+                lines = []
+                for index, phase in enumerate(("C0", "W0", "W1")):
+                    lines.append(f"PR3501 phase {phase} start")
+                    spans = [(0, 1024)] if phase == "C0" else [(512, 512)]
+                    if phase == "C0" and bad == "boundary_cut":
+                        spans = [(0, 512), (512, 512)]
+                    for start, length in spans:
+                        lines.append(
+                            f"[atom 00:00:00] Scheduled prefill batch: 1 reqs, {length} new tokens (done: [{start}], new: [{length}]), req_ids: ({index},)"
+                        )
+                if bad == "duplicate_phase":
+                    lines.append("PR3501 phase W1 start")
+                log = Path(folder) / "candidate.log"
+                log.write_text("\n".join(lines) + "\n")
+                if bad in ("missing_checkpoint", "cut_counter"):
+                    path = output / "C0.json"
+                    data = json.loads(path.read_text())
+                    key = (
+                        "checkpoints_kept"
+                        if bad == "missing_checkpoint"
+                        else "chunks_cut_for_end"
+                    )
+                    data["after"]["cache"][key] = (
+                        0 if bad == "missing_checkpoint" else 1
+                    )
+                    path.write_text(json.dumps(data))
+                with patch.object(sys, "path", [str(CLIENT.parents[1]), *sys.path]):
+                    if bad:
+                        with self.assertRaises(AssertionError):
+                            client.verify_candidate_origin(output, log)
+                    else:
+                        client.verify_candidate_origin(output, log)
+                        self.assertTrue((output / "prefill-origin.json").exists())
+                self.assertTrue((output / "C0.json").exists())
+                self.assertTrue(log.exists())
 
 
 if __name__ == "__main__":

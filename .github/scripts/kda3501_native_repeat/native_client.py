@@ -1,4 +1,4 @@
-"""One baseline instance, three fixed requests, public native client calls only."""
+"""One pinned instance, three fixed requests, public native client calls only."""
 
 import hashlib
 import importlib.metadata
@@ -44,6 +44,52 @@ def receive(sample, records, rejected):
             }
         )
         assert len(records) <= 32, "duplicate or excess streamed output"
+
+
+def verify_candidate_origin(directory, log_path):
+    """Check the completed native log and public counters; launches no model."""
+    from kda_stage1_probe import parse_step
+
+    directory, log_path = Path(directory), Path(log_path)
+    assert log_path.stat().st_size <= 16 * 1024**2, "native log exceeds 16 MiB"
+    order, steps, phase = [], {}, None
+    for line in log_path.read_text(encoding="utf-8").splitlines():
+        if line.startswith("PR3501 phase "):
+            phase = line.split()[2]
+            assert line == f"PR3501 phase {phase} start" and phase not in steps
+            order.append(phase)
+            steps[phase] = []
+        if "Scheduled prefill batch: " in line:
+            assert phase is not None, "unlabelled native prefill"
+            steps[phase].append(
+                parse_step(line[line.index("Scheduled prefill batch: ") :])
+            )
+    assert order == ["C0", "W0", "W1"]
+    counters = {}
+    for phase in order:
+        expected = [(0, 1024)] if phase == "C0" else [(512, 512)]
+        assert [(row["done"], row["new"]) for row in steps[phase]] == expected
+        data = json.loads((directory / (phase + ".json")).read_text())
+        before, after = data["before"]["cache"], data["after"]["cache"]
+        assert before["checkpoints_kept"] == (0 if phase == "C0" else 1)
+        assert after["checkpoints_kept"] == 1
+        assert after["chunks_cut_for_end"] - before["chunks_cut_for_end"] == 0
+        assert after["cached_tokens"] - before["cached_tokens"] == (
+            0 if phase == "C0" else 512
+        )
+        assert after["offload_tokens"] - before["offload_tokens"] == 0
+        counters[phase] = {"before": before, "after": after}
+    assert len({steps[phase][0]["sequence"] for phase in order}) == 3
+    save(
+        directory,
+        "prefill-origin.json",
+        {
+            "coverage": "single C0 prefill, one kept checkpoint, two 512-token resumes",
+            "prefill_steps": steps,
+            "cache_counters": counters,
+            "qualification": "numerical comparison remains separate",
+        },
+    )
 
 
 def main():

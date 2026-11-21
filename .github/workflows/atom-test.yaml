@@ -946,7 +946,7 @@ jobs:
       - name: Verify immutable source and job scope
         run: |
           python - <<'PY'
-          import ast, pathlib, subprocess, sys, types, yaml
+          import ast, json, pathlib, subprocess, sys, types, yaml
           sys.path.insert(0, '.github/scripts')
           import kda_stage1_probe as p
           def git(*args):
@@ -958,6 +958,9 @@ jobs:
           assert git('rev-parse', p.CANDIDATE + '^2') == pr
           assert git('rev-parse', p.BASE + ':atom') == p.TREES['baseline']
           assert git('rev-parse', p.CANDIDATE + ':atom') == p.TREES['candidate']
+          capture = json.loads(pathlib.Path('.github/scripts/kda3501_native_repeat/inputs.json').read_text())
+          assert capture['source'] == p.CANDIDATE and capture['atom_tree'] == p.TREES['candidate']
+          assert capture['engine_args']['num_speculative_tokens'] == 0
           subprocess.run(['git', 'diff', '--exit-code', p.BASE, 'HEAD', '--', 'atom'], check=True)
           def patch_id(a, b):
               patch = subprocess.check_output(['git', 'diff', a, b, '--', 'atom'])
@@ -1016,13 +1019,13 @@ jobs:
         timeout-minutes: 1
         run: |
           set -euo pipefail
-          mkdir -p "$STAGE1_ROOT/src/baseline" "$STAGE1_ROOT/results"
+          mkdir -p "$STAGE1_ROOT/src/candidate" "$STAGE1_ROOT/results"
           cat /sys/module/amdgpu/version > "$STAGE1_ROOT/results/host-amdgpu-version.txt" 2>&1 || true
-          git archive fb1304722a9f79cd16e7383b8b504ccb29851d77 | tar -x -C "$STAGE1_ROOT/src/baseline"
+          git archive 05ce5a39e10fcf3605fbd798870a0a5ab2fe1107 | tar -x -C "$STAGE1_ROOT/src/candidate"
           mapfile -t wheels < <(find "$STAGE1_ROOT/wheels" -name '*.whl')
           test "${#wheels[@]}" = 1
           echo "8813b5f9b81d5e499b728d59dfffbfb736109b052986ea87c10b9f7bbaa420ef  ${wheels[0]}" | sha256sum -c -
-          git show -s --format='%H %P' fb1304722a9f79cd16e7383b8b504ccb29851d77 > "$STAGE1_ROOT/results/source.txt"
+          git show -s --format='%H %P' 05ce5a39e10fcf3605fbd798870a0a5ab2fe1107 > "$STAGE1_ROOT/results/source.txt"
           container_minutes=$(( (STAGE1_STARTED + 600 - $(date +%s)) / 60 - 3 ))
           test "$container_minutes" -ge 1
           echo "container_minutes=$container_minutes" >> "$GITHUB_OUTPUT"
@@ -1056,21 +1059,24 @@ jobs:
           docker exec "$CONTAINER_NAME" /opt/venv/bin/python /workspace/.github/scripts/kda_stage1_probe.py assets \
             --output "/workspace/$STAGE1_ROOT/results/inputs.json"
           test "$(( $(date +%s) - STAGE1_STARTED ))" -le 600
-      - name: Capture one baseline C0 W0 W1 sequence
+      - name: Capture one candidate C0 W0 W1 sequence
         timeout-minutes: 37
         run: |
           set -euo pipefail
           trap 'docker stop --time 20 "$CONTAINER_NAME" >/dev/null 2>&1 || true' ERR
-          source="/workspace/$STAGE1_ROOT/src/baseline"
-          docker exec -e SETUPTOOLS_SCM_PRETEND_VERSION_FOR_ATOM="0.0.0+stage1.baseline" "$CONTAINER_NAME" \
+          source="/workspace/$STAGE1_ROOT/src/candidate"
+          docker exec -e SETUPTOOLS_SCM_PRETEND_VERSION_FOR_ATOM="0.0.0+stage1.candidate" "$CONTAINER_NAME" \
             /opt/venv/bin/python -m pip install --no-deps --no-build-isolation -e "$source"
           docker exec -e PYTHONPATH="$source" -e PR3501_SOURCE="$source" \
-            -e TORCHINDUCTOR_CACHE_DIR="/workspace/$STAGE1_ROOT/compile-baseline" "$CONTAINER_NAME" \
+            -e TORCHINDUCTOR_CACHE_DIR="/workspace/$STAGE1_ROOT/compile-candidate" "$CONTAINER_NAME" \
             timeout --signal=TERM --kill-after=30s 2100s /opt/venv/bin/python -B \
             /workspace/.github/scripts/kda3501_native_repeat/native_client.py \
             "/workspace/$STAGE1_ROOT/results/native-repeat" \
             "/workspace/$STAGE1_ROOT/results/inputs.json" \
-            > "$STAGE1_ROOT/results/baseline.log" 2>&1
+            > "$STAGE1_ROOT/results/candidate.log" 2>&1
+          docker exec -e PYTHONPATH="/workspace/.github/scripts" "$CONTAINER_NAME" \
+            /opt/venv/bin/python -B -c 'import sys; from kda3501_native_repeat.native_client import verify_candidate_origin; verify_candidate_origin(*sys.argv[1:])' \
+            "/workspace/$STAGE1_ROOT/results/native-repeat" "/workspace/$STAGE1_ROOT/results/candidate.log"
       - name: Stop only this diagnostic container
         if: ${{ always() }}
         timeout-minutes: 1
