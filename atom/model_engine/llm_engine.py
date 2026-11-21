@@ -239,23 +239,28 @@ class LLMEngine:
             request_id_iter = itertools.repeat(None)
 
         reqs = []
-        for prompt, sampling_param, callback, mm_data, request_id in zip(
-            prompt_or_tokens_list,
-            sampling_params_iter,
-            stream_callback_iter,
-            mm_data_iter,
-            request_id_iter,
-        ):
-            fanout = self.io_processor.preprocess_fanout(
-                prompt,
-                sampling_param,
-                stream_callback=callback,
-                multimodal_data=mm_data,
-                parent_request_id=request_id,
-            )
-            reqs.extend(fanout)
-        self.core_mgr.keep_finished_outputs = True
-        self.core_mgr.add_request(reqs)
+        try:
+            for prompt, sampling_param, callback, mm_data, request_id in zip(
+                prompt_or_tokens_list,
+                sampling_params_iter,
+                stream_callback_iter,
+                mm_data_iter,
+                request_id_iter,
+            ):
+                fanout = self.io_processor.preprocess_fanout(
+                    prompt,
+                    sampling_param,
+                    stream_callback=callback,
+                    multimodal_data=mm_data,
+                    parent_request_id=request_id,
+                )
+                reqs.extend(fanout)
+            self.core_mgr.keep_finished_outputs = True
+            self.core_mgr.add_request(reqs)
+        except BaseException:
+            # Left registered, they would keep generate() waiting for good.
+            self.io_processor.forget([req.id for req in reqs])
+            raise
 
     def step(self) -> list[CompletionResult]:
         seqs = self.core_mgr.get_output()
@@ -967,3 +972,11 @@ class InputOutputProcessor:
 
     def has_pending_requests(self):
         return len(self.requests) > 0
+
+    def forget(self, seq_ids) -> None:
+        """Drop requests that will never finish here (their add failed)."""
+        for seq_id in seq_ids:
+            self.requests.pop(seq_id, None)
+            external_request_id = self._internal_to_external.pop(seq_id, None)
+            if external_request_id is not None:
+                self._external_to_internal.pop(external_request_id, None)

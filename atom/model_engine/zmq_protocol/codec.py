@@ -247,58 +247,72 @@ def _decode_chain(msg, reader: FrameReader) -> ShippedChain:
 # ------------------------------------------------------------ client side --
 
 
-def encode_submit(requests: list[IngressRequest], *, max_tokens=None) -> list:
-    """One SubmitBatch. `max_tokens`, when given, replaces every request's."""
+def encode_submit(
+    requests: list[IngressRequest], *, max_tokens=None
+) -> tuple[list | None, list]:
+    """One SubmitBatch: `(frames, failures)`.
+
+    A request that does not encode -- a string that is not UTF-8 (a lone
+    surrogate), a value nested past `MAX_VALUE_DEPTH` -- is left out, as
+    `(request, reason)` in `failures`, and the rest still go; `frames` is None
+    when none encodes. `max_tokens`, when given, replaces every request's.
+    """
     writer = FrameWriter()
     envelope = pb.Envelope()
-    batch = envelope.submit
-    batch.SetInParent()
+    specs = envelope.submit.requests
+    envelope.submit.SetInParent()
+    failures = []
     for req in requests:
-        spec = batch.requests.add()
-        spec.seq_id = req.id
-        # Shared: n > 1 siblings carry one prompt, which goes out once.
-        writer.add(
-            req.prompt_token_ids, spec.prompt_token_ids, key=req.prompt_token_ids
-        )
-        _encode_sampling(
-            req.sampling_params,
-            spec.sampling,
-            req.max_tokens if max_tokens is None else max_tokens,
-        )
-        for stop in req.stop_token_sequences:
-            spec.stop_token_sequences.add().ids.extend(stop)
-        if req.external_request_id is not None:
-            spec.external_request_id = req.external_request_id
-        if req.parent_request_id is not None:
-            spec.parent_request_id = req.parent_request_id
-        spec.sibling_index = req.sibling_index
-        spec.needs_independent_noise = req.needs_independent_noise
-        encode_optional_value(
-            req.kv_transfer_params, spec, "kv_transfer_params", writer
-        )
-        encode_optional_value(req.multimodal_data, spec, "multimodal_data", writer)
-        if req.cache_seed != -1:  # a text prompt's, as on `Sequence`
-            spec.cache_seed = req.cache_seed
-        encode_optional_value(req.mrope_positions, spec, "mrope_positions", writer)
-        spec.mrope_position_delta = req.mrope_position_delta
-        if req.data_parallel_rank is not None:
-            spec.data_parallel_rank = req.data_parallel_rank
-        if req.dp_session_id is not None:
-            spec.dp_session_id = req.dp_session_id
-        if req.dp_parent_session_id is not None:
-            spec.dp_parent_session_id = req.dp_parent_session_id
-        spec.arrive_time = req.arrive_time
-        if req.prompt_hash_chain is not None:
-            _encode_chain(req.prompt_hash_chain, spec.prompt_hash_chain, writer)
-        spec.dp_est_cached_tokens = req.dp_est_cached_tokens
-        trace = tracing.wire_context(req)
-        if trace is not None:
-            carrier, model, request_id = trace
-            spec.trace.carrier.update(carrier)
-            spec.trace.model = model
-            if request_id is not None:
-                spec.trace.request_id = request_id
-    return writer.frames(envelope)
+        spec = specs.add()
+        try:
+            _encode_spec(req, spec, writer, max_tokens)
+        except Exception as exc:
+            # What it wrote to the writer stays as unreferenced bytes.
+            del specs[-1]
+            failures.append((req, f"{type(exc).__name__}: {exc}"))
+    return (writer.frames(envelope) if specs else None), failures
+
+
+def _encode_spec(req: IngressRequest, spec, writer: FrameWriter, max_tokens) -> None:
+    spec.seq_id = req.id
+    # Shared: n > 1 siblings carry one prompt, which goes out once.
+    writer.add(req.prompt_token_ids, spec.prompt_token_ids, key=req.prompt_token_ids)
+    _encode_sampling(
+        req.sampling_params,
+        spec.sampling,
+        req.max_tokens if max_tokens is None else max_tokens,
+    )
+    for stop in req.stop_token_sequences:
+        spec.stop_token_sequences.add().ids.extend(stop)
+    if req.external_request_id is not None:
+        spec.external_request_id = req.external_request_id
+    if req.parent_request_id is not None:
+        spec.parent_request_id = req.parent_request_id
+    spec.sibling_index = req.sibling_index
+    spec.needs_independent_noise = req.needs_independent_noise
+    encode_optional_value(req.kv_transfer_params, spec, "kv_transfer_params", writer)
+    encode_optional_value(req.multimodal_data, spec, "multimodal_data", writer)
+    if req.cache_seed != -1:  # a text prompt's, as on `Sequence`
+        spec.cache_seed = req.cache_seed
+    encode_optional_value(req.mrope_positions, spec, "mrope_positions", writer)
+    spec.mrope_position_delta = req.mrope_position_delta
+    if req.data_parallel_rank is not None:
+        spec.data_parallel_rank = req.data_parallel_rank
+    if req.dp_session_id is not None:
+        spec.dp_session_id = req.dp_session_id
+    if req.dp_parent_session_id is not None:
+        spec.dp_parent_session_id = req.dp_parent_session_id
+    spec.arrive_time = req.arrive_time
+    if req.prompt_hash_chain is not None:
+        _encode_chain(req.prompt_hash_chain, spec.prompt_hash_chain, writer)
+    spec.dp_est_cached_tokens = req.dp_est_cached_tokens
+    trace = tracing.wire_context(req)
+    if trace is not None:
+        carrier, model, request_id = trace
+        spec.trace.carrier.update(carrier)
+        spec.trace.model = model
+        if request_id is not None:
+            spec.trace.request_id = request_id
 
 
 def encode_abort(seq_ids) -> list:

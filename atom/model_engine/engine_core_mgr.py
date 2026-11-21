@@ -64,6 +64,7 @@ from atom.model_engine.engine_utility import (
 from atom.model_engine.prefix_hash import hash_block_size_for
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.zmq_protocol.codec import (
+    REJECTED_REASON,
     decode_core_message,
     encode_abort,
     encode_command,
@@ -258,14 +259,24 @@ def _resolve_dp_engine_count(config: Config, logical: int) -> int:
     return visible
 
 
-def _submit_frames(seqs: list[IngressRequest], *, max_tokens=None) -> list:
+def _submit_frames(
+    seqs: list[IngressRequest], *, max_tokens=None
+) -> tuple[list | None, list]:
     """`encode_submit`, then drop the seqs' shipped prompt chains: the frames
     hold them now and the frontend keeps no copy. A disaggregated prefill
     engine, sent the same seqs after decode, so gets none."""
-    frames = encode_submit(seqs, max_tokens=max_tokens)
+    frames, failures = encode_submit(seqs, max_tokens=max_tokens)
     for seq in seqs:
         seq.prompt_hash_chain = None
-    return frames
+    return frames, failures
+
+
+def _sent(seqs: list, failures: list) -> list:
+    """`seqs` but those `encode_submit` left out."""
+    if not failures:
+        return seqs
+    failed = {id(req) for req, _ in failures}
+    return [seq for seq in seqs if id(seq) not in failed]
 
 
 class CoreManager:
@@ -1015,29 +1026,7 @@ class CoreManager:
                         # callback popped by then (STREAM is enqueued ahead of
                         # the finished-seq list and this socket is FIFO), so a
                         # normal completion finds nothing to do below.
-                        delivered = False
-                        for seq in seqs:
-                            delivered |= self._deliver_terminal_output(seq)
-                            self._release_terminal_seq(seq)
-                        if delivered and self._flush_stream_batch_fn is not None:
-                            # The callbacks above only buffer into a thread-local;
-                            # without this flush the chunk never reaches the
-                            # request's collector and the client still hangs.
-                            try:
-                                self._flush_stream_batch_fn()
-                            except Exception as e:
-                                logger.warning(
-                                    f"{self.label}: flush_stream_batch failed: {e}",
-                                    exc_info=True,
-                                )
-                        if self.keep_finished_outputs:
-                            self.outputs_queue.put_nowait(seqs)
-                        # These completions freed slots on their ranks — re-feed
-                        # from the pending pool so a fast rank never drains to
-                        # empty while peers still have work. No-op when
-                        # ATOM_DP_DISPATCH_DEPTH is unset (legacy spray path).
-                        if getattr(self, "_bp_depth", 0) > 0 and self._bp_pending:
-                            self._bp_dispatch_or_refill(raise_on_error=False)
+                        self._finish_results(seqs)
             finally:
                 # Close sockets.
                 shutdown_socket.close(linger=0)
@@ -1239,17 +1228,99 @@ class CoreManager:
             if seq.stream_callback is not None:
                 self._seq_id_to_callback[seq.id] = seq.stream_callback
                 seq.stream_callback = None
-        if self.pp_size > 1:
-            # Pipeline parallel (dp=1): requests enter only at stage 0, which
-            # drives the pipeline downstream.
-            logger.debug(f"{self.label}: Add {len(seqs)} requests to PP head 0")
-            self._send_request(0, _submit_frames(seqs))
-        elif self._routable_engine_count == 1:
-            # Single routable engine, send all requests
-            logger.debug(f"{self.label}: Add {len(seqs)} requests to DP rank 0")
-            self._send_request(0, _submit_frames(seqs))
-        else:
-            self._dispatch_to_dp_ranks(seqs)
+        try:
+            if self.pp_size > 1 or self._routable_engine_count == 1:
+                # Pipeline parallel (dp=1): requests enter only at stage 0,
+                # which drives the pipeline downstream. A single routable
+                # engine takes them all.
+                logger.debug(f"{self.label}: Add {len(seqs)} requests to rank 0")
+                self._send_submit(0, seqs)
+            else:
+                self._dispatch_to_dp_ranks(seqs)
+        except BaseException:
+            self._forget_unsubmitted(seqs)
+            raise
+
+    def _send_submit(self, rank: int, seqs: list, *, max_tokens=None) -> list:
+        """Send `seqs` to `rank`; end those that do not encode (`_reject_unsent`)
+        once the rest are sent. Returns the seqs sent."""
+        frames, failures = _submit_frames(seqs, max_tokens=max_tokens)
+        if frames is not None:
+            self._send_request(rank, frames)
+        self._reject_unsent(failures)
+        return _sent(seqs, failures)
+
+    def _reject_unsent(self, failures: list) -> None:
+        """End the requests `encode_submit` left out as a Core's Rejected would
+        end them: the online client gets its terminal output, an offline run
+        the rejected result, and the load they were charged is released. Runs
+        inside a dispatch, so the slots they free are refilled by the next
+        completion, not from here."""
+        if not failures:
+            return
+        for req, reason in failures:
+            logger.error(
+                "%s: rejecting request %s, which does not encode: %s",
+                self.label,
+                req.id,
+                reason,
+            )
+        self._finish_results(
+            [
+                CompletionResult(
+                    id=req.id,
+                    leave_reason=f"{REJECTED_REASON}: {reason}",
+                    rejected=True,
+                )
+                for req, reason in failures
+            ],
+            refill=False,
+        )
+
+    def _finish_results(self, results: list, *, refill: bool = True) -> None:
+        """Hand over finished sequences: a Core's Completions or Rejected, or
+        requests rejected here. `refill`: re-feed the backpressure pool from
+        the slots they freed (not from inside a dispatch)."""
+        # Offline (non-streaming) completions arrive here as finished
+        # sequences; release their in-flight DP load.
+        #
+        # So do sequences the scheduler rejected before they ever ran
+        # (`_unschedulable_reason`, abort-while-waiting) — those never reach
+        # `postprocess`, so no STREAM chunk is ever built for them. An online
+        # client is still holding a callback and would wait forever, so the
+        # terminal output it is owed has to be raised here. Anything already
+        # delivered through STREAM has had its callback popped by then
+        # (STREAM is enqueued ahead of the finished-seq list and this socket
+        # is FIFO), so a normal completion finds nothing to do below.
+        delivered = False
+        for seq in results:
+            delivered |= self._deliver_terminal_output(seq)
+            self._release_terminal_seq(seq)
+        if delivered and self._flush_stream_batch_fn is not None:
+            # The callbacks above only buffer into a thread-local; without this
+            # flush the chunk never reaches the request's collector and the
+            # client still hangs.
+            try:
+                self._flush_stream_batch_fn()
+            except Exception as e:
+                logger.warning(
+                    f"{self.label}: flush_stream_batch failed: {e}", exc_info=True
+                )
+        if self.keep_finished_outputs:
+            self.outputs_queue.put_nowait(results)
+        # These completions freed slots on their ranks — re-feed from the
+        # pending pool so a fast rank never drains to empty while peers still
+        # have work. No-op when ATOM_DP_DISPATCH_DEPTH is unset (legacy spray
+        # path).
+        if refill and getattr(self, "_bp_depth", 0) > 0 and self._bp_pending:
+            self._bp_dispatch_or_refill(raise_on_error=False)
+
+    def _forget_unsubmitted(self, seqs: list) -> None:
+        """After an add failed partway, no callback is left registered for
+        `seqs`: their client has already failed. Those a rank took still run
+        there; the caller that failed decides whether to abort them."""
+        for seq in seqs:
+            self._seq_id_to_callback.pop(seq.id, None)
 
     def _build_prefix_router(self, config) -> PrefixSpreadRouter | None:
         """The `prefix_spread` or `share_cache` router, or None.
@@ -1405,10 +1476,15 @@ class CoreManager:
             for dp_rank, rank_seqs in enumerate(dp_seqs):
                 if not rank_seqs:
                     continue
-                frame = _submit_frames(rank_seqs)
-                if self._backlog is None:
+                frame, failures = _submit_frames(rank_seqs)
+                # Ended here and their charge released: never sent, so never
+                # ingested either.
+                self._reject_unsent(failures)
+                rank_seqs = _sent(rank_seqs, failures)
+                if frame is None:
+                    pass
+                elif self._backlog is None:
                     self._send_request(dp_rank, frame)
-                    dispatched[dp_rank] = True
                 else:
                     # The ledger counts seqs in the order the rank ingests
                     # them, so the send and its accounting are one step.
@@ -1420,6 +1496,7 @@ class CoreManager:
                         with self._lb_lock:
                             self._backlog.note_sent(dp_rank, rank_seqs, self._seq_load)
                         self._flush_credit_updates()
+                dispatched[dp_rank] = True
                 batch_prefill_tokens = sum(
                     int(getattr(seq, "num_prompt_tokens", 0) or 0) for seq in rank_seqs
                 )
@@ -1512,9 +1589,17 @@ class CoreManager:
         added = []
         failed: list[tuple[int, list]] = []
         send_error: Exception | None = None
+        unencodable = []
         for dp_rank, rank_seqs in sends:
+            # A request that does not encode is ended, not re-queued: it would
+            # fail every refill again.
+            frames, failures = _submit_frames(rank_seqs)
+            unencodable += failures
+            rank_seqs = _sent(rank_seqs, failures)
+            if frames is None:
+                continue
             try:
-                self._send_request(dp_rank, _submit_frames(rank_seqs))
+                self._send_request(dp_rank, frames)
                 added.append(f"rank{dp_rank}: {len(rank_seqs)} req")
             except Exception as exc:
                 logger.exception(
@@ -1526,6 +1611,7 @@ class CoreManager:
                 failed.append((dp_rank, rank_seqs))
                 send_error = exc
         stalled = self._bp_requeue_unsent(failed, pause_always=raise_on_error)
+        self._reject_unsent(unencodable)
         if send_error is not None and raise_on_error:
             raise send_error
         if stalled:
@@ -2846,15 +2932,21 @@ class DisaggCoreManager(CoreManager):
                 self._seq_id_to_callback[seq.id] = seq.stream_callback
                 seq.stream_callback = None
 
-        # Send decode payload as-is. Decode admits and allocates the blocks
-        # (`DecodeScheduler.allocate_waiting`), so it alone gets the chains.
-        self._send_request(1, _submit_frames(seqs))
-
-        # For prefill: limit each sequence to 1 output token.  Prefill discards
-        # all sampled tokens (postprocess is a no-op), but setting max_tokens=1
-        # ensures the forward pass terminates after a single generate step and
-        # that num_scheduled_tokens correctly reflects only the prompt tokens.
-        self._send_request(0, _submit_frames(seqs, max_tokens=1))
+        try:
+            # Send decode payload as-is. Decode admits and allocates the blocks
+            # (`DecodeScheduler.allocate_waiting`), so it alone gets the chains.
+            # Prefill gets only what decode took.
+            seqs = self._send_submit(1, seqs)
+            # For prefill: limit each sequence to 1 output token.  Prefill
+            # discards all sampled tokens (postprocess is a no-op), but setting
+            # max_tokens=1 ensures the forward pass terminates after a single
+            # generate step and that num_scheduled_tokens correctly reflects
+            # only the prompt tokens.
+            if seqs:
+                self._send_submit(0, seqs, max_tokens=1)
+        except BaseException:
+            self._forget_unsubmitted(seqs)
+            raise
 
     def _collective_rpc_unsupported(self) -> str | None:
         return "its two engines are the prefill and decode halves of one replica"

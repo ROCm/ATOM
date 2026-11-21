@@ -46,7 +46,7 @@ def _engine_seqs(reqs) -> list[Sequence]:
         enable_dp_attention=False,
         hf_config=SimpleNamespace(model_type="llama"),
     )
-    _, specs, _ = decode_client_message(received(encode_submit(reqs)))
+    _, specs, _ = decode_client_message(received(encode_submit(reqs)[0]))
     context = AdmissionContext(config)
     return [build_sequence(spec, context) for spec in specs]
 

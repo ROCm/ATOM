@@ -33,9 +33,9 @@ def submitted(params, **ingress):
     req = IngressRequest(id=7, prompt_token_ids=[1, 2, 3], sampling_params=params)
     for name, value in ingress.items():
         setattr(req, name, value)
-    _, specs, failures = codec.decode_client_message(
-        on_the_wire(codec.encode_submit([req]))
-    )
+    frames, unencodable = codec.encode_submit([req])
+    assert unencodable == []
+    _, specs, failures = codec.decode_client_message(on_the_wire(frames))
     assert failures == []
     return specs[0]
 
@@ -263,11 +263,61 @@ def test_the_deepest_value_allowed_still_parses():
     assert spec.kwargs["kv_transfer_params"] == value
 
 
-def test_a_value_nested_too_deep_is_refused_by_its_sender():
-    req = IngressRequest(id=7, prompt_token_ids=[1], sampling_params=SamplingParams())
-    req.kv_transfer_params = nested(wire.MAX_VALUE_DEPTH + 1)
-    with pytest.raises(wire.ProtocolError, match="containers deep"):
-        codec.encode_submit([req])
+def plain_request(seq_id, prompt=(1, 2)):
+    return IngressRequest(
+        id=seq_id, prompt_token_ids=list(prompt), sampling_params=SamplingParams()
+    )
+
+
+def test_a_value_nested_too_deep_is_refused_by_its_sender_alone():
+    deep = plain_request(7)
+    deep.kv_transfer_params = nested(wire.MAX_VALUE_DEPTH + 1)
+    frames, failures = codec.encode_submit([plain_request(6), deep, plain_request(8)])
+    assert [(req.id, "containers deep" in why) for req, why in failures] == [(7, True)]
+    _, specs, _ = codec.decode_client_message(on_the_wire(frames))
+    assert [spec.seq_id for spec in specs] == [6, 8]
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("external_request_id", "id\ud800"),
+        ("dp_session_id", "s\udfff"),
+        ("kv_transfer_params", {"k": "v\ud800"}),
+        ("trace", ({"traceparent": "\ud800"}, "m", None)),
+    ],
+)
+def test_a_string_that_is_not_utf8_fails_only_its_request(monkeypatch, field, value):
+    bad = plain_request(7)
+    if field == "trace":
+        monkeypatch.setattr(
+            codec.tracing, "wire_context", lambda req: value if req is bad else None
+        )
+    else:
+        setattr(bad, field, value)
+    frames, failures = codec.encode_submit([plain_request(6), bad])
+    assert [req.id for req, _ in failures] == [7]
+    _, specs, _ = codec.decode_client_message(on_the_wire(frames))
+    assert [spec.seq_id for spec in specs] == [6]
+
+
+def test_no_request_encoding_leaves_no_message():
+    deep = plain_request(7)
+    deep.kv_transfer_params = nested(wire.MAX_VALUE_DEPTH + 1)
+    frames, failures = codec.encode_submit([deep])
+    assert frames is None and [req.id for req, _ in failures] == [7]
+
+
+def test_siblings_still_share_the_prompt_when_one_fails():
+    prompt = array.array("i", range(20000))
+    reqs = [plain_request(i) for i in range(3)]
+    for req in reqs:
+        req.prompt_token_ids = prompt
+    reqs[0].kv_transfer_params = nested(wire.MAX_VALUE_DEPTH + 1)
+    frames, failures = codec.encode_submit(reqs)
+    assert [req.id for req, _ in failures] == [0]
+    _, specs, _ = codec.decode_client_message(on_the_wire(frames))
+    assert [list(spec.kwargs["token_ids"]) for spec in specs] == [list(prompt)] * 2
 
 
 def test_a_small_decoded_tensor_does_not_pin_the_shared_frame():
@@ -515,7 +565,7 @@ def test_siblings_share_one_prompt_frame():
         IngressRequest(id=i, prompt_token_ids=prompt, sampling_params=SamplingParams())
         for i in range(3)
     ]
-    frames = codec.encode_submit(reqs)
+    frames, _ = codec.encode_submit(reqs)
     assert len(frames) == 2
 
 

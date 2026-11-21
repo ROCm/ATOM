@@ -123,6 +123,7 @@ def test_core_manager_captures_context_after_executor_preprocess(spans):
             _seq_id_to_callback={},
             _send_request=lambda rank, payload: frames.append(payload),
         )
+        bind_submit(manager)
         manager._add_prepared_requests = MethodType(
             CoreManager._add_prepared_requests, manager
         )
@@ -134,6 +135,12 @@ def test_core_manager_captures_context_after_executor_preprocess(spans):
     http = spans.get_finished_spans()[0]
     assert carrier["traceparent"].split("-")[2] == f"{http.context.span_id:016x}"
     assert carrier["tracestate"] == "othervendor=x,nsdye=1"
+
+
+def bind_submit(manager):
+    """The CoreManager methods an add sends and cleans up through."""
+    for name in ("_send_submit", "_reject_unsent", "_forget_unsubmitted"):
+        setattr(manager, name, MethodType(getattr(CoreManager, name), manager))
 
 
 def _request() -> IngressRequest:
@@ -157,6 +164,7 @@ def test_same_node_pd_marks_http_and_skips_both_engine_carriers(
             _seq_id_to_callback={},
             _send_request=lambda rank, payload: frames.append(payload),
         )
+        bind_submit(manager)
         DisaggCoreManager.add_request(manager, [seq])
         assert len(frames) == 2
         for frame in frames:

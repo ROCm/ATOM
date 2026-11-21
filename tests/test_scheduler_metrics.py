@@ -152,7 +152,7 @@ def test_engine_receipt_includes_time_buffered_before_scheduler_admission(
     )
     messages = iter(
         [
-            engine_v1_helpers.received(encode_submit([request])),
+            engine_v1_helpers.received(encode_submit([request])[0]),
             engine_v1_helpers.received(encode_shutdown()),
         ]
     )
