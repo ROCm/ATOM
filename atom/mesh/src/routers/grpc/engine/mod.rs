@@ -1,5 +1,7 @@
 //! gRPC engine: the only subtree that imports `mesh_grpc::*`.
 
+#[cfg(feature = "grpc-client")]
+pub(crate) mod atom;
 pub mod payload_to_proto;
 pub mod proto_stream_wrapper;
 pub mod proto_to_chunk;
@@ -24,6 +26,7 @@ use crate::routers::prepare::generation_payload::{GenerationPayload, PdMetadata}
 use crate::routers::token_handle::engine_error::EngineError;
 use crate::routers::token_handle::token_chunk::TokenChunk;
 use crate::routers::token_handle::token_handle::{TokenHandle, TokenSource};
+use crate::tokenizer::traits::Tokenizer;
 
 pub use pd_stream_merge::merge_pd_streams;
 
@@ -34,6 +37,17 @@ pub(crate) trait Dispatcher: Send + Sync {
         placement: &PlacementPlan,
         payload: &mut GenerationPayload,
     ) -> Result<TokenHandle, EngineError>;
+
+    /// `dispatch` with the request's tokenizer, with which an ATOM worker's
+    /// stop strings are encoded.
+    async fn dispatch_with_tokenizer(
+        &self,
+        placement: &PlacementPlan,
+        payload: &mut GenerationPayload,
+        _tokenizer: &Arc<dyn Tokenizer>,
+    ) -> Result<TokenHandle, EngineError> {
+        self.dispatch(placement, payload).await
+    }
 }
 
 #[async_trait]
@@ -45,6 +59,15 @@ impl Dispatcher for GrpcEngine {
     ) -> Result<TokenHandle, EngineError> {
         GrpcEngine::dispatch(self, placement, payload).await
     }
+
+    async fn dispatch_with_tokenizer(
+        &self,
+        placement: &PlacementPlan,
+        payload: &mut GenerationPayload,
+        tokenizer: &Arc<dyn Tokenizer>,
+    ) -> Result<TokenHandle, EngineError> {
+        GrpcEngine::dispatch_with_tokenizer(self, placement, payload, tokenizer).await
+    }
 }
 
 #[derive(Clone, Default)]
@@ -55,14 +78,35 @@ impl GrpcEngine {
         Self {}
     }
 
+    /// Without a tokenizer, a request with stop strings fails for an ATOM worker;
+    /// see `dispatch_with_tokenizer`.
     pub async fn dispatch(
         &self,
         placement: &PlacementPlan,
         payload: &mut GenerationPayload,
     ) -> Result<TokenHandle, EngineError> {
+        self.dispatch_inner(placement, payload, None).await
+    }
+
+    pub async fn dispatch_with_tokenizer(
+        &self,
+        placement: &PlacementPlan,
+        payload: &mut GenerationPayload,
+        tokenizer: &Arc<dyn Tokenizer>,
+    ) -> Result<TokenHandle, EngineError> {
+        self.dispatch_inner(placement, payload, Some(tokenizer))
+            .await
+    }
+
+    async fn dispatch_inner(
+        &self,
+        placement: &PlacementPlan,
+        payload: &mut GenerationPayload,
+        tokenizer: Option<&Arc<dyn Tokenizer>>,
+    ) -> Result<TokenHandle, EngineError> {
         match placement {
             PlacementPlan::Single { worker, .. } => {
-                self.dispatch_one(worker, payload, ProtoErrorRole::Worker)
+                self.dispatch_one(worker, payload, ProtoErrorRole::Worker, tokenizer)
                     .await
             }
             PlacementPlan::Pair {
@@ -75,8 +119,8 @@ impl GrpcEngine {
                 });
                 let payload_ref: &GenerationPayload = payload;
                 let (prefill_result, decode_result) = tokio::join!(
-                    self.dispatch_one(prefill, payload_ref, ProtoErrorRole::Prefill),
-                    self.dispatch_one(decode, payload_ref, ProtoErrorRole::Decode),
+                    self.dispatch_one(prefill, payload_ref, ProtoErrorRole::Prefill, tokenizer),
+                    self.dispatch_one(decode, payload_ref, ProtoErrorRole::Decode, tokenizer),
                 );
                 let prefill_stream = prefill_result?;
                 let decode_stream = decode_result?;
@@ -89,11 +133,13 @@ impl GrpcEngine {
         }
     }
 
+    #[cfg_attr(not(feature = "grpc-client"), allow(unused_variables))]
     async fn dispatch_one(
         &self,
         worker: &Arc<dyn Worker>,
         payload: &GenerationPayload,
         role: ProtoErrorRole,
+        tokenizer: Option<&Arc<dyn Tokenizer>>,
     ) -> Result<TokenHandle, EngineError> {
         let mut client = get_grpc_client_from_worker(worker)
             .await
@@ -105,6 +151,13 @@ impl GrpcEngine {
             }
             GrpcClient::Vllm(_) => {
                 ProtoGenerateRequest::Vllm(Box::new(payload_to_proto::to_vllm_proto(payload)))
+            }
+            #[cfg(feature = "grpc-client")]
+            GrpcClient::Atom(atom_client) => {
+                let tokenizer = tokenizer.map(|t| t.as_ref());
+                let request = atom::request::generate_request(payload, worker.as_ref(), tokenizer)?;
+                let stream = atom::stream::AtomStream::open(atom_client, request).await?;
+                return Ok(TokenHandle::new(stream));
             }
         };
 

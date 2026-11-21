@@ -88,7 +88,7 @@ impl BasicWorkerBuilder {
         self
     }
 
-    /// Set the runtime type (SGLang or vLLM)
+    /// Set the runtime type (SGLang, vLLM or ATOM)
     pub fn runtime_type(mut self, runtime_type: RuntimeType) -> Self {
         self.runtime_type = runtime_type;
         self
@@ -327,7 +327,7 @@ impl DPAwareWorkerBuilder {
         self
     }
 
-    /// Set the runtime type (SGLang or vLLM)
+    /// Set the runtime type (SGLang, vLLM or ATOM)
     pub fn runtime_type(mut self, runtime_type: RuntimeType) -> Self {
         self.runtime_type = runtime_type;
         self

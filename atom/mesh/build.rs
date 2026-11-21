@@ -28,6 +28,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let grpc_proto = protox::compile([GRPC_PROTO], [REPO_ROOT])?;
         tonic_prost_build::configure()
             .extern_path(".atom.engine.v1", "crate::atom_engine::wire::pb")
+            .type_attribute(
+                ".atom.grpc.v1.GetModelInfoResponse",
+                "#[derive(serde::Serialize)]",
+            )
             .compile_fds(grpc_proto)?;
         for proto in [ENGINE_PROTO, GRPC_PROTO] {
             println!("cargo:rerun-if-changed={REPO_ROOT}/{proto}");
