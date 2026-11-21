@@ -183,6 +183,9 @@ class LMCacheReqMeta:
     after_forward: bool = False
     # The prompt's media identity (`tier_cache_salt`), part of every key.
     cache_salt: str = ""
+    # A KV store's draft window: the chunks `[start, end)` whose draft objects
+    # this save puts or this load gets, on the draft's ranks.
+    draft_chunks: tuple[int, int] | None = None
 
 
 class LMCacheOffloadMetadata(ConnectorMetadata):

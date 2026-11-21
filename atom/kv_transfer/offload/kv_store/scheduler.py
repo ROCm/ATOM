@@ -11,14 +11,18 @@ digests, which name the store's objects, instead of its token ids; paced
 retries of failed saves; and the save abandon timeout of the connector's own
 settings. A backend supplies the lookup client, which answers the one question
 the base asks a transport -- how much of a prompt the store holds -- built on
-:class:`StoreLookupBase`.
+:class:`StoreLookupBase`. Under a draft window the lookup also cuts a hit where
+the store lacks a draft object its read window needs, and saves and loads name
+the draft objects they move (``LMCacheReqMeta.draft_chunks``).
 """
 
 from __future__ import annotations
 
 import functools
 import logging
+import threading
 import time
+from collections import OrderedDict
 from typing import Any
 
 from atom.kv_transfer.disaggregation.types import LoadOperationId, SaveOperationId
@@ -29,10 +33,12 @@ from atom.kv_transfer.offload.kv_store.keys import (
     chain_seed,
     chunk_digest,
     chunk_hash_chain,
+    draft_namespace,
     rank_key_prefix,
 )
 from atom.kv_transfer.offload.lookup_client import LookupClient
 from atom.kv_transfer.offload.metadata import LMCacheReqMeta, LoadSpec, SaveSpec
+from atom.spec_decode.draft_window_geometry import DraftReadWindow
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -50,6 +56,9 @@ _SAVE_RETRY_BASE_S = 1.0
 _SAVE_RETRY_MAX_S = 30.0
 # Names the boot a CLOCK_MONOTONIC reading is from; see `monotonic_clock_id`.
 _BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
+# Uncut hits kept for loads not decided yet (`StoreLookupBase.take_uncut_hit`);
+# those of requests that never reach the decision go oldest first.
+_MAX_UNCUT_HITS = 4096
 
 
 @functools.cache
@@ -109,19 +118,58 @@ def prompt_chunk_hashes(seq: Any, chunk_tokens: int) -> bytes:
     return hashes
 
 
+def first_draft_chunk(window: DraftReadWindow, num_prompt: int, chunk: int) -> int:
+    """d0: the first chunk holding draft rows any reader of a `num_prompt`-token
+    prompt reads; a draft window stores draft objects from it on."""
+    return window.first_read_token(num_prompt) // int(chunk)
+
+
 class StoreLookupBase(LookupClient):
     """What every backend's lookup client shares.
 
     A hit is the prefix every rank holds: per rank, the run of chunks present
     from chunk 0, and the minimum over ranks, since a load is all-or-nothing
-    across the PP stages and TP ranks (`rank_prefixes`). A subclass asks its
-    store and implements ``lookup`` and ``clear_lookup_status``.
+    across the PP stages and TP ranks (`rank_prefixes`). Under a draft window
+    it is cut where its read window lacks a draft object (`_gate_draft_rows`).
+    A subclass asks its store and implements ``lookup`` and
+    ``clear_lookup_status``.
     """
 
-    def __init__(self, *, namespace: str, world: int, chunk_tokens: int) -> None:
+    def __init__(
+        self,
+        *,
+        namespace: str,
+        world: int,
+        chunk_tokens: int,
+        draft_window: DraftReadWindow | None = None,
+        draft_ranks: range = range(0),
+    ) -> None:
         self._namespace = namespace
         self._world = int(world)
         self._chunk_tokens = int(chunk_tokens)
+        # The read window draft objects are kept for, and the ranks they belong
+        # to; None keeps the draft rows in the target objects.
+        self.draft_window = draft_window
+        if draft_window is not None and not (
+            draft_ranks and set(draft_ranks) <= set(range(self._world))
+        ):
+            raise ValueError(
+                f"a draft window needs draft ranks among the {self._world} ranks, "
+                f"got {draft_ranks!r}"
+            )
+        self.draft_ranks = draft_ranks if draft_window is not None else range(0)
+        # Draft keys asked; chunks whose draft object some rank lacks inside a
+        # hit's read window; lookups that window cut at d0 or at a hole past it.
+        self.draft_keys = 0
+        self.draft_missing = 0
+        self.draft_cuts_at_d0 = 0
+        self.draft_cuts_above_d0 = 0
+        # Tokens the cuts made requests prefill, counted as their loads are
+        # decided (`KVStoreOffloadScheduler._count_draft_cut_cost`).
+        self.draft_cut_recompute_tokens = 0
+        # Lookup id -> the hit the window cut, until its load is decided.
+        self._uncut_hits: OrderedDict[str, int] = OrderedDict()
+        self._uncut_lock = threading.Lock()
         # Answered lookups; those where the ranks held prefixes of different
         # lengths; and the rank objects past the shared prefix they found,
         # present but unusable while another rank lacks the chunk -- evicted,
@@ -132,14 +180,21 @@ class StoreLookupBase(LookupClient):
         self._next_stats_at = time.monotonic() + _LOOKUP_STATS_INTERVAL_S
 
     def _rank_keys(self, hashes: bytes, first: int, last: int) -> list[str]:
-        """Every rank's keys of chunks ``[first, last)``, rank by rank.
+        """Every rank's keys of chunks ``[first, last)``, rank by rank."""
+        chunks = range(first, last)
+        return self._keys_by_rank(self._namespace, range(self._world), hashes, chunks)
 
-        Every rank's keys share the chunks' digests: each is hex-encoded once.
-        """
-        digests = [chunk_digest(hashes, index).hex() for index in range(first, last)]
+    def _keys_by_rank(
+        self, namespace: str, ranks: range, hashes: bytes, chunks: range
+    ) -> list[str]:
+        """`ranks`' keys of `chunks` under `namespace`, rank by rank. The ranks
+        share the chunks' digests: each is hex-encoded once, and none for no rank."""
+        if not ranks:
+            return []
+        digests = [chunk_digest(hashes, index).hex() for index in chunks]
         keys = []
-        for rank in range(self._world):
-            prefix = rank_key_prefix(self._namespace, rank, self._world)
+        for rank in ranks:
+            prefix = rank_key_prefix(namespace, rank, self._world)
             keys += [prefix + digest for digest in digests]
         return keys
 
@@ -160,6 +215,93 @@ class StoreLookupBase(LookupClient):
             bound.append(next((i for i, code in enumerate(shard) if code == 0), chunks))
         return held, bound
 
+    def _draft_range(self, seq: Any, chunks: int) -> range:
+        """Chunks `[d0, d1)` whose draft objects a load of `seq` may read: no load
+        takes the prompt's last token (`load_math.loadable_hit`)."""
+        if self.draft_window is None:
+            return range(0)
+        num_prompt = int(seq.num_prompt_tokens)
+        first = first_draft_chunk(self.draft_window, num_prompt, self._chunk_tokens)
+        return range(first, min(chunks, (num_prompt - 1) // self._chunk_tokens))
+
+    def _draft_keys(self, hashes: bytes, chunks: range) -> list[str]:
+        """Every draft rank's keys of `chunks`, rank by rank; none, and no
+        digest encoded, without a draft window."""
+        namespace = draft_namespace(self._namespace)
+        return self._keys_by_rank(namespace, self.draft_ranks, hashes, chunks)
+
+    def _draft_cut(self, draft: range, hit_chunks: int, codes: list[Any]) -> int | None:
+        """`hit_chunks` cut at the first chunk of `[d0, hit)` whose draft object
+        some draft rank lacks; None when keys no store answered decide the cut."""
+        held = bound = hit_chunks
+        missing = 0
+        for index in range(draft.start, min(hit_chunks, draft.stop)):
+            column = codes[index - draft.start :: len(draft)]
+            absent = 0 in column
+            missing += absent
+            if held == hit_chunks and any(code != 1 for code in column):
+                held = index
+            if absent and bound == hit_chunks:
+                bound = index
+        if held != bound:
+            return None
+        self.draft_missing += missing
+        if held == draft.start < hit_chunks:
+            self.draft_cuts_at_d0 += 1
+        elif held < hit_chunks:
+            self.draft_cuts_above_d0 += 1
+        return held
+
+    def _gate_draft_rows(
+        self, lookup_id: str | None, draft: range, hit_chunks: int, codes: list[Any]
+    ) -> int | None:
+        """`hit_chunks` cut by the draft objects of `draft`, answered in `codes` in
+        `_draft_keys` order; None where unanswered keys decide the cut."""
+        if not draft:
+            return hit_chunks
+        cut = self._draft_cut(draft, hit_chunks, codes)
+        if cut is None:
+            logger.debug(
+                "[OFFLOAD-LOOKUP] lookup_id=%s: draft keys no store answered "
+                "decide the hit; no answer",
+                lookup_id,
+            )
+            return None
+        self.draft_keys += len(draft) * len(self.draft_ranks)
+        if cut < hit_chunks:
+            logger.debug(
+                "[OFFLOAD-LOOKUP] lookup_id=%s draft window cut: d0=%d cut=%d "
+                "hit=%d (chunks)",
+                lookup_id,
+                draft.start,
+                cut,
+                hit_chunks,
+            )
+        self._remember_uncut_hit(
+            lookup_id, hit_chunks * self._chunk_tokens if cut < hit_chunks else None
+        )
+        return cut
+
+    def _remember_uncut_hit(self, lookup_id: str | None, hit: int | None) -> None:
+        """Keep the hit the window cut from `lookup_id`'s answer; None forgets
+        the one an earlier answer of it left."""
+        if lookup_id is None:
+            return
+        with self._uncut_lock:
+            if hit is None:
+                self._uncut_hits.pop(lookup_id, None)
+                return
+            self._uncut_hits[lookup_id] = int(hit)
+            self._uncut_hits.move_to_end(lookup_id)
+            while len(self._uncut_hits) > _MAX_UNCUT_HITS:
+                self._uncut_hits.popitem(last=False)
+
+    def take_uncut_hit(self, lookup_id: str) -> int | None:
+        """The hit the window cut from `lookup_id`'s last answer, once; None
+        when it cut nothing."""
+        with self._uncut_lock:
+            return self._uncut_hits.pop(lookup_id, None)
+
     def _count_lookup(self, stranded: int) -> None:
         """Count an answered lookup, logging the totals once a minute."""
         self.lookups += 1
@@ -170,8 +312,17 @@ class StoreLookupBase(LookupClient):
         if now < self._next_stats_at:
             return
         self._next_stats_at = now + _LOOKUP_STATS_INTERVAL_S
+        draft = (
+            ""
+            if self.draft_window is None
+            else f" draft_keys={self.draft_keys} draft_missing={self.draft_missing}"
+            f" draft_cuts_at_d0={self.draft_cuts_at_d0}"
+            f" draft_cuts_above_d0={self.draft_cuts_above_d0}"
+            f" draft_cut_recompute_tokens={self.draft_cut_recompute_tokens}"
+        )
         logger.info(
-            "[OFFLOAD-LOOKUP-STATS] lookups=%d uneven_lookups=%d stranded_objects=%d",
+            "[OFFLOAD-LOOKUP-STATS] lookups=%d uneven_lookups=%d stranded_objects=%d"
+            + draft,
             self.lookups,
             self.uneven_lookups,
             self.stranded_objects,
@@ -196,12 +347,17 @@ class KVStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
         world: int,
         lookup_client: Any,
         endpoint: str,
+        store_lookup: StoreLookupBase | None = None,
     ) -> None:
         """``store_cfg`` is the backend's parsed settings, ``endpoint`` how the
-        startup log names the store it asks (``"server=..."``)."""
+        startup log names the store it asks (``"server=..."``). ``store_lookup``
+        is the lookup behind ``lookup_client``, whose draft window saves and loads
+        follow; None keeps the draft rows in the target objects."""
         kvc = getattr(config, "kv_transfer_config", {}) or {}
         self._store_cfg = store_cfg
         self._namespace = namespace
+        self._store_lookup = store_lookup
+        self._draft_window = None if store_lookup is None else store_lookup.draft_window
         # Failed saves since the last stored one, and when saves may resume.
         self._failed_saves_in_a_row = 0
         self._saves_paused_until = 0.0
@@ -222,7 +378,7 @@ class KVStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
         )
         logger.info(
             "%s scheduler: namespace=%s world=%d chunk=%d %s "
-            "max_pending_saves=%s abandon_timeout=%.0fs",
+            "max_pending_saves=%s abandon_timeout=%.0fs%s",
             self.LABEL,
             namespace,
             world,
@@ -230,6 +386,12 @@ class KVStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
             endpoint,
             self._max_pending_saves,
             store_cfg.save_abandon_timeout_s,
+            (
+                ""
+                if self._draft_window is None
+                else f" draft_window={self._draft_window.window}"
+                f" draft_ranks={list(store_lookup.draft_ranks)}"
+            ),
         )
 
     def _lookup_token_ids(self, seq: Any) -> Any:
@@ -336,6 +498,36 @@ class KVStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
             chunk_hashes=hashes[: (aligned // self.chunk_size) * DIGEST_BYTES],
             dispatched_at=time.monotonic(),
             dispatch_clock=monotonic_clock_id(),
+            draft_chunks=self._save_draft_chunks(seq, saved, aligned, block_ids),
+        )
+
+    def _save_draft_chunks(
+        self, seq: Any, saved: int, aligned: int, block_ids: list[int]
+    ) -> tuple[int, int] | None:
+        """The draft objects a save of `[saved, aligned)` puts: the highest run of
+        the prompt's read window `[d0, C)` it covers whose blocks have draft rows."""
+        if self._draft_window is None:
+            return None
+        chunk = self.chunk_size
+        first = max(
+            saved // chunk,
+            first_draft_chunk(self._draft_window, seq.num_prompt_tokens, chunk),
+        )
+        end = start = aligned // chunk
+        while start > first and not self._draft_rows_missing_in(block_ids, start - 1):
+            start -= 1
+        return (start, end) if start < end else None
+
+    def _draft_rows_missing_in(self, block_ids: list[int], index: int) -> bool:
+        """Whether a block of chunk `index` lacks draft rows; True for a block the
+        scheduler cannot see (no block manager, or past the table)."""
+        manager = self._block_manager
+        per_chunk = self.chunk_size // self.virtual_block_size
+        blocks = block_ids[index * per_chunk : (index + 1) * per_chunk]
+        return (
+            manager is None
+            or len(blocks) < per_chunk
+            or any(manager.draft_rows_missing(int(block)) for block in blocks)
         )
 
     def _build_load_request(
@@ -345,15 +537,74 @@ class KVStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
         load_operation: LoadOperationId,
         transfer_end: int,
     ) -> LMCacheReqMeta:
-        """Load ``[hbm, transfer_end)``: the digests of ``[0, transfer_end)``."""
+        """Load ``[hbm, transfer_end)``: the digests of ``[0, transfer_end)``, and
+        under a draft window the draft objects of ``[max(hbm, d0), transfer_end)``."""
         hashes = prompt_chunk_hashes(seq, self.chunk_size)
-        return LMCacheReqMeta(
+        request = LMCacheReqMeta(
             req_id=seq.id,
             token_ids=[],
             block_ids=list(seq.block_table),
             load_spec=load_spec,
             load_operation=load_operation,
             chunk_hashes=hashes[: (transfer_end // self.chunk_size) * DIGEST_BYTES],
+        )
+        if self._draft_window is not None:
+            first = self._load_draft_start(
+                seq, load_spec.hbm_cached_tokens, transfer_end
+            )
+            end = int(transfer_end) // self.chunk_size
+            if first < end:
+                request.draft_chunks = (first, end)
+            # The blocks below get no draft rows: `publish_loaded_prefix` marks them.
+            seq.offload_draft_start_tokens = first * self.chunk_size
+            self._count_draft_cut_cost(
+                seq, load_spec.hbm_cached_tokens, load_spec.lmcache_cached_tokens
+            )
+        return request
+
+    def _load_draft_start(self, seq: Any, hbm: int, end: int) -> int:
+        """The first draft object a load of `[hbm, end)` reads, in chunks:
+        `max(hbm, d0)`, at most `end`."""
+        chunk = self.chunk_size
+        d0 = first_draft_chunk(self._draft_window, seq.num_prompt_tokens, chunk)
+        return min(max(int(hbm) // chunk, d0), int(end) // chunk)
+
+    def _maybe_start_unaligned_handoff(self, seq, load_spec, hbm, lmc, chunk) -> bool:
+        started = super()._maybe_start_unaligned_handoff(
+            seq, load_spec, hbm, lmc, chunk
+        )
+        manager = self._block_manager
+        if started and self._draft_window is not None and manager is not None:
+            # Marked before the partial prefill: a P/D producer sends V with its
+            # first forward, and this load runs only after it.
+            boundary = int(load_spec.hbm_cached_tokens)
+            first = self._load_draft_start(seq, boundary, lmc)
+            manager.mark_draft_rows_missing(seq, boundary, first * self.chunk_size)
+        return started
+
+    def update_state_after_alloc(self, seq: Any) -> None:
+        super().update_state_after_alloc(seq)
+        if str(seq.id) not in self._load_specs:
+            # No load follows (a hit cut to 0, or under HBM): decided here.
+            self._count_draft_cut_cost(seq, int(seq.num_cached_tokens), 0)
+
+    def _mark_load_skip(
+        self, seq: Any, reason: str, hbm: int, lmc: int, need: int, chunk: int
+    ) -> None:
+        super()._mark_load_skip(seq, reason, hbm, lmc, need, chunk)
+        self._count_draft_cut_cost(seq, hbm, lmc)
+
+    def _count_draft_cut_cost(self, seq: Any, hbm: int, hit: int) -> None:
+        """Once `seq`'s load is decided at `hit` over an HBM prefix of `hbm`: the
+        tokens it prefills that the hit the window cut would have loaded."""
+        if self._draft_window is None:
+            return
+        uncut = self._store_lookup.take_uncut_hit(str(seq.id))
+        if uncut is None:
+            return
+        uncut = self._loadable_hit(uncut, int(seq.num_prompt_tokens))
+        self._store_lookup.draft_cut_recompute_tokens += max(
+            0, uncut - max(int(hbm), int(hit))
         )
 
     def save_abandon_timeout_s(self) -> float:
@@ -369,6 +620,7 @@ class KVStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
 __all__ = [
     "KVStoreOffloadScheduler",
     "StoreLookupBase",
+    "first_draft_chunk",
     "monotonic_clock_id",
     "prompt_chunk_hashes",
     "require_monotonic_clock_id",

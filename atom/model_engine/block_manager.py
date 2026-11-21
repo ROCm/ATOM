@@ -1082,6 +1082,11 @@ class BlockManager:
             hbs = self.hash_block_size
             self.mark_draft_rows_missing(seq, start // hbs * hbs, draft_from)
 
+    def draft_rows_missing(self, block_id: int) -> bool:
+        """Whether a tier load or a P/D receive left `block_id`'s draft rows
+        unwritten; True for a block that is gone (-1)."""
+        return block_id < 0 or self.kv.block(block_id).draft_rows_missing
+
     def draft_rows_from(self, seq: Sequence) -> int:
         """Tokens up to the end of `seq`'s highest block whose draft rows are
         missing (V, sent to a P/D consumer); 0 when every block has them."""

@@ -20,6 +20,10 @@ a prompt, packed by the codec of the layout the server resolves to
 * ``digest`` is the chunk's link in a prefix chain over the prompt's tokens, so
   a chunk's key names the whole prefix up to and including it.
 
+Under a draft window the last PP stage's draft rows are objects of their own,
+``{namespace}/draft/w{rank}of{world}/{digest}``, kept only for each saved
+prompt's read window.
+
 The scheduler (which has no GPU and no KV tensors) and every worker compute the
 namespace from the same ``Config``; only the scheduler hashes tokens, and the
 digests travel to the workers in the request metadata. The hash is blake2b
@@ -226,6 +230,26 @@ def chunk_keys(
     """Keys of one rank's chunks ``[start, end)`` of a concatenated chain."""
     prefix = rank_key_prefix(namespace, rank, world)
     return [prefix + chunk_digest(hashes, index).hex() for index in range(start, end)]
+
+
+def draft_namespace(namespace: str) -> str:
+    """Where a draft window's draft objects live: their keys are chunk keys
+    under it, ``{namespace}/draft/w{rank}of{world}/{digest}``."""
+    return f"{namespace}/draft"
+
+
+def draft_chunk_keys(
+    namespace: str, rank: int, world: int, hashes: bytes, start: int, end: int
+) -> list[str]:
+    """Keys of one rank's draft objects of chunks ``[start, end)``."""
+    return chunk_keys(draft_namespace(namespace), rank, world, hashes, start, end)
+
+
+def draft_ranks(config: Any) -> range:
+    """The ranks whose objects carry the draft's rows: the last PP stage's."""
+    world = offcfg.lmcache_replica_world_size(config)
+    pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
+    return range(world - world // pp_size, world)
 
 
 def probe_key(namespace: str, rank: int, nonce: str) -> str:
