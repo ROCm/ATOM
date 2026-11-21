@@ -1,11 +1,14 @@
 import pytest
 
 from atom.models.kimi_k3.mono.kernels.execution_plan import Gfx1250KimiBuildPlan
+
+pytest.importorskip("flydsl", reason="the K3 gfx1250 mono kernels are FlyDSL")
+
 from atom.models.kimi_k3.mono.kernels.stages import k2_front_tdm_gfx1250 as front
+from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import tdm_lds_bytes
 from atom.models.kimi_k3.mono.kernels.stages.k2_finish_persistent_gfx1250 import (
     build_packed_finish,
 )
-from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import tdm_lds_bytes
 
 
 def _plan(rows):
@@ -64,6 +67,7 @@ def test_replicated_front_feeds_only_the_grouped_moe_finish():
 
 @pytest.mark.parametrize("rows", (1, 16, 40, 48))
 def test_replicated_finalize_covers_every_hidden_row_once(rows):
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
     from atom.models.kimi_k3.mono.kernels.stages import k2_finalize_tdm_gfx1250 as fin
 
     kernel = fin.build_replicated_finalize(_plan(rows))
@@ -87,6 +91,7 @@ def test_replicated_finalize_covers_every_hidden_row_once(rows):
 def test_k2_gemvs_pair_their_slabs_where_four_token_slabs_fit(
     monkeypatch, rows, front_paired, oproj_paired, finalize_paired
 ):
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
     from atom.models.kimi_k3.mono.kernels.stages import k2_finalize_tdm_gfx1250 as fin
     from atom.models.kimi_k3.mono.kernels.stages import k2_oproj_ar_gfx1250 as oar
 

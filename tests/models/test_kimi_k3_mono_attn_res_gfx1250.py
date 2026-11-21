@@ -5,6 +5,9 @@
 import pytest
 
 from atom.models.kimi_k3.mono.config import HIDDEN
+
+pytest.importorskip("flydsl", reason="the K3 gfx1250 mono kernels are FlyDSL")
+
 from atom.models.kimi_k3.mono.kernels.stages import attn_res_gfx1250 as mix
 
 

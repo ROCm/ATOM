@@ -111,9 +111,7 @@ def test_late_copies_land_before_their_step_and_never_overwrite_a_live_buffer(
 
 
 @pytest.mark.parametrize(("group", "depth"), [(2, 6), (1, 5), (1, 4), (1, 6)])
-def test_late_waits_leave_exactly_the_copies_issued_after_the_awaited_one(
-    group, depth
-):
+def test_late_waits_leave_exactly_the_copies_issued_after_the_awaited_one(group, depth):
     """Each wait leaves in flight precisely the wave's copies issued after the
     one it waits for: the barrier never waits on a later copy."""
     stages_issued = {}

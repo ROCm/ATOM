@@ -5,6 +5,9 @@ import pytest
 from atom.models.kimi_k3.mono.kernels.execution_plan import (
     Gfx1250KimiBuildPlan,
 )
+
+pytest.importorskip("flydsl", reason="the K3 gfx1250 mono kernels are FlyDSL")
+
 from atom.models.kimi_k3.mono.kernels.stages.k2_finish_persistent_gfx1250 import (
     FINISH_PACKED_FRONT_ABI,
     build_packed_finish,
@@ -84,6 +87,7 @@ def test_fp8_shared_down_is_the_grouped_moe_finish_only():
 
 @pytest.mark.parametrize("rows", _rows(20, 40, 48, 50, 55, 60, 63, 64))
 def test_precomputed_herd_scratch_holds_every_output_apart(rows):
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
     from atom.models.kimi_k3.mono.kernels.stages.k2_finish_persistent_gfx1250 import (
         herd_scratch_layout,
     )
@@ -123,10 +127,14 @@ def test_a_rolled_finish_is_a_build_of_its_own(herd, rolled):
 
 
 def test_herd_finalize_keeps_its_48_row_layout_and_grows_past_it():
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
     from atom.models.kimi_k3.mono.kernels.stages import moe_gfx1250
 
     at48 = moe_gfx1250.herd_finalize_words(48)
-    assert all(moe_gfx1250.herd_finalize_words(r)["slots"] == at48["slots"] for r in (1, 20, 48))
+    assert all(
+        moe_gfx1250.herd_finalize_words(r)["slots"] == at48["slots"]
+        for r in (1, 20, 48)
+    )
     assert moe_gfx1250.herd_finalize_words(64)["slots"] == 64 * 16
     with pytest.raises(ValueError):
         moe_gfx1250.herd_finalize_words(65)

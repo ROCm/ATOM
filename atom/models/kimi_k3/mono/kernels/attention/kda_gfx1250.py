@@ -20,6 +20,10 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T, as_ir_value
 
+from atom.models.kimi_k3.mono.kernels.attention.kda_builder_gfx1250 import (
+    REPLAY_GROUP,
+    REPLAY_TABLE,
+)
 from atom.models.kimi_k3.mono.kernels.attention.layout import (
     GATE_K,
     HIDDEN,
@@ -37,10 +41,6 @@ from atom.models.kimi_k3.mono.kernels.stages.gemv_gfx1250 import (
 from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
     K_PER_CHUNK,
     PACK_ELEMENTS,
-)
-from atom.models.kimi_k3.mono.kernels.attention.kda_builder_gfx1250 import (
-    REPLAY_GROUP,
-    REPLAY_TABLE,
 )
 from atom.mono.device.ops import (
     CM_DEV,
@@ -240,6 +240,7 @@ def gate_compute(c, k):
             step,
         )
         accumulator = mma_bf16(k["fb"][step], activation, accumulator, GFX1250)
+    tdm_timeline.stamp(tdm_timeline.HEAD_GATE_WMMA)
     decays = []
     for element in range_constexpr(ACCUMULATOR_ELEMENTS):
         output = wave * ROWS + lane_group * ACCUMULATOR_ELEMENTS + element
@@ -261,7 +262,7 @@ def gate_compute(c, k):
                 fx.ptr_store(gate, c["glog"] + token * GATE_K + output)
     # One guarded block: a guard an element would keep its chain from
     # overlapping the others'.
-    if const_expr(len(decays) > 0):
+    if const_expr(len(decays) > 0):  # noqa: SIM102
         if lane % ROWS < L:
             for decay, gate, output in decays:
                 fx.ptr_store(decay, c["decay"] + token * GATE_K + output)
@@ -345,12 +346,15 @@ def kda_conv_inputs(c, request, head, chunk):
     n_fa = L * GATE_K
     fa_rounds = (n_fa + c["matrix_threads"] - 1) // c["matrix_threads"]
     raw_indices = [
-        tid + c["matrix_threads"] * iteration for iteration in range_constexpr(fa_rounds)
+        tid + c["matrix_threads"] * iteration
+        for iteration in range_constexpr(fa_rounds)
     ]
     fa_indices = [
-        raw_index
-        if const_expr(n_fa % c["matrix_threads"] == 0)
-        else fx.min(raw_index, n_fa - 1)
+        (
+            raw_index
+            if const_expr(n_fa % c["matrix_threads"] == 0)
+            else fx.min(raw_index, n_fa - 1)
+        )
         for raw_index in raw_indices
     ]
     # Clamped so that every thread polls only published pairs; the values
@@ -410,11 +414,9 @@ def kda_conv_compute(c, k, request, head, chunk):
         state = rsrc(k["cs"])
         for token in range_constexpr(c["SL"]):
             if const_expr(token < c["SL"] - L):
-                    value = k["old"][token]
+                value = k["old"][token]
             else:
-                value = fx.ptr_load(
-                    c["qkl"] + tid * L + token - (c["SL"] - L)
-                )
+                value = fx.ptr_load(c["qkl"] + tid * L + token - (c["SL"] - L))
             bo.buffer_store(
                 fx.Float32(value).to(fx.BFloat16),
                 state,
@@ -433,11 +435,7 @@ def kda_conv_compute(c, k, request, head, chunk):
                     )
                 value = value + k["cw"][tap] * sequence_value
             output = _bf16_round(
-                value
-                * (
-                    fx.Float32(1.0)
-                    / (fx.Float32(1.0) + hw_exp2(-value * LOG2E))
-                )
+                value * (fx.Float32(1.0) / (fx.Float32(1.0) + hw_exp2(-value * LOG2E)))
             )
             if k["part"] < 2:
                 mailbox_store_device(
@@ -485,8 +483,7 @@ def kda_head_norm(c, request, head):
                 c["head_onrm"] + token * STATE_CHUNKS + chunk
             )
         inverse = hw_rsq(
-            square_sum * fx.Float32(1.0 / HEAD_DIM)
-            + fx.Float32(c["onorm_eps"])
+            square_sum * fx.Float32(1.0 / HEAD_DIM) + fx.Float32(c["onorm_eps"])
         )
         weight = (
             c["on_w_loaded"][round_index]
@@ -500,9 +497,7 @@ def kda_head_norm(c, request, head):
                 )
             )
         )
-        denominator = fx.Float32(1.0) + hw_exp2(
-            -_f32_of(gates[round_index]) * LOG2E
-        )
+        denominator = fx.Float32(1.0) + hw_exp2(-_f32_of(gates[round_index]) * LOG2E)
         normed = fx.ptr_load(c["ol"] + token * HEAD_DIM + row) * inverse * weight
         if const_expr(c.get("chunk_rounding", False)):
             output = normed * (fx.Float32(1.0) / denominator)
@@ -541,6 +536,7 @@ def kda_recur_head(c, k, request, head):
     ]
     if const_expr(replayed):
         state = replay_rows(c, state, k["replay"]["h_rec"], (row0, rows))
+        tdm_timeline.stamp(tdm_timeline.HEAD_REPLAYED)
         if k["replay"]["flush"] & live:
             # the records folded: the checkpoint moves to here
             replay_checkpoint_store(c, k, head, state, row0, rows)
@@ -625,13 +621,14 @@ def kda_recur_head(c, k, request, head):
         if lane % (GFX1250.wave_size // rows) == 0:
             fx.ptr_store(output, c["ol"] + token * HEAD_DIM + row0 + output_row)
         # A split head's chunks span waves: their norms follow the loop.
-        if const_expr(rows == ROWS):
+        if const_expr(rows == ROWS):  # noqa: SIM102
             if lane == 0:
                 square_sum = fx.Float32(0.0)
                 for row in range_constexpr(ROWS):
                     written = fx.ptr_load(c["ol"] + token * HEAD_DIM + row0 + row)
                     square_sum = square_sum + written * written
                 fx.ptr_store(square_sum, c["head_onrm"] + token * STATE_CHUNKS + wave)
+        tdm_timeline.head_token(token)
         token = token + fx.Int32(1)
     gpu.barrier()
 
@@ -686,8 +683,7 @@ def kda_recur_head_chunk(c, k, request, head):
     if const_expr(c["lb"] * L >= CHUNK_MIN_LOG_DECAY):
         # D_tj = G_t / G_j: the gates' bound keeps G_j's reciprocal finite
         key_j = [
-            [key[j][e] * hw_rcp(cumulative[j][e]) for e in range(4)]
-            for j in range(L)
+            [key[j][e] * hw_rcp(cumulative[j][e]) for e in range(4)] for j in range(L)
         ]
         partials = [_dot4(key_t[t], key_j[j]) for t, j in pairs] + [
             _dot4(query_t[t], key_j[j]) for t, j in diagonal
@@ -862,9 +858,7 @@ def _chunk_norm_sums(c, outputs):
     ]
     if lane == 0:
         for token in range_constexpr(L):
-            fx.ptr_store(
-                sums[token], c["head_onrm"] + token * STATE_CHUNKS + c["wave"]
-            )
+            fx.ptr_store(sums[token], c["head_onrm"] + token * STATE_CHUNKS + c["wave"])
 
 
 def _head_state_loads(c, slot, head):
@@ -902,9 +896,7 @@ def prefetch_head_state(
         slot0 = uniform(ld_i32(load_ptr64(args["replay"], 0), request))
     else:
         acc_idx = uniform(ld_i32(args["num_acc"], request)) - 1
-        slot0 = uniform(
-            ld_i32(args["st_idx"], request * args["st_stride"] + acc_idx)
-        )
+        slot0 = uniform(ld_i32(args["st_idx"], request * args["st_stride"] + acc_idx))
     base = (
         args["rstate"]
         + fx.Int64(fx.max(slot0, 0)) * fx.Int64(args["rs_seq"]) * 4
@@ -922,9 +914,7 @@ def prefetch_head_state(
         # XCD's L2), each a 128 B line of k, two of u ... (8 in all)
         table = args["replay"]
         h_rec = uniform(
-            fx.max(
-                ld_i32(load_ptr64(table, 1), fx.max(slot0, 0)), fx.Int32(0)
-            )
+            fx.max(ld_i32(load_ptr64(table, 1), fx.max(slot0, 0)), fx.Int32(0))
         )
         at = fx.Int64(fx.max(slot0, 0) * HEADS + head) * fx.Int64(
             args["cap"] * HEAD_DIM
@@ -935,26 +925,137 @@ def prefetch_head_state(
             (load_ptr64(table, 4) + at * 4, 4),
         )
         per_record = sum(width * HEAD_DIM // 128 for _, width in planes)
-        for step in range_constexpr((args["hmax"] * per_record + threads - 1) // threads):
+        for step in range_constexpr(
+            (args["hmax"] * per_record + threads - 1) // threads
+        ):
             line = tid + step * threads
             record = line // per_record
             within = line % per_record
             if (record < h_rec) & (slot0 >= 0):
                 k_lines = 2 * HEAD_DIM // 128
-                address = (
-                    (within < k_lines).select(
-                        planes[0][0] + fx.Int64(record * 2 * HEAD_DIM + within * 128),
-                        (within < 2 * k_lines).select(
-                            planes[1][0]
-                            + fx.Int64(record * 2 * HEAD_DIM + (within - k_lines) * 128),
-                            planes[2][0]
-                            + fx.Int64(
-                                record * 4 * HEAD_DIM + (within - 2 * k_lines) * 128
-                            ),
+                address = (within < k_lines).select(
+                    planes[0][0] + fx.Int64(record * 2 * HEAD_DIM + within * 128),
+                    (within < 2 * k_lines).select(
+                        planes[1][0]
+                        + fx.Int64(record * 2 * HEAD_DIM + (within - k_lines) * 128),
+                        planes[2][0]
+                        + fx.Int64(
+                            record * 4 * HEAD_DIM + (within - 2 * k_lines) * 128
                         ),
-                    )
+                    ),
                 )
                 _prefetch_line(address)
+
+
+# "meta": the waves from this one issue none of the rolled projection's
+# first copies (wave 0 the tokens, waves 1..4 the two tasks' weight slabs)
+SIDE_WAVE0 = 5
+# the head task's metadata in LDS, Int64 entries from 1 (entry 0 is the
+# launch's generation): these, then ``REPLAY_TABLE``'s pointers
+HEAD_META = ("acc_idx", "slot_c", "slot", "h_rec")
+
+
+@traced
+def prefetch_head_meta(
+    args, request, head, tid, threads, part, split, stash, writes, prefetch
+):
+    """``prefetch_head_state`` (ReplaySSM) by a CTA's side waves alone
+    (``threads`` threads, ``tid`` from 0), which also leave the head task's
+    metadata -- what ``kda_head`` reads through a chain of dependent global
+    loads: the request's accepted count and conv slot, its checkpoint slot
+    and committed records, the record buffers -- in LDS ``stash``
+    (``_head_meta_loads``), by the thread ``writes`` is set on. The other
+    waves issue their first projection copies meanwhile."""
+    table = args["replay"]
+    pointers = [load_ptr64(table, i) for i in range(len(REPLAY_TABLE))]
+    acc_idx = uniform(ld_i32(args["num_acc"], request)) - 1
+    slot_c = uniform(ld_i32(args["st_idx"], request * args["st_stride"]))
+    slot0 = uniform(ld_i32(pointers[0], request))
+    h_rec = uniform(fx.max(ld_i32(pointers[1], fx.max(slot0, 0)), fx.Int32(0)))
+    entries = [fx.Int64(value) for value in (acc_idx, slot_c, slot0, h_rec)]
+    if writes:
+        _store_entries(stash, entries + pointers)
+    if const_expr(prefetch):
+        base = (
+            args["rstate"]
+            + fx.Int64(fx.max(slot0, 0)) * fx.Int64(args["rs_seq"]) * 4
+            + fx.Int64(head * GATE_K * GATE_K * 4)
+        )
+        if const_expr(split > 1):
+            base = base + fx.Int64(part * (GATE_K // split) * GATE_K * 4)
+        lines = GATE_K * GATE_K * 4 // 128 // split
+        for step in range_constexpr((lines + threads - 1) // threads):
+            line = tid + step * threads
+            if line < lines:
+                _prefetch_line(base + fx.Int64(line) * 128)
+        at = fx.Int64(fx.max(slot0, 0) * HEADS + head) * fx.Int64(
+            args["cap"] * HEAD_DIM
+        )
+        planes = (
+            (pointers[2] + at * 2, 2),
+            (pointers[3] + at * 2, 2),
+            (pointers[4] + at * 4, 4),
+        )
+        per_record = sum(width * HEAD_DIM // 128 for _, width in planes)
+        for step in range_constexpr(
+            (args["hmax"] * per_record + threads - 1) // threads
+        ):
+            line = tid + step * threads
+            record = line // per_record
+            within = line % per_record
+            if (record < h_rec) & (slot0 >= 0):
+                k_lines = 2 * HEAD_DIM // 128
+                address = (within < k_lines).select(
+                    planes[0][0] + fx.Int64(record * 2 * HEAD_DIM + within * 128),
+                    (within < 2 * k_lines).select(
+                        planes[1][0]
+                        + fx.Int64(record * 2 * HEAD_DIM + (within - k_lines) * 128),
+                        planes[2][0]
+                        + fx.Int64(
+                            record * 4 * HEAD_DIM + (within - 2 * k_lines) * 128
+                        ),
+                    ),
+                )
+                _prefetch_line(address)
+
+
+def _store_entries(stash, entries):
+    """``entries`` (Int64) in LDS ``stash`` from its entry 1."""
+    for index, entry in enumerate(entries):
+        fx.ptr_store(entry, stash + (1 + index))
+
+
+def _uniform64(value):
+    """A wave-uniform Int64 (each half through ``uniform``)."""
+    return (fx.Int64(uniform(fx.Int32(value >> fx.Int64(32)))) << 32) | fx.Int64(
+        fx.Uint32(uniform(fx.Int32(value)))
+    )
+
+
+def _head_meta_loads(c, stash):
+    """``prefetch_head_meta``'s LDS entries: (acc_idx, slot_c,
+    ``replay_slot``'s dict)."""
+    count = len(HEAD_META) + len(REPLAY_TABLE)
+    entries = [fx.ptr_load(stash + (1 + index)) for index in range(count)]
+    acc_idx, slot_c, slot, h_rec = (
+        uniform(fx.Int32(entry)) for entry in entries[: len(HEAD_META)]
+    )
+    rp = {
+        name: _uniform64(entries[len(HEAD_META) + index])
+        for index, name in enumerate(REPLAY_TABLE)
+    }
+    flush = h_rec + 2 * c["rwin"] > c["cap"]
+    return (
+        acc_idx,
+        slot_c,
+        {
+            "rp": rp,
+            "slot": slot,
+            "h_rec": fx.min(h_rec, fx.Int32(c["hmax"])),
+            "flush": flush,
+            "rbase": flush.select(fx.Int32(0), h_rec),
+        },
+    )
 
 
 def _prefetch_line(address):
@@ -1038,9 +1139,7 @@ def replay_stage_loads(c, replay, bases, row0, width):
             raw = tid + threads * round_index
             e = fx.min(raw, n - 1)
             word = (e // chunks) * stride + first + (e % chunks) * 4
-            value = fx.Vector(
-                bo.buffer_load(resource, word, vec_width=4, dtype=T.i32)
-            )
+            value = fx.Vector(bo.buffer_load(resource, word, vec_width=4, dtype=T.i32))
             loads.append((raw < n, lds0 + word, value))
     return loads
 
@@ -1142,8 +1241,7 @@ def replay_rows(c, state, h_rec, rows):
                 for e in range(4)
             ]
             pairs = [
-                fx.Vector.from_elements(weighted[e : e + 2], fx.Float32)
-                for e in (0, 2)
+                fx.Vector.from_elements(weighted[e : e + 2], fx.Float32) for e in (0, 2)
             ]
             updated = []
             for r in range_constexpr(count):
@@ -1197,8 +1295,7 @@ def replay_kg_store(c, k):
                 for e in range(4)
             ]
             gate = [
-                fx.ptr_load(c["glog"] + token * HEAD_DIM + column + e)
-                for e in range(4)
+                fx.ptr_load(c["glog"] + token * HEAD_DIM + column + e) for e in range(4)
             ]
             at = base + token
             bo.buffer_store(
@@ -1213,6 +1310,54 @@ def replay_kg_store(c, k):
                 rsrc(records["g"]),
                 at * HEAD_DIM + column,
             )
+
+
+@traced
+def replay_kg_store_shares(c, k, share, split):
+    """``replay_kg_store`` ("ks", ATOM_KIMI_MONO_K1_HEAD) over a split head's
+    shares: share ``s`` stores tokens ``s``, ``s + split`` .. (every share
+    holds the head's k and log gates in LDS), its first wave's lanes as the
+    one writer's -- no share finishes behind all the tokens' stores."""
+    L, tid = c["L"], c["tid"]
+    if (tid < 32) & (k["slot0"] >= 0):
+        column = tid * 4
+        records = k["rec"]
+        base = k["replay"]["rbase"]
+        for index in range_constexpr((L + split - 1) // split):
+            token = share + split * index
+            key = [
+                fx.ptr_load(c["qkl"] + (2 * token + 1) * HEAD_DIM + column + e)
+                for e in range(4)
+            ]
+            gate = [
+                fx.ptr_load(c["glog"] + token * HEAD_DIM + column + e) for e in range(4)
+            ]
+            at = base + token
+            packed = (
+                fx.Vector.from_elements(key, fx.Float32)
+                .to(fx.BFloat16)
+                .bitcast(fx.Int32)
+            )
+            if const_expr(L % split == 0):
+                _kg_store_token(records, packed, gate, at, column)
+            else:
+                # a share's last token may be past the step's
+                _kg_store_token_if(token < L, records, packed, gate, at, column)
+
+
+def _kg_store_token(records, packed, gate, at, column):
+    bo.buffer_store(packed, rsrc(records["k"]), at * REC_WORDS + column // 2)
+    bo.buffer_store(
+        fx.Vector.from_elements(gate, fx.Float32),
+        rsrc(records["g"]),
+        at * HEAD_DIM + column,
+    )
+
+
+@traced
+def _kg_store_token_if(stores, records, packed, gate, at, column):
+    if stores:
+        _kg_store_token(records, packed, gate, at, column)
 
 
 def replay_checkpoint_store(c, k, head, state, row0, rows):
@@ -1373,10 +1518,54 @@ def _head_norm_exchange(c, request, head, share):
         [(onrm, base + token * STATE_CHUNKS + chunk)], c["tag"]
     )
     if tid < L * others:
-        fx.ptr_store(
-            _f32_of(square_sum), c["head_onrm"] + token * STATE_CHUNKS + chunk
-        )
+        fx.ptr_store(_f32_of(square_sum), c["head_onrm"] + token * STATE_CHUNKS + chunk)
     gpu.barrier()
+
+
+@traced
+def _head_conv_tokens(c, weights, sequence, raw, channels, part, column):
+    """A conv channel round's SiLU outputs of the step's tokens into LDS (q
+    and k rows, v values), a guard a token; "conv" (ATOM_KIMI_MONO_K1_HEAD):
+    every token's output, then one guarded block of stores -- a guard a token
+    keeps each token's chain (taps, exp, division) in its own block, one after
+    the other, where the guard is a real one (the last round's)."""
+    L = c["L"]
+    together = "conv" in c.get("head_opts", frozenset())
+    outputs = []
+    for token in range_constexpr(L):
+        value = fx.Float32(0.0)
+        for tap in range_constexpr(4):
+            value = value + weights[tap] * sequence[token + tap]
+        denominator = fx.Float32(1.0) + hw_exp2(-value * LOG2E)
+        if const_expr(c.get("chunk_rounding", False)):
+            output = _bf16_round(value * (fx.Float32(1.0) / denominator))
+        else:
+            output = _bf16_round(value / denominator)
+        if const_expr(together):
+            outputs.append(output)
+        else:
+            if raw < channels:
+                if part < 2:
+                    fx.ptr_store(
+                        output,
+                        c["qkl"] + (2 * token + part) * HEAD_DIM + column,
+                    )
+                if part == 2:
+                    fx.ptr_store(
+                        output,
+                        c["vloc"] + token * HEAD_DIM + column,
+                    )
+    if const_expr(together):  # noqa: SIM102
+        if raw < channels:
+            if part < 2:
+                for token in range_constexpr(L):
+                    fx.ptr_store(
+                        outputs[token],
+                        c["qkl"] + (2 * token + part) * HEAD_DIM + column,
+                    )
+            if part == 2:
+                for token in range_constexpr(L):
+                    fx.ptr_store(outputs[token], c["vloc"] + token * HEAD_DIM + column)
 
 
 @traced
@@ -1402,26 +1591,36 @@ def kda_head(c, request, head, share=None):
         c["head_width"] = width
         c["head_row_base"] = share * width
     tdm_timeline.stamp(tdm_timeline.HEAD_START)
-    acc_idx = uniform(ld_i32(args["num_acc"], request)) - 1
-    slot_c = uniform(ld_i32(args["st_idx"], request * args["st_stride"]))
-    slot0 = uniform(
-        ld_i32(
-            args["st_idx"],
-            request * args["st_stride"] + acc_idx,
-        )
-    )
-    replay = records = staged = None
-    if const_expr(replayed):
-        # ReplaySSM: the state starts at the checkpoint (``replay_rows``)
-        replay = replay_slot(c, request)
+    tdm_timeline.anchor(tdm_timeline.ANCHOR_START)
+    if const_expr(c.get("head_meta") is not None):
+        # "meta" (ATOM_KIMI_MONO_K1_HEAD): the task's metadata as the CTA's
+        # side waves left it in LDS at the entry (``prefetch_head_meta``), no
+        # chain of dependent global loads ahead of the poll
+        acc_idx, slot_c, replay = _head_meta_loads(c, c["head_meta"])
         slot0 = replay["slot"]
         records = replay_bases(c, replay, head)
+        staged = None
     else:
-        if tid < L:
-            fx.ptr_store(
-                ld_i32(args["st_idx"], request * args["st_stride"] + tid),
-                c["slots"] + tid,
+        acc_idx = uniform(ld_i32(args["num_acc"], request)) - 1
+        slot_c = uniform(ld_i32(args["st_idx"], request * args["st_stride"]))
+        slot0 = uniform(
+            ld_i32(
+                args["st_idx"],
+                request * args["st_stride"] + acc_idx,
             )
+        )
+        replay = records = staged = None
+        if const_expr(replayed):
+            # ReplaySSM: the state starts at the checkpoint (``replay_rows``)
+            replay = replay_slot(c, request)
+            slot0 = replay["slot"]
+            records = replay_bases(c, replay, head)
+        else:
+            if tid < L:
+                fx.ptr_store(
+                    ld_i32(args["st_idx"], request * args["st_stride"] + tid),
+                    c["slots"] + tid,
+                )
     # this CTA's state rows: the head's, or a split head's share
     width = HEAD_DIM // split
     row_base = share * width if const_expr(split > 1) else 0
@@ -1483,6 +1682,7 @@ def kda_head(c, request, head, share=None):
     if const_expr(split > 1):
         head_state = _head_state_loads(c, slot0, head)
     tdm_timeline.stamp(tdm_timeline.HEAD_POLLED)
+    tdm_timeline.anchor(tdm_timeline.ANCHOR_POLLED)
     if const_expr(replayed):
         # past the poll: descriptors held across it spill SGPRs; the entry's
         # L2 prefetch and the conv and gates still cover the loads
@@ -1536,28 +1736,7 @@ def kda_head(c, request, head, share=None):
                     state_offset + token * args["cs_tok"],
                 )
         sequence = window + new_values
-        for token in range_constexpr(L):
-            value = fx.Float32(0.0)
-            for tap in range_constexpr(4):
-                value = value + weights[tap] * sequence[token + tap]
-            denominator = fx.Float32(1.0) + hw_exp2(-value * LOG2E)
-            if const_expr(c.get("chunk_rounding", False)):
-                output = _bf16_round(value * (fx.Float32(1.0) / denominator))
-            else:
-                output = _bf16_round(value / denominator)
-            if raw < channels:
-                if part < 2:
-                    fx.ptr_store(
-                        output,
-                        c["qkl"]
-                        + (2 * token + part) * HEAD_DIM
-                        + column,
-                    )
-                if part == 2:
-                    fx.ptr_store(
-                        output,
-                        c["vloc"] + token * HEAD_DIM + column,
-                    )
+        _head_conv_tokens(c, weights, sequence, raw, channels, part, column)
     gpu.barrier()
     tdm_timeline.stamp(tdm_timeline.HEAD_CONV)
 
@@ -1583,13 +1762,18 @@ def kda_head(c, request, head, share=None):
     else:
         kda_recur_head(c, metadata, request, head)
     tdm_timeline.stamp(tdm_timeline.HEAD_RECUR)
+    tdm_timeline.anchor(tdm_timeline.ANCHOR_RECUR)
     if const_expr(split > 1):
         _head_norm_exchange(c, request, head, share)
         tdm_timeline.stamp(tdm_timeline.HEAD_EXCHANGED)
         for stores_conv, conv, new_values in deferred:
             if stores_conv:
                 _head_conv_store(c, conv, new_values)
-        if const_expr(replayed):
+        if const_expr(replayed and "ks" in c.get("head_opts", frozenset())):
+            # every share has published its norms, so is past its staging:
+            # each stores its tokens' records
+            replay_kg_store_shares(c, metadata, share, split)
+        elif const_expr(replayed):  # noqa: SIM102
             # every share has published its norms, so is past its staging
             if share == 0:
                 replay_kg_store(c, metadata)
@@ -1597,6 +1781,7 @@ def kda_head(c, request, head, share=None):
         replay_kg_store(c, metadata)
     kda_head_norm(c, request, head)
     tdm_timeline.stamp(tdm_timeline.HEAD_DONE)
+    tdm_timeline.anchor(tdm_timeline.ANCHOR_DONE)
 
 
 @traced
@@ -1673,8 +1858,7 @@ def kda_recur(c, k, req, head, chunk):
         outputs = []
         for row_index in range_constexpr(2):
             row_state = [
-                state[4 * row_index + element] * decay[element]
-                for element in range(4)
+                state[4 * row_index + element] * decay[element] for element in range(4)
             ]
             projection = (
                 row_state[0] * key[0]
@@ -1771,8 +1955,7 @@ def _kda_norm_row(c, request, head, chunk, token, element):
         square_sum = square_sum + _f32_of(values[other])
     gate = _f32_of(values[STATE_CHUNKS])
     inverse = hw_rsq(
-        square_sum * fx.Float32(1.0 / HEAD_DIM)
-        + fx.Float32(c["onorm_eps"])
+        square_sum * fx.Float32(1.0 / HEAD_DIM) + fx.Float32(c["onorm_eps"])
     )
     weight = fx.Float32(
         bo.buffer_load(
@@ -2105,15 +2288,9 @@ def _attention_gate(c, token, token0, total_tokens, resident):
         values = []
         for slice_index in range_constexpr(SEAM_SLICES_PER_GROUP):
             index = (
-                (
-                    (group * SEAM_SLICES_PER_GROUP + slice_index)
-                    * total_tokens
-                    + global_token
-                )
-                * sources
-                * 2
-                + pair
-            )
+                (group * SEAM_SLICES_PER_GROUP + slice_index) * total_tokens
+                + global_token
+            ) * sources * 2 + pair
             if const_expr(resident):
                 word = mailbox_poll_device(c["part"], index, c["tag"])
             else:
@@ -2250,8 +2427,7 @@ def _attention_mix(c, task, token0, total_tokens, tile, resident):
             values = []
             for slice_index in range_constexpr(SEAM_SLICES_PER_GROUP):
                 index = (
-                    (group * SEAM_SLICES_PER_GROUP + slice_index)
-                    * total_tokens
+                    (group * SEAM_SLICES_PER_GROUP + slice_index) * total_tokens
                     + token0
                     + token
                 )

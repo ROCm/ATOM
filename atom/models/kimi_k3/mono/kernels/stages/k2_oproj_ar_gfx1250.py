@@ -140,7 +140,9 @@ class K2OprojAllReduceKernel:
     launch_count: int = 1
 
 
-def _load_lines(mine, words):
+def _load_lines(mine, words, modifier=ar.SCOPE_SYS | ar.VOLATILE):
+    """The lines at ``words``. ``modifier``: ``ar.POLL_VOLATILE`` (the
+    default: a round trip a line) or ``ar.POLL_TOGETHER``."""
     return [
         fx.Vector(
             bo.buffer_load(
@@ -148,7 +150,7 @@ def _load_lines(mine, words):
                 word,
                 vec_width=LINE_WORDS,
                 dtype=T.i32,
-                cache_modifier=ar.SCOPE_SYS | ar.VOLATILE,
+                cache_modifier=modifier,
             )
         )
         for word in words
@@ -164,14 +166,44 @@ def _stale(lines, epoch):
 
 
 @traced
-def _poll_lines(mine, words, epoch):
+def _poll_lines(mine, words, epoch, modifier=ar.SCOPE_SYS | ar.VOLATILE):
     """The lines at ``words`` of this rank's region once all carry ``epoch``,
     re-loaded together while any is stale, as their tokens' pair words."""
-    lines = _load_lines(mine, words)
+    lines = _load_lines(mine, words, modifier)
     while _stale(lines, epoch):
         spin_pause()
-        lines = _load_lines(mine, words)
+        lines = _load_lines(mine, words, modifier)
     return [[fx.Int32(line[j]) for j in range(LINE_TOKENS)] for line in lines]
+
+
+@traced
+def _poll_lines_test(mine, words, epoch, modifier, bound, marks, bid, tid):
+    """Tool builds: ``_poll_lines`` giving up past ``bound`` re-loads, with
+    ``k2_allreduce_gfx1250._poll_lines_test``'s marks."""
+    lines = _load_lines(mine, words, modifier)
+    polls = fx.Int32(0)
+    while _stale(lines, epoch) & (polls < bound):
+        spin_pause()
+        lines = _load_lines(mine, words, modifier)
+        polls = polls + 1
+    if polls >= bound:
+        st_dev(fx.Int32(ar.GAVE_UP) | bid, marks, ar.GAVE_UP_WORD)
+    if (tid == 0) & (polls > 0):
+        st_dev(polls, marks, ar.POLLS_WORD + bid)
+    return [[fx.Int32(line[j]) for j in range(LINE_TOKENS)] for line in lines]
+
+
+def _poll(pc, mine, words, epoch):
+    """``_poll_lines`` as ``pc`` (``ar.poll_context``; None: the default)
+    has it."""
+    if pc is None:
+        return _poll_lines(mine, words, epoch)
+    if pc["bound"] is None:
+        return _poll_lines(mine, words, epoch, pc["modifier"])
+    return _poll_lines_test(
+        mine, words, epoch, pc["modifier"], pc["bound"], pc["marks"], pc["bid"],
+        pc["tid"],
+    )  # fmt: skip
 
 
 def _sum_ranks(words):
@@ -211,7 +243,9 @@ def _land_line(live, out, rows, triple, column_pair, words):
 
 
 @traced
-def _reduce_share(mine, bases, rank, rows, tp, own, bank, epoch, bid, tid, stamp):
+def _reduce_share(
+    mine, bases, rank, rows, tp, own, bank, epoch, bid, tid, stamp, pc=None
+):  # fmt: skip
     """This CTA's share of the lines this rank owns, ``[triple][owned pair]``
     dealt evenly to the grid: every rank's partials summed and pushed to every
     rank."""
@@ -229,7 +263,7 @@ def _reduce_share(mine, bases, rank, rows, tp, own, bank, epoch, bid, tid, stamp
         for _, item in picks
         for p in range(tp)
     ]
-    partials = _poll_lines(mine, words, epoch)
+    partials = _poll(pc, mine, words, epoch)
     stamp(STAMP_SUMMED)
     for k, (live, item) in enumerate(picks):
         totals = _sum_lines(partials[k * tp : (k + 1) * tp])
@@ -246,24 +280,25 @@ def _reduce_share(mine, bases, rank, rows, tp, own, bank, epoch, bid, tid, stamp
 
 
 @traced
-def _oneshot_sums(mine, out, rows, tp, bank, epoch, bid, tid, stamp):
+def _oneshot_sums(mine, out, rows, tp, bank, epoch, bid, tid, stamp, pc=None):
     """This CTA's columns from every rank's partials (``_reduce_owned``'s
     sums), landed here: no sum leaves the rank. Past 48 rows a thread takes
     a line a round, the rounds in turn."""
     for k in range_constexpr(line_rounds(rows)):
         _oneshot_sum(
             mine, out, rows, tp, bank, epoch, bid, tid if k == 0 else tid + k * THREADS,
-            stamp if k == 0 else (lambda *_: None),
+            stamp if k == 0 else (lambda *_: None), pc,
         )  # fmt: skip
 
 
 @traced
-def _oneshot_sum(mine, out, rows, tp, bank, epoch, bid, item, stamp):
+def _oneshot_sum(mine, out, rows, tp, bank, epoch, bid, item, stamp, pc=None):
     count = triples(rows)
     if item < count * CTA_PAIRS:
         triple = item // CTA_PAIRS
         column_pair = bid * CTA_PAIRS + item % CTA_PAIRS
-        partials = _poll_lines(
+        partials = _poll(
+            pc,
             mine,
             [
                 bank + LINE_WORDS * ((p * count + triple) * (HIDDEN // 2) + column_pair)
@@ -279,7 +314,7 @@ def _oneshot_sum(mine, out, rows, tp, bank, epoch, bid, item, stamp):
 
 @traced
 def _reduce_owned(
-    mine, bases, out, rank, rows, tp, own, bank, epoch, bid, tid, stamp
+    mine, bases, out, rank, rows, tp, own, bank, epoch, bid, tid, stamp, pc=None
 ):  # fmt: skip
     """This CTA's own columns on the rank owning them: every rank's partials
     summed, pushed to every rank and landed here directly."""
@@ -298,7 +333,7 @@ def _reduce_owned(
         for _, triple, pair in items
         for p in range(tp)
     ]
-    partials = _poll_lines(mine, words, epoch)
+    partials = _poll(pc, mine, words, epoch)
     stamp(STAMP_SUMMED)
     for k, (live, triple, pair) in enumerate(items):
         totals = _sum_lines(partials[k * tp : (k + 1) * tp])
@@ -314,30 +349,38 @@ def _reduce_owned(
 
 
 @traced
-def _owner_sums(mine, bases, out, rank, rows, tp, own, bank, epoch, bid, tid, stamp):
+def _owner_sums(
+    mine, bases, out, rank, rows, tp, own, bank, epoch, bid, tid, stamp, pc=None
+):  # fmt: skip
     if bid // (CTAS // tp) == rank:
         _reduce_owned(
-            mine, bases, out, rank, rows, tp, own, bank, epoch, bid, tid, stamp
+            mine, bases, out, rank, rows, tp, own, bank, epoch, bid, tid, stamp, pc
         )  # fmt: skip
     else:
-        _land_sums(mine, out, rows, tp, own, bank, epoch, bid, tid, THREADS, stamp)
+        _land_sums(
+            mine, out, rows, tp, own, bank, epoch, bid, tid, THREADS, stamp, pc
+        )  # fmt: skip
 
 
 @traced
-def _split_waves(mine, bases, out, rank, rows, tp, own, bank, epoch, bid, tid, stamp):
+def _split_waves(
+    mine, bases, out, rank, rows, tp, own, bank, epoch, bid, tid, stamp, pc=None
+):  # fmt: skip
     if tid < SUM_THREADS:
         _reduce_share(
-            mine, bases, rank, rows, tp, own, bank, epoch, bid, tid, stamp
+            mine, bases, rank, rows, tp, own, bank, epoch, bid, tid, stamp, pc
         )  # fmt: skip
     else:
         _land_sums(
             mine, out, rows, tp, own, bank, epoch, bid, tid - SUM_THREADS,
-            LAND_THREADS, stamp,
+            LAND_THREADS, stamp, pc,
         )  # fmt: skip
 
 
 @traced
-def _land_sums(mine, out, rows, tp, own, bank, epoch, bid, tid, threads, stamp=None):
+def _land_sums(
+    mine, out, rows, tp, own, bank, epoch, bid, tid, threads, stamp=None, pc=None
+):  # fmt: skip
     """This CTA's columns from their owner's sums, on ``threads`` lanes."""
     count = triples(rows)
     rounds = -(-count * CTA_PAIRS // threads)
@@ -352,7 +395,8 @@ def _land_sums(mine, out, rows, tp, own, bank, epoch, bid, tid, threads, stamp=N
                 bid * CTA_PAIRS + item % CTA_PAIRS,
             )
         )
-    sums = _poll_lines(
+    sums = _poll(
+        pc,
         mine,
         [
             sums_base + LINE_WORDS * (triple * (HIDDEN // 2) + column_pair)
@@ -429,10 +473,25 @@ def build_oproj_allreduce(
     proj: int,
     oneshot: bool | None = None,
     profile: bool = False,
+    poll_together: bool | None = None,
+    poll_bound: int | None = None,
+    test_skip_push: bool = False,
+    test_swap_late: int | None = None,
 ) -> K2OprojAllReduceKernel:
     """``oneshot``: one fabric hop (default ``ATOM_KIMI_MONO_OPROJ_AR_ONESHOT``;
     the banks then need ``oproj_peer_bytes(tp, rows, True)``). ``profile``:
-    ``STAMPS`` i32 a CTA to a trailing ``stamps`` argument."""
+    ``STAMPS`` i32 a CTA to a trailing ``stamps`` argument. ``poll_together``
+    (default ``ATOM_KIMI_MONO_OPROJ_AR_POLL_TOGETHER`` at more than one
+    rank): a poll's loads of the ranks' lines go out together and are awaited
+    once (``ar.POLL_TOGETHER``; with the default each is waited out before
+    the next: a memory round trip a rank); the same lines at the same
+    addresses. Tool builds only, never the runner's: ``poll_bound`` (polls
+    give up past it and mark ``epochs[ar.GAVE_UP_WORD]``, thread 0's polls a
+    CTA from ``epochs[ar.POLLS_WORD]``: ``epochs`` then holds
+    ``ar.GAVE_UP_WORD + 1`` words), and one-shot ``test_skip_push`` (no line
+    is pushed) and ``test_swap_late`` (a CTA sums and lands its partner CTA's
+    columns, the odd CTAs pushing that many sleeps late: lines that land
+    while they are polled)."""
     if plan.architecture is not GFX1250:
         raise ValueError("the o_proj all-reduce requires gfx1250")
     if plan.threads != THREADS or plan.waves != WAVES:
@@ -445,6 +504,11 @@ def build_oproj_allreduce(
     tiles = (rows + ROWS - 1) // ROWS
     own = own_pairs(tp)
     oneshot = _oneshot(oneshot)
+    if poll_together is None:
+        poll_together = envs.ATOM_KIMI_MONO_OPROJ_AR_POLL_TOGETHER and tp > 1
+    ar._check_test_knobs(poll_bound, test_skip_push, test_swap_late)
+    if (test_skip_push or test_swap_late is not None) and not oneshot:
+        raise ValueError("the o_proj all-reduce's push knobs are one-shot's")
     words_a_bank = oneshot_bank_words(tp, rows) if oneshot else bank_words(tp, rows)
     abi = OPROJ_AR_PROFILE_ABI if profile else OPROJ_AR_ABI
     # ``paired`` (ATOM_KIMI_MONO_PAIRED_SLABS "oproj"): K two slabs a step,
@@ -474,7 +538,7 @@ def build_oproj_allreduce(
         f"{'_ps' if paired else ''}"
         f"{'_profile' if profile else ''}{fresh.suffix('oproj')}"
         f"{tdm_timeline.suffix()}"
-    )
+    ) + ar._poll_suffix(poll_together, poll_bound, test_skip_push, test_swap_late)
     sources = SOURCES
     timeline = tdm_timeline.key()
 
@@ -572,16 +636,24 @@ def build_oproj_allreduce(
                 fx.ptr_store(fx.Int32(0), lds.stage.ptr + rows * CTA_PAIRS + tid)
         gpu.barrier()
         stamp(STAMP_STAGED)
+        pc = ar.poll_context(poll_together, poll_bound, epochs, bid, tid)
         # past 48 rows a thread pushes a line a round, every round's before
         # any poll
         if const_expr(oneshot):
-            for k in range_constexpr(line_rounds(rows)):
-                _push_oneshot(
-                    lds.stage.ptr, bases, rank, rows, bank, epoch, bid,
-                    tid if k == 0 else tid + k * THREADS,
-                )  # fmt: skip
+            if const_expr(test_swap_late):  # noqa: SIM102
+                if bid % 2 == 1:
+                    ar._sleeps(test_swap_late)
+            if const_expr(not test_skip_push):
+                for k in range_constexpr(line_rounds(rows)):
+                    _push_oneshot(
+                        lds.stage.ptr, bases, rank, rows, bank, epoch, bid,
+                        tid if k == 0 else tid + k * THREADS,
+                    )  # fmt: skip
             stamp(STAMP_PUSHED)
-            _oneshot_sums(mine, out, rows, tp, bank, epoch, bid, tid, stamp)
+            _oneshot_sums(
+                mine, out, rows, tp, bank, epoch,
+                bid if test_swap_late is None else bid ^ 1, tid, stamp, pc,
+            )  # fmt: skip
         else:
             for k in range_constexpr(line_rounds(rows)):
                 _push_owner(
@@ -592,12 +664,14 @@ def build_oproj_allreduce(
             stamp(STAMP_PUSHED)
             if const_expr(rows > SPREAD_ROWS):
                 _split_waves(
-                    mine, bases, out, rank, rows, tp, own, bank, epoch, bid, tid, stamp
-                )
+                    mine, bases, out, rank, rows, tp, own, bank, epoch, bid, tid,
+                    stamp, pc,
+                )  # fmt: skip
             else:
                 _owner_sums(
-                    mine, bases, out, rank, rows, tp, own, bank, epoch, bid, tid, stamp
-                )
+                    mine, bases, out, rank, rows, tp, own, bank, epoch, bid, tid,
+                    stamp, pc,
+                )  # fmt: skip
         gpu.barrier()
         stamp(STAMP_END)
         counter = bid + tid * CTAS

@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""What production's dispatch picks for the DSpark draft's two MLA GEMMs at a
-width, so the gfx1250 draft kernels sum them the same way: the FlyDSL
-mxfp8_128 split-K of ``fused_qkv_a_proj`` (E8M0 activations), and the gluon
-blockscale GEMM's split-K of ``q_b_proj`` (fp32 activation scales). Asked
-through AITER's own lookups, so a retuned table moves the mirror with it."""
+"""What production's dispatch picks for the DSpark draft's GEMMs at a width,
+so the gfx1250 draft kernels sum them the same way: the FlyDSL mxfp8_128
+split-K of ``fused_qkv_a_proj``, of the MLP's projections and of o_proj (E8M0
+activations), and the gluon blockscale GEMM's split-K of ``q_b_proj`` (fp32
+activation scales). Asked through AITER's own lookups, so a retuned table
+moves the mirror with it."""
 
 from atom.mono.runtime.consensus import MonoUnsupported
 
@@ -14,10 +15,11 @@ Q_LORA = 1536
 K_GROUP = 128
 
 
-def qkv_a_split_k(rows: int) -> int:
-    """``gemm_a8w8_blockscale_bpreshuffle``'s split_k for fused_qkv_a_proj
-    (E8M0 x E8M0 on gfx1250): the tuned FlyDSL row's, else the untuned
-    fallback kernel's. Refused where the dispatch would leave FlyDSL."""
+def mxfp8_split_k(rows: int, out_rows: int, k: int, what: str) -> int:
+    """``gemm_a8w8_blockscale_bpreshuffle``'s split_k for an E8M0 x E8M0 GEMM
+    of ``out_rows`` x ``k`` on gfx1250: the tuned FlyDSL row's, else the
+    untuned fallback kernel's. Refused where the dispatch would leave FlyDSL
+    or fuse the split-K reduce."""
     from aiter.ops.gemm_op_a8w8 import (
         _flydsl_mxfp8_fallback_kernel,
         get_mxscale_bpreshuffle_config,
@@ -27,22 +29,23 @@ def qkv_a_split_k(rows: int) -> int:
         qkv_a_split_k as parse,
     )
 
-    cfg = get_mxscale_bpreshuffle_config(rows, QKV_A_ROWS, HIDDEN, "128x128")
+    cfg = get_mxscale_bpreshuffle_config(rows, out_rows, k, "128x128")
     if cfg is not None:
         if cfg.get("libtype") != "flydsl":
-            raise MonoUnsupported(
-                f"{rows} rows: fused_qkv_a_proj on {cfg.get('libtype')}"
-            )
+            raise MonoUnsupported(f"{rows} rows: {what} on {cfg.get('libtype')}")
         split = parse(cfg.get("kernelName"))
         if split is None or "_fsk" in str(cfg.get("kernelName")):
-            raise MonoUnsupported(
-                f"{rows} rows: fused_qkv_a_proj {cfg.get('kernelName')}"
-            )
+            raise MonoUnsupported(f"{rows} rows: {what} {cfg.get('kernelName')}")
         return split
-    kernel = _flydsl_mxfp8_fallback_kernel(rows, QKV_A_ROWS, HIDDEN)
+    kernel = _flydsl_mxfp8_fallback_kernel(rows, out_rows, k)
     if kernel is None:
-        raise MonoUnsupported(f"{rows} rows: no FlyDSL kernel for fused_qkv_a_proj")
+        raise MonoUnsupported(f"{rows} rows: no FlyDSL kernel for {what}")
     return int(kernel.split_k)
+
+
+def qkv_a_split_k(rows: int) -> int:
+    """The split_k of fused_qkv_a_proj's GEMM at the width."""
+    return mxfp8_split_k(rows, QKV_A_ROWS, HIDDEN, "fused_qkv_a_proj")
 
 
 def q_b_split_groups(rows: int, out_rows: int) -> int:

@@ -24,7 +24,7 @@ from aiter.ops.triton.utils._triton import arch_info
 # no device to probe: AITER's Triton modules ask for the arch at import
 arch_info._CACHED_ARCH = arch_info._CACHED_ARCH or os.environ.get("ARCH", "gfx1250")
 
-from atom.models.kimi_k3.mono import runner_gfx1250 as rm  # noqa: E402
+from atom.models.kimi_k3.mono import runner_gfx1250 as rm
 from atom.models.kimi_k3.mono.kernels.attention.kda_builder_gfx1250 import (
     K1LocalBuildSpec,
 )
@@ -56,7 +56,7 @@ PROJ = 1536
 
 def text(elf: bytes) -> bytes:
     """The ELF64's ``.text`` section."""
-    shoff, = struct.unpack_from("<Q", elf, 0x28)
+    (shoff,) = struct.unpack_from("<Q", elf, 0x28)
     shentsize, shnum, shstrndx = struct.unpack_from("<HHH", elf, 0x3A)
 
     def section(i):
@@ -102,7 +102,9 @@ def k1(rows, qlen, quant):
 
 
 def kernels(kind, rows, qlen):
-    herd = rm._FLYDSL_USE_HERD and rm._FLYDSL_HERD_MIN_M <= rows <= rm._FLYDSL_HERD_MAX_M
+    herd = (
+        rm._FLYDSL_USE_HERD and rm._FLYDSL_HERD_MIN_M <= rows <= rm._FLYDSL_HERD_MAX_M
+    )
     fused = rows <= envs.ATOM_KIMI_MONO_FUSED_MOE_ROWS
     if kind == "k1":
         return k1(rows, qlen, False)

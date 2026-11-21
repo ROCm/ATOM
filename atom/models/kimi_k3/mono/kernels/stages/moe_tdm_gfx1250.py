@@ -1035,7 +1035,18 @@ def build_moe(
 
     @traced
     def body(
-        smem, ids, latent, scales, w13, w13s, w2, w2s, inter, grouped, flags, state,
+        smem,
+        ids,
+        latent,
+        scales,
+        w13,
+        w13s,
+        w2,
+        w2s,
+        inter,
+        grouped,
+        flags,
+        state,
         fused=None,
     ):
         """The kernel on ``smem`` (an ``Lds``). ``fused``: the launch's part
@@ -1232,10 +1243,10 @@ def build_moe(
         # weights: a TDM counter drains in order, so the first item's wait
         # covers them. A CTA with no gate/up task (whose down tiles reuse
         # this LDS) loads none.
-        if const_expr(fused is None):
+        if const_expr(fused is None):  # noqa: SIM102
             if mine > 0:
                 issue_latent()
-        if const_expr(fused is not None):
+        if const_expr(fused is not None):  # noqa: SIM102
             if mine == 0:
                 # Its down rows land where the latent does.
                 rocdl.s_wait_tensorcnt(0)
@@ -1360,7 +1371,8 @@ def build_moe(
                                 for step in range(STEPS)
                             ]
                             k_weight_scales = [
-                                fx.ptr_load(k_scale + step * 32) for step in range(STEPS)
+                                fx.ptr_load(k_scale + step * 32)
+                                for step in range(STEPS)
                             ]
                             # A K tile's STEPS * 16 words hold one pad dword.
                             k_latq = lds["latq"] + k_tile
@@ -1391,13 +1403,11 @@ def build_moe(
                                             ),
                                         )
             if const_expr(rolled and resident < k_tiles):
-                for g_tile in range(
-                    fx.Int32(resident), fx.Int32(k_tiles), unroll=1
-                ):
+                for g_tile in range(fx.Int32(resident), fx.Int32(k_tiles), unroll=1):
                     g_item = n * k_tiles + g_tile
                     g_before = clock()
                     wait_for(g_item)
-                    if const_expr(publish_at >= resident):
+                    if const_expr(publish_at >= resident):  # noqa: SIM102
                         if g_tile == publish_at:
                             rocdl.s_wait_storecnt(0)
                     _lds_barrier()
@@ -1467,7 +1477,8 @@ def build_moe(
                                 for step in range(STEPS)
                             ]
                             g_weight_scales = [
-                                fx.ptr_load(g_scale + step * 32) for step in range(STEPS)
+                                fx.ptr_load(g_scale + step * 32)
+                                for step in range(STEPS)
                             ]
                             for m in range_constexpr(tiles):
                                 if m == 0 or m * 16 < count:
@@ -1532,15 +1543,20 @@ def build_moe(
                                 accumulators[m] = _wmma(
                                     weights[step],
                                     _past_picks(
-                                        _activation_fragment(
-                                            lds["latq"] + k_step * 16 // LATENT_PAD_EVERY,
-                                            latq_words,
-                                            tokens[m],
-                                            k_step,
-                                            lane,
-                                        )
-                                        if tile_k < resident
-                                        else _latent_fragment(latent, tokens[m], k_step, lane),
+                                        (
+                                            _activation_fragment(
+                                                lds["latq"]
+                                                + k_step * 16 // LATENT_PAD_EVERY,
+                                                latq_words,
+                                                tokens[m],
+                                                k_step,
+                                                lane,
+                                            )
+                                            if tile_k < resident
+                                            else _latent_fragment(
+                                                latent, tokens[m], k_step, lane
+                                            )
+                                        ),
                                         m * 16 + lane % 16,
                                         count,
                                         zero_pad,
@@ -1863,7 +1879,17 @@ def build_moe(
         _ = sources
         body(
             fx.SharedAllocator().allocate(Lds).peek(),
-            ids, latent, scales, w13, w13s, w2, w2s, inter, grouped, flags, state,
+            ids,
+            latent,
+            scales,
+            w13,
+            w13s,
+            w2,
+            w2s,
+            inter,
+            grouped,
+            flags,
+            state,
         )
 
     @flyc.jit

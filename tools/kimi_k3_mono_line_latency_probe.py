@@ -151,9 +151,11 @@ def build_probe(probe: Probe):
                 if line < probe.lines:
                     values = [payload_word(tag, cta, line, w) for w in range(payload)]
                     store_line(
-                        (cta * probe.lines + line) * words
-                        if probe.store == "buf_sys"
-                        else peer + fx.Int64((cta * probe.lines + line) * words * 4),
+                        (
+                            (cta * probe.lines + line) * words
+                            if probe.store == "buf_sys"
+                            else peer + fx.Int64((cta * probe.lines + line) * words * 4)
+                        ),
                         fx.Vector.from_elements([*values, tag], fx.Int32),
                         peer,
                     )

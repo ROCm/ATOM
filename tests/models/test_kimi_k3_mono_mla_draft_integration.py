@@ -335,6 +335,7 @@ def test_a_step_the_kernels_take_hands_its_tensors(monkeypatch):
 # ---------------------------------------------------------- the decode
 def _attention_module():
     try:
+        pytest.importorskip("triton", reason="the kernel under test needs triton")
         from atom.model_ops import attention_mla
     except ImportError as error:
         pytest.skip(f"attention_mla needs the GPU stack: {error}")

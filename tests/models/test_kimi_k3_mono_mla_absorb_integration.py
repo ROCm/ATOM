@@ -71,6 +71,7 @@ def test_a_q_out_takes_the_attentions_decode_from_it(model_module, monkeypatch):
 
 def _attention_module():
     try:
+        pytest.importorskip("triton", reason="the kernel under test needs triton")
         from atom.model_ops import attention_mla
     except ImportError as error:
         pytest.skip(f"attention_mla needs the GPU stack: {error}")
@@ -325,7 +326,9 @@ def test_an_absorb_that_does_not_build_clean_leaves_the_width_production(
 
 def test_the_width_lists_its_absorbs_for_the_resident_checks(runner_module):
     absorb = SimpleNamespace(launcher=object(), abi="abi")
-    build = runner_module.Gfx1250WidthBuild({}, {}, None, None, {(1,): absorb, (2,): None})
+    build = runner_module.Gfx1250WidthBuild(
+        {}, {}, None, None, {(1,): absorb, (2,): None}
+    )
     assert build.kernels() == [(absorb.launcher, "abi")]
 
 
@@ -394,6 +397,7 @@ def test_a_step_the_absorb_cannot_take_writes_nothing(
 
 
 def test_the_absorb_reads_the_step_and_the_front(runner_module, monkeypatch):
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
     from atom.models.kimi_k3.mono.kernels.stages import mla_absorb_gfx1250 as ma
 
     forward, cache = _step(monkeypatch, runner_module)

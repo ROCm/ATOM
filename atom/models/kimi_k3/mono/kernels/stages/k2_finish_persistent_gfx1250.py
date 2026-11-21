@@ -504,17 +504,13 @@ def build_packed_finish(
     profile_at = profile_offset(rows, precompute_herd) // 4
     spare_cta = SHARED_DOWN_TASKS - plan.blocks
     herd_tasks = [
-        task
-        for task in (herd_cta, herd_cta + plan.blocks)
-        if task < SHARED_DOWN_TASKS
+        task for task in (herd_cta, herd_cta + plan.blocks) if task < SHARED_DOWN_TASKS
     ]
     herd_takers = [
         cta for cta in range(max(spare_cta, 0), plan.blocks) if cta != herd_cta
     ][: len(herd_tasks)]
     if precompute_herd and len(herd_takers) < len(herd_tasks):
-        raise ValueError(
-            f"no CTA takes the HERD CTA's shared-down task at {rows} rows"
-        )
+        raise ValueError(f"no CTA takes the HERD CTA's shared-down task at {rows} rows")
 
     @traced
     def body(
@@ -682,6 +678,7 @@ def build_packed_finish(
         launch = fx.Int32(
             bo.buffer_load(rsrc(scratch), launch_word, vec_width=1, dtype=T.i32)
         )
+
         def herd_context(tag):
             """``stage_herd_finalize``'s context (``stage_herd_token``'s too)."""
             return {
@@ -717,9 +714,7 @@ def build_packed_finish(
                         dtype=T.f32,
                     )
                 ),
-                "herd_lds": {
-                    name: getattr(herd_lds, name).ptr for name in herd_words
-                },
+                "herd_lds": {name: getattr(herd_lds, name).ptr for name in herd_words},
                 "store_cm": _out_cm(fused),
                 **({"stamp": stamp} if profile else {}),
             }
@@ -1155,9 +1150,13 @@ def build_packed_finish(
                 tile_rows = min(WMMA_TOKEN_ROWS, rows - tile_start)
                 # Tile t's row groups start at CTA t * ROUTED_DOWN_TASKS (mod grid)
                 # so later tiles run on otherwise idle CTAs.
-                down_task = (bid + (-tile * ROUTED_DOWN_TASKS) % plan.blocks) % plan.blocks
+                down_task = (
+                    bid + (-tile * ROUTED_DOWN_TASKS) % plan.blocks
+                ) % plan.blocks
                 if down_task < ROUTED_DOWN_TASKS:
-                    for iteration in range_constexpr((16 * 32 + THREADS - 1) // THREADS):
+                    for iteration in range_constexpr(
+                        (16 * 32 + THREADS - 1) // THREADS
+                    ):
                         index = tid + THREADS * iteration
                         if index < tile_rows * 32:
                             value = fx.Int32(
@@ -1181,7 +1180,9 @@ def build_packed_finish(
                                 )
                             )
                             fx.ptr_store(value, down.experts.ptr + index)
-                    for iteration in range_constexpr((256 * 16 + THREADS - 1) // THREADS):
+                    for iteration in range_constexpr(
+                        (256 * 16 + THREADS - 1) // THREADS
+                    ):
                         index = tid + THREADS * iteration
                         if index < tile_rows * 16 * tile_rows:
                             value = fx.Int32(
@@ -1221,7 +1222,9 @@ def build_packed_finish(
                                 )
                             )
                             fx.ptr_store(value, down.intermediate_scales.ptr + index)
-                    for iteration in range_constexpr((256 * 32 + THREADS - 1) // THREADS):
+                    for iteration in range_constexpr(
+                        (256 * 32 + THREADS - 1) // THREADS
+                    ):
                         index = tid + THREADS * iteration
                         if index < 256 * 32:
                             fx.ptr_store(
@@ -1385,9 +1388,11 @@ def build_packed_finish(
         scratch_bytes=(
             4 * (profile_at + plan.blocks * PROFILE_WORDS)
             if profile
-            else max(at + 4 * words for at, words in herd_at.values())
-            if precompute_herd
-            else 8
+            else (
+                max(at + 4 * words for at, words in herd_at.values())
+                if precompute_herd
+                else 8
+            )
         ),
         lds=RoleLds,
         body=body,

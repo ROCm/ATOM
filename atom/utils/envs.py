@@ -733,9 +733,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Kimi-K3 gfx1250 mono: K1's gate epilogue computes a wave's eight decay
     # elements before one guarded store block, so their dependency chains
     # overlap (the same bits), the default; 0 guards each element.
-    "ATOM_KIMI_MONO_K1_GATE_ILP": lambda: os.getenv(
-        "ATOM_KIMI_MONO_K1_GATE_ILP", "1"
-    )
+    "ATOM_KIMI_MONO_K1_GATE_ILP": lambda: os.getenv("ATOM_KIMI_MONO_K1_GATE_ILP", "1")
     == "1",
     # 1, the default: Kimi-K3 gfx1250 mono K1's FP8 in-projection walks K
     # two 512-column slabs a step (one barrier pair a step) where its tokens'
@@ -786,6 +784,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_KIMI_MONO_K1_WHOLE_HEADS", "1"
     )
     == "1",
+    # Kimi-K3 gfx1250 mono: K1's whole-head task (a comma list, the same
+    # bits). "conv": a conv round's tokens are all computed before one guarded
+    # block of stores, so the last round's chains overlap as the first's do.
+    # "meta" (ReplaySSM, where a head's CTA projects first): the head task's
+    # metadata (its request's accepted count, slots and committed records,
+    # the record buffers) is read at the entry by the waves that issue no
+    # first projection copy and kept in LDS, so the other waves' copies are
+    # not held behind that chain of dependent loads and the head task does
+    # not walk it again ahead of its poll. "ks" (ReplaySSM, a split head):
+    # the step's k and log-gate records are stored by every share, its own
+    # tokens', not all by the head's first share, which finished last behind
+    # them. "noack" (where a head's CTA projects first): that CTA goes on to
+    # its head task past an LDS-only barrier, not past its mailbox stores'
+    # confirm, which its head's loads and poll then overlap. Empty, the
+    # default, keeps the task as it was.
+    "ATOM_KIMI_MONO_K1_HEAD": lambda: frozenset(
+        option
+        for option in os.getenv("ATOM_KIMI_MONO_K1_HEAD", "").split(",")
+        if option not in ("", "0")
+    ),
     # Kimi-K3 gfx1250 mono: the fused MoE's gate/up K tiles, its M tiles'
     # epilogues and down tiles, and its staging loops as runtime loops, so a
     # cold launch fetches one body's code each (the same bits); 0 unrolls them
@@ -833,6 +851,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_MONO_TAIL_EARLY_GATHER": lambda: (
         os.getenv("ATOM_KIMI_MONO_TAIL_EARLY_GATHER", "0") == "1"
     ),
+    # 1: the K2 tail's polls of the all-reduce lines issue their loads of the
+    # ranks' copies together and wait once (k2_tail_gfx1250, the same bits,
+    # the same lines at the same addresses). 0, the default, keeps the
+    # volatile loads, each of which the compiler waits out before it issues
+    # the next: a poll then takes a memory round trip a rank (two a rank for
+    # a routed line and its partner). More than one rank only.
+    "ATOM_KIMI_MONO_TAIL_POLL_TOGETHER": lambda: (
+        os.getenv("ATOM_KIMI_MONO_TAIL_POLL_TOGETHER", "0") == "1"
+    ),
+    # 1: where every up-weight slab and token slab of the K2 tail's finalize
+    # fits the LDS (up to 13 rows), the tail issues the later weight slabs
+    # once its lines are pushed, awaits all its copies once the flags are
+    # seen and multiplies the slabs with no barrier between them
+    # (k2_tail_gfx1250, the same bits). 0, the default, keeps the slab ring.
+    "ATOM_KIMI_MONO_TAIL_RESIDENT": lambda: (
+        os.getenv("ATOM_KIMI_MONO_TAIL_RESIDENT", "0") == "1"
+    ),
     # 1: Kimi-K3 gfx1250 mono runs a full-attention layer's projections of its
     # normed input -- fused_qkv_a_proj, the q_a / kv_a RMSNorms, q_b_proj's
     # activation quant and g_proj -- as one resident launch
@@ -850,6 +885,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_MONO_MLA_ABSORB": lambda: (
         os.getenv("ATOM_KIMI_MONO_MLA_ABSORB", "0") == "1"
     ),
+    # 1 (with ATOM_KIMI_MONO_MLA_ABSORB=1, under DCP = TP with project before
+    # merge and the in-kernel all-reduce): the attention's back half -- the
+    # W_UV batched GEMM, aiter's DCP merge (dcp_merge_ll_gfx1250), the output
+    # gate and o_proj with its all-reduce -- runs as one resident launch
+    # (mla_back_gfx1250), those kernels' bits. 0, the default, keeps them.
+    "ATOM_KIMI_MONO_MLA_BACK": lambda: (
+        os.getenv("ATOM_KIMI_MONO_MLA_BACK", "0") == "1"
+    ),
+    # 1: a full-attention layer whose projections the MLA front takes
+    # (ATOM_KIMI_MONO_MLA_FRONT) mixes its attention-side AttnRes seam on the
+    # gfx1250 FlyDSL kernel the KDA layers' and the MLP seams run
+    # (ATOM_KIMI_MONO_ATTN_RES, sliced by ATOM_KIMI_MONO_ATTN_RES_SLICED).
+    # NOT bit for bit with production's Triton mix at that seam: the same
+    # formula and epsilons with the fp32 reductions in another order. About
+    # 2 in 10^4 BF16 values of the normed row differ -- by one rounding step,
+    # by more only where a value cancels to ~1e-5 of the row's largest --
+    # and both rows sit within rounding of the fp64 result. 0, the default,
+    # keeps production's mix.
+    "ATOM_KIMI_MONO_MLA_ATTN_RES": lambda: (
+        os.getenv("ATOM_KIMI_MONO_MLA_ATTN_RES", "0") == "1"
+    ),
     # 1: the Kimi-K3 DSpark draft's MLA layers (K3DSparkMLAAttention) run their
     # decode path from the input norm's FP8 row to the attention's q_out on
     # gfx1250 as two resident launches -- mla_draft_front_gfx1250
@@ -859,6 +915,101 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # q_out. 0, the default, keeps the production kernels.
     "ATOM_KIMI_MONO_MLA_DRAFT": lambda: (
         os.getenv("ATOM_KIMI_MONO_MLA_DRAFT", "0") == "1"
+    ),
+    # 1: the Kimi-K3 DSpark draft's attention o_proj runs its activation
+    # quant, its GEMM and its TP all-reduce on gfx1250 as one resident launch
+    # (draft_proj_ar_gfx1250: production's bits, the in-kernel one-shot
+    # all-reduce of the o_proj kernel). 0, the default, keeps the production
+    # kernels.
+    "ATOM_KIMI_MONO_DRAFT_OPROJ_AR": lambda: (
+        os.getenv("ATOM_KIMI_MONO_DRAFT_OPROJ_AR", "0") == "1"
+    ),
+    # 1: the Kimi-K3 DSpark draft's dense MLP runs down_proj -- its
+    # activation quant, its GEMM and its TP all-reduce -- on gfx1250 as one
+    # resident launch (draft_proj_ar_gfx1250, production's bits), behind
+    # production's gate_up_proj and SiLU * mul or, at the widths
+    # ATOM_KIMI_MONO_DRAFT_GATE_UP_ROWS gives it, behind
+    # draft_gate_up_gfx1250. 0, the default, keeps the production kernels.
+    "ATOM_KIMI_MONO_DRAFT_MLP": lambda: (
+        os.getenv("ATOM_KIMI_MONO_DRAFT_MLP", "0") == "1"
+    ),
+    # With ATOM_KIMI_MONO_DRAFT_OPROJ_AR / ATOM_KIMI_MONO_DRAFT_MLP: the
+    # widest step (rows) whose projections run on draft_proj_ar_gfx1250. Its
+    # all-reduce pushes a rank's whole partial to every rank in one hop;
+    # past about 0.5 MB a rank (TP8: 37 rows up) aiter itself takes its
+    # two-shot all-reduce instead of its one-shot. 48 by default, from
+    # one-GPU measurements only (the fabric hop is not in them).
+    "ATOM_KIMI_MONO_DRAFT_AR_ROWS": lambda: int(
+        os.getenv("ATOM_KIMI_MONO_DRAFT_AR_ROWS", "48")
+    ),
+    # With ATOM_KIMI_MONO_DRAFT_MLP=1: the widest step (rows) whose
+    # gate_up_proj, split-K reduce and SiLU * mul run as one resident launch
+    # (draft_gate_up_gfx1250, production's bits; the widths production's
+    # GEMM splits K in 4 or 8: up to 48 rows at the TP8 shard). 35 by
+    # default: past it the launch is within 1 us of production's three
+    # (one GPU). 0: production's GEMM and activation at every width.
+    "ATOM_KIMI_MONO_DRAFT_GATE_UP_ROWS": lambda: int(
+        os.getenv("ATOM_KIMI_MONO_DRAFT_GATE_UP_ROWS", "35")
+    ),
+    # 1: on gfx1250 a Kimi-K3 TP8 DSpark greedy verify step's tail runs in the
+    # step-tail kernels (atom.models.kimi_k3.step_tail): the LM head on this
+    # rank's vocab shard, the cross-rank argmax and the draft verification in
+    # one launch (no logits all-gather, no sampler / rejection sampler, no TP id
+    # broadcast: the model hands the engine the verdict), and the draft block's
+    # head and Markov sampling in another. Production's token ids and verdict.
+    # Any other deployment or step keeps the production path. 0, the default,
+    # keeps today's kernels and engine path.
+    # A cross-rank wait that gives up (a peer silent for 2 s) fails the step
+    # with a RuntimeError before the engine reads that step's ids on the
+    # host: with deferred output in the next step -- the stale step's ids
+    # have by then fed the draft block and the next forward on the device,
+    # never the client -- else in the step itself.
+    "ATOM_KIMI_MONO_STEP_TAIL": lambda: (
+        os.getenv("ATOM_KIMI_MONO_STEP_TAIL", "0") == "1"
+    ),
+    # On gfx1250, the parts of the Kimi-K3 DSpark draft's context path of a
+    # decode step that run on the step-gap kernels
+    # (atom.models.kimi_k3.step_gap.draft_context), a comma list; 1: all of
+    # them; 0 or empty, the default: none, production's kernels.
+    #   kv: the projected context is quantized once and one launch projects
+    #       all five layers' kv_a and rope rows (the draft front's GEMV:
+    #       production's fused_qkv_a_proj bits at the width's split-K), in
+    #       place of a quant and a full GEMM a layer.
+    #   store (takes kv with it): the five layers' cache writes are one
+    #       launch (production's fused norm + rope + store program with a
+    #       layer axis), not five.
+    # The cache rows are production's. A layer, a width or a step a part
+    # does not take runs production's kernels.
+    "ATOM_KIMI_MONO_DRAFT_CONTEXT": lambda: frozenset(
+        ("kv", "store")
+        if os.getenv("ATOM_KIMI_MONO_DRAFT_CONTEXT", "0") == "1"
+        else (
+            part
+            for part in os.getenv("ATOM_KIMI_MONO_DRAFT_CONTEXT", "0").split(",")
+            if part not in ("", "0")
+        )
+    ),
+    # 1: the Kimi-K3 DSpark drafter derives a block's paged metadata (its
+    # positions, KV write slots, context lengths and their running sum) in
+    # one launch (atom.models.kimi_k3.step_gap.block_meta: integer arithmetic,
+    # the same buffers and attention metadata) in place of the 24 torch
+    # elementwise launches of DSparkProposer._build_paged_block_metadata.
+    # Only for the standalone MLA draft sharded over DCP, and only while that
+    # method's source is the one mirrored; else the drafter's own method. 0,
+    # the default, keeps it.
+    "ATOM_KIMI_MONO_STEP_LEAN": lambda: (
+        os.getenv("ATOM_KIMI_MONO_STEP_LEAN", "0") == "1"
+    ),
+    # 1: Kimi-K3's token embedding (the target's, which its DSpark draft
+    # shares) looks ids up in a whole table held on every TP rank
+    # (atom.models.kimi_k3.step_gap.embed_local): one launch, no TP
+    # all-reduce. The table is all-gathered from the ranks' shards once, at
+    # the decode installer, and brought to what production's all-reduce
+    # returns (-0.0 and BF16 denormals to +0.0); every rank binds it or none
+    # does. 2.35 GB a rank. Production's rows. 0, the default, keeps the
+    # vocabulary-sharded lookup and its all-reduce.
+    "ATOM_KIMI_MONO_EMBED_LOCAL": lambda: (
+        os.getenv("ATOM_KIMI_MONO_EMBED_LOCAL", "0") == "1"
     ),
     # The K2 tail's remote pushes on waves of their own, so the store drain
     # before its flag waits for no fabric ack (k2_tail_gfx1250, the same
@@ -927,6 +1078,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # banks take tp/2 times more. 0 keeps the reduce-scatter then gather.
     "ATOM_KIMI_MONO_OPROJ_AR_ONESHOT": lambda: (
         os.getenv("ATOM_KIMI_MONO_OPROJ_AR_ONESHOT", "1") == "1"
+    ),
+    # 1: the o_proj all-reduce's polls (k2_oproj_ar_gfx1250, one-shot and
+    # two-hop) issue their loads of the ranks' lines together and wait once
+    # (the same bits, the same lines at the same addresses). 0, the default,
+    # keeps the volatile loads, each waited out before the next: a memory
+    # round trip a rank a poll. More than one rank only.
+    "ATOM_KIMI_MONO_OPROJ_AR_POLL_TOGETHER": lambda: (
+        os.getenv("ATOM_KIMI_MONO_OPROJ_AR_POLL_TOGETHER", "0") == "1"
+    ),
+    # 1: the same for the gathering all-reduce's polls (k2_allreduce_gfx1250,
+    # seven- and six-element lines). 0, the default, keeps the volatile
+    # loads. More than one rank only.
+    "ATOM_KIMI_MONO_GATHER_AR_POLL_TOGETHER": lambda: (
+        os.getenv("ATOM_KIMI_MONO_GATHER_AR_POLL_TOGETHER", "0") == "1"
+    ),
+    # 1: the same for the DSpark draft projection all-reduce's polls
+    # (draft_proj_ar_gfx1250). 0, the default, keeps the volatile loads.
+    # More than one rank only.
+    "ATOM_KIMI_MONO_DRAFT_AR_POLL_TOGETHER": lambda: (
+        os.getenv("ATOM_KIMI_MONO_DRAFT_AR_POLL_TOGETHER", "0") == "1"
+    ),
+    # 1: the same for the MLA back half's polls (mla_back_gfx1250): its
+    # merge's lines of the DCP shards and its all-reduce's of the TP ranks,
+    # each where its group has more than one rank. 0, the default, keeps the
+    # volatile loads.
+    "ATOM_KIMI_MONO_MLA_BACK_POLL_TOGETHER": lambda: (
+        os.getenv("ATOM_KIMI_MONO_MLA_BACK_POLL_TOGETHER", "0") == "1"
     ),
     # The gathering all-reduce's CTA barrier between its gathers and its
     # pushes (k2_allreduce_gfx1250); "0" drops it.

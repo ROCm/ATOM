@@ -19,6 +19,7 @@ weights rotating, the variants' replays alternating.
     env: ROWS (10,20,30,40,42), ITERS (10), CHECK, BENCH, PROFILE (per-CTA
     stamps of profile builds), SPLIT (0,1: the tail builds compared), BOUND
     (scratch builds: polls give up past it), GN (20), GREPS (7), REPS (4),
+    VARIANTS, PVARIANTS, SPY, K2, LEAN (see below),
     AITER_FLYDSL_USE_HERD; OPROJ=1 checks and times the o_proj all-reduce
     instead (OPROJ_PROJ: o_proj's input width over the ranks, 12288)
 
@@ -26,9 +27,11 @@ Every kernel, buffer and graph stays referenced in KEEP to the end: a graph
 replays only kernels and buffers still alive.
 """
 
+import ast
 import dataclasses
 import json
 import os
+import time
 from types import SimpleNamespace
 
 import torch
@@ -39,10 +42,20 @@ from aiter.ops.shuffle import shuffle_weight
 import atom.models.kimi_k3.mono.runner_gfx1250 as rm
 from atom.models.kimi_k3.mono.config import EXPERTS, HIDDEN, LATENT, TOPK
 from atom.models.kimi_k3.mono.kernels.stages import k2_allreduce_gfx1250 as ar
+from atom.models.kimi_k3.mono.kernels.stages import k2_oproj_ar_gfx1250 as oar
 from atom.models.kimi_k3.mono.kernels.stages import k2_tail_gfx1250 as tk
 from atom.quantization.quark.utils import quantize_weight_to_fp8_128x128_blockscale
 
 KEEP = []
+_T0 = time.time()
+
+
+def note(what):
+    """Progress, a line a stage (rank 0): where a run's minutes went."""
+    if os.environ.get("RANK", "0") == "0":
+        print(json.dumps({"t": round(time.time() - _T0, 1), "at": what}), flush=True)
+
+
 ROWS = [int(r) for r in os.environ.get("ROWS", "10,20,30,40,42").split(",")]
 ITERS = int(os.environ.get("ITERS", "10"))
 CHECK = os.environ.get("CHECK", "1") == "1"
@@ -55,11 +68,39 @@ GREPS = int(os.environ.get("GREPS", "7"))
 REPS = int(os.environ.get("REPS", "4"))
 OPROJ = os.environ.get("OPROJ", "0") == "1"
 OPROJ_PROJ = int(os.environ.get("OPROJ_PROJ", "12288"))
+# VARIANTS: extra tail builds, name:kwarg=value,..+name:.. (build_k2_tail's
+# keywords), each checked and timed as "tail_<name>"; PVARIANTS: the names
+# also profiled; SPY=1: profile builds spy; K2=0: no whole-K2 graphs
+VARIANTS = {}
+for _spec in os.environ.get("VARIANTS", "").split("+"):
+    if _spec:
+        _name, _, _body = _spec.partition(":")
+        VARIANTS[_name] = {
+            k: ast.literal_eval(v)
+            for k, _, v in (item.partition("=") for item in _body.split(",") if item)
+        }
+PVARIANTS = [v for v in os.environ.get("PVARIANTS", "").split(",") if v]
+SPY = os.environ.get("SPY", "0") == "1"
+# LEAN=1: no K2 build (minutes of compiles): the tail's builds alone, see lean()
+LEAN = os.environ.get("LEAN", "0") == "1"
+# LEAN_KIND: tail (lean), oproj (lean_oproj; ONESHOT=0 its two-hop) or gather
+# (lean_gather: the gathering all-reduce alone)
+LEAN_KIND = os.environ.get("LEAN_KIND", "tail")
+ONESHOT = os.environ.get("ONESHOT", "1") == "1"
+K2 = os.environ.get("K2", "1") == "1"
 COPIES, SETS = 3, 4
 SH, INTER, NB, EPS = 768, 384, 4, 1e-5
 
 dist.init_process_group("gloo")
 RANK, WORLD = dist.get_rank(), dist.get_world_size()
+# EMU_TP=N (one rank, LEAN): the tails built for N ranks on one GPU, every
+# peer's pointer into this rank's own bank so that its push to peer p lands
+# in the slot source p's line would take: the N-rank kernel's code with
+# local stores, each line summed N times over. The bank sits between guards.
+EMU_TP = int(os.environ.get("EMU_TP", "0"))
+if EMU_TP:
+    assert WORLD == 1 and os.environ.get("LEAN") == "1", "EMU_TP: one rank, LEAN"
+    WORLD = EMU_TP
 torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
 dev = torch.device("cuda", torch.cuda.current_device())
 gen = torch.Generator(device=dev).manual_seed(11 + RANK)
@@ -121,19 +162,71 @@ for _ in range(COPIES):
     )
 KEEP.append(layers)
 
-import mori.allocator  # noqa: F401
-import torch.distributed._symmetric_memory as symm_mem
-
-symm_mem.set_backend("MORI")
-bank = symm_mem.empty(
-    ar.allreduce_peer_bytes(WORLD, max(ROWS)) + 4096, dtype=torch.uint8, device=dev
+GUARD = 1 << 20
+BANK_BYTES = (
+    2
+    * max(
+        max(
+            ar.allreduce_peer_bytes(WORLD, r),
+            oar.oproj_peer_bytes(WORLD, r, True),
+            oar.oproj_peer_bytes(WORLD, r, False),
+        )
+        for r in ROWS
+    )
+    + 4096
 )
-bank.zero_()
-torch.cuda.synchronize()
-ptrs = list(symm_mem.rendezvous(bank, dist.group.WORLD).buffer_ptrs)
-ptrs[RANK] = bank.data_ptr()
+if EMU_TP:
+    bank_all = torch.full(
+        (GUARD + BANK_BYTES + GUARD,), 0xA5, dtype=torch.uint8, device=dev
+    )
+    bank = bank_all[GUARD : GUARD + BANK_BYTES]
+    bank.zero_()
+    torch.cuda.synchronize()
+    ptrs = [bank.data_ptr()] * WORLD
+    KEEP.append(bank_all)
+else:
+    import mori.allocator  # noqa: F401
+    import torch.distributed._symmetric_memory as symm_mem
+
+    symm_mem.set_backend("MORI")
+    bank = symm_mem.empty(BANK_BYTES, dtype=torch.uint8, device=dev)
+    bank.zero_()
+    torch.cuda.synchronize()
+    ptrs = list(symm_mem.rendezvous(bank, dist.group.WORLD).buffer_ptrs)
+    ptrs[RANK] = bank.data_ptr()
 peers = torch.tensor(ptrs, dtype=torch.int64, device=dev)
-epochs = torch.zeros(ar.MAX_CTAS, dtype=torch.int32, device=dev)
+
+
+def peers_for(rows, step=None):
+    """The peers' bank pointers; emulated, peer p's is this bank moved by p
+    sources' lines (``step`` bytes a source; by default the seven-element
+    bank's at ``rows``)."""
+    if not EMU_TP:
+        return peers
+    if step is None:
+        step = ar.allreduce7_lines(rows) * ar.LINE_WORDS * 4
+    assert 2 * WORLD * step <= BANK_BYTES
+    table = torch.tensor(
+        [bank.data_ptr() + p * step for p in range(WORLD)],
+        dtype=torch.int64,
+        device=dev,
+    )
+    KEEP.append(table)
+    return table
+
+
+def guard_ok():
+    """An emulated bank's guards untouched (None: a real one)."""
+    if not EMU_TP:
+        return None
+    return bool(
+        (bank_all[:GUARD] == 0xA5).all()
+        and (bank_all[GUARD + BANK_BYTES :] == 0xA5).all()
+    )
+
+
+# past the counters, a tool build's marks (ar.POLLS_WORD, ar.GAVE_UP_WORD)
+epochs = torch.zeros(ar.GAVE_UP_WORD + 16, dtype=torch.int32, device=dev)
 KEEP += [bank, peers, epochs]
 
 runner = object.__new__(rm.K3Gfx1250MonoDecodeRunner)
@@ -181,6 +274,18 @@ def build(rows):
             paths["tail_sw" if split else "tail"] = dataclasses.replace(
                 local, tail=tail
             )
+        for name, kw in VARIANTS.items():
+            if tk.tail_rounds(rows) > 1:
+                continue
+            tail = tk.build_k2_tail(
+                WORLD,
+                rows,
+                EPS,
+                identity_routes=local.fused_moe is not None,
+                poll_bound=BOUND,
+                **kw,
+            )
+            paths[f"tail_{name}"] = dataclasses.replace(local, tail=tail)
     KEEP.extend([local, paths])
     return local, paths
 
@@ -328,6 +433,7 @@ def check(rows, local, paths):
             bad["normed"] += not torch.equal(
                 bits(normed), bits(t["reduce"][:split].view(rows, LATENT))
             )
+
             # the grouped MoE's rows may land in another order: compare
             # each route's row
             def routed_rows(x):
@@ -454,10 +560,12 @@ def bench(rows, local, paths):
     for name, path in paths.items():
         graphs[f"{name}_alone"] = graph_capture(alone(path))
     for name, path in paths.items():
-        graphs[f"{name}_k2"] = graph_capture(layer(path))
+        if K2:
+            graphs[f"{name}_k2"] = graph_capture(layer(path))
     times = {name: [] for name in graphs}
-    for _ in range(REPS):
-        for name, graph in graphs.items():
+    for rep in range(REPS):
+        order = list(graphs.items())
+        for name, graph in order if rep % 2 == 0 else reversed(order):
             times[name].append(graph_us(graph))
     barrier()
     if RANK == 0:
@@ -471,12 +579,594 @@ def bench(rows, local, paths):
         print(json.dumps({"bench": out}), flush=True)
 
 
-def profile(rows, local):
-    """Each SPLIT's profile build, GN launches in a graph on rotating inputs,
-    each launch's stamps copied out: per launch (this rank's clock, us from
-    its first CTA's start) the last routed poll seen, the last flag
-    published, every CTA seeing every flag (median and last), the end."""
-    b = local.buffers
+POINTS = [
+    "start",
+    "issued",
+    "gathered",
+    "pushed",
+    "polled",
+    "row",
+    "rstd",
+    "stored",
+    "drained",
+    "flag",
+    "seen",
+    "gemv",
+    "end",
+    "rt0",
+    "spy",
+    "spy_all",
+    "rt1",
+    "more",
+    "x0",
+    "x1",
+]
+SKIP_POINTS = (tk.P_RT0, tk.P_RT1, tk.P_SPARE0, tk.P_SPARE1)
+
+
+def _med(values):
+    values = sorted(values)
+    return round(values[len(values) // 2], 2)
+
+
+def timeline(st, rows, grid, ar_ctas, helpers=0):
+    """``st`` [launches, grid, STAMPS] raw stamps (cycle counters' low words,
+    the 100 MHz clock at P_RT0 / P_RT1) -> per class of CTA each point's
+    [median, max] over the CTAs, us from the launch's first CTA start,
+    medians over the launches. A CTA's points count from its own cycle
+    counter; the CTAs are aligned on every CTA seeing the flags at once."""
+    full = 1 << 32
+
+    def delta(a, b):
+        d = (a - b) % full
+        return torch.where(d >= full // 2, d - full, d)
+
+    ticks = delta(st[:, :, tk.P_RT1], st[:, :, tk.P_RT0]).double()
+    span = delta(st[:, :, tk.P_END], st[:, :, tk.P_START]).double()
+    per_tick = float((span[ticks > 0] / ticks[ticks > 0]).median())
+    rel = delta(st, st[:, :, tk.P_SEEN : tk.P_SEEN + 1]).double() / (100 * per_tick)
+    t = (rel - rel[:, :, tk.P_START].min(1).values[:, None, None]).float()
+    extra = 2 * rows * helpers
+    classes = {
+        "routed": list(range(2 * rows)),
+        "shared": list(range(2 * rows, ar_ctas)),
+        "helper": list(range(ar_ctas, ar_ctas + extra)),
+        "idle": list(range(ar_ctas + extra, grid)),
+    }
+    out = {"mhz": round(per_tick * 100, 1)}
+    for name, ids in classes.items():
+        if not ids:
+            continue
+        part = {}
+        for i, point in enumerate(POINTS):
+            if i in SKIP_POINTS or not bool((st[:, ids, i] != 0).all()):
+                continue
+            x = t[:, ids, i]
+            part[point] = [
+                _med(x.median(1).values.tolist()),
+                _med(x.max(1).values.tolist()),
+            ]
+        out[name] = part
+    flag = t[:, :ar_ctas, tk.P_FLAG]
+    last = flag.argmax(1)
+    out["last_flag"] = _med(flag.max(1).values.tolist())
+    out["last_flag_routed_share"] = round(float((last < 2 * rows).float().mean()), 2)
+    out["last_flag_minus_median_flag"] = _med(
+        (flag.max(1).values - flag.median(1).values).tolist()
+    )
+    shared = classes["shared"]
+    if shared:
+        out["last_shared_flag"] = _med(t[:, shared, tk.P_FLAG].max(1).values.tolist())
+    crit = t[torch.arange(st.shape[0]), last]
+    raw = st[torch.arange(st.shape[0]), last]
+    out["last_cta"] = {
+        point: _med(crit[:, i].tolist())
+        for i, point in enumerate(POINTS)
+        if i not in SKIP_POINTS and bool((raw[:, i] != 0).all())
+    }
+    seen = t[:, :, tk.P_SEEN]
+    out["seen"] = _med(seen.median(1).values.tolist())
+    # thread 0's poll loads until its lines carried the tag: [median, max]
+    out["polls"] = {
+        name: [
+            _med(st[:, ids, tk.P_SPARE0].float().median(1).values.tolist()),
+            _med(st[:, ids, tk.P_SPARE0].float().max(1).values.tolist()),
+        ]
+        for name, ids in classes.items()
+        if ids and name in ("routed", "shared")
+    }
+    idle = classes["idle"]
+    if idle and bool((st[:, idle, tk.P_SPY] != 0).all()):
+        target = [b % (2 * rows) for b in idle]
+        out["spy_first_thread_before_owner"] = _med(
+            (t[:, target, tk.P_POLLED] - t[:, idle, tk.P_SPY]).flatten().tolist()
+        )
+        out["spy_all_threads_before_owner_row"] = _med(
+            (t[:, target, tk.P_ROW] - t[:, idle, tk.P_SPY_ALL]).flatten().tolist()
+        )
+    return out
+
+
+def lean(rows):
+    """No K2 build: the tail and each of VARIANTS' builds alone on random
+    inputs (identity routes), every rank launching them in the same order.
+    Each variant's final rows and reduced / normed rows against the tail's
+    bit for bit: ITERS eager launches, then a graph of GN launches of each
+    replayed 20 times. Then their graphs' times, the arms in turn and back
+    (BENCH), and the profiles (PROFILE)."""
+    pr = peers_for(rows)
+    width = rows * (LATENT + HIDDEN)
+    identity = torch.arange(rows * TOPK, dtype=torch.int32, device=dev).view(rows, TOPK)
+    sets = [
+        (
+            (torch.randn(width, generator=gen, device=dev) * 0.5).to(torch.bfloat16),
+            bf16(rows * TOPK, LATENT, scale=0.5),
+            torch.rand(rows, TOPK, generator=gen, device=dev).float(),
+        )
+        for _ in range(SETS)
+    ]
+    kerns = {
+        name: tk.build_k2_tail(
+            WORLD, rows, EPS, identity_routes=True, poll_bound=BOUND, **kw
+        )
+        for name, kw in [("tail", {})]
+        + [(f"tail_{n}", kw) for n, kw in VARIANTS.items()]
+    }
+    # a build that pushes nothing (bounded) is launched once, apart
+    never = {n: k for n, k in kerns.items() if "_np" in k.name}
+    builds = dict(kerns)
+    kerns = {n: k for n, k in kerns.items() if n not in never}
+    flags = torch.zeros(
+        tk.tail_flag_words(bounded=BOUND is not None), dtype=torch.int32, device=dev
+    )
+    work = torch.empty(width, dtype=torch.bfloat16, device=dev)
+    final = torch.empty(rows, HIDDEN, dtype=torch.bfloat16, device=dev)
+    KEEP.extend([identity, sets, kerns, flags, work, final])
+    note(f"lean {rows}: built")
+
+    def launch(name, k, s, data):
+        _, grouped, weights = sets[k % SETS]
+        w = layers[k % COPIES]
+        builds[name].launcher(
+            data.data_ptr(),
+            grouped.data_ptr(),
+            identity.data_ptr(),
+            weights.data_ptr(),
+            w.ln_w.data_ptr(),
+            w.w_up_full.data_ptr(),
+            final.data_ptr(),
+            flags.data_ptr(),
+            pr.data_ptr(),
+            epochs.data_ptr(),
+            RANK,
+            stream=s,
+        )
+
+    entry = {
+        "rank": RANK,
+        "rows": rows,
+        "names": {k: v.name for k, v in kerns.items()},
+    }
+    if os.environ.get("DIAG") == "1":
+        # a bounded build's launches one at a time: its give-up mark, and how
+        # many of each source rank's lines in this rank's bank carry the
+        # launch's tag (read on the host)
+        lines = ar.allreduce7_lines(rows)
+        s = torch.cuda.current_stream()
+        for i in range(ITERS):
+            barrier()
+            start = time.time()
+            work.copy_(sets[i % SETS][0])
+            launch("tail", i, s, work)
+            torch.cuda.synchronize()
+            took = time.time() - start
+            epoch = int(epochs[0])
+            words = bank[: 2 * WORLD * lines * 16].view(torch.int32)
+            tags = (words.view(2, WORLD, lines, 4)[epoch & 1, :, :, 3] >> 16) & 0xFFFF
+            diag = {
+                "rank": RANK,
+                "launch": i,
+                "s": round(took, 3),
+                "epoch": epoch,
+                "gave_up": hex(int(flags[tk.GAVE_UP_WORD])) if BOUND else None,
+                "landed_of": lines,
+                "landed": (tags == (epoch & 0xFFFF)).sum(1).tolist(),
+                "flags_set": int((flags[: tk.tail_ar_ctas(rows)] == epoch).sum()),
+            }
+            print(json.dumps({"diag": diag}), flush=True)
+        return
+    if CHECK:
+        s = torch.cuda.current_stream()
+        for name in kerns:
+            work.copy_(sets[0][0])
+            launch(name, 0, s, work)
+        barrier()
+        note(f"lean {rows}: every build launched once")
+        # a bounded build's give-ups while a peer still compiled do not count
+        flags.zero_()
+        barrier()
+        bad = {name: 0 for name in kerns if name != "tail"}
+        moving, last = 0, None
+        for i in range(ITERS):
+            got = {}
+            for name in kerns:
+                work.copy_(sets[i % SETS][0])
+                launch(name, i, s, work)
+                got[name] = (final.clone(), work.clone())
+            torch.cuda.synchronize()
+            for name in bad:
+                bad[name] += not all(
+                    torch.equal(bits(a), bits(b))
+                    for a, b in zip(got["tail"], got[name])
+                )
+            moving += last is not None and not torch.equal(got["tail"][0], last)
+            last = got["tail"][0]
+        entry["eager_mismatched_launches"] = bad
+        entry["moving"] = moving == ITERS - 1
+        snaps = {
+            name: (
+                torch.empty(GN, rows, HIDDEN, dtype=torch.bfloat16, device=dev),
+                torch.empty(GN, width, dtype=torch.bfloat16, device=dev),
+            )
+            for name in kerns
+        }
+        KEEP.append(snaps)
+
+        def every(s, k):
+            for name in kerns:
+                work.copy_(sets[k % SETS][0])
+                launch(name, k, s, work)
+                snaps[name][0][k].copy_(final)
+                snaps[name][1][k].copy_(work)
+
+        graph = graph_capture(every)
+        gbad = {name: 0 for name in bad}
+        for _ in range(20):
+            barrier()
+            graph.replay()
+            torch.cuda.synchronize()
+            for name in gbad:
+                gbad[name] += not all(
+                    torch.equal(bits(a), bits(b))
+                    for a, b in zip(snaps["tail"], snaps[name])
+                )
+        entry["graph_mismatched_replays"] = gbad
+        entry["bitwise"] = not any(bad.values()) and not any(gbad.values())
+        h = int(
+            bits(snaps["tail"][0]).long().sum() + bits(snaps["tail"][1]).long().sum()
+        )
+        entry["ranks_agree"] = EMU_TP > 0 or len(set(gathered_ints(h))) == 1
+        entry["guard_ok"] = guard_ok()
+        entry["nan"] = bool(torch.isnan(snaps["tail"][0].float()).any())
+        if BOUND is not None:
+            entry["gave_up"] = int(flags[tk.GAVE_UP_WORD])
+            entry["max_polls"] = int(flags[tk.GAVE_UP_WORD + 1 :].max())
+        for name in never:
+            flags.zero_()
+            work.copy_(sets[0][0])
+            barrier()
+            start = time.time()
+            launch(name, 0, s, work)
+            torch.cuda.synchronize()
+            entry.setdefault("never", {})[name] = {
+                "s": round(time.time() - start, 3),
+                "gave_up": hex(int(flags[tk.GAVE_UP_WORD])),
+                "max_polls": int(flags[tk.GAVE_UP_WORD + 1 :].max()),
+            }
+    print(json.dumps({"lean": entry}), flush=True)
+    if BENCH:
+        graphs = {}
+        for name in kerns:
+            graphs[name] = graph_capture(
+                lambda s, k, name=name: launch(name, k, s, sets[k % SETS][0])
+            )
+            note(f"lean {rows}: {name} captured")
+        times = {name: [] for name in graphs}
+        for rep in range(REPS):
+            order = list(graphs.items())
+            for name, graph in order if rep % 2 == 0 else reversed(order):
+                times[name].append(graph_us(graph))
+        barrier()
+        if RANK == 0:
+            out = {"rows": rows, "world": WORLD, "gn": GN, "guard_ok": guard_ok()}
+            for name, v in times.items():
+                v = sorted(v)
+                out[name] = {
+                    "median": round(v[len(v) // 2], 2),
+                    "all": [round(x, 2) for x in v],
+                }
+            print(json.dumps({"lean_bench": out}), flush=True)
+    if PROFILE:
+        profile(rows, identity)
+
+
+def lean_run(
+    kind, rows, kerns, launch, fresh, outputs, pre=None, graph=True, stale=None
+):
+    """``kerns`` (name -> kernel, the first the reference) alone on one GPU:
+    each of the others' ``outputs()`` against the reference's bit for bit --
+    ITERS eager launches (``fresh(i)`` restores an in-place input, ``pre(i)``
+    places what the host emulates), then with ``graph`` a graph of GN
+    launches of each replayed 20 times -- a bounded build's marks, a build
+    that pushes nothing launched once, and the graphs' times, the arms in
+    turn and back."""
+    never = {n: k for n, k in kerns.items() if "_np" in k.name}
+    kerns = {n: k for n, k in kerns.items() if n not in never}
+    ref = next(iter(kerns))
+    s = torch.cuda.current_stream()
+    entry = {
+        "kind": kind,
+        "rows": rows,
+        "tp": WORLD,
+        "names": {k: v.name for k, v in {**kerns, **never}.items()},
+    }
+    marks = epochs[ar.POLLS_WORD :]
+
+    def go(name, i):
+        if pre is not None:
+            pre(i)
+        fresh(i)
+        launch(name, i, s)
+
+    if CHECK:
+        for name in kerns:
+            go(name, 0)
+        barrier()
+        marks.zero_()
+        bad = {name: 0 for name in kerns if name != ref}
+        polls = {name: 0 for name in kerns}
+        moving, last = 0, None
+        for i in range(ITERS):
+            got = {}
+            for name in kerns:
+                go(name, i)
+                got[name] = [t.clone() for t in outputs()]
+                if BOUND is not None:
+                    torch.cuda.synchronize()
+                    most = int(marks[: ar.MAX_CTAS].max())
+                    polls[name] = max(polls[name], most)
+                    marks[: ar.MAX_CTAS].zero_()
+            torch.cuda.synchronize()
+            for name in bad:
+                bad[name] += not all(
+                    torch.equal(bits(a), bits(b)) for a, b in zip(got[ref], got[name])
+                )
+            moving += last is not None and not torch.equal(got[ref][0], last)
+            last = got[ref][0]
+        entry["eager_mismatched_launches"] = bad
+        entry["moving"] = moving == ITERS - 1
+        gbad = {name: 0 for name in bad}
+        if graph:
+            snaps = {
+                name: [
+                    torch.empty(GN, *t.shape, dtype=t.dtype, device=dev)
+                    for t in outputs()
+                ]
+                for name in kerns
+            }
+            KEEP.append(snaps)
+
+            def every(s_, k):
+                for name in kerns:
+                    fresh(k)
+                    launch(name, k, s_)
+                    for snap, t in zip(snaps[name], outputs()):
+                        snap[k].copy_(t)
+
+            g = graph_capture(every)
+            for _ in range(20):
+                barrier()
+                g.replay()
+                torch.cuda.synchronize()
+                for name in gbad:
+                    gbad[name] += not all(
+                        torch.equal(bits(a), bits(b))
+                        for a, b in zip(snaps[ref], snaps[name])
+                    )
+            entry["graph_mismatched_replays"] = gbad
+            entry["nan"] = bool(torch.isnan(snaps[ref][0].float()).any())
+        entry["bitwise"] = not any(bad.values()) and not any(gbad.values())
+        entry["guard_ok"] = guard_ok()
+        if BOUND is not None:
+            entry["gave_up"] = hex(int(epochs[ar.GAVE_UP_WORD]))
+            entry["max_polls"] = polls
+        for name in never:
+            marks.zero_()
+            barrier()
+            start = time.time()
+            go(name, 0)
+            torch.cuda.synchronize()
+            entry.setdefault("never", {})[name] = {
+                "s": round(time.time() - start, 3),
+                "gave_up": hex(int(epochs[ar.GAVE_UP_WORD])),
+                "max_polls": int(marks[: ar.MAX_CTAS].max()),
+                "guard_ok": guard_ok(),
+            }
+        if stale is not None and BOUND is not None:
+            # ``stale(i)``: the host's lines of a launch carry an old epoch
+            # (lines that never arrive): every build gives up
+            for name in kerns:
+                marks.zero_()
+                barrier()
+                start = time.time()
+                stale(0)
+                fresh(0)
+                launch(name, 0, s)
+                torch.cuda.synchronize()
+                entry.setdefault("stale", {})[name] = {
+                    "s": round(time.time() - start, 3),
+                    "gave_up": hex(int(epochs[ar.GAVE_UP_WORD])),
+                    "guard_ok": guard_ok(),
+                }
+    print(json.dumps({"lean": entry}), flush=True)
+    if BENCH and graph:
+        graphs = {}
+        for name in kerns:
+            graphs[name] = graph_capture(lambda s_, k, name=name: launch(name, k, s_))
+        times = {name: [] for name in graphs}
+        for rep in range(REPS):
+            order = list(graphs.items())
+            for name, g in order if rep % 2 == 0 else reversed(order):
+                times[name].append(graph_us(g))
+        barrier()
+        out = {
+            "kind": kind,
+            "rows": rows,
+            "world": WORLD,
+            "gn": GN,
+            "guard_ok": guard_ok(),
+        }
+        for name, v in times.items():
+            v = sorted(v)
+            out[name] = {
+                "median": round(v[len(v) // 2], 2),
+                "all": [round(x, 2) for x in v],
+            }
+        print(json.dumps({"lean_bench": out}), flush=True)
+
+
+def lean_oproj(rows):
+    """The o_proj all-reduce alone (ONESHOT=0: two-hop) and each of VARIANTS'
+    builds of it. Emulated ranks: one-shot, peer p's pointer is this bank
+    moved by p sources' lines; two-hop, the other ranks' pushes go to a dump
+    region of the guarded buffer and the host places, before each eager
+    launch, the other ranks' partials of this rank's columns and their sums
+    of their own (no graphs, no times)."""
+    proj = OPROJ_PROJ // WORLD
+    plan = runner._plan(rows, 1)
+    kerns = {
+        name: oar.build_oproj_allreduce(
+            plan, WORLD, proj, oneshot=ONESHOT, poll_bound=BOUND, **kw
+        )
+        for name, kw in [("oproj", {})]
+        + [(f"oproj_{n}", kw) for n, kw in VARIANTS.items()]
+    }
+    w, ws = fp8_preshuffled(HIDDEN, proj)
+    cores = [bf16(rows, proj) for _ in range(SETS)]
+    out = torch.empty(rows, HIDDEN, dtype=torch.bfloat16, device=dev)
+    count, own, half = oar.triples(rows), oar.own_pairs(WORLD), HIDDEN // 2
+    pre = None
+    stale = None
+    if not EMU_TP:
+        pr = peers
+    elif ONESHOT:
+        pr = peers_for(rows, count * half * oar.LINE_WORDS * 4)
+    else:
+        words = oar.bank_words(WORLD, rows)
+        assert 2 * words * 4 <= BANK_BYTES // 2
+        pr = torch.tensor(
+            [bank.data_ptr()] + [bank.data_ptr() + BANK_BYTES // 2] * (WORLD - 1),
+            dtype=torch.int64,
+            device=dev,
+        )
+        foreign = [
+            (
+                bf16(WORLD - 1, count, own, 3, 2).view(torch.int32).squeeze(-1),
+                bf16(count, half - own, 3, 2).view(torch.int32).squeeze(-1),
+            )
+            for _ in range(SETS)
+        ]
+        KEEP.append(foreign)
+
+        def pre(i):
+            torch.cuda.synchronize()
+            epoch = int(epochs[0]) + 1
+            v = bank[: 2 * words * 4].view(torch.int32).view(2, words)[epoch & 1]
+            partials = v[: 4 * WORLD * count * own].view(WORLD, count, own, 4)
+            partials[1:, :, :, :3] = foreign[i % SETS][0]
+            partials[1:, :, :, 3] = epoch
+            sums = v[4 * WORLD * count * own :].view(count, half, 4)
+            sums[:, own:, :3] = foreign[i % SETS][1]
+            sums[:, own:, 3] = epoch
+
+        def stale(i):
+            # the other ranks' partials as a launch two before left them
+            pre(i)
+            epoch = int(epochs[0]) + 1
+            v = bank[: 2 * words * 4].view(torch.int32).view(2, words)[epoch & 1]
+            partials = v[: 4 * WORLD * count * own].view(WORLD, count, own, 4)
+            partials[1:, :, :, 3] = epoch - 2
+            torch.cuda.synchronize()
+
+    KEEP.extend([kerns, w, ws, cores, out, pr])
+
+    def launch(name, k, s):
+        kerns[name].launcher(
+            cores[k % SETS].data_ptr(),
+            w.data_ptr(),
+            ws.data_ptr(),
+            out.data_ptr(),
+            pr.data_ptr(),
+            epochs.data_ptr(),
+            RANK,
+            stream=s,
+        )
+
+    lean_run(
+        "oproj" if ONESHOT else "oproj_twohop",
+        rows,
+        kerns,
+        launch,
+        lambda i: None,
+        lambda: [out],
+        pre,
+        graph=ONESHOT or not EMU_TP,
+        stale=stale,
+    )
+
+
+def lean_gather(rows):
+    """The gathering all-reduce alone (seven-element lines to 42 rows, six
+    past) and each of VARIANTS' builds of it; emulated ranks as the tail's."""
+    width = rows * (LATENT + HIDDEN)
+    seven = ar.allreduce7_lines(rows) <= ar.MAX_CTAS * ar.THREADS
+    lines = ar.allreduce7_lines(rows) if seven else ar.allreduce_lines(rows)
+    pr = peers_for(rows, lines * ar.LINE_WORDS * 4)
+    routes = torch.arange(rows * TOPK, dtype=torch.int32, device=dev).view(rows, TOPK)
+    sets = [
+        (
+            (torch.randn(width, generator=gen, device=dev) * 0.5).to(torch.bfloat16),
+            bf16(rows * TOPK, LATENT, scale=0.5),
+            torch.rand(rows, TOPK, generator=gen, device=dev).float(),
+        )
+        for _ in range(SETS)
+    ]
+    kerns = {
+        name: ar.build_gather_allreduce(WORLD, rows, poll_bound=BOUND, **kw)
+        for name, kw in [("gather", {})]
+        + [(f"gather_{n}", kw) for n, kw in VARIANTS.items()]
+    }
+    work = torch.empty(width, dtype=torch.bfloat16, device=dev)
+    KEEP.extend([kerns, sets, routes, work, pr])
+
+    def launch(name, k, s):
+        _, grouped, weights = sets[k % SETS]
+        kerns[name].launcher(
+            work.data_ptr(),
+            grouped.data_ptr(),
+            routes.data_ptr(),
+            weights.data_ptr(),
+            pr.data_ptr(),
+            epochs.data_ptr(),
+            RANK,
+            stream=s,
+        )
+
+    lean_run(
+        "gather7" if seven else "gather6",
+        rows,
+        kerns,
+        launch,
+        lambda i: work.copy_(sets[i % SETS][0]),
+        lambda: [work],
+    )
+
+
+def profile(rows, identity):
+    """The tail's profile build and each of PVARIANTS', GN launches in a
+    graph on rotating inputs, each launch's stamps copied out: ``timeline``
+    of the graph's second half, and the graph's time a launch."""
+    pr = peers_for(rows)
     width = rows * (LATENT + HIDDEN)
     sets = [
         (
@@ -489,22 +1179,24 @@ def profile(rows, local):
     final = torch.empty(rows, HIDDEN, dtype=torch.bfloat16, device=dev)
     KEEP.extend([sets, final])
     out = {"rows": rows, "rank": RANK}
-    for split in SPLITS:
+    words = tk.MAX_CTAS * tk.STAMPS
+    for name, kw in [("tail", {})] + [(n, VARIANTS[n]) for n in PVARIANTS]:
         kern = tk.build_k2_tail(
             WORLD,
             rows,
             EPS,
             identity_routes=True,
-            split=split,
             poll_bound=BOUND,
             profile=True,
+            spy=SPY,
+            **kw,
         )
         flags = torch.zeros(
             tk.tail_flag_words(True, bounded=BOUND is not None),
             dtype=torch.int32,
             device=dev,
         )
-        snaps = torch.zeros(GN, tk.MAX_CTAS * tk.STAMPS, dtype=torch.int32, device=dev)
+        snaps = torch.zeros(GN, words, dtype=torch.int32, device=dev)
         KEEP.extend([kern, flags, snaps])
 
         def go(s, k, kern=kern, flags=flags, snaps=snaps):
@@ -513,49 +1205,31 @@ def profile(rows, local):
             kern.launcher(
                 data.data_ptr(),
                 grouped.data_ptr(),
-                b["fused_rows"].data_ptr(),
+                identity.data_ptr(),
                 weights.data_ptr(),
                 w.ln_w.data_ptr(),
                 w.w_up_full.data_ptr(),
                 final.data_ptr(),
                 flags.data_ptr(),
-                peers.data_ptr(),
+                pr.data_ptr(),
                 epochs.data_ptr(),
                 RANK,
                 stream=s,
             )
-            snaps[k % GN].copy_(flags[tk.MAX_CTAS :])
+            snaps[k % GN].copy_(flags[tk.MAX_CTAS : tk.MAX_CTAS + words])
 
         graph = graph_capture(go)
+        note(f"profile {rows}: {name} captured")
+        us = [graph_us(graph) for _ in range(3)]
+        barrier()
         graph.replay()
         barrier()
-        st = snaps.cpu().long().view(GN, tk.MAX_CTAS, tk.STAMPS)
-        ar_ctas = tk.tail_ar_ctas(rows)
         grid = tk.tail_grid(rows)
-        parts = {}
-
-        def add(key, ticks, parts=parts):
-            parts.setdefault(key, []).append(float(ticks) / 100)
-
-        # the XCDs' realtime clocks are offset from each other, so each CTA's
-        # stamps count from its own start
-        for k in range(GN // 2, GN):
-            s = st[k, :grid]
-            s = s - s[:, :1]
-            ar = s[:ar_ctas]
-            add("gathered_median", ar[:, 5].float().median())
-            add("routed_polled_max", s[: 2 * rows, 6].max())
-            add("flag_median", ar[:, 1].float().median())
-            add("flag_max", ar[:, 1].max())
-            add("wait_after_flag_median", (ar[:, 2] - ar[:, 1]).float().median())
-            add("seen_median", s[:, 2].float().median())
-            add("seen_max", s[:, 2].max())
-            add("gemv_median", (s[:, 3] - s[:, 2]).float().median())
-            add("end_median", s[:, 4].float().median())
-            add("end_max", s[:, 4].max())
-        out["tail_sw" if split else "tail"] = {
-            key: round(sorted(v)[len(v) // 2], 2) for key, v in parts.items()
-        }
+        st = snaps.cpu().long().view(GN, tk.MAX_CTAS, tk.STAMPS)[GN // 2 :, :grid]
+        entry = timeline(st, rows, grid, tk.tail_ar_ctas(rows), kw.get("helpers", 0))
+        entry["name"] = kern.name
+        entry["graph_us"] = _med(us)
+        out[name] = entry
     print(json.dumps({"profile": out}), flush=True)
 
 
@@ -585,7 +1259,10 @@ def oproj(rows):
     vals = torch.randint(-2, 3, (rows, 4), generator=gen, device=dev).float()
     sparse.scatter_(1, cols, vals)
     sparse = sparse.to(torch.bfloat16)
-    outs = {hop: torch.empty(rows, HIDDEN, dtype=torch.bfloat16, device=dev) for hop in kerns}
+    outs = {
+        hop: torch.empty(rows, HIDDEN, dtype=torch.bfloat16, device=dev)
+        for hop in kerns
+    }
     KEEP.extend([kerns, w, ws, wi, wiq, si, cores, sparse, outs])
 
     def launch(hop, core, weight, scale, s):
@@ -677,6 +1354,12 @@ if OPROJ:
     barrier()
     raise SystemExit(0)
 
+if LEAN:
+    for rows in ROWS:
+        {"tail": lean, "oproj": lean_oproj, "gather": lean_gather}[LEAN_KIND](rows)
+    barrier()
+    raise SystemExit(0)
+
 for rows in ROWS:
     local, paths = build(rows)
     if local.fused_moe is None and local.grouped_moe is None:
@@ -690,5 +1373,5 @@ for rows in ROWS:
     if BENCH:
         bench(rows, local, paths)
     if PROFILE and local.tail is not None:
-        profile(rows, local)
+        profile(rows, local.buffers["fused_rows"])
 barrier()

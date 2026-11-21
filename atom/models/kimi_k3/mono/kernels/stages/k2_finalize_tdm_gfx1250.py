@@ -106,9 +106,7 @@ def build_replicated_finalize(plan: Gfx1250KimiBuildPlan) -> K2ReplicatedFinaliz
         wave = tid // GFX1250.wave_size
         if const_expr(overlay):
             union = fx.SharedAllocator().allocate(OverlayLds)
-            lds = SimpleNamespace(
-                gemv=union.gemv.peek().gemv, red=union.red.peek().red
-            )
+            lds = SimpleNamespace(gemv=union.gemv.peek().gemv, red=union.red.peek().red)
         else:
             lds = fx.SharedAllocator().allocate(Lds).peek()
         # Threads [0, 128) finish a tile's first task, the rest its second; the

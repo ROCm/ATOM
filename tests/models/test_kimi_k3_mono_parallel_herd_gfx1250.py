@@ -1,6 +1,9 @@
 import pytest
 
 from atom.models.kimi_k3.mono.kernels.execution_plan import Gfx1250KimiBuildPlan
+
+pytest.importorskip("flydsl", reason="the K3 gfx1250 mono kernels are FlyDSL")
+
 from atom.models.kimi_k3.mono.kernels.stages import k2_finish_persistent_gfx1250 as fin
 from atom.models.kimi_k3.mono.kernels.stages import moe_tdm_gfx1250 as mt
 
@@ -80,7 +83,9 @@ def test_the_parallel_herd_switch_defaults_on(monkeypatch):
 
 
 def test_only_a_parallel_herd_finish_bounds_its_polls():
-    assert _finish(40, parallel_herd=True, herd_poll_limit=1024).name.endswith("_ph_pl1024")
+    assert _finish(40, parallel_herd=True, herd_poll_limit=1024).name.endswith(
+        "_ph_pl1024"
+    )
     with pytest.raises(ValueError, match="bounds its candidate polls"):
         _finish(40, herd_poll_limit=1024)
 

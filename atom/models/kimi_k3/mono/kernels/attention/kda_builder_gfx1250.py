@@ -574,7 +574,10 @@ def role_lds_plan(
         need = tdm_lds_bytes(
             plan.tokens, PROJECTION_TASKS_PER_CTA, True, TDM_FP8_PAIR_DEPTH, group=2
         )
-        if smem_bytes + max(projection_bytes, need) + accumulator_bytes <= plan.lds_bytes:
+        if (
+            smem_bytes + max(projection_bytes, need) + accumulator_bytes
+            <= plan.lds_bytes
+        ):
             projection_bytes = max(projection_bytes, need)
             paired = True
     split_stages = 0

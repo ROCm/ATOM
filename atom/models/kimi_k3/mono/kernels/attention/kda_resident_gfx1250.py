@@ -161,6 +161,32 @@ def _arrive(sync, slots, blocks):
         fx.ptr_store(fx.Int64(previous + fx.Int32(1)), slots)
 
 
+def _lds_barrier():
+    """A workgroup barrier for LDS alone (``gpu.barrier`` also waits out
+    every global store first)."""
+    from flydsl._mlir.dialects import llvm
+
+    llvm.inline_asm(
+        None,
+        [],
+        "s_wait_dscnt 0x0\n s_barrier_signal -1\n s_barrier_wait -1",
+        "",
+        has_side_effects=True,
+    )
+
+
+@traced
+def _generation_lds(slots):
+    """``_generation`` past an LDS-only barrier ("noack",
+    ATOM_KIMI_MONO_K1_HEAD): a CTA that has just issued its projection's
+    mailbox stores does not wait for their confirm to start its head task
+    (its loads and its poll overlap it; the kernel's end waits for every
+    store, and the heads poll the tags)."""
+
+    _lds_barrier()
+    return fx.Int32(fx.ptr_load(slots))
+
+
 @traced
 def _generation(slots):
     """The generation ``_arrive`` kept, once its thread has."""
@@ -178,6 +204,32 @@ def _split_sum(out, task_offset, tile, tiles, row, token):
         out + (task_offset * tiles + tile) * TDM_SPLIT_TILE_WORDS + lane * 8 + row % 8
     )
     return fx.Int32(word).bitcast(fx.Float32)
+
+
+@traced
+def _stash_head_meta(
+    role, head_task, head_tasks, head_split, tid, threads, args, stash, prefetch
+):
+    """ "meta" (ATOM_KIMI_MONO_K1_HEAD): a head CTA's waves from
+    ``SIDE_WAVE0`` (``role`` is the wave, in an SGPR) read the head task's
+    metadata and leave it in LDS ``stash`` (``kda_gfx1250.prefetch_head_meta``),
+    prefetching its state; the other waves skip to their projection copies."""
+    side0 = gfx_backend.SIDE_WAVE0 * GFX1250.wave_size
+    unit = head_task // head_split
+    if role >= gfx_backend.SIDE_WAVE0:  # noqa: SIM102
+        if head_task < head_tasks:
+            gfx_backend.prefetch_head_meta(
+                args,
+                unit // HEADS,
+                unit % HEADS,
+                tid - side0,
+                threads - side0,
+                head_task % head_split,
+                head_split,
+                stash,
+                tid == side0,
+                prefetch,
+            )
 
 
 def _task_start(block, first, blocks):
@@ -204,6 +256,29 @@ def _chunk_recur(qlen: int, replay: bool) -> bool:
     if qlen == 1 or mode == "0":
         return False
     return mode == "1" or replay
+
+
+_HEAD_OPTIONS = {
+    "conv": "c",
+    "meta": "m",
+    "ks": "r",
+    "noack": "n",
+}
+
+
+def _head_options(whole_heads: bool, replay: bool) -> frozenset:
+    """ATOM_KIMI_MONO_K1_HEAD's options a build takes: none without whole
+    heads; "ks" and "meta" under ReplaySSM alone (its records, its metadata
+    chain)."""
+    options = envs.ATOM_KIMI_MONO_K1_HEAD
+    unknown = options - set(_HEAD_OPTIONS)
+    if unknown:
+        raise ValueError(f"ATOM_KIMI_MONO_K1_HEAD: unknown {sorted(unknown)}")
+    if not whole_heads:
+        return frozenset()
+    if not replay:
+        options = options - {"ks", "meta"}
+    return options
 
 
 def _whole_heads(qlen: int, tasks: int, blocks: int, replay: bool) -> tuple[bool, bool]:
@@ -271,6 +346,7 @@ def build_resident_k1(
         envs.ATOM_KIMI_MONO_K1_WHOLE_HEADS,
         declaration.lds.paired,
         envs.ATOM_KIMI_MONO_K1_CHUNK_RECUR,
+        envs.ATOM_KIMI_MONO_K1_HEAD,
     )
     cached = _BUILDS.get(cache_key)
     if cached is not None:
@@ -307,6 +383,7 @@ def build_resident_k1(
         _head_split((s // qlen) * HEADS, declaration.blocks) if whole_heads else 1
     )
     chunk_recur = whole_heads and _chunk_recur(qlen, spec.replay_cap > 0)
+    head_options = _head_options(whole_heads, spec.replay_cap > 0)
     auto_split = (
         _auto_head_split((s // qlen) * HEADS, declaration.blocks) if whole_heads else 1
     )
@@ -317,6 +394,28 @@ def build_resident_k1(
     if spec.replay_cap and not chunk_recur and spec.replay_window in REPLAY_MAX_SPLIT:
         head_split = min(head_split, REPLAY_MAX_SPLIT[spec.replay_window])
         auto_split = min(auto_split, REPLAY_MAX_SPLIT[spec.replay_window])
+    head_tasks_total = (s // qlen) * HEADS * head_split if whole_heads else 0
+    # "meta": where a head's CTA projects first and runs that one head task
+    # (ReplaySSM, the rolled projection, whose waves from SIDE_WAVE0 issue
+    # none of the first copies)
+    if "meta" in head_options and not (
+        spec.replay_cap
+        and spec.external_seam
+        and spec.tdm_projection
+        and not declaration.lds.split_stages
+        and envs.ATOM_KIMI_MONO_TDM_ROLLED
+        and spec.kda0 == 0
+        and ATTENTION_CTAS < head_tasks_total <= declaration.blocks
+    ):
+        head_options = head_options - {"meta"}
+    head_meta = "meta" in head_options
+    # "noack": where a head's CTA projects first
+    if "noack" in head_options and not (
+        spec.external_seam and ATTENTION_CTAS < head_tasks_total
+    ):
+        head_options = head_options - {"noack"}
+    head_noack = "noack" in head_options
+    head_suffix = "".join(sorted(_HEAD_OPTIONS[o] for o in head_options))
     keyed = key_tuple(
         ResidentBuildKey(
             s,
@@ -354,6 +453,7 @@ def build_resident_k1(
         *(("whole_heads",) if forced_heads else ()),
         *(("paired",) if declaration.lds.paired else ()),
         *(("chunk_recur",) if chunk_recur else ()),
+        *((f"head_{head_suffix}",) if head_options else ()),
     )
     timeline = tdm_timeline.key()
     name = (
@@ -369,6 +469,7 @@ def build_resident_k1(
         f"{'_wh' if forced_heads else ''}"
         f"{'_ps' if declaration.lds.paired else ''}"
         f"{'_cr' if chunk_recur else ''}"
+        f"{f'_hd{head_suffix}' if head_options else ''}"
         f"{tdm_timeline.suffix()}"
     )
 
@@ -548,9 +649,9 @@ def build_resident_k1(
             return None
         return _generation(slots)
 
-    def collect_generation(slots, generation):
+    def collect_generation(slots, generation, lds_only=False):
         if spec.external_seam:
-            return _generation(slots)
+            return _generation_lds(slots) if lds_only else _generation(slots)
         return generation
 
     @flyc.kernel(name=name, known_block_size=[declaration.threads, 1, 1])
@@ -594,7 +695,7 @@ def build_resident_k1(
             gemv_tdm.prefetch_tokens(
                 prefix, s, HIDDEN * 2, bid, tid, declaration.blocks
             )
-        if const_expr(_state_prefetch() and whole_heads):
+        if const_expr(_state_prefetch() and whole_heads and not head_meta):
             # Only a CTA that projects first, the others' state loads hiding
             # under their wait on the projection -- unless the head is split,
             # its state loads then following that wait.
@@ -614,9 +715,11 @@ def build_resident_k1(
                         "rs_seq": rs_seq,
                         "replay": replay,
                         "cap": spec.replay_cap,
-                        "hmax": replay_staged(spec.replay_cap, spec.replay_window)
-                        if spec.replay_cap
-                        else 0,
+                        "hmax": (
+                            replay_staged(spec.replay_cap, spec.replay_window)
+                            if spec.replay_cap
+                            else 0
+                        ),
                     },
                     unit // HEADS,
                     unit % HEADS,
@@ -635,6 +738,29 @@ def build_resident_k1(
         recurrence = role.kda.peek()
         sync = scratch + fx.Int64(layout["sync"][0])
         generation = open_generation(sync, smem.tls.ptr)
+        if const_expr(head_meta):
+            # the head task's metadata chain (and its state prefetch) on the
+            # waves that issue no first projection copy; the others go on
+            _stash_head_meta(
+                uniform(wave),
+                _task_start(bid, spec.kda0, declaration.blocks),
+                head_tasks_total,
+                head_split,
+                tid,
+                declaration.threads,
+                {
+                    "num_acc": num_acc,
+                    "st_idx": st_idx,
+                    "st_stride": st_stride,
+                    "rstate": rstate,
+                    "rs_seq": rs_seq,
+                    "replay": replay,
+                    "cap": spec.replay_cap,
+                    "hmax": replay_staged(spec.replay_cap, spec.replay_window),
+                },
+                smem.tls.ptr,
+                _state_prefetch(),
+            )
         part = scratch + fx.Int64(layout["part"][0])
         weights = scratch + fx.Int64(layout["wgt"][0])
         mean_squares = scratch + fx.Int64(layout["msq"][0])
@@ -647,7 +773,7 @@ def build_resident_k1(
         # kernel.
         core_ready = part
 
-        if const_expr(not spec.external_seam):
+        if const_expr(not spec.external_seam):  # noqa: SIM102
             if bid < ATTENTION_CTAS:
                 for tile in range_constexpr(len(tile_starts)):
                     token0 = tile_starts[tile]
@@ -862,9 +988,11 @@ def build_resident_k1(
                     **(
                         {
                             "w_scale": w_in_scale,
-                            "depth": TDM_FP8_PAIR_DEPTH
-                            if declaration.lds.paired
-                            else gemv_tdm.FP8_DEPTH,
+                            "depth": (
+                                TDM_FP8_PAIR_DEPTH
+                                if declaration.lds.paired
+                                else gemv_tdm.FP8_DEPTH
+                            ),
                             "paired": declaration.lds.paired,
                         }
                         if spec.fp8_projection
@@ -990,11 +1118,12 @@ def build_resident_k1(
                                     projected_tag,
                                 )
             tdm_timeline.stamp(tdm_timeline.STORES_ISSUED)
-            gpu.barrier()
-            device["wait_vector_stores"]()
-            tdm_timeline.stamp(tdm_timeline.STORES_DONE)
+            if const_expr(not head_noack):
+                gpu.barrier()
+                device["wait_vector_stores"]()
+                tdm_timeline.stamp(tdm_timeline.STORES_DONE)
 
-        generation = collect_generation(smem.tls.ptr, generation)
+        generation = collect_generation(smem.tls.ptr, generation, head_noack)
         tdm_timeline.stamp(tdm_timeline.RECURRENCE)
 
         recurrence_context = {
@@ -1010,6 +1139,8 @@ def build_resident_k1(
             "head_split": head_split,
             "gate_ilp": _gate_ilp(),
             "chunk_recur": chunk_recur,
+            "head_opts": head_options,
+            "head_meta": smem.tls.ptr if head_meta else None,
             # forced whole heads stand in for the chunk tasks: their SiLU and
             # output gate as the chunk tasks round them
             "chunk_rounding": forced_heads,
@@ -1083,8 +1214,7 @@ def build_resident_k1(
                     if tid == 0:
                         for own in range_constexpr(STATE_CHUNKS // head_split):
                             chunk = (
-                                (task % head_split) * (STATE_CHUNKS // head_split)
-                                + own
+                                (task % head_split) * (STATE_CHUNKS // head_split) + own
                                 if const_expr(head_split > 1)
                                 else own
                             )

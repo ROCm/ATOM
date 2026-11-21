@@ -376,6 +376,8 @@ def project(
     token_steps: int = 2,
     early_scales: bool | None = None,
     unroll: int | None = None,
+    prologue_first: int | None = None,
+    resident: bool = False,
 ):
     """``x[rows, k] @ w[task_rows[i]:+16, k]^T`` for each task, as v8 f32 WMMA
     accumulators ``[task][16-token tile]``. ``w`` has ``w_rows`` rows of ``k``
@@ -388,6 +390,14 @@ def project(
     ``prologue``: emitted once the first ``depth`` weight slabs are in flight
     and before ``x`` is first read, so ``x`` may be produced there by other
     CTAs; ``x_cache_policy`` is then the scope ``x`` is read at.
+    ``prologue_first`` (unrolled loop): only that many of the ``depth`` slabs
+    are issued ahead of the prologue, which is passed a function issuing the
+    rest and calls it once, on every wave alike.
+    ``resident`` (unrolled loop, a prologue, every weight slab and token slab
+    in LDS: ``depth + 1`` and ``token_buffers`` at least the slabs): every
+    weight slab is issued ahead, every token slab past the prologue; the
+    copies are awaited once and the slabs multiplied with no barrier between
+    them -- no buffer is refilled. The same WMMAs in the same order.
 
     ``wide``: each slab's tokens and each task's weight slab move in one TDM
     copy, by a wave of its own in turn, not as every wave's few rows: a wave
@@ -453,6 +463,19 @@ def project(
     if paired and not (rolled and slabs >= 2 and depth % 2 == 0):
         raise ValueError(
             "paired TDM GEMV slabs need the rolled loop, two slabs and even depth"
+        )
+    if prologue_first is not None and (rolled or prologue is None):
+        raise ValueError("prologue_first takes the unrolled loop and a prologue")
+    if resident and (
+        rolled
+        or prologue is None
+        or not wide
+        or depth + 1 < slabs
+        or token_buffers < slabs
+    ):
+        raise ValueError(
+            "a resident TDM GEMV takes the unrolled wide loop, a prologue and"
+            " every slab in LDS"
         )
     if rolled:
         return _project_rolled(
@@ -576,35 +599,53 @@ def project(
     if prologue is None:
         for slab in range(max(ahead - 1, 1)):
             issue_tokens(slab)
-    for slab in range(min(depth, slabs)):
+    upfront = slabs if resident else min(depth, slabs)
+    first = upfront if prologue_first is None else min(prologue_first, upfront)
+    for slab in range(first):
         issue_weights(slab)
     if prologue is not None:
-        prologue()
+        if prologue_first is None:
+            prologue()
+        else:
+            prologue(lambda: [issue_weights(slab) for slab in range(first, upfront)])
         for slab in range(max(ahead - 1, 1)):
             issue_tokens(slab)
     for slab in range(slabs):
-        if slab:
-            # The buffers slab - 1 read are the ones refilled below.
-            if TDM_CLUSTER > 1:
-                cluster.cluster_barrier()
-            else:
+        if resident:
+            if slab == 0:
+                if ahead > 1:
+                    issue_tokens(ahead - 1)
+                for issuer, tags in owned.items():
+                    if tags:
+                        _on_wave(wave, issuer, lambda: rocdl.s_wait_tensorcnt(0))
                 gpu.barrier()
-            if slab + ahead - 1 < slabs:
-                issue_tokens(slab + ahead - 1)
-        elif ahead > 1:
-            issue_tokens(ahead - 1)
-        if slab + depth < slabs:
-            issue_weights(slab + depth)
-        if wide:
-            for issuer, tags in owned.items():
-                if slab in tags:
-                    last = max(index for index, tag in enumerate(tags) if tag == slab)
-                    later = len(tags) - 1 - last
-                    _on_wave(wave, issuer, lambda n=later: rocdl.s_wait_tensorcnt(n))
         else:
-            last = max(index for index, tag in enumerate(issued) if tag == slab)
-            rocdl.s_wait_tensorcnt(len(issued) - 1 - last)
-        gpu.barrier()
+            if slab:
+                # The buffers slab - 1 read are the ones refilled below.
+                if TDM_CLUSTER > 1:
+                    cluster.cluster_barrier()
+                else:
+                    gpu.barrier()
+                if slab + ahead - 1 < slabs:
+                    issue_tokens(slab + ahead - 1)
+            elif ahead > 1:
+                issue_tokens(ahead - 1)
+            if slab + depth < slabs:
+                issue_weights(slab + depth)
+            if wide:
+                for issuer, tags in owned.items():
+                    if slab in tags:
+                        last = max(
+                            index for index, tag in enumerate(tags) if tag == slab
+                        )
+                        later = len(tags) - 1 - last
+                        _on_wave(
+                            wave, issuer, lambda n=later: rocdl.s_wait_tensorcnt(n)
+                        )
+            else:
+                last = max(index for index, tag in enumerate(issued) if tag == slab)
+                rocdl.s_wait_tensorcnt(len(issued) - 1 - last)
+            gpu.barrier()
         weights = [
             (
                 _fp8_operand(
@@ -1001,7 +1042,7 @@ def _late_issue(
     """Step ``s``'s copies past its barrier, each into a buffer step ``s - 1``
     read: wave 0 the tokens of step ``s + token_steps - 1``, wave ``1 + 2 t +
     (j & 1)`` task ``t``'s slab ``j`` (``depth`` past the step's)."""
-    if role == 0:
+    if role == 0:  # noqa: SIM102
         if s + token_steps - 1 < steps:
             for g in range_constexpr(group):
                 issue_tokens(s + token_steps - 1, g)

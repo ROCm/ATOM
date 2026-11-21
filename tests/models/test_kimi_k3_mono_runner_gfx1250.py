@@ -8,6 +8,12 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+
+pytest.importorskip(
+    "flydsl", reason="importing the K3 gfx1250 mono runner needs FlyDSL"
+)
+pytest.importorskip("aiter", reason="the K3 gfx1250 mono runner imports aiter")
+
 from aiter import QuantType, dtypes
 from aiter.jit.utils import chip_info
 
@@ -395,6 +401,7 @@ def test_kernel_o_proj_all_reduce_launch_reads_the_layer_weights():
 
 @pytest.mark.parametrize("candidates", (0, 3))
 def test_k1_seam_is_bf16_where_out_norm_folds_fp8_quant(monkeypatch, candidates):
+    pytest.importorskip("triton", reason="the kernel under test needs triton")
     import atom.models.kimi_k3.mono.runner as base_module
 
     rows, hidden = 2, 4
@@ -478,7 +485,7 @@ def test_k2_kernel_hazard_past_48_rows_falls_back_to_production(monkeypatch):
         "_resident_hazards",
         lambda found: ("331776B LDS",) if found is launcher else (),
     )
-    kernels = lambda _built: [(launcher, None)]  # noqa: E731
+    kernels = lambda _built: [(launcher, None)]
     assert runner._k2_or_production(60, object, "K2", kernels) is None
     built = object()
     assert runner._k2_or_production(48, lambda: built, "K2", kernels) is built
@@ -1247,13 +1254,13 @@ def test_fused_tail_takes_the_gather_norm_and_finalize_in_one_launch(monkeypatch
 
 
 def test_fused_tail_serves_widths_a_line_a_thread():
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
     from atom.models.kimi_k3.mono.kernels.stages import k2_tail_gfx1250 as tail
 
     assert tail.tail_line_rows() == 42 < tail.tail_max_rows()
     assert all(runner_module._tail_width(rows) for rows in range(1, 43))
     assert not any(
-        runner_module._tail_width(rows)
-        for rows in range(43, tail.tail_max_rows() + 1)
+        runner_module._tail_width(rows) for rows in range(43, tail.tail_max_rows() + 1)
     )
 
 
@@ -1272,6 +1279,7 @@ def test_fused_tail_needs_the_plain_routed_norm(monkeypatch):
 
 
 def test_precomputed_herd_hands_over_routes_laid_out_for_the_tile(monkeypatch):
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
     from atom.models.kimi_k3.mono.kernels.stages.k2_finish_persistent_gfx1250 import (
         herd_scratch_layout,
     )

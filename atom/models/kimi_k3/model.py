@@ -890,6 +890,7 @@ class KimiFullAttention(nn.Module):
         hidden_states: torch.Tensor,
         quantize: bool = True,
         front: tuple | None = None,
+        back=None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """sigmoid(g_proj) * attention output, i.e. ``o_proj``'s input, and its
         activation scale when ``o_proj`` runs fp8 and ``quantize`` (else None).
@@ -902,7 +903,12 @@ class KimiFullAttention(nn.Module):
         element, the attention's ``q_out`` (the mono MLA absorb,
         ``mla_absorb_gfx1250``, which also wrote the step's KV-cache entries),
         skips q_b_proj, the W_UK absorb and the rope + cache write too: the
-        attention decodes from it (``MLAAttention.forward_decode_q_out``)."""
+        attention decodes from it (``MLAAttention.forward_decode_q_out``).
+
+        ``back`` (with a q_out): ``(o, lse, gate) -> attention output``, the
+        mono MLA back half (``mla_back_gfx1250``) -- W_UV, the DCP merge,
+        this gate and ``o_proj`` with its all-reduce on the decode's
+        partials. Its output is returned in the core's place."""
         # deepseek_v2 pattern: one _fuse_rmsnorm_quant kernel does q_a norm +
         # kv_a norm (+ q-activation quant), then q's scale is forwarded into the
         # MLA module (q_proj consumes it).
@@ -965,7 +971,16 @@ class KimiFullAttention(nn.Module):
                 projected_k_weights=(projected[3], projected[4]),
             )
         if q_out is None:
+            if back is not None:
+                raise ValueError("the MLA back half follows the absorb's q_out")
             attn_out = self.attn(q, kv, k_rope, positions, q_scale=q_scale)
+        elif back is not None:
+            return (
+                self.attn.impl.forward_decode_q_out(
+                    q_out, back=lambda o, lse: back(o, lse, gate)
+                ),
+                None,
+            )
         else:
             attn_out = self.attn.impl.forward_decode_q_out(q_out)
         if front is None:
@@ -997,6 +1012,22 @@ class KimiFullAttention(nn.Module):
         all). ``front``: ``_gated_core``'s."""
         attn_out, _ = self._gated_core(
             positions, hidden_states, quantize=False, front=front
+        )
+        return attn_out
+
+    def forward_mono_back(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        front: tuple,
+        back,
+    ) -> torch.Tensor:
+        """``forward`` on the mono MLA path end to end: ``front`` with the
+        absorb's q_out (``_gated_core``'s), the attention decoding from it,
+        and ``back(o, lse, gate)`` taking its partials to the attention
+        output -- ``o_proj``'s, all-reduced -- which is returned."""
+        attn_out, _ = self._gated_core(
+            positions, hidden_states, quantize=False, front=front, back=back
         )
         return attn_out
 

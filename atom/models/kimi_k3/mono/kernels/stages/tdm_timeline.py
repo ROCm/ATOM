@@ -42,6 +42,16 @@ HEAD_START, HEAD_POLLED, HEAD_CONV, HEAD_GATES = 96, 97, 98, 99
 HEAD_RECUR, HEAD_GATE_POLLED, HEAD_DONE, HEAD_EXCHANGED = 100, 101, 102, 103
 # Inside the gates: the gate WMMA issued (wave 0), then every wave past it.
 HEAD_GATE_MMA, HEAD_GATE_SYNC = 104, 105
+# Inside the recurrence (wave 0): its committed records replayed (ReplaySSM),
+# then tokens 0 and 4 advanced; inside the gates, their WMMAs issued, ahead
+# of the epilogue (words 4..7, free of the GEMV's points).
+HEAD_REPLAYED, HEAD_TOKEN0, HEAD_GATE_WMMA, HEAD_TOKEN4 = 4, 5, 6, 7
+# Realtime anchors of a whole-head CTA (``anchor``): the realtime counter and
+# the cycle counter read right after it, two words each (120..127), so the
+# cycle stamps between two anchors convert at that stretch's own rate (the
+# cycle counter's rate is not one a launch: the stamps of a CTA that outlives
+# the projection ran ~20% long at the grid's median rate).
+ANCHOR_START, ANCHOR_POLLED, ANCHOR_RECUR, ANCHOR_DONE = 120, 122, 124, 126
 # The sliced AttnRes mix (``attn_res_sliced_gfx1250``), its last pass: its
 # rows summed (landed), each exchange's stores drained and its cluster barrier
 # passed, the scores staged, the output stores issued.
@@ -89,6 +99,10 @@ POINTS = {
     "head_exchanged": HEAD_EXCHANGED,
     "head_gate_mma": HEAD_GATE_MMA,
     "head_gate_sync": HEAD_GATE_SYNC,
+    "head_replayed": HEAD_REPLAYED,
+    "head_token0": HEAD_TOKEN0,
+    "head_gate_wmma": HEAD_GATE_WMMA,
+    "head_token4": HEAD_TOKEN4,
     "mix_summed": MIX_SUMMED,
     "mix_drained": MIX_DRAINED,
     "mix_passed": MIX_PASSED,
@@ -216,14 +230,18 @@ def _slab_on(role, wave_role, record, index, s):
 
 
 @traced
-def _open_on(role, lane, record, entry, cycles):
+def _open_on(role, lane, record):
+    # the realtime clock is a message round trip: wave 0 alone asks for it.
+    # With every wave of every CTA asking at the entry, waves that go straight
+    # on to poll never saw their lines (a fused K2 head inside a whole layer;
+    # the launch alone ran).
     if role == 0:
         for k in range(WORDS // LANES):
             fx.ptr_store(fx.Int32(0), record + (lane + LANES * k))
         if lane == 0:
             fx.ptr_store(_hw_id(), record + HW_ID)
-            fx.ptr_store(entry, record + ENTRY)
-            fx.ptr_store(cycles, record + CYCLES_ENTRY)
+            fx.ptr_store(_realtime(), record + ENTRY)
+            fx.ptr_store(_cycles(), record + CYCLES_ENTRY)
 
 
 @traced
@@ -257,8 +275,6 @@ def open_cta(bid, wave, config, allocator) -> None:
     address, launches = config
     role = fx.Int32(rocdl.readfirstlane(T.i32, as_ir_value(fx.Int32(wave))))
     lane = fx.thread_idx.x % LANES
-    entry = _realtime()
-    cycles = _cycles()
     record = allocator.allocate(_Record).peek().words.ptr
     _context = {
         "base": fx.Int64(address),
@@ -268,7 +284,7 @@ def open_cta(bid, wave, config, allocator) -> None:
         "lane": lane,
         "bid": bid,
     }
-    _open_on(role, lane, record, entry, cycles)
+    _open_on(role, lane, record)
 
 
 def stamp(point, wave_role=0) -> None:
@@ -289,6 +305,39 @@ def record(point, value, wave_role=0) -> None:
     if _context is None:
         return
     _record_on(_context["role"], wave_role, _context["record"], point, value)
+
+
+@traced
+def _head_token_on(role, record, token):
+    if role == 0:
+        if token == 0:
+            fx.ptr_store(_cycles(), record + HEAD_TOKEN0)
+        if token == 4:
+            fx.ptr_store(_cycles(), record + HEAD_TOKEN4)
+
+
+def head_token(token) -> None:
+    """In the whole-head recurrence's token loop: tokens 0 and 4 advanced
+    (wave 0)."""
+    if _context is None:
+        return
+    _head_token_on(_context["role"], _context["record"], token)
+
+
+@traced
+def _anchor_on(role, lane, record, index):
+    if role == 0:  # noqa: SIM102
+        if lane == 0:
+            fx.ptr_store(_realtime(), record + index)
+            fx.ptr_store(_cycles(), record + index + 1)
+
+
+def anchor(index) -> None:
+    """A realtime anchor (wave 0): the realtime counter in word ``index``,
+    the cycle counter after its round trip in the next."""
+    if _context is None:
+        return
+    _anchor_on(_context["role"], _context["lane"], _context["record"], index)
 
 
 def slab(s, which, wave_role=0) -> None:

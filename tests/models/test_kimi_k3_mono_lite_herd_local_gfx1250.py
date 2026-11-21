@@ -2,6 +2,9 @@ import numpy as np
 import pytest
 
 from atom.models.kimi_k3.mono.kernels.execution_plan import Gfx1250KimiBuildPlan
+
+pytest.importorskip("flydsl", reason="the K3 gfx1250 mono kernels are FlyDSL")
+
 from atom.models.kimi_k3.mono.kernels.stages import k2_finish_persistent_gfx1250 as fin
 from atom.models.kimi_k3.mono.kernels.stages import moe_gfx1250
 
@@ -40,7 +43,9 @@ def switches(monkeypatch):
 
     def on(*names):
         for name in SWITCHES:
-            monkeypatch.setenv(name, "1" if any(name.endswith(n) for n in names) else "0")
+            monkeypatch.setenv(
+                name, "1" if any(name.endswith(n) for n in names) else "0"
+            )
 
     return on
 
@@ -132,7 +137,9 @@ def _herd_local(ids, values, pops, rsf):
     for lane in range(KP1):
         kept_sum = np.float32(0.0)
         for k in range(KP1):
-            kept_sum = np.float32(kept_sum + (values[k] if k != lane else np.float32(0)))
+            kept_sum = np.float32(
+                kept_sum + (values[k] if k != lane else np.float32(0))
+            )
         scales.append(np.float32(rsf / max(kept_sum, np.float32(1e-20))))
         by_value.append(
             sum(
@@ -157,7 +164,9 @@ def test_the_local_herd_drop_is_the_wave_drop(seed):
     values = [np.float32(v) for v in rng.choice(rng.random(6, dtype=np.float32), KP1)]
     pops = [int(p) for p in rng.integers(1, 4 if seed % 2 else 64, KP1)]
     rsf = np.float32(rng.choice([1.0, 2.827]))
-    ref, local = _herd_reference(ids, values, pops, rsf), _herd_local(ids, values, pops, rsf)
+    ref, local = _herd_reference(ids, values, pops, rsf), _herd_local(
+        ids, values, pops, rsf
+    )
     assert ref[0] == local[0]
     assert ref[1] == local[1]
     assert {j: w.tobytes() for j, w in ref[2].items()} == {

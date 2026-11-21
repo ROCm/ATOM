@@ -12,6 +12,7 @@ import json
 import os
 import statistics
 import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
@@ -189,7 +190,9 @@ def measure(layer):
     torch.cuda.synchronize()
     totals = []
     for _ in range(REPS):
-        a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
+            enable_timing=True
+        )
         a.record()
         g.replay()
         b.record()
@@ -204,7 +207,7 @@ def measure(layer):
     path = tempfile.mktemp(suffix=".json")
     prof.export_chrome_trace(path)
     times = collections.defaultdict(list)
-    for e in json.load(open(path))["traceEvents"]:
+    for e in json.loads(Path(path).read_text())["traceEvents"]:
         if e.get("ph") == "X" and e.get("cat") == "kernel":
             for key, label in KINDS:
                 if key in e["name"]:

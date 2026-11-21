@@ -38,15 +38,15 @@ import json
 import os
 import statistics
 
+import aiter
 import torch
 from aiter import QuantType, dtypes, gemm_a8w8_blockscale_bpreshuffle
 from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm
 from aiter.ops.shuffle import shuffle_weight
-from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (  # noqa: E501
+from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as fp8_bmm,
 )
 
-import aiter
 from atom.model_ops.linear import per_1x128_e8m0_quant
 from atom.model_ops.utils import dynamic_per_batched_tensor_quant
 from atom.models.kimi_k3.mono.config import HIDDEN
@@ -77,7 +77,7 @@ KEEP = []
 dev = torch.device("cuda", torch.cuda.current_device())
 gen = torch.Generator(device=dev).manual_seed(11)
 torch.set_default_dtype(torch.bfloat16)
-from atom.model_ops.rotary_embedding import NoPositionalRotaryEmbedding  # noqa: E402
+from atom.model_ops.rotary_embedding import NoPositionalRotaryEmbedding
 
 ROTARY = NoPositionalRotaryEmbedding(lay.ROPE, lay.ROPE, MAX_POS, 10000.0).to(dev)
 torch.set_default_dtype(torch.float32)
@@ -361,7 +361,7 @@ class Front:
 
     def __init__(self, rows, inp):
         self.kernel = mf.build_mla_front(rows, GATE, EPS, EPS)
-        e = lambda *shape, dtype=torch.bfloat16: torch.empty(  # noqa: E731
+        e = lambda *shape, dtype=torch.bfloat16: torch.empty(
             shape, dtype=dtype, device=dev
         )
         self.inp = inp
@@ -399,7 +399,9 @@ def production_front(x, layer):
     )  # fmt: skip
     q_fp8, q_scale = per_1x128_e8m0_quant(q, dtypes.fp8, True)
     gq, gs = per_1x128_e8m0_quant(x, dtypes.fp8, True)
-    gate = gemm_a8w8_blockscale_bpreshuffle(gq, layer.w_g, gs, layer.s_g, torch.bfloat16)
+    gate = gemm_a8w8_blockscale_bpreshuffle(
+        gq, layer.w_g, gs, layer.s_g, torch.bfloat16
+    )
     return q_fp8, q_scale, kv, k_rope, gate
 
 
@@ -430,7 +432,9 @@ def bench(rows, absorb):
         def run_prod_all():
             for i in range(GN):
                 layer = LAYERS[i % COPIES]
-                q_fp8, q_scale, kv, k_rope, gate = production_front(xs[i % COPIES], layer)
+                q_fp8, q_scale, kv, k_rope, gate = production_front(
+                    xs[i % COPIES], layer
+                )
                 inp = {"q_fp8": q_fp8, "q_scale": q_scale, "kv": kv,
                        "k_rope": k_rope, "slots": inps[i % COPIES]["slots"],
                        "positions": inps[i % COPIES]["positions"]}  # fmt: skip

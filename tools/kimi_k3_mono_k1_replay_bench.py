@@ -15,7 +15,8 @@ rounds seq / chunk / chunk / seq, then the sustained arms the same way.
 SPLIT_AB=a,b times ReplaySSM on at head split a against b (the serving
 recurrence both), each cursor: ABBA rounds a / b / b / a, then sustained.
 
-Run on one gfx1250 GPU: ROWS=40 H=0,5,6,8,11 python tools/kimi_k3_mono_k1_replay_bench.py"""
+Run on one gfx1250 GPU: ROWS=40 H=0,5,6,8,11 python tools/kimi_k3_mono_k1_replay_bench.py
+"""
 
 import json
 import os
@@ -25,7 +26,8 @@ import time
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import kimi_k3_mono_k1_replay_check as rc  # noqa: E402
+import kimi_k3_mono_k1_replay_check as rc
+
 from atom.models.kimi_k3.mono.kernels.attention.kda_builder_gfx1250 import (
     REPLAY_TABLE,
 )
@@ -171,6 +173,7 @@ def main():
     times = {"off": []}
     for h in HS:
         times[f"on_h{h}"] = []
+
     def time_on(h):
         write_pos.fill_(h)
         torch.cuda.synchronize()
@@ -208,9 +211,7 @@ def main():
         "rows": ROWS,
         "names": {t: k.entrypoint.name for t, k in kernels.items()},
         "flush": {f"on_h{h}": h + 2 * WINDOW > CAP for h in HS},
-        "median_us": {
-            t: round(sorted(v)[len(v) // 2], 2) for t, v in times.items()
-        },
+        "median_us": {t: round(sorted(v)[len(v) // 2], 2) for t, v in times.items()},
         "min_us": {t: round(min(v), 2) for t, v in times.items()},
         "sustained_us": sustained,
         "sustained_h": SUSTAIN_H if SUSTAIN > 0 else None,

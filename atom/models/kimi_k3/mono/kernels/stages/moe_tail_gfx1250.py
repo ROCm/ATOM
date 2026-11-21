@@ -194,8 +194,7 @@ def sdown_tasks(c, tasks, operands, waves, rows, rolled=False):
                 )
                 gemv_device.store_accumulator(
                     tile_accumulator,
-                    accumulators
-                    + (task_index * tiles + row_tile) * _slot_words(waves),
+                    accumulators + (task_index * tiles + row_tile) * _slot_words(waves),
                     c["wave"],
                     c["lane"],
                 )

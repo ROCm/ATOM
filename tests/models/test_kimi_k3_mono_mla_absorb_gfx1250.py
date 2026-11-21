@@ -49,8 +49,11 @@ def _setup(heads, rows, gen, dev):
     from aiter import QuantType, dtypes
     from aiter.ops.shuffle import shuffle_weight
 
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
     from atom.model_ops.linear import per_1x128_e8m0_quant
     from atom.model_ops.utils import dynamic_per_batched_tensor_quant
+
+    pytest.importorskip("triton", reason="the kernel under test needs triton")
     from atom.quantization.quark.utils import quant_weight_online
 
     def bf16(*shape, scale=1.0):
@@ -90,10 +93,11 @@ def _production(t, cache, heads, out_heads, compute_all, q=None):
     """The decode branch's three kernels; ``q`` replaces q_b_proj's output."""
     import aiter
     from aiter import dtypes, gemm_a8w8_blockscale_bpreshuffle
-    from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (  # noqa: E501
+    from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
         batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as bmm,
     )
 
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
     from atom.model_ops.rotary_embedding import NoPositionalRotaryEmbedding
 
     rows = t["q_fp8"].size(0)

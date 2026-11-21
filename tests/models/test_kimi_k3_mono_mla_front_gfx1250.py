@@ -65,6 +65,8 @@ def _fp8_weight(rows, gen, dev):
     from aiter import QuantType, dtypes
     from aiter.ops.shuffle import shuffle_weight
 
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    pytest.importorskip("triton", reason="the kernel under test needs triton")
     from atom.quantization.quark.utils import quant_weight_online
 
     w = (torch.randn(rows, 7168, generator=gen, device=dev) * 0.02).to(torch.bfloat16)
@@ -85,6 +87,7 @@ def test_outputs_match_the_reference_and_aiters_norm_and_quant_bits(rows):
     from aiter import QuantType, dtypes
     from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm
 
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
     from atom.model_ops.linear import per_1x128_e8m0_quant
 
     dev = torch.device("cuda", torch.cuda.current_device())

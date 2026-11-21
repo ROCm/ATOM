@@ -145,6 +145,8 @@ def test_k2_candidate_lds_is_bounded_across_wave32_inputs(tokens, threads):
 
 @pytest.mark.parametrize("rows", (1, 16, 32, 33, 40, 48, 49, 52, 53, 56, 60, 64))
 def test_the_fused_moe_keeps_a_ring_of_four_to_64_rows(rows):
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
     from atom.models.kimi_k3.mono.kernels.stages import moe_tdm_gfx1250 as mt
 
     ring, resident = mt._moe_fit(rows, None, None)
@@ -160,6 +162,8 @@ def test_the_fused_moe_keeps_a_ring_of_four_to_64_rows(rows):
 
 
 def test_a_three_item_ring_holds_the_whole_64_row_latent():
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
     from atom.models.kimi_k3.mono.kernels.stages import moe_tdm_gfx1250 as mt
 
     assert mt._moe_fit(64, 3, None) == (3, ml.LATENT // mt.K_TILE)
@@ -171,6 +175,8 @@ def test_a_three_item_ring_holds_the_whole_64_row_latent():
 @pytest.mark.parametrize("rows", (10, 40))
 @pytest.mark.parametrize("rolled", (False, True))
 def test_a_rolled_fused_moe_is_a_build_of_its_own(rows, rolled):
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
     from atom.models.kimi_k3.mono.kernels.stages.moe_tdm_gfx1250 import build_moe
 
     kernel = build_moe(rows, rolled=rolled)
@@ -180,6 +186,8 @@ def test_a_rolled_fused_moe_is_a_build_of_its_own(rows, rolled):
 
 @pytest.mark.parametrize("rows", (1, 16, 40, 48, 56, 64))
 def test_the_fused_moe_runs_wide_on_zeroed_padding_by_default(rows, monkeypatch):
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
     from atom.models.kimi_k3.mono.kernels.stages.moe_tdm_gfx1250 import build_moe
 
     monkeypatch.delenv("ATOM_KIMI_MONO_FUSED_MOE_WIDE", raising=False)
@@ -195,6 +203,8 @@ def test_the_fused_moe_runs_wide_on_zeroed_padding_by_default(rows, monkeypatch)
 def test_the_fused_moe_switches_turn_wide_and_zeroed_padding_off(
     wide, zero_pad, monkeypatch
 ):
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
     from atom.models.kimi_k3.mono.kernels.stages.moe_tdm_gfx1250 import build_moe
 
     monkeypatch.setenv("ATOM_KIMI_MONO_FUSED_MOE_WIDE", wide)
@@ -205,6 +215,8 @@ def test_the_fused_moe_switches_turn_wide_and_zeroed_padding_off(
 
 
 def test_an_unrolled_fused_moe_zeroes_padding_on_six_waves():
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
     from atom.models.kimi_k3.mono.kernels.stages.moe_tdm_gfx1250 import build_moe
 
     name = build_moe(40, rolled=False, wide=True, zero_pad=True).name

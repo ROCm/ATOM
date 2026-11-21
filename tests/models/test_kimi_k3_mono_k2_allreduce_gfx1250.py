@@ -5,8 +5,10 @@
 import pytest
 
 from atom.models.kimi_k3.mono.config import HIDDEN, LATENT
-from atom.models.kimi_k3.mono.kernels.stages import k2_allreduce_gfx1250 as ar
 
+pytest.importorskip("flydsl", reason="the K3 gfx1250 mono kernels are FlyDSL")
+
+from atom.models.kimi_k3.mono.kernels.stages import k2_allreduce_gfx1250 as ar
 
 WIDE = (50, 55, 60, 64)
 
@@ -57,6 +59,7 @@ def test_peer_banks_hold_two_epochs_of_every_source():
 
 
 def test_o_proj_all_reduce_gives_each_rank_whole_ctas_of_columns():
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
     from atom.models.kimi_k3.mono.kernels.stages import k2_oproj_ar_gfx1250 as oar
 
     assert oar.CTAS * oar.CTA_COLUMNS == HIDDEN
@@ -96,6 +99,7 @@ def test_gathering_all_reduce_takes_a_line_a_thread(rows):
 
 
 def test_one_shot_o_proj_banks_hold_every_ranks_partials_of_every_column():
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
     from atom.models.kimi_k3.mono.kernels.stages import k2_oproj_ar_gfx1250 as oar
 
     for tp in (2, 4, 8):
@@ -121,6 +125,7 @@ def test_gathering_all_reduce_profile_and_barrier_builds(rows):
 
 
 def test_o_proj_all_reduce_takes_a_line_a_thread_a_round():
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
     from atom.models.kimi_k3.mono.kernels.stages import k2_oproj_ar_gfx1250 as oar
 
     assert all(oar.line_rounds(rows) == 1 for rows in range(1, 49))
@@ -132,6 +137,8 @@ def test_o_proj_all_reduce_takes_a_line_a_thread_a_round():
 @pytest.mark.parametrize("oneshot", (False, True))
 def test_o_proj_all_reduce_builds_to_64_rows(rows, oneshot):
     from atom.models.kimi_k3.mono.kernels.execution_plan import Gfx1250KimiBuildPlan
+
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
     from atom.models.kimi_k3.mono.kernels.stages import k2_oproj_ar_gfx1250 as oar
 
     plan = Gfx1250KimiBuildPlan(
@@ -140,3 +147,85 @@ def test_o_proj_all_reduce_builds_to_64_rows(rows, oneshot):
     kernel = oar.build_oproj_allreduce(plan, 8, 1536, oneshot=oneshot)
     assert kernel.grid == (oar.CTAS,) and kernel.block == (oar.THREADS,)
     assert f"_s{rows}" in kernel.name
+
+
+def _oproj_plan(rows=8):
+    from atom.models.kimi_k3.mono.kernels.execution_plan import Gfx1250KimiBuildPlan
+
+    return Gfx1250KimiBuildPlan(
+        threads=256, blocks=256, lds_bytes=320 * 1024, tokens=rows, nblocks=1
+    )
+
+
+def test_poll_together_switches_default_off_and_take_more_than_one_rank(monkeypatch):
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    from atom.models.kimi_k3.mono.kernels.stages import k2_allreduce_gfx1250 as ar
+    from atom.models.kimi_k3.mono.kernels.stages import k2_oproj_ar_gfx1250 as oar
+    from atom.utils import envs
+
+    for name in ("OPROJ_AR", "GATHER_AR"):
+        monkeypatch.delenv(f"ATOM_KIMI_MONO_{name}_POLL_TOGETHER", raising=False)
+        assert getattr(envs, f"ATOM_KIMI_MONO_{name}_POLL_TOGETHER") is False
+    plan = _oproj_plan()
+    oprojs = {
+        hop: oar.build_oproj_allreduce(plan, 8, 1536, oneshot=hop).name
+        for hop in (False, True)
+    }
+    gathers = {rows: ar.build_gather_allreduce(8, rows).name for rows in (8, 48)}
+    assert not any("_pt" in name for name in (*oprojs.values(), *gathers.values()))
+    monkeypatch.setenv("ATOM_KIMI_MONO_OPROJ_AR_POLL_TOGETHER", "1")
+    # each switch its own kernel's
+    assert ar.build_gather_allreduce(8, 8).name == gathers[8]
+    monkeypatch.setenv("ATOM_KIMI_MONO_GATHER_AR_POLL_TOGETHER", "1")
+    for hop, name in oprojs.items():
+        assert (
+            oar.build_oproj_allreduce(plan, 8, 1536, oneshot=hop).name == name + "_pt"
+        )
+        assert "_pt" not in oar.build_oproj_allreduce(plan, 1, 1536, oneshot=hop).name
+        off = oar.build_oproj_allreduce(plan, 8, 1536, oneshot=hop, poll_together=False)
+        assert off.name == name and off.abi is oar.OPROJ_AR_ABI
+    for rows, name in gathers.items():
+        assert ar.build_gather_allreduce(8, rows).name == name + "_pt"
+        assert "_pt" not in ar.build_gather_allreduce(1, rows).name
+        assert ar.build_gather_allreduce(8, rows, poll_together=False).name == name
+
+
+def test_poll_helpers_default_to_volatile_loads():
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    from atom.models.kimi_k3.mono.kernels.stages import k2_allreduce_gfx1250 as ar
+
+    assert ar.POLL_VOLATILE == ar.SCOPE_SYS | ar.VOLATILE
+    assert ar.POLL_TOGETHER == ar.SCOPE_SYS
+    # no context: the helpers are called as ever
+    assert ar.poll_context(False, None, None, 0, 0) is None
+    assert ar.poll_context(True, None, None, 0, 0)["modifier"] == ar.POLL_TOGETHER
+    assert ar.poll_context(False, 7, None, 0, 0)["modifier"] == ar.POLL_VOLATILE
+    # a tool build's marks sit past the epoch counters
+    assert ar.POLLS_WORD >= ar.MAX_CTAS
+    assert ar.GAVE_UP_WORD >= ar.POLLS_WORD + ar.MAX_CTAS
+
+
+def test_tool_builds_are_named_apart_and_dry_pushes_take_a_bound(monkeypatch):
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    from atom.models.kimi_k3.mono.kernels.stages import k2_allreduce_gfx1250 as ar
+    from atom.models.kimi_k3.mono.kernels.stages import k2_oproj_ar_gfx1250 as oar
+
+    for name in ("OPROJ_AR", "GATHER_AR"):
+        monkeypatch.delenv(f"ATOM_KIMI_MONO_{name}_POLL_TOGETHER", raising=False)
+    plan = _oproj_plan()
+    plain = oar.build_oproj_allreduce(plan, 8, 1536, oneshot=True).name
+    build = lambda **kw: oar.build_oproj_allreduce(plan, 8, 1536, oneshot=True, **kw)
+    assert build(poll_bound=9).name == plain + "_b9"
+    assert build(poll_bound=9, test_skip_push=True).name == plain + "_b9_np"
+    assert build(poll_together=True, test_swap_late=2).name == plain + "_pt_sw2"
+    with pytest.raises(ValueError, match="bound"):
+        build(test_skip_push=True)
+    with pytest.raises(ValueError, match="one-shot"):
+        oar.build_oproj_allreduce(plan, 8, 1536, oneshot=False, test_swap_late=0)
+    for rows in (8, 48):
+        name = ar.build_gather_allreduce(8, rows).name
+        assert ar.build_gather_allreduce(8, rows, poll_bound=9).name == name + "_b9"
+        late = ar.build_gather_allreduce(8, rows, poll_together=True, test_swap_late=3)
+        assert late.name == name + "_pt_sw3"
+        with pytest.raises(ValueError, match="bound"):
+            ar.build_gather_allreduce(8, rows, test_skip_push=True)

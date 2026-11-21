@@ -124,7 +124,9 @@ class AbsorbPlan:
 
     def __post_init__(self):
         if not 1 <= self.rows <= MAX_ROWS:
-            raise ValueError(f"the MLA absorb takes 1..{MAX_ROWS} rows, got {self.rows}")
+            raise ValueError(
+                f"the MLA absorb takes 1..{MAX_ROWS} rows, got {self.rows}"
+            )
         clusters(self.heads)
         if self.out_heads < self.heads:
             raise ValueError(f"{self.out_heads} q_out heads < {self.heads}")

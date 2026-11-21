@@ -70,6 +70,8 @@ from atom.models.kimi_k3.mono.kernels.stages import (
     attn_res_sliced_layout,
     mla_absorb_gfx1250,
     mla_absorb_layout,
+    mla_back_gfx1250,
+    mla_back_layout,
     mla_front_gfx1250,
     mla_front_layout,
 )
@@ -127,6 +129,7 @@ from atom.models.kimi_k3.mono.weights import (
     bind_external_moe,
     bind_fp8_o_proj,
     bind_mla_absorb,
+    bind_mla_back,
     bind_mla_front,
 )
 from atom.mono.plan.architecture import GFX1250
@@ -136,6 +139,7 @@ from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
 from atom.mono.runtime.widths import WidthBuilds
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
+from atom.utils.poll_isa import bound_build
 
 logger = logging.getLogger("atom")
 K1_PTPC_FUSION_MAX_ROWS = 40
@@ -164,9 +168,7 @@ def replay_refusal(
             f"{window}, query length {qlen}"
         )
     try:
-        role_lds_plan(
-            plan, qlen=qlen, fp8=fp8, replay_cap=cap, replay_window=window
-        )
+        role_lds_plan(plan, qlen=qlen, fp8=fp8, replay_cap=cap, replay_window=window)
     except ValueError as e:
         return f"gfx1250 K1 ReplaySSM records do not fit LDS: {e}"
     return None
@@ -251,6 +253,7 @@ def _lean_width(
         built.oproj,
         built.mla_front,
         built.mla_absorb,
+        built.mla_back,
     )
 
 
@@ -262,7 +265,12 @@ class _PrecomputedHerd:
     the finish lay out for that tile from the next launch on."""
 
     def __init__(
-        self, scratch: torch.Tensor, candidates, values, rows: int, ids_only: bool = False
+        self,
+        scratch: torch.Tensor,
+        candidates,
+        values,
+        rows: int,
+        ids_only: bool = False,
     ) -> None:
         layout = herd_scratch_layout(rows)
         # a ``parallel_herd`` finish's: its ids and weights, no grouped layout
@@ -339,6 +347,9 @@ class Gfx1250WidthBuild:
     # their MLA absorbs (ATOM_KIMI_MONO_MLA_ABSORB), by ``MlaAbsorbLayer.key``;
     # a key without one runs production's q_b_proj, W_UK and rope + cache
     mla_absorb: dict | None = None
+    # their MLA back halves (ATOM_KIMI_MONO_MLA_BACK), by ``MlaBackLayer.key``;
+    # a key without one runs production's W_UV, DCP merge, gate and o_proj
+    mla_back: dict | None = None
 
     def kernels(self) -> list[tuple[object, KernelAbi]]:
         """All local launchers, for compile-time scratch validation."""
@@ -367,6 +378,9 @@ class Gfx1250WidthBuild:
         for absorb in (self.mla_absorb or {}).values():
             if absorb is not None:
                 pairs.append((absorb.launcher, absorb.abi))
+        for back in (self.mla_back or {}).values():
+            if back is not None:
+                pairs.append((back.launcher, back.abi))
 
         unique = {}
         for launcher, abi in pairs:
@@ -493,6 +507,8 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
     k2_peers: SymmPeers | None = None
     # the o_proj all-reduce's banks, past the K2 all-reduce's in ``k2_peers``
     oproj_peers: torch.Tensor | None = None
+    # the MLA back halves' banks, past the o_proj all-reduce's in ``k2_peers``
+    mla_back_peers: torch.Tensor | None = None
     oproj_weights: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None
     # full-attention layers running o_proj and K2 here (``_bind``)
     ffn_layers: frozenset[int] = frozenset()
@@ -503,8 +519,10 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         # Every rank bound: the rendezvous is a collective they all reach.
         if envs.ATOM_KIMI_MONO_KERNEL_AR:
             reduce_bytes = allreduce_peer_bytes(self.tp, self.max_rows)
+            oproj_bytes = oproj_peer_bytes(self.tp, self.max_rows)
+            back_bytes = self._mla_back_peer_bytes()
             self.k2_peers = map_symm_peers(
-                reduce_bytes + oproj_peer_bytes(self.tp, self.max_rows),
+                reduce_bytes + oproj_bytes + back_bytes,
                 ALLREDUCE_COUNTERS,
                 group,
                 self.tp,
@@ -512,6 +530,8 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             )
             if self.k2_peers is not None and self.oproj_weights:
                 self.oproj_peers = self.k2_peers.peers + reduce_bytes
+            if self.k2_peers is not None and back_bytes:
+                self.mla_back_peers = self.k2_peers.peers + reduce_bytes + oproj_bytes
         self.widths = WidthBuilds(
             self._build_width,
             Gfx1250WidthBuild.kernels,
@@ -523,11 +543,16 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         self._served_widths: set[tuple[int, int]] = set()
         logger.info(
             "Kimi-K3 gfx1250 packed mono runner bound (TP%d, %d CUs, K2 all-reduce %s, "
-            "o_proj all-reduce %s)",
+            "o_proj all-reduce %s, %d MLA back halves)",
             self.tp,
             self.blocks,
             "in kernel" if self.k2_peers is not None else "by aiter",
             "in kernel" if self.oproj_peers is not None else "by aiter",
+            (
+                len(getattr(self, "mla_backs", {}))
+                if self.mla_back_peers is not None
+                else 0
+            ),
         )
 
     def _bind(self, model, drafter=None, metadata_builder=None) -> None:
@@ -653,6 +678,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 device=self.device,
             )
         self._bind_mla_absorbs()
+        self._bind_mla_backs()
 
     def _bind_mla_absorbs(self) -> None:
         """The layers with a front whose q_b_proj, W_UK absorb and rope +
@@ -685,6 +711,57 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 dtype=torch.int32,
                 device=self.device,
             )
+
+    def _bind_mla_backs(self) -> None:
+        """The layers with an absorb whose W_UV, DCP merge, output gate and
+        o_proj + all-reduce the MLA back half takes (ATOM_KIMI_MONO_MLA_BACK);
+        a layer it cannot read keeps them, alone. One core buffer and one flag
+        buffer serve every width (``mla_back_gfx1250``). Every rank binds the
+        same layers: the checks read shapes and settings the ranks share."""
+        self.mla_backs = {}
+        if not envs.ATOM_KIMI_MONO_MLA_BACK:
+            return
+        for layer_id, absorb in sorted(getattr(self, "mla_absorbs", {}).items()):
+            try:
+                self.mla_backs[layer_id] = bind_mla_back(
+                    self.inner.layers[layer_id], layer_id, self.dims, absorb, self.rank
+                )
+            except MonoUnsupported as e:
+                logger.warning(
+                    "Kimi-K3 mono: layer %d keeps its production W_UV, DCP merge, "
+                    "gate and o_proj (%s)",
+                    layer_id,
+                    e,
+                )
+        logger.info(
+            "Kimi-K3 gfx1250 mono: %d full-attention layers bind the MLA back half",
+            len(self.mla_backs),
+        )
+        if self.mla_backs:
+            plans = self._mla_back_plans()
+            self.mla_core = torch.empty(
+                (self.max_rows, self.dims.proj),
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+            self.mla_flags = torch.zeros(
+                max(plan.flag_words for plan in plans),
+                dtype=torch.int32,
+                device=self.device,
+            )
+
+    def _mla_back_plans(self) -> list:
+        """The widest back half of every bound shape."""
+        return [
+            mla_back_layout.BackPlan(self.max_rows, self.tp, dcp, local_heads)
+            for dcp, local_heads in sorted(
+                {back.key for back in getattr(self, "mla_backs", {}).values()}
+            )
+        ]
+
+    def _mla_back_peer_bytes(self) -> int:
+        """A rank's receive banks of the MLA back halves (0: none bound)."""
+        return max((plan.peer_bytes for plan in self._mla_back_plans()), default=0)
 
     def _allocate(self) -> None:
         self.ones = torch.ones(self.max_rows, dtype=torch.int32, device=self.device)
@@ -803,16 +880,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 if k2_key not in k2_cache:
                     k2_cache[k2_key] = self._k2_or_production(
                         rows,
-                        lambda: self._build_routed_k2(
-                            rows,
-                            nblocks,
-                            reset,
-                            routed.gu_interleave,
-                            whole_up,
-                            fp8_shared,
-                            tail_eps,
-                            fp4_latent,
-                        ),
+                        lambda key=k2_key: self._build_routed_k2(rows, *key),
                         "K2",
                         lambda k2: Gfx1250WidthBuild({}, {0: k2}).kernels(),
                     )
@@ -822,8 +890,17 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         oproj = (
             self._k2_or_production(
                 rows,
-                lambda: build_oproj_allreduce(
-                    self._plan(rows, 1), self.tp, self.dims.proj
+                # a build whose polls issue their loads together is read
+                # as compiled and kept only if it re-reads every line
+                lambda: bound_build(
+                    lambda together: build_oproj_allreduce(
+                        self._plan(rows, 1),
+                        self.tp,
+                        self.dims.proj,
+                        poll_together=together,
+                    ),
+                    "o_proj all-reduce",
+                    logger,
                 ),
                 "o_proj all-reduce",
                 lambda kernel: Gfx1250WidthBuild({}, {}, kernel).kernels(),
@@ -837,6 +914,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             oproj,
             self._mla_fronts_for(rows),
             self._mla_absorbs_for(rows),
+            self._mla_backs_for(rows),
         )
 
     def _mla_fronts_for(self, rows: int) -> dict | None:
@@ -900,6 +978,100 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             built[key] = kernel
         return built
 
+    def _mla_backs_for(self, rows: int) -> dict | None:
+        """The width's MLA back half a ``MlaBackLayer.key``, None where it
+        does not build or compiles with a resident hazard: those layers run
+        production's W_UV, DCP merge, gate and o_proj at this width. The
+        launch is collective; every rank builds the same kernel from the same
+        shapes with the same compiler, so the ranks choose alike (as for the
+        o_proj all-reduce past ``k2_fallback_past``)."""
+        backs = getattr(self, "mla_backs", None)
+        if not backs or self.mla_back_peers is None:
+            return None
+        built = {}
+        for key in sorted({back.key for back in backs.values()}):
+            dcp, local_heads = key
+            try:
+                kernel = bound_build(
+                    lambda together, dcp=dcp, local_heads=local_heads: (
+                        mla_back_gfx1250.build_mla_back
+                    )(
+                        self._plan(rows, 1),
+                        self.tp,
+                        dcp,
+                        local_heads,
+                        poll_together=together,
+                    ),
+                    "MLA back half",
+                    logger,
+                )
+                (launcher,) = compile_kernels([(kernel.launcher, kernel.abi)])
+                hazards = _resident_hazards(launcher)
+            except ValueError as why:
+                kernel, hazards = None, (str(why),)
+            if hazards:
+                logger.warning(
+                    "Kimi-K3 gfx1250 mono: %d rows run production's W_UV, DCP "
+                    "merge, gate and o_proj (%s)",
+                    rows,
+                    ", ".join(hazards),
+                )
+                kernel = None
+            built[key] = kernel
+        return built
+
+    def _mla_back_half(self, build, layer_id: int, taken: list):
+        """The layer's MLA back half at this width as ``_pre_o_core``'s
+        ``back`` -- its attention output appended to ``taken`` -- or None
+        (production's W_UV, DCP merge, gate and o_proj)."""
+        back = getattr(self, "mla_backs", {}).get(layer_id)
+        kernels = getattr(build, "mla_back", None)
+        kernel = None if back is None or not kernels else kernels.get(back.key)
+        if kernel is None:
+            return None
+
+        def run(o, lse, gate):
+            out = self._mla_back(kernel, back, o, lse, gate)
+            taken.append(out)
+            return out
+
+        return run
+
+    def _mla_back(self, kernel, back, o, lse, gate):
+        """The MLA back half on the decode's partials ``o`` / ``lse`` and the
+        front's ``gate`` rows: the attention output ``[rows, HIDDEN]``."""
+        lay = mla_back_layout
+        rows = kernel.plan.rows
+        lse = lse.to(torch.float32).contiguous()
+        if (
+            o.dtype != torch.bfloat16
+            or tuple(o.shape) != (rows, back.heads, lay.KV_LORA)
+            or not o.is_contiguous()
+            or tuple(lse.shape) != (rows, back.heads)
+            or gate.dtype != torch.bfloat16
+            or tuple(gate.shape) != (rows, self.dims.proj)
+            or not gate.is_contiguous()
+        ):
+            raise MonoUnsupported(
+                f"layer {back.layer_id}: the MLA back half reads [{rows}, "
+                f"{back.heads}, {lay.KV_LORA}] BF16 partials, their LSEs and "
+                f"[{rows}, {self.dims.proj}] BF16 gate rows, got {o.dtype} "
+                f"{tuple(o.shape)}, {tuple(lse.shape)}, {gate.dtype} "
+                f"{tuple(gate.shape)}"
+            )
+        out = o.new_empty(rows, HIDDEN)
+        p = torch.Tensor.data_ptr
+        args = mla_back_gfx1250.MLA_BACK_ABI.pack({
+            "o": p(o), "lse": p(lse), "w_uv": p(back.w_uv), "s_uv": p(back.s_uv),
+            "gate": p(gate), "w_o": p(back.w_o), "w_o_scale": p(back.s_o),
+            "out": p(out), "core": p(self.mla_core), "flags": p(self.mla_flags),
+            "peers": p(self.mla_back_peers), "merge_peers": p(self.mla_back_peers),
+            "epochs": p(self.k2_peers.epochs), "rank": self.rank,
+            "dcp_rank": back.dcp_rank,
+        })  # fmt: skip
+        kernel.launcher(*args, stream=torch.cuda.current_stream())
+        return out
+
     def _mla_projection(self, build, layer_id: int):
         """The full-attention layer's MLA front at this width (with its absorb
         where built), as ``_pre_o_core``'s ``project``, or None (the
@@ -911,7 +1083,9 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             return None
         absorb = getattr(self, "mla_absorbs", {}).get(layer_id)
         absorbs = getattr(build, "mla_absorb", None)
-        absorb_kernel = None if absorb is None or not absorbs else absorbs.get(absorb.key)
+        absorb_kernel = (
+            None if absorb is None or not absorbs else absorbs.get(absorb.key)
+        )
         if absorb_kernel is None:
             return lambda normed: self._mla_front(kernel, front, normed)
         return lambda normed: self._mla_front(
@@ -1184,7 +1358,13 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         allreduce = None
         if replicated and self.k2_peers is not None:
             allreduce = (
-                build_gather_allreduce(self.tp, rows)
+                bound_build(
+                    lambda together: build_gather_allreduce(
+                        self.tp, rows, poll_together=together
+                    ),
+                    "gathering all-reduce",
+                    logger,
+                )
                 if grouped_moe is not None or fused_moe is not None
                 else build_allreduce(self.tp, rows)
             )
@@ -1196,8 +1376,16 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             and _tail_width(rows)
         ):
             # the fused MoE's routes are its own rows: ``fused_rows``
-            tail = build_k2_tail(
-                self.tp, rows, tail_eps, identity_routes=fused_moe is not None
+            tail = bound_build(
+                lambda together: build_k2_tail(
+                    self.tp,
+                    rows,
+                    tail_eps,
+                    identity_routes=fused_moe is not None,
+                    poll_together=together,
+                ),
+                "K2 tail",
+                logger,
             )
             if "k2_tail_flags" not in self.__dict__:
                 # one set for every layer and width: a launch's flags carry
@@ -1315,8 +1503,15 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         return hidden
 
     def _seam(self, plan, prefix, blocks, add, add2, bf16=False):
-        """The attention-side seam; K1's BF16 row on the gfx1250 AttnRes mix."""
-        if not bf16:
+        """The attention-side seam; K1's BF16 row on the gfx1250 AttnRes mix,
+        and with ATOM_KIMI_MONO_MLA_ATTN_RES a full-attention layer's behind
+        the MLA front too (its binding refuses a seam whose out_norm folds a
+        quant, so that row is BF16 on either mix; the mono mix sums in
+        another order than production's)."""
+        if not bf16 and not (
+            envs.ATOM_KIMI_MONO_MLA_ATTN_RES
+            and plan.layer_id in getattr(self, "mla_fronts", {})
+        ):
             return super()._seam(plan, prefix, blocks, add, add2, bf16)
         layer = self.inner.layers[plan.layer_id]
         before, write_idx = layer_block(plan.layer_id)
@@ -1329,6 +1524,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         if plan.layer_id not in self.routed:
             out = self._fallback(plan, positions, prefix, blocks, add, add2)
         else:
+            attn_out = None
             if plan.layer_id in self.ffn_layers:
                 # A full-attention layer: its attention on the production path
                 # up to o_proj's input (its projections the MLA front's where
@@ -1340,10 +1536,22 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                         plan, positions, prefix, blocks, add, add2
                     )
                 else:
-                    core, prefix = self._pre_o_core(
-                        plan, positions, prefix, blocks, add, add2, project
-                    )
-                core = core[: prefix.size(0)]
+                    # with its absorb's q_out the back half (where built)
+                    # takes the decode's partials to the attention output
+                    taken = []
+                    back = self._mla_back_half(build, plan.layer_id, taken)
+                    if back is None:
+                        core, prefix = self._pre_o_core(
+                            plan, positions, prefix, blocks, add, add2, project
+                        )
+                    else:
+                        core, prefix = self._pre_o_core(
+                            plan, positions, prefix, blocks, add, add2, project, back
+                        )
+                    if core is None:
+                        (attn_out,) = taken
+                if core is not None:
+                    core = core[: prefix.size(0)]
             else:
                 layer, normed, prefix, _, write_idx = self._seam(
                     plan, prefix, blocks, add, add2, bf16=True
@@ -1351,7 +1559,9 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 if write_idx >= 0:
                     blocks[:, write_idx].copy_(prefix)
                 core = self._k1(build, plan, normed, None, blocks, metadata)
-            if build.oproj is not None and plan.layer_id in self.oproj_weights:
+            if attn_out is not None:
+                pass
+            elif build.oproj is not None and plan.layer_id in self.oproj_weights:
                 attn_out = self._oproj(build.oproj, plan.layer_id, core)
             elif isinstance(core, tuple):
                 core, core_scale = core

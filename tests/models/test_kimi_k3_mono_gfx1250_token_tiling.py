@@ -125,15 +125,11 @@ def test_attention_and_protocol_cover_all_rows(tokens):
         sources=7,
     )
     gates = [
-        token
-        for assignment in protocol.assignments
-        for token in assignment.gate_tokens
+        token for assignment in protocol.assignments for token in assignment.gate_tokens
     ]
     assert sorted(gates) == list(range(tokens))
     tasks = [
-        task
-        for assignment in protocol.assignments
-        for task in assignment.head_tasks
+        task for assignment in protocol.assignments for task in assignment.head_tasks
     ]
     assert len(tasks) == len(set(tasks)) == protocol.head_task_count
     assert sorted(tasks) == list(range(protocol.head_task_count))

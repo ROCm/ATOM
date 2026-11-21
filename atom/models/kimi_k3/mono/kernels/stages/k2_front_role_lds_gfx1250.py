@@ -753,7 +753,7 @@ def build_role_lds_front(
                         tag,
                     )
 
-        elif bid == norm_cta:
+        elif bid == norm_cta:  # noqa: SIM102
             if tid < rows:
                 total = fx.Float32(0.0)
                 for task in range_constexpr(ATTENTION_CTAS):

@@ -180,7 +180,7 @@ def production(proj, conv, ckpt, bufs, write_pos, slot_idx, num_acc, req):
     beta = p[:, BETA_0 : BETA_0 + NH].unsqueeze(0).contiguous()
     gate = (p[:, FA_0 : FA_0 + HD] @ w_fb.t()).view(1, T, NH, HD)
     qsl = torch.arange(req + 1, dtype=torch.int32, device=dev) * QLEN
-    conv_slots = slot_idx if QLEN > 1 else slot_idx
+    conv_slots = slot_idx
     extra = (
         {
             "num_accepted_tokens": num_acc,
@@ -396,7 +396,9 @@ def check(rows):
                 kj = bufs_before[0][slot, :, j].double()
                 uj = bufs_before[1][slot, :, j].double()
                 gj = bufs_before[2][slot, :, j].double()
-                state = state * gj.exp().unsqueeze(1) + uj.unsqueeze(2) * kj.unsqueeze(1)
+                state = state * gj.exp().unsqueeze(1) + uj.unsqueeze(2) * kj.unsqueeze(
+                    1
+                )
             rebuild.append(diff(m["ckpt"][slot], state)["max_abs"])
         report["flush_vs_own_records_max_abs"] = max(rebuild) if rebuild else None
         report["unflushed_ckpt_unchanged"] = all(kept)

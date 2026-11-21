@@ -398,9 +398,7 @@ def test_an_explicit_residency_hazard_uses_the_same_lean_ladder(caplog):
         None,
         "test",
         lean=lean,
-        hazards=lambda launcher: (
-            ("2 sgpr spill",) if launcher is spill else ()
-        ),
+        hazards=lambda launcher: (("2 sgpr spill",) if launcher is spill else ()),
     )
     with caplog.at_level("INFO", logger="atom"):
         assert widths.prepare(16)

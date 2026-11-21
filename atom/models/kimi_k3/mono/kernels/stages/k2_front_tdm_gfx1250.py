@@ -672,9 +672,7 @@ def build_replicated_front(
     )
     # The FP8 shared slabs reuse the LDS planned for the BF16 ones, and the
     # shared CTAs start a cluster, so no cluster mixes the two pipelines.
-    assert (
-        sum(tdm_lds_words(rows, 2, True, fp8_depth, group, token_steps)) <= staged
-    )
+    assert sum(tdm_lds_words(rows, 2, True, fp8_depth, group, token_steps)) <= staged
     assert SHARED_PAIR0 % gemv_tdm.CLUSTER_LAUNCH["cluster"][0] == 0
 
     @fx.struct

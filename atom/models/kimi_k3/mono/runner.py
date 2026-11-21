@@ -615,7 +615,9 @@ class K3MonoDecodeRunner:
         self._write_aux(plan.layer_id, out, blocks)
         return out
 
-    def _pre_o_core(self, plan, positions, prefix, blocks, add, add2, project=None):
+    def _pre_o_core(
+        self, plan, positions, prefix, blocks, add, add2, project=None, back=None
+    ):
         """A full-attention layer that runs K2: the production
         attention up to ``o_proj``'s input, to be handed to K2 in place of K1's.
 
@@ -627,12 +629,22 @@ class K3MonoDecodeRunner:
 
         ``project``: the normed row -> the attention's projected inputs
         (``KimiFullAttention._gated_core``'s ``front``), in place of its own
-        projections."""
+        projections.
+
+        ``back`` (with ``project``): where the projection also hands the
+        attention's q_out, ``(o, lse, gate) -> attention output`` takes the
+        decode's partials past ``o_proj`` and its all-reduce
+        (``KimiFullAttention.forward_mono_back``); the core returned is then
+        None, the output ``back``'s to keep."""
         layer, normed, prefix, _, _ = self._seam(plan, prefix, blocks, add, add2)
         if project is None:
             core = layer.self_attn.forward_pre_o(positions, normed)
         else:
-            core = layer.self_attn.forward_pre_o(positions, normed, project(normed))
+            front = project(normed)
+            if back is not None and len(front) > 5:
+                layer.self_attn.forward_mono_back(positions, normed, front, back)
+                return None, prefix
+            core = layer.self_attn.forward_pre_o(positions, normed, front)
         rows = prefix.size(0)
         if (
             core.dim() != 2

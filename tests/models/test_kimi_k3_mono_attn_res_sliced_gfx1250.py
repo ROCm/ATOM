@@ -154,6 +154,7 @@ def test_lds_fits_the_largest_gram_build():
 @pytest.mark.parametrize("gram", (False, True))
 def test_builds_take_the_mix_abi_plus_scratch(cluster, count, addends, gram):
     pytest.importorskip("flydsl", reason="building the kernel needs FlyDSL")
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
     from atom.models.kimi_k3.mono.kernels.stages import attn_res_gfx1250 as mono
     from atom.models.kimi_k3.mono.kernels.stages import (
         attn_res_sliced_gfx1250 as sliced,

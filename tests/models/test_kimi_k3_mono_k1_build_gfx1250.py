@@ -207,6 +207,8 @@ def test_local_build_accepts_the_production_conv_window():
 def test_head_split_counts_only_parts_the_grid_holds_at_once(
     monkeypatch, switch, heads, split
 ):
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
     from atom.models.kimi_k3.mono.kernels.attention import kda_resident_gfx1250
 
     monkeypatch.setenv("ATOM_KIMI_MONO_K1_HEAD_SPLIT", switch)
@@ -221,6 +223,8 @@ def test_head_split_defaults_to_auto(monkeypatch):
 
 
 def test_whole_heads_replace_the_chunk_tasks_by_default(monkeypatch):
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
     from atom.models.kimi_k3.mono.kernels.attention import kda_resident_gfx1250
     from atom.utils import envs
 
@@ -236,6 +240,8 @@ def test_whole_heads_replace_the_chunk_tasks_by_default(monkeypatch):
 
 
 def test_whole_heads_switch_off_keeps_the_chunk_tasks(monkeypatch):
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
     from atom.models.kimi_k3.mono.kernels.attention import kda_resident_gfx1250
 
     monkeypatch.setenv("ATOM_KIMI_MONO_K1_WHOLE_HEADS", "0")
@@ -244,6 +250,8 @@ def test_whole_heads_switch_off_keeps_the_chunk_tasks(monkeypatch):
 
 
 def test_head_split_refuses_other_counts(monkeypatch):
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
     from atom.models.kimi_k3.mono.kernels.attention import kda_resident_gfx1250
 
     monkeypatch.setenv("ATOM_KIMI_MONO_K1_HEAD_SPLIT", "3")
@@ -283,9 +291,7 @@ def test_paired_slabs_by_default_where_four_token_buffers_fit(
         _plan(rows), qlen=qlen, fp8=True, replay_cap=16, replay_window=qlen
     )
     assert lds.paired is paired
-    projection = dict(
-        (field.name, field.bytes) for field in lds.variant("projection").fields
-    )
+    projection = {field.name: field.bytes for field in lds.variant("projection").fields}
     need = gemv_layout.tdm_lds_bytes(
         rows, 2, True, gemv_layout.TDM_FP8_PAIR_DEPTH, group=2
     )
@@ -323,6 +329,8 @@ def test_replay_spec_refuses_an_inconsistent_window(cap, window, message):
 
 
 def test_chunk_recurrence_defaults_off_auto_takes_replay_builds(monkeypatch):
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
     from atom.models.kimi_k3.mono.kernels.attention import kda_resident_gfx1250
     from atom.utils import envs
 
@@ -342,6 +350,8 @@ def test_chunk_recurrence_defaults_off_auto_takes_replay_builds(monkeypatch):
 
 @pytest.mark.parametrize("qlen", range(2, 17))
 def test_chunk_interactions_fit_the_gate_staging(qlen):
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
     from atom.models.kimi_k3.mono.kernels.attention import kda_gfx1250
 
     words = kda_gfx1250.chunk_interaction_words(qlen)
@@ -351,6 +361,8 @@ def test_chunk_interactions_fit_the_gate_staging(qlen):
 
 
 def test_chunk_interactions_of_the_serving_windows():
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
     from atom.models.kimi_k3.mono.kernels.attention import kda_gfx1250
 
     assert kda_gfx1250.chunk_interaction_words(5) == 32
@@ -413,8 +425,65 @@ def test_chunk_form_matches_the_token_recurrence(qlen):
     [(1, 4), (2, 2), (3, 4), (4, 4), (5, 4), (6, 2), (10, 2), (11, 1)],
 )
 def test_replay_auto_split_stops_at_two_for_two_requests(requests, split):
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
     from atom.models.kimi_k3.mono.kernels.attention import kda_resident_gfx1250 as kr
 
     auto = kr._auto_head_split(requests * kr.HEADS, 256)
     assert kr._replay_auto_split(auto, requests) == split
 
+
+def test_head_options_default_to_none(monkeypatch):
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
+    from atom.models.kimi_k3.mono.kernels.attention import kda_resident_gfx1250 as kr
+    from atom.utils import envs
+
+    monkeypatch.delenv("ATOM_KIMI_MONO_K1_HEAD", raising=False)
+    assert envs.ATOM_KIMI_MONO_K1_HEAD == frozenset()
+    assert kr._head_options(True, True) == frozenset()
+
+
+def test_head_options_keep_the_replay_ones_under_replay_alone(monkeypatch):
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
+    from atom.models.kimi_k3.mono.kernels.attention import kda_resident_gfx1250 as kr
+
+    monkeypatch.setenv("ATOM_KIMI_MONO_K1_HEAD", "conv,meta,ks,noack")
+    everything = frozenset({"conv", "meta", "ks", "noack"})
+    assert kr._head_options(True, True) == everything
+    # no whole heads: none; no ReplaySSM: no records, no metadata chain
+    assert kr._head_options(False, True) == frozenset()
+    assert kr._head_options(True, False) == everything - {"meta", "ks"}
+
+
+def test_head_options_refuse_an_unknown_one(monkeypatch):
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
+    from atom.models.kimi_k3.mono.kernels.attention import kda_resident_gfx1250 as kr
+
+    monkeypatch.setenv("ATOM_KIMI_MONO_K1_HEAD", "conv,fast")
+    with pytest.raises(ValueError, match="fast"):
+        kr._head_options(True, True)
+
+
+def test_head_option_letters_are_distinct():
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
+    from atom.models.kimi_k3.mono.kernels.attention import kda_resident_gfx1250 as kr
+
+    letters = list(kr._HEAD_OPTIONS.values())
+    assert len(set(letters)) == len(letters)
+    assert all(len(letter) == 1 for letter in letters)
+
+
+def test_side_waves_issue_none_of_the_rolled_projections_first_copies():
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
+    from atom.models.kimi_k3.mono.kernels.attention import kda_gfx1250
+    from atom.models.kimi_k3.mono.kernels.attention import kda_resident_gfx1250 as kr
+
+    # wave 0 copies the tokens, waves 1 + 2 t and 2 + 2 t task t's weights
+    # (gemv_tdm._project_rolled): "meta" reads its chain on the waves past them
+    assert kda_gfx1250.SIDE_WAVE0 == 1 + 2 * kr.PROJECTION_ROWS_PER_CTA
+    assert kda_gfx1250.SIDE_WAVE0 < 8

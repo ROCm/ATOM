@@ -54,6 +54,19 @@ LINE_ELEMENTS = 2 * PAYLOAD_WORDS
 # gfx12 CPol SCOPE field (bits 4:3): peers on either tray
 SCOPE_SYS = 3 << 3
 VOLATILE = 1 << 31
+# A poll's loads' cache modifier. POLL_VOLATILE, every helper's default: the
+# compiler waits out each load before it issues the next, a memory round trip
+# a source. POLL_TOGETHER: the loads go out back to back and are awaited
+# once; the pause between polls (side-effecting asm) keeps them in the loop.
+# A caller opts in by passing ``modifier=POLL_TOGETHER`` to ``_load_lines``,
+# ``_poll_lines`` or ``_poll_lines7`` (``k2_oproj_ar_gfx1250``'s alike).
+POLL_VOLATILE = SCOPE_SYS | VOLATILE
+POLL_TOGETHER = SCOPE_SYS
+# a tool build's marks in ``epochs`` past its MAX_CTAS counters: thread 0's
+# polls a CTA from POLLS_WORD, then the give-up mark (GAVE_UP | CTA)
+POLLS_WORD = 256
+GAVE_UP_WORD = 512
+GAVE_UP = 0x7AB00000
 REDUCE_WIDTH = LATENT + HIDDEN
 assert REDUCE_WIDTH % LINE_ELEMENTS == 0
 
@@ -124,8 +137,10 @@ GATHER_SEEN, GATHER_END = 4, 5
 GATHER_DRAINED = 6
 
 
-def _load_lines(mine, ats):
-    """Every source's copy of a line, all loads in flight together."""
+def _load_lines(mine, ats, modifier=SCOPE_SYS | VOLATILE):
+    """Every source's copy of a line. ``modifier``: with VOLATILE (the
+    default) the compiler waits out each load before it issues the next, a
+    round trip a copy; without, the loads are in flight together."""
     words = []
     for at in ats:
         line = fx.Vector(
@@ -134,7 +149,7 @@ def _load_lines(mine, ats):
                 at,
                 vec_width=LINE_WORDS,
                 dtype=T.i32,
-                cache_modifier=SCOPE_SYS | VOLATILE,
+                cache_modifier=modifier,
             )
         )
         words.extend(line[w] for w in range(LINE_WORDS))
@@ -150,16 +165,79 @@ def _stale(words, sources, epoch):
 
 
 @traced
-def _poll_lines(mine, ats, epoch):
+def _poll_lines(mine, ats, epoch, modifier=SCOPE_SYS | VOLATILE):
     """Every source's copy of a line (words ``ats`` of this rank's bank) once
     all carry ``epoch``, re-loaded together while any is stale: one round trip
     after the last source lands, not one a source. A copy stays until launch
     ``epoch + 2``, and each 16 B load sees a copy whole."""
-    words = _load_lines(mine, ats)
+    words = _load_lines(mine, ats, modifier)
     while _stale(words, len(ats), epoch):
         spin_pause()
-        words = _load_lines(mine, ats)
+        words = _load_lines(mine, ats, modifier)
     return words
+
+
+@traced
+def _poll_lines_test(mine, ats, key, seven, modifier, bound, marks, bid, tid):
+    """Tool builds: ``_poll_lines`` (``seven``: ``_poll_lines7``) giving up
+    past ``bound`` re-loads, marking ``marks[GAVE_UP_WORD]``; thread 0's
+    re-loads, where any, into ``marks[POLLS_WORD + CTA]``."""
+    words = _load_lines(mine, ats, modifier)
+    polls = fx.Int32(0)
+    while _stale_of(words, len(ats), key, seven) & (polls < bound):
+        spin_pause()
+        words = _load_lines(mine, ats, modifier)
+        polls = polls + 1
+    if polls >= bound:
+        st_dev(fx.Int32(GAVE_UP) | bid, marks, GAVE_UP_WORD)
+    if (tid == 0) & (polls > 0):
+        st_dev(polls, marks, POLLS_WORD + bid)
+    return words
+
+
+def _stale_of(words, sources, key, seven):
+    return _stale7(words, sources, key) if seven else _stale(words, sources, key)
+
+
+def poll_context(poll_together, poll_bound, marks, bid, tid):
+    """What ``_poll`` takes: None for the default polls (their ISA as ever),
+    else the modifier and, for a tool build, the bound and its marks."""
+    if not poll_together and poll_bound is None:
+        return None
+    return {
+        "modifier": POLL_TOGETHER if poll_together else POLL_VOLATILE,
+        "bound": poll_bound,
+        "marks": marks,
+        "bid": bid,
+        "tid": tid,
+    }
+
+
+def _poll(pc, mine, ats, key, seven=False):
+    if pc is None:
+        return _poll_lines7(mine, ats, key) if seven else _poll_lines(mine, ats, key)
+    if pc["bound"] is None:
+        if seven:
+            return _poll_lines7(mine, ats, key, pc["modifier"])
+        return _poll_lines(mine, ats, key, pc["modifier"])
+    return _poll_lines_test(
+        mine, ats, key, seven, pc["modifier"], pc["bound"], pc["marks"], pc["bid"],
+        pc["tid"],
+    )  # fmt: skip
+
+
+def _sleeps(units):
+    """TEST ONLY: ``units`` sleeps of 31 * 64 clocks (about 0.9 us each)."""
+    for _ in range(units):
+        llvm.InlineAsmOp(None, [], "s_sleep 31", "", has_side_effects=True)
+
+
+def _swapped(line, lines, threads):
+    """TEST ONLY: the line a thread polls and reduces in place of its own --
+    its partner CTA's, where both are lines -- so every line is still reduced
+    once, by a CTA that did not push it."""
+    partner = line ^ threads
+    return ((partner < lines) & (line < lines)).select(partner, line)
 
 
 def _store_line_sys(address, line):
@@ -317,27 +395,34 @@ def _push_gathered(c, line, routed, live, first_token):
         second = words[1]
         third = words[2]
     gpu.barrier()
-    if live:
-        _push_line(
-            c["bases"],
-            c["rank"],
-            c["lines"],
-            c["bank"],
-            c["epoch"],
-            line,
-            [first, second, third],
-        )
+    if const_expr(c.get("late")):  # noqa: SIM102
+        if c["bid"] % 2 == 1:
+            _sleeps(c["late"])
+    if const_expr(not c.get("skip_push")):  # noqa: SIM102
+        if live:
+            _push_line(
+                c["bases"],
+                c["rank"],
+                c["lines"],
+                c["bank"],
+                c["epoch"],
+                line,
+                [first, second, third],
+            )
 
 
 @traced
-def _reduce_lines(data, mine, tp, lines, bank, epoch, line, last, stride):
+def _reduce_lines(data, mine, tp, lines, bank, epoch, line, last, stride, pc=None):
     """Lines ``line``, ``line + stride``, .. below ``last``: every source's copy
     once it carries ``epoch``, summed in rank order in fp32 from rank 0's, to
-    bf16 in this rank's partials."""
+    bf16 in this rank's partials. ``pc``: ``poll_context``'s."""
     local = rsrc(data)
     while line < last:
-        got = _poll_lines(
-            mine, [bank + (p * lines + line) * LINE_WORDS for p in range(tp)], epoch
+        got = _poll(
+            pc,
+            mine,
+            [bank + (p * lines + line) * LINE_WORDS for p in range(tp)],
+            epoch,
         )
         sums = []
         for p in range_constexpr(tp):
@@ -403,7 +488,14 @@ def build_allreduce(tp: int, rows: int) -> K2AllReduceKernel:
     return K2AllReduceKernel(name, launch, (ctas,), (threads,), ctas)
 
 
-def _build_gather_allreduce6(tp: int, rows: int) -> K2AllReduceKernel:
+def _build_gather_allreduce6(
+    tp: int,
+    rows: int,
+    poll_together: bool = False,
+    poll_bound: int | None = None,
+    test_skip_push: bool = False,
+    test_swap_late: int | None = None,
+) -> K2AllReduceKernel:
     """``build_allreduce`` whose routed lines this rank computes itself: AITER's
     MoE gather-reduce of ``grouped`` (the grouped MoE's gemm2 rows, BF16) by
     the routes' rows and weights (``[rows, TOPK]`` i32 and f32), bit for bit,
@@ -417,7 +509,9 @@ def _build_gather_allreduce6(tp: int, rows: int) -> K2AllReduceKernel:
         raise ValueError(f"the gathering all-reduce takes a line a thread at {rows}")
     routed_lines = -(-rows * LATENT // LINE_ELEMENTS)
     bank_words = tp * lines * LINE_WORDS
-    name = f"k3_k2_gfx1250_gather_allreduce_tp{tp}_s{rows}"
+    name = f"k3_k2_gfx1250_gather_allreduce_tp{tp}_s{rows}" + _poll_suffix(
+        poll_together, poll_bound, test_skip_push, test_swap_late
+    )
 
     @fx.struct
     class Lds:
@@ -459,13 +553,27 @@ def _build_gather_allreduce6(tp: int, rows: int) -> K2AllReduceKernel:
                 "grouped": rsrc(grouped),
                 "routes": lds.routes.ptr,
                 "local": rsrc(data),
+                "bid": bid,
+                "skip_push": test_skip_push,
+                "late": test_swap_late,
             },
             line,
             line < routed_lines,
             line < lines,
             first_token,
         )
-        _reduce_lines(data, mine, tp, lines, bank, epoch, line, fx.Int32(lines), lines)
+        _reduce_lines(
+            data,
+            mine,
+            tp,
+            lines,
+            bank,
+            epoch,
+            line if test_swap_late is None else _swapped(line, lines, threads),
+            fx.Int32(lines),
+            lines,
+            poll_context(poll_together, poll_bound, epochs, bid, tid),
+        )
         gpu.barrier()
         counter = bid + tid * ctas
         if counter < MAX_CTAS:
@@ -545,12 +653,12 @@ def _stale7(words, sources, tag):
 
 
 @traced
-def _poll_lines7(mine, ats, tag):
+def _poll_lines7(mine, ats, tag, modifier=SCOPE_SYS | VOLATILE):
     """``_poll_lines`` of seven-element lines, tagged in their top 16 bits."""
-    words = _load_lines(mine, ats)
+    words = _load_lines(mine, ats, modifier)
     while _stale7(words, len(ats), tag):
         spin_pause()
-        words = _load_lines(mine, ats)
+        words = _load_lines(mine, ats, modifier)
     return words
 
 
@@ -578,18 +686,30 @@ def _store_seven(local, element, values):
 
 
 @traced
-def _push_reduce7(local, mine, bases, rank, tp, lines, bank, tag, line, values, stamp):
+def _push_reduce7(
+    local, mine, bases, rank, tp, lines, bank, tag, line, values, stamp, pc=None,
+    push=True, target=None,
+):  # fmt: skip
     """Line ``line``'s seven values pushed to every rank, then every rank's
-    copy reduced in rank order in fp32 and stored back as BF16."""
+    copy reduced in rank order in fp32 and stored back as BF16. ``pc``:
+    ``poll_context``'s. TEST ONLY: ``push`` False pushes nothing; ``target``
+    is the line polled and reduced in place of ``line``."""
     words = [_pack(values[2 * w], values[2 * w + 1]) for w in range(3)]
     words.append((_pack(values[6], fx.Float32(0.0)) & fx.Int32(0xFFFF)) | (tag << 16))
     out = fx.Vector.from_elements(words, fx.Int32)
     at = fx.Int64(bank + (rank * lines + line) * LINE_WORDS) * 4
-    for base in bases:
-        _store_line_sys(base + at, out)
+    if const_expr(push):
+        for base in bases:
+            _store_line_sys(base + at, out)
     stamp(GATHER_PUSHED)
-    got = _poll_lines7(
-        mine, [bank + (p * lines + line) * LINE_WORDS for p in range(tp)], tag
+    if const_expr(target is not None):
+        line = target
+    got = _poll(
+        pc,
+        mine,
+        [bank + (p * lines + line) * LINE_WORDS for p in range(tp)],
+        tag,
+        seven=True,
     )
     stamp(GATHER_SEEN)
     reduced = None
@@ -648,8 +768,32 @@ def _prefetch_gather7(data, grouped, route_rows, route_weights, rows, lines, bid
         )
 
 
+def _poll_suffix(poll_together, poll_bound, test_skip_push, test_swap_late):
+    """A build's name past the default's: the polls' and the tool knobs'."""
+    return (
+        ("_pt" if poll_together else "")
+        + ("" if poll_bound is None else f"_b{poll_bound}")
+        + ("_np" if test_skip_push else "")
+        + ("" if test_swap_late is None else f"_sw{test_swap_late}")
+    )
+
+
+def _check_test_knobs(poll_bound, test_skip_push, test_swap_late):
+    if test_skip_push and poll_bound is None:
+        raise ValueError("a build that pushes nothing takes a poll bound")
+    if test_swap_late is not None and test_swap_late < 0:
+        raise ValueError("test_swap_late counts sleeps")
+
+
 def build_gather_allreduce(
-    tp: int, rows: int, profile: bool = False, prepush_barrier: bool | None = None
+    tp: int,
+    rows: int,
+    profile: bool = False,
+    prepush_barrier: bool | None = None,
+    poll_together: bool | None = None,
+    poll_bound: int | None = None,
+    test_skip_push: bool = False,
+    test_swap_late: int | None = None,
 ) -> K2AllReduceKernel:
     """``build_allreduce`` whose routed lines this rank computes itself: AITER's
     MoE gather-reduce of ``grouped`` (the grouped MoE's gemm2 rows, BF16) by
@@ -658,11 +802,25 @@ def build_gather_allreduce(
     a thread, while those fit MAX_CTAS CTAs; six-element ones past that.
     ``profile``: ``GATHER_STAMPS`` i32 a CTA to a trailing ``stamps``
     argument. ``prepush_barrier`` (``ATOM_KIMI_MONO_GATHER_AR_PREPUSH_BARRIER``):
-    the CTA's barrier between the gathers and the pushes."""
+    the CTA's barrier between the gathers and the pushes. ``poll_together``
+    (default ``ATOM_KIMI_MONO_GATHER_AR_POLL_TOGETHER`` at more than one
+    rank): a poll's loads of the ranks' copies go out together and are
+    awaited once (``POLL_TOGETHER``); the same lines at the same addresses.
+    Tool builds only, never the runner's: ``poll_bound`` (polls give up past
+    it and mark ``epochs[GAVE_UP_WORD]``, thread 0's polls a CTA from
+    ``epochs[POLLS_WORD]``: ``epochs`` then holds GAVE_UP_WORD + 1 words),
+    ``test_skip_push`` (no line is pushed) and ``test_swap_late`` (a CTA
+    reduces its partner CTA's lines, the odd CTAs pushing that many sleeps
+    late: lines that land while they are polled)."""
+    if poll_together is None:
+        poll_together = envs.ATOM_KIMI_MONO_GATHER_AR_POLL_TOGETHER and tp > 1
+    _check_test_knobs(poll_bound, test_skip_push, test_swap_late)
     lines = allreduce7_lines(rows)
     if lines > MAX_CTAS * THREADS:
         assert not profile
-        return _build_gather_allreduce6(tp, rows)
+        return _build_gather_allreduce6(
+            tp, rows, poll_together, poll_bound, test_skip_push, test_swap_late
+        )
     if prepush_barrier is None:
         prepush_barrier = envs.ATOM_KIMI_MONO_GATHER_AR_PREPUSH_BARRIER
     from atom.models.kimi_k3.mono.kernels.stages.moe_tdm_gfx1250 import _realtime
@@ -674,7 +832,7 @@ def build_gather_allreduce(
         f"k3_k2_gfx1250_gather_allreduce7_tp{tp}_s{rows}"
         f"{'' if prepush_barrier else '_nb'}{'_profile' if profile else ''}"
         f"{fresh.suffix('gather')}"
-    )
+    ) + _poll_suffix(poll_together, poll_bound, test_skip_push, test_swap_late)
 
     @fx.struct
     class Lds:
@@ -766,6 +924,9 @@ def build_gather_allreduce(
         if const_expr(prepush_barrier):
             gpu.barrier()
         stamp(GATHER_GATHERED)
+        if const_expr(test_swap_late):  # noqa: SIM102
+            if bid % 2 == 1:
+                _sleeps(test_swap_late)
         if live:
             _push_reduce7(
                 local,
@@ -779,6 +940,9 @@ def build_gather_allreduce(
                 line,
                 [v0, v1, v2, v3, v4, v5, v6],
                 stamp,
+                poll_context(poll_together, poll_bound, epochs, bid, tid),
+                not test_skip_push,
+                None if test_swap_late is None else _swapped(line, lines, THREADS),
             )
         gpu.barrier()
         stamp(GATHER_END)

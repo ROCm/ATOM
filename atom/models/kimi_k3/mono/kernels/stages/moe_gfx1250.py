@@ -228,7 +228,7 @@ def stage_route(c, token, front_payload_words=0):
     contiguous = "contiguous_logits" in c and c["contiguous_logits"]
     # HERD routing keeps TOPK + 1 candidates with their raw sigmoid scores;
     # the MoE drops one and renormalizes.
-    width = TOPK + 1 if "herd" in c and c["herd"] else TOPK
+    width = TOPK + 1 if c.get("herd") else TOPK
     if wave == 0:
         per_lane = EXPERTS // GFX1250.wave_size
         scores = []
@@ -461,7 +461,7 @@ def stage_route_cta(c, token, front_payload_words=0):
     split_bound = c.get("split_bound", False)
     own = c.get("own_candidates", False)
     contiguous = "contiguous_logits" in c and c["contiguous_logits"]
-    width = TOPK + 1 if "herd" in c and c["herd"] else TOPK
+    width = TOPK + 1 if c.get("herd") else TOPK
     per_thread = (EXPERTS + threads - 1) // threads
     scores = []
     sigmoid = []
@@ -578,7 +578,7 @@ def _route_cta_place(c, token, survivors):
     one's."""
     lane = c["lane"]
     lds = c["route_lds"]
-    width = TOPK + 1 if "herd" in c and c["herd"] else TOPK
+    width = TOPK + 1 if c.get("herd") else TOPK
     # read here: a method called in a branch makes ``c`` its traced state
     candidates_cm = c.get("candidates_cm", CM_DEV)
     # The top ``width`` to their ranks: a wave's LDS accesses are in order.
@@ -691,7 +691,11 @@ def _herd_drop_scan(c, my_id, my_value, my_pop, lane, live, kp1):
     drop_value = readlane(my_value, 0)
     drop_pop = readlane(my_pop, 0)
     for j in range(fx.Int32(1), fx.Int32(kp1), unroll=1):
-        j_id, j_value, j_pop = readlane(my_id, j), readlane(my_value, j), readlane(my_pop, j)
+        j_id, j_value, j_pop = (
+            readlane(my_id, j),
+            readlane(my_value, j),
+            readlane(my_pop, j),
+        )
         take = (j_pop < drop_pop) | (
             (j_pop == drop_pop)
             & ((j_value < drop_value) | ((j_value == drop_value) & (j_id < drop_id)))
@@ -851,7 +855,10 @@ def stage_herd_token(c, rows, token):
         tdm_timeline.stamp(tdm_timeline.LITE_HERD_DROPPED)
         if kept:
             bo.buffer_store(
-                my_id, rsrc(c["topk_ids"]), token * TOPK + place, cache_modifier=store_cm
+                my_id,
+                rsrc(c["topk_ids"]),
+                token * TOPK + place,
+                cache_modifier=store_cm,
             )
             bo.buffer_store(
                 my_value * scale,
@@ -959,7 +966,10 @@ def stage_herd_token_local(c, rows, token, survivors):
         tdm_timeline.stamp(tdm_timeline.LITE_HERD_DROPPED)
         if live & (lane != drop):
             bo.buffer_store(
-                own_id, rsrc(c["topk_ids"]), token * TOPK + place, cache_modifier=store_cm
+                own_id,
+                rsrc(c["topk_ids"]),
+                token * TOPK + place,
+                cache_modifier=store_cm,
             )
             bo.buffer_store(
                 own_value * drop_scale,

@@ -1,6 +1,11 @@
+import pytest
+
 from atom.models.kimi_k3.mono.kernels.execution_plan import (
     Gfx1250KimiBuildPlan,
 )
+
+pytest.importorskip("flydsl", reason="the K3 gfx1250 mono kernels are FlyDSL")
+
 from atom.models.kimi_k3.mono.kernels.stages.k2_front_role_lds_gfx1250 import (
     ATTENTION_CTAS,
     ROLE_LDS_FRONT_ABI,

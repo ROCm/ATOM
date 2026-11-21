@@ -9,6 +9,11 @@ Run on one gfx1250 GPU:
   ROWS=8,40 QLEN=8 WINDOW=8 python tools/kimi_k3_mono_k1_phase.py
 TL=0 times only; RAW=prefix saves the stamp words to prefix_<rows>.pt;
 OUT=prefix one launch's core/state/conv to prefix_<rows>.pt (bitwise checks).
+The stamps are converted at one rate, the CTAs' median cycles a realtime
+tick: the counter runs ~1.9-2.0 GHz while the grid projects and ~2.3 GHz once
+only the head CTAs are left, so a CTA that outlives the projection reads
+about 20% long here. scratch/k1abs.py converts between realtime anchors
+(``tdm_timeline.anchor``) and reports the points from the launch's first entry.
 AB=<switch env> times the switch off against on (ABBA, RUNS rounds).
 SECS=s: sustained (s of back-to-back replays a segment, the GFX clock from
 amdsmi index SMI_GPU, /opt/rocm/share/amd_smi on PYTHONPATH): the AB
@@ -22,15 +27,16 @@ import sys
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import kimi_k3_mono_k1_replay_check as rc  # noqa: E402
-from atom.models.kimi_k3.mono.kernels.execution_plan import (  # noqa: E402
-    Gfx1250KimiBuildPlan,
-)
-from atom.models.kimi_k3.mono.kernels.attention.kda_builder_gfx1250 import (  # noqa: E402
+import kimi_k3_mono_k1_replay_check as rc
+
+from atom.models.kimi_k3.mono.kernels.attention.kda_builder_gfx1250 import (
     REPLAY_TABLE,
 )
-from atom.models.kimi_k3.mono.kernels.stages import tdm_timeline as tl  # noqa: E402
-from atom.mono.runtime.compile import launcher_resources  # noqa: E402
+from atom.models.kimi_k3.mono.kernels.execution_plan import (
+    Gfx1250KimiBuildPlan,
+)
+from atom.models.kimi_k3.mono.kernels.stages import tdm_timeline as tl
+from atom.mono.runtime.compile import launcher_resources
 
 WIDTHS = [int(r) for r in os.environ.get("ROWS", "8,40").split(",")]
 COPIES = int(os.environ.get("COPIES", "8"))
@@ -41,17 +47,37 @@ HREC = int(os.environ.get("H", "5"))
 dev, QLEN = rc.dev, rc.QLEN
 weights = [rc.w_in] + [rc.w_in.clone() for _ in range(COPIES - 1)]
 
-PROJ_POINTS = ["gemv_start", "issued", "s0_T", "s0_W", "s0_B", "s0_C",
-               "s1_C", "last_C", "project_done", "staged", "stores_issued",
-               "stores_done", "recurrence"]
-HEAD_POINTS = ["head_start", "head_polled", "head_conv", "head_gate_mma",
-               "head_gate_sync", "head_gates", "head_recur", "head_exchanged",
-               "head_done"]
+PROJ_POINTS = [
+    "gemv_start",
+    "issued",
+    "s0_T",
+    "s0_W",
+    "s0_B",
+    "s0_C",
+    "s1_C",
+    "last_C",
+    "project_done",
+    "staged",
+    "stores_issued",
+    "stores_done",
+    "recurrence",
+]
+HEAD_POINTS = [
+    "head_start",
+    "head_polled",
+    "head_conv",
+    "head_gate_mma",
+    "head_gate_sync",
+    "head_gates",
+    "head_recur",
+    "head_exchanged",
+    "head_done",
+]
 SLABS = rc.HIDDEN // 512
 
 
 def point_index(name):
-    if name.startswith("s0_") or name.startswith("s1_") or name == "last_C":
+    if name.startswith(("s0_", "s1_")) or name == "last_C":
         slab = {"s0": 0, "s1": 1, "last": SLABS - 1}[name.split("_")[0]]
         which = {"T": tl.TOKEN, "W": tl.WEIGHT, "B": tl.B, "C": tl.C}[name[-1]]
         return tl.SLAB0 + tl.SLAB_WORDS * slab + which
@@ -66,7 +92,9 @@ def inputs(rows):
     rs = torch.randn((slots, rc.NH, rc.HD, rc.HD), generator=rc.gen, device=dev) * 0.05
     acc = torch.full((req,), QLEN, device=dev, dtype=torch.int32)
     if not REPLAY:
-        st = (torch.arange(req * QLEN, device=dev, dtype=torch.int32) + req).view(req, QLEN)
+        st = (torch.arange(req * QLEN, device=dev, dtype=torch.int32) + req).view(
+            req, QLEN
+        )
         st[:, 0] = torch.arange(req, device=dev, dtype=torch.int32)
         return [prefix, conv, rs, st, acc, None]
     # ReplaySSM (kimi_k3_mono_k1_replay_bench's): one checkpoint a request,
@@ -74,20 +102,34 @@ def inputs(rows):
     slot_idx = torch.arange(req, device=dev, dtype=torch.int32)
     st = torch.full((req, QLEN), -1, dtype=torch.int32, device=dev)
     st[:, 0] = slot_idx
-    bufs = [rc.bf16(slots, rc.NH, rc.CAP, rc.HD, scale=0.05),
-            rc.bf16(slots, rc.NH, rc.CAP, rc.HD, scale=0.05),
-            -torch.rand((slots, rc.NH, rc.CAP, rc.HD), generator=rc.gen, device=dev) * 0.1]
+    bufs = [
+        rc.bf16(slots, rc.NH, rc.CAP, rc.HD, scale=0.05),
+        rc.bf16(slots, rc.NH, rc.CAP, rc.HD, scale=0.05),
+        -torch.rand((slots, rc.NH, rc.CAP, rc.HD), generator=rc.gen, device=dev) * 0.1,
+    ]
     write_pos = torch.full((slots,), HREC, dtype=torch.int32, device=dev)
-    named = {"slot_idx": slot_idx, "write_pos": write_pos,
-             "rbuf_k": bufs[0], "rbuf_u": bufs[1], "rbuf_g": bufs[2]}
-    table = torch.tensor([named[n].data_ptr() for n in REPLAY_TABLE],
-                         dtype=torch.int64, device=dev)
+    named = {
+        "slot_idx": slot_idx,
+        "write_pos": write_pos,
+        "rbuf_k": bufs[0],
+        "rbuf_u": bufs[1],
+        "rbuf_g": bufs[2],
+    }
+    table = torch.tensor(
+        [named[n].data_ptr() for n in REPLAY_TABLE], dtype=torch.int64, device=dev
+    )
     return [prefix, conv, rs, st, acc, table, named]
 
 
 def resources(k1):
-    return [{k: r[k] for k in ("vgpr", "sgpr", "vgpr_spill", "sgpr_spill", "scratch", "lds") if k in r}
-            for r in launcher_resources(k1.entrypoint.launcher)]
+    return [
+        {
+            k: r[k]
+            for k in ("vgpr", "sgpr", "vgpr_spill", "sgpr_spill", "scratch", "lds")
+            if k in r
+        }
+        for r in launcher_resources(k1.entrypoint.launcher)
+    ]
 
 
 def graph_for(k1, held, rows):
@@ -96,14 +138,35 @@ def graph_for(k1, held, rows):
     core = torch.zeros((rows, rc.PROJ), dtype=torch.bfloat16, device=dev)
     runtimes = [
         rc.K1LocalRuntime(
-            prefix=prefix, delta=None, blocks=blk1, blk_sm=blk1.stride(0),
-            blk_sr=blk1.stride(1), ares_nw=rc.in_nw, ares_qk=rc.in_nw, in_nw=rc.in_nw,
-            w_in=weights[i % COPIES], w_in_scale=rc.w_in_scale, w_fb=rc.w_fb,
-            conv_w=rc.conv_w, conv_st=conv, cs_seq=conv.stride(0),
-            cs_dim=conv.stride(1), cs_tok=conv.stride(2), a_log=rc.a_log,
-            dt_bias=rc.dt_bias, on_w=rc.on_w, rstate=rs, rs_seq=rs.stride(0),
-            st_idx=st, st_stride=st.stride(0), num_acc=acc, core_out=core,
-            core_q=None, core_scale=None, replay=table)
+            prefix=prefix,
+            delta=None,
+            blocks=blk1,
+            blk_sm=blk1.stride(0),
+            blk_sr=blk1.stride(1),
+            ares_nw=rc.in_nw,
+            ares_qk=rc.in_nw,
+            in_nw=rc.in_nw,
+            w_in=weights[i % COPIES],
+            w_in_scale=rc.w_in_scale,
+            w_fb=rc.w_fb,
+            conv_w=rc.conv_w,
+            conv_st=conv,
+            cs_seq=conv.stride(0),
+            cs_dim=conv.stride(1),
+            cs_tok=conv.stride(2),
+            a_log=rc.a_log,
+            dt_bias=rc.dt_bias,
+            on_w=rc.on_w,
+            rstate=rs,
+            rs_seq=rs.stride(0),
+            st_idx=st,
+            st_stride=st.stride(0),
+            num_acc=acc,
+            core_out=core,
+            core_q=None,
+            core_scale=None,
+            replay=table,
+        )
         for i in range(LAUNCHES)
     ]
     k1(runtimes[0], stream=torch.cuda.current_stream())
@@ -119,7 +182,9 @@ def graph_for(k1, held, rows):
 def time_us(g, runs=7):
     out = []
     for _ in range(runs):
-        a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
+            enable_timing=True
+        )
         g.replay()
         a.record()
         g.replay()
@@ -152,10 +217,17 @@ def phases(words):
                 rows[name] = ((launch[stamped, p] - cyc0[stamped]) % m32).float() / f
         rows["ghz"] = torch.tensor([f / 1000.0])
         for k, v in rows.items():
-            per.setdefault(k, []).append((float(v.median()), float(v.max()), int(v.numel())))
-    return {k: [round(statistics.median(x[0] for x in v), 2),
-                round(statistics.median(x[1] for x in v), 2),
-                v[0][2]] for k, v in per.items()}
+            per.setdefault(k, []).append(
+                (float(v.median()), float(v.max()), int(v.numel()))
+            )
+    return {
+        k: [
+            round(statistics.median(x[0] for x in v), 2),
+            round(statistics.median(x[1] for x in v), 2),
+            v[0][2],
+        ]
+        for k, v in per.items()
+    }
 
 
 class Clock:
@@ -169,14 +241,30 @@ class Clock:
 
             amdsmi.amdsmi_init()
             handle = amdsmi.amdsmi_get_processor_handles()[int(os.environ["SMI_GPU"])]
+
             def read():
                 power = amdsmi.amdsmi_get_power_info(handle)
-                watts = next((power[k] for k in ("current_socket_power", "socket_power",
-                              "average_socket_power") if isinstance(power.get(k), (int, float))), None)
-                return amdsmi.amdsmi_get_clock_info(handle, amdsmi.AmdSmiClkType.GFX)["clk"], watts
+                watts = next(
+                    (
+                        power[k]
+                        for k in (
+                            "current_socket_power",
+                            "socket_power",
+                            "average_socket_power",
+                        )
+                        if isinstance(power.get(k), (int, float))
+                    ),
+                    None,
+                )
+                return (
+                    amdsmi.amdsmi_get_clock_info(handle, amdsmi.AmdSmiClkType.GFX)[
+                        "clk"
+                    ],
+                    watts,
+                )
 
             self._read = read
-        except Exception:
+        except Exception:  # noqa: BLE001
             self._read = None
 
     def start(self):
@@ -218,7 +306,11 @@ def sustained_us(g, seconds, clock=None):
         for _ in range(20):
             g.replay()
         torch.cuda.synchronize()
-    a, b, n = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True), 0
+    a, b, n = (
+        torch.cuda.Event(enable_timing=True),
+        torch.cuda.Event(enable_timing=True),
+        0,
+    )
     a.record()
     while time.time() - begin < seconds:
         for _ in range(20):
@@ -238,8 +330,9 @@ def abba(switch):
     seconds = float(os.environ.get("SECS", "0"))
     clock = Clock() if seconds else None
     for rows in WIDTHS:
-        plan = Gfx1250KimiBuildPlan(threads=256, blocks=256, lds_bytes=320 * 1024,
-                                    tokens=rows, nblocks=1)
+        plan = Gfx1250KimiBuildPlan(
+            threads=256, blocks=256, lds_bytes=320 * 1024, tokens=rows, nblocks=1
+        )
         graphs, names, held = {}, {}, []
         for value in ("0", "1"):
             os.environ[switch] = value
@@ -257,11 +350,24 @@ def abba(switch):
                     clocks[value].append((mhz.get("mhz_med"), mhz.get("w_med")))
                 else:
                     times[value].append(time_us(graphs[value]))
-        print(json.dumps({"rows": rows, "qlen": QLEN, "switch": switch, "names": names,
-                          "secs": seconds, "mhz_off": clocks["0"], "mhz_on": clocks["1"],
-                          "off": times["0"], "on": times["1"],
-                          "median_off": statistics.median(times["0"]),
-                          "median_on": statistics.median(times["1"])}), flush=True)
+        print(
+            json.dumps(
+                {
+                    "rows": rows,
+                    "qlen": QLEN,
+                    "switch": switch,
+                    "names": names,
+                    "secs": seconds,
+                    "mhz_off": clocks["0"],
+                    "mhz_on": clocks["1"],
+                    "off": times["0"],
+                    "on": times["1"],
+                    "median_off": statistics.median(times["0"]),
+                    "median_on": statistics.median(times["1"]),
+                }
+            ),
+            flush=True,
+        )
 
 
 def main():
@@ -269,19 +375,27 @@ def main():
         abba(os.environ["AB"])
         return
     for rows in WIDTHS:
-        plan = Gfx1250KimiBuildPlan(threads=256, blocks=256, lds_bytes=320 * 1024,
-                                    tokens=rows, nblocks=1)
+        plan = Gfx1250KimiBuildPlan(
+            threads=256, blocks=256, lds_bytes=320 * 1024, tokens=rows, nblocks=1
+        )
         tl.disable()
         k1 = plan.make_k1_local_runner(rc.spec(rows, REPLAY)).prepare(dev)
         if os.environ.get("OUT"):
             prefix, conv, rs, st, acc, table, *_ = inputs(rows)
             core, _ = rc.k1_run(k1, prefix, conv, rs, st, acc, table)
             torch.cuda.synchronize()
-            torch.save([t.cpu() for t in (core, rs, conv)], f"{os.environ['OUT']}_{rows}.pt")
+            torch.save(
+                [t.cpu() for t in (core, rs, conv)], f"{os.environ['OUT']}_{rows}.pt"
+            )
         held = list(inputs(rows))
         us = time_us(graph_for(k1, held, rows))
-        report = {"rows": rows, "qlen": QLEN, "us": us, "name": k1.entrypoint.name,
-                  "resources": resources(k1)}
+        report = {
+            "rows": rows,
+            "qlen": QLEN,
+            "us": us,
+            "name": k1.entrypoint.name,
+            "resources": resources(k1),
+        }
         if TIMELINE:
             buf = torch.zeros(tl.buffer_words(LAUNCHES), dtype=torch.int32, device=dev)
             tl.enable(buf.data_ptr(), LAUNCHES)
@@ -295,12 +409,16 @@ def main():
             if seconds:
                 # sustained: the stamps are the last of SECS of back-to-back
                 # replays (each launch's slot is overwritten in turn)
-                report["sustained_us_timeline"], report["sustained_clock"] = sustained_us(
-                    g, seconds, Clock())
+                report["sustained_us_timeline"], report["sustained_clock"] = (
+                    sustained_us(g, seconds, Clock())
+                )
             else:
                 g.replay()
             torch.cuda.synchronize()
-            words = buf[tl.CTAS:].view(LAUNCHES, tl.CTAS, tl.WORDS).cpu().long() & 0xFFFFFFFF
+            words = (
+                buf[tl.CTAS :].view(LAUNCHES, tl.CTAS, tl.WORDS).cpu().long()
+                & 0xFFFFFFFF
+            )
             if os.environ.get("RAW"):
                 torch.save(words, f"{os.environ['RAW']}_{rows}.pt")
             report["phases_med_max_n"] = phases(words)

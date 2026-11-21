@@ -389,6 +389,7 @@ def test_a_replay_buffer_too_long_for_the_lds_is_refused_by_name():
     default cache_len fits; one long enough that the records pass the LDS is
     a named refusal (``lds_refusal``), not a failed compile."""
     pytest.importorskip("flydsl", reason="the K3 K1 kernel module needs FlyDSL")
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
     from atom.models.kimi_k3.mono.kernels.attention import kda as k1
 
     def key(cap, window):
@@ -414,7 +415,10 @@ def test_a_lean_width_restages_only_the_spilled_k1_builds(monkeypatch):
     keyed on them moved to the lean key, K2 untouched."""
     pytest.importorskip("flydsl", reason="importing the K3 mono runner needs FlyDSL")
     pytest.importorskip("aiter", reason="the K3 mono runner imports aiter.dist")
+    pytest.importorskip("triton", reason="the kernel under test needs triton")
     from atom.models.kimi_k3.mono import runner
+
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
     from atom.models.kimi_k3.mono.kernels.attention import kda as k1
 
     monkeypatch.setattr(k1, "build", lambda key: ("lean", key.nblocks))

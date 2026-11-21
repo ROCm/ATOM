@@ -72,6 +72,7 @@ def test_a_declined_width_is_logged_once_per_distinct_row_count(monkeypatch, cap
 def runner_module():
     pytest.importorskip("flydsl", reason="importing the K3 mono runner needs FlyDSL")
     pytest.importorskip("aiter", reason="the K3 mono runner imports aiter.dist")
+    pytest.importorskip("triton", reason="the kernel under test needs triton")
     from atom.models.kimi_k3.mono import runner
 
     return runner
@@ -109,6 +110,7 @@ def test_prepare_builds_a_width_only_inside_the_cap(
 def test_the_peer_buffer_doubles_from_8_to_16_rows(runner_module):
     """The buffer is sized for the cap and zeroed whole at every step's start
     (``StepMailboxes.begin_step``), so a cap of 16 also costs the 8-row steps."""
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
     from atom.models.kimi_k3.mono.kernels import layer as k2
 
     assert k2.peer_bytes(16) == 2 * k2.peer_bytes(8)
@@ -118,6 +120,8 @@ def test_a_16_row_build_stages_the_x_row_in_slabs(runner_module):
     """One slab at 8 rows is the build that was always there; 16 rows' whole
     7168-wide row does not fit gfx950's LDS, so the GEMV walks the column groups
     in order through several slabs, each fitting."""
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
     from atom.models.kimi_k3.mono.kernels.attention import kda
 
     assert kda.slab_plan(8) == [(0, kda.PER_WAVE)]

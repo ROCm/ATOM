@@ -126,7 +126,11 @@ def _scalar_byte(ptr, index):
 def _words(ptr, index, count, cache_modifier=0):
     loaded = fx.Vector(
         bo.buffer_load(
-            rsrc(ptr), index, vec_width=count, dtype=T.i32, cache_modifier=cache_modifier
+            rsrc(ptr),
+            index,
+            vec_width=count,
+            dtype=T.i32,
+            cache_modifier=cache_modifier,
         )
     )
     return [fx.Int32(loaded[i]) for i in range_constexpr(count)]
@@ -287,10 +291,15 @@ def _project(c, lds, lane, wave):
     x_codes = []
     for tile in range_constexpr(tiles):
         token = fx.min(fx.Int32(tile * ROWS) + lane % ROWS, fx.Int32(rows - 1))
-        row = token * (lay.Q_LORA // 4) + (quarter * lay.K_QUARTER + lane_group * 16) // 4
+        row = (
+            token * (lay.Q_LORA // 4) + (quarter * lay.K_QUARTER + lane_group * 16) // 4
+        )
         tokens.append(
             [
-                [_words(c["q_fp8"], row + (QUANT_BYTES * g + 32 * k) // 4, 4) for k in range(4)]
+                [
+                    _words(c["q_fp8"], row + (QUANT_BYTES * g + 32 * k) // 4, 4)
+                    for k in range(4)
+                ]
                 for g in range(lay.QUARTER_GROUPS)
             ]
         )
@@ -340,7 +349,9 @@ def _project(c, lds, lane, wave):
     sums = lds + lay.HEADS_PER_CLUSTER * lay.HEAD_TASKS * lay.K_QUARTERS * QUARTER_WORDS
     for t in range_constexpr(lay.HEAD_TASKS):
         for tile in range_constexpr(tiles):
-            slot = ((job * lay.HEAD_TASKS + t) * tiles + tile) * lay.K_QUARTERS + quarter
+            slot = (
+                (job * lay.HEAD_TASKS + t) * tiles + tile
+            ) * lay.K_QUARTERS + quarter
             fx.ptr_store(
                 accs[t][tile].bitcast(fx.Int32),
                 sums + (slot * LANES + lane) * ACC,
@@ -356,7 +367,16 @@ def _project(c, lds, lane, wave):
         pair = item // (LANES * tiles * lay.HEAD_TASKS)
         token = tile * ROWS + sum_lane % ROWS
         if (item < items) & (token < rows):
-            base = sums + (((pair * lay.HEAD_TASKS + task) * tiles + tile) * lay.K_QUARTERS * LANES + sum_lane) * ACC
+            base = (
+                sums
+                + (
+                    ((pair * lay.HEAD_TASKS + task) * tiles + tile)
+                    * lay.K_QUARTERS
+                    * LANES
+                    + sum_lane
+                )
+                * ACC
+            )
             total = None
             for q in range_constexpr(lay.K_QUARTERS):
                 part = fx.Vector(
@@ -432,7 +452,8 @@ def _absorb(c, uk, lds, lane, wave):
     ).bitcast(fx.Float32)
     one = _splat(fx.Int32(E8M0_ONE))
     weights = [
-        [_fp8_operand(uk[u][s], one) for s in range(UK_STEPS)] for u in range(lay.UK_TASKS)
+        [_fp8_operand(uk[u][s], one) for s in range(UK_STEPS)]
+        for u in range(lay.UK_TASKS)
     ]
     operands = []
     for tile in range_constexpr(tiles):
@@ -463,14 +484,21 @@ def _absorb(c, uk, lds, lane, wave):
             acc = fx.Vector.filled(ACC, 0.0, fx.Float32)
             for s in range_constexpr(UK_STEPS):
                 acc = mma_bf16(weights[u][s], b[s], acc, GFX1250)
-            n0 = rank * lay.UK_ROWS + quarter * lay.UK_WAVE_ROWS + u * ROWS + lane_group * ACC
+            n0 = (
+                rank * lay.UK_ROWS
+                + quarter * lay.UK_WAVE_ROWS
+                + u * ROWS
+                + lane_group * ACC
+            )
             words = [
                 _pack(acc[2 * i] * scale, acc[2 * i + 1] * scale)
                 for i in range_constexpr(ACC // 2)
             ]
             if live & (c["ql_nope"] != 0):
                 _store_words(
-                    words, c["ql_nope"], ((out_token * heads + head) * lay.KV_LORA + n0) // 2
+                    words,
+                    c["ql_nope"],
+                    ((out_token * heads + head) * lay.KV_LORA + n0) // 2,
                 )
             nope = _nope_fp8(words)
             nope = [zero.select(fx.Int32(0), w) for w in nope]
@@ -522,7 +550,9 @@ def _uk_weights(c, lane, wave):
         out.append(
             [
                 [
-                    _words(c["w_uk"], row + (32 * s + 16 * half + lane_group * 8) // 4, 2)
+                    _words(
+                        c["w_uk"], row + (32 * s + 16 * half + lane_group * 8) // 4, 2
+                    )
                     for half in range(2)
                 ]
                 for s in range(UK_STEPS)
@@ -549,7 +579,9 @@ def _cache(c, token, tid):
                 base = token * (lay.ROPE // 2)
                 x = _words(c["k_rope"], base + rope * 4, 4)
                 y = _words(c["k_rope"], base + (rope ^ 4) * 4, 4)
-                _store_words(_rope_fp8(x, y, rope < 4), entry, lay.KV_LORA // 4 + rope * 2)
+                _store_words(
+                    _rope_fp8(x, y, rope < 4), entry, lay.KV_LORA // 4 + rope * 2
+                )
         pad_words = (c["out_heads"] - c["heads"]) * lay.ENTRY // 16
         if const_expr(pad_words > 0):
             first = (token * c["q_out_row"] + c["heads"] * lay.ENTRY) // 4

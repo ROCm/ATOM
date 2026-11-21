@@ -359,6 +359,7 @@ def test_only_a_layer_with_a_built_front_projects_through_it(runner_module):
 
 
 def test_the_launch_reads_the_layer_and_runner_buffers(runner_module, monkeypatch):
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
     from atom.models.kimi_k3.mono.kernels.stages import mla_front_gfx1250 as mf
 
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: "stream")
@@ -435,6 +436,7 @@ def test_a_built_front_reaches_the_attention_through_pre_o_core(runner_module):
 
 def test_pre_o_core_hands_the_projection_of_the_normed_row(monkeypatch):
     pytest.importorskip("flydsl", reason="the K3 mono runner imports FlyDSL")
+    pytest.importorskip("triton", reason="the kernel under test needs triton")
     from atom.models.kimi_k3.mono import runner as base
     from atom.models.kimi_k3.mono.config import Dims
 

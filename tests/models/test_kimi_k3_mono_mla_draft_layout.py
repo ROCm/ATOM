@@ -99,6 +99,7 @@ def test_the_q_quant_constants_are_the_kernels():
 
 def test_the_draft_absorbs_lds_fits_every_width():
     pytest.importorskip("flydsl", reason="the draft absorb module imports FlyDSL")
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
     from atom.models.kimi_k3.mono.kernels.stages import mla_absorb_draft_gfx1250 as ma
 
     for rows in range(1, MAX_ROWS + 1):

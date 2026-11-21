@@ -37,6 +37,7 @@ def test_no_full_attention_layer_closes_a_block():
 def test_k2_tags_stay_clear_of_k1_s():
     pytest.importorskip("flydsl", reason="importing the K3 mono runner needs FlyDSL")
     pytest.importorskip("aiter", reason="the K3 mono runner imports aiter.dist")
+    pytest.importorskip("triton", reason="the kernel under test needs triton")
     from atom.models.kimi_k3.mono.runner import K2_TAG0
 
     k1_tags = {i + 1 for i in range(LAYERS)}  # ``Mailbox``: tag = layer + 1
@@ -155,6 +156,7 @@ def test_no_kda_layer_still_refuses(stub_binds):
 def runner_module():
     pytest.importorskip("flydsl", reason="importing the K3 mono runner needs FlyDSL")
     pytest.importorskip("aiter", reason="the K3 mono runner imports aiter.dist")
+    pytest.importorskip("triton", reason="the kernel under test needs triton")
     from atom.models.kimi_k3.mono import runner
 
     return runner
@@ -295,6 +297,7 @@ def test_k2_builds_cover_full_attention_layers_and_k1_builds_do_not(runner_modul
 # ----------------------------------------------------------- forward_pre_o
 def test_forward_pre_o_is_forward_without_o_proj():
     try:
+        pytest.importorskip("aiter", reason="the kernel under test needs aiter")
         from atom.models.kimi_k3.model import KimiFullAttention
     except ImportError as error:  # the model module imports the GPU stack
         pytest.skip(f"atom.models.kimi_k3.model needs the GPU stack: {error}")

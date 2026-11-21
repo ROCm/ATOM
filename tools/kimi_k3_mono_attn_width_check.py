@@ -143,7 +143,11 @@ for rows in WIDTHS:
     report["front_repeat_mismatch"] = sum(
         int((run_front(x)[n] != wide[n]).sum().item()) for n in wide
     )
-    blocks, prefix, add = bf16(rows, NB + 1, HIDDEN), bf16(rows, HIDDEN), bf16(rows, HIDDEN)
+    blocks, prefix, add = (
+        bf16(rows, NB + 1, HIDDEN),
+        bf16(rows, HIDDEN),
+        bf16(rows, HIDDEN),
+    )
     ref = triton_attn_res(blocks, prefix, add)
     for sliced in (True, False):
         tag = "sliced" if sliced else "mix"

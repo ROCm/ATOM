@@ -49,7 +49,9 @@ def build():
             soft = soft | (nibble << (4 * k))
         hard = fx.Int32(
             rocdl_dialect.cvt_scalef32_pk8_fp4_bf16(
-                T.i32, as_ir_value(values), as_ir_value((code << 23).bitcast(fx.Float32))
+                T.i32,
+                as_ir_value(values),
+                as_ir_value((code << 23).bitcast(fx.Float32)),
             )
         )
         if FIXED:
@@ -100,8 +102,15 @@ print(
             "ordinary_mismatched": int(ordinary.sum()),
             "mismatched_codes": sorted(set(bad.nonzero()[:, 0].tolist())),
             "examples": [
-                {"code": c, "bf16": hex(v), "soft": int(soft[c, v]), "hard": int(hard[c, v])}
-                for c, v in (ordinary if ordinary.any() else bad).nonzero().tolist()[:16]
+                {
+                    "code": c,
+                    "bf16": hex(v),
+                    "soft": int(soft[c, v]),
+                    "hard": int(hard[c, v]),
+                }
+                for c, v in (ordinary if ordinary.any() else bad)
+                .nonzero()
+                .tolist()[:16]
             ],
         }
     ),

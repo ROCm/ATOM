@@ -1525,9 +1525,15 @@ class MLAAttention(nn.Module):
         )
 
     @mark_trace(prefix="dcp_decode", torch_compile=False)
-    def _dcp_decode(self, q_out, kv_cache, attn_metadata, use_qrep, q_prepadded=False):
+    def _dcp_decode(
+        self, q_out, kv_cache, attn_metadata, use_qrep, q_prepadded=False, back=None
+    ):
         """Decode under DCP: gather the group's query heads, decode locally with
         LSE, then merge the partials across ranks.
+
+        ``back``: ``(o, lse) -> attention output`` in place of
+        ``_dcp_project_merge_out`` (the Kimi-K3 mono MLA back half,
+        ``mla_back_gfx1250``): the decode's partials as that would take them.
 
         QREP skips the gather -- q_out already carries the full group head set
         from the replicated q_proj + W_K_qrep. Only real heads cross the wire;
@@ -1543,6 +1549,8 @@ class MLAAttention(nn.Module):
         o, lse = self._forward_decode(
             q_out, kv_cache, attn_metadata, return_lse=True, q_prepadded=q_prepadded
         )
+        if back is not None:
+            return back(o, lse)
         owned_counts = (
             attn_metadata.dcp_owned_counts[: q_out.shape[0]]
             if self.is_sparse_mla and attn_metadata.dcp_owned_counts is not None
@@ -3381,7 +3389,7 @@ class MLAAttention(nn.Module):
         return output
 
     def forward_decode_q_out(
-        self, q_out: torch.Tensor, prepadded: bool = False
+        self, q_out: torch.Tensor, prepadded: bool = False, back=None
     ) -> torch.Tensor:
         """``forward_impl``'s dense decode from its ``q_out`` on: the caller
         has produced q_out and written the step's KV-cache entries exactly as
@@ -3390,7 +3398,8 @@ class MLAAttention(nn.Module):
         DCP group's heads under QREP, else this rank's, padded where
         ``_fused_q_head_pad`` folds the pad in. ``prepadded`` (DCP): q_out is
         already at ``dcp_kernel_num_heads``, the pad heads zero, as
-        ``_pad_decode_query_heads`` would leave it."""
+        ``_pad_decode_query_heads`` would leave it. ``back`` (DCP only):
+        ``_dcp_decode``'s, the decode's partials to the attention output."""
         forward_context: ForwardContext = get_forward_context()
         attn_metadata = forward_context.attn_metadata
         kv_cache = forward_context.kv_cache_data[f"layer_{self.layer_num}"].k_cache
@@ -3401,9 +3410,20 @@ class MLAAttention(nn.Module):
                 False,
                 envs.ATOM_DCP_PREFILL_QREP,
             )
+            if back is None:
+                return self._dcp_decode(
+                    q_out, kv_cache, attn_metadata, use_qrep, q_prepadded=prepadded
+                )
             return self._dcp_decode(
-                q_out, kv_cache, attn_metadata, use_qrep, q_prepadded=prepadded
+                q_out,
+                kv_cache,
+                attn_metadata,
+                use_qrep,
+                q_prepadded=prepadded,
+                back=back,
             )
+        if back is not None:
+            raise ValueError("the back half takes the DCP decode's partials")
         return self._forward_decode(
             q_out,
             kv_cache,

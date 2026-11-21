@@ -70,6 +70,8 @@ def _fp8_linear(gen, dev, rows, cols, scale):
     from aiter import QuantType, dtypes
     from aiter.ops.shuffle import shuffle_weight
 
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    pytest.importorskip("triton", reason="the kernel under test needs triton")
     from atom.quantization.quark.utils import quant_weight_online
 
     q, s = quant_weight_online(
@@ -97,6 +99,7 @@ def _raw(t):
 def _group_quant(q_c, q_w, kv_c, kv_w):
     from aiter import QuantType, dtypes
 
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
     from atom.models.deepseek_v2 import _fused_rms_fp8_quant
 
     q8, qs, _, kv, _ = _fused_rms_fp8_quant(
@@ -112,6 +115,7 @@ def _group_quant(q_c, q_w, kv_c, kv_w):
 def test_the_front_is_productions_bits(rows):
     from aiter import dtypes, gemm_a8w8_blockscale_bpreshuffle
 
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
     from atom.model_ops.linear import per_1x128_e8m0_quant
     from atom.models.kimi_k3.mono import draft_dispatch
 
@@ -174,6 +178,7 @@ def test_the_absorb_is_productions_bits(heads, out_heads, rows):
     )
     from aiter.rotary_embedding import get_rope
 
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
     from atom.model_ops.utils import dynamic_per_batched_tensor_quant
     from atom.models.kimi_k3.mono import draft_dispatch
 

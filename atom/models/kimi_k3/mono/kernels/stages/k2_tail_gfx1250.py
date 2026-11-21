@@ -34,6 +34,25 @@ CTA, no split waves): the CTA gathers its lines before it issues the first
 up-weight slabs, so its gathers' loads do not queue behind them; it pushes
 them in the prologue as before.
 
+Polls together (``ATOM_KIMI_MONO_TAIL_POLL_TOGETHER``, off by default): a
+poll's loads of the ranks' copies of a line (and of a routed line's partner)
+carry no VOLATILE, so the compiler issues them back to back and waits once;
+with it, it waits out each load before it issues the next, and a poll takes
+a memory round trip a rank (about 0.4 us each: 2.0 to 2.5 us a poll at four
+ranks, 3.5 to 4.7 us at eight, one GPU, the peers' banks local). The polled
+lines and addresses are the same; the pause between polls keeps the loads in
+the loop. More than one rank only: at one rank the first poll, issued right
+behind the CTA's own local pushes, would return before they land and pay a
+retry (the whole TP1 layer 0.5 us slower at 16 rows).
+
+Resident GEMV (``ATOM_KIMI_MONO_TAIL_RESIDENT``, off by default; up to
+``tail_resident_rows()`` rows, where every up-weight slab and token slab fits
+the LDS): TAIL_DEPTH weight slabs are issued ahead of the gathers and the
+rest once the CTA's lines are pushed, under the all-reduce; once the flags
+are seen the token slabs are issued, every copy is awaited once, and the
+slabs are multiplied with no barrier between them (the ring's two barriers a
+slab were most of the finalize's time at these widths).
+
 Split waves (``ATOM_KIMI_MONO_TAIL_SPLIT``): the CTA's lines go through LDS
 to waves [0, 4), which push them, two a thread, while waves [4, 8) poll and
 reduce them, two a thread, and store the reduced (or normalized) lines. A
@@ -53,7 +72,7 @@ from flydsl.expr.typing import Int32, Int64, T
 
 from atom.models.kimi_k3.mono.config import HIDDEN, LATENT, MAX_ROWS, TOPK
 from atom.models.kimi_k3.mono.kernels.stages import fresh_prefetch_gfx1250 as fresh
-from atom.models.kimi_k3.mono.kernels.stages import gemv_gfx1250
+from atom.models.kimi_k3.mono.kernels.stages import gemv_gfx1250, tdm_timeline
 from atom.models.kimi_k3.mono.kernels.stages import gemv_tdm_gfx1250 as gemv_tdm
 from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
     TDM_CLUSTER,
@@ -66,7 +85,9 @@ from atom.models.kimi_k3.mono.kernels.stages.k2_allreduce_gfx1250 import (
     LINE7_ROUTED,
     LINE_WORDS,
     MAX_CTAS,
+    SCOPE_SYS,
     THREADS,
+    VOLATILE,
     _load_lines,
     _pack,
     _poll_lines7,
@@ -121,7 +142,39 @@ PUSH_THREADS = PUSH_WAVES * GFX1250.wave_size
 SPLIT_LINES = THREADS // PUSH_THREADS
 assert THREADS - PUSH_THREADS == PUSH_THREADS
 SPLIT_AR_WORDS = AR_WORDS + THREADS * LINE_WORDS + THREADS * LINE7_ELEMENTS
-STAMPS = 8
+STAMPS = 20
+# a profile build's points, thread 0's shader cycle counter (low word), kept
+# in LDS and copied out at the CTA's end: entry, the first weight slabs
+# issued, every thread's lines gathered, the pushes issued, thread 0's lines
+# polled, a routed row in LDS (every thread's lines polled, the pushes
+# acked), its rstd, the reduced (normed) lines' stores issued, drained, the
+# flag issued, every flag seen, the GEMV done, the end; the 100 MHz clock at
+# entry (P_RT0) and at the end (P_RT1), which convert the cycles; a spy
+# CTA's (one with no all-reduce share polling a routed CTA's lines): thread
+# 0's lines seen, every thread's; the later weight slabs issued (P_MORE)
+(
+    P_START,
+    P_ISSUED,
+    P_GATHERED,
+    P_PUSHED,
+    P_POLLED,
+    P_ROW,
+    P_RSTD,
+    P_STORED,
+    P_DRAINED,
+    P_FLAG,
+    P_SEEN,
+    P_GEMV,
+    P_END,
+    P_RT0,
+    P_SPY,
+    P_SPY_ALL,
+    P_RT1,
+    P_MORE,
+    P_SPARE0,
+    P_SPARE1,
+) = range(STAMPS)
+SPY_BOUND = 1 << 20
 TAIL_DEPTH = 3
 # a bounded (scratch) build's give-up mark: flags[GAVE_UP_WORD] = GAVE_UP | CTA,
 # past every CTA's flag and stamps
@@ -175,11 +228,24 @@ def tail_rounds(rows: int) -> int:
     return -(-tail_ar_ctas(rows) // tail_grid(rows))
 
 
+def tail_resident_rows() -> int:
+    """The widest whose every up-weight slab and token slab fit the LDS."""
+    rows = 0
+    while rows < tail_line_rows():
+        try:
+            if tail_layout(rows + 1, SLABS - 1).tokens != SLABS:
+                break
+        except ValueError:
+            break
+        rows += 1
+    return rows
+
+
 def tail_flag_words(profile: bool = False, bounded: bool = False) -> int:
     """``flags``: a word a CTA, then with ``profile`` STAMPS a CTA; a
     ``bounded`` build's through ``GAVE_UP_WORD``."""
     if bounded:
-        return GAVE_UP_WORD + 1
+        return GAVE_UP_WORD + 1 + MAX_CTAS
     return MAX_CTAS * (1 + (STAMPS if profile else 0))
 
 
@@ -202,6 +268,14 @@ def tail_split() -> bool:
 
 def tail_early_gather() -> bool:
     return envs.ATOM_KIMI_MONO_TAIL_EARLY_GATHER
+
+
+def tail_poll_together() -> bool:
+    return envs.ATOM_KIMI_MONO_TAIL_POLL_TOGETHER
+
+
+def tail_resident() -> bool:
+    return envs.ATOM_KIMI_MONO_TAIL_RESIDENT
 
 
 def tail_layout(
@@ -283,9 +357,189 @@ def _normalize(x, gain, rstd):
 
 
 @traced
-def _stamp(flags, bid, tid, index):
+def _stamp(record, tid, index):
+    """Thread 0's cycle counter at point ``index`` into the CTA's LDS record
+    (a global store a point would make every barrier wait for it)."""
     if tid == 0:
-        st_dev(fx.Int32(_realtime()), flags, MAX_CTAS + bid * STAMPS + index)
+        fx.ptr_store(tdm_timeline._cycles(), record + index)
+
+
+@traced
+def _stamps_open(record, tid):
+    """The record zeroed (a point a CTA never passes reads 0), then the
+    100 MHz clock."""
+    if tid < STAMPS:
+        fx.ptr_store(fx.Int32(0), record + tid)
+    if tid == 0:
+        fx.ptr_store(fx.Int32(_realtime()), record + P_RT0)
+
+
+@traced
+def _stamps_close(record, flags, bid, tid):
+    if tid == 0:
+        fx.ptr_store(fx.Int32(_realtime()), record + P_RT1)
+    if tid < STAMPS:
+        st_dev(
+            fx.Int32(fx.ptr_load(record + tid)), flags, MAX_CTAS + bid * STAMPS + tid
+        )
+
+
+def _push_delay(units):
+    """TEST ONLY: hold the pushes back ``units`` sleeps of 31 * 64 clocks
+    (about a microsecond each at 2 GHz), as a longer fabric hop would the
+    lines."""
+    for _ in range(units):
+        llvm.InlineAsmOp(None, [], "s_sleep 31", "", has_side_effects=True)
+
+
+def tail_helpers_max(rows: int) -> int:
+    """The most helper CTAs a routed share's lines can be dealt to (8, 4, 2,
+    1; 0: none): the grid's CTAs with no all-reduce share."""
+    if tail_rounds(rows) > 1:
+        return 0
+    spare = tail_grid(rows) - tail_ar_ctas(rows)
+    for n in (8, 4, 2, 1):
+        if 2 * rows * n <= spare:
+            return n
+    return 0
+
+
+def tail_push_lines(rows: int, helpers: int = 0) -> dict:
+    """``{(CTA, thread): line}`` of the all-reduce lines the grid pushes (a
+    share a CTA): the kernel's own arithmetic, for a host-side audit."""
+    ar_ctas, grid = tail_ar_ctas(rows), tail_grid(rows)
+    out = {}
+    for bid in range(grid):
+        for tid in range(THREADS):
+            if not helpers:
+                if bid < ar_ctas:
+                    out[bid, tid] = bid * THREADS + tid
+                continue
+            per = THREADS // helpers
+            j = bid - ar_ctas
+            if 0 <= j < 2 * rows * helpers:
+                if tid < per:
+                    share = j % (2 * rows)
+                    out[bid, tid] = share * THREADS + j // (2 * rows) * per + tid
+            elif 2 * rows <= bid < ar_ctas:
+                out[bid, tid] = bid * THREADS + tid
+    return out
+
+
+@traced
+def _send_line(c, line, values):
+    """Line ``line``'s seven values, tagged, to every rank."""
+    words = [_pack(values[2 * w], values[2 * w + 1]) for w in range(3)]
+    words.append(
+        (_pack(values[6], fx.Float32(0.0)) & fx.Int32(0xFFFF)) | (c["tag"] << 16)
+    )
+    out = fx.Vector.from_elements(words, fx.Int32)
+    at = fx.Int64(c["bank"] + (c["rank"] * c["lines"] + line) * LINE_WORDS) * 4
+    for base in c["bases"]:
+        _store_line_sys(base + at, out)
+
+
+@traced
+def _ar_push_helped(c):
+    """``_ar_push`` with helpers (identity routes): a routed share's lines
+    are gathered and pushed by ``c["helpers"]`` CTAs with no all-reduce share
+    (CTA ``ar_ctas + j``: share ``j % (2 rows)``'s lines from
+    ``j // (2 rows) * THREADS / helpers``, a line a thread of its first
+    waves), so a routed CTA pushes nothing -- it loads its norm weights and
+    polls -- and a CU gathers ``THREADS / helpers`` lines' TOPK picks. The
+    shared CTAs push their own lines as before. The same lines, values and
+    addresses: who pushes a routed line is all that changes."""
+    tid, bid = c["tid"], c["bid"]
+    rows, ar_ctas, n = c["rows"], c["ar_ctas"], c["helpers"]
+    per = THREADS // n
+    j = bid - ar_ctas
+    helper = (j >= 0) & (j < 2 * rows * n)
+    share = helper.select(j % (2 * rows), fx.min(bid, 2 * rows - 1))
+    at = helper.select(j // (2 * rows) * per, fx.Int32(0)) + tid
+    token = share // 2
+    gather = helper & (tid < per)
+    shared = (bid >= 2 * rows) & (bid < ar_ctas)
+    if const_expr(c["fused"]):
+        weights = []
+        for quad in range_constexpr(TOPK // 4):
+            loaded = fx.Vector(ld_dev(c["route_weights"], token * TOPK + 4 * quad, 4))
+            weights.extend(fx.Int32(loaded[k]).bitcast(fx.Float32) for k in range(4))
+    else:
+        loaded = fx.Vector(
+            bo.buffer_load(
+                rsrc(c["route_weights"]),
+                token * TOPK,
+                vec_width=TOPK,
+                dtype=T.i32,
+                is_scalar=True,
+            )
+        )
+        weights = [fx.Int32(loaded[k]).bitcast(fx.Float32) for k in range(TOPK)]
+    v0 = v1 = v2 = v3 = v4 = v5 = v6 = fx.Float32(0.0)
+    g0 = g1 = g2 = g3 = g4 = g5 = g6 = fx.Float32(0.0)
+    if gather:
+        column = (share % 2) * HALF + at * LINE7_ELEMENTS
+        source = rsrc(c["grouped"])
+        picks = [
+            _seven(source, (token * TOPK + k) * LATENT + column, _load_cm(c))
+            for k in range(TOPK)
+        ]
+        sums = []
+        for i in range_constexpr(LINE7_ELEMENTS):
+            total = fx.Float32(0.0)
+            for pick, weight in zip(picks, weights):
+                total = total + weight * (fx.Float32(0.0) + pick[i])
+            sums.append(bf16_round(total))
+        v0, v1, v2, v3, v4, v5, v6 = sums
+    elif shared:
+        v0, v1, v2, v3, v4, v5, v6 = _seven(
+            c["local"], (bid * THREADS + tid) * LINE7_ELEMENTS, _load_cm(c)
+        )
+    if bid < 2 * rows:
+        g0, g1, g2, g3, g4, g5, g6 = _seven(
+            rsrc(c["norm_weight"]), (bid % 2) * HALF + tid * LINE7_ELEMENTS
+        )
+    gpu.barrier()
+    if const_expr(c["profile"]):
+        _stamp(c["record"], tid, P_GATHERED)
+    # TEST ONLY delay: the pushing threads' alone, so a routed CTA polls
+    # while its lines are still to come
+    if gather | shared:
+        if const_expr(c["push_delay"]):
+            _push_delay(c["push_delay"])
+        if const_expr(not c["skip_push"]):
+            _send_line(
+                c,
+                gather.select(share * THREADS + at, bid * THREADS + tid),
+                [v0, v1, v2, v3, v4, v5, v6],
+            )
+    if const_expr(c["profile"]):
+        _stamp(c["record"], tid, P_PUSHED)
+    return [g0, g1, g2, g3, g4, g5, g6]
+
+
+@traced
+def _spy(c):
+    """Profile only: a CTA with no all-reduce share polls routed CTA
+    ``bid % (2 rows)``'s lines and their partners' as that CTA does (bounded),
+    stamping thread 0's and every thread's."""
+    tp, lines, bank = c["tp"], c["lines"], c["bank"]
+    tid, bid = c["tid"], c["bid"]
+    if bid >= c["ar_ctas"]:
+        line = (bid % (2 * c["rows"])) * THREADS + tid
+        partner = line ^ THREADS
+        ats = [bank + (p * lines + line) * LINE_WORDS for p in range(tp)] + [
+            bank + (p * lines + partner) * LINE_WORDS for p in range(tp)
+        ]
+        words = _load_lines(c["mine"], ats)
+        polls = fx.Int32(0)
+        while _stale7(words, len(ats), c["tag"]) & (polls < SPY_BOUND):
+            spin_pause()
+            words = _load_lines(c["mine"], ats)
+            polls = polls + 1
+        _stamp(c["record"], tid, P_SPY)
+        _lds_barrier()
+        _stamp(c["record"], tid, P_SPY_ALL)
 
 
 @traced
@@ -371,27 +625,49 @@ def _row_square_sum(row, squares, tid, lane, wave, lds_only=False):
 
 
 @traced
-def _poll_lines7_bounded(mine, ats, tag, flags, bid, bound):
+def _poll_lines7_bounded(mine, ats, tag, flags, bid, bound, modifier, tid):
     """``_poll_lines7`` giving up past ``bound`` polls, marking
-    ``flags[GAVE_UP_WORD]`` (scratch builds only)."""
-    words = _load_lines(mine, ats)
+    ``flags[GAVE_UP_WORD]``; thread 0's polls into
+    ``flags[GAVE_UP_WORD + 1 + CTA]`` (scratch builds only)."""
+    words = _load_lines(mine, ats, modifier)
     polls = fx.Int32(0)
     while _stale7(words, len(ats), tag) & (polls < bound):
         spin_pause()
-        words = _load_lines(mine, ats)
+        words = _load_lines(mine, ats, modifier)
         polls = polls + 1
     if polls >= bound:
         st_dev(fx.Int32(GAVE_UP) | bid, flags, GAVE_UP_WORD)
+    if (tid == 0) & (polls > 0):
+        st_dev(polls, flags, GAVE_UP_WORD + 1 + bid)
+    return words
+
+
+@traced
+def _poll_lines7_counted(mine, ats, tag, record, tid, modifier):
+    """``_poll_lines7`` counting its loads (thread 0's into P_SPARE0)."""
+    words = _load_lines(mine, ats, modifier)
+    polls = fx.Int32(1)
+    while _stale7(words, len(ats), tag):
+        spin_pause()
+        words = _load_lines(mine, ats, modifier)
+        polls = polls + 1
+    if tid == 0:
+        fx.ptr_store(polls, record + P_SPARE0)
     return words
 
 
 def _poll7(c, ats):
     """Every source's copy of the lines at ``ats`` once all carry the tag."""
+    if const_expr(c["profile"] and c["bound"] is None):
+        return _poll_lines7_counted(
+            c["mine"], ats, c["tag"], c["record"], c["tid"], c["poll_cm"]
+        )
     if const_expr(c["bound"] is None):
-        return _poll_lines7(c["mine"], ats, c["tag"])
+        return _poll_lines7(c["mine"], ats, c["tag"], c["poll_cm"])
     return _poll_lines7_bounded(
-        c["mine"], ats, c["tag"], c["flags"], c["bid"], c["bound"]
-    )
+        c["mine"], ats, c["tag"], c["flags"], c["bid"], c["bound"], c["poll_cm"],
+        c["tid"],
+    )  # fmt: skip
 
 
 @traced
@@ -410,32 +686,45 @@ def _routed_finish(c, line, gains):
     own = _reduced(got, 0, tp)
     other = _reduced(got, tp, tp)
     if const_expr(c["profile"]):
-        _stamp(c["flags"], bid, tid, 6)
+        _stamp(c["record"], tid, P_POLLED)
     half = bid % 2
     row = c["row"]
     for k in range_constexpr(LINE7_ELEMENTS):
         fx.ptr_store(own[k], row + half * HALF + tid * LINE7_ELEMENTS + k)
         fx.ptr_store(other[k], row + (1 - half) * HALF + tid * LINE7_ELEMENTS + k)
-    gpu.barrier()
-    total = _row_square_sum(row, c["squares"], tid, lane, wave)
+    if const_expr(c["lds_barriers"]):
+        _lds_barrier()
+    else:
+        gpu.barrier()
+    if const_expr(c["profile"]):
+        _stamp(c["record"], tid, P_ROW)
+    total = _row_square_sum(
+        row, c["squares"], tid, lane, wave, lds_only=c["lds_barriers"]
+    )
     mean = fx.Float32(
         fx.Float64(total * _rcp(fx.Float32(float(LATENT)))) + fx.Float64(c["eps"])
     )
     rstd = hw_rsq(mean)
     if const_expr(c["profile"]):
-        _stamp(c["flags"], bid, tid, 7)
+        _stamp(c["record"], tid, P_RSTD)
     _store_seven_dev(
         c["local"],
         line * LINE7_ELEMENTS,
         [_normalize(x, g, rstd) for x, g in zip(own, gains)],
     )
+    if const_expr(c["profile"]):
+        _stamp(c["record"], tid, P_STORED)
 
 
 @traced
 def _shared_finish(c, line):
     tp, lines, bank = c["tp"], c["lines"], c["bank"]
     got = _poll7(c, [bank + (p * lines + line) * LINE_WORDS for p in range(tp)])
+    if const_expr(c["profile"]):
+        _stamp(c["record"], c["tid"], P_POLLED)
     _store_seven_dev(c["local"], line * LINE7_ELEMENTS, _reduced(got, 0, tp))
+    if const_expr(c["profile"]):
+        _stamp(c["record"], c["tid"], P_STORED)
 
 
 def _load_cm(c):
@@ -450,6 +739,8 @@ def _ar_push(c, gathered=None):
     ``identity`` routes, route ``k`` of token ``t`` is row ``t * TOPK + k``
     of ``grouped`` (the fused MoE's), its gathers issued at once.
     ``gathered``: ``_ar_gather``'s, done already."""
+    if const_expr(c["helpers"]):
+        return _ar_push_helped(c)
     values, gains = _ar_gather(c) if gathered is None else gathered
     if const_expr(c["split"]):
         _split_push(c, values, gains)
@@ -458,8 +749,18 @@ def _ar_push(c, gathered=None):
     # in flight holds back the gathers' loads behind them
     gpu.barrier()
     if const_expr(c["profile"]):
-        _stamp(c["flags"], c["bid"], c["tid"], 5)
-    _ar_send(c, values)
+        _stamp(c["record"], c["tid"], P_GATHERED)
+    if const_expr(c["push_delay"]):
+        _push_delay(c["push_delay"])
+    if const_expr(c["late_odd"]):  # noqa: SIM102
+        # TEST ONLY: a routed row's even CTA polls its partner's lines while
+        # they land
+        if c["bid"] % 2 == 1:
+            _push_delay(c["late_odd"])
+    if const_expr(not c["skip_push"]):
+        _ar_send(c, values)
+    if const_expr(c["profile"]):
+        _stamp(c["record"], c["tid"], P_PUSHED)
     return gains
 
 
@@ -494,7 +795,24 @@ def _ar_gather(c):
             rows_of = [token * TOPK + k for k in range(TOPK)]
             weights = []
             for quad in range_constexpr(TOPK // 4):
-                loaded = fx.Vector(ld_dev(c["route_weights"], token * TOPK + 4 * quad, 4))
+                loaded = fx.Vector(
+                    ld_dev(c["route_weights"], token * TOPK + 4 * quad, 4)
+                )
+                weights.extend(
+                    fx.Int32(loaded[k]).bitcast(fx.Float32) for k in range(4)
+                )
+        elif const_expr(c["identity"] and c["vector_weights"]):
+            rows_of = [token * TOPK + k for k in range(TOPK)]
+            weights = []
+            for quad in range_constexpr(TOPK // 4):
+                loaded = fx.Vector(
+                    bo.buffer_load(
+                        rsrc(c["route_weights"]),
+                        token * TOPK + 4 * quad,
+                        vec_width=4,
+                        dtype=T.i32,
+                    )
+                )
                 weights.extend(
                     fx.Int32(loaded[k]).bitcast(fx.Float32) for k in range(4)
                 )
@@ -564,7 +882,7 @@ def _split_push(c, values, gains):
             fx.ptr_store(gains[k], c["gains"] + tid * LINE7_ELEMENTS + k)
     _lds_barrier()
     if const_expr(c["profile"]):
-        _stamp(c["flags"], bid, tid, 5)
+        _stamp(c["record"], tid, P_GATHERED)
     if (bid < c["ar_ctas"]) & c["pusher"]:
         for k in range_constexpr(SPLIT_LINES):
             t = tid + k * PUSH_THREADS
@@ -606,7 +924,7 @@ def _split_routed_reduce(c):
     ]
     got = _poll7(c, ats)
     if const_expr(c["profile"]):
-        _stamp(c["flags"], bid, c["tid"] - PUSH_THREADS, 6)
+        _stamp(c["record"], c["tid"] - PUSH_THREADS, P_POLLED)
     half = bid % 2
     row = c["row"]
     for k, t in enumerate(_split_lines(c)):
@@ -675,7 +993,7 @@ def _split_finish(c):
             )
             rstd = hw_rsq(mean)
             if const_expr(c["profile"]):
-                _stamp(c["flags"], bid, tid, 7)
+                _stamp(c["record"], tid, P_RSTD)
             if c["reducer"]:
                 _split_normalize(c, rstd)
         else:
@@ -691,13 +1009,19 @@ def _ar_finish(c, gains):
     """This CTA's lines reduced, the routed ones normalized, then its flag."""
     tid, bid = c["tid"], c["bid"]
     line = bid * THREADS + tid
+    if const_expr(c["poll_delay"]):
+        _push_delay(c["poll_delay"])
     if bid < c["ar_ctas"]:
         if bid < 2 * c["rows"]:
             _routed_finish(c, line, gains)
         else:
             _shared_finish(c, line)
         rocdl.s_wait_storecnt(0)
+        if const_expr(c["profile"]):
+            _stamp(c["record"], tid, P_DRAINED)
         gpu.barrier()
+        if const_expr(c["profile"]):
+            _stamp(c["record"], tid, P_FLAG)
         if tid == 0:
             st_dev(c["epoch"], c["flags"], bid)
 
@@ -811,6 +1135,17 @@ def build_k2_tail(
     split: bool | None = None,
     poll_bound: int | None = None,
     early_gather: bool | None = None,
+    spy: bool = False,
+    push_delay_us: float = 0.0,
+    first_depth: int | None = None,
+    helpers: int = 0,
+    lds_barriers: bool = False,
+    vector_weights: bool = False,
+    poll_delay: int = 0,
+    poll_together: bool | None = None,
+    resident: bool | None = None,
+    test_skip_push: bool = False,
+    test_late_odd: int = 0,
 ) -> K2TailKernel:
     """The gathering all-reduce, routed RMSNorm (``norm_weight`` [LATENT]
     BF16, ``eps``) and replicated finalize (``up_weight`` [HIDDEN, LATENT]
@@ -827,8 +1162,40 @@ def build_k2_tail(
     ``flags[GAVE_UP_WORD]``; production polls are unbounded, since the
     ranks' skew has no bound. ``early_gather`` (default
     ``ATOM_KIMI_MONO_TAIL_EARLY_GATHER``; a share a CTA, no split waves): the
-    lines gathered before the first up-weight slabs are issued."""
+    lines gathered before the first up-weight slabs are issued. ``spy``
+    (profile builds): ``_spy``. ``push_delay_us``: TEST ONLY, never set by
+    the runner -- every CTA holds its pushes back that long, as a longer
+    fabric hop would the lines. ``first_depth`` (a share a CTA, no split
+    waves): only that many of the ``depth`` up-weight slabs are issued ahead
+    of the all-reduce's gathers, the rest once the CTA's lines are pushed,
+    under the fabric hop. ``helpers`` (identity routes, a share a CTA, no
+    split waves; at most ``tail_helpers_max``): ``_ar_push_helped``.
+    ``lds_barriers``: a routed CTA's two barriers ahead of its norm sync its
+    LDS alone (they wait for no store, so not for its pushes' acks).
+    ``vector_weights``: a routed CTA loads its token's route weights as its
+    picks, not through the scalar cache. ``poll_delay``: TEST ONLY -- the
+    first poll held back that many sleeps. ``poll_together`` (default
+    ``ATOM_KIMI_MONO_TAIL_POLL_TOGETHER`` at more than one rank): a poll's
+    loads of the sources' copies go out together and are awaited once (not
+    VOLATILE, which makes the compiler wait out each before the next: a round
+    trip a source); the same lines at the same addresses. ``resident``
+    (``depth`` every later slab, every token slab resident: up to
+    ``tail_resident_rows()`` rows): the GEMV awaits all its copies once and
+    multiplies the slabs with no barrier between them. ``test_skip_push``:
+    TEST ONLY, with ``poll_bound`` -- no line is pushed. By default
+    (``ATOM_KIMI_MONO_TAIL_RESIDENT``, a share a CTA, no split waves, no
+    ``depth`` / ``tokens`` / ``first_depth`` given) on at those widths, with
+    TAIL_DEPTH slabs issued ahead of the gathers and the rest once the lines
+    are pushed. ``test_late_odd``: TEST ONLY, with ``poll_bound`` (a share a
+    CTA, no split waves, no helpers) -- the odd CTAs hold their pushes back
+    that many sleeps: a routed row's even CTA polls its partner's lines
+    while they land."""
     ar_ctas = tail_ar_ctas(rows)
+    if test_skip_push and (poll_bound is None or tail_rounds(rows) > 1):
+        raise ValueError("a tail that pushes nothing takes a poll bound, a share a CTA")
+    if spy and not (profile and tail_rounds(rows) == 1):
+        raise ValueError("a spy K2 tail is a profile build, a share a CTA")
+    push_delay = round(push_delay_us)
     if not 1 <= rows <= tail_max_rows():
         raise ValueError(f"the K2 tail takes 1..{tail_max_rows()} rows, got {rows}")
     grid = tail_grid(rows)
@@ -846,7 +1213,46 @@ def build_k2_tail(
     if early_gather is None:
         early_gather = tail_early_gather()
     early_gather = early_gather and rounds == 1 and not split
+    if test_late_odd and (poll_bound is None or rounds > 1 or split or helpers):
+        raise ValueError(
+            "a late-odd tail takes a poll bound, a share a CTA, no split waves"
+            " and no helpers"
+        )
+    if first_depth is not None and (rounds > 1 or split):
+        raise ValueError("first_depth takes a share a CTA and no split waves")
+    if helpers:
+        if not identity_routes or split or helpers not in (1, 2, 4, 8):
+            raise ValueError("tail helpers take identity routes and no split waves")
+        if helpers > tail_helpers_max(rows):
+            raise ValueError(
+                f"{helpers} tail helpers a share at {rows} rows: at most"
+                f" {tail_helpers_max(rows)}"
+            )
+        early_gather = False
+    if poll_together is None:
+        # one rank: a poll issued right behind the CTA's own local pushes
+        # returns before they land and pays a retry
+        poll_together = tail_poll_together() and tp > 1
+    if resident is None:
+        resident = (
+            tail_resident()
+            and depth is None
+            and tokens is None
+            and first_depth is None
+            and rounds == 1
+            and not split
+            and rows <= tail_resident_rows()
+        )
+        if resident:
+            depth, first_depth = SLABS - 1, TAIL_DEPTH
     layout = tail_layout(rows, depth, tokens, split)
+    if resident and (
+        layout.depth != SLABS - 1 or layout.tokens != SLABS or rounds > 1 or split
+    ):
+        raise ValueError(
+            f"a resident K2 tail GEMV keeps every slab in LDS: depth {SLABS - 1},"
+            f" up to {tail_resident_rows()} rows"
+        )
     lines = allreduce7_lines(rows)
     bank_words = tp * lines * LINE_WORDS
     tiles = (rows + ROWS - 1) // ROWS
@@ -855,16 +1261,27 @@ def build_k2_tail(
         + ("_id" if identity_routes else "")
         + ("_sw" if split else "")
         + ("_eg" if early_gather else "")
+        + ("" if first_depth is None else f"_f{first_depth}")
+        + (f"_h{helpers}" if helpers else "")
+        + ("_lb" if lds_barriers else "")
+        + ("_wv" if vector_weights else "")
+        + (f"_qd{poll_delay}" if poll_delay else "")
+        + ("_pt" if poll_together else "")
+        + ("_np" if test_skip_push else "")
+        + (f"_lo{test_late_odd}" if test_late_odd else "")
+        + ("_rs" if resident else "")
         + ("" if poll_bound is None else f"_b{poll_bound}")
+        + (f"_pd{push_delay}" if push_delay else "")
         + ("_profile" if profile else "")
+        + ("_spy" if spy else "")
         + fresh.suffix("tail")
     )
     sources = SOURCES
 
     @fx.union
     class Lds:
-        words: fx.Array[fx.Int32, layout.words, 16]
-        floats: fx.Array[fx.Float32, layout.words, 16]
+        words: fx.Array[fx.Int32, layout.words + (STAMPS if profile else 0), 16]
+        floats: fx.Array[fx.Float32, layout.words + (STAMPS if profile else 0), 16]
 
     @traced
     def body(
@@ -894,8 +1311,10 @@ def build_k2_tail(
             _prefetch_share(data, grouped, route_weights, rows, ar_ctas, bid, tid)
         words = storage.words.peek().ptr
         floats = storage.floats.peek().ptr
+        record = words + layout.words
         if const_expr(profile):
-            _stamp(flags, bid, tid, 0)
+            _stamps_open(record, tid)
+            _stamp(record, tid, P_START)
         epoch = (
             fx.Int32(bo.buffer_load(rsrc(epochs), bid, vec_width=1, dtype=T.i32)) + 1
         )
@@ -946,6 +1365,15 @@ def build_k2_tail(
             "fused": fused is not None,
             "split": split,
             "bound": poll_bound,
+            "record": record,
+            "push_delay": push_delay,
+            "helpers": helpers,
+            "lds_barriers": lds_barriers,
+            "vector_weights": vector_weights,
+            "poll_delay": poll_delay,
+            "skip_push": test_skip_push,
+            "late_odd": test_late_odd,
+            "poll_cm": SCOPE_SYS if poll_together else SCOPE_SYS | VOLATILE,
         }
         if const_expr(split):
             role = uniform(wave)
@@ -958,19 +1386,26 @@ def build_k2_tail(
         if const_expr(early_gather and fused is None):
             early = _ar_gather(c)
 
-        def prologue():
+        def prologue(more=None):
+            if const_expr(profile):
+                _stamp(record, tid, P_ISSUED)
             if const_expr(fused is not None):
                 fused["wait_inputs"]()
             if const_expr(split):
                 _ar_push(c)
                 _split_finish(c)
             elif const_expr(rounds == 1):
-                _ar_finish(c, _ar_push(c, early))
+                gains = _ar_push(c, early)
+                if const_expr(more is not None):
+                    more()
+                    if const_expr(profile):
+                        _stamp(record, tid, P_MORE)
+                _ar_finish(c, gains)
+                if const_expr(spy):
+                    _spy(c)
             else:
                 _ar_rounds(c, grid, rounds)
             _store_epochs(epochs, bid, tid, grid, epoch)
-            if const_expr(profile):
-                _stamp(flags, bid, tid, 1)
             # Every reader of what the flags publish reads at device scope:
             # no acquire fence (its SCOPE_DEV cache invalidate, one a CTA,
             # held the last CTAs' GEMVs back by microseconds).
@@ -985,7 +1420,7 @@ def build_k2_tail(
             else:
                 gpu.barrier()
             if const_expr(profile):
-                _stamp(flags, bid, tid, 2)
+                _stamp(record, tid, P_SEEN)
             bases.extend(fx.Int32(ld_dev(shared, location)) for location in locations)
 
         accumulators = gemv_tdm.project(
@@ -1003,9 +1438,11 @@ def build_k2_tail(
             prologue=prologue,
             x_cache_policy=CM_DEV,
             token_buffers=layout.tokens,
+            prologue_first=first_depth,
+            resident=resident,
         )
         if const_expr(profile):
-            _stamp(flags, bid, tid, 3)
+            _stamp(record, tid, P_GEMV)
         red = floats + layout.red
         for tile in range_constexpr(tiles):
             for index in range_constexpr(2):
@@ -1035,7 +1472,8 @@ def build_k2_tail(
                     locations[tile],
                 )
         if const_expr(profile):
-            _stamp(flags, bid, tid, 4)
+            _stamp(record, tid, P_END)
+            _stamps_close(record, flags, bid, tid)
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def kernel(

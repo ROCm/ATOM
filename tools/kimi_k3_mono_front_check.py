@@ -31,7 +31,9 @@ from atom.mono.runtime.compile import compile_kernels, launcher_resources
 from atom.quantization.quark.utils import quant_weight_online
 
 DEFAULT_ROWS = sorted({1, *range(5, 41, 5), *range(8, 65, 8)})
-ROWS = [int(r) for r in os.environ.get("ROWS", ",".join(map(str, DEFAULT_ROWS))).split(",")]
+ROWS = [
+    int(r) for r in os.environ.get("ROWS", ",".join(map(str, DEFAULT_ROWS))).split(",")
+]
 VARIANTS = [
     frozenset(s for s in v.split(",") if s)
     for v in os.environ.get("SITES", "late,early").split("+")
@@ -60,8 +62,12 @@ w_shared, s_shared = shuffle_weight(q, layout=(16, 16)).contiguous(), s.contiguo
 def outputs(rows):
     return {
         "router_logits": torch.full((rows, EXPERTS), -7.0, device=dev),
-        "latent_fp4": torch.full((rows, LATENT // 8), -1, dtype=torch.int32, device=dev),
-        "latent_scales": torch.full((rows, LATENT // 32), 7, dtype=torch.uint8, device=dev),
+        "latent_fp4": torch.full(
+            (rows, LATENT // 8), -1, dtype=torch.int32, device=dev
+        ),
+        "latent_scales": torch.full(
+            (rows, LATENT // 32), 7, dtype=torch.uint8, device=dev
+        ),
         "shared_hidden": torch.full(
             (rows, kf.SHARED_COLUMNS), -3.0, dtype=torch.bfloat16, device=dev
         ),

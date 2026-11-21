@@ -722,9 +722,7 @@ def bind_mla_front(layer, layer_id: int, dims: Dims) -> MlaFrontLayer:
         w_g=w_g,
         s_g=s_g,
         q_norm=_vec(attn.q_a_layernorm.weight, lay.Q_LORA, f"{name} q_a_layernorm"),
-        kv_norm=_vec(
-            attn.kv_a_layernorm.weight, lay.KV_LORA, f"{name} kv_a_layernorm"
-        ),
+        kv_norm=_vec(attn.kv_a_layernorm.weight, lay.KV_LORA, f"{name} kv_a_layernorm"),
         q_eps=_eps(attn.q_a_layernorm, f"{name} q_a_layernorm"),
         kv_eps=_eps(attn.kv_a_layernorm, f"{name} kv_a_layernorm"),
         q_dtype=_q_b_activation_quant(attn.q_b_proj),
@@ -817,7 +815,9 @@ def bind_mla_absorb(layer, layer_id: int, front: MlaFrontLayer) -> MlaAbsorbLaye
         and s_uk.device == w_uk.device,
         f"{name}: W_UK's scale is not one f32 beside it",
     )
-    w_qb, s_qb = _block_fp8(attn.q_b_proj, f"{name} q_b_proj", (heads * lay.HEAD, lay.Q_LORA))
+    w_qb, s_qb = _block_fp8(
+        attn.q_b_proj, f"{name} q_b_proj", (heads * lay.HEAD, lay.Q_LORA)
+    )
     if impl.dcp_world_size > 1:
         out_heads, compute_all = heads, True
     else:
@@ -833,6 +833,141 @@ def bind_mla_absorb(layer, layer_id: int, front: MlaFrontLayer) -> MlaAbsorbLaye
         out_heads=out_heads,
         compute_all=compute_all,
         attention=impl,
+    )
+
+
+@dataclass(frozen=True)
+class MlaBackLayer:
+    """What the gfx1250 MLA back half (``mla_back_gfx1250``) reads for one
+    full-attention layer, behind its absorb: the DCP group's FP8 ``W_UV`` and
+    scale (project before merge) and this rank's o_proj in ``_block_fp8``'s
+    layout. ``dcp`` ranks merge ``local_heads`` heads each, this rank
+    ``dcp_rank`` of them."""
+
+    layer_id: int
+    w_uv: torch.Tensor
+    s_uv: torch.Tensor
+    w_o: torch.Tensor
+    s_o: torch.Tensor
+    local_heads: int
+    dcp: int
+    dcp_rank: int
+
+    @property
+    def heads(self) -> int:
+        """The DCP group's query heads: the decode's partials carry them."""
+        return self.dcp * self.local_heads
+
+    @property
+    def key(self) -> tuple[int, int]:
+        """What its build bakes in."""
+        return self.dcp, self.local_heads
+
+
+def _merge_is_aiters(dcp_ops) -> bool:
+    """Whether this tree's ``dcp_ops.cp_lse_a2a`` hands a decode merge to the
+    DCP group's fused kernel (``cp_group.dcp_lse_merge``: aiter's
+    ``dcp_merge_ll_gfx1250``, the merge the back half reproduces) instead of
+    always running the Triton pack, all-to-all and combine, whose rows are
+    not the kernel's bit for bit. Read off the function: the name it looks up
+    on the group."""
+    import inspect
+
+    merge = getattr(dcp_ops, "cp_lse_a2a", None)
+    code = getattr(inspect.unwrap(merge) if callable(merge) else None, "__code__", None)
+    return code is not None and (
+        "dcp_lse_merge" in code.co_names or "dcp_lse_merge" in code.co_consts
+    )
+
+
+def bind_mla_back(
+    layer, layer_id: int, dims: Dims, absorb: MlaAbsorbLayer, rank: int
+) -> MlaBackLayer:
+    """One full-attention layer's MLA back half tensors, read in place.
+    Refused where ``MLAAttention._dcp_project_merge_out``, the gate and
+    o_proj would compute anything else: no DCP or a DCP group other than the
+    TP group (the kernel merges and all-reduces among the same ranks), the
+    merge on the latent (project before merge off), a sparse layer, a merge
+    other than aiter's ``dcp_merge_ll_gfx1250`` behind the all-to-all backend
+    (the mailbox combine; a communicator without the merge; a tree whose
+    ``cp_lse_a2a`` does not take it, ``_merge_is_aiters``: the Triton
+    combine's bits are not reproduced), the BF16 or FP4 V up-projection,
+    other widths, an o_proj the in-kernel one cannot read."""
+    from atom.model_ops import attention_mla, dcp_ops
+    from atom.models.kimi_k3.mono.kernels.stages import mla_back_layout as lay
+
+    name = f"layer {layer_id}"
+    impl = absorb.attention
+    dcp = int(getattr(impl, "dcp_world_size", 1))
+    _need(dcp > 1, f"{name}: no DCP, nothing to merge")
+    _need(
+        dcp == dims.tp and int(impl.dcp_rank) == rank,
+        f"{name}: the DCP group ({dcp} ranks) is not the TP group",
+    )
+    _need(
+        bool(getattr(impl, "pbm_enabled", False)),
+        f"{name}: the merge carries the latent (project before merge is off)",
+    )
+    _need(not impl.is_sparse_mla, f"{name}: sparse MLA")
+    _need(
+        impl.dcp_comm_backend == "a2a",
+        f"{name}: the DCP merge runs the {impl.dcp_comm_backend!r} backend",
+    )
+    _need(
+        callable(getattr(impl.dcp_group, "dcp_lse_merge", None)),
+        f"{name}: the DCP group has no aiter merge kernel to reproduce",
+    )
+    _need(
+        _merge_is_aiters(dcp_ops),
+        f"{name}: this tree's DCP merge is the Triton combine, not aiter's "
+        "merge kernel (dcp_ops.cp_lse_a2a never takes the group's)",
+    )
+    _need(
+        not attention_mla.is_rocm_aiter_fp4bmm_enabled(),
+        f"{name}: the FP4 V up-projection",
+    )
+    _need(
+        (impl.kv_lora_rank, impl.v_head_dim) == (lay.KV_LORA, lay.V_DIM),
+        f"{name}: MLA widths",
+    )
+    local_heads = int(impl.num_heads)
+    _need(
+        local_heads * lay.V_DIM == dims.proj,
+        f"{name}: {local_heads} heads a rank, o_proj reads {dims.proj}",
+    )
+    heads = dcp * local_heads
+    w_uv = getattr(impl, "W_V_dcp", None)
+    s_uv = getattr(impl, "W_V_dcp_scale", None)
+    _need(
+        w_uv is not None and s_uv is not None,
+        f"{name}: the BF16 V up-projection (ATOM_MLA_ABSORB_BF16)",
+    )
+    _need(
+        w_uv.dtype == torch.float8_e4m3fn
+        and tuple(w_uv.shape) == (heads, lay.V_DIM, lay.KV_LORA)
+        and w_uv.is_contiguous(),
+        f"{name}: W_UV is {w_uv.dtype} {tuple(w_uv.shape)}",
+    )
+    _need(
+        s_uv.dtype == torch.float32
+        and s_uv.numel() == 1
+        and s_uv.device == w_uv.device,
+        f"{name}: W_UV's scale is not one f32 beside it",
+    )
+    try:
+        lay.BackPlan(1, dims.tp, dcp, local_heads)
+    except ValueError as why:
+        raise MonoUnsupported(f"{name}: {why}") from why
+    w_o, s_o = bind_fp8_o_proj(layer, layer_id, dims)
+    return MlaBackLayer(
+        layer_id=layer_id,
+        w_uv=w_uv,
+        s_uv=s_uv,
+        w_o=w_o,
+        s_o=s_o,
+        local_heads=local_heads,
+        dcp=dcp,
+        dcp_rank=rank,
     )
 
 

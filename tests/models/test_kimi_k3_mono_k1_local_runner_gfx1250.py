@@ -255,6 +255,4 @@ def test_replay_build_requires_its_pointer_table():
 
 def test_plain_build_takes_no_replay_table():
     with pytest.raises(ValueError, match="no replay table"):
-        _replay_runner(0)(
-            replace(_runtime(), replay=torch.zeros(5, dtype=torch.int64))
-        )
+        _replay_runner(0)(replace(_runtime(), replay=torch.zeros(5, dtype=torch.int64)))
