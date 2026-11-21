@@ -123,12 +123,15 @@ jobs:
       - name: Inspect actual image and cached inputs without devices
         run: |
           set -euo pipefail
-          mkdir -p "$WORK/output"
+          umask 077
+          mkdir -m 700 "$WORK/output"
+          owner=$(stat -c '%u:%g' "$WORK/output")
+          stat -c 'Phase0 output uid=%u gid=%g mode=%a' "$WORK/output"
           name="k31-phase0-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
           timeout --signal=TERM --kill-after=10s 900s docker pull "$IMAGE" 2>&1 | tee "$WORK/output/pull.log"
           config=$(docker image inspect "$IMAGE" --format '{{.Id}}')
-          timeout --signal=TERM --kill-after=10s 300s docker run --name "$name" \
+          timeout --signal=TERM --kill-after=10s 300s docker run --name "$name" --user "$owner" \
             --read-only --network none --ipc private --cap-drop ALL --security-opt no-new-privileges \
             --cpus 4 --memory 4g --tmpfs /tmp:rw,nosuid,nodev,size=256m --tmpfs /root:rw,nosuid,nodev,size=32m \
             --mount "type=bind,src=$GITHUB_WORKSPACE/control,dst=/code,readonly" \
@@ -136,6 +139,7 @@ jobs:
             --mount type=bind,src=/models,dst=/models,readonly \
             --mount "type=bind,src=$WORK/output,dst=/output" \
             -e PYTHONDONTWRITEBYTECODE=1 -e GIT_OPTIONAL_LOCKS=0 \
+            -e K31_REQUESTED_RUNNER=linux-atom-do-mi350x-8 -e K31_RUNNER_NAME="$RUNNER_NAME" \
             -e HIP_VISIBLE_DEVICES= -e ROCR_VISIBLE_DEVICES= -e CUDA_VISIBLE_DEVICES= \
             "$IMAGE" /opt/venv/bin/python -B /code/.github/scripts/k31_phase0_assets.py \
             --seed /seed --spec /code/.github/validation/k31-phase0.json \

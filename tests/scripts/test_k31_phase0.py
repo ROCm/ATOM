@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -225,6 +226,72 @@ def test_preview_origin_uses_actual_ci_draft_path(tmp_path):
     assert result["repo"] == view["repo"] and result["payload_bytes_read"] == 12
 
 
+def output_owner(monkeypatch, directory):
+    parent = directory.stat()
+    monkeypatch.setattr(assets.os, "geteuid", lambda: parent.st_uid, raising=False)
+    monkeypatch.setattr(assets.os, "getegid", lambda: parent.st_gid, raising=False)
+
+
+def test_output_reservation_is_writable_exclusive_and_owner_bound(
+    tmp_path, monkeypatch
+):
+    output_owner(monkeypatch, tmp_path)
+    path, report = tmp_path / "receipt.json", {"status": "failed"}
+    stream = assets.reserve_output(path, report)
+    assets.emit_report(stream, report)
+    original = path.read_bytes()
+    with pytest.raises(FileExistsError):
+        assets.reserve_output(path, report)
+    assert path.read_bytes() == original
+    monkeypatch.setattr(assets.os, "geteuid", lambda: tmp_path.stat().st_uid + 1)
+    with pytest.raises(ValueError, match="output owner differs"):
+        assets.reserve_output(tmp_path / "wrong-owner", {})
+
+
+def test_unwritable_output_fails_before_inspection_and_logs(
+    tmp_path, monkeypatch, capsys
+):
+    output_owner(monkeypatch, tmp_path)
+    path = tmp_path / "receipt.json"
+
+    def denied(*args):
+        raise PermissionError("output denied")
+
+    monkeypatch.setattr(assets.os, "open", denied)
+    monkeypatch.setattr(
+        assets, "checked_files", lambda *args: pytest.fail("inspection started")
+    )
+    with pytest.raises(PermissionError, match="output denied"):
+        assets.inspect(tmp_path, tmp_path / "unread-spec", "config", path)
+    report = json.loads(capsys.readouterr().out.split("K31_PHASE0_REPORT ")[-1])
+    assert report["status"] == "failed" and "output denied" in report["error"]
+    assert "runtime" not in report and report["model_execution_authorized"] is False
+
+
+@pytest.mark.parametrize("primary_error", [False, True])
+def test_late_output_failure_keeps_measurements_and_primary_error(
+    capsys, primary_error
+):
+    class Broken(io.StringIO):
+        def write(self, text):
+            raise PermissionError("late write failure")
+
+    report = {"status": "passed inspection", "runtime": {"observed": "fixture"}}
+    if primary_error:
+        report.update(status="failed", error="original refusal")
+        with pytest.raises(ValueError, match="original refusal"):
+            try:
+                raise ValueError("original refusal")
+            finally:
+                assets.emit_report(Broken(), report)
+    else:
+        with pytest.raises(PermissionError, match="late write failure"):
+            assets.emit_report(Broken(), report)
+    saved = json.loads(capsys.readouterr().out.split("K31_PHASE0_REPORT ")[-1])
+    assert saved["runtime"] == report["runtime"] and saved["status"] == "failed"
+    assert "late write failure" in saved["output_error"]
+
+
 def test_workflow_preserves_defaults_and_excludes_all_old_jobs():
     file = ".github/workflows/atom-test.yaml"
     old = yaml.load(
@@ -250,3 +317,12 @@ def test_workflow_preserves_defaults_and_excludes_all_old_jobs():
     assert (
         "src=/models,dst=/models,readonly" in command and "pip install" not in command
     )
+    recipe = next(
+        s["run"]
+        for s in new["jobs"]["k31-asset-preflight"]["steps"]
+        if s.get("name", "").startswith("Inspect actual")
+    )
+    assert 'mkdir -m 700 "$WORK/output"' in recipe and "owner=$(stat -c" in recipe
+    assert '--user "$owner"' in recipe and "umask 077" in recipe
+    assert "--cap-drop ALL --security-opt no-new-privileges" in recipe
+    assert "chmod" not in recipe and "chown" not in recipe and "--cap-add" not in recipe

@@ -209,14 +209,63 @@ def check_model(view, cache, result=None, blocked=()):
     return result
 
 
+def reserve_output(output, report):
+    parent = output.parent.stat()
+    report["output_identity"] = {
+        "uid": os.geteuid(),
+        "gid": os.getegid(),
+        "directory_uid": parent.st_uid,
+        "directory_gid": parent.st_gid,
+        "directory_mode": oct(stat.S_IMODE(parent.st_mode)),
+    }
+    require(
+        (parent.st_uid, parent.st_gid) == (os.geteuid(), os.getegid()),
+        "output owner differs from inspector",
+    )
+    stream = os.fdopen(
+        os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600),
+        "w",
+        encoding="utf-8",
+    )
+    try:
+        stream.write(json.dumps(report) + "\n")
+        stream.flush()
+    except Exception:
+        stream.close()
+        raise
+    return stream
+
+
+def emit_report(stream, report):
+    # The captured log keeps measurements even if output storage fails or blocks.
+    print("K31_PHASE0_REPORT " + json.dumps(report), flush=True)
+    if stream is None:
+        return
+    try:
+        with stream:
+            stream.seek(0)
+            stream.truncate()
+            stream.write(json.dumps(report, indent=2) + "\n")
+            stream.flush()
+    except OSError as error:
+        report.update(status="failed", output_error=f"{type(error).__name__}: {error}")
+        print("K31_PHASE0_REPORT " + json.dumps(report), flush=True)
+        if "error" not in report:
+            raise
+
+
 def inspect(seed, spec_path, image_config, output):
+    stream = None
     report = {
         "status": "failed",
         "model_execution_authorized": False,
         "started_epoch": time.time(),
         "image_configuration": image_config,
+        "requested_runner": os.environ.get("K31_REQUESTED_RUNNER"),
+        "runner_name": os.environ.get("K31_RUNNER_NAME"),
     }
     try:
+        stream = reserve_output(output, report)
         spec = json.loads(spec_path.read_text())
         checked_files(seed, spec)
         require(image_config == spec["image"]["config"], "OCI configuration differs")
@@ -253,7 +302,7 @@ def inspect(seed, spec_path, image_config, output):
         raise
     finally:
         report["finished_epoch"] = time.time()
-        output.write_text(json.dumps(report, indent=2) + "\n")
+        emit_report(stream, report)
 
 
 if __name__ == "__main__":
