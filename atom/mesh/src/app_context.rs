@@ -286,9 +286,7 @@ impl AppContextBuilder {
             if let Some(storage) = kv_storage.as_ref().filter(|_| weight > 0.0) {
                 monitor.read_stores(storage.clone(), weight);
             }
-            if router_config.kv_share_weight > 0.0 {
-                monitor.share_pools(router_config.kv_share_weight);
-            }
+            monitor.share_pools(router_config.kv_share_weight);
             policy_registry.set_kv_events(monitor.clone());
         }
         Ok(AppContext {

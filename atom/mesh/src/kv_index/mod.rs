@@ -44,7 +44,7 @@ pub(crate) trait PrefixMatchProvider: Send + Sync + Debug {
     /// The tokens of `tokens` each worker's device cache will hold, in the order of
     /// `workers`, when it holds what `device` says: that, or more where its engine copies
     /// the prefix in from the pools of the other ranks of its share group. None where no
-    /// worker's can, and `device` stands.
+    /// worker's can or share groups are ignored, and `device` stands.
     fn shared_tokens(
         &self,
         _tokens: &[u32],

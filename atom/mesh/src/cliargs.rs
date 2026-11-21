@@ -841,6 +841,23 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn cli_kv_share_weight_reaches_the_kv_event_monitor() {
+        use crate::{
+            app_context::AppContext, core::prepare_pool::PreparePoolRuntime,
+            kv_index::PrefixMatchProvider,
+        };
+
+        let args = CliArgs::try_parse_from(["atomesh", "--kv-events", "--kv-share-weight", "0.5"])
+            .unwrap();
+        let config = args.to_router_config(Vec::new()).unwrap();
+        let runtime = PreparePoolRuntime::new(config.resolved_prepare_pool().unwrap()).unwrap();
+        let context = AppContext::from_config(config, 5, runtime.handle())
+            .await
+            .unwrap();
+        assert_eq!(context.kv_event_monitor.unwrap().share_weight(), 0.5);
+    }
+
     #[test]
     fn parse_policy_accepts_dp_sticky() {
         let args = CliArgs::default();
