@@ -2116,6 +2116,323 @@ def test_pp_stage_relayouts_kv_and_splits_kda_state_for_a_dcp_tp_consumer():
     assert (nic.mem[~written] == before[~written]).all()
 
 
+class _SlotView:
+    """One slot region's units inside the byte NIC's flat memory."""
+
+    def __init__(self, mem, base, unit):
+        self.mem, self.base, self.unit = mem, base, unit
+
+    def __getitem__(self, slot):
+        start = self.base + slot * self.unit
+        return self.mem[start : start + self.unit]
+
+
+def test_staged_state_matches_the_direct_shard(_no_cuda_stream):
+    """Gathering the TP shard writes the same bytes as the direct descriptors,
+    in one descriptor per region instead of one per conv run."""
+    np = pytest.importorskip("numpy")
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    from atom.kv_transfer.disaggregation.mooncake.mooncake_connector import SlotPool
+
+    nic = _ByteNic()
+    for t in range(4 * _BLOCK):
+        nic.mem[_MLA_SRC + t * _TOKEN_BYTES : _MLA_SRC + (t + 1) * _TOKEN_BYTES] = t + 1
+    nic.mem[_CONV_SRC : _CURSOR_SRC + _SRC_SLOTS * _CURSOR_BPS] = np.arange(
+        _CURSOR_SRC + _SRC_SLOTS * _CURSOR_BPS - _CONV_SRC, dtype=np.uint8
+    )
+    before = nic.mem.copy()
+    connector = _pp_stage_connector(mc, nic)
+    base = 15000
+    connector._state_staging = nic.mem[base : base + 64].reshape(1, 64)
+    connector._state_staging_base = base
+    connector._state_staging_slot_bytes = 64
+    connector._state_staging_slots = SlotPool(1)
+    connector._state_region_views = [
+        _SlotView(nic.mem, _CONV_SRC, _CONV_BPS),
+        _SlotView(nic.mem, _SSM_SRC, _SSM_BPS),
+        _SlotView(nic.mem, _CURSOR_SRC, _CURSOR_BPS),
+    ]
+    connector._send_worker_stream = MagicMock()
+    labels = []
+    nic_write = nic.write
+
+    def write(*args, **kwargs):
+        labels.append(args[5])
+        return nic_write(*args, **kwargs)
+
+    connector._rdma_write = write
+
+    assert mc.MooncakeConnector._execute_block_slot_transfer(
+        connector,
+        _dcp_tp_request(),
+        "consumer:1234",
+        [0, 1, 2, 3],
+        [1, 2],
+        {"slot_index": 5},
+        "req-1",
+        kv_cache_ready_event=object(),
+    )
+
+    conv = before[_CONV_SRC + 5 * _CONV_BPS : _CONV_SRC + 6 * _CONV_BPS]
+    ssm = before[_SSM_SRC + 5 * _SSM_BPS : _SSM_SRC + 6 * _SSM_BPS]
+    cursor = before[_CURSOR_SRC + 5 * _CURSOR_BPS : _CURSOR_SRC + 6 * _CURSOR_BPS]
+    landed = [
+        (
+            _DST_SLOT[2] + 3 * (_CONV_BPS // 2),
+            conv.reshape(_CONV_ROWS, 3, 2, _CONV_RUN // 2)[:, :, 1].ravel(),
+        ),
+        (_DST_SLOT[5] + 3 * (_SSM_BPS // 2), ssm[_SSM_BPS // 2 :]),
+        (_DST_SLOT[6] + 3 * _CURSOR_BPS, cursor),
+    ]
+    for dst, want in landed:
+        assert (nic.mem[dst : dst + want.size] == want).all()
+    assert labels.count("staged-state") == 1
+    connector._send_worker_stream().wait_event.assert_called_once()
+
+
+def test_a_state_shard_larger_than_the_staging_slot_stays_direct(_no_cuda_stream):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    from atom.kv_transfer.disaggregation.mooncake.mooncake_connector import SlotPool
+
+    nic = _ByteNic()
+    connector = _pp_stage_connector(mc, nic)
+    connector._state_staging = nic.mem[15000:15004].reshape(1, 4)
+    connector._state_staging_base = 15000
+    connector._state_staging_slot_bytes = 4
+    connector._state_staging_slots = SlotPool(1)
+    connector._state_region_views = [
+        _SlotView(nic.mem, _CONV_SRC, _CONV_BPS),
+        _SlotView(nic.mem, _SSM_SRC, _SSM_BPS),
+        _SlotView(nic.mem, _CURSOR_SRC, _CURSOR_BPS),
+    ]
+    labels = []
+    nic_write = nic.write
+
+    def write(*args, **kwargs):
+        labels.append(args[5])
+        return nic_write(*args, **kwargs)
+
+    connector._rdma_write = write
+    connector._send_worker_stream = MagicMock()
+    assert mc.MooncakeConnector._execute_block_slot_transfer(
+        connector,
+        _dcp_tp_request(),
+        "consumer:1234",
+        [0, 1, 2, 3],
+        [1, 2],
+        {"slot_index": 5},
+        "req-1",
+        kv_cache_ready_event=object(),
+    )
+    assert "staged-state" not in labels
+
+
+def _arm_state_staging(nic, connector, *, slot_bytes=64):
+    from atom.kv_transfer.disaggregation.mooncake.landing import LandingCredits
+    from atom.kv_transfer.disaggregation.mooncake.mooncake_connector import SlotPool
+
+    base = 15000
+    connector._state_staging = nic.mem[base : base + slot_bytes].reshape(1, slot_bytes)
+    connector._state_staging_base = base
+    connector._state_staging_slot_bytes = slot_bytes
+    connector._state_staging_slots = SlotPool(1)
+    connector._state_region_views = [
+        _SlotView(nic.mem, _CONV_SRC, _CONV_BPS),
+        _SlotView(nic.mem, _SSM_SRC, _SSM_BPS),
+        _SlotView(nic.mem, _CURSOR_SRC, _CURSOR_BPS),
+    ]
+    connector._send_worker_stream = MagicMock()
+    connector._state_landing_credits = LandingCredits()
+    labels = []
+    nic_write = nic.write
+
+    def write(*args, **kwargs):
+        labels.append(args[5])
+        return nic_write(*args, **kwargs)
+
+    connector._rdma_write = write
+    return labels
+
+
+def test_one_state_slot_lands_and_a_failed_write_quarantines_its_credit(
+    _no_cuda_stream,
+):
+    """One slot is enough for state. A failed write keeps that credit out."""
+    np = pytest.importorskip("numpy")
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    from atom.kv_transfer.disaggregation.state_gather import KDA_SLOT_LAYOUT
+
+    nic = _ByteNic()
+    nic.mem[_CONV_SRC : _CURSOR_SRC + _SRC_SLOTS * _CURSOR_BPS] = np.arange(
+        _CURSOR_SRC + _SRC_SLOTS * _CURSOR_BPS - _CONV_SRC, dtype=np.uint8
+    )
+    before = nic.mem.copy()
+    connector = _pp_stage_connector(mc, nic)
+    connector.pp_rank = 0
+    labels = _arm_state_staging(nic, connector)
+    connector._state_landing_credits.sync("consumer:1234", {"epoch": 7, "slots": [0]})
+    sent = []
+    connector._send_on_socket = lambda addr, parts, repeat=1: sent.append(parts)
+    request = _dcp_tp_request()
+    request.update(
+        notify_host="decode",
+        notify_port=9,
+        state_landing={
+            "layout": KDA_SLOT_LAYOUT,
+            "epoch": 7,
+            "base": 15200,
+            "slot_bytes": 64,
+            "slots": [0],
+        },
+    )
+    assert mc.MooncakeConnector._execute_block_slot_transfer(
+        connector,
+        request,
+        "consumer:1234",
+        [0, 1, 2, 3],
+        [1, 2],
+        {"slot_index": 5},
+        "req-1",
+        kv_cache_ready_event=object(),
+    )
+    conv = before[_CONV_SRC + 5 * _CONV_BPS : _CONV_SRC + 6 * _CONV_BPS]
+    packed = np.concatenate(
+        [
+            conv.reshape(_CONV_ROWS, 3, 2, _CONV_RUN // 2)[:, :, 1].ravel(),
+            before[_SSM_SRC + 5 * _SSM_BPS : _SSM_SRC + 6 * _SSM_BPS][_SSM_BPS // 2 :],
+            before[_CURSOR_SRC + 5 * _CURSOR_BPS : _CURSOR_SRC + 6 * _CURSOR_BPS],
+        ]
+    )
+    assert (nic.mem[15200 : 15200 + packed.size] == packed).all()
+    # The decode slot itself is untouched: scatter, not this write, fills it.
+    assert not nic.mem[_DST_SLOT[2] : _DST_SLOT[2] + _CONV_BPS // 2].any()
+    assert labels.count("landed-state") == 1
+    assert request["_state_landed_slots"] == [0]
+    assert sent[0][0] == b"state_landing_ready"
+    items = __import__("msgpack").loads(sent[0][1])["items"]
+    assert items == [[2, 0, 1, 0], [5, 0, 1, 12], [6, 0, 1, 20]]
+
+    # The decode returns the credit. The next write fails, and that credit
+    # stays out of the free list instead of being handed on.
+    connector._state_landing_credits.release("consumer:1234", 7, [0])
+
+    def fail_landed(*args, **kwargs):
+        return args[5] != "landed-state"
+
+    connector._rdma_write = fail_landed
+    assert not mc.MooncakeConnector._execute_block_slot_transfer(
+        connector,
+        request,
+        "consumer:1234",
+        [0, 1, 2, 3],
+        [1, 2],
+        {"slot_index": 5},
+        "req-1",
+        kv_cache_ready_event=object(),
+    )
+    held = connector._state_landing_credits._targets["consumer:1234"]
+    assert 0 in held.quarantined
+    assert held.free == []
+
+
+def test_a_non_dcp_consumer_keeps_the_direct_state_writes(_no_cuda_stream):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    nic = _ByteNic()
+    connector = _pp_stage_connector(mc, nic)
+    labels = _arm_state_staging(nic, connector)
+    request = _dcp_tp_request()
+    request["consumer_dcp_size"] = 1
+    request["consumer_dcp_rank"] = 0
+    # Without DCP the MLA pages go whole; only the state decision matters.
+    assert (
+        mc.MooncakeConnector._try_staged_state(
+            connector,
+            request,
+            "consumer:1234",
+            5,
+            3,
+            [2, 5, 6],
+            connector._slot_region_tp_segments,
+            connector._slot_region_tp_replicated,
+            True,
+            2,
+            1,
+            _DST_SLOT,
+            [_CONV_BPS // 2] * 3 + [_SSM_BPS // 2] * 3 + [_CURSOR_BPS],
+            "req-1",
+            object(),
+        )
+        is None
+    )
+    assert labels == []
+
+
+def test_state_landing_is_swept_and_acked_with_the_mla_one():
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    connector = object.__new__(mc.MooncakeConnector)
+    calls = []
+
+    class _Receiver:
+        def sweep(self):
+            calls.append("sweep")
+
+        def stage_acked(self, *args):
+            calls.append(("ack", args))
+            return True
+
+    connector._state_landing = _Receiver()
+    connector._landing = None
+    connector._write_request_error = None
+    connector.is_producer = False
+
+    class _Stop(Exception):
+        pass
+
+    def stop():
+        raise _Stop
+
+    # get_finished sweeps both receivers before anything else it does.
+    connector._expire_pending_recvs = stop
+    with pytest.raises(_Stop):
+        mc.MooncakeConnector.get_finished(connector)
+    assert calls[0] == "sweep"
+    mc.MooncakeConnector._record_write_ack(
+        connector, {"request_id": "r", "write_nonce": 1, "write_window_s": 5}
+    )
+    assert calls[1][0] == "ack"
+
+
+def test_two_landing_receivers_finish_a_request_once():
+    import threading
+
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    connector = object.__new__(mc.MooncakeConnector)
+    connector._completion_lock = threading.Lock()
+    connector._landing_gates = {"r": {"left": 2, "failed": False}}
+    done = []
+    connector._complete_recv = lambda req, failed: done.append((req, failed))
+    mc.MooncakeConnector._landing_finished(connector, "r", False)
+    assert done == []
+    mc.MooncakeConnector._landing_finished(connector, "r", True)
+    assert done == [("r", True)]
+    assert "r" not in connector._landing_gates
+    # One receiver, the MLA-only case, completes on its own finish.
+    mc.MooncakeConnector._landing_finished(connector, "solo", False)
+    assert done == [("r", True), ("solo", False)]
+
+
 @pytest.mark.parametrize(
     "producer_tp, consumer_tp, consumer_rank, ssm_segments, match",
     [

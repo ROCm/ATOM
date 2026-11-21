@@ -1639,13 +1639,17 @@ def test_landing_reserve_matches_the_pool_and_its_gates(monkeypatch, transfer):
     assert landing_reserve_bytes(_config(transfer)) == 0
     assert landing_reserve_bytes(_config(consumer, dcp=1)) == 0
     assert landing_reserve_bytes(_config(consumer, kv_lora_rank=None)) == 0
-    # A latent rank alone is not plain MLA: DeepSeek-V4 (V3 schema) and the
-    # Kimi hybrid never land, so they reserve nothing.
+    # A latent rank alone is not plain MLA: DeepSeek-V4 (V3 schema) never
+    # lands MLA rows. Kimi does not either; its DCP decode reserves the
+    # separate KDA state pool instead.
     v4 = _config(
         consumer, model_type="deepseek_v3", architectures=["DeepseekV4ForCausalLM"]
     )
     assert landing_reserve_bytes(v4) == 0
-    assert landing_reserve_bytes(_config(consumer, model_type="kimi_linear")) == 0
+    kimi = _config(consumer, model_type="kimi_linear")
+    assert landing_reserve_bytes(kimi) == (256 << 20) + 24 * segment_table_capacity(
+        1024
+    )
     monkeypatch.setenv("ATOM_PD_MLA_LANDING", "0")
     assert landing_reserve_bytes(_config(consumer)) == 0
 
