@@ -257,10 +257,6 @@ class WorkflowInputTest(unittest.TestCase):
         )
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class MeshWorkerTopologyTest(TempDirTest):
     """A mesh worker is refused up front where the Rust runtime cannot serve:
     P/D topologies (not yet supported) and the image's own ATOM."""
@@ -292,3 +288,7 @@ class MeshWorkerTopologyTest(TempDirTest):
             result = self.check(aggregated, source)
             self.assertEqual(result.returncode, 2)
             self.assertIn(reason, result.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

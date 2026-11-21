@@ -9,7 +9,6 @@ from dataclasses import dataclass, fields
 from atom import LLMEngine
 from atom.config import (
     CompilationConfig,
-    Config,
     CUDAGraphMode,
     DCPConfig,
     DSparkConfig,
@@ -1084,22 +1083,22 @@ class EngineArgs:
             del kwargs["data_parallel_base_port"]
         return ParallelConfig(**kwargs)
 
-    def create_engine(self, tokenizer=None, **config_overrides) -> LLMEngine:
+    def create_engine(
+        self, tokenizer=None, *, external_engine_client: bool = False
+    ) -> LLMEngine:
         """Create and return an LLMEngine instance with the configured parameters.
 
         A node whose TP slice starts past rank 0 (--tensor-parallel-rank) has no
         engine to create: it runs its TP workers for the engine on another node
         and exits the process with their status once they stop.
 
-        `config_overrides` are Config fields the CLI does not expose. LLMEngine
-        drops keys that are not Config fields, so a misspelt one is refused here.
+        `external_engine_client` is set by the atomesh standalone launcher, whose
+        Rust runtime is the EngineCores' client; the CLI does not expose it.
         """
-        unknown = set(config_overrides) - {f.name for f in fields(Config)}
-        if unknown:
-            raise ValueError(f"not Config fields: {sorted(unknown)}")
         if self.tensor_parallel_rank > 0:
             from atom.model_engine.tp_multinode import serve_remote_tp_ranks
 
             raise SystemExit(serve_remote_tp_ranks(self))
-        kwargs = {**self._get_engine_kwargs(), **config_overrides}
+        kwargs = self._get_engine_kwargs()
+        kwargs["external_engine_client"] = external_engine_client
         return LLMEngine(self.model, tokenizer=tokenizer, **kwargs)
