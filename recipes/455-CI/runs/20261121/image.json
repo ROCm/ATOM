@@ -1,0 +1,16 @@
+{
+ "image": "rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261121",
+ "digest": "sha256:e0b30d0f8dd9cc979fddf8516dd9864ca00b1bc4cd877584f0a2972b85d3e9e4",
+ "base_image": "rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261118",
+ "atom": {
+  "commit": "cccc96a039c0936a0dfe2516245fea5e3305c346",
+  "date": "2026-11-21",
+  "title": "[Compile] Skip every pseudo path when hashing the traced files (#3642)"
+ },
+ "aiter": {
+  "commit": "df3e0b2f6f5e0007e90c6ad87bb5efef9499a053",
+  "date": "2026-11-21",
+  "title": "[Triton/Gluon] [Config] gfx942 unified_attention: tuned FP8 prefill row for head <= 128 (#8380)"
+ },
+ "dependency_changes": []
+}
