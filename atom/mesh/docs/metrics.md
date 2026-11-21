@@ -146,13 +146,20 @@ to a worker (URL and DP rank) in router memory:
 - `hit`: the pinned worker is healthy and its circuit breaker admits requests;
 - `new`: first request of the session; it goes to the worker with the fewest
   live sessions, ties broken by load;
-- `rebind`: the pinned worker is unhealthy, removed or circuit-open, so the
-  session is reassigned like a new one;
+- `rebind`: the pinned worker is unhealthy, removed or circuit-open, or the
+  session's last request to it failed with a server error or got no response
+  (a retry included), so the session is placed again like a new one, away
+  from every worker it failed on since its last hit while another one is
+  healthy. HTTP, PD and ext_proc routing report failures; gRPC does not. For
+  HTTP and PD routing a body that breaks after a successful status is not a
+  failure; ext_proc also reports an upstream reset or timeout after the
+  response started;
 - `expired`: the session was idle for more than 120 minutes and is reassigned.
 
 With N turns per session and stable workers, the hit rate approaches
-(N - 1) / N. `rebind` points at worker churn; a router restart makes every
-session `new` again. Each pool that runs `dp_sticky` records its own branches.
+(N - 1) / N. `rebind` points at worker churn or failing requests; a router
+restart makes every session `new` again. Each pool that runs `dp_sticky`
+records its own branches.
 
 ### Worker changes
 
@@ -168,7 +175,8 @@ nothing. `rank_mapping` means the pin held, but
 `--atom-pd-rank-mapping-policy idx2idx` mapped the prefill request to a
 different DP rank than the previous one. A session that moves leaves its KV
 cache on the old worker. The HTTP routers and the external-processing PD
-executor record it; gRPC routers do not.
+executor record it when they send the request, and external-processing
+single-worker routes when they hand the route to Envoy; gRPC routers do not.
 
 ### DP ranks
 

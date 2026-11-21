@@ -138,7 +138,7 @@ fn dispatch_with_headers(
     streaming: bool,
     headers: Option<HeaderMap>,
 ) -> JoinHandle<Response> {
-    dispatch_with_policy(kind, p, d, streaming, headers, None)
+    dispatch_with_policy(kind, p, d, streaming, headers, None, None)
 }
 
 fn dispatch_with_policy(
@@ -147,9 +147,13 @@ fn dispatch_with_policy(
     d: &GatedServer,
     streaming: bool,
     headers: Option<HeaderMap>,
+    prefill_policy: Option<Arc<dyn LoadBalancingPolicy>>,
     decode_policy: Option<Arc<dyn LoadBalancingPolicy>>,
 ) -> JoinHandle<Response> {
     let mut router = tests::create_test_pd_router();
+    if let Some(policy) = prefill_policy {
+        router.policy_registry.set_prefill_policy(policy);
+    }
     if let Some(policy) = decode_policy {
         router.policy_registry.set_decode_policy(policy);
     }
@@ -653,6 +657,7 @@ async fn dispatch_hooks_wait_until_the_new_decode_receives_a_request() {
             d,
             false,
             Some(headers.clone()),
+            None,
             policy,
         )
     };
@@ -706,6 +711,101 @@ async fn dispatch_hooks_wait_until_the_new_decode_receives_a_request() {
         [r#"mesh_session_worker_change_total{pool="decode",reason="rebind"} 1"#]
     );
     assert_eq!(decode_dispatches(), 2);
+}
+
+#[tokio::test]
+async fn a_decode_server_error_releases_the_session_binding_and_a_client_error_does_not() {
+    for kind in KINDS {
+        for (status, kept) in [
+            (StatusCode::BAD_REQUEST, true),
+            (StatusCode::SERVICE_UNAVAILABLE, false),
+        ] {
+            let policy: Arc<dyn LoadBalancingPolicy> = Arc::new(DpStickyPolicy::new());
+            let (mut p, mut a) = servers().await;
+            let b = GatedServer::start(WorkerType::Decode).await;
+            let decode = [a.worker.clone(), b.worker.clone()];
+            let mut headers = HeaderMap::new();
+            headers.insert("x-session-id", HeaderValue::from_static("session-1"));
+            let info = SelectWorkerInfo {
+                headers: Some(&headers),
+                ..Default::default()
+            };
+
+            assert_eq!(policy.select_worker(&decode, &info).await, Some(0));
+            let task = dispatch_with_policy(
+                kind,
+                &p,
+                &a,
+                false,
+                Some(headers.clone()),
+                None,
+                Some(policy.clone()),
+            );
+            p.wait_entered().await;
+            p.respond(prefill_response());
+            a.wait_entered().await;
+            a.respond(status.into_response());
+            assert_eq!(result(task).await.status(), status, "{kind:?}");
+
+            // The retry or next request: a 5xx placed the session again, away
+            // from the worker that failed; a 4xx kept the binding.
+            let (selected, decision) = policy.select_with_decision(&decode, &info).await;
+            let expected = if kept {
+                (Some(0), "hit")
+            } else {
+                (Some(1), "rebind")
+            };
+            assert_eq!((selected, decision.branch), expected, "{kind:?} {status}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_prefill_server_error_releases_only_the_prefill_binding() {
+    for kind in KINDS {
+        let prefill_policy: Arc<dyn LoadBalancingPolicy> = Arc::new(DpStickyPolicy::new());
+        let decode_policy: Arc<dyn LoadBalancingPolicy> = Arc::new(DpStickyPolicy::new());
+        let (mut p, mut d) = servers().await;
+        let other_prefill = GatedServer::start(WorkerType::Prefill {
+            bootstrap_port: None,
+        })
+        .await;
+        let other_decode = GatedServer::start(WorkerType::Decode).await;
+        let prefill = [p.worker.clone(), other_prefill.worker.clone()];
+        let decode = [d.worker.clone(), other_decode.worker.clone()];
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", HeaderValue::from_static("session-1"));
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+
+        assert_eq!(prefill_policy.select_worker(&prefill, &info).await, Some(0));
+        assert_eq!(decode_policy.select_worker(&decode, &info).await, Some(0));
+        let task = dispatch_with_policy(
+            kind,
+            &p,
+            &d,
+            false,
+            Some(headers.clone()),
+            Some(prefill_policy.clone()),
+            Some(decode_policy.clone()),
+        );
+        p.wait_entered().await;
+        p.respond(StatusCode::SERVICE_UNAVAILABLE.into_response());
+        if matches!(kind, DispatchKind::Vllm) {
+            // vLLM's prefill is detached: the decode answers the client.
+            d.wait_entered().await;
+            d.respond(prefill_response());
+        }
+        drop(result(task).await);
+        wait_load(&p.worker, 0).await;
+
+        let (selected, decision) = prefill_policy.select_with_decision(&prefill, &info).await;
+        assert_eq!((selected, decision.branch), (Some(1), "rebind"), "{kind:?}");
+        let (selected, decision) = decode_policy.select_with_decision(&decode, &info).await;
+        assert_eq!((selected, decision.branch), (Some(0), "hit"), "{kind:?}");
+    }
 }
 
 #[tokio::test]
