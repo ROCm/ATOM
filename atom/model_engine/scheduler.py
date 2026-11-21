@@ -2526,9 +2526,14 @@ class Scheduler:
                 continue
 
             # Without a load, every way on from here prefills locally: no
-            # connector, an offload resume of the received KV, a requeue the
-            # connector no longer loads, a preempted decode.
-            if not needs_remote_load and self._refuse_prefill_without_media(seq):
+            # connector, a failed receive, a requeue after its receive was
+            # queued, a preempted decode, an offload tier's resume on an
+            # instance with no P/D connector.
+            if (
+                seq.kv_transfer_params is not None
+                and not needs_remote_load
+                and self._refuse_prefill_without_media(seq)
+            ):
                 continue
 
             if offload_resume:
@@ -2766,8 +2771,11 @@ class Scheduler:
                 self._park_for_remote_load(seq, skipped_waiting_requests)
                 self._inflight_prefix_wait.pop(seq.id, None)
                 continue
-            # A tier load declined after `allocate` prefills locally too.
-            if self._refuse_prefill_without_media(seq):
+            # A load an offload tier declines after `allocate` prefills
+            # locally too.
+            if seq.kv_transfer_params is not None and (
+                self._refuse_prefill_without_media(seq)
+            ):
                 continue
 
             if seq.offload_joint.boundary_tokens:

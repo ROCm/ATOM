@@ -877,28 +877,41 @@ def _image_decode_on_way_in(way_in, scheduler, seq_factory):
         scheduler.running.remove(seq)
         assert scheduler.preempt(seq)
         return seq
+    if way_in == "failed_receive":
+        # Its receive failed; the connector cleared `do_remote_prefill` when
+        # it queued that receive, so it has nothing to load again.
+        seq = _received_image_decode(
+            scheduler,
+            seq_factory,
+            get_num_new_matched_tokens=lambda _seq: (0, False),
+        )
+        scheduler.finished_recving_kv_req_ids.remove(seq.id)
+        scheduler.failed_recving_kv_req_ids.append(seq.id)
+        return seq
     seq = seq_factory(list(PROMPT_IDS), kv_transfer_params=dict(IMAGE_DECODE_KV))
     if way_in == "requeued":
-        # A requeue's second query: moriio answers nothing to load.
+        # Taken back after its receive was queued, which ends the connector's
+        # remote-prefill answer: its next query finds nothing to load.
         _pd_connector(scheduler, get_num_new_matched_tokens=lambda _seq: (0, False))
-    elif way_in == "declined_after_alloc":
-        # A tier load asked for, then declined once the blocks are allocated.
-        _pd_connector(
-            scheduler,
+    # The rest reach an instance whose connector is an offload tier alone
+    # (a P/D consumer beside a tier does not start, `validate_multi_config`);
+    # nothing stops a client from sending it a decode leg.
+    elif way_in == "tier_declined_after_alloc":
+        scheduler.kv_connector = _ConnectorNamespace(
+            is_offload=True,
             get_num_new_matched_tokens=lambda _seq: (4, True),
             update_state_after_alloc=lambda _seq: None,
             should_park_for_load_after_alloc=lambda _seq: False,
         )
-    elif way_in == "offload_resume":
-        # The receive settled as an offload load the scheduler resumes.
-        scheduler.kv_connector = _ConnectorNamespace(is_offload=True)
+    elif way_in == "tier_resume":
         bm = scheduler.block_manager
+        scheduler.kv_connector = _ConnectorNamespace(is_offload=True)
         assert bm.allocate(seq, bm.can_allocate(seq))
         seq.num_cached_tokens = 2
         seq.offload_loaded = True
     scheduler.add(seq)
-    if way_in == "early_loaded":
-        # An offload tier loads its prefix ahead of admission; it lands.
+    if way_in == "tier_early_loaded":
+        # The tier loads its prefix ahead of admission; it lands.
         scheduler.kv_connector = _ConnectorNamespace(
             is_offload=True,
             supports_early_load=True,
@@ -917,11 +930,12 @@ def _image_decode_on_way_in(way_in, scheduler, seq_factory):
     "way_in",
     [
         "no_connector",
+        "failed_receive",
         "requeued",
-        "declined_after_alloc",
-        "offload_resume",
-        "early_loaded",
         "preempted",
+        "tier_declined_after_alloc",
+        "tier_resume",
+        "tier_early_loaded",
     ],
 )
 def test_media_dropped_leg_is_never_prefilled_locally(scheduler, seq_factory, way_in):
@@ -935,6 +949,30 @@ def test_media_dropped_leg_is_never_prefilled_locally(scheduler, seq_factory, wa
     assert seq.leave_reason.startswith("unschedulable:")
     assert scheduler.take_rejected() == [seq]
     assert seq not in scheduler.waiting and seq not in scheduler.running
+
+
+def test_fresh_image_leg_waits_for_remote_kv(scheduler, seq_factory):
+    _pd_connector(
+        scheduler, get_num_new_matched_tokens=lambda _seq: (len(PROMPT_IDS), True)
+    )
+    seq = seq_factory(list(PROMPT_IDS), kv_transfer_params=dict(IMAGE_DECODE_KV))
+    scheduler.add(seq)
+
+    scheduler.schedule()
+
+    assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+    assert scheduler.take_rejected() == []
+
+
+def test_a_leg_carrying_its_media_is_an_image_request(seq_factory):
+    seq = seq_factory(
+        list(PROMPT_IDS),
+        kv_transfer_params=dict(IMAGE_DECODE_KV),
+        multimodal_data={"cache_seed": 5},
+        mrope_position_delta=-1,
+    )
+    assert not seq.media_on_prefill_instance
+    assert (seq.cache_seed, seq.mrope_position_delta) == (5, -1)
 
 
 @pytest.mark.parametrize(
@@ -1051,6 +1089,7 @@ OUT_OF_RANGE_HANDOFF = [
     ("mrope_position_delta", -MAX_MODEL_LEN - 1),
     ("mrope_position_delta", 2**63),
     ("mrope_position_delta", -2.5),
+    ("mrope_position_delta", True),
 ]
 
 
@@ -1147,3 +1186,65 @@ def test_standalone_completion_refuses_an_out_of_range_handoff_key(stream, key, 
     with pytest.raises(ValueError, match=key):
         start(request)
     assert not service.engine_service.method_calls
+
+
+def _intake(hf_config=None, *, num_draft_tokens=0, rapidserve=False):
+    """The engine's request intake, as the server's executor runs it."""
+    from atom.model_engine.llm_engine import InputOutputProcessor
+
+    processor = InputOutputProcessor.__new__(InputOutputProcessor)
+    processor.__dict__.update(
+        config=SimpleNamespace(
+            hf_config=hf_config or SimpleNamespace(),
+            enable_dp_attention=False,
+            enable_rapidserve=rapidserve,
+        ),
+        num_speculative_tokens=num_draft_tokens,
+        block_size=16,
+        has_per_req_cache=False,
+        requests={},
+        _external_to_internal={},
+        _internal_to_external={},
+        prefix_hash_block_size=0,
+    )
+    return processor
+
+
+def _decode_leg(processor, delta=-2):
+    kv = dict(IMAGE_DECODE_KV, mrope_position_delta=delta)
+    return processor.preprocess(
+        list(PROMPT_IDS), SamplingParams(), kv_transfer_params=kv
+    )
+
+
+@pytest.mark.parametrize("delta", [1 - len(PROMPT_IDS), 0])
+def test_a_handed_off_delta_within_the_prompt_is_admitted(delta):
+    seq = _decode_leg(_intake(), delta)
+    assert seq.media_on_prefill_instance and seq.mrope_position_delta == delta
+
+
+@pytest.mark.parametrize(
+    "delta", [-len(PROMPT_IDS), 1, MAX_MODEL_LEN - len(PROMPT_IDS)]
+)
+def test_a_handed_off_delta_past_the_prompt_is_refused(delta):
+    processor = _intake()
+    with pytest.raises(ValueError, match="mrope_position_delta"):
+        _decode_leg(processor, delta)
+    assert processor.requests == {}
+
+
+def test_rapidserve_refuses_a_media_dropped_leg():
+    with pytest.raises(ValueError, match="RapidServe"):
+        _decode_leg(_intake(rapidserve=True))
+
+
+@pytest.mark.parametrize("num_draft_tokens", [0, 5])
+def test_dspark_refuses_a_media_dropped_leg_as_an_image_request(num_draft_tokens):
+    from atom.models.deepseek_v41.config import DeepseekV41TextConfig
+
+    processor = _intake(DeepseekV41TextConfig(), num_draft_tokens=num_draft_tokens)
+    if num_draft_tokens:
+        with pytest.raises(ValueError, match="DSpark currently supports text"):
+            _decode_leg(processor)
+    else:
+        assert _decode_leg(processor).media_on_prefill_instance
