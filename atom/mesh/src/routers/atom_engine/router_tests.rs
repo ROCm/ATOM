@@ -943,3 +943,24 @@ async fn template_kwargs_merge_as_the_python_server_merges_them() {
         );
     }
 }
+
+/// A matched stop string stays in the reply, as the Python server leaves it
+/// (its engine stops after the stop sequence): chat and completions alike.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_matched_stop_string_stays_in_the_reply() {
+    let mut served = Served::start(1).await;
+    let core = answer_each(std::mem::take(&mut served.cores), hello_world);
+    let body = user_hello(json!({"stop": ["world"]}));
+    let (status, body) = json_body(served.post("/v1/chat/completions", body).await).await;
+    drop(core.into_iter().next().unwrap().join().unwrap());
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["choices"][0]["message"]["content"], "hello world");
+
+    let mut served = Served::start(1).await;
+    let core = answer_each(std::mem::take(&mut served.cores), hello_world);
+    let body = json!({"model": MODEL, "prompt": "hello", "stop": ["world"]});
+    let (status, body) = json_body(served.post("/v1/completions", body).await).await;
+    drop(core.into_iter().next().unwrap().join().unwrap());
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["choices"][0]["text"], "hello world");
+}

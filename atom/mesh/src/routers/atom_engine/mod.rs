@@ -198,9 +198,15 @@ impl AtomEngineRouter {
     async fn prepare_generate(
         &self,
         headers: Option<&HeaderMap>,
-        request: GenerateRequest,
+        mut request: GenerateRequest,
         add_special_tokens: bool,
     ) -> Result<(GenerationPayload, ResponseContext), Response> {
+        // The Python server keeps a matched stop sequence in the text (the
+        // engine stops after it); so does this one.
+        request
+            .sampling_params
+            .get_or_insert_with(Default::default)
+            .no_stop_trim = Some(true);
         let (headers, model_id, app) = (headers.cloned(), self.model_id(), self.ctx.clone());
         self.on_prepare_worker(move || {
             let request = Arc::new(request);

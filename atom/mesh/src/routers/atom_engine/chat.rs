@@ -75,6 +75,9 @@ impl AtomEngineRouter {
             }
         }
         request.model = self.engine.model.served_name.clone();
+        // The Python server keeps a matched stop sequence in the reply (the
+        // engine stops after it); so does this one.
+        request.no_stop_trim = true;
         if request.top_logprobs.is_some() && !request.logprobs {
             return Err(bad_request("top_logprobs requires logprobs=true".into()));
         }
