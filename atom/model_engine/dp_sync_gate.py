@@ -11,24 +11,20 @@ class DPSyncGate:
     Every rank feeds it the same all_reduce results and runs the same number of
     busy rounds between syncs, so every rank syncs on the same round.
     Ranks with no local work still complete a paired dummy step. All ranks
-    must use the same interval, at most ``MAX_DP_SYNC_INTERVAL``.
-    ``interval == 1`` syncs every round. The rounds after such a sync run
-    paired, so once the group drains every rank still runs up to
-    ``interval - 1`` dummy rounds before the next sync sees it idle; utility
-    commands and shutdown wait for that sync too.
+    must use the same interval, 2 to ``MAX_DP_SYNC_INTERVAL`` (interval 1, every
+    round, needs no gate: `DPEngineCoreProc.busy_loop`). The rounds after a
+    sync that saw work run paired, so once the group drains every rank still
+    runs up to ``interval - 1`` dummy rounds before the next sync sees it idle;
+    utility commands and shutdown wait for that sync too.
     """
 
     def __init__(self, interval: int) -> None:
-        self.interval = max(1, int(interval))
+        self.interval = interval
         self._busy_rounds = 0
         self._last_sync_busy = False
 
     def should_sync(self) -> bool:
-        return (
-            self.interval == 1
-            or not self._last_sync_busy
-            or self._busy_rounds % self.interval == 0
-        )
+        return not self._last_sync_busy or self._busy_rounds % self.interval == 0
 
     def synced(self, has_unfinished: bool, shutdown: bool, held: bool) -> None:
         self._last_sync_busy = has_unfinished and not shutdown and not held

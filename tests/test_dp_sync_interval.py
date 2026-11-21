@@ -91,6 +91,8 @@ def _run(intervals, work, commands=None, shutdown_at=32, startup_error=None):
         def group_max_each(values, group, e=engine):
             if startup_error is not None:
                 raise startup_error
+            # The real payload is int64.
+            assert all(-(1 << 63) <= v < 1 << 63 for v in values), values
             values = group.exchange(e.rank, "bounds", e.tick, values)
             e.events.append(("bounds", e.tick))
             return tuple(values)
@@ -246,7 +248,8 @@ def test_mismatched_intervals_fail_on_all_ranks_before_state_or_forward(interval
 
 
 @pytest.mark.parametrize(
-    "intervals", [[1, None], [None, 8, 16, None], [1, 17], [17, 17]]
+    "intervals",
+    [[1, None], [None, 8, 16, None], [1, 17], [17, 17], [1 << 70, 1 << 70]],
 )
 def test_invalid_interval_fails_on_all_ranks_before_any_other_collective(intervals):
     engines, failures = _run(intervals, lambda r, t: True)

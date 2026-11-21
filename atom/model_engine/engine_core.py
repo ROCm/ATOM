@@ -1123,11 +1123,11 @@ class DPEngineCoreProc(EngineCore):
         metrics_interval = envs.ATOM_METRICS_UPDATE_INTERVAL_S
         next_metrics_push = 0.0
         try:
-            gate = DPSyncGate(
-                self._validate_dp_sync_interval(envs.ATOM_DP_SYNC_INTERVAL)
-            )
+            interval = self._validate_dp_sync_interval(envs.ATOM_DP_SYNC_INTERVAL)
+            # Interval 1 syncs every round, as on main: no gate.
+            gate = DPSyncGate(interval) if interval > 1 else None
             while True:
-                sync_now = gate.should_sync()
+                sync_now = gate is None or gate.should_sync()
                 if sync_now:
                     # Utility commands can hold the engine (offload, weight
                     # sync, pause). Applying them only on rounds that sync lets
@@ -1154,7 +1154,8 @@ class DPEngineCoreProc(EngineCore):
                     global_has_unfinished, global_shutdown, global_held = (
                         self._sync_dp_state(local_unfinished, shutdown, local_held)
                     )
-                    gate.synced(global_has_unfinished, global_shutdown, global_held)
+                    if gate is not None:
+                        gate.synced(global_has_unfinished, global_shutdown, global_held)
                 else:
                     # The last sync found unfinished work in the group: stay
                     # paired, including a dummy on ranks with no local work.
@@ -1197,7 +1198,8 @@ class DPEngineCoreProc(EngineCore):
                 # After the pair, so the idle rank's dummy counts too: that is
                 # what keeps every rank's step number equal. See `bump_step`.
                 self.scheduler.engine_stats.bump_step()
-                gate.busy_round_done()
+                if gate is not None:
+                    gate.busy_round_done()
         finally:
             try:
                 # Isolate the final publish so a publisher hiccup cannot skip
@@ -1220,7 +1222,8 @@ class DPEngineCoreProc(EngineCore):
         collective on the first skipped round. A peer lost here shuts the loop
         down as `_sync_dp_state` does.
         """
-        value = 0 if interval is None else interval
+        # Packed capped, so any int fits the int64 payload; past the cap is invalid.
+        value = 0 if interval is None else min(interval, MAX_DP_SYNC_INTERVAL + 1)
         try:
             highest, neg_lowest, invalid = group_max_each(
                 (value, -value, int(interval is None or value > MAX_DP_SYNC_INTERVAL)),

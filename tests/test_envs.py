@@ -84,13 +84,10 @@ def _get_envs():
         ("bad", None),
         ("", None),
         ("1.5", None),
-        (str((1 << 63) - 1), (1 << 63) - 1),
-        (str(1 << 63), None),
+        ("99", 99),  # past 16: rejected by every rank together (startup)
     ],
 )
-def test_dp_sync_interval_is_safe_to_pack_before_group_validation(
-    monkeypatch, raw, expected
-):
+def test_dp_sync_interval_env(monkeypatch, raw, expected):
     if raw is None:
         monkeypatch.delenv("ATOM_DP_SYNC_INTERVAL", raising=False)
     else:

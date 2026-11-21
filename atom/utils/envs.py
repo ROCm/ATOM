@@ -147,13 +147,12 @@ def _finite_float_env(name: str, default: float, *, allow_zero: bool) -> float:
 
 
 def _dp_sync_interval_env() -> int | None:
-    """Keep invalid input representable until every DP rank validates it."""
+    """None for a non-integer, so every DP rank can reject it together; 0 and
+    negative values mean 1."""
     try:
-        interval = max(1, int(os.getenv("ATOM_DP_SYNC_INTERVAL", "1")))
+        return max(1, int(os.getenv("ATOM_DP_SYNC_INTERVAL", "1")))
     except ValueError:
         return None
-    # Gloo's agreement payload is int64; do not overflow before the collective.
-    return interval if interval <= (1 << 63) - 1 else None
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
@@ -1077,6 +1076,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_CUSTOM_ALL_GATHER": lambda: (
         os.getenv("ATOM_USE_CUSTOM_ALL_GATHER", "1").lower() == "1"
     ),
+    # DP > 1 (single- or multi-node; not read under PP): after a sync that saw
+    # unfinished work, run the cross-DP state all_reduce only every N engine
+    # rounds (1 = every round, at most 16; 0 and negative values mean 1).
+    # Utility commands, abort and shutdown are applied only on rounds that sync,
+    # and once the group drains every rank still runs up to N-1 dummy rounds
+    # before the next sync.
+    "ATOM_DP_SYNC_INTERVAL": _dp_sync_interval_env,
     # Pure-DP LM head strategy (only active when the model TP group is size 1 and
     # the DP group is size > 1, i.e. pure DP attention on decode; every other
     # case — TP>1, DP off, prefill, ragged/draft rows — auto-falls back to the
@@ -1088,12 +1094,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #                  (config ②); kept for A/B and as a fallback.
     #   "default"   -> replicated full-vocab GEMM per DP rank (big GEMM, no comm);
     #                  explicit opt-out.
-    # DP > 1 (single- or multi-node; not read under PP): after a sync that saw
-    # unfinished work, run the cross-DP state all_reduce only every N engine
-    # rounds (1 = every round, at most 16). Utility commands, abort and shutdown are
-    # applied only on rounds that sync, and once the group drains every rank
-    # still runs up to N-1 dummy rounds before the next sync.
-    "ATOM_DP_SYNC_INTERVAL": _dp_sync_interval_env,
     "ATOM_DP_LM_HEAD_MODE": lambda: os.getenv(
         "ATOM_DP_LM_HEAD_MODE", "all2all"
     ).lower(),
