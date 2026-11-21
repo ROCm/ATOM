@@ -10,8 +10,8 @@ use crate::{
     },
     config::RoutingMode,
     core::runtime::build_runtime,
+    entrypoints::server::{self, ServerConfig},
     routers::atom_standalone::AtomStandaloneRuntime,
-    server::{self, ServerConfig},
     version,
 };
 

@@ -20,10 +20,10 @@ use serde_json::json;
 use crate::{
     config::RoutingMode,
     core::WorkerType,
+    entrypoints::server::AppState,
     observability::metrics::{
         engine_metrics::collect_engine_metrics, mesh_metrics::prometheus_handle,
     },
-    server::AppState,
 };
 
 pub struct MetricsRouteFactory;

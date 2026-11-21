@@ -14,12 +14,11 @@ use reqwest::Client;
 use crate::{
     config::RouterConfig,
     core::{
-        prepare_pool::PrepareHandle, steps::WorkflowEngines, JobQueue, LoadMonitor, WorkerRegistry,
-        WorkerService,
+        prepare_pool::PrepareHandle, steps::WorkflowEngines, token_bucket::TokenBucket, JobQueue,
+        LoadMonitor, WorkerRegistry, WorkerService,
     },
     kv_events::KvEventMonitor,
     kv_storage::StorageSources,
-    middleware::TokenBucket,
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
     reasoning_parser::ParserFactory as ReasoningParserFactory,

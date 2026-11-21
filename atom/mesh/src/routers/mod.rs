@@ -23,8 +23,8 @@ pub mod http_pd_router;
 pub mod http_router;
 pub mod ingress;
 pub mod openai;
-pub mod prepare;
-pub mod render;
+pub use crate::entrypoints::prepare;
+pub use crate::entrypoints::render;
 pub mod router_manager;
 #[cfg(test)]
 pub(crate) mod test_mocks;
@@ -43,6 +43,30 @@ pub trait RouterTrait: Send + Sync + Debug {
 
     /// Gracefully release router-owned resources during server shutdown.
     async fn shutdown(&self) {}
+
+    /// Token entry used by [`crate::entrypoints::mesh_backend::MeshBackend`].
+    ///
+    /// The request is already encoded. The default reports that this router
+    /// still serves text through its HTTP or gRPC engine interface.
+    async fn route_tokens(
+        &self,
+        _request: crate::entrypoints::backend::TokenRequest,
+    ) -> Result<crate::entrypoints::backend::TokenStream, crate::entrypoints::backend::BackendError>
+    {
+        Err(crate::entrypoints::backend::BackendError::unsupported(
+            format!("{} has no token entry", self.router_type()),
+        ))
+    }
+
+    /// Stop a request previously accepted by [`Self::route_tokens`].
+    async fn abort_tokens(
+        &self,
+        _request_id: &str,
+    ) -> Result<(), crate::entrypoints::backend::BackendError> {
+        Err(crate::entrypoints::backend::BackendError::unsupported(
+            format!("{} cannot abort a token request", self.router_type()),
+        ))
+    }
 
     /// Raw ingress dispatch. Native backends retain their existing typed API handling.
     async fn route_inference(

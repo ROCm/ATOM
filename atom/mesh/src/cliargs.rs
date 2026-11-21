@@ -9,9 +9,9 @@ use crate::{
         TokenizerCacheConfig,
     },
     core::ConnectionMode,
+    entrypoints::server::{ServerConfig, ServerTlsConfig},
     observability::metrics::PrometheusConfig,
     routers::atom_standalone::AtomStandaloneRuntime,
-    server::{ServerConfig, ServerTlsConfig},
 };
 
 pub fn parse_prefill_args() -> Vec<(String, Option<u16>)> {

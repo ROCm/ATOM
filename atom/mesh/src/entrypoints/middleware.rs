@@ -19,14 +19,13 @@ use tower::{Layer, Service};
 use tower_http::trace::{MakeSpan, OnRequest, OnResponse, TraceLayer};
 use tracing::{error, field::Empty, info, info_span, warn, Span};
 
-pub use crate::core::token_bucket::TokenBucket;
+use super::http_error;
 use crate::{
+    core::admission::AdmissionController,
     observability::{
         inflight_tracker::InFlightRequestTracker,
         metrics::{method_to_static_str, metrics_labels, normalize_path_for_metrics, MeshMetrics},
     },
-    routers::comm::error::extract_error_code_from_response,
-    server::AppState,
 };
 
 /// Extension type for storing request ID
@@ -166,7 +165,7 @@ impl<B> OnResponse<B> for ResponseLogger {
         let status = response.status();
         let status_code = status.as_u16();
 
-        let error_code = extract_error_code_from_response(response);
+        let error_code = http_error::error_code(response);
 
         // Layer 1: HTTP metrics
         MeshMetrics::record_http_response(status_code, error_code);
@@ -223,8 +222,7 @@ pub async fn payload_limit_middleware(
         .and_then(|v| v.parse::<u64>().ok())
         .is_some_and(|n| n > limit as u64)
     {
-        return crate::routers::comm::error::IngressError::body_too_large()
-            .response(request.uri().path());
+        return http_error::body_too_large(request.uri().path());
     }
     // Raw handlers also need a stream limit for chunked uploads.
     let request = request.map(|body| Body::new(http_body_util::Limited::new(body, limit)));
@@ -234,11 +232,11 @@ pub async fn payload_limit_middleware(
 /// Admission is acquired before invoking the handler and follows the response body.
 /// Dropping either the handler future or the body returns all reserved resources.
 pub async fn concurrency_limit_middleware(
-    State(app_state): State<Arc<AppState>>,
+    State(admission): State<Arc<AdmissionController>>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    match app_state.context.admission.acquire("http").await {
+    match admission.acquire("http").await {
         Ok(lease) => {
             MeshMetrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
             let response = next.run(request).await;
@@ -246,7 +244,7 @@ pub async fn concurrency_limit_middleware(
         }
         Err(error) => {
             MeshMetrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
-            crate::routers::comm::error::MeshLocalError::response(
+            http_error::local_response(
                 request.uri().path(),
                 StatusCode::from_u16(error.status).unwrap(),
                 error.code,
@@ -404,6 +402,7 @@ mod tests {
 #[cfg(test)]
 mod admission_tests {
     use super::*;
+    use crate::core::token_bucket::TokenBucket;
     use axum::{routing::get, Router};
     use futures_util::poll;
     use tower::ServiceExt;
@@ -424,16 +423,6 @@ mod admission_tests {
                 .build()
                 .unwrap(),
         );
-        let router = Arc::new(
-            crate::routers::http_router::Router::new(&context)
-                .await
-                .unwrap(),
-        );
-        let state = Arc::new(AppState {
-            context: context.clone(),
-            router,
-            router_manager: None,
-        });
         let app = Router::new()
             .route(
                 "/pending",
@@ -441,7 +430,7 @@ mod admission_tests {
             )
             .route("/body", get(|| async { "payload" }))
             .layer(axum::middleware::from_fn_with_state(
-                state,
+                context.admission.clone(),
                 concurrency_limit_middleware,
             ));
         let request = |path: &str| Request::builder().uri(path).body(Body::empty()).unwrap();

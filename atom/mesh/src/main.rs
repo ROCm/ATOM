@@ -2,7 +2,8 @@ use clap::Parser;
 use mesh::{
     cliargs::{filter_prefill_args_from, parse_prefill_args, Cli, Commands},
     core::runtime::build_runtime,
-    server, version,
+    entrypoints::server,
+    version,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
