@@ -12,13 +12,7 @@ if [[ -n "${ATOMESH_MESH_BINARY:-}" ]]; then
   printf '%s\n' "${ATOMESH_MESH_BINARY}"
   exit 0
 fi
-# Mesh-entrypoint workers need the reviewed source's PyO3 module, which the
-# image does not ship, so they always build.
-worker_module=false
-if [[ "${ATOMESH_WORKER_ENTRYPOINT:-python}" == "mesh" ]]; then
-  worker_module=true
-fi
-if [[ "${ATOMESH_BUILD_MESH:-false}" != "true" && "${worker_module}" != "true" ]]; then
+if [[ "${ATOMESH_BUILD_MESH:-false}" != "true" ]]; then
   printf '%s\n' /app/ATOM/atom/mesh/target/release/atomesh
   exit 0
 fi
@@ -26,8 +20,7 @@ fi
 artifact_dir="${run_dir}/mesh-build"
 container_dir="/run_logs/slurm_job-${job_id}/mesh-build"
 # The same job's benchmark and eval phases consume the same build artifact.
-if [[ ! -x "${artifact_dir}/atomesh" || ! -f "${artifact_dir}/mesh-build.json" \
-  || ( "${worker_module}" == "true" && ! -f "${artifact_dir}/python/atomesh_runner.so" ) ]]; then
+if [[ ! -x "${artifact_dir}/atomesh" || ! -f "${artifact_dir}/mesh-build.json" ]]; then
   # Spur's epilog deletes the user's day-old files under /tmp and /var/tmp,
   # which strips Cargo's 2006-stamped crate sources but keeps the .cargo-ok
   # markers that stop re-extraction. run_dir is <log root>/<cell>/slurm_job-<id>
@@ -45,7 +38,6 @@ if [[ ! -x "${artifact_dir}/atomesh" || ! -f "${artifact_dir}/mesh-build.json" \
     -e ATOMESH_MESH_SOURCE_COMMIT="${source_commit}" \
     -e ATOMESH_MESH_SOURCE_DIRTY="${source_dirty}" \
     -e ATOMESH_MESH_TARGET_DIR=/mesh-cache \
-    -e ATOMESH_WORKER_ENTRYPOINT="${ATOMESH_WORKER_ENTRYPOINT:-python}" \
     -v "${repo_root}:/workspace/ATOM:ro" \
     -v "${artifact_dir}:${container_dir}" \
     -v "${cache_dir}:/mesh-cache" \

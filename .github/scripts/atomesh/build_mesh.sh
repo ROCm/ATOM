@@ -51,20 +51,13 @@ lock_args=()
 if [[ -f "${build_dir}/source/Cargo.lock" ]]; then
   lock_args+=(--locked)
 fi
-# Mesh-entrypoint workers import the library as the atomesh_runner PyO3 module.
-build_module=false
-targets=(--bin atomesh)
-if [[ "${ATOMESH_WORKER_ENTRYPOINT:-python}" == "mesh" ]]; then
-  build_module=true
-  targets+=(--lib)
-fi
 run_cargo_build() {
-  cargo build --profile "${profile}" "${targets[@]}" \
+  cargo build --profile "${profile}" --bin atomesh \
     "${lock_args[@]}" \
     --manifest-path "${build_dir}/source/Cargo.toml" \
     --target-dir "${target_dir}" > "${log_dir}/mesh-build.log" 2>&1
 }
-echo "[build] Mesh commit=${source_commit} profile=${profile} targets=${targets[*]}" >&2
+echo "[build] Mesh commit=${source_commit} profile=${profile}" >&2
 if ! run_cargo_build; then
   # Shared host mesh caches go stale in two ways:
   # 1) Cargo leaves .cargo-ok after a cut-short crate extract, so registry/src
@@ -84,10 +77,6 @@ if ! run_cargo_build; then
 fi
 cp "${build_dir}/source/Cargo.lock" "${log_dir}/mesh-Cargo.lock"
 cp "${target_dir}/${profile}/atomesh" "${log_dir}/atomesh"
-if [[ "${build_module}" == "true" ]]; then
-  mkdir -p "${log_dir}/python"
-  cp "${target_dir}/${profile}/libmesh.so" "${log_dir}/python/atomesh_runner.so"
-fi
 python3 - "${log_dir}" "${source_commit}" "${profile}" <<'PY'
 import hashlib
 import json
@@ -105,9 +94,6 @@ metadata = {
     "binary_sha256": hashlib.sha256((output / "atomesh").read_bytes()).hexdigest(),
     "lockfile_sha256": hashlib.sha256((output / "mesh-Cargo.lock").read_bytes()).hexdigest(),
 }
-module = output / "python" / "atomesh_runner.so"
-if module.is_file():
-    metadata["python_module_sha256"] = hashlib.sha256(module.read_bytes()).hexdigest()
 (output / "mesh-build.json").write_text(json.dumps(metadata, indent=2) + "\n")
 PY
 printf '%s\n' "${log_dir}/atomesh"
