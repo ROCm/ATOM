@@ -1,18 +1,22 @@
 //! ATOM workers over `atom.grpc.v1`: the client, a payload as a GenerateRequest,
-//! a Generate stream as `TokenChunk`s, and ATOM's P/D flow for a pair.
+//! a Generate stream as `TokenChunk`s, ATOM's P/D flow for a pair, and the Session.
 
 pub(crate) mod pair;
 pub(crate) mod request;
+// No router sends requests over a Session yet; its tests do.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod session;
 pub(crate) mod stream;
 
 use std::time::Duration;
 
+use futures::Stream;
 use tonic::{transport::Channel, Status, Streaming};
 
 use crate::atom_engine::grpc::{
-    atom_engine_client::AtomEngineClient, GenerateRequest, GenerateResponse, GetModelInfoRequest,
-    GetModelInfoResponse, GetServerInfoRequest, GetServerInfoResponse, HealthCheckRequest,
-    HealthCheckResponse,
+    atom_engine_client::AtomEngineClient, Frames, GenerateRequest, GenerateResponse,
+    GetModelInfoRequest, GetModelInfoResponse, GetServerInfoRequest, GetServerInfoResponse,
+    HealthCheckRequest, HealthCheckResponse,
 };
 
 /// One ATOM instance's `AtomEngine` service.
@@ -76,6 +80,17 @@ impl AtomClient {
     ) -> Result<Streaming<GenerateResponse>, Status> {
         let mut client = self.client.clone();
         Ok(client.generate(request).await?.into_inner())
+    }
+
+    /// The Session call: ATOM reads `frames` as they come and answers on the
+    /// returned stream.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn session(
+        &self,
+        frames: impl Stream<Item = Frames> + Send + 'static,
+    ) -> Result<Streaming<Frames>, Status> {
+        let mut client = self.client.clone();
+        Ok(client.session(frames).await?.into_inner())
     }
 }
 
