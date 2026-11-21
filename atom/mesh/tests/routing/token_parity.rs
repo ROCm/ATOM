@@ -146,6 +146,8 @@ async fn router(model: &Path, backend: &str) -> (PreparePoolRuntime, Arc<AppCont
     if backend == "fastokens" {
         config.fastokens.models = vec!["*".to_string()];
         config.fastokens.strict = true;
+        // The timed encodes repeat a prompt, which the segment cache would serve.
+        config.fastokens.segment_cache_mb = Some(0);
     }
     let pool = PreparePoolRuntime::new(config.resolved_prepare_pool().unwrap()).unwrap();
     let app = Arc::new(

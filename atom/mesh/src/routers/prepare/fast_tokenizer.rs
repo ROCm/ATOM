@@ -1,8 +1,9 @@
 //! Prompt encoding with fastokens.
 //!
 //! fastokens encodes the BPE tokenizers of `tokenizer.json` files faster than
-//! HuggingFace `tokenizers`, and splits a long prompt across a pool of its own
-//! threads (one per logical core up to 32, or `FASTOKENS_BPE_THREADS`).
+//! HuggingFace `tokenizers`, and splits a long text between special tokens
+//! across a pool of its own threads (one per logical core up to 32, or
+//! `FASTOKENS_BPE_THREADS`).
 //! Routing by token needs the ids the engine computes, so a model's prompts
 //! encode with fastokens only once fastokens encodes a set of probe texts exactly
 //! as its HuggingFace tokenizer does, and gives the tokens only
@@ -177,11 +178,11 @@ pub(crate) struct FastTokenizer {
 impl FastTokenizer {
     /// `inner`, encoding with fastokens from the `tokenizer.json` at `path` it was
     /// loaded from, or why fastokens does not encode the probe texts as `inner`
-    /// does. `segment_cache_bytes` overrides `FASTOKENS_SEGMENT_CACHE`.
+    /// does. fastokens' segment cache gets `segment_cache_bytes`, or is off at 0.
     pub(crate) fn new(
         inner: Arc<dyn Tokenizer>,
         path: &Path,
-        segment_cache_bytes: Option<usize>,
+        segment_cache_bytes: usize,
     ) -> Result<Self, String> {
         if !inner.as_any().is::<HuggingFaceTokenizer>() {
             return Err("only HuggingFace tokenizers encode with fastokens".into());
@@ -190,9 +191,7 @@ impl FastTokenizer {
         // adds the tokens that only `tokenizer_config.json` declares.
         let mut fast = fastokens::Tokenizer::from_file(path)
             .map_err(|error| format!("fastokens cannot load {}: {error}", path.display()))?;
-        if let Some(bytes) = segment_cache_bytes {
-            fast.enable_segment_cache(bytes);
-        }
+        fast.enable_segment_cache(segment_cache_bytes);
         let (prefix, suffix) = special_affixes(&*inner)?;
         let chat = probe_chat(&*inner);
         let mut tokenizer = Self {
@@ -597,12 +596,11 @@ impl Tokenizer for FastTokenizer {
 
 #[cfg(test)]
 mod tests {
-    use serial_test::serial;
-
     use super::*;
     use crate::{
+        config::DEFAULT_FASTOKENS_SEGMENT_CACHE_MB,
         routers::test_mocks::tokenizer::{
-            byte_level_next_id, byte_level_tokenizer_dir, hf_tokenizer, hf_tokenizer_path, EnvVar,
+            byte_level_next_id, byte_level_tokenizer_dir, hf_tokenizer, hf_tokenizer_path,
             BYTE_LEVEL_MERGES,
         },
         tokenizer::{factory, MockTokenizer},
@@ -613,7 +611,7 @@ mod tests {
     fn load(dir: &Path) -> (Arc<dyn Tokenizer>, Result<FastTokenizer, String>) {
         let path = dir.join("tokenizer.json");
         let hf = factory::create_tokenizer(path.to_str().unwrap()).unwrap();
-        let fast = FastTokenizer::new(hf.clone(), &path, None);
+        let fast = FastTokenizer::new(hf.clone(), &path, 0);
         (hf, fast)
     }
 
@@ -881,7 +879,7 @@ mod tests {
         let other = byte_level_tokenizer_dir(&merges, true, json!({}));
         let path = hf.path().join("tokenizer.json");
         let hf = factory::create_tokenizer(path.to_str().unwrap()).unwrap();
-        let error = FastTokenizer::new(hf, &other.path().join("tokenizer.json"), None)
+        let error = FastTokenizer::new(hf, &other.path().join("tokenizer.json"), 0)
             .err()
             .unwrap();
         assert!(error.contains("fastokens encodes"), "{error}");
@@ -890,23 +888,19 @@ mod tests {
     #[test]
     fn tokenizers_fastokens_cannot_load_are_refused() {
         let path = Path::new(hf_tokenizer_path());
-        let error = FastTokenizer::new(hf_tokenizer(), path, None)
-            .err()
-            .unwrap();
+        let error = FastTokenizer::new(hf_tokenizer(), path, 0).err().unwrap();
         assert!(error.contains("fastokens cannot load"), "{error}");
-        let error = FastTokenizer::new(Arc::new(MockTokenizer::new()), path, None)
+        let error = FastTokenizer::new(Arc::new(MockTokenizer::new()), path, 0)
             .err()
             .unwrap();
         assert!(error.contains("only HuggingFace"), "{error}");
     }
 
     /// `--fastokens-models` names a model by the name or the source its tokenizer
-    /// registers under, or as `*`; `--fastokens-segment-cache-mb 0` turns off
-    /// the segment cache `FASTOKENS_SEGMENT_CACHE` turns on.
+    /// registers under, or as `*`; `--fastokens-segment-cache-mb` sizes the
+    /// segment cache, and 0 turns it off.
     #[tokio::test]
-    #[serial]
     async fn listed_models_encode_with_fastokens() {
-        let _cache = EnvVar::set("FASTOKENS_SEGMENT_CACHE", "1");
         let dir = byte_level_tokenizer_dir(BYTE_LEVEL_MERGES, true, json!({}));
         let source = dir.path().to_str().unwrap();
         let file = dir.path().join("tokenizer.json");
@@ -922,10 +916,15 @@ mod tests {
             .await
             .unwrap();
         assert!(Arc::ptr_eq(&kept, &hf));
-        for (models, source, segment_cache_mb) in [
-            (["model"], source, Some(1)),
-            ([source], source, Some(0)),
-            (["*"], file.to_str().unwrap(), None),
+        for (models, source, segment_cache_mb, budget) in [
+            (["model"], source, Some(1), Some(1 << 20)),
+            ([source], source, Some(0), None),
+            (
+                ["*"],
+                file.to_str().unwrap(),
+                None,
+                Some(DEFAULT_FASTOKENS_SEGMENT_CACHE_MB << 20),
+            ),
         ] {
             let fast = with_fastokens(
                 hf.clone(),
@@ -937,8 +936,8 @@ mod tests {
             .unwrap();
             let fast = fast.as_any().downcast_ref::<FastTokenizer>().unwrap();
             assert_eq!(
-                fast.fast.segment_cache_stats().is_some(),
-                segment_cache_mb != Some(0)
+                fast.fast.segment_cache_stats().map(|stats| stats.max_bytes),
+                budget
             );
         }
     }

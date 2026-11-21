@@ -850,21 +850,21 @@ mod tests {
             }
         );
         assert_eq!(config.resolved_fastokens_max_tokenize_bytes(), 1000);
-        assert_eq!(config.fastokens.segment_cache_bytes(), Some(2 << 20));
+        assert_eq!(config.fastokens.segment_cache_bytes(), 2 << 20);
         assert!(config
             .fastokens
             .covers("deepseek-ai/DeepSeek-V4.1-Flash", "/elsewhere"));
         assert!(config.fastokens.covers("qwen", "/models/qwen"));
         assert!(!config.fastokens.covers("qwen", "/models/qwen2"));
 
-        // Without the options no model encodes with fastokens, and its limit
-        // follows a larger prepare limit.
+        // Without the options no model encodes with fastokens, its limit
+        // follows a larger prepare limit, and its segment cache has 1 GiB.
         let args =
             CliArgs::try_parse_from(["atomesh", "--prepare-max-tokenize-bytes", "100000000"])
                 .unwrap();
         let config = args.to_router_config(Vec::new()).unwrap();
         assert!(!config.fastokens.covers("any", "any"));
-        assert_eq!(config.fastokens.segment_cache_bytes(), None);
+        assert_eq!(config.fastokens.segment_cache_bytes(), 1 << 30);
         assert_eq!(config.resolved_fastokens_max_tokenize_bytes(), 100_000_000);
         let config = CliArgs::try_parse_from(["atomesh", "--fastokens-models", "*"])
             .unwrap()
