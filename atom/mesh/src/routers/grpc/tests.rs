@@ -1567,3 +1567,189 @@ mod h_completion_adapter {
         assert_eq!(total, prompt + compl);
     }
 }
+
+mod i_atom_refusals {
+    use std::sync::Arc;
+
+    use axum::http::StatusCode;
+    use http::{header::CONTENT_TYPE, HeaderMap, HeaderValue};
+    use serde_json::{json, Value};
+
+    use crate::app_context::AppContext;
+    use crate::config::RouterConfig;
+    use crate::core::prepare_pool::PreparePoolRuntime;
+    use crate::core::{BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType};
+    use crate::observability::metrics::metrics_labels;
+    use crate::routers::comm::error::extract_error_code_from_response;
+    use crate::routers::grpc::{pd_router::GrpcPDRouter, pipeline::Pipeline, router::GrpcRouter};
+    use crate::routers::ingress::InferenceEnvelope;
+    use crate::routers::test_mocks::{self, hf_tokenizer, MockDispatcher, MockPdPlanner};
+    use crate::routers::token_handle::engine_error::EngineError;
+    use crate::routers::token_handle::test_support::synthetic_single_stream;
+    use crate::routers::token_handle::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
+    use crate::routers::token_handle::token_handle::TokenHandle;
+    use crate::routers::RouterTrait;
+    use crate::tokenizer::registry::TokenizerRegistry;
+
+    type Answer = (StatusCode, &'static str); // a status and its error code
+    const SERVED: Answer = (StatusCode::OK, "");
+    const MEDIA: Answer = (StatusCode::BAD_REQUEST, "unsupported_media");
+    const UNSUPPORTED: Answer = (StatusCode::NOT_IMPLEMENTED, "unsupported_api");
+
+    fn owned((status, code): Answer) -> (StatusCode, String) {
+        (status, code.to_owned())
+    }
+
+    /// Each request to model "m", and the answer when ATOM gRPC workers serve "m".
+    fn requests() -> Vec<(&'static str, Value, Answer)> {
+        let text = json!({"type": "text", "text": "test"});
+        let image = json!({"type": "image_url", "image_url": {"url": "https://x/a.png"}});
+        let video = json!({"type": "video_url", "video_url": {"url": "https://x/a.mp4"}});
+        let chat = |parts: Vec<&Value>| {
+            let message = json!({"role": "user", "content": parts});
+            json!({"model": "m", "messages": [message]})
+        };
+        let generate = |media: Option<&str>| {
+            let mut body = json!({"model": "m", "text": "test"});
+            if let Some(field) = media {
+                body[field] = json!("https://x/a");
+            }
+            body
+        };
+        let responses = json!({"model": "m", "input": "test"});
+        let message = json!({"role": "user", "content": "test"});
+        let messages = json!({"model": "m", "max_tokens": 8, "messages": [message]});
+        vec![
+            ("/v1/chat/completions", chat(vec![&text]), SERVED),
+            ("/v1/chat/completions", chat(vec![&text, &image]), MEDIA),
+            ("/v1/chat/completions", chat(vec![&text, &video]), MEDIA),
+            ("/generate", generate(None), SERVED),
+            ("/generate", generate(Some("image_data")), MEDIA),
+            ("/generate", generate(Some("video_data")), MEDIA),
+            ("/generate", generate(Some("audio_data")), MEDIA),
+            ("/v1/responses", responses, UNSUPPORTED),
+            ("/v1/messages", messages, UNSUPPORTED),
+        ]
+    }
+
+    fn completed() -> Result<TokenHandle, EngineError> {
+        Ok(synthetic_single_stream(vec![Ok(TokenChunk::Complete {
+            token_ids: vec![0],
+            finish_reason: FinishReason::Stop,
+            matched_stop: None,
+            usage: Usage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+            },
+            logprobs: None,
+            input_logprobs: None,
+            meta: WorkerMeta {
+                request_id: "req".to_string(),
+                weight_version: None,
+                cached_tokens: 0,
+            },
+        })]))
+    }
+
+    fn worker(model: &str, runtime: RuntimeType, kind: WorkerType) -> Arc<dyn Worker> {
+        let worker = BasicWorkerBuilder::new(format!("grpc://{model}-{kind}:1"))
+            .worker_type(kind)
+            .connection_mode(ConnectionMode::Grpc { port: None })
+            .runtime_type(runtime)
+            .model_id(model)
+            .build();
+        Arc::new(worker)
+    }
+
+    /// Each request's status and error code through `route_inference` when one `runtime`
+    /// worker serves "m" beside an ATOM worker of model "a", and how many were dispatched.
+    async fn answers(runtime: RuntimeType) -> (Vec<(StatusCode, String)>, usize) {
+        let config = RouterConfig::default();
+        let pool = PreparePoolRuntime::new(config.resolved_prepare_pool().unwrap()).unwrap();
+        let ctx = Arc::new(
+            AppContext::from_config(config, 5, pool.handle())
+                .await
+                .unwrap(),
+        );
+        let id = TokenizerRegistry::generate_id();
+        ctx.tokenizer_registry
+            .load(&id, "m", "hf-test", || async { Ok(hf_tokenizer()) })
+            .await
+            .unwrap();
+        let served = worker("m", runtime, WorkerType::Regular);
+        ctx.worker_registry.register(served.clone());
+        ctx.worker_registry
+            .register(worker("a", RuntimeType::Atom, WorkerType::Regular));
+        let dispatcher = Arc::new(MockDispatcher::repeat_with_stream(completed));
+        let planner = Arc::new(MockPdPlanner::repeat_single(served, "random"));
+        let pipeline =
+            Pipeline::with_injected(planner, dispatcher.clone(), metrics_labels::BACKEND_REGULAR);
+        let router = GrpcRouter::with_pipeline(&ctx, pipeline);
+
+        let mut answers = Vec::new();
+        for (path, body, _) in requests() {
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            let body = body.to_string().into();
+            let request = InferenceEnvelope::parse(path.parse().unwrap(), headers, body, &ctx)
+                .await
+                .unwrap();
+            let response = router.route_inference(request, &ctx).await;
+            let code = extract_error_code_from_response(&response).to_owned();
+            answers.push((response.status(), code));
+        }
+        (answers, dispatcher.calls().len())
+    }
+
+    #[tokio::test]
+    async fn test_atom_workers_get_no_media_responses_or_messages_request() {
+        let (answers, dispatched) = answers(RuntimeType::Atom).await;
+        let expected: Vec<_> = requests().into_iter().map(|(_, _, a)| owned(a)).collect();
+        assert_eq!(answers, expected);
+        assert_eq!(dispatched, 2, "only the text chat and the text generate");
+    }
+
+    #[tokio::test]
+    async fn test_sglang_and_vllm_workers_keep_serving_media_and_responses() {
+        for runtime in [RuntimeType::Sglang, RuntimeType::Vllm] {
+            let (answers, dispatched) = answers(runtime.clone()).await;
+            let expected: Vec<_> = requests()
+                .into_iter()
+                .map(|(path, _, _)| match path {
+                    "/v1/messages" => owned(UNSUPPORTED),
+                    _ => owned(SERVED),
+                })
+                .collect();
+            assert_eq!(answers, expected, "{runtime}");
+            assert_eq!(dispatched, expected.len() - 1, "{runtime}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_an_atom_pair_gets_no_media_request() {
+        let ctx = test_mocks::app_context_with_hf_tokenizer("m");
+        let router = GrpcPDRouter::new(&ctx).await.unwrap();
+        let prefill = WorkerType::Prefill {
+            bootstrap_port: None,
+        };
+        for kind in [prefill, WorkerType::Decode] {
+            ctx.worker_registry
+                .register(worker("m", RuntimeType::Atom, kind));
+        }
+        for (path, body, answer) in requests().into_iter().filter(|(_, _, a)| *a == MEDIA) {
+            let response = match path {
+                "/generate" => {
+                    let body = serde_json::from_value(body).unwrap();
+                    router.route_generate(None, &body, Some("m")).await
+                }
+                _ => {
+                    let body = serde_json::from_value(body).unwrap();
+                    router.route_chat(None, &body, Some("m")).await
+                }
+            };
+            let code = extract_error_code_from_response(&response);
+            assert_eq!((response.status(), code), answer, "{path}");
+        }
+    }
+}

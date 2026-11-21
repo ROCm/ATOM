@@ -949,6 +949,7 @@ mod e_generation_payload {
             stream: false,
             return_hidden_states: false,
             log_metrics: false,
+            structured_output: None,
         }
     }
 
@@ -1245,6 +1246,26 @@ mod h_prepare_chat_generate {
     }
 
     #[test]
+    fn test_prepare_chat_records_its_template_and_encode_stages() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let metrics = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let components = test_mocks::app_context_with_hf_tokenizer("m");
+        prepare_chat(
+            chat_req(false),
+            None,
+            Some("m".to_string()),
+            components.as_ref(),
+        )
+        .expect("HF tokenizer must succeed");
+        let rendered = metrics.render();
+        for stage in ["template", "encode"] {
+            let count = format!("mesh_prepare_stage_seconds_count{{stage=\"{stage}\"}} 1");
+            assert!(rendered.lines().any(|line| line == count), "{rendered}");
+        }
+    }
+
+    #[test]
     fn test_prepare_chat_streaming_flag_threads_through() {
         let components = test_mocks::app_context_with_hf_tokenizer("m");
         let (payload, ctx) = prepare_chat(
@@ -1456,5 +1477,108 @@ mod h_prepare_chat_generate {
     fn test_prepare_no_mesh_grpc_in_returned_types() {
         assert!(!std::any::type_name::<GenerationPayload>().contains("mesh_grpc"));
         assert!(!std::any::type_name::<ResponseContext>().contains("mesh_grpc"));
+    }
+}
+
+mod i_atom_structured_output {
+    use std::sync::Arc;
+
+    use serde_json::{json, Value};
+
+    use crate::core::{worker::RuntimeType, BasicWorkerBuilder};
+    use crate::protocols::chat::ChatCompletionRequest;
+    use crate::routers::prepare::{generation_payload::GenerationPayload, prepare_chat};
+    use crate::routers::test_mocks;
+
+    /// `body` prepared for model "m", whose one worker runs `runtime` with `labels`.
+    fn prepare(body: Value, runtime: RuntimeType, labels: &[(&str, &str)]) -> GenerationPayload {
+        let ctx = test_mocks::app_context_with_hf_tokenizer("m");
+        let mut worker = BasicWorkerBuilder::new("grpc://worker:1")
+            .runtime_type(runtime)
+            .model_id("m");
+        for (key, value) in labels {
+            worker = worker.label(*key, *value);
+        }
+        ctx.worker_registry.register(Arc::new(worker.build()));
+        let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+        let (payload, _) = prepare_chat(Arc::new(request), None, Some("m".into()), &ctx).unwrap();
+        payload
+    }
+
+    fn parsed(json: Option<String>) -> Option<Value> {
+        json.map(|json| serde_json::from_str(&json).unwrap())
+    }
+
+    #[test]
+    fn an_atom_chat_carries_its_fields_as_sent_its_kwargs_and_its_reasoning_opening() {
+        let tool =
+            |name: &str| json!({"type": "function", "function": {"name": name, "parameters": {}}});
+        let format = json!({"type": "json_schema", "json_schema": {"name": "a", "schema": {}}});
+        // The named choice narrows the tools atomesh renders, not those it carries.
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "developer", "content": "d", "tools": [tool("lookup")]},
+                {"role": "user", "content": "hi <think>\n"},
+            ],
+            "tools": [tool("ping"), tool("pong")],
+            "tool_choice": {"type": "function", "function": {"name": "pong"}},
+            "response_format": format,
+            "reasoning_effort": "high",
+            "chat_template_kwargs": {"flag": "request"},
+        });
+        let labels = [
+            (
+                "default_chat_template_kwargs_json",
+                r#"{"flag": "default", "kept": 1}"#,
+            ),
+            ("reasoning_open_markers", r#"["<mm:think>", "<think>"]"#),
+        ];
+        let payload = prepare(body.clone(), RuntimeType::Atom, &labels);
+
+        assert!(payload.text.ends_with("hi <think>\n"), "{}", payload.text);
+        let carried = payload.structured_output.expect("an ATOM chat carries one");
+        assert_eq!(parsed(carried.tools_json), Some(body["tools"].clone()));
+        assert_eq!(
+            parsed(carried.tool_choice_json),
+            Some(body["tool_choice"].clone())
+        );
+        assert_eq!(parsed(carried.response_format_json), Some(format));
+        let message_tools = json!([[tool("lookup")], null]);
+        assert_eq!(parsed(carried.message_tools_json), Some(message_tools));
+        let kwargs = json!({"flag": "request", "kept": 1, "reasoning_effort": "high"});
+        assert_eq!(
+            parsed(Some(carried.chat_template_kwargs_json)),
+            Some(kwargs)
+        );
+        assert!(carried.prompt_opens_reasoning);
+    }
+
+    #[test]
+    fn a_plain_atom_chat_carries_no_fields_and_its_prompt_opens_no_reasoning() {
+        let body = json!({"model": "m", "messages": [{"role": "user", "content": "<think> hi"}]});
+        let labels = [("reasoning_open_markers", r#"["<think>"]"#)];
+        let carried = prepare(body, RuntimeType::Atom, &labels)
+            .structured_output
+            .expect("an ATOM chat carries one");
+
+        let fields = [
+            carried.tools_json,
+            carried.tool_choice_json,
+            carried.response_format_json,
+            carried.message_tools_json,
+        ];
+        assert_eq!(fields, [None, None, None, None]);
+        assert_eq!(carried.chat_template_kwargs_json, "{}");
+        assert!(!carried.prompt_opens_reasoning);
+    }
+
+    #[test]
+    fn a_chat_to_an_sglang_or_vllm_worker_carries_none() {
+        let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        for runtime in [RuntimeType::Sglang, RuntimeType::Vllm] {
+            let payload = prepare(body.clone(), runtime, &[]);
+            assert!(payload.structured_output.is_none());
+        }
     }
 }
