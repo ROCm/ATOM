@@ -41,18 +41,22 @@ def mrope_decode_positions(
     req_ids, context_lens, lengths, deltas: dict, out: np.ndarray
 ) -> None:
     """Write each decode token's MRoPE position into ``out`` (3 planes, the
-    tokens in request order): its index in its own sequence, moved by its
+    tokens in request order): its `decode_positions` index, moved by its
     request's entry in ``deltas`` -- what an image prompt's positions put past
     its text, or what a decode leg's prefill handed it. A request without one
     is text."""
-    offset = 0
-    for req_id, context_len, length in zip(req_ids, context_lens, lengths):
-        length = int(length)
-        start = int(context_len) - length + int(deltas.get(req_id, 0))
-        out[:, offset : offset + length] = np.arange(
-            start, start + length, dtype=np.int64
-        )[None, :]
-        offset += length
+    lengths = np.asarray(lengths)
+    cu_seqlens_q = np.zeros(len(lengths) + 1, dtype=np.int32)
+    np.cumsum(lengths, out=cu_seqlens_q[1:])
+    positions = decode_positions(np.asarray(context_lens), lengths, cu_seqlens_q)
+    if deltas:
+        request_deltas = np.fromiter(
+            (deltas.get(req_id, 0) for req_id, _ in zip(req_ids, lengths)),
+            dtype=np.int64,
+            count=len(lengths),
+        )
+        positions = positions + np.repeat(request_deltas, lengths)
+    out[:, : len(positions)] = positions
 
 
 def query_is_uniform(lengths: np.ndarray, max_seqlen_q: int) -> bool:

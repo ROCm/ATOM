@@ -1360,9 +1360,10 @@ def _validate_kv_transfer_params(params: dict[str, Any] | None) -> None:
 
     Every endpoint that takes `kv_transfer_params` calls this first.
     """
+    if not params:
+        return
     _validate_chunked_receive(params)
-    if params:
-        check_media_handoff(params, _get_engine_max_model_len())
+    check_media_handoff(params, _get_engine_max_model_len())
 
 
 def _engine_kv_transfer_params(

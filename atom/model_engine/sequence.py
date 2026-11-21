@@ -273,6 +273,8 @@ class OffloadJointRecord:
 
 class Sequence:
     counter = count()
+    # True only for a decode leg whose prefill kept the media, set in __init__.
+    media_on_prefill_instance = False
 
     def __init__(
         self,
@@ -318,14 +320,7 @@ class Sequence:
         self.multimodal_data = multimodal_data
         self.multimodal_cache_ready = False
         # Immutable content identity survives payload release and preemption.
-        # A decode leg whose prefill kept the media keeps what the prefill
-        # derived from it; the scheduler never prefills it locally.
-        self.media_on_prefill_instance = (
-            multimodal_data is None and leaves_media_on_prefill(kv_transfer_params)
-        )
-        self.cache_seed = (
-            kv_transfer_params["cache_seed"] if self.media_on_prefill_instance else -1
-        )
+        self.cache_seed = -1
         if multimodal_data is not None:
             from atom.model_engine.multimodal_runtime import multimodal_cache_seed
 
@@ -333,11 +328,19 @@ class Sequence:
             if self.cache_seed is None:
                 self.cache_seed = multimodal_cache_seed(multimodal_data)
         self.mrope_positions = mrope_positions
-        self.mrope_position_delta = (
-            kv_transfer_params.get("mrope_position_delta", 0)
-            if self.media_on_prefill_instance
-            else mrope_position_delta
-        )
+        self.mrope_position_delta = mrope_position_delta
+        if (
+            kv_transfer_params is not None
+            and multimodal_data is None
+            and leaves_media_on_prefill(kv_transfer_params)
+        ):
+            # A decode leg whose prefill kept the media keeps what the prefill
+            # derived from it; the scheduler never prefills it locally.
+            self.media_on_prefill_instance = True
+            self.cache_seed = kv_transfer_params["cache_seed"]
+            self.mrope_position_delta = kv_transfer_params.get(
+                "mrope_position_delta", 0
+            )
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
         # Host-known prefix, excluding deferred outputs and draft placeholders.
