@@ -57,6 +57,11 @@ impl StepExecutor<LocalWorkerWorkflowData> for SubmitTokenizerJobStep {
             .chat_template
             .clone()
             .or_else(|| app_context.router_config.chat_template.clone());
+        // Without one, the worker's own template (an ATOM worker's GetModelInfo label)
+        let inline_chat_template = match chat_template {
+            Some(_) => None,
+            None => labels.get("chat_template").cloned(),
+        };
 
         // Get cache config from router config
         let cache_config = app_context.router_config.tokenizer_cache.to_option();
@@ -108,6 +113,7 @@ impl StepExecutor<LocalWorkerWorkflowData> for SubmitTokenizerJobStep {
                 name: model_id.clone(),
                 source: tokenizer_path,
                 chat_template_path: chat_template.clone(),
+                inline_chat_template: inline_chat_template.clone(),
                 cache_config: cache_config.clone(),
                 fail_on_duplicate: false,
             };

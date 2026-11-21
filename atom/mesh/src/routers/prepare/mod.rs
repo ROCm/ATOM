@@ -29,7 +29,7 @@ pub(crate) mod tool_constraints;
 #[cfg(test)]
 mod tests;
 
-use chat_template::process_chat_messages;
+use chat_template::{default_template_kwargs, process_chat_messages_with_defaults};
 use generation_payload::{GenerationPayload, LogprobConfig, SamplingParams, StopConfig};
 use response_context::{ProtocolRequest, ResponseContext};
 use stop_decoder_builder::create_stop_decoder;
@@ -59,11 +59,15 @@ pub fn prepare_chat(
         error::internal_error("model_id_not_set", "model_id not set in request")
     })?;
     let tokenizer = lookup_tokenizer(model_id_str, &components.tokenizer_registry)?;
+    let workers = components.worker_registry.get_by_model(model_id_str);
+    let default_kwargs = default_template_kwargs(&workers)
+        .map_err(|e| error::internal_error("invalid_default_template_kwargs", e))?;
 
     let body_ref = filter_chat_request_by_tool_choice(&req);
 
-    let processed = process_chat_messages(&body_ref, &*tokenizer)
-        .map_err(|e| error::bad_request("process_messages_failed", e))?;
+    let processed =
+        process_chat_messages_with_defaults(&body_ref, &*tokenizer, default_kwargs.as_ref())
+            .map_err(|e| error::bad_request("process_messages_failed", e))?;
 
     let encoding = tokenizer
         .encode(&processed.text, false)

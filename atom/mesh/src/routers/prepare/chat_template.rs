@@ -1,11 +1,12 @@
 //! Chat-template rendering helpers: turn `ChatMessage` lists into the JSON
 //! shape that HuggingFace chat templates consume.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use serde_json::{json, Value};
 
 use crate::{
+    core::Worker,
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage},
         common::StringOrArray,
@@ -25,6 +26,24 @@ pub struct ProcessedMessages {
     pub stop_sequences: Option<StringOrArray>,
 }
 
+/// The label with the template kwargs an ATOM worker renders chats with by default:
+/// GetModelInfo's `default_chat_template_kwargs_json`, a JSON object.
+const DEFAULT_TEMPLATE_KWARGS_LABEL: &str = "default_chat_template_kwargs_json";
+
+/// A model's default template kwargs, from the first of its `workers` with the label.
+pub(crate) fn default_template_kwargs(
+    workers: &[Arc<dyn Worker>],
+) -> Result<Option<HashMap<String, Value>>, String> {
+    workers
+        .iter()
+        .find_map(|worker| worker.metadata().labels.get(DEFAULT_TEMPLATE_KWARGS_LABEL))
+        .map(|json| {
+            serde_json::from_str(json)
+                .map_err(|e| format!("Invalid {DEFAULT_TEMPLATE_KWARGS_LABEL} label {json}: {e}"))
+        })
+        .transpose()
+}
+
 /// Process chat messages and apply the HuggingFace chat template.
 ///
 /// Requires a HuggingFace tokenizer (directly or via `CachedTokenizer`); other
@@ -33,6 +52,15 @@ pub struct ProcessedMessages {
 pub fn process_chat_messages(
     request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,
+) -> Result<ProcessedMessages, String> {
+    process_chat_messages_with_defaults(request, tokenizer, None)
+}
+
+/// As `process_chat_messages`, with the request's template kwargs over `default_kwargs`.
+pub fn process_chat_messages_with_defaults(
+    request: &ChatCompletionRequest,
+    tokenizer: &dyn Tokenizer,
+    default_kwargs: Option<&HashMap<String, Value>>,
 ) -> Result<ProcessedMessages, String> {
     let hf_tokenizer = tokenizer
         .as_any()
@@ -72,8 +100,7 @@ pub fn process_chat_messages(
         .transpose()
         .map_err(|e| format!("Failed to serialize tools: {}", e))?;
 
-    let kwargs_capacity = 1 + request.chat_template_kwargs.as_ref().map_or(0, |k| k.len());
-    let mut combined_template_kwargs = HashMap::with_capacity(kwargs_capacity);
+    let mut combined_template_kwargs = default_kwargs.cloned().unwrap_or_default();
 
     if let Some(reasoning_effort) = &request.reasoning_effort {
         combined_template_kwargs.insert(

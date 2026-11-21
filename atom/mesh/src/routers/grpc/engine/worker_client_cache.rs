@@ -116,6 +116,22 @@ impl GrpcClient {
         }
     }
 
+    /// Why this router refuses the worker: an ATOM worker's `atom.grpc.v1` protocol
+    /// version differs from the router's. SGLang and vLLM workers report none.
+    pub async fn protocol_refusal(
+        &self,
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        #[cfg(feature = "grpc-client")]
+        if let Self::Atom(client) = self {
+            let version = client.get_server_info().await?.protocol_version;
+            let current = crate::atom_engine::grpc::ProtocolVersion::Current as u32;
+            return Ok((version != current).then(|| {
+                format!("its atom.grpc.v1 protocol version is {version}, this router's {current}")
+            }));
+        }
+        Ok(None)
+    }
+
     pub async fn get_model_info(
         &self,
     ) -> Result<ModelInfo, Box<dyn std::error::Error + Send + Sync>> {

@@ -684,7 +684,9 @@ impl Worker for BasicWorker {
                             runtime_str,
                             self.metadata.url
                         );
-                        match GrpcClient::connect(&self.metadata.url, &runtime_str).await {
+                        // A url@rank worker connects to its instance, without the rank.
+                        let url = self.normalised_url()?;
+                        match GrpcClient::connect(url, &runtime_str).await {
                             Ok(client) => {
                                 tracing::info!(
                                     "Successfully connected gRPC client ({}) for worker: {}",

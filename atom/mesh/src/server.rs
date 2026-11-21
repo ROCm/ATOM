@@ -611,6 +611,7 @@ async fn serve_with_prepare_pool(
             name: tokenizer_source.clone(),
             source: tokenizer_source.clone(),
             chat_template_path: config.router_config.chat_template.clone(),
+            inline_chat_template: None,
             cache_config: config.router_config.tokenizer_cache.to_option(),
             fail_on_duplicate: false,
         };
