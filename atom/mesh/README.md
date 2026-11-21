@@ -331,15 +331,15 @@ fastokens' cache of the text between special tokens, per tokenizer (default:
 which does not apply to these models.
 
 `test_requests_tokenize_as_on_atom` checks that requests tokenize for routing as
-on ATOM, with either backend, and times encoding. It tokenizes the
-DeepSeek-V4.1-Flash requests of `tests/fixtures/atom_tokens/deepseek_v41_flash.json`
-with the tokenizer files of the revision recorded there, which it downloads from
-HuggingFace, or `$HF_ENDPOINT`, so it runs only when asked for, as CI's mesh unit
-tests do: `cargo test --lib -- --ignored routers::ingress::token_parity`.
-`scripts/atom_token_parity.py` records the tokens
-ATOM's own chat and completion endpoints run a set of requests with: the fixture,
-or, for `$ATOM_TOKEN_PARITY`, another checkpoint's or recorded requests. The
-script's docstring shows how to run both.
+on ATOM, with either backend, and times encoding. `scripts/atom_token_parity.py`
+tokenizes a set of requests, or recorded ones, with ATOM's own chat and
+completion endpoints, in process and without a GPU, and the test compares the
+router's tokens with those, in the file `$ATOM_TOKEN_PARITY` names, so it runs
+only when asked for. CI's mesh unit tests run the two for a DeepSeek-V4.1-Flash
+revision, whose tokenizer files and chat encoder the script downloads from
+HuggingFace, or `$HF_ENDPOINT`, and the test with
+`cargo test --lib -- --ignored routers::ingress::token_parity`. The script's
+docstring shows how to run them for another checkpoint.
 
 ## Reliability
 

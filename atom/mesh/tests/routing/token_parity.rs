@@ -21,67 +21,8 @@ use crate::{
 
 const BACKENDS: [&str; 2] = ["huggingface", "fastokens"];
 const MODEL: &str = "parity";
-/// ATOM's tokens for a set of DeepSeek-V4.1-Flash requests, which
-/// `scripts/atom_token_parity.py --huggingface` records.
-const FIXTURE: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/atom_tokens/deepseek_v41_flash.json"
-);
-/// The files of a checkpoint the router registers its tokenizer from, and
-/// whether every checkpoint has them.
-const TOKENIZER_FILES: [(&str, bool); 4] = [
-    ("tokenizer.json", true),
-    ("tokenizer_config.json", true),
-    ("config.json", false),
-    ("chat_template.jinja", false),
-];
-
-/// `model`'s tokenizer files at `revision`, from HuggingFace or `$HF_ENDPOINT`,
-/// kept in the target directory for the next run. A file not every checkpoint
-/// has may be missing; failing to download any other, each within 5 minutes,
-/// fails the test.
-async fn huggingface_files(model: &str, revision: &str) -> PathBuf {
-    let exe = std::env::current_exe().unwrap();
-    let dir = exe
-        .parent()
-        .and_then(Path::parent)
-        .unwrap()
-        .join("huggingface")
-        .join(model.replace('/', "--"))
-        .join(revision);
-    std::fs::create_dir_all(&dir).unwrap();
-    let endpoint =
-        std::env::var("HF_ENDPOINT").unwrap_or_else(|_| "https://huggingface.co".to_string());
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(30))
-        .timeout(Duration::from_secs(300))
-        .build()
-        .unwrap();
-    for (file, every_checkpoint_has) in TOKENIZER_FILES {
-        let path = dir.join(file);
-        if path.exists() {
-            continue;
-        }
-        let url = format!("{endpoint}/{model}/resolve/{revision}/{file}");
-        let response = match client.get(&url).send().await {
-            Ok(response)
-                if !every_checkpoint_has && response.status() == reqwest::StatusCode::NOT_FOUND =>
-            {
-                continue
-            }
-            response => response.and_then(reqwest::Response::error_for_status),
-        };
-        let bytes = match response {
-            Ok(response) => response.bytes().await,
-            Err(error) => Err(error),
-        };
-        let bytes = bytes.unwrap_or_else(|error| panic!("downloading {url}: {error}"));
-        let partial = dir.join(format!("{file}.partial"));
-        std::fs::write(&partial, &bytes).unwrap();
-        std::fs::rename(&partial, &path).unwrap();
-    }
-    dir
-}
+/// How many times each prompt's encode is timed, for the median.
+const RUNS: usize = 5;
 
 /// Lines `start` to `start + count` of the large prompts' text, as the script
 /// builds them.
@@ -274,28 +215,23 @@ async fn tokenize(
 }
 
 /// Requests tokenize for routing as on ATOM, with HuggingFace and with
-/// fastokens. The requests and ATOM's tokens for them are DeepSeek-V4.1-Flash's
-/// in `tests/fixtures/atom_tokens/deepseek_v41_flash.json`, whose tokenizer
-/// files the test downloads at the revision recorded, or those in
-/// `$ATOM_TOKEN_PARITY`, which `scripts/atom_token_parity.py` records for a
-/// checkpoint directory. Each request gets ATOM's tokens, or is rejected where
-/// ATOM rejects it. The table lists how long encoding each prompt takes with
-/// either backend: once for the fixture, the median of 5 runs otherwise (build
-/// with `--release` for numbers worth reading). As it downloads, it runs only
-/// when asked for (`--ignored`), and not while a test sets `$HF_ENDPOINT`.
+/// fastokens. The checkpoint, the requests and ATOM's tokens for them are those
+/// in `$ATOM_TOKEN_PARITY`, which `scripts/atom_token_parity.py` writes as it
+/// tokenizes the requests on ATOM; CI runs it for DeepSeek-V4.1-Flash first.
+/// Each request gets ATOM's tokens, or is rejected where ATOM rejects it. The
+/// table lists the median of `RUNS` encodes of each prompt with either backend
+/// (build with `--release` for numbers worth reading). As it needs ATOM's
+/// tokens, it runs only when asked for (`--ignored`), and not while a test sets
+/// the tokenizers' environment.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "downloads from HuggingFace: cargo test --lib test_requests_tokenize_as_on_atom -- --ignored"]
+#[ignore = "compares with the tokens of scripts/atom_token_parity.py in $ATOM_TOKEN_PARITY"]
 #[serial]
 async fn test_requests_tokenize_as_on_atom() {
-    let recorded = std::env::var("ATOM_TOKEN_PARITY").ok();
-    let path = recorded.clone().unwrap_or_else(|| FIXTURE.to_string());
+    let path = std::env::var("ATOM_TOKEN_PARITY")
+        .expect("ATOM_TOKEN_PARITY names the file scripts/atom_token_parity.py writes");
     let atom: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     let model = atom["model"].as_str().unwrap();
-    let checkpoint = match atom["revision"].as_str() {
-        Some(revision) => huggingface_files(model, revision).await,
-        None => PathBuf::from(model),
-    };
-    let runs = if recorded.is_some() { 5 } else { 1 };
+    let checkpoint = PathBuf::from(model);
     let requests: Vec<_> = atom["requests"]
         .as_array()
         .unwrap()
@@ -325,12 +261,12 @@ async fn test_requests_tokenize_as_on_atom() {
         );
         let mut tokenized = Vec::new();
         for (_, route, body, _) in &requests {
-            tokenized.push(tokenize(&app, route, body, runs).await);
+            tokenized.push(tokenize(&app, route, body, RUNS).await);
         }
         results.push(tokenized);
     }
 
-    eprintln!("{model} {}", atom["revision"].as_str().unwrap_or(""));
+    eprintln!("{model}");
     eprintln!(
         "  {:28} {:>9} {:>9}  {:24} {:24} {:>11} {:>11}",
         "request", "bytes", "tokens", BACKENDS[0], BACKENDS[1], "encode hf", "encode fast"

@@ -9,23 +9,17 @@ Python dependencies, not a GPU. It writes as JSON the checkpoint, each request,
 and the tokens ATOM runs it with, or the error ATOM rejects it with.
 
 The router's test `test_requests_tokenize_as_on_atom` tokenizes each request as
-HTTP routing does, with each tokenizer backend, and compares the tokens. In CI
-it reads tests/fixtures/atom_tokens/deepseek_v41_flash.json, recorded with
---huggingface, and downloads that revision's tokenizer files. To check another
-checkpoint, or recorded requests:
+HTTP routing does, with each tokenizer backend, and compares the tokens. CI's
+mesh workflow runs the two in a row, for a revision of DeepSeek-V4.1-Flash
+whose tokenizer files and chat encoder this script downloads from HuggingFace,
+or $HF_ENDPOINT. For a checkpoint directory or a HuggingFace repo@revision, and
+the built-in requests or recorded ones:
 
-    python atom/mesh/scripts/atom_token_parity.py <checkpoint dir> \\
+    python atom/mesh/scripts/atom_token_parity.py <checkpoint> \\
         [--requests recorded.jsonl] > atom.json
     cd atom/mesh && ATOM_TOKEN_PARITY=../../atom.json \\
         cargo test --release --lib test_requests_tokenize_as_on_atom -- \\
         --ignored --nocapture
-
-To record the fixture again, from a checkpoint directory holding the files of
-the revision named:
-
-    python atom/mesh/scripts/atom_token_parity.py <DeepSeek-V4.1-Flash dir> \\
-        --huggingface deepseek-ai/DeepSeek-V4.1-Flash@<revision> \\
-        --out atom/mesh/tests/fixtures/atom_tokens/deepseek_v41_flash.json
 
 --requests takes JSON Lines, one request per line, as
 {"name": ..., "route": "/v1/chat/completions", "body": {...}}, or a bare body
@@ -47,12 +41,25 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
+from huggingface_hub import snapshot_download
 
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO))
 
 CHAT = "/v1/chat/completions"
 COMPLETION = "/v1/completions"
+
+# What ATOM and the router read of a checkpoint to tokenize its prompts: the
+# tokenizer, the model type, the chat template, and the chat encoder some
+# models ship, which ATOM renders DeepSeek-V4.1's chats with.
+CHECKPOINT_FILES = [
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "config.json",
+    "chat_template.jinja",
+    "encoding/encoding*.py",
+]
 
 TOOL = {
     "type": "function",
@@ -276,6 +283,15 @@ def default_requests() -> list[dict]:
     return requests
 
 
+def checkpoint_dir(model: str) -> str:
+    """`model`, or for a HuggingFace repo@revision, the directory its files of
+    CHECKPOINT_FILES download to."""
+    if Path(model).exists() or "@" not in model:
+        return model
+    repo, revision = model.split("@")
+    return snapshot_download(repo, revision=revision, allow_patterns=CHECKPOINT_FILES)
+
+
 def recorded_requests(path: str) -> list[dict]:
     requests = []
     with open(path, encoding="utf-8") as lines:
@@ -383,8 +399,6 @@ async def tokenize_on_atom(args, requests: list[dict]) -> dict:
     # The test reads the checkpoint from atom/mesh, so a path is stored absolute.
     checkpoint = Path(args.model)
     report = {"model": str(checkpoint.resolve()) if checkpoint.exists() else args.model}
-    if args.huggingface:
-        report["model"], report["revision"] = args.huggingface.split("@")
     if any("synthetic" in request for request in requests):
         report["synthetic"] = synthetic_lines(2 << 20, turns=64)
     client, model, prompt = in_process(args)
@@ -424,13 +438,11 @@ def write(report: dict, out) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("model", help="the checkpoint directory")
-    parser.add_argument("--requests", help="recorded requests, as JSON Lines")
     parser.add_argument(
-        "--huggingface",
-        metavar="REPO@REVISION",
-        help="record the checkpoint as this HuggingFace revision, whose files the test downloads",
+        "model",
+        help="the checkpoint directory, or a HuggingFace repo@revision to download its files from",
     )
+    parser.add_argument("--requests", help="recorded requests, as JSON Lines")
     parser.add_argument("--chat-template", help="as the server takes it")
     parser.add_argument("--default-chat-template-kwargs", help="as the server takes it")
     parser.add_argument(
@@ -445,6 +457,7 @@ def main():
     )
     parser.add_argument("--out", help="write the JSON here rather than to stdout")
     args = parser.parse_args()
+    args.model = checkpoint_dir(args.model)
 
     requests = recorded_requests(args.requests) if args.requests else default_requests()
     report = asyncio.run(tokenize_on_atom(args, requests))
