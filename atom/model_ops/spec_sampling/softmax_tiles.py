@@ -9,13 +9,28 @@ them from the tile partials (`sparse_q_select`).
 `race_key` and `argmax_lowest_id` (lowest id on a tie) are the one exponential
 race every draw goes through, so the draws cannot drift apart bit by bit;
 `argmax_lowest_id` (`tile_argmax`, outside this package: the default greedy
-op uses it too) is also the verify's per-tile raw argmax.
+op uses it too) is also the verify's per-tile raw argmax. `max_of_tiles` is
+the row max over a row's tile maxima that the combine and the sampled draft's
+folded histogram both take, so the fold cannot drift from the combine.
 """
 
 import triton
 import triton.language as tl
 
-from atom.model_ops.tile_argmax import argmax_of_tiles, max_of_tiles
+from atom.model_ops.tile_argmax import argmax_of_tiles
+
+
+@triton.jit
+def max_of_tiles(part_max_ptr, row, stride, num_tiles, BLOCK_TILE):
+    """One row's tile maxima, stored ``stride`` apart for ``num_tiles`` tiles
+    (``-inf`` past them), and their max."""
+    offs_tile = tl.arange(0, BLOCK_TILE)
+    maxes = tl.load(
+        part_max_ptr + offs_tile * stride + row,
+        mask=offs_tile < num_tiles,
+        other=float("-inf"),
+    )
+    return maxes, tl.max(maxes, axis=0)
 
 
 @triton.jit

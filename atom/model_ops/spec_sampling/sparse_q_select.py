@@ -31,8 +31,12 @@ import triton.language as tl
 
 from atom.model_ops.sampler import SAMPLER_EPS
 from atom.model_ops.spec_sampling.sampling_scratch import Region
-from atom.model_ops.spec_sampling.softmax_tiles import race_key, softmax_combine_kernel
-from atom.model_ops.tile_argmax import argmax_lowest_id, argmax_of_tiles, max_of_tiles
+from atom.model_ops.spec_sampling.softmax_tiles import (
+    max_of_tiles,
+    race_key,
+    softmax_combine_kernel,
+)
+from atom.model_ops.tile_argmax import argmax_lowest_id, argmax_of_tiles
 
 # Histogram and compact tile V identically (the cut hands each tile a slot range).
 _Q_BLOCK_V = 4096
@@ -105,7 +109,7 @@ def _dspark_q_histogram(
     """
     row = tl.program_id(0)
     tile = tl.program_id(1)
-    # Rows that store nothing stop here, and in the compaction too.
+    # Rows that store nothing stop here, and in the cut and the compaction too.
     if (tl.load(q_row_base_ptr + row) < 0) | (
         tl.load(temperatures_ptr + row) <= greedy_temperature
     ):
