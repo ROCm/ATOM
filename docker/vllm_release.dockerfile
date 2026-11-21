@@ -17,6 +17,10 @@ ENV MAX_JOBS=${MAX_JOBS}
 ENV VLLM_TARGET_DEVICE=rocm
 ENV CMAKE_MAKE_PROGRAM=/usr/local/bin/ninja
 
+# Use legacy IPC mode for HSA to avoid GPU memory pinning issues
+# See: https://github.com/ROCm/rocm-libraries/issues/6266
+ENV HSA_ENABLE_IPC_MODE_LEGACY=1
+
 # Preserve the base image's custom RCCL before any OOT apt runs.
 # The native base builds RCCL from the pinned RCCL_BRANCH (build_rccl stage) and
 # installs it to /usr/local/lib with an /etc/ld.so.conf.d/rccl.conf entry, so
