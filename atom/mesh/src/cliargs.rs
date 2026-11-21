@@ -835,6 +835,21 @@ mod tests {
     }
 
     #[test]
+    fn cli_kv_storage_options_map_to_router_config() {
+        let args = CliArgs::try_parse_from([
+            "atomesh",
+            "--kv-storage-weight",
+            "0.5",
+            "--kv-storage-deadline-ms",
+            "7",
+        ])
+        .unwrap();
+        let config = args.to_router_config(Vec::new()).unwrap();
+        assert_eq!(config.kv_storage_weight, 0.5);
+        assert_eq!(config.kv_storage_deadline_ms, 7);
+    }
+
+    #[test]
     fn parse_policy_accepts_dp_sticky() {
         let args = CliArgs::default();
         assert!(matches!(

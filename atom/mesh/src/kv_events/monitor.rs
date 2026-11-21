@@ -1098,8 +1098,8 @@ mod tests {
     }
 
     /// A decode worker takes the prompt's KV from its prefill worker, and a worker whose
-    /// device cache the index knows nothing of is not asked for: of three readers of a
-    /// store, it answers for the third alone.
+    /// device cache the index knows nothing of is not asked for: of four readers of a
+    /// store, it answers for the last two, each by what its own device holds.
     #[tokio::test]
     async fn a_store_answers_for_its_readers_the_index_knows_but_decode_workers() {
         use std::collections::HashMap;
@@ -1128,10 +1128,15 @@ mod tests {
             namespace: "atomkv1-0123456789abcdef01234567".into(),
             chunk_tokens: 2,
             world: 1,
-            min_load_tokens: 2,
+            min_load_tokens: 4,
             chain_check: keys::chain_check(2),
         };
-        let urls = ["http://d:8000", "http://n:8000", "http://r:8000"];
+        let urls = [
+            "http://d:8000",
+            "http://n:8000",
+            "http://r:8000",
+            "http://h:8000",
+        ];
         for url in urls {
             stores.add(url, "model", &report);
         }
@@ -1142,12 +1147,14 @@ mod tests {
             Arc::new(decode.build()),
             Arc::new(BasicWorkerBuilder::new(urls[1]).build()),
             Arc::new(BasicWorkerBuilder::new(urls[2]).build()),
+            Arc::new(BasicWorkerBuilder::new(urls[3]).build()),
         ];
-        // The store holds the 6 chunks of 12 tokens: the engine loads all but the last.
+        // The store holds the 6 chunks of 12 tokens, of which the engine takes 10. With 8 on
+        // the device, the 2 more are under the 4 it loads at least.
         let prompt: Vec<u32> = (0..12).collect();
-        let device = [Some(0), None, Some(0)];
+        let device = [Some(0), None, Some(0), Some(8)];
         let cached = monitor.cached_tokens(&prompt, &workers, &device).await;
-        assert_eq!(cached, [Some(0), None, Some(10)]);
+        assert_eq!(cached, [Some(0), None, Some(10), Some(8)]);
     }
 
     #[test]

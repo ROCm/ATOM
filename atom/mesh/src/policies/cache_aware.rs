@@ -321,7 +321,7 @@ impl CacheAwarePolicy {
 
     /// The tree's affinity branch, with the match rate of the KV event index: the share of
     /// the request's tokens a worker's device cache holds, each token its engine will then
-    /// load from a store counted at the store's weight; the highest first, then the lower
+    /// load from its store counted at `--kv-storage-weight`; the highest first, then the lower
     /// load. None leaves the request to the tree: it has no tokens or has media, or no
     /// candidate's match rate is above `cache_threshold`.
     async fn select_by_kv_events(

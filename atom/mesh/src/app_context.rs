@@ -282,9 +282,8 @@ impl AppContextBuilder {
             Arc::new(StorageSources::new(port, deadline, client.clone()))
         });
         if let Some(monitor) = &kv_event_monitor {
-            let weight = router_config.kv_storage_weight;
-            if let Some(storage) = kv_storage.as_ref().filter(|_| weight > 0.0) {
-                monitor.read_stores(storage.clone(), weight);
+            if let Some(storage) = &kv_storage {
+                monitor.read_stores(storage.clone(), router_config.kv_storage_weight);
             }
             policy_registry.set_kv_events(monitor.clone());
         }
