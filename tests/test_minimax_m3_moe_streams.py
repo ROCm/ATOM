@@ -76,6 +76,127 @@ def test_dual_stream_overlaps_shared_and_joins_before_add(
     routed.__add__.assert_called_once_with(shared)
 
 
+class _Epilogue:
+    """`aiter moe_output_epilogue` double: records the call, and `take`
+    decides whether the routed MoE consumed it (running `before` as aiter's
+    gather-reduce would)."""
+
+    def __init__(self, log: list[str], take: bool) -> None:
+        self.log, self.take, self.args = log, take, None
+
+    @contextmanager
+    def __call__(self, addend, scale, before=None):
+        self.args = (addend, scale)
+        handle = SimpleNamespace(consumed=False)
+        self.log.append("epilogue open")
+        yield handle
+        if self.take:
+            if before is not None:
+                before()
+            handle.consumed = True
+        self.log.append("epilogue close")
+
+
+def _glue_moe(log, epilogue, routed, scale=2.0):
+    moe = SimpleNamespace(
+        _glue_epilogue=epilogue,
+        fuse_shared_experts=False,
+        routed_scaling_factor=scale,
+    )
+    moe._routed_scale = lambda: m3_model.MiniMaxM3MoE._routed_scale(moe)
+    moe._scale_routed = lambda r: m3_model.MiniMaxM3MoE._scale_routed(moe, r)
+    moe._routed_plus_shared = lambda h, s, before_add=None: (
+        m3_model.MiniMaxM3MoE._routed_plus_shared(moe, h, s, before_add)
+    )
+    moe.gate = MagicMock(side_effect=lambda _: (log.append("gate"), "logits")[1])
+    moe.experts = MagicMock(side_effect=lambda **_: (log.append("experts"), routed)[1])
+    return moe
+
+
+@pytest.mark.parametrize("taken", [True, False])
+def test_dual_stream_glue_joins_inside_the_routed_epilogue(
+    monkeypatch: pytest.MonkeyPatch, taken: bool
+) -> None:
+    log: list[str] = []
+    main, alt = _Stream("main", log), _Stream("alt", log)
+
+    @contextmanager
+    def use_stream(stream: _Stream):
+        log.append(f"enter {stream.name}")
+        yield
+        log.append(f"leave {stream.name}")
+
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: main)
+    monkeypatch.setattr(torch.cuda, "stream", use_stream)
+
+    hidden = MagicMock()
+    hidden.shape = (2, 64)
+    hidden.view.return_value = hidden
+    shared = MagicMock()
+    shared.record_stream.side_effect = lambda stream: log.append(
+        f"shared records {stream.name}"
+    )
+    routed = MagicMock()
+    routed.view.return_value = "fused"
+    scaled = MagicMock()
+    routed.__mul__.return_value = scaled
+    scaled.__add__.return_value = MagicMock(view=lambda *_: "separate")
+    epilogue = _Epilogue(log, take=taken)
+    moe = _glue_moe(log, epilogue, routed)
+    moe.alt_stream = alt
+    moe.shared_experts = MagicMock(
+        side_effect=lambda _: (log.append("shared"), shared)[1]
+    )
+
+    actual = m3_model.MiniMaxM3MoE.dual_stream_moe_forward(moe, hidden)
+
+    assert epilogue.args == (shared, 2.0)
+    head = ["alt waits main", "enter alt", "shared", "leave alt", "epilogue open"]
+    if taken:
+        # aiter added shared into the routed gather-reduce, after the join.
+        assert actual == "fused"
+        assert log == head + [
+            "gate",
+            "experts",
+            "main waits alt",
+            "epilogue close",
+            "shared records main",
+        ]
+    else:
+        assert actual == "separate"
+        routed.__mul__.assert_called_once_with(2.0)
+        scaled.__add__.assert_called_once_with(shared)
+        assert log == head + [
+            "gate",
+            "experts",
+            "epilogue close",
+            "main waits alt",
+            "shared records main",
+        ]
+
+
+def test_serial_glue_runs_shared_first_into_the_epilogue() -> None:
+    log: list[str] = []
+    hidden = MagicMock()
+    hidden.shape = (2, 64)
+    hidden.view.return_value = hidden
+    routed, shared = MagicMock(), MagicMock()
+    routed.view.return_value = "fused"
+    epilogue = _Epilogue(log, take=True)
+    moe = _glue_moe(log, epilogue, routed, scale=1.0)
+    moe._use_dual_stream = True
+    moe.shared_input_from_moe_quant = False
+    moe.shared_experts = MagicMock(
+        side_effect=lambda _: (log.append("shared"), shared)[1]
+    )
+
+    actual = m3_model.MiniMaxM3MoE.single_stream_moe_forward(moe, hidden)
+
+    assert actual == "fused"
+    assert epilogue.args == (shared, 1.0)
+    assert log == ["shared", "epilogue open", "gate", "experts", "epilogue close"]
+
+
 def test_serial_forward_preserves_routed_then_shared_order() -> None:
     log: list[str] = []
     hidden = MagicMock()

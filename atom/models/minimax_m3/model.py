@@ -46,6 +46,13 @@ from atom.model_ops.minimax_m3.sparse_attn import (
 )
 from atom.model_ops.moe import FusedMoE, Mxfp4MoEMethod
 from atom.model_ops.swiglu_oai import swiglu_oai_split
+
+try:  # aiter with the grouped MoE output epilogue (routed scale + shared add)
+    from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+        moe_output_epilogue as _moe_output_epilogue,
+    )
+except ImportError:  # pragma: no cover - older aiter keeps the separate ops
+    _moe_output_epilogue = None
 from atom.model_ops.utils import atom_parameter
 from atom.models.minimax_m3.mono.dispatch import MonoDecode
 from atom.models.utils import (
@@ -371,6 +378,19 @@ class MiniMaxM3MoE(nn.Module):
         self.alt_stream = alt_stream
         self.prefix = prefix
         self._use_dual_stream = False
+        # The routed scale and the shared add folded into the routed MoE's
+        # gather-reduce. Python-side state, so only the paths that run eagerly
+        # inside the dual-stream custom op take it (`_use_dual_stream`).
+        self._glue_epilogue = (
+            _moe_output_epilogue
+            if (
+                _moe_output_epilogue is not None
+                and self.shared_experts is not None
+                and not self.shared_input_from_moe_quant
+                and isinstance(self.experts.quant_method, Mxfp4MoEMethod)
+            )
+            else None
+        )
         if self.shared_experts is not None and self.alt_stream is not None:
             atom_config = get_current_atom_config()
             if (
@@ -380,10 +400,39 @@ class MiniMaxM3MoE(nn.Module):
                 self._use_dual_stream = True
                 atom_config.compilation_config.static_forward_context[prefix] = self
 
-    def _scale_routed(self, routed_output: torch.Tensor) -> torch.Tensor:
+    def _routed_scale(self) -> float:
         if not self.fuse_shared_experts and self.routed_scaling_factor != 1.0:
-            routed_output = routed_output * self.routed_scaling_factor
+            return float(self.routed_scaling_factor)
+        return 1.0
+
+    def _scale_routed(self, routed_output: torch.Tensor) -> torch.Tensor:
+        scale = self._routed_scale()
+        if scale != 1.0:
+            routed_output = routed_output * scale
         return routed_output
+
+    def _routed_plus_shared(
+        self,
+        hidden_states: torch.Tensor,
+        shared_output: torch.Tensor,
+        before_add=None,
+    ) -> torch.Tensor:
+        """`_scale_routed(routed) + shared_output` with the scale and the add in
+        the routed MoE's gather-reduce when aiter takes the epilogue; `before_add`
+        (the wait for the stream producing `shared_output`) runs right before
+        that launch, or before the separate add when it did not."""
+        with self._glue_epilogue(
+            shared_output, self._routed_scale(), before=before_add
+        ) as epilogue:
+            router_logits = self.gate(hidden_states)
+            routed_output = self.experts(
+                hidden_states=hidden_states, router_logits=router_logits
+            )
+        if epilogue.consumed:
+            return routed_output
+        if before_add is not None:
+            before_add()
+        return self._scale_routed(routed_output) + shared_output
 
     def routed_expert_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Run the routed E128/top-4 branch and keep its TP-partial output."""
@@ -409,6 +458,12 @@ class MiniMaxM3MoE(nn.Module):
                 shared_x, x_scale=shared_x_scale
             )
             return routed_output.view(orig_shape)
+        if getattr(self, "_glue_epilogue", None) is not None and self._use_dual_stream:
+            # Reached only from the dual-stream op (eager), see `_glue_epilogue`.
+            shared_output = self.shared_experts(hidden_states)
+            return self._routed_plus_shared(hidden_states, shared_output).view(
+                orig_shape
+            )
         routed_output = self.routed_expert_forward(hidden_states)
         if self.shared_experts is not None:
             routed_output = routed_output + self.shared_experts(hidden_states)
@@ -424,6 +479,16 @@ class MiniMaxM3MoE(nn.Module):
         alt_stream.wait_stream(current_stream)
         with torch.cuda.stream(alt_stream):
             shared_output = self.shared_experts(hidden_states)
+
+        if getattr(self, "_glue_epilogue", None) is not None:
+            # The join moves to right before the gather-reduce that adds it.
+            output = self._routed_plus_shared(
+                hidden_states,
+                shared_output,
+                before_add=lambda: current_stream.wait_stream(alt_stream),
+            )
+            shared_output.record_stream(current_stream)
+            return output.view(orig_shape)
 
         routed_output = self.routed_expert_forward(hidden_states)
         current_stream.wait_stream(alt_stream)
