@@ -131,14 +131,19 @@ mesh's gRPC routing already runs.
   it has one (Kimi-K3's `required_channel`).
 * Reasoning read from a prompt that opened it; a non-streamed reply over the
   parser's 64 KiB buffer is split rather than refused.
-* Models with a Python chat template (DeepSeek-V4, Kimi-K3).
+* Models with a Python chat template (DeepSeek-V4 / V4.1, Kimi-K3), with
+  `thinking` / `reasoning_effort` resolved by the encoder's own rules
+  (V4.1's effort aliases and budgets) and a string `tool_choice` passed to
+  the template, as `_chat_completions` does.
 * Usage with `cached_tokens` (the engine's prefix-cache hit); a chat's also
   with `prompt_tokens_details.cached_tokens` and, not streamed, `ttft_s` /
   `tpot_s` / `latency_s` (`num_choices` past one), timed as `api_server.py`
   times them (`render/atom_usage.rs`).
 * Client disconnect aborts the request.
 
-Refused with a 400 until they are built: streaming with `n > 1`, logprobs,
+Refused with a 400 until they are built: image, video or audio content
+(the engine is handed token ids only, so it would be dropped silently),
+streaming with `n > 1`, logprobs,
 `stop_token_ids`, structured output (`response_format` `json_object` /
 `json_schema`, `regex`, `ebnf`, `json_schema`), `return_hidden_states`, and
 an empty prompt. The structured-output refusal sits in the router, not the
@@ -177,6 +182,10 @@ every endpoint, GSM8K, and a concurrency sweep.
 * Streaming with `n > 1` is refused; the Python service streamed it.
 * `/v1/completions` requires `model` in the body, as the mesh's typed
   request does.
+* `thinking` / `reasoning_effort` reach only a model whose prompt ATOM
+  renders; a Jinja-rendered model (Qwen3, ...) takes its switch through
+  `chat_template_kwargs`. `reasoning_effort` is a string in the mesh's typed
+  request, so an integer budget goes through `thinking.effort`.
 * `/health` is the router's liveness, not the engine's (P1).
 
 ## Moving to B

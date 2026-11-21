@@ -101,6 +101,10 @@ impl AtomBridgeRuntime {
     }
 }
 
+/// The keys `RequestExtras::read` looks for, as they appear in a JSON body:
+/// a body naming none of them is not parsed again.
+const RAW_KEYS: [&[u8]; 2] = [b"\"data_parallel_rank\"", b"\"thinking\""];
+
 tokio::task_local! {
     /// What a request carries besides its typed body, for the dispatcher.
     /// Set around each request's pipeline, which dispatches on the same task.
@@ -115,6 +119,9 @@ pub(crate) struct RequestExtras {
     /// A chat's `tool_choice: "required"` with tools: the engine holds its
     /// output to the tool-call channel where the format defines one.
     pub tool_choice_required: bool,
+    /// A chat's `thinking` (`{"type": ..., "effort": ...}`), which the typed
+    /// body drops; read with `reasoning_effort` where ATOM renders the prompt.
+    pub thinking: Option<Value>,
 }
 
 impl RequestExtras {
@@ -130,7 +137,10 @@ impl RequestExtras {
                     ..Self::default()
                 });
             }
-            _ if memchr::memmem::find(&request.body, b"\"data_parallel_rank\"").is_none() => {
+            _ if !RAW_KEYS
+                .iter()
+                .any(|key| memchr::memmem::find(&request.body, key).is_some()) =>
+            {
                 return Ok(Self::default());
             }
             _ => serde_json::from_slice::<Map<String, Value>>(&request.body)
@@ -146,8 +156,10 @@ impl RequestExtras {
                 ))
             }
         };
+        let thinking = raw.get("thinking").filter(|v| !v.is_null()).cloned();
         Ok(Self {
             data_parallel_rank,
+            thinking,
             ..Self::default()
         })
     }
@@ -232,6 +244,21 @@ fn chat_wants_structured_output(body: &ChatCompletionRequest) -> bool {
         Some(ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. })
     ) || body.regex.is_some()
         || body.ebnf.is_some()
+}
+
+/// The kind of the first non-text part in a chat's messages: the engine is
+/// handed token ids only, so an image would be dropped without a word.
+fn media_in(body: &ChatCompletionRequest) -> Option<String> {
+    body.messages.iter().find_map(|message| {
+        let message = serde_json::to_value(message).ok()?;
+        message
+            .get("content")?
+            .as_array()?
+            .iter()
+            .filter_map(|part| part.get("type")?.as_str())
+            .find(|kind| *kind != "text")
+            .map(str::to_string)
+    })
 }
 
 fn generate_wants_structured_output(body: &GenerateRequest) -> bool {
@@ -338,6 +365,12 @@ impl RouterTrait for AtomBridgeRouter {
         if chat_wants_structured_output(body) {
             return structured_output_refused();
         }
+        if let Some(kind) = media_in(body) {
+            return error::bad_request(
+                "multimodal_unsupported",
+                format!("{kind} content is not supported by the ATOM Rust frontend yet"),
+            );
+        }
         let mut body = body.clone();
         let defaults = &self.runtime.default_chat_template_kwargs;
         if !defaults.is_empty() {
@@ -354,6 +387,18 @@ impl RouterTrait for AtomBridgeRouter {
         // reads it; "required" holds the output to the tool-call channel
         // instead, where the format has one.
         let mut extras = RequestExtras::current();
+        // ATOM renders the prompt from the request as the client sent it,
+        // tool_choice included (Kimi-K3's template reads it).
+        let rendered = if self.runtime.renders_chat {
+            match py_bridge::render_chat(&self.runtime.bridge, &body, extras.thinking.as_ref())
+                .await
+            {
+                Ok(rendered) => Some(rendered),
+                Err(response) => return response,
+            }
+        } else {
+            None
+        };
         extras.tool_choice_required = matches!(
             body.tool_choice,
             Some(ToolChoice::Value(ToolChoiceValue::Required))
@@ -368,14 +413,6 @@ impl RouterTrait for AtomBridgeRouter {
         ) {
             body.tool_choice = Some(ToolChoice::Value(ToolChoiceValue::Auto));
         }
-        let rendered = if self.runtime.renders_chat {
-            match py_bridge::render_chat(&self.runtime.bridge, &body).await {
-                Ok(rendered) => Some(rendered),
-                Err(response) => return response,
-            }
-        } else {
-            None
-        };
         let pipeline = self.pipeline.execute_chat_with(
             Arc::new(body),
             headers.cloned(),

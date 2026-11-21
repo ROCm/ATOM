@@ -54,6 +54,11 @@ from atom.entrypoints.openai.reasoning import (
     template_opens_reasoning_implicitly,
     thinking_switched_off,
 )
+from atom.entrypoints.openai.reasoning_controls import (
+    CHAT_REASONING_RULES,
+    apply_reasoning_controls,
+    resolve_reasoning_controls,
+)
 from atom.entrypoints.openai.reasoning_dialects import resolve_dialect
 from atom.entrypoints.openai.tool_parser.registry import (
     required_call_channel,
@@ -71,6 +76,9 @@ class ChatRenderer:
     def __init__(self, tokenizer: Any, model: str) -> None:
         self.tokenizer = tokenizer
         self.encoder = load_custom_message_encoder(model)
+        # An encoder that joins a content list itself (DeepSeek-V4.1's) takes
+        # it as sent, as the OpenAI server hands it over.
+        self._preserve_content = bool(getattr(self.encoder, "preserve_content", False))
         # A Jinja template (one string, or named variants) is the router's
         # to render; an encoder, or a template that is code, is not.
         self.needed = self.encoder is not None or not chat_template_source(tokenizer)
@@ -93,15 +101,37 @@ class ChatRenderer:
         messages = request.get("messages")
         if not messages:
             raise ValueError("messages is required")
-        kwargs = dict(request.get("chat_template_kwargs") or {})
+        kwargs = self._template_kwargs(request)
         prompt = apply_chat_template(
             self.tokenizer,
             self.encoder,
-            [_template_message(message) for message in messages],
+            [
+                _template_message(message, self._preserve_content)
+                for message in messages
+            ],
             tools=request.get("tools"),
             **kwargs,
         )
         return prompt, self._opener(prompt, kwargs)
+
+    def _template_kwargs(self, request: dict[str, Any]) -> dict[str, Any]:
+        """The request's template kwargs, with what the OpenAI server's
+        `_chat_completions` threads through besides: a string `tool_choice`
+        (Kimi-K3's template reads it) and `thinking` / `reasoning_effort`,
+        resolved by the encoder's own rules (DeepSeek-V4.1's effort aliases
+        and budgets)."""
+        kwargs = dict(request.get("chat_template_kwargs") or {})
+        if isinstance(request.get("tool_choice"), str):
+            kwargs["tool_choice"] = request["tool_choice"]
+        rules = getattr(self.encoder, "reasoning_rules", None) or CHAT_REASONING_RULES
+        controls = resolve_reasoning_controls(
+            thinking=request.get("thinking"),
+            effort=request.get("reasoning_effort"),
+            rules=rules,
+        )
+        return apply_reasoning_controls(
+            kwargs, self.reasoning_toggle, controls, rules=rules
+        )
 
     def _opener(self, prompt: str, kwargs: dict[str, Any]) -> str | None:
         tail = prompt.rstrip()
@@ -121,11 +151,13 @@ class ChatRenderer:
         return None
 
 
-def _template_message(message: dict[str, Any]) -> dict[str, Any]:
+def _template_message(
+    message: dict[str, Any], preserve_content: bool
+) -> dict[str, Any]:
     """A chat message as the template takes it: text parts joined, as the
-    Python standalone service sends them."""
+    Python standalone service sends them, unless the encoder joins them."""
     content = message.get("content")
-    if isinstance(content, list):
+    if isinstance(content, list) and not preserve_content:
         content = "\n".join(
             part.get("text", "")
             for part in content

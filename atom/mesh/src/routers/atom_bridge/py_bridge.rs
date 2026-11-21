@@ -271,13 +271,19 @@ fn submit(
 
 /// The chat prompt rendered by `TokenBridge.render_chat`, for a model whose
 /// template the router cannot render (a Python message encoder, or a
-/// tokenizer with no Jinja template). A `ValueError` is the request's fault.
+/// tokenizer with no Jinja template), with the request's `thinking`, which
+/// the typed body drops. A `ValueError` is the request's fault.
 pub(crate) async fn render_chat(
     bridge: &Arc<Py<PyAny>>,
     request: &ChatCompletionRequest,
+    thinking: Option<&serde_json::Value>,
 ) -> Result<RenderedChat, Response> {
-    let body = serde_json::to_string(request)
+    let mut body = serde_json::to_value(request)
         .map_err(|e| error::internal_error("serialize_failed", e.to_string()))?;
+    if let (Some(thinking), Some(object)) = (thinking, body.as_object_mut()) {
+        object.insert("thinking".to_string(), thinking.clone());
+    }
+    let body = body.to_string();
     let bridge = Arc::clone(bridge);
     let rendered = tokio::task::spawn_blocking(move || {
         Python::attach(|py| {
