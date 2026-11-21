@@ -7,9 +7,6 @@ UMBP manages (atom/kv_transfer/pool/umbp/pool.py)."""
 import test_umbp_l1_pool as umbp_tests
 from test_umbp_l1_pool import make_pool, settle, toks
 
-# The L1 service fixture, the Python model and then the real one.
-l1 = umbp_tests.l1
-
 from atom.kv_transfer.pool.umbp import pool as umbp_pool
 from atom.kv_transfer.pool.umbp.pool import (
     UmbpBlockPool,
@@ -17,6 +14,9 @@ from atom.kv_transfer.pool.umbp.pool import (
     split_point,
 )
 from atom.kv_transfer.pool.umbp.settings import UmbpPoolSettings
+
+# The L1 service fixture, the Python model and then the real one.
+l1 = umbp_tests.l1
 
 
 def make_split(
@@ -172,6 +172,34 @@ def test_stats_carry_the_whole_pools_figures_under_the_usual_names(l1):
     assert stats["blocks_total"] == 5
     assert stats["blocks_indexed"] == 1
     assert stats["private_blocks_total"] == 3 and stats["umbp_blocks_total"] == 2
+
+
+def test_count_used_counts_held_blocks_of_both_parts(l1):
+    pool = make_split(l1, "a", 3, 3)
+    held = []
+    for _ in range(5):  # three private blocks, then two of the shared part
+        held.append(pool.pop())
+        pool.allocate(held[-1])
+    assert [b >= pool.offset for b in held] == [False] * 3 + [True] * 2
+    pool.free(held[1])
+    pool.free(held[4])
+    ids = held + [5]  # block 5 was never taken
+    assert pool.count_used(ids, len(ids)) == 3
+    # Only the first `n` are looked at.
+    assert pool.count_used(ids, 2) == 1
+    assert pool.count_used(ids, 0) == 0
+    for n in range(len(ids) + 1):
+        assert pool.count_used(ids, n) == sum(pool.is_used(b) for b in ids[:n])
+
+
+def test_count_used_at_a_share_ratio_of_one(l1):
+    pool = make_split(l1, "a", 0, 4)
+    held = [pool.pop() for _ in range(3)]
+    for block_id in held:
+        pool.allocate(block_id)
+    pool.free(held[0])
+    assert pool.count_used(held, 3) == 2
+    assert pool.count_used(held, 1) == 0
 
 
 def test_a_share_ratio_of_one_sends_every_call_to_umbp(l1):

@@ -959,7 +959,15 @@ class UmbpBlockPool(KVBlockPool):
         return get
 
     def count_used(self, block_ids: list[int], n: int) -> int:
-        return sum(1 for block_id in block_ids[:n] if self.is_used(block_id))
+        # Asked on every admission probe, for a whole prefix hit: each part
+        # counts its own ids as a set, not block by block through `is_used`.
+        offset = self.offset
+        if not offset:
+            return self.umbp.count_used(block_ids, n)
+        head = block_ids[:n]
+        return self.private.count_used(
+            [b for b in head if b < offset], n
+        ) + self.umbp.count_used([b - offset for b in head if b >= offset], n)
 
     def publish(self, block_id: int, h: int, token_ids: array.array) -> None:
         if self._is_umbp(block_id):
