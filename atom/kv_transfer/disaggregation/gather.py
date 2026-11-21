@@ -13,8 +13,8 @@ import torch
 
 from atom.kv_transfer.disaggregation.sharded_transfer import coalesce_contiguous
 
-# A gather program copies one table row of at most this many words, its BLOCK.
-_PIECE_WORDS = 256
+# A gather program copies this many destination words of a unit, its BLOCK.
+_BLOCK_WORDS = 256
 
 
 @dataclass(frozen=True)
@@ -91,36 +91,33 @@ def gather_units(
         )
         return
     # Imported here, so the whole-unit path runs without Triton.
-    from atom.kv_transfer.disaggregation.gather_kernels import gather_unit_pieces
+    from atom.kv_transfer.disaggregation.gather_kernels import gather_unit_words
 
-    pieces = _device_pieces(plan, source.device)
-    gather_unit_pieces[(indices.numel(), pieces.shape[0])](
+    words = plan.unit_bytes // 4
+    gather_unit_words[(indices.numel(), -(-words // _BLOCK_WORDS))](
         source.view(torch.int32),
         indices,
         out.view(torch.int32),
-        pieces,
+        _device_src_offsets(plan, source.device),
         plan.source_bytes // 4,
-        plan.unit_bytes // 4,
-        BLOCK=_PIECE_WORDS,
+        words,
+        BLOCK=_BLOCK_WORDS,
         num_warps=1,
     )
 
 
-def _pieces(plan: GatherLayout) -> np.ndarray:
-    """``plan.segments`` as int32 ``[src word, dst word, words]`` rows of at most
-    ``_PIECE_WORDS`` words, one gather program each."""
-    rows, at = [], 0
-    for offset, size in plan.segments:
-        words = size // 4
-        for start in range(0, words, _PIECE_WORDS):
-            rows.append(
-                (offset // 4 + start, at + start, min(_PIECE_WORDS, words - start))
-            )
-        at += words
-    return np.array(rows, dtype=np.int32)
+def _src_offsets(plan: GatherLayout) -> np.ndarray:
+    """The int32 source word of each destination word, ``plan.segments`` laid end
+    to end, so one program's block of words may span many segments."""
+    return np.concatenate(
+        [
+            np.arange(offset // 4, (offset + size) // 4, dtype=np.int32)
+            for offset, size in plan.segments
+        ]
+    )
 
 
 @functools.cache
-def _device_pieces(plan: GatherLayout, device: torch.device) -> torch.Tensor:
+def _device_src_offsets(plan: GatherLayout, device: torch.device) -> torch.Tensor:
     # A blocking copy, so the table is whole before any worker's stream reads it.
-    return torch.from_numpy(_pieces(plan)).to(device)
+    return torch.from_numpy(_src_offsets(plan)).to(device)

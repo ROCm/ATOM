@@ -7,7 +7,11 @@ import numpy as np
 import pytest
 import torch
 
-from atom.kv_transfer.disaggregation.gather import GatherLayout, _pieces, gather_units
+from atom.kv_transfer.disaggregation.gather import (
+    GatherLayout,
+    _src_offsets,
+    gather_units,
+)
 from atom.kv_transfer.disaggregation.sharded_transfer import (
     coalesce_contiguous,
     consumer_head_slices,
@@ -181,6 +185,9 @@ CUTS = {
     "five-named-runs": ((8, 4, 8, 4, 4), 4),
     "one-run": ((2048,), 4),
     "nvfp4-two-heads": ((8192, 1024, 8192, 1024), 2),
+    "kv-data-plane": ((512,) * 16, 4),
+    "many-short-runs": ((4,) * 96, 4),
+    "one-long-run": ((40004,), 2),
 }
 
 
@@ -197,19 +204,20 @@ def _cut_layouts(name):
 
 
 @pytest.mark.parametrize("name", CUTS)
-def test_piece_table_splits_each_segment_into_kernel_blocks(name):
+def test_offset_table_lays_the_segments_end_to_end(name):
     for layout in _cut_layouts(name):
-        src, dst, words = _pieces(layout).astype(np.int64).T
-        assert words.min() > 0 and words.max() <= 256
-        assert (dst == words.cumsum() - words).all()  # the destination, in order
-        src, _, words = coalesce_contiguous(src, dst, words)
+        src = _src_offsets(layout).astype(np.int64)
+        assert src.size == layout.unit_bytes // 4  # one per destination word
+        assert src.min() >= 0 and src.max() < layout.source_bytes // 4
+        dst = np.arange(src.size)
+        src, _, words = coalesce_contiguous(src, dst, np.ones_like(src))
         assert tuple(zip((4 * src).tolist(), (4 * words).tolist())) == layout.segments
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton gather kernel")
 @pytest.mark.parametrize("name", CUTS)
 def test_gather_kernel_matches_the_host_reference(name):
-    # Every TP2 and TP4 rank's cut, as equal runs or named widths, up to eight segments.
+    # Every TP2 and TP4 rank's cut: up to 96 segments, or one spanning 40 blocks.
     for layout in _cut_layouts(name):
         generator = torch.Generator().manual_seed(layout.source_bytes)
         source = torch.randint(

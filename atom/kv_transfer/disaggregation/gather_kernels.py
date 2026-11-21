@@ -8,23 +8,21 @@ import triton.language as tl
 
 
 @triton.jit
-def gather_unit_pieces(
+def gather_unit_words(
     src,
     indices,
     dst,
-    pieces,
+    src_offsets,
     src_words,
     dst_words,
     BLOCK: tl.constexpr,
 ):
-    """Program ``(u, p)`` copies piece ``p`` of unit ``indices[u]``: ``pieces[p]``
-    is ``(src word, dst word, words)``, at most ``BLOCK`` words."""
+    """Program ``(u, b)`` fills block ``b`` of ``BLOCK`` words of output unit ``u``,
+    word ``w`` from word ``src_offsets[w]`` of source unit ``indices[u]``."""
     unit = tl.program_id(0)
-    piece = pieces + tl.program_id(1) * 3
+    word = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = word < dst_words
     block_id = tl.load(indices + unit).to(tl.int64)
-    src_word = tl.load(piece)
-    dst_word = tl.load(piece + 1)
-    word = tl.arange(0, BLOCK)
-    mask = word < tl.load(piece + 2)
-    value = tl.load(src + block_id * src_words + src_word + word, mask=mask)
-    tl.store(dst + unit * dst_words + dst_word + word, value, mask=mask)
+    offset = tl.load(src_offsets + word, mask=mask)
+    value = tl.load(src + block_id * src_words + offset, mask=mask)
+    tl.store(dst + unit * dst_words + word, value, mask=mask)
