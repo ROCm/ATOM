@@ -25,6 +25,7 @@ _ATOM_ENV_VARS = [
     "ATOM_ENABLE_DS_QKNORM_QUANT_FUSION",
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION",
     "ATOM_ENABLE_GLUON_FUSED_AR",
+    "ATOM_MINIMAX_M3_GLUON_AR_MXFP8",
     "ATOM_ENABLE_GDN_DECODE_LOSSY_FAST",
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT",
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT",
@@ -107,6 +108,9 @@ class TestEnvsDefaults:
 
     def test_gluon_fused_ar_default_enabled(self):
         assert _get_envs().ATOM_ENABLE_GLUON_FUSED_AR is True
+
+    def test_minimax_m3_gluon_ar_mxfp8_default_disabled(self):
+        assert _get_envs().ATOM_MINIMAX_M3_GLUON_AR_MXFP8 is False
 
     def test_model_sensitive_rmsnorm_default_disabled(self):
         assert _get_envs().ATOM_USE_MODEL_SENSITIVE_RMSNORM is False
@@ -200,6 +204,14 @@ class TestEnvsOverrides:
     def test_use_v4_prefill_asm_for_decode_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_USE_V4_PREFILL_ASM_FOR_DECODE", "1")
         assert _get_envs().ATOM_USE_V4_PREFILL_ASM_FOR_DECODE is True
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [("1", True), ("true", True), ("0", False), ("", False)],
+    )
+    def test_minimax_m3_gluon_ar_mxfp8_override(self, monkeypatch, value, expected):
+        monkeypatch.setenv("ATOM_MINIMAX_M3_GLUON_AR_MXFP8", value)
+        assert _get_envs().ATOM_MINIMAX_M3_GLUON_AR_MXFP8 is expected
 
     def test_torch_profiler_dir_override(self, monkeypatch):
         monkeypatch.setenv("ATOM_TORCH_PROFILER_DIR", "/tmp/prof")
@@ -409,6 +421,11 @@ def test_offload_env_vars_are_documented():
     ]
     assert offload
     assert [name for name in offload if f"**{name}**" not in doc] == []
+
+
+def test_minimax_m3_gluon_ar_mxfp8_is_documented():
+    doc = (Path(__file__).parents[1] / "docs" / "environment_variables.md").read_text()
+    assert "**ATOM_MINIMAX_M3_GLUON_AR_MXFP8**" in doc
 
 
 @pytest.mark.parametrize(
