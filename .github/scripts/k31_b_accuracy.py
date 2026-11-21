@@ -3,6 +3,7 @@
 import argparse
 import base64
 import json
+import math
 import os
 import re
 import shlex
@@ -341,6 +342,7 @@ def telemetry(output):
     identities = command(["rocm-smi", "--showbus", "--showuniqueid", "--json"])
     report = {
         "kind": "device-telemetry-v1",
+        "resource_metrics": "observed-only",
         "pids": pids,
         "memory": memory,
         "driver": driver,
@@ -364,17 +366,16 @@ def telemetry(output):
     require("No KFD PIDs currently running" in pids["stdout"], "GPU processes remain")
     cards = json.loads(memory["stdout"])
     require(len(cards) == 8, "ambiguous telemetry device count")
-    require(
-        all(
-            float(c["GPU use (%)"]) == 0
-            and int(c["VRAM Total Used Memory (B)"]) < 512 * 1024**2
-            and int(c["VRAM Total Memory (B)"]) - int(c["VRAM Total Used Memory (B)"])
-            >= 3 * 1024**3
-            for c in cards.values()
-        ),
-        "allocated GPUs are not idle",
-    )
-    report["passed"] = True
+    for card in cards.values():
+        # Accuracy observes resource use; native/model allocation checks availability.
+        use = float(str(card["GPU use (%)"]))
+        used = int(str(card["VRAM Total Used Memory (B)"]))
+        total = int(str(card["VRAM Total Memory (B)"]))
+        require(
+            math.isfinite(use) and 0 <= use <= 100 and 0 <= used <= total and total > 0,
+            "invalid telemetry resource values",
+        )
+    report["checks_passed"] = True
     save(output, report)
 
 

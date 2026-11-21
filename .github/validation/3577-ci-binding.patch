@@ -46,11 +46,11 @@
 +++ b/check_results.py
 @@ -1,4 +1,4 @@
 -"""Check receipts after the common supervisor proves cleanup. No model execution."""
-+"""Check fixed B-accuracy receipts after CI container removal and telemetry."""
++"""Check B-accuracy, device/PID checks and exact CI container removal."""
  import json
  from pathlib import Path
  import sys
-@@ -6,10 +6,23 @@
+@@ -6,10 +6,25 @@
  evidence = Path(sys.argv[1]).resolve()
  read = lambda name: json.loads((evidence / name).read_text())
  assert read("entry-exit.json")["entry_exit"] == 0
@@ -74,7 +74,9 @@
 +    assert json.loads(container["final_inspect"]["stdout"])[0]["Id"] == cid
 +    assert container["cleanup"]["remove"]["argv"][-1] == cid
 +    assert cid not in container["cleanup"]["inventory"]["stdout"].splitlines()
-+assert read("postflight.json")["passed"] is True
++postflight = read("postflight.json")
++assert postflight["checks_passed"] is True
++assert postflight["resource_metrics"] == "observed-only"
  assert read("verified-inputs.json")
  if evidence.name.endswith("pp2"):
      results = read("benchmark-detailed.json")

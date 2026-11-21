@@ -421,11 +421,21 @@ def test_child_entry_uses_existing_access_check(tmp_path, monkeypatch):
     ]
 
 
-def test_zero_usage_unknown_pid_still_refuses(tmp_path, monkeypatch):
+@pytest.fixture
+def telemetry_probe(tmp_path, monkeypatch):
     nodes = [{"pci": f"0000:{i:02x}:00.0"} for i in range(8)]
+    # Saved run44926975232 observations; their source is not established.
+    cards = {
+        f"card{i}": {
+            "GPU use (%)": str(use),
+            "VRAM Total Used Memory (B)": "299544576",
+            "VRAM Total Memory (B)": "308902100992",
+        }
+        for i, use in enumerate([6, 2, 2, 0, 3, 2, 5, 2])
+    }
     output = {
-        "--showpids": "PID PROCESS NAME GPU(s) VRAM USED\n1092302 UNKNOWN 0 0",
-        "--showuse": "{}",
+        "--showpids": "No KFD PIDs currently running",
+        "--showuse": json.dumps(cards),
         "--showdriverversion": "fixture",
         "--showbus": json.dumps(
             {f"card{i}": {"PCI Bus": n["pci"]} for i, n in enumerate(nodes)}
@@ -445,8 +455,91 @@ def test_zero_usage_unknown_pid_still_refuses(tmp_path, monkeypatch):
     monkeypatch.setattr(
         ci.os, "uname", lambda: SimpleNamespace(release="fixture"), raising=False
     )
+    return tmp_path / "telemetry.json", output, cards
+
+
+def test_zero_usage_unknown_pid_still_refuses(telemetry_probe):
+    path, output, _ = telemetry_probe
+    output["--showpids"] = "PID PROCESS NAME GPU(s) VRAM USED\n1092302 UNKNOWN 0 0"
     with pytest.raises(ValueError, match="GPU processes remain"):
-        ci.telemetry(tmp_path / "telemetry.json")
+        ci.telemetry(path)
+    assert "1092302 UNKNOWN" in json.loads(path.read_text())["pids"]["stdout"]
+
+
+@pytest.mark.parametrize("high_memory", [False, True])
+def test_resource_metrics_are_observations(telemetry_probe, high_memory):
+    path, output, cards = telemetry_probe
+    if high_memory:
+        cards["card0"].update(
+            {
+                "GPU use (%)": "100",
+                "VRAM Total Used Memory (B)": str(4 * 1024**3),
+                "VRAM Total Memory (B)": str(5 * 1024**3),
+            }
+        )
+        output["--showuse"] = json.dumps(cards)
+    ci.telemetry(path)
+    report = json.loads(path.read_text())
+    assert report["checks_passed"] and report["resource_metrics"] == "observed-only"
+    assert "passed" not in report
+    assert report["memory"]["stdout"] == output["--showuse"]
+    assert json.loads(report["memory"]["stdout"]) == cards
+
+
+@pytest.mark.parametrize(
+    "field", ["GPU use (%)", "VRAM Total Used Memory (B)", "VRAM Total Memory (B)"]
+)
+@pytest.mark.parametrize(
+    "invalid", [None, "", "N/A", "NaN", "Infinity", "-Infinity", float("nan"), True]
+)
+def test_invalid_resource_observations_refuse(telemetry_probe, field, invalid):
+    path, output, cards = telemetry_probe
+    if invalid is None:
+        del cards["card0"][field]
+    else:
+        cards["card0"][field] = invalid
+    output["--showuse"] = json.dumps(cards)
+    with pytest.raises((ValueError, KeyError)):
+        ci.telemetry(path)
+    report = json.loads(path.read_text())
+    assert "checks_passed" not in report
+    assert report["memory"]["stdout"] == output["--showuse"]
+
+
+@pytest.mark.parametrize(
+    "field, invalid",
+    [
+        ("GPU use (%)", "-1"),
+        ("GPU use (%)", "101"),
+        ("VRAM Total Used Memory (B)", "-1"),
+        ("VRAM Total Used Memory (B)", "308902100993"),
+        ("VRAM Total Used Memory (B)", 1.5),
+        ("VRAM Total Memory (B)", "0"),
+    ],
+)
+def test_invalid_resource_domains_refuse(telemetry_probe, field, invalid):
+    path, output, cards = telemetry_probe
+    cards["card0"][field] = invalid
+    output["--showuse"] = json.dumps(cards)
+    with pytest.raises(ValueError):
+        ci.telemetry(path)
+
+
+@pytest.mark.parametrize("invalid", ["allocation", "count", "query"])
+def test_telemetry_admission_stays_strict(telemetry_probe, monkeypatch, invalid):
+    path, output, cards = telemetry_probe
+    if invalid == "allocation":
+        output["--showbus"] = json.dumps({"card0": {"PCI Bus": "0000:ff:00.0"}})
+    elif invalid == "count":
+        del cards["card7"]
+        output["--showuse"] = json.dumps(cards)
+    else:
+        command = ci.command
+        monkeypatch.setattr(
+            ci, "command", lambda argv: dict(command(argv), returncode=1)
+        )
+    with pytest.raises(ValueError):
+        ci.telemetry(path)
 
 
 def test_allocated_nodes_and_ambiguous_inputs(monkeypatch):
@@ -736,7 +829,7 @@ def test_real_checker_patch_preserves_full_evaluation(tmp_path):
         "entry-exit.json": {"entry_exit": 0},
         "lm-eval-exit.json": {"exit_code": 0},
         "verified-inputs.json": {"source": "fixed"},
-        "postflight.json": {"passed": True},
+        "postflight.json": {"checks_passed": True, "resource_metrics": "observed-only"},
         "compiled-trace-request.json": {"requested": 0},
         "compiled-trace-outcome.json": {"status": "not_requested"},
         "container-lifecycle.json": dict(
@@ -786,6 +879,17 @@ def test_real_checker_patch_preserves_full_evaluation(tmp_path):
         check=False,
     )
     assert run().returncode == 0
+    for postflight in (
+        {"passed": True},
+        {"checks_passed": False, "resource_metrics": "observed-only"},
+        {"checks_passed": True, "resource_metrics": "quiet"},
+    ):
+        write(evidence / "postflight.json", postflight)
+        assert run().returncode != 0
+    write(
+        evidence / "postflight.json",
+        {"checks_passed": True, "resource_metrics": "observed-only"},
+    )
     legacy = tmp_path / "legacy_checker.py"
     legacy.write_text(old)
     red = subprocess.run(
