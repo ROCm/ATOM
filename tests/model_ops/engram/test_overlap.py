@@ -205,6 +205,8 @@ def make_staging(mapping, group=None, staging_cls=EngramStaging):
         row_ids=torch.empty(
             32, config.num_hash_heads, dtype=torch.int64, device=device
         ),
+        # bf16 tables: no device row cache (that is for quantized ones)
+        row_cache={},
     )
     return staging_cls(uva), backing
 

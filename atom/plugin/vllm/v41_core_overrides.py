@@ -849,6 +849,7 @@ def _prefetch(self, width):
                 head_start=host.head_start,
                 local_heads=host.local_heads,
                 total_heads=host.total_heads,
+                cache=self.uva.row_cache.get(layer),
             )
             if self.collective is not None:
                 out = self.gathered[layer][:width]
