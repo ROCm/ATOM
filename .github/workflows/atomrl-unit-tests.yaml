@@ -229,12 +229,12 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: |
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install pytest pyyaml
+          pip install pytest pyyaml numpy
           SETUPTOOLS_SCM_PRETEND_VERSION_FOR_ATOM=0.0.0+lumen.ci pip install --no-deps -e .
           pip install --no-deps -e atomrl
       - name: Run CPU-safe Lumen coverage
         run: |
-          python -m pytest \
+          PYTHONPATH="$GITHUB_WORKSPACE/atomrl" python -m pytest \
             atomrl/tests/lumen/patches/test_registry.py \
             atomrl/tests/lumen/patches/test_cli.py \
             atomrl/tests/lumen/models/test_launcher_parity.py \
