@@ -34,6 +34,9 @@ _HF = {
     "index_n_heads": 32,
     "index_head_dim": 128,
     "fp4ptpc": False,
+    # V4.1-Flash's: the candidate producer (layer 20) at ratio 1
+    "compress_ratios": [0, 0] + [2] * 18 + [1] * 20 + [0] * 3,
+    "candidate_source_layer_id": 20,
 }
 
 
@@ -165,6 +168,12 @@ def test_per_request_verify_lengths_are_served(native, schedule, ragged):
         (
             {"hf_config": SimpleNamespace(**{**_HF, "fp4ptpc": True})},
             "FP4PTPC checkpoint's per-channel FP8 linears",
+        ),
+        (
+            # a producer whose ratio's FULL rows split would wait for its
+            # blocks' scores on the other ranks for good
+            {"hf_config": SimpleNamespace(**{**_HF, "candidate_source_layer_id": 2})},
+            "a candidate producer at a ratio whose rows split",
         ),
     ],
 )

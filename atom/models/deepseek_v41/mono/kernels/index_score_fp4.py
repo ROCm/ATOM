@@ -94,7 +94,7 @@ def _vop(asm, *args):
     )
 
 
-def _sload4(addr):
+def sload4(addr):
     """Four words at a wave-uniform address, a scalar load (the constant
     address space): the scalar cache's round trip, not the vector memory's."""
     ptr = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<4>"), as_ir_value(addr)).result
@@ -503,14 +503,36 @@ def stage_iscore4(c, lead, span, ch0, ch1, max_chunks, rows):
 
 
 @traced
-def await_new_keys(c):
+def await_new_keys(c, reached=None):
     """A compressing layer kernel: this launch's new index keys in the plane
     (every compress plan row's CRDY, a lane each; the compressor writes them
-    through) before a walk reads it."""
+    through) before a walk reads it. ``reached``: whether the walk's chunks
+    reach them (``new_keys_reached``; None: assumed)."""
     fresh = c.get("cp_ratio")
-    if const_expr(fresh):  # noqa: SIM102
-        if c["cp_ncap"] > 0:
+    if const_expr(fresh):
+        live = c["cp_ncap"] > 0
+        if const_expr(reached is not None):
+            live = live & reached
+        if live:
             c["k1_poll"]([(c["crdy"], fx.min(c["lane"], c["cp_ncap"] - 1), 1)])
+
+
+def new_keys_reached(c, lead, span, ch1):
+    """Whether a FULL piece's walk up to chunk ``ch1`` reaches a column this
+    launch's compressor writes: a request's new entries start at its first
+    step position // ratio (``attention._selected_row``), at most S // ratio +
+    1 columns before the piece's largest bound (its rows ``lead`` .. ``lead +
+    span`` are one request's, within S positions of each other); 0 for a build
+    without a compressor. Read before the stage: tested inside it, the walk's
+    page addresses stayed live across the CRDY poll and spilled."""
+    ratio = c.get("cp_ratio")
+    if const_expr(not ratio):
+        return fx.Int32(0) > 0
+    bound = _stage_args(c)["ibound"]
+    top = ld_i32(bound, lead)
+    for r in range_constexpr(1, ip.WALK_ROWS):
+        top = fx.max(top, ld_i32(bound, lead + fx.min(fx.Int32(r), span - 1)))
+    return ch1 * ip.CHUNK > top - (c["S"] // ratio + 2)
 
 
 @traced
@@ -533,9 +555,10 @@ def run_scores4(c, t0, n, bid, max_chunks):
             await_new_keys(c)
             stage_iscore4(c, t0 + bid // per, fx.Int32(1), ch0, ch1, max_chunks, 1)
     else:
-        task = _sload4(a["iplan"] + fx.Int64(bid) * 16)
+        task = sload4(a["iplan"] + fx.Int64(bid) * 16)
         if task[1] > 0:
-            await_new_keys(c)
+            # this launch's new keys only where the piece's chunks reach them
+            await_new_keys(c, new_keys_reached(c, task[0], task[1], task[3]))
             stage_iscore4(
                 c, task[0], task[1], task[2], task[3], max_chunks, ip.WALK_ROWS
             )

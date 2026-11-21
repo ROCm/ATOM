@@ -80,7 +80,7 @@ _CURRENT_STREAM = fx.Stream(None)
 
 KSTEP = 32  # K an MFMA step
 RG = 16  # weight rows a row group (the MFMA's M), step rows a chunk (its N)
-QUARTERS = 4  # K slices a row group: PARTS' partials a value
+QUARTERS = 4  # K slices a row group at most: PARTS' partials a value
 ROPE = 64
 NOPE_PAIRS = (HEAD_DIM - ROPE) // 2  # the latent's first rotated pair
 KEY_NOPE_PAIRS = (ip.DIM - ROPE) // 2  # the index key's
@@ -145,10 +145,14 @@ class CompressBuild:
     k_eps: float
     kv_fp8: bool = False
     timeline: bool = False
+    # K slices a row group (``QUARTERS`` at most): the projection's CTAs are
+    # its row groups x this
+    quarters: int = QUARTERS
 
     def __post_init__(self):
         assert self.ratio in (1, 2)
-        assert HIDDEN % (QUARTERS * WAVES * KSTEP) == 0
+        assert self.quarters <= QUARTERS
+        assert HIDDEN % (self.quarters * WAVES * KSTEP) == 0
         assert self.proj_ctas <= BLOCKS
         assert self.cap + self.wcap <= BLOCKS, "a plan row a CTA at least"
 
@@ -167,12 +171,12 @@ class CompressBuild:
 
     @property
     def proj_ctas(self) -> int:
-        return self.cols // RG * QUARTERS
+        return self.cols // RG * self.quarters
 
     @property
     def wsteps(self) -> int:
         """K steps a wave."""
-        return HIDDEN // (QUARTERS * WAVES * KSTEP)
+        return HIDDEN // (self.quarters * WAVES * KSTEP)
 
     @property
     def chunks(self) -> int:
@@ -256,7 +260,7 @@ def project(c):
     # context the region's state)
     x_wait, x_cm = c.get("x_wait"), c.get("x_cm", 0)
     if t < p.proj_ctas:
-        g, q = t // QUARTERS, t % QUARTERS
+        g, q = t // p.quarters, t % p.quarters
         k0 = (q * WAVES + wave) * (p.wsteps * KSTEP) + 8 * (lane // 16)
         wrow = g * RG + lane % 16
         a = [
@@ -305,7 +309,7 @@ def project(c):
                     s = s + fx.ptr_load(c["ldsf"] + (at + w * p.chunks * 256))
                 col = g * RG + r
                 bo.buffer_store(
-                    s, c["r_parts"], (tok * p.cols + col) * QUARTERS + q,
+                    s, c["r_parts"], (tok * p.cols + col) * p.quarters + q,
                     cache_modifier=CM_DEV,
                 )  # fmt: skip
         publish(c["mb"].put, c["cpf"], t, 1, tid == 0)
@@ -317,24 +321,24 @@ def await_groups(c, ranges):
     ((first, count) each, the first a traced or Python int), polled by wave 0
     a flag a lane (the CTA's other waves would only add traffic to the polled
     lines), then the CTA past."""
-    lane = c["lane"]
-    total = sum(n for _, n in ranges) * QUARTERS
+    lane, quarters = c["lane"], c["key"].quarters
+    total = sum(n for _, n in ranges) * quarters
     if c["wave"] == 0:
         for k in range_constexpr(-(-total // 64)):
             f = fx.min(lane + 64 * k, fx.Int32(total - 1))
             at, below = f, 0
             for first, n in ranges:
                 past = f >= below
-                at = past.select(first * QUARTERS + (f - below), at)
-                below += n * QUARTERS
+                at = past.select(first * quarters + (f - below), at)
+                below += n * quarters
             c["mb"].poll([(c["cpf"], at, 1)])
     gpu.barrier()
 
 
 def proj_pairs(c, cols):
     """Projected columns (col, col + 1) of each (row, col) of ``cols`` (their
-    CTAs' flags awaited), one load each: its 4 partials added in quarter order
-    (ratio 1: rounded to bf16)."""
+    CTAs' flags awaited), one load each: its ``quarters`` partials added in
+    quarter order (ratio 1: rounded to bf16)."""
     p = c["key"]
     out = []
     for tok, col in cols:
@@ -342,11 +346,13 @@ def proj_pairs(c, cols):
         for j in range(2):
             v = fx.Vector(
                 bo.buffer_load(
-                    c["r_parts"], (tok * p.cols + col + j) * QUARTERS,
-                    vec_width=4, dtype=T.f32, cache_modifier=CM_DEV,
+                    c["r_parts"], (tok * p.cols + col + j) * p.quarters,
+                    vec_width=p.quarters, dtype=T.f32, cache_modifier=CM_DEV,
                 )
             )  # fmt: skip
-            s = ((v[0] + v[1]) + v[2]) + v[3]
+            s = v[0]
+            for q in range(1, p.quarters):
+                s = s + v[q]
             pair.append(bf16_round(s) if const_expr(p.ratio == 1) else s)
         out.append(pair)
     return out
@@ -431,6 +437,11 @@ def pool(c, i, h):
                 # and scorer, which await every plan row's (``ncap``)
                 publish(c["mb"].put, crdy, i, 1, tid == 0)
             c["stamp"](7)
+    if const_expr(crdy is not None):  # noqa: SIM102
+        # a padding row (pos -1) has no entry: its CRDY at once, so a waiter
+        # on every plan row up to ``ncap`` never waits on it
+        if (pos < 0) & (h == 0):
+            publish(c["mb"].put, crdy, i, 1, tid == 0)
 
 
 def _pooled(c, rid, wl, tt, rings, apes):

@@ -49,6 +49,11 @@ class HiDecodeModel(MonoDecodeModel):
     the first such step only: none at the served deployment, whose decode steps are all hi widths), and every other
     forward ATOM's model."""
 
+    # the hi post-verify samples a sampled row itself, and its ids are
+    # broadcast over TP as any head's: not ``MonoDecodeModel``'s
+    head_samples = True
+    head_ids_agree = False
+
     def __init__(
         self, model, drafter, max_model_len, index_fp4, dp_ranks, hook
     ) -> None:
@@ -160,12 +165,12 @@ class HiDraftModel(MonoDraftModel):
             return _HI_DRAFT
         return super().block_backbone(input_ids, positions, num_draft)
 
-    def head_and_sample(self, out, anchor_ids, num_draft):
+    def head_and_sample(self, out, anchor_ids, num_draft, *, greedy=False):
         if out is _HI_DRAFT:
             # a row of ids a request (``draft_run``)
             requests = self.hi.dr_requests
             return self.hi.mk_ids[:requests].view(requests, -1), None
-        return self.model.head_and_sample(out, anchor_ids, num_draft)
+        return super().head_and_sample(out, anchor_ids, num_draft, greedy=greedy)
 
 
 def _tp() -> tuple:

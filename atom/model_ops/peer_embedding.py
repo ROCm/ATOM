@@ -11,10 +11,14 @@ the all-reduce become one gather. The rows are the original's: the sum adds
 only zeros to the owner's row (an id no rank owns reads zeros, as there).
 """
 
+import weakref
+
 import torch
 import triton
 import triton.language as tl
 
+from atom.mono.runtime.consensus import MonoUnsupported
+from atom.mono.runtime.lifecycle import closed_with
 from atom.mono.runtime.peer_memory import PeerView
 
 BLOCK = 1024  # columns a program a round
@@ -94,3 +98,21 @@ class PeerEmbedding:
 
     def close(self) -> None:
         self.view.close()
+
+
+# each embedding's one ``PeerEmbedding`` (``shared_peer_embedding``)
+_SHARED: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def shared_peer_embedding(embed, group) -> PeerEmbedding:
+    """``embed``'s one ``PeerEmbedding`` over ``group`` (collective where it
+    is made): every reader of the same embedding (a DSpark draft shares its
+    target's) shares one set of remote mappings, closed with ``embed``. The
+    mappings are ``group``'s: a reader over another group is refused."""
+    bound = _SHARED.get(embed)
+    if bound is None:
+        bound = _SHARED[embed] = (group, PeerEmbedding(embed, group))
+        closed_with(embed, bound[1])
+    if bound[0] is not group:
+        raise MonoUnsupported("the embedding is mapped over another group")
+    return bound[1]

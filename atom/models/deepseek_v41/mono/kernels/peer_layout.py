@@ -60,6 +60,9 @@ def peer_layout(tokens: int, d: Dims) -> dict[str, tuple[int, int]]:
             ("iwg", tokens * ip.HEADS),
             ("irdy", tokens),
             ("icrdy", tokens),
+            # a split row's answers in its ``plain_layout`` IXSEL, [token]
+            # [source rank] (``index_score.stage_imerge``)
+            ("ixrdy", tokens * d.tp),
             ("rt", ROUTE_COPIES * tokens * 2 * TOPK),
             # the draft head's (key, id) bests (``draft_head``): its tasks'
             # on this rank [row][task], every rank's [source rank][row]
@@ -96,16 +99,19 @@ def peer_bytes(tokens: int, d: Dims) -> int:
     return -(-end // ZERO_ALIGN) * ZERO_ALIGN
 
 
-def plain_layout(tokens: int, selecting: int) -> dict[str, tuple[int, int]]:
+def plain_layout(tokens: int, selecting: int, tp: int) -> dict[str, tuple[int, int]]:
     """Region -> (byte offset, bytes) in the peer buffer's never-zeroed part
     (``PeerBuffer.plain``), int32 words: IROW the ``selecting`` layers' pool
     rows, [layer][token][TOPK], and ICAND the candidate blocks, [token]
     [TOPK_BLOCKS]. Each row's are written whole by the K2a that selects it
-    (``index_score._st_out``), before the step reads them."""
+    (``index_score._st_out``), before the step reads them. IXSEL: a split
+    row's (value bits, column) answers, [token][source rank][TOPK][2]
+    (``index_score._put_answer``), read past their IXRDY flags."""
     out, off = {}, 0
     for name, words in (
         ("irow", selecting * tokens * ip.TOPK),
         ("icand", tokens * ip.TOPK_BLOCKS),
+        ("ixsel", tokens * tp * ip.TOPK * 2),
     ):
         out[name] = (off, words * 4)
         off += words * 4

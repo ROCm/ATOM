@@ -36,7 +36,7 @@ from KG (``attn_pre.ring_row_from``), the normed rows gathered for the MoE
 (``layer_post.gather_x``); the residual is then not column-sharded.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -112,14 +112,26 @@ class LayerBuild:
     compress_k_eps: float = 0.0
 
     @property
+    def q_apart(self) -> bool:
+        """K1's q path on CTAs of its own, apart from the compressor's
+        projection (``k1.APART_PROJ0``): a
+        compressing layer past one token tile."""
+        return bool(self.compress_ratio) and len(k1.token_tiles(self.pre.tokens)) > 1
+
+    @property
     def compress(self) -> cp.CompressBuild | None:
         if not self.compress_ratio:
             return None
         pre = self.pre
-        return cp.CompressBuild(
+        comp = cp.CompressBuild(
             rows=pre.tokens, ratio=self.compress_ratio, eps=self.compress_eps,
             k_eps=self.compress_k_eps, kv_fp8=pre.kv_fp8, timeline=pre.timeline,
         )  # fmt: skip
+        if not self.q_apart:
+            return comp
+        # the projection on ``k1.APART_PROJ_CTAS`` CTAs whatever the ratio
+        groups = comp.proj_ctas // cp.QUARTERS
+        return replace(comp, quarters=k1.APART_PROJ_CTAS // groups)
 
     def __post_init__(self):
         pre, post = self.pre, self.post
@@ -186,11 +198,12 @@ def compress_smem(comp: cp.CompressBuild):
     return lds_struct("CompressLds", {"cpw": fx.Array[fx.Int32, comp.lds_words, 16]})
 
 
-def compress_context(comp, c1, cargs, lds, mb, normed, kvrow, tid, bid, s):
+def compress_context(comp, c1, cargs, lds, mb, normed, kvrow, tid, bid, s, proj0=0):
     """The compressor's context (``build_compress``'s) inside the layer kernel:
     its input K1's ``normed`` (awaited by the rows' x8f, read at device scope),
     its regions K1's layout's; its hand-off to K2a this step's new entries in
-    ``kvrow`` past the window rows (``dims.kvrow_bytes``) and CRDY."""
+    ``kvrow`` past the window rows (``dims.kvrow_bytes``) and CRDY. Its tasks
+    from CTA ``proj0`` (the projection's first; the plan rows' past it)."""
     lane, wave = tid % 64, tid // 64
 
     def x_wait():
@@ -199,7 +212,8 @@ def compress_context(comp, c1, cargs, lds, mb, normed, kvrow, tid, bid, s):
         gpu.barrier()
 
     return {
-        "key": comp, "tid": tid, "lane": lane, "wave": wave, "t": bid,
+        "key": comp, "tid": tid, "lane": lane, "wave": wave,
+        "t": (bid + BLOCKS - proj0) % BLOCKS if proj0 else bid,
         "lds": lds, "ldsf": fx.recast_iter(fx.Float32, lds), "args": cargs,
         "r_w": rsrc(cargs["w"], comp.cols * HIDDEN * 2),
         "r_x": rsrc(normed, comp.rows * HIDDEN * 2),
@@ -271,7 +285,8 @@ def build_layer(key: LayerBuild):
         itab_stride: Int32, itab_len: Int32, ibatch: Int64, ishift: Int32,
         ibound: Int64, ilog: Int64,
         lstride: Int32, isel: Int64, icand: Int64, ilift: Int32, iprod: Int32,
-        ibmax: Int64, bstride: Int32, icout: Int64, irow: Int64, sbound: Int64,
+        ibmax: Int64, bstride: Int32, icout: Int64, irow: Int64, ixsel: Int64,
+        sbound: Int64,
         q: Int64, pool: Int64, pool_scale: Int64, window: Int64, window_scale: Int64,
         sel: Int64, topk: Int32, kmeta: Int64, table: Int64,
         rows_per_page: Int32, page_rows: Int32, main_off: Int32, ring_off: Int32,
@@ -283,7 +298,7 @@ def build_layer(key: LayerBuild):
         normed: Int64,
         gate_w: Int64, bias: Int64, w13: Int64, w13_s: Int64, w2: Int64,
         w2_s: Int64, sgu: Int64, sgu_s: Int64, sw2: Int64, sw2_s: Int64, out: Int64,
-        qoff: Int64, kvrow: Int64,
+        queue_words: Int64, kvrow: Int64,
         c_w: Int64, c_parts: Int64, c_cplan: Int64, c_ncap: Int32, c_wplan: Int64,
         c_nwcap: Int32, c_slots: Int64, c_kv_state: Int64, c_score_state: Int64,
         c_state_stride: Int64, c_ring: Int32, c_ape: Int64, c_norm_w: Int64,
@@ -313,7 +328,7 @@ def build_layer(key: LayerBuild):
         args_a = attn_post_args(
             iact, iq, iw, plane, iqs, pscale, iplan, itab, itab_stride, itab_len,
             ibatch, ishift, ibound, ilog, lstride,
-            isel, icand, ilift, iprod, ibmax, bstride, icout, irow, sbound,
+            isel, icand, ilift, iprod, ibmax, bstride, icout, irow, ixsel, sbound,
             q, pool, pool_scale, window, window_scale, sel, topk, kmeta, table,
             rows_per_page, page_rows, main_off, ring_off, ring_slots, sink, qk_scale,
             pos, cos, sin, woa, woa_s, wob, wob_s, res_in, post_in, comb_in, pre_in,
@@ -323,7 +338,7 @@ def build_layer(key: LayerBuild):
         args_a["kvrow"] = kvrow
         args_b = moe_args(
             normed, gate_w, bias, w13, w13_s, w2, w2_s, sgu, sgu_s, sw2, sw2_s, out,
-            qoff,
+            queue_words,
         )  # fmt: skip
         mb_1 = mailbox(layer, scratch, pre.diag_off, layout_1)
         c1, co1 = attn_pre_context(
@@ -340,9 +355,6 @@ def build_layer(key: LayerBuild):
         )  # fmt: skip
         ca["normed_cm"] = CM_DEV
         ca["fused"] = True
-        # an index layer's scorer needs every register: the GEMVs' and the
-        # PV's lane splits computed at their use, not held from the entry
-        c1["fresh_lane"] = co1["fresh_lane"] = ca["fresh_lane"] = pre.feeds_index
         # seam F sharded as seam A (``attn_pre_context`` from ``pre.shard``)
         if const_expr(pre.shard):
             shard_seam(ca, ca["peer"], bases, sym, pre.tp, "pmixgf")
@@ -395,7 +407,7 @@ def build_layer(key: LayerBuild):
             }  # fmt: skip
             cc = compress_context(
                 comp, c1, cargs, lds["cp"].cpw.ptr, mb_1, k1_normed, kvrow, tid,
-                bid, s,
+                bid, s, k1.APART_PROJ0 if key.q_apart else 0,
             )  # fmt: skip
         # the compressor: its projection right after K1's norm (its rows the
         # earliest, the pool's partials with them), its pool / key / ring
@@ -403,6 +415,7 @@ def build_layer(key: LayerBuild):
         run_attn_pre(
             c1, co1, pre, tls, 0, lds["k1_iw"].nbl.ptr, gates=False,
             after_norm=None if comp is None else lambda: compress_stage(cp.project, cc),
+            q_apart=key.q_apart,
         )  # fmt: skip
         if const_expr(comp is not None):
             compress_stage(cp.plan_rows, cc)
@@ -446,7 +459,8 @@ def build_layer(key: LayerBuild):
         itab_stride: Int32, itab_len: Int32, ibatch: Int64, ishift: Int32,
         ibound: Int64, ilog: Int64,
         lstride: Int32, isel: Int64, icand: Int64, ilift: Int32, iprod: Int32,
-        ibmax: Int64, bstride: Int32, icout: Int64, irow: Int64, sbound: Int64,
+        ibmax: Int64, bstride: Int32, icout: Int64, irow: Int64, ixsel: Int64,
+        sbound: Int64,
         q: Int64, pool: Int64, pool_scale: Int64, window: Int64, window_scale: Int64,
         sel: Int64, topk: Int32, kmeta: Int64, table: Int64,
         rows_per_page: Int32, page_rows: Int32, main_off: Int32, ring_off: Int32,
@@ -458,7 +472,7 @@ def build_layer(key: LayerBuild):
         normed: Int64,
         gate_w: Int64, bias: Int64, w13: Int64, w13_s: Int64, w2: Int64,
         w2_s: Int64, sgu: Int64, sgu_s: Int64, sw2: Int64, sw2_s: Int64, out: Int64,
-        qoff: Int64, kvrow: Int64,
+        queue_words: Int64, kvrow: Int64,
         c_w: Int64, c_parts: Int64, c_cplan: Int64, c_ncap: Int32, c_wplan: Int64,
         c_nwcap: Int32, c_slots: Int64, c_kv_state: Int64, c_score_state: Int64,
         c_state_stride: Int64, c_ring: Int32, c_ape: Int64, c_norm_w: Int64,
@@ -480,12 +494,12 @@ def build_layer(key: LayerBuild):
             k1_iq_out, k1_iqs_out, k1_iw_out,
             iact, iq, iw, plane, iqs, pscale, iplan, itab, itab_stride, itab_len,
             ibatch, ishift, ibound, ilog, lstride,
-            isel, icand, ilift, iprod, ibmax, bstride, icout, irow, sbound,
+            isel, icand, ilift, iprod, ibmax, bstride, icout, irow, ixsel, sbound,
             q, pool, pool_scale, window, window_scale, sel, topk, kmeta, table,
             rows_per_page, page_rows, main_off, ring_off, ring_slots, sink, qk_scale,
             pos, cos, sin, woa, woa_s, wob, wob_s, res_in, post_in, comb_in, pre_in,
             hc_fn, hc_scale, hc_base, ffn_w, res_out, post_out, comb_out, pre_out,
-            normed, gate_w, bias, w13, w13_s, w2, w2_s, sgu, sgu_s, sw2, sw2_s, out, qoff,
+            normed, gate_w, bias, w13, w13_s, w2, w2_s, sgu, sgu_s, sw2, sw2_s, out, queue_words,
             kvrow,
             c_w, c_parts, c_cplan, c_ncap, c_wplan, c_nwcap, c_slots, c_kv_state,
             c_score_state, c_state_stride, c_ring, c_ape, c_norm_w, c_cos, c_sin,

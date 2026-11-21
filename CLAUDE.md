@@ -48,9 +48,18 @@ Key entry points:
 - Head output and deferred status: a model may give `ModelRunner` its own head
   output (`compute_head`: the forward's logits, or a verify's output ids and
   verdict; `ModelRunner._head_output`, recorded with a decode graph as the logits
-  are at TP 1); an attention builder may say a step consumes the previous
-  verdict on the device (`AttentionMetadataBuilder.consumes_device_verdict`:
-  the runner then takes the speculative status after the target's launch)
+  are at TP 1; the verdict from a head's ids, exact match or forced acceptance:
+  `atom/model_ops/verdict.py`; the model's `head_samples` / `head_ids_agree`
+  tell `ModelRunner` which steps its ids stand for); an attention builder may
+  say a step consumes the previous verdict on the device
+  (`AttentionMetadataBuilder.consumes_device_verdict`: the runner then takes
+  the speculative status after the target's launch) or stages the step before
+  that status and restages what it moves once taken
+  (`settles_spec_status` / `take_spec_status`)
+- Peer embedding: `atom/model_ops/peer_embedding.py` — a vocab-parallel
+  embedding read from each row's owner rank's shard (HIP IPC), one launch;
+  `shared_peer_embedding` one mapping an embedding and group (a DSpark draft
+  shares its target's)
 - Model hooks: `atom/model_engine/model_hooks.py` — `DecodeRound`, the part of a
   step a model's install hands DeepSeek-V4.1's metadata builder
   (`DeepseekV41MetadataBuilder.use_decode_round`); `DecodeRound.service` is the
@@ -80,18 +89,24 @@ Key entry points:
   lazy runner (`route`), debug wait reports, kernel argument tables, compile-only
   builds and their traced hand-offs (`compile.trace` / `compile.check_traced`),
   the refusals every model shares (`deployment`), check-mode
-  comparison (`compare`); `plan/`: the execution model and task placement, build
+  comparison (`compare`), the dual-copy scratch's calibration (`numa`: which
+  copy, one per I/O die, each XCD reads; hi's `dual` runs it on its own
+  probe); `plan/`: the execution model and task placement, build
   keys, a TP rank's share of the widths (`shard`: a model's `Dims` and its TP
   refusal), mailbox region layout (`layout`), int / traced arithmetic (`arith`)
   and the hand-off contract a trace is held to (`check.check`); `device/`: the tagged
   mailbox and its `publish`, the TP group's peer bases and all-reduce sum
-  (`ranks`), FP8 / MX codes, FP4 tile loads and the scaled MFMA (`mx`) and wave
-  / math primitives), a model's
+  (`ranks`), FP8 / MX codes, FP4 tile loads and the scaled MFMA (`mx`), a CTA's
+  dual copy (`numa`) and wave / math primitives), a model's
   kernels in `atom/models/<model>/mono/kernels/` (MiniMax-M3; DeepSeek-V4.1 and
   Kimi-K3, both wrapped after load through
   `models.registry.mono_decode_installers`; V4.1's per-step cell decisions live in
   `deepseek_v41/mono/{index,attention,moe}_plan.py`, each called by both the
-  kernel and its CPU I3 test. On gfx1250, V4.1's whole DSpark decode step is one
+  kernel and its CPU I3 test; its dual-copy regions in `numa_plan.py`; K1 and
+  K2 of a layer in one launch (`kernels/layer.py`), a column-sharded residual's
+  gather (`kernels/col_gather.py`), and the launches beside the layers, each
+  falling back to the original path where not built (`compress_launch`,
+  `engram_launch`, `head_launch`, `draft_ctx_launch`). On gfx1250, V4.1's whole DSpark decode step is one
   persistent FlyDSL kernel a rank (`deepseek_v41/mono/gfx1250/`: a target launch
   through sampling and verification, then a draft launch), which ModelRunner
   is offered through `atom/mono/runtime/step_override.py`; it reads the

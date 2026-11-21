@@ -38,7 +38,11 @@ from atom.model_ops.deepseek_v41.candidate_table import candidate_block_table
 from atom.model_ops.deepseek_v41.index_plane import FP4_MFMA
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState, initial_pre_mix
 from atom.model_ops.embed_head import VocabParallelEmbedding
-from atom.model_ops.peer_embedding import PeerEmbedding
+from atom.model_ops.peer_embedding import shared_peer_embedding
+from atom.model_ops.rejection_sampler import (
+    _SYNTHETIC_RNG_BASE_SEED,
+    _get_synthetic_cond_rates,
+)
 from atom.model_ops.v4_kernels.paged_decode import LOG2E
 from atom.models.deepseek_v41.config import AttentionMode
 from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
@@ -78,13 +82,12 @@ from atom.models.deepseek_v41.mono.kernels.token_par import own_rows
 from atom.models.deepseek_v41.mono.numa_plan import numa_table
 from atom.models.deepseek_v41.mono.step_meta import KMETA, write_step_meta
 from atom.models.deepseek_v41.mono.weights import bind_model
-from atom.mono.device import queue
 from atom.mono.plan.execution import BLOCKS
 from atom.mono.plan.layout import NUMA_PAGE
 from atom.mono.runtime.aux_taps import AuxTaps, bind_aux_taps
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
 from atom.mono.runtime.debug import DIAG_BYTES, given_up_waits, raise_if_given_up
-from atom.mono.runtime.lifecycle import closed_with, owned_peer_buffer
+from atom.mono.runtime.lifecycle import owned_peer_buffer
 from atom.mono.runtime.mailboxes import StepMailboxes
 from atom.mono.runtime.numa import scratch_word
 from atom.mono.runtime.step_begin import ZERO_ALIGN
@@ -103,17 +106,13 @@ logger = logging.getLogger("atom")
 # 0.5-4.9 us slower), so a TP size not here runs without it
 TOK_PAR_FROM = {4: 12}
 # ... where the layer kernel serves the step (``_layer_capable``): below it the
-# layer kernel's seams fold a rank's columns instead (``SHARD_RESIDUAL``)
+# layer kernel's seams fold a rank's columns instead (``_shard``)
 LAYER_TOK_PAR_FROM = {4: 24}
 # the widths below which the layer kernel serves an index-only layer
-# (``_fuses``): from it, at TP4 the layer build with the indexer uses scratch
-# (which would turn the whole width to the original path); a TP size not here
-# runs those layers as K1 then K2
-INDEX_LAYER_BELOW = {4: 24, 8: 24}
-# below token parallel, every layer's seams fold a rank's columns of the
-# residual (``AttnPreBuild.shard``): gathered only where a reader needs every
-# column (an Engram layer, the step's end: ``_gather_cols``)
-SHARD_RESIDUAL = True
+# (``_fuses``): the layer build with the indexer uses scratch at TP4 from 24
+# rows, at TP8 at 30 (25..29, no served width, never built: kept out); a TP
+# size not here runs those layers as K1 then K2
+INDEX_LAYER_BELOW = {4: 24, 8: 25}
 
 # K2a's and K2b's mailbox tags start past every layer's K1 and K2a
 POST_TAG0 = 64
@@ -150,6 +149,8 @@ class RowsBuild:
     keys: list
     launchers: dict
     layer_post: object = None
+    # ``layer_post``'s build key (``_lean_rows`` rebuilds it)
+    post_key: object = None
     attn_post: object = None
     moe: object = None
     # K1 key -> the layer kernel of K1 and K2 in one launch (``_fuses``)
@@ -170,9 +171,6 @@ class RowsBuild:
 
 # the layers whose attention norm has other readers (the compressor, the indexer)
 _FEEDS_INDEX = (AttentionMode.FULL, AttentionMode.REINDEX)
-# the launches a rank binds or leaves to the original path on its own (None:
-# not served): served on every rank of the group or on none
-_OPTIONAL_LAUNCHES = ("lm_head", "engram", "draft_ctx")
 
 
 def _draft_of(drafter):
@@ -214,6 +212,9 @@ class V41MonoDecodeRunner:
     # the draft's context KV write after the step in one launch
     # (``draft_ctx_launch``); None: the draft's ``write_context_kv``
     draft_ctx = None
+    # the launches a rank binds or leaves to the original path on its own
+    # (None: not served): served on every rank of the group or on none
+    optional_launches = ("lm_head", "engram", "draft_ctx")
     # the embedding read from every rank's vocab shard (``_bind_embedding``);
     # None: the module's own
     embed_peer = None
@@ -278,10 +279,10 @@ class V41MonoDecodeRunner:
         group = self._group().cpu_group
         bind_agreed(bind, group)
         # a launch one rank serves alone waits for ever on the others' pushes
-        for name in _OPTIONAL_LAUNCHES:
+        for name in self.optional_launches:
             if not group_agree(getattr(self, name) is not None, group):
                 setattr(self, name, None)
-        plain = plain_layout(self.max_rows, len(self.selecting))
+        plain = plain_layout(self.max_rows, len(self.selecting), self.tp)
         self.peers, self._finalizer = owned_peer_buffer(
             self,
             peer_bytes(self.max_rows * self.dp, self.moe_dims),
@@ -306,10 +307,12 @@ class V41MonoDecodeRunner:
         )  # fmt: skip
 
     def _place_index_outputs(self, plain: dict) -> None:
-        """Each selecting layer's pool rows (the attention's keys) and the
-        candidate blocks, in the peer buffer's never-zeroed part at one offset on
-        every rank (``plain_layout``): a token-parallel step's indexer writes a
-        row's into every rank's (``index_score._st_out``)."""
+        """Each selecting layer's pool rows (the attention's keys), the
+        candidate blocks and the split rows' answers, in the peer buffer's
+        never-zeroed part at one offset on every rank (``plain_layout``): a
+        token-parallel step's indexer writes a row's into every rank's
+        (``index_score._st_out``), a split row's answer goes to every rank's
+        merge (``index_score._put_answer``)."""
         words = self.peers.plain.view(torch.int32)
 
         def region(name, *shape):
@@ -321,6 +324,7 @@ class V41MonoDecodeRunner:
         # (``index_score._selected_rows``)
         self.irow = dict(zip(self.selecting, irow))
         self.icand = region("icand", self.max_rows, ip.TOPK_BLOCKS)
+        self.ixsel = region("ixsel", self.max_rows, self.tp, ip.TOPK, 2)
 
     def prepare(self, rows: int) -> bool:
         """Whether every rank holds the ``rows``-row kernels (``WidthBuilds``)."""
@@ -344,9 +348,7 @@ class V41MonoDecodeRunner:
         # every layer's residual column-sharded (``_shard``), gathered by column
         # where a reader needs every column (``_gather_cols``: one
         # ``col_gather`` launch, the taps' planes included)
-        self.shards = (
-            SHARD_RESIDUAL and self.tp > 1 and self.dp == 1 and taps <= cg.MAX_TAPS
-        )
+        self.shards = self.tp > 1 and self.dp == 1 and taps <= cg.MAX_TAPS
         for rope in (model.window_rope, model.global_rope):
             for table in (rope.cos_cache, rope.sin_cache):
                 if table.dtype != torch.bfloat16 or table.shape[-1] != k1.HALF:
@@ -404,9 +406,13 @@ class V41MonoDecodeRunner:
             )
             if self.dp == 1:
                 # DP attention shards the head over the DP ranks instead
+                spec = get_current_atom_config().speculative_config
+                rates = None if spec is None else spec.synthetic_acceptance_rates
                 self.lm_head = MonoLmHead.bind(
-                    model, self.tp, self.max_rows, dev, self._verify_rows()
-                )
+                    model, self.tp, self.max_rows, dev, self._verify_rows(),
+                    None if rates is None else _get_synthetic_cond_rates(tuple(rates), dev),
+                    _SYNTHETIC_RNG_BASE_SEED,
+                )  # fmt: skip
             self.engram = MonoEngram.bind(model, self.tp, self.max_rows, dev)
             self.draft_ctx = MonoDraftContext.bind(
                 _draft_of(drafter), self.tp, self.max_rows, dev
@@ -416,10 +422,10 @@ class V41MonoDecodeRunner:
     @staticmethod
     def _verify_rows():
         """A speculative verify request's rows, for the head's greedy ids and
-        verdict (``head_launch``); None without a drafter, or under forced
-        acceptance (its verdict is not the ids')."""
+        verdict (``head_launch``; forced acceptance's too); None without a
+        drafter."""
         spec = get_current_atom_config().speculative_config
-        if spec is None or spec.synthetic_acceptance_rates is not None:
+        if spec is None:
             return None
         return spec.num_speculative_tokens + 1
 
@@ -521,16 +527,33 @@ class V41MonoDecodeRunner:
         (``index_score._own_rows``)."""
         return own_rows(s, self.tp, self.rank) if self._tok_par(s) else (0, s)
 
+    def _split_over(self, s: int) -> tuple[int, int]:
+        """(ranks, this rank) an s-row step's FULL rows may split over
+        (``index_plan.row_shares``): the TP group, or none where a rank selects
+        its own rows (token parallel) or ranks are DP attention's."""
+        if self._tok_par(s) or self.dp > 1:
+            return 1, 0
+        return self.tp, self.rank
+
     @staticmethod
     def _lean_rows(built: RowsBuild, spilled: list) -> RowsBuild | None:
         """``WidthBuilds``' leaner build of a width whose spilled kernels are
-        all layer kernels: without them, those layers run K1 and K2 apart
-        (their builds are the width's anyway, ``_layer``). None where another
-        kernel spilled: the width is refused."""
-        layers = {k: f for k, f in built.layers.items() if f not in spilled}
-        if len(built.layers) - len(layers) != len(spilled):
+        layer kernels or K2: without the layer kernels, those layers run K1
+        and K2 apart (their builds are the width's anyway, ``_layer``); K2
+        rebuilt with its split rows' answers staged (``staged_answer``). None
+        where another kernel spilled, or K2 did in a build that splits no row
+        (staging would rebuild the same kernel): the width is refused."""
+        post, key = built.layer_post, built.post_key
+        if post in spilled:
+            if key is None or key.staged_answer or not key.index_split:
+                return None
+            key = replace(key, staged_answer=True)
+            post = k2.build_layer_post(key)
+        rest = [f for f in spilled if f is not built.layer_post]
+        layers = {k: f for k, f in built.layers.items() if f not in rest}
+        if len(built.layers) - len(layers) != len(rest):
             return None
-        return replace(built, layers=layers)
+        return replace(built, layers=layers, layer_post=post, post_key=key)
 
     def _layer_blocks(self) -> list:
         """(spec, block) of every layer this runner runs, in order (the
@@ -727,6 +750,7 @@ class V41MonoDecodeRunner:
             keys,
             launchers,
             layer_post=k2.build_layer_post(post_key),
+            post_key=post_key,
             layers=layers,
             gathers=gathers,
             compress=compress,
@@ -750,14 +774,13 @@ class V41MonoDecodeRunner:
         ):
             return
         try:
-            peer = PeerEmbedding(embed, group)
+            peer = shared_peer_embedding(embed, group)
         except MonoUnsupported as why:
             # every rank sees the same refusal (``PeerView`` gathers each
             # rank's): every rank keeps the module's embedding, mono serves on
             logger.warning("V4.1 mono: peer embedding off, the module's: %s", why)
             return
         self.embed_peer = peer
-        self._embed_finalizer = closed_with(self, peer)
 
     def _embed(self, embed, ids: torch.Tensor) -> torch.Tensor:
         """``embed(ids)`` [tokens, hidden]: the peer gather into ``embedded``
@@ -907,11 +930,11 @@ class V41MonoDecodeRunner:
             for layer in self.selecting
         }
         self.no_bound = torch.zeros(s, device=dev, dtype=torch.int32)
-        # the FP4 score stage's FULL-layer tasks a ratio, each step's written
-        # by ``write_step_meta``
+        # the FP4 score stage's FULL-layer tasks a ratio, then each row's share
+        # (``index_plan.fill_shares``), each step's written by ``write_step_meta``
         self.walk_plans = (
             {
-                ratio: torch.zeros(BLOCKS, 4, device=dev, dtype=torch.int32)
+                ratio: torch.zeros(BLOCKS + s, 4, device=dev, dtype=torch.int32)
                 for ratio in sorted(
                     {
                         spec.ratio
@@ -942,7 +965,9 @@ class V41MonoDecodeRunner:
         self.iw = hand(s, heads, dtype=f32)
         self.diag_off = -1
         self.numa_start, self.numa_word = -1, 0
-        nbytes = self._scratch_need(s)
+        # every width's: a narrower step's builds may place their regions
+        # further out than the widest's (token parallel from some width on)
+        nbytes = max(self._scratch_need(w) for w in range(1, s + 1))
         # a debug build's wait records: past every kernel's regions, cleared
         # with them every step
         if self.debug:
@@ -976,12 +1001,13 @@ class V41MonoDecodeRunner:
             return got
         align = lambda n: -(-n // ZERO_ALIGN) * ZERO_ALIGN
         base = self.scratch.data_ptr()
-        # the debug words lie past every width's regions in the same scratch:
-        # one range through them (``step_begin.MAX_SCRATCH`` ranges a step)
+        # the debug words lie past every width's regions in the same scratch,
+        # the queue words right before them: one range through them all
+        # (``step_begin.MAX_SCRATCH`` ranges a step)
         end = (
             self.diag_off + DIAG_BYTES if self.diag_off >= 0 else self._scratch_need(s)
         )
-        ranges = [(base, align(end))]
+        ranges = [(self.queue_words.data_ptr(), k2b.QUEUE_BYTES + align(end))]
         if self.numa_start >= 0 and self._numa(s):
             end = numa_table(self._numa_layouts(s), self.numa_start)[1]
             ranges.append((base + self.numa_start, align(end - self.numa_start)))
@@ -994,7 +1020,13 @@ class V41MonoDecodeRunner:
     def _allocate_scratch(self, nbytes: int, dev) -> None:
         """The step scratch: ``nbytes`` of regions, then the dual area every
         width's two-copy regions share (``_numa``), from a page boundary so that
-        one calibration of it (``numa.scratch_word``) holds for every width."""
+        one calibration of it (``numa.scratch_word``) holds for every width.
+        The word is each rank's own (its pages' homes) and a build key's
+        constant: where a rank's builds spill, ``WidthBuilds`` takes every
+        rank through the same lean rebuild. Right before the regions, the
+        launches' queue words (``k2b.QUEUES``): outside every build's layout,
+        which the step's layer builds lay out apart."""
+        qbytes = k2b.QUEUE_BYTES
         start = -(-nbytes // NUMA_PAGE) * NUMA_PAGE
         self.numa_start = start
         widths = [w for w in range(1, self.max_rows + 1) if self._numa(w)]
@@ -1002,17 +1034,18 @@ class V41MonoDecodeRunner:
             (numa_table(self._numa_layouts(w), start)[1] - start for w in widths),
             default=0,
         )
-        self.scratch = uncached_bytes(start + area if area else nbytes, dev)
         if not area:
             self.numa_start = -1
-        elif self.scratch.data_ptr() % NUMA_PAGE:
-            logger.warning(
-                "V4.1 mono: the scratch is not %d B aligned: every hand-off single",
-                NUMA_PAGE,
-            )
-            self.numa_start = -1
-        else:
-            self.numa_word = scratch_word(self.scratch[start:], area, "V4.1 mono")
+            raw = uncached_bytes(qbytes + nbytes, dev)
+            self.queue_words, self.scratch = raw[:qbytes], raw[qbytes:]
+            return
+        # a page more: the regions from the first page boundary past the
+        # queue words
+        raw = uncached_bytes(qbytes + start + area + NUMA_PAGE, dev)
+        shift = qbytes + -(raw.data_ptr() + qbytes) % NUMA_PAGE
+        self.queue_words = raw[shift - qbytes : shift]
+        self.scratch = raw[shift : shift + start + area]
+        self.numa_word = scratch_word(self.scratch[start:], area, "V4.1 mono")
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         model = self.model
@@ -1042,6 +1075,7 @@ class V41MonoDecodeRunner:
             self.walk_plans,
             # a token-parallel step's indexer scores this rank's rows alone
             self._own_rows(rows),
+            *self._split_over(rows),
         )
         # layer 0 reads the embedding as every stream (``embed_in``): the
         # state's residual is it, unexpanded, until layer 0's seam writes the
@@ -1272,7 +1306,7 @@ class V41MonoDecodeRunner:
         args["layer"] = layer_id
         args["post_layer"] = POST_TAG0 + layer_id
         args["moe_layer"] = MOE_TAG0 + layer_id
-        args["qoff"] = queue.tag_offset(MOE_TAG0 + layer_id)
+        args["queue_words"] = self._queue_words(layer_id)
         args["tl"] = self._timeline_ptr("layer", layer_id)
         _run_compiled(
             launcher,
@@ -1343,7 +1377,7 @@ class V41MonoDecodeRunner:
             **self._moe_args(weights),
             **self._peer_args(),
             "layer": POST_TAG0 + layer_id, "moe_layer": MOE_TAG0 + layer_id,
-            "qoff": queue.tag_offset(MOE_TAG0 + layer_id),
+            "queue_words": self._queue_words(layer_id),
             "tl": self._timeline_ptr("k2", layer_id),
         })  # fmt: skip
         _run_compiled(self.build.layer_post, *args, torch.cuda.current_stream())
@@ -1366,6 +1400,10 @@ class V41MonoDecodeRunner:
     def _peer_args(self) -> dict:
         p = torch.Tensor.data_ptr
         return {"scratch": p(self.scratch), **self.peers.kernel_args()}
+
+    def _queue_words(self, layer_id: int) -> int:
+        """Layer ``layer_id``'s K2b queue words (``k2b.queue_offset``)."""
+        return self.queue_words.data_ptr() + k2b.queue_offset(MOE_TAG0 + layer_id)
 
     def _attn_post_args(self, spec, block, weights, residual, gates, step, cache, rope):
         """K2a's own arguments."""
@@ -1420,7 +1458,7 @@ class V41MonoDecodeRunner:
         args = k2b.ABI.pack({
             "x": self.ffn_normed.data_ptr(), **self._moe_args(weights),
             **self._peer_args(), "layer": MOE_TAG0 + layer_id,
-            "qoff": queue.tag_offset(MOE_TAG0 + layer_id),
+            "queue_words": self._queue_words(layer_id),
             "tl": self._timeline_ptr("k2b", layer_id),
             # where the merged launch's layout puts K2b's regions
             "scratch": self.scratch.data_ptr() + k2.moe_base(key_a),
@@ -1486,7 +1524,7 @@ class V41MonoDecodeRunner:
             "ibound": dummy, "ilog": p(self.ilog),
             "lstride": self.ilog.shape[1], "isel": dummy, "icand": dummy, "ilift": 0,
             "iprod": 0, "ibmax": p(self.ibmax), "bstride": self.ibmax.shape[1],
-            "icout": dummy, "irow": dummy,
+            "icout": dummy, "irow": dummy, "ixsel": dummy,
         }  # fmt: skip
         if attn.indexer is None:
             return args
@@ -1522,6 +1560,6 @@ class V41MonoDecodeRunner:
             "ibound": p(bound), "isel": p(self.isel[spec.layer_id]),
             "icand": p(self.icand), "ilift": int(reindex),
             "iprod": int(spec.produces_candidates), "icout": p(self.icand),
-            "irow": p(self.irow[spec.layer_id]),
+            "irow": p(self.irow[spec.layer_id]), "ixsel": p(self.ixsel),
         })  # fmt: skip
         return args

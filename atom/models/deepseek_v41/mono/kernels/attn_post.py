@@ -45,6 +45,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64
 
 from atom.models.deepseek_v41.mono import attention_plan as aplan
+from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono.kernels import attn_pre as k1
 from atom.models.deepseek_v41.mono.kernels.attention import (
     MERGE_OUT_WORDS,
@@ -119,7 +120,6 @@ from atom.mono.device.ops import (
     bf16_round,
     butterfly,
     fp8_pack4,
-    fresh,
     kernel_symbol,
     lane_gather,
     launcher,
@@ -205,6 +205,24 @@ class AttnPostBuild:
             return 0
         return self.tokens // self.tp if self.tok_par else self.tokens
 
+    # a split row's answer staged in LDS and put after its select
+    # (``index_score._put_answer``): the leaner build ``runner._lean_rows``
+    # takes where putting it from the select spills; False: put as selected
+    staged_answer: bool = False
+
+    @property
+    def index_split(self) -> bool:
+        """The FULL layers' long rows split over the TP ranks
+        (``index_plan.row_shares``; ``index_score.stage_imerge``): the FP4
+        plane's walk plan carries the shares, a token-parallel launch selects
+        its own rows instead."""
+        return (
+            self.index_fp4
+            and not self.tok_par
+            and self.index_bound_max > ip.SPLIT_FROM
+            and ip.split_tp(self.tp)
+        )
+
 
 # the per-token arguments the token-parallel stages read and write
 K2A_OWN = (
@@ -232,7 +250,7 @@ ABI = KernelAbi(
         "iact", "iq", "iw", "plane", "iqs", "pscale", "iplan", "itab", "itab_stride",
         "itab_len", "ibatch", "ishift", "ibound",
         "ilog", "lstride", "isel", "icand", "ilift", "iprod", "ibmax", "bstride",
-        "icout", "irow", "sbound",
+        "icout", "irow", "ixsel", "sbound",
         "q", "pool", "pool_scale", "window", "window_scale", "sel", "topk", "kmeta", "table", "rows_per_page", "page_rows",
         "main_off", "ring_off", "ring_slots", "sink", "qk_scale", "pos", "cos", "sin",
         "woa", "woa_s", "wob", "wob_s",
@@ -390,9 +408,7 @@ def stage_woa(c, task, ops, t0=0, n=None):
     ATOM ``quantize_fp8`` of the 32 (one group: amax floored AMAX_FLOOR, the ceil
     code) -> X8B / X8BS, wo_b's input; the token tile from ``t0`` (its x in
     LDS)."""
-    # ``fresh_lane`` (an index layer's layer kernel): the thread's (token, row)
-    # split at its use, not hoisted to the kernel's entry and held there
-    tid = fresh(c["tid"]) if c.get("fresh_lane") else c["tid"]
+    tid = c["tid"]
     red, d = c["red"], c["d"]
     n = c["S"] if n is None else n
     split = WOA_SPLIT_K
@@ -741,6 +757,7 @@ def attn_post_context(key, s, lds, mb, bases, layout, scratch, args, rank, sym):
         "peer": peer_offsets(s, Dims(key.tp)),
         "fold": True, "index": False, "aux": False, "ffn": True,
         "index_fp4": key.index_fp4, "index_mfma": key.index_mfma,
+        "index_split": key.index_split, "staged_answer": key.staged_answer,
         "tok_par": key.tok_par, "kv_fp8": key.kv_fp8,
         "sel_slots": aplan.selection_slots(key.attn_sel),
         "block_rows": key.block_rows,
@@ -1016,7 +1033,8 @@ def build_attn_post(key: AttnPostBuild):
         itab_stride: Int32, itab_len: Int32, ibatch: Int64, ishift: Int32,
         ibound: Int64, ilog: Int64,
         lstride: Int32, isel: Int64, icand: Int64, ilift: Int32, iprod: Int32,
-        ibmax: Int64, bstride: Int32, icout: Int64, irow: Int64, sbound: Int64,
+        ibmax: Int64, bstride: Int32, icout: Int64, irow: Int64, ixsel: Int64,
+        sbound: Int64,
         q: Int64, pool: Int64, pool_scale: Int64, window: Int64, window_scale: Int64, sel: Int64, topk: Int32, kmeta: Int64, table: Int64,
         rows_per_page: Int32, page_rows: Int32, main_off: Int32, ring_off: Int32,
         ring_slots: Int32, sink: Int64,
@@ -1034,7 +1052,7 @@ def build_attn_post(key: AttnPostBuild):
         args = attn_post_args(
             iact, iq, iw, plane, iqs, pscale, iplan, itab, itab_stride, itab_len,
             ibatch, ishift, ibound, ilog, lstride,
-            isel, icand, ilift, iprod, ibmax, bstride, icout, irow, sbound,
+            isel, icand, ilift, iprod, ibmax, bstride, icout, irow, ixsel, sbound,
             q, pool, pool_scale, window, window_scale, sel, topk, kmeta, table, rows_per_page, page_rows, main_off,
             ring_off, ring_slots, sink, qk_scale, pos, cos, sin, woa, woa_s, wob,
             wob_s, res_in, post_in, comb_in, pre_in, hc_fn, hc_scale, hc_base, ffn_w,
@@ -1058,7 +1076,8 @@ def build_attn_post(key: AttnPostBuild):
         itab_stride: Int32, itab_len: Int32, ibatch: Int64, ishift: Int32,
         ibound: Int64, ilog: Int64,
         lstride: Int32, isel: Int64, icand: Int64, ilift: Int32, iprod: Int32,
-        ibmax: Int64, bstride: Int32, icout: Int64, irow: Int64, sbound: Int64,
+        ibmax: Int64, bstride: Int32, icout: Int64, irow: Int64, ixsel: Int64,
+        sbound: Int64,
         q: Int64, pool: Int64, pool_scale: Int64, window: Int64, window_scale: Int64, sel: Int64, topk: Int32, kmeta: Int64, table: Int64,
         rows_per_page: Int32, page_rows: Int32, main_off: Int32, ring_off: Int32,
         ring_slots: Int32, sink: Int64,
@@ -1073,7 +1092,7 @@ def build_attn_post(key: AttnPostBuild):
         attn_post(
             iact, iq, iw, plane, iqs, pscale, iplan, itab, itab_stride, itab_len,
             ibatch, ishift, ibound, ilog, lstride,
-            isel, icand, ilift, iprod, ibmax, bstride, icout, irow, sbound,
+            isel, icand, ilift, iprod, ibmax, bstride, icout, irow, ixsel, sbound,
             q, pool, pool_scale, window, window_scale, sel, topk, kmeta, table, rows_per_page, page_rows, main_off,
             ring_off, ring_slots, sink, qk_scale, pos, cos, sin, woa, woa_s, wob,
             wob_s, res_in, post_in, comb_in,

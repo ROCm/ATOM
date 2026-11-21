@@ -68,6 +68,16 @@ def config_refusal(atom_config) -> str | None:
             == INDEXER_SHAPE,
             "indexer shape",
         ),
+        # the candidate producer ranks its blocks over every column, so its
+        # ratio's FULL rows never split over the ranks (``index_plan.splits``)
+        (
+            hf.candidate_source_layer_id < 0
+            or not ip.splits(
+                atom_config.tensor_parallel_size,
+                hf.compress_ratios[hf.candidate_source_layer_id],
+            ),
+            "a candidate producer at a ratio whose rows split",
+        ),
         # no drafter, or DSpark, whose aux taps K1 writes: another drafter's
         # hooks on the target layers would never fire under mono
         (dspark or spec is None, f"speculative method {method}"),

@@ -75,6 +75,7 @@ from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_offsets
 from atom.models.deepseek_v41.mono.sources import SOURCES
 from atom.mono.device.ops import (
     CM_DEV,
+    LOG2E,
     bf2_f32,
     butterfly,
     hw_exp2,
@@ -96,8 +97,14 @@ _CURRENT_STREAM = fx.Stream(None)
 
 # the head launch's mailbox tag: past every layer's K1 / K2a / K2b
 HEAD_TAG = 192
-LOG2E = 1.4426950408889634
 
+# ``confidence``'s arguments ``cw`` / ``conf``: the confidence head's weight
+# [hidden + r] (bf16, no bias) and [rows] its fp32 output. Else 0.
+# ``from_state``'s ``res`` .. ``hidden``: the last stage's residual [rows, HC,
+# K] (before its owed post), its FFN output [rows, K] (bf16), the post [rows,
+# HC], comb [rows, HC, HC] and next pre [rows, HC] mixes (fp32), the final
+# norm's weight [K] (bf16), and [rows, K] the collapsed rows out (bf16); x is
+# then where the normed rows land (device scope). Else 0.
 ABI = KernelAbi(
     (
         "x", "w", "w1", "w2", "anchor", "ids", "embeds", "res", "sub", "post",
@@ -105,15 +112,6 @@ ABI = KernelAbi(
         "rank", "tl",
     )
 )  # fmt: skip
-# ``confidence`` arguments: the confidence head's weight [hidden + r] (bf16,
-# no bias) and ``conf`` [rows] its fp32 output. Else 0.
-CONFIDENCE = ("cw", "conf")
-# ``from_state`` arguments: the last stage's residual [rows, HC, K] (before
-# its owed post), its FFN output [rows, K] (bf16), the post [rows, HC], comb
-# [rows, HC, HC] and next pre [rows, HC] mixes (fp32), the final norm's weight
-# [K] (bf16), and ``hidden`` [rows, K] the collapsed rows out (bf16); x is
-# then where the normed rows land (device scope). Else 0.
-FROM_STATE = ("res", "sub", "post", "comb", "pre", "norm_w", "hidden")
 # ``timeline`` stamps: the start, the tail rows (``from_state``), the dot, the
 # W2 rows, then per position its W1 rows, its bias and waves' bests, its push,
 # its pick
@@ -145,18 +143,25 @@ class DraftHeadBuild:
     confidence: bool = False
     timeline: bool = field(default=False, metadata={"sym": "tl"})
 
-    def __post_init__(self):
-        assert self.vocab % RG == 0 and self.hidden % (KSTEP * UNIT) == 0
-        assert self.prefetch % UNIT == 0
-        assert self.rank_r % KSTEP == 0
-        assert self.requests <= RG, "a request a column of the bias MFMA"
-        assert self.tp & (self.tp - 1) == 0, "a request's ranks: xor lanes"
-        assert self.requests * self.rank_r // 8 <= THREADS, "a W1 load a thread"
-        assert self.lds_words * 4 <= LDS_BYTES, "no K slicing fits the LDS"
-        if self.from_state:
-            assert self.hidden % 8 == 0, "a tail_row thread 8 columns a round"
-            assert self.rows <= self.tasks, "a tail row a CTA"
-        assert not self.confidence or self.from_state, "a row's hidden on its CTA"
+    def refusal(self) -> str | None:
+        """Why the launch is not built for this key (None: it is)."""
+        if self.vocab % RG or self.hidden % (KSTEP * UNIT):
+            return "vocab rows a row group, hidden whole weight units"
+        if self.prefetch % UNIT or self.rank_r % KSTEP:
+            return "prefetch whole units, the Markov rank whole K steps"
+        if self.requests > RG:
+            return "a request a column of the bias MFMA"
+        if self.tp & (self.tp - 1):
+            return "a request's ranks: xor lanes"
+        if self.requests * self.rank_r // 8 > THREADS:
+            return "a W1 load a thread"
+        if self.lds_words * 4 > LDS_BYTES:
+            return "no K slicing fits the LDS"
+        if self.from_state and (self.hidden % 8 or self.rows > self.tasks):
+            return "a tail_row thread 8 columns a round, a tail row a CTA"
+        if self.confidence and not self.from_state:
+            return "a row's hidden on its CTA"
+        return None
 
     @property
     def rows(self) -> int:
@@ -601,6 +606,7 @@ def confidence(c):
 
 
 def build_draft_head(key: DraftHeadBuild):
+    assert key.refusal() is None, key.refusal()
     keyed = key_tuple(key, SOURCES)
     peer = peer_offsets(key.rows, Dims(key.tp))
 

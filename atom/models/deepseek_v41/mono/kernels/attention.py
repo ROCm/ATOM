@@ -68,7 +68,6 @@ from atom.mono.device.ops import (
     butterflies,
     butterfly,
     fp8_pack4,
-    fresh,
     hw_exp2,
     ld_dev,
     ld_i32,
@@ -875,9 +874,7 @@ def _merge_pv(c, meta, mh):
     past the group zero), a block without a key skipped (the wave's
     condition: the slots holding keys are a prefix of the selection's and of
     the window's, which a block does not straddle, so its first slot says)."""
-    # ``fresh_lane`` (an index layer's layer kernel): the lane split at its use,
-    # not hoisted out of the merge task loop and held from the kernel's entry
-    lane = fresh(c["lane"]) if c.get("fresh_lane") else c["lane"]
+    lane = c["lane"]
     wave, att = c["wave"], c["att"]
     g, n = lane // 16, lane % 16
     db, kh = wave % 4, wave // 4

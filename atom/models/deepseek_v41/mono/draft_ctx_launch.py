@@ -8,6 +8,7 @@ positions and the cache's fp8 windows. A draft, a cache or a step the launch is
 not built for keeps ``DeepseekV41DSpark.write_context_kv``."""
 
 import logging
+import weakref
 
 import torch
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
@@ -70,9 +71,10 @@ class MonoDraftContext:
         self.parts = uncached_bytes(dc.parts_bytes(max_rows, tp), dev)
         self.h8 = uncached_bytes(dc.h8_bytes(max_rows), dev)
         self.kvp = uncached_bytes(dc.kvp_bytes(max_rows), dev)
-        # a cache's window layer ids checked once (``window_target``'s ids are
-        # the cache's for these layers)
-        self._checked_ids = set()
+        # the caches whose window layer ids were checked (``window_target``'s
+        # ids are the cache's for these layers): the cache objects themselves,
+        # not their ``id``, which a rebuilt cache may take again
+        self._checked = weakref.WeakSet()
 
     @staticmethod
     def _refusal(draft) -> str | None:
@@ -173,11 +175,10 @@ class MonoDraftContext:
         )
         if not served:
             return None
-        key = (id(cache), tuple(self.layer_ids))
-        if key not in self._checked_ids:
+        if cache not in self._checked:
             if ids.tolist() != self.layer_ids:
                 return None
-            self._checked_ids.add(key)
+            self._checked.add(cache)
         p = torch.Tensor.data_ptr
         (wp, wps), (wk, wks) = self.proj, self.wkv
         kvn = self.kv_norms

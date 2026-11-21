@@ -80,13 +80,16 @@ def k1_regions(key: k1.AttnPreBuild) -> list[RegionDecl]:
     return regions
 
 
-def indexer_regions(bound_max: int, tok_par: bool) -> list[RegionDecl]:
+def indexer_regions(
+    bound_max: int, tok_par: bool, split: bool = False
+) -> list[RegionDecl]:
     """The indexer's: the scores, then per kind (sel, blk) a stage a tree level,
     each level but the last putting its lists for the next. A token's selection
     is final at the level its bound reaches (``index_plan.final_level``), so any
     sel level may put its ready flag. In a token-parallel launch a row's owner
     puts its flags on every rank, the candidate blocks' too (ICRDY, awaited by
-    ``k2a.icwait``)."""
+    ``k2a.icwait``). ``split``: a split row's final list puts its answer's flag
+    on every rank (IXRDY, awaited by ``k2a.imerge``), which then puts IRDY."""
 
     def finals(kind):
         return tuple(
@@ -98,6 +101,11 @@ def indexer_regions(bound_max: int, tok_par: bool) -> list[RegionDecl]:
         regions += [
             RegionDecl("irdy", P, finals("sel")),
             RegionDecl("icrdy", P, finals("blk")),
+        ]
+    elif split:
+        regions += [
+            RegionDecl("irdy", S, (*finals("sel"), "k2a.imerge")),
+            RegionDecl("ixrdy", P, finals("sel")),
         ]
     else:
         regions += [RegionDecl("irdy", S, finals("sel"))]
@@ -114,7 +122,9 @@ def k2a_regions(key: k2a.AttnPostBuild, shard: bool = False) -> list[RegionDecl]
     wo_b (pushing the all-reduce's partials), slice, gate, norm; ``shard``:
     its seam column-sharded (``seam_regions``)."""
     regions = (
-        indexer_regions(key.index_bound_max, key.tok_par) if key.index_bound_max else []
+        indexer_regions(key.index_bound_max, key.tok_par, key.index_split)
+        if key.index_bound_max
+        else []
     )
     return regions + [
         RegionDecl("as", S, "k2a.attn_score"),

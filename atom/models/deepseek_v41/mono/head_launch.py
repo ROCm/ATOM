@@ -20,11 +20,14 @@ from atom.models.deepseek_v41.mono.kernels import lm_head as lh
 class MonoLmHead:
     """``model``'s final norm and LM head bound for the launch, the buffers it
     writes (the normed rows, this rank's logits, the rows' ids) and an S-row
-    step's build. ``rq``: a verify request's rows (None: no greedy head, e.g.
-    under forced acceptance, whose verdict is not the ids')."""
+    step's build. ``rq``: a verify request's rows (None: no greedy head, no
+    drafter). ``cond_rates`` / ``seed_base``: forced acceptance's verdict on
+    the ids (``UniformVerdict``), None for exact match."""
 
     @classmethod
-    def bind(cls, model, tp: int, max_rows: int, dev, rq=None) -> "MonoLmHead | None":
+    def bind(
+        cls, model, tp: int, max_rows: int, dev, rq=None, cond_rates=None, seed_base=0
+    ) -> "MonoLmHead | None":
         """The head bound for the launch, None where it is not the plain
         vocab-sharded bf16 one the launch is built for."""
         head, norm = model.head, model.norm
@@ -43,12 +46,19 @@ class MonoLmHead:
             and w.shape[0] % lh.RG == 0
             and getattr(head, "tp_size", 1) == tp
         )
-        return cls(model, tp, max_rows, dev, rq) if served else None
+        if not served:
+            return None
+        return cls(model, tp, max_rows, dev, rq, cond_rates, seed_base)
 
-    def __init__(self, model, tp: int, max_rows: int, dev, rq=None) -> None:
+    def __init__(
+        self, model, tp: int, max_rows: int, dev, rq=None, cond_rates=None, seed_base=0
+    ) -> None:
         head, norm = model.head, model.norm
         w = head.weight
         self.tp, self.rq, self.dev = tp, rq, dev
+        self.cond_rates, self.seed_base = cond_rates, seed_base
+        # forced acceptance's launch count, every width's verdicts' one
+        self.launches = torch.zeros(1, dtype=torch.int64, device=dev)
         self.w, self.norm_w, self.eps = w, norm.weight, float(norm.eps)
         self.vocab, self.hidden = w.shape
         self.x = torch.empty(max_rows, self.hidden, dtype=torch.bfloat16, device=dev)
@@ -75,7 +85,14 @@ class MonoLmHead:
             tp=self.tp, argmax=self.greedy(rows),
         )  # fmt: skip
         if key.argmax and rows not in self.verdicts:
-            self.verdicts[rows] = UniformVerdict(rows // self.rq, self.rq, self.dev)
+            self.verdicts[rows] = UniformVerdict(
+                rows // self.rq,
+                self.rq,
+                self.dev,
+                self.cond_rates,
+                self.seed_base,
+                self.launches,
+            )
         return lh.build_lm_head(key)
 
     def head_of(self, launcher, hidden: torch.Tensor, input_ids, peers: dict):

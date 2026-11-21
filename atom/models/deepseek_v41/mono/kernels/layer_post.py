@@ -124,6 +124,8 @@ class LayerPostBuild:
     attn_sel: bool = True
     # a request's rows one block each row sees whole (``AttnPostBuild.block_rows``)
     block_rows: int = 0
+    # ``AttnPostBuild.staged_answer``
+    staged_answer: bool = False
 
     def __post_init__(self):
         assert not (
@@ -156,6 +158,7 @@ class LayerPostBuild:
             numa_word=self.numa_word,
             attn_sel=self.attn_sel,
             block_rows=self.block_rows,
+            staged_answer=self.staged_answer,
         )
         moe_diag = self.diag_off - moe_base(key_a) if self.diag_off >= 0 else -1
         key_b = MoeBuild(
@@ -315,6 +318,7 @@ def build_layer_post(key: LayerPostBuild):
         im=int(key.index_mfma), tpar=int(key.tok_par), sh=int(key.shard),
         **({"ep": key.ep} if key.ep > 1 else {}),
         **({"mtp": key.moe_tp} if key.moe_tp > 1 else {}),
+        **({"sa": 1} if key.staged_answer else {}),
     )  # fmt: skip
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -324,7 +328,8 @@ def build_layer_post(key: LayerPostBuild):
         itab_stride: Int32, itab_len: Int32, ibatch: Int64, ishift: Int32,
         ibound: Int64, ilog: Int64,
         lstride: Int32, isel: Int64, icand: Int64, ilift: Int32, iprod: Int32,
-        ibmax: Int64, bstride: Int32, icout: Int64, irow: Int64, sbound: Int64,
+        ibmax: Int64, bstride: Int32, icout: Int64, irow: Int64, ixsel: Int64,
+        sbound: Int64,
         q: Int64, pool: Int64, pool_scale: Int64, window: Int64, window_scale: Int64, sel: Int64, topk: Int32, kmeta: Int64, table: Int64,
         rows_per_page: Int32, page_rows: Int32, main_off: Int32, ring_off: Int32,
         ring_slots: Int32, sink: Int64,
@@ -335,7 +340,7 @@ def build_layer_post(key: LayerPostBuild):
         normed: Int64,
         gate_w: Int64, bias: Int64, w13: Int64, w13_s: Int64, w2: Int64,
         w2_s: Int64, sgu: Int64, sgu_s: Int64, sw2: Int64, sw2_s: Int64, out: Int64,
-        qoff: Int64,
+        queue_words: Int64,
         scratch: Int64, sym: Int64, peers: Int64, rank: Int32, layer: Int32,
         moe_layer: Int32, tl: Int64,
     ):  # fmt: skip
@@ -358,7 +363,7 @@ def build_layer_post(key: LayerPostBuild):
         args_a = attn_post_args(
             iact, iq, iw, plane, iqs, pscale, iplan, itab, itab_stride, itab_len,
             ibatch, ishift, ibound, ilog, lstride,
-            isel, icand, ilift, iprod, ibmax, bstride, icout, irow, sbound,
+            isel, icand, ilift, iprod, ibmax, bstride, icout, irow, ixsel, sbound,
             q, pool, pool_scale, window, window_scale, sel, topk, kmeta, table, rows_per_page, page_rows, main_off,
             ring_off, ring_slots, sink, qk_scale, pos, cos, sin, woa, woa_s, wob,
             wob_s, res_in, post_in, comb_in, pre_in, hc_fn, hc_scale, hc_base, ffn_w,
@@ -366,7 +371,7 @@ def build_layer_post(key: LayerPostBuild):
         )  # fmt: skip
         args_b = moe_args(
             normed, gate_w, bias, w13, w13_s, w2, w2_s, sgu, sgu_s, sw2, sw2_s, out,
-            qoff,
+            queue_words,
         )  # fmt: skip
         ca = attn_post_context(
             key_a, s, lds_a, mailbox(layer, scratch, key.diag_off, layout),
@@ -418,7 +423,8 @@ def build_layer_post(key: LayerPostBuild):
         itab_stride: Int32, itab_len: Int32, ibatch: Int64, ishift: Int32,
         ibound: Int64, ilog: Int64,
         lstride: Int32, isel: Int64, icand: Int64, ilift: Int32, iprod: Int32,
-        ibmax: Int64, bstride: Int32, icout: Int64, irow: Int64, sbound: Int64,
+        ibmax: Int64, bstride: Int32, icout: Int64, irow: Int64, ixsel: Int64,
+        sbound: Int64,
         q: Int64, pool: Int64, pool_scale: Int64, window: Int64, window_scale: Int64, sel: Int64, topk: Int32, kmeta: Int64, table: Int64,
         rows_per_page: Int32, page_rows: Int32, main_off: Int32, ring_off: Int32,
         ring_slots: Int32, sink: Int64,
@@ -429,7 +435,7 @@ def build_layer_post(key: LayerPostBuild):
         normed: Int64,
         gate_w: Int64, bias: Int64, w13: Int64, w13_s: Int64, w2: Int64,
         w2_s: Int64, sgu: Int64, sgu_s: Int64, sw2: Int64, sw2_s: Int64, out: Int64,
-        qoff: Int64,
+        queue_words: Int64,
         scratch: Int64, sym: Int64, peers: Int64, rank: Int32, layer: Int32,
         moe_layer: Int32, tl: Int64, stream: fx.Stream = _CURRENT_STREAM,
     ):  # fmt: skip
@@ -437,12 +443,12 @@ def build_layer_post(key: LayerPostBuild):
         layer_post(
             iact, iq, iw, plane, iqs, pscale, iplan, itab, itab_stride, itab_len,
             ibatch, ishift, ibound, ilog, lstride,
-            isel, icand, ilift, iprod, ibmax, bstride, icout, irow, sbound,
+            isel, icand, ilift, iprod, ibmax, bstride, icout, irow, ixsel, sbound,
             q, pool, pool_scale, window, window_scale, sel, topk, kmeta, table, rows_per_page, page_rows, main_off,
             ring_off, ring_slots, sink, qk_scale, pos, cos, sin, woa, woa_s, wob,
             wob_s, res_in, post_in, comb_in, pre_in, hc_fn, hc_scale, hc_base, ffn_w,
             res_out, post_out, comb_out, pre_out, normed,
-            gate_w, bias, w13, w13_s, w2, w2_s, sgu, sgu_s, sw2, sw2_s, out, qoff,
+            gate_w, bias, w13, w13_s, w2, w2_s, sgu, sgu_s, sw2, sw2_s, out, queue_words,
             scratch, sym, peers, rank, layer, moe_layer, tl,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 

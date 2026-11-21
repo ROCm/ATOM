@@ -172,11 +172,6 @@ class EngramBuild:
     def lds_words(self) -> int:
         return self.a_sum + 3 * WAVES + 3 * self.ranks
 
-    @property
-    def part_words(self) -> int:
-        """PARTS' words a part: [row][(HC + 1) own]."""
-        return self.rows * (HC + 1) * self.own
-
 
 def parts_bytes(rows: int, tp: int) -> int:
     return WIDTH // PART * rows * (HC + 1) * (HIDDEN // tp) * 4

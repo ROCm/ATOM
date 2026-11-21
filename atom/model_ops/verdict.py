@@ -70,26 +70,48 @@ def verdict_row(
 @triton.jit
 def _verdict_kernel(
     out_ptr, verdict_ptr, cu_ptr, input_ids_ptr, target_idx_ptr, bonus_idx_ptr,
-    head_ids_ptr, num_spec_steps, SP: tl.constexpr,
+    head_ids_ptr, cond_rates_ptr, launches_ptr, seed_base, nreq, num_spec_steps,
+    SP: tl.constexpr, SYNTHETIC: tl.constexpr,
 ):  # fmt: skip
-    """Program b, request b: ``verdict_row``, exact match."""
-    verdict_row(
-        out_ptr, verdict_ptr, cu_ptr, input_ids_ptr, target_idx_ptr, bonus_idx_ptr,
-        head_ids_ptr, head_ids_ptr, 0, tl.program_id(0), tl.num_programs(0),
-        num_spec_steps, SP=SP, SYNTHETIC=False,
-    )  # fmt: skip
+    """Exact match: program b, request b (``verdict_row``). ``SYNTHETIC``: one
+    program, every request in turn, seeded ``seed_base`` + ``launches``, which
+    it then bumps: one count every width's launches share, the same on every
+    rank (each replays the same launches)."""
+    if SYNTHETIC:
+        launch = tl.load(launches_ptr)
+        for b in range(nreq):
+            verdict_row(
+                out_ptr, verdict_ptr, cu_ptr, input_ids_ptr, target_idx_ptr,
+                bonus_idx_ptr, head_ids_ptr, cond_rates_ptr, seed_base + launch, b,
+                nreq, num_spec_steps, SP=SP, SYNTHETIC=True,
+            )  # fmt: skip
+        tl.store(launches_ptr, launch + 1)
+    else:
+        verdict_row(
+            out_ptr, verdict_ptr, cu_ptr, input_ids_ptr, target_idx_ptr, bonus_idx_ptr,
+            head_ids_ptr, head_ids_ptr, 0, tl.program_id(0), nreq, num_spec_steps,
+            SP=SP, SYNTHETIC=False,
+        )  # fmt: skip
 
 
 class UniformVerdict:
     """A step of ``requests`` requests of ``rq`` rows each, its verify rows'
     layout and its outputs at fixed addresses (a captured graph replays them):
     ``launch(head_ids, input_ids)`` -> (output ids [requests, rq], verdict
-    [3, requests])."""
+    [3, requests]). ``cond_rates`` (forced acceptance: the positions'
+    conditional rates, ``rejection_sampler._get_synthetic_cond_rates``): the
+    ``SYNTHETIC`` verdict, its uniforms seeded from ``seed_base`` and
+    ``launches`` (int64 [1] on the device), the launch count the head's widths
+    share."""
 
-    def __init__(self, requests: int, rq: int, device):
+    def __init__(
+        self, requests: int, rq: int, device, cond_rates=None, seed_base=0,
+        launches=None,
+    ):  # fmt: skip
         i32 = {"dtype": torch.int32, "device": device}
         s = rq - 1
         self.requests, self.rq = requests, rq
+        self.cond_rates, self.seed_base, self.launches = cond_rates, seed_base, launches
         self.out = torch.zeros(requests, rq, **i32)
         self.verdict = torch.zeros(3, requests, **i32)
         self.cu = torch.arange(1, requests + 1, **i32) * s
@@ -103,8 +125,12 @@ class UniformVerdict:
         )
 
     def launch(self, head_ids: torch.Tensor, input_ids: torch.Tensor):
-        _verdict_kernel[(self.requests,)](
+        synthetic = self.cond_rates is not None
+        _verdict_kernel[(1 if synthetic else self.requests,)](
             self.out, self.verdict, self.cu, input_ids, self.target, self.bonus,
-            head_ids, self.rq - 1, SP=triton.next_power_of_2(self.rq), num_warps=1,
+            head_ids, self.cond_rates if synthetic else head_ids,
+            self.launches if synthetic else head_ids, self.seed_base, self.requests,
+            self.rq - 1, SP=triton.next_power_of_2(self.rq), SYNTHETIC=synthetic,
+            num_warps=1,
         )  # fmt: skip
         return self.out, self.verdict

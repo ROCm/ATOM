@@ -8,9 +8,8 @@ MI355X homes each 8 KiB run of a 2 MiB page on one of its two I/O dies,
 alternating (the home is address bit 13 XOR a bit of the page). A dual area
 keeps copy 0 in its even runs and copy 1 in its odd ones, so each copy is
 homed on one die; which one, and which XCDs sit on which die, are not
-arithmetic: a ping-pong probe times them (``calibrate``), as DeepSeek-V4.1's
-hi programs do (``models.deepseek_v41.mono.hi.runtime.dual``, whose rule and
-thresholds these are):
+arithmetic: a ping-pong probe times them (``calibrate``; ``probe=`` another
+round-trip timer):
 
 - ``pp_runs``: one CTA on XCD ``xp`` and one on XCD ``xc`` trade 16-byte
   tagged puts ``ITERS`` times in each listed run; a round trip is fast when
@@ -145,17 +144,18 @@ def pp_runs(buf: torch.Tensor, runs: list[int], xp: int, xc: int) -> torch.Tenso
     return out.float().cpu() * 0.01 / ITERS
 
 
-def _homes(page, nruns, pairs, want, reps=2, either=False):
+def _homes(page, nruns, pairs, want, reps=2, either=False, probe=pp_runs):
     """Each of the first ``nruns`` runs of ``page``: 1 when it is local to
     ``pairs[0]``'s die rather than ``pairs[1]``'s. A run disagreeing with
     ``want`` (``either``: or with ``1 - want`` when most runs do) is timed
     again (``RETIME`` repetitions, ``RETIME_ROUNDS`` rounds), its last
-    measurement counting. -> (the homes, facts)."""
+    measurement counting. ``probe``: the round trips' timer (``pp_runs``'s
+    signature). -> (the homes, facts)."""
 
     def time(idx, n):
         runs = [i * NUMA_RUN for i in idx]
         t = [
-            torch.stack([pp_runs(page, runs, *ab) for _ in range(n)]).min(0).values
+            torch.stack([probe(page, runs, *ab) for _ in range(n)]).min(0).values
             for ab in pairs
         ]
         return (t[0] < t[1]).int(), (t[0] - t[1]).abs()
@@ -177,16 +177,19 @@ def _homes(page, nruns, pairs, want, reps=2, either=False):
     }
 
 
-def calibrate(page: torch.Tensor, nruns: int, reps: int = 3) -> tuple[int, float, dict]:
+def calibrate(
+    page: torch.Tensor, nruns: int, reps: int = 3, probe=pp_runs
+) -> tuple[int, float, dict]:
     """``page``: zeroed int32 at a page boundary, ``nruns`` runs at least. ->
     (word, agreement, facts): bit x of ``word`` the copy (run parity) XCD x
-    reads; agreement the share of runs whose measured home is the rule's."""
-    # host tensors, beside ``pp_runs``' timings whatever the default device
+    reads; agreement the share of runs whose measured home is the rule's.
+    ``probe``: the round trips' timer (``pp_runs``'s signature)."""
+    # host tensors, beside the probe's timings whatever the default device
     gap = torch.zeros(8, 8, device="cpu")
     for xp in range(8):
         for xc in range(8):
             t = (
-                torch.stack([pp_runs(page, [0, NUMA_RUN], xp, xc) for _ in range(reps)])
+                torch.stack([probe(page, [0, NUMA_RUN], xp, xc) for _ in range(reps)])
                 .min(0)
                 .values
             )
@@ -209,17 +212,19 @@ def calibrate(page: torch.Tensor, nruns: int, reps: int = 3) -> tuple[int, float
     ]
     # group 0 reads copy 0, the even runs
     want = 1 - torch.arange(nruns, device="cpu") % 2
-    near0, f = _homes(page, nruns, pairs, want)
+    near0, f = _homes(page, nruns, pairs, want, probe=probe)
     agree = float((near0 == want).float().mean())
     facts.update(pairs=pairs, agree=agree, margin=f["margin"], retimed=f["retimed"])
     return word, agree, facts
 
 
-def page_parity(page: torch.Tensor, nruns: int, pairs) -> tuple[int | None, dict]:
+def page_parity(
+    page: torch.Tensor, nruns: int, pairs, probe=pp_runs
+) -> tuple[int | None, dict]:
     """A further page, with page 0's pairs: 0 when its even runs are local to
     the XCDs page 0's are, 1 to the others, None when the rule does not hold."""
     even = 1 - torch.arange(nruns, device="cpu") % 2
-    near0, facts = _homes(page, nruns, pairs, even, either=True)
+    near0, facts = _homes(page, nruns, pairs, even, either=True, probe=probe)
     same = float((near0 == even).float().mean())
     facts["same"] = same
     return (0 if same == 1.0 else 1 if same == 0.0 else None), facts

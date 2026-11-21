@@ -183,6 +183,17 @@ WQB0 = QKV0 + 8
 # first); kv's (task, tile) units on slice CTAs past q_norm's and kv_norm's
 WQKV_Q0 = BLOCKS - 64
 WQKV_KV0 = 88
+# a compressing layer past one tile (``LayerBuild.q_apart``): the
+# compressor's projection on APART_PROJ_CTAS CTAs from the seam norm's first
+# (past the slices' and the gate blocks'), the q path on the rest -- q's
+# tasks, then kv's, each a CTA its tiles in series --, q_norm and kv_norm on
+# projection CTAs (theirs done by then)
+APART_PROJ0 = SLICES + 5
+APART_PROJ_CTAS = 128
+APART_Q0 = (APART_PROJ0 + APART_PROJ_CTAS) % BLOCKS
+APART_KV0 = APART_Q0 + Q_TASKS
+APART_QN0 = APART_PROJ0 + 35
+APART_KVN0 = APART_QN0 + 24
 # the layer kernel's wq_b CTAs, from this one: the ones before hold the
 # attention's scores (``AttnPostBuild.score0`` on), free to land their keys
 # before q
@@ -193,11 +204,13 @@ def iw0(tok_par: bool, own_n: int) -> int:
     """The head-weight tasks' first CTA: on CTAs that wait for wq_b's q latent
     with nothing to do, where they read only the normed rows. One token tile:
     past kv_norm's CTAs (a token each from ``KVN0``), every later one free up
-    to the gates' (``GATE0``); else CTA 120; a token-parallel launch keeps
+    to the gates' (``GATE0``); else CTA 96, its 96 tasks (S 17..24) ending
+    before the q GEMV's CTAs (``WQKV_Q0``) -- past 24 rows its tasks reach
+    them (a slower placement, not a wrong one); a token-parallel launch keeps
     those CTAs busy (0)."""
     if tok_par:
         return 0
-    return KVN0 + own_n if len(token_tiles(own_n)) == 1 else 120
+    return KVN0 + own_n if len(token_tiles(own_n)) == 1 else 96
 
 
 IQ_TASKS = IDX_ROWS // ROWS  # 256
@@ -1062,9 +1075,7 @@ def _fp8_step_load(c, r_w, r_ws, k, rg, st):
     them (lanes 0-31, 32-63); ``k`` % 64 = 32 (a last quarter step): the lanes
     of a block past the row read its last block."""
     lane = c["lane"]
-    # ``fresh_lane`` (an index layer's layer kernel): computed at each GEMV, not
-    # CSE'd across them and held from K1's first to K2's last
-    j = (fresh(lane) if c.get("fresh_lane") else lane) // 16
+    j = lane // 16
     kg = k // 32
     if const_expr(k % 64 == 0):
         lo_at = (rg * (k // 64) + 2 * st) * 256 + lane * 4
@@ -1938,22 +1949,30 @@ def _index_w(co, bid, nbl, load_group, tasks, first):
 
 @traced
 def _index_quant(c, key, bid, tasks):
-    """This CTA's (token, head) quantization tasks of the first ``tasks``."""
-    for task in range(first_task(bid, IQUANT0), tasks, BLOCKS):
-        if const_expr(key.index_fp4):
-            stage_iquant_fp4(c, task)
-        else:
+    """This CTA's (token, head) quantization tasks of the first ``tasks``; the
+    FP4 plane's a wave each (a CTA its WAVES adjacent tasks a round: one round
+    where a wave a CTA took three at S=24)."""
+    if const_expr(key.index_fp4):
+        slots = (tasks + WAVES - 1) // WAVES
+        for slot in range(first_task(bid, IQUANT0), slots, BLOCKS):
+            task = slot * WAVES + c["wave"]
+            stage_iquant_fp4(c, fx.min(task, tasks - 1), task < tasks)
+    else:
+        for task in range(first_task(bid, IQUANT0), tasks, BLOCKS):
             stage_iquant(c, task)
 
 
 @traced
-def run_attn_pre(c, co, key, tls, tl0, nbl, gates=True, after_norm=None):
+def run_attn_pre(
+    c, co, key, tls, tl0, nbl, gates=True, after_norm=None, q_apart=False
+):  # fmt: skip
     """K1's stages, in order, on context ``c`` (``co``: the own-rows view of a
     token-parallel build, else ``c``); ``timeline`` stamps from point ``tl0`` +
     1, ``nbl`` an indexer layer's normed-row LDS (``stage_iw``). ``gates``:
     seam A's gates after wqkv_a (else the caller runs ``run_seam_a_gates``
     later). ``after_norm``: the layer kernel's work on the normed rows (its
-    compressor's projection), after the norm's stages, before wqkv_a."""
+    compressor's projection), after the norm's stages, before wqkv_a.
+    ``q_apart``: the q path apart from that projection (``APART_*``)."""
     s, tid, bid = key.tokens, c["tid"], c["bid"]
     a, dims, timeline = c["args"], c["d"], key.timeline
     own_n = s // key.tp if key.tok_par else s
@@ -2016,6 +2035,15 @@ def run_attn_pre(c, co, key, tls, tl0, nbl, gates=True, after_norm=None):
             wqkv_ops = gemv_fp8_loads(co, a["wqkv"], a["wqkv_s"], HIDDEN, wqkv_task)
             load_seam_x8(co, 0, own_rows_lds)
             stage_wqkv(co, wqkv_task, wqkv_ops, 0, own_n)
+    elif const_expr(q_apart):
+        # a task a CTA, its tiles in series on its weights: q's, then kv's
+        for task, first in ((first_task(bid, APART_Q0), 0),
+                            (first_task(bid, APART_KV0), Q_TASKS)):  # fmt: skip
+            if task < (Q_TASKS if first == 0 else WQKV_TASKS - Q_TASKS):
+                ops = gemv_fp8_loads(co, a["wqkv"], a["wqkv_s"], HIDDEN, first + task)
+                for t0, n in own_tiles:
+                    load_seam_x8(co, t0, n)
+                    stage_wqkv(co, first + task, ops, t0, n)
     elif const_expr(KVN0 + own_n <= WQKV_KV0):
         ntiles = len(own_tiles)
         # q's CTAs before q_norm's, kv's past kv_norm's
@@ -2055,9 +2083,9 @@ def run_attn_pre(c, co, key, tls, tl0, nbl, gates=True, after_norm=None):
         run_seam_a_gates(c, co, bid, own_n)
     stamp(timeline, tls, tid, tl0 + 4)
     enter_stage("k1.qkv")
-    for t in range(first_task(bid, QKV0), own_n, BLOCKS):
+    for t in range(first_task(bid, APART_QN0 if q_apart else QKV0), own_n, BLOCKS):
         stage_q_norm(co, t)
-    for t in range(first_task(bid, KVN0), own_n, BLOCKS):
+    for t in range(first_task(bid, APART_KVN0 if q_apart else KVN0), own_n, BLOCKS):
         stage_kv_norm(co, t)
         if const_expr(fused):
             # ... and its attention this token's window row (``kvrow``)

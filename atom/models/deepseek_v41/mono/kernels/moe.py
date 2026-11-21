@@ -173,7 +173,24 @@ DOWN_CHAINS = 2
 RED_COLS = 32
 RED_TASKS = HIDDEN // RED_COLS  # 160
 X8_WORDS = HIDDEN // 4
-TAGS = 256  # mailbox tags (a layer's K1 / K2a / K2b each own one): the ug queues
+TAGS = 256  # mailbox tags (a layer's K1 / K2a / K2b each own one)
+# The task queues: a word each a launch, counting up from the step's clear --
+# the ug tasks past the first round (``take_ug_task``), the down arrivals
+# (``take_down_rank``), the down units (``take_down_unit``). Their own words,
+# not the scratch's: the layer builds of a step lay the scratch out apart, and
+# one build's pairs at another's queue offset start its count past zero.
+QUEUES = ("ugq", "dq", "dnq")
+# tag t's words at ``queue.tag_offset(t)`` (t + 1 slots in): TAGS + 1 slots,
+# in the step zeroing's 16 B stores
+QUEUE_BYTES = -(-len(QUEUES) * (TAGS + 1) * 4 // 16) * 16
+
+
+def queue_offset(layer: int) -> int:
+    """The byte offset of the launch ``layer``'s words in the queue words
+    (``queue.tag_offset``): the launch is handed their address
+    (``queue_words``)."""
+    return queue.tag_offset(layer, len(QUEUES))
+
 
 XQ0 = 0
 DOWN0 = 0
@@ -189,7 +206,8 @@ TL_POINTS = 1 + len(TL_STAGES)
 ABI = KernelAbi(
     (
         "x", "gate_w", "bias", "w13", "w13_s", "w2", "w2_s", "sgu", "sgu_s", "sw2",
-        "sw2_s", "out", "qoff", "scratch", "sym", "peers", "rank", "layer", "tl",
+        "sw2_s", "out", "queue_words", "scratch", "sym", "peers", "rank", "layer",
+        "tl",
     )
 )  # fmt: skip
 
@@ -216,13 +234,6 @@ def scratch_layout(key: MoeBuild) -> dict[str, tuple[int, int]]:
         "mids": rs.picks * d.inter // 32,
         # an ug task's done flag (``stage_ug``)
         "ugf": (rs.max_tiles if rs.multi else rs.max_u) * rs.ug_parts,
-        # the ug task queue: a word a mailbox tag (a layer), counting up from the
-        # step's clear (``take_ug_task``); plain words, 2 a pair
-        "ugq": TAGS // 2,
-        # the down stage's arrival count, a word a tag (``take_down_rank``)
-        "dq": TAGS // 2,
-        # the down unit queue, a word a tag (``take_down_unit``)
-        "dnq": TAGS // 2,
         # down by unit: each pick's bf16 contribution [pick][HIDDEN] (packed
         # pairs), and a CTA's units-done flag (``down_units``)
         "dcon": rs.picks * HIDDEN // 4,
@@ -489,8 +500,13 @@ def route_scores(c, t):
         for p in range_constexpr(ROUTER_PARTS):
             tot = tot + parts[p].bitcast(fx.Float32)
         sc = _score(bf16_round(tot))
-        # aiter's NaN guards: a NaN score weighs 0 and never wins
-        fx.ptr_store(fx.max(sc + bias, fx.Float32(float("-inf"))), red + tid)
+        # aiter's NaN guards: a NaN score weighs 0 and never wins (a select:
+        # the max propagates a NaN, whose order key ranks above +inf)
+        biased = sc + bias
+        fx.ptr_store(
+            fx.Float32(fx.isnan(biased).select(fx.Float32(float("-inf")), biased)),
+            red + tid,
+        )
         fx.ptr_store(
             fx.Float32(fx.isnan(sc).select(fx.Float32(0.0), sc)), red + (experts + tid)
         )
@@ -1018,11 +1034,11 @@ def take_ug_task(c):
     return take_launch_queue(c, "ugq")
 
 
-def take_launch_queue(c, region):
-    """This launch's word of the queue ``region`` (a word a tag, at the
-    host's ``qoff``: ``queue.tag_offset``), taken for the whole CTA."""
-    word = queue.word(c[region].value + c["args"]["qoff"])
-    return queue.take_shared(word, c["tab"] + c["rs"].queue0, c["tid"])
+def take_launch_queue(c, name):
+    """This launch's word of queue ``name`` (``QUEUES``, from the launch's
+    ``queue_words``: ``queue_offset``), taken for the whole CTA."""
+    at = c["args"]["queue_words"] + fx.Int64(QUEUES.index(name) * 4)
+    return queue.take_shared(queue.word(at), c["tab"] + c["rs"].queue0, c["tid"])
 
 
 @traced
@@ -2675,7 +2691,7 @@ def build_moe(key: MoeBuild):
     def moe(
         x: Int64, gate_w: Int64, bias: Int64, w13: Int64, w13_s: Int64, w2: Int64,
         w2_s: Int64, sgu: Int64, sgu_s: Int64, sw2: Int64, sw2_s: Int64, out: Int64,
-        qoff: Int64,
+        queue_words: Int64,
         scratch: Int64, sym: Int64, peers: Int64, rank: Int32, layer: Int32,
         tl: Int64,
     ):  # fmt: skip
@@ -2683,7 +2699,19 @@ def build_moe(key: MoeBuild):
         bid = fx.block_idx.x
         lds = fx.SharedAllocator().allocate(Smem).peek()
         args = moe_args(
-            x, gate_w, bias, w13, w13_s, w2, w2_s, sgu, sgu_s, sw2, sw2_s, out, qoff
+            x,
+            gate_w,
+            bias,
+            w13,
+            w13_s,
+            w2,
+            w2_s,
+            sgu,
+            sgu_s,
+            sw2,
+            sw2_s,
+            out,
+            queue_words,
         )
         c = moe_context(
             s, rs, lds, mailbox(layer, scratch, key.diag_off, layout),
@@ -2700,13 +2728,14 @@ def build_moe(key: MoeBuild):
     def launch(
         x: Int64, gate_w: Int64, bias: Int64, w13: Int64, w13_s: Int64, w2: Int64,
         w2_s: Int64, sgu: Int64, sgu_s: Int64, sw2: Int64, sw2_s: Int64, out: Int64,
-        qoff: Int64,
+        queue_words: Int64,
         scratch: Int64, sym: Int64, peers: Int64, rank: Int32, layer: Int32,
         tl: Int64, stream: fx.Stream = _CURRENT_STREAM,
     ):  # fmt: skip
         _ = keyed
         moe(
-            x, gate_w, bias, w13, w13_s, w2, w2_s, sgu, sgu_s, sw2, sw2_s, out, qoff,
+            x, gate_w, bias, w13, w13_s, w2, w2_s, sgu, sgu_s, sw2, sw2_s, out,
+            queue_words,
             scratch, sym, peers, rank, layer, tl,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 

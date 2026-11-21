@@ -363,17 +363,17 @@ def _e2m1(x):
 
 
 @traced
-def stage_iquant_fp4(c, task):
+def stage_iquant_fp4(c, task, live):
     """``stage_iquant`` on the FP4 plane: token task // 32, head task % 32, a
-    wave (wave 0), 2 dims a lane and a 32-dim group 16 lanes. ``quantize_fp4``
-    to the bit: code = ceil(log2(max(amax, FP4_MIN_AMAX) x f32(1/6))), the
-    value times 2^(127 - code) (its scale's exact inverse) to E2M1, the even
-    dim the low nibble."""
-    lane, wave = c["lane"], c["wave"]
+    wave (each wave its own task, where ``live`` says it has one), 2 dims a
+    lane and a 32-dim group 16 lanes. ``quantize_fp4`` to the bit: code =
+    ceil(log2(max(amax, FP4_MIN_AMAX) x f32(1/6))), the value times 2^(127 -
+    code) (its scale's exact inverse) to E2M1, the even dim the low nibble."""
+    lane = c["lane"]
     a = c["args"]
     t = task // ip.HEADS
     h = task % ip.HEADS
-    if wave == 0:
+    if live:
         got = poll_query(c, t, h, lane)
         x0, x1 = bf2_f32(got[0][0])
         amax = butterfly(fx.max(abs(x0), abs(x1)), (1, 2, 4, 8), fx.max)

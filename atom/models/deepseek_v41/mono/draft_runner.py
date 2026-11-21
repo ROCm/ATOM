@@ -46,6 +46,10 @@ class DraftMonoRunner(V41MonoDecodeRunner):
     up to ``MAX_REQUESTS`` requests, a block of ``width`` rows each, bound (and
     agreed on) like the target's runner."""
 
+    # the draft head (``_bind_head``), agreed on as the target's launches
+    optional_launches = V41MonoDecodeRunner.optional_launches + ("heads",)
+    heads = None
+
     def __init__(self, draft) -> None:
         config = draft.config
         self.width = draft.block_size
@@ -92,8 +96,8 @@ class DraftMonoRunner(V41MonoDecodeRunner):
         """The draft head (``kernels.draft_head``: the last stage's owed post,
         collapse and final norm, the LM head and the Markov sampler in one
         launch) at every request count; none where the draft's head is not
-        the vocab-sharded greedy one or its final norm not the plain RMSNorm."""
-        self.heads = {}
+        the vocab-sharded greedy one or its final norm not the plain RMSNorm,
+        and at a request count its build refuses (``DraftHeadBuild.refusal``)."""
         head, norm = draft.head, draft.mtp[-1].norm
         if head is None or not draft._sharded_markov_sample():
             return
@@ -115,6 +119,7 @@ class DraftMonoRunner(V41MonoDecodeRunner):
             and tuple(cw.shape) == (1, w.shape[1] + w1.shape[1])
             and cw.is_contiguous()
         )
+        heads = {}
         for requests in range(1, MAX_REQUESTS + 1):
             key = dh.DraftHeadBuild(
                 requests=requests,
@@ -127,7 +132,11 @@ class DraftMonoRunner(V41MonoDecodeRunner):
                 eps=norm.eps,
                 confidence=confidence,
             )
-            self.heads[requests] = dh.build_draft_head(key)
+            if key.refusal() is None:
+                heads[requests] = dh.build_draft_head(key)
+        if not heads:
+            return
+        self.heads = heads
         dev = self.scratch.device
         rows, hidden = self.max_rows, w.shape[1]
         # each row's confidence (``confidence``; else the caller's head)
@@ -164,7 +173,8 @@ class DraftMonoRunner(V41MonoDecodeRunner):
         stage's state; None where no build serves ``anchor_ids``' requests
         (the caller finishes the state itself: ``normed_rows``)."""
         requests = anchor_ids.numel()
-        if requests not in self.heads or anchor_ids.dtype != torch.int32:
+        heads = self.heads
+        if heads is None or requests not in heads or anchor_ids.dtype != torch.int32:
             return None
         args = dict(self.head_args)
         args["anchor"] = anchor_ids.data_ptr()
@@ -174,9 +184,7 @@ class DraftMonoRunner(V41MonoDecodeRunner):
             peers["peers"],
             peers["rank"],
         )
-        _run_compiled(
-            self.heads[requests], *dh.ABI.pack(args), torch.cuda.current_stream()
-        )
+        _run_compiled(heads[requests], *dh.ABI.pack(args), torch.cuda.current_stream())
         rows = requests * self.width
         conf = self.head_conf
         return (
