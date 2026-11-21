@@ -831,6 +831,9 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.tp_world_size = config.tp_world_size
         self.rank = rank
+        from atom.model_engine.kda_checkpoint_boundary import KDACheckpointBoundary
+
+        self._kda_checkpoint_boundary = KDACheckpointBoundary(rank)
         self.label = f"Model Runner{rank}/{self.tp_world_size}"
         self._dynamic_chunking = DynamicChunkingWorker(self)
         self.hf_text_config = get_hf_text_config(hf_config)
@@ -2668,6 +2671,9 @@ class ModelRunner:
             spec_decode_metadata = self.drafter.calc_spec_decode_metadata(
                 input_ids, spec_decode_indices
             )
+        checkpoint_observation = self._kda_checkpoint_boundary.before(
+            self.attn_metadata_builder, batch
+        )
         attn_metadata, positions = self.attn_metadata_builder.build(
             batch=batch,
             running_bs=running_bs,
@@ -2678,6 +2684,9 @@ class ModelRunner:
             pcp_groups=forward_mode.pcp_groups,
         )
         self.attn_metadata_builder.prepare_model_inputs(input_ids, attn_metadata)
+        self._kda_checkpoint_boundary.after(
+            checkpoint_observation, attn_metadata, positions
+        )
         context = Context(
             positions=positions,
             is_prefill=is_prefill,
