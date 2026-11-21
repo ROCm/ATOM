@@ -9,7 +9,7 @@ that is not this repo's frontend (the atomesh Rust runtime) skipped the
 frontend's checks.
 
 `build_sequence` is the Core's half: it turns a decoded request
-(`zmq_protocol.codec.AdmissionSpec`) into the `Sequence` the scheduler has
+(`zmq_protocol.messages.SubmitItem`) into the `Sequence` the scheduler has
 always taken. `validate_for_model` and `mrope_for` are what the frontend's
 `InputOutputProcessor` runs for the same request.
 """
@@ -17,6 +17,7 @@ always taken. `validate_for_model` and `mrope_for` are what the frontend's
 from dataclasses import replace
 
 from atom.model_engine.sequence import PER_REQ_CACHE_MODEL_TYPES, Sequence
+from atom.model_engine.zmq_protocol import codec
 from atom.observability import tracing
 from atom.sampling_params import EngineChannel, SamplingParams
 from atom.structured_output import is_structured
@@ -55,10 +56,11 @@ def validate_for_model(config, *, num_draft_tokens, multimodal_data) -> None:
         )
 
 
-def mrope_for(config, token_ids, multimodal_data):
-    """`(mrope_positions, mrope_position_delta)` of a prompt: `(None, 0)` for
-    a text one."""
-    if multimodal_data is None:
+def mrope_for(config, token_ids, multimodal_data, *, uses_mrope: bool):
+    """`(mrope_positions, mrope_position_delta)` of a prompt: `(None, 0)` for a
+    text one, and for a model without MRoPE (`registry.uses_mrope`), which
+    has none to give -- without copying the prompt to ask."""
+    if multimodal_data is None or not uses_mrope:
         return None, 0
     from atom.multimodal.registry import get_mrope_input_positions
 
@@ -70,8 +72,8 @@ class AdmissionContext:
 
     Holds what the Core derives from its own config -- the client used to
     derive the same from its copy of it -- and fills in what a client may
-    leave out (the REQUESTS section of engine_v1.proto). Built once per Core,
-    at startup.
+    leave out (`messages.SubmitItem`'s defaults). Built once per Core, at
+    startup.
     """
 
     def __init__(self, config):
@@ -83,11 +85,16 @@ class AdmissionContext:
         )
         # This Core's own: its engine loop holds one channel.
         self.engine_channel = EngineChannel(config)
+        # Whether a multimodal request's MRoPE positions are this model's to
+        # compute; a model without MRoPE skips copying the prompt for them.
+        from atom.multimodal.registry import uses_mrope
+
+        self.uses_mrope = uses_mrope(config)
 
 
-def build_sequence(spec, context: AdmissionContext) -> Sequence:
-    """The `Sequence` the client would have built for `spec`, a decoded
-    `AdmissionSpec`.
+def build_sequence(item, context: AdmissionContext) -> Sequence:
+    """The `Sequence` the client built for `item`, a decoded
+    `messages.SubmitItem`.
 
     Refuses what the frontend refuses before it sends a request, in its
     order: `check_sampling`, a structured request's execution options, and
@@ -95,10 +102,11 @@ def build_sequence(spec, context: AdmissionContext) -> Sequence:
     A structured request's grammar is the client's to have compiled
     (`LLMEngine.prepare_structured_request`).
     """
-    kwargs = dict(spec.kwargs)
-    multimodal_data = kwargs["multimodal_data"]
-    kv_transfer = kwargs["kv_transfer_params"]
-    params = kwargs["sampling_params"]
+    if item.refused is not None:
+        raise ValueError(item.refused)
+    params = codec.sampling_params(item)
+    multimodal_data, mrope_positions = codec.media(item)
+    kv_transfer = codec.unpickled(item.kv_transfer_params)
     check_sampling(
         context.config,
         params,
@@ -119,29 +127,71 @@ def build_sequence(spec, context: AdmissionContext) -> Sequence:
         multimodal_data=multimodal_data,
     )
     if params.required_channel is not None:
-        kwargs["sampling_params"] = replace(
+        params = replace(
             params,
             required_channel=context.engine_channel.hold(params.required_channel),
         )
-    if multimodal_data is not None and kwargs["mrope_positions"] is None:
+    token_ids = codec.prompt_token_ids(item)
+    mrope_position_delta = item.mrope_position_delta
+    if multimodal_data is not None and mrope_positions is None:
         # A client that cannot run the model's MRoPE code leaves them out.
-        kwargs["mrope_positions"], kwargs["mrope_position_delta"] = mrope_for(
-            context.config, list(kwargs["token_ids"]), multimodal_data
+        mrope_positions, mrope_position_delta = mrope_for(
+            context.config,
+            # A list only for a model that reads one.
+            list(token_ids) if context.uses_mrope else token_ids,
+            multimodal_data,
+            uses_mrope=context.uses_mrope,
         )
-    seq = Sequence(
-        block_size=context.block_size,
+    seq = _sequence(
+        item,
+        context,
+        token_ids,
+        params,
+        kv_transfer,
+        multimodal_data,
+        mrope_positions,
+        mrope_position_delta,
+    )
+    seq.arrive_time = item.arrive_time
+    seq.dp_est_cached_tokens = item.dp_est_cached_tokens
+    # The BlockManager checks a shipped chain before it trusts it.
+    seq.prompt_hash_chain = codec.shipped_chain(item)
+    if item.trace is not None:
+        tracing.adopt_context(
+            seq, item.trace.carrier, item.trace.model, item.trace.request_id
+        )
+    return seq
+
+
+def _sequence(
+    item,
+    context,
+    token_ids,
+    params,
+    kv_transfer,
+    multimodal_data,
+    mrope_positions,
+    delta,
+) -> Sequence:
+    return Sequence(
+        token_ids,
+        context.block_size,
+        params,
+        item.stop_token_sequences,
+        id=item.seq_id,
+        kv_transfer_params=kv_transfer,
         num_draft_tokens=context.num_draft_tokens,
         has_per_req_cache=context.has_per_req_cache,
-        id=spec.seq_id,
+        needs_independent_noise=item.needs_independent_noise,
+        parent_request_id=item.parent_request_id,
+        sibling_index=item.sibling_index,
+        request_id=item.external_request_id,
+        multimodal_data=multimodal_data,
+        mrope_positions=mrope_positions,
+        mrope_position_delta=delta,
+        data_parallel_rank=item.data_parallel_rank,
+        dp_session_id=item.dp_session_id,
+        dp_parent_session_id=item.dp_parent_session_id,
         # The client hashed the media already.
-        cache_seed=spec.cache_seed,
-        **kwargs,
+        cache_seed=item.cache_seed,
     )
-    seq.max_tokens = spec.max_tokens
-    seq.arrive_time = spec.arrive_time
-    seq.dp_est_cached_tokens = spec.dp_est_cached_tokens
-    # The BlockManager checks a shipped chain before it trusts it.
-    seq.prompt_hash_chain = spec.prompt_hash_chain
-    if spec.trace is not None:
-        tracing.adopt_context(seq, *spec.trace)
-    return seq

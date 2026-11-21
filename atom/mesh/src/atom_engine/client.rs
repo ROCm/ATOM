@@ -28,9 +28,9 @@ use tracing::{debug, error, info, warn};
 
 use super::{
     balance::Balancer,
-    link::{process_alive, recv_frames, CoreLink, Interrupted},
+    link::{process_alive, CoreLink, Interrupted},
     spec::EngineSpec,
-    wire::{self, pb, Inbound},
+    wire::{self, kind, reject, Inbound},
 };
 
 /// How long a reader blocks before checking for shutdown and Core liveness.
@@ -70,11 +70,11 @@ pub struct SeqTimes {
 
 #[derive(Debug)]
 pub enum SeqFailure {
-    /// `Rejected` INVALID: the request itself is at fault.
+    /// Refused as INVALID: the request itself is at fault.
     Invalid(String),
-    /// `Rejected` OVERLOADED, or the Core went away.
+    /// Refused as OVERLOADED, or the Core went away.
     Unavailable(String),
-    /// `Rejected` INTERNAL.
+    /// Refused as INTERNAL.
     Internal(String),
 }
 
@@ -82,8 +82,8 @@ pub enum SeqFailure {
 pub struct Submission<'a> {
     pub request_id: &'a str,
     pub prompt: &'a [u32],
-    pub sampling: pb::SamplingParams,
-    pub stop_token_sequences: Vec<pb::TokenIds>,
+    pub sampling: wire::Sampling,
+    pub stop_token_sequences: Vec<Vec<i32>>,
     pub n: u32,
     pub session: Option<&'a str>,
     /// The request's `data_parallel_rank`: every sibling goes there.
@@ -292,26 +292,26 @@ impl EngineClient {
             }
         }
 
-        let prompt = wire::token_frame(sub.prompt);
+        let prompt = wire::token_bytes(sub.prompt);
         let arrive_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs_f64())
             .unwrap_or_default();
         for (rank, link) in shared.links.iter().enumerate() {
-            let specs: Vec<pb::RequestSpec> = seq_ids
+            let items: Vec<wire::SubmitItem> = seq_ids
                 .iter()
                 .zip(&ranks)
                 .enumerate()
                 .filter(|(_, (_, &r))| r == rank)
                 .map(|(sibling, (&seq_id, _))| {
-                    sub.request_spec(seq_id, sibling as u32, rank, prompt.len(), arrive_time)
+                    sub.submit_item(seq_id, sibling as u32, rank, &prompt, arrive_time)
                 })
                 .collect();
-            if specs.is_empty() {
+            if items.is_empty() {
                 continue;
             }
-            let body = pb::envelope::Body::Submit(pb::SubmitBatch { requests: specs });
-            if let Err(e) = link.send_input(wire::encode(body, vec![prompt.clone()])) {
+            let submit = wire::encode(kind::ADD, &wire::Submit { items });
+            if let Err(e) = link.send_input(submit) {
                 error!(dp_rank = rank, "submit failed: {e}");
                 // Dropping the handles aborts and releases every sibling.
                 return Err(SeqFailure::Unavailable(format!(
@@ -332,7 +332,7 @@ impl EngineClient {
     /// Whatever is still in flight then ends as failed.
     pub fn shutdown(&self, timeout: Duration) {
         self.begin_shutdown();
-        let shutdown = wire::encode(pb::envelope::Body::Shutdown(pb::Shutdown {}), vec![]);
+        let shutdown = wire::encode(kind::SHUTDOWN, &wire::Empty {});
         for link in &self.shared.links {
             if let Err(e) = link.send_control(shutdown.clone()) {
                 warn!(dp_rank = link.spec.dp_rank, "shutdown not delivered: {e}");
@@ -358,25 +358,20 @@ impl EngineClient {
 }
 
 impl Submission<'_> {
-    /// Sibling `sibling` of this request, as Core `rank` admits it; its
-    /// prompt is frame 1 of the message, shared by every sibling there.
-    fn request_spec(
+    /// Sibling `sibling` of this request, as Core `rank` admits it.
+    fn submit_item(
         &self,
         seq_id: u64,
         sibling: u32,
         rank: usize,
-        prompt_bytes: usize,
+        prompt: &serde_bytes::ByteBuf,
         arrive_time: f64,
-    ) -> pb::RequestSpec {
+    ) -> wire::SubmitItem {
         let fanout = self.n > 1;
-        pb::RequestSpec {
+        wire::SubmitItem {
             seq_id,
-            prompt_token_ids: Some(pb::BufferRef {
-                frame: 1,
-                offset: 0,
-                nbytes: prompt_bytes as u64,
-            }),
-            sampling: Some(self.sampling.clone()),
+            prompt: prompt.clone(),
+            sampling: self.sampling.clone(),
             stop_token_sequences: self.stop_token_sequences.clone(),
             external_request_id: (!fanout).then(|| self.request_id.to_string()),
             parent_request_id: Some(self.request_id.to_string()),
@@ -414,10 +409,13 @@ impl Shared {
             return;
         };
         self.balancer.lock().release(seq_id);
-        let abort = pb::envelope::Body::Abort(pb::Abort {
-            seq_ids: vec![seq_id],
-        });
-        if let Err(e) = self.links[slot.rank].send_control(wire::encode(abort, vec![])) {
+        let abort = wire::encode(
+            kind::ABORT,
+            &wire::Abort {
+                seq_ids: vec![seq_id],
+            },
+        );
+        if let Err(e) = self.links[slot.rank].send_control(abort) {
             warn!(seq_id, dp_rank = slot.rank, "abort not delivered: {e}");
         }
     }
@@ -437,8 +435,8 @@ impl Shared {
             return self.core_lost(rank, &format!("output socket failed: {e}"));
         }
         while !self.stopping.load(Ordering::Acquire) {
-            let message = match recv_frames(&output) {
-                Ok(frames) => Inbound::decode(frames),
+            let message = match output.recv_msg(0) {
+                Ok(message) => Inbound::decode(&message),
                 Err(zmq::Error::EAGAIN) if process_alive(pid) => continue,
                 Err(zmq::Error::EAGAIN) => {
                     return self.core_lost(rank, &format!("process {pid} exited"));
@@ -457,31 +455,31 @@ impl Shared {
             if let Err(e) = self.dispatch(rank, &message) {
                 return self.core_lost(rank, &format!("sent an undecodable output: {e}"));
             }
-            if matches!(message.body, pb::envelope::Body::Stopped(_)) {
+            if matches!(message, Inbound::Stopped) {
                 return self.core_lost(rank, "stopped");
             }
         }
     }
 
     fn dispatch(&self, rank: usize, message: &Inbound) -> Result<(), String> {
-        use pb::envelope::Body;
-        match &message.body {
-            Body::Stream(batch) => self.on_stream(batch),
-            Body::Completions(done) => {
+        match message {
+            Inbound::Stream(stream) => self.on_stream(stream),
+            Inbound::Completions(done) => {
                 // Item by item: one that does not decode fails alone.
                 for item in &done.items {
-                    let decoded =
-                        message
-                            .tokens(item.completion_token_ids.as_ref())
-                            .and_then(|token_ids| {
-                                // Only a sequence that asked for them has logprobs.
-                                let logprobs = item
-                                    .logprobs
-                                    .as_ref()
-                                    .map(|r| message.floats(Some(r)))
-                                    .transpose()?;
-                                Ok((token_ids, logprobs))
-                            });
+                    if item.reject_code != reject::FINISHED {
+                        self.on_refused(item);
+                        continue;
+                    }
+                    let decoded = wire::tokens(&item.completion_tokens).and_then(|token_ids| {
+                        // Only a sequence that asked for them has logprobs.
+                        let logprobs = item
+                            .logprobs_bytes
+                            .as_ref()
+                            .map(|b| wire::floats(b))
+                            .transpose()?;
+                        Ok((token_ids, logprobs))
+                    });
                     self.end(item.seq_id, |slot| match decoded {
                         Ok((token_ids, logprobs)) => SeqEvent::Finished(Finished {
                             token_ids,
@@ -503,62 +501,50 @@ impl Shared {
                 }
                 Ok(())
             }
-            Body::Rejected(rejected) => {
-                for item in &rejected.items {
-                    let reason = item.reason.clone();
-                    let failure = match pb::rejected_request::Code::try_from(item.code) {
-                        Ok(pb::rejected_request::Code::Invalid) => SeqFailure::Invalid(reason),
-                        Ok(pb::rejected_request::Code::Overloaded) => {
-                            SeqFailure::Unavailable(reason)
-                        }
-                        _ => SeqFailure::Internal(reason),
-                    };
-                    self.end(item.seq_id, |_| SeqEvent::Failed(failure));
-                }
+            Inbound::Ignored(kind) => {
+                debug!(dp_rank = rank, kind, "ignoring output");
                 Ok(())
             }
-            other => {
-                debug!(
-                    dp_rank = rank,
-                    "ignoring output {:?}",
-                    std::mem::discriminant(other)
-                );
-                Ok(())
-            }
+            Inbound::Ready(_) | Inbound::Stopped => Ok(()),
         }
+    }
+
+    /// A sequence the Core refused: it fails with the reason the Core gave.
+    fn on_refused(&self, item: &wire::Completion) {
+        let reason = item
+            .leave_reason
+            .strip_prefix("rejected: ")
+            .unwrap_or(&item.leave_reason)
+            .to_string();
+        let failure = match item.reject_code {
+            reject::INVALID => SeqFailure::Invalid(reason),
+            reject::OVERLOADED => SeqFailure::Unavailable(reason),
+            _ => SeqFailure::Internal(reason),
+        };
+        self.end(item.seq_id, |_| SeqEvent::Failed(failure));
     }
 
     /// Route one step's tokens. A sequence's last entry ends it, unless it
     /// waits for its `Completion`; that `Completion`, when it comes, finds
     /// nothing left to end.
-    fn on_stream(&self, batch: &pb::StreamBatch) -> Result<(), String> {
-        let total: u64 = batch.token_counts.iter().map(|&c| c as u64).sum();
-        if total != batch.tokens.len() as u64 || batch.token_counts.len() != batch.seq_ids.len() {
-            return Err("stream columns disagree in length".into());
-        }
-        let finished = |i: usize| batch.finished.get(i).copied().unwrap_or(false);
+    fn on_stream(&self, stream: &wire::Stream) -> Result<(), String> {
         {
             // Load only: the slots are not touched under this lock.
             let mut balancer = self.balancer.lock();
-            for (i, &seq_id) in batch.seq_ids.iter().enumerate() {
-                balancer.prefill_done(seq_id);
-                if finished(i) {
-                    balancer.release(seq_id);
+            for item in &stream.items {
+                balancer.prefill_done(item.seq_id);
+                if item.finished {
+                    balancer.release(item.seq_id);
                 }
             }
         }
-        let mut offset = 0usize;
         let mut ended = Vec::new();
-        for (i, (&seq_id, &count)) in batch.seq_ids.iter().zip(&batch.token_counts).enumerate() {
-            let tokens = &batch.tokens[offset..offset + count as usize];
-            offset += count as usize;
-            let Some(mut slot) = self.seqs.get_mut(&seq_id) else {
+        for item in &stream.items {
+            let Some(mut slot) = self.seqs.get_mut(&item.seq_id) else {
                 continue;
             };
-            if let Some(&cached) = batch.num_cached_tokens.get(i) {
-                slot.cached_tokens = cached as u32;
-            }
-            let tokens: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
+            slot.cached_tokens = item.num_cached_tokens as u32;
+            let tokens = item.output_tokens.clone();
             if !tokens.is_empty() {
                 let now = Instant::now();
                 slot.first_token.get_or_insert(now);
@@ -568,12 +554,11 @@ impl Shared {
             if slot.stream {
                 let _ = slot.events.send(SeqEvent::Tokens(tokens));
             }
-            if finished(i) && !slot.needs_completion {
-                ended.push((seq_id, i as u32));
+            if item.finished && !slot.needs_completion {
+                ended.push((item.seq_id, item.finish_reason.clone().unwrap_or_default()));
             }
         }
-        for (seq_id, i) in ended {
-            let leave_reason = batch.finish_reasons.get(&i).cloned().unwrap_or_default();
+        for (seq_id, leave_reason) in ended {
             self.end(seq_id, |slot| {
                 SeqEvent::Finished(Finished {
                     token_ids: std::mem::take(&mut slot.tokens),

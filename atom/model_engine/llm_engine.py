@@ -20,13 +20,13 @@ from atom.model_engine.admission import (
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.prefix_hash import hash_block_size_for, ship_prompt_hash_chain
 from atom.model_engine.segment_tokenizer import PrefixEncoding, SegmentTokenizer
-from atom.model_engine.sequence import Sequence, media_cache_seed
-from atom.model_engine.zmq_protocol.requests import (
-    CompletionResult,
-    IngressRequest,
-    prompt_token_array,
+from atom.model_engine.sequence import (
+    PER_REQ_CACHE_MODEL_TYPES,
+    Sequence,
+    media_cache_seed,
 )
-from atom.sampling_params import EngineChannel, SamplingParams
+from atom.multimodal.registry import uses_mrope
+from atom.sampling_params import EngineChannel, RequiredChannel, SamplingParams
 from atom.structured_output import is_structured
 from atom.structured_output.validation import (
     WorkerGrammarPreflight,
@@ -262,7 +262,7 @@ class LLMEngine:
             self.io_processor.forget([req.id for req in reqs])
             raise
 
-    def step(self) -> list[CompletionResult]:
+    def step(self) -> list[Sequence]:
         seqs = self.core_mgr.get_output()
         return seqs
 
@@ -687,15 +687,24 @@ class InputOutputProcessor:
         self.block_size = block_size
         self.structured_admission = None
         self.requests = {}
-        self.engine_channel = EngineChannel(config)
+        # The one channel `tool_choice="required"` holds this engine's requests
+        # to (`_engine_channel`); the EngineCore holds its own the same way.
+        self._channel = EngineChannel(config)
         self.segment_tokenizer = SegmentTokenizer.maybe_create(
             tokenizer, envs.ATOM_TOKENIZE_CACHE_MB << 20
         )
+        # `has_per_req_cache` flags model architectures that need a
+        # per-request stateful buffer outside the paged KV pool. Sequences
+        # constructed for these models trigger BlockManager to reserve a
+        # per-req cache slot. Currently: GDN-based models (Qwen3-Next /
+        # Qwen3.5). Future stateful models (DeepseekV4, etc.) extend the set.
         self._external_to_internal: dict[str, int] = {}
         self._internal_to_external: dict[int, str] = {}
-        # Only for the model's own request validation up front; the engine
-        # derives the sequence's draft width from its own config.
+        self.has_per_req_cache = False
         self.num_speculative_tokens = num_draft_tokens(config)
+        self.uses_mrope = uses_mrope(config)
+        if self.config.hf_config.model_type in self._per_req_cache_model_types():
+            self.has_per_req_cache = True
         # `BlockManager.hash_block_size`, for shipping the prompt hash chain;
         # 0 = no prefix cache. The engine rehashes on a mismatch.
         self.prefix_hash_block_size = 0
@@ -704,6 +713,18 @@ class InputOutputProcessor:
             self.prefix_hash_block_size = hash_block_size_for(
                 block_size, config.decode_context_parallel_size
             )
+
+    @staticmethod
+    def _per_req_cache_model_types() -> frozenset[str]:
+        """Single source of truth for which model_types use per-req cache.
+
+        Read by Sequence-construction (here) AND by ModelRunner's startup
+        sanity check, which asserts that any model whose attention builder
+        declares a per-request state sub-pool has its model_type
+        registered here. Adding a new stateful-attention model means
+        adding its model_type to this set.
+        """
+        return PER_REQ_CACHE_MODEL_TYPES
 
     def preprocess(
         self,
@@ -719,11 +740,11 @@ class InputOutputProcessor:
     ):
         """responsible for:
         1) Tokenize
-        2) Create the IngressRequest
+        2) Create Sequence object
 
         Single-sequence entry point. Rejects ``sampling_params.n > 1`` so that
-        callers which expect exactly one request back cannot silently drop the
-        other siblings. Use :meth:`preprocess_fanout` for n > 1.
+        callers which expect exactly one ``Sequence`` back cannot silently
+        drop the other siblings. Use :meth:`preprocess_fanout` for n > 1.
         """
         if getattr(sampling_params, "n", 1) > 1:
             raise ValueError(
@@ -742,6 +763,23 @@ class InputOutputProcessor:
             dp_parent_session_id=dp_parent_session_id,
         )
         return seqs[0]
+
+    def _engine_channel(self, channel: RequiredChannel) -> RequiredChannel:
+        """The channel a required request is held to on this engine.
+
+        Hold its opening against every single id this engine ends a sequence
+        on (`Scheduler.postprocess` stops on EOS and on `stop_token_ids`), not
+        just the ones the tool-call format named. The third way a sequence
+        ends, the request's own `stop` strings, is left to end it: the client
+        asked for that stop, and a multi-token match is not one logits row's
+        mask.
+
+        Built once, from the first required request, and shared by every
+        later one. A request naming a different channel is refused here, at
+        admission, where it fails alone; the engine loop batches every
+        request together and holds one channel (`EngineChannel`).
+        """
+        return self._channel.hold(channel)
 
     def encode_prompt(
         self, prompt: str, *, multimodal: bool = False
@@ -775,16 +813,15 @@ class InputOutputProcessor:
         data_parallel_rank: int | None = None,
         dp_session_id: str | None = None,
         dp_parent_session_id: str | None = None,
-    ) -> list[IngressRequest]:
-        """Tokenize once and materialize ``sampling_params.n`` IngressRequests.
+    ) -> list[Sequence]:
+        """Tokenize once and materialize ``sampling_params.n`` Sequences.
 
         Returns a list of length ``n``. For ``n == 1`` this is functionally
         equivalent to the legacy single-sequence path. For ``n > 1``:
 
-        * The prompt is tokenized a single time and every sibling shares that
-          one token array -- and so does the message that carries them, which
-          sends it once. Each sibling's ``Sequence`` is built in the engine,
-          with a copy of its own.
+        * The prompt is tokenized a single time and the token list is copied
+          into each sibling (``Sequence`` copies internally, so mutations stay
+          isolated).
         * Every sibling is marked ``needs_independent_noise=True`` so the
           sampler generates fresh per-row noise instead of reusing the cached
           shared exponential tensor. Without this, siblings with identical
@@ -793,6 +830,7 @@ class InputOutputProcessor:
           deltas to independent queues (one per choice index). Falls back to
           the scalar ``stream_callback`` for every sibling.
         """
+        # What the EngineCore checks again (`admission.check_sampling`).
         check_sampling(
             self.config,
             sampling_params,
@@ -823,7 +861,7 @@ class InputOutputProcessor:
             prefix_encoding = None
             tokens = prompt_or_tokens
         mrope_positions, mrope_position_delta = mrope_for(
-            self.config, tokens, multimodal_data
+            self.config, tokens, multimodal_data, uses_mrope=self.uses_mrope
         )
 
         stop_token_sequences = []
@@ -841,9 +879,7 @@ class InputOutputProcessor:
         if sampling_params.required_channel is not None:
             sampling_params = replace(
                 sampling_params,
-                required_channel=self.engine_channel.hold(
-                    sampling_params.required_channel
-                ),
+                required_channel=self._engine_channel(sampling_params.required_channel),
             )
 
         if stream_callbacks is not None and len(stream_callbacks) != n:
@@ -851,39 +887,35 @@ class InputOutputProcessor:
                 f"stream_callbacks length {len(stream_callbacks)} does not match n={n}"
             )
 
-        prompt = prompt_token_array(tokens)
-        if not prompt:
-            # What `Sequence` raised on an empty prompt, still raised here.
-            raise IndexError("array index out of range")
-        # The media's content hash, which `Sequence` would otherwise compute in
-        # the engine's input thread: once here, for every sibling.
+        # The media's content hash, once for every sibling.
         cache_seed = media_cache_seed(multimodal_data)
-
-        seqs: list[IngressRequest] = []
+        seqs: list[Sequence] = []
         for i in range(n):
             cb = (
                 stream_callbacks[i] if stream_callbacks is not None else stream_callback
             )
-            seq = IngressRequest(
-                id=next(Sequence.counter),
-                prompt_token_ids=prompt,
-                sampling_params=sampling_params,
-                stop_token_sequences=stop_token_sequences,
+            seq = Sequence(
+                tokens,
+                self.block_size,
+                sampling_params,
+                stop_token_sequences,
                 stream_callback=cb,
+                num_draft_tokens=self.num_speculative_tokens,
+                has_per_req_cache=self.has_per_req_cache,
                 kv_transfer_params=kv_transfer_params,
                 multimodal_data=multimodal_data,
-                cache_seed=cache_seed,
                 mrope_positions=mrope_positions,
                 mrope_position_delta=mrope_position_delta,
                 needs_independent_noise=(n > 1),
                 parent_request_id=parent_request_id,
                 sibling_index=i,
-                external_request_id=parent_request_id if n == 1 else None,
+                request_id=parent_request_id if n == 1 else None,
                 data_parallel_rank=data_parallel_rank,
                 dp_session_id=dp_session_id,
                 dp_parent_session_id=dp_parent_session_id,
-                arrive_time=time.time(),
+                cache_seed=cache_seed,
             )
+            seq.arrive_time = time.time()
             seqs.append(seq)
 
         for seq in seqs:
@@ -919,18 +951,13 @@ class InputOutputProcessor:
             )
         return seqs
 
-    def postprocess(self, reqs: list[CompletionResult]):
+    def postprocess(self, reqs: list[Sequence]):
         """responsible for:
         1) Compute stats for logging
         2) Detokenize"""
         outputs = {}
         for req in reqs:
-            ingress = self.requests.pop(req.id)
-            if req.rejected:
-                # Rejected (at admission, or its result did not arrive whole):
-                # it carries no arrival or prompt of its own.
-                req.arrive_time = ingress.arrive_time
-                req.num_prompt_tokens = ingress.num_prompt_tokens
+            self.requests.pop(req.id)
             external_request_id = self._internal_to_external.pop(req.id, None)
             if external_request_id is not None:
                 self._external_to_internal.pop(external_request_id, None)

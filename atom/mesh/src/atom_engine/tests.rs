@@ -1,20 +1,19 @@
-//! The wire framing, the launch spec, one Core's link and the client: a
+//! The wire encoding, the launch spec, one Core's link and the client: a
 //! message decodes back with its buffers and a malformed one is refused,
 //! `EngineSpec` parses a hand-written spec, a `CoreLink` handshakes with a
 //! fake Core on real ipc sockets and routes input and control to it, and gives
-//! up on a Core that stops before it is ready or exits, or when interrupted,
-//! and `EngineClient` drives fake Cores (`test_support`) through the
-//! protocol's every ending.
+//! up on a Core that stops before it is ready, speaks another protocol version
+//! or exits, or when interrupted, and `EngineClient` drives fake Cores
+//! (`test_support`) through the protocol's every ending.
 //!
 //! The protocol across languages: the Core's messages as Python encodes them
-//! (`tests/fixtures/engine_v1/core_*`, written by
-//! `tests/test_engine_v1_cross_language.py`) drive the client here, and the
+//! (`tests/fixtures/atom_engine/core_*`, written by
+//! `tests/test_engine_wire_cross_language.py`) drive the client here, and the
 //! client's own messages are kept as `client_*` there for Python to decode.
 //! `ATOM_UPDATE_FIXTURES=1` rewrites the `client_*` ones.
 
 use std::{future::poll_fn, path::PathBuf, thread, time::Duration};
 
-use prost::Message as _;
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -22,87 +21,96 @@ use super::{
     client::{EngineClient, SeqEvent, SeqFailure, SeqHandle, Submission},
     link::{self, CoreLink},
     spec::{BalanceStrategy, CoreSpec, EngineSpec},
-    test_support::{self, token_frame, FakeCore, WAIT},
-    wire::{self, pb, Inbound, PROTOCOL_VERSION},
+    test_support::{self, decoded, token_bytes, FakeCore, WAIT},
+    wire::{self, kind, reject, Inbound, PROTOCOL_VERSION},
 };
 
-fn inbound(frames: Vec<Vec<u8>>) -> Result<Inbound, String> {
-    Inbound::decode(frames.into_iter().map(zmq::Message::from).collect())
-}
-
-fn buffer(frame: u32, offset: u64, nbytes: u64) -> Option<pb::BufferRef> {
-    Some(pb::BufferRef {
-        frame,
-        offset,
-        nbytes,
-    })
-}
-
-fn envelope_frame(protocol_version: u32, body: Option<pb::envelope::Body>) -> Vec<u8> {
-    pb::Envelope {
-        protocol_version,
-        body,
-    }
-    .encode_to_vec()
+fn float_bytes(values: &[f64]) -> serde_bytes::ByteBuf {
+    serde_bytes::ByteBuf::from(
+        values
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    )
 }
 
 #[test]
-fn a_message_decodes_back_with_the_buffers_its_refs_name() {
-    let floats: Vec<u8> = [0.5f64, -1.25]
-        .iter()
-        .flat_map(|f| f.to_le_bytes())
-        .collect();
-    let completion = pb::Completion {
-        completion_token_ids: buffer(1, 4, 8),
-        logprobs: buffer(2, 0, 16),
+fn a_completion_decodes_back_with_its_tokens_and_logprobs() {
+    let completion = wire::Completion {
+        seq_id: 4,
+        completion_tokens: token_bytes(&[8, -1]),
+        logprobs_bytes: Some(float_bytes(&[0.5, -1.25])),
+        leave_reason: "stop".into(),
         ..Default::default()
     };
-    let body = pb::envelope::Body::Completions(pb::Completions {
-        items: vec![completion],
-    });
-    let frames = wire::encode(body, vec![wire::token_frame(&[7, 8, u32::MAX]), floats]);
-    assert_eq!(frames.len(), 3);
-
-    let message = inbound(frames).unwrap();
-    let pb::envelope::Body::Completions(batch) = &message.body else {
-        panic!("decoded {:?}", message.body);
+    let message = wire::encode(
+        kind::ADD,
+        &wire::Completions {
+            items: vec![completion.clone()],
+        },
+    );
+    let Inbound::Completions(done) = Inbound::decode(&message).unwrap() else {
+        panic!("not Completions");
     };
-    let completion = &batch.items[0];
+    assert_eq!(done.items, [completion]);
+    let item = &done.items[0];
     // u32::MAX crosses as int32 -1 and comes back as itself.
     assert_eq!(
-        message
-            .tokens(completion.completion_token_ids.as_ref())
-            .unwrap(),
-        vec![8, u32::MAX]
+        wire::tokens(&item.completion_tokens).unwrap(),
+        [8, u32::MAX]
     );
-    assert_eq!(
-        message.floats(completion.logprobs.as_ref()).unwrap(),
-        vec![0.5, -1.25]
-    );
-    assert!(message.tokens(None).unwrap().is_empty());
+    let logprobs = item.logprobs_bytes.as_ref().unwrap();
+    assert_eq!(wire::floats(logprobs).unwrap(), [0.5, -1.25]);
 }
 
 #[test]
-fn a_malformed_message_or_an_out_of_bounds_ref_is_refused() {
-    let stopped = || Some(pb::envelope::Body::Stopped(pb::Stopped {}));
-    assert!(inbound(vec![]).is_err());
-    assert!(inbound(vec![envelope_frame(PROTOCOL_VERSION, None)]).is_err());
-    let err = inbound(vec![envelope_frame(PROTOCOL_VERSION + 1, stopped())])
+fn a_malformed_message_is_refused_and_an_unknown_kind_ignored() {
+    assert!(Inbound::decode(&[]).is_err());
+    assert!(Inbound::decode(b"not msgpack").is_err());
+    // Three items, not [kind, body].
+    let err = Inbound::decode(&rmp_serde::to_vec(&(6u8, 1u8, 2u8)).unwrap())
         .err()
         .unwrap();
-    assert!(err.contains("protocol version"), "{err}");
+    assert!(err.contains("[kind, body]"), "{err}");
+    // A Stream whose body is not one.
+    assert!(Inbound::decode(&rmp_serde::to_vec(&(kind::STREAM, "x")).unwrap()).is_err());
+    // A kind only the Python client reads (METRICS) is no error.
+    let metrics = rmp_serde::to_vec(&(9u8, (serde_bytes::Bytes::new(b"pickled"),))).unwrap();
+    assert!(matches!(Inbound::decode(&metrics), Ok(Inbound::Ignored(9))));
+    // Not a whole number of elements.
+    assert!(wire::tokens(&[0; 6]).is_err());
+    assert!(wire::floats(&[0; 12]).is_err());
+}
 
-    let message = inbound(vec![
-        envelope_frame(PROTOCOL_VERSION, stopped()),
-        vec![0; 8],
-    ])
-    .unwrap();
-    // Frame 0 is the envelope, never a buffer.
-    let err = message.tokens(buffer(0, 0, 4).as_ref()).err().unwrap();
-    assert!(err.contains("envelope"), "{err}");
-    assert!(message.tokens(buffer(1, 4, 8).as_ref()).is_err());
-    // Within the frame, but not a whole number of elements.
-    assert!(message.tokens(buffer(1, 0, 6).as_ref()).is_err());
+#[test]
+fn a_reader_fills_missing_trailing_fields_and_skips_unknown_ones() {
+    // A Completion from an older Core: no fields past `leave_reason`.
+    let old = (
+        9u64,
+        serde_bytes::Bytes::new(&[]),
+        None::<()>,
+        false,
+        3u32,
+        0u64,
+        1.0f64,
+        2.0f64,
+        "eos",
+    );
+    let message = rmp_serde::to_vec(&(kind::ADD, (vec![old],))).unwrap();
+    let Inbound::Completions(done) = Inbound::decode(&message).unwrap() else {
+        panic!("not Completions");
+    };
+    assert_eq!(done.items[0].seq_id, 9);
+    assert_eq!(done.items[0].leave_reason, "eos");
+    assert_eq!(done.items[0].reject_code, reject::FINISHED);
+
+    // A Ready from a newer Core: one field this client does not know.
+    let newer = (PROTOCOL_VERSION, Some(64u64), json!({}), "a later field");
+    let message = rmp_serde::to_vec(&(kind::READY, newer)).unwrap();
+    let Inbound::Ready(ready) = Inbound::decode(&message).unwrap() else {
+        panic!("not Ready");
+    };
+    assert_eq!(ready.max_pool_tokens, Some(64));
 }
 
 fn spec_json() -> serde_json::Value {
@@ -150,12 +158,12 @@ fn core_spec(dir: &TempDir, pid: u32) -> CoreSpec {
 
 /// Connect as EngineCore does (a DEALER on input and control, each announcing
 /// itself with an empty frame; a PUSH on output), send `first`, then hand
-/// back the next message on input and on control, or none if either does not
-/// come within the receive timeout.
-fn fake_core(
-    spec: CoreSpec,
-    first: pb::envelope::Body,
-) -> thread::JoinHandle<Option<[Inbound; 2]>> {
+/// back the next message on input and on control (kind and body), or none
+/// if either does not come within the receive timeout.
+/// A message's kind and body.
+type Received = (u8, Vec<u8>);
+
+fn fake_core(spec: CoreSpec, first: Vec<u8>) -> thread::JoinHandle<Option<[Received; 2]>> {
     thread::spawn(move || {
         let ctx = zmq::Context::new();
         let dealer = |address: &str| {
@@ -171,10 +179,12 @@ fn fake_core(
         let control = dealer(&spec.control);
         let output = ctx.socket(zmq::PUSH).unwrap();
         output.connect(&spec.output).unwrap();
-        output
-            .send_multipart(wire::encode(first, vec![]), 0)
-            .unwrap();
-        let receive = |socket: &zmq::Socket| Inbound::decode(link::recv_frames(socket).ok()?).ok();
+        output.send(first, 0).unwrap();
+        let receive = |socket: &zmq::Socket| {
+            let frames = link::recv_frames(socket).ok()?;
+            let (kind, body) = wire::split(&frames[0]).ok()?;
+            Some((kind, body.to_vec()))
+        };
         Some([receive(&input)?, receive(&control)?])
     })
 }
@@ -183,54 +193,47 @@ fn never_interrupted() -> bool {
     false
 }
 
+fn ready(max_pool_tokens: Option<u64>) -> Vec<u8> {
+    wire::encode(
+        kind::READY,
+        &wire::Ready {
+            max_pool_tokens,
+            ..Default::default()
+        },
+    )
+}
+
 #[test]
 fn a_link_handshakes_and_routes_input_and_control_to_their_core() {
     let dir = TempDir::new().unwrap();
     let spec = core_spec(&dir, std::process::id());
-    let ready = pb::envelope::Body::Ready(pb::Ready {
-        max_pool_tokens: Some(4096),
-        ..Default::default()
-    });
-    let core = fake_core(spec.clone(), ready);
+    let core = fake_core(spec.clone(), ready(Some(4096)));
 
     let ctx = zmq::Context::new();
     let (link, _output, max_pool_tokens) =
         CoreLink::connect(&ctx, spec, &never_interrupted).unwrap();
     assert_eq!(max_pool_tokens, Some(4096));
 
-    let tokens = wire::token_frame(&[1, 2, 3]);
-    let submit = pb::SubmitBatch {
-        requests: vec![pb::RequestSpec {
-            prompt_token_ids: buffer(1, 0, tokens.len() as u64),
+    let submit = wire::Submit {
+        items: vec![wire::SubmitItem {
+            prompt: token_bytes(&[1, 2, 3]),
             ..Default::default()
         }],
     };
-    link.send_input(wire::encode(
-        pb::envelope::Body::Submit(submit),
-        vec![tokens],
-    ))
-    .unwrap();
-    let abort = pb::Abort { seq_ids: vec![7] };
-    link.send_control(wire::encode(pb::envelope::Body::Abort(abort), vec![]))
+    link.send_input(wire::encode(kind::ADD, &submit)).unwrap();
+    let abort = wire::Abort { seq_ids: vec![7] };
+    link.send_control(wire::encode(kind::ABORT, &abort))
         .unwrap();
 
-    let [input, control] = core
+    let [(input_kind, input), (control_kind, control)] = core
         .join()
         .unwrap()
         .expect("the core received both messages");
-    let pb::envelope::Body::Submit(batch) = &input.body else {
-        panic!("input carried {:?}", input.body);
-    };
-    assert_eq!(
-        input
-            .tokens(batch.requests[0].prompt_token_ids.as_ref())
-            .unwrap(),
-        vec![1, 2, 3]
-    );
-    assert!(matches!(
-        &control.body,
-        pb::envelope::Body::Abort(a) if a.seq_ids == [7]
-    ));
+    assert_eq!(input_kind, kind::ADD);
+    let batch: wire::Submit = decoded(&input);
+    assert_eq!(wire::tokens(&batch.items[0].prompt).unwrap(), [1, 2, 3]);
+    assert_eq!(control_kind, kind::ABORT);
+    assert_eq!(decoded::<wire::Abort>(&control).seq_ids, [7]);
 }
 
 #[test]
@@ -248,7 +251,7 @@ fn a_link_gives_up_on_a_core_that_exits() {
 fn a_link_refuses_a_core_that_stops_before_it_is_ready() {
     let dir = TempDir::new().unwrap();
     let spec = core_spec(&dir, std::process::id());
-    let core = fake_core(spec.clone(), pb::envelope::Body::Stopped(pb::Stopped {}));
+    let core = fake_core(spec.clone(), wire::encode(kind::SHUTDOWN, &wire::Empty {}));
 
     let ctx = zmq::Context::new();
     let err = CoreLink::connect(&ctx, spec, &never_interrupted)
@@ -256,6 +259,24 @@ fn a_link_refuses_a_core_that_stops_before_it_is_ready() {
         .unwrap();
     assert!(err.contains("stopped before it was ready"), "{err}");
     // The link sent the Core nothing.
+    assert!(core.join().unwrap().is_none());
+}
+
+#[test]
+fn a_link_refuses_a_core_of_another_protocol_version() {
+    let dir = TempDir::new().unwrap();
+    let spec = core_spec(&dir, std::process::id());
+    let newer = wire::Ready {
+        protocol_version: PROTOCOL_VERSION + 1,
+        ..Default::default()
+    };
+    let core = fake_core(spec.clone(), wire::encode(kind::READY, &newer));
+
+    let ctx = zmq::Context::new();
+    let err = CoreLink::connect(&ctx, spec, &never_interrupted)
+        .err()
+        .unwrap();
+    assert!(err.contains("protocol"), "{err}");
     assert!(core.join().unwrap().is_none());
 }
 
@@ -295,11 +316,11 @@ impl Harness {
     }
 
     fn submit(&self, n: u32, stream: bool, logprobs: bool) -> Vec<SeqHandle> {
-        let sampling = pb::SamplingParams {
-            temperature: Some(1.0),
-            max_tokens: Some(8),
-            n: Some(n),
-            logprobs: logprobs.then_some(pb::sampling_params::Logprobs::LogprobsFlag(true)),
+        let sampling = wire::Sampling {
+            temperature: 1.0,
+            max_tokens: 8,
+            n,
+            logprobs: logprobs.then_some(true),
             ..Default::default()
         };
         self.client
@@ -317,15 +338,11 @@ impl Harness {
     }
 
     /// The Core the first submission went to, and what it received.
-    fn first_submission(&self) -> (usize, Vec<pb::RequestSpec>, Vec<Vec<u8>>) {
+    fn first_submission(&self) -> (usize, Vec<wire::SubmitItem>) {
         for (rank, core) in self.cores.iter().enumerate() {
-            if let Some((specs, data)) = FakeCore::recv_on(&core.input, Duration::from_millis(500))
-                .map(|(body, data)| match body {
-                    pb::envelope::Body::Submit(batch) => (batch.requests, data),
-                    other => panic!("expected SubmitBatch, got {other:?}"),
-                })
-            {
-                return (rank, specs, data);
+            if let Some((kind, body)) = FakeCore::recv_on(&core.input, Duration::from_millis(500)) {
+                assert_eq!(kind, kind::ADD, "expected Submit");
+                return (rank, decoded::<wire::Submit>(&body).items);
             }
         }
         panic!("no Core received the submission");
@@ -346,20 +363,18 @@ async fn ready_sets_the_pool_limit_and_a_stream_ends_on_its_finished_entry() {
     assert_eq!(harness.client.core_count(), 2);
 
     let mut handles = harness.submit(1, true, false);
-    let (rank, specs, data) = harness.first_submission();
-    let [spec] = &specs[..] else {
-        panic!("expected one RequestSpec, got {specs:?}")
+    let (rank, items) = harness.first_submission();
+    let [item] = &items[..] else {
+        panic!("expected one SubmitItem, got {items:?}")
     };
-    assert_eq!(spec.data_parallel_rank, Some(rank as i64));
-    assert_eq!(spec.external_request_id.as_deref(), Some("req"));
-    assert!(!spec.needs_independent_noise);
-    let prompt = spec.prompt_token_ids.as_ref().unwrap();
-    assert_eq!(prompt.frame, 1);
-    assert_eq!(data[0], token_frame(&[11, 12, 13]));
+    assert_eq!(item.data_parallel_rank, Some(rank as i64));
+    assert_eq!(item.external_request_id.as_deref(), Some("req"));
+    assert!(!item.needs_independent_noise);
+    assert_eq!(wire::tokens(&item.prompt).unwrap(), [11, 12, 13]);
 
     let core = &harness.cores[rank];
-    core.stream(&[(spec.seq_id, &[7], None)]);
-    core.stream(&[(spec.seq_id, &[8], Some("eos"))]);
+    core.stream(&[(item.seq_id, &[7], None)]);
+    core.stream(&[(item.seq_id, &[8], Some("eos"))]);
     let handle = &mut handles[0];
     assert!(matches!(next_event(handle).await, SeqEvent::Tokens(t) if t == [7]));
     assert!(matches!(next_event(handle).await, SeqEvent::Tokens(t) if t == [8]));
@@ -374,41 +389,28 @@ async fn ready_sets_the_pool_limit_and_a_stream_ends_on_its_finished_entry() {
     }
 }
 
+fn completions(items: Vec<wire::Completion>) -> wire::Completions {
+    wire::Completions { items }
+}
+
 #[tokio::test]
 async fn a_logprobs_request_ends_on_its_completion() {
     let harness = Harness::start(&[None]);
     let mut handles = harness.submit(1, false, true);
-    let (_, specs, _) = harness.first_submission();
-    let seq_id = specs[0].seq_id;
+    let (_, items) = harness.first_submission();
+    let seq_id = items[0].seq_id;
     let core = &harness.cores[0];
     // Its finished stream entry does not end it: only the Completion has logprobs.
     core.stream(&[(seq_id, &[5, 6], Some("max_tokens"))]);
-    let completion = pb::Completion {
+    let completion = wire::Completion {
         seq_id,
-        completion_token_ids: Some(pb::BufferRef {
-            frame: 1,
-            offset: 0,
-            nbytes: 8,
-        }),
-        logprobs: Some(pb::BufferRef {
-            frame: 2,
-            offset: 0,
-            nbytes: 16,
-        }),
+        completion_tokens: token_bytes(&[5, 6]),
+        logprobs_bytes: Some(float_bytes(&[-0.5, -1.25])),
         num_prompt_tokens: 3,
         leave_reason: "max_tokens".into(),
         ..Default::default()
     };
-    let logprobs: Vec<u8> = [-0.5f64, -1.25]
-        .iter()
-        .flat_map(|v| v.to_le_bytes())
-        .collect();
-    core.send(
-        pb::envelope::Body::Completions(pb::Completions {
-            items: vec![completion],
-        }),
-        vec![token_frame(&[5, 6]), logprobs],
-    );
+    core.send(kind::ADD, &completions(vec![completion]));
     match next_event(&mut handles[0]).await {
         SeqEvent::Finished(done) => {
             assert_eq!(done.token_ids, [5, 6]);
@@ -420,28 +422,24 @@ async fn a_logprobs_request_ends_on_its_completion() {
 }
 
 #[tokio::test]
-async fn rejections_map_to_failures_by_code() {
-    use pb::rejected_request::Code;
+async fn refusals_map_to_failures_by_code() {
     let harness = Harness::start(&[None]);
-    for (code, expect_invalid) in [(Code::Invalid, true), (Code::Overloaded, false)] {
+    for (code, expect_invalid) in [(reject::INVALID, true), (reject::OVERLOADED, false)] {
         let mut handles = harness.submit(1, false, false);
-        let (_, specs, _) = harness.first_submission();
-        harness.cores[0].send(
-            pb::envelope::Body::Rejected(pb::Rejected {
-                items: vec![pb::RejectedRequest {
-                    seq_id: specs[0].seq_id,
-                    reason: "no".into(),
-                    code: code as i32,
-                }],
-            }),
-            vec![],
-        );
+        let (_, items) = harness.first_submission();
+        let refused = wire::Completion {
+            seq_id: items[0].seq_id,
+            leave_reason: "rejected: no".into(),
+            reject_code: code,
+            ..Default::default()
+        };
+        harness.cores[0].send(kind::ADD, &completions(vec![refused]));
         match next_event(&mut handles[0]).await {
             SeqEvent::Failed(SeqFailure::Invalid(reason)) if expect_invalid => {
                 assert_eq!(reason, "no")
             }
             SeqEvent::Failed(SeqFailure::Unavailable(_)) if !expect_invalid => {}
-            other => panic!("{code:?}: unexpected {other:?}"),
+            other => panic!("{code}: unexpected {other:?}"),
         }
     }
 }
@@ -450,30 +448,27 @@ async fn rejections_map_to_failures_by_code() {
 async fn dropping_an_unfinished_handle_aborts_its_sequence() {
     let harness = Harness::start(&[None]);
     let handles = harness.submit(1, true, false);
-    let (_, specs, _) = harness.first_submission();
+    let (_, items) = harness.first_submission();
     drop(handles);
-    match harness.cores[0].control_message() {
-        pb::envelope::Body::Abort(abort) => assert_eq!(abort.seq_ids, [specs[0].seq_id]),
-        other => panic!("expected Abort, got {other:?}"),
-    }
+    let (kind, body) = harness.cores[0].control_message();
+    assert_eq!(kind, kind::ABORT);
+    assert_eq!(decoded::<wire::Abort>(&body).seq_ids, [items[0].seq_id]);
 }
 
 #[tokio::test]
-async fn siblings_spread_over_ranks_and_share_one_prompt_frame() {
+async fn siblings_spread_over_ranks_each_with_the_prompt() {
     let harness = Harness::start(&[None, None]);
     let handles = harness.submit(4, false, false);
     assert_eq!(handles.len(), 4);
     let mut siblings = Vec::new();
     for core in &harness.cores {
-        let (specs, data) = core.submitted().expect("each rank gets its share");
-        assert_eq!(data.len(), 1, "one prompt frame per message");
-        assert_eq!(data[0], token_frame(&[11, 12, 13]));
-        for spec in specs {
-            assert!(spec.needs_independent_noise);
-            assert_eq!(spec.external_request_id, None);
-            assert_eq!(spec.parent_request_id.as_deref(), Some("req"));
-            assert_eq!(spec.prompt_token_ids.as_ref().unwrap().frame, 1);
-            siblings.push(spec.sibling_index);
+        let items = core.submitted().expect("each rank gets its share");
+        for item in items {
+            assert!(item.needs_independent_noise);
+            assert_eq!(item.external_request_id, None);
+            assert_eq!(item.parent_request_id.as_deref(), Some("req"));
+            assert_eq!(wire::tokens(&item.prompt).unwrap(), [11, 12, 13]);
+            siblings.push(item.sibling_index);
         }
     }
     siblings.sort();
@@ -484,9 +479,9 @@ async fn siblings_spread_over_ranks_and_share_one_prompt_frame() {
 async fn a_core_that_stops_unasked_loses_the_client() {
     let harness = Harness::start(&[None, None]);
     let mut handles = harness.submit(1, true, false);
-    let (rank, _, _) = harness.first_submission();
+    let (rank, _) = harness.first_submission();
     assert_eq!(harness.client.lost(), None);
-    harness.cores[rank].send(pb::envelope::Body::Stopped(pb::Stopped {}), vec![]);
+    harness.cores[rank].send(kind::SHUTDOWN, &wire::Empty {});
     assert!(matches!(
         next_event(&mut handles[0]).await,
         SeqEvent::Failed(SeqFailure::Unavailable(_))
@@ -514,25 +509,17 @@ async fn a_core_that_stops_unasked_loses_the_client() {
 
 #[tokio::test]
 async fn an_undecodable_output_loses_its_core() {
-    // One envelope that does not decode, one whose stream columns disagree:
+    // One message that is not msgpack, one Stream that is not a Stream:
     // either may have held a sequence's end, so the Core is lost with them.
     let bad_outputs = [
-        vec![b"not an envelope".to_vec()],
-        wire::encode(
-            pb::envelope::Body::Stream(pb::StreamBatch {
-                seq_ids: vec![1, 2],
-                token_counts: vec![1],
-                tokens: vec![7],
-                ..Default::default()
-            }),
-            vec![],
-        ),
+        b"not msgpack".to_vec(),
+        rmp_serde::to_vec(&(kind::STREAM, "x")).unwrap(),
     ];
-    for frames in bad_outputs {
+    for message in bad_outputs {
         let harness = Harness::start(&[None, None]);
         let mut handles = harness.submit(1, true, false);
-        let (rank, _, _) = harness.first_submission();
-        harness.cores[rank].send_frames(frames);
+        let (rank, _) = harness.first_submission();
+        harness.cores[rank].send_raw(message);
         assert!(matches!(
             next_event(&mut handles[0]).await,
             SeqEvent::Failed(SeqFailure::Unavailable(_))
@@ -558,11 +545,8 @@ async fn shutdown_asks_every_core_to_stop_and_waits_for_them() {
     let cores = harness.cores;
     let replies = thread::spawn(move || {
         for core in &cores {
-            assert!(matches!(
-                core.control_message(),
-                pb::envelope::Body::Shutdown(_)
-            ));
-            core.send(pb::envelope::Body::Stopped(pb::Stopped {}), vec![]);
+            assert_eq!(core.control_message().0, kind::SHUTDOWN);
+            core.send(kind::SHUTDOWN, &wire::Empty {});
         }
         cores
     });
@@ -580,9 +564,8 @@ async fn an_explicit_rank_places_every_sibling_there() {
         harness.client.submit(Submission {
             request_id: "req",
             prompt: &[1, 2],
-            sampling: pb::SamplingParams {
-                temperature: Some(1.0),
-                n: Some(3),
+            sampling: wire::Sampling {
+                n: 3,
                 ..Default::default()
             },
             stop_token_sequences: vec![],
@@ -593,8 +576,8 @@ async fn an_explicit_rank_places_every_sibling_there() {
         })
     };
     let _handles = submit(1).unwrap();
-    let (specs, _) = harness.cores[1].submitted().expect("rank 1 gets them all");
-    assert_eq!(specs.len(), 3);
+    let items = harness.cores[1].submitted().expect("rank 1 gets them all");
+    assert_eq!(items.len(), 3);
     assert!(FakeCore::recv_on(&harness.cores[0].input, Duration::from_millis(200)).is_none());
     assert!(matches!(submit(2), Err(SeqFailure::Invalid(_))));
 }
@@ -603,29 +586,20 @@ async fn an_explicit_rank_places_every_sibling_there() {
 async fn a_logprobs_request_reports_the_prefix_hit_not_the_computed_kv() {
     let harness = Harness::start(&[None]);
     let mut handles = harness.submit(1, false, true);
-    let (_, specs, _) = harness.first_submission();
+    let (_, items) = harness.first_submission();
     let core = &harness.cores[0];
     // The stream says 3 prompt tokens hit the cache ...
-    core.stream(&[(specs[0].seq_id, &[5], Some("max_tokens"))]);
+    core.stream(&[(items[0].seq_id, &[5], Some("max_tokens"))]);
     // ... while the Completion counts all the prompt's KV as computed.
-    let completion = pb::Completion {
-        seq_id: specs[0].seq_id,
-        completion_token_ids: Some(pb::BufferRef {
-            frame: 1,
-            offset: 0,
-            nbytes: 4,
-        }),
+    let completion = wire::Completion {
+        seq_id: items[0].seq_id,
+        completion_tokens: token_bytes(&[5]),
         num_prompt_tokens: 3,
         num_cached_tokens: 3_000,
         leave_reason: "max_tokens".into(),
         ..Default::default()
     };
-    core.send(
-        pb::envelope::Body::Completions(pb::Completions {
-            items: vec![completion],
-        }),
-        vec![token_frame(&[5])],
-    );
+    core.send(kind::ADD, &completions(vec![completion]));
     match next_event(&mut handles[0]).await {
         SeqEvent::Finished(done) => assert_eq!(done.cached_tokens, 3),
         other => panic!("expected Finished, got {other:?}"),
@@ -636,9 +610,9 @@ async fn a_logprobs_request_reports_the_prefix_hit_not_the_computed_kv() {
 async fn an_ended_handle_dropped_later_sends_no_abort() {
     let harness = Harness::start(&[None]);
     let mut handles = harness.submit(1, false, false);
-    let (_, specs, _) = harness.first_submission();
+    let (_, items) = harness.first_submission();
     let core = &harness.cores[0];
-    core.stream(&[(specs[0].seq_id, &[9], Some("eos"))]);
+    core.stream(&[(items[0].seq_id, &[9], Some("eos"))]);
     assert!(matches!(
         next_event(&mut handles[0]).await,
         SeqEvent::Finished(_)
@@ -662,64 +636,62 @@ async fn shutdown_fails_what_is_still_in_flight() {
     assert_eq!(harness.client.lost(), None);
 }
 
+fn fixture_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/atom_engine")
+}
+
 fn fixture(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/engine_v1")
-        .join(format!("{name}.frames"))
+    fixture_dir().join(format!("{name}.msgpack"))
 }
 
-/// A message as `u32le length, bytes` per frame, as the Python test keeps it.
-fn read_fixture(name: &str) -> Vec<Vec<u8>> {
+/// A message as the Python test keeps it: its one frame's bytes.
+fn read_fixture(name: &str) -> Vec<u8> {
     let path = fixture(name);
-    let data = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    let mut frames = Vec::new();
-    let mut rest = &data[..];
-    while !rest.is_empty() {
-        let n = u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
-        frames.push(rest[4..4 + n].to_vec());
-        rest = &rest[4 + n..];
-    }
-    frames
+    std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
-/// The next whole message on `socket`, frames as sent.
-fn raw_message(socket: &zmq::Socket) -> Vec<Vec<u8>> {
+/// The next message on `socket`, as sent.
+fn raw_message(socket: &zmq::Socket) -> Vec<u8> {
     assert!(
         socket.poll(zmq::POLLIN, WAIT.as_millis() as i64).unwrap() > 0,
         "no message within the timeout"
     );
-    socket.recv_multipart(0).unwrap()
+    socket.recv_bytes(0).unwrap()
+}
+
+/// A Submit with its arrival times zeroed: they are the clock's.
+fn timeless(message: &[u8]) -> wire::Submit {
+    let (kind, body) = wire::split(message).unwrap();
+    assert_eq!(kind, kind::ADD);
+    let mut submit: wire::Submit = decoded(body);
+    submit
+        .items
+        .iter_mut()
+        .for_each(|item| item.arrive_time = 0.0);
+    submit
 }
 
 /// Fail when any of the client's `messages` drifted from its fixture, which
 /// Python decodes; under `ATOM_UPDATE_FIXTURES`, rewrite them all and fail (a
 /// rewrite is not a pass).
-fn check_client_fixtures(messages: &[(&str, Vec<Vec<u8>>)]) {
+fn check_client_fixtures(messages: &[(&str, Vec<u8>)]) {
     if std::env::var_os("ATOM_UPDATE_FIXTURES").is_some() {
-        for (name, frames) in messages {
-            let mut data = Vec::new();
-            for frame in frames {
-                data.extend_from_slice(&(frame.len() as u32).to_le_bytes());
-                data.extend_from_slice(frame);
-            }
-            std::fs::write(fixture(name), data).unwrap();
+        for (name, message) in messages {
+            std::fs::write(fixture(name), message).unwrap();
         }
         panic!("rewrote the client_* fixtures; rerun without ATOM_UPDATE_FIXTURES");
     }
-    // Arrival times are the clock's; everything else must match.
-    let envelope = |frames: &[Vec<u8>]| {
-        let mut envelope = pb::Envelope::decode(&frames[0][..]).unwrap();
-        if let Some(pb::envelope::Body::Submit(batch)) = &mut envelope.body {
-            batch.requests.iter_mut().for_each(|r| r.arrive_time = 0.0);
-        }
-        envelope
-    };
-    for (name, frames) in messages {
+    for (name, message) in messages {
         let kept = read_fixture(name);
+        let same = if *name == "client_submit" {
+            timeless(message) == timeless(&kept)
+        } else {
+            *message == kept
+        };
         assert!(
-            envelope(frames) == envelope(&kept) && frames[1..] == kept[1..],
-            "{name}.frames is stale: rerun with ATOM_UPDATE_FIXTURES=1, then \
-             tests/test_engine_v1_cross_language.py against it"
+            same,
+            "{name}.msgpack is stale: rerun with ATOM_UPDATE_FIXTURES=1, then \
+             tests/test_engine_wire_cross_language.py against it"
         );
     }
 }
@@ -727,19 +699,15 @@ fn check_client_fixtures(messages: &[(&str, Vec<Vec<u8>>)]) {
 #[tokio::test]
 async fn the_clients_messages_match_what_python_decodes() {
     let harness = Harness::start(&[None]);
-    let sampling = pb::SamplingParams {
-        temperature: Some(0.7),
-        top_k: Some(20),
-        top_p: Some(0.9),
-        max_tokens: Some(64),
-        stop_strings: Some(pb::StopStrings {
-            value: Some(pb::stop_strings::Value::Many(pb::StringList {
-                items: vec!["\n\n".into()],
-            })),
-        }),
-        n: Some(2),
-        logprobs: Some(pb::sampling_params::Logprobs::LogprobsFlag(true)),
-        required_channel: Some(pb::RequiredChannel {
+    let sampling = wire::Sampling {
+        temperature: 0.7,
+        top_k: 20,
+        top_p: 0.9,
+        max_tokens: 64,
+        stop_strings: Some(vec!["\n\n".into()]),
+        n: 2,
+        logprobs: Some(true),
+        required_channel: Some(wire::RequiredChannel {
             after: vec![1],
             opening: vec![2, 3],
             opens_at: 1,
@@ -753,10 +721,7 @@ async fn the_clients_messages_match_what_python_decodes() {
             request_id: "req",
             prompt: &[11, 12, 13],
             sampling,
-            stop_token_sequences: vec![
-                pb::TokenIds { ids: vec![5, 6] },
-                pb::TokenIds { ids: vec![7] },
-            ],
+            stop_token_sequences: vec![vec![5, 6], vec![7]],
             n: 2,
             session: Some("sess"),
             rank: None,
@@ -779,50 +744,21 @@ async fn the_clients_messages_match_what_python_decodes() {
 
 #[tokio::test]
 async fn python_core_messages_drive_the_client() {
-    let decode = |name| {
-        inbound(read_fixture(name))
-            .unwrap_or_else(|e| panic!("{name}: {e}"))
-            .body
+    let decode =
+        |name| Inbound::decode(&read_fixture(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+    let Inbound::Ready(ready) = decode("core_ready") else {
+        panic!("core_ready is not Ready");
     };
-    assert!(matches!(
-        decode("core_ready"),
-        pb::envelope::Body::Ready(pb::Ready {
-            max_pool_tokens: Some(4096),
-            ..
-        })
-    ));
-    assert!(matches!(
-        decode("core_stopped"),
-        pb::envelope::Body::Stopped(_)
-    ));
-
-    // KV block ids packed, beside a value nested as deep as Python may send
-    // one (`wire.MAX_VALUE_DEPTH`): still under prost's recursion limit.
-    let pb::envelope::Body::Completions(deep) = decode("core_deep_completions") else {
-        panic!("core_deep_completions is not a Completions");
-    };
-    let params = deep.items[0].kv_transfer_params_output.as_ref().unwrap();
-    let Some(pb::value::Kind::MapValue(top)) = &params.kind else {
-        panic!("kv_transfer_params_output is not a map");
-    };
-    assert_eq!(
-        top.entries[0].value.as_ref().unwrap().kind,
-        Some(pb::value::Kind::IntListValue(pb::IntList {
-            items: vec![3, 1, 2]
-        }))
-    );
-    let (mut value, mut maps) = (params, 0);
-    while let Some(pb::value::Kind::MapValue(map)) = &value.kind {
-        maps += 1;
-        value = map.entries.last().unwrap().value.as_ref().unwrap();
-    }
-    assert_eq!(maps, 30);
-    assert_eq!(value.kind, Some(pb::value::Kind::IntValue(5)));
+    assert_eq!(ready.protocol_version, PROTOCOL_VERSION);
+    assert_eq!(ready.max_pool_tokens, Some(4096));
+    assert!(matches!(decode("core_stopped"), Inbound::Stopped));
+    // Only Python reads these.
+    assert!(matches!(decode("core_metrics"), Inbound::Ignored(_)));
 
     // Each harness's first sequence is 0, the one the fixtures name.
     let harness = Harness::start(&[None]);
     let mut handles = harness.submit(1, true, false);
-    harness.cores[0].send_frames(read_fixture("core_stream"));
+    harness.cores[0].send_raw(read_fixture("core_stream"));
     assert!(matches!(next_event(&mut handles[0]).await, SeqEvent::Tokens(t) if t == [7, 8]));
     match next_event(&mut handles[0]).await {
         SeqEvent::Finished(done) => {
@@ -835,7 +771,7 @@ async fn python_core_messages_drive_the_client() {
 
     let harness = Harness::start(&[None]);
     let mut handles = harness.submit(1, false, true);
-    harness.cores[0].send_frames(read_fixture("core_completions"));
+    harness.cores[0].send_raw(read_fixture("core_completions"));
     match next_event(&mut handles[0]).await {
         SeqEvent::Finished(done) => {
             assert_eq!(done.token_ids, [5, 6]);
@@ -850,18 +786,17 @@ async fn python_core_messages_drive_the_client() {
 
     let harness = Harness::start(&[None]);
     let mut handles = harness.submit(1, false, false);
-    harness.cores[0].send_frames(read_fixture("core_rejected"));
+    harness.cores[0].send_raw(read_fixture("core_rejected"));
     assert!(matches!(
         next_event(&mut handles[0]).await,
-        SeqEvent::Failed(SeqFailure::Invalid(reason)) if reason == "bad"
+        SeqEvent::Failed(SeqFailure::Invalid(reason)) if reason == "ValueError: bad"
     ));
 }
 
 #[test]
 fn the_spec_python_writes_parses() {
     // Written by tests/entrypoints/test_engine_spec.py (`build_engine_spec`).
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/engine_v1/engine_spec.json");
+    let path = fixture_dir().join("engine_spec.json");
     let json = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let spec = EngineSpec::from_json(&json).unwrap();
     let model = &spec.model;

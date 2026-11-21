@@ -36,17 +36,9 @@ from atom.model_engine.sequence import (
 )
 from atom.model_engine.state_runtime import StateRuntime
 from atom.model_engine.zmq_protocol.codec import (
-    REJECT_INTERNAL,
-    decode_client_message,
-    encode_completions,
-    encode_dp_reuse,
-    encode_metrics,
-    encode_prefill_backlog,
-    encode_ready,
-    encode_rejected,
-    encode_stopped,
-    encode_stream,
-    encode_utility_reply,
+    decode_input,
+    encode_output,
+    rejected,
     rejection_code,
 )
 from atom.observability import tracing
@@ -957,42 +949,27 @@ class EngineCore:
             # The scheduler's own prefetch still sends these lookups.
             logger.warning(f"{self.label}: offering tier lookups failed", exc_info=True)
 
-    def _admit(self, specs, failures, received_at: float) -> None:
-        """Build the decoded requests' sequences and hand them to the scheduler.
+    def _admit(self, items, received_at: float) -> tuple[list, int]:
+        """Build the submitted requests' sequences (`admission.build_sequence`).
 
-        A request whose sequence cannot be built is rejected back to its client
-        rather than dropped, so nothing waits on it; the rest of its batch is
-        admitted as usual.
+        A request whose sequence cannot be built is refused back to its
+        client rather than dropped, so nothing waits on it; the rest of its
+        batch is admitted as usual.
         """
         seqs = []
-        rejected = list(failures)
-        for spec in specs:
+        refused = []
+        for item in items:
             try:
-                seq = build_sequence(spec, self._admission)
+                seqs.append(build_sequence(item, self._admission))
             except Exception as exc:
-                # Reported to its client below; the batch-mates still run.
-                logger.exception(f"{self.label}: rejecting request {spec.seq_id}")
-                rejected.append(
-                    (spec.seq_id, f"{type(exc).__name__}: {exc}", rejection_code(exc))
+                # Refused below; the batch-mates still run.
+                logger.exception(f"{self.label}: rejecting request {item.seq_id}")
+                refused.append(
+                    rejected(item, f"{type(exc).__name__}: {exc}", rejection_code(exc))
                 )
-                continue
-            seqs.append(seq)
-        if seqs:
-            tracing.enqueue_many(seqs, received_at=received_at)
-            for seq in seqs:
-                SchedulerMetrics.enqueue(seq, received_at=received_at)
-            logger.debug(
-                f"{self.label}: input get {EngineCoreRequestType.ADD} "
-                f"{[seq.id for seq in seqs]}"
-            )
-            self.input_queue.put_nowait(seqs)
-            self._kv_progress_event.set()
-            self._offer_tier_lookups(seqs)
-        if rejected:
-            if self._report_backlog:
-                # Counted on the engine thread, in order with the batch.
-                self.input_queue.put_nowait((INGEST_REJECTED, len(rejected)))
-            self.output_queue.put_nowait(("REJECTED", rejected))
+        if refused:
+            self.output_queue.put_nowait(("REJECTED", refused))
+        return seqs, len(refused)
 
     def process_input_sockets(self, input_address: str, control_address: str):
         """Input IO thread, serving both the request and control sockets.
@@ -1002,10 +979,6 @@ class EngineCore:
         ``control_address``. The split exists on the sending side -- it lets
         CoreManager keep the request socket single-writer and therefore
         lock-free -- and both feed the same dispatch below.
-
-        Messages arrive in the engine wire protocol (`zmq_protocol.codec`).
-        What this thread puts on the queues is what it always has: lists of
-        `Sequence` for the scheduler and `(cmd, payload)` utility tuples.
         """
         with ExitStack() as stack, zmq.Context() as ctx:
             input_socket = stack.enter_context(
@@ -1027,37 +1000,53 @@ class EngineCore:
 
             while alive:
                 for sock, _ in poller.poll():
-                    frames = sock.recv_multipart(copy=False)
+                    # (RequestType, RequestData)
+                    obj = sock.recv(copy=False)
                     received_at = time.perf_counter()
                     try:
-                        request_type, data, failures = decode_client_message(frames)
+                        request_type, reqs = decode_input(obj)
                     except Exception:
                         # This thread is the only way requests reach the engine,
                         # so letting it die strands every later request: the
                         # busy loop keeps polling an empty input queue, the
                         # workers idle, and clients wait forever with no error
                         # on any log but this thread's own traceback. Drop the
-                        # message loudly and keep serving.
+                        # frame loudly and keep serving.
                         logger.exception(
-                            f"{self.label}: dropping undecodable input message "
-                            f"({len(frames)} frames)"
+                            f"{self.label}: dropping undecodable input frame "
+                            f"({len(obj.bytes)} bytes)"
                         )
                         continue
                     if request_type == EngineCoreRequestType.ADD:
-                        self._admit(data, failures, received_at)
+                        reqs, refused = self._admit(reqs, received_at)
+                        if reqs:
+                            tracing.enqueue_many(reqs, received_at=received_at)
+                            for req in reqs:
+                                SchedulerMetrics.enqueue(req, received_at=received_at)
+                            req_ids = [req.id for req in reqs]
+                            logger.debug(
+                                f"{self.label}: input get {request_type} {req_ids}"
+                            )
+                            self.input_queue.put_nowait(reqs)
+                            self._kv_progress_event.set()
+                            self._offer_tier_lookups(reqs)
+                        if refused and self._report_backlog:
+                            # Counted on the engine thread, in queue order
+                            # with the batch's admitted requests.
+                            self.input_queue.put_nowait((INGEST_REJECTED, refused))
                     elif request_type == EngineCoreRequestType.DP_PREFIX_CREDIT:
-                        self.input_queue.put_nowait((request_type, data))
+                        self.input_queue.put_nowait((request_type, reqs))
                         self._kv_progress_event.set()
                     elif request_type == EngineCoreRequestType.UTILITY:
-                        _, reqs = data
                         cmd = reqs.get("cmd") if isinstance(reqs, dict) else None
                         logger.debug(f"{self.label}: input get UTILITY command: {cmd}")
                         self.utility_queue.put_nowait((cmd, reqs))
                         self._has_pending_utility = True
                         self._kv_progress_event.set()
                     elif request_type == EngineCoreRequestType.ABORT:
-                        # The command CoreManager used to pickle for each.
-                        for req_id in data:
+                        # A client that pickles nothing (atomesh) sends aborts
+                        # as ids: the same command CoreManager sends.
+                        for req_id in reqs:
                             self.utility_queue.put_nowait(
                                 (
                                     "abort_request",
@@ -1075,12 +1064,7 @@ class EngineCore:
             logger.debug(f"{self.label}: input thread exit due to {reason}")
 
     def process_output_sockets(self, output_address: str):
-        """Output socket IO thread.
-
-        Encodes each output-queue item in the engine wire protocol: a list of
-        finished sequences, or a ``(kind, payload)`` tuple named in
-        `_TAGGED_OUTPUT_ENCODERS`.
-        """
+        """Output socket IO thread."""
         with ExitStack() as stack, zmq.Context() as ctx:
             socket = stack.enter_context(
                 make_zmq_socket(ctx, output_address, zmq.PUSH, linger=4000)
@@ -1089,22 +1073,48 @@ class EngineCore:
 
             while True:
                 item = self.output_queue.get()
-                if isinstance(item, tuple):
-                    kind, payload = item
-                    encode = _TAGGED_OUTPUT_ENCODERS.get(kind)
-                    if encode is None:
-                        logger.error(f"{self.label}: dropping output of kind {kind!r}")
-                        continue
-                    try:
-                        frames = encode(payload)
-                    except Exception as exc:
-                        logger.exception(f"{self.label}: cannot encode {kind} output")
-                        frames = _undeliverable_output(kind, payload, exc)
-                        if frames is None:
-                            continue
-                    socket.send_multipart(frames, copy=False)
-                    if kind == "READY":
-                        logger.debug(f"{self.label}: sent READY signal")
+                if isinstance(item, tuple) and item[0] == "STREAM":
+                    # Send stream outputs
+                    stream_outputs = item[1]
+                    obj = encode_output(EngineCoreRequestType.STREAM, stream_outputs)
+                    socket.send(obj)
+                    continue
+
+                if isinstance(item, tuple) and item[0] == "READY":
+                    # Send READY signal to indicate EngineCore is fully initialized
+                    obj = encode_output(EngineCoreRequestType.READY, item[1])
+                    socket.send(obj)
+                    logger.debug(f"{self.label}: sent READY signal")
+                    continue
+
+                if isinstance(item, tuple) and item[0] == "METRICS":
+                    obj = encode_output(EngineCoreRequestType.METRICS, item[1])
+                    socket.send(obj)
+                    continue
+
+                if isinstance(item, tuple) and item[0] == "PREFILL_BACKLOG":
+                    obj = encode_output(EngineCoreRequestType.PREFILL_BACKLOG, item[1])
+                    socket.send(obj)
+                    continue
+
+                if isinstance(item, tuple) and item[0] == "DP_REUSE":
+                    obj = encode_output(EngineCoreRequestType.DP_REUSE, item[1])
+                    socket.send(obj)
+                    continue
+
+                if isinstance(item, tuple) and item[0] == "UTILITY_RESPONSE":
+                    # Send utility command response back to CoreManager
+                    response_data = item[1]
+                    serialized_obj = encode_output(
+                        EngineCoreRequestType.UTILITY_RESPONSE, response_data
+                    )
+                    socket.send(serialized_obj)
+                    continue
+
+                if isinstance(item, tuple) and item[0] == "REJECTED":
+                    # Requests refused at admission end as finished ones do.
+                    obj = encode_output(EngineCoreRequestType.ADD, item[1])
+                    socket.send(obj)
                     continue
 
                 # Regular finished sequences
@@ -1114,61 +1124,15 @@ class EngineCore:
                 ]
                 num_valid = len(valid_seqs)
                 if num_valid > 0:
-                    try:
-                        frames, rejections = encode_completions(valid_seqs)
-                    except Exception as exc:
-                        # Still end each request, or its client waits forever.
-                        logger.exception(
-                            f"{self.label}: cannot encode {num_valid} finished "
-                            f"sequences; rejecting them"
-                        )
-                        frames, rejections = None, [
-                            (seq.id, f"output encoding failed: {exc}", REJECT_INTERNAL)
-                            for seq in valid_seqs
-                        ]
-                    if frames is not None:
-                        socket.send_multipart(frames, copy=False)
-                    if rejections:
-                        socket.send_multipart(encode_rejected(rejections), copy=False)
+                    obj = encode_output(EngineCoreRequestType.ADD, valid_seqs)
+                    socket.send(obj)
                     logger.info(f"{self.label}: output send {num_valid} reqs")
                 if len(valid_seqs) != len(seqs):
-                    socket.send_multipart(encode_stopped(), copy=False)
+                    socket.send(encode_output(EngineCoreRequestType.SHUTDOWN))
                     logger.debug(
                         f"{self.label}: output send {EngineCoreRequestType.SHUTDOWN}"
                     )
                     break
-
-
-def _undeliverable_output(kind, payload, exc):
-    """What to send instead of a tagged output that would not encode, so the
-    client that waits on it fails rather than waits forever; None to drop it.
-
-    READY: `Stopped`, which a client still starting up reports as a failed
-    start. UTILITY_RESPONSE: an error reply to the same request id.
-    """
-    if kind == "READY":
-        return encode_stopped()
-    if kind == "UTILITY_RESPONSE" and isinstance(payload, dict):
-        return encode_utility_reply(
-            {
-                "cmd": payload.get("cmd"),
-                "request_id": payload.get("request_id"),
-                "error": f"reply not encodable: {type(exc).__name__}: {exc}",
-            }
-        )
-    return None
-
-
-# The tagged items EngineCore threads put on `output_queue`, and their encoders.
-_TAGGED_OUTPUT_ENCODERS = {
-    "STREAM": encode_stream,
-    "READY": encode_ready,
-    "METRICS": encode_metrics,
-    "PREFILL_BACKLOG": encode_prefill_backlog,
-    "DP_REUSE": encode_dp_reuse,
-    "UTILITY_RESPONSE": encode_utility_reply,
-    "REJECTED": encode_rejected,
-}
 
 
 class DPEngineCoreProc(EngineCore):

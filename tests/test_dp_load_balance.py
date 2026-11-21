@@ -19,16 +19,16 @@ from atom.model_engine.engine_core_mgr import (
     DP_LB_STRATEGIES,
     CoreManager,
 )
-from atom.model_engine.zmq_protocol.codec import decode_client_message
-from atom.model_engine.zmq_protocol.requests import IngressRequest
-from atom.sampling_params import SamplingParams
-from engine_v1_helpers import received
+from atom.model_engine.sequence import Sequence
+from atom.model_engine.zmq_protocol.codec import decode_input
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 
-class _FakeSeq:
-    """Minimal stand-in for Sequence: routing only reads id/num_prompt_tokens."""
+class _FakeSeq(Sequence):
+    """A `Sequence` of `num_prompt_tokens` placeholder tokens: routing reads
+    id / num_prompt_tokens, and a dispatch encodes it as it would a real one
+    (an int id, then)."""
 
     def __init__(
         self,
@@ -38,23 +38,14 @@ class _FakeSeq:
         dp_session_id=None,
         dp_parent_session_id=None,
     ):
-        self.id = seq_id
-        self.num_prompt_tokens = num_prompt_tokens
-        self.prompt_hash_chain = None
-        self.dp_session_id = dp_session_id
-        self.dp_parent_session_id = dp_parent_session_id
-        if data_parallel_rank is not None:
-            self.data_parallel_rank = data_parallel_rank
-
-
-def _wire_request(seq_id, num_prompt_tokens=1, data_parallel_rank=None):
-    """A request dispatch can actually encode, unlike `_FakeSeq`."""
-    return IngressRequest(
-        id=seq_id,
-        prompt_token_ids=[1] * num_prompt_tokens,
-        sampling_params=SamplingParams(),
-        data_parallel_rank=data_parallel_rank,
-    )
+        super().__init__(
+            [1] * num_prompt_tokens,
+            16,
+            id=seq_id,
+            data_parallel_rank=data_parallel_rank,
+            dp_session_id=dp_session_id,
+            dp_parent_session_id=dp_parent_session_id,
+        )
 
 
 def _make_mgr(
@@ -424,13 +415,11 @@ def test_dispatch_sends_explicit_hint_to_exact_engine_rank():
     mgr._rank_reqs = [0, 0, 0, 10]
     mgr._rank_tokens = [0, 0, 0, 10_000]
 
-    seq = _wire_request(7, num_prompt_tokens=100, data_parallel_rank=3)
+    seq = _FakeSeq(7, num_prompt_tokens=100, data_parallel_rank=3)
     mgr._dispatch_to_dp_ranks([seq])
 
     assert [len(sock.messages) for sock in mgr.input_sockets] == [0, 0, 0, 1]
-    identity, *frames = mgr.input_sockets[3].messages[0]
-    assert identity == b"e3"
-    request_type, dispatched, _ = decode_client_message(received(frames))
+    request_type, dispatched = decode_input(mgr.input_sockets[3].messages[0][1])
     assert request_type.name == "ADD"
     assert [item.seq_id for item in dispatched] == [seq.id]
 
@@ -500,7 +489,7 @@ def test_send_failure_rolls_back_undispatched_charge():
     # NOT successfully handed off were charged but will never emit a finished
     # output to release them. Dispatch must roll those back so routing does not
     # skew permanently; already-sent ranks keep their (legitimate) charge.
-    # dispatch encodes the batch with the real codec before each send.
+    # dispatch encodes (EngineCoreRequestType.ADD, seqs) with the real enum.
     class _FakeSocket:
         def __init__(self, fail=False):
             self.fail = fail
@@ -518,7 +507,7 @@ def test_send_failure_rolls_back_undispatched_charge():
         _FakeSocket(fail=True),
         _FakeSocket(),
     ]
-    seqs = [_wire_request(i, num_prompt_tokens=10) for i in range(4)]
+    seqs = [_FakeSeq(i, num_prompt_tokens=10) for i in range(4)]
     with pytest.raises(RuntimeError):
         mgr._dispatch_to_dp_ranks(seqs)
     # Ranks 0,1 dispatched -> stay charged; ranks 2 (failed) and 3 (never
@@ -584,17 +573,17 @@ def test_concurrent_store_dispatch_accounts_in_socket_send_order():
     from atom.model_engine.dp_routing.share_cache import ShareCacheRouter
 
     mgr = _make_mgr(1, strategy="share_cache")
+    FIRST, SECOND = 1, 2
 
     mgr._prefix_router = ShareCacheRouter(OffloadTierProfile(True, 0, 256, True), 100)
     first_sent, second_started = Event(), Event()
     order = []
-    names = {1: "first", 2: "second"}
 
-    def send(_rank, frames):
-        _, specs, _ = decode_client_message(received(frames))
-        sid = names[specs[0].seq_id]
+    def send(_rank, payload):
+        _, items = decode_input(payload)
+        sid = items[0].seq_id
         order.append(("send", sid))
-        if sid == "first":
+        if sid == FIRST:
             first_sent.set()
             assert second_started.wait(2)
             # Give the concurrent caller a chance to send while the first
@@ -604,7 +593,7 @@ def test_concurrent_store_dispatch_accounts_in_socket_send_order():
     original = mgr._backlog.note_sent
 
     def account(rank, seqs, seq_load):
-        order.append(("account", names[seqs[0].id]))
+        order.append(("account", seqs[0].id))
         original(rank, seqs, seq_load)
 
     mgr._send_request = send
@@ -613,20 +602,20 @@ def test_concurrent_store_dispatch_accounts_in_socket_send_order():
     def second():
         assert first_sent.wait(2)
         second_started.set()
-        mgr._dispatch_to_dp_ranks([_wire_request(2, 20, data_parallel_rank=0)])
+        mgr._dispatch_to_dp_ranks([_FakeSeq(SECOND, 20, data_parallel_rank=0)])
 
     with ThreadPoolExecutor(2) as pool:
         a = pool.submit(
-            mgr._dispatch_to_dp_ranks, [_wire_request(1, 10, data_parallel_rank=0)]
+            mgr._dispatch_to_dp_ranks, [_FakeSeq(FIRST, 10, data_parallel_rank=0)]
         )
         b = pool.submit(second)
         a.result(timeout=5)
         b.result(timeout=5)
     assert order == [
-        ("send", "first"),
-        ("account", "first"),
-        ("send", "second"),
-        ("account", "second"),
+        ("send", FIRST),
+        ("account", FIRST),
+        ("send", SECOND),
+        ("account", SECOND),
     ]
     assert [charge for _, charge in mgr._backlog.unseen[0]] == [10, 20]
 
@@ -668,18 +657,12 @@ def _tier_hit(router, chain):
     return router._tier_hit(router._path(chain))
 
 
-def _chain_seq(seq_id, tokens, first_block=0, session=None, hbs=128, wire=False):
-    """A seq with a shipped prompt chain; `wire` makes it one dispatch can
-    encode (`_wire_request`) rather than a routing-only `_FakeSeq`."""
+def _chain_seq(seq_id, tokens, first_block=0, session=None, hbs=128):
     import array
 
     from atom.model_engine.prefix_hash import ShippedChain
 
-    if wire:
-        seq = _wire_request(seq_id, num_prompt_tokens=tokens)
-        seq.dp_session_id = session
-    else:
-        seq = _FakeSeq(seq_id, num_prompt_tokens=tokens, dp_session_id=session)
+    seq = _FakeSeq(seq_id, num_prompt_tokens=tokens, dp_session_id=session)
     blocks = array.array("Q", range(first_block, first_block + tokens // hbs))
     seq.prompt_hash_chain = ShippedChain(hbs, 0, tokens, 0, blocks)
     return seq
@@ -1020,13 +1003,13 @@ def test_prefix_spread_tracks_load_through_dispatch():
     mgr = _make_spread_mgr()
     mgr.engine_core_identities = [b"e0", b"e1"]
     mgr.input_sockets = [_SinkSocket(), _SinkSocket()]
-    first = _chain_seq(1, 100_000, wire=True)
+    first = _chain_seq(1, 100_000)
     mgr._dispatch_to_dp_ranks([first])
     (owner,) = [r for r, n in enumerate(mgr._rank_reqs) if n]
     assert mgr._rank_tokens[owner] == 100_000
     mgr._mark_seq_prefill_complete(1)
     mgr._rank_tokens[owner] = 200_000  # backlogged
-    moved = _chain_seq(2, 110_000, wire=True)
+    moved = _chain_seq(2, 110_000)
     mgr._dispatch_to_dp_ranks([moved])
     assert mgr._seq_load[2][0] != owner
     assert _count(mgr, "prefix_moved_total") == 1

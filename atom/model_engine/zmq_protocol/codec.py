@@ -1,1029 +1,577 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Encode and decode the CoreManager <-> EngineCore messages engine_v1 carries.
+"""Encode and decode the CoreManager <-> EngineCore messages (`messages`).
 
-Client side: `encode_submit` / `encode_abort` / `encode_command` /
-`encode_shutdown`, and `decode_core_message` for what comes back.
+Each side calls these where it called ``pickle.dumps((type, payload))`` and
+``pickle.loads(frame)``, with the same ``(type, payload)`` it always had:
 
-Core side: `decode_client_message`, which decodes a request into the
-`AdmissionSpec` `atom.model_engine.admission.build_sequence` turns into a
-`Sequence`, and an `encode_*` for each of the Core's replies: completions,
-stream steps, rejections, readiness, metrics, utility / admin replies, the
-DP prefix-routing reports and its stop.
+- the client: `encode_input`, `decode_output`;
+- the EngineCore: `decode_input`, `encode_output`.
 
-This module only translates; what a request must pass to be admitted is
-`atom.model_engine.admission`'s.
+What differs from pickle is what crosses for a sequence. The client sends a
+`SubmitItem` (the Core builds the `Sequence`, `admission.build_sequence`), and
+the Core sends a finished sequence back as a `Completion`, which reads like
+the finished `Sequence` did. Everything else is the payload the engine
+pickled before, either typed (`Ready`, STREAM) or pickled as it was.
 
-Decoded kinds are `EngineCoreRequestType` members, so the dispatch on both
-ends reads as it did when the payloads were pickled.
+One item that will not encode does not fail its batch: a request the client
+cannot encode is sent refused (`SubmitItem.refused`) and comes back rejected;
+a step output or completion the Core cannot encode is sent without what did
+not encode, or as a rejected completion.
 """
 
 import array
+import io
 import logging
 import pickle
-from dataclasses import fields
-from functools import cache, lru_cache
-from itertools import chain
 
+import msgspec
 import numpy as np
 
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.prefix_hash import ShippedChain
 from atom.model_engine.request import RequestOutput
-from atom.model_engine.zmq_protocol import engine_v1_pb2 as pb
-from atom.model_engine.zmq_protocol.requests import CompletionResult, IngressRequest
-from atom.model_engine.zmq_protocol.wire import (
-    FrameReader,
-    FrameWriter,
-    ProtocolError,
-    decode_envelope,
-    decode_optional_value,
-    decode_value,
-    encode_optional_value,
-    encode_value,
-)
+from atom.model_engine.zmq_protocol import messages as m
 from atom.observability import tracing
 from atom.sampling_params import RequiredChannel, SamplingParams
 
 logger = logging.getLogger("atom")
 
-# Every SamplingParams field the wire carries. A field added to the dataclass
-# without a wire field would silently fall back to its default in the Core, so
-# this module refuses to import until the codec carries it.
-SAMPLING_FIELDS = (
-    "temperature",
-    "top_k",
-    "top_p",
-    "max_tokens",
-    "ignore_eos",
-    "stop_strings",
-    "n",
-    "logprobs",
-    "required_channel",
-    "top_logprobs",
-    "json_schema",
-    "structured_tool_format",
-    "structured_reasoning_end",
-    "max_tokens_is_default",
-)
-if {f.name for f in fields(SamplingParams)} != set(SAMPLING_FIELDS):
-    raise ImportError(
-        "SamplingParams and the engine wire protocol disagree on fields; "
-        "update engine_v1.proto and codec._encode/_decode_sampling"
-    )
-
-# RequestOutput's fields in constructor order, as `_decode_stream` builds one
-# positionally. A field added or reordered there must be carried here first.
-STREAM_FIELDS = (
-    "request_id",
-    "output_tokens",
-    "finished",
-    "finish_reason",
-    "kv_transfer_params_output",
-    "num_cached_tokens",
-    "logprobs",
-)
-if tuple(f.name for f in fields(RequestOutput)) != STREAM_FIELDS:
-    raise ImportError(
-        "RequestOutput and the engine wire protocol disagree on fields; "
-        "update engine_v1.proto (StreamBatch) and codec.encode/_decode_stream"
-    )
-
-# A rejected request's leave_reason starts with this; its `CompletionResult`
-# also says `rejected`.
-REJECTED_REASON = "rejected"
-
-# Why a request was rejected (RejectedRequest.Code).
-REJECT_INVALID = pb.RejectedRequest.INVALID
-REJECT_INTERNAL = pb.RejectedRequest.INTERNAL
-
-# Admin commands with a typed form (AdminCommand), and the arguments one may
-# carry. Anything else on the control socket travels as a pickled Utility.
-ADMIN_COMMANDS = {
-    "start_profile": pb.AdminCommand.START_PROFILE,
-    "stop_profile": pb.AdminCommand.STOP_PROFILE,
-    "get_mtp_statistics": pb.AdminCommand.GET_MTP_STATISTICS,
-    "get_cache_statistics": pb.AdminCommand.GET_CACHE_STATISTICS,
-    "clear_kv_cache": pb.AdminCommand.CLEAR_KV_CACHE,
-}
-_ADMIN_NAMES = {kind: name for name, kind in ADMIN_COMMANDS.items()}
-_ADMIN_ARGS = ("request_id", "timeout")
+_PICKLE_EXT = 1  # a value msgpack cannot hold, pickled (Python only)
 
 
-def _optional(msg, name):
-    """A proto3 optional field's value, or None when it is absent."""
-    return getattr(msg, name) if msg.HasField(name) else None
-
-
-# ------------------------------------------------------------ sampling -----
-
-
-def _encode_sampling(params: SamplingParams, msg, max_tokens) -> None:
-    for name in ("temperature", "top_k", "top_p"):
-        value = getattr(params, name)
-        if value is not None:
-            setattr(msg, name, value)
-    if max_tokens is not None:
-        msg.max_tokens = max_tokens
-    msg.ignore_eos = bool(params.ignore_eos)
-    stops = params.stop_strings
-    if isinstance(stops, str):
-        msg.stop_strings.single = stops
-    elif stops is not None:
-        msg.stop_strings.many.SetInParent()
-        msg.stop_strings.many.items.extend(stops)
-    msg.n = params.n
-    logprobs = params.logprobs
-    if type(logprobs) is bool:
-        msg.logprobs_flag = logprobs
-    elif logprobs is not None:
-        msg.logprobs_count = logprobs
-    channel = params.required_channel
-    if channel is not None:
-        msg.required_channel.after.extend(channel.after)
-        msg.required_channel.opening.extend(channel.opening)
-        msg.required_channel.opens_at = channel.opens_at
-        msg.required_channel.end_ids.extend(channel.end_ids)
-    msg.top_logprobs = params.top_logprobs
-    for name in ("json_schema", "structured_tool_format"):
-        value = getattr(params, name)
-        if value is not None:
-            setattr(msg, name, value)
-    msg.structured_reasoning_end = params.structured_reasoning_end
-    msg.max_tokens_is_default = params.max_tokens_is_default
-
-
-_SAMPLING_DEFAULTS = SamplingParams()
-
-
-def _optional_or_default(msg, name):
-    return getattr(msg if msg.HasField(name) else _SAMPLING_DEFAULTS, name)
-
-
-def _decode_sampling(msg) -> SamplingParams:
-    stops = msg.stop_strings.WhichOneof("value")
-    if stops == "single":
-        stop_strings = msg.stop_strings.single
-    elif stops == "many":
-        stop_strings = list(msg.stop_strings.many.items)
-    else:
-        stop_strings = None
-    logprobs = msg.WhichOneof("logprobs")
-    channel = None
-    if msg.HasField("required_channel"):
-        wire = msg.required_channel
-        channel = RequiredChannel(
-            after=tuple(wire.after),
-            opening=tuple(wire.opening),
-            opens_at=wire.opens_at,
-            end_ids=tuple(wire.end_ids),
-        )
-    # An absent temperature / top_k / top_p / max_tokens / n is the default,
-    # not None (which would reach the sampler as NaN); see SamplingParams in
-    # engine_v1.proto.
-    return SamplingParams(
-        temperature=_optional_or_default(msg, "temperature"),
-        top_k=_optional_or_default(msg, "top_k"),
-        top_p=_optional_or_default(msg, "top_p"),
-        max_tokens=_optional_or_default(msg, "max_tokens"),
-        ignore_eos=msg.ignore_eos,
-        stop_strings=stop_strings,
-        n=_optional_or_default(msg, "n"),
-        logprobs=None if logprobs is None else getattr(msg, logprobs),
-        required_channel=channel,
-        top_logprobs=msg.top_logprobs,
-        json_schema=_optional(msg, "json_schema"),
-        structured_tool_format=_optional(msg, "structured_tool_format"),
-        structured_reasoning_end=msg.structured_reasoning_end,
-        max_tokens_is_default=msg.max_tokens_is_default,
+def _enc_hook(obj):
+    return msgspec.msgpack.Ext(
+        _PICKLE_EXT, pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
     )
 
 
-@lru_cache(maxsize=256)
-def _sampling_from_bytes(data: bytes) -> SamplingParams:
-    msg = pb.SamplingParams()
-    msg.ParseFromString(data)
-    return _decode_sampling(msg)
+def _ext_hook(code: int, data: memoryview):
+    if code == _PICKLE_EXT:
+        return pickle.loads(data)
+    raise msgspec.DecodeError(f"unknown msgpack extension {code}")
 
 
-def _decode_sampling_cached(msg) -> tuple[SamplingParams, int]:
-    """`_decode_sampling`, shared by every request whose params encode alike,
-    and the request's own `max_tokens`.
-
-    A Core reads a request's SamplingParams only while it builds the
-    `Sequence`, which copies the fields out, so one decoded object can serve
-    them all -- as n > 1 siblings always shared theirs. Requests in one
-    deployment repeat a handful of parameter sets, and decoding one costs as
-    much as the rest of the request's spec. `max_tokens` stays out of the
-    key: it varies per request (clamped defaults, benchmarks) and would make
-    every lookup miss. `build_sequence` sets it on the sequence.
-    """
-    max_tokens = _optional_or_default(msg, "max_tokens")
-    msg.ClearField("max_tokens")
-    params = _sampling_from_bytes(msg.SerializeToString(deterministic=True))
-    return params, max_tokens
+_encoder = msgspec.msgpack.Encoder(enc_hook=_enc_hook)
+_head = msgspec.msgpack.Decoder(tuple[int, msgspec.Raw])
+_sampling = msgspec.msgpack.Decoder(m.Sampling)
+_DEFAULT_SAMPLING = msgspec.Raw(_encoder.encode(m.Sampling()))
 
 
-def _encode_chain(chain: ShippedChain, msg, writer: FrameWriter) -> None:
-    msg.hash_block_size = chain.hash_block_size
-    if chain.cache_seed != -1:
-        msg.cache_seed = chain.cache_seed
-    msg.num_prompt_tokens = chain.num_prompt_tokens
-    msg.fingerprint = chain.fingerprint
-    # Shared: n > 1 siblings carry one chain, which goes out once.
-    writer.add(chain.hashes, msg.hashes, key=chain.hashes)
+def _decoders(bodies) -> dict:
+    return {
+        m.KIND[t]: (t, msgspec.msgpack.Decoder(body, ext_hook=_ext_hook))
+        for t, body in bodies.items()
+    }
 
 
-def _decode_chain(msg, reader: FrameReader) -> ShippedChain:
-    return ShippedChain(
-        msg.hash_block_size,
-        msg.cache_seed if msg.HasField("cache_seed") else -1,
-        msg.num_prompt_tokens,
-        msg.fingerprint,
-        reader.uint64_array(msg.hashes),
-    )
+_input_decoders = _decoders(m.INPUT_BODY)
+_output_decoders = _decoders(m.OUTPUT_BODY)
 
 
-# ------------------------------------------------------------ client side --
+def _frame(request_type, body) -> bytes:
+    return _encoder.encode((m.KIND[request_type], body))
 
 
-def encode_submit(
-    requests: list[IngressRequest], *, max_tokens=None
-) -> tuple[list | None, list]:
-    """One SubmitBatch: `(frames, failures)`.
-
-    A request that does not encode -- a string that is not UTF-8 (a lone
-    surrogate), a value nested past `MAX_VALUE_DEPTH` -- is left out, as
-    `(request, reason)` in `failures`, and the rest still go; `frames` is None
-    when none encodes. `max_tokens`, when given, replaces every request's.
-    """
-    writer = FrameWriter()
-    envelope = pb.Envelope()
-    specs = envelope.submit.requests
-    envelope.submit.SetInParent()
-    failures = []
-    for req in requests:
-        spec = specs.add()
-        try:
-            _encode_spec(req, spec, writer, max_tokens)
-        except Exception as exc:
-            # What it wrote to the writer stays as unreferenced bytes.
-            del specs[-1]
-            failures.append((req, f"{type(exc).__name__}: {exc}"))
-    return (writer.frames(envelope) if specs else None), failures
+def _pickled(payload) -> m.Pickled:
+    return m.Pickled(pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL))
 
 
-def _encode_spec(req: IngressRequest, spec, writer: FrameWriter, max_tokens) -> None:
-    spec.seq_id = req.id
-    # Shared: n > 1 siblings carry one prompt, which goes out once.
-    writer.add(req.prompt_token_ids, spec.prompt_token_ids, key=req.prompt_token_ids)
-    _encode_sampling(
-        req.sampling_params,
-        spec.sampling,
-        req.max_tokens if max_tokens is None else max_tokens,
-    )
-    for stop in req.stop_token_sequences:
-        spec.stop_token_sequences.add().ids.extend(stop)
-    if req.external_request_id is not None:
-        spec.external_request_id = req.external_request_id
-    if req.parent_request_id is not None:
-        spec.parent_request_id = req.parent_request_id
-    spec.sibling_index = req.sibling_index
-    spec.needs_independent_noise = req.needs_independent_noise
-    encode_optional_value(req.kv_transfer_params, spec, "kv_transfer_params", writer)
-    encode_optional_value(req.multimodal_data, spec, "multimodal_data", writer)
-    if req.cache_seed != -1:  # a text prompt's, as on `Sequence`
-        spec.cache_seed = req.cache_seed
-    encode_optional_value(req.mrope_positions, spec, "mrope_positions", writer)
-    spec.mrope_position_delta = req.mrope_position_delta
-    if req.data_parallel_rank is not None:
-        spec.data_parallel_rank = req.data_parallel_rank
-    if req.dp_session_id is not None:
-        spec.dp_session_id = req.dp_session_id
-    if req.dp_parent_session_id is not None:
-        spec.dp_parent_session_id = req.dp_parent_session_id
-    spec.arrive_time = req.arrive_time
-    if req.prompt_hash_chain is not None:
-        _encode_chain(req.prompt_hash_chain, spec.prompt_hash_chain, writer)
-    spec.dp_est_cached_tokens = req.dp_est_cached_tokens
-    trace = tracing.wire_context(req)
-    if trace is not None:
-        carrier, model, request_id = trace
-        spec.trace.carrier.update(carrier)
-        spec.trace.model = model
-        if request_id is not None:
-            spec.trace.request_id = request_id
+def _decode(buf, decoders):
+    kind, raw = _head.decode(buf)
+    entry = decoders.get(kind)
+    if entry is None:
+        raise msgspec.DecodeError(f"unexpected message kind {kind}")
+    request_type, decoder = entry
+    return request_type, decoder.decode(raw)
 
 
-def encode_abort(seq_ids) -> list:
-    envelope = pb.Envelope()
-    envelope.abort.seq_ids.extend(seq_ids)
-    return FrameWriter().frames(envelope)
-
-
-def encode_command(payload: dict) -> list:
-    """A control-socket command; `payload` is the dict the Core's handler
-    receives. Typed (AdminCommand) when it is one of `ADMIN_COMMANDS` with
-    only the arguments that form carries, a pickled Utility otherwise."""
-    kind = ADMIN_COMMANDS.get(payload.get("cmd"))
-    if kind is not None and _fits_admin_command(payload):
-        return _encode_admin(kind, payload)
-    return encode_utility(payload)
-
-
-def _is_number(value) -> bool:
-    return type(value) in (int, float)
-
-
-def _fits_admin_command(payload: dict) -> bool:
-    request_id = payload.get("request_id")
-    return (
-        set(payload) - {"cmd"} <= set(_ADMIN_ARGS)
-        and (request_id is None or isinstance(request_id, str))
-        and (payload.get("timeout") is None or _is_number(payload["timeout"]))
-    )
-
-
-def _encode_admin(kind, payload: dict) -> list:
-    envelope = pb.Envelope()
-    msg = envelope.admin
-    msg.kind = kind
-    for name in _ADMIN_ARGS:
-        if payload.get(name) is not None:
-            setattr(msg, name, payload[name])
-    return FrameWriter().frames(envelope)
-
-
-def _decode_admin(msg) -> tuple[str, dict]:
-    name = _ADMIN_NAMES.get(msg.kind)
-    if name is None:
-        raise ProtocolError(f"unknown admin command {msg.kind}")
-    # The dict CoreManager's broadcast builds, keys in its order.
-    payload = {"cmd": name}
-    for field in _ADMIN_ARGS:
-        if msg.HasField(field):
-            payload[field] = getattr(msg, field)
-    return name, payload
-
-
-def encode_utility(payload: dict) -> list:
-    """A Python-only admin command; `payload` is the dict the Core's handler
-    receives, pickled into a frame."""
-    writer = FrameWriter()
-    envelope = pb.Envelope()
-    envelope.utility.cmd = str(payload.get("cmd", ""))
-    request_id = payload.get("request_id")
-    if isinstance(request_id, str):
-        envelope.utility.request_id = request_id
-    writer.add(
-        pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL),
-        envelope.utility.payload,
-    )
-    return writer.frames(envelope)
-
-
-def encode_dp_prefix_credit(updates) -> list:
-    """`share_cache`'s corrected estimates, `[(seq_id, credit)]`, for the
-    input socket after the SubmitBatch that named those sequences."""
-    envelope = pb.Envelope()
-    msg = envelope.dp_prefix_credit
-    msg.SetInParent()
-    for seq_id, credit in updates:
-        msg.seq_ids.append(seq_id)
-        msg.credits.append(credit)
-    return FrameWriter().frames(envelope)
-
-
-def encode_shutdown() -> list:
-    envelope = pb.Envelope()
-    envelope.shutdown.SetInParent()
-    return FrameWriter().frames(envelope)
-
-
-def _decode_completion(msg, reader: FrameReader) -> CompletionResult:
-    return CompletionResult(
-        id=msg.seq_id,
-        completion_token_ids=reader.int32_array(msg.completion_token_ids),
-        # Absent: the request asked for none.
-        logprobs=(
-            reader.float64_array(msg.logprobs)
-            if msg.HasField("logprobs")
-            else array.array("d")
-        ),
-        return_logprobs=msg.HasField("logprobs"),
-        num_prompt_tokens=msg.num_prompt_tokens,
-        num_cached_tokens=msg.num_cached_tokens,
-        arrive_time=msg.arrive_time,
-        first_token_time=msg.first_token_time,
-        leave_time=msg.leave_time,
-        leave_reason=msg.leave_reason,
-        kv_transfer_params_output=decode_optional_value(
-            msg, "kv_transfer_params_output", reader
-        ),
-        external_request_id=_optional(msg, "external_request_id"),
-        parent_request_id=_optional(msg, "parent_request_id"),
-        sibling_index=msg.sibling_index,
-        prefill_completed=msg.prefill_completed,
-    )
-
-
-def _decode_completion_alone(msg, reader: FrameReader) -> CompletionResult:
-    """`_decode_completion`, or, when this one item does not decode, a
-    rejected result for it: the batch's other sequences still finish."""
+def _encode_items(request_type, wrap, items, fallback) -> bytes:
+    """`wrap(items)` as one message. When that does not encode, each item
+    that does not alone is replaced by `fallback(item, exc)`."""
     try:
-        return _decode_completion(msg, reader)
-    except Exception as exc:  # reported on its own sequence
-        logger.exception("seq %s's completion does not decode", msg.seq_id)
-        return CompletionResult(
-            id=msg.seq_id,
-            leave_reason=f"{REJECTED_REASON}: {type(exc).__name__}: {exc}",
-            rejected=True,
-        )
+        return _frame(request_type, wrap(items))
+    except Exception:  # noqa: BLE001 - an item's; the loop below finds which
+        logger.warning("a %s message does not encode; item by item", request_type)
+    kept = []
+    for item in items:
+        try:
+            _encoder.encode(item)
+        except Exception as exc:  # this item alone
+            logger.exception("seq %s does not encode", item.seq_id)
+            item = fallback(item, exc)
+        kept.append(item)
+    return _frame(request_type, wrap(kept))
+
+
+def _token_bytes(seq, start: int, end: int) -> bytes:
+    """`seq.token_ids[start:end]` as int32 bytes, in one copy."""
+    return memoryview(seq.token_ids)[start:end].tobytes()
+
+
+def _reason(exc: BaseException) -> str:
+    return f"{type(exc).__name__}: {exc}"
+
+
+# ------------------------------------------------------------------ client --
+
+
+def _sampling_of(seq) -> m.Sampling:
+    """The `SamplingParams` a `Sequence` was built from, out of the fields it
+    copied (n is 1 per sequence; `logprobs` survives as a flag)."""
+    channel = seq.required_channel
+    return m.Sampling(
+        temperature=seq.temperature,
+        top_k=seq.top_k,
+        top_p=seq.top_p,
+        max_tokens=seq.max_tokens,
+        ignore_eos=seq.ignore_eos,
+        stop_strings=seq.stop_strings,
+        logprobs=True if seq.return_logprobs else None,
+        required_channel=(
+            None
+            if channel is None
+            else m.RequiredChannel(
+                channel.after, channel.opening, channel.opens_at, channel.end_ids
+            )
+        ),
+        top_logprobs=seq.top_logprobs,
+        json_schema=seq.json_schema,
+        structured_tool_format=seq.structured_tool_format,
+        structured_reasoning_end=seq.structured_reasoning_end,
+    )
+
+
+class _MediaPickler(pickle.Pickler):
+    """Pickles a value with its CPU tensors' and numpy arrays' bytes left out,
+    in `buffers` (one contiguous byte view each), where pickle would copy them
+    into its stream -- a tensor through torch's own serialization."""
+
+    def __init__(self, file, buffers: list):
+        super().__init__(file, protocol=pickle.HIGHEST_PROTOCOL)
+        self._buffers = buffers
+        # id -> (object, its id): one object twice is one buffer, and comes
+        # back one object, as pickle's own memo would have it.
+        self._seen: dict[int, tuple] = {}
+
+    def persistent_id(self, obj):
+        seen = self._seen.get(id(obj))
+        if seen is not None:
+            return seen[1]
+        kind = type(obj)
+        if kind is np.ndarray and not obj.dtype.hasobject:
+            # Not `ascontiguousarray`, which makes a 0-d array 1-d.
+            raw = obj if obj.flags.c_contiguous else obj.copy(order="C")
+            tag = ("ndarray", raw.dtype.str, raw.shape)
+            data = raw.reshape(-1).view(np.uint8)
+        elif kind.__name__ == "Tensor" and kind.__module__ == "torch":
+            if obj.device.type != "cpu":
+                return None
+            raw = obj.detach().contiguous()
+            tag = ("tensor", str(raw.dtype).removeprefix("torch."), tuple(raw.shape))
+            data = raw.reshape(-1).view(_torch().uint8).numpy()
+        else:
+            return None
+        self._buffers.append(memoryview(data))
+        pid = (*tag, len(self._buffers) - 1)
+        self._seen[id(obj)] = (obj, pid)
+        return pid
+
+
+class _MediaUnpickler(pickle.Unpickler):
+    def __init__(self, data, buffers):
+        super().__init__(io.BytesIO(data))
+        self._buffers = buffers
+        self._loaded: dict[int, object] = {}
+
+    def persistent_load(self, pid):
+        kind, dtype, shape, index = pid
+        if index in self._loaded:
+            return self._loaded[index]
+        if kind == "ndarray":
+            out = np.empty(shape, dtype=np.dtype(dtype))
+            view = out.reshape(-1).view(np.uint8)
+        else:
+            torch = _torch()
+            out = torch.empty(shape, dtype=getattr(torch, dtype))
+            view = out.reshape(-1).view(torch.uint8).numpy()
+        view[:] = np.frombuffer(self._buffers[index], dtype=np.uint8)
+        self._loaded[index] = out
+        return out
+
+
+def _torch():
+    import torch
+
+    return torch
+
+
+def pickle_media(value) -> tuple[bytes, list[memoryview]]:
+    """`value` pickled, and the bytes of the tensors and arrays in it."""
+    buffers: list[memoryview] = []
+    stream = io.BytesIO()
+    _MediaPickler(stream, buffers).dump(value)
+    return stream.getvalue(), buffers
+
+
+def unpickle_media(data: bytes, buffers) -> object:
+    return _MediaUnpickler(data, buffers or []).load()
+
+
+def _optional_pickle(value) -> bytes | None:
+    if value is None:
+        return None
+    return pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def _submit_item(seq) -> m.SubmitItem:
+    chain = seq.prompt_hash_chain
+    trace = tracing.wire_context(seq)
+    multimodal = seq.multimodal_data
+    media, media_buffers = None, None
+    if multimodal is not None or seq.mrope_positions is not None:
+        media, media_buffers = pickle_media((multimodal, seq.mrope_positions))
+    return m.SubmitItem(
+        seq_id=seq.id,
+        prompt=_token_bytes(seq, 0, seq.num_prompt_tokens),
+        sampling=msgspec.Raw(_encoder.encode(_sampling_of(seq))),
+        stop_token_sequences=[s.tolist() for s in seq.stop_token_sequences],
+        kv_transfer_params=_optional_pickle(seq.kv_transfer_params),
+        multimodal=media,
+        multimodal_buffers=media_buffers,
+        mrope_position_delta=seq.mrope_position_delta,
+        cache_seed=seq.cache_seed if multimodal is not None else None,
+        needs_independent_noise=seq.needs_independent_noise,
+        parent_request_id=seq.parent_request_id,
+        sibling_index=seq.sibling_index,
+        external_request_id=seq.external_request_id,
+        data_parallel_rank=seq.data_parallel_rank,
+        dp_session_id=seq.dp_session_id,
+        dp_parent_session_id=seq.dp_parent_session_id,
+        arrive_time=seq.arrive_time,
+        prompt_hash_chain=(
+            None
+            if chain is None
+            else m.PromptHashChain(
+                chain.hash_block_size,
+                chain.cache_seed,
+                chain.num_prompt_tokens,
+                chain.fingerprint,
+                chain.hashes.tobytes(),
+            )
+        ),
+        trace=None if trace is None else m.TraceContext(*trace),
+        dp_est_cached_tokens=seq.dp_est_cached_tokens,
+    )
+
+
+def _refused(seq_id, prompt: bytes, arrive_time, exc) -> m.SubmitItem:
+    return m.SubmitItem(
+        seq_id=seq_id,
+        prompt=prompt,
+        sampling=_DEFAULT_SAMPLING,
+        arrive_time=arrive_time,
+        refused=f"request not encodable: {_reason(exc)}",
+    )
+
+
+def _refused_item(item: m.SubmitItem, exc: BaseException) -> m.SubmitItem:
+    return _refused(item.seq_id, item.prompt, item.arrive_time, exc)
+
+
+def encode_submit(seqs) -> tuple[bytes, set[int]]:
+    """ADD for `seqs`, and the ids of those sent refused because they do not
+    encode: their Core rejects them, so they end like any refused request."""
+    refused: set[int] = set()
+    items = []
+    for seq in seqs:
+        try:
+            items.append(_submit_item(seq))
+        except Exception as exc:  # this request alone
+            logger.exception("seq %s does not encode", seq.id)
+            refused.add(seq.id)
+            prompt = _token_bytes(seq, 0, seq.num_prompt_tokens)
+            items.append(_refused(seq.id, prompt, seq.arrive_time, exc))
+
+    def refuse(item, exc):
+        refused.add(item.seq_id)
+        return _refused_item(item, exc)
+
+    return _encode_items(EngineCoreRequestType.ADD, m.Submit, items, refuse), refused
+
+
+def encode_input(request_type: EngineCoreRequestType, payload=None) -> bytes:
+    """A client's message to an EngineCore: ADD with `Sequence`s, ABORT with
+    their ids, SHUTDOWN, or a UTILITY / DP_PREFIX_CREDIT payload."""
+    if request_type == EngineCoreRequestType.ADD:
+        return encode_submit(payload)[0]
+    if request_type == EngineCoreRequestType.ABORT:
+        return _frame(request_type, m.Abort(list(payload)))
+    if request_type == EngineCoreRequestType.SHUTDOWN:
+        return _frame(request_type, m.Empty())
+    return _frame(request_type, _pickled(payload))
 
 
 class StreamOutputs(list):
     """A STREAM's `(seq_id, RequestOutput)` pairs.
 
     `cut_short`: the sequences this client ends here, rejected, while their
-    Core still runs them -- an entry of theirs did not decode. The client
-    tells the Core to stop them.
+    Core still runs them -- their step's KV-transfer params did not
+    unpickle. The client tells the Core to stop them.
     """
 
     cut_short: tuple = ()
 
 
-def _decode_stream(msg, reader: FrameReader) -> StreamOutputs:
-    counts = list(msg.token_counts)
-    tokens = list(msg.tokens)
-    if len(counts) != len(msg.seq_ids) or sum(counts) != len(tokens):
-        raise ProtocolError("stream columns disagree in length")
-    reasons = dict(msg.finish_reasons)
-    kv_outputs, undecodable = {}, {}
-    for i, value in msg.kv_transfer_params_outputs.items():
-        # One entry must not drop every other sequence's step.
-        try:
-            kv_outputs[i] = decode_value(value, reader)
-        except Exception as exc:
-            logger.exception("entry %d's kv_transfer_params_output does not decode", i)
-            undecodable[i] = (
-                f"{REJECTED_REASON}: kv_transfer_params_output not decodable: "
-                f"{type(exc).__name__}: {exc}"
-            )
-    logprobs = _decode_logprobs(msg, reader)
-    out = StreamOutputs()
-    start = 0
-    # A streamed output's request id is its sequence id (the Scheduler sets
-    # `request_id=seq.id`), so the wire carries it once.
-    for i, (seq_id, count, finished, cached) in enumerate(
-        zip(
-            list(msg.seq_ids),
-            counts,
-            list(msg.finished),
-            list(msg.num_cached_tokens),
-            strict=True,
+def _loaded_step_params(item, failed: list):
+    """A step's KV-transfer params, unpickled; None, with the reason in
+    `failed`, when they do not load -- one step's params must not lose every
+    other sequence's step."""
+    try:
+        return pickle.loads(item.kv_transfer_params_output)
+    except Exception as exc:
+        logger.exception(
+            "seq %s's kv_transfer_params_output does not load", item.seq_id
         )
-    ):
-        end = start + count
-        out.append(
+        failed.append((item.seq_id, exc))
+        return None
+
+
+def _stream_outputs(items) -> StreamOutputs:
+    failed: list = []
+    out = StreamOutputs(
+        [
             (
-                seq_id,
-                # Positional, in field order: this runs per sequence per step.
+                item.seq_id,
                 RequestOutput(
-                    seq_id,
-                    tokens[start:end],
-                    finished,
-                    reasons.get(i),
-                    kv_outputs.get(i),
-                    cached,
-                    logprobs.get(i),
+                    item.seq_id,
+                    item.output_tokens,
+                    item.finished,
+                    item.finish_reason,
+                    (
+                        None
+                        if item.kv_transfer_params_output is None
+                        else _loaded_step_params(item, failed)
+                    ),
+                    item.num_cached_tokens,
+                    item.logprobs,
                 ),
             )
-        )
-        start = end
-    if undecodable:
+            for item in items
+        ]
+    )
+    if failed:
+        reasons = dict(failed)
         cut_short = []
-        for i, reason in undecodable.items():
-            seq_id, output = out[i]
+        for seq_id, output in out:
+            exc = reasons.get(seq_id)
+            if exc is None:
+                continue
             if not output.finished:
                 cut_short.append(seq_id)
-            output.finished, output.finish_reason = True, reason
+            output.finished = True
+            output.finish_reason = (
+                f"rejected: kv_transfer_params_output not loadable: {_reason(exc)}"
+            )
         out.cut_short = tuple(cut_short)
     return out
 
 
-def decode_core_message(frames: list):
-    """`(kind, data)` for one message from an EngineCore.
-
-    ADD carries finished sequences as `CompletionResult`s, a rejected request
-    included (`rejected`, with a `leave_reason` that says why); STREAM carries
-    `(seq_id, RequestOutput)` pairs; SHUTDOWN means the Core is gone.
-    """
-    envelope = decode_envelope(frames)
-    reader = FrameReader(frames)
-    body = envelope.WhichOneof("body")
-    if body == "completions":
-        return EngineCoreRequestType.ADD, [
-            _decode_completion_alone(item, reader)
-            for item in envelope.completions.items
-        ]
-    if body == "stream":
-        return EngineCoreRequestType.STREAM, _decode_stream(envelope.stream, reader)
-    if body == "rejected":
-        return EngineCoreRequestType.ADD, [
-            CompletionResult(
-                id=item.seq_id,
-                leave_reason=f"{REJECTED_REASON}: {item.reason}",
-                rejected=True,
+def decode_output(buf):
+    """`(type, payload)` for an EngineCore's message, as the client always
+    had it: ADD's finished sequences (`Completion`s), STREAM's
+    `(seq_id, RequestOutput)` pairs, READY's dict (or None), SHUTDOWN's None,
+    and the rest as the Core pickled them."""
+    request_type, body = _decode(buf, _output_decoders)
+    if request_type == EngineCoreRequestType.STREAM:
+        return request_type, _stream_outputs(body.items)
+    if request_type == EngineCoreRequestType.ADD:
+        return request_type, body.items
+    if request_type == EngineCoreRequestType.READY:
+        if body.protocol_version != m.PROTOCOL_VERSION:
+            raise msgspec.DecodeError(
+                f"EngineCore speaks protocol {body.protocol_version}, "
+                f"this client {m.PROTOCOL_VERSION}"
             )
-            for item in envelope.rejected.items
-        ]
-    if body == "metrics":
-        return EngineCoreRequestType.METRICS, decode_optional_value(
-            envelope.metrics, "snapshot", reader
-        )
-    if body == "utility_reply":
-        return EngineCoreRequestType.UTILITY_RESPONSE, pickle.loads(
-            reader.view(envelope.utility_reply.payload)
-        )
-    if body == "admin_reply":
-        return EngineCoreRequestType.UTILITY_RESPONSE, _decode_admin_reply(
-            envelope.admin_reply, reader
-        )
-    if body == "ready":
-        ready = envelope.ready
-        payload = {}
-        if ready.HasField("max_pool_tokens"):
-            payload["max_pool_tokens"] = ready.max_pool_tokens
-        if ready.weight_syncs_unavailable:
-            payload["weight_syncs_unavailable"] = dict(ready.weight_syncs_unavailable)
-        return EngineCoreRequestType.READY, payload or None
-    if body == "prefill_backlog":
-        backlog = envelope.prefill_backlog
-        return EngineCoreRequestType.PREFILL_BACKLOG, (
-            backlog.ingested,
-            backlog.pending_prefill_tokens,
-            _pairs(backlog.credit_seq_ids, backlog.credits),
-        )
-    if body == "dp_reuse":
-        reuse = envelope.dp_reuse
-        return EngineCoreRequestType.DP_REUSE, _pairs(
-            reuse.seq_ids, reuse.reused_tokens
-        )
-    if body == "stopped":
-        return EngineCoreRequestType.SHUTDOWN, None
-    raise ProtocolError(f"unexpected message from an EngineCore: {body}")
+        ready = {}
+        if body.max_pool_tokens is not None:
+            ready["max_pool_tokens"] = body.max_pool_tokens
+        if body.weight_syncs_unavailable:
+            ready["weight_syncs_unavailable"] = body.weight_syncs_unavailable
+        return request_type, ready or None
+    if request_type == EngineCoreRequestType.SHUTDOWN:
+        return request_type, None
+    return request_type, pickle.loads(body.data)
 
 
-def _pairs(ids, values) -> list[tuple[int, int]]:
-    """Two parallel columns as the `(id, value)` pairs they encode."""
-    if len(ids) != len(values):
-        raise ProtocolError("paired columns disagree in length")
-    return list(zip(ids, values))
+# -------------------------------------------------------------- EngineCore --
 
 
-# ------------------------------------------------------------ core side ----
+def decode_input(buf):
+    """`(type, payload)` for a client's message: ADD's `SubmitItem`s (for
+    `admission.build_sequence`), ABORT's seq ids, SHUTDOWN's None, and a
+    UTILITY / DP_PREFIX_CREDIT payload as the client pickled it."""
+    request_type, body = _decode(buf, _input_decoders)
+    if request_type == EngineCoreRequestType.ADD:
+        return request_type, body.items
+    if request_type == EngineCoreRequestType.ABORT:
+        return request_type, body.seq_ids
+    if request_type == EngineCoreRequestType.SHUTDOWN:
+        return request_type, None
+    return request_type, pickle.loads(body.data)
 
 
-class AdmissionSpec:
-    """A decoded RequestSpec: the `Sequence` constructor's arguments, plus
-    what is set on a sequence after it is built."""
-
-    __slots__ = (
-        "arrive_time",
-        "cache_seed",
-        "dp_est_cached_tokens",
-        "kwargs",
-        "max_tokens",
-        "prompt_hash_chain",
-        "seq_id",
-        "trace",
-    )
-
-    def __init__(
-        self,
-        seq_id,
-        arrive_time,
-        cache_seed,
-        kwargs,
-        prompt_hash_chain=None,
-        trace=None,
-        max_tokens=None,
-        dp_est_cached_tokens=0,
-    ):
-        self.seq_id = seq_id
-        self.arrive_time = arrive_time
-        self.cache_seed = cache_seed
-        self.kwargs = kwargs
-        # The request's own cap; the shared SamplingParams in `kwargs` has none.
-        self.max_tokens = max_tokens
-        self.prompt_hash_chain = prompt_hash_chain
-        # `(carrier, model, request_id)`, as `tracing.wire_context` gave it.
-        self.trace = trace
-        self.dp_est_cached_tokens = dp_est_cached_tokens
-
-
-def _decode_spec(msg, reader: FrameReader) -> AdmissionSpec:
-    sampling_params, max_tokens = _decode_sampling_cached(msg.sampling)
-    kwargs = {
-        "token_ids": reader.int32_array(msg.prompt_token_ids),
-        "sampling_params": sampling_params,
-        "stop_token_sequences": [list(s.ids) for s in msg.stop_token_sequences],
-        "kv_transfer_params": decode_optional_value(msg, "kv_transfer_params", reader),
-        "needs_independent_noise": msg.needs_independent_noise,
-        "parent_request_id": _optional(msg, "parent_request_id"),
-        "sibling_index": msg.sibling_index,
-        "request_id": _optional(msg, "external_request_id"),
-        "multimodal_data": decode_optional_value(msg, "multimodal_data", reader),
-        "mrope_positions": decode_optional_value(msg, "mrope_positions", reader),
-        "mrope_position_delta": msg.mrope_position_delta,
-        "data_parallel_rank": _optional(msg, "data_parallel_rank"),
-        "dp_session_id": _optional(msg, "dp_session_id"),
-        "dp_parent_session_id": _optional(msg, "dp_parent_session_id"),
-    }
-    trace = None
-    if msg.HasField("trace"):
-        trace = (
-            dict(msg.trace.carrier),
-            msg.trace.model,
-            _optional(msg.trace, "request_id"),
-        )
-    return AdmissionSpec(
-        seq_id=msg.seq_id,
-        arrive_time=msg.arrive_time,
-        cache_seed=_optional(msg, "cache_seed"),
-        kwargs=kwargs,
-        prompt_hash_chain=(
-            _decode_chain(msg.prompt_hash_chain, reader)
-            if msg.HasField("prompt_hash_chain")
-            else None
+def sampling_params(item: m.SubmitItem) -> SamplingParams:
+    s = _sampling.decode(item.sampling)
+    channel = s.required_channel
+    return SamplingParams(
+        temperature=s.temperature,
+        top_k=s.top_k,
+        top_p=s.top_p,
+        max_tokens=s.max_tokens,
+        ignore_eos=s.ignore_eos,
+        stop_strings=s.stop_strings,
+        n=s.n,
+        logprobs=s.logprobs,
+        required_channel=(
+            None
+            if channel is None
+            else RequiredChannel(
+                channel.after, channel.opening, channel.opens_at, channel.end_ids
+            )
         ),
-        trace=trace,
-        max_tokens=max_tokens,
-        dp_est_cached_tokens=msg.dp_est_cached_tokens,
+        top_logprobs=s.top_logprobs,
+        json_schema=s.json_schema,
+        structured_tool_format=s.structured_tool_format,
+        structured_reasoning_end=s.structured_reasoning_end,
+        max_tokens_is_default=s.max_tokens_is_default,
     )
 
 
-def decode_client_message(frames: list):
-    """`(kind, data, failures)` for one message from a client.
+def prompt_token_ids(item: m.SubmitItem) -> array.array:
+    tokens = array.array("i")
+    tokens.frombytes(item.prompt)
+    return tokens
 
-    ADD's data is the `AdmissionSpec`s that decoded; `failures` lists
-    `(seq_id, reason, code)` for those that did not, each of which the Core
-    must reject so its client is not left waiting. UTILITY's data is `(cmd,
-    payload)`, from a Utility or an AdminCommand alike; ABORT's is the
-    sequence ids; DP_PREFIX_CREDIT's the `(seq_id, credit)` pairs.
-    """
-    envelope = decode_envelope(frames)
-    reader = FrameReader(frames)
-    body = envelope.WhichOneof("body")
-    if body == "submit":
-        specs, failures = [], []
-        for msg in envelope.submit.requests:
-            try:
-                specs.append(_decode_spec(msg, reader))
-            except Exception as exc:  # noqa: BLE001 - reported per request
-                failures.append(
-                    (
-                        msg.seq_id,
-                        f"{type(exc).__name__}: {exc}",
-                        REJECT_INVALID,
-                    )
-                )
-        return EngineCoreRequestType.ADD, specs, failures
-    if body == "utility":
-        payload = pickle.loads(reader.view(envelope.utility.payload))
-        return EngineCoreRequestType.UTILITY, (envelope.utility.cmd, payload), []
-    if body == "admin":
-        return EngineCoreRequestType.UTILITY, _decode_admin(envelope.admin), []
-    if body == "abort":
-        return EngineCoreRequestType.ABORT, list(envelope.abort.seq_ids), []
-    if body == "dp_prefix_credit":
-        credit = envelope.dp_prefix_credit
-        return (
-            EngineCoreRequestType.DP_PREFIX_CREDIT,
-            _pairs(credit.seq_ids, credit.credits),
-            [],
-        )
-    if body == "shutdown":
-        return EngineCoreRequestType.SHUTDOWN, None, []
-    raise ProtocolError(f"unexpected message from a client: {body}")
+
+def unpickled(data: bytes | None):
+    return None if data is None else pickle.loads(data)
+
+
+def media(item: m.SubmitItem) -> tuple:
+    """`(multimodal_data, mrope_positions)` as the client sent them."""
+    if item.multimodal is None:
+        return None, None
+    return unpickle_media(item.multimodal, item.multimodal_buffers)
+
+
+def shipped_chain(item: m.SubmitItem) -> ShippedChain | None:
+    chain = item.prompt_hash_chain
+    if chain is None:
+        return None
+    hashes = array.array("Q")
+    hashes.frombytes(chain.hashes)
+    return ShippedChain(
+        chain.hash_block_size,
+        chain.cache_seed,
+        chain.num_prompt_tokens,
+        chain.fingerprint,
+        hashes,
+    )
+
+
+def rejected(item: m.SubmitItem, reason: str, code: int) -> m.Completion:
+    """The completion a refused request ends with."""
+    return m.Completion(
+        seq_id=item.seq_id,
+        num_prompt_tokens=len(item.prompt) // 4,
+        arrive_time=item.arrive_time,
+        leave_reason=f"rejected: {reason}",
+        reject_code=code,
+    )
 
 
 def rejection_code(exc: BaseException) -> int:
     """INVALID for what a bad request raises, INTERNAL for anything else."""
     if isinstance(exc, (ValueError, TypeError, IndexError, KeyError, OverflowError)):
-        return REJECT_INVALID
-    return REJECT_INTERNAL
+        return m.REJECT_INVALID
+    return m.REJECT_INTERNAL
 
 
-def _encode_completion(seq, msg, writer: FrameWriter) -> None:
-    msg.seq_id = seq.id
-    writer.add(seq.completion_token_ids, msg.completion_token_ids)
-    if seq.return_logprobs:
-        # A copy, like the token slice above: the frame outlives this call.
-        writer.add(seq.logprobs[:], msg.logprobs)
-    msg.num_prompt_tokens = seq.num_prompt_tokens
-    msg.num_cached_tokens = seq.num_cached_tokens
-    msg.arrive_time = seq.arrive_time
-    msg.first_token_time = seq.first_token_time
-    msg.leave_time = seq.leave_time
-    msg.leave_reason = seq.leave_reason or ""
-    encode_optional_value(
-        seq.kv_transfer_params_output, msg, "kv_transfer_params_output", writer
+def _completion(seq) -> m.Completion:
+    if isinstance(seq, m.Completion):  # refused at admission
+        return seq
+    return m.Completion(
+        seq_id=seq.id,
+        completion_tokens=_token_bytes(seq, seq.num_prompt_tokens, seq.num_tokens),
+        logprobs_bytes=seq.logprobs.tobytes() if seq.return_logprobs else None,
+        return_logprobs=seq.return_logprobs,
+        num_prompt_tokens=seq.num_prompt_tokens,
+        num_cached_tokens=seq.num_cached_tokens,
+        arrive_time=seq.arrive_time,
+        first_token_time=seq.first_token_time,
+        leave_reason=seq.leave_reason,
+        prefill_completed=seq.prefill_completed,
+        json_schema=seq.json_schema,
+        structured_tool_format=seq.structured_tool_format,
     )
-    if seq.external_request_id is not None:
-        msg.external_request_id = seq.external_request_id
-    if seq.parent_request_id is not None:
-        msg.parent_request_id = seq.parent_request_id
-    msg.sibling_index = seq.sibling_index
-    msg.prefill_completed = seq.prefill_completed
 
 
-def encode_completions(seqs) -> tuple[list | None, list]:
-    """`(frames, rejections)`: the Completions of `seqs` (None if none
-    encodes), and `encode_rejected`'s items for those that do not -- one item
-    must not drop the whole batch, and its client still hears why it ended."""
-    writer = FrameWriter()
-    envelope = pb.Envelope()
-    items = envelope.completions.items
-    rejections = []
-    for seq in seqs:
-        msg = items.add()
-        try:
-            _encode_completion(seq, msg, writer)
-        except Exception as exc:
-            logger.exception("seq %s's completion does not encode", seq.id)
-            # What it wrote to the writer stays as unreferenced bytes.
-            del items[-1]
-            reason = f"completion not encodable: {type(exc).__name__}: {exc}"
-            rejections.append((seq.id, reason, REJECT_INTERNAL))
-    return (writer.frames(envelope) if items else None), rejections
+def _failed_completion(item: m.Completion, exc: BaseException) -> m.Completion:
+    return m.Completion(
+        seq_id=item.seq_id,
+        num_prompt_tokens=item.num_prompt_tokens,
+        arrive_time=item.arrive_time,
+        leave_reason=f"rejected: completion not encodable: {_reason(exc)}",
+        reject_code=m.REJECT_INTERNAL,
+    )
 
 
-def encode_stream(outputs) -> list:
-    """One step's `(seq_id, RequestOutput)` pairs, as columns."""
-    writer = FrameWriter()
-    envelope = pb.Envelope()
-    msg = envelope.stream
-    msg.SetInParent()
-    results = [output for _, output in outputs]
-    msg.seq_ids.extend([seq_id for seq_id, _ in outputs])
-    msg.token_counts.extend([len(output.output_tokens) for output in results])
-    msg.tokens.extend(chain.from_iterable(output.output_tokens for output in results))
-    msg.finished.extend([output.finished for output in results])
-    cached = [output.num_cached_tokens or 0 for output in results]
+def _step_params(seq_id, params) -> bytes | None:
+    """A step's KV-transfer params, pickled; None, and only this step's
+    params lost, when they do not pickle."""
     try:
-        msg.num_cached_tokens.extend(cached)
-    except (TypeError, ValueError):
-        # One entry's count must not drop the whole step: it reads as 0.
-        del msg.num_cached_tokens[:]
-        msg.num_cached_tokens.extend(map(_cached_count, outputs))
-    for i, output in enumerate(results):
-        if output.finish_reason is not None:
-            msg.finish_reasons[i] = output.finish_reason
-        if output.kv_transfer_params_output is not None:
-            try:
-                encode_value(
-                    output.kv_transfer_params_output,
-                    msg.kv_transfer_params_outputs[i],
-                    writer,
-                )
-            except Exception:  # one entry must not drop the whole step
-                # Every other sequence keeps this step's tokens; this one
-                # loses its params (its Completion cannot encode them either)
-                # and still ends on its finished flag.
-                del msg.kv_transfer_params_outputs[i]
-                logger.exception(
-                    "dropping seq %s's unencodable kv_transfer_params_output",
-                    outputs[i][0],
-                )
-    _encode_logprobs(results, msg, writer)
-    return writer.frames(envelope)
+        return _optional_pickle(params)
+    except Exception:
+        logger.exception("seq %s's kv_transfer_params_output does not pickle", seq_id)
+        return None
 
 
-def _cached_count(pair) -> int:
-    seq_id, output = pair
-    count = output.num_cached_tokens or 0
-    if type(count) is int and 0 <= count < 1 << 63:
-        return count
-    logger.error("seq %s's num_cached_tokens %r is not a count", seq_id, count)
-    return 0
+def _bare_step(item: m.StreamItem, exc: BaseException) -> m.StreamItem:
+    # Its tokens still go; the rest rides its Completion, or is lost with it.
+    return m.StreamItem(item.seq_id, item.output_tokens, item.finished)
 
 
-def _encode_logprobs(results, msg, writer: FrameWriter) -> None:
-    """`StreamBatch`'s logprob columns for `results`' token logprobs."""
-    entries, counts, widths, floats, ints = [], [], [], [], []
-    for i, output in enumerate(results):
-        records = output.logprobs
-        if records is None:
-            continue
-        width = (len(records[0]) - 2) // 2 if records else 0
-        entries.append(i)
-        counts.append(len(records))
-        widths.append(width)
-        for record in records:
-            if len(record) != 2 * width + 2:
-                raise ProtocolError(
-                    "token logprob records of one entry differ in width"
-                )
-            floats.append(record[0])
-            floats.extend(record[3::2])
-            ints.append(record[1])
-            ints.extend(record[2::2])
-    if entries:
-        msg.logprob_entries.extend(entries)
-        msg.logprob_counts.extend(counts)
-        msg.logprob_widths.extend(widths)
-        # Data frames, not packed fields: a reader then views them in place
-        # instead of materializing one Python number per value.
-        writer.add(array.array("d", floats), msg.logprob_floats)
-        writer.add(array.array("i", ints), msg.logprob_ints)
-
-
-def _decode_logprobs(msg, reader: FrameReader) -> dict:
-    """Entry index -> its records, from `StreamBatch`'s logprob columns."""
-    counts = list(msg.logprob_counts)
-    widths = list(msg.logprob_widths)
-    if len(counts) != len(msg.logprob_entries) or len(widths) != len(counts):
-        raise ProtocolError("logprob columns disagree in length")
-    if not counts:
-        return {}
-    total = sum(count * (width + 1) for count, width in zip(counts, widths))
-    floats = np.frombuffer(reader.view(msg.logprob_floats), dtype="<f8")
-    ints = np.frombuffer(reader.view(msg.logprob_ints), dtype="<i4")
-    if total != len(floats) or total != len(ints):
-        raise ProtocolError("logprob columns disagree in length")
-    # Entries without records (a finished one's `[]`) carry no width.
-    record_widths = {width for width, count in zip(widths, counts) if count}
-    if len(record_widths) <= 1:
-        # One step's records share their width: build them all at once, the
-        # way the runner unpacks them (`token_logprobs.unpack_token_logprobs`).
-        width = record_widths.pop() if record_widths else 0
-        records = _logprob_records(floats, ints, width)
-    else:
-        records = _logprob_records_by_entry(floats, ints, counts, widths)
-    out = {}
-    pos = 0
-    for entry, count in zip(msg.logprob_entries, counts):
-        out[entry] = records[pos : pos + count]
-        pos += count
-    return out
-
-
-@cache
-def _logprob_record_dtype(width: int) -> np.dtype:
-    columns = [("logprob", "<f8"), ("rank", "<i4")]
-    for i in range(width):
-        columns += [(f"id{i}", "<i4"), (f"value{i}", "<f8")]
-    return np.dtype(columns)
-
-
-def _logprob_records(floats, ints, width: int) -> list:
-    """Every record, all `width` wide, as tuples built in one `tolist`."""
-    floats = floats.reshape(-1, width + 1)
-    ints = ints.reshape(-1, width + 1)
-    records = np.empty(len(floats), dtype=_logprob_record_dtype(width))
-    records["logprob"] = floats[:, 0]
-    records["rank"] = ints[:, 0]
-    for i in range(width):
-        records[f"id{i}"] = ints[:, i + 1]
-        records[f"value{i}"] = floats[:, i + 1]
-    return records.tolist()
-
-
-def _logprob_records_by_entry(floats, ints, counts, widths) -> list:
-    floats, ints = floats.tolist(), ints.tolist()
-    records = []
-    pos = 0
-    for count, width in zip(counts, widths):
-        for _ in range(count):
-            end = pos + width + 1
-            f, n = floats[pos:end], ints[pos:end]
-            records.append((f[0], n[0], *chain.from_iterable(zip(n[1:], f[1:]))))
-            pos = end
-    return records
-
-
-def encode_rejected(rejections) -> list:
-    """`rejections`: `(seq_id, reason, code)`, code a RejectedRequest.Code."""
-    envelope = pb.Envelope()
-    envelope.rejected.SetInParent()
-    for seq_id, reason, code in rejections:
-        item = envelope.rejected.items.add()
-        item.seq_id = seq_id
-        item.reason = reason
-        item.code = code
-    return FrameWriter().frames(envelope)
-
-
-def encode_ready(payload) -> list:
-    """EngineCore's READY payload: None, or a dict of the facts in `Ready`."""
-    envelope = pb.Envelope()
-    envelope.ready.SetInParent()
-    if payload is not None:
-        unknown = set(payload) - {"max_pool_tokens", "weight_syncs_unavailable"}
-        if unknown:
-            # A new startup fact needs a Ready field, not a silent drop.
-            raise ProtocolError(f"Ready has no field for {sorted(unknown)}")
-        if payload.get("max_pool_tokens") is not None:
-            envelope.ready.max_pool_tokens = payload["max_pool_tokens"]
-        envelope.ready.weight_syncs_unavailable.update(
-            payload.get("weight_syncs_unavailable") or {}
+def encode_output(request_type: EngineCoreRequestType, payload=None) -> bytes:
+    """An EngineCore's message: ADD with finished `Sequence`s (or refused
+    `Completion`s), STREAM with `(seq_id, RequestOutput)` pairs, READY with
+    its dict, SHUTDOWN, or a payload only Python reads."""
+    if request_type == EngineCoreRequestType.STREAM:
+        items = [
+            m.StreamItem(
+                seq_id,
+                out.output_tokens,
+                out.finished,
+                out.finish_reason,
+                _step_params(seq_id, out.kv_transfer_params_output),
+                out.num_cached_tokens or 0,
+                out.logprobs,
+            )
+            for seq_id, out in payload
+        ]
+        return _encode_items(request_type, m.Stream, items, _bare_step)
+    if request_type == EngineCoreRequestType.ADD:
+        items = [_completion(seq) for seq in payload]
+        return _encode_items(request_type, m.Completions, items, _failed_completion)
+    if request_type == EngineCoreRequestType.READY:
+        payload = payload or {}
+        return _frame(
+            request_type,
+            m.Ready(
+                max_pool_tokens=payload.get("max_pool_tokens"),
+                weight_syncs_unavailable=payload.get("weight_syncs_unavailable") or {},
+            ),
         )
-    return FrameWriter().frames(envelope)
-
-
-def encode_metrics(snapshot) -> list:
-    writer = FrameWriter()
-    envelope = pb.Envelope()
-    envelope.metrics.SetInParent()
-    encode_optional_value(snapshot, envelope.metrics, "snapshot", writer)
-    return writer.frames(envelope)
-
-
-def encode_utility_reply(reply) -> list:
-    """A utility handler's reply: an AdminReply when it answers a typed admin
-    command in the shape those take, a pickled UtilityReply otherwise."""
-    kind = ADMIN_COMMANDS.get(reply.get("cmd")) if isinstance(reply, dict) else None
-    if kind is not None and _fits_admin_reply(reply):
-        return _encode_admin_reply(kind, reply)
-    writer = FrameWriter()
-    envelope = pb.Envelope()
-    request_id = reply.get("request_id") if isinstance(reply, dict) else None
-    if isinstance(request_id, str):
-        envelope.utility_reply.request_id = request_id
-    writer.add(
-        pickle.dumps(reply, protocol=pickle.HIGHEST_PROTOCOL),
-        envelope.utility_reply.payload,
-    )
-    return writer.frames(envelope)
-
-
-def _fits_admin_reply(reply: dict) -> bool:
-    request_id = reply.get("request_id")
-    return (
-        set(reply) <= {"cmd", "result", "error", "request_id"}
-        and ("result" in reply) != ("error" in reply)
-        and isinstance(reply.get("error", ""), str)
-        and (request_id is None or isinstance(request_id, str))
-    )
-
-
-def _encode_admin_reply(kind, reply: dict) -> list:
-    writer = FrameWriter()
-    envelope = pb.Envelope()
-    msg = envelope.admin_reply
-    msg.kind = kind
-    if reply.get("request_id") is not None:
-        msg.request_id = reply["request_id"]
-    if "error" in reply:
-        msg.error = reply["error"]
-    else:
-        encode_value(reply["result"], msg.result, writer)
-    return writer.frames(envelope)
-
-
-def _decode_admin_reply(msg, reader: FrameReader) -> dict:
-    name = _ADMIN_NAMES.get(msg.kind)
-    if name is None:
-        raise ProtocolError(f"unknown admin command {msg.kind}")
-    # The dict the handler built, keys in its order.
-    reply = {"cmd": name}
-    if msg.HasField("error"):
-        reply["error"] = msg.error
-    else:
-        reply["result"] = decode_value(msg.result, reader)
-    if msg.HasField("request_id"):
-        reply["request_id"] = msg.request_id
-    return reply
-
-
-def encode_prefill_backlog(report) -> list:
-    """`(ingested, pending prefill tokens, applied credits)`, the last as the
-    `(seq_id, credit)` pairs the Core took from `DpPrefixCredit`."""
-    ingested, pending, applied = report
-    envelope = pb.Envelope()
-    msg = envelope.prefill_backlog
-    msg.SetInParent()
-    msg.ingested = ingested
-    msg.pending_prefill_tokens = pending
-    for seq_id, credit in applied:
-        msg.credit_seq_ids.append(seq_id)
-        msg.credits.append(credit)
-    return FrameWriter().frames(envelope)
-
-
-def encode_dp_reuse(reports) -> list:
-    """`[(seq_id, prompt tokens reused)]`."""
-    envelope = pb.Envelope()
-    msg = envelope.dp_reuse
-    msg.SetInParent()
-    for seq_id, reused in reports:
-        msg.seq_ids.append(seq_id)
-        msg.reused_tokens.append(reused)
-    return FrameWriter().frames(envelope)
-
-
-def encode_stopped() -> list:
-    envelope = pb.Envelope()
-    envelope.stopped.SetInParent()
-    return FrameWriter().frames(envelope)
+    if request_type == EngineCoreRequestType.SHUTDOWN:
+        return _frame(request_type, m.Empty())
+    return _frame(request_type, _pickled(payload))

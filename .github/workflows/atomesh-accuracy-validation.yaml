@@ -5,7 +5,7 @@ on:
     branches: [main]
     paths:
       - 'atom/mesh/**'
-      # Standalone serves through the Python launcher and engine_v1.
+      # Standalone serves through the Python launcher and the engine wire protocol.
       - 'atom/entrypoints/atomesh/**'
       - 'atom/model_engine/zmq_protocol/**'
       - '.github/workflows/atomesh-accuracy-validation.yaml'

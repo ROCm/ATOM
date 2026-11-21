@@ -2,7 +2,7 @@
 
 High-performance model routing gateway for **PD (Prefill–Decode) disaggregated** LLM serving. It routes inference across heterogeneous worker fleets with cache-aware load balancing, a gRPC pipeline that keeps tokenization in Rust, and built-in reliability primitives.
 
-Atomesh can also run in an **ATOM standalone** mode. In this mode Python parses the arguments, decides what needs ATOM's own machinery (chat template, reasoning dialect and switch, tool-call format) and spawns and reaps the EngineCores; the Rust runtime (`src/atom_engine`, `src/routers/atom_engine`) is the EngineCores' only client, speaking the engine_v1 protocol (`atom/model_engine/zmq_protocol/engine_v1.proto`) to them over ZMQ, and does all request handling: templating, tokenization, DP placement, detokenization, parsers and HTTP.
+Atomesh can also run in an **ATOM standalone** mode. In this mode Python parses the arguments, decides what needs ATOM's own machinery (chat template, reasoning dialect and switch, tool-call format) and spawns and reaps the EngineCores; the Rust runtime (`src/atom_engine`, `src/routers/atom_engine`) is the EngineCores' only client, speaking the engine wire protocol (msgpack; `atom/model_engine/zmq_protocol/messages.py`) to them over ZMQ, and does all request handling: templating, tokenization, DP placement, detokenization, parsers and HTTP.
 
 ## Features
 

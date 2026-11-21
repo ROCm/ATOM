@@ -10,7 +10,7 @@ use http::HeaderMap;
 
 use super::{bad_request, not_yet, token_source::SeqTokenSource, AtomEngineRouter};
 use crate::{
-    atom_engine::{wire::pb, ModelSpec, Submission},
+    atom_engine::{wire, ModelSpec, Submission},
     protocols::common::StringOrArray,
     routers::{
         prepare::{generation_payload::GenerationPayload, response_context::ResponseContext},
@@ -97,13 +97,11 @@ impl AtomEngineRouter {
                 .map_err(|e| bad_request(format!("cannot tokenize stop string: {e}")))?;
             if !encoding.token_ids().is_empty() {
                 let ids = encoding.token_ids().iter().map(|&t| t as i32).collect();
-                stop_token_sequences.push(pb::TokenIds { ids });
+                stop_token_sequences.push(ids);
             }
         }
         for &id in payload.stop.stop_token_ids.iter().flatten() {
-            stop_token_sequences.push(pb::TokenIds {
-                ids: vec![id as i32],
-            });
+            stop_token_sequences.push(vec![id as i32]);
         }
 
         let sampling = sampling_params(
@@ -217,23 +215,17 @@ fn sampling_params(
     model: &ModelSpec,
     payload: &GenerationPayload,
     settled: Settled,
-) -> pb::SamplingParams {
+) -> wire::Sampling {
     let stop_strings = settled.stop_strings;
-    pb::SamplingParams {
-        temperature: Some(payload.sampling.temperature as f64),
-        top_k: Some(payload.sampling.top_k as i64),
-        top_p: Some(payload.sampling.top_p as f64),
-        max_tokens: Some(settled.max_tokens as i64),
+    wire::Sampling {
+        temperature: payload.sampling.temperature as f64,
+        top_k: payload.sampling.top_k as i64,
+        top_p: payload.sampling.top_p as f64,
+        max_tokens: settled.max_tokens as i64,
         ignore_eos: payload.sampling.ignore_eos,
-        stop_strings: (!stop_strings.is_empty()).then_some(pb::StopStrings {
-            value: Some(pb::stop_strings::Value::Many(pb::StringList {
-                items: stop_strings,
-            })),
-        }),
-        n: Some(settled.n),
-        logprobs: settled
-            .logprobs
-            .then_some(pb::sampling_params::Logprobs::LogprobsFlag(true)),
+        stop_strings: (!stop_strings.is_empty()).then_some(stop_strings),
+        n: settled.n,
+        logprobs: settled.logprobs.then_some(true),
         top_logprobs: 0,
         required_channel: model
             .required_channel

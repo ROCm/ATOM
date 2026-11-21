@@ -28,22 +28,15 @@ from test_state_checkpoint import (
 
 from atom.model_engine.admission import AdmissionContext
 from atom.model_engine.block_manager import AdmissionProbe, BlockManager
-from atom.model_engine.prefix_hash import chained_block_hashes, ship_prompt_hash_chain
+from atom.model_engine.prefix_hash import (
+    attach_shipped_chains,
+    chained_block_hashes,
+    ship_prompt_hash_chain,
+    take_shipped_chains,
+)
 from atom.model_engine.sequence import Sequence
-from atom.model_engine.zmq_protocol import engine_v1_pb2 as pb
-from atom.model_engine.zmq_protocol.codec import (
-    _decode_chain,
-    _encode_chain,
-    decode_client_message,
-    encode_shutdown,
-)
-from atom.model_engine.zmq_protocol.wire import (
-    FrameReader,
-    FrameWriter,
-    decode_envelope,
-)
+from atom.model_engine.zmq_protocol.codec import decode_input, encode_input
 from atom.sampling_params import SamplingParams
-from engine_v1_helpers import received
 
 BLOCK = 4
 
@@ -436,22 +429,10 @@ def test_shipped_chain_equals_engine_chain(seed, dcp, length):
 
 
 def over_ipc(seqs):
-    """The trip to the engine: each chain as the wire protocol's
-    `PromptHashChain`, beside a pickled seq (which drops its chain)."""
-    out = []
-    for seq in seqs:
-        writer = FrameWriter()
-        envelope = pb.Envelope()
-        spec = envelope.submit.requests.add()
-        _encode_chain(seq.prompt_hash_chain, spec.prompt_hash_chain, writer)
-        frames = received(writer.frames(envelope))
-        twin = pickle.loads(pickle.dumps(seq))
-        twin.prompt_hash_chain = _decode_chain(
-            decode_envelope(frames).submit.requests[0].prompt_hash_chain,
-            FrameReader(frames),
-        )
-        out.append(twin)
-    return out
+    """The ADD frame's trip: seqs pickled, their chains beside them."""
+    seqs, chains = pickle.loads(pickle.dumps((seqs, take_shipped_chains(seqs))))
+    attach_shipped_chains(seqs, chains)
+    return seqs
 
 
 PROMPT = list(range(40)) + [900, 901, 902]
@@ -541,7 +522,7 @@ def _real(name, monkeypatch):
 
 @pytest.mark.parametrize("manager", ["CoreManager", "DisaggCoreManager"])
 def test_the_chain_rides_beside_the_seqs(monkeypatch, manager):
-    """Frontend to engine in the SubmitBatch, beside the seqs; the frontend
+    """Frontend to engine in the ADD frame, next to the seqs; the frontend
     keeps no copy, and the disaggregated prefill engine (no BlockManager)
     gets none."""
     tokens = list(range(41))
@@ -550,20 +531,20 @@ def test_the_chain_rides_beside_the_seqs(monkeypatch, manager):
         getattr(_real("atom.model_engine.engine_core_mgr", monkeypatch), manager)
     )
     mgr.label, mgr.pp_size, mgr.local_engine_count = "test", 1, 1
-    mgr._seq_id_to_callback, sent = {}, []
-    mgr._send_request = lambda rank, frames: sent.append((rank, frames))
+    mgr._seq_id_to_callback, frames = {}, []
+    mgr._send_request = lambda rank, payload: frames.append((rank, payload))
     mgr.add_request(seqs)
     assert all(s.prompt_hash_chain is None for s in seqs)
     if manager == "DisaggCoreManager":
-        (rank, frames), (prefill, prefill_frames) = sent
-        _, specs, _ = decode_client_message(received(prefill_frames))
-        assert (rank, prefill) == (1, 0)
-        assert [spec.prompt_hash_chain for spec in specs] == [None] * 3
+        (rank, frame), (prefill, prefill_frame) = frames
+        _, prefill_items = decode_input(prefill_frame)
+        assert (rank, prefill, len(prefill_items)) == (1, 0, 3)
+        assert all(item.prompt_hash_chain is None for item in prefill_items)
     else:
-        [(rank, frames)] = sent
+        [(rank, frame)] = frames
     core = _real("atom.model_engine.engine_core", monkeypatch)
-    feed = iter([received(frames), received(encode_shutdown())])
-    sock = SimpleNamespace(send=lambda _: None, recv_multipart=lambda **_: next(feed))
+    feed = iter([frame, encode_input(core.EngineCoreRequestType.SHUTDOWN)])
+    sock = SimpleNamespace(send=lambda _: None, recv=lambda **_: next(feed))
     monkeypatch.setattr(core, "make_zmq_socket", lambda *a, **kw: nullcontext(sock))
     poller = SimpleNamespace(register=lambda *a: None, poll=lambda: [(sock, 1)])
     monkeypatch.setattr(core.zmq, "Poller", lambda: poller)
@@ -575,8 +556,11 @@ def test_the_chain_rides_beside_the_seqs(monkeypatch, manager):
         SimpleNamespace(
             kv_cache_block_size=BLOCK,
             speculative_config=None,
+            hf_config=SimpleNamespace(model_type="qwen3_5_moe_text"),
+            end_token_ids=(2,),
             enable_dp_attention=False,
-            hf_config=SimpleNamespace(model_type="llama"),
+            kv_transfer_config=None,
+            enable_rapidserve=False,
         )
     )
     engine.process_input_sockets("input", "control")
@@ -586,7 +570,8 @@ def test_the_chain_rides_beside_the_seqs(monkeypatch, manager):
 
 
 def test_a_pickled_seq_never_carries_a_chain():
-    """Neither to the engine (the ADD frame carries it) nor back."""
+    """Wherever a seq is still pickled (FrontendHub, runner, PP / disagg
+    channels) it leaves its chain behind; the ADD message carries it."""
     seq = shipped_seq(PROMPT)
     assert pickle.loads(pickle.dumps(seq)).prompt_hash_chain is None
     assert seq.prompt_hash_chain is not None

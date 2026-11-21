@@ -15,7 +15,7 @@ use crate::{
     atom_engine::{
         spec::ModelSpec,
         test_support::{self, FakeCore},
-        wire::pb,
+        wire::{self, kind, reject},
         AtomEngine,
     },
     config::RouterConfig,
@@ -171,32 +171,31 @@ impl Served {
     }
 }
 
-/// A Core that has answered, with the submission it received: its sequences
-/// and data frames.
-type Answered = (FakeCore, Vec<pb::RequestSpec>, Vec<Vec<u8>>);
+/// A Core that has answered, with the sequences it was submitted.
+type Answered = (FakeCore, Vec<wire::SubmitItem>);
 
 /// Play every Core in `cores` from its own thread: take one submission and
 /// answer each of its sequences with `answer`, then hand the Core and what it
 /// received back.
 fn answer_each(
     cores: Vec<FakeCore>,
-    answer: impl Fn(&FakeCore, &pb::RequestSpec) + Send + Sync + Copy + 'static,
+    answer: impl Fn(&FakeCore, &wire::SubmitItem) + Send + Sync + Copy + 'static,
 ) -> Vec<thread::JoinHandle<Answered>> {
     cores
         .into_iter()
         .map(|core| {
             thread::spawn(move || {
-                let (specs, data) = core.submitted().expect("a submission");
+                let specs = core.submitted().expect("a submission");
                 for spec in &specs {
                     answer(&core, spec);
                 }
-                (core, specs, data)
+                (core, specs)
             })
         })
         .collect()
 }
 
-fn hello_world(core: &FakeCore, spec: &pb::RequestSpec) {
+fn hello_world(core: &FakeCore, spec: &wire::SubmitItem) {
     core.stream(&[(spec.seq_id, &[HELLO], None)]);
     core.stream(&[(spec.seq_id, &[WORLD], Some("eos"))]);
 }
@@ -224,7 +223,7 @@ async fn a_chat_is_prepared_submitted_and_rendered() {
     let response = served
         .post("/v1/chat/completions", user_hello(json!({})))
         .await;
-    let (_, specs, data) = core.into_iter().next().unwrap().join().unwrap();
+    let (_, specs) = core.into_iter().next().unwrap().join().unwrap();
 
     let (status, body) = json_body(response).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -232,9 +231,9 @@ async fn a_chat_is_prepared_submitted_and_rendered() {
     assert_eq!(body["choices"][0]["finish_reason"], "stop");
     // `user: hello` `assistant:`, rendered by the template, as the prompt.
     assert_eq!(
-        data[0],
-        test_support::token_frame(&[3, 5, HELLO, 4, 5]),
-        "the prompt frame"
+        specs[0].prompt,
+        test_support::token_bytes(&[3, 5, HELLO, 4, 5]),
+        "the prompt"
     );
     assert_eq!(body["usage"]["prompt_tokens"], 5);
     assert_eq!(body["usage"]["completion_tokens"], 2);
@@ -242,8 +241,7 @@ async fn a_chat_is_prepared_submitted_and_rendered() {
     let [spec] = &specs[..] else {
         panic!("{specs:?}")
     };
-    let sampling = spec.sampling.as_ref().unwrap();
-    assert_eq!(sampling.max_tokens, Some(16));
+    assert_eq!(spec.sampling.max_tokens, 16);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -292,7 +290,7 @@ async fn siblings_run_on_both_ranks_and_count_the_prompt_once() {
         )
         .await;
     for core in cores {
-        let (_, specs, _) = core.join().unwrap();
+        let (_, specs) = core.join().unwrap();
         assert_eq!(specs.len(), 1, "one sibling a rank");
     }
 
@@ -309,26 +307,27 @@ async fn siblings_run_on_both_ranks_and_count_the_prompt_once() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rejection_answers_with_its_codes_status() {
-    use pb::rejected_request::Code;
     for (code, status) in [
-        (Code::Invalid, StatusCode::BAD_REQUEST),
-        (Code::Overloaded, StatusCode::SERVICE_UNAVAILABLE),
-        (Code::Internal, StatusCode::INTERNAL_SERVER_ERROR),
+        (reject::INVALID, StatusCode::BAD_REQUEST),
+        (reject::OVERLOADED, StatusCode::SERVICE_UNAVAILABLE),
+        (reject::INTERNAL, StatusCode::INTERNAL_SERVER_ERROR),
     ] {
         let mut served = Served::start(1).await;
         let core = thread::spawn({
             let core = served.cores.pop().unwrap();
             move || {
-                let (specs, _) = core.submitted().expect("a submission");
+                let specs = core.submitted().expect("a submission");
+                let refused = wire::Completion {
+                    seq_id: specs[0].seq_id,
+                    leave_reason: "rejected: refused".into(),
+                    reject_code: code,
+                    ..Default::default()
+                };
                 core.send(
-                    pb::envelope::Body::Rejected(pb::Rejected {
-                        items: vec![pb::RejectedRequest {
-                            seq_id: specs[0].seq_id,
-                            reason: "refused".into(),
-                            code: code as i32,
-                        }],
-                    }),
-                    vec![],
+                    kind::ADD,
+                    &wire::Completions {
+                        items: vec![refused],
+                    },
                 );
                 core
             }
@@ -423,7 +422,7 @@ async fn health_follows_the_cores() {
             .status()
     };
     assert_eq!(health().await, StatusCode::OK);
-    served.cores[1].send(pb::envelope::Body::Stopped(pb::Stopped {}), vec![]);
+    served.cores[1].send(kind::SHUTDOWN, &wire::Empty {});
     tokio::time::timeout(test_support::WAIT, served.router.engine.client.wait_lost())
         .await
         .expect("the loss is reported");
@@ -445,15 +444,14 @@ async fn a_completion_ignores_what_python_v1_does_not_declare() {
             }),
         )
         .await;
-    let (_, specs, _) = core.into_iter().next().unwrap().join().unwrap();
+    let (_, specs) = core.into_iter().next().unwrap().join().unwrap();
 
     let (status, body) = json_body(response).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     // No echoed prompt, no suffix: the completion alone.
     assert_eq!(body["choices"][0]["text"], "hello world");
     // `max_completion_tokens` over `max_tokens`, as `get_max_tokens` takes it.
-    let sampling = specs[0].sampling.as_ref().unwrap();
-    assert_eq!(sampling.max_tokens, Some(4));
+    assert_eq!(specs[0].sampling.max_tokens, 4);
     // ATOM's timing, and no cache hit: completions do not report one.
     let usage = &body["usage"];
     assert!(usage["ttft_s"].as_f64().unwrap() >= 0.0, "{usage}");
@@ -619,7 +617,7 @@ async fn requests_the_python_server_refuses_are_refused() {
 /// precedes `</think>` is reasoning, streamed or not.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_prompt_that_opens_reasoning_leaves_the_reply_inside_it() {
-    fn think_then_answer(core: &FakeCore, spec: &pb::RequestSpec) {
+    fn think_then_answer(core: &FakeCore, spec: &wire::SubmitItem) {
         core.stream(&[(spec.seq_id, &[HELLO, THINK_END, WORLD], Some("eos"))]);
     }
 
@@ -663,7 +661,7 @@ async fn a_prompt_that_opens_reasoning_leaves_the_reply_inside_it() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_long_non_streamed_reply_is_split_into_reasoning_and_content() {
     const WORDS: usize = 20_000;
-    fn think_long(core: &FakeCore, spec: &pb::RequestSpec) {
+    fn think_long(core: &FakeCore, spec: &wire::SubmitItem) {
         let mut ids = vec![HELLO; WORDS];
         ids.extend([THINK_END, WORLD]);
         core.stream(&[(spec.seq_id, &ids, Some("eos"))]);
@@ -691,7 +689,7 @@ async fn a_long_non_streamed_reply_is_split_into_reasoning_and_content() {
 fn long_reasoning_then(
     count: usize,
     tail: &'static [i32],
-) -> impl Fn(&FakeCore, &pb::RequestSpec) + Send + Sync + Copy + 'static {
+) -> impl Fn(&FakeCore, &wire::SubmitItem) + Send + Sync + Copy + 'static {
     move |core, spec| {
         let mut ids = vec![HELLO; count];
         ids.push(THINK_END);
@@ -704,7 +702,7 @@ fn long_reasoning_then(
 async fn answered_chat(
     mut served: Served,
     body: Value,
-    answer: impl Fn(&FakeCore, &pb::RequestSpec) + Send + Sync + Copy + 'static,
+    answer: impl Fn(&FakeCore, &wire::SubmitItem) + Send + Sync + Copy + 'static,
 ) -> Value {
     let core = answer_each(std::mem::take(&mut served.cores), answer);
     let response = served.post("/v1/chat/completions", body).await;
@@ -756,7 +754,7 @@ async fn a_long_kimi_reply_is_split_at_its_own_closer() {
         reasoning_parser: Some("kimi".into()),
         ..Default::default()
     };
-    fn answer(core: &FakeCore, spec: &pb::RequestSpec) {
+    fn answer(core: &FakeCore, spec: &wire::SubmitItem) {
         let mut ids = vec![HELLO; WORDS];
         ids.extend([KIMI_END, 6, WORLD]);
         core.stream(&[(spec.seq_id, &ids, Some("eos"))]);
@@ -837,10 +835,10 @@ async fn history_tool_call_arguments_reach_the_template_as_the_spec_says() {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        let (_, _, data) = core.into_iter().next().unwrap().join().unwrap();
+        let (_, specs) = core.into_iter().next().unwrap().join().unwrap();
         assert_eq!(
-            data[0],
-            test_support::token_frame(&[read_as, 4, 5]),
+            specs[0].prompt,
+            test_support::token_bytes(&[read_as, 4, 5]),
             "preserve={preserve}"
         );
     }
@@ -881,16 +879,10 @@ async fn stop_strings_and_ids_reach_the_core_as_token_sequences() {
     }));
     let (status, body) = json_body(served.post("/v1/chat/completions", body).await).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let (_, specs, _) = core.into_iter().next().unwrap().join().unwrap();
-    let ids = |ids: &[i32]| pb::TokenIds { ids: ids.to_vec() };
+    let (_, specs) = core.into_iter().next().unwrap().join().unwrap();
     assert_eq!(
         specs[0].stop_token_sequences,
-        [
-            ids(&[WORLD]),
-            ids(&[HELLO, WORLD]),
-            ids(&[THINK_END]),
-            ids(&[LT])
-        ]
+        [vec![WORLD], vec![HELLO, WORLD], vec![THINK_END], vec![LT]]
     );
 }
 
@@ -943,7 +935,11 @@ async fn template_kwargs_merge_as_the_python_server_merges_them() {
         let body = user_hello(extra.clone());
         let (status, body) = json_body(served.post("/v1/chat/completions", body).await).await;
         assert_eq!(status, StatusCode::OK, "{extra}: {body}");
-        let (_, _, data) = core.into_iter().next().unwrap().join().unwrap();
-        assert_eq!(data[0], test_support::token_frame(&prompt), "{extra}");
+        let (_, specs) = core.into_iter().next().unwrap().join().unwrap();
+        assert_eq!(
+            specs[0].prompt,
+            test_support::token_bytes(&prompt),
+            "{extra}"
+        );
     }
 }

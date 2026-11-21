@@ -87,6 +87,14 @@ def get_multimodal_input_builder(
     return _resolve(builder or "atom.models.qwen3_5_vl.build_qwen_vl_inputs")
 
 
+def uses_mrope(atom_config: Config) -> bool:
+    """Whether `get_mrope_input_positions` can return positions for this
+    model: only an architecture in the MRoPE model table has them."""
+    hf_config = getattr(atom_config, "hf_config", None)
+    architectures = getattr(hf_config, "architectures", None) or []
+    return bool(architectures) and architectures[0] in _MULTIMODAL_ARCH_TO_MODEL
+
+
 def get_mrope_input_positions(
     atom_config: Config,
     input_tokens: list[int],

@@ -551,10 +551,6 @@ def test_mesh_build_uses_writable_copy_and_archives_resolved_dependencies(
     (source / "target" / "old-artifact").touch()
     if has_lock:
         (source / "Cargo.lock").write_text("existing lock")
-    # build.rs reads the engine protocol beside the mesh crate, as in atom/.
-    proto = tmp_path / "model_engine" / "zmq_protocol" / "engine_v1.proto"
-    proto.parent.mkdir(parents=True)
-    proto.write_text('syntax = "proto3";\n')
     binary_dir = tmp_path / "bin"
     binary_dir.mkdir()
     cargo = binary_dir / "cargo"
@@ -566,8 +562,6 @@ def test_mesh_build_uses_writable_copy_and_archives_resolved_dependencies(
         "source=Path(args[args.index('--manifest-path')+1]).parent\n"
         "target=Path(args[args.index('--target-dir')+1])\n"
         "assert not (source/'target').exists()\n"
-        "proto=source.parent/'model_engine'/'zmq_protocol'/'engine_v1.proto'\n"
-        "assert proto.read_text()=='syntax = \"proto3\";\\n'\n"
         "assert ('--locked' in args)==(source/'Cargo.lock').exists()\n"
         "(source/'Cargo.lock').write_text('resolved dependencies')\n"
         "profile=args[args.index('--profile')+1]\n"

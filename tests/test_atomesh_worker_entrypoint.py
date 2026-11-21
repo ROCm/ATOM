@@ -47,10 +47,6 @@ class MeshBuildTest(TempDirTest):
         source = root / "source"
         source.mkdir(parents=True)
         (source / "Cargo.toml").write_text("[package]\n")
-        # build.rs reads the engine protocol from ../model_engine/zmq_protocol.
-        proto = root / "model_engine" / "zmq_protocol" / "engine_v1.proto"
-        proto.parent.mkdir(parents=True)
-        proto.write_text('syntax = "proto3";\n')
         bin_dir = root / "bin"
         bin_dir.mkdir()
         self.fake_cargo(bin_dir)

@@ -27,15 +27,9 @@ import zmq
 
 from atom.config import KVEventsConfig
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
-from atom.model_engine.sequence import Sequence
-from atom.model_engine.request import RequestOutput
-from atom.model_engine.zmq_protocol.codec import (
-    encode_completions,
-    encode_stopped,
-    encode_stream,
-)
-from atom.model_engine.zmq_protocol.wire import decode_envelope
-from engine_v1_helpers import received
+from atom.model_engine.engine_core_protocol import EngineCoreRequestType
+from atom.model_engine.zmq_protocol.codec import encode_output
+from atom.model_engine.zmq_protocol.messages import Completion
 
 MODULE_PATH = pathlib.Path(CoreManager.__module__.replace(".", "/") + ".py")
 SOURCE = pathlib.Path(__file__).resolve().parent.parent / MODULE_PATH
@@ -134,44 +128,10 @@ class OutputThreadStateTest(unittest.TestCase):
         thread = mgr._create_output_thread(0, receiver, url + "-shutdown")
         thread.start()
         try:
-            sender.send_multipart(encode_stopped())
+            sender.send(encode_output(EngineCoreRequestType.SHUTDOWN))
             thread.join(timeout=3)
             self.assertFalse(thread.is_alive())
             self.assertEqual(observed, [False])
-        finally:
-            sender.close(linger=0)
-
-    def test_a_sequence_its_stream_entry_cut_short_is_stopped_on_its_core(self):
-        mgr = self.managers[0]
-        mgr._shutdown_engine_core_rank = lambda rank: None
-        aborted, delivered = [], []
-        mgr.abort_request = aborted.append
-        mgr._seq_id_to_callback = {1: delivered.append, 2: delivered.append}
-        url = f"inproc://cut-short-{uuid.uuid4().hex}"
-        receiver = mgr.ctx.socket(zmq.PULL)
-        receiver.bind(url)
-        sender = mgr.ctx.socket(zmq.PUSH)
-        sender.connect(url)
-        thread = mgr._create_output_thread(0, receiver, url + "-shutdown")
-        thread.start()
-        try:
-            outputs = [
-                (1, RequestOutput(1, [5], False)),
-                (2, RequestOutput(2, [6], False, None, {"x": 1})),
-            ]
-            frames = encode_stream(outputs)
-            env = decode_envelope(received(frames))
-            # Its kv output names a frame the message does not have.
-            entry = env.stream.kv_transfer_params_outputs[1].map_value.entries[0]
-            entry.value.pickled_value.frame = 9
-            frames[0] = env.SerializeToString()
-            sender.send_multipart(frames)
-            sender.send_multipart(encode_stopped())
-            thread.join(timeout=3)
-            self.assertFalse(thread.is_alive())
-            self.assertEqual(aborted, [2])
-            self.assertEqual([out.finished for out in delivered], [False, True])
-            self.assertNotIn(2, mgr._seq_id_to_callback)
         finally:
             sender.close(linger=0)
 
@@ -195,9 +155,9 @@ class OutputThreadStateTest(unittest.TestCase):
             thread = mgr._create_output_thread(0, receiver, url + "-shutdown")
             thread.start()
             try:
-                seq = Sequence([1, 2], block_size=16, id=7)
-                sender.send_multipart(encode_completions([seq])[0])
-                sender.send_multipart(encode_stopped())
+                seqs = [Completion(seq_id=7)]
+                sender.send(encode_output(EngineCoreRequestType.ADD, seqs))
+                sender.send(encode_output(EngineCoreRequestType.SHUTDOWN))
                 thread.join(timeout=3)
                 self.assertFalse(thread.is_alive())
                 self.assertEqual(

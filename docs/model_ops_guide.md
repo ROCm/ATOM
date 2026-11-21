@@ -509,9 +509,8 @@ A request carries at most one of the two: request admission rejects a JSON
 Schema or strict tool grammar together with a required channel. The API server
 and `LLMEngine.add_request` admit through
 `InputOutputProcessor.preprocess_fanout`; a request that reaches the EngineCore
-over engine_v1 from another client (the atomesh standalone frontend) is held to
-the same refusals by `admission.build_sequence` (`admission.check_sampling`, then
-the execution options and the model's own validation). Accepted tokens advance channel and grammar
+from another client (the atomesh standalone frontend) is held to the same
+refusals by `admission.build_sequence`. Accepted tokens advance channel and grammar
 state after verification and broadcasts. Grammar input copies still overlap
 target forward, and channel state uses the existing GPU carry when deferred
 output means the host is one step behind. No constraints means no

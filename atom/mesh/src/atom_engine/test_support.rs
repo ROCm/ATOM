@@ -5,12 +5,12 @@
 
 use std::{path::Path, thread, time::Duration};
 
-use prost::Message as _;
+use serde::{de::DeserializeOwned, Serialize};
 
 use super::{
     client::EngineClient,
     spec::{BalanceSpec, BalanceStrategy, CoreSpec, EngineSpec, ModelSpec},
-    wire::{self, pb},
+    wire::{self, kind},
 };
 
 pub(crate) const WAIT: Duration = Duration::from_secs(5);
@@ -45,29 +45,26 @@ impl FakeCore {
             _ctx: ctx,
         };
         fake.send(
-            pb::envelope::Body::Ready(pb::Ready {
+            kind::READY,
+            &wire::Ready {
                 max_pool_tokens,
                 ..Default::default()
-            }),
-            vec![],
+            },
         );
         fake
     }
 
-    pub fn send(&self, body: pb::envelope::Body, data_frames: Vec<Vec<u8>>) {
-        self.send_frames(wire::encode(body, data_frames));
+    pub fn send<T: Serialize>(&self, kind: u8, body: &T) {
+        self.send_raw(wire::encode(kind, body));
     }
 
-    /// Frames sent as they are, encoded or not.
-    pub fn send_frames(&self, frames: Vec<Vec<u8>>) {
-        self.output.send_multipart(frames, 0).unwrap();
+    /// A message sent as it is, encoded or not.
+    pub fn send_raw(&self, message: Vec<u8>) {
+        self.output.send(message, 0).unwrap();
     }
 
-    /// The next message on `socket` within `timeout`: its body and data frames.
-    pub fn recv_on(
-        socket: &zmq::Socket,
-        timeout: Duration,
-    ) -> Option<(pb::envelope::Body, Vec<Vec<u8>>)> {
+    /// The next message on `socket` within `timeout`: its kind and body.
+    pub fn recv_on(socket: &zmq::Socket, timeout: Duration) -> Option<(u8, Vec<u8>)> {
         if socket
             .poll(zmq::POLLIN, timeout.as_millis() as i64)
             .unwrap()
@@ -75,43 +72,45 @@ impl FakeCore {
         {
             return None;
         }
-        let mut frames = socket.recv_multipart(0).unwrap();
-        let data = frames.split_off(1);
-        let envelope = pb::Envelope::decode(&frames[0][..]).unwrap();
-        assert_eq!(envelope.protocol_version, wire::PROTOCOL_VERSION);
-        Some((envelope.body.unwrap(), data))
+        let message = socket.recv_bytes(0).unwrap();
+        let (kind, body) = wire::split(&message).unwrap();
+        Some((kind, body.to_vec()))
     }
 
-    pub fn submitted(&self) -> Option<(Vec<pb::RequestSpec>, Vec<Vec<u8>>)> {
-        Self::recv_on(&self.input, WAIT).map(|(body, data)| match body {
-            pb::envelope::Body::Submit(batch) => (batch.requests, data),
-            other => panic!("expected SubmitBatch on input, got {other:?}"),
+    pub fn submitted(&self) -> Option<Vec<wire::SubmitItem>> {
+        Self::recv_on(&self.input, WAIT).map(|(kind, body)| {
+            assert_eq!(kind, kind::ADD, "expected Submit on input");
+            wire::body::<wire::Submit>(&body).unwrap().items
         })
     }
 
-    pub fn control_message(&self) -> pb::envelope::Body {
-        Self::recv_on(&self.control, WAIT)
-            .expect("a control message")
-            .0
+    /// The next control message: its kind and body.
+    pub fn control_message(&self) -> (u8, Vec<u8>) {
+        Self::recv_on(&self.control, WAIT).expect("a control message")
     }
 
     /// One step: `tokens` for each `(seq_id, tokens, finish_reason)`, a
     /// `Some` reason marking the entry finished. Every entry reports a
     /// 3-token prefix-cache hit.
     pub fn stream(&self, entries: &[(u64, &[i32], Option<&str>)]) {
-        let mut batch = pb::StreamBatch::default();
-        for (i, (seq_id, tokens, reason)) in entries.iter().enumerate() {
-            batch.seq_ids.push(*seq_id);
-            batch.token_counts.push(tokens.len() as u32);
-            batch.tokens.extend_from_slice(tokens);
-            batch.finished.push(reason.is_some());
-            batch.num_cached_tokens.push(3);
-            if let Some(reason) = reason {
-                batch.finish_reasons.insert(i as u32, reason.to_string());
-            }
-        }
-        self.send(pb::envelope::Body::Stream(batch), vec![]);
+        let items = entries
+            .iter()
+            .map(|(seq_id, tokens, reason)| wire::StreamItem {
+                seq_id: *seq_id,
+                output_tokens: tokens.iter().map(|&t| t as u32).collect(),
+                finished: reason.is_some(),
+                finish_reason: reason.map(str::to_string),
+                num_cached_tokens: 3,
+                ..Default::default()
+            })
+            .collect();
+        self.send(kind::STREAM, &wire::Stream { items });
     }
+}
+
+/// `body` as a `T`: a message's body this test expects to be one.
+pub(crate) fn decoded<T: DeserializeOwned>(body: &[u8]) -> T {
+    wire::body(body).unwrap()
 }
 
 /// A spec for `ranks` Cores on fresh ipc paths under `dir`, serving `model`.
@@ -174,7 +173,12 @@ pub(crate) fn connect(spec: &EngineSpec, pools: &[Option<u64>]) -> (EngineClient
     (client, cores)
 }
 
-/// An int32 token buffer, as a data frame.
-pub(crate) fn token_frame(tokens: &[i32]) -> Vec<u8> {
-    tokens.iter().flat_map(|t| t.to_le_bytes()).collect()
+/// An int32 token buffer.
+pub(crate) fn token_bytes(tokens: &[i32]) -> serde_bytes::ByteBuf {
+    serde_bytes::ByteBuf::from(
+        tokens
+            .iter()
+            .flat_map(|t| t.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    )
 }

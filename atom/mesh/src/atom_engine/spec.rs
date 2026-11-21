@@ -7,7 +7,7 @@
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use super::wire::pb;
+use super::wire;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct EngineSpec {
@@ -69,7 +69,7 @@ pub struct RequiredChannel {
     pub end_ids: Vec<i32>,
 }
 
-impl From<&RequiredChannel> for pb::RequiredChannel {
+impl From<&RequiredChannel> for wire::RequiredChannel {
     fn from(c: &RequiredChannel) -> Self {
         Self {
             after: c.after.clone(),

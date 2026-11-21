@@ -2,13 +2,12 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import array
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
 from itertools import count
 from typing import Any, NamedTuple
-
-import logging
 
 import numpy as np
 
@@ -345,7 +344,8 @@ class Sequence:
         if sampling_params is None:
             sampling_params = SamplingParams()
         self.block_size = block_size
-        # 0 is a valid id (engine_v1.proto, REQUESTS); only None takes the counter's.
+        # 0 is a valid id (`messages.SubmitItem.seq_id`); only None takes
+        # the counter's.
         self.id = id if id is not None else next(Sequence.counter)
         self.external_request_id = request_id
         self.status = SequenceStatus.WAITING
@@ -443,8 +443,8 @@ class Sequence:
         self.block_hashes: list[int] = []
         # `prefix_hash.ShippedChain`, consumed by
         # `BlockManager._adopt_shipped_chain`; None = the engine hashes it. It
-        # reaches the engine as the request's `PromptHashChain` on the wire
-        # and is left out wherever a seq is pickled (`__getstate__`).
+        # rides beside the seq in the ADD frame (`take_shipped_chains`), never
+        # inside a pickled seq (`__getstate__`).
         self.prompt_hash_chain: tuple | None = None
         # Slots taken for midstep checkpoints of the forward now in flight,
         # as `(slot, position, hash)` — one slot each, since a checkpoint never
@@ -694,8 +694,7 @@ class Sequence:
         self.num_tokens += 1
 
     def __getstate__(self):
-        # Wherever a seq is still pickled (runner and PP / disagg channels),
-        # its shipped prompt chain stays behind: only the BlockManager reads it.
+        # The shipped prompt chain rides beside the seq (`prompt_hash_chain`).
         state = self.__dict__.copy()
         state["prompt_hash_chain"] = None
         return state

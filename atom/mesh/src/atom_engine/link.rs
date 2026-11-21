@@ -1,5 +1,7 @@
-//! One EngineCore's sockets, bound and handshaken as the SOCKETS section of
-//! `engine_v1.proto` prescribes. Knows frames, not what they mean.
+//! One EngineCore's sockets, bound and handshaken as the EngineCore expects
+//! (`EngineCore.process_input_sockets`): this side binds, the Core's DEALERs
+//! send one empty frame each to name themselves, and its first output is
+//! `Ready`. Knows messages, not what they mean.
 
 use std::time::Duration;
 
@@ -8,7 +10,7 @@ use tracing::info;
 
 use super::{
     spec::CoreSpec,
-    wire::{pb, Inbound},
+    wire::{Inbound, PROTOCOL_VERSION},
 };
 
 /// How often a blocked wait rechecks that the Core process still exists.
@@ -48,11 +50,17 @@ impl CoreLink {
             interrupted,
         )?;
         wait_readable(&output, spec.pid, interrupted)?;
-        let ready = match Inbound::decode(recv_frames(&output).map_err(zmq_err)?)?.body {
-            pb::envelope::Body::Ready(ready) => ready,
-            pb::envelope::Body::Stopped(_) => return Err("stopped before it was ready".into()),
+        let ready = match Inbound::decode(&output.recv_msg(0).map_err(zmq_err)?)? {
+            Inbound::Ready(ready) => ready,
+            Inbound::Stopped => return Err("stopped before it was ready".into()),
             _ => return Err("its first output was not Ready".into()),
         };
+        if ready.protocol_version != PROTOCOL_VERSION {
+            return Err(format!(
+                "it speaks protocol {}, this client {PROTOCOL_VERSION}",
+                ready.protocol_version
+            ));
+        }
         info!(dp_rank = spec.dp_rank, "EngineCore is ready");
         let link = Self {
             spec,
@@ -62,16 +70,16 @@ impl CoreLink {
         Ok((link, output, ready.max_pool_tokens))
     }
 
-    /// SubmitBatch only, per the protocol.
-    pub fn send_input(&self, frames: Vec<Vec<u8>>) -> Result<(), String> {
-        self.input.lock().send(frames)
+    /// Submit only.
+    pub fn send_input(&self, message: Vec<u8>) -> Result<(), String> {
+        self.input.lock().send(message)
     }
 
-    /// Abort, Utility, AdminCommand and Shutdown, per the protocol: every
-    /// client -> Core message except SubmitBatch. They travel apart from input
-    /// so that none of them queues behind a large SubmitBatch.
-    pub fn send_control(&self, frames: Vec<Vec<u8>>) -> Result<(), String> {
-        self.control.lock().send(frames)
+    /// Abort and Shutdown: every client -> Core message except Submit. They
+    /// travel apart from input so that none of them queues behind a large
+    /// Submit.
+    pub fn send_control(&self, message: Vec<u8>) -> Result<(), String> {
+        self.control.lock().send(message)
     }
 }
 
@@ -86,9 +94,10 @@ impl Peer {
         Ok(Self { socket, identity })
     }
 
-    fn send(&self, frames: Vec<Vec<u8>>) -> Result<(), String> {
-        let message = std::iter::once(self.identity.clone()).chain(frames);
-        self.socket.send_multipart(message, 0).map_err(zmq_err)
+    fn send(&self, message: Vec<u8>) -> Result<(), String> {
+        self.socket
+            .send_multipart([self.identity.clone(), message], 0)
+            .map_err(zmq_err)
     }
 }
 

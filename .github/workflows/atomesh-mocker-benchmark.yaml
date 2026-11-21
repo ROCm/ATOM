@@ -5,9 +5,9 @@ on:
     branches: [main]
     paths:
       - 'atom/mesh/**'
-      - 'atom/model_engine/zmq_protocol/**'  # engine_v1.proto, built by atom/mesh/build.rs
-      - 'tests/fixtures/engine_v1/**'  # read by atom/mesh's cargo tests
-      - 'tests/test_engine_v1_cross_language.py'
+      - 'atom/model_engine/zmq_protocol/**'  # the wire protocol atom/mesh mirrors
+      - 'tests/fixtures/atom_engine/**'  # read by atom/mesh's cargo tests
+      - 'tests/test_engine_wire_cross_language.py'
       - '.github/scripts/atomesh/atomesh_mocker_benchmark.sh'
       - '.github/scripts/atomesh/atomesh_mocker_benchmark_summary.py'
       - '.github/workflows/atomesh-mocker-benchmark.yaml'
@@ -18,9 +18,9 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - 'atom/mesh/**'
-      - 'atom/model_engine/zmq_protocol/**'  # engine_v1.proto, built by atom/mesh/build.rs
-      - 'tests/fixtures/engine_v1/**'  # read by atom/mesh's cargo tests
-      - 'tests/test_engine_v1_cross_language.py'
+      - 'atom/model_engine/zmq_protocol/**'  # the wire protocol atom/mesh mirrors
+      - 'tests/fixtures/atom_engine/**'  # read by atom/mesh's cargo tests
+      - 'tests/test_engine_wire_cross_language.py'
       - '.github/scripts/atomesh/atomesh_mocker_benchmark.sh'
       - '.github/scripts/atomesh/atomesh_mocker_benchmark_summary.py'
       - '.github/workflows/atomesh-mocker-benchmark.yaml'

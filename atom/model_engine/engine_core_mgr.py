@@ -7,6 +7,7 @@ import logging
 import multiprocessing
 import multiprocessing.shared_memory
 import os
+import pickle
 import queue
 import time
 import uuid
@@ -61,18 +62,14 @@ from atom.model_engine.engine_utility import (
     completes_weight_sync,
     kv_change,
 )
-from atom.model_engine.prefix_hash import hash_block_size_for
+from atom.model_engine.prefix_hash import hash_block_size_for, take_shipped_chains
 from atom.model_engine.request import RequestOutput
+from atom.model_engine.sequence import Sequence
 from atom.model_engine.zmq_protocol.codec import (
-    REJECTED_REASON,
-    decode_core_message,
-    encode_abort,
-    encode_command,
-    encode_dp_prefix_credit,
-    encode_shutdown,
+    decode_output,
+    encode_input,
     encode_submit,
 )
-from atom.model_engine.zmq_protocol.requests import CompletionResult, IngressRequest
 from atom.observability import tracing
 from atom.structured_output import is_structured
 from atom.utils import (
@@ -259,24 +256,28 @@ def _resolve_dp_engine_count(config: Config, logical: int) -> int:
     return visible
 
 
-def _submit_frames(
-    seqs: list[IngressRequest], *, max_tokens=None
-) -> tuple[list | None, list]:
-    """`encode_submit`, then drop the seqs' shipped prompt chains: the frames
-    hold them now and the frontend keeps no copy. A disaggregated prefill
-    engine, sent the same seqs after decode, so gets none."""
-    frames, failures = encode_submit(seqs, max_tokens=max_tokens)
+def _add_frame(seqs: list[Sequence]) -> bytes:
+    """An ADD request for an engine that admits `seqs` with a BlockManager:
+    their shipped prompt chains, if any, ride third (`take_shipped_chains`)."""
+    chains = take_shipped_chains(seqs)
+    frame = (EngineCoreRequestType.ADD, seqs) + ((chains,) if chains else ())
+    return pickle.dumps(frame)
+
+
+def _submit_frame(seqs: list[Sequence]) -> bytes:
+    """ADD for an EngineCore (`_submit_frame_refusing`, its frame alone)."""
+    return _submit_frame_refusing(seqs)[0]
+
+
+def _submit_frame_refusing(seqs: list[Sequence]) -> tuple[bytes, set[int]]:
+    """ADD for an EngineCore, and the ids it carries refused
+    (`codec.encode_submit`). The seqs' shipped prompt chains go with it and
+    the frontend keeps no copy: a disaggregated prefill engine, sent the same
+    seqs after decode, so gets none."""
+    frame, refused = encode_submit(seqs)
     for seq in seqs:
         seq.prompt_hash_chain = None
-    return frames, failures
-
-
-def _sent(seqs: list, failures: list) -> list:
-    """`seqs` but those `encode_submit` left out."""
-    if not failures:
-        return seqs
-    failed = {id(req) for req, _ in failures}
-    return [seq for seq in seqs if id(seq) not in failed]
+    return frame, refused
 
 
 class CoreManager:
@@ -332,7 +333,7 @@ class CoreManager:
         # Fixed for the engines' lifetime, so `/kv_event_sources` serves it as is.
         self.kv_event_sources = kv_event_sources(config)
         self.ctx = zmq.Context(io_threads=2)
-        self.outputs_queue = queue.Queue[list[CompletionResult]]()
+        self.outputs_queue = queue.Queue[list[Sequence]]()
         self.keep_finished_outputs = config.keep_finished_outputs or config.asyncio_mode
         # Utility replies are matched to their caller by request id, not by
         # position on a shared queue, where a late or unasked-for reply became
@@ -445,10 +446,6 @@ class CoreManager:
         # seq_id -> (dp_rank, req_cost, tok_cost) so release subtracts exactly
         # what dispatch added, and only for ranks that were actually charged.
         self._seq_load = {}
-        # Ids of submitted structured requests. Their constraints were prepared
-        # on every DP rank, so each must be released everywhere when the
-        # request ends; the finished item (`CompletionResult`) does not say.
-        self._structured_ids: set[int] = set()
         self._lb_lock = Lock()
         # --- Backpressure (lazy) DP dispatch --------------------------------
         # ATOM_DP_DISPATCH_DEPTH > 0 holds load-balanced seqs in _bp_pending and
@@ -869,8 +866,8 @@ class CoreManager:
                 if ready_received[dp_rank]:
                     continue
 
-                frames = socket.recv_multipart(copy=False)
-                request_type, data = decode_core_message(frames)
+                obj = socket.recv(copy=False)
+                request_type, data = decode_output(obj)
 
                 if request_type == EngineCoreRequestType.READY:
                     logger.info(
@@ -911,9 +908,9 @@ class CoreManager:
                         )
                         break
 
-                    frames = output_socket.recv_multipart(copy=False)
+                    obj = output_socket.recv(copy=False)
                     try:
-                        request_type, data = decode_core_message(frames)
+                        request_type, data = decode_output(obj)
                     except Exception:
                         # Every request on this DP rank waits on this thread,
                         # so one message it cannot decode must not end it.
@@ -978,7 +975,7 @@ class CoreManager:
                                     logger.debug(
                                         f"{self.label}: Cleaned up callback for finished sequence {seq_id}"
                                     )
-                        # Ended here on an entry that did not decode; the Core
+                        # Ended here on params that did not load; their Core
                         # still runs them.
                         for seq_id in stream_outputs.cut_short:
                             self.abort_request(seq_id)
@@ -1026,7 +1023,29 @@ class CoreManager:
                         # callback popped by then (STREAM is enqueued ahead of
                         # the finished-seq list and this socket is FIFO), so a
                         # normal completion finds nothing to do below.
-                        self._finish_results(seqs)
+                        delivered = False
+                        for seq in seqs:
+                            delivered |= self._deliver_terminal_output(seq)
+                            self._release_terminal_seq(seq)
+                        if delivered and self._flush_stream_batch_fn is not None:
+                            # The callbacks above only buffer into a thread-local;
+                            # without this flush the chunk never reaches the
+                            # request's collector and the client still hangs.
+                            try:
+                                self._flush_stream_batch_fn()
+                            except Exception as e:
+                                logger.warning(
+                                    f"{self.label}: flush_stream_batch failed: {e}",
+                                    exc_info=True,
+                                )
+                        if self.keep_finished_outputs:
+                            self.outputs_queue.put_nowait(seqs)
+                        # These completions freed slots on their ranks — re-feed
+                        # from the pending pool so a fast rank never drains to
+                        # empty while peers still have work. No-op when
+                        # ATOM_DP_DISPATCH_DEPTH is unset (legacy spray path).
+                        if getattr(self, "_bp_depth", 0) > 0 and self._bp_pending:
+                            self._bp_dispatch_or_refill(raise_on_error=False)
             finally:
                 # Close sockets.
                 shutdown_socket.close(linger=0)
@@ -1067,7 +1086,7 @@ class CoreManager:
                 break
             await self.async_output_queue.put(seqs)
 
-    async def get_output_async(self) -> list[CompletionResult]:
+    async def get_output_async(self) -> list[Sequence]:
         if not self.async_output_queue:
             raise RuntimeError("Engine async mode not enabled")
 
@@ -1148,7 +1167,7 @@ class CoreManager:
         self._distributed_stores.clear()
         logger.info(f"{self.label}: All EngineCores shut down")
 
-    def _send_request(self, dp_rank: int, frames: list) -> None:
+    def _send_request(self, dp_rank: int, payload: bytes) -> None:
         """Send one already-encoded request to an engine core. Hot path.
 
         Every ``input_sockets`` write goes through here and holds
@@ -1157,11 +1176,10 @@ class CoreManager:
         caller's thread offline) and the per-rank output threads (backpressure
         refill when ``ATOM_DP_DISPATCH_DEPTH`` > 0). A ZMQ socket is not
         thread-safe: unserialized ``send_multipart`` calls interleave frames,
-        the DEALER reads a routing identity where an envelope should be, and
-        the message cannot be decoded. Nothing recovers what it carried -- its
-        requests never reach the engine and their clients hang.
+        the DEALER reads a routing identity where a payload should be, and its
+        input thread dies on ``UnpicklingError``. Nothing recovers from that.
 
-        Refill sends the same SubmitBatch as the request thread, so it reuses
+        Refill sends the same ADD payload as the request thread, so it reuses
         this socket under the lock. A second ROUTER would need another
         engine-side reader for the same queue. Utility commands, abort, and
         shutdown stay on :meth:`_send_control`, which is why control has its
@@ -1170,10 +1188,10 @@ class CoreManager:
         """
         with self._input_send_lock:
             self.input_sockets[dp_rank].send_multipart(
-                [self.engine_core_identities[dp_rank], *frames], copy=False
+                [self.engine_core_identities[dp_rank], payload], copy=False
             )
 
-    def _send_control(self, dp_rank: int, frames: list, copy: bool = False) -> None:
+    def _send_control(self, dp_rank: int, payload: bytes, copy: bool = False) -> None:
         """Send one already-encoded control message. Serialized, never hot.
 
         Writers here are the event loop (abort, the /debug/* endpoints) and the
@@ -1182,34 +1200,29 @@ class CoreManager:
         """
         with self._control_send_lock:
             self.control_sockets[dp_rank].send_multipart(
-                [self.control_identities[dp_rank], *frames], copy=copy
+                [self.control_identities[dp_rank], payload], copy=copy
             )
 
-    def add_request(self, seqs: list[IngressRequest]):
+    def add_request(self, seqs: list[Sequence]):
         structured = [seq for seq in seqs if is_structured(seq)]
         if structured:
-            ids = [seq.id for seq in structured]
             try:
                 if self.structured_request_prepare is None:
                     raise ValueError("Structured output requires engine admission")
                 self.structured_request_prepare(structured)
-                # Before the send: the output thread may finish them first.
-                self._structured_ids.update(ids)
                 self._add_prepared_requests(seqs)
             except BaseException:
-                self._release_constraints(ids)
+                self._release_constraints(structured)
                 raise
         else:
             self._add_prepared_requests(seqs)
 
-    def _release_finished_constraints(self, seq_id: int) -> None:
-        if seq_id in self._structured_ids:
-            self._release_constraints([seq_id])
-
-    def _release_constraints(self, ids: list[int]):
-        # Workers tolerate repeated releases.
-        for seq_id in ids:
-            self._structured_ids.discard(seq_id)
+    def _release_constraints(self, seqs):
+        # The submitted/finished sequences own the cleanup information. There
+        # is no cross-thread registry: workers tolerate repeated releases.
+        ids = [seq.id for seq in seqs if is_structured(seq)]
+        if not ids:
+            return
         try:
             # Never wait for an RPC reply on the output receiver thread.
             self.broadcast_utility_command("release_constraints", request_ids=ids)
@@ -1218,7 +1231,7 @@ class CoreManager:
             # original admission failure. Worker teardown also frees state.
             logger.exception("%s: structured cleanup failed for %s", self.label, ids)
 
-    def _add_prepared_requests(self, seqs: list[IngressRequest]):
+    def _add_prepared_requests(self, seqs: list[Sequence]):
         tracing.bind_sequences(seqs)
         logger.debug(
             f"{self.label}: Add request, sequence ids: {[seq.id for seq in seqs]}"
@@ -1229,91 +1242,20 @@ class CoreManager:
                 self._seq_id_to_callback[seq.id] = seq.stream_callback
                 seq.stream_callback = None
         try:
-            if self.pp_size > 1 or self._routable_engine_count == 1:
+            if self.pp_size > 1:
                 # Pipeline parallel (dp=1): requests enter only at stage 0,
-                # which drives the pipeline downstream. A single routable
-                # engine takes them all.
-                logger.debug(f"{self.label}: Add {len(seqs)} requests to rank 0")
-                self._send_submit(0, seqs)
+                # which drives the pipeline downstream.
+                logger.debug(f"{self.label}: Add {len(seqs)} requests to PP head 0")
+                self._send_request(0, _submit_frame(seqs))
+            elif self._routable_engine_count == 1:
+                # Single routable engine, send all requests
+                logger.debug(f"{self.label}: Add {len(seqs)} requests to DP rank 0")
+                self._send_request(0, _submit_frame(seqs))
             else:
                 self._dispatch_to_dp_ranks(seqs)
         except BaseException:
             self._forget_unsubmitted(seqs)
             raise
-
-    def _send_submit(self, rank: int, seqs: list, *, max_tokens=None) -> list:
-        """Send `seqs` to `rank`; end those that do not encode (`_reject_unsent`)
-        once the rest are sent. Returns the seqs sent."""
-        frames, failures = _submit_frames(seqs, max_tokens=max_tokens)
-        if frames is not None:
-            self._send_request(rank, frames)
-        self._reject_unsent(failures)
-        return _sent(seqs, failures)
-
-    def _reject_unsent(self, failures: list) -> None:
-        """End the requests `encode_submit` left out as a Core's Rejected would
-        end them: the online client gets its terminal output, an offline run
-        the rejected result, and the load they were charged is released. Runs
-        inside a dispatch, so the slots they free are refilled by the next
-        completion, not from here."""
-        if not failures:
-            return
-        for req, reason in failures:
-            logger.error(
-                "%s: rejecting request %s, which does not encode: %s",
-                self.label,
-                req.id,
-                reason,
-            )
-        self._finish_results(
-            [
-                CompletionResult(
-                    id=req.id,
-                    leave_reason=f"{REJECTED_REASON}: {reason}",
-                    rejected=True,
-                )
-                for req, reason in failures
-            ],
-            refill=False,
-        )
-
-    def _finish_results(self, results: list, *, refill: bool = True) -> None:
-        """Hand over finished sequences: a Core's Completions or Rejected, or
-        requests rejected here. `refill`: re-feed the backpressure pool from
-        the slots they freed (not from inside a dispatch)."""
-        # Offline (non-streaming) completions arrive here as finished
-        # sequences; release their in-flight DP load.
-        #
-        # So do sequences the scheduler rejected before they ever ran
-        # (`_unschedulable_reason`, abort-while-waiting) — those never reach
-        # `postprocess`, so no STREAM chunk is ever built for them. An online
-        # client is still holding a callback and would wait forever, so the
-        # terminal output it is owed has to be raised here. Anything already
-        # delivered through STREAM has had its callback popped by then
-        # (STREAM is enqueued ahead of the finished-seq list and this socket
-        # is FIFO), so a normal completion finds nothing to do below.
-        delivered = False
-        for seq in results:
-            delivered |= self._deliver_terminal_output(seq)
-            self._release_terminal_seq(seq)
-        if delivered and self._flush_stream_batch_fn is not None:
-            # The callbacks above only buffer into a thread-local; without this
-            # flush the chunk never reaches the request's collector and the
-            # client still hangs.
-            try:
-                self._flush_stream_batch_fn()
-            except Exception as e:
-                logger.warning(
-                    f"{self.label}: flush_stream_batch failed: {e}", exc_info=True
-                )
-        if self.keep_finished_outputs:
-            self.outputs_queue.put_nowait(results)
-        # These completions freed slots on their ranks — re-feed from the
-        # pending pool so a fast rank never drains to empty while peers still
-        # have work. No-op when ATOM_DP_DISPATCH_DEPTH is unset (legacy spray
-        # path).
-        if refill and getattr(self, "_bp_depth", 0) > 0 and self._bp_pending:
-            self._bp_dispatch_or_refill(raise_on_error=False)
 
     def _forget_unsubmitted(self, seqs: list) -> None:
         """After an add failed partway, no callback is left registered for
@@ -1380,9 +1322,7 @@ class CoreManager:
         """
         return getattr(self, "global_engine_count", self.local_engine_count)
 
-    def _resolve_and_validate_hints(
-        self, seqs: list[IngressRequest]
-    ) -> list[int | None]:
+    def _resolve_and_validate_hints(self, seqs: list[Sequence]) -> list[int | None]:
         """Resolve every seq's explicit ``data_parallel_rank`` hint and validate
         the whole batch, once.
 
@@ -1407,7 +1347,7 @@ class CoreManager:
             hints.append(hint)
         return hints
 
-    def _dispatch_to_dp_ranks(self, seqs: list[IngressRequest]) -> None:
+    def _dispatch_to_dp_ranks(self, seqs: list[Sequence]) -> None:
         """Route a batch across DP ranks and send each rank its sub-batch.
 
         Honors an explicit ``data_parallel_rank`` hint; otherwise picks a rank
@@ -1476,15 +1416,10 @@ class CoreManager:
             for dp_rank, rank_seqs in enumerate(dp_seqs):
                 if not rank_seqs:
                     continue
-                frame, failures = _submit_frames(rank_seqs)
-                # Ended here and their charge released: never sent, so never
-                # ingested either.
-                self._reject_unsent(failures)
-                rank_seqs = _sent(rank_seqs, failures)
-                if frame is None:
-                    pass
-                elif self._backlog is None:
+                frame = _submit_frame(rank_seqs)
+                if self._backlog is None:
                     self._send_request(dp_rank, frame)
+                    dispatched[dp_rank] = True
                 else:
                     # The ledger counts seqs in the order the rank ingests
                     # them, so the send and its accounting are one step.
@@ -1496,7 +1431,6 @@ class CoreManager:
                         with self._lb_lock:
                             self._backlog.note_sent(dp_rank, rank_seqs, self._seq_load)
                         self._flush_credit_updates()
-                dispatched[dp_rank] = True
                 batch_prefill_tokens = sum(
                     int(getattr(seq, "num_prompt_tokens", 0) or 0) for seq in rank_seqs
                 )
@@ -1589,17 +1523,9 @@ class CoreManager:
         added = []
         failed: list[tuple[int, list]] = []
         send_error: Exception | None = None
-        unencodable = []
         for dp_rank, rank_seqs in sends:
-            # A request that does not encode is ended, not re-queued: it would
-            # fail every refill again.
-            frames, failures = _submit_frames(rank_seqs)
-            unencodable += failures
-            rank_seqs = _sent(rank_seqs, failures)
-            if frames is None:
-                continue
             try:
-                self._send_request(dp_rank, frames)
+                self._send_request(dp_rank, _submit_frame(rank_seqs))
                 added.append(f"rank{dp_rank}: {len(rank_seqs)} req")
             except Exception as exc:
                 logger.exception(
@@ -1611,7 +1537,6 @@ class CoreManager:
                 failed.append((dp_rank, rank_seqs))
                 send_error = exc
         stalled = self._bp_requeue_unsent(failed, pause_always=raise_on_error)
-        self._reject_unsent(unencodable)
         if send_error is not None and raise_on_error:
             raise send_error
         if stalled:
@@ -1810,7 +1735,10 @@ class CoreManager:
             batches = self._backlog.take_credit_updates()
         for rank, updates in batches:
             try:
-                self._send_request(rank, encode_dp_prefix_credit(updates))
+                self._send_request(
+                    rank,
+                    encode_input(EngineCoreRequestType.DP_PREFIX_CREDIT, updates),
+                )
             except Exception:
                 logger.exception(
                     "%s: successor credit update retained for retry on rank %d",
@@ -1881,7 +1809,7 @@ class CoreManager:
         self._dp_route_counters["affinity_parent_ignored_total"] += 1
 
     def _select_dp_rank_for_seq_locked(
-        self, seq: IngressRequest, explicit_rank: int | None
+        self, seq: Sequence, explicit_rank: int | None
     ) -> Route:
         """Place a request and return its accounting from the selected policy."""
         route = self._get_dp_policy().select(seq, explicit_rank)
@@ -1915,7 +1843,7 @@ class CoreManager:
             return snapshot
 
     def _charge_seq_load_locked(
-        self, seq: IngressRequest, dp_rank: int, credit: int = 0
+        self, seq: Sequence, dp_rank: int, credit: int = 0
     ) -> None:
         """Record a seq's in-flight load on dp_rank. Caller must hold _lb_lock."""
         req_cost = 1
@@ -1939,7 +1867,7 @@ class CoreManager:
         and normal completions have had theirs popped by the STREAM that
         delivered them, so both answer False and keep their existing path.
         """
-        self._release_finished_constraints(seq.id)
+        self._release_constraints([seq])
         callback = self._seq_id_to_callback.pop(seq.id, None)
         if callback is None:
             return False
@@ -2108,12 +2036,16 @@ class CoreManager:
                 logger.debug(
                     f"{self.label}: Send utility command '{cmd}' to DP rank {rank}"
                 )
-                self._send_control(rank, encode_command({"cmd": cmd}))
+                self._send_control(
+                    rank, encode_input(EngineCoreRequestType.UTILITY, {"cmd": cmd})
+                )
         else:
             logger.debug(
                 f"{self.label}: Send utility command '{cmd}' to DP rank {dp_rank}"
             )
-            self._send_control(dp_rank, encode_command({"cmd": cmd}))
+            self._send_control(
+                dp_rank, encode_input(EngineCoreRequestType.UTILITY, {"cmd": cmd})
+            )
 
     @contextmanager
     def offline_backpressure_batch(self):
@@ -2183,10 +2115,8 @@ class CoreManager:
                         )
             return
         try:
-            frames = encode_abort([req_id])
-            for rank in range(len(self.control_sockets)):
-                self._send_control(rank, frames, copy=True)
-            # Waiting/running cancellations return a finished sequence through
+            self.broadcast_utility_command("abort_request", req_id=req_id)
+            # Waiting/running cancellations return a finished Sequence through
             # the ordinary output path, which releases grammar on every rank.
         except Exception as e:  # noqa: BLE001 - disconnect cleanup must not raise
             logger.warning(f"{self.label}: abort_request({req_id}) failed: {e}")
@@ -2339,14 +2269,14 @@ class CoreManager:
     ):
         self._refuse_unowned_weight_sync_cmd(cmd, _dispatch_token)
         payload = {"cmd": cmd, **kwargs}
-        # Encode once and reuse for all ranks.
-        frames = encode_command(payload)
+        # Serialize once and reuse for all ranks (optimization: avoid repeated encodes)
+        serialized_payload = encode_input(EngineCoreRequestType.UTILITY, payload)
         for rank in range(len(self.control_sockets)) if _ranks is None else _ranks:
             logger.debug(
                 f"{self.label}: Broadcast utility command '{cmd}' to DP rank {rank}"
             )
-            # copy=True: the same buffers are reused for every rank.
-            self._send_control(rank, frames, copy=True)
+            # copy=True: the same buffer is reused for every rank.
+            self._send_control(rank, serialized_payload, copy=True)
 
     @contextmanager
     def weight_sync_session(self):
@@ -2376,12 +2306,13 @@ class CoreManager:
         the failure that matters, and a rank whose socket fails here must not
         keep its peers, which may hold the failed update, from hearing it.
         """
-        frames = encode_command(
-            {"cmd": DISCARD_WEIGHT_SYNC_CMD, "failed_cmd": failed_cmd}
+        payload = encode_input(
+            EngineCoreRequestType.UTILITY,
+            {"cmd": DISCARD_WEIGHT_SYNC_CMD, "failed_cmd": failed_cmd},
         )
         for rank in range(len(self.control_sockets)):
             try:
-                self._send_control(rank, frames, copy=True)
+                self._send_control(rank, payload, copy=True)
             except Exception:
                 logger.exception(
                     f"{self.label}: could not tell DP rank {rank} to discard "
@@ -2611,7 +2542,9 @@ class CoreManager:
         if should_send:
             try:
                 if has_control_socket:
-                    self._send_control(dp_rank, encode_shutdown())
+                    self._send_control(
+                        dp_rank, encode_input(EngineCoreRequestType.SHUTDOWN)
+                    )
                     logger.debug(f"{self.label}: Sent shutdown to DP rank {dp_rank}")
                 else:
                     logger.warning(
@@ -2623,7 +2556,7 @@ class CoreManager:
                     f"{self.label}: Error sending shutdown to DP rank {dp_rank}: {e}"
                 )
 
-    def get_output(self) -> list[CompletionResult]:
+    def get_output(self) -> list[Sequence]:
         seqs = self.outputs_queue.get()
         if isinstance(seqs, BaseException):
             raise seqs
@@ -2912,8 +2845,8 @@ class DisaggCoreManager(CoreManager):
         """Block until output_sockets[idx] sends a READY signal."""
         sock = self.output_sockets[idx]
         while True:
-            frames = sock.recv_multipart(copy=False)
-            request_type, data = decode_core_message(frames)
+            obj = sock.recv(copy=False)
+            request_type, data = decode_output(obj)
             if request_type == EngineCoreRequestType.READY:
                 self._record_ready_payload(data)
                 return
@@ -2922,7 +2855,7 @@ class DisaggCoreManager(CoreManager):
                     f"{self.label}: process {idx} sent SHUTDOWN during initialization"
                 )
 
-    def add_request(self, seqs: list[IngressRequest]):
+    def add_request(self, seqs: list[Sequence]):
         """Fan-out: send every new sequence to BOTH prefill and decode."""
         tracing.bind_sequences(seqs, unsupported="pd")
         logger.debug(f"{self.label}: fan-out {len(seqs)} seqs to prefill and decode")
@@ -2935,15 +2868,27 @@ class DisaggCoreManager(CoreManager):
         try:
             # Send decode payload as-is. Decode admits and allocates the blocks
             # (`DecodeScheduler.allocate_waiting`), so it alone gets the chains.
-            # Prefill gets only what decode took.
-            seqs = self._send_submit(1, seqs)
+            decode_payload, refused = _submit_frame_refusing(seqs)
+            self._send_request(1, decode_payload)
+
             # For prefill: limit each sequence to 1 output token.  Prefill
             # discards all sampled tokens (postprocess is a no-op), but setting
             # max_tokens=1 ensures the forward pass terminates after a single
             # generate step and that num_scheduled_tokens correctly reflects
-            # only the prompt tokens.
-            if seqs:
-                self._send_submit(0, seqs, max_tokens=1)
+            # only the prompt tokens. One decode was sent refused is not sent:
+            # it is rejected once, by decode.
+            import copy as _copy
+
+            prefill_seqs = []
+            for seq in seqs:
+                if seq.id in refused:
+                    continue
+                ps = _copy.copy(seq)
+                ps.max_tokens = 1
+                prefill_seqs.append(ps)
+            if prefill_seqs:
+                prefill_payload = encode_input(EngineCoreRequestType.ADD, prefill_seqs)
+                self._send_request(0, prefill_payload)
         except BaseException:
             self._forget_unsubmitted(seqs)
             raise

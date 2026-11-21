@@ -10,7 +10,7 @@ readme = "README.md"
 description = "a lightweight vLLM implementation built from scratch"
 requires-python = ">=3.10"
 dynamic = ["version"]
-dependencies = ["pybind11", "transformers==5.16.1", "zmq", "msgspec", "xxhash", "fastapi>=0.115,<0.137", "psutil", "prometheus_client>=0.25,<0.26", "protobuf>=3.20", "uvicorn", "uvloop", "aiohttp", "datasets", "einops>=0.7", "openpyxl", "tqdm", "setproctitle", "jsonschema>=4.25,<5"]
+dependencies = ["pybind11", "transformers==5.16.1", "zmq", "msgspec", "xxhash", "fastapi>=0.115,<0.137", "psutil", "prometheus_client>=0.25,<0.26", "protobuf", "uvicorn", "uvloop", "aiohttp", "datasets", "einops>=0.7", "openpyxl", "tqdm", "setproctitle", "jsonschema>=4.25,<5"]
 
 [project.optional-dependencies]
 structured-output = ["llguidance==1.9.1", "google-re2>=1.1"]
@@ -42,7 +42,6 @@ include-package-data = true
 atom = [
     "mesh/target/release/libmesh.so",
     "benchmarks/results/schemas/*.json",
-    "model_engine/zmq_protocol/*.proto",
 ]
 
 [project.entry-points."vllm.platform_plugins"]
@@ -67,9 +66,6 @@ atom_sglang = "atom.plugin.sglang.register:register_plugin"
 # vendored the same way and carry the same exemption -- black already excludes
 # this directory below, for the same reason.
 "tests/models/glm52/kernels/*.py" = ["ALL"]
-# Protobuf bindings are kept as the compiler wrote them
-# (atom/model_engine/zmq_protocol/generate.py); black excludes them below.
-"*_pb2.py" = ["ALL"]
 # review-pr's gate infrastructure is vendored from ROCm/aiter at pinned commit
 # c1c482e00 and kept close to upstream so the port stays diffable against
 # `git -C aiter show c1c482e00:<path>` -- that diff is what let reviewers
@@ -140,5 +136,4 @@ force-exclude = '''
   | check_prompts
   | scan_index_width
 )\.py$
-| _pb2\.py$
 '''

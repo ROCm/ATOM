@@ -17,8 +17,8 @@ A request carries at most one rule, a grammar (JSON Schema or strict tool
 arguments) or a required channel. Request admission rejects a request with
 both: `InputOutputProcessor.preprocess_fanout` for the API server and
 `LLMEngine.add_request`, and `admission.build_sequence` on the EngineCore for
-any other engine_v1 client, such as the atomesh standalone frontend; both refuse
-it through `admission.check_sampling`. The OpenAI server
+every request, since another client (the atomesh standalone frontend) skips the
+frontend's checks. The OpenAI server
 already clears `required_channel` whenever it configures a grammar.
 
 `TokenConstraints` in `atom/model_engine/token_constraints.py` is the one

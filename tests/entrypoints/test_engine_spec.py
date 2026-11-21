@@ -182,7 +182,9 @@ def test_the_required_channel_also_ends_on_the_engines_end_ids(monkeypatch):
     }
 
 
-SPEC_FIXTURE = Path(__file__).parents[1] / "fixtures" / "engine_v1" / "engine_spec.json"
+SPEC_FIXTURE = (
+    Path(__file__).parents[1] / "fixtures" / "atom_engine" / "engine_spec.json"
+)
 
 
 def test_the_spec_matches_what_rust_parses(monkeypatch):
@@ -510,7 +512,7 @@ def test_a_named_reasoning_parser_is_handed_over_once(monkeypatch):
     monkeypatch.setattr(
         atomesh_server,
         "import_atomesh_runner",
-        lambda: SimpleNamespace(tool_parser_names=lambda: []),
+        lambda: SimpleNamespace(tool_parser_names=list),
     )
     atomesh_server.launch_atom_standalone(
         ["--model", "/m", "--reasoning_parser", "step3"]

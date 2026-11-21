@@ -36,7 +36,7 @@ if [[ ! -x "${artifact_dir}/atomesh" || ! -f "${artifact_dir}/mesh-build.json" \
   mkdir -p "${artifact_dir}" "${cache_dir}"
   source_commit="$(git -C "${repo_root}" rev-parse HEAD)"
   source_dirty=false
-  if [[ -n "$(git -C "${repo_root}" status --porcelain -- atom/mesh atom/model_engine/zmq_protocol/engine_v1.proto)" ]]; then
+  if [[ -n "$(git -C "${repo_root}" status --porcelain -- atom/mesh)" ]]; then
     source_dirty=true
   fi
   echo "[setup] Building Mesh before launching services" >&2

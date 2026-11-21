@@ -8,6 +8,7 @@ import time
 import uuid
 from contextlib import ExitStack
 
+import msgspec
 import pytest
 import zmq
 
@@ -18,11 +19,9 @@ from atom.model_engine.collective_rpc import (
     engine_budget,
 )
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
-from atom.model_engine.zmq_protocol.codec import (
-    decode_client_message,
-    encode_utility_reply,
-)
-from engine_v1_helpers import received
+from atom.model_engine.engine_core_protocol import EngineCoreRequestType
+from atom.model_engine.zmq_protocol.codec import decode_input, encode_output
+from atom.model_engine.zmq_protocol.messages import KIND
 
 # ── harness ────────────────────────────────────────────────────────────────
 
@@ -55,9 +54,9 @@ def _mgr(engine_count=2, tp=1, cls=CoreManager):
     return mgr
 
 
-def _on_rank(dp_rank, frames):
+def _on_rank(dp_rank, payload):
     """One control message, recorded like a broadcast plus the rank it reached."""
-    _, (_, body), _ = decode_client_message(received(frames))
+    _, body = decode_input(payload)
     body = dict(body)
     return body.pop("cmd"), {**body, "dp_rank": dp_rank}
 
@@ -143,7 +142,7 @@ def test_a_reply_reaches_the_caller_holding_its_id():
 
 def test_a_message_the_output_thread_cannot_decode_does_not_end_it():
     """Every request on a DP rank waits on its output thread, which had no
-    guard around decoding: one reply naming a class this process cannot
+    guard around its decode: one reply naming a class this process cannot
     import ended the thread and hung that rank's requests."""
     mgr = _mgr(1)
     mgr.ctx = zmq.Context()
@@ -159,14 +158,19 @@ def test_a_message_the_output_thread_cannot_decode_does_not_end_it():
     thread.start()
     try:
         with mgr._rpc_router.register("after") as replies:
-            push.send(b"cno_module_this_process_has\nGone\n.")
-            # A well-formed envelope whose pickled reply names a missing class.
-            unimportable = encode_utility_reply(None)
-            unimportable[1] = b"cno_module_this_process_has\nGone\n."
-            push.send_multipart(unimportable)
-            push.send_multipart(
-                encode_utility_reply(
-                    {"cmd": "clear_kv_cache", "request_id": "after", "result": 1}
+            # Well formed, but its pickled payload names a missing class.
+            unimportable = msgspec.msgpack.encode(
+                (
+                    KIND[EngineCoreRequestType.UTILITY_RESPONSE],
+                    [b"cno_module_this_process_has\nGone\n."],
+                )
+            )
+            push.send(unimportable)
+            push.send(b"not msgpack at all")
+            push.send(
+                encode_output(
+                    EngineCoreRequestType.UTILITY_RESPONSE,
+                    {"cmd": "clear_kv_cache", "request_id": "after", "result": 1},
                 )
             )
             dp_rank, body = replies.get(timeout=5)

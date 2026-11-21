@@ -14,11 +14,9 @@ from test_otel_tracing import clock, execute, spans  # noqa: F401
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import Sequence
-from atom.model_engine.zmq_protocol.codec import decode_client_message
-from atom.model_engine.zmq_protocol.requests import IngressRequest
+from atom.model_engine.zmq_protocol.codec import decode_input, prompt_token_ids
 from atom.observability import tracing
 from atom.sampling_params import SamplingParams
-from engine_v1_helpers import received
 
 
 def output(ids, tokens):
@@ -113,9 +111,11 @@ def test_core_manager_captures_context_after_executor_preprocess(spans):
     frames = []
 
     async def app(scope, receive, send):
-        # Match the API: request construction runs in an executor, while
+        # Match the API: Sequence construction runs in an executor, while
         # CoreManager.add_request runs back on the HTTP event-loop thread.
-        seq = await asyncio.get_running_loop().run_in_executor(None, _request)
+        seq = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: Sequence([10, 11, 12, 13], block_size=4)
+        )
         manager = SimpleNamespace(
             pp_size=1,
             _routable_engine_count=1,
@@ -123,30 +123,19 @@ def test_core_manager_captures_context_after_executor_preprocess(spans):
             _seq_id_to_callback={},
             _send_request=lambda rank, payload: frames.append(payload),
         )
-        bind_submit(manager)
         manager._add_prepared_requests = MethodType(
             CoreManager._add_prepared_requests, manager
         )
         CoreManager.add_request(manager, [seq])
 
     execute(app)
-    _, specs, _ = decode_client_message(received(frames[0]))
-    carrier, _, _ = specs[0].trace
+    _, items = decode_input(frames[0])
     http = spans.get_finished_spans()[0]
-    assert carrier["traceparent"].split("-")[2] == f"{http.context.span_id:016x}"
-    assert carrier["tracestate"] == "othervendor=x,nsdye=1"
-
-
-def bind_submit(manager):
-    """The CoreManager methods an add sends and cleans up through."""
-    for name in ("_send_submit", "_reject_unsent", "_forget_unsubmitted"):
-        setattr(manager, name, MethodType(getattr(CoreManager, name), manager))
-
-
-def _request() -> IngressRequest:
-    return IngressRequest(
-        id=1, prompt_token_ids=[10, 11, 12, 13], sampling_params=SamplingParams()
+    assert (
+        items[0].trace.carrier["traceparent"].split("-")[2]
+        == f"{http.context.span_id:016x}"
     )
+    assert items[0].trace.carrier["tracestate"] == "othervendor=x,nsdye=1"
 
 
 @pytest.mark.parametrize("already_bound", [False, True])
@@ -156,7 +145,7 @@ def test_same_node_pd_marks_http_and_skips_both_engine_carriers(
     frames = []
 
     async def app(scope, receive, send):
-        seq = _request()
+        seq = Sequence([10, 11, 12, 13], block_size=4)
         if already_bound:
             tracing.bind_sequences([seq])
         manager = SimpleNamespace(
@@ -164,17 +153,14 @@ def test_same_node_pd_marks_http_and_skips_both_engine_carriers(
             _seq_id_to_callback={},
             _send_request=lambda rank, payload: frames.append(payload),
         )
-        bind_submit(manager)
         DisaggCoreManager.add_request(manager, [seq])
         assert len(frames) == 2
         for frame in frames:
-            _, specs, _ = decode_client_message(received(frame))
-            for spec in specs:
-                assert spec.trace is None
-                # The engine's own sequence for it, untraced.
-                child_seq = Sequence(
-                    list(spec.kwargs["token_ids"]), block_size=4, id=spec.seq_id
-                )
+            _, items = decode_input(frame)
+            for item in items:
+                assert item.trace is None
+                child_seq = Sequence(prompt_token_ids(item), block_size=4)
+                assert not hasattr(child_seq, "_atom_trace_carrier")
                 tracing.enqueue(child_seq)
                 tracing.forward(child_seq, is_decode=False)
                 tracing.finish(child_seq, reason="max_tokens")
@@ -377,6 +363,7 @@ def test_engine_initializes_tracing_before_ready(monkeypatch):
     monkeypatch.setattr(cls, "_init_data_parallel", lambda *a: None)
     monkeypatch.setattr(cls, "_post_model_load_hook", lambda *a: None)
     monkeypatch.setattr(engine_core.StateRuntime, "from_wire", lambda wire: None)
+    monkeypatch.setattr(engine_core, "AdmissionContext", lambda *a, **k: None)
 
     def call(name, *a, **k):
         events.append(name)
@@ -395,7 +382,6 @@ def test_engine_initializes_tracing_before_ready(monkeypatch):
 
     monkeypatch.setattr(engine_core, "AsyncIOProcManager", runner_manager)
     monkeypatch.setattr(engine_core, "Scheduler", lambda *a, **k: None)
-    monkeypatch.setattr(engine_core, "AdmissionContext", lambda *a, **k: None)
     monkeypatch.setattr(engine_core, "EngineUtilityHandler", lambda *a, **k: None)
     monkeypatch.setattr(tracing, "initialize", lambda: events.append("initialize"))
     monkeypatch.setattr(

@@ -6,7 +6,6 @@ the pending pool, (3) completing a seq re-feeds the drained rank, (4) a fast ran
 ends up processing MORE total requests than a slow one (the whole point of Fix A).
 """
 
-import itertools
 import logging
 import queue
 import threading
@@ -20,21 +19,16 @@ import pytest
 from atom.config import KVEventsConfig
 from atom.model_engine.engine_core_mgr import CoreManager
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
-from atom.model_engine.zmq_protocol.codec import decode_client_message
-from atom.model_engine.zmq_protocol.requests import IngressRequest
-from atom.sampling_params import SamplingParams
-from engine_v1_helpers import received
-
-_seq_ids = itertools.count(1)
+from atom.model_engine.sequence import Sequence
+from atom.model_engine.zmq_protocol.codec import decode_input
 
 
-def make_seq(prompt=10):
-    """A request as the frontend submits it."""
-    return IngressRequest(
-        id=next(_seq_ids),
-        prompt_token_ids=[1] * prompt,
-        sampling_params=SamplingParams(),
-    )
+class Seq(Sequence):
+    _n = 0
+
+    def __init__(self, prompt=10):
+        Seq._n += 1
+        super().__init__([1] * prompt, 16, id=Seq._n)
 
 
 def make_mgr(n_ranks=4, depth=3, fail_ranks=None):
@@ -60,20 +54,19 @@ def make_mgr(n_ranks=4, depth=3, fail_ranks=None):
     mgr._bp_offline_batch = True
     mgr._bp_dispatch_paused = False
     mgr._seq_id_to_callback = {}
-    mgr._structured_ids = set()
     mgr._flush_stream_batch_fn = None
     mgr.fail_ranks = set(fail_ranks or ())
     # capture what got sent to each rank
     mgr.sent = [[] for _ in range(n_ranks)]
     mgr._send_lock = Lock()
 
-    def fake_send(dp_rank, frames):
+    def fake_send(dp_rank, payload):
         if dp_rank in mgr.fail_ranks:
             raise RuntimeError(f"send failed rank {dp_rank}")
-        kind, specs, failures = decode_client_message(received(frames))
-        assert kind == EngineCoreRequestType.ADD and not failures
+        _type, items = decode_input(payload)
+        assert _type == EngineCoreRequestType.ADD
         with mgr._send_lock:
-            mgr.sent[dp_rank].extend(spec.seq_id for spec in specs)
+            mgr.sent[dp_rank].extend(item.seq_id for item in items)
 
     mgr._send_request = fake_send
     return mgr
@@ -88,7 +81,7 @@ def _accounted(mgr):
 
 def test_cap_and_pending():
     mgr = make_mgr(n_ranks=4, depth=3)
-    seqs = [make_seq() for _ in range(100)]
+    seqs = [Seq() for _ in range(100)]
     mgr.add_request(seqs)
     # 4 ranks * depth 3 = 12 dispatched, rest pending.
     assert mgr._rank_reqs == [3, 3, 3, 3], mgr._rank_reqs
@@ -98,7 +91,7 @@ def test_cap_and_pending():
 
 def test_refill_feeds_fast_rank_more():
     mgr = make_mgr(n_ranks=4, depth=3)
-    seqs = [make_seq() for _ in range(40)]
+    seqs = [Seq() for _ in range(40)]
     mgr.add_request(seqs)
     assert mgr._rank_reqs == [3, 3, 3, 3]
 
@@ -165,7 +158,7 @@ def test_init_warns_when_backpressure_overrides_strategy(monkeypatch, caplog):
 
 def test_drains_everything():
     mgr = make_mgr(n_ranks=2, depth=2)
-    seqs = [make_seq() for _ in range(20)]
+    seqs = [Seq() for _ in range(20)]
     mgr.add_request(seqs)
     # finish all in-flight repeatedly until pending + in-flight empty
     guard = 0
@@ -185,7 +178,7 @@ def test_drains_everything():
 def test_online_add_does_not_enter_pending_pool():
     mgr = make_mgr(n_ranks=2, depth=1)
     mgr._bp_offline_batch = False
-    seqs = [make_seq() for _ in range(6)]
+    seqs = [Seq() for _ in range(6)]
     mgr.add_request(seqs)
     assert len(mgr._bp_pending) == 0
     sent, pending = _accounted(mgr)
@@ -198,7 +191,7 @@ def test_partial_send_failure_requeues_later_ranks_and_pauses():
     # attempted. The failed seq goes back to the head of the pool, its charge
     # returns to zero, and a later refill does not dispatch the failed add.
     mgr = make_mgr(n_ranks=3, depth=1, fail_ranks={1})
-    seqs = [make_seq() for _ in range(6)]
+    seqs = [Seq() for _ in range(6)]
     with pytest.raises(RuntimeError, match="send failed rank 1"):
         mgr.add_request(seqs)
     assert mgr._rank_reqs == [1, 0, 1]
@@ -215,7 +208,7 @@ def test_partial_send_failure_requeues_later_ranks_and_pauses():
 
 def test_every_send_failing_returns_counters_to_zero():
     mgr = make_mgr(n_ranks=2, depth=1, fail_ranks={0, 1})
-    seqs = [make_seq() for _ in range(4)]
+    seqs = [Seq() for _ in range(4)]
     with pytest.raises(RuntimeError):
         mgr.add_request(seqs)
     assert mgr._rank_reqs == [0, 0]
@@ -229,7 +222,7 @@ def test_every_send_failing_returns_counters_to_zero():
 def test_refill_send_failure_requeues_and_fails_a_stalled_run():
     mgr = make_mgr(n_ranks=2, depth=1)
     mgr.outputs_queue = queue.Queue()
-    seqs = [make_seq() for _ in range(4)]
+    seqs = [Seq() for _ in range(4)]
     mgr.add_request(seqs)
     assert sum(mgr._rank_reqs) == 2
     mgr.fail_ranks.update({0, 1})
@@ -250,7 +243,7 @@ def test_refill_send_failure_requeues_and_fails_a_stalled_run():
 
 def test_abort_pending_seq_is_not_dispatched():
     mgr = make_mgr(n_ranks=2, depth=1)
-    seqs = [make_seq() for _ in range(4)]
+    seqs = [Seq() for _ in range(4)]
     delivered = {}
 
     def callback(output):
@@ -280,7 +273,7 @@ def test_abort_pending_seq_is_not_dispatched():
 
 def test_concurrent_add_and_refill_dispatches_once():
     mgr = make_mgr(n_ranks=4, depth=2)
-    seqs = [make_seq() for _ in range(40)]
+    seqs = [Seq() for _ in range(40)]
     errors = []
 
     def add_chunks():
@@ -328,7 +321,7 @@ def test_a_stalled_run_ends_pending_seqs_that_wait_on_a_callback():
     mgr = make_mgr(n_ranks=2, depth=1)
     mgr.outputs_queue = queue.Queue()
     delivered = {}
-    seqs = [make_seq() for _ in range(4)]
+    seqs = [Seq() for _ in range(4)]
     seqs[-1].stream_callback = lambda out: delivered.update(
         {out.request_id: out.finish_reason}
     )

@@ -18,7 +18,6 @@ from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus, new_block_table
-import engine_v1_helpers
 
 
 @pytest.fixture
@@ -139,26 +138,21 @@ def test_engine_receipt_includes_time_buffered_before_scheduler_admission(
 
     from aiter_stub import stubbed_aiter
 
-    from atom.model_engine.admission import AdmissionContext
-    from atom.model_engine.zmq_protocol.codec import encode_shutdown, encode_submit
-    from atom.model_engine.zmq_protocol.requests import IngressRequest
-    from atom.sampling_params import SamplingParams
-
     with stubbed_aiter():
         from atom.model_engine import engine_core as core
+    from atom.model_engine.admission import AdmissionContext
+    from atom.model_engine.zmq_protocol.codec import encode_input
 
-    request = IngressRequest(
-        id=1, prompt_token_ids=[1, 3, 4], sampling_params=SamplingParams()
-    )
-    messages = iter(
+    seq = Sequence([1, 3, 4], block_size=4)
+    # A timestamp from another engine must not replace local receipt.
+    SchedulerMetrics.enqueue(seq, received_at=50.0)
+    frames = iter(
         [
-            engine_v1_helpers.received(encode_submit([request])[0]),
-            engine_v1_helpers.received(encode_shutdown()),
+            encode_input(core.EngineCoreRequestType.ADD, [seq]),
+            encode_input(core.EngineCoreRequestType.SHUTDOWN),
         ]
     )
-    sock = SimpleNamespace(
-        send=lambda _: None, recv_multipart=lambda **_: next(messages)
-    )
+    sock = SimpleNamespace(send=lambda _: None, recv=lambda **_: next(frames))
     monkeypatch.setattr(core, "make_zmq_socket", lambda *a, **kw: nullcontext(sock))
     monkeypatch.setattr(
         core.zmq,
@@ -177,8 +171,11 @@ def test_engine_receipt_includes_time_buffered_before_scheduler_admission(
         SimpleNamespace(
             kv_cache_block_size=4,
             speculative_config=None,
-            enable_dp_attention=False,
             hf_config=SimpleNamespace(model_type="llama"),
+            end_token_ids=(2,),
+            enable_dp_attention=False,
+            kv_transfer_config=None,
+            enable_rapidserve=False,
         )
     )
     engine.process_input_sockets("input", "control")
