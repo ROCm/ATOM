@@ -6,7 +6,7 @@ edition = "2021"
 [features]
 default = ["grpc-client"]
 grpc-client = []
-ext-proc = ["dep:prost-types", "dep:tonic-prost", "tonic/tls-ring"]
+ext-proc = ["dep:prost-types", "dep:tonic-prost", "dep:tonic-prost-build", "dep:protox", "tonic/tls-ring"]
 
 [lints.rust]
 unused_qualifications = "warn"
@@ -99,8 +99,8 @@ zmq = "0.10"  # zmq-sys 0.12 builds the bundled libzmq from source and links it 
 
 
 [build-dependencies]
-tonic-prost-build = "0.14"
-protox = "0.9"  # compiles .proto in-process; no protoc binary
+tonic-prost-build = { version = "0.14", optional = true }
+protox = { version = "0.9", optional = true }  # compiles .proto in-process; no protoc binary
 chrono = { version = "0.4", features = ["clock"] }
 toml = "0.9"
 
