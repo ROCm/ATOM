@@ -1487,11 +1487,6 @@ class SpeculativeConfig:
         form is converted to a length and everything downstream reads only
         ``synthetic_acceptance_rates``.
         """
-        # Local import: the schedule lives next to the kernel that consumes it,
-        # and that module pulls in triton, which has no business loading just
-        # because someone imported a config.
-        from atom.model_ops.rejection_sampler import acceptance_length_to_rates
-
         if (
             self.synthetic_acceptance_length is not None
             and self.synthetic_acceptance_rate is not None
@@ -1503,6 +1498,9 @@ class SpeculativeConfig:
         length = self.synthetic_acceptance_length
         if self.synthetic_acceptance_rate is None and length is None:
             return
+        # Below the return: the rejection sampler pulls in triton, which a config
+        # without forced acceptance has no business loading.
+        from atom.model_ops.rejection_sampler import acceptance_length_to_rates
 
         n = self.num_speculative_tokens
         if not n:
