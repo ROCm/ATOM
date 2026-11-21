@@ -442,6 +442,64 @@ t "a card carrying the measured coverage passes" \
 t "a coverage label with nothing after it is refused" \
   "$(_cov_gate "$_SMALL" 'Coverage:')" "EMPTY-COVERAGE"
 
+# check_prompts.py runs sixteen checks and only two are drift. run_one reported every
+# refusal as "prompts drifted" and sent the output that named the real one to /dev/null,
+# so the owner was told to regenerate files that were fine. aiter#8255's review aborted
+# that way on 2026-11-19 against prompts that matched SKILL.md verbatim.
+_flow_msg() {  # <python snippet that makes check_prompts fail> -> what run_one would say
+  r=$(mktemp -d); d="$r/.claude/skills/review-pr"
+  mkdir -p "$d" "$r/.github/workflows"
+  cp -r "$S"/. "$d/" 2>/dev/null
+  cp "$S/../../../.github/workflows/atom-review-bot.yml" "$r/.github/workflows/" 2>/dev/null
+  python3 -c "$1" "$d"
+  # The block run here is extracted from run_one.sh, not a copy of it: a test that
+  # reimplements the thing it guards passes whatever run_one.sh does.
+  blk=$(sed -n '/# >>> prompt-gate/,/# <<< prompt-gate/p' "$S/run_one.sh")
+  # run_one.sh is `set -euo pipefail`; a harness without it is a different shell, and the
+  # difference is load-bearing here (a grep that matches nothing aborts the script).
+  SKILL="$d" bash -c "set -euo pipefail
+fail(){ printf '%s\n' \"\$3\"; exit \"\$2\"; }
+$blk" 2>/dev/null
+  rm -rf "$r"
+}
+# These stand-ins model an early crash, before any ❌ was printed. An empty reason is the
+# very thing this block exists to remove, so it falls back to the last output line.
+_flow_raw() {  # <python body for a stand-in check_prompts> -> what run_one would say
+  d=$(mktemp -d); printf '%s\n' "$1" > "$d/check_prompts.py"
+  blk=$(sed -n '/# >>> prompt-gate/,/# <<< prompt-gate/p' "$S/run_one.sh")
+  # run_one.sh is `set -euo pipefail`; a harness without it is a different shell, and the
+  # difference is load-bearing here (a grep that matches nothing aborts the script).
+  SKILL="$d" bash -c "set -euo pipefail
+fail(){ printf '%s\n' \"\$3\"; exit \"\$2\"; }
+$blk" 2>/dev/null
+  rm -rf "$d"
+}
+# The two harnesses above hand-copy run_one.sh's shell options. If run_one gains or loses
+# one, they silently go on testing a shell that no longer exists -- which is how the grep
+# abort above survived a green suite. Pin them to the real line.
+t "the harness runs the block under run_one's own shell options" \
+  "$(grep -c '^set -euo pipefail$' "$S/run_one.sh")$(grep -c 'bash -c "set -euo pipefail$' "$S/selftest.sh")" "12"
+
+t "a crash with a message reports the message" \
+  "$(_flow_raw 'import sys
+print("Traceback: boom", file=sys.stderr)
+raise SystemExit(1)' | grep -c 'Traceback: boom')" "1"
+t "and a crash with no output still says something" \
+  "$(_flow_raw 'raise SystemExit(7)' | grep -c 'run it by hand')" "1"
+t "a drifted prompt is reported as drift" \
+  "$(_flow_msg '
+import pathlib,sys
+p = pathlib.Path(sys.argv[1], "prompts/worker.md")
+p.write_text(p.read_text().replace("**Output rules (strictly enforced):**", "**Output rules:**", 1))
+' | grep -c DRIFTED)" "1"
+t "and a refusal that is not drift is not called drift" \
+  "$(_flow_msg '
+import pathlib,sys
+p = pathlib.Path(sys.argv[1], "check_prompts.py")
+p.write_text(p.read_text().replace("def check_fail_classes():",
+    "def check_fail_classes():\n    print(\"\\u274c run budget fits the job cap: FORCED\"); return 1\n    # o", 1))
+' | awk '/refused: ❌ run budget fits the job cap: FORCED/{n++} tolower($0)~/drift/{d++} END{print n+0 ":" d+0}')" "1:0"
+
 # `[diff-too-large]` (GitHub refusing a diff over 20000 lines) writes no coverage line,
 # so the card has to supply one and it has to say BEYOND ONE PASS.
 _cov_raw() {  # <full rules.txt, or MISSING> <card coverage line or -> problem kind or ok
@@ -574,7 +632,7 @@ _drift_outside_a_repo() {
   ( cd /tmp && python3 "$t/.claude/skills/review-pr/check_prompts.py" >/dev/null 2>&1; echo $? )
   rm -rf "$t"
 }
-t "the drift check runs outside a git checkout" "$(_drift_outside_a_repo)" "0"
+t "check_prompts runs outside a git checkout" "$(_drift_outside_a_repo)" "0"
 
 
 # ATOM_AGENT_TIMEOUT and ATOM_RUN_BUDGET are coupled and nothing else enforces it. A review

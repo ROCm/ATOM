@@ -379,7 +379,7 @@ fail quietly when it is wrong:
   every card starts a run that posts a card. The workflow therefore excludes *every*
   login in `_identity.KNOWN` as well as `vars.ATOM_BOT_LOGIN`, and `check_prompts.py`
   asserts that each one appears — adding an identity to `KNOWN` without adding it to the
-  workflow turns the drift check red.
+  workflow turns `check_prompts.py` red.
 - the dedup marker, `<!-- <login> review pr=<n> head=<sha> -->`. A marker left by any
   former identity still counts, or the first run after a switch re-reviews every open PR.
 
