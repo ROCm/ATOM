@@ -28,6 +28,12 @@ Completion protocol, per worker and operation:
 * A chunk the store already holds when a save reaches its window is neither
   read nor put: it is source-safe at once and counts as stored, so a save
   whose every chunk was held ends in a success like any other.
+* Under a draft window the last PP stage also moves draft objects
+  (``LMCacheReqMeta.draft_chunks``). A save packs and puts them before its
+  target windows, so a chunk is source-safe only once both its packs ran; a
+  target the store holds says nothing of its draft object. A draft object not
+  stored fails no save (a later lookup cuts its hit there); a load gets them
+  all or fails.
 * A load ends in exactly one of done or failed, all-or-nothing.
 * A slot returns to the pool only once no GPU or store access can still reach
   it. One a store transfer or a GPU copy may still reach is quarantined for
@@ -51,6 +57,7 @@ import threading
 import time
 from collections import Counter
 from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -64,7 +71,12 @@ from atom.kv_transfer.offload._block_gpu_connector import (
 from atom.kv_transfer.offload._offload_common import pp_aware_rank_and_world
 from atom.kv_transfer.offload.dense.connector import DenseOffloadConnector
 from atom.kv_transfer.offload.kv_store.client import CallRefused, KVStoreClient
-from atom.kv_transfer.offload.kv_store.keys import DIGEST_BYTES, chunk_keys
+from atom.kv_transfer.offload.kv_store.keys import (
+    DIGEST_BYTES,
+    chunk_keys,
+    draft_chunk_keys,
+    draft_ranks,
+)
 from atom.kv_transfer.offload.kv_store.pool import (
     Slot,
     SlotPoolExhausted,
@@ -76,6 +88,7 @@ from atom.kv_transfer.offload.kv_store.scheduler import (
     require_monotonic_clock_id,
 )
 from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata, LMCacheReqMeta
+from atom.spec_decode.draft_window_geometry import DraftReadWindow
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -141,6 +154,35 @@ def _held_runs(window: range, held: list[bool]) -> list[tuple[range, bool]]:
     return runs
 
 
+def _window_block_groups(connector: Any, window: range, block_ids: list[int]) -> Any:
+    """Each chunk of ``window``'s blocks, from the window's part of the table only:
+    converting all of it would cost every window time in the prompt's length."""
+    chunk = connector.chunk_size
+    per_chunk = chunk // connector.virtual_block_size
+    offsets = range(len(window))
+    return connector._gpu_connector._ranges_to_block_ids(
+        [offset * chunk for offset in offsets],
+        [(offset + 1) * chunk for offset in offsets],
+        block_ids=block_ids[window.start * per_chunk : window.stop * per_chunk],
+    )
+
+
+@dataclass
+class _DraftTransfer:
+    """What one save or load moved of a draft window's draft objects, and the
+    time it spent; the target fields of a PROF line leave this phase out."""
+
+    # Draft objects of the puts (gets) that succeeded.
+    chunks: int = 0
+    nbytes: int = 0
+    # A pack or restore includes its fence behind the forward's stream.
+    pack_ms: float = 0.0
+    put_ms: float = 0.0
+    get_ms: float = 0.0
+    unpack_ms: float = 0.0
+    status: str = "ok"
+
+
 class KVStoreOffloadConnector(DenseOffloadConnector):
     """Offload worker whose tier is an external KV store, reached directly.
 
@@ -173,6 +215,11 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         self._namespace: str | None = None
         self._world = 1
         self._chunk_bytes = 0
+        # A draft window, and this rank's draft codec and object size when it
+        # holds the draft's regions (else None and 0).
+        self._draft_window = self._store_draft_window(config)
+        self._draft_codec: Any = None
+        self._draft_chunk_bytes = 0
         self._stats_lock = threading.Lock()
         # Whether one-run windows are copied in place; see `register_kv_caches`.
         self._in_place = False
@@ -215,6 +262,16 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
 
     def _store_namespace(self) -> str:
         """This server's key namespace."""
+        raise NotImplementedError
+
+    @staticmethod
+    def _store_draft_window(config: Any) -> DraftReadWindow | None:
+        """The read window draft objects are kept for; None keeps the draft
+        rows in the target objects."""
+        return None
+
+    def _build_draft_codec(self, transfer_tensors: Any, num_blocks: int | None) -> Any:
+        """The codec of this rank's draft objects; None where it holds none."""
         raise NotImplementedError
 
     def _select_endpoint(self, device: torch.device) -> Any:
@@ -265,8 +322,11 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         run: range,
         keys: list[str],
         slots: list[Slot],
+        *,
+        draft: bool = False,
     ) -> Any:
-        """Put chunks ``run`` of ``req`` from ``slots`` under ``keys``.
+        """Put chunks ``run`` of ``req`` from ``slots`` under ``keys`` (their
+        draft objects with ``draft``).
 
         Returns whatever `_settle_put` reads. Raises :class:`CallRefused`
         when nothing was sent; anything else it raises leaves the slots
@@ -281,9 +341,15 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         raise NotImplementedError
 
     def _get_chunks(
-        self, client: KVStoreClient, keys: list[str], slots: list[Slot]
+        self,
+        client: KVStoreClient,
+        keys: list[str],
+        slots: list[Slot],
+        *,
+        draft: bool = False,
     ) -> Any:
-        """Get ``keys`` into ``slots``; whatever `_get_failure` reads.
+        """Get ``keys`` (draft objects with ``draft``) into ``slots``; whatever
+        `_get_failure` reads.
 
         Raises like `_put_chunks`; anything but :class:`CallRefused` leaves
         the slots quarantined.
@@ -372,6 +438,7 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         # The dense codec reads kv_caches. M3 and V4.1 read the PAGE region map.
         # V4.1 also requires the replay contract; its state is not stored.
         self._codec = self._build_codec(kv_caches, transfer_tensors, num_blocks)
+        self._register_draft_codec(transfer_tensors, num_blocks, rank)
         cfg = self._store_cfg
         namespace = self._store_namespace()
         device = self._codec.device
@@ -432,7 +499,7 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
             "%s worker rank=%d world=%d: namespace=%s %s "
             "bytes_per_block=%d chunk=%d chunk_bytes=%d "
             "pool=%s save_slots=%d load_slots=%d gpu_staging_buffer_bytes=%d "
-            "save=%s load=%s save_workers=%d load_workers=%d",
+            "save=%s load=%s save_workers=%d load_workers=%d%s",
             self.LABEL,
             rank,
             world,
@@ -449,7 +516,40 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
             self._do_load,
             self.save_workers,
             self.load_workers,
+            (
+                ""
+                if self._draft_window is None
+                else f" draft_chunk_bytes={self._draft_chunk_bytes}"
+            ),
         )
+
+    def _register_draft_codec(
+        self, transfer_tensors: Any, num_blocks: int | None, rank: int
+    ) -> None:
+        """Build this rank's draft codec under a draft window; refuse a rank
+        whose draft regions do not match its place in `draft_ranks`."""
+        if self._draft_window is None:
+            return
+        codec = self._build_draft_codec(transfer_tensors, num_blocks)
+        if (codec is not None) != (rank in draft_ranks(self._config)):
+            raise ValueError(
+                f"{self.LABEL}: rank {rank} "
+                f"{'holds' if codec is not None else 'lacks'} draft KV regions, but "
+                "the draft's objects are keyed on the last PP stage's ranks"
+            )
+        if codec is None:
+            return
+        # One draft object goes through one transfer slot, sized for a target one.
+        if codec.bytes_per_block > self._codec.bytes_per_block:
+            raise ValueError(
+                f"{self.LABEL}: the draft's {codec.bytes_per_block} bytes per block "
+                f"exceed the target's {self._codec.bytes_per_block}, whose objects "
+                "size the transfer slots"
+            )
+        self._draft_codec = codec
+        self._draft_chunk_bytes = (
+            self.chunk_size // self.virtual_block_size
+        ) * codec.bytes_per_block
 
     # -- per-step (RPC thread): only enqueue, never copy ------------------
     def start_load_kv(self, metadata) -> None:
@@ -515,6 +615,17 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         return float(dispatched_at) + self._source_read_window_s
 
     # -- copy daemon threads ---------------------------------------------
+    def _missed_source_read_deadline(
+        self, deadline: float | None
+    ) -> tuple[str, str] | None:
+        """The save's failure once its source read deadline passed; None before."""
+        if deadline is None or time.monotonic() < deadline:
+            return None
+        return "source_read_deadline", (
+            f"queued past {self._source_read_window_s:.0f}s, after which "
+            "the scheduler may reclaim the source blocks"
+        )
+
     def _registered(
         self,
     ) -> tuple[TransferSlotPool, KVStoreClient, BlockGPUConnector]:
@@ -588,18 +699,23 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
             return
         pool, client, gpu_connector = self._registered()
         deadline = self._source_read_deadline(req)
+        # The draft objects first: a chunk is source-safe once both its packs ran.
+        draft = _DraftTransfer()
+        failure, detail = self._save_draft_chunks(
+            req, self._draft_chunks_of(req, start, end), deadline, producer_event, draft
+        )
         windows = _tail_first_windows(
             start, end, pool.window("save", self.save_workers)
         )
         # The lowest chunk handed to the GPU or found held so far; [start,
         # read_from) is unread.
         read_from = end
-        failure = detail = None
         segments_run = put_bytes = in_place_segments = 0
         windows_reached = put_chunks = held_chunks = 0
         pack_ms = put_ms = exists_ms = 0.0
         t_store0 = time.perf_counter()
-        for segment, held, keys, lookup_ms in self._save_segments(client, req, windows):
+        segments = self._save_segments(client, req, windows) if failure is None else ()
+        for segment, held, keys, lookup_ms in segments:
             if lookup_ms is not None:  # the first segment of a window
                 windows_reached += 1
                 exists_ms += lookup_ms
@@ -616,13 +732,10 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
                 failure, detail = "pool_exhausted", str(exc)
                 break
             # Checked after the wait for slots, right before the GPU read.
-            if deadline is not None and time.monotonic() >= deadline:
+            missed = self._missed_source_read_deadline(deadline)
+            if missed is not None:
                 pool.release(slots)
-                failure = "source_read_deadline"
-                detail = (
-                    f"queued past {self._source_read_window_s:.0f}s, after which "
-                    "the scheduler may reclaim the source blocks"
-                )
+                failure, detail = missed
                 break
             segments_run += 1
             run = pool.contiguous_view(slots) if self._in_place else None
@@ -696,7 +809,7 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
                 "held_chunks=%d put_chunks=%d windows=%d segments=%d "
                 "in_place_segments=%d put_bytes=%d producer_fenced=%d "
                 "exists_ms=%.2f pack_ms=%.2f put_ms=%.2f store_ms=%.2f "
-                "total_ms=%.2f status=%s",
+                "total_ms=%.2f status=%s" + self._draft_prof(draft, put=True),
                 self._rank,
                 req.req_id,
                 end * chunk,
@@ -855,6 +968,11 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
             # Both paths synchronized before returning: the slots are idle.
             pool.release(slots)
             loaded_chunks += len(window)
+        draft = _DraftTransfer()
+        if failure is None:
+            failure, detail = self._load_draft_chunks(
+                req, self._draft_chunks_of(req, first, end), draft
+            )
         if failure is None:
             # And once after the last get: a mark placed while a get ran is
             # one the look before it missed, and that get may have read what
@@ -879,7 +997,7 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
                 "[OFFLOAD-LOAD-PROF] rank=%s req=%s hbm=%d lmc=%d retrieved=%d "
                 "status=%s chunks=%d windows=%d in_place_windows=%d total_bytes=%d "
                 "get_ms=%.2f unpack_ms=%.2f retrieve_ms=%.2f total_ms=%.2f "
-                "effective_gbps=%.2f",
+                "effective_gbps=%.2f" + self._draft_prof(draft, put=False),
                 self._rank,
                 req.req_id,
                 hbm,
@@ -904,6 +1022,203 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
             else:
                 self._failed_load.add(self._load_completion_id(req))
                 self._record_load_error_blocks(req)
+
+    # -- a draft window's draft objects ---------------------------------------
+    def _draft_chunks_of(self, req: LMCacheReqMeta, start: int, end: int) -> range:
+        """The draft objects of `req` this rank moves, within chunks `[start, end)`."""
+        if self._draft_codec is None or req.draft_chunks is None:
+            return range(0)
+        first, last = req.draft_chunks
+        return range(max(int(first), start), min(int(last), end))
+
+    def _draft_keys(self, req: LMCacheReqMeta, window: range) -> list[str]:
+        """This rank's draft object keys of the chunks of ``req`` in ``window``."""
+        return draft_chunk_keys(
+            self._namespace,
+            self._rank,
+            self._world,
+            req.chunk_hashes,
+            window.start,
+            window.stop,
+        )
+
+    def _save_draft_chunks(
+        self,
+        req: LMCacheReqMeta,
+        chunks: range,
+        deadline: float | None,
+        producer_event: Any,
+        draft: _DraftTransfer,
+    ) -> tuple[str | None, str | None]:
+        """Pack and put the draft objects of `chunks`. Only a missed source read
+        deadline fails the save; a draft not stored costs a lookup cut."""
+        if not chunks:
+            return None, None
+        pool, client, _ = self._registered()
+        windows = _tail_first_windows(
+            chunks.start, chunks.stop, pool.window("save", self.save_workers)
+        )
+        failure = detail = why = None
+        for window in windows:
+            try:
+                slots = pool.acquire("save", len(window))
+            except SlotPoolExhausted as exc:
+                draft.status, why = "pool_exhausted", str(exc)
+                break
+            missed = self._missed_source_read_deadline(deadline)
+            if missed is not None:
+                pool.release(slots)
+                failure, detail = missed
+                break
+            t_pack0 = time.perf_counter()
+            try:
+                self._copy_draft_chunks(
+                    slots,
+                    window,
+                    req.block_ids,
+                    pack=True,
+                    producer_event=producer_event,
+                )
+            except BaseException:
+                self._release_once_device_idle(pool, slots)
+                raise
+            draft.pack_ms += (time.perf_counter() - t_pack0) * 1000
+            t_put0 = time.perf_counter()
+            try:
+                answer = self._put_chunks(
+                    client,
+                    req,
+                    window,
+                    self._draft_keys(req, window),
+                    slots,
+                    draft=True,
+                )
+            except CallRefused as exc:
+                pool.release(slots)
+                draft.status, why = "put_refused", str(exc)
+                break
+            except Exception as exc:  # noqa: BLE001  # reported below
+                pool.quarantine(slots, reason="a draft put raised")
+                self._distrust_store(f"a draft put raised {exc!r}")
+                draft.status, why = "put_raised", repr(exc)
+                break
+            draft.put_ms += (time.perf_counter() - t_put0) * 1000
+            why = self._settle_put(pool, slots, answer)
+            if why is not None:
+                draft.status = "put_failed"
+                break
+            draft.chunks += len(slots)
+            draft.nbytes += self._draft_chunk_bytes * len(slots)
+        if draft.status != "ok":
+            self._warn_rate_limited(
+                f"save:draft_{draft.status}",
+                "%s: req=%s did not store all its draft objects (%s: %s); a "
+                "lookup cuts a later hit where one is missing",
+                self.LABEL,
+                req.req_id,
+                draft.status,
+                why,
+            )
+        return failure, detail
+
+    def _load_draft_chunks(
+        self, req: LMCacheReqMeta, chunks: range, draft: _DraftTransfer
+    ) -> tuple[str | None, str | None]:
+        """Get and restore the draft objects of `chunks`, all or nothing."""
+        if not chunks:
+            return None, None
+        pool, client, _ = self._registered()
+        windows = _head_first_windows(
+            chunks.start, chunks.stop, pool.window("load", self.load_workers)
+        )
+        for window in windows:
+            refusal = self._load_refusal(client)
+            if refusal is not None:
+                return "store_distrusted", refusal
+            try:
+                slots = pool.acquire("load", len(window))
+            except SlotPoolExhausted as exc:
+                return "pool_exhausted", str(exc)
+            t_get0 = time.perf_counter()
+            try:
+                answer = self._get_chunks(
+                    client, self._draft_keys(req, window), slots, draft=True
+                )
+            except CallRefused as exc:
+                pool.release(slots)
+                return "draft_get_refused", str(exc)
+            except Exception as exc:  # noqa: BLE001  # reported by the caller
+                pool.quarantine(slots, reason="a draft get raised")
+                return "draft_get_raised", repr(exc)
+            draft.get_ms += (time.perf_counter() - t_get0) * 1000
+            problem = self._get_failure(pool, slots, answer)
+            if problem is not None:
+                return "draft_get_failed", problem
+            t_unpack0 = time.perf_counter()
+            try:
+                self._copy_draft_chunks(slots, window, req.block_ids, pack=False)
+            except BaseException:
+                self._release_once_device_idle(pool, slots)
+                raise
+            draft.unpack_ms += (time.perf_counter() - t_unpack0) * 1000
+            pool.release(slots)
+            draft.chunks += len(window)
+            draft.nbytes += self._draft_chunk_bytes * len(window)
+        return None, None
+
+    def _copy_draft_chunks(
+        self,
+        slots: list[Slot],
+        window: range,
+        block_ids: list[int],
+        *,
+        pack: bool,
+        producer_event: Any = None,
+    ) -> None:
+        """Pack `window`'s draft rows into the head of each slot, or restore them;
+        a run of slots restores in one launch at the pool's slot stride."""
+        codec = self._draft_codec
+        strided = not pack and getattr(codec, "supports_strided_restore", False)
+        run = self._pool.strided_view(slots) if strided else None
+        if run is not None:
+            self._copy_in_place(
+                run,
+                window,
+                block_ids,
+                pack=False,
+                chunk_stride_bytes=self._pool.slot_stride,
+                codec=codec,
+            )
+            return
+        stream = self._in_place_stream()
+        if producer_event is not None:
+            stream.wait_event(producer_event)
+        groups = _window_block_groups(self, window, block_ids)
+        owner = codec.prepare_block_id_groups(
+            groups, device=codec.device, stream=stream
+        )
+        copy = (
+            codec.gpu_to_chunk_major_device_buffer_prepared
+            if pack
+            else codec.chunk_major_device_buffer_to_gpu_prepared
+        )
+        for index, slot in enumerate(slots):
+            copy(slot.tensor[: self._draft_chunk_bytes], owner, index, stream=stream)
+        atom_lmcache_staging.fence_submitted_work(stream)
+
+    def _draft_prof(self, draft: _DraftTransfer, *, put: bool) -> str:
+        """The draft fields a PROF line of a draft rank appends."""
+        if self._draft_codec is None:
+            return ""
+        fields = f" draft_chunks={draft.chunks} draft_bytes={draft.nbytes}"
+        if put:
+            return fields + (
+                f" draft_pack_ms={draft.pack_ms:.2f} draft_put_ms={draft.put_ms:.2f}"
+                f" draft_status={draft.status}"
+            )
+        return fields + (
+            f" draft_get_ms={draft.get_ms:.2f} draft_unpack_ms={draft.unpack_ms:.2f}"
+        )
 
     # -- in-place copies ---------------------------------------------------
     def _in_place_stream(self) -> torch.cuda.Stream:
@@ -935,32 +1250,24 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         pack: bool,
         producer_event: Any = None,
         chunk_stride_bytes: int | None = None,
+        codec: Any = None,
     ) -> None:
         """Pack ``window``'s KV blocks into ``run``, or unpack it into them.
         With ``chunk_stride_bytes``, ``run`` holds padded Store slots and is
-        unpacked in place; each slot's padding is skipped, not read.
+        unpacked in place; each slot's padding is skipped, not read. ``codec``
+        is the target's unless given (a draft window's draft codec).
 
         Returns once the copy is done. A pack is ordered after
         ``producer_event`` like the staged pack, so the kernels that produced
         the KV finish first.
         """
-        codec = self._codec
-        chunk = self.chunk_size
+        codec = self._codec if codec is None else codec
         stream = self._in_place_stream()
         if producer_event is not None:
             # Also on the forward's stream: it may have changed since the
             # producer recorded the event, and a same-stream wait is free.
             stream.wait_event(producer_event)
-        # Only the window's part of the block table, with token offsets from
-        # its first chunk: converting the whole table would cost every window
-        # time in proportion to the prompt's length.
-        per_chunk = chunk // self.virtual_block_size
-        offsets = range(len(window))
-        groups = self._gpu_connector._ranges_to_block_ids(
-            [offset * chunk for offset in offsets],
-            [(offset + 1) * chunk for offset in offsets],
-            block_ids=block_ids[window.start * per_chunk : window.stop * per_chunk],
-        )
+        groups = _window_block_groups(self, window, block_ids)
         owner = codec.prepare_block_id_groups(
             [groups], device=codec.device, stream=stream
         )
@@ -970,7 +1277,7 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
                 owner,
                 0,
                 stream=stream,
-                items_per_chunk=per_chunk,
+                items_per_chunk=self.chunk_size // self.virtual_block_size,
                 chunk_stride_bytes=chunk_stride_bytes,
             )
         elif pack:
@@ -1039,12 +1346,22 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         failures = ",".join(
             f"{name}x{count}" for name, count in sorted(stats["failures"].items())
         )
+        draft = ""
+        if self._draft_codec is not None:
+            draft = (
+                f" draft_puts={counts.get('draft_put_calls', 0)}"
+                f" draft_put_keys={counts.get('draft_put_keys', 0)}"
+                f" draft_put_bytes={counts.get('draft_put_bytes', 0)}"
+                f" draft_gets={counts.get('draft_get_calls', 0)}"
+                f" draft_get_keys={counts.get('draft_get_keys', 0)}"
+                f" draft_get_bytes={counts.get('draft_get_bytes', 0)}"
+            )
         logger.info(
             "[OFFLOAD-STORE-STATS] rank=%s puts=%d put_keys=%d put_bytes=%d "
             "save_exists=%d save_put_chunks=%d save_held_chunks=%d "
             "save_held_bytes=%d "
             "gets=%d get_keys=%d get_bytes=%d failures=%s "
-            "quarantined_slots=save:%d,load:%d",
+            "quarantined_slots=save:%d,load:%d" + draft,
             self._rank,
             counts.get("put_calls", 0),
             counts.get("put_keys", 0),
