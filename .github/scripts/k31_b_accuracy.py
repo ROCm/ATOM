@@ -425,12 +425,14 @@ def device_groups(allocated):
     }
 
 
-def device_access(admission):
-    output = EVIDENCE / f"device-access-{os.getpid()}.json"
+def device_access(admission, output=None):
+    output = output or EVIDENCE / f"device-access-{os.getpid()}.json"
     report = {
         "kind": "ci-device-access-v1",
         "observation_location": "workload_container",
         "cid": admission["cid"],
+        "pid": os.getpid(),
+        "parent_pid": os.getppid(),
         "uid": os.getuid(),
         "euid": os.geteuid(),
         "gid": os.getegid(),
@@ -495,6 +497,59 @@ def device_access(admission):
     finally:
         save(output, report)
     return report
+
+
+def device_access_child(root):
+    return device_access(
+        read(root / "admission.json"),
+        EVIDENCE / f"device-access-from-{os.getppid()}.json",
+    )
+
+
+def isolated_device_access(root, admission):
+    parent = os.getpid()
+    stem = EVIDENCE / f"device-access-from-{parent}"
+    output = stem.with_suffix(".json")
+    require(not output.exists(), "device probe receipt already exists")
+    telemetry(EVIDENCE / f"pre-access-{parent}.json")
+    result = {
+        "kind": "ci-access-probe-exit-v1",
+        "cid": admission["cid"],
+        "parent_pid": parent,
+        "timeout_seconds": 30,
+    }
+    try:
+        with stem.with_suffix(".log").open("x") as log:
+            child = subprocess.run(
+                [sys.executable, __file__, "access-probe", str(root)],
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                timeout=30,
+                check=False,
+            )
+        result["returncode"] = child.returncode
+        require(child.returncode == 0, "device access child failed")
+        access = read(output)
+        require(
+            access["passed"]
+            and access["cid"] == admission["cid"]
+            and access["parent_pid"] == parent
+            and access["pid"] != parent,
+            "device probe receipt differs",
+        )
+        require(
+            (access["uid"], access["euid"], access["gid"])
+            == (os.getuid(), os.geteuid(), os.getegid())
+            and set(access["groups"]) == set(os.getgroups()),
+            "device probe credentials differ",
+        )
+        return access
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        result["error"] = {"type": type(error).__name__, "message": str(error)}
+        raise
+    finally:
+        save(EVIDENCE / f"device-access-from-{parent}-exit.json", result)
+        telemetry(EVIDENCE / f"post-access-{parent}.json")
 
 
 def verify_admission(root):
@@ -589,7 +644,7 @@ def verify_admission(root):
     )
     for name, wanted in read(manifest).items():
         require(checksum(root / "input" / name) == wanted, "prepared input differs")
-    access = device_access(admission)
+    access = isolated_device_access(root, admission)
     admission["observation"] = {
         "namespaces": {
             name: os.readlink(f"/proc/self/ns/{name}")
@@ -924,6 +979,7 @@ if __name__ == "__main__":
             "entry",
             "map",
             "telemetry",
+            "access-probe",
         ),
     )
     parser.add_argument("path", type=Path)
@@ -942,5 +998,6 @@ if __name__ == "__main__":
         "entry": entry,
         "map": device_map,
         "telemetry": telemetry,
+        "access-probe": device_access_child,
         "recover": recover,
     }[args.mode](args.path.resolve())

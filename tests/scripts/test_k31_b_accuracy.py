@@ -303,6 +303,152 @@ def test_unprivileged_access_refuses_and_closes(
     assert len(calls) == (1 if failure in ("deny", "fstat") else 0)
 
 
+@pytest.fixture
+def isolated_probe(tmp_path, monkeypatch):
+    monkeypatch.setattr(ci, "EVIDENCE", tmp_path)
+    credentials = {"uid": 1001, "euid": 1001, "gid": 1001, "groups": [110, 992]}
+    for name, value in {"getuid": 1001, "geteuid": 1001, "getegid": 1001}.items():
+        monkeypatch.setattr(ci.os, name, lambda value=value: value, raising=False)
+    monkeypatch.setattr(
+        ci.os, "getgroups", lambda: credentials["groups"], raising=False
+    )
+    admission = {"cid": CID}
+    write(tmp_path / "admission.json", admission)
+    worker = tmp_path / "worker.py"
+    worker.write_text("""import json, os, sys, time
+from pathlib import Path
+root = Path(sys.argv[2])
+config = json.loads((root / "worker.json").read_text())
+fd = os.open(root / "probe-fd", os.O_CREAT | os.O_RDWR, 0o600)
+try:
+    if config["mode"] == "timeout":
+        time.sleep(10)
+    if config["mode"] == "error":
+        raise SystemExit(7)
+finally:
+    os.close(fd)
+report = dict(config["credentials"], cid=config["cid"], passed=True,
+              pid=os.getpid(), parent_pid=os.getppid())
+if config["mode"] == "credentials":
+    report["euid"] = 0
+(root / f"device-access-from-{os.getppid()}.json").write_text(json.dumps(report))
+""")
+    events, processes = [], []
+    state = {"mode": "success"}
+    real_run, real_popen = ci.subprocess.run, ci.subprocess.Popen
+
+    def popen(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    def run(argv, **kwargs):
+        events.append("spawn")
+        assert argv == [sys.executable, ci.__file__, "access-probe", str(tmp_path)]
+        assert (
+            kwargs["timeout"] == 30
+            and not {"env", "user", "group", "extra_groups", "pass_fds"} & kwargs.keys()
+        )
+        write(
+            tmp_path / "worker.json",
+            {"mode": state["mode"], "credentials": credentials, "cid": CID},
+        )
+        kwargs["timeout"] = 1 if state["mode"] == "timeout" else 3
+        try:
+            return real_run([argv[0], str(worker), *argv[2:]], **kwargs)
+        finally:
+            assert processes and all(p.returncode is not None for p in processes)
+            events.append("waited")
+
+    def telemetry(path):
+        phase = "pre" if path.name.startswith("pre-access") else "post"
+        events.append(phase)
+        if phase == "post":
+            assert all(p.returncode is not None for p in processes)
+        if state["mode"] == phase + "_busy":
+            raise ValueError("GPU processes remain")
+
+    monkeypatch.setattr(ci.subprocess, "Popen", popen)
+    monkeypatch.setattr(ci.subprocess, "run", run)
+    monkeypatch.setattr(ci, "telemetry", telemetry)
+    monkeypatch.setattr(
+        ci, "device_access", lambda *a, **kw: pytest.fail("parent opened devices")
+    )
+    return tmp_path, admission, state, events, processes
+
+
+@pytest.mark.parametrize(
+    "mode", ["success", "error", "timeout", "credentials", "pre_busy", "post_busy"]
+)
+def test_probe_waits_before_strict_postcheck(isolated_probe, mode):
+    root, admission, state, events, processes = isolated_probe
+    state["mode"] = mode
+    if mode == "success":
+        assert ci.isolated_device_access(root, admission)["passed"]
+    else:
+        with pytest.raises((ValueError, subprocess.TimeoutExpired)):
+            ci.isolated_device_access(root, admission)
+    assert events == (
+        ["pre"] if mode == "pre_busy" else ["pre", "spawn", "waited", "post"]
+    )
+    assert all(p.returncode is not None for p in processes)
+    if mode != "pre_busy":
+        record = json.loads(
+            next(root.glob("device-access-from-*-exit.json")).read_text()
+        )
+        assert record["timeout_seconds"] == 30
+        if mode in ("error", "timeout", "credentials"):
+            assert "error" in record
+        if sys.platform != "win32":
+            for process in processes:
+                with pytest.raises(ChildProcessError):
+                    ci.os.waitpid(process.pid, ci.os.WNOHANG)
+        # Windows cannot remove this file while the child's CRT descriptor is open.
+        assert (root / "probe-fd").is_file()
+        (root / "probe-fd").unlink(missing_ok=True)
+
+
+def test_child_entry_uses_existing_access_check(tmp_path, monkeypatch):
+    write(tmp_path / "admission.json", {"cid": CID})
+    monkeypatch.setattr(ci, "EVIDENCE", tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        ci, "device_access", lambda admission, output: calls.append((admission, output))
+    )
+    ci.device_access_child(tmp_path)
+    assert calls == [
+        ({"cid": CID}, tmp_path / f"device-access-from-{ci.os.getppid()}.json")
+    ]
+
+
+def test_zero_usage_unknown_pid_still_refuses(tmp_path, monkeypatch):
+    nodes = [{"pci": f"0000:{i:02x}:00.0"} for i in range(8)]
+    output = {
+        "--showpids": "PID PROCESS NAME GPU(s) VRAM USED\n1092302 UNKNOWN 0 0",
+        "--showuse": "{}",
+        "--showdriverversion": "fixture",
+        "--showbus": json.dumps(
+            {f"card{i}": {"PCI Bus": n["pci"]} for i, n in enumerate(nodes)}
+        ),
+    }
+    monkeypatch.setattr(
+        ci,
+        "command",
+        lambda argv: {
+            "argv": argv,
+            "returncode": 0,
+            "stdout": output[argv[1]],
+            "stderr": "",
+        },
+    )
+    monkeypatch.setattr(ci, "read", lambda path: {"nodes": nodes})
+    monkeypatch.setattr(
+        ci.os, "uname", lambda: SimpleNamespace(release="fixture"), raising=False
+    )
+    with pytest.raises(ValueError, match="GPU processes remain"):
+        ci.telemetry(tmp_path / "telemetry.json")
+
+
 def test_allocated_nodes_and_ambiguous_inputs(monkeypatch):
     monkeypatch.setattr(ci.os, "major", lambda value: 226, raising=False)
     monkeypatch.setattr(ci.os, "minor", lambda value: value, raising=False)
