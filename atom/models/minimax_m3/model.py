@@ -53,6 +53,15 @@ try:  # aiter with the grouped MoE output epilogue (routed scale + shared add)
     )
 except ImportError:  # pragma: no cover - older aiter keeps the separate ops
     _moe_output_epilogue = None
+try:  # aiter with the shared-expert fold into the routed MoE GEMMs
+    from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+        moe_shared_expert_fold as _moe_shared_expert_fold,
+    )
+    from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+        prepare_shared_fold_weights as _prepare_shared_fold_weights,
+    )
+except ImportError:  # pragma: no cover - older aiter: the flag is a no-op
+    _moe_shared_expert_fold = _prepare_shared_fold_weights = None
 from atom.model_ops.utils import atom_parameter
 from atom.models.minimax_m3.mono.dispatch import MonoDecode
 from atom.models.utils import (
@@ -292,6 +301,53 @@ class MiniMaxM3MLP(nn.Module):
         return self.down_proj(x)
 
 
+def _unshuffled(shuffle, shuffled: torch.Tensor) -> torch.Tensor:
+    """Undo ``shuffle``, a pure byte permutation of a 1-byte tensor: shuffle the
+    byte planes of an index tensor of the same shape and dtype to get its map."""
+    n = shuffled.numel()
+    idx = torch.arange(n, device=shuffled.device, dtype=torch.int64).view(
+        shuffled.shape
+    )
+    src = torch.zeros(n, device=shuffled.device, dtype=torch.int64)
+    for b in range(4):
+        plane = ((idx >> (8 * b)) & 0xFF).to(torch.uint8).view(shuffled.dtype)
+        src |= shuffle(plane).view(torch.uint8).reshape(-1).to(torch.int64) << (8 * b)
+    raw = torch.empty_like(shuffled)
+    raw.view(torch.uint8).view(-1)[src] = shuffled.view(torch.uint8).reshape(-1)
+    return raw
+
+
+def _shared_fold_weights_of(mlp: "MiniMaxM3MLP") -> dict | None:
+    """The shared expert's weights in aiter's fold layouts, or None when it is
+    not a pair of native MXFP8 1x32 linears (or not yet loaded)."""
+    from aiter.ops.shuffle import shuffle_mxfp8_bpreshuffle_scale, shuffle_weight
+
+    parts = []
+    for lin in (mlp.gate_up_proj, mlp.down_proj):
+        w, s = lin.weight.data, getattr(lin, "weight_scale", None)
+        if (
+            getattr(lin, "native_a8_group_rows", None) != 1
+            or s is None
+            or w.dtype != torch.float8_e4m3fn
+            or w.dim() != 2
+            or getattr(lin, "bias", None) is not None
+        ):
+            return None
+        s = s.data
+        if getattr(lin.weight, "is_shuffled", False) or getattr(
+            w, "is_shuffled", False
+        ):
+            w = _unshuffled(lambda t: shuffle_weight(t, layout=(16, 16)), w)
+            s = _unshuffled(shuffle_mxfp8_bpreshuffle_scale, s)
+        if s.shape != (w.shape[0], w.shape[1] // 32):
+            return None
+        parts += [w, s]
+    w13, s13, w2, s2 = parts
+    if w13.shape[0] != 2 * w2.shape[1] or w13.shape[1] != w2.shape[0]:
+        return None
+    return _prepare_shared_fold_weights(w13, s13, w2, s2)
+
+
 class MiniMaxM3MoE(nn.Module):
     """MiniMax-M3 routed MoE for MXFP4 checkpoints."""
 
@@ -378,6 +434,22 @@ class MiniMaxM3MoE(nn.Module):
         self.alt_stream = alt_stream
         self.prefix = prefix
         self._use_dual_stream = False
+        # The shared expert folded into the routed GEMM launches at decode
+        # token counts (from the dual-stream op, eager); its weights in the
+        # fold's layouts are built once loaded (`process_weights_after_loading`).
+        self._shared_fold = bool(
+            envs.ATOM_MINIMAX_M3_SHARED_FOLD
+            and _moe_shared_expert_fold is not None
+            and self.shared_experts is not None
+            and not self.shared_input_from_moe_quant
+            and isinstance(self.experts.quant_method, Mxfp4MoEMethod)
+        )
+        self._shared_fold_weights = None
+        # Token counts aiter did not fold (e.g. routed tiles it has no shared
+        # tile for): their first call ran the shared MLP after the routed one;
+        # later calls take the dual-stream path. Decided in warm-up, before
+        # graph capture.
+        self._shared_fold_declined: set[int] = set()
         # The routed scale and the shared add folded into the routed MoE's
         # gather-reduce. Python-side state, so only the paths that run eagerly
         # inside the dual-stream custom op take it (`_use_dual_stream`).
@@ -391,7 +463,9 @@ class MiniMaxM3MoE(nn.Module):
             )
             else None
         )
-        if self.shared_experts is not None and self.alt_stream is not None:
+        if self.shared_experts is not None and (
+            self.alt_stream is not None or self._shared_fold
+        ):
             atom_config = get_current_atom_config()
             if (
                 envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0
@@ -399,6 +473,27 @@ class MiniMaxM3MoE(nn.Module):
             ):
                 self._use_dual_stream = True
                 atom_config.compilation_config.static_forward_context[prefix] = self
+
+    def process_weights_after_loading(self) -> None:
+        # Parent-first: the shared linears are normally still unshuffled here.
+        if self._shared_fold:
+            self._shared_fold_weights = _shared_fold_weights_of(self.shared_experts)
+
+    def _shared_fold_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Routed + shared in the routed MoE's launches; the separate shared
+        MLP after the routed one when aiter did not take the fold (and the
+        token count is then remembered as declined)."""
+        with _moe_shared_expert_fold(
+            self._shared_fold_weights, self._routed_scale()
+        ) as fold:
+            router_logits = self.gate(hidden_states)
+            routed_output = self.experts(
+                hidden_states=hidden_states, router_logits=router_logits
+            )
+        if fold.consumed:
+            return routed_output
+        self._shared_fold_declined.add(hidden_states.shape[0])
+        return self._scale_routed(routed_output) + self.shared_experts(hidden_states)
 
     def _routed_scale(self) -> float:
         if not self.fuse_shared_experts and self.routed_scaling_factor != 1.0:
@@ -470,9 +565,17 @@ class MiniMaxM3MoE(nn.Module):
         return routed_output.view(orig_shape)
 
     def dual_stream_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Overlap the independent shared MLP with the routed MoE branch."""
+        """Overlap the independent shared MLP with the routed MoE branch (or,
+        with the shared fold, run it inside the routed MoE's launches)."""
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, orig_shape[-1])
+        if (
+            getattr(self, "_shared_fold_weights", None) is not None
+            and hidden_states.shape[0] not in self._shared_fold_declined
+        ):
+            return self._shared_fold_forward(hidden_states).view(orig_shape)
+        if self.alt_stream is None:
+            return self.single_stream_moe_forward(hidden_states).view(orig_shape)
         current_stream = torch.cuda.current_stream()
         alt_stream = self.alt_stream
 

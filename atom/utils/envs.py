@@ -697,6 +697,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MINIMAX_M3_MOE_QUANT_SHARED": lambda: _flag_env(
         "ATOM_MINIMAX_M3_MOE_QUANT_SHARED"
     ),
+    # MiniMax-M3: fold the shared expert into the routed MoE's GEMM launches
+    # (aiter `moe_shared_expert_fold`) at decode token counts (the dual-stream
+    # op's range): its gate/up tiles join the routed GEMM1 launch, its down
+    # tiles GEMM2, its output is added in the gather-reduce. Not bitwise the
+    # separate shared MLP. Default off for A/B.
+    "ATOM_MINIMAX_M3_SHARED_FOLD": lambda: _flag_env("ATOM_MINIMAX_M3_SHARED_FOLD"),
     # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
     # comma-separated token counts to record. A prefill longer than the largest
     # runs eagerly; empty records none. The default tops out at 3072 because

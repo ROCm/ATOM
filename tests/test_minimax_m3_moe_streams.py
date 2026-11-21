@@ -351,3 +351,77 @@ def test_model_creates_one_shared_stream_for_all_layers(
 
     assert model.alt_stream is stream
     assert layer_calls[0]["alt_stream"] is stream
+
+
+class _Fold:
+    """`aiter moe_shared_expert_fold` double: `take` marks it consumed."""
+
+    def __init__(self, log: list[str], take: bool) -> None:
+        self.log, self.take, self.calls = log, take, []
+
+    @contextmanager
+    def __call__(self, weights, scale):
+        self.calls.append((weights, scale))
+        fold = SimpleNamespace(consumed=False)
+        self.log.append("fold enter")
+        yield fold
+        fold.consumed = self.take
+        self.log.append("fold exit")
+
+
+def _fold_moe(log: list[str], fold: _Fold, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(m3_model, "_moe_shared_expert_fold", fold)
+    routed, shared = MagicMock(name="routed"), MagicMock(name="shared")
+    moe = SimpleNamespace(
+        alt_stream=None,
+        _shared_fold_weights={"w13": "W"},
+        _shared_fold_declined=set(),
+        gate=lambda h: (log.append("gate"), "logits")[1],
+        experts=MagicMock(side_effect=lambda **kw: (log.append("routed"), routed)[1]),
+        shared_experts=MagicMock(
+            side_effect=lambda h: (log.append("shared"), shared)[1]
+        ),
+        _routed_scale=lambda: 2.0,
+        _scale_routed=lambda out: out,
+        single_stream_moe_forward=MagicMock(name="single"),
+    )
+    moe._shared_fold_forward = lambda h: m3_model.MiniMaxM3MoE._shared_fold_forward(
+        moe, h
+    )
+    hidden = MagicMock()
+    hidden.shape = (8, 64)
+    hidden.view.return_value = hidden
+    return moe, hidden, routed, shared
+
+
+def test_shared_fold_runs_the_shared_expert_inside_the_routed_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    log: list[str] = []
+    fold = _Fold(log, take=True)
+    moe, hidden, routed, _ = _fold_moe(log, fold, monkeypatch)
+
+    m3_model.MiniMaxM3MoE.dual_stream_moe_forward(moe, hidden)
+
+    assert log == ["fold enter", "gate", "routed", "fold exit"]
+    assert fold.calls == [({"w13": "W"}, 2.0)]
+    moe.shared_experts.assert_not_called()
+    assert moe._shared_fold_declined == set()
+
+
+def test_declined_shared_fold_adds_the_shared_mlp_then_skips_the_fold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    log: list[str] = []
+    fold = _Fold(log, take=False)
+    moe, hidden, routed, shared = _fold_moe(log, fold, monkeypatch)
+
+    m3_model.MiniMaxM3MoE.dual_stream_moe_forward(moe, hidden)
+
+    assert log == ["fold enter", "gate", "routed", "fold exit", "shared"]
+    routed.__add__.assert_called_once_with(shared)
+    assert moe._shared_fold_declined == {8}
+    # The same token count later goes to the stream path (here: no alt stream).
+    m3_model.MiniMaxM3MoE.dual_stream_moe_forward(moe, hidden)
+    assert len(fold.calls) == 1
+    moe.single_stream_moe_forward.assert_called_once_with(hidden)
