@@ -10,6 +10,7 @@ use tracing::error;
 use crate::{
     app_context::AppContext,
     protocols::parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
+    routers::prepare::reasoning_dialect,
 };
 
 fn error_response(status: StatusCode, message: &str) -> Response {
@@ -78,7 +79,7 @@ pub async fn parse_reasoning(ctx: &Arc<AppContext>, req: &SeparateReasoningReque
     };
 
     let mut parser = pooled_parser.lock().await;
-    match parser.detect_and_parse_reasoning(&req.text) {
+    match reasoning_dialect::parse_whole(parser.as_mut(), &req.text) {
         Ok(result) => (
             StatusCode::OK,
             Json(serde_json::json!({

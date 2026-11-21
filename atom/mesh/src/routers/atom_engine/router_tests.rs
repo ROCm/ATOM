@@ -28,6 +28,8 @@ const HELLO: i32 = 1;
 const WORLD: i32 = 2;
 const THINK_END: i32 = 7;
 const LT: i32 = 8;
+const KIMI_OPEN: i32 = 9;
+const KIMI_END: i32 = 10;
 
 /// The chat template: `role: content` lines, ending on `assistant:`.
 const TEMPLATE: &str = "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}\
@@ -44,6 +46,10 @@ fn write_tokenizer(dir: &std::path::Path, chat_template: &str) -> String {
              "rstrip": false, "normalized": false, "special": false},
             {"id": THINK_END, "content": "</think>", "single_word": false, "lstrip": false,
              "rstrip": false, "normalized": false, "special": false},
+            {"id": KIMI_OPEN, "content": "◁think▷", "single_word": false, "lstrip": false,
+             "rstrip": false, "normalized": false, "special": false},
+            {"id": KIMI_END, "content": "◁/think▷", "single_word": false, "lstrip": false,
+             "rstrip": false, "normalized": false, "special": false},
         ],
         "normalizer": null,
         "pre_tokenizer": {"type": "Whitespace"},
@@ -54,6 +60,7 @@ fn write_tokenizer(dir: &std::path::Path, chat_template: &str) -> String {
             "vocab": {
                 "<unk>": 0, "hello": HELLO, "world": WORLD, "user": 3, "assistant": 4, ":": 5,
                 "<think>": 6, "</think>": THINK_END, "<": LT,
+                "◁think▷": KIMI_OPEN, "◁/think▷": KIMI_END,
             },
             "unk_token": "<unk>",
         },
@@ -722,8 +729,8 @@ async fn a_long_reply_is_split_at_its_closer_whatever_the_stop_decoder_releases(
 }
 
 /// MiniMax's parser puts its own `<think>` before the reply: a reply just
-/// under 64 KiB overflows the one-shot parse by those 7 bytes and is split
-/// in pieces instead of answering 500.
+/// under 64 KiB overflows the one-shot parse by those 7 bytes and is parsed
+/// whole without the cap instead of answering 500.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_minimax_reply_its_opener_pushes_past_64_kib_is_split() {
     // 10920 words and their spaces, then ` </think> world`: 65534 bytes.
@@ -735,6 +742,31 @@ async fn a_minimax_reply_its_opener_pushes_past_64_kib_is_split() {
     let reasoning = message["reasoning_content"].as_str().unwrap();
     let reply = reasoning.len() + " </think> world".len();
     assert!((65_530..=65_536).contains(&reply), "{reply}");
+}
+
+/// Kimi's markers have no `<`: a long reply whose generation prompt opened
+/// `◁think▷` is split at its `◁/think▷` like any other, and a `<think>` is
+/// text to it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_long_kimi_reply_is_split_at_its_own_closer() {
+    const WORDS: usize = 20_000;
+    let template = "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}\
+                    {% if add_generation_prompt %}assistant: ◁think▷\n{% endif %}";
+    let config = RouterConfig {
+        reasoning_parser: Some("kimi".into()),
+        ..Default::default()
+    };
+    fn answer(core: &FakeCore, spec: &pb::RequestSpec) {
+        let mut ids = vec![HELLO; WORDS];
+        ids.extend([KIMI_END, 6, WORLD]);
+        core.stream(&[(spec.seq_id, &ids, Some("eos"))]);
+    }
+    let body = user_hello(json!({"max_tokens": WORDS + 3}));
+    let message = answered_chat(Served::serve(1, template, config).await, body, answer).await;
+    assert_eq!(message["content"], "<think> world");
+    let reasoning = message["reasoning_content"].as_str().unwrap();
+    assert!(reasoning.len() > 65536, "{}", reasoning.len());
+    assert_eq!(reasoning.split_whitespace().count(), WORDS);
 }
 
 /// What only the raw body says, read off it on the way in: `thinking` is

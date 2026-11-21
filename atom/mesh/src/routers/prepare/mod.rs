@@ -21,6 +21,7 @@ use crate::{
 pub(crate) mod chat_template;
 pub mod generation_payload;
 pub(crate) mod parser_factory_lookup;
+pub(crate) mod reasoning_dialect;
 pub mod response_context;
 pub(crate) mod stop_decoder_builder;
 pub(crate) mod thread_tokenizer;
@@ -127,7 +128,12 @@ pub fn prepare_chat_with(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let prompt_opens_reasoning = response_context::prompt_opens_reasoning(&processed.text);
+    let prompt_opens_reasoning = reasoning_dialect::prompt_opens_reasoning(
+        &processed.text,
+        components.reasoning_parser_factory.as_ref(),
+        components.configured_reasoning_parser.as_deref(),
+        &req.model,
+    );
     let ctx = ResponseContext {
         original: ProtocolRequest::Chat(Arc::clone(&req)),
         model_id,

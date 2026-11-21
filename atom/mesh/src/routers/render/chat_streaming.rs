@@ -22,7 +22,8 @@ use crate::{
     routers::{
         prepare::{
             parser_factory_lookup::{check_reasoning_parser_availability, create_reasoning_parser},
-            response_context::{ProtocolRequest, ResponseContext, THINK_OPEN},
+            reasoning_dialect,
+            response_context::{ProtocolRequest, ResponseContext},
             tool_constraints::{generate_tool_call_id, get_history_tool_calls_count},
         },
         render::{
@@ -419,10 +420,13 @@ async fn process_reasoning_stream(
         };
         match create_reasoning_parser(factory, configured, model) {
             Some(mut p) => {
-                if prompt_opens_reasoning {
+                if let Some(opener) = prompt_opens_reasoning
+                    .then(|| reasoning_dialect::opener(p.as_ref()))
+                    .flatten()
+                {
                     // The prompt opened the block: the parser reads its
                     // opener before the reply, which has none.
-                    let _ = p.parse_reasoning_streaming_incremental(THINK_OPEN);
+                    let _ = p.parse_reasoning_streaming_incremental(opener);
                 }
                 *reasoning_parser = Some(Arc::new(tokio::sync::Mutex::new(p)));
             }
