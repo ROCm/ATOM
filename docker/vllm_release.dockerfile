@@ -98,18 +98,37 @@ RUN echo "========== [OOT 4/7] Install vLLM ROCm build dependencies ==========" 
         google-auth google-cloud-storage azure-identity azure-storage-blob && \
     "${VENV_PYTHON}" -m pip install -r requirements/rocm.txt
 
-RUN echo "========== [OOT 5/7] Build and install amd-smi wheel ==========" && \
+# amd-smi comes in two shapes. The rocm/pytorch apt images ship
+# /opt/rocm/share/amd_smi as a buildable project; the pip SDK ships the same
+# directory from 10.1 on but without pyproject.toml or setup.py, so there is
+# nothing for pip to build and the old `next(...)` raised StopIteration -- which
+# is how the ROCm 10 line failed here the first time it built this image.
+#
+# The package itself is there either way, and the SDK's copy is the one matched
+# to the libamd_smi.so the SDK ships, so when there is no metadata to build
+# from, install the package directory as-is. Do not reach for the PyPI amdsmi
+# wheel as a fallback: it is ABI-incompatible with the SDK's libamd_smi.so and
+# poisons every import that touches amdsmi, torch's included.
+RUN echo "========== [OOT 5/7] Install amd-smi ==========" && \
+    PURELIB=$("${VENV_PYTHON}" -c 'import sysconfig; print(sysconfig.get_path("purelib"))') && \
     AMD_SMI_SRC=$("${VENV_PYTHON}" -c 'from pathlib import Path; \
         import sysconfig; \
         candidates = [Path("/opt/rocm/share/amd_smi"), \
                       *sorted(Path(sysconfig.get_path("purelib")).glob( \
                           "_rocm_sdk_*/share/amd_smi"))]; \
-        print(next(path for path in candidates \
-                   if (path / "pyproject.toml").is_file() \
-                   or (path / "setup.py").is_file()))') && \
+        print(next((str(path) for path in candidates \
+                    if (path / "amdsmi").is_dir()), ""))') && \
+    { [ -n "${AMD_SMI_SRC}" ] || { echo "ERROR: no amd_smi source under /opt/rocm or the pip SDK"; exit 1; }; } && \
     echo "Using amd-smi source: ${AMD_SMI_SRC}" && \
-    "${VENV_PYTHON}" -m pip wheel "${AMD_SMI_SRC}" --wheel-dir=/tmp/amd-smi-wheels && \
-    "${VENV_PYTHON}" -m pip install /tmp/amd-smi-wheels/*.whl
+    if [ -f "${AMD_SMI_SRC}/pyproject.toml" ] || [ -f "${AMD_SMI_SRC}/setup.py" ]; then \
+        "${VENV_PYTHON}" -m pip wheel "${AMD_SMI_SRC}" --wheel-dir=/tmp/amd-smi-wheels && \
+        "${VENV_PYTHON}" -m pip install /tmp/amd-smi-wheels/*.whl; \
+    else \
+        echo "No packaging metadata in ${AMD_SMI_SRC}; installing the package directory" && \
+        rm -rf "${PURELIB}/amdsmi" && \
+        cp -r "${AMD_SMI_SRC}/amdsmi" "${PURELIB}/amdsmi"; \
+    fi && \
+    "${VENV_PYTHON}" -c "import amdsmi; print('amdsmi:', amdsmi.__file__)"
 
 RUN echo "========== [OOT 6/7] Build vLLM wheel ==========" && \
     cd /app/vllm && \
