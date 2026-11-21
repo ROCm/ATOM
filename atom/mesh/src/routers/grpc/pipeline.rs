@@ -18,6 +18,7 @@ use crate::{
             traits::PdPlanner,
             types::{PlacementError, PlacementPlan, Protocol, RequestDescriptor},
         },
+        worker::RuntimeType,
         AttachedBody, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
     observability::metrics::{bool_to_static_str, metrics_labels, MeshMetrics},
@@ -31,7 +32,12 @@ use crate::{
             error, metrics_utils::error_type_from_status,
             placement_response::placement_err_to_response,
         },
-        prepare::{self, generation_payload::GenerationPayload, response_context::ResponseContext},
+        prepare::{
+            self,
+            generation_payload::GenerationPayload,
+            response_context::{ProtocolRequest, ResponseContext},
+            stop_decoder_builder::create_stop_decoder,
+        },
         render,
         token_handle::engine_error::EngineError,
     },
@@ -122,7 +128,7 @@ impl Pipeline {
             bool_to_static_str(streaming),
         );
 
-        let (mut payload, resp_ctx) =
+        let (mut payload, mut resp_ctx) =
             match prepare::prepare_chat(req, headers, model_id, &components) {
                 Ok(t) => t,
                 Err(e) => return self.record_chat_err(&model, start, e),
@@ -131,6 +137,7 @@ impl Pipeline {
             Ok(p) => p,
             Err(e) => return self.record_chat_err(&model, start, e),
         };
+        drop_stops_for_atom(&placement, &mut resp_ctx);
         let guards = self.load_guards(&placement, resp_ctx.headers.as_ref());
         let stream = match self
             .engine
@@ -181,7 +188,7 @@ impl Pipeline {
             bool_to_static_str(streaming),
         );
 
-        let (mut payload, resp_ctx) =
+        let (mut payload, mut resp_ctx) =
             match prepare::prepare_generate(req, headers, model_id, &components) {
                 Ok(t) => t,
                 Err(e) => return self.record_generate_err(&model_for_metric, start, e),
@@ -190,6 +197,7 @@ impl Pipeline {
             Ok(p) => p,
             Err(e) => return self.record_generate_err(&model_for_metric, start, e),
         };
+        drop_stops_for_atom(&placement, &mut resp_ctx);
         let guards = self.load_guards(&placement, resp_ctx.headers.as_ref());
         let stream = match self
             .engine
@@ -311,6 +319,27 @@ impl Pipeline {
         );
         resp
     }
+}
+
+/// ATOM ends an output where a stop string's ids match, and its HTTP routes return all of it:
+/// so the output of an ATOM worker, or ATOM D, is decoded with none of the request's stops.
+fn drop_stops_for_atom(plan: &PlacementPlan, ctx: &mut ResponseContext) {
+    let producer = match plan {
+        PlacementPlan::Single { worker, .. } => worker,
+        PlacementPlan::Pair { decode, .. } => decode,
+    };
+    if producer.metadata().runtime_type != RuntimeType::Atom {
+        return;
+    }
+    let skip_special_tokens = match &ctx.original {
+        ProtocolRequest::Chat(req) => req.skip_special_tokens,
+        ProtocolRequest::Generate(req) => req
+            .sampling_params
+            .as_ref()
+            .and_then(|p| p.skip_special_tokens)
+            .unwrap_or(true),
+    };
+    ctx.stop_decoder = create_stop_decoder(&ctx.tokenizer, None, None, skip_special_tokens, false);
 }
 
 fn make_load_guards(plan: &PlacementPlan, headers: Option<&HeaderMap>) -> Vec<WorkerLoadGuard> {

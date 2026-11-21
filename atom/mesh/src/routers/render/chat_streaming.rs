@@ -25,7 +25,7 @@ use crate::{
             response_context::{ProtocolRequest, ResponseContext},
             tool_constraints::{generate_tool_call_id, get_history_tool_calls_count},
         },
-        render::logprob_conversion::token_logprobs_to_chat,
+        render::{logprob_conversion::token_logprobs_to_chat, with_cached_tokens},
         token_handle::{
             engine_error::EngineError,
             token_chunk::{FinishReason, MatchedStop, TokenChunk},
@@ -133,6 +133,7 @@ async fn run_chat_stream(
     let mut matched_stop_value: Option<Value> = None;
     let mut prompt_tokens: u32 = 0;
     let mut completion_tokens: u32 = 0;
+    let mut cached_tokens: u32 = 0;
     let mut has_tool_call = false;
 
     let mut stop_decoder = ctx.stop_decoder;
@@ -143,6 +144,17 @@ async fn run_chat_stream(
 
     while let Some(item) = stream.next().await {
         let chunk = item.map_err(engine_error_to_string)?;
+        if is_first {
+            // On the engine's first message, text or not, as ATOM's HTTP chat opens its stream.
+            let first_chunk = ChatCompletionStreamResponse::builder(request_id, model)
+                .created(created)
+                .add_choice_content(INDEX, "assistant", "")
+                .maybe_system_fingerprint(system_fingerprint.clone())
+                .build();
+            format_sse_chunk_into(&mut sse_buffer, &first_chunk);
+            send_bytes(tx, &sse_buffer, "first chunk")?;
+            is_first = false;
+        }
         match chunk {
             TokenChunk::Partial {
                 token_ids,
@@ -156,17 +168,6 @@ async fn run_chat_stream(
                 let (chunk_text, _stopped) = process_chunk_tokens(&mut stop_decoder, &token_ids);
                 if chunk_text.is_empty() {
                     continue;
-                }
-
-                if is_first {
-                    let first_chunk = ChatCompletionStreamResponse::builder(request_id, model)
-                        .created(created)
-                        .add_choice_role(INDEX, "assistant")
-                        .maybe_system_fingerprint(system_fingerprint.clone())
-                        .build();
-                    format_sse_chunk_into(&mut sse_buffer, &first_chunk);
-                    send_bytes(tx, &sse_buffer, "first chunk")?;
-                    is_first = false;
                 }
 
                 let mut delta = chunk_text;
@@ -270,6 +271,7 @@ async fn run_chat_stream(
 
                 prompt_tokens = usage.prompt_tokens;
                 completion_tokens = usage.completion_tokens;
+                cached_tokens = meta.cached_tokens;
                 finish_reason_str = Some(finish_reason_to_string(&finish_reason));
                 matched_stop_value = matched_stop.map(|ms| match ms {
                     MatchedStop::Str(s) => Value::String(s),
@@ -341,7 +343,7 @@ async fn run_chat_stream(
                 })
                 .maybe_system_fingerprint(system_fingerprint.clone())
                 .build();
-            let s = serde_json::to_string(&usage_chunk)
+            let s = with_cached_tokens(&usage_chunk, cached_tokens)
                 .map_err(|e| format!("Failed to serialize usage chunk: {}", e))?;
             tx.send(Ok(Bytes::from(format!("data: {}\n\n", s))))
                 .map_err(|_| "send usage".to_string())?;
@@ -364,7 +366,7 @@ async fn run_chat_stream(
     Ok(())
 }
 
-fn process_chunk_tokens(
+pub(super) fn process_chunk_tokens(
     stop_decoder: &mut StopSequenceDecoder,
     token_ids: &[u32],
 ) -> (String, bool) {

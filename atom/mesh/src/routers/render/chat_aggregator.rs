@@ -23,7 +23,7 @@ use crate::{
                 generate_tool_call_id, get_history_tool_calls_count, parse_json_schema_response,
             },
         },
-        render::logprob_conversion::token_logprobs_to_chat,
+        render::{logprob_conversion::token_logprobs_to_chat, with_cached_tokens},
         token_handle::{
             engine_error::EngineError,
             token_chunk::{FinishReason, MatchedStop, TokenChunk},
@@ -41,9 +41,13 @@ use crate::{
 };
 
 pub async fn process(stream: TokenHandle, ctx: ResponseContext) -> Response {
-    match process_typed(stream, ctx).await {
-        Ok(resp) => axum::Json(resp).into_response(),
-        Err(resp) => resp,
+    let (resp, cached_tokens) = match aggregate(stream, ctx).await {
+        Ok(answer) => answer,
+        Err(resp) => return resp,
+    };
+    match with_cached_tokens(&resp, cached_tokens) {
+        Ok(body) => axum::Json(body).into_response(),
+        Err(e) => error::internal_error("serialization_failed", e.to_string()),
     }
 }
 
@@ -51,6 +55,14 @@ pub async fn process_typed(
     stream: TokenHandle,
     ctx: ResponseContext,
 ) -> Result<ChatCompletionResponse, Response> {
+    Ok(aggregate(stream, ctx).await?.0)
+}
+
+/// The response and the prompt tokens its completes report cached.
+async fn aggregate(
+    stream: TokenHandle,
+    ctx: ResponseContext,
+) -> Result<(ChatCompletionResponse, u32), Response> {
     let chat_request = match &ctx.original {
         ProtocolRequest::Chat(r) => Arc::clone(r),
         ProtocolRequest::Generate(_) => {
@@ -136,17 +148,18 @@ pub async fn process_typed(
         _ => None,
     });
 
+    let (usage, cached_tokens) = build_usage(&completes);
     let response = ChatCompletionResponse::builder(
         &ctx.request_id,
         ctx.model_id.as_deref().unwrap_or(&chat_request.model),
     )
     .created(ctx.created)
     .choices(choices)
-    .usage(build_usage(&completes))
+    .usage(usage)
     .maybe_system_fingerprint(weight_version)
     .build();
 
-    Ok(response)
+    Ok((response, cached_tokens))
 }
 
 async fn collect_completes(mut stream: TokenHandle) -> Result<Vec<TokenChunk>, Response> {
@@ -282,11 +295,8 @@ async fn process_choice(
         index,
         message: ChatCompletionMessage {
             role: "assistant".to_string(),
-            content: if processed_text.is_empty() {
-                None
-            } else {
-                Some(processed_text)
-            },
+            // "" when empty, as ATOM's HTTP chat answers; None would leave the key out.
+            content: Some(processed_text),
             tool_calls,
             reasoning_content: reasoning_text,
         },
@@ -340,21 +350,25 @@ async fn parse_tool_calls(
     }
 }
 
-fn build_usage(completes: &[TokenChunk]) -> Usage {
+/// The completes' usage, and the prompt tokens they report cached, which `Usage` cannot hold.
+fn build_usage(completes: &[TokenChunk]) -> (Usage, u32) {
     let mut prompt = 0u32;
     let mut completion = 0u32;
+    let mut cached = 0u32;
     for c in completes {
-        if let TokenChunk::Complete { usage, .. } = c {
+        if let TokenChunk::Complete { usage, meta, .. } = c {
             prompt += usage.prompt_tokens;
             completion += usage.completion_tokens;
+            cached += meta.cached_tokens;
         }
     }
-    Usage {
+    let usage = Usage {
         prompt_tokens: prompt,
         completion_tokens: completion,
         total_tokens: prompt + completion,
         completion_tokens_details: None,
-    }
+    };
+    (usage, cached)
 }
 
 fn finish_reason_to_str(r: &FinishReason) -> &'static str {

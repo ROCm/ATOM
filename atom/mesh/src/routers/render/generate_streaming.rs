@@ -17,14 +17,17 @@ use crate::{
     protocols::generate::{GenerateFinishReason, GenerateRequest},
     routers::{
         prepare::response_context::{ProtocolRequest, ResponseContext},
-        render::logprob_conversion::{input_logprobs_to_generate, output_logprobs_to_generate},
+        render::{
+            chat_streaming::process_chunk_tokens,
+            logprob_conversion::{input_logprobs_to_generate, output_logprobs_to_generate},
+        },
         token_handle::{
             engine_error::EngineError,
             token_chunk::{FinishReason, TokenChunk},
             token_handle::TokenHandle,
         },
     },
-    tokenizer::traits::Tokenizer,
+    tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoder},
 };
 
 pub(crate) struct GenerateStreamConfig {
@@ -41,7 +44,7 @@ pub fn process(stream: TokenHandle, ctx: ResponseContext, backend_label: &'stati
 
     let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
     let cfg = GenerateStreamConfig { backend_label };
-    let tokenizer = ctx.tokenizer.clone();
+    let stop_decoder = ctx.stop_decoder;
     let request_id = ctx.request_id.clone();
     let return_logprob = generate_request.return_logprob.unwrap_or(false);
     let model = ctx
@@ -52,7 +55,7 @@ pub fn process(stream: TokenHandle, ctx: ResponseContext, backend_label: &'stati
     tokio::spawn(async move {
         let result = run_generate_stream(
             stream,
-            tokenizer,
+            stop_decoder,
             generate_request,
             request_id,
             model,
@@ -75,7 +78,7 @@ pub fn process(stream: TokenHandle, ctx: ResponseContext, backend_label: &'stati
 
 async fn run_generate_stream(
     mut stream: TokenHandle,
-    tokenizer: Arc<dyn Tokenizer>,
+    mut stop_decoder: StopSequenceDecoder,
     _generate_request: Arc<GenerateRequest>,
     request_id: String,
     model: String,
@@ -104,7 +107,8 @@ async fn run_generate_stream(
                 }
                 completion_tokens += token_ids.len() as u32;
 
-                let chunk_text = tokenizer.decode(&token_ids, true).unwrap_or_default();
+                // Decoded across chunks, as the unary text is, so a chunk boundary loses no text.
+                let (chunk_text, _stopped) = process_chunk_tokens(&mut stop_decoder, &token_ids);
                 accumulated_text.push_str(&chunk_text);
 
                 if return_logprob {
@@ -142,6 +146,9 @@ async fn run_generate_stream(
                 input_logprobs,
                 ..
             } => {
+                if let SequenceDecoderOutput::Text(text) = stop_decoder.flush() {
+                    accumulated_text.push_str(&text);
+                }
                 prompt_tokens_seen = usage.prompt_tokens;
                 if weight_version.is_none() {
                     weight_version = meta.weight_version.clone();

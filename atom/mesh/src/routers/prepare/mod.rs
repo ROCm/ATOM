@@ -1,16 +1,19 @@
 //! Transport-neutral request preparation: HTTP request → (GenerationPayload, ResponseContext).
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use axum::response::Response;
 use http::HeaderMap;
+use serde::Serialize;
+use serde_json::Value;
 use tracing::error;
 use uuid::Uuid;
 
 use crate::{
     app_context::AppContext,
+    core::{worker::RuntimeType, Worker},
     protocols::{
-        chat::ChatCompletionRequest,
+        chat::{ChatCompletionRequest, ChatMessage},
         common::{InputIds, StringOrArray},
         generate::GenerateRequest,
     },
@@ -29,11 +32,27 @@ pub(crate) mod tool_constraints;
 #[cfg(test)]
 mod tests;
 
-use chat_template::{default_template_kwargs, process_chat_messages_with_defaults};
-use generation_payload::{GenerationPayload, LogprobConfig, SamplingParams, StopConfig};
+use chat_template::{
+    default_template_kwargs, merged_template_kwargs, process_chat_messages_with_kwargs,
+};
+use generation_payload::{
+    GenerationPayload, LogprobConfig, SamplingParams, StopConfig, StructuredOutput,
+};
 use response_context::{ProtocolRequest, ResponseContext};
 use stop_decoder_builder::create_stop_decoder;
 use tool_constraints::{filter_chat_request_by_tool_choice, generate_tool_constraints};
+
+/// The label with the markers an ATOM worker lists: GetModelInfo's `reasoning_open_markers`.
+const REASONING_OPEN_MARKERS_LABEL: &str = "reasoning_open_markers";
+
+/// `work`, its duration recorded under `stage` as the HTTP ingress records its own stages.
+fn staged<T>(stage: &'static str, work: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
+    let done = work();
+    metrics::histogram!("mesh_prepare_stage_seconds", "stage" => stage)
+        .record(started.elapsed().as_secs_f64());
+    done
+}
 
 pub fn lookup_tokenizer(
     model_id: &str,
@@ -65,12 +84,13 @@ pub fn prepare_chat(
 
     let body_ref = filter_chat_request_by_tool_choice(&req);
 
-    let processed =
-        process_chat_messages_with_defaults(&body_ref, &*tokenizer, default_kwargs.as_ref())
-            .map_err(|e| error::bad_request("process_messages_failed", e))?;
+    let template_kwargs = merged_template_kwargs(&body_ref, default_kwargs.as_ref());
+    let processed = staged("template", || {
+        process_chat_messages_with_kwargs(&body_ref, &*tokenizer, &template_kwargs)
+    })
+    .map_err(|e| error::bad_request("process_messages_failed", e))?;
 
-    let encoding = tokenizer
-        .encode(&processed.text, false)
+    let encoding = staged("encode", || tokenizer.encode(&processed.text, false))
         .map_err(|e| error::internal_error("tokenization_failed", format!("{}", e)))?;
     let token_ids = encoding.token_ids().to_vec();
 
@@ -80,6 +100,14 @@ pub fn prepare_chat(
     } else {
         None
     };
+
+    let atom = workers
+        .iter()
+        .any(|worker| worker.metadata().runtime_type == RuntimeType::Atom);
+    let structured_output = atom
+        .then(|| structured_output(&req, &processed.text, &template_kwargs, &workers))
+        .transpose()
+        .map_err(|e| error::internal_error("invalid_structured_output", e))?;
 
     let stop_decoder = create_stop_decoder(
         &tokenizer,
@@ -97,6 +125,7 @@ pub fn prepare_chat(
         &processed.text,
         token_ids,
         tool_constraints,
+        structured_output,
     );
 
     let created = std::time::SystemTime::now()
@@ -183,6 +212,7 @@ pub(crate) fn build_chat_payload(
     text: &str,
     token_ids: Vec<u32>,
     tool_constraints: Option<(String, String)>,
+    structured_output: Option<StructuredOutput>,
 ) -> GenerationPayload {
     use crate::protocols::common::{ToolChoice, ToolChoiceValue};
 
@@ -232,7 +262,55 @@ pub(crate) fn build_chat_payload(
         stream: req.stream,
         return_hidden_states: req.return_hidden_states,
         log_metrics: false,
+        structured_output,
     }
+}
+
+/// What an ATOM worker's chat route derives `req`'s structured output from: its fields
+/// as sent, the `kwargs` that rendered `text`, and whether `text` opens reasoning.
+fn structured_output(
+    req: &ChatCompletionRequest,
+    text: &str,
+    kwargs: &HashMap<String, Value>,
+    workers: &[Arc<dyn Worker>],
+) -> Result<StructuredOutput, String> {
+    let markers: Vec<String> = workers
+        .iter()
+        .find_map(|worker| worker.metadata().labels.get(REASONING_OPEN_MARKERS_LABEL))
+        .map(|json| {
+            serde_json::from_str(json)
+                .map_err(|e| format!("Invalid {REASONING_OPEN_MARKERS_LABEL} label {json}: {e}"))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    // atomesh's ChatMessage keeps a message's own tools on a developer message only.
+    let message_tools: Vec<_> = req
+        .messages
+        .iter()
+        .map(|message| match message {
+            ChatMessage::Developer { tools, .. } => tools.as_ref(),
+            _ => None,
+        })
+        .collect();
+    let prompt = text.trim_end();
+    Ok(StructuredOutput {
+        tools_json: req.tools.as_ref().map(to_json).transpose()?,
+        tool_choice_json: req.tool_choice.as_ref().map(to_json).transpose()?,
+        response_format_json: req.response_format.as_ref().map(to_json).transpose()?,
+        message_tools_json: message_tools
+            .iter()
+            .any(Option::is_some)
+            .then(|| to_json(&message_tools))
+            .transpose()?,
+        chat_template_kwargs_json: to_json(kwargs)?,
+        prompt_opens_reasoning: markers
+            .iter()
+            .any(|marker| prompt.ends_with(marker.as_str())),
+    })
+}
+
+fn to_json<T: Serialize + ?Sized>(value: &T) -> Result<String, String> {
+    serde_json::to_string(value).map_err(|e| e.to_string())
 }
 
 pub(crate) fn build_generate_payload(
@@ -283,6 +361,7 @@ pub(crate) fn build_generate_payload(
         stream: req.stream,
         return_hidden_states: req.return_hidden_states,
         log_metrics: req.log_metrics,
+        structured_output: None,
     }
 }
 
@@ -291,8 +370,7 @@ fn resolve_generate_input(
     tokenizer: &Arc<dyn Tokenizer>,
 ) -> Result<(Option<String>, Vec<u32>), String> {
     if let Some(text) = &req.text {
-        let encoding = tokenizer
-            .encode(text, false)
+        let encoding = staged("encode", || tokenizer.encode(text, false))
             .map_err(|e| format!("Tokenization failed: {}", e))?;
         return Ok((Some(text.clone()), encoding.token_ids().to_vec()));
     }

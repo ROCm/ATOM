@@ -286,29 +286,37 @@ impl ParsedInference {
     /// engine keys every KV block of the prompt by.
     pub(crate) fn carries_media(&self) -> bool {
         match self {
-            Self::Chat(chat) => chat.messages.iter().any(|message| {
-                let content = match message {
-                    ChatMessage::System { content, .. }
-                    | ChatMessage::User { content, .. }
-                    | ChatMessage::Tool { content, .. }
-                    | ChatMessage::Developer { content, .. } => Some(content),
-                    ChatMessage::Assistant { content, .. } => content.as_ref(),
-                    ChatMessage::Function { .. } => None,
-                };
-                let media = |part: &ContentPart| !matches!(part, ContentPart::Text { .. });
-                matches!(content, Some(MessageContent::Parts(parts)) if parts.iter().any(media))
-            }),
-            Self::Generate(generate) => {
-                let media = [
-                    &generate.image_data,
-                    &generate.video_data,
-                    &generate.audio_data,
-                    &generate.input_embeds,
-                ];
-                media.iter().any(|data| data.is_some())
-            }
+            Self::Chat(chat) => Self::chat_carries_media(chat),
+            Self::Generate(generate) => Self::generate_carries_media(generate),
             Self::Completion(_) | Self::Messages(_) | Self::Responses(_) => false,
         }
+    }
+
+    /// [`Self::carries_media`] for a chat: a content part other than text.
+    pub(crate) fn chat_carries_media(chat: &ChatCompletionRequest) -> bool {
+        chat.messages.iter().any(|message| {
+            let content = match message {
+                ChatMessage::System { content, .. }
+                | ChatMessage::User { content, .. }
+                | ChatMessage::Tool { content, .. }
+                | ChatMessage::Developer { content, .. } => Some(content),
+                ChatMessage::Assistant { content, .. } => content.as_ref(),
+                ChatMessage::Function { .. } => None,
+            };
+            let media = |part: &ContentPart| !matches!(part, ContentPart::Text { .. });
+            matches!(content, Some(MessageContent::Parts(parts)) if parts.iter().any(media))
+        })
+    }
+
+    /// [`Self::carries_media`] for `/generate`: image, video, audio or embedding input.
+    pub(crate) fn generate_carries_media(generate: &GenerateRequest) -> bool {
+        let media = [
+            &generate.image_data,
+            &generate.video_data,
+            &generate.audio_data,
+            &generate.input_embeds,
+        ];
+        media.iter().any(|data| data.is_some())
     }
 
     pub fn chat(&self) -> Option<&ChatCompletionRequest> {
