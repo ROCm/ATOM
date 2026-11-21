@@ -1081,6 +1081,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #                  vocab (config ③, minimal comm). DEFAULT.
     #   "allgather" -> same shard/gather, but vocab all-gather + scatter rows
     #                  (config ②); kept for A/B and as a fallback.
+    #   "argmax"    -> same shard/gather, but exchange each shard's (max, id) and
+    #                  return greedy ids; the sampler is skipped. For all-greedy
+    #                  workloads only: startup fails without a single DP-sharded
+    #                  ParallelLMHead or with speculative decoding, and requests
+    #                  with temperature != 0, logprobs, structured output or a
+    #                  required channel are rejected.
     #   "default"   -> replicated full-vocab GEMM per DP rank (big GEMM, no comm);
     #                  explicit opt-out.
     "ATOM_DP_LM_HEAD_MODE": lambda: os.getenv(

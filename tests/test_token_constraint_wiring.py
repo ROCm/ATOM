@@ -181,6 +181,27 @@ def _postprocess(runner, batch):
         )
 
 
+@pytest.mark.parametrize("ids_head", [True, False])
+def test_the_argmax_heads_ids_skip_the_sampler(monkeypatch, ids_head):
+    """Under `ATOM_DP_LM_HEAD_MODE=argmax` the head output is fp32 greedy ids:
+    postprocess takes a fresh int32 copy (a replay's live in the graph pool)
+    without the sampler; logits still go through it."""
+    runner = _postprocess_runner({10: (3,), 11: (1,)}, None)
+    runner.dp_argmax_head = object()
+    runner.sampler = mock.Mock(return_value=torch.tensor([3, 1], dtype=torch.int32))
+    prepare = mock.Mock(return_value=({10: (3,), 11: (1,)}, None))
+    runner.tokenID_processor.prepare_sampled_ids = prepare
+    head = torch.tensor([3.0, 1.0, 2.0]) if ids_head else torch.eye(4)[[3, 1, 2]]
+    fc = SimpleNamespace(spec_decode_metadata=None)
+    monkeypatch.setattr(mod, "get_forward_context", lambda: fc)
+    out = runner.postprocess(_batch(), head, torch.zeros(2), None, None, True, None)
+    assert runner.sampler.called is not ids_head
+    ids = prepare.call_args.args[1]
+    assert ids.dtype == torch.int32 and ids.tolist() == [3, 1]
+    assert ids.data_ptr() != head.data_ptr()
+    assert out.token_ids == [(3,), (1,)]
+
+
 def test_grammar_errors_are_delivered_with_the_step_output():
     grammar = SimpleNamespace(errors={10: "grammar said no"})
     runner = _postprocess_runner({10: (4,), 11: (5,)}, grammar)

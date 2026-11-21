@@ -847,6 +847,7 @@ class InputOutputProcessor:
             kv_transfer=kv_transfer_params,
             multimodal=multimodal_data is not None,
         )
+        sampling_params.validate_greedy_head()
         if is_structured(sampling_params):
             if sampling_params.required_channel is not None:
                 raise ValueError(

@@ -377,26 +377,30 @@ class ParallelLMHead(VocabParallelEmbedding):
     # change needed for this prototype (the full weight still costs VRAM; a real
     # rollout should shard it at load time).
     # ------------------------------------------------------------------
+    def dp_shards_vocab(self) -> bool:
+        """Static: a sharded mode is on, pure DP, and the vocab splits evenly
+        over a >1 DP group."""
+        dp_group = get_dp_group()
+        return (
+            envs.ATOM_DP_LM_HEAD_MODE in ("allgather", "all2all", "argmax")
+            and self.tp_size == 1
+            and dp_group.world_size > 1
+            and self.num_embeddings % dp_group.world_size == 0
+        )
+
     def _can_use_dp_sharded_head(self, context) -> bool:
         """Whether this step may run the DP-sharded LM head (pure-DP decode only).
 
         Every DP rank must reach the SAME verdict from globally-synced state, or
-        the fixed-size collective in `_dp_sharded_logits` deadlocks. The strategy
-        (all-gather vs all2all) is read from ATOM_DP_LM_HEAD_MODE there.
+        the fixed-size collective in `_dp_sharded_logits` deadlocks. The exchange
+        (all-gather, all2all or greedy ids) is ATOM_DP_LM_HEAD_MODE's there.
 
         `is_prefill` below is per-rank, which is safe only because
         `running_tokens_are_unified` is the DP-reduced form of the same
         question: a prefilling peer drives it False on every rank, so no rank
         can answer True here while another answers False.
         """
-        dp_group = get_dp_group()
-        # Static: enabled, pure DP, vocab evenly shardable over a >1 DP group.
-        if (
-            envs.ATOM_DP_LM_HEAD_MODE not in ("allgather", "all2all")
-            or self.tp_size != 1
-            or dp_group.world_size <= 1
-            or self.num_embeddings % dp_group.world_size != 0
-        ):
+        if not self.dp_shards_vocab():
             return False
         # Per-step: all ranks at one height. `is_draft` is its own question,
         # not shorthand for the flag below -- a drafter states uniformity per
@@ -420,7 +424,8 @@ class ParallelLMHead(VocabParallelEmbedding):
 
         - ``"argmax"``: reduce each shard to a packed ``(max, global_id)`` and
           all-gather only ``[Σrows, 2]``, then pick the winner -> ``[local_rows]``
-          ids, still packed as fp32 (drafting; the caller narrows into its own).
+          ids, still packed as fp32 (drafting, or the decode head under
+          ``ATOM_DP_LM_HEAD_MODE=argmax``; the caller narrows into its own).
         - ``"all2all"`` / ``"allgather"``: exchange full-vocab logits ->
           ``[local_rows, vocab]`` (the decode head).
         """
