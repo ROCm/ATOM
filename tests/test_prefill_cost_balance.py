@@ -25,6 +25,7 @@ class _Delayer:
     exchange with this rank's cost followed by `others`."""
 
     max_queue_ms = None
+    sync_prefill = False
 
     def __init__(self, others=(), is_local=False):
         self.others = list(others)
