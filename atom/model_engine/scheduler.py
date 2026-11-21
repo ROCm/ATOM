@@ -895,6 +895,10 @@ class Scheduler:
         from atom.utils.forward_context import get_kvconnector
 
         self.kv_connector = get_kvconnector("scheduler", config)
+        if self._connector_flag("cancels_undispatched_loads"):
+            # Only such a connector changes the abort path; any other keeps
+            # the class's `_finish_rejected_waiting` as is.
+            self._finish_rejected_waiting = self._finish_rejected_waiting_cancelling
         # What a P/D receive's first decode takes past its prompt: T0 and the
         # `mtp_k` verify slots its handoff appends, then the reach past them
         # that `can_append` checks before the step runs, as decode does below.
@@ -3327,6 +3331,22 @@ class Scheduler:
             self._cleanup_aborted_load(seq)
             return
         seq._awaiting_aborted_load_cleanup = True
+
+    def _finish_rejected_waiting_cancelling(
+        self, seq: Sequence, reason: str = "aborted"
+    ) -> None:
+        """`_finish_rejected_waiting` behind a connector that cancels undispatched loads.
+
+        Parking counts a reservation before metadata reaches workers. A load
+        still pending (a renewal not yet finished) is cancelled now and the
+        request leaves as one with no load; a load workers own keeps its
+        blocks until its exact terminal report.
+        """
+        if getattr(
+            seq, "_counted_as_inflight_load", False
+        ) and self.kv_connector.cancel_undispatched_load(seq):
+            self._uncount_inflight_load(seq)
+        type(self)._finish_rejected_waiting(self, seq, reason)
 
     def abort_request(self, req_id: int) -> bool:
         """Reclaim waiting cancellations on the event, independent of admission."""
