@@ -18,6 +18,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn rl(mut self, config: crate::rl::RlConfig) -> Self {
+        self.config.rl = config;
+        self
+    }
+
     #[cfg(feature = "ext-proc")]
     pub fn ext_proc(mut self, config: crate::ext_proc::ExtProcConfig) -> Self {
         self.config.ext_proc = config;

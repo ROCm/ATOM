@@ -60,6 +60,8 @@ pub struct RouterConfig {
     pub ext_proc: crate::ext_proc::ExtProcConfig,
     #[serde(default)]
     pub prepare_pool: PreparePoolConfig,
+    #[serde(default)]
+    pub rl: crate::rl::RlConfig,
     pub mode: RoutingMode,
     #[serde(default)]
     pub backend: BackendType,
@@ -444,6 +446,7 @@ impl Default for RouterConfig {
             #[cfg(feature = "ext-proc")]
             ext_proc: Default::default(),
             prepare_pool: PreparePoolConfig::default(),
+            rl: Default::default(),
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },

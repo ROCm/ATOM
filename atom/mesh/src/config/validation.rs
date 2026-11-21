@@ -15,6 +15,7 @@ impl ConfigValidator {
         }
         #[cfg(feature = "ext-proc")]
         config.ext_proc.validate(config)?;
+        Self::validate_rl(&config.rl)?;
         Self::validate_mode(&config.mode)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_server_settings(config)?;
@@ -32,6 +33,25 @@ impl ConfigValidator {
 
         Self::validate_tokenizer_cache(&config.tokenizer_cache)?;
 
+        Ok(())
+    }
+
+    fn validate_rl(rl: &crate::rl::RlConfig) -> ConfigResult<()> {
+        if !rl.enabled {
+            return Ok(());
+        }
+        if rl.api_key.as_deref().map_or(true, |k| k.trim().is_empty()) {
+            return Err(ConfigError::MissingRequired {
+                field: "rl.api_key (--rl-api-key, required with --enable-rl)".to_string(),
+            });
+        }
+        if rl.control_timeout_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "rl.control_timeout_secs".to_string(),
+                value: "0".to_string(),
+                reason: "Must be greater than zero".to_string(),
+            });
+        }
         Ok(())
     }
 
