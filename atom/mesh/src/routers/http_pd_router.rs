@@ -29,7 +29,7 @@ use crate::{
     core::{
         placement::{
             backend::{
-                atom::{AtomAdapter, AtomPrefillInfo},
+                atom::{self, AtomAdapter, AtomPrefillInfo},
                 sglang::SglangAdapter,
                 vllm::{VllmAdapter, VllmPrefillInfo},
                 BackendAdapter, PairCtx,
@@ -483,82 +483,12 @@ impl PDRouter {
         prefill: Arc<dyn Worker>,
         decode: &Arc<dyn Worker>,
     ) -> Arc<dyn Worker> {
-        match self.atom_pd_rank_mapping_policy {
-            AtomPdRankMappingPolicy::None => prefill,
-            AtomPdRankMappingPolicy::Idx2Idx => self.map_atom_prefill_idx2idx(prefill, decode),
-        }
-    }
-
-    fn map_atom_prefill_idx2idx(
-        &self,
-        prefill: Arc<dyn Worker>,
-        decode: &Arc<dyn Worker>,
-    ) -> Arc<dyn Worker> {
-        let (Some(prefill_dp_size), Some(decode_dp_rank)) = (prefill.dp_size(), decode.dp_rank())
-        else {
-            debug!(
-                "ATOM PD rank mapping policy=idx2idx skipped: prefill={} prefill_dp_size={:?} decode={} decode_dp_rank={:?}",
-                prefill.url(),
-                prefill.dp_size(),
-                decode.url(),
-                decode.dp_rank()
-            );
-            return prefill;
-        };
-
-        if decode_dp_rank >= prefill_dp_size {
-            warn!(
-                "ATOM PD rank mapping policy=idx2idx skipped: decode rank {} is outside prefill dp_size {} (prefill={}, decode={})",
-                decode_dp_rank,
-                prefill_dp_size,
-                prefill.url(),
-                decode.url()
-            );
-            return prefill;
-        }
-
-        if prefill.dp_rank() == Some(decode_dp_rank) {
-            return prefill;
-        }
-
-        let mapped_url = format!("{}@{}", prefill.base_url(), decode_dp_rank);
-        match self.worker_registry.get_by_url(&mapped_url) {
-            Some(mapped)
-                if mapped.is_available()
-                    && mapped.model_id() == prefill.model_id()
-                    && matches!(
-                        mapped.worker_type(),
-                        crate::core::WorkerType::Prefill { .. }
-                    )
-                    && mapped.connection_mode().matches(prefill.connection_mode()) =>
-            {
-                info!(
-                    "ATOM PD rank mapping policy=idx2idx: prefill {} -> {}, decode={}",
-                    prefill.url(),
-                    mapped.url(),
-                    decode.url()
-                );
-                mapped
-            }
-            Some(mapped) => {
-                warn!(
-                    "ATOM PD rank mapping policy=idx2idx target {} is unhealthy; keeping prefill {} (decode={})",
-                    mapped.url(),
-                    prefill.url(),
-                    decode.url()
-                );
-                prefill
-            }
-            None => {
-                warn!(
-                    "ATOM PD rank mapping policy=idx2idx target {} not found; keeping prefill {} (decode={})",
-                    mapped_url,
-                    prefill.url(),
-                    decode.url()
-                );
-                prefill
-            }
-        }
+        atom::apply_atom_pd_rank_mapping_policy(
+            self.atom_pd_rank_mapping_policy,
+            &self.worker_registry,
+            prefill,
+            decode,
+        )
     }
 
     async fn fetch_vllm_prefill_info(
@@ -698,22 +628,10 @@ impl PDRouter {
                 .await
                 .map_err(|e| format!("Parse {} response: {}", info_url, e))?;
 
-            let tp = data
-                .get("tp_size")
-                .and_then(|v| v.as_u64())
-                .ok_or_else(|| format!("Missing tp_size in {} response", info_url))?
-                as usize;
-            let kv_role = data.get("kv_role").and_then(|v| v.as_str());
-            if kv_role != Some("kv_producer") {
-                return Err(format!(
-                    "{} is not a prefill (kv_role={:?}, expected kv_producer)",
-                    base_url, kv_role
-                ));
-            }
-            info!("ATOM prefill {} tp_size={}", base_url, tp);
-            if let Some(meta) = data.get("chunked_transfer").filter(|v| v.is_object()) {
+            let (tp, chunked) = atom::parse_atom_prefill_info(&data, &info_url, &base_url)?;
+            if let Some(meta) = chunked {
                 chunked_transfer.insert(base_url.clone(), meta.clone());
-                chunked_transfer.insert(worker_url.clone(), meta.clone());
+                chunked_transfer.insert(worker_url.clone(), meta);
             }
             tp_sizes.insert(base_url, tp);
             tp_sizes.insert(worker_url, tp);
