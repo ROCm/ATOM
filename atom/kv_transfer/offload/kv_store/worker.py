@@ -29,11 +29,12 @@ Completion protocol, per worker and operation:
   read nor put: it is source-safe at once and counts as stored, so a save
   whose every chunk was held ends in a success like any other.
 * Under a draft window the last PP stage also moves draft objects
-  (``LMCacheReqMeta.draft_chunks``). A save packs and puts them before its
-  target windows, so a chunk is source-safe only once both its packs ran, and
-  looks them up on their own keys: a held target says nothing of its draft
-  object, nor the other way round. A draft object not stored fails no save
-  (a later lookup cuts its hit there); a load gets them all or fails.
+  (``LMCacheReqMeta.draft_chunks``). A save packs and puts the ones the store
+  lacks before its target windows, so no draft read of a chunk is left once it
+  is source-safe, and looks them up on their own keys: a held target says
+  nothing of its draft object, nor the other way round. A draft object not
+  stored fails no save (a later lookup cuts its hit there); a load gets them
+  all or fails.
 * A load ends in exactly one of done or failed, all-or-nothing.
 * A slot returns to the pool only once no GPU or store access can still reach
   it. One a store transfer or a GPU copy may still reach is quarantined for
@@ -706,7 +707,7 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
             return
         pool, client, gpu_connector = self._registered()
         deadline = self._source_read_deadline(req)
-        # The draft objects first: a chunk is source-safe once both its packs ran.
+        # The draft objects first: no draft read is left once a chunk is source-safe.
         draft = _DraftTransfer()
         failure, detail = self._save_draft_chunks(
             req, self._draft_chunks_of(req, start, end), deadline, producer_event, draft

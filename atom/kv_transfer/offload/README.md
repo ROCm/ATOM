@@ -548,15 +548,16 @@ layer's; `mooncake_store` turns it on):
   `{namespace}/draft/w{rank}of{world}/{digest}`, put in no group: only the
   lookups and puts that ask for one renew its lease.
 - **Saves** put the draft objects of the saved prompt's window `[d0, C)`,
-  `d0 = R(E) // 256`, clipped to the chunks the save covers and to the
-  highest run whose blocks all hold draft rows (`LMCacheReqMeta.draft_chunks`).
-  The last stage packs and puts them before its target windows, so a chunk is
-  source-safe only once both packs ran. Like the target chunks, they are
-  looked up first and only the missing ones are packed and put, but on their
-  own keys: a target object the Store holds says nothing of its draft object,
-  nor the other way round. A draft put that fails is counted, not fatal; one
-  Mooncake may still write distrusts the Store as a target put does.
-- **Lookups** ask for the draft objects of `[d0, d1)`, `d1 = (E - 1) // 256`,
+  `d0 = R(E) // T` (`T` = `mooncake_store.chunk_tokens`, 256 by default),
+  clipped to the chunks the save covers and to the highest run whose blocks
+  all hold draft rows (`LMCacheReqMeta.draft_chunks`). The last stage packs and
+  puts them before its target windows, so no draft read of a chunk is left
+  once it is source-safe. Like the target chunks, they are looked up first and
+  only the missing ones are packed and put, but on their own keys: a target
+  object the Store holds says nothing of its draft object, nor the other way
+  round. A draft put that fails is counted, not fatal; one Mooncake may still
+  write distrusts the Store as a target put does.
+- **Lookups** ask for the draft objects of `[d0, d1)`, `d1 = (E - 1) // T`,
   in the same `batch_is_exist` call, and cut the hit at the first chunk of
   `[d0, min(hit, d1))` whose draft object a draft rank lacks. The cut never
   goes below `d0`, so it costs at most one window; a draft key no pool answered
@@ -566,7 +567,8 @@ layer's; `mooncake_store` turns it on):
   windows and before the final taint look, all or nothing, each checked
   against the draft object size. The blocks below get no draft rows: the
   scheduler marks them (`Block.draft_rows_missing`, through
-  `offload_draft_start_tokens` and `publish_loaded_prefix`).
+  `offload_draft_start_tokens` and `publish_loaded_prefix`), and an unaligned
+  hand-off marks them when it starts, before its partial prefill's forward.
 - **Marks.** A prefix hit (prefill and decode alike) is cut at the first marked
   block in its own read window, in `can_allocate` and again in `allocate`,
   whose claims stop at the cut; neither gate runs before a block is marked.
@@ -575,14 +577,15 @@ layer's; `mooncake_store` turns it on):
   `draft_rows_from` (V, the end of its highest marked block): a chunked
   prefill's workers get it with its first forward and put it in the handoff,
   and a non-chunked transfer carries it in its output parameters, which the
-  consumer echoes back. The consumer marks the received blocks below V. Its
-  write requests say where its draft reads from for the prompt
-  (`consumer_draft_read_from`) and which blocks its own prefix cache holds
-  (`consumer_hit_blocks`). With V above 0, the producer refuses before any
-  write a consumer whose draft reads below V, a transfer that would write its
-  blocks below V over those cached blocks (other requests on the decode read
-  them before a mark could land), and a non-chunked echo other than the V its
-  own workers got with the save. A refusal still ends the send.
+  consumer echoes back. The consumer marks the received blocks below V, under
+  a `multi` connector with an offload tier too. Its write requests say where
+  its draft reads from for the prompt (`consumer_draft_read_from`) and which
+  blocks its own prefix cache holds (`consumer_hit_blocks`). With V above 0,
+  the producer refuses before any write a consumer whose draft reads below V,
+  a transfer that would write its blocks below V over those cached blocks
+  (other requests on the decode read them before a mark could land), and a
+  non-chunked echo other than the V its own workers got with the save. A
+  refusal still ends the send.
 
 Refused without such a draft, with another offload connector or another P/D
 connector (MoRIIO hands on no boundary), and for layouts other than M3.
