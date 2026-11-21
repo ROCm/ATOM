@@ -152,8 +152,9 @@ start_prefill prefill-rank-0 "${SERVER_PORT}"
                 self.assertEqual(
                     args[args.index("--prepare-queue-timeout-ms") + 1], "5000"
                 )
+                self.assertEqual(args[args.index("--fastokens-models") + 1], "*")
                 self.assertEqual(
-                    args[args.index("--prepare-prefix-cache-mb") + 1], "4096"
+                    args[args.index("--fastokens-segment-cache-mb") + 1], "1024"
                 )
 
     def test_submit_exports_the_switch(self):
@@ -181,6 +182,7 @@ start_prefill prefill-rank-0 "${SERVER_PORT}"
         self.assertNotIn("--kv-events", args)
         self.assertNotIn("--mooncake-admin-port", args)
         self.assertNotIn("--prepare-queue-timeout-ms", args)
+        self.assertNotIn("--fastokens-models", args)
 
     def test_a_kv_events_router_saves_the_sources_it_follows(self):
         script = shell_functions("save_router_kv_sources") + """

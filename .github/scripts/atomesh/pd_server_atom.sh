@@ -2277,10 +2277,12 @@ start_router() {
     # master's metrics port (with per-NIC pools, only the first pool's).
     # Routing by the events tokenizes every prompt: the opening burst of
     # 1M-token sessions above --prepare-workers outlasts the 250 ms default
-    # queue wait, and 72 sessions already fill the default 1 GiB of kept prompts.
+    # queue wait. fastokens encodes them; its segment cache of a session's
+    # earlier turns takes about 0.6 GB for 72 sessions of up to 1M tokens.
     router_kv_events_args=(
       --kv-events --mooncake-admin-port "${ATOMESH_MOONCAKE_METRICS_PORT}"
-      --prepare-queue-timeout-ms 5000 --prepare-prefix-cache-mb 4096
+      --prepare-queue-timeout-ms 5000
+      --fastokens-models '*' --fastokens-segment-cache-mb 1024
     )
   fi
   local -a router_cmd=(
