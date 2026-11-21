@@ -43,6 +43,7 @@ from atom.model_engine.zmq_protocol.wire import (
     decode_envelope,
 )
 from atom.sampling_params import SamplingParams
+from engine_v1_helpers import received
 
 BLOCK = 4
 
@@ -443,7 +444,7 @@ def over_ipc(seqs):
         envelope = pb.Envelope()
         spec = envelope.submit.requests.add()
         _encode_chain(seq.prompt_hash_chain, spec.prompt_hash_chain, writer)
-        frames = writer.frames(envelope)
+        frames = received(writer.frames(envelope))
         twin = pickle.loads(pickle.dumps(seq))
         twin.prompt_hash_chain = _decode_chain(
             decode_envelope(frames).submit.requests[0].prompt_hash_chain,
@@ -555,13 +556,13 @@ def test_the_chain_rides_beside_the_seqs(monkeypatch, manager):
     assert all(s.prompt_hash_chain is None for s in seqs)
     if manager == "DisaggCoreManager":
         (rank, frames), (prefill, prefill_frames) = sent
-        _, specs, _ = decode_client_message(prefill_frames)
+        _, specs, _ = decode_client_message(received(prefill_frames))
         assert (rank, prefill) == (1, 0)
         assert [spec.prompt_hash_chain for spec in specs] == [None] * 3
     else:
         [(rank, frames)] = sent
     core = _real("atom.model_engine.engine_core", monkeypatch)
-    feed = iter([frames, encode_shutdown()])
+    feed = iter([received(frames), received(encode_shutdown())])
     sock = SimpleNamespace(send=lambda _: None, recv_multipart=lambda **_: next(feed))
     monkeypatch.setattr(core, "make_zmq_socket", lambda *a, **kw: nullcontext(sock))
     poller = SimpleNamespace(register=lambda *a: None, poll=lambda: [(sock, 1)])

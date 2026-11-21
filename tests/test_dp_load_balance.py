@@ -22,6 +22,7 @@ from atom.model_engine.engine_core_mgr import (
 from atom.model_engine.zmq_protocol.codec import decode_client_message
 from atom.model_engine.zmq_protocol.requests import IngressRequest
 from atom.sampling_params import SamplingParams
+from engine_v1_helpers import received
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -429,7 +430,7 @@ def test_dispatch_sends_explicit_hint_to_exact_engine_rank():
     assert [len(sock.messages) for sock in mgr.input_sockets] == [0, 0, 0, 1]
     identity, *frames = mgr.input_sockets[3].messages[0]
     assert identity == b"e3"
-    request_type, dispatched, _ = decode_client_message(frames)
+    request_type, dispatched, _ = decode_client_message(received(frames))
     assert request_type.name == "ADD"
     assert [item.seq_id for item in dispatched] == [seq.id]
 
@@ -590,7 +591,7 @@ def test_concurrent_store_dispatch_accounts_in_socket_send_order():
     names = {1: "first", 2: "second"}
 
     def send(_rank, frames):
-        _, specs, _ = decode_client_message([bytes(f) for f in frames])
+        _, specs, _ = decode_client_message(received(frames))
         sid = names[specs[0].seq_id]
         order.append(("send", sid))
         if sid == "first":

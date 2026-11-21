@@ -44,6 +44,7 @@ from atom.model_engine.scheduler import (
 from atom.model_engine.sequence import Sequence
 from atom.model_engine.zmq_protocol.codec import decode_client_message
 from atom.sampling_params import SamplingParams
+from engine_v1_helpers import received
 
 
 def _running(n, scheduler_cls=Scheduler):
@@ -403,7 +404,7 @@ def _wired(schedulers, runners=None):
     ]
 
     def send(dp_rank, frames, copy=False):
-        _, (_, body), _ = decode_client_message([bytes(f) for f in frames])
+        _, (_, body), _ = decode_client_message(received(frames))
         body = dict(body)
         pending = queue.Queue()
         pending.put_nowait((body.pop("cmd"), body))
@@ -681,7 +682,7 @@ def _pipeline(sched, *, stage_runs=True):
     stage.pull_and_process_input_queue = stop.is_set
 
     def send(engine_index, frames, copy=False):
-        _, (_, body), _ = decode_client_message([bytes(f) for f in frames])
+        _, (_, body), _ = decode_client_message(received(frames))
         body = dict(body)
         cmd = body.pop("cmd")
         if engine_index == 1:

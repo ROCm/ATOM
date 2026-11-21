@@ -22,6 +22,7 @@ from atom.model_engine.zmq_protocol.codec import (
     decode_client_message,
     encode_utility_reply,
 )
+from engine_v1_helpers import received
 
 # ── harness ────────────────────────────────────────────────────────────────
 
@@ -56,7 +57,7 @@ def _mgr(engine_count=2, tp=1, cls=CoreManager):
 
 def _on_rank(dp_rank, frames):
     """One control message, recorded like a broadcast plus the rank it reached."""
-    _, (_, body), _ = decode_client_message(frames)
+    _, (_, body), _ = decode_client_message(received(frames))
     body = dict(body)
     return body.pop("cmd"), {**body, "dp_rank": dp_rank}
 

@@ -21,11 +21,12 @@ from atom.model_engine.zmq_protocol import codec, wire
 from atom.model_engine.zmq_protocol import engine_v1_pb2 as pb
 from atom.model_engine.zmq_protocol.requests import IngressRequest
 from atom.sampling_params import RequiredChannel, SamplingParams
+from engine_v1_helpers import received
 
 
 def on_the_wire(frames):
-    """What the receiver gets: every frame as bytes."""
-    return [bytes(f) for f in frames]
+    """What the receiver gets: every frame as a `zmq.Frame`."""
+    return received(frames)
 
 
 def submitted(params, **ingress):
@@ -274,9 +275,9 @@ def test_a_small_decoded_tensor_does_not_pin_the_shared_frame():
     writer = wire.FrameWriter()
     wire.encode_value(np.arange(4, dtype=np.int32), env.metrics.snapshot, writer)
     frames = writer.frames(env)
-    frames[0] = bytes(frames[0])
     shared = bytearray(frames[1])
-    frames[1] = shared
+    # A frame whose buffer the test can overwrite once the value is decoded.
+    frames = [*received(frames[:1]), SimpleNamespace(buffer=memoryview(shared))]
     out = wire.decode_value(env.metrics.snapshot, wire.FrameReader(frames))
     shared[:] = b"\xff" * len(shared)
     assert out.tolist() == [0, 1, 2, 3]

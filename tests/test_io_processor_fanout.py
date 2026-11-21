@@ -22,6 +22,7 @@ from atom.model_engine.sequence import Sequence
 from atom.model_engine.zmq_protocol.codec import decode_client_message, encode_submit
 from atom.model_engine.zmq_protocol.requests import CompletionResult, IngressRequest
 from atom.sampling_params import SamplingParams
+from engine_v1_helpers import received
 
 # ``atom.model_engine.llm_engine`` imports aiter through CoreManager on real
 # installs. Stub aiter for the import only: a module left stubbed in
@@ -45,7 +46,7 @@ def _engine_seqs(reqs) -> list[Sequence]:
         enable_dp_attention=False,
         hf_config=SimpleNamespace(model_type="llama"),
     )
-    _, specs, _ = decode_client_message(encode_submit(reqs))
+    _, specs, _ = decode_client_message(received(encode_submit(reqs)))
     context = AdmissionContext(config)
     return [build_sequence(spec, context) for spec in specs]
 

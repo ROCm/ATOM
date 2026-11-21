@@ -26,6 +26,7 @@ from atom.model_engine.request import RequestOutput
 from atom.model_engine.zmq_protocol import codec, wire
 from atom.model_engine.zmq_protocol.engine_v1_pb2 import Envelope
 from atom.sampling_params import RequiredChannel
+from engine_v1_helpers import received
 
 FIXTURES = Path(__file__).parent / "fixtures" / "engine_v1"
 
@@ -46,6 +47,11 @@ def read_frames(path: Path) -> list[bytes]:
         frames.append(data[at + 4 : at + 4 + n])
         at += 4 + n
     return frames
+
+
+def fixture(name: str) -> list:
+    """A fixture's frames as the receiving socket hands them over."""
+    return received(read_frames(FIXTURES / name))
 
 
 def deep_value() -> dict:
@@ -122,31 +128,23 @@ def test_the_core_fixtures_say_what_the_client_reads():
     ready = Envelope()
     ready.ParseFromString(read_frames(FIXTURES / "core_ready.frames")[0])
     assert ready.ready.max_pool_tokens == 4096
-    _, outputs = codec.decode_core_message(read_frames(FIXTURES / "core_stream.frames"))
+    _, outputs = codec.decode_core_message(fixture("core_stream.frames"))
     [(seq_id, out)] = outputs
     assert (seq_id, list(out.output_tokens), out.finished) == (0, [7, 8], True)
     assert (out.finish_reason, out.num_cached_tokens) == ("eos", 3)
-    _, [done] = codec.decode_core_message(
-        read_frames(FIXTURES / "core_completions.frames")
-    )
+    _, [done] = codec.decode_core_message(fixture("core_completions.frames"))
     assert (done.id, list(done.completion_token_ids)) == (0, [5, 6])
     assert list(done.logprobs) == [-0.5, -1.25]
     assert (done.num_prompt_tokens, done.leave_reason) == (3, "max_tokens")
-    _, [rejected] = codec.decode_core_message(
-        read_frames(FIXTURES / "core_rejected.frames")
-    )
+    _, [rejected] = codec.decode_core_message(fixture("core_rejected.frames"))
     assert (rejected.id, rejected.leave_reason) == (0, f"{codec.REJECTED_REASON}: bad")
     assert rejected.rejected
-    _, [deep] = codec.decode_core_message(
-        read_frames(FIXTURES / "core_deep_completions.frames")
-    )
+    _, [deep] = codec.decode_core_message(fixture("core_deep_completions.frames"))
     assert deep.kv_transfer_params_output == deep_value()
 
 
 def test_the_rust_clients_submit_decodes_as_the_core_reads_it():
-    kind, specs, failures = codec.decode_client_message(
-        read_frames(FIXTURES / "client_submit.frames")
-    )
+    kind, specs, failures = codec.decode_client_message(fixture("client_submit.frames"))
     assert kind == EngineCoreRequestType.ADD
     assert failures == []
     assert [s.kwargs["sibling_index"] for s in specs] == [0, 1]
@@ -175,11 +173,7 @@ def test_the_rust_clients_submit_decodes_as_the_core_reads_it():
 
 
 def test_the_rust_clients_control_messages_decode():
-    kind, seq_ids, _ = codec.decode_client_message(
-        read_frames(FIXTURES / "client_abort.frames")
-    )
+    kind, seq_ids, _ = codec.decode_client_message(fixture("client_abort.frames"))
     assert (kind, seq_ids) == (EngineCoreRequestType.ABORT, [0])
-    kind, _, _ = codec.decode_client_message(
-        read_frames(FIXTURES / "client_shutdown.frames")
-    )
+    kind, _, _ = codec.decode_client_message(fixture("client_shutdown.frames"))
     assert kind == EngineCoreRequestType.SHUTDOWN

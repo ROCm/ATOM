@@ -18,6 +18,7 @@ from atom.model_engine.zmq_protocol.codec import decode_client_message
 from atom.model_engine.zmq_protocol.requests import IngressRequest
 from atom.observability import tracing
 from atom.sampling_params import SamplingParams
+from engine_v1_helpers import received
 
 
 def output(ids, tokens):
@@ -128,7 +129,7 @@ def test_core_manager_captures_context_after_executor_preprocess(spans):
         CoreManager.add_request(manager, [seq])
 
     execute(app)
-    _, specs, _ = decode_client_message(frames[0])
+    _, specs, _ = decode_client_message(received(frames[0]))
     carrier, _, _ = specs[0].trace
     http = spans.get_finished_spans()[0]
     assert carrier["traceparent"].split("-")[2] == f"{http.context.span_id:016x}"
@@ -159,7 +160,7 @@ def test_same_node_pd_marks_http_and_skips_both_engine_carriers(
         DisaggCoreManager.add_request(manager, [seq])
         assert len(frames) == 2
         for frame in frames:
-            _, specs, _ = decode_client_message(frame)
+            _, specs, _ = decode_client_message(received(frame))
             for spec in specs:
                 assert spec.trace is None
                 # The engine's own sequence for it, untraced.

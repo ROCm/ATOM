@@ -18,6 +18,7 @@ from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus, new_block_table
+import engine_v1_helpers
 
 
 @pytest.fixture
@@ -149,7 +150,12 @@ def test_engine_receipt_includes_time_buffered_before_scheduler_admission(
     request = IngressRequest(
         id=1, prompt_token_ids=[1, 3, 4], sampling_params=SamplingParams()
     )
-    messages = iter([encode_submit([request]), encode_shutdown()])
+    messages = iter(
+        [
+            engine_v1_helpers.received(encode_submit([request])),
+            engine_v1_helpers.received(encode_shutdown()),
+        ]
+    )
     sock = SimpleNamespace(
         send=lambda _: None, recv_multipart=lambda **_: next(messages)
     )

@@ -23,6 +23,7 @@ from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.zmq_protocol.codec import decode_client_message
 from atom.model_engine.zmq_protocol.requests import IngressRequest
 from atom.sampling_params import SamplingParams
+from engine_v1_helpers import received
 
 _seq_ids = itertools.count(1)
 
@@ -69,7 +70,7 @@ def make_mgr(n_ranks=4, depth=3, fail_ranks=None):
     def fake_send(dp_rank, frames):
         if dp_rank in mgr.fail_ranks:
             raise RuntimeError(f"send failed rank {dp_rank}")
-        kind, specs, failures = decode_client_message(frames)
+        kind, specs, failures = decode_client_message(received(frames))
         assert kind == EngineCoreRequestType.ADD and not failures
         with mgr._send_lock:
             mgr.sent[dp_rank].extend(spec.seq_id for spec in specs)

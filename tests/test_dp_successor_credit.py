@@ -8,11 +8,12 @@ from atom.kv_transfer.offload.tier import OffloadTierProfile
 from atom.model_engine.dp_routing.share_cache import ShareCacheRouter
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.zmq_protocol.codec import decode_client_message
+from engine_v1_helpers import received
 
 
 def _decoded(frames):
     """`(kind, data)` of a message the manager sent to a Core."""
-    kind, data, _ = decode_client_message([bytes(f) for f in frames])
+    kind, data, _ = decode_client_message(received(frames))
     return kind, data
 
 

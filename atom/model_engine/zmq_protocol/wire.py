@@ -101,13 +101,11 @@ class FrameWriter:
 
 
 class FrameReader:
-    """Views into the frames of one received message."""
+    """Views into the frames of one received message: the `zmq.Frame`s of a
+    `recv_multipart(copy=False)`."""
 
     def __init__(self, frames: list):
-        self._buffers = [
-            frame.buffer if hasattr(frame, "buffer") else memoryview(frame)
-            for frame in frames
-        ]
+        self._buffers = [frame.buffer for frame in frames]
 
     def view(self, ref) -> memoryview:
         if not 1 <= ref.frame < len(self._buffers):
@@ -151,7 +149,7 @@ def decode_envelope(frames: list) -> "pb.Envelope":
         raise ProtocolError("empty message")
     head = frames[0]
     envelope = pb.Envelope()
-    envelope.ParseFromString(head.bytes if hasattr(head, "bytes") else bytes(head))
+    envelope.ParseFromString(head.bytes)
     if envelope.protocol_version != PROTOCOL_VERSION:
         raise ProtocolError(
             f"protocol version {envelope.protocol_version}, expected "
