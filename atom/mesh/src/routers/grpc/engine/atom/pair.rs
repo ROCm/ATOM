@@ -178,7 +178,7 @@ fn is_atom(worker: &Arc<dyn Worker>) -> bool {
     worker.metadata().runtime_type == RuntimeType::Atom
 }
 
-async fn atom_client(worker: &Arc<dyn Worker>) -> Option<AtomClient> {
+pub(super) async fn atom_client(worker: &Arc<dyn Worker>) -> Option<AtomClient> {
     match get_grpc_client_from_worker(worker).await {
         Ok(GrpcClient::Atom(client)) => Some(client),
         _ => None,
