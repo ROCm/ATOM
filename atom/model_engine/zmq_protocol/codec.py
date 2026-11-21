@@ -427,18 +427,36 @@ def _decode_completion_alone(msg, reader: FrameReader) -> CompletionResult:
         )
 
 
-def _decode_stream(msg, reader: FrameReader) -> list[tuple[int, RequestOutput]]:
+class StreamOutputs(list):
+    """A STREAM's `(seq_id, RequestOutput)` pairs.
+
+    `cut_short`: the sequences this client ends here, rejected, while their
+    Core still runs them -- an entry of theirs did not decode. The client
+    tells the Core to stop them.
+    """
+
+    cut_short: tuple = ()
+
+
+def _decode_stream(msg, reader: FrameReader) -> StreamOutputs:
     counts = list(msg.token_counts)
     tokens = list(msg.tokens)
     if len(counts) != len(msg.seq_ids) or sum(counts) != len(tokens):
         raise ProtocolError("stream columns disagree in length")
     reasons = dict(msg.finish_reasons)
-    kv_outputs = {
-        i: decode_value(value, reader)
-        for i, value in msg.kv_transfer_params_outputs.items()
-    }
+    kv_outputs, undecodable = {}, {}
+    for i, value in msg.kv_transfer_params_outputs.items():
+        # One entry must not drop every other sequence's step.
+        try:
+            kv_outputs[i] = decode_value(value, reader)
+        except Exception as exc:
+            logger.exception("entry %d's kv_transfer_params_output does not decode", i)
+            undecodable[i] = (
+                f"{REJECTED_REASON}: kv_transfer_params_output not decodable: "
+                f"{type(exc).__name__}: {exc}"
+            )
     logprobs = _decode_logprobs(msg, reader)
-    out = []
+    out = StreamOutputs()
     start = 0
     # A streamed output's request id is its sequence id (the Scheduler sets
     # `request_id=seq.id`), so the wire carries it once.
@@ -468,6 +486,14 @@ def _decode_stream(msg, reader: FrameReader) -> list[tuple[int, RequestOutput]]:
             )
         )
         start = end
+    if undecodable:
+        cut_short = []
+        for i, reason in undecodable.items():
+            seq_id, output = out[i]
+            if not output.finished:
+                cut_short.append(seq_id)
+            output.finished, output.finish_reason = True, reason
+        out.cut_short = tuple(cut_short)
     return out
 
 
@@ -730,7 +756,13 @@ def encode_stream(outputs) -> list:
     msg.token_counts.extend([len(output.output_tokens) for output in results])
     msg.tokens.extend(chain.from_iterable(output.output_tokens for output in results))
     msg.finished.extend([output.finished for output in results])
-    msg.num_cached_tokens.extend([output.num_cached_tokens or 0 for output in results])
+    cached = [output.num_cached_tokens or 0 for output in results]
+    try:
+        msg.num_cached_tokens.extend(cached)
+    except (TypeError, ValueError):
+        # One entry's count must not drop the whole step: it reads as 0.
+        del msg.num_cached_tokens[:]
+        msg.num_cached_tokens.extend(map(_cached_count, outputs))
     for i, output in enumerate(results):
         if output.finish_reason is not None:
             msg.finish_reasons[i] = output.finish_reason
@@ -751,6 +783,15 @@ def encode_stream(outputs) -> list:
                 )
     _encode_logprobs(results, msg, writer)
     return writer.frames(envelope)
+
+
+def _cached_count(pair) -> int:
+    seq_id, output = pair
+    count = output.num_cached_tokens or 0
+    if type(count) is int and 0 <= count < 1 << 63:
+        return count
+    logger.error("seq %s's num_cached_tokens %r is not a count", seq_id, count)
+    return 0
 
 
 def _encode_logprobs(results, msg, writer: FrameWriter) -> None:

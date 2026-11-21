@@ -344,6 +344,56 @@ def test_an_unencodable_kv_output_drops_only_its_own_entry():
     assert decoded[1][1].kv_transfer_params_output is None
 
 
+def test_a_count_that_is_not_one_reads_as_zero_not_a_lost_step():
+    outputs = [
+        (1, RequestOutput(1, [1], False, num_cached_tokens=2)),
+        (2, RequestOutput(2, [2], False, num_cached_tokens="3")),
+        (3, RequestOutput(3, [3], False, num_cached_tokens=1 << 70)),
+    ]
+    _, decoded = codec.decode_core_message(on_the_wire(codec.encode_stream(outputs)))
+    assert [list(out.output_tokens) for _, out in decoded] == [[1], [2], [3]]
+    assert [out.num_cached_tokens for _, out in decoded] == [2, 0, 0]
+
+
+@pytest.mark.parametrize(
+    "hit, kept", [(2, 2), (3, 3), (4, 0), (-1, 0), ("2", 0), (True, 0)]
+)
+def test_a_clients_cache_hit_is_taken_only_as_a_count_of_its_prompt(hit, kept):
+    seq = Sequence([1, 2, 3], 16, kv_transfer_params={"prefix_cache_hit_tokens": hit})
+    assert seq.prefix_cache_hit_tokens == kept
+
+
+def stream_with_a_bad_kv_entry(finished):
+    """A STREAM whose second entry's kv output points at a missing frame."""
+    outputs = [
+        (1, RequestOutput(1, [1], False)),
+        (2, RequestOutput(2, [2], finished, "eos" if finished else None, {"x": {1}})),
+        (3, RequestOutput(3, [3], True, "eos", {"ok": 1})),
+    ]
+    frames = codec.encode_stream(outputs)
+    env = wire.decode_envelope(on_the_wire(frames))
+    kv = env.stream.kv_transfer_params_outputs[1]
+    kv.map_value.entries[0].value.pickled_value.frame = 9
+    frames[0] = env.SerializeToString()
+    _, decoded = codec.decode_core_message(on_the_wire(frames))
+    return decoded
+
+
+@pytest.mark.parametrize("finished", [False, True])
+def test_an_undecodable_kv_entry_ends_only_its_own_sequence(finished):
+    decoded = stream_with_a_bad_kv_entry(finished)
+    assert [seq_id for seq_id, _ in decoded] == [1, 2, 3]
+    assert [list(out.output_tokens) for _, out in decoded] == [[1], [2], [3]]
+    (_, ok), (_, bad), (_, done) = decoded
+    assert (ok.finished, ok.finish_reason) == (False, None)
+    assert (done.finished, done.kv_transfer_params_output) == (True, {"ok": 1})
+    assert bad.finished and bad.kv_transfer_params_output is None
+    assert bad.finish_reason.startswith(f"{codec.REJECTED_REASON}: ")
+    assert "missing frame 9" in bad.finish_reason
+    # The Core still runs one it had not finished: the client stops it.
+    assert decoded.cut_short == (() if finished else (2,))
+
+
 class Unpicklable:
     def __reduce__(self):
         raise TypeError("nope")

@@ -8,9 +8,13 @@ from enum import Enum, auto
 from itertools import count
 from typing import Any, NamedTuple
 
+import logging
+
 import numpy as np
 
 from atom.sampling_params import UNCONSTRAINED, SamplingParams
+
+logger = logging.getLogger("atom")
 
 # The model_types whose sequences need a per-request stateful buffer outside
 # the paged KV pool (`Sequence.has_per_req_cache`): BlockManager reserves them
@@ -278,6 +282,20 @@ class OffloadJointRecord:
         self.kv_tokens = 0
         self.claim_tokens = 0
         self.hbm_hit_tokens = 0
+
+
+def _cache_hit_count(value, num_prompt_tokens: int) -> int:
+    """A client's (or P/D peer's) `prefix_cache_hit_tokens`, as a count the
+    scheduler and the output stream can take: 0 for one that is not an int in
+    `[0, num_prompt_tokens]`."""
+    if type(value) is int and 0 <= value <= num_prompt_tokens:
+        return value
+    logger.warning(
+        "ignoring prefix_cache_hit_tokens %r: not a count of the %d prompt tokens",
+        value,
+        num_prompt_tokens,
+    )
+    return 0
 
 
 def media_cache_seed(multimodal_data: dict | None, known: int | None = None) -> int:
@@ -564,13 +582,9 @@ class Sequence:
         # kv_transfer params
         self.kv_transfer_params = kv_transfer_params
         self.kv_transfer_params_output = None
-        if kv_transfer_params:
-            self.prefix_cache_hit_tokens = kv_transfer_params.get(
-                "prefix_cache_hit_tokens", 0
-            )
-
-        self.prefix_cache_hit_tokens = (kv_transfer_params or {}).get(
-            "prefix_cache_hit_tokens", 0
+        self.prefix_cache_hit_tokens = _cache_hit_count(
+            (kv_transfer_params or {}).get("prefix_cache_hit_tokens", 0),
+            len(token_ids),
         )
 
         # accepted tokens for spec decode

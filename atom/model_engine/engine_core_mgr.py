@@ -967,6 +967,10 @@ class CoreManager:
                                     logger.debug(
                                         f"{self.label}: Cleaned up callback for finished sequence {seq_id}"
                                     )
+                        # Ended here on an entry that did not decode; the Core
+                        # still runs them.
+                        for seq_id in stream_outputs.cut_short:
+                            self.abort_request(seq_id)
                         # Batched stream dispatch: the per-seq callbacks only buffer
                         # their chunks into a thread-local; flush the whole step's
                         # buffer into the per-request stream collectors now (one
