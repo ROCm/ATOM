@@ -20,25 +20,38 @@ spec = importlib.util.spec_from_file_location(
 ci = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ci)
 CID = "a" * 64
+ACTUAL_ALLOCATION = (
+    "--group-add 992 --device /dev/dri/renderD128 --device /dev/dri/renderD136 "
+    "--device /dev/dri/renderD144 --device /dev/dri/renderD152 "
+    "--device /dev/dri/renderD160 --device /dev/dri/renderD168 "
+    "--device /dev/dri/renderD176 --device /dev/dri/renderD184 --cpuset-cpus 0-127\n"
+)
+
+
+@pytest.fixture(autouse=True)
+def permitted_cpu_observation(monkeypatch):
+    monkeypatch.setattr(
+        ci.os, "sched_getaffinity", lambda pid: set(range(256)), raising=False
+    )
 
 
 def write(path, value):
     path.write_text(json.dumps(value))
 
 
-def old_allocation():
+def old_allocation(revision="d0fa6a7fb5e9b4da3f559fab153aea0567fd7e1f"):
     path = ROOT / ".github/scripts/k31_b_accuracy.py"
     namespace = {"__file__": str(path), "__name__": "before_allocation_repair"}
     source = subprocess.check_output(
         [
             "git",
             "show",
-            "d0fa6a7fb5e9b4da3f559fab153aea0567fd7e1f:.github/scripts/k31_b_accuracy.py",
+            revision + ":.github/scripts/k31_b_accuracy.py",
         ],
         cwd=ROOT,
     )
     exec(  # noqa: S102 -- frozen regression source
-        compile(source, "d0fa", "exec"), namespace
+        compile(source, revision, "exec"), namespace
     )
     return namespace["allocation"]
 
@@ -54,7 +67,7 @@ def test_numeric_producer_group_requires_observed_gid(tmp_path, monkeypatch):
     )
     with pytest.raises(ValueError, match="unexpected allocation argument"):
         old_allocation()(text, inspect)
-    assert len(ci.allocation(text, inspect)) == 9
+    assert len(ci.allocation(text, inspect)["nodes"]) == 9
     for bad in (
         text.replace("110", "111"),
         text.replace("110", "root"),
@@ -66,7 +79,9 @@ def test_numeric_producer_group_requires_observed_gid(tmp_path, monkeypatch):
     source, output = tmp_path / "allocation", tmp_path / "receipt.json"
     source.write_text(text)
     current = ci.allocation
-    monkeypatch.setattr(ci, "allocation", lambda value: current(value, inspect))
+    monkeypatch.setattr(
+        ci, "allocation", lambda value, **kw: current(value, inspect, **kw)
+    )
     ci.captured_allocation(source, output)
     assert json.loads(output.read_text())["observed_device_groups"] == [110]
 
@@ -130,7 +145,7 @@ def test_allocated_nodes_and_ambiguous_inputs(monkeypatch):
         st_mode=stat.S_IFCHR, st_gid=109, st_rdev=128
     )
     text = " ".join(f"--device /dev/dri/renderD{i}" for i in range(128, 136))
-    assert len(ci.allocation(text, inspect)) == 9
+    assert len(ci.allocation(text, inspect)["nodes"]) == 9
     for invalid in (
         "",
         text + " --privileged",
@@ -142,6 +157,135 @@ def test_allocated_nodes_and_ambiguous_inputs(monkeypatch):
             ci.allocation(invalid, inspect)
     with pytest.raises(ValueError, match="character device"):
         ci.allocation(text, lambda path: SimpleNamespace(st_mode=stat.S_IFREG))
+
+
+def test_actual_cpu_constraint_old_refuses_new_binds(tmp_path, monkeypatch):
+    assert (
+        hashlib.sha256(ACTUAL_ALLOCATION.encode()).hexdigest()
+        == "d69d45c2ff00ef48a9fd9e36f61079aca9514776dcfec682bed19bb7031faadb"
+    )
+    monkeypatch.setattr(ci.os, "major", lambda value: 226, raising=False)
+    monkeypatch.setattr(ci.os, "minor", lambda value: value, raising=False)
+    inspect = lambda path: SimpleNamespace(
+        st_mode=stat.S_IFCHR, st_gid=992, st_rdev=128
+    )
+    with pytest.raises(ValueError, match="unexpected allocation argument"):
+        old_allocation("39ee6af2b66796ee30277a4c557e87d9a9338846")(
+            ACTUAL_ALLOCATION, inspect
+        )
+    allocated = ci.allocation(ACTUAL_ALLOCATION, inspect)
+    assert allocated["cpu_affinity"] == list(range(128))
+    assert allocated["permitted_cpu_affinity"] == list(range(256))
+    assert allocated["declared_cpu_set"] == "0-127" and len(allocated["nodes"]) == 9
+    current = ci.allocation
+    monkeypatch.setattr(
+        ci, "allocation", lambda value, **kw: current(value, inspect, **kw)
+    )
+    source, output = tmp_path / "allocation", tmp_path / "receipt.json"
+    source.write_bytes(ACTUAL_ALLOCATION.encode())
+    ci.captured_allocation(source, output)
+    receipt = json.loads(output.read_text())
+    assert receipt["cpu_affinity"] == list(range(128))
+    assert receipt["permitted_cpu_affinity"] == list(range(256))
+    assert base64.b64decode(receipt["raw_base64"]) == ACTUAL_ALLOCATION.encode()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "all",
+        "-1",
+        "2-1",
+        "0-999999999999",
+        "0,",
+        "0,,1",
+        "0-3,3",
+        "0,0",
+        "0;true",
+        "0-127 --cpuset-cpus 0-127",
+    ],
+)
+def test_bad_cpu_constraints_refuse(value):
+    with pytest.raises(ValueError):
+        ci.allocation(ACTUAL_ALLOCATION.replace("0-127", value))
+
+
+def test_cpu_constraint_does_not_intersect_or_widen(tmp_path, monkeypatch):
+    assert ci.allocated_cpus("0-1,4", {0, 1, 4, 5}) == [0, 1, 4]
+    assert ci.allocated_cpus(None, {2, 7}) == [2, 7]
+    with pytest.raises(ValueError, match="unpermitted"):
+        ci.allocated_cpus("0-4", {0, 1, 3, 4})
+    with pytest.raises(ValueError, match="no permitted"):
+        ci.allocated_cpus("0", set())
+    monkeypatch.setattr(ci.os, "sched_getaffinity", lambda pid: set(range(64)))
+    with pytest.raises(ValueError, match="outside permitted"):
+        ci.allocation(ACTUAL_ALLOCATION)
+    source, output = tmp_path / "allocation", tmp_path / "receipt.json"
+    source.write_bytes(ACTUAL_ALLOCATION.encode())
+    with pytest.raises(ValueError, match="outside permitted"):
+        ci.captured_allocation(source, output)
+    report = json.loads(output.read_text())
+    assert report["permitted_cpu_affinity"] == list(range(64))
+    assert report["phase"] == "parse" and "error" in report
+
+
+@pytest.mark.parametrize(
+    "host_set,live,permitted",
+    [
+        ("0-2", {0, 1}, {0, 1, 2}),
+        ("0-1", {0, 1, 2}, {0, 1, 2}),
+        ("0-1", {0}, {0, 1}),
+        ("0-1", {0, 1}, {0}),
+    ],
+)
+def test_cpu_admission_rejects_unbound_container(
+    tmp_path, monkeypatch, host_set, live, permitted
+):
+    policy = ci.read(ci.POLICY)
+    write(
+        tmp_path / "admission.json",
+        {
+            "kind": "ci-container-v1",
+            "leg": "B-accuracy",
+            "image_manifest": policy["image"],
+            "cid": CID,
+            "docker": {
+                "Id": CID,
+                "Image": policy["config"],
+                "HostConfig": {"CpusetCpus": host_set},
+            },
+            "allocation": {
+                "cpu_affinity": [0, 1],
+                "permitted_cpu_affinity": sorted(permitted),
+            },
+        },
+    )
+    monkeypatch.setattr(ci.os, "sched_getaffinity", lambda pid: live)
+    with pytest.raises(ValueError, match="CPU"):
+        ci.verify_admission(tmp_path)
+
+
+@pytest.mark.parametrize("kind", ["dataset", "model", "postflight"])
+def test_containers_use_only_the_bound_cpu_set(tmp_path, monkeypatch, kind):
+    (tmp_path / "output").mkdir()
+    write(
+        tmp_path / "allocation.json",
+        {"nodes": [], "cpu_affinity": [1, 3], "permitted_cpu_affinity": list(range(8))},
+    )
+    monkeypatch.setenv("GITHUB_RUN_ID", "1")
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "1")
+    calls = []
+
+    def refused_create(argv, seconds=30):
+        calls.append(argv)
+        return {"returncode": 1, "stdout": "", "stderr": "fixture stops before Docker"}
+
+    monkeypatch.setattr(ci, "command", refused_create)
+    ci.container(kind, tmp_path)
+    assert [arg for arg in calls[0] if arg.startswith("--cpuset-cpus")] == [
+        "--cpuset-cpus=1,3"
+    ]
 
 
 @pytest.mark.parametrize(

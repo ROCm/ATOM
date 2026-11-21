@@ -14,6 +14,7 @@ import sys
 import time
 from pathlib import Path
 
+from atomesh.numa_exec import parse_cpulist
 from k31_phase0_inputs import digest, require, verify
 
 CONTROL = Path(__file__).resolve().parents[2]
@@ -56,8 +57,40 @@ def command(argv, seconds=30):
         return {"argv": argv, "returncode": 127, "stdout": "", "stderr": repr(error)}
 
 
-def allocation(text, inspect_path=os.stat):
+def allocated_cpus(value, permitted):
+    require(permitted, "no permitted CPUs observed")
+    if value is None:
+        return sorted(permitted)
+    require(
+        re.fullmatch(r"[0-9]+(?:-[0-9]+)?(?:,[0-9]+(?:-[0-9]+)?)*", value),
+        "malformed allocated CPU set",
+    )
+    count = 0
+    for part in value.split(","):
+        first, _, last = part.partition("-")
+        low, high = int(first), int(last or first)
+        require(
+            low <= high <= max(permitted),
+            "allocated CPU range outside permitted bounds",
+        )
+        count += high - low + 1
+    cpus = parse_cpulist(value)
+    require(
+        len(cpus) == count and cpus <= permitted,
+        "repeated or unpermitted allocated CPUs",
+    )
+    return sorted(cpus)
+
+
+def allocation(text, inspect_path=os.stat, permitted_cpus=None):
     tokens, paths = shlex.split(text), []
+    permitted = set(
+        os.sched_getaffinity(0) if permitted_cpus is None else permitted_cpus
+    )
+    declared_cpus = None
+    if len(tokens) >= 2 and tokens[-2] == "--cpuset-cpus":
+        declared_cpus, tokens = tokens[-1], tokens[:-2]
+    cpus = allocated_cpus(declared_cpus, permitted)
     groups = []
     if tokens[:1] == ["--group-add"]:
         require(
@@ -98,7 +131,12 @@ def allocation(text, inspect_path=os.stat):
         set(groups) <= {node["gid"] for node in result},
         "declared group not observed on allocated devices",
     )
-    return result
+    return {
+        "nodes": result,
+        "declared_cpu_set": declared_cpus,
+        "permitted_cpu_affinity": sorted(permitted),
+        "cpu_affinity": cpus,
+    }
 
 
 def captured_allocation(path, output):
@@ -121,9 +159,16 @@ def captured_allocation(path, output):
         report["phase"] = "tokenize"
         report["tokens"] = shlex.split(text)
         save(output, report)
+        report["phase"] = "observe_cpu"
+        report["permitted_cpu_affinity"] = sorted(os.sched_getaffinity(0))
+        save(output, report)
         report["phase"] = "parse"
-        result = allocation(text)
-        report["observed_device_groups"] = sorted({node["gid"] for node in result})
+        result = allocation(text, permitted_cpus=report["permitted_cpu_affinity"])
+        report["observed_device_groups"] = sorted(
+            {node["gid"] for node in result["nodes"]}
+        )
+        report["declared_cpu_set"] = result["declared_cpu_set"]
+        report["cpu_affinity"] = result["cpu_affinity"]
         report["phase"] = "accepted"
         return result
     except (OSError, ValueError) as error:
@@ -184,9 +229,10 @@ def prepare(work):
     subprocess.run(
         ["git", "apply", str(work / "input/B-validation.patch")], cwd=source, check=True
     )
-    nodes = captured_allocation(
+    allocated = captured_allocation(
         Path("/etc/podinfo/gha-render-devices"), work / "output/allocation-input.json"
     )
+    nodes = allocated["nodes"]
     for node in nodes[1:]:
         device = Path("/sys/class/drm") / Path(node["path"]).name / "device"
         node["pci"] = device.resolve(strict=True).name
@@ -214,7 +260,9 @@ def prepare(work):
                     "RUNNER_NAME",
                 )
             },
-            "cpu_affinity": sorted(os.sched_getaffinity(0)),
+            "cpu_affinity": allocated["cpu_affinity"],
+            "permitted_cpu_affinity": allocated["permitted_cpu_affinity"],
+            "declared_cpu_set": allocated["declared_cpu_set"],
         },
     )
 
@@ -357,6 +405,15 @@ def verify_admission(root):
         "container identity differs",
     )
     host = info["HostConfig"]
+    cpus = set(admission["allocation"]["cpu_affinity"])
+    require(
+        cpus and cpus <= set(admission["allocation"]["permitted_cpu_affinity"]),
+        "CPU admission exceeds observed permission",
+    )
+    require(
+        parse_cpulist(host["CpusetCpus"]) == cpus and os.sched_getaffinity(0) == cpus,
+        "container CPU affinity differs",
+    )
     require(
         host["CapDrop"] == ["ALL"]
         and not host["CapAdd"]
@@ -568,6 +625,7 @@ def container(kind, work):
         "--read-only",
         "--user",
         owner,
+        "--cpuset-cpus=" + ",".join(str(cpu) for cpu in allocated["cpu_affinity"]),
         "--ipc=private",
         "--network",
         "bridge" if kind == "dataset" else "none",
@@ -609,9 +667,6 @@ def container(kind, work):
             for gid in sorted({d["gid"] for d in allocated["nodes"]})
         ]
     if kind == "model":
-        flags += [
-            "--cpuset-cpus=" + ",".join(str(cpu) for cpu in allocated["cpu_affinity"])
-        ]
         for source, target in [
             (work / "source", "source"),
             (work / "input", "input"),
