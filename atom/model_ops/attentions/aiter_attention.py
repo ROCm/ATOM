@@ -1407,8 +1407,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 early_mrope = self._build_mrope_decode_positions(
                     batch, context_lens, max_seqlen_q, running_tokens=running_tokens
                 )
-            early_meta_fix(
-                early,
+            fix_args = dict(
                 context_lens=var["context_lens"].gpu,
                 positions=None if use_mrope else var["positions"].gpu,
                 slot_mapping=var["slot_mapping"].gpu,
@@ -1427,13 +1426,27 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 block_size=self.model_runner.block_size,
                 indptr_block=self.block_size,
             )
-        kv_indices_generate_triton(
-            ctx["block_tables"],
-            ctx["kv_indices"],
-            ctx["kv_indptr"],
-            self.block_ratio,
-            max_seqlen_k,
-        )
+            if early.fused:
+                # ATOM_HOSTNEXT_FUSED_PROLOGUE: launched with the GDN part at
+                # the end of the build, kv_indices right after it.
+                early.attn = fix_args
+                early.kv = (
+                    ctx["block_tables"],
+                    ctx["kv_indices"],
+                    ctx["kv_indptr"],
+                    self.block_ratio,
+                    max_seqlen_k,
+                )
+            else:
+                early_meta_fix(early, **fix_args)
+        if early is None or not early.fused:
+            kv_indices_generate_triton(
+                ctx["block_tables"],
+                ctx["kv_indices"],
+                ctx["kv_indptr"],
+                self.block_ratio,
+                max_seqlen_k,
+            )
         attn_metadata = AttentionMetaData(
             dropout_p=dropout_p,
             max_seqlen_q=max_seqlen_q,

@@ -9,7 +9,12 @@ with a CLUSTER tile of 16 x 256 (one head) over num_ctas CTAs along N, each CTA 
 piece with the bf16 kernel's own K pipeline (BLOCK_K tiles of 16x16x32 WMMAs, so every output element accumulates in
 the same order: bitwise the same y). After the C tile is TDM-stored, the cluster barrier makes the head visible to
 all of its CTAs and fold B's epilogue (`fold_qkv_qknorm._fold_epilogue`, the native row kernel's arithmetic) runs on
-it. Gate tiles do nothing more. No cross-cluster communication."""
+it. Gate tiles do nothing more. No cross-cluster communication.
+
+Also (env-gated, default off) the A8K4V4PT cache (ATOM_FOLD_QKNORM_QKV_BF16_FP4PT=1: fp4pt V, e2m1 + one fp32 scale per
+token and KV head, fold B's `_fold_v_fp4pt`; the native pair's row kernel is fused_qk_norm_mrope_cache_k4v4pt) and
+decode batches up to 48 rows (ATOM_FOLD_QKNORM_QKV_BF16_MAX_M, default 16: the drafter's pass 0 is 4 rows a sequence,
+20-48 rows at bs 5-12) with fold B's 48-row tiling: one M tile of 32 x 256 (8 CTAs) / 64 x 256 (4 CTAs, 8 warps)."""
 
 import functools
 import os
@@ -22,7 +27,7 @@ from triton.experimental.gluon import language as gl
 from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp8 import cga_bases
 from atom.model_ops.fold_qkv_qknorm import (
     _epi_layouts,
-    _fold_epilogue,
+    _fold_epilogue_rows,
     _fold_pre,
 )
 
@@ -44,6 +49,9 @@ def _gemm_bf16_qkv_qknorm_kernel(
     row_layout: gl.constexpr, rope_layout: gl.constexpr, kl: gl.constexpr, kd: gl.constexpr,
     ks: gl.constexpr, kl64: gl.constexpr, kd64: gl.constexpr, ks64: gl.constexpr,
     FOLD: gl.constexpr = True,
+    V_FP4PT: gl.constexpr = False,
+    KLDS: gl.constexpr = False,
+    KWORD: gl.constexpr = False,
 ):
     gl.static_assert(BLOCK_SIZE_N == 256)
     pid = gl.program_id(axis=0)
@@ -126,20 +134,42 @@ def _gemm_bf16_qkv_qknorm_kernel(
         if tile_n >= GATE_TILES:
             if num_ctas > 1:
                 gl.amd.gfx1250.cluster.arrive()
-            _fold_epilogue(c_ptr, stride_cm, M, tile_m, tile_n - GATE_TILES, w_e, wlo_e, whi_e, cos_e, sin_e, slot_e,
-                           q_weight_ptr, k_weight_ptr, positions_ptr, stride_positions, cos_ptr, sin_ptr, stride_cos,
-                           q_out_ptr, k_out_ptr, slot_mapping_ptr, num_slots, k_cache_ptr, v_cache_ptr, kv_inv_scale,
-                           BLOCK_SIZE_M, num_ctas, EPS, Q_HEADS, K_HEADS, SECTION_H, SECTION_W, BLOCK_SIZE,
-                           FP8_MAX, SCALE_PRESHUFFLE, row_layout, rope_layout, kl, kd, ks, kl64, kd64, ks64)
+            # fold B's epilogue on the tile's rows (several rows a wave from 33 rows: register repeats); V_FP4PT:
+            # the A8K4V4PT V page (e2m1 + one fp32 scale per token and KV head) instead of the fp8 one
+            _fold_epilogue_rows(c_ptr, stride_cm, M, tile_m * BLOCK_SIZE_M, tile_n - GATE_TILES,
+                                w_e, wlo_e, whi_e, cos_e, sin_e, slot_e,
+                                q_weight_ptr, k_weight_ptr, positions_ptr, stride_positions, cos_ptr, sin_ptr,
+                                stride_cos, q_out_ptr, k_out_ptr, slot_mapping_ptr, num_slots, k_cache_ptr,
+                                v_cache_ptr, kv_inv_scale, BLOCK_SIZE_M, num_ctas, EPS, Q_HEADS, K_HEADS,
+                                SECTION_H, SECTION_W, BLOCK_SIZE, FP8_MAX, SCALE_PRESHUFFLE,
+                                row_layout, rope_layout, kl, kd, ks, kl64, kd64, ks64, num_ctas > 1, V_FP4PT,
+                                KLDS, KWORD)
 
 
 # Cluster tile 16 x 256 (one head); the per-CTA tile is 16 x (256 / num_ctas), BLOCK_K and the WMMA shape those of
 # aiter's tuned bf16 decode configs (16 x 32 / 16 x 64, BLOCK_K 256, 16x16x32 WMMA): the same K order per element.
+# M 17-48 (the drafter's pass 0 at bs 5-12: 4 rows a sequence; graph buckets 5-8, 12 -> 20-32, 48 rows) as fold B's
+# 48-row extension: one M tile (the weights read once; two 32-row tiles: +3 us), 32 x 256 over 8 CTAs (32 x 32 each,
+# 4 warps: one row a wave in the epilogue) up to 32 rows, 64 x 256 over 8 CTAs (64 x 32 each, 4 warps: 2 rows a wave
+# held in registers, K's RoPE groups after one LDS conversion) up to 48, with native's BLOCK_K 128 / 6 buffers there
+# (task2 sweeps, gfx1250, 10 layers a graph, fp4pt: 64 x 256 over 4 CTAs 8 warps (fold B's) +1.5 us of GEMM,
+# BLOCK_K 256 / 3-4 buffers, 7-8 buffers (LDS: 1 CTA a WGP), 8 warps, KLDS off: all slower). KWORD: dword K stores.
 FOLD_CONFIGS = {
 # (measured, gfx1250, 10 layers a graph: 4 buffers best at M 1-16; 3 / 5 / 8 buffers, 4 / 16 CTAs and 4 warps slower)
     16: dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=256, BLOCK_SIZE_K=256, num_warps=2, NUM_BUFFERS=4, num_ctas=8),
+    32: dict(BLOCK_SIZE_M=32, BLOCK_SIZE_N=256, BLOCK_SIZE_K=256, num_warps=4, NUM_BUFFERS=4, num_ctas=8, KWORD=True),
+    48: dict(BLOCK_SIZE_M=64, BLOCK_SIZE_N=256, BLOCK_SIZE_K=128, num_warps=4, NUM_BUFFERS=6, num_ctas=8, KLDS=True,
+             KWORD=True),
 }
-FOLD_MAX_M = int(os.environ.get("ATOM_FOLD_QKNORM_QKV_BF16_MAX_M", "16"))
+if os.environ.get("ATOM_FOLD_QKNORM_QKV_BF16_CFG"):
+    # tuning: {"<bucket>": {config overrides}}
+    for _b, _c in __import__("json").loads(os.environ["ATOM_FOLD_QKNORM_QKV_BF16_CFG"]).items():
+        FOLD_CONFIGS.setdefault(int(_b), dict(FOLD_CONFIGS[48])).update(_c)
+KERNEL_MAX_M = 48
+# ATOM_FOLD_QKNORM_QKV_BF16_MAX_M: the largest decode batch (rows) folded (default 16, up to KERNEL_MAX_M = 48)
+FOLD_MAX_M = max(1, min(KERNEL_MAX_M, int(os.environ.get("ATOM_FOLD_QKNORM_QKV_BF16_MAX_M", "16"))))
+# ATOM_FOLD_QKNORM_QKV_BF16_FP4PT=1: also fold for an A8K4V4PT cache (--kv_cache_dtype fp8_k4v4pt: fp4pt V)
+FOLD_FP4PT = os.environ.get("ATOM_FOLD_QKNORM_QKV_BF16_FP4PT", "0") == "1"
 
 
 def fold_config(M):
@@ -181,11 +211,12 @@ def fused_gemm_bf16_qkv_qknorm_mrope_cache(
     k_cache, v_cache, slot_mapping, kv_scale, num_q_heads, num_kv_heads, y=None, config=None, fold=True,
 ):
     """y = x @ w^T (bf16 [M, N], N = (2 Hq + 2 Hk) * 256: gate | q | k | v), bitwise aiter's gemm_a16w16 at decode
-    sizes, plus what fused_qk_norm_mrope_cache(q, k, v, ..., kv_scale) does for an A8K4V8 cache: returns
-    (y, q_out fp8 [M, Hq*256], k_out bf16 [M, Hk*256]) and writes K (NVFP4) / V (fp8) into the cache."""
+    sizes, plus what fused_qk_norm_mrope_cache(q, k, v, ..., kv_scale) does for an A8K4V8 cache (v_cache fp8 5-D) or
+    fused_qk_norm_mrope_cache_k4v4pt for an A8K4V4PT one (v_cache [blocks, Hk, 128, 132] fp4pt, 4-D): returns
+    (y, q_out fp8 [M, Hq*256], k_out bf16 [M, Hk*256]) and writes K (NVFP4) / V (fp8 | fp4pt) into the cache."""
     M, K = x.shape
     N = w.shape[0]
-    assert M <= FOLD_MAX_M and N == (2 * num_q_heads + 2 * num_kv_heads) * 256
+    assert M <= KERNEL_MAX_M and N == (2 * num_q_heads + 2 * num_kv_heads) * 256
     assert x.stride(1) == 1 and w.stride(1) == 1
     cfg = fold_config(M)
     if config:
@@ -193,7 +224,17 @@ def fused_gemm_bf16_qkv_qknorm_mrope_cache(
     assert K % cfg["BLOCK_SIZE_K"] == 0
     if y is None:
         y = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
-    q_out = torch.empty((M, num_q_heads * 256), dtype=v_cache.dtype, device=x.device)
+    v_fp4pt = v_cache.dim() == 4
+    if v_fp4pt:
+        from atom.model_ops.fold_qkv_qknorm import _fp8_e4m3
+
+        q_dtype = _fp8_e4m3()
+        vc = v_cache.view(torch.uint8)
+        assert vc.shape == (k_cache.shape[0], num_kv_heads, 128, 256 // 2 + 4) and vc.is_contiguous()
+    else:
+        q_dtype = v_cache.dtype
+        vc = v_cache
+    q_out = torch.empty((M, num_q_heads * 256), dtype=q_dtype, device=x.device)
     k_out = torch.empty((M, num_kv_heads * 256), dtype=torch.bfloat16, device=x.device)
     cfg["NUM_BUFFERS"] = min(cfg["NUM_BUFFERS"], K // cfg["BLOCK_SIZE_K"])
     layouts = _layouts(cfg["num_warps"], cfg["BLOCK_SIZE_M"], cfg["BLOCK_SIZE_N"], cfg["BLOCK_SIZE_K"],
@@ -207,10 +248,10 @@ def fused_gemm_bf16_qkv_qknorm_mrope_cache(
     _gemm_bf16_qkv_qknorm_kernel[grid](
         x, w, y, M, N, K, x.stride(0), w.stride(0), y.stride(0),
         q_weight, k_weight, positions, positions.stride(0), cos, sin, cos.stride(0),
-        q_out, k_out, slot_mapping, slot_mapping.shape[0], k_cache, v_cache, 1.0 / kv_scale,
+        q_out, k_out, slot_mapping, slot_mapping.shape[0], k_cache, vc, 1.0 / kv_scale,
         EPS=eps, Q_HEADS=num_q_heads, K_HEADS=num_kv_heads, SECTION_H=mrope_section[1], SECTION_W=mrope_section[2],
-        BLOCK_SIZE=page_block, FP8_MAX=torch.finfo(v_cache.dtype).max, SCALE_PRESHUFFLE=min(128, page_block),
-        FOLD=fold, **cfg, **layouts,
+        BLOCK_SIZE=page_block, FP8_MAX=torch.finfo(q_dtype).max, SCALE_PRESHUFFLE=min(128, page_block),
+        FOLD=fold, V_FP4PT=v_fp4pt, **cfg, **layouts,
     )
     return y, q_out, k_out
 
@@ -220,8 +261,9 @@ ENABLED = os.environ.get("ATOM_FOLD_QKNORM_QKV_BF16", "0") == "1"
 
 
 def try_fold_qkv_bf16(attn, positions, hidden_states):
-    """The bf16 qkv_proj (unquantized: the MTP drafter's) with the Q/K norm, MRoPE and the A8K4V8 cache write in its
-    epilogue, for a decode batch of at most FOLD_MAX_M rows; leaves the fp8 Q / bf16 K for the attention's rope_cache
+    """The bf16 qkv_proj (unquantized: the MTP drafter's) with the Q/K norm, MRoPE and the A8K4V8 (or, with
+    ATOM_FOLD_QKNORM_QKV_BF16_FP4PT, A8K4V4PT) cache write in its epilogue, for a decode batch of at most FOLD_MAX_M
+    (ATOM_FOLD_QKNORM_QKV_BF16_MAX_M) rows; leaves the fp8 Q / bf16 K for the attention's rope_cache
     (impl._fold_pending, as fold_qkv_qknorm.try_fold_qkv). None where it does not apply."""
     if not ENABLED or torch.compiler.is_compiling():
         return None
@@ -241,7 +283,7 @@ def try_fold_qkv_bf16(attn, positions, hidden_states):
         or getattr(layer, "tp_size", 1) != 1
         or impl is None
         or not getattr(impl, "k4v8", False)
-        or getattr(impl, "k4v4pt", False)
+        or (getattr(impl, "k4v4pt", False) and not FOLD_FP4PT)
         or not attn.fuse_qk_norm_rope_cache
         or not attn.attn_output_gate
         or attn.rotary_emb is None
@@ -262,7 +304,13 @@ def try_fold_qkv_bf16(attn, positions, hidden_states):
         return None
     kvd = fc.kv_cache_data[f"layer_{impl.layer_num}"]
     k_cache, v_cache = kvd.k_cache, kvd.v_cache
-    if not (k_cache.dtype == torch.uint8 and k_cache.dim() == 4 and v_cache.dim() == 5 and k_cache.shape[2] == 128):
+    if not (k_cache.dtype == torch.uint8 and k_cache.dim() == 4 and k_cache.shape[2] == 128):
+        return None
+    if getattr(impl, "k4v4pt", False):
+        if not (v_cache.dim() == 4 and v_cache.dtype == torch.float4_e2m1fn_x2 and v_cache.is_contiguous()
+                and v_cache.shape[2] == 128 and v_cache.view(torch.uint8).shape[3] == 256 // 2 + 4):
+            return None
+    elif v_cache.dim() != 5:
         return None
     rot = attn.rotary_emb
     half = rot.rotary_dim // 2

@@ -135,6 +135,9 @@ logger = logging.getLogger("atom")
 # the rejections applied on the device (`attentions.early_meta`); the status is
 # then taken after the verify launch.
 _EARLY_META = os.environ.get("ATOM_HOSTNEXT_EARLY_META", "0") == "1"
+# ATOM_HOSTNEXT_FUSED_PROLOGUE=1 (with EARLY_META): the early fix and the GDN
+# pre-verify kernels as one launch at the end of the build (`early_meta`).
+_FUSED_PROLOGUE = _EARLY_META and os.environ.get("ATOM_HOSTNEXT_FUSED_PROLOGUE", "0") == "1"
 
 support_model_arch_dict = {
     "Qwen3ForCausalLM": "atom.models.qwen3.Qwen3ForCausalLM",
@@ -652,6 +655,7 @@ class tokenIDProcessor:
                 prev_bonus=bonus_gpu,
                 prev_rejected=rejected_gpu,
                 bs=batch.total_seqs_num,
+                fused=_FUSED_PROLOGUE,
             )
         self.early_fix = early
         if early is not None:
