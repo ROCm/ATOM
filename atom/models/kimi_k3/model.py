@@ -8,6 +8,8 @@ weights live under ``language_model.*`` in the checkpoint, so this module keeps
 the same object hierarchy and skips the vision tower/projector tensors.
 """
 
+import logging
+from functools import lru_cache
 from typing import ClassVar
 
 import torch
@@ -77,6 +79,20 @@ from atom.utils import envs, mark_spliting_op
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
 from atom.utils.region_graph import eager_region, token_graph
+
+
+@lru_cache(maxsize=32)
+def _log_kda_wave_fallback(tp_size, num_seqs, num_heads, num_cus):
+    # Deduplicate the same geometry across layers and repeated steps.
+    logging.getLogger("atom").info(
+        "Fused KDA uses split fallback: one-wave guard "
+        "(tp=%d, padded_requests=%d, local_heads=%d, programs=%d, CUs=%d).",
+        tp_size,
+        num_seqs,
+        num_heads,
+        num_seqs * num_heads,
+        num_cus,
+    )
 
 
 def _text_config(config):
@@ -1343,8 +1359,9 @@ class KimiKDAAttention(nn.Module):
         # Otherwise the plain contiguous copy runs and f_b_proj quantizes (or
         # not) exactly as before.
         f_a_view = fused_in[..., 4 * lp + nlh : 4 * lp + nlh + hd]
-        # Occupancy is one program per CU: use the captured bucket's request
-        # count, including padding, so replay never changes the selected path.
+        # One program serves each sequence/head; the one-wave guard is an
+        # admission policy, not a kernel legality constraint. Use the padded
+        # request bucket so replay never changes the selected path.
         num_seqs = 0
         if kda_metadata.num_prefills == 0 and getattr(kda_metadata, "replayssm", False):
             num_seqs = kda_metadata.num_decodes or kda_metadata.num_spec_decodes
@@ -1367,8 +1384,14 @@ class KimiKDAAttention(nn.Module):
             and conv_state.shape[-1] >= 2 + kda_metadata.replayssm_max_query_len
             and cache.replay_buf_k.shape[2] >= 2 * kda_metadata.replayssm_max_query_len
             and get_gfx_runtime() == "gfx950"
-            and 0 < num_seqs * nlh <= get_cu_num()
+            and 0 < num_seqs * nlh
         )
+        if fused:
+            num_cus = get_cu_num()
+            if num_seqs * nlh > num_cus:
+                if self.tp_rank == 0:
+                    _log_kda_wave_fallback(self.tp_size, num_seqs, nlh, num_cus)
+                fused = False
         if fused:
             gate = None
         elif self.fuse_f_a_quant:

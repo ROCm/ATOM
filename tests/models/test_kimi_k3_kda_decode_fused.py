@@ -285,6 +285,36 @@ def test_unsupported_steps_execute_existing_path(modules, monkeypatch, reason):
     torch.testing.assert_close(out, torch.full_like(out, 3))
 
 
+@pytest.mark.parametrize("rank,enabled", [(0, True), (1, True), (0, False)])
+def test_wave_fallback_logs_geometry_once(modules, monkeypatch, caplog, rank, enabled):
+    c = layer_case(modules, monkeypatch, verify=True)
+    c.attn.tp_size, c.attn.tp_rank = 2, rank
+    monkeypatch.setattr(modules.kimi, "get_cu_num", lambda: 5)
+    monkeypatch.setenv("ATOM_KIMI_K3_KDA_FUSED_DECODE", "1" if enabled else "0")
+    report = modules.kimi._log_kda_wave_fallback
+    report.cache_clear()
+    try:
+        with caplog.at_level("INFO", logger="atom"):
+            for _ in range(2):
+                out = c.attn._forward_impl(c.hidden)
+        assert not c.calls.fused and len(c.calls.split) == 2
+        torch.testing.assert_close(out, torch.full_like(out, 3))
+        messages = [
+            r.getMessage() for r in caplog.records if "one-wave guard" in r.getMessage()
+        ]
+        if rank == 0 and enabled:
+            assert messages == [
+                (
+                    "Fused KDA uses split fallback: one-wave guard "
+                    "(tp=2, padded_requests=3, local_heads=2, programs=6, CUs=5)."
+                )
+            ]
+        else:
+            assert not messages
+    finally:
+        report.cache_clear()
+
+
 @pytest.mark.parametrize("prefill", [False, True])
 def test_prefill_and_empty_steps_keep_existing_behavior(modules, monkeypatch, prefill):
     c = layer_case(modules, monkeypatch)
