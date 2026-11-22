@@ -185,6 +185,20 @@ def test_reuse_follows_the_cache_budget_and_its_switch(monkeypatch, env, kept):
         assert reused == [0, 256, len(a1) // 16 if kept == "a1" else 256]
 
 
+def test_an_extension_too_large_to_store_keeps_the_prompt_it_extends(monkeypatch):
+    # One 124K-token prompt fits in 1 MB; its 300K-token extension does not.
+    monkeypatch.setenv("ATOM_TOKENIZE_CACHE_MB", "1")
+    rng = np.random.default_rng(3)
+    a1 = tokens(rng, 124_000)
+    proc, reused = processor(16), []
+    for prompt in (a1, a1 + tokens(rng, 176_000), a1):
+        before = served(proc)["blocks_reused"]
+        [seq] = proc.preprocess_fanout(prompt, SamplingParams())
+        assert list(seq.prompt_hash_chain.hashes) == full_chain(prompt, 16)
+        reused.append(served(proc)["blocks_reused"] - before)
+    assert reused == [0, len(a1) // 16, len(a1) // 16]
+
+
 def test_a_mismatch_in_the_first_uses_check_turns_reuse_off(monkeypatch, caplog):
     real = pb.extend_block_hashes
 

@@ -217,13 +217,14 @@ class TokenPrefixChains:
     def _store(self, raw: bytes, chain, replaces) -> None:
         """Keep `raw` and its chain, in place of `replaces`, a record whose every
         block it reused (lock held)."""
+        record = _TokenRecord(raw, chain, self._next_id)
+        if not self._lru.fits(record.payload_bytes):
+            return  # it would not be kept, so `replaces` stays
         if replaces is not None and self._lru.pop(replaces.rid) is not None:
             self._unlist(replaces.rid, replaces)
-        record = _TokenRecord(raw, chain, self._next_id)
         self._next_id += 1
         self._lru.put(record.rid, record, record.payload_bytes)
-        if record.rid in self._lru:  # not larger than the whole budget
-            insort(self._order, record, key=_TOKENS)
+        insort(self._order, record, key=_TOKENS)
 
     def _unlist(self, _rid, record) -> None:
         """Drop `record` from the bytes order (lock held; also ByteLRU's eviction
