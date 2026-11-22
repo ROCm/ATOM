@@ -189,10 +189,15 @@ def test_kernel_contiguous_and_expanded_rope(kernel_on_cpu):
 
 def test_supported_gate(monkeypatch):
     monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
+    arch = {"gfx1250": True}
+    monkeypatch.setattr(kcat, "_kernel_arch", lambda index: arch["gfx1250"])
     tokens = kcat._PREFILL_K_CAT_MIN_TOKEN_HEADS // 16
     k_nope, _, k_rope = _inputs(tokens, 16)
     ok = kcat._prefill_k_cat_supported
     assert ok(k_nope, k_rope)
+    arch["gfx1250"] = False
+    assert not ok(k_nope, k_rope)
+    arch["gfx1250"] = True
     # The gate counts token-heads: fewer tokens, or fewer heads, decline.
     assert not ok(k_nope[:-1], k_rope[:-1])
     assert not ok(k_nope[:, :8], k_rope)
@@ -211,12 +216,40 @@ def test_supported_gate(monkeypatch):
     assert not ok(k_nope, k_rope.transpose(0, 2).contiguous().transpose(0, 2))
 
 
-def test_fallback_two_copies_equal_cat():
+def test_fallback_is_torch_cat(monkeypatch):
     k_nope, _, k_rope = _inputs(5, 16)
     assert not kcat._prefill_k_cat_supported(k_nope, k_rope)
-    _assert_same(kcat.cat_prefill_k(k_nope, k_rope), _ref(k_nope, k_rope))
     wide = k_rope.expand(-1, 16, -1)
-    _assert_same(kcat.cat_prefill_k(k_nope, wide), _ref(k_nope, wide))
+    refs = [_ref(k_nope, k_rope), _ref(k_nope, wide)]
+    calls = []
+    real_cat = torch.cat
+    monkeypatch.setattr(
+        kcat.torch, "cat", lambda *a, **k: calls.append(1) or real_cat(*a, **k)
+    )
+    outs = [kcat.cat_prefill_k(k_nope, k_rope), kcat.cat_prefill_k(k_nope, wide)]
+    monkeypatch.undo()
+    assert len(calls) == 2
+    for out, ref in zip(outs, refs):
+        _assert_same(out, ref)
+
+
+def test_vllm_plugin_k_sites_call_cat_prefill_k():
+    """The plugin is not imported on the CPU job, so check its source: every
+    MLA prefill K is built by `cat_prefill_k`, none by `torch.cat` of the
+    expanded rope."""
+    tree = ast.parse(
+        (ROOT / "atom/plugin/vllm/attention/layer_mla.py").read_text(encoding="utf-8")
+    )
+    k_sites, rope_cats = 0, []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = ast.unparse(node.func)
+        if name == "cat_prefill_k":
+            k_sites += 1
+        elif name == "torch.cat" and ".expand(" in ast.unparse(node):
+            rope_cats.append(ast.unparse(node))
+    assert k_sites == 4 and not rope_cats, (k_sites, rope_cats)
 
 
 class _KvB:
@@ -294,6 +327,10 @@ def test_forward_prefill_mha_hands_attention_the_cat(monkeypatch, force_kernel):
         return torch.ones(tokens, heads, 128, dtype=torch.bfloat16)
 
     monkeypatch.setattr(mla, "flash_attn_varlen_func", attend)
+    built = []
+    monkeypatch.setattr(
+        mla, "cat_prefill_k", lambda *a: built.append(1) or kcat.cat_prefill_k(*a)
+    )
     cu = torch.tensor([0, 4, 5, tokens], dtype=torch.int32)
     meta = SimpleNamespace(
         cu_seqlens_q=cu,
@@ -305,6 +342,7 @@ def test_forward_prefill_mha_hands_attention_the_cat(monkeypatch, force_kernel):
     )
     out = mla.MLAAttention._forward_prefill_mha(impl, q, None, rope2d, None, meta)
     assert out.shape == (tokens, heads * 128)
+    assert built == [1]  # K comes from cat_prefill_k, not a torch.cat of its own
     k_nope, v = kv.view(tokens, heads, 256).split([128, 128], dim=-1)
     _assert_same(seen["k"], _ref(k_nope, rope2d.unsqueeze(1)))
     assert seen["v"].data_ptr() == v.data_ptr() and seen["v"].stride() == v.stride()

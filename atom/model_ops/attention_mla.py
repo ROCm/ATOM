@@ -1109,9 +1109,11 @@ class MLAAttention(nn.Module):
         a short-prompt smoke test happens to reach leaves the others to fail
         later, under chunked prefill, as a head-dim error.
 
-        The slice is deliberately NOT made contiguous. It leaves
-        ``stride(-2) == qk_nope_head_dim + pad`` against ``size(-1) ==
-        qk_nope_head_dim``, and all five flash-attention sites take it as is.
+        The slice is deliberately NOT made contiguous. On q and on the gathered
+        workspace K it leaves ``stride(-2) == qk_nope_head_dim + pad`` against
+        ``size(-1) == qk_nope_head_dim``, and flash-attention takes it as is.
+        K from kv_b_proj is already the split view (row pitch
+        ``qk_nope_head_dim + v_head_dim``, like V), and the slice is a no-op on it.
         Measured on gfx950 rather than assumed: against a ``.contiguous()``
         copy of the same slice the output is bit-identical (max abs diff 0.0),
         so the kernel takes its row pitch from the stride and not from
@@ -1169,9 +1171,9 @@ class MLAAttention(nn.Module):
     def _prepare_prefill_k(self, k_nope, k_rope):
         """Keep K split for FP8 quantization; materialize it for BF16 attention.
 
-        A zero rope pad is sliced off before flash-attention (`_drop_rope_pad`),
-        so K is ``k_nope`` itself: the strided view is what `_drop_rope_pad`
-        hands flash-attention anyway, which takes the row pitch from the stride.
+        With a zero rope pad, K is the kv_b_proj split view itself (row pitch
+        ``qk_nope_head_dim + v_head_dim``, like V); `_drop_rope_pad` is then a
+        no-op on it.
         """
         if self._flydsl_fp8_mha_ok:
             return k_nope, None if self.rope_is_zero_pad else k_rope
