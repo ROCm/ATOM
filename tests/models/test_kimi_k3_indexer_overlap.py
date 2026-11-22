@@ -124,7 +124,11 @@ def test_capture_tbo_and_a_streamless_indexer_keep_the_serial_order(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA streams")
 def test_packed_prefill_keeps_its_per_pass_gathers_in_the_scorer(dcp_prefill):
-    calls, md = dcp_prefill(torch.cuda.Stream(), passes=(object(), object()))
+    passes = (
+        SimpleNamespace(row_base=0, stride=2, world=2),
+        SimpleNamespace(row_base=4, stride=2, world=2),
+    )
+    calls, md = dcp_prefill(torch.cuda.Stream(), passes=passes)
     main = torch.cuda.current_stream()
     assert calls == [("score", main, True), ("filter", main)]
     assert md.index_exchange_done is None
