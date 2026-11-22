@@ -19,12 +19,13 @@ from pathlib import Path
 
 from atomesh.numa_exec import parse_cpulist
 from k31_phase0_assets import measured_hash
-from k31_phase0_inputs import digest, require, verify
+from k31_phase0_inputs import checked_files, digest, require, verify
 
 CONTROL = Path(__file__).resolve().parents[2]
 POLICY = CONTROL / ".github/validation/k31-b-accuracy.json"
 EVIDENCE = Path("/app/atom-3577/evidence/B-accuracy")
 NATIVE_SOURCE = Path("/app/aiter-test/aiter/jit")
+OPUS_SOURCE = Path("/job/native-source/native/module_fmha_fwd_bf16_opus.so")
 CACHE_ENV = {
     "HOME": "/root",
     "TMPDIR": "/tmp",
@@ -228,7 +229,46 @@ def captured_allocation(path, output):
 
 def prepare(work):
     policy = read(POLICY)
-    native_pins()  # Refuse an unqualified required module before allocation or pull.
+    wanted = native_pins()  # Refuse before allocation, pull or native input reads.
+    native = work / "native-source"
+    external = policy["bf16_opus_input"]
+    require(
+        re.fullmatch("[0-9a-f]{40}", external["ref"])
+        and native.resolve() == work.resolve() / "native-source"
+        and (native / "native").resolve() == native.resolve() / "native",
+        "native input ref or containment differs",
+    )
+    git = ["git", "-C", str(native)]
+    head = command(git + ["rev-parse", "HEAD"])
+    auth = command(
+        git
+        + [
+            "config",
+            "--local",
+            "--name-only",
+            "--get-regexp",
+            r"extraheader|credential|include|pushurl|insteadof",
+        ]
+    )
+    origin = command(git + ["remote", "get-url", "origin"])
+    require(
+        head["returncode"] == 0
+        and head["stdout"].strip() == external["ref"]
+        and auth["returncode"] == 1
+        and origin["returncode"] == 0
+        and origin["stdout"].strip()
+        in {"https://github.com/ROCm/ATOM", "https://github.com/ROCm/ATOM.git"},
+        "native checkout identity or credential cleanup differs",
+    )
+    require(external["sha256"] == wanted[OPUS_SOURCE.name], "native input pin differs")
+    payload = checked_files(
+        native / "native", {"files": {OPUS_SOURCE.name: external["sha256"]}}
+    )
+    require(
+        len(payload[OPUS_SOURCE.name]) == external["bytes"], "native input size differs"
+    )
+    (native / "native" / OPUS_SOURCE.name).chmod(0o444)
+    (native / "native").chmod(0o555)
     verify(
         work / "inputs/seed",
         CONTROL / ".github/validation/k31-phase0.json",
@@ -260,6 +300,12 @@ def prepare(work):
         "prior_phase0": {
             "path": "/job/phase0/receipt.json",
             "sha256": policy["phase0_receipt"],
+        },
+        "native_input": {
+            "path": str(OPUS_SOURCE),
+            "sha256": external["sha256"],
+            "bytes": external["bytes"],
+            "source_ref": external["ref"],
         },
     }
     save(work / "input/preuse-bindings.json", bindings)
@@ -600,6 +646,17 @@ def native_view(create=False):
         "native source differs",
     )
     source = sorted(NATIVE_SOURCE.glob("*.so"))
+    external = policy["bf16_opus_input"]
+    require(OPUS_SOURCE.name not in {p.name for p in source}, "duplicate Opus source")
+    require(
+        OPUS_SOURCE.is_file()
+        and OPUS_SOURCE.resolve() == OPUS_SOURCE
+        and OPUS_SOURCE.stat().st_size == external["bytes"]
+        and external["sha256"] == wanted[OPUS_SOURCE.name]
+        and os.statvfs(OPUS_SOURCE).f_flag & os.ST_RDONLY,
+        "external Opus source differs or is writable",
+    )
+    source.append(OPUS_SOURCE)
     require(set(wanted) <= {p.name for p in source}, "required native module missing")
     modules = {}
     for path in source:
@@ -607,7 +664,7 @@ def native_view(create=False):
             re.fullmatch(r"[A-Za-z0-9_]+\.so", path.name) and path.resolve() == path,
             "ambiguous native source path",
         )
-        modules[path.name] = measured_hash(path)
+        modules[path.name] = {"source": str(path), **measured_hash(path)}
     require(
         all(modules[name]["sha256"] == value for name, value in wanted.items()),
         "required native hash differs",
@@ -700,7 +757,7 @@ def native_loads():
         require(
             Path(module.__file__).samefile(path)
             and selected == path
-            and selected.samefile(NATIVE_SOURCE / name),
+            and selected.samefile(snapshot["modules"][name]["source"]),
             "native loader selected a different module",
         )
         ctypes.CDLL(str(selected))

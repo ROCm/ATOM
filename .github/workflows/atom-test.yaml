@@ -179,6 +179,12 @@ jobs:
           ref: 8e354a56986bb6342139b657bb9e45e460171385
           path: k31-b-${{ github.run_id }}-${{ github.run_attempt }}/source
           persist-credentials: false
+      - uses: actions/checkout@v6
+        with:
+          ref: 609ddbaee1136bb9183a0b9e6db0d0d3ebd02444
+          path: k31-b-${{ github.run_id }}-${{ github.run_attempt }}/native-source
+          sparse-checkout: native
+          persist-credentials: false
       - uses: actions/download-artifact@v8
         with:
           artifact-ids: '14696677294'

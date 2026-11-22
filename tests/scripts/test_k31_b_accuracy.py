@@ -944,6 +944,93 @@ def test_unqualified_bf16_opus_blocks_before_preparation(tmp_path, monkeypatch):
     assert not list(tmp_path.iterdir())
 
 
+@pytest.mark.parametrize(
+    "problem",
+    [None, "ref", "hash", "size", "extra", "link", "escape", "auth", "origin"],
+)
+def test_external_native_preparation_stops_before_phase0(
+    tmp_path, monkeypatch, problem
+):
+    native = tmp_path / "native-source/native"
+    native.mkdir(parents=True)
+    module = native / ci.OPUS_SOURCE.name
+    module.write_bytes(b"inert native-input fixture")
+    digest = ci.checksum(module)
+    policy = ci.read(ci.POLICY)
+    policy["bf16_opus_input"].update(sha256=digest, bytes=module.stat().st_size)
+    if problem == "hash":
+        module.write_bytes(b"changed native-input fixture")
+    elif problem == "size":
+        policy["bf16_opus_input"]["bytes"] += 1
+    elif problem == "extra":
+        (native / "extra.so").write_bytes(b"not allowed")
+    elif problem == "link":
+        is_link = Path.is_symlink
+        monkeypatch.setattr(Path, "is_symlink", lambda p: p == module or is_link(p))
+    elif problem == "escape":
+        resolve = Path.resolve
+        monkeypatch.setattr(
+            Path,
+            "resolve",
+            lambda p, *a, **kw: (
+                tmp_path / "outside" if p == native else resolve(p, *a, **kw)
+            ),
+        )
+    policy_file = tmp_path / "policy.json"
+    write(policy_file, policy)
+    monkeypatch.setattr(ci, "POLICY", policy_file)
+    monkeypatch.setattr(ci, "native_pins", lambda: {ci.OPUS_SOURCE.name: digest})
+
+    def git(argv):
+        if "--get-regexp" in argv:
+            return {"returncode": 0 if problem == "auth" else 1, "stdout": ""}
+        if "get-url" in argv:
+            return {
+                "returncode": 0,
+                "stdout": (
+                    "unexpected-origin"
+                    if problem == "origin"
+                    else "https://github.com/ROCm/ATOM"
+                ),
+            }
+        return {
+            "returncode": 0,
+            "stdout": (
+                "0" * 40 if problem == "ref" else policy["bf16_opus_input"]["ref"]
+            ),
+        }
+
+    reached = []
+
+    def phase0(*args):
+        reached.append(True)
+        raise ValueError("fixture Phase0 boundary")
+
+    monkeypatch.setattr(ci, "command", git)
+    monkeypatch.setattr(ci, "verify", phase0)
+    with pytest.raises(ValueError):
+        ci.prepare(tmp_path)
+    assert bool(reached) is (problem is None)
+    if problem is None:
+        assert not module.stat().st_mode & 0o222
+    module.chmod(0o644)
+    native.chmod(0o755)
+
+
+def test_native_checkout_is_fixed_and_keeps_credentials_out():
+    workflow = yaml.safe_load((ROOT / ".github/workflows/atom-test.yaml").read_text())
+    step = next(
+        s
+        for s in workflow["jobs"]["k31-b-accuracy"]["steps"]
+        if s.get("with", {}).get("path", "").endswith("/native-source")
+    )
+    assert step["uses"] == "actions/checkout@v6"
+    assert step["with"]["ref"] == ci.read(ci.POLICY)["bf16_opus_input"]["ref"]
+    assert len(step["with"]["ref"]) == 40
+    assert step["with"]["persist-credentials"] is False
+    assert step["with"]["sparse-checkout"] == "native"
+
+
 @pytest.fixture
 def native_fixture(runtime_cache, monkeypatch):
     root, env = runtime_cache
@@ -963,10 +1050,23 @@ def native_fixture(runtime_cache, monkeypatch):
             "native_files"
         ]
     ]
-    names.append("module_fmha_fwd_bf16_opus.so")
     for name in names + ["optional_module.so"]:
         (source / name).write_bytes(name.encode())
     pins = {name: ci.checksum(source / name) for name in names}
+    external = root / ci.OPUS_SOURCE.name
+    external.write_bytes(external.name.encode())
+    pins[external.name] = ci.checksum(external)
+    policy = ci.read(ci.POLICY)
+    policy["bf16_opus_input"].update(
+        sha256=pins[external.name], bytes=external.stat().st_size
+    )
+    write(root / "policy.json", policy)
+    monkeypatch.setattr(ci, "POLICY", root / "policy.json")
+    monkeypatch.setattr(ci, "OPUS_SOURCE", external)
+    monkeypatch.setattr(ci.os, "ST_RDONLY", 1, raising=False)
+    monkeypatch.setattr(
+        ci.os, "statvfs", lambda p: SimpleNamespace(f_flag=1), raising=False
+    )
     (source / "flydsl_cache").mkdir()
     (source / "flydsl_cache/denied.pkl").write_bytes(b"generated cache")
     view = Path(env["AITER_JIT_DIR"])
@@ -1013,7 +1113,7 @@ def native_fixture(runtime_cache, monkeypatch):
 
 
 def test_native_view_created_once_then_only_verified(native_fixture, monkeypatch):
-    root, source, view, pins, _ = native_fixture
+    root, _source, view, pins, _ = native_fixture
     first = ci.native_view(create=True)
     receipt = (root / "native-view.json").read_bytes()
     assert set(first["modules"]) == set(pins) | {"optional_module.so"}
@@ -1025,33 +1125,44 @@ def test_native_view_created_once_then_only_verified(native_fixture, monkeypatch
     )
     assert ci.native_view() == first
     assert (root / "native-view.json").read_bytes() == receipt
-    assert all((view / name).samefile(source / name) for name in first["modules"])
+    assert all(
+        (view / name).samefile(row["source"]) for name, row in first["modules"].items()
+    )
     assert (
         not view.stat().st_mode & 0o222 and not (view / "build").stat().st_mode & 0o222
     )
 
 
-@pytest.mark.parametrize("problem", ["missing", "hash", "unreadable", "source"])
+@pytest.mark.parametrize(
+    "problem",
+    ["missing", "hash", "unreadable", "source", "duplicate", "writable", "size"],
+)
 def test_native_inputs_refuse_without_fallback(native_fixture, monkeypatch, problem):
     root, source, view, pins, _ = native_fixture
     name = "module_fmha_fwd_bf16_opus.so"
     if problem == "missing":
-        (source / name).unlink()
+        ci.OPUS_SOURCE.unlink()
     elif problem == "hash":
         pins[name] = "0" * 64
     elif problem == "unreadable":
         real_open = Path.open
 
         def denied(path, *args, **kwargs):
-            if path == source / name:
+            if path == ci.OPUS_SOURCE:
                 raise PermissionError("required module unreadable")
             return real_open(path, *args, **kwargs)
 
         monkeypatch.setattr(Path, "open", denied)
-    else:
+    elif problem == "source":
         monkeypatch.setattr(
             ci, "command", lambda argv: {"returncode": 1, "stdout": "wrong"}
         )
+    elif problem == "duplicate":
+        (source / name).write_bytes(b"duplicate")
+    elif problem == "writable":
+        monkeypatch.setattr(ci.os, "statvfs", lambda p: SimpleNamespace(f_flag=0))
+    else:
+        ci.OPUS_SOURCE.write_bytes(b"wrong size")
     with pytest.raises((ValueError, PermissionError)):
         ci.native_view(create=True)
     assert not view.exists() and not (root / "native-view.json").exists()
