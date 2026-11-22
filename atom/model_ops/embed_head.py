@@ -235,6 +235,17 @@ def empty_token_ids(hidden: torch.Tensor) -> torch.Tensor:
     return torch.empty(hidden.shape[0], dtype=torch.int32, device=hidden.device)
 
 
+def dp_shards_vocab(tp_size: int, num_embeddings: int) -> bool:
+    """A DP-sharded `ATOM_DP_LM_HEAD_MODE` is on, the head is pure DP (TP 1),
+    and the vocab splits evenly over a DP group of more than one rank."""
+    if envs.ATOM_DP_LM_HEAD_MODE not in ("allgather", "all2all", "argmax"):
+        return False
+    if tp_size != 1:
+        return False
+    world = get_dp_group().world_size
+    return world > 1 and num_embeddings % world == 0
+
+
 class ParallelLMHead(VocabParallelEmbedding):
 
     def __init__(
@@ -252,6 +263,10 @@ class ParallelLMHead(VocabParallelEmbedding):
             self.bias.weight_loader = self.weight_loader
         else:
             self.register_parameter("bias", None)
+        # Static, read on every forward (`_can_use_dp_sharded_head`).
+        self.dp_shards_vocab = not is_plugin_mode() and dp_shards_vocab(
+            self.tp_size, self.num_embeddings
+        )
 
     def forward(self, x: torch.Tensor):
         if not is_plugin_mode():
@@ -368,8 +383,8 @@ class ParallelLMHead(VocabParallelEmbedding):
         return group.device_communicator.all_gather(shard, -1)
 
     # ------------------------------------------------------------------
-    # Pure-DP sharded LM head (config ② all-gather / ③ all-to-all).
-    #
+    # Pure-DP sharded LM head (config ② all-gather / ③ all-to-all, or greedy ids
+    # under ATOM_DP_LM_HEAD_MODE=argmax).    #
     # Precondition (checked by `_can_use_dp_sharded_head`): the model TP group is size 1
     # (pure DP) and the DP group is size > 1. The lm_head weight is currently
     # replicated on every DP rank, so each rank slices out its own vocab shard
@@ -377,17 +392,6 @@ class ParallelLMHead(VocabParallelEmbedding):
     # change needed for this prototype (the full weight still costs VRAM; a real
     # rollout should shard it at load time).
     # ------------------------------------------------------------------
-    def dp_shards_vocab(self) -> bool:
-        """Static: a sharded mode is on, pure DP, and the vocab splits evenly
-        over a >1 DP group."""
-        dp_group = get_dp_group()
-        return (
-            envs.ATOM_DP_LM_HEAD_MODE in ("allgather", "all2all", "argmax")
-            and self.tp_size == 1
-            and dp_group.world_size > 1
-            and self.num_embeddings % dp_group.world_size == 0
-        )
-
     def _can_use_dp_sharded_head(self, context) -> bool:
         """Whether this step may run the DP-sharded LM head (pure-DP decode only).
 
@@ -400,7 +404,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         question: a prefilling peer drives it False on every rank, so no rank
         can answer True here while another answers False.
         """
-        if not self.dp_shards_vocab():
+        if not self.dp_shards_vocab:
             return False
         # Per-step: all ranks at one height. `is_draft` is its own question,
         # not shorthand for the flag below -- a drafter states uniformity per

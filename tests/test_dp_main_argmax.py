@@ -1,6 +1,6 @@
 """CPU checks for the DP greedy argmax head, with external kernels stubbed.
 
-The real head exchange and runner methods run without AITER or a GPU. The
+The real head exchange runs without AITER or a GPU. The
 exchange's pack boundary uses a CPU reference; test_lm_head_argmax.py covers
 the actual Triton kernel separately. Startup and request admission are in
 test_dp_main_argmax_init.py, the sampler bypass in
@@ -13,14 +13,13 @@ import pytest
 import torch
 from aiter_stub import atom_without_aiter
 
-mr = eh = None  # bound against the CPU stand-ins by `_modules`
+eh = None  # bound against the CPU stand-ins by `_modules`
 
 
 @pytest.fixture(scope="module", autouse=True)
 def _modules():
-    global mr, eh
+    global eh
     with atom_without_aiter() as load:
-        mr = load("atom.model_engine.model_runner")
         eh = load("atom.model_ops.embed_head")
         yield
 
@@ -163,6 +162,7 @@ def test_forward_takes_the_modes_exchange(monkeypatch, mode, ctx, dp_meta, expec
     torch.nn.Module.__init__(head)
     head.tp_size, head.num_embeddings = 1, DP * VSHARD
     head.weight, head.bias = None, None
+    head.dp_shards_vocab = eh.dp_shards_vocab(head.tp_size, head.num_embeddings)
     calls = []
     ids = torch.tensor([5.0, 7.0])
 

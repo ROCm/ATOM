@@ -170,23 +170,6 @@ class SamplingParams:
         if self.n < 1:
             raise ValueError("n must be >= 1")
 
-    def validate_greedy_head(self):
-        """Under `ATOM_DP_LM_HEAD_MODE=argmax` the decode head returns greedy
-        ids only: reject a request that needs anything else."""
-        from atom.utils import envs
-
-        if envs.ATOM_DP_LM_HEAD_MODE == "argmax" and (
-            self.temperature != 0
-            or self.logprobs
-            or self.json_schema is not None
-            or self.structured_tool_format is not None
-            or self.required_channel is not None
-        ):
-            raise ValueError(
-                "ATOM_DP_LM_HEAD_MODE=argmax serves greedy requests only: "
-                "temperature 0, no logprobs, structured output or required tool"
-            )
-
     def validate_logprob_options(
         self, config, *, kv_transfer=None, multimodal=False, synthetic=False
     ):

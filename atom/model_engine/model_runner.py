@@ -15,7 +15,7 @@ from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from functools import partial, wraps
-from typing import Any, ClassVar, NamedTuple
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 import numpy as np
 import torch
@@ -163,6 +163,28 @@ from atom.utils.tbo import (
 from atom.utils.tbo.ubatch_wrapper import UBatchWrapper
 
 logger = logging.getLogger("atom")
+
+if TYPE_CHECKING:
+    from atom.model_ops.embed_head import ParallelLMHead
+
+
+class GreedyIdsOrSample:
+    """The sampler under `ATOM_DP_LM_HEAD_MODE=argmax`: a decode head output
+    is fp32 greedy ids, cast to int32 (a fresh tensor, out of a replay's graph
+    pool, which the next replay overwrites); logits (a prefill, or a step the
+    head does not shard) go to the sampler. Bound once at startup, so other
+    modes call the sampler directly."""
+
+    def __init__(self, sampler):
+        self.sampler = sampler
+
+    def __call__(self, logits: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        if logits.dim() == 1:
+            return logits.to(torch.int32)
+        return self.sampler(logits, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self.sampler, name)
 
 
 def max_schedulable_decode_bs(
@@ -807,7 +829,7 @@ class ModelRunner:
     compute_head: Callable | None = None
     # The LM head whose decode output is greedy ids
     # (`ATOM_DP_LM_HEAD_MODE=argmax`), else None.
-    dp_argmax_head = None
+    dp_argmax_head: "ParallelLMHead | None" = None
     spec_status_deferred = False
 
     def __init__(self, rank: int, config: Config):
@@ -1075,7 +1097,7 @@ class ModelRunner:
             self.compute_head is not None
             or self.config.speculative_config
             or len(heads) != 1
-            or not heads[0].dp_shards_vocab()
+            or not heads[0].dp_shards_vocab
         ):
             raise ValueError(
                 "ATOM_DP_LM_HEAD_MODE=argmax needs pure DP (TP 1, DP > 1, the "
@@ -1083,6 +1105,7 @@ class ModelRunner:
                 "model's head output, and no speculative decoding"
             )
         self.dp_argmax_head = heads[0]
+        self.sampler = GreedyIdsOrSample(self.sampler)
 
     def poll_forward_metrics(self):
         if self.gpu_forward_metrics is not None:
@@ -3352,8 +3375,9 @@ class ModelRunner:
         [requests, num_spec_steps + 1] and verdict [3, requests] -- accepted,
         rejected, anchor row -- as the rejection sampler lays them out, for
         the forward's requests each verifying the full draft span); else,
-        with `logits`, the logits. A decode graph's capture records it
-        (`capture_cudagraph`), the logits at TP 1."""
+        with `logits`, the logits, or under `ATOM_DP_LM_HEAD_MODE=argmax` a
+        sharded decode's greedy ids (fp32 [rows]). A decode graph's capture
+        records it (`capture_cudagraph`), the logits or ids at TP 1."""
         head = None if self.compute_head is None else self.compute_head(hidden_states)
         if head is None and logits:
             head = self.model.compute_logits(hidden_states)
@@ -3362,7 +3386,8 @@ class ModelRunner:
     def _step_head(self, head, hidden_states: torch.Tensor, batch):
         """This step's head output from the forward's (`head`: `_head_output`'s
         or a replay's, None for none recorded): a verify's ids and verdict
-        where they stand for the step (`_head_ids_serve`), else the logits."""
+        where they stand for the step (`_head_ids_serve`), else the logits (or
+        `ATOM_DP_LM_HEAD_MODE=argmax`'s greedy ids)."""
         if isinstance(head, tuple) and self._head_ids_serve(head, batch):
             return head
         if head is None or isinstance(head, tuple):
@@ -3441,7 +3466,8 @@ class ModelRunner:
     def postprocess(
         self,
         batch: ScheduledBatch,
-        # The step's head output (`_step_head`): logits, or ids and verdict.
+        # The step's head output (`_step_head`): logits, greedy ids under
+        # `ATOM_DP_LM_HEAD_MODE=argmax` (`GreedyIdsOrSample`), or ids and verdict.
         logits: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         temperatures: torch.Tensor,
         top_ks: int | torch.Tensor | None,
@@ -3475,20 +3501,14 @@ class ModelRunner:
             # after either and the pad rows divide `[running_bs, V]` by
             # `[scheduled_bs, 1]`.
             logits = logits[:bs]
-            if logits.dim() == 1 and self.dp_argmax_head is not None:
-                # The head's greedy ids (`ATOM_DP_LM_HEAD_MODE=argmax`), fp32.
-                # The cast copies them out of a replay's graph pool, which the
-                # next replay overwrites.
-                sampled_tokens = logits.to(torch.int32)
-            else:
-                sampled_tokens = self.sampler(
-                    logits,
-                    temperatures,
-                    top_ks,
-                    top_ps,
-                    all_greedy,
-                    needs_independent_noise=needs_independent_noise,
-                )
+            sampled_tokens = self.sampler(
+                logits,
+                temperatures,
+                top_ks,
+                top_ps,
+                all_greedy,
+                needs_independent_noise=needs_independent_noise,
+            )
             # Prefill has zero bonus/rejection counts, in the same contiguous
             # layout as verification. Slice before reshaping to avoid row gaps.
             spec_counts = self.tokenID_processor.zero_spec_counts[: 2 * bs].view(2, bs)
