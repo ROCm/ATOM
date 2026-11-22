@@ -212,6 +212,15 @@ pub(super) fn media_refused() -> Response {
     )
 }
 
+/// ATOM gRPC workers return no logprobs yet; /v1/completions keeps its null, as
+/// ATOM's HTTP route answers it.
+pub(super) fn logprobs_refused() -> Response {
+    error::bad_request(
+        "unsupported_logprobs",
+        "ATOM gRPC workers return no logprobs",
+    )
+}
+
 impl std::fmt::Debug for GrpcRouter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let stats = self.worker_registry.stats();
@@ -233,10 +242,13 @@ impl RouterTrait for GrpcRouter {
         body: &GenerateRequest,
         model_id: Option<&str>,
     ) -> Response {
-        if atom_serves(&self.worker_registry, model_id)
-            && ParsedInference::generate_carries_media(body)
-        {
-            return media_refused();
+        if atom_serves(&self.worker_registry, model_id) {
+            if ParsedInference::generate_carries_media(body) {
+                return media_refused();
+            }
+            if body.return_logprob == Some(true) {
+                return logprobs_refused();
+            }
         }
         self.route_generate_impl(headers, body, model_id).await
     }
@@ -247,9 +259,13 @@ impl RouterTrait for GrpcRouter {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        if atom_serves(&self.worker_registry, model_id) && ParsedInference::chat_carries_media(body)
-        {
-            return media_refused();
+        if atom_serves(&self.worker_registry, model_id) {
+            if ParsedInference::chat_carries_media(body) {
+                return media_refused();
+            }
+            if body.logprobs {
+                return logprobs_refused(); // top_logprobs needs logprobs
+            }
         }
         self.route_chat_impl(headers, body, model_id).await
     }
