@@ -20,7 +20,7 @@ class V4WorkflowTest(unittest.TestCase):
     def setUpClass(cls):
         cls.script = workflow_step(load_workflow(), "matrix")
 
-    def matrix(self, event="schedule", schedule="10 16 * * *", **overrides):
+    def matrix(self, event="push", schedule="", **overrides):
         env = {
             "GITHUB_EVENT_NAME": event,
             "EVENT_SCHEDULE": schedule,

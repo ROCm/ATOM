@@ -26,7 +26,10 @@ from atom.model_engine.page_unit_checkpoint import (
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_mla import MLAModules
-from atom.model_ops.attentions.pool_layout.paged_state_copy import DescriptorStaging
+from atom.model_ops.attentions.pool_layout.paged_state_copy import (
+    DescriptorStaging,
+    launch_copy_descriptor,
+)
 from atom.model_ops.attentions.pool_layout.pool_rows import PoolRowsMixin
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import SubPoolSpec
 from atom.model_ops.attentions.sparse_mla_head_groups import PERSISTENT_WORK_BUFFERS
@@ -35,6 +38,7 @@ from atom.model_ops.attentions.token_layout.batch_ids import (
     build_cu_seqlens,
     build_query_layout,
 )
+from atom.model_ops.attentions.token_layout.decode import mrope_decode_positions
 from atom.model_ops.attentions.token_layout.prefill import (
     PrefillBatch,
     prefill_positions,
@@ -453,14 +457,27 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         return staging
 
     def warmup_per_req_cache(self) -> None:
-        """Pay whatever the first checkpoint copy would pay, before serving.
+        """Warm checkpoint planning, staging and copying without changing bytes.
 
-        Called once by ModelRunner after `allocate_per_req_cache`'s pools are
-        installed, which is the earliest a backend can reach its own addresses.
-        Nothing else warms this path: `execute_paged_state_copies` runs only
-        from `build()`, so a backend that compiles a kernel or fills a cache
-        there does it inside a live request's batch. A no-op by default.
+        ModelRunner calls this after installing the per-request pools. Each
+        planned span copies onto itself, preserving both pages and initialized
+        state even when eager startup has no later capture reset.
         """
+        spec = self.model_runner.state_runtime.checkpoint_spec
+        if spec is None:
+            return
+        plan = self._checkpoint_copy_plan()
+        if not plan.num_spans:
+            return
+        staging = self._checkpoint_staging()
+        rows = staging.rows(0)[: plan.num_spans]
+        destinations = np.zeros(
+            (1, len(self._page_unit_stream_sizes(spec.units_per_checkpoint))),
+            dtype=np.int64,
+        )
+        plan.write_descriptor(rows, self._checkpoint_slot_bases()[:1], destinations)
+        rows[:, 1] = rows[:, 0]
+        launch_copy_descriptor(staging.upload(0, plan.num_spans), plan)
 
     def get_kv_transfer_tensors(self) -> "KVTransferTensors | None":
         """Return RDMA transfer regions for PD disaggregation.
@@ -1114,19 +1131,13 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         width = scheduled_tokens if running_tokens is None else running_tokens
         positions = self._mrope_cpu_view(width)
         positions[:, scheduled_tokens:] = 0
-        lengths = batch.num_scheduled_tokens[: len(context_lens)]
-        offset = 0
-        for req_id, context_len, length in zip(batch.req_ids, context_lens, lengths):
-            start = int(context_len) - int(length)
-            stop = int(context_len)
-            delta = batch.mrope_position_deltas.get(req_id)
-            if delta is None:
-                base = np.arange(start, stop, dtype=np.int64)
-            else:
-                base = np.arange(start + int(delta), stop + int(delta), dtype=np.int64)
-            positions[:, offset : offset + int(length)] = base[None, :]
-            offset += int(length)
-
+        mrope_decode_positions(
+            batch.req_ids,
+            context_lens,
+            batch.num_scheduled_tokens[: len(context_lens)],
+            batch.mrope_position_deltas,
+            positions,
+        )
         return self._stage_mrope(width, group)
 
     @h2d_producer("early", runner="model_runner")

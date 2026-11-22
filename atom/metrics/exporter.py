@@ -19,6 +19,8 @@ from prometheus_client import CollectorRegistry, generate_latest
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 from prometheus_client.exposition import CONTENT_TYPE_LATEST
 
+from atom.model_engine.dp_routing.share_cache import ShareCacheRouter
+
 Snapshot = dict[str, Any]
 SnapshotState = tuple[Snapshot, int, float]
 
@@ -122,6 +124,16 @@ class _AtomMetricsCollector:
                 "Fraction of KV-cache blocks currently allocated.",
                 snapshot.get("kv_cache_usage_ratio", 0),
             ),
+            (
+                "atom:requests_deferred_free",
+                "Finished or aborted requests held whole until every connector releases them: a P/D decode pull, a whole-request offload save, or a load still writing into their blocks. Early-release offload leases are excluded.",
+                snapshot.get("requests_deferred_free", 0),
+            ),
+            (
+                "atom:kv_cache_blocks_deferred_free",
+                "Physical KV blocks of finished or aborted requests held whole until every connector releases them: a P/D decode pull, a whole-request offload save, or a load still writing into their blocks. Early-release offload leases are excluded. Shared prefix blocks are counted once.",
+                snapshot.get("kv_blocks_deferred_free", 0),
+            ),
         )
         for name, documentation, value in gauges:
             metric = GaugeMetricFamily(name, documentation)
@@ -155,6 +167,11 @@ class _AtomMetricsCollector:
             yield metric
 
         dp_router = snapshot.get("dp_router", {})
+        for key, documentation in ShareCacheRouter.DECISIONS.items():
+            name = "atom:dp_" + key.removesuffix("_total")
+            metric = CounterMetricFamily(name, documentation)
+            metric.add_metric([], float(dp_router.get(key, 0)))
+            yield metric
         for name, documentation, value in (
             (
                 "atom:dp_affinity_new",

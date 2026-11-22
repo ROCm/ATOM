@@ -77,8 +77,9 @@ listing it; accepting an unknown JSON field does not establish rank-routing supp
   source "$HOME/.cargo/env"
   ```
 
-- **Protocol Buffers compiler (`protoc`)**, only when enabling the optional
-  `ext-proc` Cargo feature, for the vendored Envoy protocol bindings:
+- **Protocol Buffers compiler (`protoc`)**, for every build: the `smg-grpc-client`
+  dependency's build script runs it (this crate's own protos, including the optional
+  `ext-proc` Envoy bindings, are compiled in-process by protox):
   ```bash
   sudo apt-get install protobuf-compiler
   ```
@@ -94,7 +95,7 @@ cargo build
 # Release build (optimized)
 cargo build --release
 
-# Release build with optional Envoy ext-proc support (requires protoc)
+# Release build with optional Envoy ext-proc support
 cargo build --release --features ext-proc
 ```
 
@@ -129,8 +130,8 @@ ATOM_MESH_BUILD=1 ATOM_MESH_FEATURES=ext-proc python -m pip install -e .
 
 `ATOM_MESH_FEATURES` accepts Cargo's comma- or space-separated feature list and
 defaults to empty. Both `docker/Dockerfile` and `docker/atom_release.dockerfile`
-accept `--build-arg ATOM_MESH_FEATURES=ext-proc` for the same opt-in; the build
-image must provide `protoc` when enabling it.
+accept `--build-arg ATOM_MESH_FEATURES=ext-proc` for the same opt-in. The build
+image must provide `protoc` either way, for `smg-grpc-client`.
 
 ## Usage
 
@@ -162,12 +163,29 @@ without `mesh-only`, it defaults to ATOM standalone mode.
 ```bash
 ./target/release/atomesh launch \
   --worker-urls http://worker1:8000 http://worker2:8000 \
-  --policy cache_aware
+  --policy cache_aware \
+  --backend atom
 
 USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server mesh-only \
   --worker-urls http://worker1:8000 http://worker2:8000 \
   --policy cache_aware
 ```
+
+ATOM workers need `--backend atom`, in regular mode as in PD mode. Without it
+the router keys an image chat as it would for SGLang: two chats that differ only
+in an image past `prefix_hash`'s token window, or after a long shared text, get
+the same `cache_aware` or `prefix_hash` key, though ATOM keys every KV block of
+a media prompt by all its media and shares no block between them. The binary
+defaults to `--backend sglang`; the Python entrypoint's `mesh-only` passes
+`--backend atom` unless the command line sets `--backend` (or its alias
+`--runtime`) itself, so put `--backend sglang` there to route to SGLang workers.
+
+`--backend atom` also changes how the router discovers an HTTP worker's model:
+it reads `/v1/models` instead of SGLang's `/server_info` and `/model_info`, and
+the model id it returns names the worker's model. For a worker serving under an
+alias (`--served-model-name`) that id is the alias, so the router loads the
+worker's tokenizer from `--tokenizer-path` or `--model-path` when either is
+set, and from the model id only otherwise.
 
 ### Envoy external processing
 
@@ -249,6 +267,7 @@ Supported tool parsers: `json`, `python`, `xml`.
 | `POST` | `/flush_cache` | Flush cache across HTTP workers |
 | `GET` | `/get_loads` | Sample current worker loads |
 | `GET` | `/kv_events/sources` | With `--kv-events`: each followed worker rank's KV event stream and what it carried. A worker not followed, as with the engine's KV events off (`ATOM_KV_EVENTS_ENABLE`) or sources that cannot be read, has no row, as if not registered; the log says why |
+| `GET` | `/kv_storage/sources` | With `--kv-events`: each Mooncake Store the workers report offloading to, its readers, and each pool master's answer, asked meanwhile at `--mooncake-admin-port`: tainted or not |
 
 ## Load balancing
 
@@ -264,8 +283,11 @@ In PD mode, use `--prefill-policy` and `--decode-policy` for per-mode overrides.
 
 `prefix_hash` routes on exact request tokens. Messages and Responses have no
 registered token-routing template, so under `prefix_hash` they return
-`501 token_routing_unsupported`. Use a policy that does not need tokens, such as
-`cache_aware` or `round_robin`, for models served through these APIs.
+`501 token_routing_unsupported`. So do chats for a model whose tokenizer
+llm-tokenizer renders with a built-in encoder chosen from `config.json`, not a
+chat template, such as DeepSeek V3.2 and V4
+([#3377](https://github.com/ROCm/ATOM/issues/3377)). Use a policy that does not
+need tokens, such as `cache_aware` or `round_robin`, for these models and APIs.
 
 ## Reliability
 
@@ -315,7 +337,7 @@ changing worker metric names.
 | Router | `mesh_router_*` | Requests by model/endpoint, latency, errors |
 | Inference | `mesh_router_ttft/tpot/tokens_*` | TTFT, TPOT, token counts (gRPC) |
 | Worker | `mesh_worker_*` | Pool size, connections, health, selection |
-| Routing | `mesh_route_*`, `mesh_session_*` | Policy decisions, session worker changes |
+| Routing | `mesh_route_*`, `mesh_session_*` | Policy decisions, session worker changes, engine-reported cached tokens against the router estimate |
 | Circuit breaker | `mesh_worker_cb_*` | State, transitions, outcomes |
 | Retry | `mesh_worker_retries_*` | Attempts, exhaustion, backoff |
 

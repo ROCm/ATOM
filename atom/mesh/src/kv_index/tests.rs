@@ -13,7 +13,7 @@ use xxhash_rust::xxh3::xxh3_64_with_seed;
 use super::{
     hash,
     index::{HolderTable, Op, PrefixIndex},
-    match_holders, HolderId, Partition, PrefixHash,
+    match_lanes, HolderId, Lane, Partition, PrefixHash,
 };
 use crate::kv_events::{
     model::{DropReason, EngineHash, KvEvent, StoredBlock},
@@ -241,30 +241,46 @@ fn stores_are_idempotent_and_bounded() {
     assert_eq!(held(HolderId(1)), 1);
 }
 
+type Lanes = [Option<Lane>];
+
+fn match_holders(tokens: &[u32], lanes: &Lanes) -> Vec<Option<u32>> {
+    match_lanes(tokens, lanes, &[])
+}
+
+fn match_predicted(tokens: &[u32], lanes: &Lanes) -> Vec<Option<u32>> {
+    match_lanes(tokens, &[], lanes)
+}
+
 async fn settles(
+    matches: fn(&[u32], &Lanes) -> Vec<Option<u32>>,
     tokens: &[u32],
-    lanes: &[Option<(Arc<Partition>, HolderId)>],
+    lanes: &Lanes,
     want: &[Option<u32>],
 ) {
     for _ in 0..200 {
-        if match_holders(tokens, lanes) == want {
+        if matches(tokens, lanes) == want {
             return;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    panic!("{:?}, not {want:?}", match_holders(tokens, lanes));
+    panic!("{:?}, not {want:?}", matches(tokens, lanes));
 }
 
 /// Batches reach the index through the partition's writer, in order, a reset clearing
 /// the rank first. Lanes run out at 64; one given back is free once its blocks are gone.
 #[tokio::test]
 async fn the_writer_applies_batches_and_frees_released_lanes() {
-    let partition = Partition::start(4, &tokio::runtime::Handle::current());
+    let ttl = Duration::from_secs(120);
+    let partition = Partition::start(4, ttl, &tokio::runtime::Handle::current());
     let status = Arc::new(Mutex::new(SourceStatus::default()));
     let mut holders: Vec<_> = (0..64)
         .map(|_| partition.hold(status.clone()).unwrap())
         .collect();
     assert!(partition.hold(status.clone()).is_none());
+    // Predictions take lanes of their own.
+    let predictors: Vec<_> = (0..64).map(|_| partition.predict("w").unwrap()).collect();
+    assert!(partition.predict("w").is_none());
+    drop(predictors);
     let seq: Vec<u32> = (0..10).collect();
     let lanes: Vec<_> = holders[..2].iter().map(|h| Some(h.lane())).collect();
     holders[0]
@@ -273,17 +289,17 @@ async fn the_writer_applies_batches_and_frees_released_lanes() {
     holders[1]
         .write(false, vec![stored(1, &seq, 0..1, 4)])
         .await;
-    settles(&seq, &lanes, &[Some(8), Some(4)]).await;
+    settles(match_holders, &seq, &lanes, &[Some(8), Some(4)]).await;
     assert_eq!(status.lock().indexed_blocks, Some(1));
     holders[0].write(true, vec![stored(0, &seq, 0..1, 4)]).await;
-    settles(&seq, &lanes, &[Some(4), Some(4)]).await;
+    settles(match_holders, &seq, &lanes, &[Some(4), Some(4)]).await;
     let first = KvEvent::Removed {
         hashes: vec![engine_hash(0, &seq[..4])],
     };
     holders[0]
         .write(false, vec![first, stored(0, &seq, 1..2, 4)])
         .await;
-    settles(&seq, &lanes, &[Some(0), Some(4)]).await;
+    settles(match_holders, &seq, &lanes, &[Some(0), Some(4)]).await;
     let dropped = BTreeMap::from([(DropReason::UnknownParent, 1)]);
     assert_eq!(status.lock().dropped_events, dropped);
 
@@ -296,6 +312,83 @@ async fn the_writer_applies_batches_and_frees_released_lanes() {
     };
     assert_eq!(holder.lane().1, HolderId(1));
     assert_eq!(match_holders(&seq, &[Some(holder.lane())]), [Some(0)]);
+}
+
+/// A prediction holds the full blocks of each prompt routed, each until a TTL after its
+/// last routing, apart from the events. A lane given back is free once they are gone.
+#[tokio::test]
+async fn predictions_last_a_ttl_from_their_last_routing() {
+    let ttl = Duration::from_millis(800);
+    let partition = Partition::start(4, ttl, &tokio::runtime::Handle::current());
+    let status = Arc::new(Mutex::new(SourceStatus::default()));
+    let holder = partition.hold(status).unwrap();
+    let predictor = partition.predict("w").unwrap();
+    let lanes = [Some(predictor.lane())];
+    let seq: Vec<u32> = (0..10).collect();
+    predictor.record(&seq[..8]);
+    settles(match_predicted, &seq, &lanes, &[Some(8)]).await;
+    assert_eq!(match_holders(&seq, &[Some(holder.lane())]), [Some(0)]);
+    tokio::time::sleep(ttl * 3 / 4).await;
+    predictor.record(&seq[..7]);
+    // The second block expires a TTL after the first routing, the first after the second.
+    settles(match_predicted, &seq, &lanes, &[Some(4)]).await;
+    settles(match_predicted, &seq, &lanes, &[Some(0)]).await;
+
+    predictor.record(&seq);
+    settles(match_predicted, &seq, &lanes, &[Some(8)]).await;
+    drop(predictor);
+    let predictor = loop {
+        if let Some(predictor) = partition.predict("w") {
+            break predictor;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(match_predicted(&seq, &[Some(predictor.lane())]), [Some(0)]);
+}
+
+/// A worker holds the more of what its rank's events and its predictions hold: the
+/// predictions go on where the events end, and alone stand in for missing events.
+#[tokio::test]
+async fn predictions_go_on_where_the_events_end() {
+    let ttl = Duration::from_secs(120);
+    let partition = Partition::start(4, ttl, &tokio::runtime::Handle::current());
+    let status = Arc::new(Mutex::new(SourceStatus::default()));
+    let seq: Vec<u32> = (0..17).collect();
+    let prefix = hash::prefix_hashes(&seq[..16], 4);
+    // Blocks of the events and of the predictions, by worker; `None` without a lane.
+    let held = [
+        (Some(2), Some(4)),
+        (Some(3), Some(1)),
+        (None, Some(2)),
+        (Some(1), None),
+    ];
+    let holders: Vec<_> = held
+        .iter()
+        .map(|_| partition.hold(status.clone()).unwrap())
+        .collect();
+    let predictors: Vec<_> = held
+        .iter()
+        .map(|_| partition.predict("w").unwrap())
+        .collect();
+    let store = |index: &PrefixIndex, lane: Lane, blocks: usize| {
+        index.apply(
+            lane.1,
+            &mut prefix[..blocks].iter().copied().map(Op::Store).collect(),
+        );
+        lane
+    };
+    let (events, predicted): (Vec<_>, Vec<_>) = held
+        .iter()
+        .zip(holders.iter().zip(&predictors))
+        .map(|(&(on_events, on_predicted), (holder, predictor))| {
+            (
+                on_events.map(|blocks| store(&partition.index, holder.lane(), blocks)),
+                on_predicted.map(|blocks| store(&partition.predicted, predictor.lane(), blocks)),
+            )
+        })
+        .unzip();
+    let want = [Some(16), Some(12), Some(8), Some(4)];
+    assert_eq!(match_lanes(&seq, &events, &predicted), want);
 }
 
 fn resident_bytes() -> u64 {
@@ -426,35 +519,109 @@ fn bench_memory_1m_blocks() {
 }
 
 /// What `cache_aware` asks, hashing the request included: 16 workers, worker k holding
-/// (k+1)/16 of a 100k-token prompt, in one partition with 1M other entries.
+/// (k+1)/16 of a 100k-token prompt, in one partition with 1M other entries. `filled` reads
+/// the sizes, and `KV_BENCH_SAMPLES` (2000) the samples.
 #[tokio::test]
 #[ignore]
 async fn bench_match_workers_16_workers() {
-    let partition = Partition::start(16, &tokio::runtime::Handle::current());
-    let (_, tokens, prefix) = filled(&partition.index);
+    let ttl = Duration::from_secs(120);
+    let partition = Partition::start(16, ttl, &tokio::runtime::Handle::current());
+    let (background, tokens, prefix) = filled(&partition.index);
+    let (workers, count) = (background.len(), size("KV_BENCH_SAMPLES", 2000));
     let status = Arc::new(Mutex::new(SourceStatus::default()));
-    let holders: Vec<_> = (0..16)
+    let holders: Vec<_> = (0..workers)
         .map(|_| partition.hold(status.clone()).unwrap())
         .collect();
     for (k, holder) in holders.iter().enumerate() {
-        let held = &prefix[..prefix.len() * (k + 1) / 16];
+        let held = &prefix[..prefix.len() * (k + 1) / workers];
         partition.index.apply(
             holder.lane().1,
             &mut held.iter().copied().map(Op::Store).collect(),
         );
     }
     let lanes: Vec<_> = holders.iter().map(|holder| Some(holder.lane())).collect();
-    let samples = (0..2000)
+    // Short of the block of the prompt's last token.
+    let all = Some(((tokens.len() - 1) / 16 * 16) as u32);
+    let samples = (0..count)
         .map(|_| {
             let started = Instant::now();
             let hits = match_holders(&tokens, &lanes);
-            assert_eq!(hits[15], Some(100_000));
+            assert_eq!(hits[workers - 1], all);
             started.elapsed()
         })
         .collect();
     println!(
-        "match_workers with hashing, 16 workers: {}",
+        "match_workers with hashing, {workers} workers: {}",
         percentiles(samples)
+    );
+
+    // Every rank's events partial, and each worker predicted to hold its share too.
+    let predictors: Vec<_> = (0..workers)
+        .map(|_| partition.predict("w").unwrap())
+        .collect();
+    for (k, predictor) in predictors.iter().enumerate() {
+        let held = &prefix[..prefix.len() * (k + 1) / workers];
+        partition.predicted.apply(
+            predictor.lane().1,
+            &mut held.iter().copied().map(Op::Store).collect(),
+        );
+    }
+    let predicted: Vec<_> = predictors.iter().map(|p| Some(p.lane())).collect();
+    let samples = (0..count)
+        .map(|_| {
+            let started = Instant::now();
+            let hits = match_lanes(&tokens, &lanes, &predicted);
+            assert_eq!(hits[workers - 1], all);
+            started.elapsed()
+        })
+        .collect();
+    println!(
+        "match_workers with hashing, {workers} partial workers with predictions: {}",
+        percentiles(samples)
+    );
+}
+
+/// One routing of a 100k-token prompt, routed again and again: the request's time, each
+/// once the writer is done with the one before, and the writer's, hashing included, for
+/// routings queued at once. `KV_BENCH_TOKENS` sizes the prompt.
+#[tokio::test]
+#[ignore]
+async fn bench_predict_100k_tokens() {
+    const ROUTINGS: u32 = 32;
+    let ttl = Duration::from_secs(120);
+    let partition = Partition::start(16, ttl, &tokio::runtime::Handle::current());
+    let predictor = partition.predict("w").unwrap();
+    let lanes = [Some(predictor.lane())];
+    let prompt: Vec<u32> = (0..size("KV_BENCH_TOKENS", 100_000) as u32).collect();
+    let mut request = Duration::ZERO;
+    for round in 0..=ROUTINGS {
+        let last: Vec<u32> = (0..17).map(|i| (round << 20) | i).collect();
+        let started = Instant::now();
+        predictor.record(&prompt);
+        // The first only warms the allocator up.
+        if round > 0 {
+            request += started.elapsed();
+        }
+        predictor.record(&last);
+        while match_predicted(&last, &lanes) != [Some(16)] {
+            tokio::task::yield_now().await;
+        }
+    }
+    let last: Vec<u32> = (0..17).rev().collect();
+    let started = Instant::now();
+    for _ in 1..ROUTINGS {
+        predictor.record(&prompt);
+    }
+    predictor.record(&last);
+    let queued = started.elapsed();
+    while match_predicted(&last, &lanes) != [Some(16)] {
+        tokio::task::yield_now().await;
+    }
+    println!(
+        "predict, {} tokens: request {:?}, writer {:?}",
+        prompt.len(),
+        request / ROUTINGS,
+        (started.elapsed() - queued) / ROUTINGS
     );
 }
 
