@@ -1338,7 +1338,9 @@ jobs:
         if: ${{ steps.validation-window.outputs.should_run == 'true' && success() }}
         timeout-minutes: 120
         env:
-          MAX_WAIT_RETRIES: "120"
+          # Cold large-model initialization can exceed an hour. Leave ten
+          # minutes within the step cap for polling overhead and diagnostics.
+          MAX_WAIT_RETRIES: "220"
           WAIT_INTERVAL_SEC: "30"
           STREAM_VLLM_LOGS: "1"
         run: |
