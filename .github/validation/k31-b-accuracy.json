@@ -7,7 +7,7 @@
   "image": "docker.io/rocm/atom-dev@sha256:ea74fa0b05d8c7a062ae235b901cb2b1bc0c169b0a5edd7ca07bfa3b967ca462",
   "config": "sha256:67f3f06c5b90e86eeb6d25ff9075826d4e97c439ecaf7e8d7ecc41ade75b99d6",
   "aiter": "b9e08daca8c45dd758f4fa1fbb7d0da027f399c9",
-  "bf16_opus_sha256": null,
+  "bf16_opus_sha256": "8de672a1e25b9d05807d42643809618a502e589862f63c859ddec3e35805403b",
   "bf16_opus_input": {
     "ref": "609ddbaee1136bb9183a0b9e6db0d0d3ebd02444",
     "bytes": 1216968,

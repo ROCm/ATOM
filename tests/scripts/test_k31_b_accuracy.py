@@ -933,20 +933,36 @@ def test_cache_escape_and_write_denial_refuse(runtime_cache, monkeypatch):
 
 
 def test_unqualified_bf16_opus_blocks_before_preparation(tmp_path, monkeypatch):
-    assert ci.read(ci.POLICY)["bf16_opus_sha256"] is None
+    policy = ci.read(ci.POLICY)
+    policy["bf16_opus_sha256"] = None
+    write(tmp_path / "null-policy.json", policy)
+    monkeypatch.setattr(ci, "POLICY", tmp_path / "null-policy.json")
+    work = tmp_path / "work"
+    work.mkdir()
     monkeypatch.setattr(
         ci, "verify", lambda *a: pytest.fail("unqualified module reached inputs")
     )
     with pytest.raises(
         ValueError, match="no qualified hash: module_fmha_fwd_bf16_opus"
     ):
-        ci.prepare(tmp_path)
-    assert not list(tmp_path.iterdir())
+        ci.prepare(work)
+    assert not list(work.iterdir())
 
 
 @pytest.mark.parametrize(
     "problem",
-    [None, "ref", "hash", "size", "extra", "link", "escape", "auth", "origin"],
+    [
+        None,
+        "ref",
+        "missing_ref",
+        "hash",
+        "size",
+        "extra",
+        "link",
+        "escape",
+        "auth",
+        "origin",
+    ],
 )
 def test_external_native_preparation_stops_before_phase0(
     tmp_path, monkeypatch, problem
@@ -994,7 +1010,7 @@ def test_external_native_preparation_stops_before_phase0(
                 ),
             }
         return {
-            "returncode": 0,
+            "returncode": 128 if problem == "missing_ref" else 0,
             "stdout": (
                 "0" * 40 if problem == "ref" else policy["bf16_opus_input"]["ref"]
             ),
