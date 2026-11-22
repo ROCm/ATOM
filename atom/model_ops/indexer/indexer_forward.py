@@ -5,8 +5,9 @@
 
 It writes the step's index keys, scores its rows (`score_topk`) and hands the
 selection to sparse MLA as KV slots: through the DCP candidate exchange on a
-DCP decode, the owned-slot filter on a DCP prefill, a request-to-global
-conversion otherwise. The `Indexer` module (models/deepseek_v2.py) owns the
+DCP decode, the owned-slot filter on a "q" DCP prefill, rows of the gathered
+KV at the global indptr on a "kv" DCP prefill, a request-to-global conversion
+otherwise. The `Indexer` module (models/deepseek_v2.py) owns the
 projections and calls this op.
 """
 
@@ -347,7 +348,8 @@ def sparse_attn_indexer(
         return
     rows = attn_metadata.index_rows
     # A single-rank prefill's slot conversion subtracts concat rows' request
-    # base itself; decode and the DCP filter read request-local ids.
+    # base itself; decode, the DCP filter and the "kv" index read request-local
+    # ids.
     single_rank_prefill = context.is_prefill and get_dcp_world_size() == 1
     topk_indices = score_topk(
         ((q_quant.unsqueeze(1), q_fp4_scale.unsqueeze(1)) if indexer_fp4 else q_quant),

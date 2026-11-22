@@ -609,10 +609,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self._dcp_sparse_prefill_mode = self._resolve_dcp_sparse_prefill_mode(
             config.kv_cache_dtype
         )
-        self._dcp_sparse_prefill_kv_max_tokens = (
-            envs.ATOM_DCP_SPARSE_PREFILL_KV_MAX_TOKENS
-        )
         self._dcp_sparse_prefill_kv_fallback_warned = False
+        self._warm_dcp_sparse_prefill_kv()
         if self.dcp_world_size > 1 and dcp_persistent:
             self.persistent_num_heads = mla_dcp_kernel_num_heads(
                 self.num_attention_heads,
@@ -2317,6 +2315,20 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         for name, buffer in work.items():
             setattr(attn_metadata, f"sparse_prefill_{name}", buffer)
 
+    def _warm_dcp_sparse_prefill_kv(self):
+        """Compile the "kv" index kernel at init: dummy runs build no plan, so
+        the first live "kv" step would JIT it."""
+        if self._dcp_sparse_prefill_mode == "q":
+            return
+        from atom.model_ops.dcp_ops import warm_dcp_sparse_prefill_kv_index
+
+        warm_dcp_sparse_prefill_kv_index(
+            self.dcp_world_size,
+            self.cp_kv_cache_interleave_size,
+            self.index_topk,
+            self.device,
+        )
+
     def _resolve_dcp_sparse_prefill_mode(self, kv_cache_dtype):
         """ATOM_DCP_SPARSE_PREFILL as this builder can run it. The "kv"
         transport's conditions are `dcp_sparse_prefill_kv_blocker`'s."""
@@ -2335,7 +2347,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             log("DCP sparse prefill: %s takes the q transport (%s)", mode, blocker)
             return "q"
         if mode != "q":
-            dcp_sparse_prefill_kv_max_tokens_env()
+            self._dcp_sparse_prefill_kv_max_tokens = (
+                dcp_sparse_prefill_kv_max_tokens_env()
+            )
         logger.info("DCP sparse prefill transport: %s", mode)
         return mode
 
@@ -2349,7 +2363,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         )
 
         mode = self._dcp_sparse_prefill_mode
-        if mode == "q" or batch.is_dummy_run:
+        if batch.is_dummy_run:
             return None
         plan = dcp_sparse_prefill_kv_plan(
             batch.context_lens,
@@ -2693,13 +2707,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         same contiguous local packing used by the Phase-1 slot_mapping writes.
         """
         from atom.model_ops.dcp_ops import (
+            dcp_padded_local_lens,
             dcp_reorg_row_indices,
             get_dcp_local_seq_lens,
         )
 
         dcp = self.dcp_world_size
         bsz = self.model_runner.block_size
-        vbs = bsz * dcp  # virtual (global) block size
 
         bs = batch.scheduled_bs
         cached_lens = batch.cached_lens.astype(np.int64)
@@ -2719,10 +2733,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         )  # [bs, dcp]
 
         # Number of local blocks per seq is identical on every rank
-        # (= ceil(global_len / vbs)), so the padded local length is uniform and
-        # the AllGather block is uniform across ranks.
-        num_local_blocks = cdiv(cached_lens, vbs)  # [bs]
-        padded_local_len = num_local_blocks * bsz  # [bs]
+        # (= ceil(global_len / (bsz * dcp))), so the padded local length is
+        # uniform and the AllGather block is uniform across ranks.
+        padded_local_len = dcp_padded_local_lens(cached_lens, dcp, bsz)  # [bs]
         max_padded_local = int(padded_local_len.max(initial=0))
 
         # Local per-seq chunk budget (in local tokens), block-aligned so each

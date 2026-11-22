@@ -1369,11 +1369,12 @@ class MLAAttention(nn.Module):
     def _local_q_proj(self):
         """This rank's rows of the QREP-widened q_proj, built on first use.
 
-        Dense prefill (and sparse prefill without ATOM_DCP_PREFILL_QREP) needs
-        only its own heads, and slicing the OUTPUT still pays for the whole
-        group's GEMM -- so it projects through a zero-copy row view of the
-        weight. Decode keeps the full q_proj; that is what lets it skip the
-        AllGather Q. See ``ColumnParallelLinear.make_row_view``.
+        Dense prefill, sparse prefill without ATOM_DCP_PREFILL_QREP and a "kv"
+        sparse prefill step need only their own heads, and slicing the OUTPUT
+        still pays for the whole group's GEMM -- so it projects through a
+        zero-copy row view of the weight. Decode keeps the full q_proj; that
+        is what lets it skip the AllGather Q. See
+        ``ColumnParallelLinear.make_row_view``.
         """
         w = self.q_proj.weight.data
         if self._qrep_local_src is not w:
@@ -3260,7 +3261,8 @@ class MLAAttention(nn.Module):
                 self.qrep_enabled,
                 self.use_seg_mla,
                 context.is_prefill,
-                envs.ATOM_DCP_PREFILL_QREP
+                context.is_prefill
+                and envs.ATOM_DCP_PREFILL_QREP
                 and attn_metadata.dcp_sparse_prefill_kv is None,
             )
             q_nope, q_rope = self._q_proj_and_k_up_proj(

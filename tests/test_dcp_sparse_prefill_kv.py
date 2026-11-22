@@ -166,6 +166,36 @@ def _index(c, plan, world, interleave, topk=None):
     return out
 
 
+def _compiled(kernel):
+    return sum(len(c[0]) for c in kernel.device_caches.values())
+
+
+@gpu
+def test_the_warmup_compiles_what_a_live_kv_step_runs():
+    """A "kv" step launches the index kernel that the builder warmed: its
+    sizes vary per step but key no new compile."""
+    kernel = dcp_ops._dcp_sparse_prefill_kv_index_kernel
+    dcp_ops.warm_dcp_sparse_prefill_kv_index(4, 1, TOPK, torch.device(DEV))
+    warmed = _compiled(kernel)
+    for tokens, reqs, rows_pad, out_rows in [(1, 1, 1, 7), (17, 3, 17, 333)]:
+        topk = torch.randint(
+            0, 1 << 16, (tokens + 8, TOPK), dtype=torch.int32, device=DEV
+        )
+        indptr = torch.zeros(tokens + 1, dtype=torch.int32, device=DEV)
+        indptr[1:] = torch.randint(0, TOPK, (tokens,), device=DEV).cumsum(0)
+        base = torch.arange(reqs + 1, dtype=torch.int32, device=DEV) * rows_pad
+        dcp_ops.triton_dcp_sparse_prefill_kv_index(
+            indptr,
+            torch.randint(0, reqs, (tokens,), dtype=torch.int32, device=DEV),
+            topk[:tokens],
+            dcp_ops.DcpSparsePrefillKV(base[:0], base, rows_pad),
+            4,
+            torch.empty(out_rows + 13, dtype=torch.int32, device=DEV)[:out_rows],
+            NUM_TOPK_TOKENS=TOPK,
+        )
+    assert _compiled(kernel) == warmed
+
+
 @gpu
 @pytest.mark.parametrize(
     "world,page,interleave",
@@ -287,7 +317,23 @@ def test_a_q_step_keeps_its_plan(monkeypatch, nonps, planned):
     assert seen == ["plan"] + planned
 
 
-def _finisher(monkeypatch, mode):
+def test_a_kv_step_plans_into_its_prefix_buffers(monkeypatch):
+    """A TBO ubatch's "kv" step plans into that ubatch's buffers, over the
+    step's own last-page lengths."""
+    b, md, _ = _builder(monkeypatch, object(), True)
+    seen = []
+    b._sparse_prefill_work_views = lambda prefix, heads: seen.append(prefix) or {
+        n: n for n in PERSISTENT_WORK_BUFFERS
+    }
+    monkeypatch.setattr(
+        aiter_mla, "get_mla_metadata_v1", lambda *a, **k: seen.append(a[2])
+    )
+    md.sparse_kv_last_page_lens = object()
+    b._dcp_sparse_prefill_step(None, md, "ub0_")
+    assert seen == ["ub0_", md.sparse_kv_last_page_lens]
+
+
+def _finisher(monkeypatch, mode, prefix=""):
     """`_finish_prefill_batch` at DCP=1 with no cached prefix; records which
     planner it calls and with what heads."""
     seen = []
@@ -300,17 +346,19 @@ def _finisher(monkeypatch, mode):
     b.model_runner = SimpleNamespace(forward_vars={})
     staged = SimpleNamespace(index_rows=SimpleNamespace(passes=None), pcp_split=False)
     staged.total_kv = staged.sparse_counts = None
-    b._sparse_prefill_staged = {"": staged}
+    b._sparse_prefill_staged = {prefix: staged}
     b._sparse_prefill_work_plan = lambda md, prefix, heads, *a, **k: seen.append(
-        ("work_plan", heads)
+        ("work_plan", heads, prefix, a[0])
     )
-    b._dcp_sparse_prefill_step = lambda *a: seen.append("kv_step")
+    b._dcp_sparse_prefill_step = lambda batch, md, prefix: seen.append(
+        ("kv_step", prefix)
+    )
     b._finish_prefill_index_rows = lambda *a: None
     b._prefill_reads_token_csr = lambda md: False
     monkeypatch.setattr(
         aiter_mla.CommonAttentionBuilder, "_finish_prefill_batch", lambda *a: None
     )
-    md = SimpleNamespace(sparse_kv_last_page_lens=None, has_cached=False)
+    md = SimpleNamespace(sparse_kv_last_page_lens=object(), has_cached=False)
     return b, md, seen
 
 
@@ -318,12 +366,16 @@ def _finisher(monkeypatch, mode):
     "mode,want",
     [("q", [("work_plan", 64)]), ("auto", ["kv_step"]), ("kv", ["kv_step"])],
 )
-def test_a_q_builder_skips_the_kv_step(monkeypatch, mode, want):
+@pytest.mark.parametrize("prefix", ["", "ub0_"])
+def test_a_q_builder_skips_the_kv_step(monkeypatch, mode, want, prefix):
     """The default transport (and DCP=1) plans as before the "kv" transport,
-    without its per-step host work."""
-    b, md, seen = _finisher(monkeypatch, mode)
-    b._finish_prefill_batch(SimpleNamespace(scheduled_bs=1), md)
-    assert seen == want
+    without its per-step host work; a TBO ubatch's step keeps its prefix."""
+    b, md, seen = _finisher(monkeypatch, mode, prefix)
+    b._finish_prefill_batch(SimpleNamespace(scheduled_bs=1), md, prefix)
+    last_page = md.sparse_kv_last_page_lens
+    assert seen == [
+        ("kv_step", prefix) if w == "kv_step" else (*w, prefix, last_page) for w in want
+    ]
 
 
 def _work_sizer(mode, local, gathered):
@@ -515,6 +567,19 @@ def test_an_unknown_transport_is_refused(monkeypatch):
         b._resolve_dcp_sparse_prefill_mode("fp8")
 
 
+@pytest.mark.parametrize("mode,warmed", [("auto", True), ("kv", True), ("q", False)])
+def test_a_builder_that_can_take_kv_warms_the_index_kernel(monkeypatch, mode, warmed):
+    calls = []
+    monkeypatch.setattr(
+        dcp_ops, "warm_dcp_sparse_prefill_kv_index", lambda *a: calls.append(a)
+    )
+    b = _resolver(monkeypatch, mode)
+    b._dcp_sparse_prefill_mode = mode
+    b.cp_kv_cache_interleave_size, b.index_topk, b.device = 1, TOPK, "dev"
+    b._warm_dcp_sparse_prefill_kv()
+    assert calls == ([(4, 1, TOPK, "dev")] if warmed else [])
+
+
 @pytest.mark.parametrize("kw", [{"sparse": False}, {"dcp": 1}])
 def test_a_builder_without_a_dcp_sparse_prefill_ignores_the_value(monkeypatch, kw):
     b = _resolver(monkeypatch, "KV", **kw)
@@ -556,7 +621,6 @@ def _batch(context_lens, q_lens, tables=None, dummy=False):
         ("auto", _batch([524288], [64]), False),  # 512K hit + 64: "q" faster
         ("auto", _batch([524288], [16384]), True),  # 512K hit + 16K: "kv" faster
         ("kv", _batch([524288], [64]), True),  # forced
-        ("q", _batch([4096], [4096]), False),
         ("auto", _batch([4096], [4096], dummy=True), False),
         ("kv", _batch([4096], [4096], tables=[]), False),  # padding batch
     ],
@@ -862,7 +926,8 @@ def test_a_negative_kv_cap_is_refused_where_it_is_read(monkeypatch, env, kw, cap
     monkeypatch.setenv("ATOM_DCP_SPARSE_PREFILL_KV_MAX_TOKENS", cap)
     b = _resolver(monkeypatch, env, **kw)
     if ok:
-        b._resolve_dcp_sparse_prefill_mode("fp8")
+        if b._resolve_dcp_sparse_prefill_mode("fp8") != "q":
+            assert b._dcp_sparse_prefill_kv_max_tokens == int(cap)
     else:
         with pytest.raises(ValueError, match=">= 0"):
             b._resolve_dcp_sparse_prefill_mode("fp8")
@@ -1027,3 +1092,53 @@ def test_a_dummy_decode_profiles_no_kv_scratch(monkeypatch):
     a = _dummy_attention(monkeypatch, "auto", "fp8", is_prefill=False, cap=cap)
     kv = dcp_ops.dcp_sparse_prefill_kv_scratch_bytes(5, 16, 16, 512, 64, 1, 4, cap)
     assert _profiled_peak(a, 5) < kv
+
+
+def _held_bytes(monkeypatch, a, num_tokens):
+    """The scratch a dummy forward holds, recorded instead of allocated."""
+    held, real = [], torch.empty
+
+    def empty(*size, dtype=None, **kw):
+        if dtype is torch.uint8:
+            held.append(size[0])
+            size = (0,)
+        return real(*size, dtype=dtype, **kw)
+
+    monkeypatch.setattr(torch, "empty", empty)
+    attention_mla.MLAAttention.forward_impl(
+        a, torch.zeros(num_tokens, 16, 576), None, None
+    )
+    return held
+
+
+@pytest.mark.parametrize("heads", [16, 12])
+@pytest.mark.parametrize(
+    "env,dtype,page,prefill,held",
+    [
+        ("auto", "fp8", "1", True, True),
+        ("kv", "fp8", "1", True, True),
+        ("q", "fp8", "1", True, False),
+        ("auto", "bf16", "1", True, False),
+        ("auto", "fp8", "64", True, False),
+        ("auto", "fp8", "1", False, False),
+    ],
+)
+def test_a_dummy_prefill_holds_the_kv_scratch_of_a_full_batch(
+    monkeypatch, env, dtype, page, prefill, held, heads
+):
+    """A dummy prefill holds, once, what a "kv" step at the batch budget adds
+    for this layer's heads and padded heads; nothing where no step can take
+    "kv". The GPU tests above check the same against the allocator."""
+    cap, budget = 1 << 20, 8192
+    monkeypatch.setenv("ATOM_MLA_PAGE_SIZE", page)
+    a = _dummy_attention(
+        monkeypatch, env, dtype, is_prefill=prefill, cap=cap, batch_tokens=budget
+    )
+    a.num_heads, a.padded_num_heads = heads, 32
+    rows = dcp_ops.dcp_sparse_prefill_kv_profile_rows(
+        env, budget, heads, 256, 16, 4, cap
+    )
+    want = dcp_ops.dcp_sparse_prefill_kv_scratch_bytes(
+        budget, heads, 32, 512, 64, 1, 4, rows
+    )
+    assert _held_bytes(monkeypatch, a, 5) == ([want] if held else [])

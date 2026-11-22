@@ -1974,20 +1974,19 @@ class DcpSparsePrefillKV:
     rows_pad: int
 
 
-def dcp_sparse_prefill_kv_local_rows(
+def dcp_padded_local_lens(
     context_lens, dcp_world_size: int, block_size: int
 ) -> np.ndarray:
-    """Each request's rows on one rank in a "kv" step: its context padded to
-    whole local blocks, the same count on every rank."""
+    """Each request's length on one DCP rank padded to whole local blocks: the
+    same on every rank, since every rank holds ceil(len / (block_size * dcp))
+    blocks of it."""
     context_lens = np.asarray(context_lens, dtype=np.int64)
     return -(-context_lens // (block_size * dcp_world_size)) * block_size
 
 
 def dcp_sparse_prefill_kv_rows(context_lens, dcp_world_size: int, block_size: int):
     """Rows one rank contributes to a "kv" step."""
-    return int(
-        dcp_sparse_prefill_kv_local_rows(context_lens, dcp_world_size, block_size).sum()
-    )
+    return int(dcp_padded_local_lens(context_lens, dcp_world_size, block_size).sum())
 
 
 def dcp_sparse_prefill_kv_plan(
@@ -2013,7 +2012,7 @@ def dcp_sparse_prefill_kv_plan(
         return None
     if context_lens.sum() > max_context:
         return None
-    padded = dcp_sparse_prefill_kv_local_rows(context_lens, dcp_world_size, block_size)
+    padded = dcp_padded_local_lens(context_lens, dcp_world_size, block_size)
     rows_pad = int(padded.sum())
     if rows_pad == 0 or rows_pad * dcp_world_size > max_tokens:
         return None
@@ -2046,7 +2045,7 @@ def dcp_gather_sparse_prefill_kv(
     return dcp_all_gather(cp_group, local, 0).unsqueeze(1)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["rows_pad", "out_numel"])
 def _dcp_sparse_prefill_kv_index_kernel(
     dsa_kv_indptr,  # int32 [num_tokens + 1], GLOBAL per-token candidate counts
     batch_id_per_q_token,  # int32 [num_tokens]
@@ -2125,3 +2124,21 @@ def triton_dcp_sparse_prefill_kv_index(
         ti_stride1,
     )
     return out
+
+
+def warm_dcp_sparse_prefill_kv_index(
+    dcp_world_size: int, interleave: int, num_topk_tokens: int, device
+) -> None:
+    """Compile the "kv" index kernel with one candidate-free token: dummy runs
+    build no plan, so the first live "kv" step would JIT it."""
+    zeros = torch.zeros(2, dtype=torch.int32, device=device)
+    triton_dcp_sparse_prefill_kv_index(
+        zeros,
+        zeros[:1],
+        torch.zeros(1, num_topk_tokens, dtype=torch.int32, device=device),
+        DcpSparsePrefillKV(slot_ids=zeros[:0], shard_base=zeros, rows_pad=0),
+        dcp_world_size,
+        zeros[:0],
+        NUM_TOPK_TOKENS=num_topk_tokens,
+        cp_kv_cache_interleave_size=interleave,
+    )
