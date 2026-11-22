@@ -1594,6 +1594,7 @@ mod i_atom_refusals {
     type Answer = (StatusCode, &'static str); // a status and its error code
     const SERVED: Answer = (StatusCode::OK, "");
     const MEDIA: Answer = (StatusCode::BAD_REQUEST, "unsupported_media");
+    const LOGPROBS: Answer = (StatusCode::BAD_REQUEST, "unsupported_logprobs");
     const UNSUPPORTED: Answer = (StatusCode::NOT_IMPLEMENTED, "unsupported_api");
 
     fn owned((status, code): Answer) -> (StatusCode, String) {
@@ -1616,6 +1617,13 @@ mod i_atom_refusals {
             }
             body
         };
+        let mut chat_logprobs = chat(vec![&text]);
+        chat_logprobs["logprobs"] = json!(true);
+        chat_logprobs["top_logprobs"] = json!(2);
+        let mut generate_logprobs = generate(None);
+        generate_logprobs["return_logprob"] = json!(true);
+        // ATOM's HTTP /v1/completions answers logprobs null; so does this route.
+        let completion_logprobs = json!({"model": "m", "prompt": "test", "logprobs": 1});
         let responses = json!({"model": "m", "input": "test"});
         let message = json!({"role": "user", "content": "test"});
         let messages = json!({"model": "m", "max_tokens": 8, "messages": [message]});
@@ -1623,10 +1631,13 @@ mod i_atom_refusals {
             ("/v1/chat/completions", chat(vec![&text]), SERVED),
             ("/v1/chat/completions", chat(vec![&text, &image]), MEDIA),
             ("/v1/chat/completions", chat(vec![&text, &video]), MEDIA),
+            ("/v1/chat/completions", chat_logprobs, LOGPROBS),
             ("/generate", generate(None), SERVED),
             ("/generate", generate(Some("image_data")), MEDIA),
             ("/generate", generate(Some("video_data")), MEDIA),
             ("/generate", generate(Some("audio_data")), MEDIA),
+            ("/generate", generate_logprobs, LOGPROBS),
+            ("/v1/completions", completion_logprobs, SERVED),
             ("/v1/responses", responses, UNSUPPORTED),
             ("/v1/messages", messages, UNSUPPORTED),
         ]
@@ -1703,15 +1714,18 @@ mod i_atom_refusals {
     }
 
     #[tokio::test]
-    async fn test_atom_workers_get_no_media_responses_or_messages_request() {
+    async fn test_atom_workers_get_no_media_logprobs_responses_or_messages_request() {
         let (answers, dispatched) = answers(RuntimeType::Atom).await;
         let expected: Vec<_> = requests().into_iter().map(|(_, _, a)| owned(a)).collect();
         assert_eq!(answers, expected);
-        assert_eq!(dispatched, 2, "only the text chat and the text generate");
+        assert_eq!(
+            dispatched, 3,
+            "the text chat, the text generate and the completion"
+        );
     }
 
     #[tokio::test]
-    async fn test_sglang_and_vllm_workers_keep_serving_media_and_responses() {
+    async fn test_sglang_and_vllm_workers_keep_serving_media_logprobs_and_responses() {
         for runtime in [RuntimeType::Sglang, RuntimeType::Vllm] {
             let (answers, dispatched) = answers(runtime.clone()).await;
             let expected: Vec<_> = requests()
@@ -1727,7 +1741,7 @@ mod i_atom_refusals {
     }
 
     #[tokio::test]
-    async fn test_an_atom_pair_gets_no_media_request() {
+    async fn test_an_atom_pair_gets_no_media_or_logprobs_request() {
         let ctx = test_mocks::app_context_with_hf_tokenizer("m");
         let router = GrpcPDRouter::new(&ctx).await.unwrap();
         let prefill = WorkerType::Prefill {
@@ -1737,7 +1751,8 @@ mod i_atom_refusals {
             ctx.worker_registry
                 .register(worker("m", RuntimeType::Atom, kind));
         }
-        for (path, body, answer) in requests().into_iter().filter(|(_, _, a)| *a == MEDIA) {
+        let refused = |answer: &Answer| *answer == MEDIA || *answer == LOGPROBS;
+        for (path, body, answer) in requests().into_iter().filter(|(_, _, a)| refused(a)) {
             let response = match path {
                 "/generate" => {
                     let body = serde_json::from_value(body).unwrap();
