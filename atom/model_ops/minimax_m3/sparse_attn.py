@@ -28,6 +28,7 @@ from atom.model_ops.minimax_m3.index_topk import (
     build_n_valid_column_per_row,
     flydsl_ops,
 )
+from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import prefill_row_positions
 
 # Page-16 SHUFFLE layout for the AITER paged-attention path. The KV
 # cache is allocated with physical page size 16 (the ASM kernel page), and each
@@ -71,6 +72,10 @@ class MiniMaxM3SparsePrefillMetadata:
     block_table: torch.Tensor
     max_query_len: int
     max_seq_len: int
+    nvfp4_row_info: tuple[torch.Tensor, torch.Tensor] | None = None
+    """``(row_req_id, row_kv_lens)`` of every prefill row, int32: what the NVFP4 sparse
+    PA takes per row. Built once with the step's metadata and read by every sparse layer;
+    None unless the KV cache is NVFP4 (``make_sparse_prefill_metadata(nvfp4_kv=True)``)."""
 
 
 @dataclass
@@ -100,8 +105,8 @@ class MiniMaxM3SparseMetadata:
     indexer. `index_topk` consumes it and never derives its own.
     """
     index_scorer: IndexScoreBuffers | None = None
-    """The MXFP4 index scorer's record for this step; None for any other index cache
-    and on an empty batch (the scorer then refuses)."""
+    """The FP4 (MXFP4 or NVFP4) index scorer's record for this step; None for any other
+    index cache and on an empty batch (the scorer then refuses)."""
 
 
 def make_sparse_prefill_metadata(
@@ -117,9 +122,12 @@ def make_sparse_prefill_metadata(
     num_idx_heads: int,
     n_valid_column_per_row_out: torch.Tensor | None = None,
     index_scorer: IndexScoreBuffers | None = None,
+    nvfp4_kv: bool = False,
 ) -> MiniMaxM3SparseMetadata:
-    """``index_scorer`` is the builder's MXFP4 index scorer record (None for any other
-    index cache); a prefill step uses only its score workspace, so the map is dropped.
+    """``index_scorer`` is the builder's FP4 (MXFP4 or NVFP4) index scorer record (None
+    for any other index cache); a prefill step uses only its score workspace, so the map
+    is dropped. ``nvfp4_kv`` (an NVFP4 KV cache) also builds the per-row request id and
+    key count the NVFP4 sparse PA reads, once here for every layer of the step.
     """
     query_lens = cu_seqlens_q[1 : num_prefills + 1] - cu_seqlens_q[:num_prefills]
     prefix_lens = seq_lens - query_lens
@@ -132,6 +140,11 @@ def make_sparse_prefill_metadata(
         block_table=block_table,
         max_query_len=max_query_len,
         max_seq_len=max_seq_len,
+        nvfp4_row_info=(
+            prefill_row_positions(cu_seqlens_q, prefix_lens, num_prefill_tokens)
+            if nvfp4_kv
+            else None
+        ),
     )
     return MiniMaxM3SparseMetadata(
         seq_lens=seq_lens,
@@ -169,8 +182,8 @@ def make_sparse_decode_metadata(
     n_valid_column_per_row_out: torch.Tensor | None = None,
     index_scorer: IndexScoreBuffers | None = None,
 ) -> MiniMaxM3SparseMetadata:
-    """``index_scorer`` is the builder's MXFP4 index scorer record (None for any other
-    index cache): the step's work map is built into its capacity buffer here, once, at
+    """``index_scorer`` is the builder's FP4 (MXFP4 or NVFP4) index scorer record (None
+    for any other index cache): the step's work map is built into its capacity buffer here, once, at
     its ``max_block``, and the metadata carries the record with that map; an empty batch
     builds none. Under indexer CP the map is the record's shard over every index head
     (``num_idx_heads``, this rank's, times the world). ``seq_lens`` and
@@ -1515,6 +1528,110 @@ def sparse_pa_per_row(
         plan_cache_owner=plan_cache_owner,
         # Bounded topk window per row: keep the static split cap.
         plan_partition_cap=max_context_partition_num,
+    )
+
+
+@functools.cache
+def _fp8_output_plan_budget(device) -> int:
+    """The FlyDSL plan's workgroup budget for a sparse PA writing FP8: six per CU.
+
+    With aiter's default, two per CU, a call whose rows x split pass it gets
+    fewer partitions than the split asks for and a slower merge, which for an
+    FP8 output also quantizes in a launch of its own. One MI455X (256 CUs),
+    FP8 KV, 2048-token windows, us per call, default -> six per CU (median of
+    7, interleaved, CUDA graphs): decode rows 72 9.12 -> 6.08, 96 9.85 -> 8.12,
+    160 11.43 -> 8.35, 192 13.53 -> 10.52, 240 14.45 -> 11.11, 256 13.39 ->
+    12.73, 320 21.28 -> 14.23, 384 22.16 -> 14.84; prefill 300 rows 16.31 ->
+    15.61; within 1% at 1-64, 128 and 512 decode rows and 600 prefill rows.
+    """
+    return 6 * torch.cuda.get_device_properties(device).multi_processor_count
+
+
+@torch.no_grad()
+def sparse_pa_fp8_per_row(
+    q: torch.Tensor,  # [rows, num_heads, head_dim==128], one KV head
+    k_cache: torch.Tensor,  # FP8 page-16 SHUFFLE [pages, 1, ...], as above
+    v_cache: torch.Tensor,
+    sparse_bt: torch.Tensor,  # [>= rows, topk*8] int32
+    sparse_ctx: torch.Tensor,  # [>= rows] int32
+    sm_scale: float,
+    output: torch.Tensor,  # [rows, num_heads, head_dim]: the layout, not written
+    k_scale: torch.Tensor | None,
+    v_scale: torch.Tensor | None,
+    quantized_output: torch.Tensor,  # OCP FP8, q's rows then any pad rows
+    output_scale: torch.Tensor,  # FP32 [quantized_output rows, 1]
+    plan_step_owner=None,
+    plan_cache_owner=None,
+) -> None:
+    """``sparse_pa_per_row`` writing o_proj's per-token FP8 input instead, in
+    FlyDSL's paged decode (aiter #7401), with the pad rows past q's written as
+    FP8 zeros with a unit descale. On a plan whose epilogue aiter quantizes
+    (one partition, or a cluster merge with one sequence per cluster) the PA
+    launch does both and stores no BF16. On any other plan, e.g. clusters
+    shared by several sequences (more than 15 rows per 16 CUs: past 240 decode
+    rows on 256 CUs, as at 320), aiter stores BF16 to a buffer of its own, then
+    quantizes it and fills the pad rows in separate launches.
+
+    Only for ``SparseMHAPagedAttentionImpl.supports_output_quant``: an FP8 KV,
+    one KV head (a token's row is then one PA sequence, which its one descale
+    covers) and a GPU without gluon, whose sparse PA is FlyDSL's on every call.
+    A separate entry so that every call without an FP8 output runs
+    ``sparse_pa_per_row`` -> ``run_pa_decode`` unchanged.
+    """
+    from aiter.ops.flydsl.pa_decode import pa_decode
+    from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
+
+    from atom.model_ops.base_attention import (
+        _flydsl_context_bound,
+        _flydsl_plan_scratch,
+        _flydsl_prepare_explicit_plan,
+    )
+
+    rows, group, head_dim = q.shape
+    bound = _flydsl_context_bound(None, sparse_bt, k_cache)
+    plan = _flydsl_prepare_explicit_plan(
+        q=q,
+        k_cache=k_cache,
+        context_lens=sparse_ctx,
+        num_seqs=rows,
+        query_length=1,
+        # the static split cap of `sparse_pa_per_row`, with the budget above
+        plan_partition_cap=get_recommended_splits(rows, 1),
+        plan_workgroup_budget=_fp8_output_plan_budget(q.device),
+        context_bound=bound,
+        existing_plan=None,
+        plan_step_owner=plan_step_owner,
+        plan_cache_owner=plan_cache_owner,
+    )
+    exp_sums, max_logits, tmp = _flydsl_plan_scratch(
+        plan, 1, group, head_dim, output.dtype, q.device, plan_cache_owner
+    )
+    if k_scale is not None:  # per-page scales, collapsed as the cache
+        k_scale = k_scale.view(-1, 1, k_scale.shape[-1], 1)
+        v_scale = v_scale.view(-1, 1, v_scale.shape[-1], 1)
+    pa_decode(
+        output,
+        q,
+        k_cache,
+        v_cache,
+        sparse_ctx[:rows],
+        sparse_bt[:rows],
+        sm_scale,
+        1,
+        context_partition_size=256,
+        compute_type=aiter.dtypes.fp8,
+        key_scale=k_scale,
+        value_scale=v_scale,
+        exp_sums=exp_sums,
+        max_logits=max_logits,
+        temporary_output=tmp,
+        sliding_window=0,
+        work_plan=plan,
+        max_context_length=bound,
+        quantized_output=quantized_output.view(-1, group, head_dim),
+        output_scale=output_scale,
+        store_output=False,
+        quantized_pad_rows=quantized_output.shape[0] - rows,
     )
 
 

@@ -268,10 +268,16 @@ pub struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     pub dp_aware: bool,
 
-    /// Follow the KV cache events each worker reports at /kv_event_sources (ATOM);
-    /// /kv_events/sources shows every subscription
+    /// Follow the KV cache events each worker reports at /kv_event_sources (ATOM),
+    /// replaying missed batches from engines that keep them
+    /// (ATOM_KV_EVENTS_REPLAY_ENDPOINT); /kv_events/sources shows every subscription
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     pub kv_events: bool,
+
+    /// With --kv-events, the admin port (--metrics_port) of each master of the Mooncake
+    /// Store a worker offloads to; /kv_storage/sources shows every store and its pools
+    #[arg(long, default_value_t = 9003, help_heading = "Routing Policy")]
+    pub mooncake_admin_port: u16,
 
     // ==================== PD Disaggregation ====================
     /// Enable PD (Prefill-Decode) disaggregated mode
@@ -498,7 +504,14 @@ pub struct CliArgs {
     pub tool_call_parser: Option<String>,
 
     // ==================== Backend ====================
-    /// Backend runtime to use
+    /// Backend runtime of the workers; ATOM workers need `atom`
+    ///
+    /// ATOM workers need `atom` in regular mode as in PD mode: it keys an
+    /// image chat by all its media, as ATOM's prefix cache does. It also
+    /// discovers an HTTP worker's model through `/v1/models`, whose model id
+    /// (an alias under `--served-model-name`) names the worker's model;
+    /// `--tokenizer-path` and `--model-path` take precedence over it for the
+    /// worker's tokenizer.
     #[arg(long, value_enum, default_value_t = Backend::Sglang, alias = "runtime", help_heading = "Backend")]
     pub backend: Backend,
 
@@ -701,6 +714,7 @@ impl CliArgs {
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .dp_aware(self.dp_aware)
             .kv_events(self.kv_events)
+            .mooncake_admin_port(self.mooncake_admin_port)
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
             .build()
@@ -943,6 +957,7 @@ impl Default for CliArgs {
             prefix_hash_load_factor: 1.25,
             dp_aware: false,
             kv_events: false,
+            mooncake_admin_port: 9003,
             pd_disaggregation: false,
             decode: Vec::new(),
             prefill_policy: None,

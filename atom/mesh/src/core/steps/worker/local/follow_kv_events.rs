@@ -1,6 +1,7 @@
 //! With `--kv-events`, the KV event stream of each worker rank is followed from its
 //! registration to its removal, at the endpoint the worker reports for the rank at
-//! `/kv_event_sources` (ROCm/ATOM#3275).
+//! `/kv_event_sources` (ROCm/ATOM#3275), and the rank reads meanwhile the store it
+//! reports offloading to.
 
 use async_trait::async_trait;
 use tracing::warn;
@@ -14,7 +15,8 @@ use crate::{
     kv_events::source,
 };
 
-/// Follows every rank just registered. A worker whose sources cannot be read still serves.
+/// Follows every rank just registered, and predicts the prompts routed to every worker. A
+/// worker whose sources cannot be read still serves.
 pub struct FollowKvEventsStep;
 
 #[async_trait]
@@ -36,6 +38,9 @@ impl StepExecutor<LocalWorkerWorkflowData> for FollowKvEventsStep {
             .actual_workers
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("workers".to_string()))?;
+        for worker in workers {
+            monitor.register(worker.url());
+        }
         let Some(first) = workers
             .first()
             .filter(|worker| matches!(worker.connection_mode(), ConnectionMode::Http))
@@ -52,6 +57,12 @@ impl StepExecutor<LocalWorkerWorkflowData> for FollowKvEventsStep {
                     message,
                 }
             })?;
+        // The answer is all the ranks read now: a store it leaves out is no longer theirs.
+        if let Some(storage) = &app_context.kv_storage {
+            for worker in workers {
+                storage.remove(worker.url());
+            }
+        }
         if sources.is_empty() {
             warn!(
                 worker = first.base_url(),
@@ -78,6 +89,11 @@ impl StepExecutor<LocalWorkerWorkflowData> for FollowKvEventsStep {
                 Some((&rank, source)) => {
                     let pool = worker.worker_type().as_metric_label();
                     monitor.attach(worker.url(), worker.model_id(), pool, rank, source.clone());
+                    if let (Some(storage), Some(offload)) =
+                        (&app_context.kv_storage, &source.offload)
+                    {
+                        storage.add(worker.url(), worker.model_id(), offload);
+                    }
                 }
                 None => warn!(
                     worker = worker.url(),
@@ -106,6 +122,11 @@ impl StepExecutor<WorkerRemovalWorkflowData> for StopFollowingKvEventsStep {
         if let Some(monitor) = &app_context.kv_event_monitor {
             for url in &context.data.worker_urls {
                 monitor.detach(url);
+            }
+        }
+        if let Some(storage) = &app_context.kv_storage {
+            for url in &context.data.worker_urls {
+                storage.remove(url);
             }
         }
         Ok(StepResult::Success)
