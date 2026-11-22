@@ -52,10 +52,13 @@ from atom.utils.gc_utils import (
 
 logger = logging.getLogger("atom")
 
-# Pace of the idle KV drain. The busy loops never block, so an unpaced drain
+# Pace of the idle KV drain. The pending-work loops poll, so an unpaced drain
 # would fire one worker RPC round per spin; 1ms matches the PP head's existing
 # idle token-poll timeout and is far below any transfer latency.
 KV_IDLE_DRAIN_INTERVAL_S = 0.001
+# Requests and control traffic wake this wait directly. The timeout keeps
+# metrics and throughput heartbeats running while no work is scheduled.
+ENGINE_IDLE_WAIT_S = 0.01
 # How long a busy loop that finds its engine held sleeps before it looks again.
 HELD_POLL_S = 0.01
 
@@ -535,6 +538,8 @@ class EngineCore:
                     self.scheduler.engine_stats.note_idle(now)
                     if self.has_pending_kv_work():
                         self._advance_idle_kv_transfer()
+                    else:
+                        self._wait_for_input()
         finally:
             try:
                 # Teardown runs even on exceptions so the sender thread/socket
@@ -637,6 +642,16 @@ class EngineCore:
 
         self._postprocess(seqs.values(), fwd_out, scheduled_batch)
         return True
+
+    def _wait_for_input(self) -> None:
+        """Yield an idle engine until requests, control or worker progress arrive."""
+        # Queue writers enqueue before setting the event. Clear before checking
+        # the queues: older arrivals remain queued, and arrivals during or after
+        # these checks leave the event set. Never clear between a check and wait.
+        self._kv_progress_event.clear()
+        if not self.input_queue.empty() or not self.utility_queue.empty():
+            return
+        self._kv_progress_event.wait(ENGINE_IDLE_WAIT_S)
 
     def _wait_for_kv_progress(self) -> None:
         # Work queued before the event was cleared must also prevent sleeping.
