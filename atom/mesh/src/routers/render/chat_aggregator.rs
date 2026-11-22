@@ -474,3 +474,57 @@ fn engine_error_to_response(err: EngineError) -> Response {
         EngineError::RequestBuildFailed(r) => error::bad_request("engine_request_build_failed", r),
     }
 }
+
+#[cfg(test)]
+mod split_reasoning_tests {
+    use super::*;
+
+    /// A reply as the detokenizer hands it over: text a few bytes at a time,
+    /// a special token (`</think>`) whole.
+    fn pieces(parts: &[&str]) -> Vec<String> {
+        parts
+            .iter()
+            .flat_map(|part| {
+                if part.starts_with('<') {
+                    vec![part.to_string()]
+                } else {
+                    part.as_bytes()
+                        .chunks(7)
+                        .map(|c| String::from_utf8(c.to_vec()).unwrap())
+                        .collect()
+                }
+            })
+            .collect()
+    }
+
+    async fn split(parts: &[&str], opener: Option<&str>) -> ParserResult {
+        let factory = ReasoningParserFactory::new();
+        let text = parts.concat();
+        split_reasoning(&factory, Some("qwen3"), "m", &pieces(parts), &text, opener)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_reply_over_the_one_shot_limit_splits_as_a_short_one_does() {
+        for len in [100, ONE_SHOT_MAX_BYTES + 1000] {
+            let thought = "x".repeat(len);
+            let result = split(&["<think>", &thought, "</think>", "The answer."], None).await;
+            assert_eq!(result.reasoning_text, thought, "len {len}");
+            assert_eq!(result.normal_text, "The answer.", "len {len}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_prompt_that_opened_reasoning_has_its_opener_read_first() {
+        for len in [100, ONE_SHOT_MAX_BYTES + 1000] {
+            let thought = "y".repeat(len);
+            let result = split(&[&thought, "</think>", "Done."], Some("<think>")).await;
+            assert_eq!(result.reasoning_text, thought, "len {len}");
+            assert_eq!(result.normal_text, "Done.", "len {len}");
+        }
+        // Without the opener the same reply has no reasoning to find.
+        let result = split(&["plain", "</think>", "Done."], None).await;
+        assert!(result.reasoning_text.is_empty());
+    }
+}
