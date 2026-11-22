@@ -17,7 +17,7 @@ reference is NeMo AutoModel ``speculative/dspark/draft_minimax_m3.py``:
     the whole context and the whole block.
   * Every norm is Gemma style, ``x * (1 + w)``; the MLP is dense SwiGLU-OAI.
     There is no indexer and no MoE -- both belong to the target.
-  * The context is ``hidden_norm(fc(concat(aux)))`` and goes straight into each
+  * The context is ``hidden_norm(fc(concat(taps)))`` and goes straight into each
     layer's K/V projection, never through ``input_layernorm``.
 
 KV lives in a sibling pool of its own (an MHA draft cannot share the target's

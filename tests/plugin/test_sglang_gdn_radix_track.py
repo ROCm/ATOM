@@ -206,6 +206,7 @@ def test_extend_metadata_keeps_states_only_when_tracking(monkeypatch):
         fm = SimpleNamespace(
             query_start_loc=torch.tensor([0, 4], dtype=torch.int32),
             mamba_cache_indices=torch.tensor([1], dtype=torch.int32),
+            logical_num_tokens=4,
             has_mamba_track_mask=track,
         )
 

@@ -390,7 +390,15 @@ impl JobQueue {
                         let decode_workers =
                             decode_urls.iter().map(|url| (url.clone(), "decode", None));
 
-                        prefill_workers.chain(decode_workers).collect()
+                        let encode_workers = router_config
+                            .encode_urls
+                            .iter()
+                            .map(|url| (url.clone(), "encode", None));
+
+                        prefill_workers
+                            .chain(decode_workers)
+                            .chain(encode_workers)
+                            .collect()
                     }
                 };
 
@@ -478,6 +486,7 @@ impl JobQueue {
                 // Tokenizer removal is synchronous and fast
                 if let Some(entry) = context.tokenizer_registry.remove_by_id(&request.id) {
                     crate::routers::prepare::thread_tokenizer::release_copies(&entry.id);
+                    context.chats_without_template.write().remove(&entry.id);
                     info!(
                         "Successfully removed tokenizer '{}' (id: {})",
                         entry.name, entry.id

@@ -69,6 +69,12 @@ pub struct RouterConfig {
     pub atom_standalone: bool,
     #[serde(default)]
     pub atom_pd_rank_mapping_policy: AtomPdRankMappingPolicy,
+    /// Encode workers; valid only in PD mode
+    #[serde(default)]
+    pub encode_urls: Vec<String>,
+    /// Encode worker policy (falls back to `policy` when unset)
+    #[serde(default)]
+    pub encode_policy: Option<PolicyConfig>,
 
     pub policy: PolicyConfig,
     pub host: String,
@@ -81,6 +87,9 @@ pub struct RouterConfig {
     /// Follow the KV cache events each worker reports at `/kv_event_sources`.
     #[serde(default)]
     pub kv_events: bool,
+    /// The admin port of each master of the Mooncake Store a worker offloads to.
+    #[serde(default = "default_mooncake_admin_port")]
+    pub mooncake_admin_port: u16,
     pub api_key: Option<String>,
     pub metrics: Option<MetricsConfig>,
     pub log_dir: Option<String>,
@@ -430,6 +439,11 @@ impl Default for MetricsConfig {
     }
 }
 
+/// Mooncake's `--metrics_port`.
+fn default_mooncake_admin_port() -> u16 {
+    9003
+}
+
 impl Default for RouterConfig {
     fn default() -> Self {
         Self {
@@ -449,6 +463,7 @@ impl Default for RouterConfig {
             worker_startup_check_interval_secs: 30,
             dp_aware: false,
             kv_events: false,
+            mooncake_admin_port: default_mooncake_admin_port(),
             api_key: None,
             metrics: None,
             log_dir: None,
@@ -466,6 +481,8 @@ impl Default for RouterConfig {
             connection_mode: ConnectionMode::Http,
             atom_standalone: false,
             atom_pd_rank_mapping_policy: AtomPdRankMappingPolicy::None,
+            encode_urls: vec![],
+            encode_policy: None,
             model_path: None,
             tokenizer_path: None,
             chat_template: None,

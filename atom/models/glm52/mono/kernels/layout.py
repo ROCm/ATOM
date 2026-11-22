@@ -476,6 +476,11 @@ def layout(
     return scratch, symmetric
 
 
+def uv_by_head(samples: int, dcp_size: int) -> bool:
+    """Whether UV tasks merge one head's ``16 * WAVES``-row output parts."""
+    return samples >= 4 and dcp_size == 1
+
+
 def stage_tasks(
     samples: int,
     heads: int,
@@ -487,12 +492,14 @@ def stage_tasks(
     indexer_cp: bool = False,
     npes: int = 1,
     split_head_merge: bool = False,
+    uv_by_head: bool = False,
 ):
     """Return ``(stage name, task count)`` pairs in execution order.
 
     ``split_head_merge`` folds the two head groups of an (sample, key-chunk)
-    cell into one task, halving ``split``. It must be given the same value the
-    kernel was built with: these counts set the CTA placement rotation and the
+    cell into one task, halving ``split``. ``uv_by_head`` makes one task per
+    ``16 * WAVES``-row output part instead of per ``UV_TILE``. Both must match
+    the kernel build: these counts set the CTA placement rotation and the
     timeline's per-stage offsets, so a disagreement silently mis-seats both.
     """
 
@@ -530,7 +537,12 @@ def stage_tasks(
             * (1 if split_head_merge else heads // WAVES)
             * (sparse_attention_topk // sparse_keys_per_task(samples, heads)),
         ),
-        ("uv", samples * (heads * V_DIM // UV_TILE)),
+        (
+            "uv",
+            samples
+            * heads
+            * (V_DIM // ((16 * WAVES) if uv_by_head else UV_TILE)),
+        ),
         ("o", N_ROW_TILES),
         ("router", samples * N_ROUTER),
         (
