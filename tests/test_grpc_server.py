@@ -7,11 +7,13 @@ import itertools
 import json
 import sys
 import threading
+from argparse import Namespace
 from types import SimpleNamespace
 
 import pytest
 
 from atom.entrypoints.grpc import atom_grpc_pb2 as pb
+from atom.entrypoints.grpc import server as grpc_server
 from atom.entrypoints.grpc.server import AtomEngineServicer
 from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.protocol import DEFAULT_MAX_TOKENS
@@ -393,3 +395,31 @@ def test_grpc_port_refuses_a_tokenizer_with_named_chat_templates(monkeypatch, ca
         api_server.main()
     error = capsys.readouterr().err
     assert "(default, tool_use); pick one with --chat-template" in error
+
+
+def test_a_step_ending_as_the_listener_starts_reaches_its_call(monkeypatch):
+    core_mgr = SimpleNamespace(_flush_stream_batch_fn=lambda: None)  # HTTP's
+    api, delivered = SimpleNamespace(engine=SimpleNamespace(core_mgr=core_mgr)), []
+
+    async def listen(address, servicer, listening):
+        try:  # a call's last output, buffered and flushed on this thread
+            queue = asyncio.Queue()
+            servicer.steps.callback(queue)(RequestOutput(1, [5], True, "eos"))
+            core_mgr._flush_stream_batch_fn()
+            delivered.append(await asyncio.wait_for(queue.get(), 1))
+        finally:
+            listening.set_result(None)
+
+    monkeypatch.setattr(grpc_server, "_serve", listen)
+    args = Namespace(host="127.0.0.1", grpc_port=1, model="m")
+    grpc_server.start_grpc_server(api, args)
+    assert [output.finish_reason for output in delivered] == ["eos"]
+
+
+def test_model_info_leaves_an_absent_chat_template_unset(serve, monkeypatch):
+    engine = FakeEngine()
+    engine.config.end_token_ids = [2]
+    servicer = serve(engine)
+    monkeypatch.setattr(api_server, "tokenizer", SimpleNamespace(chat_template=None))
+    info = asyncio.run(servicer.GetModelInfo(pb.GetModelInfoRequest(), None))
+    assert not info.HasField("chat_template") and list(info.eos_token_ids) == [2]
