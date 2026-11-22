@@ -703,8 +703,11 @@ class TestPrefillDecodeInterval:
         # its reduce slot stays 0.
         d = make_delayer(prefill_ramp=True, **kw)
         assert d.prefill_ramp is armed and d.ramp_active is armed
-        call(d, pending_tokens=MAX_BATCHED, full_chunk=True)
+        skip_first(d)
+        call(d, pending_tokens=MAX_BATCHED, running_decode_batch=5, full_chunk=True)
         assert d._reduce_buf[FULL_CHUNK] == int(armed)
+        if not armed:  # the ramp block does not run: its state stays put
+            assert d._ramp_done is False
 
     def test_ramp_needs_every_rank_full(self):
         d = make_delayer(dp_size=2, prefill_decode_interval=3, prefill_ramp=True)

@@ -891,9 +891,11 @@ class Scheduler:
         # hash. Keyed on advance_on_schedule, which only PP sets. Only a class
         # that must file at retire lands here; see `_finalize_prefill_chunk`.
         self._checkpoint_holds: dict[int, int] = {}
-        # Whether the last `_probe_local_prefill_work` stopped because the batch
-        # budget could not take the next request (the initial ramp's fill).
+        # What the last `_probe_local_prefill_work` found for the initial ramp:
+        # whether it stopped because the batch budget could not take the next
+        # request, and how many fresh requests it counted.
         self._probe_filled_budget = False
+        self._probe_fresh = 0
 
         from atom.utils.forward_context import get_kvconnector
 
@@ -1153,6 +1155,7 @@ class Scheduler:
         budget = self.max_num_batched_tokens
         pending = 0
         self._probe_filled_budget = False
+        self._probe_fresh = 0
         if self._partial_prefill_count:
             for seq in self.running:
                 if not seq.is_partial_prefill:
@@ -1201,7 +1204,9 @@ class Scheduler:
                     prefillable = True
                     break
                 resume = cached_blocks * self.block_manager.hash_block_size
-                if self._waits_for_inflight_prefix(
+                # Admission waits there only under the local coalescer (Phase 2);
+                # on DP>1 it admits the request, so the probe counts it.
+                if self._local_prefill_coalescing and self._waits_for_inflight_prefix(
                     seq, max(resume, seq.offload_joint.kv_prefix_tokens)
                 ):
                     break  # Admission defers it; the seqs behind it go uncounted.
@@ -1228,6 +1233,7 @@ class Scheduler:
             chunk = self._preview_prefill_chunk(seq, cached, resume, chunk)
             prefillable = True
             pending += chunk
+            self._probe_fresh += 1
             slots -= 1
             # The resume just consumed its virtual running slot; do not also
             # reserve that same request in the fresh-admission parked count.
@@ -1360,16 +1366,17 @@ class Scheduler:
         free_slots: int,
         probed_tokens: int | None,
     ) -> bool:
-        """The initial ramp's signal for this rank: a fresh request waits for a
-        free seq slot, and admission's own probe (`_probe_local_prefill_work`:
-        checkpoint holds, atomic heads, in-flight prefixes and parking included)
-        fills target_fill of a prefill chunk, or stops because what is left of
-        the batch budget cannot take the next request (without chunked prefill
-        whole prompts rarely pack to target_fill, yet the rank has more work
-        than one batch). A resumable partial alone does not: that is one long
-        prompt, not empty slots. ``probed_tokens`` is the probe's count where
-        this tick already ran it. A local delayer with no decode fires anyway,
-        so it skips the probe."""
+        """The initial ramp's signal for this rank: admission's own probe
+        (`_probe_local_prefill_work`: checkpoint holds, atomic heads, in-flight
+        prefixes and parking as admission sees them) counts at least one fresh
+        request into a free seq slot, and fills target_fill of a prefill chunk
+        or stops because what is left of the batch budget cannot take the next
+        request (without chunked prefill whole prompts rarely pack to
+        target_fill). Resumable partials that fill the chunk with no fresh
+        request counted do not: that is one long prompt, not empty slots.
+        ``probed_tokens`` is the probe's count where this tick already ran it.
+        With no free slot or no waiting request, or a local delayer with no
+        decode (it fires anyway), the probe is skipped."""
         delayer = self.prefill_delayer
         if (
             not prefillable
@@ -1381,7 +1388,7 @@ class Scheduler:
             return False
         if probed_tokens is None:
             probed_tokens = self._local_prefill_pending_work()[1]
-        return (
+        return self._probe_fresh > 0 and (
             self._probe_filled_budget
             or probed_tokens >= delayer.target_fill * self.max_num_batched_tokens
         )
@@ -2335,9 +2342,11 @@ class Scheduler:
             if protects_decode or (
                 self._local_prefill_coalescing and not running_decode_batch
             ):
-                # Existence is sufficient during the hard protection window:
-                # fit probes cannot change its decision. Coalescer hold bounds
-                # start afterwards. With no decode, admission proceeds directly.
+                # Existence is sufficient for prefillable during the hard
+                # protection window: fit probes cannot change the interval's
+                # HOLD (an active initial ramp probes its own fill, below).
+                # Coalescer hold bounds start afterwards. With no decode,
+                # admission proceeds directly.
                 prefillable = (
                     self._partial_prefill_count > 0
                     or next(self._waiting_prefills(), None) is not None
@@ -2375,7 +2384,11 @@ class Scheduler:
                 # The ramp ends on high KV, protection window or not.
                 kv_usage=(
                     0.0
-                    if protects_decode and not self.prefill_delayer.ramp_active
+                    if protects_decode
+                    and not (
+                        self.prefill_delayer.prefill_ramp
+                        and self.prefill_delayer.ramp_active
+                    )
                     else self._kv_usage()
                 ),
                 has_partial=self._partial_prefill_count > 0,
@@ -2398,7 +2411,8 @@ class Scheduler:
                 # decode batch -- partials plus waiting heads up to free slots
                 admittable_requests=self._partial_prefill_count
                 + min(len(self.waiting), free_slots),
-                full_chunk=self._ramp_full_chunk(
+                full_chunk=self.prefill_delayer.prefill_ramp
+                and self._ramp_full_chunk(
                     prefillable, running_decode_batch, free_slots, probed_tokens
                 ),
             )

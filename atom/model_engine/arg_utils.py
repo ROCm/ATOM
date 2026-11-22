@@ -777,9 +777,9 @@ class EngineArgs:
             "the fixed prefill cost times the decode batch, fitted from measured "
             "step times; on DP=1, PP=1 it enables the delayer as a positive "
             "interval does. With a positive interval or 'adaptive', "
-            "ATOM_PREFILL_INITIAL_RAMP (on by default) releases full chunks "
-            "while every rank has a free seq slot and a waiting request, until "
-            "a rank cannot fill or KV reaches the high watermark, and re-arms "
+            "ATOM_PREFILL_INITIAL_RAMP (on by default) releases prefill while "
+            "every rank fills a chunk with fresh requests into free seq slots, "
+            "until a rank cannot or KV reaches the high watermark, and re-arms "
             "once the group has no decode; set it to 0 to keep them exact.",
         )
         parser.add_argument(
