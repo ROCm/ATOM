@@ -69,9 +69,8 @@ def test_unmarked_tensor_goes_straight_back_to_the_comm_stream(monkeypatch):
 
 
 def test_marking_while_a_graph_records(monkeypatch):
-    """Decode TBO's overlapped all-reduce and the side-stream compressors mark
-    their tensors while a graph records: the mark must neither break the
-    capture nor the replay."""
+    """The side-stream compressors mark their tensors while a graph records:
+    the mark must neither break the capture nor the replay."""
     comm, compute = torch.cuda.Stream(), torch.cuda.Stream()
     ctx = SimpleNamespace(compute_stream=compute)
     monkeypatch.setattr(ubatching, "_get_current_tbo_context", lambda: ctx)

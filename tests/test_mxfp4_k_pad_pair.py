@@ -247,6 +247,65 @@ def test_padded_slots_are_zeroed_at_allocation_and_stay_zero(monkeypatch, tp_ran
     assert (dw[:, : REAL // 2] != 0).all() and (ds[:, : REAL // 32] != 0).all()
 
 
+@pytest.mark.parametrize("tp_rank", [0, 3, 7], indirect=True)
+def test_a_weight_sync_keeps_the_pad_zero(tp_rank):
+    """Loaded and preshuffled, then a weight sync: the module-level loaders write the new real shards over the
+    preshuffled weight, whose bytes in the pad's row-major place belong to other tiles (the loaders zero the pad
+    again), and the updater re-shuffles it. The weight is then the preshuffle of the real shards at the front of each
+    slot and zeros behind them, as after a load."""
+    from atom.model_ops.utils import shuffle_weights
+    from atom.rollout.weight_updater import WeightUpdaterMixin
+
+    def expected(gate, up, down_w):
+        gu = torch.zeros(2 * PADDED, HIDDEN // 2, dtype=torch.uint8)
+        gu[:REAL], gu[PADDED : PADDED + REAL] = (
+            gate.chunk(TP, 0)[tp_rank],
+            up.chunk(TP, 0)[tp_rank],
+        )
+        dw = torch.zeros(HIDDEN, PADDED // 2, dtype=torch.uint8)
+        dw[:, : REAL // 2] = down_w.chunk(TP, 1)[tp_rank]
+        out = []
+        for t, like in ((gu, gate_up.weight), (dw, down.weight)):
+            p = torch.nn.Parameter(t.cuda().view(like.dtype), requires_grad=False)
+            shuffle_weights(p)
+            out.append(p.data.view(torch.uint8).cpu())
+        return out
+
+    def load(seed):
+        gate, up = (
+            _pattern(INTER, HIDDEN // 2) | 1,
+            (_pattern(INTER, HIDDEN // 2).flip(0) + seed) | 1,
+        )
+        down_w = (_pattern(HIDDEN, INTER // 2) + seed) | 1
+        gate_up.weight_loader(gate_up.weight, gate.cuda(), 0)
+        gate_up.weight_loader(gate_up.weight, up.cuda(), 1)
+        down.weight_loader(down.weight, down_w.cuda())
+        return gate, up, down_w
+
+    with torch.device("cuda"):
+        gate_up, down = _pair()
+    sc = _pattern(INTER, HIDDEN // 32) | 1
+    for shard_id in (0, 1):
+        gate_up.weight_loader(gate_up.weight_scale, sc.cuda(), shard_id)
+    down.weight_loader(down.weight_scale, (_pattern(HIDDEN, INTER // 32) | 1).cuda())
+    first = load(0)
+    for layer in (gate_up, down):
+        layer.process_weights_after_loading()
+    want = expected(*first)
+    assert torch.equal(_u8(gate_up.weight), want[0]) and torch.equal(
+        _u8(down.weight), want[1]
+    )
+
+    second = load(7)  # the sync's loads, over the preshuffled weight
+    updater = object.__new__(WeightUpdaterMixin)
+    for layer in (gate_up, down):
+        updater._post_process_fp8_weight(layer, layer.weight)
+    want = expected(*second)
+    assert torch.equal(_u8(gate_up.weight), want[0]) and torch.equal(
+        _u8(down.weight), want[1]
+    )
+
+
 def test_an_unpadded_mxfp4_down_is_refused(monkeypatch, tp_rank):
     """Without the pair's padding, the backstop refuses K=4224 at load."""
     qc = _qc(*MXFP4)

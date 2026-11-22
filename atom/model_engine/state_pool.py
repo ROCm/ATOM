@@ -62,6 +62,7 @@ class StateSlotPool:
         # reason `BlockManager` still cuts prefill chunks onto rungs; see
         # `StateTransfer.readable_midstep`.
         self.readable_midstep: bool = self.transfer.readable_midstep
+        self.decode_keep: str = self.transfer.decode_keep
         self.hash_block_size: int = hash_block_size
         if self.transfer.copies:
             raise ValueError("PAGE-copy checkpoints do not belong to StateSlotPool")
@@ -575,7 +576,7 @@ class StateSlotPool:
             self.release(slot)
 
     # ---------------------------- checkpointing ---------------------------- #
-    def checkpoint(self, seq, boundary_blocks: int, h: int) -> None:
+    def checkpoint(self, seq, boundary_blocks: int, h: int, step: int = -1) -> None:
         """Keep `seq`'s state as of this boundary, filed under hash `h`.
 
         The owner moves to a fresh slot and the old slot becomes read-only.
@@ -587,6 +588,7 @@ class StateSlotPool:
         whether the position is this prompt's own end decides where the
         checkpoint sits in the LRU order — see `mark_speculative`.
         """
+        del step
         if not self.applies(seq) or not self.transfer.forks:
             return
         old = seq.state_slot

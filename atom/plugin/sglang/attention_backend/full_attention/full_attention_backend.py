@@ -210,9 +210,11 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         """Init auxiliary variables for triton attention backend."""
         # Native QSA (Flash-Next) does not read FlashInfer MHA/MLA tables.
         # TARGET_VERIFY / draft-extend would otherwise take the speculative
-        # MHA path and run the wrong kernel on QSA caches.
+        # MHA path and run the wrong kernel on QSA caches. For an extend
+        # (including the draft prefill) the MHA table would cost a gather over
+        # the whole context plus a host sync.
         if self._uses_native_qsa() and (
-            forward_batch.forward_mode.is_target_verify()
+            forward_batch.forward_mode.is_extend()
             or is_draft_extend_mode(forward_batch.forward_mode, include_v2=True)
         ):
             self._set_qwen4_exp_qsa_graph_forward_metadata()

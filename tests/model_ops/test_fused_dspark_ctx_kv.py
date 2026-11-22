@@ -91,8 +91,9 @@ def _stored(keys, *, packed):
     if not packed:
         return keys.double()
     values, scales = keys
-    exponent = scales.view(torch.uint8).to(torch.int32) - 127
-    scale = torch.ldexp(torch.ones_like(exponent, dtype=torch.float64), exponent)
+    # The E8M0 cast is exact, unlike `torch.ldexp` on gfx950 (see
+    # tests/models/deepseek_v41/test_dspark_context_norm_quant.py).
+    scale = scales.view(torch.float8_e8m0fnu).double()
     return values.double() * scale.repeat_interleave(32, dim=-1)
 
 
