@@ -73,7 +73,8 @@ impl PolicyFactory {
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
             "prefix_hash" | "prefixhash" => Some(Arc::new(PrefixHashPolicy::with_defaults())),
             "agentic" => Some(Arc::new(AgenticPolicy::default())),
-            "least_load" | "leastload" => Some(Arc::new(LeastLoadPolicy::default())),
+            // No least_load: a worker's policy label places through plan_single, which never
+            // reserves decode load, so least_load would rank in-flight requests only.
             _ => None,
         }
     }
@@ -121,6 +122,7 @@ mod tests {
         assert!(PolicyFactory::create_by_name("PowerOfTwo").is_some());
         assert!(PolicyFactory::create_by_name("cache_aware").is_some());
         assert!(PolicyFactory::create_by_name("CacheAware").is_some());
+        assert!(PolicyFactory::create_by_name("least_load").is_none());
         assert!(PolicyFactory::create_by_name("unknown").is_none());
     }
 
@@ -225,8 +227,6 @@ mod tests {
             ("prefixhash", "prefix_hash"),
             ("agentic", "agentic"),
             ("Agentic", "agentic"),
-            ("least_load", "least_load"),
-            ("leastload", "least_load"),
         ];
 
         for (input, expected_name) in cases {

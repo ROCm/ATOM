@@ -433,7 +433,6 @@ impl PDRouter {
             prefill_policy,
             decode_policy,
             prefill_tokens,
-            prefill_load,
             decode_load,
         } = plan
         else {
@@ -461,11 +460,8 @@ impl PDRouter {
                 policy,
             );
         }
-        let prefill_guard = match prefill_load {
-            Some(reservation) => WorkerLoadGuard::adopt(reservation),
-            None => WorkerLoadGuard::new(prefill.clone(), headers),
-        }
-        .with_prefill_tokens(prefill_tokens);
+        let prefill_guard =
+            WorkerLoadGuard::new(prefill.clone(), headers).with_prefill_tokens(prefill_tokens);
         let decode_guard = match decode_load {
             Some(reservation) => WorkerLoadGuard::adopt(reservation),
             None => WorkerLoadGuard::new(decode.clone(), headers),
@@ -2346,7 +2342,6 @@ mod tests {
                         prefill_policy: "round_robin",
                         decode_policy: "round_robin",
                         prefill_tokens: 0,
-                        prefill_load: None,
                         decode_load: None,
                     },
                     None,
@@ -2489,7 +2484,6 @@ mod tests {
                     prefill_policy: "round_robin",
                     decode_policy: "round_robin",
                     prefill_tokens: 0,
-                    prefill_load: None,
                     decode_load: None,
                 },
                 None,
@@ -2514,6 +2508,43 @@ mod tests {
         assert_eq!(request_counts.len(), 1, "{rendered}");
         assert!(request_counts[0].ends_with(" 1"), "{rendered}");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn reserve_pair_adopts_the_least_load_decode_reservation() {
+        let router = create_test_pd_router();
+        router
+            .policy_registry
+            .set_decode_policy(Arc::new(crate::policies::LeastLoadPolicy::default()));
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://prefill:8000")
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: Some(8001),
+                })
+                .build(),
+        );
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://decode:8000")
+                .worker_type(WorkerType::Decode)
+                .build(),
+        );
+        router.worker_registry.register(prefill.clone());
+        router.worker_registry.register(decode.clone());
+        let tokens = [1, 2, 3, 4];
+        let descriptor = crate::core::placement::test_support::make_descriptor(
+            None,
+            Some("test"),
+            Some(&tokens),
+            None,
+        );
+
+        let plan = router.planner.plan(&descriptor).await.unwrap();
+        let charged = |worker: &Arc<dyn Worker>| (worker.load(), worker.decode_kv_tokens());
+        assert_eq!((charged(&prefill), charged(&decode)), ((0, 0), (1, 4)));
+        let pair = router.reserve_pair(plan, None).unwrap();
+        assert_eq!((charged(&prefill), charged(&decode)), ((1, 0), (1, 4)));
+        drop(pair);
+        assert_eq!((charged(&prefill), charged(&decode)), ((0, 0), (0, 0)));
     }
 
     #[derive(Debug)]
@@ -2732,7 +2763,6 @@ mod tests {
                     prefill_policy: "round_robin",
                     decode_policy: "round_robin",
                     prefill_tokens: 7,
-                    prefill_load: None,
                     decode_load: None,
                 },
                 None,
@@ -2820,7 +2850,6 @@ mod tests {
                         prefill_policy: "dp_sticky",
                         decode_policy: "round_robin",
                         prefill_tokens: 0,
-                        prefill_load: None,
                         decode_load: None,
                     },
                     Some(&headers),

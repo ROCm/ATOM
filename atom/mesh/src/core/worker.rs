@@ -714,10 +714,8 @@ impl Worker for BasicWorker {
         match tokens {
             Some(tokens) => self.add_decode_kv_tokens(tokens),
             None => {
-                let previous = self
-                    .decode_untokenized_counter
+                self.decode_untokenized_counter
                     .fetch_add(1, Ordering::Relaxed);
-                let _ = previous;
             }
         }
     }
@@ -728,7 +726,7 @@ impl Worker for BasicWorker {
             Some(tokens) => {
                 let previous = self
                     .decode_kv_counter
-                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                         Some(current.saturating_sub(tokens))
                     })
                     .unwrap_or_else(|current| current);
@@ -748,7 +746,7 @@ impl Worker for BasicWorker {
             None => {
                 let previous = self
                     .decode_untokenized_counter
-                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                         Some(current.saturating_sub(1))
                     })
                     .unwrap_or_else(|current| current);

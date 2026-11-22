@@ -2430,9 +2430,9 @@ mod i_route_metrics {
     use super::super::traits::{PdPlanner, PolicySource, WorkerSource};
     use super::super::types::PlacementError;
     use crate::core::Worker;
-    use crate::policies::PolicyFactory;
+    use crate::policies::{LeastLoadPolicy, LoadBalancingPolicy, PolicyFactory};
 
-    const POLICIES: [&str; 7] = [
+    const POLICIES: [&str; 8] = [
         "random",
         "round_robin",
         "dp_sticky",
@@ -2440,7 +2440,16 @@ mod i_route_metrics {
         "cache_aware",
         "prefix_hash",
         "agentic",
+        "least_load",
     ];
+
+    /// `least_load` is not available by name: a label policy never reserves decode load.
+    fn policy(name: &str) -> Arc<dyn LoadBalancingPolicy> {
+        match name {
+            "least_load" => Arc::new(LeastLoadPolicy::default()),
+            _ => PolicyFactory::create_by_name(name).unwrap(),
+        }
+    }
 
     fn unhealthy(worker: Arc<dyn Worker>) -> Arc<dyn Worker> {
         worker.set_healthy(false);
@@ -2471,7 +2480,7 @@ mod i_route_metrics {
         let descriptor = make_descriptor(Some("m"), Some("hello"), Some(&tokens), None);
 
         for name in POLICIES {
-            let policy = PolicyFactory::create_by_name(name).unwrap();
+            let policy = policy(name);
             apply_policy(&candidates, policy.as_ref(), &descriptor, None)
                 .await
                 .unwrap();
@@ -2506,7 +2515,7 @@ mod i_route_metrics {
         let descriptor = make_descriptor(Some("m"), Some("hello"), Some(&tokens), None);
 
         for name in POLICIES {
-            let policy = PolicyFactory::create_by_name(name).unwrap();
+            let policy = policy(name);
             let err = apply_policy(&candidates, policy.as_ref(), &descriptor, None)
                 .await
                 .unwrap_err();
