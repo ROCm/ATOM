@@ -18,6 +18,7 @@ from types import ModuleType
 import grpc
 import setproctitle
 from fastapi import HTTPException
+from google.protobuf.json_format import MessageToDict
 
 from atom.entrypoints.grpc import atom_grpc_pb2 as pb
 from atom.entrypoints.grpc import atom_grpc_pb2_grpc as pb_grpc
@@ -44,7 +45,10 @@ from atom.entrypoints.openai.tool_parser.registry import channel_for_request
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
 from atom.model_engine.zmq_protocol import engine_v1_pb2 as v1
-from atom.structured_output.validation import schema_from_format
+from atom.structured_output.validation import (
+    raise_for_structured_error,
+    schema_from_format,
+)
 
 logger = logging.getLogger("atom")
 
@@ -58,6 +62,14 @@ STRUCTURED_FIELDS = (
     "structured_reasoning_end",
 )
 N_ABOVE_1 = "n above 1 is not served over gRPC; send one request each"
+# SamplingParams fields Generate does not serve: no logprobs in its answer, and the
+# structured ones derived from structured_output.
+UNSERVED_FIELDS = {
+    "logprobs_flag",
+    "logprobs_count",
+    "top_logprobs",
+    *STRUCTURED_FIELDS,
+}
 
 
 class StepOutputs:
@@ -115,17 +127,22 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
         output; a refusal answered with its status; streamed one chunk per step."""
         api, outputs = self.api, asyncio.Queue()
         seq, submitted, finished = None, False, False
+        self._log(request.request_id, "request", request)
         try:
+            _refuse_unserved(request.sampling)
             params, kv_transfer_params, stops = self._admission(request)
+            # An empty repeated field is an absent one.
             prompt = resolve_prompt_token_ids(
-                list(request.prompt_token_ids), kv_transfer_params
+                list(request.prompt_token_ids) or None, kv_transfer_params
             )
+            if prompt is None:
+                raise ValueError("prompt_token_ids is required")
             if request.HasField("structured_output"):
                 fields = await self._structured(
                     request, params, kv_transfer_params, stops
                 )
                 params = replace(params, **fields)
-            seq = await asyncio.get_running_loop().run_in_executor(
+            preprocessing = asyncio.get_running_loop().run_in_executor(
                 None,
                 partial(
                     api.engine.io_processor.preprocess,
@@ -139,6 +156,11 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
                     stop_token_sequences=stops,
                 ),
             )
+            try:
+                seq = await asyncio.shield(preprocessing)
+            except asyncio.CancelledError:  # the seq it registers is dropped once made
+                preprocessing.add_done_callback(partial(_drop_preprocessed, api))
+                raise
             self.live.setdefault(request.request_id, set()).add(seq.id)
             api._validate_sequence_context_length(seq, params)
             await api._submit_engine_requests([seq])
@@ -147,6 +169,7 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
             while not finished:
                 output = await outputs.get()
                 finished = output.finished
+                raise_for_structured_error(output.finish_reason)  # HTTP chat's 500
                 ids += output.output_tokens
                 cached = output.num_cached_tokens or cached
                 if request.stream and output.output_tokens:
@@ -156,7 +179,9 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
                         completion_tokens=len(ids),
                         cached_tokens=cached,
                     )
-                    await context.write(pb.GenerateResponse(chunk=chunk))
+                    await self._write(
+                        context, request, pb.GenerateResponse(chunk=chunk)
+                    )
             complete = pb.GenerateComplete(
                 output_ids=[] if request.stream else ids,
                 finish_reason=output.finish_reason,
@@ -167,9 +192,10 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
             if output.kv_transfer_params_output is not None:
                 kv_json = json.dumps(output.kv_transfer_params_output)
                 complete.kv_transfer_params_json = kv_json
-            await context.write(pb.GenerateResponse(complete=complete))
+            await self._write(context, request, pb.GenerateResponse(complete=complete))
         except Exception as error:  # noqa: BLE001 - answered as `_completions` does
-            await context.write(pb.GenerateResponse(error=_refusal(error, "Generate")))
+            refusal = pb.GenerateResponse(error=_refusal(error, "Generate"))
+            await self._write(context, request, refusal)
         finally:
             if seq is not None:
                 self._forget(request.request_id, seq.id)
@@ -348,6 +374,17 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
             session.drop(request.seq_id)
             raise
 
+    async def _write(self, context, request, response) -> None:
+        kind = "stream_chunk" if response.HasField("chunk") else "response"
+        self._log(request.request_id, kind, response)
+        await context.write(response)
+
+    def _log(self, request_id: str, kind: str, message) -> None:
+        """`message` in --request-log's file, as the HTTP routes log theirs."""
+        if self.api._request_logger is not None:
+            data = MessageToDict(message, preserving_proto_field_name=True)
+            self.api._log_request_event(kind, request_id, data)
+
     def _forget(self, request_id: str, seq_id: int) -> None:
         live = self.live.get(request_id, set())
         live.discard(seq_id)
@@ -383,6 +420,19 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
 
 def _optional(message, name: str, default=None):
     return getattr(message, name) if message.HasField(name) else default
+
+
+def _refuse_unserved(sampling) -> None:
+    unserved = sorted(
+        f.name for f, _ in sampling.ListFields() if f.name in UNSERVED_FIELDS
+    )
+    if unserved:
+        raise ValueError(f"Generate does not serve sampling fields {unserved}")
+
+
+def _drop_preprocessed(api: ModuleType, preprocessing: asyncio.Future) -> None:
+    if not preprocessing.cancelled() and preprocessing.exception() is None:
+        api.engine.io_processor.requests.pop(preprocessing.result().id, None)
 
 
 def _json(message, name: str, default=None):
