@@ -22,7 +22,10 @@
     "enforce_eager": true,
     "level": 0,
     "cudagraph_mode": "FULL",
-    "kv_transfer_config": "{}"
+    "kv_transfer_config": "{}",
+    "dcp_config": {
+      "comm_backend": "ag_rs"
+    }
   },
   "environment": {
     "ATOM_ENABLE_REPLAYSSM": "1",
