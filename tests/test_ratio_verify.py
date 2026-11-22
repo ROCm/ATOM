@@ -178,7 +178,8 @@ def test_a_row_without_a_finite_z_emits_its_argmax_not_id_0():
     assert (out[:, 0] == hot).all()
 
 
-def test_a_request_without_q_rejects_and_draws_from_p():
+@pytest.mark.parametrize("block", [False, True], ids=["token", "block"])
+def test_a_request_without_q_rejects_and_draws_from_p(block):
     torch.manual_seed(23)
     n = 30000
     p, q = sparse(VOCAB, P), sparse(VOCAB, Q)
@@ -193,6 +194,7 @@ def test_a_request_without_q_rejects_and_draws_from_p():
         ),
         q=draft_q(q),
         step=7,
+        block=block,
     )
     assert (accepted == 0).all()
     assert (out[:, 1:] == -1).all()
@@ -262,8 +264,9 @@ def test_a_reused_scratch_verifies_exactly_what_a_fresh_one_does(dtype, filters)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("block", [False, True], ids=["token", "block"])
 def test_the_startup_warmup_compiles_every_variant_a_serving_verify_launches(
-    dtype,
+    dtype, block
 ):
     """No warmup or capture forward verifies, so `warmup_ratio_verify` is what
     keeps the first sampled steps from compiling mid-serve: after it, a
@@ -287,7 +290,7 @@ def test_the_startup_warmup_compiles_every_variant_a_serving_verify_launches(
     for cache in caches:
         cache.clear()
     try:
-        warmup_ratio_verify(width, vocab, q_width, dtype, scratch)
+        warmup_ratio_verify(width, vocab, q_width, dtype, scratch, block)
         torch.cuda.synchronize()
         warmed = [len(cache) for cache in caches]
         assert all(warmed), [k.fn.__name__ for k, n in zip(kernels, warmed) if not n]
@@ -325,6 +328,7 @@ def test_the_startup_warmup_compiles_every_variant_a_serving_verify_launches(
                 step=3,
                 top_ks=top_ks_form,
                 top_ps=top_ps_form,
+                block=block,
             )
         torch.cuda.synchronize()
         grew = [
@@ -482,15 +486,17 @@ def test_the_reference_coins_are_tl_rand_bit_for_bit(seed, dtype):
     assert torch.equal(out, triton_rand(seed, offsets))
 
 
+@pytest.mark.parametrize("block", [False, True], ids=["token", "block"])
 @pytest.mark.parametrize("filtered", [False, True], ids=["p", "p_f"])
-def test_the_verify_decides_as_the_fp64_reference_on_the_same_coins(filtered):
+def test_the_verify_decides_as_the_fp64_reference_on_the_same_coins(filtered, block):
     """The verify against `ratio_verify_reference`, which shares none of its
     code: on the same Philox coins every request emits the reference's tokens
     and verdict, save one whose decision lies within rounding of its threshold
     (at most one a step). Greedy rows, requests without q, an emitted slot
     that does not hold the draft, a draft the store does not hold, stored
     entries that are not probabilities and, filtered, per-request top-k and
-    top-p cuts are all included."""
+    top-p cuts are all included. Under the block rule
+    too, which `ratio_verify_reference` walks with the same coins."""
     torch.manual_seed(61)
     batch_n, width, vocab = 96, 4, 2 * _RATIO_BLOCK_V + 500
     rows = batch_n * width
@@ -516,9 +522,11 @@ def test_the_verify_decides_as_the_fp64_reference_on_the_same_coins(filtered):
         top_ks = top_ks.repeat(batch_n)[:batch_n]
         top_ps = top_ps.repeat(batch_n)[:batch_n]
     for step in (0, 1, 2):
-        out, verdict = verify(**args, q=q, step=step, top_ks=top_ks, top_ps=top_ps)
+        out, verdict = verify(
+            **args, q=q, step=step, top_ks=top_ks, top_ps=top_ps, block=block
+        )
         ref_out, ref_verdict, undecided = ratio_verify_reference(
-            args, q, step, top_ks, top_ps
+            args, q, step, top_ks, top_ps, block
         )
         assert undecided.sum() <= 1, step
         decided = ~undecided
@@ -605,12 +613,15 @@ def test_the_first_token_follows_p_at_any_store_width(width, temperature):
     assert 0 < accepted.float().mean().item() < 1
 
 
+@pytest.mark.parametrize("block", [False, True], ids=["token", "block"])
 @pytest.mark.parametrize("width", [7, 50])
-def test_a_chained_block_follows_the_autoregressive_target(width):
+def test_a_chained_block_follows_the_autoregressive_target(width, block):
     """Three chained positions, each drafted from the last and scored by a
     target conditioned on it: every emitted token follows p(. | the token
     emitted before it) -- position 0 given the anchor, later positions among
-    the requests that reached them -- and none lands where p is 0."""
+    the requests that reached them -- and none lands where p is 0. Under the
+    token rule and the block rule alike: the block rule keeps the joint law,
+    so a request that reaches a position emits there from p given its prefix."""
     torch.manual_seed(79)
     n, vocab, rank, steps, anchor = 60000, 50, 16, 3, 3
     base, _, w1, w2 = tables(1, vocab, rank, seed=83)
@@ -658,6 +669,7 @@ def test_a_chained_block_follows_the_autoregressive_target(width):
         **verify_batch(drafts, steps, logits, temps),
         q=store,
         step=29,
+        block=block,
     )
     cond = torch.softmax(table, -1)
     given = torch.full((n,), anchor, dtype=torch.int64, device=DEV)
@@ -729,7 +741,8 @@ def test_a_mixed_batch_serves_each_request_its_own_p():
         torch.testing.assert_close(freq, p_f[0], rtol=0, atol=0.015)
 
 
-def test_each_position_of_a_filtered_block_is_served_its_own_p_f():
+@pytest.mark.parametrize("block", [False, True], ids=["token", "block"])
+def test_each_position_of_a_filtered_block_is_served_its_own_p_f(block):
     """Three draft positions per request, each scoring its own logits, under
     interleaved per-request filters (one kind unfiltered): every position a
     request reaches emits an id its own row keeps, at that row's p_f."""
@@ -759,6 +772,7 @@ def test_each_position_of_a_filtered_block_is_served_its_own_p_f():
         step=53,
         top_ks=ks,
         top_ps=ps,
+        block=block,
     )
     for i, kind in enumerate(kinds):
         kept, p_f = sampler_kept(target, temps[:width], ks[i].expand(width), ps[i])
@@ -890,3 +904,72 @@ def test_filters_that_keep_everything_leave_the_verify_bit_for_bit():
     ):
         got = verify(**args, q=q, step=3, top_ks=ks, top_ps=ps)
         assert torch.equal(got[0], ref[0]) and torch.equal(got[1], ref[1]), (ks, ps)
+
+
+def test_the_block_rule_accepts_no_fewer_drafts_than_the_token_rule():
+    """Sun et al.'s guarantee beside the law: on the same drafts, q, target
+    and coins, the block rule accepts at least as many drafts on average as
+    the token rule, and here, with q off p at every position, strictly more."""
+    torch.manual_seed(191)
+    n, width, vocab = 40000, 4, 64
+    target = torch.randn(width, vocab, device=DEV) * 2
+    q_rows = torch.softmax(target + torch.randn(width, vocab, device=DEV) * 1.5, -1)
+    drafts = torch.multinomial(q_rows, n, replacement=True).t().reshape(-1)
+    drafts = drafts.to(torch.int32)
+    store = draft_q(q_rows.repeat(n, 1), drafts)
+    args = verify_batch(drafts, width, target.repeat(n, 1), torch.ones(n, device=DEV))
+    _, (token, _, _) = verify(**args, q=store, step=67)
+    _, (block, _, _) = verify(**args, q=store, step=67, block=True)
+    token, block = token.float(), block.float()
+    se = ((token.var() + block.var()) / n).sqrt().item()
+    assert block.mean().item() > token.mean().item() + 3 * se, (
+        block.mean().item(),
+        token.mean().item(),
+    )
+
+
+def test_a_greedy_row_keeps_exact_match_under_the_block_rule():
+    """The block rule is for sampled requests with q only: a greedy row in
+    the same batch is verified by exact match against the target argmax."""
+    torch.manual_seed(193)
+    batch_n, width, vocab = 64, 3, 500
+    logits = torch.randn(batch_n * width, vocab, device=DEV)
+    q_rows = torch.softmax(torch.randn(batch_n * width, vocab, device=DEV), -1)
+    drafts = torch.multinomial(q_rows, 1).view(-1).to(torch.int32)
+    argmax = logits.argmax(-1).to(torch.int32)
+    drafts[::2] = argmax[::2]
+    temps = torch.tensor([SAMPLER_EPS, 1.0], device=DEV).repeat(batch_n // 2)
+    args = verify_batch(drafts, width, logits, temps)
+    q = draft_q(q_rows, drafts)
+    token = verify(**args, q=q, step=71)
+    block = verify(**args, q=q, step=71, block=True)
+    greedy = temps <= SAMPLER_EPS
+    assert torch.equal(token[0][greedy], block[0][greedy])
+    assert torch.equal(token[1][:, greedy], block[1][:, greedy])
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "input_ids",
+        "target_logits_indices",
+        "cu_num_draft_tokens",
+        "bonus_token_ids",
+        "bonus_logits_indices",
+    ],
+)
+def test_a_strided_flat_input_is_refused(name):
+    """The verify kernels read these at unit stride through raw pointers, so
+    a strided view would verify, and emit, other rows' tokens."""
+    batch_n, width, vocab = 4, 3, 100
+    logits = torch.randn(batch_n * width, vocab, device=DEV)
+    q_rows = torch.softmax(torch.randn(batch_n * width, vocab, device=DEV), -1)
+    drafts = torch.multinomial(q_rows, 1).view(-1).to(torch.int32)
+    args = verify_batch(drafts, width, logits, torch.ones(batch_n, device=DEV))
+    flat = args[name]
+    strided = torch.empty(flat.shape[0] * 2, *flat.shape[1:], dtype=flat.dtype)
+    strided = strided.to(DEV)[::2]
+    strided.copy_(flat)
+    args[name] = strided
+    with pytest.raises(AssertionError):
+        verify(**args, q=draft_q(q_rows, drafts), step=1)

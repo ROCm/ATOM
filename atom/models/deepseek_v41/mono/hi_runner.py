@@ -1077,8 +1077,8 @@ def install(model, atom_config, engram_mapping, draft) -> HiLayers | None:
     torch.set_default_dtype(torch.float32)
     torch.set_default_device("cpu")
     try:
-        # the builds from FlyDSL's disk cache where it holds them (a restart loads them untraced), their trace checks
-        # left to the CPU checks of the served programs (``hi.emit.compile.serving``)
+        # the builds from FlyDSL's disk cache where it holds them (a restart traces them but compiles none), their
+        # trace checks left to the CPU checks of the served programs (``hi.emit.compile.serving``)
         with serving():
             hook = HiLayers(model, atom_config, widths, max_ctx, engram_mapping, draft)
     finally:

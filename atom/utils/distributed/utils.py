@@ -10,7 +10,9 @@ from torch.distributed.distributed_c10d import (
     Backend,
     PrefixStore,
     _get_default_timeout,
+    _new_process_group_helper,
     _unregister_process_group,
+    _world,
 )
 from torch.distributed.rendezvous import rendezvous
 
@@ -35,15 +37,21 @@ def get_tcp_uri(ip: str, port: int) -> str:
 def raise_default_group_timeout(seconds: int) -> None:
     """Raise, never lower, the timeout torch gives groups created without one.
 
-    aiter builds its gloo groups that way. Across nodes their first collective
-    after the weight load waits for the slowest node, and a cold read of a large
-    checkpoint from NFS can trail another node's by more than the 30 minutes.
+    The default group and aiter's gloo and NCCL groups are built that way.
+    Across nodes their first collective after the weight load waits for the
+    slowest node, and a cold read of a large checkpoint from NFS can trail
+    another node's by more than torch's defaults (30 minutes for gloo, 10 for
+    NCCL).
     """
     from torch.distributed import distributed_c10d
 
+    floor = timedelta(seconds=seconds)
     distributed_c10d.default_pg_timeout = max(
-        distributed_c10d.default_pg_timeout, timedelta(seconds=seconds)
+        distributed_c10d.default_pg_timeout, floor
     )
+    nccl = distributed_c10d.default_pg_nccl_timeout
+    if nccl is not None:  # None in a torch built without NCCL
+        distributed_c10d.default_pg_nccl_timeout = max(nccl, floor)
 
 
 def raise_timeout_if_dp_spans_nodes(parallel_config) -> None:
@@ -56,6 +64,20 @@ def raise_timeout_if_dp_spans_nodes(parallel_config) -> None:
     """
     if parallel_config.data_parallel_size_local < parallel_config.data_parallel_size:
         raise_default_group_timeout(envs.ATOM_MULTINODE_PG_TIMEOUT_S)
+
+
+def raise_timeout_if_tp_spans_nodes(config) -> None:
+    """Apply ATOM_MULTINODE_PG_TIMEOUT_S when the TP group has ranks on other
+    nodes (tp_multinode.py), as raise_timeout_if_dp_spans_nodes does for DP."""
+    if config.is_multinode_tp:
+        raise_default_group_timeout(envs.ATOM_MULTINODE_PG_TIMEOUT_S)
+
+
+def kv_blocks_differ_across_ranks(config) -> bool:
+    """Whether ranks can size different KV pools: PP stages hold different
+    layers, and ranks on another node have their own free memory. Only rank
+    0's count reaches the scheduler, so these reduce to the global minimum."""
+    return config.pipeline_parallel_size > 1 or config.is_multinode_tp
 
 
 def init_gloo_process_group(
@@ -99,8 +121,40 @@ def init_gloo_process_group(
     return pg
 
 
+def init_nccl_process_group(
+    store: PrefixStore,
+    group_rank: int,
+    group_size: int,
+    group_name: str,
+    timeout: timedelta,
+) -> ProcessGroup:
+    """Stateless init of an NCCL ProcessGroup that ``broadcast`` can address.
+
+    Built by torch's own helper, which registers the group under its name;
+    the map to global ranks is identity, as the group's rank space is its own.
+    """
+    pg, _ = _new_process_group_helper(
+        group_size,
+        group_rank,
+        [],
+        Backend(Backend.NCCL),
+        store,
+        group_name=group_name,
+        timeout=timeout,
+    )
+    _world.pg_group_ranks[pg] = {i: i for i in range(group_size)}
+    return pg
+
+
 def stateless_init_torch_distributed_process_group(
-    host: str, port: int, rank: int, world_size: int, backend: str
+    host: str,
+    port: int,
+    rank: int,
+    world_size: int,
+    backend: str,
+    *,
+    group_name: str | None = None,
+    timeout: timedelta | None = None,
 ) -> ProcessGroup:
     """
     A replacement for `torch.distributed.init_process_group` that does not
@@ -132,10 +186,18 @@ def stateless_init_torch_distributed_process_group(
     are the same as process 1 and 5, the main communication channel is
     always formed with process 1, 2, ..., 8, and the additional communication
     channel is formed with process 9 and 10.
+
+    An NCCL group needs a *group_name*. It is registered with
+    torch.distributed, so ``broadcast`` works on it, and its store keys sit
+    under that name, where a trainer building its end the same way puts them.
+    *timeout* covers the rendezvous and the group's collectives alike.
     """
     init_method = get_tcp_uri(host, port)
     backend = Backend(backend)  # it is basically string
-    timeout = _get_default_timeout(backend)
+    if timeout is None:
+        timeout = _get_default_timeout(backend)
+    if backend == "nccl" and not group_name:
+        raise ValueError("an NCCL group needs a group_name")
 
     store, rank, world_size = next(
         rendezvous(init_method, rank, world_size, timeout=timeout)
@@ -146,7 +208,7 @@ def stateless_init_torch_distributed_process_group(
 
     # Use a PrefixStore to avoid accidental overrides of keys used by
     # different systems (e.g. RPC) in case the store is multi-tenant.
-    prefix_store = PrefixStore(init_method, store)
+    prefix_store = PrefixStore(group_name or init_method, store)
     if backend == "gloo":
         return init_gloo_process_group(
             backend=backend,
@@ -155,8 +217,33 @@ def stateless_init_torch_distributed_process_group(
             group_size=group_size,
             timeout=timeout,
         )
-    else:
-        raise ValueError(f"Unsupported backend: {backend}")
+    if backend == "nccl":
+        return init_nccl_process_group(
+            prefix_store, group_rank, group_size, group_name, timeout
+        )
+    raise ValueError(f"Unsupported backend: {backend}")
+
+
+def forget_process_group(pg: ProcessGroup) -> None:
+    """Drop torch.distributed's record of *pg*, as ``destroy_process_group``
+    does once the group's shutdown returns. After a shutdown that raised -- on
+    a broken communicator -- the record stays, and with it the group's name:
+    a group of that name cannot be built again."""
+    if pg not in _world.pg_map:
+        return
+    for record in (
+        _world.pg_map,
+        _world.pg_names,
+        _world.pg_group_ranks,
+        _world.pg_backend_config,
+        _world.pg_coalesce_state,
+    ):
+        record.pop(pg, None)
+    tag = _world.pg_to_tag.pop(pg, None)
+    for key in {tag, ""} - {None}:
+        if pg in _world.tags_to_pg.get(key, ()):
+            _world.tags_to_pg[key].remove(pg)
+    _unregister_process_group(pg.group_name)
 
 
 def stateless_destroy_torch_distributed_process_group(pg: ProcessGroup) -> None:

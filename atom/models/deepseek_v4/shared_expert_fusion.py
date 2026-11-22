@@ -19,11 +19,14 @@ _FUSED_SCALE_NATIVE_MX = {"quant_block_size": 32, "scale_dtype_fmt": "ue8m0"}
 _FUSED_SCALE_BLOCKSCALE = {"transpose_scale": True}
 
 
-def fused_scale_kwargs(native_a8_group_rows: Any | None) -> dict:
-    """Scale kwargs for ``fused_clamp_act_mul`` given ``w2``'s activation layout."""
+def fused_scale_kwargs(
+    native_a8_group_rows: Any | None, blockscale: bool
+) -> dict | None:
+    """Scale kwargs for ``fused_clamp_act_mul`` given ``w2``'s activation layout;
+    None for a ``w2`` that reads neither layout (per-channel FP8)."""
     if native_a8_group_rows is not None:
         return _FUSED_SCALE_NATIVE_MX
-    return _FUSED_SCALE_BLOCKSCALE
+    return _FUSED_SCALE_BLOCKSCALE if blockscale else None
 
 
 @cache
@@ -42,7 +45,7 @@ def shared_expert_fused_act_enabled(intermediate_per_rank: int) -> bool:
 
     The kernel asserts the half width is at least 128 and a multiple of 128.
     With the flag on and a width that fails that, log once per width and keep
-    the unfused path (V4.1-Flash at TP4 is 576, at TP8 is 288).
+    the unfused path (V4.1-Flash at TP4 is 576, at TP8 the padded 320).
     """
     if not envs.ATOM_V4_USE_TRITON_FUSION:
         return False
