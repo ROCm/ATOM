@@ -64,13 +64,19 @@ def init_pp_aware_dist_env(
     data_parallel_size: int = 1,
     prefill_context_model_parallel_size: int = 1,
     decode_context_parallel_size: int = 1,
+    local_rank: int = -1,
 ) -> None:
-    """PP-aware distributed init (aiter's init_dist_env pins pp=1)."""
+    """PP-aware distributed init (aiter's init_dist_env pins pp=1).
+
+    ``local_rank`` is this rank's GPU on its node, which every group binds to;
+    -1 lets aiter take the global rank, right only when every rank is local.
+    """
     set_custom_all_reduce(True)
     init_distributed_environment(
         world_size=world_size,
         rank=global_rank,
         distributed_init_method=distributed_init_method,
+        local_rank=local_rank,
         backend=backend,
         data_parallel_size=1,
     )
@@ -94,8 +100,10 @@ def init_pp_aware_dist_env(
     # its own pools and copy-in path; nothing further is needed.
 
     logger.debug(
-        "init_pp_aware_dist_env: global_rank=%d tp=%d pp=%d pcp=%d dp=%d world=%d",
+        "init_pp_aware_dist_env: global_rank=%d local_rank=%d tp=%d pp=%d pcp=%d "
+        "dp=%d world=%d",
         global_rank,
+        local_rank,
         tensor_model_parallel_size,
         pipeline_model_parallel_size,
         prefill_context_model_parallel_size,
