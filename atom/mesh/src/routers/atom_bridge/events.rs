@@ -314,13 +314,17 @@ impl SeqEventSource {
     }
 }
 
-/// The engine's reasons in OpenAI's terms (`Sequence.leave_reason`).
+/// The engine's reason (`Sequence.leave_reason`) in OpenAI's terms, as the
+/// Python server's `openai_stop_reason` maps it: a length cap is `length`,
+/// and every other end -- `eos`, `stop_sequence`, `stop_<token_id>` (a model
+/// with more than one EOS), `aborted`, `rejected`, `unschedulable: ...`, or
+/// none -- is `stop`. Passing an unknown reason through would reach the
+/// client as a `finish_reason` it does not know, and the render upgrades
+/// only `stop` to `tool_calls` when the reply called a tool.
 pub(crate) fn finish_reason(reason: Option<&str>) -> FinishReason {
     match reason {
-        None | Some("eos") | Some("stop_sequence") | Some("stop") => FinishReason::Stop,
-        Some("max_tokens") | Some("length") => FinishReason::Length,
-        Some("aborted") | Some("abort") => FinishReason::Abort,
-        Some(other) => FinishReason::Other(other.to_string()),
+        Some("max_tokens" | "max_new_tokens" | "length") => FinishReason::Length,
+        _ => FinishReason::Stop,
     }
 }
 
@@ -465,6 +469,28 @@ mod tests {
         assert_eq!(outputs, vec![vec![5, 6], vec![7]]);
         drop(source);
         assert_eq!(aborter.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn engine_reasons_map_as_the_python_server_maps_them() {
+        for reason in ["max_tokens", "max_new_tokens", "length"] {
+            assert!(matches!(finish_reason(Some(reason)), FinishReason::Length));
+        }
+        for reason in [
+            "eos",
+            "stop_sequence",
+            "stop_151645",
+            "aborted",
+            "rejected",
+            "unschedulable: prompt too long",
+            "",
+        ] {
+            assert!(
+                matches!(finish_reason(Some(reason)), FinishReason::Stop),
+                "{reason}"
+            );
+        }
+        assert!(matches!(finish_reason(None), FinishReason::Stop));
     }
 
     #[test]
