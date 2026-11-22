@@ -1,0 +1,169 @@
+{
+  "kind": "719 exact BF16 Opus native input; data only",
+  "payload": {
+    "path": "native/module_fmha_fwd_bf16_opus.so",
+    "bytes": 1216968,
+    "sha256": "8de672a1e25b9d05807d42643809618a502e589862f63c859ddec3e35805403b"
+  },
+  "sources": {
+    "aiter": {
+      "repository": "https://github.com/ROCm/aiter",
+      "commit": "b9e08daca8c45dd758f4fa1fbb7d0da027f399c9",
+      "license": "licenses/aiter-MIT.txt"
+    },
+    "composable_kernel": {
+      "repository": "https://github.com/ROCm/composable_kernel",
+      "commit": "f93c029e09f67c983696eecac8e0e0350f3dbb54",
+      "license": "licenses/composable-kernel-MIT.txt"
+    },
+    "pytorch": {
+      "repository": "https://github.com/ROCm/pytorch",
+      "commit": "3d3aa833db84eed6b7f5595cb5f162c2f78300a4",
+      "license": "licenses/pytorch-BSD.txt"
+    },
+    "pybind11": {
+      "repository": "https://github.com/pybind/pybind11",
+      "commit": "d03662f0984f652b60e7ddce53d3868002275197",
+      "license": "licenses/pybind11-BSD.txt"
+    }
+  },
+  "primary_translation_units": [
+    {
+      "path": "csrc/py_itfs_cu/fmha_fwd_bf16_opus_kernels.cu",
+      "mode": "100644",
+      "kind": "blob",
+      "git_blob": "854b2b01044d13624a53f2bc5b6a594dbcc768fe",
+      "bytes": 22864,
+      "repository": "aiter",
+      "commit": "b9e08daca8c45dd758f4fa1fbb7d0da027f399c9",
+      "sha256": "6ca2c52629031eb270ce3788acb96af3e634001fa01b3b0a7515d44f2e68ce4f"
+    },
+    {
+      "path": "csrc/pybind/fmha_fwd_bf16_opus_pybind.cu",
+      "mode": "100644",
+      "kind": "blob",
+      "git_blob": "e992a3b9020a11dcb5b91caeb81013887aaa1c19",
+      "bytes": 249,
+      "repository": "aiter",
+      "commit": "b9e08daca8c45dd758f4fa1fbb7d0da027f399c9",
+      "sha256": "030e93b8828f95c303b0bb1f383a81b0a11cd92424943c1a27f30da62dcabbe7"
+    }
+  ],
+  "source_modifications": "Translation units and vendored OPUS/CK headers unchanged. Separately frozen CPU build adapter limited workers and requested this module; no kernel-source edit.",
+  "source_copyright": "Primary Opus translation units: SPDX-License-Identifier MIT; Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.",
+  "build": {
+    "source_closure_sha256": "ccdbcfd6b3e544c4213f8dda6c1aa59866d2a8326551edf08047af9e1c7ac99b",
+    "build_freeze_sha256": "8d5edd62796c31093d82af1b2fb00ee681a9baf139ed38d4f3d2b2c95c3ea841",
+    "result_sha256": "d37a35bf86b05f33a40e3de8171c5f3972b5a6e392aff960d5ef244fe3239675",
+    "ninja_sha256": "dd041d2054aca826b5ac406cb5ff3c26915422d14025e36368bbeb3050accbbb",
+    "toolchain_preflight_sha256": "be9fd5e9b8e430e6a8ffa5ef7c43a5455996e03cf1ab56dda57a5ca0083b09d5",
+    "offload_architecture": "gfx950",
+    "CXX11_ABI": 1,
+    "python": "3.12",
+    "pybind11": "3.0.4",
+    "torch_distribution": "2.10.0+rocm7.2.4.lw.git3d3aa833",
+    "worker_limit": 1,
+    "built_once": true
+  },
+  "CPU_qualification": {
+    "freeze_sha256": "ede815a106ea3b80b84bfd41c6aae64f4d92ace4a3ff57627ee10301c252921e",
+    "result_sha256": "9c6432f4c3518cca7cc0fe706351a0c2db8545b011accd550da510492ba1e143",
+    "status": "PASSED_CPU_HOST_LOADER_ONLY",
+    "image_manifest": "sha256:ea74fa0b05d8c7a062ae235b901cb2b1bc0c169b0a5edd7ca07bfa3b967ca462",
+    "image_config": "sha256:67f3f06c5b90e86eeb6d25ff9075826d4e97c439ecaf7e8d7ecc41ade75b99d6",
+    "assessment_sha256": "1934f29f78d347a1c175a31388331e9266ac571ea3caaa3f6dedcaa95745606e"
+  },
+  "dynamic_dependencies": {
+    "libc10.so": {
+      "path": "/opt/venv/lib/python3.12/site-packages/torch/lib/libc10.so",
+      "sha256": "a2b8514c5583f9a03677b444545576e8c4cd8706c5800132e06f1312e398435b",
+      "required_versions": []
+    },
+    "libc10_hip.so": {
+      "path": "/opt/venv/lib/python3.12/site-packages/torch/lib/libc10_hip.so",
+      "sha256": "e5d747a3b1ad15155a3d518d82d16a342b30e80149720e4fdab68dcf6e485241",
+      "required_versions": []
+    },
+    "libtorch_cpu.so": {
+      "path": "/opt/venv/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so",
+      "sha256": "251f90b2df1c949656599443debc3a8478b54fe6900a98671ac2129f49a614a2",
+      "required_versions": []
+    },
+    "libtorch_python.so": {
+      "path": "/opt/venv/lib/python3.12/site-packages/torch/lib/libtorch_python.so",
+      "sha256": "a26a56453b27357d49f6834c3899506572de374eb9390688b74b35e4e0d3f9b3",
+      "required_versions": []
+    },
+    "libamdhip64.so.7": {
+      "path": "/opt/rocm-7.2.4/lib/libamdhip64.so.7.2.53211-b539bf7",
+      "sha256": "bc630e9baaec84cf2ff5446bcfb509322e9e3ff1dcfab022ec091fe3a0bd490f",
+      "required_versions": [
+        "hip_4.2",
+        "hip_6.0"
+      ]
+    },
+    "libstdc++.so.6": {
+      "path": "/usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.33",
+      "sha256": "1fd75fe70354a416d75aef22bcae68c47bd25d20e2d0568c30b1a9838cf62f11",
+      "required_versions": [
+        "CXXABI_1.3",
+        "CXXABI_1.3.2",
+        "CXXABI_1.3.3",
+        "CXXABI_1.3.5",
+        "CXXABI_1.3.9",
+        "GLIBCXX_3.4",
+        "GLIBCXX_3.4.11",
+        "GLIBCXX_3.4.18",
+        "GLIBCXX_3.4.20",
+        "GLIBCXX_3.4.21",
+        "GLIBCXX_3.4.29",
+        "GLIBCXX_3.4.31",
+        "GLIBCXX_3.4.9"
+      ]
+    },
+    "libgcc_s.so.1": {
+      "path": "/usr/lib/x86_64-linux-gnu/libgcc_s.so.1",
+      "sha256": "d93224d2b0dab4247598be683adca02f5cf00586f99c187579cd7e92058fb7cb",
+      "required_versions": [
+        "GCC_3.0"
+      ]
+    },
+    "libc.so.6": {
+      "path": "/usr/lib/x86_64-linux-gnu/libc.so.6",
+      "sha256": "755a371e86cc9f564ab54f66140747700fb0a103f698f659f2060f707897e09a",
+      "required_versions": [
+        "GLIBC_2.14",
+        "GLIBC_2.2.5",
+        "GLIBC_2.32"
+      ]
+    },
+    "ld-linux-x86-64.so.2": {
+      "path": "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+      "sha256": "5fc0940888e9d2e1a00e66d6b1a559c36364ee867683652e1074fa576952cc3f",
+      "required_versions": [
+        "GLIBC_2.3"
+      ]
+    }
+  },
+  "distribution_scope": "Only this extension is included. Shared runtime libraries are external prerequisites and are not redistributed. Exact upstream refs and applicable project copyright/license notices accompany this input.",
+  "limits": "CPU host-loader evidence does not qualify GPU numerics or the model. Normal AITER get_module/build_ctypes_module, gfx950 recognition, source/alias/origin checks and frozen model gates remain required.",
+  "licenses": {
+    "aiter-MIT.txt": {
+      "bytes": 1100,
+      "sha256": "0baca809927cad448401b252ce3bae12687c2987597ad7088cf3423f872d5bcd"
+    },
+    "composable-kernel-MIT.txt": {
+      "bytes": 1726,
+      "sha256": "20f3b83dfda01bd18d285e0edbb9d044be6dde04cdf76a1ec18d9fc7127936bf"
+    },
+    "pybind11-BSD.txt": {
+      "bytes": 1684,
+      "sha256": "83965b843b98f670d3a85bd041ed4b372c8ec50d7b4a5995a83ac697ba675dcb"
+    },
+    "pytorch-BSD.txt": {
+      "bytes": 3464,
+      "sha256": "bd018feef8825e88181c84eb7e3aa4eafb8f08a20d9fd6ef948569610c4a3e43"
+    }
+  },
+  "model_execution_authorized": false
+}
