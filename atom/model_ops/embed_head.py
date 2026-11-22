@@ -329,6 +329,11 @@ class ParallelLMHead(VocabParallelEmbedding):
                 x = x[last_indices].contiguous()
             if self._can_use_dp_sharded_head(context):
                 return self._dp_sharded_logits(x, envs.ATOM_DP_LM_HEAD_MODE)
+        # ATOM_VERIFY_LM_HEAD_FP8: the target's logits from the FP8 copy of the head
+        # (ModelRunner._install_verify_lm_head_fp8; TP1, no bias). Numerical change.
+        verify_fp8 = getattr(self, "verify_fp8", None)
+        if verify_fp8 is not None:
+            return verify_fp8.mm(x, prepared=False)
         logits = tgemm.mm(x, self.weight, self.bias)
         if self.tp_size > 1:
             use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
