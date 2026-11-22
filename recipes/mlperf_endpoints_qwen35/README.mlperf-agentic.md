@@ -27,6 +27,11 @@ LPT does not depend on it (only the program-to-block mapping changes, bitwise wi
 | c512 | 302.5 | | **320.7** (+6.0%) | | | 0.564 |
 | c1024 | (11-20 base 151.4) | 157.8 / 157.8 | **159.8** (+1.3%) | **158.0** (+0.8% vs 156.8, the 11-20 settings without fixed max; accuracy 0.5677) | + fp8 verify head: 161.4 (+1.0%) | 0.5683 |
 
+Official-length run of the recipe default at c1024 (no fixed max, LPT; `CAP_MIN=600`, 19,616 trajectories,
+`run_official_host.sh <container> 1024`): **e2e 137.0, 86,606 tok/s, accuracy 0.5615** (coding 0.5312, workflow 0.7018),
+609,122 / 609,122 requests, 0 failed, 44.1 minutes, TTFT p99 1.42 s. The 2026-11-20 official-length run with fixed max:
+e2e 136.6, 86,613 tok/s, accuracy 0.5627.
+
 Notes:
 - Fixed max (optional now) is worth +1.1% at c1024 (158.0 -> 159.8) and +1.5% at c384 (405.2 -> 411.1) in these runs; the
   c64, c256 and c512 numbers above were measured with it on.
