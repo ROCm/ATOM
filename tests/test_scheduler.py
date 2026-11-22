@@ -2,6 +2,7 @@
 # Tests for atom/model_engine/scheduler.py — public API only
 
 
+import itertools
 import logging
 import time
 from collections import deque
@@ -2263,7 +2264,7 @@ class TestInitialRampWithTheDelayer:
             fires[ramp] = delayer._stat_fire_ramp
         on = runs[True]
         assert fires == {True: 1, False: 0}
-        assert not any(a and b for a, b in zip(on[1:], on[2:]))
+        assert not any(a and b for a, b in itertools.pairwise(on[1:]))
         assert on.count(0) >= runs[False].count(0) - 1
 
 
