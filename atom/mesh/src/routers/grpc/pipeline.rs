@@ -381,14 +381,10 @@ fn make_load_guards(plan: &mut PlacementPlan, headers: Option<&HeaderMap>) -> Ve
         PlacementPlan::Pair {
             prefill,
             decode,
-            prefill_load,
             decode_load,
             ..
         } => {
-            let prefill_guard = match prefill_load.take() {
-                Some(reservation) => WorkerLoadGuard::adopt(reservation),
-                None => WorkerLoadGuard::new(prefill.clone(), headers),
-            };
+            let prefill_guard = WorkerLoadGuard::new(prefill.clone(), headers);
             let decode_guard = match decode_load.take() {
                 Some(reservation) => WorkerLoadGuard::adopt(reservation),
                 None => WorkerLoadGuard::new(decode.clone(), headers),

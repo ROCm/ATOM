@@ -263,8 +263,8 @@ pub struct CliArgs {
     #[arg(long, default_value_t = 1.25, help_heading = "Routing Policy")]
     pub prefix_hash_load_factor: f64,
 
-    /// Tokens the agentic policy charges per in-flight request; keep it equal to
-    /// the engine's ATOM_DP_LB_REQ_EQUIV
+    /// Tokens the agentic and least_load policies charge per in-flight request; keep
+    /// it equal to the engine's ATOM_DP_LB_REQ_EQUIV
     #[arg(long, default_value_t = 512, help_heading = "Routing Policy")]
     pub agentic_request_token_equivalent: u64,
 

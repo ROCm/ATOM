@@ -843,7 +843,6 @@ mod e_engine_dispatch {
             prefill_policy: "rr",
             decode_policy: "rr",
             prefill_tokens: 0,
-            prefill_load: None,
             decode_load: None,
         };
         match Dispatcher::dispatch(&e, &plan, &mut basic_payload()).await {
@@ -883,7 +882,6 @@ mod e_engine_dispatch {
             prefill_policy: "rr",
             decode_policy: "rr",
             prefill_tokens: 0,
-            prefill_load: None,
             decode_load: None,
         };
         let _s = mock.dispatch(&plan, &mut basic_payload()).await.unwrap();
