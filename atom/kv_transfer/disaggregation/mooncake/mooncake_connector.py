@@ -77,8 +77,10 @@ from atom.kv_transfer.disaggregation.sharded_transfer import (
     consumer_head_slices,
 )
 from atom.kv_transfer.disaggregation.staging_config import (
+    kimi_mla_admitted,
     kimi_state_landing_configured,
     kimi_state_staging_reserve_bytes,
+    kv_staging_reserve_bytes,
     landing_reserve_bytes,
     landing_spec,
     minimax_page_staging,
@@ -1281,7 +1283,10 @@ class MooncakeConnector(KVConnectorBase):
         self._kv_staging: torch.Tensor | None = None
         self._kv_staging_slots = SlotPool()
         self._kv_source_views = {}
-        self._kv_staging_reserve = staging_reserve_bytes(config)
+        # The KV pool's share only: the KDA state pool is reserved apart.
+        self._kv_staging_reserve = kv_staging_reserve_bytes(config)
+        # Kimi-K3 registers slot regions, yet its MLA rows stage and land.
+        self._slot_mla_rows = kimi_mla_admitted(config)
         self._page_staging_enabled = minimax_page_staging(config)
         self._state_staging: torch.Tensor | None = None
         self._state_staging_slots = SlotPool()
@@ -1432,10 +1437,13 @@ class MooncakeConnector(KVConnectorBase):
     # Class-level so a connector built without __init__ keeps the per-token
     # paths; register_kv_caches sets the instance values.
     _kv_staging: torch.Tensor | None = None
+    _slot_mla_rows = False
     _landing: LandingReceiver | None = None
     _state_landing: LandingReceiver | None = None
     _state_landing_credits: LandingCredits | None = None
     _state_staging: torch.Tensor | None = None
+    _state_staging_reserve = 0
+    _state_landing_enabled = False
     _state_region_views = None
 
     def _rdma_chunk_units(self, unit_bytes: int) -> int:
@@ -1748,8 +1756,14 @@ class MooncakeConnector(KVConnectorBase):
         self._await_listener()
 
     def _build_kv_staging(self, tt) -> KVTransferRegion | None:
-        """One bounded pool for every eligible byte-layout adapter on this P rank."""
-        if not self._kv_staging_reserve or self._has_slot_regions:
+        """One bounded pool for every eligible byte-layout adapter on this P rank.
+
+        A slot backend stages only Kimi-K3's MLA rows; its index pages and KDA
+        slots have pools of their own.
+        """
+        if not self._kv_staging_reserve or (
+            self._has_slot_regions and not self._slot_mla_rows
+        ):
             return None
         views = tt.block_tensor_views
         if len(views) != len(tt.block_regions):
@@ -1805,7 +1819,7 @@ class MooncakeConnector(KVConnectorBase):
 
     def _build_landing(self) -> LandingReceiver | None:
         spec = self._landing_spec
-        if spec is None or self._has_slot_regions:
+        if spec is None or (self._has_slot_regions and not self._slot_mla_rows):
             return None
         regions = [
             i
@@ -3725,9 +3739,17 @@ class MooncakeConnector(KVConnectorBase):
         regions: list[int],
         *,
         token_ownership: DCPShardPlan | None = None,
+        consumer_addrs: list[int] | None = None,
     ) -> TransferPlan:
-        """Resolve rank ownership before byte addressing; no attention-family dispatch."""
+        """Resolve rank ownership before byte addressing; no attention-family dispatch.
+
+        ``consumer_addrs`` are the consumer's PAGE region bases, which a slot
+        request sends under its own key; a block-only one's are the default.
+        """
         widths = request.get("consumer_block_bpb")
+        bases = (
+            request["consumer_base_addrs"] if consumer_addrs is None else consumer_addrs
+        )
         layouts = []
         for region in regions:
             consumer = cmap[region]
@@ -3736,7 +3758,7 @@ class MooncakeConnector(KVConnectorBase):
                 RegionLayout(
                     region,
                     consumer,
-                    request["consumer_base_addrs"][consumer],
+                    bases[consumer],
                     width,
                     widths[consumer] if widths is not None else width,
                 )
@@ -4197,6 +4219,7 @@ class MooncakeConnector(KVConnectorBase):
         sharded_plan = None
         sharded_runs = None
         stages_sharded_index = False
+        stages_token_units = False
         if consumer_dcp_size > 1 and self.dcp_size == 1:
             sharded_plan = self._consumer_dcp_plan(
                 request_data, src_block_ids, dst_block_ids
@@ -4205,7 +4228,13 @@ class MooncakeConnector(KVConnectorBase):
             stages_sharded_index = self._stages_sharded_index(
                 request_data.get("consumer_dcp_interleave", 1)
             )
+            # As on the block-only path: without the ready event the gather
+            # could read KV still being written, so the rows go per token.
+            stages_token_units = (
+                self._kv_staging is not None and kv_cache_ready_event is not None
+            )
         staged_index_regions: list[tuple[int, int, int]] = []
+        staged_token_regions: list[int] = []
         deadline = request_data.get("_deadline")
         batch = _RdmaBatch(
             lambda srcs, dsts, lens: self._rdma_write(
@@ -4235,6 +4264,11 @@ class MooncakeConnector(KVConnectorBase):
             ):
                 staged_index_regions.append((region_idx, dst_base, bpb))
                 continue
+            elif stages_token_units and region_idx in self._kv_source_views:
+                # Validate only: _make_staging_plan addresses its tokens.
+                self._dcp_token_unit(region_idx, bpb)
+                staged_token_regions.append(region_idx)
+                continue
             else:
                 srcs, dsts, lens = self._dcp_token_descriptors(
                     region_idx, src_base, dst_base, bpb, sharded_runs
@@ -4246,9 +4280,9 @@ class MooncakeConnector(KVConnectorBase):
         if blocks_only:
             # Unreachable: the chunked path refuses a slot transfer to a DCP
             # consumer (`has_slot_regions` with `consumer_dcp_size > 1`).
-            if staged_index_regions:
+            if staged_index_regions or staged_token_regions:
                 raise RuntimeError(
-                    "staged DSA index regions in a chunked slot transfer"
+                    "staged MLA or DSA index regions in a chunked slot transfer"
                 )
             return batch.flush()
 
@@ -4289,6 +4323,24 @@ class MooncakeConnector(KVConnectorBase):
 
         if not batch.flush():
             logger.error("[PRODUCER] block transfer failed for req %s", req_id)
+            return False
+        # MLA rows, then index pages, then KDA state: all before write-done.
+        if staged_token_regions and not self._execute_staged_transfer(
+            request_data,
+            target,
+            self._make_staging_plan(
+                request_data,
+                src_block_ids,
+                dst_block_ids,
+                block_cmap,
+                staged_token_regions,
+                token_ownership=sharded_plan,
+                consumer_addrs=consumer_block_addrs,
+            ),
+            req_id,
+            kv_cache_ready_event,
+            engine=engine,
+        ):
             return False
         if staged_index_regions and not self._execute_staged_index_regions(
             target,

@@ -2433,6 +2433,616 @@ def test_two_landing_receivers_finish_a_request_once():
     assert done == [("r", True), ("solo", False)]
 
 
+# ---------------------------------------------------------------------------
+# Kimi-K3.1's MLA rows on the slot path. A PP stage gathers a DCP rank's rows
+# into staging and writes or lands them, beside its index pages and KDA state.
+# The per-token direct path the staging replaces is the byte reference.
+# ---------------------------------------------------------------------------
+
+_K_BLOCK = 16
+_K_ROW = 8  # one MLA row
+_K_IDX_ROW = 4  # one index row
+_K_MLA_PAGE = _K_BLOCK * _K_ROW
+_K_IDX_PAGE = _K_BLOCK * _K_IDX_ROW
+_K_SRC_PAGES = 6
+# This stage: a target MLA row, a DSpark draft row and one index layer, after
+# `_pp_stage_connector`'s KDA slots. Five source pages are 80 tokens, so each
+# of two DCP ranks owns 40: two full destination pages and half a third.
+_K_MLA_SRC = (1024, 2048)
+_K_IDX_SRC = 3072
+_K_SRC_BLOCKS = (4, 1, 5, 2, 0)
+# The PP=1 peer: three MLA rows, two index layers and the KDA slots.
+_K_DST_MLA = [8192 + i * 1024 for i in range(3)]
+_K_DST_IDX = [11264 + i * 512 for i in range(2)]
+_K_DST_SLOT = [16384 + i * 1024 for i in range(7)]
+_K_DST_BLOCKS = (6, 2, 3)
+_K_IDX_STAGING = 24576
+_K_KV_STAGING = 32768
+
+
+class _PtrNic(_ByteNic):
+    """A `_ByteNic` that also takes real addresses, which a torch staging slot
+    or landing pool names its bytes by: an address past ``mem`` is a pointer.
+    Counts descriptors per write label."""
+
+    def __init__(self):
+        np = pytest.importorskip("numpy")
+        self.mem = np.random.default_rng(31).integers(0, 256, 1 << 16, dtype=np.uint8)
+        self.descriptors = {}
+
+    def ptr(self, addr):
+        return self.mem.ctypes.data + addr if addr < self.mem.size else addr
+
+    def tensor(self, start, stop):
+        torch = pytest.importorskip("torch")
+        return torch.from_numpy(self.mem[start:stop])
+
+    def write(
+        self, _target, src, dst, sizes, _req_id, label, *, engine=None, deadline=None
+    ):
+        import ctypes
+
+        for s, d, n in zip(src, dst, sizes):
+            ctypes.memmove(self.ptr(int(d)), self.ptr(int(s)), int(n))
+        self.descriptors[label] = self.descriptors.get(label, 0) + len(src)
+        return True
+
+    def compared(self):
+        """Sources, then every destination a transfer writes."""
+        np = pytest.importorskip("numpy")
+        return np.concatenate(
+            [self.mem[:4096], self.mem[8192:12288], self.mem[16384:23552]]
+        )
+
+
+def _kimi_stage(mc, nic, *, slot_bytes=None):
+    """A Kimi-K3.1 PP stage on ``nic``: `_pp_stage_connector`'s KDA slots, two
+    MLA rows and one index layer at a 16-token block. ``slot_bytes`` arms MLA
+    staging with two slots of that size; without it the rows go per token."""
+    from atom.kv_transfer.disaggregation.mooncake.landing import LandingCredits
+    from atom.kv_transfer.disaggregation.types import INDEX_CACHE_ROLE, MLA_KV_ROLE
+
+    connector = _pp_stage_connector(mc, nic)
+    connector.pp_rank = 1
+    connector.block_size = _K_BLOCK
+    bases = [*_K_MLA_SRC, _K_IDX_SRC]
+    widths = [_K_MLA_PAGE, _K_MLA_PAGE, _K_IDX_PAGE]
+    connector._block_regions = list(zip(bases, widths))
+    connector._per_block_bytes_list = widths
+    connector._block_region_roles = [MLA_KV_ROLE, MLA_KV_ROLE, INDEX_CACHE_ROLE]
+    connector._block_head_major_runs = [None] * 3
+    connector._block_region_consumer_indices = [1, 2, 4]
+    connector._send_worker_stream = MagicMock()
+    connector._landing_credits = LandingCredits()
+    # The backend packs a rank's index rows into preshuffled 16-row tiles; this
+    # stand-in packs them row by row, enough to see them reach the peer.
+    connector._index_staging_chunk_pages = 256
+    connector._index_staging_slots = mc.SlotPool(1)
+    connector._prepare_sharded_index = lambda plan: plan.source_token_per_dst_token()
+
+    def gather(region, tokens, _pool_idx):
+        base = connector._block_regions[region][0]
+        for j, token in enumerate(tokens):
+            src = base + int(token) * _K_IDX_ROW
+            dst = _K_IDX_STAGING + j * _K_IDX_ROW
+            nic.mem[dst : dst + _K_IDX_ROW] = nic.mem[src : src + _K_IDX_ROW]
+        return _K_IDX_STAGING, len(tokens) // _K_BLOCK
+
+    connector._gather_sharded_index = gather
+    if slot_bytes is not None:
+        connector._kv_staging = nic.tensor(
+            _K_KV_STAGING, _K_KV_STAGING + 2 * slot_bytes
+        ).view(2, slot_bytes)
+        connector._kv_staging_slots = mc.SlotPool(2)
+        connector._kv_source_views = {
+            i: nic.tensor(base, base + _K_SRC_PAGES * _K_MLA_PAGE)
+            for i, base in enumerate(_K_MLA_SRC)
+        }
+    return connector
+
+
+def _kimi_request(dcp_rank, *, dcp=2):
+    from atom.kv_transfer.disaggregation.types import INDEX_CACHE_ROLE, MLA_KV_ROLE
+
+    request = _dcp_tp_request()
+    request.update(
+        request_id="req-1",
+        write_nonce=5,
+        notify_host="decode",
+        notify_port=9,
+        consumer_block_base_addrs=_K_DST_MLA + _K_DST_IDX,
+        consumer_block_bpb=[_K_MLA_PAGE] * 3 + [_K_IDX_PAGE] * 2,
+        consumer_region_roles=[MLA_KV_ROLE] * 3 + [INDEX_CACHE_ROLE] * 2,
+        consumer_slot_base_addrs=_K_DST_SLOT,
+        consumer_dcp_size=dcp,
+        consumer_dcp_rank=dcp_rank,
+    )
+    return request
+
+
+def _kimi_transfer(mc, connector, request, dst_blocks=_K_DST_BLOCKS, ready=True):
+    return mc.MooncakeConnector._execute_block_slot_transfer(
+        connector,
+        request,
+        "consumer:1234",
+        list(_K_SRC_BLOCKS),
+        list(dst_blocks),
+        {"slot_index": 5},
+        "req-1",
+        kv_cache_ready_event=object() if ready else None,
+    )
+
+
+def _kimi_oracle(mc, dcp_rank, *, dcp=2, dst_blocks=_K_DST_BLOCKS):
+    """Today's path: no MLA staging, so the rows go one token per descriptor."""
+    nic = _PtrNic()
+    assert _kimi_transfer(
+        mc, _kimi_stage(mc, nic), _kimi_request(dcp_rank, dcp=dcp), dst_blocks
+    )
+    assert "staged-kv" not in nic.descriptors
+    return nic
+
+
+def _assert_rank_rows(nic, before, dcp_rank):
+    """Row j of a DCP rank is global token ``j * 2 + rank``, at token j % 16
+    of destination page j // 16, worked out apart from either plan."""
+    np = pytest.importorskip("numpy")
+    owned = np.arange(dcp_rank, len(_K_SRC_BLOCKS) * _K_BLOCK, 2)
+    tokens = np.asarray(_K_SRC_BLOCKS)[owned // _K_BLOCK] * _K_BLOCK + owned % _K_BLOCK
+    for src_base, dst_base, row in (
+        (_K_MLA_SRC[0], _K_DST_MLA[1], _K_ROW),
+        (_K_MLA_SRC[1], _K_DST_MLA[2], _K_ROW),
+        (_K_IDX_SRC, _K_DST_IDX[1], _K_IDX_ROW),
+    ):
+        for j, token in enumerate(tokens):
+            page = _K_DST_BLOCKS[j // _K_BLOCK]
+            dst = dst_base + (page * _K_BLOCK + j % _K_BLOCK) * row
+            src = src_base + int(token) * row
+            assert (nic.mem[dst : dst + row] == before[src : src + row]).all()
+
+
+@pytest.mark.parametrize("dcp_rank", [0, 1])
+def test_kimi_staged_mla_rows_match_the_per_token_path(_no_cuda_stream, dcp_rank):
+    """One slot holds both rows' 40 tokens, so each goes out as one descriptor
+    per run of adjacent destination pages instead of one per token."""
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    oracle = _kimi_oracle(mc, dcp_rank)
+    nic = _PtrNic()
+    before = nic.mem.copy()
+    connector = _kimi_stage(mc, nic, slot_bytes=1024)
+
+    assert _kimi_transfer(mc, connector, _kimi_request(dcp_rank))
+
+    assert (nic.compared() == oracle.compared()).all()
+    _assert_rank_rows(nic, before, dcp_rank)
+    # Two rows x 40 tokens before; pages 6 and 2-3 of each row now.
+    assert oracle.descriptors["block"] == 80
+    assert nic.descriptors["staged-kv"] == 4
+    assert "block" not in nic.descriptors
+    # Index pages and KDA state still take their own paths.
+    assert nic.descriptors["staged-index"] == oracle.descriptors["staged-index"]
+    assert nic.descriptors["slot"] == oracle.descriptors["slot"]
+    # The rows and the index pages both wait for this prefill's KV.
+    assert connector._send_worker_stream().wait_event.call_count == 2
+    assert sorted(connector._kv_staging_slots.free) == [0, 1]
+
+
+def _kimi_receiver(nic, *, bases, widths, regions, slot_bytes, credit_pool=""):
+    """A CPU decode-side receiver whose scatter is a memmove into ``nic``."""
+    import ctypes
+
+    from atom.kv_transfer.disaggregation.landing_scatter import (
+        segment_table_capacity,
+    )
+    from atom.kv_transfer.disaggregation.mooncake.landing import LandingReceiver
+
+    sent, finished = [], []
+    recv = LandingReceiver(
+        device=None,
+        pool_slots=8,
+        slot_bytes=slot_bytes,
+        units_per_page=_K_BLOCK if not credit_pool else 1,
+        consumer_key="consumer:1234",
+        region_bases=bases,
+        region_block_bytes=widths,
+        region_indices=regions,
+        send=lambda addr, parts: sent.append((addr, parts)),
+        finish=lambda req, failed: finished.append((req, failed)),
+        table_segments=segment_table_capacity(1024),
+        credit_pool=credit_pool,
+    )
+
+    def copy(src, dst, nbytes, _events):
+        for s, d, n in zip(src, dst, nbytes):
+            ctypes.memmove(
+                nic.ptr(recv._dst_origin + int(d)),
+                recv.pool.data_ptr() + int(s),
+                int(n),
+            )
+
+    recv._copy_segments = copy
+    recv.sent, recv.finished = sent, finished
+    return recv
+
+
+def _run_listener(monkeypatch, mc, listener, messages):
+    """Run a connector's listener loop over ``(type, payload)`` messages."""
+    from contextlib import nullcontext
+
+    class _Stop(Exception):
+        pass
+
+    class _Socket:
+        def poll(self, timeout):
+            if not messages:
+                raise _Stop
+            return mc.zmq.POLLIN
+
+        def getsockopt(self, _option):
+            return b"tcp://0.0.0.0:1"
+
+        def recv_multipart(self):
+            if not messages:
+                raise _Stop
+            return [b"peer", *messages.pop(0)]
+
+    conn = listener.__self__
+    conn._completed_prefills_lock = threading.Lock()
+    conn._pending_chunked_requests = []
+    conn._chunked_admissions = {}
+    conn._chunked_local_ids = {}
+    conn._listener_bound = threading.Event()
+    conn._listener_error = None
+    monkeypatch.setattr(mc, "zmq_socket_ctx", lambda *_a, **_k: nullcontext(_Socket()))
+    with pytest.raises(_Stop):
+        listener()
+
+
+@pytest.mark.parametrize("offered", ["both", "mla", "state"])
+@pytest.mark.parametrize("dcp_rank", [0, 1])
+def test_kimi_mla_rows_land_beside_the_kda_state(
+    _no_cuda_stream, monkeypatch, dcp_rank, offered
+):
+    """The decode scatters both landings into the per-token path's bytes, the
+    request completes once after both, and each credit goes back to its pool.
+
+    With one landing offered, the other half goes out staged and the request
+    completes on the one receiver that tracks it.
+    """
+    msgpack = pytest.importorskip("msgpack")
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    from atom.kv_transfer.disaggregation.state_gather import KDA_SLOT_LAYOUT
+
+    oracle = _kimi_oracle(mc, dcp_rank)
+    nic = _PtrNic()
+    # Two 256-byte slots: 40 rows x 2 rows x 8 B pack into three, so they land.
+    connector = _kimi_stage(mc, nic, slot_bytes=2 * _K_MLA_PAGE)
+    _arm_state_staging(nic, connector)
+    connector._rdma_write = nic.write
+    sent = []
+    connector._send_on_socket = lambda _addr, parts, repeat=1: sent.extend(
+        [parts] * repeat
+    )
+
+    mla = _kimi_receiver(
+        nic,
+        bases=_K_DST_MLA + _K_DST_IDX,
+        widths=[_K_MLA_PAGE] * 3 + [_K_IDX_PAGE] * 2,
+        regions=[0, 1, 2],
+        slot_bytes=2 * _K_MLA_PAGE,
+    )
+    state = _kimi_receiver(
+        nic,
+        bases=_K_DST_SLOT,
+        widths=[_CONV_BPS // 2] * 3 + [_SSM_BPS // 2] * 3 + [_CURSOR_BPS],
+        regions=list(range(7)),
+        slot_bytes=64,
+        credit_pool="state",
+    )
+    consumer = object.__new__(mc.MooncakeConnector)
+    consumer._landing, consumer._state_landing = mla, state
+    consumer._completion_lock = threading.Lock()
+    consumer._pending_handoffs = {}
+    consumer._landing_gates = {}
+    done = []
+    consumer._complete_recv = lambda req, failed: done.append((req, failed))
+    for recv in (mla, state):
+        recv._finish = consumer._landing_finished
+
+    request = _kimi_request(dcp_rank)
+    began = 0
+    if offered in ("both", "mla"):
+        request["mla_landing"] = mla.advertise("stage1", 2)
+        connector._landing_credits.sync("consumer:1234", request["mla_landing"])
+        mla.begin("req-1", 5, list(_K_DST_BLOCKS), {1: "stage1"})
+        began += 1
+    if offered in ("both", "state"):
+        request["state_landing"] = {
+            **state.advertise("stage1", 2),
+            "layout": KDA_SLOT_LAYOUT,
+        }
+        connector._state_landing_credits.sync("consumer:1234", request["state_landing"])
+        state.begin("req-1", 5, [3], {1: "stage1"})
+        began += 1
+    if began > 1:  # as start_load_kv arms it
+        consumer._landing_gates["req-1"] = {"left": began, "failed": False}
+
+    assert _kimi_transfer(mc, connector, request)
+    mc.MooncakeConnector._notify_transfer_result(connector, request, success=True)
+    kinds = [parts[0] for parts in sent]
+    assert kinds.count(mc.MSG_LANDING_READY) == (3 if offered != "state" else 0)
+    assert kinds.count(mc.MSG_STATE_LANDING_READY) == (1 if offered != "mla" else 0)
+    assert kinds.count(mc.MSG_WRITE_DONE) == 3  # sent three times, counted once
+    # One descriptor per landed slot; staged, the three slots take five.
+    if offered == "state":
+        assert nic.descriptors["staged-kv"] == 5 and "landed-kv" not in nic.descriptors
+    else:
+        assert nic.descriptors["landed-kv"] == 3 and "staged-kv" not in nic.descriptors
+
+    _run_listener(monkeypatch, mc, consumer._notification_listener, sent)
+    assert done == []  # nothing scattered yet
+    for recv in (mla, state):
+        recv._process(recv._drain(block=False))
+    assert done == [("req-1", False)]
+    assert consumer._landing_gates == {}
+    assert (nic.compared() == oracle.compared()).all()
+
+    # The returned credits reach the pool that lent them; each pool's epoch
+    # is its own, so a credit read against the other pool is dropped.
+    credits = [parts for _addr, parts in mla.sent + state.sent]
+    assert {msgpack.loads(p).get("pool") for _kind, p in credits} == {
+        "both": {None, "state"},
+        "mla": {None},
+        "state": {"state"},
+    }[offered]
+    connector._side_channel_port = 1
+    _run_listener(monkeypatch, mc, connector._write_listener, credits)
+    for credits_of, landing in (
+        (connector._landing_credits, request.get("mla_landing")),
+        (connector._state_landing_credits, request.get("state_landing")),
+    ):
+        if landing is None:
+            continue
+        held = credits_of._targets["consumer:1234"]
+        assert held.in_flight == set()
+        assert sorted(held.free) == sorted(landing["slots"])
+
+
+def test_landing_credits_go_back_to_the_pool_that_lent_them(monkeypatch):
+    msgpack = pytest.importorskip("msgpack")
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    from atom.kv_transfer.disaggregation.mooncake.landing import LandingCredits
+
+    connector = object.__new__(mc.MooncakeConnector)
+    connector._side_channel_port = 1
+    connector._landing_credits = LandingCredits()
+    connector._state_landing_credits = LandingCredits()
+    # One decode rank lends both pools under one key, each with its own epoch.
+    connector._landing_credits.sync("d:1", {"epoch": 7, "slots": [0]})
+    connector._state_landing_credits.sync("d:1", {"epoch": 9, "slots": [0]})
+    assert connector._landing_credits.acquire("d:1", 7, 0) == 0
+    assert connector._state_landing_credits.acquire("d:1", 9, 0) == 0
+
+    def credit(epoch, pool=None):
+        body = {"consumer": "d:1", "epoch": epoch, "slots": [0]}
+        if pool is not None:
+            body["pool"] = pool
+        return (mc.MSG_LANDING_CREDIT, msgpack.dumps(body))
+
+    mla = connector._landing_credits._targets["d:1"]
+    state = connector._state_landing_credits._targets["d:1"]
+    # Misrouted: the state pool's credit without its tag, and the reverse.
+    _run_listener(
+        monkeypatch,
+        mc,
+        connector._write_listener,
+        [credit(9), credit(7, "state")],
+    )
+    assert mla.in_flight == {0} and state.in_flight == {0}
+    _run_listener(monkeypatch, mc, connector._write_listener, [credit(7)])
+    assert mla.free == [0] and state.in_flight == {0}
+    _run_listener(monkeypatch, mc, connector._write_listener, [credit(9, "state")])
+    assert state.free == [0]
+
+
+def test_kimi_mla_rows_needing_one_landing_slot_stay_staged(_no_cuda_stream):
+    """Below LANDING_MIN_SLOTS the rows go staged: no credit, no READY, and the
+    write-done lists none landed rather than "cannot land"."""
+    msgpack = pytest.importorskip("msgpack")
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    oracle = _kimi_oracle(mc, 1)
+    nic = _PtrNic()
+    connector = _kimi_stage(mc, nic, slot_bytes=1024)
+    sent = []
+    connector._send_on_socket = lambda _addr, parts, repeat=1: sent.append(parts)
+    request = _kimi_request(1)
+    request["mla_landing"] = {"epoch": 3, "base": 1 << 40, "slot_bytes": 1024}
+    request["mla_landing"]["slots"] = [0, 1, 2, 3]
+    connector._landing_credits.sync("consumer:1234", request["mla_landing"])
+
+    assert _kimi_transfer(mc, connector, request)
+    mc.MooncakeConnector._notify_transfer_result(connector, request, success=True)
+
+    assert (nic.compared() == oracle.compared()).all()
+    assert nic.descriptors["staged-kv"] == 4 and "landed-kv" not in nic.descriptors
+    [(kind, payload)] = sent
+    assert kind == mc.MSG_WRITE_DONE
+    assert msgpack.loads(payload)["landed_slots"] == []
+    assert sorted(connector._landing_credits._targets["consumer:1234"].free) == [
+        0,
+        1,
+        2,
+        3,
+    ]
+
+
+def test_a_failed_landed_kimi_mla_write_quarantines_only_its_credit(
+    _no_cuda_stream,
+):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    nic = _PtrNic()
+    connector = _kimi_stage(mc, nic, slot_bytes=2 * _K_MLA_PAGE)
+    _arm_state_staging(nic, connector)
+    sent = []
+    connector._send_on_socket = lambda _addr, parts, repeat=1: sent.append(parts)
+    connector._rdma_write = lambda *args, **kwargs: (
+        args[5] != "landed-kv" and nic.write(*args, **kwargs)
+    )
+    request = _kimi_request(0)
+    request["mla_landing"] = {
+        "epoch": 3,
+        "base": 1 << 40,
+        "slot_bytes": 2 * _K_MLA_PAGE,
+        "slots": [0, 1, 2, 3],
+    }
+    connector._landing_credits.sync("consumer:1234", request["mla_landing"])
+    connector._state_landing_credits.sync("consumer:1234", {"epoch": 4, "slots": [0]})
+
+    assert not _kimi_transfer(mc, connector, request)
+
+    held = connector._landing_credits._targets["consumer:1234"]
+    assert len(held.quarantined) == 1 and not held.in_flight
+    assert len(held.free) == 3
+    assert not request.get("_landed_slots")
+    assert sent == []  # no READY for a slot that may hold a partial write
+    # The state never started, so its pool lent nothing.
+    assert connector._state_landing_credits._targets["consumer:1234"].free == [0]
+    assert sorted(connector._kv_staging_slots.free) == [0, 1]
+
+
+def test_kimi_mla_rows_to_a_non_dcp_decode_go_whole(_no_cuda_stream):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    dst_blocks = (6, 2, 3, 7, 0)
+    oracle = _kimi_oracle(mc, 0, dcp=1, dst_blocks=dst_blocks)
+    nic = _PtrNic()
+    connector = _kimi_stage(mc, nic, slot_bytes=1024)
+
+    assert _kimi_transfer(mc, connector, _kimi_request(0, dcp=1), dst_blocks)
+
+    assert (nic.compared() == oracle.compared()).all()
+    # Three regions x five whole pages, nothing staged or per token.
+    assert nic.descriptors == {"block": 15, "slot": oracle.descriptors["slot"]}
+    connector._send_worker_stream().wait_event.assert_not_called()
+
+
+def test_kimi_mla_rows_without_a_ready_event_go_per_token(_no_cuda_stream):
+    """The gather could read KV the forward is still writing. A stage without
+    index layers (which need the event themselves) keeps the per-token path."""
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+
+    def stage(nic, staged):
+        connector = _pp_stage_connector(mc, nic)
+        connector._send_worker_stream = MagicMock()
+        if staged:
+            connector._kv_staging = nic.tensor(_K_KV_STAGING, _K_KV_STAGING + 64)
+            connector._kv_staging = connector._kv_staging.view(1, 64)
+            connector._kv_staging_slots = mc.SlotPool(1)
+            connector._kv_source_views = {0: nic.tensor(_MLA_SRC, _MLA_SRC + 4 * _BPB)}
+        return connector
+
+    def run(connector, ready):
+        return mc.MooncakeConnector._execute_block_slot_transfer(
+            connector,
+            _dcp_tp_request(),
+            "consumer:1234",
+            [0, 1, 2, 3],
+            [1, 2],
+            {"slot_index": 5},
+            "req-1",
+            kv_cache_ready_event=ready,
+        )
+
+    oracle = _PtrNic()
+    assert run(stage(oracle, False), None)
+    for ready, label in ((None, "block"), (object(), "staged-kv")):
+        nic = _PtrNic()
+        assert run(stage(nic, True), ready)
+        assert (nic.mem[:16384] == oracle.mem[:16384]).all()
+        assert set(nic.descriptors) == {label, "slot"}
+    # Eight tokens per descriptor before; destination pages 1-2 in one now.
+    assert oracle.descriptors["block"] == 8 and nic.descriptors["staged-kv"] == 1
+
+
+def test_only_kimi_slot_backends_build_mla_staging_and_landing(monkeypatch):
+    """The pools cover the MLA rows alone; any other slot backend keeps none."""
+    torch = pytest.importorskip("torch")
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    from atom.kv_transfer.disaggregation.staging_config import landing_spec
+    from atom.kv_transfer.disaggregation.types import (
+        INDEX_CACHE_ROLE,
+        MLA_KV_ROLE,
+        KVTransferRegion,
+    )
+
+    monkeypatch.delenv("ATOM_PD_MLA_LANDING", raising=False)
+    monkeypatch.delenv("ATOM_GLM5_KPOOL", raising=False)
+
+    class _DeviceView:
+        # What a GPU PAGE view reports, backed by host memory here.
+        is_cuda = True
+        dtype = torch.uint8
+        device = torch.device("cpu")
+
+        def is_contiguous(self):
+            return True
+
+    roles = [MLA_KV_ROLE, MLA_KV_ROLE, INDEX_CACHE_ROLE]
+    tt = SimpleNamespace(
+        block_regions=[
+            KVTransferRegion(4096 * i, 8 * 9216, 9216, semantic_role=role)
+            for i, role in enumerate(roles)
+        ],
+        block_tensor_views=[_DeviceView() for _ in roles],
+    )
+    decode = SimpleNamespace(
+        kv_transfer_config={"kv_connector": "mooncake", "kv_role": "kv_consumer"},
+        decode_context_parallel_size=8,
+        kv_cache_block_size=16,
+        hf_config=SimpleNamespace(model_type="kimi_linear", kv_lora_rank=512),
+    )
+    for kimi in (True, False):
+        conn = object.__new__(mc.MooncakeConnector)
+        conn._has_slot_regions = True
+        conn._slot_mla_rows = kimi
+        conn._page_staging_enabled = False
+        conn._num_send_workers = 2
+        conn._kv_staging_reserve = 2 * (8 << 20)
+        staging = conn._build_kv_staging(tt)
+        assert (staging is not None) is kimi
+        assert (conn._kv_staging is not None) is kimi
+        if kimi:
+            # The index layer keeps its own staging pool.
+            assert list(conn._kv_source_views) == [0, 1]
+
+        conn._landing_spec = landing_spec(decode)
+        conn._block_region_roles = roles
+        conn.kv_caches_base_addr = [r.base_addr for r in tt.block_regions]
+        conn._per_block_bytes_list = [9216] * 3
+        conn._cuda_device = None
+        conn.local_ip, conn.rpc_port = "d", 1
+        conn._send_on_socket = lambda *_a: None
+        landing = conn._build_landing()
+        assert (landing is not None) is kimi
+        if kimi:
+            assert landing._region_enabled.tolist() == [True, True, False]
+
+
 @pytest.mark.parametrize(
     "producer_tp, consumer_tp, consumer_rank, ssm_segments, match",
     [

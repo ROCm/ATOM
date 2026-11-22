@@ -25,6 +25,7 @@ from atom.kv_transfer.disaggregation.state_gather import (
     STATE_SLOT_BYTES,
 )
 from atom.kv_transfer.disaggregation.transfer_plan import PAGE_UNITS, TOKEN_UNITS
+from atom.model_ops.glm5_next.geometry import pooled_path_enabled
 from atom.utils import envs, get_hf_text_config
 from atom.utils.selector import Family, attn_family
 
@@ -38,7 +39,9 @@ def plain_mla_model(config) -> bool:
     is what the producer stages and a DCP consumer lands. DeepSeek-V4 carries
     a ``kv_lora_rank`` too (its V3 schema defaults one) but is its own family,
     and the MLA hybrids register slot regions, which both paths skip, so
-    reserving for either would hold back HBM nothing uses.
+    reserving for either would hold back HBM nothing uses. Kimi-K3, the one
+    hybrid whose rows the slot path stages, has its own gate
+    (``kimi_mla_admitted``).
     """
 
     hf_config = getattr(config, "hf_config", None)
@@ -158,7 +161,7 @@ class LandingSpec:
 
 def landing_spec(config):
     # MLA lands only with DCP and MHA only without it, so at most one applies.
-    if mla_landing_configured(config):
+    if mla_landing_configured(config) or kimi_mla_landing_configured(config):
         return LandingSpec(
             config.kv_cache_block_size,
             mla_landing_table_segments(config),
@@ -178,6 +181,53 @@ def kimi_state_model(config) -> bool:
     if hf_config is None:
         return False
     return getattr(get_hf_text_config(hf_config), "model_type", None) == "kimi_linear"
+
+
+def kimi_mla_admitted(config) -> bool:
+    """Whether the slot path stages and lands ``config``'s MLA rows.
+
+    Kimi-K3 with a per-token indexer only. A pooled indexer (``index_kpool``
+    > 1 with ``ATOM_GLM5_KPOOL``) caches one key per pool, which the PP
+    backend refuses anyway; GLM-5.3-Flash shares the family but not the gate.
+    """
+
+    if not kimi_state_model(config):
+        return False
+    hf_config = config.hf_config
+    return not any(
+        pooled_path_enabled(int(getattr(c, "index_kpool", 1) or 1))
+        for c in (hf_config, get_hf_text_config(hf_config))
+    )
+
+
+def kimi_mla_staging_reserve_bytes(config) -> int:
+    """HBM a Kimi producer without DCP holds back for its MLA row pool.
+
+    The same ``staging_pool_bytes`` per Mooncake producer entry as a plain
+    MLA model, beside the KDA state pool.
+    """
+
+    if (
+        not envs.ATOM_PD_MLA_STAGING
+        or getattr(config, "decode_context_parallel_size", 1) > 1
+        or not kimi_mla_admitted(config)
+    ):
+        return 0
+    return sum(
+        staging_pool_bytes(send_worker_count(connector))
+        for connector in mooncake_producer_connectors(config)
+    )
+
+
+def kimi_mla_landing_configured(config) -> bool:
+    """Whether a Kimi DCP decode gets the MLA row landing pool."""
+
+    return bool(
+        envs.ATOM_PD_MLA_LANDING
+        and getattr(config, "decode_context_parallel_size", 1) > 1
+        and config.kv_transfer_config.get("kv_role") == "kv_consumer"
+        and kimi_mla_admitted(config)
+    )
 
 
 def _state_pool_bytes(num_send_workers: int) -> int:
@@ -225,12 +275,17 @@ def kimi_state_landing_reserve_bytes(config) -> int:
     return STATE_POOL_BYTES + table_bytes
 
 
-def staging_reserve_bytes(config):
+def kv_staging_reserve_bytes(config):
+    """The KV staging pool's share: what ``_build_kv_staging`` sizes slots from."""
     return (
         mla_staging_reserve_bytes(config)
         + minimax_staging_reserve_bytes(config)
-        + kimi_state_staging_reserve_bytes(config)
+        + kimi_mla_staging_reserve_bytes(config)
     )
+
+
+def staging_reserve_bytes(config):
+    return kv_staging_reserve_bytes(config) + kimi_state_staging_reserve_bytes(config)
 
 
 def landing_reserve_bytes(config):
