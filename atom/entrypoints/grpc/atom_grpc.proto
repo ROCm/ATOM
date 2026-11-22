@@ -38,7 +38,8 @@ message GenerateRequest {
   string request_id = 1;
   repeated uint32 prompt_token_ids = 2;
   // Read as the HTTP routes read a request: an absent max_tokens takes their
-  // default, not SamplingParams'.
+  // default, not SamplingParams'. Its stop_strings are not read (the stops are
+  // stop_token_sequences); logprobs and the structured-output fields are refused.
   atom.engine.v1.SamplingParams sampling = 3;
   repeated atom.engine.v1.TokenIds stop_token_sequences = 4;  // the stop strings, tokenized
   optional string kv_transfer_params_json = 5;  // the HTTP routes' kv_transfer_params
