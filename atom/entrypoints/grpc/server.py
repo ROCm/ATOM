@@ -457,10 +457,10 @@ def start_grpc_server(api: ModuleType, args: Namespace) -> Callable[[], None]:
     loop, server = listening.result()
 
     def stop() -> None:
-        """Refuses new calls and lets the running ones finish, as uvicorn drains HTTP;
-        run before the engine closes, which would leave them waiting forever."""
-        asyncio.run_coroutine_threadsafe(server.stop(float("inf")), loop).result()
-        thread.join()  # every call's teardown has run
+        """Refuses new calls and ends the running ones, their seqs aborted; run before
+        the engine closes, which would leave them waiting forever."""
+        asyncio.run_coroutine_threadsafe(server.stop(None), loop).result()
+        thread.join()  # stop returns before the calls' teardown has run
 
     return stop
 

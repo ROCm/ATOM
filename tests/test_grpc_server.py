@@ -420,12 +420,11 @@ def test_a_step_ending_as_the_listener_starts_reaches_its_call(monkeypatch):
     assert [output.finish_reason for output in delivered] == ["eos"]
 
 
-def test_shutdown_lets_a_running_call_finish_and_refuses_new_ones(serve, monkeypatch):
+def test_shutdown_ends_running_calls_before_it_returns(serve, monkeypatch):
     engine = FakeEngine([([5], None)])  # the seq runs on after its first step
     serve(engine)  # api_server's engine; start_grpc_server makes its own servicer
     engine.core_mgr._flush_stream_batch_fn = None
     engine.flush = lambda: engine.core_mgr._flush_stream_batch_fn()
-    monkeypatch.setattr(api_server, "health_problem", lambda: None)
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
@@ -433,25 +432,23 @@ def test_shutdown_lets_a_running_call_finish_and_refuses_new_ones(serve, monkeyp
     stop = grpc_server.start_grpc_server(api_server, args)
     channel = grpc.insecure_channel(f"127.0.0.1:{port}")
     request = pb.GenerateRequest(request_id="r", prompt_token_ids=[1], stream=True)
-    call = pb_grpc.AtomEngineStub(channel).Generate(request, timeout=10)
-    assert list(next(call).chunk.token_ids) == [5]
-    stopping = threading.Thread(target=stop, daemon=True)
-    stopping.start()
-    late = pb_grpc.AtomEngineStub(grpc.insecure_channel(f"127.0.0.1:{port}"))
-    with pytest.raises(grpc.RpcError) as refused:
-        for _ in range(500):  # until the server refuses new calls
-            late.HealthCheck(pb.HealthCheckRequest(), timeout=1)
-            time.sleep(0.01)
-    refusals = (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.CANCELLED)
-    assert refused.value.code() in refusals
-    seq = engine.running.pop(1)  # its last step, after shutdown began
-    seq.callback(RequestOutput(1, [6], True, "eos"))
-    engine.flush()
-    rest = list(call)
-    stopping.join(10)
-    assert list(rest[0].chunk.token_ids) == [6]
-    assert rest[1].complete.finish_reason == "eos" and not stopping.is_alive()
-    assert engine.aborted == [] and engine.io_processor.requests == {}
+    stub = pb_grpc.AtomEngineStub(channel)
+    streaming = stub.Generate(request, timeout=10)
+    assert list(next(streaming).chunk.token_ids) == [5]
+    engine.release.clear()
+    preprocessing = stub.Generate(request, timeout=10)
+    for _ in range(500):
+        if len(engine.preprocessed) == 2:
+            break
+        time.sleep(0.01)
+    threading.Timer(0.3, engine.release.set).start()
+    stop()
+    # Before the engine closes: one seq aborted, the other dropped once made.
+    assert engine.made == [1, 2] and engine.aborted == [1]
+    assert engine.io_processor.requests == {} and engine.submitted[1:] == []
+    for call in (streaming, preprocessing):
+        with pytest.raises(grpc.RpcError):
+            list(call)
     channel.close()
 
 

@@ -258,7 +258,7 @@ _frontend_stats = None
 # response that read differently depending on `stream` is the asymmetry the
 # reasoning and tool-call readers were unified to remove.
 synthetic_token_text: str | None = None
-# With --grpc-port: stops the gRPC server once its calls finish; lifespan runs it.
+# With --grpc-port: stops the gRPC server, ending its calls; lifespan runs it.
 _stop_grpc_server: Callable[[], None] | None = None
 
 
@@ -1862,7 +1862,7 @@ async def lifespan(app: FastAPI):
         await _metrics_exporter.wait_for_render()
         logger.info("Server shutting down, releasing resources...")
         try:
-            try:  # gRPC first: its running calls finish while the engine runs
+            try:  # gRPC first: its calls end, seqs aborted, while the engine runs
                 if _stop_grpc_server is not None:
                     await asyncio.to_thread(_stop_grpc_server)
             finally:
