@@ -1,7 +1,45 @@
-# Qwen3.5-35B-A3B MXFP4 on 4 x MI455X (gfx1250): MLPerf Endpoints agentic, the 2026-11-01 to 11-20 points
+# Qwen3.5-35B-A3B MXFP4 on 4 x MI455X (gfx1250): MLPerf Endpoints agentic, the 2026-11-01 to 11-21 points
 
 How to reproduce the numbers below: the exact code, the settings, the run, and how each number is computed.
 They are 10-minute measurement points, not official results (see [What these numbers are](#what-these-numbers-are)).
+
+## 2026-11-21: the 11-20 settings at every point, LPT prefill order, c256-c512 decode configs, optional c64 decode flags
+
+`agentic_20261121.env` on top of `agentic_20261101.env`, `agentic_20261107.env`, `agentic_20261119.env` and
+`agentic_20261120.env`. Code: `alizaidy/gfx1250-qwen-support` (ATOM 31b6c86fa, aiter ff25bd74c) plus the aiter 2D prefill
+longest-first order (`AITER_UA_2D_LPT`), the aiter qkv / router+shared decode configs for 65-256 rows and, for the optional
+c64 lines, the ATOM + aiter low-concurrency decode change. Same image, topology, client and metric as the 2026-11-19
+section; every configuration was warmed up (a 2-minute point) before its 10-minute run.
+
+Per-point settings are the 11-19 ones (KV, interval, extras, dense CAPS at c256 / c384, the c64 fp4pt split settings at
+c64-c384), plus `agentic_20261120.env` and `AITER_UA_2D_LPT=1`.
+
+**Fixed max is off by default from this recipe on** (`AITER_UA_2D_FIXED_MAX=0` in `agentic_20261121.env`): an accuracy concern
+with the fixed-reference-max 2D prefill was reported outside these runs. It stays available as an option where a point's
+accuracy check passes. Every run in the table below except the "no fixed max" column had it on (`agentic_20261120.env`);
+LPT does not depend on it (only the program-to-block mapping changes, bitwise with fixed max on or off).
+
+| point | 11-19 settings | + 11-20 env | + LPT | + LPT, no fixed max (recipe default) | other | accuracy (final) |
+|---|---:|---:|---:|---:|---|---|
+| c64 | 1080.7 | 1105.0 / 1105.2 / 1092.6 (+1.7% mean) | | | + optional c64 flags with the fp8 verify head: 1115.0 / 1110.3 (+1.3%) | 0.5639 / 0.5589 |
+| c256 | 522.7 | | **549.2** (+5.1%) | | | 0.5612 |
+| c384 | 389.7 | 402.5 (+3.3%) | **408.2 / 408.8** (+4.7%) | **405.2** (with the c256-c512 decode configs; +4.0% vs 389.7; accuracy 0.5628) | + c256-c512 decode configs: 411.1 (+0.6%, accuracy 0.5619) | 0.5622 / 0.5613 |
+| c512 | 302.5 | | **320.7** (+6.0%) | | | 0.564 |
+| c1024 | (11-20 base 151.4) | 157.8 / 157.8 | **159.8** (+1.3%) | **158.0** (+0.8% vs 156.8, the 11-20 settings without fixed max; accuracy 0.5677) | + fp8 verify head: 161.4 (+1.0%) | 0.5683 |
+
+Notes:
+- Fixed max (optional now) is worth +1.1% at c1024 (158.0 -> 159.8) and +1.5% at c384 (405.2 -> 411.1) in these runs; the
+  c64, c256 and c512 numbers above were measured with it on.
+- LPT: the gfx1250 2D kernel took the batch's q blocks in the caller's order, so a long-context prefill early in the batch
+  ran in the last wave. Longest-first is bitwise and never slower (kernel -2.2..-2.9% on c1024-like batches).
+- At c384 the point's `pt` extra (`AITER_GFX12_TOKEN_SPLIT_MIN_TILES_FP4PT=16`) comes after the extra flags and wins, so
+  the c64 split settings there are `PROGRAMS=512` only; dropping that (aiter default 2048) scored 391.1 vs 402.5.
+- MTP depth 2 at c1024 (needs `ATOM_GDN_FUSED_DECODE_PAD=0`): 148.4 vs 157.8 (-6.0%; acceptance ~81% vs ~74%). MTP-3 stays.
+- `--long-prefill-token-threshold` 4096 / 6144 at c1024: 157.3 / 160.4 vs 159.8, TTFT p99 up: off.
+- The fp8 verify LM head (`ATOM_VERIFY_LM_HEAD_FP8`) is numerical: -0.002..-0.0035 accuracy in every 10-minute pair, and
+  10-minute accuracy moves +-0.004 run to run. It stays out of the defaults until an official-length run checks the margin.
+- The optional c64 flags alone (no fp8 head) measured 1098.5: the host trims count only once the GPU part of the step is
+  shorter (c64 runs close to the host / GPU balance point).
 
 ## 2026-11-20: c1024 (prefill idle time, decode GEMMs at 513-640 rows, fixed-max prefill attention)
 
