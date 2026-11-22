@@ -106,6 +106,7 @@ def _engine_io():
     from atom.model_engine.llm_engine import InputOutputProcessor
 
     io = InputOutputProcessor.__new__(InputOutputProcessor)
+    io._greedy_ids_only = False
     io.config = types.SimpleNamespace(
         hf_config=types.SimpleNamespace(),
         eos_token_id=EOS,

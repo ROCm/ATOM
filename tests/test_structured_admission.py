@@ -336,6 +336,7 @@ def test_engine_boundary_checks_structured_requests_before_tokenization(fields):
     from atom.sampling_params import SamplingParams
 
     processor = InputOutputProcessor.__new__(InputOutputProcessor)
+    processor._greedy_ids_only = False
     processor.config = NS()
     processor.structured_admission = Mock(side_effect=ValueError("admission rejected"))
     with pytest.raises(ValueError, match="admission rejected"):
@@ -349,6 +350,7 @@ def test_engine_boundary_rejects_a_grammar_with_a_required_channel(fields):
     from atom.sampling_params import RequiredChannel, SamplingParams
 
     processor = InputOutputProcessor.__new__(InputOutputProcessor)
+    processor._greedy_ids_only = False
     processor.config = NS()
     processor.structured_admission = Mock()
     channel = RequiredChannel(after=(1,), opening=(2,), opens_at=1, end_ids=(3,))
