@@ -189,6 +189,8 @@ def absorb():
     layer = SimpleNamespace(
         qrep_enabled=True,
         W_K_qrep_scale=None,
+        W_K_qrep=torch.empty(1, dtype=torch.bfloat16),
+        dtype=torch.bfloat16,
         kv_shuffled=False,
         qk_nope_head_dim=128,
         kv_lora_rank=512,
@@ -217,6 +219,8 @@ def absorb():
         ({"qk_nope_head_dim": 512}, False),
         ({"kv_lora_rank": 96}, False),
         ({"W_K_qrep_scale": object()}, False),
+        ({"W_K_qrep": torch.empty(1, dtype=torch.float16)}, False),
+        ({"model_dtype": torch.float16}, False),
         ({"qrep_enabled": False}, False),
     ],
 )
@@ -226,6 +230,7 @@ def test_absorb_fixed_gate_is_cached_and_live_cache_dtype_still_gates(
     layer, namespace = absorb
     change = dict(change)
     dtype = change.pop("dtype", torch.float8_e4m3fn)
+    layer.dtype = change.pop("model_dtype", torch.bfloat16)
     empty = change.pop("empty", False)
     namespace["_runs_on_gfx950"] = lambda: change.get("gfx", True)
     namespace["is_rocm_aiter_fp4bmm_enabled"] = lambda: change.get("fp4", False)

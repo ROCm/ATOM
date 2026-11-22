@@ -1409,6 +1409,8 @@ class MLAAttention(nn.Module):
             not is_rocm_aiter_fp4bmm_enabled()
             and self.qrep_enabled
             and self.W_K_qrep_scale is None
+            and self.dtype == torch.bfloat16
+            and self.W_K_qrep.dtype == torch.bfloat16
             and not self.kv_shuffled
             and _runs_on_gfx950()
             and self.qk_nope_head_dim == triton.next_power_of_2(self.qk_nope_head_dim)
