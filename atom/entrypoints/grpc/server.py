@@ -270,11 +270,12 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
         tools = request_tools(chat)
         logprobs = request.sampling.WhichOneof("logprobs")
         # What the chat route checks: the stop ids count as stop strings and logprobs
-        # as asked, though the SamplingParams Generate admits carry neither.
+        # as asked, though the SamplingParams Generate admits carry none of them.
         chat_params = replace(
             params,
             stop_strings=[str(ids) for ids in stops],
             logprobs=getattr(request.sampling, logprobs) if logprobs else False,
+            top_logprobs=request.sampling.top_logprobs,  # SamplingParams checks both
             required_channel=channel_for_request(
                 api.required_tool_channel, chat.tool_choice, tools
             ),
@@ -421,6 +422,19 @@ def _then(flush: Callable[[], None] | None, more: Callable[[], None]):
             more()
 
     return both
+
+
+def startup_refusal(tokenizer) -> str | None:
+    """Why --grpc-port cannot serve with `tokenizer`, or None: GetModelInfo carries
+    one chat template, and atomesh's tokenizer reads only one."""
+    template = getattr(tokenizer, "chat_template", None)
+    if isinstance(template, dict):
+        names = ", ".join(map(str, template))
+        return (
+            f"--grpc-port serves one chat template, and this tokenizer has named "
+            f"ones ({names}); pick one with --chat-template"
+        )
+    return None
 
 
 def start_grpc_server(api: ModuleType, args: Namespace) -> None:
