@@ -258,6 +258,8 @@ _frontend_stats = None
 # response that read differently depending on `stream` is the asymmetry the
 # reasoning and tool-call readers were unified to remove.
 synthetic_token_text: str | None = None
+# With --grpc-port: stops the gRPC server, ending its calls; lifespan runs it.
+_stop_grpc_server: Callable[[], None] | None = None
 
 
 def delivered_text(token_ids) -> str:
@@ -1860,8 +1862,12 @@ async def lifespan(app: FastAPI):
         await _metrics_exporter.wait_for_render()
         logger.info("Server shutting down, releasing resources...")
         try:
-            if engine is not None:
-                engine.close()
+            try:  # gRPC first: its calls end, seqs aborted, while the engine runs
+                if _stop_grpc_server is not None:
+                    await asyncio.to_thread(_stop_grpc_server)
+            finally:
+                if engine is not None:
+                    engine.close()
         finally:
             try:
                 # After the engine: its output threads flush into the hub.
@@ -3751,7 +3757,7 @@ async def stop_profile():
 
 def main():
     """Main entry point for the server."""
-    global engine
+    global engine, _stop_grpc_server
 
     parser = FlexibleArgumentParser(description="ATOM OpenAI API Server")
     EngineArgs.add_cli_args(parser)
@@ -3889,7 +3895,7 @@ def main():
         from atom.entrypoints.grpc.server import start_grpc_server
 
         try:  # the module main() runs in: `__main__` under `python -m` on this file
-            start_grpc_server(sys.modules[__name__], args)
+            _stop_grpc_server = start_grpc_server(sys.modules[__name__], args)
         except Exception:
             engine.close()  # its processes would keep the failed launch alive
             raise

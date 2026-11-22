@@ -98,7 +98,10 @@ class StepOutputs:
             return
         self._local.step = None
         for loop, outputs in step.items():
-            loop.call_soon_threadsafe(_deliver, outputs)
+            try:
+                loop.call_soon_threadsafe(_deliver, outputs)
+            except RuntimeError:  # closed: the server stopped after its calls ended
+                pass
 
 
 def _deliver(outputs: list[tuple[Callable, Callable | None, RequestOutput]]) -> None:
@@ -555,9 +558,9 @@ def startup_refusal(tokenizer) -> str | None:
     return None
 
 
-def start_grpc_server(api: ModuleType, args: Namespace) -> None:
-    """Serve AtomEngine on `--host`:`--grpc-port`; return once it listens, or raise
-    why it cannot."""
+def start_grpc_server(api: ModuleType, args: Namespace) -> Callable[[], None]:
+    """Serve AtomEngine on `--host`:`--grpc-port`; once it listens, return its stop,
+    or raise why it cannot listen."""
     # The API process's own ids wrap inside [0, 2^24), window -1 in worker_seq_ids'
     # numbering: below every Session's window.
     Sequence.counter = worker_seq_ids(-1, next(Sequence.counter))
@@ -568,10 +571,19 @@ def start_grpc_server(api: ModuleType, args: Namespace) -> None:
     flush = _then(core_mgr._flush_stream_batch_fn, servicer.steps.flush)
     core_mgr._flush_stream_batch_fn = flush
     listening = Future()
-    threading.Thread(
+    thread = threading.Thread(
         target=_run, args=(address, servicer, listening), name=THREAD_NAME, daemon=True
-    ).start()
-    listening.result()
+    )
+    thread.start()
+    loop, server = listening.result()
+
+    def stop() -> None:
+        """Refuses new calls and ends the running ones, their seqs aborted; run before
+        the engine closes, which would leave them waiting forever."""
+        asyncio.run_coroutine_threadsafe(server.stop(None), loop).result()
+        thread.join()  # stop returns before the calls' teardown has run
+
+    return stop
 
 
 def _run(address: str, servicer: AtomEngineServicer, listening: Future) -> None:
@@ -591,5 +603,5 @@ async def _serve(address: str, servicer: AtomEngineServicer, listening: Future) 
     except Exception as error:  # noqa: BLE001 - start_grpc_server raises it
         listening.set_exception(error)
         return
-    listening.set_result(None)
+    listening.set_result((asyncio.get_running_loop(), server))
     await server.wait_for_termination()
