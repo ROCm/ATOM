@@ -92,7 +92,10 @@ class StepOutputs:
             return
         self._local.step = None
         for loop, outputs in step.items():
-            loop.call_soon_threadsafe(_deliver, outputs)
+            try:
+                loop.call_soon_threadsafe(_deliver, outputs)
+            except RuntimeError:  # closed: the server stopped after its calls ended
+                pass
 
 
 def _deliver(outputs: list[tuple[asyncio.Queue, RequestOutput]]) -> None:
@@ -160,7 +163,7 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
                 raise
             call.seq_id = seq.id
             api._validate_sequence_context_length(seq, params)
-            ids, cached = [], 0
+            ids, completion_tokens, cached = [], 0, 0
             if call.aborted:  # before its submission: it never reaches the engine
                 finished, output = True, RequestOutput(seq.id, [], True, "aborted")
             else:
@@ -172,23 +175,25 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
                 output = await outputs.get()
                 finished = output.finished
                 raise_for_structured_error(output.finish_reason)  # HTTP chat's 500
-                ids += output.output_tokens
+                completion_tokens += len(output.output_tokens)
+                if not request.stream:  # a stream's tokens go out in its chunks
+                    ids += output.output_tokens
                 cached = output.num_cached_tokens or cached
                 if request.stream and output.output_tokens:
                     chunk = pb.GenerateStreamChunk(
                         token_ids=output.output_tokens,
                         prompt_tokens=seq.num_prompt_tokens,
-                        completion_tokens=len(ids),
+                        completion_tokens=completion_tokens,
                         cached_tokens=cached,
                     )
                     await self._write(
                         context, request, pb.GenerateResponse(chunk=chunk)
                     )
             complete = pb.GenerateComplete(
-                output_ids=[] if request.stream else ids,
+                output_ids=ids,
                 finish_reason=output.finish_reason,
                 prompt_tokens=seq.num_prompt_tokens,
-                completion_tokens=len(ids),
+                completion_tokens=completion_tokens,
                 cached_tokens=cached,
             )
             if output.kv_transfer_params_output is not None:
@@ -437,9 +442,9 @@ def startup_refusal(tokenizer) -> str | None:
     return None
 
 
-def start_grpc_server(api: ModuleType, args: Namespace) -> None:
-    """Serve AtomEngine on `--host`:`--grpc-port`; return once it listens, or raise
-    why it cannot."""
+def start_grpc_server(api: ModuleType, args: Namespace) -> Callable[[], None]:
+    """Serve AtomEngine on `--host`:`--grpc-port`; once it listens, return its stop,
+    or raise why it cannot listen."""
     host = f"[{args.host}]" if ":" in args.host else args.host  # an IPv6 address
     address, servicer = f"{host}:{args.grpc_port}", AtomEngineServicer(api, args.model)
     # Before the listener starts: the per-step flush hands gRPC every call's outputs.
@@ -447,10 +452,19 @@ def start_grpc_server(api: ModuleType, args: Namespace) -> None:
     flush = _then(core_mgr._flush_stream_batch_fn, servicer.steps.flush)
     core_mgr._flush_stream_batch_fn = flush
     listening = Future()
-    threading.Thread(
+    thread = threading.Thread(
         target=_run, args=(address, servicer, listening), name=THREAD_NAME, daemon=True
-    ).start()
-    listening.result()
+    )
+    thread.start()
+    loop, server = listening.result()
+
+    def stop() -> None:
+        """Refuses new calls and ends the running ones, their seqs aborted; run before
+        the engine closes, which would leave them waiting forever."""
+        asyncio.run_coroutine_threadsafe(server.stop(None), loop).result()
+        thread.join()  # stop returns before the calls' teardown has run
+
+    return stop
 
 
 def _run(address: str, servicer: AtomEngineServicer, listening: Future) -> None:
@@ -459,13 +473,16 @@ def _run(address: str, servicer: AtomEngineServicer, listening: Future) -> None:
 
 
 async def _serve(address: str, servicer: AtomEngineServicer, listening: Future) -> None:
-    try:  # without SO_REUSEPORT: a second server on the port fails, not shares it
-        server = grpc.aio.server(options=[("grpc.so_reuseport", 0)])
+    # Without SO_REUSEPORT a second server on the port fails, not shares it; a long
+    # prompt's Generate may pass gRPC's default 4 MiB, so no receive limit.
+    options = [("grpc.so_reuseport", 0), ("grpc.max_receive_message_length", -1)]
+    try:
+        server = grpc.aio.server(options=options)
         pb_grpc.add_AtomEngineServicer_to_server(servicer, server)
         server.add_insecure_port(address)  # raises when the port is taken
         await server.start()
     except Exception as error:  # noqa: BLE001 - start_grpc_server raises it
         listening.set_exception(error)
         return
-    listening.set_result(None)
+    listening.set_result((asyncio.get_running_loop(), server))
     await server.wait_for_termination()
