@@ -204,7 +204,8 @@ def benchmark(contract, args):
         [
             str(python),
             "-c",
-            "import importlib.metadata; print(importlib.metadata.version('agentx-harness'))",
+            "import importlib.metadata; "
+            "print(importlib.metadata.version('agentx-harness'))",
         ],
         text=True,
     ).strip()
@@ -240,7 +241,7 @@ def benchmark(contract, args):
         contract["dataset"],
     ]
     env = dict(os.environ) | contract["benchmark_env"]
-    # Preserve the recipe/client defaults for both arms; do not add a session header for ATOMesh.
+    # Preserve the recipe/client defaults in both arms, including session headers.
     env.pop("AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID", None)
     (output / "benchmark-command.json").write_text(
         json.dumps(
@@ -259,7 +260,7 @@ def benchmark(contract, args):
             (output / f"router-{name}.json").write_text(
                 json.dumps(request(url), indent=2)
             )
-        except Exception as error:
+        except (OSError, ValueError) as error:
             (output / f"router-{name}.error.txt").write_text(str(error))
     return result.returncode
 
