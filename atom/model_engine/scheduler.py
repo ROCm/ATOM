@@ -361,12 +361,13 @@ class ScheduledBatch:
         self.mrope_positions_by_req = {
             seq.id: seq.mrope_positions
             for seq in seqs.values()
-            if getattr(seq, "mrope_positions", None) is not None
+            if seq.mrope_positions is not None
         }
+        # A decode leg has no positions, only the delta its prefill handed it.
         self.mrope_position_deltas = {
-            seq.id: getattr(seq, "mrope_position_delta", 0)
+            seq.id: seq.mrope_position_delta
             for seq in seqs.values()
-            if getattr(seq, "mrope_positions", None) is not None
+            if seq.mrope_positions is not None or seq.mrope_position_delta
         }
 
         # num_cached_tokens for chunked prefill support
@@ -686,7 +687,8 @@ class Scheduler:
     _ENGINE_LABEL = ""
     _METRICS_ROLE = ""
     # A preempted sequence recomputes its prompt here, which a KV change relies
-    # on to keep what was running (see `preempt_running`).
+    # on to keep what was running (see `preempt_running`); an image decode leg
+    # whose media its prefill kept cannot, and is finished instead.
     can_recompute_prompts = True
     pd_admission: PdAdmissionController | None = None
 
@@ -1572,7 +1574,7 @@ class Scheduler:
         BlockManager bookkeeping; cheap (no traversal of seq tables).
         """
         bm = self.block_manager
-        total = bm.kv.num_blocks
+        total = bm.kv.num_usable_blocks
         if total <= 0:
             return 0.0
         return bm.kv.num_used / total
@@ -2145,7 +2147,7 @@ class Scheduler:
                 f"{self.max_num_batched_tokens}. {remedy}"
             )
         bm = self.block_manager
-        total_blocks = bm.kv.num_blocks
+        total_blocks = bm.kv.num_usable_blocks
         # `num_pool_blocks`, not `seq.num_blocks`: the latter counts global
         # blocks, while the pool is sized and drawn per-rank. Under dcp>1 the
         # two differ by `dcp_world_size`.
@@ -2523,6 +2525,17 @@ class Scheduler:
                 self._schedule_first_decode_after_remote_kv(seq)
                 continue
 
+            # Without a load, every way on from here prefills locally: no
+            # connector, a failed receive, a requeue after its receive was
+            # queued, a preempted decode, an offload tier's resume on an
+            # instance with no P/D connector.
+            if (
+                seq.kv_transfer_params is not None
+                and not needs_remote_load
+                and self._refuse_prefill_without_media(seq)
+            ):
+                continue
+
             if offload_resume:
                 # Blocks already held from the pre-park allocate; only re-check
                 # the batch budget. No re-match / re-allocate / re-park.
@@ -2757,6 +2770,12 @@ class Scheduler:
                     break
                 self._park_for_remote_load(seq, skipped_waiting_requests)
                 self._inflight_prefix_wait.pop(seq.id, None)
+                continue
+            # A load an offload tier declines after `allocate` prefills
+            # locally too.
+            if seq.kv_transfer_params is not None and (
+                self._refuse_prefill_without_media(seq)
+            ):
                 continue
 
             if seq.offload_joint.boundary_tokens:
@@ -3584,6 +3603,17 @@ class Scheduler:
         )
         return needs_remote_load
 
+    def _refuse_prefill_without_media(self, seq: Sequence) -> bool:
+        """Finish `seq` instead of prefilling it locally when it is a decode
+        leg whose media its prefill kept: its image placeholders would run as
+        text. True when it was finished."""
+        if not seq.media_on_prefill_instance:
+            return False
+        self._finish_rejected_waiting(
+            seq, reason="unschedulable: image decode leg has no media"
+        )
+        return True
+
     def _schedule_first_decode_after_remote_kv(self, seq: Sequence) -> None:
         """P/D path: a remote prefill completed, so schedule first decode."""
         # num_cached_tokens still describes this consumer's pre-existing prefix.
@@ -4117,8 +4147,8 @@ class Scheduler:
         """Refuse a batch whose draft round would write past a row's blocks.
 
         A position past the last allocated block reads block id 0 from the
-        zeroed block-table tail, and the KV write lands in physical block 0 --
-        silently, in whatever request or state checkpoint owns it. Every path
+        zeroed block-table tail, overwriting reserved padding or unrelated
+        live KV at physical block 0. Every path
         that schedules a forward has to have allocated through
         `len(seq) + draft_lookahead` (`may_append(..., lookahead=)`); this is
         where one that did not fails loudly. Remote-prefill rows are skipped:
@@ -4404,7 +4434,7 @@ class Scheduler:
             or not self.kv_connector.supports_early_load
         ):
             return 0
-        total_blocks = int(bm.kv.num_blocks) if bm is not None else 0
+        total_blocks = int(bm.kv.num_usable_blocks) if bm is not None else 0
         state.maybe_log(total_blocks)
         state.tick += 1
         if state.entries:
@@ -4608,7 +4638,9 @@ class Scheduler:
     def preempt_running(self) -> int:
         """Preempt every running sequence ahead of a KV change; return how many.
 
-        Each recomputes its prompt and tokens once scheduled again. Raises,
+        Each recomputes its prompt and tokens once scheduled again, except an
+        image decode leg whose media its prefill kept: that one is finished
+        when it is next admitted, as it has nothing to recompute from. Raises,
         preempting none, while one's blocks are still in use: remote KV loading
         for a parked request, a KV connector holding the sequence, or its token
         in flight through the pipeline. ``preempt()`` refuses nothing else, so

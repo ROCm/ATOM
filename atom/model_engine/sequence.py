@@ -189,6 +189,17 @@ def resumes_offload_prefill(seq) -> bool:
     return (seq.offload_loaded or seq.offload_load_failed) and len(seq.block_table) > 0
 
 
+def leaves_media_on_prefill(kv_transfer_params: dict | None) -> bool:
+    """True for a remote-prefill decode leg whose prefill kept the media.
+
+    Such a leg runs on its prefill's expanded prompt ids with the `cache_seed`
+    and `mrope_position_delta` the prefill returned, and cannot prefill
+    locally: it has no media to put in the placeholders.
+    """
+    handoff = kv_transfer_params or {}
+    return bool(handoff.get("do_remote_prefill")) and "cache_seed" in handoff
+
+
 @dataclass
 class OffloadJointRecord:
     """The KV-transfer offload/joint-load protocol state for one sequence.
@@ -262,6 +273,8 @@ class OffloadJointRecord:
 
 class Sequence:
     counter = count()
+    # True only for a decode leg whose prefill kept the media, set in __init__.
+    media_on_prefill_instance = False
 
     def __init__(
         self,
@@ -316,6 +329,18 @@ class Sequence:
                 self.cache_seed = multimodal_cache_seed(multimodal_data)
         self.mrope_positions = mrope_positions
         self.mrope_position_delta = mrope_position_delta
+        if (
+            kv_transfer_params is not None
+            and multimodal_data is None
+            and leaves_media_on_prefill(kv_transfer_params)
+        ):
+            # A decode leg whose prefill kept the media keeps what the prefill
+            # derived from it; the scheduler never prefills it locally.
+            self.media_on_prefill_instance = True
+            self.cache_seed = kv_transfer_params["cache_seed"]
+            self.mrope_position_delta = kv_transfer_params.get(
+                "mrope_position_delta", 0
+            )
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
         # Host-known prefix, excluding deferred outputs and draft placeholders.
