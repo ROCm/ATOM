@@ -125,3 +125,12 @@ class PrefixPolicy(LoadPolicy):
 
     def reset(self) -> None:
         self.router.reset()
+
+
+class ShareCachePolicy(PrefixPolicy):
+    """Shared-tier placement; the router balances on `rank_tokens`, each rank's
+    reported prefill backlog."""
+
+    def charge(self, seq: Any, credit: int) -> int:
+        seq.dp_est_cached_tokens = hit = super().charge(seq, credit)
+        return hit

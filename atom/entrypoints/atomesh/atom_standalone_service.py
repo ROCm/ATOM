@@ -18,7 +18,13 @@ import uuid
 from typing import Any
 
 from atom import SamplingParams
-from atom.entrypoints.openai.api_server import _build_sampling_params, _coerce_n
+from atom.entrypoints.chat_utils import has_multimodal_content
+from atom.entrypoints.openai.api_server import (
+    _build_sampling_params,
+    _coerce_n,
+    load_multimodal_processor,
+    prepare_chat_multimodal_inputs,
+)
 from atom.entrypoints.openai.chat_encoders import (
     apply_chat_template,
     chat_template_source,
@@ -26,6 +32,7 @@ from atom.entrypoints.openai.chat_encoders import (
     render_probe_prompt,
     resolve_reasoning_toggle,
 )
+from atom.entrypoints.openai.images import check_chat_images
 from atom.entrypoints.openai.protocol import (
     CHAT_COMPLETION_CHUNK_OBJECT,
     DEFAULT_MAX_TOKENS,
@@ -34,7 +41,9 @@ from atom.entrypoints.openai.protocol import (
     DEFAULT_TOP_P,
     STREAM_DONE_MESSAGE,
     TEXT_COMPLETION_OBJECT,
+    ChatMessage,
     CompletionRequest,
+    check_media_handoff,
     ended_by_stop,
     openai_stop_reason,
     openai_stop_reason_with_calls,
@@ -43,6 +52,7 @@ from atom.entrypoints.openai.reasoning import (
     NO_REASONING,
     ReasoningChannel,
     prompt_starts_in_reasoning,
+    prompt_tokens_start_in_reasoning,
     template_opens_reasoning_implicitly,
     thinking_switched_off,
 )
@@ -73,23 +83,25 @@ logger = logging.getLogger("atom")
 @dataclasses.dataclass
 class EngineRequest:
     request_id: str
-    prompt: str
+    prompt: str | list[int]
     sampling_params: SamplingParams
     effective_n: int
     future: concurrent.futures.Future[list[dict[str, Any]]]
     kv_transfer_params: dict[str, Any] | None = None
     data_parallel_rank: int | None = None
+    multimodal_data: dict[str, Any] | None = None
 
 
 @dataclasses.dataclass
 class EngineStreamRequest:
     request_id: str
-    prompt: str
+    prompt: str | list[int]
     sampling_params: SamplingParams
     effective_n: int
     stream_queue: queue.Queue[dict[str, Any]]
     kv_transfer_params: dict[str, Any] | None = None
     data_parallel_rank: int | None = None
+    multimodal_data: dict[str, Any] | None = None
 
 
 class AtomEngineService:
@@ -133,12 +145,13 @@ class AtomEngineService:
 
     def generate(
         self,
-        prompt: str,
+        prompt: str | list[int],
         sampling_params: SamplingParams,
         request_id: str,
         effective_n: int,
         kv_transfer_params: dict[str, Any] | None = None,
         data_parallel_rank: int | None = None,
+        multimodal_data: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         if self._closed.is_set():
             raise RuntimeError("ATOM standalone engine service is closed")
@@ -158,6 +171,7 @@ class AtomEngineService:
                 future=future,
                 kv_transfer_params=kv_transfer_params,
                 data_parallel_rank=data_parallel_rank,
+                multimodal_data=multimodal_data,
             )
         )
         try:
@@ -236,12 +250,13 @@ class AtomEngineService:
 
     def start_stream(
         self,
-        prompt: str,
+        prompt: str | list[int],
         sampling_params: SamplingParams,
         request_id: str,
         effective_n: int,
         kv_transfer_params: dict[str, Any] | None = None,
         data_parallel_rank: int | None = None,
+        multimodal_data: dict[str, Any] | None = None,
     ) -> queue.Queue[dict[str, Any]]:
         if self._closed.is_set():
             raise RuntimeError("ATOM standalone engine service is closed")
@@ -257,6 +272,7 @@ class AtomEngineService:
                 stream_queue=stream_queue,
                 kv_transfer_params=kv_transfer_params,
                 data_parallel_rank=data_parallel_rank,
+                multimodal_data=multimodal_data,
             )
         )
         return stream_queue
@@ -397,6 +413,7 @@ class AtomEngineService:
             stream_callback=completion_callback,
             kv_transfer_params=request.kv_transfer_params,
             data_parallel_rank=request.data_parallel_rank,
+            multimodal_data=request.multimodal_data,
         )
 
     def _preprocess_fanout_stream_request(
@@ -424,6 +441,7 @@ class AtomEngineService:
             kv_transfer_params=request.kv_transfer_params,
             parent_request_id=request.request_id,
             data_parallel_rank=request.data_parallel_rank,
+            multimodal_data=request.multimodal_data,
         )
 
     def _preprocess_single_request(self, request: EngineRequest) -> Any:
@@ -442,6 +460,7 @@ class AtomEngineService:
             stream_callback=completion_callback,
             kv_transfer_params=request.kv_transfer_params,
             data_parallel_rank=request.data_parallel_rank,
+            multimodal_data=request.multimodal_data,
         )
         state.set_num_tokens_input(seq.num_prompt_tokens)
         return seq
@@ -469,6 +488,7 @@ class AtomEngineService:
             kv_transfer_params=request.kv_transfer_params,
             parent_request_id=request.request_id,
             data_parallel_rank=request.data_parallel_rank,
+            multimodal_data=request.multimodal_data,
         )
         if seqs:
             state.set_num_tokens_input(seqs[0].num_prompt_tokens)
@@ -679,7 +699,7 @@ class ChatCompletionStreamState:
         self,
         request_id: str,
         model_name: str,
-        prompt: str,
+        prompt: str | list[int],
         tokenizer: Any,
         stream_queue: queue.Queue[dict[str, Any]],
         n: int,
@@ -691,7 +711,9 @@ class ChatCompletionStreamState:
         self.request_id = request_id
         self.model_name = model_name
         self.stream_queue = stream_queue
-        self.num_tokens_input = len(tokenizer.encode(prompt))
+        self.num_tokens_input = len(
+            tokenizer.encode(prompt) if isinstance(prompt, str) else prompt
+        )
         self.num_tokens_output = [0] * n
         # Same prompt for every sibling, so the same starting state. Without
         # this a template that opens the reasoning channel in the prompt has
@@ -1211,13 +1233,17 @@ class AtomStandaloneService:
         )
 
         self.engine_service = AtomEngineService(engine, tokenizer)
+        # Loaded by the first request with an image, under the lock so that
+        # concurrent first requests load it once.
+        self._multimodal_processor = None
+        self._multimodal_processor_lock = threading.Lock()
 
         self._streams: dict[str, ChatCompletionStreamState] = {}
         self._completion_streams: dict[str, CompletionStreamState] = {}
         self._streams_lock = threading.Lock()
 
     def _reasoning_channel(
-        self, prompt: str, template_kwargs: dict[str, Any] | None = None
+        self, prompt: str | list[int], template_kwargs: dict[str, Any] | None = None
     ) -> ReasoningChannel:
         """How to read this response's reasoning channel.
 
@@ -1238,7 +1264,11 @@ class AtomStandaloneService:
         """
         return ReasoningChannel(
             dialect=self.reasoning_dialect,
-            starts_open=prompt_starts_in_reasoning(prompt)
+            starts_open=(
+                prompt_starts_in_reasoning(prompt)
+                if isinstance(prompt, str)
+                else prompt_tokens_start_in_reasoning(prompt, self.tokenizer.decode)
+            )
             or (
                 self.model_starts_in_reasoning
                 and not thinking_switched_off(template_kwargs, self.reasoning_toggle)
@@ -1259,15 +1289,8 @@ class AtomStandaloneService:
             if request_data.get("chat_template_kwargs"):
                 template_kwargs.update(request_data["chat_template_kwargs"])
 
-            prompt = apply_chat_template(
-                self.tokenizer,
-                self.custom_message_encoder,
-                [
-                    self._chat_message_to_template_dict(msg)
-                    for msg in self._get_chat_messages(request_data)
-                ],
-                tools=request_data.get("tools"),
-                **template_kwargs,
+            prompt, multimodal_data = self._chat_engine_input(
+                request_data, template_kwargs
             )
 
             effective_n = _coerce_n(
@@ -1286,6 +1309,7 @@ class AtomStandaloneService:
                     request_id,
                     effective_n,
                     data_parallel_rank=data_parallel_rank,
+                    multimodal_data=multimodal_data,
                 )
                 if not outputs:
                     raise RuntimeError("No output generated")
@@ -1305,6 +1329,7 @@ class AtomStandaloneService:
                     request_id,
                     effective_n,
                     data_parallel_rank=data_parallel_rank,
+                    multimodal_data=multimodal_data,
                 )
                 if not outputs:
                     raise RuntimeError("No output generated")
@@ -1345,13 +1370,18 @@ class AtomStandaloneService:
                 request_data.get("temperature", DEFAULT_TEMPERATURE),
             )
             sampling_params = self._build_sampling_params(request_data, effective_n)
+            kv_transfer_params = request_data.get("kv_transfer_params")
+            if kv_transfer_params:
+                check_media_handoff(
+                    kv_transfer_params, self.engine.config.max_model_len
+                )
             request_id = f"cmpl-{uuid.uuid4().hex}"
             outputs = self.engine_service.generate(
                 prompts[0],
                 sampling_params,
                 request_id,
                 effective_n,
-                kv_transfer_params=request_data.get("kv_transfer_params"),
+                kv_transfer_params=kv_transfer_params,
                 data_parallel_rank=self._get_data_parallel_rank(request_data),
             )
             if not outputs:
@@ -1385,6 +1415,11 @@ class AtomStandaloneService:
                 request_data.get("temperature", DEFAULT_TEMPERATURE),
             )
             sampling_params = self._build_sampling_params(request_data, effective_n)
+            kv_transfer_params = request_data.get("kv_transfer_params")
+            if kv_transfer_params:
+                check_media_handoff(
+                    kv_transfer_params, self.engine.config.max_model_len
+                )
             request_id = f"cmpl-{uuid.uuid4().hex}"
             prompt = prompts[0]
             stream_queue = self.engine_service.start_stream(
@@ -1392,7 +1427,7 @@ class AtomStandaloneService:
                 sampling_params,
                 request_id,
                 effective_n,
-                kv_transfer_params=request_data.get("kv_transfer_params"),
+                kv_transfer_params=kv_transfer_params,
                 data_parallel_rank=self._get_data_parallel_rank(request_data),
             )
             stream_state = CompletionStreamState(
@@ -1478,15 +1513,8 @@ class AtomStandaloneService:
             if request_data.get("chat_template_kwargs"):
                 template_kwargs.update(request_data["chat_template_kwargs"])
 
-            prompt = apply_chat_template(
-                self.tokenizer,
-                self.custom_message_encoder,
-                [
-                    self._chat_message_to_template_dict(msg)
-                    for msg in self._get_chat_messages(request_data)
-                ],
-                tools=request_data.get("tools"),
-                **template_kwargs,
+            prompt, multimodal_data = self._chat_engine_input(
+                request_data, template_kwargs
             )
 
             effective_n = _coerce_n(
@@ -1503,6 +1531,7 @@ class AtomStandaloneService:
                 request_id,
                 effective_n,
                 data_parallel_rank=self._get_data_parallel_rank(request_data),
+                multimodal_data=multimodal_data,
             )
             stream_state = ChatCompletionStreamState(
                 request_id=request_id,
@@ -1522,6 +1551,45 @@ class AtomStandaloneService:
         except Exception:
             logger.exception("ATOM standalone start_chat_completions_stream failed")
             raise
+
+    def _chat_engine_input(
+        self, request_data: dict[str, Any], template_kwargs: dict[str, Any]
+    ) -> tuple[str | list[int], dict[str, Any] | None]:
+        """A chat request's prompt for the engine, and its images' data.
+
+        A request with images is prepared as the OpenAI server prepares it:
+        its image parts checked, fetched and expanded into the model's
+        placeholders, so its prompt arrives as token ids. Blocking.
+        """
+        messages = self._get_chat_messages(request_data)
+        if has_multimodal_content(messages):
+            # Tool-call arguments go to the template as sent, as on the text
+            # path below.
+            return prepare_chat_multimodal_inputs(
+                self.engine.config,
+                self._get_multimodal_processor(),
+                check_chat_images([ChatMessage.model_validate(m) for m in messages]),
+                template_kwargs,
+                request_data.get("tools"),
+                preserve_tool_call_arguments=True,
+            )
+        prompt = apply_chat_template(
+            self.tokenizer,
+            self.custom_message_encoder,
+            [self._chat_message_to_template_dict(msg) for msg in messages],
+            tools=request_data.get("tools"),
+            **template_kwargs,
+        )
+        return prompt, None
+
+    def _get_multimodal_processor(self) -> Any:
+        with self._multimodal_processor_lock:
+            if self._multimodal_processor is None:
+                logger.info("Loading multimodal processor for %s", self.model_name)
+                self._multimodal_processor = load_multimodal_processor(
+                    self.engine.config, self.tokenizer, self.custom_message_encoder
+                )
+            return self._multimodal_processor
 
     def drain_chat_completions_stream(
         self,

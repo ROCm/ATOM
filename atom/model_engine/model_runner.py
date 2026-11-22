@@ -21,18 +21,17 @@ import numpy as np
 import torch
 import torch.profiler as torch_profiler
 import tqdm
-from aiter import destroy_dist_env, init_dist_env
+from aiter import destroy_dist_env
 from aiter.dist.parallel_state import (
     get_dp_group,
     get_pp_group,
     get_tp_group,
     graph_capture,
 )
-from aiter.dist.utils import get_distributed_init_method
 from torch.profiler import record_function
 
 from atom import structured_output
-from atom.config import Config, local_device_index, set_current_atom_config
+from atom.config import Config, set_current_atom_config
 from atom.distributed.group_agreement import agree_kv_budget, group_min
 from atom.distributed.pcp_utils import (
     PcpBalGroup,
@@ -49,9 +48,7 @@ from atom.distributed.pp_comm import (
     commit_pp_send_work,
     recv_intermediate_tensors,
 )
-from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_tp
 from atom.distributed.ulysses_sp import (
-    check_aiter_sp_api,
     get_sp_world_size,
     local_num_kv_heads,
     sp_is_enabled,
@@ -65,6 +62,13 @@ from atom.kv_transfer.disaggregation import (
 from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
 from atom.model_engine.dynamic_chunking_worker import DynamicChunkingWorker
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_engine.model_setup import (
+    build_model,
+    construct_drafter,
+    get_model,
+    init_model_env,
+    load_weights,
+)
 from atom.model_engine.output_transfer import D2HQueue
 from atom.model_engine.page_unit_checkpoint import (
     PagedStateCheckpointSpec,
@@ -99,7 +103,6 @@ from atom.model_engine.token_logprobs import (
     pack_token_logprobs,
     unpack_token_logprobs,
 )
-from atom.model_loader.loader import load_model
 from atom.model_ops.attentions.pool_layout.entry_arena import plan_regions
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
     InsufficientPoolBudget,
@@ -121,11 +124,10 @@ from atom.model_ops.indexer.schedule import skips_index_topk
 from atom.model_ops.rejection_sampler import RELAXED_TOP_N, RejectionSampler
 from atom.model_ops.required_channel import DeviceChannel
 from atom.model_ops.sampler import SAMPLER_EPS, sampler_from_config
-from atom.models.registry import mono_decode_installers, support_model_arch_dict
+from atom.models.registry import mono_decode_installers
 from atom.mono.runtime.step_override import StepOverrideModel
 from atom.sampling_params import RequiredChannel
 from atom.spec_decode.drafter import Drafter
-from atom.spec_decode.factory import build_drafter
 from atom.spec_decode.pp_aux_relay import PPAuxRelay
 from atom.spec_decode.status import SpecStatusQueue
 from atom.utils import (
@@ -136,7 +138,7 @@ from atom.utils import (
     resolve_obj_by_qualname,
     worker_process_name,
 )
-from atom.utils.distributed.utils import raise_timeout_if_dp_spans_nodes
+from atom.utils.distributed.utils import kv_blocks_differ_across_ranks
 from atom.utils.forward_context import (
     Context,
     ForwardMode,
@@ -813,6 +815,8 @@ class ModelRunner:
         from atom.model_engine.multimodal_runtime import VisionEmbeddingCache
 
         self.vision_embeddings = VisionEmbeddingCache()
+        # Reads an encoder server's image embeddings; built on first use.
+        self.ec_reader = None
         self.mark_trace = getattr(config, "mark_trace", False)
         from atom.utils.graph_marker import set_graph_marker_enabled
 
@@ -918,20 +922,7 @@ class ModelRunner:
             dtype=np.int64,
         )
 
-        model_class = resolve_obj_by_qualname(
-            support_model_arch_dict[hf_config.architectures[0]]
-        )  # type: ignore
-        # The model construction depends on quant_config,
-        # so we must complete the remapping for layers before constructing the model.
-        config.quant_config.remap_layer_name(
-            config.hf_config,
-            packed_modules_mapping=getattr(model_class, "packed_modules_mapping", {}),
-            quant_exclude_name_mapping=getattr(
-                model_class, "quant_exclude_name_mapping", {}
-            ),
-        )
-
-        self._build_and_load_model(model_class)
+        self.model = get_model(config, self.device, self._build_and_load_model)
         # After weight processing, before warmup and capture. Here rather than in
         # the loader so a runner that builds its model differently still sets it.
         from atom.model_ops.fused_moe.sp_mega_moe import initialize_sp_mega_moe
@@ -951,19 +942,12 @@ class ModelRunner:
         maybe_dump_weights_and_exit(self.model)
 
         if self.config.speculative_config and get_pp_group().is_last_rank:
-            from atom.utils.backends import set_model_tag
-
-            torch.set_default_device(self.device)
-            with set_model_tag("drafter"):
-                self.drafter = build_drafter(self.config, self.device, self)
+            self.drafter = self._build_and_load_drafter()
             self.rejection_sampler = RejectionSampler(
                 synthetic_acceptance_rates=(
                     self.config.speculative_config.synthetic_acceptance_rates
                 )
             )
-            torch.set_default_device(None)
-            logger.info("Loading drafter model...")
-            self.drafter.load_model(self.model)
             # A block drafter's width reads the loaded draft model's window.
             self.tokenID_processor.draft_tokens_per_seq = (
                 self.drafter.draft_tokens_per_seq
@@ -1080,31 +1064,41 @@ class ModelRunner:
         if self.gpu_forward_metrics is not None:
             self.gpu_forward_metrics.poll()
 
-    def _build_and_load_model(self, model_class):
-        """Construct the model and load its weights from disk.
+    def _build_and_load_model(
+        self, config: Config, model_class: type, device: torch.device
+    ) -> torch.nn.Module:
+        """Construct the model and load its weights from disk: the loader
+        ``get_model`` calls.
 
         Override point: subclasses (e.g. the rapidserve decode process) may
         construct on the meta device and import weights via IPC instead.
         """
-        config = self.config
-        self.model = model_class(config)
-        fused_shared_expert_load_fn = None
-        if hasattr(self.model, "load_fused_expert_weights"):
-            fused_shared_expert_load_fn = self.model.load_fused_expert_weights
-        torch.set_default_device(None)
+        model = build_model(config, model_class, device)
         load_start = time.perf_counter()
-        load_model(
-            self.model,
-            config.model,
-            config.hf_config,
-            config.load_dummy,
-            load_fused_expert_weights_fn=fused_shared_expert_load_fn,
-        )
+        loaded = load_weights(model, config)
+        # The parameters the checkpoint wrote, by name; None if none was read.
+        self._checkpoint_param_names = None if config.load_dummy else frozenset(loaded)
         load_elapsed = time.perf_counter() - load_start
         logger.info(
             f"[{self.rank_name}] Model load done: {config.model} "
             f"(weights loaded in {load_elapsed:.2f}s)"
         )
+        return model
+
+    def _build_and_load_drafter(self) -> Drafter:
+        """Construct the drafter and load its weights, sharing with the loaded
+        model what the draft does not hold itself."""
+        drafter = construct_drafter(self.config, self.device, self)
+        logger.info("Loading drafter model...")
+        load_start = time.perf_counter()
+        drafter.load_model(self.model)
+        load_elapsed = time.perf_counter() - load_start
+        logger.info(
+            f"[{self.rank_name}] Drafter load done: "
+            f"{self.config.speculative_config.method} "
+            f"(weights loaded in {load_elapsed:.2f}s)"
+        )
+        return drafter
 
     def _maybe_warmup(self):
         """Run model warmup. Override point: the rapidserve decode process
@@ -1119,98 +1113,7 @@ class ModelRunner:
         return 0
 
     def _setup_device_and_distributed(self, rank: int, config: Config):
-        if sp_is_enabled():
-            check_aiter_sp_api()
-        # `rank` is this worker's local index (0..tp*pcp-1) within its stage.
-        dp_rank_local = config.parallel_config.data_parallel_rank_local or 0
-        pp_rank = config.parallel_config.pipeline_parallel_rank
-        pp_size = config.pipeline_parallel_size
-        if pp_size > 1:
-            # Reject before any collective can wait for nonexistent ranks.
-            reject_simulated_tp(config, "pipeline parallel")
-        # tp_world_size: how many GPUs this stage actually occupies.
-        stage_span = config.tp_world_size * config.pcp_group_size
-        local_device_rank = local_device_index(config, rank)
-        num_gpus = torch.cuda.device_count()
-        if local_device_rank >= num_gpus:
-            raise ValueError(
-                f"Calculated local_device_rank={local_device_rank} exceeds available GPUs ({num_gpus}). "
-            )
-
-        self.device = torch.device(f"cuda:{local_device_rank}")
-        logger.info(
-            f"ModelRunner rank={rank}, dp_rank_local={dp_rank_local}, "
-            f"pp_rank={pp_rank}, local_device_rank={local_device_rank}, "
-            f"device={self.device}"
-        )
-
-        torch.cuda.set_device(self.device)
-        os.environ["MASTER_ADDR"] = self.config.master_addr
-        os.environ["MASTER_PORT"] = str(self.config.port)
-        distributed_init_method = get_distributed_init_method(
-            config.parallel_config.data_parallel_master_ip,
-            config.parallel_config.data_parallel_base_port,
-        )
-        dp_size = config.parallel_config.data_parallel_size
-        world_size = dp_size * pp_size * stage_span
-        dp_rank = config.parallel_config.data_parallel_rank
-        global_rank = (dp_rank * pp_size + pp_rank) * stage_span + rank
-        raise_timeout_if_dp_spans_nodes(config.parallel_config)
-        if (
-            config.parallel_config._managed_distributed_store
-            and not torch.distributed.is_initialized()
-        ):
-            # Preserve AITER's environment setup when preinitializing its group.
-            os.environ.setdefault(
-                "HIP_VISIBLE_DEVICES", ",".join(map(str, range(world_size)))
-            )
-            store = torch.distributed.TCPStore(
-                config.parallel_config.data_parallel_master_ip,
-                config.parallel_config.data_parallel_base_port,
-                is_master=False,
-            )
-            torch.distributed.init_process_group(
-                backend="nccl", store=store, rank=global_rank, world_size=world_size
-            )
-        # AITER reuses the default group and creates the model-parallel groups.
-        if config.pipeline_parallel_size > 1:
-            from atom.distributed.pp_comm import init_pp_aware_dist_env
-
-            # No local_rank here, unlike the non-PP branch below. Safe only
-            # because PP is single-node today: CoreManager rejects multi-node
-            # DP when pp_size > 1, and asserts PP+DP out entirely, so
-            # global_rank is already the physical device index. Revisit if
-            # either restriction is lifted.
-            init_pp_aware_dist_env(
-                tensor_model_parallel_size=config.tensor_parallel_size,
-                pipeline_model_parallel_size=pp_size,
-                global_rank=global_rank,
-                world_size=world_size,
-                distributed_init_method=distributed_init_method,
-                backend="nccl",
-                data_parallel_size=dp_size,
-                prefill_context_model_parallel_size=config.pcp_group_size,
-            )
-        else:
-            # The group spans the devices that exist; apply_simulated_tp then
-            # makes it *report* the logical width so layers shard that many ways.
-            init_dist_env(
-                config.tp_world_size,
-                rankID=rank,
-                backend="nccl",
-                distributed_init_method=distributed_init_method,
-                # This node's physical device index. Without it aiter derives a
-                # local rank from the DP-scaled global rank, which overruns the
-                # device list on every node after the first.
-                local_rank=local_device_rank,
-                data_parallel_size=config.parallel_config.data_parallel_size,
-                data_parallel_rank=config.parallel_config.data_parallel_rank,
-                prefill_context_model_parallel_size=config.pcp_group_size,
-                decode_context_parallel_size=getattr(
-                    config, "decode_context_parallel_size", 1
-                ),
-            )
-            apply_simulated_tp(config)
+        self.device = init_model_env(config, rank)
 
     def _get_cumsum_and_arange(
         self,
@@ -1231,6 +1134,27 @@ class ModelRunner:
         arange = self.arange_np[:total_num_tokens] - cumsums_offsets
 
         return cu_num_tokens, arange
+
+    def read_image_embeddings(self, params, cache_seed, dtype):
+        """The rows an encoder server stored for ``cache_seed``, or None when
+        this rank must run its own vision tower."""
+        if self.ec_reader is None:
+            from atom.kv_transfer.disaggregation.mooncake.ec_transport import (
+                EcReader,
+            )
+
+            # A request's image rows never outnumber its prompt's tokens.
+            row_bytes = self.config.hf_config.hidden_size * dtype.itemsize
+            self.ec_reader = EcReader(
+                self.config.max_model_len * row_bytes, self.device
+            )
+        rows = self.ec_reader.read(params, cache_seed, dtype)
+        if rows is None:
+            logger.warning(
+                "Image embeddings from %s are unavailable; running the vision tower",
+                params["session"],
+            )
+        return rows
 
     def release_multimodal_requests(self, request_ids):
         self.vision_embeddings.release(request_ids)
@@ -1585,17 +1509,18 @@ class ModelRunner:
             )
 
     def _init_forward_vars_ring(self):
-        """Build a ring of independent ``forward_vars`` copies, one per possible
-        in-flight pipeline microbatch.
+        """Build a ring of ``pp_size`` independent ``forward_vars`` copies.
 
-        The head launches up to ``pp_size`` forwards back-to-back without a GPU
-        sync, so a single reused ``forward_vars`` set would let microbatch N+1's
-        ``prepare_inputs`` overwrite staging buffers microbatch N's kernels are
-        still reading. Each in-flight slot gets its own buffer set; reuse of a
-        slot is gated by a per-slot CUDA event (see ``_advance_forward_vars`` /
-        ``_record_forward_vars_event``), bounding the CPU's GPU lead to the ring
-        size even when the head runs middle-chunk or DP-sync dummy batches
-        without a GPU sync.
+        The head launches up to ``pp_max_inflight`` forwards back-to-back
+        without a GPU sync (``pp_size`` unless ATOM_PP_MAX_INFLIGHT says
+        otherwise), so a single reused ``forward_vars`` set would let
+        microbatch N+1's ``prepare_inputs`` overwrite staging buffers
+        microbatch N's kernels are still reading. Each slot gets its own buffer
+        set; reuse of a slot is gated by a per-slot CUDA event (see
+        ``_advance_forward_vars`` / ``_record_forward_vars_event``), bounding
+        the CPU's GPU lead to the ring size even when more forwards are in
+        flight, or the head runs middle-chunk or DP-sync dummy batches without
+        a GPU sync.
 
         When ``pp_size == 1`` the ring is the single original dict and advance is
         a no-op, so behavior is unchanged.
@@ -1723,6 +1648,7 @@ class ModelRunner:
                 int(self.drafter.model.vocab_size),
                 config.torch_dtype,
                 self.device,
+                block=lossless.block_verify,
             )
         elif envs.ATOM_SPEC_LOSSLESS_SAMPLING:
             # Without a drafter there is no draft to sample, and a DSpark
@@ -2016,7 +1942,6 @@ class ModelRunner:
             )
         units = max(entry[3] for entry in stages)
         op_bytes = sum(entry[1] for entry in stages)
-        largest_image = max(entry[1] for entry in stages)
         digest = hashlib.sha256(repr(stages).encode()).hexdigest()[:16]
         layout_id = f"pp{len(stages)}-joint:{digest}"
         logger.info(
@@ -2028,7 +1953,7 @@ class ModelRunner:
             op_bytes,
             layout_id,
         )
-        return spec.for_pipeline(layout_id, units, op_bytes, largest_image)
+        return spec.for_pipeline(layout_id, units, op_bytes)
 
     def get_num_blocks(self) -> dict[str, object]:
         torch.set_default_device(self.device)
@@ -2137,13 +2062,14 @@ class ModelRunner:
                 )
             raise RuntimeError(base_msg + fix_msg) from exc
 
-        # PP stages compute different block counts; block ids must be valid on
-        # every stage's KV tensor, so reduce to the global minimum. Fold the
+        # PP stages, and TP ranks on another node, compute different block
+        # counts; block ids must be valid on every rank's KV tensor, so reduce
+        # to the global minimum (kv_blocks_differ_across_ranks). Fold the
         # result back into the plan before publishing anything: the plan is the
         # single source for every entry count, so it must never disagree with
         # the number the pool is actually built at.
         num_kvcache_blocks = plan.paged_entries
-        if config.pipeline_parallel_size > 1 and torch.distributed.is_initialized():
+        if kv_blocks_differ_across_ranks(config) and torch.distributed.is_initialized():
             t = torch.tensor(
                 [num_kvcache_blocks], dtype=torch.int64, device=self.device
             )
@@ -3273,6 +3199,7 @@ class ModelRunner:
                             batch,
                             self.device,
                             self.config.torch_dtype,
+                            self.read_image_embeddings,
                         )
                     else:
                         mm_data_values = list(batch.multimodal_data.values())
@@ -4279,7 +4206,8 @@ class ModelRunner:
         # all-to-all. No-op unless the flag is on.
         from atom.distributed.indexer_cp import warmup_exchange
 
-        warmup_exchange(self.device)
+        full_q_len = self.drafter.mtp_k + 1 if hasattr(self, "drafter") else 1
+        warmup_exchange(self.device, self.config.max_num_seqs * full_q_len)
 
         tr_hybrid = self._tr_hybrid_active()
         if tr_hybrid:
@@ -4313,7 +4241,6 @@ class ModelRunner:
         #
         # Warn rather than raise so a misconfig (default cuda_graph_sizes=[512]
         # vs e.g. max_num_seqs=16) stays recoverable.
-        full_q_len = self.drafter.mtp_k + 1 if hasattr(self, "drafter") else 1
         max_seq_bs = self.config.max_num_seqs
         max_tok_bs = self.config.max_num_batched_tokens // full_q_len
         max_bs = max_schedulable_decode_bs(
@@ -4591,6 +4518,11 @@ class ModelRunner:
         # The captures and the calibration ran the model for real; take back
         # what they wrote into the cache before the first request is admitted.
         self.attn_metadata_builder.reset_cache_after_capture()
+
+        if self.config.dcp_config.comm_backend == "mailbox":
+            from atom.model_ops.dcp_ops import check_dcp_mailbox_launches
+
+            check_dcp_mailbox_launches()
 
         # How much GPU memory the CUDA graph capture consumed (pool = reserved
         # delta; the allocated delta is what the graphs pin live).
@@ -4877,19 +4809,16 @@ class RapidServeModelRunner(ModelRunner):
     # Base ModelRunner override points
     # ------------------------------------------------------------------
 
-    def _build_and_load_model(self, model_class):
-        config = self.config
+    def _build_and_load_model(self, config, model_class, device):
         if not config.disagg_is_decode:
-            super()._build_and_load_model(model_class)
-            return
+            return super()._build_and_load_model(config, model_class, device)
         # Decode imports prefill's weights via CUDA IPC and owns no weight
         # memory. Build on the meta device so construction allocates zero GPU
         # bytes (avoids the transient 2x-weights peak that OOMs at TP=4);
         # import_model_weight_ipc_handles() materializes params from prefill,
         # and RoPE caches are recomputed locally.
         with self._init_weight_params_on_meta():
-            self.model = model_class(config)
-        torch.set_default_device(None)
+            return build_model(config, model_class, device)
 
     def _maybe_warmup(self):
         # Decode owns no GPU memory yet (weights/kvcache imported from prefill
@@ -5298,6 +5227,10 @@ class RapidServeModelRunner(ModelRunner):
             stream = self._prefill_streams[batch.cu_stream_fraction]
         else:
             stream = torch.cuda.current_stream()
+        # A connector that stages on the forward's stream follows it.
+        connector = get_kvconnector()
+        if connector is not None:
+            connector.set_forward_stream(stream)
         with torch.cuda.stream(stream):
             self._advance_forward_vars()
             self._gate_staging_reuse()

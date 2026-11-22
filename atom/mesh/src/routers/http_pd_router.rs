@@ -284,7 +284,7 @@ struct PDRequestContext<'a> {
     return_logprob: bool,
     request_text: Option<&'a str>,
     tokens: Option<&'a [u32]>,
-    carries_media: bool,
+    media_count: usize,
     model_id: Option<&'a str>,
     headers: Option<Arc<HeaderMap>>,
 }
@@ -298,7 +298,7 @@ impl<'a> PDRequestContext<'a> {
             return_logprob: metadata.return_logprob,
             request_text: Some(&metadata.text),
             tokens: None,
-            carries_media: metadata.carries_media,
+            media_count: metadata.media_count,
             model_id: metadata.model.as_deref().filter(|model| !model.is_empty()),
             headers: headers.cloned().map(Arc::new),
         }
@@ -753,7 +753,7 @@ impl PDRouter {
         );
         self.attach_encode_output(headers, &mut request, &context)
             .await;
-        let response = RetryExecutor::execute_response_with_retry(
+        let attempts = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             |_attempt| {
                 let request = request.clone();
@@ -783,9 +783,12 @@ impl PDRouter {
                     endpoint,
                 );
             },
-        )
-        .await;
-        observation.wrap_response(response)
+        );
+        let (response, estimate) = crate::observability::route_trace::estimated(attempts).await;
+        // Decode returns the response, but its cached tokens are the ones prefill reused.
+        observation
+            .reconcile(metrics_labels::WORKER_PREFILL, estimate)
+            .wrap_response(response)
     }
 
     /// Runs E for an ATOM chat request with media and adds E's opaque
@@ -806,7 +809,7 @@ impl PDRouter {
             obj.remove("ec_transfer_params");
         }
         if route_to_endpoint(context.route) != metrics_labels::ENDPOINT_CHAT
-            || !AtomAdapter::has_media_parts(body)
+            || context.media_count == 0
         {
             return;
         }
@@ -828,7 +831,7 @@ impl PDRouter {
             tokens: context.tokens,
             headers: context.headers.as_deref(),
             stream: false,
-            carries_media: context.carries_media,
+            media_count: context.media_count,
         };
         let hash_ring = context
             .model_id
@@ -908,7 +911,7 @@ impl PDRouter {
             tokens: context.tokens,
             headers: context.headers.as_deref(),
             stream: context.is_stream,
-            carries_media: context.carries_media,
+            media_count: context.media_count,
         };
         let plan = planner
             .plan(&descriptor)
@@ -926,7 +929,12 @@ impl PDRouter {
     ) -> Response {
         let prefill = placement.prefill.clone();
         let decode = placement.decode.clone();
-        let ctx = match self.adapter.prepare_pair(prefill.as_ref(), decode.as_ref()) {
+        let pair = self.adapter.prepare_pair_with_media(
+            prefill.as_ref(),
+            decode.as_ref(),
+            context.media_count,
+        );
+        let ctx = match pair {
             Ok(ctx) => ctx,
             Err(error) => return Self::handle_serialization_error(error),
         };
@@ -1287,9 +1295,10 @@ impl PDRouter {
         // P has completed its work; D's output stream must not keep P loaded.
         drop(prefill_guard);
 
+        // ATOM's prefill answers without a handoff as `"kv_transfer_params": null`.
         let mut kv_params = match prefill_body.get("kv_transfer_params").cloned() {
-            Some(v) => v,
-            None => {
+            Some(v) if !v.is_null() => v,
+            _ => {
                 error!(
                     "ATOM prefill {} request_id={} response missing kv_transfer_params",
                     prefill.url(),
@@ -2423,7 +2432,7 @@ mod tests {
                 return_logprob: false,
                 request_text: None,
                 tokens: None,
-                carries_media: false,
+                media_count: 0,
                 model_id: None,
                 headers: None,
             };
@@ -2651,6 +2660,7 @@ mod tests {
             batch_size: None,
             stream: false,
             return_logprob: false,
+            media_count: 0,
         };
         let body = json!({
             "messages": [{"role": "user", "content": "hi"}],
@@ -2672,6 +2682,110 @@ mod tests {
             prefill_bodies[0].1.get("ec_transfer_params").is_none(),
             "{bodies:?}"
         );
+}
+
+    #[derive(Debug)]
+    struct EstimatingPolicy;
+    #[async_trait::async_trait]
+    impl crate::policies::LoadBalancingPolicy for EstimatingPolicy {
+        async fn select_with_decision(
+            &self,
+            _: &[Arc<dyn Worker>],
+            _: &crate::policies::SelectWorkerInfo<'_>,
+        ) -> (Option<usize>, crate::policies::RouteDecision) {
+            let decision = crate::policies::RouteDecision {
+                estimated_hit_ratio: Some(0.5),
+                ..crate::policies::RouteDecision::branch("affinity")
+            };
+            (Some(0), decision)
+        }
+        fn name(&self) -> &'static str {
+            "estimating-test"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn pd_cached_tokens_are_reconciled_against_the_prefill_estimate() {
+        use crate::core::prepare_pool::PreparePoolRuntime;
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let usage = r#"{"usage":{"prompt_tokens":100,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":40}}}"#;
+        let app = axum::Router::new()
+            .fallback(move || async move { ([(CONTENT_TYPE, "application/json")], usage) });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let pool = PreparePoolRuntime::new(
+            crate::config::RouterConfig::default()
+                .resolved_prepare_pool()
+                .unwrap(),
+        )
+        .unwrap();
+        let config = crate::config::RouterConfig {
+            mode: crate::config::RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            ..Default::default()
+        };
+        let app_context = Arc::new(
+            crate::app_context::AppContext::from_config(config, 5, pool.handle())
+                .await
+                .unwrap(),
+        );
+        let mut router = create_test_pd_router();
+        router.worker_registry = app_context.worker_registry.clone();
+        router
+            .policy_registry
+            .set_prefill_policy(Arc::new(EstimatingPolicy));
+        router.worker_registry.register(Arc::new(
+            BasicWorkerBuilder::new(format!("{url}/prefill"))
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: Some(8001),
+                })
+                .build(),
+        ));
+        router.worker_registry.register(Arc::new(
+            BasicWorkerBuilder::new(format!("{url}/decode"))
+                .worker_type(WorkerType::Decode)
+                .build(),
+        ));
+        let body = json!({"model": UNKNOWN_MODEL_ID, "prompt": "test"});
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let request = super::super::ingress::InferenceEnvelope::parse(
+            "/v1/completions".parse().unwrap(),
+            headers,
+            serde_json::to_vec(&body).unwrap().into(),
+            &app_context,
+        )
+        .await
+        .unwrap();
+
+        let response = router.route_inference(request, &app_context).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+
+        let rendered = handle.render();
+        for line in [
+            r#"mesh_route_cache_tokens_total{pool="prefill",kind="prompt"} 100"#,
+            r#"mesh_route_cache_tokens_total{pool="prefill",kind="cached"} 40"#,
+            r#"mesh_route_cache_estimate_tokens_total{pool="prefill",kind="estimated"} 50"#,
+            r#"mesh_route_cache_estimate_tokens_total{pool="prefill",kind="actual"} 40"#,
+        ] {
+            assert!(rendered.contains(line), "missing {line} in\n{rendered}");
+        }
+        assert!(!rendered.contains(r#"pool="decode",kind="#), "{rendered}");
         server.abort();
     }
 
@@ -3152,7 +3266,7 @@ mod tests {
             return_logprob: false,
             request_text: None,
             tokens: None,
-            carries_media: false,
+            media_count: 0,
             model_id: Some("m"),
             headers: Some(Arc::new(headers)),
         };

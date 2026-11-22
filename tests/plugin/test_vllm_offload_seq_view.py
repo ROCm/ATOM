@@ -13,6 +13,20 @@ from types import SimpleNamespace
 from atom.plugin.vllm.kv_transfer.seq_view import SeqViewRegistry
 
 
+def test_shared_offload_resume_contract_and_preemption_reset():
+    from atom.model_engine.sequence import resumes_offload_prefill
+
+    view = SeqViewRegistry().get_or_create(_request())
+    view.set_block_table([1])
+    assert resumes_offload_prefill(view) is False
+    view.offload_loaded = True
+    assert resumes_offload_prefill(view) is True
+    view.reset_for_preemption()
+    assert view.offload_loaded is False
+    assert view.offload_load_failed is False
+    assert resumes_offload_prefill(view) is False
+
+
 def _request(rid: str = "r1", prompt=(1, 2, 3)):
     return SimpleNamespace(request_id=rid, prompt_token_ids=list(prompt))
 
@@ -166,6 +180,9 @@ def test_view_accepts_the_frozen_placement_the_chunked_scheduler_writes():
     # would hide exactly the kind of attribute access this test exists to catch.
     scheduler._release_failed_load_attempt = (
         ChunkedOffloadSchedulerBase._release_failed_load_attempt.__get__(scheduler)
+    )
+    scheduler._release_lookup = ChunkedOffloadSchedulerBase._release_lookup.__get__(
+        scheduler
     )
     scheduler._drop_finished_save_state = (
         ChunkedOffloadSchedulerBase._drop_finished_save_state.__get__(scheduler)
