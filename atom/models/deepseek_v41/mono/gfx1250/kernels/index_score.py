@@ -88,15 +88,21 @@ def fp4_key(c, flat, l):
     return kv, hx.gload(c["iscale"] + flat * 4, I32)
 
 
-def fp4_score(sm, k, l, kv, ksc):
+def fp4_score(sm, k, l, kv, ksc, rel_q=None, qb=None):
     """Row slot k's 32 heads against a lane's key tile: native gfx1250 order (pa_mqa_logits_mxfp4): even / odd fma
     chains of relu(acc) * w over heads mi*16 + 8 (l // 16) + i, then (even + odd) + the lane 16 apart."""
     se = F32(0.0)
     so = F32(0.0)
     for mi in range_constexpr(2):
         qrow = sm + O_Q + k * (HEADS * DIM) + (mi * 16 + l % 16) * 64
-        q0 = hx.lload(qrow + (l // 16) * 16, I32, 4)
-        q1 = hx.lload(qrow + 32 + (l // 16) * 16, I32, 4)
+        if rel_q is not None:   # (a loop-variant zero: the task loop reloads the query, keeps only the head weights)
+            qrow = qrow + rel_q
+        if qb is not None:   # (the lane's query base incl. the loop-variant zero, one VGPR: rows / mi as immediate offsets)
+            q0 = hx.lload(qb + (k * (HEADS * DIM) + mi * 16 * 64), I32, 4)
+            q1 = hx.lload(qb + (k * (HEADS * DIM) + mi * 16 * 64 + 32), I32, 4)
+        else:
+            q0 = hx.lload(qrow + (l // 16) * 16, I32, 4)
+            q1 = hx.lload(qrow + 32 + (l // 16) * 16, I32, 4)
         z = I32(0)
         qv = fx.Vector.from_elements([q0[e] for e in range(4)] + [q1[e] for e in range(4)] + [z] * 8, I32)
         qsc = hx.lload(sm + O_Q + k * (HEADS * DIM) + QS_OFF + (mi * 16 + l % 16) * 4, I32)
@@ -423,13 +429,32 @@ def stage_score_grouped(c):
     gpu.barrier()
     key_of = lambda flat: _grouped_key(c, flat, l)
 
+    # the rows' context / bound, read once into VGPRs (opaque: kept per lane, not as 12 uniform SGPRs -- as SGPRs they
+    # added 22 SGPR spills to the step kernel once the task loop held them)
+    cxv = [hx.opaque_v(hx.lload(osr + r * 4, I32)) for r in range(TR)]
+    # (the compressor rows' flag words and tag, per lane in VGPRs, for the poll inside the task loop)
+    cad = [c["crflag"] + i64(hx.opaque_v(fx.min(l + 32 * k_, I32(NCROW - 1)))) * 8 for k_ in range((NCROW + 31) // 32)]
+    crtv = hx.opaque_v(c["crtag"])
+    bdv = [hx.opaque_v(hx.lload(osr + (64 + r) * 4, I32)) for r in range(TR)]
+
+    qlane = hx.opaque_v(O_Q + (l % 16) * 64 + (l // 16) * 16)
+    iprv = hx.opaque_v(iprod.select(I32(1), I32(0)))   # (layer 20 flag per lane: not a spilled SGPR reloaded per row)
+    ilwv = hx.opaque_v(c["ilw"])
+    ilw8v = hx.opaque_v(c["ilw"] // 8)
     def score_task(task, kb, ks):
         col = task * CHUNK + w * 16 + l % 16
+        zr = ((task >> 30) & 1) * 32   # (a loop-variant 0, task < 2^30: the query reloaded a task, not held in VGPRs)
+        qb = (zr + qlane) + sm
+        rlo = col      # (row r's ilog / ibmax column: + ilw / ilw // 8 a row from one VGPR each, not TR uniform SGPRs)
+        rbo = col // 8
         for r in range_constexpr(TR):
-            cx = hx.lload(osr + r * 4, I32)
-            bd = hx.lload(osr + (64 + r) * 4, I32)
+            if fx.const_expr(r > 0):
+                rlo = rlo + ilwv
+                rbo = rbo + ilw8v
+            cx = cxv[r]
+            bd = bdv[r]
             if fx.const_expr(c["ifp4"]):
-                sc = fp4_score(sm, r, l, kb, ks)
+                sc = fp4_score(sm, r, l, kb, ks, qb=qb)
             else:
                 tot = F32(0.0)
                 for mi in range_constexpr(2):
@@ -443,8 +468,8 @@ def stage_score_grouped(c):
                 sc = tot + tot.shuffle_xor(16, 32)
             v = (col < cx).select(sc, F32(float("-inf")))
             if (cx > I32(TOPK)) & (l < 16) & (col < ((cx + (CHUNK - 1)) // CHUNK) * CHUNK):
-                c["stx"](c["ilog"] + i64(r * c["ilw"] + col) * 4, v)
-            if iprod:
+                c["stx"](c["ilog"] + i64(rlo) * 4, v)
+            if iprv != I32(0):
                 m = (v != v).select(F32(float("-inf")), v)
                 for o_ in range_constexpr(3):
                     m = fx.max(m, m.shuffle_xor(1 << o_, 32))
@@ -453,7 +478,7 @@ def stage_score_grouped(c):
                 nblk = (bd + 7) // 8
                 m = (bk == nblk - 1).select(F32(float("inf")), m)
                 if (cx > I32(TOPK)) & (l < 16) & (l % 8 == 0) & (bk < nblk):
-                    c["stx"](c["ibmax"] + i64(r * (c["ilw"] // 8) + bk) * 4, m)
+                    c["stx"](c["ibmax"] + i64(rbo) * 4, m)
 
     pf = c.get("score_pf", SCORE_PREFETCH)
     last = fx.max(vb + (nme - 1) * ncta, vb)
@@ -461,8 +486,17 @@ def stage_score_grouped(c):
     for i in range(nme):
         task = vb + i * ncta
         if early & ((task + 1) * CHUNK > newc):   # (B) this step's new keys: the compressor rows' flags
-            hx.wait_flags(c["crflag"], NCROW, c["crtag"], w, l, 11)
-            gpu.barrier()
+            # every wave polls them itself, plain LL peeks only (no s_sleep / clock / barrier in the task loop: a
+            # side-effecting op there kept LLVM from holding the rows' LDS operands in VGPRs over the loop -- 48
+            # ds_load_b128 a task; CT16 grouped-scorer fixture, the step's early path: a task 1.9 -> ~1.3 us)
+            bad = I32(1)
+            rn = I32(0)
+            while (bad != I32(0)) & (rn < I32(1 << 26)):   # (bounded by a poll count: no clock read in the loop)
+                rn = rn + 1
+                bad = I32(0)
+                for a_ in cad:
+                    bad = bad | (hx.peek(a_)[1] != crtv).select(I32(1), I32(0))
+                bad = TK.wave_max(bad)
         if fx.const_expr(pf):
             # the next task's page row (block table: this step's tables, not this layer's outputs) loaded before this
             # task's key tile, so the next round's chain is the key load alone, not block table -> key (2 VGPRs carried;
