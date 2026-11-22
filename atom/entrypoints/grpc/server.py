@@ -337,6 +337,8 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
         seq_id = session.seq_id(request.seq_id)
         if given.n > 1:
             raise ValueError(N_ABOVE_1)
+        if given.logprobs or given.top_logprobs:
+            raise ValueError("logprobs are not served over the Session")
         kv_transfer_params = request.kv_transfer_params
         api._validate_chunked_receive(kv_transfer_params)
         params = api._build_sampling_params(
@@ -351,7 +353,7 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
         structured = {name: getattr(given, name) for name in STRUCTURED_FIELDS}
         params = replace(params, **structured)
         prompt = resolve_prompt_token_ids(request.prompt_token_ids, kv_transfer_params)
-        seq = await asyncio.get_running_loop().run_in_executor(
+        preprocessing = asyncio.get_running_loop().run_in_executor(
             None,
             partial(
                 api.engine.io_processor.preprocess,
@@ -366,6 +368,11 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
                 seq_id=seq_id,
             ),
         )
+        try:
+            seq = await asyncio.shield(preprocessing)
+        except asyncio.CancelledError:  # the Session ended: drop the seq once made
+            preprocessing.add_done_callback(partial(_drop_preprocessed, api))
+            raise
         session.add(request.seq_id, seq, request.request_id)
         try:
             api._validate_sequence_context_length(seq, params)

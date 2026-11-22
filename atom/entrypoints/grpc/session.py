@@ -18,6 +18,8 @@ logger = logging.getLogger("atom")
 
 SEQ_IDS = worker_seq_id_base(0)  # a window's size: a client's seq ids lie below it
 WINDOWS = 127  # window k holds worker_seq_id_base(k) | seq_id; 127 stay inside int32
+STRUCTURED_ERROR = "structured_output_error"  # a grammar failure's finish reason
+STRUCTURED_FAILED = "Structured decoding failed for this request"  # HTTP chat's 500
 
 
 @dataclass(eq=False)
@@ -110,11 +112,19 @@ class Session:
                 done.append(_completion(client_id, request, output, now))
         if self.open and entries:
             self.outbox.put_nowait(frames.encode_stream(entries))
-        if self.open and done:
+        failed = [c for c in done if c.leave_reason == STRUCTURED_ERROR]
+        completed = [c for c in done if c.leave_reason != STRUCTURED_ERROR]
+        if self.open and failed:  # HTTP chat answers a grammar failure with a 500
+            code = v1.RejectedRequest.INTERNAL
+            refused = [
+                frames.Rejection(c.seq_id, STRUCTURED_FAILED, code) for c in failed
+            ]
+            self.outbox.put_nowait(frames.encode_rejected(refused))
+        if self.open and completed:
             try:
-                self.outbox.put_nowait(frames.encode_completions(done))
+                self.outbox.put_nowait(frames.encode_completions(completed))
             except TypeError:  # kv_transfer_params engine_v1 cannot carry
-                for completion in done:
+                for completion in completed:
                     self.outbox.put_nowait(_completed_or_rejected(completion))
         for completion in done:
             request = self.requests.pop(completion.seq_id)

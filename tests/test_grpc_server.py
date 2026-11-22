@@ -11,11 +11,13 @@ from types import SimpleNamespace
 import pytest
 
 from atom.entrypoints.grpc import atom_grpc_pb2 as pb
+from atom.entrypoints.grpc import frames
 from atom.entrypoints.grpc.server import AtomEngineServicer
 from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.protocol import DEFAULT_MAX_TOKENS
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.zmq_protocol import engine_v1_pb2 as v1
+from atom.sampling_params import SamplingParams
 
 
 class FakeEngine:
@@ -43,7 +45,7 @@ class FakeEngine:
         self.preprocessed.append((prompt, params, kwargs))
         self.release.wait(10)
         seq = SimpleNamespace(
-            id=next(self.ids),
+            id=kwargs.get("seq_id") or next(self.ids),
             num_prompt_tokens=len(prompt),
             max_tokens=params.max_tokens,
             callback=stream_callback,
@@ -220,3 +222,56 @@ def test_request_log_records_the_request_and_each_answer(serve, monkeypatch):
     assert {e["request_id"] for e in entries} == {"r"}
     assert entries[0]["data"]["prompt_token_ids"] == [1, 2, 3]
     assert entries[-1]["data"]["complete"]["finish_reason"] == "eos"
+
+
+def _envelope(message) -> v1.Envelope:
+    return v1.Envelope.FromString(message[0])
+
+
+def _submit(prompt=(1, 2), **sampling):
+    return frames.SubmitRequest(
+        seq_id=1,
+        prompt_token_ids=list(prompt),
+        sampling_params=SamplingParams(**sampling),
+    )
+
+
+def test_the_session_refuses_logprobs_it_would_not_serve(serve):
+    engine = FakeEngine()
+    servicer = serve(engine)
+    session = servicer.sessions.open()
+    with pytest.raises(ValueError, match="logprobs"):
+        asyncio.run(servicer._submit(session, _submit(logprobs=True)))
+    assert engine.preprocessed == []
+
+
+def test_a_session_grammar_failure_is_rejected_as_internal(serve):
+    engine = FakeEngine()
+    session = serve(engine).sessions.open()
+    seq = SimpleNamespace(id=session.base | 1, num_prompt_tokens=2, arrive_time=0.0)
+    engine.io_processor.requests[seq.id] = seq
+    session.add(1, seq, "r")
+    session.put(RequestOutput(seq.id, [], True, "structured_output_error"))
+    session.flush()
+    rejected = _envelope(session.outbox.get_nowait()).rejected.items
+    assert [(r.seq_id, r.code) for r in rejected] == [(1, v1.RejectedRequest.INTERNAL)]
+    assert session.outbox.empty() and engine.io_processor.requests == {}
+
+
+def test_a_session_ended_during_preprocess_leaves_no_seq(serve):
+    engine = FakeEngine()
+    engine.release.clear()
+    servicer = serve(engine)
+    session = servicer.sessions.open()
+
+    async def end_while_preprocessing():
+        submit = asyncio.create_task(servicer._submit(session, _submit()))
+        await _until(lambda: engine.preprocessed)
+        submit.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await submit
+        engine.release.set()
+        await _until(lambda: engine.made and not engine.io_processor.requests)
+
+    asyncio.run(end_while_preprocessing())
+    assert engine.submitted == [] and session.requests == {}
