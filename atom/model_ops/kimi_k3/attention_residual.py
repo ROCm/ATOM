@@ -121,7 +121,8 @@ if _HAS_TRITON:
         # prefix so downstream layers reuse it. DO_ADD2 folds a SECOND addend the
         # same way, so an MoE layer can hand over its routed and shared expert
         # outputs unsummed and skip an entire [T, H] elementwise kernel.
-        t = tl.program_id(0)
+        # Bank strides can place live rows or blocks past 2**31 elements.
+        t = tl.program_id(0).to(tl.int64)
         o_d = tl.arange(0, BD)
         m_d = o_d < H
         sw = tl.load(sw_ptr + o_d, mask=m_d, other=0.0).to(tl.float32)
@@ -149,7 +150,7 @@ if _HAS_TRITON:
         b_o = tl.zeros([BD], dtype=tl.float32)  # running weighted sum
 
         for i_l in range(tl.cdiv(Bp, BL)):
-            o_l = i_l * BL + tl.arange(0, BL)
+            o_l = (i_l * BL + tl.arange(0, BL)).to(tl.int64)
             m_l = o_l < Bp
             is_last = o_l == B
             v = tl.load(
@@ -269,7 +270,7 @@ def _apply_attn_res_impl(
     if quant and not out_norm:
         raise ValueError("quant_dtype requires out_norm_weight")
     fp8_max = float(torch.finfo(quant_dtype).max) if quant else 1.0
-    # The active prefix is read by stride (i32 offsets); a wider bank needs no
+    # The active prefix is read by stride; a wider bank needs no
     # slice or copy when H is unit-stride.
     br = (
         block_residual
