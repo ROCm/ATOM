@@ -5,14 +5,18 @@
 import asyncio
 import itertools
 import json
+import socket
 import sys
 import threading
+import time
 from argparse import Namespace
 from types import SimpleNamespace
 
+import grpc
 import pytest
 
 from atom.entrypoints.grpc import atom_grpc_pb2 as pb
+from atom.entrypoints.grpc import atom_grpc_pb2_grpc as pb_grpc
 from atom.entrypoints.grpc import server as grpc_server
 from atom.entrypoints.grpc.server import AtomEngineServicer
 from atom.entrypoints.openai import api_server
@@ -408,12 +412,57 @@ def test_a_step_ending_as_the_listener_starts_reaches_its_call(monkeypatch):
             core_mgr._flush_stream_batch_fn()
             delivered.append(await asyncio.wait_for(queue.get(), 1))
         finally:
-            listening.set_result(None)
+            listening.set_result((asyncio.get_running_loop(), None))
 
     monkeypatch.setattr(grpc_server, "_serve", listen)
     args = Namespace(host="127.0.0.1", grpc_port=1, model="m")
     grpc_server.start_grpc_server(api, args)
     assert [output.finish_reason for output in delivered] == ["eos"]
+
+
+def test_shutdown_lets_a_running_call_finish_and_refuses_new_ones(serve, monkeypatch):
+    engine = FakeEngine([([5], None)])  # the seq runs on after its first step
+    serve(engine)  # api_server's engine; start_grpc_server makes its own servicer
+    engine.core_mgr._flush_stream_batch_fn = None
+    engine.flush = lambda: engine.core_mgr._flush_stream_batch_fn()
+    monkeypatch.setattr(api_server, "health_problem", lambda: None)
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    args = Namespace(host="127.0.0.1", grpc_port=port, model="m")
+    stop = grpc_server.start_grpc_server(api_server, args)
+    channel = grpc.insecure_channel(f"127.0.0.1:{port}")
+    request = pb.GenerateRequest(request_id="r", prompt_token_ids=[1], stream=True)
+    call = pb_grpc.AtomEngineStub(channel).Generate(request, timeout=10)
+    assert list(next(call).chunk.token_ids) == [5]
+    stopping = threading.Thread(target=stop, daemon=True)
+    stopping.start()
+    late = pb_grpc.AtomEngineStub(grpc.insecure_channel(f"127.0.0.1:{port}"))
+    with pytest.raises(grpc.RpcError) as refused:
+        for _ in range(500):  # until the server refuses new calls
+            late.HealthCheck(pb.HealthCheckRequest(), timeout=1)
+            time.sleep(0.01)
+    refusals = (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.CANCELLED)
+    assert refused.value.code() in refusals
+    seq = engine.running.pop(1)  # its last step, after shutdown began
+    seq.callback(RequestOutput(1, [6], True, "eos"))
+    engine.flush()
+    rest = list(call)
+    stopping.join(10)
+    assert list(rest[0].chunk.token_ids) == [6]
+    assert rest[1].complete.finish_reason == "eos" and not stopping.is_alive()
+    assert engine.aborted == [] and engine.io_processor.requests == {}
+    channel.close()
+
+
+def test_a_step_flushed_after_the_server_stopped_is_dropped():
+    steps = grpc_server.StepOutputs()
+
+    async def buffer():
+        steps.callback(asyncio.Queue())(RequestOutput(1, [5], True, "eos"))
+
+    asyncio.run(buffer())  # its loop is closed once this returns
+    steps.flush()
 
 
 def test_model_info_leaves_an_absent_chat_template_unset(serve, monkeypatch):
