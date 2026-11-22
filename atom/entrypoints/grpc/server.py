@@ -111,6 +111,14 @@ def _deliver(outputs: list[tuple[Callable, Callable | None, RequestOutput]]) -> 
             end()
 
 
+class _Call:
+    """A Generate call as Abort finds it: its seq once made, and whether aborted."""
+
+    def __init__(self):
+        self.seq_id: int | None = None
+        self.aborted = False
+
+
 class AtomEngineServicer(pb_grpc.AtomEngineServicer):
     """Answers from `api`, the API server module running the engine, as its routes
     do; every RPC not defined here answers UNIMPLEMENTED."""
@@ -120,13 +128,14 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
         self.model_path = model_path  # --model, which the tokenizer loads from
         self.steps = StepOutputs()
         self.sessions = Sessions(api)
-        self.live: dict[str, set[int]] = {}  # request_id: its live seq ids, for Abort
+        self.live: dict[str, set[_Call]] = {}  # request_id: its Generate calls
 
     async def Generate(self, request, context):
         """Admitted as `/v1/completions` admits its ids, plus its chat's structured
         output; a refusal answered with its status; streamed one chunk per step."""
-        api, outputs = self.api, asyncio.Queue()
+        api, outputs, call = self.api, asyncio.Queue(), _Call()
         seq, submitted, finished = None, False, False
+        self.live.setdefault(request.request_id, set()).add(call)
         self._log(request.request_id, "request", request)
         try:
             _refuse_unserved(request.sampling)
@@ -161,11 +170,16 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
             except asyncio.CancelledError:  # the seq it registers is dropped once made
                 preprocessing.add_done_callback(partial(_drop_preprocessed, api))
                 raise
-            self.live.setdefault(request.request_id, set()).add(seq.id)
+            call.seq_id = seq.id
             api._validate_sequence_context_length(seq, params)
-            await api._submit_engine_requests([seq])
-            submitted = True
             ids, cached = [], 0
+            if call.aborted:  # before its submission: it never reaches the engine
+                finished, output = True, RequestOutput(seq.id, [], True, "aborted")
+            else:
+                await api._submit_engine_requests([seq])
+                submitted = True
+                if call.aborted:  # during its submission
+                    api.engine.core_mgr.abort_request(seq.id)
             while not finished:
                 output = await outputs.get()
                 finished = output.finished
@@ -197,18 +211,20 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
             refusal = pb.GenerateResponse(error=_refusal(error, "Generate"))
             await self._write(context, request, refusal)
         finally:
+            self._forget(request.request_id, call)
             if seq is not None:
-                self._forget(request.request_id, seq.id)
                 if submitted:  # the HTTP stream teardown
                     api.cleanup_stream(seq.id, aborted=not finished)
                 else:
                     api.engine.io_processor.requests.pop(seq.id, None)
 
     async def Abort(self, request, context):
-        """Ends the request as a dropped HTTP stream ends one; an unknown or finished
-        request_id is no error."""
-        for seq_id in list(self.live.get(request.request_id, ())):
-            self.api.cleanup_stream(seq_id, aborted=True)
+        """Ends the request as a dropped HTTP stream ends one, or, before it reaches the
+        engine, keeps it out; an unknown or finished request_id is no error."""
+        for call in list(self.live.get(request.request_id, ())):
+            call.aborted = True
+            if call.seq_id is not None:
+                self.api.cleanup_stream(call.seq_id, aborted=True)
         return pb.AbortResponse()
 
     async def PrepareStructuredOutput(self, request, context):
@@ -392,9 +408,9 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
             data = MessageToDict(message, preserving_proto_field_name=True)
             self.api._log_request_event(kind, request_id, data)
 
-    def _forget(self, request_id: str, seq_id: int) -> None:
+    def _forget(self, request_id: str, call: _Call) -> None:
         live = self.live.get(request_id, set())
-        live.discard(seq_id)
+        live.discard(call)
         if not live:
             self.live.pop(request_id, None)
 

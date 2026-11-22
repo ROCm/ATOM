@@ -33,9 +33,10 @@ class FakeEngine:
         self.aborted, self.made = [], []
         self.core_mgr = SimpleNamespace(
             add_request=self.add_request,
-            abort_request=self.aborted.append,
+            abort_request=self.abort_request,
             max_pool_tokens=None,
         )
+        self.running = {}  # submitted seqs no step has ended
         self.preprocessed, self.submitted = [], []
         self.release = threading.Event()
         self.release.set()
@@ -59,6 +60,15 @@ class FakeEngine:
         for tokens, reason in self.steps:
             for seq in seqs:
                 seq.callback(RequestOutput(seq.id, tokens, reason is not None, reason))
+            self.flush()
+        if not self.steps or self.steps[-1][1] is None:
+            self.running.update((seq.id, seq) for seq in seqs)
+
+    def abort_request(self, seq_id):
+        """As the engine aborts a running seq: a terminal output at its next step."""
+        self.aborted.append(seq_id)
+        if (seq := self.running.pop(seq_id, None)) is not None:
+            seq.callback(RequestOutput(seq_id, [], True, "aborted"))
             self.flush()
 
 
@@ -275,3 +285,39 @@ def test_a_session_ended_during_preprocess_leaves_no_seq(serve):
 
     asyncio.run(end_while_preprocessing())
     assert engine.submitted == [] and session.requests == {}
+
+
+def test_abort_during_preprocess_keeps_the_request_out_of_the_engine(serve):
+    engine = FakeEngine([([5], "eos")])
+    engine.release.clear()
+    servicer = serve(engine)
+
+    async def abort_while_preprocessing():
+        request = pb.GenerateRequest(request_id="r", prompt_token_ids=[1], stream=True)
+        context = Context()
+        call = asyncio.create_task(servicer.Generate(request, context))
+        await _until(lambda: engine.preprocessed)
+        await servicer.Abort(pb.AbortRequest(request_id="r"), None)
+        engine.release.set()
+        await asyncio.wait_for(call, 10)
+        return context.written
+
+    (written,) = asyncio.run(abort_while_preprocessing())
+    assert written.complete.finish_reason == "aborted"
+    assert engine.submitted == [] and engine.io_processor.requests == {}
+    assert servicer.live == {}
+
+
+def test_abort_during_submission_aborts_the_request_once_submitted(serve, monkeypatch):
+    engine = FakeEngine([([5], None)])
+    servicer = serve(engine)
+    submit = api_server._submit_engine_requests
+
+    async def abort_then_submit(seqs):
+        await servicer.Abort(pb.AbortRequest(request_id="r"), None)
+        await submit(seqs)
+
+    monkeypatch.setattr(api_server, "_submit_engine_requests", abort_then_submit)
+    written = _generate(servicer, stream=True)
+    assert written[-1].complete.finish_reason == "aborted"
+    assert engine.running == {} and engine.io_processor.requests == {}
