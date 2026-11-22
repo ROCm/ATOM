@@ -64,6 +64,13 @@ class _Runner(CapabilityProviderMixin):
         for name in methods:
             setattr(self, name, lambda *a, **k: None)
 
+    # Every RLHFModelRunner has both; these take any sync.
+    def _reload_refusal(self):
+        return None
+
+    def _rdma_receive_refusal(self):
+        return None
+
 
 def _worker(rank, methods=(), features=(), version=None):
     return WorkerCapabilities(
@@ -142,9 +149,15 @@ def test_fp8_is_claimed_by_the_weights_not_by_the_helper():
     assert "fp8_weight_update" not in bf16.get_worker_capabilities()["features"]
 
 
-def test_rdma_is_absent_until_the_receiver_exists():
-    """A7 has not landed, so no runner should claim it yet."""
-    assert "rdma_weight_receive" not in _Runner().get_worker_capabilities()["features"]
+def test_rdma_is_claimed_where_the_receiver_takes_a_stream():
+    """The receiver decides, and says why where it does not take one."""
+    runner = _Runner()
+    assert "rdma_weight_receive" in runner.get_worker_capabilities()["features"]
+
+    runner._rdma_receive_refusal = lambda: "pipeline_parallel_size=2"
+    report = runner.get_worker_capabilities()
+    assert "rdma_weight_receive" not in report["features"]
+    assert report["unavailable"]["rdma_weight_receive"] == "pipeline_parallel_size=2"
 
 
 def test_the_report_is_plain_data():

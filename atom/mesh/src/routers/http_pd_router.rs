@@ -35,6 +35,7 @@ use crate::{
                 BackendAdapter, PairCtx,
             },
             planner::DefaultPlanner,
+            policy_apply::apply_policy,
             registry_adapters::{PolicyRegistryAdapter, WorkerRegistryAdapter},
             traits::PdPlanner,
             types::{PlacementPlan, Protocol, RequestDescriptor},
@@ -69,6 +70,8 @@ pub struct PDRouter {
     pub adapter: Arc<dyn BackendAdapter>,
     /// Set when backend == Atom. enrich_decode_kv is ATOM-specific and not on the trait.
     atom_adapter: Option<Arc<AtomAdapter>>,
+    /// How long P waits on E before encoding the media itself.
+    encode_timeout: Duration,
 }
 
 impl std::fmt::Debug for PDRouter {
@@ -121,10 +124,7 @@ struct WorkerOutcome {
 
 impl WorkerOutcome {
     fn record_error(&self, worker: &dyn Worker) {
-        let kind = match worker.worker_type() {
-            crate::core::WorkerType::Prefill { .. } => metrics_labels::WORKER_PREFILL,
-            _ => metrics_labels::WORKER_DECODE,
-        };
+        let kind = worker.worker_type().as_metric_label();
         let error = self
             .status
             .filter(|s| s.is_client_error() || s.is_server_error())
@@ -284,7 +284,7 @@ struct PDRequestContext<'a> {
     return_logprob: bool,
     request_text: Option<&'a str>,
     tokens: Option<&'a [u32]>,
-    carries_media: bool,
+    media_count: usize,
     model_id: Option<&'a str>,
     headers: Option<Arc<HeaderMap>>,
 }
@@ -298,7 +298,7 @@ impl<'a> PDRequestContext<'a> {
             return_logprob: metadata.return_logprob,
             request_text: Some(&metadata.text),
             tokens: None,
-            carries_media: metadata.carries_media,
+            media_count: metadata.media_count,
             model_id: metadata.model.as_deref().filter(|model| !model.is_empty()),
             headers: headers.cloned().map(Arc::new),
         }
@@ -415,6 +415,7 @@ impl PDRouter {
             policies,
             adapter,
             atom_adapter,
+            encode_timeout: Duration::from_secs(ctx.router_config.request_timeout_secs),
         })
     }
 
@@ -467,11 +468,17 @@ impl PDRouter {
     pub(crate) async fn execute_placement(
         &self,
         headers: &HeaderMap,
-        body: Value,
+        mut body: Value,
         metadata: &InferenceMetadata,
         path: &str,
         placement: Arc<ReservedPair>,
     ) -> Response {
+        // Only E's output may reach P, and this path never runs E.
+        if matches!(self.backend, BackendType::Atom) {
+            if let Some(obj) = body.as_object_mut() {
+                obj.remove("ec_transfer_params");
+            }
+        }
         let mut context = PDRequestContext::from_metadata(metadata, Some(headers));
         context.route = path;
         self.execute_reserved(Some(headers), body, context, placement)
@@ -732,7 +739,7 @@ impl PDRouter {
     async fn dispatch_pd(
         &self,
         headers: Option<&HeaderMap>,
-        request: Value,
+        mut request: Value,
         context: PDRequestContext<'_>,
         planner: &dyn PdPlanner,
     ) -> Response {
@@ -744,7 +751,9 @@ impl PDRouter {
             context.route,
             context.is_stream,
         );
-        let response = RetryExecutor::execute_response_with_retry(
+        self.attach_encode_output(headers, &mut request, &context)
+            .await;
+        let attempts = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             |_attempt| {
                 let request = request.clone();
@@ -774,9 +783,120 @@ impl PDRouter {
                     endpoint,
                 );
             },
-        )
-        .await;
-        observation.wrap_response(response)
+        );
+        let (response, estimate) = crate::observability::route_trace::estimated(attempts).await;
+        // Decode returns the response, but its cached tokens are the ones prefill reused.
+        observation
+            .reconcile(metrics_labels::WORKER_PREFILL, estimate)
+            .wrap_response(response)
+    }
+
+    /// Runs E for an ATOM chat request with media and adds E's opaque
+    /// `ec_transfer_params` to the body P receives. A client-supplied
+    /// `ec_transfer_params` is always removed first, so only E's reaches P.
+    /// With no available encode worker, or when E fails or times out, P gets
+    /// the body without it and encodes the media itself.
+    async fn attach_encode_output(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &mut Value,
+        context: &PDRequestContext<'_>,
+    ) {
+        if !matches!(self.backend, BackendType::Atom) {
+            return;
+        }
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("ec_transfer_params");
+        }
+        if route_to_endpoint(context.route) != metrics_labels::ENDPOINT_CHAT
+            || context.media_count == 0
+        {
+            return;
+        }
+        let candidates: Vec<_> = self
+            .worker_registry
+            .get_encode_workers()
+            .into_iter()
+            .filter(|w| w.is_available() && context.model_id.is_none_or(|m| w.model_id() == m))
+            .collect();
+        if candidates.is_empty() {
+            debug!("no available encode worker; prefill encodes the media");
+            return;
+        }
+        let policy = self.policy_registry.get_encode_policy();
+        let descriptor = RequestDescriptor {
+            model_id: context.model_id,
+            protocol: Some(Protocol::Http),
+            text: context.request_text,
+            tokens: context.tokens,
+            headers: context.headers.as_deref(),
+            stream: false,
+            media_count: context.media_count,
+        };
+        let hash_ring = context
+            .model_id
+            .and_then(|model| self.worker_registry.get_hash_ring(model));
+        let encode = match apply_policy(&candidates, policy.as_ref(), &descriptor, hash_ring).await
+        {
+            Ok(worker) => worker,
+            Err(error) => {
+                warn!(%error, "encode worker selection failed; prefill encodes the media");
+                return;
+            }
+        };
+        MeshMetrics::record_worker_selection(
+            metrics_labels::WORKER_ENCODE,
+            metrics_labels::CONNECTION_HTTP,
+            encode.model_id(),
+            policy.name(),
+        );
+        let _load = WorkerLoadGuard::new(encode.clone(), headers);
+
+        let mut encode_body = body.clone();
+        encode_body["stream"] = Value::Bool(false);
+        if let Some(obj) = encode_body.as_object_mut() {
+            obj.remove("stream_options");
+        }
+        let Ok(post) = self
+            .build_worker_post_with_headers(
+                &self.client,
+                encode.as_ref(),
+                context.route,
+                encode_body,
+                headers,
+                false,
+            )
+            .await
+        else {
+            return;
+        };
+        let params = match self
+            .send_worker(post.timeout(self.encode_timeout), encode.clone(), headers)
+            .await
+        {
+            Ok(res) if res.status().is_success() => match res.json::<Value>().await {
+                Ok(mut answer) => answer
+                    .get_mut("ec_transfer_params")
+                    .filter(|params| params.is_object())
+                    .map(Value::take)
+                    .ok_or_else(|| "response has no ec_transfer_params object".to_string()),
+                Err(error) => Err(error.to_string()),
+            },
+            Ok(res) => {
+                let status = res.status();
+                let text = res.text().await.unwrap_or_default();
+                Err(format!("status {status}: {text}"))
+            }
+            Err(error) => Err(error.to_string()),
+        };
+        match params {
+            Ok(params) => body["ec_transfer_params"] = params,
+            Err(error) => warn!(
+                encode_url = encode.url(),
+                %error,
+                "encode failed; prefill encodes the media"
+            ),
+        }
     }
 
     async fn plan_pd_pair(
@@ -791,7 +911,7 @@ impl PDRouter {
             tokens: context.tokens,
             headers: context.headers.as_deref(),
             stream: context.is_stream,
-            carries_media: context.carries_media,
+            media_count: context.media_count,
         };
         let plan = planner
             .plan(&descriptor)
@@ -809,7 +929,12 @@ impl PDRouter {
     ) -> Response {
         let prefill = placement.prefill.clone();
         let decode = placement.decode.clone();
-        let ctx = match self.adapter.prepare_pair(prefill.as_ref(), decode.as_ref()) {
+        let pair = self.adapter.prepare_pair_with_media(
+            prefill.as_ref(),
+            decode.as_ref(),
+            context.media_count,
+        );
+        let ctx = match pair {
             Ok(ctx) => ctx,
             Err(error) => return Self::handle_serialization_error(error),
         };
@@ -834,6 +959,10 @@ impl PDRouter {
             }
             BackendType::Vllm | BackendType::Atom => {
                 let mut decode_body = body.clone();
+                // E's output is P's input; D receives P's KV instead.
+                if let Some(obj) = decode_body.as_object_mut() {
+                    obj.remove("ec_transfer_params");
+                }
                 if let Err(error) = self.adapter.inject_prefill_fields(&mut body, &ctx) {
                     return Self::handle_serialization_error(error);
                 }
@@ -1166,9 +1295,10 @@ impl PDRouter {
         // P has completed its work; D's output stream must not keep P loaded.
         drop(prefill_guard);
 
+        // ATOM's prefill answers without a handoff as `"kv_transfer_params": null`.
         let mut kv_params = match prefill_body.get("kv_transfer_params").cloned() {
-            Some(v) => v,
-            None => {
+            Some(v) if !v.is_null() => v,
+            _ => {
                 error!(
                     "ATOM prefill {} request_id={} response missing kv_transfer_params",
                     prefill.url(),
@@ -1837,16 +1967,12 @@ impl PDRouter {
         worker: &Arc<dyn Worker>,
         headers: Option<&HeaderMap>,
     ) -> Arc<dyn crate::policies::LoadBalancingPolicy> {
-        let (pool, policy) = match worker.worker_type() {
-            crate::core::WorkerType::Prefill { .. } => (
-                metrics_labels::WORKER_PREFILL,
-                self.policy_registry.get_prefill_policy(),
-            ),
-            _ => (
-                metrics_labels::WORKER_DECODE,
-                self.policy_registry.get_decode_policy(),
-            ),
+        let policy = match worker.worker_type() {
+            crate::core::WorkerType::Prefill { .. } => self.policy_registry.get_prefill_policy(),
+            crate::core::WorkerType::Encode => self.policy_registry.get_encode_policy(),
+            _ => self.policy_registry.get_decode_policy(),
         };
+        let pool = worker.worker_type().as_metric_label();
         // Only a request that is actually sent moves the session.
         policy.on_dispatch(pool, headers, worker);
         crate::observability::route_trace::record_dispatch(pool, worker);
@@ -2306,7 +2432,7 @@ mod tests {
                 return_logprob: false,
                 request_text: None,
                 tokens: None,
-                carries_media: false,
+                media_count: 0,
                 model_id: None,
                 headers: None,
             };
@@ -2482,6 +2608,187 @@ mod tests {
         server.abort();
     }
 
+    #[cfg(feature = "ext-proc")]
+    #[tokio::test]
+    async fn reserved_execution_drops_a_client_ec_transfer_params_before_prefill() {
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::<(String, Value)>::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback({
+            let bodies = bodies.clone();
+            move |uri: axum::http::Uri, axum::Json(body): axum::Json<Value>| {
+                let bodies = bodies.clone();
+                async move {
+                    bodies.lock().unwrap().push((uri.path().to_string(), body));
+                    axum::Json(json!({"choices": []}))
+                }
+            }
+        });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut router = create_test_pd_router();
+        router.backend = BackendType::Atom;
+        router.adapter = Arc::new(AtomAdapter::new(Arc::default()));
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(format!("{url}/prefill"))
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: None,
+                })
+                .build(),
+        );
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(format!("{url}/decode"))
+                .worker_type(WorkerType::Decode)
+                .build(),
+        );
+        let pair = router
+            .reserve_pair(
+                PlacementPlan::Pair {
+                    prefill,
+                    decode,
+                    prefill_policy: "round_robin",
+                    decode_policy: "round_robin",
+                },
+                None,
+            )
+            .unwrap();
+        let metadata = InferenceMetadata {
+            route: "/v1/chat/completions",
+            model: None,
+            text: String::new(),
+            batch_size: None,
+            stream: false,
+            return_logprob: false,
+            media_count: 0,
+        };
+        let body = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "ec_transfer_params": {"remote_addr": "client-chosen"},
+        });
+        let response = router
+            .execute_placement(&HeaderMap::new(), body, &metadata, metadata.route, pair)
+            .await;
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let bodies = bodies.lock().unwrap();
+        let prefill_bodies: Vec<_> = bodies
+            .iter()
+            .filter(|(path, _)| path.starts_with("/prefill/"))
+            .collect();
+        assert_eq!(prefill_bodies.len(), 1, "{bodies:?}");
+        assert!(
+            prefill_bodies[0].1.get("ec_transfer_params").is_none(),
+            "{bodies:?}"
+        );
+}
+
+    #[derive(Debug)]
+    struct EstimatingPolicy;
+    #[async_trait::async_trait]
+    impl crate::policies::LoadBalancingPolicy for EstimatingPolicy {
+        async fn select_with_decision(
+            &self,
+            _: &[Arc<dyn Worker>],
+            _: &crate::policies::SelectWorkerInfo<'_>,
+        ) -> (Option<usize>, crate::policies::RouteDecision) {
+            let decision = crate::policies::RouteDecision {
+                estimated_hit_ratio: Some(0.5),
+                ..crate::policies::RouteDecision::branch("affinity")
+            };
+            (Some(0), decision)
+        }
+        fn name(&self) -> &'static str {
+            "estimating-test"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn pd_cached_tokens_are_reconciled_against_the_prefill_estimate() {
+        use crate::core::prepare_pool::PreparePoolRuntime;
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let usage = r#"{"usage":{"prompt_tokens":100,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":40}}}"#;
+        let app = axum::Router::new()
+            .fallback(move || async move { ([(CONTENT_TYPE, "application/json")], usage) });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let pool = PreparePoolRuntime::new(
+            crate::config::RouterConfig::default()
+                .resolved_prepare_pool()
+                .unwrap(),
+        )
+        .unwrap();
+        let config = crate::config::RouterConfig {
+            mode: crate::config::RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            ..Default::default()
+        };
+        let app_context = Arc::new(
+            crate::app_context::AppContext::from_config(config, 5, pool.handle())
+                .await
+                .unwrap(),
+        );
+        let mut router = create_test_pd_router();
+        router.worker_registry = app_context.worker_registry.clone();
+        router
+            .policy_registry
+            .set_prefill_policy(Arc::new(EstimatingPolicy));
+        router.worker_registry.register(Arc::new(
+            BasicWorkerBuilder::new(format!("{url}/prefill"))
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: Some(8001),
+                })
+                .build(),
+        ));
+        router.worker_registry.register(Arc::new(
+            BasicWorkerBuilder::new(format!("{url}/decode"))
+                .worker_type(WorkerType::Decode)
+                .build(),
+        ));
+        let body = json!({"model": UNKNOWN_MODEL_ID, "prompt": "test"});
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let request = super::super::ingress::InferenceEnvelope::parse(
+            "/v1/completions".parse().unwrap(),
+            headers,
+            serde_json::to_vec(&body).unwrap().into(),
+            &app_context,
+        )
+        .await
+        .unwrap();
+
+        let response = router.route_inference(request, &app_context).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+
+        let rendered = handle.render();
+        for line in [
+            r#"mesh_route_cache_tokens_total{pool="prefill",kind="prompt"} 100"#,
+            r#"mesh_route_cache_tokens_total{pool="prefill",kind="cached"} 40"#,
+            r#"mesh_route_cache_estimate_tokens_total{pool="prefill",kind="estimated"} 50"#,
+            r#"mesh_route_cache_estimate_tokens_total{pool="prefill",kind="actual"} 40"#,
+        ] {
+            assert!(rendered.contains(line), "missing {line} in\n{rendered}");
+        }
+        assert!(!rendered.contains(r#"pool="decode",kind="#), "{rendered}");
+        server.abort();
+    }
+
     pub(super) fn create_test_pd_router() -> PDRouter {
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry =
@@ -2505,6 +2812,7 @@ mod tests {
             policies,
             adapter,
             atom_adapter: None,
+            encode_timeout: Duration::from_secs(1),
         }
     }
 
@@ -2958,7 +3266,7 @@ mod tests {
             return_logprob: false,
             request_text: None,
             tokens: None,
-            carries_media: false,
+            media_count: 0,
             model_id: Some("m"),
             headers: Some(Arc::new(headers)),
         };

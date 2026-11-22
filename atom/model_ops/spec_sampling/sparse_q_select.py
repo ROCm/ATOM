@@ -71,13 +71,20 @@ def _dspark_q_histogram(
     hist_ptr,
     vocab_size,
     stride_s_row,
-    num_tiles,
+    hist_row_stride,
+    hist_tile_stride,
     BLOCK_V: tl.constexpr,
     NUM_BINS: tl.constexpr,
     LEVELS_PER_NAT: tl.constexpr,
     MAX_GAP: tl.constexpr,
 ):
-    """One (row, V tile): how many of the tile's ids sit at each level."""
+    """One (row, V tile): how many of the tile's ids sit at each level.
+
+    Its table goes to `hist_ptr + (row * hist_row_stride + tile *
+    hist_tile_stride) * NUM_BINS`: row-major `[B, tiles, bins]` for the whole
+    vocab, tile-major `[tiles, B, bins]` for a TP shard, whose tables the
+    ranks then gather (`select_and_draw_q_tp`).
+    """
     row = tl.program_id(0)
     tile = tl.program_id(1)
     # Rows that store nothing stop here, and in the cut and compaction too.
@@ -97,7 +104,9 @@ def _dspark_q_histogram(
     )
     counts = tl.histogram(level, NUM_BINS)
     tl.store(
-        hist_ptr + (row * num_tiles + tile) * NUM_BINS + tl.arange(0, NUM_BINS),
+        hist_ptr
+        + (row * hist_row_stride + tile * hist_tile_stride) * NUM_BINS
+        + tl.arange(0, NUM_BINS),
         counts,
     )
 
@@ -115,6 +124,8 @@ def _dspark_q_cut(
     row_cut_ptr,
     row_n_ptr,
     num_tiles,
+    hist_row_stride,
+    hist_tile_stride,
     store_width,
     BLOCK_TILE: tl.constexpr,
     NUM_BINS: tl.constexpr,
@@ -128,6 +139,9 @@ def _dspark_q_cut(
     first, so each tile's share of them (its quota) is what the tiles before
     it leave over, and each tile's first output slot is the running total of
     the tiles before it. Exactly n ids are then stored.
+
+    The tables are read where `_dspark_q_histogram` wrote them, the
+    ``num_tiles`` tiles in id order.
     """
     row = tl.program_id(0)
     if (tl.load(q_row_base_ptr + row) < 0) | (
@@ -138,7 +152,9 @@ def _dspark_q_cut(
     tile_mask = offs_tile < num_tiles
     bins = tl.arange(0, NUM_BINS)
     table = tl.load(
-        hist_ptr + (row * num_tiles + offs_tile[:, None]) * NUM_BINS + bins[None, :],
+        hist_ptr
+        + (row * hist_row_stride + offs_tile[:, None] * hist_tile_stride) * NUM_BINS
+        + bins[None, :],
         mask=tile_mask[:, None],
         other=0,
     )
@@ -168,7 +184,9 @@ def _dspark_q_cut(
     # The boundary level's column, read back rather than reduced out of the
     # table: one program per row runs this, so every full-table pass shows.
     tile_edge = tl.load(
-        hist_ptr + (row * num_tiles + offs_tile) * NUM_BINS + cut,
+        hist_ptr
+        + (row * hist_row_stride + offs_tile * hist_tile_stride) * NUM_BINS
+        + cut,
         mask=tile_mask,
         other=0,
     )
@@ -199,13 +217,23 @@ def _dspark_q_compact(
     num_tiles,
     store_width,
     position,
+    tile_base,
+    id_base,
     BLOCK_V: tl.constexpr,
     NUM_BINS: tl.constexpr,
     LEVELS_PER_NAT: tl.constexpr,
     MAX_GAP: tl.constexpr,
+    DEST_BY_ROW: tl.constexpr,
 ):
     """One (row, V tile): store the tile's chosen ids and their unnormalized
-    weights ``exp(s - max)`` at its slot range, in id order."""
+    weights ``exp(s - max)`` at its slot range, in id order.
+
+    ``s`` holds ``vocab_size`` ids from ``id_base``, which are the cut's tiles
+    from ``tile_base`` (both 0 for the whole vocab; a TP shard's otherwise,
+    `select_and_draw_q_tp`). ``DEST_BY_ROW`` writes batch row ``row``'s slots
+    to row ``row`` of a ``[B, store_width]`` staging pair rather than to its
+    store row.
+    """
     row = tl.program_id(0)
     tile = tl.program_id(1)
     q_base = tl.load(q_row_base_ptr + row)
@@ -221,14 +249,17 @@ def _dspark_q_compact(
     row_max = tl.load(row_max_ptr + row)
     level = _q_level(s, row_max, v_mask, NUM_BINS, LEVELS_PER_NAT, MAX_GAP)
     cut = tl.load(row_cut_ptr + row)
-    quota = tl.load(tile_quota_ptr + row * num_tiles + tile)
+    quota = tl.load(tile_quota_ptr + row * num_tiles + tile_base + tile)
     edge = level == cut
     take = (level < cut) | (edge & (tl.cumsum(edge.to(tl.int32), axis=0) <= quota))
-    slot = tl.load(tile_off_ptr + row * num_tiles + tile) + (
+    slot = tl.load(tile_off_ptr + row * num_tiles + tile_base + tile) + (
         tl.cumsum(take.to(tl.int32), axis=0) - 1
     )
-    dest = (q_base + position).to(tl.int64) * store_width + slot
-    tl.store(q_ids_ptr + dest, offs_v, mask=take)
+    if DEST_BY_ROW:
+        dest = row.to(tl.int64) * store_width + slot
+    else:
+        dest = (q_base + position).to(tl.int64) * store_width + slot
+    tl.store(q_ids_ptr + dest, id_base + offs_v, mask=take)
     tl.store(q_probs_ptr + dest, tl.exp(s - row_max), mask=take)
 
 
@@ -385,6 +416,7 @@ def select_and_draw_q(
         vocab_size,
         s_scratch.stride(0),
         q_tiles,
+        1,
         BLOCK_V=_Q_BLOCK_V,
         **levels,
         num_warps=4,
@@ -401,6 +433,8 @@ def select_and_draw_q(
         row_cut,
         row_n,
         q_tiles,
+        q_tiles,
+        1,
         store_width,
         BLOCK_TILE=triton.next_power_of_2(q_tiles),
         NUM_BINS=_Q_BINS,
@@ -423,8 +457,246 @@ def select_and_draw_q(
         q_tiles,
         store_width,
         position,
+        0,
+        0,
         BLOCK_V=_Q_BLOCK_V,
         **levels,
+        DEST_BY_ROW=False,
+        num_warps=4,
+    )
+    _dspark_q_finalize[(num_rows,)](
+        q_ids,
+        q_probs,
+        q_meta,
+        q_row_base,
+        temperatures,
+        SAMPLER_EPS,
+        row_argmax,
+        row_n,
+        seed,
+        out,
+        vocab_size,
+        store_width,
+        position,
+        noise_offset,
+        out.stride(0),
+        BLOCK=_Q_FINAL_BLOCK,
+        num_warps=4,
+    )
+
+
+# TP-sharded vocab (`select_and_draw_q_tp`): each rank holds the scores of its
+# own vocab shard only. Every stage above is per (row, V tile) but the cut,
+# which reads one row's whole histogram table, and finalize, which reads the
+# stored entries. So each rank histograms its own tiles, tile-major, and the
+# gathered tables (rank-major, which is id order: a shard is a contiguous id
+# range) are the whole row's; every rank runs the same cut over them. Each rank
+# then compacts only its own tiles, into a `[2, B, K]` staging pair at the
+# slots the cut gave them, and the gathered pairs are published to the store,
+# each slot from the rank whose tiles own it. The stored set, its order and
+# every value are the whole-vocab op's: a level depends only on the score and
+# the row max, and the cut takes the boundary level's lowest ids wherever the
+# tile edges fall.
+
+
+class QSelectTPScratch(NamedTuple):
+    """`select_and_draw_q_tp`'s work buffers, all int32."""
+
+    hist: torch.Tensor  # [local tiles, B, bins], this rank's tables
+    tile_off: torch.Tensor  # [B, every rank's tiles]
+    tile_quota: torch.Tensor  # [B, every rank's tiles]
+    row_cut: torch.Tensor  # [B]
+    row_n: torch.Tensor  # [B]
+    stage: torch.Tensor  # [2, B, K]: this rank's stored ids and weight bits
+
+
+def q_select_tp_scratch(
+    num_rows: int, local_vocab: int, world: int, store_width: int
+) -> QSelectTPScratch:
+    """The regions `select_and_draw_q_tp` needs for ``num_rows`` rows, a
+    ``local_vocab`` shard on each of ``world`` ranks and a store of
+    ``store_width``."""
+    local_tiles = triton.cdiv(local_vocab, _Q_BLOCK_V)
+    tiles = world * local_tiles
+    i32 = torch.int32
+    return QSelectTPScratch(
+        Region((local_tiles, num_rows, _Q_BINS), i32),
+        Region((num_rows, tiles), i32),
+        Region((num_rows, tiles), i32),
+        Region((num_rows,), i32),
+        Region((num_rows,), i32),
+        Region((2, num_rows, store_width), i32),
+    )
+
+
+@triton.jit
+def _dspark_q_publish(
+    gathered_ptr,  # [world, 2, B, K] int32: every rank's staging pair
+    tile_off_ptr,  # [B, num_tiles] int32, the cut's first slot of each tile
+    q_ids_ptr,
+    q_probs_ptr,
+    q_row_base_ptr,
+    temperatures_ptr,
+    greedy_temperature,
+    row_n_ptr,
+    num_rows,
+    num_tiles,
+    rank_tiles,
+    store_width,
+    position,
+    WORLD: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """One row: copy its ``n`` stored entries into its store row, each slot
+    from the rank whose tiles the cut gave it (the ranks' slot ranges follow
+    one another in rank order). The weights travel as their fp32 bits."""
+    row = tl.program_id(0)
+    q_base = tl.load(q_row_base_ptr + row)
+    if (q_base < 0) | (tl.load(temperatures_ptr + row) <= greedy_temperature):
+        return
+    n = tl.load(row_n_ptr + row)
+    dst = (q_base + position).to(tl.int64) * store_width
+    offs = tl.arange(0, BLOCK)
+    for start in range(0, n, BLOCK):
+        slots = start + offs
+        mask = slots < n
+        owner = tl.zeros((BLOCK,), dtype=tl.int32)
+        for r in tl.static_range(1, WORLD):
+            first = tl.load(tile_off_ptr + row * num_tiles + r * rank_tiles)
+            owner += (slots >= first).to(tl.int32)
+        src = (owner.to(tl.int64) * 2 * num_rows + row) * store_width + slots
+        ids = tl.load(gathered_ptr + src, mask=mask, other=0)
+        bits = tl.load(gathered_ptr + src + num_rows * store_width, mask=mask, other=0)
+        tl.store(q_ids_ptr + dst + slots, ids, mask=mask)
+        tl.store(
+            q_probs_ptr + dst + slots, bits.to(tl.float32, bitcast=True), mask=mask
+        )
+
+
+def _gather_words(t: torch.Tensor, tp_group, use_custom: bool) -> torch.Tensor:
+    """All-gather an int32 tensor along dim 0 as raw 32-bit words."""
+    gathered = tp_group.all_gather(t.view(torch.float32), use_custom=use_custom, dim=0)
+    return gathered.view(torch.int32)
+
+
+def select_and_draw_q_tp(
+    s_scratch: torch.Tensor,
+    row_max: torch.Tensor,
+    row_argmax: torch.Tensor,
+    q_row_base: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    seed: torch.Tensor,
+    out: torch.Tensor,
+    q_ids: torch.Tensor,
+    q_probs: torch.Tensor,
+    q_meta: torch.Tensor,
+    scratch: QSelectTPScratch,
+    position: int,
+    noise_offset: int,
+    vocab_size: int,
+    vocab_start: int,
+    tp_group,
+    use_custom: bool,
+) -> None:
+    """`select_and_draw_q` over a TP-sharded vocab (see the notes above).
+
+    ``s_scratch`` is this rank's ``[B, V / tp]`` scores, ids ``vocab_start``
+    on; ``row_max`` / ``row_argmax`` are already the whole row's;
+    ``vocab_size`` is the whole vocab's; ``scratch`` is carved from
+    `q_select_tp_scratch`. Every rank stores and draws what the whole-vocab op
+    would. What crosses ranks is each rank's histogram tables and its
+    ``[2, B, K]`` staging pair.
+    """
+    num_rows, local_vocab = q_row_base.shape[0], s_scratch.shape[1]
+    world = tp_group.world_size
+    store_width = q_ids.shape[1]
+    local_tiles = triton.cdiv(local_vocab, _Q_BLOCK_V)
+    num_tiles = world * local_tiles
+    hist, tile_off, tile_quota, row_cut, row_n, stage = scratch
+    levels = {
+        "NUM_BINS": _Q_BINS,
+        "LEVELS_PER_NAT": _Q_LEVELS_PER_NAT,
+        "MAX_GAP": _Q_MAX_GAP,
+    }
+    # Tile-major, so the gathered tables are `[world * local_tiles, B, bins]`:
+    # the whole row's tiles in id order. A row that stores nothing leaves its
+    # tables unwritten, and the cut never reads them.
+    _dspark_q_histogram[(num_rows, local_tiles)](
+        s_scratch,
+        row_max,
+        q_row_base,
+        temperatures,
+        SAMPLER_EPS,
+        hist,
+        local_vocab,
+        s_scratch.stride(0),
+        1,
+        num_rows,
+        BLOCK_V=_Q_BLOCK_V,
+        **levels,
+        num_warps=4,
+    )
+    _dspark_q_cut[(num_rows,)](
+        _gather_words(hist, tp_group, use_custom),
+        q_row_base,
+        temperatures,
+        SAMPLER_EPS,
+        top_k,
+        top_p,
+        tile_off,
+        tile_quota,
+        row_cut,
+        row_n,
+        num_tiles,
+        1,
+        num_rows,
+        store_width,
+        BLOCK_TILE=triton.next_power_of_2(num_tiles),
+        NUM_BINS=_Q_BINS,
+        LEVELS_PER_NAT=_Q_LEVELS_PER_NAT,
+        num_warps=8,
+    )
+    _dspark_q_compact[(num_rows, local_tiles)](
+        s_scratch,
+        row_max,
+        q_row_base,
+        temperatures,
+        SAMPLER_EPS,
+        tile_off,
+        tile_quota,
+        row_cut,
+        stage[0],
+        stage[1].view(torch.float32),
+        local_vocab,
+        s_scratch.stride(0),
+        num_tiles,
+        store_width,
+        position,
+        tp_group.rank_in_group * local_tiles,
+        vocab_start,
+        BLOCK_V=_Q_BLOCK_V,
+        **levels,
+        DEST_BY_ROW=True,
+        num_warps=4,
+    )
+    _dspark_q_publish[(num_rows,)](
+        _gather_words(stage, tp_group, use_custom),
+        tile_off,
+        q_ids,
+        q_probs,
+        q_row_base,
+        temperatures,
+        SAMPLER_EPS,
+        row_n,
+        num_rows,
+        num_tiles,
+        local_tiles,
+        store_width,
+        position,
+        WORLD=world,
+        BLOCK=_Q_FINAL_BLOCK,
         num_warps=4,
     )
     _dspark_q_finalize[(num_rows,)](

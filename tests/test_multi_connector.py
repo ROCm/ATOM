@@ -36,6 +36,12 @@ from atom.kv_transfer.disaggregation.types import (
 class FakeSchedSub:
     """Scheduler-side sub-connector mock."""
 
+    def lookup_pending(self, seq):
+        return False
+
+    def lookup_would_defer(self, seq):
+        return False
+
     def __init__(
         self,
         *,
@@ -47,10 +53,11 @@ class FakeSchedSub:
     ):
         self._match = match
         self.is_producer = is_producer
-        if is_offload:
-            self.is_offload = True
+        self.is_offload = is_offload
+        self.supports_early_load = False
         self.alloc_calls = []
         self.finished_calls = []
+        self.cancelled = []
         self.meta = ConnectorMetadata()
         self._offload = offload_methods
         # No longer offload-specific: a P/D producer claims its source too, so
@@ -117,9 +124,19 @@ class FakeSchedSub:
         self.load_failed_ids.append(req_id)
 
     def cancel_pending_load(self, seq):
+        if not self._offload:
+            return  # KVConnectorSchedulerBase's non-offload default.
         # Idempotent, like the real connector's `_load_lifecycles` guard.
         self.cancelled.append(seq)
         self.pending_load = False
+
+    def cancel_preadmission(self, seq):
+        # The base default: the pending load's cancellation, for a sub that has one.
+        if self._offload:
+            self.cancel_pending_load(seq)
+
+    def close(self):
+        pass
 
     def process_completions(self, output):
         # Mirrors OffloadSchedulerMixin: apply the completions, then hand the
@@ -157,7 +174,6 @@ class FakeSchedSub:
             "should_park_partial_prefill_for_load",
             "save_finished",
             "load_failed",
-            "cancel_pending_load",
             "process_completions",
             "has_pending_work",
             "enqueue_state_loads",
@@ -365,17 +381,44 @@ def test_cancel_pending_load_forwards_to_offload_subs():
     loads (idempotent, and moriio has no such method)."""
     moriio = FakeSchedSub(is_producer=True)
     off = FakeSchedSub(is_offload=True, offload_methods=True)
-    seq = object()
+    seq = SimpleNamespace(id="cancel-pending")
     _sched([moriio, off]).cancel_pending_load(seq)
 
     assert off.cancelled == [seq]
-    assert not hasattr(moriio, "cancel_pending_load")
+    assert moriio.cancelled == []
+
+
+def test_cancel_preadmission_clears_tier_state_and_load_winner():
+    """Taking back an early admission must reach the tier's stronger hook."""
+    seq = SimpleNamespace(id="early-load")
+    off = FakeSchedSub(is_offload=True, offload_methods=True)
+    off.held_answer = seq
+    off.parked = seq
+
+    def cancel_preadmission(request):
+        off.cancel_pending_load(request)
+        off.held_answer = None
+        off.parked = None
+
+    off.cancel_preadmission = cancel_preadmission
+    legacy = FakeSchedSub(is_offload=True, offload_methods=True)
+    producer = FakeSchedSub(is_producer=True)
+    sched = _sched([producer, off, legacy])
+    sched._load_winner[seq.id] = off
+
+    sched.cancel_preadmission(seq)
+
+    assert off.held_answer is None
+    assert off.parked is None
+    assert off.cancelled == [seq]
+    assert legacy.cancelled == [seq]
+    assert seq.id not in sched._load_winner
 
 
 def test_update_and_finished_fan_out_to_all():
     a, b = FakeSchedSub(), FakeSchedSub()
     sched = _sched([a, b])
-    seq = object()
+    seq = SimpleNamespace(id="fan-out")
     sched.update_state_after_alloc(seq)
     sched.request_finished(seq)
     assert a.alloc_calls == [seq] and b.alloc_calls == [seq]
@@ -992,6 +1035,34 @@ def test_two_offload_subs_are_refused_before_either_is_built(monkeypatch, sub_na
     assert built == []
 
 
+@pytest.mark.parametrize("role", ["kv_consumer", "kv_both"])
+@pytest.mark.parametrize("pd", ["mooncake", "moriio"])
+def test_a_pd_consumer_with_an_offload_tier_is_refused(monkeypatch, pd, role):
+    """The scheduler would resume a received prefill as a tier load and prefill
+    the prompt again on the decode instance, never reaching first decode. A P/D
+    leaf builds as a consumer whenever its role is not ``kv_producer``."""
+    built = []
+    import atom.kv_transfer.disaggregation.factory as factory_mod
+
+    monkeypatch.setattr(
+        factory_mod.KVConnectorFactory,
+        "create_connector",
+        staticmethod(lambda config, role: built.append(config)),
+    )
+    config = SimpleNamespace(
+        kv_transfer_config={
+            "kv_connector": "multi",
+            "connectors": [
+                {"kv_connector": pd, "kv_role": role},
+                {"kv_connector": "mooncake_store"},
+            ],
+        }
+    )
+    with pytest.raises(ValueError, match="P/D consumer with an offload tier"):
+        mc_module._build_subconnectors(config, role="scheduler")
+    assert built == []
+
+
 def test_one_offload_sub_beside_a_producer_is_built(monkeypatch):
     _patch_factory(
         monkeypatch,
@@ -1059,3 +1130,22 @@ def test_waits_for_transfer_report_needs_every_deferring_sub():
     assert not multi(sub(True, True), sub(True)).waits_for_transfer_report(seq)
     assert not multi(sub(True, True), sub(True, False)).waits_for_transfer_report(seq)
     assert not multi(sub(False, True)).waits_for_transfer_report(seq)
+
+
+def test_config_refuses_a_pd_consumer_with_an_offload_tier_before_the_model_loads():
+    """`Config` runs the multi checks itself: the refusal must not wait for a
+    worker to build the connector after the weights are loaded."""
+    from atom.kv_transfer.disaggregation.multi.multi_connector import (
+        validate_multi_config,
+    )
+
+    consumer = {"kv_connector": "mooncake", "kv_role": "kv_consumer"}
+    producer = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
+    store = {"kv_connector": "mooncake_store"}
+    with pytest.raises(ValueError, match="P/D consumer with an offload tier"):
+        validate_multi_config(
+            {"kv_connector": "multi", "connectors": [consumer, store]}
+        )
+    assert validate_multi_config(
+        {"kv_connector": "multi", "connectors": [producer, store]}
+    ) == [producer, store]

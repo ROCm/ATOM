@@ -243,29 +243,21 @@ def test_fused_seam_writes_the_fp8_pools_query_and_rows():
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-@pytest.mark.parametrize("fp8_heads", [2, 4, 16, 64])
-def test_fp8_query_heads_a_program_is_bit_exact(monkeypatch, fp8_heads):
-    """Any power-of-two group of MXFP8 query heads a program gives a program a
-    head's query and KV bytes; the KV keeps the slot after the query ones."""
+def _run_fp8_query(n, query, normed, rope, positions, rope_dim):
+    """`rope_quant_window` with `_FP8_HEADS` at `n` (None: the arch's list),
+    an MXFP8 query sink and the FP8 KV packed as rows: (KV rows, query
+    values, query scales). `query` is not modified."""
     from atom.model_ops.blockscale import quantize_fp8
     from atom.model_ops.deepseek_v41 import rope_window
 
-    torch.manual_seed(729)
-    device, tokens, heads, dim, rope_dim = "cuda", 64, 64, 512, 64
-    rope = RotaryEmbedding(rope_dim, 1024, base=10000).to(device)
-    positions = torch.randint(0, 1024, (tokens,), device=device, dtype=torch.int32)
-    normed = torch.randn(tokens, dim, device=device, dtype=torch.bfloat16)
-    query = torch.randn(tokens, heads, dim, device=device, dtype=torch.bfloat16) * 3
+    tokens, heads, dim = query.shape
     fp8, e8m0 = (t.dtype for t in quantize_fp8(normed))
-
-    monkeypatch.setattr(rope_window, "_FP8_HEADS_MIN_PROGRAMS_PER_CU", 0)
-
-    def run(n):
-        monkeypatch.setattr(rope_window, "_FP8_HEADS", n)
-        rows = torch.empty(tokens, dim + dim // 32, device=device, dtype=torch.uint8)
-        qv = torch.empty(tokens, heads, dim, device=device, dtype=fp8)
-        qs = torch.empty(tokens, heads, dim // 32, device=device, dtype=e8m0)
+    rows = torch.empty(tokens, dim + dim // 32, device=query.device, dtype=torch.uint8)
+    qv = torch.empty(tokens, heads, dim, device=query.device, dtype=fp8)
+    qs = torch.empty(tokens, heads, dim // 32, device=query.device, dtype=e8m0)
+    saved = rope_window._FP8_HEADS
+    rope_window._FP8_HEADS = n
+    try:
         rope_window.rope_quant_window(
             query.clone(),
             normed,
@@ -277,10 +269,145 @@ def test_fp8_query_heads_a_program_is_bit_exact(monkeypatch, fp8_heads):
             scales=rows[:, dim:].view(e8m0),
             query_fp8=(qv, qs),
         )
+    finally:
+        rope_window._FP8_HEADS = saved
+    return rows, qv, qs
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("fp8_heads", [2, 4, 16, 64])
+def test_fp8_query_heads_a_program_is_bit_exact(monkeypatch, fp8_heads):
+    """Any power-of-two group of MXFP8 query heads a program gives a program a
+    head's query and KV bytes; the KV keeps the slot after the query ones."""
+    from atom.model_ops.deepseek_v41 import rope_window
+
+    torch.manual_seed(729)
+    device, tokens, heads, dim, rope_dim = "cuda", 64, 64, 512, 64
+    rope = RotaryEmbedding(rope_dim, 1024, base=10000).to(device)
+    positions = torch.randint(0, 1024, (tokens,), device=device, dtype=torch.int32)
+    normed = torch.randn(tokens, dim, device=device, dtype=torch.bfloat16)
+    query = torch.randn(tokens, heads, dim, device=device, dtype=torch.bfloat16) * 3
+    monkeypatch.setattr(rope_window, "_FP8_HEADS_MIN_PROGRAMS_PER_CU", 0)
+
+    def run(n):
+        rows, qv, qs = _run_fp8_query(n, query, normed, rope, positions, rope_dim)
         return rows, qv.view(torch.uint8), qs.view(torch.uint8)
 
     for expected, actual in zip(run(1), run(fp8_heads)):
         assert torch.equal(actual, expected)
+
+
+def _zero_sign_cleared(values):
+    """MXFP8 bytes with an OCP E4M3 -0.0 read as +0.0. FNUZ has no -0.0 (its
+    0x80 is NaN), so those bytes are kept as they are."""
+    if values.dtype != torch.float8_e4m3fn:
+        return values.view(torch.uint8)
+    values = values.view(torch.uint8)
+    return torch.where(values & 0x7F == 0, 0, values)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("rope_dim", [16, 64])
+@pytest.mark.parametrize("tokens", [1, 7, 1344, 1536, 2048])
+def test_fp8_query_rope_tail_only_is_bit_exact(monkeypatch, rope_dim, tokens):
+    """From 16 heads a program only the RoPE tail is rotated when it is whole
+    quant groups, the NoPE groups quantized as loaded; 8 keep the full row.
+    Same bytes as a program a head but for the sign of a zero, on rows of
+    zeros, -0.0 lanes beside either sign, saturating, tiny and ordinary
+    values; scales and KV bytes exact."""
+    from atom.model_ops.deepseek_v41 import rope_window
+
+    torch.manual_seed(tokens + rope_dim)
+    device, heads, dim = "cuda", 64, 512
+    rope = RotaryEmbedding(rope_dim, 4096, base=10000).to(device)
+    positions = torch.randint(0, 4096, (tokens,), device=device, dtype=torch.int32)
+    normed = torch.randn(tokens, dim, device=device, dtype=torch.bfloat16)
+    query = torch.randn(tokens, heads, dim, device=device, dtype=torch.bfloat16) * 3
+    query[0, : heads // 4] = 0
+    # Even and odd lanes, NoPE and RoPE, beside neighbours of either sign.
+    query[0, heads // 4 :: 2, ::5] = -0.0
+    if tokens > 1:
+        query[1, :, ::3] = 3e4
+        query[-1, heads // 2 :] = 1e-30
+    monkeypatch.setattr(rope_window, "_FP8_HEADS_MIN_PROGRAMS_PER_CU", 0)
+
+    def run(n):
+        rows, qv, qs = _run_fp8_query(n, query, normed, rope, positions, rope_dim)
+        return rows, _zero_sign_cleared(qv), qs.view(torch.uint8)
+
+    reference = run(1)
+    for n in (8, 16, 32):
+        for expected, actual in zip(reference, run(n)):
+            assert torch.equal(actual, expected)
+
+
+def test_fp8_query_heads_a_program_follow_the_arch(monkeypatch):
+    """gfx1250 tries 16 heads a program then 8, elsewhere 8, unless
+    `_FP8_HEADS` says; the first that divides the heads and keeps two
+    programs a CU wins. A rank's 8 heads (TP8) keep 8 on gfx1250."""
+    pytest.importorskip("aiter", reason="the arch is read through AITER")
+    from aiter.jit.utils import chip_info
+
+    from atom.model_ops.deepseek_v41 import rope_window
+
+    monkeypatch.setattr(rope_window, "_cu_count", lambda device: 256)
+    # The arch is faked under a cache: clear it whatever the asserts do, so
+    # later tests read the real arch.
+    try:
+        for arch, tokens, heads, expected in (
+            ("gfx1250", 1344, 64, 16),
+            ("gfx1250", 1344, 8, 8),
+            ("gfx1250", 64, 64, 8),
+            ("gfx1250", 32, 64, 1),
+            ("gfx1250", 1344, 6, 1),
+            ("gfx950", 1344, 64, 8),
+            ("gfx950", 1344, 8, 8),
+            ("gfx942", 1344, 64, 8),
+        ):
+            monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda arch=arch: arch)
+            rope_window._arch_fp8_heads.cache_clear()
+            assert rope_window._fp8_heads(tokens, heads, "cuda") == expected
+        monkeypatch.setattr(rope_window, "_FP8_HEADS", 4)
+        assert rope_window._fp8_heads(1344, 64, "cuda") == 4
+        assert rope_window._fp8_heads(1344, 6, "cuda") == 1
+    finally:
+        rope_window._arch_fp8_heads.cache_clear()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize(
+    "heads, tokens, fp8_heads",
+    [(8, 1344, 8), (8, 2048, 8), (64, 1344, 16), (64, 2048, 16), (64, 64, 8)],
+)
+def test_fp8_query_heads_fall_back_along_the_list(
+    monkeypatch, heads, tokens, fp8_heads
+):
+    """With gfx1250's (16, 8), a rank's 8 heads (TP8) still quantize 8 a
+    program rather than 1, and so do 64 heads where 16 a program would leave
+    too few programs; the bytes match a program a head's."""
+    from atom.model_ops.deepseek_v41 import rope_window
+
+    torch.manual_seed(heads + tokens)
+    monkeypatch.setattr(rope_window, "_cu_count", lambda device: 256)
+    monkeypatch.setattr(rope_window, "_arch_fp8_heads", lambda: (16, 8))
+    device, dim, rope_dim = "cuda", 512, 64
+    rope = RotaryEmbedding(rope_dim, 1024, base=10000).to(device)
+    positions = torch.randint(0, 1024, (tokens,), device=device, dtype=torch.int32)
+    normed = torch.randn(tokens, dim, device=device, dtype=torch.bfloat16)
+    query = torch.randn(tokens, heads, dim, device=device, dtype=torch.bfloat16)
+
+    def run(n):
+        spy = _GridSpy(rope_window._rope_window_kernel)
+        monkeypatch.setattr(rope_window, "_rope_window_kernel", spy)
+        rows, qv, qs = _run_fp8_query(n, query, normed, rope, positions, rope_dim)
+        monkeypatch.setattr(rope_window, "_rope_window_kernel", spy.kernel)
+        return (rows, _zero_sign_cleared(qv), qs.view(torch.uint8)), spy.launches
+
+    reference, _ = run(1)
+    actual, launches = run(None)
+    assert launches == [((tokens * (heads // fp8_heads + 1),), False, fp8_heads)]
+    for expected, got in zip(reference, actual):
+        assert torch.equal(got, expected)
 
 
 class _GridSpy:
@@ -410,6 +537,7 @@ def test_fp8_query_groups_heads_from_two_programs_a_cu(
     from atom.model_ops.deepseek_v41 import rope_window
 
     monkeypatch.setattr(rope_window, "_cu_count", lambda device: cus)
+    monkeypatch.setattr(rope_window, "_FP8_HEADS", 8)
     device, heads, dim, rope_dim = "cuda", 64, 512, 64
     rope = RotaryEmbedding(rope_dim, 1024, base=10000).to(device)
     positions = torch.zeros(tokens, device=device, dtype=torch.int32)
@@ -526,17 +654,25 @@ def test_compressor_project_hands_back_strided_halves(single_rank):
         assert half.untyped_storage().data_ptr() == values.untyped_storage().data_ptr()
 
 
-def test_draft_context_kv_fusion_sees_the_kv_half(single_rank, small_config):
+@pytest.mark.parametrize("bf16", [False, True])
+def test_draft_context_kv_fusion_sees_the_kv_half(
+    single_rank, small_config, monkeypatch, bf16
+):
     """The fused context-KV GEMM reads a shard of `wqkv_a`, not a `wkv` layer.
 
     It concatenates one projection per stage and declines when a stage cannot
     supply one. Nothing else asserts that a real attention module supplies it,
     so a rename on the model side turns the fusion off and only costs speed --
-    the per-stage fallback it falls back to is numerically identical.
+    the per-stage fallback it falls back to is numerically identical. A BF16
+    shard (no group32 FP8 GEMM) has no FP8 weight to fuse: per stage.
     """
-    from atom.models.deepseek_v41.config import build_attention_topology
-    from atom.models.deepseek_v41.dspark import DraftAttention
+    from types import SimpleNamespace
 
+    from atom.model_ops import linear
+    from atom.models.deepseek_v41.config import build_attention_topology
+    from atom.models.deepseek_v41.dspark import DeepseekV41DSpark, DraftAttention
+
+    monkeypatch.setattr(linear, "native_group32_runs_bf16", lambda: bf16)
     spec = build_attention_topology(small_config)[1]
     attention = DraftAttention(small_config, spec)
     shard = attention.wkv_shard
@@ -552,4 +688,79 @@ def test_draft_context_kv_fusion_sees_the_kv_half(single_rank, small_config):
     assert torch.equal(
         shard.weight_scale.view(torch.uint8),
         attention.wqkv_a.weight_scale.view(torch.uint8)[rows // group :],
+    )
+    assert shard.runs_bf16 is bf16
+    draft = object.__new__(DeepseekV41DSpark)
+    torch.nn.Module.__init__(draft)
+    draft.mtp = [SimpleNamespace(attn=attention)]
+    assert (draft._context_kv_fusion() is None) is bf16
+
+
+@pytest.mark.parametrize("fp4ptpc", [False, True])
+def test_q_leaves_its_norm_in_the_format_its_readers_take(
+    single_rank, small_config, fp4ptpc
+):
+    """`wq_b` and `indexer.wq_b` share one spec and one Q: per-token FP8 for an
+    FP4PTPC checkpoint's per-channel GEMMs; for native group32 ones MXFP8, or
+    BF16 where those run in BF16."""
+    from aiter import QuantType
+
+    from atom.model_ops.layernorm import (
+        DualRMSNormBF16,
+        DualRMSNormMXFP8,
+        DualRMSNormPerToken,
+    )
+    from atom.model_ops.linear import native_group32_runs_bf16
+    from atom.models.deepseek_v41.attention import Attention
+    from atom.models.deepseek_v41.config import build_attention_topology
+
+    small_config.fp4ptpc = fp4ptpc
+    spec = build_attention_topology(small_config)[1]
+    attention = Attention(small_config, spec)
+    native = DualRMSNormBF16 if native_group32_runs_bf16() else DualRMSNormMXFP8
+    assert type(attention.qk_norm) is (DualRMSNormPerToken if fp4ptpc else native)
+    readers = [attention.wq_b]
+    if attention.indexer is not None:
+        readers.append(attention.indexer.wq_b)
+    for reader in readers:
+        assert (reader.quant_type == QuantType.per_Token) == fp4ptpc
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="inverse RoPE is Triton")
+def test_bf16_wo_a_projects_like_a_grouped_einsum(
+    single_rank, small_config, monkeypatch
+):
+    """`_project_out` where `wo_a` runs in BF16 (no group32 FP8 GEMM): inverse
+    RoPE, then each group's heads through its `wo_a` rows, written through the
+    strided view into `wo_b`'s input; against the CPU rotation and an einsum."""
+    from atom.model_ops import linear
+    from atom.models.deepseek_v41.attention import Attention
+    from atom.models.deepseek_v41.config import build_attention_topology
+
+    monkeypatch.setattr(linear, "native_group32_runs_bf16", lambda: True)
+    small_config.o_groups = 2
+    attention = Attention(small_config, build_attention_topology(small_config)[1])
+    assert attention.wo_a.runs_bf16 and attention.groups == 2
+    groups, o_rank = attention.groups, attention.o_rank
+    rows, heads, head_dim = 5, attention.heads, attention.head_dim
+    torch.manual_seed(31)
+    output = torch.randn(rows, heads, head_dim, dtype=torch.bfloat16)
+    positions = torch.tensor([0, 1, 7, 19, 31])
+    weight = torch.randn(groups * o_rank, heads * head_dim // groups).bfloat16()
+    rope = RotaryEmbedding(64, 32, base=10000, original_length=0, factor=16)
+    rotated = rope(output[None].clone(), positions, inverse=True)[0].float()
+    expected = torch.einsum(
+        "rgk,gok->rgo",
+        rotated.view(rows, groups, -1),
+        weight.float().view(groups, o_rank, -1),
+    ).reshape(rows, -1)
+
+    attention.wo_a.weight = torch.nn.Parameter(weight.cuda(), requires_grad=False)
+    attention.wo_b = torch.nn.Identity()
+    actual = attention._project_out(output.cuda(), rope.cuda(), positions.cuda())
+    torch.testing.assert_close(
+        actual.float().cpu(),
+        expected,
+        rtol=2**-6,
+        atol=2**-6 * expected.abs().max().item(),
     )
