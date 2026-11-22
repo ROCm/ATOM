@@ -5,6 +5,7 @@ put, rather than spinning on the GIL that thread needs; a request queued wakes i
 import pickle
 import queue
 import threading
+from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -15,15 +16,18 @@ LONG_WAIT_S = 3600.0  # the idle loop's timeout here: only a wake ends its wait
 
 
 @pytest.fixture
-def idle(monkeypatch):
-    """An `EngineCore` with nothing to run, whose scheduler steps what it is given;
-    `waits` gets each wait's timeout and whether that wait could return at once."""
+def idle(monkeypatch, request):
+    """An `EngineCore` or PP head with nothing to run, whose scheduler steps what it
+    is given; `waits` gets each wait's timeout and whether it could return at once."""
     from aiter_stub import stubbed_aiter
 
     with stubbed_aiter():
         from atom.model_engine import engine_core as core
+        from atom.model_engine.pp_engine_core import PPEngineCoreProc
     monkeypatch.setattr(core, "IDLE_WAIT_S", LONG_WAIT_S)
-    engine = core.EngineCore.__new__(core.EngineCore)
+    pp_head = getattr(request, "param", "EngineCore") == "PP head"
+    cls = PPEngineCoreProc if pp_head else core.EngineCore
+    engine = cls.__new__(cls)
     waits, pending, stepped = queue.Queue(), [], []
 
     class Event(threading.Event):
@@ -49,9 +53,15 @@ def idle(monkeypatch):
     engine.utility_queue = queue.Queue()
     engine._kv_progress_event = Event()
     engine._process_engine_step = step
+    if pp_head:
+        engine.is_head, engine._in_flight = True, deque()
+        engine._pp_kv_aggregator, engine.runner_mgr = None, Mock()
+        engine._run_then_publish_kv_events = lambda run: run()
+        engine._pp_head_step = step
     return core, engine, waits, stepped
 
 
+@pytest.mark.parametrize("idle", ["EngineCore", "PP head"], indirect=True)
 def test_a_request_from_the_input_thread_wakes_an_idle_loop(idle, monkeypatch):
     core, engine, waits, stepped = idle
     frames = queue.Queue()  # what the input thread's sockets receive
