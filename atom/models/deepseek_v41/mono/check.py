@@ -39,6 +39,18 @@ def _bad_rows(name, got, ref):
     return f"{name} rows {bad.nonzero().flatten().tolist()}"
 
 
+def check_index_score(runner, indexer, cache, step):
+    """Run the reference scorer on K1's outputs with its weight contract."""
+    weights, scale = runner.iw, 1.0
+    if runner.index_fp4:
+        # K1 folds the scale into FP32 weights; OPUS wants unscaled BF16.
+        scale = indexer.weights_scale
+        weights = (weights / scale).to(torch.bfloat16)
+    indexer.score_quantized(
+        runner.index_query(), weights, cache, step, weight_scale=scale
+    )
+
+
 def _mailbox(runner, layout, region, rows):
     """A scratch mailbox region's value words (its pairs' first words), one row a
     token, as int32."""

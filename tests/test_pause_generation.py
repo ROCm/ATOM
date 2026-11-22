@@ -162,6 +162,7 @@ def test_a_held_engine_reports_kv_transfers_back_but_starts_none(offloaded, repo
 
 def test_one_held_dp_rank_holds_every_rank():
     reported = []
+    closed = []
 
     def sync_dp_state(local_unfinished, shutdown, held):
         reported.append((local_unfinished, held))
@@ -173,6 +174,7 @@ def test_one_held_dp_rank_holds_every_rank():
         _is_rl_weights_offloaded=False,
         _weight_sync_fenced=False,
         _generation_paused=True,
+        _report_backlog=False,
         pull_and_process_input_queue=lambda: True,
         _sync_dp_state=sync_dp_state,
         _drain_kv_work_at_exit=lambda: None,
@@ -181,6 +183,7 @@ def test_one_held_dp_rank_holds_every_rank():
             is_finished=lambda: False,  # requests are waiting
             publish_kv_events=lambda: None,
             shutdown_kv_events=lambda: None,
+            close_kv_connector=lambda: closed.append(True),
         ),
         utility_handler=SimpleNamespace(
             process_queue=lambda *args: None, push_metrics=lambda **kw: None
@@ -191,6 +194,7 @@ def test_one_held_dp_rank_holds_every_rank():
 
     # It offers no work and asks to be held; the MAX reduction holds the group.
     assert reported == [(False, True)]
+    assert closed == [True]
 
 
 # ── pipeline parallelism ───────────────────────────────────────────────────

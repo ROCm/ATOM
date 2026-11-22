@@ -43,6 +43,7 @@ from atom.entrypoints.openai.protocol import (
     TEXT_COMPLETION_OBJECT,
     ChatMessage,
     CompletionRequest,
+    check_media_handoff,
     ended_by_stop,
     openai_stop_reason,
     openai_stop_reason_with_calls,
@@ -1369,13 +1370,18 @@ class AtomStandaloneService:
                 request_data.get("temperature", DEFAULT_TEMPERATURE),
             )
             sampling_params = self._build_sampling_params(request_data, effective_n)
+            kv_transfer_params = request_data.get("kv_transfer_params")
+            if kv_transfer_params:
+                check_media_handoff(
+                    kv_transfer_params, self.engine.config.max_model_len
+                )
             request_id = f"cmpl-{uuid.uuid4().hex}"
             outputs = self.engine_service.generate(
                 prompts[0],
                 sampling_params,
                 request_id,
                 effective_n,
-                kv_transfer_params=request_data.get("kv_transfer_params"),
+                kv_transfer_params=kv_transfer_params,
                 data_parallel_rank=self._get_data_parallel_rank(request_data),
             )
             if not outputs:
@@ -1409,6 +1415,11 @@ class AtomStandaloneService:
                 request_data.get("temperature", DEFAULT_TEMPERATURE),
             )
             sampling_params = self._build_sampling_params(request_data, effective_n)
+            kv_transfer_params = request_data.get("kv_transfer_params")
+            if kv_transfer_params:
+                check_media_handoff(
+                    kv_transfer_params, self.engine.config.max_model_len
+                )
             request_id = f"cmpl-{uuid.uuid4().hex}"
             prompt = prompts[0]
             stream_queue = self.engine_service.start_stream(
@@ -1416,7 +1427,7 @@ class AtomStandaloneService:
                 sampling_params,
                 request_id,
                 effective_n,
-                kv_transfer_params=request_data.get("kv_transfer_params"),
+                kv_transfer_params=kv_transfer_params,
                 data_parallel_rank=self._get_data_parallel_rank(request_data),
             )
             stream_state = CompletionStreamState(
