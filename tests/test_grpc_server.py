@@ -5,14 +5,18 @@
 import asyncio
 import itertools
 import json
+import socket
 import sys
 import threading
+import time
 from argparse import Namespace
 from types import SimpleNamespace
 
+import grpc
 import pytest
 
 from atom.entrypoints.grpc import atom_grpc_pb2 as pb
+from atom.entrypoints.grpc import atom_grpc_pb2_grpc as pb_grpc
 from atom.entrypoints.grpc import server as grpc_server
 from atom.entrypoints.grpc.server import AtomEngineServicer
 from atom.entrypoints.openai import api_server
@@ -408,12 +412,73 @@ def test_a_step_ending_as_the_listener_starts_reaches_its_call(monkeypatch):
             core_mgr._flush_stream_batch_fn()
             delivered.append(await asyncio.wait_for(queue.get(), 1))
         finally:
-            listening.set_result(None)
+            listening.set_result((asyncio.get_running_loop(), None))
 
     monkeypatch.setattr(grpc_server, "_serve", listen)
     args = Namespace(host="127.0.0.1", grpc_port=1, model="m")
     grpc_server.start_grpc_server(api, args)
     assert [output.finish_reason for output in delivered] == ["eos"]
+
+
+def _listen(serve, engine):
+    """`engine` behind a listening gRPC server: its stop and a channel to it."""
+    serve(engine)  # api_server's engine; start_grpc_server makes its own servicer
+    engine.core_mgr._flush_stream_batch_fn = None
+    engine.flush = lambda: engine.core_mgr._flush_stream_batch_fn()
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    args = Namespace(host="127.0.0.1", grpc_port=port, model="m")
+    stop = grpc_server.start_grpc_server(api_server, args)
+    return stop, grpc.insecure_channel(f"127.0.0.1:{port}")
+
+
+def test_a_generate_past_4_mib_is_admitted(serve):
+    stop, channel = _listen(serve, FakeEngine([([5], "eos")]))
+    prompt = [1 << 28] * 900_000  # 5 bytes apiece: 4.5 MB
+    request = pb.GenerateRequest(request_id="r", prompt_token_ids=prompt)
+    assert request.ByteSize() > 4 << 20
+    try:
+        answer = list(pb_grpc.AtomEngineStub(channel).Generate(request, timeout=30))
+        assert [r.WhichOneof("response") for r in answer] == ["complete"]
+        assert answer[0].complete.prompt_tokens == len(prompt)
+    finally:
+        channel.close()
+        stop()
+
+
+def test_shutdown_ends_running_calls_before_it_returns(serve):
+    engine = FakeEngine([([5], None)])  # the seq runs on after its first step
+    stop, channel = _listen(serve, engine)
+    request = pb.GenerateRequest(request_id="r", prompt_token_ids=[1], stream=True)
+    stub = pb_grpc.AtomEngineStub(channel)
+    streaming = stub.Generate(request, timeout=10)
+    assert list(next(streaming).chunk.token_ids) == [5]
+    engine.release.clear()
+    preprocessing = stub.Generate(request, timeout=10)
+    for _ in range(500):
+        if len(engine.preprocessed) == 2:
+            break
+        time.sleep(0.01)
+    threading.Timer(0.3, engine.release.set).start()
+    stop()
+    # Before the engine closes: one seq aborted, the other dropped once made.
+    assert engine.made == [1, 2] and engine.aborted == [1]
+    assert engine.io_processor.requests == {} and engine.submitted[1:] == []
+    for call in (streaming, preprocessing):
+        with pytest.raises(grpc.RpcError):
+            list(call)
+    channel.close()
+
+
+def test_a_step_flushed_after_the_server_stopped_is_dropped():
+    steps = grpc_server.StepOutputs()
+
+    async def buffer():
+        steps.callback(asyncio.Queue())(RequestOutput(1, [5], True, "eos"))
+
+    asyncio.run(buffer())  # its loop is closed once this returns
+    steps.flush()
 
 
 def test_model_info_leaves_an_absent_chat_template_unset(serve, monkeypatch):
