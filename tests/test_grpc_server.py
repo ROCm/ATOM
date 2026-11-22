@@ -478,8 +478,8 @@ def test_a_step_ending_as_the_listener_starts_reaches_its_call(monkeypatch):
     assert [output.finish_reason for output in delivered] == ["eos"]
 
 
-def test_shutdown_ends_running_calls_before_it_returns(serve, monkeypatch):
-    engine = FakeEngine([([5], None)])  # the seq runs on after its first step
+def _listen(serve, monkeypatch, engine):
+    """`engine` behind a listening gRPC server: its stop and a channel to it."""
     serve(engine)  # api_server's engine; start_grpc_server makes its own servicer
     engine.core_mgr._flush_stream_batch_fn = None
     engine.flush = lambda: engine.core_mgr._flush_stream_batch_fn()
@@ -489,7 +489,26 @@ def test_shutdown_ends_running_calls_before_it_returns(serve, monkeypatch):
     monkeypatch.setattr(grpc_server.Sequence, "counter", grpc_server.Sequence.counter)
     args = Namespace(host="127.0.0.1", grpc_port=port, model="m")
     stop = grpc_server.start_grpc_server(api_server, args)
-    channel = grpc.insecure_channel(f"127.0.0.1:{port}")
+    return stop, grpc.insecure_channel(f"127.0.0.1:{port}")
+
+
+def test_a_generate_past_4_mib_is_admitted(serve, monkeypatch):
+    stop, channel = _listen(serve, monkeypatch, FakeEngine([([5], "eos")]))
+    prompt = [1 << 28] * 900_000  # 5 bytes apiece: 4.5 MB
+    request = pb.GenerateRequest(request_id="r", prompt_token_ids=prompt)
+    assert request.ByteSize() > 4 << 20
+    try:
+        answer = list(pb_grpc.AtomEngineStub(channel).Generate(request, timeout=30))
+        assert [r.WhichOneof("response") for r in answer] == ["complete"]
+        assert answer[0].complete.prompt_tokens == len(prompt)
+    finally:
+        channel.close()
+        stop()
+
+
+def test_shutdown_ends_running_calls_before_it_returns(serve, monkeypatch):
+    engine = FakeEngine([([5], None)])  # the seq runs on after its first step
+    stop, channel = _listen(serve, monkeypatch, engine)
     request = pb.GenerateRequest(request_id="r", prompt_token_ids=[1], stream=True)
     stub = pb_grpc.AtomEngineStub(channel)
     streaming = stub.Generate(request, timeout=10)

@@ -175,7 +175,7 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
                 raise
             call.seq_id = seq.id
             api._validate_sequence_context_length(seq, params)
-            ids, cached = [], 0
+            ids, completion_tokens, cached = [], 0, 0
             if call.aborted:  # before its submission: it never reaches the engine
                 finished, output = True, RequestOutput(seq.id, [], True, "aborted")
             else:
@@ -187,23 +187,25 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
                 output = await outputs.get()
                 finished = output.finished
                 raise_for_structured_error(output.finish_reason)  # HTTP chat's 500
-                ids += output.output_tokens
+                completion_tokens += len(output.output_tokens)
+                if not request.stream:  # a stream's tokens go out in its chunks
+                    ids += output.output_tokens
                 cached = output.num_cached_tokens or cached
                 if request.stream and output.output_tokens:
                     chunk = pb.GenerateStreamChunk(
                         token_ids=output.output_tokens,
                         prompt_tokens=seq.num_prompt_tokens,
-                        completion_tokens=len(ids),
+                        completion_tokens=completion_tokens,
                         cached_tokens=cached,
                     )
                     await self._write(
                         context, request, pb.GenerateResponse(chunk=chunk)
                     )
             complete = pb.GenerateComplete(
-                output_ids=[] if request.stream else ids,
+                output_ids=ids,
                 finish_reason=output.finish_reason,
                 prompt_tokens=seq.num_prompt_tokens,
-                completion_tokens=len(ids),
+                completion_tokens=completion_tokens,
                 cached_tokens=cached,
             )
             if output.kv_transfer_params_output is not None:
@@ -592,8 +594,8 @@ def _run(address: str, servicer: AtomEngineServicer, listening: Future) -> None:
 
 
 async def _serve(address: str, servicer: AtomEngineServicer, listening: Future) -> None:
-    # Without SO_REUSEPORT a second server on the port fails, not shares it; a Session's
-    # SubmitBatch of long prompts may pass gRPC's default 4 MiB, so no receive limit.
+    # Without SO_REUSEPORT a second server on the port fails, not shares it; a long
+    # prompt's Generate or a Session's SubmitBatch may pass gRPC's default 4 MiB.
     options = [("grpc.so_reuseport", 0), ("grpc.max_receive_message_length", -1)]
     try:
         server = grpc.aio.server(options=options)
