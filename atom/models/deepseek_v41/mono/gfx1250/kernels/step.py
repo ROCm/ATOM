@@ -993,8 +993,13 @@ def target_layer(E, Ly):
         FS.topk_v3(dict(t=t, b=b, w=w, l=l, sm=sm + FLO, scores=fptr(fp, "plog"), gbias=ltab(fp, Ly, "gbias")(),
                         tag=hx.epoch32(tep, Ly, 1), ne=RNE, ktop=RTOPK, bias=tkb, **(dict(ucnt=1) if moe_ids == "ids" else {})),
                    TR, MS.O_PID, MS.O_WTS, moe_ids == "ids")
+        UD = moe_ids == "ids" and MS.udir_ok(TR, TR * RTOPK)
+        if fx.const_expr(UD):   # (udir) the x8 row flags by wave 7 (idle in the top-k); the UG starts at this barrier
+            hx.wait_flags(crr["xflag"], TR, crr["xtag"], w - 7, l, 10)
+            crr = dict(crr, udir=1, rne=RNE)
         gpu.barrier()
-        MS.moe_union(crr, moe_ids == "ids")
+        if fx.const_expr(not UD):
+            MS.moe_union(crr, moe_ids == "ids")
         MS.ug_union(crr, rr_ * MS.NRC + ss_, TR)
         if rr_ < TR:
             MS.dn_row(crr, ss_)

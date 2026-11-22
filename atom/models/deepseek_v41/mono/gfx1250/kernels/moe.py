@@ -1359,13 +1359,16 @@ def dn_row(c, s):
         e = pick_id(c, w)
         wt = hx.lload(sm + O_WTS + p * 4, F32)
         # (union UG) the pick's union entry ui (O_UNI[ui] == e) and its token slot pos (O_LST[e][pos] == p)
-        nun = hx.lload(sm + O_NUNI, I32)
-        ua = ((hx.lload(sm + O_UNI + l * 4, I32) == e) & (l < nun)).select(l, I32(-1))
-        ub = ((hx.lload(sm + O_UNI + fx.min(l + 32, I32(NEX - 1)) * 4, I32) == e) & (l + 32 < nun)).select(l + 32, I32(-1))
-        ui = ufl(_rv_wmax(fx.max(ua, ub)))
-        ne_ = hx.lload(sm + O_CNT + e * 4, I32)
-        pa = ((hx.lload(sm + O_LST + (e * MAXTOK + l % 16) * 4, I32) == p) & (l % 16 < ne_)).select(l % 16, I32(-1))
-        pos = ufl(_rv_wmax(pa))
+        if fx.const_expr("udir" in c):
+            ui, pos = uni_pos(c, e, p)
+        else:
+            nun = hx.lload(sm + O_NUNI, I32)
+            ua = ((hx.lload(sm + O_UNI + l * 4, I32) == e) & (l < nun)).select(l, I32(-1))
+            ub = ((hx.lload(sm + O_UNI + fx.min(l + 32, I32(NEX - 1)) * 4, I32) == e) & (l + 32 < nun)).select(l + 32, I32(-1))
+            ui = ufl(_rv_wmax(fx.max(ua, ub)))
+            ne_ = hx.lload(sm + O_CNT + e * 4, I32)
+            pa = ((hx.lload(sm + O_LST + (e * MAXTOK + l % 16) * 4, I32) == p) & (l % 16 < ne_)).select(l % 16, I32(-1))
+            pos = ufl(_rv_wmax(pa))
 
         def tile_loads(j):
             tt = s * 8 + j
@@ -1573,29 +1576,140 @@ def x8_pub(c, r, lr=0):
         hx.put(c["xflag"] + i64(r) * 8, I32(0), c["xtag"])
 
 
+def udir_ok(TR, NP):
+    """(c1) the union read straight from the top-k's counts / picks (no moe_union, no sorted lists): every expert has
+    <= TR <= MAXTOK picks (no overflow chunk), the picks fit two lane chunks, and a wave >= TR is idle in the top-k
+    (it waits the x8 row flags there)."""
+    return TR <= MAXTOK and TR < 8 and NP <= 64
+
+
+def uni_masks(c):
+    """(udir) the routed union as lane masks (wave-uniform): chunk cc = experts 32 cc + l with a pick (O_CNT > 0), every
+    chunk's count issued first; their popcounts (the shared pseudo-experts / overflow chunks not in the union)."""
+    sm, l = c["sm"], c["l"]
+    cns = [hx.lload(sm + O_CNT + (cc * 32 + l) * 4, I32) for cc in range(c.get("rne", NE) // 32)]
+    ms = [ballot(cn > 0) for cn in cns]
+    return ms, [popc(m) for m in ms]
+
+
+def uni_picks(c):
+    """(udir) the top-k's pick ids (O_PID) in lane chunks: pick l + 32 k."""
+    sm, l, NP = c["sm"], c["l"], c["NP"]
+    return [hx.lload(sm + O_PID + fx.min(l + 32 * k, I32(NP - 1)) * 4, I32) for k in range((NP + 31) // 32)]
+
+
+def uni_find(ms, pcs, ui, l):
+    """(udir) union entry ui (uniform; experts in id order, as moe_union lists them) -> its expert: the chunk holding
+    it by the scalar prefix counts, then its (ui - base)-th set lane (one ballot of the matching lane)."""
+    base = I32(0)
+    msel = I32(0)
+    bsel = I32(0)
+    csel = I32(0)
+    for cc in range_constexpr(len(ms)):
+        inn = (ui >= base) & (ui < base + pcs[cc])
+        msel = inn.select(ms[cc], msel)
+        bsel = inn.select(base, bsel)
+        csel = inn.select(I32(32 * cc), csel)
+        base = base + pcs[cc]
+    hit = (((msel >> l) & 1) != 0) & (mbcnt(msel) == ui - bsel)
+    return csel + popc(ballot(hit) - 1)
+
+
+def uni_pick(c, e, pid, TR):
+    """(udir) expert e's picks (ballots over the pick chunks, pick order = moe_union's sorted list): its count n and
+    lane token slot tl's pick (the tl-th; slots tl >= n: the first, as the list's padding read), scalar."""
+    l, NP = c["l"], c["NP"]
+    tl = l % 16
+    mm = [ballot((pid[k] == e) & (l + 32 * k < NP)) for k in range(len(pid))]
+    n = I32(0)
+    for m in mm:
+        n = n + popc(m)
+    pk = I32(0)
+    p0 = I32(0)
+    for j in range_constexpr(min(TR, MAXTOK)):   # (an expert has <= TR picks: one a row)
+        pj = I32(0)
+        if len(mm) == 1:
+            pj = popc((mm[0] & (I32(0) - mm[0])) - 1)
+            mm = [mm[0] & (mm[0] - 1)]
+        else:
+            a0 = mm[0] != 0
+            pj = a0.select(popc((mm[0] & (I32(0) - mm[0])) - 1), 32 + popc((mm[1] & (I32(0) - mm[1])) - 1))
+            mm = [a0.select(mm[0] & (mm[0] - 1), mm[0]), a0.select(mm[1], mm[1] & (mm[1] - 1))]
+        if j == 0:
+            p0 = pj
+        pk = (tl == j).select(pj, pk)
+    return fx.min(n, I32(MAXTOK)), (tl < n).select(pk, p0)
+
+
+def uni_pos(c, e, p):
+    """(udir) pick p (expert e): its union entry ui (the experts with a pick and a smaller id) and its token slot pos
+    (the expert's picks before p) -- moe_union's O_UNI / O_LST positions. (l opaque: no address shared with the UG's
+    union reads, live across its K loop)"""
+    sm, NP = c["sm"], c["NP"]
+    l = hx.opaque_v(fx.thread_idx.x) % 32
+    c = dict(c, l=l)
+    ui = I32(0)
+    for cc in range_constexpr(c.get("rne", NE) // 32):
+        ui = ui + popc(ballot((hx.lload(sm + O_CNT + (cc * 32 + l) * 4, I32) > 0) & (I32(32 * cc) + l < e)))
+    pid = uni_picks(c)
+    pos = I32(0)
+    for k in range_constexpr(len(pid)):
+        pos = pos + popc(ballot((pid[k] == e) & (l + 32 * k < p)))
+    return ufl(ui), ufl(pos)
+
+
 @ASTRewriter.transform
 def ug_union(c, i, TR):
     """Routed CTA i (0..239): union groups [U i / 240, U (i + 1) / 240) (U = routed union entries x 18): 2 groups a
     round (waves 0..3 / 4..7, tile w % 4, full K), B = the expert's picks' x8 rows (global, after the TR row flags);
-    the group epilogue -> MID slot ui (token slots = the expert's pick list), one LL flag (ui, g)."""
+    the group epilogue -> MID slot ui (token slots = the expert's pick list), one LL flag (ui, g).
+    c["udir"] (udir_ok): the top-k's barrier is the entry (the x8 row flags waited by an idle top-k wave before it), a
+    wave's groups straight from the counts / picks (uni_find / uni_pick, scalar; no moe_union) -- the same ui / slots,
+    bit for bit."""
     w, l, sm = c["w"], c["l"], c["sm"]
     tl = l % 16
-    hx.wait_flags(c["xflag"], TR, c["xtag"], w, l, 10)
-    gpu.barrier()
-    nuni = ufl(hx.lload(sm + O_NUNI, I32))
-    U = dn_nuni(c, nuni) * NUG
+    UD = "udir" in c
+    if fx.const_expr(UD):
+        ms, pcs = uni_masks(c)
+        pid = uni_picks(c)
+        nr = I32(0)
+        for pc in pcs:
+            nr = nr + pc
+        U = nr * NUG
+    else:
+        hx.wait_flags(c["xflag"], TR, c["xtag"], w, l, 10)
+        gpu.barrier()
+        nuni = ufl(hx.lload(sm + O_NUNI, I32))
+        U = dn_nuni(c, nuni) * NUG
     u0 = (U * i) // (CTAS_R)
     u1 = (U * (i + 1)) // (CTAS_R)
+    if fx.const_expr(UD):
+        wq = ufl(w // 4)
     for rd in range_constexpr(2):
         G = u0 + rd * 2 + w // 4
         live = G < u1
         Gc = fx.max(fx.min(G, u1 - 1), I32(0))
         ui = Gc // NUG
         g = Gc % NUG
-        e = hx.lload(sm + O_UNI + ui * 4, I32)
-        n = fx.min(hx.lload(sm + O_CNT + e * 4, I32), I32(MAXTOK))
-        pk = hx.lload(sm + O_LST + (e * MAXTOK + (tl < n).select(tl, I32(0))) * 4, I32)
-        ex = i64(pslot(e, sm))
+        if fx.const_expr(UD and rd == 0):
+            e = uni_find(ms, pcs, fx.max(fx.min(u0 + wq, u1 - 1), I32(0)) // NUG, l)
+            n, pk = uni_pick(c, e, pid, TR)
+            ex = i64(e)
+        elif fx.const_expr(UD):   # (the rare second round: the union re-read only if live, l opaque -- nothing of
+            e = I32(0)            # the first round's union live across its UG)
+            n = I32(0)
+            pk = I32(0)
+            if hx.unlikely(live):
+                cu = dict(c, l=hx.opaque_v(fx.thread_idx.x) % 32)
+                ms1, pcs1 = uni_masks(cu)
+                e = uni_find(ms1, pcs1, fx.max(fx.min(u0 + 2 + wq, u1 - 1), I32(0)) // NUG, cu["l"])
+                n, pk = uni_pick(cu, e, uni_picks(cu), TR)
+            ex = i64(e)
+        else:
+            e = hx.lload(sm + O_UNI + ui * 4, I32)
+            n = fx.min(hx.lload(sm + O_CNT + e * 4, I32), I32(MAXTOK))
+            pk = hx.lload(sm + O_LST + (e * MAXTOK + (tl < n).select(tl, I32(0))) * 4, I32)
+            ex = i64(pslot(e, sm))
         acc1 = fx.Vector.filled(8, 0.0, F32)
         if (hx.unlikely(live) if rd == 1 else live):   # (c1 code size: a second round is rare, off the hot path)
             acc1 = ug_body1(c, pk, c["w13"] + ex * W13_E + i64(g) * (4 * W13_TS), c["s13"] + ex * S13_E + i64(g) * (2 * W13_KC), w % 4)
