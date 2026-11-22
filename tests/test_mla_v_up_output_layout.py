@@ -27,6 +27,7 @@ def projection():
         "_v_up_proj",
         "_v_up_proj_and_o_proj",
         "_dcp_project_merge_out",
+        "_dcp_project_merge_out_prefill",
         "_dcp_project_merge_out_head_major",
         "_configure_dcp_prefill_routes",
     }
@@ -192,11 +193,13 @@ def test_head_major_projection_stores_heads_for_exchange(projection, monkeypatch
         ("a2a", False, False, True, True),
     ],
 )
+@pytest.mark.parametrize("tokens", [1, 32, 33])
 def test_projection_layout_follows_the_merge_that_can_use_it(
-    projection, monkeypatch, backend, decode, fused, fp32, heads_layout
+    projection, monkeypatch, backend, decode, fused, fp32, heads_layout, tokens
 ):
     attn, namespace = projection
-    tokens, heads = 5, attn.num_heads
+    heads = attn.num_heads
+    heads_layout = heads_layout and tokens > 32
     x, weights = _inputs(tokens, heads, attn.kv_lora_rank, attn.v_head_dim)
     attn.W_V, attn.W_V_dcp = weights, weights
     attn.W_V_scale = attn.W_V_dcp_scale = None
@@ -205,15 +208,20 @@ def test_projection_layout_follows_the_merge_that_can_use_it(
     attn._dcp_fused_quant_dtype = lambda: dtype if fused else None
     attn.o_proj = lambda flat: flat
     seen = _stub_bmm(namespace, "bf16", weights, None)
+    counts = torch.ones(tokens, dtype=torch.int32)
 
     def merge(out, lse, **kwargs):
         assert "head_major" not in kwargs and not heads_layout
-        assert kwargs["decode"] == decode
+        assert kwargs.get("decode", False) == decode
+        assert kwargs["owned_counts"] is counts
+        assert out.dtype == (torch.float32 if fp32 else torch.bfloat16)
         assert seen["output"].is_contiguous()
         return (out, None) if kwargs.get("quant_dtype") is not None else out
 
     def head_merge(out, lse, group, **kwargs):
         assert heads_layout and out.is_contiguous()
+        assert kwargs["owned_counts"] is counts
+        assert out.dtype == (torch.float32 if fp32 else torch.bfloat16)
         return out.transpose(0, 1).contiguous()
 
     attn.dcp_group = object()
@@ -222,9 +230,13 @@ def test_projection_layout_follows_the_merge_that_can_use_it(
     _transport(monkeypatch, head_merge)
     attn._configure_dcp_prefill_routes()
     if decode:
-        result = attn._dcp_project_merge_out(x, None, decode=True, merge_in_fp32=fp32)
+        result = attn._dcp_project_merge_out(
+            x, None, decode=True, merge_in_fp32=fp32, owned_counts=counts
+        )
     else:
-        result = attn._dcp_prefill_merge_out(x, None, merge_in_fp32=fp32)
+        result = attn._dcp_prefill_merge_out(
+            x, None, merge_in_fp32=fp32, owned_counts=counts
+        )
     expected = torch.einsum("tnl,nvl->tnv", x.float(), weights.float())
     assert torch.equal(result, expected.to(torch.bfloat16).reshape(tokens, -1))
 
@@ -240,21 +252,22 @@ def test_ordinary_merge_interface_has_no_head_major_switch(name):
     assert "head_major" not in {a.arg for a in function.args.args}
 
 
-@pytest.mark.parametrize("branch,collectives", [("fp8", 1), ("fp4", 1), ("bf16", 2)])
-def test_one_row_prefill_keeps_the_projection_transport(
-    projection, monkeypatch, branch, collectives
+@pytest.mark.parametrize("branch", ["fp8", "fp4", "bf16"])
+@pytest.mark.parametrize("tokens", [1, 32, 33])
+def test_prefill_row_count_selects_projection_and_transport_together(
+    projection, monkeypatch, branch, tokens
 ):
     attn, namespace = projection
     attn.num_heads = 2
     heads = 2 * attn.num_heads
-    x, weights = _inputs(1, heads, attn.kv_lora_rank, attn.v_head_dim)
+    x, weights = _inputs(tokens, heads, attn.kv_lora_rank, attn.v_head_dim)
     scale = None if branch == "bf16" else torch.ones(heads)
     attn.W_V = attn.W_V_dcp = weights
     attn.W_V_scale = attn.W_V_dcp_scale = scale
     attn.pbm_enabled, attn.dcp_comm_backend = True, "a2a"
     attn._dcp_fused_quant_dtype = lambda: None
     attn.o_proj = lambda value: value
-    _stub_bmm(namespace, branch, weights, scale)
+    seen = _stub_bmm(namespace, branch, weights, scale)
 
     path = Path(__file__).resolve().parents[1] / "atom/model_ops/dcp_ops.py"
     functions = [
@@ -299,9 +312,15 @@ def test_one_row_prefill_keeps_the_projection_transport(
     attn.dcp_group = cp_group
     _transport(monkeypatch, transport["cp_lse_a2a_head_major"])
     attn._configure_dcp_prefill_routes()
-    result = attn._dcp_prefill_merge_out(x, torch.zeros(1, heads))
-    assert result.shape == (1, attn.num_heads * attn.v_head_dim)
-    assert len(calls) == collectives
+    result = attn._dcp_prefill_merge_out(x, torch.zeros(tokens, heads))
+    assert result.shape == (tokens, attn.num_heads * attn.v_head_dim)
+    head_major = branch == "bf16" and tokens > 32
+    if head_major:
+        assert calls == [(heads, tokens, attn.v_head_dim), (heads, tokens)]
+        assert seen["YQ"].is_contiguous()
+    else:
+        assert calls == [(2, tokens, attn.num_heads, attn.v_head_dim + 2)]
+        assert seen["output"].is_contiguous()
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])

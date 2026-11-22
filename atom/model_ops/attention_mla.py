@@ -1421,10 +1421,21 @@ class MLAAttention(nn.Module):
             )
         )
         self._dcp_prefill_merge_out = (
-            self._dcp_project_merge_out_head_major
+            self._dcp_project_merge_out_prefill
             if head_major
             else self._dcp_project_merge_out
         )
+
+    def _dcp_project_merge_out_prefill(
+        self, o, lse, merge_in_fp32=False, owned_counts=None
+    ):
+        """Keep short BF16 projections on the one-collective packed tail."""
+        merge_out = (
+            self._dcp_project_merge_out
+            if o.shape[0] <= 32
+            else self._dcp_project_merge_out_head_major
+        )
+        return merge_out(o, lse, merge_in_fp32=merge_in_fp32, owned_counts=owned_counts)
 
     @mark_trace(prefix="dcp_project_merge_out_head_major", torch_compile=False)
     def _dcp_project_merge_out_head_major(
