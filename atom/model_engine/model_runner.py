@@ -135,6 +135,9 @@ logger = logging.getLogger("atom")
 # the rejections applied on the device (`attentions.early_meta`); the status is
 # then taken after the verify launch.
 _EARLY_META = os.environ.get("ATOM_HOSTNEXT_EARLY_META", "0") == "1"
+# ATOM_HOSTNEXT_FUSED_PROLOGUE=1 (with EARLY_META): the early fix and the GDN
+# pre-verify kernels as one launch at the end of the build (`early_meta`).
+_FUSED_PROLOGUE = _EARLY_META and os.environ.get("ATOM_HOSTNEXT_FUSED_PROLOGUE", "0") == "1"
 
 support_model_arch_dict = {
     "Qwen3ForCausalLM": "atom.models.qwen3.Qwen3ForCausalLM",
@@ -652,6 +655,7 @@ class tokenIDProcessor:
                 prev_bonus=bonus_gpu,
                 prev_rejected=rejected_gpu,
                 bs=batch.total_seqs_num,
+                fused=_FUSED_PROLOGUE,
             )
         self.early_fix = early
         if early is not None:
@@ -1046,6 +1050,8 @@ class ModelRunner:
                 self._install_draft_presence_penalty()
             if envs.ATOM_MTP_DRAFT_LM_HEAD_FP8:
                 self._install_draft_lm_head_fp8()
+            if os.environ.get("ATOM_VERIFY_LM_HEAD_FP8", "0") == "1":
+                self._install_verify_lm_head_fp8()
             if envs.ATOM_MTP_REJECTION_SAMPLING:
                 self._install_spec_rejection_sampling()
             # A block drafter's width reads the loaded draft model's window.
@@ -3503,6 +3509,36 @@ class ModelRunner:
         return max(
             self.config.hf_config.vocab_size,
             getattr(head, "num_embeddings", 0) if head is not None else 0,
+        )
+
+    def _install_verify_lm_head_fp8(self) -> None:
+        """ATOM_VERIFY_LM_HEAD_FP8=1 (numerical change, default off): the target's
+        (verify) logits from the same e4m3 / 128 x 128 e8m0-block copy of the LM
+        head the draft passes use (`DraftLMHeadFP8`; shared with the draft head's
+        when ATOM_MTP_DRAFT_LM_HEAD_FP8 built one from an identical weight, else
+        made here): half the bytes of the bf16 head a verify. TP1, unbiased heads."""
+        from atom.model_ops.draft_lm_head_fp8 import DraftLMHeadFP8
+
+        head = self._greedy_lm_head()
+        if head is None or getattr(head, "tp_size", 1) != 1 or head.bias is not None:
+            logger.warning("ATOM_VERIFY_LM_HEAD_FP8: no TP1 unbiased target LM head; not applied")
+            return
+        drafter = getattr(self, "drafter", None)
+        dhead = getattr(getattr(drafter, "model", None), "lm_head", None)
+        shared = getattr(dhead, "draft_fp8", None)
+        if shared is not None and not (
+            dhead.weight.shape == head.weight.shape
+            and (
+                dhead.weight.data_ptr() == head.weight.data_ptr()
+                or torch.equal(dhead.weight, head.weight)
+            )
+        ):
+            shared = None
+        head.verify_fp8 = shared if shared is not None else DraftLMHeadFP8(head.weight.data)
+        logger.info(
+            "ATOM_VERIFY_LM_HEAD_FP8: verify logits from a %s FP8 copy (%s)",
+            tuple(head.verify_fp8.weight.shape),
+            "shared with the draft head" if shared is not None else "own copy",
         )
 
     def _install_draft_lm_head_fp8(self) -> None:

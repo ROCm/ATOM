@@ -56,6 +56,12 @@ _PINNED_RING = 8  # host staging buffers for the per-step slot ids (async H2D)
 # ids and the draft presence record (`DraftPresencePenalty.record`) made in the
 # sampler's kernels: three launches fewer a pass, the same bits.
 _FUSED_SELECT = os.environ.get("ATOM_MTP_DRAFT_FUSED_SELECT", "0") == "1"
+# ATOM_MTP_DRAFT_LMHEAD_STATS=1 (with ATOM_MTP_DRAFT_FUSED_SELECT and
+# ATOM_MTP_DRAFT_LM_HEAD_FP8): the draft LM head's GEMM writes the sampler's
+# group keys (bit-identical) and per-256-column softmax partials in its
+# epilogue (aiter gemm_a8w8_lmhead_stats) and advances the draw counter: no
+# stats kernel. Z and p differ in their last bits (summation order).
+_LMHEAD_STATS = os.environ.get("ATOM_MTP_DRAFT_LMHEAD_STATS", "0") == "1"
 
 
 def _kb(k: int) -> int:
@@ -300,11 +306,43 @@ class SpecRejectionSampling:
             )
         return self._presence[1]
 
+    def lmhead_stats_args(self, rows: int, vocab: int, out: torch.Tensor, draft_presence=None):
+        """ATOM_MTP_DRAFT_LMHEAD_STATS: (temperatures, presence, rng_state) for
+        the draft LM head's stats epilogue when sample_draft's fused path will
+        take its records (``stats=``), else None."""
+        if not _LMHEAD_STATS or not _FUSED_SELECT:
+            return None
+        from atom.utils import envs
+        from aiter.ops.triton.fusions import topk_topp_sample as tts
+
+        if not (
+            envs.ATOM_MTP_DRAFT_DEVICE_RNG
+            and hasattr(tts, "topk_topp_sample_gluon_select_supported")
+            and rows <= self.max_rows
+            and out.is_contiguous()
+            and out.numel() == rows
+            and vocab % 256 == 0
+            and vocab <= 8192 * 32
+            and 0 < self.draft_k <= tts.MAX_K
+            and self.draft_k * 32 <= vocab
+        ):
+            return None
+        return (
+            self.row_temp,
+            self._presence_args(draft_presence),
+            self._rng_state,
+        )
+
     def sample_draft(
-        self, logits: torch.Tensor, out: torch.Tensor, draft_presence=None
+        self,
+        logits: torch.Tensor,
+        out: torch.Tensor,
+        draft_presence=None,
+        stats: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Each draft row's token, drawn from its q by the verify's sampler, into
-        ``out``; the sampler's records into the scratch."""
+        ``out``; the sampler's records into the scratch. ``stats``: the LM
+        head's records (lmhead_stats_args), in place of the stats kernel."""
         from aiter.ops.triton.fusions import topk_topp_sample as tts
 
         rows = logits.shape[0]
@@ -337,9 +375,11 @@ class SpecRejectionSampling:
                 rng_state=(self._rng_state, self._rng_seed),
                 out2=out.view(-1),
                 record=rec,
+                **({"stats": stats} if stats is not None else {}),
             )
             self.recorded_presence = rec is not None
             return out
+        assert stats is None, "the LM head's records need the fused select path"
         if envs.ATOM_MTP_DRAFT_DEVICE_RNG:
             _draft_uniform_kernel[(1,)](
                 u,

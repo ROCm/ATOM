@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import os
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -94,6 +95,8 @@ class GDNAttentionBackend(AiterBackend):
     def get_impl_cls() -> type["GatedDeltaNet"]:
         return GatedDeltaNet
 
+
+_HOSTNEXT_PINNED_NAT = os.environ.get("ATOM_HOSTNEXT_PINNED_NAT", "0") == "1"
 
 @triton.jit(do_not_specialize=["num_decodes"])
 def _gdn_spec_decode_pad_kernel(
@@ -1510,16 +1513,38 @@ class GDNStateMixin(PoolRowsMixin):
             self.num_accepted_tokens.fill_(1)
             return
         num_bonus = np.asarray(num_bonus, dtype=np.int32)
-        host = np.ones(self.num_accepted_tokens.shape, dtype=np.int32)
-        host[: num_bonus.shape[0]] = num_bonus + 1
-        self.num_accepted_tokens.copy_(torch.from_numpy(host), non_blocking=True)
+        if _HOSTNEXT_PINNED_NAT:
+            # ATOM_HOSTNEXT_PINNED_NAT: the same row through a ring of pinned
+            # buffers (a pageable source costs ~40 us of host staging a step).
+            # The ring is deeper than the host's lead over the GPU (one step,
+            # `_gate_staging_reuse`), so a slot is never rewritten in flight.
+            ring = getattr(self, "_nat_ring", None)
+            if ring is None:
+                ring = self._nat_ring = [
+                    torch.ones(self.num_accepted_tokens.shape, dtype=torch.int32).pin_memory()
+                    for _ in range(4)
+                ]
+                self._nat_ring_np = [t.numpy() for t in ring]
+                self._nat_next = 0
+            i = self._nat_next
+            self._nat_next = (i + 1) % len(ring)
+            host = self._nat_ring_np[i]
+            n = num_bonus.shape[0]
+            np.add(num_bonus, 1, out=host[:n])
+            host[n:] = 1
+            self.num_accepted_tokens.copy_(ring[i], non_blocking=True)
+        else:
+            host = np.ones(self.num_accepted_tokens.shape, dtype=np.int32)
+            host[: num_bonus.shape[0]] = num_bonus + 1
+            self.num_accepted_tokens.copy_(torch.from_numpy(host), non_blocking=True)
         early = getattr(self.model_runner.tokenID_processor, "early_fix", None)
         if early is not None:
             # ATOM_HOSTNEXT_EARLY_META: the carried-over rows' bonus counts
             # come from the previous verify on the device.
             from atom.model_ops.attentions.early_meta import early_gdn_accepted
 
-            early_gdn_accepted(early, self.num_accepted_tokens)
+            if not early.fused:
+                early_gdn_accepted(early, self.num_accepted_tokens)
 
     def prepare_gdn_metadata(
         self,
@@ -1579,7 +1604,8 @@ class GDNStateMixin(PoolRowsMixin):
             spec_token_indx = self.spec_token_indx[:spec_token_size]
             non_spec_token_indx = self.non_spec_token_indx[:0]
             spec_sequence_masks = self.spec_sequence_masks[:num_reqs]
-            spec_sequence_masks.fill_(True)
+            if not self._fused_prologue():
+                spec_sequence_masks.fill_(True)
             spec_state_indices_tensor = self.spec_state_indices_tensor.copy_to_gpu(
                 num_reqs
             )
@@ -1713,6 +1739,16 @@ class GDNStateMixin(PoolRowsMixin):
         # Decode: apply the PREVIOUS step's accepted counts.  For non-spec
         # decode `num_accepted_tokens` stays at its initialised value of 1,
         # which is exactly one committed token per step.
+        if self._fused_prologue():
+            early = self.model_runner.tokenID_processor.early_fix
+            early.gdn = dict(
+                write_pos=write_pos,
+                slot_idx=slot_idx,
+                commit_n=slot_idx.numel(),
+                t_max=self.replayssm_max_query_len,
+                cap=self.replayssm_cache_len,
+            )
+            return
         replayssm_commit(
             write_pos,
             slot_idx,
@@ -1738,15 +1774,31 @@ class GDNStateMixin(PoolRowsMixin):
         # transfer data to ps buffer
         if self.use_spec_decode and envs.ATOM_GDN_FUSED_DECODE_PAD:
             # The pad fills and query prefix below in one launch.
-            _gdn_spec_decode_pad(
-                self.non_spec_state_indices_tensor.gpu if self.replayssm else None,
-                self.spec_state_indices_tensor.gpu,
-                self.spec_sequence_masks,
-                self.spec_query_start_loc,
-                gdn_metadata.spec_query_start_loc,
-                self.num_accepted_tokens,
-                num_decodes,
-            )
+            if self._fused_prologue():
+                early = self.model_runner.tokenID_processor.early_fix
+                g = early.gdn if early.gdn is not None else dict(commit_n=0, write_pos=None, slot_idx=None, t_max=0, cap=0)
+                g.update(
+                    nat=self.num_accepted_tokens,
+                    masks=self.spec_sequence_masks,
+                    ns_idx=self.non_spec_state_indices_tensor.gpu if self.replayssm else None,
+                    sp_idx=self.spec_state_indices_tensor.gpu,
+                    qsl_dst=self.spec_query_start_loc,
+                    qsl_src=gdn_metadata.spec_query_start_loc,
+                    pad=PAD_SLOT_ID,
+                )
+                if num_decodes != early.bs:
+                    raise RuntimeError("ATOM_HOSTNEXT_FUSED_PROLOGUE: decode rows != batch")
+                early.gdn = g
+            else:
+                _gdn_spec_decode_pad(
+                    self.non_spec_state_indices_tensor.gpu if self.replayssm else None,
+                    self.spec_state_indices_tensor.gpu,
+                    self.spec_sequence_masks,
+                    self.spec_query_start_loc,
+                    gdn_metadata.spec_query_start_loc,
+                    self.num_accepted_tokens,
+                    num_decodes,
+                )
             gdn_metadata.spec_query_start_loc = self.spec_query_start_loc[
                 : num_decodes + 1
             ]
@@ -2880,7 +2932,23 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         self._attach_gdn_decode_metadata(
             batch, attn_metadata, prepare_block_tables=False
         )
+        if self._fused_prologue():
+            from atom.model_ops.attentions.early_meta import early_prologue
+
+            early_prologue(self.model_runner.tokenID_processor.early_fix)
         return attn_metadata, positions
+
+    def _fused_prologue(self) -> bool:
+        """ATOM_HOSTNEXT_FUSED_PROLOGUE applies to this step: an early fix in
+        flight that asked for it, on the fused-pad spec-decode path."""
+        early = getattr(self.model_runner.tokenID_processor, "early_fix", None)
+        return (
+            early is not None
+            and early.fused
+            and early.attn is not None
+            and self.use_spec_decode
+            and envs.ATOM_GDN_FUSED_DECODE_PAD
+        )
 
     def prepare_mtp_decode(
         self,

@@ -329,6 +329,11 @@ class ParallelLMHead(VocabParallelEmbedding):
                 x = x[last_indices].contiguous()
             if self._can_use_dp_sharded_head(context):
                 return self._dp_sharded_logits(x, envs.ATOM_DP_LM_HEAD_MODE)
+        # ATOM_VERIFY_LM_HEAD_FP8: the target's logits from the FP8 copy of the head
+        # (ModelRunner._install_verify_lm_head_fp8; TP1, no bias). Numerical change.
+        verify_fp8 = getattr(self, "verify_fp8", None)
+        if verify_fp8 is not None:
+            return verify_fp8.mm(x, prepared=False)
         logits = tgemm.mm(x, self.weight, self.bias)
         if self.tp_size > 1:
             use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
@@ -485,8 +490,24 @@ class ParallelLMHead(VocabParallelEmbedding):
             units = tensor_model_parallel_all_reduce(units)
             lm_head_argmax_pick(units, self.tp_size, out.view(-1))
             return out
+        stats = None
         if draft_fp8 is not None:
-            logits = draft_fp8.mm(x)  # [N, vocab], TP1 only
+            # ATOM_MTP_DRAFT_LMHEAD_STATS: the sampler's stats from the GEMM's
+            # epilogue (spec_rejection.lmhead_stats_args), no stats kernel
+            sargs = (
+                draft_rs.lmhead_stats_args(
+                    x.shape[0], draft_fp8.weight.shape[0], out, draft_presence
+                )
+                if draft_rs is not None
+                and self.tp_size <= 1
+                and hasattr(draft_rs, "lmhead_stats_args")
+                else None
+            )
+            got = draft_fp8.mm_stats(x, *sargs) if sargs is not None else None
+            if got is not None:
+                logits, stats = got
+            else:
+                logits = draft_fp8.mm(x)  # [N, vocab], TP1 only
         else:
             logits = tgemm.mm(x, self.weight, self.bias)  # [N, vocab/tp]
         if self.tp_size <= 1:
@@ -502,7 +523,10 @@ class ParallelLMHead(VocabParallelEmbedding):
             if draft_rs is not None:
                 # The verify's sampler draws the draft, the draft presence
                 # penalty applied in its kernel (no separate vocab pass).
-                draft_rs.sample_draft(logits, out, draft_presence)
+                if stats is not None:
+                    draft_rs.sample_draft(logits, out, draft_presence, stats=stats)
+                else:
+                    draft_rs.sample_draft(logits, out, draft_presence)
                 # ATOM_MTP_DRAFT_FUSED_SELECT: recorded in the sampler's kernel
                 if draft_presence is not None and not getattr(
                     draft_rs, "recorded_presence", False
