@@ -63,14 +63,18 @@ decode_args=(--decode http://decode:8020)
 start_router
 """
 
-    def router_args(self, cell, policy=None, kind=None):
+    def router_args(self, cell, policy=None, kind=None, role_policies=True):
         service = cell["service"]
+        # As pd_submit.sh passes them; without them the harness picks its own.
+        roles = service["router"] if role_policies else {}
         result = subprocess.run(
             ["bash", "-eu", "-c", self.script],
             cwd=ROOT,
             env=dict(
                 self.env | cell["env"]["common"],
                 ROUTER_POLICY=policy or service["router"]["policy"],
+                ROUTER_PREFILL_POLICY=roles.get("prefill_policy", ""),
+                ROUTER_DECODE_POLICY=roles.get("decode_policy", ""),
                 ATOMESH_MESH_BINARY="/test/atomesh",
                 ATOM_PD_RANK_MAPPING_POLICY="none",
                 BENCHMARK_KIND=kind or cell["benchmark"]["kind"],
@@ -89,11 +93,26 @@ start_router
             line[4:] for line in result.stdout.splitlines() if line.startswith("ARG:")
         ]
 
-    def test_all_v4_concurrencies_launch_cache_aware_on_both_roles(self):
+    def test_all_v4_concurrencies_launch_agentic_prefill_and_least_load_decode(self):
         self.assertEqual(
             {tuple(cell["concurrency"]) for cell in self.cells},
             {(1,), (2,), (16,), (32,), (128,), (192,), (256,)},
         )
+        expected = {
+            "--policy": "cache_aware",
+            "--prefill-policy": "agentic",
+            "--decode-policy": "least_load",
+        }
+        for cell in self.cells:
+            with self.subTest(concurrency=cell["concurrency"]):
+                args = self.router_args(cell)
+                self.assertIn("--dp-aware", args)
+                self.assertNotIn("--cache-threshold", args)
+                for flag, value in expected.items():
+                    self.assertEqual(args.count(flag), 1)
+                    self.assertEqual(args[args.index(flag) + 1], value)
+
+    def test_dropping_the_role_policies_restores_cache_aware_on_both_roles(self):
         expected = {
             "--policy": "cache_aware",
             "--prefill-policy": "cache_aware",
@@ -109,7 +128,7 @@ start_router
                     "40" if cell["concurrency"] == [256] else "20"
                 )
                 self.assertEqual(cell["service"]["router"]["policy"], "cache_aware")
-                args = self.router_args(cell)
+                args = self.router_args(cell, role_policies=False)
                 self.assertIn("--dp-aware", args)
                 self.assertNotIn("dp_sticky", args)
                 for flag, value in expected.items():
@@ -144,12 +163,14 @@ start_router
                 )
 
     def test_existing_agentic_dpa_default_remains_sticky(self):
-        args = self.router_args(self.cells[0], policy="random")
+        args = self.router_args(self.cells[0], policy="random", role_policies=False)
         self.assertEqual(args[args.index("--policy") + 1], "dp_sticky")
         self.assertIn("--dp-aware", args)
 
     def test_non_agentic_policy_is_preserved(self):
-        args = self.router_args(self.cells[0], policy="random", kind="random")
+        args = self.router_args(
+            self.cells[0], policy="random", kind="random", role_policies=False
+        )
         self.assertEqual(args[args.index("--policy") + 1], "random")
         self.assertNotIn("dp_sticky", args)
 

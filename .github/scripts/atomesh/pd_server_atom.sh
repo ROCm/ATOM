@@ -2224,10 +2224,10 @@ start_router() {
   local -a router_dp_aware_args=()
   local -a router_prefill_policy_args=()
   local -a explicit_policy_args=()
-  if [[ -n "${ROUTER_PREFILL_POLICY}" ]]; then
+  if [[ -n "${ROUTER_PREFILL_POLICY:-}" ]]; then
     explicit_policy_args+=(--prefill-policy "${ROUTER_PREFILL_POLICY}")
   fi
-  if [[ -n "${ROUTER_DECODE_POLICY}" ]]; then
+  if [[ -n "${ROUTER_DECODE_POLICY:-}" ]]; then
     explicit_policy_args+=(--decode-policy "${ROUTER_DECODE_POLICY}")
   fi
   if [[ ${#explicit_policy_args[@]} -eq 0 ]]; then
