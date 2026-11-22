@@ -52,6 +52,7 @@ pub struct MockWorker {
     config: Arc<RwLock<MockWorkerConfig>>,
     kv_event_sources: Arc<RwLock<serde_json::Value>>,
     dp_size: Arc<RwLock<Option<usize>>>,
+    model_path: Arc<RwLock<Option<String>>>,
     shutdown_handle: Option<tokio::task::JoinHandle<()>>,
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
@@ -62,6 +63,7 @@ impl MockWorker {
             config: Arc::new(RwLock::new(config)),
             kv_event_sources: Arc::new(RwLock::new(json!({}))),
             dp_size: Arc::new(RwLock::new(None)),
+            model_path: Arc::new(RwLock::new(None)),
             shutdown_handle: None,
             shutdown_tx: None,
         }
@@ -77,6 +79,13 @@ impl MockWorker {
         *self.dp_size.write().await = Some(dp_size);
     }
 
+    /// The path the worker loaded its model from, served as SGLang's `/server_info`
+    /// `model_path` (with no `tokenizer_path`) and as vLLM's `/v1/models` `root`; not
+    /// served until set.
+    pub async fn set_model_path(&self, model_path: &str) {
+        *self.model_path.write().await = Some(model_path.to_string());
+    }
+
     /// Start the mock worker server
     pub async fn start(&mut self) -> Result<String, Box<dyn std::error::Error>> {
         let config = self.config.clone();
@@ -87,6 +96,9 @@ impl MockWorker {
 
         let kv_event_sources = self.kv_event_sources.clone();
         let dp_size = self.dp_size.clone();
+        let model_path = self.model_path.clone();
+        let model_info_path = self.model_path.clone();
+        let models_root = self.model_path.clone();
         let app = Router::new()
             .route(
                 "/kv_event_sources",
@@ -99,9 +111,31 @@ impl MockWorker {
                 "/server_info",
                 get(move || {
                     let dp_size = dp_size.clone();
+                    let model_path = model_path.clone();
                     async move {
-                        match *dp_size.read().await {
-                            Some(dp_size) => Json(json!({"dp_size": dp_size})).into_response(),
+                        let mut info = serde_json::Map::new();
+                        if let Some(dp_size) = *dp_size.read().await {
+                            info.insert("dp_size".to_string(), json!(dp_size));
+                        }
+                        if let Some(model_path) = model_path.read().await.clone() {
+                            info.insert("model_path".to_string(), json!(model_path));
+                        }
+                        if info.is_empty() {
+                            return StatusCode::NOT_FOUND.into_response();
+                        }
+                        Json(info).into_response()
+                    }
+                }),
+            )
+            // SGLang's `/model_info` with no `tokenizer_path`. A 404 would send discovery to
+            // `/get_model_info`, whose `tokenizer_path` beats the served `model_path`.
+            .route(
+                "/model_info",
+                get(move || {
+                    let model_path = model_info_path.clone();
+                    async move {
+                        match model_path.read().await.clone() {
+                            Some(path) => Json(json!({"model_path": path})).into_response(),
                             None => StatusCode::NOT_FOUND.into_response(),
                         }
                     }
@@ -121,7 +155,13 @@ impl MockWorker {
                 post(responses_cancel_handler),
             )
             .route("/flush_cache", post(flush_cache_handler))
-            .route("/v1/models", get(v1_models_handler))
+            .route(
+                "/v1/models",
+                get(move |state: State<Arc<RwLock<MockWorkerConfig>>>| {
+                    let root = models_root.clone();
+                    async move { v1_models_handler(state, root.read().await.clone()).await }
+                }),
+            )
             .with_state(config);
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -1131,7 +1171,10 @@ async fn flush_cache_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>
     .into_response()
 }
 
-async fn v1_models_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {
+async fn v1_models_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    root: Option<String>,
+) -> Response {
     let config = config.read().await;
 
     if should_fail(&config).await {
@@ -1153,16 +1196,16 @@ async fn v1_models_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) 
         .unwrap()
         .as_secs();
 
-    Json(json!({
-        "object": "list",
-        "data": [{
-            "id": "mock-model",
-            "object": "model",
-            "created": timestamp,
-            "owned_by": "organization-owner"
-        }]
-    }))
-    .into_response()
+    let mut card = json!({
+        "id": "mock-model",
+        "object": "model",
+        "created": timestamp,
+        "owned_by": "organization-owner"
+    });
+    if let Some(root) = root {
+        card["root"] = json!(root);
+    }
+    Json(json!({"object": "list", "data": [card]})).into_response()
 }
 
 async fn responses_get_handler(
@@ -1262,5 +1305,117 @@ impl Default for MockWorkerConfig {
             response_delay_ms: 0,
             fail_rate: 0.0,
         }
+    }
+}
+
+// --- ATOM servers in their E/P/D roles ---
+
+/// What a stub ATOM encode server answers to a chat request.
+#[derive(Clone, Copy, Debug)]
+pub enum EncodeReply {
+    /// A choice-less completion carrying `ec_transfer_params`.
+    Params,
+    /// This status alone, as when E's embedding pool is full.
+    Status(u16),
+    /// `Params`, after this many milliseconds.
+    DelayMs(u64),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum AtomRole {
+    Prefill,
+    Decode,
+    Encode(EncodeReply),
+}
+
+/// The `ec_transfer_params` a stub encode server answers with.
+pub fn stub_ec_transfer_params() -> serde_json::Value {
+    json!({"session": "e0:17001", "cache_seed": 42, "addr": 4096, "len": 2048,
+           "generation": 3, "rows": [[0, 16]]})
+}
+
+/// The `cache_seed` a stub prefill server returns in its `kv_transfer_params`.
+pub const STUB_PREFILL_CACHE_SEED: u64 = 7;
+
+/// A stub ATOM server in one role, recording every chat body it receives.
+pub struct AtomRoleStub {
+    pub url: String,
+    pub chat_bodies: Arc<Mutex<Vec<serde_json::Value>>>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for AtomRoleStub {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+pub async fn start_atom_role(role: AtomRole) -> AtomRoleStub {
+    let chat_bodies = Arc::new(Mutex::new(Vec::new()));
+    let recorder = chat_bodies.clone();
+    let app = Router::new()
+        .route("/health", get(|| async { "OK" }))
+        .route(
+            "/v1/models",
+            get(|| async { Json(json!({"object": "list", "data": [{"id": "test-model"}]})) }),
+        )
+        .route(
+            "/kv_transfer_info",
+            get(|| async { Json(json!({"tp_size": 1, "kv_role": "kv_producer"})) }),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let recorder = recorder.clone();
+                async move {
+                    let stream = body["stream"] == true;
+                    recorder.lock().unwrap().push(body);
+                    atom_role_reply(role, stream).await
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    AtomRoleStub {
+        url,
+        chat_bodies,
+        server,
+    }
+}
+
+async fn atom_role_reply(role: AtomRole, stream: bool) -> Response {
+    let message = json!({"index": 0, "message": {"role": "assistant", "content": "red"},
+                         "finish_reason": "stop"});
+    let mut completion = json!({"id": "chatcmpl-stub", "object": "chat.completion",
+                                "model": "test-model", "choices": [message]});
+    match role {
+        AtomRole::Encode(EncodeReply::Status(code)) => {
+            StatusCode::from_u16(code).unwrap().into_response()
+        }
+        AtomRole::Encode(reply) => {
+            if let EncodeReply::DelayMs(ms) = reply {
+                tokio::time::sleep(tokio::time::Duration::from_millis(ms)).await;
+            }
+            completion["choices"] = json!([]);
+            completion["ec_transfer_params"] = stub_ec_transfer_params();
+            Json(completion).into_response()
+        }
+        AtomRole::Prefill => {
+            completion["kv_transfer_params"] = json!({"do_remote_decode": true,
+                "cache_seed": STUB_PREFILL_CACHE_SEED, "mrope_position_delta": 0});
+            completion["prompt_token_ids"] = json!([1, 2, 3]);
+            Json(completion).into_response()
+        }
+        AtomRole::Decode if stream => {
+            let chunk = json!({"id": "chatcmpl-stub", "object": "chat.completion.chunk",
+                "choices": [{"index": 0, "delta": {"content": "red"}}]});
+            (
+                [("content-type", "text/event-stream")],
+                format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+            )
+                .into_response()
+        }
+        AtomRole::Decode => Json(completion).into_response(),
     }
 }

@@ -460,7 +460,7 @@ impl RouterTrait for Router {
             tokens: tokens.as_deref(),
             headers: Some(&request.headers),
             stream: metadata.stream,
-            carries_media: metadata.carries_media,
+            media_count: metadata.media_count,
         };
         let policy = self.policies.regular_policy(metadata.model.as_deref());
         let observation = crate::observability::request::RequestMetrics::new(
@@ -471,7 +471,7 @@ impl RouterTrait for Router {
             metadata.stream,
         );
         let endpoint = route_to_endpoint(metadata.route);
-        let response = RetryExecutor::execute_response_with_retry(
+        let attempts = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             |_| async {
                 let response = self
@@ -495,9 +495,11 @@ impl RouterTrait for Router {
                     endpoint,
                 )
             },
-        )
-        .await;
-        observation.wrap_response(response)
+        );
+        let (response, estimate) = crate::observability::route_trace::estimated(attempts).await;
+        observation
+            .reconcile(metrics_labels::WORKER_REGULAR, estimate)
+            .wrap_response(response)
     }
 
     async fn health_generate(&self, req: Request<Body>) -> Response {

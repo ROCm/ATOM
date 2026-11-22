@@ -48,15 +48,18 @@ def check_linears(*lins) -> None:
 
 @torch.no_grad()
 def _dense(
-    lin, rows: tuple[int, int] | None = None
+    lin, rows: tuple[int, int] | None = None, cols: int | None = None
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """``lin`` (an ATOM FP8 linear) -> its weight in the checkpoint's row-major order (rows ``rows`` of a fused one)
-    and its E8M0 block scale (the rows' blocks)."""
+    """``lin`` (an ATOM FP8 linear) -> its weight in the checkpoint's row-major order (rows ``rows`` of a fused one,
+    its first ``cols`` columns: a K the loader padded) and its E8M0 block scale (the rows' and columns' blocks).
+    """
     check_linears(lin)
     w, s = _unshuffle_linear_weight(lin.weight).detach(), lin.weight_scale.detach()
     if rows is not None:
         a, b = rows
         w, s = w[a:b], s[a // _GROUP : b // _GROUP]
+    if cols is not None:
+        w, s = w[:, :cols], s[:, : cols // _GROUP]
     return w, s
 
 
@@ -74,16 +77,19 @@ def block_tensors(block, prefix: str) -> tuple[dict, dict]:
     w["attn.wkv.weight"], w["attn.wkv.scale"] = _dense(a.wqkv_a, (q_lora, kv_rows))
     w["attn.wq_b.weight"], w["attn.wq_b.scale"] = _dense(a.wq_b)
     w["attn.wo_b.weight"], w["attn.wo_b.scale"] = _dense(a.wo_b)
+    # (the loader may pad the pair's rank share with zero gate_up rows / w2 columns, ``fp8_group32_k_pad_align``:
+    # the checkpoint's share is the front of each half; the hi packer pads it its own way)
     gu = f.shared_experts.gate_up_proj
     half = gu.weight.shape[0] // 2
+    real = gu._ckpt_output_sizes[0] // gu.tp_size
     w["ffn.shared_experts.w1.weight"], w["ffn.shared_experts.w1.scale"] = _dense(
-        gu, (0, half)
+        gu, (0, real)
     )
     w["ffn.shared_experts.w3.weight"], w["ffn.shared_experts.w3.scale"] = _dense(
-        gu, (half, 2 * half)
+        gu, (half, half + real)
     )
     w["ffn.shared_experts.w2.weight"], w["ffn.shared_experts.w2.scale"] = _dense(
-        f.shared_experts.w2
+        f.shared_experts.w2, cols=real
     )
     plain = {
         "attn.q_norm.weight": a.q_norm.weight, "attn.kv_norm.weight": a.kv_norm.weight, "attn.attn_sink": a.attn_sink,

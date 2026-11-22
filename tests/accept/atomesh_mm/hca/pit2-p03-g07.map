@@ -1,0 +1,12 @@
+# GPU index (as HIP_VISIBLE_DEVICES counts it) and the HCA on the same PCIe
+# switch, from the bus addresses in `amd-smi list` and
+# /sys/class/infiniband/<hca>/device: GPU 0 at 05:00.0 beside rdma0 at
+# 09:00.0, and so on up to GPU 7 at f5:00.0 beside rdma7 at f9:00.0.
+0 rdma0
+1 rdma1
+2 rdma2
+3 rdma3
+4 rdma4
+5 rdma5
+6 rdma6
+7 rdma7

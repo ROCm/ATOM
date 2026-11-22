@@ -81,6 +81,17 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Encode workers, valid only in prefill-decode mode
+    pub fn encode_urls(mut self, encode_urls: Vec<String>) -> Self {
+        self.config.encode_urls = encode_urls;
+        self
+    }
+
+    pub fn encode_policy(mut self, policy: Option<PolicyConfig>) -> Self {
+        self.config.encode_policy = policy;
+        self
+    }
+
     pub fn mode(mut self, mode: RoutingMode) -> Self {
         self.config.mode = mode;
         self
@@ -366,6 +377,11 @@ impl RouterConfigBuilder {
 
     pub fn kv_events(mut self, enable: bool) -> Self {
         self.config.kv_events = enable;
+        self
+    }
+
+    pub fn mooncake_admin_port(mut self, port: u16) -> Self {
+        self.config.mooncake_admin_port = port;
         self
     }
 

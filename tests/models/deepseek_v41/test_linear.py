@@ -9,16 +9,6 @@ import torch
 from atom.quant_spec import LayerQuantConfig
 
 
-@pytest.fixture
-def linear_modules(monkeypatch):
-    pytest.importorskip("aiter")
-    from atom.model_ops import linear
-
-    group = SimpleNamespace(rank_in_group=0, world_size=4)
-    monkeypatch.setattr(linear, "get_tp_group", lambda: group)
-    return linear, group
-
-
 def _config(block_rows=32):
     from aiter import QuantType
 
@@ -57,6 +47,46 @@ def _online_quant_config(block_rows=1):
     )
 
 
+def test_a_native_w4a8_linear_does_not_ask_for_the_group32_gemm(
+    linear_modules, monkeypatch
+):
+    """Only an FP8 weight can fall back to BF16, so only it asks AITER."""
+    from aiter import QuantType
+
+    linear, group = linear_modules
+    group.world_size = 1
+
+    def asked():
+        raise AssertionError("an FP4 linear asked for the group32 FP8 GEMM")
+
+    monkeypatch.setattr(linear, "native_group32_runs_bf16", asked)
+    spec = LayerQuantConfig(
+        quant_type=QuantType.per_1x32,
+        quant_dtype=torch.float4_e2m1fn_x2,
+        weight_block_size=(1, 32),
+        activation_dtype=torch.float8_e4m3fn,
+    )
+    config = SimpleNamespace(get_layer_quant_config=lambda _: spec, online_quant=False)
+    module = linear.ReplicatedLinear(64, 32, quant_config=config)
+    assert module.native_a8_group_rows == 1 and not module.runs_bf16
+
+
+def test_an_mxfp4_linear_is_not_an_online_quant_source(linear_modules):
+    """Only MoE experts convert from MXFP4."""
+    from aiter import QuantType, dtypes
+
+    linear, _ = linear_modules
+    target = LayerQuantConfig(quant_type=QuantType.per_Token, quant_dtype=dtypes.fp8)
+    module = SimpleNamespace(
+        prefix="layers.0.proj",
+        quant_type=QuantType.per_1x32,
+        params_dtype=torch.float4_e2m1fn_x2,
+        quant_config=SimpleNamespace(get_layer_quant_config=lambda *_a, **_k: target),
+    )
+    with pytest.raises(ValueError, match="MXFP4 linear"):
+        linear.LinearBase.online_quantize_weight(module)
+
+
 def test_online_requantized_source_drops_the_native_layout(linear_modules):
     """MiniMax-M3-MXFP8's attention linears, which online quant overwrites.
 
@@ -77,8 +107,17 @@ def test_online_requantized_source_drops_the_native_layout(linear_modules):
     assert module.weight_scale.shape == (256, 4)
 
 
+def _skip_without_ocp_fp8():
+    """No native MXFP8 layout where the platform FP8 is E4M3FNUZ."""
+    from aiter import dtypes
+
+    if dtypes.fp8 != torch.float8_e4m3fn:
+        pytest.skip("the platform FP8 is E4M3FNUZ: no native MXFP8 layout")
+
+
 def test_online_excluded_source_keeps_the_native_layout(linear_modules):
     linear, group = linear_modules
+    _skip_without_ocp_fp8()
     group.world_size = 1
     module = linear.ColumnParallelLinear(
         128,
@@ -92,6 +131,7 @@ def test_online_excluded_source_keeps_the_native_layout(linear_modules):
 
 def test_online_requantized_32x32_source_still_rejected(linear_modules):
     linear, group = linear_modules
+    _skip_without_ocp_fp8()
     group.world_size = 1
     with pytest.raises(ValueError, match="Native group32 A8"):
         linear.ColumnParallelLinear(
@@ -119,20 +159,88 @@ def test_parallel_source_slices_and_scale_alignment(linear_modules, kind):
         module.weight_loader(module.weight, weight)
         module.weight_loader(module.weight_scale, scales)
         module.process_weights_after_loading()
+        shard = weight.chunk(4, axis)[rank].contiguous()
+        scale_shard = scales.chunk(4, axis)[rank]
+        if linear.native_group32_runs_bf16():
+            # Dequantized to BF16 at load, scales folded in.
+            block_scale = scale_shard.float().repeat_interleave(32, 0)
+            expected = shard.float() * block_scale.repeat_interleave(32, 1)
+            assert module.weight.dtype == torch.bfloat16
+            assert torch.equal(module.weight.float(), expected.bfloat16().float())
+            assert module.weight_scale is None
+            continue
         # The shard's bytes, (16, 16)-shuffled where the preshuffled group32
         # GEMM reads it (gfx950); the compact scales stay as loaded.
         preshuffled = linear.weight_is_stored_preshuffled(
             module.quant_type, module.params_dtype, native_group_rows=32
         )
-        shard = weight.chunk(4, axis)[rank].contiguous()
         if preshuffled:
             shard = shuffle_weight(shard, layout=(16, 16))
         assert torch.equal(module.weight.view(torch.uint8), shard.view(torch.uint8))
         assert torch.equal(
-            module.weight_scale.view(torch.uint8),
-            scales.chunk(4, axis)[rank].view(torch.uint8),
+            module.weight_scale.view(torch.uint8), scale_shard.view(torch.uint8)
         )
         assert getattr(module.weight, "is_shuffled", False) == preshuffled
+
+
+@pytest.mark.parametrize("kind", ["ColumnParallelLinear", "RowParallelLinear"])
+def test_per_channel_source_slices_with_its_row_scales(
+    linear_modules, per_channel_config, kind
+):
+    """OCP FP8 with one F32 scale an output row: a column-parallel rank keeps
+    its rows' scales, a row-parallel one all of them, and whatever FP8 type
+    and layout the GEMM stores the weight in, weight times scale is the
+    source's."""
+    from atom.mono.weights.layer import _unshuffle_linear_weight
+
+    linear, group = linear_modules
+    torch.manual_seed(7)
+    weight = torch.randn(512, 128).to(torch.float8_e4m3fn)
+    scales = torch.rand(512, 1) + 0.5
+    axis = 0 if kind == "ColumnParallelLinear" else 1
+    for rank in range(4):
+        group.rank_in_group = rank
+        module = getattr(linear, kind)(128, 512, quant_config=per_channel_config)
+        module.weight_loader(module.weight, weight)
+        module.weight_loader(module.weight_scale, scales)
+        module.process_weights_after_loading()
+        shard = weight.chunk(4, axis)[rank]
+        scale_shard = scales.chunk(4, 0)[rank] if axis == 0 else scales
+        stored = _unshuffle_linear_weight(module.weight)
+        assert not module.is_output_padded
+        assert torch.equal(
+            stored.float() * module.weight_scale.float(), shard.float() * scale_shard
+        )
+
+
+def test_per_channel_linear_restores_leading_dims(
+    linear_modules, per_channel_config, monkeypatch
+):
+    """The per-token quant and the a8w8 GEMM take rows: a (B, T, K) input and
+    its (B, T, 1) scale reach them as B * T rows, and the result comes back in
+    (B, T, N)."""
+    linear, group = linear_modules
+    group.world_size = 1
+    module = linear.ReplicatedLinear(256, 512, quant_config=per_channel_config)
+    seen = []
+
+    def quant(x, quant_dtype, scale=None):
+        seen.append(("quant", tuple(x.shape)))
+        return x, torch.ones(x.shape[0], 1)
+
+    def gemm(x, weight, x_scale, weight_scale, dtype=None):
+        seen.append(("gemm", tuple(x.shape), tuple(x_scale.shape)))
+        return torch.arange(x.shape[0] * 512.0).view(x.shape[0], 512)
+
+    module.quant_func = quant
+    monkeypatch.setattr(linear, "use_triton_gemm", lambda: False)
+    monkeypatch.setattr(linear, "gemm_a8w8_bpreshuffle", gemm)
+    rows = torch.arange(6 * 512.0).view(6, 512)
+    assert torch.equal(module(torch.randn(2, 3, 256)), rows.view(2, 3, 512))
+    assert seen == [("quant", (6, 256)), ("gemm", (6, 256), (6, 1))]
+    seen.clear()
+    module(torch.randn(2, 3, 256), torch.ones(2, 3, 1))
+    assert seen == [("gemm", (6, 256), (6, 1))]
 
 
 @pytest.mark.parametrize("shard_ids", [None, (0, 1)])
@@ -187,12 +295,8 @@ def test_column_row_views_use_source_scale_groups(linear_modules):
         module.make_row_view(16, 64)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-def test_native_linear_dispatch_keeps_a8_qat(linear_modules, monkeypatch):
-    from . import oracle_kernels as oracle
-
-    linear, group = linear_modules
-    group.world_size = 1
+def _native_dispatch_case(linear, monkeypatch):
+    """A 288 -> 96 native 32x32 FP8 linear, a BF16 input and its FP32 weight."""
     # FP32 output is the row-major group32 GEMM's; the preshuffled one emits BF16.
     monkeypatch.setenv("ATOM_GROUP32_WEIGHT_PRESHUFFLE", "0")
     torch.manual_seed(991)
@@ -203,11 +307,23 @@ def test_native_linear_dispatch_keeps_a8_qat(linear_modules, monkeypatch):
     module.weight_loader(module.weight_scale, scale)
     module.process_weights_after_loading()
     x = torch.randn(5, 288, dtype=torch.bfloat16)
-    q, s = oracle.act_quant(x, 32, "ue8m0", torch.float8_e8m0fnu)
-    activation = (q.float().reshape(5, 9, 32) * s.float()[:, :, None]).reshape(5, 288)
     full_weight = weight.float() * scale.float().repeat_interleave(
         32, 0
     ).repeat_interleave(32, 1)
+    return module, x, full_weight
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+def test_native_linear_dispatch_keeps_a8_qat(linear_modules, monkeypatch):
+    from . import oracle_kernels as oracle
+
+    linear, group = linear_modules
+    if linear.native_group32_runs_bf16():
+        pytest.skip("no group32 FP8 GEMM here; see test_native_linear_bf16_fallback")
+    group.world_size = 1
+    module, x, full_weight = _native_dispatch_case(linear, monkeypatch)
+    q, s = oracle.act_quant(x, 32, "ue8m0", torch.float8_e8m0fnu)
+    activation = (q.float().reshape(5, 9, 32) * s.float()[:, :, None]).reshape(5, 288)
     expected = torch.nn.functional.linear(activation, full_weight)
     # Bound tied to the output magnitude; see test_quant_gpu for why the
     # native microscaling MFMA cannot be held to a per-element rtol.
@@ -216,6 +332,40 @@ def test_native_linear_dispatch_keeps_a8_qat(linear_modules, monkeypatch):
         expected,
         rtol=3e-5,
         atol=5e-5 * expected.abs().max().item(),
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+def test_native_linear_bf16_fallback(linear_modules, monkeypatch):
+    """Exact BF16 weight, BF16 input without the A8 rounding."""
+    linear, group = linear_modules
+    if not linear.native_group32_runs_bf16():
+        pytest.skip(
+            "group32 FP8 GEMM here; see test_native_linear_dispatch_keeps_a8_qat"
+        )
+    group.world_size = 1
+    module, x, full_weight = _native_dispatch_case(linear, monkeypatch)
+    assert module.weight_scale is None
+    assert torch.equal(module.weight.float().cpu(), full_weight)
+    # A later weight update (a rollout sync) loads through the BF16 weight.
+    module.weight_loader(module.weight, 2 * full_weight)
+    assert torch.equal(module.weight.float().cpu(), 2 * full_weight)
+    module.weight_loader(module.weight, full_weight)
+
+    def reached(*_args, **_kwargs):
+        raise AssertionError("a BF16 weight reached the shuffle decision")
+
+    # A second call returns as the first did.
+    monkeypatch.setattr(linear, "weight_is_stored_preshuffled", reached)
+    module.process_weights_after_loading()
+    assert torch.equal(module.weight.float().cpu(), full_weight)
+    expected = torch.nn.functional.linear(x.float(), full_weight)
+    # BF16 operands, so only the GEMM's own rounding is left: a few BF16 ulps.
+    torch.testing.assert_close(
+        module(x.cuda(), otype=torch.float32).cpu(),
+        expected,
+        rtol=2**-7,
+        atol=1e-3 * expected.abs().max().item(),
     )
 
 

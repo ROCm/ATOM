@@ -10,7 +10,7 @@ import torch
 import triton
 import triton.language as tl
 
-from atom.config import _is_minimax_m3_config
+from atom.config import _is_minimax_m3_config, kv_cache_torch_dtype
 from atom.distributed.ulysses_sp import local_num_kv_heads
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
@@ -437,8 +437,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         a second geometry sharing one block-id space, which is what sizing
         summed for it all along. Nothing here asks which model it is.
         """
-        from aiter import dtypes
-
         runner = self.model_runner
         # `INDEX_ROWS` is a row space, not a pool: the indexer keys ride the
         # first geometry's pool, since declaring them per pool would charge for
@@ -464,13 +462,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 blocks_per_entry=self.block_ratio,
                 num_kv_heads=geometry.num_kv_heads,
                 head_dim=geometry.head_dim,
-                # An MXFP4 layout declares its own bytes (uint8 pages); the dtype
-                # is read only by the dtype-wide cache, which `fp4` is not.
-                kv_dtype=(
-                    torch.uint8
-                    if geometry.layout is not None
-                    else dtypes.d_dtypes[runner.config.kv_cache_dtype]
-                ),
+                # An FP4 (MXFP4 / NVFP4) layout declares its own bytes (uint8 pages);
+                # the dtype is read only by the dtype-wide cache, which FP4 is not.
+                kv_dtype=kv_cache_torch_dtype(runner.config.kv_cache_dtype),
                 extra_fields=extra_fields,
                 layout=geometry.layout,
             )
@@ -487,7 +481,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         """
         if not self._has_sparse_attention:
             return None
-        from aiter import dtypes
 
         config = self.model_runner.config
         text_config = getattr(config.hf_config, "text_config", config.hf_config)
@@ -508,11 +501,26 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # the one geometry check of an MXFP4 page, as the K / V layout makes it
             Mxfp4KvLayout().check(self.block_size, dim, entry_tokens // self.block_size)
             return _IndexCacheSpec(rows, (PAGE_BYTES,), torch.uint8, (-1, PAGE_BYTES))
+        if index_dtype == "nvfp4":
+            from atom.model_ops.minimax_m3.nvfp4_pages import (
+                HEAD_DIM,
+                INDEX_PAGE_BYTES,
+            )
+
+            if dim != HEAD_DIM or entry_tokens != self.block_size:
+                raise ValueError(
+                    "the NVFP4 index cache is 128-wide keys, one block an entry; "
+                    f"got dim {dim}, {entry_tokens} tokens an entry"
+                )
+            return _IndexCacheSpec(
+                rows, (INDEX_PAGE_BYTES,), torch.uint8, (-1, INDEX_PAGE_BYTES)
+            )
         if index_dtype not in ("bf16", "fp8"):
             raise ValueError(
-                f"index_cache_dtype must be 'bf16', 'fp8' or 'fp4', got {index_dtype!r}"
+                "index_cache_dtype must be 'bf16', 'fp8', 'fp4' or 'nvfp4', got "
+                f"{index_dtype!r}"
             )
-        dtype = dtypes.d_dtypes[index_dtype]
+        dtype = kv_cache_torch_dtype(index_dtype)
         return _IndexCacheSpec(
             rows,
             (entry_tokens * dim * dtype.itemsize,),
@@ -594,7 +602,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # the layout has scale planes): page-128 SHUFFLE, which
             # SparseMHAPagedAttentionImpl.rope_cache re-views as page-16 at attention
             # time; under `--kv-cache-dtype fp4`, scale-less MXFP4 pages (8704 B a page
-            # and kv head) used as they are. Only the separate indexer-key cache is
+            # and kv head), under `nvfp4` NVFP4 pages (data and scales in one buffer,
+            # 18432 B a page and kv head), used as they are. Only the separate
+            # indexer-key cache is
             # bound here; each sparse layer has its own row in that second space.
             runner = self.model_runner
             pool = next(p for p in self.kv_pools.values() if p.extra_fields)
@@ -623,11 +633,22 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         row = self.pool_rows[geometry][module]
 
         k_cache, v_cache = pool.kv_views(row)
-        # A layout with scale planes hands them over; an MXFP4 pool has none, its
-        # pages carry their own (the sparse impl takes the (data, scale) views of
-        # them, mxfp4_pages.page_views).
+        # A layout with scale planes hands them over; an FP4 (MXFP4 / NVFP4) pool has
+        # none, its pages carry their own (the sparse impl takes the (data, scale)
+        # views of them, mxfp4_pages.page_views).
         if pool.scale_fields:
             module.k_scale, module.v_scale = pool.scale_views(row)
+
+        if config.kv_cache_dtype == "nvfp4" and _is_indexed_sparse_attention(module):
+            # The layer's fp32 global K / V scale, one element each, outside the
+            # page. 1.0: the M3.1 checkpoint carries no k_scale / v_scale and vLLM's
+            # default is the same; the kernels take whatever value is here.
+            module.impl.nvfp4_k_scale = torch.ones(
+                1, dtype=torch.float32, device=k_cache.device
+            )
+            module.impl.nvfp4_v_scale = torch.ones(
+                1, dtype=torch.float32, device=k_cache.device
+            )
 
         module.max_model_len = config.max_model_len
         module.k_cache = k_cache
@@ -655,7 +676,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
     @staticmethod
     def _index_cp_shard() -> tuple[int, int]:
         """This rank's indexer-CP ``(world, rank)``, ``(1, 0)`` without CP: under it the
-        MXFP4 decode scorer runs every index head over the rank's 1/P of the blocks."""
+        FP4 decode scorer runs every index head over the rank's 1/P of the blocks."""
         from atom.distributed.indexer_cp import (
             get_indexer_cp_rank,
             get_indexer_cp_world_size,
@@ -960,6 +981,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 num_prefill_tokens=batch.scheduled_tokens,
                 num_idx_heads=self._num_idx_heads,
                 index_scorer=self._index_scorers.get(""),
+                nvfp4_kv=self.model_runner.config.kv_cache_dtype == "nvfp4",
             )
 
     def _refuse_ragged_on_rectangular_layers(
@@ -1096,15 +1118,15 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # Plain decode (q==1) and eagle3 spec-verify (q==num_spec+1) both run
             # the DECODE sparse path; the decode kernels handle q>1 per-token
             # causal internally via max_query_len.
-            # The MXFP4 scorer takes its batch off the rows of idx_q, which a DP step
+            # The FP4 scorer takes its batch off the rows of idx_q, which a DP step
             # can make more or fewer than `running_bs * q`; `_sparse_decode` slices q /
             # idx_q to this batch. The other index caches keep the padded batch.
             index_bs = running_bs
-            if "" in self._index_scorers:  # the MXFP4 index cache
+            if "" in self._index_scorers:  # an FP4 (MXFP4 / NVFP4) index cache
                 index_bs = min(running_bs, running_tokens // max_seqlen_q)
                 if index_bs < batch.total_seqs_num_decode:
                     raise ValueError(
-                        f"MXFP4 index decode: {running_tokens} rows of {max_seqlen_q} "
+                        f"FP4 index decode: {running_tokens} rows of {max_seqlen_q} "
                         f"query tokens do not cover the {batch.total_seqs_num_decode} "
                         "scheduled requests"
                     )
