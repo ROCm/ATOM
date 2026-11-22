@@ -1,0 +1,10 @@
+{
+  "purpose": "Prevent duplicate PR5090 A/B workload after the timed-out workflow",
+  "jobs": [
+    {
+      "job_id": "29577",
+      "job_name": "pr5090-router-ab-pr5090-c40-router-ab-vllm-44515834708-1",
+      "run_id": "44515834708"
+    }
+  ]
+}

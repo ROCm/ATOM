@@ -2,10 +2,14 @@
   "source": {
     "repo": "SemiAnalysisAI/InferenceX",
     "pr": 5090,
-    "sha": "a269a4299e3761d54b6fbc09f0ce31ca84129f29",
+    "sha": "7785faa2c9b342ec632b03fc4a279f9248304f3a",
     "recipe": "inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/minimaxm31flash/vllm/mi355x-fp4/agentx/disagg-mooncake-variants.yaml",
     "variant": "override_c40",
-    "recipe_sha256": "fb1625c2b79748c4fb26c91dbdda5120f4e52f304dfd1f898b27e59bd0f796c2"
+    "recipe_sha256": "fb1625c2b79748c4fb26c91dbdda5120f4e52f304dfd1f898b27e59bd0f796c2",
+    "recipe_blob": "082c20636e54a30769fcbeb4abde68738255ce43",
+    "setup_blob": "150c0bc947bf37c7a9d981e77d9d0426a3124da2",
+    "master_blob": "2b0978eb6d820cb95e0b7284587355e0ee4bb8bc",
+    "client_requirements_blob": "2d791859312637304d51430825582f4f1ee8a533"
   },
   "image": "vllm/vllm-openai-rocm:minimax-m31-flash-75bc8cf1@sha256:f8e8ab239e5edb7c3070c5802fc7fc0cbb889513bf81183dfc98ce1c77e1dfe1",
   "model": "amd/MiniMax-M3.1-Flash-Quark-MXFP4",
@@ -158,5 +162,11 @@
   "router_policy": {
     "baseline": "consistent_hash",
     "atomesh": "dp_sticky"
+  },
+  "deployment": {
+    "memlock": "unlimited soft and hard in both worker arms",
+    "slurm_time_limit": "08:00:00",
+    "workflow_timeout_minutes": 960,
+    "scheduler_admission": "previous job 29577 must be absent before sbatch"
   }
 }

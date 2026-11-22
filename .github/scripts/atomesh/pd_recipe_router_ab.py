@@ -3,12 +3,12 @@
 import argparse
 import json
 import os
-from pathlib import Path
 import re
 import subprocess
 import sys
 import time
 import urllib.request
+from pathlib import Path
 
 
 def worker_plan(contract, role, model_path, port, host, gpus, inherited):
@@ -296,9 +296,20 @@ def main():
     for key in ("HIP_VISIBLE_DEVICES", "VLLM_HOST_IP", "VLLM_MOONCAKE_BOOTSTRAP_PORT"):
         if key in env:
             declared[key] = env[key]
+    import resource
+
+    limits = {
+        "memlock_soft_hard_bytes": list(resource.getrlimit(resource.RLIMIT_MEMLOCK))
+    }
     Path(args.output).write_text(
         json.dumps(
-            {"argv": argv, "env": declared, "source": contract["source"]}, indent=2
+            {
+                "argv": argv,
+                "env": declared,
+                "source": contract["source"],
+                "limits": limits,
+            },
+            indent=2,
         )
     )
     os.execvpe(argv[0], argv, env)

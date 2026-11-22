@@ -370,6 +370,14 @@ PY
 fi
 
 mkdir -p "${LOG_ROOT}"
+if [[ "${ATOMESH_ENV_ATOMESH_PR5090_ROUTER_AB:-0}" == "1" ]]; then
+  # Admission for the real A/B workload, before sbatch: never overlap an orphaned run.
+  python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_spur_allocation.py" check-previous \
+    --controller "${SPUR_CONTROLLER_ADDR}" \
+    --previous-manifest "${REPO_ROOT}/.github/benchmark/pr5090-router-ab/previous-spur-jobs.json" \
+    --output "${RESULT_DIR}/${ATOMESH_CELL_ID}.previous-job-check.json"
+fi
+
 if [[ -n "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" ]]; then
   # Archived logs may be reclaimed; admission uses fresh scheduler state.
   c48_previous_manifest="${REPO_ROOT}/.github/benchmark/c48-model-gap/previous-spur-jobs.json"
