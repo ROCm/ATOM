@@ -3846,6 +3846,11 @@ def main():
         parser.error("--grpc-port needs --api-server-count 1")
 
     _setup_frontend(args)
+    if args.grpc_port is not None:
+        from atom.entrypoints.grpc.server import startup_refusal
+
+        if (refusal := startup_refusal(tokenizer)) is not None:
+            parser.error(refusal)
 
     logger.info(f"Initializing engine with model {args.model}...")
     engine_args = EngineArgs.from_cli_args(args)

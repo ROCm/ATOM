@@ -5,6 +5,7 @@
 import asyncio
 import itertools
 import json
+import sys
 import threading
 from types import SimpleNamespace
 
@@ -15,6 +16,7 @@ from atom.entrypoints.grpc import frames
 from atom.entrypoints.grpc.server import AtomEngineServicer
 from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.protocol import DEFAULT_MAX_TOKENS
+from atom.entrypoints.openai.reasoning_dialects import FALLBACK_DIALECT
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.zmq_protocol import engine_v1_pb2 as v1
 from atom.sampling_params import SamplingParams
@@ -37,6 +39,7 @@ class FakeEngine:
             max_pool_tokens=None,
         )
         self.running = {}  # submitted seqs no step has ended
+        self.grammars = []  # the SamplingParams each structured request prepared
         self.preprocessed, self.submitted = [], []
         self.release = threading.Event()
         self.release.set()
@@ -63,6 +66,9 @@ class FakeEngine:
             self.flush()
         if not self.steps or self.steps[-1][1] is None:
             self.running.update((seq.id, seq) for seq in seqs)
+
+    def prepare_structured_request(self, params, kv_transfer, multimodal):
+        self.grammars.append(params)
 
     def abort_request(self, seq_id):
         """As the engine aborts a running seq: a terminal output at its next step."""
@@ -321,3 +327,124 @@ def test_abort_during_submission_aborts_the_request_once_submitted(serve, monkey
     written = _generate(servicer, stream=True)
     assert written[-1].complete.finish_reason == "aborted"
     assert engine.running == {} and engine.io_processor.requests == {}
+
+
+SCHEMA = {"type": "object", "properties": {"a": {"type": "integer"}}}
+RESPONSE_FORMAT = json.dumps(
+    {"type": "json_schema", "json_schema": {"name": "s", "schema": SCHEMA}}
+)
+
+
+@pytest.fixture
+def chat(serve, monkeypatch):
+    """`serve` with the chat route's startup state: no reasoning switch, no tool
+    parser, the fallback dialect."""
+    for name, value in {
+        "reasoning_dialect": FALLBACK_DIALECT,
+        "reasoning_toggle": None,
+        "model_starts_in_reasoning": False,
+        "required_tool_channel": None,
+        "tool_call_parser_cls": None,
+        "synthetic_token_text": None,
+        "tokenizer": SimpleNamespace(),
+    }.items():
+        monkeypatch.setattr(api_server, name, value)
+    return serve
+
+
+def _prepare(servicer, structured, **fields):
+    request = pb.PrepareStructuredOutputRequest(structured_output=structured, **fields)
+    return asyncio.run(servicer.PrepareStructuredOutput(request, None))
+
+
+def test_prepare_answers_a_response_schema_as_the_chat_route_derives_it(chat):
+    engine = FakeEngine()
+    structured = pb.StructuredOutput(response_format_json=RESPONSE_FORMAT)
+    answer = _prepare(chat(engine), structured).sampling
+    assert json.loads(answer.json_schema) == SCHEMA
+    assert answer.structured_reasoning_end == ""
+    assert len(engine.grammars) == 1  # each rank's grammar prepared
+
+
+def test_a_prompt_opening_reasoning_suspends_the_grammar_until_its_end(chat):
+    structured = pb.StructuredOutput(
+        response_format_json=RESPONSE_FORMAT, prompt_opens_reasoning=True
+    )
+    answer = _prepare(chat(FakeEngine()), structured).sampling
+    assert answer.structured_reasoning_end == FALLBACK_DIALECT.think_end_marker
+
+
+def test_generate_admits_a_chat_with_the_fields_prepare_answers(chat):
+    engine = FakeEngine([([5], "eos")])
+    structured = pb.StructuredOutput(response_format_json=RESPONSE_FORMAT)
+    written = _generate(chat(engine), structured_output=structured)
+    assert written[-1].complete.finish_reason == "eos"
+    params = engine.preprocessed[0][1]
+    assert json.loads(params.json_schema) == SCHEMA
+    assert engine.submitted and engine.io_processor.requests == {}
+
+
+def test_message_declared_tools_reach_the_tool_call_grammar(chat, monkeypatch):
+    seen = {}
+
+    async def tool_call_grammar(engine, config, params, channel, **kwargs):
+        seen.update(kwargs)
+
+    monkeypatch.setattr(api_server, "tool_call_parser_cls", object)
+    monkeypatch.setattr(api_server, "configure_tool_call_grammar", tool_call_grammar)
+    top = {"type": "function", "function": {"name": "top", "parameters": {}}}
+    declared = {"type": "function", "function": {"name": "own", "parameters": {}}}
+    structured = pb.StructuredOutput(
+        tools_json=json.dumps([top]), message_tools_json=json.dumps([None, [declared]])
+    )
+    _prepare(chat(FakeEngine()), structured)
+    names = [tool["function"]["name"] for tool in seen["tools"]]
+    assert sorted(names) == ["own", "top"]
+
+
+@pytest.mark.parametrize(
+    "fields, message",
+    [
+        ({"sampling": v1.SamplingParams(ignore_eos=True)}, "ignore_eos"),
+        (
+            {"stop_token_sequences": [v1.TokenIds(ids=[7])]},
+            "custom stop strings",
+        ),
+        ({"sampling": v1.SamplingParams(top_logprobs=2)}, "top_logprobs requires"),
+    ],
+)
+def test_prepare_refuses_what_the_chat_route_refuses_with_a_400(chat, fields, message):
+    engine = FakeEngine()
+    structured = pb.StructuredOutput(response_format_json=RESPONSE_FORMAT)
+    error = _prepare(chat(engine), structured, **fields).error
+    assert error.http_status == 400 and message in error.message
+    assert engine.grammars == []
+
+
+def test_chat_template_kwargs_must_be_an_object(chat):
+    structured = pb.StructuredOutput(chat_template_kwargs_json="[]")
+    error = _prepare(chat(FakeEngine()), structured).error
+    assert (error.http_status, error.message) == (
+        400,
+        "chat_template_kwargs must be an object",
+    )
+
+
+def test_grpc_port_refuses_a_tokenizer_with_named_chat_templates(monkeypatch, capsys):
+    templates = {"default": "{{ messages }}", "tool_use": "{{ tools }}"}
+
+    def frontend(args):
+        monkeypatch.setattr(
+            api_server, "tokenizer", SimpleNamespace(chat_template=templates)
+        )
+
+    def no_engine(*args, **kwargs):
+        raise AssertionError("the engine started")
+
+    monkeypatch.setattr(api_server, "_setup_frontend", frontend)
+    monkeypatch.setattr(api_server.EngineArgs, "from_cli_args", no_engine)
+    monkeypatch.setattr(sys, "argv", ["atom", "--model", "m", "--grpc-port", "1"])
+    with pytest.raises(SystemExit):
+        api_server.main()
+    error = capsys.readouterr().err
+    assert "(default, tool_use); pick one with --chat-template" in error
