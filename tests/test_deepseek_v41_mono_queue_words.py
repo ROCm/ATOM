@@ -37,11 +37,25 @@ def test_no_build_lays_a_queue_word_out_in_the_scratch(rows, tp, bound):
     assert not set(k2b.QUEUES) & set(layout)
 
 
+CACHE_LINE = 128
+
+
 def test_each_launch_owns_its_queue_words():
-    span = len(k2b.QUEUES) * 4
-    # every tag a launch can take, the last one too
+    # every tag a launch can take, the last one too: a word a queue region
     starts = [
         k2b.queue_offset(MOE_TAG0 + layer) for layer in range(k2b.TAGS - MOE_TAG0)
     ]
-    assert all(b - a >= span for a, b in itertools.pairwise(starts))
-    assert starts[-1] + span <= k2b.QUEUE_BYTES
+    assert all(b - a >= 4 for a, b in itertools.pairwise(starts))
+    assert starts[-1] + 4 <= k2b.QUEUE_REGION
+    last = starts[-1] + (len(k2b.QUEUES) - 1) * k2b.QUEUE_REGION
+    assert last + 4 <= k2b.QUEUE_BYTES
+
+
+def test_a_launchs_queue_words_sit_in_separate_cache_lines():
+    # its CTAs' atomics on one queue do not contend with the others'
+    for layer in range(k2b.TAGS - MOE_TAG0):
+        base = k2b.queue_offset(MOE_TAG0 + layer)
+        lines = {
+            (base + i * k2b.QUEUE_REGION) // CACHE_LINE for i in range(len(k2b.QUEUES))
+        }
+        assert len(lines) == len(k2b.QUEUES)

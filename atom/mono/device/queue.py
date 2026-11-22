@@ -19,10 +19,12 @@ from flydsl.expr.typing import T
 from atom.mono.device.ops import traced
 
 
-def tag_offset(layer: int, words: int = 1) -> int:
-    """The byte offset of the launch ``layer``'s ``words`` queue words (its
-    tag's, ``Mailbox``: ``layer`` + 1) in a queue array a tag."""
-    return (layer + 1) * words * 4
+def tag_offset(layer: int) -> int:
+    """The byte offset of the launch ``layer``'s queue word (its tag's,
+    ``Mailbox``: ``layer`` + 1) in a queue's array, a word a tag. A kernel's
+    queues each an array of their own: one launch's words packed together
+    share a cache line its CTAs' atomics contend for."""
+    return (layer + 1) * 4
 
 
 def word(addr):

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """DeepSeek-V4.1's high-interactivity (hi) monokernels inside ATOM's V4.1 mono decode
 (``ATOM_DSV41_MONO_HI``, MI355X / gfx950, TP2, TP4 or TP8).
 
@@ -70,11 +71,9 @@ and the exact cross-rank argmax with ATOM's rule: the bf16 logit, ties to the
 lowest id) runs right after the last layer inside the target graph, its weights
 packed from ATOM's own ``model.norm.weight`` / ``model.head.weight``. Its ids
 land in a persistent int32 buffer (``head_ids``) that the in-graph post-verify
-(``round.post_verify``) turns into the verify's output ids and verdict: the
-forward's head output (``HiDecodeModel.compute_head``), which ATOM's runner
-takes instead of logits on the verify steps that read nothing but each row's
-pick. It samples (the hi runtime's ``head_blocks(sample=True)``): per row,
-temperature 0 takes the greedy pick, else one draw of softmax(bf16 logits / T)
+(``round.post_verify``) turns into the verify's output ids and spec status
+(``HiLayers.token_ids``). It samples (the hi runtime's
+``head_blocks(sample=True)``): per row, temperature 0 takes the greedy pick, else one draw of softmax(bf16 logits / T)
 in ATOM's top-p nucleus, the rows with top_p >= 1 drawn in the dot epilogue
 (``race``); Philox counters keyed by the seed, the launch tag, the row and the
 id (the same draw on every rank). The rows' (T, top_p) are a persistent buffer
@@ -173,8 +172,6 @@ class HiLayers(HiDraft, HiPrograms):
         # hook's path at (a capture's included), the builder's lean-step test
         self.runs_every_layer = True
         self.lean_host, self.served_widths, self.lean_steps = False, set(), 0
-        # the rows of this forward's in-graph verify (``end_step``; 0: none), its head output (``head_output``)
-        self.verified = 0
         dev = self.dev = torch.device("cuda", torch.cuda.current_device())
         # (a band's programs: the band's rows)
         R, H = max(self.pwidth(s) for s in self.widths), cfg.hidden_size
@@ -608,11 +605,18 @@ class HiLayers(HiDraft, HiPrograms):
         self.par_last[:] = self.par_work
         return True
 
-    def head_output(self, rows: int):
-        """The head output of the forward that just ran on the host (an eager step, or the one a graph capture
-        records; ``HiDecodeModel.compute_head``): its in-graph verify's output ids and verdict at width ``rows``
-        (``post_verify``), or None when it ran none."""
-        if self.pv is None or self.verified != rows:
+    def token_ids(self, metadata, rows: int):
+        """The in-graph verify's output ids and spec status at width ``rows`` (``post_verify``; eager, or replayed
+        with the target graph) of the step ``metadata`` lays out, None where that step ran none: one the round did
+        not serve (``served_by_round``), or not a verify of every request's full span at a width it launched at.
+        """
+        if (
+            self.pv is None
+            or rows not in self.pv.launched
+            or not metadata.served_by_round
+        ):
+            return None
+        if metadata.step.max_q_len != self.split[rows][1]:
             return None
         return self.pv.output(rows)
 
@@ -896,9 +900,8 @@ class HiLayers(HiDraft, HiPrograms):
         self._end_step(cache, step, rows)
         self._ctx_after_target(cache, step, rows)
         if self.pv is not None and step.max_q_len == self.split[rows][1]:
-            # the verdict and commit in the graph (``post_verify``): the forward's head output (``head_output``)
+            # the verify and commit in the graph (``post_verify``): the step's token ids (``token_ids``)
             self.pv.launch(self, cache, step, rows)
-            self.verified = rows
 
     def _end_step(self, cache, step, rows: int) -> None:
         taps = self._taps()

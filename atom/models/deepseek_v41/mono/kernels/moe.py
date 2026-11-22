@@ -180,16 +180,19 @@ TAGS = 256  # mailbox tags (a layer's K1 / K2a / K2b each own one)
 # not the scratch's: the layer builds of a step lay the scratch out apart, and
 # one build's pairs at another's queue offset start its count past zero.
 QUEUES = ("ugq", "dq", "dnq")
-# tag t's words at ``queue.tag_offset(t)`` (t + 1 slots in): TAGS + 1 slots,
+# a queue's words, TAGS + 1 slots (tag t's at ``queue.tag_offset(t)``): one
+# region a queue, so a launch's three words sit in three cache lines, not one
+# its CTAs' atomics on all three contend for
+QUEUE_REGION = (TAGS + 1) * 4
 # in the step zeroing's 16 B stores
-QUEUE_BYTES = -(-len(QUEUES) * (TAGS + 1) * 4 // 16) * 16
+QUEUE_BYTES = -(-len(QUEUES) * QUEUE_REGION // 16) * 16
 
 
 def queue_offset(layer: int) -> int:
-    """The byte offset of the launch ``layer``'s words in the queue words
-    (``queue.tag_offset``): the launch is handed their address
-    (``queue_words``)."""
-    return queue.tag_offset(layer, len(QUEUES))
+    """The byte offset of the launch ``layer``'s word in the first queue's
+    region (``queue.tag_offset``): the launch is handed its address
+    (``queue_words``), queue i's ``i * QUEUE_REGION`` on."""
+    return queue.tag_offset(layer)
 
 
 XQ0 = 0
@@ -1037,7 +1040,7 @@ def take_ug_task(c):
 def take_launch_queue(c, name):
     """This launch's word of queue ``name`` (``QUEUES``, from the launch's
     ``queue_words``: ``queue_offset``), taken for the whole CTA."""
-    at = c["args"]["queue_words"] + fx.Int64(QUEUES.index(name) * 4)
+    at = c["args"]["queue_words"] + fx.Int64(QUEUES.index(name) * QUEUE_REGION)
     return queue.take_shared(queue.word(at), c["tab"] + c["rs"].queue0, c["tid"])
 
 

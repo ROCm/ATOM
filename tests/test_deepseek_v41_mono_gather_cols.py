@@ -30,14 +30,38 @@ def M():
             _drop(name)
 
 
+def _settle_past_a_wave(cg, state, taps, tp) -> bool:
+    """A settle whose (row, quad) pushes span more than one wave (refused)."""
+    lanes = cg.THREADS // cg.WAVES
+    return state == cg.State.SETTLE and lanes % ((cg.HC + taps) * tp) != 0
+
+
 def builds(cg):
     for state in cg.State:
         for taps in range(cg.MAX_TAPS + 1):
             if state == cg.State.NONE and taps == 0:
                 continue
             for tp in (2, 4, 8):
+                if _settle_past_a_wave(cg, state, taps, tp):
+                    continue
                 for rows in (1, 6, 11, 48):
                     yield cg.ColGatherBuild(rows=rows, taps=taps, state=state, tp=tp)
+
+
+def test_a_settle_past_one_wave_is_refused(M):
+    """SETTLE lands into the residual its pushes read: only where a (row,
+    quad)'s pushes are one wave's lanes, every one reads before a land."""
+    cg = M.cg
+    refused = [
+        (taps, tp)
+        for taps in range(cg.MAX_TAPS + 1)
+        for tp in (2, 4, 8)
+        if _settle_past_a_wave(cg, cg.State.SETTLE, taps, tp)
+    ]
+    assert refused and (0, 8) not in refused  # the runner's settle builds
+    for taps, tp in refused:
+        with pytest.raises(AssertionError, match="past one wave"):
+            cg.ColGatherBuild(rows=6, taps=taps, state=cg.State.SETTLE, tp=tp)
 
 
 def test_every_column_is_pushed_to_every_rank_once(M):

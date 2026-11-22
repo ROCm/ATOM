@@ -39,11 +39,8 @@ from atom.model_ops.deepseek_v41.index_plane import FP4_MFMA
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState, initial_pre_mix
 from atom.model_ops.embed_head import VocabParallelEmbedding
 from atom.model_ops.peer_embedding import shared_peer_embedding
-from atom.model_ops.rejection_sampler import (
-    _SYNTHETIC_RNG_BASE_SEED,
-    _get_synthetic_cond_rates,
-)
 from atom.model_ops.v4_kernels.paged_decode import LOG2E
+from atom.model_ops.verify_ids import IdVerifiers
 from atom.models.deepseek_v41.config import AttentionMode
 from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
 from atom.models.deepseek_v41.mono import index_plan as ip
@@ -59,7 +56,7 @@ from atom.models.deepseek_v41.mono.compress_launch import MonoCompressor
 from atom.models.deepseek_v41.mono.config import MAX_MOE_ROWS, MAX_ROWS
 from atom.models.deepseek_v41.mono.draft_ctx_launch import MonoDraftContext
 from atom.models.deepseek_v41.mono.engram_launch import MonoEngram
-from atom.models.deepseek_v41.mono.head_launch import MonoLmHead
+from atom.models.deepseek_v41.mono.head_launch import bind_lm_head
 from atom.models.deepseek_v41.mono.kernels import attn_post as k2a
 from atom.models.deepseek_v41.mono.kernels import attn_pre as k1
 from atom.models.deepseek_v41.mono.kernels import col_gather as cg
@@ -69,7 +66,6 @@ from atom.models.deepseek_v41.mono.kernels import draft_ctx as dc
 from atom.models.deepseek_v41.mono.kernels import engram as eg
 from atom.models.deepseek_v41.mono.kernels import layer as kl
 from atom.models.deepseek_v41.mono.kernels import layer_post as k2
-from atom.models.deepseek_v41.mono.kernels import lm_head as lh
 from atom.models.deepseek_v41.mono.kernels import moe as k2b
 from atom.models.deepseek_v41.mono.kernels.dims import UG_PART, Dims, kvrow_bytes
 from atom.models.deepseek_v41.mono.kernels.index_query import (
@@ -82,6 +78,7 @@ from atom.models.deepseek_v41.mono.kernels.token_par import own_rows
 from atom.models.deepseek_v41.mono.numa_plan import numa_table
 from atom.models.deepseek_v41.mono.step_meta import KMETA, write_step_meta
 from atom.models.deepseek_v41.mono.weights import bind_model
+from atom.mono.lm_head import kernel as lk
 from atom.mono.plan.execution import BLOCKS
 from atom.mono.plan.layout import NUMA_PAGE
 from atom.mono.runtime.aux_taps import AuxTaps, bind_aux_taps
@@ -259,9 +256,11 @@ class V41MonoDecodeRunner:
     index_layout = "fp8"
 
     def __init__(
-        self, model, drafter, max_model_len: int, index_fp4: bool, outputs=None
-    ) -> None:
-        self.outputs = outputs
+        self, model, drafter, max_model_len: int, index_fp4: bool, outputs,
+        sampling,
+    ) -> None:  # fmt: skip
+        # the forward's output buffer, the step's staged (temperatures, top-p)
+        self.outputs, self.sampling = outputs, sampling
         # the indexer's widest bound: a ratio-1 layer sees every position. No
         # token's bound may exceed it (positions stay below max_model_len): its
         # selection would never reach a final level nor publish IRDY
@@ -282,6 +281,10 @@ class V41MonoDecodeRunner:
         for name in self.optional_launches:
             if not group_agree(getattr(self, name) is not None, group):
                 setattr(self, name, None)
+        if self.lm_head is not None:
+            # its own peer buffer (served only without DP attention: the
+            # group is the TP group)
+            self.lm_head.open_peers(group, self.rank)
         plain = plain_layout(self.max_rows, len(self.selecting), self.tp)
         self.peers, self._finalizer = owned_peer_buffer(
             self,
@@ -404,30 +407,26 @@ class V41MonoDecodeRunner:
             self.compressor = MonoCompressor.bind(
                 model, self.max_rows, self.kv_fp8, dev
             )
-            if self.dp == 1:
-                # DP attention shards the head over the DP ranks instead
-                spec = get_current_atom_config().speculative_config
-                rates = None if spec is None else spec.synthetic_acceptance_rates
-                self.lm_head = MonoLmHead.bind(
-                    model, self.tp, self.max_rows, dev, self._verify_rows(),
-                    None if rates is None else _get_synthetic_cond_rates(tuple(rates), dev),
-                    _SYNTHETIC_RNG_BASE_SEED,
-                )  # fmt: skip
+            if self.dp == 1 and (verifiers := self._id_verifiers(dev)) is not None:
+                # DP attention shards the head over the DP ranks instead; the
+                # launch picks a verify's ids, none without a drafter
+                self.lm_head = bind_lm_head(
+                    model, self.tp, self.max_rows, verifiers, lambda: self.step_ids
+                )
             self.engram = MonoEngram.bind(model, self.tp, self.max_rows, dev)
             self.draft_ctx = MonoDraftContext.bind(
                 _draft_of(drafter), self.tp, self.max_rows, dev
             )
         self._allocate(model.config)
 
-    @staticmethod
-    def _verify_rows():
-        """A speculative verify request's rows, for the head's greedy ids and
-        verdict (``head_launch``; forced acceptance's too); None without a
-        drafter."""
+    def _id_verifiers(self, dev):
+        """The head's verifies on its ids (``head_launch``), its draws by the
+        step's staged sampling; None without a drafter."""
         spec = get_current_atom_config().speculative_config
         if spec is None:
             return None
-        return spec.num_speculative_tokens + 1
+        temps, top_ps = self.sampling
+        return IdVerifiers.from_spec(spec, dev, lambda: temps, lambda: top_ps)
 
     def index_query(self):
         """K1's indexer query as the original scorer takes it quantized: e4m3,
@@ -835,7 +834,7 @@ class V41MonoDecodeRunner:
         kernels += [(launcher, cg.ABI) for launcher in build.gathers.values()]
         kernels += [(launcher, cp.ABI) for launcher in build.compress.values()]
         if build.head is not None:
-            kernels.append((build.head, lh.ABI))
+            kernels.append((build.head, lk.ABI))
         if build.engram is not None:
             kernels.append((build.engram, eg.ABI))
         if build.ctx is not None:
@@ -1199,20 +1198,15 @@ class V41MonoDecodeRunner:
             block.engram_forward(state.residual, None, None), state.pre_mix
         )
 
-    def head(self, hidden: torch.Tensor):
-        """The last step's head output from its ``hidden`` (``forward``'s), the
-        final norm and LM head in one launch (``head_launch``): a step of
-        whole verify requests its (output ids, verdict), else its logits; None
-        where that launch does not serve (no build, or rows other than the
-        step's)."""
-        head = self.build.head
-        if head is None or hidden.dim() != 2 or not hidden.is_contiguous():
+    def sample_token_ids(self, hidden: torch.Tensor):
+        """The verify of a step of ``hidden``'s rows (``forward``'s, eager or
+        replayed), the final norm and LM head in one launch
+        (``MonoLmHead.launch``) of that width's build: (output ids, spec
+        status); None where the width has no head launch."""
+        head = self.widths[hidden.shape[0]].head
+        if head is None or not hidden.is_contiguous():
             return None
-        if hidden.shape[0] != self.normed.shape[1]:
-            return None
-        return self.lm_head.head_of(
-            head, hidden, self.step_ids, self.peers.kernel_args()
-        )
+        return self.lm_head.launch(head, hidden)
 
     def _gather_rows(self, hidden, rows):
         """A token-parallel step's every row from its owner: the collapsed

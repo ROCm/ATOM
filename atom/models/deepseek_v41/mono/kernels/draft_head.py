@@ -48,12 +48,37 @@ from dataclasses import dataclass, field
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T
 
-from atom.models.deepseek_v41.mono.kernels import vocab_argmax as va
 from atom.models.deepseek_v41.mono.kernels.dims import Dims
-from atom.models.deepseek_v41.mono.kernels.head_dot import (
+from atom.models.deepseek_v41.mono.kernels.mhc_cols import (
+    collapsed8,
+    seam_mixes,
+    settled8,
+)
+from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_offsets
+from atom.models.deepseek_v41.mono.sources import SOURCES
+from atom.mono.device.ops import (
+    CM_DEV,
+    LOG2E,
+    bf2_f32,
+    bf16_words,
+    butterfly,
+    hw_exp2,
+    kernel_symbol,
+    launcher,
+    mfma_bf16,
+    rsrc,
+    traced,
+    words4,
+    xshfl,
+)
+from atom.mono.device.ranks import peer_bases
+from atom.mono.device.stamps import stamp, stamp_begin, stamp_flush
+from atom.mono.device.sync import Mailbox, preg, publish
+from atom.mono.lm_head import argmax as va
+from atom.mono.lm_head.dot import (
     KSTEP,
     LDS_BYTES,
     RG,
@@ -64,31 +89,6 @@ from atom.models.deepseek_v41.mono.kernels.head_dot import (
     lds_quad,
     row_rstd,
 )
-from atom.models.deepseek_v41.mono.kernels.mhc_cols import (
-    bf16_words,
-    collapsed8,
-    seam_mixes,
-    settled8,
-    words4,
-)
-from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_offsets
-from atom.models.deepseek_v41.mono.sources import SOURCES
-from atom.mono.device.ops import (
-    CM_DEV,
-    LOG2E,
-    bf2_f32,
-    butterfly,
-    hw_exp2,
-    kernel_symbol,
-    launcher,
-    mfma_bf16,
-    rsrc,
-    traced,
-    xshfl,
-)
-from atom.mono.device.ranks import peer_bases
-from atom.mono.device.stamps import stamp, stamp_begin, stamp_flush
-from atom.mono.device.sync import Mailbox, preg, publish
 from atom.mono.plan.build_key import key_tuple
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES
 from atom.mono.runtime.abi import KernelAbi
@@ -271,7 +271,7 @@ class DraftHeadBuild:
 
     @property
     def x_in_launch(self) -> bool:
-        """x made by this launch (``tail_row``): ``head_dot`` reads it after
+        """x made by this launch (``tail_row``): ``lm_head.dot`` reads it after
         the rows' flags, at device scope."""
         return self.from_state
 
@@ -325,7 +325,7 @@ def tail(c):
 # ---------------------------------------------------------------- the dot
 @traced
 def base_put(c, blk, ch, vals):
-    """``head_dot``'s logits of a chunk into LDS [row][id of the task]."""
+    """``lm_head.dot``'s logits of a chunk into LDS [row][id of the task]."""
     p, lane = c["key"], c["lane"]
     row = lane % 16 + RG * ch
     if row < p.rows:
@@ -515,6 +515,11 @@ def position(c, j):
     for off in (16, 32):
         kk, ii = va.take(kk, ii, xshfl(kk, off), xshfl(ii, off))
     wave_bests(c, kk, ii)
+    if const_expr(p.confidence):
+        # task 0's ``embeds`` stores drained before its bests are pushed: the
+        # confidence stage on every CTA reads them once the picks are in
+        # (``publish``: a barrier does not wait for them)
+        rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()
     c["stamp"](k0 + 1)
     # the argmax in two hops: the tasks' bests to their rank, a rank's best

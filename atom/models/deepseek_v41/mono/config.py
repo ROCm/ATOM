@@ -52,6 +52,9 @@ def config_refusal(atom_config) -> str | None:
             atom_config.index_cache_dtype in ("fp8", "fp4"),
             f"index cache {atom_config.index_cache_dtype}",
         ),
+        # layer 0's seam reads the embedding unexpanded (``embed_in``), which
+        # an Engram layer would have to see as the hc streams first
+        (0 not in hf.engram_layer_ids, "an Engram layer 0"),
         (
             keys <= ATTENTION_KEYS_MAX,
             f"{keys} attention keys a token > {ATTENTION_KEYS_MAX}",

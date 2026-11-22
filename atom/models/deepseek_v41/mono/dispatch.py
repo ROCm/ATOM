@@ -24,6 +24,7 @@ import logging
 import torch
 from torch import nn
 
+from atom.model_ops.verify_head import VerifyHead
 from atom.models.deepseek_v41.mono import hi_gate
 from atom.models.deepseek_v41.mono.config import (
     MAX_MOE_ROWS,
@@ -41,8 +42,9 @@ from atom.utils.forward_context import get_forward_context
 logger = logging.getLogger("atom")
 
 
-def step_supported(input_ids: torch.Tensor, inputs_embeds, dp_ranks: int = 0) -> bool:
-    """Is this forward a decode step of up to ``MAX_ROWS`` rows? Its width,
+def step_supported(rows: int, embeds: bool = False, dp_ranks: int = 0) -> bool:
+    """Is this forward a decode step of ``rows`` rows, up to ``MAX_ROWS``
+    (``embeds``: its input embeddings given, not its ids: no)? Its width,
     not the scheduled request count: a captured graph's width is the one
     its replays run, while the scheduled count differs from replay to replay.
 
@@ -54,9 +56,8 @@ def step_supported(input_ids: torch.Tensor, inputs_embeds, dp_ranks: int = 0) ->
     (``running_tokens_are_unified``, agreed across DP); then every rank's width
     is the agreed ``running_tokens``, and an idle rank's step, requests or
     none, is a decode as well."""
-    rows = input_ids.numel()
     max_rows = min(MAX_ROWS, MAX_MOE_ROWS // dp_ranks) if dp_ranks else MAX_ROWS
-    if inputs_embeds is not None or not 0 < rows <= max_rows:
+    if embeds or not 0 < rows <= max_rows:
         return False
     fwd = get_forward_context()
     if fwd.context is None or fwd.context.is_prefill or fwd.ubatch_slices is not None:
@@ -70,16 +71,29 @@ def step_supported(input_ids: torch.Tensor, inputs_embeds, dp_ranks: int = 0) ->
     return step.decode and step.running_tokens == rows
 
 
-class MonoDecodeModel(nn.Module):
-    """The loaded V4.1 runtime model, with its supported steps routed to mono."""
+class MonoVerifyHead(VerifyHead):
+    """The mono LM head launch as the verify head (``atom.mono.lm_head``)
+    on a step the mono kernels serve (``serves_step(rows)``), by
+    ``runner()``'s launch: temperature and top-p rows drawn in it, every row's id
+    picked over every rank's vocab shard alike on every rank."""
 
-    # its head's ids are greedy picks: a sampled step takes the logits
-    # (``ModelRunner._head_ids_serve``)
-    head_samples = False
-    # and the same on every TP rank: the LM head launch picks each row's id
-    # over every rank's vocab shard, every rank reducing the ranks' bests
-    # alike (``kernels.lm_head``), so the runner broadcasts none
-    head_ids_agree = True
+    samples = ids_agree = True
+
+    def __init__(self, serves_step, runner) -> None:
+        self.serves_step, self.runner = serves_step, runner
+
+    def draws_top_p(self, rows: int) -> bool:
+        return self.serves_step(rows)
+
+    def sample_token_ids(self, hidden: torch.Tensor):
+        if not self.serves_step(hidden.shape[0]):
+            return None
+        return self.runner().sample_token_ids(hidden)
+
+
+class MonoDecodeModel(nn.Module):
+    """The loaded V4.1 runtime model, with its supported steps routed to mono,
+    and its verify head the mono LM head launch (``MonoVerifyHead``)."""
 
     def __init__(
         self,
@@ -88,7 +102,8 @@ class MonoDecodeModel(nn.Module):
         max_model_len: int,
         index_fp4: bool,
         dp_ranks: int,
-        outputs=None,
+        outputs,
+        sampling,
     ) -> None:
         super().__init__()
         self.model = model
@@ -98,51 +113,42 @@ class MonoDecodeModel(nn.Module):
         # created on its first eligible step (``LazyRunner``)
         self._mono = LazyRunner(
             lambda: V41MonoDecodeRunner(
-                model, drafter, max_model_len, index_fp4, outputs
+                model, drafter, max_model_len, index_fp4, outputs, sampling
             ),
             "V4.1 mono decode",
         )
-        self._served = False
+        self.verify_head = MonoVerifyHead(self.serves_step, lambda: self._mono.runner)
+
+    def serves_step(self, rows: int, embeds: bool = False) -> bool:
+        """Whether the mono kernels serve this forward's ``rows``-row step:
+        the decision ``forward`` takes, which the step's head and the draft's
+        context write take again after it (a replayed graph does not call
+        ``forward``)."""
+        return step_supported(rows, embeds, self._dp_ranks) and self._mono.ready(rows)
 
     def forward(self, input_ids, positions, inputs_embeds=None):
-        # the forward ran on the mono kernels: its head may too
-        # (``compute_head`` follows its forward, recorded with it or not)
-        self._served = step_supported(
-            input_ids, inputs_embeds, self._dp_ranks
-        ) and self._mono.ready(input_ids.numel())
-        if self._served:
+        if self.serves_step(input_ids.numel(), inputs_embeds is not None):
             return self._mono.runner.forward(input_ids, positions)
         if inputs_embeds is None:
             return self.model(input_ids, positions)
         return self.model(input_ids, positions, inputs_embeds=inputs_embeds)
 
-    def compute_head(self, hidden_states: torch.Tensor):
-        """The head output of the forward that just ran
-        (``ModelRunner._head_output``, recorded with a captured one): on a step
-        the mono kernels served, the final norm and LM head in one launch
-        (``head_launch``): a verify step's greedy (output ids, verdict), else
-        its logits; else None (the runner computes them)."""
-        if not self._served:
-            return None
-        return self._mono.runner.head(hidden_states)
-
     def write_context(self, taps, positions) -> bool:
         """The draft's context KV of the target step that just ran, in one
         launch (``V41MonoDecodeRunner.write_context``), True if it ran: only
-        when the mono kernels served that step (the decision ``forward``
-        took, taken again: a replayed graph does not call it), whose step
+        when the mono kernels served that step (``serves_step``), whose step
         begin zeroed the launch's mailboxes."""
         fwd = get_forward_context()
         if fwd.context is None or fwd.context.is_dummy_run:
             return False
         metadata = fwd.attn_metadata
         rows = metadata.step.running_tokens
-        ids = positions[:rows]
-        if not (step_supported(ids, None, self._dp_ranks) and self._mono.ready(rows)):
+        if not self.serves_step(rows):
             return False
         return self._mono.runner.write_context(
-            [tap[:rows] for tap in taps], ids, metadata.cache, metadata.step
-        )
+            [tap[:rows] for tap in taps], positions[:rows], metadata.cache,
+            metadata.step,
+        )  # fmt: skip
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.model.compute_logits(hidden_states)
@@ -231,7 +237,7 @@ class MonoDraftModel(nn.Module):
 
 
 def install_mono_decode(
-    model: nn.Module, atom_config, drafter, *, metadata_builder=None
+    model: nn.Module, atom_config, drafter, *, metadata_builder
 ) -> nn.Module:
     """``model`` wrapped for mono decode (and ``drafter``'s DSpark draft model
     for its backbone), or ``model`` itself when this deployment is one mono
@@ -271,19 +277,17 @@ def install_mono_decode(
     draft = None
     if drafter is not None and hasattr(drafter.model, "block_backbone"):
         draft = drafter.model = MonoDraftModel(drafter.model, dp_ranks)
+    # the forward's output buffer and the step's staged sampling (one slot:
+    # mono refuses pipeline parallel, whose forward_vars ring would swap them)
+    staged = metadata_builder.model_runner.forward_vars
     decoder = MonoDecodeModel(
         model,
         drafter,
         atom_config.max_model_len,
         atom_config.index_cache_dtype == "fp4",
         dp_ranks,
-        # the forward's output buffer (one slot: mono refuses pipeline
-        # parallel, whose forward_vars ring would swap it)
-        (
-            None
-            if metadata_builder is None
-            else metadata_builder.model_runner.forward_vars["outputs"]
-        ),
+        staged["outputs"],
+        (staged["temperatures"].gpu, staged["top_ps"].gpu),
     )
     if draft is not None:
         draft.context_writer = decoder.write_context

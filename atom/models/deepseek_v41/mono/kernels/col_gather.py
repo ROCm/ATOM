@@ -36,20 +36,25 @@ from flydsl.expr.typing import Int32, Int64
 
 from atom.models.deepseek_v41.mono.kernels.dims import HC, HIDDEN, Dims
 from atom.models.deepseek_v41.mono.kernels.mhc_cols import (
-    bf16_words,
     collapsed8,
     seam_mixes,
     settled8,
-    words4,
 )
 from atom.models.deepseek_v41.mono.kernels.peer_layout import CG_PLANES, peer_offsets
 from atom.models.deepseek_v41.mono.sources import SOURCES
-from atom.mono.device.ops import kernel_symbol, launcher, rsrc, traced
+from atom.mono.device.ops import (
+    bf16_words,
+    kernel_symbol,
+    launcher,
+    rsrc,
+    traced,
+    words4,
+)
 from atom.mono.device.ranks import peer_bases
 from atom.mono.device.sync import Mailbox, preg
 from atom.mono.plan.arith import pick
 from atom.mono.plan.build_key import key_tuple
-from atom.mono.plan.execution import BLOCKS, THREADS
+from atom.mono.plan.execution import BLOCKS, THREADS, WAVES
 from atom.mono.runtime.abi import KernelAbi
 
 _CURRENT_STREAM = fx.Stream(None)
@@ -88,6 +93,13 @@ class ColGatherBuild:
         assert 0 <= self.taps <= MAX_TAPS
         assert self.state != State.NONE or self.taps, "nothing to gather"
         assert HIDDEN % (8 * self.tp) == 0
+        # SETTLE lands into ``res``, which its pushes read: a (row, quad)'s
+        # pushes (``push_task``: every plane to every rank) one wave's lanes,
+        # so all of them read before any of that wave's lands writes
+        lanes = THREADS // WAVES
+        assert (
+            self.state != State.SETTLE or lanes % (self.planes * self.tp) == 0
+        ), "a settle's (row, quad) pushes past one wave"
 
     @property
     def state_planes(self) -> int:

@@ -117,7 +117,13 @@ class UvaGather:
         self._shards = shards
         self.quant_block = first.block_size or 1
         self.quantized = first.quantized
-        self.weight_dtype = _TL_DTYPES[shards[0][0].dtype]
+        dtype = shards[0][0].dtype
+        if dtype not in _TL_DTYPES:
+            raise ValueError(
+                f"engram UVA gather: table dtype {dtype} is not one of "
+                f"{sorted(map(str, _TL_DTYPES))}"
+            )
+        self.weight_dtype = _TL_DTYPES[dtype]
         self.rows = torch.tensor(
             [[w.data_ptr(), s.data_ptr(), start, end] for w, s, start, end in shards],
             dtype=torch.int64,

@@ -143,7 +143,9 @@ class Mailbox:
     (no store drain, no separate flag). The tag is ``layer + 1``: it tells the
     layers of one step apart, and the runner zeroes every mailbox at a step's
     start (``StepMailboxes.begin_step``), so a pair from an earlier step never
-    carries a live tag. Every address is an ``Addr``: its space picks the scope.
+    carries a live tag. A launch that no step begin zeroes for tags its pairs
+    with its own launch's tag instead (``of_launch``). Every address is an
+    ``Addr``: its space picks the scope.
     """
 
     def __init__(self, layer, diag=None, region_ids=None):
@@ -153,6 +155,15 @@ class Mailbox:
         self.tag = layer + 1
         self.diag = diag
         self.region_ids = region_ids or {}
+
+    @classmethod
+    def of_launch(cls, tag, diag=None, region_ids=None) -> Mailbox:
+        """The mailbox of a launch tagged ``tag`` (traced Int32, nonzero, a
+        different one every launch and the same on every rank): a pair an
+        earlier launch left never carries it, so nothing zeroes its regions
+        between launches. A region a peer pushes into is the caller's to keep
+        apart from the one the peer's previous launch may still be read from."""
+        return cls(tag - 1, diag, region_ids)
 
     def _store(self, a, w, vec):
         """``vec`` at word ``w`` of region ``a``: a dual region's both copies,

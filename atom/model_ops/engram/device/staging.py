@@ -10,6 +10,7 @@ fixed addresses (`EngramStep`): a replay reads its own step.
 """
 
 import logging
+import os
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -24,6 +25,17 @@ from atom.model_ops.engram.device.hashing import (
 from atom.model_ops.engram.device.uva import UvaGather
 
 logger = logging.getLogger(__name__)
+# the caching allocator's settings, either spelling (HIP reads both)
+ALLOC_CONF_ENVS = ("PYTORCH_HIP_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF")
+
+
+def _expandable_segments() -> bool:
+    """Whether the caching allocator maps expandable segments: memory no IPC
+    handle exports."""
+    return any(
+        "expandable_segments:True" in os.environ.get(name, "")
+        for name in ALLOC_CONF_ENVS
+    )
 
 
 @dataclass(frozen=True)
@@ -122,6 +134,17 @@ class EngramStaging:
         collective = CustomAllreduce(group.cpu_group, host.device, max_size=1 << 20)
         if collective.disabled:
             logger.warning("engram: private TP gather unavailable; using main stream")
+            return
+        # only IPC registers a buffer peers read in place: VMM registers a
+        # copy made now, symm_mem registers nothing; and IPC exports no
+        # expandable-segment allocation (ROCm/aiter#4921), which every rank's
+        # environment says alike (an export failing on one rank alone would
+        # leave the others waiting in the handle exchange)
+        if collective._use_vmm or collective._use_symm_mem or _expandable_segments():
+            logger.warning(
+                "engram: private TP gather needs the IPC transport and a "
+                "non-expandable allocation; using main stream"
+            )
             return
         collective.register_input_buffer(self.lookup)
         self.collective = collective

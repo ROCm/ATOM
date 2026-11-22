@@ -28,21 +28,11 @@ from atom.mono.device.ops import (
     wave_prefix_dpp,
     wave_umax_dpp,
 )
-from atom.mono.device.select import INT_MIN, u32_lt
+from atom.mono.device.select import order_key, u32_lt
 from atom.mono.plan.execution import THREADS, WAVES
 
 PER_THREAD = 64  # the largest a CTA's LDS takes alone: 32768 keys
 LDS_KEYS = THREADS * PER_THREAD
-
-
-def order_key(bits):
-    """u32 order key of fp32 bits, held in an Int32."""
-    return (bits < 0).select(~bits, bits | INT_MIN)
-
-
-def key_bits(key):
-    """The fp32 bits ``order_key`` came from."""
-    return (key < 0).select(key ^ INT_MIN, ~key)
 
 
 # a histogram: 256 bins, then a dummy bin a lane: a key outside the pass's

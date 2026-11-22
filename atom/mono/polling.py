@@ -11,38 +11,14 @@ the Mono kernels and the variable is unset. It is not in this file's bytes, so e
 source digest that hashes this file also hashes ``CACHE_TAG``: builds with
 different values never share a JIT cache entry.
 
-This module imports nothing from ATOM so ops, sync and the runtime can all use
-it without an import cycle.
+This module imports nothing from ATOM but the variable's vocabulary
+(``polling_env``) so ops, sync and the runtime can all use it without an
+import cycle.
 """
 
 import os
 
-ENV = "ATOM_MONO_POLL_SLEEP_UNITS"
-# without concurrent KV copies (the evidence below is about them only)
-DEFAULT = 4
-# beside concurrent KV copies (offload or P/D connectors)
-COPY_SAFE = 16
-# s_sleep's immediate is 16 bits, but gfx9 / CDNA (gfx950 included) sleeps for
-# about 64 * SIMM16[6:0] clocks: the assembler takes 128 and the wave sleeps as
-# for 0. 0 is no backoff at all. So only 1..127 mean what they say.
-MAX = 127
-
-
-def _units(raw):
-    raw = (raw or "").strip()
-    if not raw:
-        return DEFAULT
-    try:
-        units = int(raw)
-    except ValueError:
-        units = None
-    if units is None or not 1 <= units <= MAX:
-        raise ValueError(
-            f"{ENV}={raw!r}: expected an integer in 1..{MAX} (s_sleep units "
-            f"of 64 clocks; unset means {DEFAULT})"
-        )
-    return units
-
+from atom.mono.polling_env import ENV, units
 
 # s_sleep uses 64-clock units: 16 is about 1024 clocks. On gfx950, s_sleep(1)
 # hung with a concurrent copy kernel (see tools/mono_mailbox_copy_repro.py and
@@ -61,7 +37,7 @@ def _units(raw):
 # exactly (`s_sleep 1` in sync.py / step_begin.py, `s_nop 0` in spin_pause and
 # the V4 helpers' poll). Below COPY_SAFE beside concurrent KV copies, 1 and 4
 # hung and 8 hung once (above); `Config` warns once at startup.
-POLL_SLEEP_UNITS = _units(os.environ.get(ENV))
+POLL_SLEEP_UNITS = units(os.environ.get(ENV))
 # `spin_pause` and the V4 helpers' poll: main had `s_nop 0` there
 MAIN_POLLING = POLL_SLEEP_UNITS == 1
 SPIN_PAUSE_ASM = "s_nop 0" if MAIN_POLLING else f"s_sleep {POLL_SLEEP_UNITS}"

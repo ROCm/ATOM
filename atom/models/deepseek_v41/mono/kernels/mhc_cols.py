@@ -10,26 +10,11 @@ is its own: a rank settles and collapses the columns it owns alone."""
 from dataclasses import dataclass
 
 import flydsl.expr as fx
-from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr
-from flydsl.expr.typing import T
 
 from atom.models.deepseek_v41.mono.kernels.dims import HC
-from atom.mono.device.ops import bf2_f32, bf16_pair, bf16_round, rsrc
-
-
-def words4(ptr, at):
-    """Words ``at`` .. + 3 of the buffer at ``ptr``, one 16-byte load."""
-    return fx.Vector(bo.buffer_load(rsrc(ptr), at, vec_width=4, dtype=T.i32))
-
-
-def bf16_words(vals):
-    """Eight f32 -> four packed bf16 pair words (RNE)."""
-    return fx.Vector.from_elements(
-        [bf16_pair(vals[2 * e], vals[2 * e + 1]).bitcast(fx.Int32) for e in range(4)],
-        fx.Int32,
-    )
+from atom.mono.device.ops import bf2_f32, bf16_round, words4
 
 
 @dataclass

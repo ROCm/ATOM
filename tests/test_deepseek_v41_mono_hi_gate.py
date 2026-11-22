@@ -29,6 +29,14 @@ from atom.models.deepseek_v41.mono import hi_gate
 from atom.utils import envs
 
 FIXTURES = Path(__file__).parent / "models" / "deepseek_v41" / "fixtures"
+# a runner's staging buffers as ATOM's mono install reads them
+_STAGED = {
+    "outputs": None,
+    "temperatures": SimpleNamespace(gpu=None),
+    "top_ps": SimpleNamespace(gpu=None),
+}
+# a metadata builder whose runner stages them
+BUILDER = SimpleNamespace(model_runner=SimpleNamespace(forward_vars=_STAGED))
 # serve_v41.sh's ATOM arguments (the InferenceX dsv41flash recipe at TP4) but the model path and the server's own
 CAPTURE = "[" + ",".join(map(str, [*range(1, 33), 48, 64, 128])) + "]"
 SERVED_ARGS = (
@@ -428,10 +436,14 @@ def test_a_model_the_hi_path_does_not_serve_falls_back(
     monkeypatch.setattr(dispatch, "MonoDecodeModel", lambda *a: "atom mono")
     if mode == "1":
         with pytest.raises(MonoUnsupported, match="FlyDSL layout"):
-            dispatch.install_mono_decode("model", served, None, metadata_builder=None)
+            dispatch.install_mono_decode(
+                "model", served, None, metadata_builder=BUILDER
+            )
         return
     with caplog.at_level(logging.INFO, logger="atom"):
-        got = dispatch.install_mono_decode("model", served, None, metadata_builder=None)
+        got = dispatch.install_mono_decode(
+            "model", served, None, metadata_builder=BUILDER
+        )
     assert got == "atom mono"
     assert [r.getMessage() for r in caplog.records] == [
         "V4.1 mono hi off: routed experts not in the gfx950 FlyDSL layout"
@@ -524,8 +536,9 @@ def _install_world(hi_dispatch, monkeypatch, *, local=None, others=(None, None, 
     drafter = SimpleNamespace(model=draft)
     builder = SimpleNamespace(
         engram=SimpleNamespace(mapping=None, host=None),
-        # ATOM's mono path takes the forward's output buffer from it
-        model_runner=SimpleNamespace(forward_vars={"outputs": None}),
+        # ATOM's mono path takes the forward's output buffer and the step's
+        # staged temperatures from it
+        model_runner=SimpleNamespace(forward_vars=_STAGED),
         use_decode_round=lambda rnd: log.append("use round"),
     )
     cfg = SimpleNamespace(max_model_len=4096, index_cache_dtype="fp4")

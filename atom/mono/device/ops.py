@@ -353,15 +353,20 @@ def _xpartner(v, off, lane):
     return ((lane & off) != 0).select(a, b)
 
 
-def wave_prefix_dpp(v):
-    """Inclusive prefix sum of an Int32 over the wave's 64 lanes in lane order:
-    DPP row shifts within 16-lane rows, then the row broadcasts 15 and 31 (gfx9;
-    six DPP adds, no exchange and select a step as ``wave_incl_scan``)."""
-    v = fx.Int32(v)
-    for n in (1, 2, 4, 8):
-        v = v + fx.Int32(update_dpp_i32(fx.Int32(0), v, 0x110 + n, 0xF, 0xF, False))
-    v = v + fx.Int32(update_dpp_i32(fx.Int32(0), v, 0x142, 0xA, 0xF, False))
-    return v + fx.Int32(update_dpp_i32(fx.Int32(0), v, 0x143, 0xC, 0xF, False))
+def wave_prefix_dpp(v, op=_add):
+    """Inclusive prefix ``op`` (sum by default; ``fx.max`` of values >= 0) of an
+    Int32 or Float32 over the wave's 64 lanes in lane order: DPP row shifts
+    within 16-lane rows, then the row broadcasts 15 and 31 (gfx9; six DPP steps,
+    no exchange and select a step as ``wave_incl_scan``). A lane shifted in from
+    outside its row reads 0 (+0.0)."""
+    is_f = isinstance(v, fx.Float32)
+    v = v if is_f else fx.Int32(v)
+    for ctrl, rows in ((0x111, 0xF), (0x112, 0xF), (0x114, 0xF), (0x118, 0xF),
+                       (0x142, 0xA), (0x143, 0xC)):  # fmt: skip
+        bits = v.bitcast(fx.Int32) if is_f else v
+        moved = fx.Int32(update_dpp_i32(fx.Int32(0), bits, ctrl, rows, 0xF, False))
+        v = op(v, moved.bitcast(fx.Float32) if is_f else moved)
+    return v
 
 
 def wave_incl_scan(v, lane, lanes=64):
@@ -567,6 +572,32 @@ def bf16_pair(a, b):
         .to(fx.BFloat16)
         .bitcast(fx.Float32)[0]
     )
+
+
+def bf16_words(vals):
+    """Eight f32 -> four packed bf16 pair words (RNE)."""
+    return fx.Vector.from_elements(
+        [bf16_pair(vals[2 * e], vals[2 * e + 1]).bitcast(fx.Int32) for e in range(4)],
+        fx.Int32,
+    )
+
+
+def i64_of(lo, hi):
+    """The Int64 of words (lo, hi)."""
+    return fx.Vector.from_elements([fx.Int32(lo), fx.Int32(hi)], fx.Int32).bitcast(
+        fx.Int64
+    )[0]
+
+
+def i64_words(v):
+    """An Int64's words (lo, hi)."""
+    w = fx.Vector.from_elements([fx.Int64(v)], fx.Int64).bitcast(fx.Int32)
+    return w[0], w[1]
+
+
+def words4(ptr, at):
+    """Words ``at`` .. + 3 of the buffer at ``ptr``, one 16-byte load."""
+    return fx.Vector(bo.buffer_load(rsrc(ptr), at, vec_width=4, dtype=T.i32))
 
 
 def lds_bytes(struct) -> int:

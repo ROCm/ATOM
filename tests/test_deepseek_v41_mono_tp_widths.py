@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """V4.1 mono's LDS at every TP size it serves: each buffer holds what the
 kernels write into it, and every build fits a CU's LDS."""
 
@@ -18,10 +19,15 @@ from atom.mono.plan.execution import LDS_BYTES
 
 TPS = [2, 4, 8]
 # target verify widths (1, 2, 4, 8 requests) and the draft's (2, 8 requests of
-# 5 rows), each with the ug_groups its runner builds with
+# 5 rows), each at either ug_groups its runner may build with
+# (``V41MonoDecodeRunner.ug_groups_at``, the draft's runner too)
 SHAPES = [
-    (6, 384, 6, 2), (12, 384, 6, 2), (24, 384, 6, 2), (48, 384, 6, 2),
-    (10, 128, 3, 1), (40, 128, 3, 1),
+    (tokens, experts, topk, ug_groups)
+    for tokens, experts, topk in (
+        (6, 384, 6), (12, 384, 6), (24, 384, 6), (48, 384, 6),
+        (10, 128, 3), (40, 128, 3),
+    )
+    for ug_groups in (1, 2)
 ]  # fmt: skip
 
 

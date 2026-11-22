@@ -35,6 +35,7 @@ import numpy as np
 import torch
 
 from atom.model_ops.engram import host_memory
+from atom.model_ops.engram.device.uva import UvaGather
 from atom.model_ops.engram.mapping import EngramConfig, NgramHashMapping
 from atom.model_ops.engram.tables import HostEmbeddingTable
 from atom.models.deepseek_v41.weights import shared_tensor
@@ -118,8 +119,6 @@ def main():
         pinned += (end - start) * (table.head_dim + table._scale.shape[1])
     seconds = time.perf_counter() - t0
     after = memory()
-
-    from atom.model_ops.engram.device.uva import UvaGather
 
     rng = np.random.default_rng(args.rank)
     gathers, exact = [], True

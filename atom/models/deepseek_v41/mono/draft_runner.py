@@ -56,7 +56,6 @@ class DraftMonoRunner(V41MonoDecodeRunner):
         self.max_rows = self.width * MAX_REQUESTS
         self.experts = config.dspark_n_routed_experts
         self.topk = config.dspark_num_experts_per_tok
-        self.ug_groups = 1
         # no indexer: the K2a build without it
         self.index_bound_max = 0
         self._bind_agreed(lambda: self._bind_draft(draft))

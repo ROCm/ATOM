@@ -31,6 +31,7 @@ from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
     MQA_LOGITS_PRESHUFFLE_ROWS,
 )
 from atom.model_ops.indexer.layout import MFMA, PRESHUFFLE
+from atom.mono import polling_env
 from atom.plugin import is_plugin_mode, is_vllm
 from atom.plugin.config import PluginConfig
 from atom.quant_spec import (
@@ -2228,29 +2229,28 @@ def _hf_architecture_factor(hf_config) -> tuple:
 
 
 def _resolve_mono_poll_sleep_units(kv_copies: bool) -> None:
-    """The Mono mailbox retry spacing of this deployment, fixed before the
-    workers (which read the same environment) spawn: ``polling.COPY_SAFE``
-    where a KV transfer or offload connector copies beside the Mono kernels
-    (``kv_copies``) and ATOM_MONO_POLL_SLEEP_UNITS is unset, else as set or
-    ``polling.DEFAULT``. A bad value is rejected (importing
-    ``atom.mono.polling`` raises); one below ``COPY_SAFE`` beside such copies
-    is warned about once."""
-    from atom.mono import polling
-
+    """The Mono mailbox retry spacing of this deployment, fixed before this
+    process or the workers it spawns import ``atom.mono.polling`` (which reads
+    it once; only the variable's vocabulary, ``polling_env``, is imported
+    here): ``COPY_SAFE`` where a KV transfer or offload connector copies beside
+    the Mono kernels (``kv_copies``) and ATOM_MONO_POLL_SLEEP_UNITS is unset,
+    else as set or ``DEFAULT``. A bad value is rejected; one below
+    ``COPY_SAFE`` beside such copies is warned about once."""
+    units = polling_env.units(os.environ.get(polling_env.ENV))
     if not kv_copies:
         return
-    if not os.environ.get(polling.ENV, "").strip():
-        os.environ[polling.ENV] = str(polling.COPY_SAFE)
+    if not os.environ.get(polling_env.ENV, "").strip():
+        os.environ[polling_env.ENV] = str(polling_env.COPY_SAFE)
         return
-    if polling.POLL_SLEEP_UNITS < polling.COPY_SAFE:
+    if units < polling_env.COPY_SAFE:
         logger.warning(
             "%s=%d beside a KV transfer or offload connector: Mono mailbox "
             "polls back off less than %d, and values below %d hung beside "
             "concurrent KV copies in the reproducer (ROCm/ATOM#3369).",
-            polling.ENV,
-            polling.POLL_SLEEP_UNITS,
-            polling.COPY_SAFE,
-            polling.COPY_SAFE,
+            polling_env.ENV,
+            units,
+            polling_env.COPY_SAFE,
+            polling_env.COPY_SAFE,
         )
 
 

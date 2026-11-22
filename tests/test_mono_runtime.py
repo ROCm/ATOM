@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """The mono framework's host mechanisms that need no GPU: TP agreement, kernel
 argument tables, compile-only builds, and the framework's dependency rules."""
 
@@ -165,6 +166,7 @@ def test_the_framework_package_is_found():
 
 # --------------------------------------------------------------- shared runner parts
 from atom.mono.runtime import route
+from atom.mono.runtime import widths as widths_module
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
 from atom.mono.runtime.widths import WidthBuilds
 
@@ -294,8 +296,6 @@ def test_a_width_is_built_and_compiled_once():
 def test_each_rank_compiles_its_own_share_of_a_width_first(monkeypatch):
     """Rank r of w compiles every w-th kernel from r first (the ranks side by
     side, not queued on one cache lock), then loads all of them."""
-    from atom.mono.runtime import widths as widths_module
-
     monkeypatch.setattr(widths_module.dist, "get_rank", lambda group: 1)
     monkeypatch.setattr(widths_module.dist, "get_world_size", lambda group: 3)
     widths = WidthBuilds(lambda key: key, lambda k: [], object(), "test")
@@ -309,7 +309,6 @@ def test_each_rank_compiles_its_own_share_of_a_width_first(monkeypatch):
 def test_a_lean_rebuild_leaves_out_what_any_rank_spilled(monkeypatch):
     """A rank whose own kernels did not spill still leaves out the ones at the
     places another rank's spilled: every rank rebuilds into one structure."""
-    from atom.mono.runtime import widths as widths_module
 
     def all_gather_object(every, places, group):
         every[:] = [places, {1}]  # the other rank spilled the second kernel

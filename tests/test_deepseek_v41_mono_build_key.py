@@ -71,7 +71,7 @@ BUILDS = {
         cp.build_compress, cp.ABI,
         cp.CompressBuild(rows=6, ratio=2, eps=1e-6, k_eps=1e-6),
         {"rows": 12, "ratio": 1, "eps": 1e-5, "k_eps": 1e-5, "kv_fp8": True,
-         "timeline": True},
+         "timeline": True, "quarters": 2},
     ),
     "dh": (
         dh.build_draft_head, dh.ABI,

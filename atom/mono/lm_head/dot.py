@@ -2,8 +2,8 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # Copyright (c) 2026 ATOM Project Contributors
 """A vocab head's dot ``bf16(x . W[v])`` over this rank's vocab rows, a task
-a CTA: the part the draft head (``draft_head``) and the target's LM head
-(``lm_head``) share.
+a CTA: the part every head launch shares (the LM head, ``lm_head.kernel``;
+DeepSeek-V4.1's draft head, ``deepseek_v41/mono/kernels/draft_head``).
 
 ``W`` is the LM head shard as loaded (row-major [vocab, K] bf16). A task's
 ``blocks`` blocks of ``VT`` rows, a wave 16 rows (the MFMA's A), x's rows
@@ -174,10 +174,10 @@ def dots(c, put):
 
 @traced
 def row_rstd(c, groups, lives):
-    """The final RMSNorm's rstd of a row both heads norm (``lm_head.norm_row``,
-    ``draft_head.tail_row``): ``groups`` this thread's 8-column f32 groups of
-    it, live where ``lives``, summed over the CTA through LDS (``a_red``),
-    rounded as aiter's norm (``rms_rstd``)."""
+    """The final RMSNorm's rstd of a row a head norms (``kernel.norm_row``,
+    V4.1's ``draft_head.tail_row``): ``groups`` this thread's 8-column f32
+    groups of it, live where ``lives``, summed over the CTA through LDS
+    (``a_red``), rounded as aiter's norm (``rms_rstd``)."""
     p, lane = c["key"], c["lane"]
     sq = fx.Float32(0.0)
     for k in range_constexpr(len(groups)):

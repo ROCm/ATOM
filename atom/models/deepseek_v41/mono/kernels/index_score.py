@@ -46,8 +46,6 @@ from atom.models.deepseek_v41.mono.kernels.index_query import await_queries
 from atom.models.deepseek_v41.mono.kernels.index_score_fp4 import run_scores4, sload4
 from atom.models.deepseek_v41.mono.kernels.token_par import own_rows
 from atom.models.deepseek_v41.mono.kernels.topk import (
-    key_bits,
-    order_key,
     radix_select,
     radix_slot,
     select_words,
@@ -65,6 +63,7 @@ from atom.mono.device.ops import (
     traced,
     uniform,
 )
+from atom.mono.device.select import key_bits, order_key
 from atom.mono.device.sync import POLL_MAX, preg, publish
 from atom.mono.plan.arith import pick, sel
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES, first_task
@@ -219,10 +218,11 @@ def _score_chunk(c, t, bound, blocks, query, blk, ks, b64):
 
 
 @traced
-def stage_iscore(c, lead, span, ch0, width, max_chunks):
-    """Chunks [ch0, ch0 + width) of the ``span`` tokens from ``lead``, which
-    read lead's tile table (``index_plan.score_tasks``): the keys loaded once,
-    every (token, chunk) scored, then one drain and the chunks' flags."""
+def stage_iscore(c, lead, span, span_max, ch0, width, max_chunks):
+    """Chunks [ch0, ch0 + width) of the ``span`` tokens from ``lead`` (traced,
+    at most the static ``span_max``), which read lead's tile table
+    (``index_plan.score_tasks``): the keys loaded once, every (token, chunk)
+    scored, then one drain and the chunks' flags."""
     tid, lane, wave = c["tid"], c["lane"], c["wave"]
     a = c["args"]
     # a thread a (token, chunk) flag; its bound loaded with the keys
@@ -232,7 +232,7 @@ def stage_iscore(c, lead, span, ch0, width, max_chunks):
     keys = _chunk_keys(a, lead, ch0, width, wave, lane)
     # the layer kernel: the rows' queries from this launch's K1 (the key
     # loads above go out first)
-    await_queries(c, lead, span, span)
+    await_queries(c, lead, span, span_max)
     for r in range(span):
         tok = lead + r
         tok_bound = ld_i32(a["ibound"], tok)
@@ -689,7 +689,7 @@ def run_scores(c, t0, n, bid, bounds, max_chunks):
     for task in range(first_task(bid, 0), ip.flat_total(counts), BLOCKS):
         lead, i = ip.flat_task(counts, task)
         stage_iscore(
-            c, t0 + lead, pick(spans, lead), i << width_log2, width, max_chunks
+            c, t0 + lead, pick(spans, lead), n, i << width_log2, width, max_chunks
         )
 
 

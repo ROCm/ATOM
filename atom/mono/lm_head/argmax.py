@@ -2,7 +2,8 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # Copyright (c) 2026 ATOM Project Contributors
 """The argmax of a row over every TP rank's vocab shard, by tagged pairs in two
-hops (the draft head's, ``draft_head``, and the target head's, ``lm_head``).
+hops (the LM head's, ``lm_head.kernel``; DeepSeek-V4.1's draft head's,
+``deepseek_v41/mono/kernels/draft_head``).
 
 A key is aiter's u32 order of a logit's fp32 bits (-0 counted as +0), held in an
 Int32; (key, id) pairs are compared in a total order -- the larger key, then the
@@ -24,16 +25,15 @@ regions), ``mrank_fan`` (every rank's MRANK), ``rank``, ``tid``, ``lane``,
 import flydsl.expr as fx
 from flydsl.expr import gpu, range_constexpr
 
-from atom.models.deepseek_v41.mono.kernels.topk import order_key
 from atom.mono.device.ops import traced, xshfl
-from atom.mono.device.select import INT_MIN, u32_lt
+from atom.mono.device.select import INT_MIN, order_key, u32_lt
 from atom.mono.plan.execution import THREADS, WAVES
 
 INT_MAX = 2**31 - 1
 
 
 def value_key(v):
-    """The order key of fp32 ``v`` (``topk.order_key``: aiter's u32 key in an
+    """The order key of fp32 ``v`` (``select.order_key``: aiter's u32 key in an
     Int32), -0 as +0."""
     bits = v.bitcast(fx.Int32)
     return order_key((bits == fx.Int32(INT_MIN)).select(fx.Int32(0), bits))
