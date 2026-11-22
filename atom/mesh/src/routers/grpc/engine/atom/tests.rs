@@ -20,9 +20,7 @@ use crate::atom_engine::grpc::{
     GetModelInfoResponse, GetServerInfoRequest, GetServerInfoResponse, HealthCheckRequest,
     HealthCheckResponse, PrepareStructuredOutputRequest, PrepareStructuredOutputResponse,
 };
-use crate::atom_engine::wire::pb::{
-    stop_strings, SamplingParams, StopStrings, StringList, TokenIds,
-};
+use crate::atom_engine::wire::pb::{SamplingParams, TokenIds};
 use crate::core::placement::PlacementPlan;
 use crate::core::worker::{ConnectionMode, RuntimeType, Worker};
 use crate::core::{BasicWorkerBuilder, DPAwareWorkerBuilder};
@@ -237,7 +235,6 @@ async fn a_payload_becomes_the_generate_request_atom_receives() {
     let response = route_generate(atom_worker(&url), false).await;
     assert_eq!(response.status(), StatusCode::OK);
 
-    let stops = ["Hello world", "<|im_end|>", "unseen"].map(String::from);
     let expected = GenerateRequest {
         request_id: "atom-req".to_string(),
         prompt_token_ids: vec![7, 8, 9],
@@ -247,11 +244,6 @@ async fn a_payload_becomes_the_generate_request_atom_receives() {
             top_p: Some(0.9),
             max_tokens: Some(16),
             ignore_eos: true,
-            stop_strings: Some(StopStrings {
-                value: Some(stop_strings::Value::Many(StringList {
-                    items: stops.to_vec(),
-                })),
-            }),
             n: Some(1),
             ..Default::default()
         }),

@@ -3,7 +3,7 @@
 
 use crate::atom_engine::{
     grpc::{self, GenerateRequest},
-    wire::pb::{stop_strings, SamplingParams, StopStrings, StringList, TokenIds},
+    wire::pb::{SamplingParams, TokenIds},
 };
 use crate::core::Worker;
 use crate::protocols::common::StringOrArray;
@@ -34,7 +34,6 @@ pub(crate) fn generate_request(
             // Absent, ATOM applies its HTTP routes' default.
             max_tokens: sampling.max_new_tokens.map(i64::from),
             ignore_eos: sampling.ignore_eos,
-            stop_strings: payload.stop.stop.as_ref().map(stop_strings),
             n: Some(sampling.n.max(0) as u32),
             ..Default::default()
         }),
@@ -55,16 +54,6 @@ fn structured_output(carried: &StructuredOutput) -> grpc::StructuredOutput {
         prompt_opens_reasoning: carried.prompt_opens_reasoning,
         message_tools_json: carried.message_tools_json.clone(),
     }
-}
-
-fn stop_strings(stop: &StringOrArray) -> StopStrings {
-    let value = match stop {
-        StringOrArray::String(stop) => stop_strings::Value::Single(stop.clone()),
-        StringOrArray::Array(stops) => stop_strings::Value::Many(StringList {
-            items: stops.clone(),
-        }),
-    };
-    StopStrings { value: Some(value) }
 }
 
 /// Each stop string as ATOM encodes one, without special tokens, dropping a
