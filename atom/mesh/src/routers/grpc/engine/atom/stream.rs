@@ -97,7 +97,8 @@ impl TokenSource for AtomStream {
 fn complete_chunk(complete: GenerateComplete) -> TokenChunk {
     TokenChunk::Complete {
         finish_reason: finish_reason(&complete.finish_reason),
-        // ATOM's reason for a stop token is `stop_<token id>`.
+        // ATOM's reason for a stop token is `stop_<token id>`; a stop-string hit is
+        // `stop_sequence`, naming none, so it has no matched_stop, as on ATOM's HTTP routes.
         matched_stop: complete
             .finish_reason
             .strip_prefix("stop_")
