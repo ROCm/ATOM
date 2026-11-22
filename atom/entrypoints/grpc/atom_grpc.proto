@@ -106,7 +106,9 @@ message GetModelInfoResponse {
   string served_model_name = 3;
   uint32 max_context_length = 4;
   repeated uint32 eos_token_ids = 5;
-  optional string chat_template = 6;  // as --chat-template left it; absent: none
+  // As --chat-template left it; absent: none. One template: --grpc-port refuses
+  // a tokenizer with named ones.
+  optional string chat_template = 6;
   string default_chat_template_kwargs_json = 7;  // --default-chat-template-kwargs, a JSON object
   // A rendered prompt ending in one of these, trailing whitespace aside, opens
   // a reasoning channel.
