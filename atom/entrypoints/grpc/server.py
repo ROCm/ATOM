@@ -442,14 +442,15 @@ def start_grpc_server(api: ModuleType, args: Namespace) -> None:
     why it cannot."""
     host = f"[{args.host}]" if ":" in args.host else args.host  # an IPv6 address
     address, servicer = f"{host}:{args.grpc_port}", AtomEngineServicer(api, args.model)
+    # Before the listener starts: the per-step flush hands gRPC every call's outputs.
+    core_mgr = api.engine.core_mgr
+    flush = _then(core_mgr._flush_stream_batch_fn, servicer.steps.flush)
+    core_mgr._flush_stream_batch_fn = flush
     listening = Future()
     threading.Thread(
         target=_run, args=(address, servicer, listening), name=THREAD_NAME, daemon=True
     ).start()
     listening.result()
-    core_mgr = api.engine.core_mgr  # its per-step flush now hands gRPC its outputs too
-    flush = _then(core_mgr._flush_stream_batch_fn, servicer.steps.flush)
-    core_mgr._flush_stream_batch_fn = flush
 
 
 def _run(address: str, servicer: AtomEngineServicer, listening: Future) -> None:
