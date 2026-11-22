@@ -204,8 +204,10 @@ def benchmark(contract, args):
         [
             str(python),
             "-c",
-            "import importlib.metadata; "
-            "print(importlib.metadata.version('agentx-harness'))",
+            (
+                "import importlib.metadata; "
+                "print(importlib.metadata.version('agentx-harness'))"
+            ),
         ],
         text=True,
     ).strip()
