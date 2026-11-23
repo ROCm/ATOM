@@ -1,0 +1,741 @@
+# SPDX-License-Identifier: MIT
+"""Gate-permute EPLB (no redundant experts) and the "swap" placement policy.
+
+EPLB's default keeps the router on logical expert ids and remaps them to
+physical slots in a launch of its own, on every forward of every placed layer.
+With ``ATOM_EPLB_GATE_PERMUTE=1`` a rebalance instead moves the gate's rows
+(``weight`` and the routing biases, `expert_placement._GATE_ROWS`) together
+with the expert weights, in place, so the router emits physical ids directly --
+what ``ATOM_EXPERT_PLACEMENT`` does once at load. Nothing is then launched for
+EPLB in a decode graph.
+
+The load statistics are logical and come from two places:
+
+* prefill: a count launch a placed layer in every pass that is not a decode
+  request-graph recording -- eager passes and the recordings a prefill replays
+  -- into the monitor's pass buffer, folded to logical ids when a pure-prefill
+  pass commits it (`ExpertLoadMonitor.on_forward_end`);
+* decode: a decode request graph's top-k id tensors are kept referenced when
+  it is recorded, which pins their graph-pool memory, so after a replay they
+  hold that step's ids; one replay in ``ATOM_EPLB_DECODE_SAMPLE_EVERY`` is
+  counted from them, eagerly (`GatePermuteRuntime.after_decode_replay`).
+
+``placement_policy: "swap"`` re-places a layer by a few pairwise swaps from its
+live placement (`swap_rebalance`), in numpy float64 from the group's integer
+loads, so every rank derives the same plan.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from contextlib import contextmanager
+from typing import Any
+
+import numpy as np
+import torch
+
+from atom.model_ops.fused_moe.expert_placement import _GATE_ROWS, placement_for
+from atom.utils import envs
+from atom.utils.graph_holders import register_graph_holder
+
+try:
+    import triton
+    import triton.language as tl
+
+    _HAS_TRITON = True
+except ImportError:
+    _HAS_TRITON = False
+
+logger = logging.getLogger("atom")
+
+TAG = "[EPLB-GP]"
+
+# The swap objective's terms -- prefill rows, the decode active-expert proxy,
+# decode rows -- each a rank load whose mean over the ranks is 1, their weights,
+# and the weight of the smoothing term (the sum of squared rank loads) that
+# lets the greedy leave a plateau of the max.
+SWAP_WEIGHTS = (1.0, 1.0, 0.25)
+SWAP_SMOOTH = 1.0
+
+
+# ---------------------------------------------------------------- swap policy
+def rank_loads(values: np.ndarray, rk: np.ndarray, num_ranks: int) -> np.ndarray:
+    """[experts, terms] summed over the experts of each rank -> [ranks, terms],
+    each sum in expert order (no BLAS: the same bits on every rank)."""
+    out = np.zeros((num_ranks, values.shape[1]), dtype=np.float64)
+    for m in range(values.shape[1]):
+        out[:, m] = np.bincount(rk, weights=values[:, m], minlength=num_ranks)
+    return out
+
+
+def active_proxy(dec: np.ndarray, rows: float, top_k: int) -> np.ndarray:
+    """a_e = 1 - (1 - q_e)^(top_k * rows): the chance expert e is active in a
+    decode step of ``rows`` rows, q_e its share of the decode picks (picks as
+    if independent)."""
+    total = float(dec.sum())
+    if total <= 0 or rows <= 0:
+        return np.zeros(dec.shape, dtype=np.float64)
+    share = np.clip(dec / total, 0.0, 1.0)
+    return 1.0 - (1.0 - share) ** (float(rows) * top_k)
+
+
+def swap_terms(
+    pf: np.ndarray, dec: np.ndarray, rows: float, top_k: int, num_ranks: int
+) -> np.ndarray:
+    """[experts, 3] objective terms of one layer from its prefill and decode
+    pick counts; a term with no data is zero (it then weighs nothing)."""
+    pf = np.asarray(pf, dtype=np.float64)
+    dec = np.asarray(dec, dtype=np.float64)
+    values = np.zeros((pf.shape[0], 3), dtype=np.float64)
+    if pf.sum() > 0:
+        values[:, 0] = pf / pf.sum() * num_ranks
+    if dec.sum() > 0:
+        proxy = active_proxy(dec, rows, top_k)
+        if proxy.sum() > 0:
+            values[:, 1] = proxy / proxy.sum() * num_ranks
+        values[:, 2] = dec / dec.sum() * num_ranks
+    return values
+
+
+def greedy_swaps(
+    values: np.ndarray,
+    rk: np.ndarray,
+    num_ranks: int,
+    *,
+    budget: int | None,
+    eps: float,
+    weights=SWAP_WEIGHTS,
+    smooth: float = SWAP_SMOOTH,
+) -> list[tuple[int, int]]:
+    """Greedy pairwise swaps, in place on ``rk`` (expert -> rank).
+
+    Each round takes the heaviest rank of every term and tries every swap of
+    one of its experts with one of another rank; the swap that lowers
+    ``sum_m w_m * (max_r L[r, m] + smooth * sum_r L[r, m]^2)`` most is applied
+    if it lowers it by more than ``eps``. Stops at ``budget`` swaps (None: no
+    bound). Ties go to the first candidate in (heavy rank, other rank, expert
+    of the heavy rank, expert of the other rank) order.
+
+    A round is a dozen passes over [terms, experts a rank, the other experts]
+    float64 buffers that are allocated once: it runs in the forward path.
+    """
+    w = np.asarray(weights, dtype=np.float64)
+    num_experts, num_terms = values.shape
+    per = num_experts // num_ranks
+    assert per * num_ranks == num_experts
+    other = num_experts - per
+    by_term = np.ascontiguousarray(values.T)  # [terms, experts]
+    loads = rank_loads(values, rk, num_ranks)  # [ranks, terms]
+    delta = np.empty((num_terms, per, other), dtype=np.float64)
+    gain = np.empty_like(delta)
+    work = np.empty_like(delta)
+    score = np.empty((per, other), dtype=np.float64)
+    part = np.empty_like(score)
+    no_rest = np.full(num_terms, -np.inf)
+    swaps: list[tuple[int, int]] = []
+    while budget is None or len(swaps) < budget:
+        # members[r]: the experts of rank r, ascending.
+        members = np.argsort(rk, kind="stable").reshape(num_ranks, per)
+        top = loads.max(0)
+        best_gain, best = float(eps), None
+        heavy = sorted({int(loads[:, m].argmax()) for m in range(len(w)) if w[m] > 0})
+        for h in heavy:
+            others = [r for r in range(num_ranks) if r != h]
+            if not others:
+                continue
+            mine, theirs = members[h], members[others].reshape(-1)
+            load_h = loads[h][:, None, None]
+            # Per expert of the other ranks: its rank's load, and the heaviest
+            # of the ranks that are neither its own nor h.
+            load_l = np.repeat(loads[others], per, axis=0).T[:, None, :]
+            rest = np.repeat(
+                np.stack(
+                    [
+                        (
+                            np.delete(loads, [h, r], axis=0).max(0)
+                            if num_ranks > 2
+                            else no_rest
+                        )
+                        for r in others
+                    ]
+                ),
+                per,
+                axis=0,
+            ).T[:, None, :]
+            # delta[m, i, j]: the load of term m that a swap of mine[i] with
+            # theirs[j] moves onto rank h.
+            np.subtract(
+                by_term[:, theirs][:, None, :], by_term[:, mine][:, :, None], out=delta
+            )
+            np.add(delta, load_h, out=gain)
+            np.subtract(load_l, delta, out=work)
+            np.maximum(gain, work, out=gain)
+            np.maximum(gain, rest, out=gain)
+            np.subtract(top[:, None, None], gain, out=gain)  # what the max drops
+            if smooth:
+                # less the change of the sum of squares: 2 d (L_l - L_h - d)
+                np.subtract(load_l - load_h, delta, out=work)
+                np.multiply(delta, smooth * 2, out=delta)
+                np.multiply(delta, work, out=work)
+                np.add(gain, work, out=gain)
+            np.multiply(gain[0], w[0], out=score)
+            for m in range(1, num_terms):
+                np.multiply(gain[m], w[m], out=part)
+                np.add(score, part, out=score)
+            flat_score = score.reshape(-1)
+            flat = int(flat_score.argmax())
+            value = float(flat_score[flat])
+            if value > best_gain:
+                tied = np.flatnonzero(flat_score == value)
+                if len(tied) > 1:
+                    i, j = np.divmod(tied, other)
+                    flat = int(tied[np.lexsort((j, i, j // per))[0]])
+                i, j = divmod(flat, other)
+                best_gain = value
+                best = (h, others[j // per], int(mine[i]), int(theirs[j]))
+        if best is None:
+            break
+        h, low, a, b = best
+        loads[h] += values[b] - values[a]
+        loads[low] += values[a] - values[b]
+        rk[a], rk[b] = low, h
+        swaps.append((a, b))
+    return swaps
+
+
+def swap_rebalance(
+    pf_load: torch.Tensor,
+    dec_load: torch.Tensor | None,
+    rows_per_step: float,
+    old_p2l: torch.Tensor,
+    *,
+    num_gpus: int,
+    top_k: int,
+    budget: int | None,
+    eps: float,
+    layer_ids: list[int] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[int, int]]:
+    """The "swap" policy: `rebalance_experts`' result for a placement that
+    differs from ``old_p2l`` by at most ``budget`` pairwise swaps a layer.
+
+    ``pf_load`` / ``dec_load``: [layers, logical] pick counts (prefill, sampled
+    decode; None: none), ``rows_per_step`` the group's decode rows a step.
+    A swap exchanges two experts' physical slots; a layer with none keeps its
+    row of ``old_p2l`` as is. Returns ``(physical_to_logical [L, P],
+    logical_to_physical [L, Lg, 1], logcnt [L, Lg], swaps a layer)``.
+    """
+    p2l = old_p2l.detach().to("cpu", torch.int64).numpy().copy()
+    num_layers, num_physical = p2l.shape
+    pf = pf_load.detach().to("cpu").numpy().astype(np.float64)
+    dec = (
+        np.zeros_like(pf)
+        if dec_load is None
+        else dec_load.detach().to("cpu").numpy().astype(np.float64)
+    )
+    assert pf.shape == dec.shape == (num_layers, num_physical), (
+        "the swap policy places as many logical experts as there are slots: "
+        f"loads {pf.shape} / {dec.shape}, placement {p2l.shape}"
+    )
+    assert num_physical % num_gpus == 0
+    per = num_physical // num_gpus
+    slots = np.arange(num_physical, dtype=np.int64)
+    l2p = np.empty_like(p2l)
+    swaps: dict[int, int] = {}
+    for layer in range(num_layers):
+        assert np.array_equal(np.sort(p2l[layer]), slots), (
+            f"layer {layer}: the swap policy needs a permutation placement "
+            "(no redundant experts)"
+        )
+        l2p[layer, p2l[layer]] = slots
+    for layer in range(num_layers) if layer_ids is None else layer_ids:
+        values = swap_terms(pf[layer], dec[layer], rows_per_step, top_k, num_gpus)
+        rk = l2p[layer] // per
+        done = greedy_swaps(values, rk, num_gpus, budget=budget, eps=eps)
+        for a, b in done:
+            slot_a, slot_b = l2p[layer, a], l2p[layer, b]
+            p2l[layer, slot_a], p2l[layer, slot_b] = b, a
+            l2p[layer, a], l2p[layer, b] = slot_b, slot_a
+        swaps[layer] = len(done)
+    dev = old_p2l.device
+    return (
+        torch.from_numpy(p2l).to(dev, torch.int32),
+        torch.from_numpy(l2p).to(dev, torch.int32).unsqueeze(-1),
+        torch.ones((num_layers, num_physical), dtype=torch.int32, device=dev),
+        swaps,
+    )
+
+
+# ---------------------------------------------------------------- metrics
+def placement_metrics(
+    pf: np.ndarray,
+    dec: np.ndarray,
+    rows: float,
+    rk: np.ndarray,
+    num_ranks: int,
+    top_k: int,
+) -> tuple[float, float, float, float]:
+    """One layer under ``rk`` (logical expert -> rank): prefill-row max/mean
+    over the ranks, the active-expert proxy's max and mean rank sum, decode-row
+    max/mean. NaN where the layer has no such load."""
+    nan = float("nan")
+
+    def imbalance(x):
+        load = np.bincount(rk, weights=x, minlength=num_ranks)
+        return float(load.max() / load.mean()) if load.sum() > 0 else nan
+
+    proxy = np.bincount(rk, weights=active_proxy(dec, rows, top_k), minlength=num_ranks)
+    has_proxy = proxy.sum() > 0
+    return (
+        imbalance(pf),
+        float(proxy.max()) if has_proxy else nan,
+        float(proxy.mean()) if has_proxy else nan,
+        imbalance(dec),
+    )
+
+
+def _mean(values) -> float:
+    values = [v for v in values if v == v]
+    return float(np.mean(values)) if values else float("nan")
+
+
+def metrics_line(
+    pf: np.ndarray,
+    dec: np.ndarray,
+    rows: float,
+    rk: np.ndarray,
+    layer_ids: list[int],
+    num_ranks: int,
+    top_k: int,
+) -> str:
+    """The metrics of one placement (``rk`` [layers, logical] -> rank) on the
+    loads ``pf`` / ``dec`` [layers, logical], averaged over the layers: the
+    prefill figure over the lower half of the layer ids and over the upper
+    half less the last layer (which a bounded-replay prefill runs on one row
+    a request)."""
+    per_layer = {
+        i: placement_metrics(pf[i], dec[i], rows, rk[i], num_ranks, top_k)
+        for i in layer_ids
+    }
+    half = (max(layer_ids) + 1) // 2
+    low = [i for i in layer_ids if i < half]
+    high = [i for i in layer_ids if half <= i < max(layer_ids)]
+
+    def span(ids):
+        return f"L{ids[0]}-{ids[-1]}" if ids else "L-"
+
+    return (
+        f"prefill max/mean {span(low)} {_mean(per_layer[i][0] for i in low):.3f} "
+        f"{span(high)} {_mean(per_layer[i][0] for i in high):.3f} | "
+        f"active proxy max {_mean(m[1] for m in per_layer.values()):.2f} "
+        f"mean/rank {_mean(m[2] for m in per_layer.values()):.2f} | "
+        f"decode-row max/mean {_mean(m[3] for m in per_layer.values()):.3f}"
+    )
+
+
+def ranks_of(p2l: np.ndarray, per_rank: int) -> np.ndarray:
+    """[layers, physical] slot -> logical  ->  [layers, logical] -> rank."""
+    rk = np.empty_like(p2l)
+    slots = np.arange(p2l.shape[1]) // per_rank
+    for layer in range(p2l.shape[0]):
+        rk[layer, p2l[layer]] = slots
+    return rk
+
+
+def reference_ranks(
+    path: str, layers: dict[int, Any], num_logical: int, per_rank: int
+) -> dict[int, np.ndarray]:
+    """``ATOM_EPLB_REF_PLACEMENT`` as layer id -> [logical] -> rank, for the
+    layers the table names. The table maps checkpoint expert ids to slots; a
+    layer ``ATOM_EXPERT_PLACEMENT`` renumbered at load has its logical ids
+    renumbered the same way here."""
+    with open(path) as f:
+        table = json.load(f)
+    out: dict[int, np.ndarray] = {}
+    for layer_id, layer in layers.items():
+        perm = table.get(getattr(layer, "prefix", None))
+        if perm is None:
+            continue
+        if sorted(perm) != list(range(num_logical)):
+            raise ValueError(f"{path}: {layer.prefix} is not a permutation")
+        loaded = placement_for(layer.prefix) or list(range(num_logical))
+        rk = np.empty(num_logical, dtype=np.int64)
+        rk[np.asarray(loaded)] = np.asarray(perm) // per_rank
+        out[layer_id] = rk
+    return out
+
+
+# ---------------------------------------------------------------- gate rows
+def stage_rows(
+    tensors: list[torch.Tensor], old_p2l: torch.Tensor, new_p2l: torch.Tensor
+) -> list[torch.Tensor] | None:
+    """The rows of every tensor as the placement ``new_p2l`` holds them, read
+    from tensors that hold them as ``old_p2l`` does (physical slot -> logical
+    expert, permutations): row p of the result is the row of logical
+    ``new_p2l[p]``, which row ``old_l2p[new_p2l[p]]`` holds now. Copies, with
+    nothing written; None when the two placements agree."""
+    old = old_p2l.to(torch.int64)
+    new = new_p2l.to(torch.int64)
+    if torch.equal(old, new):
+        return None
+    slots = torch.arange(old.numel(), dtype=torch.int64, device=old.device)
+    if not (
+        torch.equal(old.sort().values, slots) and torch.equal(new.sort().values, slots)
+    ):
+        raise ValueError("a gate moves between permutation placements only")
+    old_l2p = torch.empty_like(old)
+    old_l2p[old] = slots
+    source = old_l2p[new]
+    staged = [t.index_select(0, source.to(t.device)) for t in tensors]
+    for tensor, rows in zip(tensors, staged):
+        if tensor.shape != rows.shape or tensor.dtype != rows.dtype:
+            raise ValueError("a staged gate tensor does not match its target")
+    return staged
+
+
+def permute_rows_(
+    tensors: list[torch.Tensor], old_p2l: torch.Tensor, new_p2l: torch.Tensor
+) -> bool:
+    """Move the rows of every tensor from the placement ``old_p2l`` to
+    ``new_p2l``, in place: the storage keeps its address (captured graphs read
+    it by pointer). False, and nothing written, when the placements agree."""
+    staged = stage_rows(tensors, old_p2l, new_p2l)
+    if staged is None:
+        return False
+    for tensor, rows in zip(tensors, staged):
+        tensor.copy_(rows)
+    return True
+
+
+def gate_row_tensors(gate: Any) -> list[torch.Tensor]:
+    """The gate's per-expert tensors a placement moves (`_GATE_ROWS`)."""
+    return [
+        param.data
+        for param in (getattr(gate, name, None) for name in _GATE_ROWS)
+        if param is not None
+    ]
+
+
+def collect_gates(model: Any, layers: dict[int, Any]) -> dict[int, Any]:
+    """Layer id -> the gate that routes ``layers[layer id]`` (an EP MoE layer
+    EPLB places). Raises for a layer gate-permute cannot serve."""
+    by_experts = {
+        id(module.experts): module.gate
+        for module in model.modules()
+        if getattr(module, "gate", None) is not None
+        and getattr(module, "experts", None) is not None
+    }
+    gates: dict[int, Any] = {}
+    for layer_id, layer in layers.items():
+        name = getattr(layer, "prefix", f"layer {layer_id}")
+
+        def refuse(why, name=name):
+            raise RuntimeError(f"ATOM_EPLB_GATE_PERMUTE cannot place {name}: {why}")
+
+        gate = by_experts.get(id(layer))
+        if gate is None:
+            refuse("no module holds it as `experts` beside a `gate`")
+        if hasattr(gate, "tid2eid"):
+            refuse("its gate is hash-routed")
+        layout = getattr(layer, "expert_layout", None)
+        if layout is not None and (
+            layout.shared_is_routed or layout.num_fused_shared_experts
+        ):
+            refuse("a shared expert is fused into its routed experts")
+        if not getattr(layer.quant_method, "eplb_gate_permute_capable", False):
+            refuse(f"{type(layer.quant_method).__name__} does not place for EPLB")
+        parallel = getattr(layer, "moe_parallel_config", None)
+        if parallel is not None and (
+            getattr(parallel, "pcp_merge", False)
+            or (
+                getattr(layer, "dp_size", 1) > 1
+                and not getattr(parallel, "use_all2all_kernels", True)
+            )
+        ):
+            refuse("its rows are gathered across ranks before the experts")
+        rows = gate.weight.shape[0]
+        if rows != layer.global_num_experts:
+            refuse(f"its gate has {rows} rows for {layer.global_num_experts} slots")
+        bias = getattr(layer, "e_score_correction_bias", None)
+        gate_bias = getattr(gate, "e_score_correction_bias", None)
+        if bias is not None and (
+            gate_bias is None or bias.data_ptr() != gate_bias.data_ptr()
+        ):
+            refuse("its routing bias is a copy of the gate's, which would go stale")
+        gates[layer_id] = gate
+    return gates
+
+
+# ---------------------------------------------------------------- counting
+if _HAS_TRITON:
+
+    @triton.jit
+    def _count_ids_kernel(
+        ids_ptr,  # [numel] expert ids; < 0 or >= num_physical is not counted
+        load_ptr,  # [num_physical] int32 counts, added to
+        num_physical,
+        numel,
+        BLOCK: tl.constexpr,
+        NUM_BINS: tl.constexpr,  # next_pow2(num_physical + 1)
+    ):
+        # `eplb._eplb_route_kernel`'s record half.
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < numel
+        ids = tl.load(ids_ptr + offs, mask=mask, other=-1).to(tl.int64)
+        in_range = mask & (ids >= 0) & (ids < num_physical)
+        bin_idx = tl.where(in_range, ids, num_physical).to(tl.int32)
+        hist = tl.histogram(bin_idx, NUM_BINS)
+        bins = tl.arange(0, NUM_BINS)
+        tl.atomic_add(load_ptr + bins, hist, mask=bins < num_physical)
+
+
+class GatePermuteRuntime:
+    """What gate-permute EPLB holds beside the manager: the gates, the decode
+    load and the decode graphs' id tensors."""
+
+    def __init__(
+        self,
+        *,
+        manager: Any,
+        monitor: Any,
+        layers: dict[int, Any],
+        gates: dict[int, Any],
+        meta: Any,
+    ):
+        if meta.num_physical_experts != meta.num_logical_experts:
+            raise RuntimeError(
+                "ATOM_EPLB_GATE_PERMUTE needs num_redundant_experts == 0, got "
+                f"{meta.num_physical_experts - meta.num_logical_experts}"
+            )
+        mode = envs.ATOM_EPLB_GP_COUNT
+        if mode not in ("triton", "torch"):
+            raise ValueError(
+                f"ATOM_EPLB_GP_COUNT must be triton or torch, got {mode!r}"
+            )
+        self.manager = manager
+        self.monitor = monitor
+        self.layers = layers
+        self.gates = gates
+        self.meta = meta
+        self.count_triton = mode == "triton" and _HAS_TRITON
+        self.sample_every = int(envs.ATOM_EPLB_DECODE_SAMPLE_EVERY)
+        # Sums since the start (default), else the monitor's window of
+        # prefill passes and the decode samples since the last rebalance.
+        self.cumulative = bool(envs.ATOM_EPLB_STATS_CUMULATIVE)
+        dev = meta.physical_to_logical_map.device
+        shape = (meta.num_layers, meta.num_logical_experts)
+        # Logical expert -> its slot, the index that folds a pass's physical
+        # counts to logical ones. Fixed address, rewritten a layer a commit.
+        self.fold_index = (
+            meta.logical_to_physical_map[:, :, 0].to(torch.int64).contiguous()
+        )
+        self.dec_load = torch.zeros(shape, dtype=torch.int64, device=dev)
+        self.pf_total = (
+            torch.zeros(shape, dtype=torch.int64, device=dev)
+            if self.cumulative
+            else None
+        )
+        self.dec_rows = 0  # this rank's live rows over the sampled replays
+        self.dec_steps = 0  # the sampled replays
+        self._replays = 0
+        # Request bucket -> [(layer id, the recording's top-k ids)].
+        self._captures: dict[Any, list[tuple[int, torch.Tensor]]] = {}
+        self._capture_key = None
+        self._warned: set = set()
+        register_graph_holder(self)
+
+    # -- routing ---------------------------------------------------------
+    def owns(self, layer: Any) -> bool:
+        return self.layers.get(getattr(layer, "layer_id", None)) is layer
+
+    def place(self, layer: Any, topk_ids: torch.Tensor) -> None:
+        """A placed layer's routed ids, which are physical already: kept for
+        the decode sampler inside a decode request-graph recording (nothing
+        launched), counted into the monitor's pass buffer otherwise."""
+        if not self.owns(layer):
+            return
+        if self._capture_key is not None:
+            self._captures[self._capture_key].append((layer.layer_id, topk_ids))
+            return
+        if self.manager.rebalancing_stopped:
+            return
+        num_physical = self.meta.num_physical_experts
+        if not self.count_triton:
+            self.monitor.record(
+                layer_id=layer.layer_id,
+                topk_physical=topk_ids,
+                num_physical=num_physical,
+            )
+            return
+        load = self.monitor.pass_count_buffer(layer.layer_id, num_physical)
+        numel = topk_ids.numel()
+        if load is None or numel == 0:
+            return
+        _count_ids_kernel[(triton.cdiv(numel, 256),)](
+            topk_ids.contiguous(),
+            load,
+            num_physical,
+            numel,
+            BLOCK=256,
+            NUM_BINS=1 << num_physical.bit_length(),
+        )
+
+    # -- decode sampling -------------------------------------------------
+    @contextmanager
+    def decode_capture(self, key: Any):
+        """Around the recording of the decode request graph ``key``."""
+        self._captures[key] = []
+        self._capture_key = key
+        try:
+            yield
+        finally:
+            self._capture_key = None
+
+    def after_decode_replay(self, key: Any, scheduled_tokens: int) -> None:
+        """After the decode request graph ``key`` replayed a step of
+        ``scheduled_tokens`` live rows on this rank: every
+        ``ATOM_EPLB_DECODE_SAMPLE_EVERY``-th replay is counted."""
+        if self.manager.rebalancing_stopped:
+            return
+        self._replays += 1
+        if self._replays % self.sample_every:
+            return
+        held = self._captures.get(key)
+        if not held:
+            if key not in self._warned:
+                self._warned.add(key)
+                logger.warning(
+                    "%s decode graph %s holds no top-k ids of a placed layer; "
+                    "its replays are not sampled",
+                    TAG,
+                    key,
+                )
+            return
+        rows = int(scheduled_tokens)
+        self.dec_steps += 1
+        if rows <= 0:
+            return
+        self.dec_rows += rows
+        self.count_decode(held, rows)
+
+    def count_decode(self, held: list[tuple[int, torch.Tensor]], rows: int) -> None:
+        """Add the ids ``held`` -- (layer id, [bucket rows, top_k] physical
+        ids) -- of a step's ``rows`` live rows to the decode load, by logical
+        expert. Pad rows are routed to -1 and trail the live ones; both are
+        used."""
+        shapes = {tuple(ids.shape) for _, ids in held}
+        groups = (
+            [held]
+            if len(shapes) == 1
+            # Several launches a layer (micro-batches): count each as it is.
+            else [[item] for item in held]
+        )
+        for group in groups:
+            whole = len(groups) == 1
+            ids = torch.stack([t[:rows] if whole else t for _, t in group]).to(
+                torch.int64
+            )
+            layer = torch.tensor(
+                [i for i, _ in group], dtype=torch.int64, device=ids.device
+            )
+            self._add_physical(self.dec_load, layer, ids.reshape(len(group), -1))
+
+    def _add_physical(
+        self, load: torch.Tensor, layer: torch.Tensor, ids: torch.Tensor
+    ) -> None:
+        """load[layer[n], logical of ids[n, :]] += 1 for the ids in range."""
+        num_physical = self.meta.num_physical_experts
+        valid = (ids >= 0) & (ids < num_physical)
+        safe = torch.where(valid, ids, torch.zeros_like(ids))
+        p2l = self.meta.physical_to_logical_map.index_select(0, layer)
+        logical = torch.gather(p2l.to(torch.int64), 1, safe)
+        flat = logical + (layer * load.shape[1]).unsqueeze(1)
+        load.view(-1).scatter_add_(
+            0, flat.reshape(-1), valid.reshape(-1).to(load.dtype)
+        )
+
+    def release_graphs(self) -> int:
+        """The graphs are being dropped (`graph_holders`): so are the id
+        tensors their recordings left in the pool."""
+        dropped = len(self._captures)
+        self._captures.clear()
+        return dropped
+
+    # -- statistics ------------------------------------------------------
+    def dump_global(
+        self, group: Any
+    ) -> tuple[torch.Tensor, torch.Tensor | None, float, int]:
+        """The group's sums: decode load [L, Lg], the cumulative prefill load
+        (None unless ATOM_EPLB_STATS_CUMULATIVE), the group's live decode rows
+        a sampled step, and the sampled steps of a rank (their mean)."""
+        dev = self.dec_load.device
+        parts = [self.dec_load.reshape(-1)]
+        if self.pf_total is not None:
+            parts.append(self.pf_total.reshape(-1))
+        parts.append(
+            torch.tensor([self.dec_rows, self.dec_steps], dtype=torch.int64, device=dev)
+        )
+        payload = torch.cat(parts)
+        world = int(getattr(group, "world_size", 1)) if group is not None else 1
+        device_group = getattr(group, "device_group", None)
+        if world > 1:
+            if device_group is None:
+                raise RuntimeError("gate-permute EPLB needs the EP device group")
+            torch.distributed.all_reduce(
+                payload, op=torch.distributed.ReduceOp.SUM, group=device_group
+            )
+        size = self.dec_load.numel()
+        dec = payload[:size].view_as(self.dec_load)
+        pf = None
+        if self.pf_total is not None:
+            pf = payload[size : 2 * size].view_as(self.pf_total)
+        rows, steps = (int(v) for v in payload[-2:].tolist())
+        rows_per_step = rows * world / steps if steps > 0 else 0.0
+        return dec, pf, rows_per_step, steps // world
+
+    def after_rebalance(self) -> None:
+        """A rebalance is done: the decode samples start afresh (kept under
+        ATOM_EPLB_STATS_CUMULATIVE)."""
+        if self.cumulative:
+            return
+        self.dec_load.zero_()
+        self.dec_rows = self.dec_steps = 0
+
+    # -- commit ----------------------------------------------------------
+    def stage_commit(self, layer_id: int, old_p2l: torch.Tensor, new_p2l: torch.Tensor):
+        """Before ``layer_id``'s weights move from ``old_p2l`` to ``new_p2l``:
+        its gate rows in the new order, as copies. Everything of the gate's
+        move that can fail happens here, with nothing written."""
+        tensors = gate_row_tensors(self.gates[layer_id])
+        staged = stage_rows(tensors, old_p2l, new_p2l)
+        return None if staged is None else (tensors, staged)
+
+    def apply_commit(self, layer_id: int, staged) -> bool:
+        """``layer_id``'s weights and maps are the new placement's: write the
+        gate rows `stage_commit` staged, and the layer's fold index. True when
+        anything moved."""
+        if staged is None:
+            return False
+        for tensor, rows in zip(*staged):
+            tensor.copy_(rows)
+        self.fold_index[layer_id].copy_(
+            self.meta.logical_to_physical_map[layer_id, :, 0]
+        )
+        return True
+
+    def commit_layer(
+        self, layer_id: int, old_p2l: torch.Tensor, new_p2l: torch.Tensor
+    ) -> bool:
+        """`stage_commit` and `apply_commit` in one, for a layer whose weights
+        and maps already moved."""
+        return self.apply_commit(
+            layer_id, self.stage_commit(layer_id, old_p2l, new_p2l)
+        )
+
+    def describe(self) -> str:
+        return (
+            f"count={'triton' if self.count_triton else 'torch'} "
+            f"decode_sample_every={self.sample_every} "
+            f"cumulative={int(self.cumulative)}"
+        )

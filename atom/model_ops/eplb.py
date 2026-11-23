@@ -11,6 +11,7 @@ import torch
 from aiter.dist.parallel_state import get_tp_group
 
 from atom.config import get_current_atom_config
+from atom.model_ops import eplb_gate_permute as gate_permute
 from atom.utils import envs
 
 try:
@@ -1385,6 +1386,22 @@ class ExpertLoadMonitor:
         self._logged_first_record: bool = False
         self._logged_logical_without_metadata: bool = False
         self._load_group: Any | None = None
+        # Gate-permute EPLB (`use_logical_window`): the window holds logical
+        # loads, a pass's physical counts folded through this index.
+        self._logical_fold: torch.Tensor | None = None
+        self._logical_total: torch.Tensor | None = None
+
+    def use_logical_window(
+        self, fold_index: torch.Tensor, total: torch.Tensor | None = None
+    ) -> None:
+        """Keep the load by logical expert: a committed pass is its count
+        gathered through ``fold_index`` ([layers, logical] -> physical slot,
+        rewritten in place when a placement changes), so what is kept stays
+        valid across a rebalance. It goes to the window, or to ``total``
+        ([layers, logical] int64, every committed pass summed) when given.
+        Needs as many logical experts as slots."""
+        self._logical_fold = fold_index
+        self._logical_total = total
 
     def set_load_group(self, group: Any) -> None:
         self._load_group = group
@@ -1520,7 +1537,16 @@ class ExpertLoadMonitor:
             or self._expert_load_window is None
         ):
             return
-        self._expert_load_window[self._slot].copy_(self._cur_pass_count)
+        if self._logical_fold is None:
+            self._expert_load_window[self._slot].copy_(self._cur_pass_count)
+        else:
+            # Folded now, by the placement this pass ran under: a later
+            # commit must not re-read these counts.
+            folded = torch.gather(self._cur_pass_count, 1, self._logical_fold)
+            if self._logical_total is not None:
+                self._logical_total.add_(folded)
+                return
+            self._expert_load_window[self._slot].copy_(folded)
         self._slot = (self._slot + 1) % self.window_size
         self._filled = min(self._filled + 1, self.window_size)
 
@@ -1572,6 +1598,9 @@ class ExpertLoadMonitor:
         physical = self.dump_global_physical_load()
         if physical is None:
             return None
+        if self._logical_fold is not None:
+            # The window is logical already (`use_logical_window`).
+            return physical
         meta = get_live_expert_location_metadata()
         if meta is None:
             if not self._logged_logical_without_metadata and self._num_physical > 0:
@@ -1691,6 +1720,10 @@ class EPLBManager:
         ), "eplb_rebalance_balancedness_agg must be one of {'min','mean'}"
         # 0 = rebalance for the life of the process.
         self.max_rebalances = max(0, envs.ATOM_EPLB_MAX_REBALANCES)
+        # Gate-permute EPLB's state (ATOM_EPLB_GATE_PERMUTE), None otherwise.
+        self.gate_permute: gate_permute.GatePermuteRuntime | None = None
+        # Layer id -> [logical] -> rank of ATOM_EPLB_REF_PLACEMENT (logging).
+        self._reference_ranks: dict[int, Any] = {}
         self._rebalancing_stopped = False
         self._gen = self._entrypoint()
         self._rebalance_count = 0
@@ -1870,6 +1903,7 @@ class EPLBManager:
             ep_rank,
         )
         self.monitor.initialize_for_metadata(self.live_metadata)
+        self._init_gate_permute(model)
         # Initialize redundant physical slots the checkpoint loader left empty.
         # At init the weights are loaded, the EP group is up, and no forward has
         # run yet -- an idle window for the one-time trivial copy.
@@ -1879,6 +1913,70 @@ class EPLBManager:
         # asymmetric P2P operations involving only a subset of EP ranks.
         torch.distributed.barrier(group=self._migration_group)
         self.fill_redundant()
+
+    def _init_gate_permute(self, model: Any) -> None:
+        """Set up gate-permute EPLB (ATOM_EPLB_GATE_PERMUTE) and say once how
+        this EPLB runs; a deployment it cannot serve is refused here."""
+        meta = self.live_metadata
+        assert meta is not None
+        swap = self.placement_policy == "swap"
+        if swap and meta.num_physical_experts != meta.num_logical_experts:
+            raise RuntimeError(
+                "eplb placement_policy 'swap' needs num_redundant_experts == 0"
+            )
+        if envs.ATOM_EPLB_GATE_PERMUTE:
+            self.gate_permute = gate_permute.GatePermuteRuntime(
+                manager=self,
+                monitor=self.monitor,
+                layers=self._moe_layers,
+                gates=gate_permute.collect_gates(model, self._moe_layers),
+                meta=meta,
+            )
+            self.monitor.use_logical_window(
+                self.gate_permute.fold_index, self.gate_permute.pf_total
+            )
+        if self.gate_permute is None and not swap:
+            return
+        reference = envs.ATOM_EPLB_REF_PLACEMENT
+        if reference and meta.ep_rank == 0:
+            try:
+                self._reference_ranks = gate_permute.reference_ranks(
+                    reference,
+                    self._moe_layers,
+                    meta.num_logical_experts,
+                    meta.num_local_physical_experts,
+                )
+            except Exception as exc:  # noqa: BLE001 - logging only
+                logger.warning(
+                    "%s ATOM_EPLB_REF_PLACEMENT=%s ignored: %s",
+                    gate_permute.TAG,
+                    reference,
+                    exc,
+                )
+        logger.info(
+            "%s mode: gate_permute=%d (%s) policy=%s layers=%d (%d..%d) "
+            "experts=%d ep_size=%d ep_rank=%d window=%d interval=%d first=%d "
+            "layers_per_chunk=%d max_rebalances=%d swap_budget=%d swap_eps=%g "
+            "ref_layers=%d",
+            gate_permute.TAG,
+            self.gate_permute is not None,
+            "-" if self.gate_permute is None else self.gate_permute.describe(),
+            self.placement_policy,
+            len(self._moe_layers),
+            min(self._moe_layers),
+            max(self._moe_layers),
+            meta.num_logical_experts,
+            meta.ep_size,
+            meta.ep_rank,
+            self.monitor.window_size,
+            self.rebalance_interval,
+            self._first_rebalance_steps(),
+            self._rebalance_layers_per_chunk,
+            self.max_rebalances,
+            envs.ATOM_EPLB_SWAP_BUDGET,
+            envs.ATOM_EPLB_SWAP_EPS,
+            len(self._reference_ranks),
+        )
 
     def _collect_expert_weight_tensors(self, layer: Any) -> list[torch.Tensor]:
         assert self.live_metadata is not None
@@ -2151,8 +2249,7 @@ class EPLBManager:
         # step counter to 3/4 of the interval), so balancing on real traffic
         # kicks in early. Initial placement stays trivial (round-robin) until
         # this first real-load rebalance
-        first_window = max(1, self.rebalance_interval // 4)
-        for _ in range(first_window):
+        for _ in range(self._first_rebalance_steps()):
             yield
         while not self._max_rebalances_reached():
             yield from self._rebalance()
@@ -2164,6 +2261,12 @@ class EPLBManager:
         # Never finish: a caller that still advances the generator idles here.
         while True:
             yield
+
+    def _first_rebalance_steps(self) -> int:
+        """The prefill-bearing steps before the first rebalance:
+        ATOM_EPLB_FIRST_REBALANCE_STEPS, else a quarter of the interval."""
+        steps = envs.ATOM_EPLB_FIRST_REBALANCE_STEPS
+        return max(1, self.rebalance_interval // 4 if steps is None else steps)
 
     def _max_rebalances_reached(self) -> bool:
         return 0 < self.max_rebalances <= self._rebalance_count
@@ -2187,6 +2290,12 @@ class EPLBManager:
                 yield
                 migrate_and_commit(new_meta, layer_ids=chunk)
         """
+        if self.gate_permute is not None or self.placement_policy == "swap":
+            # No balancedness gate: the window may be logical (gate-permute),
+            # and the swap policy takes a swap only for a gain of its own.
+            if self.live_metadata is not None:
+                yield from self._execute_rebalance()
+            return
         physical_load = self.monitor.dump_global_physical_load()
         if physical_load is None:
             return
@@ -2227,19 +2336,50 @@ class EPLBManager:
         _ep_rank = self.live_metadata.ep_rank
         _rc = self._rebalance_count
 
+        # Gate-permute: the decode samples (and, summed since the start, the
+        # prefill load), reduced over the group like the window above.
+        gp = self.gate_permute
+        dec_load, rows_per_step, dec_steps = None, 0.0, 0
+        if gp is not None:
+            dec_load, pf_total, rows_per_step, dec_steps = gp.dump_global(
+                self.monitor._load_group
+            )
+            if pf_total is not None:
+                logical_load = pf_total
+
         _t0 = _time.perf_counter()
-        p2l, l2p, logcnt = rebalance_experts(
-            logical_load,
-            num_physical=self.live_metadata.num_physical_experts,
-            num_groups=num_groups,
-            num_nodes=num_nodes,
-            num_gpus=ep_size,
-            enable_hierarchical=(num_groups > 1 and num_nodes > 1),
-            policy=resolve_placement_policy(self.placement_policy),
-            # Current live placement -> enables the biased sticky/shortest-path
-            # fast-path: unchanged hot set => reuse old placement => zero migration.
-            old_p2l=self.live_metadata.physical_to_logical_map,
-        )
+        swaps = None
+        if self.placement_policy == "swap":
+            try:
+                p2l, l2p, logcnt, swaps = gate_permute.swap_rebalance(
+                    logical_load,
+                    dec_load,
+                    rows_per_step,
+                    self.live_metadata.physical_to_logical_map,
+                    num_gpus=ep_size,
+                    top_k=int(first_layer.top_k),
+                    budget=envs.ATOM_EPLB_SWAP_BUDGET,
+                    eps=envs.ATOM_EPLB_SWAP_EPS,
+                    layer_ids=sorted(self._moe_layers),
+                )
+            except Exception as exc:  # noqa: BLE001
+                # The plan is a function of the group's loads alone, so every
+                # rank fails here alike, with nothing switched anywhere.
+                self._fatal_stop(f"the swap policy failed ({exc!r}); nothing moved")
+                return
+        else:
+            p2l, l2p, logcnt = rebalance_experts(
+                logical_load,
+                num_physical=self.live_metadata.num_physical_experts,
+                num_groups=num_groups,
+                num_nodes=num_nodes,
+                num_gpus=ep_size,
+                enable_hierarchical=(num_groups > 1 and num_nodes > 1),
+                policy=resolve_placement_policy(self.placement_policy),
+                # Current live placement -> enables the biased sticky/shortest-path
+                # fast-path: unchanged hot set => reuse old placement => zero migration.
+                old_p2l=self.live_metadata.physical_to_logical_map,
+            )
         new_meta = ExpertLocationMetadata.from_rebalance_result(
             physical_to_logical_map=p2l,
             logical_to_physical_map=l2p,
@@ -2251,8 +2391,29 @@ class EPLBManager:
 
         chunk_size = max(1, int(self._rebalance_layers_per_chunk))
         layer_ids = sorted(self._moe_layers)
-        num_chunks = (len(layer_ids) + chunk_size - 1) // chunk_size
         _t_rearrange_ms = (_time.perf_counter() - _t0) * 1000.0
+        old_p2l = None
+        if gp is not None or swaps is not None:
+            # Only the layers whose placement changes are migrated, the same
+            # ones on every rank (the plan is the group's): a layer that keeps
+            # its placement costs no step. The gates move from `old_p2l`.
+            old_p2l = self.live_metadata.physical_to_logical_map.clone()
+            moved = (old_p2l != p2l.to(old_p2l.device)).sum(dim=1).tolist()
+            self._log_gate_permute_plan(
+                rc=_rc,
+                pf_load=logical_load,
+                dec_load=dec_load,
+                rows_per_step=rows_per_step,
+                dec_steps=dec_steps,
+                old_p2l=old_p2l,
+                new_p2l=p2l,
+                moved=moved,
+                swaps=swaps,
+                solve_ms=_t_rearrange_ms,
+            )
+            layer_ids = [i for i in layer_ids if moved[i]]
+        num_chunks = (len(layer_ids) + chunk_size - 1) // chunk_size
+        _t_migrate_ms = 0.0
 
         logger.info(
             "EPLB rebalance #%d ep_rank=%d: rearrange=%.1fms; migrating %d layers "
@@ -2277,6 +2438,9 @@ class EPLBManager:
                 # OOM spike. Each layer's migrate+commit finishes before the next
                 # reuses them. Same approach as vllm's shared weights_buffer.
                 temp_buffers = self._reusable_temp_buffers
+                if old_p2l is not None:
+                    self._switch_layer(layer_id, new_meta, old_p2l, p2l)
+                    continue
                 migrate_and_commit_chunk(
                     layer_ids=[layer_id],
                     old_meta=self.live_metadata,
@@ -2292,6 +2456,7 @@ class EPLBManager:
                 )
                 # if needed, just refresh relayer expert_map/mask here
             _chunk_ms = (_time.perf_counter() - _tc) * 1000.0
+            _t_migrate_ms += _chunk_ms
             logger.info(
                 "EPLB rebalance #%d ep_rank=%d chunk %d/%d layers=%s migrate=%.1fms",
                 _rc,
@@ -2301,6 +2466,197 @@ class EPLBManager:
                 chunk,
                 _chunk_ms,
             )
+            if old_p2l is not None and _ep_rank == 0:
+                logger.info(
+                    "%s rebalance #%d chunk %d/%d layers=%s migrate=%.1fms",
+                    gate_permute.TAG,
+                    _rc,
+                    start // chunk_size + 1,
+                    num_chunks,
+                    chunk,
+                    _chunk_ms,
+                )
+        if gp is not None:
+            gp.after_rebalance()
+        if old_p2l is not None and _ep_rank == 0:
+            logger.info(
+                "%s rebalance #%d done: %d layers migrated in %d chunks, "
+                "migrate total=%.1fms",
+                gate_permute.TAG,
+                _rc,
+                len(layer_ids),
+                num_chunks,
+                _t_migrate_ms,
+            )
+
+    def _switch_layer(
+        self,
+        layer_id: int,
+        new_meta: ExpertLocationMetadata,
+        old_p2l: torch.Tensor,
+        new_p2l: torch.Tensor,
+    ) -> None:
+        """One layer to its new placement as a unit: its weights, its maps
+        and, under gate-permute, its gate rows, in this step on every rank.
+
+        Whatever can fail runs before anything live is written -- the gate
+        rows staged as copies, the commit's own checks, the P2P into the temp
+        buffers -- and what follows only copies between tensors that exist.
+        A failure is logged as FATAL, latches rebalancing off and is raised:
+        the peers are mid-migration with this rank, so no rank can go on
+        alone, and a layer that is half switched must not serve.
+        """
+        live = self.live_metadata
+        assert live is not None
+        gp = self.gate_permute
+        stage = "prepare"
+        try:
+            staged = (
+                None
+                if gp is None
+                else gp.stage_commit(layer_id, old_p2l[layer_id], new_p2l[layer_id])
+            )
+            # `ExpertLocationMetadata.update`'s checks, before the weights move.
+            if live.max_num_replicas != new_meta.max_num_replicas or not torch.equal(
+                live.expert_map[layer_id], new_meta.expert_map[layer_id]
+            ):
+                raise RuntimeError("the new placement cannot be committed in place")
+            stage = "p2p"
+            plans = migrate_experts_chunk(
+                layer_ids=[layer_id],
+                old_meta=live,
+                new_meta=new_meta,
+                expert_weights_of_layer=self._expert_weights_of_layer,
+                temp_buffers=self._reusable_temp_buffers,
+                ep_group=self._migration_group,
+                nnodes=self._nnodes,
+                rank=self._ep_rank,
+                p2p_batch_chunk_size=self._p2p_batch_chunk_size,
+                cuda_stream=None,
+            )
+            stage = "commit"
+            commit_experts_chunk(
+                layer_ids=[layer_id],
+                plans=plans,
+                temp_buffers=self._reusable_temp_buffers,
+                expert_weights_of_layer=self._expert_weights_of_layer,
+                live_meta=live,
+                new_meta=new_meta,
+                cuda_stream=None,
+            )
+            if gp is not None:
+                gp.apply_commit(layer_id, staged)
+        except BaseException as exc:
+            self._fatal_stop(
+                f"layer {layer_id} failed at '{stage}' ({exc!r}); "
+                + (
+                    "the layer may be half switched on this rank"
+                    if stage == "commit"
+                    else "nothing of the layer was written on this rank"
+                )
+            )
+            raise
+
+    def _fatal_stop(self, why: str) -> None:
+        """Latch rebalancing off for the life of the process, loudly."""
+        self._rebalancing_stopped = True
+        logger.error(
+            "%s FATAL rebalance #%d ep_rank=%d: %s. Rebalancing is stopped "
+            "for good; the placement stays as it is now.",
+            gate_permute.TAG,
+            self._rebalance_count,
+            self._ep_rank,
+            why,
+        )
+
+    def _log_gate_permute_plan(
+        self,
+        *,
+        rc: int,
+        pf_load: torch.Tensor,
+        dec_load: torch.Tensor | None,
+        rows_per_step: float,
+        dec_steps: int,
+        old_p2l: torch.Tensor,
+        new_p2l: torch.Tensor,
+        moved: list[int],
+        swaps: dict[int, int] | None,
+        solve_ms: float,
+    ) -> None:
+        """Rank 0: what this rebalance changes, and the metrics of four
+        placements on the loads it was planned from -- the one before, the
+        one after, the identity and ATOM_EPLB_REF_PLACEMENT's. Diagnostic
+        only: never raises into the rebalance path."""
+        meta = self.live_metadata
+        assert meta is not None
+        if meta.ep_rank != 0:
+            return
+        tag = gate_permute.TAG
+        try:
+            layer_ids = sorted(self._moe_layers)
+            per_layer = [
+                moved[i] // 2 if swaps is None else swaps.get(i, 0) for i in layer_ids
+            ]
+            pf = pf_load.detach().to("cpu").numpy().astype("float64")
+            dec = (
+                pf * 0.0
+                if dec_load is None
+                else dec_load.detach().to("cpu").numpy().astype("float64")
+            )
+            logger.info(
+                "%s rebalance #%d: policy=%s swaps sum=%d max=%d "
+                "layers_changed=%d/%d experts_moved=%d | prefill picks=%d "
+                "decode picks=%d decode samples/rank=%d rows/step=%.1f | "
+                "solve=%.1fms",
+                tag,
+                rc,
+                self.placement_policy,
+                sum(per_layer),
+                max(per_layer, default=0),
+                sum(1 for i in layer_ids if moved[i]),
+                len(layer_ids),
+                sum(moved[i] for i in layer_ids),
+                int(pf.sum()),
+                int(dec.sum()),
+                dec_steps,
+                rows_per_step,
+                solve_ms,
+            )
+            logger.info(
+                "%s rebalance #%d swaps/layer: %s",
+                tag,
+                rc,
+                " ".join(str(n) for n in per_layer),
+            )
+            per_rank = meta.num_local_physical_experts
+            top_k = int(self._moe_layers[layer_ids[0]].top_k)
+            before = gate_permute.ranks_of(old_p2l.to("cpu").numpy(), per_rank)
+            after = gate_permute.ranks_of(new_p2l.to("cpu").numpy(), per_rank)
+            identity = before * 0 + (
+                torch.arange(meta.num_logical_experts).numpy() // per_rank
+            )
+            tables = [("before", before, layer_ids), ("after", after, layer_ids)]
+            tables.append(("identity", identity, layer_ids))
+            if self._reference_ranks:
+                reference = identity.copy()
+                covered = [i for i in layer_ids if i in self._reference_ranks]
+                for i in covered:
+                    reference[i] = self._reference_ranks[i]
+                tables.append((f"ref[{len(covered)} layers]", reference, covered))
+            for name, rk, ids in tables:
+                if not ids:
+                    continue
+                logger.info(
+                    "%s rebalance #%d metrics %-8s: %s",
+                    tag,
+                    rc,
+                    name,
+                    gate_permute.metrics_line(
+                        pf, dec, rows_per_step, rk, ids, meta.ep_size, top_k
+                    ),
+                )
+        except Exception as exc:  # noqa: BLE001  # pragma: no cover - diagnostic only
+            logger.warning("%s rebalance #%d metrics failed: %s", tag, rc, exc)
 
     def _log_rebalance_metrics(
         self, *, rc: int, logical_load: torch.Tensor, logcnt: torch.Tensor
@@ -2447,9 +2803,27 @@ def initialize_eplb_runtime(owner: Any) -> EPLBManager | None:
     """
     manager = _get_configured_eplb_manager()
     if manager is None:
+        if envs.ATOM_EPLB_GATE_PERMUTE:
+            raise RuntimeError(
+                "ATOM_EPLB_GATE_PERMUTE=1 needs EPLB (--eplb-enable) with "
+                "num_redundant_experts == 0"
+            )
         return None
     manager.bind_runtime_owner(owner)
     return manager
+
+
+def eplb_gate_permute() -> gate_permute.GatePermuteRuntime | None:
+    """Gate-permute EPLB's runtime (ATOM_EPLB_GATE_PERMUTE), else None."""
+    return _MANAGER.gate_permute if _MANAGER is not None else None
+
+
+def eplb_decode_capture(key: Any):
+    """Context for recording the decode request graph ``key``: under
+    gate-permute EPLB the placed layers' top-k ids are kept for the decode
+    sampler; nothing otherwise."""
+    gp = eplb_gate_permute()
+    return nullcontext() if gp is None else gp.decode_capture(key)
 
 
 def trigger_eplb_profile_rearrange() -> None:
@@ -2484,7 +2858,15 @@ def with_eplb_forward_monitor(fn):
         if manager is None or manager.live_metadata is None:
             return fn(self, batch, *args, **kwargs)
         monitor = manager.monitor
-        monitor.on_forward_start()
+        # Gate-permute EPLB counts in prefill passes only, and nothing once
+        # rebalancing has stopped: any other forward leaves the pass buffer
+        # alone (a pure-prefill pass, the only one committed, clears it first).
+        counting = manager.gate_permute is None or (
+            not manager.rebalancing_stopped
+            and getattr(batch, "total_tokens_num_prefill", 0) > 0
+        )
+        if counting:
+            monitor.on_forward_start()
         try:
             return fn(self, batch, *args, **kwargs)
         finally:
@@ -2498,7 +2880,8 @@ def with_eplb_forward_monitor(fn):
                 and getattr(batch, "total_tokens_num_decode", 0) == 0
             )
             # Recording gate commits clean load on pure-prefill only (local op).
-            monitor.on_forward_end(is_dummy_run, is_pure_prefill)
+            if counting:
+                monitor.on_forward_end(is_dummy_run, is_pure_prefill)
             # Step gate advances on prefill ACTIVITY (has-prefill), reduced to a
             # group-uniform flag. Coincides with the pure-prefill commit above
             # under the no-mixed-batch invariant (see on_forward_pass_end).

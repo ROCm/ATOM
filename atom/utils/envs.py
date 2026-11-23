@@ -1166,6 +1166,39 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # keep that expert placement for the rest of the process. Rebalances the
     # balancedness gate skips do not count. 0 (default) = no limit.
     "ATOM_EPLB_MAX_REBALANCES": lambda: _int_env("ATOM_EPLB_MAX_REBALANCES", 0),
+    # Prefill-bearing steps before the first rebalance. Unset = a quarter of
+    # `rebalance_interval`.
+    "ATOM_EPLB_FIRST_REBALANCE_STEPS": lambda: _optional_int_env(
+        "ATOM_EPLB_FIRST_REBALANCE_STEPS", min_value=1
+    ),
+    # DeepSeek-V4.1 under decoder bounded replay: EPLB places every target
+    # layer, the decoder's too (default: the layers before it only).
+    "ATOM_EPLB_ALL_LAYERS": lambda: _flag_env("ATOM_EPLB_ALL_LAYERS"),
+    # Gate-permute EPLB (`atom/model_ops/eplb_gate_permute.py`), R = 0 only:
+    # a rebalance moves the gate's rows with the expert weights, so the router
+    # emits physical ids and no id remap is launched. Load statistics come
+    # from a count launch in prefill passes and from sampled decode replays.
+    "ATOM_EPLB_GATE_PERMUTE": lambda: _flag_env("ATOM_EPLB_GATE_PERMUTE"),
+    # Gate-permute: one decode graph replay in this many is counted.
+    "ATOM_EPLB_DECODE_SAMPLE_EVERY": lambda: (
+        _optional_int_env("ATOM_EPLB_DECODE_SAMPLE_EVERY", min_value=1) or 64
+    ),
+    # Gate-permute: the prefill count launch, "triton" (one launch a layer) or
+    # "torch" (`count_physical_load`, several small launches a layer).
+    "ATOM_EPLB_GP_COUNT": lambda: os.getenv("ATOM_EPLB_GP_COUNT", "triton")
+    .strip()
+    .lower(),
+    # Gate-permute: the prefill and decode loads are summed since the start
+    # (default). "0" takes the prefill window (`load_window_size` pure-prefill
+    # passes of a rank) and the decode samples since the last rebalance.
+    "ATOM_EPLB_STATS_CUMULATIVE": lambda: _flag_env("ATOM_EPLB_STATS_CUMULATIVE", "1"),
+    # `placement_policy: "swap"`: pairwise swaps a layer a rebalance at most,
+    # and the objective gain (relative to the mean rank load) a swap needs.
+    "ATOM_EPLB_SWAP_BUDGET": lambda: max(0, _int_env("ATOM_EPLB_SWAP_BUDGET", 16)),
+    "ATOM_EPLB_SWAP_EPS": lambda: float(os.getenv("ATOM_EPLB_SWAP_EPS") or 0.005),
+    # Logging only: a placement table (ATOM_EXPERT_PLACEMENT's format) the
+    # rebalance metrics are also computed for.
+    "ATOM_EPLB_REF_PLACEMENT": lambda: os.getenv("ATOM_EPLB_REF_PLACEMENT") or None,
     # --- Structured output ---
     # Hold tool calls to the declared schemas when the tool parser declares a
     # grammar for them (Kimi-K3) and the structured-output extra is installed.
