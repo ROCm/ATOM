@@ -149,6 +149,11 @@ class KVConnectorSchedulerBase(ABC):
 
     supports_pd_admission = False
 
+    def receives_suffix_and_state(self, seq: Any) -> bool:
+        """Whether `seq`'s remote prefill receives only the blocks past its local
+        hit, and its per-request state whole (`Sequence.state_from_peer`)."""
+        return False
+
     def pd_receive_block_offset(
         self, seq: Any, num_blocks: int, num_cached_blocks: int
     ) -> int | None:

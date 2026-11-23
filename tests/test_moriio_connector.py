@@ -13,10 +13,13 @@ their own, and the rest is asserted against the source.
 from __future__ import annotations
 
 import ast
+import functools
 import os
 import unittest
 from pathlib import Path
 from unittest import mock
+
+from aiter_stub import atom_without_aiter
 
 ROOT = Path(__file__).resolve().parents[1]
 CONNECTOR = ROOT / "atom/kv_transfer/disaggregation/moriio/moriio_connector.py"
@@ -234,14 +237,15 @@ class ConnectorSourceTest(unittest.TestCase):
         for name in ("get_finished", "_handshake_listener", "_finish_write"):
             self.assertIn("with self._done_sending_lock:", self.segment(name), name)
 
-    def test_unimplemented_transfer_subsets_are_not_ignored(self):
+    def test_transfer_subsets_are_skipped_or_refused(self):
         body = self.segment("_rejects_transfer_subset")
-        self.assertIn("num_computed_blocks", body)
         self.assertIn("src_block_skip_factor", body)
         for path in ("_issue_read_for_req", "_request_write"):
             caller = self.segment(path)
             self.assertIn("self._rejects_transfer_subset(", caller, path)
             self.assertIn("_fail_before_transfer", caller, path)
+            # The consumer's local prefix is skipped on both ends of the pairing.
+            self.assertIn("self._split_at_kept_prefix(meta)", caller, path)
 
     def test_a_rejected_request_does_not_take_down_the_rank(self):
         body = self.segment("_issue_read_for_req")
@@ -306,19 +310,26 @@ class ConnectorSourceTest(unittest.TestCase):
         )
 
 
-def import_connector(name: str = "MoRIIOConnector"):
-    """A class from the connector module, or None where it cannot be imported.
-
-    aiter resolves the gfx arch from rocminfo while importing, so this only
-    succeeds in a container that can see the GPUs.
-    """
+@functools.cache
+def connector_modules():
+    """`moriio_connector` and `moriio_common`, under the AITER and Triton stand-ins
+    where those cannot run; kept, as the stand-ins are gone once this returns."""
     try:
-        from atom.kv_transfer.disaggregation.moriio import moriio_connector
+        with atom_without_aiter() as load:
+            return (
+                load("atom.kv_transfer.disaggregation.moriio.moriio_connector"),
+                load("atom.kv_transfer.disaggregation.moriio.moriio_common"),
+            )
     # Broad on purpose: whatever stops the native stack loading means skip,
     # and an unexpected type must not turn the CPU lane red.
     except Exception:  # noqa: BLE001
         return None
-    return getattr(moriio_connector, name)
+
+
+def import_connector(name: str = "MoRIIOConnector"):
+    """A class from the connector module, or None where it cannot be loaded."""
+    modules = connector_modules()
+    return None if modules is None else getattr(modules[0], name)
 
 
 class ConnectorBehaviourTest(unittest.TestCase):
@@ -346,7 +357,8 @@ class ConnectorBehaviourTest(unittest.TestCase):
             name: types.SimpleNamespace(
                 k_cache=self.torch.zeros(
                     (blocks * block_size, 4), dtype=self.torch.uint8
-                )
+                ),
+                v_cache=None,
             )
             for name in names
         }
@@ -354,6 +366,7 @@ class ConnectorBehaviourTest(unittest.TestCase):
         conn._verify_before = {}
         conn._state_tensors = {}
         conn._verify_state_before = {}
+        conn._verify_kept = {}
         conn._write_state_digests = {}
         conn._write_reports_lock = threading.Lock()
         return conn, names
@@ -415,7 +428,7 @@ class ConnectorBehaviourTest(unittest.TestCase):
 
         with self.assertLogs("atom", "ERROR") as logs:
             conn._verify_landed("req")
-        self.assertIn("1 of 3 layers unchanged", logs.output[0])
+        self.assertIn("1 of 3 K/V planes unchanged", logs.output[0])
         self.assertIn(names[2], logs.output[0])
 
     def test_a_fully_landed_read_is_not_reported_as_an_error(self):
@@ -428,7 +441,7 @@ class ConnectorBehaviourTest(unittest.TestCase):
 
         with self.assertLogs("atom", "INFO") as logs:
             conn._verify_landed("req")
-        self.assertIn("all 3 layers changed", logs.output[0])
+        self.assertIn("all 3 K/V planes changed", logs.output[0])
         # Both maps are popped, or a long run accumulates a digest per request.
         self.assertEqual(conn._verify_rows, {})
         self.assertEqual(conn._verify_before, {})
@@ -585,13 +598,9 @@ class WritePathTest(unittest.TestCase):
         import msgpack
         import torch
 
-        from atom.kv_transfer.disaggregation.moriio.moriio_common import (
-            MoRIIOConstants,
-        )
-
         cls.msgpack = msgpack
         cls.torch = torch
-        cls.constants = MoRIIOConstants
+        cls.constants = connector_modules()[1].MoRIIOConstants
 
     def make(self, *, producer: bool, layers: int = 2, blocks: int = 8):
         """A connector holding only what the write path reads.
@@ -661,6 +670,7 @@ class WritePathTest(unittest.TestCase):
         conn._num_state_slots = 0
         conn._built_state_sessions = {}
         conn._verify_state_before = {}
+        conn._verify_kept = {}
         conn._write_state_digests = {}
 
         conn.sent = []
@@ -839,6 +849,72 @@ class WritePathTest(unittest.TestCase):
         )
         self.assertAlmostEqual(request["deadline"], time.time() + 600, delta=60)
         self.assertEqual(conn._awaiting_write["d1"][0], request["deadline"])
+
+    def test_a_push_skips_the_prefix_the_consumer_holds(self):
+        conn = self.make(producer=False)
+        meta = self.recv_meta([4, 5, 6], [10, 11, 12])
+        meta.num_computed_blocks = 1
+        conn._request_write("d1", meta)
+        ((frames, _host, _port),) = conn.sent
+        request = self.msgpack.loads(frames[1])
+        self.assertEqual(request["dst_block_ids"], [5, 6])
+        self.assertEqual(request["src_block_ids"], [11, 12])
+
+    def test_a_read_skips_the_prefix_the_consumer_holds(self):
+        conn = self.make(producer=False)
+        conn.transfer_mode = "read"
+        reads = []
+        conn._read_blocks = lambda **kwargs: reads.append(kwargs)
+        meta = self.recv_meta([4, 5, 6], [10, 11, 12])
+        meta.num_computed_blocks = 2
+        meta.remote_engine_id = "engine"
+        conn._issue_read_for_req("d1", meta)
+        ((call,),) = [reads]
+        self.assertEqual(call["local_block_ids"], [6])
+        self.assertEqual(call["remote_block_ids"], [12])
+        self.assertEqual(call["kept_block_ids"], [4, 5])
+
+    def test_a_read_with_nothing_past_the_kept_prefix_is_refused(self):
+        conn = self.make(producer=False)
+        conn.transfer_mode = "read"
+        # Recorded, not failed in place: the read path swallows exceptions.
+        reads = []
+        conn._read_blocks = lambda **kwargs: reads.append(kwargs)
+        meta = self.recv_meta([4, 5], [10, 11])
+        meta.num_computed_blocks = 2
+        meta.remote_engine_id = "engine"
+        with self.assertLogs("atom", "ERROR"):
+            conn._issue_read_for_req("d1", meta)
+        self.assertEqual(reads, [])
+        self.assertEqual(conn._failed_before_read, {"d1"})
+
+    def test_the_kept_prefix_check_covers_v(self):
+        import types
+
+        conn = self.make(producer=False)
+        for name in conn.kv_caches:
+            conn.kv_caches[name] = types.SimpleNamespace(
+                k_cache=self.torch.zeros((8, 4), dtype=self.torch.uint8),
+                v_cache=self.torch.zeros((8, 4), dtype=self.torch.uint8),
+            )
+        conn._note_kept_prefix("d1", [1], is_mla=False)
+        conn.kv_caches["layer_1"].v_cache[1] = 3
+        with self.assertLogs("atom", "ERROR") as logs:
+            conn._verify_kept_landed("d1")
+        self.assertIn("layer_1.v", logs.output[0])
+
+    def test_verify_reports_a_receive_that_wrote_into_the_kept_prefix(self):
+        conn = self.make(producer=False)
+        conn._note_kept_prefix("d1", [1], is_mla=True)
+        with self.assertLogs("atom", "INFO") as logs:
+            conn._verify_kept_landed("d1")
+        self.assertIn("reused prefix rows unchanged", logs.output[-1])
+
+        conn._note_kept_prefix("d2", [1], is_mla=True)
+        conn.kv_caches["layer_0"].k_cache[2] = 7
+        with self.assertLogs("atom", "ERROR") as logs:
+            conn._verify_kept_landed("d2")
+        self.assertIn("the receive wrote into blocks it kept", logs.output[0])
 
     def test_the_consumer_refuses_a_short_source_without_asking(self):
         conn = self.make(producer=False)
@@ -1540,6 +1616,9 @@ class SchedulerSlotTest(unittest.TestCase):
         sched.dp_rank = 0
         sched._reqs_need_recv = {}
         sched._awaiting_send = set()
+        sched.block_size = 4
+        sched.dcp_size = 1
+        sched.hash_block_size = 4
         sched.request_id_to_transfer_id = {}
         sched.transfer_id_to_request_id = {}
         return sched
@@ -1554,9 +1633,48 @@ class SchedulerSlotTest(unittest.TestCase):
             "kv_transfer_params": {},
             "output_tokens": [42],
             "spec_token_ids": None,
+            "num_cached_tokens": 0,
         }
         fields.update(attrs)
         return types.SimpleNamespace(**fields)
+
+    def test_the_consumer_records_the_prefix_it_holds(self):
+        def params(**geometry):
+            return {"do_remote_prefill": True, "transfer_id": 7, **geometry}
+
+        for geometry, kept in (
+            ({"block_size": 4, "dcp_size": 1}, 2),
+            # A producer paging differently, or one that does not say: the
+            # block offset means nothing there, so the whole prompt moves.
+            ({"block_size": 8, "dcp_size": 1}, 0),
+            ({"block_size": 4, "dcp_size": 2}, 0),
+            ({}, 0),
+        ):
+            with self.subTest(geometry=geometry):
+                sched = self.make(producer=False)
+                seq = self.seq(
+                    kv_transfer_params=params(**geometry),
+                    block_table=[1, 2, 3],
+                    num_cached_tokens=8,
+                    state_slot=3,
+                )
+                # Asked before allocation; the receive's skip agrees with it.
+                self.assertEqual(sched.receives_suffix_and_state(seq), bool(kept))
+                if kept:
+                    sched.update_state_after_alloc(seq)
+                else:
+                    with self.assertLogs("atom", "WARNING"):
+                        sched.update_state_after_alloc(seq)
+                self.assertEqual(seq.kv_transfer_params["num_computed_blocks"], kept)
+        seq = self.seq(kv_transfer_params=params(block_size=4, dcp_size=1))
+        self.assertFalse(self.make(producer=True).receives_suffix_and_state(seq))
+
+    def test_the_producer_advertises_its_page_geometry(self):
+        sched = self.make(producer=True)
+        seq = self.seq(state_slot=6)
+        sched.request_finished(seq)
+        out = seq.kv_transfer_params_output
+        self.assertEqual((out["block_size"], out["dcp_size"]), (4, 1))
 
     def test_the_producer_publishes_its_state_slot(self):
         sched = self.make(producer=True)

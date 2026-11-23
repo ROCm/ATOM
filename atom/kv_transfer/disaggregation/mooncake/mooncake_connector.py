@@ -538,9 +538,33 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         # A full transfer still pairs blocks at this ratio: the producer
         # checks its source count against the destination count by it.
         factor = self.dcp_size // geometry[1]
-        if seq.has_per_req_cache:
+        # A block delta does not cover per-request state. Its prefix is kept
+        # only where the scheduler was told the state arrives whole
+        # (`receives_suffix_and_state`), which is also the only case in which
+        # the block manager claimed that prefix rather than private blocks.
+        if seq.has_per_req_cache and not seq.state_from_peer:
             return 0, factor
         return num_cached_blocks, factor
+
+    def receives_suffix_and_state(self, seq: Sequence) -> bool:
+        """A receive from one TP producer paging KV alike skips the blocks this
+        consumer holds (`num_computed_blocks`) and takes the state whole.
+
+        The producer writes the paired blocks and then the per-request state,
+        keyed by slot and not by block (`_execute_block_slot_transfer`), so the
+        block offset leaves the state whole. A PP producer's stages each push
+        part of it, and a chunked transfer pairs blocks before the prompt is
+        done; neither is covered here, and both keep the full transfer, as does
+        a producer sharded differently from this consumer.
+        """
+        params = seq.kv_transfer_params or {}
+        return (
+            not self.is_producer
+            and bool(params.get("do_remote_prefill"))
+            and not params.get("chunked_transfer")
+            and int(params.get("remote_pp_size") or 1) == 1
+            and self._remote_page_geometry(params) == (self.block_size, self.dcp_size)
+        )
 
     def pd_receive_block_offset(self, seq, num_blocks, num_cached_blocks):
         params = seq.kv_transfer_params or {}
@@ -741,7 +765,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             params["local_slot_index"] = slot_index
             # PD incremental: skip leading blocks already in the decode node's
             # prefix cache. Per-request state (including the SWA ring slot) is
-            # not covered by a block-only delta, so it takes a full transfer.
+            # not covered by a block-only delta: it skips them only when the
+            # producer sends that state whole (`seq.state_from_peer`), and
+            # takes a full transfer otherwise.
             remote_geometry = self._remote_page_geometry(params)
             num_computed_blocks, src_block_skip_factor = self._receive_prefix(
                 seq, seq.num_cached_tokens // self.hash_block_size, remote_geometry
