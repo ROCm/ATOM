@@ -1236,6 +1236,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_EPLB_GP_COUNT": lambda: os.getenv("ATOM_EPLB_GP_COUNT", "triton")
     .strip()
     .lower(),
+    # Diagnostic: EPLB creates no process group of its own for migration and
+    # uses the EP group's.
+    "ATOM_EPLB_SHARED_MIGRATION_GROUP": lambda: _flag_env(
+        "ATOM_EPLB_SHARED_MIGRATION_GROUP", "0"
+    ),
     # Diagnostic: freeze the placement as it is after N prefill-bearing
     # steps, with no rebalance (0 = off).
     "ATOM_EPLB_FREEZE_AT_STEP": lambda: max(0, _int_env("ATOM_EPLB_FREEZE_AT_STEP", 0)),

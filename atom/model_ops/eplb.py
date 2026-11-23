@@ -1890,7 +1890,14 @@ class EPLBManager:
             # isend/irecv from cross-matching in-flight forward ops on that group.
             # new_group is collective over the default group; every rank calls it.
             ep_global_ranks = torch.distributed.get_process_group_ranks(self._ep_group)
-            self._migration_group = torch.distributed.new_group(ranks=ep_global_ranks)
+            if envs.ATOM_EPLB_SHARED_MIGRATION_GROUP:
+                # Diagnostic: no communicator of EPLB's own; migration P2P
+                # (if any runs) goes over the EP group's.
+                self._migration_group = self._ep_group
+            else:
+                self._migration_group = torch.distributed.new_group(
+                    ranks=ep_global_ranks
+                )
             # If the DP group is exactly the migration group, the DP sync's
             # any_rank_has_prefill already spans it -> reuse it (free). Otherwise
             # keep False and OR the prefill flag over the migration group ourselves.
