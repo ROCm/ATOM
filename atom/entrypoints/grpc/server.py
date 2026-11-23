@@ -437,6 +437,8 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
             raise ValueError(SESSION_N)
         if given.logprobs or given.top_logprobs:
             raise ValueError("logprobs are not served over the Session")
+        if given.stop_strings and not request.stop_token_sequences:
+            raise ValueError("stop strings need their ids in stop_token_sequences")
         kv_transfer_params = request.kv_transfer_params
         api._validate_chunked_receive(kv_transfer_params)
         params = api._build_sampling_params(

@@ -396,6 +396,16 @@ def test_the_session_refuses_logprobs_it_would_not_serve(serve):
     assert engine.preprocessed == []
 
 
+def test_the_session_refuses_stop_strings_without_their_ids(serve):
+    engine = FakeEngine()
+    servicer = serve(engine)
+    session = servicer.sessions.open()
+    with pytest.raises(ValueError, match="stop_token_sequences"):
+        asyncio.run(servicer._submit(session, _submit(stop_strings=["END"])))
+    assert grpc_server._rejected(1, ValueError("x")).code == v1.RejectedRequest.INVALID
+    assert engine.preprocessed == []
+
+
 def test_a_session_grammar_failure_is_rejected_as_internal(serve):
     engine = FakeEngine()
     session = serve(engine).sessions.open()
