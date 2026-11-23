@@ -856,6 +856,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MULTINODE_TP_TIMEOUT_S": lambda: _positive_float_env(
         "ATOM_MULTINODE_TP_TIMEOUT_S", "1800"
     ),
+    # --- Sampling ---
+    # Unfiltered temperature sampling of at most ATOM_SAMPLER_SPLIT_V_MAX_REQS
+    # requests splits each vocabulary row over many Triton programs
+    # (`atom/model_ops/sampler_split.py`). Off by default.
+    "ATOM_SAMPLER_SPLIT_V": lambda: _flag_env("ATOM_SAMPLER_SPLIT_V"),
+    "ATOM_SAMPLER_SPLIT_V_MAX_REQS": lambda: _int_env(
+        "ATOM_SAMPLER_SPLIT_V_MAX_REQS", 8
+    ),
     # --- Profiling & Logging ---
     "ATOM_METRICS_UPDATE_INTERVAL_S": lambda: _positive_float_env(
         "ATOM_METRICS_UPDATE_INTERVAL_S", "1.0"

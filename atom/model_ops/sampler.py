@@ -10,6 +10,9 @@ from aiter.ops.triton.softmax import softmax
 from aiter.ops.triton.topk import topk
 from torch import nn
 
+from atom.model_ops.sampler_split import split_sample
+from atom.utils import envs
+
 # Try to import aiter top-k/top-p sampling ops
 try:
     import aiter.ops.sampling  # noqa: F401
@@ -81,6 +84,11 @@ class Sampler(nn.Module):
         super().__init__()
         self.eps = SAMPLER_EPS
         self.always_independent_noise = always_independent_noise
+        # The most requests an unfiltered call may have to take the
+        # split-vocabulary sampler (-1 = off).
+        self._split_v_max_reqs = (
+            envs.ATOM_SAMPLER_SPLIT_V_MAX_REQS if envs.ATOM_SAMPLER_SPLIT_V else -1
+        )
         # Keep a tie group at the top-k cut whole (`keep_ties`); off unless
         # lossless sampling arms.
         self.keep_top_k_ties = False
@@ -134,6 +142,7 @@ class Sampler(nn.Module):
             expand(top_ps),
             all_greedy=False,
             needs_independent_noise=True,
+            num_requests=cu_num_draft_tokens.shape[0],
         )
 
     def forward(
@@ -148,6 +157,7 @@ class Sampler(nn.Module):
         ) = None,  # (num_tokens,) float32, 1.0 means disabled
         all_greedy: bool = False,  # True if all temperatures are 0 (checked on CPU)
         needs_independent_noise: bool = False,
+        num_requests: int | None = None,  # None: one row a request
     ) -> torch.Tensor:  # (num_tokens,)
         """
         Sample tokens from logits using temperature or top-k top-p filtering.
@@ -165,6 +175,9 @@ class Sampler(nn.Module):
                 reaches callers that do not pass the argument. Adds an
                 O(bs * vocab_size) allocation on the unfiltered temperature
                 path.
+            num_requests: Requests behind the rows (a verification call's rows
+                are its requests' draft positions); None means one row a
+                request. Only the ATOM_SAMPLER_SPLIT_V gate reads it.
 
         Returns:
             Sampled token IDs (num_tokens,)
@@ -186,6 +199,11 @@ class Sampler(nn.Module):
 
         # No Top-K Top-P parameters, perform temperature-based sampling
         if not self._needs_filtering(top_ks, top_ps):
+            requests = logits.shape[0] if num_requests is None else num_requests
+            if requests <= self._split_v_max_reqs:
+                return self._split_v_sample(
+                    logits, temperatures, needs_independent_noise
+                )
             if needs_independent_noise:
                 return self._independent_noise_sample(logits, temperatures)
             sampled = self._temperature_sample(logits, temperatures)
@@ -263,6 +281,30 @@ class Sampler(nn.Module):
             (num_tokens, vocab_size), dtype=torch.float, device=logits.device
         ).exponential_(1)
         return fused_mixed_sample(
+            logits, exponential, temperatures, eps=self.eps, greedy_eps=SAMPLER_EPS
+        )
+
+    def _split_v_sample(
+        self,
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        needs_independent_noise: bool,
+    ) -> torch.Tensor:
+        """The unfiltered temperature draw split over the vocabulary, greedy rows
+        included. The noise is drawn as ``_independent_noise_sample`` /
+        ``_temperature_sample`` draw it, so the torch RNG stream is unchanged."""
+        num_tokens, vocab_size = logits.shape
+        if needs_independent_noise:
+            exponential = torch.empty(
+                (num_tokens, vocab_size), dtype=torch.float, device=logits.device
+            ).exponential_(1)
+        else:
+            exponential = get_per_token_exponential(vocab_size, logits.device).expand(
+                num_tokens, vocab_size
+            )
+        if logits.stride(-1) != 1:
+            logits = logits.contiguous()
+        return split_sample(
             logits, exponential, temperatures, eps=self.eps, greedy_eps=SAMPLER_EPS
         )
 
