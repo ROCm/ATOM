@@ -377,9 +377,9 @@ VAE patch; Qwen also needs `qwen_offline_fix`.
 | `vae_bf16` | The frozen VAE runs in BF16; `encode()` returns FP32 latents | `train_dit_lumen.py` |
 | `vae_conv` / `vae_conv_video` | VAE convolutions use Lumen's AITER-backed Conv2d/Conv3d route. The first is for images (exact T=1 → conv2d); the second also covers T>1 and the feature cache | `lumen_vae_conv.py`, `atomrl.lumen.ops.conv` |
 | `conv_pad_in_kernel` | Causal convolutions no longer `F.pad` a full copy; the kernel applies the symmetric padding with masks | `lumen_vae_conv.py` |
-| `sdpa_efficient` | SDPA's flash backend off; on ROCm the backward runs aiter's fused `fmha_bwd`. **Nondeterministic** | `atomrl.lumen.ops.attention.dit_sdpa` |
-| `attn_triton_fwd` | DiT attention only (no mask, non-causal, BF16, head_dim 128) gets aiter's Triton forward, with the efficient backward kept; requires `sdpa_efficient` | `atomrl.lumen.ops.attention.dit_sdpa` |
-| `rmsnorm_fuse` | diffusers `RMSNorm` forward fused with `torch.compile`; weighted RMSNorm only, LayerNorm never touched | `atomrl.lumen.ops.normalization.diffusers_rmsnorm` |
+| `sdpa_efficient` | SDPA's flash backend off; on ROCm the backward runs aiter's fused `fmha_bwd`. **Nondeterministic** | `atomrl.lumen.ops.attention.hf_patch` |
+| `attn_triton_fwd` | DiT attention only (no mask, non-causal, BF16, head_dim 128) gets aiter's Triton forward, with the efficient backward kept; requires `sdpa_efficient` | `atomrl.lumen.ops.attention.hf_patch` |
+| `rmsnorm_fuse` | diffusers `RMSNorm` forward fused with `torch.compile`; weighted RMSNorm only, LayerNorm never touched | `atomrl.lumen.ops.normalization.rmsnorm` |
 | `local_adamw` | Fused AdamW runs directly on the FSDP2 local shards, bypassing DTensor dispatch; bit-identical | `atomrl.lumen.quantize.local_adamw` |
 | `qwen_offline_fix` | Works around a VeOmni `573848a` defect: Qwen-Image `offline_training` reads `self.vae.config` with no VAE loaded and crashes on step 1. Should be fixed upstream | `veomni_patches/qwen_offline.py` |
 

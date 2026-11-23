@@ -602,3 +602,95 @@ class LumenRMSNorm(nn.Module):
     def extra_repr(self) -> str:
         gq = f", grad_quant={self.grad_quant_type}" if self.grad_quant_type else ""
         return f"{self.weight.shape[0]}, eps={self.eps}{gq}"
+
+
+# ---------------------------------------------------------------------------
+# Diffusers class-level route
+# ---------------------------------------------------------------------------
+
+_diffusers_compiled = None
+_diffusers_original_forward = None
+_diffusers_stats = {"fused": 0, "fallback": 0}
+
+
+def _diffusers_rmsnorm_weighted(hidden_states, weight, eps):
+    """Diffusers weighted RMSNorm expression with FP32 intermediates."""
+    variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
+    hidden_states = hidden_states * torch.rsqrt(variance + eps)
+    return hidden_states.to(weight.dtype) * weight
+
+
+def fused_diffusers_rmsnorm(hidden_states, weight, eps):
+    """Compile the narrow Diffusers RMSNorm expression on first use."""
+    global _diffusers_compiled
+    if _diffusers_compiled is None:
+        _diffusers_compiled = torch.compile(
+            _diffusers_rmsnorm_weighted,
+            dynamic=False,
+        )
+    return _diffusers_compiled(hidden_states, weight, eps)
+
+
+def patch_diffusers_rmsnorm(min_seq: int = 1024) -> bool:
+    """Patch weighted Diffusers RMSNorm forwards without replacing modules."""
+    global _diffusers_original_forward
+    if _diffusers_original_forward is not None:
+        return True
+    try:
+        from diffusers.models.normalization import RMSNorm
+    except (ImportError, OSError) as error:
+        logger.info(
+            "Diffusers RMSNorm unavailable (%s); not patching",
+            type(error).__name__,
+        )
+        return False
+    try:
+        from torch.distributed.tensor import DTensor
+    except ImportError:
+        DTensor = ()
+
+    _diffusers_original_forward = RMSNorm.forward
+    original = _diffusers_original_forward
+    threshold = int(min_seq)
+
+    def forward(self, hidden_states):
+        weight = getattr(self, "weight", None)
+        if (
+            weight is not None
+            and getattr(self, "bias", None) is None
+            and hidden_states.dim() == 4
+            and hidden_states.shape[1] >= threshold
+            and not isinstance(weight, DTensor)
+            and not isinstance(hidden_states, DTensor)
+        ):
+            _diffusers_stats["fused"] += 1
+            return fused_diffusers_rmsnorm(
+                hidden_states,
+                weight,
+                self.eps,
+            )
+        _diffusers_stats["fallback"] += 1
+        return original(self, hidden_states)
+
+    RMSNorm.forward = forward
+    logger.info(
+        "Diffusers RMSNorm forward fused for 4-D sequences >= %d",
+        threshold,
+    )
+    return True
+
+
+def unpatch_diffusers_rmsnorm() -> None:
+    """Restore Diffusers RMSNorm's original class method."""
+    global _diffusers_original_forward
+    if _diffusers_original_forward is None:
+        return
+    from diffusers.models.normalization import RMSNorm
+
+    RMSNorm.forward = _diffusers_original_forward
+    _diffusers_original_forward = None
+
+
+def diffusers_rmsnorm_stats() -> dict[str, int]:
+    """Return fused and fallback call counts for the Diffusers route."""
+    return dict(_diffusers_stats)

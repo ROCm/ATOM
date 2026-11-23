@@ -26,7 +26,7 @@ import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from atomrl.lumen.ops.attention.dit_sdpa import (
+from atomrl.lumen.ops.attention.hf_patch import (
     TritonFwdEfficientBwd,
     _triton_forward,
 )

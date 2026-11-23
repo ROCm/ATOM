@@ -25,9 +25,9 @@ import torch
 import torch.profiler as P
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from atomrl.lumen.ops.normalization.diffusers_rmsnorm import (
-    _rmsnorm_weighted,
-    fused_rmsnorm,
+from atomrl.lumen.ops.normalization.rmsnorm import (
+    _diffusers_rmsnorm_weighted,
+    fused_diffusers_rmsnorm,
 )
 
 SHAPES = [("image", (1, 4096, 24, 128)), ("text", (1, 13, 24, 128))]
@@ -36,7 +36,7 @@ ITERS, WARMUP = 30, 10
 
 def stock(hidden_states, weight, eps):
     """diffusers 0.37.0 RMSNorm.forward, weight path, eager."""
-    return _rmsnorm_weighted(hidden_states, weight, eps)
+    return _diffusers_rmsnorm_weighted(hidden_states, weight, eps)
 
 
 def snr_db(ref, got):
@@ -97,9 +97,9 @@ def main():
             else:
                 a = (x, w, eps)
             s_us = timed(stock, a, bwd)
-            f_us = timed(fused_rmsnorm, a, bwd)
+            f_us = timed(fused_diffusers_rmsnorm, a, bwd)
             s_k = count_kernels(stock, a, bwd)
-            f_k = count_kernels(fused_rmsnorm, a, bwd)
+            f_k = count_kernels(fused_diffusers_rmsnorm, a, bwd)
             print(
                 f"  {tag:7} {label:10} {s_us:9.1f} {f_us:9.1f} {s_us / f_us:7.2f}x {s_k:8d} {f_k:8d}"
             )
@@ -111,7 +111,7 @@ def main():
         w = torch.randn(shape[-1], device="cuda", dtype=torch.bfloat16)
         ref = stock(x.float(), w.float(), eps)
         s = stock(x, w, eps)
-        f = fused_rmsnorm(x, w, eps)
+        f = fused_diffusers_rmsnorm(x, w, eps)
         print(
             f"  {tag:7} stock {snr_db(ref, s):6.1f} dB   fused {snr_db(ref, f):6.1f} dB   "
             f"fused-vs-stock {snr_db(s, f):6.1f} dB"
@@ -122,7 +122,7 @@ def main():
         "\n=== 4. DTensor weight: the patch must hand it to diffusers, not compile it ==="
     )
     import torch.distributed as dist
-    from atomrl.lumen.ops.normalization import diffusers_rmsnorm as mod
+    from atomrl.lumen.ops.normalization import rmsnorm as mod
     from diffusers.models.normalization import RMSNorm
     from torch.distributed.tensor import Replicate, distribute_tensor, init_device_mesh
 
@@ -141,9 +141,9 @@ def main():
         [Replicate()],
     )
     mod.patch_diffusers_rmsnorm()
-    before = mod.stats()
+    before = mod.diffusers_rmsnorm_stats()
     out = norm(x)
-    after = mod.stats()
+    after = mod.diffusers_rmsnorm_stats()
     mod.unpatch_diffusers_rmsnorm()
     ref = norm(x)
     took = (

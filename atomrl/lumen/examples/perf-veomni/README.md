@@ -348,9 +348,9 @@ dx ". $EX/env.sh && RUN_NAME=<名字> RUN_SUFFIX=r1 LUMEN_PATCH=<补丁> \
 | `vae_bf16` | 冻结的 VAE 以 BF16 运行，`encode()` 出口把 latent 转回 FP32 | `train_dit_lumen.py` |
 | `vae_conv` / `vae_conv_video` | VAE 卷积走 Lumen 的 AITER-backed Conv2d/Conv3d 路径；前者用于图像（T=1 精确转 conv2d），后者还覆盖 T>1 与 feature cache | `lumen_vae_conv.py`、`atomrl.lumen.ops.conv` |
 | `conv_pad_in_kernel` | 因果卷积不再先 `F.pad` 拷贝整块，改由 kernel 用掩码处理对称 padding | `lumen_vae_conv.py` |
-| `sdpa_efficient` | 关闭 SDPA 的 flash 后端；在 ROCm 上反向改走 aiter 融合 `fmha_bwd`。**引入非确定性** | `atomrl.lumen.ops.attention.dit_sdpa` |
-| `attn_triton_fwd` | 仅对 DiT 的 attention（无 mask、非因果、BF16、head_dim 128）改用 aiter Triton 前向，反向仍用 efficient；需同时加 `sdpa_efficient` | `atomrl.lumen.ops.attention.dit_sdpa` |
-| `rmsnorm_fuse` | diffusers `RMSNorm` 的前向经 `torch.compile` 融合；只处理带权重的 RMSNorm，从不碰 LayerNorm | `atomrl.lumen.ops.normalization.diffusers_rmsnorm` |
+| `sdpa_efficient` | 关闭 SDPA 的 flash 后端；在 ROCm 上反向改走 aiter 融合 `fmha_bwd`。**引入非确定性** | `atomrl.lumen.ops.attention.hf_patch` |
+| `attn_triton_fwd` | 仅对 DiT 的 attention（无 mask、非因果、BF16、head_dim 128）改用 aiter Triton 前向，反向仍用 efficient；需同时加 `sdpa_efficient` | `atomrl.lumen.ops.attention.hf_patch` |
+| `rmsnorm_fuse` | diffusers `RMSNorm` 的前向经 `torch.compile` 融合；只处理带权重的 RMSNorm，从不碰 LayerNorm | `atomrl.lumen.ops.normalization.rmsnorm` |
 | `local_adamw` | fused AdamW 直接在 FSDP2 本地分片上执行，绕过 DTensor 分发；结果逐位一致 | `atomrl.lumen.quantize.local_adamw` |
 | `qwen_offline_fix` | 修复 VeOmni `573848a` 的缺陷：Qwen-Image `offline_training` 在未加载 VAE 时读取 `self.vae.config` 导致首步崩溃；应由上游修复 | `veomni_patches/qwen_offline.py` |
 

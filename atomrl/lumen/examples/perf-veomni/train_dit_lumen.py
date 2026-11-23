@@ -349,13 +349,13 @@ def _report_backends():
 
         _rank0(f"aiter conv calls: {conv_calls()}")
     if "attn_triton_fwd" in _PATCH:
-        from atomrl.lumen.ops.attention import dit_sdpa as sdpa
+        from atomrl.lumen.ops.attention import hf_patch as sdpa
 
         _rank0(f"sdpa routing: {sdpa.stats()}")
     if "rmsnorm_fuse" in _PATCH:
-        from atomrl.lumen.ops.normalization import diffusers_rmsnorm as rmsnorm
+        from atomrl.lumen.ops.normalization import rmsnorm
 
-        _rank0(f"rmsnorm_fuse calls: {rmsnorm.stats()}")
+        _rank0(f"rmsnorm_fuse calls: {rmsnorm.diffusers_rmsnorm_stats()}")
 
 
 def _install_hook():

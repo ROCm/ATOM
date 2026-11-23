@@ -51,7 +51,7 @@ def test_conv_uses_aiter_for_bf16_and_torch_otherwise():
 def test_triton_forward_routes_dit_attention_only():
     pytest.importorskip("aiter.ops.triton.mha")
     from atomrl.lumen.config import LumenConfig
-    from atomrl.lumen.ops.attention import dit_sdpa as sdpa
+    from atomrl.lumen.ops.attention import hf_patch as sdpa
 
     LumenConfig(
         scaling="none",
@@ -79,7 +79,7 @@ def test_triton_forward_routes_dit_attention_only():
         stock = sdpa.stats()["stock"]
         with torch.no_grad():
             got = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-            want = sdpa._orig_sdpa(q, k, v, is_causal=True)
+            want = sdpa._original_sdpa(q, k, v, is_causal=True)
         assert sdpa.stats()["stock"] == stock + 1 and torch.equal(got, want)
     finally:
         sdpa.uninstall_triton_forward()
@@ -92,19 +92,21 @@ def test_triton_forward_routes_dit_attention_only():
 def test_rmsnorm_fuses_long_weighted_inputs_only():
     norm_mod = pytest.importorskip("diffusers.models.normalization")
     from atomrl.lumen.config import LumenConfig
-    from atomrl.lumen.ops.normalization import diffusers_rmsnorm as rmsnorm
+    from atomrl.lumen.ops.normalization import rmsnorm
 
     norm = norm_mod.RMSNorm(128, eps=1e-6).cuda().to(torch.bfloat16)
     long_x = torch.randn(1, 2048, 24, 128, device="cuda", dtype=torch.bfloat16)
     short_x = torch.randn(1, 13, 24, 128, device="cuda", dtype=torch.bfloat16)
     want_short = norm(short_x)
-    ref_long = rmsnorm._rmsnorm_weighted(long_x.float(), norm.weight.float(), 1e-6)
+    ref_long = rmsnorm._diffusers_rmsnorm_weighted(
+        long_x.float(), norm.weight.float(), 1e-6
+    )
     LumenConfig(scaling="none", diffusers_rmsnorm_fuse=True).enable(torch.nn.Identity())
     try:
-        before = rmsnorm.stats()
+        before = rmsnorm.diffusers_rmsnorm_stats()
         got_long = norm(long_x)
         assert torch.equal(norm(short_x), want_short)
-        after = rmsnorm.stats()
+        after = rmsnorm.diffusers_rmsnorm_stats()
         assert (
             after["fused"] == before["fused"] + 1
             and after["fallback"] == before["fallback"] + 1

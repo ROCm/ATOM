@@ -112,9 +112,9 @@ def install(target):
 def stats():
     out = {"mask": dict(_mask_stats)}
     if "rmsnorm_fuse" in PATCHES:
-        from atomrl.lumen.ops.normalization import diffusers_rmsnorm as rmsnorm
+        from atomrl.lumen.ops.normalization import rmsnorm
 
-        out["rmsnorm"] = rmsnorm.stats()
+        out["rmsnorm"] = rmsnorm.diffusers_rmsnorm_stats()
     return out
 
 

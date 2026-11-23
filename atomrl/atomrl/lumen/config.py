@@ -344,17 +344,15 @@ class LumenConfig:
             self._patch_conv(model)
 
         if self.dit_sdpa_efficient:
-            from atomrl.lumen.ops.attention.dit_sdpa import prefer_efficient_backend
+            from atomrl.lumen.ops.attention.hf_patch import prefer_efficient_backend
 
             prefer_efficient_backend()
         if self.dit_sdpa_triton_forward:
-            from atomrl.lumen.ops.attention.dit_sdpa import install_triton_forward
+            from atomrl.lumen.ops.attention.hf_patch import install_triton_forward
 
             install_triton_forward()
         if self.diffusers_rmsnorm_fuse:
-            from atomrl.lumen.ops.normalization.diffusers_rmsnorm import (
-                patch_diffusers_rmsnorm,
-            )
+            from atomrl.lumen.ops.normalization.rmsnorm import patch_diffusers_rmsnorm
 
             patch_diffusers_rmsnorm()
         if self.local_shard_adamw:
