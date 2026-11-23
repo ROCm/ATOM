@@ -213,9 +213,8 @@ def test_engine_teardown_always_flushes_traces(monkeypatch, engine_kind, failure
     core._generation_paused = False
     core._sync_dp_state = lambda *a: (False, True, False)
     monkeypatch.setattr(tracing, "shutdown", lambda: calls.append("trace"))
-    if failure in {"drain", "shutdown"} and not (
-        engine_kind == "pp_downstream" and failure == "drain"
-    ):
+    # A later PP stage neither drains KV work nor shuts a KV event publisher down.
+    if failure in {"drain", "shutdown"} and engine_kind != "pp_downstream":
         with pytest.raises(RuntimeError, match=failure):
             core.busy_loop()
     else:
@@ -392,6 +391,7 @@ def test_engine_initializes_tracing_before_ready(monkeypatch):
         is_multinode_tp=False,
         pcp_group_size=1,
         runner_qualname="unused",
+        weight_sync_runner=False,
         enforce_eager=True,
         disagg_is_decode=False,
         pipeline_parallel_size=1,

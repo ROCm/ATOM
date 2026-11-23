@@ -1,3 +1,4 @@
+from collections import OrderedDict
 from types import SimpleNamespace
 
 import pytest
@@ -462,7 +463,7 @@ class _TemporalPool:
 def test_extend_attaches_flydsl_prefill_metadata_for_qwen4(monkeypatch):
     from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy
 
-    attention_gdn._PREFILL_SCHEDULES.clear()
+    monkeypatch.setattr(attention_gdn, "_PREFILL_SCHEDULES", OrderedDict())
     cfg, impl = _qwen4_flydsl_atom_config()
     impl.gdn_flydsl_policy = GDNFlyDSLPolicy(prefill=True, decode=True)
     monkeypatch.setattr(attention_gdn, "get_current_atom_config", lambda: cfg)
@@ -493,7 +494,7 @@ def test_flydsl_prefill_schedule_reuses_host_lengths(monkeypatch):
     """Same query lengths keep one schedule and do not reread the GPU offsets."""
     from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy
 
-    attention_gdn._PREFILL_SCHEDULES.clear()
+    monkeypatch.setattr(attention_gdn, "_PREFILL_SCHEDULES", OrderedDict())
     cfg, impl = _qwen4_flydsl_atom_config()
     impl.gdn_flydsl_policy = GDNFlyDSLPolicy(prefill=True, decode=True)
     monkeypatch.setattr(attention_gdn, "get_current_atom_config", lambda: cfg)
@@ -537,6 +538,51 @@ def test_flydsl_prefill_schedule_reuses_host_lengths(monkeypatch):
     third = SGLangGDNForwardContext._build_gdn_metadata(forward_batch, linear)
     assert calls == [(8,), (8,)]
     assert third.flydsl_prefill_metadata is not first.flydsl_prefill_metadata
+
+
+def test_flydsl_prefill_schedules_keep_only_the_most_recent(monkeypatch):
+    from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy
+
+    monkeypatch.setattr(attention_gdn, "_PREFILL_SCHEDULES", OrderedDict())
+    cfg, impl = _qwen4_flydsl_atom_config()
+    impl.gdn_flydsl_policy = GDNFlyDSLPolicy(prefill=True, decode=True)
+    monkeypatch.setattr(attention_gdn, "get_current_atom_config", lambda: cfg)
+    builds = []
+
+    def _build(lengths, cu_seqlens):
+        builds.append(cu_seqlens)
+        return ("schedule", len(builds))
+
+    monkeypatch.setattr(
+        "atom.model_ops.fla_ops.gdn_flydsl.build_prefill_metadata",
+        _build,
+    )
+    limit = attention_gdn._PREFILL_SCHEDULES_MAX
+    forward_batch = SimpleNamespace(extend_seq_lens_cpu=[8])
+
+    def schedule_for(loc):
+        return attention_gdn._flydsl_prefill_metadata(loc, forward_batch)
+
+    # SGLang allocates a fresh offset tensor for every eager extend.
+    locs = [torch.tensor([0, 8], dtype=torch.int32) for _ in range(limit + 4)]
+    first = [schedule_for(loc) for loc in locs[: limit + 3]]
+    assert len(builds) == limit + 3
+    assert len(attention_gdn._PREFILL_SCHEDULES) == limit
+
+    # The same unchanged buffer still reuses its schedule, and a hit makes it
+    # the most recent entry.
+    assert schedule_for(locs[3]) is first[3]
+    assert len(builds) == limit + 3
+    schedule_for(locs[limit + 3])
+    assert len(attention_gdn._PREFILL_SCHEDULES) == limit
+    assert schedule_for(locs[3]) is first[3]
+    # The least recently used one was dropped and rebuilds on its next use.
+    rebuilt = schedule_for(locs[4])
+    assert rebuilt is not first[4] and builds[-1] is locs[4]
+    assert len(attention_gdn._PREFILL_SCHEDULES) == limit
+    # Writing to the buffer invalidates it, exactly as before the bound.
+    locs[3][1] = 8
+    assert schedule_for(locs[3]) is not first[3]
 
 
 def test_extend_skips_flydsl_metadata_when_prefill_disabled(monkeypatch):
