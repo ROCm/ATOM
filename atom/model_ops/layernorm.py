@@ -18,6 +18,7 @@ from aiter.dist.communication_op import (
     tensor_model_parallel_fused_allreduce_rmsnorm_quant,
 )
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.fused_qk_rmsnorm_group_quant import (
     fused_qk_rmsnorm_group_quant,
@@ -34,6 +35,32 @@ from atom.model_ops.utils import atom_parameter
 from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
+
+try:
+    from aiter.dist.communication_op import (
+        tensor_model_parallel_fused_allreduce_rmsnorm_mxfp8_quant,
+    )
+except ImportError:
+    tensor_model_parallel_fused_allreduce_rmsnorm_mxfp8_quant = None
+try:  # aiter with the sequence-parallel residual ops (gfx1250 ar2s_rms_ex)
+    from aiter.dist.communication_op import (
+        tensor_model_parallel_sp_allreduce_add_residual,
+        tensor_model_parallel_sp_fused_allreduce_rmsnorm,
+        tensor_model_parallel_sp_fused_allreduce_rmsnorm_mxfp8_quant,
+    )
+except ImportError:
+    tensor_model_parallel_sp_fused_allreduce_rmsnorm = None
+    tensor_model_parallel_sp_fused_allreduce_rmsnorm_mxfp8_quant = None
+    tensor_model_parallel_sp_allreduce_add_residual = None
+
+
+def sp_allreduce_supported() -> bool:
+    """Whether this aiter has the sequence-parallel residual AR + RMSNorm ops, on the
+    arch they were validated on (aiter falls back to the replicated ops elsewhere)."""
+    return (
+        tensor_model_parallel_sp_fused_allreduce_rmsnorm is not None
+        and get_gfx_runtime() == "gfx1250"
+    )
 
 
 def silu(input: Tensor, inplace: bool = False) -> Tensor:
@@ -1053,6 +1080,53 @@ def fused_allreduce_gemma_rms_norm(
     return norm(hidden_states, residual)
 
 
+def sp_fused_allreduce_gemma_rms_norm(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    norm: GemmaRMSNorm,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """fused_allreduce_gemma_rms_norm with a sequence-parallel residual (TP > 1): at prefill sizes the
+    returned residual is valid on this rank's owner rows only and may only feed the sp_* helpers;
+    the normed output is whole and bit-identical."""
+    return tensor_model_parallel_sp_fused_allreduce_rmsnorm(
+        hidden_states.contiguous(),
+        residual,
+        norm.weight,
+        norm.variance_epsilon,
+        gemma_norm=True,
+    )
+
+
+def sp_fused_allreduce_gemma_rms_norm_mxfp8_quant(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    norm: GemmaRMSNorm,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """fused_allreduce_gemma_rms_norm_mxfp8_quant with a sequence-parallel residual, see
+    sp_fused_allreduce_gemma_rms_norm. Returns (E4M3, E8M0 scale, residual)."""
+    out_fp8, residual_out, scale_out = (
+        tensor_model_parallel_sp_fused_allreduce_rmsnorm_mxfp8_quant(
+            hidden_states.contiguous(),
+            residual,
+            norm.weight,
+            norm.variance_epsilon,
+            gemma_norm=True,
+        )
+    )
+    return out_fp8, scale_out, residual_out
+
+
+def sp_allreduce_add_residual(
+    hidden_states: torch.Tensor, residual: torch.Tensor
+) -> torch.Tensor:
+    """all_reduce(hidden) + residual, whole on every rank, from a sequence-parallel residual: the
+    residual stream after a layer, as the next layer's AR + norm writes it."""
+    # The op takes a hidden-sized tensor only to read the hidden size; a residual row is one.
+    return tensor_model_parallel_sp_allreduce_add_residual(
+        hidden_states.contiguous(), residual, residual[0]
+    )
+
+
 def fused_allreduce_gemma_rms_norm_quant(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
@@ -1080,6 +1154,40 @@ def fused_allreduce_gemma_rms_norm_quant(
         normed,
         quant_dtype=fp8,
     )
+    return out_fp8, scale_out, residual_out
+
+
+def fused_allreduce_gemma_rms_norm_mxfp8_supported() -> bool:
+    """aiter's AR + Gemma RMSNorm + MXFP8 op exists and was validated on this arch
+    (its E4M3 / E8M0 bytes equal the separate norm and ``quantize_fp8``)."""
+    return (
+        tensor_model_parallel_fused_allreduce_rmsnorm_mxfp8_quant is not None
+        and get_gfx_runtime() == "gfx1250"
+    )
+
+
+def fused_allreduce_gemma_rms_norm_mxfp8_quant(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    norm: GemmaRMSNorm,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return Gemma-normalized E4M3 values, E8M0 scales, and the residual."""
+    if get_tensor_model_parallel_world_size() > 1:
+        out_fp8, residual_out, scale_out = (
+            tensor_model_parallel_fused_allreduce_rmsnorm_mxfp8_quant(
+                hidden_states.contiguous(),
+                residual,
+                norm.weight,
+                norm.variance_epsilon,
+                gemma_norm=True,
+            )
+        )
+        return out_fp8, scale_out, residual_out
+
+    from atom.model_ops.blockscale import quantize_fp8
+
+    normed, residual_out = norm(hidden_states, residual)
+    out_fp8, scale_out = quantize_fp8(normed)
     return out_fp8, scale_out, residual_out
 
 

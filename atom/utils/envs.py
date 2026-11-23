@@ -209,6 +209,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KV_OFFLOAD_EXTRA_CONFIG": lambda: os.getenv(
         "ATOM_KV_OFFLOAD_EXTRA_CONFIG", ""
     ),
+    "ATOM_STORE_SAVE_BATCH_CHUNKS": lambda: _int_env("ATOM_STORE_SAVE_BATCH_CHUNKS", 0),
     # --- Data Parallelism ---
     "ATOM_DP_RANK": lambda: int(os.getenv("ATOM_DP_RANK", "0")),
     "ATOM_DP_RANK_LOCAL": lambda: int(os.getenv("ATOM_DP_RANK_LOCAL", "0")),
@@ -526,8 +527,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_STATE_CHECKPOINT_CHECK_BLOCKS", "0") == "1"
     ),
     # Set to 1 to read Qwen GDN state checkpoints out of the chunk kernel's
-    # interior states instead of cutting prefill chunks onto them. PAGE path
-    # only (Qwen3-Next / Qwen3.5); see `PagedStateCheckpointCoordinator`.
+    # interior states instead of cutting prefill chunks onto them, on both the
+    # PAGE and the fork-slot path; see `StateCache.publish_midstep`. Not
+    # Qwen3.8, whose PLE windows are checkpointed only where a forward ends.
     "ATOM_GDN_STATE_MIDSTEP": lambda: os.getenv("ATOM_GDN_STATE_MIDSTEP", "0") == "1",
     # Set to 0 to keep Qwen3.5's GDN input projection as two layers
     # (`in_proj_qkvz` + `in_proj_ba`) when the checkpoint quantizes them with
@@ -586,14 +588,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_V4_INDEXER_QSPLIT_MIN_LOGITS": lambda: int(
         os.getenv("ATOM_V4_INDEXER_QSPLIT_MIN_LOGITS", str(1 << 26))
     ),
-    # DCP sparse (DSA) prefill: when QREP is active, produce the whole DCP
-    # group's query heads locally, as decode does, instead of AllGather Q. The
+    # DCP sparse (DSA) prefill, "q" transport: when QREP is active, produce the
+    # whole DCP group's query heads locally, as decode does, instead of
+    # AllGather Q. A "kv" step attends only this rank's heads and ignores it. The
     # pynccl gather lands rank-major, so the dim=1 reshape after it also copies
     # the whole gathered q back to token-major; this removes both. Costs a
     # group-wide q GEMM + W_K bmm per prefill token. Off by default.
     "ATOM_DCP_PREFILL_QREP": lambda: os.getenv("ATOM_DCP_PREFILL_QREP", "0") == "1",
-    # DCP sparse prefill: use the non-persistent fp8 gqa64 MLA kernel, which
-    # needs no work metadata. On by default; needs an aiter with ROCm/aiter#6132.
+    # DCP sparse prefill transport. "q" gathers the group's query heads and
+    # merges partials by LSE; "kv" all-gathers the step's KV rows and attends
+    # this rank's own heads over the whole top-k, with no merge. "auto" takes
+    # "kv" while the step's context is under ~200K + k * its new tokens (k 52
+    # with >= 16 heads a rank, 40 with fewer) and its gathered KV fits the token cap, else "q";
+    # "kv" skips the first condition and warns when it cannot be taken. The cap
+    # counts gathered rows (each request padded to whole local blocks), >= 0.
+    "ATOM_DCP_SPARSE_PREFILL": lambda: os.getenv("ATOM_DCP_SPARSE_PREFILL", "auto"),
+    "ATOM_DCP_SPARSE_PREFILL_KV_MAX_TOKENS": lambda: int(
+        os.getenv("ATOM_DCP_SPARSE_PREFILL_KV_MAX_TOKENS", str(1 << 20))
+    ),
+    # DCP sparse prefill, "q" transport: use the non-persistent fp8 gqa64 MLA
+    # kernel, which needs no work metadata; a "kv" step runs the dcp=1 kernel
+    # and its plan regardless. On by default; needs an aiter with ROCm/aiter#6132.
     "ATOM_DCP_SPARSE_PREFILL_NONPS": lambda: (
         os.getenv("ATOM_DCP_SPARSE_PREFILL_NONPS", "1") == "1"
     ),
@@ -1441,6 +1456,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # OFFLOAD_LOAD_WORKERS: its SLOT load path needs a serial load executor.
     "OFFLOAD_COPY_WORKERS": lambda: _int_env("OFFLOAD_COPY_WORKERS", 1),
     "OFFLOAD_LOAD_WORKERS": lambda: _int_env("OFFLOAD_LOAD_WORKERS", 1),
+    # Opt-in (default off). Mooncake Store only: renew a load's lease keys on
+    # the bounded renewal executor instead of blocking the scheduler thread.
+    "ATOM_STORE_ASYNC_RENEW": lambda: _flag_env("ATOM_STORE_ASYNC_RENEW"),
     # Running-plus-queued save bound. None means unset: the connector then
     # derives max(2, 2 * OFFLOAD_COPY_WORKERS) and the scheduler's state tier
     # uses 2. A kv_connector_extra_config "max_pending_saves" takes precedence.
