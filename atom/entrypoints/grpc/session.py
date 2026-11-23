@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """The Session RPC's state: each Session's engine ids in a window of their own, and per
 engine step one StreamBatch per Session, then an id-free item per request it ended."""
 

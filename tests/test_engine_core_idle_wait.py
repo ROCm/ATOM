@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """An idle `EngineCore.busy_loop` sleeps on the event its input thread sets after each
 put, rather than spinning on the GIL that thread needs; a request queued wakes it."""
 
