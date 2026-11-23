@@ -36,7 +36,8 @@ def load(src):
 
 def drive(mod, scn):
     """Run watchdog.run() once; return everything it did."""
-    rec = {"polls": 0, "posts": [], "notices": [], "warnings": [], "errors": [], "rc": None}
+    rec = {"polls": 0, "posts": [], "notices": [], "warnings": [], "errors": [],
+           "scopes": set(), "rc": None}
 
     class Fake(mod.GitHub):
         def _get(self, path):
@@ -50,8 +51,14 @@ def drive(mod, scn):
                 # A watchdog that never returns would hang this test instead of failing it.
                 assert rec["polls"] <= 60, "polled past any sane deadline"
                 st = scn["self_status"](rec["polls"])
-                return {"jobs": [] if st is None else [{"name": "review", "status": st}]}
+                return {"jobs": [] if st is None else
+                        [{"name": "review", "status": st,
+                          "labels": ["self-hosted", "atom-bot"]}]}
             if "/runs" in u.path:
+                # The two scopes are different endpoints, and the fake has to tell them
+                # apart: answering both from one list let box_busy be narrowed back to this
+                # workflow with every test still green.
+                rec["scopes"].add("workflow" if "/workflows/" in u.path else "repo")
                 live = scn.get("live_runs", [])
                 live = live(rec["polls"]) if callable(live) else live
                 per, page = int(q["per_page"][0]), int(q["page"][0])
@@ -85,7 +92,7 @@ def drive(mod, scn):
 
 QUEUED_FOREVER = lambda _n: "queued"
 BUSY_ELSEWHERE = {"live_runs": [{"id": 222}],
-                  "other_jobs": {222: [{"name": "review", "status": "in_progress"}]}}
+                  "other_jobs": {222: [{"name": "review", "status": "in_progress", "labels": ["self-hosted", "atom-bot"]}]}}
 
 CASES = [
     ("alarms when no runner ever claims the review",
@@ -118,12 +125,47 @@ CASES = [
          (r["polls"] > 1, "stopped watching the moment it saw the box busy"),
      ]),
 
+    # ...and it must ask the repo-wide endpoint to find out. Narrowing this back to the
+    # review workflow is the bug this PR fixes, and nothing else would notice.
+    ("asks about the whole box, not just its own workflow",
+     {"self_status": QUEUED_FOREVER,
+      "live_runs": [{"id": 333}],
+      "other_jobs": {333: [{"name": "nightly-bench", "status": "in_progress",
+                            "labels": ["self-hosted", "atom-bot"]}]}},
+     lambda r: [
+         ("repo" in r["scopes"], "only ever queried its own workflow's runs"),
+     ]),
+
+    # The box is busy whoever is using it. Counting only this workflow's runs made a healthy
+    # box doing other work read as idle, and the only defence against that was a gate that
+    # forbade anyone else from using the label -- which, when a repo did, stopped every review
+    # there under a message about prompt drift (aiter#8255, 2026-11-18).
+    ("stays silent while the box runs another workflow entirely",
+     {"self_status": QUEUED_FOREVER,
+      "live_runs": [{"id": 333}],
+      "other_jobs": {333: [{"name": "nightly-bench", "status": "in_progress",
+                            "labels": ["self-hosted", "atom-bot"]}]}},
+     lambda r: [
+         (not r["posts"], "paged someone while the box was legitimately busy"),
+         (r["rc"] == 0, "failed the job for queueing behind another workflow"),
+     ]),
+
+    # ...and a job on some other runner is not this box.
+    ("alarms when the busy job is on a different box",
+     {"self_status": QUEUED_FOREVER,
+      "live_runs": [{"id": 444}],
+      "other_jobs": {444: [{"name": "review", "status": "in_progress",
+                            "labels": ["self-hosted", "some-other-box"]}]}},
+     lambda r: [
+         (len(r["posts"]) == 1, "stayed quiet although nothing was holding this box"),
+     ]),
+
     # Seeing another review is not a reason to stop watching: the runner can die a minute later,
     # and then this PR sits `queued` with nobody left alive to notice.
     ("alarms when the busy runner dies mid-wait",
      {"self_status": QUEUED_FOREVER,
       "live_runs": lambda n: [{"id": 222}] if n <= 2 else [],
-      "other_jobs": {222: [{"name": "review", "status": "in_progress"}]}},
+      "other_jobs": {222: [{"name": "review", "status": "in_progress", "labels": ["self-hosted", "atom-bot"]}]}},
      lambda r: [
          (len(r["posts"]) == 1, "went quiet for a runner that died while it was watching"),
          (r["rc"] == 1, "did not fail the run after the runner disappeared"),
@@ -146,7 +188,7 @@ CASES = [
     ("finds the busy runner under a large backlog",
      {"self_status": QUEUED_FOREVER,
       "live_runs": [{"id": 1000 + i} for i in range(120)],
-      "other_jobs": {1000: [{"name": "review", "status": "in_progress"}]}},
+      "other_jobs": {1000: [{"name": "review", "status": "in_progress", "labels": ["self-hosted", "atom-bot"]}]}},
      lambda r: [
          (not r["posts"], "paged someone although a review was running the whole time"),
          (any("busy" in m for m in r["notices"]), "did not recognise the box as busy"),

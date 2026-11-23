@@ -148,7 +148,10 @@ def test_exchange_scores_local_rows_then_gathers_and_filters_on_its_stream(fp4):
         (True, 2, True, True),
     ],
 )
-def test_only_eligible_prefill_dispatches_the_exchange(prefill, dcp, stream, packed):
+@pytest.mark.parametrize("kv", [False, True])
+def test_only_eligible_prefill_dispatches_the_exchange(
+    prefill, dcp, stream, packed, kv
+):
     tree = ast.parse(PATH.read_text())
     fn = next(
         n
@@ -189,8 +192,9 @@ def test_only_eligible_prefill_dispatches_the_exchange(prefill, dcp, stream, pac
         dcp_owned_counts=None,
         sparse_cu_seqlens_q=None,
         cu_seqlens_k=None,
+        dcp_sparse_prefill_kv=object() if kv and prefill and dcp > 1 else None,
     )
-    eligible = prefill and dcp > 1 and stream and not packed
+    eligible = prefill and dcp > 1 and stream and not packed and not kv
 
     def exchange(value):
         assert eligible and value is side
@@ -224,6 +228,7 @@ def test_only_eligible_prefill_dispatches_the_exchange(prefill, dcp, stream, pac
         "triton_filter_and_convert_dcp_index_prefill": lambda *a, **k: calls.append(
             "filter"
         ),
+        "triton_dcp_sparse_prefill_kv_index": lambda *a, **k: calls.append("kv"),
         "triton_convert_req_index_to_global_index_dsa_prefill": lambda *a, **k: calls.append(
             "convert"
         ),
@@ -236,7 +241,13 @@ def test_only_eligible_prefill_dispatches_the_exchange(prefill, dcp, stream, pac
     assert calls == (
         ["guard", "exchange"]
         if eligible
-        else ["decode" if not prefill else "filter" if dcp > 1 else "convert"]
+        else [
+            (
+                "decode"
+                if not prefill
+                else ("kv" if kv else "filter") if dcp > 1 else "convert"
+            )
+        ]
     )
     assert len(scores) == (0 if eligible else 1)
     if scores:

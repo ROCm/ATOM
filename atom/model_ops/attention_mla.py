@@ -71,7 +71,10 @@ from atom.distributed.pcp_utils import (
 from atom.model_ops.attentions.sparse_mla_head_groups import (
     PERSISTENT_WORK_BUFFERS,
 )
-from atom.model_ops.dcp_ops import dcp_all_gather_prefill_query_heads
+from atom.model_ops.dcp_ops import (
+    dcp_all_gather_prefill_query_heads,
+    dcp_gather_sparse_prefill_kv,
+)
 from atom.model_ops.indexer.schedule import skips_index_topk
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import use_triton_gemm
@@ -401,9 +404,9 @@ def mla_dcp_sparse_prefill_num_heads(
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
 ) -> tuple[int, bool]:
-    """Return the gathered prefill width and whether its plan is known native.
+    """Return the "q" prefill width and whether its plan is known native.
 
-    Sparse prefill uses the group-wide query heads, gathered or already
+    A "q" prefill uses the group-wide query heads, gathered or already
     replicated: ``num_heads * dcp_world_size``, not the per-rank count. It needs
     its own kernel support query since decode's widths differ here.
 
@@ -869,6 +872,7 @@ class MLAAttention(nn.Module):
         self.qrep_enabled = qrep_enabled_for_layer(
             wants_qrep, self.q_proj, self.qrep_num_heads, self.qk_head_dim
         )
+        self.dcp_prefill_qrep = envs.ATOM_DCP_PREFILL_QREP
         # Keyed on type(self), not the MLAAttention base class: subclasses
         # (SGLangATOMGLM52MLAAttention, the vLLM plugin's AttentionForVllmMLA)
         # would otherwise share one base-class flag/set and mask each other.
@@ -1031,7 +1035,7 @@ class MLAAttention(nn.Module):
                 self.dcp_kernel_num_heads - self.num_heads * dcp_world_size
             )
 
-        # Sparse prefill gathers query heads too, and needs its own width
+        # A "q" sparse prefill gathers query heads too, and needs its own width
         # (mla_dcp_sparse_prefill_num_heads), sized here so the vllm plugin's
         # re-init picks both up. Uses its own persistence predicate so it
         # can't silently borrow decode's answer if the two ever diverge.
@@ -1468,11 +1472,12 @@ class MLAAttention(nn.Module):
     def _local_q_proj(self):
         """This rank's rows of the QREP-widened q_proj, built on first use.
 
-        Dense prefill (and sparse prefill without ATOM_DCP_PREFILL_QREP) needs
-        only its own heads, and slicing the OUTPUT still pays for the whole
-        group's GEMM -- so it projects through a zero-copy row view of the
-        weight. Decode keeps the full q_proj; that is what lets it skip the
-        AllGather Q. See ``ColumnParallelLinear.make_row_view``.
+        Dense prefill, sparse prefill without ATOM_DCP_PREFILL_QREP and a "kv"
+        sparse prefill step need only their own heads, and slicing the OUTPUT
+        still pays for the whole group's GEMM -- so it projects through a
+        zero-copy row view of the weight. Decode keeps the full q_proj; that
+        is what lets it skip the AllGather Q. See
+        ``ColumnParallelLinear.make_row_view``.
         """
         w = self.q_proj.weight.data
         if self._qrep_local_src is not w:
@@ -1596,8 +1601,10 @@ class MLAAttention(nn.Module):
 
     @mark_trace(prefix="dcp_sparse_prefill", torch_compile=False)
     def _dcp_sparse_prefill(self, q_out, kv_cache, attn_metadata, use_qrep=False):
-        """Sparse prefill under DCP: each rank holds a disjoint slice of the
-        global top-k, so its partial output must be merged like decode's.
+        """Sparse prefill under DCP. The "q" transport: each rank holds a
+        disjoint slice of the global top-k, so its partial output must be
+        merged like decode's. The "kv" one (a step whose metadata carries
+        ``dcp_sparse_prefill_kv``) is `_dcp_sparse_prefill_kv`.
 
         Merge dtype is platform-dependent -- on gfx942 the bf16 ReduceScatter
         sum costs ~3.5pp, on gfx950 it is free even at ctx~32k with fp8 KV.
@@ -1614,6 +1621,10 @@ class MLAAttention(nn.Module):
         if attn_metadata.index_exchange_done is not None:
             attn_metadata.index_exchange_done.wait()
             attn_metadata.index_exchange_done = None
+        if attn_metadata.dcp_sparse_prefill_kv is not None:
+            # forward() turns QREP off for a "kv" step: its plan is per-rank heads.
+            assert not use_qrep, "a DCP kv prefill got the group's query heads"
+            return self._dcp_sparse_prefill_kv(q_out, kv_cache, attn_metadata)
         if not use_qrep:
             q_out = dcp_all_gather_prefill_query_heads(
                 self.dcp_group, q_out, self.dcp_sparse_prefill_num_heads
@@ -1631,6 +1642,61 @@ class MLAAttention(nn.Module):
             merge_in_fp32=not self.dcp_prefill_merge_bf16_ok,
             owned_counts=attn_metadata.dcp_owned_counts[: q_out.shape[0]],
         )
+
+    def _hold_dcp_sparse_prefill_scratch(self, num_tokens, device):
+        """Dummy prefill: allocate, and free, what a "kv" sparse prefill adds
+        in this layer, so the memory profile that sizes the KV cache counts it;
+        the dummy run skips the attention itself."""
+        from atom.model_ops.dcp_ops import (
+            dcp_sparse_prefill_kv_blocker,
+            dcp_sparse_prefill_kv_max_tokens_env,
+            dcp_sparse_prefill_kv_profile_rows,
+            dcp_sparse_prefill_kv_scratch_bytes,
+            dcp_sparse_prefill_mode_env,
+        )
+
+        page = max(1, envs.ATOM_MLA_PAGE_SIZE)
+        mode = dcp_sparse_prefill_mode_env()
+        if (
+            mode == "q"
+            or dcp_sparse_prefill_kv_blocker(self.kv_cache_dtype, page) is not None
+        ):
+            return
+        config = get_current_atom_config()
+        # A real step takes up to the batch budget, more than a short dummy
+        # prefill, and the gathered rows and the per-token scratch grow with it.
+        num_tokens = max(num_tokens, config.max_num_batched_tokens)
+        kv_rows = dcp_sparse_prefill_kv_profile_rows(
+            mode,
+            num_tokens,
+            self.num_heads,
+            config.max_num_seqs,
+            config.kv_cache_block_size,
+            self.dcp_world_size,
+            dcp_sparse_prefill_kv_max_tokens_env(),
+        )
+        nbytes = dcp_sparse_prefill_kv_scratch_bytes(
+            num_tokens,
+            self.num_heads,
+            self.padded_num_heads,
+            self.kv_lora_rank,
+            self.qk_rope_head_dim,
+            1,  # fp8 KV, which the blocker requires
+            self.dcp_world_size,
+            kv_rows,
+        )
+        torch.empty(nbytes, dtype=torch.uint8, device=device)
+
+    @mark_trace(prefix="dcp_sparse_prefill_kv", torch_compile=False)
+    def _dcp_sparse_prefill_kv(self, q_out, kv_cache, attn_metadata):
+        """Sparse prefill under DCP, "kv" transport: gather the step's KV rows
+        from the group and attend this rank's own heads over the whole top-k
+        (the indexer wrote it as rows of the gathered KV). No LSE, no merge:
+        the output is what the dcp=1 prefill computes for these heads."""
+        kv = dcp_gather_sparse_prefill_kv(
+            self.dcp_group, kv_cache, attn_metadata.dcp_sparse_prefill_kv
+        )
+        return self._forward_prefill_mla(q_out, kv, attn_metadata, dcp_kv=True)
 
     @mark_trace(prefix="dcp_decode", torch_compile=False)
     def _dcp_decode(self, q_out, kv_cache, attn_metadata, use_qrep):
@@ -2450,6 +2516,7 @@ class MLAAttention(nn.Module):
         attn_metadata: AttentionMetaData,
         return_lse: bool = False,
         q_prepadded: bool = False,
+        dcp_kv: bool = False,
     ) -> torch.Tensor:
         assert attn_metadata is not None
         B = q.shape[0]
@@ -2458,7 +2525,9 @@ class MLAAttention(nn.Module):
         # so it pads to its own kernel width, from its own query -- not decode's
         # (see mla_dcp_sparse_prefill_is_persistent). Every other caller pads
         # the per-rank count.
-        dcp_sparse = self.is_sparse_mla and self.dcp_world_size > 1
+        # A "kv" DCP prefill (`_dcp_sparse_prefill_kv`) runs as dcp=1 does: this
+        # rank's heads over the global top-k of a gathered KV.
+        dcp_sparse = self.is_sparse_mla and self.dcp_world_size > 1 and not dcp_kv
         if q_prepadded:
             # Fused Q writing pads local heads; DCP gather pads the whole group.
             # Restore all real group heads before the cross-rank merge.
@@ -2524,7 +2593,7 @@ class MLAAttention(nn.Module):
             # Sparse attention needs one last-page len per query token; the dense
             # kv_last_page_lens (per-seq) would over-read -> illegal access.
             kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
-            if self.dcp_world_size > 1:
+            if dcp_sparse:
                 # The indexer compacted this rank's owned candidates to the front
                 # of each query token's region, so the region lengths are the
                 # per-rank (and per-layer) ones, not the global sparse_kv_indptr.
@@ -2624,7 +2693,9 @@ class MLAAttention(nn.Module):
                 # either way -- use_decode_kernel above already requires fp8
                 # or return_lse, and return_lse is never true when DCP is off
                 # -- kept only so both arms read the same condition.
-                use_work_meta = self.dcp_world_size <= 1 or sparse_dcp_persistent
+                use_work_meta = (
+                    self.dcp_world_size <= 1 or dcp_kv or sparse_dcp_persistent
+                )
                 if group_heads:
                     work = head_groups.work
                 elif use_work_meta:
@@ -2645,7 +2716,7 @@ class MLAAttention(nn.Module):
                     max_q_len,
                     page_size=page_size,
                     num_kv_splits=mla_dcp_sparse_prefill_kv_splits(
-                        nonps, self.dcp_world_size
+                        nonps, 1 if dcp_kv else self.dcp_world_size
                     ),
                     sm_scale=self.scale,
                     q_scale=self._q_scale if is_fp8 else None,
@@ -3222,6 +3293,8 @@ class MLAAttention(nn.Module):
         context = forward_context.context
         use_prefill_mla = self.is_sparse_mla and attn_metadata.run_sparse
         if forward_context.context.is_dummy_run:
+            if self.is_sparse_mla and self.dcp_world_size > 1 and context.is_prefill:
+                self._hold_dcp_sparse_prefill_scratch(q.shape[0], q.device)
             output_shape = list(q.shape)
             atom_config = get_current_atom_config()
             output_shape[-1] = _mla_output_width(
@@ -3305,11 +3378,14 @@ class MLAAttention(nn.Module):
             # even when use_qrep is False (group=False slices back to per-rank heads
             # and the AG path runs as before); use_qrep only toggles the optimization.
             # Sparse prefill joins under ATOM_DCP_PREFILL_QREP (see qrep_for_step).
+            # A "kv" prefill attends only this rank's heads.
             use_qrep = qrep_for_step(
                 self.qrep_enabled,
                 self.use_seg_mla,
                 context.is_prefill,
-                envs.ATOM_DCP_PREFILL_QREP,
+                context.is_prefill
+                and self.dcp_prefill_qrep
+                and attn_metadata.dcp_sparse_prefill_kv is None,
             )
             absorb_into_q_out = (
                 use_qrep

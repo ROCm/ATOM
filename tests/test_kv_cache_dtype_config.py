@@ -9,6 +9,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import torch
 from transformers import PretrainedConfig
 
 from atom import config as config_module
@@ -205,3 +206,17 @@ def test_invalid_a8w4_mode_fails_at_startup_before_loading(monkeypatch):
     with pytest.raises(ValueError, match="ATOM_DSV41_A8W4_ATTN must be auto or off"):
         Config(model="unused-local-config")
     loader.assert_not_called()
+
+
+@pytest.mark.parametrize("name", ["fp4", "nvfp4"])
+def test_an_fp4_kv_cache_is_stored_as_uint8(name):
+    assert config_module.kv_cache_torch_dtype(name) is torch.uint8
+
+
+@pytest.mark.parametrize("name", ["bf16", "fp8"])
+def test_other_kv_cache_dtypes_are_aiters_entry(monkeypatch, name):
+    table = {"bf16": torch.bfloat16, "fp8": torch.float8_e4m3fn}
+    aiter = ModuleType("aiter")
+    aiter.dtypes = SimpleNamespace(d_dtypes=table)
+    monkeypatch.setitem(sys.modules, "aiter", aiter)
+    assert config_module.kv_cache_torch_dtype(name) is table[name]

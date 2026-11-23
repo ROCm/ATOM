@@ -253,7 +253,9 @@ class _PerTokenFp8Proj:
 
 
 _METADATA = SimpleNamespace(
-    dcp_owned_counts=torch.ones(8, dtype=torch.int32), index_exchange_done=None
+    dcp_owned_counts=torch.ones(8, dtype=torch.int32),
+    index_exchange_done=None,
+    dcp_sparse_prefill_kv=None,
 )
 
 

@@ -356,7 +356,10 @@ def test_plan_support_is_bound_to_the_final_width_and_reset(
     "dcp,block,topk,expected",
     [(1, 128, 2048, 128), (8, 1, 2048, 2048), (8, 1, 2176, 4096)],
 )
-def test_work_plan_reuses_its_initialized_granularity(dcp, block, topk, expected):
+@pytest.mark.parametrize("local_heads", [False, True])
+def test_work_plan_preserves_transport_granularity(
+    dcp, block, topk, expected, local_heads
+):
     path = (
         Path(__file__).resolve().parents[1] / "atom/model_ops/attentions/aiter_mla.py"
     )
@@ -407,6 +410,7 @@ def test_work_plan_reuses_its_initialized_granularity(dcp, block, topk, expected
         model_runner=SimpleNamespace(
             forward_vars={f"sparse_prefill_{k}": v for k, v in work.items()}
         ),
+        _sparse_prefill_work_views=lambda prefix, heads: work,
     )
     ns = {
         "self": instance,
@@ -429,7 +433,10 @@ def test_work_plan_reuses_its_initialized_granularity(dcp, block, topk, expected
     initialized = list(counts)
     metadata = SimpleNamespace(sparse_cu_seqlens_q=None, sparse_kv_indptr=None)
     for _ in range(2):
-        ns["_sparse_prefill_work_plan"](instance, metadata, "", 64, None)
-    assert plans == [expected, expected]
-    assert counts == initialized, "prefill recomputed static granularity"
+        ns["_sparse_prefill_work_plan"](
+            instance, metadata, "", 64, None, local_heads=local_heads
+        )
+    want = max(block, 16) if local_heads else expected
+    assert plans == [want, want]
+    assert counts == initialized + (["max"] * 2 if local_heads else [])
     assert initialized == ["power" if dcp > 1 else "max"]
