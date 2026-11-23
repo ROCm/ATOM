@@ -2286,6 +2286,10 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
     def should_defer_free(self, seq: Sequence) -> bool:
         return str(seq.id) in self._awaiting_send
 
+    def pd_send_pending(self, seq: Sequence) -> bool:
+        # The only claim this connector holds is a send's.
+        return self.should_defer_free(seq)
+
     def send_finished(self, req_id) -> None:
         self._awaiting_send.discard(str(req_id))
 

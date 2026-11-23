@@ -5,7 +5,6 @@ import logging
 import queue
 import time
 import uuid
-from collections.abc import Iterable
 from typing import ClassVar
 
 import numpy as np
@@ -71,17 +70,43 @@ def kv_change(cmd: str, args) -> str | None:
     return None
 
 
-def physical_block_count(tables: Iterable[BlockTable], num_blocks: int) -> int:
-    """Physical blocks across tables, a shared prefix counted once.
+DEFERRED_FREE_HOLDERS = ("send", "store", "aborted_load")
 
-    A boolean mask over the pool, filled from each table's buffer. Building a
+
+def deferred_free_blocks_by_holder(seqs, connector, num_blocks: int) -> dict[str, int]:
+    """Physical blocks of whole-deferred requests by what still holds them.
+
+    A request held for an aborted load's cleanup is `aborted_load`; otherwise
+    one whose P/D send still claims it is `send`; any other connector claim (an
+    offload save, a load still writing) is `store`. A block shared across
+    holders counts once, under the first in `DEFERRED_FREE_HOLDERS`, so the
+    three sum to the physical blocks the requests hold.
+
+    One boolean mask over the pool, filled from each table's buffer. Building a
     Python set of every id costs tens to hundreds of milliseconds once finished
     requests hold a long context, and this runs on the engine thread.
     """
+    tables: dict[str, list[BlockTable]] = {
+        holder: [] for holder in DEFERRED_FREE_HOLDERS
+    }
+    for seq in seqs:
+        if getattr(seq, "_awaiting_aborted_load_cleanup", False):
+            holder = "aborted_load"
+        elif connector is not None and connector.pd_send_pending(seq):
+            holder = "send"
+        else:
+            holder = "store"
+        tables[holder].append(seq.block_table)
     seen = np.zeros(num_blocks, dtype=bool)
-    for table in tables:
-        seen[np.frombuffer(table, dtype=np.int32)] = True
-    return int(seen.sum())
+    counts = {}
+    held = 0
+    for holder in DEFERRED_FREE_HOLDERS:
+        for table in tables[holder]:
+            seen[np.frombuffer(table, dtype=np.int32)] = True
+        total = int(np.count_nonzero(seen))
+        counts[holder] = total - held
+        held = total
+    return counts
 
 
 def completes_weight_sync(cmd: str, args: dict) -> bool:
@@ -1217,6 +1242,9 @@ class EngineUtilityHandler:
                 # save, or a load still writing into their blocks. Early-release
                 # offload leases are excluded.
                 deferred_free = self.scheduler.deferred_free_blocks.values()
+                by_holder = deferred_free_blocks_by_holder(
+                    deferred_free, kv_connector, kv_pool.num_blocks
+                )
                 result |= {
                     "kv_blocks_used": kv_pool.num_used,
                     "kv_blocks_free": kv_pool.num_free,
@@ -1225,10 +1253,8 @@ class EngineUtilityHandler:
                     "kv_blocks_evictable": reusable,
                     "kv_blocks_vacant": kv_pool.num_free - reusable,
                     "requests_deferred_free": len(deferred_free),
-                    "kv_blocks_deferred_free": physical_block_count(
-                        (seq.block_table for seq in deferred_free),
-                        kv_pool.num_blocks,
-                    ),
+                    "kv_blocks_deferred_free": sum(by_holder.values()),
+                    "kv_blocks_deferred_free_by_holder": by_holder,
                 }
 
             metrics = getattr(self.scheduler, "metrics", None)

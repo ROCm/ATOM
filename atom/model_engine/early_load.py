@@ -18,9 +18,9 @@ from typing import Any
 
 logger = logging.getLogger("atom")
 
-# Skips that are about pressure on blocks or slots; every other skip is a
-# condition the request does not meet.
-LIMIT_REASONS = ("watermark", "max_frac", "pool_full", "seq_slots")
+# Skips that are about pressure on blocks, slots or a producer's P/D send
+# budget; every other skip is a condition the request does not meet.
+LIMIT_REASONS = ("watermark", "max_frac", "pool_full", "seq_slots", "pd_send_budget")
 
 
 class EarlyLoadState:

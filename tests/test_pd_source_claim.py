@@ -119,11 +119,13 @@ def test_claim_is_taken_at_publication_and_dropped_on_send(build, as_str):
     assert (
         sched.should_defer_free(seq) is True
     ), "the peer now has these addresses and the read outlives the call"
+    assert sched.pd_send_pending(seq) is True  # The claim is the send's.
     assert seq.kv_transfer_params_output["do_remote_prefill"] is True
     assert seq.kv_transfer_params_output["remote_block_ids"] == seq.block_table
 
     sched.send_finished(str(seq.id) if as_str else seq.id)
     assert sched.should_defer_free(seq) is False
+    assert sched.pd_send_pending(seq) is False
 
 
 @pytest.mark.parametrize("build", BACKENDS)

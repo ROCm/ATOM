@@ -139,6 +139,16 @@ class _AtomMetricsCollector:
             metric = GaugeMetricFamily(name, documentation)
             metric.add_metric([], float(value))
             yield metric
+        by_holder = GaugeMetricFamily(
+            "atom:kv_cache_blocks_deferred_free_by_holder",
+            "atom:kv_cache_blocks_deferred_free by what still holds the blocks: a P/D send (send), another connector claim such as an offload save (store), or an aborted load's cleanup (aborted_load). A block shared across holders counts once, so the holders sum to the unlabelled metric.",
+            labels=["holder"],
+        )
+        for holder, blocks in snapshot.get(
+            "kv_blocks_deferred_free_by_holder", {}
+        ).items():
+            by_holder.add_metric([holder], float(blocks))
+        yield by_holder
 
         for name, documentation, value in (
             (
@@ -518,12 +528,12 @@ class _AtomMetricsCollector:
 
         pending = GaugeMetricFamily(
             "atom:pd_admission_pending_requests",
-            "PD requests holding admission credits through their first scheduled forward.",
+            "PD requests holding admission credits: decode receives until their first scheduled forward, prefill sends until the send claim retires.",
             labels=["dp_rank", "engine_role", "state"],
         )
         pending_bytes = GaugeMetricFamily(
             "atom:pd_admission_pending_kv_bytes",
-            "Physical receive-target bytes held by pending PD requests per D rank.",
+            "Physical KV bytes held by pending PD requests per rank: receive targets on a decode, send sources on a prefill.",
             labels=["dp_rank", "engine_role"],
         )
         deferred = CounterMetricFamily(

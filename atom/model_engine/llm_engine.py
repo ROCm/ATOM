@@ -493,6 +493,12 @@ class LLMEngine:
         def summed(key: str) -> int:
             return sum(int(stats.get(key, 0)) for stats in rank_stats)
 
+        deferred_by_holder: Counter[str] = Counter()
+        for stats in rank_stats:
+            deferred_by_holder.update(
+                stats.get("kv_blocks_deferred_free_by_holder", {})
+            )
+
         # Queue depths cannot be summed across a P/D pair: one in-flight
         # request sits in the prefill rank's `running` and the decode rank's
         # `prefill_waiting` at once. The decode side's four queues already
@@ -599,6 +605,7 @@ class LLMEngine:
             "preemptions": summed("preemptions"),
             "requests_deferred_free": summed("requests_deferred_free"),
             "kv_blocks_deferred_free": summed("kv_blocks_deferred_free"),
+            "kv_blocks_deferred_free_by_holder": dict(deferred_by_holder),
             "kv_blocks_used": kv_used,
             "kv_blocks_free": summed("kv_blocks_free"),
             "kv_blocks_total": kv_total,

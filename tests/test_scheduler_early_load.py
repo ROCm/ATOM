@@ -753,8 +753,9 @@ def test_a_routed_estimate_reports_the_hit_not_the_replay_start(
     assert sched.dp_reuse_reports == [(seq.id, 48)]
 
 
+@pytest.mark.parametrize("blocked_by", ["blocks", "pd_send_budget"])
 def test_settled_early_owner_keeps_fifo_until_the_head_cannot_allocate(
-    monkeypatch, seq_factory
+    monkeypatch, seq_factory, blocked_by
 ):
     sched, _, (head, owner) = _make(monkeypatch, seq_factory, n=2)
     sched.kv_connector.not_ready_ids = {head.id}
@@ -767,12 +768,15 @@ def test_settled_early_owner_keeps_fifo_until_the_head_cannot_allocate(
         assert owner.id in sched._early_load.entries
         assert list(sched.waiting) == [head, owner]
     assert owner.id not in sched.finished_recving_kv_req_ids
-    original = sched.block_manager.can_allocate_memoized
-    monkeypatch.setattr(
-        sched.block_manager,
-        "can_allocate_memoized",
-        lambda seq: -1 if seq is head else original(seq),
-    )
+    if blocked_by == "blocks":
+        original = sched.block_manager.can_allocate_memoized
+        monkeypatch.setattr(
+            sched.block_manager,
+            "can_allocate_memoized",
+            lambda seq: -1 if seq is head else original(seq),
+        )
+    else:
+        _fill_send_budget(sched)
     sched._prioritize_ready_remote_kv_requests()
     assert list(sched.waiting) == [owner, head]
     assert owner.block_table
@@ -906,3 +910,30 @@ def test_early_loads_in_flight_do_not_spend_the_lookup_bypass_budget(
     assert sched._can_admit_head_prefill()
     _, scheduled = sched.schedule()
     assert list(scheduled) == [ready.id]
+
+
+def _fill_send_budget(sched):
+    """A producer whose one parked send holds its whole P/D send budget."""
+    from atom.kv_transfer.disaggregation.pd_admission import PdAdmissionController
+
+    sched.pd_admission = PdAdmissionController(
+        1024, 1024, connector=None, block_manager=None, producer=True
+    )
+    parked_send = SimpleNamespace(id=-1, block_table=[99], kv_transfer_params=None)
+    sched.pd_admission.charge_send(parked_send)
+    return parked_send
+
+
+def test_producer_send_budget_stops_early_allocation(monkeypatch, seq_factory):
+    sched, _, (seq,) = _make(monkeypatch, seq_factory)
+    parked_send = _fill_send_budget(sched)
+
+    sched.schedule()
+    # Phase 2 would defer it under the send budget, so no early allocation.
+    assert not seq.block_table
+    assert seq.status == SequenceStatus.WAITING
+    assert sched._early_load.skips["pd_send_budget"] == 1
+
+    sched.pd_admission.release(parked_send)
+    sched.schedule()
+    assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS

@@ -865,6 +865,10 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             for c in self._connectors
         )
 
+    def pd_send_pending(self, seq: Any) -> bool:
+        # The send sub's claim alone: `should_defer_free` also counts saves.
+        return any(c.pd_send_pending(seq) for c in self._connectors)
+
     def protected_block_ids(self, seq: Any):
         """Union exact protections only when every deferring sub can narrow."""
 

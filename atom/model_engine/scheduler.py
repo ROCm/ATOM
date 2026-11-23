@@ -1189,6 +1189,8 @@ class Scheduler:
                 # hit resumes as one, as admission starts it.
                 resume, cached = tier_waiter
             else:
+                if not self._pd_send_budget_admits(seq):
+                    break  # Phase 2 defers it under the producer's send budget.
                 # The exact probe's answer; the walk is memoised across ticks.
                 cached_blocks = self.block_manager.can_allocate_memoized(seq)
                 if cached_blocks < 0:
@@ -1539,6 +1541,9 @@ class Scheduler:
                 # and a probe would recompute the hit flags it was admitted
                 # with (`replays_hit`), which decide how it resumes.
                 return True
+            # Phase 2 would defer it under the producer's send budget too.
+            if not self._pd_send_budget_admits(seq):
+                return False
             # KV-pressured requests definitely cannot prefill. A fit probe, not
             # an admission: it records nothing, and runs every tick, so the
             # walk is memoised across ticks.
@@ -1923,6 +1928,13 @@ class Scheduler:
         callback = getattr(self.kv_connector, "source_blocks_released", None)
         if callable(callback):
             callback(seq)
+
+    def _pd_send_budget_admits(self, seq: Sequence, *, record: bool = False) -> bool:
+        """Whether the producer's P/D send budget lets `seq` start a prefill
+        (`PdAdmissionController.admits_prefill`). `record` counts a refusal for
+        the metrics; the per-tick probes pass False."""
+        admission = self.pd_admission
+        return admission is None or admission.admits_prefill(seq, record=record)
 
     def _maybe_release_deferred(self, seq: Sequence) -> None:
         """Release once every connector has let go of the source blocks.
@@ -2616,6 +2628,11 @@ class Scheduler:
                 self._uncount_inflight_load(seq)
                 continue
 
+            # After the tier-lookup skip above, as `_can_admit_head_prefill`
+            # orders them; before the re-probe and chunk sizing a refusal wastes.
+            if not self._pd_send_budget_admits(seq, record=True):
+                self.waiting.appendleft(seq)
+                break
             if (
                 needs_remote_load
                 and len(self.running) + self._num_parked_remote_kv >= self.max_num_seqs
@@ -4464,6 +4481,9 @@ class Scheduler:
                 # early loads behind it can never fill every slot first.
                 state.skip(seq.id, "seq_slots")
                 break
+            if not self._pd_send_budget_admits(seq):
+                state.skip(seq.id, "pd_send_budget")
+                break  # Phase 2 defers it too
             hbm_probe, probed_tier_kv, detachable = self._admission_probe(seq)
             if detachable:
                 state.skip(seq.id, "detach_no_load")
@@ -5468,6 +5488,16 @@ class Scheduler:
                 # A request aborted after promotion but before its first batch
                 # never reaches `scheduled`, which would otherwise return this.
                 self.pd_admission.release(seq)
+            if (
+                seq.id in self.deferred_free_blocks
+                and self.kv_connector.pd_send_pending(seq)
+            ):
+                # Parked whole for its P/D send: the producer's send credit and
+                # the hold clock, both retired by its `finished_sending`.
+                if self.pd_admission is not None:
+                    self.pd_admission.charge_send(seq)
+                if metrics := getattr(self, "metrics", None):
+                    metrics.start_send_hold(seq)
             self.running.remove(seq)
 
         self.engine_stats.update_throughput(
@@ -5671,11 +5701,12 @@ class Scheduler:
           A settled early load stays where it is unless trigger two holds.
         * The head is blocked while an early load is settled and waiting
           behind it. The head is the first entry Phase 2 would try; it is
-          blocked on slots (`len(running) + parked >= max_num_seqs`) or on
-          blocks (`can_allocate_memoized(head) < 0`). Then the settled early
-          loads move ahead too, so the owner can run and release its
-          blocks/slot. This can happen on a later tick than the completion,
-          after the completion event was consumed.
+          blocked on slots (`len(running) + parked >= max_num_seqs`), on a
+          producer's P/D send budget, or on blocks
+          (`can_allocate_memoized(head) < 0`). Then the settled early loads
+          move ahead too, so the owner can run and release its blocks/slot.
+          This can happen on a later tick than the completion, after the
+          completion event was consumed.
 
         With neither trigger the method returns without copying `waiting`: a
         settled early load behind a head that can run keeps its arrival
@@ -5730,7 +5761,9 @@ class Scheduler:
                 len(self.running) + self._num_parked_remote_kv >= self.max_num_seqs
             )
             head_blocked = head is not None and (
-                slots_full or self.block_manager.can_allocate_memoized(head) < 0
+                slots_full
+                or not self._pd_send_budget_admits(head)
+                or self.block_manager.can_allocate_memoized(head) < 0
             )
         # A settled early load waiting behind a head that can run stays put.
         if not recving and not head_blocked:
@@ -5818,8 +5851,9 @@ class Scheduler:
         """Reconcile scheduler state with completed KV transfers.
 
         * ``finished_recving``: marks requests as ready for decode scheduling.
-        * ``finished_sending``: releases the producer's send ownership; blocks
-          remain deferred while the connector still has offload work.
+        * ``finished_sending``: releases the producer's send ownership and its
+          PD send credit; blocks remain deferred while the connector still has
+          offload work.
         """
         if kv_connector_output is None:
             return
@@ -5910,6 +5944,12 @@ class Scheduler:
                 # Already reclaimed by `_reconcile_stalled_deferred_saves` after
                 # a stall; a late completion report has nothing left to free.
                 continue
+            # The send credit and its hold clock retire with the claim, even
+            # while another claim (an offload save) still parks the blocks.
+            if self.pd_admission is not None:
+                self.pd_admission.release(seq)
+            if metrics := getattr(self, "metrics", None):
+                metrics.finish_send_hold(seq)
             self._maybe_release_deferred(seq)
 
         for req_id in finished_saving:
@@ -6065,7 +6105,7 @@ class PrefillScheduler:
     _METRICS_ROLE = "prefill"
     # Its KV blocks are the decode engine's, assigned per request.
     can_recompute_prompts = False
-    # P/D admission is decode-side Mooncake policy; this prefill side has none.
+    # P/D admission is Mooncake connector policy; this prefill side has none.
     pd_admission: PdAdmissionController | None = None
 
     def __init__(self, config: Config, disagg_cu_shm_name: str = ""):

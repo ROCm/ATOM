@@ -60,6 +60,41 @@ the reserve until its load lands and it runs. D must have PP=1, DCP=1, PCP=1,
 SP=1 and a single paged KV pool. Metrics are listed under `atom:pd_admission_*`
 in the [metrics guide](../docs/metrics_guide.md#scheduler).
 
+## Prefill admission
+
+A legacy (non-chunked) Mooncake producer keeps a finished request's whole block
+table until D has pulled its KV. When prefill outpaces the transfer, for
+example when an offload tier turns long contexts into short prefills, those
+parked tables fill P's KV pool while transfers back up. With `pd_admission`
+on the producer, a new prefill waits while the blocks held by pending sends
+reach a per-rank byte budget. Set it in the producer's top-level
+`--kv-transfer-config`; with `multi`, put it next to `connectors` and list the
+Mooncake producer first:
+
+```json
+"pd_admission": {"enabled": true, "max_pending_kv_fraction": 0.5}
+```
+
+A producer has no default budget: set `max_pending_kv_fraction` (of each P
+rank's paged KV pool) or `max_pending_kv_bytes` (per P rank).
+`num_reserved_decode_tokens` is rejected. A finished request is charged when it
+is parked for its send and returns its credit when the send completes, even
+while an offload save still holds the blocks; shared prefix blocks are charged
+once. The limit is soft: requests already admitted are charged only when they
+finish, so the held bytes can pass the budget by what was in flight when it
+filled. With nothing pending, a prefill always starts. Chunked transfers are
+exempt, because D's readiness already paces their admission, though one queued
+behind a waiting legacy request waits its turn; combine them with D's
+`pd_admission` for end-to-end backpressure. The budget bounds how far P runs
+ahead of the transfer; it does not raise transfer throughput. A send that
+never completes, because D never pulls it or the transfer fails on P, is not
+reclaimed and keeps its credit; once such sends hold the budget, the rank
+admits no more legacy prefills until it restarts. P must have a single paged
+KV pool. Metrics: `atom:pd_admission_*` (state `sending`),
+`atom:pd_kv_send_hold_seconds` and
+`atom:kv_cache_blocks_deferred_free_by_holder` in the
+[metrics guide](../docs/metrics_guide.md#scheduler).
+
 ## Prerequisites
 
 - Two nodes with AMD MI300X GPUs (8 GPUs each for TP=8)

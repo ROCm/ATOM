@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: MIT
-"""Decode-side admission credits, held through the first scheduled forward."""
+"""PD admission credits for KV held by in-flight transfers.
+
+On a decode (consumer), receive credits are held through the first scheduled
+forward. On a prefill (producer), send credits are held from when a finished
+request is parked for its send until the send claim retires.
+"""
 
 from __future__ import annotations
 
@@ -37,12 +42,22 @@ def _positive_int(name: str, value):
     return value
 
 
+def _chunked_transfer(seq) -> bool:
+    return bool((seq.kv_transfer_params or {}).get("chunked_transfer"))
+
+
 @dataclass
 class PendingReceive:
     sequence: Any
     blocks: frozenset[int]
     ready: bool = False
     cancelled: bool = False
+
+
+@dataclass
+class PendingSend:
+    sequence: Any
+    blocks: frozenset[int]
 
 
 @dataclass(frozen=True)
@@ -69,8 +84,26 @@ class PdAdmissionController:
         if unknown:
             raise ValueError(f"Unknown pd_admission options: {sorted(unknown)}")
         if connector is None or not connector.supports_pd_admission:
-            raise ValueError("pd_admission requires a Mooncake consumer")
-        if (
+            raise ValueError(
+                "pd_admission requires a Mooncake connector, first in a multi "
+                "connector"
+            )
+        producer = bool(connector.is_producer)
+        if producer:
+            # A producer counts the blocks its finished requests' sends hold. It
+            # has no receive range to measure and no decode growth to reserve,
+            # and a fixed default share of its pool would bind healthy runs.
+            if "num_reserved_decode_tokens" in options:
+                raise ValueError(
+                    "pd_admission.num_reserved_decode_tokens applies to a decode "
+                    "(kv_consumer) only"
+                )
+            if not options.keys() & {"max_pending_kv_bytes", "max_pending_kv_fraction"}:
+                raise ValueError(
+                    "pd_admission on a producer needs max_pending_kv_bytes or "
+                    "max_pending_kv_fraction"
+                )
+        elif (
             config.pipeline_parallel_size != 1
             or config.decode_context_parallel_size != 1
             # Ulysses SP runs over the PCP group, so this also covers SP.
@@ -114,6 +147,7 @@ class PdAdmissionController:
             block_manager,
             reserve_tokens=reserve_tokens,
             first_decode_tokens=first_decode_tokens,
+            producer=producer,
         )
 
     def __init__(
@@ -125,7 +159,9 @@ class PdAdmissionController:
         *,
         reserve_tokens=None,
         first_decode_tokens=0,
+        producer=False,
     ):
+        self.producer = producer
         self.max_bytes = max_bytes
         self.block_bytes = block_bytes
         # The receive range is the connector's prefix-skip rule over the
@@ -136,20 +172,28 @@ class PdAdmissionController:
         # the fewest any request is given: what a first decode takes.
         self.reserve_tokens = reserve_tokens
         self.first_decode_tokens = first_decode_tokens
-        self.pending: dict[str, PendingReceive] = {}
+        self.pending: dict[str, PendingReceive | PendingSend] = {}
         self._block_refs: dict[int, int] = {}
         # Requests deferred, once per admission wait and limit, for the metrics
         # snapshot. `_deferred_by` holds the limits each waiting request hit.
         self.deferred = {"bytes": 0, "free_kv": 0}
         self._deferred_by: dict[str, set[str]] = {}
-        logger.info(
-            "PD admission enabled: pending_kv_bytes=%s per D rank, "
-            "reserved_decode_tokens=%s per request, block_bytes=%d; credits held "
-            "until first forward",
-            max_bytes,
-            reserve_tokens,
-            block_bytes,
-        )
+        if producer:
+            logger.info(
+                "PD admission enabled: pending_kv_bytes=%s per P rank, "
+                "block_bytes=%d; credits held until the send claim retires",
+                max_bytes,
+                block_bytes,
+            )
+        else:
+            logger.info(
+                "PD admission enabled: pending_kv_bytes=%s per D rank, "
+                "reserved_decode_tokens=%s per request, block_bytes=%d; credits "
+                "held until first forward",
+                max_bytes,
+                reserve_tokens,
+                block_bytes,
+            )
 
     @property
     def pending_bytes(self):
@@ -158,6 +202,8 @@ class PdAdmissionController:
     @property
     def pending_states(self) -> dict[str, int]:
         """Pending requests by state; a cancelled one drains whether or not ready."""
+        if self.producer:
+            return {"sending": len(self.pending)}
         states = dict.fromkeys(("receiving", "ready", "cancel_draining"), 0)
         for entry in self.pending.values():
             if entry.cancelled:
@@ -168,6 +214,33 @@ class PdAdmissionController:
                 states["receiving"] += 1
         return states
 
+    def admits_prefill(self, seq, *, record=False) -> bool:
+        """Whether a producer may start `seq`'s prefill while sends hold `pending_bytes`.
+
+        A soft limit: prefills already admitted are charged only once they
+        finish, so the held bytes can pass the budget by what was in flight
+        when it filled. A consumer, whose limit is `check`, and a chunked
+        transfer, which the decode's readiness paces, always pass. `record`
+        counts a refusal once per admission wait; the per-tick probes do not.
+        """
+        if (
+            not self.producer
+            or self.pending_bytes < self.max_bytes
+            or _chunked_transfer(seq)
+        ):
+            return True
+        if record:
+            self._note_deferred(seq, ("bytes",))
+        return False
+
+    def charge_send(self, seq) -> None:
+        """Hold a finished request's blocks for its send until `release`.
+
+        A chunked transfer takes no credit: the decode's readiness paced it.
+        """
+        if not _chunked_transfer(seq):
+            self._hold(seq, PendingSend(seq, frozenset(seq.block_table)))
+
     def check(self, seq, probe, *, running) -> tuple[bool, ReceivePlan | None]:
         """Whether `seq` may allocate now, and the range a later `commit` charges.
 
@@ -176,6 +249,8 @@ class PdAdmissionController:
         just drops the result. The plan is `None` when this is not a PD
         receive. `running` is the scheduler's running requests on this D rank.
         """
+        if self.producer:
+            return True, None  # A producer receives nothing; see `admits_prefill`.
         num_blocks = self._block_manager.num_pool_blocks(len(seq))
         offset = self._connector.pd_receive_block_offset(
             seq, num_blocks, probe.num_cached_blocks
@@ -209,17 +284,17 @@ class PdAdmissionController:
                 hit.append("free_kv")
         if not hit:
             return True, plan
+        self._note_deferred(seq, hit)
+        return False, plan
+
+    def _note_deferred(self, seq, limits) -> None:
         # One deferral per admission wait and limit, however many passes it
         # takes; a repeated pass allocates nothing.
-        key = str(seq.id)
-        reasons = self._deferred_by.get(key)
-        if reasons is None:
-            reasons = self._deferred_by[key] = set()
-        for reason in hit:
+        reasons = self._deferred_by.setdefault(str(seq.id), set())
+        for reason in limits:
             if reason not in reasons:
                 reasons.add(reason)
                 self.deferred[reason] += 1
-        return False, plan
 
     def _growth_reserve(self, seq, num_blocks, running) -> int:
         """Blocks `seq` and every admitted request need to grow by the reserve.
@@ -269,13 +344,16 @@ class PdAdmissionController:
         per-request state (a joint boundary, a disowned prefix) has to
         re-measure the receive from `seq.block_table` here.
         """
+        blocks = frozenset(seq.block_table[plan.offset : plan.num_blocks])
+        self._hold(seq, PendingReceive(seq, blocks))
+
+    def _hold(self, seq, entry: PendingReceive | PendingSend) -> None:
         key = str(seq.id)
         if key in self.pending:
             raise RuntimeError(f"Duplicate PD admission for sequence {key}")
         self._deferred_by.pop(key, None)
-        blocks = frozenset(seq.block_table[plan.offset : plan.num_blocks])
-        self.pending[key] = PendingReceive(seq, blocks)
-        for block in blocks:
+        self.pending[key] = entry
+        for block in entry.blocks:
             self._block_refs[block] = self._block_refs.get(block, 0) + 1
 
     def received(self, req_id):
@@ -292,8 +370,9 @@ class PdAdmissionController:
             entry.cancelled = True
 
     def scheduled(self, sequences):
-        # Runs on every batch, and most batches decode with nothing pending.
-        if not self.pending:
+        # Runs on every batch, and most batches decode with nothing pending. A
+        # producer's credits are sends, which no forward retires.
+        if self.producer or not self.pending:
             return
         for seq in sequences:
             entry = self.pending.get(str(seq.id))

@@ -99,8 +99,9 @@ Observed in each scheduler; exported per DP rank. All carry
 | --- | --- | --- |
 | `atom:request_queue_time_seconds` | Histogram, s | Engine receipt to first real forward dispatch, including KV loading waits. Once per executed request. |
 | `atom:pd_kv_transfer_seconds` | Histogram, s | Decode-side PD KV load wait until all workers report completion; includes dispatch, handshake and notification. Successful loads only. |
-| `atom:pd_admission_pending_requests` | Gauge, requests | Decode-side PD requests holding admission credits, by `state` (`receiving`, `ready`, `cancel_draining`). |
-| `atom:pd_admission_pending_kv_bytes` | Gauge, bytes | Physical receive-target bytes those requests hold, per D rank. |
+| `atom:pd_kv_send_hold_seconds` | Histogram, s | Producer-side time a finished request's KV blocks stay held for its PD send, until the send claim retires. |
+| `atom:pd_admission_pending_requests` | Gauge, requests | PD requests holding admission credits, by `state`: on a decode `receiving`, `ready`, `cancel_draining`; on a prefill `sending`. |
+| `atom:pd_admission_pending_kv_bytes` | Gauge, bytes | Physical bytes those requests hold per rank: receive targets on a decode, send sources on a prefill. |
 | `atom:pd_admission_deferred` | Counter, requests | Requests deferred by an admission limit, once per admission wait and `reason` (`bytes`, `free_kv`). |
 | `atom:decode_batch_size` | Histogram, requests | Real decode request rows per forward (`ScheduledBatch.total_seqs_num_decode`). Excludes dummy work and graph padding. |
 | `atom:prefill_request_tokens` | Histogram, tokens | `num_prompt_tokens - batch.num_cached_tokens` at first local prefill dispatch, floored at 0. Once per request. |
@@ -199,6 +200,7 @@ Summed across DP ranks by `LLMEngine.get_metrics_statistics()`.
 | `atom:kv_cache_usage_ratio` | Gauge, ratio | Fraction of KV blocks currently allocated. |
 | `atom:requests_deferred_free` | Gauge, requests | Finished or aborted requests held whole until every connector releases them: a P/D decode pull, a whole-request offload save, or a load still writing into their blocks. Early-release offload leases are excluded. |
 | `atom:kv_cache_blocks_deferred_free` | Gauge, blocks | Physical KV blocks of finished or aborted requests held whole until every connector releases them: a P/D decode pull, a whole-request offload save, or a load still writing into their blocks. Early-release offload leases are excluded. Shared prefix blocks are counted once. |
+| `atom:kv_cache_blocks_deferred_free_by_holder` | Gauge, blocks | `atom:kv_cache_blocks_deferred_free` by `holder`: `send` (a P/D send), `store` (another connector claim, such as an offload save), `aborted_load` (an aborted load's cleanup). A block shared across holders counts once, under the first in that order, so the holders sum to the unlabelled metric. |
 | `atom:requests_finished` | Counter, requests | Requests completed by the scheduler. |
 | `atom:prompt_tokens` / `atom:generation_tokens` | Counter, tokens | Tokens in completed requests. |
 | `atom:preemptions` | Counter | Scheduler preemptions. |

@@ -84,6 +84,13 @@ class SchedulerMetrics:
             buckets=LATENCY_BUCKETS,
             registry=registry,
         ).labels(**labels)
+        self.pd_send_hold = Histogram(
+            "atom:pd_kv_send_hold_seconds",
+            "Producer-side time a finished request's KV blocks stay held for its PD send, until the send claim retires.",
+            labels,
+            buckets=LATENCY_BUCKETS,
+            registry=registry,
+        ).labels(**labels)
         self.prefill_request_tokens = Histogram(
             "atom:prefill_request_tokens",
             "Prompt tokens remaining at first local prefill dispatch, once per request.",
@@ -172,6 +179,16 @@ class SchedulerMetrics:
         timing = getattr(seq, "queue_timing", None)
         if timing is not None and succeeded and timing.is_pd:
             self.pd_transfer.observe(now - started)
+
+    @staticmethod
+    def start_send_hold(seq) -> None:
+        seq.pd_send_held_at = time.perf_counter()
+
+    def finish_send_hold(self, seq) -> None:
+        started = getattr(seq, "pd_send_held_at", None)
+        if started is not None:
+            seq.pd_send_held_at = None
+            self.pd_send_hold.observe(time.perf_counter() - started)
 
     def _record_request_context(self, metric, req_id, seq, tokens):
         if metric is None:

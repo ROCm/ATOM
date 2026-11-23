@@ -526,9 +526,8 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
         self.transfer_id_to_request_id: dict[TransferId, ReqId] = {}
 
-    @property
-    def supports_pd_admission(self) -> bool:
-        return not self.is_producer
+    # Receive credits on a consumer, send credits on a producer.
+    supports_pd_admission = True
 
     def _receive_prefix(
         self, seq, num_cached_blocks: int, geometry: tuple[int, int] | None
@@ -888,6 +887,10 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
 
     def should_defer_free(self, seq: Sequence) -> bool:
         return str(seq.id) in self._awaiting_send
+
+    def pd_send_pending(self, seq: Sequence) -> bool:
+        # The only claim this connector holds is a send's.
+        return self.should_defer_free(seq)
 
     def send_finished(self, req_id) -> None:
         self._awaiting_send.discard(str(req_id))

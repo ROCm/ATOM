@@ -149,6 +149,10 @@ class KVConnectorSchedulerBase(ABC):
 
     supports_pd_admission = False
 
+    def pd_send_pending(self, seq: Any) -> bool:
+        """Whether a P/D send still holds this finished request's blocks."""
+        return False
+
     def pd_receive_block_offset(
         self, seq: Any, num_blocks: int, num_cached_blocks: int
     ) -> int | None:
