@@ -49,6 +49,7 @@ class Session:
         self.sessions, self.api = sessions, sessions.api
         self.window, self.base = window, worker_seq_id_base(window)
         self.requests: dict[int, _Request] = {}
+        self.preparing = 0  # submissions in preprocess: each holds the window too
         self.pending: list[RequestOutput] = []  # the step being delivered
         self.put = self.pending.append  # where each output goes as a step is delivered
         self.outbox: asyncio.Queue = asyncio.Queue()  # message frames; None ends them
@@ -64,6 +65,14 @@ class Session:
 
     def add(self, client_id: int, seq, external_request_id: str | None) -> None:
         self.requests[client_id] = _Request(seq, external_request_id)
+
+    def abandon(self, preprocessing: asyncio.Future) -> None:
+        """A submission ended before `add`: the seq its preprocess made is dropped,
+        then its hold on the window ends."""
+        if not preprocessing.cancelled() and preprocessing.exception() is None:
+            self.api.engine.io_processor.requests.pop(preprocessing.result().id, None)
+        self.preparing -= 1
+        self._release()
 
     def drop(self, client_id: int) -> None:
         """Forgets a request whose submission failed."""
@@ -132,7 +141,8 @@ class Session:
         self._release()
 
     def _release(self) -> None:
-        if not self.open and not self.requests and self.window is not None:
+        held = self.requests or self.preparing
+        if not self.open and not held and self.window is not None:
             self.sessions.free.append(self.window)
             self.window = None
 
