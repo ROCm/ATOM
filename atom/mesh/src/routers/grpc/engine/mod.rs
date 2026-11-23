@@ -105,14 +105,20 @@ impl GrpcEngine {
         }
     }
 
-    /// With `session`, every ATOM request goes over its instance's Session rather
-    /// than a Generate call of its own.
+    /// With `workers`, every ATOM request goes over its instance's Session rather than
+    /// a Generate call of its own; a Session is released once none of its instance's
+    /// workers is in `workers`.
     #[cfg(feature = "grpc-client")]
-    pub(crate) fn with_atom_session(self, session: bool) -> Self {
-        let atom_calls = if session {
-            atom::AtomCalls::Session(Default::default())
-        } else {
-            atom::AtomCalls::Generate
+    pub(crate) fn with_atom_session(
+        self,
+        workers: Option<Arc<crate::core::WorkerRegistry>>,
+    ) -> Self {
+        let atom_calls = match workers {
+            Some(workers) => {
+                let sessions = atom::session::AtomSessions::releasing_removed(workers);
+                atom::AtomCalls::Session(Arc::new(sessions))
+            }
+            None => atom::AtomCalls::Generate,
         };
         Self { atom_calls, ..self }
     }

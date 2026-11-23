@@ -60,7 +60,8 @@ impl GrpcPDRouter {
             let pairs =
                 AtomPairs::new(worker_registry.clone(), config.atom_pd_rank_mapping_policy).await?;
             let engine = GrpcEngine::with_atom_pairs(pairs);
-            pipeline.with_engine(engine.with_atom_session(config.atom_grpc_session))
+            let sessions = config.atom_grpc_session.then(|| worker_registry.clone());
+            pipeline.with_engine(engine.with_atom_session(sessions))
         };
 
         Ok(GrpcPDRouter {

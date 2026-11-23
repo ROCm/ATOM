@@ -58,8 +58,11 @@ impl GrpcRouter {
         let pipeline =
             Pipeline::new_regular(ctx.worker_registry.clone(), ctx.policy_registry.clone());
         #[cfg(feature = "grpc-client")]
-        let pipeline = pipeline
-            .with_engine(GrpcEngine::new().with_atom_session(ctx.router_config.atom_grpc_session));
+        let pipeline = {
+            let sessions = ctx.router_config.atom_grpc_session;
+            let sessions = sessions.then(|| ctx.worker_registry.clone());
+            pipeline.with_engine(GrpcEngine::new().with_atom_session(sessions))
+        };
         Ok(Self::with_pipeline(ctx, pipeline))
     }
 

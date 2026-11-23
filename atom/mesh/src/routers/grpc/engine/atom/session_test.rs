@@ -942,6 +942,47 @@ mod routed {
         spec.sampling.as_ref().unwrap().max_tokens
     }
 
+    /// A chat for `m` through `router`, under way.
+    fn chat(router: &Arc<GrpcRouter>) -> JoinHandle<HttpResponse> {
+        let chat = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        let chat: ChatCompletionRequest = serde_json::from_value(chat).unwrap();
+        let router = router.clone();
+        tokio::spawn(async move { router.route_chat(None, &chat, Some("m")).await })
+    }
+
+    #[tokio::test]
+    async fn a_removed_instances_session_is_released() {
+        let (old_url, _, mut old_calls) = serve("{}").await;
+        let (new_url, _, mut new_calls) = serve("{}").await;
+        let old = worker(&old_url, WorkerType::Regular);
+        let context = test_mocks::app_context_with_hf_tokenizer("m");
+        let context = over_sessions(context, &[&old]);
+        let router = Arc::new(GrpcRouter::new(&context).await.unwrap());
+
+        let request = chat(&router);
+        let mut old_call = accept(&mut old_calls, PROTOCOL_VERSION).await;
+        let (spec, _, _) = one_request(&mut old_call).await;
+        let ended = done(vec![(completion(spec.seq_id, "eos"), vec![11])]);
+        old_call.outbound.send(ended).unwrap();
+        assert_eq!(respond(request).await.0, StatusCode::OK);
+
+        // The worker is replaced at another URL; past the sweep interval, the next
+        // request releases the old instance's Session, whose call ends.
+        context.worker_registry.remove_by_url(old.url());
+        let new = worker(&new_url, WorkerType::Regular);
+        context.worker_registry.register(Arc::clone(&new));
+        tokio::time::sleep(SWEEP + Duration::from_millis(100)).await;
+        let request = chat(&router);
+        let mut new_call = accept(&mut new_calls, PROTOCOL_VERSION).await;
+        let (spec, _, _) = one_request(&mut new_call).await;
+        let sent = timeout(Duration::from_secs(5), old_call.inbound.message()).await;
+        let sent = sent.expect("the removed instance's Session stayed open");
+        assert!(!matches!(sent, Ok(Some(_))), "{sent:?}");
+        let ended = done(vec![(completion(spec.seq_id, "eos"), vec![11])]);
+        new_call.outbound.send(ended).unwrap();
+        assert_eq!(respond(request).await.0, StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn a_chat_runs_over_the_session_after_atom_prepares_its_structured_output() {
         let (url, fake, mut calls) = serve("{}").await;
