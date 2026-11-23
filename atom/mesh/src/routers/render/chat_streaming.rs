@@ -31,7 +31,7 @@ use crate::{
         },
         token_handle::{
             engine_error::EngineError,
-            token_chunk::{FinishReason, MatchedStop, TokenChunk},
+            token_chunk::{FinishReason, MatchedStop, TokenChunk, TokenLogprobs},
             token_handle::TokenHandle,
         },
     },
@@ -168,10 +168,11 @@ async fn run_chat_stream(
         // A Complete's ids past the partials' are streamed first, as one more partial.
         let chunk = match unstreamed(&chunk, consumed) {
             Some(rest) => {
+                let logprobs = unstreamed_logprobs(&chunk, consumed);
                 held = Some(chunk);
                 TokenChunk::Partial {
                     token_ids: rest,
-                    logprobs: None,
+                    logprobs,
                 }
             }
             None => chunk,
@@ -429,6 +430,20 @@ pub(super) fn unstreamed(chunk: &TokenChunk, consumed: usize) -> Option<Vec<u32>
             .filter(|rest| !rest.is_empty())
             .map(<[u32]>::to_vec),
         TokenChunk::Partial { .. } => None,
+    }
+}
+
+/// The logprobs of those ids, where the Complete's cover every id it carries.
+fn unstreamed_logprobs(chunk: &TokenChunk, consumed: usize) -> Option<TokenLogprobs> {
+    match chunk {
+        TokenChunk::Complete {
+            token_ids,
+            logprobs: Some(logprobs),
+            ..
+        } if logprobs.items.len() == token_ids.len() => Some(TokenLogprobs {
+            items: logprobs.items.get(consumed..)?.to_vec(),
+        }),
+        _ => None,
     }
 }
 

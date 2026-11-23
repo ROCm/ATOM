@@ -4288,6 +4288,45 @@ mod g_complete_suffix {
         assert!(streamed.ends_with('.'), "{streamed}");
     }
 
+    /// The unstreamed id's delta carries its logprob from the Complete's, which covers every id.
+    #[tokio::test]
+    async fn a_streamed_chat_carries_the_logprobs_of_the_complete_s_unstreamed_ids() {
+        use crate::routers::token_handle::token_chunk::{TokenLogprob, TokenLogprobs};
+        let logprob = |token_id, logprob| TokenLogprob {
+            token_id,
+            logprob,
+            decoded_text: None,
+            top: vec![],
+        };
+        let mut chunks = chunks(true);
+        for (chunk, id) in chunks.iter_mut().zip([1, 2]) {
+            if let TokenChunk::Partial { logprobs, .. } = chunk {
+                *logprobs = Some(TokenLogprobs {
+                    items: vec![logprob(id, -0.5)],
+                });
+            }
+        }
+        if let Some(TokenChunk::Complete { logprobs, .. }) = chunks.last_mut() {
+            let items = vec![logprob(1, -0.5), logprob(2, -0.5), logprob(6, -0.25)];
+            *logprobs = Some(TokenLogprobs { items });
+        }
+        let mut ctx = chat_ctx();
+        if let crate::routers::prepare::response_context::ProtocolRequest::Chat(req) =
+            &mut ctx.original
+        {
+            std::sync::Arc::make_mut(req).stream = true;
+        }
+        let stream = synthetic_single_stream(chunks.into_iter().map(Ok).collect());
+        let sse = body(chat_streaming::process(stream, ctx, "regular")).await;
+        let last = events(&sse)
+            .into_iter()
+            .filter(|e| e["choices"][0]["delta"]["content"] == " .")
+            .last()
+            .unwrap_or_else(|| panic!("no delta for the unstreamed id: {sse}"));
+        let logprobs = &last["choices"][0]["logprobs"]["content"];
+        assert_eq!(logprobs[0]["logprob"], -0.25, "{last}");
+    }
+
     #[tokio::test]
     async fn a_streamed_generate_carries_the_complete_s_unstreamed_ids_as_unary_does() {
         let stream = synthetic_single_stream(chunks(false).into_iter().map(Ok).collect());
