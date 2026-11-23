@@ -161,6 +161,18 @@ def test_submit_hands_the_siblings_to_core_manager_with_the_routing_fields():
     assert bridge.engine.kwargs["data_parallel_rank"] == 1
 
 
+@pytest.mark.parametrize("affinity", ["1", "0"])
+def test_session_ids_reach_preprocess_only_with_session_affinity(monkeypatch, affinity):
+    """The router reads the session headers (`x-session-id`, ...); as on the
+    OpenAI server, CoreManager gets them only with ATOM_DP_SESSION_AFFINITY."""
+    monkeypatch.setenv("ATOM_DP_SESSION_AFFINITY", affinity)
+    bridge = _bridge()
+    bridge.submit(7, [1, 2], {"dp_session_id": "s1", "dp_parent_session_id": "p0"})
+    expected = ("s1", "p0") if affinity == "1" else (None, None)
+    kwargs = bridge.engine.kwargs
+    assert (kwargs["dp_session_id"], kwargs["dp_parent_session_id"]) == expected
+
+
 def test_a_steps_outputs_reach_rust_in_one_push_and_a_finish_cleans_up():
     bridge = _bridge()
     bridge.submit(7, [1, 2, 3], {"n": 2, "temperature": 0.5})

@@ -122,6 +122,31 @@ pub(crate) struct RequestExtras {
     /// A chat's `thinking` (`{"type": ..., "effort": ...}`), which the typed
     /// body drops; read with `reasoning_effort` where ATOM renders the prompt.
     pub thinking: Option<Value>,
+    /// The request's DP session and its parent, from the same headers the
+    /// OpenAI server reads (`_get_dp_session_affinity_ids`). CoreManager
+    /// routes on them only with `ATOM_DP_SESSION_AFFINITY`, which Python
+    /// checks.
+    pub dp_session_id: Option<String>,
+    pub dp_parent_session_id: Option<String>,
+}
+
+/// The session headers, in the OpenAI server's order of preference.
+const SESSION_HEADERS: [&str; 3] = ["x-dynamo-session-id", "x-session-id", "x-correlation-id"];
+const PARENT_SESSION_HEADER: &str = "x-dynamo-parent-session-id";
+
+/// A request's DP session and parent session ids from its headers.
+fn session_ids(headers: &HeaderMap) -> (Option<String>, Option<String>) {
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    (
+        SESSION_HEADERS.iter().find_map(|name| header(name)),
+        header(PARENT_SESSION_HEADER),
+    )
 }
 
 impl RequestExtras {
@@ -294,10 +319,11 @@ impl RouterTrait for AtomBridgeRouter {
         request: InferenceEnvelope,
         _app: &Arc<AppContext>,
     ) -> Response {
-        let extras = match RequestExtras::read(&request) {
+        let mut extras = match RequestExtras::read(&request) {
             Ok(extras) => extras,
             Err(response) => return response,
         };
+        (extras.dp_session_id, extras.dp_parent_session_id) = session_ids(&request.headers);
         let (uri, headers, parsed, metadata) = request.into_native_parts();
         let headers = Some(&headers);
         let model = metadata.model.as_deref();
@@ -468,5 +494,42 @@ impl RouterTrait for AtomBridgeRouter {
 
     fn is_pd_mode(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(*name, value.parse().unwrap());
+        }
+        map
+    }
+
+    #[test]
+    fn session_ids_come_from_the_openai_servers_headers_in_its_order() {
+        assert_eq!(session_ids(&headers(&[])), (None, None));
+        assert_eq!(
+            session_ids(&headers(&[
+                ("x-correlation-id", "c"),
+                ("x-session-id", "s")
+            ])),
+            (Some("s".into()), None)
+        );
+        assert_eq!(
+            session_ids(&headers(&[
+                ("x-session-id", "s"),
+                ("x-dynamo-session-id", "d"),
+                ("x-dynamo-parent-session-id", "p"),
+            ])),
+            (Some("d".into()), Some("p".into()))
+        );
+        assert_eq!(
+            session_ids(&headers(&[("x-correlation-id", "c")])),
+            (Some("c".into()), None)
+        );
     }
 }

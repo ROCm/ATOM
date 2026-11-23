@@ -71,6 +71,7 @@ from atom.entrypoints.openai.tool_parser.registry import (
     resolve_tool_call_parser,
     template_keeps_tool_call_arguments,
 )
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -235,13 +236,19 @@ class TokenBridge:
         anything else is the server's.
         """
         sampling = self._sampling_params(params)
+        # The session lineage the OpenAI server reads from the same headers
+        # (`_get_dp_session_affinity_ids`), and only with the same switch.
+        affinity = envs.ATOM_DP_SESSION_AFFINITY
         seqs = self.engine.io_processor.preprocess_fanout(
             token_ids,
             sampling,
             stream_callbacks=[self._callback(key, i) for i in range(sampling.n)],
             parent_request_id=params.get("request_id"),
             data_parallel_rank=params.get("data_parallel_rank"),
-            dp_session_id=params.get("dp_session_id"),
+            dp_session_id=params.get("dp_session_id") if affinity else None,
+            dp_parent_session_id=(
+                params.get("dp_parent_session_id") if affinity else None
+            ),
         )
         try:
             for seq in seqs:

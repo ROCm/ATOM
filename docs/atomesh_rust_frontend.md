@@ -125,6 +125,10 @@ mesh's gRPC routing already runs.
   server ignores them.
 * `data_parallel_rank` in the body, `--default-chat-template-kwargs` under a
   request's `chat_template_kwargs`.
+* DP session affinity: with `ATOM_DP_SESSION_AFFINITY`, the session and its
+  parent come from the headers the OpenAI server reads
+  (`x-dynamo-session-id` / `x-session-id` / `x-correlation-id`,
+  `x-dynamo-parent-session-id`) and reach CoreManager's `SessionPolicy`.
 * `tool_choice`: `required`, a named function and `allowed_tools` are read
   with the model's own tool parser, as the Python standalone service read
   them; `required` holds the output to the format's tool-call channel where

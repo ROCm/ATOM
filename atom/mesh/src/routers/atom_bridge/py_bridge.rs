@@ -94,6 +94,8 @@ pub(crate) struct BridgeRequest {
     pub ignore_eos: bool,
     pub data_parallel_rank: Option<i64>,
     pub tool_choice_required: bool,
+    pub dp_session_id: Option<String>,
+    pub dp_parent_session_id: Option<String>,
 }
 
 impl BridgeRequest {
@@ -147,6 +149,8 @@ impl BridgeRequest {
             ignore_eos: payload.sampling.ignore_eos,
             data_parallel_rank: extras.data_parallel_rank,
             tool_choice_required: extras.tool_choice_required,
+            dp_session_id: extras.dp_session_id.clone(),
+            dp_parent_session_id: extras.dp_parent_session_id.clone(),
         })
     }
 
@@ -162,6 +166,8 @@ impl BridgeRequest {
         params.set_item("ignore_eos", self.ignore_eos)?;
         params.set_item("data_parallel_rank", self.data_parallel_rank)?;
         params.set_item("tool_choice_required", self.tool_choice_required)?;
+        params.set_item("dp_session_id", &self.dp_session_id)?;
+        params.set_item("dp_parent_session_id", &self.dp_parent_session_id)?;
         Ok(params)
     }
 }
