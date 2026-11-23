@@ -505,9 +505,12 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         self._pending_chunked_admissions: dict[ReqId, TransferId] = {}
         self.host_ip = get_ip()
 
-        # Pending requests: req_id -> (Sequence, block_table)
-        self._reqs_need_recv: dict[ReqId, tuple[Any, list[int]]] = {}
-        self._reqs_need_save: dict[ReqId, tuple[Any, list[int]]] = {}
+        # Pending requests: req_id -> (Sequence, block ids, state slot).
+        # Recv and chunked save entries hold the full block table; build_connector_meta
+        # trims chunked saves to the prompt's pages (_prompt_block_ids). A non-chunked
+        # save is queued already trimmed.
+        self._reqs_need_recv: dict[ReqId, tuple[Any, list[int], int]] = {}
+        self._reqs_need_save: dict[ReqId, tuple[Any, list[int], int]] = {}
 
         # Source-block ownership: the scheduler frees a finished request's HBM
         # only once every connector stops claiming it. Claimed in
@@ -598,6 +601,18 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
 
         return 0, False
 
+    def _prompt_block_ids(self, seq: Sequence, block_ids: list[int]) -> list[int]:
+        """The pages of `block_ids` that hold `seq`'s prompt, all D allocates.
+
+        P can hold more: MTP lookahead pages, and with deferred output the page
+        a finished prefill's one extra step takes when the prompt fills its
+        last page. D computes the first token's KV itself, and the producer
+        aborts the send unless D's destination page count equals
+        ceil(source pages / src_block_skip_factor).
+        """
+        page_tokens = self.block_size * self.dcp_size
+        return block_ids[: -(-seq.num_prompt_tokens // page_tokens)]
+
     def build_connector_meta(self) -> ConnectorMetadata:
         # Sweep even behind a capacity-blocked head, and on idle PP ticks.
         # Expiry queues the existing cancellation protocol; it never frees D's
@@ -625,12 +640,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             assert req.kv_transfer_params is not None
             req.kv_transfer_params["local_slot_index"] = slot_idx
             if req.kv_transfer_params.get("chunked_transfer"):
-                # MTP owns lookahead pages beyond the prompt on P. D reserves
-                # only prompt pages; keep the extra pages pinned on the sequence
-                # but leave them out of both initial and final transfer metadata.
-                page_tokens = self.block_size * self.dcp_size
-                prompt_blocks = (req.num_prompt_tokens + page_tokens - 1) // page_tokens
-                block_ids = block_ids[:prompt_blocks]
+                # Pages past the prompt stay pinned on the sequence, but out
+                # of both initial and final transfer metadata.
+                block_ids = self._prompt_block_ids(req, block_ids)
             meta.add_new_req_to_save(
                 request_id=req_id,
                 local_block_ids=block_ids,
@@ -807,6 +819,10 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             seq.kv_transfer_params_output = None
             return
 
+        prefill_block_ids = list(seq.block_table)
+        if self.is_producer:
+            prefill_block_ids = self._prompt_block_ids(seq, prefill_block_ids)
+
         # Claim iff we will send: the same `do_remote_decode` gate that fills
         # `_reqs_need_save`.
         if self.is_producer and (getattr(seq, "kv_transfer_params", None) or {}).get(
@@ -819,7 +835,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             # aborted load releases the allocation.
             self._reqs_need_save[seq.id] = (
                 seq,
-                list(seq.block_table),
+                prefill_block_ids,
                 seq.state_slot,
             )
 
@@ -832,7 +848,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         seq.kv_transfer_params_output = {
             "do_remote_prefill": True,
             "do_remote_decode": False,
-            "remote_block_ids": list(seq.block_table),
+            "remote_block_ids": list(prefill_block_ids),
             # The consumer's SWA ring slot; the producer keys the SWA region
             # transfer by it. Empty for backends with no SWA state.
             "remote_swa_block_ids": _swa_ring_ids(seq),
