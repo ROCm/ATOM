@@ -1213,9 +1213,10 @@ def test_moe_parallel_config_exchanges_tokens(
         assert parallel.selected_all2all_backend is None
 
 
-def _v4_moe_built(monkeypatch, atom_modules, *, parallel):
+def _v4_moe_built(monkeypatch, atom_modules, *, parallel, shared_stream=True):
     """A V4 `MoE` through its real `__init__`, GEMM/expert modules stubbed;
-    ``parallel`` is the experts' real `FusedMoEParallelConfig`."""
+    ``parallel`` is the experts' real `FusedMoEParallelConfig` and
+    ``shared_stream`` their method's `allows_concurrent_shared_stream`."""
     v4 = atom_modules.deepseek_v4
     forward_context = {}
     config = SimpleNamespace(
@@ -1230,6 +1231,7 @@ def _v4_moe_built(monkeypatch, atom_modules, *, parallel):
         experts.num_fused_shared_experts = 0
         experts._comm_fused_moe = None
         experts.moe_parallel_config = parallel
+        experts.allows_concurrent_shared_stream = shared_stream
         return experts
 
     monkeypatch.setattr(v4, "FusedMoE", fused_moe)
@@ -1309,3 +1311,26 @@ def test_dsv4_moe_init_sets_its_dual_stream_threshold(
     # 0 turns the dual stream off: no fork and no registration for it.
     assert moe._use_dual_stream == (expected > 0)
     assert (forward_context.get("model.layers.3.ffn") is moe) == (expected > 0)
+
+
+def test_dsv4_moe_keeps_shared_experts_single_stream_when_its_experts_refuse(
+    monkeypatch, atom_modules
+):
+    """Experts whose method refuses a concurrent shared-expert stream (MegaMoEV2:
+    its persistent kernels deadlock next to one) turn the V4 dual stream off."""
+    monkeypatch.delenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", raising=False)
+    parallel = _moe_parallel(monkeypatch, atom_modules, **_DEP4)
+    moe, forward_context = _v4_moe_built(
+        monkeypatch, atom_modules, parallel=parallel, shared_stream=False
+    )
+
+    assert not moe._use_dual_stream
+    assert "model.layers.3.ffn" not in forward_context
+
+
+def test_only_the_mega_method_refuses_a_concurrent_shared_stream(atom_modules):
+    moe_ops = atom_modules.moe
+
+    assert moe_ops.FusedMoEMethodBase.allows_concurrent_shared_stream
+    assert moe_ops.Mxfp4MoEMethod.allows_concurrent_shared_stream
+    assert not moe_ops.MegaMxfp4MoEMethod.allows_concurrent_shared_stream

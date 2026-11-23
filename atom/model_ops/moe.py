@@ -533,6 +533,9 @@ def _select_logical(
 class FusedMoEMethodBase(QuantizeMethodBase):
     # Set by a method that fixes OCP E4M3 bytes up to E4M3FNUZ after loading.
     need_normalize_e4m3fn_to_e4m3fnuz: bool = False
+    # Whether the model may run its shared experts on a side stream next to
+    # this method's routed experts.
+    allows_concurrent_shared_stream: bool = True
 
     def __init__(self, moe: FusedMoEConfig):
         super().__init__()
@@ -2697,6 +2700,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
     """MXFP4 MoE method backed by the fused FlyDSL MegaMoE pipeline."""
 
+    # MegaMoEV2's fused small- and large-input kernels keep every CTA resident
+    # and wait on the peer ranks; a shared-expert kernel holding CUs on one rank
+    # next to them deadlocks the group (EP4 V4.1-Flash hung in decode-graph
+    # warm-up and serving).
+    allows_concurrent_shared_stream = False
+
     def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
         super().__init__(quant_config, moe)
         # Mega owns the weight layout and the complete routed-MoE execution.
@@ -4023,6 +4032,11 @@ class FusedMoE(torch.nn.Module):
     @property
     def num_fused_shared_experts(self) -> int:
         return self.expert_layout.num_fused_shared_experts
+
+    @property
+    def allows_concurrent_shared_stream(self) -> bool:
+        """Whether shared experts may run on a side stream next to these experts."""
+        return self.quant_method.allows_concurrent_shared_stream
 
     @property
     def shared_expert_weight(self) -> float:
