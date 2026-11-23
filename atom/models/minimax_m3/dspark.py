@@ -56,12 +56,19 @@ from typing import TYPE_CHECKING, ClassVar
 import torch
 from aiter import QuantType, dtypes
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.rotary_embedding import get_rope
 from torch import nn
 
 from atom.config import QuantizationConfig
 from atom.kv_transfer.disaggregation import kv_config_has_producer
-from atom.model_ops.layernorm import GemmaRMSNorm
+from atom.model_ops.communication_op import tensor_model_parallel_all_reduce
+from atom.model_ops.layernorm import (
+    GemmaRMSNorm,
+    fused_allreduce_gemma_rms_norm,
+    fused_allreduce_gemma_rms_norm_mxfp8_quant,
+    fused_allreduce_gemma_rms_norm_mxfp8_supported,
+)
 from atom.model_ops.linear import QKVParallelLinear, ReplicatedLinear, RowParallelLinear
 from atom.model_ops.minimax_m3.sparse_attn import (
     ASM_PAGE_SIZE,
@@ -81,11 +88,43 @@ from atom.models.dspark_draft import (
     draft_quant_config,
     linear_out,
 )
-from atom.models.minimax_m3.model import MiniMaxM3MLP
+from atom.models.minimax_m3.model import MiniMaxM3MLP, _linear_consumes_mxfp8
 from atom.utils.forward_context import get_forward_context
 
 if TYPE_CHECKING:
     from atom.config import Config
+
+
+# The draft block rows (requests x block tokens) that take the fused all-reduce
+# norms: eight requests of a 7-token block. Bigger blocks keep the unfused
+# launches; the small-batch regime is where the draft pass's launch count matters.
+_FUSED_AR_MAX_ROWS = 56
+
+
+def _draft_fused_ar() -> bool:
+    """The draft layers leave o_proj's and the MLP's outputs TP-partial and
+    all-reduce them in the next norm, fused with the RMSNorm (and the next
+    linear's MXFP8 quant), as the target layers do. TP > 1 on gfx1250."""
+    return get_tensor_model_parallel_world_size() > 1 and get_gfx_runtime() == "gfx1250"
+
+
+def _ar_norm(hidden, residual, norm, consumer):
+    """All-reduce ``hidden``, add ``residual``, Gemma-RMSNorm; MXFP8-quantized for
+    an MXFP8 ``consumer``. Returns ``(hidden, x_scale | None, residual)``. Past
+    ``_FUSED_AR_MAX_ROWS``: the unfused launches (all-reduce, then the norm; the
+    consumer quantizes for itself)."""
+    if hidden.shape[0] > _FUSED_AR_MAX_ROWS:
+        hidden = tensor_model_parallel_all_reduce(hidden)
+        hidden, residual = norm(hidden, residual)
+        return hidden, None, residual
+    if (
+        consumer is not None
+        and fused_allreduce_gemma_rms_norm_mxfp8_supported()
+        and _linear_consumes_mxfp8(consumer)
+    ):
+        return fused_allreduce_gemma_rms_norm_mxfp8_quant(hidden, residual, norm)
+    hidden, residual = fused_allreduce_gemma_rms_norm(hidden, residual, norm)
+    return hidden, None, residual
 
 
 def _draft_rope_theta(config) -> float:
@@ -202,7 +241,8 @@ class M3DSparkAttention(nn.Module):
             self.total_num_heads * self.head_dim,
             config.hidden_size,
             bias=False,
-            reduce_results=True,
+            # TP-partial under the fused draft all-reduce: the next norm reduces.
+            reduce_results=not _draft_fused_ar(),
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
@@ -277,13 +317,19 @@ class M3DSparkAttention(nn.Module):
         _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         self._norm_rope_write(k, k, v, 0, positions, slot_mapping, cache)
 
-    def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor):
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        x_scale: torch.Tensor | None = None,
+    ):
         """The block pass: non-causal attention over ``[context | block]``.
 
         Write the block's K/V at the block slots the proposer masked to the
         request's allocated pages -- an unallocated column reads as page 0, a
         page another request owns (under prefix caching, a shared prefix) --
-        then decode per row.
+        then decode per row. ``x_scale``: ``hidden_states`` arrives as MXFP8
+        (E4M3 + E8M0 per 32) from the fused all-reduce norm.
         """
         if self.num_kv_heads != 1:
             # Before any K/V is written: only a P/D producer, which never
@@ -292,7 +338,7 @@ class M3DSparkAttention(nn.Module):
                 f"The block pass decodes one KV head per rank; this rank holds "
                 f"{self.num_kv_heads} of {self.total_num_kv_heads}"
             )
-        qkv = linear_out(self.qkv_proj(hidden_states))
+        qkv = linear_out(self.qkv_proj(hidden_states, x_scale=x_scale))
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         cache = self._bound_cache()
         if cache is None:
@@ -360,7 +406,8 @@ class M3DSparkDecoderLayer(DSparkGQADecoderLayer):
             config=config,
             intermediate_size=int(config.dspark_ffn_hidden_size),
             quant_config=quant_config,
-            reduce_results=True,
+            # TP-partial under the fused draft all-reduce: the next norm reduces.
+            reduce_results=not _draft_fused_ar(),
             prefix=f"{prefix}.mlp",
             # The checkpoint says `swigluoai`, and the reference draft MLP is
             # SwiGLU-OAI whatever the field says; transformers'
@@ -372,6 +419,33 @@ class M3DSparkDecoderLayer(DSparkGQADecoderLayer):
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+
+    def forward(self, positions, hidden_states, residual=None):
+        if _draft_fused_ar():
+            return self._forward_fused_ar(positions, hidden_states, residual)
+        return super().forward(positions, hidden_states, residual)
+
+    def _forward_fused_ar(self, positions, hidden_states, residual):
+        """``forward`` with each all-reduce fused into the norm after it. The
+        returned hidden is TP-partial; the next layer's input norm, or the model's
+        final norm (``block_final_norm``), reduces it."""
+        x_scale = None
+        if residual is None:
+            # The embedding arrives reduced.
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, x_scale, residual = _ar_norm(
+                hidden_states, residual, self.input_layernorm, self.self_attn.qkv_proj
+            )
+        hidden_states = self.self_attn(positions, hidden_states, x_scale=x_scale)
+        hidden_states, x_scale, residual = _ar_norm(
+            hidden_states,
+            residual,
+            self.post_attention_layernorm,
+            self.mlp.gate_up_proj,
+        )
+        return self.mlp(hidden_states, x_scale=x_scale), residual
 
 
 class MiniMaxM3DSpark(DSparkDraftModel):
@@ -541,6 +615,19 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         )
         attn_metadata.dspark_bt16_rows = self._bt16_rows[:rows]
         attn_metadata.dspark_ctx_rows = self._ctx_rows[:rows]
+
+    def block_final_norm(self, hidden, residual):
+        """With the fused draft all-reduce the last layer's MLP output is
+        TP-partial: reduce it in the final norm (fused), or past
+        ``_FUSED_AR_MAX_ROWS`` with a plain all-reduce, as the unfused path does."""
+        if _draft_fused_ar():
+            if hidden.shape[0] <= _FUSED_AR_MAX_ROWS:
+                hidden, _ = fused_allreduce_gemma_rms_norm(
+                    hidden, residual, self.final_norm
+                )
+                return hidden
+            hidden = tensor_model_parallel_all_reduce(hidden)
+        return super().block_final_norm(hidden, residual)
 
     def head_and_sample(self, hidden, anchor_ids, num_draft):
         bs = anchor_ids.shape[0]

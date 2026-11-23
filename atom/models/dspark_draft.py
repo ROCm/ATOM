@@ -708,6 +708,14 @@ class DSparkDraftModel(nn.Module):
         residual = None
         for layer in self.layers:
             hidden, residual = layer(positions, hidden, residual)
+        return self.block_final_norm(hidden, residual)
+
+    def block_final_norm(
+        self, hidden: torch.Tensor, residual: torch.Tensor
+    ) -> torch.Tensor:
+        """The default ``block_backbone``'s last step: ``final_norm`` of the
+        last layer's output plus its residual. A draft whose layers leave the
+        output TP-partial reduces it here."""
         hidden, _ = self.final_norm(hidden, residual)
         return hidden
 
