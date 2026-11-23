@@ -783,6 +783,41 @@ def test_an_abort_is_applied_while_admissions_are_at_their_cap(serve, monkeypatc
     assert [prompt for prompt, *_ in engine.preprocessed] == [[1], [2], [3], [4]]
 
 
+def test_a_submission_past_the_waiting_bound_is_rejected_overloaded(serve, monkeypatch):
+    monkeypatch.setattr(grpc_server, "SESSION_ADMISSIONS", 1)
+    monkeypatch.setattr(grpc_server, "SESSION_WAITING", 1)
+    engine = FakeEngine()
+    engine.release.clear()  # A holds the cap in preprocess; B waits; C is one too many
+    servicer = serve(engine)
+    ended = asyncio.Event()
+
+    async def client():
+        yield pb.Frames(
+            frames=_submit_batch((3, "a", [1]), (4, "b", [2]), (5, "c", [3]))
+        )
+        await ended.wait()
+
+    async def overflow():
+        call = servicer.Session(client(), SimpleNamespace())
+        await anext(call)  # Ready
+        message = await asyncio.wait_for(anext(call), 5)
+        rejected = [
+            (r.seq_id, r.code) for r in _envelope(message.frames).rejected.items
+        ]
+        preprocessed = len(engine.preprocessed)
+        engine.release.set()
+        await _until(lambda: len(engine.preprocessed) == 2)
+        ended.set()
+        await call.aclose()
+        return rejected, preprocessed
+
+    rejected, preprocessed = asyncio.run(overflow())
+    assert rejected == [(5, v1.RejectedRequest.OVERLOADED)]
+    # B waited for A's admission, then was admitted; C never was.
+    assert preprocessed == 1
+    assert [prompt for prompt, *_ in engine.preprocessed] == [[1], [2]]
+
+
 def test_a_submission_preprocessed_after_its_session_closed_never_runs(
     serve, monkeypatch
 ):
