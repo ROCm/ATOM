@@ -5,6 +5,7 @@ import copy
 import json
 import os
 import re
+import shlex
 from pathlib import Path
 
 import yaml
@@ -41,7 +42,8 @@ def configurations(
     environment["VLLM_HOST_IP"] = fabric["host-ip"]
     command = (
         "python3 /experiment/pd_recipe_router_ab.py benchmark "
-        "--contract /experiment/contract.json --model-path /model "
+        "--contract /experiment/contract.json "
+        f"--model-path {shlex.quote(str(Path(model_path).resolve()))} "
         '--router "http://${SRT_FRONTEND_HOST}:${SRT_FRONTEND_PORT}" '
         '--workers "http://${SRT_PREFILL_ENDPOINTS}" "http://${SRT_DECODE_ENDPOINTS}" '
         "--output /logs/functional"
@@ -86,6 +88,7 @@ def configurations(
     cluster = {
         "launcher": "docker",
         "docker_gpus": "",
+        "docker_cap_add": ["SYS_NICE"],
         "visible_devices_env": "HIP_VISIBLE_DEVICES",
         "network_interface": fabric["socket-ifname"],
         "docker_args": [
@@ -95,8 +98,6 @@ def configurations(
             "--device=/dev/dri",
             "--device=/dev/infiniband",
             "--cap-add=IPC_LOCK",
-            "--cap-add=NET_ADMIN",
-            "--security-opt=seccomp=unconfined",
         ],
     }
     cluster["default_mounts"] = {str(run_dir / "bin"): "/opt/atomesh-ci-bin"}
@@ -194,7 +195,7 @@ def main():
             {
                 "source": contract["source"],
                 "case": contract["case_name"],
-                "srtctl_sha": "d7305542f91e966a3f9e1028fe7cf8d34bd157a2",
+                "srtctl_sha": "df706bc365e00bea74e5babe87b4049f624341ea",
                 "router_runtime": router_runtime,
                 "execution_backend": (
                     "gpu-pool" if os.environ.get("GPOOL_LEASE") else "Spur"

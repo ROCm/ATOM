@@ -48,6 +48,17 @@ python="${stage}/venv/bin/python"
 "${python}" -m pip install "${SRTCTL_SOURCE_DIR}" > "${RUN_DIR}/srt-install.log" 2>&1
 "${python}" -m pip freeze > "${RUN_DIR}/requirements-installed.txt"
 cp "${runtime}/source-sha.txt" "${RUN_DIR}/"
+"${python}" - "${SRTCTL_SOURCE_DIR}" "${RUN_DIR}" <<'PY'
+import hashlib, importlib.util, json, pathlib, sys
+source, output = map(pathlib.Path, sys.argv[1:])
+installed = pathlib.Path(importlib.util.find_spec("srtctl").origin).parent
+files = {}
+for name in ("core/docker.py", "core/launcher.py", "core/runtime.py", "core/schema.py", "frontends/atomesh.py"):
+    actual = (installed / name).read_bytes()
+    assert actual == (source / "src/srtctl" / name).read_bytes(), name
+    files[name] = hashlib.sha256(actual).hexdigest()
+(output / "srt-runtime.json").write_text(json.dumps({"source_sha": (output / "source-sha.txt").read_text().strip(), "installed_hashes": files, "python": sys.version}, indent=2))
+PY
 if [[ -n "${GPOOL_LEASE:-}" ]]; then
   python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_gpool_guard.py" router-compile
 fi

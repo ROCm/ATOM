@@ -2,7 +2,7 @@
 set -euo pipefail
 root="${GITHUB_WORKSPACE:?}"
 runtime="${root}/.sa-srt-runtime"
-source_sha=d7305542f91e966a3f9e1028fe7cf8d34bd157a2
+source_sha=df706bc365e00bea74e5babe87b4049f624341ea
 mkdir -p "${runtime}"
 if [[ ! -d "${runtime}/source/.git" ]]; then
   git clone --filter=blob:none --no-checkout https://github.com/whx-sjtu/srt-slurm.git "${runtime}/source"
