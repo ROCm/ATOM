@@ -41,7 +41,10 @@ class _Engine:
     def __init__(self, fail_add=False):
         self.added, self.aborted, self.fail_add = [], [], fail_add
         self.io_processor = types.SimpleNamespace(
-            requests={}, preprocess_fanout=self._fanout
+            requests={},
+            preprocess_fanout=self._fanout,
+            _external_to_internal={},
+            _internal_to_external={},
         )
         self.core_mgr = types.SimpleNamespace(
             add_request=self._add,
@@ -55,8 +58,12 @@ class _Engine:
         self.prompt, self.kwargs = prompt, kwargs
         tokens = getattr(prompt, "token_ids", prompt)
         seqs = [_Seq(tokens, sampling, cb) for cb in stream_callbacks]
+        io, external = self.io_processor, kwargs.get("parent_request_id")
         for seq in seqs:
-            self.io_processor.requests[seq.id] = seq
+            io.requests[seq.id] = seq
+            if len(seqs) == 1 and external is not None:  # as preprocess_fanout
+                io._external_to_internal[external] = seq.id
+                io._internal_to_external[seq.id] = external
         return seqs
 
     def _add(self, seqs):
@@ -205,6 +212,20 @@ def test_a_steps_outputs_reach_rust_in_one_push_and_a_finish_cleans_up():
     assert bridge.engine.io_processor.requests == {}
     bridge._flush()  # nothing pending: no empty push
     assert len(bridge.sink.pushes) == 2
+
+
+def test_a_finished_or_aborted_request_leaves_no_request_id_behind():
+    """`preprocess_fanout` maps a single sequence to its request id; only the
+    offline `postprocess` pops those maps, so the bridge does."""
+    bridge = _bridge()
+    io = bridge.engine.io_processor
+    bridge.submit(7, [1, 2], {"request_id": "r7"})
+    bridge.submit(8, [1, 2], {"request_id": "r8"})
+    (done,), _ = bridge.engine.added
+    done.callback(_output(done, [5], finished=True, reason="eos"))
+    bridge.abort([8])
+    assert io.requests == {}
+    assert io._external_to_internal == {} and io._internal_to_external == {}
 
 
 def test_abort_stops_every_sibling_once_and_forgets_the_key():

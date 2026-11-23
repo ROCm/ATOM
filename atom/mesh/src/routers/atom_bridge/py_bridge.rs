@@ -3,7 +3,7 @@
 //! to LLMEngine / CoreManager; each engine step comes back in one
 //! `StepSink.push`.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -12,6 +12,7 @@ use pyo3::{
     prelude::*,
     types::{PyDict, PyList},
 };
+use serde_json::{Map, Value};
 use tracing::{debug, warn};
 
 use super::{
@@ -24,7 +25,7 @@ use axum::response::Response;
 
 use crate::{
     core::placement::types::PlacementPlan,
-    protocols::{chat::ChatCompletionRequest, common::StringOrArray},
+    protocols::common::StringOrArray,
     routers::{
         comm::error,
         grpc::engine::Dispatcher,
@@ -266,14 +267,17 @@ fn submit(
     request: &BridgeRequest,
     stage: &Mutex<Stage>,
 ) -> Result<usize, EngineError> {
-    let siblings = Python::attach(|py| -> PyResult<usize> {
-        let params = request.params(py)?;
-        bridge
-            .bind(py)
-            .call_method1("submit", (key, request.token_ids.as_slice(), params))?
-            .extract()
-    })
-    .map_err(|e| py_err_to_engine(&e))?;
+    let siblings = Python::attach(|py| {
+        request
+            .params(py)
+            .and_then(|params| {
+                bridge
+                    .bind(py)
+                    .call_method1("submit", (key, request.token_ids.as_slice(), params))?
+                    .extract::<usize>()
+            })
+            .map_err(|e| py_err_to_engine(py, &e))
+    })?;
     if submitted(stage) {
         // The client left while Python was admitting it.
         call_abort(bridge, key);
@@ -283,27 +287,30 @@ fn submit(
 
 /// The chat prompt rendered by `TokenBridge.render_chat`, for a model whose
 /// template the router cannot render (a Python message encoder, or a
-/// tokenizer with no Jinja template), with the request's `thinking`, which
-/// the typed body drops, and the handle `submit` collects its encoding by
-/// (`prompt_handle`). A `ValueError` is the request's fault.
+/// tokenizer with no Jinja template), from the `body` the client sent with
+/// the `template_kwargs` merged over its own, and the handle `submit`
+/// collects its encoding by (`prompt_handle`). A `ValueError` is the
+/// request's fault.
 pub(crate) async fn render_chat(
     bridge: &Arc<Py<PyAny>>,
-    request: &ChatCompletionRequest,
-    thinking: Option<&serde_json::Value>,
+    body: &Map<String, Value>,
+    template_kwargs: Option<&HashMap<String, Value>>,
 ) -> Result<(RenderedChat, Option<u64>), Response> {
-    let mut body = serde_json::to_value(request)
-        .map_err(|e| error::internal_error("serialize_failed", e.to_string()))?;
-    if let (Some(thinking), Some(object)) = (thinking, body.as_object_mut()) {
-        object.insert("thinking".to_string(), thinking.clone());
+    let mut body = body.clone();
+    if let Some(kwargs) = template_kwargs {
+        let kwargs = serde_json::to_value(kwargs)
+            .map_err(|e| error::internal_error("serialize_failed", e.to_string()))?;
+        body.insert("chat_template_kwargs".to_string(), kwargs);
     }
-    let body = body.to_string();
+    let body = Value::Object(body).to_string();
     let bridge = Arc::clone(bridge);
     let rendered = tokio::task::spawn_blocking(move || {
         Python::attach(|py| {
             bridge
                 .bind(py)
-                .call_method1("render_chat", (body,))?
-                .extract::<(String, Vec<u32>, Option<String>, Option<u64>)>()
+                .call_method1("render_chat", (body,))
+                .and_then(|r| r.extract::<(String, Vec<u32>, Option<String>, Option<u64>)>())
+                .map_err(|e| py_err_to_engine(py, &e))
         })
     })
     .await
@@ -317,23 +324,20 @@ pub(crate) async fn render_chat(
             },
             handle,
         )),
-        Err(e) => Err(match py_err_to_engine(&e) {
-            EngineError::RequestBuildFailed(message) => {
-                error::bad_request("process_messages_failed", message)
-            }
-            other => error::internal_error("render_failed", format!("{other:?}")),
-        }),
+        Err(EngineError::RequestBuildFailed(message)) => {
+            Err(error::bad_request("process_messages_failed", message))
+        }
+        Err(other) => Err(error::internal_error("render_failed", format!("{other:?}"))),
     }
 }
 
 /// A `ValueError` is the request's fault (400); anything else, the server's.
-fn py_err_to_engine(error: &PyErr) -> EngineError {
-    Python::attach(|py| {
-        let message = error.value(py).to_string();
-        if error.is_instance_of::<PyValueError>(py) {
-            EngineError::RequestBuildFailed(message)
-        } else {
-            EngineError::Transport(tonic::Status::unavailable(message))
-        }
-    })
+/// Called holding the GIL, on a blocking thread.
+fn py_err_to_engine(py: Python<'_>, error: &PyErr) -> EngineError {
+    let message = error.value(py).to_string();
+    if error.is_instance_of::<PyValueError>(py) {
+        EngineError::RequestBuildFailed(message)
+    } else {
+        EngineError::Transport(tonic::Status::unavailable(message))
+    }
 }

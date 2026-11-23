@@ -375,7 +375,7 @@ async fn run_chat_stream(
     Ok(())
 }
 
-fn process_chunk_tokens(
+pub(super) fn process_chunk_tokens(
     stop_decoder: &mut StopSequenceDecoder,
     token_ids: &[u32],
 ) -> (String, bool) {

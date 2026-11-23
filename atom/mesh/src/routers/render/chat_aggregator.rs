@@ -288,7 +288,9 @@ async fn process_choice(
     }
 
     let finish_reason_str = finish_reason_to_str(finish_reason);
-    let final_finish_reason = if tool_calls.is_some() {
+    // A reply that called a tool and stopped ends in `tool_calls`; one cut at
+    // its length keeps `length`, as the streamed reply does.
+    let final_finish_reason = if tool_calls.is_some() && finish_reason_str == "stop" {
         "tool_calls"
     } else {
         finish_reason_str

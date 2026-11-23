@@ -78,8 +78,14 @@ the bottleneck.
   with the same defaults (`protocol.py`), caps `max_tokens` by
   `deployment_metadata`, shrinks a defaulted `max_tokens` to the context left
   and refuses what `_validate_context_length` / `_validate_pool_capacity`
-  refuse. Stop strings go to the engine, which matches them in token space;
-  render trims them from the text.
+  refuse. These are copies of the OpenAI server's admission for now; a later
+  PR moves that admission out of FastAPI so the OpenAI routes, the gRPC
+  servicer (#3673) and `TokenBridge` call one implementation.
+* **Output read as the OpenAI server reads it** (`pipeline::AtomOutput`).
+  Stop strings go to the engine, which ends the output where their ids
+  match; like the OpenAI server, the text is not cut at them again. The
+  model's end-of-sequence ids are left out of the text (the tiktoken
+  decoder ignores `skip_special_tokens`).
 * **One model.** The router loads the model's tokenizer (`--model-path` is
   added unless `--model-path` / `--tokenizer-path` is given) under the served
   model name, and prepares every request for it whatever `model` the client
@@ -211,6 +217,12 @@ every endpoint, GSM8K, and a concurrency sweep.
   renders; a Jinja-rendered model (Qwen3, ...) takes its switch through
   `chat_template_kwargs`. `reasoning_effort` is a string in the mesh's typed
   request, so an integer budget goes through `thinking.effort`.
+* The mesh's typed request refuses what the OpenAI server accepts: an
+  integer `reasoning_effort`, `top_k: 0`, a tool without `parameters`.
+* Kimi-K3 output parsing: a reply that skips the think channel is read as
+  reasoning with no content; a literal `<|open|>think<|sep|>` inside the
+  answer re-enters reasoning; a thinking-off reply over 64 KiB keeps
+  `<|close|>response<|sep|>` in its content.
 * `/health` is the router's liveness, not the engine's (P1).
 
 ## Moving to B

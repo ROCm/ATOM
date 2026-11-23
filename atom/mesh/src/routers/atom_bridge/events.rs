@@ -252,14 +252,9 @@ impl SeqEventSource {
         }) = self.siblings.get(self.next_complete)
         {
             let sibling = std::mem::take(&mut self.siblings[self.next_complete]);
-            // The siblings share one prompt and the renders sum what each
-            // reports, so only the first reports it.
-            let prompt_tokens = if self.next_complete == 0 {
-                self.prompt_tokens
-            } else {
-                0
-            };
-            let complete = self.complete(sibling, prompt_tokens);
+            // Each reports the prompt it shares with the others, as each
+            // `/generate` item does; a chat counts it once (`AtomUsage`).
+            let complete = self.complete(sibling);
             self.ready.push_back(complete);
             self.next_complete += 1;
         }
@@ -269,7 +264,8 @@ impl SeqEventSource {
         }
     }
 
-    fn complete(&self, sibling: Sibling, prompt_tokens: u32) -> TokenChunk {
+    fn complete(&self, sibling: Sibling) -> TokenChunk {
+        let prompt_tokens = self.prompt_tokens;
         let timing = self.timing(&sibling);
         let finish = sibling.finish.unwrap_or(SeqFinish {
             reason: None,

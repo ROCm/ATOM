@@ -29,10 +29,16 @@ use crate::{
             error, metrics_utils::error_type_from_status,
             placement_response::placement_err_to_response,
         },
-        prepare::{self, generation_payload::GenerationPayload, response_context::ResponseContext},
+        prepare::{
+            self,
+            generation_payload::GenerationPayload,
+            response_context::{ProtocolRequest, ResponseContext},
+            stop_decoder_builder::create_stop_decoder,
+        },
         render,
         token_handle::engine_error::EngineError,
     },
+    tokenizer::{traits::Tokenizer, StopSequenceDecoder},
 };
 
 #[derive(Clone)]
@@ -40,11 +46,53 @@ pub(crate) struct Pipeline {
     planner: Arc<dyn PdPlanner>,
     engine: Arc<dyn Dispatcher>,
     backend_label: &'static str,
-    /// Whether a chat the router renders has the channel opener its prompt
-    /// ends on read before the reply (`ResponseContext::prompt_opener`).
-    /// The ATOM bridge's, as ATOM's Python server reads it; gRPC routing
-    /// keeps its parsers' own start.
-    reads_prompt_opener: bool,
+    /// The ATOM bridge's: its output read as ATOM's Python server reads it
+    /// (`AtomOutput`). gRPC routing keeps its own reading.
+    atom_output: Option<Arc<AtomOutput>>,
+}
+
+/// How ATOM's Python server reads the engine's output, where the router's
+/// own reading differs:
+/// - a chat the router renders has the channel opener its prompt ends on
+///   read before the reply (`ResponseContext::prompt_opener`);
+/// - the engine ends an output where a stop string's ids match and the
+///   server returns all of it, so the router cuts at none of the stops;
+/// - the server's decode leaves the model's end-of-sequence ids out of the
+///   text, which the tiktoken decoder would not do by `skip_special_tokens`.
+pub(crate) struct AtomOutput {
+    end_token_ids: Vec<u32>,
+}
+
+impl AtomOutput {
+    pub(crate) fn new(end_token_ids: Vec<u32>) -> Self {
+        Self { end_token_ids }
+    }
+
+    /// The request's decoder: none of its stops, and the end-of-sequence ids
+    /// hidden unless it asked to run past them.
+    fn stop_decoder(&self, ctx: &ResponseContext) -> StopSequenceDecoder {
+        let (skip_special_tokens, ignore_eos) = match &ctx.original {
+            ProtocolRequest::Chat(req) => (req.skip_special_tokens, req.ignore_eos),
+            ProtocolRequest::Generate(req) => {
+                let params = req.sampling_params.as_ref();
+                (
+                    params.and_then(|p| p.skip_special_tokens).unwrap_or(true),
+                    params.and_then(|p| p.ignore_eos).unwrap_or(false),
+                )
+            }
+        };
+        self.decoder(&ctx.tokenizer, skip_special_tokens, ignore_eos)
+    }
+
+    fn decoder(
+        &self,
+        tokenizer: &Arc<dyn Tokenizer>,
+        skip_special_tokens: bool,
+        ignore_eos: bool,
+    ) -> StopSequenceDecoder {
+        let end_token_ids = (!ignore_eos).then_some(&self.end_token_ids);
+        create_stop_decoder(tokenizer, None, end_token_ids, skip_special_tokens, false)
+    }
 }
 
 impl Pipeline {
@@ -57,14 +105,21 @@ impl Pipeline {
             planner,
             engine,
             backend_label,
-            reads_prompt_opener: false,
+            atom_output: None,
         }
     }
 
-    /// Read the opener a rendered prompt ends on (`reads_prompt_opener`).
-    pub(crate) fn reading_prompt_opener(mut self) -> Self {
-        self.reads_prompt_opener = true;
+    /// Read the output as ATOM's Python server reads it (`AtomOutput`).
+    pub(crate) fn reading_output_as_atom(mut self, atom_output: AtomOutput) -> Self {
+        self.atom_output = Some(Arc::new(atom_output));
         self
+    }
+
+    /// Give a prepared request the decoder `AtomOutput` reads with, if any.
+    fn read_as_atom(&self, ctx: &mut ResponseContext) {
+        if let Some(atom) = &self.atom_output {
+            ctx.stop_decoder = atom.stop_decoder(ctx);
+        }
     }
 }
 
@@ -100,7 +155,7 @@ impl Pipeline {
             planner,
             engine: Arc::new(GrpcEngine::new()),
             backend_label,
-            reads_prompt_opener: false,
+            atom_output: None,
         }
     }
 
@@ -137,17 +192,18 @@ impl Pipeline {
             bool_to_static_str(streaming),
         );
 
-        let (mut payload, resp_ctx) = match prepare::prepare_chat_with(
+        let (mut payload, mut resp_ctx) = match prepare::prepare_chat_with(
             req,
             headers,
             model_id,
             &components,
             rendered,
-            self.reads_prompt_opener,
+            self.atom_output.is_some(),
         ) {
             Ok(t) => t,
             Err(e) => return self.record_chat_err(&model, start, e),
         };
+        self.read_as_atom(&mut resp_ctx);
         let placement = match self.plan_for(&payload, &resp_ctx).await {
             Ok(p) => p,
             Err(e) => return self.record_chat_err(&model, start, e),
@@ -198,11 +254,12 @@ impl Pipeline {
             bool_to_static_str(streaming),
         );
 
-        let (mut payload, resp_ctx) =
+        let (mut payload, mut resp_ctx) =
             match prepare::prepare_generate(req, headers, model_id, &components) {
                 Ok(t) => t,
                 Err(e) => return self.record_generate_err(&model_for_metric, start, e),
             };
+        self.read_as_atom(&mut resp_ctx);
         let placement = match self.plan_for(&payload, &resp_ctx).await {
             Ok(p) => p,
             Err(e) => return self.record_generate_err(&model_for_metric, start, e),
@@ -361,5 +418,97 @@ fn engine_err_to_response(err: EngineError) -> Response {
             error::service_unavailable("engine_connection_failed", r)
         }
         EngineError::RequestBuildFailed(r) => error::bad_request("engine_request_build_failed", r),
+    }
+}
+
+#[cfg(test)]
+mod atom_output_tests {
+    use super::*;
+    use crate::{
+        protocols::generate::GenerateRequest,
+        routers::test_mocks::{
+            dispatcher::MockDispatcher, planner::MockPdPlanner, tokenizer::byte_level_tokenizer_dir,
+        },
+        tokenizer::{huggingface::HuggingFaceTokenizer, stop::SequenceDecoderOutput},
+    };
+
+    /// A `/generate` of `body`, prepared as the router prepares it: its own
+    /// stops in its decoder.
+    fn generate_ctx(tokenizer: &Arc<dyn Tokenizer>, body: &str) -> ResponseContext {
+        let req: GenerateRequest = serde_json::from_str(body).unwrap();
+        let params = req.sampling_params.as_ref();
+        let stop_decoder = create_stop_decoder(
+            tokenizer,
+            params.and_then(|p| p.stop.as_ref()),
+            None,
+            true,
+            false,
+        );
+        ResponseContext {
+            original: ProtocolRequest::Generate(Arc::new(req)),
+            model_id: None,
+            headers: None,
+            original_text: None,
+            processed_messages: None,
+            tokenizer: Arc::clone(tokenizer),
+            stop_decoder,
+            request_id: "gen-1".to_string(),
+            created: 0,
+            tool_parser_factory: None,
+            reasoning_parser_factory: None,
+            configured_tool_parser: None,
+            configured_reasoning_parser: None,
+            prompt_opener: None,
+        }
+    }
+
+    /// The text `decoder` makes of `ids`.
+    fn decode(decoder: &mut StopSequenceDecoder, ids: &[u32]) -> String {
+        let mut text = String::new();
+        for &id in ids {
+            match decoder.process_token(id).unwrap() {
+                SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) => {
+                    text.push_str(&t)
+                }
+                SequenceDecoderOutput::Stopped | SequenceDecoderOutput::Held => {}
+            }
+        }
+        if let SequenceDecoderOutput::Text(t) = decoder.flush() {
+            text.push_str(&t);
+        }
+        text
+    }
+
+    #[test]
+    fn atom_output_keeps_the_text_past_a_stop_and_hides_the_end_of_sequence() {
+        let dir = byte_level_tokenizer_dir(&[], false, serde_json::json!({}));
+        let path = dir.path().join("tokenizer.json");
+        let tokenizer: Arc<dyn Tokenizer> =
+            Arc::new(HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap());
+        // "</s>", the second token added after the 256 bytes, ends the output.
+        let eos = 257;
+        let ids: Vec<u32> = "ab. c".bytes().map(u32::from).collect();
+        let output = [ids.as_slice(), &[eos]].concat();
+        let pipeline = Pipeline::with_injected(
+            Arc::new(MockPdPlanner::new(vec![])),
+            Arc::new(MockDispatcher::new(vec![])),
+            "regular",
+        );
+
+        let mut ctx = generate_ctx(
+            &tokenizer,
+            r#"{"text": "hi", "sampling_params": {"stop": ["."]}}"#,
+        );
+        // The router's own reading cuts at the stop.
+        assert_eq!(decode(&mut ctx.stop_decoder, &output), "ab");
+
+        let atom = pipeline.reading_output_as_atom(AtomOutput::new(vec![eos]));
+        let mut ctx = generate_ctx(
+            &tokenizer,
+            r#"{"text": "hi", "sampling_params": {"stop": ["."]}}"#,
+        );
+        atom.read_as_atom(&mut ctx);
+        // The engine stopped where the stop's ids matched; the text is all of it.
+        assert_eq!(decode(&mut ctx.stop_decoder, &output), "ab. c");
     }
 }

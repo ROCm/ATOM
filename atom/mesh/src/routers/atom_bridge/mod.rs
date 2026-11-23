@@ -50,7 +50,7 @@ use crate::{
                 completion_to_generate, wrap_generate_response_as_completion,
                 wrap_streaming_generate_as_completion,
             },
-            pipeline::Pipeline,
+            pipeline::{AtomOutput, Pipeline},
         },
         ingress::InferenceEnvelope,
         prepare::inference::ParsedInference,
@@ -69,6 +69,8 @@ pub struct AtomBridgeRuntime {
     pub(crate) default_chat_template_kwargs: Map<String, Value>,
     /// The model's chat template is Python's to render (`TokenBridge.renders_chat`).
     pub(crate) renders_chat: bool,
+    /// Every id that ends the model's output (`TokenBridge.end_token_ids`).
+    pub(crate) end_token_ids: Vec<u32>,
 }
 
 impl AtomBridgeRuntime {
@@ -83,6 +85,7 @@ impl AtomBridgeRuntime {
         let sink: PyRef<'_, py_bridge::StepSink> = sink.extract()?;
         let registry = Arc::clone(&sink.registry);
         let renders_chat = bridge.getattr("renders_chat")?.extract::<bool>()?;
+        let end_token_ids = bridge.getattr("end_token_ids")?.extract::<Vec<u32>>()?;
         let default_chat_template_kwargs = match default_chat_template_kwargs {
             None | Some("") => Map::new(),
             Some(raw) => serde_json::from_str(raw).map_err(|e| {
@@ -97,17 +100,14 @@ impl AtomBridgeRuntime {
             served_model_name,
             default_chat_template_kwargs,
             renders_chat,
+            end_token_ids,
         })
     }
 }
 
 /// The keys `RequestExtras::read` looks for, as they appear in a JSON body:
 /// a body naming none of them is not parsed again.
-const RAW_KEYS: [&[u8]; 3] = [
-    b"\"data_parallel_rank\"",
-    b"\"thinking\"",
-    b"\"kv_transfer_params\"",
-];
+const RAW_KEYS: [&[u8]; 2] = [b"\"data_parallel_rank\"", b"\"kv_transfer_params\""];
 
 tokio::task_local! {
     /// What a request carries besides its typed body, for the dispatcher.
@@ -123,9 +123,6 @@ pub(crate) struct RequestExtras {
     /// A chat's `tool_choice: "required"` with tools: the engine holds its
     /// output to the tool-call channel where the format defines one.
     pub tool_choice_required: bool,
-    /// A chat's `thinking` (`{"type": ..., "effort": ...}`), which the typed
-    /// body drops; read with `reasoning_effort` where ATOM renders the prompt.
-    pub thinking: Option<Value>,
     /// The request's DP session and its parent, from the same headers the
     /// OpenAI server reads (`_get_dp_session_affinity_ids`). CoreManager
     /// routes on them only with `ATOM_DP_SESSION_AFFINITY`, which Python
@@ -135,6 +132,10 @@ pub(crate) struct RequestExtras {
     /// The encoding `TokenBridge.render_chat` kept for this prompt, which
     /// `submit` hands to preprocessing so the prompt is hashed once.
     pub prompt_handle: Option<u64>,
+    /// A chat's body as the client sent it, where Python renders the prompt:
+    /// the typed request drops fields its template reads (a system message's
+    /// `tools`, a tool message's `name`) and normalizes others (`tool_choice`).
+    pub chat_body: Option<Arc<Map<String, Value>>>,
 }
 
 /// The session headers, in the OpenAI server's order of preference.
@@ -162,10 +163,11 @@ impl RequestExtras {
     }
 
     /// The extras of a request: its session headers, and the body fields the
-    /// typed request drops. A P/D request -- `kv_transfer_params`, or
-    /// `/generate`'s bootstrap fields -- is refused: the transfer is not
-    /// carried to the engine, and served plainly its peer waits for nothing.
-    fn read(request: &InferenceEnvelope) -> Result<Self, Response> {
+    /// typed request drops -- a chat's whole body with `keeps_chat_body`. A P/D
+    /// request -- `kv_transfer_params`, or `/generate`'s bootstrap fields -- is
+    /// refused: the transfer is not carried to the engine, and served plainly
+    /// its peer waits for nothing.
+    fn read(request: &InferenceEnvelope, keeps_chat_body: bool) -> Result<Self, Response> {
         let (dp_session_id, dp_parent_session_id) = session_ids(&request.headers);
         let mut extras = Self {
             dp_session_id,
@@ -178,9 +180,11 @@ impl RequestExtras {
             }
             extras.data_parallel_rank = body.data_parallel_rank.map(i64::from);
         }
-        if !RAW_KEYS
-            .iter()
-            .any(|key| memchr::memmem::find(&request.body, key).is_some())
+        let keeps_chat_body = keeps_chat_body && matches!(request.parsed, ParsedInference::Chat(_));
+        if !keeps_chat_body
+            && !RAW_KEYS
+                .iter()
+                .any(|key| memchr::memmem::find(&request.body, key).is_some())
         {
             return Ok(extras);
         }
@@ -190,7 +194,6 @@ impl RequestExtras {
         if field("kv_transfer_params").is_some() {
             return Err(pd_refused());
         }
-        extras.thinking = field("thinking").cloned();
         if let Some(rank) = field("data_parallel_rank") {
             extras.data_parallel_rank =
                 Some(rank.as_i64().filter(|r| *r >= 0).ok_or_else(|| {
@@ -199,6 +202,9 @@ impl RequestExtras {
                         format!("data_parallel_rank must be a non-negative integer, got {rank}"),
                     )
                 })?);
+        }
+        if keeps_chat_body {
+            extras.chat_body = Some(Arc::new(raw));
         }
         Ok(extras)
     }
@@ -259,7 +265,7 @@ impl AtomBridgeRouter {
             )),
             metrics_labels::BACKEND_REGULAR,
         )
-        .reading_prompt_opener();
+        .reading_output_as_atom(AtomOutput::new(runtime.end_token_ids.clone()));
         Ok(Self {
             runtime,
             pipeline,
@@ -350,7 +356,7 @@ impl RouterTrait for AtomBridgeRouter {
         request: InferenceEnvelope,
         _app: &Arc<AppContext>,
     ) -> Response {
-        let extras = match RequestExtras::read(&request) {
+        let extras = match RequestExtras::read(&request, self.runtime.renders_chat) {
             Ok(extras) => extras,
             Err(response) => return response,
         };
@@ -428,6 +434,9 @@ impl RouterTrait for AtomBridgeRouter {
             );
         }
         let mut body = body.clone();
+        // The served model, whatever name the client sent: the parsers are
+        // looked up by it, streamed or not.
+        body.model = self.runtime.served_model_name.clone();
         let defaults = &self.runtime.default_chat_template_kwargs;
         if !defaults.is_empty() {
             let kwargs = body
@@ -445,9 +454,22 @@ impl RouterTrait for AtomBridgeRouter {
         let mut extras = RequestExtras::current();
         // ATOM renders the prompt from the request as the client sent it,
         // tool_choice included (Kimi-K3's template reads it).
-        let rendered = if self.runtime.renders_chat {
-            match py_bridge::render_chat(&self.runtime.bridge, &body, extras.thinking.as_ref())
-                .await
+        // A chat reaching here without its body (not through `route_inference`)
+        // is rendered from the typed request.
+        let chat_body = extras.chat_body.take().or_else(|| {
+            if !self.runtime.renders_chat {
+                return None;
+            }
+            let typed = serde_json::to_value(&body).ok()?;
+            typed.as_object().cloned().map(Arc::new)
+        });
+        let rendered = if let Some(chat_body) = chat_body {
+            match py_bridge::render_chat(
+                &self.runtime.bridge,
+                &chat_body,
+                body.chat_template_kwargs.as_ref(),
+            )
+            .await
             {
                 Ok((rendered, handle)) => {
                     extras.prompt_handle = handle;
@@ -540,6 +562,51 @@ mod tests {
             map.insert(*name, value.parse().unwrap());
         }
         map
+    }
+
+    #[tokio::test]
+    async fn a_python_rendered_chat_keeps_the_fields_its_typed_body_drops() {
+        let pool = crate::core::prepare_pool::PreparePoolRuntime::new(
+            crate::config::RouterConfig::default()
+                .resolved_prepare_pool()
+                .unwrap(),
+        )
+        .unwrap();
+        let app = Arc::new(
+            AppContext::from_config(Default::default(), 5, pool.handle())
+                .await
+                .unwrap(),
+        );
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "s", "tools": [{"type": "function",
+                    "function": {"name": "f", "parameters": {}}}]},
+                {"role": "tool", "content": "r", "tool_call_id": "c", "name": "f"},
+            ],
+            "tools": [],
+        });
+        let parse = |keeps: bool| {
+            let body = serde_json::to_vec(&body).unwrap();
+            let app = Arc::clone(&app);
+            async move {
+                let request = InferenceEnvelope::parse(
+                    "/v1/chat/completions".parse().unwrap(),
+                    headers(&[("content-type", "application/json")]),
+                    body.into(),
+                    &app,
+                )
+                .await
+                .unwrap();
+                RequestExtras::read(&request, keeps).unwrap()
+            }
+        };
+        assert!(parse(false).await.chat_body.is_none());
+        let kept = parse(true).await.chat_body.unwrap();
+        assert_eq!(kept["messages"][0]["tools"][0]["function"]["name"], "f");
+        assert_eq!(kept["messages"][1]["name"], "f");
+        // As sent: an empty tool list is not read as `tool_choice: "none"`.
+        assert!(kept.get("tool_choice").is_none());
     }
 
     #[test]

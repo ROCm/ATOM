@@ -29,6 +29,8 @@ pub(crate) const CHAT_STREAM: Fields = Fields {
 };
 
 pub(crate) struct AtomUsage {
+    /// The prompt the siblings share, which a chat counts once.
+    prompt_tokens: Option<u32>,
     cached_tokens: u32,
     timing: SeqTiming,
     choices: usize,
@@ -44,6 +46,7 @@ impl AtomUsage {
             match &mut usage {
                 None => {
                     usage = Some(Self {
+                        prompt_tokens: None,
                         cached_tokens: meta.cached_tokens,
                         timing,
                         choices: 1,
@@ -61,14 +64,28 @@ impl AtomUsage {
     }
 
     pub fn of_completes(completes: &[TokenChunk]) -> Option<Self> {
-        Self::of(completes.iter().filter_map(|c| match c {
+        let mut usage = Self::of(completes.iter().filter_map(|c| match c {
             TokenChunk::Complete { meta, .. } => Some(meta),
             TokenChunk::Partial { .. } => None,
-        }))
+        }))?;
+        usage.prompt_tokens = completes.iter().find_map(|c| match c {
+            TokenChunk::Complete { usage, .. } => Some(usage.prompt_tokens),
+            TokenChunk::Partial { .. } => None,
+        });
+        Some(usage)
     }
 
     /// Add this endpoint's `fields` to the `usage` object.
     pub fn extend(&self, usage: &mut Map<String, Value>, fields: Fields) {
+        if let (Some(prompt), true) = (self.prompt_tokens, self.choices > 1) {
+            // Summed over the siblings by the render; the server counts it once.
+            let completion = usage
+                .get("completion_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            usage.insert("prompt_tokens".into(), json!(prompt));
+            usage.insert("total_tokens".into(), json!(u64::from(prompt) + completion));
+        }
         if fields.cached_tokens {
             usage.insert(
                 "prompt_tokens_details".into(),

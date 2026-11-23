@@ -34,6 +34,7 @@ from collections import OrderedDict
 from typing import Any
 
 from atom import SamplingParams, structured_output
+from atom.entrypoints.openai.api_compatibility import api_compatibility_for
 from atom.entrypoints.openai.api_server import (
     _coerce_n,
     _validate_context_length,
@@ -152,6 +153,11 @@ class ChatRenderer:
         chat.tools = normalize_chat_tools(chat.tools)
         validate_chat_request(chat)
         kwargs = self._template_kwargs(request)
+        compatibility = api_compatibility_for(self.encoder)
+        if not compatibility.chat_forced_tools_with_thinking:
+            compatibility.validate_chat_tool_choice(
+                chat.tool_choice, thinking_enabled=self._thinking_enabled(kwargs)
+            )
         prompt = apply_chat_template(
             self.tokenizer,
             self.encoder,
@@ -186,6 +192,18 @@ class ChatRenderer:
         return apply_reasoning_controls(
             kwargs, self.reasoning_toggle, controls, rules=rules
         )
+
+    def _thinking_enabled(self, kwargs: dict[str, Any]) -> bool:
+        """As the OpenAI server's `_effective_thinking_enabled`: the template
+        kwargs read through the encoder's defaults and normalization."""
+        effective = dict(getattr(self.encoder, "defaults", {}))
+        effective.update(kwargs)
+        if self.encoder is not None:
+            effective = self.encoder.prepare_kwargs(effective)
+        if self.reasoning_toggle is None:
+            return True
+        name, off_value, on_value = self.reasoning_toggle
+        return effective.get(name, on_value) != off_value
 
     def _opener(self, prompt: str, kwargs: dict[str, Any]) -> str | None:
         tail = prompt.rstrip()
@@ -252,8 +270,14 @@ class TokenBridge:
             self._renderer.tool_parser_cls, tokenizer
         )
         config = getattr(engine, "config", None)
+        # Read by Rust: every id that ends an output, which its decode leaves
+        # out of the text as the OpenAI server's does.
+        self.end_token_ids = list(getattr(config, "end_token_ids", ()) or ())
         self._max_model_len = getattr(config, "max_model_len", None)
-        self._output_limit = deployment_metadata(config, None).get("max_output_tokens")
+        # The OpenAI server's cap, its message encoder's included (V4.1's).
+        self._output_limit = deployment_metadata(config, self._renderer.encoder).get(
+            "max_output_tokens"
+        )
         self._lock = threading.Lock()
         # CoreManager has one request thread (the OpenAI server's event loop):
         # its DP and prefix routers are not written for concurrent
@@ -371,8 +395,9 @@ class TokenBridge:
     def is_healthy(self) -> bool:
         return bool(self.engine.core_mgr.is_healthy())
 
-    def close(self) -> None:
+    def close(self) -> bool:
         self.engine.core_mgr._flush_stream_batch_fn = None
+        return True
 
     # ------------------------------------------------------------------
     # Engine -> Rust
@@ -476,9 +501,17 @@ class TokenBridge:
         )
 
     def _forget(self, seq_ids: list[int]) -> None:
-        requests = self.engine.io_processor.requests
+        """Drop what preprocessing recorded of the sequences: the request, and
+        the request-id maps a request id given for ``n == 1`` fills (only the
+        offline ``postprocess`` pops those)."""
+        io = self.engine.io_processor
+        to_external = getattr(io, "_internal_to_external", {})
+        to_internal = getattr(io, "_external_to_internal", {})
         for seq_id in seq_ids:
-            requests.pop(seq_id, None)
+            io.requests.pop(seq_id, None)
+            external = to_external.pop(seq_id, None)
+            if external is not None and to_internal.get(external) == seq_id:
+                del to_internal[external]
 
 
 def _or(value: Any, default: Any) -> Any:
