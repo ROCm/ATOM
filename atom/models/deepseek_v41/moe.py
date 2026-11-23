@@ -32,6 +32,7 @@ from atom.model_ops.deepseek_v41.router import (
     router_logits as fixed_order_router_logits,
 )
 from atom.model_ops.deepseek_v41.router import router_supported
+from atom.model_ops.deepseek_v41 import router_prefill
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.topK import mm_topk, topk_meta_rows
 from atom.model_ops.utils import atom_parameter
@@ -120,6 +121,8 @@ class MoE(V4MoE):
         decode's MoE kernel runs too, else the gate's own GEMM."""
         if router_supported(x, self.gate.weight):
             return fixed_order_router_logits(x, self.gate.weight)
+        if router_prefill.compatible(x, self.gate):
+            return router_prefill.v41_prefill_router_logits_fp32(x, self.gate.weight)
         return self.gate(x)
 
     def routed_expert_forward(

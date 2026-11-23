@@ -628,8 +628,16 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--kv-share",
         choices=["gloo", "ipc"],
-        default="gloo",
-        help="tk: the landed KV to ranks 1..7: rank 0's converted planes over gloo, or its buffer mapped over HIP IPC",
+        default="ipc",
+        help="tk: the landed KV to ranks 1..7: ipc (default) every rank maps rank 0's receive buffer over HIP IPC and "
+        "converts it on its own GPU; gloo: rank 0's converted planes through the CPU (about 1.3 s at a 400K prompt vs "
+        "0.02 s for fused ipc, 8 x MI355X)",
+    )
+    ap.add_argument(
+        "--kv-convert",
+        choices=["torch", "fused"],
+        default=None,
+        help="tk/ipc: fused direct cache conversion (default), or torch for comparison and rollback; gloo uses torch",
     )
     ap.add_argument("--progress-dir", help="tk: each worker's startup phase, rank<r>.progress (a hang names its phase)")  # fmt: skip
     return ap
@@ -645,6 +653,8 @@ def build_engine(args):
         )
     if not args.model_weights_dir:
         raise SystemExit("--engine tk needs --model-weights-dir")
+    from .tkworker import resolve_kv_convert
+
     kw = {
         "ckpt": args.model_weights_dir,
         "toktab_dir": args.toktab_dir,
@@ -653,6 +663,7 @@ def build_engine(args):
         "mooncake_host": W.local_ip(),
         "accept": args.accept,
         "kv_share": args.kv_share,
+        "kv_convert": resolve_kv_convert(args.kv_convert, kv_share=args.kv_share),
         "progress_dir": args.progress_dir,
     }
     logger.info("decode host: starting 8 TkRank workers (%s)", kw)

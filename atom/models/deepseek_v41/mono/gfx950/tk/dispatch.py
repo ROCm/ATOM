@@ -46,7 +46,7 @@ from atom.utils.forward_context import RoundService, get_forward_context
 logger = logging.getLogger("atom")
 
 
-def commit_served(cache, step, anchors, advance: bool = False) -> None:
+def _commit_served_torch(cache, step, anchors, advance: bool = False) -> None:
     """A served verify step's speculative commit: ATOM's tentative state dropped (its staging was the forward's), each
     request's state cursor at its next step's start -- one past its accepted anchor's position, where
     ``TentativeState.commit`` puts it (prefix ``t`` of a request at ``position``: ``position + 1 + t``,
@@ -66,6 +66,17 @@ def commit_served(cache, step, anchors, advance: bool = False) -> None:
         starts = step.positions.index_select(0, rows).to(cache.cursor.dtype) + 1
         cache.cursor.index_put_((slots, col), starts.to(dev))
     cache.pending = None
+
+
+def commit_served(cache, step, anchors, advance: bool = False) -> None:
+    """Commit a served round, using the single-writer DEVICE update when supported."""
+    if advance and step.scheduled_bs == 1 and cache.cursor.is_cuda:
+        from .cursor import commit_device, supported
+
+        if supported(cache, step, anchors):
+            commit_device(cache, step, anchors)
+            return
+    _commit_served_torch(cache, step, anchors, advance=advance)
 
 
 class TkRound(DecodeRound):
@@ -281,5 +292,10 @@ def install_tk_step(
         fly_cache=envs.ATOM_DSV41_TK_FLY_CACHE or None,
     )
     wrapped = TkStepModel(model, drafter, runner)
+    from atom.models.deepseek_v41.mono.gfx950.tk.prefill_index import (
+        install_prefill_index,
+    )
+
+    install_prefill_index(model)
     metadata_builder.use_decode_round(TkRound(wrapped, metadata_builder))
     return wrapped

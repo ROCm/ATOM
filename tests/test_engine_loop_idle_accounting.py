@@ -145,6 +145,9 @@ class _Engine:
     def has_pending_kv_work(self):
         return False
 
+    def _wait_for_input(self):
+        pass
+
     def _advance_idle_kv_transfer(self):
         raise AssertionError("no KV work was scripted")
 

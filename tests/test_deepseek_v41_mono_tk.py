@@ -1557,7 +1557,7 @@ def test_server_flags_for_a_real_run():
     a = SV.build_parser().parse_args(["--engine", "tk", "--with-mtp", "--num-mtp", "5", "--accept", "recorded", "--kv-share", "ipc"])  # fmt: skip
     assert (a.accept, a.kv_share, a.max_seq_len, a.ctrl_port, a.http_port) == ("recorded", "ipc", 1 << 20, 5556, 5557)  # fmt: skip
     d = SV.build_parser().parse_args([])
-    assert (d.accept, d.kv_share) == ("real", "gloo")
+    assert (d.accept, d.kv_share) == ("real", "ipc")
 
 
 def test_imports_without_gpu_stack():

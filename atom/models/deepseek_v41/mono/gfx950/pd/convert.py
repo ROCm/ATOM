@@ -290,6 +290,44 @@ def build_planes(
     return planes
 
 
+def warm(device, n: int = 1024) -> None:
+    """``build_planes`` once on ``device`` over zero pages of ``n`` positions: the conversion's torch ops' first-use cost
+    (about 0.35 s a process, whatever the request's length) at startup instead of in the first request's TTFT.
+    """
+    dev = torch.device(device)
+    main, index = {}, {}
+    for s in KV_SOURCES:
+        cb = 128 // RATIO[s]
+        npg = -(-(n // RATIO[s]) // cb)
+        main[s] = (torch.zeros(npg, cb * V4_REC, dtype=U8, device=dev), cb)
+        index[s] = (torch.zeros(npg, cb * IDX_REC, dtype=U8, device=dev), cb)
+    win_cb = 32
+    win = [
+        torch.zeros(WINDOW // win_cb + 1, win_cb * V4_REC, dtype=U8, device=dev)
+        for _ in range(NUM_WIN)
+    ]
+    rings = {
+        s: torch.zeros(STATE_SLOTS, RING_ROW, dtype=F32, device=dev)
+        for s in KV_SOURCES
+        if RATIO[s] == 2
+    }
+    tm = torch.arange(HIST, dtype=I64, device=dev)
+    build_planes(
+        n,
+        main,
+        index,
+        win,
+        window_first_block(n, win_cb),
+        rings,
+        list(range(HIST)),
+        tm,
+        device=dev,
+        win_cb=win_cb,
+    )
+    if dev.type == "cuda":
+        torch.cuda.synchronize(dev)
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # the landed buffer (Dsv41RocmProfile.convert)
 

@@ -195,6 +195,25 @@ def _save_toktab(path: str, tabs: dict) -> None:
     os.replace(tmp, path)
 
 
+def resolve_kv_convert(
+    kv_convert: str | None,
+    *,
+    kv_share: str = "ipc",
+    receive: bool = True,
+    planes: str | None = None,
+) -> str:
+    """Default live IPC imports to fused; saved planes and gloo use Torch."""
+    if kv_convert is None:
+        kv_convert = (
+            "fused" if receive and kv_share == "ipc" and not planes else "torch"
+        )
+    if kv_convert not in ("torch", "fused"):
+        raise ValueError(f"kv_convert: torch | fused, not {kv_convert!r}")
+    if kv_convert == "fused" and (kv_share != "ipc" or not receive or planes):
+        raise ValueError("fused KV conversion needs IPC and a live receive buffer")
+    return kv_convert
+
+
 class TkRankWorker:
     """The module docstring's worker; ``fanout.RankGroup(8, "...pd.tkworker:TkRankWorker", kwargs)``."""
 
@@ -213,8 +232,12 @@ class TkRankWorker:
         planes: str | None = None,
         progress_dir: str | None = None,
         accept: str = "real",
-        kv_share: str = "gloo",
+        kv_share: str = "ipc",
+        kv_convert: str | None = None,
     ):
+        kv_convert = resolve_kv_convert(
+            kv_convert, kv_share=kv_share, receive=receive, planes=planes
+        )
         import torch
         import torch.distributed as dist
 
@@ -241,6 +264,7 @@ class TkRankWorker:
         if kv_share not in ("gloo", "ipc"):
             raise ValueError(f"kv_share: gloo | ipc, not {kv_share!r}")
         self.accept, self.kv_share = accept, kv_share
+        self.kv_convert = kv_convert
         self.tk = host.TkRank(
             rank, None, device=self.device, cached_sym=cached_sym, accept=accept
         )
@@ -271,9 +295,20 @@ class TkRankWorker:
             self.planes_n = int(snap["n"])
             self.planes = _to_device(snap["planes"], self.device)
         self.buffer = None
+        self.converter = None
         if receive:
             self._progress("receive")
             self._map_receive_buffer(mooncake_host)
+            from . import convert as C
+
+            C.warm(self.device)  # the conversion's first-use cost off the first request
+            if self.kv_convert == "fused":
+                from . import convert_fused as CF
+
+                CF.warm(self.device)
+                self.converter = CF.Converter(
+                    self.tk.buffers.tensors, self.token_map, self.max_seq_len
+                )
         self.events: dict = {}
         dist.barrier()
         self._progress("ready")
@@ -330,6 +365,7 @@ class TkRankWorker:
             "transport": "mooncake",
             "accept": self.accept,
             "kv_share": self.kv_share,
+            "kv_convert": self.kv_convert,
         }
         if self.rank == 0 and self.buffer is not None:
             out.update(self.receive_info)
@@ -388,6 +424,14 @@ class TkRankWorker:
                 raise RuntimeError(
                     "load_kv: this worker has neither a receive buffer nor a planes file"
                 )
+            elif self.converter is not None:
+                try:
+                    self.converter.import_wire(self.buffer, seq_len)
+                except Exception:
+                    # The receive slot cannot be released while direct writers
+                    # might still read it, even if a later enqueue fails.
+                    self.stream.synchronize()
+                    raise
             else:
                 conv = C.convert(
                     self.buffer,
