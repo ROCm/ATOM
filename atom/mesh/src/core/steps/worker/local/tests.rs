@@ -35,7 +35,9 @@ use crate::{
     },
     routers::{
         grpc::engine::GrpcEngine,
-        prepare::{build_generate_payload, fast_tokenizer::FastTokenizer, prepare_chat},
+        prepare::{
+            build_generate_payload, fast_tokenizer::FastTokenizer, prepare_chat, prepare_generate,
+        },
         test_mocks::{
             app_context::app_context_with_router_config,
             tokenizer::{byte_level_tokenizer_dir, hf_tokenizer_path, BYTE_LEVEL_MERGES},
@@ -283,6 +285,63 @@ async fn an_atom_worker_registers_as_atom_with_its_model_info_labels() {
     ] {
         assert_eq!(labels.get(key).map(String::as_str), Some(value), "{key}");
     }
+}
+
+#[tokio::test]
+async fn an_atom_workers_parsers_come_from_its_model_info_unless_configured() {
+    let info = GetModelInfoResponse {
+        tool_call_parser: Some("qwen_xml".into()),
+        reasoning_parser: Some("qwen3".into()),
+        ..model_info("atom-parsers", "", "{}")
+    };
+    let labelled = serve_atom(info.clone(), 1).await;
+    let configured = serve_atom(info, 1).await;
+    let ctx = context();
+    register(&ctx, json!({ "url": labelled })).await.unwrap();
+    register(&ctx, json!({ "url": configured, "tool_parser": "kimik2" }))
+        .await
+        .unwrap();
+
+    let worker = ctx.worker_registry.get_by_url(&labelled).unwrap();
+    assert_eq!(worker.tool_parser(), Some("qwen_xml"));
+    assert_eq!(worker.reasoning_parser(), Some("qwen3"));
+    let worker = ctx.worker_registry.get_by_url(&configured).unwrap();
+    assert_eq!(worker.tool_parser(), Some("kimik2"));
+    assert_eq!(worker.reasoning_parser(), Some("qwen3"));
+}
+
+#[tokio::test]
+async fn an_atom_model_without_a_chat_template_answers_chats_with_501() {
+    let info = GetModelInfoResponse {
+        chat_template: None,
+        ..model_info("atom-encoder", "", "{}")
+    };
+    let url = serve_atom(info, 1).await;
+    let ctx = context();
+    register(&ctx, json!({ "url": url })).await.unwrap();
+    let registered = async {
+        while !ctx.tokenizer_registry.contains("atom-encoder") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(60), registered)
+        .await
+        .expect("the tokenizer job registers the model's tokenizer");
+
+    let chat = json!({"model": "atom-encoder", "messages": [{"role": "user", "content": "hi"}]});
+    let chat: ChatCompletionRequest = serde_json::from_value(chat).unwrap();
+    let Err(refused) = prepare_chat(Arc::new(chat), None, Some("atom-encoder".into()), &ctx) else {
+        panic!("a chat for a model without a template is refused");
+    };
+    assert_eq!(refused.status(), http::StatusCode::NOT_IMPLEMENTED);
+    let completion: GenerateBody = serde_json::from_value(json!({"text": "hi"})).unwrap();
+    assert!(prepare_generate(
+        Arc::new(completion),
+        None,
+        Some("atom-encoder".into()),
+        &ctx
+    )
+    .is_ok());
 }
 
 #[tokio::test]

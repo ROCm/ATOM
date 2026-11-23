@@ -154,6 +154,10 @@ impl GrpcEngine {
                 .dispatch(&self.atom_calls, prefill, decode, payload, tokenizer)
                 .await;
         }
+        #[cfg(feature = "grpc-client")]
+        if let Some(refusal) = atom::pair::mixed_pair_refusal(placement) {
+            return Err(refusal);
+        }
         match placement {
             PlacementPlan::Single { worker, .. } => {
                 self.dispatch_one(worker, payload, ProtoErrorRole::Worker, tokenizer)
@@ -206,8 +210,9 @@ impl GrpcEngine {
             GrpcClient::Atom(atom_client) => {
                 let tokenizer = tokenizer.map(|t| t.as_ref());
                 let request = atom::request::generate_request(payload, worker.as_ref(), tokenizer)?;
+                let (streamed, started) = (request.stream, std::time::Instant::now());
                 let responses = self.atom_calls.start(worker, atom_client, request).await?;
-                let stream = atom::stream::AtomStream::start(responses).await?;
+                let stream = atom::stream::AtomStream::start(responses, streamed, started).await?;
                 return Ok(TokenHandle::new(stream));
             }
         };

@@ -1,9 +1,11 @@
 //! ATOM's own P/D flow over `atom.grpc.v1`: `AtomAdapter` fills a JSON view of the
 //! request fields it reads and writes, which each GenerateRequest then takes.
 
+use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Weak};
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use futures::{Stream, StreamExt};
 use http::StatusCode;
@@ -29,13 +31,16 @@ use crate::routers::grpc::engine::worker_client_cache::{get_grpc_client_from_wor
 use crate::routers::prepare::generation_payload::GenerationPayload;
 use crate::routers::token_handle::engine_error::EngineError;
 use crate::routers::token_handle::token_chunk::TokenChunk;
-use crate::routers::token_handle::token_handle::{TokenHandle, TokenSource};
+use crate::routers::token_handle::token_handle::{SourceClock, TokenHandle, TokenSource};
 use crate::tokenizer::traits::Tokenizer;
 
 /// Runs ATOM pairs as ATOM's HTTP P/D router does: relay, or chunked when P's
 /// instance reports a chunked-transfer template.
 pub(crate) struct AtomPairs {
     info: RwLock<Arc<AtomPrefillInfo>>,
+    /// The worker each URL's info was read for: a worker registered again at that
+    /// URL is another, whose info is read afresh.
+    read_for: RwLock<HashMap<String, Weak<dyn Worker>>>,
     mapping: AtomPdRankMappingPolicy,
     workers: Arc<WorkerRegistry>,
 }
@@ -48,32 +53,44 @@ impl AtomPairs {
         mapping: AtomPdRankMappingPolicy,
     ) -> Result<Self, String> {
         let mut info = AtomPrefillInfo::default();
+        let mut read_for = HashMap::new();
         for worker in workers.get_prefill_workers().iter().filter(|w| is_atom(w)) {
-            learn(&mut info, worker).await?;
+            learn(&mut info, worker).await.map_err(|e| e.to_string())?;
+            read_for.insert(worker.url().to_string(), Arc::downgrade(worker));
         }
         Ok(Self {
             info: RwLock::new(Arc::new(info)),
+            read_for: RwLock::new(read_for),
             mapping,
             workers,
         })
     }
 
-    /// The prefills' info, `prefill`'s read on its first pair when it registered later.
+    /// The prefills' info, `prefill`'s read on its first pair when it registered later
+    /// or again.
     pub(super) async fn adapter_for(
         &self,
         prefill: &Arc<dyn Worker>,
     ) -> Result<AtomAdapter, EngineError> {
-        let known = self.info.read().unwrap().clone();
-        if known.tp_sizes.contains_key(prefill.url()) {
-            return Ok(AtomAdapter::new(known));
+        let url = prefill.url();
+        let this = Arc::downgrade(prefill);
+        let read = |read_for: &HashMap<String, Weak<dyn Worker>>| {
+            read_for.get(url).is_some_and(|known| known.ptr_eq(&this))
+        };
+        if read(&self.read_for.read().unwrap()) {
+            return Ok(AtomAdapter::new(self.info.read().unwrap().clone()));
         }
         let mut learned = AtomPrefillInfo::default();
-        learn(&mut learned, prefill).await.map_err(bad_gateway)?;
+        learn(&mut learned, prefill).await?;
         let mut info = self.info.write().unwrap();
         let mut merged = AtomPrefillInfo::clone(&info);
+        for url in learned.tp_sizes.keys() {
+            merged.chunked_transfer.remove(url);
+        }
         merged.tp_sizes.extend(learned.tp_sizes);
         merged.chunked_transfer.extend(learned.chunked_transfer);
         *info = Arc::new(merged);
+        self.read_for.write().unwrap().insert(url.to_string(), this);
         Ok(AtomAdapter::new(info.clone()))
     }
 
@@ -87,6 +104,7 @@ impl AtomPairs {
         payload: &GenerationPayload,
         tokenizer: Option<&dyn Tokenizer>,
     ) -> Result<TokenHandle, EngineError> {
+        let started = Instant::now();
         let prefill =
             apply_atom_pd_rank_mapping_policy(self.mapping, &self.workers, prefill.clone(), decode);
         let prefill_load = WorkerLoadGuard::new(prefill.clone(), None);
@@ -105,6 +123,7 @@ impl AtomPairs {
         Ok(TokenHandle::new(DecodeStream {
             stream,
             _load: decode_load,
+            started,
         }))
     }
 
@@ -179,6 +198,24 @@ pub(crate) fn atom_pair(placement: &PlacementPlan) -> Option<[&Arc<dyn Worker>; 
     }
 }
 
+/// The refusal of a pair `placement` plans from an ATOM and a non-ATOM worker, between
+/// which neither P/D flow hands the KV over.
+pub(crate) fn mixed_pair_refusal(placement: &PlacementPlan) -> Option<EngineError> {
+    match placement {
+        PlacementPlan::Pair {
+            prefill, decode, ..
+        } if is_atom(prefill) != is_atom(decode) => Some(internal(format!(
+            "P/D pair mixes runtimes: prefill {} is {:?}, decode {} is {:?}; an ATOM worker \
+             pairs only with an ATOM worker",
+            prefill.url(),
+            prefill.metadata().runtime_type,
+            decode.url(),
+            decode.metadata().runtime_type,
+        ))),
+        _ => None,
+    }
+}
+
 fn is_atom(worker: &Arc<dyn Worker>) -> bool {
     worker.metadata().runtime_type == RuntimeType::Atom
 }
@@ -192,12 +229,13 @@ pub(super) async fn atom_client(worker: &Arc<dyn Worker>) -> Option<AtomClient> 
 
 /// Adds `worker`'s TP size and chunked template to `info`, its instance's GetServerInfo
 /// read once.
-async fn learn(info: &mut AtomPrefillInfo, worker: &Arc<dyn Worker>) -> Result<(), String> {
+async fn learn(info: &mut AtomPrefillInfo, worker: &Arc<dyn Worker>) -> Result<(), EngineError> {
     let base_url = worker.base_url().trim_end_matches('/').to_string();
     if !info.tp_sizes.contains_key(&base_url) {
         let data = kv_transfer_info(worker).await?;
         let source = format!("{base_url} GetServerInfo");
-        let (tp, chunked) = parse_atom_prefill_info(&data, &source, &base_url)?;
+        let (tp, chunked) =
+            parse_atom_prefill_info(&data, &source, &base_url).map_err(bad_gateway)?;
         info.tp_sizes.insert(base_url.clone(), tp);
         if let Some(template) = chunked {
             info.chunked_transfer.insert(base_url.clone(), template);
@@ -211,18 +249,28 @@ async fn learn(info: &mut AtomPrefillInfo, worker: &Arc<dyn Worker>) -> Result<(
     Ok(())
 }
 
-/// `worker`'s instance's `/kv_transfer_info` body, as GetServerInfo carries it.
-async fn kv_transfer_info(worker: &Arc<dyn Worker>) -> Result<Value, String> {
+/// `worker`'s instance's `/kv_transfer_info` body, as GetServerInfo carries it. Connecting
+/// and reading it take at most the worker's health-check timeout together.
+async fn kv_transfer_info(worker: &Arc<dyn Worker>) -> Result<Value, EngineError> {
     let url = worker.url();
-    let client = atom_client(worker)
+    let deadline = Duration::from_secs(worker.metadata().health_config.timeout_secs);
+    let read = async {
+        let client = atom_client(worker)
+            .await
+            .ok_or_else(|| bad_gateway(format!("Failed to connect to ATOM prefill {url}")))?;
+        client
+            .get_server_info()
+            .await
+            .map_err(|e| bad_gateway(format!("GetServerInfo on {url} failed: {e}")))
+    };
+    let info = tokio::time::timeout(deadline, read)
         .await
-        .ok_or_else(|| format!("Failed to connect to ATOM prefill {url}"))?;
-    let info = client
-        .get_server_info()
-        .await
-        .map_err(|e| format!("GetServerInfo on {url} failed: {e}"))?;
+        .map_err(|_| EngineError::Http {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            message: format!("GetServerInfo on {url} timed out after {deadline:?}"),
+        })??;
     serde_json::from_str(&info.kv_transfer_info_json)
-        .map_err(|e| format!("Parse {url} GetServerInfo kv_transfer_info: {e}"))
+        .map_err(|e| bad_gateway(format!("Parse {url} GetServerInfo kv_transfer_info: {e}")))
 }
 
 /// The fields `AtomAdapter` wrote into `view`, onto `request`.
@@ -268,8 +316,9 @@ async fn open_decode(
     client: &AtomClient,
     request: GenerateRequest,
 ) -> Result<AtomStream, EngineError> {
+    let (streamed, started) = (request.stream, Instant::now());
     let opened = match calls.start(decode, client, request).await {
-        Ok(responses) => AtomStream::start(responses).await,
+        Ok(responses) => AtomStream::start(responses, streamed, started).await,
         Err(e) => Err(e),
     };
     opened.map_err(|e| match e {
@@ -300,6 +349,8 @@ fn internal(error: impl std::fmt::Display) -> EngineError {
 struct DecodeStream {
     stream: AtomStream,
     _load: WorkerLoadGuard,
+    /// When the pair began, so the TTFT a renderer measures includes P's part.
+    started: Instant,
 }
 
 impl Stream for DecodeStream {
@@ -313,5 +364,13 @@ impl Stream for DecodeStream {
 impl TokenSource for DecodeStream {
     fn mark_completed(&mut self) {
         self.stream.mark_completed();
+    }
+
+    fn clock(&self) -> Option<SourceClock> {
+        let clock = self.stream.clock()?;
+        Some(SourceClock {
+            started: self.started,
+            ..clock
+        })
     }
 }

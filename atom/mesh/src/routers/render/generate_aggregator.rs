@@ -23,7 +23,7 @@ use crate::{
 };
 
 pub async fn process(stream: TokenHandle, ctx: ResponseContext) -> Response {
-    let start = Instant::now();
+    let start = stream.clock().map_or_else(Instant::now, |c| c.started);
 
     if !matches!(&ctx.original, ProtocolRequest::Generate(_)) {
         return error::internal_error(

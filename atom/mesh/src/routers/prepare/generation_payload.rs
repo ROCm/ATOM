@@ -23,6 +23,9 @@ pub struct GenerationPayload {
     pub log_metrics: bool,
     /// ATOM only: a chat's input to ATOM's structured-output derivation.
     pub structured_output: Option<StructuredOutput>,
+    /// ATOM only: the request's DP session and its parent, from its headers.
+    pub dp_session_id: Option<String>,
+    pub dp_parent_session_id: Option<String>,
 }
 
 /// What ATOM's HTTP chat route derives a chat's structured output from: the

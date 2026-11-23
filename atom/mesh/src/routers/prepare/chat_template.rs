@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 
 use super::fast_tokenizer::FastTokenizer;
 use crate::{
-    core::Worker,
+    core::{worker::RuntimeType, Worker},
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage},
         common::StringOrArray,
@@ -43,6 +43,22 @@ pub(crate) fn default_template_kwargs(
                 .map_err(|e| format!("Invalid {DEFAULT_TEMPLATE_KWARGS_LABEL} label {json}: {e}"))
         })
         .transpose()
+}
+
+/// The first of `workers` that is ATOM's and reports no chat template (Kimi-K3's
+/// encoder), when neither it nor the router (`configured`) has one set.
+pub(crate) fn atom_worker_without_template(
+    workers: &[Arc<dyn Worker>],
+    configured: bool,
+) -> Option<&Arc<dyn Worker>> {
+    if configured {
+        return None;
+    }
+    workers.iter().find(|worker| {
+        worker.metadata().runtime_type == RuntimeType::Atom
+            && worker.chat_template().is_none()
+            && !worker.metadata().labels.contains_key("chat_template")
+    })
 }
 
 /// Process chat messages and apply the HuggingFace chat template.

@@ -415,6 +415,8 @@ fn scenario_a_payload() -> GenerationPayload {
         return_hidden_states: false,
         log_metrics: false,
         structured_output: None,
+        dp_session_id: None,
+        dp_parent_session_id: None,
     }
 }
 
@@ -503,6 +505,8 @@ fn scenario_b_payload() -> GenerationPayload {
         // our payload mirrors that for parity with upstream's plain builder.
         log_metrics: true,
         structured_output: None,
+        dp_session_id: None,
+        dp_parent_session_id: None,
     }
 }
 
@@ -585,6 +589,8 @@ fn scenario_c_payload() -> GenerationPayload {
         return_hidden_states: false,
         log_metrics: false,
         structured_output: None,
+        dp_session_id: None,
+        dp_parent_session_id: None,
     }
 }
 
@@ -679,6 +685,8 @@ fn scenario_d_payload() -> GenerationPayload {
         return_hidden_states: false,
         log_metrics: false,
         structured_output: None,
+        dp_session_id: None,
+        dp_parent_session_id: None,
     }
 }
 
@@ -801,6 +809,8 @@ fn scenario_b_prime_payload() -> GenerationPayload {
         return_hidden_states: false,
         log_metrics: true,
         structured_output: None,
+        dp_session_id: None,
+        dp_parent_session_id: None,
     }
 }
 

@@ -2,7 +2,7 @@
 //! answers: per-seq_id splitting, Abort on drop, failure and reopening, Ready's version.
 
 use std::future::Future;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use prost::Message as _;
 use tokio::time::timeout;
@@ -289,7 +289,7 @@ fn done(items: Vec<(pb::Completion, Vec<u32>)>) -> Result<Frames, Status> {
 /// Every TokenChunk of `stream`, read as a Generate stream is read.
 async fn chunks(stream: SessionStream) -> Vec<Result<TokenChunk, EngineError>> {
     let read = async {
-        match AtomStream::start(stream).await {
+        match AtomStream::start(stream, true, Instant::now()).await {
             Ok(stream) => stream.collect().await,
             Err(e) => vec![Err(e)],
         }
@@ -474,7 +474,9 @@ async fn dropping_an_unfinished_request_aborts_it_and_a_finished_one_sends_nothi
         matches!(&finished[..], [Ok(TokenChunk::Complete { .. })]),
         "{finished:?}"
     );
-    let started = timeout(HANG, AtomStream::start(running)).await.unwrap();
+    let started = timeout(HANG, AtomStream::start(running, true, Instant::now()))
+        .await
+        .unwrap();
     let mut running = started.unwrap();
     let first = running.next().await;
     assert!(
@@ -509,7 +511,11 @@ async fn a_broken_session_fails_its_requests_and_the_next_request_reopens_it() {
         call.outbound
             .send(step(&[(started_id, vec![11], 0)]))
             .unwrap();
-        let started = timeout(HANG, AtomStream::start(started.unwrap())).await;
+        let started = timeout(
+            HANG,
+            AtomStream::start(started.unwrap(), true, Instant::now()),
+        )
+        .await;
         let mut started = started.unwrap().unwrap();
         let chunk = started.next().await;
         assert!(matches!(chunk, Some(Ok(TokenChunk::Partial { .. }))));
@@ -682,6 +688,8 @@ mod routed {
             .connection_mode(ConnectionMode::Grpc { port: None })
             .runtime_type(RuntimeType::Atom)
             .model_id("m")
+            // An ATOM worker reporting none has its chats refused.
+            .label("chat_template", "{{ messages }}")
             .build();
         Arc::new(worker)
     }
