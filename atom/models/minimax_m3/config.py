@@ -6,21 +6,6 @@ imports neither the model nor AITER until the architecture check needs it."""
 
 from atom.config import FP4_CACHE_DTYPES
 
-# A draft whose KV dtype differs from the target's has been verified (save and restore)
-# only as a DSpark draft under these, whatever transports move NVFP4 pages.
-DRAFT_DTYPE_CONNECTORS = frozenset({"lmcache_offload"})
-
-
-def _leaves_within(config, names) -> bool:
-    """Whether every configured transport, ``multi`` expanded, is one of ``names``."""
-    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-
-    try:
-        leaves = KVConnectorFactory.leaf_connectors(config)
-    except ValueError:  # an unknown connector: refused by the caller
-        return False
-    return bool(leaves) and all(name in names for name, _ in leaves)
-
 
 def nvfp4_pages_move(config) -> bool:
     """Whether this config's NVFP4 KV and index pages move under every transport it
@@ -34,14 +19,16 @@ def nvfp4_pages_move(config) -> bool:
 
 def draft_dtype_moves(config) -> bool:
     """Whether an own-pool draft may keep a KV dtype other than the target's under this
-    config's transports: a DSpark draft beside an NVFP4 KV, every transport in
-    ``DRAFT_DTYPE_CONNECTORS``."""
+    config's transports: a DSpark draft beside an NVFP4 KV, every transport registered
+    with ``moves_own_dtype_draft``."""
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
     spec = config.speculative_config
     return (
         config.kv_cache_dtype == "nvfp4"
         and spec is not None
         and spec.method == "dspark"
-        and _leaves_within(config, DRAFT_DTYPE_CONNECTORS)
+        and KVConnectorFactory.topology_moves_own_dtype_draft(config)
     )
 
 
