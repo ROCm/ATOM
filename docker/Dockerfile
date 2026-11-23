@@ -552,11 +552,14 @@ RUN pip install rocm-trace-lite && \
 ARG CACHEBUST=1
 # Optional Cargo features; ext-proc is excluded unless explicitly requested.
 ARG ATOM_MESH_FEATURES=""
+# With the structured-output extra (llguidance, RE2): without it, response_format
+# json_object/json_schema and strict tools are refused.
 RUN git clone $ATOM_REPO /app/ATOM && \
     cd /app/ATOM && \
     git checkout $ATOM_COMMIT && \
-    ATOM_MESH_BUILD=1 ATOM_MESH_FEATURES="${ATOM_MESH_FEATURES}" python -m pip install -e .
+    ATOM_MESH_BUILD=1 ATOM_MESH_FEATURES="${ATOM_MESH_FEATURES}" python -m pip install -e ".[structured-output]"
 RUN pip show atom || true
+RUN python -c "import llguidance, re2; print('structured output: llguidance', llguidance.__version__)"
 
 RUN pip install --no-cache-dir msgpack msgspec quart
 
