@@ -559,3 +559,14 @@ def test_model_info_leaves_an_absent_chat_template_unset(serve, monkeypatch):
     monkeypatch.setattr(api_server, "tokenizer", SimpleNamespace(chat_template=None))
     info = asyncio.run(servicer.GetModelInfo(pb.GetModelInfoRequest(), None))
     assert not info.HasField("chat_template") and list(info.eos_token_ids) == [2]
+
+
+def test_server_info_carries_the_kv_event_sources_body(serve, monkeypatch):
+    engine = FakeEngine()
+    sources = {"0": {"endpoint": "tcp://*:5557", "topic": "kv", "block_size": 16}}
+    engine.core_mgr.kv_event_sources = sources
+    monkeypatch.setattr(api_server, "kv_transfer_info_body", dict)
+    monkeypatch.setattr(api_server, "server_info_body", dict)
+    servicer = serve(engine)
+    info = asyncio.run(servicer.GetServerInfo(pb.GetServerInfoRequest(), None))
+    assert json.loads(info.kv_event_sources_json) == sources
