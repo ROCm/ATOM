@@ -11,6 +11,7 @@ from pd_recipe_router_ab import (
     benchmark,
     cancellation_probe,
     functional_probe,
+    prefill_failure_probe,
     request,
     transferred_bytes,
     verify_kv_transfer,
@@ -110,6 +111,10 @@ class FunctionalOnlyTest(unittest.TestCase):
                 "pd_recipe_router_ab.verify_kv_transfer", return_value={"passed": True}
             ),
             patch("pd_recipe_router_ab.shutil.which", return_value=None),
+            patch(
+                "pd_recipe_router_ab.prefill_failure_probe",
+                return_value=[{"passed": True}],
+            ),
             patch("pd_recipe_router_ab.subprocess.run") as run,
             patch("pd_recipe_router_ab.subprocess.check_output") as check_output,
         ):
@@ -163,6 +168,65 @@ class FunctionalOnlyTest(unittest.TestCase):
             )
         self.assertEqual(len(calls), 5)
         self.assertGreater(len(calls[-1]["prompt"].split()), 128)
+
+
+class PrefillFailureProbeTest(unittest.TestCase):
+    def test_requires_prefill_error_idle_workers_and_recovery(self):
+        class Handler(BaseHTTPRequestHandler):
+            error_code = "prefill_server_error"
+
+            def do_POST(self):
+                payload = json.loads(
+                    self.rfile.read(int(self.headers["Content-Length"]))
+                )
+                fault = "min_tokens" in payload
+                stream = fault and payload["stream"]
+                self.send_response(200 if stream or not fault else 400)
+                self.end_headers()
+                body = (
+                    {"error": {"code": self.error_code}}
+                    if fault
+                    else {"choices": [{"text": "hello"}]}
+                )
+                text = json.dumps(body)
+                self.wfile.write(
+                    (f"data: {text}\n\ndata: [DONE]\n\n" if stream else text).encode()
+                )
+
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(
+                    b"vllm:num_requests_running 0\nvllm:num_requests_waiting 0\n"
+                )
+
+            def log_message(self, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        url = f"http://127.0.0.1:{server.server_port}"
+        try:
+            with (
+                tempfile.TemporaryDirectory() as temporary,
+                patch("pd_recipe_router_ab.time.sleep"),
+            ):
+                output = Path(temporary) / "failure.json"
+                records = prefill_failure_probe(SINGLE_NODE, url, [url], output)
+                self.assertEqual(
+                    [record["http_status"] for record in records], [400, 200]
+                )
+                self.assertTrue(
+                    all(record["recovery_response"]["choices"] for record in records)
+                )
+                Handler.error_code = "decode_server_error"
+                with self.assertRaises(AssertionError):
+                    prefill_failure_probe(SINGLE_NODE, url, [url], output)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
 
 
 class TransferTest(unittest.TestCase):

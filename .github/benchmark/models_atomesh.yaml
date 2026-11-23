@@ -17418,7 +17418,7 @@ models:
           slurm_partition: amd-spur
           slurm_qos: amd-atom-qos
           slurm_submit_runner: atomesh-cicd
-          time_limit: 01:00:00
+          time_limit: 01:30:00
       - <<: *pr5090_functional
         name: pr5090-1p1d-pp4-single-node-functional
         display_topology: 1P1D-P-TP1PP4-D-TP4

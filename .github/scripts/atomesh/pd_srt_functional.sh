@@ -45,6 +45,7 @@ python="${stage}/venv/bin/python"
 "${python}" -m pip install "${SRTCTL_SOURCE_DIR}" > "${RUN_DIR}/srt-install.log" 2>&1
 "${python}" -m pip freeze > "${RUN_DIR}/requirements-installed.txt"
 cp "${runtime}/source-sha.txt" "${RUN_DIR}/"
+bash "${REPO_ROOT}/.github/scripts/atomesh/pd_build_srt_router.sh"
 "${python}" "${REPO_ROOT}/.github/scripts/atomesh/pd_srt_functional.py" \
   --contract "${REPO_ROOT}/${ATOMESH_ENV_ATOMESH_PR5090_CONTRACT:?}" \
   --model-path "${MODEL_PATH:?}" --run-dir "${RUN_DIR}" --uid "$(id -u):$(id -g)"

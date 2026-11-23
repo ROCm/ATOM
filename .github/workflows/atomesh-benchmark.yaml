@@ -1774,6 +1774,8 @@ jobs:
 
       - name: Prepare pinned srtctl for functional GPU workload
         if: ${{ matrix.env.common.ATOMESH_PR5090_FUNCTIONAL_ONLY == '1' }}
+        env:
+          SRT_FUNCTIONAL_CONTRACT: ${{ matrix.env.common.ATOMESH_PR5090_CONTRACT }}
         run: bash .github/scripts/atomesh/prepare_srt_functional.sh
 
       - name: Run Slurm benchmark cell

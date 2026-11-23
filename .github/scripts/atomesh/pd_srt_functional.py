@@ -4,12 +4,15 @@ import argparse
 import copy
 import json
 import os
+import re
 from pathlib import Path
 
 import yaml
 
 
-def configurations(contract, model_path, run_dir, experiment_dir, fabric, uid):
+def configurations(
+    contract, model_path, run_dir, experiment_dir, fabric, uid, router_image
+):
     roles = {}
     for role in ("prefill", "decode"):
         spec = contract["roles"][role]
@@ -52,10 +55,10 @@ def configurations(contract, model_path, run_dir, experiment_dir, fabric, uid):
             "precision": "MXFP4",
         },
         "resources": {"gpu_type": "mi355x", "gpus_per_node": 8},
-        "slurm": {"time_limit": "01:00:00"},
+        "slurm": {"time_limit": "01:30:00"},
         "frontend": {
             "type": "atomesh",
-            "container_image": contract["router_images"]["atomesh"],
+            "container_image": router_image,
             "enable_multiple_frontends": False,
             "args": {"policy": "dp_sticky"},
         },
@@ -127,6 +130,26 @@ def configurations(contract, model_path, run_dir, experiment_dir, fabric, uid):
     return recipe, cluster
 
 
+def verified_router_image(contract, manifest):
+    build = contract["router_build"]
+    if (
+        manifest.get("commit") != build["source_sha"]
+        or manifest.get("lockfile_sha256") != build["lockfile_sha256"]
+        or manifest.get("base_image") != contract["router_images"]["atomesh"]
+        or manifest.get("runtime_verified") is not True
+        or manifest.get("profile") != build["profile"]
+        or not manifest.get("cargo", "").startswith(
+            "cargo " + build["rust_toolchain"] + " "
+        )
+        or not re.fullmatch(r"[0-9a-f]{64}", manifest.get("binary_sha256", ""))
+    ):
+        raise ValueError("Router runtime does not match the reviewed build contract")
+    image = manifest.get("image_id", "")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
+        raise ValueError("A verified local router image ID is required")
+    return image
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--contract", type=Path, required=True)
@@ -149,8 +172,18 @@ def main():
         "rdma-gid-index": os.environ["NCCL_IB_GID_INDEX"],
         "rdma-tc": os.environ["NCCL_IB_TC"],
     }
+    router_runtime = json.loads(
+        (args.run_dir / "router-build/runtime.json").read_text()
+    )
+    router_image = verified_router_image(contract, router_runtime)
     recipe, cluster = configurations(
-        contract, args.model_path, args.run_dir, experiment, fabric, args.uid
+        contract,
+        args.model_path,
+        args.run_dir,
+        experiment,
+        fabric,
+        args.uid,
+        router_image,
     )
     (args.run_dir / "recipe.yaml").write_text(yaml.safe_dump(recipe, sort_keys=False))
     (args.run_dir / "srtslurm.yaml").write_text(
@@ -162,6 +195,7 @@ def main():
                 "source": contract["source"],
                 "case": contract["case_name"],
                 "srtctl_sha": "d7305542f91e966a3f9e1028fe7cf8d34bd157a2",
+                "router_runtime": router_runtime,
                 "shared_sa_path": "schema loader, runtime, SweepOrchestrator, worker/frontend builders, port allocator, readiness, registry cleanup",
                 "differences": [
                     "Spur allocation replaces SA sbatch",
@@ -169,7 +203,7 @@ def main():
                     "custom functionality workload replaces AgentX performance/eval",
                     "power collection disabled for functional-only validation",
                 ],
-                "budget": "60 minutes: up to 45 startup, 10 functionality/capture, 5 cleanup; large-model startup includes graph capture and CPU offload allocation, no successful local startup timing yet",
+                "budget": "90 minutes including a pinned-source router build, up to 45 minutes model readiness, functionality/capture and cleanup; no performance window",
             },
             indent=2,
         )

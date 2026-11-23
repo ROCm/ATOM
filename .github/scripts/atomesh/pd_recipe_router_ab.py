@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -152,6 +153,13 @@ def cancellation_probe(contract, router, workers, output):
     with urllib.request.urlopen(query, timeout=180) as response:
         first = response.readline().decode()
     time.sleep(5)
+    values = wait_idle(workers)
+    record = {"first_sse_line": first, "running_and_waiting_after_disconnect": values}
+    output.write_text(json.dumps(record, indent=2) + "\n")
+    assert values and all(value == 0 for value in values), record
+
+
+def wait_idle(workers):
     deadline = time.monotonic() + 30
     values = []
     while time.monotonic() < deadline:
@@ -169,9 +177,78 @@ def cancellation_probe(contract, router, workers, output):
         if all(value == 0 for value in values):
             break
         time.sleep(1)
-    record = {"first_sse_line": first, "running_and_waiting_after_disconnect": values}
-    output.write_text(json.dumps(record, indent=2) + "\n")
-    assert values and all(value == 0 for value in values), record
+    return values
+
+
+def prefill_failure_probe(contract, router, workers, output):
+    model = contract["roles"]["decode"]["args"]["served-model-name"]
+    records = []
+    for stream in (False, True):
+        # D accepts min_tokens=2/max_tokens=16; P is forced to max_tokens=1 and
+        # must reject the inconsistent sampling bounds before producing KV.
+        payload = {
+            "model": model,
+            "prompt": "Prefill rejection probe. " * 256,
+            "min_tokens": 2,
+            "max_tokens": 16,
+            "temperature": 0,
+            "stream": stream,
+        }
+        query = urllib.request.Request(
+            router + "/v1/completions",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        started = time.monotonic()
+        error_payload = None
+        try:
+            with urllib.request.urlopen(query, timeout=30) as response:
+                status = response.status
+                if stream:
+                    for line in response:
+                        if time.monotonic() - started > 30:
+                            raise TimeoutError(
+                                "Prefill failure did not terminate the stream"
+                            )
+                        if not line.startswith(b"data: "):
+                            continue
+                        data = line[6:].strip()
+                        if data == b"[DONE]":
+                            break
+                        item = json.loads(data)
+                        if "error" in item:
+                            error_payload = item
+                else:
+                    error_payload = json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            status = error.code
+            error_payload = json.loads(error.read())
+        record = {
+            "stream": stream,
+            "http_status": status,
+            "response": error_payload,
+            "elapsed_seconds": time.monotonic() - started,
+        }
+        records.append(record)
+        output.write_text(json.dumps(records, indent=2) + "\n")
+        assert (
+            error_payload
+            and error_payload.get("error", {}).get("code") == "prefill_server_error"
+        ), record
+        assert record["elapsed_seconds"] < 30, record
+        time.sleep(5)
+        record["worker_request_gauges"] = wait_idle(workers)
+        assert record["worker_request_gauges"] and all(
+            value == 0 for value in record["worker_request_gauges"]
+        ), record
+        recovery = request(
+            router + "/v1/completions",
+            {"model": model, "prompt": "Reply with hello:", "max_tokens": 16},
+        )
+        record["recovery_response"] = recovery
+        output.write_text(json.dumps(records, indent=2) + "\n")
+        assert recovery.get("choices") and "error" not in recovery, recovery
+    return records
 
 
 def scrape(urls, output, tag):
@@ -237,6 +314,9 @@ def benchmark(contract, args):
     )
     scrape(args.workers, output, "after-probe")
     if contract.get("functional_only"):
+        failure = prefill_failure_probe(
+            contract, args.router, args.workers, output / "prefill-failure.json"
+        )
         (output / "functional-status.json").write_text(
             json.dumps(
                 {
@@ -244,6 +324,7 @@ def benchmark(contract, args):
                     "request_gauges_after_disconnect": "zero",
                     "performance_run": False,
                     "kv_transfer_evidence": transfer,
+                    "prefill_failure": failure,
                 },
                 indent=2,
             )
@@ -252,6 +333,7 @@ def benchmark(contract, args):
         (output.parent / "perf-analysis.md").write_text(
             "# Functional run\n\nProtocol probes, SSE and request gauges after disconnect passed. "
             "Completed Mooncake transfer bytes increased; see functional/kv-transfer.json and the raw worker metrics. "
+            "Controlled P rejection returned prefill_server_error in buffered and streaming modes, request gauges drained, and valid requests recovered; see functional/prefill-failure.json. "
             "GPU memory evidence: functional/gpu-memory.log when rocm-smi is available. "
             "This run used srtctl orchestration via remote run-pd-ci. "
             "TTFT p50/p95/p99, ITL p50/p99, output throughput and AgentX Pareto/SLO are unavailable: "

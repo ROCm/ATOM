@@ -177,7 +177,7 @@
   },
   "deployment": {
     "memlock": "unlimited soft and hard in both worker arms",
-    "slurm_time_limit": "01:00:00",
+    "slurm_time_limit": "01:30:00",
     "workflow_timeout_minutes": 960,
     "scheduler_admission": "All previous two-node A/B jobs must be absent before sbatch",
     "startup_guard": "wait for RUNNING with the expected node count and allocation generation; publish failures to the submitter",
@@ -187,5 +187,12 @@
   "functional_only": true,
   "purpose": "Single-node ATOMesh + native vLLM Mooncake functionality; not a performance comparison",
   "layout": "single_node",
-  "case_name": "pr5090-1p1d-single-node-functional"
+  "case_name": "pr5090-1p1d-single-node-functional",
+  "router_build": {
+    "lockfile_sha256": "86354f5a25283aa2535ea97b2b6a937a7cc5860f6934d378ab91cd2d13db19b7",
+    "profile": "release",
+    "rust_toolchain": "1.100.0",
+    "lockfile": ".github/benchmark/pr5090-router-ab/router-Cargo.lock",
+    "source_sha": "69ed5e77bcc93b9d51cb5cf1528badd0e703ed93"
+  }
 }
