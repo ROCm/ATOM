@@ -1,8 +1,9 @@
 # Launch library for accept.sh: one container per role, on the node and GPUs
 # the model profile names (<ROLE>_NODE, <ROLE>_GPUS), named
-# epd-<ACCEPT_ISSUE>-<role>, running ATOM and ATOMesh from the checkout at
-# $ROOT. Every container is removed at exit. Progress goes to stderr, logs to
-# $RUN_DIR.
+# epd-<ACCEPT_ISSUE>-<PORT_BASE>-<role>, so runs that share a node on
+# different PORT_BASE never share a name, running ATOM and ATOMesh from the
+# checkout at $ROOT. Every container this run created is removed at exit.
+# Progress goes to stderr, logs to $RUN_DIR.
 
 CONTAINERS=()
 
@@ -25,7 +26,7 @@ role_var() { # role_var <role> <NODE|GPUS>
   echo "${!name:-}"
 }
 
-cname() { echo "epd-${ACCEPT_ISSUE}-$1"; }
+cname() { echo "epd-${ACCEPT_ISSUE}-${PORT_BASE}-$1"; }
 
 cleanup_containers() {
   local role
@@ -54,8 +55,11 @@ start_container() {
     args+=(--device /dev/kfd --device /dev/dri --group-add video -e "HIP_VISIBLE_DEVICES=$gpus")
   fi
   log "starting $name on $node${gpus:+ (GPUs $gpus)}"
+  # Only a container this run created is this run's to remove: when the name
+  # is taken, docker run fails and the other run's container stays.
+  on_node "$node" "$(printf '%q ' docker "${args[@]}" "$IMAGE" sleep infinity) >/dev/null" ||
+    return 1
   CONTAINERS+=("$role")
-  on_node "$node" "$(printf '%q ' docker "${args[@]}" "$IMAGE" sleep infinity) >/dev/null"
 }
 
 # in_role <role> [docker exec options --] <command...>: run in the role's container.

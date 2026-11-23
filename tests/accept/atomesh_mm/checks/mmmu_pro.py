@@ -8,8 +8,12 @@ line "Answer: X". A vision answer is the letter of the last such line, or,
 when there is none, the option letter lmms-eval's multiple-choice extractor
 finds in the response; a standard answer is the extractor's letter. lmms-eval's
 own vision scorer compares the whole response to the letter.
-Passes when each subset's score is within 2 x its standard error of the
-model profile's reference (MMMU_PRO_REF_STANDARD, MMMU_PRO_REF_VISION).
+Passes when no request failed and each subset's score is within 2 x the
+reference's standard error of the reference's score. On a topology with a
+reference topology the reference is that topology's recorded run; otherwise
+(direct) it is the model profile's recipe score (MMMU_PRO_REF_STANDARD,
+MMMU_PRO_REF_VISION), with the standard error of that score over this run's
+questions.
 """
 
 import json
@@ -17,7 +21,16 @@ import re
 import shutil
 from pathlib import Path
 
-from mmstar import env, failed_requests, finish, run_check, run_lmms_eval, stderr
+from _common import (
+    env,
+    failed_requests,
+    finish,
+    reference,
+    run_check,
+    run_lmms_eval,
+    stderr,
+    within,
+)
 
 SUBSETS = {
     "standard": "mmmu_pro_standard",
@@ -85,7 +98,17 @@ def accuracy(lines, letter):
 SCORERS = {"standard": extracted_letter, "vision": answer_line_letter}
 
 
+def subset_reference(ref, subset, n):
+    """The reference score and standard error for a subset: the reference
+    topology's recorded run when there is one, else the recipe's score."""
+    if ref:
+        return ref[subset]["score"], ref[subset]["stderr"], ref["topology"]
+    score = float(env(f"MMMU_PRO_REF_{subset.upper()}"))
+    return score, stderr(score, n), "recipe"
+
+
 def main():
+    ref = reference() if env("REF_TOPOLOGY") else None
     _, samples = run_lmms_eval(
         "mmmu_pro",
         list(SUBSETS.values()),
@@ -98,18 +121,21 @@ def main():
     for subset, task in SUBSETS.items():
         n = len(samples[task])
         score = accuracy(samples[task], SCORERS[subset])
-        ref = float(env(f"MMMU_PRO_REF_{subset.upper()}"))
-        tolerance = 2 * stderr(score, n)
+        ref_score, ref_stderr, source = subset_reference(ref, subset, n)
+        failed = failed_requests(samples[task])
         result[subset] = {
             "score": score,
             "stderr": stderr(score, n),
             "n": n,
-            "failed_requests": failed_requests(samples[task]),
-            "reference": ref,
+            "failed_requests": failed,
+            "reference": {"source": source, "score": ref_score, "stderr": ref_stderr},
         }
-        if abs(score - ref) > tolerance:
+        if failed:
+            failures.append(f"{subset}: {failed} failed requests")
+        if not within(score, ref_score, ref_stderr):
             failures.append(
-                f"{subset} {score:.4f} is not within {tolerance:.4f} of {ref:.4f}"
+                f"{subset} {score:.4f} is not within {2 * ref_stderr:.4f} of "
+                f"{source}'s {ref_score:.4f}"
             )
     finish(result, failures)
 

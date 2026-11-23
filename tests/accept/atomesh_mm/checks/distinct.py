@@ -10,6 +10,10 @@ which by then holds the red request's routing key: a blue key equal to it
 would match whole. With the text shared, only the images' media digests can
 tell the two keys apart, and only the images' cache_seed keeps the second
 request off the first one's cached KV.
+
+Needs ROCm/ATOM#3407, which puts `media_count` on the route log and keys a
+media chat's route by its images; on main the blue request's key equals the
+red one's and the check fails.
 """
 
 import json
@@ -21,7 +25,7 @@ import zlib
 from base64 import b64encode
 from pathlib import Path
 
-from mmstar import env, finish, run_check
+from _common import env, finish, run_check
 
 COLORS = {"red": (255, 0, 0), "blue": (0, 0, 255)}
 SIDE = 448  # large enough that the image's tokens fill whole KV blocks
