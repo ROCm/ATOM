@@ -1223,6 +1223,39 @@ mod pairs {
         assert_eq!(reads, 1);
     }
 
+    /// A read publishing while a pair finds its prefill already read cannot take that
+    /// prefill's info from under it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cache_hit_takes_its_prefill_s_info_with_its_identity() {
+        let (_, p_url) = instance(Vec::new(), false, prefill_info(2, None)).await;
+        let pw = worker(&p_url, PREFILL);
+        let registry = Arc::new(WorkerRegistry::new());
+        registry.register(pw.clone());
+        let pairs = AtomPairs::new(registry, AtomPdRankMappingPolicy::Idx2Idx);
+        let pairs = Arc::new(pairs.await.unwrap());
+
+        // Another prefill's read is publishing, and prunes this one.
+        let hit = {
+            let mut publishing = pairs.info.write().unwrap();
+            let (hit_pairs, hit_worker) = (pairs.clone(), pw.clone());
+            let hit = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(hit_pairs.adapter_for(&hit_worker))
+            });
+            std::thread::sleep(Duration::from_millis(200));
+            pairs.read_for.write().unwrap().clear();
+            *publishing = Arc::default();
+            hit
+        };
+
+        let hit = tokio::task::spawn_blocking(move || hit.join().unwrap());
+        let info = hit.await.unwrap().unwrap().prefill_info;
+        assert_eq!(info.tp_sizes.get(&p_url), Some(&2));
+    }
+
     #[tokio::test]
     async fn a_removed_prefill_s_info_is_forgotten_at_the_next_read() {
         let (_, first_url) = instance(Vec::new(), false, prefill_info(2, Some(template()))).await;

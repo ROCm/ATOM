@@ -40,10 +40,11 @@ use crate::tokenizer::traits::Tokenizer;
 /// Runs ATOM pairs as ATOM's HTTP P/D router does: relay, or chunked when P's
 /// instance reports a chunked-transfer template.
 pub(crate) struct AtomPairs {
-    info: RwLock<Arc<AtomPrefillInfo>>,
+    pub(super) info: RwLock<Arc<AtomPrefillInfo>>,
     /// The worker each URL's info was read for, and each instance's (its base URL):
     /// a worker registered again at that URL is another, whose info is read afresh.
-    read_for: RwLock<HashMap<String, Weak<dyn Worker>>>,
+    /// Taken after `info`, as a read publishes both.
+    pub(super) read_for: RwLock<HashMap<String, Weak<dyn Worker>>>,
     /// Per instance, held while its GetServerInfo is read, so concurrent first pairs of
     /// its ranks read it once.
     reading: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -82,11 +83,16 @@ impl AtomPairs {
     ) -> Result<AtomAdapter, EngineError> {
         let url = prefill.url();
         let this = Arc::downgrade(prefill);
-        let read = |read_for: &HashMap<String, Weak<dyn Worker>>| {
-            read_for.get(url).is_some_and(|known| known.ptr_eq(&this))
+        // The info this prefill was read into, taken with the check that it was, so no
+        // read publishing meanwhile can have pruned it.
+        let cached = || {
+            let info = self.info.read().unwrap();
+            let read_for = self.read_for.read().unwrap();
+            let read = read_for.get(url).is_some_and(|known| known.ptr_eq(&this));
+            read.then(|| AtomAdapter::new(info.clone()))
         };
-        if read(&self.read_for.read().unwrap()) {
-            return Ok(AtomAdapter::new(self.info.read().unwrap().clone()));
+        if let Some(adapter) = cached() {
+            return Ok(adapter);
         }
         let base = base_url(prefill);
         let gate = self
@@ -97,8 +103,8 @@ impl AtomPairs {
             .or_default()
             .clone();
         let _reading = gate.lock().await;
-        if read(&self.read_for.read().unwrap()) {
-            return Ok(AtomAdapter::new(self.info.read().unwrap().clone()));
+        if let Some(adapter) = cached() {
+            return Ok(adapter);
         }
         let mut learned = AtomPrefillInfo::default();
         // A rank still registered read this instance: its info serves this sibling too,
