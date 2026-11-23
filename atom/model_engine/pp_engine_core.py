@@ -209,7 +209,7 @@ class PPEngineCoreProc(EngineCore):
             self.pp_transport.send_metadata(scheduled_batch)
             tracing.record_forward(scheduled_batch, seqs)
             self.scheduler.metrics.record_forward(scheduled_batch, seqs)
-            self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
+            EngineCore._timed_forward(self, scheduled_batch)
             self.scheduler.mark_pp_inflight(scheduled_batch)
             self._in_flight.append((scheduled_batch, seqs, needs_output))
             launched += 1
@@ -511,7 +511,7 @@ class PPEngineCoreProc(EngineCore):
                         self._poll_and_send_kv_status()
                     continue
 
-                fwd_out = self.runner_mgr.call_func("forward", batch, wait_out=True)
+                fwd_out = EngineCore._timed_forward(self, batch)
 
                 if self.kv_transfer_enabled:
                     self._poll_and_send_kv_status()

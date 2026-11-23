@@ -83,10 +83,16 @@ def _config_refusal(atom_config) -> str | None:
 class MonoDecode:
     """Routes supported decode steps of one ``MiniMaxM3SparseForCausalLM``."""
 
+    blocked = False  # see `set_blocked`
+
     def __init__(self, causal_lm, atom_config) -> None:
         self._lm = causal_lm
         self._uses_dspark = _uses_dspark(atom_config)
         self._drafter = None
+        # set per step from the batch (the engine's GPU guard), so TP-uniform
+        self.blocked = False
+        # token counts of the graphs captured with the mono kernels in them
+        self._graph_mono: set[int] = set()
         # created on its first eligible step (``LazyRunner``)
         self._mono = LazyRunner(
             lambda: MonoDecodeRunner(
@@ -111,6 +117,11 @@ class MonoDecode:
             raise RuntimeError("cannot bind a DSpark drafter after Mono starts")
         self._drafter = drafter
 
+    def set_blocked(self, blocked: bool) -> None:
+        """Another process is on the TP GPUs (``atom.utils.gpu_guard``): a Mono
+        step could not finish while its kernels hold a CU, so none starts."""
+        self.blocked = blocked
+
     def supports(
         self,
         input_ids: torch.Tensor,
@@ -118,7 +129,7 @@ class MonoDecode:
         intermediate_tensors,
         inputs_embeds,
     ) -> bool:
-        if input_ids is None or not self._mono.enabled:
+        if input_ids is None or not self._mono.enabled or self.blocked:
             return False
         n = input_ids.numel()  # a cudagraph's pad rows included
         if intermediate_tensors is not None or inputs_embeds is not None:
@@ -164,7 +175,11 @@ class MonoDecode:
         if ids is None or ids.dtype != torch.int32 or ids.numel() < n:
             return False
         # the runner and its n-token kernel, both collective: n is TP-uniform
-        return self._mono.ready(n)
+        if not self._mono.ready(n):
+            return False
+        if torch.cuda.is_current_stream_capturing():
+            self._graph_mono.add(n)
+        return True
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         sums = None
@@ -189,4 +204,8 @@ def install_mono_decode(
     """Bind MiniMax's in-model Mono router after drafter hooks are armed."""
     if drafter is not None:
         model.bind_mono_drafter(drafter)
+    lm = getattr(model, "language_model", model)
+    # the GPU guard's switch, and the token counts of the graphs it must not replay
+    model.mono_set_blocked = lm._mono.set_blocked
+    model.mono_graph_tokens = lm._mono._graph_mono
     return model
