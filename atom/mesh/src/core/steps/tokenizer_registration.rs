@@ -144,8 +144,8 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                     if let Some(controls) = checkpoint_chat_controls(&name, &source).await {
                         chat_controls.write().insert(id.clone(), controls);
                     }
-                    // fastokens has a cache of its own, off by default:
-                    // `--fastokens-segment-cache-mb`.
+                    // fastokens has its own segment cache
+                    // (`--fastokens-segment-cache-mb`, 1 GiB by default).
                     if base_tokenizer.as_any().is::<FastTokenizer>() {
                         return Ok(base_tokenizer);
                     }
