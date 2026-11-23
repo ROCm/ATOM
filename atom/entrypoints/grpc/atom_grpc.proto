@@ -121,6 +121,7 @@ message GetServerInfoResponse {
   uint32 protocol_version = 1;  // ProtocolVersion.PROTOCOL_VERSION_CURRENT
   string kv_transfer_info_json = 2;  // the body of /kv_transfer_info
   string server_info_json = 3;  // the body of /server_info
+  string kv_event_sources_json = 4;  // the body of /kv_event_sources
 }
 
 message HealthCheckRequest {}

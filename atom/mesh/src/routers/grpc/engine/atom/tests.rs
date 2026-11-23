@@ -105,6 +105,7 @@ impl AtomEngine for FakeAtom {
                 .clone()
                 .unwrap_or_else(|| r#"{"tp_size":1}"#.into()),
             server_info_json: r#"{"dp_size":2}"#.into(),
+            ..Default::default()
         }))
     }
 
