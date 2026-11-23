@@ -5,8 +5,10 @@ SGLang renames a DSpark-bundling V4.1 draft runner to
 ``DeepseekV4ForCausalLMDSpark``; this wrapper keeps that public name and
 delegates the draft to ATOM's native ``DeepseekV41DSpark`` (three MoE draft
 stages, ``DraftAttention`` over the target's window rings 40-42 plus the
-block). SGLang keeps the worker lifecycle, the Markov sampling, the rejection
-and the TP token sync; ATOM owns the weights, the block math and the KV.
+block). SGLang keeps the worker lifecycle, the rejection and the TP token
+sync, and the Markov sampling except where a greedy draft block runs ATOM's
+sharded fused argmax (``atom_v41_greedy_draft_block``); ATOM owns the
+weights, the block math and the KV.
 
 The draft is a separate enablement from the target: its own config (ATOM's
 draft parse, ``model_type=deepseek_v41_dspark``), its own loader pass
@@ -57,7 +59,9 @@ class ATOMV41MarkovHeadAdapter(BaseDSparkMarkovHead):
     (`refresh_w2_cache`) instead of redone per block position. The vocab is
     whole on every rank (ATOM keeps both tables replicated), so ``vocab_shard``
     stays None and SGLang samples from the gathered base logits. No fused
-    greedy weight (SGLang's one-row kernel).
+    greedy weight (SGLang's one-row kernel): a greedy draft block runs ATOM's
+    sharded fused argmax instead
+    (`DeepseekV4ForCausalLMDSpark.atom_v41_greedy_draft_block`).
 
     ATOM's head is held outside the module tree so its weights are not
     registered twice.
@@ -228,6 +232,9 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.vocab_size = int(draft_hf.vocab_size)
         self.markov_head = ATOMV41MarkovHeadAdapter(self.model.mtp[-1].markov_head)
         self.logits_mup_width_multiplier = None
+        # Whether the greedy block runs ATOM's sharded fused argmax
+        # (`atom_v41_greedy_draft_block`); resolved at its first call.
+        self._fused_greedy: bool | None = None
         self._check_mask_token(config)
         self._log_route()
 
@@ -342,6 +349,11 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             raise RuntimeError("DeepSeek-V4.1 DSpark draft and target vocab differ")
         self.model.share_with_target(backbone)
         lm_head.atom_wrapper.attach_dspark_draft(self.model)
+        from atom.plugin.sglang.patches.dspark_fused_greedy_draft_patch import (
+            install_dspark_fused_greedy_draft_patch,
+        )
+
+        install_dspark_fused_greedy_draft_patch()
         # SGLang's folded draft sampler sizes its step logits off the draft's
         # ``lm_head.org_vocab_size``. The target's head view, not a module:
         # nothing registers twice.
@@ -418,6 +430,80 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         ):
             self.model._context_layer_ids(embed.weight.device)
             self.model._noise_embedding()
+
+    # -- greedy draft: ATOM's sharded fused Markov argmax -------------------
+
+    def _resolve_fused_greedy(self) -> bool:
+        """Native's own gate (`DeepseekV41DSpark._sharded_markov_sample`: a
+        TP-sharded head without a bias, the fused sampler on, Markov weights
+        the kernel takes), plus a head whose TP shards cover the Markov vocab
+        exactly (SGLang's chain draws from the whole vocab). Logged once a
+        rank; host checks only."""
+        head = self.model.head
+        fused = self.model._sharded_markov_sample() and int(
+            head.num_embeddings_per_partition
+        ) * int(head.tp_size) == int(self.model.markov_head.vocab_size)
+        logger.info(
+            "ATOM DeepSeek-V4.1 DSpark greedy draft block: %s",
+            (
+                "ATOM dspark_markov_argmax_tp on the vocab shard (no step logits, "
+                "no [B*T, V] all-gather)"
+                if fused
+                else "SGLang's Markov chain (native's sharded sampler is off)"
+            ),
+        )
+        return fused
+
+    def atom_v41_greedy_draft_block(
+        self, hidden: torch.Tensor, anchor_tokens: torch.Tensor, gamma: int
+    ) -> torch.Tensor | None:
+        """The greedy draft block ``[bs, gamma]`` from the draft's normed rows,
+        as native ``_head_and_sample_sharded`` drafts its ids: this rank's
+        LM-head shard ``[bs * gamma, V / tp]``, then per position ATOM's fused
+        ``W1[x_{k-1}] @ W2^T`` + argmax over the shard, the ranks exchanging
+        only each row's ``(max, id)``. The same argmax SGLang's greedy chain
+        takes over the gathered logits plus the fp32 bias (fp32 accumulation,
+        lowest id on ties), up to the GEMV's summation order; identical on
+        every rank by construction. No confidence head (static verify reads
+        none). None when native's gate is off (`_resolve_fused_greedy`):
+        SGLang's chain runs instead."""
+        if self._fused_greedy is None:
+            # At the graph runner's eager warmup, before any capture.
+            self._fused_greedy = self._resolve_fused_greedy()
+        if not self._fused_greedy:
+            return None
+        from aiter.dist.parallel_state import get_tp_group
+        from aiter.tuned_gemm import tgemm
+
+        from atom.model_ops.dspark_markov_argmax import dspark_markov_argmax_tp
+        from atom.utils import envs
+
+        rows = int(hidden.shape[0])
+        if int(anchor_tokens.numel()) * gamma != rows:
+            raise RuntimeError(
+                f"DeepSeek-V4.1 DSpark greedy block of {rows} rows for "
+                f"{int(anchor_tokens.numel())} anchors x {gamma}"
+            )
+        bs = rows // gamma
+        head, markov = self.model.head, self.model.markov_head
+        with plugin_runtime_scope(
+            framework="sglang", atom_config=self.target_atom_config
+        ):
+            base_logits = tgemm.mm(hidden, head.weight).view(bs, gamma, -1)
+            out = torch.empty((bs, gamma), dtype=torch.int64, device=hidden.device)
+            tp_group = get_tp_group()
+            for k in range(gamma):
+                dspark_markov_argmax_tp(
+                    base_logits[:, k],
+                    anchor_tokens if k == 0 else out[:, k - 1],
+                    markov.markov_w1.weight,
+                    markov.markov_w2.weight,
+                    out[:, k],
+                    int(head.vocab_start_idx),
+                    tp_group,
+                    use_custom=envs.ATOM_USE_CUSTOM_ALL_GATHER,
+                )
+        return out
 
     def compute_base_logits(self, x: torch.Tensor):
         """The shared target head over the draft's normed rows, full vocab

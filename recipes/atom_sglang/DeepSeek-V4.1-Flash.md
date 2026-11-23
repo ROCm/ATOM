@@ -109,14 +109,73 @@ block verification, `SGLANG_DSPARK_EMBED_IN_GRAPH=0` (the ATOM draft embeds its 
 `SGLANG_SIMULATE_ACC_LEN` above 1 (unless `ATOM_SGLANG_V41_DSPARK_ALLOW_SIMULATED_ACC=1`, below), and full hidden-state
 returns (`--enable-return-hidden-states` or `--return-hidden-states-mode full`) under decoder SWA bounded replay: SGLang
 returns every prompt row of the target's DSpark capture, which the replay leaves zero outside each request's last 128
-rows (`--return-hidden-states-mode last` is served; `ATOM_SGLANG_V41_DECODER_REPLAY=0` serves full returns).
+rows (`--return-hidden-states-mode last` is served; `ATOM_SGLANG_V41_DECODER_REPLAY=0` serves full returns). With
+`SGLANG_DSPARK_USE_GREEDY_DRAFT=1` a graph-folded greedy draft block runs ATOM's sharded fused Markov argmax wherever
+native ATOM's DSpark would (a TP-sharded head; native's `ATOM_DSPARK_FUSED_MARKOV_SAMPLE=0` turns it off), and SGLang's
+Markov chain otherwise.
+
+Set `SGLANG_DSPARK_USE_GREEDY_DRAFT=1` for temperature-0 serving: the draft always takes the argmax, as native ATOM's
+draft does, and the draft graph runs that fused argmax over each rank's LM-head shard, the ranks exchanging only each
+row's `(max, id)`, instead of SGLang's Markov chain over all-gathered full-vocabulary logits. Greedy requests draft the
+same tokens up to numerics. With the flag, a sampled request's draft is still the argmax and is accepted with the
+target's probability of that token (native's rule) instead of SGLang's rejection sampling against a sampled draft;
+for workloads with temperature above 0, leave it unset to keep SGLang's sampled draft.
+
+## Prefill
+
+After SGLang's own graph capture, ATOM records prefill token graphs for the target's layers 0-19 at native ATOM's
+buckets (`ATOM_TOKEN_GRAPH_SIZES` up to the chunk size; 256 to 3072 tokens by default). A prefill step pads to the
+smallest bucket that holds it and replays the recording; a larger step runs eagerly. A radix hit step pads on the rows
+ATOM runs (its new rows plus 128 replay rows per hit). Without decode CUDA graphs no prefill token graphs are recorded
+(one log line says so). With DSpark they are recorded only under decoder SWA bounded replay (the default). SGLang
+0.5.22 ranks its deprecated `--disable-cuda-graph` below an explicit `--cuda-graph-backend-decode`: to run without
+decode graphs, replace `--cuda-graph-backend-decode full` with `disabled`.
+
+With or without graphs, ATOM then runs one eager prefill at the chunk budget (`--chunked-prefill-size`, at most the
+builder's budget; split over two sequences under DSpark), as native ATOM's start-up warm-up does, on the graph-capture
+STATE slots and SGLang's padding page, so no request state is touched. Without it the first chunk-sized prefill pays
+the eager path's first-use kernel loads.
+
+An arriving prefill takes its STATE slot and page rows from a copy queued where SGLang's `alloc_for_extend` wrote
+them, instead of a read-back behind the step in flight.
+
+A long prompt is prefilled in chunks of `--chunked-prefill-size`. A chunk that leaves at least 128 rows of its prompt
+for later chunks runs layers 0-19 and layer 20's compression only; the decoder layers (20-39) and the DSpark draft
+context write run on the chunk that ends the prompt, as in native ATOM. If the step that continues such a prompt
+computes every row instead (another request in it asks input logprobs, or SGLang cuts the next chunk below 128 rows),
+that prompt's decoder window starts at the chunk boundary instead of reading rows the skipped chunk never wrote.
+
+## Decode step tail
+
+- An all-greedy batch (every request at temperature 0, no logprobs, no sampling mask) gets its tokens from aiter's
+  `topk_select(k=1, tie="low")`, native ATOM's greedy sampler, instead of SGLang's `torch.argmax` over the full fp32
+  vocabulary: same lowest-id tie rule, ids as int64; SGLang's NaN check, logit preprocessing and TP token sync run
+  around it, and every other sampler call is SGLang's own. It is installed only where `Sampler.forward` has the
+  expected signature (otherwise one log line and SGLang's path). With DSpark it only picks each request's first token
+  after prefill.
+- Step metadata goes to the GPU on native ATOM's packed transport: one pinned arena, one copy and one scatter per phase
+  group, instead of one copy per member.
+
+## Prefill admission
+
+`--max-running-requests <concurrency> --min-free-slots-delay N` holds new admissions until `N` running slots have
+freed, which coalesces arrivals into fewer prefill steps: shorter wall time for a higher TTFT. It only engages when
+the running batch is full, so set `--max-running-requests` to the serving concurrency. SGLang then captures decode
+graphs only up to that size (it drops larger buckets and adds one at `--max-running-requests`).
 
 ## Environment variables
 
-Read by the plugin (`atom/plugin/sglang/deepseek_v41_envs.py`):
+Read by the plugin (`atom/plugin/sglang/deepseek_v41_envs.py`). Every one is a bool with one parser: `0`, `false`,
+`no`, `off` or an empty value turn it off, anything else on.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_SGLANG_V41_DECODER_REPLAY** | bool | 1 (true) | Decoder SWA bounded replay: a prefill runs V4.1's decoder layers on each request's last 128 rows only, as native ATOM does. `0` / `false` / `no` / `off`, or an empty value, turn it off (every prefill row runs every layer), as native's `--no-decoder-swa-bounded-replay` does. Unlike native, which backs a short resumed chunk off to a full window, a chunk SGLang resumes with fewer rows than the window computes every row, and so does a step in which SGLang reads more than each request's last row (input logprobs, a full hidden-state capture, a prefill-only batch); the plugin's prefill output therefore depends on where SGLang cuts a prompt. |
 | **ATOM_SGLANG_V41_RADIX** | bool | 1 (true) | Serve SGLang's radix cache with the replay above whenever it is on. `0` / `false` / `no` / `off`, or an empty value, turn SGLang's radix cache off for the launch (declared through SGLang's model-override registry when the server arguments are resolved, so the tokenizer manager and the schedulers agree; one warning). |
+| **ATOM_SGLANG_V41_PREFILL_TOKEN_GRAPHS** | bool | 1 (true) | Prefill token graphs (see Prefill). `0`: every prefill runs eagerly. |
+| **ATOM_SGLANG_V41_PREFILL_WARMUP** | bool | 1 (true) | The start-up eager prefill at the chunk budget (see Prefill), with or without graphs. `0` skips it. |
+| **ATOM_SGLANG_V41_EXTEND_ROWS_AT_ALLOC** | bool | 1 (true) | An arriving prefill takes its STATE slot and page rows from a copy made when SGLang allocated them. `0`: read back at staging, behind the step in flight. |
+| **ATOM_SGLANG_V41_FAST_GREEDY** | bool | 1 (true) | All-greedy batches pick tokens with aiter's top-1 (see Decode step tail). `0`: SGLang's sampler. |
+| **ATOM_SGLANG_V41_DSPARK_DEFERRED_SEQ_LENS** | bool | 1 (true) | A DSpark decode round launches its draft block before the host waits for the previous round's published lengths, and the verify's staging takes them. `0`: SGLang's wait at the top of the round. |
+| **ATOM_SGLANG_V41_DSPARK_PREFETCH_ROWS** | bool | 1 (true) | A DSpark round's page rows that the verify would read back are copied before the draft launch. `0`: read back behind the draft block. |
 | **ATOM_SGLANG_V41_DSPARK_ALLOW_SIMULATED_ACC** | bool | 0 (false) | Performance runs only: allow `SGLANG_SIMULATE_ACC_LEN` > 1 (a fixed mean accept length; the output text is then not the model's). |

@@ -15,6 +15,8 @@ from atom.plugin.sglang.deepseek_v41_bridge import (
     V41_DSPARK_DRAFT_ARCH,
     align_atom_config_with_sglang,
     build_deepseek_v41_forward_metadata,
+    install_v41_chunk_decoder_gate,
+    install_v41_decoder_floor_gate,
     is_deepseek_v41_config,
     log_deepseek_v41_runtime,
     refuse_fp4ptpc_without_online_quant,
@@ -155,6 +157,16 @@ def _prepare_deepseek_v41_config(atom_config: Any, model_arch: str) -> None:
     _remap_quant_config_for_sglang_plugin(
         atom_config, _ATOM_SUPPORTED_MODELS[DEEPSEEK_V41_ARCH]
     )
+
+
+def _install_deepseek_v41_adapters(model: Any) -> None:
+    # A prefill finishing no prompt skips the decoder, as native's middle
+    # chunk (`v41_chunk_finals`), and a later step computing every row of
+    # such a request starts its decoder window where its rings hold rows
+    # (`v41_decoder_floors`).
+    install_v41_chunk_decoder_gate()
+    install_v41_decoder_floor_gate()
+    log_deepseek_v41_runtime(model)
 
 
 def _build_deepseek_v41_forward_metadata(
@@ -635,7 +647,7 @@ MODEL_ADAPTER_SPECS = {
     DEEPSEEK_V41_ARCH: SGLangModelAdapterSpec(
         uses_context_only_forward=True,
         prepare_config=_prepare_deepseek_v41_config,
-        install_adapters=log_deepseek_v41_runtime,
+        install_adapters=_install_deepseek_v41_adapters,
         build_forward_metadata=_build_deepseek_v41_forward_metadata,
         expand_forward_inputs=expand_v41_forward_inputs,
     ),

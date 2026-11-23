@@ -91,6 +91,8 @@ class V41DSparkTargetSurface:
         self.layer_ids: tuple[int, ...] | None = None
         self.draft = None
         self._rows: dict[int, torch.Tensor] = {}
+        # Columns of the aux block (`take_aux`): one hidden row per tap.
+        self.aux_width: int | None = None
 
     @property
     def wrapper(self):
@@ -138,6 +140,7 @@ class V41DSparkTargetSurface:
         spec = self.draft.target_aux_capture_spec(ids, int(hf.hidden_size))
         install_aux_taps(wrapper.model, spec, ids, self._make_hook)
         self.layer_ids = ids
+        self.aux_width = len(ids) * int(hf.hidden_size)
         wrapper.capture_aux_hidden_states = True
         logger.info(
             "ATOM V4.1 DSpark aux taps layers=%s capture=input "
@@ -202,7 +205,14 @@ class V41DSparkTargetSurface:
                     f"DeepSeek-V4.1 DSpark tap {layer_id} has shape "
                     f"{tuple(tap.shape)}, the forward {rows} rows"
                 )
-        return torch.cat(taps, dim=-1)
+        aux = torch.cat(taps, dim=-1)
+        # Set with the taps (`set_layers_to_capture`), before any forward.
+        if int(aux.shape[-1]) != self.aux_width:
+            raise RuntimeError(
+                f"DeepSeek-V4.1 DSpark aux block is {int(aux.shape[-1])} wide, "
+                f"{len(taps)} taps x hidden {self.aux_width // len(taps)}"
+            )
+        return aux
 
     def finish_forward(self, hidden_states, positions, forward_batch) -> torch.Tensor:
         """After the target model, inside its ATOM forward context: write the
@@ -251,6 +261,13 @@ class V41DSparkTargetSurface:
             )
         # The taps exist only with a draft attached (`set_layers_to_capture`).
         plan = step.replay
+        if step.atom_v41_finishes_no_prompt:
+            # Every request continues its prompt: the decoder, whose layers
+            # hold the taps, did not run (`install_v41_chunk_decoder_gate`),
+            # as native's middle chunk writes no draft context. The finishing
+            # chunk's tail writes the window the first draft block reads.
+            # Zero rows, as every non-tail row of a replay's aux.
+            return hidden_states.new_zeros(rows, self.aux_width)
         if plan is None:
             aux = self.take_aux(rows)
         else:
@@ -264,7 +281,8 @@ class V41DSparkTargetSurface:
         # read; the rest are zero (no draft block reads them). ATOM takes the
         # taps as a sequence (`DSparkDraftModel.write_context_kv`); this one
         # block is them already joined, as a PP relay hands them, which ATOM
-        # projects as is.
+        # projects as is (FP8 `main_proj`: `quantize_fp8` of the block; BF16:
+        # the block itself).
         self.draft.write_context_kv([aux], positions)
         return aux
 
@@ -312,6 +330,15 @@ def install_v41_dspark_target_surface(wrapper) -> V41DSparkTargetSurface:
     wrapper.set_dspark_layers_to_capture = surface.set_layers_to_capture
     wrapper.attach_dspark_draft = surface.attach_draft
     install_deepseek_v41_dspark_commit_patch()
+    from atom.plugin.sglang.patches.dspark_deferred_seq_lens_patch import (
+        install_dspark_deferred_seq_lens_patch,
+    )
+    from atom.plugin.sglang.patches.dspark_verify_rows_prefetch_patch import (
+        install_dspark_verify_rows_prefetch_patch,
+    )
+
+    install_dspark_deferred_seq_lens_patch()
+    install_dspark_verify_rows_prefetch_patch()
     logger.info(
         "ATOM DeepSeek-V4.1 DSpark target surface: lm_head view, input "
         "embeddings, capture layers, in-forward draft context write"

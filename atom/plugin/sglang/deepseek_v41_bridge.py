@@ -50,18 +50,24 @@ DSpark under the overlap schedule (SGLang 0.5.22 ``event_loop_overlap``):
   the hidden commit -- in one ``forward_batch_generation`` call on the
   scheduler thread under ``forward_stream``. What overlaps the GPU is the
   scheduler's own work: processing round t-1's result and forming round
-  t+1's batch. Round t+1's ``run_batch`` then waits for round t's publish
-  (``FutureMap.resolve_seq_lens_cpu``) before it stages anything, so a verify
-  is never staged over an uncommitted one (``require_committed`` and
-  ``begin_step`` refuse it if it ever were).
+  t+1's batch. Round t+1's verify is staged only after round t's publish
+  (upstream ``FutureMap.resolve_seq_lens_cpu`` waits for it at the top of
+  ``run_batch``; with `dspark_deferred_seq_lens_patch` the device gather is
+  stream-ordered after it, the draft block is launched, and the host waits
+  for the published lengths in the verify's staging, ``take_late_seq_lens``),
+  so a verify is never
+  staged over an uncommitted one (``require_committed`` and ``begin_step``
+  refuse it if it ever were).
 - The tentative step's publication epoch is opened by the verify's staging
   and resumed by its commit on the same thread and stream
   (``PublicationOwner.resume`` checks both); the next ``begin`` waits on the
   commit's completion event before the pinned sources are rewritten.
 - Host lengths: the ScheduleBatch's ``seq_lens_cpu`` is seeded one round late
   by ``prepare_for_decode`` and overwritten with the published exact lengths
-  (this backend's ``needs_cpu_seq_lens``) before the forward, so
-  ``live_seq_lens_cpu`` is the committed prefix as without overlap.
+  (this backend's ``needs_cpu_seq_lens``) before the verify, so
+  ``live_seq_lens_cpu`` is the committed prefix as without overlap. Deferred,
+  the draft runs with ``seq_lens_cpu`` None as for a ``needs_cpu_seq_lens=False``
+  backend (host planning sized by ``spec_info.nxt_kv_lens_cpu``).
 - Slots and PAGE rows: the verify forward batch carries the ScheduleBatch's
   host ``req_pool_indices`` (`_install_host_mirror_patch`), and a verify
   replay stages its block tables off `HostPageRows` like a decode replay. A
@@ -77,7 +83,9 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from functools import wraps
 from types import SimpleNamespace
 from typing import Any
@@ -559,8 +567,6 @@ def align_atom_config_with_sglang(atom_config: Any) -> None:
 
 
 # --- Metadata builder ---
-
-
 # H2D publication: native's ModelRunner owns a registry over its
 # ``forward_vars``; here the shim runner and the cache's host sources do.
 
@@ -608,14 +614,35 @@ def _v41_publication_epoch(owner, *, resume=False):
         owner.finish()
 
 
-def _init_v41_publication(runner, builder):
-    """The shim runner's registry: `_v41_publication_owner` over its
-    ``forward_vars`` plus one group per phase the builder declares."""
-    owner, groups = _v41_publication_owner(runner.forward_vars, builder.device)
-    for name, names in builder.h2d_group_members().items():
-        groups[name] = owner.group(
-            name, [runner.forward_vars[item]._publication for item in names]
+def _init_v41_publication(forward_vars, members, device):
+    """The shim runner's publication owner and groups over ``forward_vars``,
+    on the packed transport native configures
+    (`ModelRunner._init_h2d_publication`): one group per builder-declared
+    phase (``members``, `h2d_group_members`), each gathered into one pinned
+    arena and published as one H2D copy plus one scatter kernel. Native's
+    other composed groups (``prefill_metadata`` from the runner's
+    ``seq_metadata`` and ``positions`` producers, the token inputs, MRoPE)
+    have no producers on the shim runner."""
+    owner, groups = _v41_publication_owner(forward_vars, device)
+    for name, names in members.items():
+        bindings = []
+        for item in names:
+            binding = forward_vars[item]._publication
+            if binding not in bindings:
+                bindings.append(binding)
+        groups[name] = owner.group(name, bindings)
+    for group in owner.use_packed_transport(set(members)):
+        logger.info(
+            "ATOM DeepSeek-V4.1 SGLang H2D group %s: %s (%d members)%s",
+            group.name,
+            group.transport,
+            len(group.members),
+            f" ({group.fallback_reason})" if group.fallback_reason else "",
         )
+    if owner.completion is not None:
+        # Cover the transports' pointer-table uploads before the first
+        # preparation, as native records after configuring.
+        owner.completion.record()
     return owner, groups
 
 
@@ -646,7 +673,7 @@ def _make_builder_cls():
             runner = self.model_runner
             if runner.h2d_owner is None:
                 runner.h2d_owner, runner.h2d_groups = _init_v41_publication(
-                    runner, self
+                    runner.forward_vars, self.h2d_group_members(), self.device
                 )
             with _v41_publication_epoch(runner.h2d_owner):
                 # No runner token inputs carry the query metadata on this path.
@@ -710,6 +737,20 @@ def _make_builder_cls():
             metadata.dummy = True  # No host Engram lookup for synthetic tokens.
             self.prepare_model_inputs(input_ids, metadata)
             return metadata
+
+        # (capture STATE slots, ids buffer) native's prefill capture steps run
+        # on (`record_deepseek_v41_prefill_token_graphs` sets them).
+        _sglang_capture_inputs = None
+
+        def _build_for_prefill_capture(self, lengths, finishing):
+            """Native's prefill capture step, as its
+            ``build_for_token_graph_capture`` calls it (that one runs as is:
+            the buckets' request layout is native's), on the proxy pool's
+            reserved capture slots and the padded-prefill ids buffer."""
+            slots, input_ids = self._sglang_capture_inputs
+            return _prefill_capture_step(
+                self, lengths, finishing=finishing, slots=slots, input_ids=input_ids
+            )
 
     return SGLangDeepseekV41MetadataBuilder
 
@@ -1039,6 +1080,13 @@ def _make_proxy_pool_cls():
             # extend guard; the generation SGLang bumps on every row allocation
             # is how a new tenant is told from a chunked continuation.
             self.state_gen = np.zeros(self.num_req_slots, dtype=np.int64)
+            # Per request-row STATE slot, the lowest position its decoder
+            # (layers 20-39) rings hold a row at, as the last EXTEND on it
+            # left them: a chunk that skipped the decoder wrote none below
+            # its end. Written and read only by the EXTEND staging
+            # (`v41_note_decoder_rows`, `v41_decoder_floors`); every new
+            # tenant's first EXTEND starts at 0 or replays its own floor.
+            self.decoder_rows_from = np.zeros(self.num_req_slots, dtype=np.int64)
             total_bytes = _arena_bytes(geometry, self.num_pages, self.num_slots)
             self.raw_arena = torch.empty(total_bytes, dtype=torch.uint8, device=device)
             # Reported by /get_internal_state and the scheduler metrics, in GiB.
@@ -1348,8 +1396,13 @@ def _install_host_mirror_patch() -> None:
     EXTEND only, and the decode graph runner's replay view carries neither it
     nor the request ids. Both ride along as ``atom_v41_*`` attributes, on
     V4.1 DECODE and TARGET_VERIFY batches only (DSpark's verify is built from
-    the ScheduleBatch by ``prepare_for_verify``), so
-    `build_v41_graph_replay_batch` can stage without reading the device back.
+    the ScheduleBatch by ``prepare_for_verify``), so a graph replay
+    (`build_v41_graph_replay_batch`) and an eager verify
+    (`build_v41_scheduled_batch`) stage without reading the device back.
+    A V4.1 EXTEND carries each request's prompt rows left after its chunk
+    (``PROMPT_REST_ATTR``, `v41_prompt_rest`), which ``ForwardBatch`` does
+    not say either. The eager runner's view of the batch carries both
+    (`carry_host_mirror_view`).
     """
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -1364,11 +1417,15 @@ def _install_host_mirror_patch() -> None:
                 model_runner
             ):
                 forward_batch.atom_v41_req_pool_indices_cpu = batch.req_pool_indices_cpu
+            elif mode.name == "EXTEND" and _is_v41_runner(model_runner):
+                # Which request this chunk leaves unfinished (`v41_chunk_finals`).
+                setattr(forward_batch, PROMPT_REST_ATTR, v41_prompt_rest(batch))
             return forward_batch
 
         ForwardBatch.init_new = classmethod(init_new)
         ForwardBatch._atom_v41_host_mirror_patched = True
 
+    _install_host_mirror_view_carrier()
     from sglang.srt.model_executor.runner import decode_cuda_graph_runner
 
     original_view = decode_cuda_graph_runner.build_replay_fb_view
@@ -1389,10 +1446,44 @@ def _install_host_mirror_patch() -> None:
     decode_cuda_graph_runner.build_replay_fb_view = build_replay_fb_view
 
 
+def carry_host_mirror_view(forward_batch, view) -> None:
+    """``EagerRunner.load_batch``'s addition: the view it hands the model
+    (``dataclasses.replace`` of the ForwardBatch over its static input
+    buffers, which keeps dataclass fields only) carries the batch's host
+    mirror: an EXTEND's per-request prompt rows left (``PROMPT_REST_ATTR``),
+    a decode's or verify's host request rows."""
+    if view is forward_batch:
+        return
+    # The attributes `_install_host_mirror_patch` sets, each on the modes it
+    # serves.
+    for name in (PROMPT_REST_ATTR, "atom_v41_req_pool_indices_cpu"):
+        value = getattr(forward_batch, name, None)
+        if value is not None:
+            setattr(view, name, value)
+
+
+def _install_host_mirror_view_carrier() -> None:
+    from sglang.srt.model_executor.runner.eager_runner import EagerRunner
+
+    original = EagerRunner.load_batch
+    if getattr(original, "_atom_v41_host_mirror_patched", False):
+        return
+
+    @wraps(original)
+    def load_batch(self, forward_batch, *args, **kwargs):
+        view = original(self, forward_batch, *args, **kwargs)
+        carry_host_mirror_view(forward_batch, view)
+        return view
+
+    load_batch._atom_v41_host_mirror_patched = True
+    EagerRunner.load_batch = load_batch
+
+
 def install_deepseek_v41_proxy_pool_patch() -> None:
     """Make SGLang size and build the V4.1 proxy pool instead of its DSV4 pool,
     keep its own V4.1 decode-graph variants off the ATOM model, carry decode
-    batches' host request rows to the replay staging.
+    batches' host request rows to the replay staging, and pick all-greedy
+    tokens with native ATOM's top-1 kernel instead of torch.argmax.
 
     First refuses an SGLang other than the one this rewiring is written
     against (`sglang_version_guard`), before any of it is installed."""
@@ -1403,9 +1494,23 @@ def install_deepseek_v41_proxy_pool_patch() -> None:
     refuse_unsupported_sglang()
     import sglang.srt.mem_cache.deepseek_v4_memory_pool as dsv4_pool
 
+    from atom.plugin.sglang.patches.v41_greedy_sampler_patch import (
+        install_v41_greedy_sampler_patch,
+    )
+
+    install_v41_greedy_sampler_patch()
     _install_pool_sizing_patch()
     _install_graph_variants_patch()
     _install_host_mirror_patch()
+    from atom.plugin.sglang.patches.v41_extend_rows_at_alloc_patch import (
+        install_v41_extend_rows_at_alloc_patch,
+    )
+    from atom.plugin.sglang.patches.v41_prefill_token_graph_patch import (
+        install_v41_prefill_token_graph_patch,
+    )
+
+    install_v41_extend_rows_at_alloc_patch()
+    install_v41_prefill_token_graph_patch()
     original_pool_cls = dsv4_pool.DeepSeekV4TokenToKVPool
     if getattr(original_pool_cls, "is_atom_v41_proxy_pool", False):
         return
@@ -1477,14 +1582,30 @@ class HostPageRows:
 
     def __init__(self):
         self._rows = {}
+        # Per slot, how many times its row was rewritten in place (`forget`):
+        # a copy read before a rewrite and recorded after it (a prefetch,
+        # `VerifyRowPrefetch`) is refused by comparing this.
+        self._generations = {}
 
-    def record(self, slots, rids, rows):
-        for slot, rid, row in zip(slots, rids, rows):
+    def generation(self, slot) -> int:
+        return self._generations.get(int(slot), 0)
+
+    def record(self, slots, rids, rows, generations=None):
+        """Record each slot's row. ``generations``: the slot generations when
+        the rows were read; a slot rewritten since keeps no copy."""
+        if generations is None:
+            generations = [None] * len(slots)
+        for slot, rid, row, gen in zip(slots, rids, rows, generations):
+            if gen is not None and gen != self.generation(slot):
+                self._rows.pop(int(slot), None)
+                continue
             self._rows[int(slot)] = (rid, row)
 
     def forget(self, slot) -> None:
         """Drop ``slot``'s copy: its row was rewritten in place."""
-        self._rows.pop(int(slot), None)
+        slot = int(slot)
+        self._rows.pop(slot, None)
+        self._generations[slot] = self._generations.get(slot, 0) + 1
 
     def lookup(self, slots, rids, widths):
         """Each request's first ``widths[i]`` pages, or None if any request's
@@ -1504,6 +1625,248 @@ _HOST_ROWS = HostPageRows()
 def forget_host_page_rows(slot) -> None:
     """The tree rewrote ``slot``'s ``req_to_token`` row: drop its host copy."""
     _HOST_ROWS.forget(slot)
+
+
+class VerifyRowPrefetch:
+    """The PAGE rows a DSpark round's verify will miss in `HostPageRows`,
+    copied to the host before the round's draft block is launched.
+
+    A verify replay that finds a request's host copy shorter than the pages
+    of ``p..p+5`` reads the rows back with a blocking D2H. Staged after the
+    draft launch, that read waits for the whole draft block, then the rest of
+    the staging runs with the GPU idle. Which rows will miss is known before
+    the draft: SGLang's ``prepare_for_decode`` reserved every request's KV up
+    to ``spec_info.nxt_kv_lens_cpu`` (page-aligned, at least the round's
+    ``p + 6``; ``alloc_for_spec_decode`` wrote those ``req_to_token`` entries
+    and the forward stream is ordered after them), so a request whose host
+    copy does not cover ``nxt / 256`` pages gets those pages read on a side
+    stream into pinned memory, without waiting. The verify's staging takes
+    them (`take`, one event wait: the copy depends only on the allocation,
+    not on the draft) and records them in `HostPageRows`, which then holds
+    them the way an EXTEND or a read-back would: keyed by STATE slot and
+    request id, so a copy is never used for another tenant.
+
+    With radix cache on, a checkpoint (``checkpoint_into_tree``) repoints a
+    live row at the tree's pages and drops its copy (``forget``). It runs in
+    the scheduler's result processing (a chunk's or a release's), never
+    between this ``issue`` and the same round's ``take``, and a checkpoint
+    before ``issue`` makes the row a miss read afresh: the forward stream
+    the side copy waits on waits on the schedule stream that rewrote it. The
+    rows still carry their slots' rewrite generation from ``issue``, and
+    ``take`` records none whose slot was rewritten since, so a stale copy can
+    never enter `HostPageRows` whatever the order.
+    """
+
+    def __init__(self):
+        self.pending = None
+        self.stream = None
+        self.event = None
+        self.pinned = None
+
+    def _host(self, rows: int, pages: int) -> torch.Tensor:
+        """A contiguous pinned ``[rows, pages]`` (an async D2H needs one)."""
+        pinned = self.pinned
+        if pinned is None or pinned.numel() < rows * pages:
+            pinned = torch.empty(
+                (max(rows * pages, 64 * 64),),
+                dtype=torch.int32,
+                pin_memory=True,
+            )
+            self.pinned = pinned
+        return pinned[: rows * pages].view(rows, pages)
+
+    def issue(self, slots, rids, bounds, req_to_token, block_size: int) -> int:
+        """Start the copy of the rows `HostPageRows` does not cover up to
+        each request's reserved length ``bounds``; returns how many."""
+        self.drop()
+        # The table's columns bound a row (a reservation at the context cap).
+        widths = np.minimum(
+            -(-np.asarray(bounds, dtype=np.int64) // block_size),
+            -(-int(req_to_token.shape[1]) // block_size),
+        )
+        miss = [
+            i
+            for i, (slot, rid, width) in enumerate(zip(slots, rids, widths))
+            if _HOST_ROWS.lookup([slot], [rid], [width]) is None
+        ]
+        if not miss:
+            return 0
+        miss_slots = [int(slots[i]) for i in miss]
+        pages = int(max(widths[i] for i in miss))
+        device = req_to_token.device
+        module = _device_module(device)
+        current = module.current_stream()
+        if self.stream is None:
+            self.stream = module.Stream(device=device)
+            self.event = module.Event()
+        host = self._host(len(miss), pages)
+        index = torch.tensor(miss_slots, dtype=torch.int64)
+        self.stream.wait_stream(current)
+        with module.stream(self.stream):
+            index = index.to(device, non_blocking=True)
+            table = (
+                req_to_token[index, : pages * block_size : block_size] // block_size
+            ).to(torch.int32)
+            host.copy_(table, non_blocking=True)
+            self.event.record(self.stream)
+        self.pending = (
+            miss_slots,
+            [rids[i] for i in miss],
+            [int(widths[i]) for i in miss],
+            host,
+            # A radix checkpoint that rewrites one of these rows before
+            # `take` (`forget_host_page_rows`) voids that row's copy.
+            [_HOST_ROWS.generation(slot) for slot in miss_slots],
+        )
+        return len(miss)
+
+    def take(self) -> bool:
+        """Record the prefetched rows in `HostPageRows` (one event wait);
+        False if none are pending."""
+        if self.pending is None:
+            return False
+        slots, rids, widths, host, generations = self.pending
+        self.pending = None
+        self.event.synchronize()
+        rows = [host[i, :width].numpy().copy() for i, width in enumerate(widths)]
+        _refuse_padding_page(rows)
+        _HOST_ROWS.record(slots, rids, rows, generations)
+        return True
+
+    def drop(self) -> None:
+        """Forget a prefetch no verify took (one whose copies already covered
+        it): its pinned rows are reused next."""
+        if self.pending is not None:
+            self.pending = None
+            self.event.synchronize()
+
+
+_VERIFY_PREFETCH = VerifyRowPrefetch()
+
+
+class ExtendRowRead:
+    """An EXTEND's PAGE rows, copied to the host where SGLang wrote them.
+
+    The staging of an EXTEND needs every request's PAGE row on the host.
+    Read back at staging, the copy is queued on the forward stream behind the
+    step in flight -- under overlap a whole DSpark verify graph or decode
+    graph -- and every host launch of the prefill waits for
+    it. The rows exist much earlier: ``alloc_for_extend`` wrote them into
+    ``req_to_token`` on the scheduler's stream, which does not wait for the
+    forward stream. `issue` queues the copy right there, on that stream,
+    after the allocator's own write; the staging of the same batch `take` s
+    it (one event wait, for those few kernels). A copy is only used by the
+    batch whose allocation made it: same STATE slots in the same order, same
+    request ids, at least the widths the staging needs; anything else (a
+    MIXED batch, a batch that never ran) falls back to the read-back.
+
+    With radix cache on, the copy holds each row's prefix pages too
+    (``alloc_for_extend`` writes a hit's tree pages into ``[0, P)`` with the
+    extend's own), and a fused replay's ``[P - R, P)`` lies inside them. The
+    one in-place rewrite of a live row, a radix checkpoint
+    (``checkpoint_into_tree``), bumps the slot's `HostPageRows` generation;
+    `issue` notes each slot's generation and `take` refuses the copy if any
+    moved since (the staging reads back). A checkpoint of a request running
+    in this EXTEND happens before its allocation (a chunked request is
+    checkpointed when the next batch is built) or after its forward, so the
+    refusal guards ordering SGLang does not promise rather than one it takes.
+    """
+
+    def __init__(self):
+        self.pending = None
+
+    def issue(self, req_pool_indices, slots, rids, ends, req_to_token, block_size):
+        self.pending = None
+        ends = np.asarray(ends, dtype=np.int64)
+        widths = np.minimum(
+            -(-ends // block_size), -(-int(req_to_token.shape[1]) // block_size)
+        )
+        pages = int(widths.max())
+        device = req_to_token.device
+        module = _device_module(device)
+        # On the caller's (the scheduler's) stream, after the allocator's
+        # write of these rows.
+        table = (
+            req_to_token[
+                req_pool_indices[: len(slots)].to(device, torch.int64),
+                : pages * block_size : block_size,
+            ]
+            // block_size
+        ).to(torch.int32)
+        host = torch.empty(tuple(table.shape), dtype=torch.int32, pin_memory=True)
+        host.copy_(table, non_blocking=True)
+        event = module.Event()
+        event.record()
+        slots = [int(s) for s in slots]
+        generations = [_HOST_ROWS.generation(slot) for slot in slots]
+        self.pending = (slots, list(rids), widths, host, event, generations)
+
+    def take(self, slots, rids, widths):
+        """The rows of the batch ``(slots, rids)`` (first ``widths[i]`` pages
+        each), or None when the pending copy is not that batch's."""
+        pending, self.pending = self.pending, None
+        if pending is None:
+            return None
+        read_slots, read_rids, read_widths, host, event, generations = pending
+        if (
+            [int(s) for s in slots] != read_slots
+            or list(rids) != read_rids
+            or np.any(np.asarray(widths, np.int64) > read_widths)
+        ):
+            return None
+        if [_HOST_ROWS.generation(slot) for slot in read_slots] != generations:
+            # A radix checkpoint rewrote a row after the copy was queued.
+            return None
+        event.synchronize()
+        table = host.numpy()
+        rows = [table[i, : int(width)].copy() for i, width in enumerate(widths)]
+        _refuse_padding_page(rows)
+        return rows
+
+
+_EXTEND_ROWS = ExtendRowRead()
+
+
+def read_v41_extend_rows_at_alloc(batch, req_pool_indices, req_pool_indices_cpu):
+    """After SGLang's ``alloc_for_extend`` for a V4.1 target batch: queue the
+    D2H of its requests' PAGE rows on the current (scheduler) stream
+    (`ExtendRowRead`). From the batch's own allocation: its host slots (one
+    per request), request ids and ``seq_lens_cpu`` (``prepare_for_extend``
+    sets it before allocating; every request ends at >= 1 token). SGLang
+    allocates no request before the proxy pool, and so the builder, exist."""
+    reqs = batch.reqs
+    bs = len(reqs)
+    _EXTEND_ROWS.issue(
+        req_pool_indices,
+        [int(s) for s in req_pool_indices_cpu],
+        [req.rid for req in reqs],
+        _cpu_ints(batch.seq_lens_cpu, None, bs),
+        batch.req_to_token_pool.req_to_token,
+        _V41_BUILDER.block_size,
+    )
+
+
+def _device_module(device):
+    return torch.get_device_module(torch.device(device))
+
+
+def prefetch_v41_dspark_verify_rows(batch, req_to_token, block_size: int) -> int:
+    """Before a DSpark decode round's draft launch: prefetch the PAGE rows
+    its verify would otherwise read back behind the draft
+    (`VerifyRowPrefetch`). From the round's own ScheduleBatch: host slots,
+    request ids and SGLang's reservation ``spec_info.nxt_kv_lens_cpu``."""
+    slots = batch.req_pool_indices_cpu
+    bounds = batch.spec_info.nxt_kv_lens_cpu
+    reqs = batch.reqs
+    if slots is None or bounds is None:
+        _VERIFY_PREFETCH.drop()
+        return 0
+    bs = len(reqs)
+    slots = [int(slot) for slot in slots]
+    bounds = _cpu_ints(bounds, None, bs)
+    return _VERIFY_PREFETCH.issue(
+        slots, [req.rid for req in reqs], bounds, req_to_token, block_size
+    )
 
 
 def _refuse_padding_page(rows) -> None:
@@ -1528,27 +1891,58 @@ def _is_target_verify(mode) -> bool:
     return mode.is_target_verify()
 
 
-def _verify_lengths(forward_batch, bs: int):
-    """``(prefix, width)`` of a TARGET_VERIFY: every request verifies
+def _committed_prefix(spec_info, ends, bs: int, width: int, slots):
+    """``(prefix, ends)`` of a verify of ``width`` rows a request in STATE
+    ``slots``.
+
+    ``live_seq_lens_cpu`` is the committed prefix the verify caller recorded
+    before widening, ``ends`` (``seq_lens_cpu``) the widened lengths, which
+    must agree. Without it SGLang ran its ``needs_cpu_seq_lens=False``
+    contract (the late host lengths): ``ends`` is then SGLang's reservation
+    bound, the prefix is the round's deferred copy, taken here for these
+    slots (`dspark_deferred_seq_lens_patch.take_late_seq_lens`, which refuses
+    another batch's), and the exact ends are that prefix plus the width."""
+    live = spec_info.live_seq_lens_cpu
+    if live is None:
+        from atom.plugin.sglang.patches.dspark_deferred_seq_lens_patch import (
+            deferred_state_summary,
+            take_late_seq_lens,
+        )
+
+        taken = take_late_seq_lens(bs, slots)
+        if taken is None:
+            # `seq_lens` may be SGLang's over-allocated bound here, so the
+            # prefix cannot be derived from it.
+            raise ValueError(
+                "DeepSeek-V4.1 TARGET_VERIFY needs spec_info.live_seq_lens_cpu "
+                f"(bs={bs}; {deferred_state_summary()})"
+            )
+        prefix = _cpu_ints(taken[0], None, bs)
+        return prefix, prefix + width
+    prefix = _cpu_ints(live, None, bs)
+    if np.any(prefix + width != ends):
+        raise ValueError(
+            "DeepSeek-V4.1 TARGET_VERIFY lengths disagree: "
+            f"prefix={prefix.tolist()} width={width} seq_lens={ends.tolist()}"
+        )
+    return prefix, ends
+
+
+def _verify_lengths(forward_batch, ends, bs: int, slots):
+    """``(prefix, width, ends)`` of a TARGET_VERIFY: every request verifies
     ``spec_info.draft_token_num`` rows (6, the bonus token and its drafts;
     ATOM's speculative config refuses any other count), on top of its
     committed prefix.
 
     The width is SGLang's official verify width, never the extend lengths.
     ``seq_lens_cpu`` arrives already widened by it (this backend has no
-    ``make_forward_metadata_from_raw_verify``); ``live_seq_lens_cpu`` is the
-    committed prefix the verify caller recorded before widening.
+    ``make_forward_metadata_from_raw_verify``), or as SGLang's reservation
+    bound under the late host lengths (`_committed_prefix`).
     """
     spec_info = forward_batch.spec_info
     width = int(spec_info.draft_token_num)
-    live = spec_info.live_seq_lens_cpu
-    if live is None:
-        # `seq_lens` may be SGLang's over-allocated bound here, so the prefix
-        # cannot be derived from it.
-        raise ValueError(
-            "DeepSeek-V4.1 TARGET_VERIFY needs spec_info.live_seq_lens_cpu"
-        )
-    return _cpu_ints(live, None, bs), width
+    prefix, ends = _committed_prefix(spec_info, ends, bs, width, slots)
+    return prefix, width, ends
 
 
 def _radix_stamps():
@@ -1618,9 +2012,19 @@ def build_v41_scheduled_batch(forward_batch, block_size: int):
             f"DeepSeek-V4.1 SGLang bridge does not translate {mode} yet"
         )
     bs = int(forward_batch.batch_size)
+    if verify:
+        # The ScheduleBatch's host rows, carried onto the verify batch and its
+        # eager view (`_install_host_mirror_patch`), as a verify replay reads
+        # them: no read-back behind the draft block.
+        host_slots = forward_batch.atom_v41_req_pool_indices_cpu
+    else:
+        # SGLang mirrors req_pool_indices on the host for EXTEND only.
+        host_slots = forward_batch.req_pool_indices_cpu
+    slots = _cpu_ints(host_slots, forward_batch.req_pool_indices, bs).astype(np.int32)
+    _refuse_shared_or_padding_slots(slots, bs)
     ends = _cpu_ints(forward_batch.seq_lens_cpu, forward_batch.seq_lens, bs)
     if verify:
-        prefix, width = _verify_lengths(forward_batch, bs)
+        prefix, width, ends = _verify_lengths(forward_batch, ends, bs, slots)
         lengths = np.full(bs, width, dtype=np.int64)
     elif mode.is_decode():
         # positions = seq_lens - 1: seq_lens already counts the decode token.
@@ -1639,12 +2043,19 @@ def build_v41_scheduled_batch(forward_batch, block_size: int):
             f"prefix={prefix.tolist()} lengths={lengths.tolist()} "
             f"ends={ends.tolist()}"
         )
-    # SGLang mirrors req_pool_indices on the host for EXTEND only.
-    slots = _cpu_ints(
-        forward_batch.req_pool_indices_cpu, forward_batch.req_pool_indices, bs
-    ).astype(np.int32)
-    _refuse_shared_or_padding_slots(slots, bs)
     rids = list(forward_batch.rids[:bs])
+    rows = None
+    if verify:
+        # As a verify replay (`build_v41_graph_replay_batch`): the host
+        # copies, completed by the round's prefetch (`VerifyRowPrefetch`).
+        widths = -(-ends // block_size)
+        rows = _HOST_ROWS.lookup(slots, rids, widths)
+        if rows is None and _VERIFY_PREFETCH.take():
+            rows = _HOST_ROWS.lookup(slots, rids, widths)
+    elif not mode.is_decode():
+        # The batch's own allocation queued its rows' copy on the scheduler's
+        # stream (`ExtendRowRead`); taken here when it is this batch's.
+        rows = _EXTEND_ROWS.take(slots, rids, -(-ends // block_size))
     fused = getattr(forward_batch, radix.FUSED_ATTR, None)
     replay_rows = np.zeros(bs, dtype=np.int64)
     replaying = {}
@@ -1658,23 +2069,31 @@ def build_v41_scheduled_batch(forward_batch, block_size: int):
         # Each hit's span now starts at P - R; context_lens stay.
         replay_rows = fused.replay_rows(bs)
         lengths = lengths + replay_rows
-    rows = _block_rows(
-        _req_to_token(), forward_batch.req_pool_indices[:bs], ends, block_size
-    )
-    # Graph replays stage off these copies (`HostPageRows`); a verify's rows
-    # are valid copies too (over-allocated pages stay until release).
-    _HOST_ROWS.record(slots, rids, rows)
+    read_back = rows is None
+    if read_back:
+        rows = _block_rows(
+            _req_to_token(), forward_batch.req_pool_indices[:bs], ends, block_size
+        )
+    # Graph replays stage off these copies (`HostPageRows`): a read-back or an
+    # EXTEND's own row copy is recorded (a verify's rows are valid copies too:
+    # over-allocated pages stay until release). A verify's rows taken from the
+    # copies are not recorded again (as in `build_v41_graph_replay_batch`):
+    # that would cut a prefetched copy back to this verify's width.
+    if read_back or not verify:
+        _HOST_ROWS.record(slots, rids, rows)
     return SimpleNamespace(
         is_dummy_run=False,
         req_ids=rids,
         num_scheduled_tokens=lengths.astype(np.int32),
         context_lens=ends,
-        # SGLang's ForwardBatch does not say whether a chunk finishes its
-        # prompt, so every request counts as finishing (None): under decoder
+        # Every request counts as finishing (None) here: under decoder
         # bounded replay a chunk SGLang continues runs the decoder on its last
         # window rows too, whose ring the next chunk then reads if it is
-        # shorter than the window (`v41_extend_replays`). A fused radix
-        # replay is one span from P - R, at least the window long.
+        # shorter than the window (`v41_extend_replays`). The EXTEND staging
+        # narrows it (`v41_chunk_finals`): a chunk SGLang continues with at
+        # least a window of its prompt left runs none of the decoder, as
+        # native's middle chunk. A fused radix replay is one span from
+        # P - R, at least the window long.
         is_final_chunk=None,
         replaying=replaying,
         # Rows ATOM runs ahead of each request's own (a fused radix replay).
@@ -1688,6 +2107,228 @@ def build_v41_scheduled_batch(forward_batch, block_size: int):
         total_seqs_num=bs,
         total_tokens_num=int(lengths.sum()),
     )
+
+
+# Per request of a V4.1 EXTEND ForwardBatch (`_install_host_mirror_patch`):
+# the rows of its prompt after this chunk, 0 for a request this chunk finishes.
+PROMPT_REST_ATTR = "atom_v41_prompt_rest"
+
+
+def v41_prompt_rest(batch) -> tuple[int, ...]:
+    """The rows each request of an EXTEND ScheduleBatch has left of its prompt
+    after this chunk: nonzero only for the request SGLang continues
+    (``batch.chunked_req``, the identity SGLang's own EAGLE path tests for a
+    chunk that does not finish its prompt), ``len(full_untruncated_fill_ids)
+    - extend_end``. An EXTEND batch has requests, each with its
+    ``extend_end`` (``prepare_for_extend`` sizes the batch by them).
+
+    Zero, too, for a continued request that asks input logprobs of a prompt
+    row (``return_logprob`` with ``0 <= logprob_start_len <
+    len(full_untruncated_fill_ids)``): the chunk holding that row computes
+    every row (`v41_extend_replays`) and reads the decoder rings below its
+    start, so this chunk keeps its tail, which writes them. Known here, at
+    the chunk, unlike another request's logprobs in the next step
+    (`v41_decoder_floors`)."""
+    rest = []
+    for req in batch.reqs:
+        left = 0
+        if req is batch.chunked_req:
+            full = len(req.full_untruncated_fill_ids)
+            left = max(full - int(req.extend_end), 0)
+            if left and req.return_logprob and 0 <= req.logprob_start_len < full:
+                # SGLang's `compute_extend_logprob_start_len`: -1 asks none.
+                left = 0
+        rest.append(left)
+    return tuple(rest)
+
+
+def v41_chunk_finals(forward_batch, batch, window: int) -> tuple[bool, ...] | None:
+    """``is_final_chunk`` for a replaying EXTEND, or None (every request counts
+    as finishing).
+
+    A request whose chunk leaves at least ``window`` rows of its prompt
+    (`v41_prompt_rest`) does not finish it here, so under decoder bounded
+    replay it needs none of the decoder, as native's middle chunk
+    (`bounded_replay`: "one that does not runs none of it"): nothing after it
+    reads its decoder rows. Its next chunk either holds at least the window
+    and replays its own tail from the tail start, or is shorter -- then the
+    chunk before it left fewer than ``window`` rows and so counted as
+    finishing, which wrote the decoder rings the short chunk reads
+    (`v41_extend_replays`). A request with fewer than ``window`` rows left
+    keeps the tail for the same reason. The draft's context is the finishing
+    chunk's tail (`V41DSparkTargetSurface.finish_forward`), and a radix hit
+    below a skipped chunk's end replays its own ``R >= window`` rows. The
+    next step need not replay, though: another request's input logprobs, or
+    a continuation SGLang cut below the window (its memory budget), make it
+    compute every row. Then the request's decoder window starts where its
+    rings hold rows (`v41_decoder_floors`), as a native forward's tail starts
+    at its own rows. None when the ForwardBatch carries no per-request rest
+    or every request finishes."""
+    rest = getattr(forward_batch, PROMPT_REST_ATTR, None)
+    count = len(batch.num_scheduled_tokens)
+    if rest is None or len(rest) != count:
+        return None
+    finals = tuple(int(left) < int(window) for left in rest)
+    return None if all(finals) else finals
+
+
+# On a V4.1 prefill step (`BatchStep`): True when every request continues its
+# prompt (`v41_chunk_finals` marked none finishing), so the runtime model
+# skips the decoder. The staging sets it on every prefill step; every other
+# step reads the class default, False (`install_v41_chunk_decoder_gate`).
+NO_PROMPT_ENDS_ATTR = "atom_v41_finishes_no_prompt"
+
+
+def install_v41_chunk_decoder_gate() -> None:
+    """Let the runtime model skip the decoder on a plugin prefill that
+    finishes no prompt (``NO_PROMPT_ENDS_ATTR`` on its step, one attribute
+    read), as native skips it on a middle chunk; every other forward keeps
+    core's ``decoder_runs``. The plugin's context carries no
+    ``forward_mode`` (native's carries the DP group's final-request count),
+    and V4.1 refuses DP attention at launch, so no peer's collectives count
+    on this rank's decoder. Idempotent."""
+    from atom.model_ops.attentions.deepseek_v41.metadata import BatchStep
+    from atom.models.deepseek_v41 import runtime as v41_runtime
+
+    original = v41_runtime.decoder_runs
+    if getattr(original, "_atom_v41_chunk_gate", False):
+        return
+    setattr(BatchStep, NO_PROMPT_ENDS_ATTR, False)
+
+    @wraps(original)
+    def decoder_runs(forward):
+        if forward.attn_metadata.step.atom_v41_finishes_no_prompt:
+            return False
+        return original(forward)
+
+    decoder_runs._atom_v41_chunk_gate = True
+    v41_runtime.decoder_runs = decoder_runs
+
+
+# Per V4.1 EXTEND attention metadata that computes every row and resumes a
+# request whose decoder rings lack rows below its start: [running_bs] int32 on
+# the device, each request's lowest decoder window row (`v41_decoder_floors`).
+DECODER_FLOORS_ATTR = "atom_v41_decoder_floors"
+
+
+def _decoder_rows_from() -> np.ndarray:
+    """The proxy pool's per-slot decoder row floor
+    (``ATOMDeepSeekV41ProxyKVPool.decoder_rows_from``), off the pool of the
+    current forward context."""
+    from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+
+    return get_token_to_kv_pool().decoder_rows_from
+
+
+def _extend_spans(batch):
+    """Each request's ``(start, prefix, end)`` in an EXTEND ScheduledBatch:
+    where ATOM's span starts (a fused radix replay's rows included), where
+    SGLang's own rows start, and where they end."""
+    ends = np.asarray(batch.context_lens, np.int64)
+    starts = ends - np.asarray(batch.num_scheduled_tokens, np.int64)
+    return starts, starts + np.asarray(batch.replay_rows, np.int64), ends
+
+
+def v41_decoder_floors(batch, rows_from, window: int) -> np.ndarray | None:
+    """Per request of an EXTEND that computes every row
+    (``decoder_replays`` False), the lowest position its decoder (layers
+    20-39) window may read, or None when every request's rings hold the
+    window below its start.
+
+    A request resuming at ``p`` reads its decoder rings' rows ``[p - window +
+    1, p)``. ``rows_from[slot]`` is where they hold rows
+    (`v41_note_decoder_rows`): a chunk that skipped the decoder
+    (`v41_chunk_finals`) left none below its end, so such a request's window
+    starts there -- where its rows do, as a native forward's decoder window
+    starts at its own tail (``swa_replay_start``) -- instead of reading rows
+    nobody wrote. Its encoder keeps the exact window: its rings hold every
+    row. A radix replay (``batch.replaying``) brings its own floor; a fresh
+    request reads nothing below 0."""
+    if batch.decoder_replays:
+        return None
+    _, prefix, _ = _extend_spans(batch)
+    slots = np.asarray(batch.state_slots_committed, np.int64)
+    floors = np.zeros(len(slots), np.int64)
+    for i, slot in enumerate(slots):
+        p = int(prefix[i])
+        if i in batch.replaying or p <= 0:
+            continue
+        held = int(rows_from[slot])
+        if held > max(p - int(window) + 1, 0):
+            floors[i] = held
+    return floors if np.any(floors) else None
+
+
+def v41_note_decoder_rows(batch, rows_from, window: int) -> None:
+    """Record, per request slot, where its decoder rings hold rows once this
+    EXTEND has run (``rows_from[slot]``, read by `v41_decoder_floors`): a
+    replaying step writes a finishing request's tail (its last ``window``
+    rows of the span) and nothing for one that continues; a step computing
+    every row writes all of them, from its radix replay's start or from 0,
+    and continues a resumed request's rings as they were. Verify and decode
+    rows only append above a finished prompt's tail."""
+    starts, prefix, ends = _extend_spans(batch)
+    slots = np.asarray(batch.state_slots_committed, np.int64)
+    finals = batch.is_final_chunk
+    for i, slot in enumerate(slots):
+        if batch.decoder_replays:
+            if finals is None or finals[i]:
+                tail = min(int(ends[i] - starts[i]), int(window))
+                rows_from[slot] = int(ends[i]) - tail
+            else:
+                rows_from[slot] = int(ends[i])
+        elif i in batch.replaying:
+            rows_from[slot] = int(starts[i])
+        elif int(prefix[i]) <= 0:
+            rows_from[slot] = 0
+
+
+def publish_v41_decoder_floors(metadata, floors: np.ndarray) -> None:
+    """Hang ``floors`` on ``metadata`` for `install_v41_decoder_floor_gate`,
+    each at least the step's own floor (a radix replay's start)."""
+    step = metadata.step
+    own = step.request_floors
+    floors = np.asarray(floors, np.int64)
+    if len(own) >= len(floors):
+        floors = np.maximum(floors, np.asarray(own[: len(floors)], np.int64))
+    floors = torch.from_numpy(floors.astype(np.int32))
+    setattr(metadata, DECODER_FLOORS_ATTR, floors.to(step.positions.device))
+
+
+def install_v41_decoder_floor_gate() -> None:
+    """Run a non-replaying prefill's decoder layers (runtime
+    ``run_decoder_stages``) under its decoder floors
+    (``DECODER_FLOORS_ATTR``): the step's ``swa_replay_start`` -- the floor
+    every window index build reads -- is swapped for them and its memoized
+    indptrs dropped, so layers 20-39 build theirs from the floors, and both
+    are restored after them (the indptrs dropped again: their fixed buffers
+    now hold the decoder's). The encoder, run before, keeps its own. Every
+    other forward runs core's function unchanged. Idempotent."""
+    from atom.models.deepseek_v41 import runtime as v41_runtime
+
+    original = v41_runtime.run_decoder_stages
+    if getattr(original, "_atom_v41_floor_gate", False):
+        return
+
+    @wraps(original)
+    def run_decoder_stages(forward, *args, **kwargs):
+        metadata = forward.attn_metadata
+        # Only a staged prefill's metadata carries the floors.
+        floors = getattr(metadata, DECODER_FLOORS_ATTR, None)
+        if floors is None:
+            return original(forward, *args, **kwargs)
+        step = metadata.step
+        held = step.swa_replay_start
+        step.swa_replay_start = floors
+        step.indptrs = {}
+        try:
+            return original(forward, *args, **kwargs)
+        finally:
+            step.swa_replay_start = held
+            step.indptrs = {}
+
+    run_decoder_stages._atom_v41_floor_gate = True
+    v41_runtime.run_decoder_stages = run_decoder_stages
 
 
 def v41_extend_replays(
@@ -1768,7 +2409,9 @@ def build_deepseek_v41_forward_metadata(forward_batch):
         input_ids = fused.expanded.input_ids
     running_tokens = int(input_ids.shape[0])
     running_bs = batch.total_seqs_num
-    if _is_target_verify(mode):
+    verify = _is_target_verify(mode)
+    decoder_floors, no_prompt_ends = None, False
+    if verify:
         width = int(batch.num_scheduled_tokens[0])
         metadata, _ = builder._prepare(
             batch, running_bs, running_tokens, max_q_len=width, tentative=True
@@ -1784,7 +2427,58 @@ def build_deepseek_v41_forward_metadata(forward_batch):
                 # Only DSpark speculates on V4.1 here (`v41_dspark_capability_error`).
                 dspark_context_in_forward=bool(builder.geometry.speculative_tokens),
             )
-        metadata, _ = builder.prepare_prefill(batch, running_bs, running_tokens)
+            if batch.decoder_replays and not batch.replaying:
+                finals = v41_chunk_finals(
+                    forward_batch, batch, builder.geometry.window_size
+                )
+                if finals is not None:
+                    batch.is_final_chunk = finals
+                    no_prompt_ends = not any(finals)
+            # Where each request's decoder rings hold rows: a step computing
+            # every row starts a request's decoder window there when a chunk
+            # that skipped the decoder left none below its start.
+            rows_from = _decoder_rows_from()
+            decoder_floors = v41_decoder_floors(
+                batch, rows_from, builder.geometry.window_size
+            )
+            v41_note_decoder_rows(batch, rows_from, builder.geometry.window_size)
+        # A radix replay's rows are rows of the step like any other (native
+        # pads a replaying prefill too): a fused step buckets on its widened
+        # row count, its Replay records staged here for the eager regions.
+        bucket = prefill_token_graph_bucket(running_tokens)
+        if decoder_floors is not None:
+            # Eager: the floors ride on the live step for the decoder's
+            # Python-side swap (`install_v41_decoder_floor_gate`).
+            bucket = None
+        if bucket is None:
+            metadata, step_positions = builder.prepare_prefill(
+                batch, running_bs, running_tokens
+            )
+            if decoder_floors is not None:
+                publish_v41_decoder_floors(metadata, decoder_floors)
+        else:
+            # Padded to the recorded bucket, as native pads a prefill
+            # (`ForwardMode._pad_to_token_graph`): the builder lays the spans
+            # out and publishes positions out to ``bucket`` rows; the ids
+            # past the scheduled ones are zero.
+            metadata, step_positions = builder.prepare_prefill(
+                batch, running_bs, bucket
+            )
+            input_ids = _pad_prefill_ids(input_ids, bucket)
+            metadata.sglang_padded_inputs = PaddedPrefillInputs(
+                input_ids=input_ids,
+                positions=step_positions[:bucket],
+                scheduled_tokens=running_tokens,
+                scheduled_tokens_gpu=_PREFILL_GRAPHS.scheduled_tokens(running_tokens),
+            )
+        # Read by the decoder gate (`install_v41_chunk_decoder_gate`).
+        setattr(metadata.step, NO_PROMPT_ENDS_ATTR, no_prompt_ends)
+    if (
+        decoder_floors is None
+        and getattr(metadata, DECODER_FLOORS_ATTR, None) is not None
+    ):
+        # Never a previous forward's (a builder may hand one object back).
+        setattr(metadata, DECODER_FLOORS_ATTR, None)
     # ATOM's cache keeps the tentative step (`cache.pending`) until the
     # commit, and refuses any other step before it (`require_committed`).
     builder.prepare_model_inputs(input_ids, metadata)
@@ -1795,6 +2489,303 @@ def build_deepseek_v41_forward_metadata(forward_batch):
         rows.join()
     metadata.staged_outside_forward = True
     return metadata
+
+
+# --- Prefill token graphs ---
+# Native ATOM records the runtime model's token-graph unit (`_EarlyLayers`
+# under decoder bounded replay, `_Backbone` without it) once per prefill token
+# bucket (`ATOM_TOKEN_GRAPH_SIZES`) and replays it on every prefill padded to
+# the bucket that holds it, its eager regions (attention, Engram staging)
+# running between the recorded segments on the live step
+# (`atom/utils/region_graph.py`). The plugin records the same unit at the same
+# buckets after SGLang's own graph capture (`record_deepseek_v41_prefill_
+# token_graphs`) and pads an EXTEND to its bucket here; the forward context
+# then replays (`ForwardContext.tr_graph`), and SGLang sees the scheduled rows
+# only (`SGLangPluginRuntime.trim_output`). Larger prefills run eagerly.
+
+
+@dataclass
+class PaddedPrefillInputs:
+    """A prefill padded to a token-graph bucket: the ids and positions the
+    model runs (``bucket`` rows), the rows SGLang scheduled, and their count
+    on the device (`Context.scheduled_tokens_gpu`, which the recording reads
+    in place)."""
+
+    input_ids: torch.Tensor
+    positions: torch.Tensor
+    scheduled_tokens: int
+    scheduled_tokens_gpu: torch.Tensor
+
+
+class _PrefillTokenGraphs:
+    """What the recording left for the serving prefills: its buckets, the ids
+    buffer every padded prefill stages into, and the device row count."""
+
+    def __init__(self) -> None:
+        self.sizes: tuple[int, ...] = ()
+        self.ids: torch.Tensor | None = None
+        self._scheduled: torch.Tensor | None = None
+
+    def ids_buffer(self, rows: int, device) -> torch.Tensor:
+        ids = self.ids
+        if ids is None or int(ids.shape[0]) < rows:
+            # SGLang's ids are int64 (`flatten_arrays_to_pinned_cpu`).
+            ids = torch.zeros(rows, dtype=torch.int64, device=device)
+            self.ids = ids
+        return ids
+
+    def scheduled_tokens(self, tokens: int) -> torch.Tensor:
+        """`[1]` int32 on the device holding ``tokens``, written in stream
+        order (a fill, not a copy: nothing for the host to keep alive)."""
+        if self._scheduled is None:
+            self._scheduled = torch.zeros(1, dtype=torch.int32, device=self.ids.device)
+        self._scheduled.fill_(int(tokens))
+        return self._scheduled
+
+
+_PREFILL_GRAPHS = _PrefillTokenGraphs()
+
+
+def prefill_token_graph_bucket(tokens: int) -> int | None:
+    """The recorded bucket an EXTEND of ``tokens`` rows pads to, or None
+    (none recorded, or none holds it). ``tokens``: the rows ATOM runs, a
+    fused radix hit's replay rows included."""
+    if not _PREFILL_GRAPHS.sizes:
+        return None
+    from atom.utils.region_graph import TokenGraph
+
+    bucket = TokenGraph.bucket(int(tokens), "prefill")
+    if bucket is None or bucket not in _PREFILL_GRAPHS.sizes:
+        return None
+    return bucket
+
+
+def _pad_prefill_ids(input_ids: torch.Tensor, bucket: int) -> torch.Tensor:
+    """``input_ids`` in the leading rows of the padded-prefill ids buffer,
+    zeros after them, ``bucket`` rows."""
+    tokens = int(input_ids.shape[0])
+    ids = _PREFILL_GRAPHS.ids_buffer(bucket, input_ids.device)[:bucket]
+    ids[:tokens].copy_(input_ids)
+    if bucket > tokens:
+        ids[tokens:].zero_()
+    return ids
+
+
+def _prefill_capture_step(builder, lengths, *, finishing, slots, input_ids):
+    """Native ``_build_for_prefill_capture``: a prefill of requests of
+    ``lengths`` from position 0, each ``finishing`` its prompt or not, every
+    row on SGLang's padding PAGE 0, Engram on no token -- on the given STATE
+    ``slots`` (the proxy pool's reserved capture slots, not ``0..n-1``: live
+    requests' rows in SGLang's table) over ``input_ids``. Returns
+    ``(metadata, Context)``."""
+    from atom.utils.forward_context import Context
+
+    count, tokens = len(lengths), int(sum(lengths))
+    slots = tuple(int(slot) for slot in slots[:count])
+    pages = -(-max(lengths) // builder.block_size)
+    batch = SimpleNamespace(
+        is_dummy_run=False,
+        req_ids=slots,
+        num_scheduled_tokens=tuple(lengths),
+        context_lens=tuple(lengths),
+        state_slots_committed=slots,
+        block_tables=((0,) * pages,) * count,
+        total_seqs_num=count,
+        total_tokens_num=tokens,
+        total_tokens_num_prefill=tokens,
+        is_final_chunk=None if finishing else (False,) * count,
+        replaying={},
+        # The builder's configured decoder, as native's capture runs it.
+        decoder_replays=True,
+    )
+    metadata, positions = builder._prepare(
+        batch, count, tokens, is_prefill=True, engram_live=False
+    )
+    # No slot reset, host Engram lookup or cursor advance for it.
+    metadata.dummy = True
+    builder.prepare_model_inputs(input_ids[:tokens], metadata)
+    context = Context(
+        positions=positions[:tokens],
+        is_prefill=True,
+        is_dummy_run=False,
+        scheduled_bs=count,
+        scheduled_tokens=tokens,
+        running_bs=count,
+        running_tokens=tokens,
+    )
+    return metadata, context
+
+
+def _run_prefill_capture_forward(wrapper, metadata, context, input_ids, **kwargs):
+    """One target forward over a capture step (`_prefill_capture_step`),
+    outside SGLang's forward: ATOM's forward context set here (``kwargs``:
+    ``in_hipgraph``), ``tr_graph`` None (eager) or "record"."""
+    from atom.utils.forward_context import (
+        DPMetadata,
+        get_forward_context,
+        reset_forward_context,
+        set_forward_context,
+    )
+
+    tr_graph = kwargs.pop("tr_graph", None)
+    atom_config = wrapper.atom_config
+    tokens = int(context.running_tokens)
+    surface = wrapper._v41_dspark
+    set_forward_context(
+        attn_metadata=metadata,
+        atom_config=atom_config,
+        context=context,
+        running_tokens_per_dp_rank=DPMetadata.gather_running_tokens(
+            atom_config.parallel_config, tokens
+        ),
+        **kwargs,
+    )
+    try:
+        get_forward_context().tr_graph = tr_graph
+        if surface is not None:
+            # The DSpark taps fire in the decoder; nothing takes them here.
+            surface._rows.clear()
+        wrapper.model(
+            **wrapper._filter_model_forward_kwargs(
+                {
+                    "input_ids": input_ids[:tokens],
+                    "positions": context.positions,
+                    "intermediate_tensors": None,
+                    "inputs_embeds": None,
+                }
+            )
+        )
+        if surface is not None:
+            surface._rows.clear()
+    finally:
+        reset_forward_context()
+
+
+def _prefill_chunk_budget(builder) -> int:
+    """The rows one prefill step holds: SGLang's resolved chunk (its schedule
+    bag, as `align_atom_config_with_sglang` reads it; a chunk <= 0 is unset,
+    and disabled chunking is refused at launch anyway), at most the
+    builder's."""
+    from sglang.srt.runtime_context import get_schedule
+
+    limit = int(builder.max_num_batched_tokens)
+    chunk = get_schedule().chunked_prefill_size
+    return limit if chunk is None or int(chunk) <= 0 else min(limit, int(chunk))
+
+
+def record_deepseek_v41_prefill_token_graphs(model_runner) -> tuple[int, ...]:
+    """Record the target's prefill token graphs, every rank at once, after
+    SGLang's graph capture: per bucket of ``ATOM_TOKEN_GRAPH_SIZES`` that a
+    chunk can fill (largest first: a module's buckets share one input buffer
+    and one pool), native's ``build_for_token_graph_capture`` step on the
+    pool's capture slots, one warmup forward and one recording forward, under
+    aiter's ``graph_capture`` (a capture stream; its custom all-reduce armed
+    for capture), as native's `ModelRunner._record_tr_graphs`. Returns the
+    buckets recorded."""
+    from aiter.dist.parallel_state import graph_capture
+
+    from atom.plugin.sglang.runtime.context import plugin_runtime_scope
+    from atom.utils import envs
+    from atom.utils.region_graph import TokenGraph
+
+    builder = get_deepseek_v41_builder()
+    wrapper = model_runner.model
+    atom_config = wrapper.atom_config
+    surface = wrapper._v41_dspark
+    if surface is not None and not wrapper.model.replay:
+        # Without decoder bounded replay the recorded unit is `_Backbone`, the
+        # whole forward: the DSpark taps (Python forward hooks, not native's
+        # in-graph aux buffers) would fire only while recording, and a replay
+        # runs no model Python, so `take_aux` would find them missing. Under
+        # replay the unit is `_EarlyLayers`, below every tap.
+        logger.info(
+            "ATOM DeepSeek-V4.1: prefills run eagerly under DSpark without "
+            "decoder bounded replay (its aux taps sit inside the recorded unit)"
+        )
+        return ()
+    limit = _prefill_chunk_budget(builder)
+    sizes = sorted(
+        {int(n) for n in envs.ATOM_TOKEN_GRAPH_SIZES if 0 < int(n) <= limit},
+        reverse=True,
+    )
+    if not sizes:
+        return ()
+    ids = _PREFILL_GRAPHS.ids_buffer(sizes[0], builder.cache.backing.device)
+    builder._sglang_capture_inputs = (model_runner.token_to_kv_pool.capture_slots, ids)
+    start = time.perf_counter()
+    with (
+        plugin_runtime_scope(framework="sglang", atom_config=atom_config),
+        graph_capture(),
+    ):
+        for tokens in sizes:
+            for mode in (None, "record"):
+                metadata, context = builder.build_for_token_graph_capture(tokens)
+                context.scheduled_tokens_gpu = _PREFILL_GRAPHS.scheduled_tokens(tokens)
+                _run_prefill_capture_forward(
+                    wrapper, metadata, context, ids, tr_graph=mode, in_hipgraph=True
+                )
+            torch.cuda.synchronize()
+    recorded = tuple(n for n in TokenGraph.captured_sizes("prefill") if n in set(sizes))
+    if recorded != tuple(sorted(sizes)):
+        raise RuntimeError(
+            f"DeepSeek-V4.1 prefill token graphs recorded {recorded}, not "
+            f"{sorted(sizes)}"
+        )
+    _PREFILL_GRAPHS.sizes = recorded
+    torch.cuda.empty_cache()
+    logger.info(
+        "ATOM DeepSeek-V4.1: prefill token graphs recorded for buckets %s in "
+        "%.1f s (ATOM_SGLANG_V41_PREFILL_TOKEN_GRAPHS=0 to disable)",
+        list(recorded),
+        time.perf_counter() - start,
+    )
+    return recorded
+
+
+def warm_deepseek_v41_eager_prefill(model_runner) -> int:
+    """One eager prefill at the server's chunk budget before the first
+    request, every rank at once, as native's ``ModelRunner.warmup_model``
+    (the budget's rows split over two sequences under DSpark, else one).
+    Returns the rows run, 0 when skipped.
+
+    SGLang's own start-up runs no prefill wider than the token-graph
+    buckets, so without this the first real chunk-sized EXTEND pays the
+    eager path's first-use costs at that width (kernel module loads). The
+    step is the prefill
+    capture step (`_prefill_capture_step`): reserved capture STATE slots,
+    every row on SGLang's padding PAGE 0, ``metadata.dummy`` (no slot reset,
+    Engram lookup or cursor advance), so no live state is touched."""
+    from atom.plugin.sglang.runtime.context import plugin_runtime_scope
+
+    builder = get_deepseek_v41_builder()
+    wrapper = model_runner.model
+    atom_config = wrapper.atom_config
+    tokens = _prefill_chunk_budget(builder)
+    slots = model_runner.token_to_kv_pool.capture_slots
+    count = min(2 if wrapper._v41_dspark is not None else 1, len(slots))
+    lengths = (tokens // count,) * (count - 1) + (
+        tokens - tokens // count * (count - 1),
+    )
+    ids = torch.zeros(tokens, dtype=torch.int64, device=builder.cache.backing.device)
+    start = time.perf_counter()
+    with plugin_runtime_scope(framework="sglang", atom_config=atom_config):
+        metadata, context = _prefill_capture_step(
+            builder,
+            lengths,
+            finishing=True,
+            slots=slots,
+            input_ids=ids,
+        )
+        _run_prefill_capture_forward(wrapper, metadata, context, ids)
+        torch.cuda.synchronize()
+    logger.info(
+        "ATOM DeepSeek-V4.1: eager prefill warm-up of %d rows (%s) in %.2f s "
+        "(ATOM_SGLANG_V41_PREFILL_WARMUP=0 to disable)",
+        tokens,
+        "+".join(str(n) for n in lengths),
+        time.perf_counter() - start,
+    )
+    return tokens
 
 
 # --- Decode CUDA graphs ---
@@ -1856,7 +2847,9 @@ def stage_deepseek_v41_graph_capture(forward_batch, pool):
     return metadata
 
 
-def build_v41_graph_replay_batch(fb_view, req_to_token, block_size: int, width=1):
+def build_v41_graph_replay_batch(
+    fb_view, req_to_token, block_size: int, width=1, ends=None
+):
     """ATOM's scheduled batch for the live rows of a padded graph replay of
     ``width`` rows a request (1 for a decode, 6 for a DSpark verify).
 
@@ -1870,11 +2863,16 @@ def build_v41_graph_replay_batch(fb_view, req_to_token, block_size: int, width=1
     requests: ATOM pads them itself up to the bucket width.
     """
     raw_bs = int(fb_view.batch_size) - int(fb_view.num_padding)
-    ends = np.asarray(fb_view.seq_lens_cpu[:raw_bs], dtype=np.int64)
+    if ends is None:
+        ends = fb_view.seq_lens_cpu[:raw_bs]
+    ends = np.asarray(ends, dtype=np.int64)
     slots = np.asarray(fb_view.atom_v41_req_pool_indices_cpu, dtype=np.int32)
     _refuse_shared_or_padding_slots(slots, raw_bs)
     rids = list(fb_view.atom_v41_rids)
-    rows = _HOST_ROWS.lookup(slots, rids, -(-ends // block_size))
+    widths = -(-ends // block_size)
+    rows = _HOST_ROWS.lookup(slots, rids, widths)
+    if rows is None and _VERIFY_PREFETCH.take():
+        rows = _HOST_ROWS.lookup(slots, rids, widths)
     if rows is None:
         rows = _block_rows(
             req_to_token, fb_view.req_pool_indices[:raw_bs], ends, block_size
@@ -1926,31 +2924,25 @@ def stage_deepseek_v41_verify_replay(fb_view, req_to_token):
     the accepted prefix is committed after the replay, once, from SGLang's
     ``commit_lens`` (`commit_deepseek_v41_dspark_verify`).
 
-    Lengths: the committed prefix from ``spec_info.live_seq_lens_cpu``, the
-    ends from the widened ``seq_lens_cpu``; both host mirrors.
+    Lengths: the committed prefix from ``spec_info.live_seq_lens_cpu`` and
+    the ends from the widened ``seq_lens_cpu`` (both host mirrors), or, under
+    the late host lengths, the prefix taken here from the round's deferred
+    copy and the ends that prefix plus the width (`_committed_prefix`).
     """
     builder = get_deepseek_v41_builder()
     spec_info = fb_view.spec_info
     width = int(spec_info.draft_token_num)
     bs = int(fb_view.batch_size)
     raw_bs = bs - int(fb_view.num_padding)
-    live = spec_info.live_seq_lens_cpu
-    if live is None:
-        # `seq_lens` may be SGLang's over-allocated bound here, so the prefix
-        # cannot be derived from it.
-        raise ValueError(
-            "DeepSeek-V4.1 verify replay needs the committed prefix "
-            "(spec_info.live_seq_lens_cpu)"
-        )
-    ends = _cpu_ints(fb_view.seq_lens_cpu, None, raw_bs)
-    prefix = _cpu_ints(live, None, raw_bs)
-    if np.any(prefix + width != ends):
-        raise ValueError(
-            "DeepSeek-V4.1 verify replay lengths disagree: "
-            f"prefix={prefix.tolist()} width={width} seq_lens={ends.tolist()}"
-        )
+    _, ends = _committed_prefix(
+        spec_info,
+        _cpu_ints(fb_view.seq_lens_cpu, None, raw_bs),
+        raw_bs,
+        width,
+        fb_view.atom_v41_req_pool_indices_cpu,
+    )
     batch = build_v41_graph_replay_batch(
-        fb_view, req_to_token, builder.block_size, width=width
+        fb_view, req_to_token, builder.block_size, width=width, ends=ends
     )
     metadata, _ = builder._prepare(
         batch, bs, bs * width, max_q_len=width, tentative=True
@@ -2004,6 +2996,16 @@ def commit_deepseek_v41_dspark_verify(
     anchors = dspark_commit_anchors(commit_lens, verify_width).to(
         step.cu_seqlens_q.device
     )
+    if cache.pending.staged_on_device:
+        # A verify staged on the device (every graph replay) commits from
+        # device rows alone: no host source of the cache's publication is
+        # read, so the epoch its preparation sealed stays sealed, and the
+        # cache's reuse event stays where that preparation recorded it --
+        # before the verify. Resumed, `finish` would re-record it after the
+        # verify, and the next forward's `begin` (an arriving EXTEND's
+        # staging) would wait for the whole verify graph.
+        cache.commit_tentative(step, anchors)
+        return
     # Host-staged Engram prefixes were written in the epoch the verify's
     # preparation sealed; their H2D copy happens here, in that same epoch.
     with _v41_publication_epoch(cache._sglang_h2d_owner, resume=True):

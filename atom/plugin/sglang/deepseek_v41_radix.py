@@ -94,6 +94,18 @@ PAGE rows (``deepseek_v41_bridge.HostPageRows``) stay valid: a radix checkpoint
 rewrites a live request's row in place, so every
 ``UnifiedRadixCache.checkpoint_into_tree`` drops that slot's host copy
 (``_install_checkpoint_invalidation``), and the next decode reads it again.
+The same invalidation keeps an EXTEND's rows copied at its allocation
+(``deepseek_v41_bridge.ExtendRowRead``) valid under radix: the copy holds the
+hit's prefix pages (``alloc_for_extend`` writes them with the extend's own)
+and is refused if a checkpoint rewrote one of its rows after it was queued.
+
+Prefill token graphs (``deepseek_v41_bridge.prefill_token_graph_bucket``): a
+fused step pads to the bucket holding its widened rows, as native pads a
+replaying prefill: every launch outside the model's eager regions is sized by
+the token count alone, and the replay itself (slot reset at ``P - R``, no
+global write below ``P``, Engram history) is staged metadata the eager
+attention / Engram regions read. ``trim_output`` selects SGLang's rows out of
+the bucket.
 
 Refused while radix is on (``deepseek_v41_bridge``): mixed chunk (the seam
 serves EXTEND batches only), session radix cache, KV storage backends
