@@ -222,7 +222,7 @@ def reassign_gathered_shared_ids(layer, topk_ids: torch.Tensor) -> None:
 
 # Rows per CU up to which `triton_topk_softmax` is faster than AITER's
 # `topk_softmax`, measured per architecture; others run AITER.
-TRITON_TOPK_SOFTMAX_MAX_ROWS_PER_CU = {"gfx950": 20}
+TRITON_TOPK_SOFTMAX_MAX_ROWS_PER_CU = {"gfx950": 20, "gfx1250": 64}
 
 
 @lru_cache
