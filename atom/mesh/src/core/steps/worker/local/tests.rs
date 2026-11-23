@@ -270,7 +270,10 @@ async fn render(ctx: &AppContext, model: &str, kwargs: Value) -> String {
 
 #[tokio::test]
 async fn an_atom_worker_registers_as_atom_with_its_model_info_labels() {
-    let info = model_info("atom-labels", "label: {{ messages[0].content }}", "{}");
+    let info = GetModelInfoResponse {
+        usage_on_finish: true,
+        ..model_info("atom-labels", "label: {{ messages[0].content }}", "{}")
+    };
     let url = serve_atom(info, 1).await;
     let ctx = context();
     register(&ctx, json!({ "url": url })).await.unwrap();
@@ -287,6 +290,7 @@ async fn an_atom_worker_registers_as_atom_with_its_model_info_labels() {
         ("eos_token_ids", "[2,7]"),
         ("chat_template", "label: {{ messages[0].content }}"),
         ("default_chat_template_kwargs_json", "{}"),
+        ("usage_on_finish", "true"),
     ] {
         assert_eq!(labels.get(key).map(String::as_str), Some(value), "{key}");
     }
