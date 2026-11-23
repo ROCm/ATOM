@@ -1,7 +1,7 @@
 //! Aggregate a `TokenHandle<TokenChunk>` into a non-streaming
 //! `ChatCompletionResponse`.
 
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
@@ -13,17 +13,22 @@ use crate::{
         chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse},
         common::{FunctionCallResponse, ToolCall, ToolChoice, ToolChoiceValue, Usage},
     },
-    reasoning_parser::ParserFactory as ReasoningParserFactory,
+    reasoning_parser::{ParserFactory as ReasoningParserFactory, ParserResult},
     routers::{
         comm::error,
         prepare::{
-            parser_factory_lookup::{check_reasoning_parser_availability, get_reasoning_parser},
+            parser_factory_lookup::{
+                check_reasoning_parser_availability, create_reasoning_parser, get_reasoning_parser,
+            },
             response_context::{ProtocolRequest, ResponseContext},
             tool_constraints::{
                 generate_tool_call_id, get_history_tool_calls_count, parse_json_schema_response,
             },
         },
-        render::{logprob_conversion::token_logprobs_to_chat, with_cached_tokens},
+        render::{
+            atom_usage::{self, AtomUsage},
+            logprob_conversion::token_logprobs_to_chat,
+        },
         token_handle::{
             engine_error::EngineError,
             token_chunk::{FinishReason, MatchedStop, TokenChunk},
@@ -41,13 +46,13 @@ use crate::{
 };
 
 pub async fn process(stream: TokenHandle, ctx: ResponseContext) -> Response {
-    let (resp, cached_tokens) = match aggregate(stream, ctx).await {
-        Ok(answer) => answer,
-        Err(resp) => return resp,
-    };
-    match with_cached_tokens(&resp, cached_tokens) {
-        Ok(body) => axum::Json(body).into_response(),
-        Err(e) => error::internal_error("serialization_failed", e.to_string()),
+    match aggregate(stream, ctx).await {
+        Ok((resp, None)) => axum::Json(resp).into_response(),
+        Ok((resp, Some(atom))) => match atom.extend_response(&resp, atom_usage::CHAT) {
+            Ok(value) => axum::Json(value).into_response(),
+            Err(e) => error::internal_error("serialization_failed", e.to_string()),
+        },
+        Err(resp) => resp,
     }
 }
 
@@ -58,11 +63,11 @@ pub async fn process_typed(
     Ok(aggregate(stream, ctx).await?.0)
 }
 
-/// The response and the prompt tokens its completes report cached.
+/// The response, and ATOM's usage additions where an ATOM worker answered.
 async fn aggregate(
     stream: TokenHandle,
     ctx: ResponseContext,
-) -> Result<(ChatCompletionResponse, u32), Response> {
+) -> Result<(ChatCompletionResponse, Option<AtomUsage>), Response> {
     let chat_request = match &ctx.original {
         ProtocolRequest::Chat(r) => Arc::clone(r),
         ProtocolRequest::Generate(_) => {
@@ -130,6 +135,8 @@ async fn aggregate(
             ctx.reasoning_parser_factory.as_ref(),
             ctx.configured_tool_parser.as_deref(),
             ctx.configured_reasoning_parser.as_deref(),
+            ctx.prompt_opener.as_deref(),
+            ctx.reads_as_atom,
         )
         .await;
         match res {
@@ -148,18 +155,17 @@ async fn aggregate(
         _ => None,
     });
 
-    let (usage, cached_tokens) = build_usage(&completes);
     let response = ChatCompletionResponse::builder(
         &ctx.request_id,
         ctx.model_id.as_deref().unwrap_or(&chat_request.model),
     )
     .created(ctx.created)
     .choices(choices)
-    .usage(usage)
+    .usage(build_usage(&completes))
     .maybe_system_fingerprint(weight_version)
     .build();
 
-    Ok((response, cached_tokens))
+    Ok((response, AtomUsage::of_completes(&completes)))
 }
 
 async fn collect_completes(mut stream: TokenHandle) -> Result<Vec<TokenChunk>, Response> {
@@ -189,6 +195,8 @@ async fn process_choice(
     reasoning_parser_factory: Option<&ReasoningParserFactory>,
     configured_tool_parser: Option<&str>,
     configured_reasoning_parser: Option<&str>,
+    prompt_opener: Option<&str>,
+    reads_as_atom: bool,
 ) -> Result<ChatChoice, String> {
     let (token_ids, finish_reason, matched_stop, logprobs) = match complete {
         TokenChunk::Complete {
@@ -206,12 +214,13 @@ async fn process_choice(
         .process_tokens(token_ids)
         .map_err(|e| format!("Failed to process tokens: {}", e))?;
 
-    let mut final_text = String::new();
+    // The decoded pieces, as a streamed reply would carry them.
+    let mut pieces = Vec::new();
     for output in outputs {
         match output {
-            SequenceDecoderOutput::Text(t) => final_text.push_str(&t),
+            SequenceDecoderOutput::Text(t) => pieces.push(t),
             SequenceDecoderOutput::StoppedWithText(t) => {
-                final_text.push_str(&t);
+                pieces.push(t);
                 break;
             }
             SequenceDecoderOutput::Stopped => break,
@@ -219,26 +228,29 @@ async fn process_choice(
         }
     }
     if let SequenceDecoderOutput::Text(t) = stop_decoder.flush() {
-        final_text.push_str(&t);
+        pieces.push(t);
     }
+    let final_text = pieces.concat();
 
     let mut reasoning_text: Option<String> = None;
     let mut processed_text = final_text;
 
     if reasoning_available {
         if let Some(factory) = reasoning_parser_factory {
-            let pooled =
-                get_reasoning_parser(factory, configured_reasoning_parser, &chat_request.model);
-            let mut parser = pooled.lock().await;
-            match parser.detect_and_parse_reasoning(&processed_text) {
-                Ok(result) => {
-                    if !result.reasoning_text.is_empty() {
-                        reasoning_text = Some(result.reasoning_text);
-                    }
-                    processed_text = result.normal_text;
-                }
-                Err(e) => return Err(format!("Reasoning parsing error: {}", e)),
+            let result = split_reasoning(
+                factory,
+                configured_reasoning_parser,
+                &chat_request.model,
+                &pieces,
+                &processed_text,
+                prompt_opener,
+            )
+            .await
+            .map_err(|e| format!("Reasoning parsing error: {}", e))?;
+            if !result.reasoning_text.is_empty() {
+                reasoning_text = Some(result.reasoning_text);
             }
+            processed_text = result.normal_text;
         }
     }
 
@@ -249,12 +261,14 @@ async fn process_choice(
     );
 
     if tool_choice_enabled && chat_request.tools.is_some() {
-        let used_json_schema = match &chat_request.tool_choice {
-            Some(ToolChoice::Function { .. }) => true,
-            Some(ToolChoice::Value(ToolChoiceValue::Required)) => true,
-            Some(ToolChoice::AllowedTools { mode, .. }) => mode == "required",
-            _ => false,
-        };
+        // ATOM derives a forced choice's format itself: the model's own tool syntax.
+        let used_json_schema = !reads_as_atom
+            && match &chat_request.tool_choice {
+                Some(ToolChoice::Function { .. }) => true,
+                Some(ToolChoice::Value(ToolChoiceValue::Required)) => true,
+                Some(ToolChoice::AllowedTools { mode, .. }) => mode == "required",
+                _ => false,
+            };
 
         if used_json_schema {
             (tool_calls, processed_text) = parse_json_schema_response(
@@ -295,8 +309,8 @@ async fn process_choice(
         index,
         message: ChatCompletionMessage {
             role: "assistant".to_string(),
-            // "" when empty, as ATOM's HTTP chat answers; None would leave the key out.
-            content: Some(processed_text),
+            // ATOM's HTTP chat answers "" when empty; None leaves the key out.
+            content: (reads_as_atom || !processed_text.is_empty()).then_some(processed_text),
             tool_calls,
             reasoning_content: reasoning_text,
         },
@@ -305,6 +319,59 @@ async fn process_choice(
         matched_stop: matched_stop_value,
         hidden_states: None,
     })
+}
+
+/// Every reasoning parser's `max_buffer_size`: `detect_and_parse_reasoning`
+/// refuses a longer text outright.
+const ONE_SHOT_MAX_BYTES: usize = 65536;
+
+/// A whole reply (`text`, decoded as `pieces`) split into content and reasoning, the
+/// prompt's `opener` read first; one over the one-shot limit is parsed piece by piece.
+async fn split_reasoning(
+    factory: &ReasoningParserFactory,
+    configured: Option<&str>,
+    model: &str,
+    pieces: &[String],
+    text: &str,
+    opener: Option<&str>,
+) -> Result<ParserResult, String> {
+    let opened: Cow<str> = match opener {
+        Some(opener) => format!("{opener}{text}").into(),
+        None => text.into(),
+    };
+    if opened.len() <= ONE_SHOT_MAX_BYTES {
+        let pooled = get_reasoning_parser(factory, configured, model);
+        let mut parser = pooled.lock().await;
+        return parser
+            .detect_and_parse_reasoning(&opened)
+            .map_err(|e| e.to_string());
+    }
+    let Some(mut parser) = create_reasoning_parser(factory, configured, model) else {
+        return Ok(ParserResult::normal(text.to_string()));
+    };
+    let (mut normal, mut reasoning, mut entered) = (String::new(), String::new(), false);
+    for piece in opener.into_iter().chain(pieces.iter().map(String::as_str)) {
+        let result = parser
+            .parse_reasoning_streaming_incremental(piece)
+            .map_err(|e| e.to_string())?;
+        entered |= parser.is_in_reasoning() || !result.reasoning_text.is_empty();
+        normal.push_str(&result.normal_text);
+        reasoning.push_str(&result.reasoning_text);
+    }
+    if !entered {
+        // The one-shot parse hands back a reply without reasoning untouched.
+        return Ok(ParserResult::normal(text.to_string()));
+    }
+    // It trims the text after the opener, and then what follows the closer.
+    let reasoning = if parser.is_in_reasoning() {
+        reasoning.trim()
+    } else {
+        reasoning.trim_start()
+    };
+    Ok(ParserResult::new(
+        normal.trim().to_string(),
+        reasoning.to_string(),
+    ))
 }
 
 async fn parse_tool_calls(
@@ -350,25 +417,21 @@ async fn parse_tool_calls(
     }
 }
 
-/// The completes' usage, and the prompt tokens they report cached, which `Usage` cannot hold.
-fn build_usage(completes: &[TokenChunk]) -> (Usage, u32) {
+fn build_usage(completes: &[TokenChunk]) -> Usage {
     let mut prompt = 0u32;
     let mut completion = 0u32;
-    let mut cached = 0u32;
     for c in completes {
-        if let TokenChunk::Complete { usage, meta, .. } = c {
+        if let TokenChunk::Complete { usage, .. } = c {
             prompt += usage.prompt_tokens;
             completion += usage.completion_tokens;
-            cached += meta.cached_tokens;
         }
     }
-    let usage = Usage {
+    Usage {
         prompt_tokens: prompt,
         completion_tokens: completion,
         total_tokens: prompt + completion,
         completion_tokens_details: None,
-    };
-    (usage, cached)
+    }
 }
 
 fn finish_reason_to_str(r: &FinishReason) -> &'static str {
@@ -408,5 +471,59 @@ fn engine_error_to_response(err: EngineError) -> Response {
         EngineError::Http { status, message } => {
             error::create_error(status, "engine_error", message)
         }
+    }
+}
+
+#[cfg(test)]
+mod split_reasoning_tests {
+    use super::*;
+
+    /// A reply as the detokenizer hands it over: text a few bytes at a time,
+    /// a special token (`</think>`) whole.
+    fn pieces(parts: &[&str]) -> Vec<String> {
+        parts
+            .iter()
+            .flat_map(|part| {
+                if part.starts_with('<') {
+                    vec![part.to_string()]
+                } else {
+                    part.as_bytes()
+                        .chunks(7)
+                        .map(|c| String::from_utf8(c.to_vec()).unwrap())
+                        .collect()
+                }
+            })
+            .collect()
+    }
+
+    async fn split(parts: &[&str], opener: Option<&str>) -> ParserResult {
+        let factory = ReasoningParserFactory::new();
+        let text = parts.concat();
+        split_reasoning(&factory, Some("qwen3"), "m", &pieces(parts), &text, opener)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_reply_over_the_one_shot_limit_splits_as_a_short_one_does() {
+        for len in [100, ONE_SHOT_MAX_BYTES + 1000] {
+            let thought = "x".repeat(len);
+            let result = split(&["<think>", &thought, "</think>", "The answer."], None).await;
+            assert_eq!(result.reasoning_text, thought, "len {len}");
+            assert_eq!(result.normal_text, "The answer.", "len {len}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_prompt_that_opened_reasoning_has_its_opener_read_first() {
+        for len in [100, ONE_SHOT_MAX_BYTES + 1000] {
+            let thought = "y".repeat(len);
+            let result = split(&[&thought, "</think>", "Done."], Some("<think>")).await;
+            assert_eq!(result.reasoning_text, thought, "len {len}");
+            assert_eq!(result.normal_text, "Done.", "len {len}");
+        }
+        // Without the opener the same reply has no reasoning to find.
+        let result = split(&["plain", "</think>", "Done."], None).await;
+        assert!(result.reasoning_text.is_empty());
     }
 }

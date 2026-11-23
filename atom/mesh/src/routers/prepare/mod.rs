@@ -13,7 +13,7 @@ use crate::{
     app_context::AppContext,
     core::{worker::RuntimeType, Worker},
     protocols::{
-        chat::{ChatCompletionRequest, ChatMessage},
+        chat::ChatCompletionRequest,
         common::{InputIds, StringOrArray},
         generate::GenerateRequest,
     },
@@ -24,6 +24,7 @@ use crate::{
 pub(crate) mod chat_template;
 pub(crate) mod fast_tokenizer;
 pub mod generation_payload;
+pub mod message_tools;
 pub(crate) mod parser_factory_lookup;
 pub mod response_context;
 pub(crate) mod stop_decoder_builder;
@@ -40,6 +41,7 @@ use chat_template::{
 use generation_payload::{
     GenerationPayload, LogprobConfig, SamplingParams, StopConfig, StructuredOutput,
 };
+use message_tools::MessageTools;
 use response_context::{ProtocolRequest, ResponseContext};
 use stop_decoder_builder::create_stop_decoder;
 use tool_constraints::{filter_chat_request_by_tool_choice, generate_tool_constraints};
@@ -75,6 +77,18 @@ pub fn prepare_chat(
     model_id: Option<String>,
     components: &AppContext,
 ) -> Result<(GenerationPayload, ResponseContext), Response> {
+    prepare_chat_declaring(req, None, headers, model_id, components)
+}
+
+/// `prepare_chat`, with the tools its messages declare read from its raw body
+/// (`MessageTools::read`); without them, the typed request's.
+pub fn prepare_chat_declaring(
+    req: Arc<ChatCompletionRequest>,
+    message_tools: Option<MessageTools>,
+    headers: Option<HeaderMap>,
+    model_id: Option<String>,
+    components: &AppContext,
+) -> Result<(GenerationPayload, ResponseContext), Response> {
     let model_id_str = model_id.as_deref().ok_or_else(|| {
         error!("model_id not set");
         error::internal_error("model_id_not_set", "model_id not set in request")
@@ -97,10 +111,22 @@ pub fn prepare_chat(
         .map_err(|e| error::internal_error("invalid_default_template_kwargs", e))?;
 
     let body_ref = filter_chat_request_by_tool_choice(&req);
+    let atom = workers
+        .iter()
+        .any(|worker| worker.metadata().runtime_type == RuntimeType::Atom);
+    // Only ATOM reads the tools a message declares.
+    let message_tools = atom
+        .then(|| message_tools.unwrap_or_else(|| MessageTools::of(&req)))
+        .filter(|declared| !declared.is_empty());
 
     let template_kwargs = merged_template_kwargs(&body_ref, default_kwargs.as_ref());
     let processed = staged("template", || {
-        process_chat_messages_with_kwargs(&body_ref, &*tokenizer, &template_kwargs)
+        process_chat_messages_with_kwargs(
+            &body_ref,
+            &*tokenizer,
+            &template_kwargs,
+            message_tools.as_ref(),
+        )
     })
     .map_err(|e| error::bad_request("process_messages_failed", e))?;
 
@@ -115,11 +141,18 @@ pub fn prepare_chat(
         None
     };
 
-    let atom = workers
-        .iter()
-        .any(|worker| worker.metadata().runtime_type == RuntimeType::Atom);
+    let prompt_opener = if atom {
+        let markers = reasoning_open_markers(&workers)
+            .map_err(|e| error::internal_error("invalid_structured_output", e))?;
+        response_context::prompt_opener(&processed.text, &markers)
+    } else {
+        None
+    };
     let structured_output = atom
-        .then(|| structured_output(&req, &processed.text, &template_kwargs, &workers))
+        .then(|| {
+            let opens = prompt_opener.is_some();
+            structured_output(&req, message_tools.as_ref(), &template_kwargs, opens)
+        })
         .transpose()
         .map_err(|e| error::internal_error("invalid_structured_output", e))?;
 
@@ -147,8 +180,16 @@ pub fn prepare_chat(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    // The reply's tool calls are read against every tool the chat declares.
+    let rendered_for = match &message_tools {
+        Some(declared) => Arc::new(ChatCompletionRequest {
+            tools: Some(declared.with_top_level(req.tools.as_ref())),
+            ..(*req).clone()
+        }),
+        None => Arc::clone(&req),
+    };
     let ctx = ResponseContext {
-        original: ProtocolRequest::Chat(Arc::clone(&req)),
+        original: ProtocolRequest::Chat(rendered_for),
         model_id,
         headers,
         original_text: Some(processed.text.clone()),
@@ -161,6 +202,8 @@ pub fn prepare_chat(
         reasoning_parser_factory: components.reasoning_parser_factory.clone(),
         configured_tool_parser: components.configured_tool_parser.clone(),
         configured_reasoning_parser: components.configured_reasoning_parser.clone(),
+        prompt_opener,
+        reads_as_atom: false,
     };
 
     Ok((payload, ctx))
@@ -216,6 +259,8 @@ pub fn prepare_generate(
         reasoning_parser_factory: components.reasoning_parser_factory.clone(),
         configured_tool_parser: components.configured_tool_parser.clone(),
         configured_reasoning_parser: components.configured_reasoning_parser.clone(),
+        prompt_opener: None,
+        reads_as_atom: false,
     };
 
     Ok((payload, ctx))
@@ -304,15 +349,9 @@ pub(crate) fn build_chat_payload(
     }
 }
 
-/// What an ATOM worker's chat route derives `req`'s structured output from: its fields
-/// as sent, the `kwargs` that rendered `text`, and whether `text` opens reasoning.
-fn structured_output(
-    req: &ChatCompletionRequest,
-    text: &str,
-    kwargs: &HashMap<String, Value>,
-    workers: &[Arc<dyn Worker>],
-) -> Result<StructuredOutput, String> {
-    let markers: Vec<String> = workers
+/// The markers an ATOM worker of the model lists as opening reasoning; none if none does.
+fn reasoning_open_markers(workers: &[Arc<dyn Worker>]) -> Result<Vec<String>, String> {
+    Ok(workers
         .iter()
         .find_map(|worker| worker.metadata().labels.get(REASONING_OPEN_MARKERS_LABEL))
         .map(|json| {
@@ -320,30 +359,26 @@ fn structured_output(
                 .map_err(|e| format!("Invalid {REASONING_OPEN_MARKERS_LABEL} label {json}: {e}"))
         })
         .transpose()?
-        .unwrap_or_default();
-    // atomesh's ChatMessage keeps a message's own tools on a developer message only.
-    let message_tools: Vec<_> = req
-        .messages
-        .iter()
-        .map(|message| match message {
-            ChatMessage::Developer { tools, .. } => tools.as_ref(),
-            _ => None,
-        })
-        .collect();
-    let prompt = text.trim_end();
+        .unwrap_or_default())
+}
+
+/// What an ATOM worker's chat route derives `req`'s structured output from: its fields
+/// as sent, the `kwargs` its prompt rendered with, and whether that prompt opens reasoning.
+fn structured_output(
+    req: &ChatCompletionRequest,
+    message_tools: Option<&MessageTools>,
+    kwargs: &HashMap<String, Value>,
+    prompt_opens_reasoning: bool,
+) -> Result<StructuredOutput, String> {
     Ok(StructuredOutput {
         tools_json: req.tools.as_ref().map(to_json).transpose()?,
         tool_choice_json: req.tool_choice.as_ref().map(to_json).transpose()?,
         response_format_json: req.response_format.as_ref().map(to_json).transpose()?,
         message_tools_json: message_tools
-            .iter()
-            .any(Option::is_some)
-            .then(|| to_json(&message_tools))
+            .map(|declared| to_json(declared.0.as_ref()))
             .transpose()?,
         chat_template_kwargs_json: to_json(kwargs)?,
-        prompt_opens_reasoning: markers
-            .iter()
-            .any(|marker| prompt.ends_with(marker.as_str())),
+        prompt_opens_reasoning,
     })
 }
 

@@ -805,6 +805,15 @@ mod h_completion_adapter {
         completion_to_generate, wrap_generate_response_as_completion,
         wrap_streaming_generate_as_completion,
     };
+    use crate::routers::prepare::response_context::{ProtocolRequest, ResponseContext};
+    use crate::routers::prepare::stop_decoder_builder::create_stop_decoder;
+    use crate::routers::render::generate_aggregator;
+    use crate::routers::token_handle::test_support::synthetic_single_stream;
+    use crate::routers::token_handle::token_chunk::{
+        FinishReason, SeqTiming, TokenChunk, Usage, WorkerMeta,
+    };
+    use crate::tokenizer::{traits::Tokenizer, MockTokenizer};
+    use std::sync::Arc;
 
     fn minimal_completion_request() -> CompletionRequest {
         serde_json::from_value(json!({
@@ -1570,6 +1579,90 @@ mod h_completion_adapter {
         let total = usage["total_tokens"].as_u64().unwrap();
         assert_eq!(total, prompt + compl);
     }
+
+    /// The `/generate` body the aggregator answers `completes` with, as an upstream response.
+    async fn generated(completes: Vec<TokenChunk>) -> Response {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+        let req: crate::protocols::generate::GenerateRequest =
+            serde_json::from_str(r#"{"text": "hi"}"#).unwrap();
+        let ctx = ResponseContext {
+            original: ProtocolRequest::Generate(Arc::new(req)),
+            model_id: Some("m".to_string()),
+            headers: None,
+            original_text: Some("hi".to_string()),
+            processed_messages: None,
+            stop_decoder: create_stop_decoder(&tokenizer, None, None, true, false),
+            tokenizer,
+            request_id: "cmpl-1".to_string(),
+            created: 0,
+            tool_parser_factory: None,
+            reasoning_parser_factory: None,
+            configured_tool_parser: None,
+            configured_reasoning_parser: None,
+            prompt_opener: None,
+            reads_as_atom: false,
+        };
+        let stream = synthetic_single_stream(completes.into_iter().map(Ok).collect());
+        generate_aggregator::process(stream, ctx).await
+    }
+
+    fn sibling(timing: Option<SeqTiming>) -> TokenChunk {
+        TokenChunk::Complete {
+            token_ids: vec![1],
+            finish_reason: FinishReason::Stop,
+            matched_stop: None,
+            usage: Usage {
+                prompt_tokens: 3,
+                completion_tokens: 1,
+                total_tokens: 4,
+            },
+            logprobs: None,
+            input_logprobs: None,
+            meta: WorkerMeta {
+                cached_tokens: 2,
+                timing,
+                ..Default::default()
+            },
+        }
+    }
+
+    async fn completion_usage(completes: Vec<TokenChunk>) -> Value {
+        let upstream = generated(completes).await;
+        let resp = wrap_generate_response_as_completion(upstream, "m".into()).await;
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        serde_json::from_slice::<Value>(&body).unwrap()["usage"].clone()
+    }
+
+    #[tokio::test]
+    async fn an_atom_completion_reports_its_timing_once_per_request() {
+        let timed = |ttft_s, latency_s| {
+            Some(SeqTiming {
+                ttft_s,
+                tpot_s: 0.01,
+                latency_s,
+            })
+        };
+        let usage = completion_usage(vec![sibling(timed(0.1, 1.0))]).await;
+        let expected = json!({
+            "prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4,
+            "ttft_s": 0.1, "tpot_s": 0.01, "latency_s": 1.0,
+        });
+        assert_eq!(usage, expected);
+
+        // n=2: the prompt once, the slowest sibling's timing, and n.
+        let usage =
+            completion_usage(vec![sibling(timed(0.1, 2.0)), sibling(timed(0.3, 1.0))]).await;
+        let expected = json!({
+            "prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5,
+            "ttft_s": 0.3, "tpot_s": 0.01, "latency_s": 2.0, "num_choices": 2,
+        });
+        assert_eq!(usage, expected);
+
+        // An SGLang or vLLM completion keeps its usage.
+        let usage = completion_usage(vec![sibling(None)]).await;
+        let expected = json!({"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4});
+        assert_eq!(usage, expected);
+    }
 }
 
 mod i_atom_refusals {
@@ -1581,12 +1674,15 @@ mod i_atom_refusals {
 
     use crate::app_context::AppContext;
     use crate::config::RouterConfig;
+    use crate::core::placement::types::PlacementPlan;
     use crate::core::prepare_pool::PreparePoolRuntime;
     use crate::core::{BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType};
     use crate::observability::metrics::metrics_labels;
     use crate::routers::comm::error::extract_error_code_from_response;
+    use crate::routers::grpc::engine::{atom::request::generate_request, Dispatcher};
     use crate::routers::grpc::{pd_router::GrpcPDRouter, pipeline::Pipeline, router::GrpcRouter};
     use crate::routers::ingress::InferenceEnvelope;
+    use crate::routers::prepare::generation_payload::GenerationPayload;
     use crate::routers::test_mocks::{self, hf_tokenizer, MockDispatcher, MockPdPlanner};
     use crate::routers::token_handle::engine_error::EngineError;
     use crate::routers::token_handle::test_support::synthetic_single_stream;
@@ -1594,12 +1690,14 @@ mod i_atom_refusals {
     use crate::routers::token_handle::token_handle::TokenHandle;
     use crate::routers::RouterTrait;
     use crate::tokenizer::registry::TokenizerRegistry;
+    use crate::tokenizer::traits::Tokenizer;
 
     type Answer = (StatusCode, &'static str); // a status and its error code
     const SERVED: Answer = (StatusCode::OK, "");
     const MEDIA: Answer = (StatusCode::BAD_REQUEST, "unsupported_media");
     const LOGPROBS: Answer = (StatusCode::BAD_REQUEST, "unsupported_logprobs");
     const UNSUPPORTED: Answer = (StatusCode::NOT_IMPLEMENTED, "unsupported_api");
+    const MESSAGE_TOOLS: Answer = (StatusCode::BAD_REQUEST, "invalid_message_tools");
 
     fn owned((status, code): Answer) -> (StatusCode, String) {
         (status, code.to_owned())
@@ -1626,8 +1724,12 @@ mod i_atom_refusals {
         chat_logprobs["top_logprobs"] = json!(2);
         let mut generate_logprobs = generate(None);
         generate_logprobs["return_logprob"] = json!(true);
-        // ATOM's HTTP /v1/completions answers logprobs null; so does this route.
+        // ATOM's HTTP /v1/completions answers logprobs null; so does this route, past
+        // ATOM's request builder, which refuses logprobs.
         let completion_logprobs = json!({"model": "m", "prompt": "test", "logprobs": 1});
+        // The typed request drops a system message's tools; ATOM reads them from the body.
+        let system = json!({"role": "system", "content": "test", "tools": "not a list"});
+        let message_tools = json!({"model": "m", "messages": [system]});
         let responses = json!({"model": "m", "input": "test"});
         let message = json!({"role": "user", "content": "test"});
         let messages = json!({"model": "m", "max_tokens": 8, "messages": [message]});
@@ -1636,6 +1738,7 @@ mod i_atom_refusals {
             ("/v1/chat/completions", chat(vec![&text, &image]), MEDIA),
             ("/v1/chat/completions", chat(vec![&text, &video]), MEDIA),
             ("/v1/chat/completions", chat_logprobs, LOGPROBS),
+            ("/v1/chat/completions", message_tools, MESSAGE_TOOLS),
             ("/generate", generate(None), SERVED),
             ("/generate", generate(Some("image_data")), MEDIA),
             ("/generate", generate(Some("video_data")), MEDIA),
@@ -1680,6 +1783,34 @@ mod i_atom_refusals {
         Arc::new(worker)
     }
 
+    /// `MockDispatcher`'s answer to what ATOM's request builder accepts for an ATOM worker.
+    struct AtomBuilding(Arc<MockDispatcher>);
+
+    #[async_trait::async_trait]
+    impl Dispatcher for AtomBuilding {
+        async fn dispatch(
+            &self,
+            placement: &PlacementPlan,
+            payload: &mut GenerationPayload,
+        ) -> Result<TokenHandle, EngineError> {
+            self.0.dispatch(placement, payload).await
+        }
+
+        async fn dispatch_with_tokenizer(
+            &self,
+            placement: &PlacementPlan,
+            payload: &mut GenerationPayload,
+            tokenizer: &Arc<dyn Tokenizer>,
+        ) -> Result<TokenHandle, EngineError> {
+            if let PlacementPlan::Single { worker, .. } = placement {
+                if worker.metadata().runtime_type == RuntimeType::Atom {
+                    generate_request(payload, worker.as_ref(), Some(tokenizer.as_ref()))?;
+                }
+            }
+            self.0.dispatch(placement, payload).await
+        }
+    }
+
     /// Each request's status and error code through `route_inference` when one `runtime`
     /// worker serves "m" beside an ATOM worker of model "a", and how many were dispatched.
     async fn answers(runtime: RuntimeType) -> (Vec<(StatusCode, String)>, usize) {
@@ -1701,8 +1832,8 @@ mod i_atom_refusals {
             .register(worker("a", RuntimeType::Atom, WorkerType::Regular));
         let dispatcher = Arc::new(MockDispatcher::repeat_with_stream(completed));
         let planner = Arc::new(MockPdPlanner::repeat_single(served, "random"));
-        let pipeline =
-            Pipeline::with_injected(planner, dispatcher.clone(), metrics_labels::BACKEND_REGULAR);
+        let building = Arc::new(AtomBuilding(dispatcher.clone()));
+        let pipeline = Pipeline::with_injected(planner, building, metrics_labels::BACKEND_REGULAR);
         let router = GrpcRouter::with_pipeline(&ctx, pipeline);
 
         let mut answers = Vec::new();
@@ -1848,5 +1979,134 @@ mod j_atom_stops {
     async fn test_an_sglang_output_is_still_cut_at_its_stop_string() {
         let sglang = text(RuntimeType::Sglang).await;
         assert!(!sglang.contains("test"), "{sglang:?}");
+    }
+}
+
+mod k_cache_reconcile {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+
+    use crate::core::placement::traits::PdPlanner;
+    use crate::core::placement::types::{PlacementError, PlacementPlan, RequestDescriptor};
+    use crate::core::WorkerType;
+    use crate::observability::{metrics::metrics_labels, route_trace};
+    use crate::protocols::generate::GenerateRequest;
+    use crate::routers::grpc::pipeline::Pipeline;
+    use crate::routers::test_mocks::{self, mock_grpc_worker, MockDispatcher};
+    use crate::routers::token_handle::test_support::synthetic_single_stream;
+    use crate::routers::token_handle::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
+
+    /// Plans one regular worker, or a pair, and expects half the prompt cached on the
+    /// worker that computes it, as a cache-aware policy's selection records.
+    struct EstimatingPlanner {
+        pair: bool,
+    }
+
+    #[async_trait]
+    impl PdPlanner for EstimatingPlanner {
+        async fn plan(&self, _: &RequestDescriptor<'_>) -> Result<PlacementPlan, PlacementError> {
+            if !self.pair {
+                let worker = mock_grpc_worker("grpc://w:1", WorkerType::Regular);
+                route_trace::record_estimate(
+                    metrics_labels::WORKER_REGULAR,
+                    Some(&worker),
+                    Some(0.5),
+                );
+                return Ok(PlacementPlan::Single {
+                    worker,
+                    policy_name: "cache_aware",
+                });
+            }
+            let prefill = mock_grpc_worker(
+                "grpc://p:1",
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+            );
+            let decode = mock_grpc_worker("grpc://d:1", WorkerType::Decode);
+            route_trace::record_estimate(metrics_labels::WORKER_PREFILL, Some(&prefill), Some(0.5));
+            route_trace::record_estimate(metrics_labels::WORKER_DECODE, Some(&decode), Some(0.9));
+            Ok(PlacementPlan::Pair {
+                prefill,
+                decode,
+                prefill_policy: "cache_aware",
+                decode_policy: "cache_aware",
+            })
+        }
+    }
+
+    fn completed() -> TokenChunk {
+        TokenChunk::Complete {
+            token_ids: vec![1],
+            finish_reason: FinishReason::Stop,
+            matched_stop: None,
+            usage: Usage {
+                prompt_tokens: 100,
+                completion_tokens: 1,
+                total_tokens: 101,
+            },
+            logprobs: None,
+            input_logprobs: None,
+            meta: WorkerMeta {
+                cached_tokens: 40,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// The metrics a unary /generate placed by `planner` renders.
+    async fn rendered(pair: bool) -> String {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let dispatcher = MockDispatcher::repeat_with_stream(|| {
+            // n=2: the siblings' one prompt is reconciled once.
+            Ok(synthetic_single_stream(vec![
+                Ok(completed()),
+                Ok(completed()),
+            ]))
+        });
+        let pipeline = Pipeline::with_injected(
+            Arc::new(EstimatingPlanner { pair }),
+            Arc::new(dispatcher),
+            metrics_labels::BACKEND_REGULAR,
+        );
+        let registry = test_mocks::tokenizer_registry_with("m");
+        let ctx = test_mocks::app_context_with_tokenizer_registry(registry);
+        let req: GenerateRequest = serde_json::from_str(r#"{"text": "test"}"#).unwrap();
+        let response = pipeline
+            .execute_generate(Arc::new(req), None, Some("m".to_string()), ctx)
+            .await;
+        assert!(response.status().is_success());
+        axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        handle.render()
+    }
+
+    fn assert_reconciled(rendered: &str, pool: &str) {
+        for line in [
+            format!(r#"mesh_route_cache_tokens_total{{pool="{pool}",kind="prompt"}} 100"#),
+            format!(r#"mesh_route_cache_tokens_total{{pool="{pool}",kind="cached"}} 40"#),
+            format!(
+                r#"mesh_route_cache_estimate_tokens_total{{pool="{pool}",kind="estimated"}} 50"#
+            ),
+            format!(r#"mesh_route_cache_estimate_tokens_total{{pool="{pool}",kind="actual"}} 40"#),
+        ] {
+            assert!(rendered.contains(&line), "missing {line} in\n{rendered}");
+        }
+    }
+
+    #[tokio::test]
+    async fn grpc_cached_tokens_are_reconciled_against_the_estimate() {
+        assert_reconciled(&rendered(false).await, "regular");
+    }
+
+    #[tokio::test]
+    async fn grpc_pd_cached_tokens_are_reconciled_against_the_prefill_estimate() {
+        let rendered = rendered(true).await;
+        assert_reconciled(&rendered, "prefill");
+        assert!(!rendered.contains(r#"pool="decode",kind="#), "{rendered}");
     }
 }

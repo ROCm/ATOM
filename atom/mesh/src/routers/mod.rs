@@ -51,11 +51,14 @@ pub trait RouterTrait: Send + Sync + Debug {
         _app: &std::sync::Arc<crate::app_context::AppContext>,
     ) -> Response {
         use prepare::inference::ParsedInference;
-        let (uri, headers, parsed, metadata) = request.into_native_parts();
+        let (uri, headers, parsed, metadata, raw) = request.into_native_parts();
         let headers = Some(&headers);
         let model = metadata.model.as_deref();
         match parsed {
-            ParsedInference::Chat(body) => self.route_chat(headers, &body, model).await,
+            ParsedInference::Chat(body) => {
+                let raw = raw.unwrap_or_default();
+                self.route_chat_body(headers, &body, raw, model).await
+            }
             ParsedInference::Completion(body) => self.route_completion(headers, &body, model).await,
             ParsedInference::Generate(body) => self.route_generate(headers, &body, model).await,
             ParsedInference::Responses(body) => {
@@ -124,6 +127,19 @@ pub trait RouterTrait: Send + Sync + Debug {
             "Generate endpoint not implemented",
         )
             .into_response()
+    }
+
+    /// Route a chat completion request with its `raw` body, for a router that reads
+    /// fields the typed request drops; release `raw` before routing.
+    async fn route_chat_body(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        raw: bytes::Bytes,
+        model_id: Option<&str>,
+    ) -> Response {
+        drop(raw);
+        self.route_chat(headers, body, model_id).await
     }
 
     /// Route a chat completion request
