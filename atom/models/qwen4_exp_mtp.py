@@ -7,7 +7,7 @@ import json
 import os
 
 import torch
-from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from torch import nn
 
 from atom.config import Config
@@ -23,6 +23,7 @@ from atom.models.qwen4_exp import (
     Qwen4ExpForConditionalGeneration,
     _Qwen4ExpQuantizationConfig,
     _SequenceParallel,
+    moe_pad_align,
 )
 from atom.quant_spec import LayerQuantConfig
 
@@ -123,8 +124,16 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
                     quant_config=quant_config,
                     fuse_shared_expert=(
                         isinstance(quant_config, _UnquantizedMTPQuantizationConfig)
-                        and get_gfx_runtime() == "gfx942"
-                        and not atom_config.enable_expert_parallel
+                        and moe_pad_align(
+                            config.moe_intermediate_size,
+                            get_tensor_model_parallel_world_size(),
+                            quant_config.get_layer_quant_config(
+                                "mtp.layers.0.mlp.experts", check_children=True
+                            ),
+                            config=config,
+                            fuse_shared_expert=True,
+                        )
+                        == 64
                     ),
                 )
             ]

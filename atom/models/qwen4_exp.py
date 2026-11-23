@@ -11,10 +11,10 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
-from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from torch import nn
 
-from atom.config import Config
+from atom.config import Config, get_current_atom_config
 from atom.model_ops.base_attention import LinearAttention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.linear import (
@@ -51,7 +51,7 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
-from atom.quant_spec import LayerQuantConfig
+from atom.quant_spec import LayerQuantConfig, will_online_requant
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
@@ -135,8 +135,8 @@ class _Qwen4ExpQuantizationConfig:
 
 # The sigmoid-gated shared expert rides through the fused MoE as expert
 # `num_experts` (top-k + 1) and batch-1 MoE goes through
-# `moe_decode_single_token` outside the gfx942 tuned PTPC path. On gfx942,
-# BF16 MTP also fuses the shared expert and uses AITER's tuned MoE tables.
+# `moe_decode_single_token` outside the scoped gfx942 PTPC path. The same
+# customer configuration enables shared-expert fusion for BF16 MTP.
 
 
 def _is_dynamic_ptpc_fp8(policy: LayerQuantConfig) -> bool:
@@ -292,25 +292,47 @@ def moe_pad_align(
     intermediate_size: int,
     tp_size: int,
     quant: LayerQuantConfig | None = None,
+    *,
+    config=None,
+    fuse_shared_expert: bool = False,
 ) -> int | None:
-    """Use the gfx942 PTPC/BF16 tuned widths; retain the MXFP4 policy.
+    """Limit the 64-aligned layout to the validated MI308X customer setup.
+
+    This is an explicit support scope, not an AITER tuned-coverage query.
+    Callers pass a runtime policy, never a source awaiting online conversion.
+    The shared expert makes 512/top-10 into 513/top-11 for this layout.
 
     TP1 keeps Qwen3.8-Flash-Next's 640 instead of padding it to 768; other
-    shards keep the MXFP4 default (256).
+    configurations retain the existing MXFP4 alignment policy.
     """
     if (
         quant is not None
+        and config is not None
+        and tp_size in (2, 4)
+        and intermediate_size == 640
+        and config.hidden_size == 2560
+        and config.num_experts == 512
+        and config.num_experts_per_tok == 10
+        and config.shared_expert_intermediate_size == intermediate_size
+        and config.hidden_act == "silu"
+        and fuse_shared_expert
         and get_gfx_runtime() == "gfx942"
+        and get_cu_num() == 80
         and (
             (quant.quant_type == QuantType.No and quant.quant_dtype == torch.bfloat16)
             or (
                 quant.quant_method == "compressed-tensors"
-                and quant.quant_type == QuantType.per_Token
-                and quant.quant_dtype == dtypes.fp8
+                and _is_dynamic_ptpc_fp8(quant)
+                and quant.weight_block_size is None
             )
         )
     ):
-        return 64
+        atom_config = get_current_atom_config()
+        if (
+            not atom_config.enable_expert_parallel
+            and atom_config.parallel_config.data_parallel_size == 1
+        ):
+            return 64
     return 128 if (intermediate_size // tp_size) % 128 == 0 else None
 
 
@@ -336,9 +358,6 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
             if quant_config is not None
             else LayerQuantConfig(quant_dtype=torch.get_default_dtype())
         )
-        pad_align = moe_pad_align(
-            config.moe_intermediate_size, self.tp_size, expert_quant
-        )
         self.fuse_shared = (
             fuse_shared_expert
             and is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
@@ -346,6 +365,25 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
                 shared_expert_prefix=f"{prefix}.shared_expert",
                 routed_expert_prefix=f"{prefix}.experts",
             )
+        )
+        # A source awaiting online conversion is not the runtime MoE format.
+        # In particular, Fp8MoEMethod does not use this CT/PTPC padded layout.
+        runtime_quant = (
+            None
+            if will_online_requant(
+                quant_config,
+                f"{prefix}.experts",
+                expert_quant.quant_type,
+                expert_quant.quant_dtype,
+            )
+            else expert_quant
+        )
+        pad_align = moe_pad_align(
+            config.moe_intermediate_size,
+            self.tp_size,
+            runtime_quant,
+            config=config,
+            fuse_shared_expert=self.fuse_shared,
         )
         if self.tp_size > self.n_routed_experts:
             raise ValueError(

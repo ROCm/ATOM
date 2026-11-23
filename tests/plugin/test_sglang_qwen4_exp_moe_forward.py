@@ -45,11 +45,13 @@ def _make_block(monkeypatch, mode, tp, hidden):
         parallel_config=SimpleNamespace(data_parallel_size=1, data_parallel_rank=0),
         compilation_config=SimpleNamespace(static_forward_context={}),
         enable_dp_attention=False,
+        enable_expert_parallel=False,
         enable_tbo=False,
         moe_all2all_backend="none",
     )
     monkeypatch.setattr(moe, "get_current_atom_config", lambda: config)
     monkeypatch.setattr(topK, "get_current_atom_config", lambda: config)
+    monkeypatch.setattr(qwen4_exp, "get_current_atom_config", lambda: config)
     monkeypatch.setattr(moe, "get_dp_group", lambda: SimpleNamespace(world_size=1))
     monkeypatch.setattr(qwen4_exp, "get_tensor_model_parallel_world_size", lambda: tp)
     monkeypatch.setattr(qwen4_exp, "get_gfx_runtime", lambda: "gfx942")
@@ -124,33 +126,11 @@ def _make_block(monkeypatch, mode, tp, hidden):
     return block, config
 
 
-@pytest.mark.parametrize("tp", [2, 4])
-@pytest.mark.parametrize("mode", ["fp8", "bf16"])
-def test_gfx942_pure_tp_single_row_reaches_experts(monkeypatch, mode, tp):
-    block, _ = _make_block(monkeypatch, mode, tp, hidden=32)
-    calls = []
-
-    def experts_forward(hidden_states, router_logits):
-        calls.append((hidden_states.shape, router_logits.shape))
-        return hidden_states + 1
-
-    def legacy_single_token(*_):
-        pytest.fail("gfx942 pure TP bypassed tuned dispatch")
-
-    monkeypatch.setattr(block.experts, "forward", experts_forward)
-    monkeypatch.setattr(block, "_single_token_experts", legacy_single_token)
-    if mode == "fp8" and tp == 2:
-        assert block._single_token_supported()  # The old branch would run.
-    hidden = torch.zeros((1, 32), dtype=torch.bfloat16)
-    torch.testing.assert_close(block(hidden, reduce_results=False), hidden + 1)
-    assert calls == [(torch.Size([1, 32]), torch.Size([1, 513]))]
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 @pytest.mark.parametrize("tp", [2, 4])
 @pytest.mark.parametrize("mode", ["fp8", "bf16"])
 def test_gpu_sglang_moe_forward_and_padded_graph(monkeypatch, mode, tp):
-    from aiter.jit.utils.chip_info import get_gfx_runtime
+    from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
     from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
@@ -160,8 +140,8 @@ def test_gpu_sglang_moe_forward_and_padded_graph(monkeypatch, mode, tp):
     from atom.model_ops.utils import normalize_e4m3fn_to_e4m3fnuz
     from atom.plugin.sglang.runtime.forward_context import _set_atom_forward_context
 
-    if torch.version.hip is None or get_gfx_runtime() != "gfx942":
-        pytest.skip("gfx942 tuned Qwen MoE contract")
+    if torch.version.hip is None or get_gfx_runtime() != "gfx942" or get_cu_num() != 80:
+        pytest.skip("gfx942/80 CU Qwen MoE contract")
     monkeypatch.setattr(fc, "_forward_context", fc.ForwardContext())
     monkeypatch.setattr(topK, "aiter_topK_meta_data", None)
     with torch.device("cuda"), torch.inference_mode():

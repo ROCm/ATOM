@@ -27,7 +27,6 @@ def _bf16_layer(monkeypatch, rank, streaming, *, excluded=False):
     config = qwen4_exp._Qwen4ExpQuantizationConfig(config)
     source = config.get_layer_quant_config(prefix)
     monkeypatch.setenv("ATOM_ONLINE_QUANT_STREAMING", str(int(streaming)))
-    monkeypatch.setattr(qwen4_exp, "get_gfx_runtime", lambda: "gfx942")
 
     layer = object.__new__(moe.FusedMoE)
     torch.nn.Module.__init__(layer)
@@ -43,8 +42,9 @@ def _bf16_layer(monkeypatch, rank, streaming, *, excluded=False):
     layer.intermediate_size_per_partition = 160
     layer.moe_config = SimpleNamespace(in_dtype=torch.bfloat16, hidden_dim=32)
     layer.quant_method = moe.UnquantizedFusedMoEMethod(layer.moe_config)
-    layer.quant_method.pad_align = qwen4_exp.moe_pad_align(640, 4, source)
-    assert layer.quant_method.pad_align == 64
+    # Exercise the allocator's handling of an explicit padding request even
+    # when model-level policy excludes a source awaiting online conversion.
+    layer.quant_method.pad_align = 64
     layer._stream_online_quant = should_stream_online_quant(
         config, prefix, source.quant_type, layer.params_dtype
     )

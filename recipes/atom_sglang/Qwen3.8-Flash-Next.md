@@ -68,6 +68,12 @@ For the `Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16` checkpoint on gfx942, use
 BF16 MTP fuse the shared expert into slot 512, so AITER sees 513 experts
 and top-k 11. The target and draft retain their checkpoint dtypes.
 
+The 64-aligned layout and BF16 MTP fusion are limited to gfx942 with 80 CU,
+TP2/TP4, EP disabled and DP1, hidden size 2560, and routed/shared intermediate
+size 640. They require the fused 513-expert/top-k-11 layout and runtime CT
+PTPC FP8 or BF16 weights. Other configurations retain the previous policy;
+this guard does not query AITER's tuned-row coverage.
+
 The following settings use SGLang 0.5.22. Set `AITER_MODEL_CONFIGS` to the
 `aiter/configs/model_configs` directory in the AITER installation:
 
@@ -180,14 +186,14 @@ gated behind environment variables:
   combine into the next mix.
 * shared expert: routed through the fused MoE as expert 512 (top-k + 1),
   scoring with sigmoid.
-* batch-1 MoE: gfx942 PTPC uses the AITER tuned table; other supported
+* batch-1 MoE: the scoped MI308X PTPC configuration uses AITER; other supported
   layouts retain the routing/expert Triton specialization.
 * QSA indexer scoring: matrix cores for prefill, CUDA cores for decode-sized
   batches.
 
 The MTP drafter's single layer keeps separate HC `mix`/`combine` operations.
-On gfx942 its BF16 shared expert is fused into the MoE; other MTP layouts
-retain the standalone shared expert.
+For the MI308X pure TP2/TP4 configuration above, its BF16 shared expert is
+fused into the MoE; other MTP layouts retain the standalone shared expert.
 
 ## Optional: quantized prefill all-reduce (lossy)
 

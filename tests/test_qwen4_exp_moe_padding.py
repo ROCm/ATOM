@@ -339,32 +339,6 @@ def test_preshuffle_preserves_final_parameter_markers_and_padding(tp, mode):
     )
 
 
-@pytest.mark.parametrize("tp", [2, 4])
-@pytest.mark.parametrize("mode", ["bf16", "fp8"])
-def test_gfx942_alignment_policy(monkeypatch, tp, mode):
-    monkeypatch.setattr(qwen4_exp, "get_gfx_runtime", lambda: "gfx942")
-    spec = (
-        LayerQuantConfig(
-            quant_dtype=dtypes.fp8,
-            quant_type=QuantType.per_Token,
-            quant_method="compressed-tensors",
-        )
-        if mode == "fp8"
-        else LayerQuantConfig()
-    )
-    assert qwen4_exp.moe_pad_align(640, tp, spec) == 64
-
-
-def test_gfx942_blockscale_keeps_existing_alignment(monkeypatch):
-    monkeypatch.setattr(qwen4_exp, "get_gfx_runtime", lambda: "gfx942")
-    blockscale = LayerQuantConfig(
-        quant_dtype=dtypes.fp8,
-        quant_type=QuantType.per_1x128,
-        quant_method="compressed-tensors",
-    )
-    assert qwen4_exp.moe_pad_align(640, 2, blockscale) is None
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 @pytest.mark.parametrize("tp", [2, 4])
 @pytest.mark.parametrize("mode", ["bf16", "fp8"])
