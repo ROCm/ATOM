@@ -1,2 +1,4 @@
 model,scenario,concurrency,tok_s_per_gpu,source
 kimi-k3,endpoint,64,250,"zejun, 2026-11-23"
+qwen-3.8-flash,8k1k,4,8535,"zejun, 2026-11-23"
+qwen-3.8-flash,8k1k,64,35433,"zejun, 2026-11-23"
