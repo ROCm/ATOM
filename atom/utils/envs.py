@@ -164,6 +164,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the decode side scatters them into the paged KV and returns the slot.
     # 0 = staged writes only.
     "ATOM_PD_MLA_LANDING": lambda: _flag_env("ATOM_PD_MLA_LANDING", "1"),
+    # MiniMax PP/TP1 -> TP landing, independent of incremental chunk transfer.
+    "ATOM_PD_MINIMAX_LANDING": lambda: _flag_env("ATOM_PD_MINIMAX_LANDING", "0"),
     # Mooncake and MoRIIO P/D: how long a failed transfer may still land. A
     # decode holds a failed receive's KV pages this long before reporting the
     # failure; a Mooncake prefill keeps a landing slot whose write failed out
@@ -346,9 +348,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gfx95x when ATOM_USE_TRITON_GEMM is set.
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
     # Qwen3.8-Flash-Next eager prefill on SGLang-ATOM: run QSA sparse attention
-    # with aiter's FlyDSL kernel (gfx942, BF16 D256, one KV head per rank)
-    # instead of qsa_sparse_paged_gqa. Other steps keep the native kernel. On by
-    # default; 0 / false / off disables. Needs aiter with ROCm/aiter#6576.
+    # with aiter's FlyDSL kernel (BF16 D256, one KV head per rank) instead of
+    # qsa_sparse_paged_gqa, where aiter reports it runs
+    # (aiter.ops.qsa.qsa_sparse_prefill_widths()). Other steps keep the native
+    # kernel. On by default; 0 / false / off disables. qsa_attention imports
+    # aiter's queries at module level, so aiter with ROCm/aiter#8083 is needed
+    # whether the flag is on or off.
     "ATOM_QSA_FLYDSL_ATTN": lambda: _flag_env("ATOM_QSA_FLYDSL_ATTN", "1"),
     # Split the routed experts by phase: FlyDSL fused_moe on prefill, the Triton
     # /gluon GUGU kernel on decode. Needs ATOM_USE_TRITON_MOE=1 (it narrows that
@@ -1424,6 +1429,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # OFFLOAD_LOAD_WORKERS: its SLOT load path needs a serial load executor.
     "OFFLOAD_COPY_WORKERS": lambda: _int_env("OFFLOAD_COPY_WORKERS", 1),
     "OFFLOAD_LOAD_WORKERS": lambda: _int_env("OFFLOAD_LOAD_WORKERS", 1),
+    # Opt-in (default off). Mooncake Store only: renew a load's lease keys on
+    # the bounded renewal executor instead of blocking the scheduler thread.
+    "ATOM_STORE_ASYNC_RENEW": lambda: _flag_env("ATOM_STORE_ASYNC_RENEW"),
     # Running-plus-queued save bound. None means unset: the connector then
     # derives max(2, 2 * OFFLOAD_COPY_WORKERS) and the scheduler's state tier
     # uses 2. A kv_connector_extra_config "max_pending_saves" takes precedence.
