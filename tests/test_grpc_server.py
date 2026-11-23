@@ -21,7 +21,8 @@ from atom.entrypoints.grpc import server as grpc_server
 from atom.entrypoints.grpc.server import AtomEngineServicer
 from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.protocol import DEFAULT_MAX_TOKENS
-from atom.entrypoints.openai.reasoning_dialects import FALLBACK_DIALECT
+from atom.entrypoints.openai.reasoning_dialects import DIALECTS, FALLBACK_DIALECT
+from atom.entrypoints.openai.tool_parser.registry import PARSERS_BY_NAME
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.zmq_protocol import engine_v1_pb2 as v1
 
@@ -500,6 +501,53 @@ def test_model_info_leaves_an_absent_chat_template_unset(serve, monkeypatch):
     monkeypatch.setattr(api_server, "tokenizer", SimpleNamespace(chat_template=None))
     info = asyncio.run(servicer.GetModelInfo(pb.GetModelInfoRequest(), None))
     assert not info.HasField("chat_template") and list(info.eos_token_ids) == [2]
+
+
+@pytest.mark.parametrize(
+    "atom_parser, router_parser",
+    [
+        ("dsml_v41", "dsml_v41"),
+        ("kimi", "kimik2"),
+        ("qwen", "qwen_xml"),
+        ("minimax", "minimax"),
+        ("glm", None),  # atomesh's model-name mapping tells GLM's dialects apart
+        (None, None),
+    ],
+)
+def test_router_tool_call_parser_names_atoms_format(atom_parser, router_parser):
+    parser_cls = PARSERS_BY_NAME.get(atom_parser)
+    names = grpc_server.router_parser_names(parser_cls, FALLBACK_DIALECT)
+    assert names == (router_parser, "qwen3")
+
+
+@pytest.mark.parametrize(
+    "dialect, router_parser",
+    [
+        (FALLBACK_DIALECT, "qwen3"),  # <think>: starts outside reasoning
+        (DIALECTS[1], None),  # MiniMax-M3's <mm:think>
+        (DIALECTS[0], None),  # Kimi-K3's channels
+        (None, None),
+    ],
+)
+def test_router_reasoning_parser_is_qwen3_only_for_the_think_dialect(
+    dialect, router_parser
+):
+    assert grpc_server.router_parser_names(None, dialect) == (None, router_parser)
+
+
+def test_model_info_names_the_router_parsers(serve, monkeypatch):
+    engine = FakeEngine()
+    engine.config.end_token_ids = [2]
+    monkeypatch.setattr(api_server, "tokenizer", SimpleNamespace(chat_template=None))
+    monkeypatch.setattr(api_server, "tool_call_parser_cls", PARSERS_BY_NAME["dsml_v41"])
+    monkeypatch.setattr(api_server, "reasoning_dialect", FALLBACK_DIALECT)
+    info = asyncio.run(serve(engine).GetModelInfo(pb.GetModelInfoRequest(), None))
+    assert (info.tool_call_parser, info.reasoning_parser) == ("dsml_v41", "qwen3")
+    monkeypatch.setattr(api_server, "tool_call_parser_cls", None)
+    monkeypatch.setattr(api_server, "reasoning_dialect", DIALECTS[1])
+    info = asyncio.run(serve(engine).GetModelInfo(pb.GetModelInfoRequest(), None))
+    assert not info.HasField("tool_call_parser")
+    assert not info.HasField("reasoning_parser")
 
 
 def test_server_info_carries_the_kv_event_sources_body(serve, monkeypatch):

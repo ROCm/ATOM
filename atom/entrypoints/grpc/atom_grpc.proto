@@ -113,6 +113,10 @@ message GetModelInfoResponse {
   // A rendered prompt ending in one of these, trailing whitespace aside, opens
   // a reasoning channel.
   repeated string reasoning_open_markers = 8;
+  // atomesh's parsers for this model's tool-call and reasoning formats, named by
+  // server.py's router_parser_names; absent: atomesh's model-name mapping chooses.
+  optional string tool_call_parser = 9;
+  optional string reasoning_parser = 10;
 }
 
 message GetServerInfoRequest {}

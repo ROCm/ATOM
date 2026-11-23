@@ -33,6 +33,7 @@ from atom.entrypoints.openai.protocol import (
     validate_max_tokens,
 )
 from atom.entrypoints.openai.reasoning import _REASONING_OPEN_MARKERS
+from atom.entrypoints.openai.reasoning_dialects import THINK_END_MARKER
 from atom.entrypoints.openai.serving_chat import (
     normalize_chat_tools,
     request_tools,
@@ -64,6 +65,17 @@ UNSERVED_FIELDS = {
     "logprobs_count",
     "top_logprobs",
     *STRUCTURED_FIELDS,
+}
+# ATOM's tool-call formats by atomesh's name for the same syntax. ATOM's `qwen` is the
+# XML one, atomesh's `qwen_xml`; GLM's two dialects are one ATOM parser, so atomesh's
+# model-name mapping picks GLM's.
+ROUTER_TOOL_CALL_PARSERS = {
+    "dsml": "dsml",
+    "dsml_v41": "dsml_v41",
+    "kimi": "kimik2",
+    "kimi_k3": "kimi_k3",
+    "minimax": "minimax",
+    "qwen": "qwen_xml",
 }
 
 
@@ -321,6 +333,9 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
 
     async def GetModelInfo(self, request, context):
         api, config = self.api, self.api.engine.config
+        tool_call_parser, reasoning_parser = router_parser_names(
+            api.tool_call_parser_cls, api.reasoning_dialect
+        )
         return pb.GetModelInfoResponse(
             model_path=self.model_path,
             tokenizer_path=self.model_path,
@@ -332,6 +347,8 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
                 api.default_chat_template_kwargs
             ),
             reasoning_open_markers=_REASONING_OPEN_MARKERS,
+            tool_call_parser=tool_call_parser,  # None leaves it unset
+            reasoning_parser=reasoning_parser,
         )
 
     async def GetServerInfo(self, request, context):
@@ -341,6 +358,17 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
             server_info_json=json.dumps(self.api.server_info_body()),
             kv_event_sources_json=json.dumps(self.api.engine.core_mgr.kv_event_sources),
         )
+
+
+def router_parser_names(tool_call_parser_cls, reasoning_dialect) -> tuple:
+    """atomesh's tool-call and reasoning parser names for ATOM's, each None where atomesh
+    has none. The `<think>` one, qwen3, starts outside reasoning: the prompt decides."""
+    tool_call = getattr(tool_call_parser_cls, "NAME", None)
+    reasoning = getattr(reasoning_dialect, "think_end_marker", None)
+    return (
+        ROUTER_TOOL_CALL_PARSERS.get(tool_call),
+        "qwen3" if reasoning == THINK_END_MARKER else None,
+    )
 
 
 def _optional(message, name: str, default=None):
