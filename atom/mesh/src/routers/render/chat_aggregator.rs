@@ -11,7 +11,7 @@ use tracing::error;
 use crate::{
     protocols::{
         chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse},
-        common::{FunctionCallResponse, ToolCall, ToolChoice, ToolChoiceValue, Usage},
+        common::{FunctionCallResponse, Tool, ToolCall, ToolChoice, ToolChoiceValue, Usage},
     },
     reasoning_parser::{ParserFactory as ReasoningParserFactory, ParserResult},
     routers::{
@@ -283,6 +283,7 @@ async fn process_choice(
                     factory,
                     configured_tool_parser,
                     &processed_text,
+                    chat_request.tools.as_deref().unwrap_or_default(),
                     &chat_request.model,
                     history_tool_calls_count,
                 )
@@ -378,13 +379,15 @@ async fn parse_tool_calls(
     factory: &ToolParserFactory,
     configured: Option<&str>,
     text: &str,
+    tools: &[Tool],
     model: &str,
     history_tool_calls_count: usize,
 ) -> (Option<Vec<ToolCall>>, String) {
     let pooled = get_tool_parser(factory, configured, model);
     let result = {
         let parser = pooled.lock().await;
-        parser.parse_complete(text).await
+        // The declared schemas type each argument, as the streamed reply's parser has them.
+        parser.parse_complete_with_tools(text, tools).await
     };
     match result {
         Ok((normal_text, parsed)) => {

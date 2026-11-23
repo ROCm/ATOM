@@ -4409,6 +4409,43 @@ mod h_atom_native_tool_calls {
         }
     }
 
+    /// The declared schema types the unary reply's arguments, as it does the streamed one's.
+    #[tokio::test]
+    async fn a_unary_tool_call_keeps_a_string_declared_argument_a_string() {
+        let tool = json!({"type": "function", "function": {"name": "search", "parameters": {
+            "type": "object", "properties": {"limit": {"type": "string"}},
+        }}});
+        let req: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "tools": [tool],
+        }))
+        .unwrap();
+        let mut ctx = ctx(false, json!("auto"));
+        ctx.original = ProtocolRequest::Chat(Arc::new(req));
+        ctx.configured_tool_parser = Some("qwen_xml".to_string());
+        let call =
+            "<tool_call><function=search><parameter=limit>4</parameter></function></tool_call>";
+        let ids = tokenizer()
+            .encode(call, false)
+            .unwrap()
+            .token_ids()
+            .to_vec();
+        let stream = synthetic_single_stream(vec![Ok(TokenChunk::Complete {
+            token_ids: ids,
+            finish_reason: FinishReason::Stop,
+            matched_stop: None,
+            usage: Usage::default(),
+            logprobs: None,
+            input_logprobs: None,
+            meta: WorkerMeta::default(),
+        })]);
+        let resp = chat_aggregator::process(stream, ctx).await;
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let call = &json["choices"][0]["message"]["tool_calls"][0]["function"];
+        let arguments: Value = serde_json::from_str(call["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(arguments, json!({"limit": "4"}), "{json}");
+    }
+
     #[tokio::test]
     async fn a_forced_atom_tool_call_streams_in_the_model_s_syntax() {
         for choice in forced_choices() {
