@@ -442,7 +442,7 @@ t "a card carrying the measured coverage passes" \
 t "a coverage label with nothing after it is refused" \
   "$(_cov_gate "$_SMALL" 'Coverage:')" "EMPTY-COVERAGE"
 
-# check_prompts.py runs sixteen checks and only two are drift. run_one reported every
+# Only two of check_prompts.py's checks are drift. run_one reported every
 # refusal as "prompts drifted" and sent the output that named the real one to /dev/null,
 # so the owner was told to regenerate files that were fine. aiter#8255's review aborted
 # that way on 2026-11-19 against prompts that matched SKILL.md verbatim.
@@ -469,9 +469,13 @@ _flow_raw() {  # <python body for a stand-in check_prompts> -> what run_one woul
   blk=$(sed -n '/# >>> prompt-gate/,/# <<< prompt-gate/p' "$S/run_one.sh")
   # run_one.sh is `set -euo pipefail`; a harness without it is a different shell, and the
   # difference is load-bearing here (a grep that matches nothing aborts the script).
+  # The block's headline behaviour is the dump: it keeps check_prompts' output instead of
+  # discarding it. A harness that sends stderr to /dev/null cannot see that, so deleting
+  # the dump kept the suite green. FLOW_ERR makes it readable without a third harness --
+  # the pin test above counts the harnesses by their `set -euo pipefail` line.
   SKILL="$d" bash -c "set -euo pipefail
 fail(){ printf '%s\n' \"\$3\"; exit \"\$2\"; }
-$blk" 2>/dev/null
+$blk" 2>"${FLOW_ERR:-/dev/null}"
   rm -rf "$d"
 }
 # The two harnesses above hand-copy run_one.sh's shell options. If run_one gains or loses
@@ -486,6 +490,23 @@ print("Traceback: boom", file=sys.stderr)
 raise SystemExit(1)' | grep -c 'Traceback: boom')" "1"
 t "and a crash with no output still says something" \
   "$(_flow_raw 'raise SystemExit(7)' | grep -c 'run it by hand')" "1"
+# The two halves of the headline behaviour: the notice quotes at most the first three ❌,
+# and the whole output -- context lines and the ❌ past the third included -- is kept on
+# stderr instead of going to /dev/null. Neither was covered, so deleting the dump or
+# narrowing `grep -m3` to `-m1` left the suite green.
+_FOUR_BAD='print("check_prompts: 14 checks")
+print("❌ one")
+print("❌ two")
+print("❌ three")
+print("❌ four")
+raise SystemExit(1)'
+_flow_err=$(mktemp)
+t "the notice quotes the first three ❌ lines" \
+  "$(FLOW_ERR="$_flow_err" _flow_raw "$_FOUR_BAD")" \
+  "check_prompts.py refused: ❌ one;❌ two;❌ three"
+t "and the output the notice dropped is kept on stderr" \
+  "$(grep -c -e 'check_prompts: 14 checks' -e '❌ four' "$_flow_err")" "2"
+rm -f "$_flow_err"
 t "a drifted prompt is reported as drift" \
   "$(_flow_msg '
 import pathlib,sys

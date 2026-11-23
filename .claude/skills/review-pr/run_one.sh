@@ -141,9 +141,9 @@ fail() {  # <class> <exit-code> <message...>
   exit "$code"
 }
 
-# Fail fast if check_prompts.py refuses. Drift is two of its sixteen checks; the rest
-# are fail classes, the run budget, the OWNERS wiring, the gate's identity exclusions,
-# the runner label, _publish.py's permission closure and the citation gating. Reporting
+# Fail fast if check_prompts.py refuses. Drift is two of its checks; the rest guard the
+# wiring around the review -- the fail classes, the run budget, OWNERS, the runner label,
+# _publish.py's permission closure, the citation gating. Reporting
 # every one of them as "prompts drifted" -- with the output that named the real one sent
 # to /dev/null -- sends the owner to regenerate files that were never the problem. It
 # happened: aiter#8255's review aborted on 2026-11-19 with that message against a tree
