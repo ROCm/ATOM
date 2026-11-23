@@ -16,7 +16,7 @@ mod tests;
 use std::{fmt::Debug, sync::Arc};
 
 use async_trait::async_trait;
-pub(crate) use partition::{match_lanes, Holder, Lane, Partition, Predictor};
+pub(crate) use partition::{match_groups, match_lanes, Holder, Lane, Partition, Predictor};
 
 use crate::core::Worker;
 
@@ -40,6 +40,25 @@ pub(crate) trait PrefixMatchProvider: Send + Sync + Debug {
     /// Predicts that `worker` will hold `tokens`, routed to it, without waiting for the
     /// index's writer.
     fn on_routed(&self, _tokens: &[u32], _worker: &dyn Worker) {}
+
+    /// The tokens of `tokens` each worker's device cache will hold, in the order of
+    /// `workers`, when it holds what `device` says: that, or more where its engine copies
+    /// the prefix in from the pools of the other ranks of its share group. None where no
+    /// worker's can or share groups are ignored, and `device` stands.
+    fn shared_tokens(
+        &self,
+        _tokens: &[u32],
+        _workers: &[Arc<dyn Worker>],
+        _device: &[Option<u32>],
+    ) -> Option<Vec<Option<u32>>> {
+        None
+    }
+
+    /// What a token an engine copies in from its share group counts for in a match rate,
+    /// against one its device cache holds: 0 while share groups are ignored.
+    fn share_weight(&self) -> f64 {
+        0.0
+    }
 
     /// The tokens of `tokens` each worker's engine will report cached, in the order of
     /// `workers`, when its device cache holds what `device` says: that, with what it then
