@@ -383,6 +383,10 @@ def test_decode_replays_are_sampled_from_the_held_ids(monkeypatch):
         if step % 2 == 1:
             live_rows += rows
             sampled += 1
+    # the samples sit by slot until they are read or a placement changes
+    assert env.gp.dec_raw[:, 0].sum() > 0  # the pad picks' column
+    env.gp.fold_decode()
+    assert int(env.gp.dec_raw.sum()) == 0
     assert env.gp.dec_load.tolist() == want.tolist()
     assert (env.gp.dec_steps, env.gp.dec_rows) == (sampled, live_rows)
     dec, _, rows_per_step, steps, *_ = env.gp.dump_global(None)
@@ -399,6 +403,7 @@ def test_decode_step_without_live_rows_counts_as_a_step(monkeypatch):
     env.gp.after_decode_replay("k", 2)
     env.gp.after_decode_replay("other", 2)  # a bucket recorded without ids
     assert (env.gp.dec_steps, env.gp.dec_rows) == (2, 2)
+    env.gp.fold_decode()
     assert int(env.gp.dec_load.sum()) == 2 * TOP_K
 
 
@@ -430,6 +435,7 @@ def test_after_a_rebalance_the_decode_samples_restart_unless_cumulative(
         env.gp.place(env.layers[0], ids)
     env.gp.after_decode_replay("k", 2)
     env.gp.after_rebalance()
+    env.gp.fold_decode()
     kept = 2 * TOP_K if cumulative else 0
     assert int(env.gp.dec_load.sum()) == kept
     assert env.gp.dec_steps == (1 if cumulative else 0)

@@ -572,6 +572,23 @@ class GatePermuteRuntime:
         # sampling go on as while it was learnt.
         self.observing = False
         self._replays = 0
+        # A decode sample is added here by slot, one column a slot after the
+        # column pad picks (-1) fall into, and folded into `dec_load` before
+        # that is read and before a layer's placement changes (`fold_decode`):
+        # the host runs a sampled step's few launches while the step's own
+        # recording is still being launched, so each one lengthens that step.
+        slots = meta.num_physical_experts + 1
+        self.dec_raw = torch.zeros(
+            (meta.num_layers, slots), dtype=torch.int64, device=dev
+        )
+        self._raw_base = (
+            torch.arange(meta.num_layers, dtype=torch.int64, device=dev) * slots + 1
+        )
+        self._raw_dirty = False
+        self._ones = torch.ones(1, dtype=torch.int64, device=dev)
+        # Request bucket -> (its held id tensors, their layers' bases), where
+        # the tensors share a shape.
+        self._plans: dict[Any, tuple[tuple[torch.Tensor, ...], torch.Tensor] | None] = {}
         # Request bucket -> [(layer id, the recording's top-k ids)].
         self._captures: dict[Any, list[tuple[int, torch.Tensor]]] = {}
         self._layer_indices: dict[tuple[int, ...], torch.Tensor] = {}
@@ -626,6 +643,7 @@ class GatePermuteRuntime:
     def decode_capture(self, key: Any):
         """Around the recording of the decode request graph ``key``."""
         self._captures[key] = []
+        self._plans.pop(key, None)
         self._capture_key = key
         try:
             yield
@@ -662,7 +680,45 @@ class GatePermuteRuntime:
             return
         self.dec_rows += rows
         self.window_rows += rows
-        self.count_decode(held, rows)
+        if key not in self._plans:
+            self._plans[key] = self._plan(held)
+        plan = self._plans[key]
+        if plan is None:
+            self.count_decode(held, rows)
+            return
+        # Three launches: the held tensors stacked, their slots' addresses in
+        # `dec_raw`, and the add. Rows past the live ones are cut off; a pad
+        # pick (-1) lands in its layer's pad column.
+        tensors, base = plan
+        flat = (torch.stack(tensors)[:, :rows] + base).view(-1)
+        count = flat.numel()
+        if self._ones.numel() < count:
+            self._ones = torch.ones(count, dtype=torch.int64, device=flat.device)
+        self.dec_raw.view(-1).scatter_add_(0, flat, self._ones[:count])
+        self._raw_dirty = True
+
+    def _plan(self, held: list[tuple[int, torch.Tensor]]):
+        """The held id tensors of a request bucket and their layers' first
+        slot address in `dec_raw` ([layers, 1, 1]) -- None where the tensors
+        differ in shape (several launches a layer), which `count_decode`
+        counts one by one."""
+        if len({(tuple(ids.shape), ids.dtype) for _, ids in held}) != 1:
+            return None
+        if held[0][1].dim() != 2 or held[0][1].dtype not in (torch.int32, torch.int64):
+            return None
+        layers = self._layer_index(tuple(i for i, _ in held), held[0][1].device)
+        base = self._raw_base.index_select(0, layers).view(-1, 1, 1)
+        return tuple(ids for _, ids in held), base
+
+    def fold_decode(self) -> None:
+        """The decode samples held by slot (`dec_raw`) added to `dec_load` by
+        logical expert, under the placement they were sampled under: before
+        `dec_load` is read, and before a layer's fold index changes."""
+        if not self._raw_dirty:
+            return
+        self.dec_load.add_(torch.gather(self.dec_raw[:, 1:], 1, self.fold_index))
+        self.dec_raw.zero_()
+        self._raw_dirty = False
 
     def count_decode(self, held: list[tuple[int, torch.Tensor]], rows: int) -> None:
         """Add the ids ``held`` -- (layer id, [bucket rows, top_k] physical
@@ -716,6 +772,7 @@ class GatePermuteRuntime:
         tensors their recordings left in the pool."""
         dropped = len(self._captures)
         self._captures.clear()
+        self._plans.clear()
         return dropped
 
     # -- statistics ------------------------------------------------------
@@ -727,6 +784,7 @@ class GatePermuteRuntime:
         a sampled step and the sampled steps of a rank (their mean) -- and
         those two over the samples since the last rebalance (`start_window`),
         the window's operating point."""
+        self.fold_decode()
         dev = self.dec_load.device
         parts = [self.dec_load.reshape(-1)]
         if self.pf_total is not None:
@@ -809,6 +867,7 @@ class GatePermuteRuntime:
         ATOM_EPLB_STATS_CUMULATIVE)."""
         if self.cumulative:
             return
+        self.fold_decode()
         self.dec_load.zero_()
         self.dec_rows = self.dec_steps = 0
 
@@ -827,6 +886,9 @@ class GatePermuteRuntime:
         anything moved."""
         if staged is None:
             return False
+        # The decode samples still held by slot were taken under the old
+        # placement.
+        self.fold_decode()
         for tensor, rows in zip(*staged):
             tensor.copy_(rows)
         self.fold_index[layer_id].copy_(
