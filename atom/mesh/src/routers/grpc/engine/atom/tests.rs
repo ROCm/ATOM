@@ -985,6 +985,59 @@ mod pairs {
     }
 
     #[tokio::test]
+    async fn a_prefill_registered_again_at_its_url_has_its_info_read_again() {
+        let p_script = vec![vec![prefill_done(json!({}))]];
+        let (_, p_url) = instance(p_script.clone(), false, prefill_info(2, Some(template()))).await;
+        let (_, replacement_url) = instance(p_script, false, prefill_info(4, None)).await;
+        let d_script = vec![vec![complete(&[21], "eos")], vec![complete(&[22], "eos")]];
+        let (d, d_url) = instance(d_script, false, None).await;
+        let (pw, dw) = (worker(&p_url, PREFILL), worker(&d_url, WorkerType::Decode));
+        let registry = Arc::new(WorkerRegistry::new());
+        registry.register(pw.clone());
+        registry.register(dw.clone());
+        let pairs = AtomPairs::new(registry.clone(), AtomPdRankMappingPolicy::Idx2Idx)
+            .await
+            .unwrap();
+        let engine = GrpcEngine::with_atom_pairs(pairs);
+        let run = |prefill: Arc<dyn Worker>| {
+            let plan = PlacementPlan::Pair {
+                prefill,
+                decode: dw.clone(),
+                prefill_policy: "random",
+                decode_policy: "random",
+            };
+            let engine = engine.clone();
+            async move {
+                let handle = engine.dispatch(&plan, &mut payload(false)).await.unwrap();
+                timeout(HANG, handle.collect::<Vec<_>>()).await.unwrap();
+            }
+        };
+        run(pw).await;
+
+        // Removed, then registered again at the same URL: another instance behind it.
+        registry.remove_by_url(&p_url);
+        let client = GrpcClient::connect(&replacement_url, "atom").await.unwrap();
+        let replacement: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(&p_url)
+                .worker_type(PREFILL)
+                .connection_mode(ConnectionMode::Grpc { port: None })
+                .runtime_type(RuntimeType::Atom)
+                .grpc_client(client)
+                .build(),
+        );
+        registry.register(replacement.clone());
+        run(replacement).await;
+
+        let decodes = d.requests.lock().unwrap().clone();
+        let tp_and_chunked = |request: &GenerateRequest| {
+            let kv = kv(request);
+            (kv["remote_tp_size"].clone(), kv["chunked_transfer"].clone())
+        };
+        assert_eq!(tp_and_chunked(&decodes[0]), (json!(2), json!(true)));
+        assert_eq!(tp_and_chunked(&decodes[1]), (json!(4), Value::Null));
+    }
+
+    #[tokio::test]
     async fn each_rank_takes_its_instances_info_and_idx2idx_runs_prefill_on_decodes_rank() {
         let (p, p_url) = instance(vec![vec![]], true, prefill_info(4, Some(template()))).await;
         let (d, d_url) = instance(vec![vec![complete(&[21], "eos")]], false, None).await;

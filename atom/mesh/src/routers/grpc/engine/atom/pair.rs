@@ -1,8 +1,9 @@
 //! ATOM's own P/D flow over `atom.grpc.v1`: `AtomAdapter` fills a JSON view of the
 //! request fields it reads and writes, which each GenerateRequest then takes.
 
+use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -37,6 +38,9 @@ use crate::tokenizer::traits::Tokenizer;
 /// instance reports a chunked-transfer template.
 pub(crate) struct AtomPairs {
     info: RwLock<Arc<AtomPrefillInfo>>,
+    /// The worker each URL's info was read for: a worker registered again at that
+    /// URL is another, whose info is read afresh.
+    read_for: RwLock<HashMap<String, Weak<dyn Worker>>>,
     mapping: AtomPdRankMappingPolicy,
     workers: Arc<WorkerRegistry>,
 }
@@ -49,32 +53,44 @@ impl AtomPairs {
         mapping: AtomPdRankMappingPolicy,
     ) -> Result<Self, String> {
         let mut info = AtomPrefillInfo::default();
+        let mut read_for = HashMap::new();
         for worker in workers.get_prefill_workers().iter().filter(|w| is_atom(w)) {
             learn(&mut info, worker).await.map_err(|e| e.to_string())?;
+            read_for.insert(worker.url().to_string(), Arc::downgrade(worker));
         }
         Ok(Self {
             info: RwLock::new(Arc::new(info)),
+            read_for: RwLock::new(read_for),
             mapping,
             workers,
         })
     }
 
-    /// The prefills' info, `prefill`'s read on its first pair when it registered later.
+    /// The prefills' info, `prefill`'s read on its first pair when it registered later
+    /// or again.
     pub(super) async fn adapter_for(
         &self,
         prefill: &Arc<dyn Worker>,
     ) -> Result<AtomAdapter, EngineError> {
-        let known = self.info.read().unwrap().clone();
-        if known.tp_sizes.contains_key(prefill.url()) {
-            return Ok(AtomAdapter::new(known));
+        let url = prefill.url();
+        let this = Arc::downgrade(prefill);
+        let read = |read_for: &HashMap<String, Weak<dyn Worker>>| {
+            read_for.get(url).is_some_and(|known| known.ptr_eq(&this))
+        };
+        if read(&self.read_for.read().unwrap()) {
+            return Ok(AtomAdapter::new(self.info.read().unwrap().clone()));
         }
         let mut learned = AtomPrefillInfo::default();
         learn(&mut learned, prefill).await?;
         let mut info = self.info.write().unwrap();
         let mut merged = AtomPrefillInfo::clone(&info);
+        for url in learned.tp_sizes.keys() {
+            merged.chunked_transfer.remove(url);
+        }
         merged.tp_sizes.extend(learned.tp_sizes);
         merged.chunked_transfer.extend(learned.chunked_transfer);
         *info = Arc::new(merged);
+        self.read_for.write().unwrap().insert(url.to_string(), this);
         Ok(AtomAdapter::new(info.clone()))
     }
 
