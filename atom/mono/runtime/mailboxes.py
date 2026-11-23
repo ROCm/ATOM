@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """A runner's mailboxes and where a step begins with them.
 
 A mailbox tag is a layer's, so a pair left from one step would pass for the
@@ -31,9 +32,11 @@ class StepMailboxes:
             STATE_WORDS, dtype=torch.int64, device=peers.bytes.device
         )
 
-    def begin_step(self) -> None:
-        """Before the step's first kernel, on its stream (a graph records it)."""
-        step_begin(self._scratch, self.peers, self._state, self._debug)
+    def begin_step(self, extents=None) -> None:
+        """Before the step's first kernel, on its stream (a graph records it).
+        ``extents``: only what this step's width uses (``step_begin``); every
+        buffer whole by default."""
+        step_begin(self._scratch, self.peers, self._state, self._debug, extents)
 
     def missing_ranks(self) -> list[int]:
         """The ranks the fences since the last call gave up on (a debug build;
