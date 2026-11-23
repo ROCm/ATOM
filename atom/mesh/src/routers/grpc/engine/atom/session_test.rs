@@ -995,7 +995,13 @@ mod routed {
             "max_completion_tokens": 8, "response_format": format,
         });
         let chat: ChatCompletionRequest = serde_json::from_value(chat).unwrap();
-        let request = tokio::spawn(async move { router.route_chat(None, &chat, Some("m")).await });
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-session-id", "turns".parse().unwrap());
+        headers.insert("x-dynamo-parent-session-id", "root".parse().unwrap());
+        let request = tokio::spawn(async move {
+            let headers = Some(&headers);
+            router.route_chat(headers, &chat, Some("m")).await
+        });
 
         let mut call = accept(&mut calls, PROTOCOL_VERSION).await;
         let (spec, _, _) = one_request(&mut call).await;
@@ -1013,6 +1019,12 @@ mod routed {
         let id = spec.external_request_id.as_deref().unwrap();
         assert!(id.starts_with("chatcmpl-"), "{id}");
         assert_eq!(max_tokens(&spec), Some(8));
+        // The session ids its headers carry, as Generate's request has them.
+        let ids = (
+            spec.dp_session_id.as_deref(),
+            spec.dp_parent_session_id.as_deref(),
+        );
+        assert_eq!(ids, (Some("turns"), Some("root")));
         // The RequestSpec's sampling is the request's, with the fields ATOM derived.
         let derived = derived();
         let expected = pb::SamplingParams {

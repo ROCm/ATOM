@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 // Copyright (c) 2026 ATOM Project Contributors
-//! A `GenerationPayload` as ATOM's GenerateRequest (the sampling fields ATOM's HTTP routes read,
-//! stop strings and stop ids as id sequences, DP rank, a chat's StructuredOutput), which the
-//! Session sends as a RequestSpec.
+//! A `GenerationPayload` as ATOM's GenerateRequest (the sampling fields ATOM's HTTP routes
+//! read, stop strings and stop ids as id sequences, DP rank and session ids, a chat's
+//! StructuredOutput), which the Session sends as a RequestSpec.
 
 use http::StatusCode;
 use serde_json::Value as Json;
@@ -93,6 +93,8 @@ pub(crate) fn request_spec(
         external_request_id: Some(request.request_id),
         kv_transfer_params,
         data_parallel_rank: request.data_parallel_rank.map(i64::from),
+        dp_session_id: request.dp_session_id,
+        dp_parent_session_id: request.dp_parent_session_id,
         ..Default::default()
     };
     Ok((spec, request.prompt_token_ids))
