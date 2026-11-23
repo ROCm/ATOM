@@ -46,6 +46,8 @@ struct FakeAtom {
     kv_transfer_info: Option<String>,
     /// GetServerInfo never answers.
     stall_server_info: bool,
+    /// GetServerInfo calls, each answered after 100 ms.
+    server_info_reads: std::sync::atomic::AtomicUsize,
 }
 
 impl FakeAtom {
@@ -92,6 +94,7 @@ impl AtomEngine for FakeAtom {
             served_model_name: "m".into(),
             max_context_length: 4096,
             eos_token_ids: vec![2, 7],
+            usage_on_finish: true,
             ..Default::default()
         }))
     }
@@ -103,6 +106,9 @@ impl AtomEngine for FakeAtom {
         if self.stall_server_info {
             std::future::pending::<()>().await;
         }
+        self.server_info_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(100)).await;
         Ok(Response::new(GetServerInfoResponse {
             protocol_version: 1,
             kv_transfer_info_json: self
@@ -228,9 +234,19 @@ async fn route_generate_with(
     stream: bool,
     headers: Option<http::HeaderMap>,
 ) -> axum::response::Response {
+    let planner = test_mocks::MockPdPlanner::repeat_single(worker, "random");
+    route_planned_generate(planner, GrpcEngine::new(), stream, headers).await
+}
+
+async fn route_planned_generate(
+    planner: test_mocks::MockPdPlanner,
+    engine: GrpcEngine,
+    stream: bool,
+    headers: Option<http::HeaderMap>,
+) -> axum::response::Response {
     let pipeline = test_mocks::pipeline_with(
-        Arc::new(test_mocks::MockPdPlanner::repeat_single(worker, "random")),
-        Arc::new(GrpcEngine::new()),
+        Arc::new(planner),
+        Arc::new(engine),
         metrics_labels::BACKEND_REGULAR,
     );
     let context =
@@ -475,6 +491,13 @@ async fn a_streamed_ttft_includes_the_wait_for_the_first_token() {
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
     let metrics = recorder.handle();
     let _guard = metrics::set_default_local_recorder(&recorder);
+    let fake = answering_after_300_ms(vec![chunk(&[11]), complete(&[], "eos")]);
+    let response = route_generate(atom_worker(&serve(fake).await), true).await;
+    assert_ttft_at_least_300_ms(response, &metrics).await;
+}
+
+/// A held call that sends `replies` 300 ms after it opens.
+fn answering_after_300_ms(replies: Vec<GenerateResponse>) -> Arc<FakeAtom> {
     let fake = Arc::new(FakeAtom {
         scripts: Mutex::new(vec![Vec::new()].into()),
         hold: true,
@@ -489,12 +512,17 @@ async fn a_streamed_ttft_includes_the_wait_for_the_first_token() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         };
         tokio::time::sleep(Duration::from_millis(300)).await;
-        for reply in [chunk(&[11]), complete(&[], "eos")] {
+        for reply in replies {
             sender.send(Ok(reply)).await.unwrap();
         }
     });
+    fake
+}
 
-    let response = route_generate(atom_worker(&serve(fake).await), true).await;
+async fn assert_ttft_at_least_300_ms(
+    response: axum::response::Response,
+    metrics: &metrics_exporter_prometheus::PrometheusHandle,
+) {
     assert_eq!(response.status(), StatusCode::OK);
     axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
@@ -511,26 +539,7 @@ async fn a_streamed_ttft_includes_the_wait_for_the_first_token() {
     );
 }
 
-#[tokio::test]
-async fn an_unstreamed_e2e_latency_includes_the_wait_for_the_complete() {
-    let fake = Arc::new(FakeAtom {
-        scripts: Mutex::new(vec![Vec::new()].into()),
-        hold: true,
-        ..Default::default()
-    });
-    let held = fake.clone();
-    tokio::spawn(async move {
-        let sender = loop {
-            if let Some(sender) = held.held.lock().unwrap().take() {
-                break sender;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        };
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        sender.send(Ok(complete(&[4], "eos"))).await.unwrap();
-    });
-
-    let response = route_generate(atom_worker(&serve(fake).await), false).await;
+async fn assert_e2e_latency_at_least_300_ms(response: axum::response::Response) {
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
@@ -541,6 +550,59 @@ async fn an_unstreamed_e2e_latency_includes_the_wait_for_the_complete() {
         latency >= 0.3,
         "e2e_latency {latency} s misses the generation"
     );
+}
+
+#[tokio::test]
+async fn an_unstreamed_e2e_latency_includes_the_wait_for_the_complete() {
+    let fake = answering_after_300_ms(vec![complete(&[4], "eos")]);
+    let response = route_generate(atom_worker(&serve(fake).await), false).await;
+    assert_e2e_latency_at_least_300_ms(response).await;
+}
+
+/// A pair placement: P answers at once, D 300 ms after its call opens.
+async fn route_pair_generate(
+    stream: bool,
+    decode_replies: Vec<GenerateResponse>,
+) -> axum::response::Response {
+    let mut prefill_done = complete(&[], "eos");
+    if let Some(generate_response::Response::Complete(c)) = prefill_done.response.as_mut() {
+        c.kv_transfer_params_json = Some("{}".into());
+    }
+    let prefill = Arc::new(FakeAtom {
+        scripts: Mutex::new(vec![vec![prefill_done]].into()),
+        kv_transfer_info: Some(r#"{"tp_size":1,"kv_role":"kv_producer"}"#.into()),
+        ..Default::default()
+    });
+    let decode = answering_after_300_ms(decode_replies);
+    let planner = test_mocks::MockPdPlanner::repeat_pair(
+        atom_worker(&serve(prefill).await),
+        atom_worker(&serve(decode).await),
+        "random",
+        "random",
+    );
+    let pairs = super::pair::AtomPairs::new(
+        Arc::new(crate::core::WorkerRegistry::new()),
+        crate::config::types::AtomPdRankMappingPolicy::Idx2Idx,
+    )
+    .await
+    .unwrap();
+    let engine = GrpcEngine::with_atom_pairs(pairs);
+    route_planned_generate(planner, engine, stream, None).await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_pairs_streamed_ttft_includes_the_wait_for_the_first_token() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics = recorder.handle();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let response = route_pair_generate(true, vec![chunk(&[11]), complete(&[], "eos")]).await;
+    assert_ttft_at_least_300_ms(response, &metrics).await;
+}
+
+#[tokio::test]
+async fn a_pairs_unstreamed_e2e_latency_includes_the_wait_for_the_complete() {
+    let response = route_pair_generate(false, vec![complete(&[4], "eos")]).await;
+    assert_e2e_latency_at_least_300_ms(response).await;
 }
 
 #[tokio::test]
@@ -591,6 +653,7 @@ async fn the_client_connects_and_reads_health_and_model_and_server_info() {
         ("served_model_name", "m"),
         ("max_context_length", "4096"),
         ("eos_token_ids", "[2,7]"),
+        ("usage_on_finish", "true"),
     ];
     assert_eq!(
         labels,
@@ -984,6 +1047,27 @@ mod pairs {
             matches!(error, EngineError::Http { status, .. } if status == StatusCode::GATEWAY_TIMEOUT),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_pairs_of_a_prefill_read_its_info_once() {
+        let (p, p_url) = instance(Vec::new(), false, prefill_info(2, None)).await;
+        let pw = worker(&p_url, PREFILL);
+        let pairs = AtomPairs::new(
+            Arc::new(WorkerRegistry::new()),
+            AtomPdRankMappingPolicy::Idx2Idx,
+        )
+        .await
+        .unwrap();
+        let reads = (0..8).map(|_| pairs.adapter_for(&pw));
+        let adapters = timeout(HANG, futures::future::join_all(reads))
+            .await
+            .unwrap();
+        assert!(adapters.iter().all(Result::is_ok));
+        let reads = p
+            .server_info_reads
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(reads, 1);
     }
 
     #[tokio::test]

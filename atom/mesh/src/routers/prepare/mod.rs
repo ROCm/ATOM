@@ -35,7 +35,7 @@ pub(crate) mod tool_constraints;
 mod tests;
 
 use chat_template::{
-    atom_worker_without_template, default_template_kwargs, merged_template_kwargs,
+    atom_chat_render_gap, default_template_kwargs, merged_template_kwargs,
     process_chat_messages_with_kwargs,
 };
 use generation_payload::{
@@ -95,14 +95,17 @@ pub fn prepare_chat_declaring(
     })?;
     let workers = components.worker_registry.get_by_model(model_id_str);
     let configured_template = components.router_config.chat_template.is_some();
-    if let Some(worker) = atom_worker_without_template(&workers, configured_template) {
+    let registry = &components.tokenizer_registry;
+    let built_in_encoder = registry
+        .get_by_name(model_id_str)
+        .or_else(|| registry.get_by_id(model_id_str))
+        .is_some_and(|entry| components.chats_without_template.read().contains(&entry.id));
+    if let Some(gap) = atom_chat_render_gap(&workers, configured_template, built_in_encoder) {
         return Err(error::not_implemented(
             "chat_template_unavailable",
             format!(
-                "Chats for model {model_id_str} are not served over gRPC: its ATOM worker {} \
-                 renders them without a chat template, which atomesh needs. Route its chats \
-                 to ATOM over HTTP; completions are served over gRPC.",
-                worker.url()
+                "Chats for model {model_id_str} are not served over gRPC: {gap}. Route its \
+                 chats to ATOM over HTTP; completions are served over gRPC."
             ),
         ));
     }

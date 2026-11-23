@@ -534,6 +534,9 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
             reasoning_open_markers=_REASONING_OPEN_MARKERS,
             tool_call_parser=tool_call_parser,  # None leaves it unset
             reasoning_parser=reasoning_parser,
+            usage_on_finish=api_compatibility_for(
+                api.custom_message_encoder
+            ).usage_on_finish,
         )
 
     async def GetServerInfo(self, request, context):

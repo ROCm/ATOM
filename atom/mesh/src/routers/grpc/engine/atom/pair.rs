@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -45,6 +45,8 @@ pub(crate) struct AtomPairs {
     /// The worker each URL's info was read for: a worker registered again at that
     /// URL is another, whose info is read afresh.
     read_for: RwLock<HashMap<String, Weak<dyn Worker>>>,
+    /// Per URL, held while its GetServerInfo is read, so concurrent first pairs read it once.
+    reading: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     mapping: AtomPdRankMappingPolicy,
     workers: Arc<WorkerRegistry>,
 }
@@ -65,6 +67,7 @@ impl AtomPairs {
         Ok(Self {
             info: RwLock::new(Arc::new(info)),
             read_for: RwLock::new(read_for),
+            reading: Mutex::default(),
             mapping,
             workers,
         })
@@ -81,6 +84,17 @@ impl AtomPairs {
         let read = |read_for: &HashMap<String, Weak<dyn Worker>>| {
             read_for.get(url).is_some_and(|known| known.ptr_eq(&this))
         };
+        if read(&self.read_for.read().unwrap()) {
+            return Ok(AtomAdapter::new(self.info.read().unwrap().clone()));
+        }
+        let gate = self
+            .reading
+            .lock()
+            .unwrap()
+            .entry(url.to_string())
+            .or_default()
+            .clone();
+        let _reading = gate.lock().await;
         if read(&self.read_for.read().unwrap()) {
             return Ok(AtomAdapter::new(self.info.read().unwrap().clone()));
         }
