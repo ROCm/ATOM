@@ -166,7 +166,7 @@ Any of the following ends with P encoding locally, as in PD:
 - an E error or timeout, including a full pool (E answers 503),
 - an E answer without an `ec_transfer_params` object,
 - on a P rank: a failed read, a changed generation word, a `cache_seed`
-  mismatch, or embeddings larger than its read buffer.
+  or dtype mismatch, or embeddings larger than its read buffer.
 
 The first three are ATOMesh's decision for the whole request. The last is
 each P rank's own decision (see the gap in D12).
@@ -500,7 +500,8 @@ E's pool (`EcPool`):
   word inside another entry's rows does not match.
 
 P's read (`EcReader.read`): P checks `cache_seed` against its own, reads
-the rows, then rereads the word. A `cache_seed` mismatch, a failed read, a
+the rows, then rereads the word. A `cache_seed` mismatch, a dtype other
+than the one E stored (`ec_transfer_params` carries it), a failed read, a
 changed word or rows larger than its buffer make it return `None`. The rank
 then logs "Image embeddings from ... are unavailable; running the vision
 tower" and runs its own tower, which P keeps loaded.
