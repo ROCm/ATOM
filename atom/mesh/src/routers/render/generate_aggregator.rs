@@ -12,7 +12,10 @@ use crate::{
     routers::{
         comm::error,
         prepare::response_context::{ProtocolRequest, ResponseContext},
-        render::logprob_conversion::{input_logprobs_to_generate, output_logprobs_to_generate},
+        render::{
+            atom_usage::AtomUsage,
+            logprob_conversion::{input_logprobs_to_generate, output_logprobs_to_generate},
+        },
         token_handle::{
             engine_error::EngineError,
             token_chunk::{FinishReason, MatchedStop, TokenChunk},
@@ -47,6 +50,7 @@ pub async fn process(stream: TokenHandle, ctx: ResponseContext) -> Response {
 
     let mut stop_decoder = ctx.stop_decoder;
     let mut result_array = Vec::with_capacity(completes.len());
+    let mut metas = Vec::with_capacity(completes.len());
 
     for complete in &completes {
         let (token_ids, finish_reason, matched_stop, usage, meta, output_lp, input_lp) =
@@ -113,6 +117,7 @@ pub async fn process(stream: TokenHandle, ctx: ResponseContext) -> Response {
             (None, None)
         };
 
+        metas.push(meta);
         result_array.push(GenerateResponse {
             text: decoded_text,
             output_ids: token_ids.clone(),
@@ -134,7 +139,20 @@ pub async fn process(stream: TokenHandle, ctx: ResponseContext) -> Response {
         });
     }
 
-    axum::Json(result_array).into_response()
+    if metas.iter().all(|meta| meta.timing.is_none()) {
+        return axum::Json(result_array).into_response();
+    }
+    // An ATOM worker's: each sequence's timing, which /v1/completions reports.
+    let mut value = match serde_json::to_value(&result_array) {
+        Ok(value) => value,
+        Err(e) => return error::internal_error("serialization_failed", e.to_string()),
+    };
+    if let Some(items) = value.as_array_mut() {
+        for (item, meta) in items.iter_mut().zip(metas) {
+            AtomUsage::add_timing(&mut item["meta_info"], meta);
+        }
+    }
+    axum::Json(value).into_response()
 }
 
 async fn collect_completes(mut stream: TokenHandle) -> Result<Vec<TokenChunk>, Response> {

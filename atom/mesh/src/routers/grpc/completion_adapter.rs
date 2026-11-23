@@ -22,7 +22,10 @@ use crate::{
         generate::{GenerateFinishReason, GenerateRequest, GenerateResponse},
         sampling_params::SamplingParams,
     },
-    routers::comm::error,
+    routers::{
+        comm::error,
+        render::atom_usage::{self, AtomUsage},
+    },
 };
 
 /// Build a synthetic SGLang `GenerateRequest` from an OpenAI `CompletionRequest`.
@@ -117,6 +120,16 @@ pub(crate) fn completion_to_generate(c: &CompletionRequest) -> Result<GenerateRe
     })
 }
 
+/// `generate` without the logprobs its completion asked for: ATOM's HTTP /v1/completions
+/// answers logprobs null, and its gRPC workers refuse a request for them.
+pub(crate) fn without_logprobs(generate: GenerateRequest) -> GenerateRequest {
+    GenerateRequest {
+        return_logprob: Some(false),
+        top_logprobs_num: None,
+        ..generate
+    }
+}
+
 /// Convert a list of native `GenerateResponse`s into an OpenAI `CompletionResponse`.
 fn build_completion_response(gens: Vec<GenerateResponse>, model: String) -> CompletionResponse {
     let id = gens
@@ -204,8 +217,19 @@ pub(crate) async fn wrap_generate_response_as_completion(
         }
     };
 
+    // An ATOM worker's sequences carry their timing, which its usage reports.
+    let raw: Vec<Value> = serde_json::from_slice(&bytes).unwrap_or_default();
+    let meta_infos: Vec<&Value> = raw.iter().filter_map(|g| g.get("meta_info")).collect();
+    let atom = AtomUsage::of_meta_infos(&meta_infos);
+
     let completion = build_completion_response(gens, model);
-    let json = match serde_json::to_vec(&completion) {
+    let json = match atom {
+        None => serde_json::to_vec(&completion),
+        Some(atom) => atom
+            .extend_response(&completion, atom_usage::COMPLETION)
+            .and_then(|value| serde_json::to_vec(&value)),
+    };
+    let json = match json {
         Ok(v) => v,
         Err(e) => {
             return error::internal_error(

@@ -592,8 +592,19 @@ impl InferenceEnvelope {
 
     /// Native backends consume typed requests; release raw JSON before awaiting
     /// their own request handling.
-    pub(crate) fn into_native_parts(self) -> (Uri, HeaderMap, ParsedInference, InferenceMetadata) {
-        (self.uri, self.headers, self.parsed, self.metadata)
+    /// The typed parts, and a chat's raw body, which a router may read past the typed parse;
+    /// any other raw body is released here.
+    pub(crate) fn into_native_parts(
+        self,
+    ) -> (
+        Uri,
+        HeaderMap,
+        ParsedInference,
+        InferenceMetadata,
+        Option<Bytes>,
+    ) {
+        let raw = matches!(self.parsed, ParsedInference::Chat(_)).then_some(self.body);
+        (self.uri, self.headers, self.parsed, self.metadata, raw)
     }
 
     pub(crate) fn validate_headers(headers: &HeaderMap) -> Result<(), IngressError> {

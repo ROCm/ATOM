@@ -42,4 +42,21 @@ pub struct ResponseContext {
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
     pub configured_tool_parser: Option<String>,
     pub configured_reasoning_parser: Option<String>,
+    /// The channel opener the rendered prompt ends on (see [`prompt_opener`]): the reply
+    /// starts inside that block, with no opener of its own, so the reasoning parser reads
+    /// this one before the reply. Kept only for a reply read as ATOM's.
+    pub prompt_opener: Option<String>,
+    /// The reply is ATOM's (`AtomOutput`), and takes the shape ATOM's HTTP chat gives
+    /// it: content "" when empty, and a stream opened by an empty assistant delta.
+    pub reads_as_atom: bool,
+}
+
+/// ATOM's `prompt_starts_in_reasoning`: the marker among `markers` (GetModelInfo's
+/// `reasoning_open_markers`) that the prompt, trailing whitespace aside, ends with.
+pub fn prompt_opener(prompt: &str, markers: &[String]) -> Option<String> {
+    let prompt = prompt.trim_end();
+    markers
+        .iter()
+        .find(|marker| !marker.is_empty() && prompt.ends_with(marker.as_str()))
+        .cloned()
 }
