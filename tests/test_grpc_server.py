@@ -159,6 +159,15 @@ def test_generate_refuses_what_it_cannot_serve_with_a_400(serve, sampling, messa
     assert engine.preprocessed == []
 
 
+def test_session_affinity_ids_reach_preprocess(serve):
+    engine = FakeEngine([([5], "eos")])
+    _generate(serve(engine), dp_session_id="s", dp_parent_session_id="p")
+    _generate(serve(engine))
+    (_, _, given), (_, _, absent) = engine.preprocessed
+    assert (given["dp_session_id"], given["dp_parent_session_id"]) == ("s", "p")
+    assert (absent["dp_session_id"], absent["dp_parent_session_id"]) == (None, None)
+
+
 def test_a_prompt_only_in_kv_transfer_params_is_admitted(serve):
     engine = FakeEngine([([5], "eos")])
     kv = json.dumps({"prompt_token_ids": [4, 5], "do_remote_prefill": False})

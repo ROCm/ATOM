@@ -46,6 +46,11 @@ message GenerateRequest {
   optional int32 data_parallel_rank = 6;
   bool stream = 7;
   StructuredOutput structured_output = 8;  // absent: no chat-level input, as on /v1/completions
+  // Session affinity, as the HTTP routes read it from x-dynamo-session-id,
+  // x-session-id or x-correlation-id, and x-dynamo-parent-session-id; the engine
+  // reads them only under ATOM_DP_SESSION_AFFINITY.
+  optional string dp_session_id = 9;
+  optional string dp_parent_session_id = 10;
 }
 
 // What ATOM's HTTP chat route derives a chat request's structured output from,

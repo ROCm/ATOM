@@ -165,6 +165,8 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
                         kv_transfer_params
                     ),
                     data_parallel_rank=_optional(request, "data_parallel_rank"),
+                    dp_session_id=_optional(request, "dp_session_id"),
+                    dp_parent_session_id=_optional(request, "dp_parent_session_id"),
                     stop_token_sequences=stops,
                 ),
             )
