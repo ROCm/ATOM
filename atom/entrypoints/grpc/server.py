@@ -401,7 +401,10 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
         except frames.FrameError as error:
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
         finally:
-            reader.cancel()
+            # send() cancelled a failed Session's reader; a second cancel could abort a
+            # structured admission before its thread enqueues the request.
+            if session.failed is None:
+                reader.cancel()
             session.close()
 
     async def _read(self, session, request_iterator) -> None:

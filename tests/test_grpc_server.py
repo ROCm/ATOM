@@ -587,6 +587,60 @@ def test_a_failed_session_admits_no_submission_still_in_preprocess(serve, monkey
     assert engine.submitted == []
 
 
+def test_a_session_failed_in_structured_admission_aborts_once_its_seq_is_enqueued(
+    serve, monkeypatch
+):
+    monkeypatch.setattr(grpc_session, "OUTBOX", 0)  # its next message fails it
+    engine, entered, admit, events = (
+        FakeEngine(),
+        threading.Event(),
+        threading.Event(),
+        [],
+    )
+    servicer = serve(engine)
+    open_session, opened = servicer.sessions.open, []
+    monkeypatch.setattr(
+        servicer.sessions, "open", lambda: opened.append(open_session()) or opened[-1]
+    )
+
+    def add_request(seqs):  # the structured admission, on its thread
+        entered.set()
+        admit.wait(10)
+        events.append("enqueued")
+
+    monkeypatch.setattr(engine.core_mgr, "add_request", add_request)
+    monkeypatch.setattr(
+        engine.core_mgr, "abort_request", lambda seq_id: events.append("aborted")
+    )
+
+    class Context:
+        async def abort(self, code, details):
+            raise grpc.RpcError()
+
+    async def client():
+        batch = _submit_batch((3, "a", [1, 2]))
+        envelope = v1.Envelope.FromString(batch[0])
+        envelope.submit.requests[0].sampling.json_schema = '{"type": "object"}'
+        yield pb.Frames(frames=[envelope.SerializeToString(), *batch[1:]])
+        await asyncio.Event().wait()
+
+    async def fail_during_admission():
+        call = servicer.Session(client(), Context())
+        await anext(call)  # Ready
+        await asyncio.to_thread(entered.wait, 10)
+        opened[0].send([b"a step the client does not read"])  # cancels the reader
+        await asyncio.sleep(0.05)  # which settles its submission
+        with pytest.raises(grpc.RpcError):
+            await anext(call)  # the call ends
+        admit.set()
+        with pytest.raises(asyncio.CancelledError):
+            await opened[0].reader  # its submission settled, then aborted
+
+    asyncio.run(fail_during_admission())
+    # close() aborted it before it was enqueued, the admission once it was.
+    assert events == ["aborted", "enqueued", "aborted"]
+
+
 def test_a_session_submission_that_fails_after_a_send_aborts_its_seq(serve):
     engine = FakeEngine()
     servicer = serve(engine)
