@@ -32,7 +32,7 @@ from torch.profiler import record_function
 
 from atom import structured_output
 from atom.config import Config, set_current_atom_config
-from atom.distributed.group_agreement import agree_kv_budget, group_min
+from atom.distributed.group_agreement import agree_kv_budget, group_agree, group_min
 from atom.distributed.pcp_utils import (
     PcpBalGroup,
     cut_pcp_prefill_ubatches,
@@ -799,6 +799,18 @@ def _profile_runner_stage(method):
     return wrapped
 
 
+def _forward_cpu_groups():
+    """The CPU groups of the ranks that run one request's forward together:
+    its TP group, then its PCP group, each when it has more than one rank."""
+    if not torch.distributed.is_initialized():
+        return ()
+    return tuple(
+        group.cpu_group
+        for group in (get_tp_group(), get_pcp_group())
+        if group.world_size > 1
+    )
+
+
 class ModelRunner:
     # The installed model's own head output (its `compute_head`, resolved at
     # install: `_head_output`), None for a model whose head output is its
@@ -1149,11 +1161,20 @@ class ModelRunner:
                 self.config.max_model_len * row_bytes, self.device
             )
         rows = self.ec_reader.read(params, cache_seed, dtype)
-        if rows is None:
+        # Every rank of the forward takes E's rows, or none does: E's rows and
+        # a rank's own tower's need not be bit-identical, and mixing them
+        # would split the ranks' activations. Each rank reaches this call for
+        # the same request at the same point of the step.
+        agreed = rows is not None
+        for group in _forward_cpu_groups():
+            agreed = group_agree(agreed, group)
+        if not agreed:
             logger.warning(
-                "Image embeddings from %s are unavailable; running the vision tower",
+                "Image embeddings from %s are unavailable%s; running the vision tower",
                 params["session"],
+                "" if rows is None else " on another rank",
             )
+            return None
         return rows
 
     def release_multimodal_requests(self, request_ids):
