@@ -194,18 +194,29 @@ def test_bind_agreed_converts_other_failures_to_refusal():
         bind_agreed(oom, None)
 
 
-def _mlir_escaped(data: bytes) -> str:
-    return "".join(
-        chr(b) if 0x20 <= b < 0x7F and b not in b'\\"' else f"\\{b:02X}" for b in data
-    )
-
-
 class _CompiledLauncher:
-    """A compiled ``@flyc.jit`` launcher as ``scratch_bytes`` / ``kernel_names``
-    read it: one artifact whose module text holds a code object's scratch size
-    (``value``: its msgpack encoding) and kernel ``name``."""
+    """A compiled launcher whose artifact is supplied by the test fixture."""
 
-    def __init__(self, value: bytes, name: bytes = b"k_s6"):
+    def __init__(self, module_text):
+        self._mem_cache = {"key": type("Artifact", (), {"_ir_text": module_text})()}
+
+    def __call__(self, *args):  # already compiled: the compile-only call is a no-op
+        pass
+
+
+@pytest.fixture
+def compiled_launcher(monkeypatch):
+    """Exercise metadata and width decisions without a compiler dependency.
+
+    Only the MLIR-to-bytes boundary is mocked. The real parser is covered by
+    test_mono_code_object.py for both Binary and Fatbin assembly.
+    """
+    from atom.mono.runtime import compile as compile_module
+
+    code_objects = {}
+    monkeypatch.setattr(compile_module, "_code_object", code_objects.__getitem__)
+
+    def make(value: bytes, name: bytes = b"k_s6"):
         elf = (
             b"\x7fELF\x02\x01"
             + b"\x9b.private_segment_fixed_size"
@@ -215,13 +226,11 @@ class _CompiledLauncher:
             + name
             + b".kd\x00"
         )
-        text = (
-            f'gpu.binary @m [#gpu.object<#rocdl.target, bin = "{_mlir_escaped(elf)}">]'
-        )
-        self._mem_cache = {"key": type("Artifact", (), {"_ir_text": text})()}
+        key = f"test-code-object-{len(code_objects)}"
+        code_objects[key] = elf
+        return _CompiledLauncher(key)
 
-    def __call__(self, *args):  # already compiled: the compile-only call is a no-op
-        pass
+    return make
 
 
 class _NoArgs:
@@ -230,15 +239,19 @@ class _NoArgs:
         return ()
 
 
-NO_SCRATCH = _CompiledLauncher(b"\x00")
+@pytest.fixture
+def no_scratch(compiled_launcher):
+    return compiled_launcher(b"\x00")
 
 
 @pytest.mark.parametrize(
     "value, size",
     [(b"\x00", 0), (b"\x24", 36), (b"\xcc\x90", 144), (b"\xcd\x14\x8c", 5260)],
 )
-def test_scratch_bytes_reads_the_code_objects_private_segment(value, size):
-    assert scratch_bytes(_CompiledLauncher(value)) == size
+def test_scratch_bytes_reads_the_code_objects_private_segment(
+    compiled_launcher, value, size
+):
+    assert scratch_bytes(compiled_launcher(value)) == size
 
 
 def _note(key: bytes, value: bytes) -> bytes:
@@ -275,7 +288,7 @@ def test_scratch_bytes_refuses_a_launcher_without_a_binary():
         scratch_bytes(launcher)
 
 
-def test_a_width_is_built_and_compiled_once():
+def test_a_width_is_built_and_compiled_once(no_scratch):
     built, compiled = [], []
 
     def build(rows):
@@ -284,7 +297,7 @@ def test_a_width_is_built_and_compiled_once():
 
     def kernels(k):
         compiled.append(k)
-        return [(NO_SCRATCH, _NoArgs)]
+        return [(no_scratch, _NoArgs)]
 
     widths = WidthBuilds(build, kernels, None, "test")
     assert widths.prepare(6) and widths.prepare(6)
@@ -306,8 +319,8 @@ def test_each_rank_compiles_its_own_share_of_a_width_first(monkeypatch):
     ]
 
 
-def test_a_built_width_logs_its_kernels_names(caplog):
-    launchers = [_CompiledLauncher(b"\x00", n) for n in (b"post_s6", b"pre_s6")]
+def test_a_built_width_logs_its_kernels_names(caplog, compiled_launcher):
+    launchers = [compiled_launcher(b"\x00", n) for n in (b"post_s6", b"pre_s6")]
     widths = WidthBuilds(
         lambda key: key, lambda k: [(x, _NoArgs) for x in launchers], None, "test"
     )
@@ -316,29 +329,31 @@ def test_a_built_width_logs_its_kernels_names(caplog):
     assert "test kernels built: post_s6, pre_s6" in caplog.text
 
 
-def test_a_width_that_fails_to_build_is_not_kept():
+def test_a_width_that_fails_to_build_is_not_kept(no_scratch):
     def build(rows):
         raise RuntimeError("trace error")
 
-    widths = WidthBuilds(build, lambda k: [(NO_SCRATCH, _NoArgs)], None, "test")
+    widths = WidthBuilds(build, lambda k: [(no_scratch, _NoArgs)], None, "test")
     assert not widths.prepare(12)
     with pytest.raises(KeyError):
         widths[12]
 
 
-def test_a_refused_width_is_not_built_again():
+def test_a_refused_width_is_not_built_again(no_scratch):
     tries = []
 
     def build(rows):
         tries.append(rows)
         raise ValueError("LDS outgrows a CU's")
 
-    widths = WidthBuilds(build, lambda k: [(NO_SCRATCH, _NoArgs)], None, "test")
+    widths = WidthBuilds(build, lambda k: [(no_scratch, _NoArgs)], None, "test")
     assert not widths.prepare(48) and not widths.prepare(48)
     assert tries == [48]
 
 
-def test_a_kernel_with_scratch_refuses_its_width_with_a_warning(caplog):
+def test_a_kernel_with_scratch_refuses_its_width_with_a_warning(
+    caplog, compiled_launcher, no_scratch
+):
     tries = []
 
     def build(rows):
@@ -348,8 +363,8 @@ def test_a_kernel_with_scratch_refuses_its_width_with_a_warning(caplog):
     widths = WidthBuilds(
         build,
         lambda k: [
-            (NO_SCRATCH, _NoArgs),
-            (_CompiledLauncher(b"\x34", b"post_s48"), _NoArgs),
+            (no_scratch, _NoArgs),
+            (compiled_launcher(b"\x34", b"post_s48"), _NoArgs),
         ],
         None,
         "test",
@@ -362,8 +377,10 @@ def test_a_kernel_with_scratch_refuses_its_width_with_a_warning(caplog):
         widths[48]
 
 
-def test_a_spilled_kernel_is_rebuilt_lean_and_its_width_served(caplog):
-    spill = _CompiledLauncher(b"\x18", b"pre_s56")
+def test_a_spilled_kernel_is_rebuilt_lean_and_its_width_served(
+    caplog, compiled_launcher, no_scratch
+):
+    spill = compiled_launcher(b"\x18", b"pre_s56")
     lean_calls = []
 
     def lean(built, spilled):
@@ -372,7 +389,7 @@ def test_a_spilled_kernel_is_rebuilt_lean_and_its_width_served(caplog):
 
     widths = WidthBuilds(
         lambda key: "fat",
-        lambda k: [(NO_SCRATCH, _NoArgs)] + ([(spill, _NoArgs)] if k == "fat" else []),
+        lambda k: [(no_scratch, _NoArgs)] + ([(spill, _NoArgs)] if k == "fat" else []),
         None,
         "test",
         lean=lean,
@@ -383,8 +400,8 @@ def test_a_spilled_kernel_is_rebuilt_lean_and_its_width_served(caplog):
     assert "pre_s56 need scratch, rebuilt lean" in caplog.text
 
 
-def test_a_lean_rebuild_that_still_spills_refuses_its_width(caplog):
-    spill = _CompiledLauncher(b"\x18", b"pre_s56")
+def test_a_lean_rebuild_that_still_spills_refuses_its_width(caplog, compiled_launcher):
+    spill = compiled_launcher(b"\x18", b"pre_s56")
     widths = WidthBuilds(
         lambda key: "fat",
         lambda k: [(spill, _NoArgs)],
@@ -397,10 +414,12 @@ def test_a_lean_rebuild_that_still_spills_refuses_its_width(caplog):
     assert "pre_s56 needs 24 B of scratch" in caplog.text
 
 
-def test_a_spill_with_nothing_leaner_refuses_without_a_rebuild(caplog):
+def test_a_spill_with_nothing_leaner_refuses_without_a_rebuild(
+    caplog, compiled_launcher
+):
     """``lean`` None (a K2 or indexer spill: no K1 build to restage) refuses
     the width on the first build, not after compiling the same one again."""
-    spill = _CompiledLauncher(b"\x18", b"post_s56")
+    spill = compiled_launcher(b"\x18", b"post_s56")
     builds = []
 
     def build(key):
@@ -431,10 +450,12 @@ def test_a_build_that_refuses_is_logged_by_its_reason(caplog):
     assert "Traceback" not in caplog.text
 
 
-def test_an_unreadable_binary_refuses_its_width_instead_of_raising(caplog):
+def test_an_unreadable_binary_refuses_its_width_instead_of_raising(
+    caplog, compiled_launcher
+):
     """A launcher whose binary cannot be read (no compiled artifact) is a build
     failure every rank agrees on, not an exception out of ``prepare``."""
-    unread = _CompiledLauncher(b"\x00")
+    unread = compiled_launcher(b"\x00")
     unread._mem_cache = {}
     widths = WidthBuilds(
         lambda key: "built", lambda k: [(unread, _NoArgs)], None, "test"
