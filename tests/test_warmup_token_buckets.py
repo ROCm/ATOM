@@ -54,7 +54,10 @@ def _runner(model_runner, monkeypatch, *, warmup_tokens, dspark=False):
     return runner, forwards
 
 
-def test_buckets_are_the_powers_of_two_below_the_warmed_count(model_runner):
+def test_buckets_are_the_powers_of_two_below_the_warmed_count(
+    model_runner, monkeypatch
+):
+    monkeypatch.setenv("ATOM_WARMUP_PREFILL_BUCKETS", "1")
     buckets = model_runner.warmup_token_buckets
     assert buckets(16384) == [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
     assert buckets(3000) == [16, 32, 64, 128, 256, 512, 1024, 2048]
@@ -65,7 +68,7 @@ def test_buckets_are_the_powers_of_two_below_the_warmed_count(model_runner):
 
 
 def test_warmup_runs_one_forward_per_bucket_after_the_first(model_runner, monkeypatch):
-    monkeypatch.delenv("ATOM_WARMUP_PREFILL_BUCKETS", raising=False)
+    monkeypatch.setenv("ATOM_WARMUP_PREFILL_BUCKETS", "1")
     runner, forwards = _runner(model_runner, monkeypatch, warmup_tokens=4096)
 
     model_runner.ModelRunner.warmup_model(runner)
@@ -83,7 +86,7 @@ def test_warmup_runs_one_forward_per_bucket_after_the_first(model_runner, monkey
 
 
 def test_a_dspark_warmup_keeps_two_sequences_per_bucket(model_runner, monkeypatch):
-    monkeypatch.delenv("ATOM_WARMUP_PREFILL_BUCKETS", raising=False)
+    monkeypatch.setenv("ATOM_WARMUP_PREFILL_BUCKETS", "1")
     runner, forwards = _runner(
         model_runner, monkeypatch, warmup_tokens=128, dspark=True
     )
@@ -93,8 +96,14 @@ def test_a_dspark_warmup_keeps_two_sequences_per_bucket(model_runner, monkeypatc
     assert forwards == [(2, 128, True), (2, 16, True), (2, 32, True), (2, 64, True)]
 
 
-def test_the_switch_leaves_the_single_warmup_forward(model_runner, monkeypatch):
-    monkeypatch.setenv("ATOM_WARMUP_PREFILL_BUCKETS", "0")
+@pytest.mark.parametrize("value", [None, "0"])
+def test_default_and_zero_leave_the_single_warmup_forward(
+    model_runner, monkeypatch, value
+):
+    if value is None:
+        monkeypatch.delenv("ATOM_WARMUP_PREFILL_BUCKETS", raising=False)
+    else:
+        monkeypatch.setenv("ATOM_WARMUP_PREFILL_BUCKETS", value)
     runner, forwards = _runner(model_runner, monkeypatch, warmup_tokens=4096)
 
     model_runner.ModelRunner.warmup_model(runner)

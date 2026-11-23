@@ -193,7 +193,7 @@ def warmup_token_buckets(warmed_tokens: int, min_seqs: int = 1) -> list[int]:
     """The power-of-two prefill token counts `ModelRunner.warmup_model` runs
     after its first forward of ``warmed_tokens``: each from
     `MIN_WARMUP_TOKEN_BUCKET` up to the largest below ``warmed_tokens``, as
-    ``min_seqs`` equal sequences. None under ATOM_WARMUP_PREFILL_BUCKETS=0.
+    ``min_seqs`` equal sequences. None unless ATOM_WARMUP_PREFILL_BUCKETS=1.
 
     A power of two is where per-bucket host work is keyed: aiter's fused MoE
     looks its tuned config up at `get_padded_M(tokens)`, the next power of two
