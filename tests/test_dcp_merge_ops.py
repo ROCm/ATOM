@@ -1250,7 +1250,7 @@ def test_pcp_reindex_builds_work_plan_only_when_read(
         gpu=torch.ones(4, dtype=torch.int32)
     )
     builder._dcp_sparse_prefill_mode = "q"
-    builder.sparse_prefill_num_heads = 64
+    builder._sparse_prefill_kv_granularity = 16
     builder._sparse_prefill_work_view_cache = {}
     for name in (
         "_sparse_prefill_work_plan",
