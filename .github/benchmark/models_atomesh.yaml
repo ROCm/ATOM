@@ -2152,7 +2152,7 @@ models:
             common:
               KV_CONNECTOR: moriio
           benchmark:
-            wait_server_timeout: 3600
+            wait_server_timeout: 1800
           run_eval: true
           eval_only: true
           accuracy:
