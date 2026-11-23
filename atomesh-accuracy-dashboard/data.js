@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795365827793,
+  "lastUpdate": 1795438573402,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -5272,6 +5272,48 @@ window.BENCHMARK_DATA = {
             "value": 0.903,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/45042373242 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611221510 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1562 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "Perry.Zhang@amd.com",
+            "name": "PerryZhang01",
+            "username": "PerryZhang01"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "cabbc6a77dce28176cff49b5cea265e014733e39",
+          "message": "fix(mesh): prefix_match refreshes only a tenant the node holds (#3539)\n\nTree::prefix_match_with_counts names the placeholder tenant \"empty\" when\nthe matched node has no tenant, and on one match in eight (epoch & 0x7)\nit inserted that name into the node's tenant_last_access_time. On an\nempty tree the node is the root, so get_used_size_per_tenant then reports\na tenant \"empty\" of size 0, and\ntest_tree_structure_integrity_after_stress fails (\"Tenant empty should\nhave positive size\") whenever a thread matches before any insert: 30 of\n500 runs alone at adbf4e3b4.\n\nThe timestamp refresh now updates the entry in place (get_mut) instead of\ninserting it, so the placeholder is never recorded, and a tenant removed\nbetween the read and the refresh is not put back either. The returned\ntenant is unchanged.\n\ntest_match_on_a_tenantless_node_records_no_tenant matches 256 times on\nan empty tree and asserts no tenant is recorded; it fails with the\ninsert restored. The stress test passes 500 of 500 alone.\n\nCo-authored-by: perzhang@amd.com <perzhang@amd.com@pit2-vm-amd-xl-02.amd.pit2.tensorwave.lan>\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>\nCo-authored-by: wanzhenchn <wanzhenchn@gmail.com>",
+          "timestamp": "2026-11-23T18:10:04+08:00",
+          "tree_id": "b4a45a324368aa3cef2f81fe387bb28b2e8301e5",
+          "url": "https://github.com/ROCm/ATOM/commit/cabbc6a77dce28176cff49b5cea265e014733e39"
+        },
+        "date": 1795438572802,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9447,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/45153588657 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202611221510 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9416 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.9052,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/45153588657 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611221510 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1713 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b-1p1d accuracy (GSM8K)",
+            "value": 0.8969,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/45153588657 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611221510 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1554 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
