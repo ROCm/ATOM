@@ -465,6 +465,47 @@ async fn an_error_keeps_its_http_status() {
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn a_streamed_ttft_includes_the_wait_for_the_first_token() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics = recorder.handle();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let fake = Arc::new(FakeAtom {
+        scripts: Mutex::new(vec![Vec::new()].into()),
+        hold: true,
+        ..Default::default()
+    });
+    let held = fake.clone();
+    tokio::spawn(async move {
+        let sender = loop {
+            if let Some(sender) = held.held.lock().unwrap().take() {
+                break sender;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for reply in [chunk(&[11]), complete(&[], "eos")] {
+            sender.send(Ok(reply)).await.unwrap();
+        }
+    });
+
+    let response = route_generate(atom_worker(&serve(fake).await), true).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let rendered = metrics.render();
+    let ttft: f64 = rendered
+        .lines()
+        .find(|line| line.starts_with("mesh_router_ttft_seconds_sum{"))
+        .and_then(|line| line.rsplit_once(' ')?.1.parse().ok())
+        .unwrap_or_else(|| panic!("no TTFT recorded: {rendered}"));
+    assert!(
+        ttft >= 0.3,
+        "TTFT {ttft} s misses the wait for the first token"
+    );
+}
+
 #[tokio::test]
 async fn dropping_the_handle_cancels_the_call() {
     let fake = Arc::new(FakeAtom {
