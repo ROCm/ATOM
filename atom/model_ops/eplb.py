@@ -2293,6 +2293,10 @@ class EPLBManager:
 
             self._t_first_step = _time.time()
         self._steps += 1
+        if self.gate_permute is not None:
+            # Group-uniform, like the step itself: the ranks' decode samplers
+            # restart their phase together.
+            self.gate_permute.sync_phase()
         next(self._gen)
 
     def trigger_offline_rebalance(self, reason: str = "manual") -> None:

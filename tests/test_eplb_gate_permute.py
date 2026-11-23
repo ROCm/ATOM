@@ -377,10 +377,10 @@ def test_decode_replays_are_sampled_from_the_held_ids(monkeypatch):
             logical[rows - 1, 1] = -1
             if rows < bucket_rows - 1:
                 held[i][rows + 1 :] = 5  # garbage the row count must cut off
-            if step % 2 == 1:
+            if step % 2 == 0:  # the first replay, then every second
                 want[i] += _logical_counts(logical)
         env.gp.after_decode_replay(key, rows)
-        if step % 2 == 1:
+        if step % 2 == 0:  # the first replay, then every second
             live_rows += rows
             sampled += 1
     # the samples sit by slot until they are read or a placement changes
@@ -392,6 +392,25 @@ def test_decode_replays_are_sampled_from_the_held_ids(monkeypatch):
     dec, _, rows_per_step, steps, *_ = env.gp.dump_global(None)
     assert dec.tolist() == want.tolist()
     assert steps == sampled and rows_per_step == pytest.approx(live_rows / sampled)
+
+
+def test_the_sampling_phase_restarts_with_a_prefill_step(monkeypatch):
+    """`sync_phase` (a prefill-bearing step ended, on every rank alike): the
+    next decode replay is sampled wherever the count stood, so ranks whose
+    counts differ sample the same steps from there."""
+    env = _setup(monkeypatch, ATOM_EPLB_DECODE_SAMPLE_EVERY=4)
+    ids = torch.full((4, TOP_K), 1, dtype=torch.int32)
+    with env.gp.decode_capture("k"):
+        env.gp.place(env.layers[0], ids)
+    sampled = []
+    for step in range(11):
+        if step in (2, 5):
+            env.gp.sync_phase()
+        before = env.gp.dec_steps
+        env.gp.after_decode_replay("k", 2)
+        if env.gp.dec_steps != before:
+            sampled.append(step)
+    assert sampled == [0, 2, 5, 9]
 
 
 def test_decode_step_without_live_rows_counts_as_a_step(monkeypatch):

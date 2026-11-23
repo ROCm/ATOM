@@ -659,8 +659,12 @@ class GatePermuteRuntime:
             self.watch_steps += 1
         if self.manager.rebalancing_stopped and not self.observing:
             return
+        # The first replay after a prefill-bearing step and every
+        # ``sample_every``-th from there: `sync_phase` restarts the count on
+        # every rank in the same step, so the ranks sample the same decode
+        # steps (they step together, and a sampled step is a little longer).
         self._replays += 1
-        if self._replays % self.sample_every:
+        if (self._replays - 1) % self.sample_every:
             return
         held = self._captures.get(key)
         if not held:
@@ -719,6 +723,12 @@ class GatePermuteRuntime:
         self.dec_load.add_(torch.gather(self.dec_raw[:, 1:], 1, self.fold_index))
         self.dec_raw.zero_()
         self._raw_dirty = False
+
+    def sync_phase(self) -> None:
+        """A prefill-bearing step ended -- on every rank in the same step
+        (`EPLBManager.on_forward_pass_end`): the decode sampler's phase
+        restarts."""
+        self._replays = 0
 
     def count_decode(self, held: list[tuple[int, torch.Tensor]], rows: int) -> None:
         """Add the ids ``held`` -- (layer id, [bucket rows, top_k] physical
