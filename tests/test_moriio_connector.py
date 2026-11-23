@@ -142,8 +142,8 @@ class ConnectorSourceTest(unittest.TestCase):
             and node.func.id == "get_port_offset"
         ]
         # Side channel, read notify, early-failure notify, handshake, write
-        # request, write report.
-        self.assertEqual(len(calls), 6)
+        # request, write report, the scheduler's release of an unmoved request.
+        self.assertEqual(len(calls), 7)
         for call in calls:
             self.assertEqual(len(call.args), 3, ast.unparse(call))
 
@@ -1588,6 +1588,215 @@ class SchedulerSlotTest(unittest.TestCase):
         meta = sched.build_connector_meta().reqs_to_recv[7]
         self.assertEqual((meta.local_slot_index, meta.remote_slot_index), (4, 6))
         self.assertEqual(meta.local_block_ids, [1, 2, 3])
+
+
+class _Ended(Exception):
+    """The scripted listener socket has handed over every message."""
+
+
+class UnmovedReleaseTest(unittest.TestCase):
+    """A decode request that ends before it reads or asks for a push.
+
+    Prefill's leg of the request is over, so no abort reaches it, and it keeps
+    the source blocks until a consumer rank's done-notify comes, which no
+    decode worker will send for a request that never reached one.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.scheduler = import_connector("MoRIIOConnectorScheduler")
+        cls.connector = import_connector()
+        if cls.scheduler is None or cls.connector is None:
+            raise unittest.SkipTest("moriio_connector needs aiter, torch and a GPU")
+        from atom.kv_transfer.disaggregation.moriio import moriio_connector
+
+        cls.module = moriio_connector
+
+    def consumer(self):
+        """A decode scheduler half holding only what its request path reads."""
+        sched = object.__new__(self.scheduler)
+        sched.is_producer = False
+        sched.engine_id = "10.0.0.2:7300"
+        sched.host_ip = "10.0.0.2"
+        sched.handshake_port = 7300
+        sched.base_handshake_port = 7300
+        sched.tp_size = 1
+        sched.dp_rank = 0
+        sched._reqs_need_recv = {}
+        sched._awaiting_send = set()
+        sched._release_sockets = {}
+        sched.request_id_to_transfer_id = {}
+        sched.transfer_id_to_request_id = {}
+        self.addCleanup(
+            lambda: [sock.close() for sock in sched._release_sockets.values()]
+        )
+        return sched
+
+    @staticmethod
+    def blob(port: int, **extra) -> dict:
+        """What prefill's `request_finished` hands decode, via the proxy."""
+        return {
+            "do_remote_prefill": True,
+            "transfer_id": 9,
+            "remote_block_ids": [5, 6, 7],
+            "remote_host": "127.0.0.1",
+            "remote_handshake_port": port,
+            "tp_size": 1,
+            **extra,
+        }
+
+    def producer_hears(self, frames: list[bytes]) -> set:
+        """What a producer rank's handshake listener reports for `frames`."""
+        import threading
+
+        rank = object.__new__(self.connector)
+        rank.done_sending = set()
+        rank._done_sending_lock = threading.Lock()
+        messages = [[b"decode", *frames]]
+
+        def recv_multipart():
+            if not messages:
+                raise _Ended
+            return messages.pop(0)
+
+        sock = mock.Mock(recv_multipart=recv_multipart)
+        context = mock.MagicMock()
+        context.__enter__.return_value = sock
+        with (
+            mock.patch.object(self.module, "_zmq_ctx", return_value=context),
+            self.assertRaises(_Ended),
+        ):
+            rank._handshake_listener({}, threading.Event(), 0, 0, 0, {})
+        return rank.done_sending
+
+    def test_a_request_ended_while_it_waited_frees_the_producer(self):
+        import zmq
+        from conftest import MockConfig
+
+        from atom.model_engine.scheduler import Scheduler
+        from atom.model_engine.sequence import Sequence
+        from atom.sampling_params import SamplingParams
+
+        def abort(decode, seq):
+            self.assertIs(decode.abort_request(seq.id), True)
+
+        def reject(decode, seq):
+            # Decode's own limits refuse what prefill's took.
+            decode.max_model_len = seq.num_tokens - 1
+            decode.schedule()
+            self.assertEqual(decode.take_rejected(), [seq])
+
+        for end in (abort, reject):
+            with self.subTest(end.__name__):
+                listener = zmq.Context.instance().socket(zmq.ROUTER)
+                listener.setsockopt(zmq.LINGER, 0)
+                self.addCleanup(listener.close)
+                port = listener.bind_to_random_port("tcp://127.0.0.1")
+                decode = Scheduler(MockConfig())
+                decode.kv_connector = consumer = self.consumer()
+                seq = Sequence(
+                    [1, 2, 3, 4],
+                    4,
+                    sampling_params=SamplingParams(max_tokens=8),
+                    kv_transfer_params=self.blob(port),
+                )
+                decode.add(seq)
+
+                end(decode, seq)
+
+                self.assertTrue(listener.poll(5000), "the producer heard nothing")
+                frames = listener.recv_multipart()[1:]
+                consumer.request_finished(seq)
+                self.assertFalse(listener.poll(100), "told once")
+                self.assertEqual(self.producer_hears(frames), {9})
+
+    def test_every_producer_rank_of_its_dp_rank_is_told(self):
+        """The producer's send is done only once each of its TP ranks reports
+        it, at the port that rank's listener binds."""
+        sent = []
+
+        class Socket:
+            def setsockopt(self, *_):
+                pass
+
+            def connect(self, addr):
+                self.addr = addr
+
+            def send_multipart(self, frames):
+                sent.append((self.addr, frames))
+
+            def close(self):
+                pass
+
+        context = mock.Mock(socket=lambda _kind: Socket())
+        fake = mock.Mock(
+            Context=mock.Mock(instance=lambda: context),
+            ZMQError=Exception,
+        )
+        seq = mock.Mock(
+            id=5,
+            kv_transfer_params=self.blob(7000, tp_size=2, remote_dp_rank=1),
+            block_table=[],
+            output_tokens=[],
+            spec_token_ids=None,
+            prefix_cache_hit_tokens=0,
+        )
+        with mock.patch.object(self.module, "zmq", fake):
+            self.consumer().request_finished(seq)
+
+        notice = [b"pop_done_recv", b"9"]
+        self.assertEqual(
+            sent,
+            [("tcp://127.0.0.1:7002", notice), ("tcp://127.0.0.1:7003", notice)],
+        )
+
+    def test_a_request_that_queued_its_transfer_sends_nothing(self):
+        """Its worker moves the KV and sends the done-notify itself."""
+        consumer = self.consumer()
+        seq = mock.Mock(
+            id=5,
+            kv_transfer_params=self.blob(7000),
+            block_table=[1, 2, 3],
+            output_tokens=[],
+            spec_token_ids=None,
+            prefix_cache_hit_tokens=0,
+            state_slot=-1,
+        )
+        consumer.update_state_after_alloc(seq)
+        with mock.patch.object(self.module, "zmq", None):
+            consumer.request_finished(seq)
+
+    def test_notices_to_an_unreachable_producer_never_block_the_step_loop(self):
+        """At a DEALER's default high-water mark, the send after the
+        thousandth queued notice would block."""
+        import signal
+        import socket
+
+        with socket.socket() as unbound:
+            unbound.bind(("127.0.0.1", 0))
+            port = unbound.getsockname()[1]
+        consumer = self.consumer()
+
+        def blocked(*_):
+            raise TimeoutError("a notice blocked the step loop")
+
+        previous = signal.signal(signal.SIGALRM, blocked)
+        signal.alarm(20)
+        try:
+            for i in range(1001):
+                consumer.request_finished(
+                    mock.Mock(
+                        id=i,
+                        kv_transfer_params=self.blob(port),
+                        block_table=[],
+                        output_tokens=[],
+                        spec_token_ids=None,
+                        prefix_cache_hit_tokens=0,
+                    )
+                )
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous)
 
 
 class WrapperMessagingTest(unittest.TestCase):
