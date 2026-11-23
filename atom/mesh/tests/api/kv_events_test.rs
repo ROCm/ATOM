@@ -373,18 +373,23 @@ async fn served_by(app: &Router, uri: &str, body: &Value) -> String {
     response.headers()["x-worker-id"].to_str().unwrap().into()
 }
 
-/// Registers a worker and waits until it is listed among `listed` workers.
-async fn register(app: &Router, url: &str, listed: usize) {
+/// Registers a worker and waits until it is listed among `listed` workers and its
+/// registration job is done: the worker serves once activated, which does not wait for
+/// its model's policy, so a request before that is placed by the default policy.
+async fn register(ctx: &AppTestContext, app: &Router, url: &str, listed: usize) {
     let (status, _) = call(app, "POST", "/workers", Some(json!({"url": url}))).await;
     assert!(status.is_success(), "{status}");
+    let jobs = ctx.app_context.worker_job_queue.get().unwrap();
     for _ in 0..1500 {
         let (_, workers) = call(app, "GET", "/workers", None).await;
-        if workers["workers"].as_array().map(Vec::len) == Some(listed) {
+        if workers["workers"].as_array().map(Vec::len) == Some(listed)
+            && jobs.get_status(url).is_none()
+        {
             return;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    panic!("{url} was not listed");
+    panic!("{url} was not registered: {:?}", jobs.get_status(url));
 }
 
 /// A tokenizer that, as Llama's, puts `<s>` before the words `a` to `i`, and renders a
@@ -473,11 +478,11 @@ async fn cache_aware_places_requests_by_the_kv_event_index() {
     ];
 
     // The tree learns each request on the worker without KV events, alone yet.
-    register(&app, &workers[1].1, 1).await;
+    register(&ctx, &app, &workers[1].1, 1).await;
     for (uri, body) in &requests {
         assert_eq!(served_by(&app, uri, body).await, workers[1].2);
     }
-    register(&app, &workers[0].1, 2).await;
+    register(&ctx, &app, &workers[0].1, 2).await;
     let joined = |sources: &Value| sources[0]["batches"].as_u64() > Some(0);
     sources_once(&app, Some(&mut publisher), joined).await;
     publish(&mut publisher, 1, sample("stored_root")).await;
