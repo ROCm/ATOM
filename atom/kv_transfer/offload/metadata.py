@@ -143,6 +143,24 @@ class NativeStateTransfer:
     kv_only: bool = False
 
 
+@dataclass(frozen=True)
+class PrehashedSave:
+    """A save named by its LMCache chunk hashes instead of its token prefix.
+
+    ``hashes[i]`` is LMCache's prefix-chained hash of the chunk that covers
+    tokens ``[start + i * chunk, start + (i + 1) * chunk)``, computed by the
+    scheduler with the lookup client's token database. ``start`` is
+    chunk-aligned and equals the save's ``skip_leading_tokens``; the worker
+    builds each chunk's key with LMCache's ``_make_key_by_hash`` and never sees
+    the prefix tokens. ``token_ids`` (tokens ``[start, end)``) is shipped only
+    when LMCache KV events are on, for the events ``store`` would emit.
+    """
+
+    start: int
+    hashes: tuple[int, ...]
+    token_ids: tuple[int, ...] | None = None
+
+
 @dataclass
 class LMCacheReqMeta:
     """Everything the worker needs to load/save one request's KV this step."""
@@ -183,6 +201,9 @@ class LMCacheReqMeta:
     after_forward: bool = False
     # The prompt's media identity (`tier_cache_salt`), part of every key.
     cache_salt: str = ""
+    # Set instead of `token_ids`: the save's new chunks as LMCache chunk
+    # hashes (see `PrehashedSave`).
+    prehashed_save: PrehashedSave | None = None
 
 
 class LMCacheOffloadMetadata(ConnectorMetadata):
