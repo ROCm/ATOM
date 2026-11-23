@@ -202,13 +202,22 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                 let replacement = loader().await;
                 result = match replacement {
                     Ok(tokenizer) => {
-                        if let Some(entry) = registry.remove_by_id(loaded) {
+                        // Lookups read the replaced entry until the new one is in.
+                        let replaced = registry.get_by_id(loaded);
+                        let swapping = &app_context.tokenizers_replaced;
+                        if let Some(entry) = &replaced {
+                            swapping.insert(name.clone(), entry.clone());
+                        }
+                        registry.remove_by_id(loaded);
+                        let swapped = registry
+                            .load(&id, &name, &source, || async { Ok(tokenizer) })
+                            .await;
+                        swapping.remove(&name);
+                        if let Some(entry) = replaced {
                             crate::routers::prepare::thread_tokenizer::release_copies(&entry.id);
                             app_context.forget_tokenizer(&entry.id);
                         }
-                        registry
-                            .load(&id, &name, &source, || async { Ok(tokenizer) })
-                            .await
+                        swapped
                     }
                     Err(e) => Err(LoadError::LoadFailed(e)),
                 };
@@ -552,6 +561,7 @@ mod tests {
         register(None, path).await.unwrap();
         assert_eq!(loaded().id, file_loaded);
         assert!(context.tokenizer_inline_templates.read().is_empty());
+        assert!(context.tokenizers_replaced.is_empty());
     }
 
     /// Overlapping registrations with other templates replace the tokenizer one at a

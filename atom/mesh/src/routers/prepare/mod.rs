@@ -1,7 +1,6 @@
 //! Transport-neutral request preparation: HTTP request → (GenerationPayload, ResponseContext).
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use axum::response::Response;
 use http::HeaderMap;
@@ -16,7 +15,7 @@ use crate::{
         generate::GenerateRequest,
     },
     routers::comm::error,
-    tokenizer::traits::Tokenizer,
+    tokenizer::{registry::TokenizerEntry, traits::Tokenizer},
 };
 
 pub(crate) mod chat_template;
@@ -39,32 +38,40 @@ use response_context::{ProtocolRequest, ResponseContext};
 use stop_decoder_builder::create_stop_decoder;
 use tool_constraints::{filter_chat_request_by_tool_choice, generate_tool_constraints};
 
-/// How long a lookup waits for a registration swapping the model's tokenizer.
-const TOKENIZER_SWAP_WAIT: Duration = Duration::from_secs(1);
+/// The model's tokenizer entry; while a registration swaps it, the one being replaced.
+fn tokenizer_entry(model_id: &str, components: &AppContext) -> Option<TokenizerEntry> {
+    let registry = &components.tokenizer_registry;
+    let registered = || {
+        registry
+            .get_by_name(model_id)
+            .or_else(|| registry.get_by_id(model_id))
+    };
+    // Missed between a swap's removal and insert: the replaced entry, or, once it
+    // is forgotten, the replacement.
+    let replaced = || {
+        components
+            .tokenizers_replaced
+            .get(model_id)
+            .map(|e| e.clone())
+    };
+    registered().or_else(replaced).or_else(registered)
+}
 
-/// A model whose tokenizer is missing while a registration of its name runs
-/// waits, up to `TOKENIZER_SWAP_WAIT`, for that registration, then looks again.
+fn tokenizer_not_found(model_id: &str) -> Response {
+    error!(model = %model_id, "Tokenizer not found for model");
+    error::internal_error(
+        "tokenizer_not_found",
+        format!("Tokenizer not found for model: {}", model_id),
+    )
+}
+
 pub fn lookup_tokenizer(
     model_id: &str,
     components: &AppContext,
 ) -> Result<Arc<dyn Tokenizer>, Response> {
-    let registry = &components.tokenizer_registry;
-    let swapped_in = || {
-        // A replacement removes the old tokenizer, then inserts the new one.
-        let reconciling = components.tokenizer_reconciling.get(model_id)?.clone();
-        let deadline = Instant::now() + TOKENIZER_SWAP_WAIT;
-        while reconciling.try_lock().is_err() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        registry.get(model_id)
-    };
-    registry.get(model_id).or_else(swapped_in).ok_or_else(|| {
-        error!(model = %model_id, "Tokenizer not found for model");
-        error::internal_error(
-            "tokenizer_not_found",
-            format!("Tokenizer not found for model: {}", model_id),
-        )
-    })
+    tokenizer_entry(model_id, components)
+        .map(|entry| entry.tokenizer)
+        .ok_or_else(|| tokenizer_not_found(model_id))
 }
 
 pub fn prepare_chat(
