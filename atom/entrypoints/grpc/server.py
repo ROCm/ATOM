@@ -22,7 +22,10 @@ from google.protobuf.json_format import MessageToDict
 
 from atom.entrypoints.grpc import atom_grpc_pb2 as pb
 from atom.entrypoints.grpc import atom_grpc_pb2_grpc as pb_grpc
+from atom.entrypoints.grpc import frames
+from atom.entrypoints.grpc.session import Sessions
 from atom.entrypoints.openai.api_compatibility import api_compatibility_for
+from atom.entrypoints.openai.frontend_workers import worker_seq_ids
 from atom.entrypoints.openai.protocol import (
     DEFAULT_MAX_TOKENS,
     DEFAULT_TEMPERATURE,
@@ -40,6 +43,7 @@ from atom.entrypoints.openai.serving_chat import (
 )
 from atom.entrypoints.openai.tool_parser.registry import channel_for_request
 from atom.model_engine.request import RequestOutput
+from atom.model_engine.sequence import Sequence
 from atom.model_engine.zmq_protocol import engine_v1_pb2 as v1
 from atom.structured_output.validation import (
     raise_for_structured_error,
@@ -57,6 +61,7 @@ STRUCTURED_FIELDS = (
     "structured_tool_format",
     "structured_reasoning_end",
 )
+N_ABOVE_1 = "n above 1 is not served over gRPC; send one request each"
 # SamplingParams fields Generate does not serve: no logprobs in its answer, and the
 # structured ones derived from structured_output.
 UNSERVED_FIELDS = {
@@ -74,15 +79,16 @@ class StepOutputs:
     def __init__(self):
         self._local = threading.local()
 
-    def callback(self, queue: asyncio.Queue) -> Callable[[RequestOutput], None]:
-        """A stream callback buffering for `queue`, which the running loop reads."""
+    def callback(self, put, end=None) -> Callable[[RequestOutput], None]:
+        """A stream callback buffering each output for `put`, called on the running loop;
+        `end`, if given, runs there once after the step's last output."""
         loop, local = asyncio.get_running_loop(), self._local
 
         def buffer(output: RequestOutput) -> None:
             step = getattr(local, "step", None)
             if step is None:
                 step = local.step = defaultdict(list)
-            step[loop].append((queue, output))
+            step[loop].append((put, end, output))
 
         return buffer
 
@@ -98,9 +104,14 @@ class StepOutputs:
                 pass
 
 
-def _deliver(outputs: list[tuple[asyncio.Queue, RequestOutput]]) -> None:
-    for queue, output in outputs:
-        queue.put_nowait(output)
+def _deliver(outputs: list[tuple[Callable, Callable | None, RequestOutput]]) -> None:
+    ends = {}
+    for put, end, output in outputs:
+        put(output)
+        ends[end] = None
+    for end in ends:
+        if end is not None:
+            end()
 
 
 class _Call:
@@ -119,6 +130,7 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
         self.api = api
         self.model_path = model_path  # --model, which the tokenizer loads from
         self.steps = StepOutputs()
+        self.sessions = Sessions(api)
         self.live: dict[str, set[_Call]] = {}  # request_id: its Generate calls
 
     async def Generate(self, request, context):
@@ -148,7 +160,7 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
                     api.engine.io_processor.preprocess,
                     prompt,
                     params,
-                    stream_callback=self.steps.callback(outputs),
+                    stream_callback=self.steps.callback(outputs.put_nowait),
                     kv_transfer_params=api._engine_kv_transfer_params(
                         kv_transfer_params
                     ),
@@ -235,7 +247,7 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
         kv_transfer_params and its stop ids as given."""
         api, sampling = self.api, request.sampling
         if sampling.n > 1:
-            raise ValueError("n above 1 is not served over gRPC; send one request each")
+            raise ValueError(N_ABOVE_1)
         kv_transfer_params = _kv_transfer_params(request)
         api._validate_chunked_receive(kv_transfer_params)
         temperature = _optional(sampling, "temperature", DEFAULT_TEMPERATURE)
@@ -297,6 +309,99 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
             kv_transfer=kv_transfer_params,
         )
         return {name: getattr(chat_params, name) for name in STRUCTURED_FIELDS}
+
+    async def Session(self, request_iterator, context):
+        """engine_v1 messages both ways, Ready first, its seq ids in a window of its own;
+        once the client's side ends, is cancelled or unreadable, its requests abort."""
+        session = self.sessions.open()
+        if session is None:
+            await context.abort(
+                grpc.StatusCode.RESOURCE_EXHAUSTED, "no Session window free"
+            )
+        reader = asyncio.create_task(self._read(session, request_iterator))
+        try:
+            ready = frames.encode_ready(self.api._get_engine_max_pool_tokens())
+            yield pb.Frames(frames=ready)
+            while (message := await session.outbox.get()) is not None:
+                yield pb.Frames(frames=message)
+            await reader  # how the client's side ended
+        except frames.FrameError as error:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
+        finally:
+            reader.cancel()
+            session.close()
+
+    async def _read(self, session, request_iterator) -> None:
+        """Admits and aborts what the client sends, in order, until its side ends."""
+        try:
+            async for message in request_iterator:
+                kind, items = frames.decode_client(message.frames)
+                if kind == "abort":
+                    session.abort(items)
+                    continue
+                refused = []
+                for item in items:
+                    if isinstance(item, frames.Rejection):  # the codec's INVALID
+                        refused.append(item)
+                        continue
+                    try:
+                        await self._submit(session, item)
+                    except Exception as error:  # noqa: BLE001 - refused as Generate is
+                        refused.append(_rejected(item.seq_id, error))
+                session.reject(refused)
+        finally:
+            session.outbox.put_nowait(None)
+
+    async def _submit(self, session, request: frames.SubmitRequest) -> None:
+        """Admits one RequestSpec as Generate admits a request, under the Session's id
+        for it, with the structured fields PrepareStructuredOutput answered."""
+        api, given = self.api, request.sampling_params
+        seq_id = session.seq_id(request.seq_id)
+        if given.n > 1:
+            raise ValueError(N_ABOVE_1)
+        if given.logprobs or given.top_logprobs:
+            raise ValueError("logprobs are not served over the Session")
+        kv_transfer_params = request.kv_transfer_params
+        api._validate_chunked_receive(kv_transfer_params)
+        params = api._build_sampling_params(
+            temperature=given.temperature,
+            max_tokens=validate_max_tokens(given.max_tokens),
+            max_tokens_is_default=given.max_tokens_is_default,
+            stop_strings=None,  # they arrive as ids, which preprocess takes
+            ignore_eos=given.ignore_eos,
+            top_k=given.top_k,
+            top_p=given.top_p,
+        )
+        structured = {name: getattr(given, name) for name in STRUCTURED_FIELDS}
+        params = replace(params, **structured)
+        prompt = resolve_prompt_token_ids(request.prompt_token_ids, kv_transfer_params)
+        preprocessing = asyncio.get_running_loop().run_in_executor(
+            None,
+            partial(
+                api.engine.io_processor.preprocess,
+                prompt,
+                params,
+                stream_callback=self.steps.callback(session.put, session.flush),
+                kv_transfer_params=api._engine_kv_transfer_params(kv_transfer_params),
+                data_parallel_rank=request.data_parallel_rank,
+                dp_session_id=request.dp_session_id,
+                dp_parent_session_id=request.dp_parent_session_id,
+                stop_token_sequences=request.stop_token_sequences,
+                seq_id=seq_id,
+            ),
+        )
+        try:
+            seq = await asyncio.shield(preprocessing)
+        except asyncio.CancelledError:  # the Session ended: drop the seq once made
+            preprocessing.add_done_callback(partial(_drop_preprocessed, api))
+            raise
+        session.add(request.seq_id, seq, request.request_id)
+        try:
+            api._validate_sequence_context_length(seq, params)
+            await api._submit_engine_requests([seq])
+        except BaseException:
+            session.drop(request.seq_id)
+            raise
 
     async def _write(self, context, request, response) -> None:
         kind = "stream_chunk" if response.HasField("chunk") else "response"
@@ -416,6 +521,19 @@ def _refusal(error: Exception, rpc: str) -> pb.GenerateError:
     return pb.GenerateError(message=message, http_status=status)
 
 
+def _rejected(seq_id: int, error: Exception) -> frames.Rejection:
+    """`error` as Generate answers it, with the code atomesh reads back as that status:
+    INVALID for a 4xx, OVERLOADED for 503 and INTERNAL otherwise."""
+    refusal, codes = _refusal(error, "Session"), v1.RejectedRequest
+    if 400 <= refusal.http_status < 500:
+        code = codes.INVALID
+    elif refusal.http_status == 503:
+        code = codes.OVERLOADED
+    else:
+        code = codes.INTERNAL
+    return frames.Rejection(seq_id, refusal.message, code)
+
+
 def _then(flush: Callable[[], None] | None, more: Callable[[], None]):
     """One per-step flush: `flush`, then `more` even when `flush` fails."""
 
@@ -445,6 +563,9 @@ def startup_refusal(tokenizer) -> str | None:
 def start_grpc_server(api: ModuleType, args: Namespace) -> Callable[[], None]:
     """Serve AtomEngine on `--host`:`--grpc-port`; once it listens, return its stop,
     or raise why it cannot listen."""
+    # The API process's own ids wrap inside [0, 2^24), window -1 in worker_seq_ids'
+    # numbering: below every Session's window.
+    Sequence.counter = worker_seq_ids(-1, next(Sequence.counter))
     host = f"[{args.host}]" if ":" in args.host else args.host  # an IPv6 address
     address, servicer = f"{host}:{args.grpc_port}", AtomEngineServicer(api, args.model)
     # Before the listener starts: the per-step flush hands gRPC every call's outputs.
@@ -474,7 +595,7 @@ def _run(address: str, servicer: AtomEngineServicer, listening: Future) -> None:
 
 async def _serve(address: str, servicer: AtomEngineServicer, listening: Future) -> None:
     # Without SO_REUSEPORT a second server on the port fails, not shares it; a long
-    # prompt's Generate may pass gRPC's default 4 MiB, so no receive limit.
+    # prompt's Generate or a Session's SubmitBatch may pass gRPC's default 4 MiB.
     options = [("grpc.so_reuseport", 0), ("grpc.max_receive_message_length", -1)]
     try:
         server = grpc.aio.server(options=options)
