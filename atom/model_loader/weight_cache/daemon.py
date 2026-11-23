@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import gc
+import glob
 import multiprocessing
 import os
 import queue
@@ -55,7 +56,11 @@ from atom.model_loader.weight_cache.values import (
     logger,
     release_checksum_buffers,
 )
-from atom.utils import get_hf_text_config, worker_process_name
+from atom.utils import (
+    get_hf_text_config,
+    shutdown_all_processes,
+    worker_process_name,
+)
 
 # Without a connected server: an idle daemon still holds every GPU's weights.
 _IDLE_TIMEOUT_S = 3600
@@ -113,7 +118,7 @@ def run_daemon(engine_args) -> None:
     for p in procs:
         p.start()
     serving: set[int] = set()
-    failed = []
+    exited = []
     while not signaled:
         with contextlib.suppress(queue.Empty):
             serving.add(ready.get(timeout=1.0))
@@ -123,22 +128,18 @@ def run_daemon(engine_args) -> None:
                     f"{_TAG} daemon ready: {n} rank(s) serve their weights "
                     f"({time.monotonic() - t0:.0f}s)"
                 )
-        failed = [p.name for p in procs if p.exitcode is not None]
-        if failed:
+        exited = [p for p in procs if p.exitcode is not None]
+        if exited:
             break
-    # A Ctrl-C reaches the ranks too: their exit is then no failure.
-    failed = [] if signaled else failed
-    if failed:
-        logger.error(f"{_TAG} daemon process(es) {failed} exited; stopping the daemon")
-    for p in procs:
-        if p.is_alive():
-            p.terminate()  # each stops serving and exits
-    deadline = time.monotonic() + 60
-    for p in procs:
-        p.join(max(0.0, deadline - time.monotonic()))
-        if p.is_alive():
-            p.kill()
-            p.join(5)
+    # A Ctrl-C reaches the ranks too: their exit is then no failure. Nor is
+    # an exit with 0: that rank's load cannot be cached (_load_and_serve).
+    gone = [] if signaled else exited
+    failed = [p.name for p in gone if p.exitcode != 0]
+    if gone:
+        say = logger.error if failed else logger.info
+        names = [p.name for p in gone]
+        say(f"{_TAG} daemon process(es) {names} exited; stopping the daemon")
+    shutdown_all_processes(procs, 60)  # each stops serving and exits
     del store
     logger.info(f"{_TAG} daemon stopped")
     if failed:
@@ -177,9 +178,7 @@ def _serve_rank(rank: int, config, ready, index: int, all_serving) -> None:
     # leaves MoE communication setup to the servers that take the weights.
     loader.MOE_PREPARE_FINALIZE = False
     device = init_model_env(config, rank, device_communicators=False)
-    server, pool = _load_and_serve(
-        config, rank, device, path, lock, t0, used_before=_device_used(device)
-    )
+    server, pool = _load_and_serve(config, rank, device, path, lock, t0)
     # Flags: a handler that takes a lock could land inside its holder.
     signaled, idle = [], []
 
@@ -332,14 +331,28 @@ def _leave_out_shared(d, target) -> list[str]:
     ]
 
 
-def _device_used(device) -> int:
-    free, total = torch.cuda.mem_get_info(device)
-    return total - free
+def _own_vram(pdev: str, fdinfo: str = "/proc/self/fdinfo") -> int | None:
+    """The memory this process holds on the GPU at PCI address ``pdev``, as
+    the kernel counts it for the process (DRM fdinfo); None: it does not say."""
+    units, held = {"KiB": 10, "MiB": 20}, []
+    for path in glob.glob(os.path.join(fdinfo, "*")):
+        with contextlib.suppress(OSError, ValueError, KeyError), open(path) as f:
+            info = dict(line.split(":", 1) for line in f if ":" in line)
+            if info["drm-pdev"].strip() == pdev:
+                n, unit = info["drm-memory-vram"].split()
+                held.append(int(n) << units[unit])
+    return max(held, default=None)
 
 
-def _load_and_serve(config, rank, device, path, lock, t0, used_before: int):
-    """``used_before``: the device memory in use before this rank loaded
-    (other processes' and this one's context)."""
+def _own_device_memory(device) -> int:
+    """What this process holds on ``device``: the device's total would count
+    a server that starts beside a daemon started by hand. No less than the
+    allocator holds, where the kernel does not say."""
+    own = _own_vram(gpu_identity(device).split("|")[1] + ".0")
+    return max(own or 0, torch.cuda.memory_reserved(device))
+
+
+def _load_and_serve(config, rank, device, path, lock, t0):
     label = worker_process_name(config, rank)
     load = _DaemonLoad(rank)
     get_model(config, device, load)
@@ -364,9 +377,9 @@ def _load_and_serve(config, rank, device, path, lock, t0, used_before: int):
     for p, ks in zip(parts, keys):
         p["storages"] = {k: handles[k] for k in ks}
     total = sum(v.numel() for v in views.values())
-    # What the load left beside the weights (kernels it loaded, gaps between
-    # the weights); a server's KV budget leaves it out.
-    load_extra = max(_device_used(device) - used_before - total, 0)
+    # What this process holds beside the weights (its runtime, the kernels it
+    # loaded, gaps between the weights); a server's KV budget leaves it out.
+    load_extra = max(_own_device_memory(device) - total, 0)
     payload = {
         "key": load.key,
         "structure": exported_structure(rec.built, export),

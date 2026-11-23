@@ -40,6 +40,7 @@ from atom.model_loader.weight_cache.preload import (
     launch_recorded,
     stop_daemon,
     uncacheable,
+    unsupported,
 )
 from atom.model_loader.weight_cache.transport import (
     _recv,
@@ -58,7 +59,7 @@ _NONE, _USABLE, _UNUSABLE = range(3)
 # [the drafter part] of the payload this process took its model from, for
 # load_drafter_from_cache, which runs after the model's.
 _draft: list | None = None
-# What that daemon's load left on the GPU beside the weights it maps here.
+# What that daemon's process holds on the GPU beside the weights it maps here.
 _load_extra = 0
 
 
@@ -229,10 +230,6 @@ def _check_payload(payload: dict, key: dict) -> list[str]:
         return [
             "the checkpoint, the shard or a setting that decides it differ:"
         ] + diffs
-    if payload["export"]["unshippable"]:
-        return ["the daemon's load created state that cannot be shared:"] + payload[
-            "export"
-        ]["unshippable"]
     return []
 
 
@@ -376,6 +373,8 @@ def _replace_daemon(
         started = _spawn_daemon()
     except _Miss as e:
         err = str(e)
+    except Exception as e:  # noqa: BLE001 - every rank must reach the agreement
+        err = f"could not start a weight cache daemon: {e!r}"
     if not group_agree(err is None, me.group):
         # No daemon holds these GPUs now: none was there, or it was stopped.
         logger.warning(
@@ -442,9 +441,17 @@ def load_from_cache(config, model_class, device, *, rank: int) -> nn.Module | No
             "loading from disk"
         )
         return None
+    # Before the first collective: every rank, on every node, leaves here.
+    why = unsupported(config)
+    if why:
+        logger.warning(
+            f"{_TAG} {worker_process_name(config, rank)}: the weight cache does "
+            f"not support {', '.join(why)}; loading from disk"
+        )
+        return None
     t0 = time.perf_counter()
     me = _rank(config, device, rank)
-    # The daemon this launch started (the API server may have already).
+    # The daemon ranks of this launch started before this call, if any.
     started = _started_by_launch()
     # Taken once, before this server builds anything (as the daemon's was).
     key = compute_key(config, rank)

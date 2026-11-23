@@ -106,17 +106,20 @@ def _checkpoint_digest(model_path: str) -> str:
     root = os.path.realpath(model_path)
     if not os.path.isdir(root):
         return f"path:{root}"
-    h = hashlib.sha256()
+    h, weights = hashlib.sha256(), False
     for name in sorted(os.listdir(root)):
         if not any(fnmatch.fnmatch(name, p) for p in _LOADED_FILES):
             continue
         path = os.path.join(root, name)
         h.update(f"{name}\0{file_identity(path)}\n".encode())
         if name.endswith(".safetensors"):
+            weights = True
             with contextlib.suppress(OSError), open(path, "rb") as f:
                 n = int.from_bytes(f.read(8), "little")
                 h.update(f.read(min(n, _MAX_SAFETENSORS_HEADER_BYTES)))
-    return h.hexdigest()
+    # No weights there yet (a hub model before its download): the other files
+    # do not tell two repos or revisions apart, the snapshot's path does.
+    return h.hexdigest() if weights else f"incomplete:{root}:{h.hexdigest()}"
 
 
 def _setting(config, name: str) -> str:

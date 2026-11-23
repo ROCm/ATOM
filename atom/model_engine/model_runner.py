@@ -103,6 +103,12 @@ from atom.model_engine.token_logprobs import (
     pack_token_logprobs,
     unpack_token_logprobs,
 )
+from atom.model_loader.weight_cache.client import (
+    daemon_load_extra,
+    load_drafter_from_cache,
+    load_from_cache,
+)
+from atom.model_loader.weight_utils import params_on_meta
 from atom.model_ops.attentions.pool_layout.entry_arena import plan_regions
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
     InsufficientPoolBudget,
@@ -806,9 +812,6 @@ class ModelRunner:
     # the target's launch (`prepare_model`).
     compute_head: Callable | None = None
     spec_status_deferred = False
-    # Device memory a weight cache daemon holds beside the weights it gave
-    # this runner (client.daemon_load_extra), left out of the KV budget.
-    _daemon_load_extra = 0
 
     def __init__(self, rank: int, config: Config):
         self.config = config
@@ -1076,13 +1079,8 @@ class ModelRunner:
         """
         if envs.ATOM_PRELOAD == "server":
             # A weight cache daemon's weights, if it can give them.
-            from atom.model_loader.weight_cache.client import load_from_cache
-
             model = load_from_cache(config, model_class, device, rank=self.rank)
             if model is not None:
-                from atom.model_loader.weight_cache.client import daemon_load_extra
-
-                self._daemon_load_extra = daemon_load_extra()
                 return model
         model = build_model(config, model_class, device)
         load_start = time.perf_counter()
@@ -1100,8 +1098,6 @@ class ModelRunner:
         """Construct the drafter and load its weights, sharing with the loaded
         model what the draft does not hold itself."""
         if envs.ATOM_PRELOAD == "server":
-            from atom.model_loader.weight_cache.client import load_drafter_from_cache
-
             drafter = load_drafter_from_cache(
                 self.config, self.device, self, self.model, rank=self.rank
             )
@@ -1969,8 +1965,8 @@ class ModelRunner:
         # torch-reserved. Ignoring it over-allocates KV and OOMs at runtime.
         non_torch = max((total - free) - torch.cuda.memory_reserved(), 0)
         # A weight cache daemon's weights count here, as a disk load's would;
-        # what its load left beside them is left out (the headroom holds it).
-        non_torch = max(non_torch - self._daemon_load_extra, 0)
+        # what it holds beside them is left out (the headroom holds it).
+        non_torch = max(non_torch - daemon_load_extra(), 0)
 
         cudagraph_overhead = self._estimate_cudagraph_overhead()
         safety_margin = int(total * 0.02)
@@ -4790,8 +4786,6 @@ class RapidServeModelRunner(ModelRunner):
         # bytes (avoids the transient 2x-weights peak that OOMs at TP=4);
         # import_model_weight_ipc_handles() materializes params from prefill,
         # and RoPE caches are recomputed locally.
-        from atom.model_loader.weight_utils import params_on_meta
-
         with params_on_meta():
             return build_model(config, model_class, device)
 

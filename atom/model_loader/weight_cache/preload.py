@@ -109,9 +109,11 @@ def unsupported(config) -> list[str]:
     own sharing), and a daemon serves the GPUs of its own node. A daemon has no
     device communicators (sequence parallelism builds on them), a server
     builds without its weights (--fake-eplb makes a tensor from one), and
-    streaming online quantization swaps parameters the daemon's diff holds."""
+    streaming online quantization swaps parameters the daemon's diff holds.
+    Every rank of a launch gets the same answer, on every node."""
     default_runner = "atom.model_engine.model_runner.ModelRunner"
     streams = envs.ATOM_ONLINE_QUANT_STREAMING and config.online_quant_config
+    pc = config.parallel_config
     checks = (
         (config.runner_qualname, config.runner_qualname != default_runner),
         ("EPLB", config.eplb_enable),
@@ -119,7 +121,11 @@ def unsupported(config) -> list[str]:
         ("streaming online quantization", bool(streams)),
         ("pipeline parallelism", config.pipeline_parallel_size > 1),
         ("sequence parallelism", config.sequence_parallel_size > 1),
-        ("data parallelism across nodes", config.parallel_config.is_multinode_dp),
+        # Not is_multinode_dp, which is also true of a worker's own rank > 0.
+        (
+            "data parallelism across nodes",
+            pc.data_parallel_size_local < pc.data_parallel_size,
+        ),
         ("tensor parallelism across nodes", config.is_multinode_tp),
     )
     return [name for name, used in checks if used]
@@ -150,14 +156,6 @@ def record_launch() -> None:
         _record_launch()
     except OSError as e:
         _off(str(e))
-
-
-def check_launch(config) -> None:
-    """Called by the engine with the launch's Config, before any runner
-    starts: a launch the cache does not serve goes without it."""
-    why = unsupported(config) if launch_recorded() else []
-    if why:
-        _off("the weight cache does not support " + ", ".join(why))
 
 
 def _record_launch() -> None:
@@ -251,12 +249,15 @@ def _spawn_daemon() -> dict:
         info = {"pid": pid, "log": log, "created": psutil.Process(pid).create_time()}
     except Exception as e:  # noqa: BLE001 - the other ranks wait for the marker
         info = {"error": f"could not start a weight cache daemon: {e!r}"}
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(info, f)
+    except OSError as e:  # the other ranks do not learn of the daemon
+        info = {"error": f"could not record the weight cache daemon: {e!r}"}
+    if "error" in info:
         if pid is not None:  # started all the same: not next to the disk load
             with contextlib.suppress(ProcessLookupError):
                 os.kill(pid, signal.SIGTERM)
-    with os.fdopen(fd, "w") as f:
-        json.dump(info, f)
-    if "error" in info:
         raise _Miss(info["error"])
     return info
 
@@ -276,15 +277,18 @@ def stop_daemon(path: str, timeout_s: float = 180) -> int | None:
         # daemon that died here).
         time.sleep(0.2)
     proc, main = state.get("pid"), state.get("daemon_pid")
+    why = None
     if not _pid_running(proc):
-        raise RuntimeError(
+        why = (
             f"the daemon holding {path}.lock (pid {proc}) does not run in this PID "
             "namespace (another container?); stop it where it runs"
         )
-    if not main or main not in _ancestors(proc):
-        raise RuntimeError(
-            f"cannot find the main process of the daemon holding {path}.lock (process {proc})"
-        )
+    elif not main or main not in _ancestors(proc):
+        why = f"cannot find the main process of the daemon holding {path}.lock (process {proc})"
+    if why:
+        if not daemon_alive(path):
+            return None  # it exited by itself meanwhile
+        raise RuntimeError(why)
     if main == 1:
         raise RuntimeError(
             "the daemon's main process is this container's PID 1: stopping it would "
@@ -360,6 +364,8 @@ def _hold_unused(path: str, wait_s: float = 5):
                 return None, None  # it has stopped serving and exited
         except Exception as e:  # noqa: BLE001 - every rank must reach the agreement
             sock.close()
+            if not daemon_alive(path):
+                return None, None  # it exited by itself while it was asked
             return None, f"could not ask the daemon whether servers use it: {e!r}"
         sock.close()
         if time.monotonic() > deadline:
