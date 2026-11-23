@@ -36,6 +36,7 @@ from atom.model_ops.v4_kernels import make_compress_plans
 from atom.model_ops.v4_kernels.state_writes import swa_write
 from atom.utils import CpuGpuBuffer, upload_numpy
 
+from .fp8_attention import native_fp8_attention
 from .indices import (
     build_indices,
     build_window_rows,
@@ -991,7 +992,7 @@ class PagedAttentionCache:
 
     def query_fp8(self, query, *, a8w4=False):
         """MXFP8 Q for A8W8 or A8W4 attention; None for the BF16 adapter."""
-        if not (self.kv_fp8 or a8w4):
+        if not (a8w4 or (self.kv_fp8 and native_fp8_attention())):
             return None
         *rows, dim = query.shape
         return (
