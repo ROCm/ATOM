@@ -178,6 +178,24 @@ pub(crate) fn atom_pair(placement: &PlacementPlan) -> Option<[&Arc<dyn Worker>; 
     }
 }
 
+/// The refusal of a pair `placement` plans from an ATOM and a non-ATOM worker, between
+/// which neither P/D flow hands the KV over.
+pub(crate) fn mixed_pair_refusal(placement: &PlacementPlan) -> Option<EngineError> {
+    match placement {
+        PlacementPlan::Pair {
+            prefill, decode, ..
+        } if is_atom(prefill) != is_atom(decode) => Some(internal(format!(
+            "P/D pair mixes runtimes: prefill {} is {:?}, decode {} is {:?}; an ATOM worker \
+             pairs only with an ATOM worker",
+            prefill.url(),
+            prefill.metadata().runtime_type,
+            decode.url(),
+            decode.metadata().runtime_type,
+        ))),
+        _ => None,
+    }
+}
+
 fn is_atom(worker: &Arc<dyn Worker>) -> bool {
     worker.metadata().runtime_type == RuntimeType::Atom
 }

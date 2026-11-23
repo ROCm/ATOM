@@ -955,6 +955,36 @@ mod pairs {
     }
 
     #[tokio::test]
+    async fn a_pair_of_an_atom_and_a_non_atom_worker_is_refused_before_either_call() {
+        let (p, p_url) = instance(vec![vec![prefill_done(json!({}))]], false, None).await;
+        let other = test_mocks::mock_http_only_worker("http://d:8000");
+        assert_ne!(other.metadata().runtime_type, RuntimeType::Atom);
+        let plan = PlacementPlan::Pair {
+            prefill: worker(&p_url, PREFILL),
+            decode: other,
+            prefill_policy: "random",
+            decode_policy: "random",
+        };
+        let pairs = AtomPairs::new(
+            Arc::new(WorkerRegistry::new()),
+            AtomPdRankMappingPolicy::Idx2Idx,
+        )
+        .await
+        .unwrap();
+        let refused = GrpcEngine::with_atom_pairs(pairs)
+            .dispatch(&plan, &mut payload(false))
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(&refused, EngineError::Http { status, message }
+                if *status == StatusCode::INTERNAL_SERVER_ERROR && message.contains("mixes runtimes")),
+            "{refused}"
+        );
+        assert!(p.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn each_rank_takes_its_instances_info_and_idx2idx_runs_prefill_on_decodes_rank() {
         let (p, p_url) = instance(vec![vec![]], true, prefill_info(4, Some(template()))).await;
         let (d, d_url) = instance(vec![vec![complete(&[21], "eos")]], false, None).await;

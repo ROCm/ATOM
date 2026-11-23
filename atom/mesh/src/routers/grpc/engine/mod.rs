@@ -137,6 +137,10 @@ impl GrpcEngine {
                 .dispatch(prefill, decode, payload, tokenizer.map(|t| t.as_ref()))
                 .await;
         }
+        #[cfg(feature = "grpc-client")]
+        if let Some(refusal) = atom::pair::mixed_pair_refusal(placement) {
+            return Err(refusal);
+        }
         match placement {
             PlacementPlan::Single { worker, .. } => {
                 self.dispatch_one(worker, payload, ProtoErrorRole::Worker, tokenizer)
