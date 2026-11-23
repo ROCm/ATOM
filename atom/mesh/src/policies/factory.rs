@@ -3,8 +3,9 @@
 use std::sync::Arc;
 
 use super::{
-    CacheAwareConfig, CacheAwarePolicy, DpStickyPolicy, LoadBalancingPolicy, PowerOfTwoPolicy,
-    PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
+    AgenticConfig, AgenticCost, AgenticPolicy, CacheAwareConfig, CacheAwarePolicy, DpStickyPolicy,
+    LeastLoadPolicy, LoadBalancingPolicy, PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy,
+    RandomPolicy, RoundRobinPolicy,
 };
 use crate::config::PolicyConfig;
 
@@ -45,6 +46,20 @@ impl PolicyFactory {
                 };
                 Arc::new(PrefixHashPolicy::new(config))
             }
+            PolicyConfig::Agentic {
+                request_token_equivalent,
+                eviction_interval_secs,
+                max_tree_size,
+            } => Arc::new(AgenticPolicy::new(AgenticConfig {
+                cost: AgenticCost {
+                    request_token_equivalent: *request_token_equivalent,
+                },
+                eviction_interval_secs: *eviction_interval_secs,
+                max_tree_size: *max_tree_size,
+            })),
+            PolicyConfig::LeastLoad {
+                request_token_equivalent,
+            } => Arc::new(LeastLoadPolicy::new(*request_token_equivalent)),
         }
     }
 
@@ -57,6 +72,9 @@ impl PolicyFactory {
             "power_of_two" | "poweroftwo" => Some(Arc::new(PowerOfTwoPolicy::new())),
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
             "prefix_hash" | "prefixhash" => Some(Arc::new(PrefixHashPolicy::with_defaults())),
+            "agentic" => Some(Arc::new(AgenticPolicy::default())),
+            // No least_load: a worker's policy label places through plan_single, which never
+            // reserves decode load, so least_load would rank in-flight requests only.
             _ => None,
         }
     }
@@ -104,6 +122,7 @@ mod tests {
         assert!(PolicyFactory::create_by_name("PowerOfTwo").is_some());
         assert!(PolicyFactory::create_by_name("cache_aware").is_some());
         assert!(PolicyFactory::create_by_name("CacheAware").is_some());
+        assert!(PolicyFactory::create_by_name("least_load").is_none());
         assert!(PolicyFactory::create_by_name("unknown").is_none());
     }
 
@@ -161,6 +180,20 @@ mod tests {
                     load_factor: 1.25,
                 },
             ),
+            (
+                "agentic",
+                PolicyConfig::Agentic {
+                    request_token_equivalent: 512,
+                    eviction_interval_secs: 60,
+                    max_tree_size: 500,
+                },
+            ),
+            (
+                "least_load",
+                PolicyConfig::LeastLoad {
+                    request_token_equivalent: 512,
+                },
+            ),
         ];
 
         for (expected_name, config) in configs {
@@ -192,6 +225,8 @@ mod tests {
             ("cacheaware", "cache_aware"),
             ("prefix_hash", "prefix_hash"),
             ("prefixhash", "prefix_hash"),
+            ("agentic", "agentic"),
+            ("Agentic", "agentic"),
         ];
 
         for (input, expected_name) in cases {

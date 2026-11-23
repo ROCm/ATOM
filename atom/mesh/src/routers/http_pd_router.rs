@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
 
@@ -11,6 +11,7 @@ use axum::{
     http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
+use dashmap::DashSet;
 use futures_util::StreamExt;
 
 #[cfg(test)]
@@ -34,7 +35,7 @@ use crate::{
                 vllm::{VllmAdapter, VllmPrefillInfo},
                 BackendAdapter, PairCtx,
             },
-            planner::DefaultPlanner,
+            planner::{idx2idx, DefaultPlanner, Idx2Idx},
             registry_adapters::{PolicyRegistryAdapter, WorkerRegistryAdapter},
             traits::PdPlanner,
             types::{PlacementPlan, Protocol, RequestDescriptor},
@@ -399,10 +400,13 @@ impl PDRouter {
         };
 
         let policies = Arc::new(PolicyRegistryAdapter::new(policy_registry.clone()));
-        let planner: Arc<dyn PdPlanner> = Arc::new(DefaultPlanner::new(
-            Arc::new(WorkerRegistryAdapter::new(worker_registry.clone())),
-            policies.clone(),
-        ));
+        let planner: Arc<dyn PdPlanner> = Arc::new(
+            DefaultPlanner::new(
+                Arc::new(WorkerRegistryAdapter::new(worker_registry.clone())),
+                policies.clone(),
+            )
+            .with_prefill_on_decode_rank(ctx.router_config.prefill_on_decode_rank()),
+        );
 
         Ok(PDRouter {
             worker_registry,
@@ -428,6 +432,8 @@ impl PDRouter {
             decode,
             prefill_policy,
             decode_policy,
+            prefill_tokens,
+            decode_load,
         } = plan
         else {
             return Err(error::internal_error(
@@ -435,6 +441,9 @@ impl PDRouter {
                 "PD execution requires a pair",
             ));
         };
+        // Under idx2idx the planner selects decode first, and a prefill idx2idx keeps unless
+        // none is available, when this keeps the selected one too. It moves a prefill only
+        // if health or membership changed since planning.
         let prefill = if matches!(self.backend, BackendType::Atom) {
             self.apply_atom_pd_rank_mapping_policy(prefill, &decode)
         } else {
@@ -451,11 +460,14 @@ impl PDRouter {
                 policy,
             );
         }
+        let prefill_guard =
+            WorkerLoadGuard::new(prefill.clone(), headers).with_prefill_tokens(prefill_tokens);
+        let decode_guard = match decode_load {
+            Some(reservation) => WorkerLoadGuard::adopt(reservation),
+            None => WorkerLoadGuard::new(decode.clone(), headers),
+        };
         Ok(Arc::new(ReservedPair {
-            load: parking_lot::Mutex::new(Some([
-                WorkerLoadGuard::new(prefill.clone(), headers),
-                WorkerLoadGuard::new(decode.clone(), headers),
-            ])),
+            load: parking_lot::Mutex::new(Some([prefill_guard, decode_guard])),
             canceled: tokio::sync::watch::channel(false).0,
             prefill,
             decode,
@@ -494,32 +506,30 @@ impl PDRouter {
         prefill: Arc<dyn Worker>,
         decode: &Arc<dyn Worker>,
     ) -> Arc<dyn Worker> {
-        let (Some(prefill_dp_size), Some(decode_dp_rank)) = (prefill.dp_size(), decode.dp_rank())
-        else {
-            debug!(
-                "ATOM PD rank mapping policy=idx2idx skipped: prefill={} prefill_dp_size={:?} decode={} decode_dp_rank={:?}",
-                prefill.url(),
-                prefill.dp_size(),
-                decode.url(),
-                decode.dp_rank()
-            );
-            return prefill;
+        let decode_dp_rank = match idx2idx(prefill.as_ref(), decode.as_ref()) {
+            Idx2Idx::Move(rank) => rank,
+            Idx2Idx::Keep => {
+                debug!(
+                    "ATOM PD rank mapping policy=idx2idx keeps prefill={} decode={}",
+                    prefill.url(),
+                    decode.url()
+                );
+                return prefill;
+            }
+            Idx2Idx::OutOfRange { rank, size } => {
+                // A deployment fault rather than a request's: warn once per prefill.
+                static WARNED: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
+                if WARNED.insert(prefill.base_url().to_string()) {
+                    warn!(
+                        "ATOM PD rank mapping policy=idx2idx: decode rank {} is outside prefill {} dp_size {}, so its ranks are not mapped; check the prefill and decode DP sizes",
+                        rank,
+                        prefill.base_url(),
+                        size
+                    );
+                }
+                return prefill;
+            }
         };
-
-        if decode_dp_rank >= prefill_dp_size {
-            warn!(
-                "ATOM PD rank mapping policy=idx2idx skipped: decode rank {} is outside prefill dp_size {} (prefill={}, decode={})",
-                decode_dp_rank,
-                prefill_dp_size,
-                prefill.url(),
-                decode.url()
-            );
-            return prefill;
-        }
-
-        if prefill.dp_rank() == Some(decode_dp_rank) {
-            return prefill;
-        }
 
         let mapped_url = format!("{}@{}", prefill.base_url(), decode_dp_rank);
         match self.worker_registry.get_by_url(&mapped_url) {
@@ -2320,6 +2330,8 @@ mod tests {
                         decode: decode.clone(),
                         prefill_policy: "round_robin",
                         decode_policy: "round_robin",
+                        prefill_tokens: 0,
+                        decode_load: None,
                     },
                     None,
                 )
@@ -2460,6 +2472,8 @@ mod tests {
                     decode: decode.clone(),
                     prefill_policy: "round_robin",
                     decode_policy: "round_robin",
+                    prefill_tokens: 0,
+                    decode_load: None,
                 },
                 None,
             )
@@ -2483,6 +2497,43 @@ mod tests {
         assert_eq!(request_counts.len(), 1, "{rendered}");
         assert!(request_counts[0].ends_with(" 1"), "{rendered}");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn reserve_pair_adopts_the_least_load_decode_reservation() {
+        let router = create_test_pd_router();
+        router
+            .policy_registry
+            .set_decode_policy(Arc::new(crate::policies::LeastLoadPolicy::default()));
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://prefill:8000")
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: Some(8001),
+                })
+                .build(),
+        );
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://decode:8000")
+                .worker_type(WorkerType::Decode)
+                .build(),
+        );
+        router.worker_registry.register(prefill.clone());
+        router.worker_registry.register(decode.clone());
+        let tokens = [1, 2, 3, 4];
+        let descriptor = crate::core::placement::test_support::make_descriptor(
+            None,
+            Some("test"),
+            Some(&tokens),
+            None,
+        );
+
+        let plan = router.planner.plan(&descriptor).await.unwrap();
+        let charged = |worker: &Arc<dyn Worker>| (worker.load(), worker.decode_kv_tokens());
+        assert_eq!((charged(&prefill), charged(&decode)), ((0, 0), (1, 4)));
+        let pair = router.reserve_pair(plan, None).unwrap();
+        assert_eq!((charged(&prefill), charged(&decode)), ((1, 0), (1, 4)));
+        drop(pair);
+        assert_eq!((charged(&prefill), charged(&decode)), ((0, 0), (0, 0)));
     }
 
     #[derive(Debug)]
@@ -2700,19 +2751,27 @@ mod tests {
                     decode: decode_rank_5.clone(),
                     prefill_policy: "round_robin",
                     decode_policy: "round_robin",
+                    prefill_tokens: 7,
+                    decode_load: None,
                 },
                 None,
             )
             .unwrap();
         assert_eq!(pair.prefill.url(), "http://prefill@5");
         assert_eq!(pair.prefill.dp_rank(), Some(5));
-        assert_eq!(prefill_rank_2.load(), 0);
+        assert_eq!(
+            (prefill_rank_2.load(), prefill_rank_2.prefill_tokens()),
+            (0, 0)
+        );
         assert_eq!((prefill_rank_5.load(), decode_rank_5.load()), (1, 1));
+        // The prefill charge lands on the rank the request runs on.
+        assert_eq!(prefill_rank_5.prefill_tokens(), 7);
         let execution = pair.clone();
         drop(pair);
         assert_eq!((prefill_rank_5.load(), decode_rank_5.load()), (1, 1));
         drop(execution);
         assert_eq!((prefill_rank_5.load(), decode_rank_5.load()), (0, 0));
+        assert_eq!(prefill_rank_5.prefill_tokens(), 0);
     }
 
     #[tokio::test]
@@ -2779,6 +2838,8 @@ mod tests {
                         decode,
                         prefill_policy: "dp_sticky",
                         decode_policy: "round_robin",
+                        prefill_tokens: 0,
+                        decode_load: None,
                     },
                     Some(&headers),
                 )

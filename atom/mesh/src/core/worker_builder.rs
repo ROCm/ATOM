@@ -225,6 +225,9 @@ impl BasicWorkerBuilder {
         BasicWorker {
             metadata,
             load_counter: Arc::new(AtomicUsize::new(0)),
+            prefill_token_counter: Arc::new(AtomicUsize::new(0)),
+            decode_kv_counter: Arc::new(AtomicUsize::new(0)),
+            decode_untokenized_counter: Arc::new(AtomicUsize::new(0)),
             worker_routing_key_load: Arc::new(WorkerRoutingKeyLoad::new(&self.url)),
             processed_counter: Arc::new(AtomicUsize::new(0)),
             healthy: Arc::new(AtomicBool::new(healthy)),

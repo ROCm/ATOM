@@ -18,15 +18,16 @@ pub enum BackendType {
     Atom,
 }
 
-/// Strategy used by the ATOM PD router to map a selected prefill DP rank to
-/// the selected decode DP rank.
+/// How the ATOM PD router pairs prefill and decode DP ranks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum AtomPdRankMappingPolicy {
     /// Do not rewrite the planner-selected prefill/decode DP ranks.
     #[default]
     #[serde(rename = "none")]
     None,
-    /// Map prefill rank N to decode rank N when both sides expose DP workers.
+    /// Run prefill on the decode's DP rank N when both sides expose DP workers: the
+    /// planner selects decode first and prefill among the workers on rank N, and the
+    /// router moves a prefill selected elsewhere to rank N.
     #[serde(rename = "idx2idx")]
     Idx2Idx,
 }
@@ -383,6 +384,48 @@ pub enum PolicyConfig {
         #[serde(default = "default_load_factor")]
         load_factor: f64,
     },
+
+    /// Lowest prefill cost: in-flight prefill tokens, plus the prompt tokens the
+    /// worker's GPU cache does not hold, plus a token charge per in-flight request.
+    /// Cache hits come from the KV event index (`--kv-events`), or from a text tree
+    /// for requests the index cannot match. Prefill and regular pools only.
+    #[serde(rename = "agentic")]
+    Agentic {
+        /// Tokens charged per in-flight request; keep it equal to the engine's
+        /// `ATOM_DP_LB_REQ_EQUIV` (default: 512)
+        #[serde(default = "default_request_token_equivalent")]
+        request_token_equivalent: u64,
+        /// Seconds between text tree evictions (default: 120)
+        #[serde(default = "default_agentic_eviction_interval_secs")]
+        eviction_interval_secs: u64,
+        /// Size the text tree is evicted down to (default: 67108864)
+        #[serde(default = "default_agentic_max_tree_size")]
+        max_tree_size: usize,
+    },
+
+    /// Lowest outstanding decode cost at `url@rank`: reserved KV tokens plus
+    /// one request-equivalent per in-flight request.
+    #[serde(rename = "least_load")]
+    LeastLoad {
+        /// Cost of one in-flight request, in tokens. Same default as `agentic`
+        /// and the engine's `ATOM_DP_LB_REQ_EQUIV`.
+        #[serde(default = "default_request_token_equivalent")]
+        request_token_equivalent: u64,
+    },
+}
+
+fn default_request_token_equivalent() -> u64 {
+    crate::policies::AgenticConfig::default()
+        .cost
+        .request_token_equivalent
+}
+
+fn default_agentic_eviction_interval_secs() -> u64 {
+    crate::policies::AgenticConfig::default().eviction_interval_secs
+}
+
+fn default_agentic_max_tree_size() -> usize {
+    crate::policies::AgenticConfig::default().max_tree_size
 }
 
 fn default_prefix_token_count() -> usize {
@@ -402,6 +445,8 @@ impl PolicyConfig {
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::PrefixHash { .. } => "prefix_hash",
+            PolicyConfig::Agentic { .. } => "agentic",
+            PolicyConfig::LeastLoad { .. } => "least_load",
         }
     }
 }
@@ -565,6 +610,39 @@ impl RouterConfig {
         config
     }
 
+    /// Interval for `power_of_two`'s load sample. Uses the smallest configured
+    /// `load_check_interval_secs`. Without that policy, the startup check
+    /// interval remains, and the monitor does not fetch.
+    pub fn load_sample_interval_secs(&self) -> u64 {
+        let mut intervals = Vec::new();
+        let mut push = |policy: &PolicyConfig| {
+            if let PolicyConfig::PowerOfTwo {
+                load_check_interval_secs,
+            } = policy
+            {
+                intervals.push(*load_check_interval_secs);
+            }
+        };
+        push(&self.policy);
+        if let RoutingMode::PrefillDecode {
+            prefill_policy,
+            decode_policy,
+            ..
+        } = &self.mode
+        {
+            if let Some(policy) = prefill_policy {
+                push(policy);
+            }
+            if let Some(policy) = decode_policy {
+                push(policy);
+            }
+        }
+        intervals
+            .into_iter()
+            .min()
+            .unwrap_or(self.worker_startup_check_interval_secs)
+    }
+
     pub fn resolved_prepare_pool(&self) -> ConfigResult<PoolConfig> {
         let config = self.effective_prepare_pool();
         let workers = config.workers.unwrap_or_else(default_prepare_workers);
@@ -605,6 +683,17 @@ impl RouterConfig {
         self.fastokens.max_tokenize_bytes.unwrap_or_else(|| {
             DEFAULT_FASTOKENS_MAX_TOKENIZE_BYTES.max(self.resolved_max_tokenize_bytes())
         })
+    }
+
+    /// Whether the HTTP PD router's and ext-proc's planners select decode first and
+    /// prefill on the decode's DP rank: the ATOM backend with idx2idx rank mapping. gRPC
+    /// PD does not map ranks.
+    pub fn prefill_on_decode_rank(&self) -> bool {
+        matches!(self.backend, BackendType::Atom)
+            && matches!(
+                self.atom_pd_rank_mapping_policy,
+                AtomPdRankMappingPolicy::Idx2Idx
+            )
     }
 
     /// Create a new configuration with mode and policy
@@ -656,6 +745,30 @@ impl RouterConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_atom_with_idx2idx_plans_prefill_on_the_decode_rank() {
+        for backend in [BackendType::Sglang, BackendType::Vllm, BackendType::Atom] {
+            for mapping in [
+                AtomPdRankMappingPolicy::None,
+                AtomPdRankMappingPolicy::Idx2Idx,
+            ] {
+                let config = RouterConfig {
+                    backend,
+                    atom_pd_rank_mapping_policy: mapping,
+                    ..Default::default()
+                };
+                assert_eq!(
+                    config.prefill_on_decode_rank(),
+                    matches!(
+                        (backend, mapping),
+                        (BackendType::Atom, AtomPdRankMappingPolicy::Idx2Idx)
+                    ),
+                    "{backend:?} {mapping}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn prepare_pool_defaults_overrides_and_legacy_config_deserialization() {
@@ -891,6 +1004,17 @@ mod tests {
             load_check_interval_secs: 60,
         };
         assert_eq!(power_of_two.name(), "power_of_two");
+
+        let agentic: PolicyConfig = serde_json::from_str(r#"{"type":"agentic"}"#).unwrap();
+        assert_eq!(agentic.name(), "agentic");
+        assert!(matches!(
+            agentic,
+            PolicyConfig::Agentic {
+                request_token_equivalent: 512,
+                eviction_interval_secs: 120,
+                max_tree_size: 67108864,
+            }
+        ));
     }
 
     #[test]

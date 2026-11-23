@@ -3,7 +3,7 @@ use std::sync::Arc;
 use http::HeaderMap;
 use thiserror::Error;
 
-use crate::core::Worker;
+use crate::core::{LoadReservation, Worker};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
@@ -27,12 +27,18 @@ pub enum PlacementPlan {
     Single {
         worker: Arc<dyn Worker>,
         policy_name: &'static str,
+        /// Prompt tokens charged to `worker` until its prefill finishes.
+        prefill_tokens: usize,
     },
     Pair {
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
         prefill_policy: &'static str,
         decode_policy: &'static str,
+        /// Prompt tokens charged to `prefill` until its prefill finishes.
+        prefill_tokens: usize,
+        /// Reservation `least_load` took on the decode worker, if it selected it.
+        decode_load: Option<LoadReservation>,
     },
 }
 
