@@ -1,5 +1,6 @@
 //! A `GenerationPayload` as ATOM's GenerateRequest: the sampling fields ATOM's
-//! HTTP routes read, stop strings as token ids, and the worker's DP rank.
+//! HTTP routes read, stop strings and stop ids as token id sequences, and the
+//! worker's DP rank.
 
 use crate::atom_engine::{
     grpc::GenerateRequest,
@@ -34,6 +35,13 @@ pub(crate) fn generate_request(
         Some(StringOrArray::Array(stops)) => stops.as_slice(),
         None => &[],
     };
+    let mut stop_sequences = stop_token_sequences(stops, tokenizer)?;
+    // An explicit stop id is a one-id stop sequence, which ATOM ends the output at.
+    if let Some(ids) = &payload.stop.stop_token_ids {
+        stop_sequences.extend(ids.iter().map(|&id| TokenIds {
+            ids: vec![id as i32],
+        }));
+    }
     let sampling = &payload.sampling;
     Ok(GenerateRequest {
         request_id: payload.request_id.clone(),
@@ -48,7 +56,7 @@ pub(crate) fn generate_request(
             n: Some(sampling.n.max(0) as u32),
             ..Default::default()
         }),
-        stop_token_sequences: stop_token_sequences(stops, tokenizer)?,
+        stop_token_sequences: stop_sequences,
         kv_transfer_params_json: None,
         data_parallel_rank: worker.dp_rank().map(|rank| rank as i32),
         stream: payload.stream,

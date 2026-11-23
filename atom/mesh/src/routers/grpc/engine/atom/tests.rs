@@ -227,7 +227,7 @@ async fn route_generate_with(
         test_mocks::app_context_with_tokenizer_registry(test_mocks::tokenizer_registry_with("m"));
     let sampling = serde_json::json!({
         "temperature": 0.7, "top_p": 0.9, "top_k": 20, "max_new_tokens": 16, "ignore_eos": true,
-        "stop": ["Hello world", "<|im_end|>", "unseen"],
+        "stop": ["Hello world", "<|im_end|>", "unseen"], "stop_token_ids": [7, 42],
     });
     let body = generate_body(stream, sampling);
     pipeline
@@ -256,7 +256,13 @@ async fn a_payload_becomes_the_generate_request_atom_receives() {
             ..Default::default()
         }),
         // The mock tokenizer's ids; "unseen" encodes to nothing and is dropped.
-        stop_token_sequences: vec![TokenIds { ids: vec![1, 2] }, TokenIds { ids: vec![1002] }],
+        // Then each stop id, alone.
+        stop_token_sequences: vec![
+            TokenIds { ids: vec![1, 2] },
+            TokenIds { ids: vec![1002] },
+            TokenIds { ids: vec![7] },
+            TokenIds { ids: vec![42] },
+        ],
         kv_transfer_params_json: None,
         data_parallel_rank: None,
         stream: false,
