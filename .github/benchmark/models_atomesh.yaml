@@ -2583,6 +2583,8 @@ models:
         HSA_ENABLE_IPC_MODE_LEGACY: "1"
         NCCL_DEBUG: WARN
         NCCL_IB_DISABLE: "0"
+        # The recipe replays the trace's own assistant turns.
+        AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES: "0"
       prefill:
         OFFLOAD_MIN_LOAD_TOKENS: "512"
         OFFLOAD_LOAD_WORKERS: "4"
