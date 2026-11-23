@@ -120,6 +120,16 @@ pub(crate) fn completion_to_generate(c: &CompletionRequest) -> Result<GenerateRe
     })
 }
 
+/// `generate` without the logprobs its completion asked for: ATOM's HTTP /v1/completions
+/// answers logprobs null, and its gRPC workers refuse a request for them.
+pub(crate) fn without_logprobs(generate: GenerateRequest) -> GenerateRequest {
+    GenerateRequest {
+        return_logprob: Some(false),
+        top_logprobs_num: None,
+        ..generate
+    }
+}
+
 /// Convert a list of native `GenerateResponse`s into an OpenAI `CompletionResponse`.
 fn build_completion_response(gens: Vec<GenerateResponse>, model: String) -> CompletionResponse {
     let id = gens

@@ -1674,12 +1674,15 @@ mod i_atom_refusals {
 
     use crate::app_context::AppContext;
     use crate::config::RouterConfig;
+    use crate::core::placement::types::PlacementPlan;
     use crate::core::prepare_pool::PreparePoolRuntime;
     use crate::core::{BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType};
     use crate::observability::metrics::metrics_labels;
     use crate::routers::comm::error::extract_error_code_from_response;
+    use crate::routers::grpc::engine::{atom::request::generate_request, Dispatcher};
     use crate::routers::grpc::{pd_router::GrpcPDRouter, pipeline::Pipeline, router::GrpcRouter};
     use crate::routers::ingress::InferenceEnvelope;
+    use crate::routers::prepare::generation_payload::GenerationPayload;
     use crate::routers::test_mocks::{self, hf_tokenizer, MockDispatcher, MockPdPlanner};
     use crate::routers::token_handle::engine_error::EngineError;
     use crate::routers::token_handle::test_support::synthetic_single_stream;
@@ -1687,6 +1690,7 @@ mod i_atom_refusals {
     use crate::routers::token_handle::token_handle::TokenHandle;
     use crate::routers::RouterTrait;
     use crate::tokenizer::registry::TokenizerRegistry;
+    use crate::tokenizer::traits::Tokenizer;
 
     type Answer = (StatusCode, &'static str); // a status and its error code
     const SERVED: Answer = (StatusCode::OK, "");
@@ -1720,7 +1724,8 @@ mod i_atom_refusals {
         chat_logprobs["top_logprobs"] = json!(2);
         let mut generate_logprobs = generate(None);
         generate_logprobs["return_logprob"] = json!(true);
-        // ATOM's HTTP /v1/completions answers logprobs null; so does this route.
+        // ATOM's HTTP /v1/completions answers logprobs null; so does this route, past
+        // ATOM's request builder, which refuses logprobs.
         let completion_logprobs = json!({"model": "m", "prompt": "test", "logprobs": 1});
         // The typed request drops a system message's tools; ATOM reads them from the body.
         let system = json!({"role": "system", "content": "test", "tools": "not a list"});
@@ -1778,6 +1783,34 @@ mod i_atom_refusals {
         Arc::new(worker)
     }
 
+    /// `MockDispatcher`'s answer to what ATOM's request builder accepts for an ATOM worker.
+    struct AtomBuilding(Arc<MockDispatcher>);
+
+    #[async_trait::async_trait]
+    impl Dispatcher for AtomBuilding {
+        async fn dispatch(
+            &self,
+            placement: &PlacementPlan,
+            payload: &mut GenerationPayload,
+        ) -> Result<TokenHandle, EngineError> {
+            self.0.dispatch(placement, payload).await
+        }
+
+        async fn dispatch_with_tokenizer(
+            &self,
+            placement: &PlacementPlan,
+            payload: &mut GenerationPayload,
+            tokenizer: &Arc<dyn Tokenizer>,
+        ) -> Result<TokenHandle, EngineError> {
+            if let PlacementPlan::Single { worker, .. } = placement {
+                if worker.metadata().runtime_type == RuntimeType::Atom {
+                    generate_request(payload, worker.as_ref(), Some(tokenizer.as_ref()))?;
+                }
+            }
+            self.0.dispatch(placement, payload).await
+        }
+    }
+
     /// Each request's status and error code through `route_inference` when one `runtime`
     /// worker serves "m" beside an ATOM worker of model "a", and how many were dispatched.
     async fn answers(runtime: RuntimeType) -> (Vec<(StatusCode, String)>, usize) {
@@ -1799,8 +1832,8 @@ mod i_atom_refusals {
             .register(worker("a", RuntimeType::Atom, WorkerType::Regular));
         let dispatcher = Arc::new(MockDispatcher::repeat_with_stream(completed));
         let planner = Arc::new(MockPdPlanner::repeat_single(served, "random"));
-        let pipeline =
-            Pipeline::with_injected(planner, dispatcher.clone(), metrics_labels::BACKEND_REGULAR);
+        let building = Arc::new(AtomBuilding(dispatcher.clone()));
+        let pipeline = Pipeline::with_injected(planner, building, metrics_labels::BACKEND_REGULAR);
         let router = GrpcRouter::with_pipeline(&ctx, pipeline);
 
         let mut answers = Vec::new();

@@ -11,7 +11,7 @@ use tracing::debug;
 use super::engine::atom::pair::AtomPairs;
 use super::{
     completion_adapter::{
-        completion_to_generate, wrap_generate_response_as_completion,
+        completion_to_generate, without_logprobs, wrap_generate_response_as_completion,
         wrap_streaming_generate_as_completion,
     },
     pipeline::Pipeline,
@@ -278,6 +278,7 @@ impl RouterTrait for GrpcPDRouter {
         model_id: Option<&str>,
     ) -> Response {
         let synthetic = match completion_to_generate(body) {
+            Ok(g) if atom_serves(&self.worker_registry, model_id) => without_logprobs(g),
             Ok(g) => g,
             Err(msg) => return error::bad_request("completion_unsupported_field", msg),
         };
