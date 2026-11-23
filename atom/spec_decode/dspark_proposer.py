@@ -1266,5 +1266,9 @@ class DSparkProposer(Drafter):
         with record_function(f"propose_dspark[{label} T={T}]"):
             draft_token_ids, confidence = pass_.run(running_bs, **staged)
 
-        self._set_verify_lengths(confidence, attn_metadata, scheduled_bs, T)
+        if self.verify_scheduler is not None:
+            if confidence is not None:
+                self._set_verify_lengths(confidence, attn_metadata, scheduled_bs, T)
+            else:
+                self.verify_scheduler.set_last_ell(None)
         return draft_token_ids[:scheduled_bs, :T]

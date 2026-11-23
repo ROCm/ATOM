@@ -353,6 +353,44 @@ def test_prefill_confidence_cannot_change_decode_budget_or_request_mapping(
     assert published == ([metadata] if prefill_rows else [])
 
 
+@pytest.mark.parametrize("scheduler_enabled", [False, True])
+@pytest.mark.parametrize("has_confidence", [False, True])
+def test_separate_draft_handles_optional_confidence(scheduler_enabled, has_confidence):
+    from atom.spec_decode.dspark_proposer import DSparkProposer
+
+    lengths = []
+    confidence = torch.arange(15).reshape(3, 5) if has_confidence else None
+    verify = SimpleNamespace(
+        compute_ell=lambda rows: rows.sum(dim=1), set_last_ell=lengths.append
+    )
+    drafter = DSparkProposer.__new__(DSparkProposer)
+    drafter._verify_scheduler = verify if scheduler_enabled else None
+    drafter.mtp_k = 3
+    drafter.model = SimpleNamespace()
+    drafter.runner = SimpleNamespace(
+        forward_vars={"batch_info": SimpleNamespace(gpu=torch.zeros(3))}
+    )
+    drafter._publish_draft_shape = lambda *args, **kwargs: None
+    drafter._build_paged_block_metadata = lambda *args, **kwargs: None
+    metadata = SimpleNamespace(is_mixed=False, max_seqlen_k=64)
+    fc = SimpleNamespace(context=SimpleNamespace(running_bs=3, is_prefill=False))
+    ids = torch.arange(15).reshape(3, 5)
+    block = SimpleNamespace(
+        run=lambda *args, **kwargs: (ids, confidence), label=lambda *args: "test"
+    )
+    result = drafter._propose_with_draft(
+        block, fc, metadata, {"anchor_positions": torch.zeros(3)}, scheduled_bs=2
+    )
+    torch.testing.assert_close(result, ids[:2, :3])
+    if not scheduler_enabled:
+        assert lengths == []
+    elif not has_confidence:
+        assert lengths == [None]
+    else:
+        assert len(lengths) == 1
+        torch.testing.assert_close(lengths[0], confidence[:2, :3].sum(dim=1))
+
+
 def _mixed_batch(**overrides):
     fields = {
         "is_mixed": True,
