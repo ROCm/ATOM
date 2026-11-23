@@ -1236,6 +1236,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_EPLB_GP_COUNT": lambda: os.getenv("ATOM_EPLB_GP_COUNT", "triton")
     .strip()
     .lower(),
+    # Diagnostic: freeze the placement as it is after N prefill-bearing
+    # steps, with no rebalance (0 = off).
+    "ATOM_EPLB_FREEZE_AT_STEP": lambda: max(0, _int_env("ATOM_EPLB_FREEZE_AT_STEP", 0)),
     # Diagnostic: log this rank's engine step times by kind every N steps
     # (`eplb._StepTimer`); 0 = off. Independent of EPLB being enabled.
     "ATOM_EPLB_STEP_TIMER": lambda: max(0, _int_env("ATOM_EPLB_STEP_TIMER", 0)),

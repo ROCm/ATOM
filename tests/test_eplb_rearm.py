@@ -982,3 +982,22 @@ def test_frozen_without_observer_or_watch_counts_nothing(monkeypatch):
     manager.monitor.on_forward_start()
     gpr.place(manager._moe_layers[1], torch.full((4, TOP_K), 2, dtype=torch.int32))
     assert int(manager.monitor._cur_pass_count.sum()) == 0
+
+
+def test_freeze_at_step_freezes_without_a_rebalance(monkeypatch):
+    """ATOM_EPLB_FREEZE_AT_STEP (diagnostic): after that many steps the
+    placement is frozen as it is -- no evaluation, nothing moved, and the
+    schedule is not advanced again."""
+    manager = _manager(monkeypatch, ATOM_EPLB_FREEZE_AT_STEP=3)
+    before = manager.live_metadata.physical_to_logical_map.clone()
+    monkeypatch.setattr(
+        manager, "_execute_rebalance", lambda: pytest.fail("a rebalance ran")
+    )
+    gen = manager._entrypoint()
+    for step in range(3):
+        next(gen)
+        assert not manager.rebalancing_stopped, step
+    next(gen)
+    assert manager.rebalancing_stopped and manager.rebalance_count == 0
+    assert torch.equal(manager.live_metadata.physical_to_logical_map, before)
+    next(gen)  # idles

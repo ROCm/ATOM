@@ -2316,6 +2316,17 @@ class EPLBManager:
         # step counter to 3/4 of the interval), so balancing on real traffic
         # kicks in early. Initial placement stays trivial (round-robin) until
         # this first real-load rebalance
+        freeze_at = envs.ATOM_EPLB_FREEZE_AT_STEP
+        if freeze_at > 0:
+            # Diagnostic: the placement as it is, frozen after this many
+            # steps with no rebalance at all -- the frozen state by itself
+            # (graphs recorded while loads were counted, nothing moved).
+            for _ in range(freeze_at):
+                yield
+            self._stop_rebalancing()
+            self._log_frozen()
+            while True:
+                yield
         for _ in range(self._first_rebalance_steps()):
             yield
         while True:
