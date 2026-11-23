@@ -144,6 +144,18 @@ def test_absent_sampling_fields_read_as_the_http_routes_fill_them():
     )
 
 
+def test_explicit_zero_and_false_sampling_fields_are_kept_not_defaulted():
+    explicit = pb.SamplingParams(
+        temperature=0.0, top_k=0, top_p=1.0, max_tokens=5, logprobs_flag=False
+    )
+    spec = pb.RequestSpec(seq_id=1, prompt_token_ids=ref(1, 4), sampling=explicit)
+    _, [item] = frames.decode_client(submit([spec], le32(9)))
+    assert item.sampling_params == SamplingParams(
+        temperature=0.0, top_k=0, top_p=1.0, max_tokens=5, logprobs=False
+    )
+    assert not item.sampling_params.max_tokens_is_default
+
+
 def test_an_abort_decodes_to_its_seq_ids():
     message = pb.Envelope(protocol_version=VERSION, abort=pb.Abort(seq_ids=[0, 7]))
     assert frames.decode_client([message.SerializeToString()]) == ("abort", [0, 7])
