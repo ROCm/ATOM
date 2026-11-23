@@ -76,6 +76,8 @@ UNSERVED_FIELDS = {
 N_STREAMED = "a streamed n above 1 is not served over gRPC; send it unstreamed"
 N_TRANSFERRED = "n above 1 with kv_transfer_params (P/D) is not served over gRPC"
 SESSION_N = "n above 1 is not served over the Session; Generate serves it unstreamed"
+# Submissions a Session admits at once; its reader waits for one to end past it.
+SESSION_ADMISSIONS = 64
 # ATOM's tool-call formats by atomesh's name for the same syntax. ATOM's `qwen` is the
 # XML one, atomesh's `qwen_xml`; GLM's two dialects are one ATOM parser, so atomesh's
 # model-name mapping picks GLM's.
@@ -409,7 +411,9 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
             session.close()
 
     async def _read(self, session, request_iterator) -> None:
-        """Admits and aborts what the client sends, in order, until its side ends."""
+        """Admits and aborts what the client sends, until its side ends. Each submission
+        is admitted in a task of its own, so an Abort is read while one is pending."""
+        admissions: set[asyncio.Task] = set()
         try:
             async for message in request_iterator:
                 kind, items = frames.decode_client(message.frames)
@@ -420,14 +424,45 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
                 for item in items:
                     if isinstance(item, frames.Rejection):  # the codec's INVALID
                         refused.append(item)
-                        continue
-                    try:
-                        await self._submit(session, item)
-                    except Exception as error:  # noqa: BLE001 - refused as Generate is
-                        refused.append(_rejected(item.seq_id, error))
+                    elif item.seq_id in session.admitting:
+                        in_flight = ValueError(
+                            f"seq_id {item.seq_id} is already in flight"
+                        )
+                        refused.append(_rejected(item.seq_id, in_flight))
+                    else:
+                        while len(admissions) >= SESSION_ADMISSIONS:
+                            await asyncio.wait(
+                                admissions, return_when=asyncio.FIRST_COMPLETED
+                            )
+                        session.admitting.add(item.seq_id)
+                        admission = asyncio.create_task(self._admit(session, item))
+                        admissions.add(admission)
+                        admission.add_done_callback(admissions.discard)
                 session.reject(refused)
+            while admissions:  # the client's side ended: what it sent is admitted first
+                await asyncio.wait(admissions)
         finally:
-            session.outbox.put_nowait(None)
+            try:  # a cancelled reader's admissions settle as a cancelled submission does
+                for admission in admissions:
+                    admission.cancel()
+                if admissions:
+                    await asyncio.wait(admissions)
+            finally:
+                session.outbox.put_nowait(None)
+
+    async def _admit(self, session, request: frames.SubmitRequest) -> None:
+        """`_submit`, refused alone; an Abort read meanwhile applies once it is added."""
+        client_id = request.seq_id
+        try:
+            await self._submit(session, request)
+        except Exception as error:  # noqa: BLE001 - refused as Generate is
+            session.reject([_rejected(client_id, error)])
+        finally:
+            session.admitting.discard(client_id)
+            aborted = client_id in session.aborted_while_admitting
+            session.aborted_while_admitting.discard(client_id)
+        if aborted:
+            session.abort([client_id])
 
     async def _submit(self, session, request: frames.SubmitRequest) -> None:
         """Admits one RequestSpec as Generate admits a request, under the Session's id
