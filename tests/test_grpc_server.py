@@ -24,6 +24,7 @@ from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.protocol import DEFAULT_MAX_TOKENS
 from atom.entrypoints.openai.reasoning_dialects import DIALECTS, FALLBACK_DIALECT
 from atom.entrypoints.openai.tool_parser.registry import PARSERS_BY_NAME
+from atom.model_engine.engine_core_mgr import CoreManager
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.zmq_protocol import engine_v1_pb2 as v1
 
@@ -273,6 +274,29 @@ def test_a_partly_dispatched_fan_out_aborts_every_sibling(serve):
     error = _error(_generate(serve(engine), sampling=sampling))
     assert error.http_status == 500
     assert engine.running == {} and engine.io_processor.requests == {}
+
+
+def test_a_refused_rank_hint_leaves_no_callback_in_core_manager(serve):
+    # CoreManager's own callback registry, over two DP ranks: rank 2 is refused.
+    engine, mgr = FakeEngine(), CoreManager.__new__(CoreManager)
+    mgr.label, mgr.pp_size, mgr.local_engine_count = "mgr", 1, 2
+    mgr._seq_id_to_callback, mgr._seq_load, mgr._backlog = {}, {}, None
+    mgr._lb_lock = threading.Lock()
+    mgr.broadcast_utility_command = lambda *args, **kwargs: None
+    engine.core_mgr = mgr
+    make = engine.preprocess_fanout
+
+    def preprocess_fanout(prompt, params, *, stream_callback, **kwargs):
+        seqs = make(prompt, params, stream_callback=stream_callback, **kwargs)
+        for seq in seqs:  # as a Sequence carries them
+            seq.stream_callback = stream_callback
+            seq.data_parallel_rank = kwargs["data_parallel_rank"]
+        return seqs
+
+    engine.io_processor.preprocess_fanout = preprocess_fanout
+    error = _error(_generate(serve(engine), data_parallel_rank=2))
+    assert error.http_status == 400 and "data_parallel_rank=2" in error.message
+    assert mgr._seq_id_to_callback == {} and engine.io_processor.requests == {}
 
 
 def test_a_prompt_only_in_kv_transfer_params_is_admitted(serve):
