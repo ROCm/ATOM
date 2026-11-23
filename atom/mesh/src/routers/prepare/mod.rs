@@ -48,6 +48,9 @@ use tool_constraints::{filter_chat_request_by_tool_choice, generate_tool_constra
 
 /// The label with the markers an ATOM worker lists: GetModelInfo's `reasoning_open_markers`.
 const REASONING_OPEN_MARKERS_LABEL: &str = "reasoning_open_markers";
+/// GetModelInfo's `implicit_reasoning_opener` and `reasoning_toggle_json`, as labels.
+const IMPLICIT_REASONING_OPENER_LABEL: &str = "implicit_reasoning_opener";
+const REASONING_TOGGLE_LABEL: &str = "reasoning_toggle_json";
 
 /// `work`, its duration recorded under `stage` as the HTTP ingress records its own stages.
 fn staged<T>(stage: &'static str, work: impl FnOnce() -> T) -> T {
@@ -158,6 +161,12 @@ pub fn prepare_chat_declaring(
         })
         .transpose()
         .map_err(|e| error::internal_error("invalid_structured_output", e))?;
+    // Else the opener the model's reply starts after unprompted, unless switched off.
+    let prompt_opener = match prompt_opener {
+        None if atom => implicit_reasoning_opener(&workers, &template_kwargs)
+            .map_err(|e| error::internal_error("invalid_reasoning_toggle", e))?,
+        opener => opener,
+    };
 
     let stop_decoder = create_stop_decoder(
         &tokenizer,
@@ -365,6 +374,31 @@ fn reasoning_open_markers(workers: &[Arc<dyn Worker>]) -> Result<Vec<String>, St
         })
         .transpose()?
         .unwrap_or_default())
+}
+
+/// The opener an ATOM worker of the model reports its replies start after with no
+/// prompt opener (GetModelInfo's `implicit_reasoning_opener`), unless `kwargs` hold the
+/// off value of its reasoning toggle: `reasoning_channel` in ATOM's HTTP server.
+fn implicit_reasoning_opener(
+    workers: &[Arc<dyn Worker>],
+    kwargs: &HashMap<String, Value>,
+) -> Result<Option<String>, String> {
+    let Some(labels) = workers
+        .iter()
+        .map(|w| &w.metadata().labels)
+        .find(|labels| labels.contains_key(IMPLICIT_REASONING_OPENER_LABEL))
+    else {
+        return Ok(None);
+    };
+    let toggle: Option<(String, Value, Value)> = labels
+        .get(REASONING_TOGGLE_LABEL)
+        .map(|json| {
+            serde_json::from_str(json)
+                .map_err(|e| format!("Invalid {REASONING_TOGGLE_LABEL} label {json}: {e}"))
+        })
+        .transpose()?;
+    let switched_off = toggle.is_some_and(|(name, off, _)| kwargs.get(&name) == Some(&off));
+    Ok((!switched_off).then(|| labels[IMPLICIT_REASONING_OPENER_LABEL].clone()))
 }
 
 /// What an ATOM worker's chat route derives `req`'s structured output from: its fields
