@@ -17,11 +17,13 @@ import torch
 
 hlab = pytest.importorskip("sglang.srt.layers.attention.hybrid_linear_attn_backend")
 
+from atom.model_ops.attention_gdn import GatedDeltaNet
 from atom.model_ops.fla_ops import chunk as chunk_mod
 from atom.plugin.sglang.attention_backend.attention_gdn import (
     SGLangGatedDeltaNet,
     SGLangGDNForwardContext,
 )
+from atom.plugin.sglang.runtime import bind_current_forward_batch
 
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 H, K, V = 2, 8, 16  # K != V: an interchanged axis cannot go unnoticed
@@ -37,6 +39,24 @@ class _Mode:
 
     def is_target_verify(self):
         return False
+
+
+class _Pool:
+    def __init__(self, conv, temporal):
+        self.mamba_map = {0: 0}
+        self.mamba_pool = SimpleNamespace(
+            mamba_cache=SimpleNamespace(conv=[conv[None]], temporal=temporal[None])
+        )
+
+    def mamba2_layer_index(self, layer_id):
+        return self.mamba_map[layer_id]
+
+    def mamba2_layer_cache(self, layer_id):
+        state = self.mamba_pool.mamba_cache
+        index = self.mamba2_layer_index(layer_id)
+        return SimpleNamespace(
+            conv=[state.conv[0][index]], temporal=state.temporal[index]
+        )
 
 
 def _h(vk_view: bool) -> torch.Tensor:
@@ -73,11 +93,7 @@ def _run(monkeypatch, h, md, pool_vk: bool):
     x = torch.randn(16, D, generator=g).to(DEV, torch.bfloat16)
     backend = SimpleNamespace(
         forward_metadata=md,
-        req_to_token_pool=SimpleNamespace(
-            mamba2_layer_cache=lambda layer: SimpleNamespace(
-                conv=[conv], temporal=temporal
-            )
-        ),
+        req_to_token_pool=_Pool(conv, temporal),
         _track_mamba_state_extend=lambda fb, hh, s, m: (
             hlab.MambaAttnBackendBase._track_mamba_state_extend(None, fb, hh, s, m)
         ),
@@ -91,13 +107,21 @@ def _run(monkeypatch, h, md, pool_vk: bool):
     impl = SGLangGatedDeltaNet.__new__(SGLangGatedDeltaNet)
     torch.nn.Module.__init__(impl)
     impl.layer_num = 0
+    impl.dt_bias = torch.nn.Parameter(torch.zeros(1, device=DEV, dtype=x.dtype))
     impl.gdn_flydsl_policy = SimpleNamespace(decode=True) if pool_vk else None
     rows = md.track_conv_indices.shape[0]
     fb = SimpleNamespace(
         mamba_track_mask=torch.ones(rows, dtype=torch.bool, device=DEV),
         forward_mode=_Mode(),
     )
-    impl._track_mamba_states(fb, x)
+    # Supply the snapshot independently of GDN compute, then exercise the
+    # frontend's real forward/track dispatch and SGLang's eager writer.
+    monkeypatch.setattr(
+        GatedDeltaNet, "forward", lambda self, x, b, a, out, layer_name: out
+    )
+    gates = torch.zeros(1, device=DEV, dtype=x.dtype)
+    with bind_current_forward_batch(fb):
+        impl.forward(x, gates, gates, torch.empty_like(x), "layer_0")
     assert chunk_mod.ChunkGatedDeltaRuleFunction.last_h is None
     return conv, temporal
 
