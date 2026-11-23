@@ -143,6 +143,15 @@ jobs:
             --target-dir atom/mesh/mocker/target/mesh \
             --profile ci --test api_tests -- kv_events_test
 
+      # The RL control plane under /v1/rl, through the router's own app.
+      - name: Test RL control plane
+        run: |
+          set -euo pipefail
+          cargo test \
+            --manifest-path atom/mesh/Cargo.toml \
+            --target-dir atom/mesh/mocker/target/mesh \
+            --profile ci --test rl_tests -- --test-threads=1
+
       # The mocker is its own cargo root: atom/mesh's profiles, ci included,
       # do not apply, and its release profile is cargo's default (no fat LTO).
       - name: Run Atomesh test harness

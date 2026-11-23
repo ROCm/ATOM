@@ -15,6 +15,7 @@ impl ConfigValidator {
         }
         #[cfg(feature = "ext-proc")]
         config.ext_proc.validate(config)?;
+        Self::validate_rl(&config.rl)?;
         Self::validate_mode(&config.mode)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_server_settings(config)?;
@@ -32,6 +33,38 @@ impl ConfigValidator {
 
         Self::validate_tokenizer_cache(&config.tokenizer_cache)?;
 
+        Ok(())
+    }
+
+    fn validate_rl(rl: &crate::rl::RlConfig) -> ConfigResult<()> {
+        if !rl.enabled {
+            return Ok(());
+        }
+        let key = rl.api_key.as_deref().unwrap_or_default();
+        if key.trim().is_empty() {
+            return Err(ConfigError::MissingRequired {
+                field: "rl.api_key (--rl-api-key, required with --enable-rl)".to_string(),
+            });
+        }
+        // HTTP parsers strip the whitespace around a header value, so such a
+        // key could never match. The message leaves the key out.
+        if key != key.trim() {
+            return Err(ConfigError::ValidationFailed {
+                reason: "--rl-api-key has leading or trailing whitespace".to_string(),
+            });
+        }
+        for (field, value) in [
+            ("rl.control_timeout_secs", rl.control_timeout_secs),
+            ("rl.fanout_concurrency", rl.fanout_concurrency as u64),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: field.to_string(),
+                    value: "0".to_string(),
+                    reason: "Must be greater than zero".to_string(),
+                });
+            }
+        }
         Ok(())
     }
 
