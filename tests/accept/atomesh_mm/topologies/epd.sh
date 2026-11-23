@@ -26,7 +26,8 @@ topology_up() {
   launch_pd prefill kv_producer "$PREFILL_PORT" "$PREFILL_ENGINE_PORT"
   launch_pd decode kv_consumer "$DECODE_PORT" "$DECODE_ENGINE_PORT"
   launch_mesh mesh "$MESH_PORT" --backend atom --pd-disaggregation --policy cache_aware \
-    --request-timeout-secs 14400 --encode "$(role_url encode "$ENCODE_PORT")" \
+    --request-timeout-secs 14400 --route-log-sample-rate 1 \
+    --encode "$(role_url encode "$ENCODE_PORT")" \
     --prefill "$(role_url prefill "$PREFILL_PORT")" --decode "$(role_url decode "$DECODE_PORT")"
   ENDPOINT=$(role_url mesh "$MESH_PORT")
 }
@@ -46,9 +47,10 @@ log_lines() {
 topology_findings() {
   local ranks image_requests served read_fallbacks kv
   IFS=, read -ra ranks <<<"$PREFILL_GPUS"
-  # ATOMesh logs a routing decision per pool and request, with the number of
-  # media in the request.
-  image_requests=$(log_lines mesh 'routing decision.*pool="prefill".*media_digests=[1-9]')
+  # ATOMesh logs a Selected worker line per pool and request (target
+  # mesh::route, on with --route-log-sample-rate), with the number of media in
+  # the request.
+  image_requests=$(log_lines mesh 'Selected worker.*pool="prefill".*media_count=[1-9]')
   served=$(log_lines encode '"POST /v1/chat/completions HTTP/1.1" 200')
   read_fallbacks=$(log_lines prefill 'are unavailable; running the vision tower')
   kv=$(kv_failures "$1")

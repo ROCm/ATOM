@@ -3,13 +3,17 @@ image, then a blue one, then the red one again, one request after the other,
 with the engine's prefix cache on (checks/distinct.env).
 
 Passes when each answer names its own color and not the other, ATOMesh's log
-($RUN_DIR/mesh.log) holds one routing decision event per request, the red
-and blue ones with different key hashes, and the second red request starts
-its prefill further into the engine's prefix cache than the blue one did
-(its first prefill batch's "done" cursor in $RUN_DIR/atom.log). With the
-text shared, only the images' media digests can tell the two routing keys
-apart, and only the images' cache_seed keeps the blue request off the red
-one's cached KV; the second red request shows that KV was there to reuse.
+($RUN_DIR/mesh.log) holds one `Selected worker` event (target `mesh::route`,
+on with checks/distinct.env) per request with `media_count=1`, the blue one
+with a `match_ratio` below 1 and the second red one with 1, and the second
+red request starts its prefill further into the engine's prefix cache than
+the blue one did (its first prefill batch's "done" cursor in
+$RUN_DIR/atom.log). A media request routes on cache_aware's prefix tree,
+which by then holds the red request's routing key: a blue key equal to it
+would match whole, as the second red one does. With the text shared, only
+the images' media digests can tell the two routing keys apart, and only the
+images' cache_seed keeps the blue request off the red one's cached KV; the
+second red request shows that KV was there to reuse.
 """
 
 import json
@@ -88,11 +92,11 @@ def ask(color):
 
 
 def decision_events(log):
-    """The routing decision events in a router log, as dicts of the event's
+    """The `Selected worker` events in a router log, as dicts of the event's
     own fields (not its span's)."""
     events = []
     for line in log.splitlines():
-        _, mark, fields = ANSI.sub("", line).partition("routing decision")
+        _, mark, fields = ANSI.sub("", line).partition("Selected worker")
         if mark:
             events.append({k: v.strip('"') for k, v in FIELD.findall(fields)})
     return events
@@ -124,6 +128,27 @@ def prefix_hit(log):
     return None
 
 
+def key_failures(result):
+    """The blue request must match the red one's routing key in part, the
+    second red request whole: the routing keys tell the colors apart."""
+    failures = []
+    for name, whole in (("blue", False), ("red_again", True)):
+        entry = result[name]
+        if len(entry["events"]) != 1:
+            continue
+        if entry["match_ratio"] is None:
+            failures.append(
+                f"the {name} request's route ({entry['branch']}) logged no match_ratio"
+            )
+        elif (float(entry["match_ratio"]) >= 1) != whole:
+            failures.append(
+                f"the {name} request matched the red one's routing key "
+                f"{'in part' if whole else 'whole'} "
+                f"(match_ratio {entry['match_ratio']})"
+            )
+    return failures
+
+
 def names(answer, color):
     return re.search(rf"\b{color}\b", answer, re.IGNORECASE) is not None
 
@@ -138,10 +163,13 @@ def main():
         answer = ask(color)
         events = new_events(log, seen)
         seen += len(events)
+        event = events[0] if len(events) == 1 else {}
         result[name] = {
             "answer": answer,
             "prefix_hit": prefix_hit(read_log(atom_log)[start:]),
-            "key_hash": events[0].get("key_hash") if len(events) == 1 else None,
+            "branch": event.get("branch"),
+            "match_ratio": event.get("match_ratio"),
+            "media_count": event.get("media_count"),
             "events": events,
         }
         other = next(c for c in COLORS if c != color)
@@ -151,11 +179,14 @@ def main():
             )
         if len(events) != 1:
             failures.append(
-                f"{len(events)} routing decision events in {log} for the {name} request"
+                f"{len(events)} Selected worker events in {log} for the {name} request"
             )
-    hashes = [result[color]["key_hash"] for color in COLORS]
-    if None not in hashes and hashes[0] == hashes[1]:
-        failures.append(f"both colors routed on key hash {hashes[0]}")
+        elif event.get("media_count") != "1":
+            failures.append(
+                f"the {name} request routed with media_count "
+                f"{event.get('media_count')}, not 1"
+            )
+    failures += key_failures(result)
     blue, again = result["blue"]["prefix_hit"], result["red_again"]["prefix_hit"]
     if blue is None or again is None:
         failures.append(f"no prefill start for a request in {atom_log}")
