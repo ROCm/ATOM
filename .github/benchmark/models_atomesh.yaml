@@ -2662,6 +2662,9 @@ models:
             apply_chat_template: false
             benchmark_duration: 900
             wait_server_timeout: 5400
+            # Each lane prefills its starting context once, into P and the
+            # Store; ten warmup turns per lane take about two hours at C1228.
+            warmup_requests_per_lane: 1
           run_eval: false
 
       kv_events:
