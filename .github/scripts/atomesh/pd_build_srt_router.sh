@@ -4,6 +4,17 @@ runtime="${REPO_ROOT:?}/.sa-srt-runtime"
 output="${RUN_DIR:?}/router-build"
 contract="${REPO_ROOT}/${ATOMESH_ENV_ATOMESH_PR5090_CONTRACT:?}"
 mkdir -p "${output}"
+arm="$(python3 - "${contract}" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1])).get("router_arm", "atomesh"))
+PY
+)"
+if [[ "${arm}" == baseline ]]; then
+  python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_verify_baseline_router.py" \
+    --contract "${contract}" --output "${output}" --job-id "${SRTCTL_JOB_ID:?}"
+  exit 0
+fi
+[[ "${arm}" == atomesh ]] || { echo "Unsupported router arm: ${arm}" >&2; exit 1; }
 mapfile -t build_spec < <(python3 - "${contract}" "${runtime}" <<'PY'
 import hashlib, json, pathlib, re, sys
 c = json.load(open(sys.argv[1]))

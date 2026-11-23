@@ -1,6 +1,7 @@
 """Run the pinned PR 5090 worker contract and router acceptance probes."""
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -345,6 +346,12 @@ def benchmark(contract, args):
         return 0
     shared = output.parent / "client-venv"
     python = shared / "bin/python"
+    constraints = []
+    if lock := contract.get("client_constraints"):
+        lock_path = Path(args.contract).with_name("client-constraints.txt")
+        if hashlib.sha256(lock_path.read_bytes()).hexdigest() != lock["sha256"]:
+            raise ValueError("Client constraints hash differs from the paired run")
+        constraints = ["--constraint", str(lock_path)]
     if not python.exists():
         created = subprocess.run(
             [sys.executable, "-m", "venv", str(shared)], check=False
@@ -368,6 +375,7 @@ def benchmark(contract, args):
                 "-m",
                 "pip",
                 "install",
+                *constraints,
                 f"agentx-harness=={contract['agentx_version']}",
                 "datasets>=4.7.0",
             ],
@@ -387,6 +395,20 @@ def benchmark(contract, args):
     assert version == contract["agentx_version"], version
     freeze = subprocess.check_output([str(python), "-m", "pip", "freeze"], text=True)
     (output / "client-freeze.txt").write_text(freeze)
+    if constraints:
+
+        def versions(text):
+            return {
+                re.sub(r"[-_.]+", "-", name.lower()): version
+                for line in text.splitlines()
+                if line.strip()
+                for name, version in [line.split("==", 1)]
+            }
+
+        if versions(freeze) != versions(lock_path.read_text()):
+            raise ValueError(
+                "Client package versions differ from the paired ATOMesh run"
+            )
     scrape(args.workers, output, "before-benchmark")
     model = contract["roles"]["decode"]["args"]["served-model-name"]
     argv = [

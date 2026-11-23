@@ -14,6 +14,33 @@ CONTRACT = json.loads(
 
 
 class RouterBuildTest(unittest.TestCase):
+    def test_baseline_requires_its_own_image_and_version_evidence(self):
+        contract = CONTRACT | {
+            "router_arm": "baseline",
+            "baseline_router_version": "0.1.16",
+        }
+        manifest = {
+            "kind": "baseline",
+            "base_image": contract["router_images"]["baseline"],
+            "image_id": "sha256:" + "c" * 64,
+            "version": "0.1.16",
+            "binary_sha256": "d" * 64,
+            "runtime_verified": True,
+        }
+        self.assertEqual(
+            verified_router_image(contract, manifest), manifest["image_id"]
+        )
+        for key, value in (
+            ("kind", "atomesh"),
+            ("version", "0.1.15"),
+            ("base_image", contract["router_images"]["atomesh"]),
+            ("runtime_verified", False),
+            ("binary_sha256", ""),
+            ("image_id", "latest"),
+        ):
+            with self.subTest(field=key), self.assertRaises(ValueError):
+                verified_router_image(contract, manifest | {key: value})
+
     def test_only_the_verified_image_is_selected(self):
         build = CONTRACT["router_build"]
         manifest = {

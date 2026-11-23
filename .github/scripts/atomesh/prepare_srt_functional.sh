@@ -19,11 +19,15 @@ git -C "${runtime}/source" checkout --detach "${source_sha}"
 printf '%s\n' "${source_sha}" > "${runtime}/source-sha.txt"
 router_sha="$(python3 - "${SRT_FUNCTIONAL_CONTRACT:?}" <<'PY'
 import json, re, sys
-sha = json.load(open(sys.argv[1]))["router_build"]["source_sha"]
+contract = json.load(open(sys.argv[1]))
+if contract.get("router_arm") == "baseline":
+    sys.exit(0)
+sha = contract["router_build"]["source_sha"]
 assert re.fullmatch(r"[0-9a-f]{40}", sha)
 print(sha)
 PY
 )"
+[[ -n "${router_sha}" ]] || exit 0
 git fetch --no-tags --depth=1 origin "${router_sha}"
 mkdir -p "${runtime}/router-source"
 git archive "${router_sha}" atom/mesh | tar -xf - -C "${runtime}/router-source"

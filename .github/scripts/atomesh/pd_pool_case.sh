@@ -7,6 +7,7 @@ case "${case_name}" in
   tp4) contract_file=single-node-functional.json; budget=90m ;;
   pp4) contract_file=single-node-pp4-functional.json; budget=90m ;;
   tp4-perf) contract_file=single-node-tp4-performance.json; budget=120m ;;
+  tp4-baseline) contract_file=single-node-tp4-baseline.json; budget=120m ;;
   pp4-dep4) contract_file=single-node-pp4-dep4-functional.json; budget=90m ;;
   *) exit 2 ;;
 esac

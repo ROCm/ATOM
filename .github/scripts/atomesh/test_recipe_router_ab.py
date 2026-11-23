@@ -1,3 +1,4 @@
+import hashlib
 import json
 import tempfile
 import threading
@@ -101,6 +102,41 @@ class RecipeWorkerTest(unittest.TestCase):
 
 
 class FunctionalOnlyTest(unittest.TestCase):
+    def test_dependency_drift_stops_before_performance(self):
+        locked = b"agentx-harness==1.0.14\nrequests==2.32.5\n"
+        contract = SINGLE_NODE | {
+            "functional_only": False,
+            "verify_pd": True,
+            "client_constraints": {"sha256": hashlib.sha256(locked).hexdigest()},
+        }
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch("pd_recipe_router_ab.scrape"),
+            patch("pd_recipe_router_ab.functional_probe"),
+            patch("pd_recipe_router_ab.cancellation_probe"),
+            patch("pd_recipe_router_ab.verify_kv_transfer"),
+            patch("pd_recipe_router_ab.shutil.which", return_value=None),
+            patch("pd_recipe_router_ab.subprocess.run") as run,
+            patch(
+                "pd_recipe_router_ab.subprocess.check_output",
+                side_effect=["1.0.14", "agentx-harness==1.0.14\nrequests==2.33.0\n"],
+            ),
+        ):
+            root = Path(temporary)
+            (root / "client-venv/bin").mkdir(parents=True)
+            (root / "client-venv/bin/python").touch()
+            (root / "client-constraints.txt").write_bytes(locked)
+            args = SimpleNamespace(
+                contract=str(root / "contract.json"),
+                output=str(root / "benchmark"),
+                router="http://router",
+                workers=["p", "d"],
+                model_path="/model",
+            )
+            with self.assertRaisesRegex(ValueError, "package versions differ"):
+                benchmark(contract, args)
+            run.assert_not_called()
+
     def test_performance_uses_full_window_and_mounted_client_path(self):
         contract = SINGLE_NODE | {
             "functional_only": False,

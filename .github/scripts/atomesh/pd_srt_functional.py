@@ -2,6 +2,7 @@
 
 import argparse
 import copy
+import hashlib
 import json
 import os
 import re
@@ -14,6 +15,9 @@ import yaml
 def configurations(
     contract, model_path, run_dir, experiment_dir, fabric, uid, router_image
 ):
+    arm = contract.get("router_arm", "atomesh")
+    if arm not in {"atomesh", "baseline"}:
+        raise ValueError(f"Unsupported router arm: {arm}")
     roles = {}
     for role in ("prefill", "decode"):
         spec = contract["roles"][role]
@@ -60,10 +64,14 @@ def configurations(
         "resources": {"gpu_type": "mi355x", "gpus_per_node": 8},
         "slurm": {"time_limit": contract.get("run_time_limit", "01:30:00")},
         "frontend": {
-            "type": "atomesh",
+            "type": "atomesh" if arm == "atomesh" else "vllm-router",
             "container_image": router_image,
             "enable_multiple_frontends": False,
-            "args": {"policy": "dp_sticky"},
+            "args": (
+                {"policy": "dp_sticky"}
+                if arm == "atomesh"
+                else copy.deepcopy(contract["frontend"]["args"])
+            ),
         },
         "engine": {
             "type": "vllm",
@@ -133,6 +141,19 @@ def configurations(
 
 
 def verified_router_image(contract, manifest):
+    if contract.get("router_arm", "atomesh") == "baseline":
+        if (
+            manifest.get("kind") != "baseline"
+            or manifest.get("base_image") != contract["router_images"]["baseline"]
+            or manifest.get("version") != contract["baseline_router_version"]
+            or manifest.get("runtime_verified") is not True
+            or not re.fullmatch(r"[0-9a-f]{64}", manifest.get("binary_sha256", ""))
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", manifest.get("image_id", ""))
+        ):
+            raise ValueError("Baseline router runtime does not match its pinned image")
+        return manifest["image_id"]
+    if contract.get("router_arm", "atomesh") != "atomesh":
+        raise ValueError("Unsupported router arm")
     build = contract["router_build"]
     if (
         manifest.get("commit") != build["source_sha"]
@@ -167,6 +188,11 @@ def main():
     (experiment / "contract.json").write_text(json.dumps(contract, indent=2))
     source = Path(__file__).with_name("pd_recipe_router_ab.py")
     (experiment / source.name).write_text(source.read_text())
+    if lock := contract.get("client_constraints"):
+        content = (Path(os.environ["REPO_ROOT"]) / lock["path"]).read_bytes()
+        if hashlib.sha256(content).hexdigest() != lock["sha256"]:
+            raise ValueError("Client constraints do not match the measured ATOMesh run")
+        (experiment / "client-constraints.txt").write_bytes(content)
     fabric = {
         "host-ip": os.environ["ATOMESH_NODE_IP"],
         "socket-ifname": os.environ["MORI_SOCKET_IFNAME"],
@@ -210,8 +236,12 @@ def main():
                         else "Spur allocation replaces SA sbatch"
                     ),
                     "srtctl DockerLauncher replaces pyxis/enroot",
-                    "custom functionality workload replaces AgentX performance/eval",
-                    "power collection disabled for functional-only validation",
+                    (
+                        "custom probes replace AgentX performance/eval"
+                        if contract.get("functional_only")
+                        else "custom benchmark hook launches pinned AgentX"
+                    ),
+                    "power collection disabled",
                 ],
                 "budget": contract.get(
                     "budget_rationale",
