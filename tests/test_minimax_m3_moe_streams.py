@@ -474,3 +474,182 @@ def test_front_fusion_routes_through_the_fused_router(fused: bool) -> None:
 
     assert actual is routed
     assert log == (["fused gate_weight"] if fused else ["gate", "experts"])
+
+
+class _LateEpilogue(_Epilogue):
+    """`_Epilogue` whose handle carries the addend (set late by the router hook)
+    and is taken only when it has one."""
+
+    @contextmanager
+    def __call__(self, addend, scale, before=None):
+        self.args = (addend, scale)
+        handle = SimpleNamespace(consumed=False, addend=addend)
+        self.log.append("epilogue open")
+        yield handle
+        if self.take and handle.addend is not None:
+            if before is not None:
+                before()
+            handle.consumed = True
+        self.args = (handle.addend, scale)
+        self.log.append("epilogue close")
+
+
+class _Event:
+    def __init__(self, log):
+        self.log = log
+
+    def record(self, stream):
+        self.log.append(f"fork recorded on {stream.name}")
+
+
+def _routed_first_moe(monkeypatch, log, epilogue, routed, shared, fused=True):
+    from atom.model_ops import moe as moe_ops
+
+    main, alt = _Stream("main", log), _Stream("alt", log)
+    alt.wait_event = lambda ev: log.append("alt waits fork")
+
+    @contextmanager
+    def use_stream(stream: _Stream):
+        log.append(f"enter {stream.name}")
+        yield
+        log.append(f"leave {stream.name}")
+
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: main)
+    monkeypatch.setattr(torch.cuda, "stream", use_stream)
+    monkeypatch.setattr(torch.cuda, "Event", lambda: _Event(log))
+    moe = _glue_moe(log, epilogue, routed)
+    moe._routed_plus_shared = lambda h, s, before_add=None, launch_shared=None: (
+        m3_model.MiniMaxM3MoE._routed_plus_shared(moe, h, s, before_add, launch_shared)
+    )
+    moe._routed_first = True
+    moe.alt_stream = alt
+    moe.shared_experts = MagicMock(
+        side_effect=lambda _: (log.append("shared"), shared)[1]
+    )
+    if fused:
+        moe._front_fusion = True
+        moe.gate = SimpleNamespace(weight="w")
+
+        def fused_router(h, w):
+            log.append("router")
+            moe_ops._run_after_router_hook()
+            log.append("experts")
+            return routed
+
+        moe.experts = SimpleNamespace(forward_fused_router=fused_router)
+    return moe
+
+
+@pytest.mark.parametrize("fused", [True, False])
+def test_routed_first_launches_shared_after_the_router(
+    monkeypatch: pytest.MonkeyPatch, fused: bool
+) -> None:
+    log: list[str] = []
+    hidden = MagicMock()
+    hidden.shape = (2, 64)
+    hidden.view.return_value = hidden
+    shared = MagicMock()
+    shared.record_stream.side_effect = lambda stream: log.append(
+        f"shared records {stream.name}"
+    )
+    routed = MagicMock()
+    routed.view.return_value = "fused"
+    epilogue = _LateEpilogue(log, take=True)
+    moe = _routed_first_moe(monkeypatch, log, epilogue, routed, shared, fused)
+
+    actual = m3_model.MiniMaxM3MoE.dual_stream_moe_forward(moe, hidden)
+
+    assert actual == "fused"
+    assert epilogue.args == (shared, 2.0)
+    launch = ["alt waits fork", "enter alt", "shared", "leave alt"]
+    if fused:
+        # The router is the fork's first dependent launch; the shared MLP
+        # still waits only for the fork (the MoE input), not for the router.
+        assert log == ["fork recorded on main", "epilogue open", "router"] + launch + [
+            "experts",
+            "main waits alt",
+            "epilogue close",
+            "shared records main",
+        ]
+    else:
+        # No router hook ran: the shared MLP after the routed one, its add
+        # separate (the epilogue had no addend when the routed MoE ran).
+        assert log[:4] == ["fork recorded on main", "epilogue open", "gate", "experts"]
+        assert log[4:8] == launch
+
+
+def test_tail_in_ar_defers_only_without_hooks(monkeypatch: pytest.MonkeyPatch) -> None:
+    log: list[str] = []
+
+    @contextmanager
+    def defer():
+        log.append("defer open")
+        yield SimpleNamespace(deferred=None)
+        log.append("defer close")
+
+    monkeypatch.setattr(m3_model, "_moe_defer_tail", defer)
+    hidden = MagicMock()
+    hidden.shape = (80, 64)
+    routed, shared = MagicMock(), MagicMock()
+    epilogue = _Epilogue(log, take=True)
+    moe = _glue_moe(log, epilogue, routed)
+    moe._tail_in_ar = True
+    owner = SimpleNamespace(_forward_hooks={}, _forward_pre_hooks={})
+    moe._owner_layer = lambda: owner
+    moe._defer_tail_now = lambda h: m3_model.MiniMaxM3MoE._defer_tail_now(moe, h)
+
+    assert m3_model.MiniMaxM3MoE._routed_plus_shared(moe, hidden, shared) is routed
+    assert log == [
+        "epilogue open",
+        "defer open",
+        "gate",
+        "experts",
+        "defer close",
+        "epilogue close",
+    ]
+
+    log.clear()
+    owner._forward_hooks = {0: "dspark tap"}
+    m3_model.MiniMaxM3MoE._routed_plus_shared(moe, hidden, shared)
+    assert "defer open" not in log
+
+    log.clear()
+    owner._forward_hooks = {}
+    nxt = SimpleNamespace(_forward_pre_hooks={0: "input tap"})
+    owner._next_layer = lambda: nxt
+    m3_model.MiniMaxM3MoE._routed_plus_shared(moe, hidden, shared)
+    assert "defer open" not in log
+
+    log.clear()
+    nxt._forward_pre_hooks = {}
+    hidden.shape = (m3_model._TAIL_IN_AR_MAX_ROWS + 1, 64)
+    m3_model.MiniMaxM3MoE._routed_plus_shared(moe, hidden, shared)
+    assert "defer open" not in log
+
+
+def test_tail_in_ar_wraps_the_folded_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    log: list[str] = []
+
+    @contextmanager
+    def defer():
+        log.append("defer open")
+        yield SimpleNamespace(deferred=None)
+        log.append("defer close")
+
+    monkeypatch.setattr(m3_model, "_moe_defer_tail", defer)
+    fold = _Fold(log, take=True)
+    moe, hidden, routed, _ = _fold_moe(log, fold, monkeypatch)
+    moe._tail_in_ar = True
+    owner = SimpleNamespace(_forward_hooks={}, _forward_pre_hooks={})
+    moe._owner_layer = lambda: owner
+    moe._defer_tail_now = lambda h: m3_model.MiniMaxM3MoE._defer_tail_now(moe, h)
+
+    assert m3_model.MiniMaxM3MoE._shared_fold_forward(moe, hidden) is routed
+    assert log == [
+        "fold enter",
+        "defer open",
+        "gate",
+        "routed",
+        "defer close",
+        "fold exit",
+    ]

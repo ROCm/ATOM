@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import contextlib
 import logging
+import threading
 from abc import abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -218,6 +220,29 @@ def init_balance_router_logits(
     )
     router_logits.scatter_(1, expert_ids, _FAKE_EPLB_LOGIT)
     return router_logits
+
+
+_AFTER_ROUTER_TLS = threading.local()
+
+
+@contextlib.contextmanager
+def moe_after_router_hook(fn: Callable[[], None]):
+    """Run ``fn`` once, right after the routed MoE's router launch inside the
+    block (``forward_impl_fused_router``; eager callers only, e.g. the
+    dual-stream op). A caller that sees ``fn`` not run must run it itself."""
+    prev = getattr(_AFTER_ROUTER_TLS, "fn", None)
+    _AFTER_ROUTER_TLS.fn = fn
+    try:
+        yield
+    finally:
+        _AFTER_ROUTER_TLS.fn = prev
+
+
+def _run_after_router_hook() -> None:
+    fn = getattr(_AFTER_ROUTER_TLS, "fn", None)
+    if fn is not None:
+        _AFTER_ROUTER_TLS.fn = None
+        fn()
 
 
 @dataclass
@@ -5771,6 +5796,7 @@ class FusedMoE(torch.nn.Module):
             router_logits = tgemm.mm(
                 hidden_states, gate_weight, None, otype=dtypes.bf16
             )
+            _run_after_router_hook()
             return self.forward_impl(
                 hidden_states, router_logits, mxfp8_copy_out=mxfp8_copy_out
             )
@@ -5784,6 +5810,9 @@ class FusedMoE(torch.nn.Module):
             routed_scaling_factor=1.0,
             num_valid_rows=pass_scheduled_tokens_gpu(rows),
         )
+        # Routed first: the caller's launches that follow the router
+        # (moe_after_router_hook), captured after it
+        _run_after_router_hook()
         return self.forward_impl(
             hidden_states, None, mxfp8_copy_out=mxfp8_copy_out, routing=routing
         )
