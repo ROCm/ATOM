@@ -1,12 +1,15 @@
 """Red/blue image distinction through ATOMesh: one text, sent once with a red
 and once with a blue image, one request after the other, with the engine's
-prefix cache on (checks/distinct.env).
+prefix cache on and every routing decision logged (checks/distinct.env).
 
 Passes when each answer names its own color and not the other, and ATOMesh's
-log ($RUN_DIR/mesh.log) holds one routing decision event per request, the two
-with different key hashes. With the text shared, only the images' media
-digests can tell the two routing keys apart, and only the images' cache_seed
-keeps the second request off the first one's cached KV.
+log ($RUN_DIR/mesh.log) holds one `Selected worker` event (target
+`mesh::route`) per request, each with `media_count=1`, the blue one with a
+`match_ratio` below 1. A media request routes on cache_aware's prefix tree,
+which by then holds the red request's routing key: a blue key equal to it
+would match whole. With the text shared, only the images' media digests can
+tell the two keys apart, and only the images' cache_seed keeps the second
+request off the first one's cached KV.
 """
 
 import json
@@ -76,11 +79,11 @@ def ask(color):
 
 
 def decision_events(log):
-    """The routing decision events in a router log, as dicts of the event's
+    """The `Selected worker` events in a router log, as dicts of the event's
     own fields (not its span's)."""
     events = []
     for line in log.splitlines():
-        _, mark, fields = ANSI.sub("", line).partition("routing decision")
+        _, mark, fields = ANSI.sub("", line).partition("Selected worker")
         if mark:
             events.append({k: v.strip('"') for k, v in FIELD.findall(fields)})
     return events
@@ -112,9 +115,12 @@ def main():
         answer = ask(color)
         events = new_events(log, seen)
         seen += len(events)
+        event = events[0] if len(events) == 1 else {}
         result[color] = {
             "answer": answer,
-            "key_hash": events[0].get("key_hash") if len(events) == 1 else None,
+            "branch": event.get("branch"),
+            "match_ratio": event.get("match_ratio"),
+            "media_count": event.get("media_count"),
             "events": events,
         }
         other = next(c for c in COLORS if c != color)
@@ -124,11 +130,24 @@ def main():
             )
         if len(events) != 1:
             failures.append(
-                f"{len(events)} routing decision events in {log} for the {color} request"
+                f"{len(events)} Selected worker events in {log} for the {color} request"
             )
-    hashes = [result[color]["key_hash"] for color in COLORS]
-    if None not in hashes and hashes[0] == hashes[1]:
-        failures.append(f"both requests routed on key hash {hashes[0]}")
+        elif event.get("media_count") != "1":
+            failures.append(
+                f"the {color} request routed with media_count "
+                f"{event.get('media_count')}, not 1"
+            )
+    blue = result["blue"]
+    if len(blue["events"]) == 1:
+        if blue["match_ratio"] is None:
+            failures.append(
+                f"the blue request's route ({blue['branch']}) logged no match_ratio"
+            )
+        elif float(blue["match_ratio"]) >= 1:
+            failures.append(
+                "the blue request matched the red one's routing key whole "
+                f"(match_ratio {blue['match_ratio']})"
+            )
     finish(result, failures)
 
 
