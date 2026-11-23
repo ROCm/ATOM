@@ -16,8 +16,12 @@ from atom.models.minimax_m3.model import MiniMaxM3SparseAttention
 
 
 class _QKV:
+    def __init__(self):
+        self.calls = 0
+
     def __call__(self, hidden_states, x_scale=None):
         del x_scale
+        self.calls += 1
         return hidden_states
 
 
@@ -38,15 +42,21 @@ class _Attention:
         self.impl = SimpleNamespace(kv_format=kv_format, kv_nvfp4=False)
         self.mxfp8_calls = []
         self.plain_calls = []
+        self.q_scales = []
+        self.qkvs = []
 
-    def forward_mxfp8(self, q, k, v, positions, qkv=None):
+    def forward_mxfp8(self, q, k, v, positions, q_scale=None, qkv=None):
         self.mxfp8_calls.append(q)
+        self.q_scales.append(q_scale)
+        self.qkvs.append(qkv)
         return torch.zeros_like(q, dtype=torch.uint8), torch.ones(
             (q.shape[0], q.shape[1] // 32), dtype=torch.uint8
         )
 
-    def __call__(self, *args, **kwargs):
+    def __call__(self, *args, q_scale=None, qkv=None, **kwargs):
         self.plain_calls.append(args)
+        self.q_scales.append(q_scale)
+        self.qkvs.append(qkv)
         return args[0]
 
 
@@ -60,6 +70,7 @@ def _layer(*, enabled=True):
         index_q_size=2,
         idx_head_dim=2,
         sparse_pa_mxfp8_out=enabled,
+        fused_qkv_chain=False,
     )
 
 
@@ -165,3 +176,84 @@ def test_fill_unit_scale_writes_e8m0_one_and_fp32_one():
     fp32 = torch.zeros(2, 1)
     base_attention.fill_unit_scale(fp32)
     assert (fp32 == 1).all()
+
+
+# --- fused QKV chain: the MXFP8 activation goes to rope_cache as `qkv`
+
+
+def _mxfp8_hidden(rows=3, hidden=96):
+    return (
+        torch.zeros(rows, hidden, dtype=torch.float8_e4m3fn),
+        torch.ones(rows, hidden // 32, dtype=torch.uint8),
+    )
+
+
+@pytest.mark.parametrize("mxfp8_out", [True, False])
+def test_fused_qkv_chain_hands_the_mxfp8_activation_to_the_attention(
+    monkeypatch, mxfp8_out
+):
+    monkeypatch.setattr(m3_model, "_linear_consumes_mxfp8", lambda linear: True)
+    layer = _layer(enabled=mxfp8_out)
+    layer.fused_qkv_chain = True
+    hidden, scale = _mxfp8_hidden()
+    MiniMaxM3SparseAttention.forward(
+        layer, torch.arange(3), hidden, hidden_states_scale=scale
+    )
+    assert layer.qkv_proj.calls == 0
+    assert layer.attn.qkvs == [hidden] and layer.attn.q_scales == [scale]
+
+
+def test_fused_qkv_chain_keeps_the_gemm_without_an_mxfp8_activation(monkeypatch):
+    monkeypatch.setattr(m3_model, "_linear_consumes_mxfp8", lambda linear: True)
+    layer = _layer()
+    layer.fused_qkv_chain = True
+    MiniMaxM3SparseAttention.forward(layer, torch.arange(3), torch.randn(3, 72))
+    assert layer.qkv_proj.calls == 1 and layer.attn.q_scales == [None]
+
+
+def _sparse_impl(fused: bool):
+    from atom.model_ops.attention_mha import SparseMHAPagedAttentionImpl
+
+    impl = SparseMHAPagedAttentionImpl.__new__(SparseMHAPagedAttentionImpl)
+    impl.fused_qkv_linear = (object(),) if fused else None
+    impl._fused_x_scale = None
+    return impl
+
+
+def test_sparse_impl_keeps_the_mxfp8_scales_for_rope_cache(monkeypatch):
+    """An e4m3 `qkv` is the QKV GEMM's input: its scales wait for rope_cache and
+    the attention itself is handed no q scale."""
+    from atom.model_ops.attention_mha import PagedAttentionImpl
+
+    seen = {}
+    monkeypatch.setattr(
+        PagedAttentionImpl,
+        "forward_impl",
+        lambda self, q, k, v, position=None, q_scale=None, qkv=None, **kw: seen.update(
+            q_scale=q_scale
+        ),
+    )
+    impl = _sparse_impl(fused=True)
+    hidden, scale = _mxfp8_hidden()
+    impl.forward_impl(hidden, hidden, hidden, q_scale=scale, qkv=hidden)
+    assert impl._fused_x_scale is scale and seen["q_scale"] is None
+    with pytest.raises(RuntimeError):
+        impl.forward_impl(hidden, hidden, hidden, q_scale=None, qkv=hidden)
+
+
+def test_sparse_impl_passes_a_bf16_qkv_through(monkeypatch):
+    from atom.model_ops.attention_mha import PagedAttentionImpl
+
+    seen = {}
+    monkeypatch.setattr(
+        PagedAttentionImpl,
+        "forward_impl",
+        lambda self, q, k, v, position=None, q_scale=None, qkv=None, **kw: seen.update(
+            q_scale=q_scale
+        ),
+    )
+    impl = _sparse_impl(fused=True)
+    qkv = torch.randn(3, 8)
+    marker = torch.ones(1)
+    impl.forward_impl(qkv, qkv, qkv, q_scale=marker, qkv=qkv)
+    assert impl._fused_x_scale is None and seen["q_scale"] is marker

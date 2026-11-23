@@ -70,6 +70,13 @@ from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
 from atom.utils.region_graph import token_graph
 
+try:
+    from aiter.ops.flydsl.mxfp8_qkv_rope_nvfp4_gfx1250 import (
+        mxfp8_qkv_chain_supported,
+    )
+except ImportError:  # an aiter without ROCm/aiter#8432
+    mxfp8_qkv_chain_supported = None
+
 
 def _get_text_config(config: PretrainedConfig) -> PretrainedConfig:
     return config.text_config if hasattr(config, "text_config") else config
@@ -183,6 +190,30 @@ def _linear_consumes_mxfp8(linear: nn.Module) -> bool:
         and params_dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
         and getattr(linear, "native_a8_group_rows", None) is not None
         and not getattr(linear, "runs_bf16", False)
+    )
+
+
+def _fused_qkv_chain_supported(attn: nn.Module) -> bool:
+    """Whether ``attn`` (a MiniMaxM3SparseAttention) may route its MXFP8 QKV input
+    into rope_cache's fused chain: aiter's kernel present and serving the head
+    shape (gfx1250, the M3 TP4 heads), a layer that runs the indexer, and no
+    plugin bridge. The per-call conditions are rope_cache's."""
+    if mxfp8_qkv_chain_supported is None or attn.skip_index_topk:
+        return False
+    from atom.plugin.prepare import is_plugin_mode
+
+    return (
+        not is_plugin_mode()
+        and attn.idx_head_dim == attn.head_dim
+        and mxfp8_qkv_chain_supported(
+            1,
+            attn.num_heads,
+            attn.num_kv_heads,
+            attn.head_dim,
+            attn.rotary_emb.rotary_dim,
+            attn.hidden_size,
+        )
+        and isinstance(getattr(attn.attn, "impl", None), SparseMHAPagedAttentionImpl)
     )
 
 
@@ -622,6 +653,13 @@ class MiniMaxM3SparseAttention(nn.Module):
                 mxfp8_conditions,
                 prefix,
             )
+        # The QKV GEMM moves into rope_cache, which fuses it with the norm / RoPE /
+        # NVFP4 inserts where aiter's chain kernel takes the call and runs the
+        # GEMM itself otherwise (SparseMHAPagedAttentionImpl).
+        self.fused_qkv_chain = _fused_qkv_chain_supported(self)
+        if self.fused_qkv_chain:
+            # A tuple: the impl reads the linear, it does not own it.
+            self.attn.impl.fused_qkv_linear = (self.qkv_proj,)
 
     def forward(
         self,
@@ -629,25 +667,42 @@ class MiniMaxM3SparseAttention(nn.Module):
         hidden_states: torch.Tensor,
         hidden_states_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # Keep index Q/K packed with main QKV. Layers that reuse cached top-k skip
-        # the indexer norm/rope/top-k path, but still compute the packed GEMM.
-        qkv = self.qkv_proj(hidden_states, x_scale=hidden_states_scale)
-        q, k, v, _, _ = qkv.split(
-            [
-                self.q_size,
-                self.kv_size,
-                self.kv_size,
-                self.index_q_size,
-                self.idx_head_dim,
-            ],
-            dim=-1,
-        )
+        x_scale = None
+        if (
+            self.fused_qkv_chain
+            and hidden_states_scale is not None
+            and hidden_states.dtype == torch.float8_e4m3fn
+            and _linear_consumes_mxfp8(self.qkv_proj)
+        ):
+            # The MXFP8 activation rides to rope_cache as `qkv` with its E8M0
+            # scales as `q_scale`; q/k/v only size the attention's outputs.
+            qkv, x_scale = hidden_states, hidden_states_scale
+            rows = hidden_states.new_empty(
+                (hidden_states.shape[0], self.q_size + 2 * self.kv_size),
+                dtype=torch.bfloat16,
+            )
+            q, k, v = rows.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        else:
+            # Keep index Q/K packed with main QKV. Layers that reuse cached top-k
+            # skip the indexer norm/rope/top-k path, but still compute the packed
+            # GEMM.
+            qkv = self.qkv_proj(hidden_states, x_scale=hidden_states_scale)
+            q, k, v, _, _ = qkv.split(
+                [
+                    self.q_size,
+                    self.kv_size,
+                    self.kv_size,
+                    self.index_q_size,
+                    self.idx_head_dim,
+                ],
+                dim=-1,
+            )
         if self.sparse_pa_mxfp8_out:
             attn_output, attn_scale = self.attn.forward_mxfp8(
-                q, k, v, positions, qkv=qkv
+                q, k, v, positions, q_scale=x_scale, qkv=qkv
             )
             return self.o_proj(attn_output, x_scale=attn_scale)
-        attn_output = self.attn(q, k, v, positions, qkv=qkv)
+        attn_output = self.attn(q, k, v, positions, q_scale=x_scale, qkv=qkv)
         return self.o_proj(attn_output)
 
 

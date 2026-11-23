@@ -1377,6 +1377,103 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         # Rotated indexer query produced by rope_cache, consumed (and cleared) by
         # dispatch_backend within the same single-threaded layer forward.
         self._index_q: torch.Tensor | None = None
+        # The fused QKV chain: the layer's QKV linear (a 1-tuple, set by the
+        # model), and the MXFP8 activation's scales between forward_impl and
+        # rope_cache of one call.
+        self.fused_qkv_linear: tuple | None = None
+        self._fused_x_scale: torch.Tensor | None = None
+
+    def forward_impl(self, q, k, v, position=None, q_scale=None, qkv=None, **kwargs):
+        # An e4m3 `qkv` is the QKV GEMM's MXFP8 input (the fused QKV chain) and
+        # `q_scale` its E8M0 scales, for rope_cache; the attention takes no q scale.
+        # Set on every call: a dummy run returns before rope_cache consumes it.
+        fused = (
+            self.fused_qkv_linear is not None
+            and qkv is not None
+            and qkv.dtype == torch.float8_e4m3fn
+        )
+        self._fused_x_scale = q_scale if fused else None
+        if fused:
+            if q_scale is None:
+                raise RuntimeError(
+                    "an MXFP8 qkv reached the attention without its scales"
+                )
+            q_scale = None
+        return super().forward_impl(
+            q, k, v, position=position, q_scale=q_scale, qkv=qkv, **kwargs
+        )
+
+    def _fused_qkv_chain(self, x, x_scale, q, position, k_cache, v_cache, k_scale,
+                         v_scale, slot_mapping):  # fmt: skip
+        """The QKV GEMM + norm / RoPE + NVFP4 K/V and index inserts in one aiter
+        launch, writing what fused_qknorm_idxrqknorm writes; (q_out, index_q), or
+        None where the chain does not take the call."""
+        from aiter.ops.flydsl.mxfp8_qkv_rope_nvfp4_gfx1250 import (
+            mxfp8_qkv_chain_supported,
+            mxfp8_qkv_norm_rope_nvfp4_insert,
+        )
+
+        linear = self.fused_qkv_linear[0]
+        num_tokens = x.shape[0]
+        if not (
+            self.kv_nvfp4
+            and self.index_scale is not None
+            and not self.skip_index_topk
+            and x_scale.dtype in (torch.float8_e8m0fnu, torch.uint8)
+            and linear.weight.dtype == torch.float8_e4m3fn
+            and getattr(linear.weight, "is_shuffled", False)
+            and getattr(linear, "native_a8_group_rows", None) == 1
+            and linear.weight.shape[0]
+            == self.num_heads * self.head_dim
+            + 2 * self.num_kv_heads * self.head_dim
+            + self.index_q_size
+            + self.index_head_dim
+            and mxfp8_qkv_chain_supported(
+                num_tokens,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.rotary_emb.rotary_dim,
+                x.shape[1],
+                num_index_heads=self.num_idx_heads,
+            )
+        ):
+            return None
+        from atom.models.minimax_m3.model import _minimax_m3_cos_sin_cache
+
+        q_out = torch.empty(
+            (num_tokens, self.num_heads * self.head_dim),
+            dtype=torch.bfloat16,
+            device=x.device,
+        )
+        index_q = torch.empty(
+            (num_tokens, self.index_q_size), dtype=torch.bfloat16, device=x.device
+        )
+        mxfp8_qkv_norm_rope_nvfp4_insert(
+            x,
+            x_scale.view(torch.float8_e8m0fnu),
+            linear.weight,
+            linear.weight_scale,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self.index_q_norm.weight,
+            self.index_k_norm.weight,
+            _minimax_m3_cos_sin_cache(self.rotary_emb, q),
+            position,
+            slot_mapping,
+            slot_mapping,
+            k_cache,
+            v_cache,
+            k_scale,
+            v_scale,
+            self.index_cache,
+            self.index_scale,
+            q_out,
+            index_q,
+            self.q_norm.variance_epsilon,
+            num_index_heads=self.num_idx_heads,
+        )
+        return q_out, index_q
 
     @mark_trace(prefix="rope_cache", torch_compile=False)
     def rope_cache(self, q, k, v, qkv, position, fwd_ctx: ForwardContext):
@@ -1432,6 +1529,26 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         if sparse_metadata is None:
             sparse_metadata = attn_metadata
         slot_mapping = sparse_metadata.slot_mapping
+        x_scale, self._fused_x_scale = self._fused_x_scale, None
+        if x_scale is not None:
+            # `qkv` is the QKV GEMM's MXFP8 input.
+            fused = self._fused_qkv_chain(
+                qkv, x_scale, q, position, k_cache, v_cache, k_scale, v_scale,
+                slot_mapping,
+            )  # fmt: skip
+            if fused is not None:
+                q_out, index_q = fused
+                self._index_q = index_q.view(
+                    -1, self.num_idx_heads, self.index_head_dim
+                )
+                self._index_q_cache_key_info = (
+                    tuple(self._index_q.shape),
+                    self._index_q.dtype,
+                    self._index_q.device,
+                )
+                q = q_out.view(-1, self.num_heads, self.head_dim)
+                return q, k, v, k_cache, v_cache, k_scale, v_scale
+            qkv = self.fused_qkv_linear[0](qkv, x_scale=x_scale)
 
         qkv = qkv.contiguous()
         num_tokens = qkv.shape[0]
