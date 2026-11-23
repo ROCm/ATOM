@@ -559,7 +559,7 @@ RUN git clone $ATOM_REPO /app/ATOM && \
     git checkout $ATOM_COMMIT && \
     ATOM_MESH_BUILD=1 ATOM_MESH_FEATURES="${ATOM_MESH_FEATURES}" python -m pip install -e ".[structured-output]"
 RUN pip show atom || true
-RUN python -c "import llguidance, re2; print('structured output: llguidance', llguidance.__version__)"
+RUN python -c "import llguidance, re2; from importlib.metadata import version; print('structured output: llguidance', version('llguidance'))"
 
 RUN pip install --no-cache-dir msgpack msgspec quart
 
