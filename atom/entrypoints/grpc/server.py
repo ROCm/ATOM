@@ -129,9 +129,9 @@ class _Sibling:
         self.first = self.last = None
         self.finished = False
 
-    def add(self, output: RequestOutput, keep_ids: bool) -> None:
+    def add(self, output: RequestOutput, delivered: float, keep_ids: bool) -> None:
         if output.output_tokens:
-            self.last = time.time()
+            self.last = delivered
             if self.first is None:
                 self.first = self.last
         self.completion_tokens += len(output.output_tokens)
@@ -205,13 +205,19 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
                     request, params, kv_transfer_params, stops
                 )
                 params = replace(params, **fields)
+            buffer = self.steps.callback(outputs)
+
+            def stream_callback(output: RequestOutput) -> None:
+                # Timed as the engine delivers it, as generate_async times its outputs.
+                buffer((output, time.time()))
+
             preprocessing = asyncio.get_running_loop().run_in_executor(
                 None,
                 partial(
                     api.engine.io_processor.preprocess_fanout,
                     prompt,
                     params,
-                    stream_callback=self.steps.callback(outputs),
+                    stream_callback=stream_callback,
                     kv_transfer_params=api._engine_kv_transfer_params(
                         kv_transfer_params
                     ),
@@ -232,7 +238,8 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
                 siblings[seq.id] = _Sibling(index, seq.num_prompt_tokens, started)
             if call.aborted:  # before its submission: none reaches the engine
                 for seq in seqs:
-                    outputs.put_nowait(RequestOutput(seq.id, [], True, "aborted"))
+                    aborted = RequestOutput(seq.id, [], True, "aborted")
+                    outputs.put_nowait((aborted, time.time()))
             else:
                 submitted = True  # a failed submission may have dispatched some seqs
                 await api._submit_engine_requests(seqs)
@@ -241,12 +248,12 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
                         api.engine.core_mgr.abort_request(seq.id)
             running = len(seqs)
             while running:
-                output = await outputs.get()
+                output, delivered = await outputs.get()
                 sibling = siblings[output.request_id]
                 if sibling.finished:
                     continue
                 # A stream's tokens go out in its chunks.
-                sibling.add(output, keep_ids=not request.stream)
+                sibling.add(output, delivered, keep_ids=not request.stream)
                 raise_for_structured_error(output.finish_reason)  # HTTP chat's 500
                 if request.stream and output.output_tokens:
                     chunk = pb.GenerateStreamChunk(

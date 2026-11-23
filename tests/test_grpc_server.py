@@ -155,11 +155,31 @@ def test_the_complete_carries_the_http_usage_timing(serve, monkeypatch, stream):
     assert (complete.ttft_s, complete.tpot_s, complete.latency_s) == (1, 0.5, 3)
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_token_times_are_taken_as_the_engine_delivers_them(serve, monkeypatch, stream):
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(grpc_server, "time", SimpleNamespace(time=lambda: clock.now))
+    engine = FakeEngine()
+
+    def add_request(seqs):  # the steps end at 1 s and 2 s; the call reads them at 10 s
+        for now, tokens, reason in ((1.0, [5], None), (2.0, [6, 7], "eos")):
+            clock.now = now
+            seqs[0].callback(
+                RequestOutput(seqs[0].id, tokens, reason is not None, reason)
+            )
+            engine.flush()
+        clock.now = 10.0
+
+    engine.core_mgr.add_request = add_request
+    complete = _generate(serve(engine), stream=stream)[-1].complete
+    assert (complete.ttft_s, complete.tpot_s, complete.latency_s) == (1, 0.5, 10)
+
+
 def test_a_complete_without_output_ids_has_no_token_timing(serve, monkeypatch):
-    clock = itertools.count()
+    clock = itertools.count()  # arrival 0, the step's delivery 1, the end 2
     monkeypatch.setattr(grpc_server, "time", SimpleNamespace(time=lambda: next(clock)))
     complete = _generate(serve(FakeEngine([([], "eos")])))[-1].complete
-    assert (complete.ttft_s, complete.tpot_s, complete.latency_s) == (0, 0, 1)
+    assert (complete.ttft_s, complete.tpot_s, complete.latency_s) == (0, 0, 2)
 
 
 @pytest.mark.parametrize(
