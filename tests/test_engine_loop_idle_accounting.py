@@ -47,6 +47,7 @@ def _extract(class_name: str, method: str):
         "tracing": SimpleNamespace(shutdown=lambda: None),
         "time": SimpleNamespace(monotonic=lambda: 0.0, sleep=lambda _: None),
         "HELD_POLL_S": 0.0,
+        "IDLE_YIELD_S": 2e-4,
     }
     exec(  # noqa: S102 - execute only AST nodes from this repository's source.
         compile(ast.Module([func], []), str(ENGINE_CORE), "exec"), scope
@@ -152,10 +153,12 @@ class _Engine:
         return None
 
 
-def _run(class_name, schedule, **kw):
+def _run(class_name, schedule, sleeps=None, **kw):
     loop, scope = _extract(class_name, "busy_loop")
     engine = _Engine(schedule, **kw)
     scope["time"].monotonic = engine.now
+    if sleeps is not None:
+        scope["time"].sleep = sleeps.append
     with pytest.raises(StopIteration):
         loop(engine)
     return engine
@@ -259,3 +262,17 @@ def test_time_mode_loops_leave_the_origin_alone(class_name):
     """The default path: every deployment that never sets the step interval."""
     engine = _run(class_name, BURST_IDLE_BURST, interval_steps=0)
     assert engine.stats._throughput_last_log_time == 0.0
+
+
+def test_the_base_loop_yields_only_on_passes_without_a_forward():
+    """A pass that ran no forward (stalled or idle) sleeps, so the output IO
+    thread gets the GIL; a forward never does."""
+    sleeps: list = []
+    engine = _run(
+        "EngineCore",
+        [(0.0, WORK), (1.0, STALLED), (2.0, WORK), (3.0, IDLE), (4.0, IDLE)]
+        + [(5.0, STALLED), (6.0, WORK)],
+        sleeps=sleeps,
+    )
+    assert engine.forwards == 3
+    assert sleeps == [2e-4] * 4

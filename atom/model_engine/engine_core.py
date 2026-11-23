@@ -62,6 +62,9 @@ logger = logging.getLogger("atom")
 KV_IDLE_DRAIN_INTERVAL_S = 0.001
 # How long a busy loop that finds its engine held sleeps before it looks again.
 HELD_POLL_S = 0.01
+# A busy-loop pass that runs no forward sleeps this long, so the output thread
+# gets the GIL now instead of at the 5 ms switch interval.
+IDLE_YIELD_S = 0.0002
 
 # Upper bound on the drain that runs after the loop exits. A peer that died
 # mid-transfer leaves a completion that never arrives; exiting late beats
@@ -573,10 +576,12 @@ class EngineCore:
                         self.scheduler.engine_stats.bump_step()
                     else:
                         self.scheduler.engine_stats.note_idle(now)
+                        time.sleep(IDLE_YIELD_S)
                 else:
                     self.scheduler.engine_stats.note_idle(now)
                     if self.has_pending_kv_work():
                         self._advance_idle_kv_transfer()
+                    time.sleep(IDLE_YIELD_S)
         finally:
             try:
                 # Teardown runs even on exceptions so the sender thread/socket
