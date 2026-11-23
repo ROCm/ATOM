@@ -86,10 +86,16 @@ pub fn prepare_chat(
     })?;
     let workers = components.worker_registry.get_by_model(model_id_str);
     let configured_template = components.router_config.chat_template.is_some();
-    let entry = tokenizer_entry(model_id_str, components);
-    let built_in_encoder = entry
-        .as_ref()
-        .is_some_and(|entry| components.chats_without_template.read().contains(&entry.id));
+    // The entry and its mark read under one lock, which a swap takes to forget the
+    // replaced entry's mark.
+    let (entry, built_in_encoder) = {
+        let marked = components.chats_without_template.read();
+        let entry = tokenizer_entry(model_id_str, components);
+        let built_in = entry
+            .as_ref()
+            .is_some_and(|entry| marked.contains(&entry.id));
+        (entry, built_in)
+    };
     if let Some(gap) = atom_chat_render_gap(&workers, configured_template, built_in_encoder) {
         return Err(error::not_implemented(
             "chat_template_unavailable",

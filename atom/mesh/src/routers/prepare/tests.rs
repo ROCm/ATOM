@@ -1511,6 +1511,51 @@ mod h_prepare_chat_generate {
         assert_eq!(status, http::StatusCode::NOT_IMPLEMENTED);
     }
 
+    /// A swap that completes, forgetting the replaced tokenizer's mark, while a chat
+    /// reads the model's tokenizer leaves the chat refused: it reads the entry and its
+    /// mark together.
+    #[test]
+    fn test_a_chat_reads_its_tokenizer_and_its_mark_together() {
+        use crate::core::{BasicWorkerBuilder, RuntimeType};
+
+        let registry = test_mocks::tokenizer_registry_with("m");
+        let components = test_mocks::app_context_with_tokenizer_registry(registry.clone());
+        let worker = BasicWorkerBuilder::new("grpc://atom:1")
+            .runtime_type(RuntimeType::Atom)
+            .model_id("m")
+            .label("chat_template", "{{ messages }}")
+            .build();
+        components.worker_registry.register(Arc::new(worker));
+        let old = registry.get_by_name("m").unwrap();
+        components
+            .chats_without_template
+            .write()
+            .insert(old.id.clone());
+
+        // The swap holds the marks while the chat starts.
+        let mut marks = components.chats_without_template.write();
+        let chatting = components.clone();
+        let chat = std::thread::spawn(move || {
+            let chat = prepare_chat(chat_req(false), None, Some("m".into()), &chatting);
+            chat.err().map(|refused| refused.status())
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        registry.remove_by_id(&old.id).unwrap();
+        let id = TokenizerRegistry::generate_id();
+        let tokenizer = old.tokenizer.clone();
+        let insert = registry.load(&id, "m", "mock", || async { Ok(tokenizer) });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(insert).unwrap();
+        marks.insert(id);
+        marks.remove(&old.id);
+        drop(marks);
+
+        let status = chat.join().unwrap();
+        assert_eq!(status, Some(http::StatusCode::NOT_IMPLEMENTED));
+    }
+
     #[test]
     fn test_prepare_generate_request_ids_unique_per_call() {
         let registry = test_mocks::tokenizer_registry_with("m");
