@@ -8,7 +8,7 @@ from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 from torch import nn
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 
-from atom.config import get_current_atom_config
+from atom.config import get_current_atom_config, kv_cache_torch_dtype
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.base_attention import (
     PA_ASM_MAX_QUERY_GROUP_SIZE,
@@ -858,7 +858,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         num_pages, block_size, num_kv_heads, _ = k_cache.shape
 
         if self.kv_cache_dtype == "fp8":
-            target_dtype = dtypes.d_dtypes[self.kv_cache_dtype]
+            target_dtype = kv_cache_torch_dtype(self.kv_cache_dtype)
             k_cache = k_cache.view(target_dtype)
             v_cache = v_cache.view(target_dtype)
 
