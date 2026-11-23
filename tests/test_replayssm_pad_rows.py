@@ -6,8 +6,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-pytest.importorskip("triton", reason="the ReplaySSM kernels are Triton")
-pytest.importorskip("aiter", reason="replayssm imports aiter's arch helpers")
+if not torch.cuda.is_available():
+    pytest.skip("ReplaySSM kernels require a GPU", allow_module_level=True)
 
 from atom.model_ops.fla_ops.replayssm import (
     replayssm_buffer_shapes,
@@ -131,7 +131,6 @@ def check(kind, t, route, layout, all_pad, device, dtype=torch.bfloat16):
         assert torch.equal(padded[name], want), f"{name} differs"
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 @pytest.mark.parametrize("kind, t, route", CASES)
 @pytest.mark.parametrize("layout", ["uniform", "ragged", "empty"])
 @pytest.mark.parametrize("all_pad", [False, True], ids=["mixed", "all_pad"])
@@ -139,7 +138,6 @@ def test_pad_entries_write_zeros_and_touch_no_state(kind, t, route, layout, all_
     check(kind, t, route, layout, all_pad, "cuda")
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 @pytest.mark.parametrize(
     "kind, route", [("gdn", "serial"), ("gdn", "ut"), ("kda", None)]
 )
