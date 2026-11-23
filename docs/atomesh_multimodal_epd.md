@@ -496,7 +496,8 @@ E's pool (`EcPool`):
   word inside another entry's rows does not match.
 
 P's read (`EcReader.read`): P checks `cache_seed` against its own, reads
-the rows, then rereads the word. A `cache_seed` mismatch, a failed read, a
+the rows, then rereads the word. A `cache_seed` mismatch, a dtype other
+than the one E stored (`ec_transfer_params` carries it), a failed read, a
 changed word or rows larger than its buffer make it return `None`.
 
 P's ranks agree before any of them uses the rows
@@ -525,8 +526,8 @@ Rejected:
 **D13. E answers with `ec_transfer_params`, as P answers with
 `kv_transfer_params`.** *#3412; ATOMesh's side in #3409.*
 - E returns a chat completion with no choices and an `ec_transfer_params`
-  object: Mooncake session, `cache_seed`, address, length, generation and
-  rows (`EcPool.put`, `api_server.py: _encoder_only_response`).
+  object: Mooncake session, `cache_seed`, address, length, generation,
+  rows and dtype (`EcPool.put`, `api_server.py: _encoder_only_response`).
 - ATOMesh copies it into P's body. P's chat path puts it into the
   request's `multimodal_data`, which the scheduler already carries to the
   runner for prefill. A body without it behaves as today.
