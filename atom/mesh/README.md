@@ -273,18 +273,13 @@ chat template, such as DeepSeek V3.2 and V4
 need tokens, such as `cache_aware` or `round_robin`, for these models and APIs.
 
 The router renders a chat it tokenizes with the model's chat template and the
-request's `chat_template_kwargs` and `reasoning_effort`. For a checkpoint whose
-`config.json` has a `model_type` with reasoning controls of its own in ATOM,
-DeepSeek-V4.1's `deepseek_v41`, it renders the chat as ATOM does instead. Under
-V4.1's rules, the request's `thinking`, `reasoning_effort` and
-`chat_template_kwargs` set the template's `thinking_mode` and
-`reasoning_effort`: a `minimal` effort is `low`, `medium` and `xhigh` are
-`high`, a `none` effort or a disabled `thinking` is chat mode, and
-`thinking.effort` may be a budget from 1 to 100. Only the kwargs V4.1's encoder
-takes reach the template. Controls ATOM refuses get `400`, and a chat after a
-`context` kwarg, which the template does not render, gets
-`501 token_routing_unsupported`. The router does not know a worker's
-`--default-chat-template-kwargs`.
+request's `reasoning_effort` and `chat_template_kwargs`. For a checkpoint whose
+`config.json` has `model_type` `deepseek_v41` (DeepSeek-V4.1), it takes the
+effort as ATOM's V4.1 encoder does: `minimal` as `low`, `medium` and `xhigh` as
+`high`, and `none` as chat mode. V4.1's template rejects `minimal`, `xhigh` and
+`none`. Other controls, such as `thinking` and a message's list of text blocks,
+can still render otherwise than on ATOM; ATOM renders the chat again, so the
+difference costs prefix hits, not a different prompt.
 
 ## Tokenization
 

@@ -261,10 +261,10 @@ async fn fastokens_models_tokenize_up_to_their_own_limit() {
     }
 }
 
-/// The chats of a model ATOM keeps reasoning controls for tokenize as ATOM
-/// renders them, and those ATOM rejects fail as on ATOM.
+/// A chat whose effort its model's template rejects and ATOM accepts
+/// tokenizes under the model's reasoning controls, with the effort ATOM takes.
 #[tokio::test]
-async fn chats_tokenize_under_their_models_reasoning_controls() {
+async fn chats_tokenize_with_the_effort_their_model_takes() {
     let config = crate::config::RouterConfig {
         policy: prefix_hash(),
         ..Default::default()
@@ -273,7 +273,12 @@ async fn chats_tokenize_under_their_models_reasoning_controls() {
     let app = AppContext::from_config(config, 5, _pool.handle())
         .await
         .unwrap();
-    let template = "{{ messages[0].content }}/{{ thinking_mode | default('-') }}/{{ reasoning_effort | default('-') }}";
+    // As V4.1's, the template rejects an effort it has no budget for.
+    let template = concat!(
+        "{%- if reasoning_effort is defined and reasoning_effort not in ['low', 'medium', 'high', 'max'] -%}",
+        "{{ raise_exception('Invalid reasoning effort') }}{%- endif -%}",
+        "{{ messages[0].content }}/{{ thinking_mode | default('-') }}/{{ reasoning_effort | default('-') }}",
+    );
     let (_dir, hf, _) = huggingface_and_fastokens(template);
     let id = TokenizerRegistry::generate_id();
     let tokenizer = hf.clone();
@@ -281,36 +286,24 @@ async fn chats_tokenize_under_their_models_reasoning_controls() {
         .load(&id, "m", "m", || async { Ok(tokenizer) })
         .await
         .unwrap();
-    for (controls, fields, want) in [
-        (
-            None,
-            json!({"reasoning_effort": "medium"}),
-            Ok("hi/-/medium"),
-        ),
-        (
-            Some(ChatControls::DeepseekV41),
-            json!({"reasoning_effort": "medium"}),
-            Ok("hi/thinking/high"),
-        ),
-        (
-            Some(ChatControls::DeepseekV41),
-            json!({"thinking": {"type": "disabled"}}),
-            Ok("hi/chat/-"),
-        ),
-        (
-            Some(ChatControls::DeepseekV41),
-            json!({"reasoning_effort": "ultra"}),
-            Err("invalid_request"),
-        ),
+    let v41 = Some(ChatControls::DeepseekV41);
+    for (controls, effort, want) in [
+        (None, "medium", Ok("hi/-/medium")),
+        (None, "minimal", Err("invalid_request")),
+        (v41, "minimal", Ok("hi/-/low")),
+        (v41, "medium", Ok("hi/-/high")),
+        (v41, "none", Ok("hi/chat/-")),
+        (v41, "ultra", Err("invalid_request")),
     ] {
         match controls {
             Some(controls) => app.chat_controls.write().insert(id.clone(), controls),
             None => app.chat_controls.write().remove(&id),
         };
-        let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
-        body.as_object_mut()
-            .unwrap()
-            .extend(fields.as_object().unwrap().clone());
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": effort,
+        });
         let parsed =
             ParsedInference::parse("/v1/chat/completions", &serde_json::to_vec(&body).unwrap())
                 .unwrap();

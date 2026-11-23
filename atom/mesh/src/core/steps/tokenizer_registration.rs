@@ -322,8 +322,7 @@ async fn controls_beside(name: &str, tokenizer: &Path) -> Option<ChatControls> {
     let controls = ChatControls::of_model_type(model_type)?;
     info!(
         tokenizer = name,
-        model_type,
-        "HTTP routing renders these chats under ATOM's reasoning controls for the model"
+        model_type, "HTTP routing takes the effort of these chats as ATOM does for the model"
     );
     Some(controls)
 }

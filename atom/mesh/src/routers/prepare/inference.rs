@@ -1,6 +1,4 @@
 //! Validated routing views; callers retain raw request bodies.
-use std::fmt;
-
 use crate::protocols::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
     common::{ContentPart, GenerationRequest, InputIds, StringOrArray},
@@ -8,13 +6,7 @@ use crate::protocols::{
     generate::GenerateRequest,
     validated::Normalizable,
 };
-use serde::{
-    de::{
-        value::{BorrowedStrDeserializer, StrDeserializer},
-        DeserializeSeed, Deserializer, Error as _, MapAccess, SeqAccess, Visitor,
-    },
-    Deserialize, Serialize, Serializer,
-};
+use serde::{Serialize, Serializer};
 use validator::Validate;
 
 #[derive(Debug, Clone)]
@@ -123,165 +115,8 @@ impl InferenceRequest for GenerateRequest {
     }
 }
 
-/// The chat fields ATOM reads that the typed request does not keep: it has no
-/// `thinking`. A `null` is not sent.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct SentControls {
-    pub(crate) thinking: Option<serde_json::Value>,
-}
-
-impl SentControls {
-    /// `bytes` parsed as a `T`, with the controls as sent.
-    fn parse<'de, T: Deserialize<'de>>(bytes: &'de [u8]) -> serde_json::Result<(T, Self)> {
-        let mut sent = Self::default();
-        let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-        let parsed = T::deserialize(Capture {
-            inner: &mut deserializer,
-            sent: &mut sent,
-        })?;
-        deserializer.end()?;
-        Ok((parsed, sent))
-    }
-}
-
-/// Deserializes as `inner` does, keeping the top-level object's controls in
-/// `sent` on the way: it wraps the deserializer, the request's visitor, and
-/// the map that visitor reads.
-struct Capture<'a, T> {
-    inner: T,
-    sent: &'a mut SentControls,
-}
-
-impl<'de, D: Deserializer<'de>> Deserializer<'de> for Capture<'_, D> {
-    type Error = D::Error;
-
-    fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, D::Error> {
-        let visitor = Capture {
-            inner: visitor,
-            sent: self.sent,
-        };
-        self.inner.deserialize_any(visitor)
-    }
-
-    fn deserialize_map<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, D::Error> {
-        let visitor = Capture {
-            inner: visitor,
-            sent: self.sent,
-        };
-        self.inner.deserialize_map(visitor)
-    }
-
-    fn deserialize_struct<V: Visitor<'de>>(
-        self,
-        name: &'static str,
-        fields: &'static [&'static str],
-        visitor: V,
-    ) -> Result<V::Value, D::Error> {
-        let visitor = Capture {
-            inner: visitor,
-            sent: self.sent,
-        };
-        self.inner.deserialize_struct(name, fields, visitor)
-    }
-
-    serde::forward_to_deserialize_any! {
-        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
-        bytes byte_buf option unit unit_struct newtype_struct seq tuple
-        tuple_struct enum identifier ignored_any
-    }
-}
-
-impl<'de, V: Visitor<'de>> Visitor<'de> for Capture<'_, V> {
-    type Value = V::Value;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-        self.inner.expecting(formatter)
-    }
-
-    fn visit_map<M: MapAccess<'de>>(self, map: M) -> Result<V::Value, M::Error> {
-        self.inner.visit_map(CaptureMap {
-            inner: map,
-            sent: self.sent,
-            thinking: false,
-        })
-    }
-
-    fn visit_seq<S: SeqAccess<'de>>(self, seq: S) -> Result<V::Value, S::Error> {
-        self.inner.visit_seq(seq)
-    }
-}
-
-/// The request's map, whose `thinking` value `next_value_seed` keeps.
-struct CaptureMap<'a, M> {
-    inner: M,
-    sent: &'a mut SentControls,
-    /// Whether the value to come is `thinking`'s.
-    thinking: bool,
-}
-
-impl<'de, M: MapAccess<'de>> MapAccess<'de> for CaptureMap<'_, M> {
-    type Error = M::Error;
-
-    fn next_key_seed<K: DeserializeSeed<'de>>(
-        &mut self,
-        seed: K,
-    ) -> Result<Option<K::Value>, M::Error> {
-        self.inner.next_key_seed(ControlKey {
-            inner: seed,
-            thinking: &mut self.thinking,
-        })
-    }
-
-    fn next_value_seed<S: DeserializeSeed<'de>>(&mut self, seed: S) -> Result<S::Value, M::Error> {
-        if !std::mem::take(&mut self.thinking) {
-            return self.inner.next_value_seed(seed);
-        }
-        let value: serde_json::Value = self.inner.next_value()?;
-        self.sent.thinking = (!value.is_null()).then(|| value.clone());
-        seed.deserialize(value).map_err(M::Error::custom)
-    }
-
-    fn size_hint(&self) -> Option<usize> {
-        self.inner.size_hint()
-    }
-}
-
-/// A key of the request's map, given to the request's own seed as read, and
-/// borrowed where the input allows, noting whether it is `thinking`.
-struct ControlKey<'a, K> {
-    inner: K,
-    thinking: &'a mut bool,
-}
-
-impl<'de, K: DeserializeSeed<'de>> DeserializeSeed<'de> for ControlKey<'_, K> {
-    type Value = K::Value;
-
-    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<K::Value, D::Error> {
-        deserializer.deserialize_str(self)
-    }
-}
-
-impl<'de, K: DeserializeSeed<'de>> Visitor<'de> for ControlKey<'_, K> {
-    type Value = K::Value;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-        formatter.write_str("a field name")
-    }
-
-    fn visit_borrowed_str<E: serde::de::Error>(self, key: &'de str) -> Result<K::Value, E> {
-        *self.thinking = key == "thinking";
-        self.inner.deserialize(BorrowedStrDeserializer::new(key))
-    }
-
-    fn visit_str<E: serde::de::Error>(self, key: &str) -> Result<K::Value, E> {
-        *self.thinking = key == "thinking";
-        self.inner.deserialize(StrDeserializer::new(key))
-    }
-}
-
 pub enum ParsedInference {
-    /// A chat, with the controls ATOM reads as sent.
-    Chat(ChatCompletionRequest, SentControls),
+    Chat(ChatCompletionRequest),
     Completion(CompletionRequest),
     Generate(GenerateRequest),
     Messages(serde_json::Value),
@@ -306,11 +141,11 @@ impl ParsedInference {
         let endpoint = EndpointSpec::find(path).ok_or("unsupported inference API")?;
         match endpoint.api {
             Api::Chat => {
-                let (mut request, sent): (ChatCompletionRequest, _) =
-                    SentControls::parse(bytes).map_err(|e| e.to_string())?;
+                let mut request: ChatCompletionRequest =
+                    serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
                 request.normalize();
                 request.validate().map_err(|e| e.to_string())?;
-                Ok(Self::Chat(request, sent))
+                Ok(Self::Chat(request))
             }
             Api::Completions => serde_json::from_slice(bytes)
                 .map(Self::Completion)
@@ -451,7 +286,7 @@ impl ParsedInference {
     /// engine keys every KV block of the prompt by.
     pub(crate) fn carries_media(&self) -> bool {
         match self {
-            Self::Chat(chat, _) => chat.messages.iter().any(|message| {
+            Self::Chat(chat) => chat.messages.iter().any(|message| {
                 let content = match message {
                     ChatMessage::System { content, .. }
                     | ChatMessage::User { content, .. }
@@ -477,13 +312,8 @@ impl ParsedInference {
     }
 
     pub fn chat(&self) -> Option<&ChatCompletionRequest> {
-        self.chat_as_sent().map(|(chat, _)| chat)
-    }
-
-    /// The chat, with the controls ATOM reads as it was sent.
-    pub(crate) fn chat_as_sent(&self) -> Option<(&ChatCompletionRequest, &SentControls)> {
-        if let Self::Chat(chat, sent) = self {
-            Some((chat, sent))
+        if let Self::Chat(chat) = self {
+            Some(chat)
         } else {
             None
         }
@@ -512,7 +342,7 @@ impl InferenceRequest for ParsedInference {
     }
     fn metadata_with_text(&self, include_text: bool) -> InferenceMetadata {
         let mut metadata = match self {
-            Self::Chat(r, _) => r.metadata_with_text(include_text),
+            Self::Chat(r) => r.metadata_with_text(include_text),
             Self::Completion(r) => r.metadata_with_text(include_text),
             Self::Generate(r) => r.metadata_with_text(include_text),
             Self::Messages(body) | Self::Responses(body) => {
@@ -676,44 +506,5 @@ mod tests {
             assert_eq!(parsed.carries_media(), media, "{body}");
             assert_eq!(parsed.metadata_with_text(false).carries_media, media);
         }
-    }
-
-    /// A chat keeps the top-level `thinking` it was sent, however its key is
-    /// spelt, unless `null`; the request parses as it would without it.
-    #[test]
-    fn chats_keep_the_thinking_they_were_sent() {
-        for (fields, thinking) in [
-            (
-                r#""thinking":{"type":"enabled","effort":30}"#,
-                Some(serde_json::json!({"type": "enabled", "effort": 30})),
-            ),
-            (
-                r#""thin\u006bing":{"type":"disabled"}"#,
-                Some(serde_json::json!({"type": "disabled"})),
-            ),
-            (r#""thinking":"on""#, Some(serde_json::json!("on"))),
-            (r#""thinking":null"#, None),
-            (
-                r#""chat_template_kwargs":{"thinking":{"type":"disabled"}}"#,
-                None,
-            ),
-        ] {
-            let body = format!(
-                r#"{{{fields},"model":"m","messages":[{{"role":"user","content":"hi"}}]}}"#
-            );
-            let parsed = ParsedInference::parse("/v1/chat/completions", body.as_bytes()).unwrap();
-            let (chat, sent) = parsed.chat_as_sent().unwrap();
-            assert_eq!(sent.thinking, thinking, "{body}");
-            let mut plain: ChatCompletionRequest = serde_json::from_str(&body).unwrap();
-            plain.normalize();
-            assert_eq!(
-                serde_json::to_value(chat).unwrap(),
-                serde_json::to_value(plain).unwrap(),
-                "{body}"
-            );
-        }
-        let trailing =
-            br#"{"model":"m","messages":[{"role":"user","content":"hi"}],"thinking":{}} x"#;
-        assert!(ParsedInference::parse("/v1/chat/completions", trailing).is_err());
     }
 }

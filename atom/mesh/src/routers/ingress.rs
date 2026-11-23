@@ -35,7 +35,7 @@ use crate::{
             chat_controls::ChatControls,
             chat_template::process_chat_messages,
             fast_tokenizer::TokenizeLimits,
-            inference::{InferenceMetadata, InferenceRequest, ParsedInference, SentControls},
+            inference::{InferenceMetadata, InferenceRequest, ParsedInference},
         },
     },
     server::AppState,
@@ -881,11 +881,11 @@ impl IngressRouting {
         }
         ctx.check()?;
         let template_started = Instant::now();
-        let prompt = if let Some((chat, sent)) = parsed.chat_as_sent() {
+        let prompt = if let Some(chat) = parsed.chat() {
             if self.chats_without_template.read().contains(&entry.id) {
                 return Err(IngressError::new(http::StatusCode::NOT_IMPLEMENTED, "token_routing_unsupported", "this model's chats render with a built-in encoder whose defaults are not the engine's; use a policy that does not require exact tokens"));
             }
-            self.render_chat(&entry, chat, sent)?
+            self.render_chat(&entry, chat)?
         } else {
             metadata.text.clone()
         };
@@ -907,22 +907,19 @@ impl IngressRouting {
         Ok(tokens)
     }
 
-    /// The prompt the router renders `chat` to with `entry`'s template: as ATOM
-    /// does for a model with reasoning controls of its own, else with the
-    /// chat's template kwargs.
+    /// The prompt the router renders `chat` to with `entry`'s template, under
+    /// the reasoning controls of its model where ATOM has its own.
     fn render_chat(
         &self,
         entry: &TokenizerEntry,
         chat: &ChatCompletionRequest,
-        sent: &SentControls,
     ) -> Result<String, IngressError> {
         let controls = self.chat_controls.read().get(&entry.id).copied();
         match controls {
-            Some(controls) => controls.render(chat, sent, &*entry.tokenizer),
-            None => Ok(process_chat_messages(chat, &*entry.tokenizer)
-                .map_err(IngressError::invalid)?
-                .text),
+            Some(controls) => controls.render(chat, &*entry.tokenizer),
+            None => process_chat_messages(chat, &*entry.tokenizer).map(|rendered| rendered.text),
         }
+        .map_err(IngressError::invalid)
     }
 }
 

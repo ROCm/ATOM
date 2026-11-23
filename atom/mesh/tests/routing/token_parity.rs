@@ -191,8 +191,8 @@ async fn tokenize(
             let tokens = routing
                 .tokens(&parsed, &metadata, ctx, true)
                 .map_err(|error| error.message);
-            let prompt = match parsed.chat_as_sent() {
-                Some((chat, sent)) => routing.render_chat(&entry, chat, sent),
+            let prompt = match parsed.chat() {
+                Some(chat) => routing.render_chat(&entry, chat),
                 None => Ok(metadata.text.clone()),
             };
             let encode = prompt.ok().filter(|_| tokens.is_ok()).map(|prompt| {

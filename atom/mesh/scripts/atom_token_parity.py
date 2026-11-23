@@ -201,20 +201,14 @@ def default_requests() -> list[dict]:
         "effort_high": {"reasoning_effort": "high"},
         "effort_max": {"reasoning_effort": "max"},
         "effort_minimal": {"reasoning_effort": "minimal"},
+        "effort_xhigh": {"reasoning_effort": "xhigh"},
         "effort_none": {"reasoning_effort": "none"},
         "effort_unknown": {"reasoning_effort": "ultra"},
-        "effort_over_kwargs_effort": {
-            "reasoning_effort": "max",
-            "chat_template_kwargs": {"reasoning_effort": "low"},
-        },
-        "kwargs_thinking_off": {"chat_template_kwargs": {"enable_thinking": False}},
         "kwargs_thinking_on": {"chat_template_kwargs": {"enable_thinking": True}},
         "kwargs_thinking_mode_chat": {
             "chat_template_kwargs": {"thinking_mode": "chat"}
         },
-        "thinking_disabled": {"thinking": {"type": "disabled"}},
         "thinking_enabled": {"thinking": {"type": "enabled"}},
-        "thinking_effort_30": {"thinking": {"type": "enabled", "effort": 30}},
         "thinking_enabled_effort_none": {
             "thinking": {"type": "enabled"},
             "reasoning_effort": "none",
@@ -238,18 +232,6 @@ def default_requests() -> list[dict]:
         "multi_turn_keep_thinking": {
             "messages": [*MESSAGES, ANSWERED, NEXT_QUESTION],
             "chat_template_kwargs": {"drop_thinking": False},
-        },
-        "content_parts": {
-            "messages": [
-                MESSAGES[0],
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Read"},
-                        {"type": "text", "text": "README.md."},
-                    ],
-                },
-            ]
         },
         "multi_turn_tool_history": {
             "tools": [TOOL],

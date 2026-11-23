@@ -58,7 +58,7 @@ pub struct AppContext {
     pub chats_without_template: Arc<RwLock<HashSet<String>>>,
     /// The reasoning controls ATOM renders a tokenizer's chats under, by
     /// registry id, for the checkpoints that have their own; HTTP routing
-    /// renders those chats under them.
+    /// takes the effort of those chats as ATOM does.
     pub(crate) chat_controls: Arc<RwLock<HashMap<String, ChatControls>>>,
     /// `router_config`'s tokenization byte limits.
     pub(crate) tokenize_limits: TokenizeLimits,

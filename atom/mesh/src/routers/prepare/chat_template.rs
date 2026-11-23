@@ -37,6 +37,11 @@ pub fn process_chat_messages(
     request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,
 ) -> Result<ProcessedMessages, String> {
+    render_chat_messages(request, tokenizer, &template_kwargs(request))
+}
+
+/// The template kwargs `process_chat_messages` renders `request` with.
+pub(crate) fn template_kwargs(request: &ChatCompletionRequest) -> HashMap<String, Value> {
     let kwargs_capacity = 1 + request.chat_template_kwargs.as_ref().map_or(0, |k| k.len());
     let mut combined_template_kwargs = HashMap::with_capacity(kwargs_capacity);
 
@@ -53,17 +58,14 @@ pub fn process_chat_messages(
         }
     }
 
-    render_chat_messages(request, tokenizer, &combined_template_kwargs, None)
+    combined_template_kwargs
 }
 
-/// `process_chat_messages` with `template_kwargs` as the template kwargs, and
-/// message content in `content_format` where given rather than in the form the
-/// template reads.
+/// `process_chat_messages` with `template_kwargs` as the template kwargs.
 pub(crate) fn render_chat_messages(
     request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,
     template_kwargs: &HashMap<String, Value>,
-    content_format: Option<ChatTemplateContentFormat>,
 ) -> Result<ProcessedMessages, String> {
     let any = tokenizer.as_any();
     let hf_tokenizer = any.downcast_ref::<HuggingFaceTokenizer>().or_else(|| {
@@ -80,8 +82,7 @@ pub(crate) fn render_chat_messages(
         );
     };
 
-    let content_format =
-        content_format.unwrap_or_else(|| hf_tokenizer.chat_template_content_format());
+    let content_format = hf_tokenizer.chat_template_content_format();
     let mut transformed_messages = process_content_format(&request.messages, content_format)?;
 
     process_tool_call_arguments(&mut transformed_messages)?;
