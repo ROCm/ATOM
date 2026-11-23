@@ -544,10 +544,11 @@ def front_any(c):
 
 
 RCTA0, NRC = 160, 96   # the 96 CTAs past the owners: a router CTA that is also an owner started its MoE ~7 us late
-TKPUB, TKCTA = False, 124
+TKPUB, TKCTA = False, 124   # (rtk, c1 udir: TKCTA alone runs the top-k after the NRC flags and publishes the picks)
 RFLAG = True   # (r2ug) a router CTA's scores -> one LL flag after its stores land; the MoE CTAs' wave 0 polls the NRC
                # flags (3 words a lane), then every top-k wave reads its row once (not 1440 waves x 384 words a poll round)
 RFL_OFF = 1175552   # plog: the router flags [parity][NRC] (past the Engram partials)
+TKP_OFF = 24576     # (rtk) plog: the published picks [parity][<= 64] x 16 B (past the scores: < 8 rows with udir)
 SHE_TOPK_FIRST = False   # (v2) the shared-UG CTAs run their top-k while their UG weights load, before waiting for x8   # (v2) one top-k CTA (idle: no shared UG, no router) publishes the picks as LL words
 EPR = -(-NE // NRC)          # 4 experts a router CTA (the draft's 128: 2)
 NCHUNK = H // 8          # 640 16-byte chunks a row
@@ -932,7 +933,10 @@ def topk_v3(c, TR, pid_off, wts_off, write_ids):
             else:
                 wl = wl + shx(wl.bitcast(I32), 16).bitcast(F32)
         if l < TOPK_:
-            hx.lstore(sm + wts_off + (row * TOPK_ + l) * 4, psc * frcp(fx.max(wl, F32(1e-20))) * F32(1.5))
+            wfin = psc * frcp(fx.max(wl, F32(1e-20))) * F32(1.5)
+            if fx.const_expr("tkpub" in c):   # (rtk) the top-k CTA: pick (row, l) -> one 16-byte pair of LL words
+                hx.put2(c["tkpub"] + i64(row * TOPK_ + l) * 16, sel, wfin.bitcast(I32), c["tag"])
+            hx.lstore(sm + wts_off + (row * TOPK_ + l) * 4, wfin)
             if fx.const_expr(write_ids):
                 hx.lstore(sm + pid_off + (row * TOPK_ + l) * 4, sel)
             if fx.const_expr("ucnt" in c):   # (the union's lists initialized before: moe.union_init)
@@ -952,6 +956,37 @@ def topk_get(c, TR, pid_off, wts_off, write_ids):
         if fx.const_expr(write_ids):
             hx.lstore(sm + pid_off + (w * TOPK + l) * 4, pid)
         hx.lstore(sm + wts_off + (w * TOPK + l) * 4, pw.bitcast(F32))
+
+
+@ASTRewriter.transform
+def topk_take(c, NP, pid_off, wts_off):
+    """(rtk) A MoE CTA other than the top-k CTA (TKCTA): wave 0 takes the NP picks (id, weight) that CTA's topk_v3
+    published (c: w l sm tkpub tag; pick p = one 16-byte pair of LL words at tkpub + 16 p) into the MoE LDS (pid_off /
+    wts_off) and counts each into the union (moe.union_count: the lists initialized, a barrier before) -- every lane's
+    peeks issued together and re-polled together (one round trip a poll), as wait_flags. The same ids / weights / counts
+    as its own topk_v3 (bit for bit), without its 96 score flags, 12 score words a lane and selection."""
+    w, l, sm = c["w"], c["l"], c["sm"]
+    if w == 0:
+        K = (NP + 31) // 32
+        ad = [c["tkpub"] + i64(fx.min(l + 32 * k, I32(NP - 1))) * 16 for k in range(K)]
+        ipf(16)   # (the union and the UG after it)
+        t0 = hx.clock()
+        pg = [hx.peek(ad[k]) for k in range(K)] + [hx.peek(ad[k] + i64(8)) for k in range(K)]
+        bad = I32(0)
+        for k in range_constexpr(2 * K):
+            bad = bad | (pg[k][1] != c["tag"]).select(I32(1), I32(0))
+        while (bad != 0) & (hx.clock() - t0 < I64(hx.POLL_TICKS)):
+            hx.s_sleep(1)
+            pg = [hx.peek(ad[k]) for k in range(K)] + [hx.peek(ad[k] + i64(8)) for k in range(K)]
+            bad = I32(0)
+            for k in range_constexpr(2 * K):
+                bad = bad | (pg[k][1] != c["tag"]).select(I32(1), I32(0))
+        for k in range_constexpr(K):
+            p = l + 32 * k
+            if p < NP:
+                hx.lstore(sm + pid_off + p * 4, pg[k][0])
+                hx.lstore(sm + wts_off + p * 4, pg[K + k][0])
+                union_count(sm, p, pg[k][0])
 
 
 # ------------------------------------------------------------------ (fx-v3) the router as TileRT's [E] (mega_afm 2.10)
