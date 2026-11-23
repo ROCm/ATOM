@@ -577,33 +577,55 @@ async fn a_pairs_unstreamed_e2e_latency_includes_the_wait_for_the_complete() {
     assert_e2e_latency_at_least_300_ms(response).await;
 }
 
+/// `fake`'s held call, once its Generate handler has opened it.
+async fn held(fake: &FakeAtom) -> mpsc::Sender<Reply> {
+    let opened = async {
+        loop {
+            if let Some(sender) = fake.held.lock().unwrap().take() {
+                break sender;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(60), opened)
+        .await
+        .expect("the call was not opened")
+}
+
 #[tokio::test]
 async fn a_pair_leg_that_refuses_fails_the_dispatch_and_cancels_the_other() {
-    let prefill = FakeAtom::new(vec![vec![error("max_tokens must be at least 1", 400)]]);
-    let decode = Arc::new(FakeAtom {
-        hold: true,
-        ..Default::default()
-    });
+    let holding = || {
+        Arc::new(FakeAtom {
+            hold: true,
+            ..Default::default()
+        })
+    };
+    let (prefill, decode) = (holding(), holding());
     let plan = PlacementPlan::Pair {
-        prefill: atom_worker(&serve(prefill).await),
+        prefill: atom_worker(&serve(prefill.clone()).await),
         decode: atom_worker(&serve(decode.clone()).await),
         prefill_policy: "random",
         decode_policy: "random",
     };
-    // D has not answered: P's refusal fails the dispatch without waiting for D.
+    // Both calls open; D has not answered when P refuses.
+    let refused = async {
+        let (p, d) = tokio::join!(held(&prefill), held(&decode));
+        p.send(Ok(error("max_tokens must be at least 1", 400)))
+            .await
+            .unwrap();
+        d
+    };
     let (engine, mut payload) = (GrpcEngine::new(), payload(true));
     let dispatched = engine.dispatch(&plan, &mut payload);
-    let failed = tokio::time::timeout(Duration::from_secs(5), dispatched)
-        .await
-        .expect("the refusal waited for the other leg");
+    let dispatched = tokio::time::timeout(Duration::from_secs(5), dispatched);
+    let (failed, decode_call) = tokio::join!(dispatched, refused);
+    let failed = failed.expect("the refusal waited for the other leg");
     assert!(
         matches!(&failed, Err(EngineError::Http { status, .. }) if *status == StatusCode::BAD_REQUEST),
         "{:?}",
         failed.err()
     );
-    let sender = decode.held.lock().unwrap().take();
-    let sender = sender.expect("D's call was opened");
-    tokio::time::timeout(Duration::from_secs(60), sender.closed())
+    tokio::time::timeout(Duration::from_secs(60), decode_call.closed())
         .await
         .expect("D's call was not cancelled");
 }
