@@ -17,7 +17,9 @@ hit's span starts at ``P - R``, which the bridge translates into ATOM's
    decoder replay verdict, the staged inputs;
 6. ATOM's cache and compress plans over a fused span;
 7. the host-row invalidation that lets overlap run;
-8. the GPU page-check tool (``v41_radix_page_check``).
+8. the GPU page-check tool (``v41_radix_page_check``);
+9. admission: a 400 at the scheduler's queue door for positional embedding
+   overrides.
 """
 
 import importlib.util
@@ -693,6 +695,7 @@ def test_install_turns_the_seam_on_once_per_process(monkeypatch):
         "_install_eager_view_carrier",
         "_install_checkpoint_invalidation",
         "_install_admission_accounting",
+        "_install_request_admission",
     ):
         monkeypatch.setattr(radix, name, lambda name=name: installed.append(name))
     monkeypatch.setattr(radix, "_get_builder", None)
@@ -700,7 +703,7 @@ def test_install_turns_the_seam_on_once_per_process(monkeypatch):
     assert radix.install_deepseek_v41_radix(window=128) == R
     assert radix.radix_replay_rows() == R
     assert radix._get_builder is bridge.get_deepseek_v41_builder
-    assert len(installed) == 5
+    assert len(installed) == 6 and "_install_request_admission" in installed
     # R covers the sliding window, or the rows at a hit read unwritten rings.
     with pytest.raises(ValueError, match="sliding window 256"):
         radix.install_deepseek_v41_radix(window=256)
@@ -794,11 +797,6 @@ class TestFusedInputs:
     def test_other_forwards_are_not_widened(self):
         fb = _fused_fb([3], None)
         assert expand_v41_forward_inputs(fb, torch.zeros(3), torch.zeros(3)) is None
-
-    def test_embeddings_are_refused(self):
-        _, fb, ids, positions = self._case()
-        with pytest.raises(NotImplementedError, match="input_ids"):
-            expand_v41_forward_inputs(fb, ids, positions, torch.zeros(5, 2))
 
     def test_the_v41_adapter_hook(self):
         from atom.plugin.sglang.runtime import model_arch
@@ -1459,3 +1457,69 @@ def test_the_page_check_wraps_the_seam(monkeypatch, radix_on, caplog):
     assert "pages_changed=0" in records[0].getMessage()
     assert "pages_changed=2" in records[1].getMessage()
     assert tool._PENDING == {}
+
+
+# ---------------------------------------------------------------------------
+# 9. Admission: a 400 at the scheduler's queue door
+# ---------------------------------------------------------------------------
+
+
+def _queued_req(rid, overrides=None):
+    return SimpleNamespace(rid=rid, positional_embed_overrides=overrides)
+
+
+class TestOverrideAdmission:
+    def test_positional_overrides_are_refused(self):
+        error = radix.radix_request_refusal(_queued_req("p", overrides="pe"))
+        assert "positional_embed_overrides" in error
+        assert "--disable-radix-cache" in error
+        assert radix.radix_request_refusal(_queued_req("t")) is None
+
+    def test_the_scheduler_queue_door_is_wrapped(self, monkeypatch):
+        Scheduler = _sglang_module("sglang.srt.managers.scheduler").Scheduler
+        queued, rejected = [], []
+
+        def original(self, req, is_retracted=False):
+            queued.append((req.rid, is_retracted))
+
+        monkeypatch.setattr(Scheduler, "_add_request_to_queue", original)
+        monkeypatch.setattr(
+            Scheduler,
+            "_reject_sampling_mask_request",
+            lambda self, req, error: rejected.append((req.rid, error)),
+            raising=False,
+        )
+        radix._install_request_admission()
+        radix._install_request_admission()  # idempotent
+        door = Scheduler._add_request_to_queue
+        assert door._atom_v41_radix_patched
+        scheduler = object.__new__(Scheduler)
+        door(scheduler, _queued_req("text"))
+        door(scheduler, _queued_req("pe", overrides="pe"))
+        door(scheduler, _queued_req("back"), is_retracted=True)
+        assert queued == [("text", False), ("back", True)]
+        assert [rid for rid, _ in rejected] == ["pe"]
+        assert "positional_embed_overrides" in rejected[0][1]
+
+    def test_sglang_answers_the_refusal_with_a_400(self):
+        """The door's answer is SGLang's own: a 400 abort streamed without
+        queueing or running the model."""
+        Scheduler = _sglang_module("sglang.srt.managers.scheduler").Scheduler
+        streamed, aborted = [], []
+        scheduler = object.__new__(Scheduler)
+        scheduler.output_streamer = SimpleNamespace(
+            stream_output=lambda reqs, return_logprob: streamed.append(
+                [r.rid for r in reqs]
+            )
+        )
+        req = _queued_req("pe", overrides="pe")
+        req.return_logprob = False
+        req.time_stats = SimpleNamespace(
+            trace_ctx=SimpleNamespace(abort=lambda abort_info: aborted.append(1))
+        )
+        error = radix.radix_request_refusal(req)
+        Scheduler._reject_sampling_mask_request(scheduler, req, error)
+        reason = req.finished_reason
+        assert type(reason).__name__ == "FINISH_ABORT"
+        assert reason.message == error and int(reason.status_code) == 400
+        assert streamed == [["pe"]] and aborted == [1]

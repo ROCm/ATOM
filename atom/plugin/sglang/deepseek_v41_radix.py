@@ -57,6 +57,20 @@ Flow per prefill step (target worker, current batch only):
    guard fails that forward before it extends from ``P`` over the previous
    tenant's state.
 
+Admission: a fused forward runs ATOM on widened ``input_ids`` /
+``positions``, never on ``input_embeds``, which the widening does not extend
+(ATOM V4.1 runs on ``inputs_embeds`` when it is given). SGLang's tokenizer
+refuses ``input_embeds`` while radix cache is on, and ``--language-model-only``
+(which the plugin requires) refuses multimodal inputs. The one remaining
+source is a request carrying ``positional_embed_overrides``. SGLang never
+matches or inserts such a request's prefix, so it never hits itself, but an
+EXTEND batch holding it gets ``input_embeds`` for all its rows
+(``ModelRunner._extend_forward_kwargs``), a hit's in the same batch included.
+Such a request is answered with a 400 at the scheduler's queue door
+(``Scheduler._add_request_to_queue``) and never reaches a batch; keeping it out
+of every batch with a hit would take a patch of SGLang's batch formation.
+``--disable-radix-cache`` serves it.
+
 Ownership. Which rows replay is a function of current state alone: the step's
 ``prefix_lens`` and the proxy pool's per-slot stamp against SGLang's
 ``req_generation``. ``ReqToTokenPool.alloc_rows`` bumps ``req_generation[row]``
@@ -316,7 +330,8 @@ def expand_v41_forward_inputs(forward_batch, input_ids, positions, input_embeds=
     """The adapter's ``expand_forward_inputs``: with a fused replay on this
     ``ForwardBatch``, the ``input_ids`` / ``positions`` ATOM executes (each
     hit's ``[P - R, P)`` prepended to its rows) and the rows of the model's
-    output that are SGLang's; None for every other forward.
+    output that are SGLang's; None for every other forward. A fused forward
+    carries no ``input_embeds`` (see Admission above).
 
     One asynchronous H2D of the host layout from a pinned tensor (no host
     stall under overlap); the widened tensors are scattered on the device
@@ -325,11 +340,6 @@ def expand_v41_forward_inputs(forward_batch, input_ids, positions, input_embeds=
     fused = getattr(forward_batch, FUSED_ATTR, None)
     if fused is None:
         return None
-    if input_ids is None or input_embeds is not None:
-        raise NotImplementedError(
-            "DeepSeek-V4.1 fused radix replay needs token input_ids, not "
-            "input_embeds"
-        )
     bs = int(forward_batch.batch_size)
     lengths = np.asarray(forward_batch.extend_seq_lens_cpu[:bs], dtype=np.int64)
     rows = int(lengths.sum())
@@ -585,11 +595,54 @@ def _install_admission_accounting() -> None:
     PrefillAdder._account_prefill_cache_admission = account
 
 
+def radix_request_refusal(req) -> str | None:
+    """Why ``req`` is refused while the replay is installed, else None:
+    positional embedding overrides give its EXTEND batch input embeddings
+    for every row, which a prefix hit's replay rows in that batch would not
+    be part of."""
+    if req.positional_embed_overrides is None:
+        return None
+    return (
+        "DeepSeek-V4.1 with radix cache does not serve "
+        "positional_embed_overrides (they give the prefill batch input "
+        "embeddings the radix replay cannot widen); launch with "
+        "--disable-radix-cache to serve this request"
+    )
+
+
+def _install_request_admission() -> None:
+    """Answer ``radix_request_refusal``'s requests with a 400 at the
+    scheduler's queue door, without queueing them or running the model. Every
+    new request enters the waiting queue through
+    ``Scheduler._add_request_to_queue`` (PD disaggregation and pipeline
+    parallelism, which have other doors, are refused); a refused request is
+    never admitted, so it never comes back retracted."""
+    from sglang.srt.managers.scheduler import Scheduler
+
+    original = Scheduler._add_request_to_queue
+    if getattr(original, "_atom_v41_radix_patched", False):
+        return
+
+    @wraps(original)
+    def _add_request_to_queue(self, req, *args, **kwargs):
+        error = radix_request_refusal(req)
+        if error is not None:
+            # SGLang's 400 without running the model (log, trace abort,
+            # prepare_abort, stream); named for its first user.
+            self._reject_sampling_mask_request(req, error)
+            return None
+        return original(self, req, *args, **kwargs)
+
+    _add_request_to_queue._atom_v41_radix_patched = True
+    Scheduler._add_request_to_queue = _add_request_to_queue
+
+
 def install_deepseek_v41_radix(window: int | None = None) -> int:
     """Turn the replay on in this process: the worker seam, the ForwardBatch
     carriers (``init_new`` and the eager runner's view), the host-row
-    invalidation and the admission charge. Idempotent; returns ``R``.
-    Called only with radix cache on."""
+    invalidation, the admission charge and the queue door for positional
+    embedding overrides.
+    Idempotent; returns ``R``. Called only with radix cache on."""
     global _INSTALLED, _get_builder
     from atom.plugin.sglang import deepseek_v41_bridge as bridge
 
@@ -604,6 +657,7 @@ def install_deepseek_v41_radix(window: int | None = None) -> int:
     _install_eager_view_carrier()
     _install_checkpoint_invalidation()
     _install_admission_accounting()
+    _install_request_admission()
     _get_builder = bridge.get_deepseek_v41_builder
     _INSTALLED = True
     logger.info(

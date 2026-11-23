@@ -82,7 +82,11 @@ When a request hits the cache at `P` tokens, the 128 rows below `P` are recomput
 ring, compressor rings, Engram history) inside the step's own forward, prepended to the request's rows, as native
 ATOM's encoder SWA bounded replay does. The plugin refuses radix cache beside mixed chunks, session radix cache, a
 custom radix cache backend, and a KV storage backend (LMCache, FlexKV, the external cache linker). Unchunked prefill
-and unified memory stay refused for every launch (above).
+and unified memory stay refused for every launch (above). With radix cache on, a request that carries positional
+embedding overrides gets a 400: SGLang never matches or caches such a request's prefix, but a prefill step holding it
+hands the model input embeddings for the whole batch, which a prefix hit's replay rows in the same step are not part
+of. SGLang's tokenizer already refuses `input_embeds` with radix cache, and `--language-model-only` refuses multimodal
+inputs. Launch with `--disable-radix-cache` to serve such requests.
 
 ## Environment variables
 
