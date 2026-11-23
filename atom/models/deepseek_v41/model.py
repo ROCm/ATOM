@@ -33,7 +33,7 @@ from atom.utils.forward_context import get_forward_context
 
 from .attention import Attention
 from .config import build_attention_topology
-from .layers import native_quant_config
+from .layers import converted_linear_config, converted_linear_spec
 from .moe import MoE
 
 
@@ -105,7 +105,7 @@ class Block(nn.Module):
                 width,
                 hc,
                 config.rms_norm_eps,
-                quant_config=native_quant_config(),
+                quant_config=converted_linear_config(config),
             )
 
     def process_weights_after_loading(self):
@@ -117,8 +117,13 @@ class Block(nn.Module):
                 f"hc_{sublayer}_fn_packed",
                 pack_mhc_fn(getattr(self, f"hc_{sublayer}_fn")),
             )
+        # Only a native group32 `wqkv_a` reads MXFP8; a per-channel one
+        # quantizes its input per token.
         self.hc_fuse_quant = (
-            self.hc_attn_fn_packed is not None and fuse_quant_supported()
+            self.hc_attn_fn_packed is not None
+            and fuse_quant_supported()
+            and self.attn.wqkv_a.native_a8_group_rows is not None
+            and not self.attn.wqkv_a.runs_bf16
         )
 
     def attention_forward(self, normed, cache, step, rope):
@@ -258,9 +263,16 @@ class DeepseekV41ForCausalLM(nn.Module):
         self.embed = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         # One shared configuration owns all expert source/online quantization
         # rules. Native attention and Engram projections own their A8 layouts.
+        # Shared experts keep the converted spec; online patterns may convert
+        # the routed experts.
         self.moe_quant_config = make_v4_quant_config(
-            config, online_quant_config=online_quant_config
+            config,
+            online_quant_config=online_quant_config,
+            shared_expert_spec=converted_linear_spec(config),
+            online_routed_experts=True,
         )
+        # Read by the loader's shared-expert rename (`_fuse_shared_expert`).
+        self.quant_config = self.moe_quant_config
         # A stream earns a hardware queue only where two branches are live at
         # once -- overlapping lifetimes, not independent data. One per model
         # rather than per layer, because layers do not overlap.

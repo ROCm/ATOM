@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 class GDNFlyDSLPolicy:
     """Which GDN stages run FlyDSL for a layer; `decode` needs VK state storage.
 
-    Native ATOM and the SGLang plugin resolve it once, when the state is bound;
+    Native ATOM and the SGLang plugin reuse a fixed policy for the bound state;
     the RTP-LLM plugin resolves it on every forward.
     """
 

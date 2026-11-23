@@ -172,6 +172,17 @@ def _assert_chain_matches_tp(
         want = reference[head]
         for name, a, b in zip(("topk_idx", "sparse_bt", "sparse_ctx"), got, want):
             assert torch.equal(a, b), f"head {head} {name} diverged from the TP path"
+        bare = merge_candidate_keys(
+            _exchange(keys, head, transport),
+            block_table,
+            lens,
+            topk,
+            init,
+            local,
+            q,
+            emit_sparse_block_table=False,
+        )
+        assert torch.equal(bare, want[0]), f"head {head} topk_idx without the emit"
 
 
 # ───────────────────────────────────────────────────────────── exactness ──

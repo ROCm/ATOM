@@ -51,6 +51,7 @@ def test_written_plane_scores_as_if_it_were_never_shuffled(tile):
     honestly. `tile` 8 and 16 shuffle in groups of different length, and 8 was
     unreachable before aiter admitted a page below the MFMA tile.
     """
+    from aiter import dtypes
     from aiter.ops.triton.attention.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
     from atom.model_ops.deepseek_v41 import index_write
@@ -62,6 +63,8 @@ def test_written_plane_scores_as_if_it_were_never_shuffled(tile):
     plan = torch.zeros(rows, 4, dtype=torch.int32, device="cuda")
     plan[:, 2] = torch.arange(rows, device="cuda")
     keys = torch.randn(rows, dim, dtype=torch.bfloat16, device="cuda")
+    # Tiny negatives quantize to -0, which the e4m3fn bytes spell as FNUZ NaN.
+    keys[:, ::16] = -1e-6
     index_write.write_index_rows(
         keys,
         plane,
@@ -74,7 +77,7 @@ def test_written_plane_scores_as_if_it_were_never_shuffled(tile):
     )
 
     query = torch.randn(1, 1, heads, dim, dtype=torch.bfloat16, device="cuda")
-    q_fp8 = query.to(torch.float8_e4m3fn)
+    q_fp8 = query.to(dtypes.fp8)
     weights = torch.rand(1, heads, dtype=torch.float32, device="cuda")
     logits = torch.empty(1, rows, dtype=torch.float32, device="cuda")
     units = plane.view(-1, tile, dim + 4).shape[0]
@@ -92,8 +95,9 @@ def test_written_plane_scores_as_if_it_were_never_shuffled(tile):
 
     # The writer's own quantization, restated on the keys rather than read back
     # out of the plane: one fp32 scale per row, the row being the block.
-    scale = (keys.float().abs().amax(-1, keepdim=True).clamp_min(1e-4)) / 448.0
-    stored = (keys.float() / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    fp8_max = torch.finfo(dtypes.fp8).max
+    scale = (keys.float().abs().amax(-1, keepdim=True).clamp_min(1e-4)) / fp8_max
+    stored = (keys.float() / scale).clamp(-fp8_max, fp8_max).to(dtypes.fp8)
     per_head = torch.einsum(
         "hd,rd->hr", q_fp8.reshape(heads, dim).float(), stored.float() * scale
     )
