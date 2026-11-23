@@ -155,9 +155,30 @@ def nvfp4_page_table(
     return table, ctx
 
 
+# aiter's K/V-reuse sparse prefill: the shortest prefill it takes, and its
+# validated configuration (v2, two consecutive tokens a tile).
+PREFILL_REUSE_MIN_ROWS = 256
+PREFILL_REUSE_TILE_ROWS = 2
+
+
+@functools.cache
+def _prefill_reuse_kernel():
+    """aiter's K/V-reuse sparse prefill and its shape predicate, or None on an
+    aiter without it."""
+    try:
+        from aiter.ops.flydsl.pa_sparse_prefill import (
+            pa_sparse_prefill_nvfp4,
+            pa_sparse_prefill_nvfp4_supported,
+        )
+    except ImportError:
+        return None
+    return pa_sparse_prefill_nvfp4, pa_sparse_prefill_nvfp4_supported
+
+
 def _flydsl_attention(
     q, k_payload, k_scale, v_payload, v_scale, table, ctx, sm_scale,
     plan_step_owner, plan_cache_owner, quantized_output=None, output_scale=None,
+    prefill=False,
 ):  # fmt: skip
     """aiter's FlyDSL paged decode over the NVFP4 cache, one length-1 sequence a
     (row, kv head), planned and scratch-cached like the FP8 sparse path's.
@@ -166,7 +187,12 @@ def _flydsl_attention(
     ``[rows, heads * D]`` and E8M0 ``[rows, heads * D // 32]``), written by the
     attention instead of the BF16 output with the BF16 call's split: aiter
     writes it in every output mode, bit for bit the BF16 output quantized as
-    o_proj's ``quantize_fp8`` would."""
+    o_proj's ``quantize_fp8`` would.
+
+    ``prefill``: the rows are prefill tokens. A prefill of at least
+    ``PREFILL_REUSE_MIN_ROWS`` rows takes aiter's K/V-reuse kernel where it
+    serves the shape: a CTA walks the union of a tile of consecutive tokens'
+    pages once, instead of a CTA a token gathering its own 16 pages."""
     from aiter.ops.flydsl.pa_decode import pa_decode
     from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 
@@ -200,6 +226,31 @@ def _flydsl_attention(
     ]
     k_view, v_view = caches[0], caches[1]
     ks_view, vs_view = (t.view(torch.float8_e4m3fn) for t in caches[2:])
+    if prefill and rows >= PREFILL_REUSE_MIN_ROWS:
+        reuse = _prefill_reuse_kernel()
+        if reuse is not None and reuse[1](q_view, k_view, table):
+            mx_args = {}
+            if quantized_output is not None:
+                mx_args = {
+                    "quantized_output": quant_args["quantized_output"],
+                    "output_scale": output_scale,
+                }
+            reuse[0](
+                out_view,
+                q_view,
+                k_view,
+                v_view,
+                ks_view,
+                vs_view,
+                table,
+                ctx,
+                sm_scale,
+                kv_heads=num_kv_heads,
+                tile_rows=PREFILL_REUSE_TILE_ROWS,
+                impl="v2",
+                **mx_args,
+            )
+            return output
     # The FP8 sparse path's split: a bounded top-k window per row.
     partitions = get_recommended_splits(seqs, 1)
     context_bound = table.shape[1] * BLOCK
@@ -256,6 +307,7 @@ def nvfp4_sparse_attention(
     plan_cache_owner=None,
     quantized_output: torch.Tensor | None = None,
     output_scale: torch.Tensor | None = None,
+    prefill: bool = False,
 ) -> torch.Tensor:
     """O ``[rows, num_heads, D]`` of every row over its top-k blocks.
 
@@ -265,7 +317,8 @@ def nvfp4_sparse_attention(
     ``plan_step_owner`` / ``plan_cache_owner``: as for the FP8 sparse path's
     ``sparse_pa_per_row``. ``quantized_output`` / ``output_scale`` (gfx1250):
     o_proj's MXFP8 input, see ``_flydsl_attention``; the returned BF16 output
-    is then unspecified.
+    is then unspecified. ``prefill`` (gfx1250): the rows are prefill tokens
+    (see ``_flydsl_attention``).
     """
     if _gluon_kernel():
         if quantized_output is not None:
@@ -301,6 +354,7 @@ def nvfp4_sparse_attention(
         plan_cache_owner,
         quantized_output,
         output_scale,
+        prefill,
     )
 
 

@@ -1609,6 +1609,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         plan_cache_owner=None,
         quantized_output=None,
         output_scale=None,
+        prefill=False,
     ):
         from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import (
             check_nvfp4_sparse_attention,
@@ -1636,6 +1637,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             plan_cache_owner=plan_cache_owner,
             quantized_output=quantized_output,
             output_scale=output_scale,
+            prefill=prefill,
         )
 
     def _nvfp4_emit_kwargs(self) -> dict:
@@ -1877,6 +1879,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 plan_cache_owner=prefill_md,
                 quantized_output=quantized_output,
                 output_scale=output_scale,
+                prefill=True,
             )
             if quantized_output is not None:
                 output = quantized_output

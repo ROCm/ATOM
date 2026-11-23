@@ -431,3 +431,78 @@ def test_nvfp4_attention_mxfp8_output_is_bf16_then_quantize_fp8(rows):
     torch.cuda.synchronize()
     assert torch.equal(fp8.view(torch.uint8), ref_q.view(torch.uint8))
     assert torch.equal(scales.view(torch.uint8), ref_s.view(torch.uint8))
+
+
+def _reuse_call(monkeypatch, *, prefill, rows, served=True, mx=False):
+    """`_flydsl_attention` with aiter stubbed: which kernel ran, with what."""
+    import importlib
+
+    from atom.model_ops import base_attention
+    from atom.model_ops.minimax_m3 import sparse_attn_nvfp4
+
+    calls = {"reuse": [], "pa_decode": []}
+    monkeypatch.setattr(
+        sparse_attn_nvfp4,
+        "_prefill_reuse_kernel",
+        lambda: (
+            lambda *a, **kw: calls["reuse"].append(kw),
+            lambda q, k, table: served,
+        ),
+    )
+    monkeypatch.setattr(
+        importlib.import_module("aiter.ops.flydsl.pa_decode"),
+        "pa_decode",
+        lambda *a, **kw: calls["pa_decode"].append(kw),
+    )
+    monkeypatch.setattr(
+        "aiter.ops.triton.gluon.pa_decode_gluon.get_recommended_splits",
+        lambda *_: 3,
+    )
+    monkeypatch.setattr(
+        base_attention, "_flydsl_prepare_explicit_plan", lambda **kw: None
+    )
+    monkeypatch.setattr(
+        base_attention, "_flydsl_plan_scratch", lambda *a, **kw: (None, None, None)
+    )
+    q = torch.randn(rows, 16, 128, dtype=torch.bfloat16)
+    payload = torch.zeros(4, 1, 128, 64, dtype=torch.uint8)
+    scales = torch.zeros(4, 1, 128, 8, dtype=torch.uint8)
+    mx_kw = {}
+    if mx:
+        mx_kw = {
+            "quantized_output": torch.empty(rows, 16 * 128, dtype=torch.uint8),
+            "output_scale": torch.empty(rows, 64, dtype=torch.uint8).view(
+                torch.float8_e8m0fnu
+            ),
+        }
+    sparse_attn_nvfp4._flydsl_attention(
+        q, payload, scales, payload, scales,
+        torch.zeros(rows, 1, dtype=torch.int32), torch.ones(rows, dtype=torch.int32),
+        128**-0.5, None, None, prefill=prefill, **mx_kw,
+    )  # fmt: skip
+    return calls
+
+
+@pytest.mark.parametrize("mx", [False, True])
+def test_prefill_reuse_takes_long_prefills(monkeypatch, mx):
+    calls = _reuse_call(monkeypatch, prefill=True, rows=256, mx=mx)
+    assert not calls["pa_decode"] and len(calls["reuse"]) == 1
+    kw = calls["reuse"][0]
+    assert kw["tile_rows"] == 2 and kw["kv_heads"] == 1 and kw["impl"] == "v2"
+    if mx:
+        assert kw["quantized_output"].shape == (256, 16, 128)
+        assert kw["output_scale"].dtype == torch.float8_e8m0fnu
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"prefill": False, "rows": 512},  # decode rows
+        {"prefill": True, "rows": 255},  # below the row floor
+        {"prefill": True, "rows": 512, "served": False},  # aiter declines
+    ],
+    ids=["decode", "short-prefill", "unserved"],
+)
+def test_prefill_reuse_keeps_the_paged_decode_otherwise(monkeypatch, kwargs):
+    calls = _reuse_call(monkeypatch, **kwargs)
+    assert not calls["reuse"] and len(calls["pa_decode"]) == 1
