@@ -339,6 +339,7 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
             protocol_version=pb.PROTOCOL_VERSION_CURRENT,
             kv_transfer_info_json=json.dumps(self.api.kv_transfer_info_body()),
             server_info_json=json.dumps(self.api.server_info_body()),
+            kv_event_sources_json=json.dumps(self.api.engine.core_mgr.kv_event_sources),
         )
 
 
