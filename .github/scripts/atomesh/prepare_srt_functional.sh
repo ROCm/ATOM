@@ -2,7 +2,13 @@
 set -euo pipefail
 root="${GITHUB_WORKSPACE:?}"
 runtime="${root}/.sa-srt-runtime"
-source_sha=df706bc365e00bea74e5babe87b4049f624341ea
+source_sha="$(python3 - "${SRT_FUNCTIONAL_CONTRACT:?}" <<'PY'
+import json, re, sys
+sha = json.load(open(sys.argv[1])).get("srtctl_sha", "df706bc365e00bea74e5babe87b4049f624341ea")
+assert re.fullmatch(r"[0-9a-f]{40}", sha)
+print(sha)
+PY
+)"
 mkdir -p "${runtime}"
 if [[ ! -d "${runtime}/source/.git" ]]; then
   git clone --filter=blob:none --no-checkout https://github.com/whx-sjtu/srt-slurm.git "${runtime}/source"
