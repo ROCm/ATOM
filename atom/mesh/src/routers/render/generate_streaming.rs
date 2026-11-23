@@ -50,7 +50,7 @@ pub fn process(stream: TokenHandle, ctx: ResponseContext, backend_label: &'stati
         .unwrap_or_else(|| generate_request.model.clone().unwrap_or_default());
 
     tokio::spawn(async move {
-        let result = run_generate_stream(
+        let run = run_generate_stream(
             stream,
             tokenizer,
             generate_request,
@@ -59,8 +59,12 @@ pub fn process(stream: TokenHandle, ctx: ResponseContext, backend_label: &'stati
             return_logprob,
             cfg,
             &tx,
-        )
-        .await;
+        );
+        let result = tokio::select! {
+            result = run => result,
+            // The client left: dropping the stream ends its call and frees its loads.
+            _ = tx.closed() => return,
+        };
         if let Err(e) = result {
             let _ = tx.send(Ok(Bytes::from(format!(
                 "data: {{\"error\": \"{}\"}}\n\n",
