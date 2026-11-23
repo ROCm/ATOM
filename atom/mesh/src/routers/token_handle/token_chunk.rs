@@ -69,4 +69,14 @@ pub struct WorkerMeta {
     pub request_id: String,
     pub weight_version: Option<String>,
     pub cached_tokens: u32,
+    /// ATOM workers only: the sequence's timing, as ATOM's HTTP usage reports it.
+    pub timing: Option<SeqTiming>,
+}
+
+/// In seconds: to the first output token, per output token after it, and in all.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SeqTiming {
+    pub ttft_s: f64,
+    pub tpot_s: f64,
+    pub latency_s: f64,
 }

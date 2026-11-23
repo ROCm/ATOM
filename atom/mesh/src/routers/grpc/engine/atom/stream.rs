@@ -3,6 +3,7 @@
 
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
+use std::time::Instant;
 
 use futures::{Stream, StreamExt};
 use http::StatusCode;
@@ -14,15 +15,20 @@ use crate::atom_engine::grpc::{
 };
 use crate::routers::token_handle::engine_error::EngineError;
 use crate::routers::token_handle::token_chunk::{
-    FinishReason, MatchedStop, TokenChunk, Usage, WorkerMeta,
+    FinishReason, MatchedStop, SeqTiming, TokenChunk, Usage, WorkerMeta,
 };
-use crate::routers::token_handle::token_handle::TokenSource;
+use crate::routers::token_handle::token_handle::{SourceClock, TokenSource};
 
 pub(crate) struct AtomStream {
     inner: Streaming<GenerateResponse>,
     /// The first message, read by `open`.
     first: Option<TokenChunk>,
+    /// Unstreamed, each sibling's Complete arrives as it ends; all are read, then
+    /// handed out by index.
+    streamed: bool,
+    completes: Vec<(u32, TokenChunk)>,
     finished: bool,
+    clock: SourceClock,
 }
 
 impl AtomStream {
@@ -32,6 +38,8 @@ impl AtomStream {
         client: &AtomClient,
         request: GenerateRequest,
     ) -> Result<Self, EngineError> {
+        let streamed = request.stream;
+        let started = Instant::now();
         let inner = client
             .generate(request)
             .await
@@ -39,10 +47,20 @@ impl AtomStream {
         let mut stream = Self {
             inner,
             first: None,
+            streamed,
+            completes: Vec::new(),
             finished: false,
+            clock: SourceClock {
+                started,
+                first_token: None,
+            },
         };
         let first = stream.next().await;
-        stream.first = Some(first.unwrap_or(Err(EngineError::DecodeIncomplete))?);
+        let first = first.unwrap_or(Err(EngineError::DecodeIncomplete))?;
+        if matches!(first, TokenChunk::Partial { .. }) {
+            stream.clock.first_token = Some(Instant::now());
+        }
+        stream.first = Some(first);
         Ok(stream)
     }
 }
@@ -54,17 +72,28 @@ impl Stream for AtomStream {
         if let Some(chunk) = self.first.take() {
             return Poll::Ready(Some(Ok(chunk)));
         }
-        while !self.finished {
+        if self.finished {
+            return Poll::Ready(self.completes.pop().map(|(_, chunk)| Ok(chunk)));
+        }
+        loop {
             let response = match ready!(self.inner.poll_next_unpin(cx)) {
                 Some(Ok(GenerateResponse { response: Some(r) })) => r,
                 Some(Ok(GenerateResponse { response: None })) => continue,
                 Some(Err(status)) => {
                     self.finished = true;
+                    self.completes.clear();
                     return Poll::Ready(Some(Err(EngineError::Transport(status))));
+                }
+                None if self.completes.is_empty() => {
+                    self.finished = true;
+                    return Poll::Ready(Some(Err(EngineError::DecodeIncomplete)));
                 }
                 None => {
                     self.finished = true;
-                    return Poll::Ready(Some(Err(EngineError::DecodeIncomplete)));
+                    // Highest index first, so `pop` hands them out from index 0.
+                    self.completes
+                        .sort_by_key(|(index, _)| std::cmp::Reverse(*index));
+                    return Poll::Ready(self.completes.pop().map(|(_, chunk)| Ok(chunk)));
                 }
             };
             let item = match response {
@@ -72,13 +101,20 @@ impl Stream for AtomStream {
                     token_ids: chunk.token_ids,
                     logprobs: None,
                 }),
+                Response::Complete(complete) if !self.streamed => {
+                    let index = complete.index;
+                    self.completes.push((index, complete_chunk(complete)));
+                    continue;
+                }
                 Response::Complete(complete) => Ok(complete_chunk(complete)),
                 Response::Error(error) => Err(http_error(error)),
             };
             self.finished = !matches!(item, Ok(TokenChunk::Partial { .. }));
+            if item.is_err() {
+                self.completes.clear();
+            }
             return Poll::Ready(Some(item));
         }
-        Poll::Ready(None)
     }
 }
 
@@ -86,6 +122,11 @@ impl TokenSource for AtomStream {
     /// Nothing to suppress: a cancelled call is ATOM's abort, and a finished
     /// call has nothing left to cancel.
     fn mark_completed(&mut self) {}
+
+    /// `open` reads the first message before any renderer starts its clock.
+    fn clock(&self) -> Option<SourceClock> {
+        Some(self.clock)
+    }
 }
 
 /// A GenerateError, with the status ATOM's HTTP routes answer its request with.
@@ -120,6 +161,11 @@ fn complete_chunk(complete: GenerateComplete) -> TokenChunk {
             request_id: String::new(),
             weight_version: None,
             cached_tokens: complete.cached_tokens,
+            timing: Some(SeqTiming {
+                ttft_s: complete.ttft_s,
+                tpot_s: complete.tpot_s,
+                latency_s: complete.latency_s,
+            }),
         },
         token_ids: complete.output_ids,
     }
