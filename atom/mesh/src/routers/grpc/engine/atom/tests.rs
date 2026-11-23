@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (c) 2026 ATOM Project Contributors
 //! ATOM workers against an in-process `AtomEngine`: the request a payload becomes,
 //! the stream's `TokenChunk`s, an error's HTTP status, and cancel on drop.
 
