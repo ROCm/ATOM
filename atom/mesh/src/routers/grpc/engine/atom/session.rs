@@ -195,8 +195,8 @@ fn refused(reason: &str) -> EngineError {
     )))
 }
 
-/// The writer: what is queued when it runs goes out as one SubmitBatch, then
-/// one Abort, so an Abort never goes before its request.
+/// The writer: what is queued when it runs goes out as SubmitBatches and Aborts in
+/// queue order, so an Abort never goes before its request nor after a later one.
 fn writer(queued: mpsc::UnboundedReceiver<Command>) -> impl Stream<Item = Frames> + Send + 'static {
     stream::unfold(queued, |mut queued| async move {
         let mut commands = vec![queued.recv().await?];
@@ -208,11 +208,17 @@ fn writer(queued: mpsc::UnboundedReceiver<Command>) -> impl Stream<Item = Frames
     .flat_map(stream::iter)
 }
 
+/// `commands` as messages: each run of Submits then Aborts as one SubmitBatch then
+/// one Abort, a Submit after an Abort starting the next run.
 fn encode(commands: Vec<Command>) -> Vec<Frames> {
     let (mut requests, mut prompts, mut aborts) = (Vec::new(), Vec::new(), Vec::new());
+    let mut messages = Vec::new();
     for command in commands {
         match command {
             Command::Submit(mut spec, prompt) => {
+                if !aborts.is_empty() {
+                    flush(&mut messages, &mut requests, &mut prompts, &mut aborts);
+                }
                 let frame = wire::token_frame(&prompt);
                 spec.prompt_token_ids = Some(pb::BufferRef {
                     frame: prompts.len() as u32 + 1,
@@ -225,19 +231,31 @@ fn encode(commands: Vec<Command>) -> Vec<Frames> {
             Command::Abort(seq_id) => aborts.push(seq_id),
         }
     }
-    let mut messages = Vec::new();
+    flush(&mut messages, &mut requests, &mut prompts, &mut aborts);
+    messages
+}
+
+/// The run so far as its SubmitBatch, then its Abort, onto `messages`.
+fn flush(
+    messages: &mut Vec<Frames>,
+    requests: &mut Vec<pb::RequestSpec>,
+    prompts: &mut Vec<Vec<u8>>,
+    aborts: &mut Vec<u64>,
+) {
     if !requests.is_empty() {
-        let body = Body::Submit(pb::SubmitBatch { requests });
-        messages.push(wire::encode(body, prompts));
+        let body = Body::Submit(pb::SubmitBatch {
+            requests: std::mem::take(requests),
+        });
+        let frames = wire::encode(body, std::mem::take(prompts));
+        messages.push(Frames { frames });
     }
     if !aborts.is_empty() {
-        let body = Body::Abort(pb::Abort { seq_ids: aborts });
-        messages.push(wire::encode(body, Vec::new()));
+        let body = Body::Abort(pb::Abort {
+            seq_ids: std::mem::take(aborts),
+        });
+        let frames = wire::encode(body, Vec::new());
+        messages.push(Frames { frames });
     }
-    messages
-        .into_iter()
-        .map(|frames| Frames { frames })
-        .collect()
 }
 
 /// The reader: hands each message's outputs to their requests until the call
@@ -441,9 +459,14 @@ impl Stream for SessionStream {
 
 impl Drop for SessionStream {
     fn drop(&mut self) {
-        // Its route lasts until its last message, so no other request holds its seq_id yet.
+        // Only its own route: once it has ended, a later request may hold its seq_id.
+        self.rx.close();
         let routes = self.session.routes.lock();
-        if routes.open.contains_key(&self.seq_id) {
+        if routes
+            .open
+            .get(&self.seq_id)
+            .is_some_and(|route| route.tx.is_closed())
+        {
             let _ = self.session.commands.send(Command::Abort(self.seq_id));
         }
     }

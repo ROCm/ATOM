@@ -555,3 +555,57 @@ fn seq_ids_stay_below_2_24_and_skip_those_open_requests_hold() {
     let ids = [routes.free_seq_id(), routes.free_seq_id()];
     assert_eq!(ids, [Some(SEQ_IDS - 2), Some(1)]);
 }
+
+#[test]
+fn a_submit_queued_after_an_abort_goes_out_after_it() {
+    let submit = |id: u64| {
+        let mut spec = spec("r");
+        spec.seq_id = id;
+        Command::Submit(Box::new(spec), vec![1])
+    };
+    // The Abort of seq_id 1 was queued before seq_id 1 was submitted again.
+    let messages = encode(vec![submit(1), Command::Abort(1), submit(1), submit(2)]);
+    let bodies: Vec<_> = messages
+        .into_iter()
+        .map(
+            |message| match Inbound::decode(message.frames).unwrap().body {
+                Body::Submit(batch) => {
+                    ("submit", batch.requests.iter().map(|r| r.seq_id).collect())
+                }
+                Body::Abort(abort) => ("abort", abort.seq_ids),
+                body => panic!("{body:?}"),
+            },
+        )
+        .collect();
+    let expected = [
+        ("submit", vec![1]),
+        ("abort", vec![1]),
+        ("submit", vec![1, 2]),
+    ];
+    assert_eq!(bodies, expected);
+}
+
+#[test]
+fn a_finished_stream_dropped_after_its_seq_id_is_reused_aborts_nothing() {
+    let (commands, mut queued) = mpsc::unbounded_channel();
+    let routes = Arc::new(Mutex::new(Routes::default()));
+    let session = Session { routes, commands };
+    let finished = session.submit(spec("finished"), vec![1], true).unwrap();
+    let ended = done(vec![(completion(finished.seq_id, "eos"), Vec::new())]);
+    let ended = Inbound::decode(ended.unwrap().frames).unwrap();
+    session.routes.lock().route(&ended).unwrap();
+    // The allocator has wrapped around to the finished request's seq_id.
+    session.routes.lock().next_seq_id = finished.seq_id;
+    let reused = session.submit(spec("reused"), vec![2], true).unwrap();
+    assert_eq!(reused.seq_id, finished.seq_id);
+
+    drop(finished);
+    let sent: Vec<_> = std::iter::from_fn(|| queued.try_recv().ok()).collect();
+    assert!(matches!(
+        &sent[..],
+        [Command::Submit(..), Command::Submit(..)]
+    ));
+    // Dropped unfinished, the request now holding the seq_id is aborted.
+    drop(reused);
+    assert!(matches!(queued.try_recv(), Ok(Command::Abort(id)) if id == 0));
+}
