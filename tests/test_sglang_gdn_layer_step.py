@@ -86,6 +86,31 @@ def test_layer_views_are_taken_once_per_pool(gdn):
     assert _is_slice(temporal, state.temporal, 3)
 
 
+def test_layer_views_follow_a_rebound_mamba_cache(gdn):
+    ag = gdn.attention_gdn
+    pool = _Pool()
+    ag._layer_states(pool, 4)
+    pool.mamba_pool.mamba_cache = _Pool().mamba_pool.mamba_cache
+    conv, temporal = ag._layer_states(pool, 4)
+    state = pool.mamba_pool.mamba_cache
+    assert _is_slice(conv, state.conv[0], 3)
+    assert _is_slice(temporal, state.temporal, 3)
+
+
+def test_layer_views_follow_a_new_pool_on_the_same_mamba_cache(gdn):
+    ag = gdn.attention_gdn
+    old = _Pool()
+    old.mamba_map = {layer: i for i, layer in enumerate(LAYERS[:3])}
+    ag._layer_states(old, LAYERS[0])
+    new = _Pool()
+    new.mamba_pool = old.mamba_pool
+    new.mamba_map = {layer: i for i, layer in enumerate(LAYERS[:4])}
+    conv, temporal = ag._layer_states(new, LAYERS[3])
+    state = new.mamba_pool.mamba_cache
+    assert _is_slice(conv, state.conv[0], 3)
+    assert _is_slice(temporal, state.temporal, 3)
+
+
 def test_every_lookup_waits_for_the_layer_transfer(gdn):
     """The HiCache per-layer wait lives in `mamba2_layer_index`; taking the
     views once must not skip it."""

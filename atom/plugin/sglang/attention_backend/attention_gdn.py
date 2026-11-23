@@ -344,15 +344,16 @@ class _MambaLayerViews:
 
     `MambaPool.State.at_layer_idx` builds a new view of every state field on
     each call. The pool's state tensors are allocated once at startup, so the
-    two views the GDN wrapper reads are taken from them once.
+    two views the GDN wrapper reads are taken from them once per state object.
     """
 
-    __slots__ = ("conv", "pool", "temporal")
+    __slots__ = ("conv", "pool", "state", "temporal")
 
     def __init__(self, pool: Any) -> None:
         state = pool.mamba_pool.mamba_cache
         indices = range(len(pool.mamba_map))
         self.pool = pool
+        self.state = state
         self.conv = tuple(state.conv[0][i] for i in indices)
         self.temporal = tuple(state.temporal[i] for i in indices)
 
@@ -366,7 +367,11 @@ def _layer_states(pool: Any, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]
     # `mamba2_layer_index` also holds the layer's HiCache transfer wait.
     index = pool.mamba2_layer_index(layer_id)
     views = _LAYER_VIEWS
-    if views is None or views.pool is not pool:
+    if (
+        views is None
+        or views.pool is not pool
+        or views.state is not pool.mamba_pool.mamba_cache
+    ):
         views = _LAYER_VIEWS = _MambaLayerViews(pool)
     return views.conv[index], views.temporal[index]
 
