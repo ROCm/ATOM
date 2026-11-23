@@ -205,5 +205,17 @@
     "scope": "Same node and worker/router versions; this transport setting differs from the earlier functional baseline. No transport trace logging during measurement.",
     "source": "kvcache-ai/Mooncake v0.3.14 multi_transport.cpp protocol_priority; flag confirmed in pinned image engine.so",
     "engine_so_sha256": "540428ce937a5be29726195730246f053f88d3ddfabaa2af33ad79c7a92198a8"
+  },
+  "srtctl_sha": "df706bc365e00bea74e5babe87b4049f624341ea",
+  "client_constraints": {
+    "path": ".github/benchmark/pr5090-router-ab/client-freeze-1p1d-20261123.txt",
+    "sha256": "286771817a9d892fffe64319804bb6991fabe372b2df46be3372ee794953b02a",
+    "paired_run": "Lb4c8c6"
+  },
+  "paired_baseline_run": {
+    "lease": "Ld48419",
+    "node": "pit2-p03-g42",
+    "harness_sha": "112a93b2884e25e250b986f48c1ebb2fd171e5cd",
+    "router_image": "vllm/vllm-router:v0.1.16@sha256:4c9c87a7a911fd7628cf38a4c2ab65107a797778d95fa2a4d63e19f91b732e7c"
   }
 }
