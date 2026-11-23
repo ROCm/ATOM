@@ -4,8 +4,9 @@
 > implements it. None of them is on `main` until that PR merges. The stack,
 > in merge order: #3410 (engine PD), #3407 (routing), #3411 (embedding
 > transport), #3412 (encoder-only server), #3413 (standalone service),
-> #3408 (encode workers), #3409 (E before P), #3414, #3415 and #3416
-> (acceptance harness and CI case), then this document (#3417).
+> #3408 (encode workers), #3409 (E before P), #3415 (CI case), then this
+> document (#3417). The acceptance harness is kept out of ROCm/ATOM; each
+> acceptance result is posted on the PR it checks.
 
 This document covers image chat requests through ATOMesh for
 MiniMax-M3.1-Flash (M3.1) and Kimi-K3.1 (K3.1). It covers three
@@ -20,8 +21,8 @@ Terms:
 - A **media digest** is ATOMesh's xxh3 of an image URL string
   (`atom/mesh/src/routers/prepare/inference.rs: media_digest`).
 - **g07**, **g08**, **g15** and **g24** are the 8-GPU MI355X nodes
-  `pit2-p03-g07` and so on. The harness defaults to g07 for M3.1 and g24
-  for K3.1. The measurements below were taken on g15, whose HCAs are
+  `pit2-p03-g07` and so on. Acceptance runs use g07 for M3.1 and g24 for
+  K3.1. The measurements below were taken on g15, whose HCAs are
   `rocep9s0` to `rocep249s0`.
 
 Code facts were checked against `main` at 36adbfddb and the heads of the
@@ -57,7 +58,7 @@ media digests. The engine's request path does not change.
 
 ```mermaid
 sequenceDiagram
-    participant H as accept.sh
+    participant H as harness
     participant M as ATOMesh
     participant A as ATOM
     H->>M: chat request with image_url parts
@@ -71,13 +72,13 @@ sequenceDiagram
 
 ### Image distinction (A3, both models)
 
-The harness sends one text three times: with a red image, a blue image,
+The acceptance harness sends one text three times: with a red image, a blue image,
 then the red image again. The requests share their text, so only the media
 digests separate their routing keys.
 
 ```mermaid
 sequenceDiagram
-    participant H as accept.sh
+    participant H as harness
     participant M as ATOMesh
     participant A as ATOM
     H->>M: same text plus red image
@@ -108,7 +109,7 @@ image.
 
 ```mermaid
 sequenceDiagram
-    participant H as accept.sh
+    participant H as harness
     participant M as ATOMesh
     participant P as ATOM prefill
     participant D as ATOM decode
@@ -132,7 +133,7 @@ instead of running its own tower. D works as in 1P1D.
 
 ```mermaid
 sequenceDiagram
-    participant H as accept.sh
+    participant H as harness
     participant M as ATOMesh
     participant E as ATOM encoder
     participant P as ATOM prefill
@@ -189,18 +190,18 @@ score against A6's. A failing A6 is an engine accuracy bug, which is
 escalated rather than fixed here.
 
 ```
-accept.sh k31 direct mmstar ──PASS + score──> reference
+k31 direct mmstar ──PASS + score──> reference
         │ FAIL: escalate, A7 not run
         v
-accept.sh k31 single|pd|epd mmstar ──> within 2 x stderr of reference
-accept.sh k31 epd ttft             ──> median TTFT <= K3.1 PD
+k31 single|pd|epd mmstar ──> within 2 x stderr of reference
+k31 epd ttft             ──> median TTFT <= K3.1 PD
 ```
 
 ### CI case (A8)
 
 ```mermaid
 sequenceDiagram
-    participant H as accept.sh
+    participant H as harness
     participant Y as models_atomesh.yaml
     participant A as ATOM via openai_server
     participant L as lm_eval client
@@ -214,20 +215,20 @@ sequenceDiagram
 
 ## Acceptance
 
-Every check is `bash tests/accept/atomesh_mm/accept.sh <model> <topology>
-<check>`. Each run prints one JSON line, then `PASS` or `FAIL <reason>`.
-The Harness column names the PR that adds the check's model, topology and
-check files.
+An acceptance run deploys the topology on MI355X nodes, runs the check
+through ATOMesh, and prints one JSON line, then `PASS` or `FAIL <reason>`.
+Its harness is kept out of ROCm/ATOM. The Result column names the PR where
+the run's result is posted.
 
-| Item | Requirement | Check arguments | Harness |
+| Item | Requirement | Run | Result |
 |---|---|---|---|
-| A1 | M3.1 single: MMStar through ATOMesh within 2 x stderr of direct ATOM, 0 failed requests | `m31 single mmstar` | #3414 |
-| A2 | M3.1 single: MMMU-Pro standard / vision within 2 x stderr of the recipe's 0.791 / 0.682 | `m31 single mmmu-pro` | #3414 |
-| A3 | Both models, prefix cache and `cache_aware` on: red and blue answers name their own color, and the router log shows two routing keys | `m31 single distinct`, `k31 single distinct` | #3414; the repeated red request and `k31` in #3416 |
-| A4 | M3.1 1P1D: MMStar within 2 x stderr of A1, 0 failed requests | `m31 pd mmstar` | #3416 |
-| A5 | M3.1 E/P/D: MMStar within 2 x stderr of A4, 0 failed requests; at 4 images x 32 concurrent, median TTFT <= PD's | `m31 epd mmstar`, `m31 epd ttft` | #3416 |
-| A6 | K3.1 direct: MMStar with 0 failed requests; the score is K3.1's reference | `k31 direct mmstar` | #3416 |
-| A7 | K3.1 single, 1P1D, E/P/D: as A1, A4, A5 against A6 | `k31 single\|pd\|epd mmstar`, `k31 epd ttft` | #3416 |
+| A1 | M3.1 single: MMStar through ATOMesh within 2 x stderr of direct ATOM, 0 failed requests | `m31 single mmstar` | #3407 |
+| A2 | M3.1 single: MMMU-Pro standard / vision within 2 x stderr of the recipe's 0.791 / 0.682 | `m31 single mmmu-pro` | #3407 |
+| A3 | Both models, prefix cache and `cache_aware` on: red and blue answers name their own color, and the router log shows two routing keys | `m31 single distinct`, `k31 single distinct` | m31 on #3407; k31 not yet run |
+| A4 | M3.1 1P1D: MMStar within 2 x stderr of A1, 0 failed requests | `m31 pd mmstar` | #3410, #3407 |
+| A5 | M3.1 E/P/D: MMStar within 2 x stderr of A4, 0 failed requests; at 4 images x 32 concurrent, median TTFT <= PD's | `m31 epd mmstar`, `m31 epd ttft` | not yet posted |
+| A6 | K3.1 direct: MMStar with 0 failed requests; the score is K3.1's reference | `k31 direct mmstar` | not yet run |
+| A7 | K3.1 single, 1P1D, E/P/D: as A1, A4, A5 against A6 | `k31 single\|pd\|epd mmstar`, `k31 epd ttft` | not yet run |
 | A8 | The M3.1 image case in `models_atomesh.yaml` passes when run the way `atomesh-accuracy-validation.yaml` runs it | `m31 single ci-case` | #3415 |
 
 ## Decisions
@@ -265,9 +266,9 @@ branch, worker, `match_ratio` and, from #3407, the request's `media_count`.
   (`match_ratio` 1), so a blue `match_ratio` below 1 shows the keys differ.
   The repeated red request matches whole, which shows the log reflects key
   identity rather than noise.
-- `checks/distinct.py` checks that, plus `media_count=1` on every event,
-  with `--route-log-sample-rate 1` (`checks/distinct.env`). `epd.sh` counts
-  image requests on the same event (`pool="prefill"`, `media_count` >= 1).
+- A3's run checks that, plus `media_count=1` on every event, with
+  `--route-log-sample-rate 1`. The E/P/D run counts image requests on the
+  same event (`pool="prefill"`, `media_count` >= 1).
 - Basis: a metric label cannot carry the key.
   `atom/mesh/src/observability/metrics/schema.rs: intern_string` interns
   every label string and never frees it, which its comment accepts only
@@ -354,7 +355,8 @@ carries media (`AtomPairCtx::carries_media`).
 - Rejected: let D preprocess in chunked mode. That contradicts Goal 2,
   under which D receives only KV.
 
-**D8. 1P1D for M3.1 runs on one node.** *#3416 (`topologies/pd.sh`).*
+**D8. 1P1D for M3.1 runs on one node.** *Acceptance topology; result on
+#3410.*
 - Layout: P on GPUs 0-3 and D on GPUs 4-7 of g07, each at the recipe's
   TP4, with DSpark on as in the recipe.
 - Mooncake runs with `MC_DISABLE_HIP=1` and the HCAs named as in D11.
@@ -415,8 +417,7 @@ carries media (`AtomPairCtx::carries_media`).
   see below.
 
 **D11. Embeddings move over Mooncake, and P pulls.** *#3411
-(`atom/kv_transfer/disaggregation/mooncake/ec_transport.py`); the HCA
-maps in #3416.*
+(`atom/kv_transfer/disaggregation/mooncake/ec_transport.py`).*
 
 How the transfer works:
 - E's `EcPool` registers its pool with a Mooncake TransferEngine. P's
@@ -427,10 +428,9 @@ How the transfer works:
   `mooncake_connector.py: _select_ib_devices`, with
   `ATOM_MOONCAKE_IB_DEVICE`, now declared in `atom/utils/envs.py`, taking
   precedence.
-- The harness names the HCAs. `pd.sh: launch_rdma` sets
-  `ATOM_MOONCAKE_IB_DEVICE` on E, P and D to the HCAs local to each role's
-  GPUs, read from `hca/<node>.map` (g07, g08 and g24 have maps), together
-  with `MC_DISABLE_HIP=1`. Unconfigured, `_auto_select_ib_device` tries
+- Acceptance runs name the HCAs. They set `ATOM_MOONCAKE_IB_DEVICE` on E,
+  P and D to the HCAs local to each role's GPUs, from a per-node map of
+  GPU to HCA by PCIe switch, together with `MC_DISABLE_HIP=1`. Unconfigured, `_auto_select_ib_device` tries
   `rdma<N>` and then `ionic_<N>`. On g15, whose HCAs are named `rocep*`, it
   finds neither and hands Mooncake a missing `rdma<N>`, so Mooncake
   installs only TCP and HIP. In the 1P1D run of D8, the HCAs received 0 GiB
@@ -439,8 +439,8 @@ How the transfer works:
   registers on its local HCA. Each TP4 rank of P and D registers on every
   HCA listed for its role, and the connector advertises `ib_device` as
   `None` for a multi-HCA engine (`MooncakeConnector.__init__`).
-  `pd.sh` and `epd.sh` fail the run when a role's HCAs moved no RDMA bytes,
-  so a run off RDMA cannot pass. A per-rank mapping from GPU to HCA by PCI
+  The PD and E/P/D runs fail when a role's HCAs moved no RDMA bytes, so a
+  run off RDMA cannot pass. A per-rank mapping from GPU to HCA by PCI
   locality in `_auto_select_ib_device` is the fix if it happens.
 - Naming the HCAs also puts A4's and A5's KV on the same transport, so A5's
   PD baseline runs on it too.
@@ -602,20 +602,20 @@ to P without `ec_transfer_params`, and P encodes.
 
 ### Topology, models, CI and harness
 
-**D17. E for M3.1 runs on one GPU of a second node.** *#3416
-(`topologies/epd.sh`, `models/m31.env`).*
+**D17. E for M3.1 runs on one GPU of a second node.** *Acceptance
+topology.*
 - P and D take all of g07, as in A4, and E runs on GPU 0 of g08. PD for
   A5's comparison runs on g07 as in A4.
 - E's node must reach P's HCAs over RoCE, so that D11's read stays on
-  RDMA. `epd.sh` fails the run when E's HCAs sent no RDMA bytes, when E
+  RDMA. The E/P/D run fails when E's HCAs sent no RDMA bytes, when E
   served no request, or when every read P made fell back.
 - Basis: the requirement allows additional nodes for multi-node runs. One
   node holds P and D at the recipe's TP4. See also D11.
 - Rejected: E on a D GPU with D's memory utilization lowered. That departs
   from the recipe and muddies A5's comparison. Low confidence: see below.
 
-**D18. K3.1 uses the same code at the recipe's TP8.** *#3416
-(`models/k31.env`).*
+**D18. K3.1 uses the same code at the recipe's TP8.** *Acceptance
+topology; no code of its own.*
 - Its input builder already emits spans and `cache_seed` on `main`.
 - A6 runs first and gates A7.
 - The single instance runs on g24. 1P1D puts P on g24 and D on g07, and
@@ -627,34 +627,28 @@ to P without `ec_transfer_params`, and P encodes.
 
 **D19. The CI case is an M3.1 aggregated cell in `models_atomesh.yaml`.**
 *#3415; #3413 serves images through the ATOMesh standalone service.*
-- The cell `minimax-m31-flash-mxfp4-agg-tp4-mmmu` carries an image eval
-  task.
-- `accept.sh m31 single ci-case` serves that cell's arguments and
-  environment with `USE_ATOMESH_ENTRYPOINTS=1`, the way
-  `atomesh-accuracy-validation.yaml` serves a model, and scores it with
-  lm_eval's API client as `pd_server_atom.sh` does.
-- `pd_matrix.py` and `pd_server_atom.sh` accept the image task, so the cell
-  stays valid for `atomesh-benchmark.yaml`, which reads the file.
-- Basis: `.github/workflows/atomesh-accuracy-validation.yaml` reads
-  `models_accuracy.json`, not `models_atomesh.yaml`, and
-  `.github/scripts/atomesh/pd_matrix.py` allowed only `gsm8k` and
-  `swebench_lite`.
+- The cell `minimax-m31-flash-mxfp4-agg-tp4-mmmu` serves the recipe's
+  aggregated TP4 server through ATOMesh's standalone service
+  (`USE_ATOMESH_ENTRYPOINTS=1`) and scores MMMU through chat completions,
+  with a threshold of 0.77. Only a manual dispatch runs it.
+- An eval-only cell may run MMMU and name its metric, model arguments and
+  generation arguments (`pd_matrix.py`, `pd_submit.sh`, `pd_server_atom.sh:
+  run_eval`). Every other cell keeps GSM8K's eval.
+- Basis: `.github/scripts/atomesh/pd_matrix.py` allowed only `gsm8k` and
+  `swebench_lite`, so the models file could not hold an image case.
 - Rejected: put the case in `models_accuracy.json`. That contradicts Goal
   5, which names `models_atomesh.yaml`. Low confidence: see below.
 
-**D20. The harness is `tests/accept/atomesh_mm/accept.sh <model>
-<topology> <check>`.** *#3414 (core, `m31`, `direct`, `single`, `mmstar`,
-`mmmu-pro`, `distinct`), #3415 (`ci-case`), #3416 (`pd`, `epd`, `k31`,
-`ttft`, HCA maps).*
-- It launches one container per role on the profile's nodes over ssh, per
-  the recipe.
-- It runs MMStar, MMMU-Pro, the red/blue probe, the TTFT load or the CI
-  case through ATOMesh, then prints one JSON line and `PASS` or
-  `FAIL <reason>`.
-- No harness file is named `test_*.py`, so pytest does not collect it. The
-  CPU tests of its parsing logic (`tests/test_accept_*.py`) run in the unit
-  gate.
-- Rejected: a pytest GPU suite, which the CPU-only gate cannot run.
+**D20. The acceptance harness stays out of the tree.** Its runs deploy
+each topology on named MI355X nodes over ssh, run MMStar, MMMU-Pro, the
+red/blue probe, the TTFT load or the CI case through ATOMesh, and print one
+JSON line and `PASS` or `FAIL <reason>`. Each result is posted on the PR it
+checks (see Acceptance).
+- Basis: nothing in CI runs it, and its defaults are the hosts and paths of
+  one deployment. The CI case it also checks is in the tree (D19).
+- Rejected: check it in under `tests/`, which the review of the harness PR
+  turned down for those reasons; or a pytest GPU suite, which the CPU-only
+  gate cannot run.
 
 ## Simpler alternative
 
@@ -687,7 +681,7 @@ It puts A5 at risk:
   - Mooncake was measured on one node only. E sits on a second node (D17),
     so the read P makes in its forward step is unmeasured across nodes.
   - No cross-node figure would favour the HTTP pull while the read stays on
-    RDMA, which `epd.sh` requires of E's node. The pull's single-node cost
+    RDMA, which the E/P/D run requires of E's node. The pull's single-node cost
     (11 ms for a median request) is Python HTTP and host copies over
     loopback. Across nodes it pays the same plus a real network hop, so it
     does not fall.
@@ -697,7 +691,7 @@ It puts A5 at risk:
     from 0.56 to 15.5 ms at 16 MiB, which only a fallback to TCP does.
   - That leaves the read's own cost to A5's TTFT check.
 - **D17, E's node.** It rests on g08 reaching g07 over RoCE, which the
-  harness checks per run but no measurement has settled yet. K3.1 (D18)
+  E/P/D run checks but no measurement has settled yet. K3.1 (D18)
   spans three nodes for the same reason.
 - **D19, the CI case.** Goal 5 names `models_atomesh.yaml`, while A8 names
   `atomesh-accuracy-validation.yaml` as how the case runs, and that
@@ -725,9 +719,8 @@ All were taken on g15 with M3.1, at the recipe's launch flags.
 | #3413 | `atom/entrypoints/atomesh/atom_standalone_service.py`, `api_server.py` | D19 |
 | #3408 | `atom/mesh/src/cliargs.rs`, `config/`, `core/worker.rs`, `core/worker_registry.rs`, `policies/registry.rs`, `routers/factory.rs` | D15 |
 | #3409 | `atom/mesh/src/routers/http_pd_router.rs`, `routers/ingress.rs` | D13, D15, D16 |
-| #3414 | `tests/accept/atomesh_mm/`: core, `m31`, `direct`, `single`, `mmstar`, `mmmu-pro`, `distinct` | D3, D20 |
-| #3415 | `.github/benchmark/models_atomesh.yaml`, `.github/scripts/atomesh/pd_matrix.py`, `pd_server_atom.sh`, `pd_submit.sh`; `tests/accept/atomesh_mm/checks/ci_case.*` | D19, D20 |
-| #3416 | `tests/accept/atomesh_mm/`: `pd`, `epd`, `k31`, `ttft`, `hca/*.map`, the repeated red request | D8, D11, D17, D18, D20 |
+| #3415 | `.github/benchmark/models_atomesh.yaml`, `.github/scripts/atomesh/pd_matrix.py`, `pd_server_atom.sh`, `pd_submit.sh`; `tests/test_atomesh_pd_matrix.py` | D19 |
+| Out of tree | the acceptance harness; results on #3407 and #3410 | D8, D17, D18, D20 |
 
 Each PR carries CPU tests under `tests/` and Rust tests in `atom/mesh` for
 what it changes.
