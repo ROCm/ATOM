@@ -33,6 +33,16 @@ try:  # aiter with the gfx1250 fused router GEMM + top-k
 except ImportError:  # pragma: no cover - older aiter: the gate stays separate
     _flydsl_moe_router_topk = None
     _router_split_k = None
+try:  # aiter whose decode GEMM1 gathers the router's token-major MX rows
+    from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+        moe_router_quant_rows as _moe_router_quant_rows,
+    )
+    from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+        router_quant_rows_buffers as _router_quant_rows_buffers,
+    )
+except ImportError:  # pragma: no cover - older aiter: the A1 launch quantizes
+    _moe_router_quant_rows = None
+    _router_quant_rows_buffers = None
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -5800,6 +5810,14 @@ class FusedMoE(torch.nn.Module):
             return self.forward_impl(
                 hidden_states, router_logits, mxfp8_copy_out=mxfp8_copy_out
             )
+        # The router also writes the input as token-major MX rows, and the MXFP4
+        # experts' decode GEMM1 gathers them in place of the A1 route/quant
+        # launch (aiter decides per batch: no buffers where it would not take them).
+        quant_rows = None
+        if _router_quant_rows_buffers is not None and mxfp8_copy_out is None:
+            quant_rows = _router_quant_rows_buffers(
+                rows, k, hidden_states.device, topk=self.top_k
+            )
         routing = _flydsl_moe_router_topk(
             hidden_states,
             gate_weight,
@@ -5809,10 +5827,23 @@ class FusedMoE(torch.nn.Module):
             need_renorm=self.renormalize,
             routed_scaling_factor=1.0,
             num_valid_rows=pass_scheduled_tokens_gpu(rows),
+            **(
+                {
+                    "quant_rows": quant_rows.quant_rows,
+                    "quant_rows8": quant_rows.quant_rows8,
+                }
+                if quant_rows is not None
+                else {}
+            ),
         )
         # Routed first: the caller's launches that follow the router
         # (moe_after_router_hook), captured after it
         _run_after_router_hook()
+        if quant_rows is not None:
+            with _moe_router_quant_rows(routing[1], quant_rows):
+                return self.forward_impl(
+                    hidden_states, None, mxfp8_copy_out=mxfp8_copy_out, routing=routing
+                )
         return self.forward_impl(
             hidden_states, None, mxfp8_copy_out=mxfp8_copy_out, routing=routing
         )
