@@ -19,6 +19,7 @@ from .blockscale_kernels.quantization import (
     FP8_DTYPE,
     quantize_fp4_kernel,
     quantize_fp8_kernel,
+    quantize_fp8_taps_kernel,
 )
 
 
@@ -73,6 +74,57 @@ def quantize_fp8(x: torch.Tensor, *, dequantize: bool = False):
             dequantize,
         )
     return output if dequantize else (output, scales)
+
+
+FP8_TAPS = 3  # V4.1 DSpark's target taps, `dspark_target_layer_ids`
+
+
+def quantize_fp8_taps(taps):
+    """``quantize_fp8(torch.cat(taps, -1))`` without the concatenation.
+
+    The taps are equal-shape [T, W] rows (any row stride, unit column
+    stride); the fp8 values and E8M0 scales come out bit-identical to
+    quantizing the concatenated tensor, one kernel instead of a copy plus a
+    quantize. The kernel is cut for V4.1 DSpark's ``FP8_TAPS`` CUDA taps of
+    bf16, fp16 or fp32. Anything else takes the concatenating path: another
+    tap count, taps that are not 2-D, a column stride other than 1, W not a
+    multiple of 1024, mixed shapes, dtypes or devices, non-CUDA tensors and
+    other dtypes. A single tap, e.g. a block already joined by a PP relay, is
+    quantized as it is, without a copy.
+    """
+    taps = tuple(taps)
+    first = taps[0]
+    rows, width = first.shape[0], first.shape[-1]
+    if not (
+        len(taps) == FP8_TAPS
+        and width % 1024 == 0
+        and all(
+            t.ndim == 2
+            and t.shape == first.shape
+            and t.dtype == first.dtype
+            and t.device == first.device
+            and t.stride(1) == 1
+            for t in taps
+        )
+        and first.is_cuda
+        and first.dtype in (torch.bfloat16, torch.float16, torch.float32)
+    ):
+        return quantize_fp8(taps[0] if len(taps) == 1 else torch.cat(taps, dim=-1))
+    output = torch.empty((rows, FP8_TAPS * width), device=first.device, dtype=FP8_DTYPE)
+    scales = torch.empty(
+        (rows, FP8_TAPS * width // 32),
+        device=first.device,
+        dtype=torch.float8_e8m0fnu,
+    )
+    if rows:
+        quantize_fp8_taps_kernel[(rows * FP8_TAPS * (width // 1024),)](
+            *taps,
+            *(t.stride(0) for t in taps),
+            output,
+            scales.view(torch.uint8),
+            width,
+        )
+    return output, scales
 
 
 def quantize_fp4(
@@ -160,8 +212,9 @@ def native_quant_linear(
 ):
     """FP8 32x32/1x32 or W4A8 1x32 GEMM; inputs and weights stay native.
 
-    Weight scales remain compact. FP8 prefers AITER's configured GEMM interface
-    and falls back to local kernels on older AITER builds. An opt-in native
+    Weight scales remain compact. FP8 uses AITER's configured GEMM interface;
+    the local FP8 kernels are for a build without it, which no linear reaches
+    (`native_group32_runs_bf16` needs AITER's group32 query). An opt-in native
     MXFP8 1x32 preshuffle weight is sent through AITER's configured preshuffled
     group32 GEMM, whose mxscale table selects the gfx950 MXFP8 backend.
     Otherwise a ``weight_preshuffled`` (16, 16) FP8 weight is read by AITER's

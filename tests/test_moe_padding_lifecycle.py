@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from aiter_stub import atom_without_aiter
+from conftest import atom_config_double
 
 
 @pytest.fixture(scope="module")
@@ -20,6 +21,7 @@ def impl():
             updater=load("atom.rollout.weight_updater"),
             utils=load("atom.model_ops.utils"),
             shuffle=load("aiter.ops.shuffle"),
+            selector=load("atom.utils.selector"),
         )
 
 
@@ -158,15 +160,17 @@ def test_release_resume_sync_restores_zero_padding(impl, tp):
 
     class Runner(impl.memory.MemoryManagerMixin, impl.updater.WeightUpdaterMixin):
         def __init__(self):
+            self._init_weight_updater()
             self.model = model
             self.device = torch.device("cpu")
             self.rank = 0
             self.world_size = tp
             self.label = "padding-test"
             self.enforce_eager = True
-            self.config = SimpleNamespace(
+            self.config = atom_config_double(
                 parallel_config=SimpleNamespace(data_parallel_rank_local=0)
             )
+            self.attn_family = impl.selector.Family.MHA
 
         def clear_kv_cache(self):
             pass
