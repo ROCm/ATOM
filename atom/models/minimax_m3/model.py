@@ -3,6 +3,7 @@
 
 """Inference-only MiniMax-M3 model support for ATOM."""
 
+import logging
 from typing import ClassVar
 
 import torch
@@ -42,6 +43,9 @@ from atom.model_ops.linear import (
 )
 from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
+)
+from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import (
+    reads_page_table as nvfp4_reads_page_table,
 )
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.swiglu_oai import swiglu_oai_split
@@ -122,6 +126,48 @@ def _linear_consumes_per_token_fp8(linear: nn.Module) -> bool:
     return (
         quant_type_value == QuantType.per_Token.value
         and getattr(linear, "params_dtype", None) == dtypes.fp8
+    )
+
+
+def _sparse_pa_mxfp8_conditions(attn: nn.Module, o_proj: nn.Module) -> dict:
+    """What the sparse attention needs to write o_proj's MXFP8 input
+    (ATOM_MINIMAX_M3_PA_MXFP8_OUT): NVFP4 K/V, which gfx1250 attends through
+    aiter's paged decode, and an o_proj that is a native group-32 A8 GEMM, whose
+    own input quant (``quantize_fp8``) the attention's epilogue replaces bit for
+    bit.
+
+    All of it is known at construction, and has to be: torch.compile traces the
+    forward once, in the warmup run, before the KV cache is bound, and the
+    compiled graph keeps the branch it saw. The K/V format is the one the layer
+    declares (``SparseMHAPagedAttentionImpl.kv_format``, which sizes and binds
+    its pool), not ``impl.kv_nvfp4``: that is only set when the cache is bound,
+    so a forward that asked it traced the BF16 output and o_proj's own quant
+    into every phase."""
+    return {
+        "ATOM_MINIMAX_M3_PA_MXFP8_OUT": bool(envs.ATOM_MINIMAX_M3_PA_MXFP8_OUT),
+        "gfx1250 paged decode": nvfp4_reads_page_table(),
+        "NVFP4 K/V (declared)": getattr(attn.impl, "kv_format", "") == "nvfp4",
+        "native group-32 o_proj": getattr(o_proj, "native_a8_group_rows", None)
+        is not None,
+    }
+
+
+_logged_once: set[str] = set()
+
+
+def _log_conditions_once(what: str, conditions: dict, prefix: str) -> None:
+    """Log each condition of a fused path once per process: the first layer's,
+    and any later layer whose verdict differs from it."""
+    verdict = all(conditions.values())
+    key = f"{what}:{verdict}"
+    if key in _logged_once:
+        return
+    first = not any(k.startswith(f"{what}:") for k in _logged_once)
+    _logged_once.add(key)
+    text = ", ".join(f"{name}={value}" for name, value in conditions.items())
+    logging.getLogger("atom").log(
+        logging.INFO if first else logging.WARNING,
+        f"MiniMax-M3 {what} {'ON' if verdict else 'OFF'} ({prefix}): {text}",
     )
 
 
@@ -550,6 +596,17 @@ class MiniMaxM3SparseAttention(nn.Module):
             sparse_layer_ordinal=self.sparse_layer_ordinal,
             index_cache_dtype=index_cache_config,
         )
+        # Opt-in: the NVFP4 sparse attention writes o_proj's MXFP8 input. Only
+        # gfx1250's NVFP4 attention (aiter's paged decode) has that output.
+        # Decided here, never in forward (see _sparse_pa_mxfp8_conditions).
+        mxfp8_conditions = _sparse_pa_mxfp8_conditions(self.attn, self.o_proj)
+        self.sparse_pa_mxfp8_out = all(mxfp8_conditions.values())
+        if envs.ATOM_MINIMAX_M3_PA_MXFP8_OUT:
+            _log_conditions_once(
+                "sparse PA -> o_proj MXFP8 input (ATOM_MINIMAX_M3_PA_MXFP8_OUT)",
+                mxfp8_conditions,
+                prefix,
+            )
 
     def forward(
         self,
@@ -570,6 +627,11 @@ class MiniMaxM3SparseAttention(nn.Module):
             ],
             dim=-1,
         )
+        if self.sparse_pa_mxfp8_out:
+            attn_output, attn_scale = self.attn.forward_mxfp8(
+                q, k, v, positions, qkv=qkv
+            )
+            return self.o_proj(attn_output, x_scale=attn_scale)
         attn_output = self.attn(q, k, v, positions, qkv=qkv)
         return self.o_proj(attn_output)
 

@@ -530,6 +530,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_M3_SPARSE_KV_NVFP4": lambda: (
         os.getenv("ATOM_M3_SPARSE_KV_NVFP4", "0") == "1"
     ),
+    # MiniMax-M3 NVFP4 sparse layers on gfx1250 with a native MXFP8 o_proj: the
+    # paged attention writes o_proj's MXFP8 input (E4M3 + E8M0 per 32) instead
+    # of its BF16 output, which o_proj then quantized itself. Opt-in for A/B.
+    "ATOM_MINIMAX_M3_PA_MXFP8_OUT": lambda: _flag_env("ATOM_MINIMAX_M3_PA_MXFP8_OUT"),
     # Fused decode for measured model/deployment/step geometries. Unsupported
     # configurations and forwards keep the production path. 0 disables it.
     "ATOM_MONO_ENABLE": lambda: os.getenv("ATOM_MONO_ENABLE", "1") == "1",
