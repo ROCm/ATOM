@@ -18,6 +18,9 @@ logger = logging.getLogger("atom")
 
 SEQ_IDS = worker_seq_id_base(0)  # a window's size: a client's seq ids lie below it
 WINDOWS = 127  # window k's engine ids are worker_seq_ids(k)'s; 127 stay inside int32
+# Messages a client may leave unread; one more fails its Session, which bounds the
+# memory a client that stops reading holds in the API process.
+OUTBOX = 4096
 STRUCTURED_ERROR = "structured_output_error"  # a grammar failure's finish reason
 STRUCTURED_FAILED = "Structured decoding failed for this request"  # HTTP chat's 500
 
@@ -58,6 +61,7 @@ class Session:
         self.put = self.pending.append  # where each output goes as a step is delivered
         self.outbox: asyncio.Queue = asyncio.Queue()  # message frames; None ends them
         self.open = True
+        self.failed: str | None = None  # why the Session failed its client's call
 
     def seq_id(self, client_id: int) -> int:
         """A new engine id for `client_id`, which is below SEQ_IDS and not in flight."""
@@ -92,7 +96,7 @@ class Session:
 
     def reject(self, refused: list[frames.Rejection]) -> None:
         if refused and self.open:
-            self.outbox.put_nowait(frames.encode_rejected(refused))
+            self.send(frames.encode_rejected(refused))
 
     def abort(self, client_ids) -> None:
         """Aborts those in flight as a dropped HTTP stream is aborted; each still ends
@@ -104,9 +108,25 @@ class Session:
 
     def close(self) -> None:
         """The call has ended: every request in flight is aborted."""
-        self.open = False
-        self.abort(list(self.requests))
+        if self.open:
+            self.open = False
+            self.abort(list(self.requests))
         self._release()
+
+    def send(self, message: list[bytes]) -> None:
+        """Queues `message` for the client; past OUTBOX unread ones, the Session fails
+        instead: its messages dropped, its requests aborted, its call ended."""
+        if not self.open:
+            return
+        if self.outbox.qsize() < OUTBOX:
+            self.outbox.put_nowait(message)
+            return
+        self.failed = f"the client left {OUTBOX} Session messages unread"
+        logger.error("Session window %s: %s", self.window, self.failed)
+        while not self.outbox.empty():
+            self.outbox.get_nowait()
+        self.close()
+        self.outbox.put_nowait(None)
 
     def flush(self) -> None:
         """The step's outputs: one StreamBatch of those carrying ids, then a Completions
@@ -130,7 +150,7 @@ class Session:
             if output.finished:
                 done.append(_completion(client_id, request, output, now))
         if self.open and entries:
-            self.outbox.put_nowait(frames.encode_stream(entries))
+            self.send(frames.encode_stream(entries))
         failed = [c for c in done if c.leave_reason == STRUCTURED_ERROR]
         completed = [c for c in done if c.leave_reason != STRUCTURED_ERROR]
         if self.open and failed:  # HTTP chat answers a grammar failure with a 500
@@ -138,13 +158,13 @@ class Session:
             refused = [
                 frames.Rejection(c.seq_id, STRUCTURED_FAILED, code) for c in failed
             ]
-            self.outbox.put_nowait(frames.encode_rejected(refused))
+            self.send(frames.encode_rejected(refused))
         if self.open and completed:
             try:
-                self.outbox.put_nowait(frames.encode_completions(completed))
+                self.send(frames.encode_completions(completed))
             except TypeError:  # kv_transfer_params engine_v1 cannot carry
                 for completion in completed:
-                    self.outbox.put_nowait(_completed_or_rejected(completion))
+                    self.send(_completed_or_rejected(completion))
         for completion in done:
             request = self._pop(completion.seq_id)
             self.api.cleanup_stream(request.seq.id)

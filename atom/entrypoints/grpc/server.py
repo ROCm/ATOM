@@ -385,6 +385,9 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
             yield pb.Frames(frames=ready)
             while (message := await session.outbox.get()) is not None:
                 yield pb.Frames(frames=message)
+            if session.failed is not None:
+                code = grpc.StatusCode.RESOURCE_EXHAUSTED
+                await context.abort(code, session.failed)
             await reader  # how the client's side ended
         except frames.FrameError as error:
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))

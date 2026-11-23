@@ -22,6 +22,7 @@ from atom.entrypoints.grpc import atom_grpc_pb2 as pb
 from atom.entrypoints.grpc import atom_grpc_pb2_grpc as pb_grpc
 from atom.entrypoints.grpc import frames
 from atom.entrypoints.grpc import server as grpc_server
+from atom.entrypoints.grpc import session as grpc_session
 from atom.entrypoints.grpc.server import AtomEngineServicer
 from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.protocol import DEFAULT_MAX_TOKENS
@@ -490,6 +491,51 @@ def test_engine_ids_are_not_reused_by_a_client_seq_id_or_a_windows_next_session(
     asyncio.run(submit_seq_id_1_twice(sessions.open()))
     engine_ids = [seq.id for seq in engine.submitted]
     assert len(set(engine_ids)) == 4
+
+
+def test_a_client_that_stops_reading_fails_its_session_past_the_outbox_bound(
+    serve, monkeypatch
+):
+    monkeypatch.setattr(grpc_session, "OUTBOX", 2)
+    engine = FakeEngine([([5], None)])  # the request runs on, a message per step
+    servicer = serve(engine)
+    open_session, opened = servicer.sessions.open, []
+
+    def record_open():
+        opened.append(open_session())
+        return opened[-1]
+
+    monkeypatch.setattr(servicer.sessions, "open", record_open)
+
+    class Context:
+        async def abort(self, code, details):
+            self.code, self.details = code, details
+            raise grpc.RpcError()
+
+    async def client():
+        await asyncio.Event().wait()  # sends nothing more, ends never
+        yield
+
+    async def stop_reading():
+        context = Context()
+        call = servicer.Session(client(), context)
+        assert _envelope(list((await anext(call)).frames)).WhichOneof("body") == "ready"
+        session = opened[0]
+        await servicer._submit(session, _submit())
+        await _until(lambda: session.outbox.qsize() == 1)
+        seq = engine.running[next(iter(session.client_ids))]
+        for _ in range(2):  # the engine's next steps, which the client does not read
+            seq.callback(RequestOutput(seq.id, [6], False))
+            engine.flush()
+        await _until(lambda: session.failed is not None)
+        with pytest.raises(grpc.RpcError):
+            await anext(call)  # its messages dropped: the failure is all that is left
+        return context
+
+    context = asyncio.run(stop_reading())
+    assert context.code == grpc.StatusCode.RESOURCE_EXHAUSTED
+    assert "left 2 Session messages unread" in context.details
+    assert engine.running == {} and engine.aborted  # its request aborted
 
 
 def test_a_session_admits_a_prompt_only_in_kv_transfer_params(serve):
