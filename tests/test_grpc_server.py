@@ -1022,6 +1022,45 @@ def test_a_session_serves_a_submit_batch_over_the_wire(serve, monkeypatch):
     assert engine.io_processor.requests == {} and engine.aborted == []
 
 
+def test_shutdown_during_structured_admission_aborts_once_its_seq_is_enqueued(
+    serve, monkeypatch
+):
+    engine, entered, admit, events = (
+        FakeEngine(),
+        threading.Event(),
+        threading.Event(),
+        [],
+    )
+    stop, channel = _listen(serve, monkeypatch, engine)
+
+    def add_request(seqs):  # the structured admission, on its thread
+        entered.set()
+        admit.wait(10)
+        events.append("enqueued")
+
+    monkeypatch.setattr(engine.core_mgr, "add_request", add_request)
+    monkeypatch.setattr(
+        engine.core_mgr, "abort_request", lambda seq_id: events.append("aborted")
+    )
+    batch = _submit_batch((3, "a", [1, 2]))
+    envelope = v1.Envelope.FromString(batch[0])
+    envelope.submit.requests[0].sampling.json_schema = '{"type": "object"}'
+
+    def client():
+        yield pb.Frames(frames=[envelope.SerializeToString(), *batch[1:]])
+        admit.wait(10)
+
+    answers = pb_grpc.AtomEngineStub(channel).Session(client(), timeout=10)
+    next(answers)  # Ready
+    assert entered.wait(10)
+    # The shutdown cancels the reader, then asyncio.run cancels it again.
+    threading.Timer(0.3, admit.set).start()
+    stop()
+    channel.close()
+    # close() aborted it before it was enqueued, the admission once it was.
+    assert events == ["aborted", "enqueued", "aborted"]
+
+
 def test_a_step_flushed_after_the_server_stopped_is_dropped():
     steps = grpc_server.StepOutputs()
 
