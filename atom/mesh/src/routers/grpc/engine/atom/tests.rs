@@ -218,8 +218,17 @@ async fn route_generate_with(
     stream: bool,
     headers: Option<http::HeaderMap>,
 ) -> axum::response::Response {
+    let planner = test_mocks::MockPdPlanner::repeat_single(worker, "random");
+    route_planned_generate(planner, stream, headers).await
+}
+
+async fn route_planned_generate(
+    planner: test_mocks::MockPdPlanner,
+    stream: bool,
+    headers: Option<http::HeaderMap>,
+) -> axum::response::Response {
     let pipeline = test_mocks::pipeline_with(
-        Arc::new(test_mocks::MockPdPlanner::repeat_single(worker, "random")),
+        Arc::new(planner),
         Arc::new(GrpcEngine::new()),
         metrics_labels::BACKEND_REGULAR,
     );
@@ -465,6 +474,13 @@ async fn a_streamed_ttft_includes_the_wait_for_the_first_token() {
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
     let metrics = recorder.handle();
     let _guard = metrics::set_default_local_recorder(&recorder);
+    let fake = answering_after_300_ms(vec![chunk(&[11]), complete(&[], "eos")]);
+    let response = route_generate(atom_worker(&serve(fake).await), true).await;
+    assert_ttft_at_least_300_ms(response, &metrics).await;
+}
+
+/// A held call that sends `replies` 300 ms after it opens.
+fn answering_after_300_ms(replies: Vec<GenerateResponse>) -> Arc<FakeAtom> {
     let fake = Arc::new(FakeAtom {
         scripts: Mutex::new(vec![Vec::new()].into()),
         hold: true,
@@ -479,12 +495,17 @@ async fn a_streamed_ttft_includes_the_wait_for_the_first_token() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         };
         tokio::time::sleep(Duration::from_millis(300)).await;
-        for reply in [chunk(&[11]), complete(&[], "eos")] {
+        for reply in replies {
             sender.send(Ok(reply)).await.unwrap();
         }
     });
+    fake
+}
 
-    let response = route_generate(atom_worker(&serve(fake).await), true).await;
+async fn assert_ttft_at_least_300_ms(
+    response: axum::response::Response,
+    metrics: &metrics_exporter_prometheus::PrometheusHandle,
+) {
     assert_eq!(response.status(), StatusCode::OK);
     axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
@@ -501,26 +522,7 @@ async fn a_streamed_ttft_includes_the_wait_for_the_first_token() {
     );
 }
 
-#[tokio::test]
-async fn an_unstreamed_e2e_latency_includes_the_wait_for_the_complete() {
-    let fake = Arc::new(FakeAtom {
-        scripts: Mutex::new(vec![Vec::new()].into()),
-        hold: true,
-        ..Default::default()
-    });
-    let held = fake.clone();
-    tokio::spawn(async move {
-        let sender = loop {
-            if let Some(sender) = held.held.lock().unwrap().take() {
-                break sender;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        };
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        sender.send(Ok(complete(&[4], "eos"))).await.unwrap();
-    });
-
-    let response = route_generate(atom_worker(&serve(fake).await), false).await;
+async fn assert_e2e_latency_at_least_300_ms(response: axum::response::Response) {
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
@@ -531,6 +533,44 @@ async fn an_unstreamed_e2e_latency_includes_the_wait_for_the_complete() {
         latency >= 0.3,
         "e2e_latency {latency} s misses the generation"
     );
+}
+
+#[tokio::test]
+async fn an_unstreamed_e2e_latency_includes_the_wait_for_the_complete() {
+    let fake = answering_after_300_ms(vec![complete(&[4], "eos")]);
+    let response = route_generate(atom_worker(&serve(fake).await), false).await;
+    assert_e2e_latency_at_least_300_ms(response).await;
+}
+
+/// A pair placement: P answers at once, D 300 ms after its call opens.
+async fn route_pair_generate(
+    stream: bool,
+    decode_replies: Vec<GenerateResponse>,
+) -> axum::response::Response {
+    let prefill = FakeAtom::new(vec![vec![complete(&[], "eos")]]);
+    let decode = answering_after_300_ms(decode_replies);
+    let planner = test_mocks::MockPdPlanner::repeat_pair(
+        atom_worker(&serve(prefill).await),
+        atom_worker(&serve(decode).await),
+        "random",
+        "random",
+    );
+    route_planned_generate(planner, stream, None).await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_pairs_streamed_ttft_includes_the_wait_for_the_first_token() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics = recorder.handle();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let response = route_pair_generate(true, vec![chunk(&[11]), complete(&[], "eos")]).await;
+    assert_ttft_at_least_300_ms(response, &metrics).await;
+}
+
+#[tokio::test]
+async fn a_pairs_unstreamed_e2e_latency_includes_the_wait_for_the_complete() {
+    let response = route_pair_generate(false, vec![complete(&[4], "eos")]).await;
+    assert_e2e_latency_at_least_300_ms(response).await;
 }
 
 #[tokio::test]
