@@ -14,7 +14,7 @@ use crate::atom_engine::grpc::{
 };
 use crate::routers::token_handle::engine_error::EngineError;
 use crate::routers::token_handle::token_chunk::{
-    FinishReason, MatchedStop, TokenChunk, Usage, WorkerMeta,
+    FinishReason, MatchedStop, SeqTiming, TokenChunk, Usage, WorkerMeta,
 };
 use crate::routers::token_handle::token_handle::TokenSource;
 
@@ -115,6 +115,11 @@ fn complete_chunk(complete: GenerateComplete) -> TokenChunk {
             request_id: String::new(),
             weight_version: None,
             cached_tokens: complete.cached_tokens,
+            timing: Some(SeqTiming {
+                ttft_s: complete.ttft_s,
+                tpot_s: complete.tpot_s,
+                latency_s: complete.latency_s,
+            }),
         },
         token_ids: complete.output_ids,
     }

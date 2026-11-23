@@ -30,7 +30,7 @@ use crate::routers::grpc::engine::{worker_client_cache::GrpcClient, GrpcEngine};
 use crate::routers::prepare::{build_generate_payload, generation_payload::GenerationPayload};
 use crate::routers::test_mocks;
 use crate::routers::token_handle::engine_error::EngineError;
-use crate::routers::token_handle::token_chunk::{FinishReason, MatchedStop, TokenChunk};
+use crate::routers::token_handle::token_chunk::{FinishReason, MatchedStop, SeqTiming, TokenChunk};
 
 type Reply = Result<GenerateResponse, Status>;
 
@@ -190,6 +190,9 @@ fn complete(output_ids: &[u32], finish_reason: &str) -> GenerateResponse {
             completion_tokens: 3,
             cached_tokens: 2,
             kv_transfer_params_json: None,
+            ttft_s: 0.25,
+            tpot_s: 0.125,
+            latency_s: 0.5,
             ..Default::default()
         })),
     }
@@ -346,6 +349,12 @@ async fn a_stream_becomes_token_chunks_in_order() {
         usage.total_tokens,
     );
     assert_eq!((counts, meta.cached_tokens), ((3, 3, 6), 2));
+    let timing = SeqTiming {
+        ttft_s: 0.25,
+        tpot_s: 0.125,
+        latency_s: 0.5,
+    };
+    assert_eq!(meta.timing, Some(timing));
 
     // A stream that ends before its Complete fails rather than ending short.
     let cut = collect(&plan, true).await;
