@@ -138,6 +138,12 @@ message GetModelInfoResponse {
   // "usage": null to the chunks before it; false: a usage-only chunk ends every
   // stream. APICompatibility.usage_on_finish, which the model's encoder selects.
   bool usage_on_finish = 11;
+  // The opener a reply starts after though the prompt does not end on it: the
+  // dialect's prompt opener, for a template that closes a reasoning block it never
+  // opens (DeepSeek-R1's); absent: none. Off where reasoning_toggle_json's kwarg
+  // holds its off value, as api_server.reasoning_channel decides.
+  optional string implicit_reasoning_opener = 12;
+  string reasoning_toggle_json = 13;  // [kwarg, off value, on value]; empty: none
 }
 
 message GetServerInfoRequest {}
