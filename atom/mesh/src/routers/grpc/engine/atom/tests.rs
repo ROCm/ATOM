@@ -502,6 +502,38 @@ async fn a_streamed_ttft_includes_the_wait_for_the_first_token() {
 }
 
 #[tokio::test]
+async fn an_unstreamed_e2e_latency_includes_the_wait_for_the_complete() {
+    let fake = Arc::new(FakeAtom {
+        scripts: Mutex::new(vec![Vec::new()].into()),
+        hold: true,
+        ..Default::default()
+    });
+    let held = fake.clone();
+    tokio::spawn(async move {
+        let sender = loop {
+            if let Some(sender) = held.held.lock().unwrap().take() {
+                break sender;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        sender.send(Ok(complete(&[4], "eos"))).await.unwrap();
+    });
+
+    let response = route_generate(atom_worker(&serve(fake).await), false).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let latency = body[0]["meta_info"]["e2e_latency"].as_f64().unwrap();
+    assert!(
+        latency >= 0.3,
+        "e2e_latency {latency} s misses the generation"
+    );
+}
+
+#[tokio::test]
 async fn dropping_the_handle_cancels_the_call() {
     let fake = Arc::new(FakeAtom {
         scripts: Mutex::new(vec![vec![chunk(&[11])]].into()),
