@@ -229,6 +229,11 @@ class UmbpL1Pool(KVBlockPool):
 
     # ------------------------------- counts -------------------------------- #
     @property
+    def num_usable_blocks(self) -> int:
+        """Allocation capacity; every registered UMBP slot is usable."""
+        return self.num_blocks
+
+    @property
     def num_free(self) -> int:
         return self.num_blocks - len(self._used)
 
@@ -953,6 +958,11 @@ class UmbpBlockPool(KVBlockPool):
         return self.umbp.async_fetch
 
     # ------------------------------- counts -------------------------------- #
+    @property
+    def num_usable_blocks(self) -> int:
+        """Capacity of both parts, excluding any private padding block."""
+        return self.private.num_usable_blocks + self.umbp.num_usable_blocks
+
     @property
     def num_free(self) -> int:
         return self.private.num_free + self.umbp.num_free
