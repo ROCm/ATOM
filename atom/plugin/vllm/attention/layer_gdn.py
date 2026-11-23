@@ -6,14 +6,11 @@ import torch
 import triton
 import triton.language as tl
 from einops import rearrange
-from atom.model_ops.mamba_ops.causal_conv1d import (
-    causal_conv1d_fn,
-    causal_conv1d_update,
-)
+from torch import nn
+from vllm.distributed import get_tensor_model_parallel_world_size
 
 # from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadata
 from vllm.forward_context import get_forward_context
-from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
@@ -38,10 +35,11 @@ from atom.model_ops.fla_ops.chunk_vk import chunk_gated_delta_rule_vk
 from atom.model_ops.fla_ops.fused_sigmoid_gating import (
     fused_sigmoid_gating_delta_rule_update,
 )
-
+from atom.model_ops.mamba_ops.causal_conv1d import (
+    causal_conv1d_fn,
+    causal_conv1d_update,
+)
 from atom.utils import envs
-
-from torch import nn
 
 USE_FLYDSL_GDR = envs.ATOM_USE_FLYDSL_GDR
 if USE_FLYDSL_GDR:
