@@ -147,7 +147,7 @@ pub fn prepare_chat_declaring(
     // Only ATOM reads the tools a message declares.
     let message_tools = atom
         .then(|| message_tools.unwrap_or_else(|| MessageTools::of(&req)))
-        .filter(|declared| !declared.is_empty());
+        .filter(|declared| !declared.is_empty() || declared.1.is_some());
 
     let template_kwargs = merged_template_kwargs(&body_ref, default_kwargs.as_ref());
     let processed = staged("template", || {
@@ -434,11 +434,18 @@ fn structured_output(
     kwargs: &HashMap<String, Value>,
     prompt_opens_reasoning: bool,
 ) -> Result<StructuredOutput, String> {
+    // Namespaced top-level tools go as sent: the typed ones lost their namespace.
+    let top_level = message_tools.and_then(|declared| declared.1.as_deref());
+    let tools_json = match top_level {
+        Some(sent) => Some(to_json(sent)?),
+        None => req.tools.as_ref().map(to_json).transpose()?,
+    };
     Ok(StructuredOutput {
-        tools_json: req.tools.as_ref().map(to_json).transpose()?,
+        tools_json,
         tool_choice_json: req.tool_choice.as_ref().map(to_json).transpose()?,
         response_format_json: req.response_format.as_ref().map(to_json).transpose()?,
         message_tools_json: message_tools
+            .filter(|declared| !declared.is_empty())
             .map(|declared| to_json(declared.0.as_ref()))
             .transpose()?,
         chat_template_kwargs_json: to_json(kwargs)?,
