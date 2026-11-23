@@ -31,9 +31,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from conftest import atom_config_double
 from torch import nn
 
 from atom.rollout.weight_updater import WeightUpdaterMixin
+from atom.utils.selector import Family
 
 # `atom.model_ops.linear` and `atom.model_ops.utils` import aiter, which
 # resolves the chip architecture through rocminfo. Everything that does not
@@ -54,11 +56,14 @@ def _updater(model=None, world_size=1):
         device = torch.device("cpu")
         label = "test"
         rank = 0
+        config = atom_config_double()
+        attn_family = Family.MHA
 
         def clear_kv_cache(self):
             pass
 
     updater = _Updater()
+    updater._init_weight_updater()
     updater.world_size = world_size
     updater.model = model if model is not None else nn.Module()
     return updater
@@ -272,7 +277,7 @@ def test_expert_relayout_waits_first(monkeypatch):
         lambda *a, **k: order.append("shuffle"),
         raising=True,
     )
-    updater._pending_expert_relayout[(model.mlp.experts, "w13_weight")] = {
+    updater._expert_relayout_pending[(model.mlp.experts, "w13_weight")] = {
         0: {"w1", "w3"}
     }
 

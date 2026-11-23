@@ -26,12 +26,27 @@ def _regions(table):
 
 
 @pytest.mark.parametrize(
-    "table", [layout.SCRATCH, layout.sym_layout(4)], ids=["scratch", "sym"]
+    "table",
+    [layout.SCRATCH_OF[False], layout.SCRATCH_OF[True], layout.sym_layout(4)],
+    ids=["scratch", "scratch_fused_shared", "sym"],
 )
 def test_regions_are_disjoint_nonempty_and_aligned(table):
     for name, start, end in _regions(table):
         assert start % 256 == 0, name
         assert end > start, name
+
+
+def test_scratch_kinds_overlay_their_moe_regions():
+    """Both kinds' tables are the buffer's offsets; each kind's extent (all a step
+    zeroes, 16 B stores) ends at its own last region."""
+    unfused, fused = layout.SCRATCH_OF[False], layout.SCRATCH_OF[True]
+    for table in (unfused, fused):
+        assert table["_bytes"] % 16 == 0
+        assert all(layout.SCRATCH[n] == o for n, o in table.items() if n != "_bytes")
+    assert layout.SCRATCH["_bytes"] == max(unfused["_bytes"], fused["_bytes"])
+    common = unfused.keys() & fused.keys() - {"_bytes"}
+    moe = lambda t: min(o for n, o in t.items() if n not in common | {"_bytes"})
+    assert moe(unfused) == moe(fused) >= max(layout.SCRATCH[n] for n in common)
 
 
 @pytest.mark.parametrize("npes", [1, 2, 4, 8])

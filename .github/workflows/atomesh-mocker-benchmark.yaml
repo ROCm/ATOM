@@ -64,7 +64,7 @@ jobs:
       - name: Set up build environment
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler python3-dev
+          sudo apt-get install -y protobuf-compiler python3-dev python3-venv
           # pyo3 caches the detected Python in the restored target dir and only
           # re-detects when an env var changes, so a runner-image Python upgrade
           # would keep linking the old -lpython3.X. Key the detection on it.
@@ -112,6 +112,32 @@ jobs:
             --target-dir atom/mesh/mocker/target/mesh \
             --profile ci --lib --features atom-engine
 
+      # The token parity test compares the router's tokens with the ones ATOM's
+      # own endpoints give, here on CPU, for a DeepSeek-V4.1-Flash revision whose
+      # tokenizer files and chat encoder the script downloads from HuggingFace.
+      # So the unit tests leave it out and it runs here, once.
+      - name: Test token parity with ATOM
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          python3 -m venv "${RUNNER_TEMP}/atom"
+          "${RUNNER_TEMP}/atom/bin/pip" install -q torch --index-url https://download.pytorch.org/whl/cpu
+          SETUPTOOLS_SCM_PRETEND_VERSION_FOR_ATOM=0.0.0+cpu.ci \
+            "${RUNNER_TEMP}/atom/bin/pip" install -q -e . httpx
+          "${RUNNER_TEMP}/atom/bin/python" atom/mesh/scripts/atom_token_parity.py \
+            deepseek-ai/DeepSeek-V4.1-Flash@314113f8a7dadb388215396ba5fbee2c610a04d6 \
+            --out "${RUNNER_TEMP}/atom_tokens.json"
+          ATOM_TOKEN_PARITY="${RUNNER_TEMP}/atom_tokens.json" cargo test \
+            --manifest-path atom/mesh/Cargo.toml \
+            --target-dir atom/mesh/mocker/target/mesh \
+            --profile ci --lib --features atom-engine -- \
+            --ignored routers::ingress::token_parity
+
+      # The vendored ext-proc protos must match the checksums pinned in
+      # manifest.json; offline, so a drifted file or manifest fails here.
+      - name: Check vendored ext-proc protos
+        run: python3 atom/mesh/proto/vendor_ext_proc.py --check
+
       # Nothing else builds the optional ext-proc feature or its protox
       # codegen; checking it, its tests included, keeps that path compiling.
       - name: Check atomesh with ext-proc
@@ -122,8 +148,8 @@ jobs:
             --target-dir atom/mesh/mocker/target/mesh \
             --profile ci --features ext-proc --tests
 
-      # KV events: following the engines' streams, the prefix index, and the routing and
-      # observability code it feeds.
+      # KV events: following the engines' streams, the prefix index, the shared store, and
+      # the routing and observability code they feed.
       - name: Test KV events
         run: |
           set -euo pipefail
@@ -131,7 +157,7 @@ jobs:
             --manifest-path atom/mesh/Cargo.toml \
             --target-dir atom/mesh/mocker/target/mesh \
             --profile ci --lib -- \
-            kv_events:: kv_index:: policies::cache_aware policies::registry \
+            kv_events:: kv_index:: kv_storage:: policies::cache_aware policies::registry \
             observability:: routers::prepare routers::ingress
           cargo test \
             --manifest-path atom/mesh/Cargo.toml \

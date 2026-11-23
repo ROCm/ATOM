@@ -12,7 +12,7 @@ import pytest
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from atom.distributed.group_agreement import group_agree
+from atom.distributed.group_agreement import group_agree, group_min_each
 from atom.mono.runtime.abi import KernelAbi
 from atom.mono.runtime.compile import (
     _COMPILE_ONLY,
@@ -119,6 +119,26 @@ def test_one_refusing_rank_turns_every_rank_down(refuser):
             join=True,
         )
     assert dict(out) == {r: refuser is None for r in range(world)}
+
+
+def _min_each_worker(rank, world, init, out):
+    dist.init_process_group("gloo", init_method=init, rank=rank, world_size=world)
+    out[rank] = group_min_each((rank, -rank, 7), dist.group.WORLD)
+    dist.destroy_process_group()
+
+
+def test_each_position_is_decided_on_its_own_in_one_collective():
+    world = 3
+    with tempfile.TemporaryDirectory() as d:
+        out = mp.Manager().dict()
+        mp.spawn(
+            _min_each_worker,
+            args=(world, f"file://{d}/store", out),
+            nprocs=world,
+            join=True,
+        )
+    assert dict(out) == {r: (0, -2, 7) for r in range(world)}
+    assert group_min_each((3, 1), None) == (3, 1)
 
 
 def _module_files():
