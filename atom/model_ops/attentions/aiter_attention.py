@@ -14,6 +14,7 @@ from atom.config import _is_minimax_m3_config, kv_cache_torch_dtype
 from atom.distributed.ulysses_sp import local_num_kv_heads
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
+from atom.model_ops.decode_verdict import rebase_decode_on_verdict
 from atom.model_ops.minimax_m3.index_buffers import allocate_index_scorers
 from atom.model_ops.minimax_m3.sparse_attn import (
     ASM_PAGE_SIZE,
@@ -198,6 +199,12 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
     # EagleProposer fuses the per-draft-step position bump into
     # prepare_mtp_decode's kernel when this is set (block-paged MHA draft).
     fuse_mtp_decode_position_update = True
+    # Whether a verify step may lay its decode metadata out from the previous
+    # verify's verdict on the device (`consumes_device_verdict`), opted into by
+    # a builder whose every verdict-dependent decode input `finish_decode`
+    # moves there (`_rebase_on_verdict`). Per step: whether this one does.
+    rebases_decode_on_verdict: ClassVar[bool] = False
+    _rebases_this_step = False
 
     def __init__(
         self,
@@ -1005,6 +1012,65 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_seqlen_q,
             )
 
+    def consumes_device_verdict(self, batch: ScheduledBatch, max_seqlen_q: int) -> bool:
+        """A verify step that carries requests over from the previous output
+        forward, whose verdict that forward left on the device, on a builder
+        that opted in: its metadata is laid out at the scheduler's lengths and
+        moved to the verdict's in `finish_decode`, so the runner takes the
+        status after the launch. Not a split decode or MiniMax-M3's sparse
+        one: their host-side extras read the lengths too."""
+        processor = getattr(self.model_runner, "tokenID_processor", None)
+        self._rebases_this_step = bool(
+            self.rebases_decode_on_verdict
+            and processor is not None
+            and max_seqlen_q > 1
+            and batch.total_seqs_num_prefill == 0
+            and batch.total_seqs_num_decode > 0
+            and not batch.is_dummy_run
+            and processor.is_deferred_out
+            and processor.prev_batch is not None
+            and processor.device_spec_counts is not None
+            and not self._has_sparse_attention
+            and not self.model_runner.config.enable_tbo_decode
+        )
+        return self._rebases_this_step
+
+    def _rebase_on_verdict(
+        self,
+        batch: ScheduledBatch,
+        running_bs: int,
+        running_tokens: int,
+        max_seqlen_q: int,
+    ) -> None:
+        """Move the published decode metadata of the requests carried over to
+        where the previous verdict leaves them (`decode_verdict`), before any
+        reader: `stage_decode` laid them out without their rejected drafts."""
+        processor = self.model_runner.tokenID_processor
+        if not processor.carries_over:
+            return
+        var = self.model_runner.forward_vars
+        bs = batch.total_seqs_num_decode
+        use_mrope = self.model_runner.use_mrope
+        rebase_decode_on_verdict(
+            processor.device_spec_counts[1],
+            var["decode_src"].gpu[:bs],
+            var["cu_seqlens_q"].gpu,
+            var["context_lens"].gpu,
+            var["kv_indptr"].gpu,
+            var["slot_mapping"].gpu,
+            var["block_tables"].gpu,
+            running_bs=running_bs,
+            max_seqlen_q=max_seqlen_q,
+            kv_block_size=self.model_runner.block_size,
+            page_size=self.block_size,
+            positions=None if use_mrope else var["positions"].gpu,
+            mrope_positions=(
+                self.model_runner._mrope_positions_view(running_tokens)
+                if use_mrope
+                else None
+            ),
+        )
+
     def stage_decode(
         self,
         batch: ScheduledBatch,
@@ -1022,6 +1088,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         context_lens = np.asarray(batch.context_lens, dtype=np.int32)
 
         if max_seqlen_q > 1:
+            # A step that rebases on the verdict reads zero rejected drafts for
+            # the requests carried over: their lengths stay the scheduler's.
             context_lens = self.model_runner.tokenID_processor.verify_ctx_lens(
                 context_lens
             )
@@ -1098,6 +1166,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         super().finish_decode(
             batch, attn_metadata, running_bs, running_tokens, max_seqlen_q
         )
+        if self._rebases_this_step:
+            self._rebase_on_verdict(batch, running_bs, running_tokens, max_seqlen_q)
+        # The scheduler's on a step that rebases: an upper bound.
         max_seqlen_k = attn_metadata.max_seqlen_k
         if self.block_size in (256, 1024):
             for name, value in self.set_aiter_persistent_worker_buffers(
