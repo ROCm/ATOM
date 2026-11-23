@@ -2253,10 +2253,13 @@ start_router() {
     fi
   fi
   local -a router_policy_args=(--policy "${router_policy}")
-  if [[ ${#explicit_policy_args[@]} -eq 0 && "${router_policy}" == "cache_aware" ]]; then
-    # Keep the InferenceX defaults, with a case-level absolute-load override.
+  if [[ "${router_policy}" == "cache_aware" ]]; then
+    # Keep the InferenceX defaults, with a case-level absolute-load override. Role
+    # policies a case names replace only the cache_aware pair.
+    if [[ ${#explicit_policy_args[@]} -eq 0 ]]; then
+      router_policy_args+=(--prefill-policy cache_aware --decode-policy cache_aware)
+    fi
     router_policy_args+=(
-      --prefill-policy cache_aware --decode-policy cache_aware
       --cache-threshold 0.8
       --balance-abs-threshold "${ROUTER_BALANCE_ABS_THRESHOLD:-20}"
       --balance-rel-threshold 2.0
