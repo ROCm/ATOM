@@ -558,6 +558,22 @@ def test_a_client_that_stops_reading_fails_its_session_past_the_outbox_bound(
     assert engine.running == {} and engine.aborted  # its request aborted
 
 
+def test_a_session_submission_that_fails_after_a_send_aborts_its_seq(serve):
+    engine = FakeEngine()
+    servicer = serve(engine)
+    session = servicer.sessions.open()
+
+    def decode_then_fail(seqs):  # as RapidServe's: decode has it, prefill's send fails
+        engine.running.update((seq.id, seq) for seq in seqs)
+        raise RuntimeError("the prefill send failed")
+
+    engine.core_mgr.add_request = decode_then_fail
+    with pytest.raises(RuntimeError, match="prefill send"):
+        asyncio.run(servicer._submit(session, _submit()))
+    assert engine.running == {} and engine.aborted
+    assert session.requests == {} and engine.io_processor.requests == {}
+
+
 def test_a_session_admits_a_prompt_only_in_kv_transfer_params(serve):
     engine = FakeEngine()
     servicer = serve(engine)

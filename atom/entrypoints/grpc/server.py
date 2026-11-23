@@ -479,12 +479,17 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
         session.add(request.seq_id, seq, request.request_id)
         try:
             api._validate_sequence_context_length(seq, params)
+        except BaseException:
+            session.drop(request.seq_id)
+            raise
+        try:
             await api._submit_engine_requests([seq])
         except asyncio.CancelledError:
             # It reached the engine, which aborts it: the request and its window stay
             # held until flush delivers that end.
             raise
-        except BaseException:  # it never reached the engine
+        except BaseException:  # a failed send may have reached one engine (P/D: decode)
+            api.cleanup_stream(seq.id, aborted=True)
             session.drop(request.seq_id)
             raise
 
