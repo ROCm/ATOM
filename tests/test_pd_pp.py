@@ -2812,6 +2812,135 @@ def test_kimi_mla_rows_land_beside_the_kda_state(
         assert sorted(held.free) == sorted(landing["slots"])
 
 
+@pytest.mark.parametrize("spent", [None, "mla", "state"])
+def test_kimi_decode_offers_its_landings_and_completes_after_both(monkeypatch, spent):
+    """`start_load_kv` gives each prefill stage a partition of every pool with
+    slots left and tracks the request in each pool it offered. A request in
+    both completes once, after the second receiver settles."""
+    msgpack = pytest.importorskip("msgpack")
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    from atom.kv_transfer.disaggregation.staging_config import landing_spec
+    from atom.kv_transfer.disaggregation.state_gather import KDA_SLOT_LAYOUT
+    from atom.kv_transfer.disaggregation.types import INDEX_CACHE_ROLE, MLA_KV_ROLE
+
+    monkeypatch.delenv("ATOM_PD_MLA_LANDING", raising=False)
+    monkeypatch.delenv("ATOM_GLM5_KPOOL", raising=False)
+    nic = _PtrNic()
+    mla = _kimi_receiver(
+        nic,
+        bases=_K_DST_MLA + _K_DST_IDX,
+        widths=[_K_MLA_PAGE] * 3 + [_K_IDX_PAGE] * 2,
+        regions=[0, 1, 2],
+        slot_bytes=2 * _K_MLA_PAGE,
+    )
+    state = _kimi_receiver(
+        nic,
+        bases=_K_DST_SLOT,
+        widths=[_CONV_BPS // 2] * 3 + [_SSM_BPS // 2] * 3 + [_CURSOR_BPS],
+        regions=list(range(7)),
+        slot_bytes=64,
+        credit_pool="state",
+    )
+    pools = {"mla": mla, "state": state}
+    if spent is not None:
+        # An earlier prefill instance took every slot of that pool.
+        pools[spent]._unassigned.clear()
+
+    consumer = object.__new__(mc.MooncakeConnector)
+    consumer.is_producer = False
+    consumer.tp_size, consumer.tp_rank, consumer.dp_rank = 1, 0, 0
+    consumer.dcp_size, consumer.dcp_rank, consumer.dcp_interleave_size = 2, 1, 1
+    consumer.local_ip, consumer.rpc_port, consumer.ib_device = "decode", 1, None
+    consumer._notification_port = 9
+    consumer._num_local_layers = 3
+    consumer._block_regions = list(
+        zip(_K_DST_MLA + _K_DST_IDX, [_K_MLA_PAGE] * 3 + [_K_IDX_PAGE] * 2)
+    )
+    consumer._block_region_roles = [MLA_KV_ROLE] * 3 + [INDEX_CACHE_ROLE] * 2
+    consumer._unit_layout = None
+    consumer._has_slot_regions = True
+    consumer._slot_regions = [(base, 64) for base in _K_DST_SLOT]
+    consumer._swa_block_regions = []
+    consumer._staging_pool_size = consumer._staging_slot_bytes = 0
+    consumer._fp4_index_layout = False
+    consumer._landing_spec = landing_spec(
+        SimpleNamespace(
+            kv_transfer_config={"kv_connector": "mooncake", "kv_role": "kv_consumer"},
+            decode_context_parallel_size=2,
+            kv_cache_block_size=_K_BLOCK,
+            hf_config=SimpleNamespace(model_type="kimi_linear", kv_lora_rank=512),
+        )
+    )
+    assert consumer._landing_spec is not None
+    consumer._landing, consumer._state_landing = mla, state
+    consumer._completion_lock = threading.Lock()
+    consumer._landing_gates = {}
+    consumer._pending_handoffs = {}
+    consumer._pending_recv_expected = {}
+    consumer._pending_recv_nonce = {}
+    consumer._pending_recv_stall_watch = {}
+    consumer._pending_recv = set()
+    consumer._pending_recv_blocks = {}
+    consumer._pending_recv_slots = {}
+    consumer._release_targets = {}
+    queued = []
+    consumer._enqueue_write_requests = queued.extend
+    done = []
+    consumer._complete_recv = lambda req, failed: done.append((req, failed))
+    for recv in (mla, state):
+        recv._finish = consumer._landing_finished
+
+    meta = ConnectorMetadata()
+    meta.add_new_req_to_recv(
+        "req-1",
+        list(_K_DST_BLOCKS),
+        {
+            "remote_block_ids": list(_K_SRC_BLOCKS),
+            "remote_host": "prefill",
+            "remote_handshake_port": 6301,
+            "remote_pp_size": 2,
+            "tp_size": 1,
+            "transfer_id": 7,
+            "local_slot_index": 3,
+            "remote_slot_index": 5,
+            "src_block_skip_factor": 2,
+        },
+    )
+    mc.MooncakeConnector.start_load_kv(consumer, meta)
+
+    assert [parts[0] for _addr, parts in queued] == [mc.MSG_WRITE_REQUEST] * 2
+    requests = [msgpack.loads(parts[1]) for _addr, parts in queued]
+    offered = [name for name in pools if name != spent]
+    for stage, request in enumerate(requests):
+        assert request["has_slot_regions"] and request["dst_slot_index"] == 3
+        # Eight slots per pool over two stages.
+        share = list(range(4 * stage, 4 * stage + 4))
+        for name, key in (("mla", "mla_landing"), ("state", "state_landing")):
+            if name not in offered:
+                assert key not in request
+                continue
+            assert request[key]["slots"] == share
+            assert request[key]["epoch"] == pools[name].epoch
+        assert "layout" not in request.get("mla_landing", {})
+        if "state" in offered:
+            assert request["state_landing"]["layout"] == KDA_SLOT_LAYOUT
+    gate = {"left": 2, "failed": False}
+    assert consumer._landing_gates == ({"req-1": gate} if spent is None else {})
+
+    # Neither stage landed a slot: each write-done ends its stage in every
+    # receiver that tracks the request, and the last one completes it.
+    nonce = requests[0]["write_nonce"]
+    for stage in range(2):
+        assert done == []
+        mc.MooncakeConnector._record_write_done(
+            consumer, "req-1", stage, 0, nonce, landed_slots=[], state_landed_slots=[]
+        )
+    assert done == [("req-1", False)]
+    assert consumer._landing_gates == {}
+
+
 def test_landing_credits_go_back_to_the_pool_that_lent_them(monkeypatch):
     msgpack = pytest.importorskip("msgpack")
     mc = pytest.importorskip(
