@@ -62,6 +62,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_SGLANG_V41_PREFILL_WARMUP": lambda: _flag_env(
         "ATOM_SGLANG_V41_PREFILL_WARMUP", "1"
     ),
+    # DSpark sampled verify (top-p, no top-k): the target's top-p probabilities
+    # take PyTorch's exact pivot without the vocabulary sort
+    # (`dspark_topp_verify_probs_patch`, temporary); 0 keeps SGLang's sort.
+    # Read at install.
+    "ATOM_SGLANG_V41_DSPARK_TOPP_VERIFY": lambda: _flag_env(
+        "ATOM_SGLANG_V41_DSPARK_TOPP_VERIFY", "1"
+    ),
+    # Its cost guard (SGLang's sort for a while when the device fallback costs
+    # more than the exact calls save; same probabilities); 0 keeps the exact
+    # path whatever the fallback costs. Read at install.
+    "ATOM_SGLANG_V41_DSPARK_TOPP_VERIFY_GUARD": lambda: _flag_env(
+        "ATOM_SGLANG_V41_DSPARK_TOPP_VERIFY_GUARD", "1"
+    ),
     # All-greedy sampling picks with aiter's exact top-1, native's kernel,
     # instead of torch.argmax (`v41_greedy_sampler_patch`); 0 keeps SGLang's
     # sampler. Read at install.

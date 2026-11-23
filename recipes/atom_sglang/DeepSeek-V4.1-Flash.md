@@ -95,6 +95,7 @@ DSpark (block 5, the draft bundled in the checkpoint) adds to the launch above:
 
 ```bash
 export SGLANG_RAGGED_VERIFY_MODE=static
+export SGLANG_DSPARK_USE_GREEDY_DRAFT=1  # native ATOM's draft and verify rule, at any temperature (below)
 # appended to the sglang.launch_server arguments:
 --speculative-algorithm DSPARK --speculative-dspark-block-size 5 --speculative-num-draft-tokens 6
 ```
@@ -109,17 +110,51 @@ block verification, `SGLANG_DSPARK_EMBED_IN_GRAPH=0` (the ATOM draft embeds its 
 `SGLANG_SIMULATE_ACC_LEN` above 1 (unless `ATOM_SGLANG_V41_DSPARK_ALLOW_SIMULATED_ACC=1`, below), and full hidden-state
 returns (`--enable-return-hidden-states` or `--return-hidden-states-mode full`) under decoder SWA bounded replay: SGLang
 returns every prompt row of the target's DSpark capture, which the replay leaves zero outside each request's last 128
-rows (`--return-hidden-states-mode last` is served; `ATOM_SGLANG_V41_DECODER_REPLAY=0` serves full returns). With
-`SGLANG_DSPARK_USE_GREEDY_DRAFT=1` a graph-folded greedy draft block runs ATOM's sharded fused Markov argmax wherever
-native ATOM's DSpark would (a TP-sharded head; native's `ATOM_DSPARK_FUSED_MARKOV_SAMPLE=0` turns it off), and SGLang's
-Markov chain otherwise.
+rows (`--return-hidden-states-mode last` is served; `ATOM_SGLANG_V41_DECODER_REPLAY=0` serves full returns).
 
-Set `SGLANG_DSPARK_USE_GREEDY_DRAFT=1` for temperature-0 serving: the draft always takes the argmax, as native ATOM's
-draft does, and the draft graph runs that fused argmax over each rank's LM-head shard, the ranks exchanging only each
-row's `(max, id)`, instead of SGLang's Markov chain over all-gathered full-vocabulary logits. Greedy requests draft the
-same tokens up to numerics. With the flag, a sampled request's draft is still the argmax and is accepted with the
-target's probability of that token (native's rule) instead of SGLang's rejection sampling against a sampled draft;
-for workloads with temperature above 0, leave it unset to keep SGLang's sampled draft.
+### Greedy draft (`SGLANG_DSPARK_USE_GREEDY_DRAFT=1`)
+
+The launch sets `SGLANG_DSPARK_USE_GREEDY_DRAFT=1` for every temperature: the draft always takes the argmax, as native
+ATOM's draft does. The graph-folded draft block then runs ATOM's sharded fused Markov argmax wherever native ATOM's
+DSpark would (a TP-sharded head; native's `ATOM_DSPARK_FUSED_MARKOV_SAMPLE=0` turns it off): each rank's LM-head
+shard, the ranks exchanging only each row's `(max, id)`, instead of SGLang's Markov chain over all-gathered
+full-vocabulary logits. Greedy requests draft the same tokens up to numerics.
+
+Every verify rule involved is lossless, so a sampled request's output follows the target distribution (temperature,
+top-p) with or without the flag; only acceptance differs. A round whose batch holds a sampled request accepts eagerly,
+outside the verify CUDA graph. For a top-p batch with no greedy, top-k or min-p request, the plugin then verifies as
+native ATOM does: each verify row draws a token from the target's top-p distribution (`softmax(logits / T)` in fp32 and
+aiter's `top_p_sampling_from_probs`, native's kernels), and the draft is accepted while the drawn token equals it. For
+an argmax draft this is the same output distribution as SGLang's rejection sampler given the draft as one-hot (a draft
+token is accepted with its target probability, a rejected row emits a draw from the target without it), without
+SGLang's one-hot `[bs, 5, V]` draft distribution, per-row top-p renormalisation and rejection kernel. Batches with a
+greedy, top-k or min-p request and temperature-only sampling keep SGLang's accept.
+
+Unset the flag only to take SGLang's sampled draft: the draft samples its block from its own distribution and
+SGLang's rejection sampler accepts by the probability ratio, which accepts more as the distributions flatten (high
+temperature) but costs more a round (the draft samples over the all-gathered full-vocabulary logits, and the verify
+computes the draft's full-vocabulary probabilities). Native ATOM's lossless sampled draft
+(`ATOM_SPEC_LOSSLESS_SAMPLING=1`) has no counterpart flag in the plugin.
+
+### Sampled verify with the sampled draft: exact top-p without the vocabulary sort (temporary)
+
+With the sampled draft (`SGLANG_DSPARK_USE_GREEDY_DRAFT` unset), a top-p batch with no top-k request goes through
+SGLang's rejection sampler, which renormalises the target distribution of every verify row by sorting its whole
+vocabulary (`top_p_renorm_probs_triton`). For DeepSeek-V4.1 the plugin replaces that one branch: it finds the pivot
+SGLang's sort / cumsum / searchsorted would find, bitwise, from the top 1280 values of each row (PyTorch's fp32 cumsum
+replayed addition for addition, the rest of the row entering as its exact sum within a rigorous rounding bracket),
+and renormalises with SGLang's own kernel, so the accept sees SGLang's target distribution bit for bit. Rows the top
+1280 cannot settle are sorted on the device; nothing is read back on the host. A cost guard compares, from device
+counts copied without waiting, what those rows cost with what the exact calls saved, and takes SGLang's sort for the
+next 1024 calls when that is cheaper (same probabilities either way; its cost table is MI308X's).
+
+The DeepSeek-V4.1 DSpark draft wrapper installs it only with the sampled draft (with
+`SGLANG_DSPARK_USE_GREEDY_DRAFT=1` a top-p verify takes the draw rule above, and one INFO line says the patch is not
+installed), and only when the source of the five SGLang functions it replaces or relies on matches pinned sha256
+fingerprints, PyTorch is the pinned build whose HIP cumsum it replays, and a GPU self-check at 6, 192 and 258 verify
+rows is bitwise equal to SGLang's; otherwise one WARNING line names the reason and SGLang's path stays. It covers at
+most 85 requests (510 verify rows) and static verify. Temporary: remove `atom/plugin/sglang/patches/dspark_topp_verify_probs_patch.py`,
+`dspark_topp_pivot.py` and their test once SGLang's top-p renorm no longer sorts the full vocabulary.
 
 ## Prefill
 
@@ -178,4 +213,6 @@ Read by the plugin (`atom/plugin/sglang/deepseek_v41_envs.py`). Every one is a b
 | **ATOM_SGLANG_V41_FAST_GREEDY** | bool | 1 (true) | All-greedy batches pick tokens with aiter's top-1 (see Decode step tail). `0`: SGLang's sampler. |
 | **ATOM_SGLANG_V41_DSPARK_DEFERRED_SEQ_LENS** | bool | 1 (true) | A DSpark decode round launches its draft block before the host waits for the previous round's published lengths, and the verify's staging takes them. `0`: SGLang's wait at the top of the round. |
 | **ATOM_SGLANG_V41_DSPARK_PREFETCH_ROWS** | bool | 1 (true) | A DSpark round's page rows that the verify would read back are copied before the draft launch. `0`: read back behind the draft block. |
+| **ATOM_SGLANG_V41_DSPARK_TOPP_VERIFY** | bool | 1 (true) | With the sampled draft (`SGLANG_DSPARK_USE_GREEDY_DRAFT` unset), a top-p verify (no top-k) takes PyTorch's exact top-p pivot without the vocabulary sort, bitwise SGLang's probabilities (see Sampled verify; temporary patch). `0`: SGLang's sort. |
+| **ATOM_SGLANG_V41_DSPARK_TOPP_VERIFY_GUARD** | bool | 1 (true) | The cost guard of the above: SGLang's sort for the next 1024 calls when the device fallback cost more than the exact calls saved (MI308X cost table; same probabilities either way). `0`: always the exact path. |
 | **ATOM_SGLANG_V41_DSPARK_ALLOW_SIMULATED_ACC** | bool | 0 (false) | Performance runs only: allow `SGLANG_SIMULATE_ACC_LEN` > 1 (a fixed mean accept length; the output text is then not the model's). |

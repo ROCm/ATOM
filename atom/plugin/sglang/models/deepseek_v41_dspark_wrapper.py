@@ -5,10 +5,11 @@ SGLang renames a DSpark-bundling V4.1 draft runner to
 ``DeepseekV4ForCausalLMDSpark``; this wrapper keeps that public name and
 delegates the draft to ATOM's native ``DeepseekV41DSpark`` (three MoE draft
 stages, ``DraftAttention`` over the target's window rings 40-42 plus the
-block). SGLang keeps the worker lifecycle, the rejection and the TP token
-sync, and the Markov sampling except where a greedy draft block runs ATOM's
-sharded fused argmax (``atom_v41_greedy_draft_block``); ATOM owns the
-weights, the block math and the KV.
+block). SGLang keeps the worker lifecycle and the TP token sync, and the
+Markov sampling and the rejection except where a greedy draft block runs
+ATOM's sharded fused argmax (``atom_v41_greedy_draft_block``) and a greedy
+draft's top-p verify takes native's draw rule (``dspark_draw_verify_patch``);
+ATOM owns the weights, the block math and the KV.
 
 The draft is a separate enablement from the target: its own config (ATOM's
 draft parse, ``model_type=deepseek_v41_dspark``), its own loader pass
@@ -354,6 +355,16 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         )
 
         install_dspark_fused_greedy_draft_patch()
+        from atom.plugin.sglang.patches.dspark_topp_verify_probs_patch import (
+            install_dspark_topp_verify_probs_patch,
+        )
+
+        install_dspark_topp_verify_probs_patch()
+        from atom.plugin.sglang.patches.dspark_draw_verify_patch import (
+            install_dspark_draw_verify_patch,
+        )
+
+        install_dspark_draw_verify_patch()
         # SGLang's folded draft sampler sizes its step logits off the draft's
         # ``lm_head.org_vocab_size``. The target's head view, not a module:
         # nothing registers twice.
