@@ -4142,3 +4142,97 @@ mod f_atom_reasoning_opener {
         assert_eq!(streamed("still planning", Some("<think>")).await, expected);
     }
 }
+
+mod g_complete_suffix {
+    use axum::body::to_bytes;
+    use serde_json::Value;
+
+    use super::test_support::{chat_ctx, generate_ctx};
+    use crate::routers::render::{
+        chat_aggregator, chat_streaming, generate_aggregator, generate_streaming,
+    };
+    use crate::routers::token_handle::test_support::synthetic_single_stream;
+    use crate::routers::token_handle::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
+
+    /// SGLang's or vLLM's stream: "Hello", "world", then a Complete with every id, its
+    /// last ("." , not an end of sequence) in no partial.
+    fn chunks(streamed: bool) -> Vec<TokenChunk> {
+        let partial = |id| TokenChunk::Partial {
+            token_ids: vec![id],
+            logprobs: None,
+        };
+        let complete = TokenChunk::Complete {
+            token_ids: vec![1, 2, 6],
+            finish_reason: FinishReason::Stop,
+            matched_stop: None,
+            usage: Usage {
+                prompt_tokens: 1,
+                completion_tokens: 3,
+                total_tokens: 4,
+            },
+            logprobs: None,
+            input_logprobs: None,
+            meta: WorkerMeta::default(),
+        };
+        let mut chunks = if streamed {
+            vec![partial(1), partial(2)]
+        } else {
+            vec![]
+        };
+        chunks.push(complete);
+        chunks
+    }
+
+    async fn body(resp: axum::response::Response) -> String {
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    fn events(sse: &str) -> Vec<Value> {
+        sse.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|data| serde_json::from_str(data).ok())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_streamed_chat_carries_the_complete_s_unstreamed_ids_as_unary_does() {
+        let stream = synthetic_single_stream(chunks(false).into_iter().map(Ok).collect());
+        let unary: Value =
+            serde_json::from_str(&body(chat_aggregator::process(stream, chat_ctx()).await).await)
+                .unwrap();
+        let mut ctx = chat_ctx();
+        if let crate::routers::prepare::response_context::ProtocolRequest::Chat(req) =
+            &mut ctx.original
+        {
+            std::sync::Arc::make_mut(req).stream = true;
+        }
+        let stream = synthetic_single_stream(chunks(true).into_iter().map(Ok).collect());
+        let sse = body(chat_streaming::process(stream, ctx, "regular")).await;
+        let streamed: String = events(&sse)
+            .iter()
+            .filter_map(|e| e["choices"][0]["delta"]["content"].as_str())
+            .collect();
+        assert_eq!(streamed, unary["choices"][0]["message"]["content"]);
+        assert!(streamed.ends_with('.'), "{streamed}");
+    }
+
+    #[tokio::test]
+    async fn a_streamed_generate_carries_the_complete_s_unstreamed_ids_as_unary_does() {
+        let stream = synthetic_single_stream(chunks(false).into_iter().map(Ok).collect());
+        let unary: Value = serde_json::from_str(
+            &body(generate_aggregator::process(stream, generate_ctx()).await).await,
+        )
+        .unwrap();
+        let stream = synthetic_single_stream(chunks(true).into_iter().map(Ok).collect());
+        let sse = body(generate_streaming::process(
+            stream,
+            generate_ctx(),
+            "regular",
+        ))
+        .await;
+        let last = events(&sse).pop().unwrap();
+        assert_eq!(last["text"], unary[0]["text"]);
+        assert!(last["text"].as_str().unwrap().ends_with('.'), "{last}");
+    }
+}

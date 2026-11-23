@@ -146,8 +146,30 @@ async fn run_chat_stream(
     let mut tool_parser: Option<Arc<tokio::sync::Mutex<Box<dyn ToolParser>>>> = None;
     let mut sse_buffer = Vec::with_capacity(512);
 
-    while let Some(item) = stream.next().await {
-        let chunk = item.map_err(engine_error_to_string)?;
+    let mut consumed = 0;
+    let mut held: Option<TokenChunk> = None;
+    loop {
+        let chunk = match held.take() {
+            Some(chunk) => chunk,
+            None => match stream.next().await {
+                Some(item) => item.map_err(engine_error_to_string)?,
+                None => break,
+            },
+        };
+        // A Complete's ids past the partials' are streamed first, as one more partial.
+        let chunk = match unstreamed(&chunk, consumed) {
+            Some(rest) => {
+                held = Some(chunk);
+                TokenChunk::Partial {
+                    token_ids: rest,
+                    logprobs: None,
+                }
+            }
+            None => chunk,
+        };
+        if let TokenChunk::Partial { token_ids, .. } = &chunk {
+            consumed += token_ids.len();
+        }
         if is_first && ctx.reads_as_atom {
             // On the engine's first message, text or not, as ATOM's HTTP chat opens its stream.
             let first_chunk = ChatCompletionStreamResponse::builder(request_id, model)
@@ -387,6 +409,18 @@ async fn run_chat_stream(
     });
 
     Ok(())
+}
+
+/// The ids of a Complete past the `consumed` its partials streamed: SGLang's and vLLM's
+/// carry every output id, ATOM's streamed one none.
+pub(super) fn unstreamed(chunk: &TokenChunk, consumed: usize) -> Option<Vec<u32>> {
+    match chunk {
+        TokenChunk::Complete { token_ids, .. } => token_ids
+            .get(consumed..)
+            .filter(|rest| !rest.is_empty())
+            .map(<[u32]>::to_vec),
+        TokenChunk::Partial { .. } => None,
+    }
 }
 
 pub(super) fn process_chunk_tokens(

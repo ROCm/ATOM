@@ -18,7 +18,7 @@ use crate::{
     routers::{
         prepare::response_context::{ProtocolRequest, ResponseContext},
         render::{
-            chat_streaming::process_chunk_tokens,
+            chat_streaming::{process_chunk_tokens, unstreamed},
             logprob_conversion::{input_logprobs_to_generate, output_logprobs_to_generate},
         },
         token_handle::{
@@ -95,9 +95,12 @@ async fn run_generate_stream(
     let mut weight_version: Option<String> = None;
     let mut prompt_tokens_seen: u32 = 0;
     let mut accumulated_output_logprobs: Option<Vec<Vec<Option<f64>>>> = None;
+    let mut consumed = 0;
 
     while let Some(item) = stream.next().await {
         let chunk = item.map_err(engine_error_to_string)?;
+        // A Complete's ids past the partials' (SGLang's and vLLM's carries them all).
+        let rest = unstreamed(&chunk, consumed);
         match chunk {
             TokenChunk::Partial {
                 token_ids,
@@ -107,6 +110,7 @@ async fn run_generate_stream(
                     first_token_time = Some(Instant::now());
                 }
                 completion_tokens += token_ids.len() as u32;
+                consumed += token_ids.len();
 
                 // Decoded across chunks, as the unary text is, so a chunk boundary loses no text.
                 let (chunk_text, _stopped) = process_chunk_tokens(&mut stop_decoder, &token_ids);
@@ -147,6 +151,10 @@ async fn run_generate_stream(
                 input_logprobs,
                 ..
             } => {
+                if let Some(rest) = rest {
+                    let (text, _stopped) = process_chunk_tokens(&mut stop_decoder, &rest);
+                    accumulated_text.push_str(&text);
+                }
                 if let SequenceDecoderOutput::Text(text) = stop_decoder.flush() {
                     accumulated_text.push_str(&text);
                 }
