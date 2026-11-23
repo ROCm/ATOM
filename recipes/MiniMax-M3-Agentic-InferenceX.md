@@ -208,9 +208,9 @@ MiniMax-M3.1-Flash runs a different configuration from the M3 recipe above:
 - every one of the 60 layers is sparse attention with its own indexer;
 - the quantized checkpoint is Quark MXFP4.
 
-The reference is the SemiAnalysis InferenceX SGLang recipe `minimaxm31flash-fp4-mi355x-sglang-agentic-dspark` (TP4, K=7, golden accepted length 4.04, CI run 41277894342). This section is the configuration of the InferenceX ATOM submission `minimaxm31flash-fp4-mi355x-atom-agentic-dspark` (SemiAnalysisAI/InferenceX#5157).
+This section is the configuration of the InferenceX ATOM submission `minimaxm31flash-fp4-mi355x-atom-agentic-dspark` (SemiAnalysisAI/InferenceX#5157): TP4, DSpark K=7.
 
-Everything below is on `main` and in `rocm/atom-dev:nightly_202611200431` (ATOM `17edc6157`, AITER `a485545d3`). It needs:
+Everything below is on `main`. It needs:
 - #3310: the NVFP4 KV and index caches;
 - #3308: mono decode with the MXFP8 shared expert;
 - #3576 with ROCm/aiter#8285: indexer CP over the NVFP4 caches;
@@ -222,7 +222,7 @@ Every concurrency runs:
   - no `--online_quant_config`, so attention and the dense MLPs stay MXFP8;
   - the MXFP8 shared expert stays its own MLP (`ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4` unset);
   - no quick-allreduce quantization (`AITER_QUICK_REDUCE_QUANTIZATION` unset).
-- **The DSpark draft as shipped.** Its weights stay MXFP8, and its KV, in a pool of its own, is ATOM's default beside an NVFP4 target: BF16 (`--spec-decode-kv-cache-dtype` unset). InferenceX does not allow a draft KV below the framework default, even though the vLLM and SGLang M3.1 recipes run an FP8 one.
+- **The DSpark draft as shipped.** Its weights stay MXFP8, and its KV, in a pool of its own, is ATOM's default beside an NVFP4 target: BF16 (`--spec-decode-kv-cache-dtype` unset). InferenceX does not allow a draft KV below the framework default.
 
 What changes with concurrency:
 
@@ -274,7 +274,7 @@ env -u AITER_QUICK_REDUCE_QUANTIZATION -u ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4 $EXT
   > server_c${CONC}.log 2>&1 &
 ```
 
-- `--spec-decode-acceptance-length 4.04` is SGLang CI's golden accepted length, applied the way InferenceX applies it. It is performance-only. Drop it for accuracy runs.
+- `--spec-decode-acceptance-length 4.04` is InferenceX's golden accepted length for this draft at K=7 (`minimax-m3.1-flash__dspark__native__probabilistic-block`), applied the way InferenceX applies it. It is performance-only. Drop it for accuracy runs.
 - `PYTHONHASHSEED=0` keeps the ranks' prefix and LMCache keys equal; without it the LMCache points never hit.
 - `ATOM_KV_OFFLOAD=lmcache` is the env form of `--kv-transfer-config '{"kv_connector":"lmcache_offload","kv_role":"offload"}'`, which the InferenceX recipe passes as `extra-kv-connectors`.
 - Check the startup lines:
@@ -283,7 +283,7 @@ env -u AITER_QUICK_REDUCE_QUANTIZATION -u ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4 $EXT
   - at CONC 32, `PrefillDelayer initialized: ... max_num_batched_tokens=16384 target_fill=0.05 ... stall_ticks=2`;
   - at CONC 48, `LMCache M3 PAGE offload worker rank=N: page_regions=130 bytes_per_block=1986560 chunk=256`.
 
-Client: the InferenceX AgentX harness (`agentx-harness` 1.0.12, the version SGLang CI run 41277894342 used), which drives the same `semianalysis_cc_traces_weka_062126` replay as the aiperf command above:
+Client: the InferenceX AgentX harness (`agentx-harness` 1.0.12), which drives the same `semianalysis_cc_traces_weka_062126` replay as the aiperf command above:
 
 ```bash
 export AIPERF_REQUIRED_SERVER_METRIC_PREFIX=atom: AIPERF_HTTP_TCP_USER_TIMEOUT=900000
@@ -302,18 +302,14 @@ InferenceX CI ran this configuration in [run-sweep 44987957118](https://github.c
 
 gsm8k, the InferenceX CI method: its `infx/evals/gsm8k.yaml` (5-shot, chat template), temperature 0, `max_tokens` 16384, all 1319 samples, real acceptance (no `--spec-decode-acceptance-length`). strict-match:
 
-| config | InferenceX CI (run 44987957118) | local, `nightly_202611200431` |
+| config | InferenceX CI (run 44987957118) | local |
 |---|---|---|
 | CONC 8 command | 0.9644 | |
 | CONC 16 command (indexer CP) | 0.9682 | |
 | CONC 32 command (indexer CP + delayer) | 0.9613 | 0.9636 ± 0.0052 |
 | CONC 48 command (indexer CP + LMCache) | 0.9598, with an FP8 draft KV | 0.9682 ± 0.0048 |
-| SGLang CI (run 41277894342) | 0.9598 ± 0.0054 | |
 
-### Not in this command yet
-
-On `main` after `nightly_202611200431`, and active in this command without a flag once the image has it:
-- #3434: the DSpark confidence head runs as one fused GEMV.
+### Not on `main` yet
 
 These moved the earlier best numbers (ROCm/ATOM experiment branches) and are not in this command:
 - Mono decode beyond 16 rows, and the fused-handoff MoE (FHMoE): no PR yet.
