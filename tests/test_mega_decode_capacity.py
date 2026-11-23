@@ -15,14 +15,14 @@ import torch
 
 pytest.importorskip("triton", reason="MegaMoE imports its Triton row-zeroing kernel")
 
-from atom import config as atom_config
 from atom.model_ops.fused_moe import flydsl_mega_experts as mega
 from atom.plugin import prepare as plugin_prepare
 
 LARGE_CAPACITY = 16384
 SMALL_M_MTPR = 32
 N_LAYERS = 61
-N_MTP = 3
+# DSpark builds 3 draft stages, numbered after the target layers.
+N_DRAFT = 3
 
 
 def _context(rows, **overrides):
@@ -39,9 +39,11 @@ def _context(rows, **overrides):
     return SimpleNamespace(**values)
 
 
-def _layer(value=0, layer_id=0):
+def _layer(value=0, layer_id=0, *, pcp_merge=False):
     return SimpleNamespace(
         layer_id=layer_id,
+        prefix=f"model.layers.{layer_id}.ffn.experts",
+        moe_parallel_config=SimpleNamespace(pcp_merge=pcp_merge),
         **{
             name: torch.full((48, 4), value, dtype=torch.uint8)
             for name in ("_mega_w1", "_mega_w1_scale", "_mega_w2", "_mega_w2_scale")
@@ -62,11 +64,14 @@ def runtime(monkeypatch):
         events=[],
         instances={},
         layer=_layer(),
+        small_m_mtpr=SMALL_M_MTPR,
+        pcp=1,
     )
     monkeypatch.setenv("ATOM_MEGA_DECODE_FAST_PATH", "1")
     monkeypatch.setattr(plugin_prepare, "_CURRENT_FRAMEWORK", "atom")
     monkeypatch.setattr(mega, "_MEGA_CACHE", {})
     monkeypatch.setattr(mega, "_MEGA_CAPACITY_LOGGED", set())
+    monkeypatch.setattr(mega, "_MEGA_LAYER_IDS", set())
     monkeypatch.setattr(
         torch.cuda, "is_current_stream_capturing", lambda: state.capturing
     )
@@ -82,9 +87,8 @@ def runtime(monkeypatch):
 
     class FakeMegaMoEV2:
         """AITER's MegaMoEV2 (ROCm/aiter#7788): builds its fused routes with
-        routed=True and picks one per call from the max_tokens hint."""
-
-        small_m_mtpr = SMALL_M_MTPR
+        routed=True and picks one per call from the max_tokens hint, which
+        must lie in [this rank's rows, capacity]."""
 
         def __init__(self, *, routed, large_m_state_slots, **kwargs):
             assert state.heap_initialized
@@ -93,6 +97,7 @@ def runtime(monkeypatch):
             self.rank = kwargs["rank"]
             self.capacity = kwargs["max_tok_per_rank"]
             self.large_m_state_slots = large_m_state_slots
+            self.small_m_mtpr = state.small_m_mtpr
             self.kwargs = kwargs
             state.events.append(("build", self.rank, self.capacity))
             state.instances[self.rank, self.capacity] = self
@@ -104,12 +109,22 @@ def runtime(monkeypatch):
         def select_layer_state(self, layer_slot):
             assert self.large_m_available
             # AITER refuses a slot outside the ones it built.
-            assert 0 <= layer_slot < self.large_m_state_slots
+            if not 0 <= layer_slot < self.large_m_state_slots:
+                raise ValueError(
+                    f"layer_slot={layer_slot} outside [0, {self.large_m_state_slots})"
+                )
             state.events.append(("slot", self.rank, layer_slot))
 
         def forward(self, x, weights, ids, *, mask_invalid_slots, max_tokens):
             # Pad rows are routed to -1, so combine must skip those slots.
             assert mask_invalid_slots is True
+            if max_tokens is not None and not (
+                x.shape[0] <= max_tokens <= self.capacity
+            ):
+                raise ValueError(
+                    f"max_tokens={max_tokens} must be in "
+                    f"[{x.shape[0]} (this rank's rows), {self.capacity}]"
+                )
             state.events.append(("forward", self.rank, self.capacity))
             state.events.append(("hint", self.rank, max_tokens))
             return torch.full_like(x, self.capacity)
@@ -125,6 +140,10 @@ def runtime(monkeypatch):
         "atom.utils.forward_context", get_forward_context=lambda: state.forward_context
     )
     stub_module("atom.utils.tbo.ubatching", tbo_active=lambda: state.tbo)
+    stub_module(
+        "atom.distributed.pcp_utils",
+        pcp_pad_len=lambda rows: -(-rows // state.pcp) * state.pcp,
+    )
 
     def run(
         context,
@@ -154,15 +173,10 @@ def runtime(monkeypatch):
             swiglu_limit=0.0,
         )
 
-    def use_hf_config(**fields):
-        config = SimpleNamespace(hf_config=SimpleNamespace(**fields))
-        monkeypatch.setattr(
-            atom_config, "get_current_atom_config", lambda: config, raising=False
-        )
-
-    use_hf_config(num_hidden_layers=N_LAYERS, num_nextn_predict_layers=N_MTP)
+    # Target layers, then the draft model's: both are built before any forward.
+    for layer_id in range(N_LAYERS + N_DRAFT):
+        mega.register_mega_layer(_layer(layer_id=layer_id))
     state.run = run
-    state.use_hf_config = use_hf_config
     return state
 
 
@@ -457,7 +471,7 @@ def test_capture_warmup_hints_like_the_capture(runtime):
 def test_each_layer_selects_the_large_input_slot_of_its_layer_id(runtime):
     # Target layers and the draft layers after them (MTP / DSpark number them
     # num_hidden_layers + i) each own one slot, whatever order they first run in.
-    ids = (2, 0, N_LAYERS + N_MTP - 1, N_LAYERS, 1)
+    ids = (2, 0, N_LAYERS + N_DRAFT - 1, N_LAYERS, 1)
     layers = [_layer(value, layer_id) for value, layer_id in enumerate(ids)]
     for layer in layers + layers:
         runtime.run(_context(512, running_tokens_are_unified=False), layer=layer)
@@ -467,15 +481,88 @@ def test_each_layer_selects_the_large_input_slot_of_its_layer_id(runtime):
     assert {
         capacity: instance.large_m_state_slots
         for (_, capacity), instance in runtime.instances.items()
-    } == {LARGE_CAPACITY: N_LAYERS + N_MTP, 128: N_LAYERS + N_MTP}
+    } == {LARGE_CAPACITY: N_LAYERS + N_DRAFT, 128: N_LAYERS + N_DRAFT}
     assert _events(runtime, "slot") == list(ids) * 2
 
 
-def test_a_config_without_draft_layers_sizes_the_slots_by_its_layers(runtime):
-    runtime.use_hf_config(num_hidden_layers=N_LAYERS)
+def test_slots_cover_the_layer_ids_built_and_no_more(runtime, monkeypatch):
+    # A target without a draft model: the slots end at its last layer, and a
+    # layer id nobody registered is refused by AITER rather than aliased.
+    monkeypatch.setattr(mega, "_MEGA_LAYER_IDS", set())
+    for layer_id in range(N_LAYERS):
+        mega.register_mega_layer(_layer(layer_id=layer_id))
     runtime.run(_context(512, running_tokens_are_unified=False))
 
     assert runtime.instances[0, LARGE_CAPACITY].large_m_state_slots == N_LAYERS
+    with pytest.raises(ValueError, match=f"layer_slot={N_LAYERS} outside"):
+        runtime.run(
+            _context(512, running_tokens_are_unified=False),
+            layer=_layer(layer_id=N_LAYERS),
+        )
+
+
+def test_a_mega_layer_without_a_layer_id_is_refused():
+    with pytest.raises(ValueError, match="needs the layer_id.*model.layers.3"):
+        mega.register_mega_layer(
+            SimpleNamespace(layer_id=None, prefix="model.layers.3.mlp.experts")
+        )
+
+
+@pytest.mark.parametrize("pcp", [2, 4])
+@pytest.mark.parametrize("prefill_rows", [101, 102, 4093])
+def test_pcp_merge_hints_the_gathered_padded_rows(runtime, pcp, prefill_rows):
+    # Under ATOM_PCP_MOE_MERGE a split prefill gathers every PCP shard of the
+    # step's rows padded to a PCP multiple; other passes hold the step's rows.
+    # Every PCP rank hints the padded count, which bounds both.
+    runtime.pcp = pcp
+    layer = _layer(pcp_merge=True)
+    padded = -(-prefill_rows // pcp) * pcp
+    context = _context(
+        prefill_rows,
+        running_tokens_are_unified=False,
+        running_tokens_across_dp=(prefill_rows,),
+        is_prefill=True,
+    )
+    runtime.run(context, rows=padded, layer=layer)
+    runtime.run(context, rows=prefill_rows, layer=layer)
+
+    assert _events(runtime, "hint") == [padded, padded]
+
+
+def test_unpadded_hint_is_refused_by_the_route_bounds(runtime):
+    # Without pcp_merge the hint is the step's own rows: a gathered, padded
+    # input above it is outside AITER's [run_tokens, mtpr] bounds.
+    runtime.pcp = 2
+    context = _context(
+        101, running_tokens_are_unified=False, running_tokens_across_dp=(101,)
+    )
+    with pytest.raises(ValueError, match="max_tokens=101 must be in \\[102"):
+        runtime.run(context, rows=102)
+
+
+@pytest.mark.parametrize(
+    ("small_m_mtpr", "decode_mtpr", "builds_decode"),
+    [
+        (0, 128, True),  # no small-input route: the decode capacity serves
+        (SMALL_M_MTPR, 128, True),
+        (512, 128, False),
+        (512, 512, False),
+        (512, 1024, True),
+    ],
+)
+def test_decode_capacity_is_skipped_when_the_small_route_covers_it(
+    runtime, monkeypatch, small_m_mtpr, decode_mtpr, builds_decode
+):
+    runtime.small_m_mtpr = small_m_mtpr
+    monkeypatch.setattr(mega, "_MEGA_DECODE_MTPR", decode_mtpr)
+    for rank in range(2):
+        runtime.run(_context(64), rank=rank)
+
+    expected = [LARGE_CAPACITY, decode_mtpr] if builds_decode else [LARGE_CAPACITY]
+    assert _built(runtime, 0) == _built(runtime, 1) == expected
+    assert _forwarded(runtime) == [expected[-1]] * 2
+    # The configured capacity routes the step by its hint.
+    assert _events(runtime, "hint") == [64, 64]
 
 
 @pytest.mark.parametrize(
@@ -499,3 +586,55 @@ def test_draft_pass_hints_its_own_rows(runtime, context, hint):
     runtime.run(context, layer=_layer(layer_id=N_LAYERS))
 
     assert _events(runtime, "hint") == [hint]
+
+
+@pytest.mark.parametrize(
+    ("arch", "num_cu", "mtpr", "fused"),
+    [
+        ("gfx950", 256, LARGE_CAPACITY, True),
+        ("gfx950:sramecc+:xnack-", 256, 128, True),
+        # Without the small-input route only a large-input capacity fuses.
+        ("gfx950", 304, LARGE_CAPACITY, True),
+        ("gfx950", 304, 32768, False),
+        ("gfx942", 304, LARGE_CAPACITY, False),
+    ],
+)
+def test_fused_route_is_decided_by_aiter_queries(
+    monkeypatch, arch, num_cu, mtpr, fused
+):
+    layout = {
+        "world_size": 8,
+        "model_dim": 7168,
+        "inter_dim": 3072,
+        "experts": 384,
+        "topk": 6,
+        "quant": "a8w4",
+        "swiglu_limit": 10.0,
+    }
+    queried = []
+
+    def fused_layout_supported(*, arch, **kwargs):
+        queried.append(kwargs)
+        return arch.split(":", 1)[0] == "gfx950"
+
+    def stub_module(name, **attrs):
+        module = ModuleType(name)
+        module.__dict__.update(attrs)
+        monkeypatch.setitem(sys.modules, name, module)
+
+    stub_module("aiter.jit.utils.chip_info", get_gfx_runtime=lambda: arch)
+    stub_module(
+        "aiter.ops.flydsl.kernels.mega_moe.mega_moe_config",
+        fused_layout_supported=fused_layout_supported,
+        large_m_mtprs_for=lambda **_: (1024, 2048, 4096, 8192, 16384),
+        small_m_cu_supported=lambda cu: cu == 256,
+    )
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: SimpleNamespace(multi_processor_count=num_cu),
+    )
+
+    assert mega.mega_builds_fused_route(mtpr=mtpr, **layout) is fused
+    assert queried == [layout]

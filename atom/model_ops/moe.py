@@ -533,9 +533,6 @@ def _select_logical(
 class FusedMoEMethodBase(QuantizeMethodBase):
     # Set by a method that fixes OCP E4M3 bytes up to E4M3FNUZ after loading.
     need_normalize_e4m3fn_to_e4m3fnuz: bool = False
-    # Whether the model may run its shared experts on a side stream next to
-    # this method's routed experts.
-    allows_concurrent_shared_stream: bool = True
 
     def __init__(self, moe: FusedMoEConfig):
         super().__init__()
@@ -554,6 +551,11 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             and moe.use_mori_kernels
             else None
         )
+
+    def allows_concurrent_shared_stream(self, layer: torch.nn.Module) -> bool:
+        """Whether the model may run its shared experts on a side stream next to
+        this method's routed experts on ``layer``. Asked once, at model init."""
+        return True
 
     @abstractmethod
     def create_weights(
@@ -2700,11 +2702,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
     """MXFP4 MoE method backed by the fused FlyDSL MegaMoE pipeline."""
 
-    # MegaMoEV2's fused small- and large-input kernels keep every CTA resident
-    # and wait on the peer ranks; a shared-expert kernel holding CUs on one rank
-    # next to them deadlocks the group (EP4 V4.1-Flash hung in decode-graph
-    # warm-up and serving).
-    allows_concurrent_shared_stream = False
+    # Activation x weight format of the MegaMoEV2 instances.
+    mega_quant = "a8w4"
 
     def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
         super().__init__(quant_config, moe)
@@ -2712,6 +2711,34 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
         # Standard Triton weight/forward paths must not preempt it.
         self.use_triton = False
         self.use_triton_decode = False
+
+    def allows_concurrent_shared_stream(self, layer: torch.nn.Module) -> bool:
+        # MegaMoEV2's fused small- and large-input kernels keep every CTA
+        # resident and wait on the peer ranks; a shared-expert kernel holding
+        # CUs on one rank next to them deadlocks the group (EP4 V4.1-Flash hung
+        # in decode-graph warm-up and serving). Its staged route does not wait
+        # so, and a layout AITER does not fuse takes only that one.
+        from atom.model_ops.fused_moe.flydsl_mega_experts import (
+            mega_builds_fused_route,
+        )
+
+        return not mega_builds_fused_route(
+            world_size=self.moe.ep_size,
+            model_dim=self.hidden_size,
+            inter_dim=self.intermediate_size,
+            experts=self.moe.num_experts,
+            topk=self.moe.experts_per_token,
+            quant=self.mega_quant,
+            swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
+            mtpr=self.moe.max_num_tokens,
+        )
+
+    def create_weights(self, layer: torch.nn.Module, *args, **kwargs):
+        from atom.model_ops.fused_moe.flydsl_mega_experts import register_mega_layer
+
+        # The large-input route gives each layer id its own protocol slot.
+        register_mega_layer(layer)
+        super().create_weights(layer, *args, **kwargs)
 
     def _process_weight_layout_after_loading(self, layer) -> None:
         from atom.model_ops.fused_moe.flydsl_mega_experts import build_mega_weights
@@ -2742,7 +2769,7 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
             model_dim=self.hidden_size,
             inter_dim=self.intermediate_size,
             mtpr=self.moe.max_num_tokens,
-            quant="a8w4",
+            quant=self.mega_quant,
         )
         # MegaMoE quantizes the bf16 rows itself, inside its dispatch.
         self.routed_rows_wire = None
@@ -4035,8 +4062,11 @@ class FusedMoE(torch.nn.Module):
 
     @property
     def allows_concurrent_shared_stream(self) -> bool:
-        """Whether shared experts may run on a side stream next to these experts."""
-        return self.quant_method.allows_concurrent_shared_stream
+        """Whether shared experts may run on a side stream next to these experts.
+
+        A model asks after it set the experts' ``swiglu_limit``, which decides
+        whether MegaMoE fuses them."""
+        return self.quant_method.allows_concurrent_shared_stream(self)
 
     @property
     def shared_expert_weight(self) -> float:

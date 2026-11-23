@@ -1213,10 +1213,12 @@ def test_moe_parallel_config_exchanges_tokens(
         assert parallel.selected_all2all_backend is None
 
 
-def _v4_moe_built(monkeypatch, atom_modules, *, parallel, shared_stream=True):
+def _v4_moe_built(
+    monkeypatch, atom_modules, *, parallel, shared_stream=lambda experts: True
+):
     """A V4 `MoE` through its real `__init__`, GEMM/expert modules stubbed;
     ``parallel`` is the experts' real `FusedMoEParallelConfig` and
-    ``shared_stream`` their method's `allows_concurrent_shared_stream`."""
+    ``shared_stream(experts)`` their `allows_concurrent_shared_stream`."""
     v4 = atom_modules.deepseek_v4
     forward_context = {}
     config = SimpleNamespace(
@@ -1226,12 +1228,16 @@ def _v4_moe_built(monkeypatch, atom_modules, *, parallel, shared_stream=True):
     monkeypatch.setattr(v4, "get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(v4, "ReplicatedLinear", lambda *a, **k: torch.nn.Module())
 
+    class Experts(torch.nn.Module):
+        @property
+        def allows_concurrent_shared_stream(self):
+            return shared_stream(self)
+
     def fused_moe(**kwargs):
-        experts = torch.nn.Module()
+        experts = Experts()
         experts.num_fused_shared_experts = 0
         experts._comm_fused_moe = None
         experts.moe_parallel_config = parallel
-        experts.allows_concurrent_shared_stream = shared_stream
         return experts
 
     monkeypatch.setattr(v4, "FusedMoE", fused_moe)
@@ -1313,24 +1319,115 @@ def test_dsv4_moe_init_sets_its_dual_stream_threshold(
     assert (forward_context.get("model.layers.3.ffn") is moe) == (expected > 0)
 
 
+@pytest.mark.parametrize("refuses", [False, True])
 def test_dsv4_moe_keeps_shared_experts_single_stream_when_its_experts_refuse(
-    monkeypatch, atom_modules
+    monkeypatch, atom_modules, refuses
 ):
-    """Experts whose method refuses a concurrent shared-expert stream (MegaMoEV2:
-    its persistent kernels deadlock next to one) turn the V4 dual stream off."""
+    """Experts whose method refuses a concurrent shared-expert stream (a fused
+    MegaMoEV2 route: its persistent kernels deadlock next to one) turn the V4
+    dual stream off. V4 asks once it set the experts' swiglu_limit."""
     monkeypatch.delenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", raising=False)
     parallel = _moe_parallel(monkeypatch, atom_modules, **_DEP4)
+    asked = []
+
+    def shared_stream(experts):
+        asked.append(experts.swiglu_limit)
+        return not refuses
+
     moe, forward_context = _v4_moe_built(
-        monkeypatch, atom_modules, parallel=parallel, shared_stream=False
+        monkeypatch, atom_modules, parallel=parallel, shared_stream=shared_stream
     )
 
-    assert not moe._use_dual_stream
-    assert "model.layers.3.ffn" not in forward_context
+    assert asked == [7.0]
+    assert moe._use_dual_stream is not refuses
+    assert ("model.layers.3.ffn" in forward_context) is not refuses
 
 
-def test_only_the_mega_method_refuses_a_concurrent_shared_stream(atom_modules):
+@pytest.mark.parametrize("refuses", [False, True])
+def test_dsv2_moe_keeps_shared_experts_single_stream_when_its_experts_refuse(
+    monkeypatch, atom_modules, refuses
+):
+    """The V2 MoE (DeepSeek-V3/R1, Kimi-K2.5) takes the same gate as V4."""
+    monkeypatch.delenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", raising=False)
+    v2 = atom_modules.deepseek_v2
+    forward_context = {}
+    config = SimpleNamespace(
+        enable_tbo=False,
+        compilation_config=SimpleNamespace(static_forward_context=forward_context),
+    )
+    monkeypatch.setattr(v2, "get_current_atom_config", lambda: config)
+    monkeypatch.setattr(v2, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(v2, "ReplicatedLinear", lambda *a, **k: torch.nn.Module())
+    monkeypatch.setattr(v2, "DeepseekV2MLP", lambda *a, **k: torch.nn.Module())
+    monkeypatch.setattr(
+        v2, "is_rocm_aiter_fusion_shared_expert_enabled", lambda **_: False
+    )
+
+    def fused_moe(**kwargs):
+        experts = torch.nn.Module()
+        experts.allows_concurrent_shared_stream = not refuses
+        return experts
+
+    monkeypatch.setattr(v2, "FusedMoE", fused_moe)
+    hf_config = SimpleNamespace(
+        routed_scaling_factor=1.0,
+        n_shared_experts=1,
+        hidden_act="silu",
+        hidden_size=8,
+        n_routed_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=16,
+        norm_topk_prob=True,
+        n_group=1,
+        topk_group=1,
+        scoring_func="sigmoid",
+        topk_method="greedy",
+        model_type="deepseek_v3",
+    )
+    moe = v2.DeepseekV2MoE(
+        hf_config, prefix="model.layers.3.mlp", alt_stream=object(), layer_id=3
+    )
+
+    assert moe._use_dual_stream is not refuses
+    assert ("model.layers.3.mlp" in forward_context) is not refuses
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_mega_method_refuses_a_concurrent_shared_stream_on_a_fused_route(
+    monkeypatch, atom_modules, fused
+):
+    """Only a layout AITER builds a fused MegaMoEV2 route for refuses; other
+    MoE methods always allow the side stream. The experts ask their method."""
+    import atom.model_ops.fused_moe.flydsl_mega_experts as mega
+
     moe_ops = atom_modules.moe
+    queried = []
 
-    assert moe_ops.FusedMoEMethodBase.allows_concurrent_shared_stream
-    assert moe_ops.Mxfp4MoEMethod.allows_concurrent_shared_stream
-    assert not moe_ops.MegaMxfp4MoEMethod.allows_concurrent_shared_stream
+    def mega_builds_fused_route(**layout):
+        queried.append(layout)
+        return fused
+
+    monkeypatch.setattr(mega, "mega_builds_fused_route", mega_builds_fused_route)
+    method = object.__new__(moe_ops.MegaMxfp4MoEMethod)
+    method.moe = SimpleNamespace(
+        ep_size=8, num_experts=384, experts_per_token=6, max_num_tokens=16384
+    )
+    method.hidden_size = 7168
+    method.intermediate_size = 3072
+    experts = SimpleNamespace(quant_method=method, swiglu_limit=10.0)
+
+    assert moe_ops.FusedMoE.allows_concurrent_shared_stream.fget(experts) is not fused
+    assert queried == [
+        {
+            "world_size": 8,
+            "model_dim": 7168,
+            "inter_dim": 3072,
+            "experts": 384,
+            "topk": 6,
+            "quant": "a8w4",
+            "swiglu_limit": 10.0,
+            "mtpr": 16384,
+        }
+    ]
+    other = object.__new__(moe_ops.Mxfp4MoEMethod)
+    assert other.allows_concurrent_shared_stream(experts)

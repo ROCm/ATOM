@@ -13,6 +13,7 @@ def atom_modules():
             moe=load("atom.model_ops.moe"),
             comm=load("atom.model_ops.fused_moe.comm_fused_moe"),
             deepseek_v4=load("atom.models.deepseek_v4"),
+            deepseek_v2=load("atom.models.deepseek_v2"),
             host=load("aiter.ops.flydsl.comm_fused_moe_host"),
             runtime=load("aiter.ops.comm_fused_moe_runtime"),
         )
