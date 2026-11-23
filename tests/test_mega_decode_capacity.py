@@ -21,6 +21,8 @@ from atom.plugin import prepare as plugin_prepare
 
 LARGE_CAPACITY = 16384
 SMALL_M_MTPR = 32
+N_LAYERS = 61
+N_MTP = 3
 
 
 def _context(rows, **overrides):
@@ -37,12 +39,13 @@ def _context(rows, **overrides):
     return SimpleNamespace(**values)
 
 
-def _layer(value=0):
+def _layer(value=0, layer_id=0):
     return SimpleNamespace(
+        layer_id=layer_id,
         **{
             name: torch.full((48, 4), value, dtype=torch.uint8)
             for name in ("_mega_w1", "_mega_w1_scale", "_mega_w2", "_mega_w2_scale")
-        }
+        },
     )
 
 
@@ -64,7 +67,6 @@ def runtime(monkeypatch):
     monkeypatch.setattr(plugin_prepare, "_CURRENT_FRAMEWORK", "atom")
     monkeypatch.setattr(mega, "_MEGA_CACHE", {})
     monkeypatch.setattr(mega, "_MEGA_CAPACITY_LOGGED", set())
-    monkeypatch.setattr(mega, "_MEGA_LAYER_SLOTS", {})
     monkeypatch.setattr(
         torch.cuda, "is_current_stream_capturing", lambda: state.capturing
     )
@@ -79,29 +81,21 @@ def runtime(monkeypatch):
     ep_group = SimpleNamespace(device_communicator=Communicator())
 
     class FakeMegaMoEV2:
-        def __init__(self, **kwargs):
-            assert state.heap_initialized
-            assert not state.capturing, "constructor reached during capture"
-            self.rank = kwargs["rank"]
-            self.capacity = kwargs["max_tok_per_rank"]
-            self.kwargs = kwargs
-            state.events.append(("build", self.rank, self.capacity))
-            state.instances[self.rank, self.capacity] = self
-
-        def forward(self, x, weights, ids, *, mask_invalid_slots):
-            # Pad rows are routed to -1, so combine must skip those slots.
-            assert mask_invalid_slots is True
-            state.events.append(("forward", self.rank, self.capacity))
-            return torch.full_like(x, self.capacity)
-
-    class RoutedMegaMoEV2(FakeMegaMoEV2):
-        """An AITER build that builds its fused routes on request and picks one per call
-        from a max_tokens hint."""
+        """AITER's MegaMoEV2 (ROCm/aiter#7788): builds its fused routes with
+        routed=True and picks one per call from the max_tokens hint."""
 
         small_m_mtpr = SMALL_M_MTPR
 
-        def __init__(self, *, routed=False, **kwargs):
-            super().__init__(routed=routed, **kwargs)
+        def __init__(self, *, routed, large_m_state_slots, **kwargs):
+            assert state.heap_initialized
+            assert not state.capturing, "constructor reached during capture"
+            assert routed is True
+            self.rank = kwargs["rank"]
+            self.capacity = kwargs["max_tok_per_rank"]
+            self.large_m_state_slots = large_m_state_slots
+            self.kwargs = kwargs
+            state.events.append(("build", self.rank, self.capacity))
+            state.instances[self.rank, self.capacity] = self
 
         @property
         def large_m_available(self):
@@ -109,9 +103,12 @@ def runtime(monkeypatch):
 
         def select_layer_state(self, layer_slot):
             assert self.large_m_available
+            # AITER refuses a slot outside the ones it built.
+            assert 0 <= layer_slot < self.large_m_state_slots
             state.events.append(("slot", self.rank, layer_slot))
 
-        def forward(self, x, weights, ids, *, mask_invalid_slots, max_tokens=None):
+        def forward(self, x, weights, ids, *, mask_invalid_slots, max_tokens):
+            # Pad rows are routed to -1, so combine must skip those slots.
             assert mask_invalid_slots is True
             state.events.append(("forward", self.rank, self.capacity))
             state.events.append(("hint", self.rank, max_tokens))
@@ -157,15 +154,15 @@ def runtime(monkeypatch):
             swiglu_limit=0.0,
         )
 
-    def use_routed_aiter(layers=61):
-        sys.modules["aiter.ops.flydsl.kernels.mega_moe"].MegaMoEV2 = RoutedMegaMoEV2
-        config = SimpleNamespace(hf_config=SimpleNamespace(num_hidden_layers=layers))
+    def use_hf_config(**fields):
+        config = SimpleNamespace(hf_config=SimpleNamespace(**fields))
         monkeypatch.setattr(
             atom_config, "get_current_atom_config", lambda: config, raising=False
         )
 
+    use_hf_config(num_hidden_layers=N_LAYERS, num_nextn_predict_layers=N_MTP)
     state.run = run
-    state.use_routed_aiter = use_routed_aiter
+    state.use_hf_config = use_hf_config
     return state
 
 
@@ -334,7 +331,7 @@ def test_warmup_builds_both_capacities_before_any_forward_or_capture(runtime):
     # False. Actual stream capture state must govern allocation in both cases.
     runtime.forward_context.in_hipgraph = True
     runtime.run(_context(256))
-    assert runtime.events == [
+    assert [e for e in runtime.events if e[0] in ("build", "forward")] == [
         ("build", 0, LARGE_CAPACITY),
         ("build", 0, 128),
         ("forward", 0, LARGE_CAPACITY),
@@ -389,16 +386,6 @@ def _events(runtime, kind):
     return [value for event, _, value in runtime.events if event == kind]
 
 
-def test_aiter_without_route_hints_keeps_the_staged_call(runtime):
-    runtime.run(_context(256))
-
-    assert all(
-        "large_m_state_slots" not in instance.kwargs and "routed" not in instance.kwargs
-        for instance in runtime.instances.values()
-    )
-    assert _events(runtime, "hint") == _events(runtime, "slot") == []
-
-
 @pytest.mark.parametrize(
     ("context", "rows", "hint"),
     [
@@ -420,14 +407,12 @@ def test_aiter_without_route_hints_keeps_the_staged_call(runtime):
     ],
 )
 def test_route_hint_is_the_dp_group_max_rows(runtime, context, rows, hint):
-    runtime.use_routed_aiter()
     runtime.run(context, rows=rows)
 
     assert _events(runtime, "hint") == [hint]
 
 
 def test_tbo_and_plugin_steps_take_no_route_hint(runtime, monkeypatch):
-    runtime.use_routed_aiter()
     runtime.tbo = True
     runtime.run(_context(64))
     runtime.tbo = False
@@ -438,7 +423,6 @@ def test_tbo_and_plugin_steps_take_no_route_hint(runtime, monkeypatch):
 
 
 def test_capture_hints_only_the_small_input_route(runtime):
-    runtime.use_routed_aiter()
     runtime.run(_context(256))
     runtime.capturing = True
     runtime.run(_context(SMALL_M_MTPR))
@@ -451,7 +435,6 @@ def test_capture_warmup_hints_like_the_capture(runtime):
     # The capture loop's warmup forward runs eagerly with in_hipgraph set; it
     # must take the capture's route, or the capture launches kernels the
     # warmup never compiled.
-    runtime.use_routed_aiter()
     runtime.forward_context.in_hipgraph = True
     runtime.run(_context(SMALL_M_MTPR))
     runtime.run(_context(SMALL_M_MTPR + 1))
@@ -471,16 +454,48 @@ def test_capture_warmup_hints_like_the_capture(runtime):
     ]
 
 
-def test_each_layer_selects_its_own_large_input_slot(runtime):
-    runtime.use_routed_aiter(layers=61)
-    layers = [_layer(value) for value in range(3)]
+def test_each_layer_selects_the_large_input_slot_of_its_layer_id(runtime):
+    # Target layers and the draft layers after them (MTP / DSpark number them
+    # num_hidden_layers + i) each own one slot, whatever order they first run in.
+    ids = (2, 0, N_LAYERS + N_MTP - 1, N_LAYERS, 1)
+    layers = [_layer(value, layer_id) for value, layer_id in enumerate(ids)]
     for layer in layers + layers:
         runtime.run(_context(512, running_tokens_are_unified=False), layer=layer)
     # The decode capacity has no large-input route and selects no slot.
-    runtime.run(_context(64), layer=layers[2])
+    runtime.run(_context(64), layer=layers[0])
 
     assert {
-        capacity: (instance.kwargs["routed"], instance.kwargs["large_m_state_slots"])
+        capacity: instance.large_m_state_slots
         for (_, capacity), instance in runtime.instances.items()
-    } == {LARGE_CAPACITY: (True, 69), 128: (True, 69)}
-    assert _events(runtime, "slot") == [0, 1, 2, 0, 1, 2]
+    } == {LARGE_CAPACITY: N_LAYERS + N_MTP, 128: N_LAYERS + N_MTP}
+    assert _events(runtime, "slot") == list(ids) * 2
+
+
+def test_a_config_without_draft_layers_sizes_the_slots_by_its_layers(runtime):
+    runtime.use_hf_config(num_hidden_layers=N_LAYERS)
+    runtime.run(_context(512, running_tokens_are_unified=False))
+
+    assert runtime.instances[0, LARGE_CAPACITY].large_m_state_slots == N_LAYERS
+
+
+@pytest.mark.parametrize(
+    ("context", "hint"),
+    [
+        # dp_size 1 never publishes a draft shape: the table still holds the
+        # target's rows, and the draft's own unified count is the bound.
+        (_context(6, is_draft=True, running_tokens_across_dp=(4096,)), 6),
+        (
+            _context(
+                6,
+                is_draft=True,
+                running_tokens_are_unified=False,
+                running_tokens_across_dp=(6, 18),
+            ),
+            18,
+        ),
+    ],
+)
+def test_draft_pass_hints_its_own_rows(runtime, context, hint):
+    runtime.run(context, layer=_layer(layer_id=N_LAYERS))
+
+    assert _events(runtime, "hint") == [hint]
