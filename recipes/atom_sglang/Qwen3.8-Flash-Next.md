@@ -209,34 +209,6 @@ python -m sglang.bench_serving --backend sglang --host 127.0.0.1 --port 30080 \
   --num-prompts 64 --max-concurrency 32 --request-rate inf
 ```
 
-## CI (MI308)
-
-The MI308 SGLang-ATOM nightlies cover the PTPC checkpoint
-[`sammysun0711/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16`](https://huggingface.co/sammysun0711/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16)
-(PTPC FP8 weights, BF16 PLE) with two cases:
-
-| Case | Speculative decoding | GSM8K gate |
-|---|---|---|
-| `MI308 Qwen3.8-Flash-Next-PTPC-FP8 TP2` | none | 0.9506 |
-| `MI308 Qwen3.8-Flash-Next-PTPC-FP8 TP2 MTP3` | EAGLE, 3 steps, top-k 1, 4 draft tokens | 0.9555 |
-
-* Server: TP2 without expert parallelism, BF16 KV, page size 64,
-  `--mem-fraction-static 0.95`,
-  `--max-running-requests 32`, `--chunked-prefill-size 16384`,
-  `--mamba-ssm-dtype float32`, radix cache off, no reasoning parser.
-* `AITER_MOE_PADDING_SIZE=64`. The commands above use 128.
-* The cases do not set SGLang's `--moe-runner-backend` or `--linear-attn-*`
-  backends. The plugin computes MoE and GDN in Native ATOM.
-* GSM8K: lm_eval on the first 200 examples (`lm_eval_limit`), 5-shot, chat
-  completions, greedy, up to 16384 generated tokens.
-* The GSM8K gates are 97% of the 0.98 (base) and 0.985 (MTP) references.
-* The MTP case has an acceptance gate of 0. The gate passes at any acceptance
-  rate, but fails if `/server_info` reports no speculative metrics.
-* Benchmark: one shape per case, 12000 input / 350 output tokens at
-  concurrency 1, 128 prompts, 10 warmups. The shape comes from the case's
-  `nightly_param_lists`. A manual run with `param_lists` overrides it.
-
-## Boundaries
 ## Boundaries
 
 - Use BF16 KV and page size 64. TP greater than 1 without EP is validated only
