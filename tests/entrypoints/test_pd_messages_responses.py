@@ -123,14 +123,7 @@ def _post(path, body):
 
 
 def _responses(body):
-    async def post():
-        transport = httpx.ASGITransport(app=api_server.app)
-        async with httpx.AsyncClient(
-            transport=transport, base_url="http://test"
-        ) as client:
-            return await client.post("/v1/responses", json=body)
-
-    return asyncio.run(post())
+    return _post("/v1/responses", body)
 
 
 class TestMessages:
@@ -342,6 +335,42 @@ class TestNotCut:
         assert reply.status_code == 400
         assert json.loads(reply.body)["error"]["message"] == (
             "prompt is too long: 8000 tokens > 4000 maximum"
+        )
+
+    def test_a_pool_larger_than_the_context_is_not_the_limit_reported(
+        self, server, monkeypatch
+    ):
+        # The pool is sized from free memory, so it is often larger than the
+        # context. A prompt past both is too long for the context, not the pool.
+        monkeypatch.setattr(api_server, "_get_engine_max_pool_tokens", lambda: 20000)
+        monkeypatch.setattr(
+            api_server.engine.io_processor,
+            "encode_prompt",
+            lambda _text, **_kw: [0] * 30000,
+        )
+        _admit(monkeypatch)
+        reply = _messages(max_tokens=16)
+        assert reply.status_code == 400
+        assert json.loads(reply.body)["error"]["message"] == (
+            "prompt is too long: 30000 tokens > 8191 maximum"
+        )
+
+    def test_a_smaller_pool_answers_before_the_default_output_clamp(
+        self, server, monkeypatch
+    ):
+        # max_tokens omitted and the prompt fills the context: the pool, the
+        # tighter limit, is what the client is told.
+        monkeypatch.setattr(api_server, "_get_engine_max_pool_tokens", lambda: 4000)
+        monkeypatch.setattr(
+            api_server.engine.io_processor,
+            "encode_prompt",
+            lambda _text, **_kw: [0] * MAX_CTX,
+        )
+        _admit(monkeypatch)
+        reply = _messages()
+        assert reply.status_code == 400
+        assert json.loads(reply.body)["error"]["message"] == (
+            f"prompt is too long: {MAX_CTX} tokens > 4000 maximum"
         )
 
     @staticmethod
