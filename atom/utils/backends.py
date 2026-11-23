@@ -575,13 +575,9 @@ class VllmBackend:
             # graph.
 
             factors = []
-            # 0. factors come from the env, for example, The values of
-            # VLLM_PP_LAYER_PARTITION will affect the computation graph.
-            # env_hash = envs.compute_hash()
-            # factors.append(env_hash)
-
             # 1. factors come from the vllm_config (it mainly summarizes how the
-            #    model is created)
+            #    model is created). This includes the env values that change the
+            #    graph, e.g. a PP stage's layer range from VLLM_PP_LAYER_PARTITION.
             config_hash = vllm_config.compute_hash()
             factors.append(config_hash)
 
