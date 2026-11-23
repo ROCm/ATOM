@@ -11,6 +11,7 @@ import torch
 
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.model_hooks import DecodeRound
+from atom.model_engine.round_stats import RoundStats
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_loader.weight_utils import local_model_dir
 from atom.model_ops.attentions.backends import (
@@ -270,6 +271,8 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
     # The model's decode round (`use_decode_round`), None for a model without
     # one.
     decode_round: DecodeRound | None = None
+    # Per-step tally of the round's routing decisions (`round_stats`).
+    _round_stats: RoundStats | None = None
 
     def use_decode_round(self, decode_round: DecodeRound) -> None:
         """Have a model's decode round (`model_hooks.DecodeRound`, from its
@@ -705,6 +708,12 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 image_rows=not token_mask.all(),
             )
         )
+        if decode_round is not None and not batch.is_dummy_run:
+            if self._round_stats is None:
+                self._round_stats = RoundStats()
+            self._round_stats.record(
+                is_prefill=is_prefill, requests=len(spans), service=service
+            )
         # The step's one upload, after everything below is staged into it.
         group = self._step_group("step_metadata")
         # Published in span order, including the private dummy slots used at
