@@ -220,7 +220,8 @@ The MI308 SGLang-ATOM nightlies cover the PTPC checkpoint
 | `MI308 Qwen3.8-Flash-Next-PTPC-FP8 TP2` | none | 0.9506 |
 | `MI308 Qwen3.8-Flash-Next-PTPC-FP8 TP2 MTP3` | EAGLE, 3 steps, top-k 1, 4 draft tokens | 0.9555 |
 
-* Server: TP2/EP2, BF16 KV, page size 64, `--mem-fraction-static 0.95`,
+* Server: TP2 without expert parallelism, BF16 KV, page size 64,
+  `--mem-fraction-static 0.95`,
   `--max-running-requests 32`, `--chunked-prefill-size 16384`,
   `--mamba-ssm-dtype float32`, radix cache off, no reasoning parser.
 * GSM8K: lm_eval on the first 200 examples (`lm_eval_limit`), 5-shot, chat

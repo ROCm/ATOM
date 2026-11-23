@@ -153,3 +153,78 @@ def test_accuracy_dropdowns_list_every_case():
     for key, models in (("model_mi355", all_mi355), ("model_mi308", all_mi308)):
         options = [o for o in inputs[key]["options"] if o not in ("none", "all")]
         assert sorted(options) == sorted(models), key
+
+
+def _benchmark_cells(models, params, manual_param_lists, tmp_path):
+    """Run the benchmark workflow's matrix builder; return {prefix: cells}."""
+    step = next(
+        s
+        for s in _workflow(BENCHMARK)["jobs"]["build-benchmark-matrix"]["steps"]
+        if s.get("id") == "build"
+    )
+    script = textwrap.dedent(step["run"].split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0])
+    output = tmp_path / "github_output"
+    subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,  # the builder writes sglang_benchmark_matrix.json to cwd
+        env={
+            **os.environ,
+            "MODELS_JSON": json.dumps(models),
+            "PARAMS_JSON": json.dumps(params),
+            "INPUT_PARAM_LISTS": manual_param_lists,
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    outputs = dict(
+        line.split("=", 1) for line in output.read_text().splitlines() if "=" in line
+    )
+    cells = {}
+    for key in ("benchmark_matrix_mi355", "benchmark_matrix_mi308"):
+        for row in json.loads(outputs[key])["include"]:
+            p = row["params"]
+            cells.setdefault(row["model"]["prefix"], []).append(
+                (p["input_length"], p["output_length"], p["concurrency"])
+            )
+    return cells
+
+
+def test_nightly_param_lists_replace_shared_params_for_that_model_only(tmp_path):
+    shared = [
+        {
+            "input_length": 1024,
+            "output_length": 1024,
+            "concurrency": c,
+            "random_range_ratio": 0.8,
+        }
+        for c in (4, 8)
+    ]
+    models = [
+        {
+            "prefix": "pinned-mi308",
+            "runner": "atom-mi308-8gpu-plugins-benchmark",
+            "nightly_param_lists": "12000,350,1,1.0",
+        },
+        {"prefix": "shared-mi308", "runner": "atom-mi308-8gpu-plugins-benchmark"},
+    ]
+
+    nightly = _benchmark_cells(models, shared, "", tmp_path)
+    assert nightly == {
+        "pinned-mi308": [(12000, 350, 1)],
+        "shared-mi308": [(1024, 1024, 4), (1024, 1024, 8)],
+    }
+
+    # A manual param_lists input wins over the model's own lists.
+    manual = _benchmark_cells(
+        models, shared, "1024,1024,4,0.8;1024,1024,8,0.8", tmp_path
+    )
+    assert (
+        manual["pinned-mi308"]
+        == manual["shared-mi308"]
+        == [
+            (1024, 1024, 4),
+            (1024, 1024, 8),
+        ]
+    )

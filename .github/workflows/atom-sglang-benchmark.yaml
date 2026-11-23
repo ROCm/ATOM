@@ -64,6 +64,10 @@ on:
           - MI308 Qwen3.8-Flash-Next-FP8 TP2
           - MI308 Qwen3.8-Flash-Next-PTPC-FP8 TP2
           - MI308 Qwen3.8-Flash-Next-PTPC-FP8 TP2 MTP3
+          - MI308 Qwen3.5-35B-A3B-PTPC-FP8 TP4
+          - MI308 Qwen3.5-35B-A3B-PTPC-FP8 TP1 DFlash
+          - MI308 Qwen3.5-397B-A17B-PTPC-FP8 TP8
+          - MI308 Qwen3.5-397B-A17B-PTPC-FP8 TP8 DFlash
           - MI308 DeepSeek-V4-Flash
       docker_image:
         description: "Optional Docker image override."
@@ -687,6 +691,10 @@ jobs:
               "MI308 Qwen3.8-Flash-Next-FP8 TP2": "qwen3-8-flash-next-fp8-tp2-mi308",
               "MI308 Qwen3.8-Flash-Next-PTPC-FP8 TP2": "qwen3-8-flash-next-ptpc-fp8-tp2-mi308",
               "MI308 Qwen3.8-Flash-Next-PTPC-FP8 TP2 MTP3": "qwen3-8-flash-next-ptpc-fp8-tp2-mtp3-mi308",
+              "MI308 Qwen3.5-35B-A3B-PTPC-FP8 TP4": "qwen3-5-35b-a3b-ptpc-fp8-tp4-mi308",
+              "MI308 Qwen3.5-35B-A3B-PTPC-FP8 TP1 DFlash": "qwen3-5-35b-a3b-ptpc-fp8-tp1-dflash-mi308",
+              "MI308 Qwen3.5-397B-A17B-PTPC-FP8 TP8": "qwen3-5-397b-a17b-ptpc-fp8-tp8-mi308",
+              "MI308 Qwen3.5-397B-A17B-PTPC-FP8 TP8 DFlash": "qwen3-5-397b-a17b-ptpc-fp8-tp8-dflash-mi308",
               "MI308 DeepSeek-V4-Flash": "deepseek-v4-flash-fp8-mi308",
           }
 
