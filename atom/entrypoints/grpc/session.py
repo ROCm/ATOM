@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""The Session RPC's state: each Session's seq ids in a window of their own, and per
+"""The Session RPC's state: each Session's engine ids in a window of their own, and per
 engine step one StreamBatch per Session, then an id-free item per request it ended."""
 
 import asyncio
@@ -10,14 +10,17 @@ from collections import deque
 from dataclasses import dataclass, replace
 
 from atom.entrypoints.grpc import frames
-from atom.entrypoints.openai.frontend_workers import worker_seq_id_base
+from atom.entrypoints.openai.frontend_workers import worker_seq_id_base, worker_seq_ids
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.zmq_protocol import engine_v1_pb2 as v1
 
 logger = logging.getLogger("atom")
 
 SEQ_IDS = worker_seq_id_base(0)  # a window's size: a client's seq ids lie below it
-WINDOWS = 127  # window k holds worker_seq_id_base(k) | seq_id; 127 stay inside int32
+WINDOWS = 127  # window k's engine ids are worker_seq_ids(k)'s; 127 stay inside int32
+# Messages a client may leave unread; one more fails its Session, which bounds the
+# memory a client that stops reading holds in the API process.
+OUTBOX = 4096
 STRUCTURED_ERROR = "structured_output_error"  # a grammar failure's finish reason
 STRUCTURED_FAILED = "Structured decoding failed for this request"  # HTTP chat's 500
 
@@ -35,6 +38,9 @@ class Sessions:
     def __init__(self, api):
         self.api = api
         self.free = deque(range(WINDOWS))
+        # Kept across a window's Sessions: an engine id returns only after 2^24 newer
+        # requests, by when CoreManager has long forgotten it, as for HTTP's ids.
+        self.engine_ids = [worker_seq_ids(window) for window in range(WINDOWS)]
 
     def open(self) -> "Session | None":
         """A Session in the next free window; None while every window is held."""
@@ -47,24 +53,33 @@ class Session:
 
     def __init__(self, sessions: Sessions, window: int):
         self.sessions, self.api = sessions, sessions.api
-        self.window, self.base = window, worker_seq_id_base(window)
+        self.window, self.engine_ids = window, sessions.engine_ids[window]
         self.requests: dict[int, _Request] = {}
+        self.client_ids: dict[int, int] = {}  # by engine id, each request's seq_id
         self.preparing = 0  # submissions in preprocess: each holds the window too
         self.pending: list[RequestOutput] = []  # the step being delivered
         self.put = self.pending.append  # where each output goes as a step is delivered
         self.outbox: asyncio.Queue = asyncio.Queue()  # message frames; None ends them
         self.open = True
+        self.failed: str | None = None  # why the Session failed its client's call
+        self.reader: asyncio.Task | None = None  # admits the client's messages
 
     def seq_id(self, client_id: int) -> int:
-        """The engine's id for `client_id`, which is below SEQ_IDS and not in flight."""
+        """A new engine id for `client_id`, which is below SEQ_IDS and not in flight."""
         if client_id >= SEQ_IDS:
             raise ValueError(f"seq_id {client_id} is not below {SEQ_IDS}")
         if client_id in self.requests:
             raise ValueError(f"seq_id {client_id} is already in flight")
-        return self.base | client_id
+        return next(self.engine_ids)
 
     def add(self, client_id: int, seq, external_request_id: str | None) -> None:
         self.requests[client_id] = _Request(seq, external_request_id)
+        self.client_ids[seq.id] = client_id
+
+    def _pop(self, client_id: int) -> _Request:
+        request = self.requests.pop(client_id)
+        del self.client_ids[request.seq.id]
+        return request
 
     def abandon(self, preprocessing: asyncio.Future) -> None:
         """A submission ended before `add`: the seq its preprocess made is dropped,
@@ -75,14 +90,14 @@ class Session:
         self._release()
 
     def drop(self, client_id: int) -> None:
-        """Forgets a request whose submission failed."""
-        request = self.requests.pop(client_id)
+        """Forgets a request whose submission failed before it reached the engine."""
+        request = self._pop(client_id)
         self.api.engine.io_processor.requests.pop(request.seq.id, None)
         self._release()
 
     def reject(self, refused: list[frames.Rejection]) -> None:
         if refused and self.open:
-            self.outbox.put_nowait(frames.encode_rejected(refused))
+            self.send(frames.encode_rejected(refused))
 
     def abort(self, client_ids) -> None:
         """Aborts those in flight as a dropped HTTP stream is aborted; each still ends
@@ -94,22 +109,40 @@ class Session:
 
     def close(self) -> None:
         """The call has ended: every request in flight is aborted."""
-        self.open = False
-        self.abort(list(self.requests))
+        if self.open:
+            self.open = False
+            self.abort(list(self.requests))
         self._release()
+
+    def send(self, message: list[bytes]) -> None:
+        """Queues `message` for the client; past OUTBOX unread ones, the Session fails
+        instead: its messages dropped, its requests aborted, its call ended."""
+        if not self.open:
+            return
+        if self.outbox.qsize() < OUTBOX:
+            self.outbox.put_nowait(message)
+            return
+        self.failed = f"the client left {OUTBOX} Session messages unread"
+        logger.error("Session window %s: %s", self.window, self.failed)
+        while not self.outbox.empty():
+            self.outbox.get_nowait()
+        self.close()
+        if self.reader is not None:  # admits nothing after close() aborted what it held
+            self.reader.cancel()
+        self.outbox.put_nowait(None)
 
     def flush(self) -> None:
         """The step's outputs: one StreamBatch of those carrying ids, then a Completions
         item, or a Rejected one, for each request the step ended."""
         pending = self.pending[:]
         self.pending.clear()  # the list `put` appends to
-        requests, base, now = self.requests, self.base, time.time()
+        requests, now = self.requests, time.time()
         entries, done = [], []
         for output in pending:
-            client_id = output.request_id - base  # the engine's id is base | client id
-            request = requests.get(client_id)
-            if request is None:  # dropped when its submission failed
+            client_id = self.client_ids.get(output.request_id)
+            if client_id is None:  # dropped when its submission failed
                 continue
+            request = requests[client_id]
             if output.output_tokens:
                 if not request.first_token_time:
                     request.first_token_time = now
@@ -120,7 +153,7 @@ class Session:
             if output.finished:
                 done.append(_completion(client_id, request, output, now))
         if self.open and entries:
-            self.outbox.put_nowait(frames.encode_stream(entries))
+            self.send(frames.encode_stream(entries))
         failed = [c for c in done if c.leave_reason == STRUCTURED_ERROR]
         completed = [c for c in done if c.leave_reason != STRUCTURED_ERROR]
         if self.open and failed:  # HTTP chat answers a grammar failure with a 500
@@ -128,15 +161,15 @@ class Session:
             refused = [
                 frames.Rejection(c.seq_id, STRUCTURED_FAILED, code) for c in failed
             ]
-            self.outbox.put_nowait(frames.encode_rejected(refused))
+            self.send(frames.encode_rejected(refused))
         if self.open and completed:
             try:
-                self.outbox.put_nowait(frames.encode_completions(completed))
+                self.send(frames.encode_completions(completed))
             except TypeError:  # kv_transfer_params engine_v1 cannot carry
                 for completion in completed:
-                    self.outbox.put_nowait(_completed_or_rejected(completion))
+                    self.send(_completed_or_rejected(completion))
         for completion in done:
-            request = self.requests.pop(completion.seq_id)
+            request = self._pop(completion.seq_id)
             self.api.cleanup_stream(request.seq.id)
         self._release()
 

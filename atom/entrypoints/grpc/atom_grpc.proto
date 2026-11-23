@@ -19,7 +19,10 @@ service AtomEngine {
   rpc GetModelInfo(GetModelInfoRequest) returns (GetModelInfoResponse);
   rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
   rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
-  // Many requests on one stream: each Frames is one engine_v1 message.
+  // Many requests on one stream: each Frames is one engine_v1 message. A client's
+  // seq_ids lie below 2^24, 1 << _SEQ_ID_SHIFT (frontend_workers.py), which SEQ_IDS
+  // in atom/mesh/src/routers/grpc/engine/atom/session.rs must equal. A client that
+  // leaves 4096 messages unread ends its Session with RESOURCE_EXHAUSTED.
   rpc Session(stream Frames) returns (stream Frames);
   // The structured-output fields of a chat sent over the Session, derived as the
   // HTTP chat route derives them; the request's SamplingParams takes them.
@@ -46,6 +49,11 @@ message GenerateRequest {
   optional int32 data_parallel_rank = 6;
   bool stream = 7;
   StructuredOutput structured_output = 8;  // absent: no chat-level input, as on /v1/completions
+  // Session affinity, as the HTTP routes read it from x-dynamo-session-id,
+  // x-session-id or x-correlation-id, and x-dynamo-parent-session-id; the engine
+  // reads them only under ATOM_DP_SESSION_AFFINITY.
+  optional string dp_session_id = 9;
+  optional string dp_parent_session_id = 10;
 }
 
 // What ATOM's HTTP chat route derives a chat request's structured output from,
@@ -85,6 +93,15 @@ message GenerateComplete {
   uint32 completion_tokens = 4;
   uint32 cached_tokens = 5;
   optional string kv_transfer_params_json = 6;  // the engine's output kv_transfer_params
+  // In seconds, as the HTTP usage reports them: from Generate's arrival to the
+  // first output id and to this complete, and per output id after the first.
+  double ttft_s = 7;
+  double tpot_s = 8;
+  double latency_s = 9;
+  // Which sibling this answers, below the request's n. An n above 1 that greedy
+  // sampling leaves standing (it collapses to 1, as on HTTP) is served unstreamed
+  // and without kv_transfer_params: one complete per sibling, as each ends.
+  uint32 index = 10;
 }
 
 message GenerateError {
@@ -113,6 +130,10 @@ message GetModelInfoResponse {
   // A rendered prompt ending in one of these, trailing whitespace aside, opens
   // a reasoning channel.
   repeated string reasoning_open_markers = 8;
+  // atomesh's parsers for this model's tool-call and reasoning formats, named by
+  // server.py's router_parser_names; absent: atomesh's model-name mapping chooses.
+  optional string tool_call_parser = 9;
+  optional string reasoning_parser = 10;
 }
 
 message GetServerInfoRequest {}
