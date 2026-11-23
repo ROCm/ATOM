@@ -203,9 +203,6 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Release one reservation taken by [`Self::charge_decode_load`].
     fn release_decode_load(&self, _tokens: Option<usize>) {}
 
-    /// Add generated tokens to an existing token reservation.
-    fn add_decode_kv_tokens(&self, _tokens: usize) {}
-
     /// Get the worker routing key load tracker
     fn worker_routing_key_load(&self) -> &WorkerRoutingKeyLoad;
 
@@ -712,7 +709,10 @@ impl Worker for BasicWorker {
     fn charge_decode_load(&self, tokens: Option<usize>) {
         self.increment_load();
         match tokens {
-            Some(tokens) => self.add_decode_kv_tokens(tokens),
+            Some(tokens) => {
+                let previous = self.decode_kv_counter.fetch_add(tokens, Ordering::Relaxed);
+                MeshMetrics::set_worker_decode_kv_tokens(self.url(), previous + tokens);
+            }
             None => {
                 self.decode_untokenized_counter
                     .fetch_add(1, Ordering::Relaxed);
@@ -758,14 +758,6 @@ impl Worker for BasicWorker {
                 }
             }
         }
-    }
-
-    fn add_decode_kv_tokens(&self, tokens: usize) {
-        if tokens == 0 {
-            return;
-        }
-        let previous = self.decode_kv_counter.fetch_add(tokens, Ordering::Relaxed);
-        MeshMetrics::set_worker_decode_kv_tokens(self.url(), previous + tokens);
     }
 
     fn reset_load(&self) {
@@ -1015,10 +1007,6 @@ impl Worker for DPAwareWorker {
         self.base_worker.release_decode_load(tokens);
     }
 
-    fn add_decode_kv_tokens(&self, tokens: usize) {
-        self.base_worker.add_decode_kv_tokens(tokens);
-    }
-
     fn worker_routing_key_load(&self) -> &WorkerRoutingKeyLoad {
         self.base_worker.worker_routing_key_load()
     }
@@ -1151,10 +1139,7 @@ pub struct WorkerLoadGuard {
     worker: Arc<dyn Worker>,
     prefill_tokens: usize,
     decode_charge: DecodeCharge,
-    generated_seen: usize,
     owns_load: bool,
-    /// Reassembles SSE so a usage frame split across chunks is still read.
-    frames: crate::observability::ttft::SseFrames,
 }
 
 impl WorkerLoadGuard {
@@ -1164,9 +1149,7 @@ impl WorkerLoadGuard {
             worker,
             prefill_tokens: 0,
             decode_charge: DecodeCharge::None,
-            generated_seen: 0,
             owns_load: true,
-            frames: crate::observability::ttft::SseFrames::default(),
         }
     }
 
@@ -1180,35 +1163,7 @@ impl WorkerLoadGuard {
                 Some(tokens) => DecodeCharge::Tokens(tokens),
                 None => DecodeCharge::Untokenized,
             },
-            generated_seen: 0,
             owns_load: false,
-            frames: crate::observability::ttft::SseFrames::default(),
-        }
-    }
-
-    /// Add newly reported completion tokens to a token reservation.
-    ///
-    /// `completion_tokens` in a usage frame is cumulative. Repeated values add nothing.
-    /// Text inside `choices` is not a usage frame, so a matching string there adds nothing.
-    pub fn observe_output_chunk(&mut self, chunk: &[u8]) {
-        let DecodeCharge::Tokens(charged) = &mut self.decode_charge else {
-            return;
-        };
-        self.frames.append(chunk);
-        let mut latest = None;
-        while let Some(frame) = self.frames.next_frame() {
-            if let Some(tokens) = completion_tokens_in_frame(frame) {
-                latest = Some(latest.map_or(tokens, |previous: usize| previous.max(tokens)));
-            }
-        }
-        let Some(latest) = latest else {
-            return;
-        };
-        if latest > self.generated_seen {
-            let delta = latest - self.generated_seen;
-            self.generated_seen = latest;
-            self.worker.add_decode_kv_tokens(delta);
-            *charged = charged.saturating_add(delta);
         }
     }
 
@@ -1246,30 +1201,6 @@ impl Drop for WorkerLoadGuard {
             self.owns_load = false;
         }
     }
-}
-
-/// `completion_tokens` or `output_tokens` on this SSE event's usage object.
-///
-/// The number has to be a field of `usage` (or `meta_info`, or a nested
-/// response/message usage). The same text inside generated content does not
-/// count, and `completion_tokens_details` is not the count.
-fn completion_tokens_in_frame(frame: &[u8]) -> Option<usize> {
-    let data = crate::observability::ttft::sse_data(frame)?;
-    if data == "[DONE]" {
-        return None;
-    }
-    let payload: serde_json::Value = serde_json::from_str(&data).ok()?;
-    let usage = ["usage", "meta_info"]
-        .iter()
-        .find_map(|key| payload.get(*key))
-        .or_else(|| payload.pointer("/response/usage"))
-        .or_else(|| payload.pointer("/message/usage"))
-        .filter(|usage| usage.is_object())?;
-    usage
-        .get("completion_tokens")
-        .or_else(|| usage.get("output_tokens"))
-        .and_then(serde_json::Value::as_u64)
-        .map(|tokens| tokens as usize)
 }
 
 /// Body wrapper that holds an attached value.
@@ -2198,31 +2129,6 @@ mod tests {
         assert_eq!((worker.load(), worker.decode_kv_tokens()), (1, 8));
         let guard = WorkerLoadGuard::adopt(reservation);
         assert_eq!((worker.load(), worker.decode_kv_tokens()), (1, 8));
-        drop(guard);
-        assert_eq!((worker.load(), worker.decode_kv_tokens()), (0, 0));
-    }
-
-    #[test]
-    fn observe_output_chunk_adds_usage_completion_tokens_only() {
-        let worker = decode_worker();
-        let mut guard = WorkerLoadGuard::adopt(LoadReservation::charge(worker.clone(), Some(8)));
-        let content = concat!(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"\\\"completion_tokens\\\": 1000\"}}]}\n\n",
-            "data: {\"usage\":{\"prompt_tokens\":8,\"completion_tokens_details\":{\"reasoning_tokens\":2}}}\n\n",
-        );
-        guard.observe_output_chunk(content.as_bytes());
-        assert_eq!(worker.decode_kv_tokens(), 8);
-
-        let first = b"data: {\"usage\":{\"prompt_tokens\":8,\"comp";
-        let second = b"letion_tokens\":3}}\n\n";
-        guard.observe_output_chunk(first);
-        assert_eq!(worker.decode_kv_tokens(), 8);
-        guard.observe_output_chunk(second);
-        assert_eq!(worker.decode_kv_tokens(), 11);
-        guard.observe_output_chunk(
-            b"data: {\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":3}}\n\n",
-        );
-        assert_eq!(worker.decode_kv_tokens(), 11);
         drop(guard);
         assert_eq!((worker.load(), worker.decode_kv_tokens()), (0, 0));
     }

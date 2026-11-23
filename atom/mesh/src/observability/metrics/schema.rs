@@ -439,7 +439,7 @@ pub const METRIC_INVENTORY: &[MetricSpec] = &[
     MetricSpec {
         name: names::WORKER_DECODE_KV_TOKENS,
         kind: MetricKind::Gauge,
-        help: "KV tokens reserved on a worker (url@rank) from selection until its decode response finishes: prompt tokens, plus completion tokens from the usage frames of streaming HTTP PD responses",
+        help: "Prompt tokens reserved on a worker (url@rank) from selection until its decode response finishes",
         status: MetricStatus::Active,
     },
     MetricSpec {

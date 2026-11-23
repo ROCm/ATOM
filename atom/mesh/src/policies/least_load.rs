@@ -1,10 +1,12 @@
 //! `least_load`: place a request on the worker (`url@rank`) with the lowest
 //! outstanding decode cost.
 //!
-//! The cost is the KV already reserved on that worker plus one request-equivalent,
-//! the same 512-token weight the engine's `least_tokens` balancer uses. The
-//! reservation is taken inside the selection, before the lock is released, so a
-//! request still in prefill or waiting on decode is visible to the next choice.
+//! The cost is the prompt tokens reserved on that worker plus one request-equivalent
+//! per in-flight request, the same 512-token weight the engine's `least_tokens`
+//! balancer uses. Generated tokens are not counted: ATOM reports `usage` only on a
+//! stream's last frame. The reservation is taken inside the selection, before the
+//! lock is released, so a request still in prefill or waiting on decode is visible
+//! to the next choice.
 
 use std::{
     collections::HashMap,
