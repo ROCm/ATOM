@@ -1556,6 +1556,33 @@ mod h_prepare_chat_generate {
         assert_eq!(status, Some(http::StatusCode::NOT_IMPLEMENTED));
     }
 
+    /// While the model's tokenizer still carries a replaced ATOM worker's template, the
+    /// live worker's chats are refused with a 503; once it carries the live one, not.
+    #[test]
+    fn test_a_chat_waits_for_its_atom_workers_template_to_be_loaded() {
+        use crate::core::{BasicWorkerBuilder, RuntimeType};
+
+        let registry = test_mocks::tokenizer_registry_with("m");
+        let components = test_mocks::app_context_with_tokenizer_registry(registry.clone());
+        let worker = BasicWorkerBuilder::new("grpc://atom:2")
+            .runtime_type(RuntimeType::Atom)
+            .model_id("m")
+            .label("chat_template", "new")
+            .build();
+        components.worker_registry.register(Arc::new(worker));
+        let loaded = registry.get_by_name("m").unwrap().id;
+        let templates = &components.tokenizer_inline_templates;
+        templates.write().insert(loaded.clone(), "old".into());
+
+        let refused = || {
+            let chat = prepare_chat(chat_req(false), None, Some("m".into()), &components);
+            chat.err().map(|refused| refused.status())
+        };
+        assert_eq!(refused(), Some(http::StatusCode::SERVICE_UNAVAILABLE));
+        templates.write().insert(loaded, "new".into());
+        assert_ne!(refused(), Some(http::StatusCode::SERVICE_UNAVAILABLE));
+    }
+
     #[test]
     fn test_prepare_generate_request_ids_unique_per_call() {
         let registry = test_mocks::tokenizer_registry_with("m");

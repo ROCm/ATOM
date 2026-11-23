@@ -31,7 +31,8 @@ pub(crate) mod tool_constraints;
 mod tests;
 
 use chat_template::{
-    atom_chat_render_gap, default_template_kwargs, process_chat_messages_with_defaults,
+    atom_chat_render_gap, atom_template_not_loaded, default_template_kwargs,
+    process_chat_messages_with_defaults,
 };
 use generation_payload::{GenerationPayload, LogprobConfig, SamplingParams, StopConfig};
 use response_context::{ProtocolRequest, ResponseContext};
@@ -86,15 +87,17 @@ pub fn prepare_chat(
     })?;
     let workers = components.worker_registry.get_by_model(model_id_str);
     let configured_template = components.router_config.chat_template.is_some();
-    // The entry and its mark read under one lock, which a swap takes to forget the
-    // replaced entry's mark.
-    let (entry, built_in_encoder) = {
+    // The entry, its mark and its worker template read under one lock, which a swap
+    // takes to forget the replaced entry's.
+    let (entry, built_in_encoder, loaded_template) = {
         let marked = components.chats_without_template.read();
         let entry = tokenizer_entry(model_id_str, components);
         let built_in = entry
             .as_ref()
             .is_some_and(|entry| marked.contains(&entry.id));
-        (entry, built_in)
+        let templates = components.tokenizer_inline_templates.read();
+        let loaded = entry.as_ref().and_then(|e| templates.get(&e.id).cloned());
+        (entry, built_in, loaded)
     };
     if let Some(gap) = atom_chat_render_gap(&workers, configured_template, built_in_encoder) {
         return Err(error::not_implemented(
@@ -102,6 +105,17 @@ pub fn prepare_chat(
             format!(
                 "Chats for model {model_id_str} are not served over gRPC: {gap}. Route its \
                  chats to ATOM over HTTP; completions are served over gRPC."
+            ),
+        ));
+    }
+    let loaded = loaded_template.as_deref();
+    if let Some(worker) = atom_template_not_loaded(&workers, configured_template, loaded) {
+        return Err(error::service_unavailable(
+            "chat_template_loading",
+            format!(
+                "The tokenizer of model {model_id_str} is not yet loaded with the chat \
+                 template of its ATOM worker {}; retry later.",
+                worker.url()
             ),
         ));
     }

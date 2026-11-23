@@ -427,11 +427,19 @@ async fn a_later_worker_s_template_replaces_the_loaded_one() {
             .await
             .unwrap();
         let expected = format!("{template}: hi");
+        // Until the tokenizer is loaded with the new worker's template, its chats get 503.
         let rendered = async {
             loop {
-                let rendered = render(&ctx, "atom-retemplate", Value::Null).await;
-                if rendered == expected {
-                    break;
+                let body = json!({"model": "atom-retemplate",
+                    "messages": [{"role": "user", "content": "hi"}]});
+                let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+                let model = Some("atom-retemplate".into());
+                match prepare_chat(Arc::new(request), None, model, &ctx) {
+                    Ok((_, resp)) if resp.original_text.as_deref() == Some(&expected) => break,
+                    Err(refused) => {
+                        assert_eq!(refused.status(), http::StatusCode::SERVICE_UNAVAILABLE)
+                    }
+                    Ok(_) => {}
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
