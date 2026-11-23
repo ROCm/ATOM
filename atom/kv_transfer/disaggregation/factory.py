@@ -98,6 +98,10 @@ class KVConnectorFactory:
     # Whether a backend is a KV offload tier, whose scheduler half rewrites the
     # completion sets it is handed (`process_completions`). Absent means no.
     _offload: ClassVar[dict[str, bool]] = {}
+    # Whether a backend stores and restores a PAGE checkpoint image, the
+    # per-request state behind a hybrid's pages. Absent means no: a model
+    # whose state rides that image refuses it.
+    _reads_page_images: ClassVar[dict[str, bool]] = {}
     _min_load_tokens: ClassVar[dict[str, int | None]] = {}
     # Whether a backend's tier is one store every DP rank reads (an LMCache MP
     # server, Mooncake Store), not one per rank. Absent means per rank.
@@ -121,6 +125,7 @@ class KVConnectorFactory:
         copies_whole_block_regions: bool = False,
         requires_pd_staging: bool = True,
         offload: bool = False,
+        reads_page_images: bool = False,
         min_load_tokens: int | None = None,
         shared_tier: bool = False,
         chunk_tokens: str | None = None,
@@ -136,6 +141,8 @@ class KVConnectorFactory:
             scheduler_class: Class name within *scheduler_module*.
             offload: The backend is a KV offload tier; a ``multi`` runs at most
                 one (`is_offload_backend`).
+            reads_page_images: The backend carries PAGE checkpoint images
+                (`reads_page_images`).
             min_load_tokens: This tier's own default for the smallest hit worth
                 loading (`resolve_min_load_tokens`); None keeps the global
                 default.
@@ -178,6 +185,7 @@ class KVConnectorFactory:
             )
         cls._copies_whole_block_regions[name] = bool(copies_whole_block_regions)
         cls._offload[name] = bool(offload)
+        cls._reads_page_images[name] = bool(reads_page_images)
         cls._min_load_tokens[name] = min_load_tokens
         cls._shared_tier[name] = bool(shared_tier)
         cls._lowers_hbm_hit_to_chunk[name] = bool(lowers_hbm_hit_to_chunk)
@@ -209,6 +217,13 @@ class KVConnectorFactory:
         """Whether the registered backend ``name`` (canonical) is an offload tier."""
 
         return cls._offload.get(name, False)
+
+    @classmethod
+    def reads_page_images(cls, name: str) -> bool:
+        """Whether the registered backend ``name`` (canonical) carries PAGE
+        checkpoint images."""
+
+        return cls._reads_page_images.get(name, False)
 
     @classmethod
     def shared_offload_connectors(cls) -> frozenset[str]:

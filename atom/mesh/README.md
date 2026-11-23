@@ -289,6 +289,53 @@ chat template, such as DeepSeek V3.2 and V4
 ([#3377](https://github.com/ROCm/ATOM/issues/3377)). Use a policy that does not
 need tokens, such as `cache_aware` or `round_robin`, for these models and APIs.
 
+## Tokenization
+
+The router tokenizes requests with their model's HuggingFace tokenizer, or with
+[fastokens](https://github.com/crusoecloud/fastokens) for the models listed in
+`--fastokens-models`, by the name or source their tokenizer registers under, or
+`*` for every model. fastokens encodes a `tokenizer.json` BPE faster than
+HuggingFace `tokenizers`, and splits a long text between special tokens across
+a pool of its own threads (one per logical core up to 32;
+`FASTOKENS_BPE_THREADS` sets the number). Decoding, chat templates and vocabulary lookups stay with the
+HuggingFace tokenizer.
+
+A model encodes with fastokens only if fastokens encodes a set of probe texts
+exactly as its HuggingFace tokenizer does, with special tokens and without. The
+probe covers added tokens, digits, whitespace, several scripts, a chat, a 1 MiB
+text and a 256 KiB one with no newline. A model that fails the probe keeps
+HuggingFace, with a warning, or under `--fastokens-strict` its tokenizer fails
+to register, with no retries. A `tokenizer.json` that fastokens cannot find or
+download fails no probe: the model keeps HuggingFace, with a warning, or under
+`--fastokens-strict` its registration fails and is retried.
+
+fastokens loads `tokenizer.json` alone, as HuggingFace `tokenizers` does, so
+both encode the tokens only `tokenizer_config.json` declares (Qwen3.5's audio
+tokens, for one) as text, where `transformers`, and so the engine, encodes them
+as tokens. With gRPC workers the router sends
+the ids it encodes as the prompt, so the model runs on fastokens' ids, not only
+routes by them. `mesh_fastokens_tokenizers_total{outcome}` counts tokenizers as
+`loaded`, `fallback` or `refused`.
+
+The prompts of these models tokenize up to `--fastokens-max-tokenize-bytes`
+(default: the larger of 64 MiB and the other models' limit), and so do their
+`/v1/tokenize` batches. `--fastokens-segment-cache-mb` sizes
+fastokens' cache of the ids of the text between special tokens, per tokenizer
+(default: 1024; 0 turns it off). An agent re-sends its history with each
+request, and the cache keeps the router from encoding it again. It replaces
+`--tokenizer-cache-*`, which does not apply to these models.
+
+`test_requests_tokenize_as_on_atom` checks that requests tokenize for routing as
+on ATOM, with either backend, and times encoding. `scripts/atom_token_parity.py`
+tokenizes a set of requests, or recorded ones, with ATOM's own chat and
+completion endpoints, in process and without a GPU, and the test compares the
+router's tokens with those, in the file `$ATOM_TOKEN_PARITY` names, so it runs
+only when asked for. CI's mesh unit tests run the two for a DeepSeek-V4.1-Flash
+revision, whose tokenizer files and chat encoder the script downloads from
+HuggingFace, or `$HF_ENDPOINT`, and the test with
+`cargo test --lib -- --ignored routers::ingress::token_parity`. The script's
+docstring shows how to run them for another checkpoint.
+
 ## Reliability
 
 - **Request preparation**: Parsing, template rendering and tokenization use a fixed
@@ -304,7 +351,9 @@ need tokens, such as `cache_aware` or `round_robin`, for these models and APIs.
   `--prepare-queue-timeout-ms` deadline (default: 250 ms); canceled waiters release
   their slot immediately. All request parsing runs on this pool. Each request's
   preparation shares one `--prepare-timeout-ms` deadline (default: 5000 ms), and
-  tokenization input is limited by `--prepare-max-tokenize-bytes` (default: 1 MiB).
+  tokenization input is limited by `--prepare-max-tokenize-bytes` (default: 1 MiB),
+  or for the models fastokens encodes by `--fastokens-max-tokenize-bytes`
+  (default: the larger of that limit and 64 MiB).
   When ext-proc is enabled, the legacy `--ext-proc-parser-concurrency` and
   `--ext-proc-max-tokenize-bytes` options apply only if the corresponding
   `--prepare-*` option is unset; neither has a default of its own. On shutdown,
@@ -340,6 +389,7 @@ changing worker metric names.
 | Routing | `mesh_route_*`, `mesh_session_*` | Policy decisions, session worker changes, engine-reported cached tokens against the router estimate |
 | Circuit breaker | `mesh_worker_cb_*` | State, transitions, outcomes |
 | Retry | `mesh_worker_retries_*` | Attempts, exhaustion, backoff |
+| Tokenization | `mesh_fastokens_*` | Tokenizers that encode with fastokens, keep HuggingFace or fail to register |
 
 [Routing metrics](docs/metrics.md) covers each routing metric's labels, the
 policies and branches that record it, how to read the values, and example
