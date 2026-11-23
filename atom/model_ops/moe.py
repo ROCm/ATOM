@@ -58,6 +58,8 @@ from atom.model_ops.fused_moe.expert_layout import (
     expert_shard_dim,
     expert_shard_view,
     physical_expert_id,
+    zero_pad_tail,
+    zero_unpacked_expert_padding,
 )
 from atom.model_ops.fused_moe.modular_kernel import (
     FusedMoEModularKernel,
@@ -880,6 +882,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
 
         layer.w13_weight = atom_parameter(self._maybe_pad_weight(layer.w13_weight.data))
         layer.w2_weight = atom_parameter(self._maybe_pad_weight(layer.w2_weight.data))
+        # Dummy initialization bypasses the loaders and fills the padding too.
+        zero_unpacked_expert_padding(
+            layer.w13_weight.data,
+            layer.w2_weight.data,
+            layer.intermediate_size_per_partition,
+        )
         # reshaping weights is required for aiter moe kernel.
         shuffle_weights(layer.w13_weight, layer.w2_weight)
 
@@ -2887,6 +2895,13 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Post-process weights after loading from checkpoint."""
+        if self.per_channel:
+            zero_unpacked_expert_padding(
+                layer.w13_weight.data,
+                layer.w2_weight.data,
+                layer.intermediate_size_per_partition,
+                layer.w13_weight_scale.data,
+            )
         # Get references to weights and scales
         w13 = layer.w13_weight
         w2 = layer.w2_weight
@@ -4702,6 +4717,7 @@ class FusedMoE(torch.nn.Module):
             expert_data = expert_shard_view(expert_data, shard_id, shard_dim)
             load_size = loaded_weight.shape[shard_dim]
             if load_size != expert_shard_size:
+                zero_pad_tail(expert_data, shard_dim, load_size)
                 expert_data = expert_data.narrow(shard_dim, 0, load_size)
             self._copy_quant_storage(expert_data, loaded_weight)
             return
@@ -4719,8 +4735,10 @@ class FusedMoE(torch.nn.Module):
         # weight of w13, w3 (up_proj) into the second.
         expert_data = expert_shard_view(expert_data, shard_id, shard_dim)
         # When expert_data is padded beyond the actual weight size, narrow to
-        # the loaded weight size so the copy shape matches.
+        # the loaded weight size so the copy shape matches. Restore the tail
+        # on every write: resume/sync can replace the initially zeroed storage.
         if load_shard_size != expert_shard_size:
+            zero_pad_tail(expert_data, shard_dim, load_shard_size)
             expert_data = expert_data.narrow(shard_dim, 0, load_shard_size)
         self._copy_quant_storage(expert_data, loaded_weight)
 
@@ -4737,6 +4755,7 @@ class FusedMoE(torch.nn.Module):
             shard_size = expert_data.shape[shard_dim]
             load_size = loaded_weight.shape[shard_dim]
             if load_size != shard_size:
+                zero_pad_tail(expert_data, shard_dim, load_size)
                 expert_data = expert_data.narrow(shard_dim, 0, load_size)
             self._copy_quant_storage(expert_data, loaded_weight)
             return
@@ -4750,6 +4769,7 @@ class FusedMoE(torch.nn.Module):
             shard_dim, load_shard_size * tp_rank, load_shard_size
         )
         if load_shard_size != shard_size:
+            zero_pad_tail(expert_data, shard_dim, load_shard_size)
             expert_data = expert_data.narrow(shard_dim, 0, load_shard_size)
         # w2, down_proj: Load into only logical weight of w2.
         self._copy_quant_storage(expert_data, loaded_weight)
