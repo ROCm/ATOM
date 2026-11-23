@@ -1,6 +1,16 @@
 # SPDX-License-Identifier: MIT
 """Common scheduler lookup contract, including non-driving clients."""
 
+from enum import Enum
+
+
+class LookupPinStatus(Enum):
+    PENDING = "pending"
+
+    def __bool__(self) -> bool:
+        # Not pinned yet: falls into the caller's `if not pinned:` branch.
+        return False
+
 
 class LookupClient:
     token_database = None
