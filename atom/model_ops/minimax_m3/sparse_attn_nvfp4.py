@@ -157,10 +157,16 @@ def nvfp4_page_table(
 
 def _flydsl_attention(
     q, k_payload, k_scale, v_payload, v_scale, table, ctx, sm_scale,
-    plan_step_owner, plan_cache_owner,
+    plan_step_owner, plan_cache_owner, quantized_output=None, output_scale=None,
 ):  # fmt: skip
     """aiter's FlyDSL paged decode over the NVFP4 cache, one length-1 sequence a
-    (row, kv head), planned and scratch-cached like the FP8 sparse path's."""
+    (row, kv head), planned and scratch-cached like the FP8 sparse path's.
+
+    ``quantized_output`` / ``output_scale``: o_proj's MXFP8 input (E4M3
+    ``[rows, heads * D]`` and E8M0 ``[rows, heads * D // 32]``), written by the
+    attention instead of the BF16 output with the BF16 call's split: aiter
+    writes it in every output mode, bit for bit the BF16 output quantized as
+    o_proj's ``quantize_fp8`` would."""
     from aiter.ops.flydsl.pa_decode import pa_decode
     from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 
@@ -174,6 +180,14 @@ def _flydsl_attention(
     group = num_q_heads // num_kv_heads
     seqs = rows * num_kv_heads
     output = torch.empty_like(q)
+    quant_args = {}
+    if quantized_output is not None:
+        quant_args = {
+            "quantized_output": quantized_output.view(seqs, group, head_dim),
+            "output_scale": output_scale,
+            # Nothing reads the BF16 output.
+            "store_output": False,
+        }
     if seqs == 0:
         return output
     # (row, kv head) -> sequence, as the FP8 path collapses them; zero-copy
@@ -220,6 +234,7 @@ def _flydsl_attention(
         temporary_output=partials,
         work_plan=plan,
         max_context_length=context_bound,
+        **quant_args,
     )
     return output
 
@@ -239,6 +254,8 @@ def nvfp4_sparse_attention(
     page_table: tuple[torch.Tensor, torch.Tensor] | None = None,
     plan_step_owner=None,
     plan_cache_owner=None,
+    quantized_output: torch.Tensor | None = None,
+    output_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """O ``[rows, num_heads, D]`` of every row over its top-k blocks.
 
@@ -246,9 +263,15 @@ def nvfp4_sparse_attention(
     selector's NVFP4 emission) when the caller already built it (it is shared
     by the sparse layers of a step); built here otherwise.
     ``plan_step_owner`` / ``plan_cache_owner``: as for the FP8 sparse path's
-    ``sparse_pa_per_row``.
+    ``sparse_pa_per_row``. ``quantized_output`` / ``output_scale`` (gfx1250):
+    o_proj's MXFP8 input, see ``_flydsl_attention``; the returned BF16 output
+    is then unspecified.
     """
     if _gluon_kernel():
+        if quantized_output is not None:
+            raise NotImplementedError(
+                "the gfx950 NVFP4 attention writes its BF16 output only"
+            )
         from atom.model_ops.minimax_m3.nvfp4_kernels.decode import flash_decode_nvfp4
 
         return flash_decode_nvfp4(
@@ -276,6 +299,8 @@ def nvfp4_sparse_attention(
         sm_scale,
         plan_step_owner,
         plan_cache_owner,
+        quantized_output,
+        output_scale,
     )
 
 

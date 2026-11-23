@@ -1079,6 +1079,71 @@ def unified_attention_with_output_base(
         )
 
 
+def fill_unit_scale(scale: torch.Tensor) -> None:
+    """Fill a quantized output's scales with 1.0: E8M0 MXFP8 scales (byte 127)
+    or FP32 descales."""
+    if scale.dtype == torch.float8_e8m0fnu:
+        scale.view(torch.uint8).fill_(127)
+    else:
+        scale.fill_(1.0)
+
+
+def unified_attention_with_output_quant_base_fake(
+    q: torch.Tensor,
+    q_scale: torch.Tensor | None,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    use_mla: bool,
+    qkv: torch.Tensor,
+    quantized_output: torch.Tensor,
+    output_scale: torch.Tensor,
+) -> None:
+    return None
+
+
+@mark_spliting_op(
+    is_custom=True,
+    gen_fake=unified_attention_with_output_quant_base_fake,
+    mutates_args=["quantized_output", "output_scale"],
+)
+@eager_region()
+def unified_attention_with_output_quant_base(
+    q: torch.Tensor,
+    q_scale: torch.Tensor | None,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    use_mla: bool,
+    qkv: torch.Tensor,
+    quantized_output: torch.Tensor,
+    output_scale: torch.Tensor,
+) -> None:
+    """Sparse-M3 attention writing o_proj's quantized input in place.
+
+    Caller-owned mutable buffers keep stable addresses for graph replay while
+    the eager region returns nothing; the generic attention op is unchanged.
+    """
+    if use_mla:
+        raise ValueError("quantized attention output is only defined for sparse MHA")
+    atom_config = get_current_atom_config()
+    self = atom_config.compilation_config.static_forward_context[layer_name]
+    if not getattr(self.impl, "supports_output_quant", False):
+        raise RuntimeError(f"{layer_name} does not support quantized attention output")
+    self.impl.forward(
+        query=q,
+        key=k,
+        value=v,
+        position=positions,
+        q_scale=q_scale,
+        qkv=qkv,
+        quantized_output=quantized_output,
+        output_scale=output_scale,
+    )
+
+
 def linear_attention_with_output_base_fake(
     mixed_qkv: torch.Tensor,
     b: torch.Tensor,
