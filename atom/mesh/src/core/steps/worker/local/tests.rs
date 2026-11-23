@@ -207,6 +207,7 @@ fn model_info(name: &str, chat_template: &str, default_kwargs: &str) -> GetModel
         chat_template: Some(chat_template.into()),
         default_chat_template_kwargs_json: default_kwargs.into(),
         reasoning_open_markers: Vec::new(),
+        ..Default::default()
     }
 }
 
