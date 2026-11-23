@@ -7,7 +7,7 @@
 //! (startup, worker connection, API) should use this workflow to ensure consistent
 //! behavior (validation, caching, deduplication).
 
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{collections::HashSet, path::Path, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -25,7 +25,9 @@ use crate::{
     config::TokenizerCacheConfig,
     routers::prepare::{
         chat_controls::ChatControls,
-        fast_tokenizer::{tokenizer_json, with_fastokens, FastTokenizer, STRICT_REFUSAL},
+        fast_tokenizer::{
+            tokenizer_json, with_fastokens, FastTokenizer, DOWNLOAD_FAILURE, STRICT_REFUSAL,
+        },
     },
     tokenizer::{
         cache::{CacheConfig, CachedTokenizer},
@@ -141,7 +143,7 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                         chat_template.as_deref(),
                     )
                     .await;
-                    if let Some(controls) = checkpoint_chat_controls(&name, &source).await {
+                    if let Some(controls) = checkpoint_chat_controls(&name, &source).await? {
                         chat_controls.write().insert(id.clone(), controls);
                     }
                     // fastokens has its own segment cache
@@ -295,9 +297,23 @@ fn renders_without_template(tokenizer: &mut dyn Tokenizer) -> bool {
 
 /// The reasoning controls ATOM renders `source`'s chats under, by the
 /// `model_type` in the `config.json` beside its `tokenizer.json`, if the
-/// checkpoint has its own.
-async fn checkpoint_chat_controls(name: &str, source: &str) -> Option<ChatControls> {
-    let tokenizer = tokenizer_json(source).await.ok()?;
+/// checkpoint has its own. A HuggingFace model ID's tokenizer that cannot be
+/// downloaded fails the registration, to be retried, rather than leave the
+/// model's chats rendered without them.
+async fn checkpoint_chat_controls(
+    name: &str,
+    source: &str,
+) -> Result<Option<ChatControls>, String> {
+    match tokenizer_json(source).await {
+        Ok(tokenizer) => Ok(controls_beside(name, &tokenizer).await),
+        Err(reason) if reason.starts_with(DOWNLOAD_FAILURE) => Err(reason),
+        Err(_) => Ok(None),
+    }
+}
+
+/// The reasoning controls for the `model_type` in the `config.json` beside
+/// `tokenizer`, if there is one.
+async fn controls_beside(name: &str, tokenizer: &Path) -> Option<ChatControls> {
     let config = tokio::fs::read(tokenizer.with_file_name("config.json"))
         .await
         .ok()?;
@@ -588,6 +604,28 @@ mod tests {
             .await
             .unwrap();
         assert!(Arc::ptr_eq(&kept, &hf));
+    }
+
+    /// A HuggingFace model ID whose tokenizer cannot be downloaded fails the
+    /// lookup of its chat controls, and the registration is retried; a source
+    /// with no `tokenizer.json` has none.
+    #[tokio::test]
+    #[serial]
+    async fn test_chat_controls_download_failures_are_retried() {
+        let _endpoint = EnvVar::set("HF_ENDPOINT", "http://127.0.0.1:1");
+        let error = checkpoint_chat_controls("model", "org/model")
+            .await
+            .unwrap_err();
+        assert!(error.starts_with(DOWNLOAD_FAILURE), "{error}");
+        let error = WorkflowError::StepFailed {
+            step_id: StepId::new("load_tokenizer"),
+            message: error,
+        };
+        assert!(LoadTokenizerStep.is_retryable(&error), "{error}");
+
+        let empty = tempfile::TempDir::new().unwrap();
+        let empty = empty.path().to_str().unwrap();
+        assert_eq!(checkpoint_chat_controls("model", empty).await, Ok(None));
     }
 
     #[test]
