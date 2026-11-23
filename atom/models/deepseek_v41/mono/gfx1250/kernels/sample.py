@@ -147,7 +147,7 @@ def _bf_max64(x):
 
 @ASTRewriter.transform
 def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank, tag0, sp, qlog, dids, prow, outtok,
-                  verdict, anc, qids=None, ctxp=None, com=None, outsl=None):
+                  verdict, anc, qids=None, ctxp=None, com=None, outsl=None, outh=None):
     t = hx.opaque_v(t)
     b = hx.opaque_s(b)
     row = b // CPR
@@ -579,6 +579,9 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
             sl_ = hx.gload(sp + i64(OUT_SLOT_ROW * SPW + 7) * 4, I32)
             o_out.append(outsl + i64(sl_) * OUT_SLOT_BYTES)
             o_ver.append(outsl + i64(2 * OUT_SLOT_BYTES) + i64(sl_) * VER_SLOT_BYTES)
+            if fx.const_expr(outh is not None):   # the same pair in pinned host memory: the host reads it, no D2H
+                o_out.append(outh + i64(sl_) * OUT_SLOT_BYTES)
+                o_ver.append(outh + i64(2 * OUT_SLOT_BYTES) + i64(sl_) * VER_SLOT_BYTES)
         for o_ in range_constexpr(len(o_out)):
             for p in range_constexpr(ND):
                 hx.gstore(o_out[o_] + i64(rr * (ND + 1) + p) * 4, (I32(p) < f).select(xs[p], (I32(p) == f).select(tf, I32(-1))))

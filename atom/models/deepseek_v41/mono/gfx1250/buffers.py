@@ -175,6 +175,8 @@ TPTRS_ROLE = {
     "tcom": SCRATCH,
     # the verify's outputs for the host, a 2-slot pair (sample.OUT_SLOT_BYTES / VER_SLOT_BYTES): ``verify_outputs``
     "outsl": SCRATCH,
+    # the same pair in pinned host memory (the runner allocates it): the host reads the verify's outputs there, no D2H
+    "outh": SCRATCH,
     "memb": SCRATCH,
     "mbest": SCRATCH,
     # each target row's sampling [T][8] (invT, top_p, seed, greedy | invTd, hasq, qsrc, seed_acc) -> ``runner._sampling``
@@ -341,7 +343,8 @@ def scratch_bytes(K, nlt: int) -> dict[str, int]:
         "mids": TD_MAX * 4,
         "mids64": TD_MAX * 8,
         "tcom": (32 + 256) * 8,
-        "outsl": 2 * 8 * 6 * 4 + 2 * 3 * 8 * 4,  # sample.COM_*: the commit words, then the target launch's CTA exit stamps
+        "outsl": 2 * 8 * 6 * 4 + 2 * 3 * 8 * 4,
+        "outh": 2 * 8 * 6 * 4 + 2 * 3 * 8 * 4,  # (the runner replaces it with pinned host memory)  # sample.COM_*: the commit words, then the target launch's CTA exit stamps
         "memb": TD_MAX * 256 * 2,
         "mbest": TD_MAX * 8,
         # context KV

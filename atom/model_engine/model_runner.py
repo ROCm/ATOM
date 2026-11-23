@@ -302,6 +302,14 @@ class tokenIDProcessor:
         copy_done: torch.cuda.Event | None = None,
         gpu_logprobs: torch.Tensor | None = None,
     ):
+        if getattr(gpu_tensor, "host_view", None) is not None and gpu_logprobs is None:
+            # Already in host memory (a served step's outputs): read in place
+            # once its event completes (`recv_async_output`), no D2H.
+            cpu_tensor_handle.append(
+                (gpu_tensor.host_view, gpu_tensor.host_ready, (gpu_tensor, None))
+            )
+            self.logprobs_cpu.append(None)
+            return
         copy_done = copy_done or torch.cuda.Event()
         with torch.cuda.stream(self.async_copy_stream):
             data_ready.wait(stream=self.async_copy_stream)
@@ -3580,6 +3588,11 @@ class ModelRunner:
             num_bonus_tokens, num_reject_tokens, anchors = verdict
             next_token_locs = num_bonus_tokens
             spec_counts = verdict[:2]
+            if getattr(verdict, "host_view", None) is not None:
+                # The step wrote its outputs to host memory too: the
+                # transfers read them there (`D2HQueue.send`), no D2H.
+                spec_counts.host_view = verdict.host_view[:2]
+                spec_counts.host_ready = verdict.host_ready
         else:
             assert logits is not None
             bonus_logits_indices = spec_decode_metadata.bonus_logits_indices

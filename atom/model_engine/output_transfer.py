@@ -12,6 +12,7 @@ class _D2HSlot:
         self.buffer_array = self.buffer.numpy()
         self.copy_done = torch.cuda.Event()
         self.shape = None
+        self.host = None
         # The tensor being copied, held until copy_done has been waited on.
         self.source: torch.Tensor | None = None
 
@@ -58,6 +59,14 @@ class D2HQueue:
         if slot is None or slot.buffer.dtype != source.dtype:
             slot = _D2HSlot(self.capacity, source.dtype)
         slot.set_shape_from(source)
+        # A source that is also in host memory (`host_view`, readable after
+        # `host_ready`: a served step's own writes) is read in place, no D2H.
+        slot.host = None
+        if getattr(source, "host_view", None) is not None:
+            slot.host = (source.host_view, source.host_ready)
+            slot.source = source
+            self._pending.append(slot)
+            return
         producer = torch.cuda.current_stream() if ready is None else None
         with torch.cuda.stream(self.stream):
             if ready is None:
@@ -74,8 +83,12 @@ class D2HQueue:
         if not self._pending:
             return None
         slot = self._pending[0]
-        slot.copy_done.synchronize()
-        output = self._copy_output(slot.array_view)
+        if slot.host is not None:
+            slot.host[1].synchronize()
+            output = self._copy_output(slot.host[0].numpy())
+        else:
+            slot.copy_done.synchronize()
+            output = self._copy_output(slot.array_view)
         # The copy has completed; only now may the allocator reuse the source.
         slot.source = None
         self._pending.popleft()
@@ -86,7 +99,7 @@ class D2HQueue:
         """Wait for every pending transfer, then drop its output and source."""
         while self._pending:
             slot = self._pending[0]
-            slot.copy_done.synchronize()
+            (slot.copy_done if slot.host is None else slot.host[1]).synchronize()
             slot.source = None
             self._pending.popleft()
             self._free.append(slot)

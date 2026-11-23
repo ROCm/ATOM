@@ -33,7 +33,7 @@ from atom.models.deepseek_v41.mono.gfx1250.kernels import draft_ctx as CX
 from atom.models.deepseek_v41.mono.gfx1250.kernels.attention import handoff
 
 TPTRS = ['xh', 'hw', 'logits', 's0', 's1', 's2', 's3', 'sids', 'dids', 'outtok', 'verdict', 'anc', 'dh', 'dlog', 'mw1',
-         'mw2', 'mids', 'memb', 'mbest', 'sparam', 'qlog', 'prow', 'qids', 'mids64', 'tcom', 'outsl']
+         'mw2', 'mids', 'memb', 'mbest', 'sparam', 'qlog', 'prow', 'qids', 'mids64', 'tcom', 'outsl', 'outh']
 # sparam [48][8] (32 B a row, host-filled a step; sample.SPW): invT, topp, seed, greedy | invTd, hasq, qsrc, seed_acc.
 # T > 0 rows use the recipe's prob drafting + block verification (markov / sample; ATOM dspark_prob_sample
 # PROB_DRAFT + BLOCK_VERIFY), greedy rows the argmax match. qlog [8][5][32320] f32: this rank's draft logits of the step
@@ -85,7 +85,7 @@ def target(tp, t, b, sm, tc, recv, rank, head_d=4, ctx=None, T=None, kv_fp4=Fals
         SPF.sample_once_p(P['logits'], P['s0'], P['s1'], P['s2'], P['s3'], P['sids'], tc + i64(LY.SAMPLE), t, b, sm, HF.VR,
                           [r + i64(SOFF) for r in recv], rank, 1, tptr(tp, 'sparam'), tptr(tp, 'qlog'), P['dids'],
                           tptr(tp, 'prow'), P['outtok'], P['verdict'], P['anc'], tptr(tp, 'qids'), com=tptr(tp, 'tcom'),
-                          outsl=tptr(tp, 'outsl'))
+                          outsl=tptr(tp, 'outsl'), outh=tptr(tp, 'outh'))
     else:
         if fx.const_expr(ctx is not None):
             # (ctx TP, with the step epoch) main_proj split over the ranks, its columns exchanged in the receive halves

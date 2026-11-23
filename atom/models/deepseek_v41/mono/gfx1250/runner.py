@@ -170,6 +170,12 @@ class SingleStepRunner(StepInputs):
             n: torch.zeros(b, dtype=torch.uint8, device=self.device)
             for n, b in buffers.scratch_bytes(self.K, NL + NDR).items()
         }
+        # the verify's outputs for the host (sample: outh, outsl's 2-slot pair) in pinned host memory, each slot readable
+        # after its event (``verify_outputs``): ModelRunner reads sampled ids and spec status there instead of copying
+        # them D2H on its copy stream -- a request whose main stream got ordered behind those copies started every
+        # draft ~40 us late (2026-11-23, copy-stream events: the copies themselves did not slow)
+        self.scratch["outh"] = torch.zeros(self.scratch["outh"].numel(), dtype=torch.uint8, pin_memory=True)
+        self._outh_ready = (torch.cuda.Event(), torch.cuda.Event())
         # fine-grained, not uncached: the step's few-word peer pushes (Markov, sampling) waited ~80-100 us each for an
         # uncached store to become visible (fine-grained receive buffers did not, measured on the kernel's fixture)
         self.peer = SymmetricPeerBuffer(
@@ -525,7 +531,9 @@ class SingleStepRunner(StepInputs):
         rejected drafts, anchor row)`` -- the kernel's verify (tail), in place: the step's slot of the 2-slot pair the
         verify writes (the next launch writes the other; the one after reuses this, by when the host received every copy
         of it). Produced on the caller's stream: its readers there need no wait. The output stream waits for the target
-        launch (``verify_ready``: ModelRunner's output D2H), and takes the STOP word and the stamps.
+        launch (``verify_ready``), marks the slot's host pair readable and takes the STOP word and the stamps. Both
+        tensors carry ``host_view`` (the slot in the pinned host pair, the kernel's own writes) and ``host_ready`` (its
+        event): ModelRunner's transfers read them there (``D2HQueue.send``) instead of a D2H.
         """
         SPF = self.K["sample"]
         sl = self._out_slot
@@ -536,11 +544,16 @@ class SingleStepRunner(StepInputs):
         with torch.cuda.stream(self._verify_stream):
             self._verify_stream.wait_event(self._ev_verify)
             self.verify_ready.record()
+            self._outh_ready[sl].record()
             self._stop_host.copy_(self._stop, non_blocking=True)
             a_, b_ = self._ts_words
             self._ts_host.copy_(self.scratch["tcom"].view(torch.int64)[a_:b_], non_blocking=True)
             self._ts_owed = True
             self._stop_ready.record()
+        hb = self.scratch["outh"]
+        out.host_view = hb[sl * SPF.OUT_SLOT_BYTES : (sl + 1) * SPF.OUT_SLOT_BYTES].view(torch.int32).view(8, ROWS_PER_REQ)[:bs]
+        verdict.host_view = hb[vo : vo + SPF.VER_SLOT_BYTES].view(torch.int32).view(3, 8)[:, :bs]
+        out.host_ready = verdict.host_ready = self._outh_ready[sl]
         # the anchors this launch's verify committed in the kernel (``committed_in_kernel``) and that its successor's
         # preparation may advance from (``advances``): the slot's row, as the round hands them back
         self._verdict_anchors = verdict[2].data_ptr() if bs else None
