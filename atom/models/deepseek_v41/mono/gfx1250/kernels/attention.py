@@ -239,6 +239,8 @@ A_WIDE = True   # (v2) stage A's GEMV on 5 waves x 4 K steps at one row tile
 @ASTRewriter.transform
 def stage_A(c):
     t, b, w, l, sm, MT, TR = c["t"], c["b"], c["w"], c["l"], c["sm"], c["MT"], c["TR"]
+    if t == 0:   # the reduction's qnw line (a layer's cold weight) -> L2 now, not an HBM round trip after the cluster sync
+        hx.prefetch(c["qnw"] + i64(fx.min((b // 4) * 32, I32(QL - 32))) * 4)
     if b < 224:
         nt = b // 2
         kh = b % 2
@@ -378,19 +380,16 @@ def stage_A(c):
                 gpu.barrier()
     cluster_sync()
     if (b < 224) & (b % 4 == 0):
+        # (a 32-col block's 4 threads a row are adjacent lanes of one wave: the row's sum of squares ((x0 + x1) + x2) + x3
+        # in lane order -- the LDS f32 atomics' order -- and the block amax by lane shuffles; no LDS, no barrier)
         c0 = (b // 4) * 32
-        rss = sm + c["SMEM"]
-        gmx = rss + 48 * 4
-        if t < 48:
-            hx.lstore(rss + t * 4, F32(0.0))
-            hx.lstore(gmx + t * 4, I32(0))
-        gpu.barrier()
         r = fx.min(t // 4, I32(TR - 1))
         qq = t % 4
         cc = c0 + qq * 8
         act = t < TR * 4
         p0 = hx.gload(c["qkv_part"] + i64(r * NQKV + cc) * 4, F32, 8)
         p1 = hx.gload(c["qkv_part"] + i64((T + r) * NQKV + cc) * 4, F32, 8)
+        qnw8 = hx.gload(c["qnw"] + i64(fx.min(cc, I32(QL - 8))) * 4, F32, 8)   # (kv blocks: in bounds, unused)
         hb = [bf(p0[e] + p1[e]) for e in range(8)]
         xsq = F32(0.0)
         am = F32(0.0)
@@ -398,23 +397,25 @@ def stage_A(c):
         for e in range_constexpr(8):
             x = hb[e].to(F32)
             xsq = xsq + x * x
-            v = (c0 < QL).select(x * hx.gload(c["qnw"] + i64(cc + e) * 4, F32), x)
+            v = (c0 < QL).select(x * qnw8[e], x)
             vv.append(v)
             am = fx.max(am, abs(v))
+        lb = (l // 4) * 4
+        xs4 = [hx.lane_gather(xsq.bitcast(I32), lb + k).bitcast(F32) for k in range(4)]
+        rsum = ((xs4[0] + xs4[1]) + xs4[2]) + xs4[3]
+        am = fx.max(am, am.shuffle_xor(1, 32))
+        am = fx.max(am, am.shuffle_xor(2, 32))
         if act:
             c["stx"](c["qkv"] + i64(r * NQKV + cc) * 2, fx.Vector.from_elements(hb, BF16))
-            hx.latomic_add_f32(rss + r * 4, xsq)
-            hx.latomic_max_u32(gmx + r * 4, am.bitcast(I32))
-        gpu.barrier()
         if (c0 < QL) & act:
-            code = e8m0_of(hx.lload(gmx + r * 4, I32).bitcast(F32))
+            code = e8m0_of(am)
             inv = inv_pow2(code)
             bts = [to_e4m3(vv[e] * inv) for e in range(8)]
             c["stx"](c["qr8"] + i64(r * QL + cc), fx.Vector.from_elements([pack4(bts[:4]), pack4(bts[4:])], I32))
             if qq == 0:
                 c["stx"](c["qrs"] + i64(r * (QL // 32) + c0 // 32), code.to(fx.Int8))
-        if t < TR:
-            hx.atomic_fadd(c["ss"] + i64((c0 < QL).select(I32(0), I32(T)) + t) * 4, hx.lload(rss + t * 4, F32))
+        if act & (qq == 0):
+            hx.atomic_fadd(c["ss"] + i64((c0 < QL).select(I32(0), I32(T)) + r) * 4, rsum)
         if fx.const_expr("a2flag" in c):   # (v3 e3) this 32-col block's q / kv (+ its ss share) out: one LL flag
             hx.wait_storecnt0()
             gpu.barrier()
