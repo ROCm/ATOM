@@ -4,12 +4,12 @@
 //! The Session to an ATOM instance: one `AtomEngine.Session` call carries every
 //! request to it as engine_v1 messages, and each request's outputs come back by seq_id.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::future::{BoxFuture, FutureExt, WeakShared};
 use futures::{stream, Stream, StreamExt};
@@ -31,7 +31,7 @@ use crate::atom_engine::wire::{
     pb::{self, envelope::Body, rejected_request::Code, value::Kind},
     Inbound,
 };
-use crate::core::Worker;
+use crate::core::{Worker, WorkerRegistry};
 use crate::routers::token_handle::engine_error::EngineError;
 
 /// A Session's seq ids stay below 2^24, the window ATOM maps each Session's ids into:
@@ -40,6 +40,9 @@ const SEQ_IDS: u64 = 1 << 24;
 
 /// How long opening a Session may take, from connecting to ATOM's Ready.
 const OPENING: Duration = Duration::from_secs(10);
+
+/// How often requests look for Sessions whose instance has no registered worker.
+const SWEEP: Duration = Duration::from_secs(1);
 
 /// The outputs a streamed request may leave unread; past them it fails and is aborted.
 const ROUTE_BUFFER: usize = 4096;
@@ -55,6 +58,11 @@ pub(crate) struct AtomSessions {
     slots: Mutex<HashMap<String, Slot>>,
     /// Bounds each opening; OPENING but in tests.
     opening: Duration,
+    /// With it, the Session of an instance none of whose workers is registered is
+    /// released, at most every `sweep`.
+    workers: Option<Arc<WorkerRegistry>>,
+    sweep: Duration,
+    swept: Mutex<Instant>,
 }
 
 impl Default for AtomSessions {
@@ -62,6 +70,9 @@ impl Default for AtomSessions {
         Self {
             slots: Mutex::default(),
             opening: OPENING,
+            workers: None,
+            sweep: SWEEP,
+            swept: Mutex::new(Instant::now()),
         }
     }
 }
@@ -73,6 +84,35 @@ enum Slot {
 }
 
 impl AtomSessions {
+    /// Sessions each released once its instance's workers are all removed from `workers`.
+    pub(crate) fn releasing_removed(workers: Arc<WorkerRegistry>) -> Self {
+        Self {
+            workers: Some(workers),
+            ..Self::default()
+        }
+    }
+
+    /// Drops the Sessions of instances no registered worker belongs to; their requests'
+    /// streams keep theirs until they end, and the call ends with the last.
+    fn release_removed(&self) {
+        let Some(workers) = &self.workers else {
+            return;
+        };
+        {
+            let mut swept = self.swept.lock();
+            if swept.elapsed() < self.sweep {
+                return;
+            }
+            *swept = Instant::now();
+        }
+        let registered: HashSet<String> = workers
+            .get_all()
+            .iter()
+            .map(|worker| worker.base_url().trim_end_matches('/').to_string())
+            .collect();
+        self.slots.lock().retain(|url, _| registered.contains(url));
+    }
+
     /// Sends `spec` for `prompt` on `worker`'s instance's Session, which sets its
     /// seq_id; the stream carries what Generate answers, streamed as `stream` says.
     pub(crate) async fn submit(
@@ -88,6 +128,7 @@ impl AtomSessions {
     /// The instance's open Session, else the one being opened, else a new opening;
     /// no lock is held while it opens.
     async fn session(&self, worker: &Arc<dyn Worker>) -> Result<Session, EngineError> {
+        self.release_removed();
         let url = worker.base_url().trim_end_matches('/').to_string();
         let opening = {
             let mut slots = self.slots.lock();

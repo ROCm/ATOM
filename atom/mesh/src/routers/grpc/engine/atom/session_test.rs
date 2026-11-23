@@ -22,7 +22,7 @@ use crate::atom_engine::grpc::{
 };
 use crate::atom_engine::wire::PROTOCOL_VERSION;
 use crate::core::worker::{ConnectionMode, RuntimeType};
-use crate::core::DPAwareWorkerBuilder;
+use crate::core::{DPAwareWorkerBuilder, WorkerRegistry};
 use crate::routers::grpc::engine::atom::stream::AtomStream;
 use crate::routers::grpc::engine::worker_client_cache::GrpcClient;
 use crate::routers::token_handle::token_chunk::{FinishReason, MatchedStop, SeqTiming, TokenChunk};
@@ -636,6 +636,41 @@ async fn an_opening_without_ready_is_bounded_and_one_no_request_waits_for_ends()
     let (mut call, opened) = opening(&mut calls, PROTOCOL_VERSION, next).await;
     assert!(opened.is_ok());
     assert!(submitted(&mut call, 1).await.contains_key("next"));
+}
+
+#[tokio::test]
+async fn a_session_is_released_once_no_worker_of_its_instance_is_registered() {
+    let (ranks, mut calls) = instance().await;
+    let workers = Arc::new(WorkerRegistry::new());
+    for rank in &ranks {
+        workers.register(rank.clone());
+    }
+    let sessions = AtomSessions {
+        sweep: Duration::ZERO,
+        ..AtomSessions::releasing_removed(workers.clone())
+    };
+    let first = sessions.submit(&ranks[0], spec("running"), vec![1], false);
+    let (mut call, running) = opening(&mut calls, PROTOCOL_VERSION, first).await;
+    let running_id = submitted(&mut call, 1).await["running"].0.seq_id;
+
+    // Both ranks are removed; the next request, to another instance, releases the Session.
+    for rank in &ranks {
+        workers.remove_by_url(rank.url());
+    }
+    let (others, mut other_calls) = instance().await;
+    workers.register(others[0].clone());
+    let next = sessions.submit(&others[0], spec("next"), vec![2], false);
+    let (_other_call, next) = opening(&mut other_calls, PROTOCOL_VERSION, next).await;
+    assert!(next.is_ok());
+
+    // The running request keeps its Session to its end; then the client's half ends.
+    let ended = done(vec![(completion(running_id, "eos"), Vec::new())]);
+    call.outbound.send(ended).unwrap();
+    let running: Vec<_> = timeout(HANG, running.unwrap().collect()).await.unwrap();
+    assert!(matches!(&running[..], [Ok(_)]), "{running:?}");
+    let sent = timeout(Duration::from_secs(5), call.inbound.message()).await;
+    let sent = sent.expect("the released Session's call stayed open");
+    assert!(!matches!(sent, Ok(Some(_))), "{sent:?}");
 }
 
 #[test]
