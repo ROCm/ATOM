@@ -348,8 +348,6 @@ class SingleStepRunner(StepInputs):
             return
         self._draft_pending = None
         p[0](*p[1])
-        if not torch.cuda.is_current_stream_capturing() and self.K["attention"].DSTAMP:
-            self._log_dstamps()
 
     def launch(self, input_ids, forward_context, batch=None) -> None:
         self.launch_draft()   # (a step whose draft no hook launched: before this step's target, in stream order)
@@ -486,24 +484,6 @@ class SingleStepRunner(StepInputs):
         self.scratch["englook"].view(torch.int64)[: w.numel()].copy_(w.view(-1))
         torch.cuda.current_stream().synchronize()
         self._englook_set = True
-
-    def _log_dstamps(self):
-        """(diagnostic, ATOM_MONO_DSTAMP=1) every 50 launches: D CTA 0's mean steady-counter time (us, 100 MHz) from D's
-        entry to each phase point, over the target layers and the draft layers (attention._dstamp)."""
-        self._dst_n = getattr(self, "_dst_n", 0) + 1
-        if self._dst_n % 50 or self.rank != 0:
-            return
-        torch.cuda.synchronize()
-        v = self.scratch["cyc"][: (NL + NDR) * 32].view(torch.int32).view(NL + NDR, 8).double().cpu()
-        for name, rows in (("target", v[:NL]), ("draft", v[NL:])):
-            n = rows[:, 0].clamp(min=1)
-            mean = (rows[:, 1:] / n[:, None]).mean(0) / 100.0
-            logger.info(
-                "V4.1 single-launch step D stamps (%s, %d passes): %s us",
-                name,
-                int(rows[:, 0].sum()),
-                " ".join(f"p{i + 1}={x:.2f}" for i, x in enumerate(mean.tolist())),
-            )
 
     def run_step(self, input_ids, running_bs: int, forward_context, batch) -> None:
         """The served step: one launch (target layers, head, sampling, verify, draft layers, Markov drafts)."""

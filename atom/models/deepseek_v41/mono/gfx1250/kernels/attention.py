@@ -697,23 +697,12 @@ def _kg_rows(c, t, r0, jj, sm, o, RPC, TR):
 
 KDQ_IT = KC * 32 // THREADS   # (FP4 KV) decode: a wave a key, a lane 16 dims -- the CTA's KC keys in KDQ_IT passes
 assert KC * 32 % THREADS == 0
-# (diagnostic) ATOM_MONO_DSTAMP=1: CTA 0 of D accumulates steady-counter deltas from D's entry at its phase points into
-# cyc[(layer * 8 + point) * 8] (int64; the runner logs their means). A build parameter (step.build keys it).
-DSTAMP = __import__("os").environ.get("ATOM_MONO_DSTAMP", "0") == "1"
 
 
 def _iprefetch(kb):
     """Instruction prefetch of the next kb KB of code (s_prefetch_inst_pc_rel, 4 KB a request; step.iprefetch's)."""
     for off in range(0, kb * 1024, 4096):
         llvm.inline_asm(None, [], f"s_prefetch_inst_pc_rel {off}, null, 31", "", has_side_effects=True)
-
-
-@ASTRewriter.transform
-def _dstamp(c, p, t0):
-    if fx.const_expr(DSTAMP):
-        if (c["b"] == 0) & (c["t"] == 0):   # (point 0: the count of D passes; a non-returning atomic: no wait)
-            a = c["cycp"] + (i64(c["ly"]) * 8 + i64(p)) * 4
-            hx.atomic_add(a, I32(1) if p == 0 else I32(hx.clock() - t0))
 
 
 @ASTRewriter.transform
@@ -804,8 +793,6 @@ def stage_D(c):
     cl = b // CL
     jj = b % CL
     r0 = cl * RPC
-    t0s = hx.clock() if DSTAMP else None
-    _dstamp(c, 0, t0s)
     if fx.const_expr(kv_fp4_of(c)):   # (FP4 KV) D's code -> the I-cache while the kv rows' flags are awaited
         _iprefetch(12)
     # every row: ceil(TR / RPC) clusters (a draft width 5 B need not be a multiple of RPC)
@@ -832,7 +819,6 @@ def stage_D(c):
         rsv = hx.gload(c["rsin"] + (rpp * 32 + i64(rf0 + 2 * (t % 8))) * 2, BF16, 2)   # this lane's 2 pairs
         msk = _d_merge_sink(c, w, l)   # (c1) the merge's sink weight too
         hx.bar()
-        _dstamp(c, 1, t0s)
         if fx.const_expr(kv_fp4_of(c)):   # FP4 KV: the raw key rows staged by async copies (decoded below)
             for rr in range_constexpr(RPC):
                 _kg_fetch(c, t, sm, o, rr)
@@ -864,11 +850,9 @@ def stage_D(c):
                     bb = i // ((48 - KC) * HD // 8)
                     rem = i % ((48 - KC) * HD // 8)
                     hx.lstore(sm + o["k"] + ((bb * 48 + KC + rem // (HD // 8)) * HP + (rem % (HD // 8)) * 8) * 2, fx.Vector.filled(4, 0, I32))
-        _dstamp(c, 2, t0s)
         if fx.const_expr(kv_fp4_of(c)):   # FP4 KV: the staged key rows -> BF16 key rows, while C still runs
             hx.wait_asynccnt0()
             hx.bar()
-            _dstamp(c, 3, t0s)
             for rr in range_constexpr(RPC):
                 _kg_decode(c, t, sm, o, rr)
         if fx.const_expr("cflag" in c):   # every C CTA's q tiles: only the q copies wait for them (not where dwait is False)
@@ -879,7 +863,6 @@ def stage_D(c):
                 if hx.likely(dwv):
                     hx.wait_flags(c["cflag"], CTAS, c["ctag"], w, l, 8)
                     hx.bar()
-        _dstamp(c, 4, t0s)
         for it in range(QV * HD // 8 // THREADS):
             i = t + it * THREADS
             qv = i // (HD // 8)
@@ -892,7 +875,6 @@ def stage_D(c):
         pp = c["apart"] + i64(b * QV * HD) * 2
         hx.wait_asynccnt0()
         hx.bar()
-        _dstamp(c, 5, t0s)
         for tt in range(hx.opaque_s(I32(2))):   # (opaque trip count: kept a loop)
             tile = w + tt * 8
             if tile < RPC * 3:
@@ -976,7 +958,6 @@ def stage_D(c):
                     hx.gstore(pp + i64((nd * 16 + l % 16) * QV + rr * H + (l // 16) * 8) * 2,
                               fx.Vector.from_elements([acc[i].to(BF16) for i in range(8)], BF16))
         hx.bar()
-        _dstamp(c, 6, t0s)
         if t < QV:
             hx.gstore(c["aml"] + i64(b * QV * 2 + t * 2) * 4, hx.lload(sm + o["m"] + t * 4, F32))
             hx.gstore(c["aml"] + i64(b * QV * 2 + t * 2 + 1) * 4, hx.lload(sm + o["l"] + t * 4, F32))
@@ -989,7 +970,6 @@ def stage_D(c):
             mg = _d_merge_pre(c, cl, jj, w, l, msk)   # (c1) the merge's operand bases, before the cluster sync
             cluster_sync()
             _d_merge(c, cl, jj, rcv, rsv, mg)
-            _dstamp(c, 7, t0s)
 
 
 def _d_merge_sink(c, w, l):

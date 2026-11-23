@@ -252,7 +252,7 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
     the cache walk does not reach still rebuilds)."""
     assert part in ("all", "target", "draft")
     assert ES.look_ok(TR), TR   # (englook) the entry's Engram row pushes fit the receive half (every served width)
-    keyed = (("TR", TR), ("rank", rank), ("NL", NL), ("ndr", ndr), ("trd", trd), ("part", part), ("sources", sources), ("moe_ids", moe_ids), ("split", split), ("index_fp4", index_fp4), ("kv_fp4", kv_fp4), ("dstamp", AS.DSTAMP))
+    keyed = (("TR", TR), ("rank", rank), ("NL", NL), ("ndr", ndr), ("trd", trd), ("part", part), ("sources", sources), ("moe_ids", moe_ids), ("split", split), ("index_fp4", index_fp4), ("kv_fp4", kv_fp4))
     L = smem_layout(TR)
     TPG = TR * 10 // 3
     stx = hx.stx_dev
@@ -557,9 +557,6 @@ def layer_part(E, Ly, part):
     for k_ in ("kmeta", "knsel", "ksel", "kvw"):
         dict.__setitem__(c, k_, None)
     c["kring_off"] = fx.Int32(ltab(fp, Ly, "kring")())
-    if fx.const_expr(AS.DSTAMP):   # (diagnostic) D's phase stamps: cyc scratch, by layer
-        c["cycp"] = fptr(fp, "cyc")
-        c["ly"] = Ly
     if fx.const_expr(c["kvfp4"]):   # FP4 KV: the layer's window ring planes and its kv owner's main pool planes
         c._th.update(kwd=ltab(fp, Ly, "kwd"), kws=ltab(fp, Ly, "kws"), kmd=ltab(fp, Ly, "kmd"), kms=ltab(fp, Ly, "kms"))
         for k_ in ("kwd", "kws", "kmd", "kms"):

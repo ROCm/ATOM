@@ -499,14 +499,11 @@ def stx_dev(addr, val):
         gstore(addr, val, scope="agent", align=nb)
 
 
-SLOAD_INV = __import__("os").environ.get("SLOAD_INV", "0") == "1"
-
-
 def sload64(addr):
     """i64 load through the constant address space (addrspace 4) at a wave-uniform address -> s_load_b64 (scalar cache;
     for read-only tables such as pointer tables)."""
     p = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<4>"), _v(fx.Int64(addr))).result
-    return fx.Int64(llvm.LoadOp(fx.Int64.ir_type, p, alignment=8, invariant=SLOAD_INV).result)
+    return fx.Int64(llvm.LoadOp(fx.Int64.ir_type, p, alignment=8).result)
 
 
 def llvm_wait_loads():
