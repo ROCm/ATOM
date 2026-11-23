@@ -26,6 +26,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # no / off, or an empty value, turn SGLang's radix cache off at launch
     # (`deepseek_v41_radix.v41_radix_launch_override`).
     "ATOM_SGLANG_V41_RADIX": lambda: _flag_env("ATOM_SGLANG_V41_RADIX", "1"),
+    # Performance runs only: let a DSpark launch run SGLang's
+    # SGLANG_SIMULATE_ACC_LEN above 1 (a fixed mean accept length; the text
+    # is then not the model's). Off: such a launch is refused.
+    "ATOM_SGLANG_V41_DSPARK_ALLOW_SIMULATED_ACC": lambda: _flag_env(
+        "ATOM_SGLANG_V41_DSPARK_ALLOW_SIMULATED_ACC"
+    ),
 }
 
 

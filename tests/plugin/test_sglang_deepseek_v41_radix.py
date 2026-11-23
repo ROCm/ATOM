@@ -604,14 +604,6 @@ class TestRefusals:
         monkeypatch.setenv("ATOM_SGLANG_V41_RADIX", "0")
         refuse_unsupported_sglang_features()
 
-    def test_speculation_stays_refused(self, launch):
-        # No radix-specific speculation path: the launch contract refuses
-        # speculative decoding with radix on or off.
-        launch.bags["spec"].speculative_algorithm = "DSPARK"
-        with pytest.raises(ValueError, match="speculative decoding") as refused:
-            refuse_unsupported_sglang_features()
-        assert "radix" not in str(refused.value)
-
     @pytest.mark.parametrize(
         ("bag", "path", "value", "match"),
         [
@@ -668,7 +660,7 @@ class TestLaunchPolicy:
         # A plain record: SGLang's resolving view reads it the same way.
         monkeypatch.setattr(radix, "_resolving_view", lambda server_args: server_args)
 
-    ARGS = SimpleNamespace(disable_radix_cache=False)
+    ARGS = SimpleNamespace(disable_radix_cache=False, speculative_algorithm=None)
     V41 = SimpleNamespace(model_type="deepseek_v41")
 
     def test_default_launch_keeps_radix(self, caplog):
@@ -689,10 +681,27 @@ class TestLaunchPolicy:
 
     def test_radix_already_off_declares_nothing(self, monkeypatch, caplog):
         monkeypatch.setenv("ATOM_SGLANG_V41_RADIX", "0")
-        args = SimpleNamespace(disable_radix_cache=True)
+        args = SimpleNamespace(disable_radix_cache=True, speculative_algorithm="DSPARK")
         with caplog.at_level("WARNING", logger="atom"):
             assert radix.v41_radix_launch_override(args, self.V41) == {}
         assert not caplog.records
+
+    @pytest.mark.parametrize("pinned", [None, "1"])
+    def test_speculation_turns_radix_off_once(self, monkeypatch, caplog, pinned):
+        if pinned is not None:
+            monkeypatch.setenv("ATOM_SGLANG_V41_RADIX", pinned)
+        args = SimpleNamespace(
+            disable_radix_cache=False, speculative_algorithm="DSPARK"
+        )
+        with caplog.at_level("WARNING", logger="atom"):
+            for _ in range(3):
+                assert radix.v41_radix_launch_override(args, self.V41) == {
+                    "disable_radix_cache": True
+                }
+        (record,) = caplog.records
+        assert "speculative decoding (DSPARK)" in record.getMessage()
+        args.speculative_algorithm = None
+        assert radix.v41_radix_launch_override(args, self.V41) == {}
 
     # ATOM's text type never reaches SGLang's registry: SGLang's V4.1 config
     # forces ``deepseek_v41``.
@@ -721,7 +730,7 @@ class TestLaunchPolicy:
         base = _sglang_module("sglang.srt.arg_groups.model_override_base")
         monkeypatch.setattr(radix, "_resolving_view", base.resolving_view)
         monkeypatch.setenv("ATOM_SGLANG_V41_RADIX", "0")
-        args = SimpleNamespace(disable_radix_cache=False)
+        args = SimpleNamespace(disable_radix_cache=False, speculative_algorithm=None)
         args._resolved_overrides = [("earlier", {"disable_radix_cache": True})]
         assert radix.v41_radix_launch_override(args, self.V41) == {}
         args._resolved_overrides = []
@@ -807,6 +816,7 @@ def _v41_atom_config():
         kv_cache_block_size=128,
         enable_decoder_swa_bounded_replay=True,
         enable_encoder_swa_bounded_replay=True,
+        speculative_config=None,
         online_quant_config={"layer_quant_config": {}},
         quant_config=None,
         hf_config=SimpleNamespace(sliding_window=128, fp4ptpc=False),

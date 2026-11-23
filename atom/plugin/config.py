@@ -308,17 +308,31 @@ def _build_atom_speculative_config_from_vllm(vllm_spec_config: Any):
 
 
 def _build_atom_speculative_config_from_sglang(server_args: Any, hf_config: Any):
-    """SGLang EAGLE/NEXTN → ATOM ``SpeculativeConfig``.
+    """SGLang speculative decoding → ATOM ``SpeculativeConfig``.
 
-    Native Qwen4Exp returns the unmixed HC bundle only when
-    ``atom_config.speculative_config is not None``. SGLang owns scheduling;
-    this object is that ABI flag plus the Native draft-token horizon
-    (``speculative_num_steps``, not SGLang's ``steps+1`` draft-token count).
+    DeepSeek-V4.1 (DSPARK only): native DSpark's config (method ``dspark``,
+    five drafts, the target checkpoint; `build_v41_dspark_speculative_config`),
+    which sizes the V4.1 pool for the drafts and builds the draft.
+
+    Qwen4Exp (EAGLE/NEXTN): native Qwen4Exp returns the unmixed HC bundle
+    only when ``atom_config.speculative_config is not None``. SGLang owns
+    scheduling; this object is that ABI flag plus the Native draft-token
+    horizon (``speculative_num_steps``, not SGLang's ``steps+1`` draft-token
+    count). Every other model: None.
     """
     algo = getattr(server_args, "speculative_algorithm", None)
     name = str(getattr(algo, "name", algo)).strip().upper()
     if name in {"", "NONE", "NULL", "FALSE"}:
         return None
+
+    from atom.plugin.sglang.deepseek_v41_bridge import (
+        build_v41_dspark_speculative_config,
+        is_deepseek_v41_config,
+    )
+
+    if is_deepseek_v41_config(hf_config):
+        # Native DSpark (`dspark`, five drafts, the target checkpoint).
+        return build_v41_dspark_speculative_config(server_args, hf_config)
 
     text = getattr(hf_config, "text_config", None) or hf_config
     if getattr(text, "model_type", None) not in {"qwen4_exp", "qwen4_exp_text"}:

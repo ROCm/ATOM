@@ -105,7 +105,9 @@ installed.
 Radix on by default for V4.1 on the plugin: whenever SGLang's radix cache is
 on (no ``--disable-radix-cache``) and ATOM serves the model. ``ATOM_SGLANG_V41_RADIX=0``
 turns SGLang's radix cache off for such a launch at server-args resolution,
-with one warning (``v41_radix_launch_override``).
+with one warning (``v41_radix_launch_override``), and so does speculative
+decoding (DSpark): its draft windows and verify lifecycle are not served under
+the replay here.
 """
 
 from __future__ import annotations
@@ -155,8 +157,10 @@ def radix_replay_rows() -> int | None:
 
 
 # --- Launch policy (SGLang server-args resolution) ---
-# Radix is on whenever SGLang's radix cache is. Where the operator turned it
-# off (ATOM_SGLANG_V41_RADIX=0), SGLang's radix cache is turned off with it,
+# Radix is on whenever SGLang's radix cache is. Where the replay cannot run
+# (speculative decoding: the DSpark draft windows and the verify lifecycle
+# are not served under a replay here) or the operator turned it off
+# (ATOM_SGLANG_V41_RADIX=0), SGLang's radix cache is turned off with it,
 # through SGLang's own model-override registry: the declaration is resolved
 # once in the launching process, before the tokenizer manager and the
 # schedulers are spawned, so every reader of ``disable_radix_cache`` (the
@@ -182,10 +186,10 @@ def _resolving_view(server_args):
 
 def v41_radix_launch_override(server_args, hf_config) -> dict:
     """SGLang model-override provider: ``disable_radix_cache=True`` for a
-    DeepSeek-V4.1 launch ATOM serves while ``ATOM_SGLANG_V41_RADIX`` is off,
-    with one warning; nothing otherwise. The entry point registers it on
-    every SGLang launch, so a native V4.1 launch (ATOM not serving the model)
-    is left alone."""
+    DeepSeek-V4.1 launch ATOM serves while ``ATOM_SGLANG_V41_RADIX`` is off or
+    the launch speculates, with one warning; nothing otherwise. The entry
+    point registers it on every SGLang launch, so a native V4.1 launch (ATOM
+    not serving the model) is left alone."""
     global _POLICY_WARNED
     from atom.plugin.sglang.register import _is_atom_external_model_enabled
 
@@ -193,16 +197,26 @@ def v41_radix_launch_override(server_args, hf_config) -> dict:
         return {}
     if not _is_atom_external_model_enabled():
         return {}
-    if _resolving_view(server_args).disable_radix_cache:
+    cfg = _resolving_view(server_args)
+    if cfg.disable_radix_cache:
         return {}
-    if envs.ATOM_SGLANG_V41_RADIX:
+    algorithm = cfg.speculative_algorithm
+    if not envs.ATOM_SGLANG_V41_RADIX:
+        reason = "ATOM_SGLANG_V41_RADIX is off"
+    elif algorithm is not None:
+        reason = (
+            f"speculative decoding ({algorithm}) is not served with the "
+            "DeepSeek-V4.1 radix cache"
+        )
+    else:
         return {}
     if not _POLICY_WARNED:
         _POLICY_WARNED = True
         logger.warning(
-            "ATOM DeepSeek-V4.1: ATOM_SGLANG_V41_RADIX is off; turning SGLang's "
-            "radix cache off for this launch (same as --disable-radix-cache). "
-            "Pass --disable-radix-cache to silence this."
+            "ATOM DeepSeek-V4.1: %s; turning SGLang's radix cache off for this "
+            "launch (same as --disable-radix-cache). Pass --disable-radix-cache "
+            "to silence this.",
+            reason,
         )
     return {"disable_radix_cache": True}
 

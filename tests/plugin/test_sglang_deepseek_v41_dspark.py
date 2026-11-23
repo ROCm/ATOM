@@ -13,6 +13,7 @@ of the proxy pool, the draft block's inputs and forward context, the Markov
 head adapter and the target's aux taps. No GPU.
 """
 
+import copy
 import json
 import os
 import weakref
@@ -25,12 +26,18 @@ from atom.plugin.sglang import deepseek_v41_bridge as bridge
 from atom.plugin.sglang.deepseek_v41_bridge import (
     ATOM_DEEPSEEK_V41_SGLANG_BLOCK_SIZE,
     DEEPSEEK_V41_ARCH,
+    V41_DSPARK_DRAFT_ARCH,
     build_deepseek_v41_forward_metadata,
     build_v41_scheduled_batch,
     commit_deepseek_v41_dspark_verify,
     dspark_commit_anchors,
     is_v41_dspark_atom_config,
+    refuse_unsupported_sglang_features,
     v41_dspark_capability_error,
+)
+from atom.plugin.sglang.runtime.model_arch import (
+    MODEL_ADAPTER_SPECS,
+    resolve_model_arch_spec,
 )
 
 try:
@@ -70,7 +77,21 @@ def _isolated(monkeypatch):
     monkeypatch.setattr(bridge, "_V41_BUILDER", None)
     monkeypatch.delenv("SGLANG_RAGGED_VERIFY_MODE", raising=False)
     monkeypatch.delenv("SGLANG_SIMULATE_ACC_LEN", raising=False)
+    monkeypatch.delenv("ATOM_SGLANG_V41_DSPARK_ALLOW_SIMULATED_ACC", raising=False)
     monkeypatch.delenv("SGLANG_DSPARK_EMBED_IN_GRAPH", raising=False)
+
+
+def test_embed_in_graph_off_is_refused(monkeypatch):
+    monkeypatch.setenv("SGLANG_DSPARK_EMBED_IN_GRAPH", "0")
+    spec = SimpleNamespace(speculative_use_block_verification=False)
+    refused = bridge._dspark_launch_refusals(
+        spec,
+        SimpleNamespace(
+            graph=_graph(),
+            features=SimpleNamespace(enable_decoder_swa_bounded_replay=False),
+        ),
+    )
+    assert any("SGLANG_DSPARK_EMBED_IN_GRAPH" in r for r in refused)
 
 
 def _forward_batch(**fields):
@@ -176,6 +197,70 @@ class TestCapability:
         )
 
 
+class TestAdapterRouting:
+    def test_draft_config_routes_to_the_draft_spec(self):
+        from atom.config import SpeculativeConfig
+
+        target = _atom_text_v41()
+        draft = copy.deepcopy(target)
+        SpeculativeConfig.hf_config_override(draft)
+        assert draft.model_type == "deepseek_v41_dspark"
+        assert draft.architectures == [V41_DSPARK_DRAFT_ARCH]
+        arch, spec = resolve_model_arch_spec(draft)
+        assert arch == V41_DSPARK_DRAFT_ARCH
+        assert spec is not MODEL_ADAPTER_SPECS[DEEPSEEK_V41_ARCH]
+        with pytest.raises(RuntimeError, match="build their metadata"):
+            spec.build_forward_metadata(None, SimpleNamespace(), None)
+        # The target's config is a different object and stays the target.
+        assert resolve_model_arch_spec(target)[0] == DEEPSEEK_V41_ARCH
+        assert target.model_type == "deepseek_v41_text"
+
+    def test_target_and_v4_keep_their_specs(self):
+        assert resolve_model_arch_spec(_v41())[0] == DEEPSEEK_V41_ARCH
+        v4 = SimpleNamespace(
+            architectures=["DeepseekV4ForCausalLM"], model_type="deepseek_v4"
+        )
+        arch, spec = resolve_model_arch_spec(v4)
+        assert arch == "DeepseekV4ForCausalLM"
+        assert (
+            spec.build_forward_metadata.__name__
+            == "_build_deepseek_v4_forward_metadata"
+        )
+        nextn = SimpleNamespace(
+            architectures=["DeepseekV4ForCausalLMNextN"], model_type="deepseek_v4_mtp"
+        )
+        assert resolve_model_arch_spec(nextn)[0] == "DeepseekV4ForCausalLMNextN"
+
+    def test_decoder_replay_is_off_under_dspark(self, monkeypatch):
+        # DSpark's taps and draft context write read every row of the plain
+        # backbone; the no-spec target keeps replay on as natively.
+        from atom.plugin.sglang.runtime.model_arch import (
+            _deepseek_v41_decoder_replays,
+        )
+
+        monkeypatch.delenv("ATOM_SGLANG_V41_DECODER_REPLAY", raising=False)
+        plain = SimpleNamespace(speculative_config=None, hf_config=_atom_text_v41())
+        dspark = SimpleNamespace(
+            speculative_config=SimpleNamespace(method="dspark"),
+            hf_config=_atom_text_v41(),
+        )
+        assert _deepseek_v41_decoder_replays(plain) is True
+        assert _deepseek_v41_decoder_replays(dspark) is False
+        monkeypatch.setenv("ATOM_SGLANG_V41_DECODER_REPLAY", "0")
+        assert _deepseek_v41_decoder_replays(plain) is False
+
+    @pytest.mark.skipif(not HAVE_CHECKPOINT, reason="V4.1-Flash checkpoint absent")
+    def test_real_checkpoint_configs(self):
+        from atom.config import SpeculativeConfig, get_hf_config
+
+        target = get_hf_config(FLASH_CHECKPOINT, trust_remote_code=True)
+        assert v41_dspark_capability_error(target) is None
+        draft = copy.deepcopy(target)
+        SpeculativeConfig.hf_config_override(draft, FLASH_CHECKPOINT)
+        assert resolve_model_arch_spec(draft)[0] == V41_DSPARK_DRAFT_ARCH
+        assert resolve_model_arch_spec(target)[0] == DEEPSEEK_V41_ARCH
+
+
 # ---------------------------------------------------------------------------
 # Speculative config
 # ---------------------------------------------------------------------------
@@ -186,9 +271,253 @@ class TestCapability:
 _LAST_SERVER_ARGS = []
 
 
+@pytest.fixture
+def spec_config_env(monkeypatch):
+    """The builder's inputs without a checkpoint: ATOM's config loader returns
+    a V4.1 text config, SGLang's spec bag holds the launch's settings."""
+    from sglang.srt import runtime_context
+
+    import atom.config as atom_config
+
+    monkeypatch.setattr(atom_config, "get_hf_config", lambda *a, **k: _atom_text_v41())
+    monkeypatch.setattr(runtime_context, "get_spec", lambda: _LAST_SERVER_ARGS[-1])
+    _LAST_SERVER_ARGS.clear()
+
+
+def _server_args(**overrides):
+    args = {
+        "speculative_algorithm": "DSPARK",
+        "speculative_num_draft_tokens": 6,
+        # SGLang's DSpark resolution: a bundled draft is the target checkpoint.
+        "speculative_draft_model_path": "/models/v41",
+        "model_path": "/models/v41",
+    }
+    args.update(overrides)
+    _LAST_SERVER_ARGS.append(SimpleNamespace(**args))
+    return _LAST_SERVER_ARGS[-1]
+
+
+class TestSpeculativeConfig:
+    @needs_native_dspark
+    def test_dspark_on_v41(self, spec_config_env):
+        from atom.plugin.config import _build_atom_speculative_config_from_sglang
+
+        hf = _v41()
+        before = copy.deepcopy(vars(hf))
+        spec = _build_atom_speculative_config_from_sglang(_server_args(), hf)
+        assert spec.method == "dspark"
+        assert spec.num_speculative_tokens == 5
+        assert spec.model == "/models/v41"
+        assert spec.use_dspark()
+        assert spec.draft_model_hf_config.model_type == "deepseek_v41_dspark"
+        # SGLang's config is never what the override mutates.
+        assert vars(hf) == before
+
+    @needs_native_dspark
+    def test_same_draft_path_is_accepted(self, spec_config_env):
+        from atom.plugin.config import _build_atom_speculative_config_from_sglang
+
+        args = _server_args(speculative_draft_model_path="/models/v41")
+        assert _build_atom_speculative_config_from_sglang(args, _v41()) is not None
+
+    @pytest.mark.parametrize(
+        ("overrides", "match"),
+        [
+            ({"speculative_num_draft_tokens": 8}, "num-draft-tokens 6"),
+            ({"speculative_draft_model_path": "/other"}, "draft from the target"),
+        ],
+    )
+    def test_refusals(self, spec_config_env, overrides, match):
+        from atom.plugin.config import _build_atom_speculative_config_from_sglang
+
+        with pytest.raises(ValueError, match=match):
+            _build_atom_speculative_config_from_sglang(
+                _server_args(**overrides), _v41()
+            )
+
+    def test_checkpoint_without_dspark_is_refused(self, spec_config_env):
+        from atom.plugin.config import _build_atom_speculative_config_from_sglang
+
+        with pytest.raises(ValueError, match="not servable"):
+            _build_atom_speculative_config_from_sglang(
+                _server_args(), _v41(dspark_block_size=None)
+            )
+
+    def test_no_speculation_and_other_models_unchanged(self, spec_config_env):
+        from atom.plugin.config import _build_atom_speculative_config_from_sglang
+
+        args = _server_args(speculative_algorithm=None)
+        assert _build_atom_speculative_config_from_sglang(args, _v41()) is None
+        qwen3 = SimpleNamespace(model_type="qwen3", architectures=["Qwen3ForCausalLM"])
+        assert _build_atom_speculative_config_from_sglang(_server_args(), qwen3) is None
+
+
 # ---------------------------------------------------------------------------
 # Launch refusals
 # ---------------------------------------------------------------------------
+
+
+def _graph(decode="disabled", prefill="disabled"):
+    return SimpleNamespace(
+        cuda_graph_config=SimpleNamespace(
+            decode=SimpleNamespace(backend=decode, bs=None),
+            prefill=SimpleNamespace(backend=prefill),
+        ),
+        disable_cuda_graph_padding=False,
+    )
+
+
+@pytest.fixture
+def dspark_launch(monkeypatch):
+    """SGLang's resolved config bags for a DSpark launch."""
+    from sglang.srt import runtime_context
+
+    state = SimpleNamespace(
+        bags={
+            "memory": SimpleNamespace(
+                disable_radix_cache=True,
+                enable_hierarchical_cache=False,
+                enable_hisparse=False,
+                enable_session_radix_cache=False,
+                radix_cache_backend=None,
+                enable_unified_memory=False,
+                enable_lmcache=False,
+                enable_flexkv=False,
+                enable_unified_cache_external_linker=False,
+            ),
+            "exec": SimpleNamespace(
+                features=SimpleNamespace(
+                    enable_encoder_swa_bounded_replay=False,
+                    enable_decoder_swa_bounded_replay=False,
+                    enable_memory_saver=False,
+                    enable_watermark=False,
+                ),
+                moe=SimpleNamespace(moe_a2a_backend="none"),
+                graph=_graph(),
+            ),
+            "spec": SimpleNamespace(
+                speculative_algorithm="DSPARK",
+                speculative_num_draft_tokens=6,
+                speculative_draft_model_path="/models/v41",
+                speculative_use_block_verification=False,
+            ),
+            "disagg": SimpleNamespace(
+                disaggregation_mode="null", language_model_only=True
+            ),
+            "parallel": SimpleNamespace(
+                enable_dp_attention=False,
+                pp_size=1,
+                dcp_size=1,
+                moe_dense_tp_size=None,
+            ),
+            "schedule": SimpleNamespace(
+                disable_hybrid_swa_memory=False,
+                page_size=PAGE,
+                chunked_prefill_size=8192,
+                max_running_requests=64,
+                disable_overlap_schedule=True,
+                enable_mixed_chunk=False,
+            ),
+            "model": SimpleNamespace(model_path="/models/v41"),
+        },
+    )
+    for name in ("memory", "exec", "spec", "disagg", "parallel", "schedule", "model"):
+        monkeypatch.setattr(
+            runtime_context, f"get_{name}", lambda name=name: state.bags[name]
+        )
+    return state
+
+
+class TestLaunchRefusals:
+    def test_supported_dspark_launch_passes(self, dspark_launch, monkeypatch):
+        refuse_unsupported_sglang_features()
+        monkeypatch.setenv("SGLANG_RAGGED_VERIFY_MODE", "static")
+        monkeypatch.setenv("SGLANG_SIMULATE_ACC_LEN", "1.0")
+        refuse_unsupported_sglang_features()
+        monkeypatch.setenv("SGLANG_SIMULATE_ACC_LEN", "-1")
+        refuse_unsupported_sglang_features()
+        # SGLang reads an unparsable value as its default, -1 (off).
+        monkeypatch.setenv("SGLANG_SIMULATE_ACC_LEN", "off")
+        with pytest.warns(UserWarning, match="SGLANG_SIMULATE_ACC_LEN"):
+            refuse_unsupported_sglang_features()
+        # A fixed mean accept length is a perf-run opt-in.
+        monkeypatch.setenv("SGLANG_SIMULATE_ACC_LEN", "3.47")
+        with pytest.raises(ValueError, match="SIMULATE_ACC_LEN=3.47"):
+            refuse_unsupported_sglang_features()
+        monkeypatch.setenv("ATOM_SGLANG_V41_DSPARK_ALLOW_SIMULATED_ACC", "true")
+        refuse_unsupported_sglang_features()
+
+    @pytest.mark.parametrize(
+        ("field", "value", "match"),
+        [
+            ("speculative_use_block_verification", True, "block verification"),
+        ],
+    )
+    def test_spec_refusals(self, dspark_launch, field, value, match):
+        setattr(dspark_launch.bags["spec"], field, value)
+        with pytest.raises(ValueError, match=match):
+            refuse_unsupported_sglang_features()
+
+    @pytest.mark.parametrize(
+        ("env", "value", "match"),
+        [
+            ("SGLANG_RAGGED_VERIFY_MODE", "compact", "must be static"),
+            ("SGLANG_RAGGED_VERIFY_MODE", "cap_accept", "must be static"),
+            ("SGLANG_SIMULATE_ACC_LEN", "2.5", "SIMULATE_ACC_LEN=2.5"),
+        ],
+    )
+    def test_env_refusals(self, dspark_launch, monkeypatch, env, value, match):
+        monkeypatch.setenv(env, value)
+        with pytest.raises(ValueError, match=match):
+            refuse_unsupported_sglang_features()
+
+    def test_prefill_graph_is_refused(self, dspark_launch):
+        dspark_launch.bags["exec"].graph = _graph(prefill="full")
+        with pytest.raises(ValueError, match="prefill CUDA graph"):
+            refuse_unsupported_sglang_features()
+
+    @pytest.mark.parametrize("backend", ["full", "breakable"])
+    def test_decode_graphs_are_refused(self, dspark_launch, backend):
+        dspark_launch.bags["exec"].graph = _graph(decode=backend)
+        with pytest.raises(ValueError, match="--cuda-graph-backend-decode disabled"):
+            refuse_unsupported_sglang_features()
+
+    def test_decoder_replay_flag_is_refused(self, dspark_launch):
+        # DSpark runs without decoder replay: the flag would be accepted and
+        # then overridden, whatever ATOM_SGLANG_V41_DECODER_REPLAY says.
+        dspark_launch.bags["exec"].features.enable_decoder_swa_bounded_replay = True
+        with pytest.raises(
+            ValueError, match="--enable-decoder-swa-bounded-replay with DSpark"
+        ):
+            refuse_unsupported_sglang_features()
+
+    def test_overlap_schedule_is_served(self, dspark_launch):
+        # A DSpark round (draft, verify, accept, commit) is one worker call
+        # under SGLang 0.5.22's overlap loop: nothing to refuse.
+        dspark_launch.bags["schedule"].disable_overlap_schedule = False
+        refuse_unsupported_sglang_features()
+
+    def test_dp_stays_refused(self, dspark_launch):
+        dspark_launch.bags["parallel"].enable_dp_attention = True
+        with pytest.raises(ValueError, match="DP attention"):
+            refuse_unsupported_sglang_features()
+
+    def test_launch_policy_turns_radix_off_under_dspark(self, monkeypatch):
+        from atom.plugin.sglang import deepseek_v41_radix as radix
+
+        monkeypatch.setattr(radix, "_POLICY_WARNED", False)
+        monkeypatch.setattr(radix, "_resolving_view", lambda server_args: server_args)
+        monkeypatch.setenv("SGLANG_EXTERNAL_MODEL_PACKAGE", "atom.plugin.sglang.models")
+        args = SimpleNamespace(
+            speculative_algorithm="DSPARK", disable_radix_cache=False
+        )
+        config = SimpleNamespace(model_type="deepseek_v41")
+        assert radix.v41_radix_launch_override(args, config) == {
+            "disable_radix_cache": True
+        }
+        # A native DSpark launch (ATOM not serving the model) keeps radix.
+        monkeypatch.delenv("SGLANG_EXTERNAL_MODEL_PACKAGE")
+        assert radix.v41_radix_launch_override(args, config) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -538,11 +867,68 @@ def _proxy(**overrides):
         "dtype": torch.bfloat16,
         "layer_num": 3,
         "device": "cpu",
+        "start_layer": 0,
+        "end_layer": 3,
         "num_req_slots": 4,
         "is_draft_worker": True,
     }
     kwargs.update(overrides)
     return bridge._make_proxy_pool_cls()(**kwargs)
+
+
+@needs_sglang
+class TestDraftPool:
+    def _builder(self, monkeypatch, speculative_tokens=5):
+        cache = SimpleNamespace(num_pages=5, num_slots=4, pending=None)
+        builder = SimpleNamespace(
+            geometry=_small_geometry(speculative_tokens), cache=cache
+        )
+        monkeypatch.setattr(bridge, "_V41_BUILDER", builder)
+        return builder
+
+    def test_binds_the_target_arena_and_allocates_nothing(self, monkeypatch):
+        builder = self._builder(monkeypatch)
+        pool = _proxy()
+        assert pool.is_atom_v41_proxy_pool and pool.is_atom_v41_draft_proxy
+        assert pool.atom_cache is builder.cache
+        assert pool.get_kv_size_bytes() == 0
+        assert pool.mem_usage == 0
+        assert (pool.num_pages, pool.num_slots) == (5, 4)
+        assert pool.needs_paged_swa_allocator is False
+        assert pool.request_window is None
+        # SGLang's injector must hand the hidden to the draft model.
+        assert not hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope")
+        pool.register_mapping(torch.zeros(3))
+        assert pool.full_to_swa_index_mapping is None
+
+    def test_backend_roles_must_match_pools(self, monkeypatch):
+        from atom.plugin.sglang.attention_backend.deepseek_v41_backend import (
+            ATOMDeepseekV41BackendForSgl,
+        )
+
+        self._builder(monkeypatch)
+        draft_pool = _proxy()
+        runner = SimpleNamespace(
+            device="cpu",
+            token_to_kv_pool=draft_pool,
+            req_to_token_pool=object(),
+            is_draft_worker=True,
+        )
+        assert ATOMDeepseekV41BackendForSgl(runner).role == "draft"
+        runner.is_draft_worker = False
+        with pytest.raises(RuntimeError, match="draft role"):
+            ATOMDeepseekV41BackendForSgl(runner)
+        target_pool = SimpleNamespace(
+            is_atom_v41_proxy_pool=True, is_atom_v41_draft_proxy=False
+        )
+        runner = SimpleNamespace(
+            device="cpu",
+            token_to_kv_pool=target_pool,
+            req_to_token_pool=object(),
+            is_draft_worker=True,
+        )
+        with pytest.raises(RuntimeError, match="target role"):
+            ATOMDeepseekV41BackendForSgl(runner)
 
 
 # ---------------------------------------------------------------------------
@@ -590,14 +976,205 @@ def test_builder_must_hold_a_full_verify():
 NOISE = 99
 
 
+def _draft_batch(prefix, slots, width=5, mode=None, noise=NOISE):
+    bs = len(prefix)
+    seq = torch.tensor(prefix, dtype=torch.int64)
+    positions = (seq[:, None] + torch.arange(width)).reshape(-1)
+    ids = torch.full((bs, width), noise, dtype=torch.int64)
+    ids[:, 0] = torch.arange(10, 10 + bs)
+    fb = SimpleNamespace(
+        forward_mode=ForwardMode.TARGET_VERIFY if mode is None else mode,
+        batch_size=bs,
+        seq_lens=seq,
+        req_pool_indices=torch.tensor(slots, dtype=torch.int64),
+        req_pool_indices_cpu=None,
+        spec_info=SimpleNamespace(draft_token_num=width),
+    )
+    return fb, ids.reshape(-1), positions
+
+
+@needs_sglang
+class TestDraftBlock:
+    def test_anchor_is_the_bonus_one_row_back(self):
+        from atom.plugin.sglang.deepseek_v41_dspark import draft_block_inputs
+
+        fb, ids, positions = _draft_batch([10, 300], [2, 5])
+        block = draft_block_inputs(fb, ids, positions, noise_token_id=NOISE)
+        assert block.anchor_ids.tolist() == [10, 11]
+        # native: anchors locate the last processed target row, the block
+        # runs at anchor + 1 .. anchor + 5 == p .. p + 4.
+        assert block.anchor_positions.tolist() == [9, 299]
+        assert block.slots.tolist() == [2, 5] and block.slots.dtype == torch.int32
+        assert (block.bs, block.width) == (2, 5)
+
+    def test_only_the_block_runs(self):
+        from atom.plugin.sglang.deepseek_v41_dspark import draft_block_inputs
+
+        fb, ids, positions = _draft_batch([10, 300], [2, 5])
+        fb.forward_mode = ForwardMode.EXTEND
+        with pytest.raises(NotImplementedError, match="only its block"):
+            draft_block_inputs(fb, ids, positions, noise_token_id=NOISE)
+
+    def test_forward_context_is_a_draft_pass(self):
+        from atom.plugin.sglang.deepseek_v41_dspark import (
+            draft_block_inputs,
+            v41_dspark_draft_forward_context,
+        )
+        from atom.utils.forward_context import AttnState, get_forward_context
+
+        fb, ids, positions = _draft_batch([10, 300], [2, 5])
+        block = draft_block_inputs(fb, ids, positions, noise_token_id=NOISE)
+        cache = object()
+        atom_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(data_parallel_size=1, data_parallel_rank=0),
+            compilation_config=SimpleNamespace(static_forward_context={}),
+        )
+        with v41_dspark_draft_forward_context(atom_config, cache=cache, block=block):
+            forward = get_forward_context()
+            metadata, context = forward.attn_metadata, forward.context
+            assert metadata.cache is cache and metadata.step is None
+            assert metadata.state_slot_out is block.slots
+            assert metadata.max_seqlen_q == 5 and metadata.state == AttnState.DECODE
+            assert not metadata.served_by_round
+            assert context.is_draft and not context.is_prefill
+            assert (context.scheduled_bs, context.running_tokens) == (2, 10)
+        # Reset on exit: no draft metadata outlives the block.
+        assert get_forward_context().context is None
+
+
 # ---------------------------------------------------------------------------
 # Markov head adapter
 # ---------------------------------------------------------------------------
 
 
+@needs_sglang
+def test_markov_adapter_matches_atom_head(monkeypatch):
+    from atom.models.dspark_draft import DSparkMarkovHead
+    from atom.plugin.sglang.models.deepseek_v41_dspark_wrapper import (
+        ATOMV41MarkovHeadAdapter,
+    )
+
+    torch.manual_seed(0)
+    head = DSparkMarkovHead(50, 8)
+    head.fused_sample = False
+    with torch.no_grad():
+        head.markov_w1.weight.normal_()
+        head.markov_w2.weight.normal_()
+    adapter = ATOMV41MarkovHeadAdapter(head)
+    # ATOM's weights are not re-registered on the adapter.
+    assert list(adapter.parameters()) == []
+    assert adapter.vocab_size == 50 and adapter.vocab_shard is None
+    assert adapter.greedy_w2_weight() is None
+    assert adapter.step_logits_dtype(torch.bfloat16) == torch.float32
+    prev = torch.tensor([3, 17, 42])
+    bias, state = adapter.step_bias(prev, hidden_states=None, state="s")
+    assert state == "s" and bias.dtype == torch.float32
+    assert torch.equal(bias, head(prev)[0])
+    assert torch.equal(adapter.get_prev_embeddings(prev), head.markov_w1(prev))
+    base = torch.randn(3, 50)
+    out = torch.empty(3, dtype=torch.int64)
+    head.sample_next(prev, base, out)
+    assert torch.equal((base + bias).argmax(-1), out)
+
+
 # ---------------------------------------------------------------------------
 # Draft wrapper contract (no model construction)
 # ---------------------------------------------------------------------------
+
+
+def _bare_wrapper():
+    from atom.plugin.sglang.models.deepseek_v41_dspark_wrapper import (
+        DeepseekV4ForCausalLMDSpark,
+    )
+
+    wrapper = DeepseekV4ForCausalLMDSpark.__new__(DeepseekV4ForCausalLMDSpark)
+    torch.nn.Module.__init__(wrapper)
+    wrapper.num_context_features = 3
+    wrapper.hidden_size = 4
+    wrapper.vocab_size = 12
+    wrapper.logits_mup_width_multiplier = None
+    return wrapper
+
+
+@needs_sglang
+class TestDraftWrapper:
+    def test_v4_dspark_is_refused(self):
+        from atom.plugin.sglang.models.deepseek_v41_dspark_wrapper import (
+            DeepseekV4ForCausalLMDSpark,
+        )
+
+        v4 = SimpleNamespace(
+            architectures=["DeepseekV4ForCausalLMDSpark"],
+            model_type="deepseek_v4",
+            vocab_size=10,
+        )
+        with pytest.raises(NotImplementedError, match="V4.1 only"):
+            DeepseekV4ForCausalLMDSpark(v4)
+
+    def test_sglang_contract_flags(self):
+        from atom.plugin.sglang.models.deepseek_v41_dspark_wrapper import (
+            DeepseekV4ForCausalLMDSpark,
+            EntryClass,
+        )
+
+        cls = DeepseekV4ForCausalLMDSpark
+        assert EntryClass == [cls]
+        assert cls.sglang_skip_quant_config and cls.sample_from_anchor
+        assert not cls.uses_own_vocab_modules
+        assert not cls.supports_pre_gather_target_hidden_projection
+        assert cls.confidence_head is None
+        # SGLang embeds nothing when the draft defines forward_embed.
+        assert hasattr(cls, "forward_embed")
+
+    def test_injection_is_a_no_op(self):
+        # The target forward wrote the rows already; SGLang's injection call
+        # keeps its keyword contract.
+        wrapper = _bare_wrapper()
+        pool = SimpleNamespace(is_atom_v41_draft_proxy=True)
+        hidden = torch.zeros(7, 12)
+        positions = torch.arange(7)
+        wrapper.write_target_hidden_kv(
+            target_hidden=hidden, pool=pool, positions=positions
+        )
+        with pytest.raises(TypeError):
+            wrapper.write_target_hidden_kv(
+                main_hidden=hidden, swa_loc=positions, positions=positions, pool=pool
+            )
+
+    def test_forward_takes_token_ids_only(self):
+        wrapper = _bare_wrapper()
+        with pytest.raises(NotImplementedError, match="token ids only"):
+            wrapper.forward(
+                torch.zeros(5, dtype=torch.int64),
+                torch.arange(5),
+                SimpleNamespace(),
+                input_embeds=torch.zeros(5, 4),
+            )
+        with pytest.raises(NotImplementedError, match="inside block_backbone"):
+            wrapper.forward_embed(torch.zeros(5, dtype=torch.int64))
+        for method in (
+            "set_dspark_layers_to_capture",
+            "prune_to_ctx_kv_injection",
+            "project_target_hidden",
+        ):
+            with pytest.raises(NotImplementedError):
+                getattr(wrapper, method)(
+                    *([None] if method != "prune_to_ctx_kv_injection" else [])
+                )
+
+    def test_base_logits_are_the_shared_head_full_vocab(self):
+        wrapper = _bare_wrapper()
+        head = SimpleNamespace(get_logits=lambda x: x @ torch.ones(4, 12))
+        wrapper.__dict__["model"] = SimpleNamespace(head=head)
+        wrapper.target_atom_config = None
+        x = torch.randn(10, 4)
+        logits, features = wrapper.compute_base_logits(x)
+        assert logits.shape == (10, 12) and features is x
+
+    def test_attach_needs_the_atom_target_view(self):
+        wrapper = _bare_wrapper()
+        with pytest.raises(RuntimeError, match="lm_head view"):
+            wrapper.attach_shared_modules(embed_tokens=object(), lm_head=object())
 
 
 # ---------------------------------------------------------------------------
@@ -843,3 +1420,25 @@ class TestTargetSurface:
             )
         with pytest.raises(RuntimeError, match="no plain DECODE"):
             self._finish(monkeypatch, surface, rows=1, mode=ForwardMode.DECODE, bs=1)
+
+
+@needs_sglang
+class TestDraftBlockPadding:
+    def test_padding_rows_draft_from_slot_zero(self):
+        from atom.plugin.sglang import deepseek_v41_dspark as dspark
+
+        # SGLang's capture batch: zero positions and slots, any ids.
+        fb, ids, positions = _draft_batch([1, 1], [0, 0])
+        positions = torch.zeros_like(positions)
+        ids = torch.zeros_like(ids)
+        block = dspark.draft_block_inputs(fb, ids, positions, noise_token_id=NOISE)
+        # Padding rows draft from anchor 0 in slot 0, as native pads.
+        assert block.anchor_positions.tolist() == [0, 0]
+        assert block.slots.tolist() == [0, 0]
+
+    def test_anchor_clamp_is_a_no_op_on_live_rows(self):
+        from atom.plugin.sglang.deepseek_v41_dspark import draft_block_inputs
+
+        fb, ids, positions = _draft_batch([1, 300], [2, 5])
+        block = draft_block_inputs(fb, ids, positions, noise_token_id=NOISE)
+        assert block.anchor_positions.tolist() == [0, 299]

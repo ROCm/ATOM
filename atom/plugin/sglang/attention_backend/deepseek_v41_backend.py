@@ -27,6 +27,18 @@ class ATOMDeepseekV41BackendForSgl(AttentionBackend):
         self.device = torch.device(model_runner.device)
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token_pool = model_runner.req_to_token_pool
+        # A DSpark draft runner binds the draft role of the proxy (a view of
+        # the target arena); the target binds the arena's owner. A mix is a
+        # pool from the wrong runner.
+        is_draft = bool(model_runner.is_draft_worker)
+        if is_draft != self.token_to_kv_pool.is_atom_v41_draft_proxy:
+            raise RuntimeError(
+                "ATOMDeepseekV41BackendForSgl: the "
+                f"{'draft' if is_draft else 'target'} runner holds the "
+                f"{'target' if is_draft else 'draft'} role of the V4.1 proxy pool"
+            )
+        self.role = "draft" if is_draft else "target"
+        logger.info("Initializing ATOMDeepseekV41BackendForSgl role=%s", self.role)
         # Buckets replayed so far (the first replay of each is logged).
         self._v41_replayed_buckets = set()
         # The bridge's staging, bound by `init_cuda_graph_state`.

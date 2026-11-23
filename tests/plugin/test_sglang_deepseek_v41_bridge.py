@@ -278,8 +278,6 @@ class TestLaunchContract:
         ("bag", "field", "value", "match"),
         [
             ("memory", "enable_hierarchical_cache", True, "hierarchical cache"),
-            # The one algorithm SGLang admits for V4.1.
-            ("spec", "speculative_algorithm", "DSPARK", "speculative decoding"),
             ("disagg", "disaggregation_mode", "prefill", "PD disaggregation"),
             ("disagg", "language_model_only", False, "language-model-only"),
             ("schedule", "disable_hybrid_swa_memory", True, "hybrid-swa-memory"),
@@ -499,6 +497,7 @@ class TestPrepareConfig:
                 hf_config=SimpleNamespace(fp4ptpc=fp4ptpc),
                 online_quant_config=online_quant_config,
                 quant_config=None,
+                speculative_config=None,
                 enable_decoder_swa_bounded_replay=True,
                 enable_encoder_swa_bounded_replay=True,
             )
@@ -1057,6 +1056,7 @@ def _proxy(**overrides):
         "start_layer": 0,
         "end_layer": 4,
         "num_req_slots": 4,
+        "is_draft_worker": False,
     }
     kwargs.update(overrides)
     return bridge._make_proxy_pool_cls()(**kwargs)
@@ -1148,8 +1148,10 @@ class TestProxyPool:
             pool.translate_loc_from_full_to_swa(torch.zeros(1))
 
     def test_refusals(self, real_sglang, monkeypatch):
+        _install_builder(monkeypatch, _small_geometry())
         # Built without the sizing hook's builder: its buffers would be
         # outside the profiled budget.
+        monkeypatch.setattr(bridge, "_V41_BUILDER", None)
         with pytest.raises(RuntimeError, match="before the metadata builder"):
             _proxy()
 
@@ -1250,6 +1252,7 @@ class TestPublication:
 def _kvc(context_len=4096, hf_config=None):
     return SimpleNamespace(
         page_size=PAGE,
+        is_draft_worker=False,
         model_config=SimpleNamespace(
             context_len=context_len,
             hf_config=hf_config or _sglang_normalized_v41(),
@@ -1319,6 +1322,9 @@ class TestPoolSizing:
     def test_target_detection(self, sizing):
         assert bridge._is_atom_v41_target(_kvc())
         assert not bridge._is_atom_v41_target(_kvc(hf_config=_deepseek_v4()))
+        draft = _kvc()
+        draft.is_draft_worker = True
+        assert not bridge._is_atom_v41_target(draft)
 
 
 def test_sizing_patch_routes_only_v41(real_sglang, sglang_launch, monkeypatch):
@@ -1502,11 +1508,16 @@ class TestMoeCompaction:
 class TestBackendShim:
     def _runner(self, pool):
         return SimpleNamespace(
-            device="cpu", token_to_kv_pool=pool, req_to_token_pool=object()
+            device="cpu",
+            token_to_kv_pool=pool,
+            req_to_token_pool=object(),
+            is_draft_worker=False,
         )
 
     def _backend(self):
-        pool = SimpleNamespace(is_atom_v41_proxy_pool=True)
+        pool = SimpleNamespace(
+            is_atom_v41_proxy_pool=True, is_atom_v41_draft_proxy=False
+        )
         return ATOMDeepseekV41BackendForSgl(self._runner(pool))
 
     def test_publishes_pools_and_keeps_no_step_state(self):
@@ -1945,6 +1956,7 @@ def graph_backend(real_sglang, monkeypatch):
         device="cpu",
         token_to_kv_pool=pool,
         req_to_token_pool=SimpleNamespace(req_to_token=table),
+        is_draft_worker=False,
     )
     return SimpleNamespace(
         backend=ATOMDeepseekV41BackendForSgl(runner),

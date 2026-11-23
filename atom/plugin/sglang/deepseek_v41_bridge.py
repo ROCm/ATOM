@@ -84,6 +84,7 @@ from sglang.srt.model_executor.forward_context import (
 )
 
 from atom.model_engine.sequence import Replay
+from atom.plugin.sglang import deepseek_v41_envs
 from atom.plugin.sglang import deepseek_v41_radix as radix
 
 logger = logging.getLogger("atom")
@@ -162,6 +163,56 @@ def is_v41_dspark_atom_config(atom_config: Any) -> bool:
         speculative is not None
         and speculative.method == "dspark"
         and is_deepseek_v41_config(atom_config.hf_config)
+    )
+
+
+def build_v41_dspark_speculative_config(server_args: Any, hf_config: Any):
+    """SGLang DSPARK on a V4.1 checkpoint -> ATOM's native ``SpeculativeConfig``.
+
+    The same object native ATOM builds from ``--method dspark
+    --num-speculative-tokens 5`` (`arg_utils`): ``draft_model_hf_config`` is
+    left to ATOM's own loader, so the draft config is ATOM's parse of the
+    checkpoint, never a mutated view of SGLang's (`hf_config_override` writes
+    into whatever it is handed). Its effect on the target is the pool geometry
+    (`build_v41_pool_geometry(speculative_tokens=5)`), and native
+    `validate_speculative_config` checks it again when ``Config`` is built.
+    """
+    from sglang.srt.runtime_context import get_spec
+
+    # The algorithm is DSPARK: SGLang refuses any other for V4.1
+    # (`validate_deepseek_v41_features`) while it resolves the server args,
+    # and its DSpark resolution (`_handle_dspark`) sets the verify width and
+    # the draft path or refuses the launch.
+    spec = get_spec()
+    reason = v41_dspark_capability_error(hf_config)
+    if reason is not None:
+        raise ValueError(f"DeepSeek-V4.1 DSpark is not servable: {reason}")
+    verify_tokens = spec.speculative_num_draft_tokens
+    if int(verify_tokens) != V41_DSPARK_VERIFY_TOKENS:
+        raise ValueError(
+            "DeepSeek-V4.1 DSpark verifies the bonus token and five drafts: "
+            f"launch with --speculative-num-draft-tokens {V41_DSPARK_VERIFY_TOKENS}"
+            f" (got {verify_tokens})"
+        )
+    model_path = server_args.model_path
+    draft_path = spec.speculative_draft_model_path
+    if draft_path != model_path:
+        raise ValueError(
+            "DeepSeek-V4.1 DSpark loads its draft from the target checkpoint; "
+            f"got --speculative-draft-model-path {draft_path}"
+        )
+
+    from atom.config import SpeculativeConfig
+
+    logger.info(
+        "SGLang+ATOM speculative_config method=dspark tokens=%d model=%s",
+        V41_DSPARK_DRAFT_TOKENS,
+        model_path,
+    )
+    return SpeculativeConfig(
+        method="dspark",
+        model=model_path,
+        num_speculative_tokens=V41_DSPARK_DRAFT_TOKENS,
     )
 
 
@@ -289,7 +340,6 @@ def refuse_unsupported_sglang_features() -> None:
     from sglang.srt import runtime_context as sglang_config
     from sglang.srt.environ import envs as sglang_envs
 
-    from atom.plugin.sglang import deepseek_v41_envs
     from atom.utils import envs as atom_envs
 
     memory = sglang_config.get_memory()
@@ -327,10 +377,6 @@ def refuse_unsupported_sglang_features() -> None:
         ("--disable-hybrid-swa-memory", schedule.disable_hybrid_swa_memory),
         # The ATOM arena is allocated outside SGLang's memory-saver region.
         ("--enable-memory-saver", exec_.features.enable_memory_saver),
-        (
-            "speculative decoding",
-            sglang_config.get_spec().speculative_algorithm is not None,
-        ),
         ("PD disaggregation", str(disagg.disaggregation_mode) != "null"),
         ("DP attention", parallel.enable_dp_attention),
         # Either makes SGLang gather attention inputs across attention-TP
@@ -377,10 +423,73 @@ def refuse_unsupported_sglang_features() -> None:
     if not memory.disable_radix_cache:
         unsupported += _radix_refusals(memory, schedule)
     refused = [name for name, enabled in unsupported if enabled]
+    spec = sglang_config.get_spec()
+    if spec.speculative_algorithm is not None:
+        refused.extend(_dspark_launch_refusals(spec, exec_))
     if refused:
         raise ValueError(
             "DeepSeek-V4.1 on the SGLang plugin does not support " + ", ".join(refused)
         )
+
+
+def _dspark_launch_refusals(spec, exec_) -> list:
+    """What a DSpark V4.1 launch asks for that the DSpark path does not
+    serve: static verify, with or without the overlap schedule; decode graphs
+    off, prefill eager. SGLang's own variables are read through SGLang's
+    ``envs``, parsed as SGLang parses them.
+
+    The algorithm is DSPARK: SGLang refuses any other for V4.1, and its
+    unified-kv DSV4 ring, while it resolves the server args
+    (`validate_deepseek_v41_features`). The five drafts and the target's
+    checkpoint are checked when ATOM's ``Config`` is built, before this runs
+    (`build_v41_dspark_speculative_config`)."""
+    from sglang.srt.environ import envs as sglang_envs
+
+    refused = []
+    mode = sglang_envs.SGLANG_RAGGED_VERIFY_MODE.get().strip().lower()
+    if mode != "static":
+        refused.append(
+            f"SGLANG_RAGGED_VERIFY_MODE={mode} (DSpark verify must be static)"
+        )
+    decode = exec_.graph.cuda_graph_config.decode.backend
+    if decode != "disabled":
+        refused.append(
+            f"DSpark with the {decode} decode CUDA graph backend (launch with "
+            "--cuda-graph-backend-decode disabled)"
+        )
+    # The overlap schedule is served (see "DSpark under the overlap schedule"
+    # in the module docstring): a round's verify, accept and commit are one
+    # `forward_batch_generation` call on the scheduler thread and the forward
+    # stream, so the verify's tentative step is committed, in the epoch it
+    # opened, before the next round is staged.
+    if not sglang_envs.SGLANG_DSPARK_EMBED_IN_GRAPH.get():
+        # The ATOM draft embeds its own block; SGLang would pass input_embeds.
+        refused.append("SGLANG_DSPARK_EMBED_IN_GRAPH=0 (the ATOM draft embeds)")
+    # SGLang's parse: unset or unparsable is -1, off; it simulates above 0.
+    simulated = float(sglang_envs.SGLANG_SIMULATE_ACC_LEN.get())
+    if (
+        simulated > 0
+        and simulated != 1.0
+        and not deepseek_v41_envs.ATOM_SGLANG_V41_DSPARK_ALLOW_SIMULATED_ACC
+    ):
+        # A fixed acceptance length commits draft tokens the target did not
+        # choose: the text is not the model's. Benchmarks at a fixed mean
+        # accept length (native's --spec-decode-acceptance-length) opt in.
+        refused.append(
+            f"SGLANG_SIMULATE_ACC_LEN={simulated} (only 1.0, the verify-only "
+            "test, unless ATOM_SGLANG_V41_DSPARK_ALLOW_SIMULATED_ACC=1 for a "
+            "perf run)"
+        )
+    if spec.speculative_use_block_verification:
+        refused.append("DSpark block verification")
+    if exec_.features.enable_decoder_swa_bounded_replay:
+        # DSpark runs without decoder replay (`_deepseek_v41_decoder_replays`):
+        # SGLang's flag would be accepted and then overridden.
+        refused.append(
+            "--enable-decoder-swa-bounded-replay with DSpark (DSpark runs "
+            "without decoder SWA bounded replay)"
+        )
+    return refused
 
 
 def align_atom_config_with_sglang(atom_config: Any) -> None:
@@ -792,6 +901,8 @@ def _make_proxy_pool_cls():
         every argument below."""
 
         is_atom_v41_proxy_pool = True
+        # The DSpark draft runner's role view (`_init_draft_role`).
+        is_atom_v41_draft_proxy = False
         atom_cache = None
         # SGLang reads these off any DSV4 pool (no SWA allocator, no rings).
         _unified_kv = False
@@ -818,8 +929,24 @@ def _make_proxy_pool_cls():
             end_layer: int,
             num_req_slots: int,
             full_size: int,
+            is_draft_worker: bool,
             **_unused_kwargs: Any,
         ) -> None:
+            if is_draft_worker:
+                self._init_draft_role(
+                    max_num_reqs=max_num_reqs,
+                    swa_size=swa_size,
+                    page_size=page_size,
+                    swa_page_size=swa_page_size,
+                    dtype=dtype,
+                    layer_num=layer_num,
+                    device=device,
+                    start_layer=start_layer,
+                    end_layer=end_layer,
+                    full_size=full_size,
+                )
+                return
+            self.is_atom_v41_draft_proxy = False
             if _V41_BUILDER is None:
                 # No sizing hook ran: the builder is outside the profiled budget.
                 raise RuntimeError(
@@ -899,10 +1026,76 @@ def _make_proxy_pool_cls():
                 self.size,
             )
 
+        def _init_draft_role(
+            self,
+            *,
+            max_num_reqs,
+            swa_size,
+            page_size,
+            swa_page_size,
+            dtype,
+            layer_num,
+            device,
+            start_layer,
+            end_layer,
+            full_size,
+        ) -> None:
+            """The DSpark draft runner's pool: a role view of the target arena.
+
+            The draft's whole KV is its context window, rings 40-42 of the
+            requests' own STATE slots, which the target pool already holds
+            and prices (`geometry.state_bytes` at ``spec=5``). So this pool
+            allocates nothing and binds the target's ATOM cache. Same class
+            as the target's, so SGLang's DSV4 ``isinstance`` checks hold;
+            ``is_atom_v41_draft_proxy`` tells the roles apart. It defines no
+            ``set_swa_key_buffer_radix_fused_norm_rope``, so SGLang's injector
+            hands the target hidden to the draft model
+            (``write_target_hidden_kv``) instead of writing MLA rows here.
+            """
+            # SGLang builds the target worker (and its pool, which binds the
+            # builder's cache) before the draft worker; the builder checked
+            # the arena's DSpark geometry (`_check_dspark_geometry`), and
+            # SGLang's page size is the target's.
+            builder = get_deepseek_v41_builder()
+            geometry = builder.geometry
+            self.is_atom_v41_draft_proxy = True
+            self.max_num_reqs = int(max_num_reqs)
+            self.page_size = int(page_size)
+            self.swa_page_size = int(swa_page_size)
+            self.dtype = dtype
+            self.store_dtype = torch.uint8
+            self.device = device
+            self.start_layer = int(start_layer)
+            self.end_layer = int(end_layer)
+            self.layer_num = int(layer_num)
+            # SGLang sizes the draft from the target's pool config: the same
+            # hybrid-SWA full count (DeepseekV4ForCausalLMDSpark is hybrid-SWA).
+            self.size = self.full_size = int(full_size)
+            self.swa_size = self.size_swa = int(swa_size)
+            self.full_to_swa_index_mapping = None
+            cache = builder.cache
+            self.num_pages, self.num_slots = cache.num_pages, cache.num_slots
+            self.atom_cache = cache
+            self.raw_arena = torch.empty(0, dtype=torch.uint8, device=device)
+            self.mem_usage = 0.0
+            logger.info(
+                "ATOM DeepSeek-V4.1 proxy pool: role=draft bound to the target "
+                "arena (%d STATE slots, window rings of layers %s), 0 B allocated",
+                self.num_slots,
+                tuple(
+                    range(
+                        geometry.layers - V41_DSPARK_STAGES,
+                        geometry.layers,
+                    )
+                ),
+            )
+
         def get_kv_size_bytes(self):
             return self.raw_arena.nbytes
 
         def register_mapping(self, full_to_swa_index_mapping: torch.Tensor) -> None:
+            if self.is_atom_v41_draft_proxy:
+                return
             self.full_to_swa_index_mapping = full_to_swa_index_mapping
 
         def translate_loc_from_full_to_swa(
@@ -943,8 +1136,11 @@ def _make_proxy_pool_cls():
 def _is_atom_v41_target(kvc) -> bool:
     """Whether SGLang's KV configurator is building this plugin's V4.1 pool."""
     # Installed from `prepare_model`'s V4.1 branch only, so ``kvc.model`` is
-    # the ATOM wrapper. No draft worker exists: speculative decoding is refused.
-    return is_deepseek_v41_config(kvc.model_config.hf_config)
+    # the ATOM wrapper. The DSpark draft worker's pool is a role view of the
+    # target's arena: it is not sized or profiled here.
+    return not kvc.is_draft_worker and is_deepseek_v41_config(
+        kvc.model_config.hf_config
+    )
 
 
 def _make_pool_configurator_cls():

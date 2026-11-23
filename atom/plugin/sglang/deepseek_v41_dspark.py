@@ -6,16 +6,26 @@ off the target wrapper (``lm_head`` with ``weight``, ``get_input_embeddings``,
 ``set_dspark_layers_to_capture``), ATOM's own aux taps on target layers 37-39,
 and the draft's context-KV write inside the target forward that produced the
 rows -- native ``DSparkProposer.compute_draft_kv``'s place and contract.
+
+Draft side (`draft_block_inputs`, `v41_dspark_draft_forward_context`): one
+draft block per forward, a TARGET_VERIFY of five rows a request on the draft
+runner, translated into ATOM's ``block_backbone`` call. Every value comes from
+the current ``ForwardBatch`` and the current runner's pool; nothing is carried
+from the target's verify.
 """
 
 from __future__ import annotations
 
 import logging
 import weakref
+from contextlib import contextmanager
+from types import SimpleNamespace
+from typing import Any
 
 import torch
 
 from atom.plugin.sglang.deepseek_v41_bridge import (
+    V41_DSPARK_DRAFT_TOKENS,
     _is_target_verify,
     install_deepseek_v41_dspark_commit_patch,
 )
@@ -246,3 +256,92 @@ def install_v41_dspark_target_surface(wrapper) -> V41DSparkTargetSurface:
         "embeddings, capture layers, in-forward draft context write"
     )
     return surface
+
+
+# --- Draft ---
+
+
+def draft_block_inputs(
+    forward_batch, input_ids, positions, *, noise_token_id: int, width=None
+):
+    """The draft block of one draft forward, from the current ``ForwardBatch``.
+
+    SGLang runs the block as a TARGET_VERIFY of ``draft_token_num`` (5) rows a
+    request: ``[bonus, noise x 4]`` at positions ``p..p+4``, with ``p`` the
+    committed length (``seq_lens``). ATOM's ``block_backbone`` takes the bonus
+    as the anchor token and its anchor position as the last processed target
+    row, ``p - 1``, whose block runs at ``anchor + 1 .. anchor + 5``.
+    """
+    width = V41_DSPARK_DRAFT_TOKENS if width is None else int(width)
+    mode = forward_batch.forward_mode
+    if not _is_target_verify(mode):
+        raise NotImplementedError(
+            f"DeepSeek-V4.1 DSpark draft runs only its block (TARGET_VERIFY); got {mode}"
+        )
+    # SGLang's block is ``gamma`` (5) rows a request (`spec_info.draft_token_num`).
+    bs = int(forward_batch.batch_size)
+    ids = input_ids.view(bs, width)
+    pos = positions.view(bs, width)
+    return SimpleNamespace(
+        bs=bs,
+        width=width,
+        anchor_ids=ids[:, 0].contiguous(),
+        # A no-op on a live row (position >= 1). A graph's padding row (SGLang
+        # zero-pads positions and req_pool_indices) then drafts what native's
+        # `_stage_anchors_kernel` pads with: anchor position 0 in STATE slot
+        # 0, the never-allocated padding row.
+        anchor_positions=(pos[:, 0] - 1).clamp_min(0).contiguous(),
+        slots=forward_batch.req_pool_indices[:bs].to(torch.int32).contiguous(),
+        positions=positions.reshape(-1),
+    )
+
+
+@contextmanager
+def v41_dspark_draft_forward_context(atom_config: Any, *, cache, block):
+    """ATOM's forward context for one draft block: the current draft pool's
+    cache, the block's own STATE slots, a decode-shaped context of
+    ``bs * width`` rows marked as a draft pass. No target step rides along
+    (``step`` is None): the block reads committed windows only
+    (`read_windows` refuses while a tentative step is pending)."""
+    from atom.utils.forward_context import (
+        AttentionMetaData,
+        AttnState,
+        Context,
+        DPMetadata,
+        RoundService,
+        reset_forward_context,
+        set_forward_context,
+    )
+
+    rows = block.bs * block.width
+    metadata = AttentionMetaData(max_seqlen_q=block.width, state=AttnState.DECODE)
+    metadata.cache = cache
+    metadata.step = None
+    metadata.state_slot_out = block.slots
+    metadata.served_by_round = RoundService.NONE
+    metadata.queries = None
+    metadata.image_mask = None
+    metadata.dummy = False
+    context = Context(
+        positions=block.positions,
+        is_prefill=False,
+        is_dummy_run=False,
+        scheduled_bs=block.bs,
+        scheduled_tokens=rows,
+        running_bs=block.bs,
+        running_tokens=rows,
+        is_draft=True,
+        running_tokens_are_unified=True,
+    )
+    set_forward_context(
+        attn_metadata=metadata,
+        atom_config=atom_config,
+        context=context,
+        running_tokens_per_dp_rank=DPMetadata.gather_running_tokens(
+            atom_config.parallel_config, rows
+        ),
+    )
+    try:
+        yield metadata
+    finally:
+        reset_forward_context()
