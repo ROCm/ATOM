@@ -2635,6 +2635,7 @@ class EPLBManager:
                     budget=budget,
                     eps=envs.ATOM_EPLB_SWAP_EPS,
                     layer_ids=sorted(self._moe_layers),
+                    hot_first=envs.ATOM_EPLB_HOT_FIRST,
                 )
             except Exception as exc:  # noqa: BLE001
                 # The plan is a function of the group's loads alone, so every
@@ -3081,6 +3082,27 @@ class EPLBManager:
             )
             before = gate_permute.ranks_of(p2l_before, per_rank)
             after = gate_permute.ranks_of(p2l_after, per_rank)
+            # How hot-first the ranks are: the share of a rank's prefill picks
+            # in its first 4 slots (ATOM_EPLB_HOT_FIRST orders them so).
+            head = [
+                float(
+                    sum(
+                        gate_permute.head_share(table[i], pf[i], per_rank, 4)
+                        for i in layer_ids
+                    )
+                    / max(1, len(layer_ids))
+                )
+                for table in (p2l_before, p2l_after)
+            ]
+            logger.info(
+                "%s rebalance #%d order: prefill share in a rank's first 4 "
+                "slots before=%.3f after=%.3f (hot_first=%d)",
+                tag,
+                rc,
+                head[0],
+                head[1],
+                int(envs.ATOM_EPLB_HOT_FIRST),
+            )
             identity = before * 0 + (
                 torch.arange(meta.num_logical_experts).numpy() // per_rank
             )

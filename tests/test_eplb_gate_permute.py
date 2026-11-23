@@ -1275,3 +1275,49 @@ def test_the_count_flag_follows_counting(monkeypatch):
     env.gp.observing = False
     env.gp.sync_count_flag()
     assert flag.tolist() == [0]
+
+
+def test_hot_first_rebalance_orders_every_rank_and_moves_gate_with_it(
+    monkeypatch, caplog
+):
+    """ATOM_EPLB_HOT_FIRST: the plan also orders each rank's experts by load;
+    weights, maps, gate rows and the fold index follow as for any other plan."""
+    manager, gates, layers = _bound_manager(
+        monkeypatch,
+        ATOM_EPLB_GATE_PERMUTE=1,
+        ATOM_EPLB_SWAP_BUDGET=2,
+        ATOM_EPLB_SWAP_EPS=0,
+        ATOM_EPLB_HOT_FIRST=1,
+    )
+    gpr = manager.gate_permute
+    pristine = {i: _Gate(seed=i) for i in gates}
+    pf, dec = _skewed(1), _skewed(2)
+    gpr.pf_total.copy_(pf)
+    gpr.dec_load.copy_(dec)
+    gpr.dec_rows, gpr.dec_steps = 480, 20
+    monkeypatch.setattr(
+        eplb, "migrate_experts_chunk", lambda **kw: {i: [] for i in kw["layer_ids"]}
+    )
+    monkeypatch.setattr(
+        eplb,
+        "commit_experts_chunk",
+        lambda **kw: kw["live_meta"].update(kw["new_meta"], list(kw["layer_ids"])),
+    )
+    with caplog.at_level(logging.INFO, logger="atom"):
+        _drain(manager._rebalance())
+
+    meta = manager.live_metadata
+    p2l = meta.physical_to_logical_map
+    per = meta.num_local_physical_experts
+    for i in gates:
+        row = p2l[i].long()
+        assert sorted(row.tolist()) == list(range(EXPERTS))
+        key = gp.hot_key(pf[i].numpy().astype(float), dec[i].numpy().astype(float))
+        for start in range(0, EXPERTS, per):
+            assert np.all(np.diff(key[row[start : start + per].numpy()]) <= 0)
+        assert torch.equal(gates[i].weight.data, pristine[i].weight.data[row])
+        assert torch.equal(gpr.fold_index[i], meta.logical_to_physical_map[i, :, 0])
+    text = "\n".join(r.getMessage() for r in caplog.records if gp.TAG in r.getMessage())
+    assert "rebalance #1 order: prefill share in a rank's first 4 slots" in text
+    assert "(hot_first=1)" in text and "FATAL" not in text
+    assert manager.rebalance_count == 1

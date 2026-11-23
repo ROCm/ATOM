@@ -215,9 +215,13 @@ def swap_rebalance(
     budget: int | None,
     eps: float,
     layer_ids: list[int] | None = None,
+    hot_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[int, int]]:
     """The "swap" policy: `rebalance_experts`' result for a placement that
     differs from ``old_p2l`` by at most ``budget`` pairwise swaps a layer.
+    ``hot_first`` then orders every rank's experts by load, the heaviest in
+    the rank's first slot (`order_within_ranks`): which rank holds an expert
+    is the swaps' alone.
 
     ``pf_load`` / ``dec_load``: [layers, logical] pick counts (prefill, sampled
     decode; None: none), ``rows_per_step`` the group's decode rows a step.
@@ -257,6 +261,11 @@ def swap_rebalance(
             p2l[layer, slot_a], p2l[layer, slot_b] = b, a
             l2p[layer, a], l2p[layer, b] = slot_b, slot_a
         swaps[layer] = len(done)
+        if hot_first:
+            p2l[layer] = order_within_ranks(
+                p2l[layer], hot_key(pf[layer], dec[layer]), per
+            )
+            l2p[layer, p2l[layer]] = slots
     dev = old_p2l.device
     return (
         torch.from_numpy(p2l).to(dev, torch.int32),
@@ -264,6 +273,43 @@ def swap_rebalance(
         torch.ones((num_layers, num_physical), dtype=torch.int32, device=dev),
         swaps,
     )
+
+
+def hot_key(pf: np.ndarray, dec: np.ndarray) -> np.ndarray:
+    """What "hot" is for the order inside a rank: an expert's share of the
+    layer's prefill picks plus its share of the decode picks (either alone
+    where the other has none)."""
+    key = np.zeros(pf.shape, dtype=np.float64)
+    for load in (pf, dec):
+        total = float(load.sum())
+        if total > 0:
+            key += load / total
+    return key
+
+
+def order_within_ranks(p2l: np.ndarray, key: np.ndarray, per_rank: int) -> np.ndarray:
+    """One layer's ``p2l`` (slot -> logical expert) with every rank's experts
+    in descending ``key`` ([logical]), ties in their present slot order. The
+    experts of a rank stay the rank's; only their slots inside it change."""
+    out = p2l.copy()
+    for start in range(0, p2l.shape[0], per_rank):
+        experts = p2l[start : start + per_rank]
+        out[start : start + per_rank] = experts[
+            np.argsort(-key[experts], kind="stable")
+        ]
+    return out
+
+
+def head_share(p2l: np.ndarray, load: np.ndarray, per_rank: int, head: int) -> float:
+    """How hot-first one layer's placement is: the mean over ranks of the
+    share of the rank's ``load`` that sits in its first ``head`` slots."""
+    shares = []
+    for start in range(0, p2l.shape[0], per_rank):
+        mine = load[p2l[start : start + per_rank]]
+        total = float(mine.sum())
+        if total > 0:
+            shares.append(float(mine[:head].sum()) / total)
+    return float(np.mean(shares)) if shares else 0.0
 
 
 # ---------------------------------------------------------------- metrics

@@ -1236,6 +1236,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_EPLB_GP_COUNT": lambda: os.getenv("ATOM_EPLB_GP_COUNT", "triton")
     .strip()
     .lower(),
+    # The swap policy also orders every rank's experts by load, the heaviest
+    # in the rank's first slot (a static table built by greedy packing has
+    # that order, and the expert kernels walk a rank's experts in slot order).
+    "ATOM_EPLB_HOT_FIRST": lambda: _flag_env("ATOM_EPLB_HOT_FIRST", "0"),
     # Gate-permute: about how many 256-id blocks of a prefill pass the count
     # launch reads, evenly spread and scaled back up (0: every id). Every
     # block adds to the same counters, so a pass counted whole queues on them.

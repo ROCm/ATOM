@@ -334,3 +334,50 @@ def test_count1_placement_depends_on_the_operating_point():
         assert max(proxy_max(low, rows), proxy_max(high, rows)) < proxy_max(
             identity, rows
         )
+
+
+def test_hot_first_orders_each_rank_and_keeps_its_experts():
+    """`hot_first`: the swaps alone decide an expert's rank; inside a rank the
+    experts then sit in descending load, the heaviest in the rank's first
+    slot, and the result is still a permutation `rebalance_experts` returns."""
+    rng = np.random.default_rng(3)
+    layers, experts, ranks = 3, 48, 8
+    per = experts // ranks
+    pf = torch.from_numpy(rng.pareto(1.2, (layers, experts)) * 1000).to(torch.int64)
+    dec = torch.from_numpy(rng.pareto(1.5, (layers, experts)) * 100).to(torch.int64)
+    old = torch.stack([torch.randperm(experts) for _ in range(layers)]).to(torch.int32)
+    kwargs = dict(num_gpus=ranks, top_k=6, budget=4, eps=0.005)
+    plain, _, _, swaps = gp.swap_rebalance(pf, dec, 64.0, old, **kwargs)
+    hot, l2p, cnt, swaps_hot = gp.swap_rebalance(
+        pf, dec, 64.0, old, hot_first=True, **kwargs
+    )
+    assert swaps == swaps_hot
+    assert hot.dtype == torch.int32 and tuple(l2p.shape) == (layers, experts, 1)
+    for layer in range(layers):
+        key = gp.hot_key(pf[layer].numpy().astype(float), dec[layer].numpy().astype(float))
+        row, base = hot[layer].numpy(), plain[layer].numpy()
+        assert sorted(row.tolist()) == list(range(experts))
+        assert np.array_equal(l2p[layer, :, 0].numpy()[row], np.arange(experts))
+        for start in range(0, experts, per):
+            mine = row[start : start + per]
+            assert set(mine.tolist()) == set(base[start : start + per].tolist())
+            assert np.all(np.diff(key[mine]) <= 0)
+        assert gp.head_share(row, pf[layer].numpy().astype(float), per, 1) >= (
+            gp.head_share(base, pf[layer].numpy().astype(float), per, 1)
+        )
+    # idempotent: an ordered placement with nothing to swap stays as it is
+    again, _, _, none = gp.swap_rebalance(
+        pf, dec, 64.0, hot, hot_first=True, **dict(kwargs, budget=0)
+    )
+    assert torch.equal(again, hot) and not any(none.values())
+
+
+def test_order_within_ranks_is_stable_and_takes_one_kind_of_load():
+    p2l = np.array([3, 1, 2, 0, 7, 5, 6, 4])
+    key = np.array([5.0, 5.0, 9.0, 1.0, 2.0, 2.0, 2.0, 8.0])
+    out = gp.order_within_ranks(p2l, key, 4)
+    assert out.tolist() == [2, 1, 0, 3, 7, 5, 6, 4]  # ties keep their slot order
+    pf = np.array([4.0, 0.0, 4.0, 0.0])
+    assert gp.hot_key(pf, np.zeros(4)).tolist() == [0.5, 0.0, 0.5, 0.0]
+    assert gp.hot_key(np.zeros(4), pf).tolist() == [0.5, 0.0, 0.5, 0.0]
+    assert gp.hot_key(pf, pf).tolist() == [1.0, 0.0, 1.0, 0.0]
