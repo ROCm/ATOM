@@ -1359,9 +1359,15 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         self.index_scale: torch.Tensor | None = None
         self.index_stage: torch.Tensor | None = None
         self.index_stage_slots: torch.Tensor | None = None
+        # The K/V format this layer's pool is built in ("nvfp4", or "" for the
+        # cache dtype's own), fixed here: the metadata builder sizes and binds
+        # the pool by it (`_module_kinds`), and a forward traced before the
+        # cache is bound (torch.compile's, in the warmup run) can branch on it.
+        self.kv_format = "nvfp4" if envs.ATOM_M3_SPARSE_KV_NVFP4 else ""
         # ATOM_M3_SPARSE_KV_NVFP4: the bound k/v caches are NVFP4 payload planes
         # and k/v_scale their E4M3 scale planes; the fused qk-norm/rope/cache
-        # write quantizes K/V into them (aiter's NVFP4 row layout).
+        # write quantizes K/V into them (aiter's NVFP4 row layout). Set when
+        # the cache is bound.
         self.kv_nvfp4: bool = False
         self._nvfp4_attention_checked = False
         # Optional shared dict bound by the metadata builder. It is scoped to the
