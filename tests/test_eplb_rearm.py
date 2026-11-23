@@ -6,6 +6,8 @@
 import logging
 from types import SimpleNamespace
 
+import os
+
 import pytest
 from import_guard import skip_if_dependency_missing
 
@@ -1040,3 +1042,67 @@ def test_lazy_migration_group_is_made_at_the_first_rebalance_and_destroyed_at_th
     kept = manager._migration_group
     manager._release_migration_group()
     assert manager._migration_group is kept and manager._ensure_migration_group() is kept
+
+
+def test_host_transport_moves_experts_between_ranks_through_files(tmp_path, monkeypatch):
+    """ATOM_EPLB_MIGRATE_VIA=shm: `_migrate_single_layer` with a
+    `HostExpertTransport` in place of the process group gives every rank's
+    temp buffers the bytes of the experts it takes, for whole-layer plans
+    with moves inside and across ranks, and removes its files."""
+    ranks, per, experts = 4, 4, 16
+    gen = torch.Generator().manual_seed(5)
+    # one weight tensor in a packed dtype view and one scale tensor, per rank
+    full = [
+        torch.randint(0, 255, (experts, 6, 8), generator=gen, dtype=torch.uint8),
+        torch.randn(experts, 3, generator=gen),
+    ]
+    old = torch.arange(experts)
+    new = torch.tensor([5, 1, 2, 0, 4, 3, 6, 15, 8, 9, 10, 11, 12, 13, 14, 7])
+    barriers = []
+    monkeypatch.setattr(torch.distributed, "barrier", lambda group: barriers.append(group))
+    weights = [[t[r * per : (r + 1) * per].clone() for t in full] for r in range(ranks)]
+    buffers = [[torch.zeros_like(w) for w in weights[r]] for r in range(ranks)]
+    transports = [eplb.HostExpertTransport("cpu", str(tmp_path), r) for r in range(ranks)]
+    assert eplb.layer_changes_rank(old, new, per)
+    assert not eplb.layer_changes_rank(old, torch.tensor([1, 0, *range(2, 16)]), per)
+
+    # the ranks run the layer one after another here; each one's sends are on
+    # the host before any reads because the plan is run in two passes
+    plans, pending = {}, []
+    for r in range(ranks):
+        plan, local, sends, recvs = eplb._plan_single_layer_migration(
+            old_p2l_layer=old, new_p2l_layer=new, num_local_physical_experts=per,
+            num_gpu_per_node=ranks, rank=r, world_size=ranks,
+        )
+        plans[r] = plan
+        for action in local:
+            for w, b in zip(weights[r], buffers[r]):
+                b[action.dst_slot].copy_(w[action.src_slot])
+        pending.append((sends, recvs))
+    for r, (sends, _) in enumerate(pending):  # every rank writes ...
+        transports[r].seq = 1
+        for action in sends:
+            for part, w in enumerate(weights[r]):
+                eplb._as_p2p_bytes(w[action.local_slot]).reshape(-1).numpy().tofile(
+                    transports[r]._path(int(action.logical_expert_id), part)
+                )
+    for r, (_, recvs) in enumerate(pending):  # ... then every rank reads
+        transports[r].seq = 0
+        transports[r].exchange(weights[r], buffers[r], [], recvs)
+    for r in range(ranks):
+        for dst_primary, dst in plans[r]:
+            for part in range(2):
+                logical = int(new[r * per + dst])
+                assert torch.equal(buffers[r][part][dst_primary], full[part][logical])
+    assert len(barriers) == 2 * ranks
+
+    # one rank end to end through `exchange`: writes once, cleans up
+    t = eplb.HostExpertTransport("cpu", str(tmp_path / "solo"), 0)
+    send = [type("A", (), dict(logical_expert_id=3, peer_rank=1, local_slot=3))()]
+    seen = []
+    monkeypatch.setattr(
+        torch.distributed, "barrier", lambda group: seen.append(sorted(os.listdir(t.directory)))
+    )
+    t.exchange(weights[0], buffers[0], send + send, [])
+    assert seen[0] == ["x1_e3_0.bin", "x1_e3_1.bin"] and os.listdir(t.directory) == []
+    assert t.bytes_moved == 6 * 8 + 3 * 4

@@ -1236,6 +1236,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_EPLB_GP_COUNT": lambda: os.getenv("ATOM_EPLB_GP_COUNT", "triton")
     .strip()
     .lower(),
+    # "shm": experts change rank through files under ATOM_EPLB_SHM_DIR (default
+    # /dev/shm/atom_eplb_<uid>_<port>) with barriers of the CPU group, and the
+    # loads are summed over the CPU group: EPLB uses no device process group
+    # at all (no redundant experts only). "p2p" (default): device P2P.
+    "ATOM_EPLB_MIGRATE_VIA": lambda: os.getenv("ATOM_EPLB_MIGRATE_VIA", "p2p")
+    .strip()
+    .lower(),
+    "ATOM_EPLB_SHM_DIR": lambda: os.getenv("ATOM_EPLB_SHM_DIR", "").strip(),
     # EPLB makes its migration process group at the first rebalance instead of
     # at init, reduces the loads over it, and destroys it when the placement
     # freezes: no device communicator of EPLB's exists before or after the

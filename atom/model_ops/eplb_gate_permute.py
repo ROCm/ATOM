@@ -924,7 +924,15 @@ class GatePermuteRuntime:
         payload = torch.cat(parts)
         world = int(getattr(group, "world_size", 1)) if group is not None else 1
         device_group = getattr(group, "device_group", None)
-        if world > 1:
+        if world > 1 and getattr(group, "reduce_on_cpu", False):
+            # No device collective (ATOM_EPLB_MIGRATE_VIA=shm): the sums go
+            # over the CPU group -- one read back from the device a rebalance.
+            host = payload.cpu()
+            torch.distributed.all_reduce(
+                host, op=torch.distributed.ReduceOp.SUM, group=group.cpu_group
+            )
+            payload = host.to(dev)
+        elif world > 1:
             if device_group is None:
                 raise RuntimeError("gate-permute EPLB needs the EP device group")
             torch.distributed.all_reduce(

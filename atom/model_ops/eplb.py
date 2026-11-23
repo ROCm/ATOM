@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import wraps
 from typing import Any
 
+import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
 
@@ -1108,6 +1110,94 @@ def _plan_single_layer_migration(
     return buffer_copy_plan, local_copy_actions, send_actions, recv_actions
 
 
+class HostExpertTransport:
+    """Expert weights between EP ranks through files on a shared host
+    directory (ATOM_EPLB_MIGRATE_VIA=shm), in place of P2P on a device process
+    group: no device communicator exists for it, before, during or after.
+
+    Every rank runs `exchange` for the same layers in the same order. A rank
+    writes each expert it gives away once, all ranks meet at a barrier of the
+    CPU (gloo) group, each reads what it receives into its temp buffers, they
+    meet again, and the writers remove their files.
+    """
+
+    def __init__(self, cpu_group: Any, directory: str, rank: int):
+        self.cpu_group = cpu_group
+        self.directory = directory
+        self.rank = int(rank)
+        self.seq = 0
+        self.bytes_moved = 0
+        os.makedirs(directory, exist_ok=True)
+
+    def _path(self, logical: int, part: int) -> str:
+        return os.path.join(self.directory, f"x{self.seq}_e{logical}_{part}.bin")
+
+    def barrier(self) -> None:
+        if self.cpu_group is not None:
+            torch.distributed.barrier(group=self.cpu_group)
+
+    def exchange(
+        self,
+        weights: list[torch.Tensor],
+        buffers: list[torch.Tensor],
+        sends: list[Any],
+        recvs: list[Any],
+    ) -> None:
+        """One layer's experts that change rank. Called by every rank, also
+        by one that neither gives nor takes (the barriers are collective)."""
+        self.seq += 1
+        mine: list[str] = []
+        written: set[int] = set()
+        for action in sends:
+            logical = int(action.logical_expert_id)
+            if logical in written:
+                continue  # one file an expert, however many ranks read it
+            written.add(logical)
+            for part, w in enumerate(weights):
+                path = self._path(logical, part)
+                data = _as_p2p_bytes(w[action.local_slot]).reshape(-1).cpu().numpy()
+                tmp = f"{path}.{self.rank}.tmp"
+                data.tofile(tmp)
+                os.replace(tmp, path)
+                mine.append(path)
+                self.bytes_moved += int(data.size)
+        self.barrier()  # every rank's files are complete
+        for action in recvs:
+            logical = int(action.logical_expert_id)
+            for part, b in enumerate(buffers):
+                dst = _as_p2p_bytes(b[action.local_slot])
+                data = np.fromfile(self._path(logical, part), dtype=np.uint8)
+                if data.size != dst.numel():
+                    raise RuntimeError(
+                        f"expert {logical} part {part}: {data.size} bytes on the "
+                        f"host, {dst.numel()} expected"
+                    )
+                dst.copy_(torch.from_numpy(data).to(dst.device).view_as(dst))
+        self.barrier()  # every rank has read what it takes
+        for path in mine:
+            try:
+                os.unlink(path)
+            except OSError:  # pragma: no cover - nothing depends on the cleanup
+                pass
+
+
+def layer_changes_rank(
+    old_p2l_layer: torch.Tensor, new_p2l_layer: torch.Tensor, per_rank: int
+) -> bool:
+    """Whether the plan moves an expert of the layer to another rank -- from
+    the global maps, so every rank answers alike."""
+    old = old_p2l_layer.tolist()
+    new = new_p2l_layer.tolist()
+    held = {}
+    for slot, logical in enumerate(old):
+        if logical >= 0:
+            held.setdefault(logical, set()).add(slot // per_rank)
+    for slot, logical in enumerate(new):
+        if logical >= 0 and slot // per_rank not in held.get(logical, ()):
+            return True
+    return False
+
+
 def _migrate_single_layer(
     routed_experts_weights: list[torch.Tensor],
     temp_buffers: list[torch.Tensor],
@@ -1149,6 +1239,17 @@ def _migrate_single_layer(
         for action in local_copy_actions:
             for w, b in zip(routed_experts_weights, temp_buffers):
                 b[action.dst_slot].copy_(w[action.src_slot])
+
+    if isinstance(ep_group, HostExpertTransport):
+        # No device process group: the experts that change rank go through
+        # the host. Every rank enters or skips this together.
+        if layer_changes_rank(
+            old_p2l_layer, new_p2l_layer, num_local_physical_experts
+        ):
+            ep_group.exchange(
+                routed_experts_weights, temp_buffers, send_actions, recv_actions
+            )
+        return buffer_copy_plan
 
     # Build and execute P2P ops for case-4/5.
     ops_by_logical: dict[int, list[Any]] = {}
@@ -1777,6 +1878,7 @@ class EPLBManager:
         self._lazy_group = False
         self._ep_global_ranks: list[int] = []
         self._groups_made = 0
+        self._host_transport: HostExpertTransport | None = None
         self._ep_rank: int = 0
         self._nnodes: int = 1
         self._rebalance_layers_per_chunk: int = 64
@@ -1905,6 +2007,17 @@ class EPLBManager:
                 # Diagnostic: no communicator of EPLB's own; migration P2P
                 # (if any runs) goes over the EP group's.
                 self._migration_group = self._ep_group
+            elif self._host_transport_wanted(meta):
+                # ATOM_EPLB_MIGRATE_VIA=shm: experts change rank through host
+                # files and the loads are summed over the CPU group, so EPLB
+                # never brings up a device communicator.
+                self._host_transport = HostExpertTransport(
+                    getattr(ep, "cpu_group", None),
+                    self._host_transport_dir(),
+                    self._ep_rank,
+                )
+                self._migration_group = self._host_transport
+                self._lazy_group = False
             elif self._lazy_group:
                 # ATOM_EPLB_LAZY_MIGRATION_GROUP: no collective runs at init,
                 # so no device communicator comes up for EPLB until the first
@@ -1966,9 +2079,32 @@ class EPLBManager:
         # the first collective on an NCCL process group. Initialize the dedicated
         # migration group with an all-rank barrier because fill_redundant issues
         # asymmetric P2P operations involving only a subset of EP ranks.
-        if self._migration_group is not None:
+        if self._host_transport is not None:
+            logger.info(
+                "EPLB migrates through host files in %s (no device process group)",
+                self._host_transport.directory,
+            )
+        elif self._migration_group is not None:
             torch.distributed.barrier(group=self._migration_group)
         self.fill_redundant()
+
+    @staticmethod
+    def _host_transport_wanted(meta: Any) -> bool:
+        return (
+            envs.ATOM_EPLB_MIGRATE_VIA == "shm"
+            and meta is not None
+            and meta.num_physical_experts == meta.num_logical_experts
+        )
+
+    @staticmethod
+    def _host_transport_dir() -> str:
+        directory = envs.ATOM_EPLB_SHM_DIR
+        if directory:
+            return directory
+        from atom.config import get_current_atom_config
+
+        port = getattr(get_current_atom_config(), "port", 0)
+        return f"/dev/shm/atom_eplb_{os.getuid()}_{port}"
 
     def _ensure_migration_group(self) -> Any:
         """The process group migration (and, when it is made lazily, the load
@@ -2006,6 +2142,15 @@ class EPLBManager:
         -- or, with a lazily made migration group, that one, so that the EP
         group's own device communicator is never brought up either."""
         group = self.monitor._load_group
+        if self._host_transport is not None:
+            from types import SimpleNamespace
+
+            return SimpleNamespace(
+                world_size=int(getattr(group, "world_size", 1)),
+                device_group=None,
+                cpu_group=self._host_transport.cpu_group,
+                reduce_on_cpu=True,
+            )
         if not self._lazy_group:
             return group
         from types import SimpleNamespace
