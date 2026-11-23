@@ -59,6 +59,7 @@ def _atom_config(**overrides):
         "prefill_context_parallel_size": 1,
         "enable_tbo": False,
         "enable_tbo_decode": False,
+        "eplb_enable": False,
         "compilation_config": SimpleNamespace(level=0, cudagraph_mode=_Mode(False)),
         "kv_cache_dtype": "bf16",
         "index_cache_dtype": "fp8",
@@ -124,6 +125,7 @@ def test_per_request_verify_lengths_are_served(native, schedule, ragged):
         ({"is_multinode_tp": True}, "TP group spans nodes"),
         ({"enable_tbo": True}, "TBO"),
         ({"enable_tbo_decode": True}, "TBO"),
+        ({**_DPA, "eplb_enable": True}, "EPLB"),
         (
             {
                 "compilation_config": SimpleNamespace(
