@@ -128,6 +128,9 @@ pub(crate) struct RequestExtras {
     /// checks.
     pub dp_session_id: Option<String>,
     pub dp_parent_session_id: Option<String>,
+    /// The encoding `TokenBridge.render_chat` kept for this prompt, which
+    /// `submit` hands to preprocessing so the prompt is hashed once.
+    pub prompt_handle: Option<u64>,
 }
 
 /// The session headers, in the OpenAI server's order of preference.
@@ -419,7 +422,10 @@ impl RouterTrait for AtomBridgeRouter {
             match py_bridge::render_chat(&self.runtime.bridge, &body, extras.thinking.as_ref())
                 .await
             {
-                Ok(rendered) => Some(rendered),
+                Ok((rendered, handle)) => {
+                    extras.prompt_handle = handle;
+                    Some(rendered)
+                }
                 Err(response) => return response,
             }
         } else {

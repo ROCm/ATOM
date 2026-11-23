@@ -5,11 +5,14 @@
 OpenAI server's, a request's sequences through CoreManager, its outputs back
 to Rust once per step, and abort."""
 
+import itertools
 import threading
 import types
+from collections import OrderedDict
 
 import pytest
 
+from atom.entrypoints.atomesh import token_bridge
 from atom.entrypoints.atomesh.token_bridge import TokenBridge
 from atom.entrypoints.openai.protocol import (
     DEFAULT_MAX_TOKENS,
@@ -18,6 +21,7 @@ from atom.entrypoints.openai.protocol import (
     DEFAULT_TOP_P,
 )
 from atom.model_engine.request import RequestOutput
+from atom.model_engine.segment_tokenizer import PrefixEncoding
 
 
 class _Seq:
@@ -47,8 +51,9 @@ class _Engine:
             _flush_stream_batch_fn=None,
         )
 
-    def _fanout(self, tokens, sampling, stream_callbacks, **kwargs):
-        self.kwargs = kwargs
+    def _fanout(self, prompt, sampling, stream_callbacks, **kwargs):
+        self.prompt, self.kwargs = prompt, kwargs
+        tokens = getattr(prompt, "token_ids", prompt)
         seqs = [_Seq(tokens, sampling, cb) for cb in stream_callbacks]
         for seq in seqs:
             self.io_processor.requests[seq.id] = seq
@@ -61,11 +66,16 @@ class _Engine:
 
 
 class _Sink:
-    def __init__(self):
-        self.pushes = []
+    def __init__(self, broken=False):
+        self.pushes, self.failed, self.broken = [], [], broken
 
     def push(self, outputs):
+        if self.broken:
+            raise TypeError("cannot convert")
         self.pushes.append(outputs)
+
+    def fail(self, keys, message):
+        self.failed.append((keys, message))
 
 
 def _bridge(engine=None, *, max_model_len=None, output_limit=None, channel=None):
@@ -80,6 +90,8 @@ def _bridge(engine=None, *, max_model_len=None, output_limit=None, channel=None)
     bridge._engine_lock = threading.Lock()
     bridge._seq_ids = {}
     bridge._local = threading.local()
+    bridge._rendered = OrderedDict()
+    bridge._render_handles = itertools.count(1)
     bridge.engine.core_mgr._flush_stream_batch_fn = bridge._flush
     return bridge
 
@@ -219,3 +231,70 @@ def test_a_submit_admission_refuses_never_reaches_core_manager():
         bridge.submit(7, [1, 2, 3, 4], {})
     assert bridge.engine.added == [] and bridge._seq_ids == {}
     assert bridge.engine.io_processor.requests == {}
+
+
+# ── a Python-rendered prompt's encoding ───────────────────────────────────
+
+
+def _rendering(bridge, encoded):
+    bridge._renderer = types.SimpleNamespace(render=lambda request: ("PROMPT", None))
+    bridge.engine.io_processor.encode_prompt = lambda prompt: encoded
+
+
+def test_the_encoding_render_chat_built_reaches_preprocessing_once():
+    """Its block-hash chain is not thrown away and computed again."""
+    bridge = _bridge()
+    encoded = PrefixEncoding([1, 2, 3], "HASHES")
+    _rendering(bridge, encoded)
+    _, ids, _, handle = bridge.render_chat('{"messages": []}')
+    assert ids == [1, 2, 3] and handle is not None
+    bridge.submit(7, ids, {"prompt_handle": handle})
+    assert bridge.engine.prompt is encoded
+    assert bridge._rendered == {}  # collected
+
+
+def test_without_a_matching_encoding_the_ids_go_as_they_are():
+    bridge = _bridge()
+    _rendering(bridge, PrefixEncoding([1, 2, 3], "HASHES"))
+    handle = bridge.render_chat("{}")[3]
+    bridge.submit(7, [9, 9], {"prompt_handle": handle})  # not the rendered ids
+    assert bridge.engine.prompt == [9, 9]
+    bridge.submit(8, [1, 2, 3], {"prompt_handle": 12345})  # unknown handle
+    assert bridge.engine.prompt == [1, 2, 3]
+
+    _rendering(bridge, [4, 5])  # no tokenizer cache: plain ids, no handle
+    assert bridge.render_chat("{}")[3] is None
+
+
+def test_uncollected_encodings_are_bounded_by_count_and_age(monkeypatch):
+    monkeypatch.setattr(token_bridge, "_RENDERED_MAX", 2)
+    bridge = _bridge()
+    _rendering(bridge, PrefixEncoding([1], None))
+    handles = [bridge.render_chat("{}")[3] for _ in range(3)]
+    assert list(bridge._rendered) == handles[1:]
+
+    clock = iter([1000.0, 1000.0 + token_bridge._RENDERED_TTL_S + 1])
+    monkeypatch.setattr(token_bridge.time, "monotonic", lambda: next(clock))
+    old = bridge.render_chat("{}")[3]
+    new = bridge.render_chat("{}")[3]  # the earlier ones have aged out
+    assert old not in bridge._rendered and list(bridge._rendered) == [new]
+
+
+# ── a lost step ───────────────────────────────────────────────────────────
+
+
+def test_a_step_rust_could_not_take_ends_its_requests_with_an_error():
+    bridge = _bridge()
+    bridge.sink = _Sink(broken=True)
+    bridge.submit(7, [1, 2], {"n": 2, "temperature": 0.5})
+    bridge.submit(8, [3], {})
+    a, b = bridge.engine.added[0]
+    (c,) = bridge.engine.added[1]
+    a.callback(_output(a, [11], finished=True, reason="eos"))
+    c.callback(_output(c, [31]))
+    bridge._flush()
+    ((keys, message),) = bridge.sink.failed
+    assert keys == [7, 8] and "lost an engine step" in message
+    # What is still running is stopped; the finished sibling already left.
+    assert sorted(bridge.engine.aborted) == sorted([b.id, c.id])
+    assert bridge._seq_ids == {}

@@ -25,9 +25,12 @@ request Rust does not know yet.
 
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import threading
+import time
+from collections import OrderedDict
 from typing import Any
 
 from atom import SamplingParams
@@ -71,9 +74,16 @@ from atom.entrypoints.openai.tool_parser.registry import (
     resolve_tool_call_parser,
     template_keeps_tool_call_arguments,
 )
+from atom.model_engine.segment_tokenizer import PrefixEncoding
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
+
+# Rendered prompts whose encoding waits for its submit. A request refused
+# between the two never collects its entry, so an entry older than this, or
+# the oldest beyond the count, goes; a submit normally follows in ms.
+_RENDERED_MAX = 1024
+_RENDERED_TTL_S = 30.0
 
 
 class ChatRenderer:
@@ -222,6 +232,10 @@ class TokenBridge:
         self._seq_ids: dict[int, list[int]] = {}
         # Each CoreManager output thread buffers its own step.
         self._local = threading.local()
+        # handle -> the PrefixEncoding `render_chat` built (token ids with the
+        # tokenizer cache's block-hash chain), until its request's `submit`.
+        self._rendered: OrderedDict[int, tuple[float, PrefixEncoding]] = OrderedDict()
+        self._render_handles = itertools.count(1)
         engine.core_mgr._flush_stream_batch_fn = self._flush
 
     # ------------------------------------------------------------------
@@ -236,11 +250,12 @@ class TokenBridge:
         anything else is the server's.
         """
         sampling = self._sampling_params(params)
+        prompt = self._rendered_encoding(params.get("prompt_handle"), token_ids)
         # The session lineage the OpenAI server reads from the same headers
         # (`_get_dp_session_affinity_ids`), and only with the same switch.
         affinity = envs.ATOM_DP_SESSION_AFFINITY
         seqs = self.engine.io_processor.preprocess_fanout(
-            token_ids,
+            prompt,
             sampling,
             stream_callbacks=[self._callback(key, i) for i in range(sampling.n)],
             parent_request_id=params.get("request_id"),
@@ -264,13 +279,45 @@ class TokenBridge:
             raise
         return len(seqs)
 
-    def render_chat(self, request_json: str) -> tuple[str, list[int], str | None]:
+    def render_chat(
+        self, request_json: str
+    ) -> tuple[str, list[int], str | None, int | None]:
         """A chat request's prompt, its token ids as the engine would encode
-        the text, and the channel opener it ends on (``ChatRenderer.render``)."""
+        the text, the channel opener it ends on (``ChatRenderer.render``), and
+        a handle to the encoding for ``submit``, or None.
+
+        The encoding keeps the block-hash chain the tokenizer cache built with
+        the ids (extended turn by turn in a session); ``submit`` hands it to
+        ``preprocess_fanout`` so the prompt is not hashed a second time.
+        """
         prompt, opener = self._renderer.render(json.loads(request_json))
         encoded = self.engine.io_processor.encode_prompt(prompt)
-        token_ids = getattr(encoded, "token_ids", encoded)
-        return prompt, list(token_ids), opener
+        if not isinstance(encoded, PrefixEncoding):
+            return prompt, list(encoded), opener, None
+        handle = next(self._render_handles)
+        now = time.monotonic()
+        with self._lock:
+            rendered = self._rendered
+            rendered[handle] = (now, encoded)
+            # Oldest first: drop what aged out, then what is over the count.
+            while rendered and (
+                len(rendered) > _RENDERED_MAX
+                or now - next(iter(rendered.values()))[0] > _RENDERED_TTL_S
+            ):
+                rendered.popitem(last=False)
+        return prompt, list(encoded.token_ids), opener, handle
+
+    def _rendered_encoding(
+        self, handle: int | None, token_ids: list[int]
+    ) -> PrefixEncoding | list[int]:
+        """The encoding `render_chat` kept for these ids, else the ids."""
+        if handle is None:
+            return token_ids
+        with self._lock:
+            entry = self._rendered.pop(handle, None)
+        if entry is None or entry[1].token_ids != token_ids:
+            return token_ids
+        return entry[1]
 
     def abort(self, keys: list[int]) -> None:
         """Stop the requests behind ``keys``; a finished or unknown key is a no-op."""
@@ -320,12 +367,30 @@ class TokenBridge:
         return record
 
     def _flush(self) -> None:
-        """One push per output thread per step (CoreManager calls this)."""
+        """One push per output thread per step (CoreManager calls this).
+
+        A push that fails would lose the step for good -- and with it any
+        finish, leaving those streams open forever -- since CoreManager only
+        logs the error. Its requests are ended with an error instead, and
+        stopped in the engine.
+        """
         pending = getattr(self._local, "pending", None)
         if not pending:
             return
         self._local.pending = None
-        self.sink.push(pending)
+        try:
+            self.sink.push(pending)
+        except Exception as exc:
+            keys = sorted({output[0] for output in pending})
+            logger.exception("TokenBridge: lost an engine step for keys %s", keys)
+            self.sink.fail(keys, f"lost an engine step: {exc}")
+            if not getattr(self._local, "failing", False):
+                # An abort can flush again on this thread; stop there.
+                self._local.failing = True
+                try:
+                    self.abort(keys)
+                finally:
+                    self._local.failing = False
 
     def _finish(self, key: int, seq_id: int) -> None:
         with self._lock:

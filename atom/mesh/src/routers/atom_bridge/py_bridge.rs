@@ -76,6 +76,14 @@ impl StepSink {
     fn fail_all(&self, message: &str) {
         self.registry.fail_all(message);
     }
+
+    /// End these requests' streams with an error: a step of theirs was lost.
+    fn fail(&self, keys: Vec<u64>, message: &str) {
+        for key in keys {
+            self.registry
+                .deliver(key, SeqEvent::Failed(message.to_string()));
+        }
+    }
 }
 
 /// What the bridge submits besides the prompt's token ids. Fields the engine
@@ -96,6 +104,7 @@ pub(crate) struct BridgeRequest {
     pub tool_choice_required: bool,
     pub dp_session_id: Option<String>,
     pub dp_parent_session_id: Option<String>,
+    pub prompt_handle: Option<u64>,
 }
 
 impl BridgeRequest {
@@ -151,6 +160,7 @@ impl BridgeRequest {
             tool_choice_required: extras.tool_choice_required,
             dp_session_id: extras.dp_session_id.clone(),
             dp_parent_session_id: extras.dp_parent_session_id.clone(),
+            prompt_handle: extras.prompt_handle,
         })
     }
 
@@ -168,6 +178,7 @@ impl BridgeRequest {
         params.set_item("tool_choice_required", self.tool_choice_required)?;
         params.set_item("dp_session_id", &self.dp_session_id)?;
         params.set_item("dp_parent_session_id", &self.dp_parent_session_id)?;
+        params.set_item("prompt_handle", self.prompt_handle)?;
         Ok(params)
     }
 }
@@ -278,12 +289,13 @@ fn submit(
 /// The chat prompt rendered by `TokenBridge.render_chat`, for a model whose
 /// template the router cannot render (a Python message encoder, or a
 /// tokenizer with no Jinja template), with the request's `thinking`, which
-/// the typed body drops. A `ValueError` is the request's fault.
+/// the typed body drops, and the handle `submit` collects its encoding by
+/// (`prompt_handle`). A `ValueError` is the request's fault.
 pub(crate) async fn render_chat(
     bridge: &Arc<Py<PyAny>>,
     request: &ChatCompletionRequest,
     thinking: Option<&serde_json::Value>,
-) -> Result<RenderedChat, Response> {
+) -> Result<(RenderedChat, Option<u64>), Response> {
     let mut body = serde_json::to_value(request)
         .map_err(|e| error::internal_error("serialize_failed", e.to_string()))?;
     if let (Some(thinking), Some(object)) = (thinking, body.as_object_mut()) {
@@ -296,17 +308,20 @@ pub(crate) async fn render_chat(
             bridge
                 .bind(py)
                 .call_method1("render_chat", (body,))?
-                .extract::<(String, Vec<u32>, Option<String>)>()
+                .extract::<(String, Vec<u32>, Option<String>, Option<u64>)>()
         })
     })
     .await
     .map_err(|e| error::internal_error("render_task_failed", e.to_string()))?;
     match rendered {
-        Ok((text, token_ids, prompt_opener)) => Ok(RenderedChat {
-            text,
-            token_ids,
-            prompt_opener,
-        }),
+        Ok((text, token_ids, prompt_opener, handle)) => Ok((
+            RenderedChat {
+                text,
+                token_ids,
+                prompt_opener,
+            },
+            handle,
+        )),
         Err(e) => Err(match py_err_to_engine(&e) {
             EngineError::RequestBuildFailed(message) => {
                 error::bad_request("process_messages_failed", message)
