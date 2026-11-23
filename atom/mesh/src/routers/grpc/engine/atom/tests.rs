@@ -1223,6 +1223,26 @@ mod pairs {
         assert_eq!(reads, 1);
     }
 
+    #[tokio::test]
+    async fn a_removed_prefill_s_info_is_forgotten_at_the_next_read() {
+        let (_, first_url) = instance(Vec::new(), false, prefill_info(2, Some(template()))).await;
+        let (_, next_url) = instance(Vec::new(), false, prefill_info(4, None)).await;
+        let registry = Arc::new(WorkerRegistry::new());
+        let pairs = AtomPairs::new(registry.clone(), AtomPdRankMappingPolicy::Idx2Idx)
+            .await
+            .unwrap();
+        let first = worker(&first_url, PREFILL);
+        registry.register(first.clone());
+        pairs.adapter_for(&first).await.unwrap();
+        registry.remove_by_url(&first_url);
+
+        let next = worker(&next_url, PREFILL);
+        registry.register(next.clone());
+        let info = pairs.adapter_for(&next).await.unwrap().prefill_info;
+        assert_eq!(info.tp_sizes.keys().collect::<Vec<_>>(), [&next_url]);
+        assert!(info.chunked_transfer.is_empty());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn a_pairs_streamed_ttft_includes_the_prefill() {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
