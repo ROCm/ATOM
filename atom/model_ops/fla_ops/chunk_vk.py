@@ -40,10 +40,7 @@ def chunk_gated_delta_rule_fwd_vk(
     cu_seqlens: torch.Tensor | None = None,
     o: torch.Tensor | None = None,
 ):
-    """ATOM-native vk prefill: K1-K6 all run as separate Triton kernels.
-
-    See `chunk_gated_delta_rule_fwd_vk_flydsl` for the flydsl-K5 variant.
-    """
+    """ATOM-native vk prefill: K1-K6 all run as separate Triton kernels."""
     g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
     # obtain WY representation. u is actually the new v.
     A = chunk_scaled_dot_kkt_fwd(
