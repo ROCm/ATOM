@@ -53,14 +53,37 @@ pub fn process_chat_messages(
     request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,
 ) -> Result<ProcessedMessages, String> {
-    process_chat_messages_with_defaults(request, tokenizer, None)
+    let template_kwargs = merged_template_kwargs(request, None);
+    process_chat_messages_with_kwargs(request, tokenizer, &template_kwargs)
 }
 
-/// As `process_chat_messages`, with the request's template kwargs over `default_kwargs`.
-pub fn process_chat_messages_with_defaults(
+/// The kwargs a chat renders with: `default_kwargs`, then its reasoning effort and its own.
+pub(crate) fn merged_template_kwargs(
+    request: &ChatCompletionRequest,
+    default_kwargs: Option<&HashMap<String, Value>>,
+) -> HashMap<String, Value> {
+    let mut combined_template_kwargs = default_kwargs.cloned().unwrap_or_default();
+
+    if let Some(reasoning_effort) = &request.reasoning_effort {
+        combined_template_kwargs.insert(
+            "reasoning_effort".to_string(),
+            Value::String(reasoning_effort.clone()),
+        );
+    }
+
+    if let Some(template_kwargs) = &request.chat_template_kwargs {
+        for (key, value) in template_kwargs {
+            combined_template_kwargs.insert(key.clone(), value.clone());
+        }
+    }
+    combined_template_kwargs
+}
+
+/// As `process_chat_messages`, rendered with `template_kwargs`, the merged kwargs.
+pub fn process_chat_messages_with_kwargs(
     request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,
-    default_kwargs: Option<&HashMap<String, Value>>,
+    template_kwargs: &HashMap<String, Value>,
 ) -> Result<ProcessedMessages, String> {
     let hf_tokenizer = tokenizer
         .as_any()
@@ -100,25 +123,10 @@ pub fn process_chat_messages_with_defaults(
         .transpose()
         .map_err(|e| format!("Failed to serialize tools: {}", e))?;
 
-    let mut combined_template_kwargs = default_kwargs.cloned().unwrap_or_default();
-
-    if let Some(reasoning_effort) = &request.reasoning_effort {
-        combined_template_kwargs.insert(
-            "reasoning_effort".to_string(),
-            Value::String(reasoning_effort.clone()),
-        );
-    }
-
-    if let Some(template_kwargs) = &request.chat_template_kwargs {
-        for (key, value) in template_kwargs {
-            combined_template_kwargs.insert(key.clone(), value.clone());
-        }
-    }
-
-    let final_template_kwargs = if combined_template_kwargs.is_empty() {
+    let final_template_kwargs = if template_kwargs.is_empty() {
         None
     } else {
-        Some(&combined_template_kwargs)
+        Some(template_kwargs)
     };
 
     let params = ChatTemplateParams {

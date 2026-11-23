@@ -510,6 +510,35 @@ mod b2_chat_aggregator_branches {
         assert!(s.contains("usage"));
         assert!(s.contains("\"total_tokens\":10"));
     }
+
+    #[tokio::test]
+    async fn test_aggregator_usage_reports_the_cached_prompt_tokens() {
+        let mut complete = cmpl(vec![1], FinishReason::Stop, None);
+        if let TokenChunk::Complete { meta, .. } = &mut complete {
+            meta.cached_tokens = 2;
+        }
+        let stream = synthetic_single_stream(vec![Ok(complete)]);
+        let req = ChatCompletionRequest::default();
+        let resp = chat_aggregator::process(stream, ctx_with(req)).await;
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["usage"]["prompt_tokens_details"]["cached_tokens"], 2);
+    }
+
+    #[tokio::test]
+    async fn test_aggregator_reasoning_only_output_carries_an_empty_content() {
+        let mut req = ChatCompletionRequest::default();
+        req.separate_reasoning = true;
+        let mut ctx = ctx_with(req);
+        ctx.configured_reasoning_parser = Some("deepseek_r1".to_string());
+        let complete = cmpl(vec![1, 2], FinishReason::Length, None);
+        let resp = chat_aggregator::process(synthetic_single_stream(vec![Ok(complete)]), ctx).await;
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let message = &json["choices"][0]["message"];
+        assert_eq!(message["reasoning_content"], "Hello world");
+        assert_eq!(message["content"], "");
+    }
 }
 
 mod b3_chat_aggregator_typed {
@@ -1166,6 +1195,57 @@ mod c2_chat_streaming_branches {
         let s = body_of(resp).await;
         assert!(s.contains("usage"));
         assert!(s.contains("\"total_tokens\":8") || s.contains("total_tokens"));
+    }
+
+    #[tokio::test]
+    async fn test_streaming_usage_chunk_reports_the_cached_prompt_tokens() {
+        let mut req = ChatCompletionRequest::default();
+        req.stream = true;
+        req.stream_options = Some(StreamOptions {
+            include_usage: Some(true),
+        });
+        let mut meta = meta_plain();
+        meta.cached_tokens = 2;
+        let stream = synthetic_single_stream(vec![Ok(TokenChunk::Complete {
+            token_ids: vec![1],
+            finish_reason: FinishReason::Stop,
+            matched_stop: None,
+            usage: usage(3, 5),
+            logprobs: None,
+            input_logprobs: None,
+            meta,
+        })]);
+        let s = body_of(chat_streaming::process(stream, ctx_with(req), "regular")).await;
+        let mut events = s.lines().filter_map(|line| line.strip_prefix("data: "));
+        let usage_chunk = events.find(|e| e.contains("\"usage\"")).unwrap();
+        let json: serde_json::Value = serde_json::from_str(usage_chunk).unwrap();
+        assert_eq!(json["usage"]["prompt_tokens_details"]["cached_tokens"], 2);
+    }
+
+    #[tokio::test]
+    async fn test_streaming_output_without_text_opens_with_an_empty_content() {
+        let mut req = ChatCompletionRequest::default();
+        req.stream = true;
+        let stream = synthetic_single_stream(vec![
+            Ok(TokenChunk::Partial {
+                token_ids: vec![999], // <eos>, which decodes to no text
+                logprobs: None,
+            }),
+            Ok(TokenChunk::Complete {
+                token_ids: vec![],
+                finish_reason: FinishReason::Stop,
+                matched_stop: None,
+                usage: usage(3, 1),
+                logprobs: None,
+                input_logprobs: None,
+                meta: meta_plain(),
+            }),
+        ]);
+        let s = body_of(chat_streaming::process(stream, ctx_with(req), "regular")).await;
+        let mut events = s.lines().filter_map(|line| line.strip_prefix("data: "));
+        let json: serde_json::Value = serde_json::from_str(events.next().unwrap()).unwrap();
+        assert_eq!(json["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(json["choices"][0]["delta"]["content"], "");
     }
 
     #[tokio::test]
@@ -3652,5 +3732,143 @@ mod e2_generate_streaming_branches {
         })]);
         let resp = generate_streaming::process(stream, generate_ctx(), "pd");
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+}
+
+mod e3_generate_streaming_across_chunks {
+    use std::sync::Arc;
+
+    use axum::body::to_bytes;
+    use axum::response::Response;
+    use serde_json::Value;
+    use tempfile::TempDir;
+
+    use super::test_support::generate_ctx;
+    use crate::routers::grpc::completion_adapter::wrap_streaming_generate_as_completion;
+    use crate::routers::prepare::response_context::ResponseContext;
+    use crate::routers::prepare::stop_decoder_builder::create_stop_decoder;
+    use crate::routers::render::{generate_aggregator, generate_streaming};
+    use crate::routers::token_handle::test_support::synthetic_single_stream;
+    use crate::routers::token_handle::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
+    use crate::routers::token_handle::token_handle::TokenHandle;
+    use crate::tokenizer::{huggingface::HuggingFaceTokenizer, traits::Tokenizer};
+
+    /// DeepSeek-V4.1-Flash's decoder and its vocabulary entries for the ids in `CASES`.
+    const TOKENIZER_JSON: &str = r#"{
+        "version": "1.0",
+        "truncation": null,
+        "padding": null,
+        "added_tokens": [],
+        "normalizer": null,
+        "pre_tokenizer": null,
+        "post_processor": null,
+        "decoder": {
+            "type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true, "use_regex": true
+        },
+        "model": {
+            "type": "BPE",
+            "vocab": {
+                "ä»ĸåĢĳ": 9281, "èªª": 4172, "ï¼ļ": 768, "é¬±": 89474, "èĶ": 6355, "¥": 101,
+                "çļĦ": 301, "é¾": 2715, "ĺ": 249, "ðŁĺ": 28927, "Ģ": 225, "ðŁĳį": 92526,
+                "ðŁı": 40965, "½": 124, "Ġem": 980, "oji": 82644
+            },
+            "merges": []
+        }
+    }"#;
+
+    /// Each string and its DeepSeek-V4.1-Flash ids; some ids decode alone to part of a character.
+    const CASES: [(&str, &[u32]); 2] = [
+        (
+            "他們說：鬱鬱蔥蔥的龘",
+            &[
+                9281, 4172, 768, 89474, 89474, 6355, 101, 6355, 101, 301, 2715, 249,
+            ],
+        ),
+        ("😀👍🏽 emoji", &[28927, 225, 92526, 40965, 124, 980, 82644]),
+    ];
+
+    fn tokenizer() -> Arc<dyn Tokenizer> {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("tokenizer.json");
+        std::fs::write(&path, TOKENIZER_JSON).unwrap();
+        Arc::new(HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap())
+    }
+
+    fn ctx(tokenizer: &Arc<dyn Tokenizer>) -> ResponseContext {
+        ResponseContext {
+            tokenizer: tokenizer.clone(),
+            stop_decoder: create_stop_decoder(tokenizer, None, None, true, false),
+            ..generate_ctx()
+        }
+    }
+
+    fn complete(token_ids: Vec<u32>, completion_tokens: u32) -> TokenChunk {
+        TokenChunk::Complete {
+            token_ids,
+            finish_reason: FinishReason::Stop,
+            matched_stop: None,
+            usage: Usage {
+                prompt_tokens: 1,
+                completion_tokens,
+                total_tokens: 1 + completion_tokens,
+            },
+            logprobs: None,
+            input_logprobs: None,
+            meta: WorkerMeta {
+                request_id: "req".to_string(),
+                weight_version: None,
+                cached_tokens: 0,
+            },
+        }
+    }
+
+    /// One id a chunk, then the Complete ATOM ends a stream with, which carries no ids.
+    fn token_by_token(ids: &[u32]) -> TokenHandle {
+        let mut chunks: Vec<_> = ids
+            .iter()
+            .map(|&id| {
+                Ok(TokenChunk::Partial {
+                    token_ids: vec![id],
+                    logprobs: None,
+                })
+            })
+            .collect();
+        chunks.push(Ok(complete(Vec::new(), ids.len() as u32)));
+        synthetic_single_stream(chunks)
+    }
+
+    async fn data_events(resp: Response) -> Vec<Value> {
+        let body = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
+        std::str::from_utf8(&body)
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str(data).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_generate_and_completions_streams_token_by_token_join_to_the_unary_text() {
+        let tokenizer = tokenizer();
+        for (text, ids) in CASES {
+            let whole = synthetic_single_stream(vec![Ok(complete(ids.to_vec(), ids.len() as u32))]);
+            let resp = generate_aggregator::process(whole, ctx(&tokenizer)).await;
+            let body = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
+            let unary: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(unary[0]["text"], text);
+
+            let resp = generate_streaming::process(token_by_token(ids), ctx(&tokenizer), "regular");
+            let events = data_events(resp).await;
+            assert_eq!(events.last().unwrap()["text"], text);
+
+            let resp = generate_streaming::process(token_by_token(ids), ctx(&tokenizer), "regular");
+            let completion = wrap_streaming_generate_as_completion(resp, "m".into()).await;
+            let events = data_events(completion).await;
+            let pieces = events
+                .iter()
+                .filter_map(|e| e["choices"][0]["text"].as_str());
+            assert_eq!(pieces.collect::<String>(), text);
+        }
     }
 }

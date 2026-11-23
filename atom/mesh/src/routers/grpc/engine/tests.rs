@@ -53,6 +53,7 @@ mod a_payload_to_proto {
             stream: false,
             return_hidden_states: false,
             log_metrics: false,
+            structured_output: None,
         }
     }
 
@@ -816,6 +817,7 @@ mod e_engine_dispatch {
             stream: false,
             return_hidden_states: false,
             log_metrics: false,
+            structured_output: None,
         }
     }
 

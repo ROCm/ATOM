@@ -30,6 +30,7 @@ from atom.distributed.dcp_layout import (  # noqa: F401
     dcp_global_pos,
     dcp_local_index,
     dcp_owner_rank,
+    get_dcp_local_seq_lens,
 )
 from atom.distributed.dcp_utils import get_dcp_group, get_dcp_world_size
 from atom.model_ops.indexer.layout import MFMA, PRESHUFFLE
@@ -1231,33 +1232,6 @@ def reorg_kvcache(
     assert reorganized_k_pe.shape[0] == sum_seq_len
     assert max_seq_len_check == max_seq_len
     return reorganized_kv_c_normed, reorganized_k_pe
-
-
-def get_dcp_local_seq_lens(seq_lens, dcp_size, dcp_rank, cp_kv_cache_interleave_size=1):
-    """Compute per-DCP-rank local sequence lengths.
-
-    With interleaved storage, token i is stored on rank
-    (i // cp_kv_cache_interleave_size) % dcp_size.
-
-    Args:
-        seq_lens: numpy array of sequence lengths
-        dcp_size: DCP world size
-        dcp_rank: this rank's DCP rank
-        cp_kv_cache_interleave_size: interleaving granularity (default 1 = token-level)
-
-    Returns:
-        local_seq_lens: numpy array of local sequence lengths
-    """
-    full_chunks = seq_lens // (cp_kv_cache_interleave_size * dcp_size)
-    base = full_chunks * cp_kv_cache_interleave_size
-
-    remainder_total = seq_lens - base * dcp_size
-    remainder = np.clip(
-        remainder_total - dcp_rank * cp_kv_cache_interleave_size,
-        0,
-        cp_kv_cache_interleave_size,
-    )
-    return base + remainder
 
 
 def get_dcp_local_window_lens(

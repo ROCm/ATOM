@@ -14,6 +14,7 @@ use super::{
         wrap_streaming_generate_as_completion,
     },
     pipeline::Pipeline,
+    router::{atom_serves, logprobs_refused, media_refused},
 };
 use crate::{
     app_context::AppContext,
@@ -26,7 +27,7 @@ use crate::{
     protocols::{
         chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
     },
-    routers::{comm::error, RouterTrait},
+    routers::{comm::error, prepare::inference::ParsedInference, RouterTrait},
 };
 
 #[derive(Clone)]
@@ -215,6 +216,14 @@ impl RouterTrait for GrpcPDRouter {
         body: &GenerateRequest,
         model_id: Option<&str>,
     ) -> Response {
+        if atom_serves(&self.worker_registry, model_id) {
+            if ParsedInference::generate_carries_media(body) {
+                return media_refused();
+            }
+            if body.return_logprob == Some(true) {
+                return logprobs_refused();
+            }
+        }
         self.route_generate_impl(headers, body, model_id).await
     }
 
@@ -224,6 +233,14 @@ impl RouterTrait for GrpcPDRouter {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
+        if atom_serves(&self.worker_registry, model_id) {
+            if ParsedInference::chat_carries_media(body) {
+                return media_refused();
+            }
+            if body.logprobs {
+                return logprobs_refused(); // top_logprobs needs logprobs
+            }
+        }
         self.route_chat_impl(headers, body, model_id).await
     }
 
