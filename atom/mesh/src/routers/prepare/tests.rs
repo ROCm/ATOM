@@ -1482,6 +1482,35 @@ mod h_prepare_chat_generate {
         assert!(Arc::ptr_eq(&found, &replacement));
     }
 
+    /// A chat for an ATOM model whose tokenizer renders with a built-in encoder is
+    /// refused during a swap of that tokenizer too.
+    #[test]
+    fn test_a_chat_during_a_swap_reads_the_replaced_tokenizers_encoder() {
+        use crate::core::{BasicWorkerBuilder, RuntimeType};
+
+        let registry = test_mocks::tokenizer_registry_with("m");
+        let components = test_mocks::app_context_with_tokenizer_registry(registry.clone());
+        let worker = BasicWorkerBuilder::new("grpc://atom:1")
+            .runtime_type(RuntimeType::Atom)
+            .model_id("m")
+            .label("chat_template", "{{ messages }}")
+            .build();
+        components.worker_registry.register(Arc::new(worker));
+        let old = registry.get_by_name("m").unwrap();
+        components
+            .chats_without_template
+            .write()
+            .insert(old.id.clone());
+        components
+            .tokenizers_replaced
+            .insert("m".into(), old.clone());
+        registry.remove_by_id(&old.id).unwrap();
+
+        let refused = prepare_chat(chat_req(false), None, Some("m".into()), &components);
+        let status = refused.err().expect("a chat it cannot render").status();
+        assert_eq!(status, axum::http::StatusCode::NOT_IMPLEMENTED);
+    }
+
     #[test]
     fn test_prepare_generate_request_ids_unique_per_call() {
         let registry = test_mocks::tokenizer_registry_with("m");

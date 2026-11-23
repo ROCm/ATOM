@@ -86,10 +86,9 @@ pub fn prepare_chat(
     })?;
     let workers = components.worker_registry.get_by_model(model_id_str);
     let configured_template = components.router_config.chat_template.is_some();
-    let registry = &components.tokenizer_registry;
-    let built_in_encoder = registry
-        .get_by_name(model_id_str)
-        .or_else(|| registry.get_by_id(model_id_str))
+    let entry = tokenizer_entry(model_id_str, components);
+    let built_in_encoder = entry
+        .as_ref()
         .is_some_and(|entry| components.chats_without_template.read().contains(&entry.id));
     if let Some(gap) = atom_chat_render_gap(&workers, configured_template, built_in_encoder) {
         return Err(error::not_implemented(
@@ -100,7 +99,9 @@ pub fn prepare_chat(
             ),
         ));
     }
-    let tokenizer = lookup_tokenizer(model_id_str, components)?;
+    let tokenizer = entry
+        .map(|entry| entry.tokenizer)
+        .ok_or_else(|| tokenizer_not_found(model_id_str))?;
     let default_kwargs = default_template_kwargs(&workers)
         .map_err(|e| error::internal_error("invalid_default_template_kwargs", e))?;
 
