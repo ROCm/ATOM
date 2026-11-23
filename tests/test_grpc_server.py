@@ -250,6 +250,20 @@ def test_abort_ends_every_sibling(serve):
     assert servicer.live == {}
 
 
+def test_a_partly_dispatched_fan_out_aborts_every_sibling(serve):
+    engine = FakeEngine()
+
+    def dispatch_one_then_fail(seqs):  # as CoreManager when a later rank's send fails
+        engine.running[seqs[0].id] = seqs[0]
+        raise RuntimeError("the second rank's send failed")
+
+    engine.core_mgr.add_request = dispatch_one_then_fail
+    sampling = v1.SamplingParams(n=2, temperature=1.0)
+    error = _error(_generate(serve(engine), sampling=sampling))
+    assert error.http_status == 500
+    assert engine.running == {} and engine.io_processor.requests == {}
+
+
 def test_a_prompt_only_in_kv_transfer_params_is_admitted(serve):
     engine = FakeEngine([([5], "eos")])
     kv = json.dumps({"prompt_token_ids": [4, 5], "do_remote_prefill": False})
