@@ -139,14 +139,8 @@ class PrehashedSaveSchedulerMixin:
         else:
             chain = entry[1]
         if len(chain) < n_chunks:
-            tdb = self._prehash_tdb
             t0 = time.perf_counter()
-            prev = chain[-1] if chain else tdb._get_init_hash()
-            for i in range(len(chain), n_chunks):
-                prev = tdb._hash_tokens(
-                    _chunk_list(tokens, i * chunk, (i + 1) * chunk), prev
-                )
-                chain.append(prev)
+            self._extend_prehash_chain(chain, tokens, n_chunks)
             self._perf_bump("prehash_us", int((time.perf_counter() - t0) * 1e6))
             self._perf_bump("prehash_chunks", n_chunks)
         if (
@@ -156,6 +150,17 @@ class PrehashedSaveSchedulerMixin:
         ):
             return None
         return chain
+
+    def _extend_prehash_chain(self, chain: list[int], tokens, n_chunks: int) -> None:
+        """Append the chained hashes of `tokens`' chunks `len(chain)` to `n_chunks`."""
+        tdb = self._prehash_tdb
+        chunk = int(self.chunk_size)
+        prev = chain[-1] if chain else tdb._get_init_hash()
+        for i in range(len(chain), n_chunks):
+            prev = tdb._hash_tokens(
+                _chunk_list(tokens, i * chunk, (i + 1) * chunk), prev
+            )
+            chain.append(prev)
 
     def _verify_prehash_chain(self, tokens, chain: list[int], n_chunks: int) -> bool:
         """Compare the first chain with LMCache's own hashing, once."""
@@ -212,12 +217,15 @@ class PrehashedSaveSchedulerMixin:
         chain = self._prefix_chunk_hashes(seq, n_chunks)
         if chain is None:
             return super()._tier_lookup(seq, sid)
-        if n_chunks == 0:
+        start = min(self._tier_lookup_start(seq) // chunk, n_chunks)
+        if start == n_chunks:
             # LMCacheLookupClient.lookup: no hashes -> a hit of 0, no RPC.
             return 0
-        hit = self._lookup_rpc(chain[:n_chunks], sid, self._lookup_configs(seq))
+        hit = self._lookup_rpc(chain[start:n_chunks], sid, self._lookup_configs(seq))
         # LMCacheLookupClient answers 0, not None, when the transport failed.
-        return 0 if hit is None else hit
+        # The tier's contiguous run from `start` counts from the prompt's head;
+        # none at all is no hit.
+        return start * chunk + hit if hit else 0
 
     # -- save: ship the new chunks' hashes ---------------------------------
     def _build_save_request(

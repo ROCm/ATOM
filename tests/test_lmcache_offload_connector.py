@@ -6898,6 +6898,9 @@ def test_every_member_the_scheduler_reads_is_reachable_through_the_shell():
         # Without this read the send's claim never clears and a producer's
         # blocks are parked forever.
         "send_finished",
+        # A lazy tier is asked only past the HBM hit, which admission probes
+        # first only when this reads True.
+        "needs_hbm_probe_before_lookup",
     }
     lost = sorted(must_be_seen - probed)
     assert not lost, (
