@@ -25,7 +25,7 @@ use crate::core::worker::{ConnectionMode, RuntimeType};
 use crate::core::DPAwareWorkerBuilder;
 use crate::routers::grpc::engine::atom::stream::AtomStream;
 use crate::routers::grpc::engine::worker_client_cache::GrpcClient;
-use crate::routers::token_handle::token_chunk::{FinishReason, MatchedStop, TokenChunk};
+use crate::routers::token_handle::token_chunk::{FinishReason, MatchedStop, SeqTiming, TokenChunk};
 
 /// Bounds the waits that only stop a hang.
 const HANG: Duration = Duration::from_secs(60);
@@ -372,6 +372,51 @@ async fn a_request_that_does_not_stream_completes_with_the_ids_its_entries_carri
     };
     assert!(
         matches!(&whole[..], [Ok(response)] if *response == expected),
+        "{whole:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_completion_reports_its_ttft_tpot_and_latency_from_its_times() {
+    let (ranks, mut calls) = instance().await;
+    let sessions = AtomSessions::default();
+    let first = sessions.submit(&ranks[0], spec("streamed"), vec![1], true);
+    let (mut call, streamed) = opening(&mut calls, PROTOCOL_VERSION, first).await;
+    let whole = submit(&sessions, &ranks[0], "whole", vec![2], false).await;
+    let sent = submitted(&mut call, 2).await;
+    let (streamed_id, whole_id) = (sent["streamed"].0.seq_id, sent["whole"].0.seq_id);
+    // Three tokens each: the first 0.25 s after arrival, the last 1 s after it.
+    let timed = |seq_id| pb::Completion {
+        arrive_time: 100.0,
+        first_token_time: 100.25,
+        leave_time: 101.25,
+        ..completion(seq_id, "max_tokens")
+    };
+    for message in [
+        step(&[(streamed_id, vec![11], 0), (whole_id, vec![21], 0)]),
+        step(&[(streamed_id, vec![12, 13], 0), (whole_id, vec![22, 23], 0)]),
+        done(vec![
+            (timed(streamed_id), Vec::new()),
+            (timed(whole_id), Vec::new()),
+        ]),
+    ] {
+        call.outbound.send(message).unwrap();
+    }
+
+    let timing = SeqTiming {
+        ttft_s: 0.25,
+        tpot_s: 0.5,
+        latency_s: 1.25,
+    };
+    let streamed = chunks(streamed.unwrap()).await;
+    assert!(
+        matches!(streamed.last(), Some(Ok(TokenChunk::Complete { meta, .. }))
+            if meta.timing == Some(timing)),
+        "{streamed:?}"
+    );
+    let whole = chunks(whole).await;
+    assert!(
+        matches!(&whole[..], [Ok(TokenChunk::Complete { meta, .. })] if meta.timing == Some(timing)),
         "{whole:?}"
     );
 }

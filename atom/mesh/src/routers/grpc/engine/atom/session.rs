@@ -338,6 +338,7 @@ impl Routes {
                         continue;
                     };
                     let output_ids = std::mem::take(&mut route.ids);
+                    let (ttft_s, tpot_s, latency_s) = timing(item, route.completion_tokens);
                     route.send(Response::Complete(GenerateComplete {
                         completion_tokens: route.completion_tokens,
                         output_ids,
@@ -345,6 +346,9 @@ impl Routes {
                         prompt_tokens: item.num_prompt_tokens,
                         cached_tokens: route.cached_tokens,
                         kv_transfer_params_json: kv.map(|kv| kv.to_string()),
+                        ttft_s,
+                        tpot_s,
+                        latency_s,
                         ..Default::default()
                     }));
                 }
@@ -410,6 +414,21 @@ impl Routes {
             let _ = route.tx.send(Err(status.clone()));
         }
     }
+}
+
+/// A Completion's TTFT, TPOT and latency in seconds from its times, `tokens` long; as
+/// Generate reports them, TTFT is 0 without a first token and TPOT without a second.
+fn timing(item: &pb::Completion, tokens: u32) -> (f64, f64, f64) {
+    let latency = item.leave_time - item.arrive_time;
+    if item.first_token_time == 0.0 {
+        return (0.0, 0.0, latency);
+    }
+    let ttft = item.first_token_time - item.arrive_time;
+    let tpot = match tokens {
+        0 | 1 => 0.0,
+        n => (item.leave_time - item.first_token_time) / f64::from(n - 1),
+    };
+    (ttft, tpot, latency)
 }
 
 /// A Rejected code as the HTTP status ATOM's HTTP routes answer that refusal with.
