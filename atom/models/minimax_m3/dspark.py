@@ -61,6 +61,7 @@ from torch import nn
 
 from atom.config import QuantizationConfig
 from atom.kv_transfer.disaggregation import kv_config_has_producer
+from atom.model_ops.blockscale import native_quant_linear
 from atom.model_ops.layernorm import GemmaRMSNorm
 from atom.model_ops.linear import QKVParallelLinear, ReplicatedLinear, RowParallelLinear
 from atom.model_ops.minimax_m3.sparse_attn import (
@@ -81,6 +82,7 @@ from atom.models.dspark_draft import (
     draft_quant_config,
     linear_out,
 )
+from atom.models.minimax_m3.draft_fused import gemma_rmsnorm_mxfp8
 from atom.models.minimax_m3.model import MiniMaxM3MLP
 from atom.utils.forward_context import get_forward_context
 
@@ -277,13 +279,18 @@ class M3DSparkAttention(nn.Module):
         _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         self._norm_rope_write(k, k, v, 0, positions, slot_mapping, cache)
 
-    def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor):
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        x_scale: torch.Tensor | None = None,
+    ):
         """The block pass: non-causal attention over ``[context | block]``.
 
         Write the block's K/V at the block slots the proposer masked to the
         request's allocated pages -- an unallocated column reads as page 0, a
         page another request owns (under prefix caching, a shared prefix) --
-        then decode per row.
+        then decode per row. ``x_scale``: ``hidden_states`` is already MXFP8.
         """
         if self.num_kv_heads != 1:
             # Before any K/V is written: only a P/D producer, which never
@@ -292,7 +299,7 @@ class M3DSparkAttention(nn.Module):
                 f"The block pass decodes one KV head per rank; this rank holds "
                 f"{self.num_kv_heads} of {self.total_num_kv_heads}"
             )
-        qkv = linear_out(self.qkv_proj(hidden_states))
+        qkv = linear_out(self.qkv_proj(hidden_states, x_scale=x_scale))
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         cache = self._bound_cache()
         if cache is None:
@@ -341,6 +348,19 @@ class M3DSparkAttention(nn.Module):
         return out.view(rows, -1)
 
 
+def _is_native_mxfp8(lin) -> bool:
+    """``lin`` runs the native MXFP8 1x32 path on a quantized input (not a
+    weight dequantized to bf16, not another weight format)."""
+    weight = getattr(lin, "weight", None)
+    return (
+        getattr(lin, "native_a8_group_rows", None) == 1
+        and not getattr(lin, "runs_bf16", False)
+        and weight is not None
+        and weight.dtype == torch.float8_e4m3fn
+        and getattr(lin, "weight_scale", None) is not None
+    )
+
+
 class M3DSparkDecoderLayer(DSparkGQADecoderLayer):
     """One draft layer: pre-norm attention + pre-norm dense SwiGLU-OAI MLP."""
 
@@ -372,6 +392,32 @@ class M3DSparkDecoderLayer(DSparkGQADecoderLayer):
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+
+    def forward(self, positions, hidden_states, residual=None):
+        # Both norms feed a native MXFP8 linear (qkv_proj, gate_up_proj): write
+        # its quantized input directly instead of bf16 + a quantize pass.
+        # Checked per call: a linear's mode can change as the weights load.
+        if not all(
+            _is_native_mxfp8(lin)
+            for lin in (self.self_attn.qkv_proj, self.mlp.gate_up_proj)
+        ):
+            return super().forward(positions, hidden_states, residual)
+        norm = self.input_layernorm
+        if residual is None:
+            residual = hidden_states
+            xq, xs, _ = gemma_rmsnorm_mxfp8(
+                hidden_states, norm.weight, norm.variance_epsilon
+            )
+        else:
+            xq, xs, residual = gemma_rmsnorm_mxfp8(
+                hidden_states, norm.weight, norm.variance_epsilon, residual
+            )
+        hidden_states = self.self_attn(positions, xq, x_scale=xs)
+        norm = self.post_attention_layernorm
+        xq, xs, residual = gemma_rmsnorm_mxfp8(
+            hidden_states, norm.weight, norm.variance_epsilon, residual
+        )
+        return self.mlp(xq, x_scale=xs), residual
 
 
 class MiniMaxM3DSpark(DSparkDraftModel):
@@ -457,6 +503,80 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         # first call.
         self.max_num_seqs = atom_config.max_num_seqs
         self._bt16 = None
+        # `_context_kv_weight`, built on first use (after the weights load)
+        self._ctx_kv = None
+
+    def _context_kv_weight(self):
+        """The K/V rows of every context layer's qkv_proj as one MXFP8 weight
+        ``[layers * 2 * kv, hidden]`` (and its E8M0 scales): one GEMM gives
+        every layer's context K/V, the q rows each layer's projection would
+        compute and drop are not read. The bytes are the layers' own, copied
+        (``make_row_view`` slices whole 16-row shuffle tiles). None where a
+        layer's projection is not native MXFP8 1x32. The copy is made once,
+        after the weights load; weights are not updated in place afterwards."""
+        if self._ctx_kv is None:
+            if torch.cuda.is_current_stream_capturing():
+                # built only eagerly: a recording would put it in its private pool
+                return None
+            attns = [layer.self_attn for layer in self.context_layers]
+            projs = [a.qkv_proj for a in attns]
+            a0 = attns[0]
+            if not all(_is_native_mxfp8(p) for p in projs) or any(
+                p.bias is not None or getattr(p, "is_output_padded", False)
+                for p in projs
+            ):
+                self._ctx_kv = ()
+            else:
+                try:
+                    views = [p.make_row_view(a0.q_size, 2 * a0.kv_size) for p in projs]
+                except ValueError:  # offsets not tile-aligned at this TP size
+                    self._ctx_kv = ()
+                else:
+                    self._ctx_kv = (
+                        torch.cat([v.weight.data for v in views], dim=0),
+                        torch.cat([v.weight_scale.data for v in views], dim=0),
+                        bool(getattr(views[0].weight, "is_shuffled", False)),
+                    )
+        return self._ctx_kv or None
+
+    def write_context_kv(
+        self, taps, positions, slot_mapping=None, pcp_num_tokens=None
+    ) -> None:
+        """The context K/V of every layer from one GEMM over one quantized
+        ``hidden_norm(fc(taps))`` (see ``_context_kv_weight``)."""
+        kv_weight = None
+        if (
+            pcp_num_tokens is None
+            and not get_forward_context().context.is_dummy_run
+            and self.layers[0].self_attn.kv.bound
+        ):
+            kv_weight = self._context_kv_weight()
+        if kv_weight is None:
+            return super().write_context_kv(
+                taps, positions, slot_mapping, pcp_num_tokens
+            )
+        weight, scale, shuffled = kv_weight
+        norm = self.hidden_norm
+        xq, xs, _ = gemma_rmsnorm_mxfp8(
+            linear_out(self.fc(self.concat_taps(taps))),
+            norm.weight,
+            norm.variance_epsilon,
+        )
+        kv = native_quant_linear(
+            xq,
+            weight,
+            scale,
+            x_scale=xs,
+            weight_group_rows=1,
+            weight_preshuffled=shuffled,
+        )
+        for i, layer in enumerate(self.context_layers):
+            attn = layer.self_attn
+            k = kv[:, (2 * i) * attn.kv_size : (2 * i + 1) * attn.kv_size]
+            v = kv[:, (2 * i + 1) * attn.kv_size : (2 * i + 2) * attn.kv_size]
+            attn._norm_rope_write(
+                k, k, v, 0, positions, slot_mapping, attn._bound_cache()
+            )
 
     # ---- drafting entry points (called by the proposer) --------------------
 
