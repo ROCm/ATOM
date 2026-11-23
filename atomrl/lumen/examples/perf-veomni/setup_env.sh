@@ -28,8 +28,8 @@ print("devices    ", torch.cuda.device_count())
 assert torch.version.hip and torch.version.cuda is None, "not a ROCm torch -- stop here"
 PY
 PYTHONPATH="$EXAMPLE_DIR:$LUMEN_PYTHONPATH" python3 -c "
-from veomni_patches import aiter_conv
-fn = aiter_conv.load()
+from atomrl.lumen.ops.conv import conv
+fn = conv
 print('Lumen convolution:', 'available' if fn else 'MISSING', '(must be available)')
 assert fn is not None
 "

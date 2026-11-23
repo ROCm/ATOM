@@ -375,7 +375,7 @@ VAE patch; Qwen also needs `qwen_offline_fix`.
 | Value | Effect | Code |
 |---|---|---|
 | `vae_bf16` | The frozen VAE runs in BF16; `encode()` returns FP32 latents | `train_dit_lumen.py` |
-| `vae_conv` / `vae_conv_video` | VAE convolutions use Lumen's AITER-backed Conv2d/Conv3d route. The first is for images (exact T=1 → conv2d); the second also covers T>1 and the feature cache | `lumen_vae_conv.py`, `veomni_patches/aiter_conv.py` |
+| `vae_conv` / `vae_conv_video` | VAE convolutions use Lumen's AITER-backed Conv2d/Conv3d route. The first is for images (exact T=1 → conv2d); the second also covers T>1 and the feature cache | `lumen_vae_conv.py`, `atomrl.lumen.ops.conv` |
 | `conv_pad_in_kernel` | Causal convolutions no longer `F.pad` a full copy; the kernel applies the symmetric padding with masks | `lumen_vae_conv.py` |
 | `sdpa_efficient` | SDPA's flash backend off; on ROCm the backward runs aiter's fused `fmha_bwd`. **Nondeterministic** | `veomni_patches/sdpa.py` |
 | `attn_triton_fwd` | DiT attention only (no mask, non-causal, BF16, head_dim 128) gets aiter's Triton forward, with the efficient backward kept; requires `sdpa_efficient` | `veomni_patches/sdpa.py` |
@@ -438,7 +438,7 @@ python3 compare_batch_hash.py <log A> <log B>            # did two runs see iden
 | `profile.sh` | a trace of any level with VeOmni's built-in profiler |
 | `train_dit_lumen.py` | wrapper around VeOmni's training entry: applies the patches from `LUMEN_PATCH`, and reports backend routing counts |
 | `lumen_vae_conv.py` | VAE convolution rewrites: exact T=1 → conv2d, kernel swap under T>1, padding in the kernel |
-| `veomni_patches/` | every Lumen-level patch: `aiter_conv.py` (public AITER convolution routing), `sdpa.py`, `rmsnorm.py`, `local_adamw.py`, `qwen_offline.py` |
+| `veomni_patches/` | example-only patches: `sdpa.py`, `rmsnorm.py`, `local_adamw.py`, `qwen_offline.py`; convolution calls Lumen directly |
 | `verify_aiter_conv.py` / `verify_sdpa_triton_fwd.py` / `verify_rmsnorm_fuse.py` | single-GPU numerics and speed checks |
 | `test_patches.py` | unit tests for `veomni_patches/` |
 | `summarize.py` | median step, spread, p, peak memory, loss deviation; `--chain` compares level by level |

@@ -23,20 +23,20 @@ def _snr(ref, got):
     )
 
 
-# --- aiter_conv -------------------------------------------------------------------
+# --- Lumen convolution --------------------------------------------------------------
 
 
 @_CUDA
 def test_conv_uses_aiter_for_bf16_and_torch_otherwise():
-    from veomni_patches import aiter_conv
+    from atomrl.lumen.ops.conv import conv, conv_calls
 
     torch.manual_seed(0)
     x = torch.randn(1, 96, 4, 24, 24, device="cuda")
     w = torch.randn(96, 96, 3, 3, 3, device="cuda") * 0.05
-    before = aiter_conv.conv_calls()
-    fp32 = aiter_conv.conv(x, w, None, 1, 1, 1)
-    bf16 = aiter_conv.conv(x.bfloat16(), w.bfloat16(), None, 1, 1, 1)
-    after = aiter_conv.conv_calls()
+    before = conv_calls()
+    fp32 = conv(x, w, None, 1, 1, 1)
+    bf16 = conv(x.bfloat16(), w.bfloat16(), None, 1, 1, 1)
+    after = conv_calls()
     assert (
         after["torch"] == before["torch"] + 1 and after["aiter"] == before["aiter"] + 1
     )

@@ -58,8 +58,8 @@ tied to ``video``: 0.88x at Qwen-Image's 256^2, but 1.19-1.86x on Wan's
 import types
 
 import torch
+from atomrl.lumen.ops.conv import conv
 from torch import nn
-from veomni_patches.aiter_conv import conv
 
 # Both are nn.Conv3d subclasses with an identical causal forward. Matching on the
 # name rather than the type keeps this file from importing either autoencoder

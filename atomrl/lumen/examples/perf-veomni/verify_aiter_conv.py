@@ -2,7 +2,7 @@
 """Single-GPU check of Lumen's AITER-backed convolution in a real VAE.
 
 Encodes one input at the shape training uses through the stock BF16 VAE and
-through the patched one (lumen_vae_conv -> veomni_patches.aiter_conv -> aiter), and reports:
+through the patched one (lumen_vae_conv -> atomrl.lumen.ops.conv -> AITER), and reports:
 
   * latents against an FP32 encode, patched next to stock BF16
   * encode time

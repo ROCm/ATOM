@@ -334,9 +334,9 @@ def _report_backends():
     if not _PATCH:
         return
     if "vae_conv" in _PATCH or "vae_conv_video" in _PATCH:
-        from veomni_patches import aiter_conv
+        from atomrl.lumen.ops.conv import conv_calls
 
-        _rank0(f"aiter conv calls: {aiter_conv.conv_calls()}")
+        _rank0(f"aiter conv calls: {conv_calls()}")
     if "attn_triton_fwd" in _PATCH:
         from veomni_patches import sdpa
 

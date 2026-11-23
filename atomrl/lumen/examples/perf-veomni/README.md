@@ -346,7 +346,7 @@ dx ". $EX/env.sh && RUN_NAME=<名字> RUN_SUFFIX=r1 LUMEN_PATCH=<补丁> \
 | 取值 | 作用 | 代码位置 |
 |---|---|---|
 | `vae_bf16` | 冻结的 VAE 以 BF16 运行，`encode()` 出口把 latent 转回 FP32 | `train_dit_lumen.py` |
-| `vae_conv` / `vae_conv_video` | VAE 卷积走 Lumen 的 AITER-backed Conv2d/Conv3d 路径；前者用于图像（T=1 精确转 conv2d），后者还覆盖 T>1 与 feature cache | `lumen_vae_conv.py`、`veomni_patches/aiter_conv.py` |
+| `vae_conv` / `vae_conv_video` | VAE 卷积走 Lumen 的 AITER-backed Conv2d/Conv3d 路径；前者用于图像（T=1 精确转 conv2d），后者还覆盖 T>1 与 feature cache | `lumen_vae_conv.py`、`atomrl.lumen.ops.conv` |
 | `conv_pad_in_kernel` | 因果卷积不再先 `F.pad` 拷贝整块，改由 kernel 用掩码处理对称 padding | `lumen_vae_conv.py` |
 | `sdpa_efficient` | 关闭 SDPA 的 flash 后端；在 ROCm 上反向改走 aiter 融合 `fmha_bwd`。**引入非确定性** | `veomni_patches/sdpa.py` |
 | `attn_triton_fwd` | 仅对 DiT 的 attention（无 mask、非因果、BF16、head_dim 128）改用 aiter Triton 前向，反向仍用 efficient；需同时加 `sdpa_efficient` | `veomni_patches/sdpa.py` |
@@ -409,7 +409,7 @@ python3 compare_batch_hash.py <日志 A> <日志 B>          # 两次运行的�
 | `profile.sh` | 用 VeOmni 自带的 profiler 采任一级的 trace |
 | `train_dit_lumen.py` | VeOmni 训练入口的包装：按 `LUMEN_PATCH` 装配补丁，并报告后端路由计数 |
 | `lumen_vae_conv.py` | VAE 卷积改写：T=1 精确转 conv2d、T>1 替换底层 kernel、padding 交给 kernel |
-| `veomni_patches/` | L 级的全部补丁：`aiter_conv.py`（AITER 公共卷积路由）、`sdpa.py`、`rmsnorm.py`、`local_adamw.py`、`qwen_offline.py` |
+| `veomni_patches/` | 示例专用补丁：`sdpa.py`、`rmsnorm.py`、`local_adamw.py`、`qwen_offline.py`；卷积直接调用 Lumen |
 | `verify_aiter_conv.py` / `verify_sdpa_triton_fwd.py` / `verify_rmsnorm_fuse.py` | 单卡数值与性能校验 |
 | `test_patches.py` | `veomni_patches/` 的单元测试 |
 | `summarize.py` | 步时中位数、散布、p、峰值显存、loss 偏差；`--chain` 逐级比较 |
