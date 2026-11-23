@@ -1,16 +1,23 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """The runtime switch that stops an lmcache_mp tier's lookups for new requests
-(`POST /offload/lookups`): no lookup and no load plan once off, while an answer
-held from before still loads and a committed load still re-takes its pin."""
+(`POST /offload/lookups`): no lookup, no load plan and no admission wait once
+off, while an answer held from before still loads and a committed load still
+re-takes its pin."""
 
 import queue
+import time
 from types import SimpleNamespace
 
 import pytest
 from test_collective_rpc_dispatch import _Engine, _responses, _RunnerMgr
 from test_lmcache_mp import _config
 from test_lmcache_mp_async_lookup import CHUNK, _Adapter, _Client
+from test_lmcache_mp_async_threads import (
+    _driven_client,
+    _PerRequestClient,
+    _wait_until,
+)
 
 from atom.kv_transfer.disaggregation.multi.multi_connector import (
     MultiConnectorScheduler,
@@ -75,7 +82,7 @@ def test_switched_off_a_new_request_is_not_looked_up_and_leaves_no_state(
     sched.prefetch_lookups([seq])
     assert sched.get_num_new_matched_tokens(seq) == (0, False)
     assert sched.can_detach_lookup(seq, PROMPT - 1) is False
-    assert sched._offered_tokens(seq) is None
+    assert client.submit(seq.token_ids, "7") is False
 
     # Neither an async nor a synchronous lookup was started.
     assert adapter._client.lookups == []
@@ -85,30 +92,57 @@ def test_switched_off_a_new_request_is_not_looked_up_and_leaves_no_state(
     assert "7" not in sched._load_specs
 
 
-def test_an_answered_lookup_from_before_the_switch_is_released(monkeypatch):
+def test_the_switch_releases_an_answered_lookup_nobody_consumed(monkeypatch):
     sched, client, adapter = _scheduler(monkeypatch)
     seq = _seq()
     sched.prefetch_lookups([seq])
     client.pump()
+
     sched.set_offload_lookups(False)
-
-    assert sched.get_num_new_matched_tokens(seq) == (0, False)
     assert [(c["start"], c["end"]) for c in adapter.freed] == [(0, HIT)]
+    assert sched.get_num_new_matched_tokens(seq) == (0, False)
 
 
-def test_an_in_flight_lookup_from_before_the_switch_is_released_on_answer(
+def test_an_in_flight_lookup_stops_holding_its_request_and_is_released_on_answer(
     monkeypatch,
 ):
     sched, client, adapter = _scheduler(monkeypatch)
     adapter._client.lookup_future.done = False
     seq = _seq()
     sched.prefetch_lookups([seq])
-    sched.set_offload_lookups(False)
+    assert sched.lookup_pending(seq) is True
 
+    sched.set_offload_lookups(False)
+    assert sched.lookup_pending(seq) is False
+    assert sched.lookup_would_defer(seq) is False
     assert sched.get_num_new_matched_tokens(seq) == (0, False)
     adapter._client.lookup_future.done = True
     client.pump()
     assert [(c["start"], c["end"]) for c in adapter.freed] == [(0, HIT)]
+    assert len(adapter._client.lookups) == 1
+
+
+def test_the_driver_sends_nothing_once_lookups_are_off():
+    fake = _PerRequestClient(chunks=1)
+    adapter = _Adapter(fake)
+    client = _driven_client(adapter, window=1)
+    try:
+        client.offer("answered", lambda: list(range(8)))
+        assert _wait_until(lambda: "answered" in client._async_hits)
+        client.offer("queued", lambda: list(range(8)))  # the window is full
+
+        client.set_enabled(False)
+        # The answer is released, not refreshed; the queued offer is dropped.
+        assert adapter.freed[0]["end"] == CHUNK
+        assert not client._offered and not client._answered_at
+        assert client.offer("late", lambda: list(range(8))) is False
+        assert client.submit(list(range(8)), "late") is False
+        client._driver.notify()
+        time.sleep(0.05)
+        assert len(fake.lookups) == 1
+        assert client.driver_stats["stale_released"] == 0
+    finally:
+        client.close()
 
 
 def test_switched_back_on_lookups_resume(monkeypatch):
@@ -150,14 +184,16 @@ def test_a_plan_without_a_held_answer_is_dropped_by_the_switch(monkeypatch):
 
 
 def test_a_committed_load_still_retakes_its_pin(monkeypatch):
-    sched, client, _ = _scheduler(monkeypatch)
-    seq = _seq()
-    sched.prefetch_lookups([seq])
-    client.pump()
+    # Only async lookups are off: a load planned from a remembered hit asks
+    # the tier again, synchronously, before it is dispatched.
+    sched, _, adapter = _scheduler(monkeypatch)
+    adapter.maybe_submit_lookup_request = lambda request_id, _tokens: (
+        adapter._lookup_results.__setitem__(request_id, HIT)
+    )
     sched.set_offload_lookups(False)
 
     spec = LoadSpec(hbm_cached_tokens=0, lmcache_cached_tokens=HIT, can_load=True)
-    assert sched._ensure_lookup_pin(seq, "7", spec) is True
+    assert sched._ensure_lookup_pin(_seq(), "7", spec) is True
 
 
 def test_the_mp_shell_forwards_the_switch_to_its_scheduler(monkeypatch):

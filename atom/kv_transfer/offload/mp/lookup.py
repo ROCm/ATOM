@@ -120,6 +120,8 @@ class _MPLookupClient(LookupClient):
         self._answered_at: dict[str, float] = {}
         self._max_unconsumed_hold_s = read_ttl_s * _UNCONSUMED_HOLD_TTL_FRACTION
         self.driver_stats = {"sent": 0, "stale_released": 0}
+        # False: no async lookup is queued or sent (`set_enabled`).
+        self._enabled = True
         # The non-blocking path drives LMCache's ATOM adapter through its
         # internals (message-queue client and result caches). An adapter
         # without them falls back to the synchronous lookup.
@@ -173,7 +175,8 @@ class _MPLookupClient(LookupClient):
         with self._lock:
             self._salt_session(lookup_id, request_configs)
             if (
-                lookup_id in self._offered
+                not self._enabled
+                or lookup_id in self._offered
                 or lookup_id in self._async
                 or lookup_id in self._async_tokens
                 or lookup_id in self._lookups
@@ -261,7 +264,8 @@ class _MPLookupClient(LookupClient):
         self._salt_session(lookup_id, request_configs)
         self._offered.pop(lookup_id, None)
         if (
-            not self._async_supported
+            not self._enabled
+            or not self._async_supported
             or lookup_id in self._async
             or lookup_id in self._async_tokens
             or lookup_id in self._lookups
@@ -297,6 +301,19 @@ class _MPLookupClient(LookupClient):
         if salt:
             session = _mp_session_id(self._config, lookup_id)
             self._adapter.salt_session(session, salt)
+
+    @_locked
+    def set_enabled(self, enabled: bool) -> None:
+        """Queue and send async lookups or not.
+
+        Off also discards every lookup no request has consumed, queued, in
+        flight or answered, so the driver's stale refresh does not send it
+        again. A consumed one keeps its locks for its load.
+        """
+        self._enabled = bool(enabled)
+        if not enabled:
+            for lookup_id in [*self._offered, *self._async_tokens]:
+                self.discard(lookup_id)
 
     def supports_async(self) -> bool:
         """Whether `submit` can send a lookup without waiting for it."""

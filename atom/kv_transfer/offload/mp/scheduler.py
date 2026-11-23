@@ -162,8 +162,6 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         """
         if getattr(seq, "status", None) != SequenceStatus.WAITING:
             return None
-        if not self._lookups_enabled:
-            return None
         return self._lookup_token_ids(seq)
 
     # -- turning lookups off ---------------------------------------------------
@@ -174,16 +172,32 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         """Start tier lookups for new requests or not; True if applied.
 
         Off once what a read-only tier holds is back in HBM (a replayed warmup).
-        An answer already held still loads. Refused while this scheduler saves:
-        without a lookup its saves would store every prompt from token 0 again.
+        An answer already held still loads. A lookup no request has consumed,
+        answered or not, is released, so that request prefills its prompt.
+        Refused while this scheduler saves: without a lookup its saves would
+        store every prompt from token 0 again.
         """
         if not enabled and self._do_save:
             return False
         self._lookups_enabled = bool(enabled)
+        self._lookup_client.set_enabled(enabled)
         return True
+
+    def _lookups_off_for(self, seq: Any) -> bool:
+        """Lookups are off and `seq` holds no answer from before: it cannot load."""
+        if self._lookups_enabled:
+            return False
+        held = self._lookup_results.get(str(seq.id))
+        return held is None or held[0] is not seq
 
     def _lookup_wanted(self, seq: Any) -> bool:
         return self._lookups_enabled and super()._lookup_wanted(seq)
+
+    def lookup_pending(self, seq: Any) -> bool:
+        return not self._lookups_off_for(seq) and super().lookup_pending(seq)
+
+    def lookup_would_defer(self, seq: Any) -> bool:
+        return not self._lookups_off_for(seq) and super().lookup_would_defer(seq)
 
     # -- same-step saves -------------------------------------------------------
 
@@ -228,14 +242,11 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
 
     def get_num_new_matched_tokens(self, seq: Any) -> tuple[int, bool]:
         sid = str(seq.id)
-        held = self._lookup_results.get(sid)
-        if not self._lookups_enabled and (held is None or held[0] is not seq):
+        if self._lookups_off_for(seq):
             # As with loads off (`_do_load`): no lookup, and a plan made from a
             # remembered hit before the switch must not load after allocation.
             if sid in self._load_specs:
                 self._clear_pending_load(sid)
-            # A lookup sent before the switch is never consumed: free its locks.
-            self._lookup_client.discard(sid)
             return 0, False
         matched = super().get_num_new_matched_tokens(seq)
         num_prompt = int(seq.num_prompt_tokens)

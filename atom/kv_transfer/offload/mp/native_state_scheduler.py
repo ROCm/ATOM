@@ -318,7 +318,8 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         # only with a replay, which stores no images).
         if self._page_only or not seq.has_per_req_cache:
             return False
-        if not self._restore_slots_full():
+        # With lookups off and no answer held it starts no load: no slot needed.
+        if self._lookups_off_for(seq) or not self._restore_slots_full():
             return False
         return self._lookup_client.answered_hit(str(seq.id)) != 0
 
