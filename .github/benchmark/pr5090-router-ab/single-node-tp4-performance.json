@@ -148,7 +148,8 @@
     "NCCL_SOCKET_IFNAME": "@fabric.socket-ifname",
     "GLOO_SOCKET_IFNAME": "@fabric.socket-ifname",
     "NCCL_IB_HCA": "@fabric.rdma-devices",
-    "NCCL_IB_GID_INDEX": "@fabric.rdma-gid-index"
+    "NCCL_IB_GID_INDEX": "@fabric.rdma-gid-index",
+    "MC_DISABLE_HIP": "1"
   },
   "benchmark_env": {
     "AIPERF_REQUIRED_SERVER_METRIC_PREFIX": "vllm:"
@@ -197,5 +198,12 @@
   },
   "verify_pd": true,
   "run_time_limit": "02:00:00",
-  "budget_rationale": "120 minutes total: prior same-model startup about 20 minutes, full 3600-second measurement, remaining allowance for pinned router build, client/dataset preparation, drain and cleanup. No comparable complete local load point; use the 2-hour full-run default."
+  "budget_rationale": "120 minutes total: prior same-model startup about 20 minutes, full 3600-second measurement, remaining allowance for pinned router build, client/dataset preparation, drain and cleanup. No comparable complete local load point; use the 2-hour full-run default.",
+  "transport_adjustment": {
+    "reason": "The first full-run attempt failed before measurement because the local HIP IPC fast path returned invalid device context. De-prioritize HIP for buffers also registered with RDMA.",
+    "setting": "MC_DISABLE_HIP=1 on both roles",
+    "scope": "Same node and worker/router versions; this transport setting differs from the earlier functional baseline. No transport trace logging during measurement.",
+    "source": "kvcache-ai/Mooncake v0.3.14 multi_transport.cpp protocol_priority; flag confirmed in pinned image engine.so",
+    "engine_so_sha256": "540428ce937a5be29726195730246f053f88d3ddfabaa2af33ad79c7a92198a8"
+  }
 }
