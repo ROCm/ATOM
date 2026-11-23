@@ -32,6 +32,7 @@ import pytest
 import torch
 from conftest import MockConfig, with_min_load
 
+from atom.config import KVCacheTensor
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.disaggregation.pp_kv_aggregator import PPKVAggregator
 from atom.kv_transfer.disaggregation.types import (
@@ -3879,7 +3880,8 @@ def test_factory_builds_both_halves(cluster):
 def _kv_caches(num_blocks=8):
     # MLA-like: token-major rows, one plane per layer.
     return {
-        f"layer_{i}": SimpleNamespace(
+        f"layer_{i}": KVCacheTensor(
+            layer_num=i,
             k_cache=torch.zeros((num_blocks * BLOCK, 1, 8), dtype=torch.uint8),
             index_cache=None,
         )
