@@ -522,6 +522,9 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
         except BaseException:
             session.abandon(preprocessing)
             raise
+        if not session.open:  # closed while it preprocessed: close() aborted none of it
+            session.abandon(preprocessing)
+            return
         session.preparing -= 1
         session.add(request.seq_id, seq, request.request_id)
         try:
