@@ -470,7 +470,11 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
         try:
             api._validate_sequence_context_length(seq, params)
             await api._submit_engine_requests([seq])
-        except BaseException:
+        except asyncio.CancelledError:
+            # It reached the engine, which aborts it: the request and its window stay
+            # held until flush delivers that end.
+            raise
+        except BaseException:  # it never reached the engine
             session.drop(request.seq_id)
             raise
 

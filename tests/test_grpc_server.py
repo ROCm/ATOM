@@ -74,6 +74,7 @@ class FakeEngine:
                 max_tokens=params.max_tokens,
                 callback=stream_callback,
                 arrive_time=time.time(),
+                json_schema=params.json_schema,  # structured: submitted off the loop
             )
             self.io_processor.requests[seq.id] = seq
             self.made.append(seq.id)
@@ -426,6 +427,46 @@ def test_a_session_ended_during_preprocess_keeps_its_window_until_the_seq_drops(
 
     assert asyncio.run(end_while_preprocessing())
     assert window in servicer.sessions.free and session.window is None
+
+
+def test_a_submission_cancelled_once_it_reached_the_engine_holds_its_window(
+    serve, monkeypatch
+):
+    engine, entered, admit = FakeEngine(), threading.Event(), threading.Event()
+    servicer = serve(engine)
+    sessions = servicer.sessions
+    session = sessions.open()
+    window = session.window
+    sessions.free.clear()  # every other window held: a next Session needs this one
+
+    def add_request(seqs):  # the structured admission, on its thread
+        entered.set()
+        admit.wait(10)
+        engine.running.update((seq.id, seq) for seq in seqs)
+
+    monkeypatch.setattr(engine.core_mgr, "add_request", add_request)
+    # The engine ends an aborted seq at its next step, not at once.
+    monkeypatch.setattr(engine.core_mgr, "abort_request", engine.aborted.append)
+
+    async def cancel_then_resubmit():
+        request = _submit(json_schema='{"type": "object"}')
+        submit = asyncio.create_task(servicer._submit(session, request))
+        await asyncio.to_thread(entered.wait, 10)
+        submit.cancel()  # as the Session RPC ends: its reader cancelled, then close
+        session.close()
+        admit.set()
+        with pytest.raises(asyncio.CancelledError):
+            await submit
+        reopened = sessions.open()  # before the abort's end: no window
+        (seq,) = engine.running.values()
+        seq.callback(RequestOutput(seq.id, [], True, "aborted"))
+        engine.flush()
+        await _until(lambda: window in sessions.free)
+        return reopened
+
+    assert asyncio.run(cancel_then_resubmit()) is None
+    assert engine.aborted and engine.io_processor.requests == {}
+    assert sessions.open().window == window
 
 
 def test_a_session_admits_a_prompt_only_in_kv_transfer_params(serve):

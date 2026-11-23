@@ -75,7 +75,7 @@ class Session:
         self._release()
 
     def drop(self, client_id: int) -> None:
-        """Forgets a request whose submission failed."""
+        """Forgets a request whose submission failed before it reached the engine."""
         request = self.requests.pop(client_id)
         self.api.engine.io_processor.requests.pop(request.seq.id, None)
         self._release()
