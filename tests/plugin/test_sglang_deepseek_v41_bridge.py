@@ -436,7 +436,9 @@ class TestPrepareConfig:
             register, "_ATOM_SUPPORTED_MODELS", {DEEPSEEK_V41_ARCH: object}
         )
 
-        def prepare(env=None, fp4ptpc=False, online_quant_config=None):
+        def prepare(
+            env=None, fp4ptpc=False, online_quant_config=None, kv_cache_dtype="bf16"
+        ):
             if env is None:
                 monkeypatch.delenv("ATOM_SGLANG_V41_DECODER_REPLAY", raising=False)
             else:
@@ -446,7 +448,7 @@ class TestPrepareConfig:
                 max_num_seqs=64,
                 gpu_memory_utilization=None,
                 kv_cache_block_size=128,
-                kv_cache_dtype="bf16",
+                kv_cache_dtype=kv_cache_dtype,
                 index_cache_dtype="fp8",
                 hf_config=SimpleNamespace(fp4ptpc=fp4ptpc),
                 online_quant_config=online_quant_config,
@@ -481,6 +483,95 @@ class TestPrepareConfig:
             "online_quant_config": {
                 "layer_quant_config": {"*.ffn.experts*": "ptpc_fp8"}
             }
+        }
+
+    def test_fp8_kv_is_refused_where_aiter_has_no_backend(self, prepared, monkeypatch):
+        # MI308X: the FP8 pool would build, then the first decode-graph capture
+        # forward fails in `mla_sparse_prefill_v41`, as natively.
+        monkeypatch.setattr(bridge, "fp8_kv_attention_backend", lambda config: None)
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        monkeypatch.setattr(
+            torch.cuda,
+            "get_device_properties",
+            lambda index: SimpleNamespace(gcnArchName="gfx942:sramecc+:xnack-"),
+        )
+        with pytest.raises(
+            ValueError,
+            match=r"backend, which this device \(gfx942\) lacks; launch with "
+            r"--kv-cache-dtype bfloat16$",
+        ):
+            prepared(kv_cache_dtype="fp8")
+
+    def test_fp8_kv_passes_where_aiter_has_a_backend(self, prepared, monkeypatch):
+        monkeypatch.setattr(bridge, "fp8_kv_attention_backend", lambda config: "opus")
+        assert prepared(kv_cache_dtype="fp8").kv_cache_dtype == "fp8"
+
+    def test_bf16_kv_is_never_probed(self, prepared, monkeypatch):
+        # `bfloat16` reaches the bridge as "bf16" (`auto` is refused first).
+        def probe(config):
+            raise AssertionError("BF16 KV probed AITER's FP8 attention")
+
+        monkeypatch.setattr(bridge, "fp8_kv_attention_backend", probe)
+        prepared(kv_cache_dtype="bf16")
+
+    def test_the_probe_asks_for_the_fp8_pools_attention_call(self, monkeypatch):
+        # The probe must describe the call the FP8 pool's attention makes
+        # (`sparse_attn_v41_paged_2src` over `PagedAttentionCache.query_fp8`
+        # and MXFP8 planes), dtype for dtype, on one TP4 rank's heads.
+        import types
+
+        fp8_attention = pytest.importorskip(
+            "atom.model_ops.attentions.deepseek_v41.fp8_attention"
+        )
+        from atom.model_ops.attentions.deepseek_v41.cache import (
+            PagedAttentionCache,
+        )
+
+        heads, dim = 16, 512
+        attended = {}
+        monkeypatch.setattr(
+            fp8_attention,
+            "mla_sparse_prefill_v41",
+            lambda *args, **kwargs: attended.update(args=args),
+        )
+        query = PagedAttentionCache.query_fp8(
+            SimpleNamespace(kv_fp8=True), torch.zeros(1, heads, dim)
+        )
+
+        def plane(rows):
+            return (
+                torch.zeros(rows, dim, dtype=torch.uint8),
+                torch.zeros(rows, dim // 32, dtype=torch.uint8),
+            )
+
+        index = torch.zeros(1, dtype=torch.int32)
+        fp8_attention.sparse_attn_v41_paged_2src(
+            query, plane(2), index, index, plane(3), index, index, None, 1.0
+        )
+        q, q_scale, csa, csa_scale, _, _, swa, swa_scale = attended["args"][:8]
+
+        probed = []
+        aiter_module = types.ModuleType("aiter.ops.mla_sparse_prefill")
+        aiter_module.get_mla_sparse_prefill_v41_backend = (
+            lambda *args, **kwargs: probed.append((args, kwargs)) or "opus"
+        )
+        monkeypatch.setitem(sys.modules, aiter_module.__name__, aiter_module)
+        config = SimpleNamespace(
+            tensor_parallel_size=4,
+            hf_config=SimpleNamespace(num_attention_heads=4 * heads, head_dim=dim),
+        )
+        assert bridge.fp8_kv_attention_backend(config) == "opus"
+        (device, shape), kwargs = probed[0]
+        assert (device, shape) == (torch.device("cuda"), (1, heads, dim))
+        assert kwargs == {
+            "q_dtype": q.dtype,
+            "q_scale_dtype": q_scale.dtype,
+            "unified_kv_dtype": csa.dtype,
+            "unified_kv_scale_dtype": csa_scale.dtype,
+            "kv_dtype": swa.dtype,
+            "kv_scale_dtype": swa_scale.dtype,
+            "softmax_scale": dim**-0.5,
+            "layout": "contiguous",
         }
 
     @pytest.mark.parametrize(
