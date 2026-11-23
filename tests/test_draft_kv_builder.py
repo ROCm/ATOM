@@ -697,7 +697,9 @@ def test_a_declared_scale_other_than_unit_is_refused():
         draft_kv_builder(SimpleNamespace(), None, _Draft())
 
 
-@pytest.mark.parametrize("draft_kind", ["disabled", "shared", "independent"])
+@pytest.mark.parametrize(
+    "draft_kind", ["disabled", "pp_non_last", "shared", "independent"]
+)
 def test_serving_binding_uses_the_drafts_builder_before_target_fallback(draft_kind):
     from atom.model_engine.kv_cache_binding import kv_cache_bindings
 
@@ -721,10 +723,13 @@ def test_serving_binding_uses_the_drafts_builder_before_target_fallback(draft_ki
 
     runner = SimpleNamespace(
         model=SimpleNamespace(modules=lambda: [target, norm]),
-        drafter=SimpleNamespace(model=SimpleNamespace(modules=lambda: [draft, shared])),
         config=SimpleNamespace(speculative_config=draft_kind != "disabled"),
         attn_metadata_builder=SimpleNamespace(build_kv_cache_tensor=target_bind),
     )
+    if draft_kind != "pp_non_last":
+        runner.drafter = SimpleNamespace(
+            model=SimpleNamespace(modules=lambda: [draft, shared])
+        )
     if draft_kind == "independent":
         runner.draft_kv_builder = SimpleNamespace(build_kv_cache_tensor=draft_bind)
     bound = [
@@ -733,13 +738,14 @@ def test_serving_binding_uses_the_drafts_builder_before_target_fallback(draft_ki
         if tensor is not None
     ]
     assert [module.layer_num for module, _ in bound] == (
-        [17] if draft_kind == "disabled" else [17, 29, 31]
+        [17] if draft_kind in ("disabled", "pp_non_last") else [17, 29, 31]
     )
     assert all(tensor is tensors[module] for module, tensor in bound)
     assert (
         target_calls
         == {
             "disabled": [target, norm],
+            "pp_non_last": [target, norm],
             "shared": [target, norm, draft, shared],
             "independent": [target, norm, shared],
         }[draft_kind]
