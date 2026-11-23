@@ -659,6 +659,7 @@ indefinitely for an identity handshake that never arrives.
   engine-index space folds PP stages into DP ranks and the two mappings are not
   reconciled across nodes.
 - PP + DP is separately unsupported (single-node assertion, pre-existing).
+  One pipeline without DP may span nodes: see section 11.
 
 ## 9. Wide expert parallelism (multi-node EP)
 
@@ -752,3 +753,45 @@ the whole group.
   node), and so are barrier RPCs (the TP barrier is a local multiprocessing one).
 - The custom all-reduce is node-local, so collectives between nodes go through
   RCCL. On gfx950 also set `ATOM_USE_CUSTOM_ALL_GATHER=0`.
+
+## 11. Multi-node pipeline parallelism
+
+One pipeline (one serving instance) may run its stages on several nodes. Each
+node runs a contiguous, equal slice of the stages, and every stage's TP group
+stays on its node. The node of stage 0 is the coordinator: the API server, the
+CoreManager router, the model-runner TCPStore and every engine socket live
+there, as on a multi-node DP coordinator. The other nodes run only their stages'
+EngineCores. Multi-node PP is read off `--pipeline-parallel-size-local` below
+`-pp`; without the new flags every path is the single-node one.
+
+| Flag | Meaning |
+|---|---|
+| `--pipeline-parallel-size-local` | Stages on this node |
+| `--pipeline-parallel-rank` | First stage this node runs (0 on the coordinator) |
+| `--pipeline-parallel-node-ips` | Every node's IPv4 address in stage order, the same on every node |
+| `--data-parallel-master-ip` / `-master-port` / `-base-port` | The coordinator's address, the base of the derived socket ports, the TCPStore port |
+
+PP8 x TP1 on two 4-GPU nodes (node 1 runs the same command with
+`--pipeline-parallel-rank 4`):
+
+```bash
+python -m atom.entrypoints.openai_server --model <model> -tp 1 -pp 8 --enforce-eager \
+  --pipeline-parallel-size-local 4 --pipeline-parallel-rank 0 \
+  --pipeline-parallel-node-ips 10.0.0.1,10.0.0.2 \
+  --data-parallel-master-ip 10.0.0.1 --data-parallel-master-port 29500 --data-parallel-base-port 29501
+```
+
+Worker `r` of stage `s` has global rank `s * tp + r` and runs on its node's GPU
+`(s mod pipeline_parallel_size_local) * tp + r`. The stage channels take fixed
+TCP ports after the engine sockets (`InternodePPChannelPlan` in
+`engine_core_mgr.py`; PP8 uses master port + 100 .. + 133). The groups wait
+`ATOM_MULTINODE_TP_TIMEOUT_S` for the store and at least
+`ATOM_MULTINODE_PG_TIMEOUT_S` in gloo / NCCL, so a slow node's weight load does
+not time them out.
+
+Restrictions: DP, DP-attention, PCP, RapidServe and `--fake-eplb` are refused, as
+are a KV offload tier (its lookups and saves assume every stage runs on the
+head's host) and the Mooncake P/D connector (its producer advertises one host for
+all stages). Use the same environment on every node, and set
+`GLOO_SOCKET_IFNAME` / `NCCL_SOCKET_IFNAME` where the default interface is not
+the one the nodes share.

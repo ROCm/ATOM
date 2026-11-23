@@ -134,8 +134,10 @@ def build_internode_dp_socket_plan(
     """Derive deterministic per-engine TCP ports from the DP master port.
 
     Multi-node only -- ``CoreManager.__init__`` calls this when
-    ``is_multinode_dp`` and passes ``None`` otherwise, and that ``None`` is what
-    selects the IPC path (and, with it, the connect/bind polarity) further down.
+    ``is_multinode_dp`` or ``is_multinode_pp`` and passes ``None`` otherwise,
+    and that ``None`` is what selects the IPC path (and, with it, the
+    connect/bind polarity) further down. ``rank`` is the global engine index:
+    the DP rank, or the stage of a pipeline that spans nodes.
 
     Three ports per engine: requests, outputs, and control. Control is separate
     so utility, abort, and shutdown never share ``input_sockets`` with add and
@@ -151,6 +153,60 @@ def build_internode_dp_socket_plan(
         )
         for rank in range(engine_count)
     ]
+
+
+@dataclass(frozen=True)
+class InternodePPChannelPlan:
+    """Where the pipeline's stage channels (``pp_transport.py``) listen when
+    the stages run on more than one node.
+
+    The ports follow the engines' sockets (``build_internode_dp_socket_plan``)
+    on the same master port, so every node derives the same plan. Each channel
+    keeps PPStageTransport's polarity -- its receiver binds, its senders
+    connect -- so stage ``s`` binds ``meta_ports[s]`` on its own node (index 0,
+    the head's, is unused) and the head binds the token and KV-status ports on
+    the first node. A sender reaches a receiver at ``stage_ips[receiver]``.
+    """
+
+    stage_ips: tuple[str, ...]
+    meta_ports: tuple[int, ...]
+    token_port: int
+    kv_status_port: int
+
+    def stage_addresses(self, pp_rank: int) -> tuple[list[str], str, str]:
+        """``(pp_meta_addrs, pp_token_addr, pp_kv_status_addr)`` as stage
+        ``pp_rank`` sees them: every interface for the endpoints it binds, the
+        owning node's IP for those it connects to."""
+
+        def endpoint(owner: int, port: int) -> str:
+            host = "0.0.0.0" if owner == pp_rank else self.stage_ips[owner]
+            return f"tcp://{host}:{port}"
+
+        meta = [endpoint(s, port) for s, port in enumerate(self.meta_ports)]
+        return meta, endpoint(0, self.token_port), endpoint(0, self.kv_status_port)
+
+
+def build_internode_pp_channel_plan(
+    *, pp_size: int, pp_size_local: int, node_ips: list[str], master_port: int
+) -> InternodePPChannelPlan:
+    """The PP channel plan of a pipeline whose node ``k`` (at ``node_ips[k]``)
+    runs stages ``k * pp_size_local`` onwards.
+
+    ``pp_size + 2`` ports right after the ``pp_size`` engines' sockets: stage
+    ``s`` receives the head's batches on the ``s``-th, the head the last
+    stage's completions and every stage's KV status on the final two.
+    """
+    base = (
+        master_port
+        + INTERNODE_DP_SOCKET_PORT_OFFSET
+        + pp_size * INTERNODE_DP_PORTS_PER_ENGINE
+    )
+    return InternodePPChannelPlan(
+        stage_ips=tuple(node_ips[s // pp_size_local] for s in range(pp_size)),
+        meta_ports=tuple(base + s for s in range(pp_size)),
+        token_port=base + pp_size,
+        kv_status_port=base + pp_size + 1,
+    )
 
 
 def iter_dp_rank_assignments(config) -> list[tuple[int, int]]:
@@ -505,10 +561,14 @@ class CoreManager:
         pc.server_instance_id = uuid.uuid4().hex[:12]
         if multinode and pc.data_parallel_base_port == 0:
             raise ValueError(
-                "Multi-node DP or TP requires the same nonzero "
+                "Multi-node DP, TP or PP requires the same nonzero "
                 "--data-parallel-base-port (or ATOM_DP_BASE_PORT) on every node."
             )
-        if not multinode or pc.data_parallel_rank == 0:
+        # The coordinator serves the store: the node of global DP rank 0 and,
+        # under a pipeline that spans nodes, of stage 0.
+        if not multinode or (
+            pc.data_parallel_rank == 0 and pc.pipeline_parallel_rank == 0
+        ):
             store = TCPStore(
                 pc.data_parallel_master_ip,
                 pc.data_parallel_base_port,
@@ -537,6 +597,12 @@ class CoreManager:
                 "the engine index space folds PP stages into DP ranks, and the "
                 "two mappings have not been reconciled across nodes."
             )
+        # The stages this node runs: all of them, unless the pipeline spans
+        # nodes, when this node's config names the first of its slice
+        # (validated by Config._check_multinode_pp).
+        multinode_pp = config.is_multinode_pp
+        pp_size_local = config.pp_size_local
+        pp_rank_start = pc.pipeline_parallel_rank
 
         rank_assignments = iter_dp_rank_assignments(config)
         if config.enable_dp_attention:
@@ -559,32 +625,44 @@ class CoreManager:
             assert not (
                 pp_size > 1 and dp_size > 1
             ), "Pipeline parallel combined with data parallel is not supported yet."
-            local_engine_count = len(rank_assignments) * pp_size
+            local_engine_count = len(rank_assignments) * pp_size_local
 
         global_engine_count = (
             config.parallel_config.data_parallel_size * pp_size
             if not config.enable_dp_attention
             else config.parallel_config.data_parallel_size
         )
-        # Global DP rank 0's node owns the router; the others only host engines.
-        self.is_coordinator = not multinode or pc.data_parallel_rank == 0
+        # Global DP rank 0's node, and stage 0's under a pipeline that spans
+        # nodes, owns the router; the others only host engines.
+        self.is_coordinator = (
+            not multinode or pc.data_parallel_rank == 0
+        ) and pp_rank_start == 0
         socket_plan = (
             build_internode_dp_socket_plan(
                 engine_count=global_engine_count,
                 master_port=pc.data_parallel_master_port,
             )
-            if multinode
+            if multinode or multinode_pp
             else None
         )
 
         # Inter-stage ZMQ channels (head<->downstream metadata, last->head
         # tokens), shared across the single dp group. PP+DP would need per-group
         # sets — deferred with the assertion above. Not shared state: only this
-        # class's spawn loop reads them.
+        # class's spawn loop reads them. Across nodes they are TCP endpoints,
+        # and each stage gets its own view of them (InternodePPChannelPlan).
         self.pp_meta_addrs = []
         self.pp_token_addr = ""
         self.pp_kv_status_addr = ""
-        if pp_size > 1:
+        pp_channel_plan = None
+        if multinode_pp:
+            pp_channel_plan = build_internode_pp_channel_plan(
+                pp_size=pp_size,
+                pp_size_local=pp_size_local,
+                node_ips=pc.pipeline_parallel_node_ips,
+                master_port=pc.data_parallel_master_port,
+            )
+        elif pp_size > 1:
             self.pp_meta_addrs = [get_open_zmq_ipc_path() for _ in range(pp_size)]
             self.pp_token_addr = get_open_zmq_ipc_path()
             self.pp_kv_status_addr = get_open_zmq_ipc_path()
@@ -606,12 +684,13 @@ class CoreManager:
 
         try:
             self._start_distributed_store(
-                config, multinode=multinode or config.is_multinode_tp
+                config,
+                multinode=multinode or config.is_multinode_tp or multinode_pp,
             )
             for engine_index in range(self.local_engine_count):
-                assignment_index = engine_index // self.pp_size
+                assignment_index = engine_index // pp_size_local
                 dp_rank, local_dp_rank = rank_assignments[assignment_index]
-                pp_rank = engine_index % self.pp_size
+                pp_rank = pp_rank_start + engine_index % pp_size_local
                 logger.info(
                     f"{self.label}: Creating EngineCore engine {engine_index}"
                     f" (global dp={dp_rank}, local dp={local_dp_rank}, "
@@ -625,7 +704,13 @@ class CoreManager:
                 rank_config.parallel_config.data_parallel_rank = dp_rank
                 rank_config.parallel_config.data_parallel_rank_local = local_dp_rank
                 rank_config.parallel_config.pipeline_parallel_rank = pp_rank
-                if self.pp_size > 1:
+                if pp_channel_plan is not None:
+                    (
+                        rank_config.parallel_config.pp_meta_addrs,
+                        rank_config.parallel_config.pp_token_addr,
+                        rank_config.parallel_config.pp_kv_status_addr,
+                    ) = pp_channel_plan.stage_addresses(pp_rank)
+                elif self.pp_size > 1:
                     rank_config.parallel_config.pp_meta_addrs = self.pp_meta_addrs
                     rank_config.parallel_config.pp_token_addr = self.pp_token_addr
                     rank_config.parallel_config.pp_kv_status_addr = (
@@ -633,7 +718,9 @@ class CoreManager:
                     )
 
                 if socket_plan is not None:
-                    plan = socket_plan[dp_rank]
+                    # Indexed like the coordinator's sockets: one per engine,
+                    # DP rank-major, then stage.
+                    plan = socket_plan[dp_rank * self.pp_size + pp_rank]
                     ip = config.parallel_config.data_parallel_master_ip
                     engine_addresses = {
                         "input_address": f"tcp://{ip}:{plan.input_port}",
@@ -652,6 +739,7 @@ class CoreManager:
                         "process": engine_core_process,
                         "addresses": addresses,
                         "dp_rank": dp_rank,
+                        "pp_rank": pp_rank,
                         "config": rank_config,
                     }
                 )
@@ -661,7 +749,7 @@ class CoreManager:
                 # No visible-device mask is published here. Device placement is
                 # owned by ModelRunner._setup_device_and_distributed (by default
                 # init_model_env in model_setup.py; the rollout runner overrides
-                # it), which selects an ABSOLUTE cuda:{local_dp_rank*tp_size+rank}.
+                # it), which selects an ABSOLUTE cuda:{local_device_index(...)}.
                 # Masking the child as well would renumber its devices and compound
                 # the two offsets -- see set_device_control_env_var's docstring.
                 for info, local_dp_rank in zip(processes_info, local_dp_ranks):
@@ -678,10 +766,13 @@ class CoreManager:
                     # coordinator binds every socket. Wait for the children and
                     # return -- raising here would be caught by the enclosing
                     # handler and reported as a startup failure.
+                    engines = (
+                        f"PP stages {[i['pp_rank'] for i in processes_info]}"
+                        if multinode_pp
+                        else f"global DP ranks {[i['dp_rank'] for i in processes_info]}"
+                    )
                     logger.info(
-                        f"{self.label}: worker node for global DP ranks "
-                        f"{[i['dp_rank'] for i in processes_info]}; "
-                        f"coordinator at "
+                        f"{self.label}: worker node for {engines}; coordinator at "
                         f"{config.parallel_config.data_parallel_master_ip}"
                     )
                     self._finalizer = weakref.finalize(self, self.close)
