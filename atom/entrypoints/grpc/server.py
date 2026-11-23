@@ -542,6 +542,14 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
             usage_on_finish=api_compatibility_for(
                 api.custom_message_encoder
             ).usage_on_finish,
+            implicit_reasoning_opener=(
+                api.reasoning_dialect.prompt_open_marker
+                if api.model_starts_in_reasoning and api.reasoning_dialect
+                else None
+            ),
+            reasoning_toggle_json=(
+                json.dumps(list(api.reasoning_toggle)) if api.reasoning_toggle else ""
+            ),
         )
 
     async def GetServerInfo(self, request, context):

@@ -1062,6 +1062,22 @@ def test_model_info_places_streamed_usage_as_the_encoder_does(
     assert info.usage_on_finish is usage_on_finish
 
 
+def test_model_info_says_how_a_reply_starts_in_reasoning(serve, monkeypatch):
+    engine = FakeEngine()
+    engine.config.end_token_ids = [2]
+    monkeypatch.setattr(api_server, "tokenizer", SimpleNamespace(chat_template=None))
+    info = asyncio.run(serve(engine).GetModelInfo(pb.GetModelInfoRequest(), None))
+    assert not info.HasField("implicit_reasoning_opener")
+    assert info.reasoning_toggle_json == ""
+    # DeepSeek-R1's template closes a <think> it never opens.
+    monkeypatch.setattr(api_server, "model_starts_in_reasoning", True)
+    monkeypatch.setattr(api_server, "reasoning_dialect", FALLBACK_DIALECT)
+    monkeypatch.setattr(api_server, "reasoning_toggle", ("thinking", False, True))
+    info = asyncio.run(serve(engine).GetModelInfo(pb.GetModelInfoRequest(), None))
+    assert info.implicit_reasoning_opener == FALLBACK_DIALECT.prompt_open_marker
+    assert json.loads(info.reasoning_toggle_json) == ["thinking", False, True]
+
+
 def test_server_info_carries_the_kv_event_sources_body(serve, monkeypatch):
     engine = FakeEngine()
     sources = {"0": {"endpoint": "tcp://*:5557", "topic": "kv", "block_size": 16}}
