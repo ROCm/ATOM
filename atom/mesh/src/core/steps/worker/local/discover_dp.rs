@@ -66,9 +66,11 @@ async fn get_atom_dp_size(url: &str, api_key: Option<&str>) -> Result<usize, Str
         .ok_or_else(|| format!("No dp_size in response from {}", endpoint))
 }
 
-/// The `/server_info` body that an ATOM gRPC worker's GetServerInfo carries.
+/// An ATOM gRPC worker's GetServerInfo, and the `grpc://` URL it answered at.
 #[cfg(feature = "grpc-client")]
-async fn get_atom_grpc_server_info(url: &str) -> Result<ServerInfo, String> {
+pub(super) async fn atom_grpc_get_server_info(
+    url: &str,
+) -> Result<(crate::atom_engine::grpc::GetServerInfoResponse, String), String> {
     let grpc_url = format!("grpc://{}", super::strip_protocol(url));
     let client = crate::routers::grpc::engine::atom::AtomClient::connect(&grpc_url)
         .await
@@ -77,6 +79,13 @@ async fn get_atom_grpc_server_info(url: &str) -> Result<ServerInfo, String> {
         .get_server_info()
         .await
         .map_err(|e| format!("GetServerInfo failed at {}: {}", grpc_url, e))?;
+    Ok((response, grpc_url))
+}
+
+/// The `/server_info` body that an ATOM gRPC worker's GetServerInfo carries.
+#[cfg(feature = "grpc-client")]
+async fn get_atom_grpc_server_info(url: &str) -> Result<ServerInfo, String> {
+    let (response, grpc_url) = atom_grpc_get_server_info(url).await?;
     serde_json::from_str(&response.server_info_json)
         .map_err(|e| format!("Failed to parse GetServerInfo from {}: {}", grpc_url, e))
 }
