@@ -25,7 +25,7 @@ from google.protobuf.json_format import MessageToDict
 from atom.entrypoints.grpc import atom_grpc_pb2 as pb
 from atom.entrypoints.grpc import atom_grpc_pb2_grpc as pb_grpc
 from atom.entrypoints.grpc import frames
-from atom.entrypoints.grpc.session import Sessions
+from atom.entrypoints.grpc.session import OUTBOX, Sessions
 from atom.entrypoints.openai.api_compatibility import api_compatibility_for
 from atom.entrypoints.openai.frontend_workers import worker_seq_ids
 from atom.entrypoints.openai.protocol import (
@@ -78,6 +78,10 @@ N_TRANSFERRED = "n above 1 with kv_transfer_params (P/D) is not served over gRPC
 SESSION_N = "n above 1 is not served over the Session; Generate serves it unstreamed"
 # Submissions a Session admits at once; past it, they wait in order for one to end.
 SESSION_ADMISSIONS = 64
+# Submissions that may wait so; past it, each is rejected OVERLOADED. As many as the
+# messages a client may leave unread (OUTBOX): the Session holds neither side unbounded.
+SESSION_WAITING = OUTBOX
+SESSION_BUSY = "the Session has too many submissions waiting for admission"
 # ATOM's tool-call formats by atomesh's name for the same syntax. ATOM's `qwen` is the
 # XML one, atomesh's `qwen_xml`; GLM's two dialects are one ATOM parser, so atomesh's
 # model-name mapping picks GLM's.
@@ -441,12 +445,17 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
                             f"seq_id {item.seq_id} is already in flight"
                         )
                         refused.append(_rejected(item.seq_id, in_flight))
-                    else:
+                    elif len(admissions) < SESSION_ADMISSIONS:
                         session.admitting.add(item.seq_id)  # an Abort waits for it
-                        if len(admissions) < SESSION_ADMISSIONS:
-                            admit(item)
-                        else:
-                            waiting.append(item)
+                        admit(item)
+                    elif len(waiting) < SESSION_WAITING:
+                        session.admitting.add(item.seq_id)
+                        waiting.append(item)
+                    else:
+                        busy = v1.RejectedRequest.OVERLOADED
+                        refused.append(
+                            frames.Rejection(item.seq_id, SESSION_BUSY, busy)
+                        )
                 session.reject(refused)
             while admissions:  # the client's side ended: what it sent is admitted first
                 await asyncio.wait(admissions)
