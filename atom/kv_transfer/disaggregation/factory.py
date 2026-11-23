@@ -98,6 +98,9 @@ class KVConnectorFactory:
     # Whether a backend moves NVFP4 KV and index pages (`topology_moves_nvfp4_pages`).
     # Absent means no.
     _moves_nvfp4_pages: ClassVar[dict[str, bool]] = {}
+    # Whether a backend moves a DSpark draft's KV kept in a dtype of its own beside an
+    # NVFP4 target (`topology_moves_own_dtype_draft`). Absent means no.
+    _moves_own_dtype_draft: ClassVar[dict[str, bool]] = {}
     # Whether a backend is a KV offload tier, whose scheduler half rewrites the
     # completion sets it is handed (`process_completions`). Absent means no.
     _offload: ClassVar[dict[str, bool]] = {}
@@ -134,6 +137,7 @@ class KVConnectorFactory:
         chunk_tokens: str | None = None,
         lowers_hbm_hit_to_chunk: bool = False,
         moves_nvfp4_pages: bool = False,
+        moves_own_dtype_draft: bool = False,
     ) -> None:
         """Register a KV connector backend.
 
@@ -162,6 +166,8 @@ class KVConnectorFactory:
                 from the preceding transfer chunk, rather than recompute it.
             moves_nvfp4_pages: The backend moves NVFP4 KV and index pages: by the
                 head runs their layout declares, or whole.
+            moves_own_dtype_draft: The backend moves a DSpark draft's KV in a dtype
+                of its own beside an NVFP4 target, its rows as bytes of their own.
         """
         cls._registry[name] = {
             "worker_module": worker_module,
@@ -196,6 +202,7 @@ class KVConnectorFactory:
         cls._shared_tier[name] = bool(shared_tier)
         cls._lowers_hbm_hit_to_chunk[name] = bool(lowers_hbm_hit_to_chunk)
         cls._moves_nvfp4_pages[name] = bool(moves_nvfp4_pages)
+        cls._moves_own_dtype_draft[name] = bool(moves_own_dtype_draft)
         if chunk_tokens:
             cls._chunk_tokens[name] = chunk_tokens
 
@@ -435,18 +442,36 @@ class KVConnectorFactory:
         )
 
     @classmethod
-    def topology_moves_nvfp4_pages(cls, config: Any) -> bool:
-        """Does every transport `config` runs declare `moves_nvfp4_pages`? False when
+    def _every_leaf_declares(cls, flags: dict[str, bool], config: Any) -> bool:
+        """Does every transport `config` runs declare the flag in `flags`? False when
         it runs none or the topology cannot be parsed."""
         leaves = cls.leaf_connectors(config)
-        return bool(leaves) and all(
-            cls._moves_nvfp4_pages.get(name, False) for name, _ in leaves
-        )
+        return bool(leaves) and all(flags.get(name, False) for name, _ in leaves)
+
+    @staticmethod
+    def _declaring(flags: dict[str, bool]) -> tuple[str, ...]:
+        """The registered backends that declare the flag in `flags`, sorted."""
+        return tuple(sorted(name for name, declared in flags.items() if declared))
+
+    @classmethod
+    def topology_moves_nvfp4_pages(cls, config: Any) -> bool:
+        """Does every transport `config` runs declare `moves_nvfp4_pages`?"""
+        return cls._every_leaf_declares(cls._moves_nvfp4_pages, config)
 
     @classmethod
     def nvfp4_page_connectors(cls) -> tuple[str, ...]:
         """The registered backends that declare `moves_nvfp4_pages`, sorted."""
-        return tuple(sorted(n for n, moves in cls._moves_nvfp4_pages.items() if moves))
+        return cls._declaring(cls._moves_nvfp4_pages)
+
+    @classmethod
+    def topology_moves_own_dtype_draft(cls, config: Any) -> bool:
+        """Does every transport `config` runs declare `moves_own_dtype_draft`?"""
+        return cls._every_leaf_declares(cls._moves_own_dtype_draft, config)
+
+    @classmethod
+    def own_dtype_draft_connectors(cls) -> tuple[str, ...]:
+        """The registered backends that declare `moves_own_dtype_draft`, sorted."""
+        return cls._declaring(cls._moves_own_dtype_draft)
 
     @classmethod
     def _leaf_reads_block_regions(cls, connector: str, config: Any) -> bool:
@@ -537,6 +562,9 @@ KVConnectorFactory.register(
     # Cuts an NVFP4 KV page by the head runs `Nvfp4KvLayout.head_runs` declares; the
     # index page has no head axis and moves whole.
     moves_nvfp4_pages=True,
+    # A draft's own-dtype rows are units of their own; `pair_units` refuses a
+    # consumer whose draft units differ.
+    moves_own_dtype_draft=True,
 )
 
 # Composite backend: fans out to several sub-connectors listed under
