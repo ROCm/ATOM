@@ -703,11 +703,8 @@ impl CliArgs {
             .mooncake_admin_port(self.mooncake_admin_port)
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
+            .atom_grpc_session(self.atom_grpc_session)
             .build()
-            .map(|config| RouterConfig {
-                atom_grpc_session: self.atom_grpc_session,
-                ..config
-            })
     }
 
     pub fn to_server_config(&self, router_config: RouterConfig) -> ServerConfig {

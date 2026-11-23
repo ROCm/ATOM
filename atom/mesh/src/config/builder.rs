@@ -165,6 +165,12 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Sends every request to an ATOM gRPC worker over its instance's Session.
+    pub fn atom_grpc_session(mut self, enable: bool) -> Self {
+        self.config.atom_grpc_session = enable;
+        self
+    }
+
     pub fn host<S: Into<String>>(mut self, host: S) -> Self {
         self.config.host = host.into();
         self
@@ -491,6 +497,17 @@ impl RouterConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An embedder sends ATOM requests over the Session with the builder alone.
+    #[test]
+    fn test_atom_grpc_session_is_set_by_the_builder() {
+        let built = |enable| {
+            let builder = RouterConfigBuilder::new().regular_mode(Vec::new());
+            builder.atom_grpc_session(enable).build().unwrap()
+        };
+        assert!(built(true).atom_grpc_session);
+        assert!(!built(false).atom_grpc_session);
+    }
 
     /// Test that .to_builder() round-trip conversion works correctly
     #[test]
