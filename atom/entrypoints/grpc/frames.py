@@ -19,6 +19,9 @@ PROTOCOL_VERSION = 1  # engine_v1's: atom_engine::wire::PROTOCOL_VERSION in Rust
 INVALID = pb.RejectedRequest.INVALID
 _DEFAULTED = ("temperature", "top_k", "top_p")  # absent: SamplingParams' defaults
 _ROUTING = ("data_parallel_rank", "dp_session_id", "dp_parent_session_id")
+# RequestSpec fields the Session does not read: it stamps arrival on its own clock,
+# hashes the prompt itself, takes no siblings and does not trace.
+_UNREAD = ("arrive_time", "prompt_hash_chain", "parent_request_id", "trace")
 _COMPLETION_SCALARS = (
     "leave_reason",
     "num_prompt_tokens",
@@ -179,6 +182,14 @@ def _read(frames, parent, name: str, dtype: str) -> np.ndarray:
     return np.frombuffer(frames[ref.frame], dtype, ref.nbytes // size, ref.offset)
 
 
+def _is_set(msg, name: str) -> bool:
+    """Whether field `name` is set: present, or not its default where it has no
+    presence."""
+    if msg.DESCRIPTOR.fields_by_name[name].has_presence:
+        return msg.HasField(name)
+    return bool(getattr(msg, name))
+
+
 def _optional(msg, name: str):
     return getattr(msg, name) if msg.HasField(name) else None
 
@@ -192,6 +203,9 @@ def _request(spec: pb.RequestSpec, frames) -> SubmitRequest:
         raise FrameError("the Session takes text prompts; this request carries media")
     if spec.needs_independent_noise or spec.sibling_index:
         raise FrameError("the Session takes n=1; this request is one sibling of n")
+    unread = [name for name in _UNREAD if _is_set(spec, name)]
+    if unread:
+        raise FrameError(f"the Session does not read {', '.join(unread)}")
     prompt = _read(frames, spec, "prompt_token_ids", "<i4")
     if (prompt < 0).any():
         raise FrameError("prompt token ids must be non-negative")

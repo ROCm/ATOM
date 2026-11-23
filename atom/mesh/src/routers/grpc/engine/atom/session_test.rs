@@ -369,6 +369,7 @@ async fn one_session_serves_both_ranks_and_each_request_gets_only_its_outputs_in
         completion_tokens: 2,
         cached_tokens: 0,
         kv_transfer_params_json: Some(r#"{"remote_host":"10.0.0.1"}"#.to_string()),
+        ..Default::default()
     };
     let expected = GenerateResponse {
         response: Some(Response::Complete(complete)),
@@ -404,6 +405,7 @@ async fn a_request_that_does_not_stream_completes_with_the_ids_its_entries_carri
         completion_tokens: 3,
         cached_tokens: 4,
         kv_transfer_params_json: None,
+        ..Default::default()
     };
     let expected = GenerateResponse {
         response: Some(Response::Complete(complete)),

@@ -342,6 +342,7 @@ impl Routes {
                         prompt_tokens: item.num_prompt_tokens,
                         cached_tokens: route.cached_tokens,
                         kv_transfer_params_json: kv.map(|kv| kv.to_string()),
+                        ..Default::default()
                     }));
                 }
                 Ok(())

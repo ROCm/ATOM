@@ -6,10 +6,12 @@ import asyncio
 import itertools
 import json
 import socket
+import struct
 import sys
 import threading
 import time
 from argparse import Namespace
+from collections import deque
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -20,10 +22,12 @@ from atom.entrypoints.grpc import atom_grpc_pb2 as pb
 from atom.entrypoints.grpc import atom_grpc_pb2_grpc as pb_grpc
 from atom.entrypoints.grpc import frames
 from atom.entrypoints.grpc import server as grpc_server
+from atom.entrypoints.grpc import session as grpc_session
 from atom.entrypoints.grpc.server import AtomEngineServicer
 from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.protocol import DEFAULT_MAX_TOKENS
-from atom.entrypoints.openai.reasoning_dialects import FALLBACK_DIALECT
+from atom.entrypoints.openai.reasoning_dialects import DIALECTS, FALLBACK_DIALECT
+from atom.entrypoints.openai.tool_parser.registry import PARSERS_BY_NAME
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.zmq_protocol import engine_v1_pb2 as v1
 from atom.sampling_params import SamplingParams
@@ -38,7 +42,11 @@ class FakeEngine:
         self.config = SimpleNamespace(
             max_model_len=1 << 20, tensor_parallel_size=1, pipeline_parallel_size=1
         )
-        self.io_processor = SimpleNamespace(requests={}, preprocess=self.preprocess)
+        self.io_processor = SimpleNamespace(
+            requests={},
+            preprocess=self.preprocess,
+            preprocess_fanout=self.preprocess_fanout,
+        )
         self.aborted, self.made = [], []
         self.core_mgr = SimpleNamespace(
             add_request=self.add_request,
@@ -52,18 +60,28 @@ class FakeEngine:
         self.release.set()
         self.flush = None  # the servicer's per-step flush
 
-    def preprocess(self, prompt, params, *, stream_callback, **kwargs):
+    def preprocess(self, prompt, params, *, seq_id=None, **kwargs):
+        """The Session's entry: one seq, under the id it assigns."""
+        seq_ids = None if seq_id is None else [seq_id]
+        return self.preprocess_fanout(prompt, params, seq_ids=seq_ids, **kwargs)[0]
+
+    def preprocess_fanout(self, prompt, params, *, stream_callback, **kwargs):
         self.preprocessed.append((prompt, params, kwargs))
         self.release.wait(10)
-        seq = SimpleNamespace(
-            id=kwargs.get("seq_id") or next(self.ids),
-            num_prompt_tokens=len(prompt),
-            max_tokens=params.max_tokens,
-            callback=stream_callback,
-        )
-        self.io_processor.requests[seq.id] = seq
-        self.made.append(seq.id)
-        return seq
+        seqs, ids = [], kwargs.get("seq_ids") or [None] * params.n
+        for seq_id in ids:
+            seq = SimpleNamespace(
+                id=seq_id or next(self.ids),
+                num_prompt_tokens=len(prompt),
+                max_tokens=params.max_tokens,
+                callback=stream_callback,
+                arrive_time=time.time(),
+                json_schema=params.json_schema,  # structured: submitted off the loop
+            )
+            self.io_processor.requests[seq.id] = seq
+            self.made.append(seq.id)
+            seqs.append(seq)
+        return seqs
 
     def add_request(self, seqs):
         self.submitted += seqs
@@ -143,10 +161,46 @@ def test_generate_answers_once_when_not_streaming(serve):
     assert not engine.preprocessed[0][1].max_tokens_is_default
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_the_complete_carries_the_http_usage_timing(serve, monkeypatch, stream):
+    clock = itertools.count()  # arrival 0, the two steps' ids 1 and 2, the end 3
+    monkeypatch.setattr(grpc_server, "time", SimpleNamespace(time=lambda: next(clock)))
+    engine = FakeEngine([([5], None), ([6, 7], "eos")])
+    complete = _generate(serve(engine), stream=stream)[-1].complete
+    assert (complete.ttft_s, complete.tpot_s, complete.latency_s) == (1, 0.5, 3)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_token_times_are_taken_as_the_engine_delivers_them(serve, monkeypatch, stream):
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(grpc_server, "time", SimpleNamespace(time=lambda: clock.now))
+    engine = FakeEngine()
+
+    def add_request(seqs):  # the steps end at 1 s and 2 s; the call reads them at 10 s
+        for now, tokens, reason in ((1.0, [5], None), (2.0, [6, 7], "eos")):
+            clock.now = now
+            seqs[0].callback(
+                RequestOutput(seqs[0].id, tokens, reason is not None, reason)
+            )
+            engine.flush()
+        clock.now = 10.0
+
+    engine.core_mgr.add_request = add_request
+    complete = _generate(serve(engine), stream=stream)[-1].complete
+    assert (complete.ttft_s, complete.tpot_s, complete.latency_s) == (1, 0.5, 10)
+
+
+def test_a_complete_without_output_ids_has_no_token_timing(serve, monkeypatch):
+    clock = itertools.count()  # arrival 0, the step's delivery 1, the end 2
+    monkeypatch.setattr(grpc_server, "time", SimpleNamespace(time=lambda: next(clock)))
+    complete = _generate(serve(FakeEngine([([], "eos")])))[-1].complete
+    assert (complete.ttft_s, complete.tpot_s, complete.latency_s) == (0, 0, 2)
+
+
 @pytest.mark.parametrize(
     "sampling, message",
     [
-        (v1.SamplingParams(n=2, temperature=1.0), "n above 1"),
+        (v1.SamplingParams(n=2, temperature=1.0), "a streamed n above 1"),
         (v1.SamplingParams(max_tokens=0), "max_tokens must be at least 1"),
         (v1.SamplingParams(logprobs_flag=True), "logprobs_flag"),
         (v1.SamplingParams(top_logprobs=2), "top_logprobs"),
@@ -156,9 +210,83 @@ def test_generate_answers_once_when_not_streaming(serve):
 )
 def test_generate_refuses_what_it_cannot_serve_with_a_400(serve, sampling, message):
     engine = FakeEngine()
-    error = _error(_generate(serve(engine), sampling=sampling))
+    error = _error(_generate(serve(engine), sampling=sampling, stream=True))
     assert error.http_status == 400 and message in error.message
     assert engine.preprocessed == []
+
+
+def test_session_affinity_ids_reach_preprocess(serve):
+    engine = FakeEngine([([5], "eos")])
+    _generate(serve(engine), dp_session_id="s", dp_parent_session_id="p")
+    _generate(serve(engine))
+    (_, _, given), (_, _, absent) = engine.preprocessed
+    assert (given["dp_session_id"], given["dp_parent_session_id"]) == ("s", "p")
+    assert (absent["dp_session_id"], absent["dp_parent_session_id"]) == (None, None)
+
+
+def test_n_above_1_answers_one_complete_per_sibling(serve):
+    engine = FakeEngine([([5], None), ([6], "eos")])
+    sampling = v1.SamplingParams(n=2, temperature=1.0)
+    written = _generate(serve(engine), sampling=sampling)
+    assert [r.complete.index for r in written] == [0, 1]
+    assert [list(r.complete.output_ids) for r in written] == [[5, 6], [5, 6]]
+    assert engine.preprocessed[0][1].n == 2 and len(engine.submitted) == 2
+    assert engine.io_processor.requests == {} and engine.aborted == []
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_greedy_n_above_1_is_served_as_1_as_on_http(serve, stream):
+    engine = FakeEngine([([5], "eos")])
+    sampling = v1.SamplingParams(n=3, temperature=0.0)
+    written = _generate(serve(engine), sampling=sampling, stream=stream)
+    assert [r.WhichOneof("response") for r in written][-1] == "complete"
+    assert engine.preprocessed[0][1].n == 1
+
+
+def test_n_above_1_with_kv_transfer_params_is_a_400(serve):
+    engine = FakeEngine()
+    kv = json.dumps({"do_remote_decode": True})
+    sampling = v1.SamplingParams(n=2, temperature=1.0)
+    written = _generate(serve(engine), sampling=sampling, kv_transfer_params_json=kv)
+    error = _error(written)
+    assert error.http_status == 400 and "kv_transfer_params" in error.message
+    assert engine.preprocessed == []
+
+
+def test_abort_ends_every_sibling(serve):
+    engine = FakeEngine([([5], None)])  # both siblings run on after their first step
+    servicer = serve(engine)
+
+    async def abort_running():
+        sampling = v1.SamplingParams(n=2, temperature=1.0)
+        request = pb.GenerateRequest(
+            request_id="r", prompt_token_ids=[1], sampling=sampling
+        )
+        context = Context()
+        call = asyncio.create_task(servicer.Generate(request, context))
+        await _until(lambda: len(engine.running) == 2)
+        await servicer.Abort(pb.AbortRequest(request_id="r"), None)
+        await asyncio.wait_for(call, 10)
+        return context.written
+
+    written = asyncio.run(abort_running())
+    assert [r.complete.finish_reason for r in written] == ["aborted", "aborted"]
+    assert sorted(engine.aborted) == [1, 2] and engine.io_processor.requests == {}
+    assert servicer.live == {}
+
+
+def test_a_partly_dispatched_fan_out_aborts_every_sibling(serve):
+    engine = FakeEngine()
+
+    def dispatch_one_then_fail(seqs):  # as CoreManager when a later rank's send fails
+        engine.running[seqs[0].id] = seqs[0]
+        raise RuntimeError("the second rank's send failed")
+
+    engine.core_mgr.add_request = dispatch_one_then_fail
+    sampling = v1.SamplingParams(n=2, temperature=1.0)
+    error = _error(_generate(serve(engine), sampling=sampling))
+    assert error.http_status == 500
+    assert engine.running == {} and engine.io_processor.requests == {}
 
 
 def test_a_prompt_only_in_kv_transfer_params_is_admitted(serve):
@@ -271,7 +399,7 @@ def test_the_session_refuses_logprobs_it_would_not_serve(serve):
 def test_a_session_grammar_failure_is_rejected_as_internal(serve):
     engine = FakeEngine()
     session = serve(engine).sessions.open()
-    seq = SimpleNamespace(id=session.base | 1, num_prompt_tokens=2, arrive_time=0.0)
+    seq = SimpleNamespace(id=session.seq_id(1), num_prompt_tokens=2, arrive_time=0.0)
     engine.io_processor.requests[seq.id] = seq
     session.add(1, seq, "r")
     session.put(RequestOutput(seq.id, [], True, "structured_output_error"))
@@ -321,6 +449,158 @@ def test_a_session_ended_during_preprocess_keeps_its_window_until_the_seq_drops(
 
     assert asyncio.run(end_while_preprocessing())
     assert window in servicer.sessions.free and session.window is None
+
+
+def test_a_submission_cancelled_once_it_reached_the_engine_holds_its_window(
+    serve, monkeypatch
+):
+    engine, entered, admit = FakeEngine(), threading.Event(), threading.Event()
+    servicer = serve(engine)
+    sessions = servicer.sessions
+    session = sessions.open()
+    window = session.window
+    sessions.free.clear()  # every other window held: a next Session needs this one
+
+    def add_request(seqs):  # the structured admission, on its thread
+        entered.set()
+        admit.wait(10)
+        engine.running.update((seq.id, seq) for seq in seqs)
+
+    monkeypatch.setattr(engine.core_mgr, "add_request", add_request)
+    # The engine ends an aborted seq at its next step, not at once.
+    monkeypatch.setattr(engine.core_mgr, "abort_request", engine.aborted.append)
+
+    async def cancel_then_resubmit():
+        request = _submit(json_schema='{"type": "object"}')
+        submit = asyncio.create_task(servicer._submit(session, request))
+        await asyncio.to_thread(entered.wait, 10)
+        submit.cancel()  # as the Session RPC ends: its reader cancelled, then close
+        session.close()
+        admit.set()
+        with pytest.raises(asyncio.CancelledError):
+            await submit
+        reopened = sessions.open()  # before the abort's end: no window
+        (seq,) = engine.running.values()
+        seq.callback(RequestOutput(seq.id, [], True, "aborted"))
+        engine.flush()
+        await _until(lambda: window in sessions.free)
+        return reopened
+
+    assert asyncio.run(cancel_then_resubmit()) is None
+    assert engine.aborted and engine.io_processor.requests == {}
+    assert sessions.open().window == window
+
+
+def test_engine_ids_are_not_reused_by_a_client_seq_id_or_a_windows_next_session(
+    serve,
+):
+    # CoreManager's finished-seq message may still name a completed request's id
+    # after the client reads its Completions and sends its seq_id again.
+    engine = FakeEngine([([5], "eos")])
+    servicer = serve(engine)
+    sessions = servicer.sessions
+    sessions.free = deque([sessions.free[0]])  # one window, for both Sessions
+
+    async def submit_seq_id_1_twice(session):
+        for _ in range(2):
+            await servicer._submit(session, _submit())
+            await _until(lambda: not session.requests)
+        session.close()
+
+    asyncio.run(submit_seq_id_1_twice(sessions.open()))
+    asyncio.run(submit_seq_id_1_twice(sessions.open()))
+    engine_ids = [seq.id for seq in engine.submitted]
+    assert len(set(engine_ids)) == 4
+
+
+def test_a_client_that_stops_reading_fails_its_session_past_the_outbox_bound(
+    serve, monkeypatch
+):
+    monkeypatch.setattr(grpc_session, "OUTBOX", 2)
+    engine = FakeEngine([([5], None)])  # the request runs on, a message per step
+    servicer = serve(engine)
+    open_session, opened = servicer.sessions.open, []
+
+    def record_open():
+        opened.append(open_session())
+        return opened[-1]
+
+    monkeypatch.setattr(servicer.sessions, "open", record_open)
+
+    class Context:
+        async def abort(self, code, details):
+            self.code, self.details = code, details
+            raise grpc.RpcError()
+
+    async def client():
+        await asyncio.Event().wait()  # sends nothing more, ends never
+        yield
+
+    async def stop_reading():
+        context = Context()
+        call = servicer.Session(client(), context)
+        assert _envelope(list((await anext(call)).frames)).WhichOneof("body") == "ready"
+        session = opened[0]
+        await servicer._submit(session, _submit())
+        await _until(lambda: session.outbox.qsize() == 1)
+        seq = engine.running[next(iter(session.client_ids))]
+        for _ in range(2):  # the engine's next steps, which the client does not read
+            seq.callback(RequestOutput(seq.id, [6], False))
+            engine.flush()
+        await _until(lambda: session.failed is not None)
+        with pytest.raises(grpc.RpcError):
+            await anext(call)  # its messages dropped: the failure is all that is left
+        return context
+
+    context = asyncio.run(stop_reading())
+    assert context.code == grpc.StatusCode.RESOURCE_EXHAUSTED
+    assert "left 2 Session messages unread" in context.details
+    assert engine.running == {} and engine.aborted  # its request aborted
+
+
+def test_a_failed_session_admits_no_submission_still_in_preprocess(serve, monkeypatch):
+    monkeypatch.setattr(grpc_session, "OUTBOX", 0)  # its next message fails it
+    engine = FakeEngine([([5], None)])
+    engine.release.clear()
+    servicer = serve(engine)
+    open_session, opened = servicer.sessions.open, []
+    monkeypatch.setattr(
+        servicer.sessions, "open", lambda: opened.append(open_session()) or opened[-1]
+    )
+
+    async def client():
+        yield pb.Frames(frames=_submit_batch((3, "a", [1, 2])))
+        await asyncio.Event().wait()
+
+    async def fail_during_preprocess():
+        call = servicer.Session(client(), SimpleNamespace())
+        await anext(call)  # Ready
+        await _until(lambda: engine.preprocessed)
+        opened[0].send([b"a step the client does not read"])
+        engine.release.set()
+        await _until(lambda: engine.made and not engine.io_processor.requests)
+        await call.aclose()
+        return opened[0]
+
+    session = asyncio.run(fail_during_preprocess())
+    assert session.failed is not None and session.requests == {}
+    assert engine.submitted == []
+
+
+def test_a_session_submission_that_fails_after_a_send_aborts_its_seq(serve):
+    engine = FakeEngine()
+    servicer = serve(engine)
+    session = servicer.sessions.open()
+
+    def decode_then_fail(seqs):  # as RapidServe's: decode has it, prefill's send fails
+        engine.running.update((seq.id, seq) for seq in seqs)
+        raise RuntimeError("the prefill send failed")
+
+    engine.core_mgr.add_request = decode_then_fail
+    with pytest.raises(RuntimeError, match="prefill send"):
+        asyncio.run(servicer._submit(session, _submit()))
+    assert engine.running == {} and engine.aborted
+    assert session.requests == {} and engine.io_processor.requests == {}
 
 
 def test_a_session_admits_a_prompt_only_in_kv_transfer_params(serve):
@@ -585,6 +865,58 @@ def test_shutdown_ends_running_calls_before_it_returns(serve, monkeypatch):
     channel.close()
 
 
+def _submit_batch(*requests) -> list[bytes]:
+    """A SubmitBatch of (seq_id, external id, prompt) requests, no sampling field set."""
+    envelope = v1.Envelope(protocol_version=frames.PROTOCOL_VERSION)
+    envelope.submit.SetInParent()
+    data = []
+    for seq_id, external, prompt in requests:
+        data.append(struct.pack(f"<{len(prompt)}i", *prompt))
+        envelope.submit.requests.add(
+            seq_id=seq_id,
+            external_request_id=external,
+            prompt_token_ids=v1.BufferRef(frame=len(data), nbytes=len(data[-1])),
+        )
+    return [envelope.SerializeToString(), *data]
+
+
+def test_a_session_serves_a_submit_batch_over_the_wire(serve, monkeypatch):
+    engine = FakeEngine([([5], None), ([6], "eos")])
+    stop, channel = _listen(serve, monkeypatch, engine)
+    read = threading.Event()
+
+    def client():
+        yield pb.Frames(frames=_submit_batch((3, "a", [1, 2]), (9, "b", [4])))
+        read.wait(10)  # the client's side ends once it has read its answers
+
+    try:
+        answers = pb_grpc.AtomEngineStub(channel).Session(client(), timeout=10)
+        messages = [_envelope(list(next(answers).frames)) for _ in range(7)]
+        read.set()
+        assert list(answers) == []
+    finally:
+        channel.close()
+        stop()
+    assert messages[0].WhichOneof("body") == "ready"
+    for seq_id, external in ((3, "a"), (9, "b")):
+        mine = [
+            (m.WhichOneof("body"), m)
+            for m in messages
+            if seq_id in m.stream.seq_ids
+            or seq_id in [c.seq_id for c in m.completions.items]
+        ]
+        assert [body for body, _ in mine] == ["stream", "stream", "completions"]
+        assert [list(m.stream.tokens) for _, m in mine[:2]] == [[5], [6]]
+        (done,) = mine[2][1].completions.items  # its ids went in the StreamBatches
+        assert (done.leave_reason, done.external_request_id) == ("eos", external)
+        assert done.completion_token_ids.nbytes == 0
+    # Omitted sampling fields read as /v1/completions fills them.
+    for prompt, params, _ in engine.preprocessed:
+        assert params.max_tokens == DEFAULT_MAX_TOKENS and params.max_tokens_is_default
+    assert [p for p, _, _ in engine.preprocessed] == [[1, 2], [4]]
+    assert engine.io_processor.requests == {} and engine.aborted == []
+
+
 def test_a_step_flushed_after_the_server_stopped_is_dropped():
     steps = grpc_server.StepOutputs()
 
@@ -602,6 +934,53 @@ def test_model_info_leaves_an_absent_chat_template_unset(serve, monkeypatch):
     monkeypatch.setattr(api_server, "tokenizer", SimpleNamespace(chat_template=None))
     info = asyncio.run(servicer.GetModelInfo(pb.GetModelInfoRequest(), None))
     assert not info.HasField("chat_template") and list(info.eos_token_ids) == [2]
+
+
+@pytest.mark.parametrize(
+    "atom_parser, router_parser",
+    [
+        ("dsml_v41", "dsml_v41"),
+        ("kimi", "kimik2"),
+        ("qwen", "qwen_xml"),
+        ("minimax", "minimax"),
+        ("glm", None),  # atomesh's model-name mapping tells GLM's dialects apart
+        (None, None),
+    ],
+)
+def test_router_tool_call_parser_names_atoms_format(atom_parser, router_parser):
+    parser_cls = PARSERS_BY_NAME.get(atom_parser)
+    names = grpc_server.router_parser_names(parser_cls, FALLBACK_DIALECT)
+    assert names == (router_parser, "qwen3")
+
+
+@pytest.mark.parametrize(
+    "dialect, router_parser",
+    [
+        (FALLBACK_DIALECT, "qwen3"),  # <think>: starts outside reasoning
+        (DIALECTS[1], None),  # MiniMax-M3's <mm:think>
+        (DIALECTS[0], None),  # Kimi-K3's channels
+        (None, None),
+    ],
+)
+def test_router_reasoning_parser_is_qwen3_only_for_the_think_dialect(
+    dialect, router_parser
+):
+    assert grpc_server.router_parser_names(None, dialect) == (None, router_parser)
+
+
+def test_model_info_names_the_router_parsers(serve, monkeypatch):
+    engine = FakeEngine()
+    engine.config.end_token_ids = [2]
+    monkeypatch.setattr(api_server, "tokenizer", SimpleNamespace(chat_template=None))
+    monkeypatch.setattr(api_server, "tool_call_parser_cls", PARSERS_BY_NAME["dsml_v41"])
+    monkeypatch.setattr(api_server, "reasoning_dialect", FALLBACK_DIALECT)
+    info = asyncio.run(serve(engine).GetModelInfo(pb.GetModelInfoRequest(), None))
+    assert (info.tool_call_parser, info.reasoning_parser) == ("dsml_v41", "qwen3")
+    monkeypatch.setattr(api_server, "tool_call_parser_cls", None)
+    monkeypatch.setattr(api_server, "reasoning_dialect", DIALECTS[1])
+    info = asyncio.run(serve(engine).GetModelInfo(pb.GetModelInfoRequest(), None))
+    assert not info.HasField("tool_call_parser")
+    assert not info.HasField("reasoning_parser")
 
 
 def test_server_info_carries_the_kv_event_sources_body(serve, monkeypatch):
