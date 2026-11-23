@@ -1228,6 +1228,7 @@ mod h_prepare_chat_generate {
     use crate::routers::prepare::response_context::{ProtocolRequest, ResponseContext};
     use crate::routers::prepare::{lookup_tokenizer, prepare_chat, prepare_generate};
     use crate::routers::test_mocks;
+    use crate::tokenizer::registry::TokenizerRegistry;
 
     fn chat_req(stream: bool) -> Arc<ChatCompletionRequest> {
         Arc::new(ChatCompletionRequest {
@@ -1439,18 +1440,52 @@ mod h_prepare_chat_generate {
     #[test]
     fn test_lookup_tokenizer_returns_arc_for_known_model() {
         let registry = test_mocks::tokenizer_registry_with("m");
-        let tok = lookup_tokenizer("m", &registry).expect("known model");
-        let tok2 = lookup_tokenizer("m", &registry).unwrap();
+        let components = test_mocks::app_context_with_tokenizer_registry(registry);
+        let tok = lookup_tokenizer("m", &components).expect("known model");
+        let tok2 = lookup_tokenizer("m", &components).unwrap();
         assert!(Arc::ptr_eq(&tok, &tok2));
     }
 
     #[test]
     fn test_lookup_tokenizer_unknown_model_returns_err() {
         let registry = test_mocks::tokenizer_registry_with("m");
-        let err = lookup_tokenizer("no-such-model", &registry)
+        let components = test_mocks::app_context_with_tokenizer_registry(registry);
+        let err = lookup_tokenizer("no-such-model", &components)
             .err()
             .expect("unknown model must be Err");
         assert!(!err.status().is_success());
+    }
+
+    /// A lookup between a replacement's removal of the old tokenizer and its insert
+    /// of the new one waits for the registration and gets the new one.
+    #[test]
+    fn test_lookup_during_a_tokenizer_swap_finds_the_new_tokenizer() {
+        let registry = test_mocks::tokenizer_registry_with("m");
+        let components = test_mocks::app_context_with_tokenizer_registry(registry.clone());
+        let reconciling = components
+            .tokenizer_reconciling
+            .entry("m".to_string())
+            .or_default()
+            .clone();
+        let registering = reconciling.try_lock().unwrap();
+        let old = registry.get_by_name("m").unwrap();
+        registry.remove_by_id(&old.id).unwrap();
+
+        let looking = components.clone();
+        let lookup = std::thread::spawn(move || lookup_tokenizer("m", &looking).ok());
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let replacement = test_mocks::tokenizer();
+        let inserted = replacement.clone();
+        let id = TokenizerRegistry::generate_id();
+        let insert = registry.load(&id, "m", "mock", || async { Ok(inserted) });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(insert).unwrap();
+        drop(registering);
+
+        let found = lookup.join().unwrap().expect("the lookup missed the swap");
+        assert!(Arc::ptr_eq(&found, &replacement));
     }
 
     #[test]

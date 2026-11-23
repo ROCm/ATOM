@@ -1,6 +1,7 @@
 //! Transport-neutral request preparation: HTTP request → (GenerationPayload, ResponseContext).
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::response::Response;
 use http::HeaderMap;
@@ -15,7 +16,7 @@ use crate::{
         generate::GenerateRequest,
     },
     routers::comm::error,
-    tokenizer::{registry::TokenizerRegistry, traits::Tokenizer},
+    tokenizer::traits::Tokenizer,
 };
 
 pub(crate) mod chat_template;
@@ -38,11 +39,26 @@ use response_context::{ProtocolRequest, ResponseContext};
 use stop_decoder_builder::create_stop_decoder;
 use tool_constraints::{filter_chat_request_by_tool_choice, generate_tool_constraints};
 
+/// How long a lookup waits for a registration swapping the model's tokenizer.
+const TOKENIZER_SWAP_WAIT: Duration = Duration::from_secs(1);
+
+/// A model whose tokenizer is missing while a registration of its name runs
+/// waits, up to `TOKENIZER_SWAP_WAIT`, for that registration, then looks again.
 pub fn lookup_tokenizer(
     model_id: &str,
-    registry: &TokenizerRegistry,
+    components: &AppContext,
 ) -> Result<Arc<dyn Tokenizer>, Response> {
-    registry.get(model_id).ok_or_else(|| {
+    let registry = &components.tokenizer_registry;
+    let swapped_in = || {
+        // A replacement removes the old tokenizer, then inserts the new one.
+        let reconciling = components.tokenizer_reconciling.get(model_id)?.clone();
+        let deadline = Instant::now() + TOKENIZER_SWAP_WAIT;
+        while reconciling.try_lock().is_err() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        registry.get(model_id)
+    };
+    registry.get(model_id).or_else(swapped_in).ok_or_else(|| {
         error!(model = %model_id, "Tokenizer not found for model");
         error::internal_error(
             "tokenizer_not_found",
@@ -77,7 +93,7 @@ pub fn prepare_chat(
             ),
         ));
     }
-    let tokenizer = lookup_tokenizer(model_id_str, &components.tokenizer_registry)?;
+    let tokenizer = lookup_tokenizer(model_id_str, components)?;
     let default_kwargs = default_template_kwargs(&workers)
         .map_err(|e| error::internal_error("invalid_default_template_kwargs", e))?;
 
@@ -151,7 +167,7 @@ pub fn prepare_generate(
         error!("model_id not set");
         error::internal_error("model_id_not_set", "model_id not set in request")
     })?;
-    let tokenizer = lookup_tokenizer(model_id_str, &components.tokenizer_registry)?;
+    let tokenizer = lookup_tokenizer(model_id_str, components)?;
 
     let (original_text, token_ids) = resolve_generate_input(&req, &tokenizer)
         .map_err(|e| error::bad_request("resolve_input_failed", e))?;
