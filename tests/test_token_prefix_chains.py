@@ -196,6 +196,9 @@ def test_an_extension_too_large_to_store_keeps_the_prompt_it_extends(monkeypatch
         [seq] = proc.preprocess_fanout(prompt, SamplingParams())
         assert list(seq.prompt_hash_chain.hashes) == full_chain(prompt, 16)
         reused.append(served(proc)["blocks_reused"] - before)
+        chains = proc.token_prefix_chains  # only a1: the extension is in neither
+        assert len(chains._order) == len(chains._lru) == 1
+        assert chains._lru.bytes <= chains._lru.budget
     assert reused == [0, len(a1) // 16, len(a1) // 16]
 
 

@@ -111,3 +111,22 @@ def test_a_request_queued_before_the_wait_is_not_slept_on(idle):
         engine._kv_progress_event.set()
         loop.join(5)
     assert not loop.is_alive()
+
+
+def test_a_put_while_the_queues_are_checked_is_not_slept_on(idle):
+    _, engine, _, _ = idle
+    arrived = []
+
+    class Arriving(queue.Queue):  # the input thread's put and set land in the check
+        def empty(self):
+            if not arrived:
+                arrived.append(True)
+                engine.input_queue.put_nowait("request")
+                engine._kv_progress_event.set()
+            return super().empty()
+
+    engine.utility_queue = Arriving()
+    waiter = threading.Thread(target=engine._wait_for_input, daemon=True)
+    waiter.start()
+    waiter.join(5)
+    assert not waiter.is_alive()  # woken at once, not after IDLE_WAIT_S
