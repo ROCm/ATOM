@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class GDNFlyDSLPolicy:
-    """Resolved at cache binding; decode and physical VK layout are inseparable."""
+    """Decode policy and physical VK layout are inseparable."""
 
     prefill: bool = False
     decode: bool = False
