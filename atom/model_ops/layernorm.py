@@ -18,6 +18,7 @@ from aiter.dist.communication_op import (
     tensor_model_parallel_fused_allreduce_rmsnorm_quant,
 )
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gated_rmsnorm_fp8_group_quant import gated_rmsnorm_fp8_group_quant
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
@@ -30,6 +31,13 @@ from atom.model_ops.utils import atom_parameter
 from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
+
+try:
+    from aiter.dist.communication_op import (
+        tensor_model_parallel_fused_allreduce_rmsnorm_mxfp8_quant,
+    )
+except ImportError:
+    tensor_model_parallel_fused_allreduce_rmsnorm_mxfp8_quant = None
 
 
 def silu(input: Tensor, inplace: bool = False) -> Tensor:
@@ -1006,6 +1014,40 @@ def fused_allreduce_gemma_rms_norm_quant(
         normed,
         quant_dtype=fp8,
     )
+    return out_fp8, scale_out, residual_out
+
+
+def fused_allreduce_gemma_rms_norm_mxfp8_supported() -> bool:
+    """aiter's AR + Gemma RMSNorm + MXFP8 op exists and was validated on this arch
+    (its E4M3 / E8M0 bytes equal the separate norm and ``quantize_fp8``)."""
+    return (
+        tensor_model_parallel_fused_allreduce_rmsnorm_mxfp8_quant is not None
+        and get_gfx_runtime() == "gfx1250"
+    )
+
+
+def fused_allreduce_gemma_rms_norm_mxfp8_quant(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    norm: GemmaRMSNorm,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return Gemma-normalized E4M3 values, E8M0 scales, and the residual."""
+    if get_tensor_model_parallel_world_size() > 1:
+        out_fp8, residual_out, scale_out = (
+            tensor_model_parallel_fused_allreduce_rmsnorm_mxfp8_quant(
+                hidden_states.contiguous(),
+                residual,
+                norm.weight,
+                norm.variance_epsilon,
+                gemma_norm=True,
+            )
+        )
+        return out_fp8, scale_out, residual_out
+
+    from atom.model_ops.blockscale import quantize_fp8
+
+    normed, residual_out = norm(hidden_states, residual)
+    out_fp8, scale_out = quantize_fp8(normed)
     return out_fp8, scale_out, residual_out
 
 
