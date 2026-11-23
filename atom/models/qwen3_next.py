@@ -915,10 +915,16 @@ class Qwen3NextModel(nn.Module):
         self.config.n_shared_experts = 1
         self.config.n_routed_experts = self.config.num_experts
 
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-        )
+        # The last stage also holds it when the LM head is tied to it.
+        if get_pp_group().is_first_rank or (
+            config.tie_word_embeddings and get_pp_group().is_last_rank
+        ):
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
@@ -1019,14 +1025,17 @@ class Qwen3NextForCausalLM(nn.Module):
             prefix=maybe_prefix(prefix, "model"),
         )
 
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            org_num_embeddings=config.vocab_size,
-            prefix=maybe_prefix(prefix, "lm_head"),
-        )
-        if self.config.tie_word_embeddings:
-            self.lm_head.weight = self.model.embed_tokens.weight
+        if get_pp_group().is_last_rank:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                org_num_embeddings=config.vocab_size,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            )
+            if self.config.tie_word_embeddings:
+                self.lm_head.weight = self.model.embed_tokens.weight
+        else:
+            self.lm_head = PPMissingLayer()
 
         # Expose embed_tokens at this level for vLLM MTP embedding sharing.
         # vLLM's proposer accesses target_wrapper.model.embed_tokens, where

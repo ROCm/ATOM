@@ -42,6 +42,7 @@ from atom.model_ops.linear import QKVParallelLinear, ReplicatedLinear, RowParall
 from atom.model_ops.moe import FusedMoE
 from atom.models.utils import (
     IntermediateTensors,
+    PPMissingLayer,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -277,10 +278,16 @@ class MixtralModel(nn.Module):
         self.vocab_size = config.vocab_size
         self.org_vocab_size = config.vocab_size
 
-        self.embed_tokens = VocabParallelEmbedding(
-            self.vocab_size,
-            config.hidden_size,
-        )
+        # The last stage also holds it when the LM head is tied to it.
+        if get_pp_group().is_first_rank or (
+            config.tie_word_embeddings and get_pp_group().is_last_rank
+        ):
+            self.embed_tokens = VocabParallelEmbedding(
+                self.vocab_size,
+                config.hidden_size,
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
@@ -295,7 +302,10 @@ class MixtralModel(nn.Module):
             layer_num_offset=0,
         )
 
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if get_pp_group().is_last_rank:
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer()
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
@@ -355,13 +365,16 @@ class MixtralForCausalLM(nn.Module):
             atom_config=atom_config, prefix=maybe_prefix(prefix, "model")
         )
         self.unpadded_vocab_size = config.vocab_size
-        self.lm_head = ParallelLMHead(
-            self.unpadded_vocab_size,
-            config.hidden_size,
-            org_num_embeddings=config.vocab_size,
-        )
-        if config.tie_word_embeddings:
-            self.lm_head.weight = self.model.embed_tokens.weight
+        if get_pp_group().is_last_rank:
+            self.lm_head = ParallelLMHead(
+                self.unpadded_vocab_size,
+                config.hidden_size,
+                org_num_embeddings=config.vocab_size,
+            )
+            if config.tie_word_embeddings:
+                self.lm_head.weight = self.model.embed_tokens.weight
+        else:
+            self.lm_head = PPMissingLayer()
 
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
