@@ -1530,7 +1530,10 @@ mod i_atom_structured_output {
     use crate::core::{worker::RuntimeType, BasicWorkerBuilder};
     use crate::protocols::chat::ChatCompletionRequest;
     use crate::routers::prepare::{
-        generation_payload::GenerationPayload, prepare_chat, response_context::ResponseContext,
+        generation_payload::GenerationPayload,
+        message_tools::MessageTools,
+        prepare_chat, prepare_chat_declaring,
+        response_context::{ProtocolRequest, ResponseContext},
     };
     use crate::routers::test_mocks;
 
@@ -1636,5 +1639,90 @@ mod i_atom_structured_output {
             let payload = prepare(body.clone(), runtime, &[]);
             assert!(payload.structured_output.is_none());
         }
+    }
+
+    /// `body` prepared for model "m" with the tools its raw messages declare, as the gRPC
+    /// routers prepare it; its one worker runs `runtime`.
+    fn prepared_raw(body: Value, runtime: RuntimeType) -> (GenerationPayload, ResponseContext) {
+        let ctx = test_mocks::app_context_with_hf_tokenizer("m");
+        let worker = BasicWorkerBuilder::new("grpc://worker:1")
+            .runtime_type(runtime)
+            .model_id("m")
+            .label("chat_template", "{{ messages }}");
+        ctx.worker_registry.register(Arc::new(worker.build()));
+        let raw = serde_json::to_vec(&body).unwrap();
+        let declared = MessageTools::read(&raw).unwrap();
+        let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+        let model = Some("m".to_string());
+        prepare_chat_declaring(Arc::new(request), Some(declared), None, model, &ctx).unwrap()
+    }
+
+    fn tool_names(ctx: &ResponseContext) -> Vec<String> {
+        let ProtocolRequest::Chat(req) = &ctx.original else {
+            unreachable!()
+        };
+        let tools = req.tools.iter().flatten();
+        tools.map(|tool| tool.function.name.clone()).collect()
+    }
+
+    #[test]
+    fn an_atom_chat_carries_the_tools_a_message_of_any_role_declares() {
+        let tool =
+            |name: &str| json!({"type": "function", "function": {"name": name, "parameters": {}}});
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "be brief", "tools": [tool("lookup")]},
+                {"role": "user", "content": "hi", "tools": [tool("fetch")]},
+            ],
+            "tools": [tool("ping")],
+        });
+        // The typed request keeps a message's tools on a developer message only.
+        let typed: ChatCompletionRequest = serde_json::from_value(body.clone()).unwrap();
+        assert!(serde_json::to_value(&typed.messages).unwrap()[0]
+            .get("tools")
+            .is_none());
+
+        let (payload, ctx) = prepared_raw(body, RuntimeType::Atom);
+        let carried = payload.structured_output.expect("an ATOM chat carries one");
+        let declared = json!([[tool("lookup")], [tool("fetch")]]);
+        assert_eq!(parsed(carried.message_tools_json), Some(declared));
+        // The reply's tool calls are read against all of them.
+        assert_eq!(tool_names(&ctx), ["ping", "lookup", "fetch"]);
+    }
+
+    #[test]
+    fn the_template_sees_each_message_s_own_tools() {
+        use crate::routers::prepare::chat_template::process_chat_messages_with_kwargs;
+        use crate::tokenizer::{traits::Tokenizer, HuggingFaceTokenizer};
+
+        let mut tokenizer =
+            HuggingFaceTokenizer::from_file(test_mocks::tokenizer::hf_tokenizer_path()).unwrap();
+        let template = "{% for m in messages %}{{ m.role }}\
+            {% for t in m.tools or [] %}+{{ t.function.name }}{% endfor %};{% endfor %}";
+        tokenizer.set_chat_template(template.to_string()).unwrap();
+        let tool = json!({"type": "function", "function": {"name": "lookup", "parameters": {}}});
+        let body = json!({"model": "m", "messages": [
+            {"role": "system", "content": "be brief", "tools": [tool]},
+            {"role": "user", "content": "hi"},
+        ]});
+        let declared = MessageTools::read(&serde_json::to_vec(&body).unwrap()).unwrap();
+        let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+        let kwargs = Default::default();
+        let rendered =
+            process_chat_messages_with_kwargs(&request, &tokenizer, &kwargs, Some(&declared));
+        assert_eq!(rendered.unwrap().text, "system+lookup;user;");
+    }
+
+    #[test]
+    fn a_chat_to_an_sglang_worker_keeps_its_top_level_tools() {
+        let tool = json!({"type": "function", "function": {"name": "lookup", "parameters": {}}});
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "system", "content": "be brief", "tools": [tool]}],
+        });
+        let (payload, ctx) = prepared_raw(body, RuntimeType::Sglang);
+        assert!(!payload.text.contains("lookup"), "{}", payload.text);
+        assert!(tool_names(&ctx).is_empty());
     }
 }

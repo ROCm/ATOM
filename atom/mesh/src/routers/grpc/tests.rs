@@ -1693,6 +1693,7 @@ mod i_atom_refusals {
     const MEDIA: Answer = (StatusCode::BAD_REQUEST, "unsupported_media");
     const LOGPROBS: Answer = (StatusCode::BAD_REQUEST, "unsupported_logprobs");
     const UNSUPPORTED: Answer = (StatusCode::NOT_IMPLEMENTED, "unsupported_api");
+    const MESSAGE_TOOLS: Answer = (StatusCode::BAD_REQUEST, "invalid_message_tools");
 
     fn owned((status, code): Answer) -> (StatusCode, String) {
         (status, code.to_owned())
@@ -1721,6 +1722,9 @@ mod i_atom_refusals {
         generate_logprobs["return_logprob"] = json!(true);
         // ATOM's HTTP /v1/completions answers logprobs null; so does this route.
         let completion_logprobs = json!({"model": "m", "prompt": "test", "logprobs": 1});
+        // The typed request drops a system message's tools; ATOM reads them from the body.
+        let system = json!({"role": "system", "content": "test", "tools": "not a list"});
+        let message_tools = json!({"model": "m", "messages": [system]});
         let responses = json!({"model": "m", "input": "test"});
         let message = json!({"role": "user", "content": "test"});
         let messages = json!({"model": "m", "max_tokens": 8, "messages": [message]});
@@ -1729,6 +1733,7 @@ mod i_atom_refusals {
             ("/v1/chat/completions", chat(vec![&text, &image]), MEDIA),
             ("/v1/chat/completions", chat(vec![&text, &video]), MEDIA),
             ("/v1/chat/completions", chat_logprobs, LOGPROBS),
+            ("/v1/chat/completions", message_tools, MESSAGE_TOOLS),
             ("/generate", generate(None), SERVED),
             ("/generate", generate(Some("image_data")), MEDIA),
             ("/generate", generate(Some("video_data")), MEDIA),

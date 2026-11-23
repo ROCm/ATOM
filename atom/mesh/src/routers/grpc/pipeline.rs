@@ -35,6 +35,7 @@ use crate::{
         prepare::{
             self,
             generation_payload::GenerationPayload,
+            message_tools::MessageTools,
             response_context::{ProtocolRequest, ResponseContext},
             stop_decoder_builder::create_stop_decoder,
         },
@@ -213,6 +214,19 @@ impl Pipeline {
         model_id: Option<String>,
         components: Arc<AppContext>,
     ) -> Response {
+        self.execute_chat_declaring(req, None, headers, model_id, components)
+            .await
+    }
+
+    /// `execute_chat`, with the tools its messages declare read from its raw body.
+    pub async fn execute_chat_declaring(
+        &self,
+        req: Arc<ChatCompletionRequest>,
+        message_tools: Option<MessageTools>,
+        headers: Option<HeaderMap>,
+        model_id: Option<String>,
+        components: Arc<AppContext>,
+    ) -> Response {
         let start = Instant::now();
         let model = req.model.clone();
         let streaming = req.stream;
@@ -225,11 +239,16 @@ impl Pipeline {
             bool_to_static_str(streaming),
         );
 
-        let (mut payload, mut resp_ctx) =
-            match prepare::prepare_chat(req, headers, model_id, &components) {
-                Ok(t) => t,
-                Err(e) => return self.record_chat_err(&model, start, e),
-            };
+        let (mut payload, mut resp_ctx) = match prepare::prepare_chat_declaring(
+            req,
+            message_tools,
+            headers,
+            model_id,
+            &components,
+        ) {
+            Ok(t) => t,
+            Err(e) => return self.record_chat_err(&model, start, e),
+        };
         let placement = match self.plan_for(&payload, &resp_ctx).await {
             Ok(p) => p,
             Err(e) => return self.record_chat_err(&model, start, e),

@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::{http::HeaderMap, response::Response};
+use bytes::Bytes;
 use tracing::debug;
 
 #[cfg(feature = "grpc-client")]
@@ -14,7 +15,7 @@ use super::{
         wrap_streaming_generate_as_completion,
     },
     pipeline::Pipeline,
-    router::{atom_serves, logprobs_refused, media_refused},
+    router::{atom_chat_refusal, atom_serves, declared_tools, logprobs_refused, media_refused},
 };
 use crate::{
     app_context::AppContext,
@@ -27,7 +28,11 @@ use crate::{
     protocols::{
         chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
     },
-    routers::{comm::error, prepare::inference::ParsedInference, RouterTrait},
+    routers::{
+        comm::error,
+        prepare::{inference::ParsedInference, message_tools::MessageTools},
+        RouterTrait,
+    },
 };
 
 #[derive(Clone)]
@@ -126,6 +131,7 @@ impl GrpcPDRouter {
         &self,
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
+        message_tools: Option<MessageTools>,
         model_id: Option<&str>,
     ) -> Response {
         debug!(
@@ -143,12 +149,19 @@ impl GrpcPDRouter {
             &self.retry_config,
             |_attempt| {
                 let request = Arc::clone(&request);
+                let message_tools = message_tools.clone();
                 let headers = headers_cloned.clone();
                 let model_id = model_id_cloned.clone();
                 let components = Arc::clone(&components);
                 async move {
                     pipeline
-                        .execute_chat(request, headers, model_id, components)
+                        .execute_chat_declaring(
+                            request,
+                            message_tools,
+                            headers,
+                            model_id,
+                            components,
+                        )
                         .await
                 }
             },
@@ -233,15 +246,29 @@ impl RouterTrait for GrpcPDRouter {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        if atom_serves(&self.worker_registry, model_id) {
-            if ParsedInference::chat_carries_media(body) {
-                return media_refused();
-            }
-            if body.logprobs {
-                return logprobs_refused(); // top_logprobs needs logprobs
-            }
+        if let Some(refused) = atom_chat_refusal(&self.worker_registry, body, model_id) {
+            return refused;
         }
-        self.route_chat_impl(headers, body, model_id).await
+        self.route_chat_impl(headers, body, None, model_id).await
+    }
+
+    async fn route_chat_body(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        raw: Bytes,
+        model_id: Option<&str>,
+    ) -> Response {
+        if let Some(refused) = atom_chat_refusal(&self.worker_registry, body, model_id) {
+            return refused;
+        }
+        let message_tools = match declared_tools(&self.worker_registry, &raw, model_id) {
+            Ok(declared) => declared,
+            Err(refused) => return refused,
+        };
+        drop(raw);
+        self.route_chat_impl(headers, body, message_tools, model_id)
+            .await
     }
 
     async fn route_completion(

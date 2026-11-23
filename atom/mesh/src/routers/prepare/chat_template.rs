@@ -5,7 +5,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use serde_json::{json, Value};
 
-use super::fast_tokenizer::FastTokenizer;
+use super::{fast_tokenizer::FastTokenizer, message_tools::MessageTools};
 use crate::{
     core::{worker::RuntimeType, Worker},
     protocols::{
@@ -71,7 +71,7 @@ pub fn process_chat_messages(
     tokenizer: &dyn Tokenizer,
 ) -> Result<ProcessedMessages, String> {
     let template_kwargs = merged_template_kwargs(request, None);
-    process_chat_messages_with_kwargs(request, tokenizer, &template_kwargs)
+    process_chat_messages_with_kwargs(request, tokenizer, &template_kwargs, None)
 }
 
 /// The kwargs a chat renders with: `default_kwargs`, then its reasoning effort and its own.
@@ -96,11 +96,13 @@ pub(crate) fn merged_template_kwargs(
     combined_template_kwargs
 }
 
-/// As `process_chat_messages`, rendered with `template_kwargs`, the merged kwargs.
+/// As `process_chat_messages`, rendered with `template_kwargs`, the merged kwargs, and
+/// each message given its own `message_tools`, as ATOM's HTTP chat renders them.
 pub fn process_chat_messages_with_kwargs(
     request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,
     template_kwargs: &HashMap<String, Value>,
+    message_tools: Option<&MessageTools>,
 ) -> Result<ProcessedMessages, String> {
     let any = tokenizer.as_any();
     let hf_tokenizer = any.downcast_ref::<HuggingFaceTokenizer>().or_else(|| {
@@ -121,6 +123,14 @@ pub fn process_chat_messages_with_kwargs(
     let mut transformed_messages = process_content_format(&request.messages, content_format)?;
 
     process_tool_call_arguments(&mut transformed_messages)?;
+    if let Some(declared) = message_tools {
+        for (message, tools) in transformed_messages.iter_mut().zip(declared.0.iter()) {
+            if let (Some(message), Some(tools)) = (message.as_object_mut(), tools) {
+                let tools = serde_json::to_value(tools).map_err(|e| e.to_string())?;
+                message.insert("tools".to_string(), tools);
+            }
+        }
+    }
 
     let tools_json: Option<Vec<Value>> = request
         .tools
