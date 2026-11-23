@@ -386,8 +386,8 @@ def test_triton_moe_keeps_atoms_path(mi355x, served, monkeypatch):
 
 @pytest.fixture
 def dispatch_module(monkeypatch):
-    """``mono.dispatch`` with ATOM's own mono runners (FlyDSL kernels) stood in for: loaded fresh, dropped after."""
-    import importlib
+    """``mono.dispatch`` (AITER stood in for where it cannot run: its verify head reaches ``pcp_utils``) with ATOM's
+    own mono runners (FlyDSL kernels) stood in for: loaded fresh, dropped after."""
     import types
 
     from aiter_stub import _drop
@@ -403,7 +403,8 @@ def dispatch_module(monkeypatch):
         monkeypatch.setitem(sys.modules, stub.__name__, stub)
     _drop(name)
     try:
-        yield importlib.import_module(name)
+        with atom_without_aiter() as load:
+            yield load(name)
     finally:
         _drop(name)
         if saved is not None:

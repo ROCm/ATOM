@@ -222,11 +222,14 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
         start_positions=None,
         engram_live=True,
         cache_override=None,
+        final_heads=None,
     ):
         """``engram_live`` False: Engram's forward kernels run on no token.
 
         ``cache_override`` selects private profiling capture storage without
         changing the serving binding or forcing a verify batch into prefill.
+        ``final_heads``: returns the requests' heads once they are known; the
+        step is staged at ``start_positions`` until then (`_settle_heads`).
         """
         spans, rows, offset, next_page = [], [], 0, 0
         slots = batch.state_slots_committed
@@ -293,6 +296,7 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
                 is_prefill=is_prefill,
                 engram_live=engram_live,
                 replay_layout=(resumes, floors, cached_until, histories),
+                final_heads=final_heads,
             )
 
 
