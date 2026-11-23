@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (c) 2026 ATOM Project Contributors
 //! The Session to an ATOM instance: one `AtomEngine.Session` call carries every
 //! request to it as engine_v1 messages, and each request's outputs come back by seq_id.
 

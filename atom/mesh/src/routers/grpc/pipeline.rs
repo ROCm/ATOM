@@ -72,7 +72,8 @@ const EOS_TOKEN_IDS_LABEL: &str = "eos_token_ids";
 const USAGE_ON_FINISH_LABEL: &str = "usage_on_finish";
 
 /// ATOM's servers' reading of an output: the prompt's opener read first, no stop cut
-/// (ATOM ends where a stop's ids match and returns it all), end-of-sequence ids hidden.
+/// (ATOM ends where a stop's ids match and returns it all), special tokens skipped and
+/// end-of-sequence ids hidden.
 pub(crate) struct AtomOutput {
     end_token_ids: Vec<u32>,
     /// A streamed chat's usage rides on its finish chunk.
@@ -103,30 +104,20 @@ impl AtomOutput {
         }
     }
 
-    /// The request's decoder: none of its stops, and the end-of-sequence ids
-    /// hidden unless it asked to run past them.
+    /// The request's decoder: none of its stops, special tokens skipped whatever it asks
+    /// (as ATOM's HTTP routes decode), and the end-of-sequence ids hidden unless it asked
+    /// to run past them.
     fn stop_decoder(&self, ctx: &ResponseContext) -> StopSequenceDecoder {
-        let (skip_special_tokens, ignore_eos) = match &ctx.original {
-            ProtocolRequest::Chat(req) => (req.skip_special_tokens, req.ignore_eos),
-            ProtocolRequest::Generate(req) => {
-                let params = req.sampling_params.as_ref();
-                (
-                    params.and_then(|p| p.skip_special_tokens).unwrap_or(true),
-                    params.and_then(|p| p.ignore_eos).unwrap_or(false),
-                )
-            }
+        let ignore_eos = match &ctx.original {
+            ProtocolRequest::Chat(req) => req.ignore_eos,
+            ProtocolRequest::Generate(req) => req
+                .sampling_params
+                .as_ref()
+                .and_then(|p| p.ignore_eos)
+                .unwrap_or(false),
         };
-        self.decoder(&ctx.tokenizer, skip_special_tokens, ignore_eos)
-    }
-
-    fn decoder(
-        &self,
-        tokenizer: &Arc<dyn Tokenizer>,
-        skip_special_tokens: bool,
-        ignore_eos: bool,
-    ) -> StopSequenceDecoder {
         let end_token_ids = (!ignore_eos).then_some(&self.end_token_ids);
-        create_stop_decoder(tokenizer, None, end_token_ids, skip_special_tokens, false)
+        create_stop_decoder(&ctx.tokenizer, None, end_token_ids, true, false)
     }
 }
 
@@ -644,9 +635,11 @@ mod atom_output_tests {
         Arc::new(HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap())
     }
 
-    // "</s>", the second token added after the 256 bytes, ends the output.
-    const EOS: u32 = 257;
-    // Special tokens kept, so only the end ids' hiding keeps "</s>" out.
+    // "<tool>", an added token that is not special, ends the output: only the end
+    // ids' hiding keeps it out.
+    const EOS: u32 = 260;
+    // "</s>", a special token.
+    const SPECIAL: u32 = 257;
     const STOPPED_AT_DOT: &str =
         r#"{"text": "hi", "sampling_params": {"stop": ["."], "skip_special_tokens": false}}"#;
 
@@ -678,6 +671,32 @@ mod atom_output_tests {
     }
 
     #[test]
+    fn an_atom_reading_skips_special_tokens_as_atom_s_http_routes_do() {
+        // Both requests ask for special tokens kept; ATOM's HTTP routes skip them.
+        let tokenizer = byte_level();
+        let output = [u32::from(b'a'), SPECIAL, u32::from(b'b')];
+        let chat = || {
+            let mut ctx = chat_ctx(&tokenizer, "m", None);
+            let req = ChatCompletionRequest {
+                skip_special_tokens: false,
+                ..Default::default()
+            };
+            ctx.original = ProtocolRequest::Chat(Arc::new(req));
+            ctx.stop_decoder = create_stop_decoder(&tokenizer, None, None, false, false);
+            ctx
+        };
+        let generate = || generate_ctx(&tokenizer, STOPPED_AT_DOT);
+        for request in [&chat as &dyn Fn() -> ResponseContext, &generate] {
+            let mut ctx = request();
+            pipeline().read_as_atom(&single(RuntimeType::Sglang, &[]), &mut ctx);
+            assert_eq!(decode(&mut ctx.stop_decoder, &output), "a</s>b");
+            let mut ctx = request();
+            pipeline().read_as_atom(&single(RuntimeType::Atom, &[]), &mut ctx);
+            assert_eq!(decode(&mut ctx.stop_decoder, &output), "ab");
+        }
+    }
+
+    #[test]
     fn an_atom_producer_is_read_with_the_end_ids_its_worker_lists() {
         let tokenizer = byte_level();
         let output = output();
@@ -694,7 +713,7 @@ mod atom_output_tests {
         let body = r#"{"text": "hi", "sampling_params": {"ignore_eos": true, "skip_special_tokens": false}}"#;
         let mut ctx = generate_ctx(&tokenizer, body);
         pipeline().read_as_atom(&atom, &mut ctx);
-        assert_eq!(decode(&mut ctx.stop_decoder, &output), "ab. c</s>");
+        assert_eq!(decode(&mut ctx.stop_decoder, &output), "ab. c<tool>");
 
         // A pair's output is its decode worker's.
         let PlacementPlan::Single { worker, .. } = atom else {

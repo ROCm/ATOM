@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (c) 2026 ATOM Project Contributors
 //! A `GenerationPayload` as ATOM's GenerateRequest (the sampling fields ATOM's HTTP routes read,
 //! stop strings and stop ids as id sequences, DP rank, a chat's StructuredOutput), which the
 //! Session sends as a RequestSpec.

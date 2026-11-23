@@ -1720,6 +1720,22 @@ mod i_atom_structured_output {
     }
 
     #[test]
+    fn a_message_declaring_an_empty_tool_list_leaves_tool_parsing_off() {
+        // ATOM's HTTP chat parses no tool call when the chat declares no tool.
+        let body = json!({"model": "m", "messages": [
+            {"role": "system", "content": "be brief", "tools": []},
+            {"role": "user", "content": "hi"},
+        ]});
+        let (payload, ctx) = prepared_raw(body, RuntimeType::Atom);
+        let carried = payload.structured_output.expect("an ATOM chat carries one");
+        assert_eq!(parsed(carried.message_tools_json), Some(json!([[], null])));
+        let ProtocolRequest::Chat(req) = &ctx.original else {
+            unreachable!()
+        };
+        assert!(req.tools.is_none());
+    }
+
+    #[test]
     fn the_template_sees_each_message_s_own_tools() {
         use crate::routers::prepare::chat_template::process_chat_messages_with_kwargs;
         use crate::tokenizer::{traits::Tokenizer, HuggingFaceTokenizer};

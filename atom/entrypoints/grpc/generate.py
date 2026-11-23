@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Rewrite the committed Python modules of atom_grpc.proto and engine_v1.proto:
 `python -m atom.entrypoints.grpc.generate`, after editing either proto."""
 
@@ -20,10 +21,16 @@ MODULES = (
     "atom/entrypoints/grpc/atom_grpc_pb2.py",
     "atom/entrypoints/grpc/atom_grpc_pb2_grpc.py",
 )
+# The source header every module gets above protoc's output.
+HEADER = (
+    b"# SPDX-License-Identifier: MIT\n"
+    b"# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.\n"
+    b"# Copyright (c) 2026 ATOM Project Contributors\n"
+)
 
 
 def generated() -> dict[str, bytes]:
-    """Each module in MODULES, by its path from ROOT, as protoc writes it."""
+    """Each module in MODULES, by its path from ROOT: HEADER, then protoc's output."""
     try:
         found = version("grpcio-tools")
     except PackageNotFoundError:
@@ -37,7 +44,9 @@ def generated() -> dict[str, bytes]:
             args = [f"-I{ROOT}", *(f"{o}={out}" for o in outputs), str(ROOT / proto)]
             if protoc.main(["protoc", *args]) != 0:
                 raise RuntimeError(f"protoc failed on {proto}")
-        return {module: (Path(out) / module).read_bytes() for module in MODULES}
+        return {
+            module: HEADER + (Path(out) / module).read_bytes() for module in MODULES
+        }
 
 
 def main() -> None:

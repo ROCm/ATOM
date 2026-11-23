@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (c) 2026 ATOM Project Contributors
 //! The Session against an in-process `AtomEngine` whose Session calls the test
 //! answers: per-seq_id splitting, Abort on drop, failure and reopening, Ready's version.
 

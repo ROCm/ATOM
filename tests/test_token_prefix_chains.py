@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Token-id prompts reuse the block-hash chain of the stored prompt they share
 the most leading tokens with (`TokenPrefixChains`)."""
 

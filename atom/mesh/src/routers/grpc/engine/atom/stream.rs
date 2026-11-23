@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (c) 2026 ATOM Project Contributors
 //! ATOM's Generate stream, or a Session request's stream of the same messages, as
 //! `TokenChunk`s. A GenerateError keeps the HTTP status ATOM's HTTP routes answer.
 

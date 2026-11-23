@@ -19,6 +19,7 @@ if __name__ == "__main__":
 
 import asyncio
 import contextlib
+import contextvars
 import json
 import logging
 import os
@@ -30,6 +31,7 @@ from collections.abc import AsyncGenerator, Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from functools import partial
 from typing import Any
 
 import uvicorn
@@ -877,13 +879,16 @@ async def _submit_engine_requests(seqs):
         return
     # Admission RPCs must not block the API event loop. If the client cancels,
     # settle the in-flight submission before aborting so it cannot enqueue later.
-    submission = asyncio.create_task(
-        asyncio.to_thread(engine.core_mgr.add_request, seqs)
-    )
+    # A Future, as to_thread runs it: asyncio.run's teardown cancels only Tasks.
+    submit = partial(contextvars.copy_context().run, engine.core_mgr.add_request)
+    submission = asyncio.get_running_loop().run_in_executor(None, submit, seqs)
     try:
         await asyncio.shield(submission)
     except BaseException:
         try:
+            while not submission.done():  # a repeated cancel (shutdown) waits too
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.wait((submission,))
             await submission
         finally:
             for seq in seqs:

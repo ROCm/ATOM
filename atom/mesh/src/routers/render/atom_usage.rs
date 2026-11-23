@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (c) 2026 ATOM Project Contributors
 //! ATOM's additions to an OpenAI `usage`, as `serving_chat.py` and `serving_completion.py`
 //! write them; only an ATOM worker's sequences carry the timing (`WorkerMeta.timing`).
 
