@@ -393,7 +393,7 @@ def test_the_target_file_puts_each_point_against_its_target(ci):
     assert "| Kimi-K3 (2.8T) | tp8dcp8 | 64 | 39.9 | first | 16.0% of 250 |" in text
 
 
-def test_the_results_list_a_models_unmerged_optimization_prs_and_only_the_gsm8k_change(
+def test_the_results_list_a_models_unmerged_optimizations_and_only_the_gsm8k_change(
     ci,
 ):
     write_csv(ci / "perf.csv", PERF_COLUMNS, [perf("2026-11-21", 64, "39.90")])
@@ -403,16 +403,18 @@ def test_the_results_list_a_models_unmerged_optimization_prs_and_only_the_gsm8k_
         [acc("2026-11-18", "0.963"), acc("2026-11-21", "0.963")],
     )
     (ci / "pending_optimizations.csv").write_text(
-        "model,pr,note\n"
-        "kimi-k3,https://github.com/ROCm/ATOM/pull/2942,prefill as token graphs\n"
-        "kimi-k3,https://github.com/ROCm/aiter/pull/7876,wave-per-head MLA reduce\n"
+        "model,link,label,note\n"
+        "kimi-k3,https://github.com/ROCm/ATOM/pull/2942,,prefill as token graphs\n"
+        "kimi-k3,https://github.com/demonsan/aiter/tree/qkv-proj-fusion/x,"
+        "aiter-qkv-proj-fusion,a branch without a PR\n"
     )
     main(["--date", "2026-11-21", "--data-dir", str(ci)])
     text = result(ci, "20261121").read_text()
     assert (
         "| Kimi-K3 (2.8T) | MLPerf Endpoint | — | 39.9 | first | — | "
         "[ATOM-2942](https://github.com/ROCm/ATOM/pull/2942), "
-        "[aiter-7876](https://github.com/ROCm/aiter/pull/7876) | 0.0 pts |" in text
+        "[aiter-qkv-proj-fusion](https://github.com/demonsan/aiter/tree/qkv-proj-fusion/x)"
+        " | 0.0 pts |" in text
     )
 
 

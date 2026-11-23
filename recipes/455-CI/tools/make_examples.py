@@ -315,7 +315,7 @@ def main():
     write_csv(
         os.path.join(OUT, "pending_optimizations.csv"),
         OPTIMIZATION_COLUMNS,
-        [{"model": m, "pr": pr, "note": "(mock)"} for m, pr in OPTIMIZATIONS],
+        [{"model": m, "link": pr, "note": "(mock)"} for m, pr in OPTIMIZATIONS],
     )
     with open(
         os.path.join(run, "qwen-35b-a3b", "error.log"), "w", encoding="utf-8"

@@ -444,9 +444,9 @@ def test_a_failed_point_has_no_share_of_its_target():
 
 def test_summary_row_links_the_unmerged_optimization_prs_by_repo_and_number():
     r = kimi(pc(64, 39.9, None))
-    r.optimization_prs = [
-        "https://github.com/ROCm/ATOM/pull/2942",
-        "https://github.com/ROCm/aiter/pull/7876",
+    r.optimizations = [
+        ("https://github.com/ROCm/ATOM/pull/2942", ""),
+        ("https://github.com/ROCm/aiter/pull/7876", ""),
     ]
     row = summary_row(r, "2026-11-21", None)
     assert row[5:] == [
@@ -457,6 +457,13 @@ def test_summary_row_links_the_unmerged_optimization_prs_by_repo_and_number():
         ),
         "first",
     ]
+
+
+def test_an_optimization_without_a_pr_yet_links_its_branch_under_its_label():
+    r = kimi(pc(64, 39.9, None))
+    branch = "https://github.com/demonsan/aiter/tree/qkv-proj-fusion/pr7847-merge-main"
+    r.optimizations = [(branch, "aiter-qkv-proj-fusion")]
+    assert summary_row(r, "2026-11-21", None)[6] == f"[aiter-qkv-proj-fusion]({branch})"
 
 
 def test_the_results_and_details_put_each_concurrency_against_its_own_target():

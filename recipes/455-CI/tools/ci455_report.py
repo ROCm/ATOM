@@ -39,8 +39,10 @@ class ModelResult:
     baseline: float | None = None
     # Target tok/s per GPU by concurrency, perf_target.csv
     targets: dict = field(default_factory=dict)
-    # Links of the model's unmerged optimization PRs, pending_optimizations.csv
-    optimization_prs: list = field(default_factory=list)
+    # (link, label) of each unmerged optimization, pending_optimizations.csv:
+    # a PR, or a branch that has no PR yet; an empty label names a PR by its
+    # repo and number
+    optimizations: list = field(default_factory=list)
 
 
 def pct(x):
@@ -330,10 +332,13 @@ def target_share(c, target):
     return f"{c.value / target * 100:.1f}% of {num(target)}"
 
 
-def pr_link(url):
-    """A PR as a link named by its repo and number: [ATOM-2942](<url>)."""
-    m = PR_URL.match(url)
-    return f"[{m.group(1).split('/')[-1]}-{m.group(2)}]({url})" if m else url
+def optimization_link(link, label=""):
+    """An unmerged optimization as a link: under its label (a branch without
+    a PR yet), else a PR named by its repo and number, [ATOM-2942](<url>)."""
+    if label:
+        return f"[{label}]({link})"
+    m = PR_URL.match(link)
+    return f"[{m.group(1).split('/')[-1]}-{m.group(2)}]({link})" if m else link
 
 
 def summary_row(r, date, ref):
@@ -359,7 +364,7 @@ def summary_row(r, date, ref):
         else:
             delta = f"{perf_flag(c.delta)} {pct(c.delta)}".strip()
     share = target_share(c, r.targets.get(c.concurrency))
-    prs = ", ".join(map(pr_link, r.optimization_prs)) or "—"
+    prs = ", ".join(optimization_link(*o) for o in r.optimizations) or "—"
     return [r.name, LABEL[r.scenario], prev, now, delta, share, prs, _acc_delta(a)]
 
 

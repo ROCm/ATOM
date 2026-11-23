@@ -1,23 +1,26 @@
-model,pr,note
-kimi-k3,https://github.com/ROCm/ATOM/pull/2894,gfx1250 Kimi-K3 monokernel (draft); LLM-Booster#384
-kimi-k3,https://github.com/ROCm/ATOM/pull/2942,record Kimi-K3 prefill as token graphs; LLM-Booster#398
-kimi-k3,https://github.com/ROCm/ATOM/pull/3402,"fold the E8M0 per-1x128 q_b_proj quant into the MLA q/kv norm, with aiter#8017; LLM-Booster#406"
-kimi-k3,https://github.com/ROCm/ATOM/pull/3503,fuse the KDA o_norm into the decode recurrence (draft; ATOM#3461 is the same change on a K3 branch); LLM-Booster#549
-kimi-k3,https://github.com/ROCm/aiter/pull/7876,wave-per-head MLA reduce for wave32 decode with few splits per tile; LLM-Booster#543
-kimi-k3,https://github.com/ROCm/aiter/pull/7937,gfx1250 Lamport two-shot custom all-reduce replaces the LL two-shot; LLM-Booster#399
-kimi-k3,https://github.com/ROCm/aiter/pull/8017,"fused_qk_rmsnorm with FP8 group quant and E8M0 scales, for ATOM#3402; LLM-Booster#406"
-kimi-k3,https://github.com/ROCm/aiter/pull/8031,FP32 cluster TDM and native BF16 GEMM retuning; LLM-Booster#414
-kimi-k3,https://github.com/ROCm/aiter/pull/8246,"fused split-K for the generic a8w8 GEMM, Kimi-K3 mx128 rows retuned; LLM-Booster#591"
-kimi-k3,https://github.com/ROCm/aiter/pull/8348,"Kimi-K3 latent-MoE BF16 GEMM rows for 256 CUs, needs aiter#8031; LLM-Booster#535"
-minimax-m3,https://github.com/ROCm/aiter/pull/8310,"AR + RMSNorm + native MXFP8 quant in one launch, with ATOM#3611 (draft)"
-minimax-m3,https://github.com/ROCm/ATOM/pull/3611,M3 opts into the fused native MXFP8 AR + RMSNorm of aiter#8310 (draft)
-minimax-m3,https://github.com/ROCm/ATOM/pull/3619,dense and shared-expert SwiGLU fused with the MXFP8 quant (draft)
-minimax-m3,https://github.com/ROCm/aiter/pull/8364,"the routed MoE's A1 quant also writes the shared expert's MXFP8 input, with ATOM#3630 (draft)"
-minimax-m3,https://github.com/ROCm/ATOM/pull/3630,"shared-expert input from the routed MoE quant, opt-in, with aiter#8364 (draft)"
-minimax-m3,https://github.com/ROCm/aiter/pull/8365,"NVFP4 PA decode writes o_proj's MXFP8 input, with ATOM#3634 (draft)"
-minimax-m3,https://github.com/ROCm/ATOM/pull/3634,"NVFP4 sparse attention writes o_proj's MXFP8 input, opt-in; stacked on ATOM#2744 (draft)"
-minimax-m3,https://github.com/ROCm/ATOM/pull/3640,"shared expert on a second stream, overlapped with the routed MoE (draft)"
-minimax-m3,https://github.com/ROCm/ATOM/pull/2744,FP4 index cache and NVFP4 sparse KV cache
-minimax-m3,https://github.com/ROCm/ATOM/pull/3581,"gfx1250 scaled-WMMA index scorers, index key written in the fused qk-norm launch; stacked on ATOM#2744, with aiter#8290 (draft)"
-minimax-m3,https://github.com/ROCm/aiter/pull/8290,"fused_qknorm_idxrqknorm writes NVFP4 K/V in the row layout, with ATOM#3581 (draft)"
-minimax-m3,https://github.com/ROCm/aiter/pull/8273,native MXFP8 (1x32 scale) GEMM optimized across M regimes (draft)
+model,link,label,note
+kimi-k3,https://github.com/ROCm/ATOM/pull/2894,,gfx1250 Kimi-K3 monokernel (draft); LLM-Booster#384
+kimi-k3,https://github.com/ROCm/ATOM/pull/2942,,record Kimi-K3 prefill as token graphs; LLM-Booster#398
+kimi-k3,https://github.com/ROCm/ATOM/pull/3402,,"fold the E8M0 per-1x128 q_b_proj quant into the MLA q/kv norm, with aiter#8017; LLM-Booster#406"
+kimi-k3,https://github.com/ROCm/ATOM/pull/3503,,fuse the KDA o_norm into the decode recurrence (draft; ATOM#3461 is the same change on a K3 branch); LLM-Booster#549
+kimi-k3,https://github.com/ROCm/aiter/pull/7876,,wave-per-head MLA reduce for wave32 decode with few splits per tile; LLM-Booster#543
+kimi-k3,https://github.com/ROCm/aiter/pull/7937,,gfx1250 Lamport two-shot custom all-reduce replaces the LL two-shot; LLM-Booster#399
+kimi-k3,https://github.com/ROCm/aiter/pull/8017,,"fused_qk_rmsnorm with FP8 group quant and E8M0 scales, for ATOM#3402; LLM-Booster#406"
+kimi-k3,https://github.com/ROCm/aiter/pull/8031,,FP32 cluster TDM and native BF16 GEMM retuning; LLM-Booster#414
+kimi-k3,https://github.com/ROCm/aiter/pull/8246,,"fused split-K for the generic a8w8 GEMM, Kimi-K3 mx128 rows retuned; LLM-Booster#591"
+kimi-k3,https://github.com/ROCm/aiter/pull/8348,,"Kimi-K3 latent-MoE BF16 GEMM rows for 256 CUs, needs aiter#8031; LLM-Booster#535"
+minimax-m3,https://github.com/ROCm/aiter/pull/8310,,"AR + RMSNorm + native MXFP8 quant in one launch, with ATOM#3611 (draft)"
+minimax-m3,https://github.com/ROCm/ATOM/pull/3611,,M3 opts into the fused native MXFP8 AR + RMSNorm of aiter#8310 (draft)
+minimax-m3,https://github.com/ROCm/ATOM/pull/3619,,dense and shared-expert SwiGLU fused with the MXFP8 quant (draft)
+minimax-m3,https://github.com/ROCm/aiter/pull/8364,,"the routed MoE's A1 quant also writes the shared expert's MXFP8 input, with ATOM#3630 (draft)"
+minimax-m3,https://github.com/ROCm/ATOM/pull/3630,,"shared-expert input from the routed MoE quant, opt-in, with aiter#8364 (draft)"
+minimax-m3,https://github.com/ROCm/aiter/pull/8365,,"NVFP4 PA decode writes o_proj's MXFP8 input, with ATOM#3634 (draft)"
+minimax-m3,https://github.com/ROCm/ATOM/pull/3634,,"NVFP4 sparse attention writes o_proj's MXFP8 input, opt-in; stacked on ATOM#2744 (draft)"
+minimax-m3,https://github.com/ROCm/ATOM/pull/3640,,"shared expert on a second stream, overlapped with the routed MoE (draft)"
+minimax-m3,https://github.com/ROCm/ATOM/pull/2744,,FP4 index cache and NVFP4 sparse KV cache
+minimax-m3,https://github.com/ROCm/ATOM/pull/3581,,"gfx1250 scaled-WMMA index scorers, index key written in the fused qk-norm launch; stacked on ATOM#2744, with aiter#8290 (draft)"
+minimax-m3,https://github.com/ROCm/aiter/pull/8290,,"fused_qknorm_idxrqknorm writes NVFP4 K/V in the row layout, with ATOM#3581 (draft)"
+minimax-m3,https://github.com/ROCm/aiter/pull/8273,,native MXFP8 (1x32 scale) GEMM optimized across M regimes (draft)
+qwen-3.8-flash,https://github.com/demonsan/aiter/tree/qkv-proj-fusion/pr7847-merge-main,aiter-qkv-proj-fusion,"QKV projection fusion, aiter side: routed op for the fused QSA projection epilogue. Branch on aiter#7847 merged with main, no PR yet; goes with ATOM-qkv-proj-fusion and plugin_poc-qkv-proj-fusion"
+qwen-3.8-flash,https://github.com/demonsan/ATOM/tree/qkv-proj-fusion/pr3225-merge-main,ATOM-qkv-proj-fusion,"QKV projection fusion, ATOM side: serves every decode-sized batch (M <= 128). Branch on ATOM#3225 merged with main, no PR yet"
+qwen-3.8-flash,https://github.com/coderfeli/plugin_poc/tree/feat/qkv-proj-fusion-aiter-provider,plugin_poc-qkv-proj-fusion,"QKV projection fusion, the aiter provider in coderfeli/plugin_poc (a private repo). Branch, no PR yet"

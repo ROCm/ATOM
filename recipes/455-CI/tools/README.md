@@ -29,7 +29,7 @@ python3 -m pytest -q                         # 改了脚本先跑测试
 - 结果开头写全镜像名，以及 ATOM、aiter 的 branch、完整 commit 和日期；跑挂的模型在 Failures 里附复现命令，取自 `../runs/<YYYYMMDD>/<slug>/*_cmd*.sh`。
 - `../pending_fixes.csv` 登记某个模型在 main 上还在等的 PR。这个模型出了问题又没写说法时，`make_report.py` 会在警告下面列出这些 PR，并给出一行可以直接贴进 `followups.csv` 的说法。
 - `../perf_target.csv` 登记每个模型每个场景、每个并发的目标每卡吞吐（guide §4.2）。Results 和 Details 的性能表里 `% of target` 一列写本场每卡吞吐占目标的百分比和目标值，例如 `16.0% of 250`；没设目标的写 —，跑挂的写 N/A。
-- `../pending_optimizations.csv` 登记每个模型还没合入 main 的优化 PR，一个 PR 一行（guide §4.2）。Results 里 `% of target` 后面一列把它们写成 `ATOM-2942`、`aiter-7876` 这样的链接；PR 合入后删掉那一行。
+- `../pending_optimizations.csv` 登记每个模型还没合入 main 的优化，一项一行；还没开 PR 的写分支链接，并在 `label` 填显示名（guide §4.2）。Results 里 `% of target` 后面一列把 PR 写成 `ATOM-2942`、`aiter-7876` 这样的链接，分支用 `label`；PR 合入后删掉那一行。
 - 依赖：Python 3.10 以上、matplotlib；跑测试还要 pytest。没有字体文件也能画，会退回 DejaVu Sans。
 
 ## 样例
