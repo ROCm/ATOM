@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-if [[ -n "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" ]]; then
+if [[ -n "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" || "${ATOMESH_ENV_ATOMESH_PR5090_ROUTER_AB:-0}" == 1 ]]; then
   PD_LAUNCH_EVIDENCE_ROLE=batch
   [[ "${1:-}" != --spur-worker ]] || PD_LAUNCH_EVIDENCE_ROLE=worker
   # Emit before external commands or shared-directory setup. These markers do
@@ -57,7 +57,7 @@ fi
 mkdir -p "${RUN_DIR}"
 # Shared NFS: every Spur rank writes rank-rc-* here for GHA accounting fallback.
 chmod 0777 "${RUN_DIR}" 2>/dev/null || true
-if [[ -n "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" && "${1:-}" == --spur-worker ]]; then
+if [[ ( -n "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" || "${ATOMESH_ENV_ATOMESH_PR5090_ROUTER_AB:-0}" == 1 ) && "${1:-}" == --spur-worker ]]; then
   python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_spur_allocation.py" worker-entry \
     --job-id "${JOB_ID}" --run-dir "${RUN_DIR}" \
     --run-token "${ATOMESH_RUN_TOKEN}" --num-ranks "${NUM_NODES}"
@@ -757,18 +757,18 @@ if [[ -n "${SPUR_JOB_ID:-}" || -n "${SPUR_TASK_OFFSET:-}" || -n "${SPUR_PEER_NOD
   # Use an explicit worker argument because the batch shell also has rank 0
   # in SPUR_TASK_OFFSET. srun assigns each worker's rank and inherits the batch
   # environment, including SPUR_PEER_NODES in allocation order.
-  if [[ -n "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" ]]; then
+  if [[ -n "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" || "${ATOMESH_ENV_ATOMESH_PR5090_ROUTER_AB:-0}" == 1 ]]; then
     ATOMESH_SPUR_DISPATCH_RESTARTS="$(
       python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_spur_allocation.py" wait \
         --job-id "${JOB_ID}" --controller "${SPUR_CONTROLLER_ADDR}" \
-        --num-ranks "${NUM_NODES}" --output "${RUN_DIR}/allocation-ready.json" \
+        --run-token "${ATOMESH_RUN_TOKEN}" --num-ranks "${NUM_NODES}" --output "${RUN_DIR}/allocation-ready.json" \
         --timeout-seconds "${ATOMESH_SPUR_READY_TIMEOUT_SECONDS:-180}" \
         --poll-seconds "${ATOMESH_SPUR_READY_POLL_SECONDS:-2}"
     )"
     export ATOMESH_SPUR_DISPATCH_RESTARTS
   fi
   echo "=== Spur job ${JOB_ID}: dispatching ${NUM_NODES} node workers ==="
-  if [[ -n "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" ]]; then
+  if [[ -n "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" || "${ATOMESH_ENV_ATOMESH_PR5090_ROUTER_AB:-0}" == 1 ]]; then
     printf '[pd.launch] phase=worker-dispatch job=%s host=%s nodes=%s\n' \
       "${JOB_ID}" "${HOSTNAME:-unknown}" "${NUM_NODES}" >&2 || true
   fi

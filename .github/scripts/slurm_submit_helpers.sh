@@ -503,6 +503,7 @@ monitor_slurm_job() {
   echo "=== monitoring Slurm job ${job_id} ==="
   while true; do
     state=""
+    reason=""
     result=""
     missing_queries=$((missing_queries + 1))
     if job_line="$(query_slurm_job "${job_id}")" && [[ -n "${job_line}" ]]; then
@@ -528,7 +529,17 @@ monitor_slurm_job() {
       "${SLURM_EXTRA_LOG_STREAMER}" "${job_id}"
     fi
     if [[ -n "${SLURM_EXTRA_STATUS_CHECKER:-}" ]]; then
-      "${SLURM_EXTRA_STATUS_CHECKER}" "${job_id}" "${state}"
+      "${SLURM_EXTRA_STATUS_CHECKER}" "${job_id}" "${state}" "${reason}"
+    fi
+
+    if [[ "${SCANCEL_SENT}" == 1 ]]; then
+      # Cancellation already had its bounded wait; do not hide failure by polling forever.
+      if slurm_job_in_queue "${job_id}"; then
+        echo "ERROR: cancellation of job ${job_id} is still unconfirmed; refusing an indefinite queue wait." >&2
+        return "${SLURM_STATUS_UNAVAILABLE_RC}"
+      else
+        [[ "$?" -eq 1 ]] || return "${SLURM_STATUS_UNAVAILABLE_RC}"
+      fi
     fi
 
     if slurm_state_is_terminal "${state}"; then

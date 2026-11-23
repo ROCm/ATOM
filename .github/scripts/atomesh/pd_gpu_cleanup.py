@@ -12,7 +12,7 @@ from pathlib import Path
 
 KFD = Path("/sys/class/kfd/kfd/proc")
 DRM = Path("/sys/class/drm")
-SUFFIX = r"(?:-benchmark|-eval|-router|-benchmark-router|-eval-router)?"
+SUFFIX = r"(?:-(?:benchmark|eval|baseline|atomesh)(?:-router)?|-router)?"
 KILL_IMAGE = "busybox:1.36"
 
 

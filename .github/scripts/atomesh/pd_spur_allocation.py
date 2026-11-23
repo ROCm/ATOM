@@ -1,4 +1,4 @@
-"""Bound C48 startup to a confirmed Spur allocation and observable workers."""
+"""Bound PD startup to a confirmed Spur allocation and observable workers."""
 import argparse
 from datetime import datetime, timezone
 import json
@@ -88,7 +88,7 @@ def wait_ready(args):
         if state == 'RUNNING':
             if row['NumNodes'] != args.num_ranks:
                 raise RuntimeError('Confirmed allocation has an unexpected node count')
-            proof = event(args, 'allocation-ready', controller=row)
+            proof = event(args, 'allocation-ready', controller=row, run_token=args.run_token)
             save(args.output, proof)
             # Shell exports this generation to the workers before its one exec.
             print(restart, flush=True)
@@ -127,8 +127,24 @@ def started_workers(args, restart):
 
 
 def watch_startup(args, clock=time.monotonic):
-    """Only cancel a confirmed allocation with no worker entry in its generation."""
+    """Report readiness failure or a confirmed allocation missing worker entry."""
+    # A failed batch readiness gate must also be visible while squeue stays PENDING.
+    try:
+        gate = json.loads((args.run_dir / 'allocation-ready.json').read_text())
+    except (OSError, ValueError):
+        gate = None
+    if (isinstance(gate, dict) and gate.get('job_id') == args.job_id
+            and gate.get('run_token') == args.run_token
+            and gate.get('phase') == 'allocation-check-failed'):
+        event(args, 'allocation-gate-failed', evidence=gate)
+        return 124
     path = args.run_dir / 'startup-watch.json'
+    if args.state == 'PENDING' and 'JobLaunchFailure' in args.reason:
+        proof = event(args, 'dispatch-confirmation-failed',
+                      scheduler_state=args.state, reason=args.reason,
+                      run_token=args.run_token)
+        save(path, proof)
+        return 124
     if args.state != 'RUNNING':
         save(path, dict(job_id=args.job_id, run_token=args.run_token,
                         phase='waiting-allocation', scheduler_state=args.state))
@@ -204,7 +220,7 @@ def check_previous(args):
     if active or ambiguous:
         raise RuntimeError(f'Previous task jobs remain active or names are incomplete: '
                            f'{active or ambiguous}; refusing a duplicate workload')
-    print('[C48] Exact previous jobs are absent from the active queue', flush=True)
+    print('[Slurm] Exact previous jobs are absent from the active queue', flush=True)
     return 0
 
 
@@ -219,6 +235,7 @@ def main():
     parser.add_argument('--output', type=Path)
     parser.add_argument('--previous-manifest', type=Path)
     parser.add_argument('--state', default='')
+    parser.add_argument('--reason', default='')
     parser.add_argument('--timeout-seconds', type=float, default=180)
     parser.add_argument('--poll-seconds', type=float, default=2)
     args = parser.parse_args()
@@ -239,7 +256,10 @@ def main():
         return {'wait': wait_ready, 'worker-entry': worker_entry,
                 'watch': watch_startup, 'check-previous': check_previous}[args.mode](args)
     except Exception as error:
-        event(args, 'allocation-check-failed', error=f'{type(error).__name__}: {error}')
+        proof = event(args, 'allocation-check-failed',
+                      error=f'{type(error).__name__}: {error}', run_token=args.run_token)
+        if args.mode == 'wait' and args.output and args.run_token:
+            save(args.output, proof)
         return 75
 
 

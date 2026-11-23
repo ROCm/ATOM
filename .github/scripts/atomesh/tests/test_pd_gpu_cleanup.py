@@ -112,6 +112,24 @@ class CleanupTest(unittest.TestCase):
         self.assertIn("skip_active_container", kinds)
         self.assertIn("skip_different_owner", kinds)
 
+    def test_ab_phase_cleanup_requires_exact_cell_owner_and_inactive_job(self):
+        self.args.targets = None
+        self.args.cell_id = "pr5090-router-ab-pr5090-c40-router-ab-vllm"
+        cell = self.args.cell_id
+        stale = {
+            self.add_container(i, f"atomesh-{cell}-30080-0{suffix}")
+            for i, suffix in enumerate(("-baseline", "-atomesh", "-baseline-router", "-atomesh-router"), 1)
+        }
+        active = self.add_container(5, f"atomesh-{cell}-30081-0-baseline")
+        other_user = self.add_container(6, f"atomesh-{cell}-30080-1-baseline", "101:200")
+        other_cell = self.add_container(7, "atomesh-other-cell-30080-0-baseline")
+        unexpected_suffix = self.add_container(8, f"atomesh-{cell}-30080-0-baseline-extra")
+        self.active.add("30081")
+        self.invoke()
+        removed = {call[-1] for call in self.calls if call[:2] == ["docker", "rm"]}
+        self.assertEqual(removed, stale)
+        self.assertEqual(set(self.containers), {active, other_user, other_cell, unexpected_suffix})
+
     def test_cell_prefix_removes_inactive_sibling_cells_only(self):
         self.args.targets, self.args.cell_id, self.args.cell_prefix = (
             None,

@@ -47,7 +47,7 @@ def snapshot(state, restarts=2, job_id=8540, nodes=2):
 
 
 class BatchDispatchTest(unittest.TestCase):
-    def run_batch(self, snapshots, timeout='1'):
+    def run_batch(self, snapshots, timeout='1', case='c48'):
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             fixture = td / 'state.json'
@@ -63,14 +63,33 @@ class BatchDispatchTest(unittest.TestCase):
                        LOG_ROOT=str(td / 'logs'), SPUR_JOB_ID='8540',
                        SLURM_JOB_ID='8540', SPUR_CONTROLLER_ADDR='http://fixture',
                        NUM_NODES='2', BACKEND='vllm',
-                       ATOMESH_ENV_ATOMESH_C48_CASE='V-Q',
+                       ATOMESH_ENV_ATOMESH_C48_CASE='V-Q' if case == 'c48' else '',
+                       ATOMESH_ENV_ATOMESH_PR5090_ROUTER_AB='1' if case == 'pr5090' else '0',
                        ATOMESH_RUN_TOKEN='a' * 32,
                        ATOMESH_SPUR_READY_POLL_SECONDS='0.01',
                        ATOMESH_SPUR_READY_TIMEOUT_SECONDS=timeout)
             result = subprocess.run(['bash', str(ROOT / '.github/scripts/atomesh/pd_slurm_job.sh')],
                                     env=env, capture_output=True, text=True, timeout=5)
             state = json.loads(fixture.read_text())
+            proof = td / 'logs/slurm_job-8540/allocation-ready.json'
+            if proof.exists():
+                state['allocation_evidence'] = json.loads(proof.read_text())
             return result, state
+
+    def test_pr5090_waits_for_running_before_dispatch(self):
+        result, state = self.run_batch([snapshot('PENDING'), snapshot('RUNNING')], case='pr5090')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sum(row[0] == 'srun' for row in state['calls']), 1)
+        self.assertEqual(state['allocation_evidence']['run_token'], 'a' * 32)
+        self.assertEqual(state['allocation_evidence']['controller']['JobState'], 'RUNNING')
+
+    def test_pr5090_pending_timeout_publishes_failure_without_dispatch(self):
+        result, state = self.run_batch([snapshot('PENDING')], timeout='0.1', case='pr5090')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(any(row[0] == 'srun' for row in state['calls']))
+        self.assertEqual(state['allocation_evidence']['phase'], 'allocation-check-failed')
+        self.assertEqual(state['allocation_evidence']['job_id'], '8540')
+        self.assertEqual(state['allocation_evidence']['run_token'], 'a' * 32)
 
     def test_pending_then_running_dispatches_once_after_confirmation(self):
         result, state = self.run_batch([snapshot('PENDING'), snapshot('RUNNING')])
@@ -124,7 +143,7 @@ class StartupEvidenceTest(unittest.TestCase):
         self.args = SimpleNamespace(job_id='8540', run_token='a' * 32,
                                     controller='http://fixture', num_ranks=2,
                                     run_dir=self.directory, output=None,
-                                    state='RUNNING', timeout_seconds=600)
+                                    state='RUNNING', reason='', timeout_seconds=600)
 
     def controller(self, state='RUNNING', restart=2):
         row = snapshot(state, restart)
@@ -145,6 +164,33 @@ class StartupEvidenceTest(unittest.TestCase):
             self.assertEqual(self.module.watch_startup(self.args, lambda: 20000), 0)
             self.assertEqual(self.module.watch_startup(self.args, lambda: 20599), 0)
             self.assertEqual(self.module.watch_startup(self.args, lambda: 20600), 124)
+
+    def test_failed_batch_gate_is_observed_while_queue_stays_pending(self):
+        self.args.state = 'PENDING'
+        proof = dict(job_id='8540', run_token=self.args.run_token, phase='allocation-check-failed')
+        self.module.save(self.directory / 'allocation-ready.json', proof)
+        with self.controller() as query:
+            self.assertEqual(self.module.watch_startup(self.args, lambda: 0), 124)
+            query.assert_not_called()
+        for key, value in [('job_id', '9999'), ('run_token', 'b' * 32)]:
+            with self.subTest(key=key), self.controller() as query:
+                self.module.save(self.directory / 'allocation-ready.json', proof | {key: value})
+                self.assertEqual(self.module.watch_startup(self.args, lambda: 0), 0)
+                query.assert_not_called()
+
+    def test_dispatch_failure_is_bounded_but_ordinary_queue_wait_is_retained(self):
+        self.args.state = 'PENDING'
+        cases = [('Resources', 0), ('QOSGrpNodeLimit', 0),
+                 ('JobLaunchFailure (dispatch confirmation failed (1/2 confirmed): 1 gpu/resource allocation mismatch)', 124)]
+        for reason, expected in cases:
+            with self.subTest(reason=reason), self.controller() as query:
+                self.args.reason = reason
+                self.assertEqual(self.module.watch_startup(self.args, lambda: 0), expected)
+                query.assert_not_called()
+        proof = json.loads((self.directory / 'startup-watch.json').read_text())
+        self.assertEqual(proof['phase'], 'dispatch-confirmation-failed')
+        self.assertEqual(proof['job_id'], '8540')
+        self.assertEqual(proof['run_token'], self.args.run_token)
 
     def test_valid_worker_entry_prevents_startup_cancellation(self):
         with self.controller():
@@ -236,6 +282,12 @@ class StartupEvidenceTest(unittest.TestCase):
                 self.module.check_previous(self.args)
 
     def test_monitor_hook_preserves_failure_and_cancels_only_its_job(self):
+        self.run_monitor_hook('c48')
+
+    def test_pr5090_monitor_hook_cancels_only_its_failed_startup(self):
+        self.run_monitor_hook('pr5090')
+
+    def run_monitor_hook(self, case):
         logs = self.directory / 'logs'
         run_dir = logs / 'slurm_job-8540'
         self.module.save(run_dir / 'startup-watch.json', dict(
@@ -262,12 +314,63 @@ class StartupEvidenceTest(unittest.TestCase):
                    PD_STATE_FIXTURE=str(fixture), PD_CANCEL_RECORD=str(self.directory / 'cancel'),
                    REPO_ROOT=str(ROOT), LOG_ROOT=str(logs),
                    ATOMESH_RUN_TOKEN=self.args.run_token, NUM_NODES='2',
-                   ATOMESH_ENV_ATOMESH_C48_CASE='V-Q', SPUR_CONTROLLER_ADDR='http://fixture')
+                   ATOMESH_ENV_ATOMESH_C48_CASE='V-Q' if case == 'c48' else '',
+                   ATOMESH_ENV_ATOMESH_PR5090_ROUTER_AB='1' if case == 'pr5090' else '0',
+                   SPUR_CONTROLLER_ADDR='http://fixture')
         result = subprocess.run(['bash', '-c', code], env=env, text=True,
                                 capture_output=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('result:124:', result.stdout)
         self.assertTrue((self.directory / 'cancel').exists())
+
+
+class MonitorReasonTest(unittest.TestCase):
+    def test_unconfirmed_cancellation_cannot_loop_in_pending(self):
+        code = '''set -euo pipefail
+source "$PD_HELPERS"
+stream_slurm_logs_once() { :; }
+query_slurm_job() { printf '%s\\n' '8540|PENDING|0:00|2|JobLaunchFailure'; }
+slurm_job_in_queue() { return 0; }
+cancel_hook() { SCANCEL_SENT=1; }
+SLURM_EXTRA_STATUS_CHECKER=cancel_hook
+monitor_slurm_job 8540
+'''
+        env = os.environ.copy()
+        env['PD_HELPERS'] = (ROOT / '.github/scripts/slurm_submit_helpers.sh').as_posix()
+        result = subprocess.run(['bash', '-c', code], env=env, text=True,
+                                capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 75, result.stderr)
+        self.assertEqual(result.stdout.count('[slurm] job=8540'), 1)
+        self.assertIn('still unconfirmed', result.stderr)
+
+    def test_reason_is_forwarded_and_cleared_after_queue_query_misses(self):
+        code = '''set -euo pipefail
+source "$PD_HELPERS"
+PHASE=0
+stream_slurm_logs_once() { :; }
+sleep() { :; }
+query_slurm_job() {
+  if [[ "$PHASE" == 0 ]]; then
+    printf '%s\\n' '8540|PENDING|0:00|2|JobLaunchFailure (gpu/resource allocation mismatch)'
+  else
+    return 1
+  fi
+}
+query_slurm_result() { printf '%s\\n' 'COMPLETED|0:0'; }
+record_hook() {
+  printf 'hook:%s:%s:%s\\n' "$1" "$2" "$3"
+  PHASE=1
+}
+SLURM_EXTRA_STATUS_CHECKER=record_hook
+monitor_slurm_job 8540
+'''
+        env = os.environ.copy()
+        env['PD_HELPERS'] = (ROOT / '.github/scripts/slurm_submit_helpers.sh').as_posix()
+        result = subprocess.run(['bash', '-c', code], env=env, text=True,
+                                capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('hook:8540:PENDING:JobLaunchFailure (gpu/resource allocation mismatch)', result.stdout)
+        self.assertIn('hook:8540:COMPLETED:\n', result.stdout)
 
 
 if __name__ == '__main__':

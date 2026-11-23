@@ -167,6 +167,8 @@
     "memlock": "unlimited soft and hard in both worker arms",
     "slurm_time_limit": "08:00:00",
     "workflow_timeout_minutes": 960,
-    "scheduler_admission": "previous job 29577 must be absent before sbatch"
+    "scheduler_admission": "previous jobs 29577 and 30080 must be absent before sbatch",
+    "startup_guard": "wait for RUNNING with the expected node count and allocation generation; publish failures to the submitter",
+    "pre_cleanup": "on current exclusive nodes, stop only owned containers for this exact case whose jobs are absent from the active queue; never stop-all"
   }
 }

@@ -17354,7 +17354,7 @@ models:
         ATOMESH_PR5090_ROUTER_AB: '1'
         ATOMESH_PR5090_CONTRACT: .github/benchmark/pr5090-router-ab/contract.json
         ATOMESH_M31_CONNECTOR: mooncake
-        ATOMESH_PRE_CLEAN_GPU: '0'
+        ATOMESH_PRE_CLEAN_GPU: '1'
         ATOMESH_PRE_CLEAN_ALL: '0'
         ATOMESH_PRE_CLEAN_CELL_PREFIX: ''
         ATOMESH_DECODE_START_STAGGER_S: '120'
