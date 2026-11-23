@@ -1238,6 +1238,7 @@ mod h_prepare_chat_generate {
     use crate::routers::prepare::response_context::{ProtocolRequest, ResponseContext};
     use crate::routers::prepare::{lookup_tokenizer, prepare_chat, prepare_generate};
     use crate::routers::test_mocks;
+    use crate::tokenizer::registry::TokenizerRegistry;
 
     fn chat_req(stream: bool) -> Arc<ChatCompletionRequest> {
         Arc::new(ChatCompletionRequest {
@@ -1469,18 +1470,75 @@ mod h_prepare_chat_generate {
     #[test]
     fn test_lookup_tokenizer_returns_arc_for_known_model() {
         let registry = test_mocks::tokenizer_registry_with("m");
-        let tok = lookup_tokenizer("m", &registry).expect("known model");
-        let tok2 = lookup_tokenizer("m", &registry).unwrap();
+        let components = test_mocks::app_context_with_tokenizer_registry(registry);
+        let tok = lookup_tokenizer("m", &components).expect("known model");
+        let tok2 = lookup_tokenizer("m", &components).unwrap();
         assert!(Arc::ptr_eq(&tok, &tok2));
     }
 
     #[test]
     fn test_lookup_tokenizer_unknown_model_returns_err() {
         let registry = test_mocks::tokenizer_registry_with("m");
-        let err = lookup_tokenizer("no-such-model", &registry)
+        let components = test_mocks::app_context_with_tokenizer_registry(registry);
+        let err = lookup_tokenizer("no-such-model", &components)
             .err()
             .expect("unknown model must be Err");
         assert!(!err.status().is_success());
+    }
+
+    /// A lookup between a replacement's removal of the old tokenizer and its insert
+    /// of the new one gets the old one, then the new one once it is in.
+    #[test]
+    fn test_lookup_during_a_tokenizer_swap_finds_a_tokenizer() {
+        let registry = test_mocks::tokenizer_registry_with("m");
+        let components = test_mocks::app_context_with_tokenizer_registry(registry.clone());
+        let old = registry.get_by_name("m").unwrap();
+        components
+            .tokenizers_replaced
+            .insert("m".into(), old.clone());
+        registry.remove_by_id(&old.id).unwrap();
+        let found = lookup_tokenizer("m", &components).expect("the lookup missed the swap");
+        assert!(Arc::ptr_eq(&found, &old.tokenizer));
+
+        let replacement = test_mocks::tokenizer();
+        let inserted = replacement.clone();
+        let id = TokenizerRegistry::generate_id();
+        let insert = registry.load(&id, "m", "mock", || async { Ok(inserted) });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(insert).unwrap();
+        let found = lookup_tokenizer("m", &components).unwrap();
+        assert!(Arc::ptr_eq(&found, &replacement));
+    }
+
+    /// A chat for an ATOM model whose tokenizer renders with a built-in encoder is
+    /// refused during a swap of that tokenizer too.
+    #[test]
+    fn test_a_chat_during_a_swap_reads_the_replaced_tokenizers_encoder() {
+        use crate::core::{BasicWorkerBuilder, RuntimeType};
+
+        let registry = test_mocks::tokenizer_registry_with("m");
+        let components = test_mocks::app_context_with_tokenizer_registry(registry.clone());
+        let worker = BasicWorkerBuilder::new("grpc://atom:1")
+            .runtime_type(RuntimeType::Atom)
+            .model_id("m")
+            .label("chat_template", "{{ messages }}")
+            .build();
+        components.worker_registry.register(Arc::new(worker));
+        let old = registry.get_by_name("m").unwrap();
+        components
+            .chats_without_template
+            .write()
+            .insert(old.id.clone());
+        components
+            .tokenizers_replaced
+            .insert("m".into(), old.clone());
+        registry.remove_by_id(&old.id).unwrap();
+
+        let refused = prepare_chat(chat_req(false), None, Some("m".into()), &components);
+        let status = refused.err().expect("a chat it cannot render").status();
+        assert_eq!(status, axum::http::StatusCode::NOT_IMPLEMENTED);
     }
 
     #[test]

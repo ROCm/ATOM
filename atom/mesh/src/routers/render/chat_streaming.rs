@@ -58,7 +58,11 @@ pub fn process(stream: TokenHandle, ctx: ResponseContext, backend_label: &'stati
     let cfg = ChatStreamConfig { backend_label };
 
     tokio::spawn(async move {
-        let result = run_chat_stream(stream, ctx, chat_request, cfg, &tx).await;
+        let result = tokio::select! {
+            result = run_chat_stream(stream, ctx, chat_request, cfg, &tx) => result,
+            // The client left: dropping the stream ends its call and frees its loads.
+            _ = tx.closed() => return,
+        };
         if let Err(e) = result {
             let payload = json!({"error": {"message": e, "type": "internal_error"}});
             let _ = tx.send(Ok(Bytes::from(format!("data: {}\n\n", payload))));

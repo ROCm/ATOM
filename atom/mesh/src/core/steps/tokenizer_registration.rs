@@ -183,23 +183,41 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
             .clone();
         let _reconciling = reconciling.lock().await;
         let mut result = registry.load(&id, &name, &source, &loader).await;
-        // Loaded before with another template (a replaced worker's, or none): load again.
-        if let (Ok(LoadOutcome::AlreadyExists { id: loaded }), Some(template)) =
-            (&result, &inline_template)
-        {
-            if app_context.tokenizer_inline_templates.read().get(loaded) != Some(template) {
-                info!("Tokenizer '{name}' is loaded again with its worker's chat template");
+        // Loaded before with another template (a replaced worker's, or none), or with a
+        // worker's where this registration names a template file: load again.
+        if let Ok(LoadOutcome::AlreadyExists { id: loaded }) = &result {
+            let recorded = app_context
+                .tokenizer_inline_templates
+                .read()
+                .get(loaded)
+                .cloned();
+            let replaced = match (&inline_template, &chat_template) {
+                (Some(template), _) => recorded.as_ref() != Some(template),
+                (None, Some(_)) => recorded.is_some(),
+                (None, None) => false,
+            };
+            if replaced {
+                info!("Tokenizer '{name}' is loaded again with this registration's chat template");
                 // Loaded first, so a failed load keeps the old one.
                 let replacement = loader().await;
                 result = match replacement {
                     Ok(tokenizer) => {
-                        if let Some(entry) = registry.remove_by_id(loaded) {
+                        // Lookups read the replaced entry until the new one is in.
+                        let replaced = registry.get_by_id(loaded);
+                        let swapping = &app_context.tokenizers_replaced;
+                        if let Some(entry) = &replaced {
+                            swapping.insert(name.clone(), entry.clone());
+                        }
+                        registry.remove_by_id(loaded);
+                        let swapped = registry
+                            .load(&id, &name, &source, || async { Ok(tokenizer) })
+                            .await;
+                        swapping.remove(&name);
+                        if let Some(entry) = replaced {
                             crate::routers::prepare::thread_tokenizer::release_copies(&entry.id);
                             app_context.forget_tokenizer(&entry.id);
                         }
-                        registry
-                            .load(&id, &name, &source, || async { Ok(tokenizer) })
-                            .await
+                        swapped
                     }
                     Err(e) => Err(LoadError::LoadFailed(e)),
                 };
@@ -499,6 +517,51 @@ mod tests {
         assert_eq!(rendered(), "first: hi");
         register("second: {{ messages[0].content }}").await.unwrap();
         assert_eq!(rendered(), "second: hi");
+    }
+
+    /// A registration naming a template file replaces a tokenizer loaded with a
+    /// worker's inline template, once: the file's tokenizer then stays.
+    #[tokio::test]
+    async fn test_a_template_file_replaces_a_workers_inline_template() {
+        let context = app_context();
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("template.jinja");
+        std::fs::write(&file, "file: {{ messages[0].content }}").unwrap();
+        let register = |inline: Option<&str>, path: Option<&str>| {
+            let config = TokenizerConfigRequest {
+                id: TokenizerRegistry::generate_id(),
+                name: "m".to_string(),
+                source: hf_tokenizer_path().to_string(),
+                chat_template_path: path.map(str::to_string),
+                inline_chat_template: inline.map(str::to_string),
+                cache_config: None,
+                fail_on_duplicate: false,
+            };
+            let data = create_tokenizer_workflow_data(config, context.clone());
+            async move {
+                let mut workflow = WorkflowContext::new(WorkflowInstanceId::new(), data);
+                LoadTokenizerStep.execute(&mut workflow).await
+            }
+        };
+        let loaded = || context.tokenizer_registry.get_by_name("m").unwrap();
+        let rendered = || {
+            let hi = json!({"role": "user", "content": "hi"});
+            (loaded().tokenizer)
+                .apply_chat_template(&[hi], ChatTemplateParams::default())
+                .unwrap()
+        };
+        register(Some("inline: {{ messages[0].content }}"), None)
+            .await
+            .unwrap();
+        assert_eq!(rendered(), "inline: hi");
+        let path = file.to_str();
+        register(None, path).await.unwrap();
+        assert_eq!(rendered(), "file: hi");
+        let file_loaded = loaded().id;
+        register(None, path).await.unwrap();
+        assert_eq!(loaded().id, file_loaded);
+        assert!(context.tokenizer_inline_templates.read().is_empty());
+        assert!(context.tokenizers_replaced.is_empty());
     }
 
     /// Overlapping registrations with other templates replace the tokenizer one at a
