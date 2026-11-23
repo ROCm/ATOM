@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795438573402,
+  "lastUpdate": 1795455441972,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -5314,6 +5314,46 @@ window.BENCHMARK_DATA = {
             "value": 0.8969,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/45153588657 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611221510 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1554 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "qichu-yun",
+            "username": "qichu-yun",
+            "email": "qichu@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "de8d9d406ec8a0f64919186ec9d66430525b360a",
+          "message": "feat(kimi-k3): fold the E8M0 per-1x128 q_b_proj quant into the MLA q/kv norm (#3402)\n\n* Kimi-K3: fold the E8M0 per-1x128 q_b_proj quant into the MLA q/kv norm\n\nUnder E8M0 block scales the MLA q_a/kv_a norm stood down to bf16 and\nq_b_proj quantized q in a second kernel. When aiter's fused_qk_rmsnorm\nemits E8M0 scales (FUSED_QK_RMSNORM_SUPPORTS_E8M0_GROUP_SCALE), the norm\nnow writes the fp8 q and its E8M0 scale directly; an older aiter keeps\nthe two-kernel path.\n\n* Kimi-K3 MLA E8M0: declare _fused_rms_fp8_quant functional for torch.compile\n\nWith an E8M0 scale among its outputs, the default \"unknown\" mutation wrapped\nit in an auto_functionalized_v2 that Inductor cannot remove (\"was not\nremoved\"), so the compiled model failed to build. The op writes only tensors\nit allocates: mutates_args=[]. The new test compiles the call.\n\n* Kimi-K3 DSpark: emit the E8M0 q_b_proj input from the draft's MLA q/kv norm\n\nThe draft's MLA q/kv norm fused q_b_proj's per-1x128 quant with FP32 scales\neven when q_b_proj runs E8M0 block scales (online per_block_fp8 with\nATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE=1), so every draft step ran an extra FP32\ncopy kernel and the FP32-scale blockscale GEMM. It now emits E8M0 scales as\nthe target's MLA does, and q_b_proj runs the E8M0 GEMM directly.\n\n* Kimi-K3 MLA E8M0: call the E8M0 norm directly; test the norms against torch\n\naiter#8017 selects E8M0 from the scale tensor's dtype and has no capability\nflag, so the MLA q/kv norm passes e8m0_scale whenever q_b_proj runs E8M0 block\nscales; the getattr probe and the bare `import aiter` go. The test skips only\nwithout aiter or a GPU, and also checks the q and kv norms within one bf16 ulp\nof torch's rms_norm and of the unfused bf16 norm. _is_e8m0_blockscale's\ndocstring no longer says the q/kv norm stands down.",
+          "timestamp": "2026-11-23T16:54:18Z",
+          "url": "https://github.com/ROCm/ATOM/commit/de8d9d406ec8a0f64919186ec9d66430525b360a"
+        },
+        "date": 1795455441281,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9492,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/45213718956 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202611221510 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9462 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8916,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/45213718956 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611221510 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1956 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b-1p1d accuracy (GSM8K)",
+            "value": 0.887,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/45213718956 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611221510 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1448 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
