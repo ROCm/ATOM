@@ -414,6 +414,40 @@ def test_runner_reader_never_starts_past_the_longest_prompt(monkeypatch):
     assert built == [(120, 120)]
 
 
+@pytest.mark.parametrize(
+    "local, others, expect_rows",
+    [(True, True, True), (True, False, False), (False, True, False)],
+)
+def test_ranks_take_e_rows_only_when_every_read_succeeded(
+    monkeypatch, local, others, expect_rows
+):
+    rows = torch.ones(2, 3)
+    agreed = []
+
+    class FakeReader:
+        def read(self, *_args):
+            return rows if local else None
+
+    runner = SimpleNamespace(ec_reader=FakeReader())
+    with atom_without_aiter() as load:
+        model_runner = load("atom.model_engine.model_runner")
+        monkeypatch.setattr(model_runner, "_forward_cpu_groups", lambda: ("tp", "pcp"))
+
+        def group_agree(ok, group):
+            agreed.append((ok, group))
+            return ok and others
+
+        monkeypatch.setattr(model_runner, "group_agree", group_agree)
+        got = model_runner.ModelRunner.read_image_embeddings(
+            runner, EC_PARAMS, 9, torch.bfloat16
+        )
+
+    assert (got is rows) == expect_rows and (got is None) != expect_rows
+    # One verdict per group, the rank's own read first.
+    assert [group for _, group in agreed] == ["tp", "pcp"]
+    assert agreed[0][0] == local
+
+
 @pytest.mark.parametrize("ec_params", [None, EC_PARAMS])
 def test_chat_request_puts_ec_params_into_multimodal_data(monkeypatch, ec_params):
     import asyncio
