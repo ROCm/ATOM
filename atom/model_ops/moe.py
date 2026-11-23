@@ -6050,16 +6050,26 @@ class FusedMoE(torch.nn.Module):
         shared_ready: torch.cuda.Event | None = None,
         mxfp8_copy_out: tuple[torch.Tensor, torch.Tensor] | None = None,
         routing: tuple[torch.Tensor, torch.Tensor] | None = None,
+        x_scale: torch.Tensor | None = None,
     ):
         """`shared_add` / `shared_ready`: see `forward_maybe_comm_fused`.
         `mxfp8_copy_out`: also write `hidden_states` as `quantize_fp8` would
         (see `forward_with_mxfp8_copy`). `routing`: the `(topk_weights,
         topk_ids)` `select_experts` would return, already computed (the fused
-        router, `forward_impl_fused_router`); `router_logits` is then unused."""
+        router, `forward_impl_fused_router`); `router_logits` is then unused.
+        `x_scale` (with `routing`): `hidden_states` are already the experts'
+        quantized activations with these scales (the quant method's
+        `routed_rows_wire`), e.g. the MXFP4 A1 a sequence-parallel AR's owners
+        wrote; the experts skip their own quant."""
         assert self.quant_method is not None
         assert routing is None or (
             self.sp_mega_moe is None and get_dp_group().world_size == 1
         ), "precomputed routing takes the local (DP 1, no SP mega) path only"
+        assert x_scale is None or (
+            routing is not None
+            and mxfp8_copy_out is None
+            and self.moe_parallel_config.dp_logical_ratio == 1
+        ), "prequantized rows take precomputed routing on the local TP path only"
 
         # Decided here, at run time: the row count is symbolic while compiling.
         if self.sp_mega_moe is not None and self.sp_mega_moe.runs(
@@ -6103,6 +6113,7 @@ class FusedMoE(torch.nn.Module):
             hidden_states,
             topk_weights,
             topk_ids,
+            x_scale=x_scale,
             gathered=dp_repeat > 1,
             shared_add=shared_add,
             shared_ready=shared_ready,

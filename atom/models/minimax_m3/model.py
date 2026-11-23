@@ -12,6 +12,7 @@ from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
 )
 from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon_supports_arch
 from aiter.rotary_embedding import get_rope
@@ -81,6 +82,7 @@ from atom.models.utils import (
 )
 from atom.quant_spec import effective_layer_quant
 from atom.utils import envs
+from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import support_torch_compile
 from atom.utils.region_graph import token_graph
 
@@ -376,6 +378,14 @@ def _shared_fold_weights_of(mlp: "MiniMaxM3MLP") -> dict | None:
     return _prepare_shared_fold_weights(w13, s13, w2, s2)
 
 
+def _sp_moe_front_supported() -> bool:
+    """aiter's ar2s MoE-front mode exists (ROCm/aiter#8455): the owner rows'
+    MXFP8 / MXFP4 MoE inputs from the sequence-parallel AR."""
+    from aiter.dist.device_communicators.communicator_cuda import CudaCommunicator
+
+    return hasattr(CudaCommunicator, "sp_fused_allreduce_rmsnorm_moe_front")
+
+
 class MiniMaxM3MoE(nn.Module):
     """MiniMax-M3 routed MoE for MXFP4 checkpoints."""
 
@@ -516,6 +526,29 @@ class MiniMaxM3MoE(nn.Module):
             ):
                 self._use_dual_stream = True
                 atom_config.compilation_config.static_forward_context[prefix] = self
+        # The MoE front on the rows this rank owns after the post-attention
+        # reduce-scatter, see sp_front_forward. The layer takes it on its
+        # sequence-parallel path only (_forward_sp_ar); whether a call is in the
+        # sequence-parallel range is decided per call, from shapes.
+        experts = self.experts
+        self.sp_front = False
+        if (
+            _sp_moe_front_supported()
+            and self.shared_experts is not None
+            and not self.fuse_shared_experts
+            and isinstance(experts.quant_method, Mxfp4MoEMethod)
+            and experts.scoring_func == "sigmoid"
+            and not experts.use_grouped_topk
+            and experts.custom_routing_function is None
+            and experts.num_fused_shared_experts == 0
+            and experts.balance_router_logits is None
+            and experts.dp_size == 1
+        ):
+            self.sp_front = True
+            get_current_atom_config().compilation_config.static_forward_context[
+                prefix
+            ] = self
+        self._sp_front_quant = None  # its consumers, checked once loaded
 
     def process_weights_after_loading(self) -> None:
         # Parent-first: the shared linears are normally still unshuffled here.
@@ -649,6 +682,158 @@ class MiniMaxM3MoE(nn.Module):
         if self._use_dual_stream:
             return torch.ops.aiter.maybe_dual_stream_forward(hidden_states, self.prefix)
         return self.single_stream_moe_forward(hidden_states)
+
+    # ---- the MoE front on the sequence-parallel owner rows ----
+    def _sp_front_quant_ok(self) -> bool:
+        """The consumers take the AR's quantized rows: the shared gate_up a native
+        MXFP8 (row-major E8M0) linear, the routed experts aiter's grouped fused_moe."""
+        if self._sp_front_quant is None:
+            qm = self.experts.quant_method
+            self._sp_front_quant = bool(
+                _linear_consumes_mxfp8(self.shared_experts.gate_up_proj)
+                and getattr(qm, "fused_experts", None) is None
+                and not getattr(qm, "use_triton", False)
+                and not getattr(qm, "use_triton_ep", False)
+            )
+        return self._sp_front_quant
+
+    def _sp_route(
+        self, own_rows: list[torch.Tensor], rows: int, hidden: int, ca
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """`select_experts(x, gate(x))` of every row, (topk_weights fp32, topk_ids int32)
+        [rows, top_k] on every rank, from `own_rows[i]`: this rank's normalized rows of ar2s
+        launch i (`ar2s_sp_own_rows`). Each rank routes its own rows -- the router GEMM with
+        the kernel the tuned table picks for the whole `rows` (aiter
+        `gemm_a16w16_rows_of`), so the logits are the replicated GEMM's -- and one all-gather
+        a launch hands every rank the routes."""
+        from aiter import topk_gating
+        from aiter.tuned_gemm import gemm_a16w16_rows_of
+
+        from atom.utils.forward_context import pass_scheduled_tokens_gpu
+
+        experts = self.experts
+        top_k = experts.top_k
+        world = ca.world_size
+        launches = ca.ar2s_launch_rows(rows, hidden)
+        # rows past the pass's real count route to -1 (as select_experts' topk_gating does)
+        num_valid = pass_scheduled_tokens_gpu(rows)
+        parts = []
+        for (s, e), x in zip(launches, own_rows):
+            chunk = -(-(e - s) // world)
+            first = s + ca.rank * chunk
+            m = x.shape[0]
+            # ids then weights a row: one gather moves both
+            send = torch.empty((chunk, 2 * top_k), dtype=torch.int32, device=x.device)
+            if m:
+                nv = (
+                    None
+                    if num_valid is None
+                    else (num_valid.reshape(-1)[:1] - first)
+                    .clamp_(0, m)
+                    .to(torch.int32)
+                )
+                logits = gemm_a16w16_rows_of(
+                    x, self.gate.weight, rows, otype=dtypes.bf16
+                )
+                topk_gating(
+                    send[:m, top_k:].view(torch.float32),
+                    send[:m, :top_k],
+                    logits,
+                    experts.e_score_correction_bias,
+                    experts.renormalize,
+                    1.0,
+                    score_func=experts.scoring_func,
+                    num_valid_rows=nv,
+                )
+            parts.append(send)
+        gathered = ca.ar2s_sp_gather_rows(parts, rows, hidden)
+        both = gathered.view(rows, 2, top_k).transpose(0, 1).contiguous()
+        return both[1].view(torch.float32), both[0]
+
+    def sp_front_forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The layer's post-attention AR + Gemma RMSNorm and this MoE, on a sequence-parallel
+        residual: (MoE output, residual_out) from the TP-partial attention output, the bytes
+        of `sp_fused_allreduce_gemma_rms_norm` followed by `forward`.
+
+        In the sequence-parallel range each rank routes only the rows it owns after the
+        reduce-scatter (`_sp_route`), and the AR's owners also quantize their rows to the shared expert's MXFP8 and the routed experts' MXFP4 A1
+        (aiter `sp_fused_allreduce_rmsnorm_moe_front`), which the all-gather carries in place
+        of the bf16 rows; the experts then skip both quants. Below it, the replicated path.
+        """
+        comm = get_tp_group().device_communicator
+        rows, hidden = hidden_states.shape
+        if not (
+            self._sp_front_quant_ok()
+            and comm.sp_moe_front_eligible(hidden_states, norm_weight)
+        ):
+            normed, residual = comm.sp_fused_allreduce_rmsnorm(
+                hidden_states, residual, norm_weight, eps, True
+            )
+            return self.forward(normed), residual
+        ca = comm.ca_comm
+        x_own, residual, q8, s8, q4, s4 = comm.sp_fused_allreduce_rmsnorm_moe_front(
+            hidden_states, residual, norm_weight, eps, True
+        )
+        own_rows, off = [], 0
+        for s, e in ca.ar2s_launch_rows(rows, hidden):
+            chunk = -(-(e - s) // ca.world_size)
+            first = s + ca.rank * chunk
+            m = max(0, min(e, first + chunk) - first)
+            own_rows.append(x_own[off : off + m])
+            off += m
+        routing = self._sp_route(own_rows, rows, hidden, ca)
+        shared_output = self.shared_experts(q8, x_scale=s8)
+        x, x_scale = q4.view(dtypes.fp4x2), s4
+        if self._glue_epilogue is not None:
+            with self._glue_epilogue(shared_output, self._routed_scale()) as epilogue:
+                routed_output = self.experts.forward_impl(
+                    x, None, routing=routing, x_scale=x_scale
+                )
+            if epilogue.consumed:
+                return routed_output, residual
+        else:
+            routed_output = self.experts.forward_impl(
+                x, None, routing=routing, x_scale=x_scale
+            )
+        return self._scale_routed(routed_output) + shared_output, residual
+
+
+def minimax_m3_sp_moe_front(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`MiniMaxM3MoE.sp_front_forward` of the MoE `layer_name`, eager."""
+    moe = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    return moe.sp_front_forward(hidden_states, residual, norm_weight, eps)
+
+
+def _minimax_m3_sp_moe_front_fake(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(hidden_states), torch.empty_like(residual)
+
+
+direct_register_custom_op(
+    op_name="minimax_m3_sp_moe_front",
+    op_func=minimax_m3_sp_moe_front,
+    mutates_args=(),
+    fake_impl=_minimax_m3_sp_moe_front_fake,
+)
 
 
 class MiniMaxM3Attention(nn.Module):
@@ -1088,6 +1273,16 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 )
             )
             return self.mlp(hidden_states, x_scale=hidden_states_scale), residual
+        if self.is_moe_layer and self.block_sparse_moe.sp_front:
+            # The AR + norm and the MoE in one op, whose front runs on the rows this
+            # rank owns (MiniMaxM3MoE.sp_front_forward)
+            return torch.ops.aiter.minimax_m3_sp_moe_front(
+                hidden_states.contiguous(),
+                residual,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.variance_epsilon,
+                self.block_sparse_moe.prefix,
+            )
         hidden_states, residual = sp_fused_allreduce_gemma_rms_norm(
             hidden_states, residual, self.post_attention_layernorm
         )
