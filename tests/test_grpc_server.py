@@ -17,6 +17,7 @@ import pytest
 
 from atom.entrypoints.grpc import atom_grpc_pb2 as pb
 from atom.entrypoints.grpc import atom_grpc_pb2_grpc as pb_grpc
+from atom.entrypoints.grpc import frames
 from atom.entrypoints.grpc import server as grpc_server
 from atom.entrypoints.grpc.server import AtomEngineServicer
 from atom.entrypoints.openai import api_server
@@ -24,6 +25,7 @@ from atom.entrypoints.openai.protocol import DEFAULT_MAX_TOKENS
 from atom.entrypoints.openai.reasoning_dialects import FALLBACK_DIALECT
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.zmq_protocol import engine_v1_pb2 as v1
+from atom.sampling_params import SamplingParams
 
 
 class FakeEngine:
@@ -53,7 +55,7 @@ class FakeEngine:
         self.preprocessed.append((prompt, params, kwargs))
         self.release.wait(10)
         seq = SimpleNamespace(
-            id=next(self.ids),
+            id=kwargs.get("seq_id") or next(self.ids),
             num_prompt_tokens=len(prompt),
             max_tokens=params.max_tokens,
             callback=stream_callback,
@@ -244,6 +246,59 @@ def test_request_log_records_the_request_and_each_answer(serve, monkeypatch):
     assert entries[-1]["data"]["complete"]["finish_reason"] == "eos"
 
 
+def _envelope(message) -> v1.Envelope:
+    return v1.Envelope.FromString(message[0])
+
+
+def _submit(prompt=(1, 2), **sampling):
+    return frames.SubmitRequest(
+        seq_id=1,
+        prompt_token_ids=list(prompt),
+        sampling_params=SamplingParams(**sampling),
+    )
+
+
+def test_the_session_refuses_logprobs_it_would_not_serve(serve):
+    engine = FakeEngine()
+    servicer = serve(engine)
+    session = servicer.sessions.open()
+    with pytest.raises(ValueError, match="logprobs"):
+        asyncio.run(servicer._submit(session, _submit(logprobs=True)))
+    assert engine.preprocessed == []
+
+
+def test_a_session_grammar_failure_is_rejected_as_internal(serve):
+    engine = FakeEngine()
+    session = serve(engine).sessions.open()
+    seq = SimpleNamespace(id=session.base | 1, num_prompt_tokens=2, arrive_time=0.0)
+    engine.io_processor.requests[seq.id] = seq
+    session.add(1, seq, "r")
+    session.put(RequestOutput(seq.id, [], True, "structured_output_error"))
+    session.flush()
+    rejected = _envelope(session.outbox.get_nowait()).rejected.items
+    assert [(r.seq_id, r.code) for r in rejected] == [(1, v1.RejectedRequest.INTERNAL)]
+    assert session.outbox.empty() and engine.io_processor.requests == {}
+
+
+def test_a_session_ended_during_preprocess_leaves_no_seq(serve):
+    engine = FakeEngine()
+    engine.release.clear()
+    servicer = serve(engine)
+    session = servicer.sessions.open()
+
+    async def end_while_preprocessing():
+        submit = asyncio.create_task(servicer._submit(session, _submit()))
+        await _until(lambda: engine.preprocessed)
+        submit.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await submit
+        engine.release.set()
+        await _until(lambda: engine.made and not engine.io_processor.requests)
+
+    asyncio.run(end_while_preprocessing())
+    assert engine.submitted == [] and session.requests == {}
+
+
 def test_abort_during_preprocess_keeps_the_request_out_of_the_engine(serve):
     engine = FakeEngine([([5], "eos")])
     engine.release.clear()
@@ -420,19 +475,22 @@ def test_a_step_ending_as_the_listener_starts_reaches_its_call(monkeypatch):
     async def listen(address, servicer, listening):
         try:  # a call's last output, buffered and flushed on this thread
             queue = asyncio.Queue()
-            servicer.steps.callback(queue)(RequestOutput(1, [5], True, "eos"))
+            servicer.steps.callback(queue.put_nowait)(
+                RequestOutput(1, [5], True, "eos")
+            )
             core_mgr._flush_stream_batch_fn()
             delivered.append(await asyncio.wait_for(queue.get(), 1))
         finally:
             listening.set_result((asyncio.get_running_loop(), None))
 
     monkeypatch.setattr(grpc_server, "_serve", listen)
+    monkeypatch.setattr(grpc_server.Sequence, "counter", grpc_server.Sequence.counter)
     args = Namespace(host="127.0.0.1", grpc_port=1, model="m")
     grpc_server.start_grpc_server(api, args)
     assert [output.finish_reason for output in delivered] == ["eos"]
 
 
-def _listen(serve, engine):
+def _listen(serve, monkeypatch, engine):
     """`engine` behind a listening gRPC server: its stop and a channel to it."""
     serve(engine)  # api_server's engine; start_grpc_server makes its own servicer
     engine.core_mgr._flush_stream_batch_fn = None
@@ -440,13 +498,14 @@ def _listen(serve, engine):
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
+    monkeypatch.setattr(grpc_server.Sequence, "counter", grpc_server.Sequence.counter)
     args = Namespace(host="127.0.0.1", grpc_port=port, model="m")
     stop = grpc_server.start_grpc_server(api_server, args)
     return stop, grpc.insecure_channel(f"127.0.0.1:{port}")
 
 
-def test_a_generate_past_4_mib_is_admitted(serve):
-    stop, channel = _listen(serve, FakeEngine([([5], "eos")]))
+def test_a_generate_past_4_mib_is_admitted(serve, monkeypatch):
+    stop, channel = _listen(serve, monkeypatch, FakeEngine([([5], "eos")]))
     prompt = [1 << 28] * 900_000  # 5 bytes apiece: 4.5 MB
     request = pb.GenerateRequest(request_id="r", prompt_token_ids=prompt)
     assert request.ByteSize() > 4 << 20
@@ -459,9 +518,9 @@ def test_a_generate_past_4_mib_is_admitted(serve):
         stop()
 
 
-def test_shutdown_ends_running_calls_before_it_returns(serve):
+def test_shutdown_ends_running_calls_before_it_returns(serve, monkeypatch):
     engine = FakeEngine([([5], None)])  # the seq runs on after its first step
-    stop, channel = _listen(serve, engine)
+    stop, channel = _listen(serve, monkeypatch, engine)
     request = pb.GenerateRequest(request_id="r", prompt_token_ids=[1], stream=True)
     stub = pb_grpc.AtomEngineStub(channel)
     streaming = stub.Generate(request, timeout=10)
@@ -487,7 +546,7 @@ def test_a_step_flushed_after_the_server_stopped_is_dropped():
     steps = grpc_server.StepOutputs()
 
     async def buffer():
-        steps.callback(asyncio.Queue())(RequestOutput(1, [5], True, "eos"))
+        steps.callback(asyncio.Queue().put_nowait)(RequestOutput(1, [5], True, "eos"))
 
     asyncio.run(buffer())  # its loop is closed once this returns
     steps.flush()

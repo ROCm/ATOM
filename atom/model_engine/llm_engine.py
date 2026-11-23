@@ -12,6 +12,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
+from atom.model_engine.prefix_block_hashes import TokenPrefixChains
 from atom.model_engine.prefix_hash import hash_block_size_for, ship_prompt_hash_chain
 from atom.model_engine.segment_tokenizer import PrefixEncoding, SegmentTokenizer
 from atom.model_engine.sequence import Sequence
@@ -450,9 +451,12 @@ class LLMEngine:
             return num / den if den else 0.0
 
         compressed = totals["compressed_tokens"]
+        chains = self.io_processor.token_prefix_chains
         return {
             "enabled": bool(rank_stats),
             **totals,
+            # This frontend's chain work for token-id prompts, not summed over ranks.
+            "token_prefix_chains": None if chains is None else chains.stats(),
             "hit": rate(totals["cached_tokens"]),
             "compressed_hit": rate(compressed),
             "lost_to_checkpoint": rate(
@@ -665,6 +669,7 @@ class LLMEngine:
 class InputOutputProcessor:
     # Class default: a processor built without `__init__` ships nothing.
     prefix_hash_block_size = 0
+    token_prefix_chains: TokenPrefixChains | None = None
 
     def __init__(self, config, tokenizer, block_size):
         self.config = config
@@ -706,6 +711,11 @@ class InputOutputProcessor:
             self.prefix_hash_block_size = hash_block_size_for(
                 block_size, config.decode_context_parallel_size
             )
+            self.token_prefix_chains = TokenPrefixChains(
+                envs.ATOM_TOKENIZE_CACHE_MB << 20,
+                self.prefix_hash_block_size,
+                self._reuse_block_hashes,
+            )
 
     @staticmethod
     def _per_req_cache_model_types() -> frozenset[str]:
@@ -742,6 +752,7 @@ class InputOutputProcessor:
         dp_session_id: str | None = None,
         dp_parent_session_id: str | None = None,
         stop_token_sequences: list[list[int]] | None = None,
+        seq_id: int | None = None,
     ):
         """responsible for:
         1) Tokenize
@@ -750,6 +761,7 @@ class InputOutputProcessor:
         Single-sequence entry point. Rejects ``sampling_params.n > 1`` so that
         callers which expect exactly one ``Sequence`` back cannot silently
         drop the other siblings. Use :meth:`preprocess_fanout` for n > 1.
+        ``seq_id`` is the sequence's id when the caller assigns it.
         """
         if getattr(sampling_params, "n", 1) > 1:
             raise ValueError(
@@ -767,6 +779,7 @@ class InputOutputProcessor:
             dp_session_id=dp_session_id,
             dp_parent_session_id=dp_parent_session_id,
             stop_token_sequences=stop_token_sequences,
+            seq_ids=None if seq_id is None else [seq_id],
         )
         return seqs[0]
 
@@ -828,6 +841,7 @@ class InputOutputProcessor:
         dp_session_id: str | None = None,
         dp_parent_session_id: str | None = None,
         stop_token_sequences: list[list[int]] | None = None,
+        seq_ids: list[int] | None = None,
     ) -> list[Sequence]:
         """Tokenize once and materialize ``sampling_params.n`` Sequences.
 
@@ -844,6 +858,7 @@ class InputOutputProcessor:
         * Per-sibling ``stream_callbacks`` can be supplied to route streaming
           deltas to independent queues (one per choice index). Falls back to
           the scalar ``stream_callback`` for every sibling.
+        * ``seq_ids``, when given, are the siblings' ids, one each.
         """
         sampling_params.validate_logprob_options(
             self.config,
@@ -858,8 +873,12 @@ class InputOutputProcessor:
                 )
             if self.structured_admission is None:
                 raise ValueError("Structured output requires engine admission")
+            checked = sampling_params  # stop ids, given for stop strings, count as them
+            if any(stop_token_sequences or ()):
+                stops = [str(ids) for ids in stop_token_sequences]
+                checked = replace(sampling_params, stop_strings=stops)
             self.structured_admission(
-                sampling_params, kv_transfer_params, multimodal_data is not None
+                checked, kv_transfer_params, multimodal_data is not None
             )
         request_validator = getattr(self.config.hf_config, "validate_request", None)
         if request_validator is not None:
@@ -869,6 +888,9 @@ class InputOutputProcessor:
                 enable_dp_attention=self.config.enable_dp_attention,
             )
         n = max(1, int(getattr(sampling_params, "n", 1)))
+        token_prompt = multimodal_data is None and not isinstance(
+            prompt_or_tokens, (str, PrefixEncoding)
+        )
 
         if isinstance(prompt_or_tokens, str):
             prompt_or_tokens = self.encode_prompt(
@@ -908,6 +930,8 @@ class InputOutputProcessor:
             raise ValueError(
                 f"stream_callbacks length {len(stream_callbacks)} does not match n={n}"
             )
+        if seq_ids is not None and len(seq_ids) != n:
+            raise ValueError(f"seq_ids length {len(seq_ids)} does not match n={n}")
 
         seqs: list[Sequence] = []
         for i in range(n):
@@ -920,6 +944,7 @@ class InputOutputProcessor:
                 sampling_params,
                 stop_token_sequences,
                 stream_callback=cb,
+                id=None if seq_ids is None else seq_ids[i],
                 num_draft_tokens=self.num_speculative_tokens,
                 has_per_req_cache=self.has_per_req_cache,
                 kv_transfer_params=kv_transfer_params,
@@ -946,12 +971,14 @@ class InputOutputProcessor:
         # Runs in an executor or submit thread, not the event loop. Siblings
         # share a prompt and seed, so one chain serves them all.
         if self.prefix_hash_block_size:
+            block_hashes = (
+                None if prefix_encoding is None else prefix_encoding.block_hashes
+            )
+            chains = self.token_prefix_chains
+            if token_prompt and chains is not None and envs.ATOM_FRONTEND_PREFIX_HASH:
+                block_hashes = chains.block_hashes(seqs[0].token_ids)
             ship_prompt_hash_chain(
-                seqs[0],
-                self.prefix_hash_block_size,
-                block_hashes=(
-                    None if prefix_encoding is None else prefix_encoding.block_hashes
-                ),
+                seqs[0], self.prefix_hash_block_size, block_hashes=block_hashes
             )
             for seq in seqs[1:]:
                 seq.prompt_hash_chain = seqs[0].prompt_hash_chain
