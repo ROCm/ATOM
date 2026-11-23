@@ -222,20 +222,19 @@ Every concurrency runs:
   - no `--online_quant_config`, so attention and the dense MLPs stay MXFP8;
   - the MXFP8 shared expert stays its own MLP (`ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4` unset);
   - no quick-allreduce quantization (`AITER_QUICK_REDUCE_QUANTIZATION` unset).
-- **The DSpark draft's KV in a pool of its own.** Up to CONC 32 it is ATOM's default beside an NVFP4 target, BF16 (`--spec-decode-kv-cache-dtype` unset). CONC 48 sets `--spec-decode-kv-cache-dtype fp8`, as the merged vLLM and SGLang M3.1 InferenceX recipes run beside an NVFP4 target. The draft's weights stay MXFP8 either way.
+- **The DSpark draft as shipped.** Its weights stay MXFP8, and its KV, in a pool of its own, is ATOM's default beside an NVFP4 target: BF16 (`--spec-decode-kv-cache-dtype` unset). InferenceX does not allow a draft KV below the framework default, even though the vLLM and SGLang M3.1 recipes run an FP8 one.
 
 What changes with concurrency:
 
-| CONC | `--max-num-seqs` | decode | indexer CP | prefill delayer | draft KV | LMCache |
-| ---: | ---: | --- | --- | --- | --- | --- |
-| 1, 2, 4, 8 | 2 × CONC | Mono up to 16 rows | off | off | BF16 | off |
-| 16 | 32 | production | on | off | BF16 | off |
-| 32 | 64 | production | on | on, `--max-num-batched-tokens 16384` | BF16 | off |
-| 48 | 96 | production | on | off | FP8 | 200 GiB / rank, chunk 256 |
+| CONC | `--max-num-seqs` | decode | indexer CP | prefill delayer | LMCache |
+| ---: | ---: | --- | --- | --- | --- |
+| 1, 2, 4, 8 | 2 × CONC | Mono up to 16 rows | off | off | off |
+| 16 | 32 | production | on | off | off |
+| 32 | 64 | production | on | on, `--max-num-batched-tokens 16384` | off |
+| 48 | 96 | production | on | off | 200 GiB / rank, chunk 256 |
 
 - **Mono decode.** `ATOM_MONO_ENABLE` defaults to 1, so it is not set. Mono builds 8- and 16-row kernels, so it covers decode steps of one or two requests at DSpark 7 (8 rows each); wider steps run the production path. It declines indexer CP over the NVFP4 caches, so from CONC 16 every step runs the production path.
 - **Indexer CP** (`ATOM_M3_INDEXER_CP=1`) from CONC 16. Each rank logs a traceback at startup ending in `candidate mailbox: hipIpc of cached memory needs ROCm 7.14 or later`. It is not an error: CP falls back to the collective candidate exchange.
-- **FP8 draft KV** at CONC 48 shrinks a 128-token block from 1,986,560 to 1,822,720 bytes per rank, so the GPU prefix cache holds 9% more tokens. Below CONC 48 the cache is not the limit, so the default stays.
 - **Prefill delayer** at CONC 32: `ATOM_PREFILL_DECODE_INTERVAL=8 ATOM_PREFILL_DELAYER_TARGET_FILL=0.05 ATOM_PREFILL_DELAYER_STALL_TICKS=2`. After a prefill step, the next 8 scheduler passes are decode only. After that, a waiting prefill runs once the queued prompt tokens reach 5% of `--max-num-batched-tokens`, or after 2 passes with no new work and no new arrival.
 
 ```bash
@@ -250,7 +249,6 @@ SEQS=$((2 * CONC > 2 ? 2 * CONC : 2))
 CAPTURE=$(python3 -c "print([s for s in [1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128] if s<=$SEQS])")
 EXTRA_ENV=""
 BATCHED=32768
-SPEC_KV=""
 [ "$CONC" -ge 16 ] && EXTRA_ENV="ATOM_M3_INDEXER_CP=1"
 if [ "$CONC" -eq 32 ]; then
   EXTRA_ENV+=" ATOM_PREFILL_DECODE_INTERVAL=8 ATOM_PREFILL_DELAYER_TARGET_FILL=0.05 ATOM_PREFILL_DELAYER_STALL_TICKS=2"
@@ -259,7 +257,6 @@ fi
 if [ "$CONC" -ge 48 ]; then
   EXTRA_ENV+=" ATOM_KV_OFFLOAD=lmcache LMCACHE_LOCAL_CPU=True LMCACHE_NUMA_MODE=auto"
   EXTRA_ENV+=" LMCACHE_MAX_LOCAL_CPU_SIZE=200 LMCACHE_CHUNK_SIZE=256"
-  SPEC_KV="--spec-decode-kv-cache-dtype fp8"
 fi
 
 env -u AITER_QUICK_REDUCE_QUANTIZATION -u ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4 $EXTRA_ENV \
@@ -273,7 +270,7 @@ env -u AITER_QUICK_REDUCE_QUANTIZATION -u ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4 $EXT
     --enable-prefix-caching --timeout-keep-alive 1800 \
     --cudagraph-capture-sizes "$CAPTURE" \
     --method dspark --draft-model "$MODEL/dspark" --num-speculative-tokens 7 \
-    --spec-decode-acceptance-length 4.04 $SPEC_KV \
+    --spec-decode-acceptance-length 4.04 \
   > server_c${CONC}.log 2>&1 &
 ```
 
@@ -281,10 +278,10 @@ env -u AITER_QUICK_REDUCE_QUANTIZATION -u ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4 $EXT
 - `PYTHONHASHSEED=0` keeps the ranks' prefix and LMCache keys equal; without it the LMCache points never hit.
 - `ATOM_KV_OFFLOAD=lmcache` is the env form of `--kv-transfer-config '{"kv_connector":"lmcache_offload","kv_role":"offload"}'`, which the InferenceX recipe passes as `extra-kv-connectors`.
 - Check the startup lines:
-  - `block_bytes=1986560` (`1822720` at CONC 48);
+  - `block_bytes=1986560`;
   - from CONC 16, `MiniMax-M3 mono decode off: indexer context parallelism with NVFP4 caches`;
   - at CONC 32, `PrefillDelayer initialized: ... max_num_batched_tokens=16384 target_fill=0.05 ... stall_ticks=2`;
-  - at CONC 48, `LMCache M3 PAGE offload worker rank=N: page_regions=130 bytes_per_block=1822720 chunk=256`.
+  - at CONC 48, `LMCache M3 PAGE offload worker rank=N: page_regions=130 bytes_per_block=1986560 chunk=256`.
 
 Client: the InferenceX AgentX harness (`agentx-harness` 1.0.12, the version SGLang CI run 41277894342 used), which drives the same `semianalysis_cc_traces_weka_062126` replay as the aiperf command above:
 
@@ -301,18 +298,22 @@ agentx profile \
 
 ### Measured (M3.1)
 
-> **Being measured.** The 3600 s sweep of the command above on `nightly_202611200431` is running. Its rows, against SGLang CI run 41277894342, replace this note when it finishes. The earlier table measured a different command (online quantization, INT4 quick all-reduce, shared-expert fusion and #2744's NVFP4), and has been removed.
+InferenceX CI ran this configuration in [run-sweep 44987957118](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/44987957118) ([performance](https://inferencex.semianalysis.com/inference?unofficialRun=44987957118), [accuracy](https://inferencex.semianalysis.com/evaluation?unofficialRun=44987957118)); all seven points passed. Its CONC 48 point still had an FP8 draft KV; it needs a rerun with the BF16 default above.
 
-gsm8k on `nightly_202611200431`, the InferenceX CI method: its `infx/evals/gsm8k.yaml` (5-shot, chat template), temperature 0, `max_tokens` 16384, all 1319 samples, real acceptance (no `--spec-decode-acceptance-length`):
+gsm8k, the InferenceX CI method: its `infx/evals/gsm8k.yaml` (5-shot, chat template), temperature 0, `max_tokens` 16384, all 1319 samples, real acceptance (no `--spec-decode-acceptance-length`). strict-match:
 
-| config | strict-match | flexible-extract |
+| config | InferenceX CI (run 44987957118) | local, `nightly_202611200431` |
 |---|---|---|
-| CONC 32 command (indexer CP + delayer) | 0.9636 ± 0.0052 | 0.9629 ± 0.0052 |
-| CONC 48 command with BF16 draft KV (indexer CP + LMCache) | 0.9682 ± 0.0048 | 0.9674 ± 0.0049 |
-| CONC 48 command (FP8 draft KV) | being measured | |
-| SGLang CI | 0.9598 ± 0.0054 | |
+| CONC 8 command | 0.9644 | |
+| CONC 16 command (indexer CP) | 0.9682 | |
+| CONC 32 command (indexer CP + delayer) | 0.9613 | 0.9636 ± 0.0052 |
+| CONC 48 command (indexer CP + LMCache) | 0.9598, with an FP8 draft KV | 0.9682 ± 0.0048 |
+| SGLang CI (run 41277894342) | 0.9598 ± 0.0054 | |
 
-### Not on `main` yet
+### Not in this command yet
+
+On `main` after `nightly_202611200431`, and active in this command without a flag once the image has it:
+- #3434: the DSpark confidence head runs as one fused GEMV.
 
 These moved the earlier best numbers (ROCm/ATOM experiment branches) and are not in this command:
 - Mono decode beyond 16 rows, and the fused-handoff MoE (FHMoE): no PR yet.
