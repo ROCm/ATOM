@@ -332,14 +332,20 @@ def test_preshuffle_preserves_final_parameter_markers_and_padding(
     layer.w2_weight.data[:, :, :logical] = 3
     expected13 = shuffle_weight(layer.w13_weight.data.clone())
     expected2 = shuffle_weight(layer.w2_weight.data.clone())
+    pointers = (layer.w13_weight.data_ptr(), layer.w2_weight.data_ptr())
     if mode == "fp8":
         # Test the layout contract independently of fn -> fnuz normalization.
         method.need_normalize_e4m3fn_to_e4m3fnuz = False
+        scales = (layer.w13_weight_scale.clone(), layer.w2_weight_scale.clone())
     method.process_weights_after_loading(layer)
     assert layer.w13_weight.is_shuffled and layer.w2_weight.is_shuffled
+    assert (layer.w13_weight.data_ptr(), layer.w2_weight.data_ptr()) == pointers
     torch.testing.assert_close(
         layer.w13_weight.view(torch.uint8), expected13.view(torch.uint8), rtol=0, atol=0
     )
     torch.testing.assert_close(
         layer.w2_weight.view(torch.uint8), expected2.view(torch.uint8), rtol=0, atol=0
     )
+    if mode == "fp8":
+        torch.testing.assert_close(layer.w13_weight_scale, scales[0], rtol=0, atol=0)
+        torch.testing.assert_close(layer.w2_weight_scale, scales[1], rtol=0, atol=0)

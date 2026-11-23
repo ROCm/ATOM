@@ -77,6 +77,7 @@ from atom.model_ops.fused_moe.routed_rows import (
 )
 from atom.model_ops.fused_moe.shared_expert_dispatch import remap_topk_to_dispatch
 from atom.model_ops.fused_moe.shared_expert_staging import SharedExpertStaging
+from atom.model_ops.linear import padded_partition_size
 from atom.model_ops.topK import (
     init_aiter_topK_meta_data,
     is_rocm_aiter_fuse_routed_scaling_factor,
@@ -848,8 +849,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
             pad_align = 1
 
         logical_intermediate = intermediate_size_per_partition
-        intermediate_size_per_partition = (
-            (logical_intermediate + pad_align - 1) // pad_align * pad_align
+        intermediate_size_per_partition = padded_partition_size(
+            logical_intermediate, pad_align
         )
         # Keep layer.intermediate_size_per_partition logical for checkpoint
         # sharding. AITER computes the physical width, including these zeros;
@@ -2872,10 +2873,8 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
         # WEIGHTS
         logical_intermediate = intermediate_size_per_partition
         if self.per_channel:
-            intermediate_size_per_partition = (
-                (logical_intermediate + self.pad_align - 1)
-                // self.pad_align
-                * self.pad_align
+            intermediate_size_per_partition = padded_partition_size(
+                logical_intermediate, self.pad_align
             )
 
         w13_weight = atom_parameter(
@@ -3103,14 +3102,7 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
             torch.float8_e4m3fnuz,
             torch.float8_e4m3fn,
         ]:
-            from aiter.ops.shuffle import shuffle_weight
-
-            w13.data = shuffle_weight(w13.data)
-            w2.data = shuffle_weight(w2.data)
-            # Tensor attributes do not propagate through a Parameter.data
-            # assignment. AITER dispatch checks the final Parameters.
-            w13.is_shuffled = True
-            w2.is_shuffled = True
+            shuffle_weights(w13, w2)
 
         # Call parent class for any additional processing
         super().process_weights_after_loading(layer)
