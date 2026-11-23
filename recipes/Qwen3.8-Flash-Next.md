@@ -123,23 +123,26 @@ The timeout accommodates long requests under load; it does not change the
 generation limit or scoring. Set evaluation concurrency to suit the server's
 capacity.
 
-## AgentX c8/c64 performance replay on MI355X
+## AgentX c1-c64 performance replay on MI355X
 
 This text-only TP1 recipe uses the
 [AMD MXFP4 checkpoint](https://huggingface.co/amd/Qwen3.8-Flash-Next-Quark-MXFP4),
-FP8 KV, BF16 index keys, prefix caching, and three-token MTP. The two
-configurations below reproduce the protocol measured on ATOM
-`40a4d6d57bb16600c84ac758fff00e3379f133fa` on November 20, 2026. The commands
-use a checkout containing [#2636](https://github.com/ROCm/ATOM/pull/2636);
-those historical measurements do not establish performance on current main.
+FP8 KV, BF16 index keys, prefix caching, and three-token MTP. It covers the
+historical curve's eight concurrency points: 1, 2, 4, 8, 16, 32, 48, and 64.
+The Mono split below follows the November 20, 2026 full-curve preparation
+recipe. Only c8 and c64 were measured with this setup on ATOM
+`40a4d6d57bb16600c84ac758fff00e3379f133fa`; the other six points are prepared
+configurations. The commands use a checkout containing
+[#2636](https://github.com/ROCm/ATOM/pull/2636); no point has been performance
+tested on current main here.
 `--spec-decode-acceptance-length 2.32` forces synthetic acceptance for
 performance testing. Remove it for real generation or accuracy evaluation.
 
 ### Environment and assets
 
-Use one MI355X and run the two configurations sequentially, starting a fresh
-server for each. For c64, reserve a 208.6 GiB host cache pool plus memory for
-weights/loading, the server, and the client. Its 104.3 GiB state allowance is
+Use one MI355X and run the selected points sequentially, starting a fresh
+server for each. For c32, c48, or c64, reserve a 208.6 GiB host cache pool
+plus memory for weights/loading, the server, and the client. Its 104.3 GiB state allowance is
 carved from that pool, not added to it. The 32 GiB container shared-memory
 limit is separate from the host cache budget.
 
@@ -173,6 +176,7 @@ docker run --rm -d --name qwen38-agentx \
   --group-add video --group-add render \
   -e ROCR_VISIBLE_DEVICES="$GPU_UUID" -e HIP_VISIBLE_DEVICES=0 \
   -e PYTHONPATH=/workspace/ATOM -e PYTHONUNBUFFERED=1 \
+  -e ATOM_ONLINE_QUANT_INFO_DIR=/results \
   -e NO_PROXY=localhost,127.0.0.1 -e no_proxy=localhost,127.0.0.1 \
   -v "$ATOM_DIR:/workspace/ATOM:ro" -v "$ASSET_DIR:/assets" \
   -v "$RESULT_DIR:/results" -w /workspace/ATOM \
@@ -262,14 +266,22 @@ PY_CACHE
 
 ### Server configuration
 
-Run the following in the container. Choose `CONC=8` first; after the client
-finishes, stop that server with Ctrl-C before changing to `CONC=64` and
-starting it again. If the shell exits, re-enter with `docker exec` above.
-The three ports may be changed together if they are already occupied.
+All points use the same server command, with these differences:
+
+| Concurrency (`CONC`) | `ATOM_MONO_ENABLE` | `--max-num-seqs` | CPU offload | CPU pool (GiB) | State cap within pool (GiB) |
+|---|---|---|---|---|---|
+| 1, 2, 4, 8, 16 | 1 | 160 | None | — | — |
+| 32, 48, 64 | 0 | 64 | `lmcache_offload` | 208.6 | 104.3 |
+
+Set the desired concurrency in the container, for example `export CONC=16`,
+then run the block below; it defaults to 8 when `CONC` is unset or empty. After
+the client finishes, stop that server with Ctrl-C before selecting the next
+point and starting a fresh server. If the shell exits, re-enter with
+`docker exec` above. The three ports may be changed together if occupied.
 
 ```bash
 set -euo pipefail
-export CONC=8
+export CONC="${CONC:-8}"
 export MODEL_PATH=/assets/model
 export MODEL_ID=amd/Qwen3.8-Flash-Next-Quark-MXFP4
 export HTTP_PORT=8000 ENGINE_PORT=29500 DP_PORT=29501
@@ -278,11 +290,11 @@ unset LMCACHE_LOCAL_CPU LMCACHE_MAX_LOCAL_CPU_SIZE OFFLOAD_STATE_CPU_SIZE
 unset LMCACHE_CHUNK_SIZE OFFLOAD_MIN_SAVE_TOKENS OFFLOAD_MIN_LOAD_TOKENS
 extra_args=()
 case "$CONC" in
-  8)
+  1|2|4|8|16)
     export ATOM_MONO_ENABLE=1
     max_num_seqs=160
     ;;
-  64)
+  32|48|64)
     export ATOM_MONO_ENABLE=0
     max_num_seqs=64
     export LMCACHE_LOCAL_CPU=True LMCACHE_MAX_LOCAL_CPU_SIZE=208.6
@@ -290,7 +302,7 @@ case "$CONC" in
     export OFFLOAD_MIN_SAVE_TOKENS=256 OFFLOAD_MIN_LOAD_TOKENS=256
     extra_args=(--kv-transfer-config '{"kv_connector":"lmcache_offload","kv_role":"offload"}')
     ;;
-  *) echo 'CONC must be 8 or 64' >&2; exit 1 ;;
+  *) echo 'CONC must be 1, 2, 4, 8, 16, 32, 48, or 64' >&2; exit 1 ;;
 esac
 /opt/venv/bin/python -u -m atom.entrypoints.openai_server \
   --model "$MODEL_PATH" --served-model-name "$MODEL_ID" \
@@ -305,23 +317,24 @@ esac
   --method mtp --num-speculative-tokens 3 \
   --online_quant_config '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","*mlp.gate","*shared_expert_gate","*mlp.experts*","*mlp.shared_expert*","*hyper_connection*","*indexer*","*.ple.*","model.visual.*","mtp.*"]}' \
   --spec-decode-acceptance-length 2.32 --timeout-keep-alive 60 \
-  "${extra_args[@]}" 2>&1 | tee "/results/server-c${CONC}.log"
+  "${extra_args[@]}" 2>&1 | tee "/results/server-c${CONC}-$(date -u +%Y%m%dT%H%M%SZ).log"
 ```
 
 ### Fixed client measurement
 
-Before measuring, check the server log: c8 should report both `Qwen mono:`
-and `Qwen mono draft:` activation; c64 should report `Qwen mono off:` and
+Before measuring, check the server log: c1-c16 should report both `Qwen mono:`
+and `Qwen mono draft:` activation; c32/c48/c64 should report `Qwen mono off:` and
 `state tier up` with `sharing the paged-KV CPU pool`. Confirm GPU memory is
 allocated and model loading and warmup complete, then open a second host terminal with
 `docker exec -it qwen38-agentx /bin/bash`. Set `CONC`, `HTTP_PORT`, and
 `MODEL_PATH` to match the server. Each point has a 3,600-second request
 issuance window; allow additional wall time for dataset configuration,
-priming ten requests per lane, and draining requests.
+priming ten requests per lane, and draining requests. For a full curve,
+collect two complete rounds per point and retain each round's artifacts.
 
 ```bash
 set -euo pipefail
-export CONC=8 HTTP_PORT=8000 MODEL_PATH=/assets/model
+export CONC="${CONC:-8}" HTTP_PORT=8000 MODEL_PATH=/assets/model
 export MODEL_ID=amd/Qwen3.8-Flash-Next-Quark-MXFP4
 export HF_HOME=/assets/hf-cache HF_HUB_ENABLE_HF_TRANSFER=0
 unset HF_HUB_OFFLINE
@@ -341,7 +354,7 @@ output_dir="/results/c${CONC}-$(date -u +%Y%m%dT%H%M%SZ)"
   --stats-interval 30 --random-seed 42 --failed-request-threshold 0.10 \
   --trajectory-start-min-ratio 0.25 --trajectory-start-max-ratio 0.75 \
   --warmup-requests-per-lane 10 --trace-idle-gap-cap-seconds 300 \
-  --warmup-grace-period 1800 --use-server-token-count --no-gpu-telemetry \
+  --agentic-warmup-grace-period 1800 --use-server-token-count --no-gpu-telemetry \
   --tokenizer-trust-remote-code --num-dataset-entries 393 --slice-duration 1.0 \
   --server-metrics "http://127.0.0.1:${HTTP_PORT}/metrics" \
   --output-artifact-dir "$output_dir" \
@@ -350,8 +363,10 @@ output_dir="/results/c${CONC}-$(date -u +%Y%m%dT%H%M%SZ)"
 test -s "$output_dir/profile_export_aiperf.json"
 ```
 
-With this pinned client and scenario, `--warmup-grace-period 1800` sets the
-agentic warmup deadline. The exported configuration should show
+`--agentic-warmup-grace-period 1800` sets the agentic warmup deadline.
+The original runs used `--warmup-grace-period 1800`; the pinned 1.0.9 client
+routes that flag to the same agentic field under this scenario. The exported
+configuration should show
 `agentic_warmup_grace_period=1800`, profiling `grace_period=30`,
 `system_idle_gap_cap_seconds=10`, and `trace_idle_gap_cap_seconds=300`.
 
@@ -373,4 +388,4 @@ time; 3,600 seconds is only the issuance window. Exclude warmup rows and
 report cancelled requests separately. This replay with forced acceptance and
 archived responses does not measure model accuracy.
 
-After both points, stop the recipe container with `docker stop qwen38-agentx`.
+After the selected points finish, stop the recipe container with `docker stop qwen38-agentx`.
