@@ -546,7 +546,13 @@ def _radix_bags(**overrides):
                 )
             ),
         ),
-        "spec": SimpleNamespace(speculative_algorithm=None),
+        "spec": SimpleNamespace(
+            speculative_algorithm=None,
+            speculative_num_draft_tokens=None,
+            speculative_draft_model_path=None,
+            speculative_use_block_verification=False,
+        ),
+        "model": SimpleNamespace(model_path="/models/v41"),
         "disagg": SimpleNamespace(disaggregation_mode="null", language_model_only=True),
         "parallel": SimpleNamespace(
             enable_dp_attention=False, dcp_size=1, moe_dense_tp_size=None
@@ -571,7 +577,7 @@ def launch(monkeypatch):
     from sglang.srt import runtime_context
 
     state = SimpleNamespace(bags=_radix_bags())
-    for name in ("memory", "exec", "spec", "disagg", "parallel", "schedule"):
+    for name in ("memory", "exec", "spec", "disagg", "parallel", "schedule", "model"):
         monkeypatch.setattr(
             runtime_context, f"get_{name}", lambda name=name: state.bags[name]
         )

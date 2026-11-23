@@ -39,6 +39,8 @@ python3 -m sglang.launch_server \
 
 The plugin refuses, before loading weights:
 
+- an SGLang other than 0.5.22 (an exact match on `sglang.__version__`, so `0.5.22.post1` is refused too),
+  before the plugin's DeepSeek-V4.1 rewiring of SGLang: that rewiring is written against 0.5.22 and has no fallback;
 - the FP4PTPC checkpoint without the `--model-loader-extra-config` above;
 - `--chunked-prefill-size -1` (unchunked prefill): SGLang would admit a first prompt whole, past the step size the
   plugin's metadata buffers hold;

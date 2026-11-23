@@ -223,7 +223,13 @@ def _supported_bags(**overrides):
                 )
             ),
         ),
-        "spec": SimpleNamespace(speculative_algorithm=None),
+        "spec": SimpleNamespace(
+            speculative_algorithm=None,
+            speculative_num_draft_tokens=None,
+            speculative_draft_model_path=None,
+            speculative_use_block_verification=False,
+        ),
+        "model": SimpleNamespace(model_path="/models/v41"),
         "disagg": SimpleNamespace(
             disaggregation_mode="null",
             language_model_only=True,
@@ -251,7 +257,7 @@ def sglang_launch(real_sglang, monkeypatch):
     per scheduler process before the model is built)."""
     runtime_context = real_sglang["sglang.srt.runtime_context"]
     state = SimpleNamespace(bags=_supported_bags())
-    for name in ("memory", "exec", "spec", "disagg", "parallel", "schedule"):
+    for name in ("memory", "exec", "spec", "disagg", "parallel", "schedule", "model"):
         monkeypatch.setattr(
             runtime_context, f"get_{name}", lambda name=name: state.bags[name]
         )
@@ -340,6 +346,26 @@ class TestLaunchContract:
             match=f"MoE all-to-all backend \\(resolved moe_a2a_backend={backend}",
         ):
             refuse_unsupported_sglang_features()
+
+    def test_another_sglang_is_refused_before_any_rewiring(self, monkeypatch):
+        # The bridge's rewiring of SGLang internals has no fallback: another
+        # SGLang is refused before any of it is installed.
+        from atom.plugin.sglang.patches import sglang_version_guard
+
+        def rewired():
+            pytest.fail("SGLang rewired before the version refusal")
+
+        for name in (
+            "_install_pool_sizing_patch",
+            "_install_graph_variants_patch",
+            "_install_host_mirror_patch",
+        ):
+            monkeypatch.setattr(bridge, name, rewired)
+        monkeypatch.setattr(sglang_version_guard, "sglang_version", lambda: "0.5.23")
+        with pytest.raises(ValueError, match=r"this SGLang \(sglang 0\.5\.23"):
+            bridge.install_deepseek_v41_proxy_pool_patch()
+        monkeypatch.setattr(sglang_version_guard, "sglang_version", lambda: "0.5.22")
+        sglang_version_guard.refuse_unsupported_sglang()
 
     def test_moe_fields_are_where_sglang_publishes_them(self, real_sglang):
         # The bags above are fakes; the fields the refusals read are SGLang
@@ -808,11 +834,7 @@ class TestScheduledBatch:
 
     @pytest.mark.parametrize(
         "mode",
-        [
-            ForwardMode.TARGET_VERIFY,
-            ForwardMode.DRAFT_EXTEND_V2,
-            ForwardMode.IDLE,
-        ],
+        [ForwardMode.DRAFT_EXTEND_V2, ForwardMode.IDLE],
     )
     def test_unsupported_modes_are_refused(self, req_to_token, mode):
         fb = _forward_batch(mode, req_pool_indices=[1], seq_lens=[5])
@@ -892,6 +914,7 @@ class _RecordingBuilder:
 
     def __init__(self, max_bs=4, max_num_batched_tokens=1024, positions=None):
         self.block_size = PAGE
+        self.geometry = SimpleNamespace(window_size=128)
         self.max_bs = max_bs
         self.max_num_batched_tokens = max_num_batched_tokens
         self.calls = []
@@ -1466,7 +1489,7 @@ class TestMoeCompaction:
         )
         bridge._install_pool_sizing_patch()
         config = object()
-        model = SimpleNamespace(atom_config=config)
+        model = SimpleNamespace(atom_config=config, _v41_dspark=None)
         kvc = SimpleNamespace(model=model)
         assert KVCacheConfigurator._profile_available_bytes(kvc, 0) == 7
         assert calls == [("compact", model, "target"), ("builder", config)]
@@ -1836,7 +1859,7 @@ class TestHostPageRows:
         assert device_reads == [1, 1, 1]
 
 
-def test_host_mirror_patch_carries_v41_decode_rows(real_sglang, monkeypatch):
+def test_host_mirror_patch_carries_v41_decode_and_verify_rows(real_sglang, monkeypatch):
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
     runner_module = pytest.importorskip(
@@ -1868,6 +1891,9 @@ def test_host_mirror_patch_carries_v41_decode_rows(real_sglang, monkeypatch):
 
     decode = ForwardBatch.init_new(batch(ForwardMode.DECODE), v41)
     assert decode.atom_v41_req_pool_indices_cpu is slots
+    # DSpark's verify is built from the ScheduleBatch too (prepare_for_verify).
+    verify = ForwardBatch.init_new(batch(ForwardMode.TARGET_VERIFY), v41)
+    assert verify.atom_v41_req_pool_indices_cpu is slots
     extend = ForwardBatch.init_new(batch(ForwardMode.EXTEND), v41)
     assert not hasattr(extend, "atom_v41_req_pool_indices_cpu")
     other = ForwardBatch.init_new(batch(ForwardMode.DECODE), v4)
