@@ -75,7 +75,12 @@ def _mooncake(is_producer=True):
 
 
 def _moriio(is_producer=True):
-    return _build(MoRIIOConnectorScheduler, is_producer)
+    return _build(
+        MoRIIOConnectorScheduler,
+        is_producer,
+        _send_timeout_s=0.0,
+        _reqs_need_send={},
+    )
 
 
 def _seq(seq_id=7, **params):

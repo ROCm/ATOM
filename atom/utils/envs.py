@@ -185,6 +185,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MORIIO_WRITE_TIMEOUT_S": lambda: float(
         os.getenv("ATOM_MORIIO_WRITE_TIMEOUT_S", "600")
     ),
+    # MoRIIO P/D prefill: free a finished request's KV blocks this long after
+    # it finished when no decode has reported moving them. 0 never frees them.
+    "ATOM_MORIIO_SEND_TIMEOUT_S": lambda: float(
+        os.getenv("ATOM_MORIIO_SEND_TIMEOUT_S", "480")
+    ),
     # MoRIIO P/D: log the layers a receive left unchanged (debugging).
     "ATOM_MORIIO_VERIFY": lambda: _flag_env("ATOM_MORIIO_VERIFY", "0"),
     # Protect reused KV prefixes from one-off prefill scans. Opt-in.

@@ -271,6 +271,17 @@ class MoRIIOConnector(KVConnectorBase):
         self.done_sending: set[int] = set()
         self._done_sending_lock = threading.Lock()
 
+        # Producer: a request aborted before its consumer read it sends no
+        # report, and in read mode nothing tells that from a read still to
+        # come, so its blocks go ATOM_MORIIO_SEND_TIMEOUT_S after it finished.
+        # Transfer id -> that time on `_clock`, from the scheduler's
+        # `reqs_to_send`; and the ids reported before their timer came, with
+        # when, so a late timer is not started.
+        self._send_timeout_s = envs.ATOM_MORIIO_SEND_TIMEOUT_S
+        self._clock = time.monotonic
+        self._send_expiry: dict[int, float] = {}
+        self._reported_untimed: dict[int, float] = {}
+
         # Transfer ID mapping (worker side)
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
 
@@ -631,6 +642,8 @@ class MoRIIOConnector(KVConnectorBase):
         handshake, and ``get_finished`` issues its reads.
         """
         if self.is_producer:
+            if metadata is not None and metadata.reqs_to_send:
+                self._time_sends(metadata.reqs_to_send)
             return
 
         if metadata is not None and metadata.reqs_to_recv:
@@ -1762,6 +1775,52 @@ class MoRIIOConnector(KVConnectorBase):
                 del self._held_failures[req_id]
                 failed_recving.add(req_id)
 
+    def _time_sends(self, reqs_to_send: dict[Any, float]) -> None:
+        """Start the timers of the sends the scheduler just advertised."""
+        for req_id, expiry in reqs_to_send.items():
+            transfer_id = int(req_id)
+            # Its consumer reported before the metadata got here.
+            if self._reported_untimed.pop(transfer_id, None) is None:
+                self._send_expiry[transfer_id] = float(expiry)
+
+    def _expire_sends(self, done_sending: set[int]) -> None:
+        """Stop the timers of the reported sends, and add the expired ones.
+
+        An expired send whose push is queued or running is left to report when
+        the push ends; one asked for after the release is refused.
+        """
+        now = self._clock()
+        for transfer_id in done_sending:
+            if self._send_expiry.pop(transfer_id, None) is None:
+                self._reported_untimed.pop(transfer_id, None)
+                self._reported_untimed[transfer_id] = now
+        # A timer later than this would be past its expiry anyway.
+        while self._reported_untimed:
+            transfer_id, reported = next(iter(self._reported_untimed.items()))
+            if now - reported < self._send_timeout_s:
+                break
+            del self._reported_untimed[transfer_id]
+
+        # In claim order, so the first one not yet due ends the scan.
+        for transfer_id, expiry in list(self._send_expiry.items()):
+            if now < expiry:
+                break
+            if transfer_id in self._write_ids and self._write_ids[transfer_id] is None:
+                continue
+            del self._send_expiry[transfer_id]
+            logger.warning(
+                "transfer %s: no consumer reported moving its KV %.0fs after the "
+                "request finished; releasing its blocks (ATOM_MORIIO_SEND_TIMEOUT_S)",
+                transfer_id,
+                self._send_timeout_s,
+            )
+            # Read by `_accept_write_request`: the blocks may be another
+            # request's now, so a push asked for later is refused.
+            released = time.monotonic()
+            self._write_ids[transfer_id] = released
+            self._finished_writes.append((released, transfer_id))
+            done_sending.add(transfer_id)
+
     def _handshake_listener(
         self,
         metadata: MoRIIOAgentMetadata,
@@ -2100,6 +2159,8 @@ class MoRIIOConnector(KVConnectorBase):
                     self._write_state_digests.pop(req_id, None)
         with self._done_sending_lock:
             done_sending, self.done_sending = self.done_sending, set()
+        if self.is_producer and self._send_timeout_s > 0:
+            self._expire_sends(done_sending)
         if not self.is_producer:
             if done_sending:
                 logger.warning(
@@ -2155,6 +2216,12 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
         # Source-block ownership -- see `MooncakeConnectorScheduler` for why
         # the claim is taken in `request_finished` rather than at alloc.
         self._awaiting_send: set[str] = set()
+        # Claims taken since the last metadata, each with the time on `_clock`
+        # (monotonic, so the workers' own) after which a worker releases it
+        # unreported. Empty when ATOM_MORIIO_SEND_TIMEOUT_S is 0.
+        self._send_timeout_s = envs.ATOM_MORIIO_SEND_TIMEOUT_S
+        self._clock = time.monotonic
+        self._reqs_need_send: dict[str, float] = {}
 
         # Bidirectional transfer_id <-> request_id mapping
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
@@ -2200,6 +2267,7 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
             list(self._reqs_need_recv.keys()),
         )
         self._reqs_need_recv.clear()
+        meta.reqs_to_send, self._reqs_need_send = self._reqs_need_send, {}
         return meta
 
     def update_state_after_alloc(self, seq: Sequence) -> None:
@@ -2251,6 +2319,8 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
         # never reads `do_remote_decode` and sends everything it prefills.
         if self.is_producer:
             self._awaiting_send.add(str(seq.id))
+            if self._send_timeout_s > 0:
+                self._reqs_need_send[str(seq.id)] = self._clock() + self._send_timeout_s
 
         # Attach output metadata for the proxy to relay
         first_token_id = seq.output_tokens[0] if seq.output_tokens else None
@@ -2288,6 +2358,7 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
 
     def send_finished(self, req_id) -> None:
         self._awaiting_send.discard(str(req_id))
+        self._reqs_need_send.pop(str(req_id), None)
 
     def source_blocks_released(self, seq: Sequence) -> None:
         """No block-lifetime state remains after the send claim is retired."""
