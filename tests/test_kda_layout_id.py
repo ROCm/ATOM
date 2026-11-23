@@ -19,6 +19,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from aiter_stub import atom_without_aiter
 
 from atom.model_engine.kv_block import STATE_CHECKPOINT_CLASS, STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
@@ -29,11 +30,12 @@ from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
     state_pool,
 )
 
-K3 = pytest.importorskip(
-    "atom.model_ops.attentions.kimi_mla_gdn_attn",
-    reason="the K3 builder's module imports aiter at load",
-    exc_type=ImportError,
-)
+# The K3 builder's module and the runner's import aiter at load. Where AITER
+# cannot run (the non-GPU job) they load against the stand-ins, so this file
+# runs there too.
+with atom_without_aiter() as _load:
+    K3 = _load("atom.model_ops.attentions.kimi_mla_gdn_attn")
+    MR = _load("atom.model_engine.model_runner")
 Builder = K3._KimiMLAGDNCommon
 
 SHAPE_K = (3, 4608)
@@ -274,11 +276,7 @@ class TestEveryPPStageKeepsItsOwnImages:
 
     @pytest.fixture
     def mr(self, monkeypatch):
-        mr = pytest.importorskip(
-            "atom.model_engine.model_runner",
-            reason="the runner's module imports aiter at load",
-            exc_type=ImportError,
-        )
+        mr = MR
         import torch.distributed as dist
 
         monkeypatch.delenv("ATOM_PP_STATE_CHECKPOINT_SLOTS", raising=False)

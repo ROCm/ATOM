@@ -1901,12 +1901,12 @@ class ModelRunner:
         per stage as the state pool sizes its slots, so a stage pays for its own
         image alone, out of the paged budget (`size_pipeline_checkpoint_store`).
 
-        None outside a PP run whose checkpoints span its stages, unless the
-        launch opts into a store (ATOM_PP_STATE_CHECKPOINT_SLOTS or
-        ATOM_PP_STATE_CHECKPOINT_KV_SHARE), and on every stage when one holds
-        no recurrent state or no PAGE class, which the refusals below name.
-        Collective over the PP group, which is what refuses stages launched
-        with different settings.
+        A store only in a PP run whose checkpoints span its stages, and only
+        when the launch sets ATOM_PP_STATE_CHECKPOINT_SLOTS or
+        ATOM_PP_STATE_CHECKPOINT_KV_SHARE; None otherwise, and None on every
+        stage when one holds no recurrent state or no PAGE class, which the
+        refusals below name. Collective over the PP group, whose gather also
+        refuses stages launched with different settings.
         """
         config = self.config
         builder = self.attn_metadata_builder
