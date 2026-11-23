@@ -493,21 +493,38 @@ if _HAS_TRITON:
     def _count_ids_kernel(
         ids_ptr,  # [numel] expert ids; < 0 or >= num_physical is not counted
         load_ptr,  # [num_physical] int32 counts, added to
+        flag_ptr,  # [1] int32: 0 leaves the counts alone (nothing is counting)
         num_physical,
         numel,
+        stride,  # every ``stride``-th block of ids is counted, ``stride``-fold
         BLOCK: tl.constexpr,
         NUM_BINS: tl.constexpr,  # next_pow2(num_physical + 1)
     ):
-        # `eplb._eplb_route_kernel`'s record half.
+        # `eplb._eplb_route_kernel`'s record half, over a sample of the ids:
+        # every program adds to the same ``num_physical`` counters, so a
+        # prefill pass counted id by id would queue up on them.
         pid = tl.program_id(0)
-        offs = pid * BLOCK + tl.arange(0, BLOCK)
-        mask = offs < numel
+        on = tl.load(flag_ptr) != 0
+        offs = pid * stride * BLOCK + tl.arange(0, BLOCK)
+        mask = (offs < numel) & on
         ids = tl.load(ids_ptr + offs, mask=mask, other=-1).to(tl.int64)
         in_range = mask & (ids >= 0) & (ids < num_physical)
         bin_idx = tl.where(in_range, ids, num_physical).to(tl.int32)
         hist = tl.histogram(bin_idx, NUM_BINS)
         bins = tl.arange(0, NUM_BINS)
-        tl.atomic_add(load_ptr + bins, hist, mask=bins < num_physical)
+        tl.atomic_add(
+            load_ptr + bins,
+            (hist * stride).to(tl.int32),
+            mask=(bins < num_physical) & (hist > 0),
+        )
+
+
+def count_stride(numel: int, block: int, blocks: int) -> int:
+    """Every how many blocks of ``block`` ids a pass of ``numel`` ids is
+    counted so that about ``blocks`` of them are (``blocks`` <= 0: all)."""
+    if blocks <= 0:
+        return 1
+    return max(1, -(-numel // block) // blocks)
 
 
 class GatePermuteRuntime:
@@ -539,6 +556,14 @@ class GatePermuteRuntime:
         self.gates = gates
         self.meta = meta
         self.count_triton = mode == "triton" and _HAS_TRITON
+        # The count launch recorded into the prefill graphs reads this: 1
+        # while loads are counted, 0 otherwise (`set_count_flag`) -- a frozen
+        # placement's graphs still launch it, and it must then cost nothing.
+        self.count_blocks = int(envs.ATOM_EPLB_GP_COUNT_BLOCKS)
+        self._count_flag = torch.ones(
+            1, dtype=torch.int32, device=meta.physical_to_logical_map.device
+        )
+        self._count_flag_on = True
         self.sample_every = int(envs.ATOM_EPLB_DECODE_SAMPLE_EVERY)
         # Sums since the start (default), else the monitor's window of
         # prefill passes and the decode samples since the last rebalance.
@@ -629,14 +654,25 @@ class GatePermuteRuntime:
         numel = topk_ids.numel()
         if load is None or numel == 0:
             return
-        _count_ids_kernel[(triton.cdiv(numel, 256),)](
+        stride = count_stride(numel, 256, self.count_blocks)
+        _count_ids_kernel[(triton.cdiv(triton.cdiv(numel, 256), stride),)](
             topk_ids.contiguous(),
             load,
+            self._count_flag,
             num_physical,
             numel,
+            stride,
             BLOCK=256,
             NUM_BINS=1 << num_physical.bit_length(),
         )
+
+    def sync_count_flag(self) -> None:
+        """The device flag the recorded count launches read, brought in line
+        with `counting` (one small write, and only when that changed)."""
+        on = self.counting
+        if on != self._count_flag_on:
+            self._count_flag.fill_(1 if on else 0)
+            self._count_flag_on = on
 
     # -- decode sampling -------------------------------------------------
     @contextmanager
@@ -918,6 +954,7 @@ class GatePermuteRuntime:
     def describe(self) -> str:
         return (
             f"count={'triton' if self.count_triton else 'torch'} "
+            f"count_blocks={self.count_blocks} "
             f"decode_sample_every={self.sample_every} "
             f"cumulative={int(self.cumulative)}"
         )

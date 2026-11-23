@@ -1244,3 +1244,34 @@ def test_metrics_line_reads_the_placement(monkeypatch):
     assert "decode-row max/mean 4.000" in line
     empty = gp.metrics_line(pf * 0, dec * 0, 0.0, identity, [0, 1], RANKS, TOP_K)
     assert "nan" in empty
+
+
+def test_count_stride_reads_about_the_asked_blocks():
+    """`count_stride`: a pass of at most ``blocks`` blocks is read whole, a
+    larger one every stride-th block, about ``blocks`` of them; 0 reads all."""
+    assert gp.count_stride(768, 256, 32) == 1
+    assert gp.count_stride(32 * 256, 256, 32) == 1
+    assert gp.count_stride(98304, 256, 32) == 12  # 384 blocks -> 32 read
+    assert -(-384 // gp.count_stride(98304, 256, 32)) == 32
+    assert gp.count_stride(98304, 256, 0) == 1
+    assert gp.count_stride(1, 256, 32) == 1
+
+
+def test_the_count_flag_follows_counting(monkeypatch):
+    """The device flag the recorded count launches read: on while loads are
+    counted, off once the rebalances stopped, on again under an observer."""
+    env = _setup(monkeypatch)
+    flag = env.gp._count_flag
+    assert flag.tolist() == [1]
+    env.gp.sync_count_flag()
+    assert flag.tolist() == [1]
+    env.manager.rebalancing_stopped = True
+    assert flag.tolist() == [1]  # until the next forward syncs it
+    env.gp.sync_count_flag()
+    assert flag.tolist() == [0] and env.gp._count_flag is flag
+    env.gp.observing = True
+    env.gp.sync_count_flag()
+    assert flag.tolist() == [1]
+    env.gp.observing = False
+    env.gp.sync_count_flag()
+    assert flag.tolist() == [0]

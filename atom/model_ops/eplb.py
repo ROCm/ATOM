@@ -3345,6 +3345,8 @@ def with_eplb_forward_monitor(fn):
         if manager is None or manager.live_metadata is None:
             return fn(self, batch, *args, **kwargs)
         monitor = manager.monitor
+        if manager.gate_permute is not None:
+            manager.gate_permute.sync_count_flag()
         # Gate-permute EPLB counts in prefill passes only, and nothing once
         # rebalancing has stopped: any other forward leaves the pass buffer
         # alone (a pure-prefill pass, the only one committed, clears it first).

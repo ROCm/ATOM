@@ -1236,6 +1236,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_EPLB_GP_COUNT": lambda: os.getenv("ATOM_EPLB_GP_COUNT", "triton")
     .strip()
     .lower(),
+    # Gate-permute: about how many 256-id blocks of a prefill pass the count
+    # launch reads, evenly spread and scaled back up (0: every id). Every
+    # block adds to the same counters, so a pass counted whole queues on them.
+    "ATOM_EPLB_GP_COUNT_BLOCKS": lambda: max(
+        0, _int_env("ATOM_EPLB_GP_COUNT_BLOCKS", 32)
+    ),
     # Gate-permute: the prefill and decode loads are summed since the start
     # (default). "0" takes the prefill window (`load_window_size` pure-prefill
     # passes of a rank) and the decode samples since the last rebalance.
