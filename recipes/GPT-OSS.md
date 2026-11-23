@@ -70,3 +70,21 @@ lm_eval --model local-chat-completions --apply_chat_template \
 ```
 
 CI accuracy threshold: `flexible-extract ≥ 0.88`.
+
+## SGLang backend scope
+
+The commands above use the native ATOM server. When launching GPT-OSS through
+`sglang.launch_server`, the explicit `--moe-runner-backend triton_kernel` path
+requires `--ep-size 1`: [SGLang validates this before startup](https://github.com/sgl-project/sglang/blob/baa9befa381511cd4d56f83980951e5a45fffc6d/python/sglang/srt/arg_groups/model_hook.py#L562).
+Adding `--ep-size 8` is rejected even with `--dp-size 8 --enable-dp-attention`.
+This restriction belongs to that SGLang runner; the native ATOM DP + EP example
+above does not establish EP support for it or for other SGLang MoE backends.
+
+Use the SGLang and Triton-kernels versions selected together by the
+[release workflow](../.github/workflows/docker-release.yaml) and
+[ATOM base image](../docker/atom_release.dockerfile). A `routing` name error can
+follow an earlier optional `triton_kernels` import failure, so check the actual
+package versions and import error before adding a routing shim. See
+[#2065](https://github.com/ROCm/ATOM/issues/2065) for the old-image report and the
+current import-check evidence; an import check alone does not validate model
+startup, graph capture, or accuracy.
