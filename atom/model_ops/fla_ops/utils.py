@@ -20,6 +20,8 @@ import torch
 # from vllm.platforms import current_platform
 import triton
 
+from atom.utils import envs
+
 logger = logging.getLogger(__name__)
 
 COMPILER_MODE = os.getenv("FLA_COMPILER_MODE") == "1"
@@ -113,6 +115,21 @@ def input_guard(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
             return fn(*contiguous_args, **contiguous_kwargs)
 
     return wrapper
+
+
+def autotune(configs: list, key: list, **kwargs):
+    """`triton.autotune`, pinned to ``configs[0]`` under ATOM_FLA_PIN_AUTOTUNE.
+
+    Several of these kernels give different bits under different configs (a
+    reduction split by ``BK`` or ``num_warps``), and the autotuner picks one by
+    timing every config afresh in each process. Two runs of one tree can then
+    pick differently and diverge downstream. A single config is never timed,
+    so the pinned kernels compute the same bits in every run. Read once, when
+    the kernel module is imported.
+    """
+    if envs.ATOM_FLA_PIN_AUTOTUNE:
+        configs = configs[:1]
+    return triton.autotune(configs=configs, key=key, **kwargs)
 
 
 @functools.cache

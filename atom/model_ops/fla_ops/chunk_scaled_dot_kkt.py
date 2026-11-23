@@ -15,6 +15,7 @@ import triton.language as tl
 
 from .index import prepare_chunk_indices
 from .op import exp
+from .utils import autotune
 
 
 @triton.heuristics(
@@ -23,7 +24,7 @@ from .op import exp
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@triton.autotune(
+@autotune(
     configs=[
         triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
         for BK in [32, 64, 128]
