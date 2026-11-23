@@ -146,6 +146,7 @@ impl Pipeline {
             }
         };
         ctx.stop_decoder = atom.stop_decoder(ctx);
+        ctx.reads_as_atom = true;
     }
 }
 
@@ -509,6 +510,7 @@ mod atom_output_tests {
             configured_tool_parser: None,
             configured_reasoning_parser: None,
             prompt_opener: Some("<think>".to_string()),
+            reads_as_atom: false,
         }
     }
 
@@ -576,6 +578,7 @@ mod atom_output_tests {
         // The router's own reading cuts at the stop, and keeps no opener.
         assert_eq!(decode(&mut ctx.stop_decoder, &output), "ab");
         assert_eq!(ctx.prompt_opener, None);
+        assert!(!ctx.reads_as_atom);
 
         let atom = pipeline().reading_output_as_atom(AtomOutput::new(vec![EOS]));
         let mut ctx = generate_ctx(&tokenizer, STOPPED_AT_DOT);
@@ -583,6 +586,7 @@ mod atom_output_tests {
         // The engine stopped where the stop's ids matched; the text is all of it.
         assert_eq!(decode(&mut ctx.stop_decoder, &output), "ab. c");
         assert_eq!(ctx.prompt_opener.as_deref(), Some("<think>"));
+        assert!(ctx.reads_as_atom);
     }
 
     #[test]
@@ -651,6 +655,7 @@ mod atom_output_tests {
             configured_tool_parser: None,
             configured_reasoning_parser: configured.map(str::to_string),
             prompt_opener: None,
+            reads_as_atom: false,
         }
     }
 

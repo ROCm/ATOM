@@ -1099,6 +1099,7 @@ mod f_response_context {
             configured_tool_parser: None,
             configured_reasoning_parser: None,
             prompt_opener: None,
+            reads_as_atom: false,
         }
     }
 
@@ -1147,6 +1148,7 @@ mod f_response_context {
             configured_tool_parser: None,
             configured_reasoning_parser: None,
             prompt_opener: None,
+            reads_as_atom: false,
         };
         assert_eq!(ctx.headers.as_ref().unwrap().get("x-trace").unwrap(), "abc");
     }
@@ -1170,6 +1172,7 @@ mod f_response_context {
             configured_tool_parser: None,
             configured_reasoning_parser: None,
             prompt_opener: None,
+            reads_as_atom: false,
         };
         assert!(ctx.processed_messages.is_none());
     }

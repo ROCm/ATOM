@@ -148,7 +148,7 @@ async fn run_chat_stream(
 
     while let Some(item) = stream.next().await {
         let chunk = item.map_err(engine_error_to_string)?;
-        if is_first {
+        if is_first && ctx.reads_as_atom {
             // On the engine's first message, text or not, as ATOM's HTTP chat opens its stream.
             let first_chunk = ChatCompletionStreamResponse::builder(request_id, model)
                 .created(created)
@@ -172,6 +172,17 @@ async fn run_chat_stream(
                 let (chunk_text, _stopped) = process_chunk_tokens(&mut stop_decoder, &token_ids);
                 if chunk_text.is_empty() {
                     continue;
+                }
+
+                if is_first {
+                    let first_chunk = ChatCompletionStreamResponse::builder(request_id, model)
+                        .created(created)
+                        .add_choice_role(INDEX, "assistant")
+                        .maybe_system_fingerprint(system_fingerprint.clone())
+                        .build();
+                    format_sse_chunk_into(&mut sse_buffer, &first_chunk);
+                    send_bytes(tx, &sse_buffer, "first chunk")?;
+                    is_first = false;
                 }
 
                 let mut delta = chunk_text;

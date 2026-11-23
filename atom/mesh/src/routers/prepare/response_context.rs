@@ -46,6 +46,9 @@ pub struct ResponseContext {
     /// starts inside that block, with no opener of its own, so the reasoning parser reads
     /// this one before the reply. Kept only for a reply read as ATOM's.
     pub prompt_opener: Option<String>,
+    /// The reply is ATOM's (`AtomOutput`), and takes the shape ATOM's HTTP chat gives
+    /// it: content "" when empty, and a stream opened by an empty assistant delta.
+    pub reads_as_atom: bool,
 }
 
 /// ATOM's `prompt_starts_in_reasoning`: the marker among `markers` (GetModelInfo's

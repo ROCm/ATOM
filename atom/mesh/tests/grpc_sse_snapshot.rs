@@ -62,6 +62,7 @@ fn chat_ctx() -> ResponseContext {
         configured_tool_parser: None,
         configured_reasoning_parser: None,
         prompt_opener: None,
+        reads_as_atom: false,
     }
 }
 
@@ -86,6 +87,7 @@ fn generate_ctx() -> ResponseContext {
         configured_tool_parser: None,
         configured_reasoning_parser: None,
         prompt_opener: None,
+        reads_as_atom: false,
     }
 }
 

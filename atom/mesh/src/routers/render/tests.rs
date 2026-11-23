@@ -28,6 +28,7 @@ mod test_support {
             configured_tool_parser: None,
             configured_reasoning_parser: None,
             prompt_opener: None,
+            reads_as_atom: false,
         }
     }
 
@@ -53,6 +54,7 @@ mod test_support {
             configured_tool_parser: None,
             configured_reasoning_parser: None,
             prompt_opener: None,
+            reads_as_atom: false,
         }
     }
 }
@@ -218,6 +220,7 @@ mod b2_chat_aggregator_branches {
             configured_tool_parser: None,
             configured_reasoning_parser: None,
             prompt_opener: None,
+            reads_as_atom: false,
         }
     }
 
@@ -575,18 +578,26 @@ mod b2_chat_aggregator_branches {
     }
 
     #[tokio::test]
-    async fn test_aggregator_reasoning_only_output_carries_an_empty_content() {
-        let mut req = ChatCompletionRequest::default();
-        req.separate_reasoning = true;
-        let mut ctx = ctx_with(req);
-        ctx.configured_reasoning_parser = Some("deepseek_r1".to_string());
-        let complete = cmpl(vec![1, 2], FinishReason::Length, None);
-        let resp = chat_aggregator::process(synthetic_single_stream(vec![Ok(complete)]), ctx).await;
-        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let message = &json["choices"][0]["message"];
-        assert_eq!(message["reasoning_content"], "Hello world");
-        assert_eq!(message["content"], "");
+    async fn test_aggregator_reasoning_only_atom_output_carries_an_empty_content() {
+        for reads_as_atom in [true, false] {
+            let req = ChatCompletionRequest {
+                separate_reasoning: true,
+                ..Default::default()
+            };
+            let mut ctx = ctx_with(req);
+            ctx.configured_reasoning_parser = Some("deepseek_r1".to_string());
+            ctx.reads_as_atom = reads_as_atom;
+            let complete = cmpl(vec![1, 2], FinishReason::Length, None);
+            let stream = synthetic_single_stream(vec![Ok(complete)]);
+            let resp = chat_aggregator::process(stream, ctx).await;
+            let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let message = &json["choices"][0]["message"];
+            assert_eq!(message["reasoning_content"], "Hello world");
+            // ATOM's HTTP chat answers ""; SGLang's and vLLM's leave content out.
+            let content = message.get("content");
+            assert_eq!(content, reads_as_atom.then_some(&serde_json::json!("")));
+        }
     }
 }
 
@@ -629,6 +640,7 @@ mod b3_chat_aggregator_typed {
             configured_tool_parser: None,
             configured_reasoning_parser: None,
             prompt_opener: None,
+            reads_as_atom: false,
         }
     }
 
@@ -1043,6 +1055,7 @@ mod c2_chat_streaming_branches {
             configured_tool_parser: None,
             configured_reasoning_parser: None,
             prompt_opener: None,
+            reads_as_atom: false,
         }
     }
 
@@ -1303,8 +1316,8 @@ mod c2_chat_streaming_branches {
         assert!(chunk["usage"].get("prompt_tokens_details").is_none());
     }
 
-    #[tokio::test]
-    async fn test_streaming_output_without_text_opens_with_an_empty_content() {
+    /// The first event of a stream whose only output decodes to no text.
+    async fn first_event_without_text(reads_as_atom: bool) -> serde_json::Value {
         let mut req = ChatCompletionRequest::default();
         req.stream = true;
         let stream = synthetic_single_stream(vec![
@@ -1322,11 +1335,21 @@ mod c2_chat_streaming_branches {
                 meta: meta_plain(),
             }),
         ]);
-        let s = body_of(chat_streaming::process(stream, ctx_with(req), "regular")).await;
+        let mut ctx = ctx_with(req);
+        ctx.reads_as_atom = reads_as_atom;
+        let s = body_of(chat_streaming::process(stream, ctx, "regular")).await;
         let mut events = s.lines().filter_map(|line| line.strip_prefix("data: "));
-        let json: serde_json::Value = serde_json::from_str(events.next().unwrap()).unwrap();
+        serde_json::from_str(events.next().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_streaming_atom_output_without_text_opens_with_an_empty_content() {
+        let json = first_event_without_text(true).await;
         assert_eq!(json["choices"][0]["delta"]["role"], "assistant");
         assert_eq!(json["choices"][0]["delta"]["content"], "");
+        // SGLang's and vLLM's streams open with their first text.
+        let json = first_event_without_text(false).await;
+        assert_eq!(json["choices"][0]["finish_reason"], "stop");
     }
 
     #[tokio::test]
@@ -1484,6 +1507,7 @@ mod c3_chat_streaming_parsers {
             configured_tool_parser: configured_tool.map(|s| s.to_string()),
             configured_reasoning_parser: configured_reasoning.map(|s| s.to_string()),
             prompt_opener: None,
+            reads_as_atom: false,
         }
     }
 
@@ -1693,6 +1717,7 @@ mod c4_chat_streaming_coverage {
             configured_tool_parser: None,
             configured_reasoning_parser: None,
             prompt_opener: None,
+            reads_as_atom: false,
         }
     }
 
@@ -1715,6 +1740,7 @@ mod c4_chat_streaming_coverage {
             configured_tool_parser: None,
             configured_reasoning_parser: None,
             prompt_opener: None,
+            reads_as_atom: false,
         }
     }
 
@@ -1736,6 +1762,7 @@ mod c4_chat_streaming_coverage {
             configured_tool_parser: None,
             configured_reasoning_parser: None,
             prompt_opener: None,
+            reads_as_atom: false,
         }
     }
 
@@ -2360,6 +2387,7 @@ mod c4_chat_streaming_coverage {
             configured_tool_parser: None,
             configured_reasoning_parser: None,
             prompt_opener: None,
+            reads_as_atom: false,
         };
         let stream = synthetic_single_stream(vec![
             Ok(TokenChunk::Partial {
@@ -3139,6 +3167,7 @@ mod d2_generate_aggregator_branches {
             configured_tool_parser: None,
             configured_reasoning_parser: None,
             prompt_opener: None,
+            reads_as_atom: false,
         };
         let stream = synthetic_single_stream(vec![Ok(TokenChunk::Complete {
             token_ids: vec![1, 2, 3],
@@ -3186,6 +3215,7 @@ mod d2_generate_aggregator_branches {
             configured_tool_parser: None,
             configured_reasoning_parser: None,
             prompt_opener: None,
+            reads_as_atom: false,
         };
         let lp = TokenLogprobs {
             items: vec![TokenLogprob {
@@ -3599,6 +3629,7 @@ mod e2_generate_streaming_branches {
             configured_tool_parser: None,
             configured_reasoning_parser: None,
             prompt_opener: None,
+            reads_as_atom: false,
         }
     }
 
@@ -4021,6 +4052,7 @@ mod f_atom_reasoning_opener {
             configured_tool_parser: None,
             configured_reasoning_parser: Some("qwen3".to_string()),
             prompt_opener: opener.map(str::to_string),
+            reads_as_atom: false,
         }
     }
 

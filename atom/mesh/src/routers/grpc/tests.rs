@@ -1600,6 +1600,7 @@ mod h_completion_adapter {
             configured_tool_parser: None,
             configured_reasoning_parser: None,
             prompt_opener: None,
+            reads_as_atom: false,
         };
         let stream = synthetic_single_stream(completes.into_iter().map(Ok).collect());
         generate_aggregator::process(stream, ctx).await

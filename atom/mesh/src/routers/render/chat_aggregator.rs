@@ -136,6 +136,7 @@ async fn aggregate(
             ctx.configured_tool_parser.as_deref(),
             ctx.configured_reasoning_parser.as_deref(),
             ctx.prompt_opener.as_deref(),
+            ctx.reads_as_atom,
         )
         .await;
         match res {
@@ -195,6 +196,7 @@ async fn process_choice(
     configured_tool_parser: Option<&str>,
     configured_reasoning_parser: Option<&str>,
     prompt_opener: Option<&str>,
+    reads_as_atom: bool,
 ) -> Result<ChatChoice, String> {
     let (token_ids, finish_reason, matched_stop, logprobs) = match complete {
         TokenChunk::Complete {
@@ -305,8 +307,8 @@ async fn process_choice(
         index,
         message: ChatCompletionMessage {
             role: "assistant".to_string(),
-            // "" when empty, as ATOM's HTTP chat answers; None would leave the key out.
-            content: Some(processed_text),
+            // ATOM's HTTP chat answers "" when empty; None leaves the key out.
+            content: (reads_as_atom || !processed_text.is_empty()).then_some(processed_text),
             tool_calls,
             reasoning_content: reasoning_text,
         },
