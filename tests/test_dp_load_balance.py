@@ -470,6 +470,19 @@ def test_resolve_and_validate_hints_rejects_out_of_range_without_side_effects():
     assert mgr._seq_load == {}
 
 
+def test_a_batch_with_a_bad_rank_hint_registers_no_callback():
+    # No engine receives the batch, so a callback registered for it would never
+    # see a terminal output to retire it.
+    mgr = _make_mgr(2, strategy="least_requests")
+    mgr.pp_size = 1
+    mgr._seq_id_to_callback = {}
+    seq = _FakeSeq("bad", 10, data_parallel_rank=2)
+    seq.stream_callback = lambda output: None
+    with pytest.raises(ValueError, match="data_parallel_rank=2"):
+        mgr._add_prepared_requests([seq])
+    assert mgr._seq_id_to_callback == {}
+
+
 def test_resolve_and_validate_hints_accepts_and_returns_resolved():
     mgr = _make_mgr(4, strategy="least_requests")
     # In-range hint and no-hint (None) are both fine, and the resolved hints are

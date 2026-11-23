@@ -401,7 +401,10 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
         except frames.FrameError as error:
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
         finally:
-            reader.cancel()
+            # send() cancelled a failed Session's reader; a second cancel could abort a
+            # structured admission before its thread enqueues the request.
+            if session.failed is None:
+                reader.cancel()
             session.close()
 
     async def _read(self, session, request_iterator) -> None:
@@ -434,6 +437,12 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
             raise ValueError(SESSION_N)
         if given.logprobs or given.top_logprobs:
             raise ValueError("logprobs are not served over the Session")
+        if given.stop_strings and not request.stop_token_sequences:
+            raise ValueError("stop strings need their ids in stop_token_sequences")
+        # The chat route holds a required call only to the server's own channel.
+        channel = given.required_channel
+        if channel is not None and channel != api.required_tool_channel:
+            raise ValueError("required_channel is not this server's tool-call channel")
         kv_transfer_params = request.kv_transfer_params
         api._validate_chunked_receive(kv_transfer_params)
         params = api._build_sampling_params(
@@ -534,6 +543,17 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
             reasoning_open_markers=_REASONING_OPEN_MARKERS,
             tool_call_parser=tool_call_parser,  # None leaves it unset
             reasoning_parser=reasoning_parser,
+            usage_on_finish=api_compatibility_for(
+                api.custom_message_encoder
+            ).usage_on_finish,
+            implicit_reasoning_opener=(
+                api.reasoning_dialect.prompt_open_marker
+                if api.model_starts_in_reasoning and api.reasoning_dialect
+                else None
+            ),
+            reasoning_toggle_json=(
+                json.dumps(list(api.reasoning_toggle)) if api.reasoning_toggle else ""
+            ),
         )
 
     async def GetServerInfo(self, request, context):

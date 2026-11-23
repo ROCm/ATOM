@@ -42,13 +42,17 @@ pub struct ResponseContext {
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
     pub configured_tool_parser: Option<String>,
     pub configured_reasoning_parser: Option<String>,
-    /// The channel opener the rendered prompt ends on (see [`prompt_opener`]): the reply
-    /// starts inside that block, with no opener of its own, so the reasoning parser reads
-    /// this one before the reply. Kept only for a reply read as ATOM's.
+    /// The channel opener the rendered prompt ends on (see [`prompt_opener`]), or the one
+    /// the model's replies start after unprompted (DeepSeek-R1's): the reply starts inside
+    /// that block, with no opener of its own, so the reasoning parser reads this one before
+    /// the reply. Kept only for a reply read as ATOM's.
     pub prompt_opener: Option<String>,
     /// The reply is ATOM's (`AtomOutput`), and takes the shape ATOM's HTTP chat gives
     /// it: content "" when empty, and a stream opened by an empty assistant delta.
     pub reads_as_atom: bool,
+    /// ATOM puts this model's streamed usage on the finish chunk, not a usage-only chunk
+    /// after it (GetModelInfo's `usage_on_finish`).
+    pub usage_on_finish: bool,
 }
 
 /// ATOM's `prompt_starts_in_reasoning`: the marker among `markers` (GetModelInfo's

@@ -30,7 +30,7 @@ from atom.entrypoints.openai.reasoning_dialects import DIALECTS, FALLBACK_DIALEC
 from atom.entrypoints.openai.tool_parser.registry import PARSERS_BY_NAME
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.zmq_protocol import engine_v1_pb2 as v1
-from atom.sampling_params import SamplingParams
+from atom.sampling_params import RequiredChannel, SamplingParams
 
 
 class FakeEngine:
@@ -396,6 +396,32 @@ def test_the_session_refuses_logprobs_it_would_not_serve(serve):
     assert engine.preprocessed == []
 
 
+def test_the_session_refuses_stop_strings_without_their_ids(serve):
+    engine = FakeEngine()
+    servicer = serve(engine)
+    session = servicer.sessions.open()
+    with pytest.raises(ValueError, match="stop_token_sequences"):
+        asyncio.run(servicer._submit(session, _submit(stop_strings=["END"])))
+    assert grpc_server._rejected(1, ValueError("x")).code == v1.RejectedRequest.INVALID
+    assert engine.preprocessed == []
+
+
+def test_the_session_holds_a_required_call_only_to_the_server_s_channel(
+    serve, monkeypatch
+):
+    own = RequiredChannel((5,), (6, 7), 1, (2,))
+    monkeypatch.setattr(api_server, "required_tool_channel", own)
+    engine = FakeEngine()
+    servicer = serve(engine)
+    session = servicer.sessions.open()
+    forged = RequiredChannel((1,), (3,), 1, (-1,))
+    with pytest.raises(ValueError, match="required_channel"):
+        asyncio.run(servicer._submit(session, _submit(required_channel=forged)))
+    assert engine.preprocessed == []
+    asyncio.run(servicer._submit(session, _submit(required_channel=own)))
+    assert len(engine.preprocessed) == 1
+
+
 def test_a_session_grammar_failure_is_rejected_as_internal(serve):
     engine = FakeEngine()
     session = serve(engine).sessions.open()
@@ -585,6 +611,60 @@ def test_a_failed_session_admits_no_submission_still_in_preprocess(serve, monkey
     session = asyncio.run(fail_during_preprocess())
     assert session.failed is not None and session.requests == {}
     assert engine.submitted == []
+
+
+def test_a_session_failed_in_structured_admission_aborts_once_its_seq_is_enqueued(
+    serve, monkeypatch
+):
+    monkeypatch.setattr(grpc_session, "OUTBOX", 0)  # its next message fails it
+    engine, entered, admit, events = (
+        FakeEngine(),
+        threading.Event(),
+        threading.Event(),
+        [],
+    )
+    servicer = serve(engine)
+    open_session, opened = servicer.sessions.open, []
+    monkeypatch.setattr(
+        servicer.sessions, "open", lambda: opened.append(open_session()) or opened[-1]
+    )
+
+    def add_request(seqs):  # the structured admission, on its thread
+        entered.set()
+        admit.wait(10)
+        events.append("enqueued")
+
+    monkeypatch.setattr(engine.core_mgr, "add_request", add_request)
+    monkeypatch.setattr(
+        engine.core_mgr, "abort_request", lambda seq_id: events.append("aborted")
+    )
+
+    class Context:
+        async def abort(self, code, details):
+            raise grpc.RpcError()
+
+    async def client():
+        batch = _submit_batch((3, "a", [1, 2]))
+        envelope = v1.Envelope.FromString(batch[0])
+        envelope.submit.requests[0].sampling.json_schema = '{"type": "object"}'
+        yield pb.Frames(frames=[envelope.SerializeToString(), *batch[1:]])
+        await asyncio.Event().wait()
+
+    async def fail_during_admission():
+        call = servicer.Session(client(), Context())
+        await anext(call)  # Ready
+        await asyncio.to_thread(entered.wait, 10)
+        opened[0].send([b"a step the client does not read"])  # cancels the reader
+        await asyncio.sleep(0.05)  # which settles its submission
+        with pytest.raises(grpc.RpcError):
+            await anext(call)  # the call ends
+        admit.set()
+        with pytest.raises(asyncio.CancelledError):
+            await opened[0].reader  # its submission settled, then aborted
+
+    asyncio.run(fail_during_admission())
+    # close() aborted it before it was enqueued, the admission once it was.
+    assert events == ["aborted", "enqueued", "aborted"]
 
 
 def test_a_session_submission_that_fails_after_a_send_aborts_its_seq(serve):
@@ -981,6 +1061,37 @@ def test_model_info_names_the_router_parsers(serve, monkeypatch):
     info = asyncio.run(serve(engine).GetModelInfo(pb.GetModelInfoRequest(), None))
     assert not info.HasField("tool_call_parser")
     assert not info.HasField("reasoning_parser")
+
+
+@pytest.mark.parametrize(
+    "encoder, usage_on_finish", [(None, False), ("encoding_dsv41", True)]
+)
+def test_model_info_places_streamed_usage_as_the_encoder_does(
+    serve, monkeypatch, encoder, usage_on_finish
+):
+    engine = FakeEngine()
+    engine.config.end_token_ids = [2]
+    monkeypatch.setattr(api_server, "tokenizer", SimpleNamespace(chat_template=None))
+    encoder = encoder and SimpleNamespace(name=encoder)
+    monkeypatch.setattr(api_server, "custom_message_encoder", encoder)
+    info = asyncio.run(serve(engine).GetModelInfo(pb.GetModelInfoRequest(), None))
+    assert info.usage_on_finish is usage_on_finish
+
+
+def test_model_info_says_how_a_reply_starts_in_reasoning(serve, monkeypatch):
+    engine = FakeEngine()
+    engine.config.end_token_ids = [2]
+    monkeypatch.setattr(api_server, "tokenizer", SimpleNamespace(chat_template=None))
+    info = asyncio.run(serve(engine).GetModelInfo(pb.GetModelInfoRequest(), None))
+    assert not info.HasField("implicit_reasoning_opener")
+    assert info.reasoning_toggle_json == ""
+    # DeepSeek-R1's template closes a <think> it never opens.
+    monkeypatch.setattr(api_server, "model_starts_in_reasoning", True)
+    monkeypatch.setattr(api_server, "reasoning_dialect", FALLBACK_DIALECT)
+    monkeypatch.setattr(api_server, "reasoning_toggle", ("thinking", False, True))
+    info = asyncio.run(serve(engine).GetModelInfo(pb.GetModelInfoRequest(), None))
+    assert info.implicit_reasoning_opener == FALLBACK_DIALECT.prompt_open_marker
+    assert json.loads(info.reasoning_toggle_json) == ["thinking", False, True]
 
 
 def test_server_info_carries_the_kv_event_sources_body(serve, monkeypatch):

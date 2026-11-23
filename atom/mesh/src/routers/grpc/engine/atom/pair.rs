@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -42,9 +42,12 @@ use crate::tokenizer::traits::Tokenizer;
 /// instance reports a chunked-transfer template.
 pub(crate) struct AtomPairs {
     info: RwLock<Arc<AtomPrefillInfo>>,
-    /// The worker each URL's info was read for: a worker registered again at that
-    /// URL is another, whose info is read afresh.
+    /// The worker each URL's info was read for, and each instance's (its base URL):
+    /// a worker registered again at that URL is another, whose info is read afresh.
     read_for: RwLock<HashMap<String, Weak<dyn Worker>>>,
+    /// Per instance, held while its GetServerInfo is read, so concurrent first pairs of
+    /// its ranks read it once.
+    reading: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     mapping: AtomPdRankMappingPolicy,
     workers: Arc<WorkerRegistry>,
 }
@@ -61,10 +64,12 @@ impl AtomPairs {
         for worker in workers.get_prefill_workers().iter().filter(|w| is_atom(w)) {
             learn(&mut info, worker).await.map_err(|e| e.to_string())?;
             read_for.insert(worker.url().to_string(), Arc::downgrade(worker));
+            read_for.insert(base_url(worker), Arc::downgrade(worker));
         }
         Ok(Self {
             info: RwLock::new(Arc::new(info)),
             read_for: RwLock::new(read_for),
+            reading: Mutex::default(),
             mapping,
             workers,
         })
@@ -84,7 +89,43 @@ impl AtomPairs {
         if read(&self.read_for.read().unwrap()) {
             return Ok(AtomAdapter::new(self.info.read().unwrap().clone()));
         }
+        let base = base_url(prefill);
+        let gate = self
+            .reading
+            .lock()
+            .unwrap()
+            .entry(base.clone())
+            .or_default()
+            .clone();
+        let _reading = gate.lock().await;
+        if read(&self.read_for.read().unwrap()) {
+            return Ok(AtomAdapter::new(self.info.read().unwrap().clone()));
+        }
         let mut learned = AtomPrefillInfo::default();
+        // A rank still registered read this instance: its info serves this sibling too.
+        let sibling = self
+            .read_for
+            .read()
+            .unwrap()
+            .get(&base)
+            .and_then(Weak::upgrade);
+        let registered = |w: &Arc<dyn Worker>| {
+            self.workers
+                .get_by_url(w.url())
+                .is_some_and(|r| Arc::ptr_eq(&r, w))
+        };
+        if sibling.is_some_and(|w| registered(&w)) {
+            let info = self.info.read().unwrap();
+            if let Some(tp) = info.tp_sizes.get(&base) {
+                learned.tp_sizes.insert(base.clone(), *tp);
+            }
+            if let Some(template) = info.chunked_transfer.get(&base) {
+                learned
+                    .chunked_transfer
+                    .insert(base.clone(), template.clone());
+            }
+        }
+        let read_instance = !learned.tp_sizes.contains_key(&base);
         learn(&mut learned, prefill).await?;
         let mut info = self.info.write().unwrap();
         let mut merged = AtomPrefillInfo::clone(&info);
@@ -94,7 +135,11 @@ impl AtomPairs {
         merged.tp_sizes.extend(learned.tp_sizes);
         merged.chunked_transfer.extend(learned.chunked_transfer);
         *info = Arc::new(merged);
-        self.read_for.write().unwrap().insert(url.to_string(), this);
+        let mut read_for = self.read_for.write().unwrap();
+        if read_instance {
+            read_for.insert(base, this.clone());
+        }
+        read_for.insert(url.to_string(), this);
         Ok(AtomAdapter::new(info.clone()))
     }
 
@@ -221,6 +266,11 @@ pub(crate) fn mixed_pair_refusal(placement: &PlacementPlan) -> Option<EngineErro
     }
 }
 
+/// The URL of `worker`'s instance, which its ranks share.
+fn base_url(worker: &Arc<dyn Worker>) -> String {
+    worker.base_url().trim_end_matches('/').to_string()
+}
+
 fn is_atom(worker: &Arc<dyn Worker>) -> bool {
     worker.metadata().runtime_type == RuntimeType::Atom
 }
@@ -235,7 +285,7 @@ pub(super) async fn atom_client(worker: &Arc<dyn Worker>) -> Option<AtomClient> 
 /// Adds `worker`'s TP size and chunked template to `info`, its instance's GetServerInfo
 /// read once.
 async fn learn(info: &mut AtomPrefillInfo, worker: &Arc<dyn Worker>) -> Result<(), EngineError> {
-    let base_url = worker.base_url().trim_end_matches('/').to_string();
+    let base_url = base_url(worker);
     if !info.tp_sizes.contains_key(&base_url) {
         let data = kv_transfer_info(worker).await?;
         let source = format!("{base_url} GetServerInfo");
