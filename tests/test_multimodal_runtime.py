@@ -268,7 +268,7 @@ class CountingTower(VisionModel):
         return super().get_vision_embeddings(values, grids)
 
 
-EC_PARAMS = {"session": "192.0.2.7:17000", "cache_seed": 9, "rows": 9}
+EC_PARAMS = {"session": "192.0.2.7:17000", "cache_seed": 9, "rows": 9, "length": 36}
 
 
 def run_chunks(model, cache, data, read, width=4):
@@ -356,16 +356,16 @@ def test_read_rows_get_the_span_row_check():
     assert model.calls == 0
 
 
-def test_runner_builds_one_reader_for_its_longest_prompt(monkeypatch):
+def test_runner_builds_one_reader_for_its_first_rows(monkeypatch):
     built = []
 
     class FakeReader:
-        def __init__(self, size_bytes, device):
-            built.append((size_bytes, device))
+        def __init__(self, size_bytes, device, *, max_bytes):
+            built.append((size_bytes, device, max_bytes))
             self.answers = [torch.ones(2, 3), None]
 
         def read(self, params, cache_seed, dtype):
-            assert (params, cache_seed, dtype) == (EC_PARAMS, 9, torch.bfloat16)
+            assert cache_seed == 9 and dtype == torch.bfloat16
             return self.answers.pop(0)
 
     runner = SimpleNamespace(
@@ -380,11 +380,38 @@ def test_runner_builds_one_reader_for_its_longest_prompt(monkeypatch):
         monkeypatch.setattr(ec_transport, "EcReader", FakeReader)
         read = load("atom.model_engine.model_runner").ModelRunner.read_image_embeddings
         first = read(runner, EC_PARAMS, 9, torch.bfloat16)
-        second = read(runner, EC_PARAMS, 9, torch.bfloat16)
+        second = read(runner, {**EC_PARAMS, "length": 9000}, 9, torch.bfloat16)
 
     assert torch.equal(first, torch.ones(2, 3)) and second is None
-    # Rows of `hidden_size` bf16 values, one per token of the longest prompt.
-    assert built == [(1000 * 6 * 2, "cuda:3")]
+    # The first request's rows, growing to rows of `hidden_size` bf16 values
+    # for every token of the longest prompt.
+    assert built == [(36, "cuda:3", 1000 * 6 * 2)]
+
+
+def test_runner_reader_never_starts_past_the_longest_prompt(monkeypatch):
+    built = []
+
+    class FakeReader:
+        def __init__(self, size_bytes, device, *, max_bytes):
+            built.append((size_bytes, max_bytes))
+
+        def read(self, *_args):
+            return None
+
+    runner = SimpleNamespace(
+        ec_reader=None,
+        device="cuda:0",
+        config=SimpleNamespace(
+            max_model_len=10, hf_config=SimpleNamespace(hidden_size=6)
+        ),
+    )
+    with atom_without_aiter() as load:
+        ec_transport = load("atom.kv_transfer.disaggregation.mooncake.ec_transport")
+        monkeypatch.setattr(ec_transport, "EcReader", FakeReader)
+        read = load("atom.model_engine.model_runner").ModelRunner.read_image_embeddings
+        read(runner, {**EC_PARAMS, "length": 1 << 30}, 9, torch.bfloat16)
+
+    assert built == [(120, 120)]
 
 
 @pytest.mark.parametrize(
