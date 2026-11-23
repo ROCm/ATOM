@@ -140,7 +140,6 @@ def _case(context_lens, q_lens, world, page, interleave, seed=0):
 
 def _plan(context_lens, tables, world, page, **kw):
     kw.setdefault("max_tokens", 1 << 20)
-    kw.setdefault("max_context", float("inf"))
     return dcp_ops.dcp_sparse_prefill_kv_plan(
         np.array(context_lens),
         tables,
@@ -248,19 +247,15 @@ def test_plan_rows_and_bases():
 
 
 @pytest.mark.parametrize(
-    "context_lens,max_tokens,max_context,taken",
+    "context_lens,max_tokens,taken",
     [
-        ([1024], 1 << 20, float("inf"), True),
-        ([65536], 1 << 15, float("inf"), False),  # over the token cap
-        ([131072], 1 << 20, 131072, True),  # at the context bound
-        ([131072, 1], 1 << 20, 131072, False),  # past it
+        ([1024], 1 << 20, True),
+        ([65536], 1 << 15, False),  # over the token cap
     ],
 )
-def test_plan_takes_kv_within_its_bounds(context_lens, max_tokens, max_context, taken):
+def test_plan_takes_kv_within_its_cap(context_lens, max_tokens, taken):
     tables = [list(range(-(-n // 64) + 1)) for n in context_lens]
-    plan = _plan(
-        context_lens, tables, 4, 16, max_tokens=max_tokens, max_context=max_context
-    )
+    plan = _plan(context_lens, tables, 4, 16, max_tokens=max_tokens)
     assert (plan is not None) == taken
 
 
@@ -272,7 +267,8 @@ def test_plan_refuses_a_block_table_too_short():
 # ------------------------------------------------------------------ wiring
 def _builder(monkeypatch, plan, nonps):
     """The builder fields `_dcp_sparse_prefill_step` reads; the plan and the
-    aiter metadata call are stubbed, recording the heads the plan is built for."""
+    aiter metadata call are stubbed, recording the step's total KV the plan
+    is given and the heads the work plan is built for."""
     seen = []
     b = object.__new__(aiter_mla.AiterMLAMetadataBuilder)
     b.dcp_world_size = 4
@@ -287,12 +283,17 @@ def _builder(monkeypatch, plan, nonps):
     b._sparse_prefill_work_views = lambda prefix, heads: {
         n: n for n in PERSISTENT_WORK_BUFFERS
     }
-    b._dcp_sparse_prefill_kv_plan = lambda batch: seen.append("plan") or plan
+    b._dcp_sparse_prefill_kv_plan = lambda batch, total_kv, num_tokens: (
+        seen.append(("plan", total_kv, num_tokens)) or plan
+    )
     monkeypatch.setattr(
         aiter_mla, "get_mla_metadata_v1", lambda *a, **k: seen.append(a[3])
     )
     md = SimpleNamespace(
-        sparse_cu_seqlens_q=None, sparse_kv_indptr=None, sparse_kv_last_page_lens=None
+        sparse_cu_seqlens_q=None,
+        sparse_kv_indptr=None,
+        sparse_kv_last_page_lens=None,
+        total_kv=7,
     )
     return b, md, seen
 
@@ -303,18 +304,18 @@ def test_a_kv_step_plans_this_ranks_heads(monkeypatch, nonps):
     padded heads, built even when the q path's non-persistent kernel reads none."""
     plan = object()
     b, md, seen = _builder(monkeypatch, plan, nonps)
-    b._dcp_sparse_prefill_step(None, md, "")
+    b._dcp_sparse_prefill_step(None, md, "", 3)
     assert md.dcp_sparse_prefill_kv is plan
-    assert seen == ["plan", 16]
+    assert seen == [("plan", 7, 3), 16]
     assert md.sparse_prefill_work_meta_data == "work_meta_data"
 
 
 @pytest.mark.parametrize("nonps,planned", [(True, []), (False, [64])])
 def test_a_q_step_keeps_its_plan(monkeypatch, nonps, planned):
     b, md, seen = _builder(monkeypatch, None, nonps)
-    b._dcp_sparse_prefill_step(None, md, "")
+    b._dcp_sparse_prefill_step(None, md, "", 3)
     assert md.dcp_sparse_prefill_kv is None
-    assert seen == ["plan"] + planned
+    assert seen == [("plan", 7, 3)] + planned
 
 
 def test_a_kv_step_plans_into_its_prefix_buffers(monkeypatch):
@@ -329,7 +330,7 @@ def test_a_kv_step_plans_into_its_prefix_buffers(monkeypatch):
         aiter_mla, "get_mla_metadata_v1", lambda *a, **k: seen.append(a[2])
     )
     md.sparse_kv_last_page_lens = object()
-    b._dcp_sparse_prefill_step(None, md, "ub0_")
+    b._dcp_sparse_prefill_step(None, md, "ub0_", 3)
     assert seen == ["ub0_", md.sparse_kv_last_page_lens]
 
 
@@ -345,13 +346,13 @@ def _finisher(monkeypatch, mode, prefix=""):
     b.kv_shuffled = False
     b.model_runner = SimpleNamespace(forward_vars={})
     staged = SimpleNamespace(index_rows=SimpleNamespace(passes=None), pcp_split=False)
-    staged.total_kv = staged.sparse_counts = None
+    staged.total_kv, staged.sparse_counts = None, np.ones(3)
     b._sparse_prefill_staged = {prefix: staged}
     b._sparse_prefill_work_plan = lambda md, prefix, heads, *a, **k: seen.append(
         ("work_plan", heads, prefix, a[0])
     )
-    b._dcp_sparse_prefill_step = lambda batch, md, prefix: seen.append(
-        ("kv_step", prefix)
+    b._dcp_sparse_prefill_step = lambda batch, md, prefix, n: seen.append(
+        ("kv_step", prefix, n)
     )
     b._finish_prefill_index_rows = lambda *a: None
     b._prefill_reads_token_csr = lambda md: False
@@ -374,7 +375,8 @@ def test_a_q_builder_skips_the_kv_step(monkeypatch, mode, want, prefix):
     b._finish_prefill_batch(SimpleNamespace(scheduled_bs=1), md, prefix)
     last_page = md.sparse_kv_last_page_lens
     assert seen == [
-        ("kv_step", prefix) if w == "kv_step" else (*w, prefix, last_page) for w in want
+        ("kv_step", prefix, 3) if w == "kv_step" else (*w, prefix, last_page)
+        for w in want
     ]
 
 
@@ -475,12 +477,17 @@ def test_a_step_publishes_its_widths_buffers(monkeypatch, kv, local, gathered):
     b.dcp_world_size = 2
     b.dcp_sparse_prefill_nonps = False
     b.block_size = 1
-    b._dcp_sparse_prefill_kv_plan = lambda batch: object() if kv else None
+    b._dcp_sparse_prefill_kv_plan = lambda batch, total_kv, n: (
+        object() if kv else None
+    )
     monkeypatch.setattr(aiter_mla, "get_mla_metadata_v1", lambda *a, **k: None)
     md = SimpleNamespace(
-        sparse_cu_seqlens_q=None, sparse_kv_indptr=None, sparse_kv_last_page_lens=None
+        sparse_cu_seqlens_q=None,
+        sparse_kv_indptr=None,
+        sparse_kv_last_page_lens=None,
+        total_kv=0,
     )
-    b._dcp_sparse_prefill_step(None, md, "")
+    b._dcp_sparse_prefill_step(None, md, "", 3)
     assert _sized_for(
         lambda name: getattr(md, f"sparse_prefill_{name}"),
         4096,
@@ -530,12 +537,15 @@ def test_a_q_builder_sizes_the_work_buffers_as_before():
     assert got == want
 
 
-def _resolver(monkeypatch, env, *, sparse=True, dcp=4, page=1, plugin=False, pcp=False):
+def _resolver(
+    monkeypatch, env, *, sparse=True, dcp=4, page=1, plugin=False, pcp=False, heads=16
+):
     monkeypatch.setenv("ATOM_DCP_SPARSE_PREFILL", env)
     monkeypatch.setattr("atom.plugin.is_plugin_mode", lambda: plugin)
     monkeypatch.setattr("atom.distributed.pcp_utils.pcp_is_enabled", lambda: pcp)
     b = object.__new__(aiter_mla.AiterMLAMetadataBuilder)
     b.is_sparse, b.dcp_world_size, b.block_size = sparse, dcp, page
+    b.num_attention_heads = heads
     return b
 
 
@@ -567,17 +577,20 @@ def test_an_unknown_transport_is_refused(monkeypatch):
         b._resolve_dcp_sparse_prefill_mode("fp8")
 
 
+@pytest.mark.parametrize("interleave", [1, 4])
 @pytest.mark.parametrize("mode,warmed", [("auto", True), ("kv", True), ("q", False)])
-def test_a_builder_that_can_take_kv_warms_the_index_kernel(monkeypatch, mode, warmed):
+def test_a_builder_that_can_take_kv_warms_the_index_kernel(
+    monkeypatch, mode, warmed, interleave
+):
     calls = []
     monkeypatch.setattr(
         dcp_ops, "warm_dcp_sparse_prefill_kv_index", lambda *a: calls.append(a)
     )
     b = _resolver(monkeypatch, mode)
     b._dcp_sparse_prefill_mode = mode
-    b.cp_kv_cache_interleave_size, b.index_topk, b.device = 1, TOPK, "dev"
+    b.cp_kv_cache_interleave_size, b.index_topk, b.device = interleave, TOPK, "dev"
     b._warm_dcp_sparse_prefill_kv()
-    assert calls == ([(4, 1, TOPK, "dev")] if warmed else [])
+    assert calls == ([(4, interleave, TOPK, "dev")] if warmed else [])
 
 
 @pytest.mark.parametrize("kw", [{"sparse": False}, {"dcp": 1}])
@@ -587,16 +600,15 @@ def test_a_builder_without_a_dcp_sparse_prefill_ignores_the_value(monkeypatch, k
 
 
 def _planner(monkeypatch, mode, max_tokens=1 << 20, dcp=4, heads=16):
-    """The builder fields `_dcp_sparse_prefill_kv_plan` reads, with the real
-    plan; records its warnings."""
+    """The builder fields `_dcp_sparse_prefill_kv_plan` reads, set by the real
+    resolver, with the real plan; records its warnings."""
+    monkeypatch.setenv("ATOM_DCP_SPARSE_PREFILL_KV_MAX_TOKENS", str(max_tokens))
+    b = _resolver(monkeypatch, mode, dcp=dcp, heads=heads)
+    assert b._resolve_dcp_sparse_prefill_mode("fp8") == mode
+    b._dcp_sparse_prefill_mode = mode
     warned = []
     monkeypatch.setattr(aiter_mla.logger, "warning", lambda *a: warned.append(a))
-    b = object.__new__(aiter_mla.AiterMLAMetadataBuilder)
-    b._dcp_sparse_prefill_mode = mode
-    b._dcp_sparse_prefill_kv_max_tokens = max_tokens
     b._dcp_sparse_prefill_kv_fallback_warned = False
-    b.dcp_world_size = dcp
-    b.num_attention_heads = heads
     b.model_runner = SimpleNamespace(block_size=16)
     b.device = torch.device(DEV)
     return b, warned
@@ -610,6 +622,13 @@ def _batch(context_lens, q_lens, tables=None, dummy=False):
         seqlens_q=np.array(q_lens),
         block_tables=tables,
         is_dummy_run=dummy,
+    )
+
+
+def _take(b, batch):
+    """The builder's plan for ``batch``, given its staged total KV and tokens."""
+    return b._dcp_sparse_prefill_kv_plan(
+        batch, int(batch.context_lens.sum()), int(batch.seqlens_q.sum())
     )
 
 
@@ -627,8 +646,18 @@ def _batch(context_lens, q_lens, tables=None, dummy=False):
 )
 def test_a_step_takes_kv_by_its_mode_and_batch(monkeypatch, mode, batch, taken):
     b, warned = _planner(monkeypatch, mode)
-    assert (b._dcp_sparse_prefill_kv_plan(batch) is not None) == taken
+    assert (_take(b, batch) is not None) == taken
     assert warned == []
+
+
+@pytest.mark.parametrize("over,taken", [(0, True), (1, False)])
+def test_auto_takes_kv_up_to_its_context_bound(monkeypatch, over, taken):
+    """Two requests sharing the bound exactly, then one row past it."""
+    b, _ = _planner(monkeypatch, "auto")
+    bound = dcp_ops.dcp_sparse_prefill_kv_context_bound(16, 128)
+    assert (
+        _take(b, _batch([bound - 1024, 1024 + over], [64, 64])) is not None
+    ) == taken
 
 
 @pytest.mark.parametrize(
@@ -638,14 +667,14 @@ def test_the_context_bound_is_tighter_with_fewer_heads(monkeypatch, dcp, heads, 
     """512K + 7K new tokens: under 200K + 52 per token at 16 heads a rank,
     over 40 at 8 (TP8), whatever the DCP size."""
     b, _ = _planner(monkeypatch, "auto", dcp=dcp, heads=heads)
-    plan = b._dcp_sparse_prefill_kv_plan(_batch([524288], [7168]))
+    plan = _take(b, _batch([524288], [7168]))
     assert (plan is not None) == taken
 
 
 def test_a_256k_hit_with_1k_new_tokens_stays_on_q(monkeypatch):
     """Measured on GLM-5.2-FP8 tp4/dcp4: q 0.428 s, kv 0.449 s."""
     b, _ = _planner(monkeypatch, "auto")
-    assert b._dcp_sparse_prefill_kv_plan(_batch([262144], [1024])) is None
+    assert _take(b, _batch([262144], [1024])) is None
 
 
 def test_a_plan_at_the_cap_uploads_under_the_pageable_cliff(monkeypatch):
@@ -669,7 +698,7 @@ def test_a_plan_at_the_cap_uploads_under_the_pageable_cliff(monkeypatch):
 def test_only_a_forced_kv_warns_over_the_cap(monkeypatch, mode, warns):
     b, warned = _planner(monkeypatch, mode, max_tokens=1 << 12)
     for _ in range(2):
-        assert b._dcp_sparse_prefill_kv_plan(_batch([65536], [65536])) is None
+        assert _take(b, _batch([65536], [65536])) is None
     assert len(warned) == warns
 
 
@@ -791,7 +820,6 @@ def test_a_sparse_prefill_takes_the_transport_its_plan_names(monkeypatch, kv):
 )
 def test_a_kv_prefill_projects_only_this_ranks_heads(monkeypatch, kv, env, group):
     """ATOM_DCP_PREFILL_QREP projects the group's heads for a "q" step only."""
-    monkeypatch.setenv("ATOM_DCP_PREFILL_QREP", env)
     monkeypatch.setattr(
         attention_mla,
         "get_forward_context",
@@ -815,6 +843,7 @@ def test_a_kv_prefill_projects_only_this_ranks_heads(monkeypatch, kv, env, group
     a = _kv_attention()
     a.layer_num = 0
     a.qrep_enabled = True
+    a.dcp_prefill_qrep = env == "1"
     with pytest.raises(_Stop):
         attention_mla.MLAAttention.forward_impl(a, torch.zeros(2, 8), None, None)
     assert seen == {"group": group}
@@ -983,9 +1012,7 @@ def test_auto_profiles_every_row_it_can_gather(tokens, heads, many):
     context = np.full(n, (bound // n - 1) // stride * stride + 1, dtype=np.int64)
     context[-1] += bound - context.sum()
     tables = [np.arange(cap // block, dtype=np.int32)] * n
-    plan = dcp_ops.dcp_sparse_prefill_kv_plan(
-        context, tables, dcp, block, cap, bound, DEV
-    )
+    plan = dcp_ops.dcp_sparse_prefill_kv_plan(context, tables, dcp, block, cap, DEV)
     held = dcp_ops.dcp_sparse_prefill_kv_profile_rows(
         "auto", tokens, heads, max_num_seqs, block, dcp, cap
     )

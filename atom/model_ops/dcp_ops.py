@@ -1862,11 +1862,12 @@ def triton_filter_and_convert_dcp_index_prefill(
 # CONTEXT_BASE + context_per_new_token(heads a rank) * its new tokens: the
 # gather grows with the context, "q" with the new tokens. Fitted on
 # GLM-5.2-FP8 fp8 KV with a cached prefix + 64 / 1K / 16K new tokens,
-# 32K-960K: k in [48.5, 57)
-# classifies all 18 tp4/dcp4 points (16 heads a rank), 40 all tp8/dcp8 ones
-# (8 heads a rank). k follows the heads a rank attends, which "kv" pays for:
-# fewer heads, less attention for the gather to save. 16 or more heads a rank
-# take 52, fewer take 40. A forced "kv" skips it; both stay under the cap.
+# 32K-960K on MI355X (gfx950): k in [48.5, 57) classifies all 18 tp4/dcp4
+# points (16 heads a rank), 40 all tp8/dcp8 ones (8 heads a rank); on MI300X
+# at tp8/dcp8 the bound is conservative. k follows the heads a rank attends,
+# which "kv" pays for: fewer heads, less attention for the gather to save. 16
+# or more heads a rank take 52, fewer take 40. A forced "kv" skips it; both
+# stay under the cap.
 DCP_SPARSE_PREFILL_KV_CONTEXT_BASE = 200 * 1024
 
 
@@ -1995,7 +1996,6 @@ def dcp_sparse_prefill_kv_plan(
     dcp_world_size: int,
     block_size: int,
     max_tokens: int,
-    max_context: float,
     device: torch.device,
 ) -> DcpSparsePrefillKV | None:
     """The "kv" layout for a prefill step, or None to keep the "q" path.
@@ -2009,8 +2009,6 @@ def dcp_sparse_prefill_kv_plan(
     """
     context_lens = np.asarray(context_lens, dtype=np.int64)
     if len(context_lens) == 0 or len(block_tables) < len(context_lens):
-        return None
-    if context_lens.sum() > max_context:
         return None
     padded = dcp_padded_local_lens(context_lens, dcp_world_size, block_size)
     rows_pad = int(padded.sum())

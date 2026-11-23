@@ -398,9 +398,9 @@ def mla_dcp_sparse_prefill_num_heads(
     *,
     persistent: bool = False,
 ) -> int:
-    """Width to pad the GATHERED query heads to for a DCP sparse prefill.
+    """Width to pad the GATHERED query heads to for a "q" DCP sparse prefill.
 
-    Sparse prefill all-gathers Q on the head dim too, so what dispatches is
+    A "q" sparse prefill all-gathers Q on the head dim too, so what dispatches is
     ``num_heads * dcp_world_size``, not the per-rank count -- needs its own
     table (``_MLA_DCP_SPARSE_PREFILL_WIDTHS``) since decode's widths don't
     compute correctly here.
@@ -844,6 +844,7 @@ class MLAAttention(nn.Module):
         self.qrep_enabled = qrep_enabled_for_layer(
             wants_qrep, self.q_proj, self.qrep_num_heads, self.qk_head_dim
         )
+        self.dcp_prefill_qrep = envs.ATOM_DCP_PREFILL_QREP
         # Keyed on type(self), not the MLAAttention base class: subclasses
         # (SGLangATOMGLM52MLAAttention, the vLLM plugin's AttentionForVllmMLA)
         # would otherwise share one base-class flag/set and mask each other.
@@ -1006,7 +1007,7 @@ class MLAAttention(nn.Module):
                 self.dcp_kernel_num_heads - self.num_heads * dcp_world_size
             )
 
-        # Sparse prefill gathers query heads too, and needs its own width
+        # A "q" sparse prefill gathers query heads too, and needs its own width
         # (mla_dcp_sparse_prefill_num_heads), sized here so the vllm plugin's
         # re-init picks both up. Uses its own persistence predicate so it
         # can't silently borrow decode's answer if the two ever diverge.
@@ -3262,7 +3263,7 @@ class MLAAttention(nn.Module):
                 self.use_seg_mla,
                 context.is_prefill,
                 context.is_prefill
-                and envs.ATOM_DCP_PREFILL_QREP
+                and self.dcp_prefill_qrep
                 and attn_metadata.dcp_sparse_prefill_kv is None,
             )
             q_nope, q_rope = self._q_proj_and_k_up_proj(
