@@ -106,6 +106,8 @@ class Indexer(nn.Module):
             quant_config=converted_linear_config(config),
         )
         self.weights_proj = ReplicatedLinear(config.hidden_size, self.heads, bias=False)
+        # The selected backend may own the TP-replicated prefill queries.
+        self.prefill_index_tp = None
         if spec.mode == AttentionMode.FULL:
             self.wk = ReplicatedLinear(config.head_dim, self.head_dim, bias=False)
             self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
@@ -152,7 +154,12 @@ class Indexer(nn.Module):
         query = self.wq_b(qr, x_scale=qr_scale).unflatten(
             -1, (self.heads, self.head_dim)
         )
-        weights = self.weights_proj(hidden)[0]
+        strategy = self.prefill_index_tp
+        weights = (
+            strategy.project_weights(hidden, self.weights_proj)[0]
+            if strategy is not None and strategy.canonical(cache, step)
+            else self.weights_proj(hidden)[0]
+        )
         if cache.geometry.index_fp4:
             units = cache.index_units[self.spec.kv_owner]
             return (
@@ -185,6 +192,10 @@ class Indexer(nn.Module):
                 topk=self.topk,
                 weights_scale=self.weights_scale,
                 workspace=cache.workspace,
+                row_split=(
+                    None if self.prefill_index_tp is None else
+                    self.prefill_index_tp.rows(self.spec.layer_id, cache, step, weights.shape[0])
+                ),
                 **self._bounds(cache, step),
             ),
             step,

@@ -31,7 +31,7 @@ from aiter.dist.parallel_state import (
 from torch.profiler import record_function
 
 from atom import structured_output
-from atom.config import Config, set_current_atom_config
+from atom.config import CompilationLevel, Config, set_current_atom_config
 from atom.distributed.group_agreement import agree_kv_budget, group_min
 from atom.distributed.pcp_utils import (
     PcpBalGroup,
@@ -1364,8 +1364,13 @@ class ModelRunner:
         # (EAGLE gets that free -- its first draft step is a many-row prefill).
         # Other cases only need the usual >= 1 floor. From the config: under PP
         # only the last stage has a drafter, and every stage runs the same rows.
+        # Without compilation (level 0) nothing is first-compiled, so the floor stays 1 and a max_num_seqs=1
+        # deployment (whose per-sequence buffers hold one row) can warm up.
         spec_config = self.config.speculative_config
-        min_seqs = 2 if spec_config and spec_config.use_dspark() else 1
+        compiled = (
+            self.config.compilation_config.level != CompilationLevel.NO_COMPILATION
+        )
+        min_seqs = 2 if compiled and spec_config and spec_config.use_dspark() else 1
         num_seqs = max(num_seqs, min_seqs)
 
         # Split the token budget across the seqs so >1 sequences never exceed it

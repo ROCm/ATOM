@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 import torch
 
-from atom.models.deepseek_v41.mono import index_plan as ip
+from atom.models.deepseek_v41.mono.gfx950.k1k2 import index_plan as ip
 
 EDGES = [0, 1, 2, ip.CHUNK - 1, ip.CHUNK, ip.CHUNK + 1, ip.TOPK - 1, ip.TOPK,
          ip.TOPK + 1, ip.SEG - 1, ip.SEG, ip.SEG + 1, 2 * ip.SEG - 1, 2 * ip.SEG,

@@ -23,6 +23,8 @@ measured on the production geometry: `/app/logs_claude/v41_index_scorer_record.m
 
 import torch
 
+from atom.model_ops.indexer.rows import _plane_bands
+
 from atom.model_ops.indexer import (
     IndexCache,
     fold_query_scale,
@@ -75,6 +77,7 @@ def score_topk_paged(
     block_size=8,
     candidate_count=0,
     workspace=None,
+    row_split=None,
 ):
     """`(selected, candidate blocks)` for a whole forward's FP8 query rows:
     `query` rotated, quantized here, its scale folded into the head weights.
@@ -98,6 +101,7 @@ def score_topk_paged(
         block_size=block_size,
         candidate_count=candidate_count,
         workspace=workspace,
+        row_split=row_split,
     )
 
 
@@ -116,6 +120,7 @@ def score_topk_quantized(
     weight_scale=1.0,
     ragged=None,
     packed=None,
+    row_split=None,
 ):
     """`score_topk_paged` past its query quantization, in `units`' format.
     FP8: `query` [rows, heads, dim] e4m3 and `scaled` [rows, heads] fp32, the
@@ -165,6 +170,15 @@ def score_topk_quantized(
         bound = packed.visible
     rows = _index_rows(cache, scaled, table, bound, width, ragged, packed, workspace)
     count = scaled.shape[0]
+    if row_split is not None:
+        assert not cache.fp4 and rows.next_n == 1
+        assert ragged is None and packed is None
+        assert candidates is None and candidate_count == 0
+        assert row_split.group == "tp" and row_split.world == 8
+        rows = rows._replace(
+            split=row_split,
+            bands=_plane_bands(row_split.first, row_split.end, width, workspace),
+        )
     chosen = (
         torch.empty(count, candidate_count, dtype=torch.int32, device=scaled.device)
         if candidate_count
@@ -188,6 +202,8 @@ def score_topk_quantized(
         # Columns of the compacted width, which only this function knows how to
         # read; every caller past it wants compressed-row ids.
         lift_candidate_selection(selected, candidates.ids, rows_per_block=tile)
+    if row_split is not None:
+        selected = selected[:count]
     # Ascending already: `stable=True` is aiter's deterministic ascending,
     # smallest-index-first emit with `-1` for a short row, which is the order
     # the attention kernel sums its prefix in.

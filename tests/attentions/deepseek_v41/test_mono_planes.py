@@ -24,7 +24,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T
 
 from atom.model_ops.attentions.deepseek_v41.planes import split_source
-from atom.models.deepseek_v41.mono.kernels import attention, attn_pre
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels import attention, attn_pre
 from atom.mono.device.ops import ld_f32, ld_i32, rsrc
 
 

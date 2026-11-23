@@ -332,7 +332,7 @@ def test_pd_checks_physical_layout_before_writing(
 @pytest.mark.parametrize("fp4", [False, True])
 def test_reference_score_weight_contract(fp4):
     pytest.importorskip("aiter")
-    from atom.models.deepseek_v41.mono.check import check_index_score
+    from atom.models.deepseek_v41.mono.gfx950.k1k2.check import check_index_score
 
     original = torch.tensor([[0.125, -2.5, 0.0, 17.0]], dtype=torch.bfloat16)
     scale = 1.0 / 64
