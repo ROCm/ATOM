@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (c) 2026 ATOM Project Contributors
 //! ATOM workers over `atom.grpc.v1`: the client, a payload as a GenerateRequest,
 //! a Generate stream as `TokenChunk`s, ATOM's P/D flow for a pair, and the Session.
 

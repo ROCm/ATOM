@@ -192,10 +192,11 @@ pub fn prepare_chat_declaring(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    // The reply's tool calls are read against every tool the chat declares.
+    // The reply's tool calls are read against every tool the chat declares; none
+    // declared, ATOM's HTTP chat parses none.
     let rendered_for = match &message_tools {
         Some(declared) => Arc::new(ChatCompletionRequest {
-            tools: Some(declared.with_top_level(req.tools.as_ref())),
+            tools: Some(declared.with_top_level(req.tools.as_ref())).filter(|t| !t.is_empty()),
             ..(*req).clone()
         }),
         None => Arc::clone(&req),
