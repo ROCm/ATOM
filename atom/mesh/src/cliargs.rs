@@ -125,11 +125,7 @@ pub enum Backend {
 
 impl std::fmt::Display for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Backend::Sglang => write!(f, "sglang"),
-            Backend::Vllm => write!(f, "vllm"),
-            Backend::Atom => write!(f, "atom"),
-        }
+        f.write_str(BackendType::from(*self).as_str())
     }
 }
 
@@ -213,6 +209,8 @@ pub struct CliArgs {
     pub ext_proc: crate::ext_proc::ExtProcConfig,
     #[command(flatten)]
     pub prepare_pool: crate::config::PreparePoolConfig,
+    #[command(flatten)]
+    pub rl: crate::rl::RlConfig,
     // ==================== Worker Configuration ====================
     /// Host address to bind the router server
     #[arg(long, default_value = "0.0.0.0", help_heading = "Worker Configuration")]
@@ -647,6 +645,7 @@ impl CliArgs {
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
             .prepare_pool(self.prepare_pool.clone())
+            .rl(self.rl.clone())
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
@@ -883,6 +882,7 @@ impl Default for CliArgs {
             #[cfg(feature = "ext-proc")]
             ext_proc: Default::default(),
             prepare_pool: Default::default(),
+            rl: Default::default(),
             host: "0.0.0.0".to_string(),
             port: 30000,
             worker_urls: Vec::new(),

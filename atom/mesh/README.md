@@ -225,6 +225,52 @@ USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server mesh-only \
 Supported reasoning parsers: `deepseek-r1`, `qwen3`, `qwen3-thinking`, `kimi`, `glm45`, `glm47`, `step3`, `minimax`.  
 Supported tool parsers: `json`, `python`, `xml`.
 
+### RL rollout control (`--enable-rl`)
+
+With `--enable-rl`, Atomesh mounts an RL control plane under `/v1/rl` that
+speaks the protocol of SMG's RL control plane
+([smg-project/smg@6c7bda1](https://github.com/smg-project/smg/tree/6c7bda118c5c6c02e65fe104cc8d93a0f906c965/crates/rl)).
+Without the flag no route is added.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/v1/rl/workers` | `protocol_version`, `total` and one row per worker: `engine` (the `--backend`, or the runtime of a gRPC worker), `tp_size` / `dp_size` / `pp_size`, health, the `weight_version` label, labels and capabilities. DP ranks sharing a base URL make one row (`dp_ranks`) |
+| `GET` | `/v1/rl/workers/{id}` | One row; an unknown id answers 404 `worker_not_found` |
+| `GET` / `POST` | `/v1/rl/workers/{id}/engine/{path}` | One engine route of one worker, called with the caller's body and query (less any `selector`); answers the engine's status and an outcome with its body |
+
+`{path}` is the engine's own route, such as `pause_generation`,
+`update_weights_from_disk`, `continue_generation` or `model_info`: 1 to 4
+segments of `[A-Za-z0-9._-]`, else 400 `invalid_engine_path`. The engine must
+serve it. The call carries the worker's API key, not the caller's
+`Authorization`, and `x-request-id`, `traceparent` and `tracestate`. A call
+that does not complete answers 502 `upstream_unreachable` or 504
+`upstream_timeout`. Once a worker's status has arrived, the outcome keeps it:
+a body past 1 MiB is cut and sets `body_truncated`, and a body that fails to
+read sets `body_error`, with `body` holding the text read before the failure.
+
+Every `/v1/rl` request must carry `Authorization: Bearer <token>` matching
+`--rl-api-key`; any other request answers 401 `unauthorized`. `--enable-rl`
+without `--rl-api-key` fails at startup. Engine control calls carry each
+worker's API key to it, so only a caller holding the token gets Atomesh to act
+with those keys; keep it as secret as the worker keys.
+
+Capabilities come from a per-engine table (`sglang`, `vllm`) and can be
+overridden with `rl.*` worker labels (`rl.pause_modes`, `rl.update_from` as
+comma lists; `rl.abort`, `rl.flush_cache`, `rl.sleep_wake`,
+`rl.reports_weight_version` as `true/false`, `1/0`, `yes/no` or `on/off` in
+any case; any other value keeps the table's). `--backend atom` has no table
+row yet: its workers list with empty capabilities. For `--backend atom`,
+discovery also reads `tp_size` and `dp_size` from each worker's
+`/server_info`, so a trainer can lay out ranks. A gRPC worker lists with
+`control_url: null`: it cannot be controlled through `/v1/rl`, and a control
+call to it answers 422 `no_control_endpoint`.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--enable-rl` | off | Mount the `/v1/rl` routes |
+| `--rl-api-key` | none | Bearer token the `/v1/rl` routes require; required with `--enable-rl` |
+| `--rl-control-timeout-secs` | 600 | Total timeout of one engine control call; a refit can take minutes |
+
 ## Architecture
 
 ### Control plane
