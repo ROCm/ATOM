@@ -23,7 +23,10 @@ use crate::{
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
     reasoning_parser::ParserFactory as ReasoningParserFactory,
-    routers::{atom_standalone::AtomStandaloneRuntime, router_manager::RouterManager},
+    routers::{
+        atom_standalone::AtomStandaloneRuntime, prepare::fast_tokenizer::TokenizeLimits,
+        router_manager::RouterManager,
+    },
     tokenizer::registry::TokenizerRegistry,
     tool_parser::ParserFactory as ToolParserFactory,
 };
@@ -52,6 +55,8 @@ pub struct AppContext {
     /// their Jinja template, found as each registers. HTTP routing does not
     /// tokenize those chats.
     pub chats_without_template: Arc<RwLock<HashSet<String>>>,
+    /// `router_config`'s tokenization byte limits.
+    pub(crate) tokenize_limits: TokenizeLimits,
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
     pub tool_parser_factory: Option<ToolParserFactory>,
     pub worker_registry: Arc<WorkerRegistry>,
@@ -280,6 +285,7 @@ impl AppContextBuilder {
         }
         let kv_storage = (router_config.kv_events)
             .then(|| Arc::new(StorageSources::new(router_config.mooncake_admin_port)));
+        let tokenize_limits = TokenizeLimits::new(&router_config);
         Ok(AppContext {
             prepare_pool: self
                 .prepare_pool
@@ -292,6 +298,7 @@ impl AppContextBuilder {
                 .tokenizer_registry
                 .ok_or(AppContextBuildError("tokenizer_registry"))?,
             chats_without_template: Default::default(),
+            tokenize_limits,
             reasoning_parser_factory: self.reasoning_parser_factory,
             tool_parser_factory: self.tool_parser_factory,
             worker_registry,
