@@ -708,10 +708,6 @@ class TestStatsDistinct:
         assert d._stat_fire_fill == 1
 
 
-if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-v"]))
-
-
 @pytest.mark.parametrize("exchange_costs", [False, True])
 def test_host_writes_and_collective_share_storage_across_ticks(exchange_costs):
     d = make_delayer(exchange_prefill_costs=exchange_costs)
@@ -733,3 +729,7 @@ def test_host_writes_and_collective_share_storage_across_ticks(exchange_costs):
             assert snapshots[-1][_FIXED_SLOTS] == cost
             assert d.rank_prefill_costs == [float(cost + 7)]
     assert [row[0] for row in snapshots] == [1, 1]
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
