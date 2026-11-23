@@ -589,6 +589,55 @@ async fn a_ready_of_another_protocol_version_is_refused() {
     assert!(submitted(&mut call, 1).await.contains_key("accepted"));
 }
 
+/// Waits for the client to drop `call`: it stops reading ATOM's half as well as
+/// sending its own.
+async fn assert_ends(mut call: Call) {
+    let ended = timeout(Duration::from_secs(5), call.inbound.message()).await;
+    let ended = ended.expect("the client kept sending on the call");
+    assert!(!matches!(ended, Ok(Some(_))), "{ended:?}");
+    let dropped = timeout(Duration::from_secs(5), call.outbound.closed()).await;
+    dropped.expect("the client kept reading the call");
+}
+
+#[tokio::test]
+async fn an_opening_without_ready_is_bounded_and_one_no_request_waits_for_ends() {
+    let (ranks, mut calls) = instance().await;
+    let sessions = AtomSessions {
+        opening: Duration::from_millis(300),
+        ..Default::default()
+    };
+    // ATOM accepts the call but never sends Ready: the request fails, the call ends.
+    let first = sessions.submit(&ranks[0], spec("first"), vec![1], true);
+    let (call, refused) = tokio::join!(
+        async { timeout(HANG, calls.recv()).await.unwrap().unwrap() },
+        timeout(Duration::from_secs(5), first)
+    );
+    let refused = refused.expect("the opening was not bounded");
+    assert!(
+        matches!(&refused, Err(EngineError::Transport(status))
+            if status.code() == tonic::Code::DeadlineExceeded),
+        "{:?}",
+        refused.err()
+    );
+    assert_ends(call).await;
+
+    // A request that gives up while its Session opens ends that call, long before
+    // the bound.
+    let patient = AtomSessions::default();
+    let abandoned = patient.submit(&ranks[1], spec("abandoned"), vec![1], true);
+    let call = tokio::select! {
+        _ = abandoned => panic!("opened without Ready"),
+        call = calls.recv() => call.unwrap(),
+    };
+    assert_ends(call).await;
+
+    // The next request opens a new call and runs on it.
+    let next = sessions.submit(&ranks[0], spec("next"), vec![1], true);
+    let (mut call, opened) = opening(&mut calls, PROTOCOL_VERSION, next).await;
+    assert!(opened.is_ok());
+    assert!(submitted(&mut call, 1).await.contains_key("next"));
+}
+
 #[test]
 fn seq_ids_stay_below_2_24_and_skip_those_open_requests_hold() {
     let mut routes = Routes {

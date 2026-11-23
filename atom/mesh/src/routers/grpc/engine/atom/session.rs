@@ -9,7 +9,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::thread;
+use std::time::Duration;
 
+use futures::future::{BoxFuture, FutureExt, WeakShared};
 use futures::{stream, Stream, StreamExt};
 use http::StatusCode;
 use parking_lot::Mutex;
@@ -36,13 +38,35 @@ use crate::routers::token_handle::engine_error::EngineError;
 /// 1 << `_SEQ_ID_SHIFT` (atom/entrypoints/openai/frontend_workers.py), which this must equal.
 const SEQ_IDS: u64 = 1 << 24;
 
+/// How long opening a Session may take, from connecting to ATOM's Ready.
+const OPENING: Duration = Duration::from_secs(10);
+
 type Output = Result<GenerateResponse, Status>;
+
+/// A Session being opened, which every request waiting for it shares.
+type Opening = BoxFuture<'static, Result<Session, Arc<EngineError>>>;
 
 /// Each ATOM instance's Session (base URL, all its ranks), opened by the first
 /// request to it and again by the first request after it has failed.
-#[derive(Default)]
 pub(crate) struct AtomSessions {
-    slots: Mutex<HashMap<String, Arc<tokio::sync::Mutex<Option<Session>>>>>,
+    slots: Mutex<HashMap<String, Slot>>,
+    /// Bounds each opening; OPENING but in tests.
+    opening: Duration,
+}
+
+impl Default for AtomSessions {
+    fn default() -> Self {
+        Self {
+            slots: Mutex::default(),
+            opening: OPENING,
+        }
+    }
+}
+
+enum Slot {
+    Open(Session),
+    /// Held weakly: when every request waiting for it has gone, the opening is dropped.
+    Opening(WeakShared<Opening>),
 }
 
 impl AtomSessions {
@@ -58,19 +82,53 @@ impl AtomSessions {
         self.session(worker).await?.submit(spec, prompt, stream)
     }
 
+    /// The instance's open Session, else the one being opened, else a new opening;
+    /// no lock is held while it opens.
     async fn session(&self, worker: &Arc<dyn Worker>) -> Result<Session, EngineError> {
-        let url = worker.base_url().trim_end_matches('/');
-        let slot = self
-            .slots
-            .lock()
-            .entry(url.to_string())
-            .or_default()
-            .clone();
-        let mut slot = slot.lock().await;
-        if let Some(session) = slot.as_ref().filter(|session| session.is_open()) {
-            return Ok(session.clone());
+        let url = worker.base_url().trim_end_matches('/').to_string();
+        let opening = {
+            let mut slots = self.slots.lock();
+            let joined = match slots.get(&url) {
+                Some(Slot::Open(session)) if session.is_open() => return Ok(session.clone()),
+                Some(Slot::Opening(opening)) => opening.upgrade(),
+                _ => None,
+            };
+            joined.unwrap_or_else(|| {
+                let opening = Session::open(url.clone(), self.opening).boxed().shared();
+                let weak = opening.downgrade().expect("an opening not yet polled");
+                slots.insert(url.clone(), Slot::Opening(weak));
+                opening
+            })
+        };
+        let opened = opening.clone().await;
+        let mut slots = self.slots.lock();
+        let ours = matches!(slots.get(&url), Some(Slot::Opening(slot))
+            if slot.upgrade().is_some_and(|slot| slot.ptr_eq(&opening)));
+        match opened {
+            Ok(session) => {
+                if ours {
+                    slots.insert(url, Slot::Open(session.clone()));
+                }
+                Ok(session)
+            }
+            Err(e) => {
+                if ours {
+                    slots.remove(&url);
+                }
+                Err(cloned(&e))
+            }
         }
-        Ok(slot.insert(Session::open(url).await?).clone())
+    }
+}
+
+/// An opening's error for each request that waited for it.
+fn cloned(e: &EngineError) -> EngineError {
+    match e {
+        EngineError::Transport(status) => EngineError::Transport(status.clone()),
+        EngineError::ConnectionAcquireFailed(url) => {
+            EngineError::ConnectionAcquireFailed(url.clone())
+        }
+        other => EngineError::Transport(Status::internal(other.to_string())),
     }
 }
 
@@ -89,18 +147,19 @@ enum Command {
 
 impl Session {
     /// Opens the call on a connection and thread of its own, off the router's runtime;
-    /// waits for ATOM's Ready, refusing one of another protocol version.
-    async fn open(url: &str) -> Result<Self, EngineError> {
+    /// waits up to `bound` for ATOM's Ready, refusing one of another protocol version.
+    /// Dropped before it opens, it ends the call and the thread.
+    async fn open(url: String, bound: Duration) -> Result<Self, Arc<EngineError>> {
         let (commands, queued) = mpsc::unbounded_channel();
         let routes = Arc::new(Mutex::new(Routes::default()));
         let (opened, ready) = oneshot::channel();
-        let (url, read_into) = (url.to_string(), routes.clone());
+        let read_into = routes.clone();
         thread::Builder::new()
             .name("atom-session".into())
-            .spawn(move || run(url, queued, read_into, opened))
+            .spawn(move || run(url, bound, queued, read_into, opened))
             .map_err(|e| EngineError::Transport(Status::internal(e.to_string())))?;
         let gone = |_| EngineError::Transport(Status::internal("the Session thread ended"));
-        ready.await.map_err(gone)??;
+        ready.await.map_err(gone).and_then(|opened| opened)?;
         Ok(Self { routes, commands })
     }
 
@@ -144,13 +203,15 @@ impl Session {
     }
 }
 
-/// The Session's thread: a runtime of its own, which connects, opens the call and reads
-/// it until it ends; `opened` gets how the opening went.
+/// The Session's thread: a runtime of its own, which connects, opens the call within
+/// `bound` and reads it until it ends; `opened` gets how the opening went. With no one
+/// left to tell, it ends the call.
 fn run(
     url: String,
+    bound: Duration,
     queued: mpsc::UnboundedReceiver<Command>,
     routes: Arc<Mutex<Routes>>,
-    opened: oneshot::Sender<Result<(), EngineError>>,
+    mut opened: oneshot::Sender<Result<(), EngineError>>,
 ) {
     let runtime = match runtime::Builder::new_current_thread().enable_all().build() {
         Ok(runtime) => runtime,
@@ -160,10 +221,19 @@ fn run(
         }
     };
     runtime.block_on(async move {
-        match start(&url, queued).await {
+        let started = tokio::select! {
+            started = tokio::time::timeout(bound, start(&url, queued)) => {
+                started.unwrap_or_else(|_| Err(EngineError::Transport(Status::deadline_exceeded(
+                    format!("ATOM Session: no Ready within {bound:?}"),
+                ))))
+            }
+            _ = opened.closed() => return,
+        };
+        match started {
             Ok((_client, inbound)) => {
-                let _ = opened.send(Ok(()));
-                read(inbound, routes, url).await;
+                if opened.send(Ok(())).is_ok() {
+                    read(inbound, routes, url).await;
+                }
             }
             Err(e) => {
                 let _ = opened.send(Err(e));
