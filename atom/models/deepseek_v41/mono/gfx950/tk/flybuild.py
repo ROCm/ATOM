@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import codeobj
-from .host import ADMIT_SYMBOL
+from .host import ADMIT_SYMBOL, INDEXER_MODE2_SYMBOLS
 
 KERNELS = "atom.models.deepseek_v41.mono.gfx950.tk.kernels"
 _T = "_ZN6tilert3ops13ds_v4_1_flash"
@@ -96,10 +96,16 @@ RECIPES: tuple[Recipe, ...] = (
     Recipe("admit", ADMIT_SYMBOL, "admit"),
     Recipe("kv_extract", KV_EXTRACT_SYMBOL, "kv_extract"),
 )  # fmt: skip
+INDEXER_READER_RECIPES = tuple(
+    Recipe(f"indexer_mode2_{kr}", INDEXER_MODE2_SYMBOLS[_T + _IX.format(f"i{kr}", "i1")],
+           "indexer", "build_mode2", (("TK_IX", str(kr)),), 7)
+    for kr in (499, 243)
+)
+RECIPES += INDEXER_READER_RECIPES
 BY_KEY = {r.key: r for r in RECIPES}
 # outside the step's graphs: a request's admission, the token table build's kv
 OUTSIDE_STEP = ("admit", "kv_extract")
-STEP_RECIPES = tuple(r for r in RECIPES if r.key not in OUTSIDE_STEP)
+STEP_RECIPES = tuple(r for r in RECIPES if r.key not in OUTSIDE_STEP and r not in INDEXER_READER_RECIPES)
 
 
 # ---------------------------------------------------------------------------------------------------------------

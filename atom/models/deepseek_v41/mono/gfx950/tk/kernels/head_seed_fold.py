@@ -39,6 +39,7 @@ from atom.models.deepseek_v41.mono.gfx950.tk.kernels.common import (
     bperm,
     f32c,
     log1p_ocml,
+    spin_pause,
 )
 from atom.models.deepseek_v41.mono.gfx950.tk.kernels.draft_head import (
     F1,
@@ -75,7 +76,6 @@ from atom.mono.device.ops import (
     launcher,
     mfma_bf16,
     rsrc,
-    spin_pause,
     traced,
     uniform,
 )

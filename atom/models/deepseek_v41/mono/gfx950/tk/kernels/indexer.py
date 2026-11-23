@@ -57,6 +57,7 @@ from atom.models.deepseek_v41.mono.gfx950.tk.kernels.common import (
     bf_rne_hi,
     bperm,
     f32c,
+    spin_pause,
 )
 from atom.models.deepseek_v41.mono.gfx950.tk.kernels.engram_fused import (
     _gemv as _eng_gemv,
@@ -75,8 +76,8 @@ from atom.mono.device.ops import (
     launcher,
     memrealtime,
     permlane_swap,
+    readlane,
     rsrc,
-    spin_pause,
     traced,
     uniform,
     wave_incl_scan,
@@ -547,6 +548,56 @@ def sel_samples(tid, eslots, epoch, nsamp):
 
 
 @traced
+def _refine_sample_bucket(tid, lds, keys, old_min, old_shift, old_bucket, residual):
+    """Only the winning coarse bucket; its residual rank retains the original margin."""
+    lane, wv = tid & 63, tid >> 6
+    members = [(key != 0) & (_lshr(key - old_min, old_shift) == old_bucket) for key in keys]
+    mn, mx = Int32(-1), Int32(0)
+    for q in range_constexpr(4):
+        mn = members[q].select(_umin(mn, keys[q]), mn)
+        mx = members[q].select(_umax(mx, keys[q]), mx)
+    for o in (1, 2, 4, 8, 16, 32):
+        mn = xred(mn, o, _umin)
+        mx = xred(mx, o, _umax)
+    if lane == 0:
+        _lds_st(lds, MM_LDS + wv * 16, [mn, mx])
+    _lds_st(lds, HIST_LDS + tid * 16, [Int32(0), Int32(0), Int32(0), Int32(0)])
+    if tid == 0:
+        _lds_st(lds, TB_LDS, [Int32(0)])
+    gpu.barrier()
+    for w in range_constexpr(16):
+        mm = _lds_ld(lds, MM_LDS + w * 16, 2)
+        mn = _umin(mn, mm[0])
+        mx = _umax(mx, mm[1])
+    d = mx - mn
+    sh = _u32_lt(Int32(0xFFF), d).select(Int32(20) - _clz(d), Int32(0))
+    for q in range_constexpr(4):
+        if members[q]:
+            fx.llvm.atomic_add(lds + (HIST_LDS // 4 + _lshr(keys[q] - mn, sh)),
+                               Int32(1), syncscope="workgroup")
+    gpu.barrier()
+    h = _lds_ld(lds, HIST_LDS + tid * 16, 4)
+    hs = h[0] + h[1] + h[2] + h[3]
+    pre, total = _block_excl(lds, MM_LDS + 256, hs, lane, wv)
+    above = total - pre - hs
+    c3 = above + h[3]
+    c2 = c3 + h[2]
+    c1 = c2 + h[1]
+    c0 = c1 + h[0]
+    a3 = _u32_lt(above, residual) & _u32_ge(c3, residual)
+    a2 = _u32_lt(c3, residual) & _u32_ge(c2, residual)
+    a1 = _u32_lt(c2, residual) & _u32_ge(c1, residual)
+    a0 = _u32_lt(c1, residual) & _u32_ge(c0, residual)
+    if a0 | a1 | a2 | a3:
+        bucket = tid * 4 + a0.select(Int32(0), a1.select(Int32(1), a2.select(Int32(2), Int32(3))))
+        _lds_st(lds, TB_LDS, [bucket])
+    gpu.barrier()
+    bucket = _lds_ld(lds, TB_LDS)
+    gpu.barrier()
+    return mn + (bucket << sh)
+
+
+@traced
 def sel_threshold(tid, lds, keys, n_smp, nsamp, kk, block=False, tadd=12):
     """The threshold key T (TileRT L21000..L21460): R = (N + nsamp kk - 1) / N; tgt = R + 2 isqrt(R) + tadd
     (12 in the wide layout, 4 in the narrow one, N60408);
@@ -600,6 +651,8 @@ def sel_threshold(tid, lds, keys, n_smp, nsamp, kk, block=False, tadd=12):
     a1 = _u32_lt(c2, tg) & _u32_ge(c1, tg)
     a0 = _u32_lt(c1, tg) & _u32_ge(c0, tg)
     if a0 | a1 | a2 | a3:
+        selected_above = a0.select(c1, a1.select(c2, a2.select(c3, above)))
+        _lds_st(lds, MM_LDS + 1280, [tg - selected_above])
         _lds_st(
             lds,
             TB_LDS,
@@ -613,7 +666,14 @@ def sel_threshold(tid, lds, keys, n_smp, nsamp, kk, block=False, tadd=12):
     gpu.barrier()
     bb = _lds_ld(lds, TB_LDS)
     gpu.barrier()
-    return none.select(Int32(-1), mn + (bb << sh))
+    coarse_cut = none.select(Int32(-1), mn + (bb << sh))
+    fine_cut = coarse_cut
+    # Refine only the winning sample bucket while retaining its residual rank.
+    # The original no-hit/underflow guards and exact merge fallback stay intact.
+    if (~none) & (sh > 0) & _u32_ge(tot, tg):
+        residual = _lds_ld(lds, MM_LDS + 1280)
+        fine_cut = _refine_sample_bucket(tid, lds, keys, mn, sh, bb, residual)
+    return fine_cut
 
 
 @traced
@@ -818,7 +878,7 @@ def _fs_block(src, n_items, forced, i):
 
 @traced
 def sel_fullscan(tid, lds, src, n_items, kk, forced, out_lds):
-    """The merge's fallback (TileRT's slow path when a chunk overflowed, total < kk or total > 8192; semantic
+    """The merge's fallback (a chunk overflowed, total < kk or total exceeds the exact merge capacity; semantic
     port, the slow path's workspace spills are not reproduced): the exact top kk of all n_items items
     (key = sortable(src[i]) (sc1), item ``forced`` -> 0xff800000), ties to the smaller index, written in
     index order to out_lds. Thread t scans items [t per, (t + 1) per), per a multiple of 16, in blocks of 16
@@ -971,7 +1031,8 @@ def sel_merge(
     id_off,
 ):
     """The merge (TileRT L24961..L58451; c = 0 token level k = 512, c = s83 block level k = 2048): wave 0
-    polls the nch count LLs at ws + cbase. Normal path (no count > 4096, min(n_items, k) <= total <= 8192):
+    polls the nch count LLs at ws + cbase. Normal path (no count > 4096, min(n_items, k) <= total <= capacity,
+    8192 for both token top512 and block top2048):
     the candidates gathered in chunk / list order (position p), the top k by key with ties to the smaller
     p, in p order (= ascending index), hit counter + 1 at slots + hit_off. Otherwise TileRT's slow path:
     here the exact top k of all n_items items rescanned from src (``sel_fullscan``; TileRT's own radix and
@@ -990,7 +1051,10 @@ def sel_merge(
         _lds_st(lds, MM_LDS + 1024 + tid * 4, [off])
     gpu.barrier()
     _stk(12)
-    slow = (novf > 0) | (tot < fx.min(n_items, Int32(k))) | (tot > 0x2000)
+    # Fine sample buckets reduce over-wide candidate sets before the exact
+    # merge. Keep the tested 8K capacity and original overflow/underflow guards.
+    capacity = 8192
+    slow = (novf > 0) | (tot < fx.min(n_items, Int32(k))) | (tot > capacity)
     out_lds = SEL_OUT if k == TOPK else CAND_LDS
     n_out = Int32(0)
     if slow:
@@ -1467,10 +1531,17 @@ def _entry_eng(tid, s2, lds, a, rows, pub8):
 
 
 @traced
-def _entry(tid, s2, lds, a, rows, pub8):
+def _entry(tid, s2, lds, a, rows, pub8, mode2_reader=False):
     """a: the kernarg i64 words. Roles by s2 (TileRT's dispatch): prep, scorers, selectors (module
     docstring); the split / cross-rank path is not ported.
     """
+    if const_expr(mode2_reader):
+        # The host checks the immutable graph arguments before choosing this
+        # program. Constants erase general dispatch, prep and large selectors.
+        a = list(a)
+        a[7] = (Int64(2) << 32) | (a[7] & Int64(0xFFFFFFFF))
+        a[10] = Int64(0)
+        a[24] = Int64(0)
     _SPC.update(sp=a[23], s2=s2, tid=tid)
     _stk(0)
     if const_expr(_STAMP):
@@ -1492,75 +1563,92 @@ def _entry(tid, s2, lds, a, rows, pub8):
     # scalar instructions, and 16 waves running them shared the CU's one scalar unit (the last wave reached
     # the first barrier ~3 us after wave 0)
     if wv == 0:
-        eslots_ = a[4] + slots_offset(a[6])  # ScoreArgs+0x20 (ws) + C(ScoreArgs+0x30)
-        slots_ = a[46] + slots_offset(
-            a[47]
-        )  # PrepArgs+0x68 (ws) + C(PrepArgs+0x70): the prep's areas
-        epoch_ = _lds_scalar(eslots_, s2) + 1
-        pos0_ = _lds_scalar(a[2], 0)  # ScoreArgs+0x10: the row's position
-
-        # every other input the dispatch reads, loaded in one round trip of scalar loads; a null pointer is
-        # swapped for a valid one and its values are never used
-        def _rows6(ptr):
-            if const_expr(rows == 1):
-                return [_lds_scalar(ptr, 0)]
-            v4 = _lds_scalar(ptr, 0, 4)
-            return [
-                v4[0],
-                v4[1],
-                v4[2],
-                v4[3],
-                _lds_scalar(ptr, 4),
-                _lds_scalar(ptr, 5),
-            ]
-
-        vps_ = _rows6((a[37] != Int64(0)).select(a[37], a[2]))  # PrepArgs+0x20: vpos
-        lis_ = _rows6(
-            (a[10] != Int64(0)).select(a[10], a[2])
-        )  # ScoreArgs+0x50: latent_idx
-        cbh = (a[3] != Int64(0)).select(
-            a[3], a[2]
-        )  # ScoreArgs+0x18: the cand table's header
-        c0_ = _lds_scalar(cbh, 0)
-        c1_ = _lds_scalar(cbh, 1)
-        n93_ = (pos0_ + 1) >> shift
-        n_ = (pos0_ < 0).select(Int32(0), fx.max(n93_, Int32(0)))
-        split_ = (nsplit > 1) & (n_ > thr) & (mode != 2)
-        nosplit_ = (nsplit <= 1) | (n_ <= thr) | (mode == 2)
-        ch = (((nsplit + n_ - 1) // fx.max(nsplit, Int32(1))) + 63) & -64
-        k_lo_ = split_.select(fx.min(ch * rank, n_), Int32(0))
-        k_hi_ = split_.select(fx.min(k_lo_ + ch, n_), n_)
-        # the new compressed keys' 8-aligned block range [lo, hi) (TileRT computes it unless latent_idx is
-        # null, split or small)
-        mn = Int32(0x40000000)
-        mx = Int32(-1)
-        for r in range_constexpr(rows):
-            p = vps_[r]
-            ok = (p > -1) & (((p + 1) & (ratio - 1)) == 0)
-            k1 = (p + 1) >> shift
-            mn = (ok & (k1 <= mn) & (k1 < 0x40000001)).select(k1 - 1, mn)
-            mx = ok.select(fx.max(k1 - 1, mx), mx)
-        lohi = (li_p != Int64(0)) & nosplit_ & (n_ >= 0x4001) & (mode != 2) & (mx >= 0)
-        lo_ = lohi.select(mn & -8, Int32(0))
-        hi_ = lohi.select((mx & 0x7FFFFFF8) + 8, Int32(0))
-        # the first latent-indexed new key (TileRT's s81: rows with position and latent index, -1 none)
-        s81_ = Int32(-1)
-        for r in range_constexpr(rows):
-            p = vps_[r]
-            lr = lis_[r]
-            if const_expr(r == 0):
-                s81_ = (p > -1).select(fx.max(lr, Int32(-1)), Int32(-1))
-            else:
-                s81_ = ((p | lr) > -1).select(
-                    (s81_ < 0).select(lr, fx.min(lr, s81_)), s81_
-                )
-        s81_ = (li_p != Int64(0)).select(s81_, Int32(-1))
-        if tid == 0:
-            w = [Int32(eslots_), Int32(eslots_ >> 32), Int32(slots_), Int32(slots_ >> 32), epoch_, pos0_, n93_, n_,
-                 k_lo_, k_hi_, lo_, hi_, s81_, c0_, c1_, Int32(0)] + vps_ + lis_  # fmt: skip
-            w = w + [Int32(0)] * (-len(w) % 4)
-            for q in range_constexpr(len(w) // 4):
-                _lds_st(lds, DREC + 16 * q, w[4 * q : 4 * q + 4])
+        if const_expr(mode2_reader):
+            eslots_ = a[4] + slots_offset(a[6])
+            epoch_word = _ld(eslots_, s2)
+            position = _ld(a[2], 0)
+            cbh = (a[3] != Int64(0)).select(a[3], a[2])
+            header = _ld(cbh, 0, 2)
+            rocdl.sched_barrier(0)
+            epoch_ = uniform(epoch_word) + 1
+            pos0_ = uniform(position)
+            n93_ = (pos0_ + 1) >> shift
+            n_ = (pos0_ < 0).select(Int32(0), fx.max(n93_, Int32(0)))
+            c0_, c1_ = uniform(header[0]), uniform(header[1])
+            if tid == 0:
+                w = [Int32(eslots_), Int32(eslots_ >> 32), Int32(eslots_), Int32(eslots_ >> 32),
+                     epoch_, pos0_, n93_, n_, Int32(0), n_, Int32(0), Int32(0), Int32(-1),
+                     c0_, c1_, Int32(0), Int32(-1), Int32(-1), Int32(0), Int32(0)]  # fmt: skip
+                for q in range_constexpr(5):
+                    _lds_st(lds, DREC + 16 * q, w[4 * q : 4 * q + 4])
+        else:
+            eslots_ = a[4] + slots_offset(a[6])  # ScoreArgs+0x20 (ws) + C(ScoreArgs+0x30)
+            slots_ = a[46] + slots_offset(
+                a[47]
+            )  # PrepArgs+0x68 (ws) + C(PrepArgs+0x70): the prep's areas
+            # every other input the dispatch reads: five vector loads issued back to back (lane r: row r's word),
+            # one round trip, then read back by readlane. As scalar loads (s_buffer_load; the kernel is SGPR-starved)
+            # the compiler issued them in three rounds, each waiting on the last (epoch's after pos0's after the
+            # rows'). A null pointer is swapped for a valid one and its values are never used
+            lane = tid & 63
+            vpb = (a[37] != Int64(0)).select(a[37], a[2])  # PrepArgs+0x20: vpos
+            lib = (a[10] != Int64(0)).select(a[10], a[2])  # ScoreArgs+0x50: latent_idx
+            cbh = (a[3] != Int64(0)).select(
+                a[3], a[2]
+            )  # ScoreArgs+0x18: the cand table's header
+            rw = fx.min(lane, Int32(rows - 1))
+            ev = _ld(eslots_, s2)
+            pv = _ld(a[2], 0)  # ScoreArgs+0x10: the row's position
+            vv = _ld(vpb, rw)
+            lv = _ld(lib, rw)
+            cv = _ld(cbh, fx.min(lane, Int32(1)))
+            rocdl.sched_barrier(
+                0
+            )  # all five issued before the first readlane (SGPR pressure interleaved them)
+            epoch_ = uniform(ev) + 1
+            pos0_ = uniform(pv)
+            vps_ = [readlane(vv, r) for r in range(rows)]
+            lis_ = [readlane(lv, r) for r in range(rows)]
+            c0_ = readlane(cv, 0)
+            c1_ = readlane(cv, 1)
+            n93_ = (pos0_ + 1) >> shift
+            n_ = (pos0_ < 0).select(Int32(0), fx.max(n93_, Int32(0)))
+            split_ = (nsplit > 1) & (n_ > thr) & (mode != 2)
+            nosplit_ = (nsplit <= 1) | (n_ <= thr) | (mode == 2)
+            ch = (((nsplit + n_ - 1) // fx.max(nsplit, Int32(1))) + 63) & -64
+            k_lo_ = split_.select(fx.min(ch * rank, n_), Int32(0))
+            k_hi_ = split_.select(fx.min(k_lo_ + ch, n_), n_)
+            # the new compressed keys' 8-aligned block range [lo, hi) (TileRT computes it unless latent_idx is
+            # null, split or small)
+            mn = Int32(0x40000000)
+            mx = Int32(-1)
+            for r in range_constexpr(rows):
+                p = vps_[r]
+                ok = (p > -1) & (((p + 1) & (ratio - 1)) == 0)
+                k1 = (p + 1) >> shift
+                mn = (ok & (k1 <= mn) & (k1 < 0x40000001)).select(k1 - 1, mn)
+                mx = ok.select(fx.max(k1 - 1, mx), mx)
+            lohi = (li_p != Int64(0)) & nosplit_ & (n_ >= 0x4001) & (mode != 2) & (mx >= 0)
+            lo_ = lohi.select(mn & -8, Int32(0))
+            hi_ = lohi.select((mx & 0x7FFFFFF8) + 8, Int32(0))
+            # the first latent-indexed new key (TileRT's s81: rows with position and latent index, -1 none)
+            s81_ = Int32(-1)
+            for r in range_constexpr(rows):
+                p = vps_[r]
+                lr = lis_[r]
+                if const_expr(r == 0):
+                    s81_ = (p > -1).select(fx.max(lr, Int32(-1)), Int32(-1))
+                else:
+                    s81_ = ((p | lr) > -1).select(
+                        (s81_ < 0).select(lr, fx.min(lr, s81_)), s81_
+                    )
+            s81_ = (li_p != Int64(0)).select(s81_, Int32(-1))
+            if tid == 0:
+                w = [Int32(eslots_), Int32(eslots_ >> 32), Int32(slots_), Int32(slots_ >> 32), epoch_, pos0_, n93_, n_,
+                     k_lo_, k_hi_, lo_, hi_, s81_, c0_, c1_, Int32(0)] + vps_ + lis_  # fmt: skip
+                w = w + [Int32(0)] * (-len(w) % 4)
+                for q in range_constexpr(len(w) // 4):
+                    _lds_st(lds, DREC + 16 * q, w[4 * q : 4 * q + 4])
     if (tid >= 64) & (
         tid < 208
     ):  # waves 1..3 meanwhile put q in LDS (fp4 rows, e8m0 scales, head weights)
@@ -1577,7 +1665,11 @@ def _entry(tid, s2, lds, a, rows, pub8):
         rec += [uniform(v4[0]), uniform(v4[1]), uniform(v4[2]), uniform(v4[3])]
     eslots = (Int64(rec[1]) << 32) | (Int64(rec[0]) & Int64(0xFFFFFFFF))
     slots = (Int64(rec[3]) << 32) | (Int64(rec[2]) & Int64(0xFFFFFFFF))
-    epoch, pos0, n93, n, k_lo, k_hi, lo, hi, s81 = rec[4:13]
+    if const_expr(mode2_reader):
+        epoch, pos0, n93, n = rec[4:8]
+        k_lo, k_hi, lo, hi, s81 = Int32(0), n, Int32(0), Int32(0), Int32(-1)
+    else:
+        epoch, pos0, n93, n, k_lo, k_hi, lo, hi, s81 = rec[4:13]
     c01 = rec[13:15]
     vps = rec[16 : 16 + rows]
     lis = rec[16 + rows : 16 + 2 * rows]
@@ -1725,16 +1817,27 @@ def _entry(tid, s2, lds, a, rows, pub8):
 
 
 def build(key=None):
+    return _build(key, mode2_reader=False)
+
+
+def build_mode2(key=None):
+    """One-row mode-2 reader; the host retains the general kernel for other arguments."""
+    return _build(key, mode2_reader=True)
+
+
+def _build(key, mode2_reader):
     """(kernel symbol, launcher) of the port; the launcher takes the variant's kernarg words (50, the
     engram variant 60)."""
     key = _KEY if key is None else key
     kr, rows, eng = VARIANTS[key]
+    if mode2_reader and (rows != 1 or eng):
+        raise ValueError("mode2 reader requires a one-row non-engram variant")
     pub8 = kr in (
         4027,
         499,
     )  # TileRT's KR: 4027 / 499 publish the top-k to 8 LL targets, 2747 / 243 to 4
     name = kernel_symbol(
-        "tk_indexer_eng" if eng else "tk_indexer", kr=kr, rows=rows, v=VERSION
+        "tk_indexer_eng" if eng else "tk_indexer", kr=kr, rows=rows, v=VERSION + ("_mode2" if mode2_reader else "")
     )
 
     @fx.struct
@@ -1784,7 +1887,7 @@ def build(key=None):
         a48: Int64, a49: Int64,
     ):  # fmt: skip
         lds = fx.SharedAllocator().allocate(Smem).peek().w.ptr
-        _entry(fx.thread_idx.x, fx.block_idx.x, lds, [a00, a01, a02, a03, a04, a05, a06, a07, a08, a09, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23, a24, a25, a26, a27, a28, a29, a30, a31, a32, a33, a34, a35, a36, a37, a38, a39, a40, a41, a42, a43, a44, a45, a46, a47, a48, a49], rows, pub8)  # fmt: skip
+        _entry(fx.thread_idx.x, fx.block_idx.x, lds, [a00, a01, a02, a03, a04, a05, a06, a07, a08, a09, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23, a24, a25, a26, a27, a28, a29, a30, a31, a32, a33, a34, a35, a36, a37, a38, a39, a40, a41, a42, a43, a44, a45, a46, a47, a48, a49], rows, pub8, mode2_reader)  # fmt: skip
 
     @launcher(name)
     def launch(

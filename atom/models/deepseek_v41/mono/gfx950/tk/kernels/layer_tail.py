@@ -29,6 +29,7 @@ from atom.models.deepseek_v41.mono.gfx950.tk.kernels.common import (
     exp_ocml,
     f32c,
     log1p_ocml,
+    spin_pause,
 )
 from atom.models.deepseek_v41.mono.gfx950.tk.kernels.qkv import (
     HALF_MIRROR as QK_HALF_MIRROR,
@@ -68,7 +69,6 @@ from atom.mono.device.ops import (
     permlane_swap,
     readlane,
     rsrc,
-    spin_pause,
     traced,
     uniform,
 )
@@ -1112,7 +1112,7 @@ def _rsq_scaled(ms):
 
 
 @traced
-def moe_router(tid, s2, gate_w, xll, gamma, gflag, ws_moe, mep, lds, g16=False):
+def moe_router(tid, s2, gate_w, xll, gamma, gflag, ws_moe, mep, lds, g16=False, stp=None):
     """CTAs s2 >= 160: row (s2-160)/16, shard sh = (s2%8)*2 + bit 3 of s2 owning experts sh*24..+24.
     Thread t holds x / gamma / gate_w elements 2t, 2t+1 (+1024 j, j < 5); per expert an fma chain
     over gamma*x in that order; wave sums by row_shr scans, 8 waves in order through LDS; logit =
@@ -1161,6 +1161,8 @@ def moe_router(tid, s2, gate_w, xll, gamma, gflag, ws_moe, mep, lds, g16=False):
             ok = ok & _tag_ok(v[j], mep)
     for j in range_constexpr(5):
         _lds_st(lds, X_RAW_LDS + (tid + 512 * j) * 4, [v[j][0]])
+    if const_expr(stp is not None):
+        _stamp(stp, tid, s2, 13)  # G88b: x arrived
     xs = []
     for j in range_constexpr(5):
         xs += [(v[j][0] << 16).bitcast(F32), (v[j][0] & Int32(-65536)).bitcast(F32)]
@@ -1168,26 +1170,43 @@ def moe_router(tid, s2, gate_w, xll, gamma, gflag, ws_moe, mep, lds, g16=False):
     for k in range_constexpr(1, 10):
         sq = fmath.fma(xs[k], xs[k], sq)
     gx = [gv[k] * xs[k] for k in range(10)]
-    accs = []
-    for e in range_constexpr(24):
-        a = F32(0.0)
-        for j in range_constexpr(5):
-            lo = (w[e][j] << 16).bitcast(F32)
-            hi = (w[e][j] & Int32(-65536)).bitcast(F32)
-            a = fmath.fma(lo, gx[2 * j], a)
-            a = fmath.fma(hi, gx[2 * j + 1], a)
-        accs.append(_scan_sum(a))
+    # G88b: reduce-scatter on TileRT's tree (pairs, 4-, 8-, 16-lane groups, rows (R3 + R2) + (R1 + R0): IEEE adds are
+    # commutative, so the same pairs give the same bits); groups (k, k + 12, k + 6, k + 18) reduced right after their
+    # fma chains; levels 1 and 2 sum both candidates and keep one by lane bit (the weights stay coalesced)
+    b0 = (lane & 1) != 0
+    b1 = (lane & 2) != 0
+    t = [None] * 6
+    for r in range_constexpr(6):
+        a4 = []
+        for k in range_constexpr(4):
+            e = (r, r + 12, r + 6, r + 18)[k]
+            a = F32(0.0)
+            for j in range_constexpr(5):
+                lo = (w[e][j] << 16).bitcast(F32)
+                hi = (w[e][j] & Int32(-65536)).bitcast(F32)
+                a = fmath.fma(lo, gx[2 * j], a)
+                a = fmath.fma(hi, gx[2 * j + 1], a)
+            a4.append(a)
+        p4 = [a4[k] + _dppz(a4[k], 0xB1) for k in range(4)]  # xor 1 pair sums
+        u0 = b0.select(p4[1], p4[0])  # expert r + 12 l0
+        u1 = b0.select(p4[3], p4[2])  # expert r + 6 + 12 l0
+        q0 = u0 + _dppz(u0, 0x4E)  # xor 2
+        q1 = u1 + _dppz(u1, 0x4E)
+        v = b1.select(q1, q0)  # expert r + 6 l1 + 12 l0
+        v = v + _dppz(v, 0x124)  # lanes 4..7 mod 8: + lane - 4
+        v = v + _dppz(v, 0x128)  # lanes 12..15 mod 16: + lane - 8
+        v = _xsym(v, 16, _fadd)  # R1 + R0, R3 + R2
+        t[r] = _xsym(v, 32, _fadd)  # (R3 + R2) + (R1 + R0)
     sq = _scan_sum(sq)
+    if lane >= 60:
+        base = RT_PART_LDS + wv * 216 + (lane & 1) * 48 + ((lane >> 1) & 1) * 24
+        for p in range_constexpr(3):
+            _lds_st(lds, base + p * 8, [t[2 * p].bitcast(Int32), t[2 * p + 1].bitcast(Int32)])
     if lane == 63:
-        base = RT_PART_LDS + wv * 216
-        for p in range_constexpr(12):
-            _lds_st(
-                lds,
-                base + p * 8,
-                [accs[2 * p].bitcast(Int32), accs[2 * p + 1].bitcast(Int32)],
-            )
-        _lds_st(lds, base + 96, [sq.bitcast(Int32)])
+        _lds_st(lds, RT_PART_LDS + wv * 216 + 96, [sq.bitcast(Int32)])
     gpu.barrier()
+    if const_expr(stp is not None):
+        _stamp(stp, tid, s2, 31)  # G88b: partials barrier passed
     if tid < 24:
         dot = _lds_ld(lds, RT_PART_LDS + tid * 4).bitcast(F32)
         ss = _lds_ld(lds, RT_PART_LDS + 96).bitcast(F32)
@@ -1217,6 +1236,59 @@ SG_RED_LDS = (
     31680  # waves 1..7: [w][c 4][lane 64] f32 partials of the shared-expert MFMA
 )
 ACT_OFF = 0x6000  # ws_moe + this: [row][2016] {bf16x2, epoch} act LL, 0x1f80 B a row (shared first)
+# X8 (G21): ws_moe tail, unused by the tail kernel (the draft MoE's act LL overlaps it, told apart by
+# the epoch tag): row r's quantized x (5120 B fp8 + 160 B ue8m0 scales = 1320 dwords) as 660 LL packs
+# {d0, mep, d1, mep}, 16 B each
+X8LL_OFF, X8LL_ROW = 0x12000, 660 * 16
+
+
+@traced
+def x8ll_publish(tid, r, ws_moe, mep, lds):
+    """X8 (G21): routed CTA s2 = 24 r right after its quant_rows (which ends in a CTA barrier): its fp8 row
+    (LDS 0..5120) and scales (QX_SCALE_LDS..+160) as LL packs, pack i (thread i, and 512 + i for i < 148)
+    from LDS 8 i (i < 640) else QX_SCALE_LDS + 8 (i - 640). No drain and no flag: every pack is tagged."""
+    d = _lds_ld(lds, tid * 8, 2)
+    bo.buffer_store(fx.Vector.from_elements([d[0], mep, d[1], mep], Int32), rsrc(ws_moe),
+                    (X8LL_OFF + r * X8LL_ROW + tid * 16) >> 2, cache_modifier=CM_DEV)
+    if tid < 148:
+        src = (tid < 128).select((512 + tid) * 8, QX_SCALE_LDS + (tid - 128) * 8)
+        e = _lds_ld(lds, src, 2)
+        bo.buffer_store(fx.Vector.from_elements([e[0], mep, e[1], mep], Int32), rsrc(ws_moe),
+                        (X8LL_OFF + r * X8LL_ROW + (512 + tid) * 16) >> 2, cache_modifier=CM_DEV)
+
+
+@traced
+def x8ll_read(tid, ws_moe, mep, lds):
+    """X8 (G21): shared CTAs 144..159 instead of polling and quantizing the 6 x rows themselves: every
+    row's packs tid and 512 + tid (tid < 148), all 12 loads issued together and polled until both tags
+    of every live pack are mep (s_sleep 1), then their data into LDS exactly where quant_rows puts it
+    (row r's fp8 at r 5120, its scales at QX_SCALE_LDS + r 160), and a CTA barrier."""
+    hi = tid < 148
+    j = fx.min(tid, Int32(147))
+    words = []
+    for r in range_constexpr(6):
+        words.append((X8LL_OFF + r * X8LL_ROW + tid * 16) >> 2)
+        words.append((X8LL_OFF + r * X8LL_ROW + (512 + j) * 16) >> 2)
+    v = [_ld(ws_moe, w, 4, CM_DEV) for w in words]
+    ok = (v[0][1] == mep) & (v[0][3] == mep)
+    for n in range_constexpr(1, 12):
+        tagged = (v[n][1] == mep) & (v[n][3] == mep)
+        ok = ok & ((tagged | ~hi) if n % 2 == 1 else tagged)
+    while ~ok:
+        spin_pause()  # s_sleep is IntrNoMem: alone it lets LLVM hoist the reload (v10 hang)
+        rocdl.s_sleep(1)
+        v = [_ld(ws_moe, w, 4, CM_DEV) for w in words]
+        ok = (v[0][1] == mep) & (v[0][3] == mep)
+        for n in range_constexpr(1, 12):
+            tagged = (v[n][1] == mep) & (v[n][3] == mep)
+            ok = ok & ((tagged | ~hi) if n % 2 == 1 else tagged)
+    for r in range_constexpr(6):
+        _lds_st(lds, r * 5120 + tid * 8, [v[2 * r][0], v[2 * r][2]])
+        if hi:
+            dst = (tid < 128).select(r * 5120 + (512 + tid) * 8, QX_SCALE_LDS + r * 160 + (tid - 128) * 8)
+            _lds_st(lds, dst, [v[2 * r + 1][0], v[2 * r + 1][2]])
+    gpu.barrier()
+
 
 
 @traced
@@ -1344,7 +1416,7 @@ def _rows_ok(v, mep, lo):
 def moe_prep(tid, s2, xll, gamma, gflag, sug, sug_s, ws_moe, mep, lds, gpre=None):
     """Every CTA's MoE input: routers quantize the row they already hold in LDS, routed CTAs
     (s2 < 144, row s2/24) poll and quantize theirs, shared-expert CTAs (144..159) all 6 rows and
-    then run their shared-expert tiles."""
+    then run their shared-expert tiles (X8: on the rows each row's first routed CTA publishes)."""
     if tid == 0:
         _lds_st(lds, TOPK_FLAG_LDS, [Int32(0)])
     gv = gpre if const_expr(gpre is not None) else _gamma16(tid, gamma, gflag)
@@ -1362,11 +1434,14 @@ def moe_prep(tid, s2, xll, gamma, gflag, sug, sug_s, ws_moe, mep, lds, gpre=None
         gvr = _gamma16(tid, gamma, gflag) if const_expr(gpre is not None) else gv
         rows = poll_x_rows(tid, xll, s2 // 24, 1, mep)
         quant_rows(tid, rows, gvr, lds)
+        # X8 (G21): the row's first routed CTA publishes its quantized row for the shared CTAs
+        if (s2 % 24) == 0:
+            x8ll_publish(tid, s2 // 24, ws_moe, mep, lds)
     if (s2 >= 144) & (s2 < 160):
-        gvs = _gamma16(tid, gamma, gflag) if const_expr(gpre is not None) else gv
+        # X8 (G21): the 6 rows as their publishers quantized them (bit-identical to polling and
+        # quantizing them here, which took ~3.3 + 6.1 us on the shared chain, G20)
         g0 = g_fetch(tid, s2, sug, sug_s, 0)
-        rows6 = poll_x_rows(tid, xll, 0, 6, mep)
-        quant_rows(tid, rows6, gvs, lds)
+        x8ll_read(tid, ws_moe, mep, lds)
         shared_g(tid, s2, sug, sug_s, ws_moe, mep, lds, g0)
 
 
@@ -1614,6 +1689,16 @@ RW_LDS = 0x12BF4  # their routing weights (f32)
 SIGN = -2147483648
 
 
+# G87: the optimal 6-input sorting network (12 comparators, depth 5); (p, q), p < q: the larger to p
+TOPK_NET = ((0, 5), (1, 3), (2, 4), (1, 2), (3, 4), (0, 3), (2, 5), (0, 1), (2, 3), (4, 5), (1, 2), (3, 4))
+
+
+def _cttz64_t(x):
+    """The lowest set bit of a nonzero i64 (s_ff1_i32_b64 on a ballot)."""
+    v = llvm.call_intrinsic(T.i64, "llvm.cttz.i64", [as_ir_value(Int64(x)), as_ir_value(fx.Boolean(True))], [], [])  # fmt: skip
+    return Int32(Int64(v))
+
+
 def _all_eq(vs, x):
     ok = vs[0] == x
     for v in vs[1:]:
@@ -1679,25 +1764,36 @@ def moe_topk(tid, row, gate_b, ws_moe, mep, lds, kneed=None, sp=None, s2=None):
         # (select(neg, ~kb, kb ^ sign) ^ sign hits an AMDGPU ISel failure in this kernel)
         ub.append(kb ^ (kb < 0).select(Int32(0x7FFFFFFF), Int32(0)))
     ids = [lane + 64 * j for j in range(6)]
+    # G87: per-lane sorted lists (see TOPK_NET); a round = one wave max + a ballot (was a wave max, a wave min
+    # of the ids and a 6-register knock-out: 0.28 us a round, G86)
+    cs = [(Int64(ub[j]) << Int64(32)) | Int64(5 - j) for j in range(6)]
+    for t in range_constexpr(12):
+        p, q = TOPK_NET[t]
+        gt = cs[q] > cs[p]
+        cs[p], cs[q] = gt.select(cs[q], cs[p]), gt.select(cs[p], cs[q])
     sel = []
     for r in range_constexpr(6):
-        m = ub[0]
-        for j in range_constexpr(1, 6):
-            m = _imax(m, ub[j])
-        m = _wave_scan_red(m, _imax, SIGN)
-        cand = Int32(0x7FFFFFFF)
-        for j in range_constexpr(6):
-            cand = (ub[j] == m).select(_imin(cand, ids[j]), cand)
-        e = _wave_scan_red(cand, _imin, 0x7FFFFFFF)
+        hh = Int32(cs[0] >> Int64(32))
+        lo = Int32(cs[0])
+        m = _wave_scan_red(hh, _imax, SIGN)
+        hit = hh == m
+        bal = Int64(rocdl.ballot(T.i64, as_ir_value(hit)))
+        ln = _cttz64_t(bal)
+        e = ln + 64 * (Int32(5) - readlane(lo, ln))
+        if Int32(fx.ctpop(bal)) != 1:
+            # several lanes' heads tie on the key: the smallest id among them
+            e = _wave_scan_red(hit.select(lane + 64 * (Int32(5) - lo), Int32(0x7FFFFFFF)), _imin, 0x7FFFFFFF)
         sel.append(e)
-        for j in range_constexpr(6):
-            ub[j] = (ids[j] == e).select(Int32(SIGN), ub[j])
+        if const_expr(r < 5):
+            # that lane pops its head; after round r a lane needs at most 5 - r more entries
+            pop = lane == (e & 63)
+            for i in range_constexpr(5 - r):
+                cs[i] = pop.select(cs[i + 1], cs[i])
         if const_expr(kneed is not None):
             # TileRT: the slots up to the CTA's last needed k go out first, the other waves start H
             if lane == 0:
                 _lds_st(lds, TOPK_LDS + 4 * r, [e])
-                if kneed == r + 1:
-                    _lds_st(lds, TOPK_FLAG_LDS, [mep])
+                _lds_st(lds, TOPK_FLAG_LDS, [(mep << 3) | (r + 1)])  # G92: round counter
             if const_expr(sp is not None):
                 if kneed == r + 1:
                     _stamp(sp, tid, s2, 23)
@@ -1762,7 +1858,9 @@ def moe_h(tid, row, s33, ug, ug_s, ws_moe, mep, lds):
                 pw = pw | (((xb >> (q * 8)) & 0xFF) << (8 * qq))
             pk.append(pw)
         for j in range_constexpr(40):
-            av = _ld(ug, (wb + j * 1024) >> 2, 4, CM_NT)
+            # G58: default cache (was nt): the 6 rows' duplicate experts read the same (expert, tile) on one
+            # XCD (tile % 8 = s33 % 8), so the second read can hit L2 / MALL
+            av = _ld(ug, (wb + j * 1024) >> 2, 4)
             b0 = _lds_ld(lds, j * 128 + q * 16, 4)
             b1 = _lds_ld(lds, j * 128 + 64 + q * 16, 4)
             sbx = _u8_lds(lds, QX_SCALE_LDS + 4 * j + q)
@@ -1828,8 +1926,18 @@ def moe_routed(tid, s2, gate_b, ug, ug_s, ws_moe, mep, lds, sp=None, sdn=None):
             s2,
         )
     else:
-        while _lds_ld(lds, TOPK_FLAG_LDS) != mep:
+        # G92: wave w waits for its own UG item's slot only (moe_h's item mapping), not the CTA's last slot
+        wv92 = tid // 64
+        g92 = s33 // 8
+        st92 = (6 * nn * g92) // 5
+        en92 = (6 * nn * (g92 + 1)) // 5
+        it92 = st92 + (wv92 == 6).select(Int32(0), wv92)
+        k92 = ((wv92 != 7) & (it92 < en92)).select(fx.min(it92, en92 - 1) // nn, Int32(0))
+        tg92 = mep << 3
+        f92 = _lds_ld(lds, TOPK_FLAG_LDS)
+        while ((((f92 ^ tg92) >> 3) != 0) | ((f92 & 7) <= k92)):
             spin_pause()
+            f92 = _lds_ld(lds, TOPK_FLAG_LDS)
     if const_expr(sp is not None):
         _stamp(sp, tid, s2, 11)
     moe_h(tid, row, s33, ug, ug_s, ws_moe, mep, lds)
@@ -1867,7 +1975,7 @@ def moe_down(tid, s2, row, s33, dn, dn_s, sdn, sdn_s, ws_moe, valid, mep, lds):
                     (wbr + t * 2304 + ks * 1024 + lane * 16) >> 2,
                     rok,
                     4,
-                    CM_NT,
+                    0,  # G58: default cache (was nt), as up/gate
                 )
             )
         rw.append(
@@ -1877,7 +1985,7 @@ def moe_down(tid, s2, row, s33, dn, dn_s, sdn, sdn_s, ws_moe, valid, mep, lds):
                 (wbr + t * 2304 + 2048 + h * 16) >> 2,
                 rok & (q == 0),
                 4,
-                CM_NT,
+                0,  # G58: default cache (was nt), as up/gate
             )
         )
         rs16.append(
@@ -2350,7 +2458,7 @@ def build():
     """(symbol, launcher) of the test kernel with the ported phases (A1 so far)."""
     name = kernel_symbol(
         "tk_mega_afm6" if _AFM6 else "tk_mega_tail",
-        phases="full_v39_pf1_pf2" + ("_st" if _STAMP else ""),
+        phases="full_v39_pf1_pf2_x8" + ("_st" if _STAMP else ""),
     )
 
     @fx.struct
@@ -2686,7 +2794,7 @@ def _entry(
     gpre = fx.Vector.filled(16, 0.0, F32)
     if s2 >= 160:
         gpre = moe_router(
-            tid, s2, a36, a37, a33, Int32(a34), a52, Int32(a55), lds, True
+            tid, s2, a36, a37, a33, Int32(a34), a52, Int32(a55), lds, True, a23
         )
         _stamp(a23, tid, s2, 9)
     moe_prep(tid, s2, a37, a33, Int32(a34), a47, a48, a52, Int32(a55), lds, gpre)

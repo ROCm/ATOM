@@ -60,6 +60,32 @@ ADMIT_PAD = (
 )  # the 4 bytes after each int32 count: TileRT leaves them uninitialized
 VERIFY_ROWS = 6  # a DSpark step's target rows: the token and 5 drafts
 
+# Keep the general programs available for calls that prepare new keys or use a
+# different selection mode. These aliases name separately compiled readers.
+INDEXER_MODE2_SYMBOLS = {
+    "_ZN6tilert3ops13ds_v4_1_flash7indexer12fused_kernelILi1ELi0ELi"
+    + str(kr)
+    + "ELi1EEEvNS2_9ScoreArgsENS2_10SelectArgsENS2_8PrepArgsE":
+    f"tk_indexer_mode2_reader_{kr}"
+    for kr in (499, 243)
+}
+
+
+def indexer_mode2_symbol(symbol: str, blob: bytes) -> str:
+    """Choose the one-row reader from immutable graph arguments, or keep the general kernel.
+
+    Position, candidate header and each CTA's epoch stay live device inputs.
+    Latent pointers must be null so that no new-key preparation is removed.
+    """
+    if symbol not in INDEXER_MODE2_SYMBOLS or len(blob) != 400:
+        return symbol
+    ratio_mode = struct.unpack_from("<Q", blob, 56)[0]
+    score_latent = struct.unpack_from("<Q", blob, 80)[0]
+    select_latent = struct.unpack_from("<Q", blob, 192)[0]
+    if ratio_mode == ((2 << 32) | 1) and score_latent == select_latent == 0:
+        return INDEXER_MODE2_SYMBOLS[symbol]
+    return symbol
+
 
 def stream_len(cap: int) -> int:
     """The ``ar_acc`` / ``ar_num`` logs' length (TileRT ``e2e_graph.stream_len``)."""
@@ -291,8 +317,10 @@ class TkRank:
         from .codeobj import Launcher
 
         with torch.cuda.device(self.device):
+            readers = [reader for symbol, reader in INDEXER_MODE2_SYMBOLS.items()
+                       if reader in table.entries and any(x["kernel"] == symbol for x in self.launches)]
             self.launcher = Launcher(
-                table, [x["kernel"] for x in self.launches] + list(extra)
+                table, [x["kernel"] for x in self.launches] + list(extra) + readers
             )
 
     def _prepared(self, parity: int) -> list:
@@ -302,14 +330,18 @@ class TkRank:
         if parity not in self._blobs:
             out = []
             for launch, blob in zip(self.launches, self.blobs(parity)):
+                symbol = indexer_mode2_symbol(launch["kernel"], blob)
+                # Reference/older tables need no reader entries; retain their programs.
+                if symbol != launch["kernel"] and symbol not in self.launcher.functions:
+                    symbol = launch["kernel"]
                 # zero-padded to the loaded function's last argument (a swap's may end past TileRT's blob)
                 buf = ctypes.create_string_buffer(
-                    blob, max(len(blob), self.launcher.arg_bytes(launch["kernel"]), 1)
+                    blob, max(len(blob), self.launcher.arg_bytes(symbol), 1)
                 )
-                params = self.launcher.params(launch["kernel"], buf)
+                params = self.launcher.params(symbol, buf)
                 out.append(
                     (
-                        launch["kernel"],
+                        symbol,
                         launch["grid"],
                         launch["block"],
                         launch["shm"],

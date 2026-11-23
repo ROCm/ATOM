@@ -33,6 +33,7 @@ from atom.models.deepseek_v41.mono.gfx950.tk.kernels.common import (
     bf_rne_hi,
     exp_ocml,
     f32c,
+    spin_pause,
 )
 from atom.models.deepseek_v41.mono.gfx950.tk.kernels.layer_tail import (
     _ld,
@@ -47,7 +48,6 @@ from atom.mono.device.ops import (
     kernel_symbol,
     launcher,
     rsrc,
-    spin_pause,
     traced,
     uniform,
 )

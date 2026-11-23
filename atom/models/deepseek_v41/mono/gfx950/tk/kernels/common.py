@@ -46,6 +46,14 @@ LOG2E, LOG2E_LO = 0x3FB8AA3B, 0x32A5705F
 NLOG2E, NLOG2E_LO = 0xBFB8AA3B, 0xB2A5705F
 
 
+def spin_pause():
+    """The tk kernels' poll retry: TileRT's pure spin (a side-effecting ``s_nop 0`` that keeps the reload inside the loop),
+    not ATOM mono's ``ATOM_MONO_POLL_SLEEP_UNITS`` backoff (``atom.mono.device.ops.spin_pause``: s_sleep 16 by default
+    since #3350, ~0.4 us a retry). The ports were verified and measured with this spin; where TileRT backs off it does
+    so explicitly (s_sleep 1 / 2 / 8), and so do the ports."""
+    llvm.InlineAsmOp(None, [], "s_nop 0", "", has_side_effects=True)
+
+
 def f32c(bits):
     """The f32 with these IEEE bits."""
     return Int32(bits).bitcast(F32)

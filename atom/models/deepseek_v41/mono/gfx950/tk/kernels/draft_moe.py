@@ -27,6 +27,7 @@ from atom.models.deepseek_v41.mono.gfx950.tk.kernels.common import (
     exp_ocml,
     f32c,
     log1p_ocml,
+    spin_pause,
 )
 from atom.models.deepseek_v41.mono.gfx950.tk.kernels.layer_tail import (
     QX1,
@@ -58,7 +59,6 @@ from atom.mono.device.ops import (
     load_ptr64,
     readlane,
     rsrc,
-    spin_pause,
     traced,
     uniform,
 )

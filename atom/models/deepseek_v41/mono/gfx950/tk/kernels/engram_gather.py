@@ -45,7 +45,7 @@ _CURRENT_STREAM = fx.Stream(None)
 KARG_WORDS = 36
 LAYOUT = ",".join(f"{8 * i}:8" for i in range(KARG_WORDS))
 THREADS = 256
-VERSION = "v1"
+VERSION = "v3"
 LL_PAR = 0x31800  # the LL area of an odd epoch
 LDS_WORDS = 48  # the 24 heads' table rows (u64)
 
@@ -73,6 +73,17 @@ def _bf16x2(w, hi):
     return fx.Vector(p).bitcast(Int32)[0]
 
 
+def _ls(addr, word, n=1):
+    """A wave-uniform load through the scalar cache (s_buffer_load; n = 1 or 4 dwords), into SGPRs (v3: the tokens,
+    positions, history and token-map ids were vector loads a lane plus readfirstlane).
+    """
+    v = bo.buffer_load(rsrc(addr), word, vec_width=n, is_scalar=True)
+    if n == 1:
+        return [Int32(v)]
+    vv = fx.Vector(v)
+    return [Int32(vv[i]) for i in range(n)]
+
+
 @traced
 def _engram(tid, s2e, lds, vtok, vpos, hist, tmap, w04, emult, eprimes, eoffs, hashbuf, tbl, tbl_s,
             lo_row, hi_row, tab, w20, ep):  # fmt: skip
@@ -80,9 +91,20 @@ def _engram(tid, s2e, lds, vtok, vpos, hist, tmap, w04, emult, eprimes, eoffs, h
     R, L = s2e >> 1, s2e & 1
     vocab, pad = Int32(w04), Int32(w04 >> 32)
     rank, npes = Int32(w20), Int32(w20 >> 32)
-    toks = [uniform(_ld(vtok, j)) for j in range(6)]
-    poss = [uniform(_ld(vpos, j)) for j in range(6)]
-    hs = [uniform(_ld(hist, i)) for i in range(16)]
+    # loads that depend on nothing computed here go out first, with the tokens: the hash constants (heads
+    # tid < 24; the other lanes load head 23's) and the 8 peers' table bases (v2; v1 issued each after the
+    # values before it, two more round trips on the CTA's path)
+    th = fx.min(tid, Int32(23))
+    m = [_u64(_ld(emult, (L * 4 + i) * 2, 2)) for i in range(4)]
+    prime = _u64(_ld(eprimes, (L * 24 + th) * 2, 2))
+    off = _u64(_ld(eoffs, (L * 24 + th) * 2, 2))
+    bases = [
+        _u64([uniform(_ld(tab, 2 * pp)), uniform(_ld(tab, 2 * pp + 1))])
+        for pp in range(8)
+    ]
+    toks = _ls(vtok, 0, 4) + _ls(vtok, 4) + _ls(vtok, 5)
+    poss = _ls(vpos, 0, 4) + _ls(vpos, 4) + _ls(vpos, 5)
+    hs = _ls(hist, 0, 4) + _ls(hist, 4, 4) + _ls(hist, 8, 4) + _ls(hist, 12, 4)
 
     def pick(vals, i):
         out = vals[0]
@@ -93,7 +115,7 @@ def _engram(tid, s2e, lds, vtok, vpos, hist, tmap, w04, emult, eprimes, eoffs, h
     def cmp(j):
         t = pick(toks, j)
         ok = (t >= 0) & (t < vocab)
-        return ok.select(uniform(_ld(tmap, ok.select(t, Int32(0)))), pad)
+        return ok.select(_ls(tmap, ok.select(t, Int32(0)))[0], pad)
 
     pos = pick(poss, R)
     cur = cmp(R)
@@ -105,9 +127,6 @@ def _engram(tid, s2e, lds, vtok, vpos, hist, tmap, w04, emult, eprimes, eoffs, h
         c = match.select(cmp(fx.max(rk, Int32(0))), pick(hs, p & 15))
         ctx.append((pos < k).select(pad, c))
     if tid < 24:
-        m = [_u64(_ld(emult, (L * 4 + i) * 2, 2)) for i in range(4)]
-        prime = _u64(_ld(eprimes, (L * 24 + tid) * 2, 2))
-        off = _u64(_ld(eoffs, (L * 24 + tid) * 2, 2))
         roll = (cur.to(Int64) * m[0]) ^ (ctx[0].to(Int64) * m[1])
         roll = (tid > 7).select(roll ^ (ctx[1].to(Int64) * m[2]), roll)
         roll = (tid > 15).select(roll ^ (ctx[2].to(Int64) * m[3]), roll)
@@ -167,9 +186,7 @@ def _engram(tid, s2e, lds, vtok, vpos, hist, tmap, w04, emult, eprimes, eoffs, h
         par = ((ep & 1) != 0).select(Int32(LL_PAR), Int32(0))
         for pp in range_constexpr(8):
             if pp < npes:
-                base = _u64(
-                    [uniform(_ld(tab, 2 * pp)), uniform(_ld(tab, 2 * pp + 1))]
-                ) + par.to(Int64)
+                base = bases[pp] + par.to(Int64)
                 if (lane & 1) == 0:
                     bo.buffer_store(fx.Vector.from_elements([q8, ep, partner, ep], Int32), rsrc(base),
                                     (grp + (lane >> 1)) * 4, cache_modifier=CM_SYS)  # fmt: skip

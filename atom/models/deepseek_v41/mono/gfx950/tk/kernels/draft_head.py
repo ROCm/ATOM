@@ -22,7 +22,12 @@ from flydsl.expr import gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
-from atom.models.deepseek_v41.mono.gfx950.tk.kernels.common import _call, bperm, f32c
+from atom.models.deepseek_v41.mono.gfx950.tk.kernels.common import (
+    _call,
+    bperm,
+    f32c,
+    spin_pause,
+)
 from atom.models.deepseek_v41.mono.gfx950.tk.kernels.layer_tail import (
     _ld,
     _ldm,
@@ -38,7 +43,6 @@ from atom.mono.device.ops import (
     mfma_bf16,
     readlane,
     rsrc,
-    spin_pause,
     traced,
     uniform,
 )
@@ -283,113 +287,115 @@ def _entry(tid, s2, lds, xn, head_w, w1, w2, blk_tok, nk, ws, tab, me, npes, ep,
     gpu.barrier()
     _gemv(tid, s2, cnt, head_w, lds, pre)
     tok = uniform(_ld(blk_tok, 0))
-    for k in range_constexpr(ROWS):
-        if k < nk:
-            xr = _u_gt(Int32(VOCAB), tok).select(tok, Int32(0))
-            w1f = []
-            for o in range_constexpr(4):
-                v = _ld(w1, (xr * 512 + seg * 64 + o * 16) >> 2, 4)
-                for d in range_constexpr(4):
-                    w1f += [
-                        (v[d] << 16).bitcast(F32),
-                        (v[d] & Int32(-65536)).bitcast(F32),
-                    ]
-            bias = fmath.fma(w2f[0], w1f[0], F32(0.0))
-            for e in range_constexpr(1, 32):
-                bias = fmath.fma(w2f[e], w1f[e], bias)
-            for off in (1, 2, 4):
-                bias = bias + bperm(bias, lane ^ off)
-            logit = bias + _lds_ld(lds, U_LDS + k * 256 + r * 4).bitcast(F32)
-            if valid & (seg == 0) & (dz != 0):
-                bo.buffer_store(logit, rsrc(dz), k * VOCAB_RANK + row_l)
-            score = f32c(NEG_MAX)
-            if valid:
-                h2 = _hstep(h1, _kmix(Int32(k) ^ s1))
-                # TileRT's position block: vpos[k] c1 + 0x40000000 before the rotation (s_add 2.0 in its ISA)
-                kv = vp[k] * Int32(C1) + Int32(0x40000000)
-                h3 = _hstep(h2, _rotl(kv, 15) * Int32(C2))
-                score = _gumbel_score(logit, temp, h3, kid)
-            kh, kl = _wave_kmax(_key_hi(score.bitcast(Int32)), klo)
-            if lane == 0:
-                _lds_st(lds, KEY_LDS + w * 8, [kl, kh])
-            _x_copy(tid, s2, k, tok, embed, xout)
-            gpu.barrier()
-            if tid == 0:
-                ch, cl = _lds_ld(lds, KEY_LDS + 4), _lds_ld(lds, KEY_LDS)
-                for ww in range_constexpr(1, 8):
-                    oh, ol = _lds_ld(lds, KEY_LDS + ww * 8 + 4), _lds_ld(
-                        lds, KEY_LDS + ww * 8
-                    )
-                    g = _k_gt(oh, ol, ch, cl)
-                    ch, cl = g.select(oh, ch), g.select(ol, cl)
-                at = (k * 4096 + (s2 % 8) * 512 + (s2 // 8) * 16) >> 2
-                bo.buffer_store(
-                    fx.Vector.from_elements([_unkey(ch), tag], Int32),
-                    rsrc(ws),
-                    at,
-                    cache_modifier=CM_DEV,
+    # the rows one after another at run time: one copy of the body (unrolled, the five copies made the code
+    # ~4x TileRT's, each copy fetched cold at every launch); a row's token feeds the next
+    k = Int32(0)
+    while k < nk:
+        vpk = vp[0]
+        for kk in range_constexpr(1, ROWS):
+            vpk = (k == kk).select(vp[kk], vpk)
+        xr = _u_gt(Int32(VOCAB), tok).select(tok, Int32(0))
+        w1f = []
+        for o in range_constexpr(4):
+            v = _ld(w1, (xr * 512 + seg * 64 + o * 16) >> 2, 4)
+            for d in range_constexpr(4):
+                w1f += [
+                    (v[d] << 16).bitcast(F32),
+                    (v[d] & Int32(-65536)).bitcast(F32),
+                ]
+        bias = fmath.fma(w2f[0], w1f[0], F32(0.0))
+        for e in range_constexpr(1, 32):
+            bias = fmath.fma(w2f[e], w1f[e], bias)
+        for off in (1, 2, 4):
+            bias = bias + bperm(bias, lane ^ off)
+        logit = bias + _lds_ld(lds, U_LDS + k * 256 + r * 4).bitcast(F32)
+        if valid & (seg == 0) & (dz != 0):
+            bo.buffer_store(logit, rsrc(dz), k * VOCAB_RANK + row_l)
+        score = f32c(NEG_MAX)
+        if valid:
+            h2 = _hstep(h1, _kmix(k ^ s1))
+            # TileRT's position block: vpos[k] c1 + 0x40000000 before the rotation (s_add 2.0 in its ISA)
+            kv = vpk * Int32(C1) + Int32(0x40000000)
+            h3 = _hstep(h2, _rotl(kv, 15) * Int32(C2))
+            score = _gumbel_score(logit, temp, h3, kid)
+        kh, kl = _wave_kmax(_key_hi(score.bitcast(Int32)), klo)
+        if lane == 0:
+            _lds_st(lds, KEY_LDS + w * 8, [kl, kh])
+        _x_copy(tid, s2, k, tok, embed, xout)
+        gpu.barrier()
+        if tid == 0:
+            ch, cl = _lds_ld(lds, KEY_LDS + 4), _lds_ld(lds, KEY_LDS)
+            for ww in range_constexpr(1, 8):
+                oh, ol = _lds_ld(lds, KEY_LDS + ww * 8 + 4), _lds_ld(
+                    lds, KEY_LDS + ww * 8
                 )
-                bo.buffer_store(
-                    fx.Vector.from_elements([~cl, tag], Int32),
-                    rsrc(ws),
-                    at + 2,
-                    cache_modifier=CM_DEV,
-                )
-            if (s2 < 8) & (w == 0):
-                ph = _key_hi(Int32(NEG_MAX))
-                pl = Int32(-(1 << 31))
-                if lane < 32:
-                    lw = (k * 4096 + s2 * 512 + lane * 16) >> 2
+                g = _k_gt(oh, ol, ch, cl)
+                ch, cl = g.select(oh, ch), g.select(ol, cl)
+            at = (k * 4096 + (s2 % 8) * 512 + (s2 // 8) * 16) >> 2
+            bo.buffer_store(
+                fx.Vector.from_elements([_unkey(ch), tag], Int32),
+                rsrc(ws),
+                at,
+                cache_modifier=CM_DEV,
+            )
+            bo.buffer_store(
+                fx.Vector.from_elements([~cl, tag], Int32),
+                rsrc(ws),
+                at + 2,
+                cache_modifier=CM_DEV,
+            )
+        if (s2 < 8) & (w == 0):
+            ph = _key_hi(Int32(NEG_MAX))
+            pl = Int32(-(1 << 31))
+            if lane < 32:
+                lw = (k * 4096 + s2 * 512 + lane * 16) >> 2
+                a0 = _ld(ws, lw, 2, CM_DEV)
+                a1 = _ld(ws, lw + 2, 2, CM_DEV)
+                while ~((a0[1] == tag) & (a1[1] == tag)):
+                    spin_pause()
                     a0 = _ld(ws, lw, 2, CM_DEV)
                     a1 = _ld(ws, lw + 2, 2, CM_DEV)
-                    while ~((a0[1] == tag) & (a1[1] == tag)):
-                        spin_pause()
-                        a0 = _ld(ws, lw, 2, CM_DEV)
-                        a1 = _ld(ws, lw + 2, 2, CM_DEV)
-                    ph = _key_hi(a0[0])
-                    pl = ~a1[0]
-                gh, gl = _wave_kmax(ph, pl)
-                for p in range_constexpr(8):
-                    if (npes > p) & ((lane >> 3) == p):
-                        off = (
-                            par
-                            + k * PEER_K
-                            + (lane & 7) * PEER_REGION
-                            + me * 128
-                            + s2 * 16
-                        )
-                        if npes > 1:
-                            base = peers[p]
-                            bo.buffer_store(fx.Vector.from_elements([_unkey(gh), tag, ~gl, tag], Int32), rsrc(base),
-                                            off >> 2, cache_modifier=CM_SYS)  # fmt: skip
-                        else:
-                            bo.buffer_store(fx.Vector.from_elements([_unkey(gh), tag, ~gl, tag], Int32), rsrc(ws),
-                                            (OWN_PEER_OFF + off) >> 2, cache_modifier=CM_SYS)  # fmt: skip
-            if w == 0:
-                fh = _key_hi(Int32(NEG_MAX))
-                fl = Int32(-(1 << 31))
-                if lane < npes * 8:
-                    ro = par + k * PEER_K + (s2 % 8) * PEER_REGION + lane * 16
-                    b4 = fx.Vector.filled(4, 0, Int32)
+                ph = _key_hi(a0[0])
+                pl = ~a1[0]
+            gh, gl = _wave_kmax(ph, pl)
+            for p in range_constexpr(8):
+                if (npes > p) & ((lane >> 3) == p):
+                    off = (
+                        par + k * PEER_K + (lane & 7) * PEER_REGION + me * 128 + s2 * 16
+                    )
                     if npes > 1:
-                        b4 = _ld(own, ro >> 2, 4, CM_SYS)
-                        while ~((b4[1] == tag) & (b4[3] == tag)):
-                            spin_pause()
-                            b4 = _ld(own, ro >> 2, 4, CM_SYS)
+                        base = peers[p]
+                        bo.buffer_store(fx.Vector.from_elements([_unkey(gh), tag, ~gl, tag], Int32), rsrc(base),
+                                        off >> 2, cache_modifier=CM_SYS)  # fmt: skip
                     else:
+                        bo.buffer_store(fx.Vector.from_elements([_unkey(gh), tag, ~gl, tag], Int32), rsrc(ws),
+                                        (OWN_PEER_OFF + off) >> 2, cache_modifier=CM_SYS)  # fmt: skip
+        if w == 0:
+            fh = _key_hi(Int32(NEG_MAX))
+            fl = Int32(-(1 << 31))
+            if lane < npes * 8:
+                ro = par + k * PEER_K + (s2 % 8) * PEER_REGION + lane * 16
+                b4 = fx.Vector.filled(4, 0, Int32)
+                if npes > 1:
+                    b4 = _ld(own, ro >> 2, 4, CM_SYS)
+                    while ~((b4[1] == tag) & (b4[3] == tag)):
+                        spin_pause()
+                        b4 = _ld(own, ro >> 2, 4, CM_SYS)
+                else:
+                    b4 = _ld(ws, (OWN_PEER_OFF + ro) >> 2, 4, CM_SYS)
+                    while ~((b4[1] == tag) & (b4[3] == tag)):
+                        spin_pause()
                         b4 = _ld(ws, (OWN_PEER_OFF + ro) >> 2, 4, CM_SYS)
-                        while ~((b4[1] == tag) & (b4[3] == tag)):
-                            spin_pause()
-                            b4 = _ld(ws, (OWN_PEER_OFF + ro) >> 2, 4, CM_SYS)
-                    fh = _key_hi(b4[0])
-                    fl = ~b4[2]
-                _, tl = _wave_kmax(fh, fl)
-                if lane == 0:
-                    _lds_st(lds, TOK_LDS, [~tl])
-                    if s2 == 0:
-                        _st_i(vtok, k, ~tl)
-            gpu.barrier()
-            tok = uniform(_lds_ld(lds, TOK_LDS))
+                fh = _key_hi(b4[0])
+                fl = ~b4[2]
+            _, tl = _wave_kmax(fh, fl)
+            if lane == 0:
+                _lds_st(lds, TOK_LDS, [~tl])
+                if s2 == 0:
+                    _st_i(vtok, k, ~tl)
+        gpu.barrier()
+        tok = uniform(_lds_ld(lds, TOK_LDS))
+        k = k + 1
     _x_copy(tid, s2, nk, tok, embed, xout)
 
 

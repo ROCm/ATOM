@@ -30,10 +30,13 @@ from atom.models.deepseek_v41.mono.gfx950.tk.kernels.common import (
     bf_rne_hi,
     bf_round,
     pack_bf2,
+    spin_pause,
 )
 from atom.models.deepseek_v41.mono.gfx950.tk.kernels.common import bperm as _bperm
 from atom.models.deepseek_v41.mono.gfx950.tk.kernels.common import exp_ocml as _exp_ocml
 from atom.models.deepseek_v41.mono.gfx950.tk.kernels.common import f32c as _c
+from atom.mono.device.ops import memrealtime as _mrt104
+from atom.mono.device.ops import spin_pause as _spin104
 from atom.mono.device.ops import (
     CM_DEV,
     CM_NT,
@@ -46,7 +49,6 @@ from atom.mono.device.ops import (
     permlane_swap,
     readlane,
     rsrc,
-    spin_pause,
     traced,
 )
 
@@ -238,8 +240,21 @@ def _lds_st(lds, byte, vals):
     fx.ptr_store(v, lds + (byte // 4))
 
 
+def _fp8x8_bf16_ps(words, scale):
+    """PS: eight fp8 of two dwords -> bf16 times ``scale`` (a power of two: exact) by
+    v_cvt_scalef32_pk_bf16_fp8 -- fp8x8_bf16_pk with the block scale applied in the conversion."""
+    out = []
+    for w in words:
+        for hi in (False, True):
+            p = rocdl.cvt_scalef32_pk_bf16_fp8(
+                T.bf16x2, Int32(w).ir_value(), F32(scale).ir_value(), hi
+            )
+            out.append(fx.Vector(p).bitcast(Int32)[0])
+    return fx.Vector.from_elements(out, Int32).bitcast(fx.BFloat16)
+
+
 @traced
-def qkv_gemv(tid, s16, xq, xs, qa_w, qa_s, kv_w, kv_s, ws, lds):
+def qkv_gemv(tid, s16, xq, xs, qa_w, qa_s, kv_w, kv_s, ws, lds, ps=1):
     """Logical CTA s16 < 224: 8 rows of the 16-row tile s16 / 2 (q_a tiles 0..79, kv 80..111) for the
     6 tokens over K = 5120 (wave w: K tiles w*10 .. +9 of 64), LDS-reduced, published as LL packs.
     """
@@ -267,7 +282,8 @@ def qkv_gemv(tid, s16, xq, xs, qa_w, qa_s, kv_w, kv_s, ws, lds):
         xc.append((row, col))
         xok.append(ok)
         xv.append(_ld(xq, (row * 0x1400 + col * 16) // 4, 4))
-    d = _ld(xs, fx.min(tid, Int32(QROWS * 40 - 1)))
+    d = _ld(xs, fx.min(tid, Int32(QROWS * 40 - 1))) if const_expr(ps == 0) else Int32(0)
+    xsw = [_ld(xs, (xc[q][0] * 160 + xc[q][1] // 2) // 4) for q in range(4)]  # PS: the chunks' scale dwords
     mine = ((lane >> 3) & 1) == par
     # this CTA's half of the tile only, exec-masked as TileRT's (zeros on the other lanes). The join
     # costs a conservative vmcnt(4) before the X conversion (TileRT's hipcc emits vmcnt(10)), but every
@@ -291,35 +307,51 @@ def qkv_gemv(tid, s16, xq, xs, qa_w, qa_s, kv_w, kv_s, ws, lds):
         if xok[rnd]:
             row, col = xc[rnd]
             v = xv[rnd]
-            lo = fp8x8_bf16_pk([v[0], v[1]]).bitcast(Int32)
-            hi = fp8x8_bf16_pk([v[2], v[3]]).bitcast(Int32)
+            # PS: X pre-scaled by its 32-block ue8m0 scale (row * 160 + col / 2) in the conversion
+            sx = _e8m0_f32(xsw[rnd] >> (8 * ((col // 2) % 4)))
+            lo = _fp8x8_bf16_ps([v[0], v[1]], sx).bitcast(Int32)
+            hi = _fp8x8_bf16_ps([v[2], v[3]], sx).bitcast(Int32)
             _lds_st(lds, row * X_ROW + col * 32, [lo[0], lo[1], lo[2], lo[3]])
             _lds_st(lds, row * X_ROW + col * 32 + 16, [hi[0], hi[1], hi[2], hi[3]])
-    if tid < QROWS * 40:
-        f = [_e8m0_f32(d >> (8 * b)).bitcast(Int32) for b in range(4)]
-        _lds_st(lds, XS_LDS + (tid // 40) * 0x280 + (tid % 40) * 16, f)
+    if const_expr(ps == 0):  # the per-block X scales in LDS: only the unscaled path reads them
+        if tid < QROWS * 40:
+            f = [_e8m0_f32(d >> (8 * b)).bitcast(Int32) for b in range(4)]
+            _lds_st(lds, XS_LDS + (tid // 40) * 0x280 + (tid % 40) * 16, f)
     sbytes = [_ld(sptr, ((tile // 2) * 0xA0 + w * 20) // 4 + q) for q in range(5)]
     tok_ok = (lane % 16) < QROWS
     tok = tok_ok.select(lane % 16, Int32(0))
     gpu.barrier()
-    acc01 = acc23 = None
-    for i in range_constexpr(10):
-        for j in range_constexpr(2):
-            kb = 2 * i + j
-            a = fp8x8_bf16_pk([wv[i][2 * j], wv[i][2 * j + 1]])
-            b = _lds_ld(
-                lds, tok * X_ROW + w * 1280 + kb * 64 + (lane // 16) * 16, 4
-            ).bitcast(fx.BFloat16)
-            m = mfma_bf16(a, b, fx.Vector.filled(4, 0.0, F32))
-            wsc = _e8m0_f32(sbytes[kb // 4] >> (8 * (kb % 4)))
-            xsc = _lds_ld(lds, XS_LDS + tok * 0x280 + (w * 20 + kb) * 4, 1).bitcast(F32)
-            c = wsc * xsc
-            if kb == 0:
-                acc01 = [fmath.fma(m[0], c, F32(0.0)), fmath.fma(m[1], c, F32(0.0))]
-                acc23 = [fmath.fma(m[2], c, F32(0.0)), fmath.fma(m[3], c, F32(0.0))]
-            else:
-                acc01 = [fmath.fma(m[0], c, acc01[0]), fmath.fma(m[1], c, acc01[1])]
-                acc23 = [fmath.fma(m[2], c, acc23[0]), fmath.fma(m[3], c, acc23[1])]
+    acc = [F32(0.0), F32(0.0), F32(0.0), F32(0.0)]
+    if const_expr(ps != 0):
+        # PS: both operands carry their power-of-two block scales -> one MFMA accumulator chain
+        av = fx.Vector.filled(4, 0.0, F32)
+        for i in range_constexpr(10):
+            for j in range_constexpr(2):
+                kb = 2 * i + j
+                wsc = _e8m0_f32(sbytes[kb // 4] >> (8 * (kb % 4)))
+                a = _fp8x8_bf16_ps([wv[i][2 * j], wv[i][2 * j + 1]], wsc)
+                b = _lds_ld(
+                    lds, tok * X_ROW + w * 1280 + kb * 64 + (lane // 16) * 16, 4
+                ).bitcast(fx.BFloat16)
+                av = mfma_bf16(a, b, av)
+        for q in range_constexpr(4):
+            acc[q] = av[q]
+    else:
+        for i in range_constexpr(10):
+            for j in range_constexpr(2):
+                kb = 2 * i + j
+                a = fp8x8_bf16_pk([wv[i][2 * j], wv[i][2 * j + 1]])
+                b = _lds_ld(
+                    lds, tok * X_ROW + w * 1280 + kb * 64 + (lane // 16) * 16, 4
+                ).bitcast(fx.BFloat16)
+                m = mfma_bf16(a, b, fx.Vector.filled(4, 0.0, F32))
+                wsc = _e8m0_f32(sbytes[kb // 4] >> (8 * (kb % 4)))
+                xsc = _lds_ld(lds, XS_LDS + tok * 0x280 + (w * 20 + kb) * 4, 1).bitcast(F32)
+                c = wsc * xsc
+                for q in range_constexpr(4):
+                    acc[q] = fmath.fma(m[q], c, F32(0.0) if kb == 0 else acc[q])
+    acc01 = [acc[0], acc[1]]
+    acc23 = [acc[2], acc[3]]
     if w != 0:
         base = w * 1024 + lane * 4 + RED_LDS
         _lds_st(lds, base, [acc01[0].bitcast(Int32)])
@@ -528,7 +560,7 @@ QB_EPOCH_SLOT, QB_PREP_SLOT = 224, 488
 
 
 @traced
-def qkv_qb(tid, s16, ws, qb_w, qb_s, ropec, vpos, q_out, prep_d8, lds):
+def qkv_qb(tid, s16, ws, qb_w, qb_s, ropec, vpos, q_out, prep_d8, lds, psq=1):
     """Logical CTA 224 + t (t < 256): 16 q columns (tile t, head t / 32) for the 6 tokens over K = 1280
     (wave w: K tiles w*5 .. +4 of 64), from this XCD's replica of the fp8 q latent; RoPE on a head's
     last 64 dims (tiles 28..31), bf16 out."""
@@ -542,6 +574,10 @@ def qkv_qb(tid, s16, ws, qb_w, qb_s, ropec, vpos, q_out, prep_d8, lds):
         pos = fx.max(_ld(vpos, tok), Int32(0))
         th = t % 32
         feat = th * 16 + 4 * (lane // 16)
+        # G104: the q_b weights wait 150 ticks (1.5 us) so the q_a / kv GEMV weights get the HBM first
+        t104 = _mrt104()
+        while (_mrt104() - t104) < 150:
+            _spin104()
         wv = []
         for i in range_constexpr(5):
             v = bo.buffer_load(
@@ -569,7 +605,8 @@ def qkv_qb(tid, s16, ws, qb_w, qb_s, ropec, vpos, q_out, prep_d8, lds):
             live = (tid | 0x300) < QROWS * 160 if k == 3 else (Int32(1) == 1)
             if live:
                 row, cc = c // 160, c % 160
-                lo = fp8x8_bf16_pk([ch[k][0], ch[k][2]]).bitcast(Int32)
+                sq8 = _e8m0_f32(ch[k][1] >> 24)  # PS: the 32-block scale
+                lo = _fp8x8_bf16_ps([ch[k][0], ch[k][2]], sq8).bitcast(Int32)
                 at = (
                     QB_X_LDS
                     + row * 2560
@@ -578,44 +615,60 @@ def qkv_qb(tid, s16, ws, qb_w, qb_s, ropec, vpos, q_out, prep_d8, lds):
                     + ((cc >> 2) & 1) * 16
                 )
                 _lds_st(lds, at, [lo[0], lo[1], lo[2], lo[3]])
-                if (cc & 3) == 0:
-                    _lds_st(
-                        lds,
-                        QB_XS_LDS + row * 160 + (cc >> 2) * 4,
-                        [_e8m0_f32(ch[k][1] >> 24).bitcast(Int32)],
-                    )
+                if const_expr(psq == 0):
+                    if (cc & 3) == 0:
+                        _lds_st(
+                            lds,
+                            QB_XS_LDS + row * 160 + (cc >> 2) * 4,
+                            [_e8m0_f32(ch[k][1] >> 24).bitcast(Int32)],
+                        )
         gpu.barrier()
         if tid == 0:
             _st_i(ws, EPOCHS // 4 + QB_EPOCH_SLOT + t, epoch)
         if (tid == 1) & (prep_d8 == 0) & (t <= 127):
             _st_i(ws, EPOCHS // 4 + QB_PREP_SLOT + t, epoch)
-        acc01 = acc23 = None
-        for i in range_constexpr(5):
-            for j in range_constexpr(2):
-                kb = 2 * i + j
-                a = fp8x8_bf16_pk([wv[i][2 * j], wv[i][2 * j + 1]])
-                b = _lds_ld(
-                    lds,
-                    QB_X_LDS
-                    + tok * 2560
-                    + (w * 5 + i) * 128
-                    + (lane // 16) * 32
-                    + j * 16,
-                    4,
-                )
-                m = mfma_bf16(a, b.bitcast(fx.BFloat16), fx.Vector.filled(4, 0.0, F32))
-                bi = 2 * (w & 1) + kb
-                wsc = _e8m0_f32(_pick_byte(sw, bi))
-                xsc = _lds_ld(
-                    lds, QB_XS_LDS + tok * 160 + (w * 10 + kb) * 4, 1
-                ).bitcast(F32)
-                c = wsc * xsc
-                if kb == 0:
-                    acc01 = [fmath.fma(m[0], c, F32(0.0)), fmath.fma(m[1], c, F32(0.0))]
-                    acc23 = [fmath.fma(m[2], c, F32(0.0)), fmath.fma(m[3], c, F32(0.0))]
-                else:
-                    acc01 = [fmath.fma(m[0], c, acc01[0]), fmath.fma(m[1], c, acc01[1])]
-                    acc23 = [fmath.fma(m[2], c, acc23[0]), fmath.fma(m[3], c, acc23[1])]
+        qacc = [F32(0.0), F32(0.0), F32(0.0), F32(0.0)]
+        if const_expr(psq != 0):
+            qv = fx.Vector.filled(4, 0.0, F32)
+            for i in range_constexpr(5):
+                for j in range_constexpr(2):
+                    kb = 2 * i + j
+                    bi = 2 * (w & 1) + kb
+                    wsc = _e8m0_f32(_pick_byte(sw, bi))
+                    a = _fp8x8_bf16_ps([wv[i][2 * j], wv[i][2 * j + 1]], wsc)
+                    b = _lds_ld(
+                        lds,
+                        QB_X_LDS + tok * 2560 + (w * 5 + i) * 128 + (lane // 16) * 32 + j * 16,
+                        4,
+                    )
+                    qv = mfma_bf16(a, b.bitcast(fx.BFloat16), qv)
+            for q in range_constexpr(4):
+                qacc[q] = qv[q]
+        else:
+            for i in range_constexpr(5):
+                for j in range_constexpr(2):
+                    kb = 2 * i + j
+                    a = fp8x8_bf16_pk([wv[i][2 * j], wv[i][2 * j + 1]])
+                    b = _lds_ld(
+                        lds,
+                        QB_X_LDS
+                        + tok * 2560
+                        + (w * 5 + i) * 128
+                        + (lane // 16) * 32
+                        + j * 16,
+                        4,
+                    )
+                    m = mfma_bf16(a, b.bitcast(fx.BFloat16), fx.Vector.filled(4, 0.0, F32))
+                    bi = 2 * (w & 1) + kb
+                    wsc = _e8m0_f32(_pick_byte(sw, bi))
+                    xsc = _lds_ld(
+                        lds, QB_XS_LDS + tok * 160 + (w * 10 + kb) * 4, 1
+                    ).bitcast(F32)
+                    c = wsc * xsc
+                    for q in range_constexpr(4):
+                        qacc[q] = fmath.fma(m[q], c, F32(0.0) if kb == 0 else qacc[q])
+        acc01 = [qacc[0], qacc[1]]
+        acc23 = [qacc[2], qacc[3]]
         if w != 0:
             base = w * 1024 + lane * 4 + QB_RED_LDS
             r4 = [acc01[0], acc01[1], acc23[0], acc23[1]]
@@ -672,8 +725,8 @@ def qkv_iw(tid, s16, xn, wproj, ix, lds):
             w3 = _ld(wproj, (h * 0x2800 + 0x2000 + tid * 16) // 4, 4)
             for r in range_constexpr(6):
                 x3[r] = _ld(xn, (r * 0x2800 + 0x2000 + tid * 16) // 4, 4)
-        acc = []
-        for r in range_constexpr(6):
+        a3 = []
+        for r in range_constexpr(6):  # a row's whole chain before the next: its x registers free early
             a = F32(0.0)
             first = True
             for c in range_constexpr(2):
@@ -683,16 +736,13 @@ def qkv_iw(tid, s16, xn, wproj, ix, lds):
                         we = bf_hi(wv[c][d]) if hi else bf_lo(wv[c][d])
                         a = fmath.fma(xe, we, F32(0.0) if first else a)
                         first = False
-            acc.append(a)
-        a3 = []
-        for r in range_constexpr(6):
-            a = acc[r]
+            a2 = a
             for d in range_constexpr(4):
                 for hi in range_constexpr(2):
                     xe = bf_hi(x3[r][d]) if hi else bf_lo(x3[r][d])
                     we = bf_hi(w3[d]) if hi else bf_lo(w3[d])
                     a = fmath.fma(xe, we, a)
-            a3.append(third.select(a, acc[r]))
+            a3.append(third.select(a, a2))
         for r in range_constexpr(6):
             v = a3[r]
             for k in (32, 16, 8, 4, 2, 1):
@@ -1515,6 +1565,9 @@ def build_xf():
             a48, a49, a50, a51, a52, a53, a54, a55, a56, a57,
         ).launch(grid=(GRID,), block=(THREADS,), stream=stream)  # fmt: skip
 
+    # grids 487 / 621 / 755 > 256 CUs: two 512-thread CTAs a CU (LDS 2 x 72560 B fits) only at <= 128 VGPRs, 4
+    # waves a SIMD (TileRT's: 125 / 125 / 128); left free the compiler took 134, one CTA a CU, the rest a round later
+    launch.compile_hints = {**launch.compile_hints, "waves_per_eu": 4}
     return name, launch
 
 

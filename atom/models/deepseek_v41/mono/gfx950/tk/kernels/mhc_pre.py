@@ -24,6 +24,7 @@ from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T, as_ir_value
 
+from atom.models.deepseek_v41.mono.gfx950.tk.kernels.common import spin_pause
 from atom.mono.device.ops import (
     CM_DEV,
     hw_rsq,
@@ -31,7 +32,6 @@ from atom.mono.device.ops import (
     launcher,
     readlane,
     rsrc,
-    spin_pause,
     traced,
 )
 

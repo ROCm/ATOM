@@ -22,6 +22,7 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 
+from atom.models.deepseek_v41.mono.gfx950.tk.kernels.common import spin_pause
 from atom.models.deepseek_v41.mono.gfx950.tk.kernels.mhc_pre import (
     HC_OFF,
     QP_1032,
@@ -45,7 +46,6 @@ from atom.mono.device.ops import (
     kernel_symbol,
     launcher,
     rsrc,
-    spin_pause,
     traced,
 )
 

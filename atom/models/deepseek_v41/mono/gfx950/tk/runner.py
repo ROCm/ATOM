@@ -285,4 +285,6 @@ class TkStepRunner:
             rank,
             "real" if forced is None else f"simulated {float(forced):.4f}",
         )
-        return cls(TkDevice(tk), rank, token_map=None, stream=torch.cuda.Stream())
+        # G62: TkRank's stream at high priority: its own HIP HW queue (ROCclr pools queues per priority), so ATOM's
+        # per-step work, queued behind the verdict wait on its streams, no longer runs ahead of TkRank's next step
+        return cls(TkDevice(tk), rank, token_map=None, stream=torch.cuda.Stream(priority=-1))

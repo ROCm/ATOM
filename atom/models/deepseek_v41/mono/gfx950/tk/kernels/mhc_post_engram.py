@@ -21,6 +21,7 @@ import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import range_constexpr, rocdl
 
+from atom.models.deepseek_v41.mono.gfx950.tk.kernels.common import spin_pause
 from atom.models.deepseek_v41.mono.gfx950.tk.kernels.layer_tail import OOB, _ld, _ldm
 from atom.models.deepseek_v41.mono.gfx950.tk.kernels.mhc_full import _get_y
 from atom.models.deepseek_v41.mono.gfx950.tk.kernels.mhc_post_pre import _load_x, _x_new
@@ -34,7 +35,6 @@ from atom.mono.device.ops import (
     kernel_symbol,
     launcher,
     rsrc,
-    spin_pause,
     traced,
     uniform,
 )
