@@ -1071,6 +1071,28 @@ mod pairs {
     }
 
     #[tokio::test]
+    async fn first_pairs_of_a_dp_prefill_s_ranks_read_its_info_once() {
+        let (p, p_url) = instance(Vec::new(), false, prefill_info(2, None)).await;
+        let registry = Arc::new(WorkerRegistry::new());
+        let pairs = AtomPairs::new(registry.clone(), AtomPdRankMappingPolicy::Idx2Idx)
+            .await
+            .unwrap();
+        let rank_workers = ranks(&p_url, PREFILL).await;
+        for worker in &rank_workers {
+            registry.register(worker.clone());
+        }
+        let reads = rank_workers.iter().map(|w| pairs.adapter_for(w));
+        let adapters = timeout(HANG, futures::future::join_all(reads))
+            .await
+            .unwrap();
+        assert!(adapters.iter().all(Result::is_ok));
+        let reads = p
+            .server_info_reads
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(reads, 1);
+    }
+
+    #[tokio::test]
     async fn a_pair_of_an_atom_and_a_non_atom_worker_is_refused_before_either_call() {
         let (p, p_url) = instance(vec![vec![prefill_done(json!({}))]], false, None).await;
         let other = test_mocks::mock_http_only_worker("http://d:8000");
