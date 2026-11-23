@@ -370,6 +370,43 @@ async fn a_stream_becomes_token_chunks_in_order() {
     );
 }
 
+/// `complete`, answering sibling `index`.
+fn sibling(output_ids: &[u32], index: u32) -> GenerateResponse {
+    let mut response = complete(output_ids, "eos");
+    if let Some(generate_response::Response::Complete(c)) = response.response.as_mut() {
+        c.index = index;
+    }
+    response
+}
+
+#[tokio::test]
+async fn an_unstreamed_call_yields_every_siblings_complete_by_index() {
+    let fake = FakeAtom::new(vec![
+        vec![sibling(&[21], 1), sibling(&[10], 0)],
+        vec![sibling(&[21], 1), error("engine failed", 500)],
+    ]);
+    let plan = single(atom_worker(&serve(fake).await));
+
+    let both = collect(&plan, false).await;
+    let ids: Vec<_> = both
+        .iter()
+        .map(|item| match item {
+            Ok(TokenChunk::Complete { token_ids, .. }) => token_ids.clone(),
+            other => panic!("expected a Complete, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(ids, [vec![10], vec![21]]);
+
+    // An error after a sibling's Complete fails the call.
+    let failed = GrpcEngine::new().dispatch(&plan, &mut payload(false)).await;
+    assert!(
+        matches!(&failed, Err(EngineError::Http { status, .. })
+            if *status == StatusCode::INTERNAL_SERVER_ERROR),
+        "{:?}",
+        failed.err()
+    );
+}
+
 #[tokio::test]
 async fn an_error_keeps_its_http_status() {
     let fake = FakeAtom::new(vec![
