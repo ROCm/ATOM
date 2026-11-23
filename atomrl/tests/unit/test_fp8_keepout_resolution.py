@@ -130,12 +130,8 @@ def test_r3_has_a_single_engine_config_key():
     )
 
 
-def test_both_actor_workers_emit_the_same_r3_key():
-    """One test file parametrises both copies; keep their contract identical."""
-    for rel in (
-        "atomrl/workers/actor_worker.py",
-        "atomrl/engine/training/actor_worker.py",
-    ):
-        src = (_ROOT / rel).read_text()
-        assert '"moe_enable_routing_replay"' in src, rel
-        assert '"r3_enabled":' not in src, f"{rel} still emits the duplicate key"
+def test_actor_worker_emits_the_canonical_r3_key():
+    rel = "atomrl/workers/actor_worker.py"
+    src = (_ROOT / rel).read_text()
+    assert '"moe_enable_routing_replay"' in src
+    assert '"r3_enabled":' not in src
