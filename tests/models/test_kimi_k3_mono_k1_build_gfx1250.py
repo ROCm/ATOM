@@ -1,0 +1,489 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+
+from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from atom.models.kimi_k3.mono.kernels.attention import (
+    kda_builder_gfx1250 as builder,
+)
+from atom.models.kimi_k3.mono.kernels.execution_plan import (
+    Gfx1250KimiBuildPlan,
+)
+
+
+def _plan(rows=16):
+    return Gfx1250KimiBuildPlan(
+        threads=256,
+        blocks=256,
+        lds_bytes=320 * 1024,
+        tokens=rows,
+        nblocks=4,
+    )
+
+
+def _spec(qlen=16):
+    return builder.K1LocalBuildSpec(
+        qlen=qlen,
+        delta=True,
+        state_len=qlen + 2,
+        eps=1e-5,
+        out_eps=1e-5,
+        onorm_eps=1e-5,
+        lower_bound=-5.0,
+        write_idx=-1,
+    )
+
+
+def test_build_local_loads_complete_product_pipeline(monkeypatch):
+    plan = _plan()
+    spec = replace(_spec(), kda0=7)
+    kernel = SimpleNamespace(complete=True, launch_count=1)
+    observed = {}
+
+    def build_resident_k1(got_plan, declaration, got_spec):
+        observed.update(
+            plan=got_plan,
+            declaration=declaration,
+            spec=got_spec,
+        )
+        return kernel
+
+    monkeypatch.setattr(
+        builder,
+        "import_module",
+        lambda name: SimpleNamespace(build_resident_k1=build_resident_k1),
+    )
+
+    result = builder.build_local(plan, spec=spec)
+    assert result.runnable
+    assert result.complete
+    assert result.kernel is kernel
+    assert result.launch_count == 1
+    assert result.declaration.protocol.kda0 == 7
+    assert result.refusal.code == "none"
+    assert observed == {
+        "plan": plan,
+        "declaration": result.declaration,
+        "spec": spec,
+    }
+
+
+def test_local_scratch_covers_every_protocol_region():
+    declaration = builder.declare_local(_plan(48), qlen=16)
+    layout = builder.local_scratch_layout(declaration)
+
+    assert tuple(layout) == (
+        *declaration.protocol.mailbox_pairs,
+        "sync",
+        "x",
+    )
+    assert all(offset % 16 == 0 for offset, _size in layout.values())
+    for name, pairs in declaration.protocol.mailbox_pairs.items():
+        assert layout[name][1] == pairs * 8
+
+
+def test_split_projection_owns_whole_clusters_past_attention():
+    assert builder.split_projection_ctas(256) == 200
+    with pytest.raises(ValueError, match="whole TDM clusters"):
+        builder.split_projection_ctas(254)
+    with pytest.raises(ValueError, match="tasks"):
+        builder.split_projection_ctas(240)
+
+
+@pytest.mark.parametrize("rows", [1, 10, 20, 40, 48])
+def test_fp8_split_projection_fits_every_row_count(rows):
+    plan = _plan(rows)
+    assert builder.split_projection_fits(plan, qlen=1)
+    lds = builder.role_lds_plan(plan, qlen=1, split="fp8")
+    assert lds.split_format == "fp8"
+    assert lds.split_stages == (3 if rows <= 46 else 2)
+    assert lds.smem.bytes + lds.role.bytes <= plan.lds_bytes
+
+
+def test_bf16_split_projection_refuses_rows_it_cannot_hold():
+    assert builder.split_projection_fits(_plan(36), qlen=1, fp8=False)
+    assert not builder.split_projection_fits(_plan(40), qlen=1, fp8=False)
+    with pytest.raises(ValueError, match="does not fit 40 rows"):
+        builder.role_lds_plan(_plan(40), qlen=1, split="bf16")
+
+
+def test_split_scratch_follows_the_x_handoff():
+    plan = _plan(40)
+    declaration = builder.declare_local(plan, qlen=1, split="fp8")
+    layout = builder.local_scratch_layout(declaration)
+    x_offset, x_bytes = layout["x"]
+    offset, size = layout["split"]
+    assert tuple(layout)[-2:] == ("x", "split")
+    assert offset % 16 == 0 and offset >= x_offset + x_bytes
+    assert size == 200 * 8 * 3 * 256 * 4
+    assert "split" not in builder.local_scratch_layout(
+        builder.declare_local(plan, qlen=1)
+    )
+
+
+def test_split_projection_requires_the_tdm_projection():
+    spec = replace(
+        _spec(qlen=1), state_len=3, split_projection=True, tdm_projection=False
+    )
+    with pytest.raises(ValueError, match="split"):
+        spec.validate(_plan(40))
+    assert replace(spec, tdm_projection=True).split_format == "bf16"
+    assert replace(spec, fp8_projection=True).split_format == "fp8"
+
+
+def test_resident_projection_reuses_each_weight_slab_across_s48_tiles():
+    plan = _plan(48)
+    spec = _spec()
+    declaration = builder.declare_local(
+        plan,
+        qlen=spec.qlen,
+        gemv_unit=spec.gemv_unit,
+    )
+    slabs = declaration.lds.arena.gemv_slabs[0]
+
+    assert declaration.gemv_unit == 2
+    assert slabs == ((0, 2), (2, 2), (4, 2), (6, 1))
+    assert sum(groups for _first, groups in slabs) == 7
+    assert spec.launch_count == 1
+    # 6284 rows x 7168 BF16 columns, loaded once rather than once per M16 tile.
+    assert builder.HIDDEN * 6284 * 2 == 90_087_424
+
+
+def test_resident_launch_pins_one_eight_wave_cta_per_cu():
+    source = (
+        Path(__file__).parents[2]
+        / "atom"
+        / "models"
+        / "kimi_k3"
+        / "mono"
+        / "kernels"
+        / "attention"
+        / "kda_resident_gfx1250.py"
+    ).read_text()
+    assert 'CompilationContext.compile_hints({"waves_per_eu": 2})' in source
+    generation = source[source.index("def _arrive") : source.index("def _task_start")]
+    kept = generation.index("fx.ptr_store(fx.Int64(previous + fx.Int32(1)), slots)")
+    barrier = generation.index("gpu.barrier()", kept)
+    read = generation.index("fx.ptr_load(slots)", barrier)
+    assert kept < barrier < read
+
+    projection = source.index("if bid >= ATTENTION_CTAS:")
+    ready = source.index("mailbox_poll_device(", projection)
+    weights = source.index('compute["kda_gemv_loads"](', ready)
+    assert projection < ready < weights
+    declaration = builder.declare_local(_plan(), qlen=16)
+    assert declaration.candidate_grid == (256,)
+    assert declaration.known_block_size == (256, 1, 1)
+
+
+def test_resident_attention_refuses_more_than_sixteen_sources():
+    with pytest.raises(ValueError, match="at most 16 sources"):
+        builder.declare_local(replace(_plan(), nblocks=16), qlen=16)
+
+
+def test_local_build_accepts_the_production_conv_window():
+    plan = _plan()
+    _spec(qlen=16).validate(plan)
+    with pytest.raises(ValueError, match="two retained history"):
+        replace(_spec(qlen=16), state_len=17).validate(plan)
+
+
+@pytest.mark.parametrize(
+    ("switch", "heads", "split"),
+    [
+        ("", 48, 1),
+        ("1", 48, 1),
+        ("2", 48, 2),
+        ("4", 96, 1),
+        ("auto", 48, 4),
+        ("auto", 96, 2),
+        ("auto", 192, 1),
+    ],
+)
+def test_head_split_counts_only_parts_the_grid_holds_at_once(
+    monkeypatch, switch, heads, split
+):
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
+    from atom.models.kimi_k3.mono.kernels.attention import kda_resident_gfx1250
+
+    monkeypatch.setenv("ATOM_KIMI_MONO_K1_HEAD_SPLIT", switch)
+    assert kda_resident_gfx1250._head_split(heads, 256) == split
+
+
+def test_head_split_defaults_to_auto(monkeypatch):
+    from atom.utils import envs
+
+    monkeypatch.delenv("ATOM_KIMI_MONO_K1_HEAD_SPLIT", raising=False)
+    assert envs.ATOM_KIMI_MONO_K1_HEAD_SPLIT == "auto"
+
+
+def test_whole_heads_replace_the_chunk_tasks_by_default(monkeypatch):
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
+    from atom.models.kimi_k3.mono.kernels.attention import kda_resident_gfx1250
+    from atom.utils import envs
+
+    monkeypatch.delenv("ATOM_KIMI_MONO_K1_WHOLE_HEADS", raising=False)
+    assert envs.ATOM_KIMI_MONO_K1_WHOLE_HEADS
+    # one or two requests' chunk tasks fit the grid: forced whole heads
+    assert kda_resident_gfx1250._whole_heads(5, 96, 256, False) == (True, True)
+    assert kda_resident_gfx1250._whole_heads(8, 192, 256, False) == (True, True)
+    # past one pass, plain decode and ReplaySSM: whole heads anyway
+    assert kda_resident_gfx1250._whole_heads(5, 288, 256, False) == (True, False)
+    assert kda_resident_gfx1250._whole_heads(1, 96, 256, False) == (True, False)
+    assert kda_resident_gfx1250._whole_heads(5, 96, 256, True) == (True, False)
+
+
+def test_whole_heads_switch_off_keeps_the_chunk_tasks(monkeypatch):
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
+    from atom.models.kimi_k3.mono.kernels.attention import kda_resident_gfx1250
+
+    monkeypatch.setenv("ATOM_KIMI_MONO_K1_WHOLE_HEADS", "0")
+    assert kda_resident_gfx1250._whole_heads(5, 96, 256, False) == (False, False)
+    assert kda_resident_gfx1250._whole_heads(5, 288, 256, False) == (True, False)
+
+
+def test_head_split_refuses_other_counts(monkeypatch):
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
+    from atom.models.kimi_k3.mono.kernels.attention import kda_resident_gfx1250
+
+    monkeypatch.setenv("ATOM_KIMI_MONO_K1_HEAD_SPLIT", "3")
+    with pytest.raises(ValueError):
+        kda_resident_gfx1250._head_split(48, 256)
+
+
+def test_replay_records_bound_what_a_step_finds_committed():
+    # the serving cache_len 16, DSpark 4's window 5: a flush once h > 6
+    assert builder.replay_records(16, 5) == 11
+    assert builder.replay_staged(16, 5) == 12
+    assert builder.replay_records(16, 8) == 8  # every committed step flushes
+    assert builder.replay_staged(16, 8) == 8
+
+
+def test_replay_lds_appends_to_the_recurrence_only():
+    plain = builder.role_lds_plan(_plan(40), qlen=5)
+    replay = builder.role_lds_plan(_plan(40), qlen=5, replay_cap=16, replay_window=5)
+    assert plain == builder.role_lds_plan(_plan(40), qlen=5, replay_cap=0)
+    assert plain != replay
+    fields = repr(replay)
+    assert "glog" in fields and "rec" in fields
+    assert "glog" not in repr(plain)
+
+
+@pytest.mark.parametrize(
+    ("rows", "qlen", "paired"),
+    ((5, 5, True), (16, 8, True), (40, 5, True), (64, 8, False)),
+)
+def test_paired_slabs_by_default_where_four_token_buffers_fit(
+    monkeypatch, rows, qlen, paired
+):
+    from atom.models.kimi_k3.mono.kernels.stages import gemv_layout
+
+    monkeypatch.delenv("ATOM_KIMI_MONO_K1_PAIRED_SLABS", raising=False)
+    lds = builder.role_lds_plan(
+        _plan(rows), qlen=qlen, fp8=True, replay_cap=16, replay_window=qlen
+    )
+    assert lds.paired is paired
+    projection = {field.name: field.bytes for field in lds.variant("projection").fields}
+    need = gemv_layout.tdm_lds_bytes(
+        rows, 2, True, gemv_layout.TDM_FP8_PAIR_DEPTH, group=2
+    )
+    assert (projection["xl"] >= need) is paired
+    # BF16 in-projections walk one slab a step
+    if rows <= 58:
+        assert not builder.role_lds_plan(_plan(rows), qlen=qlen).paired
+
+
+def test_paired_slabs_switch_off_walks_one_slab_a_step(monkeypatch):
+    monkeypatch.setenv("ATOM_KIMI_MONO_K1_PAIRED_SLABS", "0")
+    assert not builder.role_lds_plan(_plan(5), qlen=5, fp8=True).paired
+
+
+def test_paired_slabs_keep_the_weight_stages_and_double_the_token_buffers():
+    from atom.models.kimi_k3.mono.kernels.stages import gemv_layout as gl
+
+    single = gl.tdm_lds_words(8, 2, True, gl.TDM_FP8_DEPTH)
+    paired = gl.tdm_lds_words(8, 2, True, gl.TDM_FP8_PAIR_DEPTH, group=2)
+    assert paired == (2 * single[0], single[1])
+
+
+@pytest.mark.parametrize(
+    ("cap", "window", "message"),
+    (
+        (16, 4, "window"),  # narrower than the query
+        (8, 5, "window"),  # two windows do not fit the buffer
+        (0, 5, "without a record buffer"),
+    ),
+)
+def test_replay_spec_refuses_an_inconsistent_window(cap, window, message):
+    spec = replace(_spec(5), replay_cap=cap, replay_window=window)
+    with pytest.raises(ValueError, match=message):
+        spec.validate(_plan(40))
+
+
+def test_chunk_recurrence_defaults_off_auto_takes_replay_builds(monkeypatch):
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
+    from atom.models.kimi_k3.mono.kernels.attention import kda_resident_gfx1250
+    from atom.utils import envs
+
+    monkeypatch.delenv("ATOM_KIMI_MONO_K1_CHUNK_RECUR", raising=False)
+    assert envs.ATOM_KIMI_MONO_K1_CHUNK_RECUR == "0"
+    chunk = kda_resident_gfx1250._chunk_recur
+    assert not chunk(8, True) and not chunk(5, True) and not chunk(8, False)
+    monkeypatch.setenv("ATOM_KIMI_MONO_K1_CHUNK_RECUR", "auto")
+    assert chunk(8, True) and chunk(5, True)
+    assert not chunk(8, False) and not chunk(5, False)
+    assert not chunk(1, True)
+    monkeypatch.setenv("ATOM_KIMI_MONO_K1_CHUNK_RECUR", "1")
+    assert chunk(8, False) and chunk(5, True) and not chunk(1, False)
+    monkeypatch.setenv("ATOM_KIMI_MONO_K1_CHUNK_RECUR", "0")
+    assert not chunk(8, True)
+
+
+@pytest.mark.parametrize("qlen", range(2, 17))
+def test_chunk_interactions_fit_the_gate_staging(qlen):
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
+    from atom.models.kimi_k3.mono.kernels.attention import kda_gfx1250
+
+    words = kda_gfx1250.chunk_interaction_words(qlen)
+    assert words >= qlen * qlen and words % kda_gfx1250.CHUNK_SUM_GROUP == 0
+    # every wave's words in ``fa`` (qlen * 128 words)
+    assert words * 8 <= qlen * kda_gfx1250.HEAD_DIM
+
+
+def test_chunk_interactions_of_the_serving_windows():
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
+    from atom.models.kimi_k3.mono.kernels.attention import kda_gfx1250
+
+    assert kda_gfx1250.chunk_interaction_words(5) == 32
+    assert kda_gfx1250.chunk_interaction_words(8) == 64
+    # the gates' bound at -5: L = 8's cumulative decay divides safely
+    assert -5.0 * 8 >= kda_gfx1250.CHUNK_MIN_LOG_DECAY
+
+
+@pytest.mark.parametrize("qlen", [5, 8])
+def test_chunk_form_matches_the_token_recurrence(qlen):
+    """``kda_recur_head_chunk``'s algebra (f64, host): S_0's projections and
+    outputs through the cumulative decays, the interactions solved forward,
+    against the token-by-token delta rule, and its last state."""
+    import torch
+
+    gen = torch.Generator().manual_seed(qlen)
+    rows, dim = 16, 128
+    state0 = torch.randn(rows, dim, generator=gen, dtype=torch.float64) * 0.05
+    q = torch.nn.functional.normalize(
+        torch.randn(qlen, dim, generator=gen, dtype=torch.float64), dim=-1
+    )
+    k = torch.nn.functional.normalize(
+        torch.randn(qlen, dim, generator=gen, dtype=torch.float64), dim=-1
+    )
+    v = torch.randn(qlen, rows, generator=gen, dtype=torch.float64)
+    beta = torch.rand(qlen, generator=gen, dtype=torch.float64)
+    decay = torch.exp(-5.0 * torch.rand(qlen, dim, generator=gen, dtype=torch.float64))
+
+    state, outputs, values = state0.clone(), [], []
+    for t in range(qlen):
+        state = state * decay[t]
+        value = (v[t] - state @ k[t]) * beta[t]
+        state = state + value[:, None] * k[t]
+        values.append(value)
+        outputs.append(state @ q[t])
+
+    cumulative = torch.cumprod(decay, dim=0)
+    key_t, query_t, key_j = k * cumulative, q * cumulative, k / cumulative
+    m, p = key_t @ key_j.T, query_t @ key_j.T
+    chunk_values, chunk_outputs = [], []
+    for t in range(qlen):
+        correction = state0 @ key_t[t]
+        for j in range(t):
+            correction = correction + m[t, j] * chunk_values[j]
+        chunk_values.append((v[t] - correction) * beta[t])
+        output = state0 @ query_t[t]
+        for j in range(t + 1):
+            output = output + p[t, j] * chunk_values[j]
+        chunk_outputs.append(output)
+    last = state0
+    for t in range(qlen):
+        last = last * decay[t] + chunk_values[t][:, None] * k[t]
+    torch.testing.assert_close(torch.stack(chunk_values), torch.stack(values))
+    torch.testing.assert_close(torch.stack(chunk_outputs), torch.stack(outputs))
+    torch.testing.assert_close(last, state)
+
+
+@pytest.mark.parametrize(
+    "requests, split",
+    [(1, 4), (2, 2), (3, 4), (4, 4), (5, 4), (6, 2), (10, 2), (11, 1)],
+)
+def test_replay_auto_split_stops_at_two_for_two_requests(requests, split):
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
+    from atom.models.kimi_k3.mono.kernels.attention import kda_resident_gfx1250 as kr
+
+    auto = kr._auto_head_split(requests * kr.HEADS, 256)
+    assert kr._replay_auto_split(auto, requests) == split
+
+
+def test_head_options_default_to_none(monkeypatch):
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
+    from atom.models.kimi_k3.mono.kernels.attention import kda_resident_gfx1250 as kr
+    from atom.utils import envs
+
+    monkeypatch.delenv("ATOM_KIMI_MONO_K1_HEAD", raising=False)
+    assert envs.ATOM_KIMI_MONO_K1_HEAD == frozenset()
+    assert kr._head_options(True, True) == frozenset()
+
+
+def test_head_options_keep_the_replay_ones_under_replay_alone(monkeypatch):
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
+    from atom.models.kimi_k3.mono.kernels.attention import kda_resident_gfx1250 as kr
+
+    monkeypatch.setenv("ATOM_KIMI_MONO_K1_HEAD", "conv,meta,ks,noack")
+    everything = frozenset({"conv", "meta", "ks", "noack"})
+    assert kr._head_options(True, True) == everything
+    # no whole heads: none; no ReplaySSM: no records, no metadata chain
+    assert kr._head_options(False, True) == frozenset()
+    assert kr._head_options(True, False) == everything - {"meta", "ks"}
+
+
+def test_head_options_refuse_an_unknown_one(monkeypatch):
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
+    from atom.models.kimi_k3.mono.kernels.attention import kda_resident_gfx1250 as kr
+
+    monkeypatch.setenv("ATOM_KIMI_MONO_K1_HEAD", "conv,fast")
+    with pytest.raises(ValueError, match="fast"):
+        kr._head_options(True, True)
+
+
+def test_head_option_letters_are_distinct():
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
+    from atom.models.kimi_k3.mono.kernels.attention import kda_resident_gfx1250 as kr
+
+    letters = list(kr._HEAD_OPTIONS.values())
+    assert len(set(letters)) == len(letters)
+    assert all(len(letter) == 1 for letter in letters)
+
+
+def test_side_waves_issue_none_of_the_rolled_projections_first_copies():
+    pytest.importorskip("aiter", reason="the kernel under test needs aiter")
+    pytest.importorskip("flydsl", reason="builds a FlyDSL kernel")
+    from atom.models.kimi_k3.mono.kernels.attention import kda_gfx1250
+    from atom.models.kimi_k3.mono.kernels.attention import kda_resident_gfx1250 as kr
+
+    # wave 0 copies the tokens, waves 1 + 2 t and 2 + 2 t task t's weights
+    # (gemv_tdm._project_rolled): "meta" reads its chain on the waves past them
+    assert kda_gfx1250.SIDE_WAVE0 == 1 + 2 * kr.PROJECTION_ROWS_PER_CTA
+    assert kda_gfx1250.SIDE_WAVE0 < 8

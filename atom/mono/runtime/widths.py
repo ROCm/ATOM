@@ -25,14 +25,23 @@ class WidthBuilds:
 
     A kernel with scratch refuses its width, with a warning: a persistent kernel
     needs every CTA resident at once, and one whose waves need scratch can be
-    dispatched only in part (the scratch the runtime holds for the grid), its
-    resident CTAs then waiting for ever on the rest. ``lean(built, spilled)``,
-    when given, first rebuilds the kernels whose launchers spilled with fewer
-    registers (a build returned with those swapped, or None when it has none
-    leaner), every rank together: the width is refused only if those spill too."""
+    dispatched only in part. Architecture-specific runners may provide
+    ``hazards(launcher)`` to reject explicit VGPR/SGPR spills or excess LDS too.
+    ``lean(built, spilled)``, when given, first rebuilds those launchers with
+    lower resource pressure, every rank together; the width is refused only if
+    the lean build is unsafe too."""
 
-    def __init__(self, build, kernels, group, what: str, lean=None) -> None:
+    def __init__(
+        self,
+        build,
+        kernels,
+        group,
+        what: str,
+        lean=None,
+        hazards=None,
+    ) -> None:
         self._build, self._kernels, self._lean = build, kernels, lean
+        self._hazards = hazards
         self._group, self._what = group, what
         self._built = {}
         self._refused = set()
@@ -58,9 +67,14 @@ class WidthBuilds:
             lean = self._lean(built, spilled) if spilled else built
             if group_agree(lean is not None, self._group):
                 logger.info(
-                    "%s: %s need scratch, rebuilt lean",
+                    "%s: %s %s, rebuilt lean",
                     self._what,
                     ", ".join(sorted({n for f in spilled for n in kernel_names(f)})),
+                    (
+                        "have resident resource hazards"
+                        if self._hazards is not None
+                        else "need scratch"
+                    ),
                 )
                 built, scratch = self._compiled(width, lambda: lean)
         if built is not None and not self._scratch_free(scratch):
@@ -95,6 +109,10 @@ class WidthBuilds:
             return None, {}
         try:
             launchers = compile_kernels(kernels)
+            if self._hazards is not None:
+                return built, {
+                    launcher: self._hazards(launcher) for launcher in launchers
+                }
             return built, {launcher: scratch_bytes(launcher) for launcher in launchers}
         except Exception:
             logger.exception(
@@ -116,6 +134,15 @@ class WidthBuilds:
     def _scratch_free(self, scratch: dict) -> bool:
         for launcher, n in scratch.items():
             if n:
+                if self._hazards is not None:
+                    logger.warning(
+                        "%s: %s has resident resource hazards (%s); its width's"
+                        " steps take the original path",
+                        self._what,
+                        ", ".join(kernel_names(launcher)),
+                        ", ".join(n),
+                    )
+                    return False
                 logger.warning(
                     "%s: %s needs %d B of scratch a lane, which can leave its"
                     " CTAs partly resident and waiting for ever: its width's"

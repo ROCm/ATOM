@@ -37,6 +37,7 @@ def test_no_full_attention_layer_closes_a_block():
 def test_k2_tags_stay_clear_of_k1_s():
     pytest.importorskip("flydsl", reason="importing the K3 mono runner needs FlyDSL")
     pytest.importorskip("aiter", reason="the K3 mono runner imports aiter.dist")
+    pytest.importorskip("triton", reason="the kernel under test needs triton")
     from atom.models.kimi_k3.mono.runner import K2_TAG0
 
     k1_tags = {i + 1 for i in range(LAYERS)}  # ``Mailbox``: tag = layer + 1
@@ -67,7 +68,9 @@ def stub_binds(monkeypatch):
     from atom.models.kimi_k3.mono import weights
 
     monkeypatch.setattr(
-        weights, "bind_kda", lambda layer, lid, dims: SimpleNamespace(layer_id=lid)
+        weights,
+        "bind_kda",
+        lambda layer, lid, dims, fp8_in_proj=False: SimpleNamespace(layer_id=lid),
     )
     monkeypatch.setattr(
         weights,
@@ -86,6 +89,18 @@ def test_full_attention_layers_get_k2_alone(stub_binds):
     assert plans[3].kda is None and plans[3].moe.layer_id == 3
     # layer 0 is dense: it never gets K2
     assert (plans[0].kda, plans[0].moe) == (None, None)
+
+
+def test_k1_only_binding_never_touches_k2_weights(stub_binds, monkeypatch):
+    monkeypatch.setattr(
+        stub_binds,
+        "bind_moe",
+        lambda *_args, **_kwargs: pytest.fail("K2 must stay on the model path"),
+    )
+    plans = stub_binds.bind_model(_model(6), None, 0, bind_k2=False)
+
+    assert [p.k1_only for p in plans] == [False, True, True, False, True, True]
+    assert all(plan.moe is None for plan in plans)
 
 
 def test_a_full_attention_layer_that_closes_a_block_keeps_production_k2(
@@ -141,6 +156,7 @@ def test_no_kda_layer_still_refuses(stub_binds):
 def runner_module():
     pytest.importorskip("flydsl", reason="importing the K3 mono runner needs FlyDSL")
     pytest.importorskip("aiter", reason="the K3 mono runner imports aiter.dist")
+    pytest.importorskip("triton", reason="the kernel under test needs triton")
     from atom.models.kimi_k3.mono import runner
 
     return runner
@@ -281,14 +297,22 @@ def test_k2_builds_cover_full_attention_layers_and_k1_builds_do_not(runner_modul
 # ----------------------------------------------------------- forward_pre_o
 def test_forward_pre_o_is_forward_without_o_proj():
     try:
+        pytest.importorskip("aiter", reason="the kernel under test needs aiter")
         from atom.models.kimi_k3.model import KimiFullAttention
     except ImportError as error:  # the model module imports the GPU stack
         pytest.skip(f"atom.models.kimi_k3.model needs the GPU stack: {error}")
 
     core = torch.ones(2, 4)
-    fake = SimpleNamespace(_gated_core=lambda positions, hidden: (core, None))
-    assert KimiFullAttention.forward_pre_o(fake, None, None) is core
+    seen = {}
 
-    quantized = SimpleNamespace(_gated_core=lambda positions, hidden: (core, core))
-    with pytest.raises(AssertionError, match="quantized"):
-        KimiFullAttention.forward_pre_o(quantized, None, None)
+    def gated_core(positions, hidden, quantize=True, front=None):
+        seen["quantize"] = quantize
+        seen["front"] = front
+        return core, None
+
+    fake = SimpleNamespace(_gated_core=gated_core)
+    assert KimiFullAttention.forward_pre_o(fake, None, None) is core
+    # the bf16 core even under an FP8 o_proj: the mono K2 quantizes it, if at all
+    assert seen["quantize"] is False
+    # the attention's own projections unless the mono MLA front hands them in
+    assert seen["front"] is None

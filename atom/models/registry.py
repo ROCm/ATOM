@@ -55,8 +55,9 @@ mono_decode_installers = {
     ),
     # its DSA indexers only (the layers keep GLM-5.2's own mono or production)
     "GlmMoeDsaForCausalLM": "atom.mono.dsa_indexer.dispatch.install_mono_decode",
+    # (the mono installer itself unless ATOM_KIMI_MONO_STEP_TAIL is on)
     "KimiK3ForConditionalGeneration": (
-        "atom.models.kimi_k3.mono.dispatch.install_mono_decode"
+        "atom.models.kimi_k3.step_tail.dispatch.install_mono_decode"
     ),
     "MiniMaxM3SparseForCausalLM": (
         "atom.models.minimax_m3.mono.dispatch.install_mono_decode"

@@ -90,6 +90,7 @@ from atom.models.dspark_draft import (
 from atom.models.kimi_k3 import _RMS_FUSABLE_QUANT_TYPES
 from atom.models.utils import is_neox_rope_style
 from atom.quant_spec import effective_layer_quant
+from atom.utils import envs
 
 if TYPE_CHECKING:
     from atom.config import Config
@@ -104,6 +105,33 @@ def _dspark_block_width(draft_config, atom_config) -> int:
     spec_config = getattr(atom_config, "speculative_config", None)
     num_spec = getattr(spec_config, "num_speculative_tokens", None)
     return int(num_spec or getattr(draft_config, "dspark_block_size", 0) or 0)
+
+
+class K3DSparkOProj(RowParallelLinear):
+    """The draft attention's o_proj under ``ATOM_KIMI_MONO_DRAFT_OPROJ_AR``:
+    a decode step's activation quant, GEMM and TP all-reduce on the gfx1250
+    draft projection kernel (``atom.models.kimi_k3.mono.draft_mlp``),
+    production's bits; a layer, a width or a step it does not take runs
+    ``RowParallelLinear.forward``. Built only with the switch on."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._try_mono_proj = True
+        self.mono_proj = None
+
+    def forward(self, x, x_scale=None, otype=dtypes.bf16, out=None):
+        if (
+            self._try_mono_proj
+            and x_scale is None
+            and out is None
+            and otype == dtypes.bf16
+        ):
+            from atom.models.kimi_k3.mono import draft_mlp
+
+            y = draft_mlp.forward_oproj(self, x)
+            if y is not None:
+                return y
+        return super().forward(x, x_scale, otype, out)
 
 
 class K3DSparkMLAAttention(nn.Module):
@@ -205,7 +233,12 @@ class K3DSparkMLAAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.kv_b_proj",
         )
-        self.o_proj = RowParallelLinear(
+        # ATOM_KIMI_MONO_DRAFT_OPROJ_AR: o_proj and its all-reduce in one
+        # gfx1250 launch on decode steps; off, the plain linear.
+        o_proj = (
+            K3DSparkOProj if envs.ATOM_KIMI_MONO_DRAFT_OPROJ_AR else RowParallelLinear
+        )
+        self.o_proj = o_proj(
             self.num_heads * self.v_head_dim,
             self.hidden_size,
             bias=False,
@@ -297,6 +330,12 @@ class K3DSparkMLAAttention(nn.Module):
             in _RMS_FUSABLE_QUANT_TYPES
         )
         self.input_quant_prefix = f"{prefix}.fused_qkv_a_proj"
+        # ATOM_KIMI_MONO_MLA_DRAFT: the block pass's decode path from the input
+        # norm's FP8 row to q_out on the gfx1250 draft kernels
+        # (atom.models.kimi_k3.mono.draft_mla), bound on the first decode step
+        # past the weights' load; a layer they cannot read turns this off.
+        self._try_mla_draft = envs.ATOM_KIMI_MONO_MLA_DRAFT
+        self.mla_draft = None
 
     # ---- context rows (target-derived) -------------------------------------
 
@@ -340,6 +379,12 @@ class K3DSparkMLAAttention(nn.Module):
         # `hidden_states` is a (fp8, scale) tuple when the decoder's
         # input_layernorm fused its activation quant; fused_qkv_a_proj is its
         # only consumer and takes the scale directly.
+        if self._try_mla_draft:
+            from atom.models.kimi_k3.mono import draft_mla
+
+            out = draft_mla.forward(self, positions, hidden_states)
+            if out is not None:
+                return out
         hidden_states_scale = None
         if isinstance(hidden_states, tuple):
             hidden_states, hidden_states_scale = hidden_states
@@ -420,8 +465,21 @@ class K3DSparkMLP(nn.Module):
             input_pad_align=intermediate_pad,
         )
         self.act_fn = SiluAndMul()
+        self.prefix = prefix
+        # ATOM_KIMI_MONO_DRAFT_MLP: a decode step's MLP on the gfx1250 draft
+        # kernels (atom.models.kimi_k3.mono.draft_mlp), bound on the first
+        # decode step past the weights' load; a layer they cannot read turns
+        # this off.
+        self._try_mono_mlp = envs.ATOM_KIMI_MONO_DRAFT_MLP
+        self.mono_mlp = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._try_mono_mlp:
+            from atom.models.kimi_k3.mono import draft_mlp
+
+            out = draft_mlp.forward_mlp(self, x)
+            if out is not None:
+                return out
         # `x` is a (fp8, scale) tuple when post_attention_layernorm fused its
         # activation quant; gate_up_proj is its only consumer.
         x_scale = None
@@ -467,6 +525,10 @@ class K3DSparkDecoderLayer(nn.Module):
             ),
             prefix=self.self_attn.input_quant_prefix,
         )
+        if self.self_attn._try_mla_draft:
+            # the draft kernels read this norm's quant layout; a plain
+            # attribute, not a submodule (it is the layer's own)
+            object.__setattr__(self.self_attn, "_input_norm", self.input_layernorm)
         self.fuse_ffn_norm_quant = (
             effective_layer_quant(quant_config, f"{prefix}.mlp.gate_up_proj")[0]
             in _RMS_FUSABLE_QUANT_TYPES
@@ -478,6 +540,11 @@ class K3DSparkDecoderLayer(nn.Module):
             quant_config=quant_config if self.fuse_ffn_norm_quant else None,
             prefix=f"{prefix}.mlp.gate_up_proj",
         )
+
+        if self.mlp._try_mono_mlp:
+            # the draft kernels read this norm's quant layout; a plain
+            # attribute, not a submodule (it is the layer's own)
+            object.__setattr__(self.mlp, "_input_norm", self.post_attention_layernorm)
 
     def write_context_kv(self, ctx_hidden, positions, slot_mapping) -> None:
         """Populate this layer's context rows.
@@ -539,6 +606,11 @@ class KimiK3DSpark(DSparkDraftModel):
         "lm_head.",
     ]
 
+    # The step-gap switches' state (set in __init__ from the environment):
+    # off on any instance that did not run it.
+    _try_mono_context = False
+    mono_context = None
+
     def __init__(self, atom_config: "Config", layer_offset: int = 0) -> None:
         super().__init__()
         self.atom_config = atom_config
@@ -576,6 +648,13 @@ class KimiK3DSpark(DSparkDraftModel):
         # the anchor uniformly across DSpark flavors (V4 exposes it too).
         self.vocab_size = int(config.vocab_size)
 
+        # ATOM_KIMI_MONO_DRAFT_CONTEXT: a decode step's context rows through
+        # the step-gap kernels (atom.models.kimi_k3.step_gap.draft_context),
+        # bound on the first decode step; a model they cannot read turns
+        # this off.
+        self._try_mono_context = bool(envs.ATOM_KIMI_MONO_DRAFT_CONTEXT)
+        self.mono_context = None
+
         # Bound by share_with_target(); both are skipped at load.
         self.embed_tokens = None
         self.lm_head = None
@@ -589,6 +668,19 @@ class KimiK3DSpark(DSparkDraftModel):
         return self.layers[0].self_attn.mla_attn.layer_num
 
     # ---- drafting entry points (called by the proposer) --------------------
+
+    def write_context_kv(self, source, positions, *rest, **kw) -> None:
+        """``DSparkDraftModel.write_context_kv``, its arguments passed through
+        as given (the aux taps or their concatenation, the positions, and the
+        slot mapping where the base takes one); with
+        ``ATOM_KIMI_MONO_DRAFT_CONTEXT`` a decode step's context rows go
+        through the step-gap kernels where they take the step."""
+        if self._try_mono_context and all(value is None for value in kw.values()):
+            from atom.models.kimi_k3.step_gap import draft_context
+
+            if draft_context.write_context_kv(self, source, positions, *rest):
+                return
+        super().write_context_kv(source, positions, *rest, **kw)
 
     def project_context(self, taps: Sequence[torch.Tensor]) -> torch.Tensor:
         """``context_norm(context_proj(concat(taps)))`` -- the shared context.

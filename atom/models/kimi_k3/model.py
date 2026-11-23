@@ -885,10 +885,30 @@ class KimiFullAttention(nn.Module):
         )
 
     def _gated_core(
-        self, positions: torch.Tensor, hidden_states: torch.Tensor
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        quantize: bool = True,
+        front: tuple | None = None,
+        back=None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """sigmoid(g_proj) * attention output, i.e. ``o_proj``'s input, and its
-        activation scale when ``o_proj`` runs fp8 (else None)."""
+        activation scale when ``o_proj`` runs fp8 and ``quantize`` (else None).
+
+        ``front``: ``(q, q_scale, kv, k_rope, gate)`` already projected from
+        ``hidden_states`` (the mono MLA front, ``mla_front_gfx1250``): q
+        normalized (and quantized for ``q_b_proj`` where ``q_scale`` is not
+        None), kv normalized, the raw rope rows and g_proj's rows. The
+        projections, the q_a / kv_a norms and g_proj are then skipped. A sixth
+        element, the attention's ``q_out`` (the mono MLA absorb,
+        ``mla_absorb_gfx1250``, which also wrote the step's KV-cache entries),
+        skips q_b_proj, the W_UK absorb and the rope + cache write too: the
+        attention decodes from it (``MLAAttention.forward_decode_q_out``).
+
+        ``back`` (with a q_out): ``(o, lse, gate) -> attention output``, the
+        mono MLA back half (``mla_back_gfx1250``) -- W_UV, the DCP merge,
+        this gate and ``o_proj`` with its all-reduce on the decode's
+        partials. Its output is returned in the core's place."""
         # deepseek_v2 pattern: one _fuse_rmsnorm_quant kernel does q_a norm +
         # kv_a norm (+ q-activation quant), then q's scale is forwarded into the
         # MLA module (q_proj consumes it).
@@ -900,38 +920,46 @@ class KimiFullAttention(nn.Module):
         if isinstance(hidden_states, tuple):
             hidden_states, hidden_states_scale = hidden_states
 
-        projected = torch.split(
-            self.fused_qkv_a_proj(hidden_states, hidden_states_scale),
-            self.projection_split_sizes,
-            dim=-1,
-        )
-        q_c, kv_c, k_rope = projected[:3]
-        q_shuffle = False
-        q_scale_shuffle_padding = False
-        if self.qknorm_dtype == dtypes.fp4x2:
-            from atom.model_ops.linear import use_triton_gemm
-            from atom.models.deepseek_v2 import _mxfp4_activation_quant_layout
+        q_out = None
+        if front is not None:
+            if self.indexer is not None:
+                raise ValueError("a DSA layer's indexer reads its own projections")
+            q, q_scale, kv, k_rope, gate = front[:5]
+            if len(front) > 5:
+                q_out = front[5]
+        else:
+            projected = torch.split(
+                self.fused_qkv_a_proj(hidden_states, hidden_states_scale),
+                self.projection_split_sizes,
+                dim=-1,
+            )
+            q_c, kv_c, k_rope = projected[:3]
+            q_shuffle = False
+            q_scale_shuffle_padding = False
+            if self.qknorm_dtype == dtypes.fp4x2:
+                from atom.model_ops.linear import use_triton_gemm
+                from atom.models.deepseek_v2 import _mxfp4_activation_quant_layout
 
-            if not use_triton_gemm() or uses_mxfp4_n32k4_scale(self.q_b_proj):
-                q_shuffle, q_scale_shuffle_padding = _mxfp4_activation_quant_layout(
-                    q_c.shape[0]
-                )
-        (q, q_scale), _, kv, _ = _fuse_rmsnorm_quant(
-            q_c,
-            self.q_a_layernorm.weight,
-            self.q_a_layernorm.eps,
-            kv_c,
-            self.kv_a_layernorm.weight,
-            self.kv_a_layernorm.eps,
-            None,
-            dtype_quant=self.qknorm_dtype,
-            shuffle=q_shuffle,
-            scale_shuffle_padding=q_scale_shuffle_padding,
-            group_size=128,
-            quant_type=self.qknorm_quant_type_value,
-            output_unquantized_inp1=False,
-            transpose_scale=True,
-        )
+                if not use_triton_gemm() or uses_mxfp4_n32k4_scale(self.q_b_proj):
+                    q_shuffle, q_scale_shuffle_padding = _mxfp4_activation_quant_layout(
+                        q_c.shape[0]
+                    )
+            (q, q_scale), _, kv, _ = _fuse_rmsnorm_quant(
+                q_c,
+                self.q_a_layernorm.weight,
+                self.q_a_layernorm.eps,
+                kv_c,
+                self.kv_a_layernorm.weight,
+                self.kv_a_layernorm.eps,
+                None,
+                dtype_quant=self.qknorm_dtype,
+                shuffle=q_shuffle,
+                scale_shuffle_padding=q_scale_shuffle_padding,
+                group_size=128,
+                quant_type=self.qknorm_quant_type_value,
+                output_unquantized_inp1=False,
+                transpose_scale=True,
+            )
         if self.indexer is not None:
             # Projection weights retain checkpoint precision; the indexer owns
             # the FP8 MQA/cache representation.
@@ -942,14 +970,27 @@ class KimiFullAttention(nn.Module):
                 positions,
                 projected_k_weights=(projected[3], projected[4]),
             )
-        attn_out = self.attn(q, kv, k_rope, positions, q_scale=q_scale)
-        gate = self.g_proj(hidden_states, hidden_states_scale)
+        if q_out is None:
+            if back is not None:
+                raise ValueError("the MLA back half follows the absorb's q_out")
+            attn_out = self.attn(q, kv, k_rope, positions, q_scale=q_scale)
+        elif back is not None:
+            return (
+                self.attn.impl.forward_decode_q_out(
+                    q_out, back=lambda o, lse: back(o, lse, gate)
+                ),
+                None,
+            )
+        else:
+            attn_out = self.attn.impl.forward_decode_q_out(q_out)
+        if front is None:
+            gate = self.g_proj(hidden_states, hidden_states_scale)
         # BF16 output gating uses the shared fused sigmoid/mul. When o_proj
         # runs FP8, the same helper also folds in its activation quantization.
         attn_out, attn_scale = fused_sigmoid_mul_maybe_quant(
             attn_out,
             gate,
-            quant=self.fuse_sigmoid_mul_quant,
+            quant=self.fuse_sigmoid_mul_quant and quantize,
             quant_type_value=self.o_proj_quant_type_value,
         )
         return attn_out, attn_scale
@@ -961,13 +1002,33 @@ class KimiFullAttention(nn.Module):
         return self.o_proj(attn_out, x_scale=attn_scale)
 
     def forward_pre_o(
-        self, positions: torch.Tensor, hidden_states: torch.Tensor
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        front: tuple | None = None,
     ) -> torch.Tensor:
-        """``forward`` without ``o_proj``: the bf16 gated core, for the mono K2
-        kernel that applies ``o_proj`` itself (``mono.weights.bind_moe`` refuses
-        a quantized ``o_proj``, so there is never an activation scale)."""
-        attn_out, attn_scale = self._gated_core(positions, hidden_states)
-        assert attn_scale is None, "o_proj is quantized; K2 reads it as bf16"
+        """``forward`` without ``o_proj``: the bf16 gated core, for a mono K2
+        that applies ``o_proj`` itself (and quantizes its input there, if at
+        all). ``front``: ``_gated_core``'s."""
+        attn_out, _ = self._gated_core(
+            positions, hidden_states, quantize=False, front=front
+        )
+        return attn_out
+
+    def forward_mono_back(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        front: tuple,
+        back,
+    ) -> torch.Tensor:
+        """``forward`` on the mono MLA path end to end: ``front`` with the
+        absorb's q_out (``_gated_core``'s), the attention decoding from it,
+        and ``back(o, lse, gate)`` taking its partials to the attention
+        output -- ``o_proj``'s, all-reduced -- which is returned."""
+        attn_out, _ = self._gated_core(
+            positions, hidden_states, quantize=False, front=front, back=back
+        )
         return attn_out
 
 

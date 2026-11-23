@@ -1,0 +1,368 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+"""Debug-only per-CTA timeline of the TDM GEMV kernels (resident K1, the
+replicated front): the low word of the shader cycle counter at each point
+(the 100 MHz realtime counter, a message round trip, at entry and end only),
+kept in a 128-word LDS record and copied to a global buffer at the CTA's end
+(a global store each point would make every barrier's release wait for it).
+
+``enable(address, launches)`` before a build bakes the buffer in: the first
+``CTAS`` words are each CTA's launch counter, then ``[launches][CTAS][WORDS]``
+stamps, a CTA's launch ``n`` at slot ``n % launches``. Disabled (the default),
+every call traces to nothing and the kernels are unchanged. Realtime offsets
+differ between XCDs: compare stamps within a CTA, or across CTAs of one XCD.
+"""
+
+import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm
+from flydsl.expr import gpu, rocdl
+from flydsl.expr.typing import T, as_ir_value
+
+from atom.mono.device.ops import traced
+
+CTAS = 256
+WORDS = 128
+LANES = 32
+# Points: 0 HW_ID1, 1 entry, 2 first global access of the GEMV, 3 its first
+# copies issued; then per slab s, SLAB0 + SLAB_WORDS * s + one of
+# A (slab's top barrier passed), T (wave 0's token slab landed),
+# W (the waiting weight wave's slab landed), B (every copy landed),
+# C (wave 0's WMMAs of the slab issued, before the next top barrier).
+HW_ID, ENTRY, GEMV_START, ISSUED = 0, 1, 2, 3
+SLAB0, SLAB_WORDS, MAX_SLABS = 8, 5, 16
+A, TOKEN, WEIGHT, B, C = range(SLAB_WORDS)
+PROJECT_DONE, STAGED, STORES_ISSUED, STORES_DONE, RECURRENCE, END = range(88, 94)
+# ENTRY and END are realtime; every other point is the low word of the shader
+# cycle counter (no message round trip), with these two to convert them.
+CYCLES_ENTRY, CYCLES_END = 94, 95
+# K1's whole-head recurrence task (``kda_gfx1250.kda_head``, the CTA's first):
+# entered, its projected rows polled, conv done, gates done, recurrence done,
+# its output gates polled, core_out stored; a split head's norm exchange done.
+HEAD_START, HEAD_POLLED, HEAD_CONV, HEAD_GATES = 96, 97, 98, 99
+HEAD_RECUR, HEAD_GATE_POLLED, HEAD_DONE, HEAD_EXCHANGED = 100, 101, 102, 103
+# Inside the gates: the gate WMMA issued (wave 0), then every wave past it.
+HEAD_GATE_MMA, HEAD_GATE_SYNC = 104, 105
+# Inside the recurrence (wave 0): its committed records replayed (ReplaySSM),
+# then tokens 0 and 4 advanced; inside the gates, their WMMAs issued, ahead
+# of the epilogue (words 4..7, free of the GEMV's points).
+HEAD_REPLAYED, HEAD_TOKEN0, HEAD_GATE_WMMA, HEAD_TOKEN4 = 4, 5, 6, 7
+# Realtime anchors of a whole-head CTA (``anchor``): the realtime counter and
+# the cycle counter read right after it, two words each (120..127), so the
+# cycle stamps between two anchors convert at that stretch's own rate (the
+# cycle counter's rate is not one a launch: the stamps of a CTA that outlives
+# the projection ran ~20% long at the grid's median rate).
+ANCHOR_START, ANCHOR_POLLED, ANCHOR_RECUR, ANCHOR_DONE = 120, 122, 124, 126
+# The sliced AttnRes mix (``attn_res_sliced_gfx1250``), its last pass: its
+# rows summed (landed), each exchange's stores drained and its cluster barrier
+# passed, the scores staged, the output stores issued.
+MIX_SUMMED, MIX_DRAINED, MIX_PASSED, MIX_SCORED = 106, 107, 108, 109
+MIX_NORM_DRAINED, MIX_NORM_PASSED, MIX_STORED = 110, 111, 112
+# The MLA front (``mla_front_gfx1250``): a norm wave's row landed whole, its
+# rstd, its stores issued; inside ``gemv_tdm.project_split`` (whose slabs
+# stamp B), the K loop done and the cluster exchange's barrier passed.
+NORM_POLLED, NORM_REDUCED, NORM_STORED = 113, 114, 115
+SPLIT_LOOPED, SPLIT_EXCHANGED = 116, 117
+# The replicated front's epilogue: its row sums issued, their barrier passed.
+EPI_SUMS, EPI_BARRIER = 118, 119
+# The lite finish (``k2_finish_persistent_gfx1250``: no slabs, its points in
+# the slab words). A routing CTA: its scores' lane maxima in LDS, its bound,
+# its survivors in their slots, ranked, its routes' stores issued, every
+# wave past them; a parallel-HERD one's candidates seen fresh (wave 0, which
+# polls none with ATOM_KIMI_MONO_HERD_OWN_LOCAL), by every wave, the batch
+# popularity counted, its drop found, its HERD routes' stores issued, and
+# wave 0's candidate polls (a count, not a stamp). A
+# shared-down CTA: its weights' loads issued, its rows staged, its WMMAs'
+# accumulators in LDS, its sums' stores issued.
+LITE_SCORED, LITE_BOUND, LITE_SLOTTED, LITE_RANKED = 8, 9, 10, 11
+LITE_ROUTES_ISSUED, LITE_ROUTED = 12, 13
+LITE_HERD_POLLED, LITE_HERD_SEEN, LITE_HERD_COUNTED = 14, 15, 16
+LITE_HERD_DROPPED, LITE_HERD_STORED, LITE_HERD_POLLS = 17, 18, 19
+LITE_SD_ISSUED, LITE_SD_STAGED, LITE_SD_MULTIPLIED, LITE_SD_STORED = 20, 21, 22, 23
+POINTS = {
+    "hw_id": HW_ID,
+    "entry": ENTRY,
+    "gemv_start": GEMV_START,
+    "issued": ISSUED,
+    "project_done": PROJECT_DONE,
+    "staged": STAGED,
+    "stores_issued": STORES_ISSUED,
+    "stores_done": STORES_DONE,
+    "recurrence": RECURRENCE,
+    "end": END,
+    "head_start": HEAD_START,
+    "head_polled": HEAD_POLLED,
+    "head_conv": HEAD_CONV,
+    "head_gates": HEAD_GATES,
+    "head_recur": HEAD_RECUR,
+    "head_gate_polled": HEAD_GATE_POLLED,
+    "head_done": HEAD_DONE,
+    "head_exchanged": HEAD_EXCHANGED,
+    "head_gate_mma": HEAD_GATE_MMA,
+    "head_gate_sync": HEAD_GATE_SYNC,
+    "head_replayed": HEAD_REPLAYED,
+    "head_token0": HEAD_TOKEN0,
+    "head_gate_wmma": HEAD_GATE_WMMA,
+    "head_token4": HEAD_TOKEN4,
+    "mix_summed": MIX_SUMMED,
+    "mix_drained": MIX_DRAINED,
+    "mix_passed": MIX_PASSED,
+    "mix_scored": MIX_SCORED,
+    "mix_norm_drained": MIX_NORM_DRAINED,
+    "mix_norm_passed": MIX_NORM_PASSED,
+    "mix_stored": MIX_STORED,
+    "norm_polled": NORM_POLLED,
+    "norm_reduced": NORM_REDUCED,
+    "norm_stored": NORM_STORED,
+    "split_looped": SPLIT_LOOPED,
+    "split_exchanged": SPLIT_EXCHANGED,
+    "epi_sums": EPI_SUMS,
+    "epi_barrier": EPI_BARRIER,
+}
+LITE_POINTS = {
+    "scored": LITE_SCORED,
+    "bound": LITE_BOUND,
+    "slotted": LITE_SLOTTED,
+    "ranked": LITE_RANKED,
+    "routes_issued": LITE_ROUTES_ISSUED,
+    "routed": LITE_ROUTED,
+    "herd_polled": LITE_HERD_POLLED,
+    "herd_seen": LITE_HERD_SEEN,
+    "herd_counted": LITE_HERD_COUNTED,
+    "herd_dropped": LITE_HERD_DROPPED,
+    "herd_stored": LITE_HERD_STORED,
+    "sd_issued": LITE_SD_ISSUED,
+    "sd_staged": LITE_SD_STAGED,
+    "sd_multiplied": LITE_SD_MULTIPLIED,
+    "sd_stored": LITE_SD_STORED,
+    "stores_done": STORES_DONE,
+}
+
+_config: tuple[int, int] | None = None
+_context: dict | None = None
+
+
+def enable(address: int, launches: int) -> None:
+    global _config
+    _config = (int(address), int(launches))
+
+
+def disable() -> None:
+    global _config
+    _config = None
+
+
+def key():
+    """Part of every timeline build's name and cache key (None: off)."""
+    return _config
+
+
+def suffix() -> str:
+    return "" if _config is None else f"_tl{_config[0]:x}"
+
+
+def buffer_words(launches: int) -> int:
+    return CTAS + launches * CTAS * WORDS
+
+
+def _word(base, index):
+    return fx.inttoptr(
+        fx.PointerType.get(T.i32, fx.AddressSpace.Global, 4),
+        base + fx.Int64(index) * 4,
+    )
+
+
+def _store(value, base, index):
+    fx.generic_store(_word(base, index), fx.Int32(value))
+
+
+def _realtime():
+    return fx.Int32(
+        fx.Int64(
+            llvm.inline_asm(
+                T.i64,
+                [],
+                "s_sendmsg_rtn_b64 $0, sendmsg(MSG_RTN_GET_REALTIME)\n"
+                " s_wait_kmcnt 0",
+                "=s",
+                has_side_effects=True,
+            )
+        )
+    )
+
+
+def _cycles():
+    return fx.Int32(
+        fx.Int64(
+            llvm.inline_asm(
+                T.i64, [], "s_get_shader_cycles_u64 $0", "=s", has_side_effects=True
+            )
+        )
+    )
+
+
+def _hw_id():
+    return fx.Int32(
+        llvm.inline_asm(
+            T.i32,
+            [],
+            "s_getreg_b32 $0, hwreg(HW_REG_HW_ID1)",
+            "=s",
+            has_side_effects=True,
+        )
+    )
+
+
+@fx.struct
+class _Record:
+    words: fx.Array[fx.Int32, WORDS, 16]
+
+
+@traced
+def _stamp_on(role, wave_role, record, index):
+    if role == wave_role:
+        fx.ptr_store(_cycles(), record + index)
+
+
+@traced
+def _slab_on(role, wave_role, record, index, s):
+    if (s < MAX_SLABS) & (role == wave_role):
+        fx.ptr_store(_cycles(), record + index)
+
+
+@traced
+def _open_on(role, lane, record):
+    # the realtime clock is a message round trip: wave 0 alone asks for it.
+    # With every wave of every CTA asking at the entry, waves that go straight
+    # on to poll never saw their lines (a fused K2 head inside a whole layer;
+    # the launch alone ran).
+    if role == 0:
+        for k in range(WORDS // LANES):
+            fx.ptr_store(fx.Int32(0), record + (lane + LANES * k))
+        if lane == 0:
+            fx.ptr_store(_hw_id(), record + HW_ID)
+            fx.ptr_store(_realtime(), record + ENTRY)
+            fx.ptr_store(_cycles(), record + CYCLES_ENTRY)
+
+
+@traced
+def _close_on(role, lane, record, base, bid, launches):
+    if role == 0:
+        if lane == 0:
+            cycles = _cycles()
+            fx.ptr_store(_realtime(), record + END)
+            fx.ptr_store(cycles, record + CYCLES_END)
+        launch = fx.Int32(fx.ptr_load(_word(base, bid)))
+        slot = CTAS + ((launch % launches) * CTAS + bid) * WORDS
+        for k in range(WORDS // LANES):
+            index = lane + LANES * k
+            _store(fx.ptr_load(record + index), base, slot + index)
+        if lane == 0:
+            _store(launch + 1, base, bid)
+
+
+def active() -> bool:
+    return _context is not None
+
+
+def open_cta(bid, wave, config, allocator) -> None:
+    """At the kernel's entry: this CTA's LDS record, HW_ID1 and the entry
+    stamps (wave 0). ``config`` is ``key()`` taken when the kernel was built:
+    its body is traced at the first launch, after the build's ``disable()``.
+    ``allocator`` is the kernel's (static) SharedAllocator, one a kernel."""
+    global _context
+    if config is None:
+        return
+    address, launches = config
+    role = fx.Int32(rocdl.readfirstlane(T.i32, as_ir_value(fx.Int32(wave))))
+    lane = fx.thread_idx.x % LANES
+    record = allocator.allocate(_Record).peek().words.ptr
+    _context = {
+        "base": fx.Int64(address),
+        "launches": launches,
+        "record": record,
+        "role": role,
+        "lane": lane,
+        "bid": bid,
+    }
+    _open_on(role, lane, record)
+
+
+def stamp(point, wave_role=0) -> None:
+    """Point ``point`` (a word index, maybe traced) on wave ``wave_role``."""
+    if _context is None:
+        return
+    _stamp_on(_context["role"], wave_role, _context["record"], point)
+
+
+@traced
+def _record_on(role, wave_role, record, index, value):
+    if role == wave_role:
+        fx.ptr_store(fx.Int32(value), record + index)
+
+
+def record(point, value, wave_role=0) -> None:
+    """``value`` (wave-uniform) in point ``point``'s word, not a stamp."""
+    if _context is None:
+        return
+    _record_on(_context["role"], wave_role, _context["record"], point, value)
+
+
+@traced
+def _head_token_on(role, record, token):
+    if role == 0:
+        if token == 0:
+            fx.ptr_store(_cycles(), record + HEAD_TOKEN0)
+        if token == 4:
+            fx.ptr_store(_cycles(), record + HEAD_TOKEN4)
+
+
+def head_token(token) -> None:
+    """In the whole-head recurrence's token loop: tokens 0 and 4 advanced
+    (wave 0)."""
+    if _context is None:
+        return
+    _head_token_on(_context["role"], _context["record"], token)
+
+
+@traced
+def _anchor_on(role, lane, record, index):
+    if role == 0:  # noqa: SIM102
+        if lane == 0:
+            fx.ptr_store(_realtime(), record + index)
+            fx.ptr_store(_cycles(), record + index + 1)
+
+
+def anchor(index) -> None:
+    """A realtime anchor (wave 0): the realtime counter in word ``index``,
+    the cycle counter after its round trip in the next."""
+    if _context is None:
+        return
+    _anchor_on(_context["role"], _context["lane"], _context["record"], index)
+
+
+def slab(s, which, wave_role=0) -> None:
+    if _context is None:
+        return
+    index = SLAB0 + SLAB_WORDS * s + which
+    _slab_on(_context["role"], wave_role, _context["record"], index, s)
+
+
+def stores_done() -> None:
+    """Every wave's stores retired, then the stamp."""
+    if _context is None:
+        return
+    rocdl.s_wait_storecnt(0)
+    gpu.barrier()
+    stamp(STORES_DONE)
+
+
+def close_cta() -> None:
+    """At the kernel's end (every wave): the END stamps, then wave 0 copies
+    the record to the CTA's slot and bumps its launch number."""
+    global _context
+    if _context is None:
+        return
+    gpu.barrier()
+    c = _context
+    _close_on(c["role"], c["lane"], c["record"], c["base"], c["bid"], c["launches"])
+    _context = None
