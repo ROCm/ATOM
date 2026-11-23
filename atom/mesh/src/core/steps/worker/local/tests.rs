@@ -55,6 +55,8 @@ struct FakeAtom {
     protocol_version: u32,
     dp_size: usize,
     ranks: Mutex<Vec<Option<i32>>>,
+    /// GetModelInfo fails.
+    no_model_info: bool,
 }
 
 #[tonic::async_trait]
@@ -82,6 +84,9 @@ impl AtomEngine for FakeAtom {
         &self,
         _: Request<GetModelInfoRequest>,
     ) -> Result<Response<GetModelInfoResponse>, Status> {
+        if self.no_model_info {
+            return Err(Status::unavailable("model info"));
+        }
         Ok(Response::new(self.info.clone()))
     }
 
@@ -370,6 +375,22 @@ async fn an_atom_worker_with_another_protocol_version_is_refused() {
 
     assert!(error.contains("protocol version is 2"), "{error}");
     assert!(ctx.worker_registry.get_by_url(&url).is_none());
+}
+
+/// The runtime the health probe found stands when GetModelInfo then fails.
+#[tokio::test]
+async fn an_atom_worker_whose_model_info_fails_still_registers_as_atom() {
+    let fake = FakeAtom {
+        protocol_version: 1,
+        no_model_info: true,
+        ..Default::default()
+    };
+    let url = serve(Server::builder().add_service(AtomEngineServer::new(fake))).await;
+    let ctx = context();
+    register(&ctx, json!({ "url": url })).await.unwrap();
+
+    let worker = ctx.worker_registry.get_by_url(&url).unwrap();
+    assert_eq!(worker.metadata().runtime_type, RuntimeType::Atom);
 }
 
 #[tokio::test]
