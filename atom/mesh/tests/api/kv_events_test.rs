@@ -9,7 +9,7 @@ use std::{
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -117,12 +117,20 @@ async fn registered(app: &Router, created: &Value) {
     panic!("timed out registering at {uri}");
 }
 
-/// A Mooncake master's admin service, its port, holding the taint key when `tainted`.
-async fn mooncake_admin(tainted: Arc<AtomicBool>) -> u16 {
+/// A Mooncake master's admin service, its port, holding every key but the taint key,
+/// which it holds when `tainted`, and keeping the keys of each request in `asked`.
+async fn mooncake_admin(
+    tainted: Arc<AtomicBool>,
+    asked: Arc<Mutex<Vec<String>>>,
+    delay: Duration,
+) -> u16 {
     let answer = move |Query(query): Query<HashMap<String, String>>| {
         let tainted = tainted.load(Ordering::Relaxed);
+        asked.lock().unwrap().push(query["keys"].clone());
         async move {
-            let state = |key: &str| match key == "atomkv/store-tainted" && tainted {
+            tokio::time::sleep(delay).await;
+            let held = |key: &str| key != "atomkv/store-tainted" || tainted;
+            let state = |key: &str| match held(key) {
                 true => json!({"ok": true, "values": [{"size_": 4096}]}),
                 false => json!({"ok": false, "error": "OBJECT_NOT_FOUND", "values": null}),
             };
@@ -226,7 +234,7 @@ async fn a_worker_whose_engine_has_kv_events_off_is_not_followed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn each_rank_of_a_dp_aware_worker_is_followed_until_the_worker_is_removed() {
     let tainted = Arc::new(AtomicBool::new(false));
-    let admin_port = mooncake_admin(tainted.clone()).await;
+    let admin_port = mooncake_admin(tainted.clone(), Arc::default(), Duration::ZERO).await;
     let mut publishers = Vec::new();
     let mut ports = Vec::new();
     for _ in 0..2 {
@@ -310,7 +318,7 @@ async fn each_rank_of_a_dp_aware_worker_is_followed_until_the_worker_is_removed(
 /// sources at all. An answer it cannot read changes nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_worker_registered_again_reads_only_the_store_it_reports_now() {
-    let admin_port = mooncake_admin(Arc::new(AtomicBool::new(false))).await;
+    let admin_port = mooncake_admin(Arc::default(), Arc::default(), Duration::ZERO).await;
     let mut worker = MockWorker::new(MockWorkerConfig {
         port: 0,
         worker_type: WorkerType::Regular,
@@ -423,12 +431,32 @@ fn stored(hashes: &[u64], tokens: &[u32]) -> Bytes {
 /// With `cache_aware`, a request whose tokens a worker's device cache holds goes to that
 /// worker, whatever the tree learned: its `input_ids`, or its prompt or chat encoded with
 /// the special tokens, as ATOM stores the blocks. One with media is placed by its text.
+/// What the engine will load of the request from the store the worker reads counts at
+/// `--kv-storage-weight`, asked of the store by ATOM's keys, and is not asked at 0. The
+/// store is tainted, so it holds nothing and only the device cache can place a request,
+/// until the end.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cache_aware_places_requests_by_the_kv_event_index() {
+    for weight in [1.0, 0.5, 0.0] {
+        places_requests_by_the_kv_event_index(weight).await;
+    }
+}
+
+async fn places_requests_by_the_kv_event_index(weight: f64) {
     let mut publisher = PubSocket::new();
     let bound = publisher.bind("tcp://127.0.0.1:0").await.unwrap();
     let port = bound.to_string().rsplit_once(':').unwrap().1.to_string();
-    let source = json!({"endpoint": format!("tcp://*:{port}"), "topic": "", "block_size": 4});
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let tainted = Arc::new(AtomicBool::new(true));
+    // Only a deadline of the configured 1000 ms, not one of a few, waits for its answers.
+    let delay = Duration::from_millis(50);
+    let admin_port = mooncake_admin(tainted.clone(), asked.clone(), delay).await;
+    // ATOM's chain_check of chunks of 2 tokens.
+    let offload = json!({"backend": "mooncake_store", "masters": ["127.0.0.1:50051"],
+        "namespace": "atomkv1-0123456789abcdef01234567", "chunk_tokens": 2, "world": 1,
+        "min_load_tokens": 2, "chain_check": "d68e6ab9e85080fefe04ef8bdde3032f"});
+    let source = json!({"endpoint": format!("tcp://*:{port}"), "topic": "", "block_size": 4,
+        "offload": offload});
     let mut workers = Vec::new();
     for sources in [json!({"0": source}), json!({})] {
         let mut worker = MockWorker::new(MockWorkerConfig {
@@ -445,6 +473,9 @@ async fn cache_aware_places_requests_by_the_kv_event_index() {
     }
     let mut config = TestRouterConfig::cache_aware(3991);
     config.kv_events = true;
+    config.mooncake_admin_port = admin_port;
+    config.kv_storage_deadline_ms = 1000;
+    config.kv_storage_weight = weight;
     let ctx = AppTestContext::new_with_config(config, vec![]).await;
     let dir = tempfile::tempdir().unwrap();
     let tokenizer = bos_tokenizer(dir.path());
@@ -458,6 +489,9 @@ async fn cache_aware_places_requests_by_the_kv_event_index() {
         .unwrap();
     let app = ctx.create_app().await;
     let request = json!({"input_ids": (100..112).collect::<Vec<u32>>(),
+        "sampling_params": {"max_new_tokens": 1}});
+    // No device cache will hold it.
+    let cold = json!({"input_ids": (200..212).collect::<Vec<u32>>(),
         "sampling_params": {"max_new_tokens": 1}});
     let text = "a b c d e f g h i";
     let requests = [
@@ -477,6 +511,7 @@ async fn cache_aware_places_requests_by_the_kv_event_index() {
     for (uri, body) in &requests {
         assert_eq!(served_by(&app, uri, body).await, workers[1].2);
     }
+    assert_eq!(served_by(&app, "/generate", &cold).await, workers[1].2);
     register(&app, &workers[0].1, 2).await;
     let joined = |sources: &Value| sources[0]["batches"].as_u64() > Some(0);
     sources_once(&app, Some(&mut publisher), joined).await;
@@ -491,6 +526,34 @@ async fn cache_aware_places_requests_by_the_kv_event_index() {
     for _ in 0..4 {
         assert_eq!(served_by(&app, "/generate", &request).await, workers[0].2);
     }
+    let requested = asked.lock().unwrap().clone();
+    let (_, stores) = call(&app, "GET", "/kv_storage/sources", None).await;
+    if weight > 0.0 {
+        // The store is asked for the whole prompt, from its first token: ATOM's keys of
+        // the request's 6 chunks at rank 0, from its keys.py, and the taint key.
+        let keys = [
+            "27fbf4f34f6a83d0823cd5a524cc26b6",
+            "860ba8237adce06b477e78dfcfbe4447",
+            "a9c694a6f9bf83bb6f8c266825c47f11",
+            "efc6ab4b75dd5218bf3cf487ceda7892",
+            "1a78819b1adf2af3bfee604892da6a74",
+            "ca1e63585d9dcb9c4a86979ef86a8d7a",
+        ]
+        .map(|digest| format!("atomkv1-0123456789abcdef01234567/w0of1/{digest}"));
+        let keys = format!("{},atomkv/store-tainted", keys.join(","));
+        assert!(
+            !requested.is_empty() && requested.iter().all(|asked| *asked == keys),
+            "{requested:?}"
+        );
+        assert!(stores[0]["last_lookup_us"].is_u64(), "{stores}");
+    } else {
+        assert!(
+            requested.iter().all(|asked| !asked.contains("/w0of1/")),
+            "{requested:?}"
+        );
+        assert!(stores[0]["last_lookup_us"].is_null(), "{stores}");
+    }
+    assert_eq!(stores[0]["breaker_open"], false);
     // `<s>` and a to g: two of the text's three blocks, as ATOM encodes it.
     publish(
         &mut publisher,
@@ -499,9 +562,27 @@ async fn cache_aware_places_requests_by_the_kv_event_index() {
     )
     .await;
     sources_once(&app, None, |sources| sources[0]["indexed_blocks"] == 4).await;
+    let before = asked.lock().unwrap().len();
     for (uri, body) in &requests[1..] {
         assert_eq!(served_by(&app, uri, body).await, workers[0].2, "{uri}");
     }
+    // Of the text's 10 tokens, the engine would take no more than the device's 8 from a
+    // store holding them all: the store is not asked.
+    let requested = asked.lock().unwrap()[before..].to_vec();
+    assert!(
+        requested.iter().all(|asked| !asked.contains("/w0of1/")),
+        "{requested:?}"
+    );
+    // Once the store holds every chunk, the engine would load 10 of the 12 tokens: at a
+    // weight w, a match rate of w × 10 / 12, which above the cache threshold of 0.5 places
+    // the request the tree has on the other worker.
+    tainted.store(false, Ordering::Relaxed);
+    let placed = if weight * 10.0 / 12.0 > 0.5 { 0 } else { 1 };
+    assert_eq!(
+        served_by(&app, "/generate", &cold).await,
+        workers[placed].2,
+        "{weight}"
+    );
     ctx.shutdown().await;
     for (mut worker, _, _) in workers {
         worker.stop().await;

@@ -36,19 +36,52 @@ pub fn chunk_chain(tokens: &[u32], chunk_tokens: usize) -> Vec<[u8; DIGEST_BYTES
 /// The `chain_check` ATOM reports: the hex digest of tokens `0..chunk_tokens`.
 pub fn chain_check(chunk_tokens: u32) -> String {
     let tokens: Vec<u32> = (0..chunk_tokens).collect();
-    chunk_chain(&tokens, chunk_tokens as usize)
-        .iter()
-        .flatten()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    let mut check = String::new();
+    for digest in chunk_chain(&tokens, chunk_tokens as usize) {
+        push_hex(&mut check, &digest);
+    }
+    check
+}
+
+/// The key of each chunk of `chain` at ranks `0..ranks` of `world`, rank by rank, as ATOM's
+/// lookup asks every rank and takes the shortest run. A store of one pool evicts a chunk's
+/// objects of every rank together, so rank 0's keys alone agree with it except on a chunk
+/// still being written, or whose put failed, at another rank, which counts as stored. Of
+/// several pools, each holds, evicts and is tainted for the ranks that write to it alone.
+pub fn rank_keys(
+    namespace: &str,
+    world: u32,
+    ranks: u32,
+    chain: &[[u8; DIGEST_BYTES]],
+) -> Vec<String> {
+    let mut keys = Vec::with_capacity(chain.len() * ranks as usize);
+    for rank in 0..ranks {
+        let prefix = format!("{namespace}/w{rank}of{world}/");
+        for digest in chain {
+            let mut key = String::with_capacity(prefix.len() + 2 * DIGEST_BYTES);
+            key.push_str(&prefix);
+            push_hex(&mut key, digest);
+            keys.push(key);
+        }
+    }
+    keys
+}
+
+fn push_hex(to: &mut String, bytes: &[u8]) {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    for byte in bytes {
+        to.push(DIGITS[usize::from(byte >> 4)].into());
+        to.push(DIGITS[usize::from(byte & 15)].into());
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // From ATOM's keys.py: chunk_hash_chain(range(n), n).hex(), and the chain of
-    // tokens (i * 7919) % 150000 for i in 0..53 in chunks of 16.
+    // From ATOM's keys.py, which tests/test_mooncake_store_offload.py asserts too:
+    // chunk_hash_chain(range(n), n).hex(), and the chain of tokens (i * 7919) % 150000
+    // for i in 0..53 in chunks of 16, and its chunk_keys at ranks 0 and 1 of 8.
     #[test]
     fn digests_are_atoms() {
         for (chunk_tokens, want) in [
@@ -60,20 +93,48 @@ mod tests {
         }
         assert_eq!(chain_check(0), "");
         let tokens: Vec<u32> = (0..53).map(|i| (i * 7919) % 150_000).collect();
-        let hex = |digest: &[u8; DIGEST_BYTES]| {
-            digest
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()
+        let namespace = "atomkv1-0123456789abcdef01234567";
+        let chain = chunk_chain(&tokens, 16);
+        let digests = [
+            "48a73da894d8d0ef643123150b31991e",
+            "a53c74ba1da5cce48218d8a3729dc7a1",
+            "bdff5c9bb8a712526c9ad1e28caa2a8e",
+        ];
+        let at = |rank: u32| digests.map(|digest| format!("{namespace}/w{rank}of8/{digest}"));
+        assert_eq!(rank_keys(namespace, 8, 1, &chain), at(0));
+        assert_eq!(rank_keys(namespace, 8, 2, &chain), [at(0), at(1)].concat());
+    }
+
+    /// `cargo test --release --lib kv_storage::keys::tests::bench -- --ignored --nocapture`;
+    /// `KV_BENCH_TOKENS` (100k) and `KV_BENCH_SAMPLES` (2000) size it.
+    #[test]
+    #[ignore]
+    fn bench_keys_of_100k_tokens() {
+        let size = |name: &str, default: usize| {
+            std::env::var(name).map_or(default, |value| value.parse().unwrap())
         };
-        let chain: Vec<String> = chunk_chain(&tokens, 16).iter().map(hex).collect();
-        assert_eq!(
-            chain,
-            [
-                "48a73da894d8d0ef643123150b31991e",
-                "a53c74ba1da5cce48218d8a3729dc7a1",
-                "bdff5c9bb8a712526c9ad1e28caa2a8e",
-            ]
+        let tokens: Vec<u32> = (0..size("KV_BENCH_TOKENS", 100_000) as u32)
+            .map(|i| (i * 7919) % 150_000)
+            .collect();
+        let samples = (0..size("KV_BENCH_SAMPLES", 2000)).map(|_| {
+            let started = std::time::Instant::now();
+            let keys = rank_keys(
+                "atomkv1-0123456789abcdef01234567",
+                8,
+                1,
+                &chunk_chain(&tokens, 256),
+            );
+            assert_eq!(keys.len(), tokens.len() / 256);
+            started.elapsed()
+        });
+        let mut samples: Vec<_> = samples.collect();
+        samples.sort();
+        let at = |q: f64| samples[(samples.len() as f64 * q) as usize];
+        println!(
+            "keys of {} tokens in chunks of 256: p50 {:?}, p99 {:?}",
+            tokens.len(),
+            at(0.5),
+            at(0.99)
         );
     }
 }

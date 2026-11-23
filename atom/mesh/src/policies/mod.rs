@@ -44,9 +44,9 @@ pub struct RouteDecision {
     pub match_ratio: Option<f64>,
     /// Expected prefix cache hit ratio on the selected worker, reconciled with the
     /// cached tokens its response reports. `cache_aware`'s tree branches set it only
-    /// when the selected worker is the best candidate, its KV event branches always;
-    /// `agentic` sets it when it knows the selected worker's hit; other policies leave
-    /// it None.
+    /// when the selected worker is the best candidate, its KV event branch unless the
+    /// store the worker loads from does not answer; `agentic` sets it when it knows the
+    /// selected worker's hit; other policies leave it None.
     pub estimated_hit_ratio: Option<f64>,
     /// Prompt tokens the selected worker still has to prefill, for policies that
     /// estimate its cache reuse. `None` charges the whole prompt.
