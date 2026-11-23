@@ -51,17 +51,23 @@ from atom.kv_transfer.offload.dense.connector import (
     DenseOffloadScheduler,
 )
 from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
+from atom.kv_transfer.offload.prehashed import (
+    PrehashedSaveSchedulerMixin,
+    PrehashedSaveWorkerMixin,
+)
 
 logger = logging.getLogger("atom")
 
 
-class M3OffloadConnector(DenseOffloadConnector):
+class M3OffloadConnector(PrehashedSaveWorkerMixin, DenseOffloadConnector):
     """PAGE-only, multi-region offload worker for MiniMax-M3.
 
     Identical lifecycle to :class:`DenseOffloadConnector`; only
     ``register_kv_caches`` differs -- it sources the byte codec from
     ``transfer_tensors.block_regions`` (which include the NSA index cache)
-    instead of the per-layer ``KVCacheTensor`` K / V.
+    instead of the per-layer ``KVCacheTensor`` K / V. A save the scheduler
+    shipped as chunk hashes (``ATOM_OFFLOAD_PREHASHED_SAVE``) is stored by
+    :class:`PrehashedSaveWorkerMixin`; every other save takes the token path.
     """
 
     def register_kv_caches(
@@ -162,10 +168,16 @@ class M3OffloadConnector(DenseOffloadConnector):
         )
 
 
-class M3OffloadScheduler(DenseOffloadScheduler):
-    """M3 reuses the model-agnostic dense offload scheduler unchanged.
+class M3OffloadScheduler(PrehashedSaveSchedulerMixin, DenseOffloadScheduler):
+    """M3 reuses the model-agnostic dense offload scheduler.
 
     The scheduler operates purely on token counts, block tables, and LMCache
     hit lookups -- no model-specific geometry -- so PAGE-only M3 needs no
-    scheduler changes.
+    scheduler changes. With ``ATOM_OFFLOAD_PREHASHED_SAVE`` it also hashes each
+    prompt's chunk chain once and ships saves as chunk hashes
+    (:class:`PrehashedSaveSchedulerMixin`); off, it is the dense scheduler.
     """
+
+    def __init__(self, config) -> None:
+        super().__init__(config)
+        self._init_prehashed_save()

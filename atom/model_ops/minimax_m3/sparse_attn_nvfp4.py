@@ -30,6 +30,7 @@ import triton.language as tl
 from aiter.jit.utils.chip_info import get_gfx
 
 from atom.model_ops.minimax_m3.nvfp4_kernels.nvfp4 import Nvfp4Cache
+from atom.utils import envs
 
 BLOCK = 128  # sparse block == cache page
 
@@ -154,10 +155,61 @@ def nvfp4_page_table(
     return table, ctx
 
 
+def fused_reduce_split(seqs: int, device) -> tuple[int, int | None, int, int]:
+    """(partitions, workgroup budget, page groups, rows a cluster) of the
+    decode rows when ``ATOM_M3_PA_FUSED_REDUCE`` merges the top-k window inside
+    the paged attention instead of the PS reduce kernel.
+
+    While every row's cluster stays resident (gfx1250: 15 clusters a 16 CUs) a
+    row's pages split over a cluster of P CTAs that merge on chip; past that
+    one CTA a row, whose four wave groups split its pages and merge in LDS.
+    MI455X, C64 decode, CUDA graph, us/layer (fused vs the split path today):
+    rows 32: 4.6 vs 5.1 (cluster8), 64: 5.1 vs 6.5 (cluster4, two wave groups),
+    80: 6.3 vs 8.5, 128: 6.9 vs 8.6, 192: 8.5 vs 13.0 (cluster4), 256: 9.6 vs
+    13.7 (one CTA a row)."""
+    cus = torch.cuda.get_device_properties(device).multi_processor_count
+    if seqs * 8 <= cus:
+        return 8, 8 * seqs, 1, 1
+    if seqs * 4 <= cus:
+        return 4, 4 * seqs, 2, 1
+    if seqs <= cus * 15 // 16:
+        return 4, 4 * seqs, 1, 1
+    return 1, None, 4, 1
+
+
+@functools.cache
+def _prefill_reuse_kernel():
+    """aiter's K/V-reuse sparse prefill and its shape predicate
+    (``ATOM_M3_SPARSE_PREFILL_REUSE``), or None on an aiter without it."""
+    try:
+        from aiter.ops.flydsl.pa_sparse_prefill import (
+            pa_sparse_prefill_nvfp4,
+            pa_sparse_prefill_nvfp4_supported,
+        )
+    except ImportError:
+        return None
+    return pa_sparse_prefill_nvfp4, pa_sparse_prefill_nvfp4_supported
+
+
+@functools.cache
+def _prefill_reuse_impl():
+    """The reuse kernel's implementation keywords (``ATOM_M3_SPARSE_PREFILL_REUSE_IMPL``
+    and ``_OPTS``); empty for the default v1."""
+    impl = envs.ATOM_M3_SPARSE_PREFILL_REUSE_IMPL
+    if impl == "v1":
+        return {}
+    opts = {}
+    for item in filter(None, envs.ATOM_M3_SPARSE_PREFILL_REUSE_OPTS.split(",")):
+        k, v = item.split("=")
+        opts[k.strip()] = int(v)
+    return {"impl": impl, "v2": opts}
+
+
 def _flydsl_attention(
     q, k_payload, k_scale, v_payload, v_scale, table, ctx, sm_scale,
     plan_step_owner, plan_cache_owner,
     quantized_output=None, output_scale=None, quantized_direct=True,
+    rows_per_request=0,
 ):  # fmt: skip
     """aiter's FlyDSL paged decode over the NVFP4 cache, one length-1 sequence a
     (row, kv head), planned and scratch-cached like the FP8 sparse path's.
@@ -214,10 +266,59 @@ def _flydsl_attention(
     ]
     k_view, v_view = caches[0], caches[1]
     ks_view, vs_view = (t.view(torch.float8_e4m3fn) for t in caches[2:])
+    if (
+        quantized_direct
+        # The BF16 output, or o_proj's MXFP8 input (E8M0 scales); the per-token
+        # FP32 FP8 output keeps the paged decode.
+        and (quantized_output is None or output_scale.dtype != torch.float32)
+        and envs.ATOM_M3_SPARSE_PREFILL_REUSE
+        and rows >= envs.ATOM_M3_SPARSE_PREFILL_REUSE_MIN_ROWS
+    ):
+        reuse = _prefill_reuse_kernel()
+        if reuse is not None and reuse[1](q_view, k_view, table):
+            # Prefill rows: a CTA walks the union of a tile of consecutive
+            # tokens' pages once (aiter `pa_sparse_prefill_nvfp4`), instead of a
+            # CTA a token gathering its own 16 pages.
+            mx_args = {}
+            if quantized_output is not None:
+                mx_args = {
+                    "quantized_output": quant_args["quantized_output"],
+                    "output_scale": output_scale,
+                    "quantized_pad_rows": quant_args["quantized_pad_rows"],
+                }
+            reuse[0](
+                out_view,
+                q_view,
+                k_view,
+                v_view,
+                ks_view,
+                vs_view,
+                table,
+                ctx,
+                sm_scale,
+                kv_heads=num_kv_heads,
+                tile_rows=envs.ATOM_M3_SPARSE_PREFILL_REUSE_TQ,
+                **mx_args,
+                **_prefill_reuse_impl(),
+            )
+            return output
     # The FP8 sparse path's split: a bounded top-k window per row.
     partitions = get_recommended_splits(seqs, 1)
     workgroup_budget = None
-    if quantized_output is not None and output_scale.dtype == torch.float32:
+    page_groups = None
+    cluster_rows = 1
+    if (
+        envs.ATOM_M3_PA_FUSED_REDUCE
+        and not quantized_direct
+        and (quantized_output is None or output_scale.dtype != torch.float32)
+    ):
+        # Decode rows (a full top-k window each) merge their partitions in the
+        # paged attention: clusters while every row's cluster is resident, else
+        # one CTA a row whose wave groups split its pages.
+        partitions, workgroup_budget, page_groups, cluster_rows = fused_reduce_split(
+            seqs, q.device
+        )
+    elif quantized_output is not None and output_scale.dtype == torch.float32:
         # The FP8 epilogue is in the one-task (direct) and cluster-of-8 output
         # modes; any other mode the plan picks quantizes after the BF16 output
         # inside aiter (`sparse_pa_per_row` explains the choice).
@@ -259,6 +360,18 @@ def _flydsl_attention(
         work_plan=plan,
         max_context_length=context_bound,
         **quant_args,
+        **(
+            {
+                "page_groups": page_groups,
+                # No plan lookups; a request's rows (which share most selected
+                # pages) dispatch on one XCD.
+                "plan_free": True,
+                "xcd_rows": rows_per_request * num_kv_heads,
+                "cluster_rows": cluster_rows,
+            }
+            if page_groups
+            else {}
+        ),
     )
     return output
 
@@ -281,6 +394,7 @@ def nvfp4_sparse_attention(
     quantized_output: torch.Tensor | None = None,
     output_scale: torch.Tensor | None = None,
     quantized_direct: bool = True,
+    rows_per_request: int = 0,
 ) -> torch.Tensor:
     """O ``[rows, num_heads, D]`` of every row over its top-k blocks.
 
@@ -327,6 +441,7 @@ def nvfp4_sparse_attention(
         quantized_output,
         output_scale,
         quantized_direct,
+        rows_per_request,
     )
 
 

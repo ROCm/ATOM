@@ -59,7 +59,12 @@ from aiter.rotary_embedding import get_rope
 from torch import nn
 
 from atom.config import QuantizationConfig
-from atom.model_ops.layernorm import GemmaRMSNorm
+from atom.model_ops.layernorm import (
+    GemmaRMSNorm,
+    fused_allreduce_gemma_rms_norm,
+    fused_allreduce_gemma_rms_norm_mxfp8_quant,
+)
+from atom.model_ops.communication_op import tensor_model_parallel_all_reduce
 from atom.model_ops.linear import QKVParallelLinear, ReplicatedLinear, RowParallelLinear
 from atom.model_ops.minimax_m3.sparse_attn import (
     ASM_PAGE_SIZE,
@@ -77,10 +82,49 @@ from atom.models.dspark_draft import (
     linear_out,
 )
 from atom.models.minimax_m3.model import MiniMaxM3MLP
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 if TYPE_CHECKING:
     from atom.config import Config
+
+
+def _draft_fused_ar() -> bool:
+    """``ATOM_DSPARK_FUSED_AR``: the draft layers leave o_proj's and the MLP's
+    outputs TP-partial and all-reduce them in the next norm, fused with the
+    RMSNorm and, where the next linear reads MXFP8, its quant -- the target
+    layers' fused all-reduce RMSNorm (MXFP8) path. Read at construction (the
+    linears' ``reduce_results``) and in the forward alike."""
+    return envs.ATOM_DSPARK_FUSED_AR and get_tensor_model_parallel_world_size() > 1
+
+
+def _draft_fuse_rows(rows: int) -> bool:
+    """ATOM_DSPARK_FUSED_AR at this many block rows: batches past
+    ATOM_DSPARK_FUSED_AR_MAX_ROWS (default 56, eight requests of a 7-token
+    block) keep the unfused all-reduce + norm launches. Decided per captured
+    batch size (the draft runs eagerly or as a CUDA graph, not compiled)."""
+    return rows <= envs.ATOM_DSPARK_FUSED_AR_MAX_ROWS
+
+
+def _ar_norm(hidden, residual, norm, consumer):
+    """All-reduce ``hidden``, add ``residual``, Gemma-RMSNorm; MXFP8-quantized
+    for an MXFP8 ``consumer``. Returns ``(hidden, x_scale | None, residual)``.
+    Past ATOM_DSPARK_FUSED_AR_MAX_ROWS: the launches the unfused path runs (the
+    linear's all-reduce, then the norm; the consumer quantizes for itself)."""
+    from atom.models.minimax_m3.model import _linear_consumes_mxfp8
+
+    if not _draft_fuse_rows(hidden.shape[0]):
+        hidden = tensor_model_parallel_all_reduce(hidden)
+        hidden, residual = norm(hidden, residual)
+        return hidden, None, residual
+    if (
+        consumer is not None
+        and envs.ATOM_MINIMAX_M3_GLUON_AR_MXFP8
+        and _linear_consumes_mxfp8(consumer)
+    ):
+        return fused_allreduce_gemma_rms_norm_mxfp8_quant(hidden, residual, norm)
+    hidden, residual = fused_allreduce_gemma_rms_norm(hidden, residual, norm)
+    return hidden, None, residual
 
 
 def _draft_rope_theta(config) -> float:
@@ -238,7 +282,8 @@ class M3DSparkAttention(nn.Module):
             self.total_num_heads * self.head_dim,
             config.hidden_size,
             bias=False,
-            reduce_results=True,
+            # TP-partial under ATOM_DSPARK_FUSED_AR: the layer's next norm reduces.
+            reduce_results=not _draft_fused_ar(),
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
@@ -313,7 +358,12 @@ class M3DSparkAttention(nn.Module):
         _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         self._norm_rope_write(k, k, v, 0, positions, slot_mapping, cache)
 
-    def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor):
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        x_scale: torch.Tensor | None = None,
+    ):
         """The block pass: non-causal attention over ``[context | block]``.
 
         Write the block's K/V at the block slots the proposer masked to the
@@ -321,7 +371,7 @@ class M3DSparkAttention(nn.Module):
         page another request owns (under prefix caching, a shared prefix) --
         then decode per row.
         """
-        qkv = linear_out(self.qkv_proj(hidden_states))
+        qkv = linear_out(self.qkv_proj(hidden_states, x_scale=x_scale))
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         cache = self._bound_cache()
         if cache is None:
@@ -389,14 +439,21 @@ class M3DSparkDecoderLayer(nn.Module):
             config=config,
             intermediate_size=int(config.dspark_ffn_hidden_size),
             quant_config=quant_config,
-            reduce_results=True,
+            # TP-partial under ATOM_DSPARK_FUSED_AR: the next norm reduces.
+            reduce_results=not _draft_fused_ar(),
             prefix=f"{prefix}.mlp",
             # The checkpoint says `swigluoai`, and the reference draft MLP is
             # SwiGLU-OAI whatever the field says; transformers'
             # MiniMaxM3VLTextConfig, which this config loads as, rewrites the
             # field to its `silu` default.
             hidden_act="swigluoai",
+            # ATOM_DSPARK_SWIGLU_MXFP8: the target's SwiGLU + MXFP8 quant fusion
+            # (bitwise its unfused pair) for the draft's MXFP8 down_proj too.
+            fuse_swiglu_mxfp8=envs.ATOM_DSPARK_SWIGLU_MXFP8,
         )
+        # ATOM_DSPARK_SWIGLU_MXFP8 as built (flag and arch); taken per call up to
+        # ATOM_DSPARK_FUSED_AR_MAX_ROWS rows (`_forward_fused_ar`).
+        self._swiglu_mxfp8 = self.mlp.fuse_swiglu_mxfp8
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -411,6 +468,8 @@ class M3DSparkDecoderLayer(nn.Module):
         self.self_attn.write_context_kv(ctx_hidden, positions, slot_mapping)
 
     def forward(self, positions, hidden_states, residual=None):
+        if _draft_fused_ar():
+            return self._forward_fused_ar(positions, hidden_states, residual)
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -419,6 +478,32 @@ class M3DSparkDecoderLayer(nn.Module):
         hidden_states = self.self_attn(positions, hidden_states)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         return self.mlp(hidden_states), residual
+
+    def _forward_fused_ar(self, positions, hidden_states, residual):
+        """``forward`` with each all-reduce fused into the norm after it
+        (ATOM_DSPARK_FUSED_AR). The returned hidden is TP-partial; the next
+        layer's input norm, or the model's final norm (``block_backbone``),
+        reduces it."""
+        x_scale = None
+        if residual is None:
+            # The embedding arrives reduced.
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, x_scale, residual = _ar_norm(
+                hidden_states, residual, self.input_layernorm, self.self_attn.qkv_proj
+            )
+        hidden_states = self.self_attn(positions, hidden_states, x_scale=x_scale)
+        hidden_states, x_scale, residual = _ar_norm(
+            hidden_states,
+            residual,
+            self.post_attention_layernorm,
+            self.mlp.gate_up_proj,
+        )
+        self.mlp.fuse_swiglu_mxfp8 = self._swiglu_mxfp8 and _draft_fuse_rows(
+            hidden_states.shape[0]
+        )
+        return self.mlp(hidden_states, x_scale=x_scale), residual
 
 
 class MiniMaxM3DSpark(DSparkDraftModel):
@@ -654,7 +739,17 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         residual = None
         for layer in self.layers:
             hidden, residual = layer(positions, hidden, residual)
-        hidden, _ = self.final_norm(hidden, residual)
+        if _draft_fused_ar() and _draft_fuse_rows(hidden.shape[0]):
+            hidden, _ = fused_allreduce_gemma_rms_norm(
+                hidden, residual, self.final_norm
+            )
+        elif _draft_fused_ar():
+            # Past ATOM_DSPARK_FUSED_AR_MAX_ROWS: the down_proj's all-reduce,
+            # unfused, as the original path runs it.
+            hidden = tensor_model_parallel_all_reduce(hidden)
+            hidden, _ = self.final_norm(hidden, residual)
+        else:
+            hidden, _ = self.final_norm(hidden, residual)
         return hidden
 
     def head_and_sample(self, hidden, anchor_ids, num_draft):

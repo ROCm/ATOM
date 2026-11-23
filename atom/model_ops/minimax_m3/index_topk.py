@@ -28,6 +28,8 @@ import triton
 import triton.language as tl
 from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 
+from atom.utils import envs
+
 from . import prefill_policy as _prefill_policy
 
 SCORE_BLOCK_SIZE_Q = _prefill_policy.SCORE_BLOCK_SIZE_Q
@@ -2130,6 +2132,32 @@ def _decode_index_score_transposed_kernel(
 # ---------------------------------------------------------------------------
 # Python wrappers
 # ---------------------------------------------------------------------------
+def _flydsl_prefill_scorer(idx_q, index_kv_cache, index_kv_scale, max_query_len):
+    """aiter's FlyDSL prefill scorer when ``ATOM_M3_INDEX_SCORE_FLYDSL_PREFILL``
+    asks for it and it serves the call (gfx1250, FP4 index cache, a prefill of
+    at least ``ATOM_M3_INDEX_SCORE_FLYDSL_MIN_ROWS`` rows), else None.
+
+    MI455X, one TP4 rank, 14336 new on 99968 cached: 97 us against Triton's 172
+    (score + select + emit 141 against 216), bit for bit; short prefills (300
+    rows) run 2-4 us slower than Triton, hence the row bound."""
+    if (
+        index_kv_scale is None
+        or not envs.ATOM_M3_INDEX_SCORE_FLYDSL_PREFILL
+        or max_query_len < envs.ATOM_M3_INDEX_SCORE_FLYDSL_MIN_ROWS
+    ):
+        return None
+    try:
+        from aiter.ops.flydsl.index_score_prefill import (
+            index_score_prefill_nvfp4,
+            index_score_prefill_nvfp4_supported,
+        )
+    except ImportError:
+        return None
+    if not index_score_prefill_nvfp4_supported(idx_q, index_kv_cache, index_kv_scale):
+        return None
+    return index_score_prefill_nvfp4
+
+
 @torch.no_grad()
 def minimax_m3_index_topk(
     idx_q: torch.Tensor,  # [total_q, num_idx_heads, head_dim]
@@ -2232,40 +2260,62 @@ def minimax_m3_index_topk(
     iks = index_kv_scale if is_fp4 else index_kv_cache
     if is_fp4:
         _check_fp4_index(index_kv_cache, index_kv_scale, head_dim)
-    _index_block_score_kernel[grid_score](
-        idx_q,
-        index_kv_cache,
-        iks,
-        score,
-        block_table,
-        cu_seqlens_q,
-        seq_lens,
-        prefix_lens,
-        num_idx_heads,
-        head_dim,
-        sm_scale,
-        chunk_blocks,
-        idx_q.stride(0),
-        idx_q.stride(1),
-        idx_q.stride(2),
-        index_kv_cache.stride(0),
-        index_kv_cache.stride(1),
-        index_kv_cache.stride(2),
-        iks.stride(0),
-        iks.stride(1),
-        score.stride(0),
-        score.stride(1),
-        score.stride(2),
-        block_table.stride(0),
-        BLOCK_SIZE_Q=score_config.block_size_q,
-        BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
-        STORE_GROUP=score_config.store_group,
-        PREFETCH_PAGES=score_config.prefetch_pages,
-        POST_REDUCE_SCALE=score_config.post_reduce_scale,
-        IS_FP4=is_fp4,
-        num_warps=score_num_warps,
-        num_stages=score_num_stages,
+    flydsl_score = _flydsl_prefill_scorer(
+        idx_q, index_kv_cache, index_kv_scale, max_query_len
     )
+    if flydsl_score is not None:
+        # aiter's FlyDSL scorer (ATOM_M3_INDEX_SCORE_FLYDSL_PREFILL): the same
+        # scores bit for bit -- the same scaled WMMA for every dot -- with its
+        # own data movement (tensor DMA pages, 16 B LDS operand reads).
+        flydsl_score(
+            idx_q,
+            index_kv_cache,
+            index_kv_scale,
+            score,
+            block_table,
+            cu_seqlens_q,
+            seq_lens,
+            prefix_lens,
+            sm_scale,
+            max_query_len,
+            chunk_blocks,
+        )
+    else:
+        _index_block_score_kernel[grid_score](
+            idx_q,
+            index_kv_cache,
+            iks,
+            score,
+            block_table,
+            cu_seqlens_q,
+            seq_lens,
+            prefix_lens,
+            num_idx_heads,
+            head_dim,
+            sm_scale,
+            chunk_blocks,
+            idx_q.stride(0),
+            idx_q.stride(1),
+            idx_q.stride(2),
+            index_kv_cache.stride(0),
+            index_kv_cache.stride(1),
+            index_kv_cache.stride(2),
+            iks.stride(0),
+            iks.stride(1),
+            score.stride(0),
+            score.stride(1),
+            score.stride(2),
+            block_table.stride(0),
+            BLOCK_SIZE_Q=score_config.block_size_q,
+            BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+            STORE_GROUP=score_config.store_group,
+            PREFETCH_PAGES=score_config.prefetch_pages,
+            POST_REDUCE_SCALE=score_config.post_reduce_scale,
+            IS_FP4=is_fp4,
+            num_warps=score_num_warps,
+            num_stages=score_num_stages,
+        )
+
 
     topk_idx = torch.empty(
         (num_idx_heads, total_q, topk), dtype=torch.int32, device=idx_q.device

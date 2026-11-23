@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import contextlib
 import logging
+import threading
 from abc import abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -20,6 +22,34 @@ from aiter.ops.shuffle import (
     moe_shuffle_scale,
     moe_shuffle_weight,
 )
+from aiter.tuned_gemm import tgemm
+
+try:  # aiter with the gfx1250 fused router GEMM + top-k
+    from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+        moe_route_group_counts as _moe_route_group_counts,
+    )
+    from aiter.ops.flydsl.moe_front_gfx1250 import (
+        flydsl_moe_router_topk as _flydsl_moe_router_topk,
+    )
+    from aiter.ops.flydsl.moe_front_gfx1250 import (
+        router_group_counts_shape as _router_group_counts_shape,
+    )
+    from aiter.ops.flydsl.moe_front_gfx1250 import router_split_k as _router_split_k
+except ImportError:  # pragma: no cover - older aiter: the gate stays separate
+    _flydsl_moe_router_topk = None
+    _router_split_k = None
+    _moe_route_group_counts = None
+    _router_group_counts_shape = None
+try:  # aiter whose decode GEMM1 gathers the router's token-major MX rows
+    from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+        moe_router_quant_rows as _moe_router_quant_rows,
+    )
+    from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+        router_quant_rows_buffers as _router_quant_rows_buffers,
+    )
+except ImportError:  # pragma: no cover - older aiter: the A1 launch quantizes
+    _moe_router_quant_rows = None
+    _router_quant_rows_buffers = None
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -211,6 +241,29 @@ def init_balance_router_logits(
     )
     router_logits.scatter_(1, expert_ids, _FAKE_EPLB_LOGIT)
     return router_logits
+
+
+_AFTER_ROUTER_TLS = threading.local()
+
+
+@contextlib.contextmanager
+def moe_after_router_hook(fn: Callable[[], None]):
+    """Run ``fn`` once, right after the routed MoE's router launch inside the
+    block (``forward_impl_fused_router``; eager callers only, e.g. the
+    dual-stream op). A caller that sees ``fn`` not run must run it itself."""
+    prev = getattr(_AFTER_ROUTER_TLS, "fn", None)
+    _AFTER_ROUTER_TLS.fn = fn
+    try:
+        yield
+    finally:
+        _AFTER_ROUTER_TLS.fn = prev
+
+
+def _run_after_router_hook() -> None:
+    fn = getattr(_AFTER_ROUTER_TLS, "fn", None)
+    if fn is not None:
+        _AFTER_ROUTER_TLS.fn = None
+        fn()
 
 
 @dataclass
@@ -3532,6 +3585,65 @@ direct_register_custom_op(
 )
 
 
+def moe_forward_fused_router(
+    hidden_states: torch.Tensor,
+    gate_weight: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    """`moe_forward` with the router GEMM folded in (`forward_fused_router`)."""
+    atom_config = get_current_atom_config()
+    self = atom_config.compilation_config.static_forward_context[layer_name]
+    return self.forward_impl_fused_router(hidden_states, gate_weight)
+
+
+def moe_forward_fused_router_fake(
+    hidden_states: torch.Tensor,
+    gate_weight: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+direct_register_custom_op(
+    op_name="moe_forward_fused_router",
+    op_func=moe_forward_fused_router,
+    mutates_args=["hidden_states"],
+    fake_impl=moe_forward_fused_router_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+def moe_forward_fused_router_mxfp8_copy(
+    hidden_states: torch.Tensor,
+    gate_weight: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """`moe_forward_mxfp8_copy` with the router GEMM folded in."""
+    atom_config = get_current_atom_config()
+    self = atom_config.compilation_config.static_forward_context[layer_name]
+    copy = _mxfp8_copy_buffers(hidden_states)
+    out = self.forward_impl_fused_router(hidden_states, gate_weight, mxfp8_copy_out=copy)
+    return out, copy[0], copy[1].view(torch.uint8)
+
+
+def moe_forward_fused_router_mxfp8_copy_fake(
+    hidden_states: torch.Tensor,
+    gate_weight: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    payload, scale = _mxfp8_copy_buffers(hidden_states)
+    return torch.empty_like(hidden_states), payload, scale.view(torch.uint8)
+
+
+direct_register_custom_op(
+    op_name="moe_forward_fused_router_mxfp8_copy",
+    op_func=moe_forward_fused_router_mxfp8_copy,
+    mutates_args=["hidden_states"],
+    fake_impl=moe_forward_fused_router_mxfp8_copy_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
 @FusedMoEDecoratorForPluginMode
 class FusedMoE(torch.nn.Module):
     """FusedMoE layer for MoE models.
@@ -5404,6 +5516,150 @@ class FusedMoE(torch.nn.Module):
             hidden_states, router_logits, self.layer_name
         )
 
+    def supports_fused_router(self, gate_weight: torch.Tensor) -> bool:
+        """Whether `forward_fused_router` may replace `gate` + `forward` here:
+        an unquantized [E, K] bf16 router feeding a plain biased-sigmoid top-k
+        (aiter `topk_gating`, no group, custom or fused-shared routing, no fake
+        EPLB) and the local MXFP4 experts (DP 1, no SP mega MoE, TP-only).
+        The kernel's own shape gate (`router_split_k`) is asked per call."""
+        if _flydsl_moe_router_topk is None:
+            return False
+        method = self.quant_method
+        return (
+            isinstance(method, Mxfp4MoEMethod)
+            and gate_weight.dtype == torch.bfloat16
+            and gate_weight.dim() == 2
+            and gate_weight.shape[0] == 128
+            and gate_weight.is_contiguous()
+            and self.scoring_func == "sigmoid"
+            and not self.use_grouped_topk
+            and self.custom_routing_function is None
+            and self.num_fused_shared_experts == 0
+            and self.shared_expert_scoring_func is None
+            and self.balance_router_logits is None
+            and self.top_k <= 4
+            and (
+                self.e_score_correction_bias is None
+                or (
+                    self.e_score_correction_bias.dtype == torch.float32
+                    and self.e_score_correction_bias.numel() == 128
+                )
+            )
+            and self.dp_size == 1
+        )
+
+    def forward_fused_router(
+        self, hidden_states: torch.Tensor, gate_weight: torch.Tensor
+    ) -> torch.Tensor:
+        """`forward(hidden_states, tgemm.mm(hidden_states, gate_weight))`, the
+        router GEMM and the top-k in one aiter launch where it reproduces them
+        (`supports_fused_router`); same output bytes."""
+        return torch.ops.aiter.moe_forward_fused_router(
+            hidden_states, gate_weight, self.layer_name
+        )
+
+    def forward_fused_router_with_mxfp8_copy(
+        self, hidden_states: torch.Tensor, gate_weight: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """`forward_with_mxfp8_copy` with the router of `forward_fused_router`."""
+        out, payload, scale = torch.ops.aiter.moe_forward_fused_router_mxfp8_copy(
+            hidden_states, gate_weight, self.layer_name
+        )
+        return out, payload, scale.view(torch.float8_e8m0fnu)
+
+    def forward_impl_fused_router(
+        self,
+        hidden_states: torch.Tensor,
+        gate_weight: torch.Tensor,
+        mxfp8_copy_out: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """Route with aiter's fused router GEMM + top-k when it takes this row
+        count (the tuned router GEMM is the FlyDSL kernel it reproduces), else
+        with the GEMM and `select_experts` as `forward` would."""
+        rows, k = hidden_states.shape
+        split_k = None
+        if (
+            rows > 0
+            and self.sp_mega_moe is None
+            and get_dp_group().world_size == 1
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.stride(1) == 1
+            and hidden_states.stride(0) % 8 == 0
+            and gate_weight.dtype == torch.bfloat16
+            and gate_weight.is_contiguous()
+            and tuple(gate_weight.shape) == (128, k)
+        ):
+            split_k = _router_split_k(
+                rows, gate_weight.shape[0], k, str(torch.bfloat16), str(torch.bfloat16)
+            )
+        if split_k is None:
+            router_logits = tgemm.mm(hidden_states, gate_weight, None, otype=dtypes.bf16)
+            _run_after_router_hook()
+            return self.forward_impl(
+                hidden_states, router_logits, mxfp8_copy_out=mxfp8_copy_out
+            )
+        # ATOM_MINIMAX_M3_MOE_ROUTER_QUANT: the router also writes the input
+        # as token-major MX rows, and the MXFP4 experts' decode GEMM1 gathers
+        # them in place of the A1 route/quant launch (aiter decides per batch:
+        # no buffers where it would not take them).
+        quant_rows = None
+        if (
+            envs.ATOM_MINIMAX_M3_MOE_ROUTER_QUANT
+            and _router_quant_rows_buffers is not None
+            and mxfp8_copy_out is None
+        ):
+            quant_rows = _router_quant_rows_buffers(
+                rows, k, hidden_states.device, topk=self.top_k
+            )
+        # ATOM_MINIMAX_M3_MOE_FRONT_COUNTS: the router also counts each 8-row
+        # group's routes per expert, which the MXFP4 experts' A1 route/quant
+        # launch reads instead of counting every id itself (same rows). Off by
+        # default: cheaper per launch, slower as a pair on MI455X so far.
+        group_counts = (
+            torch.empty(
+                _router_group_counts_shape(rows),
+                dtype=torch.int32,
+                device=hidden_states.device,
+            )
+            if envs.ATOM_MINIMAX_M3_MOE_FRONT_COUNTS and quant_rows is None
+            else None
+        )
+        routing = _flydsl_moe_router_topk(
+            hidden_states,
+            gate_weight,
+            self.e_score_correction_bias,
+            self.top_k,
+            split_k,
+            need_renorm=self.renormalize,
+            routed_scaling_factor=1.0,
+            num_valid_rows=pass_scheduled_tokens_gpu(rows),
+            group_counts=group_counts,
+            **(
+                {
+                    "quant_rows": quant_rows.quant_rows,
+                    "quant_rows8": quant_rows.quant_rows8,
+                }
+                if quant_rows is not None
+                else {}
+            ),
+        )
+        # ATOM_MINIMAX_M3_MOE_ROUTED_FIRST: the caller's launches that follow the router
+        # (moe_after_router_hook), captured after it
+        _run_after_router_hook()
+        if quant_rows is not None:
+            with _moe_router_quant_rows(routing[1], quant_rows):
+                return self.forward_impl(
+                    hidden_states, None, mxfp8_copy_out=mxfp8_copy_out, routing=routing
+                )
+        if group_counts is None:
+            return self.forward_impl(
+                hidden_states, None, mxfp8_copy_out=mxfp8_copy_out, routing=routing
+            )
+        with _moe_route_group_counts(routing[1], group_counts):
+            return self.forward_impl(
+                hidden_states, None, mxfp8_copy_out=mxfp8_copy_out, routing=routing
+            )
+
     def forward_with_mxfp8_copy(
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -5623,12 +5879,28 @@ class FusedMoE(torch.nn.Module):
     def forward_impl(
         self,
         hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
+        router_logits: torch.Tensor | None,
         mxfp8_copy_out: tuple[torch.Tensor, torch.Tensor] | None = None,
+        routing: tuple[torch.Tensor, torch.Tensor] | None = None,
+        x_scale: torch.Tensor | None = None,
     ):
         """`mxfp8_copy_out`: also write `hidden_states` as `quantize_fp8`
-        would (see `forward_with_mxfp8_copy`)."""
+        would (see `forward_with_mxfp8_copy`). `routing`: the `(topk_weights,
+        topk_ids)` `select_experts` would return, already computed (the fused
+        router, `forward_impl_fused_router`); `router_logits` is then unused.
+        `x_scale` (with `routing`): `hidden_states` are already the experts'
+        quantized activations with these scales (the quant method's
+        `routed_rows_wire`), e.g. the MXFP4 A1 a sequence-parallel AR's owners
+        wrote (ATOM_M3_SP_MOE_FRONT=2); the experts skip their own quant."""
         assert self.quant_method is not None
+        assert routing is None or (
+            self.sp_mega_moe is None and get_dp_group().world_size == 1
+        ), "precomputed routing takes the local (DP 1, no SP mega) path only"
+        assert x_scale is None or (
+            routing is not None
+            and mxfp8_copy_out is None
+            and self.moe_parallel_config.dp_logical_ratio == 1
+        ), "prequantized rows take precomputed routing on the local TP path only"
 
         # Decided here, at run time: the row count is symbolic while compiling.
         if self.sp_mega_moe is not None and self.sp_mega_moe.runs(
@@ -5645,9 +5917,12 @@ class FusedMoE(torch.nn.Module):
         # Simulated DP with no peers to gather from: the absent ranks' token
         # shards are stood in for locally, same as after the gather in
         # forward_impl_graph. Dropped again below.
-        topk_weights, topk_ids = self.quant_method.select_experts(
-            self, hidden_states, router_logits
-        )
+        if routing is not None:
+            topk_weights, topk_ids = routing
+        else:
+            topk_weights, topk_ids = self.quant_method.select_experts(
+                self, hidden_states, router_logits
+            )
         dp_repeat = self.moe_parallel_config.dp_logical_ratio
         local_rows = hidden_states.shape[0]
         if dp_repeat > 1:
@@ -5664,6 +5939,7 @@ class FusedMoE(torch.nn.Module):
             hidden_states,
             topk_weights,
             topk_ids,
+            x_scale=x_scale,
             gathered=dp_repeat > 1,
             mxfp8_copy_out=mxfp8_copy_out,
         )

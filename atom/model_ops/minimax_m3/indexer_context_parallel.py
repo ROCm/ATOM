@@ -15,6 +15,7 @@ from atom.model_ops.minimax_m3.index_topk import (
     _launch_select,
     _require_packable,
 )
+from atom.utils import envs
 from atom.model_ops.minimax_m3.nvfp4_kernels.nvfp4 import (
     NVFP4_SCALED_DOT,
     nvfp4_block_max,
@@ -290,6 +291,25 @@ def indexer_context_scores(
     scores = torch.empty(
         (heads, tokens, local), dtype=torch.float32, device=idx_q.device
     )
+    if tokens and is_fp4 and not fill_dead_slots and envs.ATOM_M3_CP_SCORE_FLYDSL:
+        # gfx1250 (`_transposed_score`, checked above): the FlyDSL scorer, the
+        # same bits with the K stream overlapped (indexer_cp_score_flydsl).
+        from atom.model_ops.minimax_m3 import indexer_cp_score_flydsl as fly
+
+        if fly.supported(idx_q, index_cache, index_scale, max_query_len):
+            return fly.cp_scores_fp4(
+                idx_q,
+                index_cache,
+                index_scale,
+                block_table,
+                seq_lens,
+                max_seq_len,
+                rank,
+                world_size,
+                max_query_len,
+                sm_scale,
+                scores,
+            )
     if tokens:
         programs = _context_score_programs(
             seq_lens.numel(),

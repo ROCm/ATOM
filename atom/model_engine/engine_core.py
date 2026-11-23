@@ -430,6 +430,12 @@ class EngineCore:
         shutdown = False
         metrics_interval = envs.ATOM_METRICS_UPDATE_INTERVAL_S
         next_metrics_push = 0.0
+        # ATOM_ENGINE_IDLE_YIELD_S: sleep this long on a pass that ran no
+        # forward. The idle loop is pure Python and never blocks, so the output
+        # IO thread that sends the last step's stream chunk (the request's
+        # final one when nothing else runs) waited for the interpreter's GIL
+        # switch interval (5 ms) -- one decode step -- before it could send.
+        idle_yield = envs.ATOM_ENGINE_IDLE_YIELD_S
         try:
             while True:
                 self.utility_handler.process_queue(self.utility_queue, self)
@@ -457,10 +463,14 @@ class EngineCore:
                         self.scheduler.engine_stats.bump_step()
                     else:
                         self.scheduler.engine_stats.note_idle(now)
+                        if idle_yield > 0:
+                            time.sleep(idle_yield)
                 else:
                     self.scheduler.engine_stats.note_idle(now)
                     if self.has_pending_kv_work():
                         self._advance_idle_kv_transfer()
+                    if idle_yield > 0:
+                        time.sleep(idle_yield)
         finally:
             try:
                 # Teardown runs even on exceptions so the sender thread/socket

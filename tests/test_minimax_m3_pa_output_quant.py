@@ -40,7 +40,7 @@ class _QuantAttention:
         self.quant_calls = []
         self.plain_calls = []
 
-    def forward_quantized(self, q, k, v, positions, qkv=None):
+    def forward_quantized(self, q, k, v, positions, q_scale=None, qkv=None):
         self.quant_calls.append((q, k, v, positions, qkv))
         return torch.zeros_like(q, dtype=torch.uint8), torch.ones(
             (q.shape[0], 1), dtype=torch.float32
@@ -62,6 +62,9 @@ def _sparse_layer(*, fused: bool, o_proj_per_token_fp8: bool = True):
         idx_head_dim=2,
         sparse_pa_output_quant_supported=fused,
         sparse_pa_mxfp8_out=False,
+        fused_qkv_chain=False,
+        fast_oproj=False,
+        o_proj_name="model.layers.0.self_attn.o_proj",
     )
 
 
@@ -351,21 +354,24 @@ def test_fp8_prefill_rows_stay_direct(monkeypatch):
 
 
 class _MxAttention(_QuantAttention):
-    def __init__(self, kv_nvfp4: bool):
+    def __init__(self, kv_format: str = "nvfp4"):
         super().__init__()
-        self.impl = SimpleNamespace(kv_nvfp4=kv_nvfp4)
+        # Before the KV cache is bound -- when torch.compile traces the forward
+        # in the warmup run -- `kv_nvfp4` is still False.
+        self.impl = SimpleNamespace(kv_format=kv_format, kv_nvfp4=False)
         self.quant_kwargs = []
 
-    def forward_quantized(self, q, k, v, positions, qkv=None, mxfp8=False):
+    def forward_quantized(self, q, k, v, positions, q_scale=None, qkv=None, mxfp8=False):
         self.quant_kwargs.append({"mxfp8": mxfp8})
-        return super().forward_quantized(q, k, v, positions, qkv)
+        return super().forward_quantized(q, k, v, positions, q_scale, qkv)
 
 
-def _mx_layer(*, enabled=True, kv_nvfp4=True, native_a8=1):
+def _mx_layer(*, enabled=True, fast_oproj=False):
     layer = _sparse_layer(fused=False)
-    layer.attn = _MxAttention(kv_nvfp4)
-    layer.o_proj.native_a8_group_rows = native_a8
+    layer.attn = _MxAttention()
+    layer.o_proj.native_a8_group_rows = 1
     layer.sparse_pa_mxfp8_out = enabled
+    layer.fast_oproj = fast_oproj
     return layer
 
 
@@ -378,17 +384,158 @@ def test_mxfp8_out_hands_the_attention_fp8_and_scales_to_o_proj():
     assert values.dtype == torch.uint8 and scale is not None
 
 
-@pytest.mark.parametrize(
-    "kwargs",
-    [{"enabled": False}, {"kv_nvfp4": False}, {"native_a8": None}],
-    ids=["flag-off", "fp8-kv", "o_proj-not-native-a8"],
-)
-def test_mxfp8_out_keeps_the_bf16_path_otherwise(kwargs):
-    layer = _mx_layer(**kwargs)
+def test_fast_oproj_routes_the_mxfp8_input_through_the_op(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        torch.ops.aiter,
+        "minimax_m3_o_proj_mxfp8",
+        lambda x, s, name: calls.append((x.dtype, s is not None, name)) or x,
+        raising=False,
+    )
+    layer = _mx_layer(fast_oproj=True)
+    MiniMaxM3SparseAttention.forward(layer, torch.arange(3), torch.randn(3, 12))
+    assert calls == [(torch.uint8, True, "model.layers.0.self_attn.o_proj")]
+    assert not layer.o_proj.calls
+
+
+def test_mxfp8_out_keeps_the_bf16_path_otherwise():
+    layer = _mx_layer(enabled=False)
     MiniMaxM3SparseAttention.forward(layer, torch.arange(3), torch.randn(3, 12))
     assert not layer.attn.quant_kwargs
     assert len(layer.attn.plain_calls) == 1
     assert layer.o_proj.calls[0][1] is None
+
+
+def _mx_conditions(monkeypatch, *, flag=True, kv_format="nvfp4", native_a8=1):
+    monkeypatch.setattr(m3_model.envs, "ATOM_MINIMAX_M3_PA_MXFP8_OUT", flag)
+    monkeypatch.setattr(m3_model, "nvfp4_reads_page_table", lambda: True)
+    attn = _MxAttention(kv_format)
+    o_proj = SimpleNamespace(native_a8_group_rows=native_a8)
+    return m3_model._sparse_pa_mxfp8_conditions(attn, o_proj)
+
+
+def test_mxfp8_out_follows_the_declared_kv_format_not_the_binding(monkeypatch):
+    """Decided at construction: torch.compile traces the forward in the warmup
+    run, before the KV cache is bound (``impl.kv_nvfp4`` still False), and the
+    compiled graph keeps that branch for every later step."""
+    assert all(_mx_conditions(monkeypatch).values())
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"flag": False}, {"kv_format": ""}, {"native_a8": None}],
+    ids=["flag-off", "fp8-kv", "o_proj-not-native-a8"],
+)
+def test_mxfp8_out_conditions_refuse(monkeypatch, kwargs):
+    assert not all(_mx_conditions(monkeypatch, **kwargs).values())
+
+
+def test_sparse_impl_declares_the_kv_format_its_pool_takes(monkeypatch):
+    from atom.model_ops.attentions.aiter_attention import AiterAttentionMetadataBuilder
+
+    for flag, expected in ((True, "nvfp4"), (False, "")):
+        monkeypatch.setattr(m3_model.envs, "ATOM_M3_SPARSE_KV_NVFP4", flag)
+        module = SimpleNamespace(
+            impl=SimpleNamespace(is_indexed_sparse_attention=True, kv_format=expected),
+            base_attention=True,
+            use_mla=False,
+            num_kv_heads=1,
+            head_dim=128,
+        )
+        kinds = AiterAttentionMetadataBuilder._module_kinds(None, module)
+        assert [k.kv_format for k in kinds if hasattr(k, "kv_format")] == [expected]
+
+
+# --- ATOM_M3_FAST_OPROJ: o_proj on the MXFP8 input through aiter's decode GEMM
+
+
+class _FastOProj:
+    """The attributes `_fast_oproj_conditions` reads; calling it is the linear."""
+
+    def __init__(self, shuffled: bool):
+        self.weight = torch.nn.Parameter(
+            torch.zeros(6144, 2048, dtype=torch.float8_e4m3fn), requires_grad=False
+        )
+        if shuffled:
+            self.weight.is_shuffled = True
+        self.weight_scale = torch.zeros(6144, 64, dtype=torch.uint8)
+        self.bias = None
+        self.native_a8_group_rows = 1
+        self.reduce_results = False
+        self.prefix = "model.layers.0.self_attn.o_proj"
+        self.calls = []
+
+    def __call__(self, x, x_scale=None):
+        self.calls.append(x.shape[0])
+        return torch.zeros(x.shape[0], 6144, dtype=torch.bfloat16)
+
+
+@pytest.fixture
+def decode_gemm(monkeypatch):
+    """aiter's gfx1250 decode GEMM, served up to 128 rows; records its rows."""
+    mod = importlib.import_module("aiter.ops.flydsl.mxfp8_decode_gemm_gfx1250")
+    calls = []
+    monkeypatch.setattr(
+        mod,
+        "mxfp8_decode_gemm_supported",
+        lambda m, n, k: 0 < m <= 128 and (n, k) == (6144, 2048),
+    )
+
+    def run(x, x_scale, w, w_scale):
+        calls.append(x.shape[0])
+        assert x_scale.dtype == torch.float8_e8m0fnu and x_scale.shape[1] == 64
+        return torch.ones(x.shape[0], w.shape[0], dtype=torch.bfloat16)
+
+    monkeypatch.setattr(mod, "mxfp8_decode_gemm", run)
+    return calls
+
+
+def _mx_input(rows):
+    x = torch.zeros(rows, 2048, dtype=torch.float8_e4m3fn)
+    return x, torch.zeros(rows, 64, dtype=torch.float8_e8m0fnu)
+
+
+def test_fast_oproj_serves_decode_rows_and_keeps_the_linear_past_them(decode_gemm):
+    o_proj = _FastOProj(shuffled=True)
+    for rows in (8, 80, 128, 129, 14336):
+        y = m3_model._o_proj_mxfp8(o_proj, *_mx_input(rows))
+        assert y.shape == (rows, 6144)
+    assert decode_gemm == [8, 80, 128]
+    assert o_proj.calls == [129, 14336]
+
+
+def test_fast_oproj_weight_is_judged_at_the_first_call(decode_gemm):
+    """The weight is shuffled by `process_weights_after_loading`, after the
+    attention's construction: the verdict waits for the first call."""
+    o_proj = _FastOProj(shuffled=False)
+    o_proj.weight.is_shuffled = True  # what the load does before any forward
+    m3_model._o_proj_mxfp8(o_proj, *_mx_input(80))
+    assert decode_gemm == [80] and not o_proj.calls
+
+
+def test_fast_oproj_falls_back_to_the_linear_without_a_shuffled_weight(decode_gemm):
+    o_proj = _FastOProj(shuffled=False)
+    m3_model._o_proj_mxfp8(o_proj, *_mx_input(80))
+    assert not decode_gemm and o_proj.calls == [80]
+    assert m3_model._fast_oproj_conditions(o_proj)["preshuffled weight"] is False
+
+
+def test_fast_oproj_op_looks_the_linear_up_by_name(decode_gemm, monkeypatch):
+    o_proj = _FastOProj(shuffled=True)
+    context = {"model.layers.0.self_attn.o_proj": o_proj}
+    monkeypatch.setattr(
+        m3_model,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(
+            compilation_config=SimpleNamespace(static_forward_context=context)
+        ),
+    )
+    x, scale = _mx_input(80)
+    name = "model.layers.0.self_attn.o_proj"
+    assert m3_model.minimax_m3_o_proj_mxfp8(x, scale, name).shape == (80, 6144)
+    fake = m3_model._minimax_m3_o_proj_mxfp8_fake(x, scale, name)
+    assert fake.shape == (80, 6144) and fake.dtype == torch.bfloat16
+    assert decode_gemm == [80]
 
 
 def _nvfp4_flydsl_call(monkeypatch, rows, bucket, scale_dtype, direct):

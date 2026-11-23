@@ -562,3 +562,78 @@ def test_nvfp4_attention_mxfp8_output_is_bf16_then_quantize_fp8(phase, rows, pad
     assert torch.equal(scales[:rows].view(torch.uint8), ref_s.view(torch.uint8))
     assert not fp8[rows:].view(torch.uint8).any()
     assert (scales[rows:].view(torch.uint8) == 127).all()
+
+
+@gfx1250_only
+@pytest.mark.parametrize("rows, pad", [(24, 0), (64, 0), (192, 5), (256, 0), (40, 3)])
+@pytest.mark.parametrize("mxfp8", [True, False], ids=["mxfp8", "bf16"])
+def test_nvfp4_attention_fused_reduce(rows, pad, mxfp8, monkeypatch):
+    """ATOM_M3_PA_FUSED_REDUCE: decode rows merge their top-k window inside the
+    paged attention (a cluster a row while every row's cluster is resident,
+    else one CTA a row) instead of the PS reduce kernel. The MXFP8 bytes are
+    o_proj's ``quantize_fp8`` of the BF16 output of that same call (store_output
+    forced on), which matches the unfused split's BF16 output to BF16 rounding
+    (a different split merges the softmax in another order); padded bucket rows
+    are FP8 zeros with E8M0 1.0 scales."""
+    import aiter.ops.flydsl.pa_decode as flydsl_pa
+    from aiter import dtypes
+
+    from atom.model_ops.blockscale import quantize_fp8
+    from atom.model_ops.minimax_m3.index_fp4 import kv_nvfp4_store
+    from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import (
+        decode_rows,
+        nvfp4_page_table,
+        nvfp4_sparse_attention,
+    )
+
+    torch.manual_seed(13)
+    blocks, topk, maxb, ql = 4096, 16, 48, 8
+    stage = torch.randn(blocks, 2, PAGE, 1, D, device=DEV).to(torch.bfloat16)
+    kp = torch.zeros(blocks, 1, PAGE, D // 2, dtype=torch.uint8, device=DEV)
+    ks = torch.zeros(blocks, 1, PAGE, D // 16, dtype=torch.uint8, device=DEV)
+    vp, vs = torch.zeros_like(kp), torch.zeros_like(ks)
+    kv_nvfp4_store(stage, torch.arange(blocks * PAGE, device=DEV), kp, ks, vp, vs)
+    reqs = rows // ql
+    seq = torch.randint(PAGE, maxb * PAGE, (reqs,), dtype=torch.int32, device=DEV)
+    seq[::3] = 200  # short requests: fewer than 16 valid blocks
+    bt = torch.randint(0, blocks, (reqs, maxb), dtype=torch.int32, device=DEV)
+    row_req, row_seq = decode_rows(seq, rows, ql)
+    n = (row_seq + PAGE - 1) // PAGE
+    idx = (torch.rand(1, rows, topk, device=DEV) * (n[None, :, None] - 1)).int()
+    idx[0, :, topk - 1] = n - 1
+    q = torch.randn(rows, 16, D, device=DEV).to(torch.bfloat16)
+    q[:, ::5] *= 16
+    table = nvfp4_page_table(idx, bt, row_req, row_seq)
+    args = (q, kp, ks, vp, vs, idx, bt, row_req, row_seq, D**-0.5)
+    bf16_split = nvfp4_sparse_attention(*args, page_table=table, quantized_direct=False)
+
+    monkeypatch.setenv("ATOM_M3_PA_FUSED_REDUCE", "1")
+    pa_decode = flydsl_pa.pa_decode
+    seen = []
+
+    def keep_bf16(*a, **kw):
+        seen.append(kw)
+        kw["store_output"] = True
+        return pa_decode(*a, **kw)
+
+    monkeypatch.setattr(flydsl_pa, "pa_decode", keep_bf16)
+    kw = {}
+    if mxfp8:
+        fp8 = torch.full((rows + pad, 16 * D), 0x7F, dtype=torch.uint8, device=DEV)
+        fp8 = fp8.view(dtypes.fp8)
+        scales = torch.full(
+            (rows + pad, 16 * D // 32), 0xFF, dtype=torch.uint8, device=DEV
+        ).view(torch.float8_e8m0fnu)
+        kw = {"quantized_output": fp8, "output_scale": scales}
+    out = nvfp4_sparse_attention(
+        *args, page_table=table, quantized_direct=False, rows_per_request=ql, **kw
+    )
+    torch.cuda.synchronize()
+    assert seen and seen[-1].get("plan_free") and seen[-1].get("xcd_rows") == ql
+    torch.testing.assert_close(out, bf16_split, atol=2e-2, rtol=2e-2)
+    if mxfp8:
+        ref_q, ref_s = quantize_fp8(out.view(rows, -1))
+        assert torch.equal(fp8[:rows].view(torch.uint8), ref_q.view(torch.uint8))
+        assert torch.equal(scales[:rows].view(torch.uint8), ref_s.view(torch.uint8))
+        assert not fp8[rows:].view(torch.uint8).any()
+        assert (scales[rows:].view(torch.uint8) == 127).all()

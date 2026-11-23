@@ -37,6 +37,21 @@ try:
     )
 except ImportError:
     tensor_model_parallel_fused_allreduce_rmsnorm_mxfp8_quant = None
+try:  # aiter with the sequence-parallel residual ops (gfx1250 ar2s_rms_ex)
+    from aiter.dist.communication_op import (
+        tensor_model_parallel_sp_allreduce_add_residual,
+        tensor_model_parallel_sp_fused_allreduce_rmsnorm,
+        tensor_model_parallel_sp_fused_allreduce_rmsnorm_mxfp8_quant,
+    )
+except ImportError:
+    tensor_model_parallel_sp_fused_allreduce_rmsnorm = None
+    tensor_model_parallel_sp_fused_allreduce_rmsnorm_mxfp8_quant = None
+    tensor_model_parallel_sp_allreduce_add_residual = None
+
+
+def sp_allreduce_supported() -> bool:
+    """Whether this aiter has the sequence-parallel residual AR + RMSNorm ops."""
+    return tensor_model_parallel_sp_fused_allreduce_rmsnorm is not None
 
 
 def silu(input: Tensor, inplace: bool = False) -> Tensor:
@@ -1054,6 +1069,53 @@ def fused_allreduce_gemma_rms_norm(
             gemma_norm=True,
         )
     return norm(hidden_states, residual)
+
+
+def sp_fused_allreduce_gemma_rms_norm(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    norm: GemmaRMSNorm,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """fused_allreduce_gemma_rms_norm with a sequence-parallel residual (TP > 1): at prefill sizes the
+    returned residual is valid on this rank's owner rows only and may only feed the sp_* helpers;
+    the normed output is whole and bit-identical."""
+    return tensor_model_parallel_sp_fused_allreduce_rmsnorm(
+        hidden_states.contiguous(),
+        residual,
+        norm.weight,
+        norm.variance_epsilon,
+        gemma_norm=True,
+    )
+
+
+def sp_fused_allreduce_gemma_rms_norm_mxfp8_quant(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    norm: GemmaRMSNorm,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """fused_allreduce_gemma_rms_norm_mxfp8_quant with a sequence-parallel residual, see
+    sp_fused_allreduce_gemma_rms_norm. Returns (E4M3, E8M0 scale, residual)."""
+    out_fp8, residual_out, scale_out = (
+        tensor_model_parallel_sp_fused_allreduce_rmsnorm_mxfp8_quant(
+            hidden_states.contiguous(),
+            residual,
+            norm.weight,
+            norm.variance_epsilon,
+            gemma_norm=True,
+        )
+    )
+    return out_fp8, scale_out, residual_out
+
+
+def sp_allreduce_add_residual(
+    hidden_states: torch.Tensor, residual: torch.Tensor
+) -> torch.Tensor:
+    """all_reduce(hidden) + residual, whole on every rank, from a sequence-parallel residual: the
+    residual stream after a layer, as the next layer's AR + norm writes it."""
+    # The op takes a hidden-sized tensor only to read the hidden size; a residual row is one.
+    return tensor_model_parallel_sp_allreduce_add_residual(
+        hidden_states.contiguous(), residual, residual[0]
+    )
 
 
 def fused_allreduce_gemma_rms_norm_quant(

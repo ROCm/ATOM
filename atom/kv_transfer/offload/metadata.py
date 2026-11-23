@@ -143,6 +143,22 @@ class NativeStateTransfer:
     kv_only: bool = False
 
 
+@dataclass(frozen=True)
+class PrehashedSave:
+    """A save named by its LMCache chunk hashes instead of its token prefix.
+
+    ``hashes[i]`` is LMCache's prefix-chained hash of the chunk that covers
+    tokens ``[start + i * chunk, start + (i + 1) * chunk)``, computed by the
+    scheduler with the lookup client's token database
+    (``ATOM_OFFLOAD_PREHASHED_SAVE``). ``start`` is chunk-aligned and equals
+    the save's ``skip_leading_tokens``; the worker builds each chunk's key with
+    LMCache's ``_make_key_by_hash`` and never sees the prefix tokens.
+    """
+
+    start: int
+    hashes: tuple[int, ...]
+
+
 @dataclass
 class LMCacheReqMeta:
     """Everything the worker needs to load/save one request's KV this step."""
@@ -180,6 +196,9 @@ class LMCacheReqMeta:
     # A save covering KV this step's forward computes: the worker submits it
     # behind that forward (`after_forward`) instead of before it.
     after_forward: bool = False
+    # Set instead of `token_ids` under ATOM_OFFLOAD_PREHASHED_SAVE: the save's
+    # new chunks as LMCache chunk hashes (see `PrehashedSave`).
+    prehashed_save: PrehashedSave | None = None
 
 
 class LMCacheOffloadMetadata(ConnectorMetadata):

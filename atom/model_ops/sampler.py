@@ -80,6 +80,14 @@ class Sampler(nn.Module):
         super().__init__()
         self.eps = SAMPLER_EPS
         self.always_independent_noise = always_independent_noise
+        # ATOM_SAMPLER_SPLIT_V: the largest row count the split-vocabulary
+        # sampler takes (-1 = off). Read once, at construction.
+        from atom.utils import envs
+
+        self._split_v_max_rows = (
+            envs.ATOM_SAMPLER_SPLIT_V_MAX_ROWS if envs.ATOM_SAMPLER_SPLIT_V else -1
+        )
+        self._split_v_max_reqs = envs.ATOM_SAMPLER_SPLIT_V_MAX_REQS
 
     def sample_verification_tokens(
         self,
@@ -116,6 +124,7 @@ class Sampler(nn.Module):
             expand(top_ps),
             all_greedy=False,
             needs_independent_noise=True,
+            num_requests=cu_num_draft_tokens.shape[0],
         )
 
     def forward(
@@ -130,6 +139,7 @@ class Sampler(nn.Module):
         ) = None,  # (num_tokens,) float32, 1.0 means disabled
         all_greedy: bool = False,  # True if all temperatures are 0 (checked on CPU)
         needs_independent_noise: bool = False,
+        num_requests: int | None = None,  # None: one row a request
     ) -> torch.Tensor:  # (num_tokens,)
         """
         Sample tokens from logits using temperature or top-k top-p filtering.
@@ -168,6 +178,14 @@ class Sampler(nn.Module):
 
         # No Top-K Top-P parameters, perform temperature-based sampling
         if not self._needs_filtering(top_ks, top_ps):
+            if self._split_v_max_rows >= logits.shape[0] and self._split_v_max_reqs >= (
+                logits.shape[0] if num_requests is None else num_requests
+            ):
+                # ATOM_SAMPLER_SPLIT_V: the same draw split over the vocabulary,
+                # greedy rows included (no `_apply_greedy_tokens` pass).
+                return self._split_v_sample(
+                    logits, temperatures, needs_independent_noise
+                )
             sampled = self._temperature_sample(
                 logits, temperatures, needs_independent_noise=needs_independent_noise
             )
@@ -232,6 +250,32 @@ class Sampler(nn.Module):
             sampled_tokens, logits, exponential, temperatures, eps=self.eps
         )
         return sampled_tokens
+
+    def _split_v_sample(
+        self,
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        needs_independent_noise: bool,
+    ) -> torch.Tensor:
+        """``_apply_greedy_tokens(logits, T, _temperature_sample(...))`` in two
+        launches (ATOM_SAMPLER_SPLIT_V, ``sampler_split.split_sample``): the
+        noise is drawn exactly as there, so the torch RNG stream is unchanged."""
+        from atom.model_ops.sampler_split import split_sample
+
+        num_tokens, vocab_size = logits.shape
+        if needs_independent_noise:
+            exponential = torch.empty(
+                (num_tokens, vocab_size), dtype=torch.float, device=logits.device
+            ).exponential_(1)
+        else:
+            exponential = get_per_token_exponential(vocab_size, logits.device).expand(
+                num_tokens, vocab_size
+            )
+        if logits.stride(-1) != 1:
+            logits = logits.contiguous()
+        return split_sample(
+            logits, exponential, temperatures, eps=self.eps, greedy_eps=SAMPLER_EPS
+        )
 
     def _topk_topp_sample(
         self,

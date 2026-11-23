@@ -596,6 +596,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # occupancy in the block scorer, winning above ~1M batch*context tokens and
     # losing below. Unset leaves the config field alone.
     "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
+    # MiniMax-M3 indexer CP on gfx1250 with the FP4 index cache: score with the
+    # FlyDSL kernel (minimax_m3/indexer_cp_score_flydsl.py) instead of the Triton
+    # `_context_score`. Bit-identical scores; opt-in until it has served.
+    "ATOM_M3_CP_SCORE_FLYDSL": lambda: (
+        os.getenv("ATOM_M3_CP_SCORE_FLYDSL", "0") == "1"
+    ),
     # MiniMax-M3: store the sparse (indexed) layers' K/V as NVFP4 (e2m1 + E4M3 per
     # 16) in their own pool; dense layers, the draft and --kv_cache_dtype are
     # unchanged.
@@ -658,16 +664,185 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MINIMAX_M3_PREFILL_TOKEN_GRAPH": lambda: _flag_env(
         "ATOM_MINIMAX_M3_PREFILL_TOKEN_GRAPH"
     ),
+    # MiniMax-M3, prefill sizes (an all-reduce input of at least aiter's ar2s floor, 32 MiB): keep the
+    # residual stream sequence-parallel -- each TP rank holds only the rows it owns in aiter's two-shot
+    # AR + RMSNorm -- so the owner normalizes (and MXFP8-quantizes) its rows and the all-gather carries
+    # the normed output, not the bf16 sum. Normed outputs are bit-identical; below the floor nothing
+    # changes. Needs an aiter with tensor_model_parallel_sp_fused_allreduce_rmsnorm*.
+    "ATOM_M3_PREFILL_SP_AR": lambda: _flag_env("ATOM_M3_PREFILL_SP_AR"),
+    # MiniMax-M3 with ATOM_M3_PREFILL_SP_AR, MoE layers at prefill sizes (the sequence-parallel
+    # range, TP2 / TP4): run the MoE front on the rows each rank owns after the post-attention
+    # reduce-scatter. 1: the router GEMM + top-k on the own rows only (the kernel the whole
+    # prefill's GEMM takes, so the same logits), then an all-gather of the routes. 2: also the
+    # MoE inputs from the AR's owner epilogue -- the shared expert's MXFP8 and the routed
+    # experts' MXFP4 A1, all-gathered in place of the bf16 rows; the experts skip both quants.
+    # Every MoE output byte is the same; 0 (default) keeps the replicated front.
+    "ATOM_M3_SP_MOE_FRONT": lambda: int(os.getenv("ATOM_M3_SP_MOE_FRONT", "0") or "0"),
+    # The own-row router of ATOM_M3_SP_MOE_FRONT: "gemm" (default) the tuned router GEMM of the
+    # whole prefill's row count on the own rows + topk_gating; "fused" aiter's FlyDSL router GEMM
+    # + top-k launch without split-K (only where it reproduces that GEMM's logits; see the PG
+    # tests).
+    "ATOM_M3_SP_MOE_ROUTER": lambda: os.getenv("ATOM_M3_SP_MOE_ROUTER", "gemm").strip() or "gemm",
     # MiniMax-M3: the routed MoE's A1 quant also writes the shared expert's
     # MXFP8 input (aiter fused_moe `mxfp8_copy_out`), so the shared gate_up
     # skips its own quant. Bitwise the same input; default off for A/B.
     "ATOM_MINIMAX_M3_MOE_QUANT_SHARED": lambda: _flag_env(
         "ATOM_MINIMAX_M3_MOE_QUANT_SHARED"
     ),
+    # MiniMax-M3: fold the routed scale and the shared expert's add into the
+    # routed MoE's gather-reduce (aiter `moe_output_epilogue`), one launch in
+    # place of gather-reduce + mul + add. Bitwise the same output; eager paths
+    # (the dual-stream op) only. Default off for A/B.
+    "ATOM_MINIMAX_M3_MOE_GLUE_FUSION": lambda: _flag_env(
+        "ATOM_MINIMAX_M3_MOE_GLUE_FUSION"
+    ),
+    # MiniMax-M3: fold the shared expert into the routed MoE's GEMM launches
+    # (aiter `moe_shared_expert_fold`) at decode token counts (the dual-stream
+    # op's range): its gate/up tiles join the routed GEMM1 launch, its down
+    # tiles GEMM2, its output is added in the gather-reduce. Not bitwise the
+    # separate shared MLP. Default off for A/B.
+    "ATOM_MINIMAX_M3_SHARED_FOLD": lambda: _flag_env("ATOM_MINIMAX_M3_SHARED_FOLD"),
+    # MiniMax-M3, with ATOM_MINIMAX_M3_MOE_GLUE_FUSION on the dual-stream op: the
+    # routed MoE's last launch (gather-reduce + routed scale + shared add) is not
+    # run; the next all-reduce + RMSNorm computes those rows in its prologue
+    # (aiter `moe_defer_tail`, the k5 one-shot kernel, AITER_K5_AR=1; any other
+    # AR path runs the launch first). Bitwise the same. Default off for A/B.
+    "ATOM_MINIMAX_M3_MOE_TAIL_IN_AR": lambda: _flag_env(
+        "ATOM_MINIMAX_M3_MOE_TAIL_IN_AR"
+    ),
+    # MiniMax-M3 dual-stream MoE with the glue epilogue: launch the fused router
+    # before the shared MLP's kernels (the shared MLP still depends only on the
+    # MoE input), so a captured graph keeps the routed chain on the parent's
+    # stream and puts the shared MLP on the side stream. Same kernels and bytes.
+    # Default off for A/B.
+    "ATOM_MINIMAX_M3_MOE_ROUTED_FIRST": lambda: _flag_env(
+        "ATOM_MINIMAX_M3_MOE_ROUTED_FIRST"
+    ),
+    # MiniMax-M3: the router GEMM and the biased sigmoid top-k run as one
+    # aiter launch (gfx1250 FlyDSL `flydsl_moe_router_topk`) in place of the
+    # gate GEMM + topk_gating pair; bitwise the same routing. Row counts whose
+    # tuned router GEMM is not the FlyDSL kernel keep the pair. Default off.
+    "ATOM_MINIMAX_M3_MOE_FRONT_FUSION": lambda: _flag_env(
+        "ATOM_MINIMAX_M3_MOE_FRONT_FUSION"
+    ),
+    # With ATOM_MINIMAX_M3_MOE_FRONT_FUSION: the fused router also writes each
+    # 8-token group's expert counts and the A1 route/quant reads them instead
+    # of re-counting every id (same bytes). Opt-in: on MI455X each launch is
+    # faster but the pair is slower in sequence so far.
+    "ATOM_MINIMAX_M3_MOE_FRONT_COUNTS": lambda: _flag_env(
+        "ATOM_MINIMAX_M3_MOE_FRONT_COUNTS"
+    ),
+    # With ATOM_MINIMAX_M3_MOE_FRONT_FUSION: the fused router also writes the
+    # layer input as token-major MXFP4 rows (and the shared fold's MXFP8 copy),
+    # and the MXFP4 experts' decode GEMM1 re-derives the route and gathers
+    # them (aiter `moe_router_quant_rows`), so the A1 route/quant launch does
+    # not run. Same GEMM and MoE output bytes. Default off for A/B.
+    "ATOM_MINIMAX_M3_MOE_ROUTER_QUANT": lambda: _flag_env(
+        "ATOM_MINIMAX_M3_MOE_ROUTER_QUANT"
+    ),
+    # Unfiltered temperature sampling of at most ATOM_SAMPLER_SPLIT_V_MAX_ROWS
+    # rows: split each vocabulary row over many programs (two Triton launches,
+    # `atom/model_ops/sampler_split.py`) instead of aiter's one-workgroup-a-row
+    # kernel plus the separate greedy argmax. Same noise and score; greedy rows
+    # bitwise the same. Default off for A/B.
+    "ATOM_SAMPLER_SPLIT_V": lambda: _flag_env("ATOM_SAMPLER_SPLIT_V"),
+    # MiniMax-M3.1 DSpark draft: fuse each layer's o_proj / MLP all-reduce into
+    # the following Gemma RMSNorm (+ MXFP8 quant of the next linear's input
+    # under ATOM_MINIMAX_M3_GLUON_AR_MXFP8), the target layers' fused
+    # all-reduce RMSNorm path (ported from track I). Default off for A/B.
+    "ATOM_DSPARK_FUSED_AR": lambda: _flag_env("ATOM_DSPARK_FUSED_AR"),
+    # Engine core (DP 1) busy loop: seconds to sleep on a pass that ran no
+    # forward (0 = never). Hands the GIL to the output IO thread at once
+    # instead of after the 5 ms switch interval, so a request's last stream
+    # chunk is not held one decode step when the engine goes idle.
+    "ATOM_ENGINE_IDLE_YIELD_S": lambda: float(
+        os.getenv("ATOM_ENGINE_IDLE_YIELD_S", "0") or 0
+    ),
+    # With ATOM_DSPARK_FUSED_AR / ATOM_DSPARK_SWIGLU_MXFP8: the largest draft
+    # block (rows = requests x block tokens) that takes the fused launches;
+    # bigger batches keep the unfused ones. Default 56 = 8 requests x 7.
+    "ATOM_DSPARK_FUSED_AR_MAX_ROWS": lambda: int(
+        os.getenv("ATOM_DSPARK_FUSED_AR_MAX_ROWS", "56")
+    ),
+    # MiniMax-M3.1 DSpark draft: its MLP's SwiGLU-OAI fused with the MXFP8 quant
+    # of down_proj's input, as ATOM_MINIMAX_M3_SWIGLU_MXFP8 does for the target.
+    "ATOM_DSPARK_SWIGLU_MXFP8": lambda: _flag_env("ATOM_DSPARK_SWIGLU_MXFP8"),
+    "ATOM_SAMPLER_SPLIT_V_MAX_ROWS": lambda: int(
+        os.getenv("ATOM_SAMPLER_SPLIT_V_MAX_ROWS", "256")
+    ),
+    # ...and of at most this many requests (a verification call's rows are its
+    # requests' draft positions). Default 8: the small-batch (C4) regime only.
+    "ATOM_SAMPLER_SPLIT_V_MAX_REQS": lambda: int(
+        os.getenv("ATOM_SAMPLER_SPLIT_V_MAX_REQS", "8")
+    ),
     # MiniMax-M3 NVFP4 sparse layers on gfx1250 with a native MXFP8 o_proj: the
     # paged attention writes o_proj's MXFP8 input (E4M3 + E8M0 per 32) instead
     # of its BF16 output, which o_proj then quantized itself. Opt-in for A/B.
     "ATOM_MINIMAX_M3_PA_MXFP8_OUT": lambda: _flag_env("ATOM_MINIMAX_M3_PA_MXFP8_OUT"),
+    # gfx1250 MiniMax-M3 sparse layers: the native-MXFP8 QKV GEMM, the q/k Gemma
+    # norm + RoPE and the NVFP4 K/V + index-key inserts in one launch (aiter
+    # mxfp8_qkv_norm_rope_nvfp4_insert) for decode-sized token counts. Needs the
+    # MXFP8 AR + RMSNorm producer (ATOM_MINIMAX_M3_GLUON_AR_MXFP8=1), the NVFP4
+    # K/V pool (ATOM_M3_SPARSE_KV_NVFP4=1) and --index-cache-dtype fp4; any other
+    # call keeps the GEMM + fused_qknorm_idxrqknorm. Opt-in for A/B.
+    "ATOM_M3_FUSED_QKV_CHAIN": lambda: _flag_env("ATOM_M3_FUSED_QKV_CHAIN"),
+    # gfx1250 MiniMax-M3 sparse layers: o_proj's native-MXFP8 GEMM (the PA
+    # epilogue's E4M3 + E8M0 input, ATOM_MINIMAX_M3_PA_MXFP8_OUT=1) through aiter's
+    # decode-shaped mxfp8_decode_gemm for the token counts it serves; anything else
+    # keeps the linear's tuned GEMM. Opt-in for A/B.
+    "ATOM_M3_FAST_OPROJ": lambda: _flag_env("ATOM_M3_FAST_OPROJ"),
+    # MiniMax-M3 NVFP4 sparse decode on gfx1250: merge the top-k window's
+    # partitions inside the paged attention (workgroup clusters, or one CTA a
+    # row whose wave groups split the pages) instead of the separate PS reduce
+    # kernel (`sparse_attn_nvfp4.fused_reduce_split`). Opt-in for A/B.
+    "ATOM_M3_PA_FUSED_REDUCE": lambda: _flag_env("ATOM_M3_PA_FUSED_REDUCE"),
+    # MiniMax-M3 NVFP4 sparse prefill on gfx1250: aiter's K/V-reuse kernel
+    # (`pa_sparse_prefill_nvfp4`: a CTA walks the union of the selected pages of
+    # ATOM_M3_SPARSE_PREFILL_REUSE_TQ consecutive tokens, 4 or 8) instead of the
+    # one-token-a-CTA paged decode, for prefills of at least
+    # ATOM_M3_SPARSE_PREFILL_REUSE_MIN_ROWS tokens; BF16 or MXFP8 output. Same
+    # result to rounding.
+    # Opt-in for A/B.
+    "ATOM_M3_SPARSE_PREFILL_REUSE": lambda: _flag_env("ATOM_M3_SPARSE_PREFILL_REUSE"),
+    "ATOM_M3_SPARSE_PREFILL_REUSE_TQ": lambda: int(
+        os.getenv("ATOM_M3_SPARSE_PREFILL_REUSE_TQ", "4")
+    ),
+    "ATOM_M3_SPARSE_PREFILL_REUSE_MIN_ROWS": lambda: int(
+        os.getenv("ATOM_M3_SPARSE_PREFILL_REUSE_MIN_ROWS", "256")
+    ),
+    # The reuse kernel's implementation: v1 (default) or v2 (rows batched in
+    # one basic block, lazy softmax rebase); ATOM_M3_SPARSE_PREFILL_REUSE_OPTS
+    # "key=int,..." passes v2's compile options (rebase_log2, waves_per_eu,
+    # all_rows, v_hoist, fence, v_wide).
+    "ATOM_M3_SPARSE_PREFILL_REUSE_IMPL": lambda: os.getenv(
+        "ATOM_M3_SPARSE_PREFILL_REUSE_IMPL", "v1"
+    ),
+    "ATOM_M3_SPARSE_PREFILL_REUSE_OPTS": lambda: os.getenv(
+        "ATOM_M3_SPARSE_PREFILL_REUSE_OPTS", ""
+    ),
+    # MiniMax-M3 prefill index block scores over the FP4 index cache on gfx1250:
+    # aiter's FlyDSL scorer (`aiter.ops.flydsl.index_score_prefill`) instead of
+    # the Triton `_index_block_score_kernel`; the same scores bit for bit, so the
+    # same top-k. Opt-in for A/B.
+    "ATOM_M3_INDEX_SCORE_FLYDSL_PREFILL": lambda: _flag_env(
+        "ATOM_M3_INDEX_SCORE_FLYDSL_PREFILL"
+    ),
+    "ATOM_M3_INDEX_SCORE_FLYDSL_MIN_ROWS": lambda: int(
+        os.getenv("ATOM_M3_INDEX_SCORE_FLYDSL_MIN_ROWS", "2048")
+    ),
+    # Debug: save rank 0's fresh MiniMax-M3 prefill top-k selections of the
+    # first ATOM_M3_DUMP_PREFILL_TOPK_CHUNKS prefill forwards whose longest
+    # cached prefix is at least ATOM_M3_DUMP_PREFILL_TOPK_MIN_PREFIX tokens to
+    # this directory (`minimax_m3/prefill_topk_dump.py`). Empty = off.
+    "ATOM_M3_DUMP_PREFILL_TOPK": lambda: os.getenv(
+        "ATOM_M3_DUMP_PREFILL_TOPK", ""
+    ).strip(),
+    "ATOM_M3_DUMP_PREFILL_TOPK_CHUNKS": lambda: int(
+        os.getenv("ATOM_M3_DUMP_PREFILL_TOPK_CHUNKS", "4")
+    ),
+    "ATOM_M3_DUMP_PREFILL_TOPK_MIN_PREFIX": lambda: int(
+        os.getenv("ATOM_M3_DUMP_PREFILL_TOPK_MIN_PREFIX", "8192")
+    ),
     # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
     # comma-separated token counts to record. A prefill longer than the largest
     # runs eagerly; empty records none. The default tops out at 3072 because
@@ -1398,6 +1573,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Per-transfer offload profiling logs.
     "OFFLOAD_PROFILE": lambda: _flag_env("OFFLOAD_PROFILE"),
+    # In-process lmcache_offload (MiniMax-M3 layout): the scheduler hashes each
+    # prompt's LMCache chunk chain once, answers its tier lookup from it, and
+    # ships a save as the hashes of its new chunks instead of the whole token
+    # prefix, so the TP workers do no O(context) work per save. Off by default.
+    "ATOM_OFFLOAD_PREHASHED_SAVE": lambda: _flag_env("ATOM_OFFLOAD_PREHASHED_SAVE"),
+    # With ATOM_OFFLOAD_PREHASHED_SAVE: tier lookups run on a scheduler-side
+    # thread, and a request whose HBM prefix leaves too little uncached to load
+    # is admitted without waiting for its lookup. Off by default.
+    "ATOM_OFFLOAD_ASYNC_TIER_LOOKUP": lambda: _flag_env(
+        "ATOM_OFFLOAD_ASYNC_TIER_LOOKUP"
+    ),
     # lmcache_mp sends tier lookups for the head of the waiting queue ahead of
     # admission; this is how many waiting requests per scheduling pass.
     "OFFLOAD_ASYNC_LOOKUP_DEPTH": lambda: _nonnegative_int_env(
