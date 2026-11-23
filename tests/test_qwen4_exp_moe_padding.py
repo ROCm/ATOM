@@ -6,24 +6,31 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
-pytest.importorskip("aiter", exc_type=ImportError)
-
-from aiter import QuantType, dtypes
-
-from atom.model_ops.moe import (
-    CompressedTensorsFp8MoEMethod,
-    FusedMoE,
-    UnquantizedFusedMoEMethod,
-)
-from atom.models import qwen4_exp
-from atom.quant_spec import LayerQuantConfig
+from aiter_stub import atom_without_aiter
 
 
-def _layer(mode, tp, rank, experts=4, hidden=32):
+@pytest.fixture(scope="module")
+def impl():
+    with atom_without_aiter() as load:
+        yield SimpleNamespace(
+            moe=load("atom.model_ops.moe"),
+            qwen=load("atom.models.qwen4_exp"),
+            mtp=load("atom.models.qwen4_exp_mtp"),
+            config=load("atom.config"),
+            topk=load("atom.model_ops.topK"),
+            loading=load("atom.model_loader.loading_core"),
+            names=load("atom.model_loader.weight_names"),
+            iterator=load("atom.model_loader.weight_iterator"),
+            utils=load("atom.model_ops.utils"),
+            shuffle=load("aiter.ops.shuffle"),
+        )
+
+
+def _layer(impl, mode, tp, rank, experts=4, hidden=32):
     # Bypass the plugin decorator's __new__, which constructs a whole layer.
     # The actual inherited loaders and method allocators are exercised below.
-    layer = object.__new__(FusedMoE)
+    m = impl.moe
+    layer = object.__new__(m.FusedMoE)
     torch.nn.Module.__init__(layer)
     layer.prefix = "model.layers.0.mlp.experts"
     layer.quant_config = None
@@ -33,17 +40,17 @@ def _layer(mode, tp, rank, experts=4, hidden=32):
     layer.intermediate_size_per_partition = 640 // tp
     moe = SimpleNamespace(in_dtype=torch.bfloat16, hidden_dim=hidden)
     if mode == "fp8":
-        method = CompressedTensorsFp8MoEMethod(
-            LayerQuantConfig(
-                quant_dtype=dtypes.fp8,
-                quant_type=QuantType.per_Token,
+        method = m.CompressedTensorsFp8MoEMethod(
+            m.LayerQuantConfig(
+                quant_dtype=m.dtypes.fp8,
+                quant_type=m.QuantType.per_Token,
                 quant_method="compressed-tensors",
             ),
             moe,
         )
-        dtype = dtypes.fp8
+        dtype = m.dtypes.fp8
     else:
-        method = UnquantizedFusedMoEMethod(moe)
+        method = m.UnquantizedFusedMoEMethod(moe)
         dtype = torch.bfloat16
     method.pad_align = 64
     method.create_weights(
@@ -61,8 +68,8 @@ def _layer(mode, tp, rank, experts=4, hidden=32):
     "tp,rank", [(2, r) for r in range(2)] + [(4, r) for r in range(4)]
 )
 @pytest.mark.parametrize("mode", ["bf16", "fp8"])
-def test_per_expert_weight_and_channel_scale_shards(tp, rank, mode):
-    layer, _ = _layer(mode, tp, rank)
+def test_per_expert_weight_and_channel_scale_shards(impl, tp, rank, mode):
+    layer, _ = _layer(impl, mode, tp, rank)
     logical = 640 // tp
     physical = 320 if tp == 2 else 192
     assert layer.intermediate_size_per_partition == logical
@@ -128,13 +135,13 @@ def test_per_expert_weight_and_channel_scale_shards(tp, rank, mode):
 @pytest.mark.parametrize(
     "tp,rank", [(2, r) for r in range(2)] + [(4, r) for r in range(4)]
 )
-def test_stacked_loader_preserves_shared_slot_and_zero_pads(tp, rank):
-    layer, _ = _layer("bf16", tp, rank)
+def test_stacked_loader_preserves_shared_slot_and_zero_pads(impl, tp, rank):
+    layer, _ = _layer(impl, "bf16", tp, rank)
     physical = layer.w2_weight.shape[2]
     logical = 640 // tp
     layer.w13_weight.data.fill_(-7)
     layer.w2_weight.data.fill_(-7)
-    qwen4_exp.install_stacked_expert_loaders(layer)
+    impl.qwen.install_stacked_expert_loaders(layer)
     gate = torch.arange(3 * 640 * 32).reshape(3, 640, 32).to(torch.bfloat16)
     up = -gate - 1
     down = torch.arange(3 * 32 * 640).reshape(3, 32, 640).to(torch.bfloat16)
@@ -156,10 +163,8 @@ def test_stacked_loader_preserves_shared_slot_and_zero_pads(tp, rank):
 
 
 @pytest.mark.parametrize("fused_shared", [False, True])
-def test_mtp_shared_name_rewrite_follows_constructed_layout(fused_shared):
-    from atom.model_loader.weight_names import CheckpointNameRewriter
-    from atom.models.qwen4_exp_mtp import Qwen4ExpMTP
-
+def test_mtp_shared_name_rewrite_follows_constructed_layout(impl, fused_shared):
+    Qwen4ExpMTP = impl.mtp.Qwen4ExpMTP
     model = Qwen4ExpMTP.__new__(Qwen4ExpMTP)
     torch.nn.Module.__init__(model)
     model.config = SimpleNamespace(num_experts=512)
@@ -169,7 +174,7 @@ def test_mtp_shared_name_rewrite_follows_constructed_layout(fused_shared):
     def target_policy(*_):
         raise AssertionError("Draft names must follow its constructed layout")
 
-    rewriter = CheckpointNameRewriter(
+    rewriter = impl.names.CheckpointNameRewriter(
         weights_mapping=model.weights_mapping,
         mtp_remap=model.remap_mtp_weight_name,
         spec_decode=True,
@@ -191,38 +196,32 @@ def test_mtp_shared_name_rewrite_follows_constructed_layout(fused_shared):
 @pytest.mark.parametrize("tp", [2, 4])
 @pytest.mark.parametrize("target_shared_bf16", [False, True])
 def test_bf16_mtp_loads_shared_slot_using_draft_policy(
-    monkeypatch, tmp_path, tp, target_shared_bf16
+    impl, monkeypatch, tmp_path, tp, target_shared_bf16
 ):
     """The BF16 draft can fuse even when the FP8 target must keep shared separate."""
     from functools import partial
 
     from safetensors.torch import save_file
 
-    from atom.config import QuantizationConfig
-    from atom.model_loader.loading_core import load_weights_into_model
-    from atom.model_loader.weight_iterator import safetensors_weights_iterator
-    from atom.model_ops import topK
-    from atom.models import qwen4_exp_mtp
-
-    target_config = QuantizationConfig()
+    target_config = impl.config.QuantizationConfig()
     target_config.quant_method = "compressed-tensors"
-    target_config.global_spec = LayerQuantConfig(
-        quant_dtype=dtypes.fp8, quant_type=QuantType.per_Token
+    target_config.global_spec = impl.moe.LayerQuantConfig(
+        quant_dtype=impl.moe.dtypes.fp8, quant_type=impl.moe.QuantType.per_Token
     )
     target_config.exclude_layers = [r"re:^mtp\."]
     if target_shared_bf16:
         target_config.exclude_layers.append(r"re:^model\.layers\.0\.mlp\.shared_expert")
-    target_policy = qwen4_exp._Qwen4ExpQuantizationConfig(target_config)
-    draft_policy = qwen4_exp_mtp._UnquantizedMTPQuantizationConfig(target_config)
+    target_policy = impl.qwen._Qwen4ExpQuantizationConfig(target_config)
+    draft_policy = impl.mtp._UnquantizedMTPQuantizationConfig(target_config)
     monkeypatch.setattr(
-        topK,
+        impl.topk,
         "get_current_atom_config",
         lambda: SimpleNamespace(
             parallel_config=SimpleNamespace(data_parallel_size=1),
             moe_all2all_backend="none",
         ),
     )
-    can_fuse = topK.is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config
+    can_fuse = impl.topk.is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config
     assert can_fuse(
         target_policy, "model.layers.0.mlp.shared_expert", "model.layers.0.mlp.experts"
     ) is (not target_shared_bf16)
@@ -230,16 +229,16 @@ def test_bf16_mtp_loads_shared_slot_using_draft_policy(
     # Keep construction CPU-only while using the real MTP model's fusion flags,
     # checkpoint rewriter, stacked loader and per-expert BF16 weight loader.
     routed, hidden, rank = 512, 8, tp - 1
-    experts, method = _layer("bf16", tp, rank, experts=routed + 1, hidden=hidden)
+    experts, method = _layer(impl, "bf16", tp, rank, experts=routed + 1, hidden=hidden)
     # A dropped shared weight must fail even if an empty TP2 buffer reuses
     # storage that a previous test populated with the expected values.
     experts.w13_weight.data[routed].zero_()
     experts.w2_weight.data[routed].zero_()
     experts.quant_method = method
-    experts.layer_quant_config = LayerQuantConfig(quant_dtype=torch.bfloat16)
+    experts.layer_quant_config = impl.moe.LayerQuantConfig(quant_dtype=torch.bfloat16)
     experts.w13_weight.weight_loader = experts.weight_loader
     experts.w2_weight.weight_loader = experts.weight_loader
-    qwen4_exp.install_stacked_expert_loaders(experts)
+    impl.qwen.install_stacked_expert_loaders(experts)
 
     block = torch.nn.Module()
     block.mlp = torch.nn.Module()
@@ -249,16 +248,14 @@ def test_bf16_mtp_loads_shared_slot_using_draft_policy(
     )
     predictor = torch.nn.Module()
     predictor.layers = torch.nn.ModuleList([block])
+    monkeypatch.setattr(impl.mtp, "Qwen4ExpMultiTokenPredictor", lambda _: predictor)
     monkeypatch.setattr(
-        qwen4_exp_mtp, "Qwen4ExpMultiTokenPredictor", lambda _: predictor
-    )
-    monkeypatch.setattr(
-        qwen4_exp_mtp, "ParallelLMHead", lambda *_args, **_kw: torch.nn.Identity()
+        impl.mtp, "ParallelLMHead", lambda *_args, **_kw: torch.nn.Identity()
     )
     hf = SimpleNamespace(
         num_experts=routed, num_hidden_layers=48, hidden_size=hidden, vocab_size=32
     )
-    model = qwen4_exp_mtp.Qwen4ExpMTP(SimpleNamespace(hf_config=hf))
+    model = impl.mtp.Qwen4ExpMTP(SimpleNamespace(hf_config=hf))
     assert model.fused_shared_experts == 1
     assert model.disable_fused_shared_loading is False
 
@@ -279,7 +276,7 @@ def test_bf16_mtp_loads_shared_slot_using_draft_policy(
     }
     save_file(weights, tmp_path / "model.safetensors")
     monkeypatch.setenv("ATOM_LOADER_NUM_THREADS", "1")
-    loaded = load_weights_into_model(
+    loaded = impl.loading.load_weights_into_model(
         model=model,
         model_name_or_path=str(tmp_path),
         hf_config=hf,
@@ -287,7 +284,7 @@ def test_bf16_mtp_loads_shared_slot_using_draft_policy(
         default_weight_loader=lambda param, weight: param.data.copy_(weight),
         fuse_shared_expert=partial(can_fuse, target_policy),
         is_rank0=lambda: True,
-        weights_iterator=safetensors_weights_iterator,
+        weights_iterator=impl.iterator.safetensors_weights_iterator,
     )
     assert loaded == {
         "model.layers.0.mlp.experts.w13_weight",
@@ -309,10 +306,17 @@ def test_bf16_mtp_loads_shared_slot_using_draft_policy(
 
 @pytest.mark.parametrize("tp", [2, 4])
 @pytest.mark.parametrize("mode", ["bf16", "fp8"])
-def test_preshuffle_preserves_final_parameter_markers_and_padding(tp, mode):
-    from aiter.ops.shuffle import shuffle_weight
+def test_preshuffle_preserves_final_parameter_markers_and_padding(
+    impl, monkeypatch, tp, mode
+):
+    def shuffle_weight(weight, *args, **kwargs):
+        # A non-identity CPU permutation checks ATOM's replacement/marker
+        # contract. The GPU suite validates AITER's actual shuffle layout.
+        return weight.view(torch.uint8).flip((-2,)).view(weight.dtype)
 
-    layer, method = _layer(mode, tp, 0)
+    monkeypatch.setattr(impl.shuffle, "shuffle_weight", shuffle_weight)
+    monkeypatch.setattr(impl.utils, "shuffle_weight", shuffle_weight)
+    layer, method = _layer(impl, mode, tp, 0)
     layer.w13_weight.data.view(torch.uint8).zero_()
     layer.w2_weight.data.view(torch.uint8).zero_()
     logical = 640 // tp
@@ -339,118 +343,3 @@ def test_preshuffle_preserves_final_parameter_markers_and_padding(tp, mode):
     torch.testing.assert_close(
         layer.w2_weight.view(torch.uint8), expected2.view(torch.uint8), rtol=0, atol=0
     )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-@pytest.mark.parametrize("tp", [2, 4])
-@pytest.mark.parametrize("mode", ["bf16", "fp8"])
-def test_gpu_padded_moe_matches_torch_reference(tp, mode):
-    """Real 513/topk11 shape, both quantization modes, eager and graph replay."""
-    from aiter import ActivationType
-    from aiter.fused_moe import fused_moe, torch_moe_stage1, torch_moe_stage2
-    from aiter.jit.utils.chip_info import get_gfx_runtime
-
-    from atom.model_ops.utils import normalize_e4m3fn_to_e4m3fnuz
-
-    if get_gfx_runtime() != "gfx942":
-        pytest.skip("gfx942 tuned Qwen MoE contract")
-    with torch.device("cuda"), torch.inference_mode():
-        torch.manual_seed(19)
-        layer, method = _layer(mode, tp, 0, experts=513, hidden=2560)
-        logical, physical = 640 // tp, layer.w2_weight.shape[-1]
-        # A deterministic selected subset keeps the reference small while
-        # retaining the actual kernel's expert count and shared id 512.
-        ids = torch.tensor(
-            [0, 3, 11, 49, 87, 131, 207, 311, 402, 511, 512], dtype=torch.int32
-        )
-        topk_ids = ids[None].expand(4, -1).contiguous()
-        topk_weights = torch.rand(4, 11, dtype=torch.float32)
-        topk_weights[:, :10] /= topk_weights[:, :10].sum(-1, keepdim=True)
-        hidden = torch.randn(4, 2560, dtype=torch.bfloat16) * 0.1
-        layer.w13_weight.data.view(torch.uint8).zero_()
-        layer.w2_weight.data.view(torch.uint8).zero_()
-        source_dtype = torch.float8_e4m3fn if mode == "fp8" else torch.bfloat16
-        for e in ids.tolist():
-            gate = (torch.randn(logical, 2560) * 0.02).to(source_dtype)
-            up = (torch.randn(logical, 2560) * 0.02).to(source_dtype)
-            down = (torch.randn(2560, logical) * 0.02).to(source_dtype)
-            layer._copy_quant_storage(layer.w13_weight.data[e, :logical], gate)
-            layer._copy_quant_storage(
-                layer.w13_weight.data[e, physical : physical + logical], up
-            )
-            layer._copy_quant_storage(layer.w2_weight.data[e, :, :logical], down)
-        qtype = QuantType.per_Token if mode == "fp8" else QuantType.No
-        raw13, raw2 = layer.w13_weight.data, layer.w2_weight.data
-        s13 = getattr(layer, "w13_weight_scale", None)
-        s2 = getattr(layer, "w2_weight_scale", None)
-        if mode == "fp8":
-            raw13, s13, _ = normalize_e4m3fn_to_e4m3fnuz(raw13.clone(), s13.clone())
-            raw2, s2, _ = normalize_e4m3fn_to_e4m3fnuz(raw2.clone(), s2.clone())
-        stage1 = torch_moe_stage1(
-            hidden,
-            raw13,
-            raw2,
-            topk_weights,
-            topk_ids,
-            dtype=torch.bfloat16,
-            activation=ActivationType.Silu,
-            quant_type=qtype,
-            a1_scale=torch.ones(1),
-            w1_scale=s13,
-        )
-        reference = torch_moe_stage2(
-            stage1.view(4, 11, -1),
-            raw13,
-            raw2,
-            topk_weights,
-            topk_ids,
-            dtype=torch.bfloat16,
-            quant_type=qtype,
-            a2_scale=torch.ones(1),
-            w2_scale=s2,
-        )
-        method.process_weights_after_loading(layer)
-
-        def run():
-            return fused_moe(
-                hidden,
-                layer.w13_weight,
-                layer.w2_weight,
-                topk_weights,
-                topk_ids,
-                activation=ActivationType.Silu,
-                quant_type=qtype,
-                w1_scale=getattr(layer, "w13_weight_scale", None),
-                w2_scale=getattr(layer, "w2_weight_scale", None),
-            )
-
-        actual = run()
-        torch.cuda.synchronize()
-        assert torch.isfinite(actual).all()
-        x, y = reference.float(), actual.float()
-        relative_l2 = (x - y).norm(dim=-1) / x.norm(dim=-1).clamp_min(1e-6)
-        logits_diff = 1 - 2 * (x * y).sum() / (x.square().sum() + y.square().sum())
-        assert relative_l2.max() < 0.2
-        assert logits_diff < 1e-3
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            replayed = run()
-        graph.replay()
-        torch.cuda.synchronize()
-        # BF16 route accumulation is atomic; graph scheduling can change its
-        # rounding near zero. Compare in token RMS units, as AITER's reference
-        # tests do, rather than applying a relative tolerance to cancellations.
-        rms = x.square().mean(-1, keepdim=True).sqrt().clamp_min(1e-6)
-        graph_y = replayed.float()
-        assert torch.isfinite(graph_y).all()
-        assert ((x - graph_y).norm(dim=-1) / x.norm(dim=-1).clamp_min(1e-6)).max() < 0.2
-        assert (
-            1 - 2 * (x * graph_y).sum() / (x.square().sum() + graph_y.square().sum())
-            < 1e-3
-        )
-        torch.testing.assert_close(
-            graph_y / rms, actual.float() / rms, rtol=0, atol=0.1
-        )
-        print(
-            f"{mode} TP{tp}: relative_l2={relative_l2.max().item():.6f}, logits_diff={logits_diff.item():.6g}, graph_rms_diff={((graph_y - y).abs() / rms).max().item():.6f}"
-        )

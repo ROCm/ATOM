@@ -173,6 +173,36 @@ def test_other_configurations_keep_previous_layout(
     assert not block.use_gfx942_tuned_moe
 
 
+@pytest.mark.parametrize("use_ep", [False, True])
+def test_dispatch_uses_actual_expert_parallel_layout(impl, setup, monkeypatch, use_ep):
+    """Isolate the final EP guard from the earlier padding policy check.
+
+    A recommended alignment alone must not override the constructed MoE's
+    parallel layout. Keeping that recommendation fixed makes dropping the
+    final `not self.experts.use_ep` check observable here.
+    """
+    _, config = setup
+    config.enable_expert_parallel = use_ep
+    _policy(impl, config, "fp8")
+    monkeypatch.setattr(impl.qwen, "moe_pad_align", lambda *a, **k: 64)
+    block = _block(impl, config)
+    assert block.experts.use_ep is use_ep
+    assert block.use_gfx942_tuned_moe is (not use_ep)
+    hidden = torch.zeros((1, 2560), dtype=torch.bfloat16)
+
+    # EP must check whether the legacy path can address the local experts;
+    # pure TP must bypass that check and dispatch directly to FusedMoE.
+    checks = []
+
+    def legacy_supported():
+        checks.append(True)
+        return False
+
+    monkeypatch.setattr(block, "_single_token_supported", legacy_supported)
+    torch.testing.assert_close(block(hidden, reduce_results=False), hidden + 1)
+    assert checks == ([True] if use_ep else [])
+
+
 @pytest.mark.parametrize("mode", ["fp8", "bf16"])
 def test_unfused_shared_expert_does_not_select_513_layout(impl, setup, mode):
     _, config = setup

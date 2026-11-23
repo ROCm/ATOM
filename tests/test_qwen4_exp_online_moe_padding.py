@@ -5,26 +5,31 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
-pytest.importorskip("aiter", exc_type=ImportError)
-
-from aiter import QuantType, dtypes
-
-from atom.config import QuantizationConfig
-from atom.model_ops import moe
-from atom.models import qwen4_exp
-from atom.quant_spec import LayerQuantConfig, should_stream_online_quant
+from aiter_stub import atom_without_aiter
 
 
-def _bf16_layer(monkeypatch, rank, streaming, *, excluded=False):
-    config = QuantizationConfig()
+@pytest.fixture(scope="module")
+def impl():
+    with atom_without_aiter() as load:
+        yield SimpleNamespace(
+            moe=load("atom.model_ops.moe"),
+            qwen=load("atom.models.qwen4_exp"),
+            config=load("atom.config"),
+        )
+
+
+def _bf16_layer(impl, monkeypatch, rank, streaming, *, excluded=False):
+    moe = impl.moe
+    config = impl.config.QuantizationConfig()
     config.online_quant = True
-    config.online_global_spec = LayerQuantConfig(
-        quant_dtype=dtypes.fp8, quant_type=QuantType.per_Token, quant_method="fp8"
+    config.online_global_spec = moe.LayerQuantConfig(
+        quant_dtype=moe.dtypes.fp8,
+        quant_type=moe.QuantType.per_Token,
+        quant_method="fp8",
     )
     config.online_exclude_layers = ["mtp.*"] if excluded else []
     prefix = "mtp.layers.0.mlp.experts" if excluded else "model.layers.0.mlp.experts"
-    config = qwen4_exp._Qwen4ExpQuantizationConfig(config)
+    config = impl.qwen._Qwen4ExpQuantizationConfig(config)
     source = config.get_layer_quant_config(prefix)
     monkeypatch.setenv("ATOM_ONLINE_QUANT_STREAMING", str(int(streaming)))
 
@@ -45,7 +50,7 @@ def _bf16_layer(monkeypatch, rank, streaming, *, excluded=False):
     # Exercise the allocator's handling of an explicit padding request even
     # when model-level policy excludes a source awaiting online conversion.
     layer.quant_method.pad_align = 64
-    layer._stream_online_quant = should_stream_online_quant(
+    layer._stream_online_quant = moe.should_stream_online_quant(
         config, prefix, source.quant_type, layer.params_dtype
     )
     layer.moe_quant_params = {
@@ -61,19 +66,20 @@ def _bf16_layer(monkeypatch, rank, streaming, *, excluded=False):
     return layer
 
 
-def _cpu_ptpc(weight):
+def _cpu_ptpc(weight, dtype):
     """Small CPU quantizer fixture; the conversion/loading code stays real."""
     rows = weight.reshape(-1, weight.shape[-1]).float()
-    scale = (
-        rows.abs().amax(-1, keepdim=True).clamp_min(1e-6) / torch.finfo(dtypes.fp8).max
-    )
-    return (rows / scale).to(dtypes.fp8), scale
+    scale = rows.abs().amax(-1, keepdim=True).clamp_min(1e-6) / torch.finfo(dtype).max
+    return (rows / scale).to(dtype), scale
 
 
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("rank", range(4))
-def test_tp4_bf16_to_online_ptpc_preserves_logical_shards(monkeypatch, rank, streaming):
-    layer = _bf16_layer(monkeypatch, rank, streaming)
+def test_tp4_bf16_to_online_ptpc_preserves_logical_shards(
+    impl, monkeypatch, rank, streaming
+):
+    moe = impl.moe
+    layer = _bf16_layer(impl, monkeypatch, rank, streaming)
     source_w13_shape = layer.w13_weight.shape
     source_w2_shape = layer.w2_weight.shape
     assert layer._stream_online_quant is streaming
@@ -124,9 +130,9 @@ def test_tp4_bf16_to_online_ptpc_preserves_logical_shards(monkeypatch, rank, str
     )
 
     def quantize(weight, *, online_quant_type, online_quant_dtype):
-        assert online_quant_type == QuantType.per_Token
-        assert online_quant_dtype == dtypes.fp8
-        return _cpu_ptpc(weight)
+        assert online_quant_type == moe.QuantType.per_Token
+        assert online_quant_dtype == moe.dtypes.fp8
+        return _cpu_ptpc(weight, online_quant_dtype)
 
     monkeypatch.setattr(moe, "quant_weight_online", quantize)
     layer._online_quant()
@@ -140,10 +146,10 @@ def test_tp4_bf16_to_online_ptpc_preserves_logical_shards(monkeypatch, rank, str
     assert layer._stream_online_quant is False
     assert gathered == ([] if streaming else [0, 1])
     for expert in range(2):
-        q_gate, s_gate = _cpu_ptpc(gate[expert, shard])
-        q_up, s_up = _cpu_ptpc(up[expert, shard])
+        q_gate, s_gate = _cpu_ptpc(gate[expert, shard], moe.dtypes.fp8)
+        q_up, s_up = _cpu_ptpc(up[expert, shard], moe.dtypes.fp8)
         q_down, s_down = _cpu_ptpc(
-            down[expert, :, shard] if streaming else down[expert]
+            down[expert, :, shard] if streaming else down[expert], moe.dtypes.fp8
         )
         if not streaming:
             q_down = q_down[:, shard]
@@ -171,8 +177,8 @@ def test_tp4_bf16_to_online_ptpc_preserves_logical_shards(monkeypatch, rank, str
 
 
 @pytest.mark.parametrize("streaming", [False, True])
-def test_online_excluded_bf16_mtp_keeps_runtime_padding(monkeypatch, streaming):
-    layer = _bf16_layer(monkeypatch, rank=0, streaming=streaming, excluded=True)
+def test_online_excluded_bf16_mtp_keeps_runtime_padding(impl, monkeypatch, streaming):
+    layer = _bf16_layer(impl, monkeypatch, rank=0, streaming=streaming, excluded=True)
     assert not layer._stream_online_quant
     assert not layer.w13_weight.is_meta
     assert layer.w13_weight.shape == (2, 384, 32)
@@ -182,4 +188,4 @@ def test_online_excluded_bf16_mtp_keeps_runtime_padding(monkeypatch, streaming):
     original = (layer.w13_weight, layer.w2_weight)
     layer._online_quant()
     assert layer.w13_weight is original[0] and layer.w2_weight is original[1]
-    assert isinstance(layer.quant_method, moe.UnquantizedFusedMoEMethod)
+    assert isinstance(layer.quant_method, impl.moe.UnquantizedFusedMoEMethod)

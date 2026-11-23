@@ -1,6 +1,7 @@
-"""Qwen MoE serving dispatch, including SGLang's padded graph output boundary.
+"""Qwen MoE numerics and serving dispatch on one shared GPU fixture.
 
 This exercises one rank's experts, without launching a model or TP collectives.
+The direct AITER call and ATOM forward use the same weights/Torch reference.
 SGLang currently leaves Context.scheduled_tokens_gpu unset: padded MoE rows
 may be computed, but must not affect live rows or escape the replay output slice.
 """
@@ -131,6 +132,7 @@ def _make_block(monkeypatch, mode, tp, hidden):
 @pytest.mark.parametrize("tp", [2, 4])
 @pytest.mark.parametrize("mode", ["fp8", "bf16"])
 def test_gpu_sglang_moe_forward_and_padded_graph(monkeypatch, mode, tp):
+    from aiter.fused_moe import fused_moe
     from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -208,18 +210,23 @@ def test_gpu_sglang_moe_forward_and_padded_graph(monkeypatch, mode, tp):
             assert fc.get_forward_context().context.scheduled_tokens_gpu is None
             fc.get_forward_context().context.is_draft = mode == "bf16"
 
-        def reference(x):
+        def routing(x):
             logits = torch.nn.functional.linear(x.float(), block.gate.weight.float())
             probs = torch.softmax(logits[:, :512], -1)
             weights, ids = probs.topk(10, dim=-1)
             weights /= weights.sum(-1, keepdim=True)
+            return (
+                torch.cat((weights, logits[:, 512:].sigmoid()), dim=-1).contiguous(),
+                torch.cat((ids, torch.full_like(ids[:, :1], 512)), dim=-1)
+                .to(torch.int32)
+                .contiguous(),
+            )
+
+        def reference(x):
+            weights, ids = routing(x)
             expected = torch.zeros(x.shape, dtype=torch.float32)
             for expert, (gate, up, down) in reference_weights.items():
-                score = (
-                    logits[:, 512].sigmoid()
-                    if expert == 512
-                    else (weights * (ids == expert)).sum(-1)
-                )
+                score = (weights * (ids == expert)).sum(-1)
                 intermediate = torch.nn.functional.silu(x.float() @ gate.T) * (
                     x.float() @ up.T
                 )
@@ -235,6 +242,21 @@ def test_gpu_sglang_moe_forward_and_padded_graph(monkeypatch, mode, tp):
 
         hidden = torch.randn((4, 2560), dtype=torch.bfloat16) * 0.1
         hidden[:, 0] = 1
+        # The former standalone AITER test now shares this fixture/reference.
+        # Its explicit top-k call remains covered alongside ATOM's real router.
+        weights, ids = routing(hidden)
+        direct = fused_moe(
+            hidden,
+            experts.w13_weight,
+            experts.w2_weight,
+            weights,
+            ids,
+            activation=ActivationType.Silu,
+            quant_type=QuantType.per_Token if mode == "fp8" else QuantType.No,
+            w1_scale=getattr(experts, "w13_weight_scale", None),
+            w2_scale=getattr(experts, "w2_weight_scale", None),
+        )
+        check(direct, reference(hidden))
         context(1)
         block(hidden[:1], reduce_results=False)  # JIT/warmup outside profiler/capture.
         with torch.profiler.profile(
