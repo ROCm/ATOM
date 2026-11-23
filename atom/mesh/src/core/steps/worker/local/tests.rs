@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (c) 2026 ATOM Project Contributors
 //! gRPC workers through the local worker registration workflow and its tokenizer job:
 //! an ATOM worker's detection, labels, version refusal, chat template and DP ranks; vLLM's.
 
