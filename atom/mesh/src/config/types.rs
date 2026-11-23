@@ -18,6 +18,17 @@ pub enum BackendType {
     Atom,
 }
 
+impl BackendType {
+    /// The backend's name as `--backend` and the config spell it.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Sglang => "sglang",
+            Self::Vllm => "vllm",
+            Self::Atom => "atom",
+        }
+    }
+}
+
 /// Strategy used by the ATOM PD router to map a selected prefill DP rank to
 /// the selected decode DP rank.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -60,6 +71,8 @@ pub struct RouterConfig {
     pub ext_proc: crate::ext_proc::ExtProcConfig,
     #[serde(default)]
     pub prepare_pool: PreparePoolConfig,
+    #[serde(default)]
+    pub rl: crate::rl::RlConfig,
     pub mode: RoutingMode,
     #[serde(default)]
     pub backend: BackendType,
@@ -444,6 +457,7 @@ impl Default for RouterConfig {
             #[cfg(feature = "ext-proc")]
             ext_proc: Default::default(),
             prepare_pool: PreparePoolConfig::default(),
+            rl: Default::default(),
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },
