@@ -829,9 +829,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
         # online conversion. Check the layer policy even with streaming off;
         # excluded BF16 layers (including MTP) still need runtime padding.
         pad_align = self.pad_align
-        quant_config = getattr(layer, "quant_config", None)
-        if quant_config is not None and will_online_requant(
-            quant_config, layer.prefix, QuantType.No, params_dtype
+        if will_online_requant(
+            layer.quant_config, layer.prefix, QuantType.No, params_dtype
         ):
             pad_align = 1
 

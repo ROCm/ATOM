@@ -78,6 +78,7 @@ def _make_block(monkeypatch, mode, tp, hidden):
         layer.expert_map = layer.expert_mask = None
         layer.intermediate_size_per_partition = 640 // tp
         layer.prefix = layer.layer_name = kwargs["prefix"]
+        layer.quant_config = kwargs["quant_config"]
         layer.top_k = kwargs["top_k"]
         layer.renormalize = kwargs["renormalize"]
         layer.use_grouped_topk = False

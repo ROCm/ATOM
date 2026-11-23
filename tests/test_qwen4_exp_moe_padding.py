@@ -25,6 +25,8 @@ def _layer(mode, tp, rank, experts=4, hidden=32):
     # The actual inherited loaders and method allocators are exercised below.
     layer = object.__new__(FusedMoE)
     torch.nn.Module.__init__(layer)
+    layer.prefix = "model.layers.0.mlp.experts"
+    layer.quant_config = None
     layer.moe_parallel_config = SimpleNamespace(tp_size=tp, tp_rank=rank)
     layer.expert_layout = SimpleNamespace(num_routed=experts - 1)
     layer.expert_map = None
