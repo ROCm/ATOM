@@ -135,23 +135,18 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                     .map_err(|e| format!("Failed to load tokenizer: {}", e))?;
                     let base_tokenizer =
                         with_fastokens(base_tokenizer, &name, &source, &fastokens).await?;
-                    // The router renders a model's chats under its controls
-                    // with every kwarg ATOM's encoder reads, so no default of
-                    // llm-tokenizer's encoder is left to differ.
-                    match checkpoint_chat_controls(&name, &source).await? {
-                        Some(controls) => {
-                            chat_controls.write().insert(id.clone(), controls);
-                        }
-                        None => {
-                            probe_chat_render(
-                                &chats_without_template,
-                                &id,
-                                &name,
-                                &source,
-                                chat_template.as_deref(),
-                            )
-                            .await;
-                        }
+                    let controls = checkpoint_chat_controls(&name, &source).await?;
+                    probe_chat_render(
+                        &chats_without_template,
+                        &id,
+                        &name,
+                        &source,
+                        chat_template.as_deref(),
+                        controls.is_some(),
+                    )
+                    .await;
+                    if let Some(controls) = controls {
+                        chat_controls.write().insert(id.clone(), controls);
                     }
                     // fastokens has its own segment cache
                     // (`--fastokens-segment-cache-mb`, 1 GiB by default).
@@ -249,16 +244,23 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
 /// Record `id` in `chats_without_template`, and warn, when llm-tokenizer renders
 /// `source`'s chats without the Jinja template. It has no accessor for that, so a
 /// copy is probed; mirroring its `config.json` check would also mean mirroring
-/// how it resolves sources.
+/// how it resolves sources. Chats the router renders under the model's
+/// `controlled` reasoning controls are not recorded, as the controls give every
+/// kwarg ATOM's encoder reads and no default of llm-tokenizer's encoder is left
+/// to differ; they are probed only to warn that `--chat-template` does not apply.
 async fn probe_chat_render(
     chats_without_template: &RwLock<HashSet<String>>,
     id: &str,
     name: &str,
     source: &str,
     chat_template: Option<&str>,
+    controlled: bool,
 ) {
     const UNPROBED: &str = "Cannot probe whether llm-tokenizer renders these chats without the \
                             Jinja template; HTTP routing tokenizes them as it renders them";
+    if controlled && chat_template.is_none() {
+        return;
+    }
     let mut copy = match factory::create_tokenizer_async_with_chat_template(source, None).await {
         Ok(copy) => copy,
         Err(error) => {
@@ -271,6 +273,14 @@ async fn probe_chat_render(
         return;
     };
     if !renders_without_template(copy) {
+        return;
+    }
+    if controlled {
+        warn!(
+            tokenizer = name,
+            "llm-tokenizer renders these chats with a built-in encoder, not the Jinja template, \
+             so --chat-template does not apply"
+        );
         return;
     }
     chats_without_template.write().insert(id.to_string());
@@ -469,7 +479,8 @@ mod tests {
     /// A tokenizer registers with the reasoning controls ATOM keeps for the
     /// `model_type` in the `config.json` beside it, from its directory or its
     /// `tokenizer.json`, and removing it drops them. HTTP routing tokenizes
-    /// its chats, which llm-tokenizer renders with its V4.1 encoder.
+    /// its chats, which llm-tokenizer renders with its V4.1 encoder, also under
+    /// a `--chat-template`, which that encoder ignores.
     #[tokio::test]
     async fn test_registration_finds_the_checkpoint_chat_controls() {
         let checkpoint = |model_type: &str| {
@@ -484,23 +495,26 @@ mod tests {
         };
         let v41 = checkpoint("deepseek_v41");
         let v41_file = v41.path().join("tokenizer.json");
+        let template = v41.path().join("template.jinja");
+        std::fs::write(&template, "{{ messages }}").unwrap();
         let llama = checkpoint("llama");
         let bare = tempfile::TempDir::new().unwrap();
         std::fs::copy(hf_tokenizer_path(), bare.path().join("tokenizer.json")).unwrap();
         let context = app_context();
         let mut ids = Vec::new();
-        for (source, controls) in [
-            (v41.path(), Some(ChatControls::DeepseekV41)),
-            (v41_file.as_path(), Some(ChatControls::DeepseekV41)),
-            (llama.path(), None),
-            (bare.path(), None),
+        for (source, chat_template, controls) in [
+            (v41.path(), None, Some(ChatControls::DeepseekV41)),
+            (v41_file.as_path(), None, Some(ChatControls::DeepseekV41)),
+            (v41.path(), Some(&template), Some(ChatControls::DeepseekV41)),
+            (llama.path(), None, None),
+            (bare.path(), None, None),
         ] {
             let id = TokenizerRegistry::generate_id();
             let config = TokenizerConfigRequest {
                 id: id.clone(),
                 name: id.clone(),
                 source: source.to_str().unwrap().to_string(),
-                chat_template_path: None,
+                chat_template_path: chat_template.map(|path| path.to_str().unwrap().to_string()),
                 cache_config: None,
                 fail_on_duplicate: false,
             };
