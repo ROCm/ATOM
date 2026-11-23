@@ -31,8 +31,9 @@ pub(crate) mod tool_constraints;
 #[cfg(test)]
 mod tests;
 
-use chat_template::process_chat_messages;
+use chat_template::{process_chat_messages, ProcessedMessages};
 use generation_payload::{GenerationPayload, LogprobConfig, SamplingParams, StopConfig};
+use inference::SentControls;
 use response_context::{ProtocolRequest, ResponseContext};
 use stop_decoder_builder::create_stop_decoder;
 use tool_constraints::{filter_chat_request_by_tool_choice, generate_tool_constraints};
@@ -64,8 +65,24 @@ pub fn prepare_chat(
 
     let body_ref = filter_chat_request_by_tool_choice(&req);
 
-    let processed = process_chat_messages(&body_ref, &*tokenizer)
-        .map_err(|e| error::bad_request("process_messages_failed", e))?;
+    // The engine generates from these tokens, so a model ATOM renders under
+    // reasoning controls of its own renders under them here too; the request
+    // as typed keeps no top-level `thinking` for them.
+    let registry = &components.tokenizer_registry;
+    let controls = registry
+        .get_by_name(model_id_str)
+        .or_else(|| registry.get_by_id(model_id_str))
+        .and_then(|entry| components.chat_controls.read().get(&entry.id).copied());
+    let processed = match controls {
+        Some(controls) => ProcessedMessages {
+            text: controls
+                .render(&body_ref, &SentControls::default(), &*tokenizer)
+                .map_err(|e| error::create_error(e.status, e.code, e.message))?,
+            stop_sequences: body_ref.stop.clone(),
+        },
+        None => process_chat_messages(&body_ref, &*tokenizer)
+            .map_err(|e| error::bad_request("process_messages_failed", e))?,
+    };
 
     let encoding = tokenizer
         .encode(&processed.text, false)
