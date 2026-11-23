@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -55,6 +55,9 @@ pub struct AppContext {
     /// their Jinja template, found as each registers. HTTP routing does not
     /// tokenize those chats.
     pub chats_without_template: Arc<RwLock<HashSet<String>>>,
+    /// Registry ids of the tokenizers loaded with a worker's inline chat template
+    /// (an ATOM worker's GetModelInfo), with that template.
+    pub tokenizer_inline_templates: Arc<RwLock<HashMap<String, String>>>,
     /// `router_config`'s tokenization byte limits.
     pub(crate) tokenize_limits: TokenizeLimits,
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
@@ -108,6 +111,12 @@ pub struct AppContextBuilder {
 }
 
 impl AppContext {
+    /// Drops what registration recorded about the tokenizer with registry id `id`.
+    pub fn forget_tokenizer(&self, id: &str) {
+        self.chats_without_template.write().remove(id);
+        self.tokenizer_inline_templates.write().remove(id);
+    }
+
     pub fn builder() -> AppContextBuilder {
         AppContextBuilder::new()
     }
@@ -298,6 +307,7 @@ impl AppContextBuilder {
                 .tokenizer_registry
                 .ok_or(AppContextBuildError("tokenizer_registry"))?,
             chats_without_template: Default::default(),
+            tokenizer_inline_templates: Default::default(),
             tokenize_limits,
             reasoning_parser_factory: self.reasoning_parser_factory,
             tool_parser_factory: self.tool_parser_factory,

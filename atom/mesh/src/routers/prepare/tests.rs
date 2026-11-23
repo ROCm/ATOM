@@ -1100,6 +1100,7 @@ mod f_response_context {
             configured_reasoning_parser: None,
             prompt_opener: None,
             reads_as_atom: false,
+            usage_on_finish: false,
         }
     }
 
@@ -1149,6 +1150,7 @@ mod f_response_context {
             configured_reasoning_parser: None,
             prompt_opener: None,
             reads_as_atom: false,
+            usage_on_finish: false,
         };
         assert_eq!(ctx.headers.as_ref().unwrap().get("x-trace").unwrap(), "abc");
     }
@@ -1173,6 +1175,7 @@ mod f_response_context {
             configured_reasoning_parser: None,
             prompt_opener: None,
             reads_as_atom: false,
+            usage_on_finish: false,
         };
         assert!(ctx.processed_messages.is_none());
     }
@@ -1630,6 +1633,31 @@ mod i_atom_structured_output {
         assert_eq!(fields, [None, None, None, None]);
         assert_eq!(carried.chat_template_kwargs_json, "{}");
         assert!(!carried.prompt_opens_reasoning);
+    }
+
+    /// DeepSeek-R1's template closes a <think> it never opens: its reply starts in
+    /// reasoning, unless the render switched reasoning off.
+    #[test]
+    fn an_atom_chat_reads_an_implicit_opener_unless_reasoning_is_switched_off() {
+        let labels = [
+            ("reasoning_open_markers", r#"["<think>"]"#),
+            ("implicit_reasoning_opener", "<think>"),
+            ("reasoning_toggle_json", r#"["thinking", false, true]"#),
+        ];
+        let chat = |kwargs: Value| {
+            json!({"model": "m", "messages": [{"role": "user", "content": "hi"}],
+                   "chat_template_kwargs": kwargs})
+        };
+        for (kwargs, opener) in [
+            (json!({}), Some("<think>")),
+            (json!({"thinking": true}), Some("<think>")),
+            (json!({"thinking": false}), None),
+        ] {
+            let (payload, ctx) = prepared(chat(kwargs.clone()), RuntimeType::Atom, &labels);
+            assert_eq!(ctx.prompt_opener.as_deref(), opener, "{kwargs}");
+            // The prompt itself opens none; ATOM adds the implicit start itself.
+            assert!(!payload.structured_output.unwrap().prompt_opens_reasoning);
+        }
     }
 
     #[test]

@@ -45,19 +45,39 @@ pub(crate) fn default_template_kwargs(
         .transpose()
 }
 
-/// The first of `workers` that is ATOM's and reports no chat template (Kimi-K3's
-/// encoder), when neither it nor the router (`configured`) has one set.
-pub(crate) fn atom_worker_without_template(
+/// Why atomesh cannot render chats as `workers`' ATOM worker does, if it cannot: the
+/// model's tokenizer renders them with a built-in encoder that ignores the chat template
+/// (`built_in_encoder`: DeepSeek V3.2 and V4), or the worker reports no chat template
+/// (Kimi-K3's encoder) and the router sets none (`configured`).
+pub(crate) fn atom_chat_render_gap(
     workers: &[Arc<dyn Worker>],
     configured: bool,
-) -> Option<&Arc<dyn Worker>> {
+    built_in_encoder: bool,
+) -> Option<String> {
+    let mut atom = workers
+        .iter()
+        .filter(|worker| worker.metadata().runtime_type == RuntimeType::Atom);
+    if built_in_encoder {
+        return atom.next().map(|worker| {
+            format!(
+                "atomesh's tokenizer renders them with a built-in encoder that ignores the \
+                 chat template, so their prompts would differ from those its ATOM worker {} \
+                 renders",
+                worker.url()
+            )
+        });
+    }
     if configured {
         return None;
     }
-    workers.iter().find(|worker| {
-        worker.metadata().runtime_type == RuntimeType::Atom
-            && worker.chat_template().is_none()
-            && !worker.metadata().labels.contains_key("chat_template")
+    atom.find(|worker| {
+        worker.chat_template().is_none() && !worker.metadata().labels.contains_key("chat_template")
+    })
+    .map(|worker| {
+        format!(
+            "its ATOM worker {} renders them without a chat template, which atomesh needs",
+            worker.url()
+        )
     })
 }
 

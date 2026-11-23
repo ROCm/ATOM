@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Single-Pass mHC math; incoming pre-mix belongs to the previous sublayer."""
 
 from dataclasses import dataclass
@@ -80,6 +82,14 @@ def collapse_streams(residual, pre_mix):
         enable_fp_fusion=False,
     )
     return out
+
+
+def initial_pre_mix(rows_shape, hc_mult: int, device) -> torch.Tensor:
+    """The embedding's pre gates, ``rows_shape + (hc_mult,)`` fp32: 1 on the
+    first stream, 0 on the others."""
+    pre_mix = torch.zeros((*rows_shape, hc_mult), dtype=torch.float32, device=device)
+    pre_mix[..., 0] = 1
+    return pre_mix
 
 
 # Hidden columns a program copies when `from_embeddings` builds the state.
@@ -195,6 +205,8 @@ class SinglePassHCState:
 
     @classmethod
     def from_embeddings(cls, hidden: torch.Tensor, hc_mult: int):
+        """Every stream the embedding, the first stream's pre gate 1: in one
+        launch (``embed_state``) where it serves, else in torch."""
         fused = embed_state(hidden, hc_mult)
         if fused is not None:
             return cls(*fused)
@@ -203,11 +215,7 @@ class SinglePassHCState:
             .expand(*hidden.shape[:-1], hc_mult, hidden.shape[-1])
             .contiguous()
         )
-        pre_mix = torch.zeros(
-            (*hidden.shape[:-1], hc_mult), dtype=torch.float32, device=hidden.device
-        )
-        pre_mix[..., 0] = 1
-        return cls(residual, pre_mix)
+        return cls(residual, initial_pre_mix(hidden.shape[:-1], hc_mult, hidden.device))
 
     def settle(self):
         """This state with any owed post applied, so `residual` is current."""

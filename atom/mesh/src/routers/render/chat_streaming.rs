@@ -31,7 +31,7 @@ use crate::{
         },
         token_handle::{
             engine_error::EngineError,
-            token_chunk::{FinishReason, MatchedStop, TokenChunk},
+            token_chunk::{FinishReason, MatchedStop, TokenChunk, TokenLogprobs},
             token_handle::TokenHandle,
         },
     },
@@ -142,6 +142,12 @@ async fn run_chat_stream(
     let mut completion_tokens: u32 = 0;
     let mut atom_usage: Option<AtomUsage> = None;
     let mut has_tool_call = false;
+    let include_usage = stream_options
+        .as_ref()
+        .is_some_and(|opts| opts.include_usage.unwrap_or(false));
+    // As ATOM's HTTP chat_finish_frames: on the finish chunk, or a usage-only chunk after it.
+    let usage_on_finish = ctx.usage_on_finish;
+    let null_usage = usage_on_finish && include_usage;
 
     let mut stop_decoder = ctx.stop_decoder;
 
@@ -162,10 +168,11 @@ async fn run_chat_stream(
         // A Complete's ids past the partials' are streamed first, as one more partial.
         let chunk = match unstreamed(&chunk, consumed) {
             Some(rest) => {
+                let logprobs = unstreamed_logprobs(&chunk, consumed);
                 held = Some(chunk);
                 TokenChunk::Partial {
                     token_ids: rest,
-                    logprobs: None,
+                    logprobs,
                 }
             }
             None => chunk,
@@ -180,7 +187,7 @@ async fn run_chat_stream(
                 .add_choice_content(INDEX, "assistant", "")
                 .maybe_system_fingerprint(system_fingerprint.clone())
                 .build();
-            format_sse_chunk_into(&mut sse_buffer, &first_chunk);
+            format_sse_chunk_into(&mut sse_buffer, &first_chunk, null_usage);
             send_bytes(tx, &sse_buffer, "first chunk")?;
             is_first = false;
         }
@@ -205,7 +212,7 @@ async fn run_chat_stream(
                         .add_choice_role(INDEX, "assistant")
                         .maybe_system_fingerprint(system_fingerprint.clone())
                         .build();
-                    format_sse_chunk_into(&mut sse_buffer, &first_chunk);
+                    format_sse_chunk_into(&mut sse_buffer, &first_chunk, null_usage);
                     send_bytes(tx, &sse_buffer, "first chunk")?;
                     is_first = false;
                 }
@@ -226,7 +233,7 @@ async fn run_chat_stream(
                     )
                     .await;
                     if let Some(c) = reasoning_chunk {
-                        format_sse_chunk_into(&mut sse_buffer, &c);
+                        format_sse_chunk_into(&mut sse_buffer, &c, null_usage);
                         send_bytes(tx, &sse_buffer, "reasoning chunk")?;
                     }
                     delta = normal_text;
@@ -272,7 +279,7 @@ async fn run_chat_stream(
                     };
 
                     for c in tool_chunks {
-                        format_sse_chunk_into(&mut sse_buffer, &c);
+                        format_sse_chunk_into(&mut sse_buffer, &c, null_usage);
                         send_bytes(tx, &sse_buffer, "tool call chunk")?;
                     }
                     continue;
@@ -287,7 +294,7 @@ async fn run_chat_stream(
                         .add_choice_content_with_logprobs(INDEX, "assistant", delta, chat_logprobs)
                         .maybe_system_fingerprint(system_fingerprint.clone())
                         .build();
-                    format_sse_chunk_into(&mut sse_buffer, &content_chunk);
+                    format_sse_chunk_into(&mut sse_buffer, &content_chunk, null_usage);
                     send_bytes(tx, &sse_buffer, "content chunk")?;
                 }
             }
@@ -305,7 +312,7 @@ async fn run_chat_stream(
                             .add_choice_content(INDEX, "assistant", text)
                             .maybe_system_fingerprint(system_fingerprint.clone())
                             .build();
-                        format_sse_chunk_into(&mut sse_buffer, &chunk);
+                        format_sse_chunk_into(&mut sse_buffer, &chunk, null_usage);
                         send_bytes(tx, &sse_buffer, "flushed content")?;
                     }
                 }
@@ -347,14 +354,25 @@ async fn run_chat_stream(
                     .add_choice_tool_call_delta(INDEX, delta)
                     .maybe_system_fingerprint(system_fingerprint.clone())
                     .build();
-                let s = serde_json::to_string(&chunk)
-                    .map_err(|e| format!("Failed to serialize tool chunk: {}", e))?;
-                tx.send(Ok(Bytes::from(format!("data: {}\n\n", s))))
-                    .map_err(|_| "send unstreamed".to_string())?;
+                format_sse_chunk_into(&mut sse_buffer, &chunk, null_usage);
+                send_bytes(tx, &sse_buffer, "unstreamed tool args")?;
             }
         }
     }
 
+    let usage = Usage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens: prompt_tokens + completion_tokens,
+        completion_tokens_details: None,
+    };
+    // The chunk that carries the usage, with ATOM's fields (the cached tokens) for ATOM's.
+    let with_usage = |chunk: &ChatCompletionStreamResponse| match &atom_usage {
+        None => serde_json::to_string(chunk),
+        Some(atom) => atom
+            .extend_response(chunk, atom_usage::CHAT_STREAM)
+            .map(|v| v.to_string()),
+    };
     if let Some(fr) = finish_reason_str {
         let final_fr = if has_tool_call && fr == "stop" {
             "tool_calls".to_string()
@@ -365,35 +383,24 @@ async fn run_chat_stream(
             .created(created)
             .add_choice_finish_reason(INDEX, final_fr, matched_stop_value)
             .maybe_system_fingerprint(system_fingerprint.clone())
+            .maybe_usage(usage_on_finish.then(|| usage.clone()))
             .build();
-        let s = serde_json::to_string(&chunk)
-            .map_err(|e| format!("Failed to serialize finish chunk: {}", e))?;
+        let s =
+            with_usage(&chunk).map_err(|e| format!("Failed to serialize finish chunk: {}", e))?;
         tx.send(Ok(Bytes::from(format!("data: {}\n\n", s))))
             .map_err(|_| "send finish".to_string())?;
     }
 
-    // ATOM's HTTP chat ends every stream with its usage chunk (`chat_finish_frames`).
-    let include_usage = stream_options
-        .as_ref()
-        .is_some_and(|opts| opts.include_usage.unwrap_or(false));
-    if include_usage || atom_usage.is_some() {
+    // ATOM's HTTP chat ends every stream with its usage chunk unless the finish chunk
+    // carries it (`chat_finish_frames`); SGLang's and vLLM's only under include_usage.
+    if !usage_on_finish && (include_usage || atom_usage.is_some()) {
         let usage_chunk = ChatCompletionStreamResponse::builder(request_id, model)
             .created(created)
-            .usage(Usage {
-                prompt_tokens,
-                completion_tokens,
-                total_tokens: prompt_tokens + completion_tokens,
-                completion_tokens_details: None,
-            })
+            .usage(usage)
             .maybe_system_fingerprint(system_fingerprint.clone())
             .build();
-        let s = match &atom_usage {
-            None => serde_json::to_string(&usage_chunk),
-            Some(atom) => atom
-                .extend_response(&usage_chunk, atom_usage::CHAT_STREAM)
-                .map(|v| v.to_string()),
-        }
-        .map_err(|e| format!("Failed to serialize usage chunk: {}", e))?;
+        let s = with_usage(&usage_chunk)
+            .map_err(|e| format!("Failed to serialize usage chunk: {}", e))?;
         tx.send(Ok(Bytes::from(format!("data: {}\n\n", s))))
             .map_err(|_| "send usage".to_string())?;
     }
@@ -423,6 +430,20 @@ pub(super) fn unstreamed(chunk: &TokenChunk, consumed: usize) -> Option<Vec<u32>
             .filter(|rest| !rest.is_empty())
             .map(<[u32]>::to_vec),
         TokenChunk::Partial { .. } => None,
+    }
+}
+
+/// The logprobs of those ids, where the Complete's cover every id it carries.
+fn unstreamed_logprobs(chunk: &TokenChunk, consumed: usize) -> Option<TokenLogprobs> {
+    match chunk {
+        TokenChunk::Complete {
+            token_ids,
+            logprobs: Some(logprobs),
+            ..
+        } if logprobs.items.len() == token_ids.len() => Some(TokenLogprobs {
+            items: logprobs.items.get(consumed..)?.to_vec(),
+        }),
+        _ => None,
     }
 }
 
@@ -638,10 +659,23 @@ async fn process_tool_calls_stream(
 }
 
 #[inline]
-fn format_sse_chunk_into(buffer: &mut Vec<u8>, chunk: &ChatCompletionStreamResponse) {
+fn format_sse_chunk_into(
+    buffer: &mut Vec<u8>,
+    chunk: &ChatCompletionStreamResponse,
+    null_usage: bool,
+) {
     buffer.clear();
     buffer.extend_from_slice(b"data: ");
-    if let Err(e) = serde_json::to_writer(&mut *buffer, chunk) {
+    let written = if null_usage && chunk.usage.is_none() {
+        // ATOM's `usage: null` on each chunk before the one carrying the usage.
+        serde_json::to_value(chunk).and_then(|mut value| {
+            value["usage"] = Value::Null;
+            serde_json::to_writer(&mut *buffer, &value)
+        })
+    } else {
+        serde_json::to_writer(&mut *buffer, chunk)
+    };
+    if let Err(e) = written {
         error!("Failed to serialize SSE chunk: {}", e);
         buffer.clear();
         buffer.extend_from_slice(b"data: ");

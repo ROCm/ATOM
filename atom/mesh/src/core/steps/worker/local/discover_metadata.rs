@@ -357,7 +357,10 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
                 Ok((labels, None))
             }
             ConnectionMode::Grpc { .. } => {
-                let runtime_type = config.runtime.as_deref();
+                let runtime_type = config
+                    .runtime
+                    .as_deref()
+                    .or(context.data.detected_runtime_type.as_deref());
                 fetch_grpc_metadata(&config.url, runtime_type)
                     .await
                     .map(|(labels, runtime)| (labels, Some(runtime)))
