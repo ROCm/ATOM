@@ -37,6 +37,7 @@ SWITCHES = (
     "ATOM_EPLB_REF_PLACEMENT",
     "ATOM_EPLB_FIRST_REBALANCE_STEPS",
     "ATOM_EPLB_MAX_REBALANCES",
+    "ATOM_EPLB_MIN_PICKS",
     "ATOM_EXPERT_PLACEMENT",
 )
 LAYERS, EXPERTS, RANKS, TOP_K = 3, 16, 4, 3
@@ -843,6 +844,103 @@ def test_first_rebalance_steps(monkeypatch):
     assert steps_before_first(_manager(interval=40, window=4)) == 3
 
 
+def _steps_taken(monkeypatch, manager, flags):
+    """How often the schedule advances over forwards of the given dummy flags,
+    each a prefill-bearing step of the group."""
+    taken = []
+    monkeypatch.setattr(manager, "_gen", iter(lambda: taken.append(1), object()))
+    manager._dp_is_migration_group = True
+    for dummy in flags:
+        manager.on_forward_pass_end(True, True, is_dummy_run=dummy)
+    return len(taken)
+
+
+def test_dummy_forwards_are_not_rebalance_steps(monkeypatch):
+    flags = [True] * 5 + [False, True, False]
+    swap, _, _ = _bound_manager(monkeypatch, policy="swap")
+    assert _steps_taken(monkeypatch, swap, flags) == 2
+    permute, _, _ = _bound_manager(
+        monkeypatch, policy="naive", ATOM_EPLB_GATE_PERMUTE=1
+    )
+    assert _steps_taken(monkeypatch, permute, flags) == 2
+    # the default EPLB keeps counting every prefill-bearing forward
+    monkeypatch.delenv("ATOM_EPLB_GATE_PERMUTE")
+    default, _, _ = _bound_manager(monkeypatch, policy="naive")
+    assert _steps_taken(monkeypatch, default, flags) == len(flags)
+
+
+def test_forward_monitor_tells_the_schedule_a_dummy_forward(monkeypatch):
+    manager, _, _ = _bound_manager(monkeypatch, policy="swap")
+    seen = []
+    monkeypatch.setattr(
+        manager, "on_forward_pass_end", lambda *a, **kw: seen.append((a, kw))
+    )
+    monkeypatch.setattr(eplb, "_MANAGER", manager)
+    forward = eplb.with_eplb_forward_monitor(lambda self, batch: None)
+    runner = SimpleNamespace(_eplb_any_rank_has_prefill=True)
+    warmup = SimpleNamespace(
+        total_tokens_num_prefill=9, total_tokens_num_decode=0, is_dummy_run=True
+    )
+    forward(runner, warmup)
+    forward(runner, PREFILL)
+    assert seen == [
+        ((True, True), {"is_dummy_run": True}),
+        ((True, True), {"is_dummy_run": False}),
+    ]
+
+
+def test_rebalance_with_too_little_load_is_skipped_and_not_counted(monkeypatch, caplog):
+    monkeypatch.setenv("ATOM_EPLB_MAX_REBALANCES", "1")
+    manager, gates, _ = _bound_manager(
+        monkeypatch,
+        ATOM_EPLB_GATE_PERMUTE=1,
+        ATOM_EPLB_SWAP_EPS=0,
+        ATOM_EPLB_MIN_PICKS=1000,
+    )
+    assert manager.max_rebalances == 1
+    gpr = manager.gate_permute
+    before = {i: g.weight.data.clone() for i, g in gates.items()}
+    switched = []
+    monkeypatch.setattr(
+        eplb, "migrate_experts_chunk", lambda **kw: {kw["layer_ids"][0]: []}
+    )
+    monkeypatch.setattr(
+        eplb,
+        "commit_experts_chunk",
+        lambda **kw: switched.append(kw["layer_ids"][0])
+        or kw["live_meta"].update(kw["new_meta"], kw["layer_ids"]),
+    )
+    # 999 picks, prefill and decode together: one short
+    gpr.pf_total[0, :3] = torch.tensor([600, 300, 90])
+    gpr.dec_load[2, 5] = 9
+    with caplog.at_level(logging.INFO, logger="atom"):
+        assert _drain(manager._rebalance()) == 0
+    assert manager.rebalance_count == 0 and not manager.rebalancing_stopped
+    assert not manager._max_rebalances_reached()
+    assert switched == []
+    assert all(torch.equal(g.weight.data, before[i]) for i, g in gates.items())
+    (line,) = [r.getMessage() for r in caplog.records if "skipped" in r.getMessage()]
+    assert line.startswith(gp.TAG) and "999 picks < ATOM_EPLB_MIN_PICKS=1000" in line
+    # one more pick and the rebalance runs, and is the one MAX_REBALANCES allows
+    gpr.dec_load[2, 5] = 10
+    _drain(manager._rebalance())
+    assert manager.rebalance_count == 1 and switched
+    assert manager._max_rebalances_reached()
+
+
+def test_min_picks_does_not_touch_the_default_policy(monkeypatch):
+    manager, _, _ = _bound_manager(
+        monkeypatch, policy="naive", ATOM_EPLB_MIN_PICKS=10**9
+    )
+    planned = []
+    monkeypatch.setattr(
+        eplb, "rebalance_experts", lambda *a, **kw: planned.append(1) or 1 / 0
+    )
+    with pytest.raises(ZeroDivisionError):
+        _drain(manager._execute_rebalance())
+    assert planned == [1] and manager.rebalance_count == 1
+
+
 # ---------------------------------------------------------------- default off
 def test_switches_default_off():
     from atom.utils import envs
@@ -850,6 +948,7 @@ def test_switches_default_off():
     assert envs.ATOM_EPLB_GATE_PERMUTE is False
     assert envs.ATOM_EPLB_ALL_LAYERS is False
     assert envs.ATOM_EPLB_FIRST_REBALANCE_STEPS is None
+    assert envs.ATOM_EPLB_MIN_PICKS == 0
     assert envs.ATOM_EPLB_REF_PLACEMENT is None
     assert envs.ATOM_EPLB_DECODE_SAMPLE_EVERY == 64
     assert envs.ATOM_EPLB_SWAP_BUDGET == 16
@@ -907,7 +1006,9 @@ def _forward_monitor_calls(monkeypatch, manager, batch):
     monkeypatch.setattr(monitor, "on_forward_start", lambda: calls.append("start"))
     monkeypatch.setattr(monitor, "on_forward_end", lambda *a: calls.append(("end", *a)))
     monkeypatch.setattr(
-        manager, "on_forward_pass_end", lambda *a: calls.append(("step", *a))
+        manager,
+        "on_forward_pass_end",
+        lambda *a, is_dummy_run: calls.append(("step", *a)),
     )
     monkeypatch.setattr(eplb, "_MANAGER", manager)
     runner = SimpleNamespace(_eplb_any_rank_has_prefill=True)

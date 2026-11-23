@@ -1166,6 +1166,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # keep that expert placement for the rest of the process. Rebalances the
     # balancedness gate skips do not count. 0 (default) = no limit.
     "ATOM_EPLB_MAX_REBALANCES": lambda: _int_env("ATOM_EPLB_MAX_REBALANCES", 0),
+    # Gate-permute EPLB / the swap policy: a rebalance planned from fewer
+    # picks than this (prefill and decode, the group's, over the placed
+    # layers) is skipped, and does not count as one. 0 (default) = never.
+    "ATOM_EPLB_MIN_PICKS": lambda: max(0, _int_env("ATOM_EPLB_MIN_PICKS", 0)),
     # Prefill-bearing steps before the first rebalance. Unset = a quarter of
     # `rebalance_interval`.
     "ATOM_EPLB_FIRST_REBALANCE_STEPS": lambda: _optional_int_env(

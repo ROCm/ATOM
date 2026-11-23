@@ -2204,11 +2204,19 @@ class EPLBManager:
         self,
         local_has_prefill: bool,
         dp_any_has_prefill: bool | None = None,
+        is_dummy_run: bool = False,
     ) -> None:
         # Once stopped there is nothing left to schedule, so skip the per-step
         # has-prefill reduction too. The stop latches on the same step on every
         # rank (rebalance counts move in lockstep), so all ranks skip it together.
         if not self.enabled or self._rebalancing_stopped:
+            return
+        # Gate-permute EPLB / the swap policy count real steps only: a dummy
+        # forward (warm-up, which every rank runs alike) carries no load, and
+        # would bring the first rebalance forward to before any request.
+        if is_dummy_run and (
+            self.gate_permute is not None or self.placement_policy == "swap"
+        ):
             return
 
         # Resolve a migration-group-uniform has-prefill flag.
@@ -2346,6 +2354,25 @@ class EPLBManager:
             )
             if pf_total is not None:
                 logical_load = pf_total
+        min_picks = envs.ATOM_EPLB_MIN_PICKS
+        if min_picks > 0 and (gp is not None or self.placement_policy == "swap"):
+            # Too little load to plan from (the group's sums, so every rank
+            # decides alike): no rebalance, and none counted.
+            picks = int(logical_load.sum().item())
+            if dec_load is not None:
+                picks += int(dec_load.sum().item())
+            if picks < min_picks:
+                self._rebalance_count -= 1
+                if _ep_rank == 0:
+                    logger.info(
+                        "%s rebalance #%d skipped: %d picks < "
+                        "ATOM_EPLB_MIN_PICKS=%d (not counted)",
+                        gate_permute.TAG,
+                        _rc,
+                        picks,
+                        min_picks,
+                    )
+                return
 
         _t0 = _time.perf_counter()
         swaps = None
@@ -2887,7 +2914,9 @@ def with_eplb_forward_monitor(fn):
             # under the no-mixed-batch invariant (see on_forward_pass_end).
             local_has_prefill = getattr(batch, "total_tokens_num_prefill", 0) > 0
             dp_any_has_prefill = getattr(self, "_eplb_any_rank_has_prefill", None)
-            manager.on_forward_pass_end(local_has_prefill, dp_any_has_prefill)
+            manager.on_forward_pass_end(
+                local_has_prefill, dp_any_has_prefill, is_dummy_run=is_dummy_run
+            )
 
     return wrapper
 
