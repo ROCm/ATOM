@@ -588,14 +588,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_V4_INDEXER_QSPLIT_MIN_LOGITS": lambda: int(
         os.getenv("ATOM_V4_INDEXER_QSPLIT_MIN_LOGITS", str(1 << 26))
     ),
-    # DCP sparse (DSA) prefill: when QREP is active, produce the whole DCP
-    # group's query heads locally, as decode does, instead of AllGather Q. The
+    # DCP sparse (DSA) prefill, "q" transport: when QREP is active, produce the
+    # whole DCP group's query heads locally, as decode does, instead of
+    # AllGather Q. A "kv" step attends only this rank's heads and ignores it. The
     # pynccl gather lands rank-major, so the dim=1 reshape after it also copies
     # the whole gathered q back to token-major; this removes both. Costs a
     # group-wide q GEMM + W_K bmm per prefill token. Off by default.
     "ATOM_DCP_PREFILL_QREP": lambda: os.getenv("ATOM_DCP_PREFILL_QREP", "0") == "1",
-    # DCP sparse prefill: use the non-persistent fp8 gqa64 MLA kernel, which
-    # needs no work metadata. On by default; needs an aiter with ROCm/aiter#6132.
+    # DCP sparse prefill transport. "q" gathers the group's query heads and
+    # merges partials by LSE; "kv" all-gathers the step's KV rows and attends
+    # this rank's own heads over the whole top-k, with no merge. "auto" takes
+    # "kv" while the step's context is under ~200K + k * its new tokens (k 52
+    # with >= 16 heads a rank, 40 with fewer) and its gathered KV fits the token cap, else "q";
+    # "kv" skips the first condition and warns when it cannot be taken. The cap
+    # counts gathered rows (each request padded to whole local blocks), >= 0.
+    "ATOM_DCP_SPARSE_PREFILL": lambda: os.getenv("ATOM_DCP_SPARSE_PREFILL", "auto"),
+    "ATOM_DCP_SPARSE_PREFILL_KV_MAX_TOKENS": lambda: int(
+        os.getenv("ATOM_DCP_SPARSE_PREFILL_KV_MAX_TOKENS", str(1 << 20))
+    ),
+    # DCP sparse prefill, "q" transport: use the non-persistent fp8 gqa64 MLA
+    # kernel, which needs no work metadata; a "kv" step runs the dcp=1 kernel
+    # and its plan regardless. On by default; needs an aiter with ROCm/aiter#6132.
     "ATOM_DCP_SPARSE_PREFILL_NONPS": lambda: (
         os.getenv("ATOM_DCP_SPARSE_PREFILL_NONPS", "1") == "1"
     ),
