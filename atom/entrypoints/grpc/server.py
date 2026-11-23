@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import threading
+import time
 from argparse import Namespace
 from collections import defaultdict
 from collections.abc import Callable
@@ -115,6 +116,28 @@ def _deliver(outputs: list[tuple[asyncio.Queue, RequestOutput]]) -> None:
         queue.put_nowait(output)
 
 
+class _Timing:
+    """A request's times as generate_async measures them: from its arrival to its first
+    and last output ids, and to its end."""
+
+    def __init__(self):
+        self.started, self.first, self.last = time.time(), None, None
+
+    def output_ids(self) -> None:
+        self.last = time.time()
+        if self.first is None:
+            self.first = self.last
+
+    def fill(self, complete: pb.GenerateComplete) -> None:
+        complete.latency_s = time.time() - self.started
+        if self.first is not None:
+            complete.ttft_s = self.first - self.started
+        if complete.completion_tokens > 1:
+            complete.tpot_s = (self.last - self.first) / (
+                complete.completion_tokens - 1
+            )
+
+
 class _Call:
     """A Generate call as Abort finds it: its seq once made, and whether aborted."""
 
@@ -136,7 +159,7 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
     async def Generate(self, request, context):
         """Admitted as `/v1/completions` admits its ids, plus its chat's structured
         output; a refusal answered with its status; streamed one chunk per step."""
-        api, outputs, call = self.api, asyncio.Queue(), _Call()
+        api, outputs, call, timing = self.api, asyncio.Queue(), _Call(), _Timing()
         seq, submitted, finished = None, False, False
         self.live.setdefault(request.request_id, set()).add(call)
         self._log(request.request_id, "request", request)
@@ -190,6 +213,8 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
                 finished = output.finished
                 raise_for_structured_error(output.finish_reason)  # HTTP chat's 500
                 completion_tokens += len(output.output_tokens)
+                if output.output_tokens:
+                    timing.output_ids()
                 if not request.stream:  # a stream's tokens go out in its chunks
                     ids += output.output_tokens
                 cached = output.num_cached_tokens or cached
@@ -210,6 +235,7 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
                 completion_tokens=completion_tokens,
                 cached_tokens=cached,
             )
+            timing.fill(complete)
             if output.kv_transfer_params_output is not None:
                 kv_json = json.dumps(output.kv_transfer_params_output)
                 complete.kv_transfer_params_json = kv_json

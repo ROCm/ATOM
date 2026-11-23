@@ -90,6 +90,11 @@ message GenerateComplete {
   uint32 completion_tokens = 4;
   uint32 cached_tokens = 5;
   optional string kv_transfer_params_json = 6;  // the engine's output kv_transfer_params
+  // In seconds, as the HTTP usage reports them: from Generate's arrival to the
+  // first output id and to this complete, and per output id after the first.
+  double ttft_s = 7;
+  double tpot_s = 8;
+  double latency_s = 9;
 }
 
 message GenerateError {

@@ -141,6 +141,22 @@ def test_generate_answers_once_when_not_streaming(serve):
     assert not engine.preprocessed[0][1].max_tokens_is_default
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_the_complete_carries_the_http_usage_timing(serve, monkeypatch, stream):
+    clock = itertools.count()  # arrival 0, the two steps' ids 1 and 2, the end 3
+    monkeypatch.setattr(grpc_server, "time", SimpleNamespace(time=lambda: next(clock)))
+    engine = FakeEngine([([5], None), ([6, 7], "eos")])
+    complete = _generate(serve(engine), stream=stream)[-1].complete
+    assert (complete.ttft_s, complete.tpot_s, complete.latency_s) == (1, 0.5, 3)
+
+
+def test_a_complete_without_output_ids_has_no_token_timing(serve, monkeypatch):
+    clock = itertools.count()
+    monkeypatch.setattr(grpc_server, "time", SimpleNamespace(time=lambda: next(clock)))
+    complete = _generate(serve(FakeEngine([([], "eos")])))[-1].complete
+    assert (complete.ttft_s, complete.tpot_s, complete.latency_s) == (0, 0, 1)
+
+
 @pytest.mark.parametrize(
     "sampling, message",
     [
