@@ -38,7 +38,13 @@ from atom.mono.polling_env import ENV, units
 # the V4 helpers' poll). Below COPY_SAFE beside concurrent KV copies, 1 and 4
 # hung and 8 hung once (above); `Config` warns once at startup.
 POLL_SLEEP_UNITS = units(os.environ.get(ENV))
+# ATOM_MONO_POLL_ESCALATE=N (0 or unset: off): a mailbox wait's first N retries
+# sleep one unit (s_sleep 1), only its later ones POLL_SLEEP_UNITS -- a step's
+# waits end in a few retries, so the backoff the copy hang asked for
+# (``COPY_SAFE`` beside KV copies) applies to long waits alone, as the gfx1250
+# step's wait loop escalates its backoff past BACKOFF_ROUNDS.
+POLL_ESCALATE = max(0, int(os.environ.get("ATOM_MONO_POLL_ESCALATE", "0") or 0))
 # `spin_pause` and the V4 helpers' poll: main had `s_nop 0` there
 MAIN_POLLING = POLL_SLEEP_UNITS == 1
 SPIN_PAUSE_ASM = "s_nop 0" if MAIN_POLLING else f"s_sleep {POLL_SLEEP_UNITS}"
-CACHE_TAG = f"poll_sleep_units={POLL_SLEEP_UNITS}".encode()
+CACHE_TAG = f"poll_sleep_units={POLL_SLEEP_UNITS},escalate={POLL_ESCALATE}".encode()
