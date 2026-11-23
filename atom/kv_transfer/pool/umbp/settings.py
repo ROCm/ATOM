@@ -29,6 +29,11 @@ Example::
                  "write_through": the private part first, and every block
                  computed there is also copied into UMBP's part, where other
                  ranks can load it; nothing moves when either part evicts.
+`transport`      "ipc" (default) for local HIP IPC, or "fabric" for direct
+                 cross-tray HBM sharing. Fabric requires the matching MORI
+                 native L1 extension; it never falls back to staging memory.
+`node_id`        required for fabric, unique per tray/ATOM instance. Fabric
+                 also requires an explicit `group` shared by compatible peers.
 `session_migrate_margin`
                  with session affinity, move a session off a rank running this
                  fraction of the mean more requests than the mean (its history
@@ -53,6 +58,8 @@ class UmbpPoolSettings:
     share_ratio: float = 1.0
     placement: str = "private"
     session_migrate_margin: float | None = None
+    transport: str = "ipc"
+    node_id: str = ""
 
     @classmethod
     def from_transfer_config(
@@ -82,12 +89,24 @@ class UmbpPoolSettings:
         fetch = extra.get("fetch", True)
         if isinstance(fetch, str):
             fetch = fetch.strip().lower() not in ("0", "false", "no", "off")
+        transport = str(extra.get("transport", "ipc")).strip().lower()
+        if transport not in ("ipc", "fabric"):
+            raise ValueError("umbp_pool transport must be 'ipc' or 'fabric'")
+        node_id = str(extra.get("node_id", "") or "").strip()
+        group = str(extra.get("group", "") or "").strip()
+        if transport == "fabric" and (not node_id or not group):
+            raise ValueError(
+                "umbp_pool fabric requires a unique 'node_id' and an explicit "
+                "'group' identifying the same model revision and KV format on peers"
+            )
         return cls(
             address=address,
             namespace=str(extra.get("namespace", "atom") or "atom"),
-            group=str(extra.get("group", "") or ""),
+            group=group,
             fetch=bool(fetch),
             share_ratio=ratio,
             placement=placement,
             session_migrate_margin=margin,
+            transport=transport,
+            node_id=node_id,
         )
