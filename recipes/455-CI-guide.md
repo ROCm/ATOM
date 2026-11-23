@@ -543,7 +543,7 @@ awk -F, -v d=<YYYY-MM-DD> '$2 == d {print $4}' perf.csv accuracy.csv | sort -u
 
 **目标性能**写在 `perf_target.csv`，一个模型的一个场景、一个并发一行，五列：`model`（§1 的 slug）、`scenario`（`endpoint` 或 `8k1k`）、`concurrency`（`4` 或 `64`）、`tok_s_per_gpu`（目标每卡吞吐，口径同 §4.1）、`source`（谁给的、哪天给的）。报告的 Results 和 Details 的性能表里都有一列 `% of target`：本场每卡吞吐 ÷ 目标，后面带上目标值，例如 Kimi-K3 endpoint c64 本场 39.9、目标 250，写 `16.0% of 250`。没设目标的写 —，跑挂的写 N/A。目标变了就改那一行和它的 `source`；每个点只有一个目标，重新生成旧场次的结果也按新目标算。
 
-**还没合入的优化 PR** 写在 `pending_optimizations.csv`，一个 PR 一行，三列：`model`（§1 的 slug）、`pr`（PR 链接）、`note`（做什么、出处）。报告 Results 里 % of target 后面一列按文件里的顺序列出这些 PR，写成 `ATOM-2942`、`aiter-7876` 这样的链接，没有的写 —。只登记以 main 为目标的 PR：合进别的分支的，CI 用的 main 拿不到。PR 合入 main 或者关掉了，就删掉那一行。每场出报告前查一遍：
+**还没合入的优化 PR** 写在 `pending_optimizations.csv`，一个 PR 一行，三列：`model`（§1 的 slug）、`pr`（PR 链接）、`note`（做什么、出处）。报告 Results 里 % of target 后面一列按文件里的顺序列出这些 PR，写成 `ATOM-2942`、`aiter-7876` 这样的链接，没有的写 —。只登记最终会合进 main 的 PR：以 main 为目标的，或者叠在另一个这样的 PR 上的（目标分支是底下那个 PR 的分支，底下的合入后它会转到 main）。合进别的长期分支的不算，CI 用的 main 拿不到。PR 合入 main 或者关掉了，就删掉那一行。每场出报告前查一遍：
 
 ```bash
 # 在 recipes/455-CI 下；输出 MERGED 或 CLOSED 的，删掉 pending_optimizations.csv 里那一行

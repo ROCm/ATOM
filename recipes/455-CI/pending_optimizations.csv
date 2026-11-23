@@ -9,3 +9,15 @@ kimi-k3,https://github.com/ROCm/aiter/pull/8017,"fused_qk_rmsnorm with FP8 group
 kimi-k3,https://github.com/ROCm/aiter/pull/8031,FP32 cluster TDM and native BF16 GEMM retuning; LLM-Booster#414
 kimi-k3,https://github.com/ROCm/aiter/pull/8246,"fused split-K for the generic a8w8 GEMM, Kimi-K3 mx128 rows retuned; LLM-Booster#591"
 kimi-k3,https://github.com/ROCm/aiter/pull/8348,"Kimi-K3 latent-MoE BF16 GEMM rows for 256 CUs, needs aiter#8031; LLM-Booster#535"
+minimax-m3,https://github.com/ROCm/aiter/pull/8310,"AR + RMSNorm + native MXFP8 quant in one launch, with ATOM#3611 (draft)"
+minimax-m3,https://github.com/ROCm/ATOM/pull/3611,M3 opts into the fused native MXFP8 AR + RMSNorm of aiter#8310 (draft)
+minimax-m3,https://github.com/ROCm/ATOM/pull/3619,dense and shared-expert SwiGLU fused with the MXFP8 quant (draft)
+minimax-m3,https://github.com/ROCm/aiter/pull/8364,"the routed MoE's A1 quant also writes the shared expert's MXFP8 input, with ATOM#3630 (draft)"
+minimax-m3,https://github.com/ROCm/ATOM/pull/3630,"shared-expert input from the routed MoE quant, opt-in, with aiter#8364 (draft)"
+minimax-m3,https://github.com/ROCm/aiter/pull/8365,"NVFP4 PA decode writes o_proj's MXFP8 input, with ATOM#3634 (draft)"
+minimax-m3,https://github.com/ROCm/ATOM/pull/3634,"NVFP4 sparse attention writes o_proj's MXFP8 input, opt-in; stacked on ATOM#2744 (draft)"
+minimax-m3,https://github.com/ROCm/ATOM/pull/3640,"shared expert on a second stream, overlapped with the routed MoE (draft)"
+minimax-m3,https://github.com/ROCm/ATOM/pull/2744,FP4 index cache and NVFP4 sparse KV cache
+minimax-m3,https://github.com/ROCm/ATOM/pull/3581,"gfx1250 scaled-WMMA index scorers, index key written in the fused qk-norm launch; stacked on ATOM#2744, with aiter#8290 (draft)"
+minimax-m3,https://github.com/ROCm/aiter/pull/8290,"fused_qknorm_idxrqknorm writes NVFP4 K/V in the row layout, with ATOM#3581 (draft)"
+minimax-m3,https://github.com/ROCm/aiter/pull/8273,native MXFP8 (1x32 scale) GEMM optimized across M regimes (draft)
