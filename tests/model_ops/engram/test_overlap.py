@@ -278,9 +278,9 @@ def exercise_replay(group=None, verify=False):
     mapping = build(tiny_config())
     staging, _ = make_staging(mapping, group)
     tables = staging.uva.hash_tables
-    if group is not None:
-        assert staging.collective is not None
-        assert staging.collective is not group.device_communicator.ca_comm
+    # TP reassembly runs on the compute stream (`EngramStaging.consume`), never a
+    # private side-stream communicator (it deadlocked TP4 prefill).
+    assert staging.collective is None
     output = {
         layer: torch.empty_like(buffer.gpu)
         for layer, buffer in staging.host.buffers.items()

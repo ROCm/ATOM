@@ -1,18 +1,16 @@
 # SPDX-License-Identifier: MIT
 """Graph-replayable Engram lookup and TP reassembly beside early layers.
 
-A private collective instance isolates side-stream synchronization/scratch
-from model collectives. Storage and IPC registration precede graph capture.
+The side stream does the hash and UVA gather; the TP reassembly runs on the
+compute stream with the model's collectives. Storage precedes graph capture.
 Every forward (including warmup) records the same kernels, fork and joins on
 fixed addresses (`EngramStep`): a replay reads its own step.
 """
 
 import logging
-import os
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from unittest.mock import patch
 
 import torch
 
@@ -90,52 +88,14 @@ class EngramStaging:
         )
 
     def _init_collective(self):
-        host = self.host
-        group = host._tp_group
-        if group is None:
-            return
-        # The last-dimension kernel supports these TP sizes and 16-byte packs.
-        # Keep the original main-stream path for other configurations.
-        first = host.layer_ids[0]
-        local_width = host.local_heads * host.prefetcher._tables[first].head_dim
-        itemsize = host.buffers[first].gpu.element_size()
-        if group.world_size not in (2, 4, 8) or local_width * itemsize % 16:
-            logger.warning(
-                "engram: side-stream TP gather unsupported; using main stream"
-            )
-            return
-        from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
-
-        # Sharing TP GPU state would race barrier flags and scratch against
-        # main-stream all-reduce. Only reuse the CPU bootstrap group.
-        # AITER exports pool handles with offset zero. Use its raw hipMalloc
-        # pool so even small allocations have an exportable allocation base.
-        # Scope this to initialization; do not change the model communicator.
-        with patch.dict(os.environ, {"AITER_CUSTOM_AR_RAW_INPUT_POOL": "1"}):
-            collective = CustomAllreduce(
-                group.cpu_group,
-                host.device,
-                max_size=max(1024 * 1024, host.max_num_tokens * local_width * itemsize),
-            )
-        if collective.disabled:
-            logger.warning("engram: private TP gather unavailable; using main stream")
-            return
-        self.collective = collective
-        for layer in host.layer_ids:
-            full_width = local_width * group.world_size
-            self.gathered[layer] = (
-                host.buffers[layer].gpu
-                if full_width == host.embed_width
-                else torch.empty(
-                    host.max_num_tokens,
-                    full_width,
-                    dtype=host.buffers[layer].gpu.dtype,
-                    device=host.device,
-                )
-            )
-        logger.info(
-            "engram: hash/UVA/TP gather on one side stream with private IPC state"
-        )
+        # The TP reassembly stays on the compute stream (`consume`: the TP
+        # group's all_gather), ordered with the model's other collectives; the
+        # side stream keeps the hash and the UVA gather. A private side-stream
+        # all_gather (its own CustomAllreduce) ran concurrently with the main
+        # stream's collectives and deadlocked TP4 prefill: one rank waited in a
+        # layer's all-reduce while its peers' side-stream gathers spun on it
+        # and starved their compute (c1 replay, 2026-11-23).
+        return
 
     def prepare(self, step, width):
         """Name the forward's inputs (`EngramStep`); `start` launches on them."""
