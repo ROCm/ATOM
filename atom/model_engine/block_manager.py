@@ -1038,6 +1038,11 @@ class BlockManager:
             self.kv.block(seq.block_table[i]).draft_rows_missing = True
             self.draft_rows_marked = True
 
+    def draft_rows_missing(self, block_id: int) -> bool:
+        """Whether a tier load or a P/D receive left `block_id`'s draft rows
+        unwritten; True for a block that is gone (-1)."""
+        return block_id < 0 or self.kv.block(block_id).draft_rows_missing
+
     def draft_rows_from(self, seq: Sequence) -> int:
         """V for a P/D consumer: tokens up to the end of `seq`'s highest block
         missing draft rows; 0 when none is."""

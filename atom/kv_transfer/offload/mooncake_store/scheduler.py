@@ -40,13 +40,16 @@ from atom.kv_transfer.offload.mooncake_store.config import (
     StorePool,
     check_engine_compatibility,
     parse_mooncake_store_config,
+    store_draft_window,
 )
 from atom.kv_transfer.offload.mooncake_store.keys import (
     DIGEST_BYTES,
     STORE_TAINT_KEY,
+    draft_ranks,
     store_namespace,
 )
 from atom.model_engine.sequence import SequenceStatus
+from atom.spec_decode.draft_window_geometry import DraftReadWindow
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -117,7 +120,8 @@ class _StoreLookup(StoreLookupBase):
     pool answered and none holds it, and unanswered if no pool answered: a
     pool that fails is absent for every key another pool answers. A lookup
     answers only what the unanswered keys cannot change, so a pool that fails
-    never makes a hit longer.
+    never makes a hit longer. Under ATOM_MOONCAKE_STORE_DRAFT_WINDOW the same
+    call asks for the draft objects of the hit's read window (`_gate_draft_rows`).
 
     Each call also asks for the Store's taint marker (:mod:`.taint`). A pool
     that carries it holds nothing from then on, for this scheduler's life, and
@@ -136,8 +140,16 @@ class _StoreLookup(StoreLookupBase):
         namespace: str,
         world: int,
         chunk_tokens: int,
+        draft_window: DraftReadWindow | None = None,
+        draft_ranks: range = range(0),
     ) -> None:
-        super().__init__(namespace=namespace, world=world, chunk_tokens=chunk_tokens)
+        super().__init__(
+            namespace=namespace,
+            world=world,
+            chunk_tokens=chunk_tokens,
+            draft_window=draft_window,
+            draft_ranks=draft_ranks,
+        )
         self._cfg = cfg
         # Exact while every server on these pools puts each rank on the same
         # NIC; see the offload README for what a different placement costs.
@@ -167,6 +179,8 @@ class _StoreLookup(StoreLookupBase):
         if not chunks:
             return 0
         keys = self._rank_keys(hashes, 0, chunks)
+        draft = self._draft_range(seq, chunks)
+        keys += self._draft_keys(hashes, draft)
         merged = self._ask(keys)
         if merged is None:
             return None
@@ -185,7 +199,13 @@ class _StoreLookup(StoreLookupBase):
                 min(bound),
             )
             return None
-        self._count_lookup(sum(present - hit_chunks for present in held))
+        stranded = sum(present - hit_chunks for present in held)
+        hit_chunks = self._gate_draft_rows(
+            lookup_id, draft, hit_chunks, merged[self._world * chunks :]
+        )
+        if hit_chunks is None:
+            return None
+        self._count_lookup(stranded)
         hit = hit_chunks * self._chunk_tokens
         logger.debug(
             "[OFFLOAD-LOOKUP] lookup_id=%s chunks=%d keys=%d hit=%d elapsed_ms=%.2f",
@@ -198,7 +218,8 @@ class _StoreLookup(StoreLookupBase):
         return hit
 
     def renew(self, seq: Any, start: int, end: int) -> int:
-        """Renew the read leases of every rank's chunks in tokens ``[start, end)``.
+        """Renew the read leases of every rank's chunks in tokens ``[start, end)``,
+        and of the draft objects the load reads, ``[max(start, d0), end)``.
 
         Right before a load reads them: the leases of the lookup behind it may
         have run out while the request waited for KV blocks. Returns how many
@@ -213,6 +234,8 @@ class _StoreLookup(StoreLookupBase):
         if not pools:
             return 0
         keys = self._rank_keys(hashes, first, last)
+        d0 = self._draft_range(seq, last).start
+        keys += self._draft_keys(hashes, range(max(first, d0), last))
         answers = [a for a in self._exists_on(pools, keys) if a is not None]
         return sum(1 for codes in zip(*answers) if 1 in codes)
 
@@ -223,7 +246,9 @@ class _StoreLookup(StoreLookupBase):
         hashes = prompt_chunk_hashes(seq, self._chunk_tokens)
         first = int(start) // self._chunk_tokens
         last = min(int(end) // self._chunk_tokens, len(hashes) // DIGEST_BYTES)
-        return tuple(self._rank_keys(hashes, first, last))
+        keys = self._rank_keys(hashes, first, last)
+        d0 = self._draft_range(seq, last).start
+        return tuple(keys + self._draft_keys(hashes, range(max(first, d0), last)))
 
     def renew_keys(self, keys: tuple[str, ...]) -> int:
         answers = self._ask(list(keys)) if keys else None
@@ -414,17 +439,22 @@ class MooncakeStoreOffloadScheduler(KVStoreOffloadScheduler):
         self._looked_up_at: dict[str, float] = {}
         self._async_renew = envs.ATOM_STORE_ASYNC_RENEW
         self.cancels_undispatched_loads = self._async_renew
+        store_lookup = _StoreLookup(
+            cfg,
+            namespace=namespace,
+            world=world,
+            chunk_tokens=cfg.chunk_tokens,
+            draft_window=store_draft_window(config),
+            draft_ranks=draft_ranks(config),
+        )
         super().__init__(
             config,
             store_cfg=cfg,
             namespace=namespace,
             world=world,
-            lookup_client=AsyncStoreLookup(
-                _StoreLookup(
-                    cfg, namespace=namespace, world=world, chunk_tokens=cfg.chunk_tokens
-                )
-            ),
+            lookup_client=AsyncStoreLookup(store_lookup),
             endpoint="masters=" + ",".join(pool.master for pool in cfg.store_masters()),
+            store_lookup=store_lookup,
         )
         if self._async_renew:
             # Bound only with the flag: without it these are the class's.

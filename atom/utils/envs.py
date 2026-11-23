@@ -227,6 +227,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_KV_OFFLOAD_EXTRA_CONFIG", ""
     ),
     "ATOM_STORE_SAVE_BATCH_CHUNKS": lambda: _int_env("ATOM_STORE_SAVE_BATCH_CHUNKS", 0),
+    # Prefill with a mooncake_store tier and a sliding-window DSpark draft: the
+    # Store keeps the draft rows of each saved prompt's read window only. Opt-in.
+    "ATOM_MOONCAKE_STORE_DRAFT_WINDOW": lambda: _flag_env(
+        "ATOM_MOONCAKE_STORE_DRAFT_WINDOW"
+    ),
     # --- Data Parallelism ---
     "ATOM_DP_RANK": lambda: int(os.getenv("ATOM_DP_RANK", "0")),
     "ATOM_DP_RANK_LOCAL": lambda: int(os.getenv("ATOM_DP_RANK_LOCAL", "0")),
