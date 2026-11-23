@@ -127,9 +127,14 @@ def _chat(service, messages, stream):
     raise AssertionError("the stream never finished")
 
 
+def _file(url):
+    return {"type": "file", "file": {"file_data": url}}
+
+
+@pytest.mark.parametrize("part", [_image, _file], ids=["image_url", "file"])
 @pytest.mark.parametrize("stream", [False, True], ids=["blocking", "streaming"])
-def test_an_image_reaches_the_engine_with_its_placeholders(service, stream):
-    messages = [{"role": "user", "content": [_image(_png_url("red")), QUESTION]}]
+def test_an_image_reaches_the_engine_with_its_placeholders(service, part, stream):
+    messages = [{"role": "user", "content": [part(_png_url("red")), QUESTION]}]
 
     text, usage = _chat(service, messages, stream)
 
