@@ -6,6 +6,7 @@ import asyncio
 import itertools
 import json
 import socket
+import struct
 import sys
 import threading
 import time
@@ -72,6 +73,7 @@ class FakeEngine:
                 num_prompt_tokens=len(prompt),
                 max_tokens=params.max_tokens,
                 callback=stream_callback,
+                arrive_time=time.time(),
             )
             self.io_processor.requests[seq.id] = seq
             self.made.append(seq.id)
@@ -686,6 +688,58 @@ def test_shutdown_ends_running_calls_before_it_returns(serve, monkeypatch):
         with pytest.raises(grpc.RpcError):
             list(call)
     channel.close()
+
+
+def _submit_batch(*requests) -> list[bytes]:
+    """A SubmitBatch of (seq_id, external id, prompt) requests, no sampling field set."""
+    envelope = v1.Envelope(protocol_version=frames.PROTOCOL_VERSION)
+    envelope.submit.SetInParent()
+    data = []
+    for seq_id, external, prompt in requests:
+        data.append(struct.pack(f"<{len(prompt)}i", *prompt))
+        envelope.submit.requests.add(
+            seq_id=seq_id,
+            external_request_id=external,
+            prompt_token_ids=v1.BufferRef(frame=len(data), nbytes=len(data[-1])),
+        )
+    return [envelope.SerializeToString(), *data]
+
+
+def test_a_session_serves_a_submit_batch_over_the_wire(serve, monkeypatch):
+    engine = FakeEngine([([5], None), ([6], "eos")])
+    stop, channel = _listen(serve, monkeypatch, engine)
+    read = threading.Event()
+
+    def client():
+        yield pb.Frames(frames=_submit_batch((3, "a", [1, 2]), (9, "b", [4])))
+        read.wait(10)  # the client's side ends once it has read its answers
+
+    try:
+        answers = pb_grpc.AtomEngineStub(channel).Session(client(), timeout=10)
+        messages = [_envelope(list(next(answers).frames)) for _ in range(7)]
+        read.set()
+        assert list(answers) == []
+    finally:
+        channel.close()
+        stop()
+    assert messages[0].WhichOneof("body") == "ready"
+    for seq_id, external in ((3, "a"), (9, "b")):
+        mine = [
+            (m.WhichOneof("body"), m)
+            for m in messages
+            if seq_id in m.stream.seq_ids
+            or seq_id in [c.seq_id for c in m.completions.items]
+        ]
+        assert [body for body, _ in mine] == ["stream", "stream", "completions"]
+        assert [list(m.stream.tokens) for _, m in mine[:2]] == [[5], [6]]
+        (done,) = mine[2][1].completions.items  # its ids went in the StreamBatches
+        assert (done.leave_reason, done.external_request_id) == ("eos", external)
+        assert done.completion_token_ids.nbytes == 0
+    # Omitted sampling fields read as /v1/completions fills them.
+    for prompt, params, _ in engine.preprocessed:
+        assert params.max_tokens == DEFAULT_MAX_TOKENS and params.max_tokens_is_default
+    assert [p for p, _, _ in engine.preprocessed] == [[1, 2], [4]]
+    assert engine.io_processor.requests == {} and engine.aborted == []
 
 
 def test_a_step_flushed_after_the_server_stopped_is_dropped():
