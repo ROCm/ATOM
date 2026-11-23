@@ -202,16 +202,18 @@ def test_an_extension_too_large_to_store_keeps_the_prompt_it_extends(monkeypatch
     assert reused == [0, len(a1) // 16, len(a1) // 16]
 
 
+_extend = pb.extend_block_hashes
+
+
+def wrong_when_reused(tokens, block_size, seed=-1, *, base=None, shared_tokens=0):
+    out = _extend(tokens, block_size, seed, base=base, shared_tokens=shared_tokens)
+    if base is None:
+        return out
+    bad = bytes([out.hashes[0] ^ 1]) + out.hashes[1:]
+    return pb.PrefixBlockHashes(block_size, seed, out.num_tokens, bad)
+
+
 def test_a_mismatch_in_the_first_uses_check_turns_reuse_off(monkeypatch, caplog):
-    real = pb.extend_block_hashes
-
-    def wrong_when_reused(tokens, block_size, seed=-1, *, base=None, shared_tokens=0):
-        out = real(tokens, block_size, seed, base=base, shared_tokens=shared_tokens)
-        if base is None:
-            return out
-        bad = bytes([out.hashes[0] ^ 1]) + out.hashes[1:]
-        return pb.PrefixBlockHashes(block_size, seed, out.num_tokens, bad)
-
     monkeypatch.setattr(pb, "extend_block_hashes", wrong_when_reused)
     proc, reused = processor(16), []
     with caplog.at_level("WARNING", logger="atom"):
@@ -223,6 +225,51 @@ def test_a_mismatch_in_the_first_uses_check_turns_reuse_off(monkeypatch, caplog)
     # The second prompt reuses the first's system prompt; nothing reuses after it.
     assert reused == [0, 6000 // 16, 0, 0, 0, 0]
     assert not served(proc)["enabled"] and "reuse is off" in caplog.text
+
+
+class CountingLock:
+    """`lock`, running `before` ahead of its acquire number `at`."""
+
+    def __init__(self, lock, at=0, before=None):
+        self.lock, self.at, self.before, self.count = lock, at, before, 0
+
+    def __enter__(self):
+        self.count += 1
+        if self.count == self.at:
+            self.before()
+        return self.lock.__enter__()
+
+    def __exit__(self, *exc):
+        return self.lock.__exit__(*exc)
+
+
+def test_reuse_turned_off_before_a_reusing_prompt_finishes_rehashes_it(monkeypatch):
+    # Past the first-uses check, an older check turns reuse off just before a
+    # reusing prompt takes its last lock: the prompt ships a full rehash.
+    monkeypatch.setattr(pb, "extend_block_hashes", wrong_when_reused)
+    rng = np.random.default_rng(5)
+    first = tokens(rng, 2000)
+    prompt = first + tokens(rng, 100)
+
+    def checked_chains():
+        chains = pb.TokenPrefixChains(1 << 20, 16)
+        chains.block_hashes(first)
+        chains._verified = pb._VERIFY_FIRST
+        return chains
+
+    chains = checked_chains()
+    chains._lock = counted = CountingLock(chains._lock)
+    chains.block_hashes(prompt)
+    chains = checked_chains()
+    lock = chains._lock
+
+    def turn_off():
+        with lock:
+            chains._turn_off()
+
+    chains._lock = CountingLock(lock, counted.count, turn_off)
+    assert list(chains.block_hashes(prompt).as_array()) == full_chain(prompt, 16)
+    assert chains.stats()["blocks_rehashed"] == len(prompt) // 16
 
 
 def test_concurrent_forks_each_ship_a_full_recompute():

@@ -176,13 +176,13 @@ class TokenPrefixChains:
         chain = extend_block_hashes(
             toks, bs, base=None if base is None else base.hashes, shared_tokens=shared
         )
-        reused, rehash = shared // bs, False
-        if reused:  # check the first reuses, and any made while reuse turned off
-            with self._lock:
-                rehash = verify or not self.enabled
+        reused = shared // bs
+        rehash = bool(reused) and verify  # check the first reuses
         if rehash:
             full = array.array("Q", chained_block_hashes(toks, bs, 0, n, -1)).tobytes()
         with self._lock:
+            # a reuse still in flight when reuse turned off is hashed again below
+            late = bool(reused) and not rehash and not self.enabled
             if rehash and full != chain.hashes:
                 self._turn_off()
                 chain = PrefixBlockHashes(bs, -1, len(toks), full)
@@ -195,7 +195,10 @@ class TokenPrefixChains:
             counts["prompts"] += 1
             counts["blocks_hashed"] += n - reused
             counts["blocks_reused"] += reused
-            counts["blocks_rehashed"] += n if rehash else 0
+            counts["blocks_rehashed"] += n if rehash or late else 0
+        if late:
+            full = array.array("Q", chained_block_hashes(toks, bs, 0, n, -1)).tobytes()
+            chain = PrefixBlockHashes(bs, -1, len(toks), full)
         return chain
 
     def _find(self, raw: bytes, toks: np.ndarray):
