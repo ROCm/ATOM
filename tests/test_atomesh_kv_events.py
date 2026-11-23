@@ -342,7 +342,7 @@ class DeepSeekV41ShareCacheCellsTest(unittest.TestCase):
                 )
                 cls.cells += json.loads(output.read_text())["include"]
 
-    def submitted_router_args(self, cell):
+    def submitted_exports(self, cell):
         source = (SCRIPTS / "pd_submit.sh").read_text()
         start = source.index("python3 - <<'PY'\n") + len("python3 - <<'PY'\n")
         result = subprocess.run(
@@ -353,12 +353,31 @@ class DeepSeekV41ShareCacheCellsTest(unittest.TestCase):
             text=True,
             timeout=10,
         )
-        exports = dict(
+        return dict(
             shlex.split(line.removeprefix("export "))[0].split("=", 1)
             for line in result.stdout.splitlines()
-            if line.startswith("export ROUTER_")
+            if line.startswith("export ")
         )
+
+    def submitted_router_args(self, cell):
+        exports = {
+            key: value
+            for key, value in self.submitted_exports(cell).items()
+            if key.startswith("ROUTER_")
+        }
         return self.router_args(cell, **exports)
+
+    def test_cells_warm_each_lane_with_its_snapshot_primers_alone(self):
+        for cell in self.cells:
+            with self.subTest(cell=cell["name"]):
+                exports = self.submitted_exports(cell)
+                self.assertEqual(exports["AIPERF_SCENARIO"], "inferencex-agentx-mvp")
+                self.assertEqual(exports["AIPERF_WARMUP_REQUESTS_PER_LANE"], "0")
+        script = (SCRIPTS / "pd_server_atom.sh").read_text()
+        self.assertIn('if [[ "${AIPERF_WARMUP_REQUESTS_PER_LANE}" != "0" ]]; then', script)
+        self.assertNotIn(
+            '--warmup-requests-per-lane "${AIPERF_WARMUP_REQUESTS_PER_LANE}" \\', script
+        )
 
     def test_cells_launch_the_recipe_router_or_the_cache_aware_flow(self):
         self.assertEqual(
