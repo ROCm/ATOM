@@ -27,12 +27,12 @@ use crate::{
         prepare_pool::{JobContext, PrepareHandle},
         ConnectionMode, Worker, WorkerRegistry, WorkerType,
     },
+    entrypoints::server::AppState,
     policies::{LoadBalancingPolicy, PolicyRegistry},
     routers::{
         comm::error::{IngressError, MeshLocalError},
         prepare::inference::{InferenceMetadata, InferenceRequest, ParsedInference},
     },
-    server::AppState,
     tokenizer::TokenizerRegistry,
 };
 

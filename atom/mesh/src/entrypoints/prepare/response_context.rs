@@ -6,10 +6,10 @@ use std::sync::Arc;
 
 use http::HeaderMap;
 
+use super::chat_template::ProcessedMessages;
 use crate::{
     protocols::{chat::ChatCompletionRequest, generate::GenerateRequest},
     reasoning_parser::ParserFactory as ReasoningParserFactory,
-    routers::prepare::chat_template::ProcessedMessages,
     tokenizer::{traits::Tokenizer, StopSequenceDecoder},
     tool_parser::ParserFactory as ToolParserFactory,
 };

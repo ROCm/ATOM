@@ -174,8 +174,7 @@ mod pd_routing_unit_tests {
                     MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
                 };
                 use mesh::{
-                    core::{LoadMonitor, WorkerRegistry},
-                    middleware::TokenBucket,
+                    core::{token_bucket::TokenBucket, LoadMonitor, WorkerRegistry},
                     policies::PolicyRegistry,
                 };
 

@@ -13,7 +13,7 @@ use mesh::{
     config::RouterConfig,
     core::{BasicWorkerBuilder, Worker},
     routers::{http_router, RouterTrait},
-    server::{build_app, AppState},
+    entrypoints::server::{build_app, AppState},
 };
 use serde_json::{json, Value};
 use std::{sync::Arc, time::Duration};

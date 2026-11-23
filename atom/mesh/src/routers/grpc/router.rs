@@ -200,6 +200,14 @@ impl RouterTrait for GrpcRouter {
         self
     }
 
+    async fn route_tokens(
+        &self,
+        request: crate::entrypoints::backend::TokenRequest,
+    ) -> Result<crate::entrypoints::backend::TokenStream, crate::entrypoints::backend::BackendError>
+    {
+        self.pipeline.dispatch_tokens(request).await
+    }
+
     async fn route_generate(
         &self,
         headers: Option<&HeaderMap>,

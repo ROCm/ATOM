@@ -16,7 +16,7 @@ use crate::{
             traits::PdPlanner,
             types::{PlacementError, PlacementPlan, Protocol, RequestDescriptor},
         },
-        AttachedBody, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
+        WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
     observability::metrics::{bool_to_static_str, metrics_labels, MeshMetrics},
     policies::PolicyRegistry,
@@ -29,7 +29,7 @@ use crate::{
             error, metrics_utils::error_type_from_status,
             placement_response::placement_err_to_response,
         },
-        prepare::{self, generation_payload::GenerationPayload, response_context::ResponseContext},
+        prepare::{self, generation_payload::GenerationPayload},
         render,
         token_handle::engine_error::EngineError,
     },
@@ -111,28 +111,20 @@ impl Pipeline {
             bool_to_static_str(streaming),
         );
 
-        let (mut payload, resp_ctx) =
-            match prepare::prepare_chat(req, headers, model_id, &components) {
-                Ok(t) => t,
-                Err(e) => return self.record_chat_err(&model, start, e),
-            };
-        let placement = match self.plan_for(&payload, &resp_ctx).await {
-            Ok(p) => p,
-            Err(e) => return self.record_chat_err(&model, start, e),
+        let backend = PipelineBackend { pipeline: self };
+        let response = match crate::entrypoints::openai::run_chat(
+            &backend,
+            req,
+            headers,
+            model_id,
+            &components,
+            self.backend_label,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(response) => return self.record_chat_err(&model, start, response),
         };
-        let guards = make_load_guards(&placement, resp_ctx.headers.as_ref());
-        let stream = match self.engine.dispatch(&placement, &mut payload).await {
-            Ok(s) => s,
-            Err(e) => return self.record_chat_err(&model, start, engine_err_to_response(e)),
-        };
-
-        let is_stream = resp_ctx.original.is_streaming();
-        let response = if is_stream {
-            render::chat_streaming::process(stream, resp_ctx, self.backend_label)
-        } else {
-            render::chat_aggregator::process(stream, resp_ctx).await
-        };
-        let response = AttachedBody::wrap_response(response, guards);
 
         MeshMetrics::record_router_duration(
             metrics_labels::ROUTER_GRPC,
@@ -166,34 +158,20 @@ impl Pipeline {
             bool_to_static_str(streaming),
         );
 
-        let (mut payload, resp_ctx) =
-            match prepare::prepare_generate(req, headers, model_id, &components) {
-                Ok(t) => t,
-                Err(e) => return self.record_generate_err(&model_for_metric, start, e),
-            };
-        let placement = match self.plan_for(&payload, &resp_ctx).await {
-            Ok(p) => p,
-            Err(e) => return self.record_generate_err(&model_for_metric, start, e),
+        let backend = PipelineBackend { pipeline: self };
+        let response = match crate::entrypoints::openai::run_generate(
+            &backend,
+            req,
+            headers,
+            model_id,
+            &components,
+            self.backend_label,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(response) => return self.record_generate_err(&model_for_metric, start, response),
         };
-        let guards = make_load_guards(&placement, resp_ctx.headers.as_ref());
-        let stream = match self.engine.dispatch(&placement, &mut payload).await {
-            Ok(s) => s,
-            Err(e) => {
-                return self.record_generate_err(
-                    &model_for_metric,
-                    start,
-                    engine_err_to_response(e),
-                )
-            }
-        };
-
-        let is_stream = resp_ctx.original.is_streaming();
-        let response = if is_stream {
-            render::generate_streaming::process(stream, resp_ctx, self.backend_label)
-        } else {
-            render::generate_aggregator::process(stream, resp_ctx).await
-        };
-        let response = AttachedBody::wrap_response(response, guards);
 
         MeshMetrics::record_router_duration(
             metrics_labels::ROUTER_GRPC,
@@ -220,41 +198,72 @@ impl Pipeline {
             ));
         }
 
-        let (mut payload, resp_ctx) = prepare::prepare_chat(req, headers, model_id, &components)?;
-        let placement = self.plan_for(&payload, &resp_ctx).await?;
-        let _guards = make_load_guards(&placement, resp_ctx.headers.as_ref());
+        let (payload, mut resp_ctx) = prepare::prepare_chat(req, headers, model_id, &components)?;
         let stream = self
+            .dispatch_tokens(crate::entrypoints::backend::TokenRequest::from_prepared(
+                payload,
+                &mut resp_ctx,
+            ))
+            .await
+            .map_err(crate::entrypoints::backend::BackendError::into_response)?;
+        // The load guards ride in `_finish` until the response is built.
+        let (handle, _finish) = stream.into_parts();
+        render::chat_aggregator::process_typed(handle, resp_ctx).await
+    }
+
+    pub(crate) async fn dispatch_tokens(
+        &self,
+        request: crate::entrypoints::backend::TokenRequest,
+    ) -> Result<crate::entrypoints::backend::TokenStream, crate::entrypoints::backend::BackendError>
+    {
+        use crate::entrypoints::backend::{TokenRequest, TokenStream};
+        let TokenRequest {
+            mut payload,
+            model,
+            headers,
+        } = request;
+        let placement = self
+            .plan_tokens(&payload, model.as_deref(), headers.as_ref())
+            .await
+            .map_err(backend_error_from_response)?;
+        let guards = make_load_guards(&placement, headers.as_ref());
+        let handle = self
             .engine
             .dispatch(&placement, &mut payload)
             .await
-            .map_err(engine_err_to_response)?;
-
-        render::chat_aggregator::process_typed(stream, resp_ctx).await
+            .map_err(|error| backend_error_from_response(engine_err_to_response(error)))?;
+        Ok(TokenStream::with_finish(handle, guards))
     }
 
-    async fn plan_for(
+    async fn plan_tokens(
         &self,
         payload: &GenerationPayload,
-        resp_ctx: &ResponseContext,
+        model_id: Option<&str>,
+        headers: Option<&HeaderMap>,
     ) -> Result<PlacementPlan, Response> {
         let tokens = if payload.token_ids.is_empty() {
             None
         } else {
             Some(payload.token_ids.as_slice())
         };
+        let text = if payload.text.is_empty() {
+            None
+        } else {
+            Some(payload.text.as_str())
+        };
         let descriptor = RequestDescriptor {
-            model_id: resp_ctx.model_id.as_deref(),
+            model_id,
             protocol: Some(Protocol::Grpc),
-            text: resp_ctx.original_text.as_deref(),
+            text,
             tokens,
-            headers: resp_ctx.headers.as_ref(),
-            stream: resp_ctx.original.is_streaming(),
+            headers,
+            stream: payload.stream,
             carries_media: false,
         };
         self.planner
             .plan(&descriptor)
             .await
-            .map_err(|e| placement_err_to_response_log(e, resp_ctx.model_id.as_deref()))
+            .map_err(|error| placement_err_to_response_log(error, model_id))
     }
 
     fn record_chat_err(&self, model: &str, _start: Instant, resp: Response) -> Response {
@@ -280,6 +289,48 @@ impl Pipeline {
         );
         resp
     }
+}
+
+struct PipelineBackend<'a> {
+    pipeline: &'a Pipeline,
+}
+
+#[async_trait::async_trait]
+impl crate::entrypoints::backend::Backend for PipelineBackend<'_> {
+    async fn generate(
+        &self,
+        request: crate::entrypoints::backend::TokenRequest,
+    ) -> Result<crate::entrypoints::backend::TokenStream, crate::entrypoints::backend::BackendError>
+    {
+        self.pipeline.dispatch_tokens(request).await
+    }
+
+    async fn abort(
+        &self,
+        _request_id: &str,
+    ) -> Result<(), crate::entrypoints::backend::BackendError> {
+        Err(crate::entrypoints::backend::BackendError::unsupported(
+            "the grpc pipeline does not abort an accepted request",
+        ))
+    }
+}
+
+fn backend_error_from_response(response: Response) -> crate::entrypoints::backend::BackendError {
+    let status = response.status();
+    let (code, message) = response
+        .extensions()
+        .get::<error::MeshLocalError>()
+        .map(error::MeshLocalError::code_and_message)
+        .unwrap_or_else(|| {
+            (
+                "backend_error".to_string(),
+                status
+                    .canonical_reason()
+                    .unwrap_or("backend error")
+                    .to_string(),
+            )
+        });
+    crate::entrypoints::backend::BackendError::new(status, code, message)
 }
 
 fn make_load_guards(plan: &PlacementPlan, headers: Option<&HeaderMap>) -> Vec<WorkerLoadGuard> {

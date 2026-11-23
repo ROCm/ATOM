@@ -137,7 +137,7 @@ jobs:
             --target-dir atom/mesh/mocker/target/mesh \
             --profile ci --lib -- \
             kv_events:: kv_index:: kv_storage:: policies::cache_aware policies::registry \
-            observability:: routers::prepare routers::ingress
+            observability:: entrypoints::prepare routers::ingress
           cargo test \
             --manifest-path atom/mesh/Cargo.toml \
             --target-dir atom/mesh/mocker/target/mesh \
