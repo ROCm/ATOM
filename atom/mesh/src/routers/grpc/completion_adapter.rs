@@ -218,9 +218,8 @@ pub(crate) async fn wrap_generate_response_as_completion(
     };
 
     // An ATOM worker's sequences carry their timing, which its usage reports.
-    let raw: Vec<Value> = serde_json::from_slice(&bytes).unwrap_or_default();
-    let meta_infos: Vec<&Value> = raw.iter().filter_map(|g| g.get("meta_info")).collect();
-    let atom = AtomUsage::of_meta_infos(&meta_infos);
+    let meta_infos = meta_infos(&bytes);
+    let atom = AtomUsage::of_meta_infos(&meta_infos.iter().collect::<Vec<_>>());
 
     let completion = build_completion_response(gens, model);
     let json = match atom {
@@ -246,6 +245,18 @@ pub(crate) async fn wrap_generate_response_as_completion(
     );
     new.headers_mut().remove(header::CONTENT_LENGTH);
     new
+}
+
+/// A generate response's `meta_info` alone; its text, ids and logprobs are skipped.
+#[derive(serde::Deserialize)]
+struct MetaInfoOnly {
+    meta_info: Option<Value>,
+}
+
+/// Each response's `meta_info` in a `/generate` body, read without decoding the rest.
+fn meta_infos(body: &[u8]) -> Vec<Value> {
+    let responses: Vec<MetaInfoOnly> = serde_json::from_slice(body).unwrap_or_default();
+    responses.into_iter().filter_map(|r| r.meta_info).collect()
 }
 
 /// Map a generate `finish_reason` Value (the raw JSON form, since streaming
@@ -480,4 +491,20 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         return None;
     }
     haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+#[cfg(test)]
+mod meta_info_tests {
+    use super::*;
+
+    #[test]
+    fn meta_infos_are_read_alone_and_responses_without_one_are_skipped() {
+        let body = json!([
+            {"text": "a long reply", "output_ids": [1, 2], "meta_info": {"ttft": 0.5}},
+            {"text": "no meta"},
+        ]);
+        let read = meta_infos(&serde_json::to_vec(&body).unwrap());
+        assert_eq!(read, [json!({"ttft": 0.5})]);
+        assert!(meta_infos(b"not json").is_empty());
+    }
 }
