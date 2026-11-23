@@ -127,8 +127,12 @@ class AsyncStoreLookup(LookupClient):
         # Renewals ride their own worker so a burst of arrival-time queries
         # cannot queue one behind it; the slot keeps the synchronous Store
         # client (and the pool state around it) to one call at a time.
-        self.renew_executor = DaemonExecutor("store-renew")
+        self.renew_executor = DaemonExecutor("store-renew", limit=capacity)
         self._renewing = False
+        # sid -> (ident, future, submitted) of the renewals the scheduler thread
+        # polls; `_stuck_renewals` holds retired futures whose RPC still runs.
+        self._renewals = {}
+        self._stuck_renewals = []
         self.backend_slot = _BackendSlot()
         self.pending = {}
         # sid -> when its Store query was sent: the read lease the answer grants
@@ -137,18 +141,20 @@ class AsyncStoreLookup(LookupClient):
         self.discarded = set()
         self.discarded_hits = {}
         self.closed = False
-        self._next_failure_warning = 0.0
+        # Per kind ("lookup", "lease renewal"): when its next warning may be
+        # logged, so one kind's failures never mute the other's.
+        self._next_warning_at: dict[str, float] = {}
 
     def supports_async(self):
         return True
 
-    def _warn_lookup_failure(self, exc):
+    def _warn_failure(self, what, outcome, exc):
         now = time.monotonic()
         with self.lock:
-            if now < self._next_failure_warning:
+            if now < self._next_warning_at.get(what, 0.0):
                 return
-            self._next_failure_warning = now + 60.0
-        logger.warning("Mooncake Store lookup failed; answer unavailable: %s", exc)
+            self._next_warning_at[what] = now + 60.0
+        logger.warning("Mooncake Store %s failed; %s: %s", what, outcome, exc)
 
     def _query(self, seq, sid):
         with self.backend_slot.take():
@@ -193,7 +199,7 @@ class AsyncStoreLookup(LookupClient):
                             if hit is not None:
                                 self.discarded_hits[sid] = hit
                         except Exception as exc:  # noqa: BLE001
-                            self._warn_lookup_failure(exc)
+                            self._warn_failure("lookup", "answer unavailable", exc)
 
     def pending_ids(self):
         self.pump()
@@ -229,7 +235,7 @@ class AsyncStoreLookup(LookupClient):
         try:
             result = f.result()
         except Exception as exc:  # noqa: BLE001
-            self._warn_lookup_failure(exc)
+            self._warn_failure("lookup", "answer unavailable", exc)
             result = None
         with self.lock:
             if self.pending.get(sid) is f and f.done():
@@ -261,6 +267,10 @@ class AsyncStoreLookup(LookupClient):
         with self.backend_slot.take(renewal=True):
             return self.backend.renew(seq, start, end)
 
+    def _renew_keys(self, keys):
+        with self.backend_slot.take(renewal=True):
+            return self.backend.renew_keys(keys)
+
     def _renewal_done(self, _future) -> None:
         self._renewing = False
 
@@ -290,6 +300,57 @@ class AsyncStoreLookup(LookupClient):
                 RENEW_TIMEOUT_S,
             )
             return 0
+
+    def renew_async(self, sid, ident, make_keys):
+        """Renew `sid`'s keys on the renewal executor; scheduler thread only.
+
+        `ident` names the keys: a ticket with the same `ident` is polled, and
+        the keys, `make_keys()`, are built only to submit.
+
+        "pending" while the renewal (queued or running) has not finished and was
+        submitted less than `RENEW_TIMEOUT_S` ago.
+        Anything else lets the load go ahead, as after the synchronous `renew`:
+        "ready" for an answered renewal (judged by `done()` first, however late
+        it is polled), else the reason the answer is missing: "timeout",
+        "error", "cancelled", "rejected" (queue full or executor closed) or
+        "renewal_busy" (a retired renewal still occupies the worker).
+        """
+        ticket = self._renewals.get(sid)
+        if ticket is not None and ticket[0] != ident:
+            self.cancel_renewal(sid)
+            ticket = None
+        if ticket is None:
+            self._stuck_renewals = [f for f in self._stuck_renewals if not f.done()]
+            if self._stuck_renewals:
+                return "renewal_busy"
+            keys = make_keys()
+            future = self.renew_executor.submit(self._renew_keys, keys)
+            if future is None or future.cancelled():
+                return "rejected"
+            ticket = self._renewals[sid] = (ident, future, time.monotonic())
+        _, future, submitted = ticket
+        if future.done():
+            del self._renewals[sid]
+            if future.cancelled():
+                return "cancelled"
+            exc = future.exception()
+            if exc is not None:
+                self._warn_failure(
+                    "lease renewal", "the load is dispatched without it", exc
+                )
+                return "error"
+            return "ready"
+        if time.monotonic() - submitted >= RENEW_TIMEOUT_S:
+            self.cancel_renewal(sid)
+            return "timeout"
+        return "pending"
+
+    def cancel_renewal(self, sid):
+        """Retire `sid`'s renewal; a running RPC cannot be stopped, so its
+        future is kept until it returns and later loads skip renewal."""
+        ticket = self._renewals.pop(sid, None)
+        if ticket is not None and not ticket[1].cancel() and not ticket[1].done():
+            self._stuck_renewals.append(ticket[1])
 
     def close(self):
         with self.lock:
