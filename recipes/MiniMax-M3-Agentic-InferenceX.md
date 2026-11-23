@@ -309,14 +309,6 @@ gsm8k, the InferenceX CI method: its `infx/evals/gsm8k.yaml` (5-shot, chat templ
 | CONC 32 command (indexer CP + delayer) | 0.9613 | 0.9636 ± 0.0052 |
 | CONC 48 command (indexer CP + LMCache) | 0.9598, with an FP8 draft KV | 0.9682 ± 0.0048 |
 
-### Not on `main` yet
-
-These moved the earlier best numbers (ROCm/ATOM experiment branches) and are not in this command:
-- Mono decode beyond 16 rows, and the fused-handoff MoE (FHMoE): no PR yet.
-- TP MegaMoE: #3512 (draft).
-- Sequence-parallel prefill: #3511 (draft).
-- Prefill TBO (DBO) under pure TP: #3510 (draft).
-
 ## Notes
 
 - `--model` / `--tokenizer` on the client must equal the server's `--served-model-name` exactly, or every request 404s.
