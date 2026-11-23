@@ -430,50 +430,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Rows per rank of that small instance: 128, 256, 512 or 1024 (see docs).
     "ATOM_MEGA_DECODE_MTPR": lambda: _int_env("ATOM_MEGA_DECODE_MTPR", 128),
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
-    # Beside the paged MLA cache, keep the open 16-token tile in BF16 so an
-    # NVFP4 scale can be recomputed from the original values. Off by default;
-    # the FP8 cache does not allocate it. One ring per request per layer.
-    "ATOM_MLA_NVFP4_HP_RING": lambda: os.getenv("ATOM_MLA_NVFP4_HP_RING", "0") == "1",
-    # Decode with the gfx1250 NVFP4 MLA shader (AITER PR 7987). The FP4 pages
-    # replace the FP8 KV cache in the paged pool. Requires 128 query heads per
-    # rank, block size 64, and no prefix caching, chunked prefill or MTP. Off
-    # by default, so the FP8 path is unchanged. Implies the BF16 tail ring above.
+    # Decode with the gfx1250 NVFP4 MLA attention of AITER (PR 8200). The FP4
+    # pages replace the FP8 KV cache in the paged pool, with a BF16 tail of the
+    # open 16-token tile for each request. Requires 128 query heads per rank,
+    # block size 64, and no prefix caching, chunked prefill or MTP. Off by
+    # default, so the FP8 path is unchanged.
     "ATOM_MLA_NVFP4": lambda: os.getenv("ATOM_MLA_NVFP4", "0") == "1",
-    # NVFP4 decode split-K: the shader walks a request's whole context in one
-    # workgroup, so a request's pages are cut into up to MAX_SPLITS ranges, as
-    # many as keep batch x splits within SPLIT_ROWS, and merged by LSE.
-    "ATOM_MLA_NVFP4_SPLIT_ROWS": lambda: _int_env("ATOM_MLA_NVFP4_SPLIT_ROWS", 2048),
-    "ATOM_MLA_NVFP4_MAX_SPLITS": lambda: _int_env("ATOM_MLA_NVFP4_MAX_SPLITS", 16),
-    # NVFP4 decode cache write. 2: one Triton launch appends to the BF16 tail
-    # and quantizes the open tile into the FP4 pages. 1: Triton append/gather,
-    # then mla_nvfp4_update_cache. 0: torch ops, then mla_nvfp4_update_cache.
-    "ATOM_MLA_NVFP4_TRITON_RING": lambda: _int_env("ATOM_MLA_NVFP4_TRITON_RING", 2),
-    # NVFP4 decode: quantize Q with one Triton launch that reads NoPE and RoPE
-    # in place (no concat). 0 keeps the concat + mla_nvfp4_quantize_q.
-    "ATOM_MLA_NVFP4_TRITON_Q": lambda: os.getenv("ATOM_MLA_NVFP4_TRITON_Q", "1") == "1",
-    # NVFP4 decode: apply the interleaved RoPE inside the Triton Q and cache
-    # kernels (needs TRITON_Q and TRITON_RING=2), dropping the RoPE launch,
-    # the copies it rotates and the latent concat. Off by default: its RoPE is
-    # rounded differently from the RoPE kernel prefill uses (MLPerf DSR1 80.58
-    # vs 81.06 with it off, for 0.5 ms per decode step).
-    "ATOM_MLA_NVFP4_TRITON_ROPE": lambda: os.getenv("ATOM_MLA_NVFP4_TRITON_ROPE", "0") == "1",
-    # NVFP4 decode: quantize the NoPE Q in the K-up GEMM (Triton, BF16 absorb
-    # only), skipping the BF16 q_nope round trip. Needs TRITON_Q and
-    # TRITON_RING=2.
-    "ATOM_MLA_NVFP4_TRITON_KUP": lambda: os.getenv("ATOM_MLA_NVFP4_TRITON_KUP", "1") == "1",
-    # Fused NVFP4 decode writes keep each open tile's block amax and rewrite only
-    # the blocks a token raises (same bytes); needs ATOM_MLA_NVFP4_TRITON_RING=2.
-    "ATOM_MLA_NVFP4_INCR_TILE": lambda: os.getenv("ATOM_MLA_NVFP4_INCR_TILE", "0") == "1",
-    # Accuracy experiment only: the tail keeps per-token E4M3 copies (one scale
-    # for NoPE, one for RoPE) instead of BF16, as a half-size FP8 tail would.
-    "ATOM_MLA_NVFP4_FP8_TAIL": lambda: os.getenv("ATOM_MLA_NVFP4_FP8_TAIL", "0") == "1",
-    # Accuracy experiment only: after each tile write, replace the tail's BF16
-    # with the FP4 round trip of what was written, so the next token requantizes
-    # dequantized FP4 (as a cache with no BF16 tail would) instead of originals.
-    "ATOM_MLA_NVFP4_EMULATE_NO_RING": lambda: os.getenv(
-        "ATOM_MLA_NVFP4_EMULATE_NO_RING", "0"
-    )
-    == "1",
     # Match SGLang's gfx950 prefill fast path, with or without a cached prefix:
     # cast Q/K/V to FP8 and use AITER's head-dim-256 per-tensor FMHA kernel.
     # Set to 0 for the BF16 flash_attn_varlen_func fallback.

@@ -3,7 +3,9 @@
 
 """RoPE inside the Triton Q and cache kernels matches the separate path
 (copies + the model's rotary embedding + concat) byte for byte, so decode
-stays consistent with the RoPE prefill uses."""
+stays consistent with the RoPE prefill uses. The kernels round as AITER's
+Triton RoPE (``forward_triton``, the backend under
+``AITER_ROPE_TRITON_BACKEND=1``, as the DeepSeek-R1 MLPerf config sets)."""
 
 import pytest
 import torch
@@ -26,8 +28,13 @@ def _rope():
     from aiter.rotary_embedding import get_rope
 
     rope = get_rope(
-        64, rotary_dim=64, max_position=163840, base=10000,
-        is_neox_style=False, rope_scaling=YARN, dtype=torch.bfloat16,
+        64,
+        rotary_dim=64,
+        max_position=163840,
+        base=10000,
+        is_neox_style=False,
+        rope_scaling=YARN,
+        dtype=torch.bfloat16,
     )
     return rope.to("cuda")
 
@@ -62,23 +69,37 @@ def test_fused_rope_matches_the_separate_path(batch, seed):
 
     ring = Nvfp4HpRing(batch + 1, 1, 576, device="cuda")
     ring.buf.copy_(randn(*ring.buf.shape))
-    nope = torch.randint(0, 256, (pages, 16384), dtype=torch.uint8, device="cuda", generator=gen)
-    aux = torch.randint(0, 256, (pages, 8192), dtype=torch.uint8, device="cuda", generator=gen)
+    nope = torch.randint(
+        0, 256, (pages, 16384), dtype=torch.uint8, device="cuda", generator=gen
+    )
+    aux = torch.randint(
+        0, 256, (pages, 8192), dtype=torch.uint8, device="cuda", generator=gen
+    )
     r_ring, r_nope, r_aux = ring.buf.clone(), nope.clone(), aux.clone()
     start_ring, start_nope, start_aux = ring.buf.clone(), nope.clone(), aux.clone()
 
     # Separate path, as try_nvfp4_decode runs it without fused RoPE.
     q_pe, k_pe = q_rope.clone(), k_rope.clone()
-    rope(positions, q_pe, k_pe)
+    rope.forward_triton(positions, q_pe, k_pe)
     want_q = quantize_q(q_nope, q_pe)
-    kv = torch.cat((k_nope.reshape(batch, 512), k_pe.reshape(batch, 64)), dim=-1).contiguous()
+    kv = torch.cat(
+        (k_nope.reshape(batch, 512), k_pe.reshape(batch, 64)), dim=-1
+    ).contiguous()
     ring_append_quantize(r_ring[:, 0], req, positions, kv, slots, r_nope, r_aux)
 
     # Fused path.
     got_q = quantize_q(q_nope, q_rope, positions, cos, sin)
     ring_append_quantize(
-        ring.buf[:, 0], req, positions, k_nope, slots, nope, aux,
-        rope=k_rope.reshape(batch, 64), cos=cos, sin=sin,
+        ring.buf[:, 0],
+        req,
+        positions,
+        k_nope,
+        slots,
+        nope,
+        aux,
+        rope=k_rope.reshape(batch, 64),
+        cos=cos,
+        sin=sin,
     )
     torch.cuda.synchronize()
 
@@ -103,33 +124,35 @@ def test_fused_rope_matches_the_separate_path(batch, seed):
         aux.copy_(start_aux)
         if fused:
             one_q = decode_prep(
-                q_nope, q_rope, ring.buf[:, 0], req, k_nope, k_rope.reshape(batch, 64),
-                slots, nope, aux, positions, cos, sin,
+                q_nope,
+                q_rope,
+                ring.buf[:, 0],
+                req,
+                k_nope,
+                k_rope.reshape(batch, 64),
+                slots,
+                nope,
+                aux,
+                positions,
+                cos,
+                sin,
             )
         else:
             one_q = decode_prep(
-                q_nope, q_pe, ring.buf[:, 0], req, k_nope, k_pe.reshape(batch, 64),
-                slots, nope, aux, positions,
+                q_nope,
+                q_pe,
+                ring.buf[:, 0],
+                req,
+                k_nope,
+                k_pe.reshape(batch, 64),
+                slots,
+                nope,
+                aux,
+                positions,
             )
         torch.cuda.synchronize()
-        assert torch.equal(one_q[0], want_q[0]) and torch.equal(one_q[1], want_q[1]), fused
+        assert torch.equal(one_q[0], want_q[0]) and torch.equal(
+            one_q[1], want_q[1]
+        ), fused
         assert torch.equal(ring.buf[:batch], r_ring[:batch]), fused
         assert torch.equal(nope, r_nope) and torch.equal(aux, r_aux), fused
-
-    # The N16 AUX layout (AITER PR 8201): the one launch with RoPE in the
-    # kernel writes what the separate N16 cache write does.
-    n16_ring, n16_nope, n16_aux = start_ring.clone(), start_nope.clone(), start_aux.clone()
-    ring_append_quantize(n16_ring[:, 0], req, positions, kv, slots, n16_nope, n16_aux, n16=True)
-    ring.buf.copy_(start_ring)
-    nope.copy_(start_nope)
-    aux.copy_(start_aux)
-    one_q = decode_prep(
-        q_nope, q_rope, ring.buf[:, 0], req, k_nope, k_rope.reshape(batch, 64),
-        slots, nope, aux, positions, cos, sin, n16=True,
-    )
-    torch.cuda.synchronize()
-    assert torch.equal(one_q[0], want_q[0]) and torch.equal(one_q[1], want_q[1])
-    assert torch.equal(nope, n16_nope) and torch.equal(nope, r_nope)
-    assert torch.equal(aux, n16_aux)
-    # Same values, different bytes: the layouts differ wherever a tile was written.
-    assert not torch.equal(n16_aux, r_aux)

@@ -19,11 +19,10 @@ pytest.importorskip("aiter.ops.mla_nvfp4")
 if not torch.cuda.is_available():
     pytest.skip("needs a GPU", allow_module_level=True)
 
-from aiter.mla import mla_decode_prepare_page_csr  # noqa: E402
+from aiter.mla import mla_decode_prepare_page_csr
 
-from atom.model_ops.attentions.nvfp4_mla import (  # noqa: E402
+from atom.model_ops.attentions.nvfp4_mla import (
     Nvfp4MlaCache,
-    split_page_csr,
     try_nvfp4_decode,
 )
 
@@ -99,6 +98,7 @@ class StepBuffers:
 
 def _step(gen, reqs):
     """`reqs` is ``[(page, position)]`` per live row; the rest are padding."""
+
     def rand(*shape):
         return (torch.randn(*shape, generator=gen, device=DEV) * 0.3).to(torch.bfloat16)
 
@@ -120,9 +120,10 @@ def _step(gen, reqs):
     return step
 
 
-def test_graph_replay_matches_eager_across_a_row_swap():
-    eager_cache = Nvfp4MlaCache(1, PAGES, MAX_REQS, DIM, device=DEV)
-    graph_cache = Nvfp4MlaCache(1, PAGES, MAX_REQS, DIM, device=DEV)
+@pytest.mark.parametrize("fused", [True, False])
+def test_graph_replay_matches_eager_across_a_row_swap(fused):
+    eager_cache = Nvfp4MlaCache(1, PAGES, MAX_REQS, DIM, device=DEV, fused=fused)
+    graph_cache = Nvfp4MlaCache(1, PAGES, MAX_REQS, DIM, device=DEV, fused=fused)
     for cache in (eager_cache, graph_cache):
         cache.kv_nope.zero_()
         cache.kv_aux.zero_()
@@ -168,50 +169,3 @@ def test_graph_replay_matches_eager_across_a_row_swap():
         assert torch.equal(graph_cache.kv_aux, eager_cache.kv_aux)
         live = slice(0, MAX_REQS)
         assert torch.equal(graph_cache.ring.buf[live], eager_cache.ring.buf[live])
-
-
-def test_split_k_matches_the_unsplit_decode():
-    """Same cache and Q, pages cut into ranges and merged by LSE.
-
-    Not bit-exact: the shader quantizes probabilities to FP4 against each
-    range's own running max.
-    """
-    from atom.model_ops.attentions.nvfp4_mla import aiter_writes_lse
-
-    if not aiter_writes_lse():
-        pytest.skip("this AITER NVFP4 decode produces no LSE to merge splits by")
-    pages_per_req, reqs, splits = 24, 4, 4
-    cache = Nvfp4MlaCache(1, pages_per_req * reqs, MAX_REQS, DIM, device=DEV)
-    gen = torch.Generator(DEV).manual_seed(5)
-    lens = torch.tensor([pages_per_req * 64, 700, 1300, 65], dtype=torch.int32, device=DEV)
-    tables = torch.arange(reqs * pages_per_req, dtype=torch.int32, device=DEV).view(
-        reqs, pages_per_req
-    )
-    n_tiles = reqs * pages_per_req * 4
-    tiles = (torch.randn(n_tiles, 16, DIM, generator=gen, device=DEV) * 0.3).to(torch.bfloat16)
-    cache._write(
-        0,
-        tiles,
-        torch.arange(reqs * pages_per_req, device=DEV).repeat_interleave(4).int(),
-        torch.arange(4, device=DEV).repeat(reqs * pages_per_req).int(),
-        torch.full((n_tiles,), 16, dtype=torch.int32, device=DEV),
-    )
-    q = (torch.randn(reqs, HEADS, DIM, generator=gen, device=DEV) * 0.3).to(torch.bfloat16)
-
-    indptr = torch.zeros(reqs + 1, dtype=torch.int32, device=DEV)
-    indices = torch.zeros(reqs * pages_per_req, dtype=torch.int32, device=DEV)
-    last = torch.zeros(reqs, dtype=torch.int32, device=DEV)
-    mla_decode_prepare_page_csr(lens, tables, indptr, indices, last)
-    whole = cache.decode(0, q, (indptr, indices, last), DIM**-0.5)
-
-    rows = reqs * splits
-    split_indptr = torch.zeros(rows + 1, dtype=torch.int32, device=DEV)
-    split_last = torch.zeros(rows, dtype=torch.int32, device=DEV)
-    split_page_csr(indptr, last, splits, split_indptr, split_last)
-    split = cache.decode(0, q, (split_indptr, indices, split_last), DIM**-0.5, splits=splits)
-
-    a, b = whole.float(), split.float()
-    rel = ((a - b).pow(2).mean().sqrt() / a.pow(2).mean().sqrt()).item()
-    cos = torch.nn.functional.cosine_similarity(a.flatten(), b.flatten(), dim=0).item()
-    assert torch.isfinite(b).all()
-    assert rel < 0.05 and cos > 0.998, f"rel={rel:.4f} cos={cos:.5f}"

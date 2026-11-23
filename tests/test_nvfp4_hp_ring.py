@@ -16,7 +16,7 @@ PAGE = 64
 
 
 def _ring(**kwargs):
-    args = dict(num_reqs=2, layers=3, head_dim=HEAD, rewind=0)
+    args = {"num_reqs": 2, "layers": 3, "head_dim": HEAD, "rewind": 0}
     args.update(kwargs)
     return Nvfp4HpRing(**args)
 

@@ -22,6 +22,7 @@ import torch
 # and TRT-LLM's HP_BLOCK_SIZE.
 HP_BLOCK_SIZE = 16
 
+
 class Nvfp4HpRing:
     """``[num_reqs, layers, ring_size, head_dim]`` BF16, allocated once."""
 
@@ -119,8 +120,10 @@ class Nvfp4HpRing:
                 f"values must be [{req_ids.shape[0]}, {self.head_dim}], "
                 f"got {tuple(values.shape)}."
             )
-        if check and req_ids.numel() and (
-            int(req_ids.min()) < 0 or int(req_ids.max()) >= self.num_reqs
+        if (
+            check
+            and req_ids.numel()
+            and (int(req_ids.min()) < 0 or int(req_ids.max()) >= self.num_reqs)
         ):
             raise ValueError(
                 f"req id outside 0..{self.num_reqs - 1}: {req_ids.tolist()}."
@@ -140,37 +143,17 @@ class Nvfp4HpRing:
         ]
         # masked_fill, not boolean-index assignment: the latter calls nonzero
         # and syncs with the host.
-        tiles = tiles.masked_fill(
-            (offsets[None, :] >= valid[:, None])[:, :, None], 0
-        )
+        tiles = tiles.masked_fill((offsets[None, :] >= valid[:, None])[:, :, None], 0)
 
-        page_ids = torch.div(positions, page_size, rounding_mode="floor").to(torch.int32)
+        page_ids = torch.div(positions, page_size, rounding_mode="floor").to(
+            torch.int32
+        )
         tile_ids = torch.div(
             torch.remainder(positions, page_size),
             HP_BLOCK_SIZE,
             rounding_mode="floor",
         ).to(torch.int32)
         return tiles, valid, page_ids, tile_ids
-
-    def store_tiles(
-        self,
-        layer: int,
-        req_ids: torch.Tensor,
-        positions: torch.Tensor,
-        tiles: torch.Tensor,
-    ) -> None:
-        """Overwrite the whole open tile of each row with ``tiles [N, 16, D]``.
-
-        ``positions`` is any position inside the tile. Rows past the tile's
-        valid count are rewritten too; the next append masks them. No host
-        reads.
-        """
-        req_ids = req_ids.to(device=self.buf.device, dtype=torch.long)
-        positions = positions.to(device=self.buf.device, dtype=torch.long)
-        tile_start = (positions // HP_BLOCK_SIZE) * HP_BLOCK_SIZE
-        offsets = torch.arange(HP_BLOCK_SIZE, device=self.buf.device)
-        slots = torch.remainder(tile_start[:, None] + offsets[None, :], self.ring_size)
-        self.buf[req_ids[:, None], layer, slots] = tiles.to(dtype=self.buf.dtype)
 
     def _check_layer_req(self, layer: int, req: int) -> None:
         if not 0 <= layer < self.layers:

@@ -33,11 +33,6 @@ except ImportError:
     fused_qk_rope_concat_and_cache_mla_seg = None
 from aiter.dist.parallel_state import get_dp_group, get_tensor_model_parallel_rank
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
-from atom.model_ops.attentions.nvfp4_mla import (
-    kup_fusable,
-    publish_prefill_kv,
-    try_nvfp4_decode,
-)
 from aiter.ops.triton.attention.mla import mla_decode_fwd as triton_mla_decode_fwd
 from aiter.ops.triton.fusions.fused_kv_cache import (
     fused_qk_rope_cat_and_cache_mla as triton_fused_qk_rope_cat_and_cache_mla,
@@ -69,6 +64,11 @@ from atom.distributed.pcp_utils import (
     get_pcp_world_size,
     pcp_allgather_rerange_many,
     pcp_is_enabled,
+)
+from atom.model_ops.attentions.nvfp4_mla import (
+    kup_fusable,
+    publish_prefill_kv,
+    try_nvfp4_decode,
 )
 from atom.model_ops.attentions.sparse_mla_head_groups import (
     PERSISTENT_WORK_BUFFERS,
@@ -3219,7 +3219,13 @@ class MLAAttention(nn.Module):
                 q, x_scale=q_scale, group=use_qrep, k_up=not kup_fused
             )
             nvfp4_out = try_nvfp4_decode(
-                self, q_nope, q_rope, k_nope, k_rope, positions, attn_metadata,
+                self,
+                q_nope,
+                q_rope,
+                k_nope,
+                k_rope,
+                positions,
+                attn_metadata,
                 w_k=self._k_up_weight(use_qrep)[0] if kup_fused else None,
             )
             if nvfp4_out is not None:
