@@ -136,8 +136,8 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                         chat_template.as_deref(),
                     )
                     .await;
-                    // fastokens has a cache of its own, off by default:
-                    // `--fastokens-segment-cache-mb`.
+                    // fastokens has its own segment cache
+                    // (`--fastokens-segment-cache-mb`, 1 GiB by default).
                     if base_tokenizer.as_any().is::<FastTokenizer>() {
                         return Ok(base_tokenizer);
                     }
