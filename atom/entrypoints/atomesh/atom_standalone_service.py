@@ -1562,13 +1562,16 @@ class AtomStandaloneService:
         placeholders, so its prompt arrives as token ids. Blocking.
         """
         messages = self._get_chat_messages(request_data)
-        if has_multimodal_content(messages):
+        # Checked first, as the OpenAI server does: a `file` image part is in
+        # its `image_url` form only once checked.
+        checked = check_chat_images([ChatMessage.model_validate(m) for m in messages])
+        if has_multimodal_content([{"content": m.content} for m in checked]):
             # Tool-call arguments go to the template as sent, as on the text
             # path below.
             return prepare_chat_multimodal_inputs(
                 self.engine.config,
                 self._get_multimodal_processor(),
-                check_chat_images([ChatMessage.model_validate(m) for m in messages]),
+                checked,
                 template_kwargs,
                 request_data.get("tools"),
                 preserve_tool_call_arguments=True,
