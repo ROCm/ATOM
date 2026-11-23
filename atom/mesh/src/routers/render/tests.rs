@@ -4236,3 +4236,133 @@ mod g_complete_suffix {
         assert!(last["text"].as_str().unwrap().ends_with('.'), "{last}");
     }
 }
+
+mod h_atom_native_tool_calls {
+    use std::sync::Arc;
+
+    use axum::body::to_bytes;
+    use serde_json::{json, Value};
+
+    use crate::protocols::chat::ChatCompletionRequest;
+    use crate::routers::prepare::response_context::{ProtocolRequest, ResponseContext};
+    use crate::routers::prepare::stop_decoder_builder::create_stop_decoder;
+    use crate::routers::render::{chat_aggregator, chat_streaming};
+    use crate::routers::test_mocks;
+    use crate::routers::token_handle::test_support::synthetic_single_stream;
+    use crate::routers::token_handle::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
+    use crate::tokenizer::{huggingface::HuggingFaceTokenizer, traits::Tokenizer};
+
+    const CALL: &str =
+        "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>";
+
+    fn tokenizer() -> Arc<dyn Tokenizer> {
+        let dir = test_mocks::tokenizer::byte_level_tokenizer_dir(&[], false, json!({}));
+        let path = dir.path().join("tokenizer.json");
+        Arc::new(HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap())
+    }
+
+    /// An ATOM reply in qwen's tool syntax to a chat forcing `choice`.
+    fn ctx(stream: bool, choice: Value) -> ResponseContext {
+        let tokenizer = tokenizer();
+        let tool =
+            json!({"type": "function", "function": {"name": "get_weather", "parameters": {}}});
+        let req: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "tools": [tool], "tool_choice": choice, "stream": stream,
+        }))
+        .unwrap();
+        ResponseContext {
+            original: ProtocolRequest::Chat(Arc::new(req)),
+            model_id: Some("m".to_string()),
+            headers: None,
+            original_text: None,
+            processed_messages: None,
+            stop_decoder: create_stop_decoder(&tokenizer, None, None, false, false),
+            tokenizer,
+            request_id: "rid".to_string(),
+            created: 0,
+            tool_parser_factory: Some(test_mocks::tool_parser_factory()),
+            reasoning_parser_factory: None,
+            configured_tool_parser: Some("qwen".to_string()),
+            configured_reasoning_parser: None,
+            prompt_opener: None,
+            reads_as_atom: true,
+        }
+    }
+
+    fn chunks(streamed: bool) -> Vec<TokenChunk> {
+        let ids = tokenizer()
+            .encode(CALL, false)
+            .unwrap()
+            .token_ids()
+            .to_vec();
+        let mut chunks: Vec<TokenChunk> = Vec::new();
+        if streamed {
+            chunks.extend(ids.chunks(4).map(|ids| TokenChunk::Partial {
+                token_ids: ids.to_vec(),
+                logprobs: None,
+            }));
+        }
+        chunks.push(TokenChunk::Complete {
+            token_ids: if streamed { Vec::new() } else { ids },
+            finish_reason: FinishReason::Stop,
+            matched_stop: None,
+            usage: Usage::default(),
+            logprobs: None,
+            input_logprobs: None,
+            meta: WorkerMeta::default(),
+        });
+        chunks
+    }
+
+    fn forced_choices() -> [Value; 2] {
+        [
+            json!({"type": "function", "function": {"name": "get_weather"}}),
+            json!("required"),
+        ]
+    }
+
+    #[tokio::test]
+    async fn a_forced_atom_tool_call_is_parsed_in_the_model_s_syntax() {
+        for choice in forced_choices() {
+            let stream = synthetic_single_stream(chunks(false).into_iter().map(Ok).collect());
+            let resp = chat_aggregator::process(stream, ctx(false, choice.clone())).await;
+            let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            let call = &json["choices"][0]["message"]["tool_calls"][0]["function"];
+            assert_eq!(call["name"], "get_weather", "{choice}: {json}");
+            let arguments: Value =
+                serde_json::from_str(call["arguments"].as_str().unwrap()).unwrap();
+            assert_eq!(arguments, json!({"city": "Paris"}));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_forced_atom_tool_call_streams_in_the_model_s_syntax() {
+        for choice in forced_choices() {
+            let stream = synthetic_single_stream(chunks(true).into_iter().map(Ok).collect());
+            let resp = chat_streaming::process(stream, ctx(true, choice.clone()), "regular");
+            let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+            let (mut name, mut arguments) = (String::new(), String::new());
+            for line in String::from_utf8_lossy(&body).lines() {
+                let Some(event) = line
+                    .strip_prefix("data: ")
+                    .and_then(|data| serde_json::from_str::<Value>(data).ok())
+                else {
+                    continue;
+                };
+                for call in event["choices"][0]["delta"]["tool_calls"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                {
+                    name.push_str(call["function"]["name"].as_str().unwrap_or_default());
+                    arguments.push_str(call["function"]["arguments"].as_str().unwrap_or_default());
+                }
+            }
+            assert_eq!(name, "get_weather", "{choice}");
+            let arguments: Value = serde_json::from_str(&arguments).unwrap();
+            assert_eq!(arguments, json!({"city": "Paris"}), "{choice}");
+        }
+    }
+}

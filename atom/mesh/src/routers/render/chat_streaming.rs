@@ -107,13 +107,16 @@ async fn run_chat_stream(
             })
             .unwrap_or(false);
 
-    let used_json_schema = match tool_choice {
-        Some(ToolChoice::Function { .. }) => true,
-        Some(ToolChoice::Value(ToolChoiceValue::Required)) => true,
-        Some(ToolChoice::AllowedTools { mode, .. }) => mode == "required",
-        _ => false,
-    };
-    let is_specific_function = matches!(tool_choice, Some(ToolChoice::Function { .. }));
+    // ATOM derives a forced choice's format itself: the model's own tool syntax.
+    let used_json_schema = !ctx.reads_as_atom
+        && match tool_choice {
+            Some(ToolChoice::Function { .. }) => true,
+            Some(ToolChoice::Value(ToolChoiceValue::Required)) => true,
+            Some(ToolChoice::AllowedTools { mode, .. }) => mode == "required",
+            _ => false,
+        };
+    let is_specific_function =
+        used_json_schema && matches!(tool_choice, Some(ToolChoice::Function { .. }));
 
     let tool_parser_available = tools.is_some()
         && ctx

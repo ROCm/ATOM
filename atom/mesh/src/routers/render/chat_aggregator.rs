@@ -261,12 +261,14 @@ async fn process_choice(
     );
 
     if tool_choice_enabled && chat_request.tools.is_some() {
-        let used_json_schema = match &chat_request.tool_choice {
-            Some(ToolChoice::Function { .. }) => true,
-            Some(ToolChoice::Value(ToolChoiceValue::Required)) => true,
-            Some(ToolChoice::AllowedTools { mode, .. }) => mode == "required",
-            _ => false,
-        };
+        // ATOM derives a forced choice's format itself: the model's own tool syntax.
+        let used_json_schema = !reads_as_atom
+            && match &chat_request.tool_choice {
+                Some(ToolChoice::Function { .. }) => true,
+                Some(ToolChoice::Value(ToolChoiceValue::Required)) => true,
+                Some(ToolChoice::AllowedTools { mode, .. }) => mode == "required",
+                _ => false,
+            };
 
         if used_json_schema {
             (tool_calls, processed_text) = parse_json_schema_response(
