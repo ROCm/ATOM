@@ -41,6 +41,9 @@ const SEQ_IDS: u64 = 1 << 24;
 /// How long opening a Session may take, from connecting to ATOM's Ready.
 const OPENING: Duration = Duration::from_secs(10);
 
+/// The outputs a streamed request may leave unread; past them it fails and is aborted.
+const ROUTE_BUFFER: usize = 4096;
+
 type Output = Result<GenerateResponse, Status>;
 
 /// A Session being opened, which every request waiting for it shares.
@@ -153,10 +156,10 @@ impl Session {
         let (commands, queued) = mpsc::unbounded_channel();
         let routes = Arc::new(Mutex::new(Routes::default()));
         let (opened, ready) = oneshot::channel();
-        let read_into = routes.clone();
+        let (read_into, aborts) = (routes.clone(), commands.downgrade());
         thread::Builder::new()
             .name("atom-session".into())
-            .spawn(move || run(url, bound, queued, read_into, opened))
+            .spawn(move || run(url, bound, queued, read_into, aborts, opened))
             .map_err(|e| EngineError::Transport(Status::internal(e.to_string())))?;
         let gone = |_| EngineError::Transport(Status::internal("the Session thread ended"));
         ready.await.map_err(gone).and_then(|opened| opened)?;
@@ -179,9 +182,10 @@ impl Session {
             message: "every seq_id of the ATOM Session is in use".to_string(),
         })?;
         spec.seq_id = seq_id;
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(ROUTE_BUFFER);
         let route = Route {
             tx,
+            overflowed: false,
             stream,
             prompt_tokens: prompt.len() as u32,
             completion_tokens: 0,
@@ -211,6 +215,7 @@ fn run(
     bound: Duration,
     queued: mpsc::UnboundedReceiver<Command>,
     routes: Arc<Mutex<Routes>>,
+    aborts: mpsc::WeakUnboundedSender<Command>,
     mut opened: oneshot::Sender<Result<(), EngineError>>,
 ) {
     let runtime = match runtime::Builder::new_current_thread().enable_all().build() {
@@ -232,7 +237,7 @@ fn run(
         match started {
             Ok((_client, inbound)) => {
                 if opened.send(Ok(())).is_ok() {
-                    read(inbound, routes, url).await;
+                    read(inbound, routes, aborts, url).await;
                 }
             }
             Err(e) => {
@@ -332,15 +337,27 @@ fn flush(
     }
 }
 
-/// The reader: hands each message's outputs to their requests until the call
-/// ends or sends one it cannot read, then fails the requests still open.
-async fn read(mut inbound: Streaming<Frames>, routes: Arc<Mutex<Routes>>, url: String) {
+/// The reader: hands each message's outputs to their requests, aborting those that
+/// overflow, until the call ends or sends one it cannot read; then fails the
+/// requests still open.
+async fn read(
+    mut inbound: Streaming<Frames>,
+    routes: Arc<Mutex<Routes>>,
+    aborts: mpsc::WeakUnboundedSender<Command>,
+    url: String,
+) {
     let status = loop {
         match inbound.message().await {
             Ok(Some(message)) => {
                 let routed = Inbound::decode(message.frames).and_then(|m| routes.lock().route(&m));
-                if let Err(e) = routed {
-                    break Status::internal(format!("ATOM Session: {e}"));
+                match routed {
+                    Ok(overflowed) => {
+                        let commands = aborts.upgrade();
+                        for seq_id in overflowed {
+                            commands.as_ref().map(|c| c.send(Command::Abort(seq_id)));
+                        }
+                    }
+                    Err(e) => break Status::internal(format!("ATOM Session: {e}")),
                 }
             }
             Ok(None) => break Status::unavailable("the ATOM Session ended"),
@@ -362,7 +379,9 @@ struct Routes {
 
 /// Where a request's outputs go, and what its Complete reports.
 struct Route {
-    tx: mpsc::UnboundedSender<Output>,
+    tx: mpsc::Sender<Output>,
+    /// Its stream left ROUTE_BUFFER outputs unread: it has its error, and is aborted.
+    overflowed: bool,
     stream: bool,
     prompt_tokens: u32,
     completion_tokens: u32,
@@ -373,11 +392,30 @@ struct Route {
 }
 
 impl Route {
+    /// Its last output; an overflowed request has its error already.
     fn send(&self, response: Response) {
         // A dropped stream has sent its Abort and reads nothing more.
-        let _ = self.tx.send(Ok(GenerateResponse {
-            response: Some(response),
-        }));
+        if !self.overflowed {
+            let _ = self.tx.try_send(Ok(GenerateResponse {
+                response: Some(response),
+            }));
+        }
+    }
+
+    /// One step's chunk; with one slot left, the request's error instead, the last
+    /// slot kept for it. True when the request is to be aborted.
+    fn stream(&mut self, chunk: GenerateStreamChunk) -> bool {
+        if self.overflowed || self.tx.is_closed() {
+            return false;
+        }
+        if self.tx.capacity() > 1 {
+            self.send(Response::Chunk(chunk));
+            return false;
+        }
+        self.overflowed = true;
+        let unread = format!("the request left {ROUTE_BUFFER} outputs unread");
+        let _ = self.tx.try_send(Err(Status::resource_exhausted(unread)));
+        true
     }
 }
 
@@ -392,8 +430,9 @@ impl Routes {
         Some(seq_id)
     }
 
-    /// Hands `message`'s outputs to their requests; an Err fails the Session.
-    fn route(&mut self, message: &Inbound<Vec<u8>>) -> Result<(), String> {
+    /// Hands `message`'s outputs to their requests; the seq_ids of those it overflows,
+    /// to abort. An Err fails the Session.
+    fn route(&mut self, message: &Inbound<Vec<u8>>) -> Result<Vec<u64>, String> {
         match &message.body {
             Body::Stream(batch) => self.step(batch),
             Body::Completions(completions) => {
@@ -423,7 +462,7 @@ impl Routes {
                         ..Default::default()
                     }));
                 }
-                Ok(())
+                Ok(Vec::new())
             }
             Body::Rejected(rejected) => {
                 for item in &rejected.items {
@@ -434,15 +473,15 @@ impl Routes {
                         }));
                     }
                 }
-                Ok(())
+                Ok(Vec::new())
             }
             _ => Err("a Session server sends Ready first, then only request outputs".into()),
         }
     }
 
     /// One engine step's entries: each request's ids, as one chunk when it streams,
-    /// else kept for its Complete.
-    fn step(&mut self, batch: &pb::StreamBatch) -> Result<(), String> {
+    /// else kept for its Complete; the seq_ids of the streams it overflows.
+    fn step(&mut self, batch: &pb::StreamBatch) -> Result<Vec<u64>, String> {
         let entries = batch.seq_ids.len();
         let counted: usize = batch.token_counts.iter().map(|&n| n as usize).sum();
         if batch.token_counts.len() != entries
@@ -451,7 +490,7 @@ impl Routes {
         {
             return Err("StreamBatch columns disagree in length".into());
         }
-        let mut start = 0;
+        let (mut start, mut overflowed) = (0, Vec::new());
         let columns = batch.token_counts.iter().zip(&batch.num_cached_tokens);
         for (seq_id, (&count, &cached)) in batch.seq_ids.iter().zip(columns) {
             let tokens = &batch.tokens[start..start + count as usize];
@@ -465,24 +504,29 @@ impl Routes {
             }
             let token_ids = tokens.iter().map(|&id| id as u32);
             if route.stream {
-                route.send(Response::Chunk(GenerateStreamChunk {
+                let chunk = GenerateStreamChunk {
                     token_ids: token_ids.collect(),
                     prompt_tokens: route.prompt_tokens,
                     completion_tokens: route.completion_tokens,
                     cached_tokens: route.cached_tokens,
-                }));
+                };
+                if route.stream(chunk) {
+                    overflowed.push(*seq_id);
+                }
             } else {
                 route.ids.extend(token_ids);
             }
         }
-        Ok(())
+        Ok(overflowed)
     }
 
     /// Ends every open request with `status`; the Session takes no request after.
     fn fail(&mut self, status: &Status) {
         self.closed = true;
         for (_, route) in self.open.drain() {
-            let _ = route.tx.send(Err(status.clone()));
+            if !route.overflowed {
+                let _ = route.tx.try_send(Err(status.clone()));
+            }
         }
     }
 }
@@ -539,7 +583,7 @@ fn json(value: &pb::Value) -> Result<Json, String> {
 /// Dropped before its last message, it aborts the request.
 pub(crate) struct SessionStream {
     seq_id: u64,
-    rx: mpsc::UnboundedReceiver<Output>,
+    rx: mpsc::Receiver<Output>,
     session: Session,
 }
 
@@ -559,7 +603,7 @@ impl Drop for SessionStream {
         if routes
             .open
             .get(&self.seq_id)
-            .is_some_and(|route| route.tx.is_closed())
+            .is_some_and(|route| route.tx.is_closed() && !route.overflowed)
         {
             let _ = self.session.commands.send(Command::Abort(self.seq_id));
         }

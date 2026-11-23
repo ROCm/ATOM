@@ -645,9 +645,10 @@ fn seq_ids_stay_below_2_24_and_skip_those_open_requests_hold() {
         ..Default::default()
     };
     for held in [SEQ_IDS - 1, 0] {
-        let (tx, _) = mpsc::unbounded_channel();
+        let (tx, _) = mpsc::channel(1);
         let route = Route {
             tx,
+            overflowed: false,
             stream: false,
             prompt_tokens: 0,
             completion_tokens: 0,
@@ -713,4 +714,41 @@ fn a_finished_stream_dropped_after_its_seq_id_is_reused_aborts_nothing() {
     // Dropped unfinished, the request now holding the seq_id is aborted.
     drop(reused);
     assert!(matches!(queued.try_recv(), Ok(Command::Abort(id)) if id == 0));
+}
+
+#[test]
+fn a_stream_left_unread_fails_alone_and_is_aborted_once_keeping_its_seq_id() {
+    let (commands, mut queued) = mpsc::unbounded_channel();
+    let routes = Arc::new(Mutex::new(Routes::default()));
+    let session = Session { routes, commands };
+    let mut unread = session.submit(spec("unread"), vec![1], true).unwrap();
+    let mut read = session.submit(spec("read"), vec![2], true).unwrap();
+    let (unread_id, read_id) = (unread.seq_id, read.seq_id);
+    let decoded = |message: Result<Frames, Status>| Inbound::decode(message.unwrap().frames);
+
+    // Each step reaches both; only `read` is read.
+    let mut aborted = Vec::new();
+    for _ in 0..ROUTE_BUFFER + 10 {
+        let message = decoded(step(&[(unread_id, vec![7], 0), (read_id, vec![8], 0)]));
+        aborted.extend(session.routes.lock().route(&message.unwrap()).unwrap());
+        assert!(matches!(read.rx.try_recv(), Ok(Ok(_))));
+    }
+    assert_eq!(aborted, [unread_id]);
+    let outputs: Vec<_> = std::iter::from_fn(|| unread.rx.try_recv().ok()).collect();
+    assert_eq!(outputs.len(), ROUTE_BUFFER);
+    assert!(outputs[..ROUTE_BUFFER - 1].iter().all(Result::is_ok));
+    assert!(
+        matches!(outputs.last(), Some(Err(status)) if status.code() == tonic::Code::ResourceExhausted)
+    );
+
+    // Its seq_id is held until its Completion, which it is not sent; dropped, it sends
+    // no second Abort.
+    assert!(session.routes.lock().open.contains_key(&unread_id));
+    let ended = decoded(done(vec![(completion(unread_id, "abort"), Vec::new())]));
+    session.routes.lock().route(&ended.unwrap()).unwrap();
+    assert!(!session.routes.lock().open.contains_key(&unread_id));
+    assert!(unread.rx.try_recv().is_err());
+    let _ = std::iter::from_fn(|| queued.try_recv().ok()).count();
+    drop(unread);
+    assert!(queued.try_recv().is_err());
 }
