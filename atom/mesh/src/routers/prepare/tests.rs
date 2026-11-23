@@ -1747,6 +1747,50 @@ mod i_atom_structured_output {
         assert_eq!(read, search("string"));
     }
 
+    /// A namespaced tool reaches the template and ATOM as sent, and its calls are read
+    /// as `namespace::name`, as ATOM's HTTP chat reads them, so two namespaces' `search`
+    /// stay apart.
+    #[test]
+    fn a_namespaced_message_tool_keeps_its_namespace() {
+        let search = |namespace: Value| {
+            json!({"type": "function", "namespace": namespace,
+                "function": {"name": "search", "parameters": {}}})
+        };
+        let (files, web) = (search(json!("files")), search(json!({"name": "web"})));
+        let body = json!({"model": "m", "messages": [
+            {"role": "system", "content": "be brief", "tools": [files.clone(), web.clone()]},
+            {"role": "user", "content": "hi"},
+        ]});
+        let (payload, ctx) = prepared_raw(body.clone(), RuntimeType::Atom);
+        let carried = payload.structured_output.expect("an ATOM chat carries one");
+        let declared = json!([[files, web], null]);
+        assert_eq!(parsed(carried.message_tools_json), Some(declared));
+        assert_eq!(tool_names(&ctx), ["files::search", "web::search"]);
+
+        use crate::routers::prepare::chat_template::process_chat_messages_with_kwargs;
+        use crate::tokenizer::{traits::Tokenizer, HuggingFaceTokenizer};
+        let mut tokenizer =
+            HuggingFaceTokenizer::from_file(test_mocks::tokenizer::hf_tokenizer_path()).unwrap();
+        let template = "{% for m in messages %}{% for t in m.tools or [] %}\
+            {{ t.namespace.name or t.namespace }}.{{ t.function.name }};{% endfor %}{% endfor %}";
+        tokenizer.set_chat_template(template.to_string()).unwrap();
+        let declared = MessageTools::read(&serde_json::to_vec(&body).unwrap()).unwrap();
+        let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+        let kwargs = Default::default();
+        let rendered =
+            process_chat_messages_with_kwargs(&request, &tokenizer, &kwargs, Some(&declared));
+        assert_eq!(rendered.unwrap().text, "files.search;web.search;");
+    }
+
+    #[test]
+    fn a_tool_with_two_namespaces_is_refused() {
+        let tool = json!({"type": "function", "namespace": "files",
+            "function": {"name": "web::search", "parameters": {}}});
+        let body = json!({"messages": [{"role": "system", "tools": [tool]}]});
+        let read = MessageTools::read(&serde_json::to_vec(&body).unwrap());
+        assert!(read.is_err_and(|e| e.contains("conflicting tool namespaces")));
+    }
+
     #[test]
     fn a_message_declaring_an_empty_tool_list_leaves_tool_parsing_off() {
         // ATOM's HTTP chat parses no tool call when the chat declares no tool.
