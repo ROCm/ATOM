@@ -1,7 +1,7 @@
 # Native L1 sharing across trays
 
 This opt-in path keeps ATOM's native paged KV allocation and slot management,
-using the MORI native L1 extension based on PR #1045. It imports the peer's
+using the MORI native L1 extension in PR #1074. It imports the peer's
 FABRIC-exportable HBM and copies directly into ATOM's held destination slots.
 There is no host/device staging buffer, SSD, or lower-tier KV pool in this path.
 Attention reads the completed local KV bytes as before.
@@ -14,17 +14,17 @@ completion; it does not implement the FABRIC memory lifecycle.
 
 ## Dependencies
 
-The 2026-11-23 alignment uses these upstream PR heads:
+This change is based directly on ATOM `main`; the base connector from
+[#3482](https://github.com/ROCm/ATOM/pull/3482) is already merged. The
+2026-11-25 alignment uses:
 
-| Repository | Base PR | Commit |
+| Repository | Source | Commit |
 | --- | --- | --- |
-| ATOM | [#3482](https://github.com/ROCm/ATOM/pull/3482) | `db27ec2198711f2d77dafff8ed0d5621af59d9fb` |
-| MORI | [#1045](https://github.com/ROCm/mori/pull/1045) | `82996281c5800ec63541cff7c793e7f86fc9907c` |
+| ATOM | `main` | `031d4da2671e72b724b41111edf979ce62e615c0` |
+| MORI | [#1074](https://github.com/ROCm/mori/pull/1074) | `36c430bab74b724843f78a4fbbec76c349155b93` |
 
-Both PRs were open at alignment time. This ATOM change builds on #3482;
-FABRIC runtime additionally requires the companion native L1 cross-tray change
-on top of MORI #1045 (tested MORI commit
-`13847e7eabde85dfa9dd6e817eaf2c114a21721a`). **MORI #1045 alone is insufficient.** Install the companion
+FABRIC runtime requires the companion MORI #1074 native L1 cross-tray change.
+**MORI #1045 alone is insufficient.** Install the companion
 Python helper and compiled extension together; startup requires
 `NATIVE_L1_FABRIC_VERSION=1` and `export_fabric_memory`. No merge of #1024 or the
 general KV-sharing branch is required. IPC remains the default.
@@ -118,38 +118,42 @@ must preserve affected owners and drain peers before teardown.
 MORI currently retains up to 65,536 peer operation receipts/tombstones per
 `PoolManager` lifetime, shared across its pools. Release and Detach/reattach do
 not reset this cumulative budget; exhaustion rejects new remote read grants.
+Each remote read window of up to 128 keys consumes one receipt.
 There is no automatic reclamation, so plan a coordinated drain and service
 restart before exhausting it.
 
 ## Validation scope
 
-The earlier implementation (ATOM base `bd897325f`, MORI base `b946dd65`) was
-validated on 2026-11-22 between g13-12 and g13-10, with four gfx1250 GPUs per tray
-in one active fabric domain:
+The 2026-11-25 alignment to `main` passed 414 pool, connector, scheduler,
+lifecycle, multi-connector and DP-routing tests, with one intentional native
+fault-injection skip. The native tests used a fresh `mori_umbp_l1` build from
+MORI `36c430ba`. GPU transfers and model inference were not rerun for this
+alignment; the results below describe the earlier PR revision.
 
-- CPU pool/lifecycle tests cover confirmed partial prefixes, unknown-Fetch
-  quarantine, GPU-event progress ordering, and failed Commit retries. Follow-up
-  CPU regressions also cover IPC/FABRIC reporter shutdown, repeated close, and
-  preservation of adapter state after an unconfirmed Detach. See
-  [ATOM lifecycle tests](../tests/test_umbp_fabric_lifecycle.py).
-- GPU tests passed all 32 directed device paths with strong byte patterns,
-  guards and final tensor-pointer checks, plus real GPU Event/Commit ordering,
-  slot reuse, and a ten-minute, four-pair bidirectional soak. Owners completed
-  normal Detach before services stopped.
-- DeepSeek-V4.1-Flash ran with Fetch disabled/enabled on the same consumer:
-  64 requests per arm including warmup had matching inputs, output text and
-  output tokens. The 16 measured remote-hit requests each confirmed actual KV
-  copying; true misses and local-hot requests had no remote copy.
+The 2026-11-23 run on g13-12 ↔ g13-10 used ATOM `3e37722ad` and MORI
+`965a6061`. It passed 134 ATOM
+pool/connector/lifecycle tests (one intentional native fault-injection skip).
+The capacity regression exercises real startup prompt limits and scheduler
+watermarks for full sharing, partial sharing and a private reserved null block.
+The matching MORI build passed 57 C++ tests, copy planner, 19 keep-copies peer
+tests and 12 Python helper tests.
 
-After alignment to the PR heads above, a fresh native extension/kernel build,
-ATOM's four pool/connector/lifecycle suites (128 passed, one intentional native
-fault-injection skip), MORI's pool/peer/RPC suites (56 passed), copy planner,
-and Python helper suite (12 passed) succeeded. All 18 peer tests also passed
-with `UMBP_L1_KEEP_COPIES=1`. The new regressions cover Fetch completion across
-cache clears, IPC Detach behavior, and remote read pins in the kept eviction
-list. GPU transfers and model inference were not rerun on these updated heads.
+Real GPUs passed all 32 directed paths (160 cases), both import orders and
+16 GPU Event/Commit cases. DeepSeek-V4.1-Flash Fetch-off/on on the same consumer
+matched inputs, complete output text and token counts for all 64 requests per
+arm including warmup. All 16 measured remote hits confirmed 96 slots /
+18,309,120 bytes copied each; true misses and local-hot requests had no remote
+copy. Each node ran attention DP4/TP1 and MoE EP4, without cross-node TP.
+Baseline, shared consumer and publisher each confirmed normal Detach.
 
-These are bounded workload and normal-shutdown results, not full model-quality
-or crash-recovery guarantees. An earlier GSM8K truncation remains unresolved
-and also reproduced with Fetch disabled. Saturated model throughput and
-topologies beyond the tested two trays have not been established.
+The test image `rocm/fw-bringup-mlperf:gfx1250-atom-20261116` needed the two
+Python modules from AITER #7416 (`11db23cc1d6f`) and the capability-query patch
+from #8086 (`ff2f0ce274e7`) for this newer ATOM base. Its existing gfx1250
+kernels were preserved. This greedy workload does not validate fused stochastic
+sampling, which requires additional gfx1250 configuration in that image.
+
+The earlier 2026-11-22 bases also passed slot reuse and a ten-minute bidirectional
+soak. These are bounded workload and normal-shutdown results, not full model
+quality or crash-recovery guarantees. An earlier GSM8K truncation remains
+unresolved and also reproduced with Fetch disabled. Saturated model throughput
+and topologies beyond the tested two trays have not been established.

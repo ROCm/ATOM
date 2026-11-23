@@ -4,11 +4,10 @@
 """`UmbpBlockPool`: private blocks first, cold content demoted into the part
 UMBP manages (atom/kv_transfer/pool/umbp/pool.py)."""
 
+import pytest
 import test_umbp_l1_pool as umbp_tests
+from conftest import MockConfig
 from test_umbp_l1_pool import make_pool, settle, toks
-
-# The L1 service fixture, the Python model and then the real one.
-l1 = umbp_tests.l1
 
 from atom.kv_transfer.pool.umbp import pool as umbp_pool
 from atom.kv_transfer.pool.umbp.pool import (
@@ -17,10 +16,21 @@ from atom.kv_transfer.pool.umbp.pool import (
     split_point,
 )
 from atom.kv_transfer.pool.umbp.settings import UmbpPoolSettings
+from atom.model_engine.block_manager import BlockManager
+from atom.model_engine.scheduler import Scheduler
+
+# The L1 service fixture, the Python model and then the real one.
+l1 = umbp_tests.l1
 
 
 def make_split(
-    client, name, private_blocks, shared_blocks, evicted=None, placement="private"
+    client,
+    name,
+    private_blocks,
+    shared_blocks,
+    evicted=None,
+    placement="private",
+    reserve_null_block=False,
 ):
     """A pool built the way `make_umbp_block_pool` builds one."""
     original = umbp_pool.make_umbp_l1_pool
@@ -40,6 +50,7 @@ def make_split(
             settings,
             private_blocks + shared_blocks,
             on_evict=None if evicted is None else evicted.append,
+            reserve_null_block=reserve_null_block,
         )
     finally:
         umbp_pool.make_umbp_l1_pool = original
@@ -58,6 +69,30 @@ def test_split_point_rounds_the_shared_part():
     assert split_point(100, 0.3) == 70
     assert split_point(100, 1.0) == 0
     assert split_point(7, 0.5) == 3  # round(3.5) = 4 shared
+
+
+@pytest.mark.parametrize("private,reserved", [(0, False), (3, False), (3, True)])
+def test_usable_capacity_drives_prompt_limit_and_watermark(l1, private, reserved):
+    pool = make_split(l1, "capacity", private, 8 - private, reserve_null_block=reserved)
+    capacity = 8 - int(reserved)
+    assert pool.num_blocks == 8
+    assert pool.umbp.num_usable_blocks == 8 - private
+    assert pool.num_usable_blocks == pool.eviction_stats()["blocks_total"] == capacity
+    manager = BlockManager(MockConfig(num_kvcache_blocks=8, kv_cache_block_size=4))
+    manager.kv = pool
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.block_manager = manager
+    for used in range(capacity + 1):
+        # Capacity stays fixed as occupancy changes: it is the watermark's
+        # denominator and the startup limit for a prompt in an empty pool.
+        assert manager.max_pool_tokens == capacity * 4
+        assert scheduler._kv_usage() == used / capacity
+        assert pool.num_free == capacity - used
+        assert pool.has_free(1) == (used < capacity)
+        if used < capacity:
+            block_id = pool.pop()
+            assert not reserved or block_id != 0
+            pool.allocate(block_id)
 
 
 def test_private_blocks_come_first(l1):
