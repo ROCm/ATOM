@@ -542,12 +542,12 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             and hasattr(module, "use_mla")
             and not module.use_mla
         ):
-            kv_format = ""
-            if _is_indexed_sparse_attention(module):
-                from atom.utils import envs
-
-                if envs.ATOM_M3_SPARSE_KV_NVFP4:
-                    kv_format = "nvfp4"
+            # The format the sparse impl declared at construction
+            # (`SparseMHAPagedAttentionImpl.kv_format`): the model's traced
+            # forward branches on that same declaration.
+            kv_format = (
+                module.impl.kv_format if _is_indexed_sparse_attention(module) else ""
+            )
             kinds.append(KvGeometry(module.num_kv_heads, module.head_dim, kv_format))
         return tuple(kinds)
 
