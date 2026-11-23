@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+from atom import structured_output
 from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.serving_anthropic import (
     AnthropicMessage,
@@ -244,6 +245,8 @@ class TestStructuredResponsesCutFirst:
             configured.append(schema)
 
         monkeypatch.setattr(api_server, "_configure_structured_output", configure)
+        # Setup is stubbed; the backend need not be installed.
+        monkeypatch.setattr(structured_output, "available", lambda: True)
         monkeypatch.setattr(
             api_server,
             "prompt_starts_in_reasoning",

@@ -17,6 +17,7 @@ import httpx
 import pytest
 from PIL import Image
 
+from atom import structured_output
 from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.images import MAX_IMAGES, NO_FILES_API
 from atom.entrypoints.openai.serving_anthropic import (
@@ -374,6 +375,8 @@ class TestResponsesEndpoint:
             seen.append(kwargs["multimodal"])
 
         monkeypatch.setattr(api_server, "_configure_structured_output", configure)
+        # Setup is stubbed; the backend need not be installed.
+        monkeypatch.setattr(structured_output, "available", lambda: True)
         monkeypatch.setattr(
             api_server, "validate_responses_output", lambda *a, **kw: None
         )

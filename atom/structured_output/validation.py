@@ -18,6 +18,12 @@ from atom import structured_output
 logger = logging.getLogger("atom")
 
 
+def require_available():
+    """A 400 naming the extra, before any schema check imports llguidance or RE2."""
+    if not structured_output.available():
+        raise ValueError(structured_output.UNAVAILABLE)
+
+
 def schema_from_format(fmt, *, responses=False):
     if fmt is None:
         return None
@@ -29,6 +35,7 @@ def schema_from_format(fmt, *, responses=False):
         raise ValueError("format.type must be text, json_object, or json_schema")
     if fmt["type"] == "text":
         return None
+    require_available()
     if fmt["type"] == "json_object":
         return json.dumps({"type": "object"})
     spec = fmt if responses else fmt.get("json_schema")
@@ -727,11 +734,11 @@ async def configure_tool_call_grammar(
     output stays unconstrained. A grammar error during decoding fails the
     request like any structured-output error.
     """
-    if not tools or parser_cls is None or not structured_output.available():
-        return False
     from atom.utils import envs
 
-    if not envs.ATOM_TOOL_CALL_GRAMMAR:
+    if not envs.ATOM_TOOL_CALL_GRAMMAR or not tools or parser_cls is None:
+        return False
+    if not structured_output.available():
         return False
     required_channel = sampling_params.required_channel
     reasoning_end = sampling_params.structured_reasoning_end
@@ -794,6 +801,7 @@ async def configure_request(
 ):
     if schema is None and not strict_schemas:
         return
+    require_available()
     validate_execution_options(
         config,
         sampling_params,

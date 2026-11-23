@@ -27,6 +27,15 @@ def deployment_metadata(config, encoder):
             "supported_levels": list(contract.effort_levels),
             "default_level": contract.default_effort,
         }
+    from atom import structured_output
+
+    # Installed with the backend's release; whether the topology runs it is
+    # still decided per request, at admission.
+    if structured_output.available():
+        result["structured_output"] = {
+            "backend": "llguidance",
+            "formats": ["json_object", "json_schema"],
+        }
     if contract.output_token_limit is not None:
         result["max_output_tokens"] = min(
             result.get("max_output_tokens", contract.output_token_limit),
