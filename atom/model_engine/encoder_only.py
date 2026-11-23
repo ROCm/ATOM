@@ -56,8 +56,13 @@ class VisionEncoder(nn.Module):
     """A model's vision modules under the model's attribute names, which are
     the checkpoint's, encoding as the model's ``get_vision_embeddings`` does."""
 
-    # Every checkpoint tensor outside the vision modules.
-    skip_weight_prefixes: ClassVar[list[str]] = ["language_model."]
+    # Every checkpoint tensor outside the vision modules. Skipping matches the
+    # checkpoint's names, before ``weights_mapping`` renames them: MiniMax-M3's
+    # mapping also takes ``model.language_model.``, which must not be read.
+    skip_weight_prefixes: ClassVar[list[str]] = [
+        "language_model.",
+        "model.language_model.",
+    ]
 
     def __init__(self, model_cls: type, modules: dict[str, nn.Module]) -> None:
         super().__init__()
