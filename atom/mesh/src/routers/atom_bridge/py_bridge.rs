@@ -89,7 +89,7 @@ impl StepSink {
 /// What the bridge submits besides the prompt's token ids. Fields the engine
 /// has no use for (penalties, `min_p`) are dropped, as the OpenAI server
 /// drops them; ones it cannot honour yet are refused (`from_payload`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub(crate) struct BridgeRequest {
     pub request_id: String,
     pub token_ids: Vec<u32>,
@@ -100,11 +100,7 @@ pub(crate) struct BridgeRequest {
     pub max_tokens: Option<i32>,
     pub stop: Vec<String>,
     pub ignore_eos: bool,
-    pub data_parallel_rank: Option<i64>,
-    pub tool_choice_required: bool,
-    pub dp_session_id: Option<String>,
-    pub dp_parent_session_id: Option<String>,
-    pub prompt_handle: Option<u64>,
+    pub extras: RequestExtras,
 }
 
 impl BridgeRequest {
@@ -112,41 +108,42 @@ impl BridgeRequest {
         payload: &GenerationPayload,
         extras: &RequestExtras,
     ) -> Result<Self, String> {
-        if payload.token_ids.is_empty() {
-            return Err("the prompt is empty".to_string());
-        }
-        if payload.stream && payload.sampling.n > 1 {
-            return Err(
-                "streaming with n > 1 is not supported by the ATOM Rust frontend yet".to_string(),
-            );
-        }
-        if payload.logprob.return_logprob || payload.logprob.logprob_start_len >= 0 {
-            return Err("logprobs are not supported by the ATOM Rust frontend yet".to_string());
-        }
-        if payload
-            .stop
-            .stop_token_ids
-            .as_ref()
-            .is_some_and(|ids| !ids.is_empty())
-        {
-            return Err("stop_token_ids is not supported by the ATOM engine".to_string());
-        }
-        if payload.tool_constraints.is_some() {
-            return Err(
+        let refused = [
+            (payload.token_ids.is_empty(), "the prompt is empty"),
+            (
+                payload.stream && payload.sampling.n > 1,
+                "streaming with n > 1 is not supported by the ATOM Rust frontend yet",
+            ),
+            (
+                payload.logprob.return_logprob || payload.logprob.logprob_start_len >= 0,
+                "logprobs are not supported by the ATOM Rust frontend yet",
+            ),
+            (
+                payload
+                    .stop
+                    .stop_token_ids
+                    .as_ref()
+                    .is_some_and(|ids| !ids.is_empty()),
+                "stop_token_ids is not supported by the ATOM engine",
+            ),
+            (
+                payload.tool_constraints.is_some(),
                 "tool_choice that constrains the output is not supported by the ATOM Rust \
-                 frontend yet"
-                    .to_string(),
-            );
-        }
-        if payload.return_hidden_states {
-            return Err("return_hidden_states is not supported by the ATOM engine".to_string());
-        }
-        if payload.pd_metadata.is_some() {
-            // A bootstrap room is P/D's; served plainly, its peer waits for
-            // a transfer that never comes.
-            return Err(
-                "P/D bootstrap fields are not supported by the ATOM Rust frontend yet".to_string(),
-            );
+                 frontend yet",
+            ),
+            (
+                payload.return_hidden_states,
+                "return_hidden_states is not supported by the ATOM engine",
+            ),
+            // A bootstrap room is P/D's; served plainly, its peer would wait
+            // for a transfer that never comes.
+            (
+                payload.pd_metadata.is_some(),
+                "P/D bootstrap fields are not supported by the ATOM Rust frontend yet",
+            ),
+        ];
+        if let Some((_, reason)) = refused.iter().find(|(refuse, _)| *refuse) {
+            return Err(reason.to_string());
         }
         let stop = match &payload.stop.stop {
             None => Vec::new(),
@@ -163,16 +160,13 @@ impl BridgeRequest {
             max_tokens: payload.sampling.max_new_tokens,
             stop,
             ignore_eos: payload.sampling.ignore_eos,
-            data_parallel_rank: extras.data_parallel_rank,
-            tool_choice_required: extras.tool_choice_required,
-            dp_session_id: extras.dp_session_id.clone(),
-            dp_parent_session_id: extras.dp_parent_session_id.clone(),
-            prompt_handle: extras.prompt_handle,
+            extras: extras.clone(),
         })
     }
 
     fn params<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let params = PyDict::new(py);
+        let extras = &self.extras;
         params.set_item("request_id", &self.request_id)?;
         params.set_item("temperature", self.temperature)?;
         params.set_item("top_p", self.top_p)?;
@@ -181,11 +175,11 @@ impl BridgeRequest {
         params.set_item("max_tokens", self.max_tokens)?;
         params.set_item("stop", PyList::new(py, &self.stop)?)?;
         params.set_item("ignore_eos", self.ignore_eos)?;
-        params.set_item("data_parallel_rank", self.data_parallel_rank)?;
-        params.set_item("tool_choice_required", self.tool_choice_required)?;
-        params.set_item("dp_session_id", &self.dp_session_id)?;
-        params.set_item("dp_parent_session_id", &self.dp_parent_session_id)?;
-        params.set_item("prompt_handle", self.prompt_handle)?;
+        params.set_item("data_parallel_rank", extras.data_parallel_rank)?;
+        params.set_item("tool_choice_required", extras.tool_choice_required)?;
+        params.set_item("dp_session_id", &extras.dp_session_id)?;
+        params.set_item("dp_parent_session_id", &extras.dp_parent_session_id)?;
+        params.set_item("prompt_handle", extras.prompt_handle)?;
         Ok(params)
     }
 }

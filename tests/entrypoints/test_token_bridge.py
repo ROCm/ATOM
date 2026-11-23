@@ -6,7 +6,6 @@ OpenAI server's, a request's sequences through CoreManager, its outputs back
 to Rust once per step, and abort."""
 
 import itertools
-import json
 import threading
 import types
 from collections import OrderedDict
@@ -93,7 +92,6 @@ def _bridge(engine=None, *, max_model_len=None, output_limit=None, channel=None)
     bridge._local = threading.local()
     bridge._rendered = OrderedDict()
     bridge._render_handles = itertools.count(1)
-    bridge._tool_parser_cls = None
     bridge.engine.core_mgr._flush_stream_batch_fn = bridge._flush
     return bridge
 
@@ -318,30 +316,30 @@ _TOOLS = [
 ]
 
 
-def _k3_bridge(monkeypatch, parser_cls, grammar_on):
+def _refusal(monkeypatch, parser_cls, grammar_on):
+    """`ChatRenderer`'s check, for a model whose prompt opens K3's think."""
     from atom.entrypoints.openai import kimi_k3_tokens
 
     monkeypatch.setenv("ATOM_TOOL_CALL_GRAMMAR", "1" if grammar_on else "0")
     monkeypatch.setattr(token_bridge.structured_output, "available", lambda: True)
-    bridge = _bridge()
-    _rendering(bridge, [1, 2])
-    bridge._renderer.dialect = types.SimpleNamespace(
-        prompt_open_marker=kimi_k3_tokens.THINK_START
+    renderer = token_bridge.ChatRenderer.__new__(token_bridge.ChatRenderer)
+    renderer.tool_parser_cls = parser_cls
+    think = kimi_k3_tokens.THINK_START
+    renderer.dialect = types.SimpleNamespace(prompt_open_marker=think)
+    return lambda tools, tool_choice=None: renderer._refuse_unheld_tool_calls(
+        tools, tool_choice, think
     )
-    bridge._tool_parser_cls = parser_cls
-    return bridge
 
 
 def test_a_k3_chat_with_tools_the_server_would_hold_is_refused(monkeypatch):
     from atom.entrypoints.openai.tool_parser.kimi_k3_tool_parser import KimiK3Parser
 
-    bridge = _k3_bridge(monkeypatch, KimiK3Parser, grammar_on=True)
+    refuse = _refusal(monkeypatch, KimiK3Parser, grammar_on=True)
     with pytest.raises(ValueError, match="ATOM_TOOL_CALL_GRAMMAR"):
-        bridge.render_chat(json.dumps({"messages": [], "tools": _TOOLS}))
+        refuse(_TOOLS)
     # tool_choice "none" or no tools: nothing to hold, nothing refused.
-    body = {"messages": [], "tools": _TOOLS, "tool_choice": "none"}
-    assert bridge.render_chat(json.dumps(body))[1] == [1, 2]
-    assert bridge.render_chat('{"messages": []}')[1] == [1, 2]
+    refuse(_TOOLS, "none")
+    refuse([])
 
 
 @pytest.mark.parametrize("parser", ["k3_grammar_off", "dsml"])
@@ -350,8 +348,6 @@ def test_tool_calls_the_server_leaves_unconstrained_are_served(monkeypatch, pars
     from atom.entrypoints.openai.tool_parser.kimi_k3_tool_parser import KimiK3Parser
 
     if parser == "dsml":  # a format that declares no grammar
-        bridge = _k3_bridge(monkeypatch, DsmlParser, grammar_on=True)
+        _refusal(monkeypatch, DsmlParser, grammar_on=True)(_TOOLS)
     else:  # the server's default: ATOM_TOOL_CALL_GRAMMAR off
-        bridge = _k3_bridge(monkeypatch, KimiK3Parser, grammar_on=False)
-    body = {"messages": [], "tools": _TOOLS}
-    assert bridge.render_chat(json.dumps(body))[1] == [1, 2]
+        _refusal(monkeypatch, KimiK3Parser, grammar_on=False)(_TOOLS)

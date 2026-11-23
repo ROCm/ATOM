@@ -67,6 +67,7 @@ from atom.entrypoints.openai.reasoning_controls import (
 from atom.entrypoints.openai.reasoning_dialects import resolve_dialect
 from atom.entrypoints.openai.serving_chat import (
     normalize_chat_tools,
+    request_tools,
     validate_chat_request,
 )
 from atom.entrypoints.openai.tool_parser.registry import (
@@ -90,11 +91,17 @@ _RENDERED_TTL_S = 30.0
 class ChatRenderer:
     """A chat prompt as ATOM's own server renders it, for a model whose
     template the router cannot render (``needed``): one with a Python message
-    encoder, or a tokenizer whose ``chat_template`` is code, not Jinja."""
+    encoder, or a tokenizer whose ``chat_template`` is code, not Jinja. Also
+    the model's tool-call format, as the OpenAI server resolves it."""
 
-    def __init__(self, tokenizer: Any, model: str) -> None:
+    def __init__(
+        self, tokenizer: Any, model: str, tool_call_parser: str | None = None
+    ) -> None:
         self.tokenizer = tokenizer
         self.encoder = load_custom_message_encoder(model)
+        self.tool_parser_cls = resolve_tool_call_parser(
+            tool_call_parser, tokenizer, self.encoder, model=model
+        )
         # A Jinja template (one string, or named variants) is the router's
         # to render; an encoder, or a template that is code, is not.
         self.needed = self.encoder is not None or not chat_template_source(tokenizer)
@@ -153,7 +160,13 @@ class ChatRenderer:
             preserve_tool_call_arguments=self.preserve_tool_call_arguments,
             **kwargs,
         )
-        return prompt, self._opener(prompt, kwargs)
+        opener = self._opener(prompt, kwargs)
+        # Every tool the request declares, K3's in-message ones included, as
+        # the OpenAI server hands them to `configure_tool_call_grammar`.
+        self._refuse_unheld_tool_calls(
+            request_tools(chat), request.get("tool_choice"), opener
+        )
+        return prompt, opener
 
     def _template_kwargs(self, request: dict[str, Any]) -> dict[str, Any]:
         """The request's template kwargs, with what the OpenAI server's
@@ -191,6 +204,30 @@ class ChatRenderer:
             return self.dialect.prompt_open_marker
         return None
 
+    def _refuse_unheld_tool_calls(self, tools, tool_choice, opener) -> None:
+        """Refuse a chat whose tool calls the OpenAI server would hold to their
+        schemas, decided as `configure_tool_call_grammar` decides it (Kimi-K3,
+        with ATOM_TOOL_CALL_GRAMMAR and the structured-output extras): the
+        bridge carries no grammar yet, and unconstrained K3 can copy an empty
+        call out of its history."""
+        if not tools or self.tool_parser_cls is None:
+            return
+        if not envs.ATOM_TOOL_CALL_GRAMMAR or not structured_output.available():
+            return
+        starts_open = opener is not None and opener == self.dialect.prompt_open_marker
+        try:
+            fmt = tool_call_grammar_format(
+                self.tool_parser_cls, tools, tool_choice, starts_open
+            )
+        except ValueError:  # a schema the server leaves unconstrained
+            return
+        if fmt is not None:
+            raise ValueError(
+                "tool calls held to their schemas (ATOM_TOOL_CALL_GRAMMAR) are not "
+                "supported by the ATOM Rust frontend yet; use the OpenAI server "
+                "(USE_ATOMESH_ENTRYPOINTS=0)"
+            )
+
 
 class TokenBridge:
     """The Python half of ``AtomBridgeRouter``; see the module docstring."""
@@ -206,16 +243,14 @@ class TokenBridge:
         self.engine = engine
         # Read by Rust (`AtomBridgeRuntime::from_bridge`) to find its sink.
         self.sink = sink
-        self._renderer = ChatRenderer(tokenizer, model)
+        self._renderer = ChatRenderer(tokenizer, model, tool_call_parser)
         # Read by Rust: render every chat prompt through `render_chat`.
         self.renders_chat = self._renderer.needed
-        # What `tool_choice: "required"` holds a chat's output to, as the
-        # Python standalone service derives it: the tool-call channel of the
-        # model's format, where the format defines one (Kimi-K3's).
-        self._tool_parser_cls = resolve_tool_call_parser(
-            tool_call_parser, tokenizer, self._renderer.encoder, model=model
+        # What `tool_choice: "required"` holds a chat's output to: the
+        # tool-call channel of the model's format, where it defines one (K3's).
+        self._required_channel = required_call_channel(
+            self._renderer.tool_parser_cls, tokenizer
         )
-        self._required_channel = required_call_channel(self._tool_parser_cls, tokenizer)
         config = getattr(engine, "config", None)
         self._max_model_len = getattr(config, "max_model_len", None)
         self._output_limit = deployment_metadata(config, None).get("max_output_tokens")
@@ -289,9 +324,7 @@ class TokenBridge:
         the ids (extended turn by turn in a session); ``submit`` hands it to
         ``preprocess_fanout`` so the prompt is not hashed a second time.
         """
-        request = json.loads(request_json)
-        prompt, opener = self._renderer.render(request)
-        self._refuse_unheld_tool_calls(request, opener)
+        prompt, opener = self._renderer.render(json.loads(request_json))
         encoded = self.engine.io_processor.encode_prompt(prompt)
         if not isinstance(encoded, PrefixEncoding):
             return prompt, list(encoded), opener, None
@@ -307,34 +340,6 @@ class TokenBridge:
             ):
                 rendered.popitem(last=False)
         return prompt, list(encoded.token_ids), opener, handle
-
-    def _refuse_unheld_tool_calls(self, request: dict[str, Any], opener) -> None:
-        """Refuse a chat whose tool calls the OpenAI server would hold to their
-        schemas, as `configure_tool_call_grammar` decides it (Kimi-K3's, with
-        ATOM_TOOL_CALL_GRAMMAR and the structured-output extras): the bridge
-        does not carry that grammar yet, and unconstrained, K3 can copy an
-        empty call out of its history. A schema the server would leave
-        unconstrained is not refused."""
-        tools = request.get("tools")
-        if not tools or self._tool_parser_cls is None:
-            return
-        if not envs.ATOM_TOOL_CALL_GRAMMAR or not structured_output.available():
-            return
-        starts_open = (
-            opener is not None and opener == self._renderer.dialect.prompt_open_marker
-        )
-        try:
-            fmt = tool_call_grammar_format(
-                self._tool_parser_cls, tools, request.get("tool_choice"), starts_open
-            )
-        except ValueError:
-            return
-        if fmt is not None:
-            raise ValueError(
-                "tool calls held to their schemas (ATOM_TOOL_CALL_GRAMMAR) are not "
-                "supported by the ATOM Rust frontend yet; use the OpenAI server "
-                "(USE_ATOMESH_ENTRYPOINTS=0)"
-            )
 
     def _rendered_encoding(
         self, handle: int | None, token_ids: list[int]
@@ -387,7 +392,7 @@ class TokenBridge:
                     list(request_output.output_tokens or ()),
                     bool(request_output.finished),
                     request_output.finish_reason,
-                    int(getattr(request_output, "num_cached_tokens", 0) or 0),
+                    request_output.num_cached_tokens or 0,
                 )
             )
             if request_output.finished:
@@ -413,13 +418,9 @@ class TokenBridge:
             keys = sorted({output[0] for output in pending})
             logger.exception("TokenBridge: lost an engine step for keys %s", keys)
             self.sink.fail(keys, f"lost an engine step: {exc}")
-            if not getattr(self._local, "failing", False):
-                # An abort can flush again on this thread; stop there.
-                self._local.failing = True
-                try:
-                    self.abort(keys)
-                finally:
-                    self._local.failing = False
+            # `abort` forgets the keys before it stops anything, so a flush the
+            # abort itself triggers finds nothing more of theirs to stop.
+            self.abort(keys)
 
     def _finish(self, key: int, seq_id: int) -> None:
         with self._lock:
@@ -475,9 +476,7 @@ class TokenBridge:
         )
 
     def _forget(self, seq_ids: list[int]) -> None:
-        requests = getattr(self.engine.io_processor, "requests", None)
-        if requests is None:
-            return
+        requests = self.engine.io_processor.requests
         for seq_id in seq_ids:
             requests.pop(seq_id, None)
 

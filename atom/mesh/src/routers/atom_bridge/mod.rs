@@ -161,55 +161,46 @@ impl RequestExtras {
         REQUEST_EXTRAS.try_with(Clone::clone).unwrap_or_default()
     }
 
+    /// The extras of a request: its session headers, and the body fields the
+    /// typed request drops. A P/D transfer is refused: it is not carried to
+    /// the engine, and served plainly a prefill hands its decode nothing.
     fn read(request: &InferenceEnvelope) -> Result<Self, Response> {
-        let typed_rank = match &request.parsed {
-            ParsedInference::Generate(body) => body.data_parallel_rank.map(i64::from),
-            _ => None,
+        let (dp_session_id, dp_parent_session_id) = session_ids(&request.headers);
+        let mut extras = Self {
+            dp_session_id,
+            dp_parent_session_id,
+            ..Self::default()
         };
+        if let ParsedInference::Generate(body) = &request.parsed {
+            extras.data_parallel_rank = body.data_parallel_rank.map(i64::from);
+        }
         if !RAW_KEYS
             .iter()
             .any(|key| memchr::memmem::find(&request.body, key).is_some())
         {
-            return Ok(Self {
-                data_parallel_rank: typed_rank,
-                ..Self::default()
-            });
+            return Ok(extras);
         }
         let raw = serde_json::from_slice::<Map<String, Value>>(&request.body)
             .map_err(|e| error::bad_request("invalid_request", e.to_string()))?;
-        // P/D's transfer is not carried to the engine: served as a plain
-        // request, a prefill would hand its decode nothing to resume from.
-        if raw.get("kv_transfer_params").is_some_and(|v| !v.is_null()) {
+        let field = |name: &str| raw.get(name).filter(|v| !v.is_null());
+        if field("kv_transfer_params").is_some() {
             return Err(error::bad_request(
                 "pd_unsupported",
                 "kv_transfer_params (P/D) is not supported by the ATOM Rust frontend yet; \
                  serve P/D workers with the OpenAI server (USE_ATOMESH_ENTRYPOINTS=0)",
             ));
         }
-        if typed_rank.is_some() {
-            let thinking = raw.get("thinking").filter(|v| !v.is_null()).cloned();
-            return Ok(Self {
-                data_parallel_rank: typed_rank,
-                thinking,
-                ..Self::default()
-            });
+        extras.thinking = field("thinking").cloned();
+        if let Some(rank) = field("data_parallel_rank") {
+            extras.data_parallel_rank =
+                Some(rank.as_i64().filter(|r| *r >= 0).ok_or_else(|| {
+                    error::bad_request(
+                        "invalid_request",
+                        format!("data_parallel_rank must be a non-negative integer, got {rank}"),
+                    )
+                })?);
         }
-        let data_parallel_rank = match raw.get("data_parallel_rank") {
-            None | Some(Value::Null) => None,
-            Some(Value::Number(n)) if n.as_i64().is_some_and(|r| r >= 0) => n.as_i64(),
-            Some(other) => {
-                return Err(error::bad_request(
-                    "invalid_request",
-                    format!("data_parallel_rank must be a non-negative integer, got {other}"),
-                ))
-            }
-        };
-        let thinking = raw.get("thinking").filter(|v| !v.is_null()).cloned();
-        Ok(Self {
-            data_parallel_rank,
-            thinking,
-            ..Self::default()
-        })
+        Ok(extras)
     }
 }
 
@@ -343,11 +334,10 @@ impl RouterTrait for AtomBridgeRouter {
         request: InferenceEnvelope,
         _app: &Arc<AppContext>,
     ) -> Response {
-        let mut extras = match RequestExtras::read(&request) {
+        let extras = match RequestExtras::read(&request) {
             Ok(extras) => extras,
             Err(response) => return response,
         };
-        (extras.dp_session_id, extras.dp_parent_session_id) = session_ids(&request.headers);
         let (uri, headers, parsed, metadata) = request.into_native_parts();
         let headers = Some(&headers);
         let model = metadata.model.as_deref();
