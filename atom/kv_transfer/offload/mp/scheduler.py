@@ -147,7 +147,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         if not self._do_load or not getattr(client, "driving", False):
             return
         for seq in seqs:
-            if self._lookup_len(seq) <= 0:
+            if not self._lookup_wanted(seq):
                 continue
             client.offer(
                 str(seq.id),
@@ -162,7 +162,28 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         """
         if getattr(seq, "status", None) != SequenceStatus.WAITING:
             return None
+        if not self._lookups_enabled:
+            return None
         return self._lookup_token_ids(seq)
+
+    # -- turning lookups off ---------------------------------------------------
+
+    _lookups_enabled = True
+
+    def set_offload_lookups(self, enabled: bool) -> bool:
+        """Start tier lookups for new requests or not; True if applied.
+
+        Off once what a read-only tier holds is back in HBM (a replayed warmup).
+        An answer already held still loads. Refused while this scheduler saves:
+        without a lookup its saves would store every prompt from token 0 again.
+        """
+        if not enabled and self._do_save:
+            return False
+        self._lookups_enabled = bool(enabled)
+        return True
+
+    def _lookup_wanted(self, seq: Any) -> bool:
+        return self._lookups_enabled and super()._lookup_wanted(seq)
 
     # -- same-step saves -------------------------------------------------------
 
@@ -206,8 +227,17 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         return reach
 
     def get_num_new_matched_tokens(self, seq: Any) -> tuple[int, bool]:
-        matched = super().get_num_new_matched_tokens(seq)
         sid = str(seq.id)
+        held = self._lookup_results.get(sid)
+        if not self._lookups_enabled and (held is None or held[0] is not seq):
+            # As with loads off (`_do_load`): no lookup, and a plan made from a
+            # remembered hit before the switch must not load after allocation.
+            if sid in self._load_specs:
+                self._clear_pending_load(sid)
+            # A lookup sent before the switch is never consumed: free its locks.
+            self._lookup_client.discard(sid)
+            return 0, False
+        matched = super().get_num_new_matched_tokens(seq)
         num_prompt = int(seq.num_prompt_tokens)
         # The base's remembered hit, not `hit_tokens`: a step answered from the
         # memo runs no lookup, so there is no client-side state to read back.
