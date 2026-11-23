@@ -2620,9 +2620,9 @@ class Scheduler:
                 break
 
             # Probe cache hits FIRST so budget check sees the real
-            # (post-prefix-cache) remaining token count. V4 SWA correctness is
-            # enforced inside can_allocate (_swa_bounded_hit bounds the hit to
-            # where the trailing-window SWA is present); no post-hoc warmup trim.
+            # (post-prefix-cache) remaining token count. V4's sliding window is
+            # part of the per-request state, which `can_allocate`'s state gate
+            # covers; no post-hoc warmup trim.
             hbm_probe = self._reprobe_after_tier_answer(seq, hbm_probe, probed_tier_kv)
             num_cached_blocks = hbm_probe.num_cached_blocks
             if num_cached_blocks < 0:
@@ -2807,12 +2807,12 @@ class Scheduler:
                 self._inflight_prefix_wait.pop(seq.id, None)
                 continue
 
-            # Refresh, not a duplicate of the set above: that one is guarded
-            # on the field being empty, so a seq re-admitted after `preempt()`
+            # Refresh, not a duplicate of the set above: that one keeps a hit
+            # the producer reported, so a seq re-admitted after `preempt()`
             # would keep its previous admission's hit. Unconditional here, where
-            # the request is certain to prefill locally. The only path reaching
-            # this with an inherited PD hit is a *failed* remote recv, and there
-            # the local hit is the truthful number.
+            # the request is certain to prefill locally. What reaches this with
+            # an inherited P/D hit is a consumer re-admitted after `preempt()`,
+            # which now prefills here, so the local hit is the truthful number.
             seq.prefix_cache_hit_tokens = seq.num_cached_tokens
             self._resume_prefill(
                 seq,
@@ -3570,11 +3570,18 @@ class Scheduler:
 
     def _query_connector_prefill_match(self, seq: Sequence, *, skip: bool) -> bool:
         """Ask the connector whether this prefill should park for remote KV."""
-        if skip or self.kv_connector is None:
+        if skip:
             return False
-        ext_tokens, needs_remote_load = self.kv_connector.get_num_new_matched_tokens(
-            seq
-        )
+        conn = self.kv_connector
+        if conn is None:
+            return False
+        ext_tokens, needs_remote_load = conn.get_num_new_matched_tokens(seq)
+        if conn.may_receive_suffix_and_state:
+            # Before `can_allocate`, every pass: the load's owner says whether
+            # this receive skips the local prefix and brings the state whole.
+            seq.state_from_peer = needs_remote_load and conn.receives_suffix_and_state(
+                seq
+            )
         # Keep the lookup's answer, not just the park flag: `can_allocate` runs
         # next and a hybrid's two legs have to be aimed at one boundary, for
         # which this is the KV leg's ceiling. In tokens, and absolute -- the
@@ -4063,9 +4070,12 @@ class Scheduler:
         # under DCP, and is what EngineStats uses, so the user-visible number
         # and the internal hit rate cannot disagree.
         #
-        # Guard: PD decode consumer inherits hit from prefill node;
-        # don't clobber with the local hit (always 0 on consumer).
-        if not seq.prefix_cache_hit_tokens:
+        # Guard: PD decode consumer inherits hit from prefill node; don't
+        # clobber it with the consumer's local hit, which only skips a transfer.
+        if (
+            not seq.kv_transfer_params
+            or "prefix_cache_hit_tokens" not in seq.kv_transfer_params
+        ):
             # The gated HBM hit, not the chunk floor `allocate` may have
             # lowered `num_cached_tokens` to. `[floor, hbm)` is refilled
             # from CPU but was already resident; recording the floor makes
@@ -4705,6 +4715,8 @@ class Scheduler:
         seq.num_placeholder_tokens = 0
         seq.spec_token_ids = np.array([], dtype=np.int32)
         seq.is_first_decode = False
+        # The recompute resumes nothing a peer pushed.
+        seq.state_from_peer = False
         if seq.is_partial_prefill:
             seq.is_partial_prefill = False
             self._partial_prefill_count -= 1

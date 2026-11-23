@@ -17,23 +17,15 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-from aiter_stub import stubbed_aiter
+from aiter_stub import atom_without_aiter, stubbed_aiter
 
-with stubbed_aiter():
-    # `importorskip`, not a plain import: `moriio_connector` reaches
-    # `disaggregation.utils`, which imports triton, and a CPU-only runner has
-    # none of it. A bare import there is a *collection* error, which takes the
-    # whole suite down rather than this module. Every test below is
-    # parametrized over both backends, so the module is the right granularity.
-    # Same guard as `test_transfer_engine.py` and `test_pd_pp.py`.
-    _SKIP = "P/D backend deps (triton, mooncake) are absent on a CPU-only runner"
-    MooncakeConnectorScheduler = pytest.importorskip(
-        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector",
-        reason=_SKIP,
+# Against the AITER and Triton stand-ins where those cannot run (the CPU lane).
+with atom_without_aiter() as load:
+    MooncakeConnectorScheduler = load(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
     ).MooncakeConnectorScheduler
-    MoRIIOConnectorScheduler = pytest.importorskip(
-        "atom.kv_transfer.disaggregation.moriio.moriio_connector",
-        reason=_SKIP,
+    MoRIIOConnectorScheduler = load(
+        "atom.kv_transfer.disaggregation.moriio.moriio_connector"
     ).MoRIIOConnectorScheduler
 
 
@@ -75,7 +67,13 @@ def _mooncake(is_producer=True):
 
 
 def _moriio(is_producer=True):
-    return _build(MoRIIOConnectorScheduler, is_producer)
+    return _build(
+        MoRIIOConnectorScheduler,
+        is_producer,
+        block_size=16,
+        dcp_size=1,
+        hash_block_size=16,
+    )
 
 
 def _seq(seq_id=7, **params):

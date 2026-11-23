@@ -347,7 +347,7 @@ The state class costs no paged blocks at admission time: sizing reserves every S
 
 ### State checkpoints (stateful-attention prefix caching)
 
-Neither the GDN recurrent state nor the V4 compressor ring can be rebuilt from cached KV blocks — the cache holds the compressor's *output*, the state is its rolling *input* window. So for a stateful model a prefix-cache hit is only resumable at a boundary where some earlier request saved its state, and `can_allocate` gates on that as a third shrink, chained after the SWA one:
+Neither the GDN recurrent state nor the V4 compressor ring can be rebuilt from cached KV blocks — the cache holds the compressor's *output*, the state is its rolling *input* window. So for a stateful model a prefix-cache hit is only resumable at a boundary where some earlier request saved its state, and `can_allocate` gates on that after the compressed-prefix walk:
 
 ```
 for cache in state_caches:                        # to a fixpoint, not in series
@@ -472,7 +472,7 @@ def can_append(self, seq: Sequence, num_new_tokens: int = 1) -> bool:
 ```
 
 `can_allocate` checks the full per-request state-slot reservation and PAGE-unit
-capacity. Its cache hit incorporates KV, SWA and state-checkpoint availability.
+capacity. Its cache hit incorporates KV and state-checkpoint availability.
 With `record=False`, it leaves joint-load fields and joint-boundary counters
 uncommitted; checkpoint demand/end and hit instrumentation still refresh.
 Checkpoint demand counters deduplicate per request.
@@ -488,10 +488,18 @@ shipped chain, and completion tokens, which never enter the chain). So a
 prefill hashes each prompt block at most once on the scheduler thread, and none
 when the shipped chain is adopted (`publish_loaded_prefix`,
 `register_received_prefix` and `acquire_offload_prefix` still hash the blocks
-they handle). The evaluation applies the SWA and state
-gates, the bounded replay, the checkpoint demand/end, the count of hit blocks
-already in use, and the fit. `allocate` claims the block ids the seq's last
-walk found, unless the index changed under them.
+they handle). The evaluation applies the state gate, the bounded replay, the
+checkpoint demand/end, the count of hit blocks already in use, and the fit. A
+P/D receive whose load owner moves only the blocks past the local hit and the
+per-request state whole skips the state gate and the replay: the hash-matched
+prefix is its hit, and it resumes no state (`seq.state_from_peer`). The
+scheduler asks before allocation, per request (`receives_suffix_and_state(seq)`),
+and only a connector whose `may_receive_suffix_and_state` is set; preemption
+drops the answer. MoRIIO says yes only for a push (write mode) from a producer that
+advertises the consumer's `block_size` / `dcp_size`. A read, a producer paging
+otherwise, and DeepSeek-V4 / V4.1 (whose KV and state move as transfer regions)
+move every block. `allocate` claims the block ids the seq's last walk found,
+unless the index changed under them.
 
 The probes that run every tick (the delayer's head check and probe, the DP
 chunk-cost estimate) call `can_allocate_memoized`. It reuses a seq's walk until
