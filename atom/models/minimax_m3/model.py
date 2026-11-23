@@ -18,7 +18,7 @@ from aiter.rotary_embedding import get_rope
 from torch import nn
 from transformers import PretrainedConfig
 
-from atom.config import Config, QuantizationConfig
+from atom.config import Config, QuantizationConfig, get_current_atom_config
 from atom.distributed.indexer_cp import indexer_cp_enabled
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.attention_mha import SparseMHAPagedAttentionImpl
@@ -65,8 +65,17 @@ from atom.models.utils import (
     maybe_prefix,
 )
 from atom.utils import envs
+from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import support_torch_compile
 from atom.utils.region_graph import token_graph
+
+try:
+    from aiter.ops.flydsl.mxfp8_decode_gemm_gfx1250 import (
+        mxfp8_decode_gemm,
+        mxfp8_decode_gemm_supported,
+    )
+except ImportError:  # an aiter without ROCm/aiter#8273
+    mxfp8_decode_gemm = mxfp8_decode_gemm_supported = None
 
 
 def _get_text_config(config: PretrainedConfig) -> PretrainedConfig:
@@ -169,6 +178,103 @@ def _log_conditions_once(what: str, conditions: dict, prefix: str) -> None:
         logging.INFO if first else logging.WARNING,
         f"MiniMax-M3 {what} {'ON' if verdict else 'OFF'} ({prefix}): {text}",
     )
+
+
+def _fast_oproj_conditions(o_proj: nn.Module) -> dict:
+    """What aiter's gfx1250 decode GEMM needs of o_proj. The weight's layout is
+    settled by its ``process_weights_after_loading``, after construction, so
+    this is asked at the first call."""
+    weight = getattr(o_proj, "weight", None)
+    scale = getattr(o_proj, "weight_scale", None)
+    n, k = tuple(weight.shape) if weight is not None and weight.dim() == 2 else (0, 0)
+    return {
+        "aiter mxfp8_decode_gemm": mxfp8_decode_gemm_supported is not None,
+        "gfx1250 and (N, K) served": mxfp8_decode_gemm_supported is not None
+        and n > 0
+        and mxfp8_decode_gemm_supported(1, n, k),
+        "no bias": getattr(o_proj, "bias", None) is None,
+        "native 1x32 scales": getattr(o_proj, "native_a8_group_rows", None) == 1,
+        "E4M3 weight": weight is not None and weight.dtype == torch.float8_e4m3fn,
+        "preshuffled weight": bool(getattr(weight, "is_shuffled", False)),
+        "contiguous weight": weight is not None and weight.is_contiguous(),
+        "scale [N, K/32]": scale is not None
+        and tuple(scale.shape) == (n, k // 32)
+        and scale.is_contiguous(),
+        "no own all-reduce": not getattr(o_proj, "reduce_results", False),
+    }
+
+
+def _fast_oproj_resolved(o_proj: nn.Module) -> bool:
+    """``_fast_oproj_conditions``, evaluated (and logged) once per o_proj."""
+    fast = o_proj.__dict__.get("_fast_oproj")
+    if fast is None:
+        conditions = _fast_oproj_conditions(o_proj)
+        fast = all(conditions.values())
+        o_proj.__dict__["_fast_oproj"] = fast
+        _log_conditions_once(
+            "o_proj through aiter's decode GEMM",
+            conditions,
+            getattr(o_proj, "prefix", ""),
+        )
+    return fast
+
+
+def _o_proj_mxfp8(o_proj: nn.Module, x: torch.Tensor, x_scale: torch.Tensor):
+    """o_proj on the PA epilogue's MXFP8 output: aiter's decode GEMM where it serves
+    the token count, the linear otherwise (same bytes up to the GEMM's FP32 K
+    order)."""
+    if (
+        _fast_oproj_resolved(o_proj)
+        and x.dtype == torch.float8_e4m3fn
+        and x_scale is not None
+    ):
+        k = x.shape[-1]
+        x2 = x.reshape(-1, k)
+        s2 = x_scale.reshape(x2.shape[0], -1)
+        n = o_proj.weight.shape[0]
+        if (
+            mxfp8_decode_gemm_supported(x2.shape[0], n, k)
+            and x2.stride(1) == 1
+            and x2.stride(0) % 16 == 0
+            and s2.shape[1] == k // 32
+            and s2.is_contiguous()
+        ):
+            y = mxfp8_decode_gemm(
+                x2, s2.view(torch.float8_e8m0fnu), o_proj.weight, o_proj.weight_scale
+            )
+            return y.view(*x.shape[:-1], n)
+    return o_proj(x, x_scale=x_scale)
+
+
+def minimax_m3_o_proj_mxfp8(
+    x: torch.Tensor, x_scale: torch.Tensor, layer_name: str
+) -> torch.Tensor:
+    """``_o_proj_mxfp8`` for the o_proj registered as ``layer_name``. Opaque to
+    torch.compile, so the kernel is chosen per call by its token count (a CUDA
+    graph keeps the capture's choice)."""
+    o_proj = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    return _o_proj_mxfp8(o_proj, x, x_scale)
+
+
+def _minimax_m3_o_proj_mxfp8_fake(
+    x: torch.Tensor, x_scale: torch.Tensor, layer_name: str
+) -> torch.Tensor:
+    o_proj = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    return x.new_empty((*x.shape[:-1], o_proj.weight.shape[0]), dtype=torch.bfloat16)
+
+
+direct_register_custom_op(
+    op_name="minimax_m3_o_proj_mxfp8",
+    op_func=minimax_m3_o_proj_mxfp8,
+    mutates_args=(),
+    fake_impl=_minimax_m3_o_proj_mxfp8_fake,
+    # The decode GEMM reads row-major E4M3 rows and contiguous E8M0 scales.
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
 
 
 def _minimax_m3_cos_sin_cache(
@@ -607,6 +713,15 @@ class MiniMaxM3SparseAttention(nn.Module):
                 mxfp8_conditions,
                 prefix,
             )
+        # o_proj on the MXFP8 output goes through a custom op that takes aiter's
+        # decode GEMM where it serves the call (_o_proj_mxfp8).
+        self.fast_oproj = self.sparse_pa_mxfp8_out and mxfp8_decode_gemm is not None
+        self.o_proj_name = f"{prefix}.o_proj"
+        if self.fast_oproj:
+            compilation_config = get_current_atom_config().compilation_config
+            if self.o_proj_name in compilation_config.static_forward_context:
+                raise ValueError(f"Duplicate layer name: {self.o_proj_name}")
+            compilation_config.static_forward_context[self.o_proj_name] = self.o_proj
 
     def forward(
         self,
@@ -631,6 +746,10 @@ class MiniMaxM3SparseAttention(nn.Module):
             attn_output, attn_scale = self.attn.forward_mxfp8(
                 q, k, v, positions, qkv=qkv
             )
+            if self.fast_oproj:
+                return torch.ops.aiter.minimax_m3_o_proj_mxfp8(
+                    attn_output, attn_scale, self.o_proj_name
+                )
             return self.o_proj(attn_output, x_scale=attn_scale)
         attn_output = self.attn(q, k, v, positions, qkv=qkv)
         return self.o_proj(attn_output)
