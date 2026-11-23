@@ -442,34 +442,36 @@ class KVConnectorFactory:
         )
 
     @classmethod
-    def topology_moves_nvfp4_pages(cls, config: Any) -> bool:
-        """Does every transport `config` runs declare `moves_nvfp4_pages`? False when
+    def _every_leaf_declares(cls, flags: dict[str, bool], config: Any) -> bool:
+        """Does every transport `config` runs declare the flag in `flags`? False when
         it runs none or the topology cannot be parsed."""
         leaves = cls.leaf_connectors(config)
-        return bool(leaves) and all(
-            cls._moves_nvfp4_pages.get(name, False) for name, _ in leaves
-        )
+        return bool(leaves) and all(flags.get(name, False) for name, _ in leaves)
+
+    @staticmethod
+    def _declaring(flags: dict[str, bool]) -> tuple[str, ...]:
+        """The registered backends that declare the flag in `flags`, sorted."""
+        return tuple(sorted(name for name, declared in flags.items() if declared))
+
+    @classmethod
+    def topology_moves_nvfp4_pages(cls, config: Any) -> bool:
+        """Does every transport `config` runs declare `moves_nvfp4_pages`?"""
+        return cls._every_leaf_declares(cls._moves_nvfp4_pages, config)
 
     @classmethod
     def nvfp4_page_connectors(cls) -> tuple[str, ...]:
         """The registered backends that declare `moves_nvfp4_pages`, sorted."""
-        return tuple(sorted(n for n, moves in cls._moves_nvfp4_pages.items() if moves))
+        return cls._declaring(cls._moves_nvfp4_pages)
 
     @classmethod
     def topology_moves_own_dtype_draft(cls, config: Any) -> bool:
-        """Does every transport `config` runs declare `moves_own_dtype_draft`? False
-        when it runs none or the topology cannot be parsed."""
-        leaves = cls.leaf_connectors(config)
-        return bool(leaves) and all(
-            cls._moves_own_dtype_draft.get(name, False) for name, _ in leaves
-        )
+        """Does every transport `config` runs declare `moves_own_dtype_draft`?"""
+        return cls._every_leaf_declares(cls._moves_own_dtype_draft, config)
 
     @classmethod
     def own_dtype_draft_connectors(cls) -> tuple[str, ...]:
         """The registered backends that declare `moves_own_dtype_draft`, sorted."""
-        return tuple(
-            sorted(n for n, moves in cls._moves_own_dtype_draft.items() if moves)
-        )
+        return cls._declaring(cls._moves_own_dtype_draft)
 
     @classmethod
     def _leaf_reads_block_regions(cls, connector: str, config: Any) -> bool:

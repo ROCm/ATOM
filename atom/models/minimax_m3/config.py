@@ -24,12 +24,12 @@ def draft_dtype_moves(config) -> bool:
     from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 
     spec = config.speculative_config
-    if config.kv_cache_dtype != "nvfp4" or spec is None or spec.method != "dspark":
-        return False
-    try:
-        return KVConnectorFactory.topology_moves_own_dtype_draft(config)
-    except ValueError:  # an unknown connector: refused by the caller
-        return False
+    return (
+        config.kv_cache_dtype == "nvfp4"
+        and spec is not None
+        and spec.method == "dspark"
+        and KVConnectorFactory.topology_moves_own_dtype_draft(config)
+    )
 
 
 def _fp4_kv_refusal(config) -> str | None:

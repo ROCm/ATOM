@@ -313,9 +313,20 @@ def test_one_transport_that_moves_no_nvfp4_pages_refuses_nvfp4(kvt):
         check(kv_transfer_config=kvt, **NV)
 
 
-def test_an_unknown_connector_keeps_the_factory_error():
+def test_an_unknown_connector_keeps_the_factory_error(monkeypatch):
     with pytest.raises(ValueError, match="unknown KV connector 'x'"):
         check(kv_transfer_config={"kv_connector": "x"}, **NV)
+    # with a DSpark draft of its own dtype too: refused before the draft check
+    spec = _dspark_spec()
+    spec.kv_cache_dtype = "fp8"
+    with pytest.raises(ValueError, match="unknown KV connector 'x'"):
+        _m3(
+            monkeypatch,
+            hf=sparse_hf(),
+            kv_transfer_config={"kv_connector": "x"},
+            speculative_config=spec,
+            **NV,
+        )
 
 
 @pytest.mark.parametrize("kvt", [OFFLOAD, PD, STORE])
