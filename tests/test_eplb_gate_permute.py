@@ -1377,3 +1377,21 @@ def test_step_timer_files_a_sampled_step_and_host_time(monkeypatch, caplog):
     text = "\n".join(r.getMessage() for r in caplog.records)
     assert "dec: n=1 mean=10.00" in text and "dec_s: n=1 mean=15.00" in text
     assert "host sample: n=1 mean=30 us" in text and "host pre: n=1 mean=4 us" in text
+
+
+def test_start_frozen_and_no_hold_leave_the_recordings_alone(monkeypatch):
+    """ATOM_EPLB_START_FROZEN: nothing is counted from the first forward on,
+    so a prefill recording gets no count launch; ATOM_EPLB_NO_DECODE_HOLD: a
+    decode recording's id tensors are not kept."""
+    env = _setup(monkeypatch, ATOM_EPLB_NO_DECODE_HOLD=1)
+    ids = torch.full((4, TOP_K), 1, dtype=torch.int32)
+    with env.gp.decode_capture("k"):
+        env.gp.place(env.layers[0], ids)
+    assert env.gp._captures["k"] == []
+    env.manager.rebalancing_stopped = True  # what START_FROZEN makes it
+    env.gp.place(env.layers[0], ids)  # outside a decode recording: a prefill
+    assert int(env.monitor._cur_pass_count.sum()) == 0
+    monkeypatch.setenv("ATOM_EPLB_START_FROZEN", "1")
+    manager, _, _ = _bound_manager(monkeypatch, ATOM_EPLB_GATE_PERMUTE=1)
+    assert manager.rebalancing_stopped
+    manager.on_forward_pass_end(True, True)  # returns at once: no schedule

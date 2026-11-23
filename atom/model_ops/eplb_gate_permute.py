@@ -702,7 +702,8 @@ class GatePermuteRuntime:
         if not self.owns(layer):
             return
         if self._capture_key is not None:
-            self._captures[self._capture_key].append((layer.layer_id, topk_ids))
+            if not envs.ATOM_EPLB_NO_DECODE_HOLD:
+                self._captures[self._capture_key].append((layer.layer_id, topk_ids))
             return
         if not self.counting:
             return

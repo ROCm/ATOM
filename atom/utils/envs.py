@@ -1236,6 +1236,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_EPLB_GP_COUNT": lambda: os.getenv("ATOM_EPLB_GP_COUNT", "triton")
     .strip()
     .lower(),
+    # Diagnostics: the decode recordings' top-k id tensors are not kept (no
+    # decode sampling), and the manager starts frozen (no load is counted, no
+    # count launch is recorded into the prefill graphs, nothing is ever moved).
+    "ATOM_EPLB_NO_DECODE_HOLD": lambda: _flag_env("ATOM_EPLB_NO_DECODE_HOLD", "0"),
+    "ATOM_EPLB_START_FROZEN": lambda: _flag_env("ATOM_EPLB_START_FROZEN", "0"),
     # Diagnostic: EPLB creates no process group of its own for migration and
     # uses the EP group's.
     "ATOM_EPLB_SHARED_MIGRATION_GROUP": lambda: _flag_env(

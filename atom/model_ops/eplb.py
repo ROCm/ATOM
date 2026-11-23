@@ -1752,7 +1752,8 @@ class EPLBManager:
         # Rank 0: the loads at the last evaluation or observation, to tell
         # what a window added (diagnostics only).
         self._window_base: tuple[Any, Any] | None = None
-        self._rebalancing_stopped = False
+        # ATOM_EPLB_START_FROZEN (diagnostic): frozen from the start.
+        self._rebalancing_stopped = bool(envs.ATOM_EPLB_START_FROZEN)
         self._gen = self._entrypoint()
         self._rebalance_count = 0
         self._last_balancedness: float | None = None
