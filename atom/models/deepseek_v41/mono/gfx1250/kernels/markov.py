@@ -14,8 +14,9 @@ ATOM dspark._head_and_sample_sharded + dspark_markov_argmax_tp: for k = 0..4 (bl
 W1, W2 [V, 256] bf16 replicated; each rank scores its 32320-row W2 shard against its base-logit shard and the ranks exchange
 (max, id) per request. Here: per round, 8 W1 rows staged in LDS (B operand, rows 8..15 zero), every wave one 16-row W2 tile
 (A operand, 8 bf16 WMMA 16x16x32), + base logits, packed (ordered key, ~id) max in LDS -> one global atomic max a CTA and
-request -> device handoff -> CTA 0 pushes the 8 rank maxima to the peers (tagged 16 B) -> every CTA polls and takes the max
-in rank order -> x_k stays in LDS for the next round; CTA 0 writes ids and the W1[x_k] rows (confidence-head input)."""
+request -> count -> CTA 0 (alone waiting for the count) pushes the 8 rank maxima to the peers and to this rank's own slot
+(tagged 16 B) -> every CTA polls and takes the max in rank order -> x_k stays in LDS for the next round; CTA 0 writes ids and
+the W1[x_k] rows (confidence-head input)."""
 from __future__ import annotations
 
 
@@ -53,6 +54,18 @@ def i64(x):
 def gatomic_max64(addr, val):
     llvm.AtomicRMWOp(llvm.AtomicBinOp.max, gptr(addr), _v(fx.Int64(val)), llvm.AtomicOrdering.monotonic,
                      syncscope="agent", alignment=8)
+
+
+@ASTRewriter.transform
+def head_local(t):
+    """The draft head -> Markov hand-over (tail.draft) without an all-CTA handoff: Markov CTA b reads only the base logits
+    head CTA b wrote (markov_once's tile b * 8 + w = the head's tiles 8b .. 8b + 7; its waves past the vocab read a clamped
+    tile they never use) -> a CTA-local release (every wave's s_wait_storecnt 0, barrier) / acquire (t0's acquire_se)."""
+    hx.wait_storecnt0()
+    gpu.barrier()
+    if t == 0:
+        hx.acquire_se()
+    gpu.barrier()
 
 
 def roff(k, src, req):
@@ -122,28 +135,38 @@ def markov_once(base, anchors, w1, w2s, ids_out, emb_out, best, cnt, recv, rank,
                     g = F32(-LN2) * log2f(F32(-LN2) * log2f(u))
                     bp = fx.max(bp, fx.Int64(skey(zs[i] * itd + g)) * fx.Int64(1 << 32) + (fx.Int64(c32(0xFFFFFFFF) - gj) & fx.Int64(0xFFFFFFFF)))
                 bl = gq.select(bl, bp)
-        if fx.const_expr(qlog is not None):   # q's pre-temperature logits, 8 consecutive columns a lane
+        if act & (l % 16 < NREQ):
+            latomic_max64(sm + LB + rq * 8, bl)
+        gpu.barrier()
+        # the CTA's maxima -> the rank's (global atomics, wave 0) -> count; only CTA 0 waits for the count, reads the rank
+        # maxima and pushes them to the peers and to this rank's own slot; every other CTA goes on to poll all 4 sources
+        # (no 256-CTA wait on the counter, no 256-CTA re-read of the maxima on CTA 0's path)
+        if t < NREQ:
+            gatomic_max64(best + i64(k * NREQ + t) * 8, hx.lload(sm + LB + t * 8, fx.Int64))
+        if t < 32:
+            hx.wait_storecnt0()   # (the release of wave 0's atomics, as device.handoff's)
+        if t == 0:
+            hx.atomic_add(cnt + i64(k) * 16, 1)
+        tag = tag0 + k
+        if b == 0:
+            if t == 0:
+                hx.wait_count(cnt + i64(k) * 16, 256, 1)
+            gpu.barrier()
+            if t < NREQ:
+                mine = hx.gload(best + i64(k * NREQ + t) * 8, fx.Int64)
+                hx.lstore(sm + LP + (rank * NREQ + t) * 8, mine)
+                v = fx.Vector.from_elements([I32(mine & fx.Int64(0xFFFFFFFF)), I32(mine >> 32), I32(0), I32(tag)], I32)
+                for o in range_constexpr(4):
+                    hx.gstore(recv[o] + roff(k, rank, t), v, nt=True)
+        # q's pre-temperature logits, 8 consecutive columns a lane -- stored here, past the count and CTA 0's push, not before
+        # the local maximum (~1 MB a round over the CTAs: there they held the round's computation 1.5 -> 1.0 us, draft-tail fixture)
+        if fx.const_expr(qlog is not None):
             if act & (l % 16 < NREQ) & anyprob:
                 qa = qlog + (i64(rq * TB + k) * VR + i64(tile * 16 + (l // 16) * 8)) * 4
                 hx.gstore(qa, fx.Vector.from_elements(zs[:4], F32))
                 hx.gstore(qa + i64(16), fx.Vector.from_elements(zs[4:], F32))
-        if act & (l % 16 < NREQ):
-            latomic_max64(sm + LB + rq * 8, bl)
-        gpu.barrier()
-        if t < NREQ:
-            gatomic_max64(best + i64(k * NREQ + t) * 8, hx.lload(sm + LB + t * 8, fx.Int64))
-        handoff(cnt + i64(k) * 16, t, 256, site=1)
-        tag = tag0 + k
-        if t < NREQ:
-            mine = hx.gload(best + i64(k * NREQ + t) * 8, fx.Int64)
-            hx.lstore(sm + LP + (rank * NREQ + t) * 8, mine)
-            if b == 0:
-                v = fx.Vector.from_elements([I32(mine & fx.Int64(0xFFFFFFFF)), I32(mine >> 32), I32(0), I32(tag)], I32)
-                for o in range_constexpr(4):
-                    if fx.const_expr(o != rank):
-                        hx.gstore(recv[o] + roff(k, rank, t), v, nt=True)
         src = t // NREQ
-        if (t < 4 * NREQ) & (src != rank):
+        if (t < 4 * NREQ) & ((src != rank) | (b != 0)):
             got = poll_unit(recv[rank] + roff(k, src, t % NREQ), tag, site=9)
             hx.lstore(sm + LP + t * 8, got[0])
             hx.lstore(sm + LP + t * 8 + 4, got[1])

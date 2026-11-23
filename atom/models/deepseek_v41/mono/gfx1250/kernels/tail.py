@@ -101,7 +101,7 @@ def target(tp, t, b, sm, tc, recv, rank, head_d=4, ctx=None, T=None, kv_fp4=Fals
 def draft(tp, t, b, sm, tc, recv, rank, head_d=4):
     P = {k: tptr(tp, k) for k in ('hw', 'anc', 'dh', 'dlog', 'mw1', 'mw2', 'mids', 'memb', 'mbest')}
     HF.head_once_r(P['dh'], P['hw'], P['dlog'], t, t % 32, t // 32, sm, b, head_d, 2, 4)
-    handoff(tc + i64(LY.DRAFT_HEAD_DONE), t, False)
+    MPF.head_local(t)   # (no DRAFT_HEAD_DONE all-CTA handoff: Markov CTA b reads only head CTA b's tiles)
     MPF.markov_once(P['dlog'], P['anc'], P['mw1'], P['mw2'], P['mids'], P['memb'], P['mbest'], tc + i64(LY.MARKOV),
                     [r + i64(SOFF2) for r in recv], rank, 101, t, b, sm, tptr(tp, 'sparam'), tptr(tp, 'qlog'), tptr(tp, 'qids'),
                     ids64=tptr(tp, 'mids64'))
