@@ -319,8 +319,32 @@ async fn an_atom_model_without_a_chat_template_answers_chats_with_501() {
     let url = serve_atom(info, 1).await;
     let ctx = context();
     register(&ctx, json!({ "url": url })).await.unwrap();
+    assert_chats_refused_and_completions_served(&ctx, "atom-encoder").await;
+}
+
+/// A DeepSeek V4 tokenizer renders with llm-tokenizer's built-in encoder, which ignores
+/// the template the ATOM worker advertises.
+#[tokio::test]
+async fn an_atom_model_whose_tokenizer_ignores_its_template_answers_chats_with_501() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::copy(hf_tokenizer_path(), dir.path().join("tokenizer.json")).unwrap();
+    let config = json!({"architectures": ["DeepseekV4ForCausalLM"]});
+    std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
+    let info = GetModelInfoResponse {
+        tokenizer_path: dir.path().to_str().unwrap().into(),
+        ..model_info("atom-deepseek", "atom: {{ messages[0].content }}", "{}")
+    };
+    let url = serve_atom(info, 1).await;
+    let ctx = context();
+    register(&ctx, json!({ "url": url })).await.unwrap();
+    assert_chats_refused_and_completions_served(&ctx, "atom-deepseek").await;
+}
+
+/// Once the tokenizer job has registered `model`'s tokenizer, its chats get 501 and its
+/// completions are prepared.
+async fn assert_chats_refused_and_completions_served(ctx: &Arc<AppContext>, model: &str) {
     let registered = async {
-        while !ctx.tokenizer_registry.contains("atom-encoder") {
+        while !ctx.tokenizer_registry.contains(model) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     };
@@ -328,20 +352,14 @@ async fn an_atom_model_without_a_chat_template_answers_chats_with_501() {
         .await
         .expect("the tokenizer job registers the model's tokenizer");
 
-    let chat = json!({"model": "atom-encoder", "messages": [{"role": "user", "content": "hi"}]});
+    let chat = json!({"model": model, "messages": [{"role": "user", "content": "hi"}]});
     let chat: ChatCompletionRequest = serde_json::from_value(chat).unwrap();
-    let Err(refused) = prepare_chat(Arc::new(chat), None, Some("atom-encoder".into()), &ctx) else {
-        panic!("a chat for a model without a template is refused");
+    let Err(refused) = prepare_chat(Arc::new(chat), None, Some(model.into()), ctx) else {
+        panic!("a chat atomesh cannot render as ATOM does is refused");
     };
     assert_eq!(refused.status(), http::StatusCode::NOT_IMPLEMENTED);
     let completion: GenerateBody = serde_json::from_value(json!({"text": "hi"})).unwrap();
-    assert!(prepare_generate(
-        Arc::new(completion),
-        None,
-        Some("atom-encoder".into()),
-        &ctx
-    )
-    .is_ok());
+    assert!(prepare_generate(Arc::new(completion), None, Some(model.into()), ctx).is_ok());
 }
 
 #[tokio::test]
