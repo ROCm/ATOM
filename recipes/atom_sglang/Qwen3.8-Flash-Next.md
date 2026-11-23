@@ -224,6 +224,9 @@ The MI308 SGLang-ATOM nightlies cover the PTPC checkpoint
   `--mem-fraction-static 0.95`,
   `--max-running-requests 32`, `--chunked-prefill-size 16384`,
   `--mamba-ssm-dtype float32`, radix cache off, no reasoning parser.
+* `AITER_MOE_PADDING_SIZE=64`. The commands above use 128.
+* The cases do not set SGLang's `--moe-runner-backend` or `--linear-attn-*`
+  backends. The plugin computes MoE and GDN in Native ATOM.
 * GSM8K: lm_eval on the first 200 examples (`lm_eval_limit`), 5-shot, chat
   completions, greedy, up to 16384 generated tokens.
 * The GSM8K gates are 97% of the 0.98 (base) and 0.985 (MTP) references.
