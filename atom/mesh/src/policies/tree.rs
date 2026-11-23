@@ -600,10 +600,13 @@ impl Tree {
 
         // Update timestamp probabilistically (1 in 8 matches) to reduce DashMap contention.
         // LRU eviction doesn't need perfect accuracy - approximate timestamps suffice.
+        // Only a tenant the node holds is refreshed: the "empty" placeholder of a
+        // tenantless node, or a tenant evicted since it was read, is not added.
         let epoch = get_epoch();
         if epoch & 0x7 == 0 {
-            curr.tenant_last_access_time
-                .insert(Arc::clone(&tenant), epoch);
+            if let Some(mut last_access) = curr.tenant_last_access_time.get_mut(tenant.as_ref()) {
+                *last_access = epoch;
+            }
         }
 
         // Compute input char count directly from input text.
@@ -1094,6 +1097,24 @@ mod tests {
 
         assert_eq!(matched_text, "");
         assert_eq!(tenant, "empty");
+    }
+
+    #[test]
+    fn test_match_on_a_tenantless_node_records_no_tenant() {
+        let tree = Tree::new();
+
+        // A match refreshes a timestamp once in eight epochs, and the epoch is
+        // process-wide: enough matches to cross several refreshes.
+        for _ in 0..256 {
+            let (_, tenant) = tree.prefix_match("key1");
+            assert_eq!(tenant, "empty");
+        }
+
+        assert_eq!(
+            tree.get_used_size_per_tenant(),
+            HashMap::new(),
+            "the placeholder tenant was recorded on the root"
+        );
     }
 
     #[test]

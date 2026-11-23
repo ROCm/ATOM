@@ -1739,8 +1739,8 @@ def _replayssm_kda_fwd_kernel(
     p_k = k + (bos * H + i_h) * K + o_k
     p_v = v + (bos * HV + i_hv) * V + o_v
     p_o = o + (bos * HV + i_hv) * V + o_v
-    p_a = a + (bos * HV + i_hv) * K + o_k
-    p_b = b + bos * HV + i_hv
+    p_a = a + bos * stride_a_token + i_hv * K + o_k
+    p_b = b + bos * stride_b_token + i_hv
     p_A_log = A_log + i_hv
     p_dt_bias = dt_bias + i_hv * K + o_k
 
@@ -1857,7 +1857,12 @@ def replayssm_sigmoid_gating_delta_rule(
     # short buffer pads rather than shrinks.
     BH = max(16, triton.next_power_of_2(cap - max_query_len))
 
-    q, k, v, a, b = (x.contiguous() for x in (q, k, v, a, b))
+    q, k, v = (x.contiguous() for x in (q, k, v))
+    # Column views need no copy when each token's head/channel row is dense.
+    if a.stride(-1) != 1 or a.stride(-2) != K:
+        a = a.contiguous()
+    if b.stride(-1) != 1:
+        b = b.contiguous()
     out = q.new_empty(1, T_tot, HV, V) if o is None else o.unsqueeze(0)
 
     _replayssm_kda_fwd_kernel[(NV, N * HV)](
