@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from types import SimpleNamespace
 
 import pytest
@@ -108,10 +107,10 @@ def _cache(bs: int, draft: int, gen: torch.Generator):
     )
 
 
-def _run(impl, layer_cache, cache_indices, mixed_qkv, a, b, replay: bool):
+def _run(monkeypatch, impl, layer_cache, cache_indices, mixed_qkv, a, b, replay: bool):
     bs = int(cache_indices.shape[0])
     draft = mixed_qkv.shape[0] // bs
-    os.environ["ATOM_ENABLE_REPLAYSSM"] = "1" if replay else "0"
+    monkeypatch.setenv("ATOM_ENABLE_REPLAYSSM", "1" if replay else "0")
     linear_backend = SimpleNamespace(
         forward_metadata=SimpleNamespace(mamba_cache_indices=cache_indices),
         req_to_token_pool=SimpleNamespace(
@@ -136,7 +135,7 @@ def _run(impl, layer_cache, cache_indices, mixed_qkv, a, b, replay: bool):
     return out
 
 
-def test_replay_matches_recurrent_across_a_partial_accept():
+def test_replay_matches_recurrent_across_a_partial_accept(monkeypatch):
     gen = torch.Generator(device="cuda")
     gen.manual_seed(11)
     bs, draft, accept = 2, 3, 2
@@ -170,12 +169,16 @@ def test_replay_matches_recurrent_across_a_partial_accept():
         )
 
     mixed, a, b = inputs()
-    legacy = _run(impl, layer_cache, cache_indices, mixed, a, b, replay=False)
+    legacy = _run(
+        monkeypatch, impl, layer_cache, cache_indices, mixed, a, b, replay=False
+    )
     accepted_state = layer_cache.intermediate_ssm[:bs, accept - 1].clone()
     layer_cache.temporal.copy_(temporal0)
     layer_cache.conv[0].copy_(conv0)
     reset_replay_runtime_for_tests()
-    replay = _run(impl, layer_cache, cache_indices, mixed, a, b, replay=True)
+    replay = _run(
+        monkeypatch, impl, layer_cache, cache_indices, mixed, a, b, replay=True
+    )
     torch.testing.assert_close(replay, legacy, rtol=1e-2, atol=1e-2)
     # No flush on an empty ring: the checkpoint stays put.
     torch.testing.assert_close(layer_cache.temporal, temporal0, rtol=0, atol=0)
@@ -195,10 +198,13 @@ def test_replay_matches_recurrent_across_a_partial_accept():
     )
 
     mixed2, a2, b2 = inputs()
-    replay2 = _run(impl, layer_cache, cache_indices, mixed2, a2, b2, replay=True)
+    replay2 = _run(
+        monkeypatch, impl, layer_cache, cache_indices, mixed2, a2, b2, replay=True
+    )
     layer_cache.temporal[cache_indices] = accepted_state
     layer_cache.conv[0].copy_(conv0)
-    legacy2 = _run(impl, layer_cache, cache_indices, mixed2, a2, b2, replay=False)
+    legacy2 = _run(
+        monkeypatch, impl, layer_cache, cache_indices, mixed2, a2, b2, replay=False
+    )
     torch.testing.assert_close(replay2, legacy2, rtol=2e-2, atol=2e-2)
-    os.environ.pop("ATOM_ENABLE_REPLAYSSM", None)
     reset_replay_runtime_for_tests()
