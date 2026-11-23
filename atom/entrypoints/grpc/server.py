@@ -386,7 +386,9 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
             await context.abort(
                 grpc.StatusCode.RESOURCE_EXHAUSTED, "no Session window free"
             )
-        reader = asyncio.create_task(self._read(session, request_iterator))
+        reader = session.reader = asyncio.create_task(
+            self._read(session, request_iterator)
+        )
         try:
             ready = frames.encode_ready(self.api._get_engine_max_pool_tokens())
             yield pb.Frames(frames=ready)

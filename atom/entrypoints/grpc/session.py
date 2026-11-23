@@ -62,6 +62,7 @@ class Session:
         self.outbox: asyncio.Queue = asyncio.Queue()  # message frames; None ends them
         self.open = True
         self.failed: str | None = None  # why the Session failed its client's call
+        self.reader: asyncio.Task | None = None  # admits the client's messages
 
     def seq_id(self, client_id: int) -> int:
         """A new engine id for `client_id`, which is below SEQ_IDS and not in flight."""
@@ -126,6 +127,8 @@ class Session:
         while not self.outbox.empty():
             self.outbox.get_nowait()
         self.close()
+        if self.reader is not None:  # admits nothing after close() aborted what it held
+            self.reader.cancel()
         self.outbox.put_nowait(None)
 
     def flush(self) -> None:

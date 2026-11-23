@@ -558,6 +558,35 @@ def test_a_client_that_stops_reading_fails_its_session_past_the_outbox_bound(
     assert engine.running == {} and engine.aborted  # its request aborted
 
 
+def test_a_failed_session_admits_no_submission_still_in_preprocess(serve, monkeypatch):
+    monkeypatch.setattr(grpc_session, "OUTBOX", 0)  # its next message fails it
+    engine = FakeEngine([([5], None)])
+    engine.release.clear()
+    servicer = serve(engine)
+    open_session, opened = servicer.sessions.open, []
+    monkeypatch.setattr(
+        servicer.sessions, "open", lambda: opened.append(open_session()) or opened[-1]
+    )
+
+    async def client():
+        yield pb.Frames(frames=_submit_batch((3, "a", [1, 2])))
+        await asyncio.Event().wait()
+
+    async def fail_during_preprocess():
+        call = servicer.Session(client(), SimpleNamespace())
+        await anext(call)  # Ready
+        await _until(lambda: engine.preprocessed)
+        opened[0].send([b"a step the client does not read"])
+        engine.release.set()
+        await _until(lambda: engine.made and not engine.io_processor.requests)
+        await call.aclose()
+        return opened[0]
+
+    session = asyncio.run(fail_during_preprocess())
+    assert session.failed is not None and session.requests == {}
+    assert engine.submitted == []
+
+
 def test_a_session_submission_that_fails_after_a_send_aborts_its_seq(serve):
     engine = FakeEngine()
     servicer = serve(engine)
