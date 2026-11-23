@@ -102,8 +102,10 @@ for every launch, and SGLang itself refuses unified memory (the only KV
 relocation) for this model. With ``--disable-radix-cache`` nothing here is
 installed.
 
-Opt-in (``ATOM_SGLANG_V41_RADIX=1``): without it the bridge refuses a launch that
-leaves SGLang's radix cache on.
+Radix on by default for V4.1 on the plugin: whenever SGLang's radix cache is
+on (no ``--disable-radix-cache``) and ATOM serves the model. ``ATOM_SGLANG_V41_RADIX=0``
+turns SGLang's radix cache off for such a launch at server-args resolution,
+with one warning (``v41_radix_launch_override``).
 """
 
 from __future__ import annotations
@@ -115,6 +117,8 @@ from typing import NamedTuple
 import numpy as np
 import torch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+from atom.plugin.sglang import deepseek_v41_envs as envs
 
 logger = logging.getLogger("atom")
 
@@ -148,6 +152,72 @@ class ReplayHit(NamedTuple):
 def radix_replay_rows() -> int | None:
     """``R`` while the radix replay is installed in this process, else None."""
     return REPLAY_ROWS if _INSTALLED else None
+
+
+# --- Launch policy (SGLang server-args resolution) ---
+# Radix is on whenever SGLang's radix cache is. Where the operator turned it
+# off (ATOM_SGLANG_V41_RADIX=0), SGLang's radix cache is turned off with it,
+# through SGLang's own model-override registry: the declaration is resolved
+# once in the launching process, before the tokenizer manager and the
+# schedulers are spawned, so every reader of ``disable_radix_cache`` (the
+# tokenizer's input_embeds check, the scheduler's tree choice, the plugin's
+# ``sglang_radix_cache_enabled``) sees the same value. Flipping it later in
+# the scheduler would leave the tokenizer manager on the other side.
+
+# SGLang keys the registry on ``hf_config.architectures[0]``, which its V4.1
+# config (``configs/deepseek_v41.DeepseekV41Config``) renames to V4's and
+# whose ``model_type`` it forces to ``deepseek_v41``: one key, and the model
+# type tells V4.1 from V4.
+_POLICY_ARCH = "DeepseekV4ForCausalLM"
+_V41_MODEL_TYPE = "deepseek_v41"
+_POLICY_REGISTERED = False
+_POLICY_WARNED = False
+
+
+def _resolving_view(server_args):
+    from sglang.srt.arg_groups.model_override_base import resolving_view
+
+    return resolving_view(server_args)
+
+
+def v41_radix_launch_override(server_args, hf_config) -> dict:
+    """SGLang model-override provider: ``disable_radix_cache=True`` for a
+    DeepSeek-V4.1 launch ATOM serves while ``ATOM_SGLANG_V41_RADIX`` is off,
+    with one warning; nothing otherwise. The entry point registers it on
+    every SGLang launch, so a native V4.1 launch (ATOM not serving the model)
+    is left alone."""
+    global _POLICY_WARNED
+    from atom.plugin.sglang.register import _is_atom_external_model_enabled
+
+    if hf_config.model_type != _V41_MODEL_TYPE:
+        return {}
+    if not _is_atom_external_model_enabled():
+        return {}
+    if _resolving_view(server_args).disable_radix_cache:
+        return {}
+    if envs.ATOM_SGLANG_V41_RADIX:
+        return {}
+    if not _POLICY_WARNED:
+        _POLICY_WARNED = True
+        logger.warning(
+            "ATOM DeepSeek-V4.1: ATOM_SGLANG_V41_RADIX is off; turning SGLang's "
+            "radix cache off for this launch (same as --disable-radix-cache). "
+            "Pass --disable-radix-cache to silence this."
+        )
+    return {"disable_radix_cache": True}
+
+
+def register_v41_radix_launch_policy() -> None:
+    """Register ``v41_radix_launch_override`` with SGLang's model-override
+    registry. Runs from the plugin entry point, before SGLang resolves its
+    server args; idempotent."""
+    global _POLICY_REGISTERED
+    from sglang.srt.arg_groups.model_override_base import register_model_override
+
+    if _POLICY_REGISTERED:
+        return
+    register_model_override(_POLICY_ARCH)(v41_radix_launch_override)
+    _POLICY_REGISTERED = True
 
 
 # --- Which rows replay (pure) ---

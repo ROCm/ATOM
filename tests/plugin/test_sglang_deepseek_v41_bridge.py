@@ -377,16 +377,13 @@ class TestLaunchContract:
         graphs.decode.backend = "disabled"
         refuse_unsupported_sglang_features()
 
-    def test_radix_cache_needs_the_opt_in(self, sglang_launch, monkeypatch):
+    def test_radix_cache_is_served_by_default(self, sglang_launch, monkeypatch):
+        # On by default, radix cache itself is not refused; what it cannot
+        # run beside is (`test_sglang_deepseek_v41_radix.py`). Overlap
+        # scheduling runs beside it (the radix seam drops a slot's host rows
+        # on every checkpoint).
         monkeypatch.delenv("ATOM_SGLANG_V41_RADIX", raising=False)
         sglang_launch.bags["memory"].disable_radix_cache = False
-        with pytest.raises(ValueError, match="without ATOM_SGLANG_V41_RADIX=1"):
-            refuse_unsupported_sglang_features()
-        # Opted in, radix cache itself is not refused; what it cannot run
-        # beside is (`test_sglang_deepseek_v41_radix.py`). Overlap scheduling
-        # runs beside it (the radix seam drops a slot's host rows on every
-        # checkpoint).
-        monkeypatch.setenv("ATOM_SGLANG_V41_RADIX", "1")
         refuse_unsupported_sglang_features()
         sglang_launch.bags["schedule"].enable_mixed_chunk = True
         with pytest.raises(ValueError, match="mixed chunk with radix cache"):

@@ -22,9 +22,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_SGLANG_V41_DECODER_REPLAY", "1"
     ),
     # Radix (prefix) cache for DeepSeek-V4.1 on the SGLang plugin
-    # (`deepseek_v41_radix`): opt-in. Off, a launch that leaves SGLang's
-    # radix cache on is refused (launch with --disable-radix-cache).
-    "ATOM_SGLANG_V41_RADIX": lambda: _flag_env("ATOM_SGLANG_V41_RADIX", "0"),
+    # (`deepseek_v41_radix`): on whenever SGLang's radix cache is. 0 / false /
+    # no / off, or an empty value, turn SGLang's radix cache off at launch
+    # (`deepseek_v41_radix.v41_radix_launch_override`).
+    "ATOM_SGLANG_V41_RADIX": lambda: _flag_env("ATOM_SGLANG_V41_RADIX", "1"),
 }
 
 

@@ -271,15 +271,6 @@ def refuse_unsupported_sglang_features() -> None:
         ),
     )
     if not memory.disable_radix_cache:
-        unsupported += (
-            (
-                (
-                    "radix cache without ATOM_SGLANG_V41_RADIX=1 (launch with "
-                    "--disable-radix-cache)"
-                ),
-                not deepseek_v41_envs.ATOM_SGLANG_V41_RADIX,
-            ),
-        )
         unsupported += _radix_refusals(memory, schedule)
     refused = [name for name, enabled in unsupported if enabled]
     if refused:

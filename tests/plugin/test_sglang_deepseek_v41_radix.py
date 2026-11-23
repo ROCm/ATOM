@@ -11,7 +11,8 @@ hit's span starts at ``P - R``, which the bridge translates into ATOM's
 1. the seam: which rows replay, the record it plans, the stamps, and the
    worker / ForwardBatch / eager-view carriers;
 2. the admission charge;
-3. the refusal matrix, and what ``prepare`` installs;
+3. the refusal matrix, what ``prepare`` installs, and the launch policy
+   (radix on by default, ``ATOM_SGLANG_V41_RADIX=0`` turning SGLang's off);
 4. the record, the widened inputs and the output rows, the runtime hook;
 5. the bridge: the widened spans, the stamp guard and stamp on consume, the
    decoder replay verdict, the staged inputs;
@@ -79,7 +80,7 @@ def _host_pinning(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _isolated_process_state(monkeypatch):
-    # Opted in; pinned so an operator's environment cannot change it.
+    # On by default; pinned so an operator's environment cannot change it.
     monkeypatch.setenv("ATOM_SGLANG_V41_RADIX", "1")
     # One builder and one install per process; no test may leak either.
     monkeypatch.setattr(bridge, "_V41_BUILDER", None)
@@ -591,10 +592,19 @@ class TestRefusals:
         assert sglang_radix_cache_enabled()
         refuse_unsupported_sglang_features()
 
-    def test_radix_needs_the_opt_in(self, launch, monkeypatch):
+    def test_the_kill_switch_is_the_launch_policys(self, launch, monkeypatch):
+        # ATOM_SGLANG_V41_RADIX=0 turns SGLang's radix cache off before the bridge
+        # runs (`TestLaunchPolicy`); the bridge has no stand-in refusal.
         monkeypatch.setenv("ATOM_SGLANG_V41_RADIX", "0")
-        with pytest.raises(ValueError, match="without ATOM_SGLANG_V41_RADIX=1"):
+        refuse_unsupported_sglang_features()
+
+    def test_speculation_stays_refused(self, launch):
+        # No radix-specific speculation path: the launch contract refuses
+        # speculative decoding with radix on or off.
+        launch.bags["spec"].speculative_algorithm = "DSPARK"
+        with pytest.raises(ValueError, match="speculative decoding") as refused:
             refuse_unsupported_sglang_features()
+        assert "radix" not in str(refused.value)
 
     @pytest.mark.parametrize(
         ("bag", "path", "value", "match"),
@@ -636,6 +646,151 @@ class TestRefusals:
         launch.bags["exec"].features.enable_encoder_swa_bounded_replay = True
         with pytest.raises(ValueError, match="encoder SWA bounded replay"):
             refuse_unsupported_sglang_features()
+
+
+class TestLaunchPolicy:
+    """Radix on by default; SGLang's radix cache turned off at server-args
+    resolution, with one warning, for ``ATOM_SGLANG_V41_RADIX=0`` -- on a
+    launch ATOM serves only."""
+
+    @pytest.fixture(autouse=True)
+    def _fresh_policy(self, monkeypatch):
+        monkeypatch.setattr(radix, "_POLICY_WARNED", False)
+        monkeypatch.setattr(radix, "_POLICY_REGISTERED", False)
+        monkeypatch.delenv("ATOM_SGLANG_V41_RADIX", raising=False)
+        monkeypatch.setenv("SGLANG_EXTERNAL_MODEL_PACKAGE", "atom.plugin.sglang.models")
+        # A plain record: SGLang's resolving view reads it the same way.
+        monkeypatch.setattr(radix, "_resolving_view", lambda server_args: server_args)
+
+    ARGS = SimpleNamespace(disable_radix_cache=False)
+    V41 = SimpleNamespace(model_type="deepseek_v41")
+
+    def test_default_launch_keeps_radix(self, caplog):
+        with caplog.at_level("WARNING", logger="atom"):
+            assert radix.v41_radix_launch_override(self.ARGS, self.V41) == {}
+        assert not caplog.records
+
+    def test_kill_switch_turns_radix_off_once(self, monkeypatch, caplog):
+        monkeypatch.setenv("ATOM_SGLANG_V41_RADIX", "0")
+        with caplog.at_level("WARNING", logger="atom"):
+            for _ in range(3):
+                assert radix.v41_radix_launch_override(self.ARGS, self.V41) == {
+                    "disable_radix_cache": True
+                }
+        (record,) = caplog.records
+        assert "ATOM_SGLANG_V41_RADIX is off" in record.getMessage()
+        assert "--disable-radix-cache" in record.getMessage()
+
+    def test_radix_already_off_declares_nothing(self, monkeypatch, caplog):
+        monkeypatch.setenv("ATOM_SGLANG_V41_RADIX", "0")
+        args = SimpleNamespace(disable_radix_cache=True)
+        with caplog.at_level("WARNING", logger="atom"):
+            assert radix.v41_radix_launch_override(args, self.V41) == {}
+        assert not caplog.records
+
+    # ATOM's text type never reaches SGLang's registry: SGLang's V4.1 config
+    # forces ``deepseek_v41``.
+    @pytest.mark.parametrize(
+        "model_type", ["deepseek_v4", "deepseek_v41_text", "qwen3", None]
+    )
+    def test_other_models_are_left_alone(self, monkeypatch, model_type):
+        monkeypatch.setenv("ATOM_SGLANG_V41_RADIX", "0")
+        config = SimpleNamespace(model_type=model_type)
+        assert radix.v41_radix_launch_override(self.ARGS, config) == {}
+
+    @pytest.mark.parametrize("package", [None, "", "sglang.srt.models"])
+    def test_native_v41_launches_are_left_alone(self, monkeypatch, package, caplog):
+        # The entry point registers the policy on every SGLang launch; a V4.1
+        # launch SGLang serves natively keeps its radix cache.
+        monkeypatch.setenv("ATOM_SGLANG_V41_RADIX", "0")
+        if package is None:
+            monkeypatch.delenv("SGLANG_EXTERNAL_MODEL_PACKAGE")
+        else:
+            monkeypatch.setenv("SGLANG_EXTERNAL_MODEL_PACKAGE", package)
+        with caplog.at_level("WARNING", logger="atom"):
+            assert radix.v41_radix_launch_override(self.ARGS, self.V41) == {}
+        assert not caplog.records
+
+    def test_sglang_resolving_view_sees_earlier_declarations(self, monkeypatch):
+        base = _sglang_module("sglang.srt.arg_groups.model_override_base")
+        monkeypatch.setattr(radix, "_resolving_view", base.resolving_view)
+        monkeypatch.setenv("ATOM_SGLANG_V41_RADIX", "0")
+        args = SimpleNamespace(disable_radix_cache=False)
+        args._resolved_overrides = [("earlier", {"disable_radix_cache": True})]
+        assert radix.v41_radix_launch_override(args, self.V41) == {}
+        args._resolved_overrides = []
+        assert radix.v41_radix_launch_override(args, self.V41) == {
+            "disable_radix_cache": True
+        }
+
+    def test_registers_under_sglangs_v41_architecture_once(self, monkeypatch):
+        registered = []
+        fake = SimpleNamespace(
+            register_model_override=lambda arch: (
+                lambda fn: registered.append((arch, fn)) or fn
+            )
+        )
+        monkeypatch.setitem(
+            sys.modules, "sglang.srt.arg_groups.model_override_base", fake
+        )
+        radix.register_v41_radix_launch_policy()
+        radix.register_v41_radix_launch_policy()
+        assert registered == [
+            ("DeepseekV4ForCausalLM", radix.v41_radix_launch_override)
+        ]
+
+    def test_sglang_hands_v41_under_v4s_architecture(self):
+        # The registry is keyed on `hf_config.architectures[0]`; SGLang's V4.1
+        # config renames V4.1's and forces the model type the policy checks.
+        configs = _sglang_module("sglang.srt.configs.deepseek_v41")
+        values = configs.normalize_deepseek_v41_config(
+            {"architectures": ["DeepseekV41ForCausalLM"], "model_type": "x"}
+        )
+        assert values["architectures"] == ["DeepseekV4ForCausalLM"]
+        assert values["model_type"] == "deepseek_v41"
+
+    def test_plugin_entry_point_registers_the_policy(self, monkeypatch):
+        """``register_plugin`` (the ``sglang.srt.plugins`` entry point) calls
+        the registration; every other patch it installs is stubbed out."""
+        import importlib
+
+        from atom.plugin.sglang import register
+
+        calls = []
+        stubs = {
+            register: (
+                "_ensure_aiter_gpu_archs_env",
+                "_install_model_config_quant_patch",
+                "_install_loader_quant_patch",
+                "_register_tc_piecewise_attention_split_ops",
+                "_install_decode_graph_forward_context_patch",
+                "apply_prefill_compile_only_patch",
+                "apply_triton_kernel_retention_patch",
+                "apply_xgrammar_hip_bitmask_patch",
+                "_keep_atom_full_attn_for_native_qwen4_exp",
+                "register_kimi_k3_text_only_processor",
+            ),
+            radix: ("register_v41_radix_launch_policy",),
+            "atom.plugin.sglang.attention_backend.gdn_replayssm": (
+                "install_sglang_replayssm_commit",
+            ),
+            "atom.plugin.sglang.patches.qwen4_exp_recognition_patch": (
+                "apply_qwen4_exp_recognition_patch",
+            ),
+            "atom.plugin.sglang.patches.qwen4_exp_rocm_patch": (
+                "apply_qwen4_exp_rocm_patch",
+            ),
+            "atom.plugin.sglang.runtime": ("apply_load_config_patch",),
+        }
+        for module, names in stubs.items():
+            if isinstance(module, str):
+                module = importlib.import_module(module)
+            for name in names:
+                monkeypatch.setattr(
+                    module, name, lambda *a, name=name, **k: calls.append(name)
+                )
+        register.register_plugin()
+        assert "register_v41_radix_launch_policy" in calls
 
 
 def _v41_atom_config():
