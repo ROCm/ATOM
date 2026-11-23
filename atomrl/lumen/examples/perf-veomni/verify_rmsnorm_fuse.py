@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Single-GPU check of veomni_patches/rmsnorm.py (rmsnorm_fuse).
+"""Single-GPU check of Lumen's Diffusers RMSNorm fusion.
 
   1. does it fuse -- kernel count per call, forward and backward
   2. is it faster at the two shapes the Qwen-Image DiT uses
@@ -25,7 +25,10 @@ import torch
 import torch.profiler as P
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from veomni_patches.rmsnorm import _rmsnorm_weighted, fused_rmsnorm
+from atomrl.lumen.ops.normalization.diffusers_rmsnorm import (
+    _rmsnorm_weighted,
+    fused_rmsnorm,
+)
 
 SHAPES = [("image", (1, 4096, 24, 128)), ("text", (1, 13, 24, 128))]
 ITERS, WARMUP = 30, 10
@@ -119,9 +122,9 @@ def main():
         "\n=== 4. DTensor weight: the patch must hand it to diffusers, not compile it ==="
     )
     import torch.distributed as dist
+    from atomrl.lumen.ops.normalization import diffusers_rmsnorm as mod
     from diffusers.models.normalization import RMSNorm
     from torch.distributed.tensor import Replicate, distribute_tensor, init_device_mesh
-    from veomni_patches import rmsnorm as mod
 
     if not dist.is_initialized():
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")

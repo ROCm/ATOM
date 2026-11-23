@@ -89,19 +89,21 @@ def _install_mask_adapter():
     F.scaled_dot_product_attention = sdpa
 
 
-def install():
+def install(target):
     global _installed
     if _installed:
         return
     _installed = True
-    from veomni_patches import INSTALLERS
+    from atomrl.lumen.config import LumenConfig
 
     unknown = set(PATCHES) - {"rmsnorm_fuse", "local_adamw", "mask_all_true_to_none"}
     if unknown:
         raise ValueError(f"unsupported LUMEN_PATCH entries for RL: {sorted(unknown)}")
-    for name in ("rmsnorm_fuse", "local_adamw"):
-        if name in PATCHES:
-            INSTALLERS[name]()
+    LumenConfig(
+        scaling="none",
+        diffusers_rmsnorm_fuse="rmsnorm_fuse" in PATCHES,
+        local_shard_adamw="local_adamw" in PATCHES,
+    ).enable(target)
     if "mask_all_true_to_none" in PATCHES:
         _install_mask_adapter()
     _log(f"installed in pid {os.getpid()}: {PATCHES}")
@@ -110,7 +112,7 @@ def install():
 def stats():
     out = {"mask": dict(_mask_stats)}
     if "rmsnorm_fuse" in PATCHES:
-        from veomni_patches import rmsnorm
+        from atomrl.lumen.ops.normalization import diffusers_rmsnorm as rmsnorm
 
         out["rmsnorm"] = rmsnorm.stats()
     return out
@@ -121,8 +123,9 @@ def _wrap_engine(module):
     build, fwd_bwd = cls._build_model_optimizer, cls.forward_backward_batch
 
     def _build_model_optimizer(self, *args, **kwargs):
-        install()
-        return build(self, *args, **kwargs)
+        result = build(self, *args, **kwargs)
+        install(self)
+        return result
 
     def forward_backward_batch(self, *args, **kwargs):
         global _calls

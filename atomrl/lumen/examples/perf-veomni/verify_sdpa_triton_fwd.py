@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Single-GPU check of veomni_patches/sdpa.py at both DiT attention shapes.
+"""Single-GPU check of Lumen's DiT SDPA route at both attention shapes.
 
 For each of Qwen-Image self-attention, Wan2.1 self-attention and Wan2.1 cross-
 attention:
@@ -26,7 +26,10 @@ import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from veomni_patches.sdpa import TritonFwdEfficientBwd, _triton_forward
+from atomrl.lumen.ops.attention.dit_sdpa import (
+    TritonFwdEfficientBwd,
+    _triton_forward,
+)
 
 SHAPES = [
     ("Qwen self", 24, 4109, 4109),

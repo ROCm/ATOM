@@ -57,24 +57,18 @@ def prefer_efficient_backend():
 
 def _triton_forward(q, k, v, scale):
     """q/k/v in SDPA layout (B, H, S, D); returns out in the same layout, and LSE (B, H, Sq)."""
-    from aiter.ops.triton.mha import _flash_attn_forward
+    from aiter.ops.triton.mha import flash_attn_func
 
     qs, ks, vs = (t.transpose(1, 2) for t in (q, k, v))
-    out, lse, _, _, _ = _flash_attn_forward(
+    out, lse = flash_attn_func(
         qs,
         ks,
         vs,
-        0.0,
-        scale,
-        False,
-        -1,
-        -1,
-        None,
-        None,
-        True,
-        False,
-        qs.shape[1],
-        ks.shape[1],
+        dropout_p=0.0,
+        softmax_scale=scale,
+        causal=False,
+        return_lse=True,
+        backend="triton",
     )
     return out.transpose(1, 2), lse
 
@@ -174,7 +168,7 @@ def install_triton_forward(min_seq=1024):
     if _orig_sdpa is not None:
         return
     # Fail here rather than on the first routed call, mid-step.
-    from aiter.ops.triton.mha import _flash_attn_forward  # noqa: F401
+    from aiter.ops.triton.mha import flash_attn_func  # noqa: F401
 
     _orig_sdpa = F.scaled_dot_product_attention
     F.scaled_dot_product_attention = scaled_dot_product_attention

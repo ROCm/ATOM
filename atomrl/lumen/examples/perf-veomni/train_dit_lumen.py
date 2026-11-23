@@ -93,6 +93,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from veomni_patches import INSTALLERS as _VEOMNI_PATCHES
 
 _PATCH = [p.strip() for p in os.environ.get("LUMEN_PATCH", "").split(",") if p.strip()]
+_LUMEN_FEATURES = {
+    "linear",
+    "sdpa_efficient",
+    "attn_triton_fwd",
+    "rmsnorm_fuse",
+    "local_adamw",
+}
 
 
 def _rank0(msg):
@@ -100,26 +107,30 @@ def _rank0(msg):
         print(f"[lumen] {msg}", flush=True)
 
 
-def _patch_linear(model):
+def _enable_lumen(model):
     from atomrl.lumen.config import LumenConfig
     from torch import nn
 
     n_linear = sum(1 for m in model.modules() if isinstance(m, nn.Linear))
-    _rank0(f"model built: {n_linear} nn.Linear before patching")
-
-    LumenConfig(lumen_linear=True)._patch_linear(model)
-
-    # _patch_linear rebinds forward, so count what actually changed rather than
-    # trusting the call: an instance attribute named 'forward' is the observable
-    # signal.
-    patched = sum(
-        1
-        for m in model.modules()
-        if isinstance(m, nn.Linear) and "forward" in m.__dict__
+    config = LumenConfig(
+        scaling="none",
+        lumen_linear="linear" in _PATCH,
+        dit_sdpa_efficient="sdpa_efficient" in _PATCH,
+        dit_sdpa_triton_forward="attn_triton_fwd" in _PATCH,
+        diffusers_rmsnorm_fuse="rmsnorm_fuse" in _PATCH,
+        local_shard_adamw="local_adamw" in _PATCH,
     )
-    _rank0(f"lumen linear patch applied to {patched}/{n_linear} nn.Linear")
-    if patched != n_linear:
-        _rank0(f"WARNING: {n_linear - patched} nn.Linear were not patched")
+    config.enable(model)
+
+    if config.lumen_linear:
+        patched = sum(
+            1
+            for module in model.modules()
+            if isinstance(module, nn.Linear) and "forward" in module.__dict__
+        )
+        _rank0(f"lumen linear patch applied to {patched}/{n_linear} nn.Linear")
+        if patched != n_linear:
+            _rank0(f"WARNING: {n_linear - patched} nn.Linear were not patched")
 
 
 def _get_vae(trainer, who):
@@ -338,11 +349,11 @@ def _report_backends():
 
         _rank0(f"aiter conv calls: {conv_calls()}")
     if "attn_triton_fwd" in _PATCH:
-        from veomni_patches import sdpa
+        from atomrl.lumen.ops.attention import dit_sdpa as sdpa
 
         _rank0(f"sdpa routing: {sdpa.stats()}")
     if "rmsnorm_fuse" in _PATCH:
-        from veomni_patches import rmsnorm
+        from atomrl.lumen.ops.normalization import diffusers_rmsnorm as rmsnorm
 
         _rank0(f"rmsnorm_fuse calls: {rmsnorm.stats()}")
 
@@ -362,6 +373,7 @@ def _install_hook():
         "vae_conv_video",
         "vae_bf16",
         "conv_pad_in_kernel",
+        *_LUMEN_FEATURES,
         *_VEOMNI_PATCHES,
     }
     unknown = set(_PATCH) - known
@@ -387,11 +399,11 @@ def _install_hook():
     # Before the trainer exists: these rebind classes and module attributes
     # (SDPA, RMSNorm.forward, AdamW.step, the condition model) that the model
     # and optimizer pick up when they are built.
-    applied = [name for name in _VEOMNI_PATCHES if name in _PATCH]
-    for name in applied:
+    example_applied = [name for name in _VEOMNI_PATCHES if name in _PATCH]
+    for name in example_applied:
         _VEOMNI_PATCHES[name]()
-    if applied:
-        _rank0(f"veomni_patches applied: {applied}")
+    if example_applied:
+        _rank0(f"veomni_patches applied: {example_applied}")
 
     from veomni.trainer.dit_trainer import DiTTrainer
 
@@ -407,8 +419,8 @@ def _install_hook():
         if "vae_conv" in _PATCH or "vae_conv_video" in _PATCH:
             _patch_vae_conv(self, video="vae_conv_video" in _PATCH)
 
-        if "linear" in _PATCH:
-            _patch_linear(self.base.model)
+        if set(_PATCH) & _LUMEN_FEATURES:
+            _enable_lumen(self.base.model)
 
         # Last, so the timer wraps the patched encode rather than being wrapped
         # by it -- otherwise vae_bf16's own encode wrapper hides the timing.

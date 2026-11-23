@@ -19,10 +19,9 @@ if [ -n "${WANDB_API_KEY:-}" ]; then export WANDB_MODE=${WANDB_MODE:-online}; el
 
 LUMEN_ARGS=()
 if [ "${LUMEN:-0}" = 1 ]; then
-  PATCH_DIR=${LUMEN_DIR:-$ATOMRL_ROOT/Lumen}/examples/perf-veomni
-  [ -f "$PATCH_DIR/veomni_patches/rmsnorm.py" ] || { echo "Lumen veomni_patches not found under $PATCH_DIR" >&2; exit 1; }
+  [ -f "$ATOMRL_ROOT/atomrl/lumen/config.py" ] || { echo "atomrl.lumen not found under $ATOMRL_ROOT" >&2; exit 1; }
   E=+ray_kwargs.ray_init.runtime_env.env_vars
-  LUMEN_ARGS=("$E.VERL_USE_EXTERNAL_MODULES=lumen_training_patch" "$E.PYTHONPATH=$HERE:$PATCH_DIR"
+  LUMEN_ARGS=("$E.VERL_USE_EXTERNAL_MODULES=lumen_training_patch" "$E.PYTHONPATH=$HERE:$ATOMRL_ROOT"
               "$E.LUMEN_PATCH=${LUMEN_PATCH:-rmsnorm_fuse:local_adamw}")
 fi
 

@@ -50,14 +50,19 @@ def test_conv_uses_aiter_for_bf16_and_torch_otherwise():
 @_CUDA
 def test_triton_forward_routes_dit_attention_only():
     pytest.importorskip("aiter.ops.triton.mha")
-    from veomni_patches import sdpa
+    from atomrl.lumen.config import LumenConfig
+    from atomrl.lumen.ops.attention import dit_sdpa as sdpa
 
-    sdpa.install_triton_forward(min_seq=256)
+    LumenConfig(
+        scaling="none",
+        dit_sdpa_efficient=True,
+        dit_sdpa_triton_forward=True,
+    ).enable(torch.nn.Identity())
     try:
         torch.manual_seed(0)
         q, k, v = (
             torch.randn(
-                1, 4, 512, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True
+                1, 4, 1024, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True
             )
             for _ in range(3)
         )
@@ -86,14 +91,15 @@ def test_triton_forward_routes_dit_attention_only():
 @_CUDA
 def test_rmsnorm_fuses_long_weighted_inputs_only():
     norm_mod = pytest.importorskip("diffusers.models.normalization")
-    from veomni_patches import rmsnorm
+    from atomrl.lumen.config import LumenConfig
+    from atomrl.lumen.ops.normalization import diffusers_rmsnorm as rmsnorm
 
     norm = norm_mod.RMSNorm(128, eps=1e-6).cuda().to(torch.bfloat16)
     long_x = torch.randn(1, 2048, 24, 128, device="cuda", dtype=torch.bfloat16)
     short_x = torch.randn(1, 13, 24, 128, device="cuda", dtype=torch.bfloat16)
     want_short = norm(short_x)
     ref_long = rmsnorm._rmsnorm_weighted(long_x.float(), norm.weight.float(), 1e-6)
-    assert rmsnorm.patch_diffusers_rmsnorm(min_seq=1024)
+    LumenConfig(scaling="none", diffusers_rmsnorm_fuse=True).enable(torch.nn.Identity())
     try:
         before = rmsnorm.stats()
         got_long = norm(long_x)
@@ -112,10 +118,8 @@ def test_rmsnorm_fuses_long_weighted_inputs_only():
 
 
 def _train_adamw(steps, patched):
-    from veomni_patches.local_adamw import (
-        install_local_shard_adamw,
-        uninstall_local_shard_adamw,
-    )
+    from atomrl.lumen.config import LumenConfig
+    from atomrl.lumen.quantize.local_adamw import uninstall_local_shard_adamw
 
     torch.manual_seed(0)
     ps = [
@@ -131,7 +135,7 @@ def _train_adamw(steps, patched):
         fused=True,
     )
     if patched:
-        install_local_shard_adamw()
+        LumenConfig(scaling="none", local_shard_adamw=True).enable(torch.nn.Identity())
     try:
         gen = torch.Generator(device="cuda").manual_seed(1)
         for _ in range(steps):

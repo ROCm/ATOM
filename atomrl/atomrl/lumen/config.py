@@ -74,6 +74,10 @@ _ARG_MAP: dict[str, tuple[str, ...]] = {
     "hf_attn_patch": ("hf_attn_patch",),
     "lumen_linear": ("lumen_linear",),
     "aiter_conv": ("lumen_aiter_conv", "aiter_conv"),
+    "dit_sdpa_efficient": ("lumen_dit_sdpa_efficient",),
+    "dit_sdpa_triton_forward": ("lumen_dit_sdpa_triton_forward",),
+    "diffusers_rmsnorm_fuse": ("lumen_diffusers_rmsnorm_fuse",),
+    "local_shard_adamw": ("lumen_local_shard_adamw",),
     "fused_mlp": ("lumen_fused_mlp",),
     "fp8_activation_store": ("lumen_fp8_activation_store",),
     "cpu_offload": ("lumen_cpu_offload",),
@@ -168,6 +172,14 @@ class LumenConfig:
     # -- Tier 2: Conv2d/Conv3d (AITER forward, PyTorch backward) --
     aiter_conv: bool = False
 
+    # -- Tier 2: Diffusion-model attention and norm routing --
+    dit_sdpa_efficient: bool = False
+    dit_sdpa_triton_forward: bool = False
+    diffusers_rmsnorm_fuse: bool = False
+
+    # -- Tier 3: FSDP2 local-shard optimizer fast path --
+    local_shard_adamw: bool = False
+
     # -- Tier 3: Execution / fusion --
     fused_mlp: bool = False
     fp8_activation_store: bool = False
@@ -255,6 +267,10 @@ class LumenConfig:
             or self.hf_attn_patch
             or self.lumen_linear
             or self.aiter_conv
+            or self.dit_sdpa_efficient
+            or self.dit_sdpa_triton_forward
+            or self.diffusers_rmsnorm_fuse
+            or self.local_shard_adamw
             or self.fp8_param_manager
             or self.lora_rank > 0
             or self.fused_mlp
@@ -297,6 +313,11 @@ class LumenConfig:
                 "which requires BF16/FP32 masters. Disable fp8_param_manager; "
                 "MXFP4 already caches packed FP4 weights per master-weight version."
             )
+        if self.dit_sdpa_triton_forward and not self.dit_sdpa_efficient:
+            raise ValueError(
+                "dit_sdpa_triton_forward requires dit_sdpa_efficient so its "
+                "forward uses the matching efficient backward"
+            )
 
         # 0a. FP8 param storage (replaces weight.data with FP8, freezes)
         fp8pm_mgr = None
@@ -321,6 +342,25 @@ class LumenConfig:
 
         if self.aiter_conv:
             self._patch_conv(model)
+
+        if self.dit_sdpa_efficient:
+            from atomrl.lumen.ops.attention.dit_sdpa import prefer_efficient_backend
+
+            prefer_efficient_backend()
+        if self.dit_sdpa_triton_forward:
+            from atomrl.lumen.ops.attention.dit_sdpa import install_triton_forward
+
+            install_triton_forward()
+        if self.diffusers_rmsnorm_fuse:
+            from atomrl.lumen.ops.normalization.diffusers_rmsnorm import (
+                patch_diffusers_rmsnorm,
+            )
+
+            patch_diffusers_rmsnorm()
+        if self.local_shard_adamw:
+            from atomrl.lumen.quantize.local_adamw import install_local_shard_adamw
+
+            install_local_shard_adamw()
 
         # 2. Pre-quant module attributes
         self._apply_pre_quant(model)
@@ -723,6 +763,12 @@ class LumenConfig:
             parts.append("lumen_linear")
         if self.aiter_conv:
             parts.append("aiter_conv")
+        if self.dit_sdpa_efficient:
+            parts.append("dit_sdpa_efficient")
+        if self.dit_sdpa_triton_forward:
+            parts.append("dit_sdpa_triton_forward")
+        if self.diffusers_rmsnorm_fuse:
+            parts.append("diffusers_rmsnorm_fuse")
         if self.use_8bit_adam:
             parts.append("use_8bit_adam")
         tier3 = [
@@ -738,6 +784,7 @@ class LumenConfig:
                 "hip_graphs",
                 "fp8_checkpoint",
                 "fp8_activation_store",
+                "local_shard_adamw",
             )
             if getattr(self, name, False)
         ]
