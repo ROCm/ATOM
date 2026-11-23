@@ -104,16 +104,26 @@ class MonoDecodeModel(nn.Module):
         dp_ranks: int,
         outputs,
         sampling,
+        draft_context: bool = True,
     ) -> None:
         super().__init__()
         self.model = model
         self._drafter = drafter
         # DP attention's ranks, 0 without it (``step_supported``)
         self._dp_ranks = dp_ranks
-        # created on its first eligible step (``LazyRunner``)
+        # created on its first eligible step (``LazyRunner``); ``sampling``
+        # None and ``draft_context`` False: an owner that neither verifies
+        # through the mono LM head nor writes the draft's context through
+        # ``write_context`` (``V41MonoDecodeRunner``)
         self._mono = LazyRunner(
             lambda: V41MonoDecodeRunner(
-                model, drafter, max_model_len, index_fp4, outputs, sampling
+                model,
+                drafter,
+                max_model_len,
+                index_fp4,
+                outputs,
+                sampling,
+                draft_context,
             ),
             "V4.1 mono decode",
         )

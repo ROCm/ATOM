@@ -34,6 +34,7 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
 from atom.models.deepseek_v41.mono import index_plan as ip
+from atom.models.deepseek_v41.mono.kernels.red import acc_sum
 from atom.mono.device.mx import FP8_MAX, clamp_fp8
 from atom.mono.device.ops import (
     CM_NT,
@@ -46,11 +47,11 @@ from atom.mono.device.ops import (
     lane_gather,
     ld_i32,
     row_shr,
-    row_sum,
     rsrc,
     traced,
     wave_umax_dpp,
 )
+from atom.mono.device.sync import Quad
 from atom.mono.plan.execution import THREADS, WAVES
 
 IDX_ROWS = ip.HEADS * ip.DIM  # 4096
@@ -256,7 +257,7 @@ def await_queries(c, lead, span, rows):
             if const_expr(iq_in_place(c["S"], c["index_fp4"])):
                 c["k1_poll"](
                     [
-                        (c["iqdone"], f * IQ_GROUPS + 2 * i, 2)
+                        (c["iqdone"], Quad(f * (IQ_GROUPS // 2) + i), 2)
                         for i in range(IQ_GROUPS // 2)
                     ]
                 )
@@ -305,8 +306,8 @@ def iq_group_fp4(c, group, t0, n, rope, iw, red, red_task):
         t = t0 + tl
         part = red + rp // 8 * red_task
         r = 2 * (rp % 8)
-        v0 = bf16_round(row_sum(part, r, tl))
-        v1 = bf16_round(row_sum(part, r + 1, tl))
+        v0 = bf16_round(acc_sum(part, r, tl))
+        v1 = bf16_round(acc_sum(part, r + 1, tl))
         d = (group * 32 + 2 * rp) % ip.DIM
         live = d >= ip.DIM - IDX_ROPE
         cs, sn = rope

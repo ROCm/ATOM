@@ -12,7 +12,7 @@ pytest.importorskip("flydsl")
 from atom.models.deepseek_v41.mono.config import MAX_MOE_ROWS, MAX_ROWS, SUPPORTED_DPA
 from atom.models.deepseek_v41.mono.kernels import attn_post as k2a
 from atom.models.deepseek_v41.mono.kernels import moe as k2b
-from atom.models.deepseek_v41.mono.kernels.dims import Dims
+from atom.models.deepseek_v41.mono.kernels.dims import SHARED_INTER, Dims
 from atom.models.deepseek_v41.mono.kernels.moe_shape import RouteShape
 from atom.mono.device.ops import lds_bytes
 from atom.mono.plan.execution import LDS_BYTES
@@ -74,6 +74,18 @@ def test_k2b_fits_a_cu_under_dp_attention_moe_tp(dp, experts, topk, ug_groups, r
     rs = RouteShape(experts, topk, tokens, dp, ug_groups, dp_attention=True)
     assert rs.dpa and rs.router_rows == tokens // dp
     assert lds_bytes(k2b.moe_smem(tokens, rs, True)) <= LDS_BYTES
+
+
+@pytest.mark.parametrize("dp", SUPPORTED_DPA)
+@pytest.mark.parametrize("ep", [False, True])
+def test_dp_attention_ranks_tile_the_replicated_shared_expert(dp, ep):
+    # under DP attention every rank holds the whole shared expert and reads
+    # columns rank x sh_inter ..: the ranks' shares tile its row exactly, the
+    # MoE TP over the DP ranks as much as expert parallel
+    rs = RouteShape(384, 6, 6 * dp, 1 if ep else dp, ep=dp if ep else 1,
+                    dp_attention=not ep)  # fmt: skip
+    assert rs.dpa and rs.dims.dp_attention
+    assert rs.dims.sh_inter * rs.dims.ranks == SHARED_INTER
 
 
 @pytest.mark.parametrize("tp", TPS)

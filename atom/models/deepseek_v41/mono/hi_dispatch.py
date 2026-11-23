@@ -52,13 +52,15 @@ class HiDecodeModel(MonoDecodeModel):
     forward ATOM's model."""
 
     def __init__(
-        self, model, drafter, max_model_len, index_fp4, dp_ranks, sampling, hook
+        self, model, drafter, max_model_len, index_fp4, dp_ranks, hook
     ) -> None:
-        # ATOM's K1 / K2 on the steps the hook does not serve: their own
-        # output buffer, the step's staged sampling
+        # ATOM's K1 / K2 on the steps the hook does not serve, with their own
+        # output buffer; no mono LM head (the hook's verify head runs) and no
+        # draft context launch (the draft writes its own context there)
         super().__init__(
-            model, drafter, max_model_len, index_fp4, dp_ranks, None, sampling
-        )
+            model, drafter, max_model_len, index_fp4, dp_ranks, None, None,
+            draft_context=False,
+        )  # fmt: skip
         self._hi = hook
         # the hook's in-graph verify, not ATOM's mono LM head
         self.verify_head = HiVerifyHead(hook)
@@ -246,13 +248,11 @@ def _install_hi(
     # the round's host work at the builder's points (``round.HiRound``): the routing decision with lean host prep on the
     # steps it serves, the device-side round advance on top of it, the verdict / Engram commit inside the target graph
     metadata_builder.use_decode_round(hi_round.install(hook, metadata_builder))
-    staged = metadata_builder.model_runner.forward_vars
     return HiDecodeModel(
         model,
         drafter,
         atom_config.max_model_len,
         atom_config.index_cache_dtype == "fp4",
         dp_ranks,
-        (staged["temperatures"].gpu, staged["top_ps"].gpu),
         hook,
     )

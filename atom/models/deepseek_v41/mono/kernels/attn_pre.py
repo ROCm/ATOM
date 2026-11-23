@@ -35,6 +35,7 @@ split and order.
 """
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import flydsl.compiler as flyc
@@ -75,6 +76,7 @@ from atom.models.deepseek_v41.mono.kernels.index_query import (
 )
 from atom.models.deepseek_v41.mono.kernels.mx import AMAX_FLOOR, code_round, fp8_value
 from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_offsets
+from atom.models.deepseek_v41.mono.kernels.red import acc_sum, acc_word
 from atom.models.deepseek_v41.mono.kernels.token_par import (
     EMBED_ROW_BYTES,
     TOKEN_ROW_BYTES,
@@ -111,7 +113,6 @@ from atom.mono.device.ops import (
     launcher,
     ld_f32,
     ld_i32,
-    row_sum,
     rows_to_lds,
     rsrc,
     traced,
@@ -119,7 +120,7 @@ from atom.mono.device.ops import (
 )
 from atom.mono.device.ranks import peer_bases
 from atom.mono.device.stamps import stamp, stamp_begin, stamp_flush
-from atom.mono.device.sync import POLL_MAX, preg, publish
+from atom.mono.device.sync import POLL_MAX, Quad, preg, publish
 from atom.mono.plan.arith import sel
 from atom.mono.plan.build_key import key_tuple
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES, first_task
@@ -143,6 +144,10 @@ LOG2E = 1.0 / math.log(2.0)
 COLS = 32  # hidden columns a slice task
 SLICES = HIDDEN // COLS  # 160
 KT = HC * COLS  # projection columns a slice task
+# a token's R_new row and a mix's fn row in LDS (``rl`` / ``fl``), padded: the
+# mixes' MFMA reads one column of sixteen rows an instruction, which at a
+# multiple of the banks' words all land on one bank
+KT_ROW = KT + 4
 # a slice's mix weights are whole rounds of the CTA (``slice_fn_loads``)
 assert MIX * KT % THREADS == 0
 PART = MIX + 1  # a slice's partials a token: the mixes, then the sum of squares
@@ -259,10 +264,10 @@ class AttnPreBuild:
     # the pool's rows are MXFP8 (FP8 values then E8M0 scales, ``row_bytes``):
     # the window row is stored so, not as its BF16 QAT
     kv_fp8: bool = False
-    # the regions kept in two copies, one on each I/O die (``numa_plan``), and
-    # the scratch's calibration word that picks a CTA's copy
+    # the regions kept in two copies, one on each I/O die (``numa_plan``); the
+    # scratch's calibration word that picks a CTA's copy is the ``numa_word``
+    # argument, measured at run time
     numa: str = ""
-    numa_word: int = 0
     # the residual column-sharded (``shard_seam``): the seam folds this rank's
     # columns, writing only those of R_new
     shard: bool = False
@@ -300,7 +305,7 @@ ABI = KernelAbi(
         "wqb", "wqb_s", "cos", "sin", "pos", "ring", "ring_scale", "ring_rows", "ring_off",
         "res_out", "post_out", "comb_out", "pre_out", "q_out", "normed", "qr_out",
         "qrs_out", "aux", "iq_w", "iq_ws", "iw_w", "iq_out", "iqs_out", "iw_out",
-        "ibound", "scratch", "sym", "peers", "rank", "layer", "tl",
+        "ibound", "scratch", "numa_word", "sym", "peers", "rank", "layer", "tl",
     )
 )  # fmt: skip
 
@@ -461,7 +466,7 @@ def slice_input(c, task, idx):
         for d in range_constexpr(2):
             acc = fx.Float32(0.0)
             for h in range_constexpr(HC):
-                rb = fx.ptr_load(rl + (t * KT + h * COLS + cc + d))
+                rb = fx.ptr_load(rl + (t * KT_ROW + h * COLS + cc + d))
                 acc = acc + ld_f32(a["pre_in"], t * HC + h) * rb
             outs.append(acc)
         put_out(c, "put_bf", "lin", t * HIDDEN + c0 + cc, outs)
@@ -475,7 +480,7 @@ def slice_input(c, task, idx):
             for d in range_constexpr(2):
                 acc = fx.Float32(0.0)
                 for h in range_constexpr(HC):
-                    acc = acc + fx.ptr_load(rl + (t * KT + h * COLS + cc + d))
+                    acc = acc + fx.ptr_load(rl + (t * KT_ROW + h * COLS + cc + d))
                 bo.buffer_store(
                     (acc * fx.Float32(1.0 / HC)).to(fx.BFloat16),
                     rsrc(a["aux"]),
@@ -574,7 +579,7 @@ def slice_direct_pair(c, task, q, got):
                     rsrc(a["res_out"]),
                     (t * HC + o) * HIDDEN + col + d,
                 )
-                fx.ptr_store(v, rl + (t * KT + o * COLS + cc + d))
+                fx.ptr_store(v, rl + (t * KT_ROW + o * COLS + cc + d))
                 vs.append(v)
             new.append(vs)
         # stream h of the group's first lane: lane h / own's value j = h % own
@@ -596,10 +601,11 @@ def slice_direct_pair(c, task, q, got):
                     acc = acc + from_lane(new[h % own][d], h // own)
                 taps.append(acc)
         # the next column pair's values (its group's lanes, ``split`` on): an
-        # even pair's first lane puts the 4 columns, one 16-byte put
+        # even pair's first lane puts the 4 columns, one 16-byte put (a quad:
+        # an even pair's column a multiple of 4)
         nxt = [xshfl(v, split) for v in outs]
         if (g == 0) & (p % 2 == 0):
-            put_out(c, "put_bf", "lin", t * HIDDEN + col, outs + nxt)
+            put_out(c, "put_bf", "lin", Quad((t * HIDDEN + col) // 4), outs + nxt)
         if g == 0:
             for d in range_constexpr(len(taps)):
                 bo.buffer_store(
@@ -654,7 +660,7 @@ def slice_row(c, c0, e, got):
             bo.buffer_store(
                 v.to(fx.BFloat16), rsrc(a["res_out"]), (t * HC + o) * HIDDEN + col
             )
-    fx.ptr_store(v, c["rl"] + (t * KT + o * COLS + e % COLS))
+    fx.ptr_store(v, c["rl"] + (t * KT_ROW + o * COLS + e % COLS))
 
 
 def slice_fn_loads(c, task):
@@ -705,7 +711,8 @@ def store_fns(c, fns):
     tid, fl = c["tid"], c["fl"]
     for i in range_constexpr(MIX * KT // THREADS):
         hi = bf16_round(fns[i])
-        fx.ptr_store(hi + bf16_round(fns[i] - hi), fl + (tid + THREADS * i))
+        e = tid + THREADS * i
+        fx.ptr_store(hi + bf16_round(fns[i] - hi), fl + (e // KT * KT_ROW + e % KT))
 
 
 @traced
@@ -760,8 +767,8 @@ def slice_tail(c, task):
     # sum of squares: token t on wave t % WAVES, two columns a lane
     for t in range_constexpr(s):
         if wave == t % WAVES:
-            x0 = fx.ptr_load(rl + (t * KT + 2 * lane))
-            x1 = fx.ptr_load(rl + (t * KT + 2 * lane + 1))
+            x0 = fx.ptr_load(rl + (t * KT_ROW + 2 * lane))
+            x1 = fx.ptr_load(rl + (t * KT_ROW + 2 * lane + 1))
             sq = butterfly(x0 * x0 + x1 * x1, (32, 16, 8, 4, 2, 1))
             if lane == 0:
                 put_out(c, "put", "pmix", (task * s + t) * PART + MIX, sq)
@@ -781,10 +788,10 @@ def slice_mix(c, task, t0, n):
     cs = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(2)]
     for kk in range_constexpr(kw // 4):
         colk = wave * kw + lane // 16 + 4 * kk
-        b = fx.ptr_load(rl + (tok * KT + colk))
+        b = fx.ptr_load(rl + (tok * KT_ROW + colk))
         for h in range_constexpr(2):
             row = h * 16 + lane % 16
-            av = fx.ptr_load(fl + (fx.min(row, MIX - 1) * KT + colk))
+            av = fx.ptr_load(fl + (fx.min(row, MIX - 1) * KT_ROW + colk))
             av = (row < MIX).select(av, fx.Float32(0.0))
             ops = rocdl._split_mfma_operands([av, b, cs[h], 0, 0, 0])
             cs[h] = fx.Vector(rocdl.mfma_f32_16x16x4f32(T.vec(4, T.f32), *ops).result)
@@ -984,10 +991,10 @@ def stage_norm(c, t):
     # the norm weights, which the row does not decide: loaded before its wait
     wts = [ld_bf8(a["attn_w"], fx.min(cols[ch], HIDDEN - 8)) for ch in range(3)]
     bases = [t * HIDDEN + fx.min(cols[ch], HIDDEN - 8) for ch in range(3)]
-    # a chunk's 8 columns: 4 bf16-pair words, two 16-byte polls (the base even);
-    # with the LSSQ partials one poll batch (``POLL_MAX``)
+    # a chunk's 8 columns: 4 bf16-pair words, two 16-byte polls (two quads: the
+    # base a multiple of 8); with the LSSQ partials one poll batch (``POLL_MAX``)
     words = c["poll"](
-        [(c["lin"], bases[ch] // 2 + 2 * k, 2) for ch in range(3) for k in range(2)]
+        [(c["lin"], Quad(bases[ch] // 4 + k), 2) for ch in range(3) for k in range(2)]
         + lssq_specs(c["lssq"], t, lane)
     )
     xs = []
@@ -1022,8 +1029,9 @@ def stage_norm(c, t):
                 )
             if const_expr(c["index"]):
                 # the indexer's weights_proj reads the bf16 row
-                c["put_bf"](c["nb"], t * HIDDEN + col, ys[0:4])
-                c["put_bf"](c["nb"], t * HIDDEN + col + 4, ys[4:8])
+                q = (t * HIDDEN + col) // 4
+                c["put_bf"](c["nb"], Quad(q), ys[0:4])
+                c["put_bf"](c["nb"], Quad(q + 1), ys[4:8])
             if const_expr(not c["ffn"]):
                 w0 = fp8_pack4(*[clamp_fp8(ys[i] * inv) for i in range(4)])
                 w1 = fp8_pack4(*[clamp_fp8(ys[4 + i] * inv) for i in range(4)])
@@ -1181,13 +1189,39 @@ def _gemv_steps(c, k, split, tiled=False):
     return [(part * per + i, None) for i in range(per)]
 
 
-def gemv_fp8_loads(c, w, ws, k, rg, split=None, tiled=False, k_row=None, st0=0):
+def _fp8_part_load(c, r_w, r_ws, k, k_row, rg, k0, st):
+    """``_fp8_step_load`` of a part of the rows: step st of the ``k`` columns
+    from column ``k0`` (a multiple of 32: a scale block; traced, a rank's or a
+    task's part) of rows ``k_row`` long. The shuffle's 32-column blocks of a
+    row group are contiguous, so the part is the whole-row layout shifted by
+    its first block, and clamped within the part (not the row)."""
+    lane = c["lane"]
+    j = lane // 16
+    kg = k // 32
+    base = rg * (k_row * 4) + k0 * 4
+    if const_expr(k % 64 == 0):
+        lo_at = base + st * 512 + lane * 4
+    else:
+        lo_at = base + fx.min(4 * st + lane // 32, kg - 1) * 128 + lane % 32 * 4
+    lo = fx.Vector(
+        bo.buffer_load(r_w, lo_at, vec_width=4, dtype=T.i32, cache_modifier=CM_NT)
+    )
+    hi_at = base + fx.min(2 * st + 1, k // 64 - 1) * 256 + lane * 4
+    hi = fx.Vector(
+        bo.buffer_load(r_w, hi_at, vec_width=4, dtype=T.i32, cache_modifier=CM_NT)
+    )
+    wsi = (rg // 2) * (k_row // 32) + k0 // 32 + fx.min(st * 4 + j, kg - 1)
+    word = fx.Int32(bo.buffer_load(r_ws, wsi // 4, vec_width=1, dtype=T.i32))
+    return lo, hi, (word >> (wsi % 4 * 8)) & 0xFF
+
+
+def gemv_fp8_loads(c, w, ws, k, rg, split=None, tiled=False, k_row=None, k0=0):
     """The weight operands of ``gemv_fp8``'s rows for this wave, every one in
     flight at once (a step's latency each would put them in series): loads
     only. A step past the end loads the last step. ``tiled`` (split x tiles =
     WAVES): row groups rg .., one a group of ``split`` waves. ``k_row``: the
-    weight's rows are this long, its K steps st0 .. the ``k`` taken (a part of
-    K: ``Dims.wob_parts``)."""
+    weight's rows are this long, its columns k0 .. the ``k`` taken (a part of
+    K: ``Dims.wob_parts``, a rank's share of a replicated weight)."""
     steps = (k + 127) // 128
     r_w, r_ws = rsrc(w), rsrc(ws)
     if const_expr(tiled):
@@ -1195,30 +1229,28 @@ def gemv_fp8_loads(c, w, ws, k, rg, split=None, tiled=False, k_row=None, st0=0):
         rg = rg + c["wave"] // split
     if k_row is None:
         k_row = k
-    # st0 may be traced (a rank's part): a part's steps never cross a row
-    offset = not (isinstance(st0, int) and st0 == 0)
-    assert not offset or (k % 128 == 0 and k_row % 128 == 0)
     sts = [
         st if live is None else fx.min(st, steps - 1)
         for st, live in _gemv_steps(c, k, split, tiled)
     ]
-    return [
-        _fp8_step_load(c, r_w, r_ws, k_row, rg, st0 + st if offset else st)
-        for st in sts
-    ]
+    # the whole rows: no column offset to apply (a traced k0 is a part's)
+    if const_expr(k_row == k and isinstance(k0, int) and k0 == 0):
+        return [_fp8_step_load(c, r_w, r_ws, k, rg, st) for st in sts]
+    assert k_row % 64 == 0
+    return [_fp8_part_load(c, r_w, r_ws, k, k_row, rg, k0, st) for st in sts]
 
 
 def gemv_fp8_mfmas(c, k, xl, xsl, red, ops, split=None, tiled=False, rows=None):
     """``gemv_fp8_loads``' operands against the rows in LDS (``rows``: a token
     tile's, every token's by default) ->
-    red[wave][lane]; the scaled 16x16x128 MFMA, chunk kc in dwords 0-3 and kc +
+    red[wave][lane] in ``red``'s layout (``acc_word``); the scaled 16x16x128 MFMA, chunk kc in dwords 0-3 and kc +
     1 in 4-7. ``k`` a multiple of 32: a last half step has its upper chunk zeroed
     on both sides at unit scale (a NaN byte past the row must not reach the
     MFMA), its loads clamped into the row: the last row group's would read past
     the tensor; a last quarter step its lower chunk's upper block too. A step
     past the end adds zero at unit scale.
 
-    The K order is the original kernel's, which ``row_sum`` completes:
+    The K order is the original kernel's, which ``red.acc_sum`` completes:
     wave w takes steps w, w + 8, ... (``split`` None: aiter's preshuffled group32
     GEMM, P0.5 microbenchmark 1), or waves 0 .. split - 1 one contiguous K range
     each, the other waves zero (aiter's split-K bmm, whose last split sums the
@@ -1232,16 +1264,54 @@ def gemv_fp8_mfmas(c, k, xl, xsl, red, ops, split=None, tiled=False, rows=None):
             [(wave < split).select(acc[e], fx.Float32(0.0)) for e in range(4)],
             fx.Float32,
         )
-    fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
+    fx.ptr_store(acc, red + acc_word(wave, lane // 16, lane % 16))
+
+
+@dataclass(frozen=True)
+class SpanAt:
+    """Where a ``poll_copy`` span's elements lie in its region: element u at
+    pair ``pair(u)``; elements u and u + 1 (u even) at ``Quad`` ``quad(u)``,
+    None where the span's rows do not start at a quad (a spec an element)."""
+
+    pair: Callable
+    quad: Callable | None = None
+
+
+def flat_span(first, row_pairs: int) -> SpanAt:
+    """Rows of ``row_pairs`` pairs back to back from row ``first`` (traced or
+    not): quad-aligned where ``row_pairs`` is even."""
+
+    def pair(u):
+        return plus(first * row_pairs, u)
+
+    def quad(u):
+        return Quad(plus(first * (row_pairs // 2), u // 2))
+
+    return SpanAt(pair, quad if row_pairs % 2 == 0 else None)
+
+
+def strided_span(first, stride: int, part, unit: int, width: int) -> SpanAt:
+    """Rows ``stride`` pairs apart from row ``first``, each's ``width`` pairs
+    from pair ``part`` x ``unit`` (``part`` traced or not): quad-aligned
+    where ``stride`` and ``unit`` are even."""
+
+    def pair(u):
+        return plus(first, u // width) * stride + part * unit + u % width
+
+    def quad(u):
+        row = plus(first, u // width) * (stride // 2)
+        return Quad(row + part * (unit // 2) + u % width // 2)
+
+    return SpanAt(pair, quad if stride % 2 == 0 and unit % 2 == 0 else None)
 
 
 @traced
 def poll_copy(c, idx, width, spans, live=None):
-    """Mailbox spans [(region, pair_of, n, dst, row)] into LDS: element u (pair
-    ``pair_of(u)``) to dst + u, or ``lds_at(u, row)`` for a span of rows
-    ``row`` words wide. A spec takes ``span_pairs`` consecutive elements (two
-    where the span's rows and length are even: one 16-byte load a spec, half
-    the specs); thread ``idx`` of ``width`` takes spec idx, idx + width, ...,
+    """Mailbox spans [(region, at, n, dst, row)] into LDS: element u (``at``:
+    a ``SpanAt``) to dst + u, or ``lds_at(u, row)`` for a span of rows ``row``
+    words wide. A spec takes ``span_pairs`` consecutive elements (two where
+    the span is quad-aligned and its rows and length even: one 16-byte load a
+    spec, half the specs); thread ``idx`` of ``width`` takes spec idx, idx + width, ...,
     POLL_MAX pairs a round trip (``pair_batches``), each batch stored before
     the next is polled (holding them all spills past S = 16); a thread past a
     span's end re-reads its last spec and stores nothing.
@@ -1253,16 +1323,16 @@ def poll_copy(c, idx, width, spans, live=None):
     idx = fresh(idx)  # its elements' indices not hoisted out of a task loop
     if const_expr(live is None):
         _poll_store_batches(c, [
-            (region, pair_of, n, (dst, row), k, k * (idx + width * i))
-            for region, pair_of, n, dst, row in spans
-            for k in [span_pairs(n, row)]
+            (region, at, n, (dst, row), k, k * (idx + width * i))
+            for region, at, n, dst, row in spans
+            for k in [span_pairs(n, row, at)]
             for i in range((n // k + width - 1) // width)
         ])  # fmt: skip
         return
-    for (region, pair_of, n, dst, row), need in zip(spans, live):
-        k = span_pairs(n, row)
+    for (region, at, n, dst, row), need in zip(spans, live):
+        k = span_pairs(n, row, at)
         chunks = [
-            (region, pair_of, need, (dst, row), k, k * (idx + width * i))
+            (region, at, need, (dst, row), k, k * (idx + width * i))
             for i in range((n // k + width - 1) // width)
         ]
         for batch in pair_batches(chunks):
@@ -1270,11 +1340,13 @@ def poll_copy(c, idx, width, spans, live=None):
                 _poll_store_batches(c, batch)
 
 
-def span_pairs(n, row):
+def span_pairs(n, row, at: SpanAt):
     """Elements a ``poll_copy`` spec takes of a span of ``n`` (rows ``row``
-    words wide, None: one row): two where both split evenly, so a spec never
-    straddles a row or the span's end; else one."""
-    return 2 if n % 2 == 0 and (row is None or row % 2 == 0) else 1
+    words wide, None: one row) at ``at``: two where it is quad-aligned and
+    both split evenly, so a spec never straddles a row or the span's end;
+    else one."""
+    even = n % 2 == 0 and (row is None or row % 2 == 0)
+    return 2 if at.quad is not None and even else 1
 
 
 def pair_batches(chunks):
@@ -1292,12 +1364,16 @@ def pair_batches(chunks):
 
 @traced
 def _poll_store_batches(c, chunks):
-    """``poll_copy``'s chunks [(region, pair_of, n, (dst, row), k, u)] (spec of
+    """``poll_copy``'s chunks [(region, at, n, (dst, row), k, u)] (spec of
     elements u .. u + k), a ``pair_batches`` batch a round trip, each stored
     before the next is polled."""
+
+    def spec(at, u, k):
+        return at.pair(u) if k == 1 else at.quad(u)
+
     for batch in pair_batches(chunks):
         got = c["poll"](
-            [(r, p(fx.min(u, n - k)), k) for r, p, n, _, k, u in batch],
+            [(r, spec(at, fx.min(u, n - k), k), k) for r, at, n, _, k, u in batch],
             batch=len(batch),
         )
         for (_, _, n, (dst, row), k, u), v in zip(batch, got):
@@ -1319,8 +1395,8 @@ def load_x8(c, words_mb, codes_mb, words, groups, xl, xsl, t0=0, n=None):
         c["tid"],
         THREADS,
         [
-            (words_mb, lambda u: plus(t0 * words, u), rows * words, xl, words),
-            (codes_mb, lambda u: plus(t0 * groups, u), rows * groups, xsl, groups),
+            (words_mb, flat_span(t0, words), rows * words, xl, words),
+            (codes_mb, flat_span(t0, groups), rows * groups, xsl, groups),
         ],
         live=None if isinstance(n, int) else [n * words, n * groups],
     )
@@ -1360,7 +1436,7 @@ def stage_wqkv(c, task, ops, t0, n):
     gemv_fp8_mfmas(c, HIDDEN, c["xl"], c["xsl"], red, ops, rows=n)
     gpu.barrier()
     r = tid % ROWS
-    v = row_sum(red, r, fx.min(tid // ROWS, n - 1))
+    v = acc_sum(red, r, fx.min(tid // ROWS, n - 1))
     # the odd row's value from the next lane (lanes r, r + 1 of a token)
     vn = xshfl(v, 1)
     if (tid < ROWS * n) & (r % 2 == 0):
@@ -1386,8 +1462,8 @@ def stage_q_norm(c, t):
     # every weight the token's rows do not decide, loaded before their wait
     qnw = [ld_bf(a["qn_w"], qc[j]) for j in range(8)]
     # the thread's 8 columns: 4 bf16-pair words, two 16-byte polls
-    base = (t * QKV_ROWS + fx.min(tt, Q_RANK // 8 - 1) * 8) // 2
-    qv = c["poll"]([(c["qkv"], base, 2), (c["qkv"], base + 2, 2)])
+    q = (t * QKV_ROWS + fx.min(tt, Q_RANK // 8 - 1) * 8) // 4
+    qv = c["poll"]([(c["qkv"], Quad(q), 2), (c["qkv"], Quad(q + 1), 2)])
     vals = []
     for w in qv[0] + qv[1]:
         vals += [bf_lo(w), bf_hi(w)]
@@ -1423,7 +1499,7 @@ def stage_q_norm(c, t):
                 if tt % 4 == 0:
                     c["put"](qs, tg * (Q_RANK // 32) + tt // 4, code)
         else:
-            c["put_words"](c["qx8"], t * QX8_WORDS + 2 * tt, [w0, w1])
+            c["put_words"](c["qx8"], Quad(t * (QX8_WORDS // 2) + tt), [w0, w1])
             if tt % 4 == 0:
                 c["put"](c["qx8s"], t * (Q_RANK // 32) + tt // 4, code)
         if const_expr(c["index"]):
@@ -1718,8 +1794,8 @@ def wqb_epilogue(c, task, t0, n, rope, red):
         tl = tid // (ROWS // 2)
         t = plus(t0, tl)
         r0 = task * ROWS + 2 * rp  # global row: head r0 // 512, dim r0 % 512
-        v0 = bf16_round(row_sum(red, 2 * rp, tl))
-        v1 = bf16_round(row_sum(red, 2 * rp + 1, tl))
+        v0 = bf16_round(acc_sum(red, 2 * rp, tl))
+        v1 = bf16_round(acc_sum(red, 2 * rp + 1, tl))
         d = r0 % HEAD_DIM
         live = d >= HEAD_DIM - ROPE
         cs, sn = rope
@@ -1755,8 +1831,8 @@ def stage_iq(c, task, ops, t0, n, rope):
         tl = tid // (ROWS // 2)
         t = plus(t0, tl)
         r0 = task * ROWS + 2 * rp
-        v0 = bf16_round(row_sum(red, 2 * rp, tl))
-        v1 = bf16_round(row_sum(red, 2 * rp + 1, tl))
+        v0 = bf16_round(acc_sum(red, 2 * rp, tl))
+        v1 = bf16_round(acc_sum(red, 2 * rp + 1, tl))
         d = r0 % ip.DIM
         live = d >= ip.DIM - IDX_ROPE
         cs, sn = rope
@@ -2103,8 +2179,7 @@ def run_attn_pre(
         def load_group(g, n):
             poll_copy(
                 co, tid, THREADS,
-                [(co["nb"], lambda u: plus(g * HIDDEN // 2, u), n * HIDDEN // 2,
-                  nbl, None)],
+                [(co["nb"], flat_span(g, HIDDEN // 2), n * HIDDEN // 2, nbl, None)],
             )  # fmt: skip
             gpu.barrier()
 
@@ -2190,8 +2265,8 @@ def attn_pre_smem(key: AttnPreBuild) -> dict:
     }
     stages = {
         "slice": {
-            "rl": fx.Array[fx.Float32, s * KT, 16],
-            "fl": fx.Array[fx.Float32, MIX * KT, 16],
+            "rl": fx.Array[fx.Float32, s * KT_ROW, 16],
+            "fl": fx.Array[fx.Float32, MIX * KT_ROW, 16],
         },
         "wqkv": {
             "xl": fx.Array[fx.Int32, rows * lds_row(X8_WORDS), 16],
@@ -2233,7 +2308,7 @@ def attn_pre_context(key, lds, mb, layout, scratch, args, rank, sym, peers):
         # the layer kernel (``layer``): its attention follows in this launch
         "fused": False,
     }  # fmt: skip
-    c.update(region_addrs(scratch, layout, key.numa, key.numa_word))
+    c.update(region_addrs(scratch, layout, key.numa, args["numa_word"]))
     c["rank"], c["sym"] = rank, sym
     if const_expr(key.shard):
         peer = peer_offsets(s, dims)
@@ -2324,8 +2399,8 @@ def build_attn_pre(key: AttnPreBuild):
         res_out: Int64, post_out: Int64, comb_out: Int64, pre_out: Int64,
         q_out: Int64, normed: Int64, qr_out: Int64, qrs_out: Int64, aux: Int64,
         iq_w: Int64, iq_ws: Int64, iw_w: Int64, iq_out: Int64, iqs_out: Int64,
-        iw_out: Int64, ibound: Int64, scratch: Int64, sym: Int64, peers: Int64,
-        rank: Int32,
+        iw_out: Int64, ibound: Int64, scratch: Int64, numa_word: Int64, sym: Int64,
+        peers: Int64, rank: Int32,
         layer: Int32, tl: Int64,
     ):  # fmt: skip
         tid = fx.thread_idx.x
@@ -2341,6 +2416,7 @@ def build_attn_pre(key: AttnPreBuild):
             qr_out, qrs_out, aux, iq_w, iq_ws, iw_w, iq_out, iqs_out, iw_out,
             ibound,
         )  # fmt: skip
+        args["numa_word"] = numa_word
         c, co = attn_pre_context(
             key, lds, mailbox(layer, scratch, key.diag_off, layout),
             layout, scratch, args, rank, sym, peers,
@@ -2359,8 +2435,8 @@ def build_attn_pre(key: AttnPreBuild):
         res_out: Int64, post_out: Int64, comb_out: Int64, pre_out: Int64,
         q_out: Int64, normed: Int64, qr_out: Int64, qrs_out: Int64, aux: Int64,
         iq_w: Int64, iq_ws: Int64, iw_w: Int64, iq_out: Int64, iqs_out: Int64,
-        iw_out: Int64, ibound: Int64, scratch: Int64, sym: Int64, peers: Int64,
-        rank: Int32,
+        iw_out: Int64, ibound: Int64, scratch: Int64, numa_word: Int64, sym: Int64,
+        peers: Int64, rank: Int32,
         layer: Int32, tl: Int64, stream: fx.Stream = _CURRENT_STREAM,
     ):  # fmt: skip
         _ = keyed
@@ -2368,8 +2444,8 @@ def build_attn_pre(key: AttnPreBuild):
             res_in, pend, post_in, comb_in, pre_in, hc_fn, hc_scale, hc_base, attn_w,
             wqkv, wqkv_s, qn_w, kvn_w, wqb, wqb_s, cos, sin, pos, ring, ring_scale, ring_rows, ring_off,
             res_out, post_out, comb_out, pre_out, q_out, normed, qr_out, qrs_out, aux,
-            iq_w, iq_ws, iw_w, iq_out, iqs_out, iw_out, ibound, scratch, sym, peers,
-            rank, layer, tl,
+            iq_w, iq_ws, iw_w, iq_out, iqs_out, iw_out, ibound, scratch, numa_word,
+            sym, peers, rank, layer, tl,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 
     ABI.check(attn_pre, launch)

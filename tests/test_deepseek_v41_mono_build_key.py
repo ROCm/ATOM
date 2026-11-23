@@ -35,20 +35,20 @@ BUILDS = {
         k1.build_attn_pre, k1.ABI, k1.AttnPreBuild(tokens=12),
         {"tokens": 24, "fold": False, "feeds_index": True, "index_fp4": True,
          "aux": True, "tp": 2, "timeline": True, "diag_off": DIAG,
-         "tok_par": True, "kv_fp8": True, "numa": NUMA % "lin", "numa_word": 0x0F,
+         "tok_par": True, "kv_fp8": True, "numa": NUMA % "lin",
          "shard": True, "embed_in": True},
     ),
     "k2a": (
         k2a.build_attn_post, k2a.ABI, k2a.AttnPostBuild(tokens=12),
         {"tokens": 24, "index_bound_max": 65536, "index_fp4": True, "index_mfma": True, "tp": 2,
          "timeline": True, "diag_off": DIAG, "tok_par": True, "kv_fp8": True,
-         "numa": NUMA % "as", "numa_word": 0x0F, "attn_sel": False, "block_rows": 5},
+         "numa": NUMA % "as", "attn_sel": False, "block_rows": 5},
     ),
     "k2b": (
         k2b.build_moe, k2b.ABI, MoeBuild(tokens=6, tp=1),
         {"tokens": 12, "experts": 128, "topk": 3, "tp": 2, "timeline": True,
          "diag_off": DIAG, "ug_groups": 1, "ep": 2, "dp_attention": True,
-         "numa": NUMA % "logit", "numa_word": 0x0F, "after_seam": True,
+         "numa": NUMA % "logit", "after_seam": True,
          "own_routes": True},
     ),
     "k2": (
@@ -56,7 +56,7 @@ BUILDS = {
         {"tokens": 24, "index_bound_max": 65536, "index_fp4": True, "index_mfma": True, "experts": 128,
          "topk": 3, "tp": 2, "timeline": True, "diag_off": DIAG, "ug_groups": 1,
          "tok_par": True, "ep": 2, "moe_tp": 2, "kv_fp8": True,
-         "numa": NUMA % "as", "numa_word": 0x0F, "shard": True, "attn_sel": False,
+         "numa": NUMA % "as", "shard": True, "attn_sel": False,
          "block_rows": 5},
     ),
     "cg": (
@@ -123,9 +123,6 @@ def test_a_rebuild_hits_the_cache(cache, build):
 @pytest.mark.parametrize(("build", "name"), CASES)
 def test_one_field_changed_is_a_new_binary(cache, build, name):
     _, _, base, other = BUILDS[build]
-    if name == "numa_word":
-        # the word picks the copies of the regions ``numa`` names: none, no code
-        base = dataclasses.replace(base, numa=other["numa"])
     if (build, name) in (("dh", "eps"), ("dh", "confidence")):
         # the epsilon is code only in a build that makes its rows, and the
         # confidence head reads a row its CTA made

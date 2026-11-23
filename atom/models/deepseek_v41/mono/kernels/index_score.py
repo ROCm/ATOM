@@ -24,7 +24,11 @@ step only in ``index_plan`` (DESIGN_v3 4.9); the CPU test there checks it.
             (level l > 0, from ISEL<l-1> / IBLK<l-1>), in index order. A list
             that is its token's last -> global (``isel``, lifted to real rows on
             a REINDEX layer; ``icout``) and, for the selection, the ready flag
-            (IRDY) the attention waits on; else -> ISEL<l> / IBLK<l>.
+            (IRDY) the attention waits on; else -> ISEL<l> / IBLK<l>. A
+            candidate producer ranks its blocks first: a row with TOPK_BLOCKS
+            of them or more then has its candidates' scores compacted to
+            the front of its ``ilog`` row (ICRDY), and its selection ranks
+            those alone, lifted as a REINDEX row's (``index_plan.compacts``)
     imerge  (a row split over the TP ranks, ``index_plan.row_shares``): each
             rank's tree ranks its share; its last list goes to every rank's
             IXSEL (plain words, then the IXRDY flag), and every rank ranks a
@@ -38,7 +42,7 @@ several chunks a task.
 
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, T
 
 from atom.models.deepseek_v41.mono import index_plan as ip
@@ -87,10 +91,12 @@ def scratch_pairs(tokens: int, bound_max: int, tok_par: bool = False) -> dict[st
     """The indexer's mailbox regions. A tree's last level's list is always a
     token's final one (global), so only levels below it have a region, sized
     for every tree of its kind (``index_plan.trees``). A token-parallel launch's
-    selection flags are peer regions (``peer_layout``: its owner's)."""
+    selection and candidate flags are peer regions (``peer_layout``: its
+    owner's)."""
     out = {"isf": tokens * ip.chunks(bound_max)}
     if not tok_par:
         out["irdy"] = tokens
+        out["icrdy"] = tokens
     for kind, k in ip.KINDS.items():
         for level in range(ip.region_levels(kind, bound_max)):
             slots = ip.region_slots(kind, level, bound_max)
@@ -260,6 +266,9 @@ def stage_ilist(c, t, j, share, kind, level, bound_max, max_chunks, seg):
     any_scored = ip.scored(raw) if split is None else (split != 0) | ip.scored(cols)
     slots = ip.list_slots(kind, level, bound_max, seg)
     bound = ip.kind_bound(kind, cols)
+    # a candidate producer's row of TOPK_BLOCKS blocks or more: its selection
+    # ranks its candidate blocks' rows, compacted to the row's front (``_compact``)
+    gathers = False if raw is None else (a["iprod"] != 0) & ip.compacts(raw)
     if j < ip.list_count(bound, level, k, seg):
         n = ip.list_inputs(bound, level, j, k, seg)
         final = ip.is_final(bound, level, k, seg)
@@ -271,6 +280,11 @@ def stage_ilist(c, t, j, share, kind, level, bound_max, max_chunks, seg):
             if const_expr(kind == "sel"):
                 first = col0 // ip.CHUNK + seg // ip.CHUNK * j
                 count = ip.share_chunks(any_scored, cols, j, seg)
+                if const_expr(raw is not None):
+                    # a compacted row's columns: its candidates' flag instead
+                    count = sel(gathers, 0, count)
+                    if gathers & (tid == 0):
+                        c["poll"]([(_icrdy(c), t, 1)])
             else:
                 first, count = ip.block_chunks(raw, j)
             if tid < count:
@@ -325,16 +339,19 @@ def stage_ilist(c, t, j, share, kind, level, bound_max, max_chunks, seg):
                 col0, split,
             )  # fmt: skip
             if to_final:
-                _final_rows(c, t, slot, split)
+                _final_rows(c, t, slot, split, gathers)
         else:
-            _select_blk(c, t, j, n, per, load, got, level, seg, slots, to_final, kind)
+            idents = _select_blk(
+                c, t, j, n, per, load, got, level, seg, slots, to_final, kind
+            )
+            if final & gathers:
+                _compact(c, t, idents)
         # a selection's flag for the attention (a split row's answer's for
-        # every rank's merge instead); the candidate blocks' only in a
-        # token-parallel launch, which waits for every rank's (``await_candidates``)
-        region = "irdy" if kind == "sel" else "icrdy" if c["tok_par"] else None
-        if const_expr(region is not None):  # noqa: SIM102
-            if final:
-                _publish_final(c, region, t, split)
+        # every rank's merge instead); the candidate blocks' for this row's
+        # compacted selection and, in a token-parallel launch, every rank's
+        # ``await_candidates``
+        if final:
+            _publish_final(c, "irdy" if kind == "sel" else "icrdy", t, split)
 
 
 @traced
@@ -396,8 +413,10 @@ def _select_blk(c, t, j, n, per, load, got, level, seg, slots, to_final, kind):
     """The candidate blocks' list: the top-2048 of its ``n`` block maxima
     (``topk.radix_select``, as ``_select_sel``), a place a thread out to
     ``icout`` (a final list) or the level's region. A merge's blocks go by
-    place through ``keys`` (its inputs' own); level 0's are its segment's."""
+    place through ``keys`` (its inputs' own); level 0's are its segment's.
+    -> this thread's places' blocks (-1 past the list), in place order."""
     tid = c["tid"]
+    idents = []
     k = ip.TOPK_BLOCKS
     keys, rlds = c["sel_lds"]["keys"], c["sel_lds"]["hi"]
     base = tid * per
@@ -420,6 +439,7 @@ def _select_blk(c, t, j, n, per, load, got, level, seg, slots, to_final, kind):
             ident = won.select(
                 fx.Int32(fx.ptr_load(keys + fx.max(idx, 0))), fx.Int32(-1)
             )
+        idents.append(ident)
         if to_final:
             _st_out(c, ident, "icout", t * k + place)
         else:
@@ -428,10 +448,44 @@ def _select_blk(c, t, j, n, per, load, got, level, seg, slots, to_final, kind):
                 c[f"i{kind}{level}"], ((t * slots + j) * k + place) * 2, [bits, ident]
             )
     gpu.barrier()
+    return idents
 
 
 @traced
-def _final_rows(c, t, slot, split=None):
+def _compact(c, t, idents):
+    """Token t's candidate blocks' scores moved to the front of its ``ilog``
+    row, place p's eight at columns 8p.. (``index_plan.candidate_bound``):
+    what its selection then ranks, lifted back through ``icout``
+    (``_selected_rows``). The blocks ascend, so a place's columns never pass
+    its block's: every thread's reads land before any write. A compacted row
+    has at least as many blocks as places, so every place holds one."""
+    a = c["args"]
+    base = t * a["lstride"]
+    tid = c["tid"]
+    vals = [
+        [fx.Vector(ld_dev(a["ilog"], base + b * TILE + 4 * h, 4)) for h in range(2)]
+        for b in idents
+    ]
+    rocdl.s_waitcnt(vmcnt=0)
+    gpu.barrier()
+    for p, pair in enumerate(vals):
+        place = tid + THREADS * p
+        for h in range_constexpr(2):
+            st_dev(pair[h], a["ilog"], base + place * TILE + 4 * h)
+
+
+def _icrdy(c):
+    """This rank's ICRDY: token t's candidate blocks out (``icout``) and, with
+    ``TOPK_BLOCKS`` blocks or more, its row compacted (``_compact``); in a
+    token-parallel launch the peer region every row's owner puts on every
+    rank."""
+    if const_expr(c["tok_par"]):
+        return preg(c["sym"], c["peer"]["icrdy"], "icrdy")
+    return c["icrdy"]
+
+
+@traced
+def _final_rows(c, t, slot, split=None, lift=False):
     """Token t's final selection out of the winners' slots (``stage_ilist``'s
     emit, by place): thread p lifts place p's column (``_selected_rows``) and
     stores it whole -- the 512 winners' table reads alone, not every ranked
@@ -439,9 +493,10 @@ def _final_rows(c, t, slot, split=None):
     row -1 and pool row 0. The barrier ends the slots' reads before the CTA's
     next list reuses them. A split row's goes to every rank's merge instead:
     as selected (``_put_place``), or a staged build's from the slots here
-    (``_put_answer``)."""
+    (``_put_answer``). ``lift``: a compacted row's columns, lifted as a
+    REINDEX layer's (a split row is never compacted)."""
     if const_expr(split is None):
-        _final_rows_of(c, t, slot)
+        _final_rows_of(c, t, slot, lift)
     else:
         if split == 0:
             _final_rows_of(c, t, slot)
@@ -450,13 +505,13 @@ def _final_rows(c, t, slot, split=None):
 
 
 @traced
-def _final_rows_of(c, t, slot):
+def _final_rows_of(c, t, slot, lift=False):
     tid = c["tid"]
     for p in range_constexpr((ip.TOPK + THREADS - 1) // THREADS):
         place = tid + THREADS * p
         if place < ip.TOPK:
             ident = fx.ptr_load(slot + place)
-            row, pool_row = _selected_rows(c, t, ident)
+            row, pool_row = _selected_rows(c, t, ident, lift)
             # the attention reads the pool rows; the selection only check mode
             # compares, which never runs token parallel: this rank's alone
             st_dev(row, c["args"]["isel"], t * ip.TOPK + place)
@@ -464,24 +519,26 @@ def _final_rows_of(c, t, slot):
     gpu.barrier()
 
 
-def _selected_rows(c, t, ident):
+@traced
+def _selected_rows(c, t, ident, lift=False):
     """Column ``ident`` of token t as a selection holds it (a REINDEX layer's
-    compacted column lifted back to the row it stands for) and as the
+    compacted column, or a ``lift`` one -- a candidate producer's compacted
+    row, ``_compact`` --, lifted back to the row it stands for) and as the
     attention reads it: its pool row, through the block table (``attention.
     _key_row``'s arithmetic; every layer sharing this selection shares its KV
-    owner, so its row). Keep candidate loads branch-free and inside the
-    token's candidate row; FULL and padding discard their values."""
+    owner, so its row). Keep candidate loads inside the token's candidate
+    row; FULL and padding discard their values. A ``lift`` row's candidates
+    are this launch's: read at device scope (a REINDEX layer's are an
+    earlier launch's, a plain load)."""
     a = c["args"]
-    cand = fx.Int32(
-        bo.buffer_load(
-            rsrc(a["icand"]),
-            ip.candidate_offset(t, ident),
-            vec_width=1,
-            dtype=T.i32,
-        )
-    )
+    off = ip.candidate_offset(t, ident)
+    cand = ld_i32(a["icand"], off)
+    if const_expr(lift is not False):  # noqa: SIM102
+        if lift:
+            cand = fx.Int32(ld_dev(a["icand"], off))
     lifted = cand * TILE + fx.max(ident, 0) % TILE
-    row = fx.Int32(((a["ilift"] != 0) & (ident >= 0)).select(lifted, ident))
+    lifts = (a["ilift"] != 0) | lift
+    row = fx.Int32((lifts & (ident >= 0)).select(lifted, ident))
     toff = fx.Int32(
         bo.buffer_load(rsrc(a["kmeta"]), t * KMETA + 2, vec_width=1, dtype=T.i32)
     )
@@ -621,17 +678,25 @@ def run_indexer(c, s, bid, bound_max):
         run_scores4(c, t0, n, bid, max_chunks)
     else:
         run_scores(c, t0, n, bid, _bounds(c, t0, n), max_chunks)
-    # the selection's trees (``index_plan.trees``): the columns', a REINDEX row's
+    # a candidate producer's blocks first: its long rows' selection ranks
+    # only their rows (``index_plan.compacts``), a CTA's tasks in this order
+    if a["iprod"] != 0:
+        ((blk, bseg),) = ip.trees("blk", bound_max)
+        _run_tree(c, t0, n, bid, "blk", _whole(c, t0, n), blk, max_chunks, bseg)
+    # the selection's trees (``index_plan.trees``): the columns', a REINDEX
+    # row's -- a candidate producer's too, over its candidates
     (full, seg), (reindex, rseg) = ip.trees("sel", bound_max)
     if a["ilift"] != 0:
         _run_tree(c, t0, n, bid, "sel", _whole(c, t0, n), reindex, max_chunks, rseg)
+    elif a["iprod"] != 0:
+        # its candidates' columns (``index_plan.candidate_bound``), apart from
+        # a REINDEX row's tree: that one computes none
+        cols = [ip.candidate_bound(b) for b in _bounds(c, t0, n)]
+        _run_tree(c, t0, n, bid, "sel", (_whole_of, cols), reindex, max_chunks, rseg)
     else:
         _run_tree(c, t0, n, bid, "sel", _shares(c, t0, n), full, max_chunks, seg)
         if const_expr(c["index_split"]):
             _run_merge(c, t0, n, bid)
-    if a["iprod"] != 0:
-        ((blk, bseg),) = ip.trees("blk", bound_max)
-        _run_tree(c, t0, n, bid, "blk", _whole(c, t0, n), blk, max_chunks, bseg)
 
 
 def _bounds(c, t0, n):

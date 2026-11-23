@@ -116,7 +116,6 @@ class LayerPostBuild:
     kv_fp8: bool = False
     # the regions kept in two copies (``AttnPostBuild.numa``), K2a's and K2b's
     numa: str = ""
-    numa_word: int = 0
     # the residual column-sharded (``attn_pre.shard_seam``): seam F folds this
     # rank's columns, the MoE output reduce-scattered to its column owners
     shard: bool = False
@@ -134,12 +133,18 @@ class LayerPostBuild:
 
     @property
     def dp_ranks(self) -> int:
-        """DP attention's ranks (1: none)."""
-        return self.ep * self.moe_tp
+        """DP attention's ranks (1: none; expert parallel at attention TP > 1
+        is over the TP ranks, every rank's rows the same)."""
+        return self.ep * self.moe_tp if self.tp == 1 else 1
 
     @property
     def moe_tokens(self) -> int:
         return self.tokens * self.dp_ranks
+
+    @property
+    def index_split(self) -> bool:
+        """Its K2a's (``AttnPostBuild.index_split``)."""
+        return self.halves()[0].index_split
 
     def halves(self):
         """(K2a's build key, K2b's). K2b's scratch starts at ``moe_base``, where
@@ -155,7 +160,6 @@ class LayerPostBuild:
             tok_par=self.tok_par,
             kv_fp8=self.kv_fp8,
             numa=self.numa,
-            numa_word=self.numa_word,
             attn_sel=self.attn_sel,
             block_rows=self.block_rows,
             staged_answer=self.staged_answer,
@@ -172,7 +176,6 @@ class LayerPostBuild:
             ep=self.ep,
             dp_attention=self.moe_tp > 1,
             numa=self.numa,
-            numa_word=self.numa_word,
             after_seam=not self.tok_par and self.moe_tp == 1,
             own_routes=self.tok_par,
         )
@@ -190,8 +193,9 @@ def moe_base(key_a) -> int:
 _K2A = k2a.ABI.names[: k2a.ABI.names.index("scratch")]
 _K2B = [n for n in k2b.ABI.names[: k2b.ABI.names.index("scratch")] if n != "x"]
 ABI = KernelAbi(
-    (*_K2A, *_K2B, "scratch", "sym", "peers", "rank", "layer", "moe_layer", "tl")
-)
+    (*_K2A, *_K2B, "scratch", "numa_word", "sym", "peers", "rank", "layer",
+     "moe_layer", "tl")
+)  # fmt: skip
 
 
 def scratch_layout(key: LayerPostBuild) -> dict[str, tuple[int, int]]:
@@ -341,8 +345,8 @@ def build_layer_post(key: LayerPostBuild):
         gate_w: Int64, bias: Int64, w13: Int64, w13_s: Int64, w2: Int64,
         w2_s: Int64, sgu: Int64, sgu_s: Int64, sw2: Int64, sw2_s: Int64, out: Int64,
         queue_words: Int64,
-        scratch: Int64, sym: Int64, peers: Int64, rank: Int32, layer: Int32,
-        moe_layer: Int32, tl: Int64,
+        scratch: Int64, numa_word: Int64, sym: Int64, peers: Int64, rank: Int32,
+        layer: Int32, moe_layer: Int32, tl: Int64,
     ):  # fmt: skip
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -373,6 +377,7 @@ def build_layer_post(key: LayerPostBuild):
             normed, gate_w, bias, w13, w13_s, w2, w2_s, sgu, sgu_s, sw2, sw2_s, out,
             queue_words,
         )  # fmt: skip
+        args_a["numa_word"] = args_b["numa_word"] = numa_word
         ca = attn_post_context(
             key_a, s, lds_a, mailbox(layer, scratch, key.diag_off, layout),
             bases_a, layout_a, scratch,
@@ -382,7 +387,7 @@ def build_layer_post(key: LayerPostBuild):
         cb = moe_context(
             sm, rs, lds_b, mailbox(moe_layer, scratch, key.diag_off, layout),
             bases, layout_b, scratch,
-            args_b, rank, sym, key_b.numa, key_b.numa_word,
+            args_b, rank, sym, key_b.numa,
         )  # fmt: skip
         cb["x_cm"], cb["x_ready"] = CM_DEV, True
         if const_expr(key.shard):
@@ -436,8 +441,8 @@ def build_layer_post(key: LayerPostBuild):
         gate_w: Int64, bias: Int64, w13: Int64, w13_s: Int64, w2: Int64,
         w2_s: Int64, sgu: Int64, sgu_s: Int64, sw2: Int64, sw2_s: Int64, out: Int64,
         queue_words: Int64,
-        scratch: Int64, sym: Int64, peers: Int64, rank: Int32, layer: Int32,
-        moe_layer: Int32, tl: Int64, stream: fx.Stream = _CURRENT_STREAM,
+        scratch: Int64, numa_word: Int64, sym: Int64, peers: Int64, rank: Int32,
+        layer: Int32, moe_layer: Int32, tl: Int64, stream: fx.Stream = _CURRENT_STREAM,
     ):  # fmt: skip
         _ = keyed
         layer_post(
@@ -449,7 +454,7 @@ def build_layer_post(key: LayerPostBuild):
             wob_s, res_in, post_in, comb_in, pre_in, hc_fn, hc_scale, hc_base, ffn_w,
             res_out, post_out, comb_out, pre_out, normed,
             gate_w, bias, w13, w13_s, w2, w2_s, sgu, sgu_s, sw2, sw2_s, out, queue_words,
-            scratch, sym, peers, rank, layer, moe_layer, tl,
+            scratch, numa_word, sym, peers, rank, layer, moe_layer, tl,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 
     ABI.check(layer_post, launch)

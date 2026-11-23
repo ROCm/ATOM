@@ -22,7 +22,6 @@ import logging
 
 import torch
 from aiter.dist.parallel_state import get_tp_group
-from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from atom.distributed.group_agreement import group_agree
@@ -32,16 +31,12 @@ from atom.model_ops.verify_ids import IdVerifiers, VerifyOutput
 from atom.mono.device import race
 from atom.mono.lm_head import kernel as lk
 from atom.mono.lm_head.dot import KSTEP, RG, UNIT
+from atom.mono.lm_head.serves import deployment_refusal
 from atom.mono.plan.execution import THREADS
 from atom.mono.runtime.lifecycle import owned_peer_buffer
-from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
-
-# the architecture and TP sizes the launch is built and measured for
-ARCH = "gfx950"
-SERVED_TPS = (2, 4, 8)
 
 
 class MonoLmHead(ShardedPicks):
@@ -57,14 +52,12 @@ class MonoLmHead(ShardedPicks):
     @staticmethod
     def refusal(weight: torch.Tensor, bias, norm, tp: int) -> str | None:
         """Why the launch does not serve this head (``bias``: the head's,
-        which the launch does not add), None where it does."""
+        which the launch does not add), None where it does: the deployment's
+        (``serves.deployment_refusal``), then the head's shapes."""
         vocab, hidden = weight.shape
-        if not envs.ATOM_MONO_ENABLE:
-            return "ATOM_MONO_ENABLE is off"
-        if get_gfx() != ARCH:
-            return f"built for {ARCH}"
-        if tp not in SERVED_TPS:
-            return f"TP {tp}: built for {SERVED_TPS}"
+        why = deployment_refusal(tp)
+        if why is not None:
+            return why
         if bias is not None:
             return "a head bias"
         if weight.dtype != torch.bfloat16 or not weight.is_contiguous():

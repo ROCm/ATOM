@@ -1400,14 +1400,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # pages from the process as it goes; 0 registers the checkpoint mapping in
     # place (one thread, under the HIP runtime lock). Either way the shard is
     # resident once. Copying needs the HIP runtime; elsewhere it registers in
-    # place regardless. Unset, DP attention (every rank holds the whole table)
-    # registers in place -- the shared checkpoint mapping, pinned once per node
-    # rather than copied once per rank -- and copies only if that is refused.
+    # place regardless. Not read under DP attention, where every rank holds the
+    # whole table: the node copies it once into memory its ranks share.
     # `tools/engram/bench_uva_shard.py` measures both.
     "ATOM_ENGRAM_UVA_COPY": lambda: os.getenv("ATOM_ENGRAM_UVA_COPY", "1") == "1",
-    # Optional override of the file that serializes shared in-place
-    # registration. Empty: host_memory names one from the checkpoint path.
-    "ATOM_ENGRAM_REG_LOCK": lambda: os.getenv("ATOM_ENGRAM_REG_LOCK", ""),
     # Where the compressed-vocab table is cached between runs. The table is
     # reproducible from the tokenizer, so this only trades startup time for
     # disk; point it at shared storage to let several servers build it once.

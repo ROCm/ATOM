@@ -218,7 +218,6 @@ class DraftMonoRunner(V41MonoDecodeRunner):
                 embed_in=i == 0 and self.embed_peer is not None,
                 # K2's dual table (``_post_key``): one layout in the layer kernel
                 numa=self._numa(s) if numa else "",
-                numa_word=self.numa_word,
             )
             for i in range(len(self.model.mtp))
         ]

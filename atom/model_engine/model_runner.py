@@ -131,6 +131,7 @@ from atom.model_ops.verify_head import (
 )
 from atom.model_ops.verify_ids import IdVerifiers
 from atom.models.registry import mono_decode_installers
+from atom.mono.lm_head.serves import deployment_refusal as mono_head_refusal
 from atom.mono.runtime.step_override import StepOverrideModel
 from atom.sampling_params import RequiredChannel
 from atom.spec_decode.drafter import Drafter
@@ -302,7 +303,9 @@ class tokenIDProcessor:
         # until the copy is known to have completed (its event waited on). The
         # sources are fresh default-stream tensors and the caching allocator
         # does not see the side-stream read: a dropped source goes to the next
-        # allocation, and a late copy then reads the next step's data.
+        # allocation, and a late copy then reads the next step's data. A source
+        # at a fixed address (a drafter's own buffer) its next writer waits on
+        # the copy's own event instead (`await_draft_ids_copy`).
         self.async_copy_stream = torch.cuda.Stream(runner.device)
         self.zero_spec_counts = torch.zeros(
             2 * self._output_request_capacity, dtype=torch.int32, device=device
@@ -351,10 +354,18 @@ class tokenIDProcessor:
             return None
         return self.logprobs_cpu.pop(0)
 
+    def await_draft_ids_copy(self, stream: torch.cuda.Stream) -> None:
+        """``stream``'s next work after the last draft ids' D2H, on the GPU
+        (no host wait): their next pass may rewrite them in place -- a
+        buffer the drafter owns (a mono head's), which no hold keeps."""
+        if self._draft_ids_copied is not None:
+            stream.wait_event(self._draft_ids_copied)
+            self._draft_ids_copied = None
+
     def send_draft_token_ids_to_cpu(self, gpu_tensor: torch.Tensor):
-        # The next replay of this draft output follows a whole target forward.
-        # Preserve side-stream overlap; no reverse wait on the forward stream.
-        self._draft_token_ids_queue.send(gpu_tensor)
+        # the copy's own event, as send_to_cpu_async's: the next pass waits
+        # on it (`await_draft_ids_copy`, before `propose`)
+        self._draft_ids_copied = self._draft_token_ids_queue.send(gpu_tensor)
 
     def recv_draft_token_ids(self) -> np.ndarray:
         output = self._draft_token_ids_queue.receive()
@@ -419,6 +430,8 @@ class tokenIDProcessor:
             self._output_request_capacity * max(self.num_spec_tokens, 1),
             self.async_copy_stream,
         )
+        # the last draft ids' copy_done, until their next pass waited on it
+        self._draft_ids_copied: torch.cuda.Event | None = None
         self.spec_status_queue = SpecStatusQueue(
             self._output_request_capacity, self.async_copy_stream
         )
@@ -1388,9 +1401,12 @@ class ModelRunner:
         # (EAGLE gets that free -- its first draft step is a many-row prefill).
         # Other cases only need the usual >= 1 floor. From the config: under PP
         # only the last stage has a drafter, and every stage runs the same rows.
+        # Never past max_num_seqs: the step buffers hold that many, and a
+        # deployment that never batches two requests never needs the batch
+        # dim dynamic.
         spec_config = self.config.speculative_config
         min_seqs = 2 if spec_config and spec_config.use_dspark() else 1
-        num_seqs = max(num_seqs, min_seqs)
+        num_seqs = max(num_seqs, min(min_seqs, self.config.max_num_seqs))
 
         # Split the token budget across the seqs so >1 sequences never exceed it
         # (peak memory unchanged); a lone seq keeps up to max_model_len.
@@ -3374,7 +3390,12 @@ class ModelRunner:
             lambda: self.forward_vars["input_ids"].gpu,
             max_rows,
         )
-        # FlyDSL: imported only where a drafted model's head is bound
+        # the launch's kernels (FlyDSL) loaded only where the deployment takes
+        # it: the same answer on every rank, so none enters the bind's
+        # collective alone
+        if mono_head_refusal(get_tp_group().world_size) is not None:
+            self.verify_head = picks
+            return
         self.verify_head = resolve_obj_by_qualname(MONO_VERIFY_HEAD)(picks, max_rows)
 
     def flush_pp_send(self) -> bool:
@@ -4006,6 +4027,9 @@ class ModelRunner:
 
         last_token_indices = self._commit_target_step(batch, anchors)
 
+        # the pass rewrites the buffers the previous step's draft ids may
+        # still be read from; a forward later, that copy is long done
+        self.tokenID_processor.await_draft_ids_copy(torch.cuda.current_stream())
         draft_token = self.drafter.propose(
             target_token_ids=input_ids,
             target_positions=positions,
@@ -4398,11 +4422,7 @@ class ModelRunner:
                     self._capture_trace_tag = f"bs_{bs}_q_{max_q_len}"
                     # A bucket that splits is recorded split at the bucket
                     # (`ForwardMode.decode_ubatch_slices`).
-                    ubatch_slices = None
-                    if self.tbo_decode_graphs and decode_bucket_splits(bs):
-                        ubatch_slices = cut_decode_ubatches(
-                            bs, running_tokens, np.full(bs, max_q_len)
-                        )
+                    ubatch_slices = self._bucket_ubatches(bs, max_q_len)
                     capture_kwargs = {
                         "bs": bs,
                         "decode_ubatch_slices": ubatch_slices,
@@ -4514,7 +4534,14 @@ class ModelRunner:
         # DSpark Phase 2: calibrate the SPS(B) throughput profile from the just-
         # captured target graphs (each is a B = bs*max_q_len token forward, i.e.
         # exactly one verification step at batch B). Cheap, GPU-only, one-shot.
-        self._maybe_calibrate_dspark_sps(full_q_len)
+        self._maybe_calibrate_dspark_sps(
+            full_q_len,
+            (
+                partial(build_capture, max_q_len=full_q_len)
+                if supports_dynamic_q_len
+                else build_capture
+            ),
+        )
 
         # The captures and the calibration ran the model for real; take back
         # what they wrote into the cache before the first request is admitted.
@@ -4631,6 +4658,15 @@ class ModelRunner:
         if sizes and self.rank == 0:
             logger.info("Prefill request graphs recorded for running_bs %s", sizes)
 
+    def _bucket_ubatches(self, bs: int, max_q_len: int):
+        """The decode ubatches a recorded bucket of ``bs`` requests of
+        ``max_q_len`` rows is split at (``ForwardMode.decode_ubatch_slices``),
+        None where it is not: what its capture recorded, and so what anything
+        replaying it stages."""
+        if self.tbo_decode_graphs and decode_bucket_splits(bs):
+            return cut_decode_ubatches(bs, bs * max_q_len, np.full(bs, max_q_len))
+        return None
+
     def _build_capture(self, build, *args, **kwargs):
         """The synthetic step ``build`` makes for a capture, staged in a
         window of its own; normal forwards never use one."""
@@ -4677,7 +4713,9 @@ class ModelRunner:
             self.compute_logits(hidden_states)
 
     @torch.inference_mode()
-    def _maybe_calibrate_dspark_sps(self, max_q_len: int, n_iters: int = 20) -> None:
+    def _maybe_calibrate_dspark_sps(
+        self, max_q_len: int, build_step, n_iters: int = 20
+    ) -> None:
         """Profile SPS(B) by timing the captured target graphs, then hand a dense
         cost table to the DSpark drafter (paper §3.2.2, scheduler input).
 
@@ -4686,6 +4724,10 @@ class ModelRunner:
         We replay each a few times, take the median step time, and densify the
         (B, steps/sec) samples into ``sps_table[B]``. No-op unless a DSpark
         drafter with confidence scheduling enabled is present.
+
+        ``build_step(bs=)``: the capture's builder of a bucket's synthetic
+        step, whose metadata and context each timed step runs under -- the
+        graph's as recorded, and the decode context its head reads.
         """
         drafter = getattr(self, "drafter", None)
         if drafter is None or not drafter.is_block_drafter:
@@ -4727,14 +4769,21 @@ class ModelRunner:
             B = bs * max_q_len
             # the rows the recorded forward writes (`capture_cudagraph`)
             hidden = self.forward_vars["outputs"][:B]
-            # Every row of the recording is real here: time the whole of it
-            # (routing reads the real token count from `batch_info`).
-            cu = self.forward_vars["cu_seqlens_q"]
-            cu.np[: bs + 1] = np.arange(0, B + 1, max_q_len, dtype=np.int32)
-            cu.copy_to_gpu(bs + 1)
-            batch_info = self.forward_vars["batch_info"]
-            batch_info.np[:] = (bs, B, 0)
-            batch_info.copy_to_gpu()
+            # Every row of the recording is real here: time the whole of it,
+            # staged as the capture staged it (`batch_info` the real token
+            # count routing reads), under the decode context the head reads.
+            ubatch_slices = self._bucket_ubatches(bs, max_q_len)
+            attn_metadata, context = build_step(
+                bs=bs, decode_ubatch_slices=ubatch_slices
+            )
+            self.running_tokens_per_dp_rank.fill(B)
+            set_forward_context(
+                attn_metadata=attn_metadata,
+                atom_config=self.config,
+                context=context,
+                running_tokens_per_dp_rank=self.running_tokens_per_dp_rank,
+                ubatch_slices=ubatch_slices,
+            )
             # A verification step is the forward then its head (`run_lm_head`,
             # outside the graph). Warm step, then timed steps (median for
             # robustness to jitter).
@@ -4757,6 +4806,7 @@ class ModelRunner:
                 continue
             token_points.append(B)
             sps_points.append(1000.0 / median_ms)  # steps per second
+        reset_forward_context()
 
         if not token_points:
             logger.warning("DSpark SPS calibration found no timeable graphs.")

@@ -282,7 +282,7 @@ def proj(c, task):
     rg0 = c["rank"] * p.groups + j * SETS
     ops = gemv_fp8_loads(
         c, a["wp"], a["wps"], k, rg0, split=1, tiled=True, k_row=K_PROJ,
-        st0=q * p.slice_steps,
+        k0=q * k,
     )  # fmt: skip
     col = (j * SETS + wave) * RG + 4 * (lane // 16)
     for b in range_constexpr(p.blocks):
@@ -407,7 +407,7 @@ def wkv(c, task):
     k = WKV_SLICE_STEPS * KSTEP
     ops = gemv_fp8_loads(
         c, a["wk"], a["wks"], k, j * SETS, split=1, tiled=True, k_row=HIDDEN,
-        st0=q * WKV_SLICE_STEPS,
+        k0=q * k,
     )  # fmt: skip
     col = (j * SETS + wave) * RG + 4 * (lane // 16)
     for b in range_constexpr(p.blocks):

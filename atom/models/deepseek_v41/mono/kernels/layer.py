@@ -161,8 +161,8 @@ COMPRESS_ARGS = tuple(
     f"c_{n}" for n in cp.ABI.names if n not in ("x", "scratch", "layer", "tl")
 )
 ABI = KernelAbi(
-    (*_K1, *_K2, "kvrow", *COMPRESS_ARGS, "scratch", "sym", "peers", "rank", "layer",
-     "post_layer", "moe_layer", "tl")
+    (*_K1, *_K2, "kvrow", *COMPRESS_ARGS, "scratch", "numa_word", "sym", "peers",
+     "rank", "layer", "post_layer", "moe_layer", "tl")
 )  # fmt: skip
 
 
@@ -306,8 +306,8 @@ def build_layer(key: LayerBuild):
         c_page_scale: Int64, c_scale_stride: Int64, c_tables: Int64,
         c_table_stride: Int32, c_per_page: Int32, c_wk: Int64, c_k_norm_w: Int64,
         c_ivals: Int64, c_iscales: Int64, c_latent: Int64, c_keys: Int64,
-        scratch: Int64, sym: Int64, peers: Int64, rank: Int32, layer: Int32,
-        post_layer: Int32, moe_layer: Int32, tl: Int64,
+        scratch: Int64, numa_word: Int64, sym: Int64, peers: Int64, rank: Int32,
+        layer: Int32, post_layer: Int32, moe_layer: Int32, tl: Int64,
     ):  # fmt: skip
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -340,6 +340,7 @@ def build_layer(key: LayerBuild):
             normed, gate_w, bias, w13, w13_s, w2, w2_s, sgu, sgu_s, sw2, sw2_s, out,
             queue_words,
         )  # fmt: skip
+        args_1["numa_word"] = args_a["numa_word"] = args_b["numa_word"] = numa_word
         mb_1 = mailbox(layer, scratch, pre.diag_off, layout_1)
         c1, co1 = attn_pre_context(
             pre, lds, mb_1, layout_1, scratch, args_1, rank, sym, peers
@@ -368,7 +369,6 @@ def build_layer(key: LayerBuild):
         cb = moe_context(
             s, rs, lds["moe"], mailbox(moe_layer, scratch, post.diag_off, layout),
             bases, layout_b, scratch, args_b, rank, sym, key_b.numa,
-            key_b.numa_word,
         )  # fmt: skip
         cb["x_cm"], cb["x_ready"] = CM_DEV, True
         # the MoE output reduce-scattered too: the next seam A folds this
@@ -480,8 +480,8 @@ def build_layer(key: LayerBuild):
         c_page_scale: Int64, c_scale_stride: Int64, c_tables: Int64,
         c_table_stride: Int32, c_per_page: Int32, c_wk: Int64, c_k_norm_w: Int64,
         c_ivals: Int64, c_iscales: Int64, c_latent: Int64, c_keys: Int64,
-        scratch: Int64, sym: Int64, peers: Int64, rank: Int32, layer: Int32,
-        post_layer: Int32, moe_layer: Int32, tl: Int64,
+        scratch: Int64, numa_word: Int64, sym: Int64, peers: Int64, rank: Int32,
+        layer: Int32, post_layer: Int32, moe_layer: Int32, tl: Int64,
         stream: fx.Stream = _CURRENT_STREAM,
     ):  # fmt: skip
         _ = keyed
@@ -506,7 +506,7 @@ def build_layer(key: LayerBuild):
             c_pages, c_page_stride, c_page_scale, c_scale_stride, c_tables,
             c_table_stride, c_per_page, c_wk, c_k_norm_w, c_ivals, c_iscales,
             c_latent, c_keys,
-            scratch, sym, peers, rank, layer, post_layer, moe_layer, tl,
+            scratch, numa_word, sym, peers, rank, layer, post_layer, moe_layer, tl,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 
     ABI.check(layer_kernel, launch)

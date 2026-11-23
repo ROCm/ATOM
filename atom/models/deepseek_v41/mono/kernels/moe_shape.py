@@ -52,10 +52,9 @@ class MoeBuild:
     # DP attention with the MoE TP over the DP ranks (``tp`` of them): the rows
     # every rank's step's, rank r's own its own (expert parallel implies it)
     dp_attention: bool = False
-    # the regions kept in two copies, one on each I/O die (``numa_plan``), and
-    # the scratch's calibration word that picks a CTA's copy
+    # the regions kept in two copies, one on each I/O die (``numa_plan``); the
+    # calibration word that picks a CTA's copy is the ``numa_word`` argument
     numa: str = ""
-    numa_word: int = 0
     # K2a's seam runs before it in the launch, on every row (``layer_post`` /
     # the layer kernel, neither token parallel nor DP attention): where it fits,
     # the router normalizes the seam's LIN itself, on the CTAs past the seam's
@@ -92,8 +91,9 @@ class RouteShape:
     @property
     def dpa(self) -> bool:
         """DP attention: the rows every rank's step's, a rank's own its own
-        (``router_rows``), the shared expert replicated (``MoeBuild``)."""
-        return self.dp_attention or self.ep > 1
+        (``router_rows``), the shared expert replicated (``MoeBuild``): the
+        MoE TP over its ranks, or expert parallel at attention TP 1."""
+        return self.dims.dp_attention
 
     @property
     def routes_pushed(self) -> bool:
@@ -103,7 +103,7 @@ class RouteShape:
 
     @property
     def dims(self) -> Dims:
-        return Dims(self.tp, self.ep)
+        return Dims(self.tp, self.ep, self.dp_attention)
 
     @property
     def local_experts(self) -> int:

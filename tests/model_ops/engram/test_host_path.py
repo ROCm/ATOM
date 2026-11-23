@@ -8,14 +8,13 @@ per-layer row counts have to equal what DeepSeek-V4.1-Flash's config declares,
 which only happens if the prime search runs in exactly the reference order.
 """
 
-import contextlib
+import gc
+import mmap
 import os
-import subprocess
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from itertools import pairwise
 
 import numpy as np
 import pytest
@@ -581,7 +580,6 @@ def test_cache_identity_covers_history_position_generation_and_tentative_tokens(
 
 
 def test_drop_during_prefetch_cannot_repopulate_recycled_request(monkeypatch):
-    import threading
 
     pf = make_prefetcher()
     entered, release = threading.Event(), threading.Event()
@@ -614,7 +612,7 @@ def test_staging_rejects_padding_that_truncates_or_exceeds_capacity():
 
 
 @pytest.fixture(autouse=True)
-def _no_real_host_allocator(monkeypatch, tmp_path):
+def _no_real_host_allocator(monkeypatch):
     """Keep every test off the real `hipHostMalloc`: the registration tests
     script `cudaHostRegister`, and the copy tests install `FakeHostAllocator`
     themselves."""
@@ -625,9 +623,8 @@ def _no_real_host_allocator(monkeypatch, tmp_path):
     # copy policy as a single-GPU or TP rank sees it by default.
     monkeypatch.setattr(host_memory, "_PAGE_RUNS", host_memory._PageRuns())
     monkeypatch.delenv("ATOM_ENGRAM_UVA_COPY", raising=False)
-    # A per-test registration lock file, so tests never share /dev/shm.
-    monkeypatch.setenv("ATOM_ENGRAM_REG_LOCK", str(tmp_path / "register.lock"))
-    monkeypatch.setattr(host_memory, "_timed_out_lock_paths", set())
+    # registration through `torch.cuda.cudart` (scripted), not ROCr's lock
+    monkeypatch.setattr(host_memory, "_device_lock", lambda: None)
 
 
 class FakeCudart:
@@ -735,321 +732,116 @@ def test_registration_is_split_into_chunks(monkeypatch):
     assert cudart.registered == []
 
 
-def test_refused_chunk_gives_back_the_chunks_before_it(monkeypatch):
-    """A refusal part way through a gap releases the pieces already taken.
+class FakeDeviceLock:
+    """ROCr's lock to this GPU alone, accounted; `refuse` turns every lock down."""
 
-    The rollback runs while this call holds the registration lock, and must
-    not take it again (that flock is not reentrant).
-    """
+    def __init__(self, refuse=False):
+        self.refuse = refuse
+        self.locked = []
+
+    def lock(self, ptr, nbytes):
+        if self.refuse:
+            return False
+        self.locked.append(ptr)
+        return True
+
+    def unlock(self, ptr):
+        self.locked.remove(ptr)
+        return True
+
+
+def test_runs_lock_to_this_gpu_alone_where_rocr_can(monkeypatch):
+    from atom.model_ops.engram import host_memory
+
+    cudart, lock = FakeCudart(), FakeDeviceLock()
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    monkeypatch.setattr(host_memory, "_device_lock", lambda: lock)
+    monkeypatch.setattr(host_memory, "_reg_chunk_bytes", lambda: 2 * host_memory._PAGE)
+    table = wide_table()
+    assert table.enable_uva(0, 4) is True
+    assert len(lock.locked) == -(-registered_pages(WIDE_VALUES) // 2)
+    assert cudart.registered == []
+    table.disable_uva()
+    assert lock.locked == []
+
+
+def test_a_refused_rocr_lock_registers_through_hip(monkeypatch):
+    from atom.model_ops.engram import host_memory
+
+    cudart, lock = FakeCudart(), FakeDeviceLock(refuse=True)
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    monkeypatch.setattr(host_memory, "_device_lock", lambda: lock)
+    table = wide_table()
+    assert table.enable_uva(0, 4) is True
+    assert cudart.registered and lock.locked == []
+    table.disable_uva()
+    assert cudart.registered == []
+
+
+def test_a_rocr_locked_run_is_addressed_at_its_host_address(monkeypatch):
+    """HIP has no record of a run ROCr locked (its `hipHostGetDevicePointer`
+    refuses it): the device address is the host one, without asking HIP."""
+    from atom.model_ops.engram import host_memory
+
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: FakeCudart())
+    monkeypatch.setattr(host_memory, "_device_lock", lambda: FakeDeviceLock())
+    monkeypatch.setattr(host_memory, "_host_get_device_pointer", lambda: None)
+    table = wide_table()
+    assert table.enable_uva(0, 4) is True
+    weight, *_ = table.registered_shard()
+    base = weight.untyped_storage().data_ptr()
+    assert host_memory.device_address(weight.data_ptr(), base) == weight.data_ptr()
+    table.disable_uva()
+
+
+def test_a_registration_raising_midway_releases_the_pieces_before_it(monkeypatch):
+    from atom.model_ops.engram import host_memory
+
+    lock = FakeDeviceLock()
+    calls = []
+
+    def register(rt, ptr, nbytes, flags):
+        calls.append(ptr)
+        if len(calls) == 2:
+            raise OSError("ROCr gone")
+        return lock.lock(ptr, nbytes), lock
+
+    monkeypatch.setattr(host_memory, "_register_range", register)
+    monkeypatch.setattr(host_memory, "_reg_chunk_bytes", lambda: host_memory._PAGE)
+    buf = mmap.mmap(-1, 4 * host_memory._PAGE)
+    lo = np.frombuffer(buf, dtype=np.uint8).ctypes.data
+    with pytest.raises(OSError):
+        host_memory._PAGE_RUNS.acquire(FakeCudart(), lo, lo + 4 * host_memory._PAGE)
+    assert len(calls) == 2 and lock.locked == []
+    assert len(host_memory._PAGE_RUNS) == 0
+
+
+def test_rocr_is_only_the_copy_already_loaded(monkeypatch):
+    """No ROCr in this process's mappings: no second copy loaded by name (one
+    not initialized lists no agents), registration goes through HIP."""
+    from atom.model_ops.engram import host_memory
+
+    monkeypatch.setattr(host_memory, "_mapped_libraries", lambda prefix: [])
+
+    def no_load(path):
+        raise AssertionError(f"loaded {path}")
+
+    monkeypatch.setattr(host_memory.ctypes, "CDLL", no_load)
+    assert host_memory._device_lock_for.__wrapped__(0) is None
+
+
+def test_refused_chunk_gives_back_the_chunks_before_it(monkeypatch):
+    """A refusal part way through a gap releases the pieces already taken."""
     from atom.model_ops.engram import host_memory
 
     cudart = FakeCudart(refuse_call=3)
     monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
     monkeypatch.setattr(host_memory, "_reg_chunk_bytes", lambda: host_memory._PAGE)
-    monkeypatch.setattr(host_memory, "_REG_LOCK_TIMEOUT_S", 2)
+    monkeypatch.setenv("ATOM_ENGRAM_UVA_COPY", "0")
     table = wide_table()
-    assert table.enable_uva(0, 4, shared=True) is False
+    assert table.enable_uva(0, 4) is False
     assert cudart.registered == []
     assert table._uva is None
-
-
-def test_unopenable_lock_file_still_registers_in_place(monkeypatch, tmp_path):
-    """A lock file that cannot be opened is skipped, not treated as a refused
-    registration (which would send the rank to the copy path)."""
-    cudart = FakeCudart()
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
-    blocker = tmp_path / "not-a-dir"
-    blocker.write_text("")
-    monkeypatch.setenv("ATOM_ENGRAM_REG_LOCK", str(blocker / "register.lock"))
-    table = wide_table()
-    assert table.enable_uva(0, 4, shared=True) is True
-    assert len(cudart.registered) >= 1
-
-
-def test_registration_exception_is_not_chained_to_a_skipped_lock(tmp_path):
-    from atom.model_ops.engram import host_memory
-
-    blocker = tmp_path / "not-a-dir"
-    blocker.write_text("x")
-    path = str(blocker / "register.lock")
-    with (
-        pytest.raises(RuntimeError) as caught,
-        host_memory._register_lock_file(path),
-    ):
-        raise RuntimeError("during registration")
-    assert caught.value.__cause__ is None
-    assert caught.value.__context__ is None
-
-
-def test_registration_and_unregistration_take_the_lock(monkeypatch):
-    from atom.model_ops.engram import host_memory
-
-    cudart = FakeCudart()
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
-    taken = []
-
-    @contextlib.contextmanager
-    def counting_lock_file(path):
-        taken.append((path, len(cudart.registered)))
-        yield
-
-    monkeypatch.setattr(host_memory, "_register_lock_file", counting_lock_file)
-    table = wide_table()
-    assert table.enable_uva(0, 4, shared=True) is True
-    table.disable_uva()
-    # Once around registering (nothing held yet), once around releasing.
-    assert taken[0][1] == 0
-    assert len(taken) >= 2
-    assert cudart.registered == []
-
-
-def test_unshared_registration_skips_the_lock(monkeypatch):
-    from atom.model_ops.engram import host_memory
-
-    cudart = FakeCudart()
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
-    taken = []
-
-    @contextlib.contextmanager
-    def counting_lock_file(path):
-        taken.append(path)
-        yield
-
-    monkeypatch.setattr(host_memory, "_register_lock_file", counting_lock_file)
-    table = wide_table()
-    assert table.enable_uva(0, 4) is True
-    table.disable_uva()
-    assert taken == []
-    assert cudart.registered == []
-
-
-def test_lock_wait_is_bounded(tmp_path, monkeypatch):
-    from atom.model_ops.engram import host_memory
-
-    monkeypatch.setattr(host_memory, "_REG_LOCK_TIMEOUT_S", 0.3)
-    path = str(tmp_path / "register.lock")
-    held, release = threading.Event(), threading.Event()
-
-    def holder():
-        with host_memory._register_lock_file(path):
-            held.set()
-            release.wait(10)
-
-    thread = threading.Thread(target=holder)
-    thread.start()
-    assert held.wait(5)
-    try:
-        started = time.monotonic()
-        with pytest.raises(TimeoutError), host_memory._register_lock_file(path):
-            pass
-        assert time.monotonic() - started < 2
-        # Latched: the next table does not wait out the timeout again.
-        monkeypatch.setattr(host_memory, "_REG_LOCK_TIMEOUT_S", 30)
-        started = time.monotonic()
-        with pytest.raises(TimeoutError), host_memory._register_lock_file(path):
-            pass
-        assert time.monotonic() - started < 1
-    finally:
-        release.set()
-        thread.join(5)
-        assert not thread.is_alive()
-
-
-def test_a_progressing_holder_is_waited_on_past_the_timeout(tmp_path, monkeypatch):
-    """The timeout bounds a holder's silence, not its hold time: a cold-cache
-    rank holding the lock for minutes, chunk by chunk, must not send the
-    ranks behind it to the copy path."""
-    from atom.model_ops.engram import host_memory
-
-    monkeypatch.setattr(host_memory, "_REG_LOCK_TIMEOUT_S", 0.3)
-    path = str(tmp_path / "register.lock")
-    held = threading.Event()
-
-    def holder():
-        with host_memory._register_lock_file(path):
-            held.set()
-            for _ in range(10):  # ~1 s of chunks, three timeouts long
-                time.sleep(0.1)
-                host_memory._lock_heartbeat()
-
-    thread = threading.Thread(target=holder)
-    thread.start()
-    assert held.wait(5)
-    started = time.monotonic()
-    with host_memory._register_lock_file(path):
-        waited = time.monotonic() - started
-    thread.join(5)
-    assert waited > 0.6
-    assert path not in host_memory._timed_out_lock_paths
-
-
-def test_fault_in_touches_a_held_lock(tmp_path, monkeypatch):
-    """`acquire` faults in under the lock what reclaim took back; on a cold
-    cache that can outlast the timeout before a chunk is registered, so every
-    faulted-in piece touches the held lock file."""
-    from atom.model_ops.engram import host_memory
-
-    advised = []
-
-    class Libc:
-        def madvise(self, addr, nbytes, advice):
-            advised.append(nbytes)
-            return 0
-
-    monkeypatch.setattr(host_memory, "_libc", lambda: Libc())
-    beats = []
-    heartbeat = host_memory._lock_heartbeat
-    monkeypatch.setattr(
-        host_memory, "_lock_heartbeat", lambda: (beats.append(1), heartbeat())
-    )
-    path = str(tmp_path / "register.lock")
-    pieces = 4
-    lo = 1 << 30
-    with host_memory._register_lock_file(path):
-        os.utime(path, (0, 0))
-        beats.clear()
-        host_memory._populate(lo, lo + pieces * host_memory._CHUNK_BYTES)
-        assert os.stat(path).st_mtime > 0
-    assert len(advised) == pieces
-    assert len(beats) == pieces
-
-
-def test_heartbeat_touches_under_the_fd_list_lock():
-    """Fault-in workers touch the held lock files while the main thread adds
-    and removes them: a touch waits for the list's lock, so a descriptor that
-    is being removed and closed is never touched."""
-    from atom.model_ops.engram import host_memory
-
-    done = threading.Event()
-
-    def beat():
-        host_memory._lock_heartbeat()
-        done.set()
-
-    with host_memory._held_lock_fds_lock:
-        thread = threading.Thread(target=beat)
-        thread.start()
-        assert not done.wait(0.2)
-    assert done.wait(5)
-    thread.join(5)
-
-
-def test_release_after_a_lock_timeout_still_unregisters(monkeypatch, tmp_path):
-    from atom.model_ops.engram import host_memory
-
-    cudart = FakeCudart()
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
-    path = str(tmp_path / "register.lock")
-    monkeypatch.setenv("ATOM_ENGRAM_REG_LOCK", path)
-    table = wide_table()
-    assert table.enable_uva(0, 4, shared=True) is True
-    assert cudart.registered
-    host_memory._timed_out_lock_paths.add(path)
-    table.disable_uva()
-    assert cudart.registered == []
-    assert len(host_memory._PAGE_RUNS) == 0
-
-
-def test_lock_path_uses_the_override_or_the_mapped_file(monkeypatch, tmp_path):
-    import mmap
-
-    from atom.model_ops.engram import host_memory
-
-    monkeypatch.delenv("ATOM_ENGRAM_REG_LOCK", raising=False)
-    anon = torch.ones(4)
-    anonymous = host_memory._registration_lock_path([anon])
-    assert anonymous.startswith("/dev/shm/engram-uva-")
-    assert host_memory._registration_lock_path([torch.ones(4)]) == anonymous
-    monkeypatch.setenv("ATOM_ENGRAM_REG_LOCK", str(tmp_path / "forced.lock"))
-    assert host_memory._registration_lock_path([anon]) == str(tmp_path / "forced.lock")
-
-    monkeypatch.delenv("ATOM_ENGRAM_REG_LOCK", raising=False)
-    with contextlib.ExitStack() as stack:
-        paths = []
-        for name in ("a.bin", "b.bin"):
-            raw = tmp_path / name
-            raw.write_bytes(b"\0" * 4096)
-            handle = stack.enter_context(open(raw, "rb"))
-            mapped = stack.enter_context(
-                mmap.mmap(handle.fileno(), 4096, prot=mmap.PROT_READ)
-            )
-            paths.append(
-                host_memory._registration_lock_path(
-                    [torch.frombuffer(mapped, dtype=torch.uint8)]
-                )
-            )
-        assert paths[0] != paths[1]
-        assert paths[0] != anonymous
-
-
-_LOCK_WORKER = r"""
-import os, sys, time, traceback
-os.environ["ATOM_ENGRAM_REG_LOCK"] = os.environ["LOCK_PATH"]
-os.environ["ATOM_ENGRAM_UVA_COPY"] = "0"
-try:
-    import torch
-    from atom.model_ops.engram import host_memory
-    from atom.model_ops.engram.tables import HostEmbeddingTable
-    hold = float(os.environ.get("HOLD_S", "0.4"))
-
-    class _Rt:
-        def cudaHostRegister(self, ptr, size, flags):
-            start = time.monotonic()
-            time.sleep(hold)
-            with open(os.environ["RECORD"], "a") as fh:
-                fh.write(f"{start:.6f} {time.monotonic():.6f}\n")
-            return 0
-
-        def cudaHostUnregister(self, ptr):
-            return 0
-
-    torch.cuda.cudart = lambda: _Rt()
-    values = torch.ones(4, 4096)
-    table = HostEmbeddingTable(values, num_rows=4, head_dim=4096)
-    if not table.enable_uva(0, 4, shared=True):
-        sys.exit("enable_uva failed")
-    table.disable_uva()
-except Exception:
-    traceback.print_exc()
-    sys.exit(1)
-"""
-
-
-def test_two_processes_do_not_register_at_once(tmp_path):
-    env = os.environ.copy()
-    env["LOCK_PATH"] = str(tmp_path / "register.lock")
-    env["HOLD_S"] = "0.4"
-    env["HIP_VISIBLE_DEVICES"] = ""
-    procs = []
-    records = []
-    for i in range(2):
-        record = tmp_path / f"rec{i}"
-        records.append(record)
-        child = env.copy()
-        child["RECORD"] = str(record)
-        procs.append(
-            subprocess.Popen(
-                [sys.executable, "-c", _LOCK_WORKER],
-                env=child,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-        )
-    for proc in procs:
-        _out, err = proc.communicate(timeout=60)
-        assert proc.returncode == 0, err
-    spans = []
-    for record in records:
-        text = record.read_text().strip().splitlines()
-        assert text, record
-        for line in text:
-            start, end = (float(part) for part in line.split())
-            spans.append((start, end))
-    spans.sort()
-    assert len(spans) >= 2
-    for (_start, end), (nxt, _end) in pairwise(spans):
-        assert end <= nxt
 
 
 class RecordingLibc:
@@ -1271,7 +1063,6 @@ def test_a_copy_leaves_an_anonymous_source_intact(monkeypatch):
 
 def _resident_pages(tensor):
     """Pages of `tensor` mapped in this process (`/proc/self/pagemap`)."""
-    import os
 
     import numpy as np
 
@@ -1459,8 +1250,6 @@ def test_a_failing_chunk_waits_for_the_others_before_the_dropper_closes(
 ):
     """One chunk raising must not let the caller close the dropper (and its
     pagemap descriptor) while other chunks are still dropping."""
-    import threading
-    import time
 
     from atom.model_ops.engram import host_memory as hm
 
@@ -1490,8 +1279,6 @@ def test_a_failed_worker_start_drains_queued_chunks(monkeypatch):
     """`submit` that queues its chunk and then fails to start a thread returns
     no future; the queued chunk must still be done or cancelled before the
     copy returns, or it would write `dst` and read the dropper afterwards."""
-    import threading
-    import time
 
     from atom.model_ops.engram import host_memory as hm
 
@@ -1529,8 +1316,6 @@ def test_a_failed_worker_start_drains_queued_chunks(monkeypatch):
 
 
 def test_closing_a_dropper_waits_for_a_drop_in_progress(tmp_path, monkeypatch):
-    import threading
-    import time
 
     import numpy as np
 
@@ -1892,17 +1677,15 @@ def _shared_file_table(tmp_path, rows=512, width=64):
 
 
 @pytest.mark.parametrize(
-    "env, shared, how",
+    "env, how",
     [
-        (None, False, "copy"),  # TP / single GPU: #2684's default
-        (None, True, "register"),  # DP attention: one pinned table per node
-        ("1", True, "copy"),  # explicit settings win
-        ("0", False, "register"),
-        ("0", True, "register"),
+        (None, "copy"),  # #2684's default
+        ("1", "copy"),
+        ("0", "register"),
     ],
 )
-def test_shared_tables_register_in_place_unless_copy_is_set(
-    monkeypatch, env, shared, how
+def test_the_copy_setting_picks_a_copy_or_an_in_place_registration(
+    monkeypatch, env, how
 ):
     from atom.model_ops.engram import host_memory
 
@@ -1913,7 +1696,7 @@ def test_shared_tables_register_in_place_unless_copy_is_set(
     monkeypatch.setattr(host_memory, "_host_allocator", lambda: allocator)
     monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
     table = scaled_table()
-    assert table.enable_uva(0, 4, shared=shared) is True
+    assert table.enable_uva(0, 4) is True
     assert (len(allocator.live), len(cudart.registered)) == (
         (2, 0) if how == "copy" else (0, 2)
     )
@@ -1921,22 +1704,8 @@ def test_shared_tables_register_in_place_unless_copy_is_set(
     assert allocator.live == {} and cudart.registered == []
 
 
-def test_a_refused_shared_registration_falls_back_to_a_copy(monkeypatch):
-    from atom.model_ops.engram import host_memory
-
-    allocator = FakeHostAllocator()
-    cudart = FakeCudart(refuse_call=2)
-    monkeypatch.setattr(host_memory, "_host_allocator", lambda: allocator)
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
-    table = scaled_table()
-    assert table.enable_uva(0, 4, shared=True) is True
-    assert cudart.registered == [] and len(allocator.live) == 2
-    table.disable_uva()
-    assert allocator.live == {}
-
-
-@pytest.mark.parametrize("env, shared", [(None, True), ("0", False)])
-def test_copy_copies_whatever_the_setting_and_shared_say(monkeypatch, env, shared):
+@pytest.mark.parametrize("env", [None, "0"])
+def test_copy_copies_whatever_the_setting_says(monkeypatch, env):
     import gc
 
     from atom.model_ops.engram import host_memory
@@ -1948,7 +1717,7 @@ def test_copy_copies_whatever_the_setting_and_shared_say(monkeypatch, env, share
     monkeypatch.setattr(host_memory, "_host_allocator", lambda: allocator)
     monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
     rows = torch.arange(1 << 18, dtype=torch.float32)
-    pinned = host_memory.pin_rows([rows], shared=shared, copy=True)
+    pinned = host_memory.pin_rows([rows], copy=True)
     assert pinned is not None and torch.equal(pinned[0], rows)
     assert (len(allocator.live), cudart.calls) == (1, 0)
     del pinned
@@ -1956,27 +1725,27 @@ def test_copy_copies_whatever_the_setting_and_shared_say(monkeypatch, env, share
     assert allocator.live == {}
 
 
-@pytest.mark.parametrize("shared", [False, True])
-def test_copy_without_an_allocator_is_a_failure(monkeypatch, shared):
+def test_copy_without_an_allocator_is_a_failure(monkeypatch):
     """With no page-locked allocator `copy=True` fails."""
     from atom.model_ops.engram import host_memory
 
     cudart = FakeCudart()
     monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
     rows = torch.ones(1 << 18)
-    assert host_memory.pin_rows([rows], shared=shared, copy=True) is None
+    assert host_memory.pin_rows([rows], copy=True) is None
     assert cudart.calls == 0
 
 
 def test_a_shared_read_only_mapping_registers_in_place_read_only(monkeypatch, tmp_path):
-    """The shared mapping cannot be written, so it is registered read-only --
-    and in place: the view is the page cache, the same pages for every rank."""
+    """The shared mapping cannot be written, so in place it is registered
+    read-only: the view is the page cache itself."""
     from atom.model_ops.engram import host_memory
 
+    monkeypatch.setenv("ATOM_ENGRAM_UVA_COPY", "0")
     cudart = OverlapRefusingCudart()
     monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
     table, expected = _shared_file_table(tmp_path)
-    assert table.enable_uva(16, 200, shared=True) is True
+    assert table.enable_uva(16, 200) is True
     weight = table.registered_shard()[0]
     assert weight.data_ptr() == table._tensor[16].data_ptr()
     assert cudart.flags == [host_memory._HOST_REGISTER_READ_ONLY]
@@ -2011,7 +1780,7 @@ def test_a_shared_read_only_mapping_still_copies_when_asked(monkeypatch, tmp_pat
 
     monkeypatch.setattr(host_memory, "_source_dropper", watched)
     table, expected = _shared_file_table(tmp_path)
-    assert table.enable_uva(0, 512, shared=True) is True
+    assert table.enable_uva(0, 512) is True
     weight = table.registered_shard()[0]
     assert weight.data_ptr() in allocator.live
     assert torch.equal(weight, expected) and dropped
@@ -2064,7 +1833,6 @@ def test_a_failed_host_malloc_leaves_the_host_path_working():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 def test_the_hip_runtime_is_torchs_on_the_device():
-    import os
 
     from atom.model_ops.engram import host_memory
 
@@ -2104,13 +1872,13 @@ def test_a_shared_read_only_mapping_is_read_by_the_uva_kernel(
         warnings.simplefilter("ignore", UserWarning)
         tensor = torch.frombuffer(raw, dtype=torch.bfloat16).view(rows, width)
     table = HostEmbeddingTable(tensor, rows, width)
-    assert table.enable_uva(shared=True) is True
+    assert table.enable_uva() is True
     in_place = table.registered_shard()[0].data_ptr() == tensor.data_ptr()
     assert in_place == (copy == "0")
     # a second table, other rows: one launch reads each layer from its own
     second = torch.randn(rows, width).to(torch.bfloat16)
     other = HostEmbeddingTable(second.clone(), rows, width)
-    assert other.enable_uva(shared=True) is True
+    assert other.enable_uva() is True
     ids = torch.tensor([[[0], [rows - 1], [77]], [[5], [77], [0]]], device="cuda")
     out = torch.empty(2, 3, 1, width, dtype=torch.bfloat16, device="cuda")
     gather = UvaGather([table, other], torch.device("cuda"))
@@ -2125,7 +1893,6 @@ def test_a_shared_read_only_mapping_is_read_by_the_uva_kernel(
 
 def _dp_runtime(monkeypatch, dp_world_size):
     """A runtime whose TP group is one GPU, in a DP group of `dp_world_size`."""
-    import sys
 
     patch_tp_group(monkeypatch, FakeGroup(world_size=1))
     state = sys.modules["aiter.dist.parallel_state"]
@@ -2133,43 +1900,59 @@ def _dp_runtime(monkeypatch, dp_world_size):
     return make_runtime()
 
 
-@pytest.mark.parametrize("dp, shared", [(4, True), (1, False)])
-def test_dp_attention_shares_the_whole_tables(monkeypatch, dp, shared):
-    """Under DP attention (TP group of one, DP > 1) every rank holds the whole
-    table: registered in place, not copied once per rank. Without DP the
-    lone rank copies, as #2684 does."""
-    from atom.model_ops.engram import host_memory
+def patch_single_rank_node_share(monkeypatch):
+    """`NodeShare`'s collectives as a group of one rank would answer them."""
+    monkeypatch.setattr(_host_memory.NodeShare, "size", property(lambda self: 1))
+    monkeypatch.setattr(
+        _host_memory.NodeShare, "all_gather", lambda self, value: [value]
+    )
+    monkeypatch.setattr(_host_memory.NodeShare, "barrier", lambda self: None)
+    monkeypatch.setattr(_host_memory.NodeShare, "agree", lambda self, ok: ok)
 
+
+@pytest.mark.parametrize("dp", [4, 1])
+def test_dp_attention_shares_the_whole_tables(monkeypatch, dp):
+    """Under DP attention (TP group of one, DP > 1) every rank holds the whole
+    table: the DP group's ranks share one copy of it (`NodeShare`), page-locked
+    by registering the shared mapping. Without DP the lone rank copies, as
+    #2684 does."""
     allocator = FakeHostAllocator()
     cudart = FakeCudart()
-    monkeypatch.setattr(host_memory, "_host_allocator", lambda: allocator)
+    monkeypatch.setattr(_host_memory, "_host_allocator", lambda: allocator)
     monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
+    patch_single_rank_node_share(monkeypatch)
     rt = _dp_runtime(monkeypatch, dp)
     heads = rt.prefetcher._hash_mapping.config.num_hash_heads
     assert rt._enable_uva(rt.prefetcher, heads) is True
-    assert rt._shared_tables is shared
     assert rt.local_heads == heads
-    if shared:
+    if dp > 1:
+        assert isinstance(rt._node_share, _host_memory.NodeShare)
+        assert rt._node_share.rank == 0
         assert allocator.live == {} and cudart.registered
     else:
+        assert rt._node_share is None
         assert allocator.live and cudart.registered == []
     rt.shutdown()
+    gc.collect()
     assert allocator.live == {} and cudart.registered == []
 
 
-def test_dp_attention_keeps_an_explicit_copy(monkeypatch):
-    from atom.model_ops.engram import host_memory
-
-    monkeypatch.setenv("ATOM_ENGRAM_UVA_COPY", "1")
-    allocator = FakeHostAllocator()
+def test_a_failed_shared_copy_raises_instead_of_taking_the_host_path(monkeypatch):
+    """Under DP attention a shared copy that fails on any rank is raised on
+    every rank, not answered as a refusal: no host-path fallback."""
     cudart = FakeCudart()
-    monkeypatch.setattr(host_memory, "_host_allocator", lambda: allocator)
     monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
+    monkeypatch.setattr(_host_memory._PAGE_RUNS, "acquire", lambda *args: None)
+    patch_single_rank_node_share(monkeypatch)
     rt = _dp_runtime(monkeypatch, 4)
     heads = rt.prefetcher._hash_mapping.config.num_hash_heads
-    assert rt._enable_uva(rt.prefetcher, heads) is True
-    assert allocator.live and cudart.registered == []
+    with pytest.raises(_host_memory.SharedTablesError):
+        rt._enable_uva(rt.prefetcher, heads)
     rt.shutdown()
+    gc.collect()
+    assert cudart.registered == []
 
 
 def test_tp_shards_are_not_shared(monkeypatch):
@@ -2180,15 +1963,255 @@ def test_tp_shards_are_not_shared(monkeypatch):
     allocator = FakeHostAllocator()
     monkeypatch.setattr(host_memory, "_host_allocator", lambda: allocator)
     patch_tp_group(monkeypatch, FakeGroup(world_size=2))
-    import sys
 
     sys.modules["aiter.dist.parallel_state"].get_dp_group = lambda: FakeGroup(4)
     monkeypatch.setattr(engram_host, "group_agree", lambda ok, group: ok)
     rt = make_runtime()
     heads = rt.prefetcher._hash_mapping.config.num_hash_heads
     assert rt._enable_uva(rt.prefetcher, heads) is True
-    assert rt._shared_tables is False and allocator.live
+    assert rt._node_share is None and allocator.live
     rt.shutdown()
+
+
+class FakeNodeShare:
+    """A `NodeShare` without a process group. Its first `all_gather` (the
+    ranks' `/proc` domains) answers `domains` (a peer's, by rank; this rank's
+    own by default), the second `peers` (a peer's `(pid, fd)` segment), each
+    with this rank's input in its own slot; `agree` answers its input, except
+    on its `refuse_agreement`-th call (a peer's refusal)."""
+
+    def __init__(self, rank=0, peers=None, domains=None, refuse_agreement=None):
+        self.rank = rank
+        self.peers = dict(peers or {})
+        self.domains = dict(domains or {})
+        self.size = len(self.peers) + 1
+        self.refuse_agreement = refuse_agreement
+        self.agreements = 0
+        self.gathers = 0
+
+    def all_gather(self, value):
+        self.gathers += 1
+        if self.gathers == 1:
+            answer = {r: self.domains.get(r, value) for r in self.peers}
+        else:
+            answer = self.peers
+        return [value if r == self.rank else answer[r] for r in range(self.size)]
+
+    def barrier(self):
+        pass
+
+    def agree(self, ok):
+        self.agreements += 1
+        return ok and self.agreements != self.refuse_agreement
+
+
+def shared_sources():
+    """A table's values and its block scales, neither a whole page."""
+    values = torch.randn(5, 300).to(torch.bfloat16)
+    scales = torch.arange(10, dtype=torch.int32).view(5, 2)
+    return [values, scales]
+
+
+def page_offsets(sources):
+    """Where `_shared_copy` places each source: page after page."""
+    offsets, total = [], 0
+    for src in sources:
+        offsets.append(total)
+        nbytes = src.numel() * src.element_size()
+        total += max(-(-nbytes // mmap.PAGESIZE), 1) * mmap.PAGESIZE
+    return offsets, total
+
+
+def record_mappings(monkeypatch):
+    """Every stitched mapping `_shared_copy` reserves, to check it is closed
+    (`base` None once unmapped)."""
+    opened = []
+
+    class RecordingMapping(_host_memory._StitchedMapping):
+        def __init__(self, nbytes):
+            super().__init__(nbytes)
+            opened.append(self)
+
+    monkeypatch.setattr(_host_memory, "_StitchedMapping", RecordingMapping)
+    return opened
+
+
+@pytest.fixture
+def shared_cudart(monkeypatch):
+    cudart = FakeCudart()
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
+    return cudart
+
+
+def test_a_shared_copy_holds_the_sources_each_on_its_own_page(
+    monkeypatch, shared_cudart
+):
+    opened = record_mappings(monkeypatch)
+    sources = shared_sources()
+    views = _host_memory.pin_rows(sources, share=FakeNodeShare())
+    assert views is not None and len(views) == len(sources)
+    for view, src in zip(views, sources, strict=True):
+        assert view.dtype == src.dtype and view.shape == src.shape
+        assert torch.equal(view, src)
+        assert view.data_ptr() % mmap.PAGESIZE == 0
+    assert shared_cudart.registered and len(opened) == 1
+    del view, views
+    gc.collect()
+    assert shared_cudart.registered == []
+    assert len(_host_memory._PAGE_RUNS) == 0
+    assert opened[0].base is None
+
+
+def test_segment_bounds_cut_at_pages_and_cover_the_layout():
+    page = _host_memory._PAGE
+    bounds = _host_memory._segment_bounds(10 * page, 4)
+    assert bounds[0] == 0 and bounds[-1] == 10 * page and len(bounds) == 5
+    assert all(b % page == 0 for b in bounds)
+    assert bounds == sorted(bounds)
+    assert _host_memory._segment_bounds(page, 3) == [0, 0, 0, page]
+
+
+def test_a_rank_fills_its_own_segment_and_reads_its_peers(monkeypatch, shared_cudart):
+    """Rank 1 of 2 fills only its segment (the scales' page); the values'
+    page is rank 0's memfd, mapped through its descriptor, read as rank 0
+    wrote it, and stitched in front of rank 1's into one range."""
+    opened = record_mappings(monkeypatch)
+    sources = shared_sources()
+    offsets, total = page_offsets(sources)
+    bounds = _host_memory._segment_bounds(total, 2)
+    assert bounds[1] == offsets[1]  # one source a segment
+    fd = os.memfd_create("engram_test")
+    try:
+        os.ftruncate(fd, bounds[1])
+        os.pwrite(fd, sources[0].reshape(-1).view(torch.uint8).numpy().tobytes(), 0)
+        share = FakeNodeShare(rank=1, peers={0: (os.getpid(), fd)})
+        views = _host_memory.pin_rows(sources, share=share)
+        assert views is not None
+        assert views[1].data_ptr() == views[0].data_ptr() + offsets[1]
+        for view, src in zip(views, sources, strict=True):
+            assert torch.equal(view, src)
+        del view, views
+        gc.collect()
+        assert shared_cudart.registered == []
+        assert len(opened) == 1 and opened[0].base is None
+    finally:
+        os.close(fd)
+
+
+def test_a_refused_shared_registration_raises_and_closes_the_mapping(
+    monkeypatch, shared_cudart
+):
+    opened = record_mappings(monkeypatch)
+    released = []
+    monkeypatch.setattr(_host_memory._PAGE_RUNS, "acquire", lambda *args: None)
+    monkeypatch.setattr(
+        _host_memory._PAGE_RUNS, "release", lambda rt, runs: released.append(runs)
+    )
+    with pytest.raises(_host_memory.SharedTablesError, match="page-lock"):
+        _host_memory.pin_rows(shared_sources(), share=FakeNodeShare())
+    assert released == []
+    assert len(opened) == 1 and opened[0].base is None
+
+
+def test_a_peers_refused_registration_releases_this_ranks(monkeypatch, shared_cudart):
+    """Every rank registered but one: the others give theirs back, and every
+    rank raises alike."""
+    opened = record_mappings(monkeypatch)
+    share = FakeNodeShare(refuse_agreement=3)
+    with pytest.raises(_host_memory.SharedTablesError, match="page-lock"):
+        _host_memory.pin_rows(shared_sources(), share=share)
+    assert share.agreements == 3
+    assert shared_cudart.calls and shared_cudart.registered == []
+    assert len(_host_memory._PAGE_RUNS) == 0
+    assert len(opened) == 1 and opened[0].base is None
+
+
+def test_a_peer_on_another_node_is_never_opened(monkeypatch, shared_cudart):
+    """A DP group spanning nodes: a peer in another `/proc` domain holds its
+    node's copy, and its `(pid, fd)` -- meaningless here -- is never opened;
+    this node's ranks (this one alone) hold the whole tables."""
+    opened = record_mappings(monkeypatch)
+    sources = shared_sources()
+    share = FakeNodeShare(
+        rank=0, peers={1: (os.getpid(), 10**6)}, domains={1: ("other-boot", 1)}
+    )
+    views = _host_memory.pin_rows(sources, share=share)
+    assert views is not None
+    for view, src in zip(views, sources, strict=True):
+        assert torch.equal(view, src)
+    del view, views
+    gc.collect()
+    assert len(opened) == 1 and opened[0].base is None
+
+
+@pytest.mark.parametrize("step", ["stitch", "fill", "acquire"])
+def test_a_raising_step_votes_no_and_releases_what_it_took(
+    monkeypatch, shared_cudart, step
+):
+    """A step raising on this rank must not skip an agreement the other ranks
+    wait in: it votes no there, every rank raises past it, and its mapping is
+    unmapped."""
+    opened = record_mappings(monkeypatch)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError(step)
+
+    if step == "stitch":
+        monkeypatch.setattr(_host_memory._StitchedMapping, "place", boom)
+    elif step == "fill":
+        monkeypatch.setattr(_host_memory, "_copy_into", boom)
+    else:
+        monkeypatch.setattr(_host_memory._PAGE_RUNS, "acquire", boom)
+    share = FakeNodeShare()
+    with pytest.raises(_host_memory.SharedTablesError):
+        _host_memory.pin_rows(shared_sources(), share=share)
+    # the agreement the failed step votes at, which every peer reaches too
+    assert share.agreements == {"stitch": 1, "fill": 2, "acquire": 3}[step]
+    assert len(opened) == 1 and opened[0].base is None
+    assert len(_host_memory._PAGE_RUNS) == 0
+
+
+def test_a_peer_without_a_memfd_raises(monkeypatch, shared_cudart):
+    opened = record_mappings(monkeypatch)
+    share = FakeNodeShare(rank=1, peers={0: None})
+    with pytest.raises(_host_memory.SharedTablesError, match="map"):
+        _host_memory.pin_rows(shared_sources(), share=share)
+    assert opened == [] and shared_cudart.calls == 0
+
+
+def test_no_memfd_on_this_rank_raises(monkeypatch, shared_cudart):
+    opened = record_mappings(monkeypatch)
+
+    def no_memfd(*args):
+        raise OSError("no memfd")
+
+    monkeypatch.setattr(os, "memfd_create", no_memfd)
+    with pytest.raises(_host_memory.SharedTablesError, match="map"):
+        _host_memory.pin_rows(shared_sources(), share=FakeNodeShare())
+    assert opened == [] and shared_cudart.calls == 0
+
+
+def test_a_node_in_several_pid_namespaces_raises_before_copying(
+    monkeypatch, shared_cudart
+):
+    """Ranks of one boot in two PID namespaces (containers on one node)
+    cannot open each other's descriptors: each namespace would hold a whole
+    copy of the tables, so every rank raises before any is made."""
+    opened = record_mappings(monkeypatch)
+    boot, _ = _host_memory._proc_domain()
+    share = FakeNodeShare(rank=0, peers={1: None}, domains={1: (boot, -1)})
+    with pytest.raises(_host_memory.SharedTablesError, match="PID namespaces"):
+        _host_memory.pin_rows(shared_sources(), share=share)
+    assert share.gathers == 1 and opened == [] and shared_cudart.calls == 0
+
+
+def test_a_rank_without_a_proc_domain_raises_before_copying(monkeypatch, shared_cudart):
+    opened = record_mappings(monkeypatch)
+    share = FakeNodeShare(rank=0, peers={1: None}, domains={1: None})
+    with pytest.raises(_host_memory.SharedTablesError, match="no /proc domain"):
+        _host_memory.pin_rows(shared_sources(), share=share)
+    assert share.gathers == 1 and opened == [] and shared_cudart.calls == 0
 
 
 class FakeGroup:
@@ -2204,7 +2227,6 @@ def patch_tp_group(monkeypatch, group):
     Undone at teardown by `monkeypatch.setitem`, which matters: an `aiter` left
     in `sys.modules` makes every later `importorskip("aiter")` succeed.
     """
-    import sys
     from types import ModuleType
 
     parallel_state = ModuleType("aiter.dist.parallel_state")

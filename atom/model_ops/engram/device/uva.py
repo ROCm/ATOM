@@ -12,6 +12,8 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.model_ops.engram.host_memory import shard_device_address
+
 
 @triton.jit
 def _uva_lookup_kernel(
@@ -124,8 +126,13 @@ class UvaGather:
                 f"{sorted(map(str, _TL_DTYPES))}"
             )
         self.weight_dtype = _TL_DTYPES[dtype]
+        # the device's addresses of the page-locked shards, which the kernel
+        # dereferences from this table
         self.rows = torch.tensor(
-            [[w.data_ptr(), s.data_ptr(), start, end] for w, s, start, end in shards],
+            [
+                [shard_device_address(w), shard_device_address(s), start, end]
+                for w, s, start, end in shards
+            ],
             dtype=torch.int64,
             device=device,
         )

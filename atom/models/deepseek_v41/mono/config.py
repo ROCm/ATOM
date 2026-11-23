@@ -14,7 +14,7 @@ from atom.utils import envs
 SUPPORTED_TP = (2, 4, 8)
 # DP attention ranks (attention TP 1, the MoE expert parallel over them,
 # ``kernels.dims``): the builds measured
-SUPPORTED_DPA = (2,)
+SUPPORTED_DPA = (2, 8)
 # the rows a step at most, the kernels' widest build (``kernels.attn_pre``): past
 # it TP2's shared expert outgrows one unit a CTA (72 tasks x 4 token tiles > 256
 # CTAs) and K1 / K2 spill VGPRs. Every row carries its own metadata, so a

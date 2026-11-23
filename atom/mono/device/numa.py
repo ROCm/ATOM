@@ -23,25 +23,29 @@ def xcc_id():
     return fx.Int32(v.result) & 7
 
 
-def local_copy(word: int, page: int, xcc):
+def local_copy(word, page: int, xcc):
     """The word offset of the copy XCD ``xcc`` reads in page ``page`` of a dual
-    area whose calibration gave ``word``."""
-    bits = word >> (8 * page) & 0xFF
-    return ((fx.Int32(bits) >> xcc) & 1) * (NUMA_RUN // 4)
+    area whose calibration gave ``word`` (the kernel's ``numa_word`` argument:
+    each rank's own, measured at run time, so no build depends on it)."""
+    bits = fx.Int32((fx.Int64(word) >> (8 * page)) & 0xFF)
+    return ((bits >> xcc) & 1) * (NUMA_RUN // 4)
 
 
-def region_addrs(scratch, layout, dual: str = "", word: int = 0) -> dict:
+def region_addrs(scratch, layout, dual: str = "", word=0) -> dict:
     """Each region of ``layout`` (name -> (byte offset, bytes)) in ``scratch``
     as its ``Addr``; one named in ``dual`` (``plan.layout.dual_spec``) kept in
     two copies at its offset there (``dreg``), the CTA reading the copy
-    ``word`` gives its XCD."""
+    ``word`` gives its XCD -- a page's copy found once for all its regions."""
     places = dual_places(dual)
     xcc = xcc_id() if places else None
+    copies = {}
     out = {}
     for region, (off, _) in layout.items():
         if region in places:
             at, page = places[region]
-            out[region] = dreg(scratch, at, region, local_copy(word, page, xcc))
+            if page not in copies:
+                copies[page] = local_copy(word, page, xcc)
+            out[region] = dreg(scratch, at, region, copies[page])
         else:
             out[region] = sreg(scratch, off, region)
     return out

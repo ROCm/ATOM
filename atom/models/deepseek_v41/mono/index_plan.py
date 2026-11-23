@@ -199,6 +199,27 @@ def blocks(bound):
     return cdiv(imax(bound, 0), BLOCK_ROWS)
 
 
+def compacts(cols):
+    """Does a candidate-producing layer's row rank only its candidate blocks'
+    rows, compacted (``index_score._compact``)? Once its newest block is block
+    ``TOPK_BLOCKS - 1`` or later; ``cols`` its bound or its
+    ``candidate_bound``, the same answer. Its selection is the same for finite
+    scores: every top-``TOPK`` row lies in a block whose maximum is at least
+    that row's score, so among the top-``TOPK_BLOCKS`` blocks (ties: the lower
+    column, the lower block, in both trees). With exactly ``TOPK_BLOCKS``
+    blocks the compaction moves nothing."""
+    return cols > (TOPK_BLOCKS - 1) * BLOCK_ROWS
+
+
+def candidate_bound(bound):
+    """The columns a candidate-producing layer's row ranks: its candidate
+    blocks' rows moved to the row's front in block order, the newest block
+    (pinned, partly visible: its ``(bound - 1) % BLOCK_ROWS + 1`` rows) last;
+    every column while it has at most ``TOPK_BLOCKS`` blocks."""
+    newest = (TOPK_BLOCKS - 1) * BLOCK_ROWS + ((bound - 1) & (BLOCK_ROWS - 1)) + 1
+    return imin(bound, newest)
+
+
 def block_chunks(bound, j):
     """(first chunk, chunk count) whose logits hold the rows of block segment j
     (blocks [SEG j, SEG (j + 1))): the flags that segment's task polls."""

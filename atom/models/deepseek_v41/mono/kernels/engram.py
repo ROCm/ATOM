@@ -45,6 +45,7 @@ from atom.models.deepseek_v41.mono.kernels.attn_pre import (
 from atom.models.deepseek_v41.mono.kernels.dims import HC, HIDDEN, Dims
 from atom.models.deepseek_v41.mono.kernels.mx import AMAX_FLOOR
 from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_offsets
+from atom.models.deepseek_v41.mono.kernels.red import acc_sum
 from atom.models.deepseek_v41.mono.sources import SOURCES
 from atom.mono.device.mx import FP8_MAX, clamp_fp8, code_ceil, rcp_pow2
 from atom.mono.device.ops import (
@@ -57,7 +58,6 @@ from atom.mono.device.ops import (
     hw_rsq,
     kernel_symbol,
     launcher,
-    row_sum,
     rsrc,
     traced,
 )
@@ -224,7 +224,7 @@ def project(c):
             branch, local = g // p.rgs, g % p.rgs
             rg = (branch * HIDDEN + _first_col(c)) // RG + local
             return gemv_fp8_loads(
-                c, a["w"], a["ws"], PART, rg, k_row=WIDTH, st0=part * WAVES
+                c, a["w"], a["ws"], PART, rg, k_row=WIDTH, k0=part * PART
             )
 
         # the first groups' weights stream while the part is quantized; then
@@ -257,7 +257,7 @@ def _group(c, part, g, ops):
         gpu.barrier()
         if tid < RG * n:
             r, tk = tid % RG, tid // RG
-            v = row_sum(red, r, tk)
+            v = acc_sum(red, r, tk)
             row = RG * tile + tk
             at = (part * p.rows + row) * (HC + 1) * p.own + g * RG + r
             bo.buffer_store(v, r_parts, at, cache_modifier=CM_DEV)

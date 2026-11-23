@@ -484,3 +484,50 @@ def test_merged_shares_select_the_unsplit_top_k():
             cols = [c for c, _ in answers]
             merged = stable_top([v for _, v in answers], cols, ip.TOPK)
             assert merged == whole
+
+
+EDGE_BLOCKS = (ip.TOPK_BLOCKS - 1) * ip.BLOCK_ROWS
+
+
+@pytest.mark.parametrize(
+    "bound", [*bounds(), *range(EDGE_BLOCKS - 9, EDGE_BLOCKS + 3 * ip.BLOCK_ROWS)]
+)
+def test_candidate_bound_is_the_candidate_blocks_rows(bound):
+    """A candidate producer's row ranks its candidate blocks' rows: every
+    column up to TOPK_BLOCKS blocks, else TOPK_BLOCKS - 1 whole blocks and the
+    newest one's visible rows; it compacts from TOPK_BLOCKS blocks on, the
+    same answer from its bound or its candidates' columns."""
+    blocks = ip.blocks(bound)
+    newest = bound - (blocks - 1) * ip.BLOCK_ROWS
+    want = bound if blocks <= ip.TOPK_BLOCKS else EDGE_BLOCKS + newest
+    cols = ip.candidate_bound(bound)
+    assert cols == want
+    assert ip.compacts(bound) == (blocks >= ip.TOPK_BLOCKS)
+    assert ip.compacts(cols) == ip.compacts(bound)
+
+
+def test_candidate_rows_select_the_whole_top_k():
+    """The top-TOPK of a row's columns is the top-TOPK of its top-TOPK_BLOCKS
+    blocks' rows (block maxima, the newest pinned; ties to the lower block
+    and the lower column), lifted back -- the same ids, ties included
+    (``index_score._compact``)."""
+    rng = np.random.default_rng(4)
+    for bound in (EDGE_BLOCKS + 1, ip.TOPK_BLOCKS * ip.BLOCK_ROWS + 3, 40000, 70001):
+        # few distinct values: ties everywhere
+        scores = rng.integers(0, 40, bound).astype(np.float32)
+        whole = stable_top(scores, list(range(bound)), ip.TOPK)
+        blocks = ip.blocks(bound)
+        maxima = [
+            scores[b * ip.BLOCK_ROWS : (b + 1) * ip.BLOCK_ROWS].max()
+            for b in range(blocks)
+        ]
+        maxima[-1] = np.inf
+        kept = [b for b, _ in stable_top(maxima, list(range(blocks)), ip.TOPK_BLOCKS)]
+        rows = [
+            c
+            for b in kept
+            for c in range(b * ip.BLOCK_ROWS, min((b + 1) * ip.BLOCK_ROWS, bound))
+        ]
+        assert len(rows) == ip.candidate_bound(bound)
+        compact = stable_top(scores[rows], list(range(len(rows))), ip.TOPK)
+        assert [(rows[i], v) for i, v in compact] == whole

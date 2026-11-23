@@ -257,10 +257,14 @@ class V41MonoDecodeRunner:
 
     def __init__(
         self, model, drafter, max_model_len: int, index_fp4: bool, outputs,
-        sampling,
+        sampling, draft_context: bool = True,
     ) -> None:  # fmt: skip
-        # the forward's output buffer, the step's staged (temperatures, top-p)
+        # the forward's output buffer; the step's staged (temperatures, top-p)
+        # the mono LM head draws by, None where the owner verifies otherwise
+        # (no head bound); whether the owner routes the draft's context write
+        # here (``write_context``; else no launch bound for it)
         self.outputs, self.sampling = outputs, sampling
+        self.draft_context = draft_context
         # the indexer's widest bound: a ratio-1 layer sees every position. No
         # token's bound may exceed it (positions stay below max_model_len): its
         # selection would never reach a final level nor publish IRDY
@@ -414,16 +418,18 @@ class V41MonoDecodeRunner:
                     model, self.tp, self.max_rows, verifiers, lambda: self.step_ids
                 )
             self.engram = MonoEngram.bind(model, self.tp, self.max_rows, dev)
-            self.draft_ctx = MonoDraftContext.bind(
-                _draft_of(drafter), self.tp, self.max_rows, dev
-            )
+            if self.draft_context:
+                self.draft_ctx = MonoDraftContext.bind(
+                    _draft_of(drafter), self.tp, self.max_rows, dev
+                )
         self._allocate(model.config)
 
     def _id_verifiers(self, dev):
         """The head's verifies on its ids (``head_launch``), its draws by the
-        step's staged sampling; None without a drafter."""
+        step's staged sampling; None without a drafter or that sampling (its
+        owner verifies otherwise)."""
         spec = get_current_atom_config().speculative_config
-        if spec is None:
+        if spec is None or self.sampling is None:
             return None
         temps, top_ps = self.sampling
         return IdVerifiers.from_spec(spec, dev, lambda: temps, lambda: top_ps)
@@ -468,7 +474,8 @@ class V41MonoDecodeRunner:
         group = self._group()
         self.dp = group.world_size // self.tp
         ep = get_current_atom_config().enable_expert_parallel
-        self.ep = self.dp if ep else 1
+        # ATOM's EP group: the experts over every TP and DP rank
+        self.ep = self.tp * self.dp if ep else 1
         self.moe_tp = 1 if ep else self.dp
         self.rank = (
             group.rank_in_group if self.dp > 1 else get_tensor_model_parallel_rank()
@@ -476,7 +483,7 @@ class V41MonoDecodeRunner:
         # attention's and the shared expert's widths, and under expert parallel
         # the routed experts a rank holds; the MoE's (its widths, its ranks)
         self.dims = Dims(self.tp, self.ep)
-        self.moe_dims = Dims(self.tp * self.moe_tp, self.ep)
+        self.moe_dims = Dims(self.tp * self.moe_tp, self.ep, self.moe_tp > 1)
         # the MoE runs every rank's rows: its widest build bounds a rank's step
         self.max_rows = min(self.max_rows, MAX_MOE_ROWS // self.dp)
 
@@ -579,7 +586,6 @@ class V41MonoDecodeRunner:
                 kv_fp8=self.kv_fp8,
                 numa=self._numa(s) if numa else "",
                 shard=self._shard(s),
-                numa_word=self.numa_word,
             )
             for spec, block in zip(self.model.topology, self.model.layers)
         ]
@@ -711,7 +717,6 @@ class V41MonoDecodeRunner:
             moe_tp=self.moe_tp,
             kv_fp8=self.kv_fp8,
             numa=self._numa(s) if numa else "",
-            numa_word=self.numa_word,
             shard=self._shard(s),
         )
 
@@ -1020,9 +1025,9 @@ class V41MonoDecodeRunner:
         """The step scratch: ``nbytes`` of regions, then the dual area every
         width's two-copy regions share (``_numa``), from a page boundary so that
         one calibration of it (``numa.scratch_word``) holds for every width.
-        The word is each rank's own (its pages' homes) and a build key's
-        constant: where a rank's builds spill, ``WidthBuilds`` takes every
-        rank through the same lean rebuild. Right before the regions, the
+        The word is each rank's own (its pages' homes), a kernel argument
+        (``_tail_args``), not a build's constant: every rank and every start
+        runs the same binaries. Right before the regions, the
         launches' queue words (``k2b.QUEUES``): outside every build's layout,
         which the step's layer builds lay out apart."""
         qbytes = k2b.QUEUE_BYTES
@@ -1258,7 +1263,7 @@ class V41MonoDecodeRunner:
         # scores a row (``index_query.step_queried``)
         bound = self._selection_bound(spec, step) if key.feeds_index else self.no_bound
         args["ibound"] = bound.data_ptr()
-        args.update(self._peer_args())
+        args.update(self._tail_args())
         args["layer"] = layer_id
         args["tl"] = self._timeline_ptr("k1", layer_id)
         # the caller's stream: a FlyDSL launcher left to its default submits on the
@@ -1294,7 +1299,7 @@ class V41MonoDecodeRunner:
             )
         )
         args.update(self._moe_args(weights))
-        args.update(self._peer_args())
+        args.update(self._tail_args())
         args["kvrow"] = self.kvrow.data_ptr()
         args.update(cargs)
         args["layer"] = layer_id
@@ -1369,7 +1374,7 @@ class V41MonoDecodeRunner:
         args = k2.ABI.pack({
             **self._attn_post_args(spec, block, weights, residual, gates, step, cache, rope),
             **self._moe_args(weights),
-            **self._peer_args(),
+            **self._tail_args(),
             "layer": POST_TAG0 + layer_id, "moe_layer": MOE_TAG0 + layer_id,
             "queue_words": self._queue_words(layer_id),
             "tl": self._timeline_ptr("k2", layer_id),
@@ -1384,16 +1389,23 @@ class V41MonoDecodeRunner:
         layer_id = spec.layer_id
         args = k2a.ABI.pack({
             **self._attn_post_args(spec, block, weights, residual, gates, step, cache, rope),
-            **self._peer_args(),
+            **self._tail_args(),
             # its own tags: K1's regions of this layer share the scratch
             "layer": POST_TAG0 + layer_id,
             "tl": self._timeline_ptr("k2a", layer_id),
         })  # fmt: skip
         _run_compiled(self.build.attn_post, *args, torch.cuda.current_stream())
 
-    def _peer_args(self) -> dict:
+    def _tail_args(self) -> dict:
+        """The layer launches' shared tail: the step scratch, its dual area's
+        calibration word (``numa_word``: this rank's, measured at run time,
+        so no build depends on it), the peer buffer."""
         p = torch.Tensor.data_ptr
-        return {"scratch": p(self.scratch), **self.peers.kernel_args()}
+        return {
+            "scratch": p(self.scratch),
+            "numa_word": self.numa_word,
+            **self.peers.kernel_args(),
+        }
 
     def _queue_words(self, layer_id: int) -> int:
         """Layer ``layer_id``'s K2b queue words (``k2b.queue_offset``)."""
@@ -1451,7 +1463,7 @@ class V41MonoDecodeRunner:
         key_a, _ = self._post_key(self.ffn_normed.shape[1]).halves()
         args = k2b.ABI.pack({
             "x": self.ffn_normed.data_ptr(), **self._moe_args(weights),
-            **self._peer_args(), "layer": MOE_TAG0 + layer_id,
+            **self._tail_args(), "layer": MOE_TAG0 + layer_id,
             "queue_words": self._queue_words(layer_id),
             "tl": self._timeline_ptr("k2b", layer_id),
             # where the merged launch's layout puts K2b's regions

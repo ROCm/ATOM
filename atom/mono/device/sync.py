@@ -124,9 +124,31 @@ def shift(a, delta):
 _SCOPE_CM = {Space.SCRATCH: CM_DEV, Space.PEER: CM_SYS}
 
 
-def _pair_word(a, i):
-    """Pair i's first word in the copy of region ``a`` this CTA reads."""
-    w = fx.Int32(i) * 2
+@dataclass(frozen=True)
+class Quad:
+    """Pairs 2 q and 2 q + 1 of a region: a two-pair access, 16-byte aligned
+    by construction -- the only one a dual region takes (two pairs from an
+    odd one cross into the other copy at a run's end)."""
+
+    q: object
+
+
+def _word(a, i, pairs):
+    """The first word of ``pairs`` pairs from ``i`` (a pair index, or a
+    ``Quad``) in region ``a``; a dual region's several only by a ``Quad``."""
+    if isinstance(i, Quad):
+        assert pairs == 2, f"{a.region}: a Quad is two pairs"
+        return fx.Int32(i.q) * 4
+    assert (
+        a.copy is None or pairs == 1
+    ), f"{a.region}: a dual region's {pairs}-pair access takes a Quad"
+    return fx.Int32(i) * 2
+
+
+def _pair_word(a, i, pairs=1):
+    """The first word of ``pairs`` pairs from ``i`` (``_word``) in the copy
+    of region ``a`` this CTA reads."""
+    w = _word(a, i, pairs)
     return w if a.copy is None else dual_word(w) + a.copy
 
 
@@ -181,20 +203,28 @@ class Mailbox:
         self._store(a, i * 2, fx.Vector.from_elements([bits, self.tag], fx.Int32))
 
     def put_bf(self, a, i, vs):
-        """Elements i .. i+len(vs) (2 or 4, i aligned) as packed bf16 pairs, one store."""
+        """Elements i .. i+len(vs) (2 or 4, i aligned) as packed bf16 pairs,
+        one store; a dual region's 4 from ``Quad`` q (elements 4 q ..)."""
+        pairs = len(vs) // 2
         words = []
-        for j in range_constexpr(len(vs) // 2):
+        for j in range_constexpr(pairs):
             words += [bf16_pair(vs[2 * j], vs[2 * j + 1]).bitcast(fx.Int32), self.tag]
-        self._store(a, i, fx.Vector.from_elements(words, fx.Int32))
+        if isinstance(i, Quad):
+            at = _word(a, i, pairs)
+        else:
+            assert a.copy is None or pairs == 1, f"{a.region}: 4 elements take a Quad"
+            at = i
+        self._store(a, at, fx.Vector.from_elements(words, fx.Int32))
 
     def put_words(self, a, i, words):
-        """Raw 32-bit words (1 or 2) at pairs i.. as (word, tag). Integer payloads
-        (fp8 words) must come this way: through an f32 value a NaN bit pattern is
-        not kept."""
+        """Raw 32-bit words (1 or 2) at pairs i.. as (word, tag); a dual
+        region's two at ``Quad`` i. Integer payloads (fp8 words) must come this
+        way: through an f32 value a NaN bit pattern is not kept."""
         vals = []
         for w in words:
             vals += [fx.Int32(w), self.tag]
-        self._store(a, i * 2, fx.Vector.from_elements(vals, fx.Int32))
+        at = _word(a, i, len(words))
+        self._store(a, at, fx.Vector.from_elements(vals, fx.Int32))
 
     def spin(self, a, index, load_all, pending):
         """Re-issue ``load_all`` until ``pending`` clears: a wait in region
@@ -208,7 +238,8 @@ class Mailbox:
 
     def poll(self, specs, batch=POLL_MAX):
         """Batched poll of pairs ``specs`` = [(Addr, pair index, npairs in {1, 2})],
-        each loaded at its own space's scope.
+        each loaded at its own space's scope; two pairs of a dual region at a
+        ``Quad`` (``_word``).
 
         All pairs are re-loaded together while any tag is stale, so a batch costs
         one round trip after its last producer lands. Returns the value words."""
@@ -226,7 +257,7 @@ class Mailbox:
                 w = fx.Vector(
                     bo.buffer_load(
                         rsrc(b),
-                        _pair_word(a, i),
+                        _pair_word(a, i, n),
                         vec_width=2 * n,
                         dtype=T.i32,
                         cache_modifier=cm,
@@ -243,7 +274,9 @@ class Mailbox:
                 bad = bad | (v[e] != tag)
             return bad
 
-        v = self.spin(specs[0][0], specs[0][1], load_all, pending)
+        first = specs[0][1]
+        first = first.q * 2 if isinstance(first, Quad) else first
+        v = self.spin(specs[0][0], first, load_all, pending)
         outs, e = [], 0
         for _, _, n in specs:
             outs.append([v[e + 2 * q] for q in range(n)])

@@ -79,6 +79,7 @@ from atom.mono.device.ops import (
     traced,
     xshfl,
 )
+from atom.mono.device.sync import Quad
 from atom.mono.plan.execution import BLOCKS, THREADS
 
 CH, CHUNKS = aplan.CH, aplan.CHUNKS  # keys a chunk, chunks a token
@@ -249,7 +250,7 @@ def _q_tile(c, t, tile):
     # past it the pairs are the next token's, or past the step's, never written
     head = tile_head(d, tile, tid // row_words)[0]
     base = (t * d.heads + head) * HEAD_DIM + tid % row_words * 16
-    got = c["k1_poll"]([(c["qp"], base // 2 + 2 * k, 2) for k in range(4)])
+    got = c["k1_poll"]([(c["qp"], Quad(base // 4 + k), 2) for k in range(4)])
     words = [w for pair in got for w in pair]
     at = tid // row_words * Q_LDS_ROW + tid % row_words * 8
     fx.ptr_store(fx.Vector.from_elements(words, fx.Int32), q + at)
@@ -284,7 +285,7 @@ def _q_load4(c, at):
         return fx.Vector(
             bo.buffer_load(rsrc(c["args"]["q"]), at, vec_width=4, dtype=T.i32)
         )
-    got = c["k1_poll"]([(c["qp"], at + 2 * k, 2) for k in range(2)])
+    got = c["k1_poll"]([(c["qp"], Quad(at // 2 + k), 2) for k in range(2)])
     return fx.Vector.from_elements([w for pair in got for w in pair], fx.Int32)
 
 
@@ -715,8 +716,8 @@ def _score_keys(c, t, tile, chunk, key0, qh, live, meta, kws, qws):
     ]
     if only_live(True, live):
         at = _as(d, t, tile, chunk, qh - tile * HEAD_TILE, key0 % CH + 4 * g)
-        c["put_words"](c["as"], at, sv[:2])
-        c["put_words"](c["as"], at + 2, sv[2:])
+        c["put_words"](c["as"], Quad(at // 2), sv[:2])
+        c["put_words"](c["as"], Quad(at // 2 + 1), sv[2:])
 
 
 def merge_task(task, tokens, tiles):
@@ -823,7 +824,7 @@ def _merge_softmax(c, t, tile, hg, mh, meta, sink2):
     ccs = [g + groups * i for i in range(-(-CHUNKS // groups))]
     got = c["poll"](
         [
-            (c["as"], _as(d, t, tile, aplan.polled_chunk(fx.min(cc, CHUNKS - 1), n_sel, count, c["sel_slots"]), hh, 2 * j), 2)
+            (c["as"], Quad(_as(d, t, tile, aplan.polled_chunk(fx.min(cc, CHUNKS - 1), n_sel, count, c["sel_slots"]), hh, 2 * j) // 2), 2)
             for cc in ccs
         ]
     )  # fmt: skip

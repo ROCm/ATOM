@@ -73,6 +73,7 @@ from atom.models.deepseek_v41.mono.kernels import attn_pre as k1
 # source of the same-directory functions it names, never through a module
 from atom.models.deepseek_v41.mono.kernels.attn_pre import (
     TILE,
+    flat_span,
     gemv_fp8_loads,
     gemv_fp8_mfmas,
     lds_row,
@@ -97,6 +98,7 @@ from atom.models.deepseek_v41.mono.kernels.moe_shape import (
 )
 from atom.models.deepseek_v41.mono.kernels.mx import AMAX_FLOOR
 from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_offsets
+from atom.models.deepseek_v41.mono.kernels.red import acc_sum
 from atom.models.deepseek_v41.mono.kernels.token_par import own_count, own_view
 from atom.models.deepseek_v41.mono.sources import SOURCES
 from atom.mono.device import queue, route
@@ -143,7 +145,7 @@ from atom.mono.device.ops import (
 from atom.mono.device.ranks import peer_bases, sum_partials
 from atom.mono.device.select import KEY_LEAST, f32_key
 from atom.mono.device.stamps import stamp, stamp_begin, stamp_flush
-from atom.mono.device.sync import preg, publish
+from atom.mono.device.sync import Quad, preg, publish
 from atom.mono.plan.build_key import key_tuple
 from atom.mono.plan.execution import BLOCKS, LDS_BYTES, THREADS, WAVES, first_task
 from atom.mono.plan.layout import pair_layout
@@ -209,8 +211,8 @@ TL_POINTS = 1 + len(TL_STAGES)
 ABI = KernelAbi(
     (
         "x", "gate_w", "bias", "w13", "w13_s", "w2", "w2_s", "sgu", "sgu_s", "sw2",
-        "sw2_s", "out", "queue_words", "scratch", "sym", "peers", "rank", "layer",
-        "tl",
+        "sw2_s", "out", "queue_words", "scratch", "numa_word", "sym", "peers", "rank",
+        "layer", "tl",
     )
 )  # fmt: skip
 
@@ -427,7 +429,7 @@ def router_x_normed(c, part, g0, per, tiles):
         specs += lssq_specs(dn["lssq"], tok, lane)
     for u, col in zip(us, cols):
         tok = fx.min(plus(g0, u // ROUTER_UNITS), s - 1)
-        specs.append((dn["lin"], (tok * HIDDEN + col) // 2, 2))
+        specs.append((dn["lin"], Quad((tok * HIDDEN + col) // 4), 2))
     got = dn["poll"](specs)
     per_tok = len(lssq_specs(dn["lssq"], 0, lane))
     for k in range_constexpr(waves_tokens):
@@ -496,7 +498,7 @@ def route_scores(c, t):
         bias = ld_f32(c["args"]["bias"], tid)
         assert ROUTER_PARTS == 4
         got = c["poll"](
-            [(c["logit"], (t * experts + tid) * ROUTER_PARTS + h, 2) for h in (0, 2)]
+            [(c["logit"], Quad((t * experts + tid) * 2 + h), 2) for h in (0, 1)]
         )
         parts = got[0] + got[1]
         tot = fx.Float32(0.0)
@@ -747,7 +749,7 @@ def stage_shared(c, task, gops, uops, t0, n):
     gpu.barrier()
     gate = fx.Float32(0.0)
     if tid < ROWS * n:
-        gate = row_sum(red, tid % ROWS, tid // ROWS)
+        gate = acc_sum(red, tid % ROWS, tid // ROWS)
     gpu.barrier()
     if const_expr(uops is None):
         uops = gemv_fp8_loads(c, a["sgu"], a["sgu_s"], HIDDEN, plus(c["sh_up0"], task))
@@ -756,7 +758,7 @@ def stage_shared(c, task, gops, uops, t0, n):
     if tid < ROWS * n:
         r = tid % ROWS
         t = plus(t0, tid // ROWS)
-        up = row_sum(red, r, tid // ROWS)
+        up = acc_sum(red, r, tid // ROWS)
         v = fx.Float32(_silu_mul(bf16_round(gate), bf16_round(up)).to(fx.BFloat16))
         c["put"](c["smid"], t * d.sh_inter + task * ROWS + r, v)
         fx.ptr_store(v, c["pair"] + tid)
@@ -1087,6 +1089,14 @@ def ug_red_slot(rs, p, bb, ks, t):
     return ((p * 2 + bb) * rs.ug_k_slices + ks) * 2 + t
 
 
+def ug_red_word(slot, g, col, bb):
+    """RED's word of lane (g, col)'s C quad in an ug slot (the MFMA lane 16 g +
+    col): the column swizzled within its lane group by the group and the half
+    ``bb``, so the epilogue's read -- a (row, pick) a lane, its rows' groups and
+    halves in one wave -- meets every bank once."""
+    return (slot * 64 + g * 16 + (col ^ (2 * g + 8 * bb))) * 4
+
+
 def pairwise_sum(vs):
     """vs summed as a balanced tree, neighbours first: (v0 + v1) + (v2 + v3)."""
     while len(vs) > 1:
@@ -1132,7 +1142,7 @@ def ug_tile_run(c, task):
     else:
         gather_x8r(c, first, count)
         ug_pass(c, e, part0, first, count, fx.min(lane % 16, count - 1))
-    if const_expr(not down_by_unit(c) and not rs.down_y):
+    if const_expr(not down_by_unit(rs) and not rs.down_y):
         # the epilogue's MID stores done before the task's flag (down by unit:
         # the CTA's flag after its last task, ``run_moe``)
         rocdl.s_waitcnt(vmcnt=0)
@@ -1174,7 +1184,7 @@ def ug_pass(c, e, part0, first, count, col):
         slot = ug_red_slot(rs, p, wave % 2, ks, t)
         fx.ptr_store(
             fx.Vector.from_elements([acc[4 * t + q] for q in range(4)], fx.Float32),
-            red + (slot * 64 + lane) * 4,
+            red + ug_red_word(slot, lane // 16, lane % 16, wave % 2),
         )
     gpu.barrier()
     # thread (p, j, i): group p, the slot's pick j, intermediate column
@@ -1249,15 +1259,18 @@ def ug_epilogue(c, part0, idx, first, count):
         i = idx % UG_PART
         tile = i // 16
         r = i % 16
-        at = (16 * (r // 4) + t) * 4 + r % 4
         g, up = [
             pairwise_sum(
                 [
-                    fx.ptr_load(red + ug_red_slot(rs, p, tile, ks, t) * 64 * 4 + at)
+                    fx.ptr_load(
+                        red
+                        + ug_red_word(ug_red_slot(rs, p, tile, ks, gu), r // 4, t, tile)
+                        + r % 4
+                    )
                     for ks in range(rs.ug_k_slices)
                 ]
             )
-            for t in range(2)
+            for gu in range(2)
         ]
         gc = fx.min(g, fx.Float32(LIMIT))
         uc = fx.max(fx.min(up, fx.Float32(LIMIT)), fx.Float32(-LIMIT))
@@ -1368,12 +1381,12 @@ def down_finish(c, tasks):
                 down_combine(c, tasks[j], j, t0, nn)
 
 
-def down_by_unit(c) -> bool:
+def down_by_unit(rs) -> bool:
     """Whether the down stage runs by unit (``down_by_units``): a CTA's down
     tasks in one call (``RouteShape.down_one_call``) with K in parts. It waits
     for every ug task at once, so the ug stage flags a CTA (UGC), not a task
     (EP 32 / 48 rows -1.3 / -1.5 us)."""
-    return c["rs"].down_one_call and down_parts(c["d"]) > 1
+    return rs.down_one_call and down_parts(rs.dims) > 1
 
 
 @traced
@@ -1739,7 +1752,7 @@ def load_mid_rows(c, first, count):
         unit = fx.min(tid + THREADS * i, units - 1)
         r, w = unit // (real_words // 2), unit % (real_words // 2) * 2
         row = first + fx.min(r, count - 1)
-        specs.append((c["mid"], row * words + w, 2))
+        specs.append((c["mid"], Quad((row * words + w) // 2), 2))
         stores.append(
             (c["dml"] + (r * lds_row(words) + w), (tid + THREADS * i < units) & (r < count), None)
         )  # fmt: skip
@@ -1808,7 +1821,7 @@ def down_store_y(c, accs, task, first, count):
     words = [bf16_pair(acc[q] * w, acc[q + 1] * w).bitcast(fx.Int32) for q in (0, 2)]
     if jj < count:
         at = pick * (HIDDEN // 2) + (task * ROWS + 4 * (lane // 16)) // 2
-        c["put_words"](c["dy"], at, words)
+        c["put_words"](c["dy"], Quad(at // 2), words)
 
 
 @traced
@@ -1834,7 +1847,7 @@ def shared_down_unit(c, k):
             gpu.barrier()
             if tid < ROWS * nn // 2:
                 rp, tl = tid % (ROWS // 2), tid // (ROWS // 2)
-                vs = [bf16_round(row_sum(red, 2 * rp + h, tl)) for h in range(2)]
+                vs = [bf16_round(acc_sum(red, 2 * rp + h, tl)) for h in range(2)]
                 at = (tasks[j] * s + plus(t0, tl)) * ROWS + 2 * rp
                 c["put_bf"](c["sdo"], at, vs)
             gpu.barrier()
@@ -2147,7 +2160,7 @@ def down_shared(c, tasks):
             gemv_fp8_mfmas(c, d.sh_inter, c["sxl"], c["sxsl"], red, shops[j], rows=nn)
             gpu.barrier()
             if tid < ROWS * nn:
-                v = row_sum(red, tid % ROWS, tid // ROWS)
+                v = acc_sum(red, tid % ROWS, tid // ROWS)
                 at = (j * s + plus(t0, tid // ROWS)) * ROWS + tid % ROWS
                 fx.ptr_store(bf16_round(v).bitcast(fx.Int32), c["sdl"] + at)
             gpu.barrier()
@@ -2162,7 +2175,7 @@ def shared_down_loads(c, task):
         return gemv_fp8_loads(c, a["sw2"], a["sw2_s"], d.sh_inter, task)
     return gemv_fp8_loads(
         c, a["sw2"], a["sw2_s"], d.sh_inter, task,
-        k_row=SHARED_INTER, st0=c["rank"] * (d.sh_inter // 128),
+        k_row=SHARED_INTER, k0=c["rank"] * d.sh_inter,
     )  # fmt: skip
 
 
@@ -2302,8 +2315,8 @@ def load_smid_tile(c, t0, n, groups):
     poll_copy(
         c, tid, THREADS,
         [
-            (c["smq"], lambda u: plus(t0 * words, u), n * words, c["sxl"], words),
-            (c["smc"], lambda u: plus(t0 * groups, u), n * groups, c["sxsl"], groups),
+            (c["smq"], flat_span(t0, words), n * words, c["sxl"], words),
+            (c["smc"], flat_span(t0, groups), n * groups, c["sxsl"], groups),
         ],
     )  # fmt: skip
     gpu.barrier()
@@ -2408,9 +2421,7 @@ def stage_lds(s, rs):
     return {"offsets": offsets, "words": {"all": max(words.values())}}
 
 
-def moe_context(
-    s, rs, lds, mb, bases, layout, scratch, args, rank, sym, numa="", numa_word=0
-):
+def moe_context(s, rs, lds, mb, bases, layout, scratch, args, rank, sym, numa=""):
     """K2b's stage context: LDS, mailbox, scratch regions, arguments. Its lane math
     starts from a ``fresh`` thread id: in the merged K2 it is not K2a's, held
     from K2a's stages on. The lane by a mask: the signed ``%`` of an id LLVM
@@ -2448,7 +2459,7 @@ def moe_context(
         c["sh_gate0"], c["sh_up0"] = 0, d.shared_tasks
     for name, off in stage_lds(s, rs)["offsets"].items():
         c[name] = lds.stage.ptr + off
-    c.update(region_addrs(scratch, layout, numa, numa_word))
+    c.update(region_addrs(scratch, layout, numa, args["numa_word"]))
     # where routes go and are read: this launch's scratch, every row routed here
     c["route_dsts"], c["route_src"] = [c["route"]], c["route"]
     c["route_rows"], c["route_t0"] = s, 0
@@ -2552,7 +2563,7 @@ def run_moe(c, key, bid, tls, tl0, before_ug=None):
         task = first_task(bid, c["rs"].ug0)
         while ug_task_id(task, ug_placed(c["rs"])) < ug_total:
             task = stage_ug_tile(cu, task, ug_total)
-        if const_expr(down_by_unit(c)):
+        if const_expr(down_by_unit(c["rs"])):
             publish(c["put"], c["ugc"], bid, 1, tid == 0)
     else:
         # one token tile: every task placed (its x in LDS once a CTA)
@@ -2579,7 +2590,7 @@ def run_moe(c, key, bid, tls, tl0, before_ug=None):
     down_task = first_task(bid, DOWN0)
     rank = take_down_rank(c)
     has_second = rank < DOWN_TASKS - BLOCKS
-    by_unit = down_by_unit(c)
+    by_unit = down_by_unit(c["rs"])
     if const_expr(c["rs"].down_y):
         # the combine's second task: live for the first arrivals only
         cy = dict(c)
@@ -2695,8 +2706,8 @@ def build_moe(key: MoeBuild):
         x: Int64, gate_w: Int64, bias: Int64, w13: Int64, w13_s: Int64, w2: Int64,
         w2_s: Int64, sgu: Int64, sgu_s: Int64, sw2: Int64, sw2_s: Int64, out: Int64,
         queue_words: Int64,
-        scratch: Int64, sym: Int64, peers: Int64, rank: Int32, layer: Int32,
-        tl: Int64,
+        scratch: Int64, numa_word: Int64, sym: Int64, peers: Int64, rank: Int32,
+        layer: Int32, tl: Int64,
     ):  # fmt: skip
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -2716,10 +2727,11 @@ def build_moe(key: MoeBuild):
             out,
             queue_words,
         )
+        args["numa_word"] = numa_word
         c = moe_context(
             s, rs, lds, mailbox(layer, scratch, key.diag_off, layout),
             peer_bases(peers, rs.dims.ranks), layout, scratch, args,
-            rank, sym, key.numa, key.numa_word,
+            rank, sym, key.numa,
         )  # fmt: skip
         tls = lds.tls.ptr
         stamp_begin(timeline, tls, tid, TL_POINTS)
@@ -2732,14 +2744,14 @@ def build_moe(key: MoeBuild):
         x: Int64, gate_w: Int64, bias: Int64, w13: Int64, w13_s: Int64, w2: Int64,
         w2_s: Int64, sgu: Int64, sgu_s: Int64, sw2: Int64, sw2_s: Int64, out: Int64,
         queue_words: Int64,
-        scratch: Int64, sym: Int64, peers: Int64, rank: Int32, layer: Int32,
-        tl: Int64, stream: fx.Stream = _CURRENT_STREAM,
+        scratch: Int64, numa_word: Int64, sym: Int64, peers: Int64, rank: Int32,
+        layer: Int32, tl: Int64, stream: fx.Stream = _CURRENT_STREAM,
     ):  # fmt: skip
         _ = keyed
         moe(
             x, gate_w, bias, w13, w13_s, w2, w2_s, sgu, sgu_s, sw2, sw2_s, out,
             queue_words,
-            scratch, sym, peers, rank, layer, tl,
+            scratch, numa_word, sym, peers, rank, layer, tl,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 
     ABI.check(moe, launch)

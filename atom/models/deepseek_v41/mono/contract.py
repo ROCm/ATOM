@@ -20,10 +20,12 @@ Usage: python -m atom.models.deepseek_v41.mono.contract [S ...]
 import sys
 
 from atom.models.deepseek_v41.mono import index_plan as ip
+from atom.models.deepseek_v41.mono.config import MAX_MOE_ROWS, SUPPORTED_DPA
 from atom.models.deepseek_v41.mono.kernels import attn_post as k2a
 from atom.models.deepseek_v41.mono.kernels import attn_pre as k1
 from atom.models.deepseek_v41.mono.kernels import compress as cp
 from atom.models.deepseek_v41.mono.kernels import layer_post as k2
+from atom.models.deepseek_v41.mono.kernels.moe import down_by_unit
 from atom.models.deepseek_v41.mono.kernels.moe_shape import MoeBuild, route_shape
 from atom.mono.plan.check import RegionDecl
 from atom.mono.plan.trace import Space
@@ -86,8 +88,10 @@ def indexer_regions(
     """The indexer's: the scores, then per kind (sel, blk) a stage a tree level,
     each level but the last putting its lists for the next. A token's selection
     is final at the level its bound reaches (``index_plan.final_level``), so any
-    sel level may put its ready flag. In a token-parallel launch a row's owner
-    puts its flags on every rank, the candidate blocks' too (ICRDY, awaited by
+    sel level may put its ready flag. A candidate producer's blocks put ICRDY,
+    awaited by a compacted row's selection (``index_plan.compacts``), so its
+    blk stages run before its sel ones. In a token-parallel launch a row's
+    owner puts its flags on every rank, ICRDY too (also awaited by
     ``k2a.icwait``). ``split``: a split row's final list puts its answer's flag
     on every rank (IXRDY, awaited by ``k2a.imerge``), which then puts IRDY."""
 
@@ -106,9 +110,13 @@ def indexer_regions(
         regions += [
             RegionDecl("irdy", S, (*finals("sel"), "k2a.imerge")),
             RegionDecl("ixrdy", P, finals("sel")),
+            RegionDecl("icrdy", S, finals("blk")),
         ]
     else:
-        regions += [RegionDecl("irdy", S, finals("sel"))]
+        regions += [
+            RegionDecl("irdy", S, finals("sel")),
+            RegionDecl("icrdy", S, finals("blk")),
+        ]
     for kind in ip.KINDS:
         regions += [
             RegionDecl(f"i{kind}{lv}", S, f"k2a.i{kind}{lv}")
@@ -143,13 +151,19 @@ def k2b_regions(key: MoeBuild) -> list[RegionDecl]:
     intermediate: an exchange), ug, down (pushing the all-reduce's partials),
     reduce. Down by queue units (``RouteShape.down_y``): ug's MID as tagged pairs in
     place of its flags, and down's units putting DY / SDO that its combine
-    polls (an exchange)."""
+    polls (an exchange). Down by unit (``moe.down_by_unit``): ug flags a CTA
+    done (UGC) and every down unit a CTA's (DNF), the combine waiting on all."""
     if route_shape(key).down_y:
         handoff = [
             RegionDecl("mid", S, "k2b.ug"),
             RegionDecl("mids", S, "k2b.ug"),
             RegionDecl("dy", S, "k2b.down", exchange=True),
             RegionDecl("sdo", S, "k2b.down", exchange=True),
+        ]
+    elif down_by_unit(route_shape(key)):
+        handoff = [
+            RegionDecl("ugc", S, "k2b.ug"),
+            RegionDecl("dnf", S, "k2b.down", exchange=True),
         ]
     else:
         handoff = [RegionDecl("ugf", S, "k2b.ug")]
@@ -178,6 +192,13 @@ def k2_regions(key: k2.LayerPostBuild) -> list[RegionDecl]:
         # the owner pushes its row to every other rank's XG
         gathered = [
             RegionDecl("xrdy", S, ("k2a.norm", "k2b.gather")),
+            RegionDecl("xg", P, "k2a.norm"),
+        ]
+    elif key.dp_ranks > 1:
+        # DP attention: each rank's norm pushes its own step's rows to every
+        # rank's XG, the MoE's rows of all of them
+        gathered = [
+            RegionDecl("xrdy", S, "k2a.norm"),
             RegionDecl("xg", P, "k2a.norm"),
         ]
     else:
@@ -245,6 +266,16 @@ if __name__ == "__main__":
             check_k2(k2.LayerPostBuild(
                 tokens=s, index_bound_max=65536, index_fp4=True, tok_par=True
             ))  # fmt: skip
+        # DP attention: each rank's attention whole (TP 1), the MoE over the
+        # DP ranks' rows, expert parallel or TP
+        for dp in SUPPORTED_DPA:
+            if s * dp <= MAX_MOE_ROWS:
+                check_k1(k1.AttnPreBuild(tokens=s, tp=1, kv_fp8=True))
+                for ep, moe_tp in ((dp, 1), (1, dp)):
+                    check_k2(k2.LayerPostBuild(
+                        tokens=s, tp=1, ep=ep, moe_tp=moe_tp, index_bound_max=65536,
+                        index_fp4=True, kv_fp8=True,
+                    ))  # fmt: skip
         for ratio in (1, 2):
             for kv_fp8 in (False, True):
                 check_compress(cp.CompressBuild(

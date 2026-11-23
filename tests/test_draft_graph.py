@@ -372,6 +372,25 @@ def test_a_replay_hands_back_a_value_not_the_recordings_own_storage(
     assert got_conf.tolist() != conf.tolist(), "every output, not just the ids"
 
 
+def test_a_replay_hands_back_an_output_the_forward_owns_without_a_copy(
+    req_graph_recordings,
+):
+    """An output outside the pool -- a buffer the forward owns, as the mono
+    draft head's ids and confidences -- is no storage the pool re-issues: a
+    replay hands it back as the eager pass would, copying only the pool's."""
+    ids = torch.full((4, 3), 9, dtype=torch.int32)
+    conf = torch.zeros(4, 3)
+    req_graph_recordings.owned.append(ids)
+    g = _graph(epilogue=lambda out, running_bs, **rows: out, capture_epilogue=True)
+    req_graph_recordings.add(4, (ids, conf))
+
+    got_ids, got_conf = g.run(
+        4, **g.stage(4, {"row": torch.zeros(4, dtype=torch.int32)})
+    )
+    assert got_ids is ids, "the forward's own buffer, not a copy"
+    assert got_conf is not conf and torch.equal(got_conf, conf), "the pool's, copied"
+
+
 def test_the_eager_path_hands_back_what_it_allocated():
     """...and only a replay needs the copy.
 

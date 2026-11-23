@@ -88,6 +88,7 @@ from atom.models.deepseek_v41.mono.kernels.attn_pre import (
     stage_gate,
     stage_norm,
     stage_slice,
+    strided_span,
     tile_rows,
     tile_tasks,
     token_tiles,
@@ -111,6 +112,7 @@ from atom.models.deepseek_v41.mono.kernels.index_score import (
 )
 from atom.models.deepseek_v41.mono.kernels.mx import AMAX_FLOOR
 from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_offsets
+from atom.models.deepseek_v41.mono.kernels.red import acc_sum, acc_word
 from atom.models.deepseek_v41.mono.kernels.token_par import own_count, own_view
 from atom.models.deepseek_v41.mono.kernels.topk import lds_words
 from atom.models.deepseek_v41.mono.sources import SOURCES
@@ -124,7 +126,6 @@ from atom.mono.device.ops import (
     lane_gather,
     launcher,
     ld_i32,
-    row_sum,
     traced,
     xshfl,
 )
@@ -182,10 +183,10 @@ class AttnPostBuild:
     # the pool's rows are MXFP8: QK on FP8 (q quantized by the original path's
     # rule), PV on the rows dequantized (``attention``)
     kv_fp8: bool = False
-    # the regions kept in two copies, one on each I/O die (``numa_plan``), and
-    # the scratch's calibration word that picks a CTA's copy
+    # the regions kept in two copies, one on each I/O die (``numa_plan``); the
+    # scratch's calibration word that picks a CTA's copy is the ``numa_word``
+    # argument, measured at run time
     numa: str = ""
-    numa_word: int = 0
     # the attention's keys include a selection (its first ``index_plan.TOPK``
     # slots, ``attention_plan.selection_slots``); False: window keys alone,
     # every slot the window's (the DSpark draft: window and block)
@@ -256,7 +257,7 @@ ABI = KernelAbi(
         "woa", "woa_s", "wob", "wob_s",
         "res_in", "post_in", "comb_in", "pre_in", "hc_fn", "hc_scale", "hc_base",
         "ffn_w", "res_out", "post_out", "comb_out", "pre_out", "normed",
-        "scratch", "sym", "peers", "rank", "layer", "tl",
+        "scratch", "numa_word", "sym", "peers", "rank", "layer", "tl",
     )
 )  # fmt: skip
 
@@ -368,13 +369,14 @@ def irq_slice(c, t, tile, hg, sl, mh, rope):
 
 @traced
 def load_rows(
-    c, words_mb, codes_mb, stride_w, off_w, words, stride_g, off_g, groups, xl, xsl,
+    c, words_mb, codes_mb, stride_w, words, stride_g, groups, part, xl, xsl,
     t0=0, n=None,
 ):  # fmt: skip
-    """Tokens t0 .. t0 + n's (every token's by default) slice ``[off, off +
-    words)`` of a mailbox of rows ``stride`` words apart (and its codes), into
-    LDS rows at the ``lds_row`` stride. ``n`` traced (a tile a CTA picks at run
-    time): a TILE-row copy of which only n rows are polled."""
+    """Tokens t0 .. t0 + n's (every token's by default) part ``part`` (words
+    ``[part words, (part + 1) words)``) of a mailbox of rows ``stride`` words
+    apart (and its codes), into LDS rows at the ``lds_row`` stride. ``n``
+    traced (a tile a CTA picks at run time): a TILE-row copy of which only n
+    rows are polled."""
     n = c["S"] if n is None else n
     rows = n if isinstance(n, int) else TILE
     poll_copy(
@@ -384,14 +386,14 @@ def load_rows(
         [
             (
                 words_mb,
-                lambda u: plus(t0, u // words) * stride_w + off_w + u % words,
+                strided_span(t0, stride_w, part, words, words),
                 rows * words,
                 xl,
                 words,
             ),
             (
                 codes_mb,
-                lambda u: plus(t0, u // groups) * stride_g + off_g + u % groups,
+                strided_span(t0, stride_g, part, groups, groups),
                 rows * groups,
                 xsl,
                 groups,
@@ -421,7 +423,7 @@ def stage_woa(c, task, ops, t0=0, n=None):
     row = tid % WOA_ROWS
     tile = row // ROWS
     y = fx.Float32(
-        row_sum(red, row % ROWS, tl, [tile * split + w for w in range(split)]).to(
+        acc_sum(red, row % ROWS, tl, [tile * split + w for w in range(split)]).to(
             fx.BFloat16
         )
     )
@@ -451,9 +453,8 @@ def woa_tile(c, task, ops, t0, n):
     d = c["d"]
     g = task // (d.woa_tasks // d.groups)
     load_rows(
-        c, c["xo"], c["xos"], d.xo_words, g * d.group_k // 4, d.group_k // 4,
-        d.heads * HEAD_DIM // 32, g * d.group_k // 32, d.group_k // 32,
-        c["xl"], c["xsl"], t0, n,
+        c, c["xo"], c["xos"], d.xo_words, d.group_k // 4,
+        d.heads * HEAD_DIM // 32, d.group_k // 32, g, c["xl"], c["xsl"], t0, n,
     )  # fmt: skip
     stage_woa(c, task, ops, t0, n)
 
@@ -475,7 +476,7 @@ def wob_loads(c, task, part=0):
         return gemv_fp8_loads(c, a["wob"], a["wob_s"], d.o_rows, task)
     return gemv_fp8_loads(
         c, a["wob"], a["wob_s"], d.wob_k, task,
-        k_row=d.o_rows, st0=part * d.wob_k // 128,
+        k_row=d.o_rows, k0=part * d.wob_k,
     )  # fmt: skip
 
 
@@ -484,8 +485,8 @@ def load_wob_rows(c, part, t0, n):
     into LDS ``xl`` / ``xsl``."""
     d = c["d"]
     load_rows(
-        c, c["x8b"], c["x8bs"], d.yb_words, part * d.wob_k // 4, d.wob_k // 4,
-        d.o_rows // 32, part * d.wob_k // 32, d.wob_k // 32, c["xl"], c["xsl"], t0, n,
+        c, c["x8b"], c["x8bs"], d.yb_words, d.wob_k // 4,
+        d.o_rows // 32, d.wob_k // 32, part, c["xl"], c["xsl"], t0, n,
     )  # fmt: skip
 
 
@@ -557,7 +558,9 @@ def stage_wob_adjacent_pair_tiles(c, pair, tiles):
         reds = [c["red"], c["red"] + WAVES * 64 * 4]
         for j, (t0, n) in enumerate(tiles):
             for i in range_constexpr(2):
-                fx.ptr_store(accs[i][j], reds[i] + (wave * 64 + lane) * 4)
+                fx.ptr_store(
+                    accs[i][j], reds[i] + acc_word(wave, lane // 16, lane % 16)
+                )
             gpu.barrier()
             for i in range_constexpr(2):
                 wob_push(c, tasks[i], t0, n, red=reds[i])
@@ -616,8 +619,8 @@ def wob_push(c, task, t0=0, n=None, part=0, red=None):
         tl = tid // (ROWS // 2)
         t = plus(t0, tl)
         col = task * ROWS + 2 * rp
-        v0 = row_sum(red, 2 * rp, tl)
-        v1 = row_sum(red, 2 * rp + 1, tl)
+        v0 = acc_sum(red, 2 * rp, tl)
+        v1 = acc_sum(red, 2 * rp + 1, tl)
         if const_expr(c["shard_f"]):
             # a sharded seam F: the column's owner only (a reduce-scatter)
             owner = col // (HIDDEN // d.tp)
@@ -724,8 +727,8 @@ def attn_post_smem(s, timeline, bound_max, d, kv_fp8=False) -> dict:
             "xsl": fx.Array[fx.Int32, tile_rows(s) * lds_row(d.group_k // 32), 16],
         },
         "slice": {
-            "rl": fx.Array[fx.Float32, s * k1.KT, 16],
-            "fl": fx.Array[fx.Float32, k1.MIX * k1.KT, 16],
+            "rl": fx.Array[fx.Float32, s * k1.KT_ROW, 16],
+            "fl": fx.Array[fx.Float32, k1.MIX * k1.KT_ROW, 16],
             "pl": fx.Array[fx.Float32, s * k1.COLS, 16],
         },
     }
@@ -767,7 +770,7 @@ def attn_post_context(key, s, lds, mb, bases, layout, scratch, args, rank, sym):
         # a sharded seam F (``layer``): its outputs' every rank's copy (``put_out``)
         "shard_f": False, "fan": {}, "dst": None,
     }  # fmt: skip
-    c.update(region_addrs(scratch, layout, key.numa, key.numa_word))
+    c.update(region_addrs(scratch, layout, key.numa, args["numa_word"]))
     if const_expr(key.tok_par and key.index_bound_max > 0):
         c["irdy"] = preg(sym, c["peer"]["irdy"], "irdy")
     c["sel_lds"] = {
@@ -1042,8 +1045,8 @@ def build_attn_post(key: AttnPostBuild):
         wob: Int64, wob_s: Int64, res_in: Int64, post_in: Int64, comb_in: Int64,
         pre_in: Int64, hc_fn: Int64, hc_scale: Int64, hc_base: Int64, ffn_w: Int64,
         res_out: Int64, post_out: Int64, comb_out: Int64, pre_out: Int64,
-        normed: Int64, scratch: Int64, sym: Int64, peers: Int64, rank: Int32,
-        layer: Int32, tl: Int64,
+        normed: Int64, scratch: Int64, numa_word: Int64, sym: Int64, peers: Int64,
+        rank: Int32, layer: Int32, tl: Int64,
     ):  # fmt: skip
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -1058,6 +1061,7 @@ def build_attn_post(key: AttnPostBuild):
             wob_s, res_in, post_in, comb_in, pre_in, hc_fn, hc_scale, hc_base, ffn_w,
             res_out, post_out, comb_out, pre_out, normed,
         )  # fmt: skip
+        args["numa_word"] = numa_word
         c = attn_post_context(
             key, s, lds, mailbox(layer, scratch, key.diag_off, layout),
             peer_bases(peers, key.tp), layout, scratch, args,
@@ -1085,8 +1089,8 @@ def build_attn_post(key: AttnPostBuild):
         wob: Int64, wob_s: Int64, res_in: Int64, post_in: Int64, comb_in: Int64,
         pre_in: Int64, hc_fn: Int64, hc_scale: Int64, hc_base: Int64, ffn_w: Int64,
         res_out: Int64, post_out: Int64, comb_out: Int64, pre_out: Int64,
-        normed: Int64, scratch: Int64, sym: Int64, peers: Int64, rank: Int32,
-        layer: Int32, tl: Int64, stream: fx.Stream = _CURRENT_STREAM,
+        normed: Int64, scratch: Int64, numa_word: Int64, sym: Int64, peers: Int64,
+        rank: Int32, layer: Int32, tl: Int64, stream: fx.Stream = _CURRENT_STREAM,
     ):  # fmt: skip
         _ = keyed
         attn_post(
@@ -1097,7 +1101,7 @@ def build_attn_post(key: AttnPostBuild):
             ring_off, ring_slots, sink, qk_scale, pos, cos, sin, woa, woa_s, wob,
             wob_s, res_in, post_in, comb_in,
             pre_in, hc_fn, hc_scale, hc_base, ffn_w, res_out, post_out, comb_out,
-            pre_out, normed, scratch, sym, peers, rank, layer, tl,
+            pre_out, normed, scratch, numa_word, sym, peers, rank, layer, tl,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 
     ABI.check(attn_post, launch)

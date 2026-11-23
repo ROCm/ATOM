@@ -98,7 +98,7 @@ import torch
 import triton
 import triton.language as tl
 
-from atom.model_ops.engram.host_memory import device_address
+from atom.model_ops.engram.host_memory import shard_device_address
 from atom.models.deepseek_v41.mono import hi_bridge as ml
 from atom.models.deepseek_v41.mono import hi_plan
 from atom.models.deepseek_v41.mono import hi_weights as hw
@@ -1040,17 +1040,8 @@ def host_shard(host, consts: dict, layer: int, tp: int, rank: int) -> tuple:
     ):
         raise MonoUnsupported(f"Engram layer {layer}: ATOM's host shard rows [{lo}, {hi}) {tuple(tq.shape)} / "
                               f"{tuple(ts.shape)}, the hi runtime's {want} x 256 / 8")  # fmt: skip
-    # the device's addresses of the page-locked host pages (the host pointer is not one: Triton maps it per launch, a
-    # hi pointer table holds what the device dereferences); each shard tensor's storage starts at its page-locked
-    # region's base (``host_memory.pin_rows``)
-    wbase, sbase = tq.untyped_storage().data_ptr(), ts.untyped_storage().data_ptr()
-    return (
-        tq,
-        ts,
-        (lo, hi),
-        device_address(tq.data_ptr(), wbase),
-        device_address(ts.data_ptr(), sbase),
-    )
+    # the device's addresses of the page-locked host pages, which a hi pointer table holds for the device to dereference
+    return tq, ts, (lo, hi), shard_device_address(tq), shard_device_address(ts)
 
 
 def install(model, atom_config, engram_mapping, draft) -> HiLayers | None:
