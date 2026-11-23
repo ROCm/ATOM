@@ -141,6 +141,13 @@ impl BridgeRequest {
         if payload.return_hidden_states {
             return Err("return_hidden_states is not supported by the ATOM engine".to_string());
         }
+        if payload.pd_metadata.is_some() {
+            // A bootstrap room is P/D's; served plainly, its peer waits for
+            // a transfer that never comes.
+            return Err(
+                "P/D bootstrap fields are not supported by the ATOM Rust frontend yet".to_string(),
+            );
+        }
         let stop = match &payload.stop.stop {
             None => Vec::new(),
             Some(StringOrArray::String(s)) => vec![s.clone()],

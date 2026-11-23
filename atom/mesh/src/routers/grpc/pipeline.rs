@@ -40,6 +40,11 @@ pub(crate) struct Pipeline {
     planner: Arc<dyn PdPlanner>,
     engine: Arc<dyn Dispatcher>,
     backend_label: &'static str,
+    /// Whether a chat the router renders has the channel opener its prompt
+    /// ends on read before the reply (`ResponseContext::prompt_opener`).
+    /// The ATOM bridge's, as ATOM's Python server reads it; gRPC routing
+    /// keeps its parsers' own start.
+    reads_prompt_opener: bool,
 }
 
 impl Pipeline {
@@ -52,7 +57,14 @@ impl Pipeline {
             planner,
             engine,
             backend_label,
+            reads_prompt_opener: false,
         }
+    }
+
+    /// Read the opener a rendered prompt ends on (`reads_prompt_opener`).
+    pub(crate) fn reading_prompt_opener(mut self) -> Self {
+        self.reads_prompt_opener = true;
+        self
     }
 }
 
@@ -88,6 +100,7 @@ impl Pipeline {
             planner,
             engine: Arc::new(GrpcEngine::new()),
             backend_label,
+            reads_prompt_opener: false,
         }
     }
 
@@ -124,11 +137,17 @@ impl Pipeline {
             bool_to_static_str(streaming),
         );
 
-        let (mut payload, resp_ctx) =
-            match prepare::prepare_chat_with(req, headers, model_id, &components, rendered) {
-                Ok(t) => t,
-                Err(e) => return self.record_chat_err(&model, start, e),
-            };
+        let (mut payload, resp_ctx) = match prepare::prepare_chat_with(
+            req,
+            headers,
+            model_id,
+            &components,
+            rendered,
+            self.reads_prompt_opener,
+        ) {
+            Ok(t) => t,
+            Err(e) => return self.record_chat_err(&model, start, e),
+        };
         let placement = match self.plan_for(&payload, &resp_ctx).await {
             Ok(p) => p,
             Err(e) => return self.record_chat_err(&model, start, e),

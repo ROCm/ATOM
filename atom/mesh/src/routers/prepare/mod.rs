@@ -65,16 +65,19 @@ pub fn prepare_chat(
     model_id: Option<String>,
     components: &AppContext,
 ) -> Result<(GenerationPayload, ResponseContext), Response> {
-    prepare_chat_with(req, headers, model_id, components, None)
+    prepare_chat_with(req, headers, model_id, components, None, false)
 }
 
-/// `prepare_chat`, taking the prompt as `rendered` when it is given.
+/// `prepare_chat`, taking the prompt as `rendered` when it is given, and,
+/// with `reads_prompt_opener`, naming the opener a prompt it renders ends on
+/// (`ResponseContext::prompt_opener`; a rendered prompt names its own).
 pub fn prepare_chat_with(
     req: Arc<ChatCompletionRequest>,
     headers: Option<HeaderMap>,
     model_id: Option<String>,
     components: &AppContext,
     rendered: Option<RenderedChat>,
+    reads_prompt_opener: bool,
 ) -> Result<(GenerationPayload, ResponseContext), Response> {
     let model_id_str = model_id.as_deref().ok_or_else(|| {
         error!("model_id not set");
@@ -100,7 +103,9 @@ pub fn prepare_chat_with(
                 .encode(&processed.text, false)
                 .map_err(|e| error::internal_error("tokenization_failed", format!("{}", e)))?;
             let token_ids = encoding.token_ids().to_vec();
-            let prompt_opener = response_context::prompt_opener(&processed.text);
+            let prompt_opener = reads_prompt_opener
+                .then(|| response_context::prompt_opener(&processed.text))
+                .flatten();
             (processed, token_ids, prompt_opener)
         }
     };

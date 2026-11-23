@@ -23,15 +23,16 @@ The OpenAI server's per-request work grows with the context: JSON and
 pydantic, the chat template, tokenizing, detokenizing, SSE. It runs on one
 event loop and one GIL (`frontend_workers.py` exists because of it). Moving
 that work to Rust removes the bulk of the frontend's cost while keeping
-everything below the frontend -- DP routing, P/D, structured output, the
-schedulers -- as it is.
+everything below the frontend -- DP routing, back-pressure, the schedulers --
+as it is. What a request carries to it that the bridge does not pass yet (P/D
+transfers, grammars) is refused, not dropped (see Status).
 
 Two ways to do it were weighed:
 
 | | A: Rust -> LLMEngine / CoreManager (this page) | B: Rust -> EngineCore (`engine_v1`) |
 |---|---|---|
 | Python on the data path | one admission per request (`Sequence`, pickle), one output pass per step | none |
-| CoreManager's features (DP router, prefix_spread / share_cache, back-pressure, P/D, PP, multi-node, metrics) | all of them, unchanged | re-implemented in Rust, or refused |
+| CoreManager's features (DP router, prefix_spread / share_cache, session affinity, back-pressure, PP, multi-node, metrics) | all of them, unchanged; P/D's `kv_transfer_params` and structured output are not carried yet (P2, P4) | re-implemented in Rust, or refused |
 | Python changes | a ~200-line adapter | the Core / CoreManager protocol (pickle -> `engine_v1`) |
 | Effect on the OpenAI server | none | it shares the new protocol |
 | Ceiling | the frontend-workers hub's: Python admission and output threads | the EngineCores' |
@@ -88,7 +89,9 @@ the bottleneck.
   router the same choice (`--tool-call-parser`, `--reasoning-parser`, in the
   router's names: `MESH_TOOL_CALL_PARSERS`), unless the launch named one. A
   prompt that ends by opening a channel (`<think>`, K3's think or response)
-  has the parser read that opener first (`ResponseContext.prompt_opener`).
+  has the parser read that opener first (`ResponseContext.prompt_opener`),
+  on this router only (`Pipeline::reading_prompt_opener`): gRPC routing keeps
+  its parsers' own start.
 * **Python templates.** A model whose chat template the router cannot render
   -- a Python message encoder (DeepSeek-V4), or a tokenizer whose template is
   code (Kimi-K3) -- has each chat prompt rendered by `TokenBridge.render_chat`
@@ -147,6 +150,11 @@ mesh's gRPC routing already runs.
 
 Refused with a 400 until they are built: image, video or audio content
 (the engine is handed token ids only, so it would be dropped silently),
+P/D requests (`kv_transfer_params`, or `/generate`'s bootstrap fields: served
+plainly, the peer would wait for a transfer that never comes), a chat whose
+tool calls the OpenAI server would hold to their schemas (Kimi-K3's
+tool-call grammar, with `ATOM_TOOL_CALL_GRAMMAR` and the structured-output
+extras; unconstrained, K3 can copy an empty call out of its history),
 streaming with `n > 1`, logprobs,
 `stop_token_ids`, structured output (`response_format` `json_object` /
 `json_schema`, `regex`, `ebnf`, `json_schema`), `return_hidden_states`, and
@@ -165,18 +173,21 @@ required, multi-turn tool calls with `reasoning_content`) match on
 DeepSeek-V4.1-Flash, DeepSeek-V4-Flash and Kimi-K3. These models still need
 a GPU run: V4.1 on gfx942 needs the FP4PTPC checkpoint.
 
-Tests: `events.rs` checks a request's steps becoming its `TokenChunk`
-stream, siblings in index order, and the abort on either side of the
-submit; `reasoning/kimi_k3.rs` the K3 channels; the rest end to end on a GPU.
+Tests: `tests/entrypoints/test_token_bridge.py` (admission, submit, the
+per-step push, abort, a lost step, the rendered prompt's encoding, session
+affinity, the K3 tool-call refusal); `events.rs` (a request's steps as its
+`TokenChunk` stream, siblings in index order, the abort on either side of the
+submit, the finish-reason mapping); `reasoning/kimi_k3.rs` (the K3 channels);
+`render/chat_aggregator.rs` (`split_reasoning`); the rest end to end on a GPU.
 
 ### Not yet
 
 | Phase | Work |
 |---|---|
 | P1 | `/health` and `/metrics` with the engine's state and series (`get_metrics_statistics`, same metric names); `/start_profile`, `/stop_profile`, `/debug/mtp_stats`, `/debug/cache_stats` through the bridge; wait for the tokenizer before reporting ready; `ttft_s` / `tpot_s` / `latency_s` in a completion's `usage` (its render is the generate one, re-wrapped); ATOM's reasoning controls as `_chat_completions` resolves them (`thinking`, `reasoning_effort`) |
-| P2 | logprobs and streaming `n > 1` (the streamed chat render writes one choice); structured output (`json_schema` to `SamplingParams`); OpenAI error bodies as the OpenAI server writes them; batching submits (one GIL entry for many requests) if admission shows up in profiles |
+| P2 | logprobs and streaming `n > 1` (the streamed chat render writes one choice); structured output (`json_schema` to `SamplingParams`), and with it Kimi-K3's tool-call grammar (`configure_tool_call_grammar` -> `SamplingParams.structured_tool_format`), refused until then; OpenAI error bodies as the OpenAI server writes them; batching submits (one GIL entry for many requests) if admission shows up in profiles |
 | P3 | `/v1/messages` (Anthropic), `/v1/responses` checked against the OpenAI server, FIM and prefix completion |
-| P4 | multimodal (images to `preprocess_fanout(multimodal_data=...)`), `kv_transfer_params` for P/D |
+| P4 | multimodal (images to `preprocess_fanout(multimodal_data=...)`), `kv_transfer_params` for P/D (refused until then) |
 
 Each model served this way is checked against the OpenAI server: the prompt
 tokens (`atom/mesh/scripts/atom_token_parity.py`, #3596), the SSE and JSON of
@@ -189,6 +200,11 @@ every endpoint, GSM8K, and a concurrency sweep.
   ones; a model whose template or parser differs between the two can render
   or parse differently.
 * Streaming with `n > 1` is refused; the Python service streamed it.
+* P/D requests are refused (P4): neither frontend carried `kv_transfer_params`;
+  the Python service served them as plain requests.
+* With `ATOM_TOOL_CALL_GRAMMAR`, a Kimi-K3 chat with tools is refused (P2):
+  the OpenAI server holds its calls to their schemas, the Python service did
+  not.
 * `/v1/completions` requires `model` in the body, as the mesh's typed
   request does.
 * `thinking` / `reasoning_effort` reach only a model whose prompt ATOM

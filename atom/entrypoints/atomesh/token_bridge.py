@@ -33,7 +33,7 @@ import time
 from collections import OrderedDict
 from typing import Any
 
-from atom import SamplingParams
+from atom import SamplingParams, structured_output
 from atom.entrypoints.openai.api_server import (
     _coerce_n,
     _validate_context_length,
@@ -75,6 +75,7 @@ from atom.entrypoints.openai.tool_parser.registry import (
     template_keeps_tool_call_arguments,
 )
 from atom.model_engine.segment_tokenizer import PrefixEncoding
+from atom.structured_output.validation import tool_call_grammar_format
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -211,12 +212,10 @@ class TokenBridge:
         # What `tool_choice: "required"` holds a chat's output to, as the
         # Python standalone service derives it: the tool-call channel of the
         # model's format, where the format defines one (Kimi-K3's).
-        self._required_channel = required_call_channel(
-            resolve_tool_call_parser(
-                tool_call_parser, tokenizer, self._renderer.encoder, model=model
-            ),
-            tokenizer,
+        self._tool_parser_cls = resolve_tool_call_parser(
+            tool_call_parser, tokenizer, self._renderer.encoder, model=model
         )
+        self._required_channel = required_call_channel(self._tool_parser_cls, tokenizer)
         config = getattr(engine, "config", None)
         self._max_model_len = getattr(config, "max_model_len", None)
         self._output_limit = deployment_metadata(config, None).get("max_output_tokens")
@@ -290,7 +289,9 @@ class TokenBridge:
         the ids (extended turn by turn in a session); ``submit`` hands it to
         ``preprocess_fanout`` so the prompt is not hashed a second time.
         """
-        prompt, opener = self._renderer.render(json.loads(request_json))
+        request = json.loads(request_json)
+        prompt, opener = self._renderer.render(request)
+        self._refuse_unheld_tool_calls(request, opener)
         encoded = self.engine.io_processor.encode_prompt(prompt)
         if not isinstance(encoded, PrefixEncoding):
             return prompt, list(encoded), opener, None
@@ -306,6 +307,34 @@ class TokenBridge:
             ):
                 rendered.popitem(last=False)
         return prompt, list(encoded.token_ids), opener, handle
+
+    def _refuse_unheld_tool_calls(self, request: dict[str, Any], opener) -> None:
+        """Refuse a chat whose tool calls the OpenAI server would hold to their
+        schemas, as `configure_tool_call_grammar` decides it (Kimi-K3's, with
+        ATOM_TOOL_CALL_GRAMMAR and the structured-output extras): the bridge
+        does not carry that grammar yet, and unconstrained, K3 can copy an
+        empty call out of its history. A schema the server would leave
+        unconstrained is not refused."""
+        tools = request.get("tools")
+        if not tools or self._tool_parser_cls is None:
+            return
+        if not envs.ATOM_TOOL_CALL_GRAMMAR or not structured_output.available():
+            return
+        starts_open = (
+            opener is not None and opener == self._renderer.dialect.prompt_open_marker
+        )
+        try:
+            fmt = tool_call_grammar_format(
+                self._tool_parser_cls, tools, request.get("tool_choice"), starts_open
+            )
+        except ValueError:
+            return
+        if fmt is not None:
+            raise ValueError(
+                "tool calls held to their schemas (ATOM_TOOL_CALL_GRAMMAR) are not "
+                "supported by the ATOM Rust frontend yet; use the OpenAI server "
+                "(USE_ATOMESH_ENTRYPOINTS=0)"
+            )
 
     def _rendered_encoding(
         self, handle: int | None, token_ids: list[int]

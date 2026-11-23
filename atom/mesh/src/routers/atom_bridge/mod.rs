@@ -8,7 +8,7 @@
 //! EngineCores directly can take `BridgeDispatcher`'s place.
 //!
 //! Python starts it from `atom/entrypoints/atomesh/server.py` with
-//! `--frontend rust`; see `docs/atomesh_rust_frontend.md`.
+//! `USE_ATOMESH_ENTRYPOINTS=1`; see `docs/atomesh_rust_frontend.md`.
 
 pub(crate) mod events;
 pub mod py_bridge;
@@ -103,7 +103,11 @@ impl AtomBridgeRuntime {
 
 /// The keys `RequestExtras::read` looks for, as they appear in a JSON body:
 /// a body naming none of them is not parsed again.
-const RAW_KEYS: [&[u8]; 2] = [b"\"data_parallel_rank\"", b"\"thinking\""];
+const RAW_KEYS: [&[u8]; 3] = [
+    b"\"data_parallel_rank\"",
+    b"\"thinking\"",
+    b"\"kv_transfer_params\"",
+];
 
 tokio::task_local! {
     /// What a request carries besides its typed body, for the dispatcher.
@@ -158,22 +162,38 @@ impl RequestExtras {
     }
 
     fn read(request: &InferenceEnvelope) -> Result<Self, Response> {
-        let raw = match &request.parsed {
-            ParsedInference::Generate(body) => {
-                return Ok(Self {
-                    data_parallel_rank: body.data_parallel_rank.map(i64::from),
-                    ..Self::default()
-                });
-            }
-            _ if !RAW_KEYS
-                .iter()
-                .any(|key| memchr::memmem::find(&request.body, key).is_some()) =>
-            {
-                return Ok(Self::default());
-            }
-            _ => serde_json::from_slice::<Map<String, Value>>(&request.body)
-                .map_err(|e| error::bad_request("invalid_request", e.to_string()))?,
+        let typed_rank = match &request.parsed {
+            ParsedInference::Generate(body) => body.data_parallel_rank.map(i64::from),
+            _ => None,
         };
+        if !RAW_KEYS
+            .iter()
+            .any(|key| memchr::memmem::find(&request.body, key).is_some())
+        {
+            return Ok(Self {
+                data_parallel_rank: typed_rank,
+                ..Self::default()
+            });
+        }
+        let raw = serde_json::from_slice::<Map<String, Value>>(&request.body)
+            .map_err(|e| error::bad_request("invalid_request", e.to_string()))?;
+        // P/D's transfer is not carried to the engine: served as a plain
+        // request, a prefill would hand its decode nothing to resume from.
+        if raw.get("kv_transfer_params").is_some_and(|v| !v.is_null()) {
+            return Err(error::bad_request(
+                "pd_unsupported",
+                "kv_transfer_params (P/D) is not supported by the ATOM Rust frontend yet; \
+                 serve P/D workers with the OpenAI server (USE_ATOMESH_ENTRYPOINTS=0)",
+            ));
+        }
+        if typed_rank.is_some() {
+            let thinking = raw.get("thinking").filter(|v| !v.is_null()).cloned();
+            return Ok(Self {
+                data_parallel_rank: typed_rank,
+                thinking,
+                ..Self::default()
+            });
+        }
         let data_parallel_rank = match raw.get("data_parallel_rank") {
             None | Some(Value::Null) => None,
             Some(Value::Number(n)) if n.as_i64().is_some_and(|r| r >= 0) => n.as_i64(),
@@ -231,7 +251,8 @@ impl AtomBridgeRouter {
                 Arc::clone(&runtime.registry),
             )),
             metrics_labels::BACKEND_REGULAR,
-        );
+        )
+        .reading_prompt_opener();
         Ok(Self {
             runtime,
             pipeline,
@@ -262,7 +283,7 @@ fn structured_output_refused() -> Response {
     error::bad_request(
         "structured_output_unsupported",
         "response_format, json_schema, regex and ebnf are not supported by the ATOM Rust \
-         frontend yet; use --frontend python",
+         frontend yet; use the OpenAI server (USE_ATOMESH_ENTRYPOINTS=0)",
     )
 }
 

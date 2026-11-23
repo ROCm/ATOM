@@ -72,7 +72,8 @@ pub struct AppContext {
     pub workflow_engines: Arc<OnceLock<WorkflowEngines>>,
     pub worker_service: Arc<WorkerService>,
     pub inflight_tracker: Arc<InFlightRequestTracker>,
-    /// ATOM standalone with the OpenAI API served by Rust (`--frontend rust`).
+    /// ATOM standalone (`USE_ATOMESH_ENTRYPOINTS=1`): the OpenAI API served by
+    /// Rust down to LLMEngine.
     pub atom_bridge_runtime: Option<Arc<AtomBridgeRuntime>>,
     /// Set with `kv_events` in the router config.
     pub kv_event_monitor: Option<Arc<KvEventMonitor>>,
