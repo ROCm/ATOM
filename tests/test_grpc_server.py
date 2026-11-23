@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 from argparse import Namespace
+from collections import deque
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -377,7 +378,7 @@ def test_the_session_refuses_logprobs_it_would_not_serve(serve):
 def test_a_session_grammar_failure_is_rejected_as_internal(serve):
     engine = FakeEngine()
     session = serve(engine).sessions.open()
-    seq = SimpleNamespace(id=session.base | 1, num_prompt_tokens=2, arrive_time=0.0)
+    seq = SimpleNamespace(id=session.seq_id(1), num_prompt_tokens=2, arrive_time=0.0)
     engine.io_processor.requests[seq.id] = seq
     session.add(1, seq, "r")
     session.put(RequestOutput(seq.id, [], True, "structured_output_error"))
@@ -467,6 +468,28 @@ def test_a_submission_cancelled_once_it_reached_the_engine_holds_its_window(
     assert asyncio.run(cancel_then_resubmit()) is None
     assert engine.aborted and engine.io_processor.requests == {}
     assert sessions.open().window == window
+
+
+def test_engine_ids_are_not_reused_by_a_client_seq_id_or_a_windows_next_session(
+    serve,
+):
+    # CoreManager's finished-seq message may still name a completed request's id
+    # after the client reads its Completions and sends its seq_id again.
+    engine = FakeEngine([([5], "eos")])
+    servicer = serve(engine)
+    sessions = servicer.sessions
+    sessions.free = deque([sessions.free[0]])  # one window, for both Sessions
+
+    async def submit_seq_id_1_twice(session):
+        for _ in range(2):
+            await servicer._submit(session, _submit())
+            await _until(lambda: not session.requests)
+        session.close()
+
+    asyncio.run(submit_seq_id_1_twice(sessions.open()))
+    asyncio.run(submit_seq_id_1_twice(sessions.open()))
+    engine_ids = [seq.id for seq in engine.submitted]
+    assert len(set(engine_ids)) == 4
 
 
 def test_a_session_admits_a_prompt_only_in_kv_transfer_params(serve):
