@@ -143,7 +143,7 @@ from atom.mono.device.ops import (
     uniform,
 )
 from atom.mono.device.ranks import peer_bases, sum_partials
-from atom.mono.device.select import KEY_LEAST, f32_key
+from atom.mono.device.select import KEY_LEAST, f32_key, wave_max_key
 from atom.mono.device.stamps import stamp, stamp_begin, stamp_flush
 from atom.mono.device.sync import Quad, preg, publish
 from atom.mono.plan.build_key import key_tuple
@@ -527,45 +527,43 @@ def stage_route(c, t):
     gpu.barrier()
     if wave == 0:
         ept = experts // 64
-        # integer order keys: an integer max takes its DPP operand in
-        # the one instruction, the f32 maximum needs a DPP move before it
+        # a lane's keys sorted with their experts only: each winner's
+        # unbiased score is read back from LDS by its expert at the end
         vals = [f32_key(fx.ptr_load(red + (lane + 64 * i))) for i in range(ept)]
-        orig = [fx.ptr_load(red + (experts + lane + 64 * i)) for i in range(ept)]
         idxs = [fx.Int32(lane + 64 * i) for i in range(ept)]
         for p, q in c["rs"].sort_net:
             sw = vals[p] < vals[q]
             vals[p], vals[q] = sw.select(vals[q], vals[p]), sw.select(vals[p], vals[q])
-            orig[p], orig[q] = sw.select(orig[q], orig[p]), sw.select(orig[p], orig[q])
             idxs[p], idxs[q] = sw.select(idxs[q], idxs[p]), sw.select(idxs[p], idxs[q])
-        # round k's winner (expert, unbiased score) read off the winning lane
-        # (the lowest lane holding the wave's max), which then pops its head:
-        # a round reads every lane's head only.
+        # round k's winner read off the winning lane (the lowest lane holding
+        # the wave's max), which then pops its head: a round reads every
+        # lane's head only.
         # A lane whose list runs out (ept < topk: the draft's 2 a lane, top 3)
         # takes KEY_LEAST, below every score's key: 64 ept >= topk, so a live
         # entry wins every round
         assert 64 * ept >= topk
-        ids, ws = [], []
+        ids = []
         for k in range_constexpr(topk):
-            best = butterfly(vals[0], (32, 16, 8, 4, 2, 1), fx.max)
+            best = wave_max_key(vals[0])
             win = fx.Int32(fmath.cttz(ballot(vals[0] == best)))
             ids.append(readlane(idxs[0], win))
-            ws.append(readlane(orig[0], win))
             popped = lane == win
             # only the entries a later round can still reach
             reach = min(ept, topk - k)
             for j in range_constexpr(reach - 1):
                 vals[j] = popped.select(vals[j + 1], vals[j])
                 idxs[j] = popped.select(idxs[j + 1], idxs[j])
-                orig[j] = popped.select(orig[j + 1], orig[j])
             if const_expr(reach == ept):
                 vals[ept - 1] = popped.select(fx.Int32(KEY_LEAST), vals[ept - 1])
+        my_id = ids[0]
+        for k in range_constexpr(1, topk):
+            my_id = (lane == k).select(ids[k], my_id)
+        # lane k's winner's unbiased score (``route_scores``' LDS, NaN as 0),
+        # the k winners' summed in top-k order
+        my_w = fx.Float32(fx.ptr_load(red + (experts + my_id)))
         total = fx.Float32(0.0)
         for k in range_constexpr(topk):
-            total = total + ws[k]
-        my_id, my_w = ids[0], ws[0]
-        for k in range_constexpr(1, topk):
-            mine = lane == k
-            my_id, my_w = mine.select(ids[k], my_id), mine.select(ws[k], my_w)
+            total = total + readlane(my_w, k)
         scale = fx.Float32(SCALE) / fx.max(total, fx.Float32(1e-20))
         if lane < topk:
             # token t of the routed rows is the step's row ``route_t0`` + t
@@ -1642,13 +1640,15 @@ def down_y_unit_blocks(d) -> int:
 
 
 @traced
-def run_down_y(c, tasks):
+def run_down_y(c, tasks, unit):
     """Down by queue units (``RouteShape.down_y``): every unit from the
     launch's queue (DNQ) -- each slot's (slot, hidden block) units
     (``down_y_unit``) and the shared expert's (``shared_down_unit``), in
-    ``down_y_next``'s order -- by the CTAs as they reach down, so a CTA whose
-    ug ended last finds the queue empty; then the combine of this CTA's
-    ``tasks`` (``down_y_combine``)."""
+    ``down_y_run``'s order -- by the CTAs as they reach down, so a CTA whose
+    ug ended last finds the queue empty, from ``unit`` (this CTA's first take,
+    ``take_down_rank_unit``); then the combine of this CTA's ``tasks``
+    (``down_y_combine``). A unit's next is taken after it: one taken ahead let
+    the first CTAs to arrive claim two units each and the last none (+6%)."""
     blocks = down_y_unit_blocks(c["d"])
     rs, tab = c["rs"], c["tab"]
     # a slot's units, or past one token tile a pick tile's
@@ -1657,32 +1657,31 @@ def run_down_y(c, tasks):
     shared = shared_down_units(rs)
     total = routed + shared
     sl = c["wsl"] + c["wave"] * down_wsl_words(c["d"])
-    unit = fx.Int32(-1)
+    unit = fx.Int32(unit)
     while unit < total:
-        unit = down_y_next(c, unit, sl, routed, shared)
+        down_y_run(c, unit, sl, routed, shared)
+        unit = take_down_unit(c)
     for pas in range_constexpr(0, len(tasks) * c["S"] * (ROWS // 2), THREADS):
         down_y_combine(c, tasks, plus(pas, c["tid"]))
     gpu.barrier()
 
 
 @traced
-def down_y_next(c, unit, sl, routed, shared):
-    """Unit ``unit`` of ``run_down_y`` (-1: none yet), then the queue's next:
-    with wide shared units (``shared_down_wide``) the shared expert's
-    ``shared`` first (from the CTAs that reach down first, while the slots'
-    MID is still being written), then the slots' ``routed``; else the slots'
-    first."""
+def down_y_run(c, unit, sl, routed, shared):
+    """Unit ``unit`` of ``run_down_y``: with wide shared units
+    (``shared_down_wide``) the shared expert's ``shared`` first (from the CTAs
+    that reach down first, while the slots' MID is still being written), then
+    the slots' ``routed``; else the slots' first."""
     if const_expr(shared_down_wide(c["rs"])):
-        if (unit >= 0) & (unit < shared):
+        if unit < shared:
             shared_down_unit(c, unit)
         if unit >= shared:
             down_y_unit(c, unit - shared, sl)
     else:
-        if (unit >= 0) & (unit < routed):
+        if unit < routed:
             down_y_unit(c, unit, sl)
         if unit >= routed:
             shared_down_unit(c, unit - routed)
-    return take_down_unit(c)
 
 
 @traced
@@ -2033,6 +2032,29 @@ def take_down_rank(c):
     CTAs take the extra tiles. A tile's result is the same whichever CTA
     computes it."""
     return take_launch_queue(c, "dq")
+
+
+@traced
+def take_down_rank_unit(c):
+    """``take_down_rank`` and the first ``take_down_unit`` (``run_down_y``) in
+    one round trip: thread 0's two atomics back to back, both handed over in
+    one LDS word (rank | unit << 16). Their words' addresses go through an
+    opaque move: on a uniform address LLVM's atomic optimizer reads each
+    result back at once, two round trips in series."""
+    slot = c["tab"] + c["rs"].queue0
+    gpu.barrier()
+    if c["tid"] == 0:
+        base = c["args"]["queue_words"] + fx.Int64(fresh(fx.Int32(0)))
+        rank = fx.Int32(
+            queue.take(queue.word(base + fx.Int64(QUEUES.index("dq") * QUEUE_REGION)))
+        )
+        unit = fx.Int32(
+            queue.take(queue.word(base + fx.Int64(QUEUES.index("dnq") * QUEUE_REGION)))
+        )
+        fx.ptr_store((rank & fx.Int32(0xFFFF)) | (unit << fx.Int32(16)), slot)
+    gpu.barrier()
+    v = fx.Int32(fx.ptr_load(slot))
+    return v & fx.Int32(0xFFFF), v >> fx.Int32(16)
 
 
 def down_weights(c, tasks, rnd, slots, nu, st0=0, nst=None):
@@ -2588,14 +2610,17 @@ def run_moe(c, key, bid, tls, tl0, before_ug=None):
     # one too: the CTAs whose ug ended first (by bid, those ending last held
     # two tiles and ended the stage)
     down_task = first_task(bid, DOWN0)
-    rank = take_down_rank(c)
+    if const_expr(c["rs"].down_y):
+        rank, unit0 = take_down_rank_unit(c)
+    else:
+        rank = take_down_rank(c)
     has_second = rank < DOWN_TASKS - BLOCKS
     by_unit = down_by_unit(c["rs"])
     if const_expr(c["rs"].down_y):
         # the combine's second task: live for the first arrivals only
         cy = dict(c)
         cy["second_live"] = has_second
-        run_down_y(cy, [down_task, has_second.select(BLOCKS + rank, down_task)])
+        run_down_y(cy, [down_task, has_second.select(BLOCKS + rank, down_task)], unit0)
     elif const_expr(by_unit):
         # the down stamp at the units' end: the combine is timed in the reduce
         second = has_second.select(BLOCKS + rank, down_task)
