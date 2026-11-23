@@ -1508,7 +1508,7 @@ mod h_prepare_chat_generate {
 
         let refused = prepare_chat(chat_req(false), None, Some("m".into()), &components);
         let status = refused.err().expect("a chat it cannot render").status();
-        assert_eq!(status, axum::http::StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(status, http::StatusCode::NOT_IMPLEMENTED);
     }
 
     #[test]
