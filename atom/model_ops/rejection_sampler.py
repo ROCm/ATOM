@@ -124,6 +124,12 @@ class RejectionSampler(nn.Module):
         self._ratio_scratch = None
         self._ratio_logits_dtype = None
 
+    def ids_only_ok(self) -> bool:
+        """Whether a greedy verify needs nothing of the target but its argmax
+        ids: exact match and the synthetic curve do; relaxed acceptance reads
+        probabilities, and the ratio verify the logits."""
+        return self.synthetic_acceptance_rates is not None or RELAXED_TOP_N <= 1
+
     def arm_ratio(
         self,
         max_bs: int,
@@ -167,11 +173,16 @@ class RejectionSampler(nn.Module):
         # The drafter's probability-ratio inputs (`DSparkLossless.verify_inputs`);
         # None selects exact match.
         ratio: RatioVerifyInputs | None = None,
+        # The target's argmax of every row of the step (`rejection_sample`).
+        row_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Ensure target_logits is contiguous. For greedy sampling, we can use
         # logits directly (argmax is the same for logits and probs), but we
         # need to ensure it's contiguous to satisfy the assertion in rejection_sample.
-        target_logits = target_logits.contiguous()
+        # None: the caller already holds the target's greedy pick of every
+        # verification row (`target_token_ids`), see `ids_only_ok`.
+        if target_logits is not None:
+            target_logits = target_logits.contiguous()
         if ratio is not None:
             if target_logits.dtype != self._ratio_logits_dtype:
                 # The kernels were compiled for another logits dtype (or not at
@@ -198,6 +209,7 @@ class RejectionSampler(nn.Module):
             synthetic_acceptance_rates=self.synthetic_acceptance_rates,
             synthetic_step=self._synthetic_step,
             target_token_ids=target_token_ids,
+            row_ids=row_ids,
         )
         if self.synthetic_acceptance_rates is not None:
             self._synthetic_step += 1
@@ -229,19 +241,44 @@ def rejection_sample(
     # Per-step seed for the (rank-consistent) synthetic RNG; ignored otherwise.
     synthetic_step: int = 0,
     target_token_ids: torch.Tensor | None = None,
+    # [rows of the step's logits] the target's argmax of EVERY row, in place of
+    # `target_logits`, `target_token_ids` and `bonus_token_ids`: the accept
+    # kernel reads its rows through the two index lists it is given anyway.
+    row_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert input_ids.ndim == 1 and target_logits_indices.ndim == 1
     assert cu_num_draft_tokens.ndim == 1
-    assert target_logits.ndim == 2
 
     batch_size = len(cu_num_draft_tokens)
     num_tokens = target_logits_indices.shape[0]
-    vocab_size = target_logits.shape[-1]
-    device = target_logits.device
     assert input_ids.is_contiguous() and target_logits_indices.is_contiguous()
-    assert target_logits.is_contiguous()
-    assert bonus_token_ids.is_contiguous()
-    assert target_logits.shape == (num_tokens, vocab_size)
+    # Ids only (dspark_options.verify_argmax_once): the target's argmax, made by
+    # the caller from one reduction over the step's logits -- of every row of
+    # the step (`row_ids`), or gathered to the verification rows
+    # (`target_token_ids`, with the bonus ids beside it).
+    ids_only = target_logits is None
+    if row_ids is not None:
+        if not ids_only or target_token_ids is not None or bonus_token_ids is not None:
+            raise ValueError("row_ids replaces the logits and both id lists")
+        if row_ids.ndim != 1 or row_ids.dtype != torch.int32:
+            raise ValueError("row_ids is the step's [rows] int32 argmax")
+        row_ids = row_ids.contiguous()
+    else:
+        assert bonus_token_ids.is_contiguous()
+    if ids_only:
+        if (
+            (target_token_ids is None and row_ids is None)
+            or ratio is not None
+            or (synthetic_acceptance_rates is None and RELAXED_TOP_N > 1)
+        ):
+            raise ValueError("An ids-only verify needs the target's greedy ids")
+        device = (row_ids if row_ids is not None else target_token_ids).device
+    else:
+        assert target_logits.ndim == 2
+        vocab_size = target_logits.shape[-1]
+        device = target_logits.device
+        assert target_logits.is_contiguous()
+        assert target_logits.shape == (num_tokens, vocab_size)
     if target_token_ids is not None:
         if target_token_ids.shape != target_logits_indices.shape:
             raise ValueError("Sampled target IDs must cover every verification row")
@@ -276,8 +313,11 @@ def rejection_sample(
         # target argmax as the correction token and stop (same output layout /
         # num_bonus_tokens semantics as the greedy path).
         cond_rates = _get_synthetic_cond_rates(synthetic_acceptance_rates, device)
-        _, target_argmax = topk_select(target_logits, 1, tie="low")
-        target_argmax = target_argmax.view(-1)
+        if ids_only:
+            target_argmax = target_token_ids
+        else:
+            _, target_argmax = topk_select(target_logits, 1, tie="low")
+            target_argmax = target_argmax.view(-1)
         # Rank-consistent uniforms: a dedicated device generator re-seeded from the
         # step counter draws the same Philox stream on every TP rank / GPU, so the
         # accept/reject pattern — and hence num_bonus_tokens — matches the
@@ -301,12 +341,13 @@ def rejection_sample(
             cu_num_draft_tokens,
             input_ids,
             target_logits_indices,
-            target_argmax,
-            bonus_token_ids,
+            row_ids if row_ids is not None else target_argmax,
+            row_ids if row_ids is not None else bonus_token_ids,
             bonus_logits_indices,
             uniform,
             cond_rates,
             num_spec_steps,
+            BY_ROW=row_ids is not None,
             num_warps=1,
         )
     elif ratio is not None:
@@ -329,12 +370,14 @@ def rejection_sample(
             bonus_logits_indices,
             num_spec_steps,
         )
-    elif target_token_ids is not None or RELAXED_TOP_N <= 1:
+    elif target_token_ids is not None or row_ids is not None or RELAXED_TOP_N <= 1:
         # Match the actual target draw for stochastic requests; greedy requests
         # take the target argmax and must match it exactly. The prefix kernel
         # needs only token IDs. `topk_select`, not `.argmax`: the tie rule
         # above is what keeps the accept/reject pattern equal across TP ranks.
-        if target_token_ids is None:
+        if row_ids is not None:
+            target_argmax = bonus_token_ids = row_ids
+        elif target_token_ids is None:
             _, target_argmax = topk_select(target_logits, 1, tie="low")
             target_argmax = target_argmax.view(-1)
         else:
@@ -349,6 +392,7 @@ def rejection_sample(
             bonus_token_ids,
             bonus_logits_indices,
             num_spec_steps,
+            BY_ROW=row_ids is not None,
             num_warps=1,
         )
     else:
@@ -399,10 +443,11 @@ def rejection_greedy_sample_kernel(
     cu_num_draft_tokens_ptr,  # [batch_size]
     input_ids_ptr,  # the step's input ids
     target_logits_indices_ptr,  # [num_tokens]
-    target_argmax_ptr,  # [num_tokens]
-    bonus_token_ids_ptr,  # [batch_size]
+    target_argmax_ptr,  # [num_tokens]; BY_ROW: [rows], the step's per-row argmax
+    bonus_token_ids_ptr,  # [batch_size]; BY_ROW: the same [rows] tensor
     bonus_logits_indices_ptr,  # [batch_size]
     num_spec_steps,
+    BY_ROW: tl.constexpr = False,
 ):
     req_idx = tl.program_id(0)
 
@@ -423,7 +468,13 @@ def rejection_greedy_sample_kernel(
             draft_token_id = _draft_token(
                 input_ids_ptr, target_logits_indices_ptr, start_idx + pos
             )
-            target_argmax_id = tl.load(target_argmax_ptr + start_idx + pos)
+            if BY_ROW:
+                target_argmax_id = tl.load(
+                    target_argmax_ptr
+                    + tl.load(target_logits_indices_ptr + start_idx + pos)
+                )
+            else:
+                target_argmax_id = tl.load(target_argmax_ptr + start_idx + pos)
             target_argmax_id = tl.cast(target_argmax_id, tl.int32)
             if draft_token_id != target_argmax_id:
                 # rejected = False
@@ -444,6 +495,7 @@ def rejection_greedy_sample_kernel(
         num_bonus_token,
         rejected,
         num_spec_steps,
+        BY_ROW,
     )
 
 
@@ -460,6 +512,7 @@ def rejection_synthetic_sample_kernel(
     uniform_ptr,  # [num_tokens] — per-position U(0, 1) samples
     cond_rates_ptr,  # [num_spec_steps] — P(accept pos | accepted through pos-1)
     num_spec_steps,
+    BY_ROW: tl.constexpr = False,  # as `rejection_greedy_sample_kernel`
 ):
     req_idx = tl.program_id(0)
 
@@ -487,7 +540,13 @@ def rejection_synthetic_sample_kernel(
                 output_id = tl.cast(output_id, tl.int32)
             else:
                 # Reject: emit the target correction token and stop accepting.
-                output_id = tl.load(target_argmax_ptr + start_idx + pos)
+                if BY_ROW:
+                    output_id = tl.load(
+                        target_argmax_ptr
+                        + tl.load(target_logits_indices_ptr + start_idx + pos)
+                    )
+                else:
+                    output_id = tl.load(target_argmax_ptr + start_idx + pos)
                 output_id = tl.cast(output_id, tl.int32)
                 rejected = True
             num_bonus_token += 1
@@ -506,6 +565,7 @@ def rejection_synthetic_sample_kernel(
         num_bonus_token,
         rejected,
         num_spec_steps,
+        BY_ROW,
     )
 
 

@@ -30,7 +30,7 @@ from aiter.dist.parallel_state import (
 )
 from torch.profiler import record_function
 
-from atom import structured_output
+from atom import plugin_host, plugin_transition, structured_output
 from atom.config import Config, set_current_atom_config
 from atom.distributed.group_agreement import agree_kv_budget, group_min
 from atom.distributed.pcp_utils import (
@@ -73,6 +73,13 @@ from atom.model_engine.output_transfer import D2HQueue
 from atom.model_engine.page_unit_checkpoint import (
     PagedStateCheckpointSpec,
     published_page_unit_bytes,
+)
+from atom.model_engine.plugin_hotplug import (
+    RELOAD_DIGEST_MISMATCH_REASON,
+    RELOAD_UNSUPPORTED_REASON,
+    checked_code_digest,
+    default_capture_rows,
+    rows_to_bs,
 )
 from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import (
@@ -150,6 +157,7 @@ from atom.utils.forward_context import (
     set_kv_cache_data,
 )
 from atom.utils.gc_utils import freeze_gc_heap
+from atom.utils.graph_holders import release_registered_graphs
 from atom.utils.h2d import h2d_producer
 from atom.utils.region_graph import ReqGraph, TokenGraph
 from atom.utils.selector import attn_family, get_attn_backend, has_mla_indexer
@@ -920,6 +928,19 @@ class ModelRunner:
             dtype=np.int64,
         )
 
+        # Before the build: seams bind at construction, and capture freezes them.
+        # A hot-plug boot binds every seam (not just the planned owners), so a
+        # later plan can be installed without rebuilding the model. Dev mode
+        # additionally allows a plan install to re-import plugin code from the
+        # allowlisted source trees.
+        plugin_host.configure(
+            config.plugin_source,
+            arm=config.plugin_arm,
+            config=config,
+            hotplug=getattr(config, "plugin_hotplug", False),
+            dev=getattr(config, "plugin_dev", False),
+            dev_roots=getattr(config, "plugin_dev_roots", ()),
+        )
         self.model = get_model(config, self.device, self._build_and_load_model)
         # After weight processing, before warmup and capture. Here rather than in
         # the loader so a runner that builds its model differently still sets it.
@@ -953,6 +974,12 @@ class ModelRunner:
             # NOTE: aux-hidden-state capture is armed AFTER the optional TBO wrap
             # below, so the drafter's capture hook lands on the object whose
             # forward returns the final (concatenated) output. See arm_aux_capture.
+
+        # Whole-module takeover (a recipe's `modules`): after both loads, before
+        # any wrapper, warmup or capture. Nothing happens without planned slots.
+        plugin_host.install_modules(self.model)
+        if getattr(self, "drafter", None) is not None:
+            plugin_host.install_modules(self.drafter.model, prefix="draft")
 
         torch.set_default_device(self.device)
         self.async_execute_stream = torch.cuda.Stream(self.device)
@@ -1003,14 +1030,21 @@ class ModelRunner:
             drafter.arm_aux_capture(self.model)
         self.pp_aux_relay = PPAuxRelay.build(self.config, self.model)
         self._refuse_unrelayed_pp_taps(drafter)
-        installer = mono_decode_installers.get(hf_config.architectures[0])
+        mono_arch = hf_config.architectures[0]
+        installer = mono_decode_installers.get(mono_arch)
+        if plugin_host.model_options().mono_mode == "off":
+            # A recipe's model_options.mono_mode: serve the layer path only.
+            installer = None
         if installer is not None:
-            self.model = resolve_obj_by_qualname(installer)(
-                self.model,
-                config,
-                drafter,
-                metadata_builder=self.attn_metadata_builder,
-            )
+            install = resolve_obj_by_qualname(installer)
+            kwargs = {"metadata_builder": self.attn_metadata_builder}
+            if mono_arch == "DeepseekV41ForCausalLM":
+                # Boot-only seam: a planned plugin may install its own instead.
+                self.model = plugin_host.call(
+                    "v41.mono.install", install, self.model, config, drafter, **kwargs
+                )
+            else:
+                self.model = install(self.model, config, drafter, **kwargs)
         # The installed model's own head output, where it has one: its
         # forward's logits, or a verify's token ids and verdict (`_head_output`).
         self.compute_head = getattr(self.model, "compute_head", None)
@@ -1026,6 +1060,17 @@ class ModelRunner:
         self._init_h2d_publication()
         self.forward_done_event = torch.cuda.Event()
         initialize_eplb_runtime(self)
+        # The boot plan's providers may need to load native code once the device
+        # is up: run their optional prepare(device) now, before warmup and
+        # capture freeze the call sites. A prepare that advertises itself but
+        # fails refuses the start rather than silently serving native.
+        boot_prepare = plugin_host.prepare_plan(self.device)
+        if boot_prepare["prepared"]:
+            logger.info(
+                "%s: plugin providers prepared before warmup: %s",
+                self.label,
+                boot_prepare["native"],
+            )
         self._maybe_warmup()
 
         # Restore the implicit CPU default. An explicit "cpu" leaves a
@@ -3324,7 +3369,9 @@ class ModelRunner:
         (`hidden_states`): the model's own where it gives one
         (`compute_head`: the logits, or a verify's output token ids
         [requests, num_spec_steps + 1] and verdict [3, requests] -- accepted,
-        rejected, anchor row -- as the rejection sampler lays them out, for
+        rejected, anchor row -- as the rejection sampler lays them out,
+        optionally with each request's next id [requests] (its id at the
+        accepted count, which `postprocess` would gather), for
         the forward's requests each verifying the full draft span); else,
         with `logits`, the logits. A decode graph's capture records it
         (`capture_cudagraph`), the logits at TP 1."""
@@ -3364,7 +3411,7 @@ class ModelRunner:
             or get_pcp_world_size() > 1
         ):
             return False
-        tokens, verdict = head
+        tokens, verdict = head[:2]
         bs, steps = batch.total_seqs_num, spec.num_spec_steps
         if (
             tokens.shape[0] < bs
@@ -3438,6 +3485,9 @@ class ModelRunner:
                 logits, batch, spec_decode_metadata, rows=logprob_rows
             )
         constraints = TokenConstraints.apply(self, batch, logits, spec_decode_metadata)
+        # The head output's next ids (each request's id at its accepted
+        # count), where it gives them: the gather below, done in the forward.
+        head_next = head_tokens = None
         if spec_decode_metadata is None:
             # The LM head emitted one row per row the step FORWARDED, which a
             # decode keeps at `running_bs` for the draft pass that follows it
@@ -3471,8 +3521,11 @@ class ModelRunner:
             # every rank): the step's requests' output ids and verdict, as
             # the rejection sampler gives them. The next ids are gathered
             # below from the broadcast ids, as on the logits path.
-            sampled_tokens, verdict = logits
+            sampled_tokens, verdict, *head_next = logits
             sampled_tokens, verdict = sampled_tokens[:bs], verdict[:, :bs]
+            # A third output, each request's next id: valid until a broadcast
+            # (in place) gives the ids rank 0's values.
+            head_next = head_next[0][:bs] if head_next else None
             num_bonus_tokens, num_reject_tokens, anchors = verdict
             next_token_locs = num_bonus_tokens
             spec_counts = verdict[:2]
@@ -3488,19 +3541,75 @@ class ModelRunner:
             bonus_logits_indices = spec_decode_metadata.bonus_logits_indices
             target_logits_indices = spec_decode_metadata.target_logits_indices
 
-            if constraints is None:
-                bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
-                target_logits = torch.index_select(logits, 0, target_logits_indices)
-            else:
-                bonus_logits, target_logits = constraints.logits, constraints.target
+            # A recipe's dspark_options.verify_argmax_once: an all-greedy
+            # verify needs each row's argmax and nothing else of the logits, so
+            # it is taken once over the step's rows where they lie; the bonus
+            # and the target picks are rows of that result. The path below
+            # copies the rows into two tensors first and reduces each.
+            ids_only_ok = getattr(self.rejection_sampler, "ids_only_ok", None)
+            argmax_once = (
+                plugin_host.dspark_options().verify_argmax_once
+                and all_greedy
+                and constraints is None
+                and ids_only_ok is not None
+                and ids_only_ok()
+            )
             # Lossless inputs determine whether verification samples are needed.
             ratio = None
             lossless = _draft_lossless(self)
             if lossless is not None and not all_greedy:
                 ratio = lossless.verify_inputs(bs, temperatures, top_ks, top_ps)
+            # The verify's sampling as one span (`v41.spec.verify_sample`),
+            # where a plan owns it and the call is one it covers.
+            from atom.model_ops.rejection_sampler import RELAXED_TOP_N
+
+            verify_seam = (
+                not argmax_once
+                and constraints is None
+                and ratio is None
+                and (all_greedy or RELAXED_TOP_N <= 1)
+                and plugin_host.owns("v41.spec.verify_sample")
+            )
+            if argmax_once:
+                row_ids = self.sampler(
+                    logits=logits if logits.is_contiguous() else logits.contiguous(),
+                    temperatures=temperatures,
+                    top_ks=top_ks,
+                    top_ps=top_ps,
+                    all_greedy=True,
+                )
+                bonus_logits = target_logits = None
+            elif verify_seam:
+                bonus_logits = None
+            elif constraints is None:
+                bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
+                target_logits = torch.index_select(logits, 0, target_logits_indices)
+            else:
+                bonus_logits, target_logits = constraints.logits, constraints.target
             target_token_ids = None
+            if verify_seam:
+                bonus_token_ids, target_token_ids, target_logits = plugin_host.call(
+                    "v41.spec.verify_sample",
+                    self._native_verify_sample,
+                    logits,
+                    temperatures,
+                    target_logits_indices,
+                    bonus_logits_indices,
+                    spec_decode_metadata.cu_num_draft_tokens,
+                    all_greedy=all_greedy,
+                    top_ks=top_ks,
+                    top_ps=top_ps,
+                    needs_independent_noise=needs_independent_noise or not all_greedy,
+                )
+                if (
+                    not all_greedy
+                    and target_token_ids is not None
+                    and target_token_ids.numel()
+                    and get_tp_group().world_size > 1
+                ):
+                    target_token_ids = get_tp_group().broadcast(target_token_ids, src=0)
             # Only exact match on a sampled batch reads the target's own draw.
-            if not all_greedy and ratio is None:
+            elif not all_greedy and ratio is None:
                 target_token_ids = self.sampler.sample_verification_tokens(
                     target_logits,
                     spec_decode_metadata.cu_num_draft_tokens,
@@ -3510,20 +3619,30 @@ class ModelRunner:
                 )
                 if target_token_ids.numel() and get_tp_group().world_size > 1:
                     target_token_ids = get_tp_group().broadcast(target_token_ids, src=0)
-            bonus_token_ids = self.sampler(
-                logits=bonus_logits,
-                temperatures=temperatures,
-                top_ks=top_ks,
-                top_ps=top_ps,
-                all_greedy=all_greedy,
-                needs_independent_noise=needs_independent_noise or not all_greedy,
-            )
+            if argmax_once:
+                # The accept kernel reads its rows of `row_ids` itself.
+                bonus_token_ids = None
+                verify_ids = {"row_ids": row_ids}
+            elif verify_seam:
+                verify_ids = {}
+            else:
+                # Nothing more than the call below always made.
+                verify_ids = {}
+                bonus_token_ids = self.sampler(
+                    logits=bonus_logits,
+                    temperatures=temperatures,
+                    top_ks=top_ks,
+                    top_ps=top_ps,
+                    all_greedy=all_greedy,
+                    needs_independent_noise=needs_independent_noise or not all_greedy,
+                )
             sampled_tokens, verdict = self.rejection_sampler.forward(
                 spec_decode_metadata,
                 target_logits,
                 bonus_token_ids,
                 target_token_ids=target_token_ids,
                 ratio=ratio,
+                **verify_ids,
             )
             # PCP ranks decode redundantly but not bit-identically, so their
             # accept counts can differ: take rank 0's verdict. Ids are synced
@@ -3542,19 +3661,26 @@ class ModelRunner:
             sampled_tokens = get_pcp_group().broadcast(
                 sampled_tokens.contiguous(), src=0
             )
+            head_next = None
 
         # Drafter input must agree across TP ranks. Ids only: the verdict is
         # deterministic on TP ranks' bit-identical inputs.
         # (An overridden step's ids are identical on every TP rank, and the
-        # broadcast would wait for the work it queued after them.)
+        # broadcast would wait for the work it queued after them. So are the
+        # ids of a head whose model says so: `identical_head_ids`.)
         if (
             get_tp_group().world_size > 1
             and self._served is None
+            and not (
+                isinstance(logits, tuple)
+                and getattr(self.model, "identical_head_ids", False)
+            )
             and _needs_id_sync(
                 self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
             )
         ):
             sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
+            head_next = None
 
         # From the ids every rank now agrees on. Only a deferred step needs
         # it: otherwise the host has these ids before the next forward.
@@ -3601,11 +3727,14 @@ class ModelRunner:
         draft_token_ids: np.ndarray | None = None
         next_token_ids = None
         if hasattr(self, "drafter"):
-            next_token_ids = torch.gather(
-                sampled_tokens.view(bs, batch.num_spec_step + 1),
-                1,
-                next_token_locs.view(-1, 1),
-            ).view(bs)
+            if head_next is not None:
+                next_token_ids = head_next  # the gather below, done in the forward
+            else:
+                next_token_ids = torch.gather(
+                    sampled_tokens.view(bs, batch.num_spec_step + 1),
+                    1,
+                    next_token_locs.view(-1, 1),
+                ).view(bs)
         if self.tokenID_processor.is_deferred_out:
             if hasattr(self, "drafter"):
                 prev_rejected_num = self.tokenID_processor.prev_rejected_num
@@ -4173,6 +4302,233 @@ class ModelRunner:
             return True
         return False
 
+    # -- CUDA-graph capture, shared by startup and plugin hot-plug -------------
+
+    @contextmanager
+    def _pause_gc(self):
+        # No GC during capture: a finalizer's hipModuleUnload aborts it (HIP 900).
+        gc.collect()
+        gc.disable()
+        try:
+            yield
+        finally:
+            gc.enable()
+            gc.collect()
+
+    def _request_capture_builder(self, full_q_len: int):
+        """The decode capture builder, bound to this backend's signature.
+
+        Returns ``(build_capture, supports_dynamic_q_len)``.  ``build_capture``
+        stages each synthetic step outside the graph window (query metadata,
+        positions, H2D publication) and then calls the backend's builder; both
+        the startup capture and a hot-plug recapture record through it, so a
+        bucket cannot be captured one way at boot and another way later.
+        """
+        raw_build_capture = self.attn_metadata_builder.build_for_cudagraph_capture
+        _build_params = inspect.signature(raw_build_capture).parameters
+        supports_dynamic_q_len = "max_q_len" in _build_params
+
+        def stage_and_build(*args, **kwargs):
+            bs = kwargs.get("bs", args[0] if args else None)
+            q_len = kwargs.get("max_q_len", full_q_len)
+            tokens = bs * q_len
+            self.attn_metadata_builder.publish_query_metadata(
+                np.full(bs, q_len, dtype=np.int32),
+                bs,
+                tokens,
+                kwargs.get("decode_ubatch_slices"),
+            )
+            self.forward_vars["positions"].np[:tokens] = (
+                np.arange(tokens, dtype=np.int64) % q_len
+            )
+            return raw_build_capture(*args, **kwargs)
+
+        @wraps(raw_build_capture)
+        def build_capture(*args, **kwargs):
+            # Preparation is outside actual graph capture, including calls
+            # made by the drafter and ragged bucket builder.
+            return self._build_capture(stage_and_build, *args, **kwargs)
+
+        return build_capture, supports_dynamic_q_len
+
+    def _capture_request_bucket(self, bs: int, max_q_len: int, **kwargs) -> bool:
+        # A segmented token graph cannot transport a transition handle across
+        # its eager regions. Only a single whole request capture has a ticket.
+        scope = (
+            nullcontext()
+            if kwargs["tr_hybrid"]
+            else plugin_transition.capture_transaction(bs * max_q_len)
+        )
+        with scope:
+            return self._capture_request_bucket_impl(bs, max_q_len, **kwargs)
+
+    def _capture_request_bucket_impl(
+        self,
+        bs: int,
+        max_q_len: int,
+        *,
+        build_capture,
+        supports_dynamic_q_len: bool,
+        tr_hybrid: bool,
+        logits_in_graph: bool,
+        prof,
+    ) -> bool:
+        """Record one decode request bucket ``(bs, max_q_len)``.
+
+        The body the startup capture's loop ran, lifted so a hot-plug can
+        record a single bucket through the same metadata staging, warmup and
+        ``ReqGraph.record`` path.  Returns whether a whole-forward graph was
+        recorded (``False`` for a TR_HYBRID token-graph bucket, and for a
+        bucket the token-graph path skips).
+        """
+        input_ids = self.forward_vars["input_ids"].gpu
+        positions = self.forward_vars["positions"].gpu
+        outputs = self.forward_vars["outputs"]
+
+        # The bucket's rows, which every DP rank records alike.
+        running_tokens = bs * max_q_len
+        if tr_hybrid and (
+            running_tokens in TokenGraph.captured_sizes("decode")
+            or self._skip_token_bucket(sp_local_len(running_tokens))
+        ):
+            return False
+        # Names the capture trace this iteration will export. Set after the
+        # skip above so a skipped bs never claims a file; its handful of Python
+        # statements just fold into the next iteration's window.
+        self._capture_trace_tag = f"bs_{bs}_q_{max_q_len}"
+        # A bucket that splits is recorded split at the bucket
+        # (`ForwardMode.decode_ubatch_slices`).
+        ubatch_slices = None
+        if self.tbo_decode_graphs and decode_bucket_splits(bs):
+            ubatch_slices = cut_decode_ubatches(
+                bs, running_tokens, np.full(bs, max_q_len)
+            )
+        capture_kwargs = {"bs": bs, "decode_ubatch_slices": ubatch_slices}
+        if supports_dynamic_q_len:
+            capture_kwargs["max_q_len"] = max_q_len
+        attn_metadata, context = build_capture(**capture_kwargs)
+        if self.use_mrope:
+            mrope_positions = self._mrope_positions_view(running_tokens)
+            mrope_positions.copy_(positions[:running_tokens].unsqueeze(0).expand(3, -1))
+            context.positions = mrope_positions
+        self.running_tokens_per_dp_rank.fill(running_tokens)
+        set_forward_context(
+            attn_metadata=attn_metadata,
+            atom_config=self.config,
+            context=context,
+            running_tokens_per_dp_rank=self.running_tokens_per_dp_rank,
+            ubatch_slices=ubatch_slices,
+            in_hipgraph=True,
+        )
+
+        # Warmup
+        model_positions = (
+            self._mrope_positions_view(running_tokens)
+            if self.use_mrope
+            else positions[:running_tokens]
+        )
+        model_output = self.model(input_ids[:running_tokens], model_positions)
+        outputs[:running_tokens] = model_output
+        self._head_output(outputs[:running_tokens], logits_in_graph)
+
+        if tr_hybrid:
+            # TR_HYBRID: no manual whole-forward graph. The model's token graph
+            # records this bucket, which any step of its rows replays, whatever
+            # its requests.
+            fc = get_forward_context()
+            fc.tr_graph = "record"
+            self.model(input_ids[:running_tokens], model_positions)
+            fc.tr_graph = None
+            if prof is not None:
+                # Drain before closing the window so this bs's kernels land in
+                # this bs's file. Profiling-only -- the unprofiled TR_HYBRID
+                # path stays sync-free.
+                torch.cuda.synchronize()
+                prof.step()
+            self._capture_trace_tag = None
+            return False
+
+        # Capture
+        with (
+            record_function(f"capture_graph_bs_{bs}")
+            if self.mark_trace
+            else nullcontext()
+        ):
+            # The drafter's aux capture hook runs inside the forward and writes
+            # its own buffers (in-graph).
+            def full_forward(n=running_tokens, pos=model_positions):
+                outputs[:n] = self.model(input_ids[:n], pos)
+                return self._head_output(outputs[:n], logits_in_graph)
+
+            self.req_graph.record(full_forward, key=request_bucket(bs, max_q_len))
+        torch.cuda.synchronize()
+        # After the sync: the warmup forward's kernels must have completed
+        # before the window closes, or they spill into the next bs's file.
+        if prof is not None:
+            prof.step()
+        self._capture_trace_tag = None
+        return True
+
+    def _tp_barrier(self, where: str) -> None:
+        """All TP ranks reach the same point before/after a collective capture.
+
+        A capture records the group's collectives; a rank that starts it early
+        records a collective its peers are not in.  A CPU-group barrier is
+        enough: it orders the hosts, and ``torch.cuda.synchronize`` before it
+        drains the rank's own work.
+        """
+        group = get_tp_group()
+        if getattr(group, "world_size", 1) <= 1:
+            return
+        if not torch.distributed.is_initialized():
+            logger.warning(
+                "%s: no process group for the TP barrier before %s", self.label, where
+            )
+            return
+        torch.distributed.barrier(group=group.cpu_group)
+
+    def _tp_agree(self, value: int) -> int:
+        """MAX of one integer flag over the TP group (local rank of one: itself).
+
+        Used to agree that a hot-plug failed or left no replayable graphs, so
+        every rank takes the same branch after the same barrier.
+        """
+        group = get_tp_group()
+        if getattr(group, "world_size", 1) <= 1:
+            return int(value)
+        if not torch.distributed.is_initialized():
+            return int(value)
+        flag = torch.tensor([int(value)], dtype=torch.int32)
+        torch.distributed.all_reduce(
+            flag, op=torch.distributed.ReduceOp.MAX, group=group.cpu_group
+        )
+        return int(flag.item())
+
+    def _tp_agreed_code_digest(self, digest: str) -> str:
+        """The one plugin code digest every TP rank reads, or refuse on all.
+
+        Each rank computes the digest over its own filesystem view; a dev reload
+        would otherwise be able to install different code per rank. Every rank
+        gathers the digests and compares them against rank 0's, so a
+        disagreement raises the same ``reload-digest-mismatch`` refusal on the
+        whole group before any module is dropped.
+        """
+        group = get_tp_group()
+        if getattr(group, "world_size", 1) <= 1:
+            return digest
+        if not torch.distributed.is_initialized():
+            return digest
+        digests: list = [None] * group.world_size
+        torch.distributed.all_gather_object(digests, digest, group=group.cpu_group)
+        agreed = digests[0] if digests else digest
+        if any(other != agreed for other in digests):
+            error = RuntimeError(
+                f"TP ranks computed different plugin code digests: {digests}"
+            )
+            error.reason = RELOAD_DIGEST_MISMATCH_REASON
+            raise error
+        return str(agreed)
+
     @torch.inference_mode()
     def capture_cudagraph(self):
         # M3 indexer-only CP puts an all-to-all in the captured decode path, and
@@ -4276,23 +4632,8 @@ class ModelRunner:
         # start capture profiler
         self.start_capture_profiler()
 
-        @contextmanager
-        def pause_gc():
-            # No GC during capture: a finalizer's hipModuleUnload aborts it (HIP 900).
-            gc.collect()
-            gc.disable()
-            try:
-                yield
-            finally:
-                gc.enable()
-                gc.collect()
-
         _rsv_before_capture = torch.cuda.memory_reserved()
         _alloc_before_capture = torch.cuda.memory_allocated()
-
-        input_ids = self.forward_vars["input_ids"].gpu
-        positions = self.forward_vars["positions"].gpu
-        outputs = self.forward_vars["outputs"]
 
         # Capture one graph per (bs, query-length bucket). Buckets default to
         # [full_q_len] (single-graph, classic per-bs capture); DSpark confidence
@@ -4322,35 +4663,13 @@ class ModelRunner:
         self.attn_metadata_builder.blank_cache_write_targets()
         self.h2d_owner.finish()
 
-        # Whether this backend's capture builder supports a dynamic (per-bucket)
-        build_capture = self.attn_metadata_builder.build_for_cudagraph_capture
-        _build_params = inspect.signature(build_capture).parameters
-        supports_dynamic_q_len = "max_q_len" in _build_params
+        # The capture builder bound to this backend's signature, with every
+        # call staged outside the graph window (see `_request_capture_builder`).
+        build_capture, supports_dynamic_q_len = self._request_capture_builder(
+            full_q_len
+        )
 
-        raw_build_capture = build_capture
-
-        def stage_and_build(*args, **kwargs):
-            bs = kwargs.get("bs", args[0] if args else None)
-            q_len = kwargs.get("max_q_len", full_q_len)
-            tokens = bs * q_len
-            self.attn_metadata_builder.publish_query_metadata(
-                np.full(bs, q_len, dtype=np.int32),
-                bs,
-                tokens,
-                kwargs.get("decode_ubatch_slices"),
-            )
-            self.forward_vars["positions"].np[:tokens] = (
-                np.arange(tokens, dtype=np.int64) % q_len
-            )
-            return raw_build_capture(*args, **kwargs)
-
-        @wraps(raw_build_capture)
-        def build_capture(*args, **kwargs):
-            # Preparation is outside actual graph capture, including calls
-            # made by the drafter and ragged bucket builder.
-            return self._build_capture(stage_and_build, *args, **kwargs)
-
-        with pause_gc(), graph_capture(), self.capture_profiler as prof:
+        with self._pause_gc(), graph_capture(), self.capture_profiler as prof:
             for max_q_len in q_buckets:
                 capture_range = (
                     tqdm.tqdm(self.capture_sizes)
@@ -4361,99 +4680,15 @@ class ModelRunner:
                     if self.rank == 0:
                         capture_range.set_description(f"Capturing {bs=}, {max_q_len=}")
 
-                    # The bucket's rows, which every DP rank records alike.
-                    running_tokens = bs * max_q_len
-                    if tr_hybrid and (
-                        running_tokens in TokenGraph.captured_sizes("decode")
-                        or self._skip_token_bucket(sp_local_len(running_tokens))
-                    ):
-                        continue
-                    # Names the capture trace this iteration will export. Set
-                    # after the skip above so a skipped bs never claims a file;
-                    # its handful of Python statements just fold into the next
-                    # iteration's window.
-                    self._capture_trace_tag = f"bs_{bs}_q_{max_q_len}"
-                    # A bucket that splits is recorded split at the bucket
-                    # (`ForwardMode.decode_ubatch_slices`).
-                    ubatch_slices = None
-                    if self.tbo_decode_graphs and decode_bucket_splits(bs):
-                        ubatch_slices = cut_decode_ubatches(
-                            bs, running_tokens, np.full(bs, max_q_len)
-                        )
-                    capture_kwargs = {
-                        "bs": bs,
-                        "decode_ubatch_slices": ubatch_slices,
-                    }
-                    if supports_dynamic_q_len:
-                        capture_kwargs["max_q_len"] = max_q_len
-                    attn_metadata, context = build_capture(**capture_kwargs)
-                    if self.use_mrope:
-                        mrope_positions = self._mrope_positions_view(running_tokens)
-                        mrope_positions.copy_(
-                            positions[:running_tokens].unsqueeze(0).expand(3, -1)
-                        )
-                        context.positions = mrope_positions
-                    self.running_tokens_per_dp_rank.fill(running_tokens)
-                    set_forward_context(
-                        attn_metadata=attn_metadata,
-                        atom_config=self.config,
-                        context=context,
-                        running_tokens_per_dp_rank=self.running_tokens_per_dp_rank,
-                        ubatch_slices=ubatch_slices,
-                        in_hipgraph=True,
+                    self._capture_request_bucket(
+                        bs,
+                        max_q_len,
+                        build_capture=build_capture,
+                        supports_dynamic_q_len=supports_dynamic_q_len,
+                        tr_hybrid=tr_hybrid,
+                        logits_in_graph=logits_in_graph,
+                        prof=prof,
                     )
-
-                    # Warmup
-                    model_positions = (
-                        self._mrope_positions_view(running_tokens)
-                        if self.use_mrope
-                        else positions[:running_tokens]
-                    )
-                    model_output = self.model(
-                        input_ids[:running_tokens], model_positions
-                    )
-                    outputs[:running_tokens] = model_output
-                    self._head_output(outputs[:running_tokens], logits_in_graph)
-
-                    if tr_hybrid:
-                        # TR_HYBRID: no manual whole-forward graph. The model's
-                        # token graph records this bucket, which any step of
-                        # its rows replays, whatever its requests.
-                        fc = get_forward_context()
-                        fc.tr_graph = "record"
-                        self.model(input_ids[:running_tokens], model_positions)
-                        fc.tr_graph = None
-                        if prof is not None:
-                            # Drain before closing the window so this bs's
-                            # kernels land in this bs's file. Profiling-only —
-                            # the unprofiled TR_HYBRID path stays sync-free.
-                            torch.cuda.synchronize()
-                            prof.step()
-                            self._capture_trace_tag = None
-                        continue
-
-                    # Capture
-                    with (
-                        record_function(f"capture_graph_bs_{bs}")
-                        if self.mark_trace
-                        else nullcontext()
-                    ):
-                        # The drafter's aux capture hook runs inside the
-                        # forward and writes its own buffers (in-graph).
-                        def full_forward(n=running_tokens, pos=model_positions):
-                            outputs[:n] = self.model(input_ids[:n], pos)
-                            return self._head_output(outputs[:n], logits_in_graph)
-
-                        self.req_graph.record(
-                            full_forward, key=request_bucket(bs, max_q_len)
-                        )
-                    torch.cuda.synchronize()
-                    # After the sync: the warmup forward's kernels must have
-                    # completed before the window closes, or they spill into the
-                    # next bs's file.
-                    if prof is not None:
-                        prof.step()
-                        self._capture_trace_tag = None
             # Inside the `with`: graph_capture() arms the custom all-reduce for
             # capture and pause_gc() keeps the collector from aborting one. The
             # drafter gets the capture builder already bound to this backend's
@@ -4535,6 +4770,420 @@ class ModelRunner:
             )
 
         return time.time() - start_time, self.capture_sizes, _pool_bytes
+
+    # -- plugin hot-plug -------------------------------------------------------
+
+    def _hotplug_full_q_len(self) -> int:
+        """Rows one decode request of a captured step runs (``mtp_k + 1``)."""
+        return self.drafter.mtp_k + 1 if hasattr(self, "drafter") else 1
+
+    @torch.inference_mode()
+    def recapture_cudagraph(self, rows: list[int]) -> dict:
+        """Re-record the decode request graphs of ``rows``, on every TP rank.
+
+        ``rows`` are padded ``running_tokens`` of decode request buckets.  A
+        plan switch changes the route tables every recorded graph decided with,
+        so the whole ``ReqGraph`` is released and only the requested buckets
+        are recorded again; every other decode batch runs eagerly until a later
+        hot-plug recaptures it.  Call on all TP ranks at once: the engine
+        handler broadcasts it, and the barriers below turn a stray rank into a
+        hang rather than into a capture of mixed plans.
+
+        Returns ``{"rows", "sizes", "seconds"}``; raises only after every rank
+        agreed on the failure, so a raise means "this hot-plug failed on every
+        rank", never "rank 3 failed and the rest kept going".
+        """
+        started = time.time()
+        full_q_len = self._hotplug_full_q_len()
+        if self._tr_hybrid_active():
+            raise RuntimeError(
+                "hot-plug recapture needs whole-forward decode graphs; this "
+                "server records TR_HYBRID token graphs, which a plan switch "
+                "cannot patch without a restart"
+            )
+        if self.req_graph is None:
+            raise RuntimeError(
+                "this runner recorded no decode request graphs (enforce_eager "
+                "or a capture that never ran), so there is nothing to recapture"
+            )
+        bs_list = rows_to_bs(rows, full_q_len)
+        if not bs_list:
+            raise RuntimeError("hot-plug recapture was asked for no rows")
+        ladder = getattr(self, "_plugin_graph_ladder", None) or self.capture_sizes
+        ladder = [int(bs) for bs in ladder]
+        missing = [bs for bs in bs_list if bs not in ladder]
+        if missing:
+            raise RuntimeError(
+                "hot-plug rows %s are not captured decode buckets of this "
+                "server; valid rows are %s (bs * (mtp_k + 1) = bs * %d)"
+                % (
+                    [bs * full_q_len for bs in missing],
+                    [bs * full_q_len for bs in sorted(ladder)],
+                    full_q_len,
+                )
+            )
+        # DSpark confidence scheduling replays smaller query-length buckets of
+        # the same requests; every one of those keys must exist or a step at
+        # this bs would replay a graph no rank holds.
+        q_buckets = self._dspark_capture_q_buckets(full_q_len)
+        build_capture, supports_dynamic_q_len = self._request_capture_builder(
+            full_q_len
+        )
+        logits_in_graph = self.world_size == 1
+        if self.rank == 0:
+            logger.info(
+                "plugin hot-plug: releasing %d recorded decode bucket(s) and "
+                "recapturing rows %s (bs=%s, q=%s)",
+                len(self.req_graph.keys()),
+                [bs * full_q_len for bs in bs_list],
+                bs_list,
+                q_buckets,
+            )
+        # From here on every rank walks the same collectives in the same order.
+        self._tp_barrier("recapture")
+        error: BaseException | None = None
+        try:
+            torch.cuda.synchronize()
+            # The old graphs decided with the previous plan's tables; replaying
+            # one after the switch would apply the previous routing. Release
+            # them all (MVP) and let what is recorded below be the new truth.
+            self.req_graph.release_graphs()
+            # Until the capture succeeds nothing may replay: an empty ladder
+            # makes ForwardMode decide eager for every decode step.
+            self.capture_sizes = []
+            self.capture_sizes_np = np.asarray(self.capture_sizes, dtype=np.int32)
+            # The capture's warmup forwards write cache through these; point
+            # them at PAD so a recapture beside live requests touches no live
+            # slot (the same staging startup capture does).
+            for name in ("kv_indptr", "sparse_kv_indptr"):
+                if name in self.forward_vars:
+                    self.forward_vars[name].gpu.zero_()
+            self.h2d_owner.begin()
+            try:
+                self.attn_metadata_builder.blank_cache_write_targets()
+                self.h2d_owner.finish()
+            except BaseException:
+                self.h2d_owner.fail()
+                raise
+            captured: set[int] = set()
+            with self._pause_gc(), graph_capture():
+                for max_q_len in q_buckets:
+                    for bs in bs_list:
+                        if self._capture_request_bucket(
+                            bs,
+                            max_q_len,
+                            build_capture=build_capture,
+                            supports_dynamic_q_len=supports_dynamic_q_len,
+                            tr_hybrid=False,
+                            logits_in_graph=logits_in_graph,
+                            prof=None,
+                        ):
+                            captured.add(bs)
+            torch.cuda.synchronize()
+        except BaseException as exc:  # noqa: BLE001 - agreed below, then raised
+            error = exc
+            logger.exception("%s: decode graph recapture failed", self.label)
+        finally:
+            # A failed capture must not leave the ladder pointing at graphs
+            # that do not exist. Derive it from the recordings that survived,
+            # then agree across the group on "failed" so every rank runs the
+            # same shape (eager) after a partial failure.
+            surviving = sorted(
+                {
+                    int(key[0])
+                    for key in self.req_graph.keys()
+                    if isinstance(key, tuple) and len(key) == 2
+                }
+            )
+            failed = self._tp_agree(0 if error is None else 1)
+            if failed:
+                surviving = []
+            self.capture_sizes = surviving
+            self.capture_sizes_np = np.asarray(self.capture_sizes, dtype=np.int32)
+            self._tp_barrier("recapture end")
+        if error is not None:
+            raise RuntimeError(f"decode graph recapture failed: {error}") from error
+        elapsed = time.time() - started
+        if self.rank == 0:
+            logger.info(
+                "plugin hot-plug: recaptured %d bucket(s) %s in %.2fs; every "
+                "other decode batch now runs eagerly",
+                len(self.capture_sizes),
+                self.capture_sizes,
+                elapsed,
+            )
+        return {
+            "rows": [bs * full_q_len for bs in self.capture_sizes],
+            "sizes": list(self.capture_sizes),
+            "seconds": elapsed,
+        }
+
+    def _install_hotplug_plan(self, plan, report: dict) -> dict:
+        """Install a plan/arm with no code reload: the plain hot-plug path.
+
+        The dev-mode reload path replaces this call with
+        ``plugin_host.reload_plugins`` (which also re-imports the code and
+        prepares the providers); both return the host's installed-plan dict.
+        """
+        return plugin_host.hotplug_plan(plan, arm=report["arm"], config=self.config)
+
+    def _native_verify_sample(
+        self,
+        logits,
+        temperatures,
+        target_logits_indices,
+        bonus_logits_indices,
+        cu_num_draft_tokens,
+        *,
+        all_greedy=False,
+        top_ks=None,
+        top_ps=None,
+        needs_independent_noise=False,
+    ):
+        """`v41.spec.verify_sample`'s native: the rows' picks, the target's
+        own draw on a sampled batch, and the bonus tokens."""
+        bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
+        target_logits = torch.index_select(logits, 0, target_logits_indices)
+        target_token_ids = None
+        if not all_greedy:
+            target_token_ids = self.sampler.sample_verification_tokens(
+                target_logits, cu_num_draft_tokens, temperatures, top_ks, top_ps
+            )
+        bonus_token_ids = self.sampler(
+            logits=bonus_logits,
+            temperatures=temperatures,
+            top_ks=top_ks,
+            top_ps=top_ps,
+            all_greedy=all_greedy,
+            needs_independent_noise=needs_independent_noise,
+        )
+        return bonus_token_ids, target_token_ids, target_logits
+
+    def hotplug_plugin(self, payload: dict) -> dict:
+        """Install a plugin plan/arm and recapture the requested decode graphs.
+
+        The engine broadcasts this to every TP rank through the runner RPC.
+        Every rank validates, installs and captures in the same order, and the
+        group agrees on any refusal before it returns, so one rank's failure is
+        never answered as another rank's success.
+
+        ``payload["reload"]`` asks for a **dev-mode code reload** instead of a
+        plain plan switch: the local plugin source digest is computed (and must
+        equal ``payload["code_digest"]`` when the caller sent one), every TP
+        rank must have computed the same digest, and only then does
+        ``plugin_host.reload_plugins`` re-import the code, prepare the planned
+        providers and install the plan. A reload refusal happens before the
+        install (so no graph is released and no host state changes), and the
+        report carries ``reloaded``/``code_digest``/``native`` for the caller.
+
+        It never raises into the RPC transport on purpose: the plain
+        ``call_func`` path lets a worker exception end that worker (and with it
+        the engine), which would turn a refusal into a timeout.  Failures are
+        reported as ``status="error"`` with the reason, and the engine handler
+        answers the API with a 4xx/5xx carrying it.
+        """
+        started = time.time()
+        report = {
+            "rank": self.rank,
+            "tp_world_size": self.tp_world_size,
+            "status": "ok",
+            "error": None,
+            "reason": None,
+            "plan_id": None,
+            "arm": None,
+            "rows": [],
+            "sizes": [],
+            "capture_seconds": 0.0,
+            "captured": False,
+            "reloaded": False,
+            "code_digest": None,
+            "reload_seconds": 0.0,
+            "reloaded_modules": [],
+            "prepared": [],
+            "native": None,
+        }
+        failure: str | None = None
+        failure_reason: str | None = None
+
+        def fail(exc: BaseException) -> None:
+            nonlocal failure, failure_reason
+            failure = f"{type(exc).__name__}: {exc}"
+            reason = getattr(exc, "reason", None)
+            failure_reason = reason if isinstance(reason, str) and reason else None
+            logger.error(
+                "%s: plugin hot-plug failed%s: %s",
+                self.label,
+                f" ({failure_reason})" if failure_reason else "",
+                failure,
+            )
+
+        def abort() -> dict:
+            report.update(
+                status="error",
+                error=failure or "another TP rank refused this hot-plug",
+                reason=failure_reason,
+                plan_id=None,
+                rows=[],
+                sizes=[],
+                reloaded=False,
+                code_digest=None,
+                native=None,
+                elapsed_seconds=time.time() - started,
+            )
+            return report
+
+        plan = None
+        rows: list[int] = []
+        reload_requested = False
+        local_digest: str | None = None
+        try:
+            if not isinstance(payload, dict):
+                raise TypeError(
+                    f"hot-plug payload must be a dict, got {type(payload).__name__}"
+                )
+            if not callable(getattr(plugin_host, "hotplug_plan", None)) or not callable(
+                getattr(plugin_host, "hotplug_enabled", None)
+            ):
+                raise RuntimeError(
+                    "this ATOM build has no plugin hot-plug API "
+                    "(plugin_host.hotplug_plan); its plan cannot change at runtime"
+                )
+            if not plugin_host.hotplug_enabled():
+                raise RuntimeError(
+                    "plugin hot-plug is off on this runner; start the server with "
+                    "--plugin-hotplug or ATOM_PLUGIN_HOTPLUG=1"
+                )
+            source = payload.get("source")
+            if hasattr(source, "resolve"):
+                plan = source.resolve()  # RecipeSource
+            elif source is None:
+                plan = None
+            else:
+                plan = source
+            report["arm"] = payload.get("arm") or "plugin"
+            rows = [int(row) for row in payload.get("rows") or ()]
+            ladder = tuple(
+                bs
+                for bs in (
+                    getattr(self, "_plugin_graph_ladder", None) or self.capture_sizes
+                )
+                if bs > 0
+            )
+            if not rows:
+                # No rows named: capture tables target their buckets; an
+                # any/eager-only plan re-records the original full ladder.
+                rows = default_capture_rows(plan, self._hotplug_full_q_len(), ladder)
+            reload_requested = payload.get("reload", False)
+            if not isinstance(reload_requested, bool):
+                raise TypeError(
+                    f"hot-plug reload flag must be true or false, got "
+                    f"{reload_requested!r}"
+                )
+            if reload_requested:
+                if not plugin_host.dev_enabled():
+                    refused = RuntimeError(
+                        "reload hot-plug needs plugin dev mode: start the server "
+                        "with --plugin-hotplug --plugin-dev --plugin-dev-root DIR"
+                    )
+                    refused.reason = RELOAD_UNSUPPORTED_REASON
+                    raise refused
+                roots = tuple(getattr(self.config, "plugin_dev_roots", ()) or ())
+                local_digest = plugin_host.plugin_code_digest(roots)
+                expected = checked_code_digest(payload.get("code_digest"))
+                if expected is not None and expected != local_digest:
+                    refused = RuntimeError(
+                        f"reload code digest mismatch: the request expects "
+                        f"{expected}, this rank reads {local_digest} from "
+                        f"{list(roots)}"
+                    )
+                    refused.reason = RELOAD_DIGEST_MISMATCH_REASON
+                    raise refused
+        except BaseException as exc:  # noqa: BLE001 - agreed below
+            fail(exc)
+        # Agree before touching the plan: a rank that refused must not be left
+        # behind by peers that went on to install and capture.
+        if self._tp_agree(0 if failure is None else 1):
+            return abort()
+
+        try:
+            if reload_requested:
+                # All ranks must serve the same code: a digest disagreement is a
+                # refusal on every rank, never "some ranks reloaded".
+                local_digest = self._tp_agreed_code_digest(local_digest)
+                installed = plugin_host.reload_plugins(
+                    plan,
+                    roots=getattr(self.config, "plugin_dev_roots", ()) or None,
+                    arm=report["arm"],
+                    config=self.config,
+                    device=self.device,
+                )
+                report.update(
+                    reloaded=True,
+                    code_digest=installed.get("code_digest") or local_digest,
+                    reload_seconds=installed.get("reload_seconds") or 0.0,
+                    reloaded_modules=installed.get("reloaded_modules") or [],
+                    prepared=installed.get("prepared") or [],
+                    native=installed.get("native"),
+                )
+            else:
+                installed = self._install_hotplug_plan(plan, report) or {}
+            report["plan_id"] = installed.get("plan_id") or (
+                None if plan is None else plan.plan_id
+            )
+            if not rows and installed.get("capture_rows"):
+                rows = [int(row) for row in installed["capture_rows"]]
+            report["rows"] = [int(row) for row in rows]
+        except BaseException as exc:  # noqa: BLE001 - agreed below
+            fail(exc)
+        # Agree on the install before any rank starts a capture: a capture
+        # records the group's collectives, so a rank that skipped it would hang
+        # the peers that did not.
+        if self._tp_agree(0 if failure is None else 1):
+            return abort()
+
+        capture = bool(payload.get("capture", True))
+        # Generation is paused. Every holder baked the old route, including
+        # draft and prefill holders outside self.req_graph. Never replay those
+        # after an install, even when the caller chooses eager (capture=false).
+        changes_graphs = not self.enforce_eager and not self.config.disagg_is_decode
+        if changes_graphs:
+            self._plugin_graph_ladder = tuple(ladder)
+            torch.cuda.synchronize()
+            report["graphs_invalidated"] = release_registered_graphs()
+            if not (capture and rows):
+                self.capture_sizes = []
+                self.capture_sizes_np = np.asarray([], dtype=np.int32)
+        if capture and not rows:
+            # Nothing is recorded (a previous capture failure left every
+            # bucket eager), so there is no graph to patch -- the plan is in.
+            report["skipped"] = "no-recorded-buckets"
+        elif capture and not self.enforce_eager and not self.config.disagg_is_decode:
+            try:
+                recaptured = self.recapture_cudagraph(rows)
+                report["sizes"] = recaptured["sizes"]
+                report["rows"] = recaptured["rows"]
+                report["capture_seconds"] = recaptured["seconds"]
+                report["captured"] = True
+            except BaseException as exc:  # noqa: BLE001 - recapture agreed itself
+                self.capture_sizes = []
+                self.capture_sizes_np = np.asarray([], dtype=np.int32)
+                fail(exc)
+        elif capture:
+            # The plan is installed; there is no decode graph to patch.
+            report["skipped"] = (
+                "enforce_eager" if self.enforce_eager else "disagg_is_decode"
+            )
+        report["elapsed_seconds"] = time.time() - started
+        if failure is not None:
+            report.update(
+                status="error",
+                error=failure,
+                reason=failure_reason,
+                plan_id=None,
+                rows=[],
+                sizes=[],
+            )
+        return report
 
     def _record_prefill_graphs(self) -> None:
         """Record what a prefill replays: the model's token graphs, then the

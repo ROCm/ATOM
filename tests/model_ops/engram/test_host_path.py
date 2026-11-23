@@ -1344,7 +1344,7 @@ def test_the_allocator_disables_huge_pages_only_around_the_allocation():
         return 0
 
     # Plain functions: the allocator sets `argtypes` on them, as on ctypes'.
-    libc = SimpleNamespace(prctl=prctl)
+    libc = SimpleNamespace(prctl=prctl, madvise=lambda *a: 0)
     hip = SimpleNamespace(hipHostMalloc=malloc, hipHostFree=lambda ptr: 0)
     alloc = hm._HipHostAllocator(hip, libc)
     assert alloc.alloc(1 << 20) == 4096
@@ -1803,7 +1803,7 @@ def test_failed_hip_allocations_and_frees_clear_the_hip_error(monkeypatch):
 
     hip = FakeHip()
     monkeypatch.setattr(hm, "_hip_runtime", lambda: hip)
-    libc = SimpleNamespace(prctl=lambda op, *rest: 0)
+    libc = SimpleNamespace(prctl=lambda op, *rest: 0, madvise=lambda *a: 0)
     fake = SimpleNamespace(
         hipHostMalloc=lambda ptr, nbytes, flags: 2,  # hipErrorOutOfMemory
         hipHostFree=lambda ptr: 1,

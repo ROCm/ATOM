@@ -2441,6 +2441,26 @@ class Config:
 
     # only use for plugin mode
     plugin_config: PluginConfig | None = None
+    # --plugin-recipe / --plugin-enable as plain, picklable data
+    # (atom.plugin_recipe.RecipeSource: the recipes' text and the names); each
+    # process resolves it to the plugin plan. None: native. --plugin-arm.
+    plugin_source: Any = None
+    plugin_arm: str = "plugin"
+    # --plugin-hotplug / ATOM_PLUGIN_HOTPLUG=1: bind every seam when the model
+    # is built (even with no plan installed) so a plan and arm can be switched
+    # at runtime and the affected decode CUDA graphs recaptured, instead of
+    # rebuilding the model. Enables nothing by itself; a recipe still does.
+    plugin_hotplug: bool = False
+    # --plugin-dev / --plugin-dev-root (ATOM_PLUGIN_DEV / ATOM_PLUGIN_DEV_ROOTS):
+    # opt-in developer mode on a hot-plug boot. A POST /plugin/hotplug body with
+    # "reload": true re-imports the plugin Python modules whose source file is
+    # under one of these allowlisted roots, re-runs each planned provider's
+    # prepare(device) and installs the plan; the existing path then recaptures
+    # the decode graphs. Off by default: it leaks the previous native library
+    # versions and is not a production path. plugin_dev_roots is empty unless
+    # plugin_dev is set.
+    plugin_dev: bool = False
+    plugin_dev_roots: tuple[str, ...] = ()
     # only for quark_online_quantization
     online_quant_config: dict | None = None
     hf_overrides: dict[str, Any] | None = None
@@ -3845,6 +3865,22 @@ class Config:
         # between runs would otherwise show up only as a cold compile, with no
         # error; logged at debug so two runs can be diffed.
         logger.debug("Compile cache HF architecture factor: %s", architecture_factor)
+        # A plugin plan puts opaque ops and AITER providers into the graph. An
+        # empty plan keys nothing, so the native cache keys stay as they were.
+        source = getattr(self, "plugin_source", None)
+        if source is not None and not source.empty:
+            factors.append((source.plan_id, envs.ATOM_PLUGIN_HOST))
+        # A hot-plug boot keeps every seam bound even when the plan is empty, so
+        # the compiled/captured artifact's route topology differs from native.
+        if getattr(self, "plugin_hotplug", False):
+            factors.append(("plugin-hotplug", envs.ATOM_PLUGIN_HOST))
+        # A dev-mode boot serves reloadable plugin code: its artifact must never
+        # share a compile cache with a normal run (or with another dev root), so
+        # a code edit cannot replay routing baked by the old build.
+        if getattr(self, "plugin_dev", False):
+            factors.append(
+                ("plugin-dev", tuple(getattr(self, "plugin_dev_roots", ()) or ()))
+            )
 
         hash_str = hashlib.md5(
             str(factors).encode(), usedforsecurity=False

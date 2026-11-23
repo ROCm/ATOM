@@ -40,55 +40,60 @@ def load_tokenizer(model: str, trust_remote_code: bool = False):
     return tokenizer
 
 
+def prepare_config(model, tokenizer=None, **kwargs):
+    """The Config an engine's processes run with, and its tokenizer."""
+    config_fields = {field.name for field in fields(Config)}
+    config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
+    data_parallel_size = kwargs.get("data_parallel_size", 1)
+    data_parallel_master_port = kwargs.get("data_parallel_master_port", None)
+    config = Config(model, **config_kwargs)
+    tokenizer = tokenizer or load_tokenizer(config.model, config.trust_remote_code)
+    config.bos_token_id = tokenizer.bos_token_id
+    config.eos_token_id = tokenizer.eos_token_id
+    stop_token_ids = set(config.stop_token_ids)
+    # separate eos_token_id from stop_token_ids
+    stop_token_ids.discard(config.eos_token_id)
+    config.stop_token_ids = list(stop_token_ids)
+    # Legacy path only: callers that pass DP topology as loose kwargs
+    # instead of a ParallelConfig. When a parallel_config was supplied it
+    # is already authoritative, and overwriting it here would reset a
+    # multi-node topology back to a single local rank.
+    if "parallel_config" not in config_kwargs:
+        config.parallel_config.data_parallel_size = data_parallel_size
+        if data_parallel_master_port is not None:
+            config.parallel_config.data_parallel_master_port = data_parallel_master_port
+    # Config validated SP before the legacy DP kwargs above landed.
+    if (
+        config.sequence_parallel_size > 1
+        and config.parallel_config.data_parallel_size != 1
+    ):
+        raise ValueError("Ulysses SP currently requires data_parallel_size=1")
+    # PCP and DP-attention together are unverified. The refusal's original
+    # cause, a DP all-gather of the hash-routing input ids sized for the
+    # un-split token count, is gone: the MoE now routes before its DP
+    # gather, on rank-local ids.
+    if config.enable_dp_attention and config.pipeline_parallel_size > 1:
+        raise ValueError(
+            "--enable-dp-attention and pipeline-parallel (pp>1) "
+            "cannot be used together."
+        )
+    if config.prefill_context_parallel_size > 1 and config.enable_dp_attention:
+        raise ValueError(
+            "prefill_context_parallel_size > 1 (-pcp) combined with "
+            "--enable-dp-attention is not supported yet (may be supported "
+            "in a future release): the combination is unverified. For "
+            "now, disable one of them (use -tp N -pcp M without "
+            "DP-attention, or -dp N --enable-dp-attention without -pcp)."
+        )
+    return config, tokenizer
+
+
 class LLMEngine:
 
     def __init__(self, model, tokenizer=None, **kwargs):
-        config_fields = {field.name for field in fields(Config)}
-        config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
-        data_parallel_size = kwargs.get("data_parallel_size", 1)
-        data_parallel_master_port = kwargs.get("data_parallel_master_port", None)
-        config = Config(model, **config_kwargs)
+        config, self.tokenizer = prepare_config(model, tokenizer, **kwargs)
         self.config = config
-        self.tokenizer = tokenizer or load_tokenizer(
-            config.model, config.trust_remote_code
-        )
-        config.bos_token_id = self.tokenizer.bos_token_id
-        config.eos_token_id = self.tokenizer.eos_token_id
-        stop_token_ids = set(config.stop_token_ids)
-        # separate eos_token_id from stop_token_ids
-        stop_token_ids.discard(config.eos_token_id)
-        config.stop_token_ids = list(stop_token_ids)
-        # Legacy path only: callers that pass DP topology as loose kwargs
-        # instead of a ParallelConfig. When a parallel_config was supplied it
-        # is already authoritative, and overwriting it here would reset a
-        # multi-node topology back to a single local rank.
-        if "parallel_config" not in config_kwargs:
-            config.parallel_config.data_parallel_size = data_parallel_size
-            if data_parallel_master_port is not None:
-                config.parallel_config.data_parallel_master_port = (
-                    data_parallel_master_port
-                )
         self.data_parallel_size = config.parallel_config.data_parallel_size
-        # Config validated SP before the legacy DP kwargs above landed.
-        if config.sequence_parallel_size > 1 and self.data_parallel_size != 1:
-            raise ValueError("Ulysses SP currently requires data_parallel_size=1")
-        # PCP and DP-attention together are unverified. The refusal's original
-        # cause, a DP all-gather of the hash-routing input ids sized for the
-        # un-split token count, is gone: the MoE now routes before its DP
-        # gather, on rank-local ids.
-        if config.enable_dp_attention and config.pipeline_parallel_size > 1:
-            raise ValueError(
-                "--enable-dp-attention and pipeline-parallel (pp>1) "
-                "cannot be used together."
-            )
-        if config.prefill_context_parallel_size > 1 and config.enable_dp_attention:
-            raise ValueError(
-                "prefill_context_parallel_size > 1 (-pcp) combined with "
-                "--enable-dp-attention is not supported yet (may be supported "
-                "in a future release): the combination is unverified. For "
-                "now, disable one of them (use -tp N -pcp M without "
-                "DP-attention, or -dp N --enable-dp-attention without -pcp)."
-            )
         self.io_processor = InputOutputProcessor(
             config, self.tokenizer, config.kv_cache_block_size
         )

@@ -143,9 +143,14 @@ def get_model(config: Config, device: torch.device, load: ModelLoader) -> nn.Mod
     """This rank's model, after ``init_model_env``: ``load`` builds it and
     gets its weights (``build_model`` then ``load_weights``, or a builder
     whose weights come later). Leaves the config's dtype as the default."""
+    from atom import plugin_host
+
     torch.set_default_dtype(config.torch_dtype)
+    arch = config.hf_config.architectures[0]
+    # Under a plugin plan (or a hot-plug boot) the architecture's plugin
+    # variant, the one with the seams in it; else ATOM's own model.
     model_class = resolve_obj_by_qualname(
-        support_model_arch_dict[config.hf_config.architectures[0]]
+        plugin_host.model_class_for(arch, support_model_arch_dict[arch])
     )
     # The model construction depends on quant_config,
     # so we must complete the remapping for layers before constructing the model.
