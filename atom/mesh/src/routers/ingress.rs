@@ -30,7 +30,10 @@ use crate::{
     policies::{LoadBalancingPolicy, PolicyRegistry},
     routers::{
         comm::error::{IngressError, MeshLocalError},
-        prepare::inference::{InferenceMetadata, InferenceRequest, ParsedInference},
+        prepare::{
+            fast_tokenizer::TokenizeLimits,
+            inference::{InferenceMetadata, InferenceRequest, ParsedInference},
+        },
     },
     server::AppState,
     tokenizer::TokenizerRegistry,
@@ -633,7 +636,7 @@ pub struct IngressRouting {
     tokenizer_registry: Arc<TokenizerRegistry>,
     chats_without_template: Arc<RwLock<HashSet<String>>>,
     pd: bool,
-    max_tokenize_bytes: usize,
+    tokenize_limits: TokenizeLimits,
 }
 
 impl IngressRouting {
@@ -644,7 +647,7 @@ impl IngressRouting {
             tokenizer_registry: app.tokenizer_registry.clone(),
             chats_without_template: app.chats_without_template.clone(),
             pd: app.router_config.mode.is_pd_mode(),
-            max_tokenize_bytes: app.router_config.resolved_max_tokenize_bytes(),
+            tokenize_limits: app.tokenize_limits,
         }
     }
 
@@ -867,7 +870,7 @@ impl IngressRouting {
                     "token routing requires input_ids or a model with a registered tokenizer",
                 )
             })?;
-        let limit = self.max_tokenize_bytes;
+        let limit = self.tokenize_limits.of(&*entry.tokenizer);
         if metadata.text.len() > limit {
             return Err(IngressError::tokenizer_input_too_large());
         }
@@ -905,3 +908,7 @@ impl IngressRouting {
 #[cfg(test)]
 #[path = "../../tests/routing/ingress_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../tests/routing/token_parity.rs"]
+mod token_parity;
