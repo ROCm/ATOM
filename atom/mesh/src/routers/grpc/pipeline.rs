@@ -137,6 +137,7 @@ impl Pipeline {
         let atom = match &self.atom_output {
             Some(atom) => Arc::clone(atom),
             None if producer.metadata().runtime_type == RuntimeType::Atom => {
+                take_parsers(producer.as_ref(), ctx);
                 Arc::new(AtomOutput::of_worker(producer.as_ref()))
             }
             None => {
@@ -145,6 +146,17 @@ impl Pipeline {
             }
         };
         ctx.stop_decoder = atom.stop_decoder(ctx);
+    }
+}
+
+/// The parsers an ATOM `worker` names (GetModelInfo's, or its registration's) where the
+/// router names none, so the reply is not parsed by the model name it was requested under.
+fn take_parsers(worker: &dyn Worker, ctx: &mut ResponseContext) {
+    if ctx.configured_reasoning_parser.is_none() {
+        ctx.configured_reasoning_parser = worker.reasoning_parser().map(str::to_string);
+    }
+    if ctx.configured_tool_parser.is_none() {
+        ctx.configured_tool_parser = worker.tool_parser().map(str::to_string);
     }
 }
 
@@ -611,5 +623,95 @@ mod atom_output_tests {
         let mut ctx = generate_ctx(&tokenizer, STOPPED_AT_DOT);
         pipeline().read_as_atom(&pair, &mut ctx);
         assert_eq!(decode(&mut ctx.stop_decoder, &output), "ab. c");
+    }
+
+    /// A chat to `model` whose reply is read with the router's `configured` parser.
+    fn chat_ctx(
+        tokenizer: &Arc<dyn Tokenizer>,
+        model: &str,
+        configured: Option<&str>,
+    ) -> ResponseContext {
+        let req = ChatCompletionRequest {
+            model: model.to_string(),
+            separate_reasoning: true,
+            ..Default::default()
+        };
+        ResponseContext {
+            original: ProtocolRequest::Chat(Arc::new(req)),
+            model_id: Some(model.to_string()),
+            headers: None,
+            original_text: None,
+            processed_messages: None,
+            tokenizer: Arc::clone(tokenizer),
+            stop_decoder: create_stop_decoder(tokenizer, None, None, true, false),
+            request_id: "chat-1".to_string(),
+            created: 0,
+            tool_parser_factory: Some(crate::tool_parser::ParserFactory::new()),
+            reasoning_parser_factory: Some(reasoning_parser::ParserFactory::new()),
+            configured_tool_parser: None,
+            configured_reasoning_parser: configured.map(str::to_string),
+            prompt_opener: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_atom_reply_is_parsed_by_its_worker_s_parsers_under_any_model_name() {
+        use crate::routers::{
+            render::chat_aggregator,
+            token_handle::test_support::synthetic_single_stream,
+            token_handle::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta},
+        };
+        let tokenizer = byte_level();
+        let reply = tokenizer
+            .encode("<think>plan</think>answer", false)
+            .unwrap();
+        let answer = |ctx: ResponseContext| {
+            let complete = TokenChunk::Complete {
+                token_ids: reply.token_ids().to_vec(),
+                finish_reason: FinishReason::Stop,
+                matched_stop: None,
+                usage: Usage::default(),
+                logprobs: None,
+                input_logprobs: None,
+                meta: WorkerMeta::default(),
+            };
+            let stream = synthetic_single_stream(vec![Ok(complete)]);
+            async move {
+                let resp = chat_aggregator::process_typed(stream, ctx).await.unwrap();
+                let message = &resp.choices[0].message;
+                (message.reasoning_content.clone(), message.content.clone())
+            }
+        };
+        let worker = BasicWorkerBuilder::new("grpc://w:1")
+            .runtime_type(RuntimeType::Atom)
+            .reasoning_parser("qwen3")
+            .build();
+        let plan = PlacementPlan::Single {
+            worker: Arc::new(worker),
+            policy_name: "random",
+        };
+
+        // Served under an alias that names no parser, the worker's splits the reply.
+        let mut ctx = chat_ctx(&tokenizer, "served-alias", None);
+        pipeline().read_as_atom(&plan, &mut ctx);
+        assert_eq!(ctx.configured_reasoning_parser.as_deref(), Some("qwen3"));
+        let split = (Some("plan".to_string()), Some("answer".to_string()));
+        assert_eq!(answer(ctx).await, split);
+
+        // The router's own parser wins.
+        let mut ctx = chat_ctx(&tokenizer, "served-alias", Some("deepseek_r1"));
+        pipeline().read_as_atom(&plan, &mut ctx);
+        assert_eq!(
+            ctx.configured_reasoning_parser.as_deref(),
+            Some("deepseek_r1")
+        );
+
+        // Another runtime's worker leaves the model name to choose.
+        let sglang = single(RuntimeType::Sglang, &[]);
+        let mut ctx = chat_ctx(&tokenizer, "served-alias", None);
+        pipeline().read_as_atom(&sglang, &mut ctx);
+        assert_eq!(ctx.configured_reasoning_parser, None);
+        let unsplit = (None, Some("<think>plan</think>answer".to_string()));
+        assert_eq!(answer(ctx).await, unsplit);
     }
 }
