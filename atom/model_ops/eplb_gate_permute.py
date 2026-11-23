@@ -215,13 +215,14 @@ def swap_rebalance(
     budget: int | None,
     eps: float,
     layer_ids: list[int] | None = None,
-    hot_first: bool = False,
+    hot_first: int | bool = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[int, int]]:
     """The "swap" policy: `rebalance_experts`' result for a placement that
     differs from ``old_p2l`` by at most ``budget`` pairwise swaps a layer.
     ``hot_first`` then orders every rank's experts by load, the heaviest in
-    the rank's first slot (`order_within_ranks`): which rank holds an expert
-    is the swaps' alone.
+    the rank's first slot (`order_within_ranks`): True or a count at least
+    the rank's size orders whole ranks, a smaller count only that many
+    leading slots. Which rank holds an expert is the swaps' alone.
 
     ``pf_load`` / ``dec_load``: [layers, logical] pick counts (prefill, sampled
     decode; None: none), ``rows_per_step`` the group's decode rows a step.
@@ -263,7 +264,10 @@ def swap_rebalance(
         swaps[layer] = len(done)
         if hot_first:
             p2l[layer] = order_within_ranks(
-                p2l[layer], hot_key(pf[layer], dec[layer]), per
+                p2l[layer],
+                hot_key(pf[layer], dec[layer]),
+                per,
+                None if hot_first is True else int(hot_first),
             )
             l2p[layer, p2l[layer]] = slots
     dev = old_p2l.device
@@ -287,16 +291,30 @@ def hot_key(pf: np.ndarray, dec: np.ndarray) -> np.ndarray:
     return key
 
 
-def order_within_ranks(p2l: np.ndarray, key: np.ndarray, per_rank: int) -> np.ndarray:
+def order_within_ranks(
+    p2l: np.ndarray, key: np.ndarray, per_rank: int, head: int | None = None
+) -> np.ndarray:
     """One layer's ``p2l`` (slot -> logical expert) with every rank's experts
     in descending ``key`` ([logical]), ties in their present slot order. The
-    experts of a rank stay the rank's; only their slots inside it change."""
+    experts of a rank stay the rank's; only their slots inside it change.
+
+    ``head``: only the rank's first ``head`` slots are put in order -- its
+    ``head`` heaviest experts, each exchanging slots with whoever sat there,
+    so the rest of the rank stays where it is (None or >= ``per_rank``: the
+    whole rank is ordered)."""
     out = p2l.copy()
+    whole = head is None or head >= per_rank
     for start in range(0, p2l.shape[0], per_rank):
-        experts = p2l[start : start + per_rank]
-        out[start : start + per_rank] = experts[
-            np.argsort(-key[experts], kind="stable")
-        ]
+        experts = out[start : start + per_rank]  # a view: exchanges land in out
+        order = experts[np.argsort(-key[experts], kind="stable")]
+        if whole:
+            experts[:] = order
+            continue
+        for slot in range(max(0, head)):
+            want = order[slot]
+            if experts[slot] != want:
+                at = int(np.nonzero(experts == want)[0][0])
+                experts[slot], experts[at] = experts[at], experts[slot]
     return out
 
 

@@ -2358,6 +2358,16 @@ class EPLBManager:
             and (self._limit > 0 or self._rearms > 0)
         )
 
+    def _hot_first(self) -> int | bool:
+        """ATOM_EPLB_HOT_FIRST for the rebalance being planned: the leading
+        slots of a rank kept in order, or True (whole ranks) for the one that
+        reaches the limit -- the placement that stays."""
+        head = envs.ATOM_EPLB_HOT_FIRST
+        if head <= 0:
+            return 0
+        last = self._limit > 0 and self._rebalance_count + 1 >= self._limit
+        return True if last and envs.ATOM_EPLB_HOT_FIRST_FINAL else head
+
     def _rearm_enabled(self) -> bool:
         return self.gate_permute is not None and envs.ATOM_EPLB_REARM_DRIFT > 0
 
@@ -2635,7 +2645,7 @@ class EPLBManager:
                     budget=budget,
                     eps=envs.ATOM_EPLB_SWAP_EPS,
                     layer_ids=sorted(self._moe_layers),
-                    hot_first=envs.ATOM_EPLB_HOT_FIRST,
+                    hot_first=self._hot_first(),
                 )
             except Exception as exc:  # noqa: BLE001
                 # The plan is a function of the group's loads alone, so every

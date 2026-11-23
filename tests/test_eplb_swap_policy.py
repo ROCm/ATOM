@@ -381,3 +381,12 @@ def test_order_within_ranks_is_stable_and_takes_one_kind_of_load():
     assert gp.hot_key(pf, np.zeros(4)).tolist() == [0.5, 0.0, 0.5, 0.0]
     assert gp.hot_key(np.zeros(4), pf).tolist() == [0.5, 0.0, 0.5, 0.0]
     assert gp.hot_key(pf, pf).tolist() == [1.0, 0.0, 1.0, 0.0]
+    # a head of 2: the rank's two heaviest take its first two slots by
+    # exchanging with whoever sat there; nobody else moves
+    p2l = np.array([0, 1, 2, 3, 4, 5, 6, 7])
+    key = np.array([1.0, 2.0, 3.0, 9.0, 5.0, 5.0, 8.0, 1.0])
+    out = gp.order_within_ranks(p2l, key, 4, head=2)
+    assert out.tolist() == [3, 2, 1, 0, 6, 4, 5, 7]
+    assert gp.order_within_ranks(out, key, 4, head=2).tolist() == out.tolist()
+    assert gp.order_within_ranks(p2l, key, 4, head=9).tolist() == [3, 2, 1, 0, 6, 4, 5, 7]
+    assert gp.order_within_ranks(p2l, key, 4, head=0).tolist() == p2l.tolist()

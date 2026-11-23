@@ -1287,8 +1287,10 @@ def test_hot_first_rebalance_orders_every_rank_and_moves_gate_with_it(
         ATOM_EPLB_GATE_PERMUTE=1,
         ATOM_EPLB_SWAP_BUDGET=2,
         ATOM_EPLB_SWAP_EPS=0,
-        ATOM_EPLB_HOT_FIRST=1,
+        ATOM_EPLB_HOT_FIRST=1,  # one leading slot while learning ...
+        ATOM_EPLB_MAX_REBALANCES=1,  # ... whole ranks in the one that stays
     )
+    assert manager._hot_first() is True
     gpr = manager.gate_permute
     pristine = {i: _Gate(seed=i) for i in gates}
     pf, dec = _skewed(1), _skewed(2)
@@ -1321,3 +1323,19 @@ def test_hot_first_rebalance_orders_every_rank_and_moves_gate_with_it(
     assert "rebalance #1 order: prefill share in a rank's first 4 slots" in text
     assert "(hot_first=1)" in text and "FATAL" not in text
     assert manager.rebalance_count == 1
+
+
+def test_hot_first_is_a_head_until_the_rebalance_that_stays(monkeypatch):
+    manager, _, _ = _bound_manager(
+        monkeypatch,
+        ATOM_EPLB_GATE_PERMUTE=1,
+        ATOM_EPLB_HOT_FIRST=3,
+        ATOM_EPLB_MAX_REBALANCES=2,
+    )
+    assert manager._hot_first() == 3 and manager._hot_first() is not True
+    manager._rebalance_count = 1
+    assert manager._hot_first() is True
+    monkeypatch.setenv("ATOM_EPLB_HOT_FIRST_FINAL", "0")
+    assert manager._hot_first() == 3
+    monkeypatch.setenv("ATOM_EPLB_HOT_FIRST", "0")
+    assert manager._hot_first() == 0

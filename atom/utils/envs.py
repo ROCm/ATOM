@@ -1239,7 +1239,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The swap policy also orders every rank's experts by load, the heaviest
     # in the rank's first slot (a static table built by greedy packing has
     # that order, and the expert kernels walk a rank's experts in slot order).
-    "ATOM_EPLB_HOT_FIRST": lambda: _flag_env("ATOM_EPLB_HOT_FIRST", "0"),
+    # The value is how many leading slots of a rank are kept in order while
+    # the placement is learnt (0: off); the last rebalance before the freeze
+    # orders whole ranks unless ATOM_EPLB_HOT_FIRST_FINAL=0.
+    "ATOM_EPLB_HOT_FIRST": lambda: max(0, _int_env("ATOM_EPLB_HOT_FIRST", 0)),
+    "ATOM_EPLB_HOT_FIRST_FINAL": lambda: _flag_env("ATOM_EPLB_HOT_FIRST_FINAL", "1"),
     # Gate-permute: about how many 256-id blocks of a prefill pass the count
     # launch reads, evenly spread and scaled back up (0: every id). Every
     # block adds to the same counters, so a pass counted whole queues on them.
