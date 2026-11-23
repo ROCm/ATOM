@@ -192,6 +192,22 @@ def test_a_request_the_session_cannot_read_is_rejected_alone():
     assert rejected == [(frames.Rejection, n, frames.INVALID) for n in unreadable]
 
 
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"arrive_time": 1.5},
+        {"trace": pb.TraceContext(model="m")},
+        {"prompt_hash_chain": pb.PromptHashChain()},
+        {"parent_request_id": "p"},
+    ],
+)
+def test_a_field_the_session_does_not_read_is_rejected_not_dropped(fields):
+    spec = pb.RequestSpec(seq_id=2, prompt_token_ids=ref(1, 4), **fields)
+    _, [item] = frames.decode_client(submit([spec], le32(7)))
+    assert (type(item), item.code) == (frames.Rejection, frames.INVALID)
+    assert next(iter(fields)) in item.reason
+
+
 def test_a_message_that_is_no_session_request_is_refused_whole():
     for body in ({"shutdown": pb.Shutdown()}, {"ready": pb.Ready()}, {}):
         message = pb.Envelope(protocol_version=VERSION, **body)
