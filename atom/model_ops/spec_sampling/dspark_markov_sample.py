@@ -14,6 +14,9 @@ CUDA-graph safe: seed, row bases and filters are device tensors; position and
 noise offset are static host ints; no data-dependent grid.
 Philox key high word 0; the verify's draws use other words (`ratio_verify`).
 int64 addressing: ``[max_bs, T, V]`` logits and the store pass 2**31 elements.
+`dspark_markov_sample_tp` is the same op over a TP-sharded LM head: the same
+stored q and draw, with tile partials, histogram tables and stored entries
+gathered across ranks instead of the logits (`sparse_q_select`).
 """
 
 from typing import NamedTuple
@@ -39,13 +42,18 @@ from atom.model_ops.spec_sampling.sampling_scratch import (
     Region,
     carve,
     scratch_buffer,
+    scratch_bytes,
 )
 from atom.model_ops.spec_sampling.softmax_tiles import softmax_combine_kernel
 from atom.model_ops.spec_sampling.sparse_q_select import (
     QSelectScratch,
+    QSelectTPScratch,
     q_select_scratch,
+    q_select_tp_scratch,
     select_and_draw_q,
+    select_and_draw_q_tp,
 )
+from atom.model_ops.spec_sampling.sparse_q_store import store_width
 
 
 @triton.jit
@@ -68,6 +76,8 @@ def _markov_sample_stage1(
     stride_w1_vocab,
     stride_w2_vocab,
     stride_s_row,
+    stride_part,
+    vocab_offset,
     min_temperature,
     BLOCK_ROW: tl.constexpr,
     BLOCK_V: tl.constexpr,
@@ -78,7 +88,13 @@ def _markov_sample_stage1(
     write the scores ``s`` of rows with a q destination into their scratch
     row, and publish the tile's max of ``s``. The (max, id) is taken before
     the division: a near-zero temperature can round distinct logits onto one
-    value. The whole vocab, from id 0."""
+    value.
+
+    ``vocab_size`` ids from ``vocab_offset``: the whole vocab from 0, or one TP
+    rank's shard of it (`dspark_markov_sample_tp`), whose published ids are
+    global. The partials are ``[tiles, ...]`` with tiles ``stride_part`` apart
+    (``num_rows`` unless they are interleaved for one gather).
+    """
     tile = tl.program_id(0)
     offs_row = tl.program_id(1) * BLOCK_ROW + tl.arange(0, BLOCK_ROW)
     offs_v = tile * BLOCK_V + tl.arange(0, BLOCK_V)
@@ -101,7 +117,7 @@ def _markov_sample_stage1(
         stride_w1_vocab,
         0,
         stride_w2_vocab,
-        0,
+        vocab_offset,
         BLOCK_ROW,
         BLOCK_V,
         BLOCK_K,
@@ -114,8 +130,8 @@ def _markov_sample_stage1(
         offs_v,
         row_mask,
         v_mask,
-        num_rows,
-        0,
+        stride_part,
+        vocab_offset,
         part_val_ptr,
         part_idx_ptr,
     )
@@ -136,7 +152,7 @@ def _markov_sample_stage1(
     )
     # Masked lanes are already -inf.
     tl.store(
-        part_smax_ptr + tile * num_rows + offs_row,
+        part_smax_ptr + tile * stride_part + offs_row,
         tl.max(scaled, axis=1),
         mask=row_mask,
     )
@@ -190,10 +206,41 @@ def _sample_scratch(num_rows: int, vocab_size: int) -> SampleScratch:
     )
 
 
-def dspark_markov_sample_scratch(max_rows: int, vocab_size: int, device):
+def dspark_markov_sample_scratch(
+    max_rows: int, vocab_size: int, device, tp_size: int = 1
+):
     """Scratch for any `dspark_markov_sample` call of up to ``max_rows`` rows,
-    allocated once. One call runs at a time, so a block's positions share it."""
-    return scratch_buffer(_sample_scratch(max_rows, vocab_size), device)
+    and with ``tp_size`` > 1 any `dspark_markov_sample_tp` call over that many
+    shards too, allocated once. One call runs at a time, so a block's
+    positions share it."""
+    spec = _sample_scratch(max_rows, vocab_size)
+    if tp_size > 1:
+        sharded = _sample_tp_scratch(
+            max_rows, vocab_size, tp_size, store_width(vocab_size)
+        )
+        if scratch_bytes(sharded) > scratch_bytes(spec):
+            spec = sharded
+    return scratch_buffer(spec, device)
+
+
+def _check_store(q_ids, q_probs, q_meta):
+    store_rows, width = q_ids.shape if q_ids.dim() == 2 else (0, 0)
+    if (
+        width < 1
+        or q_ids.dtype is not torch.int32
+        or q_probs.shape != q_ids.shape
+        or q_probs.dtype is not torch.float32
+        or q_meta.shape != (store_rows, 2)
+        or q_meta.dtype is not torch.int32
+        or not (q_ids.is_contiguous() and q_probs.is_contiguous())
+        or not q_meta.is_contiguous()
+    ):
+        raise ValueError(
+            f"q_ids {tuple(q_ids.shape)} {q_ids.dtype}, q_probs "
+            f"{tuple(q_probs.shape)} {q_probs.dtype}, q_meta "
+            f"{tuple(q_meta.shape)} {q_meta.dtype} are not a contiguous "
+            "[N, K] int32 / [N, K] fp32 / [N, 2] int32 SparseQStore"
+        )
 
 
 def _check_rows(name, t, rows, dtype):
@@ -273,23 +320,7 @@ def dspark_markov_sample(
     )
     num_rows, vocab_size = base_logits.shape
     rank = markov_w2.shape[1]
-    store_rows, store_width = q_ids.shape if q_ids.dim() == 2 else (0, 0)
-    if (
-        store_width < 1
-        or q_ids.dtype is not torch.int32
-        or q_probs.shape != q_ids.shape
-        or q_probs.dtype is not torch.float32
-        or q_meta.shape != (store_rows, 2)
-        or q_meta.dtype is not torch.int32
-        or not (q_ids.is_contiguous() and q_probs.is_contiguous())
-        or not q_meta.is_contiguous()
-    ):
-        raise ValueError(
-            f"q_ids {tuple(q_ids.shape)} {q_ids.dtype}, q_probs "
-            f"{tuple(q_probs.shape)} {q_probs.dtype}, q_meta "
-            f"{tuple(q_meta.shape)} {q_meta.dtype} are not a contiguous "
-            "[N, K] int32 / [N, K] fp32 / [N, 2] int32 SparseQStore"
-        )
+    _check_store(q_ids, q_probs, q_meta)
     _check_rows("q_row_base", q_row_base, num_rows, torch.int32)
     _check_rows("temperatures", temperatures, num_rows, torch.float32)
     _check_rows("top_k", top_k, num_rows, torch.int32)
@@ -326,6 +357,8 @@ def dspark_markov_sample(
         stride_w1_vocab=markov_w1.stride(0),
         stride_w2_vocab=markov_w2.stride(0),
         stride_s_row=work.s.stride(0),
+        stride_part=num_rows,
+        vocab_offset=0,
         min_temperature=SAMPLER_EPS,
         BLOCK_ROW=geometry.block_row,
         BLOCK_V=BLOCK_V,
@@ -365,4 +398,176 @@ def dspark_markov_sample(
         work.select,
         position,
         noise_offset,
+    )
+
+
+class SampleTPScratch(NamedTuple):
+    """One `dspark_markov_sample_tp` call's work buffers."""
+
+    s: torch.Tensor  # [B, V / tp] fp32, this rank's scaled scores
+    # [gemv tiles, 3, B] fp32: each tile's max of s, raw max and lowest id
+    # (int32 bits), tile-major so that one gather is the whole row's tiles.
+    parts: torch.Tensor
+    row_max: torch.Tensor  # [B] fp32
+    row_argmax: torch.Tensor  # [B] int32
+    select: QSelectTPScratch
+
+
+def _sample_tp_scratch(
+    num_rows: int, vocab_size: int, world: int, width: int
+) -> SampleTPScratch:
+    """The regions one `dspark_markov_sample_tp` call of ``num_rows`` over a
+    ``vocab_size`` vocab sharded ``world`` ways needs, for a store ``width``
+    entries wide."""
+    local_vocab = triton.cdiv(vocab_size, world)
+    gemv_tiles = triton.cdiv(local_vocab, BLOCK_V)
+    return SampleTPScratch(
+        Region((num_rows, local_vocab), torch.float32),
+        Region((gemv_tiles, 3, num_rows), torch.float32),
+        Region((num_rows,), torch.float32),
+        Region((num_rows,), torch.int32),
+        q_select_tp_scratch(num_rows, local_vocab, world, width),
+    )
+
+
+def dspark_markov_sample_tp(
+    base_logits: torch.Tensor,
+    prev_ids: torch.Tensor,
+    markov_w1: torch.Tensor,
+    markov_w2: torch.Tensor,
+    out: torch.Tensor,
+    q_ids: torch.Tensor,
+    q_probs: torch.Tensor,
+    q_meta: torch.Tensor,
+    q_row_base: torch.Tensor,
+    position: int,
+    temperatures: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    seed: torch.Tensor,
+    noise_offset: int,
+    scratch: torch.Tensor,
+    vocab_start: int,
+    tp_group,
+    use_custom: bool = True,
+) -> None:
+    """`dspark_markov_sample` over a TP-sharded vocab: the same draw and the
+    same stored q, bit for bit, without gathering the logits.
+
+    ``base_logits`` is this rank's ``[B, V / tp]`` slice of the LM head, ids
+    ``vocab_start`` on; the Markov tables are whole, and so are the store and
+    the noise counters (``noise_offset`` is the whole-vocab op's). ``scratch``
+    is a `dspark_markov_sample_scratch` sized for this TP degree. Each rank
+    runs stage 1 on its slice and the tile partials are gathered, so the row
+    max and raw argmax are the whole row's; the selection then crosses ranks
+    as `select_and_draw_q_tp` describes. Every column's score is the same
+    ``r``-term dot product in the same K order whichever tile holds it, so it
+    is the whole-vocab op's value. Per position, three gathers cross ranks:
+    the ``[V / (128 tp), 3, B]`` partials, the ``[V / (4096 tp), B, 256]``
+    histogram tables and the ``[2, B, K]`` staging pair.
+    """
+    if base_logits.dim() != 2 or markov_w1.dim() != 2 or markov_w2.dim() != 2:
+        raise ValueError("dspark_markov_sample_tp expects 2-D base_logits/w1/w2")
+    num_rows, local_vocab = base_logits.shape
+    world = tp_group.world_size
+    vocab_size = markov_w2.shape[0]
+    rank = markov_w2.shape[1]
+    if local_vocab * world != vocab_size or markov_w1.shape != markov_w2.shape:
+        raise ValueError(
+            f"base_logits holds {local_vocab} of {vocab_size} ids on each of "
+            f"{world} ranks, or markov_w1 {tuple(markov_w1.shape)} does not match "
+            f"markov_w2 {tuple(markov_w2.shape)}"
+        )
+    for name, ids in (("prev_ids", prev_ids), ("out", out)):
+        if ids.shape != (num_rows,) or ids.dtype not in (torch.int32, torch.int64):
+            raise ValueError(
+                f"{name} {tuple(ids.shape)} {ids.dtype} is not a [{num_rows}] "
+                "int32 or int64 id column"
+            )
+    _check_store(q_ids, q_probs, q_meta)
+    _check_rows("q_row_base", q_row_base, num_rows, torch.int32)
+    _check_rows("temperatures", temperatures, num_rows, torch.float32)
+    _check_rows("top_k", top_k, num_rows, torch.int32)
+    _check_rows("top_p", top_p, num_rows, torch.float32)
+    if base_logits.stride(1) != 1:
+        raise ValueError("base_logits rows must be contiguous over the vocab axis")
+    why = markov_weights_unsupported(markov_w1, markov_w2)
+    if why is not None:
+        raise ValueError(f"dspark_markov_sample_tp cannot run: {why}")
+    if num_rows == 0:
+        return
+    geometry = markov_launch_geometry(num_rows, local_vocab)
+    gemv_tiles = geometry.v_tiles
+    work = carve(
+        scratch, _sample_tp_scratch(num_rows, vocab_size, world, q_ids.shape[1])
+    )
+    parts = work.parts
+    _markov_sample_stage1[(gemv_tiles, geometry.row_tiles)](
+        base_logits,
+        prev_ids,
+        markov_w1,
+        markov_w2,
+        parts[:, 1],
+        parts[:, 2].view(torch.int32),
+        temperatures,
+        q_row_base,
+        work.s,
+        parts[:, 0],
+        num_rows,
+        local_vocab,
+        rank,
+        stride_base_row=base_logits.stride(0),
+        stride_prev=prev_ids.stride(0),
+        stride_w1_vocab=markov_w1.stride(0),
+        stride_w2_vocab=markov_w2.stride(0),
+        stride_s_row=work.s.stride(0),
+        stride_part=parts.stride(0),
+        vocab_offset=vocab_start,
+        min_temperature=SAMPLER_EPS,
+        BLOCK_ROW=geometry.block_row,
+        BLOCK_V=BLOCK_V,
+        BLOCK_K=BLOCK_K,
+        num_warps=geometry.num_warps,
+        num_stages=2,
+    )
+    # Rank-major is id order, so the gathered partials are the whole row's
+    # tiles, still `stride_part` apart.
+    gathered = tp_group.all_gather(parts, use_custom=use_custom, dim=0)
+    softmax_combine_kernel[(num_rows,)](
+        gathered[:, 0],
+        None,
+        work.row_max,
+        None,
+        gathered[:, 1],
+        gathered[:, 2].view(torch.int32),
+        work.row_argmax,
+        # Its row count is only the tiles' stride, which is the interleaved one.
+        parts.stride(0),
+        world * gemv_tiles,
+        BLOCK_TILE=triton.next_power_of_2(world * gemv_tiles),
+        WITH_ARGMAX=True,
+        WITH_INV_Z=False,
+        num_warps=4,
+        num_stages=1,
+    )
+    select_and_draw_q_tp(
+        work.s,
+        work.row_max,
+        work.row_argmax,
+        q_row_base,
+        temperatures,
+        top_k,
+        top_p,
+        seed,
+        out,
+        q_ids,
+        q_probs,
+        q_meta,
+        work.select,
+        position,
+        noise_offset,
+        vocab_size,
+        vocab_start,
+        tp_group,
+        use_custom,
     )

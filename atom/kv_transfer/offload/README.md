@@ -120,14 +120,19 @@ Four rules carry the module:
 | `mp/transfer.py` | Transfer identity, terminal detection and the fail-stop transfer deadline. |
 | `mp/page_views.py` | Shared validation of backend-published PAGE views. |
 | `mp/native_state_{layout,scheduler,worker}.py` | The PAGE-backed native-state layout and `stores_state_images`, scheduler leases, and the worker's restore into an Active SLOT. Its registration and block-id validation are `mp/worker.py`'s (shared with the plugin), and `require_native_state_server` is `mp/deployment.py`'s. |
+| `kv_store/client.py` | The store client protocol every KV-store backend implements (register/unregister/exists/put/get/close/stats), and `CallRefused`. |
+| `kv_store/keys.py` | Layout namespace (with each backend's own prefix), the prompt's 16-byte chunk hash chain, and object key spelling. |
+| `kv_store/layouts.py` | The layouts a KV store moves (dense, M3 PAGE, V4.1 replay PAGE) and the codec for each; a backend names the subset it moves. |
+| `kv_store/pool.py` | `TransferSlotPool`: the registered save/load slots in HBM, with quarantine. |
+| `kv_store/scheduler.py`, `kv_store/worker.py` | The scheduler (digest-carrying requests, paced save retries, lookup helpers) and worker (windowed put/get through the pool, completion protocol) every KV-store backend extends. |
 | `mooncake_store/config.py` | The `mooncake_store.*` settings (per-NIC Store pools included) and the startup refusals (layouts other than dense, M3 PAGE, and V4.1 PAGE, DCP > 1, odd chunks). |
-| `mooncake_store/layouts.py` | Which layouts this connector moves (dense, M3 PAGE, V4.1 replay PAGE), and the codec for each. |
-| `mooncake_store/keys.py` | Layout namespace, the prompt's 16-byte chunk hash chain, and Store key spelling. |
+| `mooncake_store/layouts.py` | Which layouts this connector moves (dense, M3 PAGE, V4.1 replay PAGE). |
+| `mooncake_store/keys.py` | The `atomkv1-` namespace prefix, Mooncake groups, and the taint marker key. |
 | `mooncake_store/nic.py` | One PCI-local RDMA device per worker. |
 | `mooncake_store/client.py` | Pure zero-copy `MooncakeDistributedStore` client, result codes, per-call counters. |
-| `mooncake_store/pool.py` | `TransferSlotPool`: the registered save/load slots in HBM, with quarantine. |
+| `mooncake_store/pool.py` | `TransferSlotPool` named for the Mooncake Store. |
 | `mooncake_store/taint.py` | The Store's taint marker, placed after a put Mooncake gave up on, which every client of the Store checks before it loads. |
-| `mooncake_store/scheduler.py`, `mooncake_store/worker.py` | `mooncake_store` scheduler (Store lookups, digest-carrying requests) and worker (windowed put/get, startup probe). |
+| `mooncake_store/scheduler.py`, `mooncake_store/worker.py` | `mooncake_store` scheduler (lookups across the Store pools, the taint marker, read-lease renewal) and worker (NIC selection, Mooncake groups, RDMA-aware slot settlement, the taint marker, startup probe). |
 
 The engine-side counterpart of the state tier lives outside this directory:
 `atom/model_engine/state_offload.py` holds `StateOffloadIndex`, which applies the
@@ -174,6 +179,25 @@ one copy while every rank retrieves it. MiniMax-M3 publishes its GQA KV, scale,
 and NSA index-cache planes as zero-copy PAGE views and deliberately stores one
 shard per TP rank. Both use chunk-completion events to release source PAGE
 blocks before the remote store becomes terminal.
+
+GLM-5.3 and K3.1 Pro also support the OPUS FP4 indexer cache
+(`--index-cache-layout mfma`, `--index-cache-dtype fp4`, `--block-size 64`) with
+standalone `lmcache_mp`, including Mono decode (`ATOM_MONO_ENABLE=1`). Packed
+keys and e8m0 scales retain the OPUS MFMA layout and are transferred as separate
+opaque planes. Their namespace is distinct from legacy FP4. K3 additionally
+transfers its native KDA checkpoint, without TP rank collapse. PCP=PP=1 is
+required; plugins, P/D, `multi`, and `lmcache_offload` remain unsupported for
+OPUS DSA FP4. Model checkpoint weight quantization is unchanged.
+
+For GLM DSA and K3, MP also admits TP8+DCP8 with DP=1, no DP attention and no
+separate draft KV pool. Each rank stores its own local PAGE bytes; TP rank
+collapse is disabled. MP token ranges remain global, so one local PAGE covers
+`block_size * 8` tokens. Set **both** the server's `--chunk-size` and ATOM's
+`LMCACHE_CHUNK_SIZE` to a multiple of that logical block size: for page64, use
+512 (or a multiple), not 256. DCP interleave must divide the physical block size.
+K3's checkpoint boundaries must also align to the chunk size. DCP size and
+interleave are part of the cache namespace; this does not convert caches
+between DCP1 and DCP8. Other DCP topologies remain unsupported.
 
 ### Running the MP server
 
@@ -334,7 +358,9 @@ RESTORE
 - One MP server supports TP, single-host DP, and single-host DP-attention with
   EP. DP replicas use private request-session IDs but share the same
   content-addressed model namespace.
-- Multi-node DP, PP, PCP, DCP, and engine-driven transfers are rejected.
+- Multi-node DP, PP, PCP, and engine-driven transfers are rejected.
+  DCP is limited to GLM DSA / K3 TP8+DCP8 with DP=1, no DP attention
+  or separate draft KV pool, and matching DCP-aware chunks as described above.
   Multi-node DP needs one GPU-local LMCache server per host plus routing.
 - PAGE tensors are registered as zero-copy `uint8` views, preserving FP8/BF16
   bit patterns and avoiding numerical dtype conversion in ROCm pointer paths.
@@ -585,7 +611,15 @@ reverse).
   scheduler and the workers refuse to start where the kernel's boot ID
   (`/proc/sys/kernel/random/boot_id`) cannot be read, since every save would
   then read nothing.
-- A put of a key that already exists succeeds (Mooncake reports 0).
+- A put of a key that already exists succeeds (Mooncake reports 0). Before
+  it packs a window, a save asks the Store which of the window's chunks it
+  holds (one `batch_is_exist`, the shared `kv_store` worker's) and neither
+  reads nor puts those: they are source-safe at once and count as stored. The
+  scheduler's lookup counts only the prefix every rank holds, so a save often
+  starts below what this rank has stored. The lookup grants the chunks it finds
+  a read lease, as a scheduler lookup does; it covers only chunks already held
+  and never stops a new chunk's put. A failed lookup, or a key it answers with
+  an error, puts the chunk as before.
 - After a failed save that the base retries, no save is emitted for 1 s,
   doubled for each further such failure in a row up to 30 s. A stored save
   ends the pause and starts the doubling over, also when it reports after a
@@ -680,11 +714,17 @@ this worker config.
   path, or any other setting that rearranges the KV bytes without being named
   above. A Store whose log or workers report the taint marker needs a
   restart, not `remove_all` (see above).
-- **Logs.** `OFFLOAD_PROFILE=1` emits `[OFFLOAD-SAVE-PROF]` (`pack_ms`, `put_ms`)
+- **Logs.** `OFFLOAD_PROFILE=1` emits `[OFFLOAD-SAVE-PROF]` (`held_chunks` and
+  `put_chunks`; `windows`, the windows the save reached, each looked up once,
+  and `segments`, the runs of missing chunks it packed and put, of which
+  `in_place_segments` in place; `put_bytes`, the bytes of the chunks it
+  put, held chunks not included; `exists_ms`, `pack_ms`, `put_ms`)
   and `[OFFLOAD-LOAD-PROF]` (`get_ms`, `unpack_ms`, `retrieve_ms`,
   `effective_gbps`) per operation, with `status=ok` or the failure that ended
   it, whose rate-limited warning names the first Mooncake result code.
-  Every worker logs `[OFFLOAD-STORE-STATS]` (calls, keys, bytes, failures by
+  Every worker logs `[OFFLOAD-STORE-STATS]` (calls, keys, bytes, the saves'
+  lookups and the chunks they put or found held (`save_exists`,
+  `save_put_chunks`, `save_held_chunks`, `save_held_bytes`), failures by
   code, quarantined slots) at most once a minute while it transfers;
   `put_bytes` counts every chunk a put left in the Store, those it already
   held included, since Mooncake answers both alike. The

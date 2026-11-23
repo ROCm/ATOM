@@ -30,6 +30,9 @@ import urllib.error
 import urllib.request
 
 WORKFLOW = "atom-review-bot.yml"
+# The review job's self-hosted label. box_busy asks whether anything at all is holding
+# this box, so the answer stays right when another workflow legitimately uses it.
+RUNNER_LABEL = "atom-bot"
 POLL_SECONDS = 120
 PAGE = 100
 
@@ -83,18 +86,23 @@ class GitHub:
     def jobs(self, repo, run_id):
         return self._get("/repos/%s/actions/runs/%s/jobs?per_page=%d" % (repo, run_id, PAGE))["jobs"]
 
-    def in_progress_runs(self, repo):
-        """Every in_progress run of this workflow, not just the first page.
+    def in_progress_runs(self, repo, workflow):
+        """Every in_progress run, not just the first page.
 
         A batch of reviews queues up as a long list of in_progress runs and the API returns the
         newest first -- so the one actually holding the runner is last, and a single page would
         miss exactly it.
+
+        `workflow` has no default on purpose. box_busy wants every workflow in the repo --
+        the box is busy whoever is using it -- and queue_gate wants only this one, because
+        it is counting reviews. When that was a default, widening it for box_busy silently
+        widened queue_gate's survey too.
         """
+        where = ("/actions/workflows/%s/runs" % workflow) if workflow else "/actions/runs"
         out, page = [], 1
         while True:
-            batch = self._get(
-                "/repos/%s/actions/workflows/%s/runs?status=in_progress&per_page=%d&page=%d"
-                % (repo, WORKFLOW, PAGE, page))["workflow_runs"]
+            batch = self._get("/repos/%s%s?status=in_progress&per_page=%d&page=%d"
+                              % (repo, where, PAGE, page))["workflow_runs"]
             out += batch
             if len(batch) < PAGE:
                 return out
@@ -107,12 +115,20 @@ class GitHub:
 
 
 def box_busy(api, repo, own_run_id):
-    """Is the box working on some other review? The single runner serialises them, so waiting
-    behind one is normal and must not page anyone."""
-    for run in api.in_progress_runs(repo):
+    """Is anything holding this box? The single runner serialises work, so waiting behind it
+    is normal and must not page anyone.
+
+    This used to count only this workflow's runs, which made a healthy box doing other work
+    read as idle. Nothing stops another workflow from targeting the same label -- it only made
+    the watchdog wrong -- so check_prompts forbade it, and a repo that added one had every
+    review aborted with a message about prompt drift until someone read the gate's source.
+    aiter#8255 spent 2026-11-18 that way. Asking about the label instead of about ourselves
+    costs one wider query and removes the reason for the ban.
+    """
+    for run in api.in_progress_runs(repo, None):          # any workflow: it is one box
         if run["id"] == own_run_id:
             continue
-        if any(j["name"] == "review" and j["status"] == "in_progress"
+        if any(j["status"] == "in_progress" and RUNNER_LABEL in (j.get("labels") or [])
                for j in api.jobs(repo, run["id"])):
             return True
     return False

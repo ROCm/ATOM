@@ -172,6 +172,17 @@ def _assert_chain_matches_tp(
         want = reference[head]
         for name, a, b in zip(("topk_idx", "sparse_bt", "sparse_ctx"), got, want):
             assert torch.equal(a, b), f"head {head} {name} diverged from the TP path"
+        bare = merge_candidate_keys(
+            _exchange(keys, head, transport),
+            block_table,
+            lens,
+            topk,
+            init,
+            local,
+            q,
+            emit_sparse_block_table=False,
+        )
+        assert torch.equal(bare, want[0]), f"head {head} topk_idx without the emit"
 
 
 # ───────────────────────────────────────────────────────────── exactness ──
@@ -222,6 +233,22 @@ def test_forced_blocks_survive_the_round_trip(init, local):
         local=local,
         transport="all_to_all",
         seed=23,
+    )
+
+
+@needs_gpu
+def test_parity_holds_on_rows_past_two_local_top_k_tiles():
+    """A shard row longer than two narrow tiles selects from the wide tile; past
+    1M (2048 blocks a shard) it walks more than one wide tile."""
+    _assert_chain_matches_tp(
+        batch=4,
+        max_seq_len=1_100_000,
+        q=4,
+        topk=16,
+        init=1,
+        local=2,
+        transport="all_to_all",
+        seed=31,
     )
 
 
