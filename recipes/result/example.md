@@ -33,8 +33,8 @@
 ## Environment
 
 - Image: `rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261114`
-- ATOM: `main` @ `0000000000000000000000000000000000000000` (2026-11-14)
-- aiter: `main` @ `1111111111111111111111111111111111111111` (2026-11-14)
+- ATOM: `main` @ [`000000`](https://github.com/ROCm/ATOM/commit/0000000000000000000000000000000000000000) (2026-11-14)
+- aiter: `main` @ [`111111`](https://github.com/ROCm/aiter/commit/1111111111111111111111111111111111111111) (2026-11-14)
 
 ## Findings
 
@@ -52,8 +52,8 @@
 | Item | Value |
 |---|---|
 | Test image | `rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261114` (digest `sha256:0000mock`) |
-| ATOM | `main` @ [`0000000000000000000000000000000000000000`](https://github.com/ROCm/ATOM/commit/0000000000000000000000000000000000000000), 2026-11-14 (mock) ATOM main head |
-| aiter | `main` @ [`1111111111111111111111111111111111111111`](https://github.com/ROCm/aiter/commit/1111111111111111111111111111111111111111), 2026-11-14 (mock) aiter main head |
+| ATOM | `main` @ [`000000`](https://github.com/ROCm/ATOM/commit/0000000000000000000000000000000000000000), 2026-11-14 (mock) ATOM main head |
+| aiter | `main` @ [`111111`](https://github.com/ROCm/aiter/commit/1111111111111111111111111111111111111111), 2026-11-14 (mock) aiter main head |
 | Test date | 2026-11-14 |
 
 ### Performance · MLPerf Endpoint

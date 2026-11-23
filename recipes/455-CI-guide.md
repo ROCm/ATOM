@@ -634,7 +634,7 @@ recipes/
 | `## Lowlights` | 老板 | 问题：跑挂和回退，每行带原因和说法（§5.1）。这一场没有问题就不写这一节 |
 | `## Highlights` | 老板 | 好消息：提升和恢复（§5.1）。没有就不写这一节 |
 | `## Results` | 老板 | 总表：每个模型和上一场比，吞吐还和目标比，列出还没合入的优化 PR（§5.2） |
-| `## Environment` | 所有人 | 全镜像名，ATOM 和 aiter 的 branch、完整 commit 和 commit 日期 |
+| `## Environment` | 所有人 | 全镜像名，ATOM 和 aiter 的 branch、commit 的前 6 位和 commit 日期 |
 | `## Findings` | 所有人 | 测试中的发现，取自 `runs/<YYYYMMDD>/findings.md` |
 | `## Details` | 要看细节的人 | 全部数字、趋势图、说法、跑挂 case 的核心 error log 和复现命令（§5.3、§5.4） |
 
@@ -724,8 +724,8 @@ Lowlights 每一行的 Fix 列都要写上说法，不能只报问题。下面�
 ## Environment
 
 - Image: `rocm/fw-bringup-mlperf:gfx1250-atom-ci455-<YYYYMMDD>`
-- ATOM: `main` @ `<完整 commit>` (<commit 日期>)
-- aiter: `main` @ `<完整 commit>` (<commit 日期>)
+- ATOM: `main` @ [`<commit 前 6 位>`](<完整 commit 的链接>) (<commit 日期>)
+- aiter: `main` @ [`<commit 前 6 位>`](<完整 commit 的链接>) (<commit 日期>)
 
 ## Findings
 
@@ -742,13 +742,13 @@ Lowlights 每一行的 Fix 列都要写上说法，不能只报问题。下面�
 - % of target 是并发 64 的每卡吞吐占目标的百分比，后面带目标值，例如 `16.0% of 250`。目标写在 `perf_target.csv`（§4.2），没设目标的写 —。
 - Unmerged optimization PRs 列出这个模型还没合入 main 的优化，PR 写成 `ATOM-2942`、`aiter-7876` 这样的链接，还没开 PR 的分支用它的名字，例如 `aiter-qkv-proj-fusion`。取自 `pending_optimizations.csv`（§4.2），没有的写 —。
 - N/A 表示跑挂、没有值；— 表示没有结果（例如机器挂了没测成，§3.6）；first 表示第一次有数据，没有可比的。
-- Environment 放在 Results 后面、Findings 前面：全镜像名，ATOM 和 aiter 的 branch、完整 commit 和 commit 日期。Details 里的 Environment details 另有 digest 和 commit 标题。
+- Environment 放在 Results 后面、Findings 前面：全镜像名，ATOM 和 aiter 的 branch、commit 的前 6 位和 commit 日期。commit 只显示前 6 位，链接指向完整的 commit；CSV 和 `image.json` 里仍然记完整的 40 位。Details 里的 Environment details 另有 digest 和 commit 标题。
 
 ### 5.3 Details
 
 在 Findings 后面，`## Details` 下依次是以下几节，全部英文：
 
-1. **Environment details**：测试 image 的全名和 digest、ATOM 和 aiter 的 branch 与完整 commit（带 commit 日期和标题）、测试日期。镜像信息取自本场目录里的 `image.json`（§2.4），缺的项从 CSV 里补。
+1. **Environment details**：测试 image 的全名和 digest、ATOM 和 aiter 的 branch 与 commit 的前 6 位（链接到完整 commit，带 commit 日期和标题）、测试日期。镜像信息取自本场目录里的 `image.json`（§2.4），缺的项从 CSV 里补。
 2. **Performance**：每个模型每个并发一行，列出并行策略（例如 `tp8dcp8`，不写 GPU 数）、tok/s/GPU 和第二指标（endpoint 是 E2E avg interactivity，8K/1K 是 ITL P50），以及各自和上一场比的变化；tok/s/GPU 的变化后面是 % of target，即这个并发的每卡吞吐占目标的百分比（§4.2）。变化列的表头写上一场的日期，例如 `vs 2026-11-07`；某个模型上一场跑挂了，就和它最近一次成功的那场比，并在格子里注明，例如 `+1.0% (vs 2026-10-31)`。
 3. **Accuracy**：flexible-extract、strict-match、上一场的分数（表头写日期）和变化，写法同上。
 4. **Trends**：两张趋势图，见 §5.4。

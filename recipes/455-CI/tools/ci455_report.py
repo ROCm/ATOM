@@ -16,6 +16,8 @@ PERF_SEVERE = -0.10  # down by this much: severe regression
 ACC_WARN = 0.04  # GSM8K down by more than this (0.01 = one point): regression
 ACC_SEVERE = 0.06
 LOG_LINES = 60  # core error log lines shown in the details
+SHORT_SHA = 6  # characters of a commit the result shows, linked to the full one
+REPOS = {"atom": "ROCm/ATOM", "aiter": "ROCm/aiter"}
 EXAMPLE = [
     (
         "> ⚠️ **EXAMPLE**: this file only illustrates the format. All numbers are made up; "
@@ -431,14 +433,20 @@ def _acc_delta(a):
     return f"{acc_flag(a.delta)} {pts(a.delta)}".strip()
 
 
+def _commit_link(repo, sha):
+    """A commit as its first SHORT_SHA characters, linked to the full commit."""
+    return f"[`{sha[:SHORT_SHA]}`](https://github.com/{REPOS[repo]}/commit/{sha})"
+
+
 def _branch_commit(env, repo):
-    """`main` @ `<full sha>` (<commit date>): what the result's first lines say."""
+    """`main` @ [`<short sha>`](<commit>) (<commit date>): what the result's
+    first lines say."""
     c = env.get(repo) or {}
     sha = c.get("commit") or ""
     if not sha:
         return "—"
     date = f" ({c['date']})" if c.get("date") else ""
-    return f"`{c.get('branch') or 'main'}` @ `{sha}`{date}"
+    return f"`{c.get('branch') or 'main'}` @ {_commit_link(repo, sha)}{date}"
 
 
 def _lights_and_results(date, env, results, followups):
@@ -480,24 +488,22 @@ def _lights_and_results(date, env, results, followups):
 
 
 def _env_rows(env, date):
-    def commit(repo, url):
+    def commit(repo):
         c = env.get(repo) or {}
         sha = c.get("commit") or ""
         if not sha:
             return "—"
         tail = " ".join(x for x in (c.get("date"), c.get("title")) if x)
         branch = c.get("branch") or "main"
-        return f"`{branch}` @ [`{sha}`](https://github.com/{url}/commit/{sha})" + (
-            f", {tail}" if tail else ""
-        )
+        return f"`{branch}` @ {_commit_link(repo, sha)}" + (f", {tail}" if tail else "")
 
     digest = f" (digest `{env['digest']}`)" if env.get("digest") else ""
     return [
         "| Item | Value |",
         "|---|---|",
         f"| Test image | `{env.get('image') or '—'}`{digest} |",
-        f"| ATOM | {commit('atom', 'ROCm/ATOM')} |",
-        f"| aiter | {commit('aiter', 'ROCm/aiter')} |",
+        f"| ATOM | {commit('atom')} |",
+        f"| aiter | {commit('aiter')} |",
         f"| Test date | {date} |",
     ]
 

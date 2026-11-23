@@ -26,7 +26,7 @@ python3 -m pytest -q                         # 改了脚本先跑测试
 - `--date` 是场次日期：周六那场或周三那场。每场测完跑一次，连同历史数据重新生成。那天跑的是哪个场景，脚本从数据里看出来。
 - 结果里不 @ 任何人：负责人在 Teams 里汇报时再加。
 - 每个问题（❌ 🔴 ⚠️）的说法取自 `../followups.csv`（guide §3.7）：Lowlights 是一张表（Model、What happened、Cause、Fix、Owner，Owner 始终留空），好消息另有一张 Highlights 表（Model、What happened，没有 Owner 列），哪张没有内容就不写，`problem` 填 Cause 列，`action`（`open_pr` / `merged_pr` / `our_pr` / `repro`）和 `link` 填 Fix 列，Details 里还有 Follow-ups 表。还有问题没写说法时，`make_report.py` 会打 `no follow-up` 的警告。
-- 结果开头写全镜像名，以及 ATOM、aiter 的 branch、完整 commit 和日期；跑挂的模型在 Failures 里附复现命令，取自 `../runs/<YYYYMMDD>/<slug>/*_cmd*.sh`。
+- 结果开头写全镜像名，以及 ATOM、aiter 的 branch、commit 的前 6 位（链接到完整 commit）和日期；跑挂的模型在 Failures 里附复现命令，取自 `../runs/<YYYYMMDD>/<slug>/*_cmd*.sh`。
 - `../pending_fixes.csv` 登记某个模型在 main 上还在等的 PR。这个模型出了问题又没写说法时，`make_report.py` 会在警告下面列出这些 PR，并给出一行可以直接贴进 `followups.csv` 的说法。
 - `../perf_target.csv` 登记每个模型每个场景、每个并发的目标每卡吞吐（guide §4.2）。Results 和 Details 的性能表里 `% of target` 一列写本场每卡吞吐占目标的百分比和目标值，例如 `16.0% of 250`；没设目标的写 —，跑挂的写 N/A。
 - `../pending_optimizations.csv` 登记每个模型还没合入 main 的优化，一项一行；还没开 PR 的写分支链接，并在 `label` 填显示名（guide §4.2）。Results 里 `% of target` 后面一列把 PR 写成 `ATOM-2942`、`aiter-7876` 这样的链接，分支用 `label`；PR 合入后删掉那一行。

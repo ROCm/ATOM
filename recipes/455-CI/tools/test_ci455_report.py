@@ -237,6 +237,21 @@ def test_detail_environment_lists_the_image_the_commits_and_one_test_date():
     )
 
 
+def test_the_commits_show_their_first_6_characters_linked_to_the_full_commit():
+    env = {
+        "atom": {"commit": "a" * 40, "date": "2026-11-21", "title": "t"},
+        "aiter": {"commit": "b" * 40},
+    }
+    text = report_md("2026-11-21", env, [model("Alpha", **FLAT)], "c", "r")
+    atom = f"[`aaaaaa`](https://github.com/ROCm/ATOM/commit/{'a' * 40})"
+    aiter = f"[`bbbbbb`](https://github.com/ROCm/aiter/commit/{'b' * 40})"
+    assert f"- ATOM: `main` @ {atom} (2026-11-21)" in text
+    assert f"- aiter: `main` @ {aiter}" in text
+    assert f"| ATOM | `main` @ {atom}, 2026-11-21 t |" in text
+    assert f"| aiter | `main` @ {aiter} |" in text
+    assert "`aaaaaaa" not in text and "`bbbbbbb" not in text
+
+
 def test_detail_performance_rows_show_the_parallelism_not_the_gpu_count():
     text = report_md("2026-11-14", {}, [model("Alpha", **FLAT)], "c", "r")
     assert "| Parallelism |" in text and "| GPUs |" not in text
@@ -730,12 +745,12 @@ def test_the_environment_sits_after_the_results_and_before_the_findings():
     head = text.split("\n## Environment\n")[1].split("\n## Findings\n")[0]
     assert "- Image: `rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261114`" in head
     assert (
-        "- ATOM: `main` @ `9fec99786b088168aec7729858c1176e99d818e6` (2026-11-13)"
-        in head
+        "- ATOM: `main` @ [`9fec99`](https://github.com/ROCm/ATOM/commit/"
+        "9fec99786b088168aec7729858c1176e99d818e6) (2026-11-13)" in head
     )
     assert (
-        "- aiter: `main` @ `b6f1ff6b7f3754aca8cc8c403b5fcd7a258eba47` (2026-11-13)"
-        in head
+        "- aiter: `main` @ [`b6f1ff`](https://github.com/ROCm/aiter/commit/"
+        "b6f1ff6b7f3754aca8cc8c403b5fcd7a258eba47) (2026-11-13)" in head
     )
 
 
