@@ -2179,8 +2179,9 @@ models:
         extra_args: '--index-cache-dtype fp8 --default-chat-template-kwargs {"thinking_mode":"enabled"}'
     suites:
       accuracy:
-        # The image CI case: tests/accept/atomesh_mm/checks/ci_case.py serves
-        # this cell with USE_ATOMESH_ENTRYPOINTS=1 and holds it to the threshold.
+        # The image CI case: atomesh-accuracy-validation.yaml serves this cell
+        # through ATOMesh's standalone service (USE_ATOMESH_ENTRYPOINTS=1), and
+        # lm_eval holds mmmu_val to the threshold.
         - name: minimax-m31-flash-mxfp4-agg-tp4-mmmu
           topology: agg
           display_topology: AGG-TP4
