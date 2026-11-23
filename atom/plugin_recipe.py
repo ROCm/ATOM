@@ -365,6 +365,9 @@ class Plan:
     model_options: ModelOptions = ModelOptions()
     dspark_options: DSparkOptions = DSparkOptions()
     schema_version: int = 1
+    # Process environment a v2 recipe sets for the server it configures
+    # (`apply_env`): native ATOM / AITER switches that are not recipe options.
+    env: Mapping[str, str] = MappingProxyType({})
 
     @property
     def has_options(self) -> bool:
@@ -372,6 +375,7 @@ class Plan:
             self.engine != EngineOptions()
             or self.model_options != ModelOptions()
             or self.dspark_options != DSparkOptions()
+            or bool(self.env)
         )
 
     @property
@@ -386,7 +390,7 @@ class Plan:
         state["modules"] = {
             k: None if t is None else dict(t) for k, t in self.modules.items()
         }
-        for name in ("arms", "expect", "requires"):
+        for name in ("arms", "expect", "requires", "env"):
             state[name] = dict(state[name])
         return _rebuild_plan, (state,)
 
@@ -420,6 +424,7 @@ class Plan:
             "engine": self.engine.dump(),
             "model_options": self.model_options.dump(),
             "dspark_options": self.dspark_options.dump(),
+            "env": dict(self.env),
         }
         return out
 
@@ -437,8 +442,8 @@ def _rebuild_plan(state: dict[str, Any]) -> Plan:
             for k, t in state.get("modules", {}).items()
         }
     )
-    for name in ("arms", "expect", "requires"):
-        state[name] = MappingProxyType(state[name])
+    for name in ("arms", "expect", "requires", "env"):
+        state[name] = MappingProxyType(state.get(name, {}))
     return Plan(**state)
 
 
@@ -484,6 +489,50 @@ def shorthand(enable: Iterable[str] | str | None) -> Plan | None:
 def _check_slot_pattern(slot: str) -> None:
     if not isinstance(slot, str) or not slot or not _SLOT_RE.match(slot):
         raise RecipeRefused("recipe-schema", f"invalid module slot pattern {slot!r}")
+
+
+ENV_PREFIXES = (
+    "ATOM_",
+    "AITER_",
+    "FLYDSL_",
+    "PYTORCH_",
+    "HIP_",
+    "HSA_",
+    "GPU_",
+    "NCCL_",
+    "RCCL_",
+    "TORCH_",
+)
+_ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+
+def _parse_env(raw: Any, is_v2: bool) -> dict[str, str]:
+    if raw is None:
+        return {}
+    if not is_v2:
+        raise RecipeRefused(
+            "recipe-schema", "env requires schema 'atom.plugin_recipe/2'"
+        )
+    if not isinstance(raw, Mapping):
+        raise RecipeRefused("recipe-schema", "env must map NAME -> value")
+    out = {}
+    for name, value in raw.items():
+        if not (
+            isinstance(name, str)
+            and _ENV_RE.match(name)
+            and name.startswith(ENV_PREFIXES)
+        ):
+            raise RecipeRefused(
+                "recipe-schema", f"env name {name!r}: one of {ENV_PREFIXES}, upper case"
+            )
+        if name.startswith("ATOM_PLUGIN"):
+            raise RecipeRefused("recipe-schema", f"env {name}: the host's own switch")
+        if isinstance(value, bool):
+            value = "1" if value else "0"
+        if not isinstance(value, (str, int, float)):
+            raise RecipeRefused("recipe-schema", f"env {name}: a string or a number")
+        out[name] = str(value)
+    return out
 
 
 def _parse(document: Mapping[str, Any], *, model_arch: str | None) -> dict[str, Any]:
@@ -546,6 +595,7 @@ def _parse(document: Mapping[str, Any], *, model_arch: str | None) -> dict[str, 
     engine_opts = EngineOptions.from_mapping(document.get("engine"))
     model_opts = ModelOptions.from_mapping(document.get("model_options"))
     dspark_opts = DSparkOptions.from_mapping(document.get("dspark_options"))
+    env = _parse_env(document.get("env"), is_v2)
 
     raw_plugins = document.get("plugins")
     has_explicit_plugins = raw_plugins is not None
@@ -725,6 +775,7 @@ def _parse(document: Mapping[str, Any], *, model_arch: str | None) -> dict[str, 
         "engine": engine_opts,
         "model_options": model_opts,
         "dspark_options": dspark_opts,
+        "env": env,
     }
 
 
@@ -745,6 +796,7 @@ def resolve(
             "engine",
             "model_options",
             "dspark_options",
+            "env",
         ):
             if other[field_name] != first[field_name]:
                 raise RecipeRefused("recipe-set-conflict", f"{field_name} differs")
@@ -808,6 +860,7 @@ def resolve(
                 "engine": first["engine"].dump(),
                 "model_options": first["model_options"].dump(),
                 "dspark_options": first["dspark_options"].dump(),
+                "env": dict(sorted(first["env"].items())),
             }
         )
     plan_id = _digest(id_payload)
@@ -829,6 +882,7 @@ def resolve(
         engine=first["engine"],
         model_options=first["model_options"],
         dspark_options=first["dspark_options"],
+        env=MappingProxyType(dict(first["env"])),
         schema_version=schema_version,
     )
 
@@ -907,7 +961,30 @@ def from_cli(
         return None
     if arm not in plan.arms:
         raise RecipeRefused("recipe-unknown-arm", f"{arm!r} not in {sorted(plan.arms)}")
+    apply_env(plan)
     return RecipeSource(documents, names, plan.plan_id, plan.empty)
+
+
+def apply_env(plan: Plan | None, environ=None) -> dict[str, str]:
+    """Set a recipe's ``env`` in this process before any worker starts (the
+    workers inherit it). A variable already set to another value refuses the
+    recipe: the deployment has one source of truth. Returns what was set."""
+    environ = os.environ if environ is None else environ
+    if plan is None or not plan.env:
+        return {}
+    clash = {
+        k: (environ[k], v)
+        for k, v in plan.env.items()
+        if k in environ and environ[k] != v
+    }
+    if clash:
+        raise RecipeRefused(
+            "recipe-env-conflict",
+            f"set in the environment and differently in the recipe: {clash}",
+        )
+    applied = {k: v for k, v in plan.env.items() if k not in environ}
+    environ.update(applied)
+    return applied
 
 
 def _document_text(document: Any, where: str) -> str:

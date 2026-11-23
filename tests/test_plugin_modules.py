@@ -205,6 +205,33 @@ def test_engine_options_reach_the_engine_from_the_config(tmp_path):
     )
 
 
+def test_a_recipe_env_is_applied_once_and_refuses_a_conflict():
+    plan = _plan(env={"ATOM_ENABLE_PREFILL_DELAYER": 1, "ATOM_DSV41_MONO_HI": "auto"})
+    assert dict(plan.env) == {
+        "ATOM_ENABLE_PREFILL_DELAYER": "1",
+        "ATOM_DSV41_MONO_HI": "auto",
+    }
+    assert plan.plan_id != _plan().plan_id
+    environ = {"ATOM_DSV41_MONO_HI": "auto"}
+    assert recipes.apply_env(plan, environ) == {"ATOM_ENABLE_PREFILL_DELAYER": "1"}
+    assert environ["ATOM_ENABLE_PREFILL_DELAYER"] == "1"
+    with pytest.raises(recipes.RecipeRefused, match="recipe-env-conflict"):
+        recipes.apply_env(plan, {"ATOM_DSV41_MONO_HI": "1"})
+    for bad in ({"PATH": "/x"}, {"ATOM_PLUGIN_HOST": "0"}, {"atom_x": "1"}):
+        with pytest.raises(recipes.RecipeRefused):
+            _plan(env=bad)
+    with pytest.raises(recipes.RecipeRefused, match="env requires schema"):
+        recipes.resolve(
+            [
+                {
+                    "schema": recipes.RECIPE_SCHEMA,
+                    "model_arch": ARCH,
+                    "env": {"ATOM_X": "1"},
+                }
+            ]
+        )
+
+
 def test_no_new_environment_variable_carries_a_recipe_option():
     envs = (REPO / "atom/utils/envs.py").read_text(encoding="utf-8")
     for name in (

@@ -1692,6 +1692,7 @@ def _build_options(plan) -> tuple:
     return (
         getattr(plan, "model_options", None) or ModelOptions(),
         getattr(plan, "engine", None) or EngineOptions(),
+        dict(getattr(plan, "env", None) or {}),
     )
 
 
