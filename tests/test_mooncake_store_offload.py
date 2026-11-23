@@ -19,12 +19,9 @@ import ctypes
 import json
 import logging
 import shutil
-import sys
 import threading
 import time
-import types
 from collections import deque
-from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -33,8 +30,26 @@ import pytest
 import torch
 import zmq
 from conftest import MockConfig, with_min_load
+from kv_store_test_support import (
+    BLOCK,
+    CHUNK,
+    CHUNK_BYTES,
+    SLOT,
+    FakeGPUConnector,
+    chunk_key,
+    engine_config,
+    install_fake_aiter,
+    use_one_rank,
+)
+from kv_store_test_support import chunk_hashes as _hashes
+from kv_store_test_support import kv_caches as _kv_caches
+from kv_store_test_support import load_req as _load_req
+from kv_store_test_support import quiescent as _quiescent
+from kv_store_test_support import save_req as _save_req
+from kv_store_test_support import seq as _seq
+from kv_store_test_support import source_safe as _safe
+from kv_store_test_support import stored as _store
 
-from atom.config import KVCacheTensor
 from atom.distributed.pp_transport import PPStageTransport
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.disaggregation.pp_kv_aggregator import PPKVAggregator
@@ -42,11 +57,8 @@ from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
     KVConnectorOutput,
     LoadOperationId,
-    SaveOperationId,
-    SaveSourceGroupId,
 )
 from atom.kv_transfer.offload import config as offcfg
-from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
 from atom.kv_transfer.offload.chunked_scheduler import (
     DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL,
     DENSE_PAGE_SOURCE_SAFE_CHANNEL,
@@ -62,9 +74,7 @@ from atom.kv_transfer.offload.kv_store import scheduler as store_scheduler_mod
 from atom.kv_transfer.offload.kv_store import worker as store_worker_mod
 from atom.kv_transfer.offload.metadata import (
     LMCacheOffloadMetadata,
-    LMCacheReqMeta,
     LoadSpec,
-    SaveSpec,
 )
 from atom.kv_transfer.offload.mooncake_store import async_lookup as async_lookup_mod
 from atom.kv_transfer.offload.mooncake_store import client as store_client
@@ -99,11 +109,6 @@ from atom.sampling_params import SamplingParams
 
 MASTER = "10.0.0.1:26051"
 METADATA = "http://10.0.0.1:26080/metadata"
-BLOCK = 4  # tokens per KV block
-CHUNK = 8  # tokens per Store chunk: two blocks
-BYTES_PER_BLOCK = 16
-CHUNK_BYTES = BYTES_PER_BLOCK * CHUNK // BLOCK
-SLOT = 4096  # one slot's stride for CHUNK_BYTES
 NAMESPACE = "atomkv1-test"
 
 
@@ -302,85 +307,6 @@ class FakeStore:
         return 0
 
 
-class FakeGPUConnector:
-    """Packs each KV block as a byte pattern, as the block GPU connector would.
-
-    ``kv`` is the GPU KV as block id -> bytes; a block never written holds a
-    pattern derived from its id. A save packs tail-to-head and publishes one
-    source-safe group per chunk inside ``track_save_source``, as the real
-    connector does once a group's copy has fenced.
-    """
-
-    gpu_staging_chunk_bytes = CHUNK_BYTES
-    gpu_staging_buffer_bytes = 4 * CHUNK_BYTES
-    # The real token range -> KV block mapping, which in-place copies use.
-    block_size = BLOCK
-    _ranges_to_block_ids = BlockGPUConnector._ranges_to_block_ids
-    _range_block_ids = BlockGPUConnector._range_block_ids
-
-    def __init__(self, source_safe=None) -> None:
-        self.kv: dict[int, bytes] = {}
-        self.calls: list[tuple] = []
-        self.source_safe = source_safe
-        self.fail_from = False
-        self.fail_to = False
-        self.events: list = []
-        self.closed = False
-        self._operation = None
-
-    @contextmanager
-    def track_save_source(self, operation):
-        previous, self._operation = self._operation, operation
-        try:
-            yield
-        finally:
-            self._operation = previous
-
-    @staticmethod
-    def pattern(block: int) -> bytes:
-        return bytes((block * 7 + i) % 251 for i in range(BYTES_PER_BLOCK))
-
-    def batched_from_gpu(self, slots, starts, ends, *, block_ids, producer_event=None):
-        self.calls.append(("from", list(starts)))
-        self.events.append(producer_event)
-        if self.fail_from:
-            raise RuntimeError("pack failed")
-        for slot, start, end in sorted(
-            zip(slots, starts, ends, strict=True), key=lambda item: -item[1]
-        ):
-            blocks = block_ids[start // BLOCK : end // BLOCK]
-            data = b"".join(self.kv.get(b, self.pattern(b)) for b in blocks)
-            slot.tensor.copy_(torch.frombuffer(bytearray(data), dtype=torch.uint8))
-            if self._operation is not None and self.source_safe is not None:
-                self.source_safe(SaveSourceGroupId(self._operation, ((start, end),)))
-
-    def batched_to_gpu(self, slots, starts, ends, *, block_ids):
-        self.calls.append(("to", list(starts)))
-        if self.fail_to:
-            raise RuntimeError("unpack failed")
-        for slot, start, end in zip(slots, starts, ends, strict=True):
-            data = slot.tensor.numpy().tobytes()
-            for i, block in enumerate(block_ids[start // BLOCK : end // BLOCK]):
-                self.kv[block] = data[i * BYTES_PER_BLOCK : (i + 1) * BYTES_PER_BLOCK]
-
-    def close(self):
-        self.closed = True
-
-
-_AITER_FP8 = {"gfx942": torch.float8_e4m3fnuz, "gfx950": torch.float8_e4m3fn}
-
-
-class _FakeAiterDtypes:
-    """``aiter.dtypes`` as the arch in ``state`` resolves it."""
-
-    def __init__(self, state) -> None:
-        self._state = state
-
-    @property
-    def d_dtypes(self):
-        return {"fp8": _AITER_FP8[self._state.gfx], "bf16": torch.bfloat16}
-
-
 # Saves whose expected result is the serial path's own: the pipeline packs the
 # next window while a put is in flight, a GPU copy failure there drains and
 # claims after a fence, and it needs one save thread. Their pipelined
@@ -406,24 +332,9 @@ def save_mode(request, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def aiter_arch(monkeypatch):
-    """AITER's dtype table and arch detection, as on gfx950 to start.
-
-    The namespace asks AITER what ``fp8`` is stored as; CPU runners have no
-    AITER. Setting ``aiter_arch.gfx = "gfx942"`` makes it an MI300X.
-    """
-    state = SimpleNamespace(gfx="gfx950")
-    package = types.ModuleType("aiter")
-    package.dtypes = _FakeAiterDtypes(state)
-    chip_info = types.ModuleType("aiter.jit.utils.chip_info")
-    chip_info.get_gfx = lambda: state.gfx
-    for name, module in (
-        ("aiter", package),
-        ("aiter.jit", types.ModuleType("aiter.jit")),
-        ("aiter.jit.utils", types.ModuleType("aiter.jit.utils")),
-        ("aiter.jit.utils.chip_info", chip_info),
-    ):
-        monkeypatch.setitem(sys.modules, name, module)
-    return state
+    """AITER's dtype table and arch detection, as on gfx950 to start; setting
+    ``aiter_arch.gfx = "gfx942"`` makes it an MI300X."""
+    return install_fake_aiter(monkeypatch)
 
 
 @pytest.fixture
@@ -465,97 +376,19 @@ def _extra(**overrides):
 
 
 def _config(role="offload", *, pp=1, tp=1, layers=4, extra=None, **fields):
-    config = with_min_load(
-        SimpleNamespace(
-            kv_transfer_config={
-                "kv_connector": "mooncake_store",
-                "kv_role": role,
-                "kv_connector_extra_config": _extra() if extra is None else extra,
-            },
-            kv_cache_block_size=BLOCK,
-            decode_context_parallel_size=1,
-            tensor_parallel_size=tp,
-            pipeline_parallel_size=pp,
-            hf_config=SimpleNamespace(
-                num_hidden_layers=layers, model_type="glm_moe_dsa"
-            ),
-            model="test-model",
-            kv_cache_dtype="fp8",
-            speculative_config=None,
-        )
+    return engine_config(
+        "mooncake_store",
+        _extra() if extra is None else extra,
+        role,
+        pp=pp,
+        tp=tp,
+        layers=layers,
+        **fields,
     )
-    for name, value in fields.items():
-        setattr(config, name, value)
-    return config
-
-
-def _seq(req_id, num_prompt_tokens, *, offset=0, cached=0, **fields):
-    seq = SimpleNamespace(
-        id=req_id,
-        token_ids=array.array("i", range(offset, offset + num_prompt_tokens)),
-        num_prompt_tokens=num_prompt_tokens,
-        num_cached_tokens=cached,
-        block_table=list(range(-(-num_prompt_tokens // BLOCK))),
-        offload_loaded=False,
-        offload_load_failed=False,
-    )
-    for name, value in fields.items():
-        setattr(seq, name, value)
-    return seq
-
-
-def _hashes(num_tokens, offset=0):
-    return keys.chunk_hash_chain(list(range(offset, offset + num_tokens)), CHUNK)
 
 
 def _key(hashes, index, *, rank=0, world=1, namespace=NAMESPACE):
-    [key] = keys.chunk_keys(namespace, rank, world, hashes, index, index + 1)
-    return key
-
-
-def _save_req(req_id, num_tokens, *, skip=0, generation=0, offset=0, block_ids=None):
-    return LMCacheReqMeta(
-        req_id=req_id,
-        token_ids=[],
-        block_ids=(
-            list(range(num_tokens // BLOCK)) if block_ids is None else block_ids
-        ),
-        save_spec=SaveSpec(skip_leading_tokens=skip),
-        save_operation=SaveOperationId(req_id, generation),
-        chunk_hashes=_hashes(num_tokens, offset),
-    )
-
-
-def _load_req(req_id, *, hbm, lmc, block_ids, end=None, generation=0, num_tokens=None):
-    return LMCacheReqMeta(
-        req_id=req_id,
-        token_ids=[],
-        block_ids=block_ids,
-        load_spec=LoadSpec(
-            hbm_cached_tokens=hbm,
-            lmcache_cached_tokens=lmc,
-            can_load=True,
-            transfer_end_tokens=end,
-        ),
-        load_operation=LoadOperationId(req_id, generation),
-        chunk_hashes=_hashes(num_tokens or (end or lmc)),
-    )
-
-
-def _store(operation, succeeded=True):
-    return ConnectorCompletion(DENSE_PAGE_STORE_CHANNEL, operation, succeeded)
-
-
-def _quiescent(operation):
-    return ConnectorCompletion(DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL, operation, True)
-
-
-def _safe(operation, index):
-    return ConnectorCompletion(
-        DENSE_PAGE_SOURCE_SAFE_CHANNEL,
-        SaveSourceGroupId(operation, ((index * CHUNK, (index + 1) * CHUNK),)),
-        True,
-    )
+    return chunk_key(namespace, hashes, index, rank=rank, world=world)
 
 
 @pytest.fixture
@@ -1685,7 +1518,7 @@ def test_a_pool_that_cannot_connect_leaves_the_others_open(cluster, scheduler_cl
     up = cluster.store_of("10.0.0.1:26051")
     assert not up.closed
     # The pool that failed is tried again only after its pause.
-    scheduler_clock.now += scheduler_mod._RECONNECT_INTERVAL_S - 1.0
+    scheduler_clock.now += store_scheduler_mod.LOOKUP_RECONNECT_INTERVAL_S - 1.0
     assert _completed_lookup(lookup, _seq(0, 32)) == 32
     assert len(cluster.stores) == 2
     del cluster.setup_rc_of["10.0.0.1:26151"]
@@ -1802,7 +1635,7 @@ def test_a_failed_lookup_pauses_the_next_ones(cluster, scheduler_clock):
         calls = asked()
         # A healthy Store again, but each call could block the scheduler
         # thread: inside the pause no lookup reaches it.
-        scheduler_clock.now += scheduler_mod._LOOKUP_BACKOFF_S - 0.5
+        scheduler_clock.now += store_scheduler_mod.LOOKUP_BACKOFF_S - 0.5
         assert _completed_lookup(lookup, prompt) is None
         assert asked() == calls
         scheduler_clock.now += 1.0
@@ -3177,10 +3010,10 @@ def test_a_get_refused_before_mooncake_has_it_frees_its_slots(
     worker.get_finished()
     store = worker._client._store
 
-    def refused(keys):
+    def refused(*args):
         raise store_client.CallRefused("Mooncake Store batch keys must be unique")
 
-    monkeypatch.setattr(worker._client, "_check_unique", refused)
+    monkeypatch.setattr(store_client, "require_unique_keys", refused)
     request = _load_req(56, hbm=0, lmc=16, block_ids=list(range(4)))
     worker._do_load_req(request)
     assert [call for call in store.calls if call[0] == "get"] == []
@@ -4168,25 +4001,9 @@ def test_factory_builds_both_halves(cluster):
         worker.close()
 
 
-def _kv_caches(num_blocks=8):
-    # MLA-like: token-major rows, one plane per layer.
-    return {
-        f"layer_{i}": KVCacheTensor(
-            layer_num=i,
-            k_cache=torch.zeros((num_blocks * BLOCK, 1, 8), dtype=torch.uint8),
-            index_cache=None,
-        )
-        for i in range(2)
-    }
-
-
 @pytest.fixture
 def one_rank(monkeypatch):
-    monkeypatch.setattr(
-        store_worker_mod,
-        "_tp_group",
-        lambda: SimpleNamespace(world_size=1, rank_in_group=0),
-    )
+    use_one_rank(monkeypatch)
 
 
 def _registering_config():

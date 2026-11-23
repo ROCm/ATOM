@@ -14,6 +14,9 @@ holds the key.
 
 from __future__ import annotations
 
+import threading
+from collections import Counter
+from collections.abc import Iterable
 from typing import Any, Protocol
 
 
@@ -62,4 +65,69 @@ class KVStoreClient(Protocol):
         """Cumulative ``{"counts": {...}, "failures": {...}}`` of the calls."""
 
 
-__all__ = ["CallRefused", "KVStoreClient"]
+class CallStats:
+    """A store client's cumulative calls, keys, bytes and failures per
+    operation, safe to update from the save, load and scheduler threads."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._counts: Counter[str] = Counter()
+        self._failures: Counter[str] = Counter()
+
+    def snapshot(self) -> dict[str, Any]:
+        """``{"counts": {...}, "failures": {...}}``, as ``stats`` answers."""
+        with self._lock:
+            return {"counts": dict(self._counts), "failures": dict(self._failures)}
+
+    def count(
+        self,
+        op: str,
+        keys: list[str],
+        nbytes: int | None,
+        failures: Iterable[str] = (),
+    ) -> None:
+        """Tally one call of ``op``: its keys, the bytes it moved (None for a
+        lookup) and one ``failures`` label per key that failed."""
+        with self._lock:
+            self._counts[f"{op}_calls"] += 1
+            self._counts[f"{op}_keys"] += len(keys)
+            if nbytes is not None:
+                self._counts[f"{op}_bytes"] += int(nbytes)
+            for failure in failures:
+                self._failures[f"{op}:{failure}"] += 1
+
+
+def require_unique_keys(keys: list[str], store: str, why: str = "") -> None:
+    """Refuse a batch that names a key twice, before it reaches ``store``.
+
+    Raises:
+        CallRefused: A duplicate key; nothing was sent.
+    """
+    if len(set(keys)) != len(keys):
+        raise CallRefused(
+            f"{store} batch keys must be unique" + (f"; {why}" if why else "")
+        )
+
+
+def require_answer_per_key(
+    store: str, call: str, answers: list, keys: list[str]
+) -> None:
+    """Refuse an answer that is not one result per key.
+
+    Raises:
+        RuntimeError: ``store``'s ``call`` answered for a different number of
+            keys.
+    """
+    if len(answers) != len(keys):
+        raise RuntimeError(
+            f"{store} {call} returned {len(answers)} results for {len(keys)} keys"
+        )
+
+
+__all__ = [
+    "CallRefused",
+    "CallStats",
+    "KVStoreClient",
+    "require_answer_per_key",
+    "require_unique_keys",
+]

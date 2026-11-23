@@ -19,37 +19,42 @@ is faked by one that packs a byte pattern per KV block.
 
 from __future__ import annotations
 
-import array
 import ctypes
 import logging
 import sys
 import time
 import types
-from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
 import torch
-from conftest import atom_config_double, with_min_load
+from kv_store_test_support import (
+    BLOCK,
+    BYTES_PER_BLOCK,
+    CHUNK,
+    CHUNK_BYTES,
+    SLOT,
+    FakeGPUConnector,
+    all_slots_free,
+    chunk_key,
+    engine_config,
+    install_fake_aiter,
+    use_one_rank,
+)
+from kv_store_test_support import chunk_hashes as _hashes
+from kv_store_test_support import kv_caches as _kv_caches
+from kv_store_test_support import load_req as _load_req
+from kv_store_test_support import quiescent as _quiescent
+from kv_store_test_support import save_req as _save_req
+from kv_store_test_support import seq as _seq
+from kv_store_test_support import source_safe as _safe
+from kv_store_test_support import stored as _store
 
-from atom.config import Config, ParallelConfig
+from atom.config import ParallelConfig
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-from atom.kv_transfer.disaggregation.types import (
-    ConnectorCompletion,
-    LoadOperationId,
-    SaveOperationId,
-    SaveSourceGroupId,
-)
-from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
-from atom.kv_transfer.offload.chunked_scheduler import (
-    DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL,
-    DENSE_PAGE_SOURCE_SAFE_CHANNEL,
-    DENSE_PAGE_STORE_CHANNEL,
-)
 from atom.kv_transfer.offload.kv_store import keys
 from atom.kv_transfer.offload.kv_store import pool as pool_mod
-from atom.kv_transfer.offload.kv_store import worker as store_worker_mod
-from atom.kv_transfer.offload.metadata import LMCacheReqMeta, LoadSpec, SaveSpec
+from atom.kv_transfer.offload.metadata import LoadSpec
 from atom.kv_transfer.offload.umbp_store import client as umbp_client
 from atom.kv_transfer.offload.umbp_store import taint
 from atom.kv_transfer.offload.umbp_store import worker as umbp_worker_mod
@@ -67,11 +72,6 @@ from atom.kv_transfer.offload.umbp_store.worker import (
 
 ADDRESS = "unix:///tmp/umbp-test/server.sock"
 OTHER_ADDRESS = "unix:///tmp/umbp-test/other.sock"
-BLOCK = 4  # tokens per KV block
-CHUNK = 8  # tokens per chunk: two blocks
-BYTES_PER_BLOCK = 16
-CHUNK_BYTES = BYTES_PER_BLOCK * CHUNK // BLOCK
-SLOT = 4096  # one slot's stride for CHUNK_BYTES
 NAMESPACE = "atomumbp1-test"
 
 
@@ -197,84 +197,11 @@ class FakeUMBPClient:
         return answers
 
 
-class FakeGPUConnector:
-    """Packs each KV block as a byte pattern, as the block GPU connector would.
-
-    ``kv`` is the GPU KV as block id -> bytes; a block never written holds a
-    pattern derived from its id. A save packs tail-to-head and publishes one
-    source-safe group per chunk inside ``track_save_source``.
-    """
-
-    gpu_staging_chunk_bytes = CHUNK_BYTES
-    gpu_staging_buffer_bytes = 4 * CHUNK_BYTES
-    block_size = BLOCK
-    _ranges_to_block_ids = BlockGPUConnector._ranges_to_block_ids
-    _range_block_ids = BlockGPUConnector._range_block_ids
-
-    def __init__(self, source_safe=None) -> None:
-        self.kv: dict[int, bytes] = {}
-        self.calls: list[tuple] = []
-        self.source_safe = source_safe
-        self.closed = False
-        self._operation = None
-
-    @contextmanager
-    def track_save_source(self, operation):
-        previous, self._operation = self._operation, operation
-        try:
-            yield
-        finally:
-            self._operation = previous
-
-    @staticmethod
-    def pattern(block: int) -> bytes:
-        return bytes((block * 7 + i) % 251 for i in range(BYTES_PER_BLOCK))
-
-    def batched_from_gpu(self, slots, starts, ends, *, block_ids, producer_event=None):
-        self.calls.append(("from", list(starts)))
-        for slot, start, end in sorted(
-            zip(slots, starts, ends, strict=True), key=lambda item: -item[1]
-        ):
-            blocks = block_ids[start // BLOCK : end // BLOCK]
-            data = b"".join(self.kv.get(b, self.pattern(b)) for b in blocks)
-            slot.tensor.copy_(torch.frombuffer(bytearray(data), dtype=torch.uint8))
-            if self._operation is not None and self.source_safe is not None:
-                self.source_safe(SaveSourceGroupId(self._operation, ((start, end),)))
-
-    def batched_to_gpu(self, slots, starts, ends, *, block_ids):
-        self.calls.append(("to", list(starts)))
-        for slot, start, end in zip(slots, starts, ends, strict=True):
-            data = slot.tensor.numpy().tobytes()
-            for i, block in enumerate(block_ids[start // BLOCK : end // BLOCK]):
-                self.kv[block] = data[i * BYTES_PER_BLOCK : (i + 1) * BYTES_PER_BLOCK]
-
-    def close(self):
-        self.closed = True
-
-
-class _FakeAiterDtypes:
-    def __init__(self) -> None:
-        self.d_dtypes = {"fp8": torch.float8_e4m3fn, "bf16": torch.bfloat16}
-
-
 @pytest.fixture(autouse=True)
 def aiter_arch(monkeypatch):
-    """AITER's dtype table and arch detection, as on gfx950.
-
-    The namespace asks AITER what ``fp8`` is stored as; CPU runners have no
-    AITER.
-    """
-    package = types.ModuleType("aiter")
-    package.dtypes = _FakeAiterDtypes()
-    chip_info = types.ModuleType("aiter.jit.utils.chip_info")
-    chip_info.get_gfx = lambda: "gfx950"
-    for name, module in (
-        ("aiter", package),
-        ("aiter.jit", types.ModuleType("aiter.jit")),
-        ("aiter.jit.utils", types.ModuleType("aiter.jit.utils")),
-        ("aiter.jit.utils.chip_info", chip_info),
-    ):
-        monkeypatch.setitem(sys.modules, name, module)
+    """AITER's dtype table and arch detection, as on gfx950 to start; setting
+    ``aiter_arch.gfx = "gfx942"`` makes it an MI300X."""
+    return install_fake_aiter(monkeypatch)
 
 
 @pytest.fixture(autouse=True)
@@ -294,11 +221,7 @@ def server(monkeypatch):
 
 @pytest.fixture
 def one_rank(monkeypatch):
-    monkeypatch.setattr(
-        store_worker_mod,
-        "_tp_group",
-        lambda: SimpleNamespace(world_size=1, rank_in_group=0),
-    )
+    use_one_rank(monkeypatch)
 
 
 def _extra(**overrides):
@@ -311,116 +234,20 @@ def _extra(**overrides):
     return extra
 
 
-class _EngineConfig(SimpleNamespace):
-    """The engine `Config`'s fields (`atom_config_double`, which refuses any
-    other name) with its TP placement properties, as the connector reads them
-    off the engine config."""
-
-    tp_world_size = Config.tp_world_size
-    tp_size_local = Config.tp_size_local
-    tp_rank_start = Config.tp_rank_start
-    is_multinode_tp = Config.is_multinode_tp
-    _tp_node_slice = Config._tp_node_slice
-
-
 def _config(role="offload", *, pp=1, tp=1, layers=4, extra=None, **fields):
-    values = {
-        "kv_transfer_config": {
-            "kv_connector": "umbp_store",
-            "kv_role": role,
-            "kv_connector_extra_config": _extra() if extra is None else extra,
-        },
-        "kv_cache_block_size": BLOCK,
-        "decode_context_parallel_size": 1,
-        "tensor_parallel_size": tp,
-        "pipeline_parallel_size": pp,
-        "hf_config": SimpleNamespace(
-            num_hidden_layers=layers, model_type="glm_moe_dsa"
-        ),
-        "model": "test-model",
-        "kv_cache_dtype": "fp8",
-        "speculative_config": None,
-    }
-    double = atom_config_double(**{**values, **fields})
-    return with_min_load(_EngineConfig(**vars(double)))
-
-
-def _all_slots_free(pool, region):
-    """Whether every slot of ``region`` is back in the pool (none leased)."""
-    return len(pool._free[pool._region(region)]) == pool.capacity(region)
-
-
-def _seq(req_id, num_prompt_tokens, *, offset=0):
-    return SimpleNamespace(
-        id=req_id,
-        token_ids=array.array("i", range(offset, offset + num_prompt_tokens)),
-        num_prompt_tokens=num_prompt_tokens,
-        num_cached_tokens=0,
-        block_table=list(range(-(-num_prompt_tokens // BLOCK))),
+    return engine_config(
+        "umbp_store",
+        _extra() if extra is None else extra,
+        role,
+        pp=pp,
+        tp=tp,
+        layers=layers,
+        **fields,
     )
-
-
-def _hashes(num_tokens, offset=0):
-    return keys.chunk_hash_chain(list(range(offset, offset + num_tokens)), CHUNK)
 
 
 def _key(hashes, index, *, rank=0, world=1, namespace=NAMESPACE):
-    [key] = keys.chunk_keys(namespace, rank, world, hashes, index, index + 1)
-    return key
-
-
-def _save_req(req_id, num_tokens, *, generation=0, offset=0):
-    return LMCacheReqMeta(
-        req_id=req_id,
-        token_ids=[],
-        block_ids=list(range(num_tokens // BLOCK)),
-        save_spec=SaveSpec(skip_leading_tokens=0),
-        save_operation=SaveOperationId(req_id, generation),
-        chunk_hashes=_hashes(num_tokens, offset),
-    )
-
-
-def _load_req(req_id, *, hbm, lmc, block_ids, generation=0):
-    return LMCacheReqMeta(
-        req_id=req_id,
-        token_ids=[],
-        block_ids=block_ids,
-        load_spec=LoadSpec(
-            hbm_cached_tokens=hbm,
-            lmcache_cached_tokens=lmc,
-            can_load=True,
-            transfer_end_tokens=None,
-        ),
-        load_operation=LoadOperationId(req_id, generation),
-        chunk_hashes=_hashes(lmc),
-    )
-
-
-def _store(operation, succeeded=True):
-    return ConnectorCompletion(DENSE_PAGE_STORE_CHANNEL, operation, succeeded)
-
-
-def _quiescent(operation):
-    return ConnectorCompletion(DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL, operation, True)
-
-
-def _safe(operation, index):
-    return ConnectorCompletion(
-        DENSE_PAGE_SOURCE_SAFE_CHANNEL,
-        SaveSourceGroupId(operation, ((index * CHUNK, (index + 1) * CHUNK),)),
-        True,
-    )
-
-
-def _kv_caches(num_blocks=8):
-    # MLA-like: token-major rows, one plane per layer.
-    return {
-        f"layer_{i}": SimpleNamespace(
-            k_cache=torch.zeros((num_blocks * BLOCK, 1, 8), dtype=torch.uint8),
-            index_cache=None,
-        )
-        for i in range(2)
-    }
+    return chunk_key(namespace, hashes, index, rank=rank, world=world)
 
 
 @pytest.fixture
@@ -824,8 +651,8 @@ def test_save_then_load_round_trips(server, make_worker):
     ]
     assert worker.get_finished().finished_loading == {load.load_operation}
     assert worker._pool.quarantined("save") == worker._pool.quarantined("load") == 0
-    assert _all_slots_free(worker._pool, "save")
-    assert _all_slots_free(worker._pool, "load")
+    assert all_slots_free(worker._pool, "save")
+    assert all_slots_free(worker._pool, "load")
 
 
 class FakeStridedCodec:
@@ -958,7 +785,7 @@ def test_a_put_answered_false_fails_its_save_and_frees_its_slots(server, make_wo
     # The call returned: nothing quarantined, every slot back, nothing
     # marked, loads go on.
     assert worker._pool.quarantined("save") == 0
-    assert _all_slots_free(worker._pool, "save")
+    assert all_slots_free(worker._pool, "save")
     assert worker._store_distrusted is None and taint.reason(ADDRESS) is None
 
 
@@ -972,7 +799,7 @@ def test_a_load_miss_fails_all_or_nothing(server, make_worker):
     assert worker.get_finished().failed_loading == {request.load_operation}
     assert worker.take_load_error_blocks() == set(range(102, 110))
     assert worker._pool.quarantined("load") == 0
-    assert _all_slots_free(worker._pool, "load")
+    assert all_slots_free(worker._pool, "load")
 
 
 def test_a_get_that_raises_quarantines_its_slots_only(server, make_worker):

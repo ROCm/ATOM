@@ -22,8 +22,12 @@ from atom.kv_transfer.offload._offload_common import validated_kv_role
 from atom.kv_transfer.offload.kv_store import scheduler as _store_scheduler
 from atom.kv_transfer.offload.kv_store.keys import DIGEST_BYTES
 from atom.kv_transfer.offload.kv_store.scheduler import (
+    LOOKUP_BACKOFF_S,
+    LOOKUP_RECONNECT_INTERVAL_S,
     KVStoreOffloadScheduler,
+    LookupWarnings,
     StoreLookupBase,
+    pause_lookups,
     prompt_chunk_hashes,
 )
 from atom.kv_transfer.offload.umbp_store import taint
@@ -36,18 +40,6 @@ from atom.kv_transfer.offload.umbp_store.config import (
 )
 
 logger = logging.getLogger("atom")
-
-# Seconds lookups do not ask a server the scheduler could not reach.
-# Connecting blocks the scheduler thread for up to the startup timeout, so a
-# missing server must not cost that on every step.
-_RECONNECT_INTERVAL_S = 30.0
-# The same for a server whose lookup raised or ran into its deadline.
-_LOOKUP_BACKOFF_S = 10.0
-# Either pause lasts at least this many times as long as the failed call
-# blocked the scheduler thread (`_ServerLookup._pause`).
-_LOOKUP_BACKOFF_FACTOR = 10.0
-# Seconds between two warnings about failing lookups.
-_LOOKUP_WARNING_INTERVAL_S = 60.0
 
 
 def require_monotonic_clock_id() -> str:
@@ -79,7 +71,7 @@ class _ServerLookup(StoreLookupBase):
     stage builds a scheduler, and only the head ever schedules. A lookup
     blocks the scheduler thread, so a server the scheduler cannot reach, or
     whose lookup raised or was slow, is not asked for a while
-    (``_RECONNECT_INTERVAL_S``, ``_LOOKUP_BACKOFF_S``).
+    (``LOOKUP_RECONNECT_INTERVAL_S``, ``LOOKUP_BACKOFF_S``).
     """
 
     def __init__(
@@ -94,7 +86,7 @@ class _ServerLookup(StoreLookupBase):
         self._cfg = cfg
         self.client: UMBPStoreClient | None = None
         self.paused_until = 0.0
-        self._next_warning_at = 0.0
+        self._warnings = LookupWarnings("UMBP offload")
 
     def lookup(self, seq: Any, lookup_id: str | None = None) -> int | None:
         """Tokens of ``seq``'s prompt prefix the server holds on every rank.
@@ -122,7 +114,7 @@ class _ServerLookup(StoreLookupBase):
                 "asked for %.0fs",
                 self._cfg.address,
                 len(keys),
-                self._pause(_LOOKUP_BACKOFF_S, asked_at),
+                pause_lookups(self, LOOKUP_BACKOFF_S, asked_at),
                 exc_info=exc,
             )
             return None
@@ -136,7 +128,7 @@ class _ServerLookup(StoreLookupBase):
                 waited_ms,
                 len(keys),
                 self._cfg.lookup_timeout_ms,
-                self._pause(_LOOKUP_BACKOFF_S, asked_at),
+                pause_lookups(self, LOOKUP_BACKOFF_S, asked_at),
             )
             return None
         # Per rank, the run of chunks from chunk 0 the server holds. Every key
@@ -174,7 +166,7 @@ class _ServerLookup(StoreLookupBase):
                 lookup_timeout_ms=self._cfg.lookup_timeout_ms,
             )
         except Exception:
-            pause = self._pause(_RECONNECT_INTERVAL_S, started)
+            pause = pause_lookups(self, LOOKUP_RECONNECT_INTERVAL_S, started)
             logger.warning(
                 "UMBP offload: the scheduler cannot reach the server at %s; "
                 "lookups do not ask it for the next %.0fs",
@@ -186,26 +178,9 @@ class _ServerLookup(StoreLookupBase):
         logger.info("UMBP offload: scheduler lookups use %s", self._cfg.address)
         return self.client
 
-    def _pause(self, floor_s: float, since: float) -> float:
-        """Pause lookups after a failed call that started at ``since``.
-
-        For ``floor_s`` or `_LOOKUP_BACKOFF_FACTOR` times as long as the call
-        blocked, whichever is longer, counted from now. Returns the seconds
-        paused.
-        """
-        now = time.monotonic()
-        pause = max(floor_s, _LOOKUP_BACKOFF_FACTOR * (now - since))
-        self.paused_until = now + pause
-        return pause
-
     def _warn(self, message: str, *args: Any, exc_info: Any = None) -> None:
-        """At most one warning per `_LOOKUP_WARNING_INTERVAL_S`."""
-        now = time.monotonic()
-        if now < self._next_warning_at:
-            logger.debug("UMBP offload: " + message, *args)
-            return
-        self._next_warning_at = now + _LOOKUP_WARNING_INTERVAL_S
-        logger.warning("UMBP offload: " + message, *args, exc_info=exc_info)
+        """At most one warning per `LOOKUP_WARNING_INTERVAL_S`."""
+        self._warnings.warn(self._cfg.address, message, *args, exc_info=exc_info)
 
 
 class UMBPStoreOffloadScheduler(KVStoreOffloadScheduler):

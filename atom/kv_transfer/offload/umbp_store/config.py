@@ -17,15 +17,16 @@ no key of this connector is ever a Mooncake Store key.
 
 from __future__ import annotations
 
-import math
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
-from numbers import Real
 from typing import Any
 
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload.kv_store import keys as store_keys
-from atom.kv_transfer.offload.kv_store.layouts import StoreLayouts
+from atom.kv_transfer.offload.kv_store.layouts import (
+    StoreLayouts,
+    check_store_engine,
+)
 
 KEY_PREFIX = "umbp_store."
 _MIB = 1 << 20
@@ -118,7 +119,7 @@ def parse_umbp_store_config(
             "server's address, e.g. unix:///tmp/umbp/server.sock"
         )
     return UMBPStoreOffloadConfig(
-        address=_text(f"{KEY_PREFIX}address", address),
+        address=offcfg._strict_text(f"{KEY_PREFIX}address", address),
         startup_timeout_ms=offcfg._strict_integer(
             f"{KEY_PREFIX}startup_timeout_ms",
             values.get("startup_timeout_ms", 10000),
@@ -136,7 +137,7 @@ def parse_umbp_store_config(
         save_pool_mib=offcfg._strict_integer(
             f"{KEY_PREFIX}save_pool_mib", values.get("save_pool_mib", 256), minimum=1
         ),
-        save_abandon_timeout_s=_positive_seconds(
+        save_abandon_timeout_s=offcfg._positive_seconds(
             f"{KEY_PREFIX}save_abandon_timeout_s",
             values.get("save_abandon_timeout_s", 300.0),
         ),
@@ -165,40 +166,12 @@ def check_engine_compatibility(cfg: UMBPStoreOffloadConfig, config: Any) -> None
             "several nodes is not supported (each node's ranks reach only "
             "that node's UMBP standalone server)"
         )
-    dcp = int(config.decode_context_parallel_size or 1)
-    if dcp > 1:
-        raise ValueError(
-            "the UMBP offload does not support decode context parallelism "
-            f"(decode_context_parallel_size={dcp})"
-        )
-    block_size = offcfg._strict_integer(
-        "KV cache block size", config.kv_cache_block_size, minimum=1
+    check_store_engine(
+        config,
+        cfg.chunk_tokens,
+        offload="the UMBP offload",
+        chunk_setting=f"{KEY_PREFIX}chunk_tokens",
     )
-    if cfg.chunk_tokens % block_size:
-        raise ValueError(
-            f"{KEY_PREFIX}chunk_tokens={cfg.chunk_tokens} must be a multiple "
-            f"of the KV cache block size {block_size}"
-        )
-
-
-# Every bad setting is a ValueError, whatever is wrong with it, as
-# `offcfg._strict_integer` raises them.
-
-
-def _text(name: str, value: Any) -> str:
-    if not isinstance(value, str) or not value.strip() or value != value.strip():
-        raise ValueError(f"{name} must be a non-empty string without spaces")
-    return value
-
-
-def _positive_seconds(name: str, value: Any) -> float:
-    if isinstance(value, bool) or not isinstance(value, Real):
-        raise ValueError(f"{name} must be a number of seconds")  # noqa: TRY004
-    seconds = float(value)
-    # 0 would switch off every leak reclaimer of the engine, not just this one.
-    if not math.isfinite(seconds) or seconds <= 0:
-        raise ValueError(f"{name} must be finite and > 0, got {value!r}")
-    return seconds
 
 
 __all__ = [

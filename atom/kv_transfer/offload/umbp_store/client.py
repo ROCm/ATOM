@@ -29,11 +29,14 @@ UMBP facts this wrapper is shaped by:
 from __future__ import annotations
 
 import logging
-import threading
-from collections import Counter
 from typing import Any
 
-from atom.kv_transfer.offload.kv_store.client import CallRefused
+from atom.kv_transfer.offload.kv_store.client import (
+    CallRefused,
+    CallStats,
+    require_answer_per_key,
+    require_unique_keys,
+)
 
 logger = logging.getLogger("atom")
 
@@ -91,9 +94,7 @@ class UMBPStoreClient:
     ) -> None:
         self.address = address
         self.lookup_timeout_ms = int(lookup_timeout_ms)
-        self._stats_lock = threading.Lock()
-        self._counts: Counter[str] = Counter()
-        self._failures: Counter[str] = Counter()
+        self._calls = CallStats()
         # Registered regions, base -> size.
         self._regions: dict[int, int] = {}
         try:
@@ -172,7 +173,7 @@ class UMBPStoreClient:
         for start in range(0, len(keys), _LOOKUP_BATCH_KEYS):
             batch = list(keys[start : start + _LOOKUP_BATCH_KEYS])
             answers = [bool(answer) for answer in client.batch_exists(batch)]
-            self._check_length("batch_exists", answers, batch)
+            require_answer_per_key("UMBP", "batch_exists", answers, batch)
             results.extend(answers)
             self._count("exists", batch, None, answers, count_false=False)
         return results
@@ -187,7 +188,7 @@ class UMBPStoreClient:
             Whatever ``batch_put_from_ptr`` raises, after which the server may
                 still be reading the buffers.
         """
-        self._check_unique(keys)
+        require_unique_keys(keys, "UMBP")
         client = self._live()
         answers = [
             bool(answer)
@@ -195,7 +196,7 @@ class UMBPStoreClient:
                 list(keys), [int(p) for p in ptrs], [int(s) for s in sizes]
             )
         ]
-        self._check_length("batch_put_from_ptr", answers, keys)
+        require_answer_per_key("UMBP", "batch_put_from_ptr", answers, keys)
         stored = sum(int(s) for s, ok in zip(sizes, answers) if ok)
         self._count("put", keys, stored, answers)
         return answers
@@ -208,7 +209,7 @@ class UMBPStoreClient:
             Whatever ``batch_get_into_ptr`` raises, after which the server may
                 still be writing the buffers.
         """
-        self._check_unique(keys)
+        require_unique_keys(keys, "UMBP")
         client = self._live()
         answers = [
             bool(answer)
@@ -216,7 +217,7 @@ class UMBPStoreClient:
                 list(keys), [int(p) for p in ptrs], [int(s) for s in sizes]
             )
         ]
-        self._check_length("batch_get_into_ptr", answers, keys)
+        require_answer_per_key("UMBP", "batch_get_into_ptr", answers, keys)
         read = sum(int(s) for s, ok in zip(sizes, answers) if ok)
         self._count("get", keys, read, answers)
         return answers
@@ -246,8 +247,7 @@ class UMBPStoreClient:
     # -- accounting ------------------------------------------------------
     def stats(self) -> dict[str, Any]:
         """Cumulative calls, keys, bytes and False answers, per operation."""
-        with self._stats_lock:
-            return {"counts": dict(self._counts), "failures": dict(self._failures)}
+        return self._calls.snapshot()
 
     def _count(self, op, keys, nbytes, answers, *, count_false=True) -> None:
         """Tally one call; ``nbytes`` is what it moved, None for a lookup.
@@ -255,32 +255,14 @@ class UMBPStoreClient:
         For a put that is the chunks the server holds once it returns: UMBP
         answers True for a key it already had, without moving its bytes.
         """
-        false = sum(1 for ok in answers if not ok)
-        with self._stats_lock:
-            self._counts[f"{op}_calls"] += 1
-            self._counts[f"{op}_keys"] += len(keys)
-            if nbytes is not None:
-                self._counts[f"{op}_bytes"] += int(nbytes)
-            if count_false and false:
-                self._failures[f"{op}:false"] += false
+        false = sum(1 for ok in answers if not ok) if count_false else 0
+        self._calls.count(op, keys, nbytes, ["false"] * false)
 
     def _live(self) -> Any:
         client = self.__dict__.get("_client")
         if client is None:
             raise CallRefused("UMBP client is closed")
         return client
-
-    @staticmethod
-    def _check_unique(keys: list[str]) -> None:
-        if len(set(keys)) != len(keys):
-            raise CallRefused("UMBP batch keys must be unique")
-
-    @staticmethod
-    def _check_length(call: str, answers: list, keys: list[str]) -> None:
-        if len(answers) != len(keys):
-            raise RuntimeError(
-                f"UMBP {call} returned {len(answers)} results for {len(keys)} keys"
-            )
 
 
 __all__ = ["CallRefused", "UMBPStoreClient"]

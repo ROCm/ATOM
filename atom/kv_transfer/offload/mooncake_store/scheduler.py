@@ -23,9 +23,13 @@ from atom.kv_transfer.offload._offload_common import validated_kv_role
 from atom.kv_transfer.offload.kv_store import scheduler as _store_scheduler
 from atom.kv_transfer.offload.kv_store.scheduler import (  # noqa: F401  # re-exported
     _LOOKUP_STATS_INTERVAL_S,
+    LOOKUP_BACKOFF_S,
+    LOOKUP_RECONNECT_INTERVAL_S,
     KVStoreOffloadScheduler,
+    LookupWarnings,
     StoreLookupBase,
     monotonic_clock_id,
+    pause_lookups,
     prompt_chunk_hashes,
 )
 from atom.kv_transfer.offload.lookup_client import LookupPinStatus
@@ -51,19 +55,10 @@ from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
-# Seconds lookups do not ask a pool the scheduler could not reach. Connecting
-# blocks the scheduler thread (Mooncake's setup holds the GIL, and retries a
-# master that does not answer for minutes), so a missing master must not cost
-# that on every step.
-_RECONNECT_INTERVAL_S = 30.0
-# The same for a pool that failed a lookup: a master that is down holds each
-# call for seconds, a hung one for coro_rpc's 30 s request timeout.
-_LOOKUP_BACKOFF_S = 10.0
-# Either pause lasts at least this many times as long as the failed call
-# blocked the scheduler thread (`_StoreLookup._pause`).
-_LOOKUP_BACKOFF_FACTOR = 10.0
-# Seconds between two warnings about one pool's failing lookups.
-_LOOKUP_WARNING_INTERVAL_S = 60.0
+# Lookups pause a pool after a failed call (`pause_lookups`): Mooncake's setup
+# holds the GIL and retries a master that does not answer for minutes, a
+# master that is down holds each call for seconds, a hung one for coro_rpc's
+# 30 s request timeout.
 # A hit older than this is looked up again right before its load is
 # dispatched. Only the lookup's read lease (10 s by default) keeps the chunks
 # from eviction, and a request can wait far longer than that for KV blocks.
@@ -126,7 +121,7 @@ class _StoreLookup(StoreLookupBase):
     A pool's Store client is opened on the first lookup that asks it, not at
     construction: every PP stage builds a scheduler, and only the head ever
     schedules. A pool the scheduler cannot reach, or that fails a lookup, is
-    not asked for a while (``_RECONNECT_INTERVAL_S``, ``_LOOKUP_BACKOFF_S``).
+    not asked for a while (``LOOKUP_RECONNECT_INTERVAL_S``, ``LOOKUP_BACKOFF_S``).
     """
 
     def __init__(
@@ -149,7 +144,7 @@ class _StoreLookup(StoreLookupBase):
             for index, pool in enumerate(self._pools):
                 pool.executor = DaemonExecutor(f"mooncake-store-lookup-{index}")
         # Per pool master: when its next warning may be logged.
-        self._next_warning_at: dict[str, float] = {}
+        self._warnings = LookupWarnings("Mooncake Store offload")
 
     def lookup(self, seq: Any, lookup_id: str | None = None) -> int | None:
         """Tokens of ``seq``'s prompt prefix the Store holds on every rank.
@@ -283,7 +278,7 @@ class _StoreLookup(StoreLookupBase):
 
         None for a pool that raised or could not say whether it carries the
         taint marker, and all 0 for one that does. A pool that raised or
-        answered an error is paused (`_pause`).
+        answered an error is paused (`pause_lookups`).
         """
         asked = [STORE_TAINT_KEY, *keys]
         asked_at = time.monotonic()
@@ -307,7 +302,7 @@ class _StoreLookup(StoreLookupBase):
                     "asked for %.0fs",
                     pool.pool.master,
                     len(keys),
-                    self._pause(pool, _LOOKUP_BACKOFF_S, asked_at),
+                    pause_lookups(pool, LOOKUP_BACKOFF_S, asked_at),
                     exc_info=exc,
                 )
                 answers.append(None)
@@ -335,26 +330,12 @@ class _StoreLookup(StoreLookupBase):
                     len(errors),
                     len(asked),
                     store_client.describe(errors[0]),
-                    self._pause(pool, _LOOKUP_BACKOFF_S, asked_at),
+                    pause_lookups(pool, LOOKUP_BACKOFF_S, asked_at),
                 )
             # A pool that cannot say whether it carries the marker answers
             # nothing: what it holds may be what a late write reached.
             answers.append(None if taint < 0 else codes)
         return answers
-
-    @staticmethod
-    def _pause(pool: _PoolLookups, floor_s: float, since: float) -> float:
-        """Pause ``pool`` after a failed call that started at ``since``.
-
-        For ``floor_s`` or `_LOOKUP_BACKOFF_FACTOR` times as long as the call
-        blocked, whichever is longer, counted from now: a failed setup can
-        return minutes after it started, and a pause counted from before it
-        would already be over. Returns the seconds paused.
-        """
-        now = time.monotonic()
-        pause = max(floor_s, _LOOKUP_BACKOFF_FACTOR * (now - since))
-        pool.paused_until = now + pause
-        return pause
 
     def _connect(self, pool: _PoolLookups) -> bool:
         """Open ``pool``'s client; on failure pause it and return False."""
@@ -369,7 +350,7 @@ class _StoreLookup(StoreLookupBase):
                 rdma_devices="",
             )
         except Exception:
-            pause = self._pause(pool, _RECONNECT_INTERVAL_S, started)
+            pause = pause_lookups(pool, LOOKUP_RECONNECT_INTERVAL_S, started)
             logger.warning(
                 "Mooncake Store offload: the scheduler cannot reach the Store "
                 "pool at %s; lookups do not ask it for the next %.0fs",
@@ -386,13 +367,8 @@ class _StoreLookup(StoreLookupBase):
     def _warn(
         self, pool: _PoolLookups, message: str, *args: Any, exc_info: Any = None
     ) -> None:
-        """At most one warning per pool and `_LOOKUP_WARNING_INTERVAL_S`."""
-        now = time.monotonic()
-        if now < self._next_warning_at.get(pool.pool.master, 0.0):
-            logger.debug("Mooncake Store offload: " + message, *args)
-            return
-        self._next_warning_at[pool.pool.master] = now + _LOOKUP_WARNING_INTERVAL_S
-        logger.warning("Mooncake Store offload: " + message, *args, exc_info=exc_info)
+        """At most one warning per pool and `LOOKUP_WARNING_INTERVAL_S`."""
+        self._warnings.warn(pool.pool.master, message, *args, exc_info=exc_info)
 
 
 class MooncakeStoreOffloadScheduler(KVStoreOffloadScheduler):
