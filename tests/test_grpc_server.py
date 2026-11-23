@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """AtomEngine's Generate on CPU: ATOM's API server module over a fake engine."""
 
 import asyncio
@@ -28,6 +29,7 @@ from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.protocol import DEFAULT_MAX_TOKENS
 from atom.entrypoints.openai.reasoning_dialects import DIALECTS, FALLBACK_DIALECT
 from atom.entrypoints.openai.tool_parser.registry import PARSERS_BY_NAME
+from atom.model_engine.engine_core_mgr import CoreManager
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.zmq_protocol import engine_v1_pb2 as v1
 from atom.sampling_params import RequiredChannel, SamplingParams
@@ -287,6 +289,29 @@ def test_a_partly_dispatched_fan_out_aborts_every_sibling(serve):
     error = _error(_generate(serve(engine), sampling=sampling))
     assert error.http_status == 500
     assert engine.running == {} and engine.io_processor.requests == {}
+
+
+def test_a_refused_rank_hint_leaves_no_callback_in_core_manager(serve):
+    # CoreManager's own callback registry, over two DP ranks: rank 2 is refused.
+    engine, mgr = FakeEngine(), CoreManager.__new__(CoreManager)
+    mgr.label, mgr.pp_size, mgr.local_engine_count = "mgr", 1, 2
+    mgr._seq_id_to_callback, mgr._seq_load, mgr._backlog = {}, {}, None
+    mgr._lb_lock = threading.Lock()
+    mgr.broadcast_utility_command = lambda *args, **kwargs: None
+    engine.core_mgr = mgr
+    make = engine.preprocess_fanout
+
+    def preprocess_fanout(prompt, params, *, stream_callback, **kwargs):
+        seqs = make(prompt, params, stream_callback=stream_callback, **kwargs)
+        for seq in seqs:  # as a Sequence carries them
+            seq.stream_callback = stream_callback
+            seq.data_parallel_rank = kwargs["data_parallel_rank"]
+        return seqs
+
+    engine.io_processor.preprocess_fanout = preprocess_fanout
+    error = _error(_generate(serve(engine), data_parallel_rank=2))
+    assert error.http_status == 400 and "data_parallel_rank=2" in error.message
+    assert mgr._seq_id_to_callback == {} and engine.io_processor.requests == {}
 
 
 def test_a_prompt_only_in_kv_transfer_params_is_admitted(serve):
@@ -995,6 +1020,45 @@ def test_a_session_serves_a_submit_batch_over_the_wire(serve, monkeypatch):
         assert params.max_tokens == DEFAULT_MAX_TOKENS and params.max_tokens_is_default
     assert [p for p, _, _ in engine.preprocessed] == [[1, 2], [4]]
     assert engine.io_processor.requests == {} and engine.aborted == []
+
+
+def test_shutdown_during_structured_admission_aborts_once_its_seq_is_enqueued(
+    serve, monkeypatch
+):
+    engine, entered, admit, events = (
+        FakeEngine(),
+        threading.Event(),
+        threading.Event(),
+        [],
+    )
+    stop, channel = _listen(serve, monkeypatch, engine)
+
+    def add_request(seqs):  # the structured admission, on its thread
+        entered.set()
+        admit.wait(10)
+        events.append("enqueued")
+
+    monkeypatch.setattr(engine.core_mgr, "add_request", add_request)
+    monkeypatch.setattr(
+        engine.core_mgr, "abort_request", lambda seq_id: events.append("aborted")
+    )
+    batch = _submit_batch((3, "a", [1, 2]))
+    envelope = v1.Envelope.FromString(batch[0])
+    envelope.submit.requests[0].sampling.json_schema = '{"type": "object"}'
+
+    def client():
+        yield pb.Frames(frames=[envelope.SerializeToString(), *batch[1:]])
+        admit.wait(10)
+
+    answers = pb_grpc.AtomEngineStub(channel).Session(client(), timeout=10)
+    next(answers)  # Ready
+    assert entered.wait(10)
+    # The shutdown cancels the reader, then asyncio.run cancels it again.
+    threading.Timer(0.3, admit.set).start()
+    stop()
+    channel.close()
+    # close() aborted it before it was enqueued, the admission once it was.
+    assert events == ["aborted", "enqueued", "aborted"]
 
 
 def test_a_step_flushed_after_the_server_stopped_is_dropped():

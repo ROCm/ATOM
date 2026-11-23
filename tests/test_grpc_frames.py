@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """The Session's engine_v1 codec: a SubmitBatch decodes to what preprocess takes, each
 buffer read through its ref, and the server's messages carry what a client reads."""
 

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Codec for the Session's engine_v1 messages, each an Envelope then the frames its
 BufferRefs name: what the server reads from its client and writes back."""
 
