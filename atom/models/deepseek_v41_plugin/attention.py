@@ -27,6 +27,7 @@ from atom.model_ops.attentions.deepseek_v41.a8w4_attention import (
     supports_a8w4_attention,
 )
 from atom.model_ops.attentions.deepseek_v41.fp8_attention import (
+    attend_out_native,
     fused_attention_available,
     fused_sparse_attn_v41_paged_2src,
     sparse_attn_v41_paged_2src,
@@ -64,54 +65,6 @@ from atom.utils import envs, forward_context
 from atom.utils.region_graph import eager_region, forks, join_stream
 
 logger = logging.getLogger("atom")
-
-
-def attend_out_native(
-    query,
-    pool,
-    kv_indices_prefix,
-    kv_indptr_prefix,
-    kv,
-    kv_indices_extend,
-    kv_indptr_extend,
-    attn_sink,
-    softmax_scale,
-    out,
-    positions,
-    cos_cache,
-    sin_cache,
-    x_fp8,
-    x_scale,
-    *,
-    num_groups,
-):
-    """`v41.attn.attend_out`'s native: the FP8-KV decode attention into the
-    BF16 ``out``, then the inverse RoPE + group-32 quant written into
-    ``x_fp8`` / ``x_scale``. The same kernels as the unbound path."""
-    output = sparse_attn_v41_paged_2src(
-        query,
-        pool,
-        kv_indices_prefix,
-        kv_indptr_prefix,
-        kv,
-        kv_indices_extend,
-        kv_indptr_extend,
-        attn_sink,
-        softmax_scale,
-        out=out,
-    )
-    heads, head_dim = output.shape[-2:]
-    values, scales = inverse_rope_group_quant(
-        output.reshape(-1, heads, head_dim),
-        positions,
-        cos_cache,
-        sin_cache,
-        num_groups=num_groups,
-        quant_group_size=32,
-    )
-    x_fp8.copy_(values.view_as(x_fp8))
-    x_scale.copy_(scales.view_as(x_scale))
-    return x_fp8, x_scale
 
 
 def _live_step():
