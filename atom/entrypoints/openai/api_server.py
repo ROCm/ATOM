@@ -753,6 +753,12 @@ def _validate_pool_capacity(
 
 def _validate_sequence_context_length(seq, sampling_params=None) -> None:
     limit = _get_engine_max_model_len()
+    pool = _get_engine_max_pool_tokens()
+    # The tighter limit answers first. A pool smaller than the context refuses
+    # a prompt it cannot hold whatever max_tokens is; a pool at least as large
+    # never binds once the context check passes.
+    if pool is not None and (limit is None or pool < limit):
+        _validate_pool_capacity(seq.num_prompt_tokens, pool)
     if getattr(sampling_params, "max_tokens_is_default", False) and limit is not None:
         remaining = limit - seq.num_prompt_tokens
         if remaining <= 0:
@@ -763,14 +769,7 @@ def _validate_sequence_context_length(seq, sampling_params=None) -> None:
                 limit,
             )
         seq.max_tokens = min(seq.max_tokens, remaining)
-    # The pool first: a prompt it cannot hold is too long whatever max_tokens
-    # is, and only that refusal tells a client to shorten the prompt.
-    _validate_pool_capacity(seq.num_prompt_tokens, _get_engine_max_pool_tokens())
-    _validate_context_length(
-        seq.num_prompt_tokens,
-        seq.max_tokens,
-        _get_engine_max_model_len(),
-    )
+    _validate_context_length(seq.num_prompt_tokens, seq.max_tokens, limit)
 
 
 def _has_multimodal_content(messages: list[Any]) -> bool:
