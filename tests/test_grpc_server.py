@@ -372,6 +372,18 @@ def test_prepare_refuses_what_the_chat_route_refuses_with_a_400(chat, fields, me
     assert engine.grammars == []
 
 
+def test_generate_refuses_stops_with_a_response_schema_as_the_chat_route_does(chat):
+    engine = FakeEngine()
+    structured = pb.StructuredOutput(response_format_json=RESPONSE_FORMAT)
+    stops = [v1.TokenIds(ids=[7])]
+    written = _generate(
+        chat(engine), structured_output=structured, stop_token_sequences=stops
+    )
+    error = _error(written)
+    assert error.http_status == 400 and "custom stop strings" in error.message
+    assert engine.grammars == [] and engine.preprocessed == []
+
+
 def test_chat_template_kwargs_must_be_an_object(chat):
     structured = pb.StructuredOutput(chat_template_kwargs_json="[]")
     error = _prepare(chat(FakeEngine()), structured).error
