@@ -230,3 +230,39 @@ def test_final_requests_are_max_reduced_from_their_own_row(monkeypatch):
     assert [max(row) for row in r.ub_tokens_across_dp] == [4, 7]
     alone = _sync(monkeypatch, peers=[], **_base(final_requests=3))
     assert alone.max_final_requests_across_dp == 3
+
+
+def test_every_reduction_comes_back_as_a_plain_value_in_dp_order(monkeypatch):
+    """Three ranks, every field distinct: each reduction is a Python value
+    read off its own row, and the per-rank tokens stay an int32 row in DP
+    order, the rank's own first."""
+
+    def peer(tokens, bs, eager, final):
+        def make(local):
+            row = local.clone()
+            row[0], row[1], row[3], row[4] = tokens, bs, eager, final
+            return row
+
+        return make
+
+    r = _sync(
+        monkeypatch,
+        peers=[peer(3, 5, 1, 0), peer(7, 1, 0, 4)],
+        **_base(
+            scheduled_tokens=10,
+            scheduled_bs=2,
+            final_requests=1,
+            tbo_on=True,
+            local_can_split=True,
+            max_seqlen_q=2,
+        ),
+    )
+    assert r.scheduled_tokens_per_dp_rank.dtype == np.int32
+    assert r.scheduled_tokens_per_dp_rank.tolist() == [10, 3, 7]
+    assert type(r.max_bs_across_dp) is int and r.max_bs_across_dp == 5
+    assert r.any_rank_needs_eager is True
+    assert r.prefill_across_dp == (False, False, False)
+    assert r.tbo_collective_active is False and r.ub_tokens_across_dp is None
+    assert type(r.max_seqlen_q_across_dp) is int and r.max_seqlen_q_across_dp == 2
+    assert type(r.max_final_requests_across_dp) is int
+    assert r.max_final_requests_across_dp == 4
