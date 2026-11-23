@@ -25,9 +25,10 @@ one group share the index, so a prefix another engine instance (another DP
 rank) already computed is copied into this rank's pool on demand and then read
 locally.
 
-`UmbpPoolMemory` is the model runner's side: the pool is this process's own
-allocation, and UMBP adopts the `[P, N)` part of it through its IPC handle. It
-also tells UMBP how far the GPU has got.
+`UmbpPoolMemory` is the model runner's side: it supplies the allocation's
+`[P, N)` layout to UMBP and tells UMBP how far the GPU has got. Local IPC uses
+this process's ordinary allocation; the optional FABRIC path obtains the final
+KV tensor from UMBP's native L1 memory helper in this same process.
 
 That last part is what makes sharing safe. The scheduler publishes a block when
 the forward that fills it is issued, and frees one while a forward may still be
@@ -40,7 +41,7 @@ to then has landed. UMBP reads or fills a block from outside only after that.
 
 Built by the `umbp_pool` KV connector (`connector.py`), which reads its settings
 off `kv_transfer_config` (`settings.py`). Needs the `mori_umbp_l1` client
-module and a running UMBP standalone server.
+module and a running UMBP L1 service.
 """
 
 from __future__ import annotations
@@ -66,6 +67,10 @@ logger = logging.getLogger("atom")
 _KEY_BYTES = 8
 
 
+class FabricFetchInDoubtError(RuntimeError):
+    """A FABRIC destination may still be written; its slots must stay held."""
+
+
 def _load_client_module():
     try:
         import mori_umbp_l1
@@ -77,15 +82,32 @@ def _load_client_module():
     return mori_umbp_l1
 
 
+def _load_native_l1_helpers():
+    try:
+        from mori.umbp_l1 import NativeL1Memory, require_native_l1_support
+    except ImportError as exc:  # pragma: no cover - deployment error
+        raise RuntimeError(
+            "UMBP FABRIC needs mori.umbp_l1.NativeL1Memory; install the MORI "
+            "Python package matching the native L1 cross-tray build"
+        ) from exc
+    return NativeL1Memory, require_native_l1_support
+
+
 def _connect(settings: UmbpPoolSettings):
     module = _load_client_module()
+    if settings.transport == "fabric":
+        _, require_native_l1_support = _load_native_l1_helpers()
+        module = require_native_l1_support(module)
     return module, module.L1Client(settings.address)
 
 
 def pool_id_for(config, settings: UmbpPoolSettings, rank: int = 0) -> str:
     """The name both processes of one engine rank know their pool by."""
     dp_rank = config.parallel_config.data_parallel_rank
-    return f"{settings.namespace}:dp{dp_rank}:tp{rank}"
+    namespace = settings.namespace
+    if settings.transport == "fabric":
+        namespace = f"{settings.node_id}:{namespace}"
+    return f"{namespace}:dp{dp_rank}:tp{rank}"
 
 
 def share_group_for(config, settings: UmbpPoolSettings) -> str:
@@ -144,8 +166,11 @@ class UmbpL1Pool(KVBlockPool):
         on_evict: Callable[[int], None] | None = None,
         on_remap: Callable[[int], None] | None = None,
         grant_batch: int = 32,
+        transport: str = "ipc",
     ):
         self._client = client
+        self._fabric = transport == "fabric"
+        self._fetch_error: FabricFetchInDoubtError | None = None
         self._op_hold, self._op_release, self._op_publish = ops
         self.pool_id = pool_id
         opened = client.open(pool_id)
@@ -182,7 +207,7 @@ class UmbpL1Pool(KVBlockPool):
         self.blocks_fetched = 0
         self.bytes_fetched = 0
         self.fetch_seconds = 0.0
-        # owner -> (future, block ids, hashes, tokens_of, start) of a copy
+        # owner -> (future, block ids, hashes, tokens_of, start, generation) of a copy
         # into held blocks (`fetch_async`).
         self._fetches: dict = {}
         self._executor = None
@@ -318,6 +343,7 @@ class UmbpL1Pool(KVBlockPool):
             self._op_keys.append(key)
 
     def flush(self) -> None:
+        self._check_fetch_state()
         if not self._op_kinds:
             return
         kinds, slots, keys = self._op_kinds, self._op_slots, self._op_keys
@@ -420,6 +446,9 @@ class UmbpL1Pool(KVBlockPool):
     def fetch(
         self, hashes: Sequence[int], tokens_of: Callable[[int], array.array]
     ) -> int:
+        self._check_fetch_state()
+        if self._fabric:
+            raise RuntimeError("UMBP FABRIC requires the held-slot fetch_async path")
         if not hashes:
             return 0
         self.flush()
@@ -488,6 +517,7 @@ class UmbpL1Pool(KVBlockPool):
         True while a copy for `owner` is in flight (`fetch_pending`); its
         blocks are indexed by `poll_fetches` once it lands.
         """
+        self._check_fetch_state()
         if owner in self._fetches:
             return True
         if not hashes:
@@ -520,22 +550,43 @@ class UmbpL1Pool(KVBlockPool):
         return True
 
     def fetch_pending(self, owner: Hashable) -> bool:
+        self._check_fetch_state()
         return owner in self._fetches
+
+    def _check_fetch_state(self) -> None:
+        if self._fetch_error is not None:
+            raise self._fetch_error
 
     def poll_fetches(self) -> None:
         """Index what finished copies brought in; release the rest."""
+        self._check_fetch_state()
         if not self._fetches:
             return
         done = [o for o, entry in self._fetches.items() if entry[0].done()]
         for owner in done:
-            future, ids, hashes, tokens_of, started, generation = self._fetches.pop(
-                owner
-            )
+            future, ids, hashes, tokens_of, started, generation = self._fetches[owner]
             try:
                 slots, _, copied, copied_bytes, *_ = future.result()
-            except Exception:  # a failed copy is a miss
+                if self._fabric and list(slots) != ids[: len(slots)]:
+                    raise ValueError(
+                        "FABRIC fetch returned a non-prefix destination list"
+                    )
+            except Exception as exc:
+                if self._fabric:
+                    # A lost RPC reply is not proof that DMA stopped. Keep
+                    # every destination held and the owner pending, and fail
+                    # closed rather than recomputing into these slots. A
+                    # drained failure must be returned by MORI as a completed
+                    # (possibly empty) prefix, not as an ambiguous exception.
+                    self._fetch_error = FabricFetchInDoubtError(
+                        f"UMBP pool {self.pool_id}: FABRIC completion is unknown; "
+                        f"quarantining {len(ids)} destination slots. Stop serving; "
+                        "do not recycle KV memory until peers have drained."
+                    )
+                    raise self._fetch_error from exc
                 logger.exception("UMBP pool %s: background fetch failed", self.pool_id)
                 slots, copied, copied_bytes = [], 0, 0
+            del self._fetches[owner]
             # Content from before a clear is not indexed again.
             landed = len(slots) if generation == self._clear_generation else 0
             index = self._hash_to_block_id
@@ -584,32 +635,42 @@ class UmbpL1Pool(KVBlockPool):
 
 
 class UmbpPoolMemory(KVPoolMemory):
-    """The pool is this process's allocation; UMBP adopts its `[P, N)` part.
+    """Adapt the runner's KV allocation and `[P, N)` layout to UMBP.
 
     Blocks `[0, P)` stay private, `[P, N)` are UMBP's slots `[0, N - P)`
-    (`split_point`; at a share ratio of 1 that is the whole pool). UMBP maps
-    the allocation through its IPC handle and manages, shares and copies those
-    blocks, but never allocates, zeroes or frees the memory.
+    (`split_point`; at a share ratio of 1 that is the whole pool). In FABRIC
+    mode UMBP's in-process memory helper owns allocation, export, registration
+    and safe detach. This adapter supplies the layout and owner write progress.
+    The existing IPC path adopts an ordinary torch allocation.
     """
 
     counted_by_torch = True
     shares_blocks = True
 
-    def __init__(self, client, pool_id: str, group: str, ratio: float):
+    def __init__(
+        self, client, pool_id: str, group: str, ratio: float, transport: str = "ipc"
+    ):
         self._client = client
         self.pool_id = pool_id
         self.group = group
         self.ratio = ratio
+        self._native_memory = None
+        if transport == "fabric":
+            NativeL1Memory, _ = _load_native_l1_helpers()
+            self._native_memory = NativeL1Memory(client, pool_id, group)
         self._device = None
         # Where UMBP's part was adopted from; None until `bind_layout`.
         self._mapped_base: int | None = None
         # (when it was recorded, device event) per forward, oldest first.
         self._issued: deque = deque()
         self._wake = threading.Event()
+        self._stopping = threading.Event()
         self._watcher: threading.Thread | None = None
         self._closed = False
 
     def writes_issued(self) -> None:
+        if self._closed or self._stopping.is_set():
+            raise RuntimeError(f"UMBP pool {self.pool_id}: memory is closing")
         if self._mapped_base is None:
             return
         import torch
@@ -634,23 +695,30 @@ class UmbpPoolMemory(KVPoolMemory):
         """Tell UMBP each time the device finishes another forward's writes."""
         issued = self._issued
         failed = False
-        while not self._closed:
-            if not issued:
+        pending_stamp = None
+        while not self._stopping.is_set():
+            if not issued and pending_stamp is None:
                 self._wake.clear()
-                if not issued and not self._closed:
+                if self._stopping.is_set():
+                    break
+                if not issued:
                     self._wake.wait()
                 continue
-            stamp, event = issued[0]
-            # Polled, not waited on: a blocking wait here could hold up the
-            # thread that issues the next forward.
-            if not event.query():
-                time.sleep(0.0005)
-                continue
-            issued.popleft()
-            while issued and issued[0][1].query():
-                stamp = issued.popleft()[0]
+            if issued:
+                # Polled, not waited on: a blocking wait here could hold up
+                # the thread that issues the next forward. Keep the highest
+                # completed stamp until Commit acknowledges it, including
+                # when an idle owner will not issue another forward.
+                if issued[0][1].query():
+                    pending_stamp = issued.popleft()[0]
+                    while issued and issued[0][1].query():
+                        pending_stamp = issued.popleft()[0]
+                elif pending_stamp is None:
+                    time.sleep(0.0005)
+                    continue
             try:
-                self._client.commit(self.pool_id, stamp)
+                self._client.commit(self.pool_id, pending_stamp)
+                pending_stamp = None
                 failed = False
             except Exception:  # sharing degrades, serving goes on
                 if not failed:
@@ -660,34 +728,21 @@ class UmbpPoolMemory(KVPoolMemory):
                         self.pool_id,
                     )
                 failed = True
-
-    def close(self) -> None:
-        """Stop reporting progress and let UMBP unmap its part; the memory
-        itself is this process's and goes with it."""
-        self._closed = True
-        self._wake.set()
-        if self._watcher is not None:
-            self._watcher.join(timeout=1.0)
-        if self._mapped_base is not None:
-            try:
-                self._client.detach(self.pool_id)
-            except Exception:  # noqa: BLE001 - the server may already be gone
-                logger.debug("UMBP pool %s: detach on close failed", self.pool_id)
-            self._mapped_base = None
+                self._stopping.wait(0.01)
 
     def allocate(self, nbytes: int, device) -> Any:
-        import torch
-
         if self._device is not None:
             raise NotImplementedError(
                 f"UMBP pool {self.pool_id}: the runner asked for a second paged pool"
             )
         self._device = device
+        if self._native_memory is not None:
+            return self._native_memory.allocate(nbytes, device)
+        import torch
+
         return torch.zeros(nbytes, dtype=torch.uint8, device=device)
 
     def bind_layout(self, buf, block_regions: Sequence[Any], num_blocks: int) -> None:
-        from atom.mono.runtime import hip_ipc
-
         offset = split_point(num_blocks, self.ratio)
         slots = num_blocks - offset
         if slots <= 0 or not block_regions:
@@ -716,18 +771,23 @@ class UmbpPoolMemory(KVPoolMemory):
                 f"pool ({len(overlaps)} overlapping pairs, pool {buf.numel()} B, "
                 f"last region ends at {end})"
             )
-        allocation = hip_ipc.get_allocation_base(base)
-        handle = hip_ipc.get_ipc_handle(allocation)
-        device = buf.device.index if buf.device.index is not None else 0
-        self._client.attach(
-            self.pool_id,
-            self.group,
-            device,
-            buf.numel(),
-            external_handle=handle,
-            external_offset=base - allocation,
-        )
-        self._client.bind_layout(self.pool_id, slots, layout)
+        if self._native_memory is not None:
+            self._native_memory.bind_layout(buf, slots, layout)
+        else:
+            from atom.mono.runtime import hip_ipc
+
+            device = buf.device.index if buf.device.index is not None else 0
+            allocation = hip_ipc.get_allocation_base(base)
+            handle = hip_ipc.get_ipc_handle(allocation)
+            self._client.attach(
+                self.pool_id,
+                self.group,
+                device,
+                buf.numel(),
+                external_handle=handle,
+                external_offset=base - allocation,
+            )
+            self._client.bind_layout(self.pool_id, slots, layout)
         self._mapped_base = base
         logger.info(
             "UMBP pool %s: adopted %d of %d blocks (ratio %.2f) of this process's "
@@ -739,6 +799,29 @@ class UmbpPoolMemory(KVPoolMemory):
             buf.numel() / (1 << 30),
             buf.device,
         )
+
+    def close(self) -> None:
+        if self._closed:
+            return
+
+        # Connector.close runs before ModelRunner drops KV tensors. Stop the
+        # progress reporter for either transport before the optional UMBP
+        # helper synchronizes and detaches. Its lifecycle error propagates.
+        self._stopping.set()
+        self._wake.set()
+        if self._watcher is not None:
+            # Keep IPC's bounded shutdown; FABRIC requires a drained reporter.
+            self._watcher.join(timeout=None if self._native_memory is not None else 1.0)
+        if self._native_memory is not None:
+            self._native_memory.close()
+        elif self._mapped_base is not None:
+            try:
+                self._client.detach(self.pool_id)
+            except Exception:  # noqa: BLE001 - the server may already be gone
+                logger.debug("UMBP pool %s: detach on close failed", self.pool_id)
+        self._closed = True
+        self._mapped_base = None
+        self._issued.clear()
 
 
 def make_umbp_l1_pool(
@@ -757,6 +840,7 @@ def make_umbp_l1_pool(
         num_blocks,
         on_evict=on_evict,
         on_remap=on_remap,
+        transport=settings.transport,
     )
     pool.shares_content = settings.fetch
     return pool
@@ -773,7 +857,9 @@ def make_umbp_pool_memory(
     _, client = _connect(settings)
     pool_id = pool_id_for(config, settings, rank)
     group = share_group_for(config, settings)
-    return UmbpPoolMemory(client, pool_id, group, settings.share_ratio)
+    return UmbpPoolMemory(
+        client, pool_id, group, settings.share_ratio, settings.transport
+    )
 
 
 def split_point(num_blocks: int, ratio: float) -> int:
