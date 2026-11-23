@@ -1345,6 +1345,11 @@ def _listen(monkeypatch, mc, listener, messages):
     conn._chunked_local_ids = {}
     conn._listener_bound = threading.Event()
     conn._listener_error = None
+    # Opening a named consumer ahead of its transfer is
+    # tests/test_mooncake_open_target.py's; here the opener only queues.
+    conn.__dict__.setdefault("_rail_pool", None)
+    conn.__dict__.setdefault("_opened_targets", set())
+    conn.__dict__.setdefault("_target_opener", Mock())
     monkeypatch.setattr(mc, "zmq_socket_ctx", lambda *_a, **_k: nullcontext(_Socket()))
     with pytest.raises(_Stop):
         listener()

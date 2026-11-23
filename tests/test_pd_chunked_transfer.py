@@ -104,6 +104,8 @@ def producer(pp_rank=0, pp_size=1, num_tokens=10):
     c._received_handoffs = {}
     c._rail_pool = None
     c.transfer_engine = MemoryEngine()
+    c._opened_targets = set()
+    c._target_opener = SimpleNamespace(submit=lambda fn, *a, **kw: None)
     c._notify_transfer_result = MagicMock()
     c._cuda_device = 0
     src = (ctypes.c_ubyte * 48)(*range(1, 49))
