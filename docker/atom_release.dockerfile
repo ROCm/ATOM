@@ -298,19 +298,28 @@ RUN if [ "${ATOM_BASE_IMAGE}" = "rocm10-base" ]; then \
         fi; \
     fi
 
-# Pin Triton to the perf-good ROCm build. The base rocm/pytorch image ships a
-# newer Triton (3.8.0) that regressed benchmark throughput; install the
-# AMD-published 3.7.0 wheel plus its matching triton_kernels from AMD's index,
-# here in the shared base so every downstream stage (the aiter build included)
-# links the same Triton. Empty TRITON_PIN_VERSION keeps the base image's Triton.
-# The pin is for the rocm/pytorch (ROCm 7.x) line only: the ROCm 10 flavor
-# installs Triton from the ROCm 10 SDK channel (ROCM_TRITON_VERSION) and
-# force-reinstalling a rocm7.2.0 wheel there would break the stack, so the
-# rocm10-base flavor is excluded.
+# Pin Triton to a build AITER has been tuned against, here in the shared base so
+# every downstream stage (the aiter build included) links the same one. Empty
+# TRITON_PIN_VERSION keeps whatever is already installed.
+#
+# Which build matters, not just the version number. AITER's kernel configs are
+# tuned per Triton build, closely enough that a tile fitting in LDS under one
+# build overflows it under another: ROCm/aiter#8266 reports gfx950
+# FF-A16W16-fused tiles needing 168864 B against a 163840 B limit. So take a
+# build AITER exercises in its own CI rather than whichever one the SDK channel
+# happened to produce that night.
+#
+# The index is per line: release_0914/rocm-7.2.0 for a rocm/pytorch base,
+# release_1031/rocm-10.1.0 for the ROCm 10 line (10.2.0 and 10.3.0 are 403 on
+# that index today; 10.1.0 is the newest ROCm 10 build published there, which is
+# also where AITER's own install_triton.sh lands for a 10.x SDK). The ROCm 10
+# line used to be excluded from pinning entirely, which left it on the SDK
+# channel's nightly Triton -- same 3.9 series, but a build nobody had run AITER
+# against.
 ARG TRITON_INDEX_URL="https://pypi.amd.com/triton/release_0914/rocm-7.2.0/simple/"
 ARG TRITON_PIN_VERSION="3.8.0+amd.rocm7.2.0.git7cb7b059"
 ARG TRITON_KERNELS_PIN_VERSION="1.0.0+amd.rocm7.2.0.git7cb7b059"
-RUN if [ "${ATOM_BASE_IMAGE}" != "rocm10-base" ] && [ -n "${TRITON_PIN_VERSION}" ]; then \
+RUN if [ -n "${TRITON_PIN_VERSION}" ]; then \
         echo "========== [base] Pin Triton ${TRITON_PIN_VERSION} (index ${TRITON_INDEX_URL}) =========="; \
         pip install --index-url "${TRITON_INDEX_URL}" --force-reinstall --no-deps \
             "triton==${TRITON_PIN_VERSION}" \

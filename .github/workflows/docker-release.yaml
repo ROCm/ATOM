@@ -236,6 +236,16 @@ jobs:
               # redefinition. Nothing is lost by skipping it: the pip SDK ships
               # librccl.so.1 and rccl/rccl.h, and the image keeps those.
               EXTRA_BUILD_ARGS="${EXTRA_BUILD_ARGS} --build-arg BUILD_RCCL=0"
+              # Triton is pinned to the build AITER is tuned against, not left
+              # to the SDK channel's nightly. AITER's gfx950 FF-A16W16-fused
+              # configs overflow LDS and fail with OutOfResources on a Triton
+              # they were not tuned for (ROCm/aiter#8266). release_1031 has no
+              # rocm-10.2.0 or 10.3.0 index yet -- both 403 -- so rocm-10.1.0 is
+              # the ROCm 10 build to take, which is also where AITER's own
+              # install_triton.sh lands for a 10.x SDK.
+              EXTRA_BUILD_ARGS="${EXTRA_BUILD_ARGS} --build-arg TRITON_INDEX_URL=https://pypi.amd.com/triton/release_1031/rocm-10.1.0/simple/"
+              EXTRA_BUILD_ARGS="${EXTRA_BUILD_ARGS} --build-arg TRITON_PIN_VERSION=3.9.0+amd.rocm10.1.0.gitf1bf9132"
+              EXTRA_BUILD_ARGS="${EXTRA_BUILD_ARGS} --build-arg TRITON_KERNELS_PIN_VERSION=1.0.0+amd.rocm10.1.0.gitf1bf9132"
               ;;
             */*|*:*)
               # A literal image reference, for a one-off build on something
