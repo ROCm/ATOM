@@ -46,6 +46,8 @@ struct FakeAtom {
     kv_transfer_info: Option<String>,
     /// GetServerInfo never answers.
     stall_server_info: bool,
+    /// GetServerInfo calls, each answered after 100 ms.
+    server_info_reads: std::sync::atomic::AtomicUsize,
 }
 
 impl FakeAtom {
@@ -103,6 +105,9 @@ impl AtomEngine for FakeAtom {
         if self.stall_server_info {
             std::future::pending::<()>().await;
         }
+        self.server_info_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(100)).await;
         Ok(Response::new(GetServerInfoResponse {
             protocol_version: 1,
             kv_transfer_info_json: self
@@ -1040,6 +1045,27 @@ mod pairs {
             matches!(error, EngineError::Http { status, .. } if status == StatusCode::GATEWAY_TIMEOUT),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_pairs_of_a_prefill_read_its_info_once() {
+        let (p, p_url) = instance(Vec::new(), false, prefill_info(2, None)).await;
+        let pw = worker(&p_url, PREFILL);
+        let pairs = AtomPairs::new(
+            Arc::new(WorkerRegistry::new()),
+            AtomPdRankMappingPolicy::Idx2Idx,
+        )
+        .await
+        .unwrap();
+        let reads = (0..8).map(|_| pairs.adapter_for(&pw));
+        let adapters = timeout(HANG, futures::future::join_all(reads))
+            .await
+            .unwrap();
+        assert!(adapters.iter().all(Result::is_ok));
+        let reads = p
+            .server_info_reads
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(reads, 1);
     }
 
     #[tokio::test]
