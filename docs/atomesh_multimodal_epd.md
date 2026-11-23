@@ -398,11 +398,13 @@ carries media (`AtomPairCtx::carries_media`).
 - The server builds only the model's vision modules on GPU 0
   (`build_vision_modules` of M3.1 and K3.1, chosen by
   `VISION_BUILDERS`), and loads their weights through
-  `load_weights_into_model`, skipping `language_model.`.
+  `load_weights_into_model`, skipping the checkpoint's `language_model.`
+  and `model.language_model.` tensors.
 - It encodes one request at a time on one thread
   (`ThreadPoolExecutor(1)`). The chat handler preprocesses with the
   existing `_prepare_multimodal_inputs`, and answers non-image requests
-  with an error.
+  with an error. Every route the absent engine would serve, all but chat
+  completions, models, health and metrics, answers 400.
 - The embedding pool takes what `--gpu-memory-utilization` leaves after
   the vision modules, rounded down to whole GiB so that Mooncake's
   registration slices stay aligned to 2 MiB GPU pages.
@@ -422,8 +424,12 @@ carries media (`AtomPairCtx::carries_media`).
 How the transfer works:
 - E's `EcPool` registers its pool with a Mooncake TransferEngine. P's
   `EcReader`, one per TP rank and built on first use, reads with
-  `transfer_sync_read` inside the encode callback, into a registered buffer
-  of `max_model_len` rows.
+  `transfer_sync_read` inside the encode callback, into a registered
+  buffer. The buffer starts at the first request's size and grows, at least
+  doubling, up to `max_model_len` rows: a buffer that size from the start
+  would be 12 GiB at M3.1's 1M context, outside the KV cache's share of the
+  GPU. A rank that cannot grow it fails its read, and the ranks fall back
+  together (D12).
 - Both open their engine through the KV connector's
   `mooncake_connector.py: _select_ib_devices`, with
   `ATOM_MOONCAKE_IB_DEVICE`, now declared in `atom/utils/envs.py`, taking
@@ -715,7 +721,7 @@ All were taken on g15 with M3.1, at the recipe's launch flags.
 | #3410 | `atom/entrypoints/openai/api_server.py`, `protocol.py`; `atom/model_engine/sequence.py`, `scheduler.py`, `llm_engine.py` | D4, D5, D6 |
 | #3407 | `atom/mesh/src/routers/prepare/inference.rs`, `routers/ingress.rs`, `observability/route_trace.rs`, `core/placement/backend/atom.rs` | D1, D2, D3, D7 |
 | #3411 | `atom/kv_transfer/disaggregation/mooncake/ec_transport.py`; `atom/utils/envs.py` and `docs/environment_variables.md` (`ATOM_EC_LEASE_S`, `ATOM_MOONCAKE_IB_DEVICE`) | D11, D12 |
-| #3412 | `atom/model_engine/encoder_only.py`, `model_runner.py` (the read and the ranks' agreement), `multimodal_runtime.py`, `arg_utils.py`; `atom/config.py`; `atom/entrypoints/openai/api_server.py`, `protocol.py` | D9, D10, D12, D13 |
+| #3412 | `atom/model_engine/encoder_only.py`, `model_runner.py` (the reader's size and the ranks' agreement), `multimodal_runtime.py`, `arg_utils.py`; `atom/config.py`; `atom/entrypoints/openai/api_server.py`, `protocol.py` | D9, D10, D12, D13 |
 | #3413 | `atom/entrypoints/atomesh/atom_standalone_service.py`, `api_server.py` | D19 |
 | #3408 | `atom/mesh/src/cliargs.rs`, `config/`, `core/worker.rs`, `core/worker_registry.rs`, `policies/registry.rs`, `routers/factory.rs` | D15 |
 | #3409 | `atom/mesh/src/routers/http_pd_router.rs`, `routers/ingress.rs` | D13, D15, D16 |
