@@ -433,6 +433,7 @@ class Drafter(abc.ABC):
                     running_tokens_are_unified=True,
                     scheduled_tokens_gpu=runner.forward_vars["batch_info"].gpu[2:3],
                 )
+                get_forward_context().draft_graph_warmup = pass_.will_capture
                 pass_.warmup(bs)
                 if end_trace is not None:
                     step = pass_.name.rsplit(".", 1)[-1].lstrip("_")
