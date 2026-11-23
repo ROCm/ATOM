@@ -1885,6 +1885,13 @@ class EPLBManager:
         self.gate_permute: gate_permute.GatePermuteRuntime | None = None
         # Layer id -> [logical] -> rank of ATOM_EPLB_REF_PLACEMENT (logging).
         self._reference_ranks: dict[int, Any] = {}
+        # ATOM_EPLB_MTP: a draft layer's expert weights (expert-major views),
+        # one layer's temp buffers, and the draft rows a step of the last plan.
+        self._mtp_weights: list[list[torch.Tensor]] = []
+        self._mtp_temp: list[torch.Tensor] = []
+        self._mtp_rows_at_last_solve: float | None = None
+        # Rank 0: the draft layers' decode load at the last evaluation.
+        self._mtp_window_base: Any = None
         # Gate-permute EPLB: the group's live decode rows a step the last
         # executed rebalance was planned for (its window's), None before one.
         self._rows_at_last_solve: float | None = None
@@ -2132,6 +2139,7 @@ class EPLBManager:
         )
         self.monitor.initialize_for_metadata(self.live_metadata)
         self._init_gate_permute(model)
+        self._init_mtp(getattr(owner, "drafter", None))
         # Initialize redundant physical slots the checkpoint loader left empty.
         # At init the weights are loaded, the EP group is up, and no forward has
         # run yet -- an idle window for the one-time trivial copy.
@@ -2295,9 +2303,87 @@ class EPLBManager:
             envs.ATOM_EPLB_DUMP_DIR or "-",
         )
 
-    def _collect_expert_weight_tensors(self, layer: Any) -> list[torch.Tensor]:
+    def _init_mtp(self, drafter: Any) -> None:
+        """ATOM_EPLB_MTP: gate-permute EPLB also places the drafter's EP MoE
+        layers (`MtpPlacement`), which the target model's scan leaves out.
+        Refused where it cannot: without gate-permute, without a drafter that
+        has such layers, or for layers that do not sit as EPLB's do."""
+        if not envs.ATOM_EPLB_MTP:
+            return
+        gp, meta = self.gate_permute, self.live_metadata
+        assert meta is not None
+        if gp is None:
+            raise RuntimeError("ATOM_EPLB_MTP=1 needs ATOM_EPLB_GATE_PERMUTE=1")
+        model = getattr(drafter, "model", None)
+        layers = (
+            collect_ep_moe_layers(model)
+            if model is not None and hasattr(model, "modules")
+            else {}
+        )
+        if not layers:
+            raise RuntimeError(
+                "ATOM_EPLB_MTP=1 but the runner's drafter has no EP MoE layer "
+                "with expert weights"
+            )
+        for layer_id, layer in layers.items():
+            if (
+                int(getattr(layer, "num_redundant_experts", 0))
+                or int(layer.ep_size) != meta.ep_size
+                or int(layer.ep_rank) != meta.ep_rank
+            ):
+                raise RuntimeError(
+                    f"ATOM_EPLB_MTP cannot place draft layer {layer_id}: "
+                    "redundant experts, or another EP layout than the target's"
+                )
+        mtp = gate_permute.MtpPlacement(
+            layers=layers,
+            gates=gate_permute.collect_gates(model, layers),
+            ep_size=meta.ep_size,
+            device=meta.physical_to_logical_map.device,
+        )
+        self._mtp_weights = [
+            self._collect_expert_weight_tensors(layer, mtp.per_rank)
+            for layer in mtp.layers
+        ]
+        # One draft layer's temp buffers: the head of the target layers',
+        # where an expert's parts are the same (they migrate one layer at a
+        # time, never together), else buffers of their own.
+        mine, shared = self._mtp_weights[0], self._reusable_temp_buffers or []
+        borrowed = len(shared) == len(mine) and all(
+            b.shape[0] >= w.shape[0]
+            and b.shape[1:] == w.shape[1:]
+            and b.dtype == w.dtype
+            for w, b in zip(mine, shared)
+        )
+        if borrowed:
+            self._mtp_temp = [b[: w.shape[0]] for w, b in zip(mine, shared)]
+        else:
+            self._mtp_temp = [torch.empty_like(w) for w in mine]
+        gp.mtp = mtp
+        from atom.spec_decode import draft_graph
+
+        draft_graph.record_scope = lambda pass_, running_bs: mtp.capture(
+            (pass_.name, running_bs)
+        )
+        logger.info(
+            "%s mtp: placing the drafter's layers %s (%d experts, top-%d, %d a "
+            "rank) from the identity on sampled decode steps; budget %d swaps a "
+            "layer; temp buffers %s",
+            gate_permute.TAG,
+            mtp.layer_ids,
+            mtp.num_experts,
+            mtp.top_k,
+            mtp.per_rank,
+            envs.ATOM_EPLB_MTP_SWAP_BUDGET,
+            "shared with the target layers" if borrowed else "own",
+        )
+
+    def _collect_expert_weight_tensors(
+        self, layer: Any, num_local: int | None = None
+    ) -> list[torch.Tensor]:
         assert self.live_metadata is not None
-        num_local = self.live_metadata.num_local_physical_experts
+        if num_local is None:
+            num_local = self.live_metadata.num_local_physical_experts
         # Specialized quant methods own their live weight layout. Ask the method
         # for expert-major views so EPLB never needs to know Mega-private fields
         # or shuffle details. Methods without this hook use the legacy collector.
@@ -2970,6 +3056,16 @@ class EPLBManager:
             ep_rank=self.live_metadata.ep_rank,
             max_num_replicas=self.live_metadata.max_num_replicas,
         )
+        mtp_plan = None
+        if gp is not None and gp.mtp is not None:
+            try:
+                mtp_plan = self._plan_mtp(gp.mtp)
+            except Exception as exc:  # noqa: BLE001
+                # As the swap policy above: the group's loads alone decide.
+                self._fatal_stop(
+                    f"the draft layers' plan failed ({exc!r}); nothing moved"
+                )
+                return
         if gp is not None:
             # This rebalance is planned: what it was planned for, and the
             # start of the next window.
@@ -2987,6 +3083,8 @@ class EPLBManager:
             old_p2l = self.live_metadata.physical_to_logical_map.clone()
             moved = (old_p2l != p2l.to(old_p2l.device)).sum(dim=1).tolist()
             experts_moved = sum(moved[i] for i in layer_ids)
+            if mtp_plan is not None:
+                experts_moved += sum(mtp_plan["moved"])
             # An evaluation that moves nothing is idle, and not a rebalance.
             self._idle_evaluations = 0 if experts_moved else self._idle_evaluations + 1
             self._log_gate_permute_plan(
@@ -3003,6 +3101,7 @@ class EPLBManager:
                 moved=moved,
                 swaps=swaps,
                 solve_ms=_t_rearrange_ms,
+                mtp_plan=mtp_plan,
             )
             layer_ids = [i for i in layer_ids if moved[i]]
         num_chunks = (len(layer_ids) + chunk_size - 1) // chunk_size
@@ -3067,6 +3166,24 @@ class EPLBManager:
                     start // chunk_size + 1,
                     num_chunks,
                     chunk,
+                    _chunk_ms,
+                )
+        if mtp_plan is not None and any(mtp_plan["moved"]):
+            # The draft layers that change, as one more chunk after the
+            # target layers', in a step of its own, on every rank.
+            yield
+            _tc = _time.perf_counter()
+            changed = [i for i, n in enumerate(mtp_plan["moved"]) if n]
+            for index in changed:
+                self._switch_mtp_layer(gp.mtp, index, mtp_plan["p2l"][index])
+            _chunk_ms = (_time.perf_counter() - _tc) * 1000.0
+            _t_migrate_ms += _chunk_ms
+            if _ep_rank == 0:
+                logger.info(
+                    "%s rebalance #%d mtp chunk layers=%s migrate=%.1fms",
+                    gate_permute.TAG,
+                    _rc,
+                    [gp.mtp.layer_ids[i] for i in changed],
                     _chunk_ms,
                 )
         if gp is not None:
@@ -3157,6 +3274,86 @@ class EPLBManager:
         except BaseException as exc:
             self._fatal_stop(
                 f"layer {layer_id} failed at '{stage}' ({exc!r}); "
+                + (
+                    "the layer may be half switched on this rank"
+                    if stage == "commit"
+                    else "nothing of the layer was written on this rank"
+                )
+            )
+            raise
+
+    def _plan_mtp(self, mtp: Any) -> dict[str, Any]:
+        """The draft layers' part of this rebalance, from the sums the load
+        reduction just left (`MtpPlacement.reduced`): at most
+        ATOM_EPLB_MTP_SWAP_BUDGET swaps a layer from their live placement, by
+        the swap policy without its prefill term -- a draft layer has no
+        prefill pass -- at the draft passes' own rows a step (the window's;
+        a window without one keeps the last)."""
+        assert mtp.reduced is not None
+        dec, rows_cumulative, steps, rows, window_steps = mtp.reduced
+        if rows <= 0:
+            rows = (
+                rows_cumulative
+                if self._mtp_rows_at_last_solve is None
+                else self._mtp_rows_at_last_solve
+            )
+        old = mtp.p2l.clone()
+        new, _, _, swaps = gate_permute.swap_rebalance(
+            torch.zeros_like(dec),
+            dec,
+            rows,
+            old,
+            num_gpus=mtp.ep_size,
+            top_k=mtp.top_k,
+            budget=envs.ATOM_EPLB_MTP_SWAP_BUDGET,
+            eps=envs.ATOM_EPLB_SWAP_EPS,
+            weights=(0.0, *gate_permute.SWAP_WEIGHTS[1:]),
+        )
+        self._mtp_rows_at_last_solve = rows
+        return {
+            "old": old,
+            "p2l": new,
+            "moved": (old != new.to(old.device)).sum(dim=1).tolist(),
+            "swaps": [swaps[i] for i in range(len(mtp.layers))],
+            "dec": dec,
+            "rows": rows,
+            "samples": steps,
+            "window_samples": window_steps,
+        }
+
+    def _switch_mtp_layer(self, mtp: Any, index: int, new_p2l: torch.Tensor) -> None:
+        """One draft layer to its new placement as a unit, as `_switch_layer`
+        does a target layer: its gate rows staged, its experts that change
+        rank through the same transport, then its weights, gate rows and maps
+        written. A failure is FATAL and raised."""
+        weights, buffers = self._mtp_weights[index], self._mtp_temp
+        layer_id = mtp.layer_ids[index]
+        stage = "prepare"
+        try:
+            new = new_p2l.to(mtp.p2l.device)
+            staged = mtp.stage_commit(index, new)
+            world = mtp.ep_size
+            stage = "p2p"
+            plan = _migrate_single_layer(
+                routed_experts_weights=weights,
+                temp_buffers=buffers,
+                old_p2l_layer=mtp.p2l[index],
+                new_p2l_layer=new,
+                num_local_physical_experts=mtp.per_rank,
+                num_gpu_per_node=world // max(1, self._nnodes),
+                rank=self._ep_rank,
+                world_size=world,
+                ep_group=self._ensure_migration_group(),
+                num_logical_experts=mtp.num_experts,
+                p2p_batch_chunk_size=self._p2p_batch_chunk_size,
+                cuda_stream=None,
+            )
+            stage = "commit"
+            move_from_buffer(plan, buffers, weights)
+            mtp.apply_commit(index, staged, new)
+        except BaseException as exc:
+            self._fatal_stop(
+                f"draft layer {layer_id} failed at '{stage}' ({exc!r}); "
                 + (
                     "the layer may be half switched on this rank"
                     if stage == "commit"
@@ -3317,6 +3514,57 @@ class EPLBManager:
         except Exception as exc:  # noqa: BLE001  # pragma: no cover - diagnostic only
             logger.warning("%s observe #%d failed: %s", tag, index, exc)
 
+    def _log_mtp_plan(self, rc: int, plan: dict[str, Any]) -> dict[str, Any]:
+        """Rank 0: the draft layers' part of a rebalance in one line, and
+        what the window dump keeps of it (host tensors)."""
+        mtp = self.gate_permute.mtp
+        dec = plan["dec"].detach().to("cpu").numpy().astype("float64")
+        old = plan["old"].to("cpu").numpy()
+        new = plan["p2l"].to("cpu").numpy()
+        metrics = {}
+        for name, p2l in (("before", old), ("after", new)):
+            rk = gate_permute.ranks_of(p2l, mtp.per_rank)
+            rows = [
+                gate_permute.placement_metrics(
+                    dec[i] * 0.0, dec[i], plan["rows"], rk[i], mtp.ep_size, mtp.top_k
+                )
+                for i in range(len(mtp.layers))
+            ]
+            metrics[name] = (
+                gate_permute._mean(r[3] for r in rows),
+                gate_permute._mean(r[1] for r in rows),
+            )
+        logger.info(
+            "%s rebalance #%d mtp: swaps sum=%d max=%d experts_moved=%d | "
+            "decode picks=%d decode samples/rank=%d rows/step=%.1f | "
+            "decode-row max/mean before=%.3f after=%.3f | "
+            "active proxy max before=%.2f after=%.2f",
+            gate_permute.TAG,
+            rc,
+            sum(plan["swaps"]),
+            max(plan["swaps"], default=0),
+            sum(plan["moved"]),
+            int(dec.sum()),
+            plan["samples"],
+            plan["rows"],
+            metrics["before"][0],
+            metrics["after"][0],
+            metrics["before"][1],
+            metrics["after"][1],
+        )
+        base, self._mtp_window_base = self._mtp_window_base, dec.copy()
+        window = dec if base is None or (dec - base).min() < 0 else dec - base
+
+        def counts(array):
+            return torch.from_numpy(array.astype("int64"))
+
+        return {
+            "mtp_decode_counts_window": counts(window),
+            "mtp_decode_counts_cum": counts(dec),
+            "mtp_p2l_before": counts(old),
+            "mtp_p2l_after": counts(new),
+        }
+
     def _log_gate_permute_plan(
         self,
         *,
@@ -3333,6 +3581,7 @@ class EPLBManager:
         moved: list[int],
         swaps: dict[int, int] | None,
         solve_ms: float,
+        mtp_plan: dict[str, Any] | None = None,
     ) -> None:
         """Rank 0: what this rebalance changes, and the metrics of four
         placements on the loads it was planned from -- the one before, the
@@ -3386,6 +3635,7 @@ class EPLBManager:
             top_k = int(self._moe_layers[layer_ids[0]].top_k)
             p2l_before = old_p2l.to("cpu").numpy()
             p2l_after = new_p2l.to("cpu").numpy()
+            mtp_dump = {} if mtp_plan is None else self._log_mtp_plan(rc, mtp_plan)
             self._dump_window(
                 "rebalance",
                 rows_per_step,
@@ -3393,8 +3643,10 @@ class EPLBManager:
                 dec,
                 p2l_before,
                 p2l_after,
-                executed=any(moved[i] for i in layer_ids),
+                executed=any(moved[i] for i in layer_ids)
+                or bool(mtp_plan is not None and any(mtp_plan["moved"])),
                 rebalance=rc,
+                **mtp_dump,
             )
             before = gate_permute.ranks_of(p2l_before, per_rank)
             after = gate_permute.ranks_of(p2l_after, per_rank)

@@ -31,6 +31,12 @@ def outside_pool(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+# Set by a component that keeps something of a pass's recording (EPLB's
+# placement of the drafter's MoE layers keeps the top-k ids): called with the
+# pass and the batch, returns the context its recording runs in. None: none.
+record_scope: Callable[["DraftGraph", int], Any] | None = None
+
+
 def _owned(value: Any, staged: tuple[torch.Tensor, ...] = ()) -> Any:
     """A copy the graph pool cannot re-issue.
 
@@ -335,6 +341,12 @@ class DraftGraph:
         self._forward_and_epilogue(running_bs, **staged)
         if not self.will_capture:
             return
-        self._graph.record(
-            lambda: self._to_capture(running_bs, **staged), key=running_bs
-        )
+        if record_scope is None:
+            self._graph.record(
+                lambda: self._to_capture(running_bs, **staged), key=running_bs
+            )
+            return
+        with record_scope(self, running_bs):
+            self._graph.record(
+                lambda: self._to_capture(running_bs, **staged), key=running_bs
+            )

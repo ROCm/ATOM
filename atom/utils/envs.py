@@ -1236,6 +1236,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_EPLB_GP_COUNT": lambda: os.getenv("ATOM_EPLB_GP_COUNT", "triton")
     .strip()
     .lower(),
+    # Gate-permute EPLB also places the drafter's MoE layers (the DSpark
+    # draft stages of DeepSeek-V4.1), from the identity, on sampled decode
+    # steps alone, with at most this many swaps a layer a rebalance.
+    "ATOM_EPLB_MTP": lambda: _flag_env("ATOM_EPLB_MTP", "0"),
+    "ATOM_EPLB_MTP_SWAP_BUDGET": lambda: max(
+        0, _int_env("ATOM_EPLB_MTP_SWAP_BUDGET", 4)
+    ),
     # "shm": experts change rank through files under ATOM_EPLB_SHM_DIR (default
     # /dev/shm/atom_eplb_<uid>_<port>) with barriers of the CPU group, and the
     # loads are summed over the CPU group: EPLB uses no device process group

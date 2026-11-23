@@ -216,6 +216,7 @@ def swap_rebalance(
     eps: float,
     layer_ids: list[int] | None = None,
     hot_first: int | bool = 0,
+    weights=SWAP_WEIGHTS,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[int, int]]:
     """The "swap" policy: `rebalance_experts`' result for a placement that
     differs from ``old_p2l`` by at most ``budget`` pairwise swaps a layer.
@@ -225,7 +226,8 @@ def swap_rebalance(
     leading slots. Which rank holds an expert is the swaps' alone.
 
     ``pf_load`` / ``dec_load``: [layers, logical] pick counts (prefill, sampled
-    decode; None: none), ``rows_per_step`` the group's decode rows a step.
+    decode; None: none), ``rows_per_step`` the group's decode rows a step,
+    ``weights`` the objective's (prefill rows, active proxy, decode rows).
     A swap exchanges two experts' physical slots; a layer with none keeps its
     row of ``old_p2l`` as is. Returns ``(physical_to_logical [L, P],
     logical_to_physical [L, Lg, 1], logcnt [L, Lg], swaps a layer)``.
@@ -256,7 +258,9 @@ def swap_rebalance(
     for layer in range(num_layers) if layer_ids is None else layer_ids:
         values = swap_terms(pf[layer], dec[layer], rows_per_step, top_k, num_gpus)
         rk = l2p[layer] // per
-        done = greedy_swaps(values, rk, num_gpus, budget=budget, eps=eps)
+        done = greedy_swaps(
+            values, rk, num_gpus, budget=budget, eps=eps, weights=weights
+        )
         for a, b in done:
             slot_a, slot_b = l2p[layer, a], l2p[layer, b]
             p2l[layer, slot_a], p2l[layer, slot_b] = b, a
@@ -677,12 +681,16 @@ class GatePermuteRuntime:
         self._ones = torch.ones(1, dtype=torch.int64, device=dev)
         # Request bucket -> (its held id tensors, their layers' bases), where
         # the tensors share a shape.
-        self._plans: dict[Any, tuple[tuple[torch.Tensor, ...], torch.Tensor] | None] = {}
+        self._plans: dict[Any, tuple[tuple[torch.Tensor, ...], torch.Tensor] | None] = (
+            {}
+        )
         # Request bucket -> [(layer id, the recording's top-k ids)].
         self._captures: dict[Any, list[tuple[int, torch.Tensor]]] = {}
         self._layer_indices: dict[tuple[int, ...], torch.Tensor] = {}
         self._capture_key = None
         self._warned: set = set()
+        # The drafter's MoE layers' placement (ATOM_EPLB_MTP), else None.
+        self.mtp: MtpPlacement | None = None
         register_graph_holder(self)
 
     @property
@@ -700,6 +708,8 @@ class GatePermuteRuntime:
         the decode sampler inside a decode request-graph recording (nothing
         launched), counted into the monitor's pass buffer otherwise."""
         if not self.owns(layer):
+            if self.mtp is not None:
+                self.mtp.place(layer, topk_ids)
             return
         if self._capture_key is not None:
             if not envs.ATOM_EPLB_NO_DECODE_HOLD:
@@ -765,8 +775,14 @@ class GatePermuteRuntime:
         # every rank in the same step, so the ranks sample the same decode
         # steps (they step together, and a sampled step is a little longer).
         self._replays += 1
+        mtp = self.mtp
+        if mtp is not None:
+            # The step's draft pass is sampled where this step is.
+            mtp.due = False
         if (self._replays - 1) % self.sample_every:
             return
+        if mtp is not None:
+            mtp.due = True
         held = self._captures.get(key)
         if not held:
             if key not in self._warned:
@@ -785,7 +801,9 @@ class GatePermuteRuntime:
             return
         self.dec_rows += rows
         self.window_rows += rows
-        timer = self.manager.step_timer() if hasattr(self.manager, "step_timer") else None
+        timer = (
+            self.manager.step_timer() if hasattr(self.manager, "step_timer") else None
+        )
         if timer is not None:
             import time as _time
 
@@ -898,6 +916,8 @@ class GatePermuteRuntime:
         dropped = len(self._captures)
         self._captures.clear()
         self._plans.clear()
+        if self.mtp is not None:
+            dropped += self.mtp.release_graphs()
         return dropped
 
     # -- statistics ------------------------------------------------------
@@ -914,13 +934,15 @@ class GatePermuteRuntime:
         parts = [self.dec_load.reshape(-1)]
         if self.pf_total is not None:
             parts.append(self.pf_total.reshape(-1))
-        parts.append(
-            torch.tensor(
-                [self.dec_rows, self.dec_steps, self.window_rows, self.window_steps],
-                dtype=torch.int64,
-                device=dev,
-            )
-        )
+        counters = [self.dec_rows, self.dec_steps, self.window_rows, self.window_steps]
+        mtp = self.mtp
+        if mtp is not None:
+            # The drafter's layers ride the same collective: their decode
+            # load and their four counters, ahead of the main ones.
+            mtp.fold()
+            parts.append(mtp.dec_load.reshape(-1))
+            counters = mtp.counters() + counters
+        parts.append(torch.tensor(counters, dtype=torch.int64, device=dev))
         payload = torch.cat(parts)
         world = int(getattr(group, "world_size", 1)) if group is not None else 1
         device_group = getattr(group, "device_group", None)
@@ -943,7 +965,13 @@ class GatePermuteRuntime:
         pf = None
         if self.pf_total is not None:
             pf = payload[size : 2 * size].view_as(self.pf_total)
-        rows, steps, window_rows, window_steps = (int(v) for v in payload[-4:].tolist())
+        tail = [int(v) for v in payload[-len(counters) :].tolist()]
+        rows, steps, window_rows, window_steps = tail[-4:]
+        if mtp is not None:
+            start = payload.numel() - len(counters) - mtp.dec_load.numel()
+            mtp.take_reduced(
+                payload[start : start + mtp.dec_load.numel()], tail[:4], world
+            )
         return (
             dec,
             pf,
@@ -957,6 +985,8 @@ class GatePermuteRuntime:
         """A rebalance was planned (or the rebalances re-armed): the samples
         of the next operating point start here."""
         self.window_rows = self.window_steps = 0
+        if self.mtp is not None:
+            self.mtp.window_rows = self.mtp.window_steps = 0
 
     def reduce_counts(self, group: Any, rows: int, steps: int) -> tuple[int, int, int]:
         """Two host integers of this rank summed over the group, and the
@@ -1003,6 +1033,8 @@ class GatePermuteRuntime:
         self.fold_decode()
         self.dec_load.zero_()
         self.dec_rows = self.dec_steps = 0
+        if self.mtp is not None:
+            self.mtp.restart()
 
     # -- commit ----------------------------------------------------------
     def stage_commit(self, layer_id: int, old_p2l: torch.Tensor, new_p2l: torch.Tensor):
@@ -1043,5 +1075,217 @@ class GatePermuteRuntime:
             f"count={'triton' if self.count_triton else 'torch'} "
             f"count_blocks={self.count_blocks} "
             f"decode_sample_every={self.sample_every} "
-            f"cumulative={int(self.cumulative)}"
+            f"cumulative={int(self.cumulative)} "
+            f"mtp={int(self.mtp is not None)} "
+            f"mtp_layers={0 if self.mtp is None else len(self.mtp.layers)}"
         )
+
+
+class MtpPlacement:
+    """Gate-permute EPLB's placement of the drafter's MoE layers
+    (ATOM_EPLB_MTP): the DSpark draft stages, whose expert count is their
+    own, so their maps, loads and sampler are theirs too.
+
+    They start at the identity and are placed on decode samples alone: a
+    draft pass is its own recording (`DraftGraph`), whose top-k id tensors
+    are kept like a decode request graph's, and the draft pass of a step the
+    target sampler takes is added by slot (`after_draft_replay`) and folded
+    to logical experts lazily (`fold`). The sums ride the main loads'
+    collective (`GatePermuteRuntime.dump_global`).
+    """
+
+    def __init__(
+        self,
+        *,
+        layers: dict[int, Any],
+        gates: dict[int, Any],
+        ep_size: int,
+        device: Any,
+    ):
+        self.layer_ids = sorted(layers)
+        self.layers = [layers[i] for i in self.layer_ids]
+        self.gates = [gates[i] for i in self.layer_ids]
+        experts = {int(layer.global_num_experts) for layer in self.layers}
+        top_ks = {int(layer.top_k) for layer in self.layers}
+        if len(experts) != 1 or len(top_ks) != 1:
+            raise RuntimeError(
+                f"ATOM_EPLB_MTP: the drafter's MoE layers differ ({experts} "
+                f"experts, top-{top_ks})"
+            )
+        self.num_experts = experts.pop()
+        self.top_k = top_ks.pop()
+        self.ep_size = int(ep_size)
+        if self.num_experts % self.ep_size:
+            raise RuntimeError(
+                f"ATOM_EPLB_MTP: {self.num_experts} experts over {ep_size} ranks"
+            )
+        self.per_rank = self.num_experts // self.ep_size
+        count, slots = len(self.layers), self.num_experts + 1
+        identity = torch.arange(self.num_experts, device=device)
+        # Slot -> logical expert, and logical expert -> slot (the fold index).
+        self.p2l = identity.to(torch.int32).repeat(count, 1)
+        self.fold_index = identity.to(torch.int64).repeat(count, 1)
+        self.dec_load = torch.zeros(
+            (count, self.num_experts), dtype=torch.int64, device=device
+        )
+        # A sample lands here by slot, column 0 taking the pad picks (-1).
+        self.dec_raw = torch.zeros((count, slots), dtype=torch.int64, device=device)
+        self._raw_base = (
+            torch.arange(count, dtype=torch.int64, device=device) * slots + 1
+        )
+        self._raw_dirty = False
+        self._ones = torch.ones(1, dtype=torch.int64, device=device)
+        # This rank's live draft rows over the sampled draft passes, and the
+        # passes: since the start, and since the last rebalance.
+        self.rows = self.steps = 0
+        self.window_rows = self.window_steps = 0
+        # Set by the target sampler for the step it takes.
+        self.due = False
+        self._index = {id(layer): i for i, layer in enumerate(self.layers)}
+        # Draft recording -> [(layer index, its top-k ids)], and its plan.
+        self._captures: dict[Any, list[tuple[int, torch.Tensor]]] = {}
+        self._plans: dict[Any, Any] = {}
+        self._capture_key = None
+        self._warned: set = set()
+        # The group's sums as last reduced: (decode load [layers, experts],
+        # rows a step since the start, a rank's samples, rows a step in the
+        # window, a rank's samples in it).
+        self.reduced: tuple[torch.Tensor, float, int, float, int] | None = None
+
+    # -- routing ---------------------------------------------------------
+    def owns(self, layer: Any) -> bool:
+        return id(layer) in self._index
+
+    def place(self, layer: Any, topk_ids: torch.Tensor) -> None:
+        """A draft layer's routed ids, physical already: kept inside the
+        recording of a draft pass, nothing otherwise (and never a launch)."""
+        if self._capture_key is None:
+            return
+        index = self._index.get(id(layer))
+        if index is not None and not envs.ATOM_EPLB_NO_DECODE_HOLD:
+            self._captures[self._capture_key].append((index, topk_ids))
+
+    @contextmanager
+    def capture(self, key: Any):
+        """Around the recording of the draft pass ``key``."""
+        self._captures[key] = []
+        self._plans.pop(key, None)
+        self._capture_key = key
+        try:
+            yield
+        finally:
+            self._capture_key = None
+
+    def after_draft_replay(self, key: Any, rows: int) -> None:
+        """After the draft pass ``key`` ran a step of ``rows`` live rows on
+        this rank: counted where the target sampler took the step."""
+        if not self.due:
+            return
+        self.due = False
+        held = self._captures.get(key)
+        if not held:
+            if key not in self._warned:
+                self._warned.add(key)
+                logger.warning(
+                    "%s draft pass %s holds no top-k ids of a draft layer (not "
+                    "recorded, or not this flavor); it is not sampled",
+                    TAG,
+                    key,
+                )
+            return
+        rows = int(rows)
+        self.steps += 1
+        self.window_steps += 1
+        if rows <= 0:
+            return
+        self.rows += rows
+        self.window_rows += rows
+        if key not in self._plans:
+            self._plans[key] = self._plan(held)
+        raw = self.dec_raw.view(-1)
+        plan = self._plans[key]
+        if plan is None:
+            # Several launches a layer: one add a tensor, each as it is.
+            for index, ids in held:
+                flat = (ids.to(torch.int64) + self._raw_base[index]).view(-1)
+                raw.scatter_add_(0, flat, self._count(flat))
+        else:
+            # Three launches, as the target layers' sample: the held tensors
+            # stacked and cut to the live rows, their slots' addresses, the add.
+            tensors, base = plan
+            flat = (torch.stack(tensors)[:, :rows] + base).view(-1)
+            raw.scatter_add_(0, flat, self._count(flat))
+        self._raw_dirty = True
+
+    def _count(self, flat: torch.Tensor) -> torch.Tensor:
+        if self._ones.numel() < flat.numel():
+            self._ones = torch.ones(flat.numel(), dtype=torch.int64, device=flat.device)
+        return self._ones[: flat.numel()]
+
+    def _plan(self, held: list[tuple[int, torch.Tensor]]):
+        if len({(tuple(ids.shape), ids.dtype) for _, ids in held}) != 1:
+            return None
+        if held[0][1].dim() != 2 or held[0][1].dtype not in (torch.int32, torch.int64):
+            return None
+        base = torch.stack([self._raw_base[i] for i, _ in held]).view(-1, 1, 1)
+        return tuple(ids for _, ids in held), base
+
+    def fold(self) -> None:
+        """The samples held by slot added to `dec_load` by logical expert,
+        under the placement they were taken under: before the load is read
+        and before a layer's placement changes."""
+        if not self._raw_dirty:
+            return
+        self.dec_load.add_(torch.gather(self.dec_raw[:, 1:], 1, self.fold_index))
+        self.dec_raw.zero_()
+        self._raw_dirty = False
+
+    def release_graphs(self) -> int:
+        dropped = len(self._captures)
+        self._captures.clear()
+        self._plans.clear()
+        return dropped
+
+    # -- statistics ------------------------------------------------------
+    def counters(self) -> list[int]:
+        return [self.rows, self.steps, self.window_rows, self.window_steps]
+
+    def take_reduced(self, dec: torch.Tensor, counters: list[int], world: int) -> None:
+        rows, steps, window_rows, window_steps = counters
+        self.reduced = (
+            dec.view_as(self.dec_load),
+            rows_per_step(rows, steps, world),
+            steps // world,
+            rows_per_step(window_rows, window_steps, world),
+            window_steps // world,
+        )
+
+    def restart(self) -> None:
+        """The samples start afresh (ATOM_EPLB_STATS_CUMULATIVE=0)."""
+        self.fold()
+        self.dec_load.zero_()
+        self.rows = self.steps = 0
+
+    # -- commit ----------------------------------------------------------
+    def stage_commit(self, index: int, new_p2l: torch.Tensor):
+        """Before layer ``index``'s weights move to ``new_p2l``: its gate
+        rows in the new order, as copies -- everything of the gate's move
+        that can fail, with nothing written."""
+        tensors = gate_row_tensors(self.gates[index])
+        staged = stage_rows(tensors, self.p2l[index], new_p2l)
+        return None if staged is None else (tensors, staged)
+
+    def apply_commit(self, index: int, staged, new_p2l: torch.Tensor) -> bool:
+        """Layer ``index``'s weights are ``new_p2l``'s: write its staged gate
+        rows, its map and its fold index. True when anything moved."""
+        if staged is None:
+            return False
+        self.fold()  # the samples held by slot are the old placement's
+        for tensor, rows in zip(*staged):
+            tensor.copy_(rows)
+        new = new_p2l.to(self.p2l.device)
+        self.p2l[index].copy_(new)
+        self.fold_index[index, new.to(torch.int64)] = torch.arange(
+            self.num_experts, dtype=torch.int64, device=self.p2l.device
+        )
+        return True
