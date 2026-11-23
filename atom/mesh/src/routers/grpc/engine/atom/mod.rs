@@ -46,9 +46,9 @@ impl AtomClient {
             .initial_connection_window_size(Some(32 * 1024 * 1024))
             .connect()
             .await?;
-        Ok(Self {
-            client: AtomEngineClient::new(channel),
-        })
+        // ATOM's server sends messages of any size (grpc's default send limit).
+        let client = AtomEngineClient::new(channel).max_decoding_message_size(usize::MAX);
+        Ok(Self { client })
     }
 
     pub async fn health_check(&self) -> Result<HealthCheckResponse, Status> {

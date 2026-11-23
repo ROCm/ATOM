@@ -422,6 +422,32 @@ async fn a_completion_reports_its_ttft_tpot_and_latency_from_its_times() {
 }
 
 #[tokio::test]
+async fn a_message_past_4_mib_reaches_its_request() {
+    let (ranks, mut calls) = instance().await;
+    let sessions = AtomSessions::default();
+    let first = sessions.submit(&ranks[0], spec("large"), vec![1], false);
+    let (mut call, large) = opening(&mut calls, PROTOCOL_VERSION, first).await;
+    let id = submitted(&mut call, 1).await["large"].0.seq_id;
+    let blob = "x".repeat(5 << 20);
+    let params = pb::Value {
+        kind: Some(Kind::StringValue(blob.clone())),
+    };
+    let item = pb::Completion {
+        kv_transfer_params_output: Some(params),
+        ..completion(id, "max_tokens")
+    };
+    call.outbound.send(done(vec![(item, Vec::new())])).unwrap();
+
+    let large: Vec<_> = timeout(HANG, large.unwrap().collect()).await.unwrap();
+    let kv = Json::String(blob).to_string();
+    assert!(
+        matches!(&large[..], [Ok(GenerateResponse { response: Some(Response::Complete(complete)) })]
+            if complete.kv_transfer_params_json.as_ref() == Some(&kv)),
+        "the 5 MiB Completions failed the Session"
+    );
+}
+
+#[tokio::test]
 async fn a_rejected_request_fails_with_the_http_status_its_code_reads_back_to() {
     let (ranks, mut calls) = instance().await;
     let sessions = AtomSessions::default();
