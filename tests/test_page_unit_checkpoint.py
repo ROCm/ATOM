@@ -2,6 +2,7 @@
 
 """Control-plane invariants for PAGE-backed state checkpoint images."""
 
+import math
 import pickle
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
@@ -943,6 +944,26 @@ class TestAPipelineCheckpointStore:
         assert (
             size_pipeline_checkpoint_store(k3_stages(SPLIT, AVAILABLE_GIB, -1)) is None
         )
+
+    def test_by_default_the_images_stay_in_kv_blocks(self):
+        """Neither setting given: no store. A store's KV blocks are never lent
+        back, so a deployment opts into one."""
+        stages = k3_stages(SPLIT, AVAILABLE_GIB, kv_share=None)
+        assert size_pipeline_checkpoint_store(stages) is None
+
+    @pytest.mark.parametrize(
+        "share, images, left",
+        [(0.25, 586, 365_425), (0.5, 1172, 243_683), (0.75, 1691, 121_921)],
+    )
+    def test_a_share_keeps_the_rest_of_the_kv_blocks(self, share, images, left):
+        """The store takes as many images as leave `1 - share` of the KV
+        blocks every stage could back without one (487,166 here), and not one
+        more."""
+        stages = k3_stages(SPLIT, AVAILABLE_GIB, kv_share=share)
+        kept = math.ceil((1 - share) * pipeline_kv_blocks(stages, 0))
+        assert size_pipeline_checkpoint_store(stages) == images
+        assert pipeline_kv_blocks(stages, images) == left
+        assert left >= kept > pipeline_kv_blocks(stages, images + 1)
 
     @pytest.mark.parametrize(
         "share, stage_5_share, match",

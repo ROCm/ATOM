@@ -1901,9 +1901,12 @@ class ModelRunner:
         per stage as the state pool sizes its slots, so a stage pays for its own
         image alone, out of the paged budget (`size_pipeline_checkpoint_store`).
 
-        None outside a PP run whose checkpoints span its stages, and on every
-        stage when one holds no recurrent state or no PAGE class, which the
-        refusals below name. Collective over the PP group.
+        None outside a PP run whose checkpoints span its stages, unless the
+        launch opts into a store (ATOM_PP_STATE_CHECKPOINT_SLOTS or
+        ATOM_PP_STATE_CHECKPOINT_KV_SHARE), and on every stage when one holds
+        no recurrent state or no PAGE class, which the refusals below name.
+        Collective over the PP group, which is what refuses stages launched
+        with different settings.
         """
         config = self.config
         builder = self.attn_metadata_builder
@@ -1961,14 +1964,14 @@ class ModelRunner:
         """Put every PP stage's checkpoint images on one set of unit ids.
 
         Only the head schedules, so a store or restore op it builds names the
-        same unit ids on every stage. A unit is one checkpoint-store entry,
-        sized to each stage's own image, so every stage needs one. Only with
-        the images in KV blocks (ATOM_PP_STATE_CHECKPOINT_SLOTS < 0) do the
-        stages need different counts of their own blocks; all then take the
-        largest, and a stage needing fewer leaves its tail units unwritten. An
-        op is checked against the joint layout id and the summed image bytes,
-        which change whenever any stage's geometry does. Collective over the
-        PP group, which holds one rank per stage in stage order.
+        same unit ids on every stage. With the images in KV blocks (no store,
+        the default) the stages need different counts of their own blocks; all
+        take the largest, and a stage needing fewer leaves its tail units
+        unwritten. With a checkpoint store a unit is one entry, sized to each
+        stage's own image, so every stage needs one. An op is checked against
+        the joint layout id and the summed image bytes, which change whenever
+        any stage's geometry does. Collective over the PP group, which holds
+        one rank per stage in stage order.
 
         A stage that holds no recurrent state passes None, and then every
         stage refuses with the same error: one raising alone would leave the

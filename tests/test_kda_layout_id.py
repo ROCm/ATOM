@@ -20,7 +20,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_engine.kv_block import STATE_CHECKPOINT_CLASS, STATE_SLOT_CLASS
+from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
     page_pool,
@@ -324,7 +325,11 @@ class TestEveryPPStageKeepsItsOwnImages:
             setattr(stub, name, method.__get__(stub, type(stub)))
         return stub
 
-    def stores(self, mr, monkeypatch, **kwargs):
+    def stores(self, mr, monkeypatch, share="0.5", **kwargs):
+        """Every stage's planned store, launched with ``share``; None launches
+        with neither setting."""
+        if share is not None:
+            monkeypatch.setenv("ATOM_PP_STATE_CHECKPOINT_KV_SHARE", share)
         stubs = [self.stage(mr, rank, **kwargs) for rank in range(8)]
         return stubs, on_every_stage(
             monkeypatch,
@@ -360,6 +365,52 @@ class TestEveryPPStageKeepsItsOwnImages:
         # One joint id per layout, and the two layouts never read each other.
         assert len({spec.layout_id for spec in in_store}) == 1
         assert in_store[0].layout_id != in_blocks[0].layout_id
+
+    def test_by_default_every_stage_keeps_its_images_in_kv_blocks(
+        self, mr, monkeypatch
+    ):
+        """Neither setting given, every stage still gathers -- a stage launched
+        with a store is refused beside them -- and plans none: an image takes
+        the largest stage's KV blocks, as before the store."""
+        stubs, stores = self.stores(mr, monkeypatch, share=None)
+        assert stores == [None] * 8
+        in_blocks = on_every_stage(
+            monkeypatch,
+            lambda r: stubs[r]._agree_pipeline_checkpoint_spec(
+                stubs[r]._local_checkpoint_spec(stubs[r].transfer, stubs[r].slot_bytes)
+            ),
+            8,
+        )
+        assert {spec.units_per_checkpoint for spec in in_blocks} == {308}
+
+    def test_an_op_naming_an_entry_past_the_store_is_refused(self):
+        """Under a store a unit id is an entry. An op naming one past the
+        store's count would write past its tensor, however many KV blocks
+        there are, so the bound is the store's, not the KV pool's."""
+        spec = PagedStateCheckpointSpec(KDA_IMAGE, KDA_SLOT, "kda", KDA_IMAGE)
+        spec = spec.for_pipeline("pp8-joint:test", 1, KDA_IMAGE)
+        runner = SimpleNamespace(
+            state_runtime=SimpleNamespace(checkpoint_spec=spec),
+            pool_plan=SimpleNamespace(entries={STATE_CHECKPOINT_CLASS: 1000}),
+            config=SimpleNamespace(num_kvcache_blocks=200_000),
+        )
+        stage = object.__new__(Builder)
+        stage.model_runner = runner
+
+        def op(unit):
+            return SimpleNamespace(
+                layout_id=spec.layout_id, total_bytes=spec.op_bytes, unit_ids=[unit]
+            )
+
+        stage._validate_paged_state_op(op(999))
+        for unit in (1000, 199_999):
+            with pytest.raises(RuntimeError, match="out of range"):
+                stage._validate_paged_state_op(op(unit))
+        # Without a store a unit is a KV block, and so is the bound.
+        runner.pool_plan = SimpleNamespace(entries={})
+        stage._validate_paged_state_op(op(199_999))
+        with pytest.raises(RuntimeError, match="out of range"):
+            stage._validate_paged_state_op(op(200_000))
 
     def test_without_pp_nothing_is_planned_or_gathered(self, mr, monkeypatch):
         """No store and no gather (no group exists to answer one): the spec

@@ -210,7 +210,7 @@ class PipelineCheckpointStage(NamedTuple):
     page_bytes: int
     image_bytes: int
     slots: int | None
-    kv_share: float
+    kv_share: float | None
 
 
 def pipeline_kv_blocks(stages: list[PipelineCheckpointStage], images: int) -> int:
@@ -235,7 +235,9 @@ def size_pipeline_checkpoint_store(
     Unset, the store may cost `kv_share` (ATOM_PP_STATE_CHECKPOINT_KV_SHARE)
     of the KV blocks every stage could back without one, and takes as many
     images as leave that many on every stage: a stage whose memory backs more
-    blocks than the binding one holds its images in that surplus first.
+    blocks than the binding one holds its images in that surplus first. Both
+    unset, the default, keeps the images in KV blocks: a store costs KV
+    blocks it no longer lends back, so a deployment opts into one.
     """
     launched = {(s.slots, s.kv_share) for s in stages}
     if len(launched) != 1:
@@ -245,7 +247,7 @@ def size_pipeline_checkpoint_store(
             f"{[(s.slots, s.kv_share) for s in stages]}"
         )
     slots, kv_share = launched.pop()
-    if slots is not None and slots < 0:
+    if (slots is None and kv_share is None) or (slots is not None and slots < 0):
         return None
     entries = [checkpoint_store_entry_bytes(s.image_bytes) for s in stages]
     if slots is None:
