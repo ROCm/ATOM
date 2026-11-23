@@ -1733,6 +1733,9 @@ class EPLBManager:
         self._expert_weights_of_layer: dict[int, list[torch.Tensor]] = {}
         self._reusable_temp_buffers: list[torch.Tensor] | None = None
         self._expert_map_tails: dict[int, torch.Tensor] = {}
+        # Gate-permute EPLB: the loads the last rebalance's log line saw
+        # (rank 0, diagnostics only).
+        self._gp_logged_loads: tuple[Any, Any] | None = None
         self._ep_group: Any | None = None
         # Dedicated process group for EPLB weight-migration P2P, isolated from the
         # EP group that the forward pass (MoE all-to-all etc.) runs on. NCCL/RCCL
@@ -2682,6 +2685,44 @@ class EPLBManager:
                         pf, dec, rows_per_step, rk, ids, meta.ep_size, top_k
                     ),
                 )
+            # Out of sample: the placement the PREVIOUS rebalance left (and the
+            # fixed tables) on the picks counted since then, which that plan
+            # never saw. Needs sums that only grow (the cumulative statistics).
+            previous = self._gp_logged_loads
+            self._gp_logged_loads = (pf.copy(), dec.copy())
+            if previous is not None:
+                new_pf, new_dec = pf - previous[0], dec - previous[1]
+                if (
+                    new_pf.min() >= 0
+                    and new_dec.min() >= 0
+                    and new_pf.sum() + new_dec.sum() > 0
+                ):
+                    logger.info(
+                        "%s rebalance #%d picks since the last rebalance: "
+                        "prefill=%d decode=%d",
+                        tag,
+                        rc,
+                        int(new_pf.sum()),
+                        int(new_dec.sum()),
+                    )
+                    for name, rk, ids in tables:
+                        if name == "after" or not ids:
+                            continue
+                        logger.info(
+                            "%s rebalance #%d metrics-oos %-8s: %s",
+                            tag,
+                            rc,
+                            name,
+                            gate_permute.metrics_line(
+                                new_pf,
+                                new_dec,
+                                rows_per_step,
+                                rk,
+                                ids,
+                                meta.ep_size,
+                                top_k,
+                            ),
+                        )
         except Exception as exc:  # noqa: BLE001  # pragma: no cover - diagnostic only
             logger.warning("%s rebalance #%d metrics failed: %s", tag, rc, exc)
 
