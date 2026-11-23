@@ -388,6 +388,9 @@ def test_moving_nvfp4_pages_does_not_imply_moving_a_draft_dtype(monkeypatch):
     monkeypatch.setitem(KVConnectorFactory._moves_own_dtype_draft, "mooncake", False)
     nvfp4 = {"kv_cache_dtype": "nvfp4", "index_cache_dtype": "nvfp4", "hf": sparse_hf()}
     for kvt in (PD, {"kv_connector": "multi", "connectors": [PD, STORE]}):
+        # still declared for NVFP4 pages: only the draft flag was taken away
+        topology = types.SimpleNamespace(kv_transfer_config=kvt)
+        assert KVConnectorFactory.topology_moves_nvfp4_pages(topology)
         spec = _dspark_spec()
         spec.kv_cache_dtype = "fp8"
         with pytest.raises(
@@ -395,6 +398,28 @@ def test_moving_nvfp4_pages_does_not_imply_moving_a_draft_dtype(monkeypatch):
             match="draft KV dtype fp8 differs.*under lmcache_offload, mooncake_store",
         ):
             _m3(monkeypatch, kv_transfer_config=kvt, speculative_config=spec, **nvfp4)
+
+
+def test_the_store_namespace_hashes_the_draft_kv_dtype(monkeypatch):
+    # What `moves_own_dtype_draft` on lmcache_offload / mooncake_store rests on.
+    from atom.kv_transfer.offload.config import build_page_namespace
+
+    chunk = types.SimpleNamespace(chunk_size=256)
+
+    def built(asked):
+        spec = _dspark_spec()
+        spec.kv_cache_dtype = asked
+        return _m3(
+            monkeypatch,
+            hf=sparse_hf(),
+            kv_transfer_config=STORE,
+            speculative_config=spec,
+            **NV,
+        )
+
+    fp8, bf16 = built("fp8"), built(None)
+    assert bf16.speculative_config.draft_kv_dtype == "bf16"
+    assert build_page_namespace(fp8, chunk, 1) != build_page_namespace(bf16, chunk, 1)
 
 
 LMCACHE_MP = {"kv_connector": "lmcache_mp", "kv_role": "offload"}
