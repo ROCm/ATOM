@@ -1185,6 +1185,10 @@ parse_mooncake_owner_spec() {
   fi
   local spec
   spec="$(mooncake_setting "${setting}" "${default_spec}")"
+  # none: the prefill node pins no owner, MOONCAKE_STORE_DECODE_OWNERS holds them all.
+  if [[ "${setting}" == "MOONCAKE_STORE_OWNERS" && "${spec}" == "none" ]]; then
+    return 0
+  fi
   local device_list='[A-Za-z0-9_]+(,[A-Za-z0-9_]+)*'
   local -a entries=()
   IFS=';' read -r -a entries <<< "${spec}"
@@ -1414,10 +1418,10 @@ check_mooncake_store_settings() {
   local layout="${ATOMESH_PD_WORKER_LAYOUT:-multi_node}" num_prefill="${xP:-1}"
   local prefill_nodes_per_worker="${PREFILL_NODES_PER_WORKER:-1}" decode_owner_node_count
   decode_owner_node_count="$(mooncake_decode_owner_node_count)"
-  if [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]] \
-    && [[ "${num_prefill}" != "1" || "${prefill_nodes_per_worker}" != "1" \
-      || "${decode_owner_node_count}" == "0" ]]; then
-    echo "[mooncake-store][FAIL] MOONCAKE_STORE_DECODE_OWNERS needs the decode on nodes of its own (pd_worker_layout multi_node or packed_nodes, here ${layout}, with ${decode_owner_node_count} such node(s)) and one prefill worker (here ${num_prefill}) on one node (prefill nodes_per_worker, here ${prefill_nodes_per_worker}), whose masters they join: every prefill node starts masters of its own" >&2
+  local prefill_owners
+  prefill_owners="$(mooncake_setting MOONCAKE_STORE_OWNERS)"
+  if [[ "${prefill_owners}" == "none" && -z "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]]; then
+    echo "[mooncake-store][FAIL] MOONCAKE_STORE_OWNERS=none leaves the Store no owner; set MOONCAKE_STORE_DECODE_OWNERS" >&2
     exit 2
   fi
   # This shell starts one Store, planned for its first prefill worker's GPUs;
@@ -1436,11 +1440,30 @@ check_mooncake_store_settings() {
       done
       ;;
   esac
-  if (( workers_on_a_node > 1 )); then
-    echo "[mooncake-store][FAIL] MOONCAKE_STORE=1 runs one Store per node for one prefill worker, whose GPUs its owners' NICs are placed around; pd_worker_layout ${layout} starts ${workers_on_a_node} prefill workers on one node" >&2
+  # With no owner on the prefill node, its workers all share the one Store
+  # there, each on its own GPUs' NICs: packed on one node, they are its only
+  # prefill node.
+  local shared_prefill_node=0
+  if [[ "${prefill_owners}" == "none" && "${layout}" == "packed_nodes" \
+    && "${#prefill_workers_on[@]}" == "1" && "${prefill_nodes_per_worker}" == "1" ]]; then
+    shared_prefill_node=1
+  fi
+  if [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]] \
+    && [[ ( "${num_prefill}" != "1" && "${shared_prefill_node}" == "0" ) \
+      || "${prefill_nodes_per_worker}" != "1" || "${decode_owner_node_count}" == "0" ]]; then
+    echo "[mooncake-store][FAIL] MOONCAKE_STORE_DECODE_OWNERS needs the decode on nodes of its own (pd_worker_layout multi_node or packed_nodes, here ${layout}, with ${decode_owner_node_count} such node(s)) and one prefill worker (here ${num_prefill}) on one node (prefill nodes_per_worker, here ${prefill_nodes_per_worker}), or packed_nodes prefill workers on one node with MOONCAKE_STORE_OWNERS=none, whose masters they join: every prefill node starts masters of its own" >&2
+    exit 2
+  fi
+  if (( workers_on_a_node > 1 && shared_prefill_node == 0 )); then
+    echo "[mooncake-store][FAIL] MOONCAKE_STORE=1 runs one Store per node for one prefill worker, whose GPUs its owners' NICs are placed around; pd_worker_layout ${layout} starts ${workers_on_a_node} prefill workers on one node (packed_nodes prefill workers on one node share it with MOONCAKE_STORE_OWNERS=none and MOONCAKE_STORE_DECODE_OWNERS)" >&2
     exit 2
   fi
   require_mooncake_store_number MOONCAKE_STORE_COMPACT_TIMEOUT 600 positive
+  for name in MOONCAKE_STORE_LOAD_POOL_MIB MOONCAKE_STORE_SAVE_POOL_MIB; do
+    if [[ -n "$(mooncake_setting "${name}")" ]]; then
+      require_mooncake_store_number "${name}" "" positive_integer
+    fi
+  done
   require_mooncake_store_number MOONCAKE_STORE_WAIT_TIMEOUT 1200 positive_integer
   require_mooncake_store_number MOONCAKE_STORE_MASTER_NUMA 1 integer
   require_mooncake_store_number MOONCAKE_STORE_PAGE_CACHE_DROP_FOR 1800 integer
@@ -1885,6 +1908,14 @@ mooncake_pools_json() {
 # off the owners' NICs.
 mooncake_store_launcher_config_json() {
   printf '{"mooncake_store.local_hostname":"%s","mooncake_store.protocol":"rdma",' "${host_ip}"
+  # The requester's load and save pools, ATOM's defaults unless the case sizes them.
+  local pool_kind mib
+  for pool_kind in load save; do
+    mib="$(mooncake_setting "MOONCAKE_STORE_${pool_kind^^}_POOL_MIB")"
+    if [[ -n "${mib}" ]]; then
+      printf '"mooncake_store.%s_pool_mib":%d,' "${pool_kind}" "$(( 10#${mib} ))"
+    fi
+  done
   if [[ -n "${mooncake_pool_devices[0]}" ]]; then
     printf '"mooncake_store.pools":%s}' "$(mooncake_pools_json)"
   else
@@ -1896,9 +1927,17 @@ mooncake_store_launcher_config_json() {
 
 start_mooncake_store() {
   mooncake_store_requested || return 0
+  # A later prefill worker of the node shares the Store its first one started.
+  if [[ "${mooncake_store_ready}" == "1" ]]; then
+    return 0
+  fi
   check_mooncake_store_settings
   check_mooncake_owner_devices
-  prepare_mooncake_store_memory
+  # With MOONCAKE_STORE_OWNERS=none this node pins nothing, and keeps the
+  # checkpoint's page cache for its workers.
+  if (( ${#mooncake_owner_plan_numa[@]} > 0 )); then
+    prepare_mooncake_store_memory
+  fi
   start_mooncake_page_cache_dropper
   mooncake_store_pids=()
   mooncake_store_logs=()
@@ -2284,9 +2323,9 @@ start_router() {
       router_policy_args+=(--prefill-policy cache_aware --decode-policy cache_aware)
     fi
     router_policy_args+=(
-      --cache-threshold 0.8
+      --cache-threshold "${ROUTER_CACHE_THRESHOLD:-0.8}"
       --balance-abs-threshold "${ROUTER_BALANCE_ABS_THRESHOLD:-20}"
-      --balance-rel-threshold 2.0
+      --balance-rel-threshold "${ROUTER_BALANCE_REL_THRESHOLD:-2.0}"
       --eviction-interval 300
     )
     router_rank_mapping_args=(--atom-pd-rank-mapping-policy "${ATOM_PD_RANK_MAPPING_POLICY}")
@@ -2304,6 +2343,9 @@ start_router() {
       --prepare-queue-timeout-ms 5000
       --fastokens-models '*' --fastokens-segment-cache-mb 1024
     )
+    if [[ -n "${ROUTER_KV_STORAGE_WEIGHT:-}" ]]; then
+      router_kv_events_args+=(--kv-storage-weight "${ROUTER_KV_STORAGE_WEIGHT}")
+    fi
   fi
   local -a router_cmd=(
     "${mesh_binary}" launch
@@ -2322,6 +2364,7 @@ start_router() {
     --log-level info
     --disable-circuit-breaker
     --prometheus-port "${PROMETHEUS_PORT}"
+    ${ROUTER_EXTRA_ARGS:-}
   )
   dump_launch_info "ROUTER" "${router_cmd[@]}"
   start_logged_process router_pid "${RUNTIME_LOG_DIR}/router.log" "${router_cmd[@]}"

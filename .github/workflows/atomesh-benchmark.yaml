@@ -59,7 +59,7 @@ on:
         default: false
         type: boolean
       model_names:
-        description: 'When run_all_models=false, run all cases in the selected suite for these model families. Comma-separated: DeepSeek-V4-Pro,DeepSeek-V4-Pro-0813,GLM-5.2-MXFP4,Kimi-K3-MXFP4,Kimi-K2.5-MXFP4,MiniMax-M3-MXFP4,MiniMax-M3-MXFP8'
+        description: 'When run_all_models=false, run all cases in the selected suite for these model families. Comma-separated: DeepSeek-V4-Pro,DeepSeek-V4-Pro-0813,DeepSeek-V4.1-Flash-1017,GLM-5.2-MXFP4,Kimi-K3-MXFP4,Kimi-K2.5-MXFP4,MiniMax-M3-MXFP4,MiniMax-M3-MXFP8'
         required: false
         default: ''
         type: string
@@ -83,6 +83,10 @@ on:
 
           DeepSeek-V4-Pro-0813 (accuracy):
             ds-v4-0813-1p1d-tp8-dspark3-gsm8k-only-c16
+
+          DeepSeek-V4.1-Flash-1017 8P16D share-cache (3 pit2-p03 nodes; suite=mooncake_store load-balanced baseline, suite=kv_events cache-aware routing):
+            ds-v41-flash-8p16d-p2ep2-d4noep-dspark5-agentic-mcstore-c1228,
+            ds-v41-flash-8p16d-p2ep2-d4noep-dspark5-agentic-mcstore-kvev-c1228
 
           GLM:
             glm-52-mxfp4-1p1d-tp4,glm-52-mxfp4-1p1d-tp8,
