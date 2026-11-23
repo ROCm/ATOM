@@ -213,8 +213,9 @@ def test_engine_teardown_always_flushes_traces(monkeypatch, engine_kind, failure
     core._generation_paused = False
     core._sync_dp_state = lambda *a: (False, True, False)
     monkeypatch.setattr(tracing, "shutdown", lambda: calls.append("trace"))
-    # A later PP stage neither drains KV work nor shuts a KV event publisher down.
-    if failure in {"drain", "shutdown"} and engine_kind != "pp_downstream":
+    if failure in {"drain", "shutdown"} and not (
+        engine_kind == "pp_downstream" and failure == "drain"
+    ):
         with pytest.raises(RuntimeError, match=failure):
             core.busy_loop()
     else:

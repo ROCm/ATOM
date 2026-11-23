@@ -85,7 +85,7 @@ def _case(rank, mailbox, batch, context, init, keep, pages=None):
             recv, table, seq, TOPK, init, keep, QLEN, **geometry
         )
 
-    def one_launch(i, **emit):
+    def one_launch(i):
         return ex.select_exchanged_candidates(
             scores[i],
             seq,
@@ -98,7 +98,6 @@ def _case(rank, mailbox, batch, context, init, keep, pages=None):
             keep,
             mailbox,
             **geometry,
-            **emit,
         )
 
     expected = [tuple(t.clone() for t in gathered(i)) for i in range(2)]
@@ -109,11 +108,6 @@ def _case(rank, mailbox, batch, context, init, keep, pages=None):
         results.append(
             all(torch.equal(a, b) for a, b in zip(got, expected[i], strict=True))
         )
-    # without the emit (the NVFP4 KV) only the indices come back, the same ones
-    results += [
-        torch.equal(one_launch(i, emit_sparse_block_table=False), expected[i][0])
-        for i in range(2)
-    ]
     torch.cuda.synchronize()
     dist.barrier()
     stream = torch.cuda.Stream()

@@ -26,6 +26,7 @@ from atom.model_engine.engine_utility import (
     ask_what_runners_cannot_take,
 )
 from atom.model_engine.prefill_backlog import prefill_backlog
+from atom.model_engine import sched_timing
 from atom.model_engine.prefix_hash import attach_shipped_chains
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
 from atom.model_engine.sequence import (
@@ -53,6 +54,15 @@ from atom.utils.gc_utils import (
     tune_gc,
     unfreeze_gc_heap,
 )
+from atom.kv_transfer.disaggregation.types import mono_offload_hazard
+from atom.utils.gpu_guard import (
+    GpuGuard,
+    describe,
+    kfd_gpu_ids,
+    kick,
+    scan,
+    visible_gpus,
+)
 
 logger = logging.getLogger("atom")
 
@@ -62,23 +72,6 @@ logger = logging.getLogger("atom")
 KV_IDLE_DRAIN_INTERVAL_S = 0.001
 # How long a busy loop that finds its engine held sleeps before it looks again.
 HELD_POLL_S = 0.01
-
-
-def yield_gil() -> None:
-    """Hand the GIL to this process's other threads now.
-
-    A busy loop holds the GIL for as long as it does not block: an idle pass
-    blocks nowhere, and neither does the stretch between queuing a step's
-    outputs and the loop's next blocking call. A thread that is ready to run
-    meanwhile -- the output sender with a request's last chunk, the input
-    reader with a new request -- then gets the GIL only when CPython forces a
-    switch, after `sys.getswitchinterval()` (5 ms by default): the last chunk
-    of every request sat that long in `output_queue` once the engine went
-    idle. `time.sleep(0)` drops and retakes the GIL around a zero-length
-    sleep, so such a thread runs at once; the loop pays microseconds.
-    """
-    time.sleep(0)
-
 
 # Upper bound on the drain that runs after the loop exits. A peer that died
 # mid-transfer leaves a completion that never arrives; exiting late beats
@@ -168,6 +161,8 @@ class EngineCore:
         self.input_thread.start()
 
         self.mark_trace = getattr(config, "mark_trace", False)
+        self._sched_timer = sched_timing.StepTimer("engine") if sched_timing.ENABLED else None
+        self._st_last_end = None
         init_exit_handler(self)
         self._init_data_parallel(config)
 
@@ -301,8 +296,146 @@ class EngineCore:
         tracing.initialize()
         self._freeze_after_startup()
 
+        # Last: the processes on the GPUs now are this server's.
+        self.gpu_guard = (
+            GpuGuard(self.label, envs.ATOM_GPU_GUARD_INTERVAL_S)
+            if envs.ATOM_GPU_GUARD
+            else None
+        )
+        self._step_started: float | None = None
+        self._step_desc = ""
+        # What the watchdog saw, by step kind: a forward that ran past
+        # ATOM_STEP_WATCHDOG_S, and how many of them a kick preceded the end of.
+        self._step_kind = ""
+        self.long_forwards: dict[str, int] = {}
+        self.long_forwards_kicked: dict[str, int] = {}
+        if envs.ATOM_STEP_WATCHDOG_S > 0:
+            threading.Thread(
+                target=self._step_watchdog, daemon=True, name="step-watchdog"
+            ).start()
+
         self._send_ready_signal()
         logger.info(f"{self.label}: EngineCore fully initialized and ready")
+
+    @staticmethod
+    def _forward_kind(batch) -> str:
+        """The watchdog's name for a step: Mono kernels only ever run in a
+        decode-only step, so a long prefill or mixed forward is not a Mono stall."""
+        if batch.total_seqs_num_prefill and batch.total_seqs_num_decode:
+            return "mixed"
+        if batch.total_seqs_num_prefill:
+            return "prefill"
+        return "decode (Mono off)" if getattr(batch, "mono_blocked", False) else "decode"
+
+    def _mono_block_reason(self) -> str | None:
+        """Why this step must stay off Mono, or None. Mono kernels hold every CU
+        and spin on their TP peers, so another kernel on a TP GPU can stall the
+        step for minutes (ROCm/ATOM#3369): a foreign process (the GPU guard) or
+        the CPU tier's copy kernels (a load / save not yet terminal on every
+        rank). Engine-side state only, so every rank gets the same answer."""
+        guard = getattr(self, "gpu_guard", None)
+        why = None
+        if guard is not None and guard.present():
+            why = "GPU guard"
+        elif getattr(self, "kv_transfer_enabled", False) and mono_offload_hazard(
+            getattr(self.scheduler, "kv_connector", None)
+        ):
+            why = "KV tier transfer"
+        gate = getattr(self, "_mono_gate_counts", None)
+        if gate is None:
+            gate = self._mono_gate_counts = {"steps": 0, "GPU guard": 0,
+                                             "KV tier transfer": 0,
+                                             "since": time.monotonic()}  # fmt: skip
+        gate["steps"] += 1
+        if why is not None:
+            gate[why] += 1
+        now = time.monotonic()
+        if now - gate["since"] >= 60.0:
+            if gate["GPU guard"] or gate["KV tier transfer"]:
+                logger.info(
+                    "%s: Mono gate: %d of %d forwards kept off Mono in %.0f s "
+                    "(GPU guard %d, KV tier transfer %d)",
+                    self.label,
+                    gate["GPU guard"] + gate["KV tier transfer"],
+                    gate["steps"],
+                    now - gate["since"],
+                    gate["GPU guard"],
+                    gate["KV tier transfer"],
+                )
+            gate.update({"steps": 0, "GPU guard": 0, "KV tier transfer": 0,
+                         "since": now})  # fmt: skip
+        return why
+
+    def _step_watchdog(self) -> None:
+        """Report a forward that has run past ATOM_STEP_WATCHDOG_S: the engine
+        thread is blocked in it and logs nothing of its own meanwhile."""
+        limit = envs.ATOM_STEP_WATCHDOG_S
+        guard = getattr(self, "gpu_guard", None)
+        if guard is not None:
+            gpus = guard.gpus
+        else:
+            ids = kfd_gpu_ids()
+            gpus = {g: ids[g] for g in visible_gpus() if g < len(ids)}
+        kick_after = envs.ATOM_STEP_KICK_S
+        hung = None  # (start, desc) of the forward being reported
+        next_report = next_kick = 0.0
+        kicks = 0
+        while True:
+            time.sleep(min(1.0, limit / 4))
+            started, now = self._step_started, time.monotonic()
+            if hung is not None and started != hung[0]:
+                kind = hung[2]
+                self.long_forwards[kind] = self.long_forwards.get(kind, 0) + 1
+                if kicks:
+                    self.long_forwards_kicked[kind] = (
+                        self.long_forwards_kicked.get(kind, 0) + 1
+                    )
+                logger.warning(
+                    "%s: the forward reported running long (%s) finished after %.1fs%s"
+                    "; long forwards so far %s (kicked %s)",
+                    self.label,
+                    hung[1],
+                    now - hung[0],
+                    f" ({kicks} GPU kick(s))" if kicks else "",
+                    self.long_forwards,
+                    self.long_forwards_kicked,
+                )
+                hung = None
+                kicks = 0
+            if started is None or now - started < limit:
+                continue
+            if 0 < kick_after <= now - started and now >= next_kick and kicks < 12:
+                kicks += 1
+                next_kick = now + 5.0
+                logger.warning(
+                    "%s: kicking this server's GPUs (%s forward at %.1fs, kick %d): a "
+                    "process that adds a queue makes KFD remap every queue, which can "
+                    "end a GPU spin livelock (Mono runs only in decode steps)",
+                    self.label,
+                    self._step_kind or "?",
+                    now - started,
+                    kicks,
+                )
+                if guard is not None:
+                    guard.kick()
+                else:
+                    kick(sorted(gpus))
+            if hung is None or now >= next_report:
+                hung = (started, self._step_desc, self._step_kind or "?")
+                next_report = now + 30.0
+                procs = scan(gpus)
+                if guard is not None:
+                    others = {p: u for p, u in procs.items() if p not in guard.own}
+                    who = "not its own: " + (describe(others) or "none")
+                else:
+                    who = "(GPU guard off, all): " + (describe(procs) or "none")
+                logger.error(
+                    "%s: a forward has run for %.1fs (%s). Processes on this server's GPUs %s",
+                    self.label,
+                    now - started,
+                    hung[1],
+                    who,
+                )
 
     def _init_prefill_delayer(self, config: Config, cpu_group=None):
         if (
@@ -496,10 +629,8 @@ class EngineCore:
     def _report_held_kv_work(self) -> None:
         """Let transfers already in flight report back while no forward runs.
 
-        Starts no new transfer, except that with ``ATOM_STORE_ASYNC_RENEW`` the
-        metadata build may dispatch the GET of a load parked on its lease
-        renewal. Runs nothing while the weights (and so the KV pool) may be
-        released.
+        Starts none, and runs nothing while the weights (and so the KV pool)
+        may be released.
         """
         if not self._is_rl_weights_offloaded and self.has_pending_kv_work():
             self._advance_idle_kv_transfer(dispatch_new=False)
@@ -521,9 +652,7 @@ class EngineCore:
     def prepare_kv_change(self, *, weights: bool, deadline: float) -> None:
         """Get the KV pool ready to be zeroed, freed or recomputed, or raise.
 
-        Waits until KV transfers in flight have reported back (with
-        ``ATOM_STORE_ASYNC_RENEW`` a load parked on its lease renewal counts,
-        and the metadata build may dispatch its GET meanwhile), then preempts
+        Waits until KV transfers in flight have reported back, then preempts
         what is running so it recomputes on what follows. When the weights
         change, the KV connector must also drop what it keeps for later
         requests. Raises with the reason, changing nothing that was running.
@@ -590,12 +719,10 @@ class EngineCore:
                         self.scheduler.engine_stats.bump_step()
                     else:
                         self.scheduler.engine_stats.note_idle(now)
-                        yield_gil()
                 else:
                     self.scheduler.engine_stats.note_idle(now)
                     if self.has_pending_kv_work():
                         self._advance_idle_kv_transfer()
-                    yield_gil()
         finally:
             try:
                 # Teardown runs even on exceptions so the sender thread/socket
@@ -612,18 +739,15 @@ class EngineCore:
                 tracing.shutdown()
 
     def _process_engine_step(self):
-        return self._run_then_publish_kv_events(self._process_engine_step_inner)
-
-    def _run_then_publish_kv_events(self, step):
         try:
-            return step()
+            return self._process_engine_step_inner()
         finally:
             # Swallow publisher errors so they cannot mask an exception from
-            # the step itself.
+            # the engine step itself.
             try:
                 self.scheduler.publish_kv_events()
             except Exception:
-                logger.exception("KV event publish after engine step failed")
+                logger.exception("KV event publish in engine-step finally failed")
 
     def _release_request_resources(self, sequences):
         structured_ids = [seq.id for seq in sequences if is_structured(seq)]
@@ -642,7 +766,15 @@ class EngineCore:
         # waiting. Arrivals during this step remain latched until the next step.
         if self.kv_transfer_enabled:
             self._kv_progress_event.clear()
+        st = self._sched_timer
+        if st is not None:
+            t0 = time.perf_counter()
+            if self._st_last_end is not None:
+                st.add("eng_loop", t0 - self._st_last_end)
         result = self.scheduler.schedule()
+        if st is not None:
+            t1 = time.perf_counter()
+            st.add("eng_schedule", t1 - t0)
 
         # Surface admit-rejected seqs (those `_unschedulable_reason` flags in
         # the scheduler) through the same finished-seq path as normal seqs.
@@ -677,9 +809,30 @@ class EngineCore:
             self.scheduler.compute_detailed_aggregates(scheduled_batch, seqs)
             tracing.record_forward(scheduled_batch, seqs)
             self.scheduler.metrics.record_forward(scheduled_batch, seqs)
-            fwd_out = self.runner_mgr.call_func(
-                "forward", scheduled_batch, wait_out=True
+            # Decided here, once, so every rank gets the same answer with the batch.
+            why = self._mono_block_reason()
+            scheduled_batch.mono_blocked = why is not None
+            self._step_kind = self._forward_kind(scheduled_batch)
+            self._step_desc = (
+                f"{self._step_kind}: "
+                f"{scheduled_batch.total_seqs_num_prefill} prefill + "
+                f"{scheduled_batch.total_seqs_num_decode} decode reqs, "
+                f"{scheduled_batch.total_tokens_num} tokens"
+                + (f", Mono off: {why}" if why else "")
             )
+            self._step_started = time.monotonic()
+            if st is not None:
+                t2 = time.perf_counter()
+            try:
+                fwd_out = self.runner_mgr.call_func(
+                    "forward", scheduled_batch, wait_out=True
+                )
+            finally:
+                self._step_started = None
+            if st is not None:
+                t3 = time.perf_counter()
+                st.add("eng_pre_fwd", t2 - t1)
+                st.add("eng_fwd_rpc", t3 - t2)
             if (
                 self.scheduler.prefill_delayer is not None
                 and scheduled_batch.total_seqs_num_prefill > 0
@@ -700,7 +853,23 @@ class EngineCore:
                 self._wait_for_kv_progress()
             return False
 
+        if st is not None:
+            t4 = time.perf_counter()
         self._postprocess(seqs.values(), fwd_out, scheduled_batch)
+        if st is not None:
+            t5 = time.perf_counter()
+            st.add("eng_post", t5 - t4)
+            st.add("eng_step", t5 - t0)
+            self._st_last_end = t5
+            b = scheduled_batch
+            if b.total_seqs_num_prefill:
+                st.shape(
+                    f"p{b.total_seqs_num_prefill}/{b.total_tokens_num_prefill // 1024}k"
+                    f"+d{b.total_seqs_num_decode}"
+                )
+            else:
+                st.shape(f"d{b.total_seqs_num_decode}")
+            st.step_done()
         return True
 
     def _wait_for_kv_progress(self) -> None:
@@ -733,8 +902,6 @@ class EngineCore:
         if finished_seqs:
             self._release_request_resources(finished_seqs)
             self.output_queue.put_nowait(finished_seqs)
-        # The sender ships them now, not a switch interval later (`yield_gil`).
-        yield_gil()
 
     def has_pending_kv_work(self) -> bool:
         """True while KV transfer work outlives the scheduler queues.
@@ -773,9 +940,7 @@ class EngineCore:
         # No forward batch will run this tick, but offload load/save work may
         # still need to be dispatched or reported back to the scheduler.
         # `dispatch_new=False` on the shutdown drain: report in-flight work
-        # back, but start no new transfers (see `_dispatch_idle_offload_work`);
-        # with `ATOM_STORE_ASYNC_RENEW` the metadata build may still dispatch
-        # the GET of a load parked on its lease renewal.
+        # back, but start no new transfers (see `_dispatch_idle_offload_work`).
         now = time.monotonic()
         if now < self._next_idle_kv_drain:
             return
@@ -794,9 +959,7 @@ class EngineCore:
         transfers finish and report, but must not publish new state loads/stores.
         A fresh store dispatched here spills bytes nothing will read back, and --
         worse -- keeps `has_pending_kv_work()` True, so this very loop could
-        manufacture its own work and never converge before the deadline. The
-        one exception: with `ATOM_STORE_ASYNC_RENEW` the metadata build may
-        dispatch the GET of a load already parked on its lease renewal.
+        manufacture its own work and never converge before the deadline.
         """
         if not self.kv_transfer_enabled:
             return
@@ -884,9 +1047,7 @@ class EngineCore:
         # read back, and -- worse -- each fresh store keeps `has_pending_kv_work`
         # True, so the drain loop that waits on it manufactures its own exit
         # condition and never converges. Still build/process the meta so
-        # already-dispatched transfers finish and report (with
-        # `ATOM_STORE_ASYNC_RENEW` that build may dispatch the GET of a load
-        # parked on its lease renewal).
+        # already-dispatched transfers finish and report.
         if dispatch_new:
             publish_idle_state_work(self.scheduler)
         meta = connector.build_connector_meta()
@@ -1709,7 +1870,7 @@ class DecodeEngineCore(EngineCore):
             self._send_block_assignment(seq)
         return False
 
-    def _process_engine_step_inner(self):
+    def _process_engine_step(self):
         """Override: handle None from DecodeScheduler when prefill_waiting is
         non-empty but running is empty (sequences are still being prefilled)."""
         if not self.scheduler.has_requests():
@@ -1745,8 +1906,6 @@ class DecodeEngineCore(EngineCore):
             pass
         if finished_seqs:
             self.output_queue.put_nowait(finished_seqs)
-        # The sender ships them now, not a switch interval later (`yield_gil`).
-        yield_gil()
         return True
 
     @staticmethod

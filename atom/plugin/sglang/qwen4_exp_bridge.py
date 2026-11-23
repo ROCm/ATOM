@@ -1312,8 +1312,7 @@ def _flydsl_prefill_layout(
         torch.cumsum(lengths, 0) - lengths, lengths, output_size=total
     )
     pages = block_tables[requests, tokens // block_size].to(torch.int64)
-    # int32: the layers hand this to the kernel as its slot table.
-    return (extends, seqs), (pages * block_size + tokens % block_size).to(torch.int32)
+    return (extends, seqs), pages * block_size + tokens % block_size
 
 
 def _mamba_physical_slots(pool: Any) -> int:

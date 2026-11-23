@@ -103,10 +103,17 @@ def moe_common_defs(k4ctx):
     tid = k4ctx["tid"]
     tokens = k4ctx["tokens"]
     w13 = k4ctx["w13"]
+    w13_gugu = k4ctx["w13_gugu"]
     w2 = k4ctx["w2"]
     w2s = k4ctx["w2s"]
     w13s = k4ctx["w13s"]
     wave = k4ctx["wave"]
+
+    def w13_group(cg, gu):
+        """The 16-row block of w13 holding gate (``gu`` 0) / up (1) row group ``cg``."""
+        if const_expr(w13_gugu):
+            return 2 * cg + gu
+        return gu * UG_PER_SLOT + cg
 
     def ug_task_id(it):
         """(this CTA's it-th routed task, clamped; whether it exists)."""
@@ -136,7 +143,7 @@ def moe_common_defs(k4ctx):
             scs.append([])
             for i in range_constexpr(UG_CPW):
                 kc = wave * UG_CPW + i
-                wts[gu].append(fp4_tile_load(r_w, 0, rg, HIDDEN, kc, lane * 4))
+                wts[gu].append(fp4_tile_load(r_w, 0, w13_group(cg, gu), HIDDEN, kc, lane * 4))
                 scs[gu].append(
                     e8m0_load(
                         r_s,

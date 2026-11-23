@@ -14,7 +14,6 @@ import torch
 from aiter import QuantType, dtypes
 
 from atom.model_ops.linear import weight_is_stored_preshuffled
-from atom.model_ops.minimax_m3.nvfp4_pages import INDEX_PAGE_BYTES
 from atom.models.minimax_m3.mono.config import (
     DENSE_INTER,
     HEAD_DIM,
@@ -28,6 +27,7 @@ from atom.models.minimax_m3.mono.config import (
     TOPK_BLOCKS,
     IndexHeads,
 )
+from atom.models.minimax_m3.mono.kernels.common import NVFP4_PAGE_BYTES
 from atom.mono.runtime.consensus import MonoUnsupported
 
 
@@ -67,14 +67,14 @@ def _mxfp8(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Weight + per-1x32 E8M0 scale of a native MXFP8 linear: the checkpoint's
     bytes, never requantized; the weight 16x16-preshuffled, the scales row-major."""
-    w, s = linear.weight, linear.weight_scale
+    w, s = linear.weight, getattr(linear, "weight_scale", None)
     _need(
         linear.quant_type.value == QuantType.per_1x32.value,
         f"{name}: not per-1x32",
     )
     # only the native loader keeps the scales row-major; a generic 1x32 one shuffles them
     _need(
-        linear.native_a8_group_rows is not None,
+        getattr(linear, "native_a8_group_rows", None) is not None,
         f"{name}: not the checkpoint's native 1x32 layout",
     )
     _need(
@@ -85,11 +85,11 @@ def _mxfp8(
         weight_is_stored_preshuffled(
             linear.quant_type,
             linear.params_dtype,
-            native_group_rows=linear.native_a8_group_rows,
+            native_group_rows=getattr(linear, "native_a8_group_rows", None),
         ),
         f"{name}: not preshuffled",
     )
-    _need(not linear.is_output_padded, f"{name}: output padded")
+    _need(not getattr(linear, "is_output_padded", False), f"{name}: output padded")
     _need(
         s is not None
         and s.dtype in (torch.uint8, dtypes.fp8_e8m0)
@@ -192,6 +192,9 @@ class SparseMoeLayer:
     # qkv_proj / o_proj are the checkpoint's MXFP8 1x32 (``s_qkv`` / ``s_o``: E8M0
     # ``[rows, K / 32]``), not the ptpc-FP8 requantization (f32 ``[rows]``)
     attn_mxfp8: bool = False
+    # ``w13``'s 16-row gate / up blocks interleaved (GUGU, the amd-kernels MoE's layout,
+    # ``ATOM_M3_AK_MOE``); the scales keep aiter's GGUU shuffle
+    w13_gugu: bool = False
 
     @staticmethod
     def from_layer(layer, layer_id: int, heads: IndexHeads) -> "SparseMoeLayer":
@@ -224,13 +227,13 @@ class SparseMoeLayer:
                 impl.index_cache_dtype == "nvfp4"
                 and impl.index_cache.dtype == torch.uint8
                 and impl.index_cache.dim() == 2
-                and impl.index_cache.shape[1] == INDEX_PAGE_BYTES
-                and impl.index_cache.stride() == (INDEX_PAGE_BYTES, 1),
+                and impl.index_cache.shape[1] == NVFP4_PAGE_BYTES
+                and impl.index_cache.stride() == (NVFP4_PAGE_BYTES, 1),
                 f"layer {layer_id}: index cache {impl.index_cache.dtype} "
                 f"{tuple(impl.index_cache.shape)} {impl.index_cache.stride()}",
             )
             for name in ("nvfp4_k_scale", "nvfp4_v_scale"):
-                t = getattr(impl, name)
+                t = getattr(impl, name, None)
                 _need(
                     t is not None and t.dtype == torch.float32 and t.numel() == 1,
                     f"layer {layer_id}: {name}",
@@ -322,6 +325,7 @@ class SparseMoeLayer:
             w2s=w2s,
             s2s=s2s,
             attn_mxfp8=mx_qkv,
+            w13_gugu=getattr(w13, "w13_gugu", False),
         )
 
 

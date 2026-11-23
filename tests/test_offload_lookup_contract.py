@@ -22,7 +22,9 @@ def test_owned_and_unavailable_lookup_identity():
 
 @pytest.mark.parametrize("available", [False, True])
 def test_dense_factory_passive_lookup_contract(monkeypatch, available):
-    # Exercise the external LMCache factory -> Dense -> shared base constructor.
+    # Exercise the external LMCache factory -> Dense -> shared base constructor,
+    # with the synchronous client (the async wrapper has its own tests).
+    monkeypatch.setenv("OFFLOAD_INPROC_ASYNC_LOOKUP", "0")
     external = SimpleNamespace(lookup=lambda *_args: 512)
     module = ModuleType("lmcache.v1.lookup_client.factory")
 

@@ -434,24 +434,21 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
                 continue
             policy = select_policy(
                 allowed=layer.allow_aiter_flydsl,
-                replayssm=metadata.replayssm,
+                replayssm=bool(getattr(metadata, "replayssm", False)),
                 lossy_decode=False,
                 state=state,
                 activation_dtype=layer.dt_bias.dtype,
             )
-            # RTP-LLM MTP prefill has no FlyDSL accuracy or perf data under
-            # ReplaySSM yet, so it stays on Triton there.
-            prefill = policy.prefill and not metadata.replayssm
             layer.gdn_flydsl_policy = GDNFlyDSLPolicy(
-                prefill=prefill,
+                prefill=policy.prefill,
                 decode=(
                     policy.decode
-                    and metadata.num_spec_decodes == 0
+                    and getattr(metadata, "num_spec_decodes", 0) == 0
                     and state.stride()[1:]
                     == (state.shape[-2] * state.shape[-1], 1, state.shape[-2])
                 ),
             )
-            enabled |= prefill
+            enabled |= policy.prefill
         if not enabled or metadata.num_prefills == 0:
             return
         lengths = getattr(attn_inputs, "input_lengths", None)

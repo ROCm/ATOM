@@ -46,9 +46,6 @@ class PagedAttentionImpl(nn.Module):
     """
 
     kv_layout = None  # the pool layout of its pages (a `KvLayout`); None = SHUFFLE
-    # Whether forward_impl takes ``quantized_output`` / ``output_scale`` and writes
-    # its output there as OCP FP8 plus per-token FP32 descales.
-    supports_output_quant = False
 
     @staticmethod
     def qkv_fields(num_heads, num_kv_heads, head_dim, **kwargs):
@@ -232,18 +229,12 @@ class PagedAttentionImpl(nn.Module):
         position: torch.Tensor = None,
         q_scale: torch.Tensor = None,
         qkv: torch.Tensor = None,
-        quantized_output: torch.Tensor | None = None,
-        output_scale: torch.Tensor | None = None,
     ):
 
         fwd_ctx: ForwardContext = get_forward_context()
 
         # dummy run will skip attention in cuda graph capture phase
         if fwd_ctx.context.is_dummy_run:
-            if quantized_output is not None:
-                quantized_output.zero_()
-                output_scale.fill_(1.0)
-                return quantized_output
             o = torch.empty_like(q)
             return o
 
@@ -258,14 +249,7 @@ class PagedAttentionImpl(nn.Module):
         )
 
         attn_impl = self.dispatch_backend(fwd_ctx, q, k, v)
-        if quantized_output is None:
-            o = attn_impl(q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx)
-        else:
-            # The FP8 output (`unified_attention_fp8`): only an impl with
-            # `supports_output_quant` gets one, and hands it to its backends.
-            args = (q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx)
-            out = quantized_output.view(-1, self.num_heads, self.head_dim)
-            o = attn_impl(*args, quantized_output=out, output_scale=output_scale)
+        o = attn_impl(q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx)
 
         o = o.view(-1, self.num_heads * self.head_dim)
 
@@ -1241,11 +1225,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
     """MiniMax-M3 sparse attention as a first-class ``PagedAttentionImpl``.
 
     Plugged into the standard ``Attention`` layer via ``impl_cls=`` so it reuses
-    the generic per-layer custom op (``unified_attention_with_output_base``, or
-    ``unified_attention_fp8`` when ``supports_output_quant`` turns on the FP8
-    output) for its torch.compile boundary, and the standard
-    ``AiterAttentionMetadataBuilder`` for KV-cache allocation/binding. Only two
-    framework hooks are overridden:
+    the generic per-layer custom op (``unified_attention_with_output_base``) for
+    its torch.compile boundary, and the standard ``AiterAttentionMetadataBuilder``
+    for KV-cache allocation/binding. Only two framework hooks are overridden:
 
     * :meth:`rope_cache` — MiniMax-M3 fused qk-norm + rope + page-16 SHUFFLE
       KV-insert + indexer-key insert (``aiter.fused_qknorm_idxrqknorm`` /
@@ -1391,15 +1373,6 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             # here, not per call: it needs FlyDSL, which other caches / families lack
             self._sparse_pa_nvfp4_decode = sparse_pa_nvfp4_decode
             self._sparse_pa_nvfp4_prefill = sparse_pa_nvfp4_prefill
-        # The sparse PA writes o_proj's per-token FP8 input itself (aiter #7401)
-        # on a GPU without gluon, whose sparse PA is FlyDSL's on every call, and
-        # over an FP8 KV cache, the one measured. One KV head: a token's row is
-        # then one PA sequence, which its one descale must cover.
-        self.supports_output_quant = (
-            self.kv_cache_dtype == "fp8"
-            and num_kv_heads == 1
-            and not pa_decode_gluon_supports_arch()
-        )
         # Bound by AiterAttentionMetadataBuilder.build_kv_cache_tensor (Task 6):
         # the page-128 indexer-key cache. None until the runner binds it.
         self.index_cache: torch.Tensor | None = None
@@ -1432,6 +1405,12 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         unchanged (already inserted into the cache); the sparse backends read the
         cache, not these tensors.
         """
+        from atom.model_ops.minimax_m3 import p1_front
+
+        if p1_front.QKV_CHAIN:
+            pend = p1_front.pop(q.shape[0])
+            if pend is not None:
+                return self.rope_cache_p1(q, k, v, pend, position, fwd_ctx)
         attn_metadata = fwd_ctx.attn_metadata
         kv_cache_data = fwd_ctx.kv_cache_data
 
@@ -1551,6 +1530,86 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 dtype=index_q_dtype,
                 device=qkv.device,
             )
+        from atom.model_ops.minimax_m3 import ak_kernels, prefill_check, prefill_kernels
+
+        insert_check = None
+        if (
+            prefill_kernels.INSERT == "amdk"
+            and fwd_ctx.context.is_prefill
+            and self.kv_cache_dtype == "nvfp4"
+            and self.index_cache_dtype == "nvfp4"
+            and index_q is not None
+        ):
+            q_dst, iq_dst = q_out, index_q
+            if prefill_check.ENABLED:
+                pages = prefill_check.touched_pages(slot_mapping)
+                index_pages = self.index_cache.view(-1, 128 * 72)
+                before = (k_cache[pages], index_pages[pages])
+                q_dst, iq_dst = q_out.clone(), index_q.clone()
+            prefill_kernels.insert_amdk(
+                qkv,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.index_q_norm.weight,
+                self.index_k_norm.weight,
+                cos_sin_cache,
+                position,
+                slot_mapping,
+                k_cache,
+                self.index_cache,
+                fused_k_scale,
+                fused_v_scale,
+                q_dst,
+                iq_dst,
+                self.num_heads,
+                self.num_kv_heads,
+                self.num_idx_heads,
+                self.q_norm.variance_epsilon,
+            )
+            if not prefill_check.ENABLED:
+                q = q_out.view(-1, self.num_heads, self.head_dim)
+                self._stash_index_q(index_q, num_tokens, index_q_dtype, qkv.device)
+                return q, k, v, k_cache, v_cache, k_scale, v_scale
+            # the reference (aiter's insert below) writes the same slots from the same state
+            insert_check = (pages, index_pages, k_cache[pages], index_pages[pages], q_dst, iq_dst)
+            k_cache[pages] = before[0]
+            index_pages[pages] = before[1]
+        elif (
+            ak_kernels.INSERT
+            and self.kv_cache_dtype == "nvfp4"
+            and self.index_cache_dtype == "nvfp4"
+            and index_q is not None
+            and ak_kernels.insert_blocker(
+                self.num_heads,
+                self.num_kv_heads,
+                self.num_idx_heads,
+                self.rotary_emb.rotary_dim,
+            )
+            is None
+        ):
+            ak_kernels.insert(
+                qkv,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.index_q_norm.weight,
+                self.index_k_norm.weight,
+                cos_sin_cache,
+                position,
+                slot_mapping,
+                k_cache,
+                self.index_cache,
+                fused_k_scale,
+                fused_v_scale,
+                q_out,
+                index_q,
+                self.num_heads,
+                self.num_kv_heads,
+                self.num_idx_heads,
+                self.q_norm.variance_epsilon,
+            )
+            q = q_out.view(-1, self.num_heads, self.head_dim)
+            self._stash_index_q(index_q, num_tokens, index_q_dtype, qkv.device)
+            return q, k, v, k_cache, v_cache, k_scale, v_scale
         aiter.fused_qknorm_idxrqknorm(
             qkv,
             self.q_norm.weight,
@@ -1579,10 +1638,49 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             asm_layout=self.kv_cache_dtype not in FP4_CACHE_DTYPES,
             skip_index_branch=self.skip_index_topk,
         )
+        if insert_check is not None:
+            pages, index_pages, kv_got, idx_got, q_got, iq_got = insert_check
+            n = self.layer_num
+            prefill_check.record("insert_kv", n, num_tokens, kv_got, k_cache[pages])
+            prefill_check.record("insert_idx", n, num_tokens, idx_got, index_pages[pages])
+            prefill_check.record("insert_q", n, num_tokens, q_got, q_out)
+            prefill_check.record("insert_iq", n, num_tokens, iq_got, index_q)
 
         q = q_out.view(-1, self.num_heads, self.head_dim)
         self._stash_index_q(index_q, num_tokens, index_q_dtype, qkv.device)
         return q, k, v, k_cache, v_cache, k_scale, v_scale
+
+    def rope_cache_p1(self, q, k, v, pend, position, fwd_ctx: ForwardContext):
+        """p1/glue-front: QKV MXFP8 GEMM + q / k / index norm + RoPE + NVFP4 K / V / index-K insert in one
+        amd-kernels entry from the qkv linear's parked tiled codes (``p1_front.qkv_front``)."""
+        from atom.model_ops.minimax_m3 import ak_kernels, p1_front
+        from atom.models.minimax_m3.model import _minimax_m3_cos_sin_cache
+
+        _, codes, scales, weight, ak_scale = pend[:5]
+        layer = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"]
+        k_cache = layer.k_cache
+        sparse_metadata = getattr(fwd_ctx.attn_metadata, "sparse_attention_metadata", None)
+        if sparse_metadata is None:
+            sparse_metadata = fwd_ctx.attn_metadata
+        num_tokens = q.shape[0]
+        q_out = torch.empty(
+            (num_tokens, self.num_heads * self.head_dim), dtype=torch.bfloat16, device=q.device
+        )
+        cos_sin_cache = _minimax_m3_cos_sin_cache(self.rotary_emb, q_out)
+        index_q = torch.empty(
+            (num_tokens, self.index_q_size), dtype=torch.float8_e4m3fn, device=q.device
+        )
+        p1_front.run_chain(
+            codes, scales, weight, ak_scale, q_out, index_q,
+            self.q_norm.weight, self.k_norm.weight, self.index_q_norm.weight, self.index_k_norm.weight,
+            cos_sin_cache, position, sparse_metadata.slot_mapping,
+            ak_kernels.kv_pages(k_cache, self.num_kv_heads), ak_kernels.index_pages(self.index_cache),
+            self.nvfp4_k_scale, self.nvfp4_v_scale,
+            self.num_heads, self.num_kv_heads, self.num_idx_heads, self.q_norm.variance_epsilon,
+        )
+        self._stash_index_q(index_q, num_tokens, torch.float8_e4m3fn, q.device)
+        q = q_out.view(-1, self.num_heads, self.head_dim)
+        return q, k, v, k_cache, layer.v_cache, None, None
 
     def _stash_index_q(self, index_q, num_tokens, index_q_dtype, device) -> None:
         """Keep the rotated indexer query for dispatch_backend (same-forward,
@@ -1611,9 +1709,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         v: torch.Tensor,
     ):
         """Return the MiniMax-M3 sparse backend callable matching the parent
-        contract ``fn(q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx)``,
-        plus the optional ``quantized_output=`` / ``output_scale=`` keywords
-        ``forward_impl`` adds only when the layer takes the FP8 output.
+        contract ``fn(q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx)``.
 
         Prefill and decode both: select per-(token/request) top-k index blocks
         (fusing the page-16 sparse block-table emit), then run the selected
@@ -1622,8 +1718,28 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         cache dtype inside the runners. Consumes ``self._index_q`` from rope_cache.
         """
         if fwd_ctx.context.is_prefill:
+            from atom.model_ops.minimax_m3 import prefill_check
+
+            if prefill_check.ENABLED:
+                return self._sparse_prefill_checked
             return self._sparse_prefill
         return self._sparse_decode
+
+    def _sparse_prefill_checked(
+        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
+    ):
+        """``_sparse_prefill`` with the switched kernels, then with today's on the same operands;
+        the two outputs go to ``prefill_check.record`` (``ATOM_M3_PREFILL_CHECK``)."""
+        from atom.model_ops.minimax_m3 import prefill_check
+
+        saved = (self._index_q, self._index_q_cache_key_info)
+        got = self._sparse_prefill(q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx)
+        self._index_q, self._index_q_cache_key_info = saved
+        with prefill_check.reference_path():
+            want = self._sparse_prefill(q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx)
+        prefill_check.record("attn", self.layer_num, q.shape[0], got, want)
+        prefill_check.compare_ids(self.layer_num, fwd_ctx)
+        return got
 
     def decode_reads_ragged_queries(self, max_qlen: int) -> bool:
         """No: the sparse decode (top-k and attention) takes one
@@ -1733,17 +1849,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
 
     @mark_trace(prefix="sparse_attention_prefill", torch_compile=False)
     def _sparse_prefill(
-        self,
-        q,
-        k,
-        v,
-        k_cache,
-        v_cache,
-        k_scale,
-        v_scale,
-        fwd_ctx: ForwardContext,
-        quantized_output=None,
-        output_scale=None,
+        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
     ):
         from atom.model_ops.minimax_m3.index_topk import minimax_m3_index_topk
         from atom.model_ops.minimax_m3.sparse_attn import (
@@ -1758,6 +1864,58 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         seq_lens = prefill_md.seq_lens
         prefix_lens = prefill_md.context_lens
         block_tables = prefill_md.block_table
+
+        from atom.model_ops.minimax_m3 import prefill_check, prefill_fast
+
+        if (
+            prefill_fast.ENABLED
+            and self.kv_cache_dtype == "nvfp4"
+            and self.index_cache_dtype == "nvfp4"
+            and not self.skip_index_topk
+            and self.indexer_cp_group is None
+            and index_q is not None
+        ):
+            from atom.model_ops.minimax_m3 import prefill_kernels
+
+            rows = prefill_md.qo_indptr.shape[0]
+            row_req_id, row_kv_lens = prefill_md.nvfp4_row_info
+            plan = prefill_fast.step_plan(
+                prefill_md,
+                attn=prefill_kernels.ATTN if prefill_kernels.ATTN != "aiter" else "ak16",
+                rows=rows,
+                num_kv_heads=self.num_kv_heads,
+                num_heads=self.num_heads,
+                cu_seqlens_q=cu_seqlens_q,
+                seq_lens=seq_lens,
+                block_table=block_tables,
+                n_valid=sparse_metadata.n_valid_column_per_row,
+                row_req_id=row_req_id,
+                row_kv_lens=row_kv_lens,
+                max_query_len=prefill_md.max_query_len,
+                max_seq_len=prefill_md.max_seq_len,
+                init_blocks=self.init_blocks,
+                local_blocks=self.local_blocks,
+                sm_scale=self.scale,
+                scores=self._index_scorer(sparse_metadata).scores,
+                device=q.device,
+                prefix_lens=prefix_lens,
+            )
+            ids = plan.index(index_q, self.index_cache)
+            if prefill_check.ENABLED:
+                prefill_check.stash("got_ids", ids[:, :rows])
+            output = torch.empty_like(q)
+            if rows < q.shape[0]:
+                output[rows:].zero_()
+            plan.attention(q, k_cache, output, self.nvfp4_k_scale, self.nvfp4_v_scale)
+            self._index_q = None
+            self._index_q_cache_key_info = None
+            from atom.utils.tbo.ubatching import tbo_active
+
+            if tbo_active():
+                from atom.utils.tbo.ubatching import tbo_yield
+
+                tbo_yield()
+            return output
 
         topk_key = self._topk_cache_key(
             "prefill",
@@ -1783,109 +1941,129 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 # slice is an identity, not an approximation.
                 index_q = index_q[:, self.indexer_cp_rank : self.indexer_cp_rank + 1]
             nvfp4 = self.kv_cache_dtype == "nvfp4"
-            selected = minimax_m3_index_topk(
-                index_q,
-                self.index_cache,
-                block_tables,
-                cu_seqlens_q,
-                seq_lens,
-                prefix_lens,
-                prefill_md.max_query_len,
-                prefill_md.max_seq_len,
-                self.topk,
-                self.init_blocks,
-                self.local_blocks,
-                self.num_kv_heads,
-                self.scale,
-                # the NVFP4 attention reads the logical block ids, no page-16 table
-                emit_sparse_block_table=not nvfp4,
-                n_valid_column_per_row=sparse_metadata.n_valid_column_per_row,
-                index_scorer=self._index_scorer(sparse_metadata),
-                **self._select_page_kwargs,
-            )
+            from atom.model_ops.minimax_m3 import prefill_kernels
+
+            if nvfp4 and prefill_kernels.INDEX == "amdk":
+                selected = prefill_kernels.index_topk_amdk(
+                    index_q,
+                    self.index_cache,
+                    block_tables,
+                    cu_seqlens_q,
+                    seq_lens,
+                    prefill_md.max_query_len,
+                    prefill_md.max_seq_len,
+                    self.topk,
+                    self.init_blocks,
+                    self.local_blocks,
+                    sparse_metadata.n_valid_column_per_row,
+                    self._index_scorer(sparse_metadata),
+                    self.scale,
+                )
+            else:
+                selected = minimax_m3_index_topk(
+                    index_q,
+                    self.index_cache,
+                    block_tables,
+                    cu_seqlens_q,
+                    seq_lens,
+                    prefix_lens,
+                    prefill_md.max_query_len,
+                    prefill_md.max_seq_len,
+                    self.topk,
+                    self.init_blocks,
+                    self.local_blocks,
+                    self.num_kv_heads,
+                    self.scale,
+                    # the NVFP4 attention reads the logical block ids, no page-16 table
+                    emit_sparse_block_table=not nvfp4,
+                    n_valid_column_per_row=sparse_metadata.n_valid_column_per_row,
+                    index_scorer=self._index_scorer(sparse_metadata),
+                    **self._select_page_kwargs,
+                )
             topk_idx, sparse_bt, sparse_ctx = self._selection_triple(selected)
             self._store_cached_topk(
                 sparse_metadata, topk_key, (topk_idx, sparse_bt, sparse_ctx)
             )
         else:
             topk_idx, sparse_bt, sparse_ctx = cached_topk
+        if prefill_check.ENABLED:
+            prefill_check.stash("want_ids", topk_idx[:, :rows])
+        # one output, its rows past the metadata's zero, written in place (as decode)
         fp4_kv = self.kv_cache_dtype == "fp4"
-        if quantized_output is not None:
-            # the FP8 output (`supports_output_quant`: an FP8 KV); the BF16
-            # tensor only gives it the layout, and aiter writes its pad rows
-            from atom.model_ops.minimax_m3.sparse_attn import sparse_pa_fp8_per_row
+        output = torch.empty_like(q, dtype=v.dtype if fp4_kv else None)
+        if rows < q.shape[0]:
+            output[rows:].zero_()
+        if self.kv_cache_dtype == "nvfp4":
+            # every layer of the step has the same rows: built once, with the metadata
+            row_req_id, row_kv_lens = prefill_md.nvfp4_row_info
+            from atom.model_ops.minimax_m3 import prefill_dump
 
-            sparse_pa_fp8_per_row(
+            if prefill_dump.enabled() and index_q is not None:
+                prefill_dump.maybe_dump(
+                    self.layer_num,
+                    index_q=index_q,
+                    q=q[:rows],
+                    index_cache=self.index_cache,
+                    kv_cache=k_cache,
+                    topk_idx=topk_idx,
+                    block_table=block_tables,
+                    cu_seqlens_q=cu_seqlens_q,
+                    seq_lens=seq_lens,
+                    prefix_lens=prefix_lens,
+                    k_scale=self.nvfp4_k_scale,
+                    v_scale=self.nvfp4_v_scale,
+                )
+            from atom.model_ops.minimax_m3 import prefill_kernels
+
+            prefill_kernels.attention(
+                prefill_md,
+                q[:rows],
+                k_cache,
+                topk_idx,
+                block_tables,
+                row_req_id,
+                row_kv_lens,
+                self.scale,
+                output[:rows],
+                self.nvfp4_k_scale,
+                self.nvfp4_v_scale,
+                self._sparse_pa_nvfp4_prefill,
+            )
+        elif fp4_kv:
+            # plan-free: a prefill chunk's row count is new almost every forward
+            self._sparse_pa_mxfp4(
                 q[:rows],
                 k_cache,
                 v_cache,
                 sparse_bt,
                 sparse_ctx,
+                self.num_kv_heads,
                 self.scale,
-                torch.empty_like(q[:rows]),
-                k_scale,
-                v_scale,
-                quantized_output,
-                output_scale,
+                v.dtype,
+                out=output[:rows],
+            )
+        else:
+            minimax_m3_sparse_attn_prefill_asm(
+                q[:rows],
+                k_cache,
+                v_cache,
+                topk_idx,
+                block_tables,
+                None,  # query_req_id -> sync-free on-device fallback
+                None,  # query_abs_pos -> sync-free on-device fallback
+                prefill_md.qo_indptr,  # qo_indptr -> arange(total_q+1)
+                self.num_kv_heads,
+                self.scale,
+                output[:rows],
+                k_scale=k_scale,
+                v_scale=v_scale,
+                cu_seqlens_q=cu_seqlens_q,
+                prefix_lens=prefix_lens,
+                sparse_bt=sparse_bt,
+                sparse_ctx=sparse_ctx,
                 plan_step_owner=prefill_md if self.local_blocks >= 1 else None,
                 plan_cache_owner=prefill_md,
             )
-            output = quantized_output
-        else:
-            # one output, its rows past the metadata's zero, written in place (as decode)
-            output = torch.empty_like(q, dtype=v.dtype if fp4_kv else None)
-            if rows < q.shape[0]:
-                output[rows:].zero_()
-            if self.kv_cache_dtype == "nvfp4":
-                # every layer of the step has the same rows: built once, with the metadata
-                row_req_id, row_kv_lens = prefill_md.nvfp4_row_info
-                self._sparse_pa_nvfp4_prefill(
-                    q[:rows],
-                    k_cache,
-                    topk_idx,
-                    block_tables,
-                    row_req_id,
-                    row_kv_lens,
-                    self.scale,
-                    out=output[:rows],
-                    k_scale=self.nvfp4_k_scale,
-                    v_scale=self.nvfp4_v_scale,
-                )
-            elif fp4_kv:
-                # plan-free: a prefill chunk's row count is new almost every forward
-                self._sparse_pa_mxfp4(
-                    q[:rows],
-                    k_cache,
-                    v_cache,
-                    sparse_bt,
-                    sparse_ctx,
-                    self.num_kv_heads,
-                    self.scale,
-                    v.dtype,
-                    out=output[:rows],
-                )
-            else:
-                minimax_m3_sparse_attn_prefill_asm(
-                    q[:rows],
-                    k_cache,
-                    v_cache,
-                    topk_idx,
-                    block_tables,
-                    None,  # query_req_id -> sync-free on-device fallback
-                    None,  # query_abs_pos -> sync-free on-device fallback
-                    prefill_md.qo_indptr,  # qo_indptr -> arange(total_q+1)
-                    self.num_kv_heads,
-                    self.scale,
-                    output[:rows],
-                    k_scale=k_scale,
-                    v_scale=v_scale,
-                    cu_seqlens_q=cu_seqlens_q,
-                    prefix_lens=prefix_lens,
-                    sparse_bt=sparse_bt,
-                    sparse_ctx=sparse_ctx,
-                    plan_step_owner=prefill_md if self.local_blocks >= 1 else None,
-                    plan_cache_owner=prefill_md,
-                )
         output = output.view(*q.shape)
         self._index_q = None
         self._index_q_cache_key_info = None
@@ -1931,12 +2109,12 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         )
         from atom.model_ops.minimax_m3.indexer_context_parallel import (
             indexer_context_scores,
-            indexer_context_scores_fp4,
+            indexer_context_scores_mxfp4,
         )
 
         global_blocks = block_table.shape[1]
         if index_scorer is not None:
-            scores = indexer_context_scores_fp4(
+            scores = indexer_context_scores_mxfp4(
                 index_q,
                 self.index_cache,
                 block_table,
@@ -1974,7 +2152,6 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 self.init_blocks,
                 self.local_blocks,
                 mailbox,
-                emit_sparse_block_table=self.kv_cache_dtype != "nvfp4",
                 **self._select_page_kwargs,
             )
         # Forced blocks are pinned in BOTH passes on purpose: one that lost its
@@ -1998,24 +2175,118 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             self.init_blocks,
             self.local_blocks,
             max_query_len,
-            # the NVFP4 attention reads the logical block ids, no page-16 table
-            emit_sparse_block_table=self.kv_cache_dtype != "nvfp4",
             **self._select_page_kwargs,
         )
 
+    def _takes_fused_nvfp4_decode(self, index_q, sparse_metadata, max_query_len) -> bool:
+        """Whether this decode runs the request-level NVFP4 kernel that selects the top-k
+        itself from the index scores (``ATOM_M3_FUSED_DECODE=1``): NVFP4 KV and index, a
+        scoring layer (not a top-k reuser), no indexer CP, 16 query heads per kv head,
+        top-16, a score width the kernel's union table covers."""
+        if not envs.ATOM_M3_FUSED_DECODE:
+            return False
+        if (
+            self.kv_cache_dtype != "nvfp4"
+            or self.index_cache_dtype != "nvfp4"
+            or index_q is None
+            or self.indexer_cp_group is not None
+            or self.topk != 16
+            or self.num_heads != 16 * self.num_kv_heads
+            or max_query_len not in (1, 2, 4, 8)
+        ):
+            return False
+        from atom.model_ops.minimax_m3.sparse_pa_nvfp4_q8 import CAP
+
+        scorer = sparse_metadata.index_scorer
+        return (
+            scorer is not None
+            and scorer.work_map is not None
+            and scorer.nvfp4
+            and scorer.cp_world == 1
+            and scorer.max_block <= CAP
+        )
+
+    def _sparse_decode_fused_nvfp4(
+        self, q, k_cache, index_q, sparse_metadata, decode_md, rows, max_query_len, topk_key
+    ):
+        """Index scores, then one kernel: per request (row group, split) the rows' top-16
+        (aiter's selector, bit for bit), the union of the selected pages, attention."""
+        from atom.model_ops.minimax_m3.index_topk import minimax_m3_index_score_decode
+        from atom.model_ops.minimax_m3.sparse_pa_nvfp4_q8 import (
+            sparse_pa_nvfp4_decode_q8,
+            tuned_kwargs,
+        )
+
+        output = torch.empty_like(q)
+        if rows < q.shape[0]:
+            output[rows:].zero_()
+        # a later layer reuses this top-k only when the model has skip layers
+        store = self.index_topk_cache_state is not None
+        topk_idx = torch.empty(
+            (self.num_kv_heads, rows, self.topk), dtype=torch.int32, device=q.device
+        )
+        ql = max_query_len
+
+        from atom.model_ops.minimax_m3 import ak_kernels
+
+        def score(r0, r1, req0, req1, scorer):
+            if ak_kernels.split4_wide_takes(req1 - req0, ql, index_q.shape[1]):
+                # ATOM_P1_INDEXER_SPLIT4_WIDE: the same scores from four GPUs, into the same workspace
+                width = scorer.max_block
+                out = scorer.scores.logits(r1 - r0, width).view(1, r1 - r0, width)
+                return ak_kernels.split4_wide_scores(
+                    index_q[r0:r1],
+                    self.index_cache,
+                    decode_md.block_table[req0:req1],
+                    decode_md.seq_lens[req0:req1],
+                    self.init_blocks,
+                    self.local_blocks,
+                    self.scale,
+                    out,
+                    ql,
+                )
+            return minimax_m3_index_score_decode(
+                index_q[r0:r1],
+                self.index_cache,
+                decode_md.block_table[req0:req1],
+                decode_md.seq_lens[req0:req1],
+                sparse_metadata.max_seq_len,
+                ql,
+                self.scale,
+                scorer,
+            )
+
+        def attend(r0, r1, req0, req1, scores, slot):
+            sparse_pa_nvfp4_decode_q8(
+                q[r0:r1],
+                k_cache,
+                topk_idx[:, r0:r1],
+                decode_md.block_table[req0:req1],
+                decode_md.seq_lens[req0:req1],
+                self.scale,
+                out=output[r0:r1],
+                k_scale=self.nvfp4_k_scale,
+                v_scale=self.nvfp4_v_scale,
+                query_len=ql,
+                index_score=scores,
+                local_blocks=self.local_blocks,
+                init_blocks=self.init_blocks,
+                write_topk=store,
+                workspace_slot=slot,
+                **tuned_kwargs(req1 - req0, ql),
+            )
+
+        reqs = decode_md.seq_lens.shape[0]
+        attend(0, rows, 0, reqs, score(0, rows, 0, reqs, sparse_metadata.index_scorer), 0)
+        if store:
+            self._store_cached_topk(sparse_metadata, topk_key, (topk_idx, None, None))
+        self._index_q = None
+        self._index_q_cache_key_info = None
+        return output.view(*q.shape)
+
     @mark_trace(prefix="sparse_attention_decode", torch_compile=False)
     def _sparse_decode(
-        self,
-        q,
-        k,
-        v,
-        k_cache,
-        v_cache,
-        k_scale,
-        v_scale,
-        fwd_ctx: ForwardContext,
-        quantized_output=None,
-        output_scale=None,
+        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
     ):
         from atom.model_ops.minimax_m3.index_topk import minimax_m3_index_topk_decode
         from atom.model_ops.minimax_m3.sparse_attn import (
@@ -2038,13 +2309,93 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         )
         # after the cache key: skip-index layers hold only the full shape
         rows = self._metadata_rows(q, decode_md.seq_lens.shape[0] * max_query_len)
+        from atom.model_ops.minimax_m3 import ak_kernels
+
+        # amd-kernels' block up to ATOM_M3_AK_DECODE_MAX_REQS requests, the fused
+        # kernel above it (each measured fastest in its range)
+        ak_decode = (
+            ak_kernels.DECODE
+            and self.kv_cache_dtype == "nvfp4"
+            and self.index_cache_dtype == "nvfp4"
+            and self.indexer_cp_group is None
+            and ak_kernels.decode_supported(
+                self.num_heads,
+                self.num_kv_heads,
+                self.num_idx_heads,
+                self.topk,
+                max_query_len,
+                decode_md.seq_lens.shape[0],
+            )
+        )
+        if not ak_decode and self._takes_fused_nvfp4_decode(
+            index_q, sparse_metadata, max_query_len
+        ):
+            return self._sparse_decode_fused_nvfp4(
+                q, k_cache, index_q, sparse_metadata, decode_md, rows, max_query_len, topk_key
+            )
         cached_topk = self._load_cached_topk(sparse_metadata, topk_key)
+        if ak_decode:
+            output = torch.empty_like(q)
+            if rows < q.shape[0]:
+                output[rows:].zero_()
+            # ATOM_M3_AK_DECODE_QOUT: the attention op asked for o_proj's MXFP8 input
+            # (``_ak_qout_n`` = o_proj N); only when every row of q is a metadata row
+            quant_out = None
+            qout_n = getattr(self, "_ak_qout_n", None)
+            if qout_n is not None and rows == q.shape[0]:
+                quant_out = ak_kernels.qout_buffers(
+                    rows, qout_n, self.num_heads * self.head_dim, q.device
+                )
+            if cached_topk is None:
+                if index_q is None:
+                    raise RuntimeError(
+                        "MiniMax-M3 index cache miss on a skip-index layer"
+                    )
+                topk_idx = ak_kernels.index_sparse_decode(
+                    index_q[:rows],
+                    self.index_cache,
+                    q[:rows],
+                    k_cache,
+                    decode_md.block_table,
+                    decode_md.seq_lens,
+                    self.init_blocks,
+                    self.local_blocks,
+                    self.scale,
+                    output[:rows],
+                    self.nvfp4_k_scale,
+                    self.nvfp4_v_scale,
+                    max_query_len,
+                    sparse_metadata.max_seq_len,
+                    self.num_kv_heads,
+                    quant_out=quant_out,
+                )
+                self._store_cached_topk(sparse_metadata, topk_key, (topk_idx, None, None))
+            else:
+                ak_kernels.sparse_decode(
+                    q[:rows],
+                    k_cache,
+                    cached_topk[0],
+                    decode_md.block_table,
+                    decode_md.seq_lens,
+                    self.scale,
+                    output[:rows],
+                    self.nvfp4_k_scale,
+                    self.nvfp4_v_scale,
+                    max_query_len,
+                    self.num_kv_heads,
+                    quant_out=quant_out,
+                )
+            self._index_q = None
+            self._index_q_cache_key_info = None
+            if quant_out is not None:
+                self._ak_qout_result = (quant_out, rows)
+            return output.view(*q.shape)
         if cached_topk is None:
             if index_q is None:
                 raise RuntimeError("MiniMax-M3 index cache miss on a skip-index layer")
             index_q = index_q[:rows]
             if self.indexer_cp_group is not None:
-                selected = self._cp_index_topk_decode(
+                topk_idx, sparse_bt, sparse_ctx = self._cp_index_topk_decode(
                     index_q,
                     decode_md.block_table,
                     decode_md.seq_lens,
@@ -2071,84 +2422,63 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                     index_scorer=self._index_scorer(sparse_metadata),
                     **self._select_page_kwargs,
                 )
-            topk_idx, sparse_bt, sparse_ctx = self._selection_triple(selected)
+                topk_idx, sparse_bt, sparse_ctx = self._selection_triple(selected)
             self._store_cached_topk(
                 sparse_metadata, topk_key, (topk_idx, sparse_bt, sparse_ctx)
             )
         else:
             topk_idx, sparse_bt, sparse_ctx = cached_topk
+        # one output, its pad rows (past the metadata's) zero, written in place; the
+        # MXFP4 KV's q is e4m3, so its output takes the value dtype instead
         fp4_kv = self.kv_cache_dtype == "fp4"
-        if quantized_output is not None:
-            # the FP8 output (`supports_output_quant`: an FP8 KV); the BF16
-            # tensor only gives it the layout, and aiter writes its pad rows
-            from atom.model_ops.minimax_m3.sparse_attn import sparse_pa_fp8_per_row
-
-            sparse_pa_fp8_per_row(
+        output = torch.empty_like(q, dtype=v.dtype if fp4_kv else None)
+        if rows < q.shape[0]:
+            output[rows:].zero_()
+        if self.kv_cache_dtype == "nvfp4":
+            self._sparse_pa_nvfp4_decode(
+                q[:rows],
+                k_cache,
+                topk_idx,
+                decode_md.block_table,
+                decode_md.seq_lens,
+                self.scale,
+                out=output[:rows],
+                k_scale=self.nvfp4_k_scale,
+                v_scale=self.nvfp4_v_scale,
+                query_len=max_query_len,
+            )
+        elif fp4_kv:
+            self._sparse_pa_mxfp4(
                 q[:rows],
                 k_cache,
                 v_cache,
                 sparse_bt,
                 sparse_ctx,
+                self.num_kv_heads,
                 self.scale,
-                torch.empty_like(q[:rows]),
-                k_scale,
-                v_scale,
-                quantized_output,
-                output_scale,
+                v.dtype,
+                planned=True,
+                plan_step_owner=sparse_metadata if self.local_blocks >= 1 else None,
+                out=output[:rows],
+            )
+        else:
+            minimax_m3_sparse_attn_decode_asm(
+                q[:rows],
+                k_cache,
+                v_cache,
+                topk_idx,
+                decode_md.block_table,
+                decode_md.seq_lens,
+                self.num_kv_heads,
+                self.scale,
+                output[:rows],
+                k_scale=k_scale,
+                v_scale=v_scale,
+                sparse_bt=sparse_bt,
+                sparse_ctx=sparse_ctx,
+                # Once per step only when the tail block is forced (see sparse_attn).
                 plan_step_owner=decode_md if self.local_blocks >= 1 else None,
             )
-            output = quantized_output
-        else:
-            # one output, its pad rows (past the metadata's) zero, written in place; the
-            # MXFP4 KV's q is e4m3, so its output takes the value dtype instead
-            output = torch.empty_like(q, dtype=v.dtype if fp4_kv else None)
-            if rows < q.shape[0]:
-                output[rows:].zero_()
-            if self.kv_cache_dtype == "nvfp4":
-                self._sparse_pa_nvfp4_decode(
-                    q[:rows],
-                    k_cache,
-                    topk_idx,
-                    decode_md.block_table,
-                    decode_md.seq_lens,
-                    self.scale,
-                    out=output[:rows],
-                    k_scale=self.nvfp4_k_scale,
-                    v_scale=self.nvfp4_v_scale,
-                    query_len=max_query_len,
-                )
-            elif fp4_kv:
-                self._sparse_pa_mxfp4(
-                    q[:rows],
-                    k_cache,
-                    v_cache,
-                    sparse_bt,
-                    sparse_ctx,
-                    self.num_kv_heads,
-                    self.scale,
-                    v.dtype,
-                    planned=True,
-                    plan_step_owner=sparse_metadata if self.local_blocks >= 1 else None,
-                    out=output[:rows],
-                )
-            else:
-                minimax_m3_sparse_attn_decode_asm(
-                    q[:rows],
-                    k_cache,
-                    v_cache,
-                    topk_idx,
-                    decode_md.block_table,
-                    decode_md.seq_lens,
-                    self.num_kv_heads,
-                    self.scale,
-                    output[:rows],
-                    k_scale=k_scale,
-                    v_scale=v_scale,
-                    sparse_bt=sparse_bt,
-                    sparse_ctx=sparse_ctx,
-                    # Once per step only when the tail block is forced (see sparse_attn).
-                    plan_step_owner=decode_md if self.local_blocks >= 1 else None,
-                )
         self._index_q = None
         self._index_q_cache_key_info = None
         output = output.view(*q.shape)

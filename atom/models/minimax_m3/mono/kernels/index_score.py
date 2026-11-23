@@ -27,19 +27,10 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.kernels_common import LOG2E
-from aiter.ops.flydsl.kernels.minimax_m3_index_score import (
-    LUT_ENTRIES,
-    e4m3_table_words,
-    e4m3_to_f32,
-    fp4_dword_to_e4m3,
-)
+from flydsl.compiler.kernel_function import KernelFunction
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T, as_ir_value
 
-from atom.model_ops.minimax_m3.nvfp4_pages import (
-    INDEX_DATA_PAGE_BYTES,
-    INDEX_PAGE_BYTES,
-)
 from atom.models.minimax_m3.mono.config import (
     HEAD_DIM,
     LONG_FROM_BLOCKS,
@@ -74,6 +65,10 @@ from atom.mono.plan.execution import BLOCKS, THREADS, WAVES
 from atom.mono.plan.trace import Space
 
 INDEX_BLOCK_BYTES = SPARSE_BLOCK * HEAD_DIM  # one fp8 index-K block
+# an nvfp4 index page (one buffer): 128 keys x 64 B e2m1 (low nibble = even dim),
+# then 128 x 8 B e4m3 scales, one per 16 dims (aiter / vLLM single-buffer layout)
+NVFP4_PAGE_BYTES = 9216
+NVFP4_SCALES_AT = SPARSE_BLOCK * HEAD_DIM // 2
 KEY_TILES = SPARSE_BLOCK // 16  # MFMA row tiles of a block
 _CURRENT_STREAM = fx.Stream(None)
 
@@ -119,12 +114,15 @@ def nvfp4_dword_e4m3x8(word, scale_byte):
     return e4m3_dwords(prod)
 
 
-# aiter's per-scale e4m3 table (``e4m3_table_words`` / ``fp4_dword_to_e4m3`` of its
-# scorer): for each positive e4m3 scale byte the 8 bytes e4m3_rn_satfinite(mag * scale),
-# mag the e2m1 magnitudes (equal to ``nvfp4_dword_e4m3x8`` for every code and scale byte
-# 0x00..0x7E: exhaustive check), 2 dwords an entry, in LDS: a K dword is then 2
-# v_perm_b32 + ~7 ALU, not ~33.
-EVEN_ODD = (0, 2, 4, 6, 1, 3, 5, 7)  # a dword's elements as ``fp4_dword_to_e4m3``
+# aiter's per-scale e4m3 table (``fp4_dword_to_e4m3`` of its scorer): for each positive
+# e4m3 scale byte the 8 bytes e4m3_rn_satfinite(mag * scale), mag the e2m1 magnitudes
+# (equal to ``nvfp4_dword_e4m3x8`` for every code and scale byte 0x00..0x7E: exhaustive
+# check), 2 dwords an entry, in LDS: a K dword is then 2 v_perm_b32 + ~7 ALU, not ~33.
+LUT_ENTRIES = 128
+E2M1_MAGS = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+SIGN8 = -0x7F7F7F80  # 0x80808080 as an i32: the sign bit of each fp8 byte of a dword
+MAG8 = 0x07070707  # the e2m1 magnitude bits of each nibble, spread one a byte
+EVEN_ODD = (0, 2, 4, 6, 1, 3, 5, 7)  # a dword's elements as ``fp4_dword_e4m3x8_lut``
 
 
 @fx.struct
@@ -132,12 +130,31 @@ class LutSmem:
     tab: fx.Array[fx.Int32, 2 * LUT_ENTRIES, 16]
 
 
-def lut_lds(alloc):
-    """The CTA's table in LDS: ``LUT_ENTRIES`` * 8 B more, allocated from ``alloc``,
-    the kernel's ``fx.SharedAllocator`` (a kernel makes one), after the caller's own
-    Smem."""
+def lut_lds():
+    """The CTA's table in LDS: ``LUT_ENTRIES`` * 8 B more, allocated from the kernel's
+    own allocator (a kernel may make one ``SharedAllocator``, and the callers' Smem
+    structs are not ours to change). shortcut: reaches FlyDSL's current kernel's
+    private ``_shared_allocator``, so it needs FlyDSL's static allocator mode (the
+    default); upgrade when the callers' Smem structs carry the table."""
+    alloc = KernelFunction.get_current()._shared_allocator
     assert alloc is not None and alloc.is_static, "the kernel's SharedAllocator"
     return alloc.allocate(LutSmem).peek().tab.ptr
+
+
+def e4m3_lut_row(scale_byte):
+    """The two dwords of the table entry of the scale byte ``scale_byte`` (0..127):
+    e4m3_rn_satfinite(mag * scale) for the 8 e2m1 magnitudes. The scale decodes at f32
+    exactly (``cvt_pk_f32_fp8``)."""
+    sc = fx.Vector(
+        rocdl.cvt_pk_f32_fp8(
+            res=fx.Vector.make_type(2, fx.Float32),
+            src=as_ir_value(fx.Int32(scale_byte)),
+            word_sel=False,
+        )
+    )[0]
+    return fx.Vector.from_elements(
+        e4m3_dwords([fx.Float32(m) * sc for m in E2M1_MAGS]), fx.Int32
+    )
 
 
 def e4m3_lut_entry(tab, scale_byte):
@@ -148,6 +165,18 @@ def e4m3_lut_entry(tab, scale_byte):
         )
     )
     return t[0], t[1]
+
+
+def fp4_dword_e4m3x8_lut(word, t_lo, t_hi):
+    """Eight e2m1 of ``word`` -> e4m3 K by lookup in a scale's table entry: v_perm_b32
+    takes magnitudes 0..7 (selector bytes) from the 8 table bytes, four a dword; the
+    sign bit of each nibble is OR-ed in afterwards. Two dwords: the even elements
+    (0, 2, 4, 6), then the odd ones (``EVEN_ODD``; ``q_e4m3`` orders q the same way,
+    the MFMA sums over k in any order)."""
+    w = fx.Int32(word)
+    ev = rocdl.perm_b32(t_hi, t_lo, w & MAG8)
+    od = rocdl.perm_b32(t_hi, t_lo, (w >> 4) & MAG8)
+    return fx.Int32(ev) | ((w << 4) & SIGN8), fx.Int32(od) | (w & SIGN8)
 
 
 def q_e4m3(frags, order=range(8)):
@@ -215,7 +244,7 @@ def emit_index_scores(
     slot, lane, wave, red, mb_put, iscore, q_frag, tokens, q_len, init_blocks,
     local_blocks, scale, index_cache, block_table, seq_lens, bt_width,
     wait_new_keys=None, prepare=None, heads=ONE_INDEX_HEAD, q_frag_head=None,
-    prepare_heads=None, nvfp4=False, alloc=None,
+    prepare_heads=None, nvfp4=False,
 ):  # fmt: skip
     """This CTA's (``slot``) share of the step's score tasks: up to BLOCKS tasks,
     task u runs on CTA u, else on wave (u // BLOCKS) % WAVES of CTA u % BLOCKS
@@ -241,17 +270,14 @@ def emit_index_scores(
     (every lane its own h); ``prepare_heads()`` (with CTA barriers, on every CTA)
     makes those requests' rows' heads first. The other requests score as above.
 
-    ``nvfp4``: the index cache holds nvfp4 pages (``nvfp4_pages.INDEX_PAGE_BYTES``);
-    a lane's key operand of chunk s is dims 32 g4 + 8 s .. + 7 (its own 16 B of the
-    key's data, no transpose), so ``q_frag`` must return the same dims (its
-    ``perm``). ``alloc``: the kernel's ``fx.SharedAllocator`` (nvfp4: the K table).
-    Indexer context parallelism reads fp8 index caches only (the config turns it off
-    under NVFP4 caches)."""
+    ``nvfp4``: the index cache holds nvfp4 pages (``NVFP4_PAGE_BYTES``); a lane's
+    key operand of chunk s is dims 32 g4 + 8 s .. + 7 (its own 16 B of the key's
+    data, no transpose), so ``q_frag`` must return the same dims (its ``perm``)."""
     assert local_blocks >= 1, "the block of the current token must be pinned"
     l16 = lane % 16
     g4 = lane // 16
     # nvfp4: the per-task-wave paths look K up in a CTA table (built before them)
-    tab = lut_lds(alloc) if nvfp4 else None
+    tab = lut_lds() if nvfp4 else None
     tid = wave * 64 + lane
     r_ic = rsrc(index_cache)
     rows = step_rows(seq_lens, tokens, q_len, heads)
@@ -259,7 +285,6 @@ def emit_index_scores(
     # every request's scored blocks in one list, a task per wave across the grid;
     # context-parallel requests' (this rank's blocks) in a second
     cp = heads.count > 1
-    assert not (cp and nvfp4), "indexer context parallelism with an NVFP4 index cache"
     first_own = init_blocks + (heads.own - init_blocks) % TP
     pre = [fx.Int32(0)]
     pre_cp = [fx.Int32(0)]
@@ -314,7 +339,7 @@ def emit_index_scores(
             # of its groups 2 g4, 2 g4 + 1
             for i in tiles:
                 key = 16 * i + l16
-                base = page * INDEX_PAGE_BYTES
+                base = page * NVFP4_PAGE_BYTES
                 w = fx.Vector(
                     bo.buffer_load(
                         r_ic,
@@ -326,7 +351,7 @@ def emit_index_scores(
                 sc = fx.Int32(
                     bo.buffer_load(
                         r_ic,
-                        (base + INDEX_DATA_PAGE_BYTES + key * 8 + 2 * g4) // 2,
+                        (base + NVFP4_SCALES_AT + key * 8 + 2 * g4) // 2,
                         vec_width=1,
                         dtype=T.i16,
                     )
@@ -360,7 +385,7 @@ def emit_index_scores(
                 ent = [e4m3_lut_entry(tab, sc), e4m3_lut_entry(tab, sc >> 8)]
                 words = []
                 for s in range_constexpr(4):
-                    words += fp4_dword_to_e4m3(raw[5 * n + s], *ent[s // 2])
+                    words += fp4_dword_e4m3x8_lut(raw[5 * n + s], *ent[s // 2])
                 out.append(fx.Vector.from_elements(words, fx.Int32))
             return out
         if const_expr(nvfp4):
@@ -419,12 +444,7 @@ def emit_index_scores(
         """Fill the CTA's table: thread s < LUT_ENTRIES makes the entry of scale byte
         s. The caller barriers before a lookup."""
         if tid < LUT_ENTRIES:
-            fx.ptr_store(
-                fx.Vector.from_elements(
-                    e4m3_table_words(e4m3_to_f32(fx.Int32(tid))), fx.Int32
-                ),
-                tab + tid * 2,
-            )
+            fx.ptr_store(e4m3_lut_row(tid), tab + tid * 2)
 
     def put(b, col, v):
         if (lane < 16) & (l16 < q_len):
@@ -434,8 +454,12 @@ def emit_index_scores(
         """The context-parallel requests' tasks, a task a wave: B column f of pass
         p (f = 16 p + lane % 16) is head f / q_len's row f % q_len of the request,
         the key block's operands kept for every pass."""
+        if const_expr(nvfp4):
+            fill_lut()
         if const_expr(prepare_heads is not None):
             prepare_heads()
+        if const_expr(nvfp4):
+            gpu.barrier()
         tiles = range(KEY_TILES)
         seq_lane = pick(seq, fx.min(lane, tokens - 1))  # lane k: token k's context
         n_cols = TP * q_len
@@ -445,7 +469,7 @@ def emit_index_scores(
             if const_expr(wait_new_keys is not None):  # noqa: SIM102
                 if (b + 1) * SPARSE_BLOCK > readlane(seq_lane, tk) - MAX_TOKENS:
                     wait_new_keys()
-            kw = split_tiles(load_raw(page, tiles), tiles)
+            kw = split_tiles(load_raw(page, tiles), tiles, tab)
             # every pass unrolled, the unused ones skipped: a runtime pass loop
             # slowed the whole kernel's short contexts (S = 1, 3k: +0.6 us)
             for p in range_constexpr(TP * MAX_TOKENS // 16):
@@ -453,7 +477,10 @@ def emit_index_scores(
                     f = p * 16 + l16
                     head = fx.min(f // q_len, TP - 1)
                     col = tk - (q_len - 1) + f % q_len
-                    qb = [q_frag_head(col, s, head) for s in range(HEAD_DIM // 32)]
+                    qb = q_operand(
+                        [q_frag_head(col, s, head) for s in range(HEAD_DIM // 32)],
+                        True,
+                    )
                     v = tiles_max(b, qb, lane_gather(seq_lane, col), tiles, kw)
                     if (lane < 16) & (f < n_cols):
                         mb_put(
@@ -625,8 +652,7 @@ def build_index_score_kernel(
         layer: Int32,
     ):
         tid = fx.thread_idx.x
-        smem = fx.SharedAllocator()
-        lds = smem.allocate(Smem).peek()
+        lds = fx.SharedAllocator().allocate(Smem).peek()
         red = lds.red.ptr
         mbox = Mailbox(layer)
         mb_put = mbox.put
@@ -637,7 +663,7 @@ def build_index_score_kernel(
             Addr("iscore", Space.SCRATCH, iscore),
             q_frag, tokens, q_len, init_blocks, local_blocks, scale, index_cache,
             block_table, seq_lens, bt_width, heads=k_heads, q_frag_head=q_frag_head,
-            nvfp4=nvfp4, alloc=smem,
+            nvfp4=nvfp4,
         )  # fmt: skip
 
     @launcher(kernel_name)

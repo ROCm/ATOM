@@ -44,7 +44,6 @@ from typing import Any
 
 import torch
 
-from atom.kv_transfer.offload.kv_store.save_pipeline import SettlementTransaction
 from atom.kv_transfer.offload.kv_store.worker import (
     KVStoreOffloadConnector,
     _synchronize,
@@ -338,7 +337,7 @@ class MooncakeStoreOffloadConnector(KVStoreOffloadConnector):
 
     def _settle_put(
         self,
-        pool: TransferSlotPool | SettlementTransaction,
+        pool: TransferSlotPool,
         slots: list[Slot],
         answer: tuple[list[int], float],
     ) -> str | None:
@@ -393,7 +392,7 @@ class MooncakeStoreOffloadConnector(KVStoreOffloadConnector):
     # -- slot settlement -----------------------------------------------------
     @staticmethod
     def _settle(
-        pool: TransferSlotPool | SettlementTransaction,
+        pool: TransferSlotPool,
         slots: list[Slot],
         codes: list[int],
         call_seconds: float,

@@ -335,6 +335,12 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
     def has_pending_work(self) -> bool:
         return self._impl.has_pending_work()
 
+    def mono_hazard(self) -> bool:
+        callback = getattr(self._impl, "mono_hazard", None)
+        if callback is None:
+            return self._impl.has_pending_work()
+        return bool(callback())
+
     def save_finished(self, req_id) -> None:
         self._impl.save_finished(req_id)
 

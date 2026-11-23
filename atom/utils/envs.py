@@ -164,8 +164,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the decode side scatters them into the paged KV and returns the slot.
     # 0 = staged writes only.
     "ATOM_PD_MLA_LANDING": lambda: _flag_env("ATOM_PD_MLA_LANDING", "1"),
-    # MiniMax PP/TP1 -> TP landing, independent of incremental chunk transfer.
-    "ATOM_PD_MINIMAX_LANDING": lambda: _flag_env("ATOM_PD_MINIMAX_LANDING", "0"),
     # Mooncake and MoRIIO P/D: how long a failed transfer may still land. A
     # decode holds a failed receive's KV pages this long before reporting the
     # failure; a Mooncake prefill keeps a landing slot whose write failed out
@@ -192,6 +190,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(
         os.getenv("ATOM_PREFIX_CACHE_PROTECTED_RATIO", "0.5")
     ),
+    # p1/prefix-cache: a finished request's generated blocks are evicted before
+    # any other cached block. Off by default.
+    "ATOM_P1_PREFIX_DEMOTE_DECODE": lambda: os.getenv(
+        "ATOM_P1_PREFIX_DEMOTE_DECODE", "0"
+    )
+    == "1",
+    # p1/prefix-cache: prefill token budget of a step taken while no decode
+    # runs (ATOM_SCHED_DECODE_PREFILL_CAP's idle twin). 0 = max_num_batched_tokens.
+    "ATOM_P1_SCHED_IDLE_PREFILL_CAP": lambda: int(
+        os.getenv("ATOM_P1_SCHED_IDLE_PREFILL_CAP", "0")
+    ),
     # DeepSeek-V4 bounded replay: when the compressed history hits further than
     # the nearest state checkpoint by more than the window's receptive field,
     # keep the whole hit and recompute only that field (W + (L-1)(W-1) tokens)
@@ -209,7 +218,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KV_OFFLOAD_EXTRA_CONFIG": lambda: os.getenv(
         "ATOM_KV_OFFLOAD_EXTRA_CONFIG", ""
     ),
-    "ATOM_STORE_SAVE_BATCH_CHUNKS": lambda: _int_env("ATOM_STORE_SAVE_BATCH_CHUNKS", 0),
     # --- Data Parallelism ---
     "ATOM_DP_RANK": lambda: int(os.getenv("ATOM_DP_RANK", "0")),
     "ATOM_DP_RANK_LOCAL": lambda: int(os.getenv("ATOM_DP_RANK_LOCAL", "0")),
@@ -349,12 +357,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gfx95x when ATOM_USE_TRITON_GEMM is set.
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
     # Qwen3.8-Flash-Next eager prefill on SGLang-ATOM: run QSA sparse attention
-    # with aiter's FlyDSL kernel (BF16 D256, one KV head per rank) instead of
-    # qsa_sparse_paged_gqa, where aiter reports it runs
-    # (aiter.ops.qsa.qsa_sparse_prefill_widths()). Other steps keep the native
-    # kernel. On by default; 0 / false / off disables. qsa_attention imports
-    # aiter's queries at module level, so aiter with ROCm/aiter#8083 is needed
-    # whether the flag is on or off.
+    # with aiter's FlyDSL kernel (gfx942, BF16 D256, one KV head per rank)
+    # instead of qsa_sparse_paged_gqa. Other steps keep the native kernel. On by
+    # default; 0 / false / off disables. Needs aiter with ROCm/aiter#6576.
     "ATOM_QSA_FLYDSL_ATTN": lambda: _flag_env("ATOM_QSA_FLYDSL_ATTN", "1"),
     # Split the routed experts by phase: FlyDSL fused_moe on prefill, the Triton
     # /gluon GUGU kernel on decode. Needs ATOM_USE_TRITON_MOE=1 (it narrows that
@@ -440,8 +445,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Pack mHC fn weights once after loading and use BF16 hi/lo computation.
     # Set to 0 before model loading to retain FP32 fn and FP32 mHC computation.
     "ATOM_MHC_USE_BF16": lambda: os.getenv("ATOM_MHC_USE_BF16", "1") == "1",
-    # V4.1 delayed mHC: HIP Mega-MHC on supported gfx950/gfx1250 shapes, mega_mhc's gfx942
-    # ASM seam for seams with a post where AITER supports it, else Triton.
+    # V4.1 delayed mHC: HIP Mega-MHC on supported gfx950/gfx1250 shapes, else Triton.
     "ATOM_DSV41_MHC_BACKEND": lambda: os.getenv(
         "ATOM_DSV41_MHC_BACKEND", "auto"
     ).lower(),
@@ -527,9 +531,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_STATE_CHECKPOINT_CHECK_BLOCKS", "0") == "1"
     ),
     # Set to 1 to read Qwen GDN state checkpoints out of the chunk kernel's
-    # interior states instead of cutting prefill chunks onto them, on both the
-    # PAGE and the fork-slot path; see `StateCache.publish_midstep`. Not
-    # Qwen3.8, whose PLE windows are checkpointed only where a forward ends.
+    # interior states instead of cutting prefill chunks onto them. PAGE path
+    # only (Qwen3-Next / Qwen3.5); see `PagedStateCheckpointCoordinator`.
     "ATOM_GDN_STATE_MIDSTEP": lambda: os.getenv("ATOM_GDN_STATE_MIDSTEP", "0") == "1",
     # Set to 0 to keep Qwen3.5's GDN input projection as two layers
     # (`in_proj_qkvz` + `in_proj_ba`) when the checkpoint quantizes them with
@@ -588,27 +591,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_V4_INDEXER_QSPLIT_MIN_LOGITS": lambda: int(
         os.getenv("ATOM_V4_INDEXER_QSPLIT_MIN_LOGITS", str(1 << 26))
     ),
-    # DCP sparse (DSA) prefill, "q" transport: when QREP is active, produce the
-    # whole DCP group's query heads locally, as decode does, instead of
-    # AllGather Q. A "kv" step attends only this rank's heads and ignores it. The
+    # DCP sparse (DSA) prefill: when QREP is active, produce the whole DCP
+    # group's query heads locally, as decode does, instead of AllGather Q. The
     # pynccl gather lands rank-major, so the dim=1 reshape after it also copies
     # the whole gathered q back to token-major; this removes both. Costs a
     # group-wide q GEMM + W_K bmm per prefill token. Off by default.
     "ATOM_DCP_PREFILL_QREP": lambda: os.getenv("ATOM_DCP_PREFILL_QREP", "0") == "1",
-    # DCP sparse prefill transport. "q" gathers the group's query heads and
-    # merges partials by LSE; "kv" all-gathers the step's KV rows and attends
-    # this rank's own heads over the whole top-k, with no merge. "auto" takes
-    # "kv" while the step's context is under ~200K + k * its new tokens (k 52
-    # with >= 16 heads a rank, 40 with fewer) and its gathered KV fits the token cap, else "q";
-    # "kv" skips the first condition and warns when it cannot be taken. The cap
-    # counts gathered rows (each request padded to whole local blocks), >= 0.
-    "ATOM_DCP_SPARSE_PREFILL": lambda: os.getenv("ATOM_DCP_SPARSE_PREFILL", "auto"),
-    "ATOM_DCP_SPARSE_PREFILL_KV_MAX_TOKENS": lambda: int(
-        os.getenv("ATOM_DCP_SPARSE_PREFILL_KV_MAX_TOKENS", str(1 << 20))
-    ),
-    # DCP sparse prefill, "q" transport: use the non-persistent fp8 gqa64 MLA
-    # kernel, which needs no work metadata; a "kv" step runs the dcp=1 kernel
-    # and its plan regardless. On by default; needs an aiter with ROCm/aiter#6132.
+    # DCP sparse prefill: use the non-persistent fp8 gqa64 MLA kernel, which
+    # needs no work metadata. On by default; needs an aiter with ROCm/aiter#6132.
     "ATOM_DCP_SPARSE_PREFILL_NONPS": lambda: (
         os.getenv("ATOM_DCP_SPARSE_PREFILL_NONPS", "1") == "1"
     ),
@@ -636,9 +626,87 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # occupancy in the block scorer, winning above ~1M batch*context tokens and
     # losing below. Unset leaves the config field alone.
     "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
+    # MiniMax-M3 NVFP4 decode: index scores, then one kernel that selects the top-16 per row
+    # and attends per request over the union of its rows' pages (sparse_pa_nvfp4_q8).
+    "ATOM_M3_FUSED_DECODE": lambda: os.getenv("ATOM_M3_FUSED_DECODE", "0") == "1",
+    # MiniMax-M3 sequence-parallel prefill (models/minimax_m3/sp_prefill.py): a
+    # prefill-only forward of >= MIN_TOKENS tokens keeps 1/tp of the residual
+    # stream per rank; the two per-layer all-reduces become all-gather /
+    # all-to-all / reduce-scatter hand-offs. OPROJ=full replicates o_proj
+    # (+3.1 GB/rank at TP4), tp keeps it sharded. QGATHER=1 gathers the GEMM
+    # inputs as their MXFP8 codes + scales instead of bf16.
+    "ATOM_M3_SP_PREFILL": lambda: os.getenv("ATOM_M3_SP_PREFILL", "0") == "1",
+    "ATOM_M3_SP_PREFILL_MIN_TOKENS": lambda: int(
+        os.getenv("ATOM_M3_SP_PREFILL_MIN_TOKENS", "4096")
+    ),
+    "ATOM_M3_SP_PREFILL_OPROJ": lambda: os.getenv("ATOM_M3_SP_PREFILL_OPROJ", "full"),
+    "ATOM_M3_SP_PREFILL_QGATHER": lambda: os.getenv("ATOM_M3_SP_PREFILL_QGATHER", "0")
+    == "1",
+    # pull (amd_kernels bf16 pull collectives, fp32 rank-order reduce-scatter;
+    # needs amd_kernels on PYTHONPATH, else falls back) | rccl (torch.distributed
+    # all_gather_into_tensor / reduce_scatter_tensor).
+    "ATOM_M3_SP_PREFILL_COMM": lambda: os.getenv("ATOM_M3_SP_PREFILL_COMM", "pull"),
+    # Dump dir for per-layer residual streams of large prefills (sp_prefill.py
+    # install_dump_hooks); DUMP_LAYERS=0 keeps the model output only (compiled TP).
+    "ATOM_M3_SP_DUMP": lambda: os.getenv("ATOM_M3_SP_DUMP", ""),
+    "ATOM_M3_SP_DUMP_LAYERS": lambda: os.getenv("ATOM_M3_SP_DUMP_LAYERS", "1") == "1",
+    # p1/prefill-sp-tbo kernel switches for the SP prefill (all default off; see
+    # sp_prefill.py "P1 switches"). HANDOFFS: amd_kernels SeqParallelHandoffs
+    # communicators (32-row aligned shards); QG_AK: QGATHER input quantized by
+    # amd_kernels' quantizer on the shard, codes+scales in one gather, qkv on the
+    # amd_kernels GEMM without a re-quant; A2A_UNPACK: attention output packed to
+    # MXFP8 + unpacking all-to-all straight into o_proj_full's GEMM layout;
+    # OPROJ_AK: o_proj_full (N6144 K8192) on the amd_kernels GEMM; MOE_SLOTS: the
+    # MoE partials (slots + shared) summed inside the reduce-scatter.
+    "ATOM_P1_SP_HANDOFFS": lambda: os.getenv("ATOM_P1_SP_HANDOFFS", "0") == "1",
+    "ATOM_P1_SP_QG_AK": lambda: os.getenv("ATOM_P1_SP_QG_AK", "0") == "1",
+    "ATOM_P1_SP_A2A_UNPACK": lambda: os.getenv("ATOM_P1_SP_A2A_UNPACK", "0") == "1",
+    "ATOM_P1_SP_OPROJ_AK": lambda: os.getenv("ATOM_P1_SP_OPROJ_AK", "0") == "1",
+    "ATOM_P1_SP_MOE_SLOTS": lambda: os.getenv("ATOM_P1_SP_MOE_SLOTS", "0") == "1",
+    "ATOM_P1_SP_MOE_COMPACT": lambda: os.getenv("ATOM_P1_SP_MOE_COMPACT", "0") == "1",
+    "ATOM_P1_SP_MOE_COMPACT_MIN_TOKENS": lambda: int(
+        os.getenv("ATOM_P1_SP_MOE_COMPACT_MIN_TOKENS", "4096")
+    ),
+    # p1/sp-local-shared: with MOE_SLOTS, every rank holds the FULL shared expert
+    # (gathered from the TP shards at load, no re-quantization) and runs it on its
+    # own rows; the MoE all-gather carries the routed MXFP4 payload only (3296
+    # B/token) and the owner adds the shared output in the reduce-scatter. Not
+    # bit-identical to the TP-partial shared expert (one fp32 sum over I 3072).
+    "ATOM_P1_SP_SHARED_LOCAL": lambda: os.getenv("ATOM_P1_SP_SHARED_LOCAL", "0") == "1",
+    "ATOM_P1_SP_SHARED_LOCAL_MIN_TOKENS": lambda: int(
+        os.getenv("ATOM_P1_SP_SHARED_LOCAL_MIN_TOKENS", "2048")
+    ),
+    # own rows from which the full shared expert runs on a side stream (below: serial;
+    # L2: the side stream wins at every N in 1024..16384)
+    "ATOM_P1_SP_SHARED_LOCAL_SIDE_ROWS": lambda: int(
+        os.getenv("ATOM_P1_SP_SHARED_LOCAL_SIDE_ROWS", "1")
+    ),
     # Fused decode for measured model/deployment/step geometries. Unsupported
     # configurations and forwards keep the production path. 0 disables it.
     "ATOM_MONO_ENABLE": lambda: os.getenv("ATOM_MONO_ENABLE", "1") == "1",
+    # MiniMax-M3.1 TP4 MoE block through inferact/amd-kernels (on PYTHONPATH) for
+    # the rows ATOM_M3_AK_MOE_MIN..MAX (atom/models/minimax_m3/ak_moe.py). With
+    # every row there, ATOM_M3_AK_MOE_SHARE_W13 keeps one routed w13 copy.
+    "ATOM_M3_AK_MOE": lambda: os.getenv("ATOM_M3_AK_MOE", "0") == "1",
+    "ATOM_M3_AK_MOE_MIN": lambda: int(os.getenv("ATOM_M3_AK_MOE_MIN", "1")),
+    "ATOM_M3_AK_MOE_MAX": lambda: int(os.getenv("ATOM_M3_AK_MOE_MAX", "87381")),
+    "ATOM_M3_AK_MOE_SHARE_W13": lambda: (
+        os.getenv("ATOM_M3_AK_MOE_SHARE_W13", "1") == "1"
+    ),
+    # p1/small-g-moe: the ak MoE block at 17..128 rows with retuned shared-expert tiles
+    # (atom/models/minimax_m3/ak_moe_tiles.py; same kernels and bits, tiling only).
+    "ATOM_P1_MOE_TILES": lambda: os.getenv("ATOM_P1_MOE_TILES", "0") == "1",
+    # p1/moe-gemm-headroom (with ATOM_P1_MOE_TILES): id-rows host at 97-128 rows and tuned 8 / 16-row tiles (bitwise).
+    "ATOM_P1_MOE_IDROWS": lambda: os.getenv("ATOM_P1_MOE_IDROWS", "0") == "1",
+    # p1/mbf-build-asm (with ATOM_P1_MOE_IDROWS): 32-128 rows: routed GEMM2 prefetch 3 + GEMM1 prologue issue priority (bitwise).
+    "ATOM_P1_MBF_ASM": lambda: os.getenv("ATOM_P1_MBF_ASM", "0") == "1",
+    # p1/mbf-build-gemm2 (integration branch only, default off): the ak MoE block's GEMM2 and slot/shared sum in one
+    # launch at <= 128 rows (atom/models/minimax_m3/mbf_back.py; bit-identical output; honours the tiling flags above).
+    "ATOM_P1_MBF_BACK": lambda: os.getenv("ATOM_P1_MBF_BACK", "0") == "1",
+    # MiniMax-M3.1 TP4 decode: the delayed all-reduce + residual add + Gemma RMSNorm
+    # (fused_allreduce_gemma_rms_norm) through inferact/amd-kernels' staged communicator
+    # (bf16 wire, bf16 out, coded tiers off) at <= 512 rows; others keep AITER's op.
+    "ATOM_MINIMAX_AK_AR_NORM": lambda: os.getenv("ATOM_MINIMAX_AK_AR_NORM", "0") == "1",
     # GLM-5.2 mono: run the "full" indexer layers (18 of 78) through the fused
     # MonoKernel (atom/models/glm52/mono/kernels/{kernel,layout,op}.py, built
     # with with_indexer=True), which does index Q/K/W projection, paged FP8
@@ -685,6 +753,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Read and checked by atom/mono/polling.py at import, which needs no ATOM
     # import; 1 restores the pre-backoff polling (ROCm/ATOM#3369).
     "ATOM_MONO_POLL_SLEEP_UNITS": lambda: os.getenv("ATOM_MONO_POLL_SLEEP_UNITS"),
+    # MiniMax-M3 mono: log (rank 0) how many decode steps took mono and how many the
+    # original path, by token count, every this many counted decode steps; 0 off.
+    "ATOM_MONO_STATS_EVERY": lambda: int(os.getenv("ATOM_MONO_STATS_EVERY", "0")),
+    # Watch this server's GPUs for other processes (KFD sysfs, atom/utils/gpu_guard.py): a
+    # Mono step needs every CU of every TP GPU, so while another process is on one of them
+    # decode steps leave Mono. 0 off.
+    "ATOM_GPU_GUARD": lambda: os.getenv("ATOM_GPU_GUARD", "1") == "1",
+    "ATOM_GPU_GUARD_INTERVAL_S": lambda: _positive_float_env(
+        "ATOM_GPU_GUARD_INTERVAL_S", "0.2"
+    ),
+    # Log an error (the step, and any other process on the server's GPUs) while one
+    # forward has run longer than this many seconds; 0 off.
+    "ATOM_STEP_WATCHDOG_S": lambda: float(os.getenv("ATOM_STEP_WATCHDOG_S", "5")),
+    # Past this many seconds in one forward the watchdog starts a tiny HIP process on each
+    # of the server's GPUs (gpu_guard.kick: KFD then remaps every queue, which ends a Mono
+    # spin stall), again every 5 s, at most 12 times a forward; 0 off.
+    "ATOM_STEP_KICK_S": lambda: float(os.getenv("ATOM_STEP_KICK_S", "5")),
+    # With ATOM_MONO_STATS_EVERY: also write those counts to <prefix>.rank<r>.json.
+    "ATOM_MONO_STATS_FILE": lambda: os.getenv("ATOM_MONO_STATS_FILE"),
+    # Debug, with ATOM_MONO_CHECK: compare the routed experts alone (the mono kernels' shared expert
+    # weight 0, the original layers' shared expert dropped), on the real activations. A shared
+    # expert fused into the routed experts cannot be dropped: mono is refused then.
+    "ATOM_MONO_CHECK_ROUTED_ONLY": lambda: os.getenv("ATOM_MONO_CHECK_ROUTED_ONLY", "0")
+    == "1",
     # DeepSeek-V4.1: how many of an attention layer's branches leave the main
     # stream. 0 none; 1 the compressor, on the MoE's `alt_stream`, waited at
     # the scorer that first reads it; 2 the indexer as well, on one of its own.
@@ -712,6 +804,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the pool grows with the largest bucket (16384 costs ~10 GB per GPU on
     # V4.1 TP4) while prefills that long are GPU-bound and gain little. Only
     # an attention backend with `supports_token_graph` takes them.
+    # MiniMax-M3: record and replay prefill token graphs (attention stays an
+    # eager region); see AiterAttentionMetadataBuilder.supports_token_graph.
+    "ATOM_M3_PREFILL_TOKEN_GRAPH": lambda: (
+        os.getenv("ATOM_M3_PREFILL_TOKEN_GRAPH", "0") == "1"
+    ),
     "ATOM_TOKEN_GRAPH_SIZES": lambda: tuple(
         int(s)
         for s in os.getenv("ATOM_TOKEN_GRAPH_SIZES", "256,512,1024,2048,3072").split(
@@ -800,6 +897,95 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # logits rather than keep the LM head sharded.
     "ATOM_DSPARK_FUSED_MARKOV_SAMPLE": lambda: (
         os.getenv("ATOM_DSPARK_FUSED_MARKOV_SAMPLE", "1") == "1"
+    ),
+    # MiniMax-M3.1 DSpark: sample and verify a decode step inside its graph off
+    # each rank's vocab shard (`minimax_m3/verify_head.py`) instead of gathering
+    # the logits for the eager sampler and rejection sampler. "0" keeps ATOM's path.
+    "ATOM_M3_VERIFY_HEAD": lambda: os.getenv("ATOM_M3_VERIFY_HEAD", "1") == "1",
+    # The verify head's tiles fold their (value, id) bests with a 64-bit
+    # atomic_max (no pack launch).
+    "ATOM_M3_VERIFY_HEAD_ATOMIC": lambda: (
+        os.getenv("ATOM_M3_VERIFY_HEAD_ATOMIC", "1") == "1"
+    ),
+    # MiniMax-M3.1 DSpark draft: split the bf16 context projection `fc` by output
+    # rows across TP and gather the result, instead of every rank computing the
+    # whole replicated output.
+    "ATOM_M3_DRAFT_FC_SHARDED": lambda: (
+        os.getenv("ATOM_M3_DRAFT_FC_SHARDED", "1") == "1"
+    ),
+    # MiniMax-M3.1 DSpark: write the draft's context K/V of a decode step inside
+    # the target's decode graph rather than eagerly after it.
+    "ATOM_M3_DRAFT_CTX_IN_GRAPH": lambda: (
+        os.getenv("ATOM_M3_DRAFT_CTX_IN_GRAPH", "1") == "1"
+    ),
+    # MiniMax-M3.1 DSpark: build the block pass's paged metadata (positions,
+    # slots, per-row sliding-window page tables) in one kernel instead of the
+    # proposer's ~30 eager torch ops.
+    "ATOM_M3_DRAFT_FUSED_META": lambda: (
+        os.getenv("ATOM_M3_DRAFT_FUSED_META", "1") == "1"
+    ),
+    # MiniMax-M3.1 DSpark: embed the block ``[anchor, MASK, ...]`` straight from
+    # the anchors in one kernel (no id tensor filled and patched first).
+    "ATOM_M3_DRAFT_FUSED_EMBED": lambda: (
+        os.getenv("ATOM_M3_DRAFT_FUSED_EMBED", "1") == "1"
+    ),
+    # MiniMax-M3.1 DSpark (p1/draft-fusion): the draft's o_proj / down_proj / embedding
+    # stay TP partials and each following all-reduce + residual add + Gemma RMSNorm
+    # (+ MXFP8 input of the next linear) is one amd-kernels launch (TP4 only).
+    "ATOM_M3_DRAFT_AK_AR_NORM": lambda: (
+        os.getenv("ATOM_M3_DRAFT_AK_AR_NORM", "0") == "1"
+    ),
+    # MiniMax-M3.1 DSpark: the context write's K norm + RoPE + K/V cache write
+    # for all five draft layers in one launch instead of one per layer.
+    "ATOM_M3_DRAFT_FUSED_CTX_ROPE": lambda: (
+        os.getenv("ATOM_M3_DRAFT_FUSED_CTX_ROPE", "0") == "1"
+    ),
+    # MiniMax-M3.1 DSpark (p1/drafter-head, from dk-head): Markov steps on
+    # 256-column tiles, 8 warps, 3 stages (the tile width only splits columns).
+    "ATOM_M3_DRAFT_MARKOV_WIDE": lambda: (
+        os.getenv("ATOM_M3_DRAFT_MARKOV_WIDE", "0") == "1"
+    ),
+    # MiniMax-M3.1 verify head (p1/drafter-head, from dk-head): the atomic
+    # partials' measured chunk per row count (each column's counter is its own).
+    "ATOM_M3_VERIFY_HEAD_CHUNK_TUNED": lambda: (
+        os.getenv("ATOM_M3_VERIFY_HEAD_CHUNK_TUNED", "0") == "1"
+    ),
+    # MiniMax-M3.1 DSpark (p1/drafter-head, from dk-head): fork the draft context
+    # write beside the LM head only for steps of at least this many rows (0: always).
+    "ATOM_M3_DRAFT_CTX_OVERLAP_MIN_ROWS": lambda: int(
+        os.getenv("ATOM_M3_DRAFT_CTX_OVERLAP_MIN_ROWS", "0")
+    ),
+    # MiniMax-M3.1 DSpark (p1/drafter-head): run the draft block position-major
+    # (row j * B + i is request i's position j) instead of request-major, so a
+    # request's rows are B apart in the per-row attention launch (same XCD / L2
+    # when B % 8 == 0). Row-wise everywhere else, so the same bits. Needs
+    # ATOM_M3_DRAFT_FUSED_EMBED, ATOM_M3_DRAFT_FUSED_META and the sharded Markov.
+    "ATOM_M3_DRAFT_POS_MAJOR": lambda: (
+        os.getenv("ATOM_M3_DRAFT_POS_MAJOR", "0") == "1"
+    ),
+    # MiniMax-M3.1 DSpark draft: its Gemma RMSNorms write the MXFP8 input of the
+    # linear after them (no separate quantize pass), and the five context
+    # layers' K/V come from one GEMM over their K/V weight rows.
+    "ATOM_M3_DRAFT_FUSED_NORM_QUANT": lambda: (
+        os.getenv("ATOM_M3_DRAFT_FUSED_NORM_QUANT", "1") == "1"
+    ),
+    # MiniMax-M3.1 DSpark: in the decode graph, the draft context write past the
+    # fc's all-gather runs on a side stream beside the LM head and verify head.
+    # MiniMax-M3.1 DSpark draft: each Markov position in one launch, its tiles'
+    # (max, id) folded by a 64-bit atomic_max instead of a stage-2 launch.
+    "ATOM_M3_DRAFT_ATOMIC_MARKOV": lambda: (
+        os.getenv("ATOM_M3_DRAFT_ATOMIC_MARKOV", "1") == "1"
+    ),
+    # p1/drafter-rowinv (default "" = off): a comma list of batch sizes, e.g. the default decode capture ladder
+    # "1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64". A decode step's DSpark block pass then runs at the
+    # smallest ladder entry >= the target's running batch (the batch the target would have been padded to
+    # with that ladder) while the target runs at its own (exact) capture size. The drafter's kernel choices are
+    # keyed on its row count (lm_head / qkv / gate_up / o_proj GEMM tables, gluon-vs-ASM attention), so this keeps
+    # its draft ids bit-identical to the padded path when exact capture sizes are added (the target is
+    # row-invariant). Greedy draft only (ignored when lossless sampling is armed).
+    "ATOM_P1_DRAFT_BS_LADDER": lambda: os.getenv("ATOM_P1_DRAFT_BS_LADDER", ""),
+    "ATOM_M3_DRAFT_CTX_OVERLAP": lambda: (
+        os.getenv("ATOM_M3_DRAFT_CTX_OVERLAP", "1") == "1"
     ),
     # Lossless speculative sampling: the DSpark draft samples its block from q
     # and the verify accepts by the probability ratio (u * q < p). Off by
@@ -1335,6 +1521,56 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PREFILL_DECODE_INTERVAL": lambda: int(
         os.getenv("ATOM_PREFILL_DECODE_INTERVAL", "0")
     ),
+    # Prefill token budget of a step taken while decodes are running (each
+    # running decode stalls for the whole step). 0: max_num_batched_tokens.
+    "ATOM_SCHED_DECODE_PREFILL_CAP": lambda: int(
+        os.getenv("ATOM_SCHED_DECODE_PREFILL_CAP", "0")
+    ),
+    # Max share of recent step time spent in prefill while decodes run
+    # (atom/model_engine/prefill_duty.py). 1.0 (default) or 0: off.
+    "ATOM_SCHED_PREFILL_DUTY": lambda: float(
+        os.getenv("ATOM_SCHED_PREFILL_DUTY", "1.0")
+    ),
+    "ATOM_SCHED_PREFILL_DUTY_TAU_S": lambda: float(
+        os.getenv("ATOM_SCHED_PREFILL_DUTY_TAU_S", "1.0")
+    ),
+    # A hold never lasts longer than this, so prefill cannot starve.
+    "ATOM_SCHED_PREFILL_MAX_HOLD_S": lambda: float(
+        os.getenv("ATOM_SCHED_PREFILL_MAX_HOLD_S", "2.0")
+    ),
+    # No hold while the oldest pending prefill has waited this long (0: off).
+    "ATOM_SCHED_PREFILL_MAX_WAIT_S": lambda: float(
+        os.getenv("ATOM_SCHED_PREFILL_MAX_WAIT_S", "0")
+    ),
+    # p1 (sched-stalls): finish-aware prefill hold (prefill_finish_hold.py).
+    # Hold prefill while a running decode with max_tokens <= _MAX_TOKENS has
+    # at most _LEFT tokens to go, for at most _MAX_MS per hold. 0: off.
+    "ATOM_P1_SCHED_FINISH_HOLD_LEFT": lambda: int(
+        os.getenv("ATOM_P1_SCHED_FINISH_HOLD_LEFT", "0")
+    ),
+    "ATOM_P1_SCHED_FINISH_HOLD_MAX_MS": lambda: float(
+        os.getenv("ATOM_P1_SCHED_FINISH_HOLD_MAX_MS", "500")
+    ),
+    "ATOM_P1_SCHED_FINISH_HOLD_MAX_TOKENS": lambda: int(
+        os.getenv("ATOM_P1_SCHED_FINISH_HOLD_MAX_TOKENS", "400")
+    ),
+    # p1 (ttft-sched): ITL-risk prefill hold (prefill_itl_risk.py). Hold
+    # prefill while its stall would push a running request's ITL from at or
+    # below _MS (ms per token) to above it, for at most _MAX_MS per hold. The
+    # stall is estimated as _PF_FIXED_MS + _PF_MS_PER_KTOK per 1K pending
+    # prefill tokens. 0: off.
+    "ATOM_P1_SCHED_ITL_RISK_MS": lambda: float(
+        os.getenv("ATOM_P1_SCHED_ITL_RISK_MS", "0")
+    ),
+    "ATOM_P1_SCHED_ITL_RISK_MAX_MS": lambda: float(
+        os.getenv("ATOM_P1_SCHED_ITL_RISK_MAX_MS", "300")
+    ),
+    "ATOM_P1_SCHED_ITL_RISK_PF_FIXED_MS": lambda: float(
+        os.getenv("ATOM_P1_SCHED_ITL_RISK_PF_FIXED_MS", "31.6")
+    ),
+    "ATOM_P1_SCHED_ITL_RISK_PF_MS_PER_KTOK": lambda: float(
+        os.getenv("ATOM_P1_SCHED_ITL_RISK_PF_MS_PER_KTOK", "18.65")
+    ),
     # Memoise a waiting request's prefix walk across the per-tick probes (the
     # delayer, the DP chunk-cost estimate; `BlockManager.can_allocate_memoized`).
     # "0" re-walks every tick.
@@ -1444,9 +1680,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # OFFLOAD_LOAD_WORKERS: its SLOT load path needs a serial load executor.
     "OFFLOAD_COPY_WORKERS": lambda: _int_env("OFFLOAD_COPY_WORKERS", 1),
     "OFFLOAD_LOAD_WORKERS": lambda: _int_env("OFFLOAD_LOAD_WORKERS", 1),
-    # Opt-in (default off). Mooncake Store only: renew a load's lease keys on
-    # the bounded renewal executor instead of blocking the scheduler thread.
-    "ATOM_STORE_ASYNC_RENEW": lambda: _flag_env("ATOM_STORE_ASYNC_RENEW"),
     # Running-plus-queued save bound. None means unset: the connector then
     # derives max(2, 2 * OFFLOAD_COPY_WORKERS) and the scheduler's state tier
     # uses 2. A kv_connector_extra_config "max_pending_saves" takes precedence.
@@ -1486,6 +1719,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "OFFLOAD_ASYNC_LOOKUP_DEPTH": lambda: _nonnegative_int_env(
         "OFFLOAD_ASYNC_LOOKUP_DEPTH", 16
     ),
+    # lmcache_offload (in-process): run tier lookups on a scheduler-process thread
+    # (`inproc_async_lookup.AsyncInprocLookup`) instead of blocking the scheduler
+    # thread on LMCache's synchronous client. 0 restores the synchronous client.
+    "OFFLOAD_INPROC_ASYNC_LOOKUP": lambda: _flag_env("OFFLOAD_INPROC_ASYNC_LOOKUP", "1"),
     # How long admission may pass over a request whose async lookup has not
     # answered; after it `lmcache_mp` waits for the answer and the Mooncake
     # Store admits the request without one.
@@ -1551,9 +1788,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "lmcache.mp.mp_transfer_mode" takes precedence.
     "LMCACHE_MP_TRANSFER_MODE": lambda: os.getenv("LMCACHE_MP_TRANSFER_MODE", "auto"),
     # LMCache's own chunk size, as the connector configures LMCache with it.
-    # Read on the ATOM side only by `prefix_spread` and `share_cache`, which
-    # predict loads with it and check it against an LMCache MP server's chunk
-    # at registration.
+    # Read on the ATOM side only by `prefix_spread`, which predicts loads with
+    # it and checks it against an LMCache MP server's chunk at registration.
     "LMCACHE_CHUNK_SIZE": lambda: _int_env("LMCACHE_CHUNK_SIZE", 256),
 }
 

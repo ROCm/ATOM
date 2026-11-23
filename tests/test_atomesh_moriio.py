@@ -318,11 +318,10 @@ class KimiK3MoriIOCellTest(unittest.TestCase):
         )
 
 
-SPUR_NIGHTLY = "10 16 * * *"
 SPUR_MORIIO = "10 4 * * *"
 # atomesh-benchmark.yaml's model root for the Spur lane.
 SPUR_MODEL_ROOT = "/data/junyyang/models"
-MORIIO_MODELS = ("DeepSeek-V3", "DeepSeek-V4-Pro", "Kimi-K2.5-MXFP4", "Kimi-K3-MXFP4")
+MORIIO_MODELS = ("DeepSeek-V3", "Kimi-K2.5-MXFP4", "Kimi-K3-MXFP4")
 
 
 def is_moriio(cell: dict) -> bool:
@@ -330,31 +329,29 @@ def is_moriio(cell: dict) -> bool:
 
 
 class MoriIOScheduleTest(unittest.TestCase):
-    """MoRI IO accuracy runs every night on the Spur lane, apart from the nightly."""
+    """MoRI IO accuracy is the only scheduled run, on the Spur lane."""
 
     @classmethod
     def setUpClass(cls):
         cls.workflow = load_workflow()
         cls.matrix_script = workflow_step(cls.workflow, "matrix")
-        cls.moriio_cells = cls.matrix(SPUR_MORIIO)
-        cls.nightly_cells = cls.matrix(SPUR_NIGHTLY)
+        cls.moriio_cells = cls.matrix()
 
     @classmethod
-    def lane(cls, schedule: str) -> dict[str, str]:
+    def lane(cls) -> dict[str, str]:
         return {
-            name: github_expressions(value, "schedule", schedule)
+            name: github_expressions(value, "schedule", SPUR_MORIIO)
             for name, value in cls.workflow["env"].items()
         }
 
     @classmethod
-    def matrix(cls, schedule: str) -> list[dict]:
-        """Run the workflow's matrix step as the given schedule would."""
+    def matrix(cls) -> list[dict]:
+        """Run the workflow's matrix step as the MoRI IO schedule would."""
         cells, _ = run_matrix_step(
             cls.matrix_script,
             dict(
-                cls.lane(schedule),
+                cls.lane(),
                 GITHUB_EVENT_NAME="schedule",
-                EVENT_SCHEDULE=schedule,
                 SUITE="nightly",
                 RUN_ALL_MODELS="true",
                 MODEL_NAMES="",
@@ -366,23 +363,18 @@ class MoriIOScheduleTest(unittest.TestCase):
         )
         return cells
 
-    def test_the_moriio_cron_runs_on_the_spur_lane_like_the_nightly(self):
+    def test_the_moriio_cron_is_the_only_schedule_and_runs_on_the_spur_lane(self):
         # PyYAML reads the workflow's `on:` key as True.
         self.assertEqual(
-            {entry["cron"] for entry in self.workflow[True]["schedule"]},
-            {SPUR_NIGHTLY, SPUR_MORIIO},
+            [entry["cron"] for entry in self.workflow[True]["schedule"]],
+            [SPUR_MORIIO],
         )
-        self.assertEqual(self.lane(SPUR_MORIIO), self.lane(SPUR_NIGHTLY))
         runner = "ATOMESH_SLURM_SUBMIT_RUNNER"
-        self.assertEqual(self.lane(SPUR_MORIIO)[runner], "atomesh-cicd-mi350")
+        self.assertEqual(self.lane()[runner], "atomesh-cicd-mi350")
 
-    def test_the_moriio_cron_has_a_concurrency_group_of_its_own(self):
+    def test_scheduled_runs_use_the_moriio_concurrency_group(self):
         group = self.workflow["concurrency"]["group"]
         prefix = "Atomesh Benchmark-refs/heads/main-"
-        self.assertEqual(
-            github_expressions(group, "schedule", SPUR_NIGHTLY),
-            prefix + "schedule-atomesh-cicd-mi350",
-        )
         self.assertEqual(
             github_expressions(group, "schedule", SPUR_MORIIO),
             prefix + "schedule-atomesh-cicd-mi350-moriio",
@@ -407,10 +399,6 @@ class MoriIOScheduleTest(unittest.TestCase):
             twin = expected[(cell["model"], cell["name"])]
             for key in ("suite", "service", "server_args", "env", "accuracy"):
                 self.assertEqual(cell[key], twin[key], (cell["name"], key))
-
-    def test_the_nightly_leaves_moriio_to_its_own_schedule(self):
-        self.assertTrue(self.nightly_cells)
-        self.assertFalse([cell["id"] for cell in self.nightly_cells if is_moriio(cell)])
 
     def test_deepseek_v3_finds_its_weights_on_the_spur_lane(self):
         dsv3 = [cell for cell in self.moriio_cells if cell["model"] == "DeepSeek-V3"]

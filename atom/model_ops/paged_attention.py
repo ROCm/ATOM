@@ -103,6 +103,13 @@ class Attention(BaseAttention):
         # communicator of the long-prefill head exchange.
         self.sp_columns = sp_columns
         self.sp_head_exchange = sp_head_exchange
+        # Under SP, hand an FP8 o_proj per-token FP8 `(out, scale)` straight
+        # from the head exchange instead of quantizing BF16 after it.
+        self.per_token_fp8_out = (
+            per_token_fp8_out
+            and sp_columns is not None
+            and sp_fp8_attention_output_supported()
+        )
 
         atom_config = get_current_atom_config()
         dtype = atom_config.torch_dtype
@@ -131,14 +138,6 @@ class Attention(BaseAttention):
             k_norm=k_norm,
             **kwargs,
         )
-        # Hand an FP8 o_proj per-token FP8 `(out, scale)` instead of BF16 it
-        # quantizes itself: under SP from the head exchange, else from an impl
-        # whose kernel writes it.
-        self.per_token_fp8_out = per_token_fp8_out and (
-            sp_fp8_attention_output_supported()
-            if sp_columns is not None
-            else self.impl.supports_output_quant
-        )
         compilation_config = atom_config.compilation_config
         default_name = f"MLA_{layer_num}" if self.use_mla else f"MHA_{layer_num}"
         self.layer_name = prefix if prefix is not None else default_name
@@ -159,14 +158,27 @@ class Attention(BaseAttention):
         if self.per_token_fp8_out:
             # Allocated outside the op, in the compiled segment before it.
             scale = query.new_empty((query.shape[0], 1), dtype=torch.float32)
-            op = (
-                torch.ops.aiter.sp_attention_fp8
-                if self.sp_columns is not None
-                else torch.ops.aiter.unified_attention_fp8
+            output = torch.ops.aiter.sp_attention_fp8(
+                query, key, value, positions, self.layer_name, qkv, scale
             )
-            output = op(query, key, value, positions, self.layer_name, qkv, scale)
             return output, scale
         output = torch.ops.aiter.unified_attention_with_output_base(
             query, q_scale, key, value, positions, self.layer_name, self.use_mla, qkv
         )
         return output
+
+    def forward_ak_oproj(self, query, key, value, positions, qkv, o_proj):
+        """Attention + its amd-kernels MXFP8 o_proj in one op (ATOM_M3_AK_DECODE_QOUT):
+        bf16 [tokens, N], o_proj's output."""
+        return torch.ops.aiter.unified_attention_ak_oproj(
+            query,
+            None,
+            key,
+            value,
+            positions,
+            self.layer_name,
+            qkv,
+            o_proj.weight,
+            o_proj.weight_scale,
+            o_proj._ak_weight_scale,
+        )

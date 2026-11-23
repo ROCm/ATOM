@@ -95,7 +95,6 @@ def moe_wide_defs(k4ctx):
     MID4_ROWS = k4ctx["MID4_ROWS"]
     ROUTE_ITERS = k4ctx["ROUTE_ITERS"]
     UGW_ITERS = k4ctx["UGW_ITERS"]
-    UG_SHARED_UNITS = k4ctx["UG_SHARED_UNITS"]
     UG_CPW = k4ctx["UG_CPW"]
     UG_PAIRS = k4ctx["UG_PAIRS"]
     U_MAX = k4ctx["U_MAX"]
@@ -148,6 +147,7 @@ def moe_wide_defs(k4ctx):
     urow = k4ctx["urow"]
     uwt = k4ctx["uwt"]
     w13 = k4ctx["w13"]
+    w13_gugu = k4ctx["w13_gugu"]
     w2 = k4ctx["w2"]
     wave = k4ctx["wave"]
     xs = k4ctx["xs"]
@@ -187,6 +187,12 @@ def moe_wide_defs(k4ctx):
                 fx.ptr_store(fx.Int32((1 << tokens) - 1), umask + nu_)
         gpu.barrier()
 
+    def w13_group(cg, gu):
+        """The 16-row block of w13 holding gate (``gu`` 0) / up (1) row group ``cg``."""
+        if const_expr(w13_gugu):
+            return 2 * cg + gu
+        return gu * UG_PER_SLOT + cg
+
     def wug_load(t, has, scales=True):
         """Up / gate weights (and ``scales``: the scale dwords, which hold the
         pair's both halves) of task t = (distinct expert t / 48, row group
@@ -210,7 +216,7 @@ def moe_wide_defs(k4ctx):
             scs.append([])
             for i in range_constexpr(UG_CPW):
                 kc = wave * UG_CPW + i
-                wts[gu].append(fp4_tile_load(r_w, 0, rg, HIDDEN, kc, lane * 4))
+                wts[gu].append(fp4_tile_load(r_w, 0, w13_group(cg, gu), HIDDEN, kc, lane * 4))
                 if const_expr(scales and i % 2 == 0):
                     # the dword holding this lane's scales of chunks kc, kc + 1
                     # of both 16-row halves of the 32-row block (bytes 2 d + a)
@@ -516,123 +522,128 @@ def moe_wide_defs(k4ctx):
             )
         n_routed = uniform(fx.ptr_load(uexp + (U_MAX + 1)))
         if const_expr(FUSED):
-            # the fused shared expert is the union's last expert, a task pair as any
+            # the fused shared expert is the union's last expert, a task pair as any,
+            # dealt over every CTA: round rd's pair rd * G + bid
             n_pairs = (n_routed + 1) * UG_PAIRS
+            G_R = G
         else:
             # the shared expert is not a task of the grouped loop (its tiles are fp8)
             n_pairs = n_routed * UG_PAIRS
-
-            # the MXFP8 shared expert's pairs (UG_PAIRS, each ``UG_SHARED_UNITS`` routed pairs' time) run
-            # on the last UG_PAIRS CTAs after their routed pairs: those carry that many pairs
-            # fewer, so every CTA ends within a pair of the others. Rounds (a round is
-            # one pair a CTA): the first ``full`` are every CTA's (pair round * G +
-            # bid); the last ``UG_SHARED_UNITS`` are the other G - UG_PAIRS CTAs' (the routed
-            # pairs left, in order)
-            SH_HOST0 = G - UG_PAIRS
-            rounds = (n_pairs + UG_SHARED_UNITS * UG_PAIRS + (G - 1)) // G
-            full = fx.max(rounds - UG_SHARED_UNITS, 0)
+            # the MXFP8 shared expert's pairs (UG_PAIRS) run on the last UG_PAIRS CTAs, one each and
+            # nothing else: their first tiles go out with the routing, before the xn lands (a shared pair after
+            # the host's routed pairs, its loads behind the xn: with few experts the hosts ended ~10 us
+            # after the routed CTAs, the down stage waiting for them). The routed pairs go to the other
+            # G_R CTAs, round rd's pair rd * G_R + bid.
+            G_R = G - UG_PAIRS
 
         def task(it):
-            """Iteration it's task: its pair's half it % 2 (``fused_shared``: pair
-            bid + (it / 2) G)."""
-            rd = it // 2
-            if const_expr(FUSED):
-                pr = fx.Int32(bid + rd * G)
-            else:
-                tail = full * G + (fx.Int32(rd) - full) * SH_HOST0 + bid
-                pr = (fx.Int32(rd) < full).select(
-                    fx.Int32(rd * G) + bid, (bid < SH_HOST0).select(tail, n_pairs)
-                )
-            return fx.min(pr, n_pairs - 1) * 2 + it % 2, pr < n_pairs
+            """Iteration it's task: its pair's half it % 2."""
+            pr = fx.Int32((it // 2) * G_R) + bid
+            has = pr < n_pairs
+            if const_expr(not FUSED):
+                has = has & (bid < G_R)
+            return fx.min(pr, n_pairs - 1) * 2 + it % 2, has
 
-        t0, h0 = task(0)
-        cur = wug_load(t0, h0)  # task 0: a lo half, with the pair's scales
-        down_tables()
-        stamp(7)
-        # the first task's weights are in flight: now the xn
-        # every token's MXFP8 xn and scales -> the pool, once every router task
-        # flagged its slice (plain words, 16 B a load)
-        n_rt = N_ROUTER * tokens
-        if wave == 0:
-            mb_poll(
-                [
-                    (mr("xndone"), fx.min(lane + 64 * c, n_rt - 1), 1)
-                    for c in range((n_rt + 63) // 64)
-                ]
-            )
-        gpu.barrier()
-        acquire()
-        if const_expr(FUSED):
-            # every task's B: every token's MXFP8 xn rows and scales
-            xq = None
+        def wait_xn():
+            """Every token's xn and scales in, once every router task flagged its slice."""
+            n_rt = N_ROUTER * tokens
+            if wave == 0:
+                mb_poll(
+                    [
+                        (mr("xndone"), fx.min(lane + 64 * c, n_rt - 1), 1)
+                        for c in range((n_rt + 63) // 64)
+                    ]
+                )
+            gpu.barrier()
+            acquire()
+
+        def xn8_to_lds():
+            """The MXFP8 xn rows and scales -> the pool (plain words, 16 B a load)."""
             for base_w, n_row, lds_w, lds_row in (
                 (mb("xn8p"), XN8_WORDS, 0, XN8_ROW),
                 (mb("xscp"), XSC_WORDS, XSC_LDS, XSC_ROW),
             ):
                 rows_to_lds(tid, base_w, tokens, n_row, xs + lds_w, lds_row)
-        else:
-            # this lane's MXFP4 xn operand and code of each of its wave's chunks for good (a
-            # lane's column is token l % 16, its wave's k eighth, 16 B a 128-k chunk), read once
-            # for every task; only the shared expert's CTAs hold MXFP8 rows
-            colx = fx.min(l16, tokens - 1)
-            xq = [
-                (
-                    fx.Vector(
-                        ld_dev(
-                            mb("xn4p"),
-                            colx * XN4_WORDS + (wave * UG_CPW + i) * 16 + g4 * 4,
-                            4,
-                        )
-                    ),
-                    fx.Int32(
-                        ld_dev(
-                            mb("xs4p"),
-                            colx * XSC_WORDS + (wave * UG_CPW + i) * 4 + g4,
-                            1,
-                        )
-                    ),
-                )
-                for i in range(UG_CPW)
-            ]
-            if bid >= G - UG_PAIRS:
-                for base_w, n_row, lds_w, lds_row in (
-                    (mb("xn8p"), XN8_WORDS, 0, XN8_ROW),
-                    (mb("xscp"), XSC_WORDS, XSC_LDS, XSC_ROW),
-                ):
-                    rows_to_lds(tid, base_w, tokens, n_row, xs + lds_w, lds_row)
-        gpu.barrier()
-        y_lo = fx.Float32(0.0)  # the pair's first half, until the second's
-        for it in range_constexpr(UGW_ITERS):
-            t, has_t = task(it)
-            if const_expr(it + 1 < UGW_ITERS):
-                tn, hn = task(it + 1)
-                # a hi half reads no scales: its lo half's dwords hold them
-                nxt = wug_load(tn, hn, scales=(it + 1) % 2 == 0)
-            if const_expr(it % 2 == 0):
-                pair_scs = cur[1]
-            if has_t:
-                y = wug_y(
-                    cur[0], pair_scs, it % 2, xq=xq
-                )  # a pair: row groups cg, cg + 1
+
+        def routed_pairs():
+            """This CTA's up / gate task pairs of the grouped loop."""
+            t0, h0 = task(0)
+            cur = wug_load(t0, h0)  # task 0: a lo half, with the pair's scales
+            down_tables()
+            stamp(7)
+            # the first task's weights are in flight: now the xn
+            wait_xn()
+            if const_expr(FUSED):
+                # every task's B: every token's MXFP8 xn rows and scales
+                xq = None
+                xn8_to_lds()
+            else:
+                # this lane's MXFP4 xn operand and code of each of its wave's chunks for good (a
+                # lane's column is token l % 16, its wave's k eighth, 16 B a 128-k chunk), read
+                # once for every task
+                colx = fx.min(l16, tokens - 1)
+                xq = [
+                    (
+                        fx.Vector(
+                            ld_dev(
+                                mb("xn4p"),
+                                colx * XN4_WORDS + (wave * UG_CPW + i) * 16 + g4 * 4,
+                                4,
+                            )
+                        ),
+                        fx.Int32(
+                            ld_dev(
+                                mb("xs4p"),
+                                colx * XSC_WORDS + (wave * UG_CPW + i) * 4 + g4,
+                                1,
+                            )
+                        ),
+                    )
+                    for i in range(UG_CPW)
+                ]
+            gpu.barrier()
+            y_lo = fx.Float32(0.0)  # the pair's first half, until the second's
+            for it in range_constexpr(UGW_ITERS):
+                t, has_t = task(it)
+                if const_expr(it + 1 < UGW_ITERS):
+                    tn, hn = task(it + 1)
+                    # a hi half reads no scales: its lo half's dwords hold them
+                    nxt = wug_load(tn, hn, scales=(it + 1) % 2 == 0)
                 if const_expr(it % 2 == 0):
-                    y_lo = y
-                else:
-                    (wug_publish8 if FUSED else wug_publish4)(t // 2, y_lo, y)
-            if const_expr(it + 1 < UGW_ITERS):
-                cur = nxt
-        if const_expr(not FUSED):
-            # the shared expert's pair j (task pair n_routed * UG_PAIRS + j of the
-            # step's numbering) on CTA SH_HOST0 + j: both halves' tiles in flight
-            # before the first GEMV, the pair's flag after the second
-            jsh = fx.Int32(bid) - SH_HOST0
-            has_s = jsh >= 0
-            jsh = fx.min(jsh, UG_PAIRS - 1)
-            sh_cur = wsh_load(2 * jsh, has_s)
-            sh_nxt = wsh_load(2 * jsh + 1, has_s)
-            if has_s:
+                    pair_scs = cur[1]
+                if has_t:
+                    y = wug_y(
+                        cur[0], pair_scs, it % 2, xq=xq
+                    )  # a pair: row groups cg, cg + 1
+                    if const_expr(it % 2 == 0):
+                        y_lo = y
+                    else:
+                        (wug_publish8 if FUSED else wug_publish4)(t // 2, y_lo, y)
+                if const_expr(it + 1 < UGW_ITERS):
+                    cur = nxt
+
+        if const_expr(FUSED):
+            routed_pairs()
+        else:
+            if bid >= G_R:
+                # the shared expert's pair j (task pair n_routed * UG_PAIRS + j of the step's
+                # numbering) on CTA G_R + j: the lo half's tiles in flight before the xn wait, the hi
+                # half's once the xn rows are in LDS (any earlier spills at TP4: 8 VGPRs at 16 rows),
+                # the pair's flag after the second GEMV
+                jsh = fx.Int32(bid) - G_R
+                true_ = jsh >= 0
+                sh_cur = wsh_load(2 * jsh, true_)
+                down_tables()
+                stamp(7)
+                wait_xn()
+                xn8_to_lds()
+                gpu.barrier()
+                sh_nxt = wsh_load(2 * jsh + 1, true_)
                 y_lo = wug_y(sh_cur[0], sh_cur[1], 0)
                 y_hi = wug_y(sh_nxt[0], sh_nxt[1], 1)
                 wug_publish(n_routed * UG_PAIRS + jsh, y_lo, y_hi)
+            else:
+                routed_pairs()
         stamp(8)
         if has_dn:
             (wide_down_a8w4 if FUSED else wide_down)(td)

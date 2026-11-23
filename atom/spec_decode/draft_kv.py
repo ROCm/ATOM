@@ -4,7 +4,7 @@ from functools import partial
 
 import torch
 
-from atom.config import KVCacheTensor, kv_cache_torch_dtype
+from atom.config import KVCacheTensor
 from atom.model_ops.attentions.pool_layout.pool_rows import PoolRowsMixin
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import SubPoolSpec, page_pool
 
@@ -94,7 +94,9 @@ def draft_kv_dtype(config) -> torch.dtype:
     """The dtype a draft's own pool stores K and V in, the configured KV
     cache dtype: the pool is built in it, and the draft's reader is built for
     it."""
-    return kv_cache_torch_dtype(config.kv_cache_dtype)
+    from aiter import dtypes
+
+    return dtypes.d_dtypes[config.kv_cache_dtype]
 
 
 def draft_kv_builder(model_runner, draft_hf, model):
@@ -102,9 +104,9 @@ def draft_kv_builder(model_runner, draft_hf, model):
 
     A draft is not an attention flavor; it is a model that has one. So the
     flavor comes from the draft's own config through the same selector the
-    target uses, and the family table (`selector.DRAFT_POOL_FAMILIES`) says
-    whether a draft of its flavor caches into a pool of its own. Where it does
-    not, the runner never sees a draft builder at all.
+    target uses, and that backend says whether a draft of its flavor caches
+    into a pool of its own (`selector.DRAFT_POOL_FAMILIES`). Where it does not, the
+    runner never sees a draft builder at all.
 
     Which is why speculative decoding imports no attention anywhere: adding a
     flavor is a table entry and a `make_kv_pool` on that backend.
@@ -119,6 +121,8 @@ def draft_kv_builder(model_runner, draft_hf, model):
             "draft's own pool is stored at a unit scale only, since it has no "
             "scale planes and nothing loads a scale into it"
         )
+
+    from aiter import dtypes
 
     from atom.utils.selector import DRAFT_POOL_FAMILIES, attn_family, get_attn_backend
 
@@ -144,9 +148,7 @@ def draft_kv_builder(model_runner, draft_hf, model):
         draft_hf,
         world_size=model_runner.world_size,
         # settled once, by `Config`
-        kv_dtype=kv_cache_torch_dtype(
-            model_runner.config.speculative_config.draft_kv_dtype
-        ),
+        kv_dtype=dtypes.d_dtypes[model_runner.config.speculative_config.draft_kv_dtype],
         **spec_kwargs,
     )
     # A way to build it, not the pool: how many rows it has is the walk's to

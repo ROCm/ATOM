@@ -10,7 +10,6 @@ from abc import ABC, abstractmethod
 import torch
 import triton
 import triton.language as tl
-from aiter import dtypes
 from aiter.ops.triton.gluon.pa_decode_gluon import (
     pa_decode_gluon_supports_arch,
 )
@@ -22,7 +21,7 @@ from atom.utils.region_graph import eager_region
 from atom.utils.selector import Family, get_attn_backend
 
 from .attention_mla import MLAModules, _mla_output_width
-from .sp_attention import attention_fp8_fake, gather_heads, ulysses_attention
+from .sp_attention import gather_heads, ulysses_attention
 
 logger = logging.getLogger("atom")
 
@@ -451,13 +450,12 @@ def _flydsl_prepare_explicit_plan(
     plan_step_owner=None,
     plan_cache_owner=None,
     plan_segment: int = 0,
-    plan_workgroup_budget: int | None = None,
 ):
     """Return the explicit plan aiter #5809 requires.
 
     ``plan_partition_cap``: None takes ``flydsl_plan_shape``, i.e. aiter's
     defaults except at head_dim 256; a caller's cap is kept, with aiter's
-    default budget, or ``plan_workgroup_budget`` when given.
+    default budget.
     ``plan_step_owner``: a per-step object whose calls all share the same
     lengths; the plan is then refreshed once per step instead of every call.
     ``plan_segment``: which slice of one call's rows this is, for a caller that
@@ -479,12 +477,12 @@ def _flydsl_prepare_explicit_plan(
         max_partitions = int(plan_partition_cap)
     else:
         max_partitions = shape.get("max_partitions")
+    workgroup_budget = shape.get("workgroup_budget")
 
     if existing_plan is not None and flydsl_plan_matches(
         existing_plan, num_seqs, num_kv_heads
     ):
         return existing_plan
-    workgroup_budget = shape.get("workgroup_budget", plan_workgroup_budget)
 
     from atom.utils.tbo.ubatching import tbo_current_ubatch_id
 
@@ -1044,34 +1042,65 @@ def unified_attention_with_output_base(
         )
 
 
-@mark_spliting_op(is_custom=True, gen_fake=attention_fp8_fake, mutates_args=["scale"])
-@eager_region()
-def unified_attention_fp8(
+def _attention_ak_oproj_fake(
     q: torch.Tensor,
+    q_scale: torch.Tensor | None,
     k: torch.Tensor,
     v: torch.Tensor,
     positions: torch.Tensor,
     layer_name: str,
-    qkv: torch.Tensor | None,
-    scale: torch.Tensor,
+    qkv: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    ak_weight_scale: torch.Tensor,
 ) -> torch.Tensor:
-    """`unified_attention_with_output_base` for a layer whose impl writes its
-    output as OCP FP8 plus per-token descales (`supports_output_quant`): the
-    output, and its descales into ``scale``."""
+    return torch.empty(
+        (q.shape[0], weight.shape[0]), dtype=torch.bfloat16, device=q.device
+    )
+
+
+@mark_spliting_op(is_custom=True, gen_fake=_attention_ak_oproj_fake, mutates_args=[])
+@eager_region()
+def unified_attention_ak_oproj(
+    q: torch.Tensor,
+    q_scale: torch.Tensor | None,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    qkv: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    ak_weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    """``unified_attention_with_output_base`` followed by its MXFP8 o_proj (no bias, no reduce)
+    (ATOM_M3_AK_DECODE_QOUT, p1/attn-decode). When the impl's amd-kernels decode route wrote
+    o_proj's MXFP8 input itself (``impl._ak_qout_result``) the GEMM reads those codes
+    (``mxfp8_gemm_prequant`` layout); every other path (prefill, > 16 requests, < 8 rows,
+    dummy runs) returns bf16 and o_proj runs exactly as before (``ak_mxfp8_linear``)."""
+    from atom.model_ops.ak_gemm import ak_mxfp8_linear
+    from atom.model_ops.minimax_m3 import ak_kernels
+
     self = get_current_atom_config().compilation_config.static_forward_context[
         layer_name
     ]
-    output = torch.empty(q.shape, device=q.device, dtype=dtypes.fp8)
-    self.impl.forward_impl(
-        q=q,
-        k=k,
-        v=v,
-        position=positions,
-        qkv=qkv,
-        quantized_output=output,
-        output_scale=scale,
+    impl = self.impl
+    impl._ak_qout_n = weight.shape[0]
+    impl._ak_qout_result = None
+    try:
+        out = impl.forward(
+            query=q, key=k, value=v, position=positions, q_scale=q_scale, qkv=qkv
+        )
+        res = impl._ak_qout_result
+    finally:
+        impl._ak_qout_n = None
+        impl._ak_qout_result = None
+    if res is not None:
+        quant_out, rows = res
+        return ak_kernels.prequant_linear(quant_out, rows, weight, ak_weight_scale)
+    return ak_mxfp8_linear(
+        out.view(q.shape[0], -1), weight, weight_scale, ak_weight_scale
     )
-    return output
 
 
 def linear_attention_with_output_base_fake(

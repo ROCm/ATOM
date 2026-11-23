@@ -25,7 +25,7 @@ ATOM (AiTer Optimized Model) wraps AITER kernels with model-level abstractions f
 | `VocabParallelEmbedding` | `embed_head.py` | `F.embedding` + TP all-reduce | Vocab embedding |
 | `ParallelLMHead` | `embed_head.py` | `tgemm.mm` + `tensor_model_parallel_all_gather` | LM output head |
 | `RotaryEmbedding` | `rotary_embedding.py` | `aiter.rope_cached_positions_2c_fwd_inplace` | Rotary position embedding |
-| `Sampler` | `sampler.py` | `aiter.mixed_sample_outer_exponential`, `aiter.ops.triton.fusions.fused_mixed_sample.fused_mixed_sample`, `aiter.ops.triton.topk.topk`, `aiter.ops.triton.softmax.softmax` | Token sampling |
+| `Sampler` | `sampler.py` | `aiter.mixed_sample_outer_exponential`, `aiter.ops.triton.topk.topk`, `aiter.ops.triton.softmax.softmax` | Token sampling |
 | `RejectionSampler` | `rejection_sampler.py`, `verify_kernels.py`, `spec_sampling/` (`ratio_verify.py`, `ratio_target_p.py`) | Triton `rejection_greedy_sample_kernel`, `_ratio_*`, `rejection_relaxed_sample_kernel`, `rejection_synthetic_sample_kernel` | Speculative decoding |
 | `apply_packed_bitmask` | `triton_structured_output.py` | Triton packed-bitmask kernel | JSON grammar masks on selected target logits |
 | `constrain_logits`, `advance_states` | `triton_required_channel.py` | Triton `_constrain_logits_kernel`, `_advance_states_kernel` | `tool_choice="required"` channel mask (Kimi-K3) |
@@ -496,8 +496,6 @@ def forward(self, logits, temperatures) -> sampled_tokens:
 **Fallback methods** (currently unreachable due to early return):
 - `greedy_sample()`: `aiter.ops.triton.topk.topk(logits, 1)`
 - `random_sample()`: `aiter.ops.triton.softmax.softmax(logits)` followed by exponential sampling and `topk`.
-
-**Per-row noise.** When a batch needs independent noise and has no top-k/top-p, the sampler draws a `(num_tokens, vocab_size)` `exponential_` tensor (one noise row per token) and calls aiter's `fused_mixed_sample` (ROCm/aiter#7416): the same race as `mixed_sample_outer_exponential` plus the greedy override (rows at or below `SAMPLER_EPS` take the lowest-id argmax), in one aiter call. That covers the speculative bonus token and exact-match verification rows of a non-greedy batch, any batch with `n>1` fan-out siblings, and every unfiltered batch under `--sampler-independent-noise` that is not all greedy (an all-greedy batch takes the argmax first and draws no noise). A sampling row can differ from `mixed_sample_outer_exponential` only on a near tie of its two best race keys. Other unfiltered batches share one broadcast noise row and keep `mixed_sample_outer_exponential` + `topk_select`.
 
 ### Shared token constraints
 

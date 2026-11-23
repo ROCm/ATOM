@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+from types import SimpleNamespace
 from typing import ClassVar, NamedTuple
 
 import aiter
@@ -10,7 +11,7 @@ import torch
 import triton
 import triton.language as tl
 
-from atom.config import _is_minimax_m3_config, kv_cache_torch_dtype
+from atom.config import _is_minimax_m3_config
 from atom.distributed.ulysses_sp import local_num_kv_heads
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
@@ -437,6 +438,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         a second geometry sharing one block-id space, which is what sizing
         summed for it all along. Nothing here asks which model it is.
         """
+        from aiter import dtypes
+
         runner = self.model_runner
         # `INDEX_ROWS` is a row space, not a pool: the indexer keys ride the
         # first geometry's pool, since declaring them per pool would charge for
@@ -464,7 +467,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 head_dim=geometry.head_dim,
                 # An FP4 (MXFP4 / NVFP4) layout declares its own bytes (uint8 pages);
                 # the dtype is read only by the dtype-wide cache, which FP4 is not.
-                kv_dtype=kv_cache_torch_dtype(runner.config.kv_cache_dtype),
+                kv_dtype=(
+                    torch.uint8
+                    if geometry.layout is not None
+                    else dtypes.d_dtypes[runner.config.kv_cache_dtype]
+                ),
                 extra_fields=extra_fields,
                 layout=geometry.layout,
             )
@@ -481,6 +488,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         """
         if not self._has_sparse_attention:
             return None
+        from aiter import dtypes
 
         config = self.model_runner.config
         text_config = getattr(config.hf_config, "text_config", config.hf_config)
@@ -520,7 +528,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 "index_cache_dtype must be 'bf16', 'fp8', 'fp4' or 'nvfp4', got "
                 f"{index_dtype!r}"
             )
-        dtype = kv_cache_torch_dtype(index_dtype)
+        dtype = dtypes.d_dtypes[index_dtype]
         return _IndexCacheSpec(
             rows,
             (entry_tokens * dim * dtype.itemsize,),
@@ -649,6 +657,13 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             module.impl.nvfp4_v_scale = torch.ones(
                 1, dtype=torch.float32, device=k_cache.device
             )
+            from atom.utils import envs
+
+            if envs.ATOM_M3_FUSED_DECODE:
+                # the fused decode's split scratch, before any graph capture
+                from atom.model_ops.minimax_m3.sparse_pa_nvfp4_q8 import alloc_workspace
+
+                alloc_workspace(k_cache.device)
 
         module.max_model_len = config.max_model_len
         module.k_cache = k_cache
@@ -1262,5 +1277,53 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # A capture runs a full synthetic batch: nothing is padded.
             scheduled_tokens=scheduled_tokens,
             running_tokens=scheduled_tokens,
+        )
+        return attn_metadata, context
+
+    @property
+    def supports_token_graph(self) -> bool:
+        """MiniMax-M3 prefill replays token graphs (`ATOM_M3_PREFILL_TOKEN_GRAPH`).
+
+        Every launch outside the attention op is sized by the token count, and
+        the whole sparse path (KV / index insert, scoring, selection, sparse
+        attention) runs inside `unified_attention_with_output_base`, the eager
+        region, on the live step's metadata. Padding rows are position 0 with
+        no KV slot (`_pad_tokens`), and the sparse prefill zeroes the output
+        rows its metadata does not cover (`_metadata_rows`)."""
+        return self._has_sparse_attention and envs.ATOM_M3_PREFILL_TOKEN_GRAPH
+
+    def build_for_token_graph_capture(self, tokens: int):
+        """A prefill of ``tokens`` rows for recording that token-graph bucket:
+        one request from position 0 with no KV slot, so neither the warmup nor
+        the recording pass writes the cache. The regions run for real on it;
+        the segments only need its shape."""
+        if not 0 < tokens <= self.max_num_batched_tokens:
+            raise ValueError("token-graph bucket exceeds the token buffer")
+        lengths = np.asarray([tokens], dtype=np.int32)
+        # No block table: every slot is -1 (`_write_prefill_slots`) and the
+        # staged table row is zero-filled, i.e. every page reads block 0.
+        batch = SimpleNamespace(
+            is_dummy_run=False,
+            req_ids=[0],
+            num_scheduled_tokens=lengths,
+            context_lens=lengths,
+            num_cached_tokens=[0],
+            block_tables=[],
+            total_seqs_num=1,
+            total_seqs_num_prefill=1,
+            total_tokens_num=tokens,
+            total_tokens_num_prefill=tokens,
+            mrope_positions_by_req={},
+        )
+        self.publish_query_metadata(lengths, 1, tokens)
+        attn_metadata, positions = self.prepare_prefill(batch, 1, tokens)
+        context = Context(
+            positions=positions,
+            is_prefill=True,
+            is_dummy_run=False,
+            scheduled_bs=1,
+            scheduled_tokens=tokens,
+            running_bs=1,
+            running_tokens=tokens,
         )
         return attn_metadata, context

@@ -4,7 +4,7 @@
 256-key partition x 16 heads a task, f16 MFMA over the exact dequantized products.
 
 The page (128 tokens, ``KV_PAGE_BYTES`` = 18432 B at one kv head) is aiter's
-``sparse_pa_nvfp4`` one (``nvfp4_pages`` documents it),
+``minimax_m3_sparse_pa_nvfp4`` one (``common.py`` here: ``nvfp4_k_store`` documents it),
 and a wave's work is that kernel's wave: 32 keys, the quarter ``q`` of a block,
 
   S^T = K Q^T   A = K tile (row r of tile st is key 8 (r // 4) + 4 st + r % 4 of the
@@ -27,28 +27,18 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.kernels_common import LOG2E
-from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_common import (
-    cvt_fp4x2_f16,
-    cvt_fp8x2_f16,
-    mfma_f16,
-    pk_f16,
-)
-from flydsl.expr import gpu, range_constexpr
-from flydsl.expr.typing import Int64, T
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr.typing import Int64, T, as_ir_value
 
 from atom.models.minimax_m3.mono.config import HEAD_DIM
-from atom.models.minimax_m3.mono.kernels.common import (
-    KV_K_SCALE_AT,
-    KV_PAGE_BYTES,
-    KV_V_DATA_AT,
-    KV_V_SCALE_AT,
-)
+from atom.models.minimax_m3.mono.kernels.common import KV_PAGE_BYTES
 from atom.models.minimax_m3.mono.kernels.stages.shared import NEG
 from atom.models.minimax_m3.mono.layout import N_SPLIT, O_K, SPLIT_KEYS, H
 from atom.mono.device.ops import (
     hw_exp2,
     kernel_symbol,
     launcher,
+    memrealtime,
     rsrc,
     traced,
     uniform,
@@ -58,8 +48,52 @@ from atom.mono.plan.execution import BLOCKS, THREADS, WAVES
 
 PPW = SPLIT_KEYS // WAVES // 16  # page-16 entries a wave
 KPW = SPLIT_KEYS // WAVES  # keys a wave (32)
+_K_SCALES = 8192  # a head's K scale region (Hkv = 1)
+_V_DATA = 9216
+_V_SCALES = 9216 + 8192
 _CURRENT_STREAM = fx.Stream(None)
 _V = fx.Vector
+
+
+def _cvt_fp4x2_f16(word, sel):
+    return _V(
+        rocdl.cvt_scalef32_pk_f16_fp4(
+            _V.make_type(2, fx.Float16),
+            as_ir_value(fx.Int32(word)),
+            as_ir_value(fx.Float32(1.0)),
+            sel,
+        )
+    )
+
+
+def _cvt_fp8x2_f16(word, hi):
+    return _V(
+        rocdl.cvt_scalef32_pk_f16_fp8(
+            _V.make_type(2, fx.Float16),
+            as_ir_value(fx.Int32(word)),
+            as_ir_value(fx.Float32(1.0)),
+            hi,
+        )
+    )
+
+
+def _mfma_f16(a4, b4, acc):
+    a = _V(a4).bitcast(fx.Float16)
+    b = _V(b4).bitcast(fx.Float16)
+    return _V(
+        rocdl.mfma_f32_16x16x32_f16(_V.make_type(4, fx.Float32), [a, b, acc, 0, 0, 0])
+    )
+
+
+def _pk_f16(a, b):
+    """Two f32 -> a dword of two f16 (RNE), ``a`` low."""
+    return (
+        _V.from_elements([fx.Float32(a), fx.Float32(b)], fx.Float32)
+        .to(fx.Float16)
+        .bitcast(fx.Int32)[0]
+    )
+
+
 _NEG_BITS = struct.unpack("i", struct.pack("f", NEG))[0]
 
 
@@ -95,13 +129,13 @@ def load_quarter(r_page, w, n, g, cm=0):
     ks = fx.Int32(
         bo.buffer_load(
             r_page,
-            (KV_K_SCALE_AT + ((w * 4 + g) * 16 + n) * 4) // 4,
+            (_K_SCALES + ((w * 4 + g) * 16 + n) * 4) // 4,
             vec_width=1,
             dtype=T.i32,
             cache_modifier=cm,
         )
     )
-    vbase = (KV_V_DATA_AT + ((w * 4 + g) * 128 + 8 * n) * 4) // 4
+    vbase = (_V_DATA + ((w * 4 + g) * 128 + 8 * n) * 4) // 4
     vd = [
         _V(
             bo.buffer_load(
@@ -113,7 +147,7 @@ def load_quarter(r_page, w, n, g, cm=0):
     vs = _V(
         bo.buffer_load(
             r_page,
-            (KV_V_SCALE_AT + (n // 2) * 128 + w * KPW + 8 * g) // 4,
+            (_V_SCALES + (n // 2) * 128 + w * KPW + 8 * g) // 4,
             vec_width=2,
             dtype=T.i32,
             cache_modifier=cm,
@@ -131,14 +165,14 @@ def dequant_quarter(raw, key_mask):
     kd, ks, vd, vs = raw
     kf = []
     for st in range_constexpr(2):
-        ksc = cvt_fp8x2_f16(ks, st == 1)  # [group 2 g, 2 g + 1] of row st
+        ksc = _cvt_fp8x2_f16(ks, st == 1)  # [group 2 g, 2 g + 1] of row st
         row = []
         for s in range_constexpr(4):
             sv = _V.from_elements([ksc[s // 2], ksc[s // 2]], fx.Float16)
             row.append(
                 _V.from_elements(
                     [
-                        (cvt_fp4x2_f16(kd[st][s], i) * sv).bitcast(fx.Int32)[0]
+                        (_cvt_fp4x2_f16(kd[st][s], i) * sv).bitcast(fx.Int32)[0]
                         for i in range_constexpr(4)
                     ],
                     fx.Int32,
@@ -147,7 +181,7 @@ def dequant_quarter(raw, key_mask):
         kf.append(row)
     scales = []
     for h in range_constexpr(2):
-        scales += [cvt_fp8x2_f16(vs[h], False), cvt_fp8x2_f16(vs[h], True)]
+        scales += [_cvt_fp8x2_f16(vs[h], False), _cvt_fp8x2_f16(vs[h], True)]
     words = [
         vd[0][0],
         vd[0][1],
@@ -165,7 +199,7 @@ def dequant_quarter(raw, key_mask):
             _V.from_elements(
                 [
                     (
-                        (cvt_fp4x2_f16(words[dt], i) * scales[i]).bitcast(fx.Int32)[0]
+                        (_cvt_fp4x2_f16(words[dt], i) * scales[i]).bitcast(fx.Int32)[0]
                         & key_mask[i]
                     )
                     for i in range_constexpr(4)
@@ -237,7 +271,7 @@ def split_nvfp4_task(
     for st in range_constexpr(2):
         acc = _V.filled(4, 0.0, fx.Float32)
         for s in range_constexpr(4):
-            acc = mfma_f16(kf[st][s], qb[s], acc)
+            acc = _mfma_f16(kf[st][s], qb[s], acc)
         sc.append([_masked(acc[e] * c, nl - 1 - (4 * st + e)) for e in range(4)])
     # head l16's max over this wave's 32 keys: its 8, then the four lane groups
     m = sc[0][0]
@@ -265,14 +299,14 @@ def split_nvfp4_task(
     if g4 == 0:
         fx.ptr_store(ls, hst + (WAVES * H + wave * H + l16))
     pt = _V.from_elements(
-        [pk_f16(p[st][2 * h], p[st][2 * h + 1]) for st in range(2) for h in range(2)],
+        [_pk_f16(p[st][2 * h], p[st][2 * h + 1]) for st in range(2) for h in range(2)],
         fx.Int32,
     )
     # O^T tile dt: lane (n, g) rows 4 g + e = dims 32 g + 8 e + dt of head n
     for e in range_constexpr(4):
         outs = []
         for dt in range_constexpr(8):
-            cv = mfma_f16(vf[dt], pt, _V.filled(4, 0.0, fx.Float32))
+            cv = _mfma_f16(vf[dt], pt, _V.filled(4, 0.0, fx.Float32))
             outs.append(cv[e])
         base = opart + (wave * O_K + l16 * HEAD_DIM + 32 * g4 + 8 * e)
         fx.ptr_store(_V.from_elements(outs[:4], fx.Float32), base)
@@ -307,11 +341,12 @@ def split_nvfp4_task(
     gpu.barrier()
 
 
-def build_split_nvfp4_kernel(sm_scale: float, tasks: int):
+def build_split_nvfp4_kernel(sm_scale: float, tasks: int, timed: bool = False):
     """``@flyc.jit`` launcher of ``tasks`` split tasks alone, one CTA each (K4's
     harness): task ts = (token ts // N_SPLIT, partition ts % N_SPLIT); ``tables``
     [tasks][32] i32 (16 page-16 ids, n_ctx at 16), ``q`` bf16 [token][O_K], the cache,
-    the f32 global scales [k, v]; writes ``sp_o`` bf16 [ts][O_K], ``sp_m`` / ``sp_l`` f32 [ts][H].
+    the f32 global scales [k, v]; writes ``sp_o`` bf16 [ts][O_K], ``sp_m`` / ``sp_l`` f32 [ts][H]. ``timed``:
+    ``sp_l`` is followed by an i32 [tasks] of the task's ``s_memrealtime`` ticks (100 MHz), first load of its page list to its last put.
     """
     assert 1 <= tasks <= BLOCKS
 
@@ -325,12 +360,13 @@ def build_split_nvfp4_kernel(sm_scale: float, tasks: int):
         "minimax_m3_split_nvfp4",
         s=tasks,
         sm=int(sm_scale * 1e6),
+        t=int(timed),
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[THREADS, 1, 1])
     def split_kernel(
         tables: Int64, q: Int64, kv: Int64, gs: Int64, sp_o: Int64, sp_m: Int64,
-        sp_l: Int64,
+        sp_l: Int64, tl: Int64,
     ):  # fmt: skip
         tid = fx.thread_idx.x
         ts = fx.block_idx.x
@@ -348,6 +384,7 @@ def build_split_nvfp4_kernel(sm_scale: float, tasks: int):
                 blk + tid,
             )
         gpu.barrier()
+        t0 = memrealtime()
         n_ctx = uniform(fx.ptr_load(blk + 16))
         kg = fx.Float32(bo.buffer_load(rsrc(gs), 0, vec_width=1, dtype=T.f32))
         vg = fx.Float32(bo.buffer_load(rsrc(gs), 1, vec_width=1, dtype=T.f32))
@@ -374,14 +411,17 @@ def build_split_nvfp4_kernel(sm_scale: float, tasks: int):
             tid, lane, wave, ts // N_SPLIT, ts % N_SPLIT, blk, q, kv, kg, vg,
             sm_scale, lds.hst.ptr, lds.opart.ptr, n_ctx, put_o, put_m, put_l,
         )  # fmt: skip
+        if const_expr(timed):  # noqa: SIM102
+            if tid == 0:
+                bo.buffer_store(fx.Int32(memrealtime() - t0), rsrc(tl), ts)
 
     @launcher(kernel_name)
     def launch_split(
         tables: Int64, q: Int64, kv: Int64, gs: Int64, sp_o: Int64, sp_m: Int64,
-        sp_l: Int64, stream: fx.Stream = _CURRENT_STREAM,
+        sp_l: Int64, tl: Int64, stream: fx.Stream = _CURRENT_STREAM,
     ):  # fmt: skip
         _ = (sm_scale, tasks)  # build parameters
-        split_kernel(tables, q, kv, gs, sp_o, sp_m, sp_l).launch(
+        split_kernel(tables, q, kv, gs, sp_o, sp_m, sp_l, tl).launch(
             grid=(tasks,), block=(THREADS,), stream=stream
         )
 

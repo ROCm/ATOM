@@ -129,7 +129,7 @@ REFUSALS = [  # (config change, message): one row per refusal reason
     ({"index_cache_dtype": "fp8"}, "needs --index-cache-dtype fp4, got fp8"),
     ({"sequence_parallel_size": 2}, "sequence-parallel-size > 1"),
     ({"torch_dtype": torch.float16}, "needs a bfloat16 model"),
-    ({"kv_transfer_config": {"kv_connector": "lmcache_offload"}}, "KV offload"),
+    ({"kv_transfer_config": {"kv_connector": "lmcache_offload"}}, "lmcache_offload connector only"),  # no offload role
     # EAGLE3 / MTP share the target's pool: an fp4 draft has no layout
     ({"speculative_config": SimpleNamespace(draft_kv_dtype="fp4")}, "draft would"),
     ({"hf": sparse_hf(freq=[1, 1, 0, 1])}, NOT_SPARSE),  # one dense layer
@@ -229,33 +229,25 @@ def test_an_own_pool_draft_has_the_targets_dtype_bf16_under_fp4(
     assert config.speculative_config.draft_kv_dtype == want
 
 
-def test_a_shared_pool_draft_has_the_targets_dtype_and_fp4_beside_offload_refuses(
+def test_a_shared_pool_draft_has_the_targets_dtype_and_fp4_runs_beside_offload(
     monkeypatch,
 ):
     for target in ("bf16", "fp8", "fp4"):
         assert resolve_draft_kv_dtype(target, own_pool=False) == target
-    with pytest.raises(ValueError, match="KV offload"):  # not for its bf16 draft
+    # the in-process offload copies every published region as opaque bytes
+    _m3(
+        monkeypatch,
+        kv_cache_dtype="fp4",
+        kv_transfer_config=OFFLOAD,
+        speculative_config=_dspark_spec(),
+        **FP4,
+    )
+    with pytest.raises(ValueError, match="lmcache_offload connector only"):  # P/D still refuses
         _m3(
             monkeypatch,
             kv_cache_dtype="fp4",
-            kv_transfer_config=OFFLOAD,
+            kv_transfer_config={"kv_connector": "mooncake", "kv_role": "kv_both"},
             speculative_config=_dspark_spec(),
-            **FP4,
-        )
-
-
-@pytest.mark.parametrize("asked", [None, "bf16"])
-def test_beside_offload_an_fp4_targets_bf16_draft_is_refused_asked_for_or_not(
-    monkeypatch, asked
-):
-    spec = _dspark_spec()
-    spec.kv_cache_dtype = asked
-    with pytest.raises(ValueError, match="draft KV dtype bf16 differs.*fp4"):
-        _m3(
-            monkeypatch,
-            kv_cache_dtype="fp4",
-            kv_transfer_config=OFFLOAD,
-            speculative_config=spec,
             **FP4,
         )
 

@@ -1139,8 +1139,6 @@ class DeepseekV2MoE(nn.Module):
         # computation using a separate CUDA stream. Registered as a custom op
         # (dual_stream_moe_forward) so it is opaque to torch.compile/Dynamo.
         self._use_dual_stream = False
-        self._dual_stream_token_threshold = envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
-        self._dual_stream_decode_token_threshold = self._dual_stream_token_threshold
         self.alt_stream = alt_stream
         self.prefix = prefix
         self.is_rocm_aiter_fusion_shared_expert_enabled = (

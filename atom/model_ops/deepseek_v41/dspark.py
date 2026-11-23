@@ -17,7 +17,6 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE, fp8_groups
 from atom.model_ops.deepseek_v41.draft_block import DraftSrcIndices
-from atom.model_ops.deepseek_v41.mhc import write_stream_state
 from atom.model_ops.sparse_attn_v4 import sparse_attn
 from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src
 
@@ -437,6 +436,43 @@ def draft_step_indices(positions: torch.Tensor, ring: int, window: int, width: i
     return out_positions, out_indices, out_context
 
 
+@triton.jit
+def _block_state_kernel(
+    anchor_ptr,  # [B, H] the anchor token's embedding
+    noise_ptr,  # [H] the noise token's, identical for every step
+    residual_ptr,  # [B, T, M, H]
+    pre_mix_ptr,  # [B, T, M] fp32
+    hidden,
+    width,
+    M: tl.constexpr,  # hc_mult
+    BLOCK_H: tl.constexpr,
+):
+    row = tl.program_id(0)  # flat (batch, draft position)
+    batch = row // width
+    pos = row % width
+    offs = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = offs < hidden
+
+    # Position 0 carries the anchor; the rest carry the same noise row, which
+    # is why only the anchors are embedded per step.
+    src = tl.where(pos == 0, anchor_ptr + batch.to(tl.int64) * hidden, noise_ptr)
+    value = tl.load(src + offs, mask=mask)
+
+    # The mHC state starts as `hc_mult` copies of the embedding. Writing them
+    # here is the same bytes the `expand().contiguous()` wrote, minus reading
+    # the row back out of HBM to do it.
+    dst = residual_ptr + row.to(tl.int64) * M * hidden
+    for stream in tl.static_range(M):
+        tl.store(dst + stream * hidden + offs, value, mask=mask)
+
+    if tl.program_id(1) == 0:
+        streams = tl.arange(0, M)
+        tl.store(
+            pre_mix_ptr + row.to(tl.int64) * M + streams,
+            tl.where(streams == 0, 1.0, 0.0).to(tl.float32),
+        )
+
+
 def build_block_state(anchor_embed, noise_embed, width, hc_mult):
     """The draft block's `(residual, pre_mix)`, from the anchors alone.
 
@@ -447,8 +483,7 @@ def build_block_state(anchor_embed, noise_embed, width, hc_mult):
     which only `B` differ: the noise row is the same every step, so it is
     embedded once and cached, and the collective shrinks by `width`.
 
-    Returns what `SinglePassHCState.from_embeddings` returned, in one launch
-    of the kernel that builds it (`write_stream_state`, anchor then noise):
+    Returns what `SinglePassHCState.from_embeddings` returned, in one launch:
     `residual [B, width, hc_mult, H]` and `pre_mix [B, width, hc_mult]`.
     """
     batch, hidden = anchor_embed.shape
@@ -464,15 +499,19 @@ def build_block_state(anchor_embed, noise_embed, width, hc_mult):
         batch, width, hc_mult, device=anchor_embed.device, dtype=torch.float32
     )
     rows = batch * width
-    write_stream_state(
-        residual.view(rows, hc_mult, hidden),
-        pre_mix.view(rows, hc_mult),
-        anchor_embed,
-        fill=noise_embed,
-        width=width,
-        # The tile this launch was measured at for draft batches.
-        block_h=1024,
-    )
+    if rows:
+        block = 1024
+        _block_state_kernel[(rows, triton.cdiv(hidden, block))](
+            anchor_embed,
+            noise_embed,
+            residual,
+            pre_mix,
+            hidden,
+            width,
+            M=hc_mult,
+            BLOCK_H=block,
+            num_warps=4,
+        )
     return residual, pre_mix
 
 

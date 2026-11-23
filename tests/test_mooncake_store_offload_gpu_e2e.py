@@ -30,7 +30,6 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from atom.config import KVCacheTensor
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
     LoadOperationId,
@@ -131,8 +130,7 @@ def _config():
 def _kv_caches(device):
     """Two GLM-5.2-like layers: 576-byte MLA rows and 144-byte indexer rows."""
     return {
-        f"layer_{layer}": KVCacheTensor(
-            layer_num=layer,
+        f"layer_{layer}": SimpleNamespace(
             k_cache=torch.randint(
                 0, 256, (NUM_BLOCKS * BLOCK, 1, 576), dtype=torch.uint8, device=device
             ),
@@ -234,8 +232,7 @@ def test_kv_round_trip_through_the_store(monkeypatch, layout):
             assert isinstance(worker._codec, DSV4PageSlotCodec)
         for cache in all_caches.values():
             for tensor in vars(cache).values():
-                if isinstance(tensor, torch.Tensor) and tensor.numel():
-                    tensor.reshape(NUM_BLOCKS, -1)[DESTINATION[0] :].zero_()
+                tensor.reshape(NUM_BLOCKS, -1)[DESTINATION[0] :].zero_()
         torch.cuda.synchronize(device)
 
         tokens = torch.randint(0, 150_000, (PROMPT,)).tolist()
@@ -299,11 +296,10 @@ def test_kv_round_trip_through_the_store(monkeypatch, layout):
         torch.cuda.synchronize(device)
         for name, cache in all_caches.items():
             for field, tensor in vars(cache).items():
-                if isinstance(tensor, torch.Tensor) and tensor.numel():
-                    blocks = tensor.reshape(NUM_BLOCKS, -1)
-                    assert torch.equal(
-                        blocks[DESTINATION], blocks[SOURCE]
-                    ), f"{name}.{field} differs after the Store round trip"
+                blocks = tensor.reshape(NUM_BLOCKS, -1)
+                assert torch.equal(
+                    blocks[DESTINATION], blocks[SOURCE]
+                ), f"{name}.{field} differs after the Store round trip"
         assert worker._pool.quarantined("save") == 0
         assert worker._pool.quarantined("load") == 0
     finally:

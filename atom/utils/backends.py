@@ -460,14 +460,37 @@ def _hash_traced_files(files) -> str:
     content = []
     for filepath in files:
         content.append(filepath)
-        if filepath.startswith("<"):
-            # Not a file: the function was dynamically generated (exec()'s
-            # "<string>") or lives in a frozen stdlib module ("<frozen os>",
-            # "<frozen genericpath>", ...). We can't actually check these.
+        if filepath == "<string>" or filepath == "<frozen os>":
+            # This means the function was dynamically generated, with
+            # e.g. exec() or frozen os module. We can't actually check these.
             continue
         with open(filepath) as f:
             content.append(f.read())
     return hashlib.md5("\n".join(content).encode(), usedforsecurity=False).hexdigest()
+
+
+# p1 (integrated): graph-affecting flags of our branch (all default off)
+_P1_GRAPH_FLAGS = (
+    "ATOM_M3_AK_DECODE_QOUT",
+    "ATOM_MINIMAX_AK_AR_NORM",
+    "ATOM_P1_FRONT_QKV_CHAIN",
+    "ATOM_P1_AR_QKV_CODES",
+    "ATOM_P1_L4_PULLQ",
+    "ATOM_P1_L2_D2",
+    "ATOM_P1_K2_SCORER",
+    "ATOM_P1_FAST_CONCAT",
+    "ATOM_M3_DRAFT_POS_MAJOR",
+    "ATOM_M3_DRAFT_MARKOV_WIDE",
+    "ATOM_M3_VERIFY_HEAD_CHUNK_TUNED",
+    "ATOM_M3_DRAFT_FUSED_CTX_ROPE",
+    "ATOM_M3_DRAFT_AK_AR_NORM",
+    "ATOM_M3_DRAFT_CTX_OVERLAP_MIN_ROWS",
+    "ATOM_DG_LMHEAD_AK",
+    "ATOM_P1_LMHEAD_RING",
+    "ATOM_P1_DRAFT_FC_AK",
+    "ATOM_P1_DRAFT_MARKOV_PERSIST",
+    "ATOM_DG_DENSE_AK",
+)
 
 
 class VllmBackend:
@@ -598,6 +621,12 @@ class VllmBackend:
             # 3. compiler hash
             compiler_hash = self.compiler_manager.compute_hash(vllm_config)
             factors.append(compiler_hash)
+            # p1 (integrated): these flags change the traced graph at runtime (same traced
+            # files), so each one that is on keys the cache; all off leaves the hash as is
+            for _p1_flag in _P1_GRAPH_FLAGS:
+                _p1_val = os.environ.get(_p1_flag, "0")
+                if _p1_val not in ("", "0"):
+                    factors.append(f"{_p1_flag}={_p1_val}")
 
             # combine all factors to generate the cache dir
             import hashlib

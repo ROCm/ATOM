@@ -19,7 +19,6 @@ use crate::{
 };
 
 pub(crate) mod chat_template;
-pub(crate) mod fast_tokenizer;
 pub mod generation_payload;
 pub(crate) mod parser_factory_lookup;
 pub mod response_context;

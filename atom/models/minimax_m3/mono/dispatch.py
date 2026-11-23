@@ -13,6 +13,7 @@ that disagreed would wait on each other forever (a per-rank flag such as
 ``is_dummy_run`` must never gate this).
 """
 
+import json
 import logging
 
 import torch
@@ -35,6 +36,13 @@ from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
+
+# p1/mono (default 16 = every step mono can serve): the largest decode step (rows, pad included) routed to mono;
+# larger steps take the original model with the p1 flags. TP4 decode_bench: mono wins at 8 rows (k7 G1 -0.47/-0.28 ms,
+# k3 G1/G2 by estimate), loses at 16 rows (k7 G2). Read once at import, so every rank and every capture agrees.
+import os as _os
+
+_P1_MONO_MAX_ROWS = int(_os.environ.get("ATOM_P1_MONO_MAX_ROWS", "16"))
 
 
 def _uses_dspark(atom_config) -> bool:
@@ -87,6 +95,14 @@ class MonoDecode:
         self._lm = causal_lm
         self._uses_dspark = _uses_dspark(atom_config)
         self._drafter = None
+        # decode steps by token count, [original, mono]; the rows of the graphs
+        # captured on mono
+        self.steps: dict[bool, dict[int, int]] = {False: {}, True: {}}
+        self._graph_mono: set[int] = set()
+        self._counted = 0
+        # set per step from the batch (the engine's GPU guard), so TP-uniform
+        self.blocked = False
+        self._stats_every = envs.ATOM_MONO_STATS_EVERY
         # created on its first eligible step (``LazyRunner``)
         self._mono = LazyRunner(
             lambda: MonoDecodeRunner(
@@ -111,6 +127,11 @@ class MonoDecode:
             raise RuntimeError("cannot bind a DSpark drafter after Mono starts")
         self._drafter = drafter
 
+    def set_blocked(self, blocked: bool) -> None:
+        """Another process is on the TP GPUs (``atom.utils.gpu_guard``): a Mono
+        step could not finish while its kernels hold a CU, so none starts."""
+        self.blocked = blocked
+
     def supports(
         self,
         input_ids: torch.Tensor,
@@ -120,10 +141,58 @@ class MonoDecode:
     ) -> bool:
         if input_ids is None or not self._mono.enabled:
             return False
+        ok = self._supports(input_ids, positions, intermediate_tensors, inputs_embeds)
+        if not self._stats_every:
+            return ok
+        # a captured graph's forward runs once, at capture: its replays are
+        # counted by ``note_replay``; eager decode steps count here
+        n = input_ids.numel()
+        if torch.cuda.is_current_stream_capturing():
+            if ok:
+                self._graph_mono.add(n)
+        elif ok or self._is_decode():
+            self._count(n, ok)
+        return ok
+
+    def _is_decode(self) -> bool:
+        ctx = get_forward_context().context
+        return ctx is not None and not ctx.is_prefill
+
+    def note_replay(self, n: int) -> None:
+        """A decode step replayed an n-row graph: mono's if its capture took mono."""
+        if self._stats_every:
+            self._count(n, n in self._graph_mono)
+
+    def _count(self, n: int, mono: bool) -> None:
+        self.steps[mono][n] = self.steps[mono].get(n, 0) + 1
+        self._counted += 1
+        if self._counted % self._stats_every:
+            return
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        stats = {
+            "mono": dict(sorted(self.steps[True].items())),
+            "original": dict(sorted(self.steps[False].items())),
+        }
+        if rank == 0:
+            logger.info("MiniMax-M3 mono steps by token count: %s", stats)
+        path = envs.ATOM_MONO_STATS_FILE  # a bench's proof, one file a rank
+        if path:
+            with open(f"{path}.rank{rank}.json", "w") as f:
+                json.dump(stats, f)
+
+    def _supports(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors,
+        inputs_embeds,
+    ) -> bool:
+        if not self._mono.enabled or self.blocked:
+            return False
         n = input_ids.numel()  # a cudagraph's pad rows included
         if intermediate_tensors is not None or inputs_embeds is not None:
             return False
-        if not 1 <= n <= MAX_TOKENS:
+        if not 1 <= n <= min(MAX_TOKENS, _P1_MONO_MAX_ROWS):
             return False
         # the kernels read every token's position and slot as an int64's low word
         if positions.dtype != torch.int64:
@@ -186,7 +255,57 @@ class MonoDecode:
 def install_mono_decode(
     model: torch.nn.Module, _atom_config, drafter, *, metadata_builder=None
 ):
-    """Bind MiniMax's in-model Mono router after drafter hooks are armed."""
+    """Bind MiniMax's in-model Mono router after drafter hooks are armed.
+
+    The runner reports each cudagraph replay as ``model.mono_note_replay(n)``;
+    it is attached here so the model definition carries no counter hook.
+    """
     if drafter is not None:
         model.bind_mono_drafter(drafter)
+    lm = getattr(model, "language_model", model)
+    model.mono_note_replay = lm._mono.note_replay
+    runner = getattr(metadata_builder, "model_runner", None)
+    if (
+        envs.ATOM_M3_VERIFY_HEAD
+        and drafter is not None
+        and getattr(drafter, "is_block_drafter", False)
+        and getattr(drafter, "lossless", None) is None
+        and runner is not None
+        and hasattr(lm, "lm_head")
+        and hasattr(lm.lm_head, "vocab_start_idx")
+    ):
+        from atom.models.minimax_m3.verify_head import M3VerifyHead
+
+        lm._verify_head = M3VerifyHead(lm, runner, drafter)
+        logger.info("MiniMax-M3 DSpark verify head in the decode graph")
+    draft = getattr(drafter, "model", None)
+    if (
+        envs.ATOM_M3_DRAFT_CTX_IN_GRAPH
+        and draft is not None
+        and hasattr(draft, "write_context_rows")
+        and drafter.captures_aux
+        and draft.kv_pool_spec is None
+        and atom_config_dcp(_atom_config) == 1
+    ):
+        aux = drafter._aux_buffers
+
+        def write_context(positions, slot_mapping, stream=None):
+            n = positions.shape[0]
+            return draft.write_context_rows(
+                [b[:n] for b in aux], positions, slot_mapping, stream=stream
+            )
+
+        lm._draft_context_writer = write_context
+        draft.context_in_target = True
+        logger.info("MiniMax-M3 DSpark draft context K/V in the decode graph")
+    # the GPU guard's switch, and the token counts of the graphs it must not replay
+    model.mono_set_blocked = lm._mono.set_blocked
+    model.mono_graph_tokens = lm._mono._graph_mono
+    # the most rows a Mono step serves (0: Mono off); the runner fences its
+    # async copies off such steps
+    model.mono_rows_max = MAX_TOKENS if lm._mono._mono.enabled else 0
     return model
+
+
+def atom_config_dcp(atom_config) -> int:
+    return int(getattr(atom_config, "decode_context_parallel_size", 1) or 1)

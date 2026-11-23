@@ -1899,3 +1899,47 @@ def minimax_m3_index_topk_decode(
         pages_per_block=pages_per_block,
     )
     return (topk_idx, *emit_out) if emit_out else topk_idx
+
+
+def minimax_m3_index_score_decode(
+    idx_q: torch.Tensor,  # [total_q == batch*max_query_len, num_idx_heads, head_dim]
+    index_kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    max_query_len: int,
+    sm_scale: float,
+    index_scorer,
+) -> torch.Tensor:
+    """The FP4 decode scorer of :func:`minimax_m3_index_topk_decode` alone: the fp32 block
+    scores ``[num_idx_heads, total_q, index_scorer.max_block]`` in the step's workspace, for
+    a consumer that selects the top-k itself (the fused NVFP4 decode attention). Same
+    requirements as the scorer branch there (the step's work map, a fixed ``max_block``)."""
+    total_q, num_idx_heads, _ = idx_q.shape
+    if index_scorer is None or index_scorer.work_map is None:
+        raise ValueError("the FP4 index decode needs the step's index_scorer with a work map")
+    max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
+    score_max_block = index_scorer.max_block
+    if max_block > score_max_block:
+        raise ValueError(
+            f"a context of {max_seq_len} tokens is wider than the {score_max_block} "
+            "blocks the index scorer's work map was built at"
+        )
+    views, _, score_decode = _fp4_index_ops(index_scorer)
+    score_out = index_scorer.scores.logits(
+        num_idx_heads * total_q, score_max_block
+    ).view(num_idx_heads, total_q, score_max_block)
+    k_data, k_scale = views(index_kv_cache)
+    return score_decode(
+        idx_q,
+        k_data,
+        k_scale,
+        block_table,
+        seq_lens,
+        max_query_len,
+        num_idx_heads,
+        sm_scale,
+        score_max_block,
+        work_map=index_scorer.work_map,
+        out=score_out,
+    )

@@ -12,10 +12,9 @@ trees' kernels on the pages it wrote:
   equal aiter's NVFP4 scorer (``k_round="e4m3"``, e4m3 q) on the pages K1 wrote, with K1's own index q, bit
   for bit (blocks that hold no new token: K1 standalone does not wait for them).
 
-The vLLM reference is not part of this repo: ``ATOM_NVFP4_VLLM_REF`` (vLLM's
-``tests/kernels/attention``); the test skips without it. The scorer is the installed
-aiter's, or the one in ``ATOM_NVFP4_AITER_KERNELS`` (an aiter ``aiter/ops/flydsl/kernels``
-directory) when that is set."""
+The reference trees are not part of this repo: ``ATOM_NVFP4_AITER_KERNELS`` (aiter's
+``aiter/ops/flydsl/kernels`` of the nvfp4 index scorer) and ``ATOM_NVFP4_VLLM_REF``
+(vLLM's ``tests/kernels/attention``); the test skips without them."""
 
 import os
 import sys
@@ -30,14 +29,14 @@ VLLM_REF = os.environ.get("ATOM_NVFP4_VLLM_REF")
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
     or "gfx950" not in torch.cuda.get_device_properties(0).gcnArchName
+    or not KERNELS
     or not VLLM_REF,
-    reason="needs gfx950 and the vLLM nvfp4 reference (see the module doc)",
+    reason="needs gfx950 and the nvfp4 reference trees (see the module doc)",
 )
 
 from aiter import dtypes
 from aiter.ops.shuffle import shuffle_weight
 
-from atom.model_ops.minimax_m3.nvfp4_pages import INDEX_PAGE_BYTES
 from atom.models.minimax_m3.mono.config import (
     HEAD_DIM,
     HIDDEN,
@@ -48,7 +47,7 @@ from atom.models.minimax_m3.mono.config import (
     ROTARY_DIM,
     qkv_rows,
 )
-from atom.models.minimax_m3.mono.kernels.common import KV_PAGE_BYTES
+from atom.models.minimax_m3.mono.kernels.common import KV_PAGE_BYTES, NVFP4_PAGE_BYTES
 from atom.models.minimax_m3.mono.kernels.pre_attn import (
     K1_ABI,
     SCRATCH_BYTES,
@@ -62,43 +61,16 @@ SM_SCALE = HEAD_DIM**-0.5
 ROWS = qkv_rows(1)
 
 
-SCORER = "aiter.ops.flydsl.kernels.minimax_m3_index_score"
-
-
-@pytest.fixture
-def refs(monkeypatch):
-    """(aiter's NVFP4 index scorer module, vLLM's reference module); the import path,
-    the kernels package's path and ``sys.modules`` (the modules imported from the
-    trees gone, the ones they replaced back) are put back after the test."""
-    import importlib
-
+def _reference_modules():
     import aiter.ops.flydsl.kernels as pkg
 
-    modules = dict(sys.modules)
-    trees = tuple(os.path.abspath(t) for t in (KERNELS, VLLM_REF) if t)
-    try:
-        if KERNELS:
-            monkeypatch.setattr(pkg, "__path__", [KERNELS, *pkg.__path__])
-            monkeypatch.setattr(pkg, SCORER.rsplit(".", 1)[1], None, raising=False)
-            sys.modules.pop(SCORER, None)
-        monkeypatch.syspath_prepend(VLLM_REF)
-        sys.modules.pop("minimax_m3_nvfp4_ref", None)
-        yield importlib.import_module(SCORER), importlib.import_module(
-            "minimax_m3_nvfp4_ref"
-        )
-    finally:
-        _restore_modules(modules, trees)
+    pkg.__path__.insert(0, KERNELS)
+    from aiter.ops.flydsl.kernels import minimax_m3_index_score as scorer
 
+    sys.path.insert(0, VLLM_REF)
+    import minimax_m3_nvfp4_ref as ref
 
-def _restore_modules(before, trees):
-    """Every module in ``sys.modules`` loaded from a directory of ``trees``: back to
-    ``before``'s, or gone."""
-    for name, mod in list(sys.modules.items()):
-        if (getattr(mod, "__file__", None) or "").startswith(trees):
-            if name in before:
-                sys.modules[name] = before[name]
-            else:
-                del sys.modules[name]
+    return scorer, ref
 
 
 class _Case:
@@ -155,7 +127,7 @@ class _Case:
                 (self.total_blocks, KV_PAGE_BYTES), 0x5A, device=dev, dtype=torch.uint8
             )
             idx = torch.zeros(
-                self.total_blocks, INDEX_PAGE_BYTES, device=dev, dtype=torch.uint8
+                self.total_blocks, NVFP4_PAGE_BYTES, device=dev, dtype=torch.uint8
             )
             ref.insert_nvfp4_index(
                 idx.view(self.total_blocks, 1, -1),
@@ -258,8 +230,8 @@ def _fp8_rows(o, case):
 
 
 @pytest.mark.parametrize("tokens, ctx", [(1, 300 * 128 + 5), (4, 40 * 128 + 77)])
-def test_k1_nvfp4_pages_and_scores(refs, tokens, ctx):
-    scorer, ref = refs
+def test_k1_nvfp4_pages_and_scores(tokens, ctx):
+    scorer, ref = _reference_modules()
     case = _Case(ref, tokens, ctx)
     k_gs, v_gs = 0.8, 1.7
     f8 = case.run(False)
@@ -318,10 +290,10 @@ def test_k1_nvfp4_pages_and_scores(refs, tokens, ctx):
 
     # scores: aiter's e4m3 NVFP4 scorer on the pages K1 wrote, with K1's own index q as e4m3
     kd_t = torch.as_strided(
-        idx, (case.total_blocks, 128, 64), (INDEX_PAGE_BYTES, 64, 1)
+        idx, (case.total_blocks, 128, 64), (NVFP4_PAGE_BYTES, 64, 1)
     )
     ks_t = torch.as_strided(
-        idx, (case.total_blocks, 128, 8), (INDEX_PAGE_BYTES, 8, 1), 128 * 64
+        idx, (case.total_blocks, 128, 8), (NVFP4_PAGE_BYTES, 8, 1), 128 * 64
     )
     want_s = scorer.score_flydsl_nvfp4(
         nv["iq_out"].view(tokens, 1, HEAD_DIM).float().clamp(-448, 448).to(torch.float8_e4m3fn),

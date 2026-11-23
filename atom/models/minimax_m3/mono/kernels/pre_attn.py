@@ -123,8 +123,7 @@ SCRATCH_X8S = SCRATCH_X8 + MAX_TOKENS * HIDDEN // 4 * 8  # and their scales
 # fused layer kernel only: a head task's / the residual's done flags
 SCRATCH_HDONE = SCRATCH_X8S + MAX_TOKENS * 8
 SCRATCH_RDONE = SCRATCH_HDONE + MAX_TOKENS * N_HEAD_TASKS * 8
-# ``attn_mxfp8``, S > 2: the norm tasks' per-1x32 E8M0 codes, 4 to a word (plain, behind x8s's flags);
-# last: a runner without ``attn_mxfp8`` zeroes the scratch up to here
+# ``attn_mxfp8``, S > 2: the norm tasks' per-1x32 E8M0 codes, 4 to a word (plain, behind x8s's flags)
 SCRATCH_XSC = SCRATCH_RDONE + MAX_TOKENS * 8
 SCRATCH_BYTES = SCRATCH_XSC + MAX_TOKENS * (HIDDEN // 128) * 4
 K_SCALE_BYTES = HIDDEN // 32  # an MXFP8 weight row's scale bytes
@@ -793,7 +792,7 @@ def emit_k1(
     tid, bid, lane, wave, x8, red, qs, stamp, layer, eps, index_scale, tokens,
     q_len, init_blocks, local_blocks, heads, ptrs, bt_width, signal=False, diag=None,
     region_ids=None, index_topk=True, dense=False, plain_norm=False, kv_nvfp4=False,
-    index_nvfp4=False, attn_mxfp8=False, xsc=None, alloc=None,
+    index_nvfp4=False, attn_mxfp8=False, xsc=None,
 ):  # fmt: skip
     """K1 whole: the GEMV / head / norm tasks, then every CTA's indexer scores
     (``index_topk``; else the layer reuses a selection: no index q / k, no scores).
@@ -806,8 +805,7 @@ def emit_k1(
     ``index_nvfp4``: the K/V pool / index cache hold NVFP4 pages (``emit_pre_attn``);
     the scores read them with the dims in the order the dequantized tile has.
     ``attn_mxfp8``: native MXFP8 1x32 qkv (``emit_pre_attn``); ``xsc``: the codes' LDS,
-    ``tokens * XSC_ROW`` words. ``alloc``: the kernel's ``fx.SharedAllocator``
-    (``emit_index_scores``)."""
+    ``tokens * XSC_ROW`` words."""
     (
         ar, res, h_out, g_in, w_qkv, s_qkv, g_q, g_k, g_iq, g_ik, cos_sin, positions,
         slot_mapping, k_cache, v_cache, k_scale, v_scale, index_cache, q_out, iq_out,
@@ -926,7 +924,6 @@ def emit_k1(
             q_frag, tokens, q_len, init_blocks, local_blocks, index_scale, index_cache,
             block_table, seq_lens, bt_width, wait_new_keys if signal else None,
             make_index_q, heads, q_frag_head, make_index_q_heads, nvfp4=index_nvfp4,
-            alloc=alloc,
         )  # fmt: skip
     stamp(6)
 
@@ -1056,8 +1053,7 @@ def build_pre_attn_kernel(
         bid = fx.block_idx.x
         lane = tid % 64
         wave = tid // 64
-        smem = fx.SharedAllocator()
-        lds = smem.allocate(Smem).peek()
+        lds = fx.SharedAllocator().allocate(Smem).peek()
         x8 = lds.x8.ptr
         red = lds.red.ptr
         tls = lds.tls.ptr
@@ -1085,7 +1081,6 @@ def build_pre_attn_kernel(
             index_nvfp4=index_nvfp4,
             attn_mxfp8=attn_mxfp8,
             xsc=xsc,
-            alloc=smem,
         )  # fmt: skip
         stamp_flush(timeline, tls, tl, tid, bid, TL_POINTS)
 

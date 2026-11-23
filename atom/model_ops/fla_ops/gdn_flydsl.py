@@ -21,40 +21,35 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class GDNFlyDSLPolicy:
-    """Decode policy and physical VK layout are inseparable."""
+    """Resolved at cache binding; decode and physical VK layout are inseparable."""
 
     prefill: bool = False
     decode: bool = False
 
 
-@functools.cache
-def _validated_on_gfx942():
-    # Measurement scope, not a kernel limit: aiter's FlyDSL GDN decode and
-    # prefill (`gdn_prepare_flydsl_supported`) also run on gfx950.
-    from aiter.jit.utils.chip_info import get_gfx_runtime
-
-    return get_gfx_runtime() == "gfx942"
+def decode_device_supported(device):
+    return (
+        torch.version.hip is not None
+        and device.type == "cuda"
+        and torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
+        == "gfx942"
+    )
 
 
 def select_policy(*, allowed, replayssm, lossy_decode, state, activation_dtype):
-    if not allowed:
-        return GDNFlyDSLPolicy()
-    # The ReplaySSM pool does not rule prefill out (prefill reads and writes the
-    # state as logical KV), but under ReplaySSM it runs only on gfx942.
-    prefill_enabled = backend("prefill") != "triton" and (
-        not replayssm or _validated_on_gfx942()
-    )
     # ReplaySSM kernels address a contiguous KV pool. Do not reinterpret it as
-    # VK even when K == V makes the shape identical; keep decode original.
+    # VK even when K == V makes the shape identical. Keep both stages original.
+    if not allowed or replayssm:
+        return GDNFlyDSLPolicy()
+    prefill_enabled = backend("prefill") != "triton"
     decode_enabled = (
-        not replayssm
-        and backend("decode") != "triton"
+        backend("decode") != "triton"
         and not lossy_decode
         and state.ndim == 4
         and state.shape[-2:] == (128, 128)
         and state.dtype in (torch.bfloat16, torch.float32)
         and activation_dtype == torch.bfloat16
-        and _validated_on_gfx942()
+        and decode_device_supported(state.device)
     )
     if not (prefill_enabled or decode_enabled) or ops() is None:
         return GDNFlyDSLPolicy()
@@ -305,7 +300,7 @@ def decode_supported(q, k, v, a, b, state, A_log, dt_bias, reads, writes):
         and reads.is_contiguous()
         and writes.is_contiguous()
         and q.stride(-1) == k.stride(-1) == 1
-        and _validated_on_gfx942()
+        and decode_device_supported(q.device)
     )
 
 

@@ -623,12 +623,7 @@ class TestWarmup:
 
         # No-op by contract: a backend that never copies has nothing to warm,
         # and ModelRunner calls this unconditionally.
-        stub = SimpleNamespace(
-            model_runner=SimpleNamespace(
-                state_runtime=SimpleNamespace(checkpoint_spec=None)
-            )
-        )
-        assert AttentionMetadataBuilder.warmup_per_req_cache(stub) is None
+        assert AttentionMetadataBuilder.warmup_per_req_cache(object()) is None
 
 
 class TestPageUnitRegionsValidateTheirOwnAddresses:

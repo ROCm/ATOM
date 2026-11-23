@@ -15,13 +15,7 @@ from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T, as_ir_value
 
-from atom.model_ops.minimax_m3.nvfp4_pages import (
-    INDEX_DATA_PAGE_BYTES,
-    INDEX_PAGE_BYTES,
-    head_regions,
-    kv_page_bytes,
-)
-from atom.mono.device.mx import FP8_MAX, fp4_pack2
+from atom.mono.device.mx import FP8_MAX
 from atom.mono.device.ops import butterfly, hw_rcp, traced
 
 
@@ -109,6 +103,8 @@ def ar_block_sums(parts, lane, wave, red):
 # e4m3(min(amax * RN(1/6) / gs, 448)), the elements are quantized as x / (gs * that
 # scale as decoded) by the RNE e2m1 convert at scale 1
 _NVFP4_RCP6 = struct.unpack("f", struct.pack("I", 0x3E2AAAAB))[0]
+NVFP4_PAGE_BYTES = 9216
+NVFP4_SCALES_AT = 128 * 64
 
 
 @traced
@@ -139,30 +135,34 @@ def nvfp4_quant16(vals, gs):
         )
     )[0]
     quant = (sv != 0.0).select(fx.Float32(1.0) / (sv * gs), fx.Float32(0.0))
+    one = as_ir_value(fx.Float32(1.0))
     packed = fx.Int32(0)
     for pair in range_constexpr(2):
-        packed = fp4_pack2(
-            packed,
-            vals[2 * pair] * quant,
-            vals[2 * pair + 1] * quant,
-            fx.Float32(1.0),
-            pair,
+        packed = fx.Int32(
+            rocdl.cvt_scalef32_pk_fp4_f32(
+                T.i32,
+                as_ir_value(packed),
+                as_ir_value(vals[2 * pair] * quant),
+                as_ir_value(vals[2 * pair + 1] * quant),
+                one,
+                pair,
+            )
         )
     return code, packed
 
 
 @traced
 def nvfp4_row_store(r_page, slot, vals, l32, cm=0):
-    """Token ``slot`` of a pool of single-buffer nvfp4 index pages (``nvfp4_pages``:
-    128 x 64 B e2m1, low nibble the even dim, then 128 x 8 B e4m3 scales, one per 16
-    dims; no global scale): one 128-element row quantized as vLLM's writer does, by the 32
+    """Token ``slot`` of a pool of single-buffer nvfp4 index pages (9216 B: 128 x 64 B
+    e2m1, low nibble the even dim, then 128 x 8 B e4m3 scales, one per 16 dims; no
+    global scale): one 128-element row quantized as vLLM's writer does, by the 32
     lanes of a half wave holding 4 consecutive elements ``vals`` each (already
     rounded to bf16, as an f32). Lane l writes bytes 2 l, 2 l + 1 of the row's 64
     data bytes; the first lane of each group of 4 writes its scale byte."""
     code, packed = nvfp4_quant16(vals, fx.Float32(1.0))
     page = slot // 128
     t = slot % 128
-    base = page * INDEX_PAGE_BYTES
+    base = page * NVFP4_PAGE_BYTES
     bo.buffer_store(
         fx.Int16(packed & 0xFFFF),
         r_page,
@@ -174,17 +174,20 @@ def nvfp4_row_store(r_page, slot, vals, l32, cm=0):
         bo.buffer_store(
             fx.Int8(code & 0xFF),
             r_page,
-            base + INDEX_DATA_PAGE_BYTES + t * 8 + l32 // 4,
+            base + NVFP4_SCALES_AT + t * 8 + l32 // 4,
             cache_modifier=cm,
             offset_is_bytes=True,
         )
 
 
-# The K / V page of one kv head a rank (TP4; ``nvfp4_pages`` holds the layout):
-# ``[K data | K scale | V data | V scale]``, the regions' byte offsets
-KV_PAGE_BYTES = kv_page_bytes(1)
-KV_K_SCALE_AT = head_regions(0, 0, 1)[1]
-KV_V_DATA_AT, KV_V_SCALE_AT = head_regions(1, 0, 1)
+# The K / V page (128 tokens, 2 * Hkv * 9216 B; ``[K data | K scale | V data | V scale]``,
+# a head's data 8192 B, its scales 1024 B): K data t * 64 + d // 2 (low nibble the even
+# dim), K scale ((((t // 32) * 4 + j // 2) * 16 + n) * 2 + (r % 8) // 4) * 2 + j % 2
+# (r = t % 32, n = 4 * (r // 8) + r % 4, j = d // 16), V data ((t // 8) * 128 + d) * 4 +
+# (t % 8) // 2 with nibble t % 2, V scale j * 128 + t. Hkv = 1 (TP4).
+KV_PAGE_BYTES = 2 * 9216
+KV_V_DATA_AT = 9216
+KV_V_SCALE_AT = 9216 + 8192
 
 
 def nvfp4_k_scale_at(t, j):
@@ -214,7 +217,7 @@ def nvfp4_k_store(r_page, slot, vals, l32, gs, cm=0):
         bo.buffer_store(
             fx.Int8(code & 0xFF),
             r_page,
-            base + KV_K_SCALE_AT + nvfp4_k_scale_at(t, l32 // 4),
+            base + 8192 + nvfp4_k_scale_at(t, l32 // 4),
             cache_modifier=cm,
             offset_is_bytes=True,
         )

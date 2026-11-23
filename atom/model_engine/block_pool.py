@@ -64,6 +64,12 @@ class BlockPool:
     queue on release. New content remains probationary until claimed, so a
     stream of one-off prefixes cannot evict the whole hot set. Vacant blocks
     still go first; referenced blocks are never candidates in either policy.
+
+    `free(block_id, demote=True)` files a still-hashed block in `_demoted`
+    instead: reachable by hash like `_cached`, but spent before any of it (and
+    after the vacant half), least-recently-demoted first. The manager uses it
+    for the blocks a finished request generated into, which a later prompt
+    re-hits only if the client sends that exact output back.
     """
 
     def __init__(
@@ -74,7 +80,6 @@ class BlockPool:
         cache_policy: str = "lru",
         protected_ratio: float = 0.5,
         on_remap: Callable[[int], None] | None = None,
-        reserve_null_block: bool = False,
     ):
         cache_policy = cache_policy.strip().lower()
         if cache_policy not in {"lru", "slru"}:
@@ -90,13 +95,8 @@ class BlockPool:
         # its current size; a pool with a pinned boundary passes neither and
         # gets a maximum equal to its size.
         self.max_blocks: int = num_blocks if max_blocks is None else max_blocks
-        # Zero-padded block tables must never read a raw checkpoint image.
-        self._first_block = int(reserve_null_block)
-        if not self._first_block <= num_blocks <= self.max_blocks:
-            raise ValueError(
-                f"{num_blocks} blocks outside {self._first_block}..{self.max_blocks}"
-            )
-        # Physical exclusive block-ID bound; capacity is num_usable_blocks.
+        if not 0 <= num_blocks <= self.max_blocks:
+            raise ValueError(f"{num_blocks} blocks outside 0..{self.max_blocks}")
         self.num_blocks: int = num_blocks
         self._on_evict = on_evict
         # Called with a hash whose index entry moved to another block id
@@ -111,9 +111,10 @@ class BlockPool:
         # free list (`claim`) or retired, so membership in the set — not
         # presence in a container — is what makes an id free. `pop` skips the
         # stale entries.
-        self._vacant: list[int] = list(range(self._first_block, num_blocks))
+        self._vacant: list[int] = list(range(num_blocks))
         self._cached: OrderedDict[int, None] = OrderedDict()
-        self._free: set[int] = set(self._vacant)
+        self._demoted: OrderedDict[int, None] = OrderedDict()
+        self._free: set[int] = set(range(num_blocks))
         self._used: set[int] = set()
         # Raw PAGE units reserved by multi-unit objects such as state checkpoints.
         self._raw_unit_owner: dict[int, tuple[Hashable, int]] = {}
@@ -133,11 +134,6 @@ class BlockPool:
         self.blocks_retired: int = 0
 
     # ------------------------------- counts -------------------------------- #
-    @property
-    def num_usable_blocks(self) -> int:
-        """Allocation capacity, excluding the reserved padding block."""
-        return self.num_blocks - self._first_block
-
     @property
     def num_free(self) -> int:
         return len(self._free)
@@ -170,7 +166,7 @@ class BlockPool:
         vacant count, which is the number that actually has to reach zero
         before `blocks_evicted` can start moving.
         """
-        return len(self._cached) + len(self._protected)
+        return len(self._cached) + len(self._protected) + len(self._demoted)
 
     def eviction_stats(self) -> dict[str, int]:
         """Content this pool destroyed, and the headroom it has left.
@@ -182,7 +178,7 @@ class BlockPool:
         return {
             "blocks_evicted": self.blocks_evicted,
             "blocks_retired": self.blocks_retired,
-            "blocks_total": self.num_usable_blocks,
+            "blocks_total": self.num_blocks,
             "blocks_used": self.num_used,
             "blocks_free": self.num_free,
             "blocks_free_reusable": self.num_reusable_free,
@@ -261,6 +257,7 @@ class BlockPool:
         # here rather than left to drift.
         self._cached.clear()
         self._protected.clear()
+        self._demoted.clear()
         self._reused.clear()
         self._vacant = sorted(self._free)
         heapify(self._vacant)
@@ -275,6 +272,7 @@ class BlockPool:
         """
         block = self.blocks[block_id]
         self._protected.pop(block_id, None)
+        self._demoted.pop(block_id, None)
         self._reused.discard(block_id)
         dropped = False
         if block.hash != -1 and self._hash_to_block_id.get(block.hash) == block_id:
@@ -301,6 +299,11 @@ class BlockPool:
         while self._vacant:
             block_id = heappop(self._vacant)
             if block_id in self._free and self.blocks[block_id].hash == -1:
+                self._free.discard(block_id)
+                return block_id
+        while self._demoted:
+            block_id, _ = self._demoted.popitem(last=False)
+            if block_id in self._free and self.blocks[block_id].hash != -1:
                 self._free.discard(block_id)
                 return block_id
         while self._cached:
@@ -332,6 +335,7 @@ class BlockPool:
         self._free.discard(block_id)
         self._cached.pop(block_id, None)
         self._protected.pop(block_id, None)
+        self._demoted.pop(block_id, None)
 
     def allocate(self, block_id: int) -> Block:
         """Take `block_id` for fresh content, evicting whatever it held."""
@@ -363,7 +367,12 @@ class BlockPool:
             self._used.add(block_id)
         return block
 
-    def free(self, block_id: int) -> None:
+    def free(self, block_id: int, demote: bool = False) -> None:
+        """Drop one reference. At zero the block goes back on the free list:
+        hashed content to `_cached` (or `_protected`, slru), or to `_demoted`
+        when `demote` -- evicted before every other hashed block -- and
+        unhashed blocks to `_vacant`. `demote` is ignored for a block slru
+        protects, and for one another holder still references."""
         if block_id in self._raw_unit_owner:
             raise AssertionError(
                 f"block {block_id} is a reserved raw unit; use release_units"
@@ -378,6 +387,8 @@ class BlockPool:
             if block_id in self._reused:
                 self._protected[block_id] = None
                 self._trim_protected()
+            elif demote:
+                self._demoted[block_id] = None
             else:
                 self._cached[block_id] = None
             return
@@ -391,7 +402,7 @@ class BlockPool:
 
     def _trim_protected(self) -> None:
         # Bound protection so new prefixes can compete for cache space.
-        limit = int(self.num_usable_blocks * self.protected_ratio)
+        limit = int(self.num_blocks * self.protected_ratio)
         while len(self._protected) > limit:
             block_id, _ = self._protected.popitem(last=False)
             self._reused.discard(block_id)
@@ -487,7 +498,7 @@ class BlockPool:
         request in the first place.
         """
         top = self.num_blocks - 1
-        if top < self._first_block:
+        if top < 0:
             return None
         # Raw units cannot move without updating their owning record.
         if top in self._raw_unit_owner:

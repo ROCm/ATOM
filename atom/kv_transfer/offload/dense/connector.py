@@ -69,6 +69,7 @@ from atom.kv_transfer.offload.metadata import (
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
 )
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -202,6 +203,18 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 self._lookup_unpin(lookup_id)
         save_ready_event = None
         save_fence_failed = False
+        # A load's copy kernels start only once the kernels queued on this stream
+        # before it (the step in flight, possibly Mono) have run: the engine keeps
+        # later steps off Mono until the load is terminal, but a Mono step already
+        # launched spins on its TP peers, and a kernel beside it can stall it. The
+        # step's saves share the fence; a failed one still lets loads run.
+        if load_requests:
+            try:
+                save_ready_event = record_save_fence()
+            except Exception:
+                save_fence_failed = True
+                logger.exception("LMCache offload: step fence creation failed")
+        load_after = save_ready_event
         for req in metadata.requests:
             # The futures are tracked, not discarded: `wait_for_requests` fences
             # them when vLLM preempts a request and reuses its blocks.
@@ -209,7 +222,11 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 self._track_job(
                     req.req_id,
                     self._load_executor.submit(
-                        self._guard, "load", self._do_load_req, req
+                        self._guard,
+                        "load",
+                        self._do_load_req,
+                        req,
+                        **({} if load_after is None else {"after": load_after}),
                     ),
                 )
             if req.save_spec is not None and self._do_save:
@@ -307,9 +324,11 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 )
         self._record_store_terminal(req, False)
 
-    def _do_load_req(self, req: LMCacheReqMeta) -> None:
+    def _do_load_req(self, req: LMCacheReqMeta, *, after=None) -> None:
         ls = req.load_spec
         assert ls is not None
+        if after is not None:
+            after.synchronize()
         hbm = int(ls.hbm_cached_tokens)
         lmc = int(ls.lmcache_cached_tokens)
         toks = req.token_ids[:lmc]
@@ -508,10 +527,17 @@ class DenseOffloadScheduler(ChunkedOffloadSchedulerBase):
             from lmcache.v1.lookup_client.factory import LookupClientFactory
 
             lookup_client = LookupClientFactory.create_lookup_client(cfg, meta)
+            if envs.OFFLOAD_INPROC_ASYNC_LOOKUP:
+                from atom.kv_transfer.offload.inproc_async_lookup import (
+                    AsyncInprocLookup,
+                )
+
+                lookup_client = AsyncInprocLookup(lookup_client)
             logger.info(
-                "LMCache offload scheduler: lookup client on %s (world=%d)",
+                "LMCache offload scheduler: lookup client on %s (world=%d, %s)",
                 meta.engine_id,
                 world,
+                "async" if envs.OFFLOAD_INPROC_ASYNC_LOOKUP else "sync",
             )
         except Exception as e:  # noqa: BLE001  # optional lookup service
             logger.warning(

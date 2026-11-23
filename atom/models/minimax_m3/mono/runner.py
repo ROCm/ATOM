@@ -70,15 +70,7 @@ from atom.models.minimax_m3.mono.kernels.pre_attn import (
 from atom.models.minimax_m3.mono.kernels.pre_attn import (
     SCRATCH_BYTES as K1_SCRATCH_BYTES,
 )
-from atom.models.minimax_m3.mono.kernels.pre_attn import (
-    SCRATCH_XSC as K1_SCRATCH_XSC,
-)
-from atom.models.minimax_m3.mono.layout import (
-    SCRATCH,
-    SCRATCH_OF,
-    diag_region_names,
-    sym_layout,
-)
+from atom.models.minimax_m3.mono.layout import SCRATCH, diag_region_names, sym_layout
 from atom.models.minimax_m3.mono.layout import SCRATCH_BYTES as K4_SCRATCH_BYTES
 from atom.models.minimax_m3.mono.weights import DenseLayer, SparseMoeLayer
 from atom.mono.plan.execution import BLOCKS
@@ -201,19 +193,14 @@ class MonoDecodeRunner:
         compiler keeps a 36 B frame of two SGPR spill slots that no instruction touches, and any
         schedule change flips it) is rebuilt unchanged except for the machine scheduler's
         register-pressure trackers (``LEAN_LLVM_OPTIONS``), scratch-free at every width 1..16
-        (same arithmetic: only the instruction order moves). None when only the dense kernels
-        spilled: there is no leaner build of those."""
+        (same arithmetic: only the instruction order moves)."""
         lean = dict(built)
-        n = self._width_of[id(built)]
-        rebuilt = [
-            kind
-            for kind, launch in built.items()
-            if isinstance(kind, bool) and launch in spilled
-        ]
-        for kind in rebuilt:
-            lean[kind] = self._build_k4(n, index_topk=kind)
-            lean[kind].compile_hints["llvm_options"] = LEAN_LLVM_OPTIONS
-        return lean if rebuilt else None
+        for kind, launch in built.items():
+            if isinstance(kind, bool) and launch in spilled:
+                n = self._width_of[id(built)]
+                lean[kind] = self._build_k4(n, index_topk=kind)
+                lean[kind].compile_hints["llvm_options"] = LEAN_LLVM_OPTIONS
+        return lean
 
     @staticmethod
     def _layer_kernels(kernels: dict) -> list:
@@ -271,10 +258,12 @@ class MonoDecodeRunner:
         route_scale = float(layers[N_DENSE].block_sparse_moe.routed_scaling_factor)
         # NVFP4 K/V + index pages (single-buffer): every layer alike, both caches together
         self.nvfp4 = impl.kv_cache_dtype == "nvfp4"
-        if self.nvfp4 and heads.count > 1:
-            raise MonoUnsupported("indexer context parallelism with NVFP4 caches")
-        kv_data = get_forward_context().kv_cache_data
-        kv = kv_data[f"layer_{self.sparse[0].layer_id}"]
+        if self.nvfp4 and self.index_heads > 1:
+            # the in-kernel CP scorer has not been checked against NVFP4 index
+            # pages, and there is no build that reads the CP projection's
+            # replicated index q heads but scores the rank's own head alone
+            raise MonoUnsupported("indexer CP with NVFP4 caches")
+        kv = get_forward_context().kv_cache_data[f"layer_{self.sparse[0].layer_id}"]
         pools = [t for t in (kv.k_cache, kv.v_cache) if t is not None]
         if max(t.numel() * t.element_size() for t in pools) > 1 << 32:
             raise MonoUnsupported("KV cache over 4 GiB a layer (32-bit buffer offsets)")
@@ -282,17 +271,12 @@ class MonoDecodeRunner:
             lw.attn_impl.kv_cache_dtype != impl.kv_cache_dtype for lw in self.sparse
         ):
             raise MonoUnsupported("KV cache dtype differs between layers")
-        if self.nvfp4:
-            # the pool's page view is both K and V; the kernels step pages by KV_PAGE_BYTES
-            for lw in self.sparse:
-                pages = kv_data[f"layer_{lw.layer_id}"].k_cache
-                if pages.stride() != (KV_PAGE_BYTES, 1) or pages.dtype != torch.uint8:
-                    raise MonoUnsupported(
-                        f"NVFP4 KV pages {pages.dtype} {tuple(pages.shape)} {pages.stride()}"
-                    )
         # the checkpoint's MXFP8 1x32 attention linears (native quantization) or the
         # ptpc-FP8 requantization: every layer alike (the K1 / K4 builds read one kind)
         self.attn_mxfp8 = self.sparse[0].attn_mxfp8
+        self.w13_gugu = self.sparse[0].w13_gugu
+        if any(lw.w13_gugu != self.w13_gugu for lw in self.sparse):
+            raise MonoUnsupported("routed w13 layouts differ between layers")
         if any(lw.attn_mxfp8 != self.attn_mxfp8 for lw in self.sparse):
             raise MonoUnsupported("attention linears quantized differently per layer")
         if self.attn_mxfp8 and self.dense_mono:
@@ -302,12 +286,20 @@ class MonoDecodeRunner:
         self.fused_shared = self.sparse[0].fused_shared
         if any(lw.fused_shared != self.fused_shared for lw in self.sparse):
             raise MonoUnsupported("shared expert fused in some layers only")
+        if self.fused_shared and self.w13_gugu:
+            raise MonoUnsupported("fused shared expert with the interleaved routed w13")
         logger.info(
             "MiniMax-M3 mono: attention linears %s, shared expert %s",
             "native MXFP8 1x32" if self.attn_mxfp8 else "ptpc FP8",
             "fused (MXFP4, a8w4)" if self.fused_shared else "MXFP8 MLP",
         )
+        routed_only = envs.ATOM_MONO_CHECK and envs.ATOM_MONO_CHECK_ROUTED_ONLY
         if self.fused_shared:
+            # the original layers' fused shared expert cannot be left out of the check
+            if routed_only:
+                raise MonoUnsupported(
+                    "ATOM_MONO_CHECK_ROUTED_ONLY with a fused shared expert"
+                )
             # the fused shared expert's routing weight is whatever the topK metadata
             # holds, read through the module: the metadata is assigned after this
             # file is imported
@@ -316,8 +308,9 @@ class MonoDecodeRunner:
                 raise MonoUnsupported("fused shared expert id")
             shared_weight = float(total_w[0, TOP_K].item())
         else:
-            # the unfused shared expert is added to the routed sum as it is
-            shared_weight = 1.0
+            # the shared expert is added to the routed sum as it is (a check of the
+            # routed experts alone: not at all)
+            shared_weight = 0.0 if routed_only else 1.0
         self.sm_scale = impl.scale
         if abs(self.sm_scale - HEAD_DIM**-0.5) > 1e-12:
             raise MonoUnsupported(f"softmax scale {self.sm_scale}")
@@ -354,6 +347,7 @@ class MonoDecodeRunner:
             kv_nvfp4=self.nvfp4,
             index_nvfp4=self.nvfp4,
             attn_mxfp8=self.attn_mxfp8,
+            w13_gugu=self.w13_gugu,
             fused_shared=self.fused_shared,
         )
         # a dense layer's kernels around its original attention
@@ -388,14 +382,9 @@ class MonoDecodeRunner:
             self.npes,
             dev,
         )
-        # every mailbox pair, zeroed at each step's start (forward): the scratch this
-        # runner's builds use (K1's codes only ``attn_mxfp8``'s, K4's MoE regions
-        # only its shared-expert kind's)
+        # every mailbox pair, zeroed at each step's start (forward)
         self.mailboxes = StepMailboxes(
-            self.peers,
-            self.scratch1[: K1_SCRATCH_BYTES if self.attn_mxfp8 else K1_SCRATCH_XSC],
-            self.scratch4[: SCRATCH_OF[self.fused_shared]["_bytes"]],
-            debug=self.debug,
+            self.peers, self.scratch1, self.scratch4, debug=self.debug
         )
         bf16 = torch.bfloat16
         # row k = token k of the step; sparse layer i reads ars[i % 2] (the
@@ -577,7 +566,13 @@ class MonoDecodeRunner:
         stream = torch.cuda.current_stream()
         kv = fwd.kv_cache_data[f"layer_{lw.layer_id}"]
         if self.nvfp4:
-            k16 = v16 = kv.k_cache
+            # the pool's page view is both K and V; the kernels step pages by KV_PAGE_BYTES
+            pages = kv.k_cache
+            if pages.stride() != (KV_PAGE_BYTES, 1) or pages.dtype != torch.uint8:
+                raise MonoUnsupported(
+                    f"NVFP4 KV pages {pages.dtype} {tuple(pages.shape)} {pages.stride()}"
+                )
+            k16 = v16 = pages
             ks16, vs16 = lw.attn_impl.nvfp4_k_scale, lw.attn_impl.nvfp4_v_scale
         else:
             k16, v16, ks16, vs16 = to_page16_shuffle(

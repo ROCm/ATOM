@@ -127,6 +127,18 @@ def raw_req_id(completion: Any) -> ReqId:
     return getattr(completion, "req_id", completion)
 
 
+def mono_offload_hazard(connector: Any) -> bool:
+    """Whether a scheduler-side connector may have worker copy kernels in
+    flight (``mono_hazard``; ``has_pending_work`` for connectors without it)."""
+    if connector is None:
+        return False
+    hazard = getattr(connector, "mono_hazard", None)
+    if callable(hazard):
+        return bool(hazard())
+    pending = getattr(connector, "has_pending_work", None)
+    return bool(pending()) if callable(pending) else False
+
+
 def req_id_of(completion: Any) -> str:
     """`raw_req_id` as a string key."""
     return str(raw_req_id(completion))
@@ -244,37 +256,10 @@ class KVTransferRegion:
     # makes equal-sized planes distinguishable across code versions.
     semantic_role: str | None = None
 
-    @staticmethod
-    def unit_offset(
-        index: int, total_bytes: int, unit_bytes: int, reverse_indexed: bool
-    ) -> int:
-        if reverse_indexed:
-            return total_bytes - (index + 1) * unit_bytes
-        return index * unit_bytes
-
-    @staticmethod
-    def chunk_sizes(total_bytes: int, unit_bytes: int, max_bytes: int) -> list[int]:
-        """Split a region into MR chunks, each <= ``max_bytes`` and, apart from
-        the last, a whole number of units, so no unit crosses an MR boundary.
-
-        A unit larger than ``max_bytes`` cannot be aligned and is left to
-        straddle.
-        """
-        sizes: list[int] = []
-        offset = 0
-        while offset < total_bytes:
-            remaining = total_bytes - offset
-            chunk = min(max_bytes, remaining)
-            if chunk < remaining and chunk >= unit_bytes > 0:
-                chunk -= chunk % unit_bytes
-            sizes.append(chunk)
-            offset += chunk
-        return sizes
-
     def unit_addr(self, index: int) -> int:
-        return self.base_addr + self.unit_offset(
-            index, self.total_bytes, self.unit_bytes, self.reverse_indexed
-        )
+        if self.reverse_indexed:
+            return self.base_addr + self.total_bytes - (index + 1) * self.unit_bytes
+        return self.base_addr + index * self.unit_bytes
 
 
 @dataclass(frozen=True)
@@ -350,9 +335,9 @@ class PageRegion:
 
     region: KVTransferRegion
     view: Any = None
-    # `(heads, widths)`: one run per width, each this rank's `heads` KV heads of
-    # `width` B one after another. None: not per head (replicated).
-    head_major_runs: tuple[int, tuple[int, ...]] | None = None
+    # `(runs, heads)`: the unit is `runs` equal runs, each holding this rank's
+    # `heads` KV heads one after another. None: not per head (replicated).
+    head_major_runs: tuple[int, int] | None = None
     unit_spec: PageUnitSpec | None = None
 
 

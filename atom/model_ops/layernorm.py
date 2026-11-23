@@ -19,10 +19,6 @@ from aiter.dist.communication_op import (
 )
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.ops.fused_qk_rmsnorm_group_quant import (
-    fused_qk_rmsnorm_group_quant,
-    fused_qk_rmsnorm_per_token_quant,
-)
 from aiter.ops.gated_rmsnorm_fp8_group_quant import gated_rmsnorm_fp8_group_quant
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
 from aiter.ops.triton.quant.fused_mxfp8_quant import fused_dual_rmsnorm_mxfp8_quant
@@ -1036,6 +1032,213 @@ class GemmaRMSNorm(nn.Module):
         return self.forward_cuda(x, residual)
 
 
+# ATOM_MINIMAX_AK_AR_NORM: amd-kernels' staged TP4 all-reduce + add + Gemma RMSNorm (``staged_comm``) for the
+# decode rows. bf16 partials on the wire (the 12-bit coded tiers are switched off), sums in rank order in fp32
+# (residual out matches AITER's up to fp32 summation order: ~1 element in 1e8 differs by 1 bf16 ulp), the norm's
+# fp32 square-sum order differs (<= 1 bf16 ulp at ties).
+# Graph captures entered under ``ak_ar_norm_capture()`` read the peers' inputs in place; other calls stage them.
+AK_AR_NORM_MAX_ROWS = 512  # decode rows (k7 8 x 64 requests); larger steps keep AITER's op
+AK_AR_NORM_STAGED_MAX_ROWS = 320  # unregistered calls above here would take the coded stream: AITER's op instead
+
+
+class _AkArNorm:
+    comm = None
+    tried = False
+    b16 = None  # p1/ar-epilogue: amd-kernels Bf16ArNormComm (chain Y), built with ``comm`` when its flag is on
+
+
+def _ak_ar_norm_comm():
+    """The staged communicator (a collective on the TP CPU group, built and warmed up once per rank), or None when
+    the flag is off or this process cannot run it."""
+    if not envs.ATOM_MINIMAX_AK_AR_NORM or get_tensor_model_parallel_world_size() <= 1:
+        return None
+    if _AkArNorm.tried:
+        return _AkArNorm.comm
+    _AkArNorm.tried = True
+    import logging
+
+    from aiter.dist.parallel_state import get_tp_group
+
+    try:
+        from amd_kernels.norm.gemma_add_rmsnorm_h6144 import allreduce_add_rmsnorm as arn
+    except ImportError as e:
+        raise ImportError("ATOM_MINIMAX_AK_AR_NORM=1 needs inferact/amd-kernels on PYTHONPATH") from e
+    import torch.distributed as dist
+
+    tp = get_tp_group()
+    # the ranks that exist (simulated TP reports more): the communicator maps one buffer per real rank
+    why = arn.unsupported_reason(dist.get_world_size(tp.cpu_group))
+    if why is not None:
+        logging.getLogger("atom").warning("ATOM_MINIMAX_AK_AR_NORM: keeping AITER's op: %s", why)
+        return None
+    dev = torch.device("cuda", torch.cuda.current_device())
+    comm = arn.staged_comm(tp.rank_in_group, tp.cpu_group, dev)
+    comm.lossless_min_rows = 1 << 30  # bf16 wire only
+    # warm_up graph-captures its tiers: a Triton kernel freed by the GC inside that capture unloads its module
+    # (not permitted while capturing) and invalidates this rank's capture, so collect first and hold the GC off
+    import gc
+
+    gc.collect()
+    gc_was_on = gc.isenabled()
+    gc.disable()
+    try:
+        comm.warm_up(torch.zeros(6144, dtype=torch.bfloat16, device=dev), 1e-6)
+        torch.cuda.synchronize(dev)
+        from atom.model_ops.minimax_m3 import p1_front
+
+        if p1_front.AR_CODES:
+            # chain Y: the pre-attention tail of a qkv-chain layer emits the entry's tiled MXFP8 (bf16-rounded norm)
+            from amd_kernels.norm.allreduce_gemma_bf16_mxfp8_h6144 import Bf16ArNormComm
+
+            b16 = Bf16ArNormComm(tp.rank_in_group, tp.cpu_group, dev)
+            b16.warm_up(torch.zeros(6144, dtype=torch.bfloat16, device=dev), 1e-6)
+            torch.cuda.synchronize(dev)
+            _AkArNorm.b16 = b16
+    finally:
+        if gc_was_on:
+            gc.enable()
+    _AkArNorm.comm = comm
+    logging.getLogger("atom").info("ATOM_MINIMAX_AK_AR_NORM: amd-kernels staged AR + Gemma norm, rows <= %d",
+                                   AK_AR_NORM_MAX_ROWS)
+    return comm
+
+
+def ak_ar_norm_capture():
+    """Around the CUDA-graph captures (every rank alike): registers the captured calls' inputs. A null context when
+    the flag is off."""
+    import contextlib
+
+    comm = _ak_ar_norm_comm()
+    if comm is None:
+        return contextlib.nullcontext()
+    if _AkArNorm.b16 is None:
+        return comm.capture()
+    stack = contextlib.ExitStack()
+    stack.enter_context(comm.capture())
+    stack.enter_context(_AkArNorm.b16.capture())
+    return stack
+
+
+def _ak_ar_norm_takes(comm, x: torch.Tensor, residual: torch.Tensor) -> bool:
+    rows = x.shape[0]
+    if comm is None or not 0 < rows <= AK_AR_NORM_MAX_ROWS or not comm.accepts(x, residual):
+        return False
+    from atom.utils.forward_context import get_forward_context
+
+    try:
+        if get_forward_context().ubatch_slices is not None:
+            return False  # micro-batches may overlap on two streams: one communicator per stream
+    except AssertionError:
+        pass
+    registered = (comm._inplace is not None and comm._inplace.capturing
+                  and torch.cuda.is_current_stream_capturing())
+    return registered or rows <= AK_AR_NORM_STAGED_MAX_ROWS
+
+
+def ak_allreduce_gemma_rms_norm(
+    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    comm = _ak_ar_norm_comm()
+    if _ak_ar_norm_takes(comm, x, residual) and weight.dtype == torch.bfloat16 and weight.is_contiguous():
+        return comm.ar_add_rmsnorm(x, residual, weight, eps)
+    return tensor_model_parallel_fused_allreduce_rmsnorm(x, residual, weight, eps, gemma_norm=True)
+
+
+def _ak_allreduce_gemma_rms_norm_fake(
+    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(x), torch.empty_like(residual)
+
+
+def _register_ak_ar_norm_op():
+    from atom.utils.custom_register import direct_register_custom_op
+
+    return direct_register_custom_op(
+        op_name="minimax_ak_allreduce_gemma_rms_norm",
+        op_func=ak_allreduce_gemma_rms_norm,
+        mutates_args=[],
+        fake_impl=_ak_allreduce_gemma_rms_norm_fake,
+    )
+
+
+ak_allreduce_gemma_rms_norm_op = _register_ak_ar_norm_op()
+
+
+AK_B16_MAX_ROWS = 2048  # Bf16ArNormComm's largest row count
+
+
+def _ak_b16_takes(b16, x: torch.Tensor, residual: torch.Tensor) -> bool:
+    rows = x.shape[0]
+    if not 0 < rows <= AK_B16_MAX_ROWS or x.dtype != torch.bfloat16 or not x.is_contiguous():
+        return False
+    if residual.shape != x.shape or residual.dtype != x.dtype or residual.stride(1) != 1 or residual.stride(0) % 8:
+        return False
+    from atom.utils.forward_context import get_forward_context
+
+    try:
+        if get_forward_context().ubatch_slices is not None:
+            return False
+    except AssertionError:
+        pass
+    # graph calls only inside the communicator's capture() (registered inputs); eager calls stage
+    return b16.capturing or not torch.cuda.is_current_stream_capturing()
+
+
+def ak_ar_norm_qkv_codes(
+    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """p1/ar-epilogue chain Y (ATOM_P1_AR_QKV_CODES): the pre-attention tail of a qkv-chain layer. On the rows the
+    chain takes, Bf16ArNormComm sums the bf16 partials (same owner-rotation fp32 order as the staged communicator),
+    adds the residual, norms, rounds to bf16 and quantizes to the entry's (16, 16)-tiled MXFP8 + AITER-shuffled
+    scales; the codes are parked for the layer's qkv_front and the returned hidden states are NOT computed.
+    Every other call: today's op (staged communicator or AITER)."""
+    b16 = _AkArNorm.b16 if _ak_ar_norm_comm() is not None else None
+    if b16 is not None and weight.dtype == torch.bfloat16 and weight.is_contiguous():
+        from atom.model_ops.minimax_m3 import p1_front
+
+        m = x.shape[0]
+        if p1_front.take(m) and _ak_b16_takes(b16, x, residual):
+            comm = _AkArNorm.comm
+            if (p1_front.L4_PULLQ and p1_front.L4_PULLQ_ROWS[0] <= m <= p1_front.L4_PULLQ_ROWS[1]
+                    and comm._registered(x)):
+                # p1/L4-comm: the staged pull exchange (AR1's) + chain Y's emit, bit-identical outputs
+                from l4c_y.pullq import pullq_call
+
+                codes, scales, res = pullq_call(comm, x, residual, weight, eps, p1_front.tile_rows(m))
+            else:
+                codes, scales, res = b16.ar_add_rmsnorm_mxfp8(x, residual, weight, eps, p1_front.tile_rows(m), False)
+            p1_front.park_codes(m, codes, scales)
+            return torch.empty_like(x), res
+    return ak_allreduce_gemma_rms_norm(x, residual, weight, eps)
+
+
+def _register_ak_ar_norm_qkv_codes_op():
+    from atom.utils.custom_register import direct_register_custom_op
+
+    return direct_register_custom_op(
+        op_name="p1_ak_ar_norm_qkv_codes",
+        op_func=ak_ar_norm_qkv_codes,
+        mutates_args=[],
+        fake_impl=_ak_allreduce_gemma_rms_norm_fake,
+    )
+
+
+ak_ar_norm_qkv_codes_op = _register_ak_ar_norm_qkv_codes_op()
+
+
+def fused_allreduce_gemma_rms_norm_qkv_codes(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    norm: GemmaRMSNorm,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The pre-attention tail of a layer whose qkv linear takes p1_front's chain (call site decides statically)."""
+    if get_tensor_model_parallel_world_size() > 1 and envs.ATOM_MINIMAX_AK_AR_NORM:
+        return ak_ar_norm_qkv_codes_op(
+            hidden_states.contiguous(), residual, norm.weight, norm.variance_epsilon
+        )
+    return fused_allreduce_gemma_rms_norm(hidden_states, residual, norm)
+
+
 def fused_allreduce_gemma_rms_norm(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
@@ -1043,6 +1246,10 @@ def fused_allreduce_gemma_rms_norm(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """MiniMax-M3 helper for delayed TP all-reduce followed by Gemma RMSNorm."""
     if get_tensor_model_parallel_world_size() > 1:
+        if envs.ATOM_MINIMAX_AK_AR_NORM:
+            return ak_allreduce_gemma_rms_norm_op(
+                hidden_states.contiguous(), residual, norm.weight, norm.variance_epsilon
+            )
         return tensor_model_parallel_fused_allreduce_rmsnorm(
             hidden_states.contiguous(),
             residual,
@@ -1383,82 +1590,6 @@ class DualRMSNormMXFP8:
             q_scale = q_scale.view(*lead, -1)
             k_out = k_out.view(*lead, -1)
         return q_fp8, q_scale, k_out
-
-
-def _rows(x: torch.Tensor) -> torch.Tensor:
-    """`x` as unit-stride rows."""
-    x = x.reshape(-1, x.shape[-1])
-    return x if x.stride(-1) == 1 else x.contiguous()
-
-
-class DualRMSNormBF16:
-    """BF16 `DualRMSNormMXFP8`: both norms in one launch (AITER's
-    `fused_qk_rmsnorm_group_quant` without a quant), Q unquantized (scale
-    None), for where the Q GEMMs run in BF16."""
-
-    def __init__(self, q_norm: nn.Module, k_norm: nn.Module, prefix: str = "") -> None:
-        self.q_norm = q_norm
-        self.k_norm = k_norm
-        self.prefix = prefix
-
-    @mark_trace
-    def __call__(self, q: torch.Tensor, k: torch.Tensor):
-        lead = q.shape[:-1]
-        q2, k2 = _rows(q), _rows(k)
-        yk = torch.empty(k2.shape, dtype=k.dtype, device=k.device)
-        yq, sq = self._norm(q2, k2, yk)
-        sq = None if sq is None else sq.view(*lead, 1)
-        return yq.view(*lead, -1), sq, yk.view(*lead, -1)
-
-    def _norm(self, q2, k2, yk):
-        """The launch over rows, K into `yk`; returns Q and its scale."""
-        yq = torch.empty(q2.shape, dtype=q2.dtype, device=q2.device)
-        if q2.shape[0]:
-            fused_qk_rmsnorm_group_quant(
-                q=q2,
-                q_weight=self.q_norm.weight,
-                q_epsilon=self.q_norm.eps,
-                q_out_unquantized=yq,
-                k=k2,
-                k_weight=self.k_norm.weight,
-                k_epsilon=self.k_norm.eps,
-                k_out=yk,
-            )
-        return yq, None
-
-
-class DualRMSNormPerToken(DualRMSNormBF16):
-    """`DualRMSNormBF16` with Q quantized per token in the same launch (AITER's
-    `fused_qk_rmsnorm_per_token_quant`, one F32 scale a row), so per-channel
-    Q readers share one quantization."""
-
-    def __init__(
-        self,
-        q_norm: nn.Module,
-        k_norm: nn.Module,
-        prefix: str = "",
-        *,
-        quant_dtype: torch.dtype,
-    ) -> None:
-        super().__init__(q_norm, k_norm, prefix)
-        self.quant_dtype = quant_dtype
-
-    def _norm(self, q2, k2, yk):
-        yq = torch.empty(q2.shape, dtype=self.quant_dtype, device=q2.device)
-        sq = torch.empty((q2.shape[0], 1), dtype=torch.float32, device=q2.device)
-        if q2.shape[0]:
-            fused_qk_rmsnorm_per_token_quant(
-                yq,
-                sq,
-                q2,
-                self.q_norm.weight,
-                self.q_norm.eps,
-                k=k2,
-                k_weight=self.k_norm.weight,
-                k_epsilon=self.k_norm.eps,
-                k_out=yk,
-            )
-        return yq, sq
 
 
 # ---------------------------------------------------------------------------

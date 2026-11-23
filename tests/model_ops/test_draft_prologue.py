@@ -33,6 +33,7 @@ if not torch.cuda.is_available():
 
 from atom.model_ops.deepseek_v41.draft_block import draft_step
 from atom.model_ops.deepseek_v41.dspark import build_block_state, draft_step_indices
+from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 
 DEV = "cuda"
 HC_MULT = 4  # config.hc_mult
@@ -106,20 +107,14 @@ def test_block_state_matches_embed_then_broadcast(batch, width, hidden):
     noise = torch.randn(hidden, generator=gen, device=DEV, dtype=torch.bfloat16)
 
     # The chain this replaces: embed a [B, width] id block whose columns past
-    # zero all carry the noise token, then broadcast over the mHC streams. The
-    # broadcast is spelled out in torch: `from_embeddings` now runs the same
-    # kernel as `build_block_state`, so it cannot be the reference.
+    # zero all carry the noise token, then broadcast over the mHC streams.
     embedded = noise.expand(batch, width, hidden).clone()
     embedded[:, 0, :] = anchor
-    ref_residual = (
-        embedded.unsqueeze(-2).expand(batch, width, HC_MULT, hidden).contiguous()
-    )
-    ref_pre_mix = torch.zeros(batch, width, HC_MULT, device=DEV)
-    ref_pre_mix[..., 0] = 1
+    reference = SinglePassHCState.from_embeddings(embedded, HC_MULT)
 
     residual, pre_mix = build_block_state(anchor, noise, width, HC_MULT)
-    assert torch.equal(residual, ref_residual)
-    assert torch.equal(pre_mix, ref_pre_mix)
+    assert torch.equal(residual, reference.residual)
+    assert torch.equal(pre_mix, reference.pre_mix)
     assert residual.shape == (batch, width, HC_MULT, hidden)
 
 

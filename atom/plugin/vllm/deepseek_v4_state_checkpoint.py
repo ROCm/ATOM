@@ -23,7 +23,6 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from inspect import getattr_static
 from types import SimpleNamespace
 
 import numpy as np
@@ -194,8 +193,7 @@ def _attach_native() -> None:
         return
     native = _native_builder_cls()
     for name in _NATIVE_COPY_METHODS:
-        # Find inherited methods without binding descriptors to the native class.
-        setattr(_PluginV4StateCopier, name, getattr_static(native, name))
+        setattr(_PluginV4StateCopier, name, native.__dict__[name])
     _PluginV4StateCopier._checkpoint_staging = _native_staging_fn()
     _PluginV4StateCopier._native_attached = True
 
