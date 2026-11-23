@@ -33,6 +33,11 @@ except ImportError:
     fused_qk_rope_concat_and_cache_mla_seg = None
 from aiter.dist.parallel_state import get_dp_group, get_tensor_model_parallel_rank
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
+from atom.model_ops.attentions.nvfp4_mla import (
+    kup_fusable,
+    publish_prefill_kv,
+    try_nvfp4_decode,
+)
 from aiter.ops.triton.attention.mla import mla_decode_fwd as triton_mla_decode_fwd
 from aiter.ops.triton.fusions.fused_kv_cache import (
     fused_qk_rope_cat_and_cache_mla as triton_fused_qk_rope_cat_and_cache_mla,
@@ -65,7 +70,6 @@ from atom.distributed.pcp_utils import (
     pcp_allgather_rerange_many,
     pcp_is_enabled,
 )
-from atom.model_ops.attentions.nvfp4_mla import publish_prefill_kv, try_nvfp4_decode
 from atom.model_ops.attentions.sparse_mla_head_groups import (
     PERSISTENT_WORK_BUFFERS,
 )
@@ -1605,8 +1609,15 @@ class MLAAttention(nn.Module):
         # Convert from (B, N, V) to (B, N * V)
         return self.o_proj(x.reshape(-1, self.num_heads * self.v_head_dim))
 
+    def _k_up_weight(self, group=False):
+        if self.qrep_enabled and group:
+            return self.W_K_qrep, self.W_K_qrep_scale
+        return self.W_K, self.W_K_scale
+
     @mark_trace(prefix="q_proj_and_k_up_proj", torch_compile=False)
-    def _q_proj_and_k_up_proj(self, x, x_scale=None, group=False):
+    def _q_proj_and_k_up_proj(self, x, x_scale=None, group=False, k_up=True):
+        # k_up=False returns the un-absorbed q_nope (B, N, P) for a caller that
+        # fuses the K-up itself (NVFP4, `kup_fusable`).
         # QREP: q_proj emits the full DCP-group head set. group=True (decode)
         # keeps them all and uses W_K_qrep, so the caller skips the AllGather Q;
         # group=False (prefill / non-QREP) takes only this rank's heads.
@@ -1621,14 +1632,13 @@ class MLAAttention(nn.Module):
             n_heads_out = self.qrep_num_heads if self.qrep_enabled else self.num_heads
             q = self.q_proj(x, x_scale).view(-1, n_heads_out, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        if not k_up:
+            return q_nope, q_pe
 
         # Convert from (B, N, P) to (N, B, P)
         q_nope = q_nope.transpose(0, 1)
 
-        if self.qrep_enabled and group:
-            W_K, W_K_scale = self.W_K_qrep, self.W_K_qrep_scale
-        else:
-            W_K, W_K_scale = self.W_K, self.W_K_scale
+        W_K, W_K_scale = self._k_up_weight(group)
 
         if is_rocm_aiter_fp4bmm_enabled():
             # FP4 BMM: (N, B, P) x (N, P, L) -> (N, B, L)
@@ -3202,11 +3212,15 @@ class MLAAttention(nn.Module):
                 context.is_prefill,
                 envs.ATOM_DCP_PREFILL_QREP,
             )
+            # NVFP4 with the fused K-up: q_nope stays un-absorbed and the
+            # NVFP4 decode quantizes it inside its own K-up GEMM.
+            kup_fused = kup_fusable(self) and not is_rocm_aiter_fp4bmm_enabled()
             q_nope, q_rope = self._q_proj_and_k_up_proj(
-                q, x_scale=q_scale, group=use_qrep
+                q, x_scale=q_scale, group=use_qrep, k_up=not kup_fused
             )
             nvfp4_out = try_nvfp4_decode(
-                self, q_nope, q_rope, k_nope, k_rope, positions, attn_metadata
+                self, q_nope, q_rope, k_nope, k_rope, positions, attn_metadata,
+                w_k=self._k_up_weight(use_qrep)[0] if kup_fused else None,
             )
             if nvfp4_out is not None:
                 return nvfp4_out

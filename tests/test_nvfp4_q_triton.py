@@ -13,9 +13,9 @@ def _query(batch, seed, strided=False):
     gen = torch.Generator(device="cuda").manual_seed(seed)
     ch = torch.exp(torch.randn(576, generator=gen, device="cuda") * 1.5)
     head = torch.exp(torch.randn(1, 128, 1, generator=gen, device="cuda"))
-    q = (
-        torch.randn(batch, 128, 576, generator=gen, device="cuda") * ch * head * 0.1
-    ).to(torch.bfloat16)
+    q = (torch.randn(batch, 128, 576, generator=gen, device="cuda") * ch * head * 0.1).to(
+        torch.bfloat16
+    )
     q[torch.rand(q.shape, generator=gen, device="cuda") < 0.02] = 0
     q[torch.rand(q.shape, generator=gen, device="cuda") < 0.005] = -0.0
     q[:, :3, 512:528] = 0  # whole zero blocks
@@ -63,3 +63,197 @@ def test_quantize_q_replays_in_a_graph():
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(out[0], eager[0]) and torch.equal(out[1], eager[1])
+
+
+@pytest.mark.parametrize("rows", [16, 32])
+def test_decode_prep_zeroes_padding_rows(rows):
+    """A padding row (slot -1) gets a zero Q and no cache write; live rows are
+    quantized as `quantize_q` does, for either Q rows per program."""
+    from atom.model_ops.attentions.nvfp4_hp_ring import Nvfp4HpRing
+    from atom.model_ops.attentions.nvfp4_q_triton import decode_prep, quantize_q
+
+    batch, pad = 40, [3, 17, 39]
+    _, nope, rope = _query(batch, 9, strided=True)
+    gen = torch.Generator(device="cuda").manual_seed(10)
+    k = torch.randn(batch, 576, generator=gen, device="cuda").to(torch.bfloat16)
+    pos = torch.randint(0, 4000, (batch,), generator=gen, device="cuda")
+    slots = torch.arange(batch, device="cuda") * 64 + pos % 64
+    slots[pad] = -1
+    ring = Nvfp4HpRing(batch + 1, 1, 576, device="cuda")
+    kv_nope = torch.zeros(batch, 16384, dtype=torch.uint8, device="cuda")
+    kv_aux = torch.zeros(batch, 8192, dtype=torch.uint8, device="cuda")
+    req = torch.arange(batch, dtype=torch.int32, device="cuda")
+    qn, qa = decode_prep(
+        nope, rope, ring.buf[:, 0], req, k[:, :512], k[:, 512:], slots, kv_nope, kv_aux,
+        pos, rows=rows,
+    )
+    want_n, want_a = quantize_q(nope, rope)
+    torch.cuda.synchronize()
+    live = torch.ones(batch, dtype=torch.bool, device="cuda")
+    live[pad] = False
+    assert torch.equal(qn[live], want_n[live]) and torch.equal(qa[live], want_a[live])
+    assert (qn[~live] == 0).all()
+    assert (qa[~live][..., :104] == 0).all() and (qa[~live][..., 104:] == 127).all()
+    assert (kv_nope[pad] == 0).all() and (kv_aux[pad] == 0).all()
+
+
+@pytest.mark.parametrize("n16", [False, True])
+def test_decode_prep_k_split_writes_the_same_bytes(n16):
+    """Splitting each K token's channels over 2 or 4 programs changes nothing:
+    same Q, tail and both cache planes as one program per token."""
+    from atom.model_ops.attentions.nvfp4_hp_ring import Nvfp4HpRing
+    from atom.model_ops.attentions.nvfp4_q_triton import decode_prep
+
+    batch = 48
+    _, nope, rope = _query(batch, 11, strided=True)
+    gen = torch.Generator(device="cuda").manual_seed(12)
+    k = torch.randn(batch, 576, generator=gen, device="cuda").to(torch.bfloat16)
+    pos = torch.randint(0, 4000, (batch,), generator=gen, device="cuda")
+    slots = torch.arange(batch, device="cuda") * 64 + pos % 64
+    slots[[2, 30]] = -1
+    req = torch.arange(batch, dtype=torch.int32, device="cuda")
+    ring0 = Nvfp4HpRing(batch + 1, 1, 576, device="cuda")
+    ring0.buf.copy_((torch.randn(ring0.buf.shape, generator=gen, device="cuda")).to(torch.bfloat16))
+    results = []
+    # interleave_q: each token's Q heads ride in its K programs.
+    for k_split, interleave in ((1, False), (2, False), (4, False), (2, True), (4, True)):
+        ring = ring0.buf.clone()
+        kv_nope = torch.zeros(batch, 16384, dtype=torch.uint8, device="cuda")
+        kv_aux = torch.zeros(batch, 8192, dtype=torch.uint8, device="cuda")
+        q = decode_prep(nope, rope, ring[:, 0], req, k[:, :512], k[:, 512:], slots, kv_nope,
+                        kv_aux, pos, n16=n16, k_split=k_split, interleave_q=interleave)
+        torch.cuda.synchronize()
+        results.append((q[0], q[1], ring, kv_nope, kv_aux))
+    for got in results[1:]:
+        assert all(torch.equal(a, b) for a, b in zip(got, results[0]))
+
+    # NoPE already written (the fused K-up): only the RoPE bytes of q_aux.
+    want_n, want_a = results[0][0], results[0][1]
+    for k_split, interleave in ((1, False), (2, True), (4, True)):
+        qn, qa = want_n.clone(), want_a.clone()
+        qa[..., :64] = 0x55
+        qa[..., 96:] = 0x55
+        ring = ring0.buf.clone()
+        kv_nope = torch.zeros(batch, 16384, dtype=torch.uint8, device="cuda")
+        kv_aux = torch.zeros(batch, 8192, dtype=torch.uint8, device="cuda")
+        decode_prep(None, rope, ring[:, 0], req, k[:, :512], k[:, 512:], slots, kv_nope,
+                    kv_aux, pos, n16=n16, k_split=k_split, interleave_q=interleave,
+                    q_planes=(qn, qa))
+        torch.cuda.synchronize()
+        assert torch.equal(qn, want_n) and torch.equal(qa, want_a), (k_split, interleave)
+        assert torch.equal(ring, results[0][2])
+        assert torch.equal(kv_nope, results[0][3]) and torch.equal(kv_aux, results[0][4])
+
+
+@pytest.mark.parametrize("n16", [False, True])
+def test_decode_prep_incremental_tile_writes_the_same_bytes(n16):
+    """With `tile_state` a token rewrites only the 16 x 16 blocks whose amax it
+    raises; over many steps, tile starts, outliers and padding rows the tail,
+    both cache planes and Q stay byte-identical to rebuilding every tile."""
+    from atom.model_ops.attentions.nvfp4_hp_ring import Nvfp4HpRing
+    from atom.model_ops.attentions.nvfp4_q_triton import decode_prep
+
+    batch, steps, pages_per = 24, 40, 3
+    gen = torch.Generator(device="cuda").manual_seed(21)
+    req = torch.arange(batch, dtype=torch.int32, device="cuda")
+    pos = torch.randint(0, 60, (batch,), generator=gen, device="cuda")
+    pos[:4] = torch.tensor([0, 15, 16, 31], device="cuda")  # tile edges
+    table = torch.randperm(batch * pages_per, generator=gen, device="cuda").view(batch, pages_per)
+    ring0 = (torch.randn((batch + 1, 1, 16, 576), generator=gen, device="cuda")).to(torch.bfloat16)
+    stale = lambda n: torch.randint(0, 256, (batch * pages_per, n), generator=gen, dtype=torch.uint8, device="cuda")
+    nope0, aux0 = stale(16384), stale(8192)
+    full = [ring0.clone(), nope0.clone(), aux0.clone()]
+    incr = [ring0.clone(), nope0.clone(), aux0.clone()]
+    amax = torch.rand((batch + 1, 32), generator=gen, device="cuda")  # stale state
+    tag = torch.full((batch + 1,), -1, dtype=torch.int32, device="cuda")
+    for step in range(steps):
+        k = (torch.randn((batch, 576), generator=gen, device="cuda") * 0.5)
+        spikes = torch.rand((batch, 576), generator=gen, device="cuda") < 0.02
+        k = torch.where(spikes, k * 20, k).to(torch.bfloat16)
+        _, nope, rope = _query(batch, 100 + step, strided=True)
+        slots = table.gather(1, (pos // 64)[:, None]).squeeze(1) * 64 + pos % 64
+        slots[[5, 17]] = -1  # padding rows
+        if step == 20:
+            tag[[3, 9]] = -1  # another writer touched these tiles
+        outs = []
+        for ring, kv_nope, kv_aux, state in ((*full, None), (*incr, (amax, tag))):
+            q = decode_prep(nope, rope, ring[:, 0], req, k[:, :512], k[:, 512:], slots, kv_nope,
+                            kv_aux, pos, n16=n16, tile_state=state)
+            outs.append(q)
+        torch.cuda.synchronize()
+        assert torch.equal(outs[0][0], outs[1][0]) and torch.equal(outs[0][1], outs[1][1]), step
+        assert torch.equal(full[0][:batch], incr[0][:batch]), (step, "tail")
+        assert torch.equal(full[1], incr[1]), (step, "kv_nope")
+        assert torch.equal(full[2], incr[2]), (step, "kv_aux")
+        pos = torch.where(slots >= 0, pos + 1, pos)
+
+
+@pytest.mark.parametrize("fused", [True, False])
+@pytest.mark.parametrize("batch,steps", [(24, 40), (300, 6)])
+def test_hip_decode_prep_writes_the_same_bytes(batch, steps, fused):
+    """The gfx1250 HIP decode prep (Q and K in one launch) against the Triton
+    one, step after step from the same stale bytes: q_aux, the tail and both
+    cache planes, over tile starts and edges, padding rows, K outliers and
+    signed zeros, with the fused RoPE and with pre-roped input."""
+    if "gfx1250" not in getattr(torch.cuda.get_device_properties(0), "gcnArchName", ""):
+        pytest.skip("the HIP decode prep is gfx1250")
+    from aiter.rotary_embedding import get_rope
+
+    from atom.model_ops.attentions.nvfp4_q_triton import decode_prep
+
+    yarn = {"type": "yarn", "factor": 40, "original_max_position_embeddings": 4096,
+            "beta_fast": 32, "beta_slow": 1, "mscale": 1.0, "mscale_all_dim": 1.0}
+    rope = get_rope(64, rotary_dim=64, max_position=163840, base=10000, is_neox_style=False,
+                    rope_scaling=yarn, dtype=torch.bfloat16).to("cuda")
+    cos, sin = (rope.cos_cache, rope.sin_cache) if fused else (None, None)
+    pages_per = 8
+    gen = torch.Generator(device="cuda").manual_seed(batch + steps)
+    req = torch.arange(batch, dtype=torch.int32, device="cuda")
+    pos = torch.randint(0, 300, (batch,), generator=gen, device="cuda")
+    pos[:8] = torch.tensor([0, 15, 16, 31, 63, 64, 127, 255], device="cuda")
+    table = torch.randperm(batch * pages_per, generator=gen, device="cuda").view(batch, pages_per)
+    ring0 = torch.randn((batch + 1, 16, 576), generator=gen, device="cuda").to(torch.bfloat16)
+    stale = lambda n: torch.randint(0, 256, (batch * pages_per, n), generator=gen, dtype=torch.uint8,
+                                    device="cuda")
+    nope0, aux0 = stale(16384), stale(8192)
+    tri = [ring0.clone(), nope0.clone(), aux0.clone()]
+    hip = [ring0.clone(), nope0.clone(), aux0.clone()]
+    pad = [5, 17, batch - 1]
+    for step in range(steps):
+        k = torch.randn((batch, 576), generator=gen, device="cuda") * 0.5
+        k = torch.where(torch.rand(k.shape, generator=gen, device="cuda") < 0.02, k * 30, k).to(torch.bfloat16)
+        k[torch.rand(k.shape, generator=gen, device="cuda") < 0.01] = -0.0
+        q = (torch.randn((batch, 128, 192), generator=gen, device="cuda") * 2).to(torch.bfloat16)
+        q[torch.rand(q.shape, generator=gen, device="cuda") < 0.01] = 0
+        qn = torch.zeros((batch, 128, 256), dtype=torch.uint8, device="cuda")
+        qa0 = torch.randint(0, 256, (batch, 128, 128), generator=gen, dtype=torch.uint8, device="cuda")
+        slots = table.gather(1, (pos // 64)[:, None]).squeeze(1) * 64 + pos % 64
+        slots[pad] = -1
+        outs = []
+        for (ring, kn, ka), use_hip in ((tri, False), (hip, True)):
+            qa = qa0.clone()
+            decode_prep(None, q[..., 128:], ring, req, k[:, :512], k[:, 512:], slots, kn, ka, pos, cos, sin,
+                        n16=True, q_planes=(qn, qa), hip_q=use_hip)
+            outs.append(qa)
+        torch.cuda.synchronize()
+        # The HIP RoPE is the RoPE kernel's bf16 instructions; the Triton one's
+        # emulation can lose the sign of an exact zero (a code 0 for 8), so
+        # codes may differ by a zero's sign and in nothing else.
+        assert _same_but_zero_sign(outs[0], outs[1]), (step, "q_aux")
+        assert torch.equal(tri[0][..., :512], hip[0][..., :512]), (step, "tail")
+        assert _same_bf16_but_zero_sign(tri[0][..., 512:], hip[0][..., 512:]), (step, "tail rope")
+        assert torch.equal(tri[1], hip[1]), (step, "kv_nope")
+        assert _same_but_zero_sign(tri[2], hip[2]), (step, "kv_aux")
+        pos = torch.where(slots >= 0, pos + 1, pos)
+
+
+def _same_but_zero_sign(a, b):
+    """Byte planes equal except E2M1 nibbles 0 / 8 (+0 / -0) swapped."""
+    lo_a, hi_a, lo_b, hi_b = a & 15, a >> 4, b & 15, b >> 4
+    ok = lambda x, y: (x == y) | ((x | y) == 8) & ((x & 7) == 0) & ((y & 7) == 0)
+    return bool((ok(lo_a, lo_b) & ok(hi_a, hi_b)).all())
+
+
+def _same_bf16_but_zero_sign(a, b):
+    """BF16 tensors equal except +0 / -0."""
+    return bool(((a.view(torch.int16) == b.view(torch.int16)) | ((a == 0) & (b == 0))).all())

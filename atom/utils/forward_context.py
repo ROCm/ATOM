@@ -671,6 +671,8 @@ class AttentionMetaData:
     nvfp4_tail_slots: torch.Tensor | None = None
     # NVFP4 MLA prefill: the step's tile plan, shared by every layer.
     nvfp4_prefill_plan: dict | None = None
+    # NVFP4 MLA decode: page ranges per request in `nvfp4_csr` (split-K).
+    nvfp4_splits: int = 1
 
     state: AttnState = AttnState.PREFILL_NATIVE
     """One of `DECODE / PREFILL_NATIVE / PREFILL_PREFIX` — controls which

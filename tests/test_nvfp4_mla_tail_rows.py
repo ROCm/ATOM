@@ -35,7 +35,9 @@ def _tok(value):
 
 def _decode(cache, req_ids, values, positions, pages):
     rows = torch.as_tensor(cache.bind_rows(req_ids))
-    slots = torch.tensor([page * 64 + pos % 64 for page, pos in zip(pages, positions)])
+    slots = torch.tensor(
+        [page * 64 + pos % 64 for page, pos in zip(pages, positions)]
+    )
     cache.publish_decode(
         0,
         rows,
@@ -123,9 +125,7 @@ def test_prefill_plan_writes_what_the_per_request_path_writes():
 
     plan_cache, plan_writes = _cache(max_reqs=4)
     rows = plan_cache.bind_rows([1, 2, 3])
-    plan = plan_cache.upload_plan(
-        plan_cache.plan_prefill(rows, [0, 0, 0], lengths, tables)
-    )
+    plan = plan_cache.upload_plan(plan_cache.plan_prefill(rows, [0, 0, 0], lengths, tables))
     plan_cache.publish_prefill(0, kv, plan)
     assert len(plan_writes) == 1  # one producer launch for the step
 
@@ -199,7 +199,8 @@ def test_decode_runs_every_padded_row_with_the_step_csr():
     cache, writes = _cache(max_reqs=4)
     seen = {}
 
-    def fake_decode(layer, q, csr, sm_scale):
+    def fake_decode(layer, q, csr, sm_scale, splits=1):
+        assert splits == 1
         seen["q"] = tuple(q.shape)
         seen["csr"] = tuple(t.shape[0] for t in csr)
         return torch.zeros(q.shape[0], 128, 512, dtype=torch.bfloat16)
