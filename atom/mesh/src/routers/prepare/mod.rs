@@ -207,6 +207,7 @@ pub fn prepare_chat_declaring(
         configured_reasoning_parser: components.configured_reasoning_parser.clone(),
         prompt_opener,
         reads_as_atom: false,
+        usage_on_finish: false,
     };
 
     Ok((payload, ctx))
@@ -264,6 +265,7 @@ pub fn prepare_generate(
         configured_reasoning_parser: components.configured_reasoning_parser.clone(),
         prompt_opener: None,
         reads_as_atom: false,
+        usage_on_finish: false,
     };
 
     Ok((payload, ctx))

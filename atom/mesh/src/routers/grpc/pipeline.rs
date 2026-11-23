@@ -70,26 +70,39 @@ pub(crate) struct Pipeline {
 
 /// The label an ATOM worker lists its end-of-sequence ids under, GetModelInfo's.
 const EOS_TOKEN_IDS_LABEL: &str = "eos_token_ids";
+/// The label, "true" or absent, of GetModelInfo's `usage_on_finish`.
+const USAGE_ON_FINISH_LABEL: &str = "usage_on_finish";
 
 /// ATOM's servers' reading of an output: the prompt's opener read first, no stop cut
 /// (ATOM ends where a stop's ids match and returns it all), end-of-sequence ids hidden.
 pub(crate) struct AtomOutput {
     end_token_ids: Vec<u32>,
+    /// A streamed chat's usage rides on its finish chunk.
+    usage_on_finish: bool,
 }
 
 impl AtomOutput {
     pub(crate) fn new(end_token_ids: Vec<u32>) -> Self {
-        Self { end_token_ids }
+        Self {
+            end_token_ids,
+            usage_on_finish: false,
+        }
     }
 
-    /// An ATOM worker's: the end-of-sequence ids its GetModelInfo listed.
+    /// An ATOM worker's: the end-of-sequence ids and usage placement its GetModelInfo gave.
     fn of_worker(worker: &dyn Worker) -> Self {
-        let listed = worker.metadata().labels.get(EOS_TOKEN_IDS_LABEL);
-        Self::new(
-            listed
-                .and_then(|ids| serde_json::from_str(ids).ok())
-                .unwrap_or_default(),
-        )
+        let labels = &worker.metadata().labels;
+        let listed = labels.get(EOS_TOKEN_IDS_LABEL);
+        Self {
+            usage_on_finish: labels
+                .get(USAGE_ON_FINISH_LABEL)
+                .is_some_and(|v| v == "true"),
+            ..Self::new(
+                listed
+                    .and_then(|ids| serde_json::from_str(ids).ok())
+                    .unwrap_or_default(),
+            )
+        }
     }
 
     /// The request's decoder: none of its stops, and the end-of-sequence ids
@@ -161,6 +174,7 @@ impl Pipeline {
         };
         ctx.stop_decoder = atom.stop_decoder(ctx);
         ctx.reads_as_atom = true;
+        ctx.usage_on_finish = atom.usage_on_finish;
     }
 }
 
@@ -586,6 +600,7 @@ mod atom_output_tests {
             configured_reasoning_parser: None,
             prompt_opener: Some("<think>".to_string()),
             reads_as_atom: false,
+            usage_on_finish: false,
         }
     }
 
@@ -704,6 +719,19 @@ mod atom_output_tests {
         assert_eq!(decode(&mut ctx.stop_decoder, &output), "ab. c");
     }
 
+    #[test]
+    fn an_atom_producer_places_streamed_usage_as_its_worker_says() {
+        let tokenizer = byte_level();
+        for (labels, usage_on_finish) in [
+            (&[(USAGE_ON_FINISH_LABEL, "true")][..], true),
+            (&[][..], false),
+        ] {
+            let mut ctx = generate_ctx(&tokenizer, STOPPED_AT_DOT);
+            pipeline().read_as_atom(&single(RuntimeType::Atom, labels), &mut ctx);
+            assert_eq!(ctx.usage_on_finish, usage_on_finish);
+        }
+    }
+
     /// A chat to `model` whose reply is read with the router's `configured` parser.
     fn chat_ctx(
         tokenizer: &Arc<dyn Tokenizer>,
@@ -731,6 +759,7 @@ mod atom_output_tests {
             configured_reasoning_parser: configured.map(str::to_string),
             prompt_opener: None,
             reads_as_atom: false,
+            usage_on_finish: false,
         }
     }
 

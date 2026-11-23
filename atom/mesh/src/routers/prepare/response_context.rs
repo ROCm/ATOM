@@ -49,6 +49,9 @@ pub struct ResponseContext {
     /// The reply is ATOM's (`AtomOutput`), and takes the shape ATOM's HTTP chat gives
     /// it: content "" when empty, and a stream opened by an empty assistant delta.
     pub reads_as_atom: bool,
+    /// ATOM puts this model's streamed usage on the finish chunk, not a usage-only chunk
+    /// after it (GetModelInfo's `usage_on_finish`).
+    pub usage_on_finish: bool,
 }
 
 /// ATOM's `prompt_starts_in_reasoning`: the marker among `markers` (GetModelInfo's

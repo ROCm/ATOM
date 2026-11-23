@@ -29,6 +29,7 @@ mod test_support {
             configured_reasoning_parser: None,
             prompt_opener: None,
             reads_as_atom: false,
+            usage_on_finish: false,
         }
     }
 
@@ -55,6 +56,7 @@ mod test_support {
             configured_reasoning_parser: None,
             prompt_opener: None,
             reads_as_atom: false,
+            usage_on_finish: false,
         }
     }
 }
@@ -221,6 +223,7 @@ mod b2_chat_aggregator_branches {
             configured_reasoning_parser: None,
             prompt_opener: None,
             reads_as_atom: false,
+            usage_on_finish: false,
         }
     }
 
@@ -641,6 +644,7 @@ mod b3_chat_aggregator_typed {
             configured_reasoning_parser: None,
             prompt_opener: None,
             reads_as_atom: false,
+            usage_on_finish: false,
         }
     }
 
@@ -1056,6 +1060,7 @@ mod c2_chat_streaming_branches {
             configured_reasoning_parser: None,
             prompt_opener: None,
             reads_as_atom: false,
+            usage_on_finish: false,
         }
     }
 
@@ -1316,6 +1321,63 @@ mod c2_chat_streaming_branches {
         assert!(chunk["usage"].get("prompt_tokens_details").is_none());
     }
 
+    /// The data events of an ATOM worker's stream whose usage rides on its finish chunk.
+    async fn usage_on_finish_events(include_usage: bool) -> Vec<serde_json::Value> {
+        let mut req = ChatCompletionRequest::default();
+        req.stream = true;
+        req.stream_options = include_usage.then_some(StreamOptions {
+            include_usage: Some(true),
+        });
+        let mut meta = meta_plain();
+        meta.cached_tokens = 2;
+        meta.timing = Some(SeqTiming {
+            ttft_s: 0.1,
+            tpot_s: 0.01,
+            latency_s: 1.0,
+        });
+        let stream = synthetic_single_stream(vec![Ok(TokenChunk::Complete {
+            token_ids: vec![1],
+            finish_reason: FinishReason::Stop,
+            matched_stop: None,
+            usage: usage(3, 5),
+            logprobs: None,
+            input_logprobs: None,
+            meta,
+        })]);
+        let mut ctx = ctx_with(req);
+        ctx.reads_as_atom = true;
+        ctx.usage_on_finish = true;
+        let s = body_of(chat_streaming::process(stream, ctx, "regular")).await;
+        s.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|event| *event != "[DONE]")
+            .map(|event| serde_json::from_str(event).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_streaming_atom_usage_rides_on_the_finish_chunk_where_its_worker_puts_it() {
+        // As ATOM's HTTP chat_finish_frames with usage_on_finish (DeepSeek-V4.1's contract).
+        for include_usage in [false, true] {
+            let events = usage_on_finish_events(include_usage).await;
+            let (finish, before) = events.split_last().unwrap();
+            assert_eq!(finish["choices"][0]["finish_reason"], "stop");
+            let expected = serde_json::json!({
+                "prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8,
+                "prompt_tokens_details": {"cached_tokens": 2},
+            });
+            assert_eq!(finish["usage"], expected);
+            assert!(before.len() >= 2, "{before:?}");
+            for event in before {
+                // include_usage adds `usage: null` to every chunk before the finish chunk.
+                assert_eq!(
+                    event.get("usage"),
+                    include_usage.then_some(&serde_json::Value::Null)
+                );
+            }
+        }
+    }
+
     /// The first event of a stream whose only output decodes to no text.
     async fn first_event_without_text(reads_as_atom: bool) -> serde_json::Value {
         let mut req = ChatCompletionRequest::default();
@@ -1508,6 +1570,7 @@ mod c3_chat_streaming_parsers {
             configured_reasoning_parser: configured_reasoning.map(|s| s.to_string()),
             prompt_opener: None,
             reads_as_atom: false,
+            usage_on_finish: false,
         }
     }
 
@@ -1718,6 +1781,7 @@ mod c4_chat_streaming_coverage {
             configured_reasoning_parser: None,
             prompt_opener: None,
             reads_as_atom: false,
+            usage_on_finish: false,
         }
     }
 
@@ -1741,6 +1805,7 @@ mod c4_chat_streaming_coverage {
             configured_reasoning_parser: None,
             prompt_opener: None,
             reads_as_atom: false,
+            usage_on_finish: false,
         }
     }
 
@@ -1763,6 +1828,7 @@ mod c4_chat_streaming_coverage {
             configured_reasoning_parser: None,
             prompt_opener: None,
             reads_as_atom: false,
+            usage_on_finish: false,
         }
     }
 
@@ -2388,6 +2454,7 @@ mod c4_chat_streaming_coverage {
             configured_reasoning_parser: None,
             prompt_opener: None,
             reads_as_atom: false,
+            usage_on_finish: false,
         };
         let stream = synthetic_single_stream(vec![
             Ok(TokenChunk::Partial {
@@ -3168,6 +3235,7 @@ mod d2_generate_aggregator_branches {
             configured_reasoning_parser: None,
             prompt_opener: None,
             reads_as_atom: false,
+            usage_on_finish: false,
         };
         let stream = synthetic_single_stream(vec![Ok(TokenChunk::Complete {
             token_ids: vec![1, 2, 3],
@@ -3216,6 +3284,7 @@ mod d2_generate_aggregator_branches {
             configured_reasoning_parser: None,
             prompt_opener: None,
             reads_as_atom: false,
+            usage_on_finish: false,
         };
         let lp = TokenLogprobs {
             items: vec![TokenLogprob {
@@ -3630,6 +3699,7 @@ mod e2_generate_streaming_branches {
             configured_reasoning_parser: None,
             prompt_opener: None,
             reads_as_atom: false,
+            usage_on_finish: false,
         }
     }
 
@@ -4053,6 +4123,7 @@ mod f_atom_reasoning_opener {
             configured_reasoning_parser: Some("qwen3".to_string()),
             prompt_opener: opener.map(str::to_string),
             reads_as_atom: false,
+            usage_on_finish: false,
         }
     }
 
@@ -4287,6 +4358,7 @@ mod h_atom_native_tool_calls {
             configured_reasoning_parser: None,
             prompt_opener: None,
             reads_as_atom: true,
+            usage_on_finish: false,
         }
     }
 

@@ -1100,6 +1100,7 @@ mod f_response_context {
             configured_reasoning_parser: None,
             prompt_opener: None,
             reads_as_atom: false,
+            usage_on_finish: false,
         }
     }
 
@@ -1149,6 +1150,7 @@ mod f_response_context {
             configured_reasoning_parser: None,
             prompt_opener: None,
             reads_as_atom: false,
+            usage_on_finish: false,
         };
         assert_eq!(ctx.headers.as_ref().unwrap().get("x-trace").unwrap(), "abc");
     }
@@ -1173,6 +1175,7 @@ mod f_response_context {
             configured_reasoning_parser: None,
             prompt_opener: None,
             reads_as_atom: false,
+            usage_on_finish: false,
         };
         assert!(ctx.processed_messages.is_none());
     }
