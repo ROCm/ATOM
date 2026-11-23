@@ -3,6 +3,7 @@
 
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
+use std::time::Instant;
 
 use futures::{Stream, StreamExt};
 use http::StatusCode;
@@ -16,7 +17,7 @@ use crate::routers::token_handle::engine_error::EngineError;
 use crate::routers::token_handle::token_chunk::{
     FinishReason, MatchedStop, SeqTiming, TokenChunk, Usage, WorkerMeta,
 };
-use crate::routers::token_handle::token_handle::TokenSource;
+use crate::routers::token_handle::token_handle::{SourceClock, TokenSource};
 
 pub(crate) struct AtomStream {
     inner: Streaming<GenerateResponse>,
@@ -27,6 +28,7 @@ pub(crate) struct AtomStream {
     streamed: bool,
     completes: Vec<(u32, TokenChunk)>,
     finished: bool,
+    clock: SourceClock,
 }
 
 impl AtomStream {
@@ -37,6 +39,7 @@ impl AtomStream {
         request: GenerateRequest,
     ) -> Result<Self, EngineError> {
         let streamed = request.stream;
+        let started = Instant::now();
         let inner = client
             .generate(request)
             .await
@@ -47,9 +50,17 @@ impl AtomStream {
             streamed,
             completes: Vec::new(),
             finished: false,
+            clock: SourceClock {
+                started,
+                first_token: None,
+            },
         };
         let first = stream.next().await;
-        stream.first = Some(first.unwrap_or(Err(EngineError::DecodeIncomplete))?);
+        let first = first.unwrap_or(Err(EngineError::DecodeIncomplete))?;
+        if matches!(first, TokenChunk::Partial { .. }) {
+            stream.clock.first_token = Some(Instant::now());
+        }
+        stream.first = Some(first);
         Ok(stream)
     }
 }
@@ -117,6 +128,11 @@ impl TokenSource for AtomStream {
     /// Nothing to suppress: a cancelled call is ATOM's abort, and a finished
     /// call has nothing left to cancel.
     fn mark_completed(&mut self) {}
+
+    /// `open` reads the first message before any renderer starts its clock.
+    fn clock(&self) -> Option<SourceClock> {
+        Some(self.clock)
+    }
 }
 
 fn complete_chunk(complete: GenerateComplete) -> TokenChunk {
