@@ -1,0 +1,373 @@
+{
+  "case": "M3.1 ATOMesh native-vLLM TP4/TP4 1P1D c40",
+  "lease": "Lb4c8c6",
+  "node": "pit2-p03-g07",
+  "harness_sha": "28a2f5641380d07abc595d4417b48cb4cbdcd2a9",
+  "srt_runtime": {
+    "source_sha": "df706bc365e00bea74e5babe87b4049f624341ea",
+    "installed_hashes": {
+      "core/docker.py": "ab4d438a37299e01735596862fc434ed432f3337ce412bf25e6f8f2254fda0ee",
+      "core/launcher.py": "d8023788365855558dc7226057e31dca514e3969171caad672ff9bbc9364146d",
+      "core/runtime.py": "89f1d051a53a89f1fb6d5ff2671a705af335f0487b57741accdd0baf2df74c02",
+      "core/schema.py": "ff91c29d5d607ddd6367f452bfe8a1f6f00b664f62ff96838673aeb7b38f9f1c",
+      "frontends/atomesh.py": "a313fd62b933b487703baa6857f3fc4b5e7939ed9a0b98d51d8f53009bb9df53"
+    },
+    "python": "3.10.12 (main, Aug 31 2026, 10:18:17) [GCC 11.4.0]"
+  },
+  "router_runtime": {
+    "commit": "69ed5e77bcc93b9d51cb5cf1528badd0e703ed93",
+    "profile": "release",
+    "source_dirty": "false",
+    "cargo": "cargo 1.100.0 (3acc79c0c 2026-11-05)",
+    "binary_sha256": "6237ed6828b0a926ef83811c4fb5ad9128301ae6e343acff90dd97884381db7c",
+    "lockfile_sha256": "86354f5a25283aa2535ea97b2b6a937a7cc5860f6934d378ab91cd2d13db19b7",
+    "image_id": "sha256:d43e9cc9afcececc4913968afbe3d334658a0d21592f323410f03dd45b1a6741",
+    "base_image": "rocm/atom-dev:nightly_202611110332@sha256:19712185deac1eca8db5f21bc25ff2f9a3f44758bfd7cec8cc1c7889fbea097d",
+    "runtime_verified": true
+  },
+  "worker_image": "vllm/vllm-openai-rocm:minimax-m31-flash-75bc8cf1@sha256:f8e8ab239e5edb7c3070c5802fc7fc0cbb889513bf81183dfc98ce1c77e1dfe1",
+  "model": "amd/MiniMax-M3.1-Flash-Quark-MXFP4",
+  "gpus": 8,
+  "prefill_gpus": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "decode_gpus": [
+    4,
+    5,
+    6,
+    7
+  ],
+  "transport_adjustment": {
+    "reason": "The first full-run attempt failed before measurement because the local HIP IPC fast path returned invalid device context. De-prioritize HIP for buffers also registered with RDMA.",
+    "setting": "MC_DISABLE_HIP=1 on both roles",
+    "scope": "Same node and worker/router versions; this transport setting differs from the earlier functional baseline. No transport trace logging during measurement.",
+    "source": "kvcache-ai/Mooncake v0.3.14 multi_transport.cpp protocol_priority; flag confirmed in pinned image engine.so",
+    "engine_so_sha256": "540428ce937a5be29726195730246f053f88d3ddfabaa2af33ad79c7a92198a8"
+  },
+  "concurrency": 40,
+  "agentx_harness_version": "1.0.14",
+  "requested_duration_s": 3600,
+  "window": {
+    "start_ns": 1795446546898027186,
+    "end_ns": 1795450155624892246
+  },
+  "observation_duration_s": 3608.72686506,
+  "denominator_source": "server_metrics_export.json summary.phase_time_ranges.profiling; independently reconciled with total_osl / official output_token_throughput",
+  "benchmark_duration_metric_s": 3608.7160227840004,
+  "dataset": {
+    "source_type": "public_dataset",
+    "loader": "semianalysis_cc_traces_weka_062126",
+    "hf_dataset_name": "semianalysisai/cc-traces-weka-062126",
+    "hf_split": "train",
+    "num_dataset_entries": 393
+  },
+  "duration_coverage": [
+    {
+      "phase_name": "profiling",
+      "expected_duration_seconds": 3600.0,
+      "required_ratio": 0.95,
+      "ttft_ratio": 1.0,
+      "inter_token_latency_ratio": 1.0
+    }
+  ],
+  "agentx_submission_valid": true,
+  "formal_sa_submission": false,
+  "raw_record_counts": {
+    "warmup:error": 444,
+    "profiling:valid": 5971,
+    "profiling:cancelled": 0,
+    "profiling:error": 1
+  },
+  "unique_profiling_requests": 5972,
+  "output_tokens": 6594818,
+  "client_invalid_response_rate_pct": 0.016744809109176157,
+  "error_summary": [
+    {
+      "error_details": {
+        "type": "InvalidInferenceResultError",
+        "message": "InvalidInferenceResultError('Invalid inference result: No responses with actual content were received from the server (only usage/metadata, null/empty data, or [DONE] markers)')",
+        "cause_chain": [
+          "InvalidInferenceResultError"
+        ]
+      },
+      "count": 1
+    }
+  ],
+  "metrics": {
+    "time_to_first_token": {
+      "unit": "ms",
+      "avg": 3223.3653824096464,
+      "p1": 88.16828209999998,
+      "p5": 117.86328499999999,
+      "p10": 146.345892,
+      "p25": 252.58896049999998,
+      "p50": 1242.970965,
+      "p75": 5246.1902365,
+      "p90": 9093.345609,
+      "p95": 11329.0451135,
+      "p99": 16780.201764900008,
+      "min": 52.937034999999995,
+      "max": 25347.856359999998,
+      "std": 3991.594534995046,
+      "count": 5971,
+      "sum": 19246714.698367998
+    },
+    "inter_token_latency": {
+      "unit": "ms",
+      "avg": 2.25726163112821,
+      "p1": 0.0,
+      "p5": 1.2334114938145437,
+      "p10": 1.466040300061237,
+      "p25": 1.8086336031631856,
+      "p50": 2.2771972387096775,
+      "p75": 2.703603359904315,
+      "p90": 3.049212670416198,
+      "p95": 3.2944633572284316,
+      "p99": 3.843005108791209,
+      "min": 0.0,
+      "max": 8.608465571428571,
+      "std": 0.6899857815189621,
+      "count": 5971,
+      "sum": 13478.109199466542
+    },
+    "request_latency": {
+      "unit": "ms",
+      "avg": 5603.04176357729,
+      "p1": 245.78034970000002,
+      "p5": 423.12337499999995,
+      "p10": 609.0251139999999,
+      "p25": 1397.2871555,
+      "p50": 3754.143248,
+      "p75": 8173.789243499999,
+      "p90": 12866.782253,
+      "p95": 16034.093106499999,
+      "p99": 24763.11165600001,
+      "min": 86.59255,
+      "max": 119561.60574999999,
+      "std": 5947.819404950594,
+      "count": 5971,
+      "sum": 33455762.37032
+    },
+    "output_token_throughput": {
+      "unit": "tokens/sec",
+      "avg": 1827.4638803650082
+    },
+    "input_token_throughput": {
+      "unit": "tokens/sec",
+      "avg": 285120.0130888522
+    },
+    "total_token_throughput": {
+      "unit": "tokens/sec",
+      "avg": 286947.47696921724
+    },
+    "request_throughput": {
+      "unit": "requests/sec",
+      "avg": 1.6546001466089686
+    },
+    "effective_decode_throughput": {
+      "unit": "tokens/sec",
+      "avg": 1825.450983925602,
+      "p50": 2032.1642804685766,
+      "p90": 2528.6359811149523,
+      "p95": 2678.644571031438,
+      "p99": 3225.5729339268014,
+      "min": 0.0,
+      "max": 689427.682591743,
+      "std": 1376.944184070547
+    },
+    "effective_decode_throughput_per_user": {
+      "unit": "tokens/sec/user",
+      "avg": 473.1768583712244,
+      "p50": 469.6204565411255,
+      "p90": 667.235179837248,
+      "p95": 768.3557271190042,
+      "p99": 1058.8683591586682,
+      "min": 0.0,
+      "max": 661811.9847563684,
+      "std": 381.5264130583875
+    },
+    "e2e_normalized_interactivity_p75": {
+      "unit": "tokens/sec/user",
+      "avg": 72.38257707378978
+    },
+    "e2e_normalized_interactivity_p90": {
+      "unit": "tokens/sec/user",
+      "avg": 25.587485369884508
+    },
+    "input_sequence_length": {
+      "unit": "tokens",
+      "avg": 172319.58650142356,
+      "p1": 2556.4,
+      "p5": 20113.5,
+      "p10": 39573.0,
+      "p25": 65176.0,
+      "p50": 118133.0,
+      "p75": 236636.0,
+      "p90": 356519.0,
+      "p95": 500473.0,
+      "p99": 781144.8000000002,
+      "min": 315.0,
+      "max": 826631.0,
+      "std": 157567.5182392351,
+      "count": 5971,
+      "sum": 1028920251.0
+    },
+    "output_sequence_length": {
+      "unit": "tokens",
+      "avg": 1104.4746273656003,
+      "p1": 14.0,
+      "p5": 85.0,
+      "p10": 109.0,
+      "p25": 179.5,
+      "p50": 443.0,
+      "p75": 1148.5,
+      "p90": 2732.0,
+      "p95": 4385.0,
+      "p99": 8913.400000000021,
+      "min": 2.0,
+      "max": 59903.0,
+      "std": 2200.450748076122,
+      "count": 5971,
+      "sum": 6594818.0
+    },
+    "context_overflow_count": {
+      "unit": "requests",
+      "avg": 0.0
+    },
+    "adj_time_to_first_token": {
+      "unit": "ms",
+      "p1": 88.188779,
+      "p5": 117.892133,
+      "p10": 146.345892,
+      "p25": 252.65019199999998,
+      "p50": 1244.540039,
+      "p75": 5248.488682,
+      "p90": 9107.234511999999,
+      "p95": 11338.405012,
+      "p99": 16813.257181,
+      "min": 52.937034999999995,
+      "count": 5972
+    },
+    "adj_inter_token_latency": {
+      "unit": "ms",
+      "p1": 0.0,
+      "p5": 1.2339782767857144,
+      "p10": 1.466040300061237,
+      "p25": 1.8090286306382979,
+      "p50": 2.2772965468749997,
+      "p75": 2.7037498305681242,
+      "p90": 3.049323960629921,
+      "p95": 3.2948784082840237,
+      "p99": 3.844898362637362,
+      "min": 0.0,
+      "count": 5972
+    },
+    "adj_request_latency": {
+      "unit": "ms",
+      "p1": 246.189031,
+      "p5": 423.206842,
+      "p10": 609.0251139999999,
+      "p25": 1398.35478,
+      "p50": 3754.468625,
+      "p75": 8175.059631,
+      "p90": 12876.720287,
+      "p95": 16042.797829,
+      "p99": 24793.613568,
+      "min": 86.59255,
+      "count": 5972
+    }
+  },
+  "output_tps_per_allocated_gpu": 228.43298504562603,
+  "mooncake": {
+    "reported_transferred_bytes": 1806548828160.0,
+    "failed_transfers": 0.0,
+    "failed_receives": 0.0,
+    "expired_requests": 0.0
+  },
+  "decode_queue": {
+    "running": {
+      "avg": 4.027239150507849,
+      "min": 0.0,
+      "max": 5.0,
+      "std": 1.4092738123053654,
+      "p1": 0.0,
+      "p5": 1.0,
+      "p10": 2.0,
+      "p25": 3.0,
+      "p50": 5.0,
+      "p75": 5.0,
+      "p90": 5.0,
+      "p95": 5.0,
+      "p99": 5.0
+    },
+    "waiting": {
+      "avg": 5.119759926131117,
+      "min": 0.0,
+      "max": 32.0,
+      "std": 6.623216241818659,
+      "p1": 0.0,
+      "p5": 0.0,
+      "p10": 0.0,
+      "p25": 0.0,
+      "p50": 2.0,
+      "p75": 8.0,
+      "p90": 17.0,
+      "p95": 19.0,
+      "p99": 23.709999999999127
+    }
+  },
+  "natural_speculation": {
+    "config": {
+      "method": "dspark",
+      "num_speculative_tokens": 7,
+      "attention_backend": "TRITON_ATTN",
+      "kv_cache_dtype": "fp8",
+      "draft_sample_method": "probabilistic",
+      "rejection_sample_method": "block"
+    },
+    "accepted_tokens": 5112562.0,
+    "draft_tokens": 10475430.0,
+    "draft_calls": 1496490.0,
+    "token_acceptance_rate": 0.4880527100080856,
+    "mean_accepted_draft_tokens_excluding_bonus": 3.416368970056599,
+    "accepted_per_position": {
+      "0": 1251737.0,
+      "1": 1010750.0,
+      "2": 811668.0,
+      "3": 656970.0,
+      "4": 543592.0,
+      "5": 454432.0,
+      "6": 383413.0
+    },
+    "acceptance_rate_per_position": {
+      "0": 0.836448623111414,
+      "1": 0.6754138016291455,
+      "2": 0.5423811719423451,
+      "3": 0.4390072770282461,
+      "4": 0.3632446591691224,
+      "5": 0.3036652433360731,
+      "6": 0.25620819384025284
+    }
+  },
+  "exit_codes": {
+    "pool-workload.rc": 0,
+    "pool-exit.rc": 0,
+    "gpool-release.rc": 0
+  },
+  "cleanup": "Lease released normally; final own-container query empty and gpool mine reports no leases. Prefill exceeded the initial 30-second graceful shutdown wait, and cleanup escalated after export.",
+  "limits": [
+    "Single 8-GPU 1P1D point, not matched vllm-router A/B against the original 12-GPU 1P2D baseline",
+    "No accuracy or power measurement",
+    "One profiling response was rejected for empty content; not zero-error validation",
+    "No Pareto sweep and no explicit SLO threshold",
+    "MC_DISABLE_HIP=1 differs from the prior automatic-transport functional baseline; the IPC bug itself is not fixed"
+  ],
+  "artifact_sha256": {
+    "profile_export_aiperf.json": "5a9275bd2fdb2afb753a7e545dc7c6eebf356c0c7410b45c4a3a0313ed772064",
+    "server_metrics_export.json": "0ac4b77d20af104c75f17efe8000b8b31bbbb72741111790a8b0e1b5c7c799b6",
+    "profile_export.jsonl": "cb76bc8f3af46eeef1502b41bdc28d600f0676afd7c170c7af7195defd58e36e"
+  }
+}
