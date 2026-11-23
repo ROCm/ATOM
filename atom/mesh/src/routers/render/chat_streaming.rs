@@ -25,7 +25,10 @@ use crate::{
             response_context::{ProtocolRequest, ResponseContext},
             tool_constraints::{generate_tool_call_id, get_history_tool_calls_count},
         },
-        render::{logprob_conversion::token_logprobs_to_chat, with_cached_tokens},
+        render::{
+            atom_usage::{self, AtomUsage},
+            logprob_conversion::token_logprobs_to_chat,
+        },
         token_handle::{
             engine_error::EngineError,
             token_chunk::{FinishReason, MatchedStop, TokenChunk},
@@ -134,7 +137,7 @@ async fn run_chat_stream(
     let mut matched_stop_value: Option<Value> = None;
     let mut prompt_tokens: u32 = 0;
     let mut completion_tokens: u32 = 0;
-    let mut cached_tokens: u32 = 0;
+    let mut atom_usage: Option<AtomUsage> = None;
     let mut has_tool_call = false;
 
     let mut stop_decoder = ctx.stop_decoder;
@@ -273,7 +276,7 @@ async fn run_chat_stream(
 
                 prompt_tokens = usage.prompt_tokens;
                 completion_tokens = usage.completion_tokens;
-                cached_tokens = meta.cached_tokens;
+                atom_usage = AtomUsage::of([&meta]);
                 finish_reason_str = Some(finish_reason_to_string(&finish_reason));
                 matched_stop_value = matched_stop.map(|ms| match ms {
                     MatchedStop::Str(s) => Value::String(s),
@@ -333,23 +336,30 @@ async fn run_chat_stream(
             .map_err(|_| "send finish".to_string())?;
     }
 
-    if let Some(opts) = stream_options {
-        if opts.include_usage.unwrap_or(false) {
-            let usage_chunk = ChatCompletionStreamResponse::builder(request_id, model)
-                .created(created)
-                .usage(Usage {
-                    prompt_tokens,
-                    completion_tokens,
-                    total_tokens: prompt_tokens + completion_tokens,
-                    completion_tokens_details: None,
-                })
-                .maybe_system_fingerprint(system_fingerprint.clone())
-                .build();
-            let s = with_cached_tokens(&usage_chunk, cached_tokens)
-                .map_err(|e| format!("Failed to serialize usage chunk: {}", e))?;
-            tx.send(Ok(Bytes::from(format!("data: {}\n\n", s))))
-                .map_err(|_| "send usage".to_string())?;
+    // ATOM's HTTP chat ends every stream with its usage chunk (`chat_finish_frames`).
+    let include_usage = stream_options
+        .as_ref()
+        .is_some_and(|opts| opts.include_usage.unwrap_or(false));
+    if include_usage || atom_usage.is_some() {
+        let usage_chunk = ChatCompletionStreamResponse::builder(request_id, model)
+            .created(created)
+            .usage(Usage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens + completion_tokens,
+                completion_tokens_details: None,
+            })
+            .maybe_system_fingerprint(system_fingerprint.clone())
+            .build();
+        let s = match &atom_usage {
+            None => serde_json::to_string(&usage_chunk),
+            Some(atom) => atom
+                .extend_response(&usage_chunk, atom_usage::CHAT_STREAM)
+                .map(|v| v.to_string()),
         }
+        .map_err(|e| format!("Failed to serialize usage chunk: {}", e))?;
+        tx.send(Ok(Bytes::from(format!("data: {}\n\n", s))))
+            .map_err(|_| "send usage".to_string())?;
     }
 
     stream.mark_completed();

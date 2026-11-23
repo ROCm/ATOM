@@ -22,7 +22,10 @@ use crate::{
         generate::{GenerateFinishReason, GenerateRequest, GenerateResponse},
         sampling_params::SamplingParams,
     },
-    routers::comm::error,
+    routers::{
+        comm::error,
+        render::atom_usage::{self, AtomUsage},
+    },
 };
 
 /// Build a synthetic SGLang `GenerateRequest` from an OpenAI `CompletionRequest`.
@@ -204,8 +207,19 @@ pub(crate) async fn wrap_generate_response_as_completion(
         }
     };
 
+    // An ATOM worker's sequences carry their timing, which its usage reports.
+    let raw: Vec<Value> = serde_json::from_slice(&bytes).unwrap_or_default();
+    let meta_infos: Vec<&Value> = raw.iter().filter_map(|g| g.get("meta_info")).collect();
+    let atom = AtomUsage::of_meta_infos(&meta_infos);
+
     let completion = build_completion_response(gens, model);
-    let json = match serde_json::to_vec(&completion) {
+    let json = match atom {
+        None => serde_json::to_vec(&completion),
+        Some(atom) => atom
+            .extend_response(&completion, atom_usage::COMPLETION)
+            .and_then(|value| serde_json::to_vec(&value)),
+    };
+    let json = match json {
         Ok(v) => v,
         Err(e) => {
             return error::internal_error(

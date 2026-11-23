@@ -186,7 +186,8 @@ mod b2_chat_aggregator_branches {
     use crate::routers::token_handle::engine_error::EngineError;
     use crate::routers::token_handle::test_support::synthetic_single_stream;
     use crate::routers::token_handle::token_chunk::{
-        FinishReason, MatchedStop, TokenChunk, TokenLogprob, TokenLogprobs, Usage, WorkerMeta,
+        FinishReason, MatchedStop, SeqTiming, TokenChunk, TokenLogprob, TokenLogprobs, Usage,
+        WorkerMeta,
     };
     use crate::tokenizer::{traits::Tokenizer, MockTokenizer};
 
@@ -516,18 +517,61 @@ mod b2_chat_aggregator_branches {
         assert!(s.contains("\"total_tokens\":10"));
     }
 
-    #[tokio::test]
-    async fn test_aggregator_usage_reports_the_cached_prompt_tokens() {
+    /// A sibling's Complete as an ATOM worker reports it when `timed`, with `cached` tokens.
+    fn sibling(timed: Option<(f64, f64, f64)>, cached: u32) -> TokenChunk {
         let mut complete = cmpl(vec![1], FinishReason::Stop, None);
         if let TokenChunk::Complete { meta, .. } = &mut complete {
-            meta.cached_tokens = 2;
+            meta.cached_tokens = cached;
+            meta.timing = timed.map(|(ttft_s, tpot_s, latency_s)| SeqTiming {
+                ttft_s,
+                tpot_s,
+                latency_s,
+            });
         }
-        let stream = synthetic_single_stream(vec![Ok(complete)]);
+        complete
+    }
+
+    async fn usage_of(completes: Vec<TokenChunk>) -> serde_json::Value {
+        let stream = synthetic_single_stream(completes.into_iter().map(Ok).collect());
         let req = ChatCompletionRequest::default();
         let resp = chat_aggregator::process(stream, ctx_with(req)).await;
         let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["usage"]["prompt_tokens_details"]["cached_tokens"], 2);
+        json["usage"].clone()
+    }
+
+    #[tokio::test]
+    async fn test_aggregator_usage_reports_atom_s_cached_tokens_and_timing() {
+        let usage = usage_of(vec![sibling(Some((0.123456, 0.01, 1.5)), 2)]).await;
+        let expected = serde_json::json!({
+            "prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5,
+            "prompt_tokens_details": {"cached_tokens": 2},
+            "ttft_s": 0.1235, "tpot_s": 0.01, "latency_s": 1.5,
+        });
+        assert_eq!(usage, expected);
+
+        // An SGLang or vLLM worker's usage keeps its shape.
+        let usage = usage_of(vec![sibling(None, 2)]).await;
+        let expected = serde_json::json!({
+            "prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5,
+        });
+        assert_eq!(usage, expected);
+    }
+
+    #[tokio::test]
+    async fn test_aggregator_usage_of_atom_siblings_counts_the_prompt_once() {
+        let usage = usage_of(vec![
+            sibling(Some((0.1, 0.02, 1.0)), 2),
+            sibling(Some((0.3, 0.01, 0.5)), 2),
+        ])
+        .await;
+        // Cached tokens of the shared prompt once, the slowest timing, and n.
+        let expected = serde_json::json!({
+            "prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7,
+            "prompt_tokens_details": {"cached_tokens": 2},
+            "ttft_s": 0.3, "tpot_s": 0.02, "latency_s": 1.0, "num_choices": 2,
+        });
+        assert_eq!(usage, expected);
     }
 
     #[tokio::test]
@@ -945,7 +989,8 @@ mod c2_chat_streaming_branches {
     use crate::routers::token_handle::engine_error::EngineError;
     use crate::routers::token_handle::test_support::synthetic_single_stream;
     use crate::routers::token_handle::token_chunk::{
-        FinishReason, MatchedStop, TokenChunk, TokenLogprob, TokenLogprobs, Usage, WorkerMeta,
+        FinishReason, MatchedStop, SeqTiming, TokenChunk, TokenLogprob, TokenLogprobs, Usage,
+        WorkerMeta,
     };
     use crate::tokenizer::{traits::Tokenizer, MockTokenizer};
 
@@ -1209,15 +1254,20 @@ mod c2_chat_streaming_branches {
         assert!(s.contains("\"total_tokens\":8") || s.contains("total_tokens"));
     }
 
-    #[tokio::test]
-    async fn test_streaming_usage_chunk_reports_the_cached_prompt_tokens() {
+    /// The usage chunk of a stream whose Complete `timed` (an ATOM worker's) or not.
+    async fn usage_chunk(include_usage: bool, timed: bool) -> Option<serde_json::Value> {
         let mut req = ChatCompletionRequest::default();
         req.stream = true;
-        req.stream_options = Some(StreamOptions {
+        req.stream_options = include_usage.then_some(StreamOptions {
             include_usage: Some(true),
         });
         let mut meta = meta_plain();
         meta.cached_tokens = 2;
+        meta.timing = timed.then_some(SeqTiming {
+            ttft_s: 0.1,
+            tpot_s: 0.01,
+            latency_s: 1.0,
+        });
         let stream = synthetic_single_stream(vec![Ok(TokenChunk::Complete {
             token_ids: vec![1],
             finish_reason: FinishReason::Stop,
@@ -1229,9 +1279,28 @@ mod c2_chat_streaming_branches {
         })]);
         let s = body_of(chat_streaming::process(stream, ctx_with(req), "regular")).await;
         let mut events = s.lines().filter_map(|line| line.strip_prefix("data: "));
-        let usage_chunk = events.find(|e| e.contains("\"usage\"")).unwrap();
-        let json: serde_json::Value = serde_json::from_str(usage_chunk).unwrap();
-        assert_eq!(json["usage"]["prompt_tokens_details"]["cached_tokens"], 2);
+        let chunk = events.find(|e| e.contains("\"usage\""))?;
+        Some(serde_json::from_str(chunk).unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_streaming_atom_usage_chunk_ends_every_stream_with_the_cached_tokens() {
+        // After the finish chunk, as ATOM's HTTP chat_finish_frames sends it.
+        for include_usage in [false, true] {
+            let chunk = usage_chunk(include_usage, true)
+                .await
+                .expect("a usage chunk");
+            assert_eq!(chunk["choices"], serde_json::json!([]));
+            let expected = serde_json::json!({
+                "prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8,
+                "prompt_tokens_details": {"cached_tokens": 2},
+            });
+            assert_eq!(chunk["usage"], expected);
+        }
+        // An SGLang or vLLM stream keeps its opt-in usage chunk, without the cached tokens.
+        assert!(usage_chunk(false, false).await.is_none());
+        let chunk = usage_chunk(true, false).await.expect("a usage chunk");
+        assert!(chunk["usage"].get("prompt_tokens_details").is_none());
     }
 
     #[tokio::test]

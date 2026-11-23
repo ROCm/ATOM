@@ -25,7 +25,10 @@ use crate::{
                 generate_tool_call_id, get_history_tool_calls_count, parse_json_schema_response,
             },
         },
-        render::{logprob_conversion::token_logprobs_to_chat, with_cached_tokens},
+        render::{
+            atom_usage::{self, AtomUsage},
+            logprob_conversion::token_logprobs_to_chat,
+        },
         token_handle::{
             engine_error::EngineError,
             token_chunk::{FinishReason, MatchedStop, TokenChunk},
@@ -43,13 +46,13 @@ use crate::{
 };
 
 pub async fn process(stream: TokenHandle, ctx: ResponseContext) -> Response {
-    let (resp, cached_tokens) = match aggregate(stream, ctx).await {
-        Ok(answer) => answer,
-        Err(resp) => return resp,
-    };
-    match with_cached_tokens(&resp, cached_tokens) {
-        Ok(body) => axum::Json(body).into_response(),
-        Err(e) => error::internal_error("serialization_failed", e.to_string()),
+    match aggregate(stream, ctx).await {
+        Ok((resp, None)) => axum::Json(resp).into_response(),
+        Ok((resp, Some(atom))) => match atom.extend_response(&resp, atom_usage::CHAT) {
+            Ok(value) => axum::Json(value).into_response(),
+            Err(e) => error::internal_error("serialization_failed", e.to_string()),
+        },
+        Err(resp) => resp,
     }
 }
 
@@ -60,11 +63,11 @@ pub async fn process_typed(
     Ok(aggregate(stream, ctx).await?.0)
 }
 
-/// The response and the prompt tokens its completes report cached.
+/// The response, and ATOM's usage additions where an ATOM worker answered.
 async fn aggregate(
     stream: TokenHandle,
     ctx: ResponseContext,
-) -> Result<(ChatCompletionResponse, u32), Response> {
+) -> Result<(ChatCompletionResponse, Option<AtomUsage>), Response> {
     let chat_request = match &ctx.original {
         ProtocolRequest::Chat(r) => Arc::clone(r),
         ProtocolRequest::Generate(_) => {
@@ -151,18 +154,17 @@ async fn aggregate(
         _ => None,
     });
 
-    let (usage, cached_tokens) = build_usage(&completes);
     let response = ChatCompletionResponse::builder(
         &ctx.request_id,
         ctx.model_id.as_deref().unwrap_or(&chat_request.model),
     )
     .created(ctx.created)
     .choices(choices)
-    .usage(usage)
+    .usage(build_usage(&completes))
     .maybe_system_fingerprint(weight_version)
     .build();
 
-    Ok((response, cached_tokens))
+    Ok((response, AtomUsage::of_completes(&completes)))
 }
 
 async fn collect_completes(mut stream: TokenHandle) -> Result<Vec<TokenChunk>, Response> {
@@ -411,25 +413,21 @@ async fn parse_tool_calls(
     }
 }
 
-/// The completes' usage, and the prompt tokens they report cached, which `Usage` cannot hold.
-fn build_usage(completes: &[TokenChunk]) -> (Usage, u32) {
+fn build_usage(completes: &[TokenChunk]) -> Usage {
     let mut prompt = 0u32;
     let mut completion = 0u32;
-    let mut cached = 0u32;
     for c in completes {
-        if let TokenChunk::Complete { usage, meta, .. } = c {
+        if let TokenChunk::Complete { usage, .. } = c {
             prompt += usage.prompt_tokens;
             completion += usage.completion_tokens;
-            cached += meta.cached_tokens;
         }
     }
-    let usage = Usage {
+    Usage {
         prompt_tokens: prompt,
         completion_tokens: completion,
         total_tokens: prompt + completion,
         completion_tokens_details: None,
-    };
-    (usage, cached)
+    }
 }
 
 fn finish_reason_to_str(r: &FinishReason) -> &'static str {

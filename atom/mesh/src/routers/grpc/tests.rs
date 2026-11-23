@@ -805,6 +805,15 @@ mod h_completion_adapter {
         completion_to_generate, wrap_generate_response_as_completion,
         wrap_streaming_generate_as_completion,
     };
+    use crate::routers::prepare::response_context::{ProtocolRequest, ResponseContext};
+    use crate::routers::prepare::stop_decoder_builder::create_stop_decoder;
+    use crate::routers::render::generate_aggregator;
+    use crate::routers::token_handle::test_support::synthetic_single_stream;
+    use crate::routers::token_handle::token_chunk::{
+        FinishReason, SeqTiming, TokenChunk, Usage, WorkerMeta,
+    };
+    use crate::tokenizer::{traits::Tokenizer, MockTokenizer};
+    use std::sync::Arc;
 
     fn minimal_completion_request() -> CompletionRequest {
         serde_json::from_value(json!({
@@ -1569,6 +1578,89 @@ mod h_completion_adapter {
         let compl = usage["completion_tokens"].as_u64().unwrap();
         let total = usage["total_tokens"].as_u64().unwrap();
         assert_eq!(total, prompt + compl);
+    }
+
+    /// The `/generate` body the aggregator answers `completes` with, as an upstream response.
+    async fn generated(completes: Vec<TokenChunk>) -> Response {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+        let req: crate::protocols::generate::GenerateRequest =
+            serde_json::from_str(r#"{"text": "hi"}"#).unwrap();
+        let ctx = ResponseContext {
+            original: ProtocolRequest::Generate(Arc::new(req)),
+            model_id: Some("m".to_string()),
+            headers: None,
+            original_text: Some("hi".to_string()),
+            processed_messages: None,
+            stop_decoder: create_stop_decoder(&tokenizer, None, None, true, false),
+            tokenizer,
+            request_id: "cmpl-1".to_string(),
+            created: 0,
+            tool_parser_factory: None,
+            reasoning_parser_factory: None,
+            configured_tool_parser: None,
+            configured_reasoning_parser: None,
+            prompt_opener: None,
+        };
+        let stream = synthetic_single_stream(completes.into_iter().map(Ok).collect());
+        generate_aggregator::process(stream, ctx).await
+    }
+
+    fn sibling(timing: Option<SeqTiming>) -> TokenChunk {
+        TokenChunk::Complete {
+            token_ids: vec![1],
+            finish_reason: FinishReason::Stop,
+            matched_stop: None,
+            usage: Usage {
+                prompt_tokens: 3,
+                completion_tokens: 1,
+                total_tokens: 4,
+            },
+            logprobs: None,
+            input_logprobs: None,
+            meta: WorkerMeta {
+                cached_tokens: 2,
+                timing,
+                ..Default::default()
+            },
+        }
+    }
+
+    async fn completion_usage(completes: Vec<TokenChunk>) -> Value {
+        let upstream = generated(completes).await;
+        let resp = wrap_generate_response_as_completion(upstream, "m".into()).await;
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        serde_json::from_slice::<Value>(&body).unwrap()["usage"].clone()
+    }
+
+    #[tokio::test]
+    async fn an_atom_completion_reports_its_timing_once_per_request() {
+        let timed = |ttft_s, latency_s| {
+            Some(SeqTiming {
+                ttft_s,
+                tpot_s: 0.01,
+                latency_s,
+            })
+        };
+        let usage = completion_usage(vec![sibling(timed(0.1, 1.0))]).await;
+        let expected = json!({
+            "prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4,
+            "ttft_s": 0.1, "tpot_s": 0.01, "latency_s": 1.0,
+        });
+        assert_eq!(usage, expected);
+
+        // n=2: the prompt once, the slowest sibling's timing, and n.
+        let usage =
+            completion_usage(vec![sibling(timed(0.1, 2.0)), sibling(timed(0.3, 1.0))]).await;
+        let expected = json!({
+            "prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5,
+            "ttft_s": 0.3, "tpot_s": 0.01, "latency_s": 2.0, "num_choices": 2,
+        });
+        assert_eq!(usage, expected);
+
+        // An SGLang or vLLM completion keeps its usage.
+        let usage = completion_usage(vec![sibling(None)]).await;
+        let expected = json!({"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4});
+        assert_eq!(usage, expected);
     }
 }
 
