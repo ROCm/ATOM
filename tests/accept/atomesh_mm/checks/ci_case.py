@@ -17,7 +17,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from mmstar import env, finish, run_check
+from _common import env, finish, run_check
 
 ROOT = Path(__file__).resolve().parents[4]
 MODEL = "MiniMax-M3.1-Flash-MXFP4"

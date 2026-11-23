@@ -18,8 +18,8 @@ from base64 import b64encode
 from concurrent.futures import ThreadPoolExecutor
 
 import pyarrow.parquet as pq
+from _common import env, finish, reference, run_check
 from huggingface_hub import hf_hub_download
-from mmstar import env, finish, reference, run_check
 
 IMAGES = 4
 CONCURRENCY = 32

@@ -42,6 +42,12 @@ CHECK_ENV=${CHECK_PY%.py}.env
 source "$HERE/lib.sh"
 REF_TOPOLOGY=""
 source "$HERE/topologies/$TOPOLOGY.sh"
+# A check that reads ATOMesh's log (REQUIRES_MESH in checks/<check>.env)
+# cannot run on a topology that starts no ATOMesh.
+if [[ -n ${REQUIRES_MESH:-} ]] && ! declare -f topology_up | grep -q launch_mesh; then
+  report "$CHECK needs ATOMesh, which topology $TOPOLOGY does not run"
+  exit 1
+fi
 
 RESULTS_DIR=$ACCEPT_DIR/results
 RUN_DIR=$RESULTS_DIR/$MODEL/$TOPOLOGY/$CHECK.$(date +%Y%m%d-%H%M%S)
@@ -65,6 +71,7 @@ RUN_CHECK=(in_role client
   -e "ACCEPT_MODEL=$MODEL" -e "ACCEPT_TOPOLOGY=$TOPOLOGY" -e "ACCEPT_CHECK=$CHECK"
   -e "ENDPOINT=$ENDPOINT" -e "SERVED_MODEL=$SERVED_MODEL" -e "RUN_DIR=$RUN_DIR"
   -e "RESULTS_DIR=$RESULTS_DIR" -e "REF_TOPOLOGY=$REF_TOPOLOGY" -e "LIMIT=${LIMIT:-}"
+  -e "MMSTAR_THRESHOLD=${MMSTAR_THRESHOLD:-}"
   -e "MMMU_PRO_REF_STANDARD=${MMMU_PRO_REF_STANDARD:-}" -e "MMMU_PRO_REF_VISION=${MMMU_PRO_REF_VISION:-}"
   -- python3 "$CHECK_PY")
 if ! declare -F topology_counters >/dev/null; then
