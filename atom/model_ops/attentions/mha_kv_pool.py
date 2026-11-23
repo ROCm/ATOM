@@ -373,6 +373,13 @@ class MhaKvPool:
             self.field_view("v_scale", layer, torch.float32, shape),
         )
 
+    def _arenas(self) -> list[LayerMajorArena]:
+        return [a for a in (self.cache, self.scale, self.extra) if a is not None]
+
+    @property
+    def entries(self) -> int:
+        return self.cache.entries
+
     def region_tensors(self) -> list[tuple[str, torch.Tensor]]:
         """One `(role, tensor)` per (field, layer), in declared field order.
 
@@ -381,11 +388,12 @@ class MhaKvPool:
         contiguous range is one entry. The role is a label for the reader:
         `set_block_count`'s refusal says `k` of layer 12, not region 37.
         """
-        return [
-            (f"{name}.layer_{layer}", view[layer])
-            for name, view in self._views.items()
-            for layer in range(len(view))
-        ]
+        return [region for arena in self._arenas() for region in arena.region_tensors()]
+
+    def region_layout(self) -> list[tuple[int, int]]:
+        """`region_tensors`' `(base address, bytes per entry)`, from the
+        declared offsets (`LayerMajorArena.region_layout`)."""
+        return [region for arena in self._arenas() for region in arena.region_layout()]
 
     def transfer_pages(
         self,
@@ -413,7 +421,9 @@ class MhaKvPool:
                     page = self.block_size if page_tokens is None else page_tokens[row]
                     if self.entry_tokens % page:
                         raise ValueError(f"{page}-token pages do not tile {name}")
-                    runs = (self.entry_tokens // page, self.num_kv_heads)
+                    count, heads = self.entry_tokens // page, self.num_kv_heads
+                    unit = view[row].stride(0) * view[row].element_size()
+                    runs = (heads, (unit // (count * heads),) * count)
                     layer = layers[row]
                     dim, dtype = (
                         (self.head_dim, self.kv_dtype)

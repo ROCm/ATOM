@@ -479,8 +479,10 @@ class EngineCore:
     def _report_held_kv_work(self) -> None:
         """Let transfers already in flight report back while no forward runs.
 
-        Starts none, and runs nothing while the weights (and so the KV pool)
-        may be released.
+        Starts no new transfer, except that with ``ATOM_STORE_ASYNC_RENEW`` the
+        metadata build may dispatch the GET of a load parked on its lease
+        renewal. Runs nothing while the weights (and so the KV pool) may be
+        released.
         """
         if not self._is_rl_weights_offloaded and self.has_pending_kv_work():
             self._advance_idle_kv_transfer(dispatch_new=False)
@@ -502,7 +504,9 @@ class EngineCore:
     def prepare_kv_change(self, *, weights: bool, deadline: float) -> None:
         """Get the KV pool ready to be zeroed, freed or recomputed, or raise.
 
-        Waits until KV transfers in flight have reported back, then preempts
+        Waits until KV transfers in flight have reported back (with
+        ``ATOM_STORE_ASYNC_RENEW`` a load parked on its lease renewal counts,
+        and the metadata build may dispatch its GET meanwhile), then preempts
         what is running so it recomputes on what follows; an image decode leg
         whose media its prefill kept cannot recompute, and is finished
         instead (`Scheduler.preempt_running`). When the weights
@@ -750,7 +754,9 @@ class EngineCore:
         # No forward batch will run this tick, but offload load/save work may
         # still need to be dispatched or reported back to the scheduler.
         # `dispatch_new=False` on the shutdown drain: report in-flight work
-        # back, but start no new transfers (see `_dispatch_idle_offload_work`).
+        # back, but start no new transfers (see `_dispatch_idle_offload_work`);
+        # with `ATOM_STORE_ASYNC_RENEW` the metadata build may still dispatch
+        # the GET of a load parked on its lease renewal.
         now = time.monotonic()
         if now < self._next_idle_kv_drain:
             return
@@ -769,7 +775,9 @@ class EngineCore:
         transfers finish and report, but must not publish new state loads/stores.
         A fresh store dispatched here spills bytes nothing will read back, and --
         worse -- keeps `has_pending_kv_work()` True, so this very loop could
-        manufacture its own work and never converge before the deadline.
+        manufacture its own work and never converge before the deadline. The
+        one exception: with `ATOM_STORE_ASYNC_RENEW` the metadata build may
+        dispatch the GET of a load already parked on its lease renewal.
         """
         if not self.kv_transfer_enabled:
             return
@@ -857,7 +865,9 @@ class EngineCore:
         # read back, and -- worse -- each fresh store keeps `has_pending_kv_work`
         # True, so the drain loop that waits on it manufactures its own exit
         # condition and never converges. Still build/process the meta so
-        # already-dispatched transfers finish and report.
+        # already-dispatched transfers finish and report (with
+        # `ATOM_STORE_ASYNC_RENEW` that build may dispatch the GET of a load
+        # parked on its lease renewal).
         if dispatch_new:
             publish_idle_state_work(self.scheduler)
         meta = connector.build_connector_meta()
