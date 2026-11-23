@@ -98,6 +98,20 @@ def configurations(contract, model_path, run_dir, experiment_dir, fabric, uid):
     }
     cluster["default_mounts"] = {str(run_dir / "bin"): "/opt/atomesh-ci-bin"}
     cluster["default_bash_preamble"] = "export PATH=/opt/atomesh-ci-bin:$PATH"
+    # Match the existing Spur container's writable cache paths for its required UID.
+    cache = f"/tmp/atomesh-cache-{run_dir.name}"
+    container_env = {
+        "HOME": f"/tmp/atomesh-home-{run_dir.name}",
+        "XDG_CACHE_HOME": cache,
+        "TORCHINDUCTOR_CACHE_DIR": f"{cache}/torchinductor",
+        "AITER_CACHE_DIR": f"{cache}/aiter",
+        "AITER_JIT_DIR": f"{cache}/aiter/jit",
+        "FLYDSL_RUNTIME_CACHE_DIR": f"{cache}/flydsl",
+        "USER": os.environ.get("USER", uid.split(":")[0]),
+        "LOGNAME": os.environ.get("USER", uid.split(":")[0]),
+    }
+    for key, value in container_env.items():
+        cluster["docker_args"].extend(["-e", f"{key}={value}"])
     for group in ("VIDEO_GID", "RENDER_GID"):
         if os.environ.get(group):
             cluster["docker_args"].extend(["--group-add", os.environ[group]])
