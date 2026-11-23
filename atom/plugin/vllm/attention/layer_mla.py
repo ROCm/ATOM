@@ -638,7 +638,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
             )
             k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-            k = cat_prefill_k(k_nope, k_pe)
+            k = cat_prefill_k(k_nope, k_pe, copies=True)
 
             attn_output, attn_softmax_lse = self._run_prefill_context_chunk(
                 prefill=prefill_metadata,
@@ -707,7 +707,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             )
             k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 
-            k = cat_prefill_k(k_nope, k_pe)
+            k = cat_prefill_k(k_nope, k_pe, copies=True)
 
             attn_output, attn_softmax_lse = self._run_prefill_context_chunk(
                 prefill=prefill_metadata,

@@ -216,7 +216,10 @@ def test_supported_gate(monkeypatch):
     assert not ok(k_nope, k_rope.transpose(0, 2).contiguous().transpose(0, 2))
 
 
-def test_fallback_is_torch_cat(monkeypatch):
+@pytest.mark.parametrize("copies", [False, True])
+def test_fallback_is_the_sites_own(monkeypatch, copies):
+    """Below the gate a site keeps what it did on main: torch.cat, or with
+    `copies` the two-copy write."""
     k_nope, _, k_rope = _inputs(5, 16)
     assert not kcat._prefill_k_cat_supported(k_nope, k_rope)
     wide = k_rope.expand(-1, 16, -1)
@@ -226,9 +229,9 @@ def test_fallback_is_torch_cat(monkeypatch):
     monkeypatch.setattr(
         kcat.torch, "cat", lambda *a, **k: calls.append(1) or real_cat(*a, **k)
     )
-    outs = [kcat.cat_prefill_k(k_nope, k_rope), kcat.cat_prefill_k(k_nope, wide)]
+    outs = [kcat.cat_prefill_k(k_nope, r, copies=copies) for r in (k_rope, wide)]
     monkeypatch.undo()
-    assert len(calls) == 2
+    assert len(calls) == (0 if copies else 2)
     for out, ref in zip(outs, refs):
         _assert_same(out, ref)
 
@@ -236,20 +239,28 @@ def test_fallback_is_torch_cat(monkeypatch):
 def test_vllm_plugin_k_sites_call_cat_prefill_k():
     """The plugin is not imported on the CPU job, so check its source: every
     MLA prefill K is built by `cat_prefill_k`, none by `torch.cat` of the
-    expanded rope."""
+    expanded rope, and the two sites that used two copies on main keep them
+    below the gate (`copies=True`)."""
     tree = ast.parse(
         (ROOT / "atom/plugin/vllm/attention/layer_mla.py").read_text(encoding="utf-8")
     )
-    k_sites, rope_cats = 0, []
+    k_sites, rope_cats = [], []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         name = ast.unparse(node.func)
         if name == "cat_prefill_k":
-            k_sites += 1
+            copies = any(
+                kw.arg == "copies" and ast.literal_eval(kw.value)
+                for kw in node.keywords
+            )
+            k_sites.append((node.lineno, copies))
         elif name == "torch.cat" and ".expand(" in ast.unparse(node):
             rope_cats.append(ast.unparse(node))
-    assert k_sites == 4 and not rope_cats, (k_sites, rope_cats)
+    assert not rope_cats, rope_cats
+    # In source order: the two prefill-context sites (context-parallel and
+    # plain) used two copies on main, the two `_forward_prefill` sites torch.cat.
+    assert [c for _, c in sorted(k_sites)] == [True, True, False, False], k_sites
 
 
 class _KvB:

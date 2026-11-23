@@ -83,18 +83,32 @@ def _prefill_k_cat_supported(k_nope: torch.Tensor, k_rope: torch.Tensor) -> bool
     )
 
 
-def cat_prefill_k(k_nope: torch.Tensor, k_rope: torch.Tensor) -> torch.Tensor:
+def cat_prefill_k(
+    k_nope: torch.Tensor, k_rope: torch.Tensor, copies: bool = False
+) -> torch.Tensor:
     """K for MLA prefill attention: ``k_nope`` [T, H, nope] followed by
     ``k_rope`` [T, 1, rope] broadcast over the heads, in one new contiguous
     [T, H, nope + rope] tensor. The bytes are those of ``torch.cat``.
 
     One Triton copy on gfx1250 from ``_PREFILL_K_CAT_MIN_TOKEN_HEADS``
-    token-heads, with unit last strides, one dtype and power-of-two widths;
-    everything else (fewer token-heads, other arches, CPU tensors, other
-    layouts) is ``torch.cat`` of the expanded ``k_rope``.
+    token-heads, with unit last strides, one dtype and power-of-two widths.
+    Everything else (fewer token-heads, other arches, CPU tensors, other
+    layouts) is what the call site did before: ``torch.cat`` of the expanded
+    ``k_rope``, or with ``copies`` the two slices of a new tensor written by
+    two copies.
     """
     if not _prefill_k_cat_supported(k_nope, k_rope):
-        return torch.cat((k_nope, k_rope.expand(*k_nope.shape[:-1], -1)), dim=-1)
+        if not copies:
+            return torch.cat((k_nope, k_rope.expand(*k_nope.shape[:-1], -1)), dim=-1)
+        nope_dim = k_nope.shape[-1]
+        k = torch.empty(
+            (*k_nope.shape[:-1], nope_dim + k_rope.shape[-1]),
+            dtype=k_nope.dtype,
+            device=k_nope.device,
+        )
+        k[..., :nope_dim] = k_nope
+        k[..., nope_dim:] = k_rope
+        return k
     tokens, heads, nope_dim = k_nope.shape
     rope_dim = k_rope.shape[-1]
     k = torch.empty(
