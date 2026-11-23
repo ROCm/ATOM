@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock, Weak};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::{Stream, StreamExt};
 use http::StatusCode;
@@ -31,7 +31,7 @@ use crate::routers::grpc::engine::worker_client_cache::{get_grpc_client_from_wor
 use crate::routers::prepare::generation_payload::GenerationPayload;
 use crate::routers::token_handle::engine_error::EngineError;
 use crate::routers::token_handle::token_chunk::TokenChunk;
-use crate::routers::token_handle::token_handle::{TokenHandle, TokenSource};
+use crate::routers::token_handle::token_handle::{SourceClock, TokenHandle, TokenSource};
 use crate::tokenizer::traits::Tokenizer;
 
 /// Runs ATOM pairs as ATOM's HTTP P/D router does: relay, or chunked when P's
@@ -103,6 +103,7 @@ impl AtomPairs {
         payload: &GenerationPayload,
         tokenizer: Option<&dyn Tokenizer>,
     ) -> Result<TokenHandle, EngineError> {
+        let started = Instant::now();
         let prefill =
             apply_atom_pd_rank_mapping_policy(self.mapping, &self.workers, prefill.clone(), decode);
         let prefill_load = WorkerLoadGuard::new(prefill.clone(), None);
@@ -121,6 +122,7 @@ impl AtomPairs {
         Ok(TokenHandle::new(DecodeStream {
             stream,
             _load: decode_load,
+            started,
         }))
     }
 
@@ -335,6 +337,8 @@ fn internal(error: impl std::fmt::Display) -> EngineError {
 struct DecodeStream {
     stream: AtomStream,
     _load: WorkerLoadGuard,
+    /// When the pair began, so the TTFT a renderer measures includes P's part.
+    started: Instant,
 }
 
 impl Stream for DecodeStream {
@@ -348,5 +352,13 @@ impl Stream for DecodeStream {
 impl TokenSource for DecodeStream {
     fn mark_completed(&mut self) {
         self.stream.mark_completed();
+    }
+
+    fn clock(&self) -> Option<SourceClock> {
+        let clock = self.stream.clock()?;
+        Some(SourceClock {
+            started: self.started,
+            ..clock
+        })
     }
 }

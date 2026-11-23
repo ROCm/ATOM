@@ -1037,6 +1037,36 @@ mod pairs {
         assert_eq!(tp_and_chunked(&decodes[1]), (json!(4), Value::Null));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pairs_streamed_ttft_includes_the_prefill() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let metrics = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let (p, p_url) = instance(vec![vec![]], true, prefill_info(2, None)).await;
+        let d_script = vec![vec![chunk(&[21]), complete(&[], "eos")]];
+        let (_, d_url) = instance(d_script, false, None).await;
+        let workers = [worker(&p_url, PREFILL), worker(&d_url, WorkerType::Decode)];
+        let request = start(router(&workers).await, true);
+
+        let prefill_call = calls(&p, 1).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        prefill_call
+            .send(Ok(prefill_done(json!({}))))
+            .await
+            .unwrap();
+        drop(prefill_call);
+        let response = finish(request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let rendered = metrics.render();
+        let ttft: f64 = rendered
+            .lines()
+            .find(|line| line.starts_with("mesh_router_ttft_seconds_sum{"))
+            .and_then(|line| line.rsplit_once(' ')?.1.parse().ok())
+            .unwrap_or_else(|| panic!("no TTFT recorded: {rendered}"));
+        assert!(ttft >= 0.3, "TTFT {ttft} s misses the prefill");
+    }
+
     #[tokio::test]
     async fn each_rank_takes_its_instances_info_and_idx2idx_runs_prefill_on_decodes_rank() {
         let (p, p_url) = instance(vec![vec![]], true, prefill_info(4, Some(template()))).await;
