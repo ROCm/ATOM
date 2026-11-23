@@ -14,8 +14,9 @@ import pytest
 ACCEPT = Path(__file__).parent / "accept" / "atomesh_mm"
 
 DECISION = (
-    "\x1b[2m2026-11-13\x1b[0m routing decision \x1b[3mpool\x1b[0m\x1b[2m=\x1b[0m"
-    '"{pool}" \x1b[3mmedia_digests\x1b[0m\x1b[2m=\x1b[0m{media}\n'
+    "\x1b[2m2026-11-13\x1b[0m \x1b[32m INFO\x1b[0m \x1b[2mmesh::route\x1b[0m\x1b[2m:\x1b[0m "
+    "Selected worker \x1b[3mpool\x1b[0m\x1b[2m=\x1b[0m"
+    '"{pool}" \x1b[3mmedia_count\x1b[0m\x1b[2m=\x1b[0m{media}\n'
 )
 SERVED = 'INFO:     10.0.0.1:1 - "POST /v1/chat/completions HTTP/1.1" 200 OK\n'
 FELL_BACK = (

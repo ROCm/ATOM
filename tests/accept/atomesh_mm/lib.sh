@@ -147,7 +147,8 @@ build_mesh() {
 }
 
 # launch_mesh <role> <port> [atomesh launch args...]: build ATOMesh from the
-# checkout and run it, the decision event module at debug, into a kept log.
+# checkout and run it with the topology's arguments, then the check's
+# MESH_ARGS (checks/<check>.env), into a kept log.
 launch_mesh() {
   local role=$1 port=$2
   shift 2
@@ -155,8 +156,8 @@ launch_mesh() {
   build_mesh "$role"
   local cmd
   cmd=$(printf '%q ' "$MESH_TARGET/release/atomesh" launch --host 0.0.0.0 --port "$port" \
-    --prometheus-port "$MESH_METRICS_PORT" --model-path "$MODEL_PATH" "$@")
-  in_role "$role" -d -e "RUST_LOG=mesh=info,mesh::core::placement::policy_apply=debug" -- \
+    --prometheus-port "$MESH_METRICS_PORT" --model-path "$MODEL_PATH" "$@" ${MESH_ARGS[@]+"${MESH_ARGS[@]}"})
+  in_role "$role" -d -e "RUST_LOG=mesh=info" -- \
     bash -c "$cmd > $RUN_DIR/$role.log 2>&1"
   log "waiting for $role (log $RUN_DIR/$role.log)"
   wait_http "$role" "http://127.0.0.1:$port/readiness" 600 "$MESH_TARGET/release/atomesh"
