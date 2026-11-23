@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (c) 2026 ATOM Project Contributors
 //! ATOM's own P/D flow over `atom.grpc.v1`: `AtomAdapter` fills a JSON view of the
 //! request fields it reads and writes, which each GenerateRequest then takes.
 
