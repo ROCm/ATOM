@@ -30,7 +30,7 @@ use crate::routers::grpc::engine::{worker_client_cache::GrpcClient, GrpcEngine};
 use crate::routers::prepare::{build_generate_payload, generation_payload::GenerationPayload};
 use crate::routers::test_mocks;
 use crate::routers::token_handle::engine_error::EngineError;
-use crate::routers::token_handle::token_chunk::{FinishReason, MatchedStop, TokenChunk};
+use crate::routers::token_handle::token_chunk::{FinishReason, MatchedStop, SeqTiming, TokenChunk};
 
 type Reply = Result<GenerateResponse, Status>;
 
@@ -195,6 +195,9 @@ fn complete(output_ids: &[u32], finish_reason: &str) -> GenerateResponse {
             completion_tokens: 3,
             cached_tokens: 2,
             kv_transfer_params_json: None,
+            ttft_s: 0.25,
+            tpot_s: 0.125,
+            latency_s: 0.5,
             ..Default::default()
         })),
     }
@@ -212,6 +215,14 @@ fn error(message: &str, http_status: u32) -> GenerateResponse {
 /// A /generate request through atomesh's gRPC pipeline to `worker`, with the
 /// mock tokenizer registered for model "m".
 async fn route_generate(worker: Arc<dyn Worker>, stream: bool) -> axum::response::Response {
+    route_generate_with(worker, stream, None).await
+}
+
+async fn route_generate_with(
+    worker: Arc<dyn Worker>,
+    stream: bool,
+    headers: Option<http::HeaderMap>,
+) -> axum::response::Response {
     let pipeline = test_mocks::pipeline_with(
         Arc::new(test_mocks::MockPdPlanner::repeat_single(worker, "random")),
         Arc::new(GrpcEngine::new()),
@@ -221,11 +232,11 @@ async fn route_generate(worker: Arc<dyn Worker>, stream: bool) -> axum::response
         test_mocks::app_context_with_tokenizer_registry(test_mocks::tokenizer_registry_with("m"));
     let sampling = serde_json::json!({
         "temperature": 0.7, "top_p": 0.9, "top_k": 20, "max_new_tokens": 16, "ignore_eos": true,
-        "stop": ["Hello world", "<|im_end|>", "unseen"],
+        "stop": ["Hello world", "<|im_end|>", "unseen"], "stop_token_ids": [7, 42],
     });
     let body = generate_body(stream, sampling);
     pipeline
-        .execute_generate(body, None, Some("m".to_string()), context)
+        .execute_generate(body, headers, Some("m".to_string()), context)
         .await
 }
 
@@ -250,7 +261,13 @@ async fn a_payload_becomes_the_generate_request_atom_receives() {
             ..Default::default()
         }),
         // The mock tokenizer's ids; "unseen" encodes to nothing and is dropped.
-        stop_token_sequences: vec![TokenIds { ids: vec![1, 2] }, TokenIds { ids: vec![1002] }],
+        // Then each stop id, alone.
+        stop_token_sequences: vec![
+            TokenIds { ids: vec![1, 2] },
+            TokenIds { ids: vec![1002] },
+            TokenIds { ids: vec![7] },
+            TokenIds { ids: vec![42] },
+        ],
         kv_transfer_params_json: None,
         data_parallel_rank: None,
         stream: false,
@@ -258,6 +275,21 @@ async fn a_payload_becomes_the_generate_request_atom_receives() {
         ..Default::default()
     };
     assert_eq!(*fake.requests.lock().unwrap(), vec![expected]);
+}
+
+#[tokio::test]
+async fn session_headers_reach_the_generate_request() {
+    let fake = FakeAtom::new(vec![vec![complete(&[4], "eos")]]);
+    let url = serve(fake.clone()).await;
+    let mut headers = http::HeaderMap::new();
+    headers.insert("x-session-id", "turns".parse().unwrap());
+    headers.insert("x-dynamo-parent-session-id", "root".parse().unwrap());
+
+    let response = route_generate_with(atom_worker(&url), false, Some(headers)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let requests = fake.requests.lock().unwrap();
+    assert_eq!(requests[0].dp_session_id.as_deref(), Some("turns"));
+    assert_eq!(requests[0].dp_parent_session_id.as_deref(), Some("root"));
 }
 
 #[test]
@@ -283,6 +315,24 @@ async fn stop_strings_without_a_tokenizer_fail_before_the_call() {
         .dispatch(&single(atom_worker(&url)), &mut request)
         .await;
     assert!(matches!(result, Err(EngineError::RequestBuildFailed(_))));
+    assert!(fake.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_logprobs_request_fails_before_the_call() {
+    let fake = FakeAtom::new(vec![vec![complete(&[4], "eos")]]);
+    let url = serve(fake.clone()).await;
+    let mut top = payload(false);
+    top.logprob.top_logprobs_num = 2;
+    let mut flag = payload(false);
+    flag.logprob.return_logprob = true;
+
+    for mut request in [top, flag] {
+        let result = GrpcEngine::new()
+            .dispatch(&single(atom_worker(&url)), &mut request)
+            .await;
+        assert!(matches!(result, Err(EngineError::RequestBuildFailed(_))));
+    }
     assert!(fake.requests.lock().unwrap().is_empty());
 }
 
@@ -328,6 +378,12 @@ async fn a_stream_becomes_token_chunks_in_order() {
         usage.total_tokens,
     );
     assert_eq!((counts, meta.cached_tokens), ((3, 3, 6), 2));
+    let timing = SeqTiming {
+        ttft_s: 0.25,
+        tpot_s: 0.125,
+        latency_s: 0.5,
+    };
+    assert_eq!(meta.timing, Some(timing));
 
     // A stream that ends before its Complete fails rather than ending short.
     let cut = collect(&plan, true).await;
@@ -340,6 +396,43 @@ async fn a_stream_becomes_token_chunks_in_order() {
             ]
         ),
         "{cut:?}"
+    );
+}
+
+/// `complete`, answering sibling `index`.
+fn sibling(output_ids: &[u32], index: u32) -> GenerateResponse {
+    let mut response = complete(output_ids, "eos");
+    if let Some(generate_response::Response::Complete(c)) = response.response.as_mut() {
+        c.index = index;
+    }
+    response
+}
+
+#[tokio::test]
+async fn an_unstreamed_call_yields_every_siblings_complete_by_index() {
+    let fake = FakeAtom::new(vec![
+        vec![sibling(&[21], 1), sibling(&[10], 0)],
+        vec![sibling(&[21], 1), error("engine failed", 500)],
+    ]);
+    let plan = single(atom_worker(&serve(fake).await));
+
+    let both = collect(&plan, false).await;
+    let ids: Vec<_> = both
+        .iter()
+        .map(|item| match item {
+            Ok(TokenChunk::Complete { token_ids, .. }) => token_ids.clone(),
+            other => panic!("expected a Complete, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(ids, [vec![10], vec![21]]);
+
+    // An error after a sibling's Complete fails the call.
+    let failed = GrpcEngine::new().dispatch(&plan, &mut payload(false)).await;
+    assert!(
+        matches!(&failed, Err(EngineError::Http { status, .. })
+            if *status == StatusCode::INTERNAL_SERVER_ERROR),
+        "{:?}",
+        failed.err()
     );
 }
 

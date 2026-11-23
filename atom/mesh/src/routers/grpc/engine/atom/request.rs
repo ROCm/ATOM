@@ -1,5 +1,6 @@
 //! A `GenerationPayload` as ATOM's GenerateRequest: the sampling fields ATOM's
-//! HTTP routes read, stop strings as token ids, and the worker's DP rank.
+//! HTTP routes read, stop strings and stop ids as token id sequences, and the
+//! worker's DP rank.
 
 use crate::atom_engine::{
     grpc::GenerateRequest,
@@ -12,17 +13,35 @@ use crate::routers::token_handle::engine_error::EngineError;
 use crate::tokenizer::traits::Tokenizer;
 
 /// Stop strings are encoded with `tokenizer`, the model's; a request with any
-/// fails without it.
+/// fails without it. A request for logprobs fails.
 pub(crate) fn generate_request(
     payload: &GenerationPayload,
     worker: &dyn Worker,
     tokenizer: Option<&dyn Tokenizer>,
 ) -> Result<GenerateRequest, EngineError> {
+    let logprob = &payload.logprob;
+    if logprob.return_logprob
+        || logprob.top_logprobs_num > 0
+        || logprob.input_logprobs
+        || !logprob.token_ids_logprob.is_empty()
+    {
+        // ATOM's Generate answers no logprobs; atomesh refuses rather than drop them.
+        return Err(EngineError::RequestBuildFailed(
+            "logprobs are not served by ATOM workers over gRPC".into(),
+        ));
+    }
     let stops = match &payload.stop.stop {
         Some(StringOrArray::String(stop)) => std::slice::from_ref(stop),
         Some(StringOrArray::Array(stops)) => stops.as_slice(),
         None => &[],
     };
+    let mut stop_sequences = stop_token_sequences(stops, tokenizer)?;
+    // An explicit stop id is a one-id stop sequence, which ATOM ends the output at.
+    if let Some(ids) = &payload.stop.stop_token_ids {
+        stop_sequences.extend(ids.iter().map(|&id| TokenIds {
+            ids: vec![id as i32],
+        }));
+    }
     let sampling = &payload.sampling;
     Ok(GenerateRequest {
         request_id: payload.request_id.clone(),
@@ -37,13 +56,13 @@ pub(crate) fn generate_request(
             n: Some(sampling.n.max(0) as u32),
             ..Default::default()
         }),
-        stop_token_sequences: stop_token_sequences(stops, tokenizer)?,
+        stop_token_sequences: stop_sequences,
         kv_transfer_params_json: None,
         data_parallel_rank: worker.dp_rank().map(|rank| rank as i32),
         stream: payload.stream,
         structured_output: None,
-        dp_session_id: None,
-        dp_parent_session_id: None,
+        dp_session_id: payload.dp_session_id.clone(),
+        dp_parent_session_id: payload.dp_parent_session_id.clone(),
     })
 }
 

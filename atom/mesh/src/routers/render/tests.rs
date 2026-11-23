@@ -71,6 +71,7 @@ mod b_chat_aggregator {
             request_id: "req-1".to_string(),
             weight_version: None,
             cached_tokens: 0,
+            timing: None,
         }
     }
 
@@ -192,6 +193,7 @@ mod b2_chat_aggregator_branches {
             request_id: "req".to_string(),
             weight_version: v.map(|s| s.to_string()),
             cached_tokens: 0,
+            timing: None,
         }
     }
 
@@ -529,6 +531,7 @@ mod b3_chat_aggregator_typed {
             request_id: "req".to_string(),
             weight_version: Some("v1".to_string()),
             cached_tokens: 0,
+            timing: None,
         }
     }
 
@@ -689,6 +692,7 @@ mod c_chat_streaming {
             request_id: "req-1".to_string(),
             weight_version: None,
             cached_tokens: 0,
+            timing: None,
         }
     }
 
@@ -760,6 +764,7 @@ mod c1_chat_streaming_body_content {
             request_id: "req".to_string(),
             weight_version: None,
             cached_tokens: 0,
+            timing: None,
         }
     }
 
@@ -916,6 +921,7 @@ mod c2_chat_streaming_branches {
             request_id: "req".to_string(),
             weight_version: Some(v.to_string()),
             cached_tokens: 0,
+            timing: None,
         }
     }
 
@@ -924,6 +930,7 @@ mod c2_chat_streaming_branches {
             request_id: "req".to_string(),
             weight_version: None,
             cached_tokens: 0,
+            timing: None,
         }
     }
 
@@ -1291,6 +1298,7 @@ mod c3_chat_streaming_parsers {
             request_id: "req".to_string(),
             weight_version: None,
             cached_tokens: 0,
+            timing: None,
         }
     }
 
@@ -1486,6 +1494,7 @@ mod c4_chat_streaming_coverage {
             request_id: "req".to_string(),
             weight_version: None,
             cached_tokens: 0,
+            timing: None,
         }
     }
 
@@ -1494,6 +1503,7 @@ mod c4_chat_streaming_coverage {
             request_id: "req".to_string(),
             weight_version: Some(v.to_string()),
             cached_tokens: 0,
+            timing: None,
         }
     }
 
@@ -2641,6 +2651,7 @@ mod d_generate_aggregator {
             request_id: "req-1".to_string(),
             weight_version: None,
             cached_tokens: 0,
+            timing: None,
         }
     }
 
@@ -2711,6 +2722,7 @@ mod d2_generate_aggregator_branches {
             request_id: "req-1".to_string(),
             weight_version: Some("v7".to_string()),
             cached_tokens: 5,
+            timing: None,
         }
     }
 
@@ -3191,6 +3203,7 @@ mod e_generate_streaming {
             request_id: "req-1".to_string(),
             weight_version: None,
             cached_tokens: 0,
+            timing: None,
         }
     }
 
@@ -3249,6 +3262,7 @@ mod e1_generate_streaming_body_content {
             request_id: "req".to_string(),
             weight_version: Some("v1".to_string()),
             cached_tokens: 0,
+            timing: None,
         }
     }
 
@@ -3326,6 +3340,7 @@ mod e1_generate_streaming_body_content {
                 request_id: "req".to_string(),
                 weight_version: Some("v2".to_string()),
                 cached_tokens: 42,
+                timing: None,
             },
         })]);
         let resp = generate_streaming::process(stream, generate_ctx(), "regular");
@@ -3358,6 +3373,7 @@ mod e1_generate_streaming_body_content {
                 request_id: "req".to_string(),
                 weight_version: Some("wv_abc".to_string()),
                 cached_tokens: 0,
+                timing: None,
             },
         })]);
         let resp = generate_streaming::process(stream, generate_ctx(), "regular");
@@ -3389,6 +3405,7 @@ mod e2_generate_streaming_branches {
             request_id: "req".to_string(),
             weight_version: v.map(|s| s.to_string()),
             cached_tokens: 9,
+            timing: None,
         }
     }
 
