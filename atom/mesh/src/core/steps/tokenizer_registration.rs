@@ -28,7 +28,7 @@ use crate::{
         cache::{CacheConfig, CachedTokenizer},
         chat_template::ChatTemplateParams,
         factory,
-        registry::LoadOutcome,
+        registry::{LoadError, LoadOutcome},
         traits::Tokenizer,
     },
 };
@@ -181,11 +181,21 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
         {
             if app_context.tokenizer_inline_templates.read().get(loaded) != Some(template) {
                 info!("Tokenizer '{name}' is loaded again with its worker's chat template");
-                if let Some(entry) = registry.remove_by_id(loaded) {
-                    crate::routers::prepare::thread_tokenizer::release_copies(&entry.id);
-                    app_context.forget_tokenizer(&entry.id);
-                }
-                result = registry.load(&id, &name, &source, &loader).await;
+                // Loaded first, then swapped in with no await between, so the model is
+                // never left without one; a failed load keeps the old one.
+                let replacement = loader().await;
+                result = match replacement {
+                    Ok(tokenizer) => {
+                        if let Some(entry) = registry.remove_by_id(loaded) {
+                            crate::routers::prepare::thread_tokenizer::release_copies(&entry.id);
+                            app_context.forget_tokenizer(&entry.id);
+                        }
+                        registry
+                            .load(&id, &name, &source, || async { Ok(tokenizer) })
+                            .await
+                    }
+                    Err(e) => Err(LoadError::LoadFailed(e)),
+                };
             }
         }
         if let (Ok(LoadOutcome::Loaded { id: loaded }), Some(template)) = (&result, inline_template)
@@ -443,6 +453,45 @@ mod tests {
         assert!(!marked(&jinja));
         remove_tokenizer(&context, &deepseek).await;
         assert!(!marked(&deepseek));
+    }
+
+    /// A registration with another inline template swaps in a tokenizer loaded with it;
+    /// one whose template fails to load keeps the loaded tokenizer.
+    #[tokio::test]
+    async fn test_another_inline_template_replaces_the_tokenizer_only_once_loaded() {
+        let context = app_context();
+        let register = |template: &str| {
+            let config = TokenizerConfigRequest {
+                id: TokenizerRegistry::generate_id(),
+                name: "m".to_string(),
+                source: hf_tokenizer_path().to_string(),
+                chat_template_path: None,
+                inline_chat_template: Some(template.to_string()),
+                cache_config: None,
+                fail_on_duplicate: false,
+            };
+            let data = create_tokenizer_workflow_data(config, context.clone());
+            async move {
+                let mut workflow = WorkflowContext::new(WorkflowInstanceId::new(), data);
+                LoadTokenizerStep.execute(&mut workflow).await
+            }
+        };
+        let rendered = || {
+            let tokenizer = context
+                .tokenizer_registry
+                .get("m")
+                .expect("a tokenizer for m");
+            let hi = json!({"role": "user", "content": "hi"});
+            tokenizer
+                .apply_chat_template(&[hi], ChatTemplateParams::default())
+                .unwrap()
+        };
+        register("first: {{ messages[0].content }}").await.unwrap();
+        assert_eq!(rendered(), "first: hi");
+        assert!(register("{% if %}").await.is_err());
+        assert_eq!(rendered(), "first: hi");
+        register("second: {{ messages[0].content }}").await.unwrap();
+        assert_eq!(rendered(), "second: hi");
     }
 
     /// A model `--fastokens-models` lists encodes with fastokens, which leaves the
