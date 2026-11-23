@@ -92,6 +92,17 @@ pub(crate) fn hf_tokenizer_path() -> &'static str {
     &hf_tokenizer_holder().path
 }
 
+/// A DeepSeek-V4.1 checkpoint's tokenizer: [`hf_tokenizer_path`]'s
+/// `tokenizer.json` beside a `config.json` whose `model_type` has llm-tokenizer
+/// render chats with its port of V4.1's encoder.
+pub(crate) fn deepseek_v41_tokenizer_dir() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    std::fs::copy(hf_tokenizer_path(), dir.path().join("tokenizer.json")).unwrap();
+    let config = serde_json::json!({"model_type": "deepseek_v41"});
+    std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
+    dir
+}
+
 /// Merges of a byte-level BPE, in rank order.
 pub(crate) const BYTE_LEVEL_MERGES: &[&str] = &[
     "Ġ t",

@@ -413,7 +413,9 @@ mod tests {
     use crate::{
         routers::{
             prepare::inference::ParsedInference,
-            test_mocks::tokenizer::{byte_level_tokenizer_dir, BYTE_LEVEL_MERGES},
+            test_mocks::tokenizer::{
+                byte_level_tokenizer_dir, deepseek_v41_tokenizer_dir, BYTE_LEVEL_MERGES,
+            },
         },
         tokenizer::factory::create_tokenizer,
     };
@@ -606,6 +608,33 @@ mod tests {
         ];
         for (fields, want) in cases {
             assert_eq!(render(fields.clone()), want.map(str::to_string), "{fields}");
+        }
+    }
+
+    /// llm-tokenizer's port of V4.1's encoder, which reads the mode from
+    /// `thinking` alone, renders the mode the controls give a chat.
+    #[test]
+    fn deepseek_v41_port_renders_the_mode_the_controls_give() {
+        let dir = deepseek_v41_tokenizer_dir();
+        let tokenizer =
+            create_tokenizer(dir.path().join("tokenizer.json").to_str().unwrap()).unwrap();
+        for (fields, prefill) in [
+            (json!({}), "<think>"),
+            (json!({"reasoning_effort": "high"}), "<think>"),
+            (json!({"reasoning_effort": "none"}), "</think>"),
+            (json!({"thinking": {"type": "disabled"}}), "</think>"),
+            (
+                json!({"chat_template_kwargs": {"thinking_mode": "chat"}}),
+                "</think>",
+            ),
+        ] {
+            let parsed = chat(fields.clone());
+            let (request, sent) = parsed.chat_as_sent().unwrap();
+            let prompt = ChatControls::DeepseekV41
+                .render(request, sent, &*tokenizer)
+                .unwrap();
+            let end = format!("<｜Assistant｜>{prefill}");
+            assert!(prompt.ends_with(&end), "{fields}: {prompt}");
         }
     }
 

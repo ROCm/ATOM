@@ -1184,14 +1184,18 @@ fn minimal_generate_request_with_stream(
 }
 
 mod h_prepare_chat_generate {
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
+
+    use serde_json::json;
 
     use crate::protocols::chat::{ChatCompletionRequest, ChatMessage, MessageContent};
     use crate::protocols::generate::GenerateRequest;
+    use crate::routers::prepare::chat_controls::ChatControls;
     use crate::routers::prepare::generation_payload::GenerationPayload;
     use crate::routers::prepare::response_context::{ProtocolRequest, ResponseContext};
     use crate::routers::prepare::{lookup_tokenizer, prepare_chat, prepare_generate};
     use crate::routers::test_mocks;
+    use crate::tokenizer::{factory::create_tokenizer, registry::TokenizerRegistry};
 
     fn chat_req(stream: bool) -> Arc<ChatCompletionRequest> {
         Arc::new(ChatCompletionRequest {
@@ -1242,6 +1246,40 @@ mod h_prepare_chat_generate {
             pm.text
         );
         assert_eq!(payload.text, pm.text);
+    }
+
+    /// A model ATOM renders under reasoning controls of its own renders under
+    /// them for the engine too: llm-tokenizer's port of V4.1's encoder reads
+    /// the mode from `thinking` alone, which the controls give for a
+    /// `thinking_mode`.
+    #[tokio::test]
+    async fn test_prepare_chat_renders_under_the_model_chat_controls() {
+        let dir = test_mocks::tokenizer::deepseek_v41_tokenizer_dir();
+        let path = dir.path().join("tokenizer.json");
+        let registry = Arc::new(TokenizerRegistry::new());
+        let id = TokenizerRegistry::generate_id();
+        registry
+            .load(&id, "m", "deepseek-v41", || async {
+                create_tokenizer(path.to_str().unwrap()).map_err(|e| e.to_string())
+            })
+            .await
+            .unwrap();
+        let components = test_mocks::app_context_with_tokenizer_registry(registry);
+        components
+            .chat_controls
+            .write()
+            .insert(id, ChatControls::DeepseekV41);
+        let prompt = |thinking_mode: Option<&str>| {
+            let mut req = (*chat_req(false)).clone();
+            req.chat_template_kwargs = thinking_mode
+                .map(|mode| HashMap::from([("thinking_mode".to_string(), json!(mode))]));
+            let model = Some("m".to_string());
+            let (payload, _) = prepare_chat(Arc::new(req), None, model, components.as_ref())
+                .expect("V4.1 chat must render");
+            payload.text
+        };
+        assert!(prompt(None).ends_with("<｜Assistant｜><think>"));
+        assert!(prompt(Some("chat")).ends_with("<｜Assistant｜></think>"));
     }
 
     #[test]
