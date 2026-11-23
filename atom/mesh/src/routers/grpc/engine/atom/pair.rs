@@ -1,9 +1,8 @@
 //! ATOM's own P/D flow over `atom.grpc.v1`: `AtomAdapter` fills a JSON view of the
 //! request fields it reads and writes, which each GenerateRequest then takes.
 
-use std::collections::HashSet;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 
 use futures::{Stream, StreamExt};
@@ -36,7 +35,7 @@ use crate::tokenizer::traits::Tokenizer;
 /// Runs ATOM pairs as ATOM's HTTP P/D router does: relay, or chunked when P's
 /// instance reports a chunked-transfer template.
 pub(crate) struct AtomPairs {
-    pub(super) adapter: AtomAdapter,
+    info: RwLock<Arc<AtomPrefillInfo>>,
     mapping: AtomPdRankMappingPolicy,
     workers: Arc<WorkerRegistry>,
 }
@@ -49,29 +48,33 @@ impl AtomPairs {
         mapping: AtomPdRankMappingPolicy,
     ) -> Result<Self, String> {
         let mut info = AtomPrefillInfo::default();
-        let mut queried = HashSet::new();
         for worker in workers.get_prefill_workers().iter().filter(|w| is_atom(w)) {
-            let base_url = worker.base_url().trim_end_matches('/').to_string();
-            if queried.insert(base_url.clone()) {
-                let data = kv_transfer_info(worker).await?;
-                let source = format!("{base_url} GetServerInfo");
-                let (tp, chunked) = parse_atom_prefill_info(&data, &source, &base_url)?;
-                info.tp_sizes.insert(base_url.clone(), tp);
-                if let Some(template) = chunked {
-                    info.chunked_transfer.insert(base_url.clone(), template);
-                }
-            }
-            let url = worker.url().to_string();
-            info.tp_sizes.insert(url.clone(), info.tp_sizes[&base_url]);
-            if let Some(template) = info.chunked_transfer.get(&base_url).cloned() {
-                info.chunked_transfer.insert(url, template);
-            }
+            learn(&mut info, worker).await?;
         }
         Ok(Self {
-            adapter: AtomAdapter::new(Arc::new(info)),
+            info: RwLock::new(Arc::new(info)),
             mapping,
             workers,
         })
+    }
+
+    /// The prefills' info, `prefill`'s read on its first pair when it registered later.
+    pub(super) async fn adapter_for(
+        &self,
+        prefill: &Arc<dyn Worker>,
+    ) -> Result<AtomAdapter, EngineError> {
+        let known = self.info.read().unwrap().clone();
+        if known.tp_sizes.contains_key(prefill.url()) {
+            return Ok(AtomAdapter::new(known));
+        }
+        let mut learned = AtomPrefillInfo::default();
+        learn(&mut learned, prefill).await.map_err(bad_gateway)?;
+        let mut info = self.info.write().unwrap();
+        let mut merged = AtomPrefillInfo::clone(&info);
+        merged.tp_sizes.extend(learned.tp_sizes);
+        merged.chunked_transfer.extend(learned.chunked_transfer);
+        *info = Arc::new(merged);
+        Ok(AtomAdapter::new(info.clone()))
     }
 
     /// One attempt on the planned pair, P picked by the rank mapping. Both loads
@@ -112,7 +115,7 @@ impl AtomPairs {
         tokenizer: Option<&dyn Tokenizer>,
         prefill_load: WorkerLoadGuard,
     ) -> Result<AtomStream, EngineError> {
-        let adapter = &self.adapter;
+        let adapter = &self.adapter_for(prefill).await?;
         let ctx = adapter
             .prepare_pair(prefill.as_ref(), decode.as_ref())
             .map_err(internal)?;
@@ -183,6 +186,27 @@ async fn atom_client(worker: &Arc<dyn Worker>) -> Option<AtomClient> {
         Ok(GrpcClient::Atom(client)) => Some(client),
         _ => None,
     }
+}
+
+/// Adds `worker`'s TP size and chunked template to `info`, its instance's GetServerInfo
+/// read once.
+async fn learn(info: &mut AtomPrefillInfo, worker: &Arc<dyn Worker>) -> Result<(), String> {
+    let base_url = worker.base_url().trim_end_matches('/').to_string();
+    if !info.tp_sizes.contains_key(&base_url) {
+        let data = kv_transfer_info(worker).await?;
+        let source = format!("{base_url} GetServerInfo");
+        let (tp, chunked) = parse_atom_prefill_info(&data, &source, &base_url)?;
+        info.tp_sizes.insert(base_url.clone(), tp);
+        if let Some(template) = chunked {
+            info.chunked_transfer.insert(base_url.clone(), template);
+        }
+    }
+    let url = worker.url().to_string();
+    info.tp_sizes.insert(url.clone(), info.tp_sizes[&base_url]);
+    if let Some(template) = info.chunked_transfer.get(&base_url).cloned() {
+        info.chunked_transfer.insert(url, template);
+    }
+    Ok(())
 }
 
 /// `worker`'s instance's `/kv_transfer_info` body, as GetServerInfo carries it.
