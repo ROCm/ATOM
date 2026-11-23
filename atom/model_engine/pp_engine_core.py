@@ -102,8 +102,12 @@ class PPEngineCoreProc(EngineCore):
                     continue
                 if self._in_flight or not self.scheduler.is_finished():
                     self._run_then_publish_kv_events(self._pp_head_step)
-                elif self.has_pending_kv_work():
-                    self._run_then_publish_kv_events(self._advance_idle_kv_transfer)
+                else:
+                    if self.has_pending_kv_work():
+                        self._run_then_publish_kv_events(self._advance_idle_kv_transfer)
+                    # Block, don't spin: the output thread needs the GIL to
+                    # send the last step's output (see `IDLE_WAIT_S`).
+                    self._wait_for_work()
         finally:
             self._drain_kv_work_at_exit()
             try:

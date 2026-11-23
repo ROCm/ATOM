@@ -6,7 +6,7 @@ import json
 import logging
 from dataclasses import dataclass, fields
 
-from atom import LLMEngine
+from atom import LLMEngine, plugin_recipe
 from atom.config import (
     CompilationConfig,
     CUDAGraphMode,
@@ -190,6 +190,12 @@ class EngineArgs:
     online_quant_config: dict | None = None
     hf_overrides: dict | None = None
     dspark_config: dict | None = None
+    plugin_recipe: str | None = None
+    plugin_enable: str | None = None
+    plugin_arm: str = "plugin"
+    plugin_hotplug: bool = False
+    plugin_dev: bool = False
+    plugin_dev_roots: list[str] | None = None
 
     eplb_enable: bool = False
     eplb_config: dict | None = None
@@ -875,6 +881,63 @@ class EngineArgs:
                 """"ragged_graph_sizes": "8"}'"""
             ),
         )
+        plugins = parser.add_argument_group("Plugin options")
+        plugins.add_argument(
+            "--plugin-recipe",
+            type=str,
+            default=None,
+            help="A plugin recipe (atom.plugin_recipe/1), or a directory holding "
+            "one strategy's recipes (one per graph-capture bucket set). "
+            "Default: no plugin. Check one with `python -m atom.plugin_recipe`.",
+        )
+        plugins.add_argument(
+            "--plugin-enable",
+            type=str,
+            default=None,
+            help="Comma-separated plugins, in preference order: shorthand for a "
+            "recipe of whatever they register. With --plugin-recipe it can only "
+            "narrow it. ATOM_PLUGIN_HOST=0 disables them all.",
+        )
+        plugins.add_argument(
+            "--plugin-arm",
+            type=str,
+            default="plugin",
+            help="Which planned plugins serve: plugin (all), native (none), "
+            "identity (decide, run native) or a recipe arm.",
+        )
+        plugins.add_argument(
+            "--plugin-hotplug",
+            action="store_true",
+            help="Keep the plugin host hot-pluggable: bind every seam at build "
+            "time and expose the internal POST /plugin/hotplug endpoint, which "
+            "switches the plan/arm and recaptures the requested decode CUDA "
+            "graphs without a restart. ATOM_PLUGIN_HOTPLUG=1 sets the same "
+            "flag.",
+        )
+        plugins.add_argument(
+            "--plugin-dev",
+            action="store_true",
+            help="Developer mode for a --plugin-hotplug boot: a POST "
+            '/plugin/hotplug body with "reload": true re-imports the plugin '
+            "Python modules under --plugin-dev-root from disk, re-runs each "
+            "planned provider's prepare(device) (its versioned .so load) and "
+            "then installs the plan and recaptures the decode graphs. Off by "
+            "default: old native libraries are intentionally leaked and a "
+            "reload is not a production path. ATOM_PLUGIN_DEV=1 sets the same "
+            "flag; needs at least one root.",
+        )
+        plugins.add_argument(
+            "--plugin-dev-root",
+            action="append",
+            dest="plugin_dev_roots",
+            default=None,
+            metavar="DIR",
+            help="An allowlisted directory holding plugin code (Python modules "
+            "plus the .so/headers a reload should see). Repeat for each tree: a "
+            "reload only re-imports modules whose source file is under one of "
+            "these, and computes its code digest over them. "
+            "ATOM_PLUGIN_DEV_ROOTS is a path-separator list fallback.",
+        )
         dcp_group = parser.add_argument_group("DCP options")
         dcp_group.add_argument(
             "--dcp-config",
@@ -1043,6 +1106,40 @@ class EngineArgs:
         # --dspark-config (JSON dict) → DSparkConfig object, passed through as
         # Config.dspark (no env vars).
         kwargs["dspark"] = DSparkConfig.from_dict(kwargs.pop("dspark_config", None))
+        # Resolved here, once, so a bad recipe refuses the start before any
+        # worker exists; the Plan rides Config to every worker.
+        kwargs["plugin_source"] = plugin_recipe.from_cli(
+            kwargs.pop("plugin_recipe"), kwargs.pop("plugin_enable"), self.plugin_arm
+        )
+        # ATOM_PLUGIN_HOTPLUG=1 is the env fallback for --plugin-hotplug; it
+        # only permits a runtime plan switch, it enables no plugin.
+        kwargs["plugin_hotplug"] = bool(
+            kwargs.get("plugin_hotplug") or envs.ATOM_PLUGIN_HOTPLUG
+        )
+        # --plugin-dev / repeated --plugin-dev-root, with ATOM_PLUGIN_DEV /
+        # ATOM_PLUGIN_DEV_ROOTS (path-separator list) as fallbacks. Developer
+        # mode is a reload on top of the hot-plug path, so it is refused at
+        # argument time without one: a server that cannot install a plan
+        # cannot install reloaded code either. The roots are validated as
+        # existing allowlisted directories once every rank configure()s.
+        dev_roots = tuple(kwargs.pop("plugin_dev_roots", None) or ())
+        if not dev_roots and envs.ATOM_PLUGIN_DEV_ROOTS:
+            dev_roots = tuple(envs.ATOM_PLUGIN_DEV_ROOTS)
+        dev = bool(kwargs.get("plugin_dev") or envs.ATOM_PLUGIN_DEV)
+        if dev:
+            if not kwargs["plugin_hotplug"]:
+                raise ValueError(
+                    "--plugin-dev needs --plugin-hotplug (or ATOM_PLUGIN_HOTPLUG=1): "
+                    "a code reload installs the plan through the hot-plug path"
+                )
+            if not dev_roots:
+                raise ValueError(
+                    "--plugin-dev needs at least one --plugin-dev-root (or "
+                    "ATOM_PLUGIN_DEV_ROOTS): only modules under those allowlisted "
+                    "trees are re-imported"
+                )
+        kwargs["plugin_dev"] = dev
+        kwargs["plugin_dev_roots"] = dev_roots
         # --eplb-config (JSON dict) → EPLBConfig object (--eplb-enable
         # is the master switch, --eplb-config only tunes it).
         kwargs["eplb_config"] = EPLBConfig.from_dict(kwargs.pop("eplb_config"))

@@ -10,7 +10,10 @@ from aiter.dist.parallel_state import get_tp_group
 from aiter.tuned_gemm import tgemm
 from torch import nn
 
+from atom import plugin_host
+from atom.config import get_current_atom_config
 from atom.model_loader.weight_names import WeightsMapper
+from atom.utils.region_graph import ReqGraph
 from atom.model_ops.blockscale import (
     native_quant_linear,
     quantize_fp8,
@@ -284,6 +287,9 @@ class DeepseekV41DSpark(DSparkDraftModel):
         # module tree so the loader looks for no new weight; it holds
         # main_norm's own weight tensor, so loads and weight syncs reach it.
         self._build_main_norm_quant()
+        self._ctx_seam = plugin_host.bind(
+            "v41.draft.ctx", self._concat_taps, capability=self._ctx_capability
+        )
 
     def _build_main_norm_quant(self):
         main = self.mtp[0].main_norm
@@ -377,8 +383,63 @@ class DeepseekV41DSpark(DSparkDraftModel):
         main_proj = self.mtp[0].main_proj
         if main_proj.runs_bf16:
             return main_proj(self.concat_taps(taps).unsqueeze(0))
-        x, x_scale = quantize_fp8_taps(taps)
-        return main_proj(x.unsqueeze(0), x_scale=x_scale.unsqueeze(0))
+        tokens = taps.shape[0] if isinstance(taps, torch.Tensor) else taps[0].shape[0]
+        if torch.compiler.is_compiling() or not plugin_host.has_capture_owner(
+            "v41.draft.ctx", tokens, explicit=True
+        ):
+            x, x_scale = self._ctx_seam(taps, None, tokens)
+        else:
+            x, x_scale = self._capture_context_input(taps, tokens)
+        return main_proj(
+            x.unsqueeze(0), x_scale=None if x_scale is None else x_scale.unsqueeze(0)
+        )
+
+    def _capture_context_input(self, taps, rows):
+        """Record only tap packing; position-dependent cache writes stay native."""
+        if get_current_atom_config().enforce_eager or rows <= 0:
+            return self._ctx_seam(taps, None, rows)
+        if plugin_host._stream_capturing():
+            with plugin_host.capture_bucket(rows):
+                return self._ctx_seam(taps, None, rows)
+
+        # The runner consumes returned values immediately on its stream. This
+        # local graph has no collectives or cache side effects. Flatten the list
+        # so ReqGraph owns a fresh fixed-address staging tensor for each tap.
+        flat = (taps,) if isinstance(taps, torch.Tensor) else tuple(taps)
+        key = (rows, tuple((t.dtype, t.device, t.shape) for t in flat))
+        graph = getattr(self, "_ctx_graph", None)
+        if graph is None:
+            graph = self._ctx_graph = ReqGraph()
+        if graph.has(key):
+            return graph.replay(flat, key=key)
+
+        def prepare(*inputs):
+            values = inputs[0] if isinstance(taps, torch.Tensor) else list(inputs)
+            return self._ctx_seam(values, None, rows)
+
+        stream = getattr(self, "_ctx_record_stream", None)
+        if stream is None:
+            stream = self._ctx_record_stream = torch.cuda.Stream(device=flat[0].device)
+        main = torch.cuda.current_stream(flat[0].device)
+        stream.wait_stream(main)
+        with torch.cuda.stream(stream), plugin_host.capture_bucket(rows):
+            prepare(*flat)  # Pay JIT and prepare the capture route outside recording.
+            graph.record(prepare, flat, key=key)
+            result = graph.replay(flat, key=key)
+        main.wait_stream(stream)
+        return result
+
+    @staticmethod
+    def _concat_taps(taps, rows, running_tokens):
+        # Keep the upstream quantize-where-the-taps-live path on the native arm.
+        taps = (taps,) if isinstance(taps, torch.Tensor) else taps
+        if rows is not None:
+            taps = tuple(tap[rows] for tap in taps)
+        return quantize_fp8_taps([tap[:running_tokens] for tap in taps])
+
+    def _ctx_capability(self, *inputs, **kwargs):
+        group32 = self.mtp[0].main_proj.native_a8_group_rows == 32
+        return {"quant": plugin_host.MX if group32 else None, "flags": {}}
 
     def _main_norm_quant(self):
         """The fused norm built in ``__init__``."""
@@ -396,7 +457,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
             return
         metadata = forward.attn_metadata
         cache, step = metadata.cache, metadata.step
-        plan = step.replay
+        plan, rows = step.replay, None
         if plan is not None:
             # A replayed forward ran the decoder, whose rows these come from,
             # on its tail alone: the draft's window takes the same rows.
