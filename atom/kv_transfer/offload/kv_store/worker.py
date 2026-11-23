@@ -33,9 +33,10 @@ Completion protocol, per worker and operation:
   read nor put: it is source-safe at once and counts as stored, so a save
   whose every chunk was held ends in a success like any other.
 * Under a draft window the last PP stage also moves draft objects
-  (``LMCacheReqMeta.draft_chunks``). A save packs and puts them before its
-  target windows, so a chunk is source-safe only once both its packs ran; a
-  target the store holds says nothing of its draft object. A draft object not
+  (``LMCacheReqMeta.draft_chunks``). A save packs and puts the ones the store
+  lacks before its target windows, so no draft read of a chunk is left once it
+  is source-safe, and looks them up on their own keys: a held target says
+  nothing of its draft object, nor the other way round. A draft object not
   stored fails no save (a later lookup cuts its hit there); a load gets them
   all or fails.
 * A load ends in exactly one of done or failed, all-or-nothing.
@@ -201,10 +202,12 @@ class _DraftTransfer:
     """What one save or load moved of a draft window's draft objects, and the
     time it spent; the target fields of a PROF line leave this phase out."""
 
-    # Draft objects of the puts (gets) that succeeded.
+    # Draft objects of the puts (gets) that succeeded; those a save found held.
     chunks: int = 0
     nbytes: int = 0
+    held: int = 0
     # A pack or restore includes its fence behind the forward's stream.
+    exists_ms: float = 0.0
     pack_ms: float = 0.0
     put_ms: float = 0.0
     get_ms: float = 0.0
@@ -717,6 +720,8 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         client: KVStoreClient,
         req: LMCacheReqMeta,
         windows: list[range],
+        *,
+        draft: bool = False,
     ) -> Iterator[tuple[range, bool, list[str], float | None]]:
         """``windows`` in runs of chunks the store holds or not, highest first.
 
@@ -730,26 +735,29 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         rank has -- and putting it again would pack and send bytes the store
         then drops. A lookup that fails, or a key it has no answer for, holds
         nothing: the chunk is put as it would be without a lookup. The client
-        answers one code per key or raises (`KVStoreClient.exists`).
+        answers one code per key or raises (`KVStoreClient.exists`). With
+        ``draft``, the runs are of the draft objects, on their own keys.
         """
         for window in windows:
-            keys = self._window_keys(req, window)
+            keys = (self._draft_keys if draft else self._window_keys)(req, window)
             t0 = time.perf_counter()
             try:
                 held = [answer == 1 for answer in client.exists(keys)]
             except Exception as exc:  # noqa: BLE001  # the window is put whole
+                # Kinds apart, so neither lookup's failure hides the other's.
                 self._warn_rate_limited(
-                    "save:exists_failed",
-                    "%s: a save's lookup failed (%r), req=%s; its "
-                    "chunks are put without one",
+                    "save:draft_exists_failed" if draft else "save:exists_failed",
+                    "%s: a save's %s failed (%r), req=%s; its %s are put without one",
                     self.LABEL,
+                    "draft object lookup" if draft else "lookup",
                     exc,
                     req.req_id,
+                    "draft objects" if draft else "chunks",
                 )
                 held = [False] * len(window)
             lookup_ms = (time.perf_counter() - t0) * 1000
             with self._stats_lock:
-                self._save_counts["lookups"] += 1
+                self._save_counts["draft_lookups" if draft else "lookups"] += 1
             for run, run_held in _held_runs(window, held):
                 offset = run.start - window.start
                 yield run, run_held, keys[offset : offset + len(run)], lookup_ms
@@ -803,7 +811,7 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
             return
         pool, client, gpu_connector = self._registered()
         deadline = self._source_read_deadline(req)
-        # The draft objects first: a chunk is source-safe once both its packs ran.
+        # The draft objects first: no draft read is left once a chunk is source-safe.
         draft = _DraftTransfer()
         failure, detail = self._save_draft_chunks(
             req, self._draft_chunks_of(req, start, end), deadline, producer_event, draft
@@ -1183,8 +1191,8 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         producer_event: Any,
         draft: _DraftTransfer,
     ) -> tuple[str | None, str | None]:
-        """Pack and put the draft objects of `chunks`. Only a missed source read
-        deadline fails the save; a draft not stored costs a lookup cut."""
+        """Pack and put the draft objects of `chunks` the store lacks. Only a missed
+        source read deadline fails the save; a draft not stored costs a lookup cut."""
         if not chunks:
             return None, None
         pool, client, _ = self._registered()
@@ -1192,9 +1200,16 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
             chunks.start, chunks.stop, pool.window("save", self.save_workers)
         )
         failure = detail = why = None
-        for window in windows:
+        for run, held, keys, lookup_ms in self._save_segments(
+            client, req, windows, draft=True
+        ):
+            if lookup_ms is not None:  # the first run of a window
+                draft.exists_ms += lookup_ms
+            if held:
+                draft.held += len(run)
+                continue
             try:
-                slots = pool.acquire("save", len(window))
+                slots = pool.acquire("save", len(run))
             except SlotPoolExhausted as exc:
                 draft.status, why = "pool_exhausted", str(exc)
                 break
@@ -1206,11 +1221,7 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
             t_pack0 = time.perf_counter()
             try:
                 self._copy_draft_chunks(
-                    slots,
-                    window,
-                    req.block_ids,
-                    pack=True,
-                    producer_event=producer_event,
+                    slots, run, req.block_ids, pack=True, producer_event=producer_event
                 )
             except BaseException:
                 self._release_once_device_idle(pool, slots)
@@ -1218,14 +1229,7 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
             draft.pack_ms += (time.perf_counter() - t_pack0) * 1000
             t_put0 = time.perf_counter()
             try:
-                answer = self._put_chunks(
-                    client,
-                    req,
-                    window,
-                    self._draft_keys(req, window),
-                    slots,
-                    draft=True,
-                )
+                answer = self._put_chunks(client, req, run, keys, slots, draft=True)
             except CallRefused as exc:
                 pool.release(slots)
                 draft.status, why = "put_refused", str(exc)
@@ -1242,6 +1246,8 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
                 break
             draft.chunks += len(slots)
             draft.nbytes += self._draft_chunk_bytes * len(slots)
+        with self._stats_lock:
+            self._save_counts["draft_held_chunks"] += draft.held
         if draft.status != "ok":
             self._warn_rate_limited(
                 f"save:draft_{draft.status}",
@@ -1346,6 +1352,7 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         fields = f" draft_chunks={draft.chunks} draft_bytes={draft.nbytes}"
         if put:
             return fields + (
+                f" draft_held_chunks={draft.held} draft_exists_ms={draft.exists_ms:.2f}"
                 f" draft_pack_ms={draft.pack_ms:.2f} draft_put_ms={draft.put_ms:.2f}"
                 f" draft_status={draft.status}"
             )
@@ -1492,6 +1499,8 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
                 f" draft_puts={counts.get('draft_put_calls', 0)}"
                 f" draft_put_keys={counts.get('draft_put_keys', 0)}"
                 f" draft_put_bytes={counts.get('draft_put_bytes', 0)}"
+                f" draft_save_exists={save_counts['draft_lookups']}"
+                f" draft_save_held_chunks={save_counts['draft_held_chunks']}"
                 f" draft_gets={counts.get('draft_get_calls', 0)}"
                 f" draft_get_keys={counts.get('draft_get_keys', 0)}"
                 f" draft_get_bytes={counts.get('draft_get_bytes', 0)}"
