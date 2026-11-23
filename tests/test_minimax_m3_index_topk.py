@@ -770,3 +770,73 @@ def test_split_decode_selector_matches_packed(
         assert torch.equal(a, b)
     # Not vacuous: something was selected.
     assert (packed[0] >= 0).any()
+
+
+# --- aiter's FlyDSL prefill block scorer
+
+
+def _flydsl_scorer(monkeypatch, supported=True):
+    calls = []
+    monkeypatch.setattr(
+        m, "index_score_prefill_nvfp4_supported", lambda q, p, s: supported
+    )
+    monkeypatch.setattr(m, "index_score_prefill_nvfp4", lambda *a: calls.append(a))
+    return calls
+
+
+@pytest.mark.parametrize(
+    "rows, fp4, supported, expected",
+    [
+        (2048, True, True, True),
+        (2047, True, True, False),  # below the row bound
+        (4096, False, True, False),  # BF16 / FP8 index cache
+        (4096, True, False, False),  # aiter declines (arch or shape)
+    ],
+)
+def test_flydsl_prefill_scorer_gate(monkeypatch, rows, fp4, supported, expected):
+    _flydsl_scorer(monkeypatch, supported)
+    scale = torch.zeros(1, 128, 8, dtype=torch.uint8) if fp4 else None
+    scorer = m._flydsl_prefill_scorer(
+        torch.zeros(1, 1, 128), torch.zeros(1, 128, 64), scale, rows
+    )
+    assert (scorer is not None) == expected
+
+
+def test_flydsl_prefill_scorer_replaces_the_triton_score(monkeypatch):
+    """The FlyDSL scorer writes the score tensor the selection reads; the Triton
+    score kernel does not launch."""
+    calls = _flydsl_scorer(monkeypatch)
+    monkeypatch.setattr(m, "FLYDSL_PREFILL_SCORE_MIN_ROWS", 1)
+    monkeypatch.setattr(m, "_check_fp4_index", lambda *a: None)
+    monkeypatch.setattr(m, "_score_chunk_blocks", lambda *a: 4)
+    monkeypatch.setattr(m, "_alloc_emit", lambda *a: (None, None))
+    selected = []
+    monkeypatch.setattr(
+        m, "_launch_select", lambda score, *a, **kw: selected.append(score)
+    )
+
+    class _NoLaunch:
+        def __getitem__(self, grid):
+            raise AssertionError("the Triton score kernel ran")
+
+    monkeypatch.setattr(m, "_index_block_score_kernel", _NoLaunch())
+    rows = 8
+    m.minimax_m3_index_topk(
+        torch.zeros(rows, 1, 128, dtype=torch.bfloat16),
+        torch.zeros(4, 128, 64, dtype=torch.uint8),
+        torch.zeros(1, 4, dtype=torch.int32),
+        torch.tensor([0, rows], dtype=torch.int32),
+        torch.tensor([300], dtype=torch.int32),
+        torch.tensor([300 - rows], dtype=torch.int32),
+        max_query_len=rows,
+        max_seq_len=300,
+        topk=16,
+        init_blocks=1,
+        local_blocks=1,
+        num_kv_heads=1,
+        sm_scale=1.0,
+        index_kv_scale=torch.zeros(4, 128, 8, dtype=torch.uint8),
+    )
+    assert len(calls) == 1 and len(selected) == 1
+    assert calls[0][3] is selected[0]  # the score tensor
+    assert calls[0][-1] == 4  # chunk_blocks
