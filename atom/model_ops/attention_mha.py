@@ -5,7 +5,10 @@ from functools import cache
 
 import aiter
 import torch
-from aiter import fused_qk_norm_rope_cache_quant_shuffle, reduce_splitk_partials
+from aiter import (
+    fused_qk_norm_rope_cache_quant_shuffle,
+    gemm_a8w8_bpreshuffle_splitk_reduce,
+)
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha import _flash_attn_varlen_forward
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
@@ -60,10 +63,27 @@ class PagedAttentionImpl(nn.Module):
     # (`claim_splitk_partials`). Opt-in per class: a subclass, which may override
     # rope_cache, claims them only if it sets this itself.
     claims_splitk_partials = True
+    # Whether this layer's QKV GEMM was configured to defer its split-K reduce to
+    # rope_cache; set per layer by the model, which only does so where the class
+    # claims (`claims_splitk_partials`). Off, rope_cache never looks for partials.
+    qkv_splitk_deferred = False
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
         cls.claims_splitk_partials = vars(cls).get("claims_splitk_partials", False)
+
+    def _claim_qkv_partials(self, qkv, consumer_reduces: bool):
+        """The split-K partials a deferred QKV GEMM left in ``qkv``, for a
+        consumer that reduces them itself; for any other consumer they are
+        reduced into ``qkv`` here and None is returned. None too when this
+        layer's QKV does not defer (`qkv_splitk_deferred`)."""
+        if not self.qkv_splitk_deferred:
+            return None
+        partials = claim_splitk_partials(qkv)
+        if partials is not None and not consumer_reduces:
+            gemm_a8w8_bpreshuffle_splitk_reduce(qkv, partials)
+            return None
+        return partials
 
     def __init__(
         self,
@@ -250,8 +270,9 @@ class PagedAttentionImpl(nn.Module):
 
         # dummy run will skip attention in cuda graph capture phase
         if fwd_ctx.context.is_dummy_run:
-            # Release qkv's unreduced split-K partials: nothing reads this output.
-            claim_splitk_partials(qkv)
+            if self.qkv_splitk_deferred:
+                # Release qkv's unreduced split-K partials: nothing reads it.
+                claim_splitk_partials(qkv)
             if quantized_output is not None:
                 quantized_output.zero_()
                 output_scale.fill_(1.0)
@@ -305,15 +326,13 @@ class PagedAttentionImpl(nn.Module):
             )
         )
         # Only the fused Gemma kernel reduces a deferred split-K QKV itself.
-        qkv_partials = claim_splitk_partials(qkv)
-        if qkv_partials is not None and not (
-            self.rotary_emb is not None
+        qkv_partials = self._claim_qkv_partials(
+            qkv,
+            consumer_reduces=self.rotary_emb is not None
             and self.k_norm is not None
             and isinstance(self.q_norm, GemmaRMSNorm)
-            and not gemma_unfused
-        ):
-            reduce_splitk_partials(qkv, qkv_partials)
-            qkv_partials = None
+            and not gemma_unfused,
+        )
 
         if (
             self.rotary_emb is not None
@@ -1495,8 +1514,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             sparse_metadata = attn_metadata
         slot_mapping = sparse_metadata.slot_mapping
 
-        # A deferred split-K QKV is contiguous; claim its partials before any copy.
-        qkv_partials = claim_splitk_partials(qkv)
+        # A deferred split-K QKV is contiguous; claim its partials before any
+        # copy. The Triton branch below reduces them first.
+        qkv_partials = self._claim_qkv_partials(qkv, consumer_reduces=True)
         qkv = qkv.contiguous()
         num_tokens = qkv.shape[0]
         from atom.models.minimax_m3.model import _minimax_m3_cos_sin_cache
@@ -1538,7 +1558,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
 
             # This kernel reads a reduced qkv (the index columns it skips too).
             if qkv_partials is not None:
-                reduce_splitk_partials(qkv, qkv_partials)
+                gemm_a8w8_bpreshuffle_splitk_reduce(qkv, qkv_partials)
 
             q_size = self.num_heads * self.head_dim
             kv_size = self.num_kv_heads * self.head_dim

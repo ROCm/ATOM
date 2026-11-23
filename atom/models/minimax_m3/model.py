@@ -21,10 +21,7 @@ from atom.config import Config, QuantizationConfig
 from atom.distributed.indexer_cp import indexer_cp_enabled
 from atom.distributed.ulysses_sp import local_num_kv_heads
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
-from atom.model_ops.attention_mha import (
-    PagedAttentionImpl,
-    SparseMHAPagedAttentionImpl,
-)
+from atom.model_ops.attention_mha import SparseMHAPagedAttentionImpl
 from atom.model_ops.base_attention import (
     Attention,
     _flydsl_arch_supported,
@@ -48,10 +45,10 @@ from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
 )
 from atom.model_ops.moe import FusedMoE
-from atom.model_ops.paged_attention import Attention as AtomAttention
 from atom.model_ops.swiglu_oai import swiglu_oai_split, swiglu_oai_split_reducing
 from atom.model_ops.utils import atom_parameter
 from atom.models.minimax_m3.mono.dispatch import MonoDecode
+from atom.models.minimax_m3.splitk import defer_qkv_splitk_reduce, defer_splitk_reduce
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
@@ -162,29 +159,6 @@ def _linear_consumes_per_token_fp8(linear: nn.Module) -> bool:
         quant_type_value == QuantType.per_Token.value
         and getattr(linear, "params_dtype", None) == dtypes.fp8
     )
-
-
-def _rope_cache_claims_splitk_partials(attn: nn.Module) -> bool:
-    """Whether ``attn``'s impl claims a deferred QKV's split-K partials in its
-    rope_cache (`PagedAttentionImpl.claims_splitk_partials`): ATOM's own
-    attention layer only (the plugins' run their own), not under Ulysses SP (its
-    head exchange reads qkv before the impl does)."""
-    return (
-        isinstance(attn, AtomAttention)
-        and attn.sp_columns is None
-        and isinstance(attn.impl, PagedAttentionImpl)
-        and attn.impl.claims_splitk_partials
-    )
-
-
-def _defer_splitk_reduce(linear: nn.Module, consumer_claims: bool) -> None:
-    """Let ``linear``'s per-token FP8 GEMM leave its split-K reduction to the one
-    kernel that reads its output, which sums the partials as it reads them (the
-    result is bit-identical), when that consumer claims them. The GEMM decides per
-    call, arch included, whether it splits K and defers
-    (aiter.gemm_a8w8_bpreshuffle_splitk_deferred)."""
-    if consumer_claims:
-        linear.splitk_consumer_max_m = envs.ATOM_SPLITK_CONSUMER_REDUCE_MAX_M
 
 
 def _minimax_m3_cos_sin_cache(
@@ -299,15 +273,13 @@ class MiniMaxM3MLP(nn.Module):
         self.swiglu_beta = getattr(config, "swiglu_beta", 1.0)
         self.swiglu_limit = getattr(config, "swiglu_limit", 7.0)
         # gate_up's only reader is the activation (its op takes a set limit).
-        _defer_splitk_reduce(self.gate_up_proj, self.swiglu_limit is not None)
+        defer_splitk_reduce(self.gate_up_proj, self.swiglu_limit is not None)
 
     def forward(
         self, x: torch.Tensor, x_scale: torch.Tensor | None = None
     ) -> torch.Tensor:
         gate_up = self.gate_up_proj(x, x_scale=x_scale)
-        if self.gate_up_proj.splitk_consumer_max_m > 0 and (
-            _linear_consumes_per_token_fp8(self.gate_up_proj)
-        ):
+        if self.gate_up_proj.splitk_consumer_max_m > 0:
             x = swiglu_oai_split_reducing(
                 gate_up, self.swiglu_alpha, self.swiglu_beta, self.swiglu_limit
             )
@@ -478,11 +450,8 @@ class MiniMaxM3Attention(nn.Module):
             per_token_fp8_out=effective_layer_quant(quant_config, f"{prefix}.o_proj")
             == (QuantType.per_Token, dtypes.fp8),
         )
-        # qkv's only reader is attn's rope_cache (q/k/v below are views for shapes).
-        _defer_splitk_reduce(
-            self.qkv_proj,
-            _rope_cache_claims_splitk_partials(self.attn),
-        )
+        # q/k/v in forward are views of qkv for shapes only.
+        defer_qkv_splitk_reduce(self.qkv_proj, self.attn)
 
     def forward(
         self,
@@ -636,10 +605,7 @@ class MiniMaxM3SparseAttention(nn.Module):
             per_token_fp8_out=effective_layer_quant(quant_config, f"{prefix}.o_proj")
             == (QuantType.per_Token, dtypes.fp8),
         )
-        # qkv's only reader is attn's rope_cache.
-        _defer_splitk_reduce(
-            self.qkv_proj, _rope_cache_claims_splitk_partials(self.attn)
-        )
+        defer_qkv_splitk_reduce(self.qkv_proj, self.attn)
 
     def forward(
         self,

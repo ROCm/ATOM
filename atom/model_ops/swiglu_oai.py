@@ -24,12 +24,13 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 
 
 @triton.jit
-def _splitk_reduced(ptr, split_stride, offs, mask, NUM_SPLITS: tl.constexpr):
+def splitk_reduced(ptr, split_stride, offs, mask, other, NUM_SPLITS: tl.constexpr):
     # aiter's gemm_a8w8_splitk_reduce, element for element: an fp32 sum in split
-    # order, rounded once to bf16 (round to nearest even).
-    acc = tl.load(ptr + offs, mask=mask, other=0.0)
+    # order, rounded once to bf16 (round to nearest even). Also used by
+    # triton_fused_qkv_norm_rope_cache (unmasked: mask and other None).
+    acc = tl.load(ptr + offs, mask=mask, other=other)
     for s in tl.static_range(1, NUM_SPLITS):
-        acc += tl.load(ptr + s * split_stride + offs, mask=mask, other=0.0)
+        acc += tl.load(ptr + s * split_stride + offs, mask=mask, other=other)
     return acc.to(tl.bfloat16)
 
 
@@ -60,9 +61,9 @@ def _swiglu_oai_kernel(
 
     if NUM_SPLITS > 0:
         part = part_ptr + row * (2 * n_inter)
-        gate_bf = _splitk_reduced(part, part_stride_split, cols, mask, NUM_SPLITS)
-        up_bf = _splitk_reduced(
-            part, part_stride_split, n_inter + cols, mask, NUM_SPLITS
+        gate_bf = splitk_reduced(part, part_stride_split, cols, mask, 0.0, NUM_SPLITS)
+        up_bf = splitk_reduced(
+            part, part_stride_split, n_inter + cols, mask, 0.0, NUM_SPLITS
         )
         tl.store(gate_up_ptr + row * stride_gm + cols * stride_gn, gate_bf, mask=mask)
         tl.store(
@@ -105,8 +106,9 @@ def swiglu_oai_split(
 ) -> torch.Tensor:
     """Apply MiniMax-M3 SwiGLU-OAI to a split-layout ``[..., 2I]`` tensor.
 
-    ``gate_up_partials``: the claimed split-K partials (``aiter.splitk_partials``)
-    of a contiguous bf16 2-D ``gate_up``, reduced here and written back into it."""
+    ``gate_up_partials``: the claimed split-K partials
+    (``aiter.gemm_a8w8_bpreshuffle_splitk_partials``) of a contiguous bf16 2-D
+    ``gate_up``, reduced here and written back into it."""
     if gate_up.shape[-1] % 2 != 0:
         raise ValueError(
             f"SwiGLU-OAI expects an even last dimension, got {gate_up.shape[-1]}."
@@ -173,6 +175,11 @@ def _swiglu_oai_split_reducing_fake(
     return gate_up.new_empty((*gate_up.shape[:-1], gate_up.shape[-1] // 2))
 
 
+# It writes the reduced gate/up back into ``gate_up``, yet declares no mutation:
+# until this op runs gate_up's bf16 values do not exist yet (the GEMM left only
+# partials) and it has no other reader, so nothing can observe the write. A
+# declared mutation would let torch.compile functionalize it and pass a copy,
+# whose address the split-K hand-off (keyed by the GEMM output's) does not know.
 @torch_compile_guard(gen_fake=_swiglu_oai_split_reducing_fake, mutates_args=[])
 def swiglu_oai_split_reducing(
     gate_up: torch.Tensor, alpha: float, beta: float, limit: float

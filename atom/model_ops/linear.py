@@ -17,8 +17,8 @@ from aiter import (
     gemm_a8w8_blockscale_bpreshuffle,
     gemm_a8w8_bpreshuffle,
     gemm_a8w8_bpreshuffle_splitk_deferred,
+    gemm_a8w8_bpreshuffle_splitk_partials,
     get_hip_quant,
-    splitk_partials,
 )
 
 # import torch.distributed as dist
@@ -676,8 +676,9 @@ def gemm_a8w8_per_token_fake(
 def claim_splitk_partials(y: torch.Tensor | None) -> torch.Tensor | None:
     """The fp32 split-K partials a deferred GEMM left unreduced in ``y``
     (`LinearBase.splitk_consumer_max_m`), claimed; None when ``y`` holds its
-    values. The caller reduces them itself or with ``reduce_splitk_partials``."""
-    return None if y is None else splitk_partials(y)
+    values. The caller reduces them itself or with
+    ``aiter.gemm_a8w8_bpreshuffle_splitk_reduce``."""
+    return None if y is None else gemm_a8w8_bpreshuffle_splitk_partials(y)
 
 
 def gemm_a8w8_bpreshuffle_splitk_deferred_fake(
@@ -688,7 +689,7 @@ def gemm_a8w8_bpreshuffle_splitk_deferred_fake(
     dtype: torch.dtype = torch.bfloat16,
     max_m: int = 0,
 ) -> torch.Tensor:
-    return torch.empty((x.shape[0], weight.shape[0]), dtype=dtype, device=x.device)
+    return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=dtype, device=x.device)
 
 
 @torch_compile_guard(
@@ -891,7 +892,7 @@ class LinearBase(nn.Module):
         # reduction to the consumer (aiter.gemm_a8w8_bpreshuffle_splitk_deferred,
         # which decides per call whether it does); 0 keeps it in the GEMM. Set only
         # by a model whose every consumer of this layer's output claims the
-        # partials (aiter.splitk_partials) first.
+        # partials (aiter.gemm_a8w8_bpreshuffle_splitk_partials) first.
         self.splitk_consumer_max_m = 0
         self.input_size = input_size
         self.output_size = (
@@ -1850,7 +1851,14 @@ class LinearBase(nn.Module):
                         bias=self.bias,
                         dtype=otype,
                     )
-                elif self.splitk_consumer_max_m > 0 and self.bias is None:
+                elif (
+                    self.splitk_consumer_max_m > 0
+                    and self.bias is None
+                    # The output must reach its consumer as the GEMM wrote it:
+                    # no padded-column slice, no all-reduce of unreduced rows.
+                    and not self.is_output_padded
+                    and not (self.tp_dim == 1 and self.tp_size > 1)
+                ):
                     y = gemm_a8w8_bpreshuffle_splitk_deferred_impl(
                         x,
                         self.weight,

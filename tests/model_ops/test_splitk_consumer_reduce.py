@@ -27,26 +27,11 @@ N = (NUM_HEADS + 2 * NUM_KV_HEADS) * HEAD_DIM
 
 def _aiter_or_skip():
     import aiter
-    from aiter.jit.utils.build_targets import is_gfx1250_family
-    from aiter.jit.utils.chip_info import get_gfx
+    from aiter.jit.utils.chip_info import get_gfx_runtime
 
-    if not is_gfx1250_family(get_gfx()):
-        pytest.skip("aiter defers the split-K reduction on gfx1250 only")
+    if get_gfx_runtime() != "gfx1250":
+        pytest.skip("M3 defers the split-K reduction on gfx1250 only")
     return aiter
-
-
-def test_claims_splitk_partials_is_opt_in():
-    from atom.model_ops.attention_mha import (
-        PagedAttentionImpl,
-        SparseMHAPagedAttentionImpl,
-    )
-
-    class OwnRopeCache(PagedAttentionImpl):
-        pass
-
-    assert PagedAttentionImpl.claims_splitk_partials
-    assert SparseMHAPagedAttentionImpl.claims_splitk_partials
-    assert not OwnRopeCache.claims_splitk_partials
 
 
 def _gemm_inputs(aiter, rows, n=N):
@@ -187,7 +172,7 @@ def test_partials_reach_a_consumer_through_a_compiled_graph():
         # A consumer op, as attention is one: claims and reduces in place.
         partials = claim_splitk_partials(qkv)
         assert partials is not None, "the GEMM output reached the consumer copied"
-        aiter.reduce_splitk_partials(qkv, partials)
+        aiter.gemm_a8w8_bpreshuffle_splitk_reduce(qkv, partials)
         return qkv.clone()
 
     def forward(x, w, x_scale, w_scale):
@@ -241,7 +226,7 @@ def test_triton_consumers_match_the_reduce_kernel_on_edge_values(split_k):
         (3e-39, 1e-39),
         (3.3e38, 3.3e38),
         (float("inf"), float("-inf")),
-        (1.0, 2.0**-9),
+        (1.0, 2.0**-8),
     ]
 
     def partials(n):

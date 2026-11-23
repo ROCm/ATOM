@@ -480,7 +480,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MiniMax-M3: batches of at most this many tokens may leave the split-K
     # reduction of two per-token FP8 GEMMs to the kernel that consumes them: the
     # QKV GEMM to the q/k norm + RoPE + cache kernel, the dense MLP gate/up GEMM
-    # to SwiGLU-OAI (aiter decides per call; gfx1250 today). 0 keeps the
+    # to SwiGLU-OAI (gfx1250 only; aiter decides per call). 0 keeps the
     # standalone reduce kernel.
     "ATOM_SPLITK_CONSUMER_REDUCE_MAX_M": lambda: int(
         os.getenv("ATOM_SPLITK_CONSUMER_REDUCE_MAX_M", "64")

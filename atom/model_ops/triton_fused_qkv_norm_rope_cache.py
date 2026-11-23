@@ -22,15 +22,7 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
-
-@triton.jit
-def _splitk_reduced(ptr, split_stride, offs, NUM_SPLITS: tl.constexpr):
-    # aiter's gemm_a8w8_splitk_reduce, element for element: an fp32 sum in split
-    # order, rounded once to bf16 (round to nearest even).
-    acc = tl.load(ptr + offs)
-    for s in tl.static_range(1, NUM_SPLITS):
-        acc += tl.load(ptr + s * split_stride + offs)
-    return acc.to(tl.bfloat16)
+from atom.model_ops.swiglu_oai import splitk_reduced
 
 
 @triton.jit
@@ -129,7 +121,9 @@ def _fused_qkv_norm_rope_cache_kernel(
         # Load q from strided input
         if NUM_SPLITS > 0:
             q_part = part_ptr + token_id * part_stride_t + q_part_col + h * BLOCK_D
-            q_red = _splitk_reduced(q_part, part_stride_split, d_offs, NUM_SPLITS)
+            q_red = splitk_reduced(
+                q_part, part_stride_split, d_offs, None, None, NUM_SPLITS
+            )
             tl.store(q_ptr + q_in_offset + d_offs, q_red)
             q = q_red.to(tl.float32)
         else:
@@ -189,8 +183,8 @@ def _fused_qkv_norm_rope_cache_kernel(
         )
         if NUM_SPLITS > 0:
             # Other lanes wrote the reduced row; recompute it rather than read it.
-            q_gathered_raw = _splitk_reduced(
-                q_part, part_stride_split, gather_idx, NUM_SPLITS
+            q_gathered_raw = splitk_reduced(
+                q_part, part_stride_split, gather_idx, None, None, NUM_SPLITS
             ).to(tl.float32)
         else:
             q_gathered_raw = tl.load(q_ptr + q_in_offset + gather_idx).to(tl.float32)
@@ -218,7 +212,9 @@ def _fused_qkv_norm_rope_cache_kernel(
         k_in_offset = token_id * k_stride_t + kv_h * BLOCK_D
         if NUM_SPLITS > 0:
             k_part = part_ptr + token_id * part_stride_t + k_part_col + kv_h * BLOCK_D
-            k_red = _splitk_reduced(k_part, part_stride_split, d_offs, NUM_SPLITS)
+            k_red = splitk_reduced(
+                k_part, part_stride_split, d_offs, None, None, NUM_SPLITS
+            )
             tl.store(k_ptr + k_in_offset + d_offs, k_red)
             k = k_red.to(tl.float32)
         else:
@@ -274,8 +270,8 @@ def _fused_qkv_norm_rope_cache_kernel(
             tl.where(d_offs < ROTARY_DIM, d_offs - ROTARY_DIM_HALF, d_offs),
         )
         if NUM_SPLITS > 0:
-            k_gathered_raw = _splitk_reduced(
-                k_part, part_stride_split, gather_idx, NUM_SPLITS
+            k_gathered_raw = splitk_reduced(
+                k_part, part_stride_split, gather_idx, None, None, NUM_SPLITS
             ).to(tl.float32)
         else:
             k_gathered_raw = tl.load(k_ptr + k_in_offset + gather_idx).to(tl.float32)
@@ -299,7 +295,9 @@ def _fused_qkv_norm_rope_cache_kernel(
         v_in_offset = token_id * v_stride_t + kv_h * BLOCK_D
         if NUM_SPLITS > 0:
             v_part = part_ptr + token_id * part_stride_t + v_part_col + kv_h * BLOCK_D
-            v = _splitk_reduced(v_part, part_stride_split, d_offs, NUM_SPLITS)
+            v = splitk_reduced(
+                v_part, part_stride_split, d_offs, None, None, NUM_SPLITS
+            )
             tl.store(v_ptr + v_in_offset + d_offs, v)
         else:
             v = tl.load(v_ptr + v_in_offset + d_offs)
@@ -401,9 +399,10 @@ def triton_fused_norm_rope_cache(
          + FP8 quant SHUFFLE cache write
     - V: FP8 quant SHUFFLE cache write (no norm, no RoPE)
 
-    ``qkv_partials``: the claimed split-K partials (``aiter.splitk_partials``) of
-    the bf16 packed row that q, k and v slice, which must then cover that whole
-    row; they are reduced here and written back into q, k and v.
+    ``qkv_partials``: the claimed split-K partials
+    (``aiter.gemm_a8w8_bpreshuffle_splitk_partials``) of the bf16 packed row
+    that q, k and v slice, which must then cover that whole row; they are
+    reduced here and written back into q, k and v.
 
     Returns contiguous (q_out, k_out).
     """
