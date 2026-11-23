@@ -120,6 +120,15 @@ from atom.utils.tbo.ubatching import tbo_enabled, tbo_on_comm
 logger = logging.getLogger("atom")
 
 
+def _fp8_weight_block_shape(quant_type: QuantType) -> tuple[int, int]:
+    """Weight (N, K) blocks, distinct from the activation quantization group."""
+    if quant_type == QuantType.per_1x128:
+        return 128, 128
+    if quant_type == QuantType.per_1x32:
+        return 1, 32
+    raise ValueError(f"Not a block FP8 quantization type: {quant_type}")
+
+
 class MoEActivationQuant(Enum):
     BF16 = "bf16"
     FP8 = "fp8"
@@ -2799,12 +2808,7 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
 
         # Block sizes for block quantization
         if self.block_quant:
-            if self.quant_type == QuantType.per_1x128:
-                self.block_n = 128
-                self.block_k = 128
-            elif self.quant_type == QuantType.per_1x32:
-                self.block_n = 1
-                self.block_k = 32
+            self.block_n, self.block_k = _fp8_weight_block_shape(self.quant_type)
 
     def create_weights(
         self,
@@ -3190,12 +3194,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         stream_online_quant = getattr(layer, "_stream_online_quant", False)
 
         if self.block_quant:
-            if self.quant_type == QuantType.per_1x128:
-                block_n = 128
-                block_k = 128
-            elif self.quant_type == QuantType.per_1x32:
-                block_n = 1
-                block_k = 32
+            block_n, block_k = _fp8_weight_block_shape(self.quant_type)
             intermediate_size_for_weight = block_quantized_intermediate_size(
                 intermediate_size_per_partition,
                 block_n,
@@ -3486,12 +3485,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # V4-Flash-Base on gfx942 hits this: routed experts are FP8 e4m3
             # per_1x128 + UE8M0 block-scale.
             if self.block_quant:
-                if self.quant_type == QuantType.per_1x128:
-                    block_shape = [128, 128]
-                elif self.quant_type == QuantType.per_1x32:
-                    block_shape = [1, 32]
-                else:
-                    block_shape = None
+                block_shape = list(_fp8_weight_block_shape(self.quant_type))
             else:
                 block_shape = None
             return fp8_w8a8_moe_quant_config(
@@ -5060,17 +5054,20 @@ class FusedMoE(torch.nn.Module):
                 return True
             if quant_method in (QuantType.per_1x128, QuantType.per_1x32):
                 load_full = getattr(param, "load_full_w2", False)
-                if (
-                    quant_method == QuantType.per_1x128
-                    and self.intermediate_size_per_partition < 128
-                    and not load_full
-                ):
-                    # A scale block spans several equal TP shards.
-                    scale_index = (
-                        self.tp_rank * self.intermediate_size_per_partition // 128
-                    )
-                    loaded_weight = loaded_weight.narrow(shard_dim, scale_index, 1)
-                    load_full = True
+                if quant_method == QuantType.per_1x128 and not load_full:
+                    block_n, block_k = _fp8_weight_block_shape(quant_method)
+                    # Gate/up shard N; down shards K. Multi-rank group32 TP still
+                    # requires K alignment, outside this square-block path.
+                    shard_block = block_k if shard_id == "w2" else block_n
+                    if self.intermediate_size_per_partition < shard_block:
+                        # A scale block spans several equal TP shards.
+                        scale_index = (
+                            self.tp_rank
+                            * self.intermediate_size_per_partition
+                            // shard_block
+                        )
+                        loaded_weight = loaded_weight.narrow(shard_dim, scale_index, 1)
+                        load_full = True
                 self._load_model_weight_or_group_weight_scale(
                     shard_id=shard_id,
                     shard_dim=shard_dim,

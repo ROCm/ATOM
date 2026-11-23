@@ -205,7 +205,12 @@ def physical_expert_id(
 def block_quantized_intermediate_size(
     logical_size: int, block_n: int, block_k: int, tp_size: int
 ) -> int:
-    """Physical width for a TP shard with intact or replicated scale blocks."""
+    """Physical width for a TP shard with intact or replicated scale blocks.
+
+    Equal sub-block shards may share a square weight block's scale. Group32
+    weights have (N, K) blocks of (1, 32); their multi-rank TP shards still require
+    K alignment. Padding the target kernel layout does not relax that contract.
+    """
     if (
         block_n == block_k
         and 0 < logical_size < block_n

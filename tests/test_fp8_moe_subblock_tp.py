@@ -18,7 +18,17 @@ def moe_module():
         yield load("atom.model_ops.moe")
 
 
-def _layer(moe, monkeypatch, method, rank, logical=64, tp=8, experts=2, stream=False):
+def _layer(
+    moe,
+    monkeypatch,
+    method,
+    rank,
+    logical=64,
+    tp=8,
+    experts=2,
+    stream=False,
+    quant_type=None,
+):
     parallel = SimpleNamespace(
         tp_size=tp,
         tp_rank=rank,
@@ -53,10 +63,12 @@ def _layer(moe, monkeypatch, method, rank, logical=64, tp=8, experts=2, stream=F
         use_all2all=False,
         eplb_enabled=False,
     )
+    if quant_type is None:
+        quant_type = moe.QuantType.per_1x128
     layer.layer_quant_config = moe.LayerQuantConfig(
-        quant_type=moe.QuantType.per_1x128,
+        quant_type=quant_type,
         quant_dtype=torch.float8_e4m3fn,
-        weight_block_size=(128, 128),
+        weight_block_size=(128, 128) if quant_type == moe.QuantType.per_1x128 else None,
         is_dynamic=True,
     )
     config = moe.FusedMoEConfig(
@@ -218,6 +230,52 @@ def test_group32_alignment_contract_is_unchanged():
     with pytest.raises(ValueError, match="block_k"):
         block_quantized_intermediate_size(16, 1, 32, 8)
     assert block_quantized_intermediate_size(32, 1, 32, 8) == 32
+
+
+@pytest.mark.parametrize("method", ["Fp8MoEMethod", "CompressedTensorsFp8MoEMethod"])
+@pytest.mark.parametrize("logical", [8, 16])
+def test_group32_subgroup_tp_shards_remain_rejected(
+    moe_module, monkeypatch, method, logical
+):
+    with pytest.raises(ValueError, match="block_k = 32"):
+        _layer(
+            moe_module,
+            monkeypatch,
+            method,
+            0,
+            logical,
+            quant_type=moe_module.QuantType.per_1x32,
+        )
+
+
+@pytest.mark.parametrize(
+    ("method", "physical"),
+    [("Fp8MoEMethod", 256), ("CompressedTensorsFp8MoEMethod", 32)],
+)
+def test_group32_aligned_shards_keep_existing_storage_and_kernel_metadata(
+    moe_module, monkeypatch, method, physical
+):
+    layer = _layer(
+        moe_module,
+        monkeypatch,
+        method,
+        7,
+        logical=32,
+        quant_type=moe_module.QuantType.per_1x32,
+    )
+    # Existing parsers can leave the optional checkpoint block metadata unset.
+    assert layer.layer_quant_config.weight_block_size is None
+    assert layer.intermediate_size_per_partition == 32
+    assert layer.w13_weight.shape == (2, 2 * physical, 256)
+    assert layer.w2_weight.shape == (2, 256, physical)
+    assert layer.w13_weight_scale.shape == (2, 2 * physical, 8)
+    assert layer.w2_weight_scale.shape == (2, 256, physical // 32)
+    expected_scale_dtype = (
+        moe_module.dtypes.fp8_e8m0 if method == "Fp8MoEMethod" else torch.float32
+    )
+    assert layer.w13_weight_scale.dtype == expected_scale_dtype
+    assert layer.w2_weight_scale.dtype == expected_scale_dtype
+    assert layer.quant_method.get_fused_moe_quant_config(layer).block_shape == [1, 32]
 
 
 @pytest.mark.parametrize("logical", [64, 128])
