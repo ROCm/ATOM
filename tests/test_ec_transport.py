@@ -218,3 +218,26 @@ def test_pool_on_tcp_registers_no_hca(engines, monkeypatch):
     ec.EcPool(1024, "cpu", protocol="tcp", clock=Clock())
     assert engines[0].init_args[2:] == ("tcp", "")
     assert mc.os.environ["MC_FORCE_TCP"] == "true"
+
+
+def test_read_returns_none_when_p_reads_another_dtype(engines):
+    pool = ec.EcPool(1024, "cpu", clock=Clock())
+    reader = ec.EcReader(1024, "cpu")
+    params = pool.put(11, rows(1))
+    assert params["dtype"] == "bfloat16"
+    assert reader.read(params, 11, torch.float16) is None
+
+
+def test_put_into_free_space_syncs_once(engines, monkeypatch):
+    pool = ec.EcPool(1024, "cpu", clock=Clock())
+    syncs = []
+    monkeypatch.setattr(ec, "_sync", syncs.append)
+    pool.put(11, rows(1))
+    assert len(syncs) == 1
+
+
+def test_matched_rails_warn_that_reads_take_no_rail(engines, monkeypatch, caplog):
+    monkeypatch.setenv("ATOM_MOONCAKE_MATCHED_RAILS", "rocep139s0,rocep140s0")
+    with caplog.at_level("WARNING", logger="atom"):
+        ec.EcPool(1024, "cpu", clock=Clock())
+    assert "ATOM_MOONCAKE_MATCHED_RAILS" in caplog.text

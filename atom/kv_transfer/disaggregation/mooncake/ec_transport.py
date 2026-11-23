@@ -8,6 +8,9 @@ E reuses space oldest-first, and only once an entry's lease has expired; it
 changes an entry's word before writing over the entry. P reads the rows, then
 rereads the word: a word other than the one E answered with means the rows may
 be another request's, and P encodes the images itself.
+
+Neither ``EcPool`` nor ``EcReader`` locks: each is used by one thread at a time
+(E's encoder thread puts, P's model runner reads).
 """
 
 from __future__ import annotations
@@ -44,6 +47,12 @@ def _open_engine(device: torch.device, protocol: str) -> tuple[Any, str]:
         raise RuntimeError(
             "Mooncake is not installed; image embedding transport needs it"
         )
+    if envs.ATOM_MOONCAKE_MATCHED_RAILS:
+        logger.warning(
+            "ATOM_MOONCAKE_MATCHED_RAILS is set, but image embedding transport "
+            "does not pick a matched rail; on a rail-isolated fabric its reads "
+            "may fail and P encodes the images itself"
+        )
     configured = envs.ATOM_MOONCAKE_IB_DEVICE
     phys_idx = None
     if protocol.strip().lower() != "tcp" and not configured and device.type == "cuda":
@@ -70,7 +79,7 @@ def _register(engine: Any, buf: torch.Tensor) -> None:
 def _sync(buf: torch.Tensor) -> None:
     # A remote read sees GPU memory only once the stream that wrote it is done.
     if buf.is_cuda:
-        torch.cuda.synchronize(buf.device)
+        torch.cuda.current_stream(buf.device).synchronize()
 
 
 @dataclass
@@ -124,9 +133,10 @@ class EcPool:
                     f"the way is inside its {self._lease_s} s lease"
                 )
             victims.append(self._entries.popleft())
-        for e in victims:
-            self._word(e.start).fill_(_INVALID)
-        _sync(self._buf)
+        if victims:
+            for e in victims:
+                self._word(e.start).fill_(_INVALID)
+            _sync(self._buf)
         return start
 
     def put(self, cache_seed: int, rows: torch.Tensor) -> dict[str, Any]:
@@ -151,6 +161,7 @@ class EcPool:
             "length": payload.numel(),
             "generation": self._generation,
             "rows": rows.shape[0],
+            "dtype": str(rows.dtype).removeprefix("torch."),
         }
 
 
@@ -174,6 +185,13 @@ class EcReader:
     ) -> torch.Tensor | None:
         """The rows E stored for ``cache_seed``, or None if P must encode itself."""
         if params["cache_seed"] != cache_seed:
+            return None
+        if params["dtype"] != str(dtype).removeprefix("torch."):
+            logger.warning(
+                "Image embeddings stored as %s, but P reads %s",
+                params["dtype"],
+                dtype,
+            )
             return None
         length = params["length"]
         if length > self._buf.numel() - _WORD:
