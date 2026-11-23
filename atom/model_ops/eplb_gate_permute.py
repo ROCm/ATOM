@@ -541,6 +541,7 @@ class GatePermuteRuntime:
         self._replays = 0
         # Request bucket -> [(layer id, the recording's top-k ids)].
         self._captures: dict[Any, list[tuple[int, torch.Tensor]]] = {}
+        self._layer_indices: dict[tuple[int, ...], torch.Tensor] = {}
         self._capture_key = None
         self._warned: set = set()
         register_graph_holder(self)
@@ -636,10 +637,21 @@ class GatePermuteRuntime:
             ids = torch.stack([t[:rows] if whole else t for _, t in group]).to(
                 torch.int64
             )
-            layer = torch.tensor(
-                [i for i, _ in group], dtype=torch.int64, device=ids.device
+            self._add_physical(
+                self.dec_load,
+                self._layer_index(tuple(i for i, _ in group), ids.device),
+                ids.reshape(len(group), -1),
             )
-            self._add_physical(self.dec_load, layer, ids.reshape(len(group), -1))
+
+    def _layer_index(self, layers: tuple[int, ...], device: Any) -> torch.Tensor:
+        """``layers`` as an int64 tensor on ``device``, built once: a tensor
+        made from host data is a synchronous copy, which would hold the host
+        until the replay just launched has finished -- on every sampled step."""
+        index = self._layer_indices.get(layers)
+        if index is None or index.device != device:
+            index = torch.tensor(layers, dtype=torch.int64, device=device)
+            self._layer_indices[layers] = index
+        return index
 
     def _add_physical(
         self, load: torch.Tensor, layer: torch.Tensor, ids: torch.Tensor
