@@ -57,7 +57,7 @@ BUILDS = {
          "topk": 3, "tp": 2, "timeline": True, "diag_off": DIAG, "ug_groups": 1,
          "tok_par": True, "ep": 2, "moe_tp": 2, "kv_fp8": True,
          "numa": NUMA % "as", "shard": True, "attn_sel": False,
-         "block_rows": 5},
+         "block_rows": 5, "staged_answer": True},
     ),
     "cg": (
         # taps a settle's pushes fill whole waves with (``ColGatherBuild``)
@@ -128,10 +128,10 @@ def test_one_field_changed_is_a_new_binary(cache, build, name):
         # the epsilon is code only in a build that makes its rows, and the
         # confidence head reads a row its CTA made
         base = dataclasses.replace(base, from_state=True)
-    if (build, name) == ("k2a", "staged_answer"):
+    if name == "staged_answer":
         # code only where the FULL layers' long rows split over the ranks
         base = dataclasses.replace(
-            base, index_fp4=True, index_mfma=True, index_bound_max=65536
+            base, index_fp4=True, index_mfma=True, index_bound_max=65536, tp=4
         )
         assert base.index_split
     if (build, name) == ("k1", "embed_in"):
