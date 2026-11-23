@@ -115,7 +115,7 @@ def functional_probe(contract, router, output):
             False,
         ),
     ]
-    if contract.get("functional_only"):
+    if contract.get("functional_only") or contract.get("verify_pd"):
         cases.append(
             (
                 "/v1/completions",
@@ -293,7 +293,9 @@ def verify_kv_transfer(workers, output):
 def benchmark(contract, args):
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
-    if contract.get("functional_only") and shutil.which("rocm-smi"):
+    if (contract.get("functional_only") or contract.get("verify_pd")) and shutil.which(
+        "rocm-smi"
+    ):
         with (output / "gpu-memory.log").open("w") as memory_log:
             subprocess.run(
                 ["rocm-smi", "--showmemuse"],
@@ -306,7 +308,7 @@ def benchmark(contract, args):
     functional_probe(contract, args.router, output / "functional.json")
     transfer = (
         verify_kv_transfer(args.workers, output)
-        if contract.get("functional_only")
+        if contract.get("functional_only") or contract.get("verify_pd")
         else None
     )
     cancellation_probe(
@@ -341,7 +343,7 @@ def benchmark(contract, args):
             "Slurm and container cleanup are verified separately after this client exits.\n"
         )
         return 0
-    shared = Path(os.environ["RUN_DIR"]) / "client-venv"
+    shared = output.parent / "client-venv"
     python = shared / "bin/python"
     if not python.exists():
         created = subprocess.run(

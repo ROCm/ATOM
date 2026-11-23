@@ -40,13 +40,14 @@ def configurations(
         for key, value in contract["environment"].items()
     }
     environment["VLLM_HOST_IP"] = fabric["host-ip"]
+    output_name = "functional" if contract.get("functional_only") else "benchmark"
     command = (
         "python3 /experiment/pd_recipe_router_ab.py benchmark "
         "--contract /experiment/contract.json "
         f"--model-path {shlex.quote(str(Path(model_path).resolve()))} "
         '--router "http://${SRT_FRONTEND_HOST}:${SRT_FRONTEND_PORT}" '
         '--workers "http://${SRT_PREFILL_ENDPOINTS}" "http://${SRT_DECODE_ENDPOINTS}" '
-        "--output /logs/functional"
+        f"--output /logs/{output_name}"
     )
     recipe = {
         "schema": 2,
@@ -57,7 +58,7 @@ def configurations(
             "precision": "MXFP4",
         },
         "resources": {"gpu_type": "mi355x", "gpus_per_node": 8},
-        "slurm": {"time_limit": "01:30:00"},
+        "slurm": {"time_limit": contract.get("run_time_limit", "01:30:00")},
         "frontend": {
             "type": "atomesh",
             "container_image": router_image,
@@ -195,7 +196,7 @@ def main():
             {
                 "source": contract["source"],
                 "case": contract["case_name"],
-                "srtctl_sha": "df706bc365e00bea74e5babe87b4049f624341ea",
+                "srtctl_sha": (args.run_dir / "source-sha.txt").read_text().strip(),
                 "router_runtime": router_runtime,
                 "execution_backend": (
                     "gpu-pool" if os.environ.get("GPOOL_LEASE") else "Spur"
@@ -212,7 +213,10 @@ def main():
                     "custom functionality workload replaces AgentX performance/eval",
                     "power collection disabled for functional-only validation",
                 ],
-                "budget": "90 minutes including a pinned-source router build, up to 45 minutes model readiness, functionality/capture and cleanup; no performance window",
+                "budget": contract.get(
+                    "budget_rationale",
+                    "90 minutes including pinned-source router build, model readiness, functionality/capture and cleanup; no performance window",
+                ),
             },
             indent=2,
         )

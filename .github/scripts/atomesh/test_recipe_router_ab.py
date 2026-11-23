@@ -101,6 +101,46 @@ class RecipeWorkerTest(unittest.TestCase):
 
 
 class FunctionalOnlyTest(unittest.TestCase):
+    def test_performance_uses_full_window_and_mounted_client_path(self):
+        contract = SINGLE_NODE | {
+            "functional_only": False,
+            "verify_pd": True,
+            "duration": 3600,
+            "concurrency": 40,
+        }
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch("pd_recipe_router_ab.scrape"),
+            patch("pd_recipe_router_ab.functional_probe"),
+            patch("pd_recipe_router_ab.cancellation_probe"),
+            patch("pd_recipe_router_ab.verify_kv_transfer") as transfer,
+            patch("pd_recipe_router_ab.shutil.which", return_value=None),
+            patch("pd_recipe_router_ab.request", return_value={}),
+            patch(
+                "pd_recipe_router_ab.subprocess.run",
+                return_value=SimpleNamespace(returncode=0),
+            ) as run,
+            patch(
+                "pd_recipe_router_ab.subprocess.check_output",
+                side_effect=["1.0.14", "agentx-harness==1.0.14"],
+            ),
+        ):
+            root = Path(temporary)
+            (root / "client-venv/bin").mkdir(parents=True)
+            (root / "client-venv/bin/python").touch()
+            args = SimpleNamespace(
+                output=str(root / "benchmark"),
+                router="http://router",
+                workers=["p", "d"],
+                model_path="/model",
+            )
+            self.assertEqual(benchmark(contract, args), 0)
+            command = run.call_args.args[0]
+            self.assertEqual(command[0], str(root / "client-venv/bin/agentx"))
+            self.assertEqual(command[command.index("--benchmark-duration") + 1], "3600")
+            self.assertEqual(command[command.index("--concurrency") + 1], "40")
+            transfer.assert_called_once()
+
     def test_functional_mode_skips_client_install_and_performance(self):
         with (
             tempfile.TemporaryDirectory() as temporary,

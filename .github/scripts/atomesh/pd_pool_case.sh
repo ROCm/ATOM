@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 export GPOOL_LEASE="${1:?lease id}"
-case_name="${2:?tp4 or pp4}"
+case_name="${2:?case name}"
 [[ "${GPOOL_LEASE}" =~ ^L[0-9a-f]{6}$ ]] || exit 2
-[[ "${case_name}" == tp4 || "${case_name}" == pp4 ]] || exit 2
+case "${case_name}" in
+  tp4) contract_file=single-node-functional.json; budget=90m ;;
+  pp4) contract_file=single-node-pp4-functional.json; budget=90m ;;
+  tp4-perf) contract_file=single-node-tp4-performance.json; budget=120m ;;
+  *) exit 2 ;;
+esac
 export REPO_ROOT="${3:?checkout path}"
 export RUN_DIR="${4:?output path}"
 export MODEL_PATH="${5:?model path}"
@@ -48,8 +53,7 @@ for port in (6100, 6132, 7200, 8000):
     with socket.socket() as listener:
         listener.bind(("0.0.0.0", port))
 PY
-export ATOMESH_ENV_ATOMESH_PR5090_CONTRACT=.github/benchmark/pr5090-router-ab/single-node-functional.json
-[[ "${case_name}" != pp4 ]] || export ATOMESH_ENV_ATOMESH_PR5090_CONTRACT=.github/benchmark/pr5090-router-ab/single-node-pp4-functional.json
+export ATOMESH_ENV_ATOMESH_PR5090_CONTRACT=".github/benchmark/pr5090-router-ab/${contract_file}"
 export GITHUB_WORKSPACE="${REPO_ROOT}"
 export SRT_FUNCTIONAL_CONTRACT="${ATOMESH_ENV_ATOMESH_PR5090_CONTRACT}"
 cd "${REPO_ROOT}"
@@ -75,4 +79,4 @@ exit 127
 EOF
 chmod +x "${RUN_DIR}/bin/nvcc"
 export ATOMESH_ROUTER_BUILD_TIMEOUT_SECONDS=1500
-timeout --kill-after=120s 90m bash .github/scripts/atomesh/pd_srt_functional.sh
+timeout --kill-after=120s "${budget}" bash .github/scripts/atomesh/pd_srt_functional.sh

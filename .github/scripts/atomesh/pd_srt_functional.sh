@@ -25,7 +25,7 @@ cleanup_srt() {
   [[ ! -s "${RUN_DIR}/srt-cleanup-remaining.txt" ]] || rc=1
   printf '%s\n' "${rc}" > "${RUN_DIR}/srt-exit-code.txt"
   if [[ ! -f "${RUN_DIR}/logs/perf-analysis.md" ]]; then
-    printf '# Functional run\n\nWorkload exit: %s. No performance window was requested. TTFT p50/p95/p99, ITL p50/p99, throughput and AgentX Pareto/SLO are unavailable by design. Functionality and KV evidence require log review. See srtctl.log, sa-flow-contract.json and srt cleanup records. Run dispatched using run-pd-ci.\n' "${rc}" > "${RUN_DIR}/logs/perf-analysis.md"
+    printf '# Run awaiting artifact analysis\n\nWorkload exit: %s. TTFT p50/p95/p99, ITL p50/p99, throughput and AgentX Pareto/SLO have not yet been extracted. Check the requested duration in experiment/contract.json, benchmark/ artifacts, srtctl.log and cleanup records before assigning a performance conclusion.\n' "${rc}" > "${RUN_DIR}/logs/perf-analysis.md"
   fi
   exit "${rc}"
 }
