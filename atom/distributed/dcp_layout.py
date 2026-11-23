@@ -3,10 +3,12 @@
 
 """DCP token-ownership arithmetic shared by attention and KV transfer.
 
-These helpers are pure ``//`` / ``%`` so they stay elementwise over Python
-ints, numpy arrays, and torch tensors. They live outside ``dcp_ops`` so P/D
+These helpers are ``//``, ``%`` and ``np.clip``, so they stay elementwise over
+Python ints, numpy arrays, and torch tensors. They live outside ``dcp_ops`` so P/D
 relayout can follow the same rule without importing Triton or aiter.
 """
+
+import numpy as np
 
 
 def dcp_owner_rank(pos, dcp_size, cp_kv_cache_interleave_size=1):
@@ -44,3 +46,30 @@ def dcp_global_pos(local_index, dcp_rank, dcp_size, cp_kv_cache_interleave_size=
     return (
         (local_index // cp_kv_cache_interleave_size) * dcp_size + dcp_rank
     ) * cp_kv_cache_interleave_size + (local_index % cp_kv_cache_interleave_size)
+
+
+def get_dcp_local_seq_lens(seq_lens, dcp_size, dcp_rank, cp_kv_cache_interleave_size=1):
+    """Compute per-DCP-rank local sequence lengths.
+
+    With interleaved storage, token i is stored on rank
+    (i // cp_kv_cache_interleave_size) % dcp_size.
+
+    Args:
+        seq_lens: numpy array of sequence lengths
+        dcp_size: DCP world size
+        dcp_rank: this rank's DCP rank
+        cp_kv_cache_interleave_size: interleaving granularity (default 1 = token-level)
+
+    Returns:
+        local_seq_lens: numpy array of local sequence lengths
+    """
+    full_chunks = seq_lens // (cp_kv_cache_interleave_size * dcp_size)
+    base = full_chunks * cp_kv_cache_interleave_size
+
+    remainder_total = seq_lens - base * dcp_size
+    remainder = np.clip(
+        remainder_total - dcp_rank * cp_kv_cache_interleave_size,
+        0,
+        cp_kv_cache_interleave_size,
+    )
+    return base + remainder
