@@ -166,7 +166,7 @@ def test_a_wednesday_report_covers_its_own_session_on_its_own_image(ci):
     assert "| GLM-5.2 | 8K/1K | 12,000 | 12,300 | +2.5% |" in report
     assert "MLPerf Endpoint" not in report
     assert (
-        "| Model | Scenario | 2026-11-11 (tok/s/GPU) | 2026-11-18 (tok/s/GPU) | Delta | GSM8K delta |"
+        "| Model | Scenario | 2026-11-11 (tok/s/GPU) | 2026-11-18 (tok/s/GPU) | Delta | % of target | GSM8K delta |"
         in report
     )
     assert "sha256:wednesday" in report and "| Test date | 2026-11-18 |" in report
@@ -371,6 +371,26 @@ def test_a_known_good_gsm8k_from_the_baseline_file_flags_a_low_first_result(ci, 
         "| 🔴 MiniMax-M3 | GSM8K 87.3%, 7.4 points below the known-good 94.7% |" in text
     )
     assert "MiniMax-M3 (428B) is a problem in the lowlights" in capsys.readouterr().out
+
+
+def test_the_target_file_puts_each_point_against_its_target(ci):
+    write_csv(
+        ci / "perf.csv",
+        PERF_COLUMNS,
+        [perf("2026-11-21", 4, "14.29"), perf("2026-11-21", 64, "39.90")],
+    )
+    write_csv(ci / "accuracy.csv", ACCURACY_COLUMNS, [acc("2026-11-21", "0.963")])
+    (ci / "perf_target.csv").write_text(
+        "model,scenario,concurrency,tok_s_per_gpu,source\n"
+        "kimi-k3,endpoint,64,250,given 2026-11-23\n"
+    )
+    main(["--date", "2026-11-21", "--data-dir", str(ci)])
+    text = result(ci, "20261121").read_text()
+    assert (
+        "| Kimi-K3 (2.8T) | MLPerf Endpoint | — | 39.9 | first | 16.0% of 250 |" in text
+    )
+    assert "| Kimi-K3 (2.8T) | tp8dcp8 | 4 | 14.3 | first | — |" in text
+    assert "| Kimi-K3 (2.8T) | tp8dcp8 | 64 | 39.9 | first | 16.0% of 250 |" in text
 
 
 def test_a_wednesday_gsm8k_session_reports_accuracy_only(ci):

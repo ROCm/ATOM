@@ -9,7 +9,9 @@ performance), Wednesday tests GSM8K only. The example result is the newest
 Saturday session (11-14), which has one of everything: Qwen-35B-A3B fails at
 c64 (a repro), DeepSeek R1 c64 drops 5% (our verified PR), DeepSeek-V4.1-Flash
 gains 6% but loses 5 GSM8K points (someone else's open PR), and Kimi-K3
-recovers from a failed 11-07. The Wednesday session after it (11-18) only
+recovers from a failed 11-07. Kimi-K3, Qwen-35B-A3B and GLM-5.2 have made-up
+c64 targets (perf_target.csv), so "% of target" shows a share, an N/A (a
+failed point) and, for the rest, a dash. The Wednesday session after it (11-18) only
 feeds the accuracy charts: MiniMax-M3 loses 4.7 GSM8K points. The charts and
 the result say EXAMPLE.
 """
@@ -21,7 +23,12 @@ import os
 import random
 import shutil
 
-from ci455_data import ACCURACY_COLUMNS, FOLLOWUP_COLUMNS, PERF_COLUMNS
+from ci455_data import (
+    ACCURACY_COLUMNS,
+    FOLLOWUP_COLUMNS,
+    PERF_COLUMNS,
+    TARGET_COLUMNS,
+)
 from make_charts import main as make_charts
 from make_report import main as make_report
 
@@ -80,6 +87,13 @@ GSM8K = {
 }
 FAILED = {("kimi-k3", "2026-11-07"): {4, 64, "gsm8k"}, ("qwen-35b-a3b", NEWEST): {64}}
 BASELINES = {"kimi-k3": 0.95, "glm-5.2": 0.94}
+# Made-up c64 targets (tok/s per GPU): Qwen-35B-A3B fails at c64, so its share
+# is N/A; the models without one show a dash.
+TARGETS = {
+    ("kimi-k3", "endpoint", 64): 400,
+    ("qwen-35b-a3b", "endpoint", 64): 8000,
+    ("glm-5.2", "8k1k", 64): 16000,
+}
 # Next steps for the example problems (455-CI-guide.md §3.7). The PR numbers
 # are far beyond any real PR, so the links point at nothing.
 FOLLOWUPS = [
@@ -274,6 +288,20 @@ def main():
         os.path.join(OUT, "accuracy_baseline.csv"),
         ("model", "baseline"),
         [{"model": m, "baseline": str(b)} for m, b in BASELINES.items()],
+    )
+    write_csv(
+        os.path.join(OUT, "perf_target.csv"),
+        TARGET_COLUMNS,
+        [
+            {
+                "model": m,
+                "scenario": s,
+                "concurrency": str(c),
+                "tok_s_per_gpu": str(t),
+                "source": "(mock)",
+            }
+            for (m, s, c), t in TARGETS.items()
+        ],
     )
     with open(
         os.path.join(run, "qwen-35b-a3b", "error.log"), "w", encoding="utf-8"

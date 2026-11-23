@@ -1,0 +1,4 @@
+model,scenario,concurrency,tok_s_per_gpu,source
+kimi-k3,endpoint,64,400,(mock)
+qwen-35b-a3b,endpoint,64,8000,(mock)
+glm-5.2,8k1k,64,16000,(mock)

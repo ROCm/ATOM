@@ -541,6 +541,8 @@ awk -F, -v d=<YYYY-MM-DD> '$2 == d {print $4}' perf.csv accuracy.csv | sort -u
 | `error` | 失败时的一句话核心报错 |
 | `note` | 其他说明，如重跑、失败请求数 |
 
+**目标性能**写在 `perf_target.csv`，一个模型的一个场景、一个并发一行，五列：`model`（§1 的 slug）、`scenario`（`endpoint` 或 `8k1k`）、`concurrency`（`4` 或 `64`）、`tok_s_per_gpu`（目标每卡吞吐，口径同 §4.1）、`source`（谁给的、哪天给的）。报告的 Results 和 Details 的性能表里都有一列 `% of target`：本场每卡吞吐 ÷ 目标，后面带上目标值，例如 Kimi-K3 endpoint c64 本场 39.9、目标 250，写 `16.0% of 250`。没设目标的写 —，跑挂的写 N/A。目标变了就改那一行和它的 `source`；每个点只有一个目标，重新生成旧场次的结果也按新目标算。
+
 ### 4.3 accuracy.csv
 
 每个模型每场写一行（周六、周三都测），规则同 `perf.csv`。
@@ -580,6 +582,7 @@ recipes/
     ├── perf.csv           全部历史性能
     ├── accuracy.csv       全部历史 GSM8K 精度
     ├── accuracy_baseline.csv   已知正确的 GSM8K 精度：精度图的参考线，也用来检查精度（§4.3）
+    ├── perf_target.csv    目标性能：Results 和 Details 性能表里的 % of target（§4.2）
     ├── followups.csv      每个问题的说法：已有 PR、我们的 PR 或复现文档（§3.7）
     ├── pending_fixes.csv  已知还没合入、某个模型在等的 PR（§3.7）
     ├── .gitattributes     三个 CSV 设了 merge=union，两个节点同时提交不冲突（§3.5）
@@ -622,7 +625,7 @@ recipes/
 |---|---|---|
 | `## Lowlights` | 老板 | 问题：跑挂和回退，每行带原因和说法（§5.1）。这一场没有问题就不写这一节 |
 | `## Highlights` | 老板 | 好消息：提升和恢复（§5.1）。没有就不写这一节 |
-| `## Results` | 老板 | 总表：每个模型和上一场比（§5.2） |
+| `## Results` | 老板 | 总表：每个模型和上一场比，吞吐还和目标比（§5.2） |
 | `## Environment` | 所有人 | 全镜像名，ATOM 和 aiter 的 branch、完整 commit 和 commit 日期 |
 | `## Findings` | 所有人 | 测试中的发现，取自 `runs/<YYYYMMDD>/findings.md` |
 | `## Details` | 要看细节的人 | 全部数字、趋势图、说法、跑挂 case 的核心 error log 和复现命令（§5.3、§5.4） |
@@ -699,16 +702,16 @@ Lowlights 每一行的 Fix 列都要写上说法，不能只报问题。下面�
 
 ## Results
 
-| Model | Scenario | 2026-11-07 (tok/s/GPU) | 2026-11-14 (tok/s/GPU) | Delta | GSM8K delta |
-|---|---|---|---|---|---|
-| DeepSeek R1 | MLPerf Endpoint | 1,481 | 1,414 | ⚠️ −4.6% | −0.7 pts (now 94.8%) (vs 2026-11-11) |
-| DeepSeek-V4.1-Flash | MLPerf Endpoint | 2,658 | 2,838 | 🟢 +6.8% | ⚠️ −5.1 pts (now 89.1%) (vs 2026-11-11) |
-| Kimi-K3 (2.8T) | MLPerf Endpoint | 336 (2026-10-31) | 340 | +1.2% | 0.0 pts (now 95.6%) (vs 2026-11-11) |
-| Qwen-35B-A3B | MLPerf Endpoint | 6,332 | N/A | N/A | 0.0 pts (now 90.1%) (vs 2026-11-11) |
-| DeepSeek-V4-Pro | 8K/1K | 10,063 | 10,090 | +0.3% | 0.0 pts (now 95.5%) (vs 2026-11-11) |
-| GLM-5.2 | 8K/1K | 12,765 | 12,833 | +0.5% | +0.5 pts (now 95.2%) (vs 2026-11-11) |
-| MiniMax-M3 (428B) | 8K/1K | 16,120 | 16,255 | +0.8% | +0.4 pts (now 93.5%) (vs 2026-11-11) |
-| Qwen-3.8 Flash | 8K/1K | 26,603 | 26,746 | +0.5% | 0.0 pts (now 89.2%) (vs 2026-11-11) |
+| Model | Scenario | 2026-11-07 (tok/s/GPU) | 2026-11-14 (tok/s/GPU) | Delta | % of target | GSM8K delta |
+|---|---|---|---|---|---|---|
+| DeepSeek R1 | MLPerf Endpoint | 1,481 | 1,414 | ⚠️ −4.6% | — | −0.7 pts (now 94.8%) (vs 2026-11-11) |
+| DeepSeek-V4.1-Flash | MLPerf Endpoint | 2,658 | 2,838 | 🟢 +6.8% | — | ⚠️ −5.1 pts (now 89.1%) (vs 2026-11-11) |
+| Kimi-K3 (2.8T) | MLPerf Endpoint | 336 (2026-10-31) | 340 | +1.2% | 85.1% of 400 | 0.0 pts (now 95.6%) (vs 2026-11-11) |
+| Qwen-35B-A3B | MLPerf Endpoint | 6,332 | N/A | N/A | N/A | 0.0 pts (now 90.1%) (vs 2026-11-11) |
+| DeepSeek-V4-Pro | 8K/1K | 10,063 | 10,090 | +0.3% | — | 0.0 pts (now 95.5%) (vs 2026-11-11) |
+| GLM-5.2 | 8K/1K | 12,765 | 12,833 | +0.5% | 80.2% of 16,000 | +0.5 pts (now 95.2%) (vs 2026-11-11) |
+| MiniMax-M3 (428B) | 8K/1K | 16,120 | 16,255 | +0.8% | — | +0.4 pts (now 93.5%) (vs 2026-11-11) |
+| Qwen-3.8 Flash | 8K/1K | 26,603 | 26,746 | +0.5% | — | 0.0 pts (now 89.2%) (vs 2026-11-11) |
 
 ## Environment
 
@@ -725,9 +728,10 @@ Lowlights 每一行的 Fix 列都要写上说法，不能只报问题。下面�
 ……（§5.3）
 ```
 
-- 总表（Results）一个模型一行，依次是 Model、Scenario、上一场、本场、Delta、GSM8K delta。表格下面不加说明文字。周三只测精度时是 Model、上一场、本场、Delta 四列，不写 Scenario。
+- 总表（Results）一个模型一行，依次是 Model、Scenario、上一场、本场、Delta、% of target、GSM8K delta。表格下面不加说明文字。周三只测精度时是 Model、上一场、本场、Delta 四列，不写 Scenario。
 - 第三、四列是并发 64 的每卡吞吐（口径见 §4.1：endpoint 是输出 token，8K/1K 是输入加输出 token），表头写上一场和本场的日期。上一场取该模型最近一次成功的那一场：例子里 Kimi-K3 上一场（11-07）跑挂了，就和 10-31 那场比，并在格子里注明日期。
 - Delta 只写百分比，例如 `+6.9%`。GSM8K delta 写掉了多少、现在多少，例如 `−4.6 pts (now 88.1%)`；它和上一次测过精度的那场比，周六的格子里因此写着 `(vs <上周三>)`。
+- % of target 是并发 64 的每卡吞吐占目标的百分比，后面带目标值，例如 `16.0% of 250`。目标写在 `perf_target.csv`（§4.2），没设目标的写 —。
 - N/A 表示跑挂、没有值；— 表示没有结果（例如机器挂了没测成，§3.6）；first 表示第一次有数据，没有可比的。
 - Environment 放在 Results 后面、Findings 前面：全镜像名，ATOM 和 aiter 的 branch、完整 commit 和 commit 日期。Details 里的 Environment details 另有 digest 和 commit 标题。
 
@@ -736,7 +740,7 @@ Lowlights 每一行的 Fix 列都要写上说法，不能只报问题。下面�
 在 Findings 后面，`## Details` 下依次是以下几节，全部英文：
 
 1. **Environment details**：测试 image 的全名和 digest、ATOM 和 aiter 的 branch 与完整 commit（带 commit 日期和标题）、测试日期。镜像信息取自本场目录里的 `image.json`（§2.4），缺的项从 CSV 里补。
-2. **Performance**：每个模型每个并发一行，列出并行策略（例如 `tp8dcp8`，不写 GPU 数）、tok/s/GPU 和第二指标（endpoint 是 E2E avg interactivity，8K/1K 是 ITL P50），以及各自和上一场比的变化。变化列的表头写上一场的日期，例如 `vs 2026-11-07`；某个模型上一场跑挂了，就和它最近一次成功的那场比，并在格子里注明，例如 `+1.0% (vs 2026-10-31)`。
+2. **Performance**：每个模型每个并发一行，列出并行策略（例如 `tp8dcp8`，不写 GPU 数）、tok/s/GPU 和第二指标（endpoint 是 E2E avg interactivity，8K/1K 是 ITL P50），以及各自和上一场比的变化；tok/s/GPU 的变化后面是 % of target，即这个并发的每卡吞吐占目标的百分比（§4.2）。变化列的表头写上一场的日期，例如 `vs 2026-11-07`；某个模型上一场跑挂了，就和它最近一次成功的那场比，并在格子里注明，例如 `+1.0% (vs 2026-10-31)`。
 3. **Accuracy**：flexible-extract、strict-match、上一场的分数（表头写日期）和变化，写法同上。
 4. **Trends**：两张趋势图，见 §5.4。
 5. **Follow-ups**：每个问题模型一行，写问题（`problem`）、说法和 note（§3.7）。验证用的数字写在 note 里。

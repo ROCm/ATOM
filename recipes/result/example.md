@@ -19,16 +19,16 @@
 
 ## Results
 
-| Model | Scenario | 2026-11-07 (tok/s/GPU) | 2026-11-14 (tok/s/GPU) | Delta | GSM8K delta |
-|---|---|---|---|---|---|
-| DeepSeek R1 | MLPerf Endpoint | 1,481 | 1,414 | ⚠️ −4.6% | −0.7 pts (now 94.8%) (vs 2026-11-11) |
-| DeepSeek-V4.1-Flash | MLPerf Endpoint | 2,658 | 2,838 | 🟢 +6.8% | ⚠️ −5.1 pts (now 89.1%) (vs 2026-11-11) |
-| Kimi-K3 (2.8T) | MLPerf Endpoint | 336 (2026-10-31) | 340 | +1.2% | 0.0 pts (now 95.6%) (vs 2026-11-11) |
-| Qwen-35B-A3B | MLPerf Endpoint | 6,332 | N/A | N/A | 0.0 pts (now 90.1%) (vs 2026-11-11) |
-| DeepSeek-V4-Pro | 8K/1K | 10,063 | 10,090 | +0.3% | 0.0 pts (now 95.5%) (vs 2026-11-11) |
-| GLM-5.2 | 8K/1K | 12,765 | 12,833 | +0.5% | +0.5 pts (now 95.2%) (vs 2026-11-11) |
-| MiniMax-M3 (428B) | 8K/1K | 16,120 | 16,255 | +0.8% | +0.4 pts (now 93.5%) (vs 2026-11-11) |
-| Qwen-3.8 Flash | 8K/1K | 26,603 | 26,746 | +0.5% | 0.0 pts (now 89.2%) (vs 2026-11-11) |
+| Model | Scenario | 2026-11-07 (tok/s/GPU) | 2026-11-14 (tok/s/GPU) | Delta | % of target | GSM8K delta |
+|---|---|---|---|---|---|---|
+| DeepSeek R1 | MLPerf Endpoint | 1,481 | 1,414 | ⚠️ −4.6% | — | −0.7 pts (now 94.8%) (vs 2026-11-11) |
+| DeepSeek-V4.1-Flash | MLPerf Endpoint | 2,658 | 2,838 | 🟢 +6.8% | — | ⚠️ −5.1 pts (now 89.1%) (vs 2026-11-11) |
+| Kimi-K3 (2.8T) | MLPerf Endpoint | 336 (2026-10-31) | 340 | +1.2% | 85.1% of 400 | 0.0 pts (now 95.6%) (vs 2026-11-11) |
+| Qwen-35B-A3B | MLPerf Endpoint | 6,332 | N/A | N/A | N/A | 0.0 pts (now 90.1%) (vs 2026-11-11) |
+| DeepSeek-V4-Pro | 8K/1K | 10,063 | 10,090 | +0.3% | — | 0.0 pts (now 95.5%) (vs 2026-11-11) |
+| GLM-5.2 | 8K/1K | 12,765 | 12,833 | +0.5% | 80.2% of 16,000 | +0.5 pts (now 95.2%) (vs 2026-11-11) |
+| MiniMax-M3 (428B) | 8K/1K | 16,120 | 16,255 | +0.8% | — | +0.4 pts (now 93.5%) (vs 2026-11-11) |
+| Qwen-3.8 Flash | 8K/1K | 26,603 | 26,746 | +0.5% | — | 0.0 pts (now 89.2%) (vs 2026-11-11) |
 
 ## Environment
 
@@ -58,16 +58,16 @@
 
 ### Performance · MLPerf Endpoint
 
-| Model | Parallelism | Concurrency | tok/s/GPU | vs 2026-11-07 | E2E avg interactivity (tok/s/user) | vs 2026-11-07 |
-|---|---|---|---|---|---|---|
-| DeepSeek R1 | tp4 | 4 | 165 | +0.6% | 150 | −0.4% |
-| DeepSeek R1 | tp4 | 64 | 1,414 | ⚠️ −4.6% | 58.3 | −0.3% |
-| DeepSeek-V4.1-Flash | dp4ep4 | 4 | 251 | 🟢 +6.6% | 212 | +0.7% |
-| DeepSeek-V4.1-Flash | dp4ep4 | 64 | 2,838 | 🟢 +6.8% | 95.7 | +1.2% |
-| Kimi-K3 (2.8T) | tp8dcp8 | 4 | 56.7 | +0.8% (vs 2026-10-31) | 104 | −0.9% (vs 2026-10-31) |
-| Kimi-K3 (2.8T) | tp8dcp8 | 64 | 340 | +1.2% (vs 2026-10-31) | 45.3 | +1.0% (vs 2026-10-31) |
-| Qwen-35B-A3B | tp1 | 4 | 1,010 | +0.3% | 258 | −0.7% |
-| Qwen-35B-A3B | tp1 | 64 | N/A | N/A | N/A | — |
+| Model | Parallelism | Concurrency | tok/s/GPU | vs 2026-11-07 | % of target | E2E avg interactivity (tok/s/user) | vs 2026-11-07 |
+|---|---|---|---|---|---|---|---|
+| DeepSeek R1 | tp4 | 4 | 165 | +0.6% | — | 150 | −0.4% |
+| DeepSeek R1 | tp4 | 64 | 1,414 | ⚠️ −4.6% | — | 58.3 | −0.3% |
+| DeepSeek-V4.1-Flash | dp4ep4 | 4 | 251 | 🟢 +6.6% | — | 212 | +0.7% |
+| DeepSeek-V4.1-Flash | dp4ep4 | 64 | 2,838 | 🟢 +6.8% | — | 95.7 | +1.2% |
+| Kimi-K3 (2.8T) | tp8dcp8 | 4 | 56.7 | +0.8% (vs 2026-10-31) | — | 104 | −0.9% (vs 2026-10-31) |
+| Kimi-K3 (2.8T) | tp8dcp8 | 64 | 340 | +1.2% (vs 2026-10-31) | 85.1% of 400 | 45.3 | +1.0% (vs 2026-10-31) |
+| Qwen-35B-A3B | tp1 | 4 | 1,010 | +0.3% | — | 258 | −0.7% |
+| Qwen-35B-A3B | tp1 | 64 | N/A | N/A | N/A | N/A | — |
 
 ### Accuracy (GSM8K, 3-shot) · MLPerf Endpoint
 
@@ -86,16 +86,16 @@
 
 ### Performance · 8K/1K
 
-| Model | Parallelism | Concurrency | tok/s/GPU | vs 2026-11-07 | ITL P50 (ms, lower is better) | vs 2026-11-07 |
-|---|---|---|---|---|---|---|
-| DeepSeek-V4-Pro | dp4ep4 | 4 | 2,159 | +0.1% | 13.6 | +0.5% |
-| DeepSeek-V4-Pro | dp4ep4 | 64 | 10,090 | +0.3% | 37.1 | +0.8% |
-| GLM-5.2 | tp4 | 4 | 2,679 | +0.4% | 10.6 | +0.7% |
-| GLM-5.2 | tp4 | 64 | 12,833 | +0.5% | 29.2 | +0.2% |
-| MiniMax-M3 (428B) | tp4 | 4 | 3,185 | −0.0% | 8.7 | −1.2% |
-| MiniMax-M3 (428B) | tp4 | 64 | 16,255 | +0.8% | 23.3 | +0.8% |
-| Qwen-3.8 Flash | tp1 | 4 | 4,929 | +0.2% | 5.8 | −1.2% |
-| Qwen-3.8 Flash | tp1 | 64 | 26,746 | +0.5% | 15.6 | −0.5% |
+| Model | Parallelism | Concurrency | tok/s/GPU | vs 2026-11-07 | % of target | ITL P50 (ms, lower is better) | vs 2026-11-07 |
+|---|---|---|---|---|---|---|---|
+| DeepSeek-V4-Pro | dp4ep4 | 4 | 2,159 | +0.1% | — | 13.6 | +0.5% |
+| DeepSeek-V4-Pro | dp4ep4 | 64 | 10,090 | +0.3% | — | 37.1 | +0.8% |
+| GLM-5.2 | tp4 | 4 | 2,679 | +0.4% | — | 10.6 | +0.7% |
+| GLM-5.2 | tp4 | 64 | 12,833 | +0.5% | 80.2% of 16,000 | 29.2 | +0.2% |
+| MiniMax-M3 (428B) | tp4 | 4 | 3,185 | −0.0% | — | 8.7 | −1.2% |
+| MiniMax-M3 (428B) | tp4 | 64 | 16,255 | +0.8% | — | 23.3 | +0.8% |
+| Qwen-3.8 Flash | tp1 | 4 | 4,929 | +0.2% | — | 5.8 | −1.2% |
+| Qwen-3.8 Flash | tp1 | 64 | 26,746 | +0.5% | — | 15.6 | −0.5% |
 
 ### Accuracy (GSM8K, 3-shot) · 8K/1K
 

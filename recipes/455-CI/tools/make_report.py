@@ -16,7 +16,9 @@ in the lowlights gets its next step from followups.csv (455-CI-guide.md §3.7);
 for one without, the unmerged PRs pending_fixes.csv lists for the model are
 suggested as a ready followups.csv row.
 GSM8K is also held to the known-good value in accuracy_baseline.csv (model,
-baseline, source). Prints the lowlights and highlights, a warning for a problem without a follow-up, and last the
+baseline, source), and each point's tok/s per GPU to its target in
+perf_target.csv (model, scenario, concurrency, tok_s_per_gpu, source): the
+"% of target" column of the results and the performance details. Prints the lowlights and highlights, a warning for a problem without a follow-up, and last the
 report's path. The result tags no one: the owners are added where it is posted.
 The image comes from runs/<image date>/image.json, written when the image was
 built (455-CI-guide.md §2.4), else from the CSV rows.
@@ -128,6 +130,15 @@ def main(argv=None):
             baselines[r["model"]] = float(r["baseline"])
         except (KeyError, TypeError, ValueError):
             pass
+    targets = {}  # (model, scenario) -> {concurrency: target tok/s per GPU}
+    for r in _rows(os.path.join(args.data_dir, "perf_target.csv")):
+        try:
+            target = float(r["tok_s_per_gpu"])
+            conc = int(r["concurrency"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if target > 0:
+            targets.setdefault((r["model"], r["scenario"]), {})[conc] = target
     results = [
         ModelResult(
             s,
@@ -138,6 +149,7 @@ def main(argv=None):
             _read(os.path.join(run_dir, slug, "error.log")),
             commands(os.path.join(run_dir, slug)),
             baseline=baselines.get(slug),
+            targets=targets.get((slug, s), {}),
         )
         for s in scenarios
         for slug, name in MODELS[s]

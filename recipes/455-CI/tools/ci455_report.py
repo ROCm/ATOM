@@ -37,6 +37,8 @@ class ModelResult:
     commands: list = field(default_factory=list)
     # The model's known-good GSM8K (flexible-extract), accuracy_baseline.csv
     baseline: float | None = None
+    # Target tok/s per GPU by concurrency, perf_target.csv
+    targets: dict = field(default_factory=dict)
 
 
 def pct(x):
@@ -313,10 +315,24 @@ def previous_column(results):
     )
 
 
+def target_share(c, target):
+    """A point's tok/s per GPU as a share of its target (perf_target.csv),
+    with the target: "16.0% of 250". — without a target or a number; N/A: the
+    point failed."""
+    if target is None:
+        return "—"
+    if c.status == "fail":
+        return "N/A"
+    if c.value is None:
+        return "—"
+    return f"{c.value / target * 100:.1f}% of {num(target)}"
+
+
 def summary_row(r, date, ref):
     """Model, scenario, previous and current c64 tok/s per GPU (dated only
     when the previous one is not from the `ref` session the column is headed
-    with), the delta as a percentage, GSM8K delta. N/A: the run failed."""
+    with), the delta as a percentage, the share of the c64 target, GSM8K
+    delta. N/A: the run failed."""
     c, a = headline(r), r.acc
     prev = (
         "—"
@@ -343,7 +359,8 @@ def summary_row(r, date, ref):
         acc = f"{acc_flag(a.delta)} {pts(a.delta)} (now {score(a.value)})".strip()
         if a.prev_date and a.prev_date != ref:
             acc += f" (vs {a.prev_date})"
-    return [r.name, LABEL[r.scenario], prev, now, delta, acc]
+    share = target_share(c, r.targets.get(c.concurrency))
+    return [r.name, LABEL[r.scenario], prev, now, delta, share, acc]
 
 
 def perf_ran(results):
@@ -433,8 +450,8 @@ def _lights_and_results(date, env, results, followups):
             out += [f"## {title}", "", *table, ""]
     if perf_ran(results):
         table = [
-            f"| Model | Scenario | {ref or '—'} (tok/s/GPU) | {date} (tok/s/GPU) | Delta | GSM8K delta |",
-            "|---|---|---|---|---|---|",
+            f"| Model | Scenario | {ref or '—'} (tok/s/GPU) | {date} (tok/s/GPU) | Delta | % of target | GSM8K delta |",
+            "|---|---|---|---|---|---|---|",
             *["| " + " | ".join(summary_row(r, date, ref)) + " |" for r in results],
         ]
     else:
@@ -513,8 +530,8 @@ def _details(date, env, results, charts_dir, runs_dir, followups=None):
                 "",
                 f"### Performance · {label}",
                 "",
-                f"| Model | Parallelism | Concurrency | tok/s/GPU | {vs} | {SECOND_HEADER[scenario]} | {vs} |",
-                "|---|---|---|---|---|---|---|",
+                f"| Model | Parallelism | Concurrency | tok/s/GPU | {vs} | % of target | {SECOND_HEADER[scenario]} | {vs} |",
+                "|---|---|---|---|---|---|---|---|",
             ]
             for r in mine:
                 for c in r.perf:
@@ -530,7 +547,8 @@ def _details(date, env, results, charts_dir, runs_dir, followups=None):
                     )
                     out.append(
                         f"| {r.name} | {c.parallel or '—'} | {c.concurrency} | {_perf_value(c)} | "
-                        f"{_vs(c, _perf_delta(c, c.delta), ref, c.delta)} | {sv} | "
+                        f"{_vs(c, _perf_delta(c, c.delta), ref, c.delta)} | "
+                        f"{target_share(c, r.targets.get(c.concurrency))} | {sv} | "
                         f"{_vs(c, sd, ref, c.delta_second)} |"
                     )
         aref = max((r.acc.prev_date for r in mine if r.acc.prev_date), default=None)

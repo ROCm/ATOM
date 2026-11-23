@@ -364,6 +364,7 @@ def test_summary_row_shows_c64_throughput_before_and_now_with_the_delta():
         "1,000",
         "1,040",
         "🟢 +4.0%",
+        "—",
         "−0.2 pts (now 93.9%)",
     ]
 
@@ -383,6 +384,7 @@ def test_summary_row_dates_a_previous_value_older_than_the_column():
         "336 (2026-10-31)",
         "340",
         "+1.2%",
+        "—",
         "−0.1 pts (now 96.1%) (vs 2026-10-31)",
     ]
 
@@ -398,7 +400,7 @@ def test_summary_row_of_a_failed_run_shows_na():
         "2026-11-14",
         "2026-11-07",
     )
-    assert row == ["Bravo", "MLPerf Endpoint", "900", "N/A", "N/A", "N/A"]
+    assert row == ["Bravo", "MLPerf Endpoint", "900", "N/A", "N/A", "—", "N/A"]
 
 
 def test_summary_row_of_a_first_run_has_no_delta():
@@ -413,8 +415,39 @@ def test_summary_row_of_a_first_run_has_no_delta():
         "—",
         "1,000",
         "first",
+        "—",
         "first (now 95.0%)",
     ]
+
+
+def kimi(c64):
+    """Kimi-K3 with its MLPerf endpoint target, 250 tok/s/GPU at c64."""
+    r = model("Kimi-K3 (2.8T)", pc(4, 14.29, None), c64, ac(0.963, None))
+    r.targets = {64: 250.0}
+    return r
+
+
+def test_summary_row_shows_the_c64_throughput_as_a_share_of_its_target():
+    row = summary_row(kimi(pc(64, 39.9, None)), "2026-11-21", None)
+    assert row[3:6] == ["39.9", "first", "16.0% of 250"]
+
+
+def test_a_failed_point_has_no_share_of_its_target():
+    row = summary_row(
+        kimi(pc(64, None, None, status="fail", error="x")), "2026-11-21", None
+    )
+    assert row[3:6] == ["N/A", "N/A", "N/A"]
+
+
+def test_the_results_and_details_put_each_concurrency_against_its_own_target():
+    text = report_md("2026-11-21", {}, [kimi(pc(64, 39.9, None))], "c", "r")
+    assert (
+        "| Model | Scenario | — (tok/s/GPU) | 2026-11-21 (tok/s/GPU) | Delta | % of target | GSM8K delta |"
+        in text
+    )
+    assert "| tok/s/GPU | vs — | % of target |" in text
+    assert "| Kimi-K3 (2.8T) | tp4 | 4 | 14.3 | first | — |" in text
+    assert "| Kimi-K3 (2.8T) | tp4 | 64 | 39.9 | first | 16.0% of 250 |" in text
 
 
 def test_a_problem_without_a_follow_up_is_just_the_problem():
@@ -482,7 +515,7 @@ def test_summary_row_of_a_model_that_did_not_run_shows_dashes_not_na():
         "2026-11-14",
         "2026-11-07",
     )
-    assert row == ["Alpha", "MLPerf Endpoint", "1,000", "—", "—", "—"]
+    assert row == ["Alpha", "MLPerf Endpoint", "1,000", "—", "—", "—", "—"]
 
 
 PR_OPEN = "https://github.com/ROCm/aiter/pull/1234"
