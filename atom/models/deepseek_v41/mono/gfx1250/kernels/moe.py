@@ -681,6 +681,26 @@ def ug_epilogue(c, ui, g, n, acc):
 
 
 @ASTRewriter.transform
+def ug_epi_w(c, ui, g, n, x, amx, q):
+    """(ug_union) wave q of a group: token l's 8 cols 32 g + 8 q .. of MID row (ui, l) from its silu values x and the
+    32-col block's amax -- ug_epilogue's code / cvt (bit for bit): one 8-byte word pair; wave 0 the code (+ the K pad)."""
+    l = c["l"]
+    if l < n:
+        code = e8m0_of(amx)
+        wd = q8words(x, inv_pow2(code))
+        mrow = c["mid8"] + (i64(ui) * MAXTOK + i64(l)) * MROW
+        _stx(mrow + i64(g * 32 + q * 8), fx.Vector.from_elements(wd, I32))
+        if q == 0:
+            crow = c["midc"] + (i64(ui) * MAXTOK + i64(l)) * CROW
+            _stx(crow + i64(g), code.to(fx.Int8))
+            if g == NUG - 1:   # the K pad of the down: cols 576..639 zero, codes 18, 19 = 1
+                zv = fx.Vector.from_elements([I32(0)] * 4, I32)
+                for k in range_constexpr(4):
+                    _stx(mrow + i64(I + 16 * k), zv)
+                _stx(crow + i64(18), I32(0x0101).to(fx.Int16))
+
+
+@ASTRewriter.transform
 def ug_shared8(c, ui, k, g):
     """FP8 shared UG unit g of token chunk k on this (dedicated) CTA: wave w does K steps 5w .. 5w + 4 of the 4 tiles,
     the 8 partials are summed in wave order through LDS, wave 0 runs the epilogue."""
@@ -1713,19 +1733,29 @@ def ug_union(c, i, TR):
         acc1 = fx.Vector.filled(8, 0.0, F32)
         if (hx.unlikely(live) if rd == 1 else live):   # (c1 code size: a second round is rare, off the hot path)
             acc1 = ug_body1(c, pk, c["w13"] + ex * W13_E + i64(g) * (4 * W13_TS), c["s13"] + ex * S13_E + i64(g) * (2 * W13_KC), w % 4)
+        # the group's epilogue on its 4 waves, each its own tile's 8 cols (silu, bf16-exact) -- not on one wave over the
+        # 4 tiles' sums: that ran its ~540 instructions (4 KB) once a round, I$-cold, 1.6-1.8 us (3 us the second round's
+        # copy; 0.25 run again warm); the 32-col block's amax through LDS (one barrier), then ug_epi_w (bit for bit)
+        x = []
+        am = F32(0.0)
+        for q in range_constexpr(8):
+            xv = silu_clamp(acc1[q], acc1[q].shuffle_xor(16, 32))
+            x.append(xv)
+            am = fx.max(am, abs(xv))
+        ab = sm + O_RED8 + rd * 1024
+        hx.lstore(ab + (w * 32 + l) * 4, am)
+        if fx.const_expr(rd == 0):
+            if c["t"] < 4:   # the groups' arrival counters (rounds 0 / 1)
+                hx.lstore(sm + O_RED8 + 2048 + c["t"] * 4, I32(0))
         gpu.barrier()
-        ow = sm + O_RED8 + (w * 32 + l) * 32
-        hx.lstore(ow, fx.Vector.from_elements([acc1[q] for q in range(4)], F32), align=16)
-        hx.lstore(ow + 16, fx.Vector.from_elements([acc1[q] for q in range(4, 8)], F32), align=16)
-        gpu.barrier()
-        if (hx.unlikely((w % 4 == 0) & live) if rd == 1 else ((w % 4 == 0) & live)):
-            acc = []
-            for q in range_constexpr(4):
-                orr = sm + O_RED8 + ((w + q) * 32 + l) * 32
-                lo_ = hx.lload(orr, F32, 4, align=16)
-                hi_ = hx.lload(orr + 16, F32, 4, align=16)
-                acc.append(fx.Vector.from_elements([lo_[j] for j in range(4)] + [hi_[j] for j in range(4)], F32))
-            ug_epilogue(c, ui, g, n, acc)
+        if (hx.unlikely(live) if rd == 1 else live):
+            qq = w % 4
+            b0 = w - qq
+            amx = hx.lload(ab + (b0 * 32 + l) * 4, F32)
+            for j in range_constexpr(1, 4):
+                amx = fx.max(amx, hx.lload(ab + ((b0 + j) * 32 + l) * 4, F32))
+            ug_epi_w(c, ui, g, n, x, amx, qq)
             hx.wait_storecnt0()
-            if l == 0:
-                hx.put(c["mflag"] + i64(ui * NUG + g) * 8, I32(0), c["mtag"])
+            if l == 0:   # the group's last wave past its stores puts its flag
+                if latomic_add(sm + O_RED8 + 2048 + (rd * 2 + w // 4) * 4, 1) == 3:
+                    hx.put(c["mflag"] + i64(ui * NUG + g) * 8, I32(0), c["mtag"])
