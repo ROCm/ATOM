@@ -234,8 +234,8 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
                 for seq in seqs:
                     outputs.put_nowait(RequestOutput(seq.id, [], True, "aborted"))
             else:
+                submitted = True  # a failed submission may have dispatched some seqs
                 await api._submit_engine_requests(seqs)
-                submitted = True
                 if call.aborted:  # during its submission
                     for seq in seqs:
                         api.engine.core_mgr.abort_request(seq.id)
