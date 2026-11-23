@@ -6,6 +6,7 @@ prefill command builders."""
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -25,20 +26,40 @@ def shell_functions(*names):
     return "\n".join(functions)
 
 
+MATRIX_ENV = {
+    "ATOMESH_SLURM_SUBMIT_RUNNER": "atomesh-cicd",
+    "ATOMESH_SLURM_ACCOUNT": "",
+    "ATOMESH_SLURM_PARTITION": "",
+    "ATOMESH_MODEL_ROOT": "/models",
+    "ATOMESH_LOG_ROOT": "/logs",
+    "ATOMESH_NODE_POOL": "pit2-p03-g13,pit2-p03-g27",
+    "ATOMESH_1P1D_NODES": "",
+    "ATOMESH_PD_RANK_MAPPING_POLICY": "none",
+}
+
+
+def router_script():
+    return (
+        shell_functions(
+            "has_cli_flag",
+            "is_agentic_dpa",
+            "is_agentic_multi_prefill",
+            "start_router",
+        )
+        + """
+dump_launch_info() { :; }
+start_logged_process() { shift 2; printf 'ARG:%s\\n' "$@"; }
+prefill_args=(--prefill http://prefill:8010)
+decode_args=(--decode http://decode:8020)
+start_router
+"""
+    )
+
+
 class KvEventsCellsTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.env = dict(
-            os.environ,
-            ATOMESH_SLURM_SUBMIT_RUNNER="atomesh-cicd",
-            ATOMESH_SLURM_ACCOUNT="",
-            ATOMESH_SLURM_PARTITION="",
-            ATOMESH_MODEL_ROOT="/models",
-            ATOMESH_LOG_ROOT="/logs",
-            ATOMESH_NODE_POOL="pit2-p03-g13,pit2-p03-g27",
-            ATOMESH_1P1D_NODES="",
-            ATOMESH_PD_RANK_MAPPING_POLICY="none",
-        )
+        cls.env = dict(os.environ, **MATRIX_ENV)
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "matrix.json"
             subprocess.run(
@@ -60,21 +81,7 @@ class KvEventsCellsTest(unittest.TestCase):
                 timeout=30,
             )
             cls.cells = json.loads(output.read_text())["include"]
-        cls.router_script = (
-            shell_functions(
-                "has_cli_flag",
-                "is_agentic_dpa",
-                "is_agentic_multi_prefill",
-                "start_router",
-            )
-            + """
-dump_launch_info() { :; }
-start_logged_process() { shift 2; printf 'ARG:%s\\n' "$@"; }
-prefill_args=(--prefill http://prefill:8010)
-decode_args=(--decode http://decode:8020)
-start_router
-"""
-        )
+        cls.router_script = router_script()
         cls.prefill_script = shell_functions("start_prefill") + """
 apply_role_env() { :; }
 reset_lmcache_disk() { :; }
@@ -293,6 +300,101 @@ start_mooncake_page_cache_dropper
         self.assertIn("ATOM_KV_EVENTS_ENABLE=1", args)
         self.assertIn("ATOM_KV_EVENTS_ENDPOINT=tcp://*:5589", args)
         self.assertIn("ATOM_KV_EVENTS_REPLAY_ENDPOINT=tcp://*:5605", args)
+
+
+class DeepSeekV41ShareCacheCellsTest(unittest.TestCase):
+    """The recipe's router on the baseline, and the agentic prefill, least_load
+    decode and KV events with the Store's hits on the other cell."""
+
+    BASELINE = "ds-v41-flash-8p16d-p2ep2-d4noep-dspark5-agentic-mcstore-c1228"
+    run_script = KvEventsCellsTest.run_script
+    router_args = KvEventsCellsTest.router_args
+
+    @classmethod
+    def setUpClass(cls):
+        cls.env = dict(
+            os.environ,
+            **MATRIX_ENV,
+            ATOMESH_2P1D_NODES="pit2-p03-g27,pit2-p03-g48,pit2-p03-g53",
+        )
+        cls.router_script = router_script()
+        cls.cells = []
+        with tempfile.TemporaryDirectory() as directory:
+            for suite in ("mooncake_store", "kv_events"):
+                output = Path(directory) / f"{suite}.json"
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(SCRIPTS / "pd_matrix.py"),
+                        "--suite",
+                        suite,
+                        "--model",
+                        "DeepSeek-V4.1-Flash-1017",
+                        "--output",
+                        str(output),
+                    ],
+                    cwd=ROOT,
+                    env=cls.env,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                cls.cells += json.loads(output.read_text())["include"]
+
+    def submitted_router_args(self, cell):
+        source = (SCRIPTS / "pd_submit.sh").read_text()
+        start = source.index("python3 - <<'PY'\n") + len("python3 - <<'PY'\n")
+        result = subprocess.run(
+            [sys.executable, "-c", source[start : source.index("\nPY\n", start)]],
+            env=dict(self.env, CELL_JSON=json.dumps(cell)),
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        exports = dict(
+            shlex.split(line.removeprefix("export "))[0].split("=", 1)
+            for line in result.stdout.splitlines()
+            if line.startswith("export ROUTER_")
+        )
+        return self.router_args(cell, **exports)
+
+    def test_cells_launch_the_recipe_router_or_the_cache_aware_flow(self):
+        self.assertEqual(
+            {cell["name"] for cell in self.cells},
+            {self.BASELINE, self.BASELINE.replace("-mcstore-", "-mcstore-kvev-")},
+        )
+        timeouts = {
+            "--request-timeout-secs": "1800",
+            "--prepare-queue-timeout-ms": "5000",
+            "--prepare-timeout-ms": "15000",
+        }
+        for cell in self.cells:
+            with self.subTest(cell=cell["name"]):
+                self.assertEqual(cell["num_nodes"], 3)
+                self.assertEqual(cell["concurrency"], [1228])
+                args = self.submitted_router_args(cell)
+                flags = [arg for arg in args if arg.startswith("--")]
+                self.assertEqual(len(flags), len(set(flags)), flags)
+                self.assertIn("--dp-aware", args)
+                value = {flag: args[args.index(flag) + 1] for flag in flags}
+                for flag, expected in timeouts.items():
+                    self.assertEqual(value[flag], expected)
+                if cell["name"] == self.BASELINE:
+                    # Above a 1.0 cache hit ratio and with no load imbalance
+                    # allowed, cache_aware routes by load alone.
+                    self.assertEqual(value["--prefill-policy"], "cache_aware")
+                    self.assertEqual(value["--decode-policy"], "cache_aware")
+                    self.assertEqual(float(value["--cache-threshold"]), 1.0)
+                    self.assertEqual(float(value["--balance-abs-threshold"]), 0)
+                    self.assertEqual(float(value["--balance-rel-threshold"]), 1.0)
+                    self.assertNotIn("--kv-events", flags)
+                    continue
+                self.assertEqual(value["--prefill-policy"], "agentic")
+                self.assertEqual(value["--decode-policy"], "least_load")
+                self.assertIn("--kv-events", flags)
+                self.assertEqual(float(value["--kv-storage-weight"]), 1.0)
 
 
 if __name__ == "__main__":

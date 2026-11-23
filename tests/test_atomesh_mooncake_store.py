@@ -1092,6 +1092,94 @@ stop_mooncake_store
             with self.subTest(env=env, script=script):
                 self.run_shell(script + "check_mooncake_store_settings\n", **env)
 
+    def test_packed_prefill_workers_share_a_store_the_decode_nodes_own(self):
+        # Four prefills take all eight GPUs, and so NICs, of node 0; the owners
+        # sit on the two decode nodes.
+        packed = "prefill_nodes=(0 0 0 0); decode_nodes=(1 1 2 2)\n"
+        shared = {
+            "ATOMESH_PD_WORKER_LAYOUT": "packed_nodes",
+            "xP": "4",
+            "yD": "4",
+            "MOONCAKE_STORE_OWNERS": "none",
+            "MOONCAKE_STORE_DECODE_OWNERS": "0:8:rdma2;1:8:rdma6",
+        }
+        result = self.run_shell(
+            packed
+            + "check_mooncake_store_settings\n"
+            + 'echo "OWNERS=${#mooncake_owner_plan_numa[@]} DEVICES=$(mooncake_owner_devices_csv)"\n'
+            + 'echo "CAPACITY=${mooncake_pool_capacity[*]}"\n',
+            **shared,
+        )
+        self.assertIn("OWNERS=0 DEVICES=\n", result.stdout)
+        self.assertIn(f"CAPACITY={2 * 16 * GIB}\n", result.stdout)
+        for script, env, message in (
+            ("", {"MOONCAKE_STORE_DECODE_OWNERS": ""}, "leaves the Store no owner"),
+            # Owners on the prefill node: its workers' NICs are theirs too.
+            (
+                packed,
+                {"MOONCAKE_STORE_OWNERS": "0:8:rdma4", "MOONCAKE_STORE_DECODE_OWNERS": ""},
+                "packed_nodes starts 4 prefill workers on one node",
+            ),
+            (
+                packed,
+                {"MOONCAKE_STORE_OWNERS": "0:8:rdma4"},
+                "or packed_nodes prefill workers on one node with MOONCAKE_STORE_OWNERS=none",
+            ),
+            (
+                "prefill_nodes=(0 0 1 1); decode_nodes=(2 2 3 3)\n",
+                {},
+                "needs the decode on nodes of its own",
+            ),
+        ):
+            with self.subTest(env=env, script=script):
+                result = self.run_shell(
+                    script + "check_mooncake_store_settings\n",
+                    expect_rc=2,
+                    **{**shared, **env},
+                )
+                self.assertIn(message, result.stderr)
+        # The first worker starts the masters and waits for the decode nodes'
+        # owners; the next ones find the Store up. Nothing is pinned here.
+        (self.root / "segments").write_text(f"{self.master_port} {2 * 16 * GIB}\n")
+        result = self.run_shell(
+            packed
+            + "start_mooncake_store\nstart_mooncake_store\n"
+            + "printf 'ENV %s\\n' \"${mooncake_store_prefill_env[@]}\"\n"
+            + "stop_mooncake_store\n",
+            **shared,
+            MOONCAKE_STORE_PAGE_CACHE_DROP_FOR="0",
+        )
+        self.assertEqual(len(self.store_calls("mooncake_master")), 1)
+        self.assertEqual(self.store_calls("mooncake_client"), [])
+        self.assertNotIn("numa_memory_budget.py", self.calls.read_text())
+        self.assertNotIn("drop_page_cache.py", self.calls.read_text())
+        config = json.loads(
+            prefixed_lines(result.stdout, "ENV ")["ATOM_KV_OFFLOAD_EXTRA_CONFIG"]
+        )
+        self.assertEqual(config["mooncake_store.owner_rdma_devices"], "")
+        self.assertNotIn("mooncake_store.save_pool_mib", config)
+
+    def test_the_case_sizes_the_requesters_load_and_save_pools(self):
+        result = self.run_shell(
+            "plan_mooncake_store_pools\nmooncake_store_launcher_config_json\n",
+            MOONCAKE_STORE_LOAD_POOL_MIB="2048",
+            ATOMESH_PREFILL_ENV_MOONCAKE_STORE_SAVE_POOL_MIB="1024",
+        )
+        config = json.loads(result.stdout)
+        self.assertEqual(config["mooncake_store.load_pool_mib"], 2048)
+        self.assertEqual(config["mooncake_store.save_pool_mib"], 1024)
+        for value in ("0", "1.5", "x"):
+            with self.subTest(value=value):
+                result = self.run_shell(
+                    "check_mooncake_store_settings\n",
+                    expect_rc=2,
+                    MOONCAKE_STORE_SAVE_POOL_MIB=value,
+                )
+                self.assertIn(
+                    f"MOONCAKE_STORE_SAVE_POOL_MIB={value} is not a positive integer number",
+                    result.stderr,
+                )
+
     def test_cleanup_saves_the_metrics_before_it_stops_a_worker(self):
         # A decode node stops its owners once the router closes, and the
         # router closes once the prefill worker stops.

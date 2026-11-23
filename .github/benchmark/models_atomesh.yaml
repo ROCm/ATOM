@@ -2553,3 +2553,125 @@ models:
       # V3 is not a reasoning model, so gsm8k answers are short.
       max_gen_toks: 512
       apply_chat_template: true
+
+  # recipes/DeepSeek-V4.1-6P16D-C1228-Share-Cache.md on three pit2-p03 (TW
+  # MI355X) nodes: the four EP2 prefills packed on the first take all its GPUs
+  # and so all its NICs, as the Store's requesters; the two TP4 NoEP decodes on
+  # each of the others hold the Store's 1574 GiB of owners. Dispatch-only: the
+  # recipe's router (cache_aware that balances by load alone) in suite
+  # mooncake_store, and the cache-aware one in suite kv_events.
+  DeepSeek-V4.1-Flash-1017:
+    backend: atom
+    # The 1017 checkpoint linked beside its chat template, which the router
+    # renders a chat with over HTTP.
+    model_path: "${ATOMESH_MODEL_ROOT}/deepseek-ai/DeepSeek-V4.1-Flash-1017-chat/"
+    precision: FP4
+    env:
+      common:
+        ATOM_MONO_ENABLE: "1"
+        ATOM_FRONTEND_PREFIX_HASH: "1"
+        ATOM_DP_SESSION_AFFINITY: "0"
+        ATOM_MOONCAKE_MATCHED_RAILS: auto
+        ATOM_DSV41_MOE_FP8_ACTIVATIONS: "0"
+        ATOM_USE_CUSTOM_ALL_GATHER: "0"
+        ATOM_DSPARK_DISABLE_COMPILE: "1"
+        ATOM_DISABLE_MMAP: "true"
+        ATOM_PD_RANK_MAPPING_POLICY: none
+        MC_NUM_QP_PER_EP: "1"
+        MC_LOG_LEVEL: INFO
+        MOONCAKE_DISABLE_HIP_DMABUF: "1"
+        HSA_ENABLE_IPC_MODE_LEGACY: "1"
+        NCCL_DEBUG: WARN
+        NCCL_IB_DISABLE: "0"
+      prefill:
+        OFFLOAD_MIN_LOAD_TOKENS: "512"
+        OFFLOAD_LOAD_WORKERS: "4"
+        OFFLOAD_COPY_WORKERS: "4"
+        MOONCAKE_STORE: "1"
+        MOONCAKE_STORE_OWNERS: none
+        # On each decode node. NUMA0 takes more: NUMA1 keeps page cache the
+        # drop cannot reach (the GLM kv_events cells).
+        MOONCAKE_STORE_DECODE_OWNERS: "0:448:rdma2,rdma3;1:339:rdma6,rdma7"
+        MOONCAKE_STORE_LOAD_POOL_MIB: "1024"
+        MOONCAKE_STORE_SAVE_POOL_MIB: "1024"
+        MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: "${ATOMESH_MODEL_ROOT}"
+        MOONCAKE_STORE_PAGE_CACHE_DROP_FOR: "0"
+        PREFILL_KV_TRANSFER_CONFIG: >-
+          {"kv_role":"kv_producer","kv_connector":"mooncake","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+      decode:
+        DECODE_KV_TRANSFER_CONFIG: >-
+          {"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+    server:
+      common_args:
+        trust_remote_code: true
+        kv_cache_dtype: fp8
+        block_size: 16
+        enable_prefix_caching: true
+        gpu_memory_utilization: 0.85
+        max_model_len: ""
+        max_num_seqs: 64
+        decode_max_num_seqs: 128
+        max_num_batched_tokens: 32768
+        decode_max_num_batched_tokens: 1024
+        method: dspark
+        num_speculative_tokens: 5
+        # Benchmark-only AL, as in the recipe.
+        spec_decode_acceptance_length: 3.51
+        state_checkpoint_interval_tokens: 8192
+        extra_args: >-
+          --index-cache-dtype fp8 --moe-backend standard
+          --all2all-backend high-throughput --tool-call-parser dsml_v41
+          --dspark-config {"confidence_schedule":false} --disable-uvicorn-access-log
+    suites:
+      mooncake_store:
+        - &dsv41_8p16d_mcstore
+          name: ds-v41-flash-8p16d-p2ep2-d4noep-dspark5-agentic-mcstore-c1228
+          display_topology: 8P16D-P2EP2-D4NOEP-DSPARK5-MCSTORE
+          topology: 4p4d_dpa
+          pd_worker_layout: packed_nodes
+          nodes: "${ATOMESH_2P1D_NODES}"
+          isl: [1048576]
+          osl: 1024
+          concurrency: [1228]
+          # The recipe's router: with these thresholds cache_aware places every
+          # request by load.
+          router:
+            policy: cache_aware
+            cache_threshold: 1.0
+            balance_abs_threshold: 0
+            balance_rel_threshold: 1.0
+            extra_args: "--request-timeout-secs 1800 --prepare-queue-timeout-ms 5000 --prepare-timeout-ms 15000"
+          prefill:
+            workers: 4
+            tp: 2
+            cudagraph: "[1,2,4,8,16,24,32,40,48,64]"
+            cudagraph_mode: FULL
+            compilation_level: 3
+            extra_args: "--enable-dp-attention --enable-expert-parallel --dp-load-balance share_cache --attn-prefill-chunk-size 65536"
+          decode:
+            workers: 4
+            tp: 4
+            cudagraph: "[1,2,4,8,16,24,32,48,64,96,128]"
+            cudagraph_mode: FULL
+            compilation_level: 3
+            extra_args: "--enable-dp-attention --dp-load-balance least_requests --attn-prefill-chunk-size 16384 --gpu-memory-utilization 0.75"
+          benchmark:
+            <<: *agentic_1m_aiperf
+            apply_chat_template: false
+            benchmark_duration: 900
+            wait_server_timeout: 5400
+          run_eval: false
+
+      kv_events:
+        # agentic prefill (#3406) and least_load decode (#3567), placed by the
+        # prefill's KV events and the Store hits they lead to (kv_storage_weight).
+        - <<: *dsv41_8p16d_mcstore
+          name: ds-v41-flash-8p16d-p2ep2-d4noep-dspark5-agentic-mcstore-kvev-c1228
+          display_topology: 8P16D-P2EP2-D4NOEP-DSPARK5-MCSTORE-KVEV
+          router:
+            policy: cache_aware
+            prefill_policy: agentic
+            decode_policy: least_load
+            kv_events: true
+            kv_storage_weight: 1.0
+            extra_args: "--request-timeout-secs 1800 --prepare-timeout-ms 15000"
