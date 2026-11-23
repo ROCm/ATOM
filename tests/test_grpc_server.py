@@ -746,6 +746,48 @@ def test_an_abort_is_applied_while_a_submission_is_in_admission(serve, monkeypat
     assert [seq.id for seq in engine.submitted] == [a, b] and engine.running == {}
 
 
+def test_a_finished_request_s_seq_id_is_reusable_while_its_admission_settles(
+    serve, monkeypatch
+):
+    engine, settle = FakeEngine([([5], "eos")]), threading.Event()
+    servicer = serve(engine)
+    open_session, opened = servicer.sessions.open, []
+    monkeypatch.setattr(
+        servicer.sessions, "open", lambda: opened.append(open_session()) or opened[-1]
+    )
+    add_request = engine.add_request
+
+    def finish_then_settle(seqs):  # A ends before its structured admission returns
+        add_request(seqs)
+        if seqs[0].json_schema is not None:
+            settle.wait(10)
+
+    monkeypatch.setattr(engine.core_mgr, "add_request", finish_then_settle)
+    sent = asyncio.Event()
+
+    async def client():
+        batch = _submit_batch((4, "a", [1]))
+        envelope = v1.Envelope.FromString(batch[0])
+        envelope.submit.requests[0].sampling.json_schema = '{"type": "object"}'
+        yield pb.Frames(frames=[envelope.SerializeToString(), *batch[1:]])
+        await _until(lambda: opened and engine.made and not opened[0].requests)
+        yield pb.Frames(frames=_submit_batch((4, "b", [2])))  # A's seq_id again
+        await sent.wait()
+
+    async def reuse_while_a_settles():
+        call = servicer.Session(client(), SimpleNamespace())
+        await anext(call)  # Ready
+        await _until(lambda: len(engine.made) == 2)
+        reused_before_a_settled = not settle.is_set()
+        settle.set()
+        sent.set()
+        await call.aclose()
+        return reused_before_a_settled
+
+    assert asyncio.run(reuse_while_a_settles())
+    assert [seq.id for seq in engine.submitted] == engine.made
+
+
 def test_an_abort_is_applied_while_admissions_are_at_their_cap(serve, monkeypatch):
     monkeypatch.setattr(grpc_server, "SESSION_ADMISSIONS", 2)
     engine = FakeEngine([([5], None)])
