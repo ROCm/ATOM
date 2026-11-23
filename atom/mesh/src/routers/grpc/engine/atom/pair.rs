@@ -4,6 +4,7 @@
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use futures::{Stream, StreamExt};
 use http::StatusCode;
@@ -49,7 +50,7 @@ impl AtomPairs {
     ) -> Result<Self, String> {
         let mut info = AtomPrefillInfo::default();
         for worker in workers.get_prefill_workers().iter().filter(|w| is_atom(w)) {
-            learn(&mut info, worker).await?;
+            learn(&mut info, worker).await.map_err(|e| e.to_string())?;
         }
         Ok(Self {
             info: RwLock::new(Arc::new(info)),
@@ -68,7 +69,7 @@ impl AtomPairs {
             return Ok(AtomAdapter::new(known));
         }
         let mut learned = AtomPrefillInfo::default();
-        learn(&mut learned, prefill).await.map_err(bad_gateway)?;
+        learn(&mut learned, prefill).await?;
         let mut info = self.info.write().unwrap();
         let mut merged = AtomPrefillInfo::clone(&info);
         merged.tp_sizes.extend(learned.tp_sizes);
@@ -190,12 +191,13 @@ async fn atom_client(worker: &Arc<dyn Worker>) -> Option<AtomClient> {
 
 /// Adds `worker`'s TP size and chunked template to `info`, its instance's GetServerInfo
 /// read once.
-async fn learn(info: &mut AtomPrefillInfo, worker: &Arc<dyn Worker>) -> Result<(), String> {
+async fn learn(info: &mut AtomPrefillInfo, worker: &Arc<dyn Worker>) -> Result<(), EngineError> {
     let base_url = worker.base_url().trim_end_matches('/').to_string();
     if !info.tp_sizes.contains_key(&base_url) {
         let data = kv_transfer_info(worker).await?;
         let source = format!("{base_url} GetServerInfo");
-        let (tp, chunked) = parse_atom_prefill_info(&data, &source, &base_url)?;
+        let (tp, chunked) =
+            parse_atom_prefill_info(&data, &source, &base_url).map_err(bad_gateway)?;
         info.tp_sizes.insert(base_url.clone(), tp);
         if let Some(template) = chunked {
             info.chunked_transfer.insert(base_url.clone(), template);
@@ -209,18 +211,28 @@ async fn learn(info: &mut AtomPrefillInfo, worker: &Arc<dyn Worker>) -> Result<(
     Ok(())
 }
 
-/// `worker`'s instance's `/kv_transfer_info` body, as GetServerInfo carries it.
-async fn kv_transfer_info(worker: &Arc<dyn Worker>) -> Result<Value, String> {
+/// `worker`'s instance's `/kv_transfer_info` body, as GetServerInfo carries it. Connecting
+/// and reading it take at most the worker's health-check timeout together.
+async fn kv_transfer_info(worker: &Arc<dyn Worker>) -> Result<Value, EngineError> {
     let url = worker.url();
-    let client = atom_client(worker)
+    let deadline = Duration::from_secs(worker.metadata().health_config.timeout_secs);
+    let read = async {
+        let client = atom_client(worker)
+            .await
+            .ok_or_else(|| bad_gateway(format!("Failed to connect to ATOM prefill {url}")))?;
+        client
+            .get_server_info()
+            .await
+            .map_err(|e| bad_gateway(format!("GetServerInfo on {url} failed: {e}")))
+    };
+    let info = tokio::time::timeout(deadline, read)
         .await
-        .ok_or_else(|| format!("Failed to connect to ATOM prefill {url}"))?;
-    let info = client
-        .get_server_info()
-        .await
-        .map_err(|e| format!("GetServerInfo on {url} failed: {e}"))?;
+        .map_err(|_| EngineError::Http {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            message: format!("GetServerInfo on {url} timed out after {deadline:?}"),
+        })??;
     serde_json::from_str(&info.kv_transfer_info_json)
-        .map_err(|e| format!("Parse {url} GetServerInfo kv_transfer_info: {e}"))
+        .map_err(|e| bad_gateway(format!("Parse {url} GetServerInfo kv_transfer_info: {e}")))
 }
 
 /// The fields `AtomAdapter` wrote into `view`, onto `request`.

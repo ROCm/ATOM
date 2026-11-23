@@ -44,6 +44,8 @@ struct FakeAtom {
     held: Mutex<Option<mpsc::Sender<Reply>>>,
     /// GetServerInfo's `kv_transfer_info_json`; `{"tp_size":1}` when unset.
     kv_transfer_info: Option<String>,
+    /// GetServerInfo never answers.
+    stall_server_info: bool,
 }
 
 impl FakeAtom {
@@ -98,6 +100,9 @@ impl AtomEngine for FakeAtom {
         &self,
         _: Request<GetServerInfoRequest>,
     ) -> Result<Response<GetServerInfoResponse>, Status> {
+        if self.stall_server_info {
+            std::future::pending::<()>().await;
+        }
         Ok(Response::new(GetServerInfoResponse {
             protocol_version: 1,
             kv_transfer_info_json: self
@@ -581,7 +586,7 @@ mod pairs {
 
     use super::*;
     use crate::config::types::{AtomPdRankMappingPolicy, RetryConfig};
-    use crate::core::{WorkerRegistry, WorkerType};
+    use crate::core::{HealthConfig, WorkerRegistry, WorkerType};
     use crate::policies::RoundRobinPolicy;
     use crate::routers::grpc::engine::{atom::pair::AtomPairs, Dispatcher};
     use crate::routers::grpc::pd_router::GrpcPDRouter;
@@ -901,6 +906,52 @@ mod pairs {
         // Its GetServerInfo was read: chunked transfer, and its TP size for D.
         assert_eq!(kv(&first(&p))["chunked_transfer"], json!(true));
         assert_eq!(kv(&first(&d))["remote_tp_size"], json!(2));
+    }
+
+    #[tokio::test]
+    async fn a_prefill_whose_server_info_never_answers_times_out_at_both_reads() {
+        let fake = Arc::new(FakeAtom {
+            stall_server_info: true,
+            ..Default::default()
+        });
+        let url = serve(fake).await;
+        let health = HealthConfig {
+            timeout_secs: 1,
+            ..Default::default()
+        };
+        let stalled: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(&url)
+                .worker_type(PREFILL)
+                .connection_mode(ConnectionMode::Grpc { port: None })
+                .runtime_type(RuntimeType::Atom)
+                .health_config(health)
+                .build(),
+        );
+        let registry = Arc::new(WorkerRegistry::new());
+        registry.register(stalled.clone());
+        let startup = timeout(
+            HANG,
+            AtomPairs::new(registry, AtomPdRankMappingPolicy::Idx2Idx),
+        );
+        let error = startup.await.expect("startup hung").err().unwrap();
+        assert!(error.contains("timed out"), "{error}");
+
+        let pairs = AtomPairs::new(
+            Arc::new(WorkerRegistry::new()),
+            AtomPdRankMappingPolicy::Idx2Idx,
+        )
+        .await
+        .unwrap();
+        let first_pair = timeout(HANG, pairs.adapter_for(&stalled));
+        let error = first_pair
+            .await
+            .expect("the first pair hung")
+            .err()
+            .unwrap();
+        assert!(
+            matches!(error, EngineError::Http { status, .. } if status == StatusCode::GATEWAY_TIMEOUT),
+            "{error}"
+        );
     }
 
     #[tokio::test]
