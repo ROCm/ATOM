@@ -333,6 +333,9 @@ AIPERF_APPLY_CHAT_TEMPLATE="${AIPERF_APPLY_CHAT_TEMPLATE:-false}"
 AIPERF_MAX_CONTEXT_LENGTH="${AIPERF_MAX_CONTEXT_LENGTH:-262144}"
 AIPERF_NUM_DATASET_ENTRIES="${AIPERF_NUM_DATASET_ENTRIES:-393}"
 AIPERF_BENCHMARK_DURATION="${AIPERF_BENCHMARK_DURATION:-1800}"
+# 0 passes no --warmup-requests-per-lane: the inferencex-agentx-mvp scenario
+# then warms each lane with its snapshot primers only, while agentx falls back
+# to its own 10.
 AIPERF_WARMUP_REQUESTS_PER_LANE="${AIPERF_WARMUP_REQUESTS_PER_LANE:-10}"
 AIPERF_TRACE_IDLE_GAP_CAP_SECONDS="${AIPERF_TRACE_IDLE_GAP_CAP_SECONDS:-300}"
 AIPERF_WARMUP_GRACE_PERIOD="${AIPERF_WARMUP_GRACE_PERIOD:-1800}"
@@ -2702,6 +2705,10 @@ run_aiperf_agentic_benchmark() {
     local dashboard_json="${RUN_DIR}/benchmark_results/${result_file}"
     local -a unsafe_args=()
     local -a chat_template_args=()
+    local -a warmup_args=()
+    if [[ "${AIPERF_WARMUP_REQUESTS_PER_LANE}" != "0" ]]; then
+      warmup_args+=(--warmup-requests-per-lane "${AIPERF_WARMUP_REQUESTS_PER_LANE}")
+    fi
     if (( AIPERF_BENCHMARK_DURATION < 900 )) \
       || [[ "${AIPERF_UNSAFE_OVERRIDE}" == "1" || "${AIPERF_UNSAFE_OVERRIDE}" == "true" ]]; then
       unsafe_args+=(--unsafe-override)
@@ -2756,7 +2763,7 @@ run_aiperf_agentic_benchmark() {
       --failed-request-threshold "${AIPERF_FAILED_REQUEST_THRESHOLD}" \
       --trajectory-start-min-ratio "${AIPERF_TRAJECTORY_START_MIN_RATIO}" \
       --trajectory-start-max-ratio "${AIPERF_TRAJECTORY_START_MAX_RATIO}" \
-      --warmup-requests-per-lane "${AIPERF_WARMUP_REQUESTS_PER_LANE}" \
+      "${warmup_args[@]}" \
       --trace-idle-gap-cap-seconds "${AIPERF_TRACE_IDLE_GAP_CAP_SECONDS}" \
       --warmup-grace-period "${AIPERF_WARMUP_GRACE_PERIOD}" \
       --use-server-token-count \

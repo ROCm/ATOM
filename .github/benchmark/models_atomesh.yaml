@@ -2662,9 +2662,13 @@ models:
             apply_chat_template: false
             benchmark_duration: 900
             wait_server_timeout: 5400
-            # Each lane prefills its starting context once, into P and the
-            # Store; ten warmup turns per lane take about two hours at C1228.
-            warmup_requests_per_lane: 1
+            # The recipe's scenario. Warmup is the snapshot primers alone, which
+            # prefill each lane's context into P and the Store: at C1228 the
+            # zero-delay cache-pressure turns start about a thousand Store
+            # loads at once, and within a minute every P NIC's RDMA reads stop
+            # completing (the offload README's CQ stall).
+            scenario: inferencex-agentx-mvp
+            warmup_requests_per_lane: 0
           run_eval: false
 
       kv_events:
