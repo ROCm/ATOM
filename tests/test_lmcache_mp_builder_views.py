@@ -285,7 +285,9 @@ def test_minimax_m3_builder_publishes_gqa_and_index_views_without_tp_collapse(
     assert len(transfer.block_regions) == 4 * 2 + 1
     # Every KV unit is one head-major run of the rank's one head; the indexer
     # keys are the same on every rank.
-    assert [page.head_major_runs for page in transfer.pages] == [(1, 1)] * 8 + [None]
+    assert [page.head_major_runs for page in transfer.pages] == [
+        (1, (128 * 128,))
+    ] * 4 + [(1, (128 * 4,))] * 4 + [None]
     index = transfer.pages[-1].unit_spec
     assert (index.layer, index.dim, index.dtype) == (0, 128, "torch.float8_e4m3fnuz")
     assert all(

@@ -24,6 +24,7 @@ use crate::{
         GetServerInfoResponse, HealthCheckRequest, HealthCheckResponse,
         PrepareStructuredOutputRequest, PrepareStructuredOutputResponse,
     },
+    config::RouterConfig,
     core::{
         placement::PlacementPlan, steps::WorkflowEngines, worker::RuntimeType, JobQueue,
         JobQueueConfig,
@@ -34,8 +35,11 @@ use crate::{
     },
     routers::{
         grpc::engine::GrpcEngine,
-        prepare::{build_generate_payload, prepare_chat},
-        test_mocks::{app_context, tokenizer::hf_tokenizer_path},
+        prepare::{build_generate_payload, fast_tokenizer::FastTokenizer, prepare_chat},
+        test_mocks::{
+            app_context::app_context_with_router_config,
+            tokenizer::{byte_level_tokenizer_dir, hf_tokenizer_path, BYTE_LEVEL_MERGES},
+        },
     },
 };
 
@@ -208,7 +212,11 @@ fn model_info(name: &str, chat_template: &str, default_kwargs: &str) -> GetModel
 
 /// A router context with the job queue and workflow engines that registration uses.
 fn context() -> Arc<AppContext> {
-    let ctx = app_context();
+    context_with(RouterConfig::default())
+}
+
+fn context_with(config: RouterConfig) -> Arc<AppContext> {
+    let ctx = app_context_with_router_config(config);
     let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&ctx));
     ctx.worker_job_queue.set(queue).unwrap();
     let engines = WorkflowEngines::new(&ctx.router_config);
@@ -296,6 +304,28 @@ async fn the_tokenizer_job_renders_with_the_label_template_without_a_flag() {
     // The fixture's own template would render "user: hi".
     let rendered = render(&ctx, "atom-template", Value::Null).await;
     assert_eq!(rendered, "label: hi");
+}
+
+/// The label template is set before fastokens wraps the tokenizer: a FastTokenizer
+/// refuses `set_chat_template`.
+#[tokio::test]
+async fn a_fastokens_model_renders_with_the_label_template() {
+    let dir = byte_level_tokenizer_dir(BYTE_LEVEL_MERGES, true, json!({}));
+    let info = GetModelInfoResponse {
+        tokenizer_path: dir.path().to_str().unwrap().into(),
+        ..model_info("atom-fastokens", "label: {{ messages[0].content }}", "{}")
+    };
+    let url = serve_atom(info, 1).await;
+    let mut config = RouterConfig::default();
+    config.fastokens.models = vec!["atom-fastokens".into()];
+    config.fastokens.strict = true;
+    let ctx = context_with(config);
+    register(&ctx, json!({ "url": url })).await.unwrap();
+
+    let rendered = render(&ctx, "atom-fastokens", Value::Null).await;
+    assert_eq!(rendered, "label: hi");
+    let tokenizer = ctx.tokenizer_registry.get("atom-fastokens").unwrap();
+    assert!(tokenizer.as_any().is::<FastTokenizer>());
 }
 
 #[tokio::test]

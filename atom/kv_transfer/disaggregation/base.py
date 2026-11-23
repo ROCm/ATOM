@@ -101,6 +101,9 @@ class KVConnectorSchedulerBase(ABC):
     """
 
     is_offload = False
+    # True only when `cancel_undispatched_load` can return True; the engine
+    # skips the call for an aborted in-flight load unless this is True.
+    cancels_undispatched_loads = False
     is_producer: bool
 
     # Offload-tier hooks the scheduler reads from any connector; one without a
@@ -128,6 +131,13 @@ class KVConnectorSchedulerBase(ABC):
 
     def cancel_pending_load(self, seq: Any) -> None:
         """Forget the load armed for `seq`."""
+
+    def cancel_undispatched_load(self, seq: Any) -> bool:
+        """Cancel a parked load only if no worker owns its destination.
+
+        False preserves the existing terminal-report cleanup contract.
+        """
+        return False
 
     def cancel_preadmission(self, seq: Any) -> None:
         """Take back an admission the scheduler withdraws before any dispatch;
