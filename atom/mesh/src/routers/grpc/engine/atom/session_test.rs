@@ -23,10 +23,10 @@ use crate::atom_engine::grpc::{
 };
 use crate::atom_engine::wire::PROTOCOL_VERSION;
 use crate::core::worker::{ConnectionMode, RuntimeType};
-use crate::core::DPAwareWorkerBuilder;
+use crate::core::{DPAwareWorkerBuilder, WorkerRegistry};
 use crate::routers::grpc::engine::atom::stream::AtomStream;
 use crate::routers::grpc::engine::worker_client_cache::GrpcClient;
-use crate::routers::token_handle::token_chunk::{FinishReason, MatchedStop, TokenChunk};
+use crate::routers::token_handle::token_chunk::{FinishReason, MatchedStop, SeqTiming, TokenChunk};
 
 /// Bounds the waits that only stop a hang.
 const HANG: Duration = Duration::from_secs(60);
@@ -420,6 +420,77 @@ async fn a_request_that_does_not_stream_completes_with_the_ids_its_entries_carri
 }
 
 #[tokio::test]
+async fn a_completion_reports_its_ttft_tpot_and_latency_from_its_times() {
+    let (ranks, mut calls) = instance().await;
+    let sessions = AtomSessions::default();
+    let first = sessions.submit(&ranks[0], spec("streamed"), vec![1], true);
+    let (mut call, streamed) = opening(&mut calls, PROTOCOL_VERSION, first).await;
+    let whole = submit(&sessions, &ranks[0], "whole", vec![2], false).await;
+    let sent = submitted(&mut call, 2).await;
+    let (streamed_id, whole_id) = (sent["streamed"].0.seq_id, sent["whole"].0.seq_id);
+    // Three tokens each: the first 0.25 s after arrival, the last 1 s after it.
+    let timed = |seq_id| pb::Completion {
+        arrive_time: 100.0,
+        first_token_time: 100.25,
+        leave_time: 101.25,
+        ..completion(seq_id, "max_tokens")
+    };
+    for message in [
+        step(&[(streamed_id, vec![11], 0), (whole_id, vec![21], 0)]),
+        step(&[(streamed_id, vec![12, 13], 0), (whole_id, vec![22, 23], 0)]),
+        done(vec![
+            (timed(streamed_id), Vec::new()),
+            (timed(whole_id), Vec::new()),
+        ]),
+    ] {
+        call.outbound.send(message).unwrap();
+    }
+
+    let timing = SeqTiming {
+        ttft_s: 0.25,
+        tpot_s: 0.5,
+        latency_s: 1.25,
+    };
+    let streamed = chunks(streamed.unwrap()).await;
+    assert!(
+        matches!(streamed.last(), Some(Ok(TokenChunk::Complete { meta, .. }))
+            if meta.timing == Some(timing)),
+        "{streamed:?}"
+    );
+    let whole = chunks(whole).await;
+    assert!(
+        matches!(&whole[..], [Ok(TokenChunk::Complete { meta, .. })] if meta.timing == Some(timing)),
+        "{whole:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_message_past_4_mib_reaches_its_request() {
+    let (ranks, mut calls) = instance().await;
+    let sessions = AtomSessions::default();
+    let first = sessions.submit(&ranks[0], spec("large"), vec![1], false);
+    let (mut call, large) = opening(&mut calls, PROTOCOL_VERSION, first).await;
+    let id = submitted(&mut call, 1).await["large"].0.seq_id;
+    let blob = "x".repeat(5 << 20);
+    let params = pb::Value {
+        kind: Some(Kind::StringValue(blob.clone())),
+    };
+    let item = pb::Completion {
+        kv_transfer_params_output: Some(params),
+        ..completion(id, "max_tokens")
+    };
+    call.outbound.send(done(vec![(item, Vec::new())])).unwrap();
+
+    let large: Vec<_> = timeout(HANG, large.unwrap().collect()).await.unwrap();
+    let kv = Json::String(blob).to_string();
+    assert!(
+        matches!(&large[..], [Ok(GenerateResponse { response: Some(Response::Complete(complete)) })]
+            if complete.kv_transfer_params_json.as_ref() == Some(&kv)),
+        "the 5 MiB Completions failed the Session"
+    );
+}
+
+#[tokio::test]
 async fn a_rejected_request_fails_with_the_http_status_its_code_reads_back_to() {
     let (ranks, mut calls) = instance().await;
     let sessions = AtomSessions::default();
@@ -587,6 +658,90 @@ async fn a_ready_of_another_protocol_version_is_refused() {
     assert!(submitted(&mut call, 1).await.contains_key("accepted"));
 }
 
+/// Waits for the client to drop `call`: it stops reading ATOM's half as well as
+/// sending its own.
+async fn assert_ends(mut call: Call) {
+    let ended = timeout(Duration::from_secs(5), call.inbound.message()).await;
+    let ended = ended.expect("the client kept sending on the call");
+    assert!(!matches!(ended, Ok(Some(_))), "{ended:?}");
+    let dropped = timeout(Duration::from_secs(5), call.outbound.closed()).await;
+    dropped.expect("the client kept reading the call");
+}
+
+#[tokio::test]
+async fn an_opening_without_ready_is_bounded_and_one_no_request_waits_for_ends() {
+    let (ranks, mut calls) = instance().await;
+    let sessions = AtomSessions {
+        opening: Duration::from_millis(300),
+        ..Default::default()
+    };
+    // ATOM accepts the call but never sends Ready: the request fails, the call ends.
+    let first = sessions.submit(&ranks[0], spec("first"), vec![1], true);
+    let (call, refused) = tokio::join!(
+        async { timeout(HANG, calls.recv()).await.unwrap().unwrap() },
+        timeout(Duration::from_secs(5), first)
+    );
+    let refused = refused.expect("the opening was not bounded");
+    assert!(
+        matches!(&refused, Err(EngineError::Transport(status))
+            if status.code() == tonic::Code::DeadlineExceeded),
+        "{:?}",
+        refused.err()
+    );
+    assert_ends(call).await;
+
+    // A request that gives up while its Session opens ends that call, long before
+    // the bound.
+    let patient = AtomSessions::default();
+    let abandoned = patient.submit(&ranks[1], spec("abandoned"), vec![1], true);
+    let call = tokio::select! {
+        _ = abandoned => panic!("opened without Ready"),
+        call = calls.recv() => call.unwrap(),
+    };
+    assert_ends(call).await;
+
+    // The next request opens a new call and runs on it.
+    let next = sessions.submit(&ranks[0], spec("next"), vec![1], true);
+    let (mut call, opened) = opening(&mut calls, PROTOCOL_VERSION, next).await;
+    assert!(opened.is_ok());
+    assert!(submitted(&mut call, 1).await.contains_key("next"));
+}
+
+#[tokio::test]
+async fn a_session_is_released_once_no_worker_of_its_instance_is_registered() {
+    let (ranks, mut calls) = instance().await;
+    let workers = Arc::new(WorkerRegistry::new());
+    for rank in &ranks {
+        workers.register(rank.clone());
+    }
+    let sessions = AtomSessions {
+        sweep: Duration::ZERO,
+        ..AtomSessions::releasing_removed(workers.clone())
+    };
+    let first = sessions.submit(&ranks[0], spec("running"), vec![1], false);
+    let (mut call, running) = opening(&mut calls, PROTOCOL_VERSION, first).await;
+    let running_id = submitted(&mut call, 1).await["running"].0.seq_id;
+
+    // Both ranks are removed; the next request, to another instance, releases the Session.
+    for rank in &ranks {
+        workers.remove_by_url(rank.url());
+    }
+    let (others, mut other_calls) = instance().await;
+    workers.register(others[0].clone());
+    let next = sessions.submit(&others[0], spec("next"), vec![2], false);
+    let (_other_call, next) = opening(&mut other_calls, PROTOCOL_VERSION, next).await;
+    assert!(next.is_ok());
+
+    // The running request keeps its Session to its end; then the client's half ends.
+    let ended = done(vec![(completion(running_id, "eos"), Vec::new())]);
+    call.outbound.send(ended).unwrap();
+    let running: Vec<_> = timeout(HANG, running.unwrap().collect()).await.unwrap();
+    assert!(matches!(&running[..], [Ok(_)]), "{running:?}");
+    let sent = timeout(Duration::from_secs(5), call.inbound.message()).await;
+    let sent = sent.expect("the released Session's call stayed open");
+    assert!(!matches!(sent, Ok(Some(_))), "{sent:?}");
+}
+
 #[test]
 fn seq_ids_stay_below_2_24_and_skip_those_open_requests_hold() {
     let mut routes = Routes {
@@ -594,9 +749,10 @@ fn seq_ids_stay_below_2_24_and_skip_those_open_requests_hold() {
         ..Default::default()
     };
     for held in [SEQ_IDS - 1, 0] {
-        let (tx, _) = mpsc::unbounded_channel();
+        let (tx, _) = mpsc::channel(1);
         let route = Route {
             tx,
+            overflowed: false,
             stream: false,
             prompt_tokens: 0,
             completion_tokens: 0,
@@ -662,6 +818,43 @@ fn a_finished_stream_dropped_after_its_seq_id_is_reused_aborts_nothing() {
     // Dropped unfinished, the request now holding the seq_id is aborted.
     drop(reused);
     assert!(matches!(queued.try_recv(), Ok(Command::Abort(id)) if id == 0));
+}
+
+#[test]
+fn a_stream_left_unread_fails_alone_and_is_aborted_once_keeping_its_seq_id() {
+    let (commands, mut queued) = mpsc::unbounded_channel();
+    let routes = Arc::new(Mutex::new(Routes::default()));
+    let session = Session { routes, commands };
+    let mut unread = session.submit(spec("unread"), vec![1], true).unwrap();
+    let mut read = session.submit(spec("read"), vec![2], true).unwrap();
+    let (unread_id, read_id) = (unread.seq_id, read.seq_id);
+    let decoded = |message: Result<Frames, Status>| Inbound::decode(message.unwrap().frames);
+
+    // Each step reaches both; only `read` is read.
+    let mut aborted = Vec::new();
+    for _ in 0..ROUTE_BUFFER + 10 {
+        let message = decoded(step(&[(unread_id, vec![7], 0), (read_id, vec![8], 0)]));
+        aborted.extend(session.routes.lock().route(&message.unwrap()).unwrap());
+        assert!(matches!(read.rx.try_recv(), Ok(Ok(_))));
+    }
+    assert_eq!(aborted, [unread_id]);
+    let outputs: Vec<_> = std::iter::from_fn(|| unread.rx.try_recv().ok()).collect();
+    assert_eq!(outputs.len(), ROUTE_BUFFER);
+    assert!(outputs[..ROUTE_BUFFER - 1].iter().all(Result::is_ok));
+    assert!(
+        matches!(outputs.last(), Some(Err(status)) if status.code() == tonic::Code::ResourceExhausted)
+    );
+
+    // Its seq_id is held until its Completion, which it is not sent; dropped, it sends
+    // no second Abort.
+    assert!(session.routes.lock().open.contains_key(&unread_id));
+    let ended = decoded(done(vec![(completion(unread_id, "abort"), Vec::new())]));
+    session.routes.lock().route(&ended.unwrap()).unwrap();
+    assert!(!session.routes.lock().open.contains_key(&unread_id));
+    assert!(unread.rx.try_recv().is_err());
+    let _ = std::iter::from_fn(|| queued.try_recv().ok()).count();
+    drop(unread);
+    assert!(queued.try_recv().is_err());
 }
 
 /// Requests through the gRPC routers built from a config with `atom_grpc_session`:

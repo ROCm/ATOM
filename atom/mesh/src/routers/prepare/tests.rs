@@ -1238,6 +1238,7 @@ mod h_prepare_chat_generate {
     use crate::routers::prepare::response_context::{ProtocolRequest, ResponseContext};
     use crate::routers::prepare::{lookup_tokenizer, prepare_chat, prepare_generate};
     use crate::routers::test_mocks;
+    use crate::tokenizer::registry::TokenizerRegistry;
 
     fn chat_req(stream: bool) -> Arc<ChatCompletionRequest> {
         Arc::new(ChatCompletionRequest {
@@ -1469,18 +1470,75 @@ mod h_prepare_chat_generate {
     #[test]
     fn test_lookup_tokenizer_returns_arc_for_known_model() {
         let registry = test_mocks::tokenizer_registry_with("m");
-        let tok = lookup_tokenizer("m", &registry).expect("known model");
-        let tok2 = lookup_tokenizer("m", &registry).unwrap();
+        let components = test_mocks::app_context_with_tokenizer_registry(registry);
+        let tok = lookup_tokenizer("m", &components).expect("known model");
+        let tok2 = lookup_tokenizer("m", &components).unwrap();
         assert!(Arc::ptr_eq(&tok, &tok2));
     }
 
     #[test]
     fn test_lookup_tokenizer_unknown_model_returns_err() {
         let registry = test_mocks::tokenizer_registry_with("m");
-        let err = lookup_tokenizer("no-such-model", &registry)
+        let components = test_mocks::app_context_with_tokenizer_registry(registry);
+        let err = lookup_tokenizer("no-such-model", &components)
             .err()
             .expect("unknown model must be Err");
         assert!(!err.status().is_success());
+    }
+
+    /// A lookup between a replacement's removal of the old tokenizer and its insert
+    /// of the new one gets the old one, then the new one once it is in.
+    #[test]
+    fn test_lookup_during_a_tokenizer_swap_finds_a_tokenizer() {
+        let registry = test_mocks::tokenizer_registry_with("m");
+        let components = test_mocks::app_context_with_tokenizer_registry(registry.clone());
+        let old = registry.get_by_name("m").unwrap();
+        components
+            .tokenizers_replaced
+            .insert("m".into(), old.clone());
+        registry.remove_by_id(&old.id).unwrap();
+        let found = lookup_tokenizer("m", &components).expect("the lookup missed the swap");
+        assert!(Arc::ptr_eq(&found, &old.tokenizer));
+
+        let replacement = test_mocks::tokenizer();
+        let inserted = replacement.clone();
+        let id = TokenizerRegistry::generate_id();
+        let insert = registry.load(&id, "m", "mock", || async { Ok(inserted) });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(insert).unwrap();
+        let found = lookup_tokenizer("m", &components).unwrap();
+        assert!(Arc::ptr_eq(&found, &replacement));
+    }
+
+    /// A chat for an ATOM model whose tokenizer renders with a built-in encoder is
+    /// refused during a swap of that tokenizer too.
+    #[test]
+    fn test_a_chat_during_a_swap_reads_the_replaced_tokenizers_encoder() {
+        use crate::core::{BasicWorkerBuilder, RuntimeType};
+
+        let registry = test_mocks::tokenizer_registry_with("m");
+        let components = test_mocks::app_context_with_tokenizer_registry(registry.clone());
+        let worker = BasicWorkerBuilder::new("grpc://atom:1")
+            .runtime_type(RuntimeType::Atom)
+            .model_id("m")
+            .label("chat_template", "{{ messages }}")
+            .build();
+        components.worker_registry.register(Arc::new(worker));
+        let old = registry.get_by_name("m").unwrap();
+        components
+            .chats_without_template
+            .write()
+            .insert(old.id.clone());
+        components
+            .tokenizers_replaced
+            .insert("m".into(), old.clone());
+        registry.remove_by_id(&old.id).unwrap();
+
+        let refused = prepare_chat(chat_req(false), None, Some("m".into()), &components);
+        let status = refused.err().expect("a chat it cannot render").status();
+        assert_eq!(status, http::StatusCode::NOT_IMPLEMENTED);
     }
 
     #[test]
@@ -1745,6 +1803,50 @@ mod i_atom_structured_output {
         };
         let read = serde_json::to_value(&req.tools.as_ref().unwrap()[0]).unwrap();
         assert_eq!(read, search("string"));
+    }
+
+    /// A namespaced tool reaches the template and ATOM as sent, and its calls are read
+    /// as `namespace::name`, as ATOM's HTTP chat reads them, so two namespaces' `search`
+    /// stay apart.
+    #[test]
+    fn a_namespaced_message_tool_keeps_its_namespace() {
+        let search = |namespace: Value| {
+            json!({"type": "function", "namespace": namespace,
+                "function": {"name": "search", "parameters": {}}})
+        };
+        let (files, web) = (search(json!("files")), search(json!({"name": "web"})));
+        let body = json!({"model": "m", "messages": [
+            {"role": "system", "content": "be brief", "tools": [files.clone(), web.clone()]},
+            {"role": "user", "content": "hi"},
+        ]});
+        let (payload, ctx) = prepared_raw(body.clone(), RuntimeType::Atom);
+        let carried = payload.structured_output.expect("an ATOM chat carries one");
+        let declared = json!([[files, web], null]);
+        assert_eq!(parsed(carried.message_tools_json), Some(declared));
+        assert_eq!(tool_names(&ctx), ["files::search", "web::search"]);
+
+        use crate::routers::prepare::chat_template::process_chat_messages_with_kwargs;
+        use crate::tokenizer::{traits::Tokenizer, HuggingFaceTokenizer};
+        let mut tokenizer =
+            HuggingFaceTokenizer::from_file(test_mocks::tokenizer::hf_tokenizer_path()).unwrap();
+        let template = "{% for m in messages %}{% for t in m.tools or [] %}\
+            {{ t.namespace.name or t.namespace }}.{{ t.function.name }};{% endfor %}{% endfor %}";
+        tokenizer.set_chat_template(template.to_string()).unwrap();
+        let declared = MessageTools::read(&serde_json::to_vec(&body).unwrap()).unwrap();
+        let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+        let kwargs = Default::default();
+        let rendered =
+            process_chat_messages_with_kwargs(&request, &tokenizer, &kwargs, Some(&declared));
+        assert_eq!(rendered.unwrap().text, "files.search;web.search;");
+    }
+
+    #[test]
+    fn a_tool_with_two_namespaces_is_refused() {
+        let tool = json!({"type": "function", "namespace": "files",
+            "function": {"name": "web::search", "parameters": {}}});
+        let body = json!({"messages": [{"role": "system", "tools": [tool]}]});
+        let read = MessageTools::read(&serde_json::to_vec(&body).unwrap());
+        assert!(read.is_err_and(|e| e.contains("conflicting tool namespaces")));
     }
 
     #[test]

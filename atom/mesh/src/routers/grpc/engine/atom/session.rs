@@ -4,12 +4,14 @@
 //! The Session to an ATOM instance: one `AtomEngine.Session` call carries every
 //! request to it as engine_v1 messages, and each request's outputs come back by seq_id.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::thread;
+use std::time::{Duration, Instant};
 
+use futures::future::{BoxFuture, FutureExt, WeakShared};
 use futures::{stream, Stream, StreamExt};
 use http::StatusCode;
 use parking_lot::Mutex;
@@ -29,22 +31,88 @@ use crate::atom_engine::wire::{
     pb::{self, envelope::Body, rejected_request::Code, value::Kind},
     Inbound,
 };
-use crate::core::Worker;
+use crate::core::{Worker, WorkerRegistry};
 use crate::routers::token_handle::engine_error::EngineError;
 
-/// A Session's seq ids stay below 2^24, the window ATOM maps each Session's ids into.
+/// A Session's seq ids stay below 2^24, the window ATOM maps each Session's ids into:
+/// 1 << `_SEQ_ID_SHIFT` (atom/entrypoints/openai/frontend_workers.py), which this must equal.
 const SEQ_IDS: u64 = 1 << 24;
+
+/// How long opening a Session may take, from connecting to ATOM's Ready.
+const OPENING: Duration = Duration::from_secs(10);
+
+/// How often requests look for Sessions whose instance has no registered worker.
+const SWEEP: Duration = Duration::from_secs(1);
+
+/// The outputs a streamed request may leave unread; past them it fails and is aborted.
+const ROUTE_BUFFER: usize = 4096;
 
 type Output = Result<GenerateResponse, Status>;
 
+/// A Session being opened, which every request waiting for it shares.
+type Opening = BoxFuture<'static, Result<Session, Arc<EngineError>>>;
+
 /// Each ATOM instance's Session (base URL, all its ranks), opened by the first
 /// request to it and again by the first request after it has failed.
-#[derive(Default)]
 pub(crate) struct AtomSessions {
-    slots: Mutex<HashMap<String, Arc<tokio::sync::Mutex<Option<Session>>>>>,
+    slots: Mutex<HashMap<String, Slot>>,
+    /// Bounds each opening; OPENING but in tests.
+    opening: Duration,
+    /// With it, the Session of an instance none of whose workers is registered is
+    /// released, at most every `sweep`.
+    workers: Option<Arc<WorkerRegistry>>,
+    sweep: Duration,
+    swept: Mutex<Instant>,
+}
+
+impl Default for AtomSessions {
+    fn default() -> Self {
+        Self {
+            slots: Mutex::default(),
+            opening: OPENING,
+            workers: None,
+            sweep: SWEEP,
+            swept: Mutex::new(Instant::now()),
+        }
+    }
+}
+
+enum Slot {
+    Open(Session),
+    /// Held weakly: when every request waiting for it has gone, the opening is dropped.
+    Opening(WeakShared<Opening>),
 }
 
 impl AtomSessions {
+    /// Sessions each released once its instance's workers are all removed from `workers`.
+    pub(crate) fn releasing_removed(workers: Arc<WorkerRegistry>) -> Self {
+        Self {
+            workers: Some(workers),
+            ..Self::default()
+        }
+    }
+
+    /// Drops the Sessions of instances no registered worker belongs to; their requests'
+    /// streams keep theirs until they end, and the call ends with the last.
+    fn release_removed(&self) {
+        let Some(workers) = &self.workers else {
+            return;
+        };
+        {
+            let mut swept = self.swept.lock();
+            if swept.elapsed() < self.sweep {
+                return;
+            }
+            *swept = Instant::now();
+        }
+        let registered: HashSet<String> = workers
+            .get_all()
+            .iter()
+            .map(|worker| worker.base_url().trim_end_matches('/').to_string())
+            .collect();
+        self.slots.lock().retain(|url, _| registered.contains(url));
+    }
+
     /// Sends `spec` for `prompt` on `worker`'s instance's Session, which sets its
     /// seq_id; the stream carries what Generate answers, streamed as `stream` says.
     pub(crate) async fn submit(
@@ -57,19 +125,54 @@ impl AtomSessions {
         self.session(worker).await?.submit(spec, prompt, stream)
     }
 
+    /// The instance's open Session, else the one being opened, else a new opening;
+    /// no lock is held while it opens.
     async fn session(&self, worker: &Arc<dyn Worker>) -> Result<Session, EngineError> {
-        let url = worker.base_url().trim_end_matches('/');
-        let slot = self
-            .slots
-            .lock()
-            .entry(url.to_string())
-            .or_default()
-            .clone();
-        let mut slot = slot.lock().await;
-        if let Some(session) = slot.as_ref().filter(|session| session.is_open()) {
-            return Ok(session.clone());
+        self.release_removed();
+        let url = worker.base_url().trim_end_matches('/').to_string();
+        let opening = {
+            let mut slots = self.slots.lock();
+            let joined = match slots.get(&url) {
+                Some(Slot::Open(session)) if session.is_open() => return Ok(session.clone()),
+                Some(Slot::Opening(opening)) => opening.upgrade(),
+                _ => None,
+            };
+            joined.unwrap_or_else(|| {
+                let opening = Session::open(url.clone(), self.opening).boxed().shared();
+                let weak = opening.downgrade().expect("an opening not yet polled");
+                slots.insert(url.clone(), Slot::Opening(weak));
+                opening
+            })
+        };
+        let opened = opening.clone().await;
+        let mut slots = self.slots.lock();
+        let ours = matches!(slots.get(&url), Some(Slot::Opening(slot))
+            if slot.upgrade().is_some_and(|slot| slot.ptr_eq(&opening)));
+        match opened {
+            Ok(session) => {
+                if ours {
+                    slots.insert(url, Slot::Open(session.clone()));
+                }
+                Ok(session)
+            }
+            Err(e) => {
+                if ours {
+                    slots.remove(&url);
+                }
+                Err(cloned(&e))
+            }
         }
-        Ok(slot.insert(Session::open(url).await?).clone())
+    }
+}
+
+/// An opening's error for each request that waited for it.
+fn cloned(e: &EngineError) -> EngineError {
+    match e {
+        EngineError::Transport(status) => EngineError::Transport(status.clone()),
+        EngineError::ConnectionAcquireFailed(url) => {
+            EngineError::ConnectionAcquireFailed(url.clone())
+        }
+        other => EngineError::Transport(Status::internal(other.to_string())),
     }
 }
 
@@ -88,18 +191,19 @@ enum Command {
 
 impl Session {
     /// Opens the call on a connection and thread of its own, off the router's runtime;
-    /// waits for ATOM's Ready, refusing one of another protocol version.
-    async fn open(url: &str) -> Result<Self, EngineError> {
+    /// waits up to `bound` for ATOM's Ready, refusing one of another protocol version.
+    /// Dropped before it opens, it ends the call and the thread.
+    async fn open(url: String, bound: Duration) -> Result<Self, Arc<EngineError>> {
         let (commands, queued) = mpsc::unbounded_channel();
         let routes = Arc::new(Mutex::new(Routes::default()));
         let (opened, ready) = oneshot::channel();
-        let (url, read_into) = (url.to_string(), routes.clone());
+        let (read_into, aborts) = (routes.clone(), commands.downgrade());
         thread::Builder::new()
             .name("atom-session".into())
-            .spawn(move || run(url, queued, read_into, opened))
+            .spawn(move || run(url, bound, queued, read_into, aborts, opened))
             .map_err(|e| EngineError::Transport(Status::internal(e.to_string())))?;
         let gone = |_| EngineError::Transport(Status::internal("the Session thread ended"));
-        ready.await.map_err(gone)??;
+        ready.await.map_err(gone).and_then(|opened| opened)?;
         Ok(Self { routes, commands })
     }
 
@@ -119,9 +223,10 @@ impl Session {
             message: "every seq_id of the ATOM Session is in use".to_string(),
         })?;
         spec.seq_id = seq_id;
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(ROUTE_BUFFER);
         let route = Route {
             tx,
+            overflowed: false,
             stream,
             prompt_tokens: prompt.len() as u32,
             completion_tokens: 0,
@@ -143,13 +248,16 @@ impl Session {
     }
 }
 
-/// The Session's thread: a runtime of its own, which connects, opens the call and reads
-/// it until it ends; `opened` gets how the opening went.
+/// The Session's thread: a runtime of its own, which connects, opens the call within
+/// `bound` and reads it until it ends; `opened` gets how the opening went. With no one
+/// left to tell, it ends the call.
 fn run(
     url: String,
+    bound: Duration,
     queued: mpsc::UnboundedReceiver<Command>,
     routes: Arc<Mutex<Routes>>,
-    opened: oneshot::Sender<Result<(), EngineError>>,
+    aborts: mpsc::WeakUnboundedSender<Command>,
+    mut opened: oneshot::Sender<Result<(), EngineError>>,
 ) {
     let runtime = match runtime::Builder::new_current_thread().enable_all().build() {
         Ok(runtime) => runtime,
@@ -159,10 +267,19 @@ fn run(
         }
     };
     runtime.block_on(async move {
-        match start(&url, queued).await {
+        let started = tokio::select! {
+            started = tokio::time::timeout(bound, start(&url, queued)) => {
+                started.unwrap_or_else(|_| Err(EngineError::Transport(Status::deadline_exceeded(
+                    format!("ATOM Session: no Ready within {bound:?}"),
+                ))))
+            }
+            _ = opened.closed() => return,
+        };
+        match started {
             Ok((_client, inbound)) => {
-                let _ = opened.send(Ok(()));
-                read(inbound, routes, url).await;
+                if opened.send(Ok(())).is_ok() {
+                    read(inbound, routes, aborts, url).await;
+                }
             }
             Err(e) => {
                 let _ = opened.send(Err(e));
@@ -261,15 +378,27 @@ fn flush(
     }
 }
 
-/// The reader: hands each message's outputs to their requests until the call
-/// ends or sends one it cannot read, then fails the requests still open.
-async fn read(mut inbound: Streaming<Frames>, routes: Arc<Mutex<Routes>>, url: String) {
+/// The reader: hands each message's outputs to their requests, aborting those that
+/// overflow, until the call ends or sends one it cannot read; then fails the
+/// requests still open.
+async fn read(
+    mut inbound: Streaming<Frames>,
+    routes: Arc<Mutex<Routes>>,
+    aborts: mpsc::WeakUnboundedSender<Command>,
+    url: String,
+) {
     let status = loop {
         match inbound.message().await {
             Ok(Some(message)) => {
                 let routed = Inbound::decode(message.frames).and_then(|m| routes.lock().route(&m));
-                if let Err(e) = routed {
-                    break Status::internal(format!("ATOM Session: {e}"));
+                match routed {
+                    Ok(overflowed) => {
+                        let commands = aborts.upgrade();
+                        for seq_id in overflowed {
+                            commands.as_ref().map(|c| c.send(Command::Abort(seq_id)));
+                        }
+                    }
+                    Err(e) => break Status::internal(format!("ATOM Session: {e}")),
                 }
             }
             Ok(None) => break Status::unavailable("the ATOM Session ended"),
@@ -291,7 +420,9 @@ struct Routes {
 
 /// Where a request's outputs go, and what its Complete reports.
 struct Route {
-    tx: mpsc::UnboundedSender<Output>,
+    tx: mpsc::Sender<Output>,
+    /// Its stream left ROUTE_BUFFER outputs unread: it has its error, and is aborted.
+    overflowed: bool,
     stream: bool,
     prompt_tokens: u32,
     completion_tokens: u32,
@@ -302,11 +433,30 @@ struct Route {
 }
 
 impl Route {
+    /// Its last output; an overflowed request has its error already.
     fn send(&self, response: Response) {
         // A dropped stream has sent its Abort and reads nothing more.
-        let _ = self.tx.send(Ok(GenerateResponse {
-            response: Some(response),
-        }));
+        if !self.overflowed {
+            let _ = self.tx.try_send(Ok(GenerateResponse {
+                response: Some(response),
+            }));
+        }
+    }
+
+    /// One step's chunk; with one slot left, the request's error instead, the last
+    /// slot kept for it. True when the request is to be aborted.
+    fn stream(&mut self, chunk: GenerateStreamChunk) -> bool {
+        if self.overflowed || self.tx.is_closed() {
+            return false;
+        }
+        if self.tx.capacity() > 1 {
+            self.send(Response::Chunk(chunk));
+            return false;
+        }
+        self.overflowed = true;
+        let unread = format!("the request left {ROUTE_BUFFER} outputs unread");
+        let _ = self.tx.try_send(Err(Status::resource_exhausted(unread)));
+        true
     }
 }
 
@@ -321,8 +471,9 @@ impl Routes {
         Some(seq_id)
     }
 
-    /// Hands `message`'s outputs to their requests; an Err fails the Session.
-    fn route(&mut self, message: &Inbound<Vec<u8>>) -> Result<(), String> {
+    /// Hands `message`'s outputs to their requests; the seq_ids of those it overflows,
+    /// to abort. An Err fails the Session.
+    fn route(&mut self, message: &Inbound<Vec<u8>>) -> Result<Vec<u64>, String> {
         match &message.body {
             Body::Stream(batch) => self.step(batch),
             Body::Completions(completions) => {
@@ -338,6 +489,7 @@ impl Routes {
                         continue;
                     };
                     let output_ids = std::mem::take(&mut route.ids);
+                    let (ttft_s, tpot_s, latency_s) = timing(item, route.completion_tokens);
                     route.send(Response::Complete(GenerateComplete {
                         completion_tokens: route.completion_tokens,
                         output_ids,
@@ -345,10 +497,13 @@ impl Routes {
                         prompt_tokens: item.num_prompt_tokens,
                         cached_tokens: route.cached_tokens,
                         kv_transfer_params_json: kv.map(|kv| kv.to_string()),
+                        ttft_s,
+                        tpot_s,
+                        latency_s,
                         ..Default::default()
                     }));
                 }
-                Ok(())
+                Ok(Vec::new())
             }
             Body::Rejected(rejected) => {
                 for item in &rejected.items {
@@ -359,15 +514,15 @@ impl Routes {
                         }));
                     }
                 }
-                Ok(())
+                Ok(Vec::new())
             }
             _ => Err("a Session server sends Ready first, then only request outputs".into()),
         }
     }
 
     /// One engine step's entries: each request's ids, as one chunk when it streams,
-    /// else kept for its Complete.
-    fn step(&mut self, batch: &pb::StreamBatch) -> Result<(), String> {
+    /// else kept for its Complete; the seq_ids of the streams it overflows.
+    fn step(&mut self, batch: &pb::StreamBatch) -> Result<Vec<u64>, String> {
         let entries = batch.seq_ids.len();
         let counted: usize = batch.token_counts.iter().map(|&n| n as usize).sum();
         if batch.token_counts.len() != entries
@@ -376,7 +531,7 @@ impl Routes {
         {
             return Err("StreamBatch columns disagree in length".into());
         }
-        let mut start = 0;
+        let (mut start, mut overflowed) = (0, Vec::new());
         let columns = batch.token_counts.iter().zip(&batch.num_cached_tokens);
         for (seq_id, (&count, &cached)) in batch.seq_ids.iter().zip(columns) {
             let tokens = &batch.tokens[start..start + count as usize];
@@ -390,26 +545,46 @@ impl Routes {
             }
             let token_ids = tokens.iter().map(|&id| id as u32);
             if route.stream {
-                route.send(Response::Chunk(GenerateStreamChunk {
+                let chunk = GenerateStreamChunk {
                     token_ids: token_ids.collect(),
                     prompt_tokens: route.prompt_tokens,
                     completion_tokens: route.completion_tokens,
                     cached_tokens: route.cached_tokens,
-                }));
+                };
+                if route.stream(chunk) {
+                    overflowed.push(*seq_id);
+                }
             } else {
                 route.ids.extend(token_ids);
             }
         }
-        Ok(())
+        Ok(overflowed)
     }
 
     /// Ends every open request with `status`; the Session takes no request after.
     fn fail(&mut self, status: &Status) {
         self.closed = true;
         for (_, route) in self.open.drain() {
-            let _ = route.tx.send(Err(status.clone()));
+            if !route.overflowed {
+                let _ = route.tx.try_send(Err(status.clone()));
+            }
         }
     }
+}
+
+/// A Completion's TTFT, TPOT and latency in seconds from its times, `tokens` long; as
+/// Generate reports them, TTFT is 0 without a first token and TPOT without a second.
+fn timing(item: &pb::Completion, tokens: u32) -> (f64, f64, f64) {
+    let latency = item.leave_time - item.arrive_time;
+    if item.first_token_time == 0.0 {
+        return (0.0, 0.0, latency);
+    }
+    let ttft = item.first_token_time - item.arrive_time;
+    let tpot = match tokens {
+        0 | 1 => 0.0,
+        n => (item.leave_time - item.first_token_time) / f64::from(n - 1),
+    };
+    (ttft, tpot, latency)
 }
 
 /// A Rejected code as the HTTP status ATOM's HTTP routes answer that refusal with.
@@ -449,7 +624,7 @@ fn json(value: &pb::Value) -> Result<Json, String> {
 /// Dropped before its last message, it aborts the request.
 pub(crate) struct SessionStream {
     seq_id: u64,
-    rx: mpsc::UnboundedReceiver<Output>,
+    rx: mpsc::Receiver<Output>,
     session: Session,
 }
 
@@ -469,7 +644,7 @@ impl Drop for SessionStream {
         if routes
             .open
             .get(&self.seq_id)
-            .is_some_and(|route| route.tx.is_closed())
+            .is_some_and(|route| route.tx.is_closed() && !route.overflowed)
         {
             let _ = self.session.commands.send(Command::Abort(self.seq_id));
         }
