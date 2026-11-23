@@ -153,6 +153,7 @@ pub struct ListWorkersResult {
     pub total: usize,
     pub prefill_count: usize,
     pub decode_count: usize,
+    pub encode_count: usize,
     pub regular_count: usize,
 }
 
@@ -164,6 +165,7 @@ impl IntoResponse for ListWorkersResult {
             "stats": {
                 "prefill_count": self.prefill_count,
                 "decode_count": self.decode_count,
+                "encode_count": self.encode_count,
                 "regular_count": self.regular_count,
             }
         });
@@ -277,6 +279,7 @@ impl WorkerService {
             total: stats.total_workers,
             prefill_count: stats.prefill_workers,
             decode_count: stats.decode_workers,
+            encode_count: stats.encode_workers,
             regular_count: stats.regular_workers,
         }
     }
@@ -595,6 +598,7 @@ mod tests {
             total: 0,
             prefill_count: 0,
             decode_count: 0,
+            encode_count: 0,
             regular_count: 0,
         };
         let response = result.into_response();
