@@ -42,6 +42,8 @@ pub(crate) fn generate_request(
         data_parallel_rank: worker.dp_rank().map(|rank| rank as i32),
         stream: payload.stream,
         structured_output: None,
+        dp_session_id: None,
+        dp_parent_session_id: None,
     })
 }
 
