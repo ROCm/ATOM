@@ -1166,7 +1166,11 @@ class DeepseekV2MoE(nn.Module):
             and not self.is_rocm_aiter_fusion_shared_expert_enabled
         ):
             tbo_active = get_current_atom_config().enable_tbo
-            if envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0 and not tbo_active:
+            if (
+                envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0
+                and not tbo_active
+                and self.experts.allows_concurrent_shared_stream
+            ):
                 self._use_dual_stream = True
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             self.shared_experts = DeepseekV2MLP(
