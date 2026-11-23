@@ -1720,6 +1720,34 @@ mod i_atom_structured_output {
     }
 
     #[test]
+    fn a_tool_declared_again_is_read_with_its_last_declaration() {
+        let search = |limit: &str| {
+            json!({"type": "function", "function": {"name": "search", "parameters":
+                {"type": "object", "properties": {"limit": {"type": limit}}}}})
+        };
+        let fetch = json!({"type": "function", "function": {"name": "fetch", "parameters": {}}});
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "be brief", "tools": [search("string"), fetch]},
+                {"role": "user", "content": "hi"},
+            ],
+            "tools": [search("integer")],
+        });
+        let (payload, ctx) = prepared_raw(body, RuntimeType::Atom);
+        // ATOM gets both declarations as sent; the reply is read with the last.
+        let carried = payload.structured_output.expect("an ATOM chat carries one");
+        let declared = json!([[search("string"), fetch], null]);
+        assert_eq!(parsed(carried.message_tools_json), Some(declared));
+        assert_eq!(tool_names(&ctx), ["search", "fetch"]);
+        let ProtocolRequest::Chat(req) = &ctx.original else {
+            unreachable!()
+        };
+        let read = serde_json::to_value(&req.tools.as_ref().unwrap()[0]).unwrap();
+        assert_eq!(read, search("string"));
+    }
+
+    #[test]
     fn a_message_declaring_an_empty_tool_list_leaves_tool_parsing_off() {
         // ATOM's HTTP chat parses no tool call when the chat declares no tool.
         let body = json!({"model": "m", "messages": [

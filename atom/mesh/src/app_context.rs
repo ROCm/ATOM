@@ -58,6 +58,8 @@ pub struct AppContext {
     /// Registry ids of the tokenizers loaded with a worker's inline chat template
     /// (an ATOM worker's GetModelInfo), with that template.
     pub tokenizer_inline_templates: Arc<RwLock<HashMap<String, String>>>,
+    /// Per tokenizer name, held while a registration loads or replaces its tokenizer.
+    pub tokenizer_reconciling: Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// `router_config`'s tokenization byte limits.
     pub(crate) tokenize_limits: TokenizeLimits,
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
@@ -308,6 +310,7 @@ impl AppContextBuilder {
                 .ok_or(AppContextBuildError("tokenizer_registry"))?,
             chats_without_template: Default::default(),
             tokenizer_inline_templates: Default::default(),
+            tokenizer_reconciling: Default::default(),
             tokenize_limits,
             reasoning_parser_factory: self.reasoning_parser_factory,
             tool_parser_factory: self.tool_parser_factory,
