@@ -1790,10 +1790,13 @@ def ug_union(c, i, TR):
     the group epilogue -> MID slot ui (token slots = the expert's pick list), one LL flag (ui, g).
     c["udir"] (udir_ok): the top-k's barrier is the entry (the x8 row flags waited by an idle top-k wave before it), a
     wave's groups straight from the counts / picks (uni_find / uni_pick, scalar; no moe_union) -- the same ui / slots,
-    bit for bit."""
+    bit for bit. c["u16"] (udir, the 16-wave CTA): the first round only -- a CTA's third / fourth group runs on the
+    helpers alongside it (ug_union_help), not in a cold second round after it."""
     w, l, sm = c["w"], c["l"], c["sm"]
     tl = l % 16
     UD = "udir" in c
+    U16 = "u16" in c
+    assert UD or not U16
     if fx.const_expr(UD):
         ms, pcs = uni_masks(c)
         pid = uni_picks(c)
@@ -1810,7 +1813,7 @@ def ug_union(c, i, TR):
     u1 = (U * (i + 1)) // (CTAS_R)
     if fx.const_expr(UD):
         wq = ufl(w // 4)
-    for rd in range_constexpr(2):
+    for rd in range_constexpr(1 if U16 else 2):
         G = u0 + rd * 2 + w // 4
         live = G < u1
         Gc = fx.max(fx.min(G, u1 - 1), I32(0))
@@ -1865,3 +1868,51 @@ def ug_union(c, i, TR):
                 if l == 0:   # the group's last wave past its stores puts its flag
                     if latomic_add(sm + O_RED8 + 2048 + (rd * 2 + w // 4) * 4, 1) == 3:
                         hx.put(c["mflag"] + i64(ui * NUG + g) * 8, I32(0), c["mtag"])
+
+
+@ASTRewriter.transform
+def ug_union_help(c, i, TR):
+    """(udir, the 16-wave CTA: helpers 8..15, woken at the UG's entry) ug_union's second round on the helpers, alongside
+    the main waves' first: groups u0 + 2 + (w - 8) // 4 (live only in a CTA of > 2 groups, U >= 28), tile w % 4 -- the
+    same union reads, body, epilogue and MID words as that round (bit for bit). No CTA barrier: the group's 32-col amax
+    through LDS (the second round's slots) and a tag word a wave (mtag), each wave waits its group's 3 tags (bounded,
+    s_sleep, no clock)."""
+    w, l, sm = c["w"], c["l"], c["sm"]
+    hw = w - 8
+    ms, pcs = uni_masks(c)
+    nr = I32(0)
+    for pc in pcs:
+        nr = nr + pc
+    U = nr * NUG
+    u0 = (U * i) // (CTAS_R)
+    u1 = (U * (i + 1)) // (CTAS_R)
+    G = u0 + 2 + hw // 4
+    if hx.unlikely(G < u1):
+        ui = G // NUG
+        g = G % NUG
+        e = uni_find(ms, pcs, ui, l)
+        n, pk = uni_pick(c, e, uni_picks(c), TR)
+        ex = i64(e)
+        acc1 = ug_body1(c, pk, c["w13"] + ex * W13_E + i64(g) * (4 * W13_TS), c["s13"] + ex * S13_E + i64(g) * (2 * W13_KC), w % 4)
+        x = []
+        am = F32(0.0)
+        for q in range_constexpr(8):
+            xv = silu_clamp(acc1[q], acc1[q].shuffle_xor(16, 32))
+            x.append(xv)
+            am = fx.max(am, abs(xv))
+        ab = sm + O_RED8 + 1024
+        hx.lstore(ab + (hw * 32 + l) * 4, am)
+        tg = sm + O_RED8 + UGH_TAG
+        lds_tag_put(tg + hw * 4, c["mtag"], l)
+        qq = hw % 4
+        b0 = hw - qq
+        for j in range_constexpr(1, 4):
+            lds_tag_wait(tg + ((b0 + (qq + j) % 4) * 4), c["mtag"])
+        amx = hx.lload(ab + (b0 * 32 + l) * 4, F32)
+        for j in range_constexpr(1, 4):
+            amx = fx.max(amx, hx.lload(ab + ((b0 + j) * 32 + l) * 4, F32))
+        ug_epi_w(c, ui, g, n, x, amx, qq)
+
+
+UGH_TAG = 2048 + 64                 # (ug_union_help) past O_RED8: the helpers' amax tags (int [8]); MOE_LDS covers it
+

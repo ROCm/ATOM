@@ -454,12 +454,21 @@ def target_layer(E, Ly):
     """One target layer in the 16-wave CTA (hx.NB16): waves 0..7 run it as the 8-wave CTA did (layer_part 0: A .. the UG,
     2: the push .. the layer's end; their CTA barriers named barrier MB); the helpers (waves 8..15) wait in HB through it
     and join its routed down (layer_part 1, dn_row: tiles 4..7 of every pick and of the shared expert), woken by wave 0
-    past part 0 in every CTA (a CTA without a down: they go back to HB at the next layer)."""
+    past part 0 (a CTA without a down: they go back to HB at the next layer). (udir) A routed CTA wakes them at its
+    UG's entry instead: they run the UG's second round (a CTA of > 2 groups: ug_union_help, part 1) alongside the main
+    waves' first, which keeps its code where it was (right past the UG's entry, part 0)."""
     wv = hx.wave_s()
+    TR, DRS = E["TR"], E.get("DRS", False)
+    UD = E["moe_ids"] == "ids" and MS.udir_ok(TR, TR * (D.DRAFT_TOPK if DRS else FS.TOPK))
     if wv < 8:
         layer_part(E, Ly, 0)
-        if wv == 0:
-            hx.nb_wake()
+        if fx.const_expr(UD):   # (udir: a routed CTA woke them at its UG's entry, in part 0)
+            b = hx.opaque_s(fx.block_idx.x)
+            if (wv == 0) & (b >= MS.SC0) & (b < MS.SC0 + MS.NSC):
+                hx.nb_wake()
+        else:
+            if wv == 0:
+                hx.nb_wake()
     else:
         hx.nb_park()
     layer_part(E, Ly, 1)
@@ -567,6 +576,10 @@ def layer_part(E, Ly, part):
         if fx.const_expr(moe_ids == "ids" and MS.udir_ok(TR, TR * RTOPK)):
             cdn = dict(cdn, udir=1, rne=RNE)
         if fx.const_expr(part == 1):
+            if fx.const_expr("udir" in cdn):
+                if ((b < MS.SC0) | (b >= MS.SC0 + MS.NSC)) & (hx.wave_s() >= 8):   # (udir) the helpers: the UG's second round
+                    MS.ug_union_help(dict(cdn, w13=ltab(fp, Ly, "mw13")(), s13=ltab(fp, Ly, "ms13")(), x8=fptr(fp, "fx8"),
+                                          xs=fptr(fp, "fxs")), rr_ * MS.NRC + ss_, TR)
             if ((b < MS.SC0) | (b >= MS.SC0 + MS.NSC)) & (rr_ < TR):
                 MS.dn_row(cdn, ss_)
             return
@@ -1098,4 +1111,8 @@ def layer_part(E, Ly, part):
         hx.bar()
         if fx.const_expr(not UD):
             MS.moe_union(crr, moe_ids == "ids")
-        MS.ug_union(crr, rr_ * MS.NRC + ss_, TR)
+            MS.ug_union(crr, rr_ * MS.NRC + ss_, TR)
+        else:   # (udir) the helpers out for the UG's second round (ug_union_help, part 1); the first round here
+            if hx.wave_s() == 0:
+                hx.nb_wake()
+            MS.ug_union(dict(crr, u16=1), rr_ * MS.NRC + ss_, TR)
