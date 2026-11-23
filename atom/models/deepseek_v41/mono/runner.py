@@ -1115,7 +1115,7 @@ class V41MonoDecodeRunner:
                     # the reference takes the expanded streams
                     (
                         SinglePassHCState.from_embeddings(
-                            state.residual, model.config.hc_mult, state.pre_mix
+                            state.residual, model.config.hc_mult
                         )
                         if key.embed_in
                         else state

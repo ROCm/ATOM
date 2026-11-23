@@ -42,7 +42,7 @@ BUILDS = {
         k2a.build_attn_post, k2a.ABI, k2a.AttnPostBuild(tokens=12),
         {"tokens": 24, "index_bound_max": 65536, "index_fp4": True, "index_mfma": True, "tp": 2,
          "timeline": True, "diag_off": DIAG, "tok_par": True, "kv_fp8": True,
-         "numa": NUMA % "as", "attn_sel": False, "block_rows": 5},
+         "numa": NUMA % "as", "attn_sel": False, "block_rows": 5, "staged_answer": True},
     ),
     "k2b": (
         k2b.build_moe, k2b.ABI, MoeBuild(tokens=6, tp=1),
@@ -60,7 +60,8 @@ BUILDS = {
          "block_rows": 5},
     ),
     "cg": (
-        cg.build_col_gather, cg.ABI, cg.ColGatherBuild(rows=6, taps=3),
+        # taps a settle's pushes fill whole waves with (``ColGatherBuild``)
+        cg.build_col_gather, cg.ABI, cg.ColGatherBuild(rows=6, taps=4),
         {"rows": 12, "taps": 2, "state": cg.State.SETTLE, "tp": 2},
     ),
     "eg": (
@@ -127,6 +128,12 @@ def test_one_field_changed_is_a_new_binary(cache, build, name):
         # the epsilon is code only in a build that makes its rows, and the
         # confidence head reads a row its CTA made
         base = dataclasses.replace(base, from_state=True)
+    if (build, name) == ("k2a", "staged_answer"):
+        # code only where the FULL layers' long rows split over the ranks
+        base = dataclasses.replace(
+            base, index_fp4=True, index_mfma=True, index_bound_max=65536
+        )
+        assert base.index_split
     if (build, name) == ("k1", "embed_in"):
         # layer 0 reads the embedding: it owes no post to fold
         base = dataclasses.replace(base, fold=False)
