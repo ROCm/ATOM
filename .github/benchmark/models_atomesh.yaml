@@ -2578,6 +2578,13 @@ models:
         ATOM_DISABLE_MMAP: "true"
         ATOM_PD_RANK_MAPPING_POLICY: none
         MC_NUM_QP_PER_EP: "1"
+        # pit2-p03's ionic NICs, as the MI350X cells: when the C1228 lanes
+        # start their Store loads, every P NIC stops completing reads with
+        # 2 workers x 256 WRs outstanding. One worker per context, a smaller
+        # WR depth and no relaxed ordering.
+        MC_WORKERS_PER_CTX: "1"
+        MC_MAX_WR: "64"
+        MC_IB_PCI_RELAXED_ORDERING: "0"
         MC_LOG_LEVEL: INFO
         MOONCAKE_DISABLE_HIP_DMABUF: "1"
         HSA_ENABLE_IPC_MODE_LEGACY: "1"
