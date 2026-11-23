@@ -448,7 +448,11 @@ class KimiSparseMoeBlock(nn.Module):
         self._dual_stream_decode_token_threshold = self._dual_stream_token_threshold
         if self.shared_experts is not None and self.alt_stream is not None:
             tbo_active = get_current_atom_config().enable_tbo
-            if envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0 and not tbo_active:
+            if (
+                envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0
+                and not tbo_active
+                and self.experts.allows_concurrent_shared_stream
+            ):
                 self._use_dual_stream = True
         if self._use_dual_stream:
             # Register self so `maybe_dual_stream_split_forward` can look this module up
