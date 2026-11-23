@@ -27,7 +27,7 @@ profile="${build_spec[3]}"
 cache="${TMPDIR:-/tmp}/atomesh-reviewed-router-$(id -u)"
 mkdir -p "${cache}/home"
 echo "[router-build] source=${source_sha} rust=${toolchain} profile=${profile}"
-timeout --kill-after=30s 1800s docker run --rm \
+timeout --kill-after=30s "${ATOMESH_ROUTER_BUILD_TIMEOUT_SECONDS:-1800}s" docker run --rm \
   --name "srtctl_${JOB_ID:?}_router_build" --label "srtctl.job=${SRTCTL_JOB_ID:?}" \
   --user "$(id -u):$(id -g)" \
   -e HOME=/mesh-cache/home -e CARGO_HOME=/mesh-cache/cargo-home -e RUSTUP_HOME=/mesh-cache/rustup-home \
@@ -59,6 +59,9 @@ assert m["binary_sha256"] == hashlib.sha256((out / "atomesh").read_bytes()).hexd
 # Keep the image build context to the executable and Dockerfile.
 (out / ".dockerignore").write_text("*\n!atomesh\n!Dockerfile\n")
 PY
+if [[ -n "${GPOOL_LEASE:-}" ]]; then
+  python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_gpool_guard.py" router-image
+fi
 timeout --kill-after=30s 300s docker build --iidfile "${output}/image-id.txt" \
   -f "${output}/Dockerfile" "${output}" > "${output}/image-build.log" 2>&1
 image_id="$(cat "${output}/image-id.txt")"

@@ -35,12 +35,10 @@
         "enable-prefix-caching": true,
         "max-model-len": 1048576,
         "speculative-config": "{\"method\":\"dspark\",\"num_speculative_tokens\":7,\"attention_backend\":\"TRITON_ATTN\",\"kv_cache_dtype\":\"fp8\",\"draft_sample_method\":\"probabilistic\",\"rejection_sample_method\":\"block\"}",
-        "enable-batch-sharded-sampling": true,
         "renderer-num-workers": 8,
         "enable-prompt-tokens-details": true,
         "disable-uvicorn-access-log": true,
         "max-num-batched-tokens": 32768,
-        "enable-dbo": true,
         "dbo-prefill-token-threshold": 16384,
         "dbo-decode-token-threshold": 32768,
         "compilation-config": "{\"max_cudagraph_capture_size\":2048}",
@@ -195,5 +193,13 @@
     "rust_toolchain": "1.100.0",
     "lockfile": ".github/benchmark/pr5090-router-ab/router-Cargo.lock",
     "source_sha": "69ed5e77bcc93b9d51cb5cf1528badd0e703ed93"
+  },
+  "compatibility_adjustments": {
+    "image_config_sha256": "34510473dcd22d5680412ad5cbbe8192dbcbdd4405267a74fbb2da0a369f6fda",
+    "disabled_prefill_flags": [
+      "enable-dbo",
+      "enable-batch-sharded-sampling"
+    ],
+    "reason": "The pinned worker image rejects DBO with PP>1 and explicit batch-sharded sampling with TP1"
   }
 }

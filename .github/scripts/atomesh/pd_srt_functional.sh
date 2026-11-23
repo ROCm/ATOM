@@ -32,6 +32,9 @@ cleanup_srt() {
 trap cleanup_srt EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+if [[ -n "${GPOOL_LEASE:-}" ]]; then
+  python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_gpool_guard.py" python-setup
+fi
 [[ -f "${runtime}/source-sha.txt" ]] || { echo 'Pinned srtctl source is missing' >&2; exit 1; }
 stage="$(mktemp -d "${TMPDIR:-/tmp}/atomesh-srt-${JOB_ID}.XXXXXX")"
 export SRTCTL_SOURCE_DIR="${stage}/source"
@@ -45,6 +48,9 @@ python="${stage}/venv/bin/python"
 "${python}" -m pip install "${SRTCTL_SOURCE_DIR}" > "${RUN_DIR}/srt-install.log" 2>&1
 "${python}" -m pip freeze > "${RUN_DIR}/requirements-installed.txt"
 cp "${runtime}/source-sha.txt" "${RUN_DIR}/"
+if [[ -n "${GPOOL_LEASE:-}" ]]; then
+  python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_gpool_guard.py" router-compile
+fi
 bash "${REPO_ROOT}/.github/scripts/atomesh/pd_build_srt_router.sh"
 "${python}" "${REPO_ROOT}/.github/scripts/atomesh/pd_srt_functional.py" \
   --contract "${REPO_ROOT}/${ATOMESH_ENV_ATOMESH_PR5090_CONTRACT:?}" \
@@ -52,6 +58,9 @@ bash "${REPO_ROOT}/.github/scripts/atomesh/pd_build_srt_router.sh"
 "${python}" -m srtctl.cli.submit dry-run -f "${RUN_DIR}/recipe.yaml" \
   -o "${RUN_DIR}/srt-plan" > "${RUN_DIR}/srt-dry-run.log" 2>&1
 echo "[functional] starting native srtctl orchestration job=${SRTCTL_JOB_ID}"
+if [[ -n "${GPOOL_LEASE:-}" ]]; then
+  python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_gpool_guard.py" model-start
+fi
 setsid "${python}" -m srtctl.cli.do_sweep "${RUN_DIR}/recipe.yaml" > "${RUN_DIR}/srtctl.log" 2>&1 &
 sweep_pid=$!
 wait "${sweep_pid}"

@@ -196,9 +196,17 @@ def main():
                 "case": contract["case_name"],
                 "srtctl_sha": "d7305542f91e966a3f9e1028fe7cf8d34bd157a2",
                 "router_runtime": router_runtime,
+                "execution_backend": (
+                    "gpu-pool" if os.environ.get("GPOOL_LEASE") else "Spur"
+                ),
+                "gpu_pool_lease": os.environ.get("GPOOL_LEASE"),
                 "shared_sa_path": "schema loader, runtime, SweepOrchestrator, worker/frontend builders, port allocator, readiness, registry cleanup",
                 "differences": [
-                    "Spur allocation replaces SA sbatch",
+                    (
+                        "gpool lease and direct SSH replace SA sbatch"
+                        if os.environ.get("GPOOL_LEASE")
+                        else "Spur allocation replaces SA sbatch"
+                    ),
                     "srtctl DockerLauncher replaces pyxis/enroot",
                     "custom functionality workload replaces AgentX performance/eval",
                     "power collection disabled for functional-only validation",
