@@ -247,7 +247,7 @@ def test_draft_exports_zero_copy_mp_views_and_disables_tp_collapse():
     assert [(p.unit_spec.namespace, p.unit_spec.layer) for p in transfer.pages] == [
         ("draft", 9)
     ] * 2
-    assert {p.head_major_runs for p in transfer.pages} == {(1, 4)}
+    assert {p.head_major_runs for p in transfer.pages} == {(4, (128 * 128 * 2,))}
     assert [tuple(view.shape[:2]) for view in transfer.block_tensor_views] == [
         (2, 1),
         (2, 1),
