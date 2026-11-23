@@ -25,8 +25,10 @@ For the in-process path, the public configuration remains
 layouts: `m3` for MiniMax-M3 PAGE regions
 (including its NSA index cache), `kimi_k3` when the text config has
 `model_type == "kimi_linear"` (dense paged MLA KV plus a KDA per-request state
-tier), `qwen` for GDN hybrids (`qwen3_next`, `qwen3_5_*`; a subclass of the
-K3 tier over an MHA page image), `hybrid` when `hf_config.compress_ratios` is
+tier), `qwen` for GDN hybrids (`qwen3_next`, `qwen3_5_*`, `qwen4_exp`; a
+subclass of the K3 tier over a PAGE image in the MHA pool, or in the QSA arena
+for Qwen3.8, whose image also carries the PLE windows), `hybrid` when
+`hf_config.compress_ratios` is
 present (DSV4 PAGE+SLOT), and `dense` otherwise.
 `kv_transfer_config.offload_layout` can override compatible choices without
 giving scheduler and worker different connector names. MiniMax-M3 cannot be
@@ -101,7 +103,7 @@ Four rules carry the module:
 | `hybrid/dsv4/codec.py` | `DSV4PageSlotCodec`, `DSV4CheckpointCodec`, and `DSV4CheckpointStore`: unified GPU layout plans plus AOS1 framing/storage. |
 | `hybrid/dsv4/triton_page_slot.py` | Raw-`uint8` PAGE/SLOT gather/scatter kernels; PAGE is forward-indexed and SLOT is reverse-indexed. |
 | `hybrid/kimi_k3/connector.py` | Kimi-K3 worker and scheduler: the dense paged-KV path plus one extra leg for the KDA per-request state tier. |
-| `hybrid/qwen/connector.py` | Qwen GDN worker and scheduler. Subclasses the K3 tier; the pages come from the MHA pool. |
+| `hybrid/qwen/connector.py` | Qwen GDN worker and scheduler. Subclasses the K3 tier; the pages come from the MHA pool or Qwen3.8's QSA arena. |
 | `hybrid/kimi_k3/staging.py` | Single-entry bounded GPU staging buffer, D2H/H2D copy stream, and producer event for one flat state entry per transfer. |
 | `hybrid/kimi_k3/state_object.py` | One state checkpoint as a single opaque object keyed by ATOM's own hash, bypassing LMCache's `ChunkedTokenDatabase` (state bytes are not token-sliceable). |
 | `hybrid/kimi_k3/state_tier.py` | Worker-side store/load driver for the state tier on its own executor; reports store/finished/failed hash sets for the engine-side `StateOffloadIndex` to apply. |
@@ -523,7 +525,27 @@ reverse).
   their leases right before the get. The load goes ahead whatever that
   answers -- the engine parked the request when it admitted it, and only the
   load's report wakes it -- so a prefix evicted meanwhile fails the get like
-  any other miss. Workers have nothing to unpin. A miss at get time fails the
+  any other miss. With `ATOM_STORE_ASYNC_RENEW=1` (opt-in, default off) the
+  renewal runs on the renewal executor instead of blocking the scheduler
+  (which otherwise waits up to 1 s) and the load stays parked, retried each
+  step, until the renewal finishes or 1 s after its submission (a renewal
+  queued behind others in a burst can time out before it ran): a load
+  whose renewal has not finished goes out one or more steps later than with
+  the synchronous renewal, while a fresh hit (no renewal needed), a rejected
+  submission or a new submission while an earlier renewal is still stuck
+  dispatches in the same step; a renewal already queued behind a hung RPC
+  stays parked until its own 1 s timeout. A finished renewal -- judged by
+  completion, not by how late the scheduler polls -- a timeout (1 s), an
+  executor error, a cancelled renewal, a rejected submission or a renewal
+  still stuck from an earlier load then dispatch the get exactly as above. Polls while parked
+  (not steps: the idle drain polls every 1 ms) and each fallback reason are
+  counted (`renew_parked`, `renew_fallback_<reason>` in `[OFFLOAD-PERF]`,
+  which needs `OFFLOAD_PROFILE=1`). Aborting before the dispatch releases the reservation
+  without a get and cancels a queued renewal; a running one cannot be
+  cancelled, so it is kept until it returns and later loads skip renewal
+  (`renew_fallback_renewal_busy`) meanwhile. After the dispatch the blocks
+  stay until the workers'
+  terminal report. Workers have nothing to unpin. A miss at get time fails the
   load and the request recomputes, once.
 - After a load succeeds, the scheduler publishes the loaded prefix into the HBM
   prefix index (`offload_load_start_tokens`), so a later turn finds it in HBM
@@ -658,7 +680,8 @@ settings. The same keys work in `kv_connector_extra_config` of
 
 `OFFLOAD_COPY_WORKERS`, `OFFLOAD_LOAD_WORKERS`, `OFFLOAD_MIN_LOAD_TOKENS`,
 `OFFLOAD_PROFILE` and the `OFFLOAD_GPU_STAGING_*` knobs apply as for the dense
-path.
+path. `ATOM_STORE_ASYNC_RENEW=1` (default off) moves the pre-load lease
+renewal off the scheduler thread; see the lease paragraph above.
 
 ```bash
 # Store: one master, owners on NICs no prefill worker uses (here NUMA1's).
@@ -1632,6 +1655,7 @@ Connector-specific tuning (env):
 | `OFFLOAD_PUBLICATION_TIMEOUT_S` | 5.0 | Finite, nonnegative maximum wait after PAGE or AOS1 submission for session visibility. `0` performs exactly one immediate probe. |
 | `OFFLOAD_PUBLICATION_POLL_INTERVAL_S` | 0.01 | Finite, positive sleep interval between visibility probes; prevents busy-spinning. |
 | `OFFLOAD_COMMITTED_SIDECAR_CAPACITY` | 65536 | Positive integer bound for scheduler-session AOS1 commit discovery. Oldest commits are evicted first. |
+| `ATOM_STORE_ASYNC_RENEW` | 0 | Mooncake Store only: renew a load's read leases on the bounded renewal executor instead of blocking the scheduler. A finished renewal, a timeout, an error, a cancelled renewal, a rejected submission (full executor) or a renewal still stuck from an earlier load all dispatch the get as the synchronous path does; a renewal already queued behind a hung RPC stays parked until its own 1 s timeout. |
 | `OFFLOAD_PROFILE` | 0 | Emit `[OFFLOAD-SAVE-PROF]` / `[OFFLOAD-LOAD-PROF]` records with transfer counts, fast-path evidence, and outer store/retrieve wall time. |
 
 Pinned-host asynchronous copies and one batched PAGE block-ID upload per

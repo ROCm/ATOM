@@ -526,8 +526,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_STATE_CHECKPOINT_CHECK_BLOCKS", "0") == "1"
     ),
     # Set to 1 to read Qwen GDN state checkpoints out of the chunk kernel's
-    # interior states instead of cutting prefill chunks onto them. PAGE path
-    # only (Qwen3-Next / Qwen3.5); see `PagedStateCheckpointCoordinator`.
+    # interior states instead of cutting prefill chunks onto them, on both the
+    # PAGE and the fork-slot path; see `StateCache.publish_midstep`. Not
+    # Qwen3.8, whose PLE windows are checkpointed only where a forward ends.
     "ATOM_GDN_STATE_MIDSTEP": lambda: os.getenv("ATOM_GDN_STATE_MIDSTEP", "0") == "1",
     # Set to 0 to keep Qwen3.5's GDN input projection as two layers
     # (`in_proj_qkvz` + `in_proj_ba`) when the checkpoint quantizes them with
@@ -1429,6 +1430,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # OFFLOAD_LOAD_WORKERS: its SLOT load path needs a serial load executor.
     "OFFLOAD_COPY_WORKERS": lambda: _int_env("OFFLOAD_COPY_WORKERS", 1),
     "OFFLOAD_LOAD_WORKERS": lambda: _int_env("OFFLOAD_LOAD_WORKERS", 1),
+    # Opt-in (default off). Mooncake Store only: renew a load's lease keys on
+    # the bounded renewal executor instead of blocking the scheduler thread.
+    "ATOM_STORE_ASYNC_RENEW": lambda: _flag_env("ATOM_STORE_ASYNC_RENEW"),
     # Running-plus-queued save bound. None means unset: the connector then
     # derives max(2, 2 * OFFLOAD_COPY_WORKERS) and the scheduler's state tier
     # uses 2. A kv_connector_extra_config "max_pending_saves" takes precedence.
