@@ -4,8 +4,6 @@
 
 import flydsl.expr as fx
 
-from atom.models.deepseek_v41.mono import index_plan as ip
-from atom.models.deepseek_v41.mono import index_tp_plan as tp
 from atom.mono.device.ops import (
     ld_i32,
     traced,
@@ -14,6 +12,8 @@ from atom.mono.device.ops import (
     wave_max,
     wave_sum,
 )
+from atom.mono.dsa_indexer.paged import plan as ip
+from atom.mono.dsa_indexer.paged import tp_plan as tp
 from atom.mono.dsa_indexer.selection_plan import SHORT_VERIFY_CTX
 
 

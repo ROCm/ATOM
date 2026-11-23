@@ -15,8 +15,8 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU requi
     [(1, "single"), (8, "six"), (13, "six"), (40, "mixed"), (64, "single")],
 )
 def test_parallel_plan_and_reset_replay(rows, pattern):
-    from atom.models.deepseek_v41.mono import index_plan as ip
     from atom.models.deepseek_v41.mono.step_meta import write_step_meta
+    from atom.mono.dsa_indexer.paged import plan as ip
 
     rng = np.random.default_rng(4140 + rows)
     owners = np.arange(rows, dtype=np.int32)
@@ -107,9 +107,9 @@ def test_parallel_plan_and_reset_replay(rows, pattern):
     "world,rank,parallel", [(2, 1, False), (4, 0, False), (4, 3, True), (8, 7, True)]
 )
 def test_tp_rank_work_and_short_to_long_graph_switch(world, rank, parallel):
-    from atom.models.deepseek_v41.mono import index_plan as ip
-    from atom.models.deepseek_v41.mono import index_tp_plan as tp
     from atom.models.deepseek_v41.mono.step_meta import write_step_meta
+    from atom.mono.dsa_indexer.paged import plan as ip
+    from atom.mono.dsa_indexer.paged import tp_plan as tp
 
     # Three causal query groups, including two-request mixed short/long
     # steps: a short request stays owned even when there are fewer than TP.

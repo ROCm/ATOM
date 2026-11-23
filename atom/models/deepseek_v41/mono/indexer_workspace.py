@@ -9,9 +9,9 @@ The layer runner uses the first 48 rows; the native hook can use all 64.
 
 import torch
 
-from atom.models.deepseek_v41.mono import index_plan as ip
-from atom.models.deepseek_v41.mono import index_tp_plan as tp
-from atom.models.deepseek_v41.mono import indexer_build as build
+from atom.mono.dsa_indexer.paged import build
+from atom.mono.dsa_indexer.paged import plan as ip
+from atom.mono.dsa_indexer.paged import tp_plan as tp
 from atom.mono.runtime.uncached import uncached_bytes
 
 

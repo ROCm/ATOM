@@ -20,7 +20,7 @@ compressed positions); a channel's producer must have put every element below th
 up to a multiple of 4. **Output** ``out``: a plain int32 arg [rows, k], or an ``F32`` channel of width
 ``k`` carrying the int32 indices' bits.
 
-**Shape** (adapted from ATOM's V4.1 indexer, ``atom/models/deepseek_v41/mono/index_plan.py``). One CTA
+**Shape** (adapted from ATOM's V4.1 indexer, ``atom/mono/dsa_indexer/paged/plan.py``). One CTA
 ranks at most ``seg`` values (keys in LDS). Level 0: a task per (row, segment of ``seg`` columns) ->
 its top-k list. Level l > 0: list j merges the level l - 1 lists [fan j, fan (j + 1)), fan = seg / k,
 laid end to end; every list but a level's last holds exactly k valid entries, so the merged input is

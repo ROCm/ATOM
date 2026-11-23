@@ -39,8 +39,6 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, T, as_ir_value
 
-from atom.models.deepseek_v41.mono import index_plan as ip
-from atom.models.deepseek_v41.mono.kernels.index_tp_work import row_work
 from atom.mono.device.mx import FP4, mfma_scaled
 from atom.mono.device.ops import (
     CM_DEV,
@@ -53,6 +51,8 @@ from atom.mono.device.ops import (
     uniform,
     wave_max,
 )
+from atom.mono.dsa_indexer.paged import plan as ip
+from atom.mono.dsa_indexer.paged.tp_work import row_work
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES
 from atom.mono.plan.trace import enter_stage
 
@@ -215,9 +215,9 @@ def _rows(c, rows):
     (bound, query operands [mi], scale dword, half-weights [mi][e]) a row;
     rows past the span repeat its last and write nothing (bound 0)."""
     if c.get("wide_score", False):
-        from atom.models.deepseek_v41.mono.kernels.index_score_fp4_32 import rows32
+        from atom.mono.dsa_indexer.paged.score_fp4_single_row import query_row
 
-        return rows32(c)
+        return query_row(c)
     lane, lds = c["lane"], c["sel_lds"]["keys"]
     l, g = lane % 16, lane // 16
     v4 = fx.Vector.make_type(4, fx.Int32)
@@ -247,9 +247,9 @@ def _page(c, trow, st):
     ``trow``, whose entries name 2 ** ishift pages each (a request's PAGE
     table; a REINDEX token's candidates, ishift 0)."""
     if c.get("wide_score", False):
-        from atom.models.deepseek_v41.mono.kernels.index_score_fp4_32 import page32
+        from atom.mono.dsa_indexer.paged.score_fp4_single_row import key_page
 
-        return page32(c, trow, st)
+        return key_page(c, trow, st)
     a, l = _stage_args(c), c["lane"] % 16
     shift = a["ishift"]
     blk = fx.min(st * (ip.STEP // PAGE) + l // 2, (a["itab_len"] << shift) - 1)
@@ -263,9 +263,9 @@ def _keys(c, page, nt):
     one wave) -- not a REINDEX row's candidate pages, its request's other
     rows' too."""
     if c.get("wide_score", False):
-        from atom.models.deepseek_v41.mono.kernels.index_score_fp4_32 import keys32
+        from atom.mono.dsa_indexer.paged.score_fp4_single_row import load_keys
 
-        return keys32(c, page, nt)
+        return load_keys(c, page, nt)
     a, lane = _stage_args(c), c["lane"]
     l, g = lane % 16, lane // 16
     # 64-bit addresses: a pool past 4 GiB is out of a buffer offset's reach
@@ -311,9 +311,9 @@ def _step(c, lead, rows, outs, kv, kvs, st, after_mfmas):
     """Step st's logits of every row (and block maxima on a candidate
     producer); ``after_mfmas`` once its keys are read."""
     if const_expr(c.get("wide_score", False)):
-        from atom.models.deepseek_v41.mono.kernels.index_score_fp4_32 import step32
+        from atom.mono.dsa_indexer.paged.score_fp4_single_row import score_step
 
-        step32(c, lead, rows, outs, kv, kvs, st, after_mfmas)
+        score_step(c, lead, rows, outs, kv, kvs, st, after_mfmas)
         return
     a, lane = _stage_args(c), c["lane"]
     l, g = lane % 16, lane // 16

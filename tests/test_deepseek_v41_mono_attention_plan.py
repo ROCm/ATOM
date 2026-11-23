@@ -9,8 +9,8 @@ import random
 import pytest
 
 from atom.models.deepseek_v41.mono import attention_plan as aplan
-from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono.config import ATTENTION_KEYS_MAX
+from atom.mono.dsa_indexer.paged import plan as ip
 
 # a token's window rows at most: what the selection leaves of the keys
 WINDOW_MAX = ATTENTION_KEYS_MAX - ip.TOPK

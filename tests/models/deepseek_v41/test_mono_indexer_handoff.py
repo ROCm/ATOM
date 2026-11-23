@@ -19,9 +19,9 @@ def _build_waiter():
     from aiter.ops.flydsl.kernels import buffer_ops as bo
     from flydsl.expr.typing import Int32, Int64
 
-    from atom.models.deepseek_v41.mono.kernels.index_score import _wait_chunks
     from atom.mono.device.ops import kernel_symbol, launcher, rsrc
     from atom.mono.device.sync import Mailbox, sreg
+    from atom.mono.dsa_indexer.paged.score import _wait_chunks
 
     name = kernel_symbol("validate_v41_score_handoff")
 

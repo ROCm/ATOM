@@ -11,7 +11,7 @@ its splits. Called by the kernel on traced Int32 and by the CPU property test on
 Python ints (``index_plan``'s rules: non-negative ``//`` operands only).
 """
 
-from atom.models.deepseek_v41.mono import index_plan as ip
+from atom.mono.dsa_indexer.paged import plan as ip
 
 SPLITS = 64  # a (token, head tile)'s splits: the original decode's
 BK = 16  # keys a split (a tile)

@@ -143,8 +143,8 @@ def test_dp_attention_keeps_rank_local_indexer_work(monkeypatch, gpu_module):
 def test_layer_reset_preserves_candidate_data_and_separates_split_histograms(
     gpu_module,
 ):
-    from atom.models.deepseek_v41.mono import indexer_build as ib
     from atom.models.deepseek_v41.mono.runner import V41MonoDecodeRunner
+    from atom.mono.dsa_indexer.paged import build as ib
 
     key = ib.IndexerBuild(8, 163968, world=4)
     r = V41MonoDecodeRunner.__new__(V41MonoDecodeRunner)

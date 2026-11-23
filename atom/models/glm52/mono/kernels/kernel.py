@@ -178,7 +178,7 @@ from atom.mono.device.ops import xshfl as _xshfl
 # the build's maximum therefore reaches its answer at a lower level through
 # ``select``es on runtime data, never through Python control flow -- which is
 # what keeps one build, and one CUDA graph, correct for every context.
-# Mirrors ``atom/models/deepseek_v41/mono/index_plan.py:95-154``, ``:285-291``.
+# Mirrors ``atom/mono/dsa_indexer/paged/plan.py:95-154``, ``:285-291``.
 # Only non-negative operands reach ``//``, where Python's floor and the device's
 # truncation agree.
 

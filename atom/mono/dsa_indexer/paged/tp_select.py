@@ -13,16 +13,16 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 
-from atom.models.deepseek_v41.mono import index_plan as ip
-from atom.models.deepseek_v41.mono import index_tp_plan as tp
-from atom.models.deepseek_v41.mono.kernels.index_score import _final, _selected_rows
-from atom.models.deepseek_v41.mono.kernels.topk import lds_topk
 from atom.mono.device.ops import (
     CM_SYS,
     rsrc,
     traced,
 )
 from atom.mono.device.sync import preg, publish
+from atom.mono.dsa_indexer.paged import plan as ip
+from atom.mono.dsa_indexer.paged import tp_plan as tp
+from atom.mono.dsa_indexer.paged.score import _final, _selected_rows
+from atom.mono.dsa_indexer.paged.topk import lds_topk
 from atom.mono.plan.execution import THREADS
 
 

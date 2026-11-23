@@ -6,9 +6,9 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32
 
-from atom.models.deepseek_v41.mono.kernels.topk import key_bits, order_key
 from atom.mono.device.ops import block_excl_scan, traced, wave_incl_scan
 from atom.mono.device.select import u32_lt
+from atom.mono.dsa_indexer.paged.topk import key_bits, order_key
 from atom.mono.plan.execution import THREADS, WAVES
 
 

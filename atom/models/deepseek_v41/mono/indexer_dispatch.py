@@ -5,7 +5,7 @@
 from torch import nn
 
 from atom.models.deepseek_v41.mono.decode_step import step_supported
-from atom.models.deepseek_v41.mono.indexer_build import MAX_ROWS
+from atom.mono.dsa_indexer.paged.build import MAX_ROWS
 from atom.mono.runtime.route import LazyRunner
 from atom.utils.forward_context import get_forward_context
 

@@ -10,7 +10,7 @@ chunk-aligned so rank/local ordering also preserves V4.1's global-index ties.
 
 from dataclasses import dataclass
 
-from atom.models.deepseek_v41.mono import index_plan as ip
+from atom.mono.dsa_indexer.paged import plan as ip
 from atom.mono.dsa_indexer.selection_plan import (
     DEFAULT_RADIX,
     ROW_COPIES,

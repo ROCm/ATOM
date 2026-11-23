@@ -10,7 +10,7 @@ draft block's (``write_draft_step_meta``, with its rows' positions)."""
 import triton
 import triton.language as tl
 
-from atom.models.deepseek_v41.mono import index_plan as ip
+from atom.mono.dsa_indexer.paged import plan as ip
 from atom.mono.dsa_indexer.selection_plan import SHORT_VERIFY_CTX, SPLIT_MIN
 from atom.mono.plan.execution import BLOCKS
 

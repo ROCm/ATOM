@@ -4,9 +4,9 @@
 
 from dataclasses import dataclass, replace
 
-from atom.models.deepseek_v41.mono import index_plan as ip
-from atom.models.deepseek_v41.mono import index_tp_plan as tp
-from atom.models.deepseek_v41.mono.kernels import index_select_plan as isp
+from atom.mono.dsa_indexer.paged import plan as ip
+from atom.mono.dsa_indexer.paged import selection_plan as isp
+from atom.mono.dsa_indexer.paged import tp_plan as tp
 from atom.mono.plan.execution import BLOCKS
 from atom.mono.plan.layout import pair_layout
 from atom.mono.runtime.abi import KernelAbi
@@ -25,6 +25,18 @@ class IndexerBuild:
     peer_offset: int = 0
     peer_plain: int = 0
     full_only: bool = False
+    hidden_size: int = 5120
+    query_rank: int = 1280
+
+    def __post_init__(self):
+        if self.hidden_size <= 0 or self.hidden_size % 8:
+            raise ValueError(
+                "paged indexer hidden size must be a positive multiple of 8"
+            )
+        if self.query_rank <= 0 or self.query_rank % 128:
+            raise ValueError(
+                "paged indexer query rank must be a positive multiple of 128"
+            )
 
 
 ABI = KernelAbi((

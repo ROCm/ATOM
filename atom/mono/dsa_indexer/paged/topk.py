@@ -179,7 +179,7 @@ def lds_topk(
     emit_key=False,
 ):
     if fast_hist:
-        from atom.models.deepseek_v41.mono.kernels.topk_fast import lds_topk_fast
+        from atom.mono.dsa_indexer.paged.topk_fast import lds_topk_fast
 
         return lds_topk_fast(
             n, k, load, emit, lds, tid, per_thread, after_keys, emit_key

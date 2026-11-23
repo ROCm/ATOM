@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""V4.1's index query, head weights, scoring and both selections in one launch.
+"""Paged index query, head weights, scoring and both selections in one launch.
 
 Reads the same MXFP8 latent and BF16 attention norm as the native indexer.
 The stages are shared with the layer monokernels, including FP4 query
@@ -14,47 +14,6 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
-from atom.models.deepseek_v41.mono import index_plan as ip
-from atom.models.deepseek_v41.mono import index_tp_plan as tp
-from atom.models.deepseek_v41.mono.indexer_build import (
-    ABI,
-    MAX_ROWS,
-    IndexerBuild,
-    _select_segment,
-    _split_weights,
-    scratch_layout,
-    selection_keys,
-)
-from atom.models.deepseek_v41.mono.kernels import index_select_plan as isp
-from atom.models.deepseek_v41.mono.kernels.attn_pre import (
-    Q_RANK,
-    QX8_WORDS,
-    lds_row,
-    tile_rows,
-    token_tiles,
-)
-from atom.models.deepseek_v41.mono.kernels.debug import mailbox
-from atom.models.deepseek_v41.mono.kernels.index_project_group import (
-    head_weight,
-    project_group,
-)
-from atom.models.deepseek_v41.mono.kernels.index_score import (
-    stage_ilist,
-)
-from atom.models.deepseek_v41.mono.kernels.index_score_fp4 import run_scores4
-from atom.models.deepseek_v41.mono.kernels.index_tp_radix import (
-    run_splits,
-)
-from atom.models.deepseek_v41.mono.kernels.index_tp_select import finish_row
-from atom.models.deepseek_v41.mono.kernels.index_tp_work import (
-    initialize as initialize_tp,
-)
-from atom.models.deepseek_v41.mono.kernels.index_tp_work import (
-    initialize_scores,
-    row_work,
-)
-from atom.models.deepseek_v41.mono.kernels.topk import lds_words
-from atom.models.deepseek_v41.mono.sources import SOURCES
 from atom.mono.device.ops import (
     CM_DEV,
     kernel_symbol,
@@ -68,10 +27,47 @@ from atom.mono.device.ops import (
     wave_max,
 )
 from atom.mono.device.ranks import peer_bases
-from atom.mono.device.sync import publish, sreg
+from atom.mono.device.sync import Mailbox, publish, sreg
+from atom.mono.dsa_indexer.paged import plan as ip
+from atom.mono.dsa_indexer.paged import selection_plan as isp
+from atom.mono.dsa_indexer.paged import tp_plan as tp
+from atom.mono.dsa_indexer.paged.build import (
+    ABI,
+    MAX_ROWS,
+    IndexerBuild,
+    _select_segment,
+    _split_weights,
+    scratch_layout,
+    selection_keys,
+)
+from atom.mono.dsa_indexer.paged.projection import (
+    head_weight,
+    lds_row,
+    project_group,
+    tile_rows,
+    token_tiles,
+)
+from atom.mono.dsa_indexer.paged.score import (
+    stage_ilist,
+)
+from atom.mono.dsa_indexer.paged.score_fp4 import run_scores4
+from atom.mono.dsa_indexer.paged.sources import SOURCES
+from atom.mono.dsa_indexer.paged.topk import lds_words
+from atom.mono.dsa_indexer.paged.tp_radix import (
+    run_splits,
+)
+from atom.mono.dsa_indexer.paged.tp_select import finish_row
+from atom.mono.dsa_indexer.paged.tp_work import (
+    initialize as initialize_tp,
+)
+from atom.mono.dsa_indexer.paged.tp_work import (
+    initialize_scores,
+    row_work,
+)
 from atom.mono.plan.arith import pick
 from atom.mono.plan.build_key import key_tuple
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES, first_task
+from atom.mono.runtime.debug import region_ids
 from atom.mono.runtime.step_begin import EPOCH, FENCE_BYTES, _fence, _ld64
 
 _CURRENT_STREAM = fx.Stream(None)
@@ -228,26 +224,27 @@ def _run_tp_reindex_scores(c, world, rank, meta):
 
 
 @traced
-def _load_latent(tid, qr, qr_scale, qxl, qxsl, t0, n):
-    for u in range(tid, n * QX8_WORDS, THREADS):
-        t, col = u // QX8_WORDS, u % QX8_WORDS
+def _load_latent(tid, qr, qr_scale, qxl, qxsl, t0, n, query_rank):
+    qx8_words = query_rank // 4
+    for u in range(tid, n * qx8_words, THREADS):
+        t, col = u // qx8_words, u % qx8_words
         v = bo.buffer_load(
             rsrc(qr),
-            (t0 + t) * QX8_WORDS + col,
+            (t0 + t) * qx8_words + col,
             vec_width=1,
             dtype=T.i32,
             cache_modifier=CM_DEV,
         )
-        fx.ptr_store(v, qxl + t * lds_row(QX8_WORDS) + col)
-    for u in range(tid, n * (Q_RANK // 32), THREADS):
-        t, col = u // (Q_RANK // 32), u % (Q_RANK // 32)
-        at = (t0 + t) * (Q_RANK // 32) + col
+        fx.ptr_store(v, qxl + t * lds_row(qx8_words) + col)
+    for u in range(tid, n * (query_rank // 32), THREADS):
+        t, col = u // (query_rank // 32), u % (query_rank // 32)
+        at = (t0 + t) * (query_rank // 32) + col
         v = bo.buffer_load(
             rsrc(qr_scale), at // 4, vec_width=1, dtype=T.i32, cache_modifier=CM_DEV
         )
         fx.ptr_store(
             (fx.Int32(v) >> ((at % 4) * 8)) & 255,
-            qxsl + t * lds_row(Q_RANK // 32) + col,
+            qxsl + t * lds_row(query_rank // 32) + col,
         )
     gpu.barrier()
 
@@ -260,6 +257,7 @@ def build_indexer(key: IndexerBuild):
         raise ValueError("standalone V4.1 indexer requires FP4")
     if key.world not in (1, 2, 4, 8):
         raise ValueError("cross-TP V4.1 indexer requires FP4 and TP1/2/4/8")
+    query_rank, qx8_words = key.query_rank, key.query_rank // 4
     layout = scratch_layout(key)
     keyed = key_tuple(key, SOURCES)
     rows = tile_rows(s)
@@ -275,8 +273,8 @@ def build_indexer(key: IndexerBuild):
     @fx.struct
     class ProjectionLds:
         red: fx.Array[fx.Float32, WAVES * 2 * 64 * 4, 16]
-        qxl: fx.Array[fx.Int32, rows * lds_row(QX8_WORDS), 16]
-        qxsl: fx.Array[fx.Int32, rows * lds_row(Q_RANK // 32), 16]
+        qxl: fx.Array[fx.Int32, rows * lds_row(qx8_words), 16]
+        qxsl: fx.Array[fx.Int32, rows * lds_row(query_rank // 32), 16]
         nbl: fx.Array[fx.Int32, 1, 16]
         qbf: fx.Array[fx.BFloat16, rows * ip.DIM, 16]
 
@@ -300,7 +298,7 @@ def build_indexer(key: IndexerBuild):
         select: SelectionLds
 
     name = kernel_symbol(
-        "mono_v41_indexer",
+        "mono_paged_indexer",
         s=s,
         c=key.bound_max,
         fp4=int(key.fp4),
@@ -310,6 +308,8 @@ def build_indexer(key: IndexerBuild):
         po=key.peer_offset,
         pp=key.peer_plain,
         full=int(key.full_only),
+        hidden=key.hidden_size,
+        qr=query_rank,
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -329,13 +329,18 @@ def build_indexer(key: IndexerBuild):
         alloc = fx.SharedAllocator()
         storage = alloc.allocate(StageLds)
         pr, se = storage.project.peek(), storage.select.peek()
-        mb = mailbox(layer, scratch, key.diag_off, layout)
+        mb = (
+            Mailbox(layer)
+            if key.diag_off < 0
+            else Mailbox(layer, scratch + fx.Int64(key.diag_off), region_ids(layout))
+        )
         if const_expr(key.full_only):
             ilift = fx.Int32(0)
             iprod = fx.Int32(0)
         c = {
             "S": s, "tid": tid, "bid": bid, "lane": tid % 64, "wave": tid // 64,
             "bound_max":key.bound_max,
+            "hidden_size": key.hidden_size, "query_rank": query_rank,
             "red": pr.red.ptr, "qxl": pr.qxl.ptr, "qxsl": pr.qxsl.ptr,
             "put": mb.put, "put_bf": mb.put_bf, "put_words": mb.put_words,
             "poll": mb.poll, "tok_par": False,
@@ -392,7 +397,9 @@ def build_indexer(key: IndexerBuild):
             task = bid + rep * BLOCKS
             for i, (t0, n) in enumerate(tiles):
                 if (task >= i * ip.HEADS * parts) & (task < (i + 1) * ip.HEADS * parts):
-                    _load_latent(tid, qr, qr_scale, pr.qxl.ptr, pr.qxsl.ptr, t0, n)
+                    _load_latent(
+                        tid, qr, qr_scale, pr.qxl.ptr, pr.qxsl.ptr, t0, n, query_rank
+                    )
                     project_group(
                         c,
                         hidden,

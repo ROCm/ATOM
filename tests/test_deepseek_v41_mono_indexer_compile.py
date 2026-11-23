@@ -7,8 +7,7 @@ import pytest
 
 pytest.importorskip("aiter")
 pytest.importorskip("flydsl")
-from atom.models.deepseek_v41.mono import indexer_build as build
-from atom.models.deepseek_v41.mono.kernels import indexer as kernel
+from atom.mono.dsa_indexer.paged import build, kernel
 from atom.mono.runtime.compile import compile_only, launcher_resources
 
 BASE = build.IndexerBuild(8, 8320, fp4=True, mfma=False)

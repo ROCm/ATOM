@@ -8,8 +8,10 @@ from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from atom.models.deepseek_v41.mono import index_plan as ip
-from atom.models.deepseek_v41.mono.kernels.index_score_fp4 import (
+from atom.mono.device.mx import FP4
+from atom.mono.device.ops import CM_DEV, butterfly, global_load, ld_i32, rsrc, traced
+from atom.mono.dsa_indexer.paged import plan as ip
+from atom.mono.dsa_indexer.paged.score_fp4 import (
     BOUNDS_AT,
     FLT_MAX,
     NEG,
@@ -19,11 +21,9 @@ from atom.models.deepseek_v41.mono.kernels.index_score_fp4 import (
     _swap_add,
     _vop,
 )
-from atom.mono.device.mx import FP4
-from atom.mono.device.ops import CM_DEV, butterfly, global_load, ld_i32, rsrc, traced
 
 
-def rows32(c):
+def query_row(c):
     lane, lds = c["lane"], c["sel_lds"]["keys"]
     head, group = lane % 32, lane // 32
     v4 = fx.Vector.make_type(4, fx.Int32)
@@ -46,7 +46,7 @@ def rows32(c):
     return [(fx.Int32(fx.ptr_load(lds + BOUNDS_AT)), q, scale, weights)]
 
 
-def page32(c, trow, st):
+def key_page(c, trow, st):
     a, l = _stage_args(c), c["lane"] % 32
     shift = a["ishift"]
     blk = fx.min(st * (ip.STEP // ip.BLOCK_ROWS) + l // 4, (a["itab_len"] << shift) - 1)
@@ -54,7 +54,7 @@ def page32(c, trow, st):
     return (entry << shift) | (blk & ((fx.Int32(1) << shift) - 1))
 
 
-def keys32(c, page, nt):
+def load_keys(c, page, nt):
     a, lane = _stage_args(c), c["lane"]
     l, g = lane % 32, lane // 32
     page = fx.Int64(page)
@@ -96,7 +96,7 @@ def keys32(c, page, nt):
 
 
 @traced
-def step32(c, lead, rows, outs, kv, kvs, st, after_mfmas):
+def score_step(c, lead, rows, outs, kv, kvs, st, after_mfmas):
     a, lane = _stage_args(c), c["lane"]
     bound, query, qscale, weights = rows[0]
     totals = []

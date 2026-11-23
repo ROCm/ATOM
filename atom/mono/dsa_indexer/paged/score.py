@@ -36,15 +36,6 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32, T
 
-from atom.models.deepseek_v41.mono import index_plan as ip
-from atom.models.deepseek_v41.mono import index_tp_plan as tp
-from atom.models.deepseek_v41.mono.kernels import index_select_plan as isp
-from atom.models.deepseek_v41.mono.kernels.index_score_fp4 import run_scores4
-from atom.models.deepseek_v41.mono.kernels.index_tp_work import row_work
-from atom.models.deepseek_v41.mono.kernels.token_par import own_rows
-from atom.models.deepseek_v41.mono.kernels.topk import key_bits, lds_topk
-from atom.models.deepseek_v41.mono.kernels.topk_fast import key_offset
-from atom.models.deepseek_v41.mono.step_meta import KMETA
 from atom.mono.device.ops import (
     CM_SYS,
     butterfly,
@@ -57,6 +48,14 @@ from atom.mono.device.ops import (
     traced,
 )
 from atom.mono.device.sync import POLL_MAX, preg, publish
+from atom.mono.dsa_indexer.paged import plan as ip
+from atom.mono.dsa_indexer.paged import selection_plan as isp
+from atom.mono.dsa_indexer.paged import tp_plan as tp
+from atom.mono.dsa_indexer.paged.plan import own_rows
+from atom.mono.dsa_indexer.paged.score_fp4 import run_scores4
+from atom.mono.dsa_indexer.paged.topk import key_bits, lds_topk
+from atom.mono.dsa_indexer.paged.topk_fast import key_offset
+from atom.mono.dsa_indexer.paged.tp_work import row_work
 from atom.mono.plan.arith import pick, sel
 from atom.mono.plan.execution import BLOCKS, THREADS, first_task
 from atom.mono.plan.trace import enter_stage
@@ -598,7 +597,9 @@ def _selected_rows(c, t, ident):
     lifted = cand * TILE + fx.max(ident, 0) % TILE
     row = fx.Int32(((a["ilift"] != 0) & (ident >= 0)).select(lifted, ident))
     toff = fx.Int32(
-        bo.buffer_load(rsrc(a["kmeta"]), t * KMETA + 2, vec_width=1, dtype=T.i32)
+        bo.buffer_load(
+            rsrc(a["kmeta"]), t * ip.KEY_META_WORDS + 2, vec_width=1, dtype=T.i32
+        )
     )
     rpp = a["rows_per_page"]
     live = fx.max(row, 0)
@@ -699,7 +700,8 @@ def run_scores(c, t0, n, bid, bounds, max_chunks):
     a = c["args"]
     reindex = a["ilift"] != 0
     owners = [
-        sel(reindex, t0 + t, ld_i32(a["kmeta"], (t0 + t) * KMETA + 2)) for t in range(n)
+        sel(reindex, t0 + t, ld_i32(a["kmeta"], (t0 + t) * ip.KEY_META_WORDS + 2))
+        for t in range(n)
     ]
     counts, spans, width_log2 = ip.score_tasks(bounds, owners, BLOCKS, TASK_CHUNKS_LOG2)
     width = Int32(1) << width_log2

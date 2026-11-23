@@ -15,6 +15,8 @@ import numpy as np
 
 from atom.mono.plan.arith import sel
 
+KEY_META_WORDS = 4  # ABI key metadata: request id in word 2
+
 CHUNK = 128  # columns a score task: 16 tiles of 8 rows
 SEG = 8192  # values a select task ranks: its LDS-resident keys (K2a's LDS budget)
 CHUNKS_PER_SEG = SEG // CHUNK
@@ -338,3 +340,10 @@ def top_level(kind, bound_max, seg=SEG):
 def list_slots(kind, level, bound_max, seg=SEG):
     """Lists a token can have at ``level`` (a region's per-token size)."""
     return lists(kind_bound(kind, bound_max), level, KINDS[kind], seg=seg)
+
+
+def own_rows(s, tp, rank):
+    """(first row, rows) of an evenly token-sharded step."""
+    assert s % tp == 0, f"{s} rows do not split over {tp} ranks"
+    n = s // tp
+    return rank * n, n

@@ -50,7 +50,6 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
 from atom.models.deepseek_v41.mono import attention_plan as aplan
-from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono.config import ATTENTION_KEYS_MAX
 from atom.models.deepseek_v41.mono.kernels.dims import (
     HEAD_DIM,
@@ -83,6 +82,7 @@ from atom.mono.device.ops import (
     traced,
     xshfl,
 )
+from atom.mono.dsa_indexer.paged import plan as ip
 from atom.mono.plan.execution import BLOCKS
 
 SPLITS, BK = aplan.SPLITS, aplan.BK  # a split is a 16-key tile

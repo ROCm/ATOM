@@ -36,9 +36,6 @@ from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.v4_kernels.paged_decode import LOG2E
 from atom.models.deepseek_v41.config import AttentionMode
 from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
-from atom.models.deepseek_v41.mono import index_plan as ip
-from atom.models.deepseek_v41.mono import index_tp_plan as itp
-from atom.models.deepseek_v41.mono import indexer_build as ib
 from atom.models.deepseek_v41.mono.check import (
     check_front,
     check_index_projections,
@@ -52,16 +49,19 @@ from atom.models.deepseek_v41.mono.config import MAX_MOE_ROWS, MAX_ROWS, indexer
 from atom.models.deepseek_v41.mono.kernels import attn_post as k2a
 from atom.models.deepseek_v41.mono.kernels import attn_pre as k1
 from atom.models.deepseek_v41.mono.kernels import debug as kernel_debug
-from atom.models.deepseek_v41.mono.kernels import indexer as ki
 from atom.models.deepseek_v41.mono.kernels import layer_post as k2
 from atom.models.deepseek_v41.mono.kernels import moe as k2b
-from atom.models.deepseek_v41.mono.kernels.dims import Dims
+from atom.models.deepseek_v41.mono.kernels.dims import HIDDEN, Q_RANK, Dims
 from atom.models.deepseek_v41.mono.kernels.moe_shape import EXPERTS, TOPK
 from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_bytes, plain_layout
 from atom.models.deepseek_v41.mono.kernels.token_par import own_rows
 from atom.models.deepseek_v41.mono.step_meta import KMETA, write_step_meta
 from atom.models.deepseek_v41.mono.weights import bind_model
 from atom.mono.device import queue
+from atom.mono.dsa_indexer.paged import build as ib
+from atom.mono.dsa_indexer.paged import kernel as ki
+from atom.mono.dsa_indexer.paged import plan as ip
+from atom.mono.dsa_indexer.paged import tp_plan as itp
 from atom.mono.plan.execution import BLOCKS
 from atom.mono.runtime.aux_taps import AuxTaps, bind_aux_taps
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
@@ -523,6 +523,8 @@ class V41MonoDecodeRunner:
             world=world,
             peer_offset=peer_offset,
             peer_plain=peer_plain,
+            hidden_size=HIDDEN,
+            query_rank=Q_RANK,
         )
 
     @staticmethod

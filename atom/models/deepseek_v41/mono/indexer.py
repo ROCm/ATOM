@@ -13,11 +13,11 @@ import torch
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from atom.model_ops.deepseek_v41.index_plane import FP4_MFMA
-from atom.models.deepseek_v41.mono import index_plan as ip
-from atom.models.deepseek_v41.mono import index_tp_plan as tp
-from atom.models.deepseek_v41.mono import indexer_build as build
-from atom.models.deepseek_v41.mono.kernels import indexer as kernel
+from atom.models.deepseek_v41.mono.kernels.dims import HIDDEN, Q_RANK
 from atom.models.deepseek_v41.mono.step_meta import KMETA, write_step_meta
+from atom.mono.dsa_indexer.paged import build, kernel
+from atom.mono.dsa_indexer.paged import plan as ip
+from atom.mono.dsa_indexer.paged import tp_plan as tp
 from atom.mono.plan.execution import BLOCKS
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
 from atom.mono.runtime.lifecycle import owned_peer_buffer
@@ -215,6 +215,8 @@ class MonoIndexer:
             self.layout == FP4_MFMA,
             world=world,
             peer_plain=self.peer_plain if world > 1 else 0,
+            hidden_size=HIDDEN,
+            query_rank=Q_RANK,
         )
 
     def _build(self, rows):

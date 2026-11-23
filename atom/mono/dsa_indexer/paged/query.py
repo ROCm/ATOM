@@ -32,7 +32,6 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
-from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.mono.device.mx import FP8_MAX, clamp_fp8
 from atom.mono.device.ops import (
     CM_NT,
@@ -47,6 +46,7 @@ from atom.mono.device.ops import (
     rsrc,
     traced,
 )
+from atom.mono.dsa_indexer.paged import plan as ip
 from atom.mono.plan.execution import WAVES
 
 IDX_ROWS = ip.HEADS * ip.DIM  # 4096

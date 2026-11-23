@@ -4,7 +4,7 @@
 import unittest
 from itertools import pairwise
 
-from atom.models.deepseek_v41.mono import index_tp_plan as tp
+from atom.mono.dsa_indexer.paged import tp_plan as tp
 
 
 class IndexTPPlanTests(unittest.TestCase):

@@ -10,12 +10,6 @@ ascending global index tie rule, including its raw FP32 bit ordering.
 import flydsl.expr as fx
 from flydsl.expr import gpu, range_constexpr
 
-from atom.models.deepseek_v41.mono import index_plan as ip
-from atom.models.deepseek_v41.mono import index_tp_plan as tp
-from atom.models.deepseek_v41.mono.kernels.index_score import _wait_chunks
-from atom.models.deepseek_v41.mono.kernels.index_tp_select import _publish_count
-from atom.models.deepseek_v41.mono.kernels.index_tp_work import row_work
-from atom.models.deepseek_v41.mono.kernels.topk import order_key
 from atom.mono.device.ops import (
     block_excl_scan,
     ld_dev,
@@ -30,6 +24,12 @@ from atom.mono.device.ops import (
 from atom.mono.device.select import u32_gt
 from atom.mono.device.sync import preg, publish
 from atom.mono.dsa_indexer import select as k3
+from atom.mono.dsa_indexer.paged import plan as ip
+from atom.mono.dsa_indexer.paged import tp_plan as tp
+from atom.mono.dsa_indexer.paged.score import _wait_chunks
+from atom.mono.dsa_indexer.paged.topk import order_key
+from atom.mono.dsa_indexer.paged.tp_select import _publish_count
+from atom.mono.dsa_indexer.paged.tp_work import row_work
 from atom.mono.dsa_indexer.selection_plan import DEFAULT_RADIX
 from atom.mono.plan.execution import BLOCKS, THREADS, first_task
 
