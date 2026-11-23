@@ -44,7 +44,7 @@ from atom.model_ops.linear import (
 from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
 )
-from atom.model_ops.moe import FusedMoE
+from atom.model_ops.moe import FusedMoE, Mxfp4MoEMethod
 from atom.model_ops.swiglu_oai import swiglu_oai_split
 from atom.model_ops.utils import atom_parameter
 from atom.models.minimax_m3.mono.dispatch import MonoDecode
@@ -285,6 +285,22 @@ class MiniMaxM3MLP(nn.Module):
         return self.down_proj(x)
 
 
+def shared_input_from_moe_quant(shared_experts, experts) -> bool:
+    """Whether the shared expert takes its input from the routed MoE's quant
+    (ATOM_MINIMAX_M3_MOE_QUANT_SHARED). Its gate_up quantizes with
+    `quantize_fp8` when it is a native group-32 FP8/W4A8 linear (not the BF16
+    fallback), and the MXFP4 experts' A1 quant can write those bytes in its
+    own pass."""
+    if not envs.ATOM_MINIMAX_M3_MOE_QUANT_SHARED or shared_experts is None:
+        return False
+    gate_up = shared_experts.gate_up_proj
+    return (
+        gate_up.native_a8_group_rows is not None
+        and not gate_up.runs_bf16
+        and isinstance(experts.quant_method, Mxfp4MoEMethod)
+    )
+
+
 class MiniMaxM3MoE(nn.Module):
     """MiniMax-M3 routed MoE for MXFP4 checkpoints."""
 
@@ -357,20 +373,33 @@ class MiniMaxM3MoE(nn.Module):
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
             )
+        self.shared_input_from_moe_quant = shared_input_from_moe_quant(
+            self.shared_experts, self.experts
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, orig_shape[-1])
         router_logits = self.gate(hidden_states)
 
-        routed_output = self.experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-        )
+        shared_x = shared_x_scale = None
+        if self.shared_input_from_moe_quant:
+            routed_output, shared_x, shared_x_scale = (
+                self.experts.forward_with_mxfp8_copy(hidden_states, router_logits)
+            )
+        else:
+            routed_output = self.experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+            )
         if not self.fuse_shared_experts and self.routed_scaling_factor != 1.0:
             routed_output = routed_output * self.routed_scaling_factor
 
-        if self.shared_experts is not None:
+        if shared_x is not None:
+            routed_output = routed_output + self.shared_experts(
+                shared_x, x_scale=shared_x_scale
+            )
+        elif self.shared_experts is not None:
             routed_output = routed_output + self.shared_experts(hidden_states)
 
         return routed_output.view(orig_shape)
