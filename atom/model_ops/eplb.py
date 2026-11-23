@@ -1119,6 +1119,11 @@ class HostExpertTransport:
     writes each expert it gives away once, all ranks meet at a barrier of the
     CPU (gloo) group, each reads what it receives into its temp buffers, they
     meet again, and the writers remove their files.
+
+    A blob goes device <-> file through a host staging buffer of its size
+    that the transport keeps (page-locked where the weights are on a CUDA
+    device, touched once when made): no allocation and no page fault an
+    expert, on either side.
     """
 
     def __init__(self, cpu_group: Any, directory: str, rank: int):
@@ -1127,6 +1132,15 @@ class HostExpertTransport:
         self.rank = int(rank)
         self.seq = 0
         self.bytes_moved = 0
+        # Blob size in bytes -> its staging buffer, and how many were made.
+        self._stages: dict[int, torch.Tensor] = {}
+        self.stages_made = 0
+        # Since the last `take_stats`: wall seconds writing, and waiting for
+        # the peers plus reading; experts this rank gave and took.
+        self.send_seconds = 0.0
+        self.receive_seconds = 0.0
+        self.experts_sent = 0
+        self.experts_received = 0
         os.makedirs(directory, exist_ok=True)
 
     def _path(self, logical: int, part: int) -> str:
@@ -1135,6 +1149,31 @@ class HostExpertTransport:
     def barrier(self) -> None:
         if self.cpu_group is not None:
             torch.distributed.barrier(group=self.cpu_group)
+
+    def _stage(self, nbytes: int, device: torch.device) -> torch.Tensor:
+        """The host staging buffer of ``nbytes``-byte blobs."""
+        stage = self._stages.get(nbytes)
+        if stage is None:
+            stage = torch.empty(nbytes, dtype=torch.uint8)
+            if device.type == "cuda":
+                stage = stage.pin_memory()
+            stage.fill_(0)  # every page mapped now, not at the first expert
+            self._stages[nbytes] = stage
+            self.stages_made += 1
+        return stage
+
+    def take_stats(self) -> tuple[float, float, int, int]:
+        """(seconds writing, seconds waiting and reading, experts sent,
+        experts received) since the last call."""
+        stats = (
+            self.send_seconds,
+            self.receive_seconds,
+            self.experts_sent,
+            self.experts_received,
+        )
+        self.send_seconds = self.receive_seconds = 0.0
+        self.experts_sent = self.experts_received = 0
+        return stats
 
     def exchange(
         self,
@@ -1145,6 +1184,9 @@ class HostExpertTransport:
     ) -> None:
         """One layer's experts that change rank. Called by every rank, also
         by one that neither gives nor takes (the barriers are collective)."""
+        import time as _time
+
+        started = _time.perf_counter()
         self.seq += 1
         mine: list[str] = []
         written: set[int] = set()
@@ -1155,30 +1197,50 @@ class HostExpertTransport:
             written.add(logical)
             for part, w in enumerate(weights):
                 path = self._path(logical, part)
-                data = _as_p2p_bytes(w[action.local_slot]).reshape(-1).cpu().numpy()
+                src = _as_p2p_bytes(w[action.local_slot]).reshape(-1)
+                stage = self._stage(src.numel(), src.device)
+                stage.copy_(src)
                 tmp = f"{path}.{self.rank}.tmp"
-                data.tofile(tmp)
+                data = memoryview(stage.numpy())
+                with open(tmp, "wb", buffering=0) as f:
+                    done = 0
+                    while done < len(data):
+                        done += f.write(data[done:])
                 os.replace(tmp, path)
                 mine.append(path)
-                self.bytes_moved += int(data.size)
+                self.bytes_moved += len(data)
+        self.experts_sent += len(written)
+        sent = _time.perf_counter()
+        self.send_seconds += sent - started
         self.barrier()  # every rank's files are complete
         for action in recvs:
             logical = int(action.logical_expert_id)
             for part, b in enumerate(buffers):
                 dst = _as_p2p_bytes(b[action.local_slot])
-                data = np.fromfile(self._path(logical, part), dtype=np.uint8)
-                if data.size != dst.numel():
+                stage = self._stage(dst.numel(), dst.device)
+                data = memoryview(stage.numpy())
+                with open(self._path(logical, part), "rb", buffering=0) as f:
+                    on_host = os.fstat(f.fileno()).st_size
+                    got = 0
+                    while on_host == len(data) and got < len(data):
+                        read = f.readinto(data[got:])
+                        if not read:
+                            break
+                        got += read
+                if on_host != len(data) or got != len(data):
                     raise RuntimeError(
-                        f"expert {logical} part {part}: {data.size} bytes on the "
-                        f"host, {dst.numel()} expected"
+                        f"expert {logical} part {part}: {on_host} bytes on the "
+                        f"host ({got} read), {len(data)} expected"
                     )
-                dst.copy_(torch.from_numpy(data).to(dst.device).view_as(dst))
+                dst.copy_(stage.view_as(dst))
+        self.experts_received += len(recvs)
         self.barrier()  # every rank has read what it takes
         for path in mine:
             try:
                 os.unlink(path)
             except OSError:  # pragma: no cover - nothing depends on the cleanup
                 pass
+        self.receive_seconds += _time.perf_counter() - sent
 
 
 def layer_changes_rank(
@@ -1243,9 +1305,7 @@ def _migrate_single_layer(
     if isinstance(ep_group, HostExpertTransport):
         # No device process group: the experts that change rank go through
         # the host. Every rank enters or skips this together.
-        if layer_changes_rank(
-            old_p2l_layer, new_p2l_layer, num_local_physical_experts
-        ):
+        if layer_changes_rank(old_p2l_layer, new_p2l_layer, num_local_physical_experts):
             ep_group.exchange(
                 routed_experts_weights, temp_buffers, send_actions, recv_actions
             )
@@ -3016,15 +3076,25 @@ class EPLBManager:
             # kind ATOM_EPLB_MAX_REBALANCES counts.
             self._rebalance_count += 1
             self._experts_moved_total += experts_moved
+        host = ""
+        if self._host_transport is not None:
+            # This rank's share of the host transport, every rank's reset.
+            write_s, read_s, sent, received = self._host_transport.take_stats()
+            host = (
+                f" | host transport rank 0: experts sent={sent} received="
+                f"{received} write={write_s * 1000.0:.1f}ms "
+                f"wait+read={read_s * 1000.0:.1f}ms"
+            )
         if old_p2l is not None and _ep_rank == 0:
             logger.info(
                 "%s rebalance #%d done: %d layers migrated in %d chunks, "
-                "migrate total=%.1fms",
+                "migrate total=%.1fms%s",
                 gate_permute.TAG,
                 _rc,
                 len(layer_ids),
                 num_chunks,
                 _t_migrate_ms,
+                host,
             )
 
     def _switch_layer(

@@ -1028,7 +1028,9 @@ def test_lazy_migration_group_is_made_at_the_first_rebalance_and_destroyed_at_th
     manager._ep_global_ranks = [0, 1, 2, 3]
     assert manager._migration_group is None and calls == []
     group = manager._reduce_group()
-    assert calls == ["new", "barrier"] and group.device_group is manager._migration_group
+    assert (
+        calls == ["new", "barrier"] and group.device_group is manager._migration_group
+    )
     assert manager._ensure_migration_group() is manager._migration_group
     assert calls == ["new", "barrier"]  # made once
     manager._release_migration_group()
@@ -1041,10 +1043,14 @@ def test_lazy_migration_group_is_made_at_the_first_rebalance_and_destroyed_at_th
     manager._lazy_group = False
     kept = manager._migration_group
     manager._release_migration_group()
-    assert manager._migration_group is kept and manager._ensure_migration_group() is kept
+    assert (
+        manager._migration_group is kept and manager._ensure_migration_group() is kept
+    )
 
 
-def test_host_transport_moves_experts_between_ranks_through_files(tmp_path, monkeypatch):
+def test_host_transport_moves_experts_between_ranks_through_files(
+    tmp_path, monkeypatch
+):
     """ATOM_EPLB_MIGRATE_VIA=shm: `_migrate_single_layer` with a
     `HostExpertTransport` in place of the process group gives every rank's
     temp buffers the bytes of the experts it takes, for whole-layer plans
@@ -1059,10 +1065,14 @@ def test_host_transport_moves_experts_between_ranks_through_files(tmp_path, monk
     old = torch.arange(experts)
     new = torch.tensor([5, 1, 2, 0, 4, 3, 6, 15, 8, 9, 10, 11, 12, 13, 14, 7])
     barriers = []
-    monkeypatch.setattr(torch.distributed, "barrier", lambda group: barriers.append(group))
+    monkeypatch.setattr(
+        torch.distributed, "barrier", lambda group: barriers.append(group)
+    )
     weights = [[t[r * per : (r + 1) * per].clone() for t in full] for r in range(ranks)]
     buffers = [[torch.zeros_like(w) for w in weights[r]] for r in range(ranks)]
-    transports = [eplb.HostExpertTransport("cpu", str(tmp_path), r) for r in range(ranks)]
+    transports = [
+        eplb.HostExpertTransport("cpu", str(tmp_path), r) for r in range(ranks)
+    ]
     assert eplb.layer_changes_rank(old, new, per)
     assert not eplb.layer_changes_rank(old, torch.tensor([1, 0, *range(2, 16)]), per)
 
@@ -1071,8 +1081,12 @@ def test_host_transport_moves_experts_between_ranks_through_files(tmp_path, monk
     plans, pending = {}, []
     for r in range(ranks):
         plan, local, sends, recvs = eplb._plan_single_layer_migration(
-            old_p2l_layer=old, new_p2l_layer=new, num_local_physical_experts=per,
-            num_gpu_per_node=ranks, rank=r, world_size=ranks,
+            old_p2l_layer=old,
+            new_p2l_layer=new,
+            num_local_physical_experts=per,
+            num_gpu_per_node=ranks,
+            rank=r,
+            world_size=ranks,
         )
         plans[r] = plan
         for action in local:
@@ -1101,8 +1115,86 @@ def test_host_transport_moves_experts_between_ranks_through_files(tmp_path, monk
     send = [type("A", (), dict(logical_expert_id=3, peer_rank=1, local_slot=3))()]
     seen = []
     monkeypatch.setattr(
-        torch.distributed, "barrier", lambda group: seen.append(sorted(os.listdir(t.directory)))
+        torch.distributed,
+        "barrier",
+        lambda group: seen.append(sorted(os.listdir(t.directory))),
     )
     t.exchange(weights[0], buffers[0], send + send, [])
     assert seen[0] == ["x1_e3_0.bin", "x1_e3_1.bin"] and os.listdir(t.directory) == []
     assert t.bytes_moved == 6 * 8 + 3 * 4
+    assert t.take_stats()[2:] == (1, 0) and t.take_stats() == (0.0, 0.0, 0, 0)
+
+
+def test_host_transport_stages_through_buffers_it_keeps(tmp_path, monkeypatch):
+    """A blob goes device <-> file through one staging buffer of its size:
+    made at the first expert, reused by every later one and every later
+    exchange, on the sending and on the receiving side."""
+    monkeypatch.setattr(torch.distributed, "barrier", lambda group: None)
+    gen = torch.Generator().manual_seed(9)
+    full = [
+        torch.randint(0, 255, (6, 5, 8), generator=gen, dtype=torch.uint8),
+        torch.randn(6, 3, generator=gen),
+        torch.randn(6, 10, generator=gen),  # the same 40 bytes as part 0
+    ]
+    sender = eplb.HostExpertTransport("cpu", str(tmp_path), 0)
+    taker = eplb.HostExpertTransport("cpu", str(tmp_path), 1)
+    buffers = [torch.zeros_like(t[:3]) for t in full]
+
+    def action(logical, slot):
+        return type(
+            "A", (), dict(logical_expert_id=logical, peer_rank=0, local_slot=slot)
+        )()
+
+    def move(pairs):
+        """Experts `logical` of the sender's slots into the taker's slots."""
+        sends = [action(logical, logical) for logical, _ in pairs]
+        recvs = [action(logical, slot) for logical, slot in pairs]
+        # the sender's files must outlive its own exchange for the taker here
+        kept = []
+        monkeypatch.setattr(os, "unlink", kept.append)
+        sender.exchange(full, [torch.zeros_like(t) for t in full], sends, [])
+        taker.seq = sender.seq - 1
+        monkeypatch.undo()
+        monkeypatch.setattr(torch.distributed, "barrier", lambda group: None)
+        taker.exchange([t[:3] for t in full], buffers, [], recvs)
+        for path in kept:
+            os.unlink(path)
+        for logical, slot in pairs:
+            for part in range(3):
+                assert torch.equal(buffers[part][slot], full[part][logical])
+
+    move([(4, 0), (5, 2)])
+    # two blob sizes (40 and 12 bytes), one buffer each, on either side
+    assert sorted(sender._stages) == [12, 40] and sender.stages_made == 2
+    assert sorted(taker._stages) == [12, 40] and taker.stages_made == 2
+    addresses = {
+        side: {n: stage.data_ptr() for n, stage in side._stages.items()}
+        for side in (sender, taker)
+    }
+    for round_ in range(3):
+        move([(round_, 1), (3, 0), (5, 2)])
+    for side in (sender, taker):
+        assert side.stages_made == 2
+        assert {n: s.data_ptr() for n, s in side._stages.items()} == addresses[side]
+    assert os.listdir(tmp_path) == []
+    write_s, read_s, sent, received = sender.take_stats()
+    assert sent == 2 + 3 * 3 and received == 0 and write_s > 0
+    assert taker.take_stats()[2:] == (0, 2 + 3 * 3)
+    assert sender.bytes_moved == (2 + 9) * (40 + 12 + 40)
+
+
+@pytest.mark.parametrize("size", [0, 39, 41])
+def test_host_transport_refuses_a_file_of_another_size(tmp_path, monkeypatch, size):
+    monkeypatch.setattr(torch.distributed, "barrier", lambda group: None)
+    t = eplb.HostExpertTransport("cpu", str(tmp_path), 0)
+    buffers = [torch.zeros(2, 5, 8, dtype=torch.uint8)]
+    t.seq = 0
+    path = os.path.join(str(tmp_path), "x1_e7_0.bin")
+    with open(path, "wb") as f:
+        f.write(bytes(range(size)))
+    recv = [type("A", (), dict(logical_expert_id=7, peer_rank=1, local_slot=1))()]
+    with pytest.raises(
+        RuntimeError, match=f"expert 7 part 0: {size} bytes on the host"
+    ):
+        t.exchange(buffers, buffers, [], recv)
+    assert int(buffers[0].sum()) == 0  # nothing of it reached the temp buffer
