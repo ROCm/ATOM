@@ -7,9 +7,11 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import Any
 
+from atom.plugin.sglang import deepseek_v41_envs
 from atom.plugin.sglang.deepseek_v41_bridge import (
     ATOM_DEEPSEEK_V41_SGLANG_BLOCK_SIZE,
     DEEPSEEK_V41_ARCH,
+    GRAPH_METADATA_ATTR,
     align_atom_config_with_sglang,
     build_deepseek_v41_forward_metadata,
     is_deepseek_v41_config,
@@ -106,8 +108,13 @@ def _prepare_deepseek_v41_config(atom_config: Any, model_arch: str) -> None:
     align_atom_config_with_sglang(atom_config)
     # One V4.1 PAGE per SGLang page; Config picked native's 128.
     atom_config.kv_cache_block_size = ATOM_DEEPSEEK_V41_SGLANG_BLOCK_SIZE
-    # No decoder SWA bounded replay yet: every prefill row runs every layer.
-    atom_config.enable_decoder_swa_bounded_replay = False
+    # Decoder SWA bounded replay: on as natively, unless
+    # ATOM_SGLANG_V41_DECODER_REPLAY turns it off; decided before the runtime
+    # model builds its replay stages. Unlike native, the prefill output here
+    # depends on where SGLang cuts a prompt: a resumed chunk shorter than the
+    # window computes every row (`deepseek_v41_bridge.v41_extend_replays`).
+    if not deepseek_v41_envs.ATOM_SGLANG_V41_DECODER_REPLAY:
+        atom_config.enable_decoder_swa_bounded_replay = False
     # Encoder replay rebuilds state below a prefix hit; radix cache is refused.
     atom_config.enable_encoder_swa_bounded_replay = False
     # The remap other adapters get from prepare_model, as native applies it.
@@ -125,6 +132,12 @@ def _build_deepseek_v41_forward_metadata(
     # ATOM's metadata comes off the batch and pools alone; SGLang computes
     # ``positions`` from the same lengths.
     del atom_config, positions
+    # A decode-graph capture's step, staged by the backend outside the
+    # captured region (both warmups and the capture run on it); SGLang stages
+    # every capture's batch before running it.
+    metadata = getattr(forward_batch, GRAPH_METADATA_ATTR, None)
+    if metadata is not None:
+        return metadata
     return build_deepseek_v41_forward_metadata(forward_batch)
 
 
