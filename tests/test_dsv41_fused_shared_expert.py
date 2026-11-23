@@ -21,11 +21,13 @@ _spec.loader.exec_module(v4)
 
 
 def test_native_mx_scale_kwargs():
-    assert v4.fused_scale_kwargs(32) == {
+    assert v4.fused_scale_kwargs(32, False) == {
         "quant_block_size": 32,
         "scale_dtype_fmt": "ue8m0",
     }
-    assert v4.fused_scale_kwargs(None) == {"transpose_scale": True}
+    assert v4.fused_scale_kwargs(None, True) == {"transpose_scale": True}
+    # A per-channel w2 reads neither layout: the unfused path.
+    assert v4.fused_scale_kwargs(None, False) is None
 
 
 def test_width_gate(monkeypatch):

@@ -14,9 +14,9 @@ from atom.model_ops.fla_ops.chunk import (
 )
 from atom.model_ops.fla_ops.fused_recurrent import fused_recurrent_gated_delta_rule
 
+ON_GFX942 = torch.cuda.get_device_properties().gcnArchName.split(":")[0] == "gfx942"
 requires_gfx942 = pytest.mark.skipif(
-    torch.cuda.get_device_properties().gcnArchName.split(":")[0] != "gfx942",
-    reason="FlyDSL GDN decode is supported only on gfx942",
+    not ON_GFX942, reason="FlyDSL GDN decode is validated only on gfx942"
 )
 
 
@@ -390,7 +390,7 @@ def test_qwen_backend_binds_zero_copy_vk_state(
     monkeypatch.setattr(envs, "ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", False)
     monkeypatch.setattr(fly, "backend", lambda stage: decode_backend)
     monkeypatch.setattr(fly, "ops", lambda: object())
-    monkeypatch.setattr(fly, "decode_device_supported", lambda device: supported_arch)
+    monkeypatch.setattr(fly, "_validated_on_gfx942", lambda: supported_arch)
     attention = SimpleNamespace(allow_aiter_flydsl=allowed, dt_bias=raw)
     layer = SimpleNamespace(base_linear_attention=None, impl=attention)
     result = builder.build_kv_cache_tensor(layer)
@@ -400,11 +400,9 @@ def test_qwen_backend_binds_zero_copy_vk_state(
     )
     assert attention.gdn_flydsl_policy.decode == expected
     assert result.v_cache.stride()[-2:] == ((1, 128) if expected else (128, 1))
-    # Prefill does not care about the pool layout; ReplaySSM keeps it on gfx942.
+    # Prefill does not depend on the pool layout; under ReplaySSM it needs gfx942.
     prefill = (
-        allowed
-        and decode_backend != "triton"
-        and (not replayssm or fly.replayssm_prefill_device_supported(raw.device))
+        allowed and decode_backend != "triton" and (supported_arch or not replayssm)
     )
     assert attention.gdn_flydsl_policy.prefill == prefill
     assert builder._flydsl_prefill_enabled == prefill
@@ -445,8 +443,6 @@ def test_align_flydsl_decode_rejects_strided_and_views_padded_indices():
 
 
 def test_unsupported_device_decode_fallback(monkeypatch):
-    from types import SimpleNamespace
-
     q, k, v, a, b, log, bias = inputs(3)
     state = torch.randn(6, 24, 128, 128, device="cuda", dtype=torch.bfloat16) * 0.1
     vk = state.transpose(-1, -2).contiguous().transpose(-1, -2)
@@ -454,11 +450,7 @@ def test_unsupported_device_decode_fallback(monkeypatch):
     writes = reads + 3
     monkeypatch.setattr(fly, "backend", lambda stage: "auto")
     monkeypatch.setattr(fly, "ops", lambda: object())
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda device: SimpleNamespace(gcnArchName="gfx950"),
-    )
+    monkeypatch.setattr(fly, "_validated_on_gfx942", lambda: False)
     assert not fly.decode_supported(q, k, v, a, b, vk, log, bias, reads, writes)
     with pytest.raises(ValueError, match="Unsupported"):
         fly.decode(q, k, v, a, b, vk, log, bias, reads, writes)
@@ -477,7 +469,7 @@ def test_unsupported_device_decode_fallback(monkeypatch):
 def test_policy_dependencies_and_lossy(monkeypatch, missing_ops, lossy_decode):
     monkeypatch.setattr(fly, "backend", lambda stage: "auto")
     monkeypatch.setattr(fly, "ops", lambda: None if missing_ops else object())
-    monkeypatch.setattr(fly, "decode_device_supported", lambda device: True)
+    monkeypatch.setattr(fly, "_validated_on_gfx942", lambda: True)
     policy = fly.select_policy(
         allowed=True,
         replayssm=False,
@@ -501,8 +493,8 @@ def test_cache_policy_forward_dispatch(monkeypatch, mode):
     from atom.model_ops.fla_ops.replayssm import replayssm_buffer_shapes
     from atom.utils import envs
 
-    if mode == "flydsl" and not fly.decode_device_supported(torch.device("cuda")):
-        pytest.skip("FlyDSL decode numerical coverage requires gfx942")
+    if mode == "flydsl" and not ON_GFX942:
+        pytest.skip("FlyDSL GDN decode is validated only on gfx942")
     q, k, v, a, b, log, bias = inputs(3)
     raw = torch.randn(3, 24, 128, 128, device="cuda", dtype=torch.bfloat16) * 0.1
     reference = raw.clone()
@@ -539,7 +531,7 @@ def test_cache_policy_forward_dispatch(monkeypatch, mode):
         fly, "backend", lambda stage: "triton" if mode == "disabled" else "auto"
     )
     if mode == "unsupported":
-        monkeypatch.setattr(fly, "decode_device_supported", lambda device: False)
+        monkeypatch.setattr(fly, "_validated_on_gfx942", lambda: False)
     monkeypatch.setattr(
         GDNAttentionMetadataBuilder, "build_kv_cache_tensor", lambda self, module: cache
     )
@@ -811,9 +803,7 @@ def test_replayssm_prefill_layer_dispatch_matches_triton(monkeypatch, keep):
             torch.empty_like(v[0]),
             "layer_0",
         )
-        flydsl = prefill_backend != "triton" and fly.replayssm_prefill_device_supported(
-            pool.device
-        )
+        flydsl = prefill_backend != "triton" and ON_GFX942
         assert prefill.call_count == int(flydsl)
         assert chunked.call_count == int(not flydsl)
         replay.assert_not_called()

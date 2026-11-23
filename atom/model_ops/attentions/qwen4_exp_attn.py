@@ -23,7 +23,8 @@ The physical block size matches the scheduler's (`block_ratio == 1`), so each
 block table entry directly addresses a page in both main and index-key caches.
 """
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from typing import Any
 
 import numpy as np
 import torch
@@ -72,9 +73,14 @@ class Qwen4ExpQSAMetadata:
     # Eager prefill only, for the aiter FlyDSL sparse attention: host per-request
     # (query_lens, seq_lens) of the packed tokens, and, when any request has a
     # prefix, the flat token-cache rows of every request's full context in
-    # request-major order. None elsewhere.
+    # request-major order (int32, the kernel's slot table). None elsewhere.
     host_lens: tuple[tuple[int, ...], tuple[int, ...]] | None = None
     context_slots: torch.Tensor | None = None
+    # The forward's FlyDSL attention layout, left by its first QSA layer
+    # (`qsa_attention._FlyDSLPrefill`). A `for_tokens` call that trims rows
+    # returns a copy without it (`init=False`); one that trims nothing returns
+    # this object, layout included, for the same rows.
+    flydsl_prefill: Any = field(default=None, init=False, repr=False, compare=False)
 
     def for_tokens(self, num_tokens: int) -> "Qwen4ExpQSAMetadata":
         """Draft step zero uses real rows, without the target graph's padding."""
@@ -155,6 +161,8 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
     """GDN hybrid plus the QSA side caches and the PLE state."""
 
     BACKEND = Qwen4ExpBackend
+    # Whether any bound GDN layer runs FlyDSL prefill; set at cache binding.
+    _flydsl_prefill_enabled = False
 
     def _build_gdn_cache_tensor(self, module):
         cache = super().build_kv_cache_tensor(module)
@@ -171,9 +179,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
                 activation_dtype=attention.dt_bias.dtype,
             )
             attention.gdn_flydsl_policy = policy
-            self._flydsl_prefill_enabled = (
-                getattr(self, "_flydsl_prefill_enabled", False) or policy.prefill
-            )
+            self._flydsl_prefill_enabled |= policy.prefill
             if policy.decode:
                 # Physical VK storage, exposed as a logical KV view. This is
                 # zero-copy and preserves all gather/scatter/fork interfaces.
@@ -670,9 +676,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             return
         num_reqs = batch.total_seqs_num_prefill
         query_lens = np.asarray(batch.num_scheduled_tokens[:num_reqs], dtype=np.int64)
-        if attn_metadata.gdn_metadata is not None and getattr(
-            self, "_flydsl_prefill_enabled", False
-        ):
+        if attn_metadata.gdn_metadata is not None and self._flydsl_prefill_enabled:
             from atom.model_ops.fla_ops.gdn_flydsl import build_prefill_metadata
 
             attn_metadata.gdn_metadata.flydsl_prefill_metadata = build_prefill_metadata(

@@ -174,7 +174,7 @@ def prepare_layer(
     return (*bufs, _RUNTIME.write_pos)
 
 
-def note_full_state_write(slot_idx: torch.Tensor | None) -> None:
+def note_full_state_write(slot_idx: torch.Tensor) -> None:
     """A prefill just rewrote the checkpoint. Drop uncommitted records.
 
     Commit runs after verify, not before the next kernel, so the Native
@@ -185,7 +185,7 @@ def note_full_state_write(slot_idx: torch.Tensor | None) -> None:
     with a boolean mask, whose size the host would have to read back.
     """
     write_pos = _RUNTIME.write_pos
-    if write_pos is None or slot_idx is None or slot_idx.numel() == 0:
+    if write_pos is None or slot_idx.numel() == 0:
         return
     slots = int(write_pos.shape[0])
     rows = slot_idx.to(torch.int64).masked_fill(slot_idx < 0, slots)

@@ -6,8 +6,9 @@
 `select_policy` reads only the backend settings, the device arch and whether
 AITER's FlyDSL ops import. `atom.model_ops.fla_ops` imports Triton kernels at
 package import, so this file loads `gdn_flydsl.py` on its own with Triton and
-its two sibling kernel modules stubbed. That keeps the policy matrix in the
-non-GPU unit tests, which run without Triton and AITER.
+its two sibling kernel modules stubbed, and the arch test stubs AITER's
+`get_gfx_runtime`. That keeps the policy matrix in the non-GPU unit tests,
+which run without Triton and AITER.
 """
 
 import importlib.util
@@ -52,8 +53,8 @@ def fly(monkeypatch):
     return module
 
 
-def _state(device="cpu"):
-    return torch.empty(1, 24, 128, 128, dtype=torch.bfloat16, device=device)
+def _state():
+    return torch.empty(1, 24, 128, 128, dtype=torch.bfloat16)
 
 
 @pytest.mark.parametrize("allowed", [False, True])
@@ -67,9 +68,7 @@ def test_policy_keeps_prefill_and_drops_decode_under_replayssm(
     backends = {"prefill": prefill_backend, "decode": "auto"}
     monkeypatch.setattr(fly, "backend", backends.__getitem__)
     monkeypatch.setattr(fly, "ops", lambda: None if missing_ops else object())
-    # Decode would be eligible on this device; only the ring rules it out.
-    monkeypatch.setattr(fly, "decode_device_supported", lambda device: True)
-    monkeypatch.setattr(fly, "replayssm_prefill_device_supported", lambda d: gfx942)
+    monkeypatch.setattr(fly, "_validated_on_gfx942", lambda: gfx942)
     policy = fly.select_policy(
         allowed=allowed,
         replayssm=replayssm,
@@ -81,7 +80,7 @@ def test_policy_keeps_prefill_and_drops_decode_under_replayssm(
     assert policy.prefill == (
         available and prefill_backend != "triton" and (gfx942 or not replayssm)
     )
-    assert policy.decode == (available and not replayssm)
+    assert policy.decode == (available and gfx942 and not replayssm)
 
 
 @pytest.mark.parametrize("prefill_backend", ["auto", "flydsl"])
@@ -90,8 +89,7 @@ def test_replayssm_prefill_needs_gfx942_even_when_forced(
 ):
     monkeypatch.setattr(fly, "backend", lambda stage: prefill_backend)
     monkeypatch.setattr(fly, "ops", lambda: object())
-    monkeypatch.setattr(fly, "decode_device_supported", lambda device: True)
-    monkeypatch.setattr(fly, "replayssm_prefill_device_supported", lambda d: False)
+    monkeypatch.setattr(fly, "_validated_on_gfx942", lambda: False)
     kwargs = {
         "allowed": True,
         "lossy_decode": False,
@@ -104,23 +102,10 @@ def test_replayssm_prefill_needs_gfx942_even_when_forced(
 
 
 @pytest.mark.parametrize(
-    ("hip", "device", "arch", "supported"),
-    [
-        (None, "cuda:0", "gfx942:sramecc+:xnack-", False),
-        ("6.4", "cpu", "gfx942:sramecc+:xnack-", False),
-        ("6.4", "cuda:0", "gfx942:sramecc+:xnack-", True),
-        ("6.4", "cuda:0", "gfx950:sramecc+:xnack-", False),
-        ("6.4", "cuda:0", "gfx1250", False),
-    ],
+    ("arch", "validated"), [("gfx942", True), ("gfx950", False), ("gfx1250", False)]
 )
-def test_replayssm_prefill_device_is_gfx942_only(
-    fly, monkeypatch, hip, device, arch, supported
-):
-    monkeypatch.setattr(fly.torch.version, "hip", hip)
-    monkeypatch.setattr(
-        fly.torch.cuda,
-        "get_device_properties",
-        lambda device: types.SimpleNamespace(gcnArchName=arch),
-    )
-    device = torch.device(device)
-    assert fly.replayssm_prefill_device_supported(device) is supported
+def test_flydsl_is_validated_on_gfx942_only(fly, monkeypatch, arch, validated):
+    chip_info = types.ModuleType("aiter.jit.utils.chip_info")
+    chip_info.get_gfx_runtime = lambda: arch
+    monkeypatch.setitem(sys.modules, chip_info.__name__, chip_info)
+    assert fly._validated_on_gfx942() is validated

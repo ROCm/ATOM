@@ -35,8 +35,19 @@ OTHER = {
     "npes": 2, "tokens": 2, "init_blocks": 2, "local_blocks": 2, "index_heads": 4,
     "index_own": 1, "timeline": True, "index_topk": False, "fuse_k1": False,
     "sm_scale": 0.09, "eps": 1e-5, "route_scale": 2.0, "shared_weight": 0.5,
-    "swiglu_limit": 8.0, "debug": True,
+    "swiglu_limit": 8.0, "debug": True, "kv_nvfp4": True, "index_nvfp4": True,
+    "attn_mxfp8": True, "fused_shared": True,
 }  # fmt: skip
+# a field whose other value is a valid build only beside other settings: both builds take them
+BESIDE = {
+    "index_own": {"index_heads": 4},
+}
+
+
+def _pair(name: str) -> tuple[K4Build, K4Build]:
+    """The two builds that differ in field ``name``."""
+    base = dataclasses.replace(BASE, **BESIDE.get(name, {}))
+    return base, dataclasses.replace(base, **{name: OTHER[name]})
 
 
 def _compile(key: K4Build) -> None:
@@ -45,7 +56,8 @@ def _compile(key: K4Build) -> None:
         key.npes, key.sm_scale, key.eps, key.route_scale, key.shared_weight,
         key.swiglu_limit, key.init_blocks, key.local_blocks, key.tokens,
         timeline=key.timeline, fuse_k1=key.fuse_k1, heads=heads, debug=key.debug,
-        index_topk=key.index_topk,
+        index_topk=key.index_topk, kv_nvfp4=key.kv_nvfp4, index_nvfp4=key.index_nvfp4,
+        attn_mxfp8=key.attn_mxfp8, fused_shared=key.fused_shared,
     )  # fmt: skip
     with compile_only():
         launch(*K4_ABI.zeros())
@@ -74,12 +86,7 @@ def test_a_rebuild_hits_the_cache(cache):
 
 @pytest.mark.parametrize("name", sorted(OTHER))
 def test_one_field_changed_is_a_new_binary(cache, name):
-    other = dataclasses.replace(BASE, **{name: OTHER[name]})
-    if name == "index_own":
-        other = dataclasses.replace(other, index_heads=4)
-        base = dataclasses.replace(BASE, index_heads=4)
-    else:
-        base = BASE
+    base, other = _pair(name)
     _compile(base)
     _compile(other)
     assert len(_entries(cache)) == 2
@@ -113,4 +120,17 @@ def test_every_dense_field_is_listed():
 def test_one_dense_field_changed_is_a_new_binary(cache, name):
     _compile_dense(DENSE_BASE)
     _compile_dense(dataclasses.replace(DENSE_BASE, **{name: DENSE_OTHER[name]}))
+    assert len(_entries(cache)) == 2
+
+
+def test_k1_attn_mxfp8_is_a_new_binary(cache):
+    from atom.models.minimax_m3.mono.kernels.pre_attn import (
+        K1_ABI,
+        build_pre_attn_kernel,
+    )
+
+    for flag in (False, True):
+        launch = build_pre_attn_kernel(1e-6, 0.088, 1, 1, 4, attn_mxfp8=flag)
+        with compile_only():
+            launch(*K1_ABI.zeros())
     assert len(_entries(cache)) == 2

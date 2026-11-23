@@ -108,7 +108,7 @@ def _ensure_flydsl_policy(state: torch.Tensor):
     from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy, select_policy
 
     # Under ReplaySSM the ring addresses the raw contiguous checkpoint, so
-    # `select_policy` keeps decode (and its VK view) off; prefill still runs.
+    # `select_policy` keeps decode (and its VK view) off; prefill runs only on gfx942.
     policy = select_policy(
         allowed=True,
         replayssm=replayssm_enabled(),
@@ -580,7 +580,9 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
                     "int32 view during CUDA graph capture."
                 )
             slot_idx = slot_idx.to(dtype=torch.int32).contiguous()
-        block_output = replayssm_gated_delta_rule(
+        # Every verify row is a spec row, so the kernel writes the layer's
+        # output in place, as Native does for a pure spec-decode batch.
+        replayssm_gated_delta_rule(
             q=query,
             k=key,
             v=value,
@@ -597,9 +599,7 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
             use_qk_l2norm_in_kernel=True,
             is_kda=False,
             route=envs.ATOM_REPLAYSSM_ROUTE,
-        )
-        output_blocks.copy_(
-            block_output.view(bs, draft_token_num, *output_blocks.shape[2:])
+            o=output_blocks.view(bs * draft_token_num, *output_blocks.shape[2:]),
         )
 
     def _spec_ssm_slot_table(
@@ -733,12 +733,11 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
         conv_phys = self._spec_conv_window_phys(
             layer_cache.intermediate_conv_window[0], draft_token_num
         )
-        # One wide-window spec call. ATOM writes
-        # [history2..historyM, draft1..draftN] -- exactly the physical row
-        # behind SGLang's dedup view, so every per-step window materialises
-        # for free and the live conv state is only read, never written.
-        state_len = conv_states.shape[-1]
-        conv_phys[:bs, :, :state_len] = conv_states[cache_indices]
+        # One wide-window spec call. It reads the history from the live conv
+        # state and writes [history2..historyM, draft1..draftN] -- exactly the
+        # physical row behind SGLang's dedup view, so every per-step window
+        # materialises for free and the live conv state is only read, never
+        # written.
         query_all, key_all, value_all = causal_conv1d_update(
             mixed_blocks.reshape(num_tokens, -1),
             conv_phys,
@@ -748,6 +747,8 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
             self.conv1d.bias,
             self.activation,
             conv_state_indices=self._spec_conv_slot_table(bs, mixed_blocks.device),
+            conv_state_indices_in=cache_indices.view(bs, 1),
+            conv_state_in=conv_states,
             num_accepted_tokens=self._spec_conv_accepted(bs, mixed_blocks.device),
             query_start_loc=self._spec_cu_seqlens(
                 bs, draft_token_num, mixed_blocks.device
@@ -836,7 +837,7 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
     def _spec_conv_accepted(self, bs: int, device: torch.device) -> torch.Tensor:
         """`num_accepted_tokens` of all ones: the conv kernel reads its initial
         history from column `num_accepted_tokens - 1`, and verify always starts
-        from the committed live state seeded at column 0."""
+        from the committed live state at column 0."""
         cache = getattr(self, "_spec_conv_accepted_cache", None)
         if cache is None:
             cache = {}
@@ -1023,17 +1024,17 @@ class SGLangGDNForwardContext:
         fm = getattr(linear_backend, "forward_metadata", None)
         query_start_loc = getattr(fm, "query_start_loc", None)
         idx = getattr(fm, "mamba_cache_indices", None)
-        live_slots = idx
-        # Extend only: SGLang's host sum of extend_seq_lens, i.e. the value of
-        # query_start_loc[-1].
-        num_query_tokens = getattr(fm, "logical_num_tokens", None)
         if query_start_loc is None or idx is None:
             reconstructed = reconstruct_linear_metadata(forward_batch, linear_backend)
             if reconstructed is None:
                 return None
             query_start_loc, idx = reconstructed
-            live_slots = idx
             num_query_tokens = None
+        else:
+            # Extend only: SGLang's host sum of extend_seq_lens, i.e. the value
+            # of query_start_loc[-1].
+            num_query_tokens = fm.logical_num_tokens
+        live_slots = idx
         device = query_start_loc.device
         # Decode cuda-graph: keep Hybrid's static buffers (already pad=-1 on
         # dead rows in ``_replay_metadata``). Cloning here bakes a throwaway
@@ -1094,10 +1095,11 @@ class SGLangGDNForwardContext:
                 # cursor, shared by every GDN layer, has to drop the previous
                 # tenant's records once per forward or the next verify folds
                 # them on top of that new state.
-                note_full_state_write(None if live_slots is None else live_slots[:bs])
+                note_full_state_write(live_slots[:bs])
             # SGLang's seq_lens_sum includes cached prefix tokens for some
             # hybrid batches; GDN only receives the active query tokens.
             if num_query_tokens is None:
+                # Reconstructed metadata has no host count.
                 num_query_tokens = query_start_loc[-1].item()
             seq_sum = int(num_query_tokens)
             epl = forward_batch.extend_prefix_lens

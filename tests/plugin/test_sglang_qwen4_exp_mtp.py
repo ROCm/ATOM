@@ -4,7 +4,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 from atom.plugin.config import _build_atom_speculative_config_from_sglang
 from atom.plugin.sglang.models.qwen4_exp import (
@@ -580,12 +579,12 @@ def test_draft_qsa_covers_the_graph_bucket_without_a_request_limit(monkeypatch):
     "mode, native_qsa, built",
     [
         # Target prefill and, on the draft runner, the draft prefill.
-        (ForwardMode.EXTEND, True, []),
-        (ForwardMode.MIXED, True, []),
-        (ForwardMode.TARGET_VERIFY, True, []),
-        (ForwardMode.DRAFT_EXTEND_V2, True, []),
-        (ForwardMode.DECODE, True, ["decode", "fixup"]),
-        (ForwardMode.EXTEND, False, ["extend", "fixup"]),
+        ("EXTEND", True, []),
+        ("MIXED", True, []),
+        ("TARGET_VERIFY", True, []),
+        ("DRAFT_EXTEND_V2", True, []),
+        ("DECODE", True, ["decode", "fixup"]),
+        ("EXTEND", False, ["extend", "fixup"]),
     ],
     ids=["extend", "mixed", "verify", "draft-extend-v2", "decode", "not-qsa"],
 )
@@ -593,6 +592,8 @@ def test_native_qsa_extend_builds_no_flashinfer_tables(
     monkeypatch, mode, native_qsa, built
 ):
     """QSA reads none of the MHA tables; building them costs a host sync."""
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
     from atom.plugin.sglang.attention_backend.full_attention.full_attention_backend import (
         ATOMAttnBackendForSgl,
     )
@@ -614,7 +615,7 @@ def test_native_qsa_extend_builds_no_flashinfer_tables(
     backend.forward_metadata = None
 
     backend.init_forward_metadata(
-        SimpleNamespace(forward_mode=mode, batch_size=2, spec_info=None)
+        SimpleNamespace(forward_mode=ForwardMode[mode], batch_size=2, spec_info=None)
     )
 
     assert calls == built
