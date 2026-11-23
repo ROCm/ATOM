@@ -1774,6 +1774,9 @@ class EPLBManager:
         # SGLang avoids this by issuing migration P2P on a separate (default) group;
         # we mirror that with an EP-membership subgroup used only for migration.
         self._migration_group: Any | None = None
+        self._lazy_group = False
+        self._ep_global_ranks: list[int] = []
+        self._groups_made = 0
         self._ep_rank: int = 0
         self._nnodes: int = 1
         self._rebalance_layers_per_chunk: int = 64
@@ -1891,10 +1894,23 @@ class EPLBManager:
             # isend/irecv from cross-matching in-flight forward ops on that group.
             # new_group is collective over the default group; every rank calls it.
             ep_global_ranks = torch.distributed.get_process_group_ranks(self._ep_group)
+            self._ep_global_ranks = list(ep_global_ranks)
+            meta = self.live_metadata
+            self._lazy_group = bool(
+                envs.ATOM_EPLB_LAZY_MIGRATION_GROUP
+                and meta is not None
+                and meta.num_physical_experts == meta.num_logical_experts
+            )
             if envs.ATOM_EPLB_SHARED_MIGRATION_GROUP:
                 # Diagnostic: no communicator of EPLB's own; migration P2P
                 # (if any runs) goes over the EP group's.
                 self._migration_group = self._ep_group
+            elif self._lazy_group:
+                # ATOM_EPLB_LAZY_MIGRATION_GROUP: no collective runs at init,
+                # so no device communicator comes up for EPLB until the first
+                # rebalance needs one (`_ensure_migration_group`), and it is
+                # torn down again when the placement freezes.
+                self._migration_group = None
             else:
                 self._migration_group = torch.distributed.new_group(
                     ranks=ep_global_ranks
@@ -1950,8 +1966,54 @@ class EPLBManager:
         # the first collective on an NCCL process group. Initialize the dedicated
         # migration group with an all-rank barrier because fill_redundant issues
         # asymmetric P2P operations involving only a subset of EP ranks.
-        torch.distributed.barrier(group=self._migration_group)
+        if self._migration_group is not None:
+            torch.distributed.barrier(group=self._migration_group)
         self.fill_redundant()
+
+    def _ensure_migration_group(self) -> Any:
+        """The process group migration (and, when it is made lazily, the load
+        reduction) runs on. Under ATOM_EPLB_LAZY_MIGRATION_GROUP it is made
+        here, by every rank in the same step, with the all-rank barrier that
+        the first collective on an NCCL group needs."""
+        if self._migration_group is None and self._lazy_group:
+            self._migration_group = torch.distributed.new_group(
+                ranks=self._ep_global_ranks
+            )
+            torch.distributed.barrier(group=self._migration_group)
+            self._groups_made += 1
+            if self._ep_rank == 0:
+                logger.info(
+                    "EPLB migration group #%d created (lazy)", self._groups_made
+                )
+        return self._migration_group
+
+    def _release_migration_group(self) -> None:
+        """The placement froze: the lazily made group goes, with its device
+        communicator, so a frozen server holds what one without EPLB holds."""
+        if not self._lazy_group or self._migration_group is None:
+            return
+        group, self._migration_group = self._migration_group, None
+        try:
+            torch.distributed.destroy_process_group(group)
+        except Exception as exc:  # noqa: BLE001 - never fatal: only memory stays
+            logger.warning("EPLB migration group not destroyed: %r", exc)
+            return
+        if self._ep_rank == 0:
+            logger.info("EPLB migration group #%d destroyed", self._groups_made)
+
+    def _reduce_group(self) -> Any:
+        """The group the loads are reduced over: the monitor's (the EP group)
+        -- or, with a lazily made migration group, that one, so that the EP
+        group's own device communicator is never brought up either."""
+        group = self.monitor._load_group
+        if not self._lazy_group:
+            return group
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            world_size=int(getattr(group, "world_size", len(self._ep_global_ranks))),
+            device_group=self._ensure_migration_group(),
+        )
 
     def _init_gate_permute(self, model: Any) -> None:
         """Set up gate-permute EPLB (ATOM_EPLB_GATE_PERMUTE) and say once how
@@ -2289,7 +2351,9 @@ class EPLBManager:
                 [1 if local_has_prefill else 0], device="cuda", dtype=torch.int32
             )
             torch.distributed.all_reduce(
-                flag, op=torch.distributed.ReduceOp.MAX, group=self._migration_group
+                flag,
+                op=torch.distributed.ReduceOp.MAX,
+                group=self._ensure_migration_group(),
             )
             has_prefill = bool(flag.item())
 
@@ -2348,6 +2412,10 @@ class EPLBManager:
             if self._fatal:
                 break
             self._log_frozen()
+            if not self._observe_steps():
+                # Nothing reduces loads or moves experts while frozen (the
+                # drift watch sums host integers over the CPU group).
+                self._release_migration_group()
             if not (self._rearm_enabled() or self._observe_steps()):
                 break
             # Frozen, with a watch on the operating point and/or an observer:
@@ -2609,7 +2677,7 @@ class EPLBManager:
                 dec_steps,
                 rows_per_step,
                 window_steps,
-            ) = gp.dump_global(self.monitor._load_group)
+            ) = gp.dump_global(self._reduce_group())
             if pf_total is not None:
                 logical_load = pf_total
             # The operating point is the window's: the live decode rows a
@@ -2767,7 +2835,7 @@ class EPLBManager:
                     new_meta=new_meta,
                     expert_weights_of_layer=self._expert_weights_of_layer,
                     temp_buffers=temp_buffers,
-                    ep_group=self._migration_group,
+                    ep_group=self._ensure_migration_group(),
                     nnodes=self._nnodes,
                     rank=self._ep_rank,
                     live_meta=self.live_metadata,
@@ -2853,7 +2921,7 @@ class EPLBManager:
                 new_meta=new_meta,
                 expert_weights_of_layer=self._expert_weights_of_layer,
                 temp_buffers=self._reusable_temp_buffers,
-                ep_group=self._migration_group,
+                ep_group=self._ensure_migration_group(),
                 nnodes=self._nnodes,
                 rank=self._ep_rank,
                 p2p_batch_chunk_size=self._p2p_batch_chunk_size,
@@ -2969,7 +3037,7 @@ class EPLBManager:
             None if gp.pf_total is not None else self.monitor.dump_global_logical_load()
         )
         dec_load, pf_total, rows_cumulative, _, rows_per_step, window_steps = (
-            gp.dump_global(self.monitor._load_group)
+            gp.dump_global(self._reduce_group())
         )
         gp.start_window()
         self._observations += 1

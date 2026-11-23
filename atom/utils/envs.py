@@ -1236,6 +1236,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_EPLB_GP_COUNT": lambda: os.getenv("ATOM_EPLB_GP_COUNT", "triton")
     .strip()
     .lower(),
+    # EPLB makes its migration process group at the first rebalance instead of
+    # at init, reduces the loads over it, and destroys it when the placement
+    # freezes: no device communicator of EPLB's exists before or after the
+    # learning (no redundant experts only).
+    "ATOM_EPLB_LAZY_MIGRATION_GROUP": lambda: _flag_env(
+        "ATOM_EPLB_LAZY_MIGRATION_GROUP", "0"
+    ),
     # Diagnostics: the decode recordings' top-k id tensors are not kept (no
     # decode sampling), and the manager starts frozen (no load is counted, no
     # count launch is recorded into the prefill graphs, nothing is ever moved).

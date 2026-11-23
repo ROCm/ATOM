@@ -1001,3 +1001,42 @@ def test_freeze_at_step_freezes_without_a_rebalance(monkeypatch):
     assert manager.rebalancing_stopped and manager.rebalance_count == 0
     assert torch.equal(manager.live_metadata.physical_to_logical_map, before)
     next(gen)  # idles
+
+
+def test_lazy_migration_group_is_made_at_the_first_rebalance_and_destroyed_at_the_freeze(
+    monkeypatch,
+):
+    """ATOM_EPLB_LAZY_MIGRATION_GROUP: no group (no collective) until a
+    rebalance needs one; the loads are reduced over it; the freeze destroys
+    it, and a later rebalance (a re-arm) makes a new one."""
+    manager = _manager(monkeypatch, ATOM_EPLB_MAX_REBALANCES=1)
+    calls = []
+    monkeypatch.setattr(
+        torch.distributed, "new_group", lambda ranks: calls.append("new") or object()
+    )
+    monkeypatch.setattr(
+        torch.distributed, "barrier", lambda group: calls.append("barrier")
+    )
+    monkeypatch.setattr(
+        torch.distributed,
+        "destroy_process_group",
+        lambda group: calls.append("destroy"),
+    )
+    manager._lazy_group = True
+    manager._ep_global_ranks = [0, 1, 2, 3]
+    assert manager._migration_group is None and calls == []
+    group = manager._reduce_group()
+    assert calls == ["new", "barrier"] and group.device_group is manager._migration_group
+    assert manager._ensure_migration_group() is manager._migration_group
+    assert calls == ["new", "barrier"]  # made once
+    manager._release_migration_group()
+    assert calls == ["new", "barrier", "destroy"] and manager._migration_group is None
+    manager._release_migration_group()  # nothing left to destroy
+    assert calls == ["new", "barrier", "destroy"]
+    manager._ensure_migration_group()
+    assert calls[-2:] == ["new", "barrier"] and manager._groups_made == 2
+    # not lazy: the group made at init is used as it is and never destroyed
+    manager._lazy_group = False
+    kept = manager._migration_group
+    manager._release_migration_group()
+    assert manager._migration_group is kept and manager._ensure_migration_group() is kept
