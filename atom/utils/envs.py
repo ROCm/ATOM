@@ -1170,6 +1170,50 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # picks than this (prefill and decode, the group's, over the placed
     # layers) is skipped, and does not count as one. 0 (default) = never.
     "ATOM_EPLB_MIN_PICKS": lambda: max(0, _int_env("ATOM_EPLB_MIN_PICKS", 0)),
+    # Gate-permute EPLB, once ATOM_EPLB_MAX_REBALANCES rebalances have run
+    # (the placement is then frozen): a fraction d > 0 keeps a watch on the
+    # group's live decode rows a step, and re-arms the rebalances when they
+    # leave [1 / (1 + d), 1 + d] times those of the last rebalance on two
+    # checks in a row. 0 (default) = frozen for good.
+    "ATOM_EPLB_REARM_DRIFT": lambda: max(
+        0.0, float(os.getenv("ATOM_EPLB_REARM_DRIFT") or 0.0)
+    ),
+    # ... a check every this many prefill-bearing steps (unset = 4 x
+    # `rebalance_interval`); the first rebalance after a re-arm waits for
+    # this many decode samples a rank and may take this many swaps a layer
+    # (unset = ATOM_EPLB_SWAP_BUDGET, 0 = no bound) ...
+    "ATOM_EPLB_REARM_CHECK_STEPS": lambda: _optional_int_env(
+        "ATOM_EPLB_REARM_CHECK_STEPS", min_value=1
+    ),
+    "ATOM_EPLB_REARM_MIN_SAMPLES": lambda: max(
+        0, _int_env("ATOM_EPLB_REARM_MIN_SAMPLES", 16)
+    ),
+    "ATOM_EPLB_REARM_BUDGET": lambda: _optional_int_env(
+        "ATOM_EPLB_REARM_BUDGET", min_value=0
+    ),
+    # ... and the rebalances that move experts after a re-arm before the
+    # placement freezes again.
+    "ATOM_EPLB_REARM_REBALANCES": lambda: max(
+        0, _int_env("ATOM_EPLB_REARM_REBALANCES", 2)
+    ),
+    # Gate-permute EPLB / the swap policy, where ATOM_EPLB_MAX_REBALANCES
+    # counts the rebalances that moved experts: this many evaluations in a row
+    # that move none freeze the placement too (0 = off).
+    "ATOM_EPLB_FREEZE_IDLE": lambda: max(0, _int_env("ATOM_EPLB_FREEZE_IDLE", 2)),
+    # Gate-permute EPLB, diagnostics: while the placement is frozen keep
+    # counting, and every this many prefill-bearing steps log the metrics of
+    # the frozen placement on the window's picks (0 = off).
+    "ATOM_EPLB_FROZEN_OBSERVE_STEPS": lambda: max(
+        0, _int_env("ATOM_EPLB_FROZEN_OBSERVE_STEPS", 0)
+    ),
+    # Gate-permute EPLB, diagnostics: rank 0 saves the loads of every
+    # rebalance evaluation and observation as <dir>/window_<seq>.pt.
+    "ATOM_EPLB_DUMP_DIR": lambda: os.getenv("ATOM_EPLB_DUMP_DIR") or None,
+    # `placement_policy: "swap"`: the swaps a layer of the first rebalance
+    # since the start (unset = ATOM_EPLB_SWAP_BUDGET, 0 = no bound).
+    "ATOM_EPLB_FIRST_BUDGET": lambda: _optional_int_env(
+        "ATOM_EPLB_FIRST_BUDGET", min_value=0
+    ),
     # Prefill-bearing steps before the first rebalance. Unset = a quarter of
     # `rebalance_interval`.
     "ATOM_EPLB_FIRST_REBALANCE_STEPS": lambda: _optional_int_env(

@@ -38,6 +38,11 @@ SWITCHES = (
     "ATOM_EPLB_FIRST_REBALANCE_STEPS",
     "ATOM_EPLB_MAX_REBALANCES",
     "ATOM_EPLB_MIN_PICKS",
+    "ATOM_EPLB_REARM_DRIFT",
+    "ATOM_EPLB_REARM_CHECK_STEPS",
+    "ATOM_EPLB_REARM_MIN_SAMPLES",
+    "ATOM_EPLB_REARM_BUDGET",
+    "ATOM_EPLB_FIRST_BUDGET",
     "ATOM_EXPERT_PLACEMENT",
 )
 LAYERS, EXPERTS, RANKS, TOP_K = 3, 16, 4, 3
@@ -318,7 +323,7 @@ def test_prefill_load_is_folded_by_the_placement_of_its_pass(monkeypatch, cumula
         env.monitor.on_forward_end(is_dummy_run=False, is_pure_prefill=True)
     want = sum(_logical_counts(r) for r in routes)
     load = env.monitor.dump_global_logical_load()
-    dec, pf_total, _, _ = env.gp.dump_global(None)
+    dec, pf_total, *_ = env.gp.dump_global(None)
     got = pf_total if cumulative else load
     assert got[0].tolist() == want.tolist()
     assert int(got[1].sum()) == 0 and int(got[2].sum()) == 0
@@ -380,7 +385,7 @@ def test_decode_replays_are_sampled_from_the_held_ids(monkeypatch):
             sampled += 1
     assert env.gp.dec_load.tolist() == want.tolist()
     assert (env.gp.dec_steps, env.gp.dec_rows) == (sampled, live_rows)
-    dec, _, rows_per_step, steps = env.gp.dump_global(None)
+    dec, _, rows_per_step, steps, *_ = env.gp.dump_global(None)
     assert dec.tolist() == want.tolist()
     assert steps == sampled and rows_per_step == pytest.approx(live_rows / sampled)
 
@@ -761,11 +766,12 @@ def test_swap_policy_is_not_held_back_by_the_balancedness_gate(monkeypatch):
         manager, "_execute_runtime_rebalance", lambda: ran.append(1) or iter(())
     )
     _drain(manager._rebalance())
-    assert ran == [1] and manager.rebalance_count == 1
+    assert ran == [1]
 
 
 def test_failed_policy_stops_rebalancing_with_nothing_moved(monkeypatch, caplog):
     manager, gates, _ = _bound_manager(monkeypatch, ATOM_EPLB_GATE_PERMUTE=1)
+    manager.gate_permute.pf_total.copy_(_skewed(3))
     before = {i: g.weight.data.clone() for i, g in gates.items()}
     live = manager.live_metadata.physical_to_logical_map.clone()
 

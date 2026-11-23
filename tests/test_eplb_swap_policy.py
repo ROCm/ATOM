@@ -296,3 +296,41 @@ def test_count1_load_is_balanced_from_the_identity():
     )
     line = gp.metrics_line(pfn, decn, 144.0, after, list(range(40)), 8, 6)
     assert "L0-19" in line and "L20-38" in line
+
+
+def test_count1_placement_depends_on_the_operating_point():
+    """Different concurrency, different placement: solved from the identity
+    for 64 and for 1344 decode rows a step of the group, each placement
+    carries fewer active experts on its heaviest rank at its own operating
+    point than the other does there."""
+    pf, dec = _count1()
+    p2l = identity_p2l(40, 384)
+    pfn, decn = pf.numpy().astype(float), dec.numpy().astype(float)
+    solved = {
+        rows: gp.ranks_of(
+            run_policy(pf, dec, p2l, budget=None, eps=0.005, rows=rows)[0]
+            .numpy()
+            .astype(np.int64),
+            48,
+        )
+        for rows in (64.0, 1344.0)
+    }
+
+    def proxy_max(rk, rows):
+        return np.mean(
+            [
+                gp.placement_metrics(pfn[i], decn[i], rows, rk[i], 8, 6)[1]
+                for i in range(40)
+            ]
+        )
+
+    low, high = solved[64.0], solved[1344.0]
+    assert (low != high).any()
+    assert proxy_max(low, 64.0) < proxy_max(high, 64.0)
+    assert proxy_max(high, 1344.0) < proxy_max(low, 1344.0)
+    # and both beat the identity at either point
+    identity = gp.ranks_of(p2l.numpy().astype(np.int64), 48)
+    for rows in (64.0, 1344.0):
+        assert max(proxy_max(low, rows), proxy_max(high, rows)) < proxy_max(
+            identity, rows
+        )

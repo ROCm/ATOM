@@ -1724,6 +1724,34 @@ class EPLBManager:
         self.gate_permute: gate_permute.GatePermuteRuntime | None = None
         # Layer id -> [logical] -> rank of ATOM_EPLB_REF_PLACEMENT (logging).
         self._reference_ranks: dict[int, Any] = {}
+        # Gate-permute EPLB: the group's live decode rows a step the last
+        # executed rebalance was planned for (its window's), None before one.
+        self._rows_at_last_solve: float | None = None
+        # The swap budget of the next executed rebalance where it is not
+        # ATOM_EPLB_SWAP_BUDGET: (why, swaps a layer or None for no bound) --
+        # the first one since the start, the first one after a re-arm.
+        first_budget = envs.ATOM_EPLB_FIRST_BUDGET
+        self._budget_once: tuple[str, int | None] | None = (
+            None if first_budget is None else ("first", first_budget or None)
+        )
+        self._rearms = 0
+        self._fatal = False
+        # Where a rebalance is an evaluation (`_places_by_plan`):
+        # `_rebalance_count` counts the ones that moved experts, and only
+        # once their migration is through; these count the rest.
+        self._limit = self.max_rebalances  # of the round: a re-arm's is its own
+        self._evaluations = 0  # with load to plan from; the #N of the log
+        self._idle_evaluations = 0  # in a row that moved nothing
+        self._experts_moved_total = 0
+        self._rows_cumulative = 0.0  # the mean since the start, as last reduced
+        self._last_picks = -1  # the group's picks at the last evaluation
+        self._steps = 0  # of the schedule
+        self._t_first_step: float | None = None
+        self._observations = 0
+        self._dumps = 0
+        # Rank 0: the loads at the last evaluation or observation, to tell
+        # what a window added (diagnostics only).
+        self._window_base: tuple[Any, Any] | None = None
         self._rebalancing_stopped = False
         self._gen = self._entrypoint()
         self._rebalance_count = 0
@@ -1960,7 +1988,9 @@ class EPLBManager:
             "%s mode: gate_permute=%d (%s) policy=%s layers=%d (%d..%d) "
             "experts=%d ep_size=%d ep_rank=%d window=%d interval=%d first=%d "
             "layers_per_chunk=%d max_rebalances=%d swap_budget=%d swap_eps=%g "
-            "ref_layers=%d",
+            "ref_layers=%d first_budget=%s rearm_drift=%g rearm_check=%d "
+            "rearm_min_samples=%d rearm_budget=%s rearm_rebalances=%d "
+            "freeze_idle=%d observe_steps=%d dump_dir=%s",
             gate_permute.TAG,
             self.gate_permute is not None,
             "-" if self.gate_permute is None else self.gate_permute.describe(),
@@ -1979,6 +2009,15 @@ class EPLBManager:
             envs.ATOM_EPLB_SWAP_BUDGET,
             envs.ATOM_EPLB_SWAP_EPS,
             len(self._reference_ranks),
+            "-" if self._budget_once is None else (self._budget_once[1] or "unlimited"),
+            envs.ATOM_EPLB_REARM_DRIFT if self.gate_permute is not None else 0.0,
+            self._rearm_check_steps(),
+            envs.ATOM_EPLB_REARM_MIN_SAMPLES,
+            envs.ATOM_EPLB_REARM_BUDGET,
+            envs.ATOM_EPLB_REARM_REBALANCES,
+            envs.ATOM_EPLB_FREEZE_IDLE,
+            self._observe_steps(),
+            envs.ATOM_EPLB_DUMP_DIR or "-",
         )
 
     def _collect_expert_weight_tensors(self, layer: Any) -> list[torch.Tensor]:
@@ -2212,7 +2251,15 @@ class EPLBManager:
         # Once stopped there is nothing left to schedule, so skip the per-step
         # has-prefill reduction too. The stop latches on the same step on every
         # rank (rebalance counts move in lockstep), so all ranks skip it together.
-        if not self.enabled or self._rebalancing_stopped:
+        if not self.enabled or (
+            self._rebalancing_stopped
+            # A frozen placement that is watched or observed (`_frozen`)
+            # keeps its schedule.
+            and not (
+                self.gate_permute is not None
+                and (self.gate_permute.watching or self.gate_permute.observing)
+            )
+        ):
             return
         # Gate-permute EPLB / the swap policy count real steps only: a dummy
         # forward (warm-up, which every rank runs alike) carries no load, and
@@ -2241,6 +2288,11 @@ class EPLBManager:
         if not has_prefill:
             # Pure-decode step across the migration group: do not advance.
             return
+        if self._t_first_step is None and self._places_by_plan():
+            import time as _time
+
+            self._t_first_step = _time.time()
+        self._steps += 1
         next(self._gen)
 
     def trigger_offline_rebalance(self, reason: str = "manual") -> None:
@@ -2262,16 +2314,172 @@ class EPLBManager:
         # this first real-load rebalance
         for _ in range(self._first_rebalance_steps()):
             yield
-        while not self._max_rebalances_reached():
-            yield from self._rebalance()
-            if self._max_rebalances_reached():
+        while True:
+            while not self._freeze_due():
+                yield from self._rebalance()
+                if self._freeze_due():
+                    break
+                for _ in range(self.rebalance_interval):
+                    yield
+            self._stop_rebalancing()
+            if self._fatal:
                 break
-            for _ in range(self.rebalance_interval):
-                yield
-        self._stop_rebalancing()
+            self._log_frozen()
+            if not (self._rearm_enabled() or self._observe_steps()):
+                break
+            # Frozen, with a watch on the operating point and/or an observer:
+            # back to the rebalances when the watch re-arms them.
+            yield from self._frozen()
         # Never finish: a caller that still advances the generator idles here.
         while True:
             yield
+
+    def _places_by_plan(self) -> bool:
+        """Gate-permute EPLB or the swap policy: a rebalance is an evaluation
+        that may move nothing, and only one that moved experts counts."""
+        return self.gate_permute is not None or self.placement_policy == "swap"
+
+    def _freeze_due(self) -> bool:
+        """The rebalances end here: enough of them moved experts (`_limit`),
+        or ATOM_EPLB_FREEZE_IDLE evaluations in a row moved none -- the
+        latter only where a freeze is asked for at all (a limit, or a
+        re-arm's round)."""
+        if self._max_rebalances_reached():
+            return True
+        idle = envs.ATOM_EPLB_FREEZE_IDLE
+        return (
+            self._places_by_plan()
+            and idle > 0
+            and self._idle_evaluations >= idle
+            and (self._limit > 0 or self._rearms > 0)
+        )
+
+    def _rearm_enabled(self) -> bool:
+        return self.gate_permute is not None and envs.ATOM_EPLB_REARM_DRIFT > 0
+
+    def _observe_steps(self) -> int:
+        return (
+            envs.ATOM_EPLB_FROZEN_OBSERVE_STEPS if self.gate_permute is not None else 0
+        )
+
+    def _rearm_check_steps(self) -> int:
+        steps = envs.ATOM_EPLB_REARM_CHECK_STEPS
+        return max(1, 4 * self.rebalance_interval if steps is None else steps)
+
+    def _log_frozen(self) -> None:
+        """Rank 0, where a rebalance is an evaluation: why and when the
+        placement froze."""
+        if not self._places_by_plan() or self._ep_rank != 0:
+            return
+        import time as _time
+
+        since = 0.0 if self._t_first_step is None else _time.time() - self._t_first_step
+        logger.info(
+            "%s frozen after rebalance #%d: reason=%s executed=%d "
+            "experts_moved_total=%d t_since_first_step=%.0fs rows/step=%.1f "
+            "(window) cum=%.1f",
+            gate_permute.TAG,
+            self._evaluations,
+            "max" if self._max_rebalances_reached() else "converged",
+            self._rebalance_count,
+            self._experts_moved_total,
+            since,
+            self._rows_at_last_solve or 0.0,
+            self._rows_cumulative,
+        )
+
+    def _frozen(self):
+        """The frozen placement's schedule under gate-permute EPLB: the drift
+        watch (ATOM_EPLB_REARM_DRIFT > 0) and the observer
+        (ATOM_EPLB_FROZEN_OBSERVE_STEPS > 0). Returns in the step the next
+        rebalance is due, which only a re-arm brings.
+
+        Watched, nothing is counted or sampled: a decode replay adds its live
+        rows and one to two host integers (`GatePermuteRuntime.watching`).
+        Every `_rearm_check_steps` steps the ranks sum those over the group
+        and compare the group's rows a step with those of the last
+        rebalance; outside the band on two checks in a row, the rebalances
+        re-arm: counting and decode sampling resume on the sums already
+        held, and the first rebalance runs at the first check with
+        ATOM_EPLB_REARM_MIN_SAMPLES decode samples a rank in the new window.
+        Observed, counting and sampling go on as before the freeze and
+        every ATOM_EPLB_FROZEN_OBSERVE_STEPS steps the loads are reduced and
+        logged (`_observe`); nothing is solved or moved. Every decision reads
+        the group's sums alone, so every rank takes it in the same step.
+        """
+        gp = self.gate_permute
+        assert gp is not None
+        group = self.monitor._load_group
+        rearm = self._rearm_enabled()
+        observe = self._observe_steps()
+        check = self._rearm_check_steps()
+        drift = envs.ATOM_EPLB_REARM_DRIFT
+        last = self._rows_at_last_solve or 0.0
+        lead = self._ep_rank == 0
+        tag = gate_permute.TAG
+        gp.watch_rows = gp.watch_steps = 0
+        gp.watching = rearm
+        gp.observing = observe > 0
+        if observe:
+            gp.start_window()
+        now, strikes, step = 0.0, 0, 0
+        while strikes < 2:
+            yield
+            step += 1
+            if observe and step % observe == 0:
+                self._observe()
+            if not rearm or step % check:
+                continue
+            now, replays = gp.take_watch(group)
+            if replays == 0:
+                verdict = "no decode step"
+            elif gate_permute.drifted(now, last, drift):
+                strikes += 1
+                verdict = "re-arm" if strikes == 2 else "1/2"
+            else:
+                strikes = 0
+                verdict = "ok"
+            if lead:
+                logger.info(
+                    "%s watch: rows/step now %.1f (last solve %.1f, drift %+.0f%%) %s",
+                    tag,
+                    now,
+                    last,
+                    (now / last - 1) * 100 if last > 0 else 0.0,
+                    verdict,
+                )
+        gp.watching = gp.observing = False
+        self._rebalancing_stopped = False
+        self._rebalance_count = 0
+        self._idle_evaluations = 0
+        self._limit = envs.ATOM_EPLB_REARM_REBALANCES
+        self._rearms += 1
+        budget = envs.ATOM_EPLB_REARM_BUDGET
+        if budget is None:
+            budget = envs.ATOM_EPLB_SWAP_BUDGET
+        self._budget_once = ("re-arm", budget or None)
+        gp.start_window()
+        need = envs.ATOM_EPLB_REARM_MIN_SAMPLES
+        if lead:
+            logger.info(
+                "%s re-armed #%d: rows/step now %.1f, last solve %.1f; counting "
+                "and decode sampling resume, frozen again after %d rebalances "
+                "that move experts (or %d in a row that move none), the first "
+                "at %d decode samples a rank with a budget of %s swaps a layer",
+                tag,
+                self._rearms,
+                now,
+                last,
+                self._limit,
+                envs.ATOM_EPLB_FREEZE_IDLE,
+                need,
+                budget or "unlimited",
+            )
+        while need > 0:
+            for _ in range(check):
+                yield
+            if gp.window_samples(group) >= need:
+                break
 
     def _first_rebalance_steps(self) -> int:
         """The prefill-bearing steps before the first rebalance:
@@ -2280,7 +2488,7 @@ class EPLBManager:
         return max(1, self.rebalance_interval // 4 if steps is None else steps)
 
     def _max_rebalances_reached(self) -> bool:
-        return 0 < self.max_rebalances <= self._rebalance_count
+        return 0 < self._limit <= self._rebalance_count
 
     def _stop_rebalancing(self) -> None:
         self._rebalancing_stopped = True
@@ -2325,7 +2533,8 @@ class EPLBManager:
         exception. Same-stream ordering makes migration naturally queue after
         the last forward pass's kernels, no synchronize needed.
         """
-        self._rebalance_count += 1
+        if not self._places_by_plan():
+            self._rebalance_count += 1
         yield from self._execute_runtime_rebalance()
 
     def _execute_runtime_rebalance(self):
@@ -2345,40 +2554,71 @@ class EPLBManager:
         num_nodes = self._nnodes
         ep_size = self.live_metadata.ep_size
         _ep_rank = self.live_metadata.ep_rank
-        _rc = self._rebalance_count
+        by_plan = self._places_by_plan()
+        # The #N of the log: the rebalance, or where one is an evaluation
+        # (`_places_by_plan`) the evaluation this becomes if it has load.
+        _rc = self._evaluations + 1 if by_plan else self._rebalance_count
 
         # Gate-permute: the decode samples (and, summed since the start, the
         # prefill load), reduced over the group like the window above.
         gp = self.gate_permute
         dec_load, rows_per_step, dec_steps = None, 0.0, 0
+        rows_cumulative, window_steps = 0.0, 0
         if gp is not None:
-            dec_load, pf_total, rows_per_step, dec_steps = gp.dump_global(
-                self.monitor._load_group
-            )
+            (
+                dec_load,
+                pf_total,
+                rows_cumulative,
+                dec_steps,
+                rows_per_step,
+                window_steps,
+            ) = gp.dump_global(self.monitor._load_group)
             if pf_total is not None:
                 logical_load = pf_total
-        min_picks = envs.ATOM_EPLB_MIN_PICKS
-        if min_picks > 0 and (gp is not None or self.placement_policy == "swap"):
-            # Too little load to plan from (the group's sums, so every rank
-            # decides alike): no rebalance, and none counted.
+            # The operating point is the window's: the live decode rows a
+            # step since the last rebalance, not their mean since the start
+            # (the picks stay cumulative). A window without live rows keeps
+            # the last one's.
+            if rows_per_step <= 0:
+                rows_per_step = (
+                    rows_cumulative
+                    if self._rows_at_last_solve is None
+                    else self._rows_at_last_solve
+                )
+        if by_plan:
+            # Nothing to plan from, by the group's sums (so every rank decides
+            # alike): too few picks, or -- where the picks are summed since
+            # the start -- none since the last evaluation. No rebalance, and
+            # none counted, neither as one that moved experts nor as idle.
             picks = int(logical_load.sum().item())
             if dec_load is not None:
                 picks += int(dec_load.sum().item())
+            min_picks = max(1, envs.ATOM_EPLB_MIN_PICKS)
+            why = None
             if picks < min_picks:
-                self._rebalance_count -= 1
+                why = f"{picks} picks < ATOM_EPLB_MIN_PICKS={min_picks}"
+            elif gp is not None and gp.cumulative and picks == self._last_picks:
+                why = f"no pick since the last evaluation ({picks})"
+            if why is not None:
                 if _ep_rank == 0:
                     logger.info(
-                        "%s rebalance #%d skipped: %d picks < "
-                        "ATOM_EPLB_MIN_PICKS=%d (not counted)",
+                        "%s rebalance #%d skipped: %s (not counted)",
                         gate_permute.TAG,
                         _rc,
-                        picks,
-                        min_picks,
+                        why,
                     )
                 return
+            self._evaluations = _rc
+            self._last_picks = picks
+            self._rows_cumulative = rows_cumulative
 
         _t0 = _time.perf_counter()
         swaps = None
+        budget = envs.ATOM_EPLB_SWAP_BUDGET
+        budget_why = "normal"
+        if self._budget_once is not None:
+            # The first rebalance since the start, or since a re-arm.
+            budget_why, budget = self._budget_once
         if self.placement_policy == "swap":
             try:
                 p2l, l2p, logcnt, swaps = gate_permute.swap_rebalance(
@@ -2388,7 +2628,7 @@ class EPLBManager:
                     self.live_metadata.physical_to_logical_map,
                     num_gpus=ep_size,
                     top_k=int(first_layer.top_k),
-                    budget=envs.ATOM_EPLB_SWAP_BUDGET,
+                    budget=budget,
                     eps=envs.ATOM_EPLB_SWAP_EPS,
                     layer_ids=sorted(self._moe_layers),
                 )
@@ -2397,6 +2637,7 @@ class EPLBManager:
                 # rank fails here alike, with nothing switched anywhere.
                 self._fatal_stop(f"the swap policy failed ({exc!r}); nothing moved")
                 return
+            self._budget_once = None
         else:
             p2l, l2p, logcnt = rebalance_experts(
                 logical_load,
@@ -2418,6 +2659,11 @@ class EPLBManager:
             ep_rank=self.live_metadata.ep_rank,
             max_num_replicas=self.live_metadata.max_num_replicas,
         )
+        if gp is not None:
+            # This rebalance is planned: what it was planned for, and the
+            # start of the next window.
+            self._rows_at_last_solve = rows_per_step
+            gp.start_window()
 
         chunk_size = max(1, int(self._rebalance_layers_per_chunk))
         layer_ids = sorted(self._moe_layers)
@@ -2429,12 +2675,18 @@ class EPLBManager:
             # its placement costs no step. The gates move from `old_p2l`.
             old_p2l = self.live_metadata.physical_to_logical_map.clone()
             moved = (old_p2l != p2l.to(old_p2l.device)).sum(dim=1).tolist()
+            experts_moved = sum(moved[i] for i in layer_ids)
+            # An evaluation that moves nothing is idle, and not a rebalance.
+            self._idle_evaluations = 0 if experts_moved else self._idle_evaluations + 1
             self._log_gate_permute_plan(
                 rc=_rc,
                 pf_load=logical_load,
                 dec_load=dec_load,
                 rows_per_step=rows_per_step,
+                rows_cumulative=rows_cumulative,
                 dec_steps=dec_steps,
+                window_steps=window_steps,
+                budget=f"{'unlimited' if budget is None else budget}({budget_why})",
                 old_p2l=old_p2l,
                 new_p2l=p2l,
                 moved=moved,
@@ -2508,6 +2760,11 @@ class EPLBManager:
                 )
         if gp is not None:
             gp.after_rebalance()
+        if old_p2l is not None and experts_moved:
+            # Experts moved and every chunk is committed: a rebalance, the
+            # kind ATOM_EPLB_MAX_REBALANCES counts.
+            self._rebalance_count += 1
+            self._experts_moved_total += experts_moved
         if old_p2l is not None and _ep_rank == 0:
             logger.info(
                 "%s rebalance #%d done: %d layers migrated in %d chunks, "
@@ -2590,6 +2847,9 @@ class EPLBManager:
     def _fatal_stop(self, why: str) -> None:
         """Latch rebalancing off for the life of the process, loudly."""
         self._rebalancing_stopped = True
+        self._fatal = True
+        if self.gate_permute is not None:
+            self.gate_permute.watching = False
         logger.error(
             "%s FATAL rebalance #%d ep_rank=%d: %s. Rebalancing is stopped "
             "for good; the placement stays as it is now.",
@@ -2599,6 +2859,143 @@ class EPLBManager:
             why,
         )
 
+    def _window_picks(self, pf: Any, dec: Any) -> tuple[Any, Any]:
+        """Rank 0: what the loads ``pf`` / ``dec`` (numpy, the group's sums)
+        gained since the last evaluation or observation, which becomes this
+        one. The loads themselves for the first, and for loads that do not
+        only grow (ATOM_EPLB_STATS_CUMULATIVE=0)."""
+        base = self._window_base
+        self._window_base = (pf.copy(), dec.copy())
+        if base is not None:
+            window = pf - base[0], dec - base[1]
+            if window[0].min() >= 0 and window[1].min() >= 0:
+                return window
+        return pf, dec
+
+    def _dump_window(
+        self,
+        kind: str,
+        rows_per_step: float,
+        pf: Any,
+        dec: Any,
+        p2l_before: Any,
+        p2l_after: Any,
+        executed: bool,
+        **extra: Any,
+    ) -> tuple[Any, Any]:
+        """Rank 0: this evaluation's or observation's window, saved under
+        ATOM_EPLB_DUMP_DIR where that is set; returns the window's picks.
+        Host data only (the loads are on the host for the log already)."""
+        window_pf, window_dec = self._window_picks(pf, dec)
+        directory = envs.ATOM_EPLB_DUMP_DIR
+        if not directory:
+            return window_pf, window_dec
+        import os
+        import time as _time
+
+        def counts(array):
+            return torch.from_numpy(array.astype("int64"))
+
+        self._dumps += 1
+        os.makedirs(directory, exist_ok=True)
+        torch.save(
+            {
+                "kind": kind,
+                "seq": self._dumps,
+                "t": _time.time(),
+                "steps": self._steps,
+                "rows_per_step_window": float(rows_per_step),
+                "prefill_counts_window": counts(window_pf),
+                "decode_counts_window": counts(window_dec),
+                "prefill_counts_cum": counts(pf),
+                "decode_counts_cum": counts(dec),
+                "p2l_before": counts(p2l_before),
+                "p2l_after": counts(p2l_after),
+                "executed": bool(executed),
+                **extra,
+            },
+            os.path.join(directory, f"window_{self._dumps:05d}.pt"),
+        )
+        return window_pf, window_dec
+
+    def _observe(self) -> None:
+        """A frozen placement's observation (ATOM_EPLB_FROZEN_OBSERVE_STEPS):
+        the loads reduced over the group as a rebalance reduces them, and on
+        rank 0 the metrics of the frozen placement, the identity and
+        ATOM_EPLB_REF_PLACEMENT's on the picks of this window alone, at its
+        own decode rows a step. Nothing is solved or moved."""
+        gp = self.gate_permute
+        meta = self.live_metadata
+        assert gp is not None and meta is not None
+        load = (
+            None if gp.pf_total is not None else self.monitor.dump_global_logical_load()
+        )
+        dec_load, pf_total, rows_cumulative, _, rows_per_step, window_steps = (
+            gp.dump_global(self.monitor._load_group)
+        )
+        gp.start_window()
+        self._observations += 1
+        self._rows_cumulative = rows_cumulative
+        if meta.ep_rank != 0:
+            return
+        tag, index = gate_permute.TAG, self._observations
+        try:
+            pf_load = pf_total if pf_total is not None else load
+            pf = pf_load.detach().to("cpu").numpy().astype("float64")
+            dec = dec_load.detach().to("cpu").numpy().astype("float64")
+            if rows_per_step <= 0:
+                rows_per_step = self._rows_at_last_solve or 0.0
+            p2l = meta.physical_to_logical_map.to("cpu").numpy()
+            window_pf, window_dec = self._dump_window(
+                "observe", rows_per_step, pf, dec, p2l, p2l, False, observe=index
+            )
+            logger.info(
+                "%s observe #%d: frozen since rebalance #%d | window prefill "
+                "picks=%d decode picks=%d decode samples/rank=%d rows/step=%.1f "
+                "cum=%.1f",
+                tag,
+                index,
+                self._evaluations,
+                int(window_pf.sum()),
+                int(window_dec.sum()),
+                window_steps,
+                rows_per_step,
+                rows_cumulative,
+            )
+            layer_ids = sorted(self._moe_layers)
+            per_rank = meta.num_local_physical_experts
+            top_k = int(self._moe_layers[layer_ids[0]].top_k)
+            frozen = gate_permute.ranks_of(p2l, per_rank)
+            identity = frozen * 0 + (
+                torch.arange(meta.num_logical_experts).numpy() // per_rank
+            )
+            tables = [("frozen", frozen, layer_ids), ("identity", identity, layer_ids)]
+            if self._reference_ranks:
+                reference = identity.copy()
+                covered = [i for i in layer_ids if i in self._reference_ranks]
+                for i in covered:
+                    reference[i] = self._reference_ranks[i]
+                tables.append((f"ref[{len(covered)} layers]", reference, covered))
+            for name, rk, ids in tables:
+                if ids:
+                    logger.info(
+                        "%s observe #%d metrics %-8s: %s",
+                        tag,
+                        index,
+                        name,
+                        gate_permute.metrics_line(
+                            window_pf,
+                            window_dec,
+                            rows_per_step,
+                            rk,
+                            ids,
+                            meta.ep_size,
+                            top_k,
+                        ),
+                    )
+        except Exception as exc:  # noqa: BLE001  # pragma: no cover - diagnostic only
+            logger.warning("%s observe #%d failed: %s", tag, index, exc)
+
     def _log_gate_permute_plan(
         self,
         *,
@@ -2606,7 +3003,10 @@ class EPLBManager:
         pf_load: torch.Tensor,
         dec_load: torch.Tensor | None,
         rows_per_step: float,
+        rows_cumulative: float,
         dec_steps: int,
+        window_steps: int,
+        budget: str,
         old_p2l: torch.Tensor,
         new_p2l: torch.Tensor,
         moved: list[int],
@@ -2636,8 +3036,8 @@ class EPLBManager:
             logger.info(
                 "%s rebalance #%d: policy=%s swaps sum=%d max=%d "
                 "layers_changed=%d/%d experts_moved=%d | prefill picks=%d "
-                "decode picks=%d decode samples/rank=%d rows/step=%.1f | "
-                "solve=%.1fms",
+                "decode picks=%d decode samples/rank=%d rows/step=%.1f "
+                "cum=%.1f window samples/rank=%d budget=%s | solve=%.1fms",
                 tag,
                 rc,
                 self.placement_policy,
@@ -2650,6 +3050,9 @@ class EPLBManager:
                 int(dec.sum()),
                 dec_steps,
                 rows_per_step,
+                rows_cumulative,
+                window_steps,
+                budget,
                 solve_ms,
             )
             logger.info(
@@ -2660,8 +3063,20 @@ class EPLBManager:
             )
             per_rank = meta.num_local_physical_experts
             top_k = int(self._moe_layers[layer_ids[0]].top_k)
-            before = gate_permute.ranks_of(old_p2l.to("cpu").numpy(), per_rank)
-            after = gate_permute.ranks_of(new_p2l.to("cpu").numpy(), per_rank)
+            p2l_before = old_p2l.to("cpu").numpy()
+            p2l_after = new_p2l.to("cpu").numpy()
+            self._dump_window(
+                "rebalance",
+                rows_per_step,
+                pf,
+                dec,
+                p2l_before,
+                p2l_after,
+                executed=any(moved[i] for i in layer_ids),
+                rebalance=rc,
+            )
+            before = gate_permute.ranks_of(p2l_before, per_rank)
+            after = gate_permute.ranks_of(p2l_after, per_rank)
             identity = before * 0 + (
                 torch.arange(meta.num_logical_experts).numpy() // per_rank
             )
@@ -2930,7 +3345,7 @@ def with_eplb_forward_monitor(fn):
         # rebalancing has stopped: any other forward leaves the pass buffer
         # alone (a pure-prefill pass, the only one committed, clears it first).
         counting = manager.gate_permute is None or (
-            not manager.rebalancing_stopped
+            manager.gate_permute.counting
             and getattr(batch, "total_tokens_num_prefill", 0) > 0
         )
         if counting:

@@ -365,6 +365,26 @@ def reference_ranks(
     return out
 
 
+# ---------------------------------------------------------------- operating point
+def rows_per_step(rows: int, steps: int, world: int) -> float:
+    """The group's rows a step from the ranks' summed rows and steps (every
+    rank counts the same steps, so the steps of one are ``steps / world``)."""
+    return rows * world / steps if steps > 0 else 0.0
+
+
+def drifted(now: float, last: float, drift: float) -> bool:
+    """Whether an operating point of ``now`` rows a step has left the band
+    [1 / (1 + drift), 1 + drift] around ``last``, the one the placement was
+    solved for. No rows then and some now is a drift; none now is not (there
+    is nothing to place for)."""
+    if now <= 0:
+        return False
+    if last <= 0:
+        return True
+    ratio = now / last
+    return ratio > 1.0 + drift or ratio < 1.0 / (1.0 + drift)
+
+
 # ---------------------------------------------------------------- gate rows
 def stage_rows(
     tensors: list[torch.Tensor], old_p2l: torch.Tensor, new_p2l: torch.Tensor
@@ -538,6 +558,19 @@ class GatePermuteRuntime:
         )
         self.dec_rows = 0  # this rank's live rows over the sampled replays
         self.dec_steps = 0  # the sampled replays
+        # The same two since the last rebalance: the operating point the
+        # next one is planned for.
+        self.window_rows = 0
+        self.window_steps = 0
+        # While the placement is frozen and watched (`EPLBManager._watch`):
+        # this rank's live rows and replays since the last check, host
+        # integers that every replay adds to and nothing else.
+        self.watching = False
+        self.watch_rows = 0
+        self.watch_steps = 0
+        # While the placement is frozen and observed: counting and decode
+        # sampling go on as while it was learnt.
+        self.observing = False
         self._replays = 0
         # Request bucket -> [(layer id, the recording's top-k ids)].
         self._captures: dict[Any, list[tuple[int, torch.Tensor]]] = {}
@@ -545,6 +578,12 @@ class GatePermuteRuntime:
         self._capture_key = None
         self._warned: set = set()
         register_graph_holder(self)
+
+    @property
+    def counting(self) -> bool:
+        """Whether loads are being counted: while the placement is learnt,
+        and while a frozen one is observed."""
+        return self.observing or not self.manager.rebalancing_stopped
 
     # -- routing ---------------------------------------------------------
     def owns(self, layer: Any) -> bool:
@@ -559,7 +598,7 @@ class GatePermuteRuntime:
         if self._capture_key is not None:
             self._captures[self._capture_key].append((layer.layer_id, topk_ids))
             return
-        if self.manager.rebalancing_stopped:
+        if not self.counting:
             return
         num_physical = self.meta.num_physical_experts
         if not self.count_triton:
@@ -597,7 +636,10 @@ class GatePermuteRuntime:
         """After the decode request graph ``key`` replayed a step of
         ``scheduled_tokens`` live rows on this rank: every
         ``ATOM_EPLB_DECODE_SAMPLE_EVERY``-th replay is counted."""
-        if self.manager.rebalancing_stopped:
+        if self.watching:
+            self.watch_rows += scheduled_tokens
+            self.watch_steps += 1
+        if self.manager.rebalancing_stopped and not self.observing:
             return
         self._replays += 1
         if self._replays % self.sample_every:
@@ -615,9 +657,11 @@ class GatePermuteRuntime:
             return
         rows = int(scheduled_tokens)
         self.dec_steps += 1
+        self.window_steps += 1
         if rows <= 0:
             return
         self.dec_rows += rows
+        self.window_rows += rows
         self.count_decode(held, rows)
 
     def count_decode(self, held: list[tuple[int, torch.Tensor]], rows: int) -> None:
@@ -677,16 +721,22 @@ class GatePermuteRuntime:
     # -- statistics ------------------------------------------------------
     def dump_global(
         self, group: Any
-    ) -> tuple[torch.Tensor, torch.Tensor | None, float, int]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, float, int, float, int]:
         """The group's sums: decode load [L, Lg], the cumulative prefill load
         (None unless ATOM_EPLB_STATS_CUMULATIVE), the group's live decode rows
-        a sampled step, and the sampled steps of a rank (their mean)."""
+        a sampled step and the sampled steps of a rank (their mean) -- and
+        those two over the samples since the last rebalance (`start_window`),
+        the window's operating point."""
         dev = self.dec_load.device
         parts = [self.dec_load.reshape(-1)]
         if self.pf_total is not None:
             parts.append(self.pf_total.reshape(-1))
         parts.append(
-            torch.tensor([self.dec_rows, self.dec_steps], dtype=torch.int64, device=dev)
+            torch.tensor(
+                [self.dec_rows, self.dec_steps, self.window_rows, self.window_steps],
+                dtype=torch.int64,
+                device=dev,
+            )
         )
         payload = torch.cat(parts)
         world = int(getattr(group, "world_size", 1)) if group is not None else 1
@@ -702,9 +752,57 @@ class GatePermuteRuntime:
         pf = None
         if self.pf_total is not None:
             pf = payload[size : 2 * size].view_as(self.pf_total)
-        rows, steps = (int(v) for v in payload[-2:].tolist())
-        rows_per_step = rows * world / steps if steps > 0 else 0.0
-        return dec, pf, rows_per_step, steps // world
+        rows, steps, window_rows, window_steps = (int(v) for v in payload[-4:].tolist())
+        return (
+            dec,
+            pf,
+            rows_per_step(rows, steps, world),
+            steps // world,
+            rows_per_step(window_rows, window_steps, world),
+            window_steps // world,
+        )
+
+    def start_window(self) -> None:
+        """A rebalance was planned (or the rebalances re-armed): the samples
+        of the next operating point start here."""
+        self.window_rows = self.window_steps = 0
+
+    def reduce_counts(self, group: Any, rows: int, steps: int) -> tuple[int, int, int]:
+        """Two host integers of this rank summed over the group, and the
+        group's size: one collective of two int64, on the group's CPU
+        (gloo) process group where it has one -- nothing touches the GPU."""
+        world = int(getattr(group, "world_size", 1)) if group is not None else 1
+        if world <= 1:
+            return int(rows), int(steps), 1
+        cpu_group = getattr(group, "cpu_group", None)
+        if cpu_group is not None:
+            payload = torch.tensor([rows, steps], dtype=torch.int64)
+            target = cpu_group
+        else:
+            payload = torch.tensor(
+                [rows, steps], dtype=torch.int64, device=self.dec_load.device
+            )
+            target = group.device_group
+        torch.distributed.all_reduce(
+            payload, op=torch.distributed.ReduceOp.SUM, group=target
+        )
+        total_rows, total_steps = (int(v) for v in payload.tolist())
+        return total_rows, total_steps, world
+
+    def take_watch(self, group: Any) -> tuple[float, int]:
+        """The group's live decode rows a step over the replays since the
+        last check, and a rank's replays (their mean); the watch restarts."""
+        rows, steps, world = self.reduce_counts(
+            group, self.watch_rows, self.watch_steps
+        )
+        self.watch_rows = self.watch_steps = 0
+        return rows_per_step(rows, steps, world), steps // world
+
+    def window_samples(self, group: Any) -> int:
+        """The decode samples of a rank since `start_window` (the group's
+        mean)."""
+        _, steps, world = self.reduce_counts(group, self.window_rows, self.window_steps)
+        return steps // world
 
     def after_rebalance(self) -> None:
         """A rebalance is done: the decode samples start afresh (kept under
