@@ -56,7 +56,10 @@ def runtime(monkeypatch):
     state = SimpleNamespace(
         manager=SimpleNamespace(rank=0, world_size=8),
         forward_context=SimpleNamespace(
-            context=None, ubatch_slices=None, in_hipgraph=False
+            context=None,
+            ubatch_slices=None,
+            in_hipgraph=False,
+            draft_graph_warmup=False,
         ),
         tbo=False,
         capturing=False,
@@ -72,6 +75,7 @@ def runtime(monkeypatch):
     monkeypatch.setattr(mega, "_MEGA_CACHE", {})
     monkeypatch.setattr(mega, "_MEGA_CAPACITY_LOGGED", set())
     monkeypatch.setattr(mega, "_MEGA_LAYER_IDS", set())
+    monkeypatch.setattr(mega, "_MEGA_LAYERS_WITHOUT_ID", [])
     monkeypatch.setattr(
         torch.cuda, "is_current_stream_capturing", lambda: state.capturing
     )
@@ -468,6 +472,18 @@ def test_capture_warmup_hints_like_the_capture(runtime):
     ]
 
 
+def test_draft_graph_warmup_hints_like_its_capture(runtime):
+    # A captured draft pass warms eagerly with in_hipgraph False, then records:
+    # its warmup must take the route the recording takes.
+    runtime.forward_context.draft_graph_warmup = True
+    runtime.run(_context(SMALL_M_MTPR, is_draft=True))
+    runtime.run(_context(SMALL_M_MTPR + 1, is_draft=True))
+    runtime.capturing = True
+    runtime.run(_context(SMALL_M_MTPR + 1, is_draft=True))
+
+    assert _events(runtime, "hint") == [SMALL_M_MTPR, None, None]
+
+
 def test_each_layer_selects_the_large_input_slot_of_its_layer_id(runtime):
     # Target layers and the draft layers after them (MTP / DSpark number them
     # num_hidden_layers + i) each own one slot, whatever order they first run in.
@@ -501,11 +517,19 @@ def test_slots_cover_the_layer_ids_built_and_no_more(runtime, monkeypatch):
         )
 
 
-def test_a_mega_layer_without_a_layer_id_is_refused():
-    with pytest.raises(ValueError, match="needs the layer_id.*model.layers.3"):
-        mega.register_mega_layer(
-            SimpleNamespace(layer_id=None, prefix="model.layers.3.mlp.experts")
-        )
+def test_a_layer_without_a_layer_id_is_refused_by_the_large_input_route(runtime):
+    # The DeepSeek-V3/R1 MTP block keeps layer_id None: an instance without the
+    # large-input route selects no slot and serves it; one with it is refused
+    # before it is cached, the same on every rank.
+    mega.register_mega_layer(
+        SimpleNamespace(layer_id=None, prefix="model.layers.61.mlp.experts")
+    )
+    runtime.run(_context(64), mtpr=128)
+    assert _forwarded(runtime) == [128]
+
+    with pytest.raises(ValueError, match="layer_id.*'model.layers.61.mlp.experts'"):
+        runtime.run(_context(512, running_tokens_are_unified=False))
+    assert (0, LARGE_CAPACITY) not in mega._MEGA_CACHE
 
 
 @pytest.mark.parametrize("pcp", [2, 4])
@@ -527,6 +551,20 @@ def test_pcp_merge_hints_the_gathered_padded_rows(runtime, pcp, prefill_rows):
     runtime.run(context, rows=prefill_rows, layer=layer)
 
     assert _events(runtime, "hint") == [padded, padded]
+
+
+@pytest.mark.parametrize(("rows", "capacity"), [(126, 128), (127, LARGE_CAPACITY)])
+def test_pcp_merge_selects_the_decode_capacity_by_the_padded_rows(
+    runtime, rows, capacity
+):
+    # The decode capacity must hold the padded rows the hint names: with PCP 3,
+    # 127 rows pad to 129 > 128 and stay on the configured capacity.
+    runtime.pcp = 3
+    padded = -(-rows // 3) * 3
+    runtime.run(_context(rows), rows=padded, layer=_layer(pcp_merge=True))
+
+    assert _forwarded(runtime) == [capacity]
+    assert _events(runtime, "hint") == [padded]
 
 
 def test_unpadded_hint_is_refused_by_the_route_bounds(runtime):
@@ -589,19 +627,10 @@ def test_draft_pass_hints_its_own_rows(runtime, context, hint):
 
 
 @pytest.mark.parametrize(
-    ("arch", "num_cu", "mtpr", "fused"),
-    [
-        ("gfx950", 256, LARGE_CAPACITY, True),
-        ("gfx950:sramecc+:xnack-", 256, 128, True),
-        # Without the small-input route only a large-input capacity fuses.
-        ("gfx950", 304, LARGE_CAPACITY, True),
-        ("gfx950", 304, 32768, False),
-        ("gfx942", 304, LARGE_CAPACITY, False),
-    ],
+    ("arch", "fused"),
+    [("gfx950", True), ("gfx950:sramecc+:xnack-", True), ("gfx942", False)],
 )
-def test_fused_route_is_decided_by_aiter_queries(
-    monkeypatch, arch, num_cu, mtpr, fused
-):
+def test_fused_route_is_decided_by_aiter_query(monkeypatch, arch, fused):
     layout = {
         "world_size": 8,
         "model_dim": 7168,
@@ -626,15 +655,47 @@ def test_fused_route_is_decided_by_aiter_queries(
     stub_module(
         "aiter.ops.flydsl.kernels.mega_moe.mega_moe_config",
         fused_layout_supported=fused_layout_supported,
-        large_m_mtprs_for=lambda **_: (1024, 2048, 4096, 8192, 16384),
-        small_m_cu_supported=lambda cu: cu == 256,
-    )
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda _: SimpleNamespace(multi_processor_count=num_cu),
     )
 
-    assert mega.mega_builds_fused_route(mtpr=mtpr, **layout) is fused
+    assert mega.mega_builds_fused_route(**layout) is fused
     assert queried == [layout]
+
+
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("num_cu", [256, 304])
+@pytest.mark.parametrize("mtpr", [128, 1024, LARGE_CAPACITY, 32768])
+@pytest.mark.parametrize("decode_mtpr", [128, 1024])
+def test_fused_route_query_covers_every_instance_built(
+    runtime, monkeypatch, fused, num_cu, mtpr, decode_mtpr
+):
+    # The instances run_mega_moe builds, each deciding its routes the way
+    # AITER's MegaMoEV2.__init__ does (routed=True): a fused route in any of
+    # them -- the decode capacity's large-input one included -- must be
+    # answered by mega_builds_fused_route, and on 256-CU parts (the small-input
+    # route) no other answer is given.
+    monkeypatch.setattr(mega, "_MEGA_DECODE_MTPR", decode_mtpr)
+    large_m_mtprs = (1024, 2048, 4096, 8192, 16384)
+
+    def fused_routes(capacity):
+        small = fused and num_cu == 256
+        large = fused and capacity in large_m_mtprs
+        return small, large
+
+    built = []
+    real_get_or_build = mega.get_or_build_mega_moe
+
+    def get_or_build(**kwargs):
+        instance = real_get_or_build(**kwargs)
+        small, large = fused_routes(kwargs["mtpr"])
+        instance.small_m_mtpr = min(512, kwargs["mtpr"]) if small else 0
+        instance.large_m = large
+        built.append(instance)
+        return instance
+
+    monkeypatch.setattr(mega, "get_or_build_mega_moe", get_or_build)
+    runtime.run(_context(64), mtpr=mtpr)
+    holds_fused = any(i.small_m_mtpr or fused_routes(i.capacity)[1] for i in built)
+
+    assert not holds_fused or fused
+    if num_cu == 256:
+        assert holds_fused is fused

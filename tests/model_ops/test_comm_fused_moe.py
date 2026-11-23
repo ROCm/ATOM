@@ -1392,15 +1392,9 @@ def test_dsv2_moe_keeps_shared_experts_single_stream_when_its_experts_refuse(
     assert ("model.layers.3.mlp" in forward_context) is not refuses
 
 
-@pytest.mark.parametrize("fused", [False, True])
-def test_mega_method_refuses_a_concurrent_shared_stream_on_a_fused_route(
-    monkeypatch, atom_modules, fused
-):
-    """Only a layout AITER builds a fused MegaMoEV2 route for refuses; other
-    MoE methods always allow the side stream. The experts ask their method."""
+def _stub_fused_route_query(monkeypatch, fused):
     import atom.model_ops.fused_moe.flydsl_mega_experts as mega
 
-    moe_ops = atom_modules.moe
     queried = []
 
     def mega_builds_fused_route(**layout):
@@ -1408,26 +1402,98 @@ def test_mega_method_refuses_a_concurrent_shared_stream_on_a_fused_route(
         return fused
 
     monkeypatch.setattr(mega, "mega_builds_fused_route", mega_builds_fused_route)
+    return queried
+
+
+_V4_PRO_MOE = SimpleNamespace(ep_size=8, num_experts=384, experts_per_token=6)
+_V4_PRO_LAYOUT = {
+    "world_size": 8,
+    "model_dim": 7168,
+    "inter_dim": 3072,
+    "experts": 384,
+    "topk": 6,
+    "quant": "a8w4",
+    "swiglu_limit": 10.0,
+}
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_mega_method_refuses_a_concurrent_shared_stream_on_a_fused_route(
+    monkeypatch, atom_modules, fused
+):
+    """Only a layout AITER builds a fused MegaMoEV2 route for refuses; other
+    MoE methods always allow the side stream. The experts ask their method."""
+    moe_ops = atom_modules.moe
+    queried = _stub_fused_route_query(monkeypatch, fused)
     method = object.__new__(moe_ops.MegaMxfp4MoEMethod)
-    method.moe = SimpleNamespace(
-        ep_size=8, num_experts=384, experts_per_token=6, max_num_tokens=16384
-    )
+    method.moe = _V4_PRO_MOE
     method.hidden_size = 7168
     method.intermediate_size = 3072
-    experts = SimpleNamespace(quant_method=method, swiglu_limit=10.0)
+    experts = SimpleNamespace(
+        quant_method=method,
+        swiglu_limit=10.0,
+        _online_quant_method_cls=lambda: None,
+    )
 
     assert moe_ops.FusedMoE.allows_concurrent_shared_stream.fget(experts) is not fused
-    assert queried == [
-        {
-            "world_size": 8,
-            "model_dim": 7168,
-            "inter_dim": 3072,
-            "experts": 384,
-            "topk": 6,
-            "quant": "a8w4",
-            "swiglu_limit": 10.0,
-            "mtpr": 16384,
-        }
-    ]
+    assert queried == [_V4_PRO_LAYOUT]
     other = object.__new__(moe_ops.Mxfp4MoEMethod)
     assert other.allows_concurrent_shared_stream(experts)
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_experts_quantizing_online_into_mega_answer_by_the_mega_method(
+    monkeypatch, atom_modules, fused
+):
+    """NVFP4 / BF16 experts that `_online_quant` switches to the Mega method
+    answer by it at model init, not by the source method they still hold."""
+    moe_ops = atom_modules.moe
+    queried = _stub_fused_route_query(monkeypatch, fused)
+    source = object.__new__(moe_ops.Nvfp4MoEMethod)
+    experts = SimpleNamespace(
+        quant_method=source,
+        swiglu_limit=10.0,
+        moe_config=_V4_PRO_MOE,
+        hidden_size=7168,
+        intermediate_size_per_partition=3072,
+        _online_quant_method_cls=lambda: moe_ops.MegaMxfp4MoEMethod,
+    )
+
+    assert moe_ops.FusedMoE.allows_concurrent_shared_stream.fget(experts) is not fused
+    assert queried == [_V4_PRO_LAYOUT]
+
+
+@pytest.mark.parametrize(
+    ("online", "target_dtype", "skip", "backend", "expected"),
+    [
+        (False, "fp4x2", False, "mega", None),
+        (True, "fp8", False, "mega", None),
+        (True, "fp4x2", True, "mega", None),
+        (True, "fp4x2", False, "aiter", "Mxfp4MoEMethod"),
+        (True, "fp4x2", False, "mega", "MegaMxfp4MoEMethod"),
+    ],
+)
+def test_online_quant_method_class_follows_the_online_switch(
+    monkeypatch, atom_modules, online, target_dtype, skip, backend, expected
+):
+    moe_ops = atom_modules.moe
+    target = SimpleNamespace(quant_dtype=getattr(moe_ops.dtypes, target_dtype))
+    experts = SimpleNamespace(
+        online_quant=online,
+        layer_name="model.layers.3.ffn.experts",
+        quant_config=SimpleNamespace(
+            get_layer_quant_config=lambda name, use_online_quant: target
+        ),
+        layer_quant_config=SimpleNamespace(quant_type="source"),
+        params_dtype="source",
+    )
+    monkeypatch.setattr(moe_ops, "should_skip_online_quant", lambda *_: skip)
+    monkeypatch.setattr(
+        moe_ops,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(moe_backend=backend),
+    )
+    monkeypatch.setattr(moe_ops, "sp_is_enabled", lambda: False)
+
+    cls = moe_ops.FusedMoE._online_quant_method_cls(experts)
+    assert (cls and cls.__name__) == expected
