@@ -474,7 +474,6 @@ def validate_runtime_config(config):
                 or config.parallel_config.data_parallel_size != 1
             ),
         ),
-        ("EPLB", config.eplb_enable),
         (
             # The plane the paged scorer reads: FP8, or FP4 in the row-group
             # scorer's page-8 layout (`index_plane`). The main pool stays
