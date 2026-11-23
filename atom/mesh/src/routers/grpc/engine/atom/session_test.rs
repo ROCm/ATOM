@@ -89,6 +89,7 @@ impl AtomEngine for FakeAtom {
             protocol_version: PROTOCOL_VERSION,
             kv_transfer_info_json: self.kv_transfer_info.clone(),
             server_info_json: "{}".into(),
+            ..Default::default()
         }))
     }
 
