@@ -2883,7 +2883,13 @@ def _rule_head(text):
             return m.group(1) if m.group(1) in REFUSED_IDS else None
         citation = CITATION.match(rest)
         if citation:
-            rest = re.sub(r"^[\s*`_]*(?::)?\s*", "", rest[citation.end():])
+            # Strip exactly what `_publish.first_clause` strips after the citation: the
+            # rest of a line range, and a comma or a dash as well as a colon. It drops
+            # `(?:-\d+)?` and `[,:]`, so `foo.py:563-569 A5: …` still reached the reader
+            # as `A5: …` -- the id-led line this gate exists to refuse. Range citations
+            # are common; real bot cards carry 74 of them.
+            rest = re.sub(r"^(?:-\d+)?[\s*`_]*(?:[,:]|—|–|--)?\s*", "",
+                          rest[citation.end():])
             continue
         g = LEAD_GROUP.match(rest)
         if not g:

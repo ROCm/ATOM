@@ -627,19 +627,22 @@ forms = ["**[verified] B1:** x", "**[verified]** B1: x", "`[verified]` B1: x",
          "B1 (silent bypass): x", "[B1/B2] x", "B1 The condition is wrong",
          "B1 `foo.py:3` drops it", "B1.", "B1 = broken", "B1 → broken",
          "B1+D4:", "B1 FIRE:", "`foo.py:3`: A5: broken",
-         "foo.py:3 A5: broken", "foo.py:3 (A5)", "[verified, A5] broken"]
+         "foo.py:3 A5: broken", "foo.py:3 (A5)", "[verified, A5] broken",
+         "atom/foo.py:563-569 A5: broken", "`atom/foo.py:563`, A5: broken",
+         "foo.py:563 — A5: broken"]
 print(sum(1 for f in forms if triage._rule_head(f)))' "$S"
 }
-t "a rule id hidden behind decoration or a citation is still refused" "$(_head_forms)" "22"
+t "a rule id hidden behind decoration or a citation is still refused" "$(_head_forms)" "25"
 _head_passes() {  # -> how many ordinary openings are left alone
   python3 -c '
 import sys; sys.path.insert(0, sys.argv[1]); import triage
 forms = ["FP8: x", "MI300: x", "[verified] x.py:1 drops it", "The caller must hold it",
          "[inferred] planner.rs:108 charges only on req.stream",
-         "FP8 scale is wrong", "MI300 support is missing"]
+         "FP8 scale is wrong", "MI300 support is missing",
+         "foo.py:3 — the E2E path never runs", "foo.py:3-5 TP8 is off by one"]
 print(sum(1 for f in forms if triage._rule_head(f) is None))' "$S"
 }
-t "and an ordinary opening is left alone" "$(_head_passes)" "7"
+t "and an ordinary opening is left alone" "$(_head_passes)" "9"
 # One shared 4-letter word was far too loose. SKILL.md mandates "**Author must**" on
 # every finding, so `must` alone let any finding claim any path-less FIRE whose reason
 # used it -- silencing the UNREPORTED-FIRE that should have fired for the other rule.
