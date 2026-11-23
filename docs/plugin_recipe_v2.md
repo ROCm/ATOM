@@ -63,6 +63,11 @@ weights layout, loader, runtime (graphs, bounded replay, guarded ops) and mono d
 }
 ```
 
+- `env` (v2 only): the native switches the deployment needs (`ATOM_*`, `AITER_*`, `FLYDSL_*`,
+  `PYTORCH_*`, `HIP_*`, `HSA_*`, `GPU_*`, `NCCL_*`, `RCCL_*`, `TORCH_*`; never `ATOM_PLUGIN_*`),
+  set once by the server's main process before any worker starts. A name the environment
+  already sets to another value refuses the recipe (`recipe-env-conflict`). Part of the plan id;
+  fixed for hot-plug.
 - `plugins` is optional in v2: every owner named under `seams` / `modules` is a layer
   plugin, every name under `aiter` an AITER provider. A v1 recipe stays valid as is.
 - Every option is off by default; an unknown option, or a wrong type, refuses the recipe.
