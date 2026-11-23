@@ -30,7 +30,9 @@ pub(crate) mod tool_constraints;
 #[cfg(test)]
 mod tests;
 
-use chat_template::{default_template_kwargs, process_chat_messages_with_defaults};
+use chat_template::{
+    atom_worker_without_template, default_template_kwargs, process_chat_messages_with_defaults,
+};
 use generation_payload::{GenerationPayload, LogprobConfig, SamplingParams, StopConfig};
 use response_context::{ProtocolRequest, ResponseContext};
 use stop_decoder_builder::create_stop_decoder;
@@ -59,8 +61,20 @@ pub fn prepare_chat(
         error!("model_id not set");
         error::internal_error("model_id_not_set", "model_id not set in request")
     })?;
-    let tokenizer = lookup_tokenizer(model_id_str, &components.tokenizer_registry)?;
     let workers = components.worker_registry.get_by_model(model_id_str);
+    let configured_template = components.router_config.chat_template.is_some();
+    if let Some(worker) = atom_worker_without_template(&workers, configured_template) {
+        return Err(error::not_implemented(
+            "chat_template_unavailable",
+            format!(
+                "Chats for model {model_id_str} are not served over gRPC: its ATOM worker {} \
+                 renders them without a chat template, which atomesh needs. Route its chats \
+                 to ATOM over HTTP; completions are served over gRPC.",
+                worker.url()
+            ),
+        ));
+    }
+    let tokenizer = lookup_tokenizer(model_id_str, &components.tokenizer_registry)?;
     let default_kwargs = default_template_kwargs(&workers)
         .map_err(|e| error::internal_error("invalid_default_template_kwargs", e))?;
 
