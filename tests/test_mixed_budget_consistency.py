@@ -60,9 +60,8 @@ def test_schedule_passes_reserved_limits_to_every_prefill_probe(monkeypatch, pro
     seen = []
 
     def checked(*args, **kwargs):
-        limits = kwargs.get("limits", args[0] if args else None)
-        seen.append(limits)
-        assert limits == expected
+        seen.append(sched.block_manager.reserved_decode_blocks)
+        assert seen[-1] == expected.reserved_decode_blocks
         return original(*args, **kwargs)
 
     monkeypatch.setattr(sched, probe, checked)
@@ -96,11 +95,13 @@ def test_all_prefill_probes_protect_decode_pages(prefix):
     limits = sched._prefill_limits()
     assert limits.reserved_decode_blocks == 1
     assert sched.block_manager.can_allocate_memoized(waiting) == 0
-    assert sched._probe_hbm_prefix(waiting, limits=limits).num_cached_blocks == -1
-    assert not sched._can_admit_head_prefill(limits)
+    sched.block_manager.reserved_decode_blocks = limits.reserved_decode_blocks
+    assert sched._probe_hbm_prefix(waiting).num_cached_blocks == -1
+    assert not sched._can_admit_head_prefill()
     assert sched._probe_local_prefill_work(limits) == (False, 0)
     assert sched._estimate_prefill_chunk_cost(limits) == 0
     # The prefix walk may stay cached; reservation-sensitive fit must not.
+    sched.block_manager.reserved_decode_blocks = 0
     assert sched.block_manager.can_allocate_memoized(waiting) == 0
 
 
@@ -109,13 +110,15 @@ def test_probe_demand_excludes_reserved_decode_pages(prefix):
     bm = BlockManager(MockConfig(num_kvcache_blocks=3, enable_prefix_caching=prefix))
     seq = Sequence(list(range(8)), block_size=4)
     probe = AdmissionProbe()
-    assert bm.can_allocate(seq, probe=probe, reserved_decode_blocks=1) == 0
+    bm.reserved_decode_blocks = 1
+    assert bm.can_allocate(seq, probe=probe) == 0
     assert probe.num_new_blocks == 2
     assert bm.allocate(seq, probe.num_cached_blocks)
     assert bm.kv.num_free == 1
 
     next_seq = Sequence(list(range(10, 14)), block_size=4)
-    assert bm.can_allocate(next_seq, reserved_decode_blocks=1) == -1
+    assert bm.can_allocate(next_seq) == -1
+    bm.reserved_decode_blocks = 0
     assert bm.can_allocate(next_seq) == 0
 
 
@@ -338,3 +341,54 @@ def test_mixed_profile_is_not_charged_to_graph_pools(
     assert result["num_kvcache_blocks"] == 60
     assert profile.call_count == 1
     assert sum("Memory budget:" in r.message for r in caplog.records) == 1
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_remote_completion_reservation_covers_both_promotion_phases(
+    monkeypatch, failed
+):
+    from test_mixed_kv_owners import decode, receive, scheduler
+
+    sched = scheduler(offload=failed)
+    old = decode(sched)
+    incoming = receive(sched, ready=not failed)
+    if failed:
+        sched.failed_recving_kv_req_ids.append(str(incoming.id))
+    before = sched._prioritize_ready_remote_kv_requests
+    after = sched._early_load_tier_prefixes
+    seen = []
+
+    def prioritized():
+        assert sched.block_manager.reserved_decode_blocks > 0
+        seen.append("before")
+        return before()
+
+    def admitted():
+        limits = sched._prefill_limits()
+        assert (
+            sched.block_manager.reserved_decode_blocks == limits.reserved_decode_blocks
+        )
+        seen.append("after")
+        return after()
+
+    monkeypatch.setattr(sched, "_prioritize_ready_remote_kv_requests", prioritized)
+    monkeypatch.setattr(sched, "_early_load_tier_prefixes", admitted)
+    batch, _ = sched.schedule()
+    assert seen == ["before", "after"] and old.id in batch.req_ids
+    assert incoming.id in batch.req_ids
+    assert sched.block_manager.reserved_decode_blocks == 0
+
+
+def test_admission_exception_releases_tick_reservation(monkeypatch):
+    sched = Scheduler(MockConfig(enable_mixed_prefill_decode=True))
+    _decode(sched, 3)
+    sched.add(Sequence([20] * 8, block_size=4))
+
+    def fail():
+        assert sched.block_manager.reserved_decode_blocks > 0
+        raise RuntimeError("admission failed")
+
+    monkeypatch.setattr(sched, "_early_load_tier_prefixes", fail)
+    with pytest.raises(RuntimeError, match="admission failed"):
+        sched.schedule()
+    assert sched.block_manager.reserved_decode_blocks == 0

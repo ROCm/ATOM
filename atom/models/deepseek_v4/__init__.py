@@ -21,7 +21,7 @@ import os
 from collections.abc import Iterable
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
-from functools import lru_cache
+from functools import lru_cache, partial
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
@@ -1925,6 +1925,9 @@ class DeepseekV4Attention(nn.Module):
         )
         self.layer_name = prefix
         atom_config = get_current_atom_config()
+        if atom_config.enable_mixed_prefill_decode:
+            self.forward_impl_default = self.forward_impl
+            self.forward_impl = self._forward_impl_mixed
         atom_config.compilation_config.static_forward_context[self.layer_name] = self
         # Frozen bool: when KV cache dtype is fp8, route writes/attention to the
         # native 2buff fp8 path (compute-only 2buff quant, op4 fp8 prefill, op5
@@ -2364,22 +2367,25 @@ class DeepseekV4Attention(nn.Module):
         if fc.context.is_dummy_run or os.environ.get("ATOM_V4_BYPASS_ATTN") == "1":
             return torch.zeros_like(x)
 
-        if fc.context.is_prefill and fc.attn_metadata.is_mixed:
-            # Each half owns its compressor plan; the carrier has none.
-            q, kv_pre, qr, qr_scale, *_ = self._attn_pre(
-                x, positions, run_indexer_proj=False
-            )
-            o = self._attn_mixed(
-                fc.attn_metadata, q, kv_pre, qr, qr_scale, x, positions
-            )
-            return self._attn_post(o, positions)
-
         self._launch_compressors(x)
         q, kv_pre, qr, qr_scale, *_ = self._attn_pre(
             x, positions, run_indexer_proj=False
         )
         qkn = self._qk_norm_rope(q, kv_pre, positions)
         o = self._sparse_attention(qkn, positions, x=x, qr=qr, qr_scale=qr_scale)
+        return self._attn_post(o, positions)
+
+    def _forward_impl_mixed(self, x: torch.Tensor, positions: torch.Tensor):
+        fc = get_forward_context()
+        if fc.context.is_dummy_run or os.environ.get("ATOM_V4_BYPASS_ATTN") == "1":
+            return torch.zeros_like(x)
+        if not fc.attn_metadata.is_mixed:
+            return self.forward_impl_default(x, positions)
+        # Each half owns its compressor plan; the carrier has none.
+        q, kv_pre, qr, qr_scale, *_ = self._attn_pre(
+            x, positions, run_indexer_proj=False
+        )
+        o = self._attn_mixed(fc.attn_metadata, q, kv_pre, qr, qr_scale, x, positions)
         return self._attn_post(o, positions)
 
     def _attn_mixed(
@@ -2407,7 +2413,7 @@ class DeepseekV4Attention(nn.Module):
             idx_q_quant, idx_weights, idx_q_scale = self.indexer.forward_pre(
                 x, qr, positions, qr_scale
             )
-        qkn = self._qk_norm_rope(q, kv_pre, positions, mixed=True)
+        qkn = self._qk_norm_rope(q, kv_pre, positions, True)
 
         # Each segment writes only its own rows, preserving the other query slice.
         out = qkn.q_sa
@@ -2442,6 +2448,7 @@ class DeepseekV4Attention(nn.Module):
                     idx_q_scale=None if idx_q_scale is None else idx_q_scale[sl],
                     x=x[sl],
                     out=out[sl],
+                    decode=partial(sparse_attn_v4_paged_decode, out=out[sl]),
                 )
 
         with _mixed_span(f"mixed[n_p={n_p} n_d={n_d}]"):
@@ -2454,7 +2461,6 @@ class DeepseekV4Attention(nn.Module):
         q: torch.Tensor,
         kv_pre: torch.Tensor,
         positions: torch.Tensor,
-        *,
         mixed: bool = False,
     ) -> "QKNormRopeOut":
         """The fused QK-norm/RoPE (+ decode SWA write). Single source.
@@ -2550,14 +2556,14 @@ class DeepseekV4Attention(nn.Module):
         qr: torch.Tensor | None = None,  # FULL only, same
         qr_scale: torch.Tensor | None = None,  # FULL only, same
         out: torch.Tensor | None = None,
+        decode=sparse_attn_v4_paged_decode,
     ) -> torch.Tensor:
         """The TOKEN-shaped tail: indexer top-k, CSA pack, the paged attention, and
         prefill's SWA write.
 
         ``out``, when given, is the ``[num_tokens, n_local_heads, head_dim]``
-        buffer the attention lands in -- a mixed batch's segment of the whole
-        batch's output (`_attn_mixed`). Every attention backend writes directly
-        into the supplied buffer and returns it.
+        prefill destination. Mixed decode binds its destination to ``decode``
+        in `_attn_mixed`, keeping the ordinary decode kernel call unchanged.
 
         Every launch here is sized by the token count -- `csa_translate_pack`'s grid
         is `(T, ...)`, the paged kernels take `N = qo_indptr.numel()-1`, the FP8
@@ -2584,8 +2590,6 @@ class DeepseekV4Attention(nn.Module):
             # warmup runs before allocate_kv_cache: `unified_kv` is unbound and
             # the paged kernels would read OOB. Same guard the core has always
             # carried; this half now runs outside it. See `_qk_norm_rope`.
-            if out is not None:
-                return out.zero_().view(num_tokens, -1)
             return q_rows.new_zeros(
                 (num_tokens, self.n_local_heads * self.head_dim),
                 dtype=torch.bfloat16,
@@ -2636,7 +2640,7 @@ class DeepseekV4Attention(nn.Module):
             # (unified_kv_rope set) → aiter ASM with pre-packed fp8 Q + the
             # 2buff fp8/bf16 pools read with no requant. The optional H=128
             # prefill-ASM decode route also consumes the shared empty CSR.
-            o = sparse_attn_v4_paged_decode(
+            o = decode(
                 qkn.q_sa,
                 self.unified_kv,
                 kv_indices,
@@ -2651,7 +2655,6 @@ class DeepseekV4Attention(nn.Module):
                 prefix=f"{self.layer_name}.sparse_attn_decode",
                 split_plan=split_plan,
                 compress_ratio=ratio,
-                out=out,
             )  # [S, H, head_dim]
         else:
             # Two-source paged prefill: prefix from `unified_kv` (per-ratio

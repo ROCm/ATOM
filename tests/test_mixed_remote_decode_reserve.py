@@ -98,13 +98,3 @@ def test_pure_decode_skips_prefill_reservation(monkeypatch, mixed, receiving):
 
     assert batch.total_seqs_num_decode == 1
     reserve.assert_not_called()
-
-
-def test_can_append_keeps_inline_admission(monkeypatch):
-    sched = Scheduler(MockConfig())
-    seq = Sequence([3] * 4, block_size=4)
-    assert sched.block_manager.allocate(seq, 0)
-    reserve = Mock(side_effect=AssertionError("decode admission must stay inline"))
-    monkeypatch.setattr(sched.block_manager, "append_blocks_needed", reserve)
-    assert sched.block_manager.can_append(seq)
-    reserve.assert_not_called()

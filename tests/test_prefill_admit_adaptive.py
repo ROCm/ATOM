@@ -49,7 +49,7 @@ def _run(a_us, t0_us, c_us, lam, ticks=6000, seed=0, b0=300):
             running_decode_batch=running,
             waiting_requests=waiting,
             admittable_requests=waiting,
-            prefill_budget=d.max_num_batched_tokens,
+            prefill_budget=16384,
         )
         if dec.allow and waiting > 0:
             toks = 400 * waiting
@@ -110,7 +110,7 @@ def test_no_admittable_holds_without_regret():
         prefillable=True,
         pending_tokens=1,
         running_decode_batch=10,
-        prefill_budget=d.max_num_batched_tokens,
+        prefill_budget=16384,
     )
     for _ in range(50):
         dec = d.should_allow_prefill(
@@ -119,7 +119,7 @@ def test_no_admittable_holds_without_regret():
             running_decode_batch=100,
             waiting_requests=5,
             admittable_requests=0,
-            prefill_budget=d.max_num_batched_tokens,
+            prefill_budget=16384,
         )
         assert not dec.allow
     assert d._adapt_regret == 0.0

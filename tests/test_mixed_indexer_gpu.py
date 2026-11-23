@@ -143,7 +143,7 @@ def test_mixed_indexer_topk_matches_separately_normalized_segments(
         head_dim=2,
         indexer=indexer,
         skip_topk=False,
-        _qk_norm_rope=lambda *args: QKNormRopeOut(q_sa=query),
+        _qk_norm_rope=lambda q, kv, pos, mixed=False: QKNormRopeOut(q_sa=query),
         _launch_compressors=lambda *args: None,
         _sparse_attention=attend,
     )

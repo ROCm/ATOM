@@ -462,10 +462,21 @@ def test_a_continued_replay_counts_the_long_prefill_cap_from_its_hit():
     seq.replay = Replay(32, True, (), 32 - REPLAY)
     seq.num_cached_tokens = 28  # an earlier chunk ended inside the replay
     chunk = Scheduler._partial_prefill_chunk(
-        engine, seq, 28, 28, 0, cap_from=max(28, seq.replay_until)
+        engine,
+        seq,
+        28,
+        28,
+        0,
+        cap_from=max(28, seq.replay_until),
+        budget=engine.max_num_batched_tokens,
     )
     assert chunk == 32 + 3 - 28
-    assert Scheduler._partial_prefill_chunk(engine, seq, 28, 28, 0) == 3
+    assert (
+        Scheduler._partial_prefill_chunk(
+            engine, seq, 28, 28, 0, budget=engine.max_num_batched_tokens
+        )
+        == 3
+    )
 
 
 def test_a_replay_past_the_prompt_demands_nothing():
@@ -619,7 +630,7 @@ def test_a_finished_load_is_sized_as_a_resume_without_rewalking_its_hit():
     walks = []
     real = bm.can_allocate_memoized
     bm.can_allocate_memoized = lambda s: walks.append(s) or real(s)
-    engine._prioritize_ready_remote_kv_requests(limits=engine._prefill_limits())
+    engine._prioritize_ready_remote_kv_requests()
     assert seq.status == SequenceStatus.WAITING and seq.num_cached_tokens == 36
     assert engine._local_prefill_pending_work(limits=engine._prefill_limits())[0]
     engine._estimate_prefill_chunk_cost(limits=engine._prefill_limits())

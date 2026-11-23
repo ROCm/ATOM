@@ -2784,7 +2784,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         rejected = self.model_runner.tokenID_processor.num_rejected
         if rejected is not None and len(rejected) != batch.total_seqs_num:
             raise ValueError("num_rejected is not aligned with mixed batch rows")
-        rejected = np.zeros(n_d, dtype=np.int32) if rejected is None else rejected[n_p:]
+        rejected = rejected[n_p:] if batch.num_spec_step else None
         lengths = np.asarray(decode_batch.num_scheduled_tokens, dtype=np.int32)
         cu = self.model_runner.forward_vars["cu_seqlens_q"].np[: n_d + 1]
         if cu[0] != 0 or not np.array_equal(cu[1:], np.cumsum(lengths)):
@@ -2797,7 +2797,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             t_d,
             max_q,
             group,
-            num_rejected=rejected if batch.num_spec_step else None,
+            num_rejected=rejected,
         )
         group.publish()
         self.finish_decode(decode_batch, decode_meta, n_d, t_d, max_q)
@@ -2844,20 +2844,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # full_q`, below), and every compress count is now `visible_*(pos)`, so
         # a rejected slot's KV falls out of range on its own — `block_tables`
         # needs no truncation here.
-        if num_rejected is not None:
-            # Only mixed supplies segment-local counts; prepare_mixed checked
-            # their alignment before slicing away the prefill rows.
-            shift = (
-                num_rejected
-                if self.model_runner.tokenID_processor.is_deferred_out
-                else 1
-            )
-            context_lens_np = context_lens_np - np.asarray(
-                shift, dtype=context_lens_np.dtype
-            )
-        elif max_seqlen_q > 1:
+        if num_rejected is not None or max_seqlen_q > 1:
             context_lens_np = self.model_runner.tokenID_processor.verify_ctx_lens(
-                context_lens_np
+                context_lens_np, num_rejected
             )
         # DSpark q-shrink: anchor the forwarded q tokens to the draft span HEAD
         # (ctx-full_q), not the tail, so they stay in [ctx-full_q .. ctx-1] (never

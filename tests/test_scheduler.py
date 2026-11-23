@@ -23,7 +23,6 @@ from atom.model_engine.early_load import EarlyLoadState
 from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.prefill_delayer import PrefillDecision
 from atom.model_engine.scheduler import (
-    PrefillLimits,
     ScheduledBatch,
     ScheduledBatchOutput,
     Scheduler,
@@ -1079,9 +1078,7 @@ class TestSchedule:
         sched.failed_recving_kv_req_ids = []
         sched.kv_connector = None  # P/D: resolved at admission
 
-        sched._prioritize_ready_remote_kv_requests(
-            limits=PrefillLimits(tokens=8, reserved_decode_blocks=0, num_decodes=0)
-        )
+        sched._prioritize_ready_remote_kv_requests()
 
         assert [seq.id for seq in sched.waiting] == [2, 1, 3]
 
@@ -1098,7 +1095,9 @@ class TestSchedule:
 
         # The finished id has already been consumed. A decode now needs a
         # second block, preempts, and returns behind the allocated resume.
-        assert not sched.block_manager.can_append(preempted, 1, 0)
+        assert not sched.block_manager._has_page_units(
+            sched.block_manager.append_blocks_needed(preempted, 1, 0)
+        )
         assert sched.preempt(preempted)
         assert list(sched.waiting) == [resume, preempted]
         assert sched.block_manager.can_allocate(preempted) < 0
@@ -1184,7 +1183,9 @@ class TestSchedule:
         victim.append_token(77)
         sched.running.append(victim)
         sched.waiting.extend([first, second])
-        assert not sched.block_manager.can_append(victim, 1, 0)
+        assert not sched.block_manager._has_page_units(
+            sched.block_manager.append_blocks_needed(victim, 1, 0)
+        )
         sched.running.remove(victim)
         assert sched.preempt(victim)
         assert list(sched.waiting) == [first, second, victim]
@@ -1231,7 +1232,7 @@ class TestSchedule:
 
         assert sched.preempt(victim)
         assert list(sched.waiting) == [victim, *loads]
-        assert sched._can_admit_head_prefill(limits=sched._prefill_limits())
+        assert sched._can_admit_head_prefill()
 
     def test_preempt_goes_behind_the_last_resume_of_the_leading_run(self):
         sched = self._offload_sched(12)
@@ -1263,7 +1264,7 @@ class TestSchedule:
 
         assert sched.preempt(victim)
         assert list(sched.waiting) == [victim, *reloads]
-        assert sched._can_admit_head_prefill(limits=sched._prefill_limits())
+        assert sched._can_admit_head_prefill()
 
     def test_parked_partial_prefills_queue_behind_a_settled_resume(self):
         """Four partial prefills parked for their loads must not push a settled
@@ -1284,9 +1285,9 @@ class TestSchedule:
 
         assert list(sched.waiting) == [resume, *partials]
         for _ in range(2):  # event-free ticks leave the order alone
-            sched._prioritize_ready_remote_kv_requests(limits=sched._prefill_limits())
+            sched._prioritize_ready_remote_kv_requests()
             assert next(iter(sched.waiting)) is resume
-            assert sched._can_admit_head_prefill(limits=sched._prefill_limits())
+            assert sched._can_admit_head_prefill()
 
     def test_an_idle_tick_leaves_the_waiting_queue_alone(self):
         """Without a finished or failed id nothing is scanned, however long the
@@ -1304,12 +1305,12 @@ class TestSchedule:
             "_is_offload_prefill_resume",
             wraps=sched._is_offload_prefill_resume,
         ) as scan:
-            sched._prioritize_ready_remote_kv_requests(limits=sched._prefill_limits())
+            sched._prioritize_ready_remote_kv_requests()
             assert scan.call_count == 0
             assert list(sched.waiting) == [fresh[0], early, fresh[1], late]
 
             sched.finished_recving_kv_req_ids.append(late.id)
-            sched._prioritize_ready_remote_kv_requests(limits=sched._prefill_limits())
+            sched._prioritize_ready_remote_kv_requests()
             assert scan.call_count == 4
 
         assert list(sched.waiting) == [early, late, fresh[0], fresh[1]]
@@ -1323,7 +1324,7 @@ class TestSchedule:
         sched.waiting.extend([lost, fresh, resume])
         sched.failed_recving_kv_req_ids.append(lost.id)
 
-        sched._prioritize_ready_remote_kv_requests(limits=sched._prefill_limits())
+        sched._prioritize_ready_remote_kv_requests()
 
         assert lost.status == SequenceStatus.WAITING and lost.offload_load_failed
         assert list(sched.waiting) == [resume, lost, fresh]
@@ -1336,7 +1337,7 @@ class TestSchedule:
         sched.failed_recving_kv_req_ids.append(failed.id)
         assert not sched.finished_recving_kv_req_ids
 
-        sched._prioritize_ready_remote_kv_requests(limits=sched._prefill_limits())
+        sched._prioritize_ready_remote_kv_requests()
 
         assert failed.offload_load_failed
         assert list(sched.waiting) == [failed, fresh]
@@ -1775,7 +1776,9 @@ def test_probe_stops_once_the_budget_is_filled(seq_factory, monkeypatch):
         sched.add(seq_factory(_PREFIX + [600 + 16 * i + j for j in range(16)]))
     fits = _count_fits(sched, monkeypatch)
     # Scanning on would report the same; the stop saves the third fit.
-    assert sched._local_prefill_pending_work(limits=sched._prefill_limits()) == (
+    assert sched._local_prefill_pending_work(
+        limits=sched._unreserved_prefill_limits
+    ) == (
         True,
         32,
     )
@@ -4353,8 +4356,8 @@ class TestMixedBatch:
 class TestMixedSpecDecodeReserve:
     """Decode-first reserves what the decode loop spends, `mtp_k+1`.
 
-    The reserve used to be written against `mtp_k + 1` while the loop spent
-    `spec_width + 1`; they only agree when this engine verifies locally.
+    Both use the engine's effective speculative width: target-only producers
+    reserve and schedule one token per decode.
     """
 
     def _sched(self, mtp_k, **overrides):

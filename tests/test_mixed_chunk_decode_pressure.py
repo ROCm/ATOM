@@ -135,6 +135,6 @@ def test_pressured_partial_is_not_reported_as_prefill_work():
     assert sched.block_manager.kv.num_free == 0
     limits = sched._prefill_limits()
     assert limits.reserved_decode_blocks == 1
-    assert not sched._can_admit_head_prefill(limits)
+    assert limits.tokens == 0  # caller suppresses admission probes under pressure
     assert sched._probe_local_prefill_work(limits) == (False, 0)
     assert sched._estimate_prefill_chunk_cost(limits) == 0

@@ -472,8 +472,9 @@ def record_allocation(self, seq: Sequence, num_cached_blocks: int,
                       block_hashes: list[int]) -> None:
     """Commit the joint boundary after the scheduler accepts the fit probe."""
 
-def can_append(self, seq: Sequence, num_new_tokens: int = 1) -> bool:
-    """Check capacity for the selected decode extension."""
+def append_blocks_needed(self, seq: Sequence, num_new_tokens: int = 1,
+                         lookahead: int = 0) -> int:
+    """Page demand for the selected decode extension."""
 ```
 
 `can_allocate` checks the full per-request state-slot reservation and PAGE-unit
@@ -504,8 +505,9 @@ a hash the walk read leaves the index or is remapped, or the hash at its first
 miss is published (`ATOM_PREFIX_WALK_MEMO` lists every trigger), and runs the
 same evaluation on every call, so it returns what `can_allocate` would. `allocate` revalidates only the ids it claims.
 
-`can_append` checks whether the next decode extension needs additional blocks,
-including speculative tokens and the active cache layout.
+Decode checks `_has_page_units(append_blocks_needed(...))`, using the same
+demand calculation as mixed admission, including speculative lookahead and
+the active cache layout.
 
 ### May-append (decode extension)
 
@@ -871,7 +873,10 @@ pending/cost/head probes, or actual admission. Partial prefills are excluded
 from decode demand; completed prefills awaiting first decode are included.
 New admission preserves the reserved append pages, including speculative
 lookahead. This reservation does not allocate pages and covers only the current
-tick. Each subsequent chunk therefore checks the current demand again.
+tick. BlockManager holds the reservation before completion prioritization,
+updates it after P/D promotion, and clears it when admission finishes. The
+outer scheduling entry also clears it on early return or exception. Each
+subsequent chunk therefore checks the current demand again.
 
 If available page capacity, including reclaimable checkpoints, cannot cover
 that demand, the prefill budget is zero. Continuation and new admission skip
@@ -900,7 +905,8 @@ FP8 attention allocates a separate BF16 output buffer.
 token fields, request-keyed maps, and filtered state/page rows. It rejects
 unclassified fields rather than passing parent data through to a segment.
 The V4 builder passes resolved rejection counts explicitly to decode
-preparation, which uses the common context rollback helper. The V4 carrier
+preparation, which calls `verify_ctx_lens` with decode-local counts even
+when DSpark shrinks the query width to one. The V4 carrier
 owns segment boundaries and a sampled-token row map shared by the LM head,
 draft verification, and anchor settlement; Context does not duplicate them.
 

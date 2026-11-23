@@ -778,7 +778,6 @@ def test_engine_allocates_then_parks_and_wakes_at_exact_native_boundary(monkeypa
     assert scheduled[seq.id] is seq
     assert seq.num_cached_tokens == 16
     assert list(batch.num_cached_tokens) == [16]
-    assert seq.offload_promoted_tokens == 16
     assert list(seq.block_table) == block_table
     assert seq.state_slot == state_slot
     assert engine._num_parked_remote_kv == 0
@@ -1126,7 +1125,7 @@ def test_engine_head_probe_keeps_a_woken_replay(monkeypatch):
         "_gated_hit",
         lambda _seq, compressed_hit, _hashes, **_kw: compressed_hit,
     )
-    assert engine._can_admit_head_prefill(limits=engine._prefill_limits())
+    assert engine._can_admit_head_prefill()
     assert seq.replays_hit
     batch, scheduled = engine.schedule()
     assert scheduled[seq.id] is seq

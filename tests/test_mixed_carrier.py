@@ -237,7 +237,11 @@ def test_prepare_mixed_calls_both_halves_with_their_real_signatures(
     builder = builder_cls.__new__(builder_cls)
     builder.model_runner = SimpleNamespace(
         forward_vars={"cu_seqlens_q": SimpleNamespace(np=cu)},
-        tokenID_processor=SimpleNamespace(num_rejected=None),
+        tokenID_processor=SimpleNamespace(
+            num_rejected=(
+                np.array([99, 98, 1, 0, 2], dtype=np.int32) if num_spec_step else None
+            )
+        ),
         h2d_groups={"decode_metadata": SimpleNamespace(publish=lambda: None)},
     )
     monkeypatch.setattr(
@@ -262,6 +266,10 @@ def test_prepare_mixed_calls_both_halves_with_their_real_signatures(
     pre = calls["prepare_prefill"]
     assert (pre["running_bs"], pre["running_tokens"]) == (n_p, p_tokens)
     dec = calls["stage_decode"]
+    if num_spec_step:
+        assert dec["num_rejected"].tolist() == [1, 0, 2]
+    else:
+        assert dec["num_rejected"] is None
     if num_spec_step == 0:
         assert dec["batch"].scheduled_spec_decode_tokens is None
     assert (dec["running_bs"], dec["running_tokens"], dec["max_seqlen_q"]) == (

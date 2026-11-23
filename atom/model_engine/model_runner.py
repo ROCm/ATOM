@@ -399,18 +399,22 @@ class tokenIDProcessor:
         # `take_deferred_spec_status`.
         self.spec_status_owed = False
 
-    def verify_ctx_lens(self, context_lens: np.ndarray) -> np.ndarray:
+    def verify_ctx_lens(
+        self, context_lens: np.ndarray, num_rejected: np.ndarray | None = None
+    ) -> np.ndarray:
         """`batch.context_lens` moved back to the start of this verify window.
 
         Deferred output: the last step's `num_rejected` slots are still in
         `context_lens`. Undeferred (PP): postprocess already left one run of
         `mtp_k + 1` placeholders, so the shift is 1. Before any sampler output
-        there is nothing to shift. Only a verify step has a window, so every
-        caller sits behind `max_seqlen_q > 1`.
+        there is nothing to shift. Mixed verification supplies decode-local
+        counts, including when DSpark shrinks its query width to one.
         """
-        if self.num_rejected is None:
+        if num_rejected is None:
+            num_rejected = self.num_rejected
+        if num_rejected is None:
             return context_lens
-        shift = self.num_rejected if self.is_deferred_out else 1
+        shift = num_rejected if self.is_deferred_out else 1
         return context_lens - np.asarray(shift, dtype=context_lens.dtype)
 
     @staticmethod
@@ -618,7 +622,7 @@ class tokenIDProcessor:
         total_tokens_prefill = batch.total_tokens_num_prefill
         total_tokens_decode = batch.total_tokens_num_decode
         total_reqs_prefill = batch.total_seqs_num_prefill
-        is_mixed = total_reqs_prefill > 0 and batch.is_mixed
+        is_mixed = batch.is_mixed
 
         # Both paths stage the whole batch once. Only decode rows may gather
         # last step's GPU outputs; prefill tokens always keep the scheduler's
@@ -628,9 +632,8 @@ class tokenIDProcessor:
         if is_mixed and self.use_spec:
             self.num_rejected = batch.num_rejected
             self.num_bonus = batch.num_bonus
-            if self.num_rejected is not None:
-                self.num_rejected[:total_reqs_prefill] = 0
-                self.num_bonus[:total_reqs_prefill] = 0
+            self.num_rejected[:total_reqs_prefill] = 0
+            self.num_bonus[:total_reqs_prefill] = 0
         if total_reqs_prefill and not total_tokens_decode:
             return self._publish_input_ids(total_tokens, publication_group), None
 
@@ -657,15 +660,13 @@ class tokenIDProcessor:
                 # PP: the host already holds each row's anchor, so fill only
                 # the draft columns.
                 bs, lens, cu_np = self.runner.attn_metadata_builder.decode_spans(batch)
-                spec = batch.scheduled_spec_decode_tokens[
-                    total_reqs_prefill : total_reqs_prefill + bs
-                ]
+                spec = batch.scheduled_spec_decode_tokens[:bs]
                 cols = np.arange(spec.shape[1])
                 # Row i's drafts land right after its anchor at cu_np[i].
                 drafted = cols < (lens[:, None] - 1)
-                self.input_ids.np[
-                    (total_tokens_prefill + cu_np[:bs, None] + 1 + cols)[drafted]
-                ] = spec[drafted]
+                self.input_ids.np[(cu_np[:bs, None] + 1 + cols)[drafted]] = spec[
+                    drafted
+                ]
             # Previous step's acceptance counts, read off the batch so every
             # stage (not just the sampling one) rolls its linear-attention
             # state back correctly; unset, GDN assumes 1 accepted token.
@@ -711,7 +712,7 @@ class tokenIDProcessor:
         # being few.
         if self.use_spec and batch.num_spec_step > 0 and num_new_seqs > 0:
             spec = batch.scheduled_spec_decode_tokens
-            for i in new_curr_indices:
+            for i in new_curr_indices.tolist():
                 n_draft = int(lens[i]) - 1
                 if n_draft > 0:
                     s = total_tokens_prefill + int(cu_np[i]) + 1
@@ -2544,14 +2545,14 @@ class ModelRunner:
                 and prev_b.total_seqs_num_prefill
                 else prev_b.req_ids
             )
-            if prev_b is not None and not prev_b.is_dummy_run
+            if prev_b is not None
             else None
         )
         # Keep the decode set and order stable across steps. Prefill rows may
         # change independently; their bonus counts never bound decode spans.
-        # This excludes a first decode after prefill, because the per-
-        # request lengths below are read off that batch's `num_bonus`. Any
-        # deviation → boundary step.
+        # With mixed enabled, previous prefill rows are excluded from this
+        # comparison. Flag-off retains the ordinary request-order criterion.
+        # Any change to that order is a boundary step.
         if prev_req is None or prev_req != cur_req:
             return  # boundary / reorder step: skip ragged, stay rectangular
 

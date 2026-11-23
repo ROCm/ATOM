@@ -3743,10 +3743,7 @@ class Config:
         if not self.enable_mixed_prefill_decode:
             return
 
-        from atom.kv_transfer.disaggregation.factory import (
-            PD_TRANSFER_BACKENDS,
-            KVConnectorFactory,
-        )
+        from atom.kv_transfer.disaggregation.pd_producer import pd_producer_configured
         from atom.kv_transfer.disaggregation.types import kv_config_has_producer
         from atom.utils import get_hf_text_config
         from atom.utils.selector import Family, attn_family
@@ -3757,14 +3754,6 @@ class Config:
         spec_method = None if spec is None else spec.method
         cg_mode = self.compilation_config.cudagraph_mode
         rope_parameters = getattr(hf, "rope_parameters", None) or {}
-        # Offload uses kv_producer for save-only operation on the ordinary
-        # engine. Only a P/D transport makes the engine prefill-only. Resolve
-        # aliases and nested composites through the same factory as startup.
-        pd_producer = any(
-            name in PD_TRANSFER_BACKENDS
-            and leaf.kv_transfer_config.get("kv_role", "kv_producer") == "kv_producer"
-            for name, leaf in (KVConnectorFactory.leaf_connectors(self) or ())
-        )
         # (is this config affected, what it is, why it cannot run mixed)
         refusals = [
             (
@@ -3773,7 +3762,7 @@ class Config:
                 "its separate prefill/decode schedulers do not form mixed batches",
             ),
             (
-                pd_producer,
+                pd_producer_configured(self),
                 "P/D kv_producer",
                 "a prefill-only producer cannot use mixed scheduling or its memory profile",
             ),

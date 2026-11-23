@@ -1380,9 +1380,7 @@ class Scheduler:
                 resume, cached = tier_waiter
             else:
                 # The exact probe's answer; the walk is memoised across ticks.
-                cached_blocks = self.block_manager.can_allocate_memoized(
-                    seq, reserved_decode_blocks=limits.reserved_decode_blocks
-                )
+                cached_blocks = self.block_manager.can_allocate_memoized(seq)
                 if cached_blocks < 0:
                     break  # Phase 2 also stops at the first allocation refusal.
                 if slots <= parked:
@@ -1527,9 +1525,7 @@ class Scheduler:
         ones: a per-token term plus the context each new token attends."""
         return chunk * (self._balance_token_weight + start + chunk / 2)
 
-    def _prefill_room(
-        self, batched_tokens: int, start: int, budget: int | None = None
-    ) -> int:
+    def _prefill_room(self, batched_tokens: int, start: int, budget: int) -> int:
         """New tokens a seq whose chunk starts at `start` may still add this
         tick: the batch budget, and under cost balancing the cost left to the
         step's target (largest k with `_chunk_cost(start, k)` <= what is left),
@@ -1537,8 +1533,7 @@ class Scheduler:
 
         `budget` replaces `max_num_batched_tokens` as the batch budget when
         decode-first reservation has held back the in-flight decodes' share."""
-        cap = self.max_num_batched_tokens if budget is None else budget
-        cap_room = cap - batched_tokens
+        cap_room = budget - batched_tokens
         if self._tick_cost_limit == math.inf:
             return max(cap_room, 0)
         left = self._tick_cost_limit - self._tick_cost
@@ -1558,7 +1553,7 @@ class Scheduler:
             and seq.id not in self._pp_inflight_token_block
         )
 
-    def _budget_for_decodes(self, n_decode, reserved_blocks=0):
+    def _budget_for_decodes(self, n_decode, reserved_blocks):
         # Zero prevents prefill execution, not transfer completion or reclaiming
         # a settled KV owner. Decode demand is finalized before selecting chunks.
         if reserved_blocks and not self.block_manager._has_page_units(reserved_blocks):
@@ -1567,7 +1562,7 @@ class Scheduler:
         n_decode = min(n_decode, self.max_num_seqs)
         floor = prefill_floor(budget)
         reserve = min(n_decode * (self.mtp_k + 1), budget - floor)
-        return budget - max(reserve, 0)
+        return budget - reserve
 
     def _mixed_decode_seats(self):
         """Maximum decodes beside a one-token, one-row prefill."""
@@ -1577,8 +1572,6 @@ class Scheduler:
 
     def _prefill_limits(self) -> PrefillLimits:
         """Reserve existing decodes; P/D promotions extend this before admission."""
-        if not self.enable_mixed_prefill_decode:
-            return self._unreserved_prefill_limits
         candidates = list(self._decode_candidates())
         width = self.mtp_k + 1
         # Prefill may use less than its token budget. Protect every decode
@@ -1667,9 +1660,7 @@ class Scheduler:
             else:
                 # Runs on every tick with prefill work, holds included: reuse
                 # the walk across ticks; the answer is the exact probe's.
-                cached_blocks = self.block_manager.can_allocate_memoized(
-                    seq, reserved_decode_blocks=limits.reserved_decode_blocks
-                )
+                cached_blocks = self.block_manager.can_allocate_memoized(seq)
                 if cached_blocks < 0:
                     break
                 # From where the forward will really start, as admission
@@ -1723,7 +1714,7 @@ class Scheduler:
         batched_tokens: int,
         *,
         cap_from: int | None = None,
-        budget: int | None = None,
+        budget: int,
     ) -> int:
         """The next chunk of a running prefill that resumes at `resume` and
         starts at `start`, or 0. A chunk ending at or below `resume` only
@@ -1763,7 +1754,7 @@ class Scheduler:
             return target - start
         return self.block_manager.align_midstep_chunk(seq, start, chunk)
 
-    def _can_admit_head_prefill(self, limits: PrefillLimits) -> bool:
+    def _can_admit_head_prefill(self) -> bool:
         """Match SGL's `local_prefillable=True` semantics: report True iff
         this rank would *actually* admit a new prefill this tick.
 
@@ -1779,8 +1770,6 @@ class Scheduler:
         entries) and check `can_allocate` + token-budget, mirroring the
         same checks the admission while-loop runs below.
         """
-        if not limits.tokens:
-            return False
         if self._partial_prefill_count > 0:
             return True
         if not self.waiting:
@@ -1810,7 +1799,7 @@ class Scheduler:
             if seq.status == SequenceStatus.ABORTED:
                 examined += 1
                 continue
-            if self._head_waits_on_tier_lookup(seq, limits=limits):
+            if self._head_waits_on_tier_lookup(seq):
                 # Phase 2 skips it until its lookup answers (`prefix_waiters`),
                 # so reporting it prefillable would make the delayer count a
                 # rank that then runs a dummy prefill.
@@ -1833,12 +1822,7 @@ class Scheduler:
             # KV-pressured requests definitely cannot prefill. A fit probe, not
             # an admission: it records nothing, and runs every tick, so the
             # walk is memoised across ticks.
-            return (
-                self.block_manager.can_allocate_memoized(
-                    seq, reserved_decode_blocks=limits.reserved_decode_blocks
-                )
-                >= 0
-            )
+            return self.block_manager.can_allocate_memoized(seq) >= 0
         return False
 
     def _prefix_bypass_limit(self) -> int:
@@ -1846,9 +1830,7 @@ class Scheduler:
         prefillable-work probe must reach as far as Phase 2 does."""
         return min(16, self.max_num_seqs)
 
-    def _head_waits_on_tier_lookup(
-        self, seq: Sequence, *, limits: PrefillLimits
-    ) -> bool:
+    def _head_waits_on_tier_lookup(self, seq: Sequence) -> bool:
         """Whether Phase 2 would skip `seq` for its in-flight tier lookup
         (`prefix_waiters`): same conditions, same order of the cheap checks. A
         probe: it never starts the lookup's defer window, which is Phase 2's."""
@@ -1862,9 +1844,7 @@ class Scheduler:
             self._lookup_detach_enabled(seq)
             and self._can_detach_tier_lookup(
                 seq,
-                self.block_manager.can_allocate_memoized(
-                    seq, reserved_decode_blocks=limits.reserved_decode_blocks
-                ),
+                self.block_manager.can_allocate_memoized(seq),
             )
         )
 
@@ -2534,7 +2514,10 @@ class Scheduler:
         as long as it fires, and nothing would fail — the log would just go
         quiet, which is indistinguishable from an idle engine.
         """
-        result = self._schedule()
+        try:
+            result = self._schedule()
+        finally:
+            self.block_manager.reserved_decode_blocks = 0
         if self.pd_admission is not None and result is not None:
             batch, seqs = result
             if not batch.is_dummy_run:
@@ -2575,13 +2558,16 @@ class Scheduler:
             )
             else self._unreserved_prefill_limits
         )
-        self._prioritize_ready_remote_kv_requests(limits=limits)
+        if self.enable_mixed_prefill_decode:
+            self.block_manager.reserved_decode_blocks = limits.reserved_decode_blocks
+        self._prioritize_ready_remote_kv_requests()
         self._park_ready_offload_partial_prefills()
         # Reclaim aborted heads even when decode protection vetoes Phase 2.
         while self.waiting and self.waiting[0].status == SequenceStatus.ABORTED:
             self._finish_rejected_waiting(self.waiting.popleft())
         if self.enable_mixed_prefill_decode:
             limits = self._promote_mixed_remote_decodes(limits)
+            self.block_manager.reserved_decode_blocks = limits.reserved_decode_blocks
             # Offload resolution may also change page availability. Finalize
             # after every completion, before early loads, probes or chunks.
             limits = limits._replace(
@@ -2605,7 +2591,7 @@ class Scheduler:
         # whose load is in flight is not counted as prefillable work (and so a
         # FIRE is not spent on nothing). Local to this rank: no collective, and
         # nothing is scheduled for prefill here.
-        self._early_load_tier_prefixes(limits=limits)
+        self._early_load_tier_prefixes()
 
         # should_allow_prefill() runs a cross-DP all_reduce and MUST be called
         # every tick on every rank for lockstep — hence before the early-return.
@@ -2630,7 +2616,7 @@ class Scheduler:
             elif self._local_prefill_coalescing:
                 prefillable, pending_tokens = self._local_prefill_pending_work(limits)
             else:
-                prefillable = self._can_admit_head_prefill(limits)
+                prefillable = limits.tokens > 0 and self._can_admit_head_prefill()
                 pending_tokens = min(
                     self._waiting_new_token_count()
                     + self._partial_prefill_remaining_tokens(),
@@ -2835,7 +2821,7 @@ class Scheduler:
             hbm_probe, probed_tier_kv, lookup_detachable = (
                 (None, (0, 0), False)
                 if remote_ready_for_decode or offload_resume
-                else self._admission_probe(seq, limits=limits)
+                else self._admission_probe(seq)
             )
             if (
                 not remote_ready_for_decode
@@ -2958,9 +2944,7 @@ class Scheduler:
             # (post-prefix-cache) remaining token count. V4 SWA correctness is
             # enforced inside can_allocate (_swa_bounded_hit bounds the hit to
             # where the trailing-window SWA is present); no post-hoc warmup trim.
-            hbm_probe = self._reprobe_after_tier_answer(
-                seq, hbm_probe, probed_tier_kv, limits=limits
-            )
+            hbm_probe = self._reprobe_after_tier_answer(seq, hbm_probe, probed_tier_kv)
             num_cached_blocks = hbm_probe.num_cached_blocks
             if num_cached_blocks < 0:
                 self.waiting.appendleft(seq)
@@ -3205,6 +3189,8 @@ class Scheduler:
             self._commit_calibration_arm()
             self._inflight_prefix_wait.pop(seq.id, None)
 
+        # Admission is complete; decode spends the pages protected above.
+        self.block_manager.reserved_decode_blocks = 0
         if skipped_waiting_requests:
             logger.debug(
                 "Re-adding %d skipped requests back to waiting queue.",
@@ -3268,7 +3254,7 @@ class Scheduler:
                 total_tokens_num_prefill,
             )
 
-        if group_prefill_tick and not num_seqs_prefill:
+        if group_prefill_tick:
             # The group's prefill step, with no prefill of this rank's own: it
             # keeps its peers company on an idle step rather than decode, so
             # every rank's forward replays its token graph (`ForwardMode.decide`).
@@ -3316,8 +3302,10 @@ class Scheduler:
                 continue
             blocked_by_pinned_save = False
             preempted_current = False
-            while not self.block_manager.can_append(
-                seq, num_new_tokens, self.draft_lookahead
+            while not self.block_manager._has_page_units(
+                self.block_manager.append_blocks_needed(
+                    seq, num_new_tokens, self.draft_lookahead
+                )
             ):
                 if self._preempt_one_running(seq):
                     continue
@@ -3805,7 +3793,6 @@ class Scheduler:
                     loaded,
                     promoted,
                 )
-            seq.offload_promoted_tokens = promoted
             seq.num_cached_tokens = loaded
             # Report the extended CPU-offload hit without reducing any
             # prefix-cache hit inherited from an upstream prefill node.
@@ -3867,7 +3854,7 @@ class Scheduler:
         )
 
     def _admission_probe(
-        self, seq: Sequence, *, limits: PrefillLimits
+        self, seq: Sequence
     ) -> tuple[AdmissionProbe | None, tuple[int, int], bool]:
         """`(hbm_probe, probed_tier_kv, detachable)` for a request about to be
         admitted: the HBM probe and tier answer the detach decision was made on,
@@ -3876,7 +3863,7 @@ class Scheduler:
         connector's answer (`_reprobe_after_tier_answer`)."""
         if not self._lookup_detach_enabled(seq):
             return None, (0, 0), False
-        probe = self._probe_hbm_prefix(seq, limits=limits)
+        probe = self._probe_hbm_prefix(seq)
         return (
             probe,
             self._tier_hit(seq),
@@ -3888,8 +3875,6 @@ class Scheduler:
         seq: Sequence,
         probe: AdmissionProbe | None,
         probed_tier_kv: tuple[int, int],
-        *,
-        limits: PrefillLimits,
     ) -> AdmissionProbe:
         """The admission's HBM probe. The detach probe predates the connector's
         answer, which `can_allocate` reads for a replaying model (a replaying
@@ -3901,19 +3886,16 @@ class Scheduler:
             and seq.has_per_req_cache
             and self._tier_hit(seq) != probed_tier_kv
         ):
-            return self._probe_hbm_prefix(seq, limits=limits)
+            return self._probe_hbm_prefix(seq)
         return probe
 
-    def _probe_hbm_prefix(
-        self, seq: Sequence, *, limits: PrefillLimits
-    ) -> AdmissionProbe:
+    def _probe_hbm_prefix(self, seq: Sequence) -> AdmissionProbe:
         """Probe the same reserved KV fit used by the delayer and cost estimator."""
         probe = AdmissionProbe()
         probe.num_cached_blocks = self.block_manager.can_allocate(
             seq,
             record=False,
             probe=probe,
-            reserved_decode_blocks=limits.reserved_decode_blocks,
         )
         return probe
 
@@ -4764,7 +4746,7 @@ class Scheduler:
             return False
         return True
 
-    def _early_load_tier_prefixes(self, *, limits: PrefillLimits) -> int:
+    def _early_load_tier_prefixes(self) -> int:
         """Admit-and-park waiting requests that must load a prefix from the
         tier, as soon as their lookup answers. Returns how many parked.
 
@@ -4826,17 +4808,13 @@ class Scheduler:
                 # early loads behind it can never fill every slot first.
                 state.skip(seq.id, "seq_slots")
                 break
-            hbm_probe, probed_tier_kv, detachable = self._admission_probe(
-                seq, limits=limits
-            )
+            hbm_probe, probed_tier_kv, detachable = self._admission_probe(seq)
             if detachable:
                 state.skip(seq.id, "detach_no_load")
                 state.settled.add(seq.id)
                 continue  # no load possible: it prefills when a FIRE admits it
             needs_remote_load = self._query_connector_prefill_match(seq, skip=False)
-            hbm_probe = self._reprobe_after_tier_answer(
-                seq, hbm_probe, probed_tier_kv, limits=limits
-            )
+            hbm_probe = self._reprobe_after_tier_answer(seq, hbm_probe, probed_tier_kv)
             if hbm_probe.num_cached_blocks < 0:
                 state.skip(seq.id, "pool_full")
                 break  # the pool cannot take it now; neither could Phase 2
@@ -5006,9 +4984,9 @@ class Scheduler:
             ):
                 return True
             del self.running[index]
-            if self.preempt(candidate):
-                return True
-            self.running.insert(index, candidate)
+            reclaimed = self.preempt(candidate)
+            assert reclaimed, "the selected running victim became pinned"
+            return True
         # With no running victim, compare against the decode that would
         # otherwise preempt itself. An older waiting owner must survive it.
         return self.enable_mixed_prefill_decode and self._preempt_waiting_kv_owner(
@@ -5051,21 +5029,13 @@ class Scheduler:
                     continue
                 self._schedule_first_decode_after_remote_kv(seq)
                 self.running.pop()
-            if self.preempt(seq):
-                self._uncount_inflight_load(seq)
-                self._early_load.note_gone(seq.id)
-                seq.offload_loaded = False
-                seq.offload_load_failed = False
-                seq.offload_loaded_tokens = 0
-                seq.offload_load_start_tokens = None
-                seq.offload_promoted_tokens = 0
-                return True
-            if received:
-                # A refused reclaim retains the initialized decode, including
-                # its single T0 injection, in the running queue.
-                self.running.append(seq)
-            else:
-                self.waiting.insert(index, seq)
+            # Resolving a completed receive starts no send/save, so it cannot
+            # pin the owner selected above. Call outside assert (python -O).
+            reclaimed = self.preempt(seq)
+            assert reclaimed, "the selected waiting KV owner became pinned"
+            self._uncount_inflight_load(seq)
+            self._early_load.note_gone(seq.id)
+            return True
         return False
 
     def preempt_running(self) -> int:
@@ -6168,7 +6138,7 @@ class Scheduler:
             seq.status = SequenceStatus.WAITING
             self._mark_offload_load_ready(seq)
 
-    def _prioritize_ready_remote_kv_requests(self, *, limits: PrefillLimits) -> None:
+    def _prioritize_ready_remote_kv_requests(self) -> None:
         """Prioritize completed remote requests before sizing prefill work.
 
         Re-sorts `waiting` in one stable pass, and only on one of two triggers:
@@ -6239,11 +6209,7 @@ class Scheduler:
                 len(self.running) + self._num_parked_remote_kv >= self.max_num_seqs
             )
             head_blocked = head is not None and (
-                slots_full
-                or self.block_manager.can_allocate_memoized(
-                    head, reserved_decode_blocks=limits.reserved_decode_blocks
-                )
-                < 0
+                slots_full or self.block_manager.can_allocate_memoized(head) < 0
             )
         # A settled early load waiting behind a head that can run stays put.
         if not recving and not head_blocked:
@@ -6982,8 +6948,10 @@ class DecodeScheduler(Scheduler):
                 # logger.warning("decode state: waiting=%d prefill_waiting=%d prefill_done=%d running=%d free_blocks=%d",
                 #     len(self.waiting), len(self.prefill_waiting), len(self.prefill_done),
                 #     len(self.running), self.block_manager.kv.num_free)
-                while not self.block_manager.can_append(
-                    seq, self.mtp_k + 1, self.draft_lookahead
+                while not self.block_manager._has_page_units(
+                    self.block_manager.append_blocks_needed(
+                        seq, self.mtp_k + 1, self.draft_lookahead
+                    )
                 ):
                     logger.warning("Cannot allocate")
                     if self.running:

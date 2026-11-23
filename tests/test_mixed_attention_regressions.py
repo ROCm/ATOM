@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """Default DSpark preparation and mixed attention buffer ownership."""
 
+from functools import partial
 from types import SimpleNamespace
 
 import numpy as np
@@ -133,11 +134,15 @@ def test_attention_output_reuse_keeps_decode_input_intact(monkeypatch, bf16):
         calls.append(ctx.is_prefill)
         out.copy_(incoming + 10)
 
+    def norm(q, kv, positions, mixed=False):
+        assert mixed is True
+        return qkn
+
     attention = SimpleNamespace(
         n_local_heads=2,
         head_dim=2,
         indexer=None,
-        _qk_norm_rope=lambda *args, **kw: qkn,
+        _qk_norm_rope=norm,
         _launch_compressors=lambda x: None,
         _sparse_attention=attend,
     )
@@ -344,9 +349,84 @@ def test_sparse_attention_passes_caller_slice_to_kernel(
         window_size=4,
     )
     result = model.DeepseekV4Attention._sparse_attention(
-        layer, qkn, torch.arange(3), out=output
+        layer, qkn, torch.arange(3), out=output, decode=partial(attend, out=output)
     )
     assert calls == (["attention"] if decode else ["attention", "swa_write"])
     assert result.data_ptr() == output.data_ptr() and result.shape == (3, 4)
     assert torch.all(output == 7) and torch.all(parent[[0, -1]] == -9)
     assert torch.all(query == 1)
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_full_forward_selects_mixed_only_when_needed(monkeypatch, mixed):
+    import atom.models.deepseek_v4 as model
+
+    x = torch.ones(2, 4)
+    metadata = SimpleNamespace(is_mixed=mixed)
+    monkeypatch.setattr(
+        model,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            context=SimpleNamespace(is_dummy_run=False), attn_metadata=metadata
+        ),
+    )
+    monkeypatch.delenv("ATOM_V4_BYPASS_ATTN", raising=False)
+    calls = []
+    layer = SimpleNamespace(
+        forward_impl_default=lambda *a: calls.append("default") or x,
+        _attn_pre=lambda *a, **kw: (x, x, x, None),
+        _attn_mixed=lambda *a: calls.append("mixed") or x,
+        _attn_post=lambda o, p: o,
+    )
+    assert model.DeepseekV4Attention._forward_impl_mixed(layer, x, torch.arange(2)) is x
+    assert calls == (["mixed"] if mixed else ["default"])
+
+
+@pytest.mark.parametrize("mixed,decode", [(False, False), (False, True), (True, False)])
+@pytest.mark.parametrize("fp8", [False, True])
+def test_qkn_routes_only_decode_rows_to_fused_swa(monkeypatch, mixed, decode, fp8):
+    import atom.models.deepseek_v4 as model
+    from atom.utils.forward_context import AttnState
+
+    mask = torch.tensor([-1, 0, 1]) if mixed else torch.arange(3)
+    rows = torch.tensor([9, 10, 11])
+    md = SimpleNamespace(
+        state=AttnState.DECODE if decode else AttnState.PREFILL_NATIVE,
+        swa_dest_rows={4: rows},
+        batch_id_per_q_token=mask,
+    )
+    monkeypatch.setattr(
+        model,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            context=SimpleNamespace(is_dummy_run=False), attn_metadata=md
+        ),
+    )
+    monkeypatch.delenv("ATOM_V4_BYPASS_ATTN", raising=False)
+    monkeypatch.setattr(model, "_V4_USE_REF_QUANT", False)
+    calls = []
+    monkeypatch.setattr(
+        model, "qk_norm_rope_maybe_quant", lambda *a, **kw: calls.append(kw)
+    )
+    layer = SimpleNamespace(
+        rope_head_dim=2,
+        compress_ratio=4,
+        kv_norm=SimpleNamespace(weight=None),
+        rotary_emb=SimpleNamespace(cos_cache=None, sin_cache=None),
+        n_local_heads=2,
+        head_dim=4,
+        eps=1e-6,
+        kv_fp8=fp8,
+        swa_plane=object(),
+        swa_plane_rope=object(),
+        layer_name="test",
+    )
+    model.DeepseekV4Attention._qk_norm_rope(
+        layer, torch.zeros(3, 8), None, torch.arange(3), mixed
+    )
+    kw = calls[0]
+    enabled = mixed or decode
+    assert kw["batch_id_per_q_token"] is (mask if enabled else None)
+    assert kw["swa_dest_rows"] is (rows if enabled else None)
+    key = "swa_nope_scale_buff" if fp8 else "swa_kv"
+    assert kw[key] is (layer.swa_plane if enabled else None)

@@ -131,9 +131,13 @@ def test_estimate_prices_the_chunk_the_prefill_budget_allows(
     sched.add(seq_factory(list(range(100, 164))))
     chunk = 64 - 6 if mixed else 64  # one row per decode (no drafts)
     assert sched._estimate_prefill_chunk_cost(
-        limits=sched._prefill_limits()
+        limits=sched._prefill_limits() if mixed else sched._unreserved_prefill_limits
     ) == sched._chunk_cost(0, chunk)
-    assert sched._prefill_limits().tokens == chunk
+    assert (
+        sched._prefill_limits()
+        if mixed
+        else sched._unreserved_prefill_limits.tokens == chunk
+    )
 
 
 def test_delayer_is_told_what_a_mixed_step_can_admit(monkeypatch, seq_factory):
@@ -183,9 +187,7 @@ def test_per_tick_probes_keep_the_head_walk(monkeypatch, seq_factory):
     assert hashed and len(walks) == 1
     first_probe = len(hashed)
     assert sched._estimate_prefill_chunk_cost(limits=sched._prefill_limits()) == cost
-    assert sched._can_admit_head_prefill(
-        limits=sched._prefill_limits()
-    ) and sched._can_admit_head_prefill(limits=sched._prefill_limits())
+    assert sched._can_admit_head_prefill() and sched._can_admit_head_prefill()
     assert len(hashed) == first_probe and len(walks) == 1
 
 
@@ -214,7 +216,7 @@ def test_room_is_the_largest_chunk_within_the_cost_left(monkeypatch, start):
     sched = _sched(monkeypatch, weight=4096, min_tokens=0, max_tokens=1 << 20)
     sched._tick_cost_limit = 5e8
     sched._tick_cost = 1e8
-    room = sched._prefill_room(0, start)
+    room = sched._prefill_room(0, start, sched.max_num_batched_tokens)
     left = sched._tick_cost_limit - sched._tick_cost
     assert sched._chunk_cost(start, room) <= left
     assert sched._chunk_cost(start, room + 1) > left
@@ -337,7 +339,7 @@ def test_costs_ride_the_delayer_reduce_on_a_stateless_gloo_group():
         prefillable=True,
         pending_tokens=8,
         prefill_cost=3.5e9,
-        prefill_budget=delayer.max_num_batched_tokens,
+        prefill_budget=64,
     )
     assert delayer.rank_prefill_costs == [3.5e9]
     # Without the exchange the buffer keeps its 8 decision slots only.
@@ -346,6 +348,6 @@ def test_costs_ride_the_delayer_reduce_on_a_stateless_gloo_group():
         prefillable=True,
         pending_tokens=8,
         prefill_cost=3.5e9,
-        prefill_budget=plain.max_num_batched_tokens,
+        prefill_budget=64,
     )
     assert plain.rank_prefill_costs == []

@@ -353,54 +353,6 @@ def test_prefill_confidence_cannot_change_decode_budget_or_request_mapping(
     assert published == ([metadata] if prefill_rows else [])
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="stages through the GPU")
-def test_pipeline_mixed_drafts_leave_prefill_tokens_untouched(monkeypatch):
-    from atom.model_ops.attentions.deepseek_v4_attn import (
-        DeepseekV4AttentionMetadataBuilder,
-    )
-    from tests.test_h2d_runner_publication import runner_with_buffers
-
-    runner = runner_with_buffers(
-        monkeypatch,
-        pp_size=2,
-        speculative=True,
-        builder_cls=DeepseekV4AttentionMetadataBuilder,
-    )
-    processor = runner.tokenID_processor
-    processor.use_spec = True
-    runner._gate_staging_reuse()
-    batch = SimpleNamespace(
-        has_prefill=True,
-        is_mixed=True,
-        num_spec_step=3,
-        total_seqs_num=3,
-        total_seqs_num_prefill=1,
-        total_seqs_num_decode=2,
-        total_tokens_num=9,
-        total_tokens_num_prefill=3,
-        total_tokens_num_decode=6,
-        scheduled_tokens=np.asarray(
-            [7, 8, 9, 100, -1, -1, -1, 200, -1], dtype=np.int32
-        ),
-        scheduled_spec_decode_tokens=np.asarray(
-            [[0, 0, 0], [101, 102, 103], [201, 202, 203]], dtype=np.int32
-        ),
-        num_scheduled_tokens=np.asarray([3, 4, 2], dtype=np.int32),
-        num_rejected=np.zeros(3, dtype=np.int32),
-        num_bonus=np.zeros(3, dtype=np.int32),
-        produces_output=lambda: False,
-    )
-    group = runner.h2d_groups["token_inputs"]
-    group.set_counts(
-        runner.attn_metadata_builder.prepare_query_metadata(
-            batch.num_scheduled_tokens[1:], 2, 6
-        )
-    )
-    ids = processor.prepare_input_ids(batch, 4, group).clone()
-    runner._mark_staging_h2d_enqueued()
-    assert ids.cpu().tolist() == [7, 8, 9, 100, 101, 102, 103, 200, 201]
-
-
 def _mixed_batch(**overrides):
     fields = {
         "is_mixed": True,
@@ -845,3 +797,79 @@ def test_mixed_deferred_inputs_under_spec(monkeypatch, previous_dummy):
         [0] * 4 if previous_dummy else [0, 1, 2, 0]
     )
     assert processor.num_bonus.tolist() == ([0] * 4 if previous_dummy else [0, 2, 1, 0])
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("previous_dummy", [False, True])
+@pytest.mark.parametrize("lengths", [[4, 4, 4], [1, 3, 4]])
+def test_cpu_deferred_input_wiring(monkeypatch, mixed, previous_dummy, lengths):
+    from atom.model_engine import model_runner as module
+
+    prefix = [7, 8, 9] if mixed else []
+    n_p = int(mixed)
+    scheduled = prefix + [-1] * sum(lengths[:-1]) + [500, -1, -1, -1]
+    spec = np.zeros((n_p + 3, K), dtype=np.int32)
+    spec[-1] = [501, 502, 503]
+    batch = SimpleNamespace(
+        num_spec_step=K,
+        is_mixed=mixed,
+        is_dummy_run=False,
+        req_ids=([40] if mixed else []) + [10, 30, 50],
+        scheduled_tokens=np.array(scheduled, dtype=np.int32),
+        total_tokens_num=len(scheduled),
+        total_tokens_num_prefill=len(prefix),
+        total_tokens_num_decode=sum(lengths),
+        total_seqs_num_prefill=n_p,
+        total_seqs_num_decode=3,
+        total_seqs_num=n_p + 3,
+        num_scheduled_tokens=np.array(([3] if mixed else []) + lengths),
+        scheduled_spec_decode_tokens=spec,
+        num_rejected=np.zeros(n_p + 3, dtype=np.int32),
+        num_bonus=np.zeros(n_p + 3, dtype=np.int32),
+        produces_output=lambda: False,
+    )
+    processor, group = _cpu_token_processor(monkeypatch, batch, previous_rows=4)
+    processor.prev_batch.req_ids = [] if previous_dummy else [10, 20, 30, 40]
+    processor.prev_token_ids = torch.tensor([100, 200, 300, 400], dtype=torch.int32)
+    processor.draft_token_ids = torch.tensor(
+        [[v + 1, v + 2, v + 3] for v in [100, 200, 300, 400]]
+    )
+    processor.prev_rejected_num = np.array([1, 0, 2, 0], dtype=np.int32)
+    processor.prev_bonus_num = np.array([2, 3, 1, 3], dtype=np.int32)
+    processor.runner.enforce_eager = False
+    processor.runner.capture_sizes = [8, 4, 2, 1]
+
+    def gather(dest, cu, sources, anchors, drafts, *, max_tokens_per_seq, width):
+        bs, fill_to = len(sources), width
+        assert max_tokens_per_seq == max(lengths)
+        assert bs == 3 and sources[:bs].tolist() == (
+            [-1] * 3 if previous_dummy else [0, 2, -1]
+        )
+        assert dest.data_ptr() == processor.input_ids.gpu[len(prefix) :].data_ptr()
+        assert fill_to == (sum(lengths) if mixed else 16)
+        assert dest[sum(lengths[:-1]) : sum(lengths)].tolist() == [500, 501, 502, 503]
+        for row, source in enumerate(sources[:bs].tolist()):
+            if source >= 0:
+                values = torch.cat((anchors[source : source + 1], drafts[source]))
+                dest[cu[row] : cu[row + 1]] = values[: cu[row + 1] - cu[row]]
+        dest[sum(lengths) : fill_to] = 0
+
+    monkeypatch.setattr(module, "fill_deferred_decode_ids", gather)
+    actual = processor.prepare_input_ids(batch, K + 1, group).tolist()
+    first = (
+        [-1] + [0] * (lengths[0] - 1)
+        if previous_dummy
+        else [100, 101, 102, 103][: lengths[0]]
+    )
+    second = (
+        [-1] + [0] * (lengths[1] - 1)
+        if previous_dummy
+        else [300, 301, 302, 303][: lengths[1]]
+    )
+    assert actual == prefix + first + second + [500, 501, 502, 503]
+    assert processor.num_rejected.tolist() == [0] * n_p + (
+        [0, 0, 0] if previous_dummy else [1, 2, 0]
+    )
+    assert processor.num_bonus.tolist() == [0] * n_p + (
+        [0, 0, 0] if previous_dummy else [2, 1, 0]
+    )

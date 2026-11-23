@@ -112,7 +112,12 @@ def disaggregated_kv_role(config) -> str | None:
 
 
 def pd_producer_configured(config) -> bool:
-    return bool(_producer_connectors(config, _PD_TRANSFER_CONNECTORS))
+    """Whether any configured transport makes this a prefill-only producer."""
+    return any(
+        name in PD_TRANSFER_BACKENDS
+        and leaf.kv_transfer_config.get("kv_role", "kv_producer") == "kv_producer"
+        for name, leaf in (KVConnectorFactory.leaf_connectors(config) or ())
+    )
 
 
 def mooncake_pd_producer_configured(config) -> bool:

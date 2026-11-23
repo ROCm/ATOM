@@ -306,7 +306,6 @@ class PrefillDelayer:
         "cpu_group",
         "dp_size",
         "kv_high_watermark",
-        "max_num_batched_tokens",
         "max_queue_ms",
         "partial_max_ticks",
         "prefill_decode_interval",
@@ -339,7 +338,6 @@ class PrefillDelayer:
             raise ValueError("Cross-DP prefill coalescing requires a CPU group")
         self.dp_size = dp_size
         self.cpu_group = cpu_group
-        self.max_num_batched_tokens = max_num_batched_tokens
 
         # target_fill is the fraction of a full prefill batch that must be
         # accumulated (across prefillable ranks) before we release. Must be in

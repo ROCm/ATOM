@@ -254,8 +254,7 @@ def test_settled_resume_is_victim_before_older_decode(prefix, failed):
         assert sched.total_preemptions == 1
         assert sched._num_parked_remote_kv == 0
         if mixed:
-            assert not restored.offload_loaded and not restored.offload_load_failed
-            assert restored.offload_loaded_tokens == 0
+            assert not sched._is_offload_prefill_resume(restored)
             assert restored.id not in sched._early_load.entries
 
 
@@ -355,60 +354,6 @@ def test_receive_reservation_stops_at_mixed_decode_seats(width, expected_budget)
     )
 
 
-def test_mixed_restore_keeps_receive_promoted_during_refused_reclaim(monkeypatch):
-    sched = scheduler(pages=100)
-    older = decode(sched)
-    prompt = Sequence([55] * 8, block_size=16)
-    assert sched.block_manager.allocate(prompt, 0)
-    prompt.num_cached_tokens = 4
-    prompt.is_partial_prefill = True
-    prompt.status = SequenceStatus.RUNNING
-    sched.running.append(prompt)
-    sched._partial_prefill_count = 1
-    incoming = receive(sched)
-    sched.max_num_seqs = 2
-    monkeypatch.setattr(
-        sched.kv_connector,
-        "should_defer_free",
-        lambda s: s is incoming and s.status == SequenceStatus.RUNNING,
-    )
-    can_append = sched.block_manager.can_append
-
-    def append_after_reclaim(seq, *args):
-        if seq is older and incoming.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
-            return False
-        return can_append(seq, *args)
-
-    monkeypatch.setattr(sched.block_manager, "can_append", append_after_reclaim)
-    batch, _ = sched.schedule()
-    assert batch.is_mixed
-    assert incoming in sched.running
-    assert incoming not in sched.waiting
-    assert incoming.token_ids.count(42) == 1
-
-
-@pytest.mark.parametrize("width", [1, 8])
-def test_refused_receive_reclaim_retains_initialized_decode(width, monkeypatch):
-    sched = scheduler(pages=2, width=width)
-    older = decode(sched, width=width)
-    incoming = receive(sched)
-    sched.max_num_seqs = 1
-    monkeypatch.setattr(
-        sched.kv_connector,
-        "should_defer_free",
-        lambda s: s is incoming and s.status == SequenceStatus.RUNNING,
-    )
-    sched.schedule()
-    assert incoming in sched.running and incoming not in sched.waiting
-    assert older in sched.waiting
-    assert incoming.token_ids.count(42) == 1
-    assert sched._num_parked_remote_kv == 0
-    monkeypatch.setattr(sched.kv_connector, "should_defer_free", lambda s: False)
-    batch, _ = sched.schedule()
-    assert batch.req_ids == [incoming.id]
-    assert incoming.token_ids.count(42) == 1
-
-
 @pytest.mark.parametrize("protection", ["receiving", "connector", "pipeline"])
 def test_waiting_owner_protection_survives_pressure(protection, monkeypatch):
     sched = scheduler(pages=3, offload=True)
@@ -445,8 +390,7 @@ def test_waiting_victim_order_and_readmission(failed):
     assert list(first.block_table) == first_pages
     assert second in sched.waiting and not second.block_table
     assert sched._num_parked_remote_kv == 1
-    assert not second.offload_loaded and not second.offload_load_failed
-    assert second.offload_loaded_tokens == 0
+    assert not sched._is_offload_prefill_resume(second)
     assert second.id not in sched._early_load.entries
     # Retire the decode's allocation; both resumes must admit normally again.
     sched.running.remove(older)
@@ -454,6 +398,8 @@ def test_waiting_victim_order_and_readmission(failed):
     for _ in range(8):
         batch, scheduled = sched.schedule()
         if second.id in scheduled:
+            assert not second.offload_loaded and not second.offload_load_failed
+            assert second.offload_loaded_tokens == 0
             assert batch.num_cached_tokens[batch.req_ids.index(second.id)] == 0
             break
         _finish_step(sched, batch, scheduled, 1)

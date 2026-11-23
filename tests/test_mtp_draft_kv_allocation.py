@@ -122,7 +122,7 @@ def test_room_for_the_step_is_not_the_step_allocated():
     bm = BlockManager(MockConfig(kv_cache_block_size=16, num_kvcache_blocks=8))
     seq = Sequence(list(range(16)), 16)
     bm.allocate(seq)
-    assert bm.can_append(seq, 4)
+    assert bm._has_page_units(bm.append_blocks_needed(seq, 4))
     bm.may_append(seq, 4)
     assert len(seq.block_table) == 1
     bm.may_append(seq, 4, lookahead=draft_kv_lookahead(3))

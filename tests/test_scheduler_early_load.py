@@ -169,18 +169,26 @@ def test_early_tier_load_preserves_mixed_decode_append_pages(
     decode.status = SequenceStatus.RUNNING
     sched.running.append(decode)
 
-    parked = sched._early_load_tier_prefixes(limits=sched._prefill_limits())
+    if mixed:
+        sched.block_manager.reserved_decode_blocks = (
+            sched._prefill_limits().reserved_decode_blocks
+        )
+    parked = sched._early_load_tier_prefixes()
 
     assert parked == (0 if mixed else 1)
     if mixed:
         assert not waiting.block_table
         assert waiting.status == SequenceStatus.WAITING
-        assert sched.block_manager.can_append(decode)
+        assert sched.block_manager._has_page_units(
+            sched.block_manager.append_blocks_needed(decode)
+        )
         sched.block_manager.may_append(decode)
         assert len(decode.block_table) == 2
     else:
         assert waiting.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
-        assert not sched.block_manager.can_append(decode)
+        assert not sched.block_manager._has_page_units(
+            sched.block_manager.append_blocks_needed(decode)
+        )
 
 
 def test_hold_tick_parks_a_request_and_ships_its_load(setup):
@@ -232,7 +240,7 @@ def test_loaded_request_is_not_promoted_ahead_of_earlier_arrivals(
     assert b.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
     sched.finished_recving_kv_req_ids.append(b.id)
 
-    sched._prioritize_ready_remote_kv_requests(limits=sched._prefill_limits())
+    sched._prioritize_ready_remote_kv_requests()
 
     assert list(sched.waiting) == [a, b]  # a parked-and-loaded old-path request
     # would have moved up; an early-loaded one keeps its place
@@ -249,7 +257,7 @@ def test_old_path_parked_request_is_still_promoted(monkeypatch, seq_factory):
     b.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
     sched.finished_recving_kv_req_ids.append(b.id)
 
-    sched._prioritize_ready_remote_kv_requests(limits=sched._prefill_limits())
+    sched._prioritize_ready_remote_kv_requests()
 
     assert list(sched.waiting) == [b, a]
 
@@ -398,7 +406,7 @@ def test_early_load_waits_for_the_inflight_prefix_producer_phase_2_waits_for(set
     waited = []
     sched._wait_for_inflight_prefix = lambda s, cached: waited.append(s.id) or True
 
-    sched._early_load_tier_prefixes(limits=sched._prefill_limits())
+    sched._early_load_tier_prefixes()
 
     assert waited == [seq.id]
     assert seq.status == SequenceStatus.WAITING
@@ -689,7 +697,7 @@ def test_early_loads_in_flight_do_not_use_up_the_probe_budget(monkeypatch, seq_f
         sched._early_load.entries[seq.id] = (seq, 0.0)
         sched.waiting.append(seq)
     sched.waiting.append(seq_factory(list(range(16))))  # a fifth, ready to admit
-    assert sched._can_admit_head_prefill(limits=sched._prefill_limits())
+    assert sched._can_admit_head_prefill()
 
 
 # -- slots, age and failed loads -------------------------------------
@@ -719,7 +727,7 @@ def test_finished_early_loads_are_promoted_when_the_head_has_no_slot(
     sched.waiting.extend([head, *parked])
     sched._num_parked_remote_kv = sched.max_num_seqs
     sched.finished_recving_kv_req_ids = [seq.id for seq in parked]
-    sched._prioritize_ready_remote_kv_requests(limits=sched._prefill_limits())
+    sched._prioritize_ready_remote_kv_requests()
     assert list(sched.waiting)[: len(parked)] == parked
     assert sched.waiting[-1] is head
 
@@ -729,7 +737,7 @@ def test_early_load_leaves_the_last_slot_to_the_head(monkeypatch, seq_factory):
     sched._num_parked_remote_kv = sched.max_num_seqs - 1
     seq = seq_factory(list(range(16)))
     sched.add(seq)
-    assert sched._early_load_tier_prefixes(limits=sched._prefill_limits()) == 0
+    assert sched._early_load_tier_prefixes() == 0
     assert sched._early_load.skips["seq_slots"] == 1
 
 
@@ -807,7 +815,7 @@ def test_settled_early_owner_keeps_fifo_until_the_head_cannot_allocate(
         "can_allocate_memoized",
         lambda seq, **kw: -1 if seq is head else original(seq, **kw),
     )
-    sched._prioritize_ready_remote_kv_requests(limits=sched._prefill_limits())
+    sched._prioritize_ready_remote_kv_requests()
     assert list(sched.waiting) == [owner, head]
     assert owner.block_table
 
@@ -829,7 +837,7 @@ def test_a_settled_early_owner_behind_a_runnable_head_does_not_rebuild_waiting(
     sched.schedule()  # consumes the completion event
     sched.waiting = Counting(sched.waiting)
     for _ in range(3):
-        sched._prioritize_ready_remote_kv_requests(limits=sched._prefill_limits())
+        sched._prioritize_ready_remote_kv_requests()
     assert Counting.clears == 0
     assert list(sched.waiting) == [head, owner]
     # The same queue is rebuilt once the head cannot allocate.
@@ -839,7 +847,7 @@ def test_a_settled_early_owner_behind_a_runnable_head_does_not_rebuild_waiting(
         "can_allocate_memoized",
         lambda seq, **kw: -1 if seq is head else original(seq, **kw),
     )
-    sched._prioritize_ready_remote_kv_requests(limits=sched._prefill_limits())
+    sched._prioritize_ready_remote_kv_requests()
     assert Counting.clears == 1
     assert list(sched.waiting) == [owner, head]
 
@@ -866,8 +874,9 @@ def test_settled_early_owner_passes_a_head_blocked_by_decode_reservation(
         filler = seq_factory([99] * 4)
         assert bm.allocate(filler, 0)
     assert bm.can_allocate_memoized(head) >= 0
-    assert bm.can_allocate_memoized(head, reserved_decode_blocks=1) < 0
-    sched._prioritize_ready_remote_kv_requests(limits=sched._prefill_limits())
+    bm.reserved_decode_blocks = 1
+    assert bm.can_allocate_memoized(head) < 0
+    sched._prioritize_ready_remote_kv_requests()
     assert list(sched.waiting) == [owner, head]
 
 
@@ -889,7 +898,7 @@ def test_a_load_in_flight_ahead_of_the_blocked_head_does_not_hide_it(
     )
     sched.waiting.extend([loading, head, done])
     sched.finished_recving_kv_req_ids = [done.id]
-    sched._prioritize_ready_remote_kv_requests(limits=sched._prefill_limits())
+    sched._prioritize_ready_remote_kv_requests()
     assert list(sched.waiting) == [done, loading, head]
 
 
@@ -964,6 +973,6 @@ def test_early_loads_in_flight_do_not_spend_the_lookup_bypass_budget(
     early = _parked(sched, seq_factory, sched._prefix_bypass_limit())
     ready = seq_factory(list(range(16)))
     sched.waiting.extend([waiter, *early, ready])
-    assert sched._can_admit_head_prefill(limits=sched._prefill_limits())
+    assert sched._can_admit_head_prefill()
     _, scheduled = sched.schedule()
     assert list(scheduled) == [ready.id]

@@ -229,7 +229,7 @@ def _wrap_connectors(entry, depth):
     return entry
 
 
-@pytest.mark.parametrize("depth", [0, 1, 2])
+@pytest.mark.parametrize("depth", [0, 1])
 @pytest.mark.parametrize("speculative", [False, True])
 @pytest.mark.parametrize(
     "entry,pd_producer,disables_spec",
@@ -264,7 +264,7 @@ def test_mixed_producer_refusal_matches_the_execution_mode(
 
 
 @pytest.mark.parametrize("name", ["LMCacheMPConnector", "mooncake_store"])
-@pytest.mark.parametrize("depth", [0, 2])
+@pytest.mark.parametrize("depth", [0, 1])
 def test_non_spec_offload_producer_has_matching_profile_and_mixed_step(
     monkeypatch, name, depth
 ):

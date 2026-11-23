@@ -255,6 +255,9 @@ class BlockManager:
         # round writes. Set by the scheduler, which knows whether this engine
         # drafts; admission charges for it and `may_append` allocates it.
         self.draft_lookahead = 0
+        # Admission protects the mixed tick's decodes. The scheduler updates
+        # this after P/D promotion and clears it before selecting decodes.
+        self.reserved_decode_blocks = 0
         self.min_final_prefill_rows = getattr(config, "min_final_prefill_rows", 0)
         self.state_replay_tokens = getattr(config, "state_replay_tokens", 0)
         self.enable_prefix_caching = config.enable_prefix_caching
@@ -1202,7 +1205,6 @@ class BlockManager:
         *,
         block_hashes: list[int] | None = None,
         probe: AdmissionProbe | None = None,
-        reserved_decode_blocks: int = 0,
     ) -> int:
         """Return number of cache-hit blocks (>=0) if seq fits, else -1.
 
@@ -1234,18 +1236,16 @@ class BlockManager:
                 self._admission_walk,
                 record,
                 block_hashes,
-                reserved_decode_blocks=reserved_decode_blocks,
             )
         assert block_hashes is None, "the probe carries its own chain"
         probe.num_new_blocks = None
-        probe.reserved_decode_blocks = reserved_decode_blocks
+        probe.reserved_decode_blocks = self.reserved_decode_blocks
         probe.num_cached_blocks = self._evaluate(
             seq,
             self._admission_walk,
             record,
             probe.block_hashes,
             probe,
-            reserved_decode_blocks=reserved_decode_blocks,
         )
         return probe.num_cached_blocks
 
@@ -1256,8 +1256,6 @@ class BlockManager:
         record: bool,
         block_hashes: list[int] | None,
         probe: AdmissionProbe | None = None,
-        *,
-        reserved_decode_blocks: int = 0,
     ) -> int:
         """`can_allocate` over the walk `walk_of(seq)` returns; everything but
         the walk is asked afresh on every call. `probe.num_new_blocks` is set
@@ -1271,7 +1269,7 @@ class BlockManager:
             block_hashes.clear()
         if seq.has_per_req_cache and not self.state.has_free(self.state_slots_per_req):
             return -1
-        reserved = reserved_decode_blocks
+        reserved = self.reserved_decode_blocks
         if not self.enable_prefix_caching:
             num_new_blocks = self.num_pool_blocks(
                 len(seq)
@@ -1349,7 +1347,10 @@ class BlockManager:
         # budget checks; refused probes avoid the extra LMCache hash walk.
         if record:
             self.record_allocation(
-                seq, AdmissionProbe(num_cached_blocks, block_hashes, num_new_blocks)
+                seq,
+                AdmissionProbe(
+                    num_cached_blocks, block_hashes, num_new_blocks, reserved
+                ),
             )
         # After the refusal, not before it. The chain is O(prompt) xxhash plus
         # two temporaries per block, and a refused admission discards it — a
@@ -1527,9 +1528,7 @@ class BlockManager:
             return None
         return walk
 
-    def can_allocate_memoized(
-        self, seq: Sequence, *, reserved_decode_blocks: int = 0
-    ) -> int:
+    def can_allocate_memoized(self, seq: Sequence) -> int:
         """`can_allocate(seq, record=False)` for the delayer and the DP chunk
         cost, with the walk memoised per seq. The same `_evaluate`, so state
         room, the gates, the replay, checkpoint demand/end, the used hit blocks
@@ -1543,9 +1542,7 @@ class BlockManager:
         by a publish of that hash), and token count and seed are unchanged.
         """
         walk_of = self._memoised_walk if self.walk_memo else self._walk_prefix
-        return self._evaluate(
-            seq, walk_of, False, None, reserved_decode_blocks=reserved_decode_blocks
-        )
+        return self._evaluate(seq, walk_of, False, None)
 
     def _memoised_walk(self, seq: Sequence) -> _PrefixWalk:
         memo = self._cached_walks.get(seq)
@@ -3809,24 +3806,6 @@ class BlockManager:
 
         seq.offload_joint.load_hash = -1
         seq.offload_joint.reset_joint()
-
-    def can_append(
-        self, seq: Sequence, num_new_tokens: int = 1, lookahead: int = 0
-    ) -> bool:
-        """Whether the pool can back what `may_append` takes for this step.
-
-        Sized on `len(seq) + max(num_new_tokens, lookahead)`. A decode step's
-        `num_new_tokens` (`1 + mtp_k`) already exceeds its draft lookahead
-        (`mtp_k - 1`), so the lookahead never raises the bar there; it is
-        passed so the check states what it covers.
-        """
-        seq_len = len(seq)
-        current_blocks = len(seq.block_table)
-        ebs = self._effective_block_size()
-        reach = seq_len + max(num_new_tokens, lookahead)
-        needed_blocks = (reach + ebs - 1) // ebs
-        new_blocks_needed = max(0, needed_blocks - current_blocks)
-        return self._has_page_units(new_blocks_needed)
 
     def append_blocks_needed(
         self, seq: Sequence, num_new_tokens: int = 1, lookahead: int = 0

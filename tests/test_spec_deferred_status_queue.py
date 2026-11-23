@@ -291,8 +291,8 @@ def test_the_non_deferred_branch_refuses_a_batch_carrying_drafts(is_mixed):
         batch.total_seqs_num_prefill = 1
         batch.total_seqs_num_decode = 1
         batch.is_mixed = True
-        batch.num_rejected = None
-        batch.num_bonus = None
+        batch.num_rejected = np.zeros(2, dtype=np.int32)
+        batch.num_bonus = np.zeros(2, dtype=np.int32)
 
     assert batch.is_mixed is is_mixed
     with pytest.raises(NotImplementedError, match="num_spec_step=3"):

@@ -893,8 +893,7 @@ class DSparkProposer(Drafter):
         # request's scheduled spec tokens to ell_r, which frees batch capacity
         # instead of the no-op in-block masking of Level A.
         if self.verify_scheduler is not None and confidence is not None:
-            first = attn_metadata.num_prefill_seqs if attn_metadata.is_mixed else 0
-            with record_function(f"dspark_sched[bs={scheduled_bs - first}]"):
+            with record_function(f"dspark_sched[bs={scheduled_bs}]"):
                 self._set_verify_lengths(
                     confidence, attn_metadata, scheduled_bs, self.mtp_k
                 )
@@ -903,11 +902,6 @@ class DSparkProposer(Drafter):
         return draft_token_ids
 
     def _set_verify_lengths(self, confidence, attn_metadata, scheduled_bs, width):
-        if self.verify_scheduler is None:
-            return
-        if confidence is None:
-            self.verify_scheduler.set_last_ell(None)
-            return
         # The global throughput budget must only include rows whose drafts
         # will be verified. A mixed step's prefill rows, including final chunks,
         # keep full-width drafts until they produce a decode proposal.

@@ -488,13 +488,13 @@ class TestCanAppend:
         seq = seq_factory([1, 2, 3])
         block_manager.allocate(seq)
         seq.append_token(4)
-        assert block_manager.can_append(seq)
+        assert block_manager._has_page_units(block_manager.append_blocks_needed(seq))
 
     def test_can_append_needs_new_block(self, block_manager, seq_factory):
         seq = seq_factory([1, 2, 3, 4])
         block_manager.allocate(seq)
         seq.append_token(5)
-        assert block_manager.can_append(seq)
+        assert block_manager._has_page_units(block_manager.append_blocks_needed(seq))
 
     def test_cannot_append_no_free(self, seq_factory):
         cfg = MockConfig(num_kvcache_blocks=1, kv_cache_block_size=4)
@@ -502,7 +502,7 @@ class TestCanAppend:
         seq = seq_factory([1, 2, 3, 4])
         bm.allocate(seq)
         seq.append_token(5)
-        assert not bm.can_append(seq)
+        assert not bm._has_page_units(bm.append_blocks_needed(seq))
 
 
 class TestMayAppend:
@@ -621,7 +621,9 @@ class TestCanAppendMultiToken:
         block_manager.allocate(seq)
         seq.append_token(2)
         seq.append_token(3)
-        assert block_manager.can_append(seq, num_new_tokens=3)
+        assert block_manager._has_page_units(
+            block_manager.append_blocks_needed(seq, num_new_tokens=3)
+        )
 
     def test_can_append_multi_token_crossing_boundary(self, seq_factory):
         """block_size=4, seq_len=14 (3.5 blocks=4 blocks allocated),
@@ -633,7 +635,7 @@ class TestCanAppendMultiToken:
         # seq_len=14, 4 blocks. Appending 5 tokens: positions 14..18 → need block 5
         for t in range(14, 19):
             seq.append_token(t)
-        assert bm.can_append(seq, num_new_tokens=5)
+        assert bm._has_page_units(bm.append_blocks_needed(seq, num_new_tokens=5))
 
     def test_cannot_append_multi_token_no_free(self, seq_factory):
         """block_size=4, 4 blocks total, seq fills 4 blocks (16 tokens),
@@ -644,7 +646,7 @@ class TestCanAppendMultiToken:
         bm.allocate(seq)
         for t in range(14, 19):
             seq.append_token(t)
-        assert not bm.can_append(seq, num_new_tokens=5)
+        assert not bm._has_page_units(bm.append_blocks_needed(seq, num_new_tokens=5))
 
 
 # ── Prefix caching + preemption ──────────────────────────────────────────
