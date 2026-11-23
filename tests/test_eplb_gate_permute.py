@@ -1339,3 +1339,22 @@ def test_hot_first_is_a_head_until_the_rebalance_that_stays(monkeypatch):
     assert manager._hot_first() == 3
     monkeypatch.setenv("ATOM_EPLB_HOT_FIRST", "0")
     assert manager._hot_first() == 0
+
+
+def test_step_timer_sorts_step_times_by_what_the_step_ran(monkeypatch, caplog):
+    from types import SimpleNamespace
+
+    timer = eplb._StepTimer(every=4)
+    clock = iter([0.0, 0.010, 0.030, 0.330, 0.340, 0.350])
+    monkeypatch.setattr("time.perf_counter", lambda: next(clock))
+    dec = SimpleNamespace(total_tokens_num=30, total_tokens_num_prefill=0)
+    pf = SimpleNamespace(total_tokens_num=9000, total_tokens_num_prefill=9000)
+    idle = SimpleNamespace(total_tokens_num=0, total_tokens_num_prefill=0)
+    with caplog.at_level(logging.INFO, logger="atom"):
+        for batch in (dec, dec, pf, idle, dec):
+            timer.tick(batch)
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "[STEP-TIMER] steps=4" in text
+    assert "dec: n=2 mean=15.00" in text and "pf: n=1 mean=300.00" in text
+    assert "idle: n=1 mean=10.00" in text and "tok/step=9000.0" in text
+    assert timer.n == 0 and not timer.times

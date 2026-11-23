@@ -3359,6 +3359,71 @@ def trigger_eplb_profile_rearrange() -> None:
     manager.trigger_offline_rebalance(reason="profile")
 
 
+class _StepTimer:
+    """ATOM_EPLB_STEP_TIMER=N (diagnostic, default off): the wall time from one
+    forward's start to the next one's -- a whole engine step of this rank,
+    scheduling and output handling included -- by what the step ran: `pf` (it
+    had prefill tokens), `dec` (decode tokens only; a peer's prefill in the
+    same group step shows as this rank's slow `dec` steps), `idle` (no token:
+    the DP dummy) and `dummy` (warm-up). One log line every N steps. Works
+    with EPLB on or off: it is read before the EPLB manager is looked at."""
+
+    def __init__(self, every: int):
+        self.every = every
+        self.prev_t: float | None = None
+        self.prev_kind = "idle"
+        self.times: dict[str, list[float]] = {}
+        self.rows: dict[str, int] = {}
+        self.n = 0
+
+    def tick(self, batch) -> None:
+        import time as _time
+
+        now = _time.perf_counter()
+        if self.prev_t is not None:
+            self.times.setdefault(self.prev_kind, []).append(now - self.prev_t)
+            self.n += 1
+        self.prev_t = now
+        if getattr(batch, "is_dummy_run", False):
+            kind = "dummy"
+        elif getattr(batch, "total_tokens_num_prefill", 0) > 0:
+            kind = "pf"
+        elif getattr(batch, "total_tokens_num", 0) > 0:
+            kind = "dec"
+        else:
+            kind = "idle"
+        self.prev_kind = kind
+        self.rows[kind] = self.rows.get(kind, 0) + int(
+            getattr(batch, "total_tokens_num", 0) or 0
+        )
+        if self.n >= self.every:
+            self.report()
+
+    def report(self) -> None:
+        parts = []
+        for kind in ("dec", "pf", "idle", "dummy"):
+            values = sorted(self.times.get(kind, ()))
+            if not values:
+                continue
+            count = len(values)
+
+            def q(f, values=values, count=count):
+                return values[min(count - 1, int(f * count))] * 1e3
+
+            parts.append(
+                f"{kind}: n={count} mean={sum(values) / count * 1e3:.2f} "
+                f"p10={q(0.1):.2f} p50={q(0.5):.2f} p90={q(0.9):.2f} "
+                f"p99={q(0.99):.2f} ms tok/step={self.rows.get(kind, 0) / count:.1f}"
+            )
+        logger.info("[STEP-TIMER] steps=%d | %s", self.n, " | ".join(parts))
+        self.times.clear()
+        self.rows.clear()
+        self.n = 0
+
+
+_STEP_TIMER: list[_StepTimer | None] = []
+
+
 def with_eplb_forward_monitor(fn):
     # Resolve once on the first call: if EPLB is disabled at that point the
     # inner function is replaced with a direct pass-through so subsequent calls
@@ -3369,6 +3434,11 @@ def with_eplb_forward_monitor(fn):
 
     @wraps(fn)
     def wrapper(self, batch, *args, **kwargs):
+        if not _STEP_TIMER:
+            every = envs.ATOM_EPLB_STEP_TIMER
+            _STEP_TIMER.append(_StepTimer(every) if every > 0 else None)
+        if _STEP_TIMER[0] is not None:
+            _STEP_TIMER[0].tick(batch)
         if not resolved_manager:
             resolved_manager.append(_MANAGER)
         manager = resolved_manager[0]

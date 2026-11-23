@@ -1236,6 +1236,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_EPLB_GP_COUNT": lambda: os.getenv("ATOM_EPLB_GP_COUNT", "triton")
     .strip()
     .lower(),
+    # Diagnostic: log this rank's engine step times by kind every N steps
+    # (`eplb._StepTimer`); 0 = off. Independent of EPLB being enabled.
+    "ATOM_EPLB_STEP_TIMER": lambda: max(0, _int_env("ATOM_EPLB_STEP_TIMER", 0)),
     # The swap policy also orders every rank's experts by load, the heaviest
     # in the rank's first slot (a static table built by greedy packing has
     # that order, and the expert kernels walk a rank's experts in slot order).
