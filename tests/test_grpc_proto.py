@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """atom.grpc.v1's committed modules: protoc's output for atom_grpc.proto and
 engine_v1.proto, and the AtomEngine contract the gRPC server and atomesh build on."""
 
