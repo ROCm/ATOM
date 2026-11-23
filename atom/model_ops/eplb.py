@@ -3401,6 +3401,8 @@ class _StepTimer:
         # Host seconds spent in EPLB's own code, by where: the forward
         # wrapper before / after the forward, and a decode sample.
         self.host: dict[str, list[float]] = {}
+        self.by_bs: dict[int, list[float]] = {}
+        self.prev_bs: int | None = None
 
     def spent(self, where: str, seconds: float, retag: str | None = None) -> None:
         """EPLB's own host time in the step that is running; ``retag`` files
@@ -3418,6 +3420,9 @@ class _StepTimer:
         if self.prev_t is not None:
             self.times.setdefault(self.prev_kind, []).append(now - self.prev_t)
             self.n += 1
+            group = getattr(self, "prev_bs", None)
+            if group is not None and self.prev_kind in ("dec", "dec_s"):
+                self.by_bs.setdefault(group, []).append(now - self.prev_t)
         self.prev_t = now
         if getattr(batch, "is_dummy_run", False):
             kind = "dummy"
@@ -3431,6 +3436,12 @@ class _StepTimer:
         self.rows[kind] = self.rows.get(kind, 0) + int(
             getattr(batch, "total_tokens_num", 0) or 0
         )
+        # A decode step's time also by this rank's request count (the batch
+        # the step ran), in doubling groups: 1, 2, 3-4, 5-8, 9-16, ...
+        self.prev_bs = None
+        if kind == "dec":
+            seqs = int(getattr(batch, "total_seqs_num", 0) or 0)
+            self.prev_bs = max(0, (seqs - 1).bit_length()) if seqs > 0 else None
         if self.n >= self.every:
             self.report()
 
@@ -3450,6 +3461,17 @@ class _StepTimer:
                 f"p10={q(0.1):.2f} p50={q(0.5):.2f} p90={q(0.9):.2f} "
                 f"p99={q(0.99):.2f} ms tok/step={self.rows.get(kind, 0) / count:.1f}"
             )
+        if self.by_bs:
+            groups = []
+            for group in sorted(self.by_bs):
+                values = sorted(self.by_bs[group])
+                groups.append(
+                    f"<={1 << group}:{len(values)}/"
+                    f"{values[len(values) // 2] * 1e3:.2f}/"
+                    f"{values[min(len(values) - 1, int(0.9 * len(values)))] * 1e3:.2f}"
+                )
+            parts.append("dec by reqs (n/p50/p90 ms) " + " ".join(groups))
+            self.by_bs.clear()
         for where, (seconds, count) in sorted(self.host.items()):
             parts.append(
                 f"host {where}: n={int(count)} mean={seconds / max(1, count) * 1e6:.0f} us"
