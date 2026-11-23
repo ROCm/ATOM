@@ -439,6 +439,10 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
             raise ValueError("logprobs are not served over the Session")
         if given.stop_strings and not request.stop_token_sequences:
             raise ValueError("stop strings need their ids in stop_token_sequences")
+        # The chat route holds a required call only to the server's own channel.
+        channel = given.required_channel
+        if channel is not None and channel != api.required_tool_channel:
+            raise ValueError("required_channel is not this server's tool-call channel")
         kv_transfer_params = request.kv_transfer_params
         api._validate_chunked_receive(kv_transfer_params)
         params = api._build_sampling_params(

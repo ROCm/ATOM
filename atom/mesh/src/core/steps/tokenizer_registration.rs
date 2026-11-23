@@ -109,67 +109,90 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
         let chats_without_template = app_context.chats_without_template.clone();
         let fastokens = app_context.router_config.fastokens.clone();
 
+        // The template a worker advertised, which no --chat-template overrides.
+        let inline_template = chat_template
+            .is_none()
+            .then(|| inline_chat_template.clone())
+            .flatten();
+
         // Load the tokenizer using the registry's load method
         // This handles: validation, deduplication, and loading
-        let result = app_context
-            .tokenizer_registry
-            .load(&id, &name, &source, || {
-                let id = id.clone();
-                let name = name.clone();
-                let source = source.clone();
-                let chat_template = chat_template.clone();
-                let inline_chat_template = inline_chat_template.clone();
-                let cache_cfg = cache_config.clone();
-                let chats_without_template = chats_without_template.clone();
-                let fastokens = fastokens.clone();
-                async move {
-                    // Load base tokenizer
-                    let mut base_tokenizer = factory::create_tokenizer_async_with_chat_template(
-                        &source,
-                        chat_template.as_deref(),
-                    )
-                    .await
-                    .map_err(|e| format!("Failed to load tokenizer: {}", e))?;
-                    if let (None, Some(template)) = (&chat_template, inline_chat_template) {
-                        Arc::get_mut(&mut base_tokenizer)
-                            .ok_or("the loaded tokenizer is already shared")?
-                            .set_chat_template(template)
-                            .map_err(|e| format!("Failed to set the chat template: {}", e))?;
-                    }
-                    let base_tokenizer =
-                        with_fastokens(base_tokenizer, &name, &source, &fastokens).await?;
-                    probe_chat_render(
-                        &chats_without_template,
-                        &id,
-                        &name,
-                        &source,
-                        chat_template.as_deref(),
-                    )
-                    .await;
-                    // fastokens has its own segment cache
-                    // (`--fastokens-segment-cache-mb`, 1 GiB by default).
-                    if base_tokenizer.as_any().is::<FastTokenizer>() {
-                        return Ok(base_tokenizer);
-                    }
-
-                    // Wrap with caching layer if configured
-                    let tokenizer: Arc<dyn Tokenizer> = match cache_cfg {
-                        Some(cfg) if cfg.enable_l0 || cfg.enable_l1 => {
-                            let cache_config = CacheConfig {
-                                enable_l0: cfg.enable_l0,
-                                l0_max_entries: cfg.l0_max_entries,
-                                enable_l1: cfg.enable_l1,
-                                l1_max_memory: cfg.l1_max_memory,
-                            };
-                            Arc::new(CachedTokenizer::new(base_tokenizer, cache_config))
-                        }
-                        _ => base_tokenizer,
-                    };
-
-                    Ok(tokenizer)
+        let registry = &app_context.tokenizer_registry;
+        let loader = || {
+            let id = id.clone();
+            let name = name.clone();
+            let source = source.clone();
+            let chat_template = chat_template.clone();
+            let inline_chat_template = inline_chat_template.clone();
+            let cache_cfg = cache_config.clone();
+            let chats_without_template = chats_without_template.clone();
+            let fastokens = fastokens.clone();
+            async move {
+                // Load base tokenizer
+                let mut base_tokenizer = factory::create_tokenizer_async_with_chat_template(
+                    &source,
+                    chat_template.as_deref(),
+                )
+                .await
+                .map_err(|e| format!("Failed to load tokenizer: {}", e))?;
+                if let (None, Some(template)) = (&chat_template, inline_chat_template) {
+                    Arc::get_mut(&mut base_tokenizer)
+                        .ok_or("the loaded tokenizer is already shared")?
+                        .set_chat_template(template)
+                        .map_err(|e| format!("Failed to set the chat template: {}", e))?;
                 }
-            })
-            .await;
+                let base_tokenizer =
+                    with_fastokens(base_tokenizer, &name, &source, &fastokens).await?;
+                probe_chat_render(
+                    &chats_without_template,
+                    &id,
+                    &name,
+                    &source,
+                    chat_template.as_deref(),
+                )
+                .await;
+                // fastokens has its own segment cache
+                // (`--fastokens-segment-cache-mb`, 1 GiB by default).
+                if base_tokenizer.as_any().is::<FastTokenizer>() {
+                    return Ok(base_tokenizer);
+                }
+
+                // Wrap with caching layer if configured
+                let tokenizer: Arc<dyn Tokenizer> = match cache_cfg {
+                    Some(cfg) if cfg.enable_l0 || cfg.enable_l1 => {
+                        let cache_config = CacheConfig {
+                            enable_l0: cfg.enable_l0,
+                            l0_max_entries: cfg.l0_max_entries,
+                            enable_l1: cfg.enable_l1,
+                            l1_max_memory: cfg.l1_max_memory,
+                        };
+                        Arc::new(CachedTokenizer::new(base_tokenizer, cache_config))
+                    }
+                    _ => base_tokenizer,
+                };
+
+                Ok(tokenizer)
+            }
+        };
+        let mut result = registry.load(&id, &name, &source, &loader).await;
+        // Loaded before with another template (a replaced worker's, or none): load again.
+        if let (Ok(LoadOutcome::AlreadyExists { id: loaded }), Some(template)) =
+            (&result, &inline_template)
+        {
+            if app_context.tokenizer_inline_templates.read().get(loaded) != Some(template) {
+                info!("Tokenizer '{name}' is loaded again with its worker's chat template");
+                if let Some(entry) = registry.remove_by_id(loaded) {
+                    crate::routers::prepare::thread_tokenizer::release_copies(&entry.id);
+                    app_context.forget_tokenizer(&entry.id);
+                }
+                result = registry.load(&id, &name, &source, &loader).await;
+            }
+        }
+        if let (Ok(LoadOutcome::Loaded { id: loaded }), Some(template)) = (&result, inline_template)
+        {
+            let templates = &app_context.tokenizer_inline_templates;
+            templates.write().insert(loaded.clone(), template);
+        }
 
         match result {
             Ok(outcome) => {

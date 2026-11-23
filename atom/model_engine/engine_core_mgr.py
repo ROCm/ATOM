@@ -1175,6 +1175,10 @@ class CoreManager:
         logger.debug(
             f"{self.label}: Add request, sequence ids: {[seq.id for seq in seqs]}"
         )
+        hints = None
+        if self.pp_size == 1 and self._routable_engine_count > 1:
+            # A bad rank hint refuses the batch before a callback is registered.
+            hints = self._resolve_and_validate_hints(seqs)
         # Register callbacks before sending to engine core
         for seq in seqs:
             if seq.stream_callback is not None:
@@ -1190,7 +1194,7 @@ class CoreManager:
             logger.debug(f"{self.label}: Add {len(seqs)} requests to DP rank 0")
             self._send_request(0, _add_frame(seqs))
         else:
-            self._dispatch_to_dp_ranks(seqs)
+            self._dispatch_to_dp_ranks(seqs, hints)
 
     def _build_prefix_router(self, config) -> PrefixSpreadRouter | None:
         """The `prefix_spread` or `share_cache` router, or None.
@@ -1275,7 +1279,9 @@ class CoreManager:
             hints.append(hint)
         return hints
 
-    def _dispatch_to_dp_ranks(self, seqs: list[Sequence]) -> None:
+    def _dispatch_to_dp_ranks(
+        self, seqs: list[Sequence], hints: list[int | None] | None = None
+    ) -> None:
         """Route a batch across DP ranks and send each rank its sub-batch.
 
         Honors an explicit ``data_parallel_rank`` hint; otherwise picks a rank
@@ -1288,7 +1294,8 @@ class CoreManager:
         # whole batch is known good, so a rejected batch never leaks partial
         # load. The resolved hints are reused in the loop below to avoid a second
         # getattr/int pass per seq.
-        hints = self._resolve_and_validate_hints(seqs)
+        if hints is None:
+            hints = self._resolve_and_validate_hints(seqs)
 
         # Backpressure (lazy) dispatch. Only an offline batch (see
         # ``offline_backpressure_batch``) of plain load-balanced seqs: no

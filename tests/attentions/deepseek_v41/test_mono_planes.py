@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Execute mono's cache I/O helpers against independently gathered plane bytes.
 
 These small launches cover K1 stores (including the peer-row receiver), K2
@@ -45,6 +47,8 @@ def _writer(peer):
             "rank": 99,
             "kv_fp8": True,
             "tok_par": False,
+            # a K1 launch's (the layer kernel's writes its step rows too)
+            "fused": False,
             "args": {
                 "ring": data,
                 "ring_scale": scales,
@@ -140,6 +144,8 @@ def _reader():
         c = {
             "lane": lane,
             "kv_fp8": True,
+            # a K2 launch's: every key in the pool
+            "fused": False,
             "args": {
                 "pool": main,
                 "pool_scale": main_scale,
@@ -156,16 +162,17 @@ def _reader():
         attention._rows_to_lds(c, main, slot, kv)
         rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
         gpu.barrier()
+        # the FP8 data plane only: a row's scales take ``_row_codes``, checked
+        # through the PV decode below
         for row in range_constexpr(16):
-            for chunk in range_constexpr(3):
+            for chunk in range_constexpr(2):
                 col = lane + 64 * chunk
-                if col < 132:
-                    word = fx.Int32(
-                        fx.ptr_load(
-                            kv + row * attention.SCORE_LDS_ROW + col, result_type=T.i32
-                        )
+                word = fx.Int32(
+                    fx.ptr_load(
+                        kv + row * attention.SCORE_LDS_ROW + col, result_type=T.i32
                     )
-                    bo.buffer_store(word, rsrc(raw), row * 132 + col)
+                )
+                bo.buffer_store(word, rsrc(raw), row * 128 + col)
             ident = ld_i32(ids, row)
             # One lane's eight columns; real PV loads and E8M0 dequantization.
             tile = attention._ld_row4(c, main, ident, lane * 8)
@@ -226,7 +233,7 @@ def test_mono_qk_and_pv_read_the_same_csa_swa_planes(main_rows):
         )
         expected_rows.append(torch.cat([source[0][row], source[1][row]]))
     expected = torch.stack(expected_rows)
-    raw = torch.empty((16, 528), device="cuda", dtype=torch.uint8)
+    raw = torch.empty((16, 512), device="cuda", dtype=torch.uint8)
     decoded = torch.empty((16, 512), device="cuda", dtype=torch.bfloat16)
     _run_compiled(
         _reader(),
@@ -238,7 +245,7 @@ def test_mono_qk_and_pv_read_the_same_csa_swa_planes(main_rows):
         torch.cuda.current_stream(),
     )
     torch.cuda.synchronize()
-    assert torch.equal(raw, expected)
+    assert torch.equal(raw, expected[:, :512])
     values = expected[:, :512].contiguous().view(torch.float8_e4m3fn).float()
     scales = torch.exp2(expected[:, 512:].float() - 127).repeat_interleave(32, dim=1)
     assert torch.equal(decoded, (values * scales).bfloat16())

@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """What `postprocess` hands the sampler, in rows.
 
 The LM head emits one row per sequence the step FORWARDED. On a prefill that is
@@ -117,7 +119,7 @@ def test_the_sampler_gets_as_many_rows_as_it_has_parameters(monkeypatch):
     scheduled_bs, running_bs, vocab = 3, 4, 8
     out = _runner(seen).postprocess(
         batch=_batch(scheduled_bs),
-        logits=torch.zeros(running_bs, vocab),
+        lm_head_output=mod.LmHeadOutput(None, torch.zeros(running_bs, vocab)),
         temperatures=torch.ones(scheduled_bs),
         top_ks=None,
         top_ps=None,
@@ -144,7 +146,7 @@ def test_a_step_that_padded_nothing_is_unaffected(monkeypatch):
     bs = 5
     _runner(seen).postprocess(
         batch=_batch(bs),
-        logits=torch.zeros(bs, 8),
+        lm_head_output=mod.LmHeadOutput(None, torch.zeros(bs, 8)),
         temperatures=torch.ones(bs),
         top_ks=None,
         top_ps=None,
@@ -182,7 +184,7 @@ def test_the_logprob_gather_reads_the_cut_logits(monkeypatch):
 
     runner.postprocess(
         batch=batch,
-        logits=torch.zeros(running_bs, 8),
+        lm_head_output=mod.LmHeadOutput(None, torch.zeros(running_bs, 8)),
         temperatures=torch.ones(scheduled_bs),
         top_ks=None,
         top_ps=None,
@@ -246,7 +248,13 @@ def test_deferred_tp_broadcasts_complete_probability_payload(
     runner.tokenID_processor.prepare_sampled_ids = transfer
     with pytest.raises(Transferred):
         runner.postprocess(
-            batch, torch.zeros(2, 8), torch.ones(2), None, None, False, None
+            batch,
+            torch.ones(2),
+            None,
+            None,
+            False,
+            mod.LmHeadOutput(None, torch.zeros(2, 8)),
+            None,
         )
     probability_calls = [entry for entry in broadcasts if entry[0].ndim >= 2]
     if not enabled:
@@ -319,7 +327,7 @@ def test_a_masked_row_still_reports_the_models_logprob(
 
     runner.postprocess(
         batch=batch,
-        logits=logits.clone(),
+        lm_head_output=mod.LmHeadOutput(None, logits.clone()),
         temperatures=torch.ones(2),
         top_ks=None,
         top_ps=None,
@@ -333,6 +341,60 @@ def test_a_masked_row_still_reports_the_models_logprob(
     torch.testing.assert_close(values[:, 0, 1:], expected_top)
     torch.testing.assert_close(candidates[:, 0].long(), expected_ids)
     torch.testing.assert_close(ranks[:, 0].long(), (logits > logits[:, :1]).sum(-1) + 1)
+
+
+def _lm_head_runner(monkeypatch, gives, lossless):
+    """A runner whose verify head stands for every step and gives ``gives``,
+    its drafter armed lossless or not; the logits a sentinel."""
+    monkeypatch.setattr(
+        mod,
+        "get_forward_context",
+        lambda: types.SimpleNamespace(spec_decode_metadata="spec"),
+    )
+    runner = object.__new__(mod.ModelRunner)
+    runner._served = None
+    runner.model = types.SimpleNamespace(compute_logits=lambda hidden: "logits")
+    asked = []
+    runner.verify_head = types.SimpleNamespace(
+        samples_step=lambda batch, spec, rows: asked.append(rows) or True,
+        sample_token_ids=lambda hidden: gives,
+    )
+    runner.drafter = types.SimpleNamespace(lossless=object() if lossless else None)
+    return runner, asked
+
+
+@pytest.mark.parametrize("all_greedy", [False, True])
+@pytest.mark.parametrize("lossless", [False, True])
+def test_the_lm_head_takes_the_logits_where_a_ratio_verify_reads_them(
+    monkeypatch, lossless, all_greedy
+):
+    """A lossless drafter's sampled step verifies by the probability ratio:
+    the verify head is not asked, the logits are; any other step takes the
+    head's ids."""
+    runner, asked = _lm_head_runner(monkeypatch, "ids", lossless)
+    output = runner.run_lm_head(_batch(2), torch.zeros(6, 4), all_greedy)
+    if lossless and not all_greedy:
+        assert output == mod.LmHeadOutput(None, "logits") and asked == []
+    else:
+        assert output == mod.LmHeadOutput("ids", None) and asked == [6]
+
+
+def test_the_lm_head_takes_the_logits_where_the_verify_head_gives_none(
+    monkeypatch,
+):
+    runner, _ = _lm_head_runner(monkeypatch, None, False)
+    assert runner.run_lm_head(_batch(2), torch.zeros(6, 4), True) == mod.LmHeadOutput(
+        None, "logits"
+    )
+
+
+def test_a_step_the_model_ran_whole_has_no_lm_head(monkeypatch):
+    runner, asked = _lm_head_runner(monkeypatch, "ids", False)
+    runner._served = object()
+    assert runner.run_lm_head(_batch(2), torch.zeros(6, 4), True) == mod.LmHeadOutput(
+        None, None
+    )
+    assert asked == []
 
 
 def test_prefill_really_does_run_wider_than_it_scheduled():
@@ -455,7 +517,15 @@ def test_channel_constraint_preserves_raw_logprobs(monkeypatch, speculative, ena
         torch.arange((6 if speculative else 2) * 8, dtype=torch.float32).view(-1, 8)
         / 10
     )
-    runner.postprocess(batch, raw.clone(), torch.ones(2), None, None, True, None)
+    runner.postprocess(
+        batch,
+        torch.ones(2),
+        None,
+        None,
+        True,
+        mod.LmHeadOutput(None, raw.clone()),
+        None,
+    )
     assert torch.all(seen["ids"] == 0)
     if not enabled:
         assert seen["payload"] is None
@@ -528,7 +598,13 @@ def test_a_producer_skips_propose_on_either_output_path(
     )
 
     out = runner.postprocess(
-        _batch(2), torch.zeros(2, 8), torch.ones(2), None, None, False, None
+        _batch(2),
+        torch.ones(2),
+        None,
+        None,
+        False,
+        mod.LmHeadOutput(None, torch.zeros(2, 8)),
+        None,
     )
 
     assert len(proposed) == (0 if producer else 1)

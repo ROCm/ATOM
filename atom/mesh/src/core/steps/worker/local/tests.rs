@@ -409,6 +409,36 @@ async fn the_tokenizer_job_renders_with_the_label_template_without_a_flag() {
     assert_eq!(rendered, "label: hi");
 }
 
+/// A worker registered later for a model whose tokenizer is loaded already, with another
+/// template (a replaced worker's), has the tokenizer loaded again with its own.
+#[tokio::test]
+async fn a_later_worker_s_template_replaces_the_loaded_one() {
+    let ctx = context();
+    for template in ["first", "second"] {
+        let info = model_info(
+            "atom-retemplate",
+            &format!("{template}: {{{{ messages[0].content }}}}"),
+            "{}",
+        );
+        register(&ctx, json!({ "url": serve_atom(info, 1).await }))
+            .await
+            .unwrap();
+        let expected = format!("{template}: hi");
+        let rendered = async {
+            loop {
+                let rendered = render(&ctx, "atom-retemplate", Value::Null).await;
+                if rendered == expected {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(15), rendered)
+            .await
+            .unwrap_or_else(|_| panic!("the tokenizer never rendered {expected:?}"));
+    }
+}
+
 /// The label template is set before fastokens wraps the tokenizer: a FastTokenizer
 /// refuses `set_chat_template`.
 #[tokio::test]
