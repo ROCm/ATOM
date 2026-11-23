@@ -122,6 +122,15 @@ class V41DSparkTargetSurface:
             raise RuntimeError(
                 "DeepSeek-V4.1 DSpark taps asked for before the draft was attached"
             )
+        late = _replay_late_start(wrapper.model)
+        if late is not None and min(ids) < late:
+            # A replay runs layers before `late` on every row (and layer
+            # late - 1 outside its module): the taps would disagree on rows.
+            raise ValueError(
+                f"DeepSeek-V4.1 DSpark taps {ids} under decoder SWA bounded "
+                f"replay must all be decoder layers >= {late}; set "
+                "ATOM_SGLANG_V41_DECODER_REPLAY=0"
+            )
         from atom.spec_decode.drafter import install_aux_taps
 
         # The draft's own spec, as native's drafter installs it (input taps;
@@ -198,7 +207,22 @@ class V41DSparkTargetSurface:
     def finish_forward(self, hidden_states, positions, forward_batch) -> torch.Tensor:
         """After the target model, inside its ATOM forward context: write the
         draft's context KV for every row this forward ran and hand the aux
-        block to SGLang's logits processor (``aux_hidden_states``)."""
+        block to SGLang's logits processor (``aux_hidden_states``).
+
+        Every row the late layers ran, as native ``compute_draft_kv`` writes
+        every scheduled row: a radix hit's replay rows ``[P - R, P)``
+        included, which ride in this forward (``hidden_states`` /
+        ``positions`` are the widened rows, and the wrapper gathers SGLang's
+        rows out of the returned aux afterwards). That is what rebuilds the
+        draft's windows below the hit.
+
+        Under decoder SWA bounded replay (``step.replay``) the late layers --
+        the taps' -- ran on each request's last ``window`` rows alone, and
+        ATOM's ``write_context_kv`` writes exactly those under the tail's
+        step. A fused hit's span ``[P - R, L)`` is at least ``R >= window``
+        rows (`deepseek_v41_bridge.v41_extend_replays`), so its tail is
+        ``[L - window, L)``: the first draft block's whole context, whether it
+        lies in SGLang's rows or reaches into the replay rows."""
         from atom.utils.forward_context import get_forward_context
 
         forward = get_forward_context()
@@ -220,22 +244,59 @@ class V41DSparkTargetSurface:
                 f"DeepSeek-V4.1 DSpark forward of {rows} rows, step "
                 f"{step.running_tokens}, positions {int(positions.shape[0])}"
             )
-        if (
-            metadata.served_by_round
-            or step.replay is not None
-            or step.decoder is not None
-        ):
+        if metadata.served_by_round:
             raise RuntimeError(
                 "DeepSeek-V4.1 DSpark on SGLang writes the draft context from "
-                "the plain forward only (no decode round, no bounded replay)"
+                "the plain forward only (no decode round)"
             )
         # The taps exist only with a draft attached (`set_layers_to_capture`).
-        aux = self.take_aux(rows)
-        # ATOM takes the taps as a sequence (`DSparkDraftModel.write_context_kv`);
-        # this one block is them already joined, as a PP relay hands them,
-        # which ATOM projects as is.
+        plan = step.replay
+        if plan is None:
+            aux = self.take_aux(rows)
+        else:
+            if _is_target_verify(mode):
+                raise RuntimeError("DeepSeek-V4.1 DSpark verify ran a bounded replay")
+            aux = tail_aux_to_forward_rows(
+                self.take_aux(int(plan.tail.running_tokens)), plan, rows
+            )
+        # Native's drafter call: under a replay it takes `aux[plan.tail_rows]`
+        # and writes them under the tail's step, so only the rows above are
+        # read; the rest are zero (no draft block reads them). ATOM takes the
+        # taps as a sequence (`DSparkDraftModel.write_context_kv`); this one
+        # block is them already joined, as a PP relay hands them, which ATOM
+        # projects as is.
         self.draft.write_context_kv([aux], positions)
         return aux
+
+
+def tail_aux_to_forward_rows(tail_aux, plan, rows: int) -> torch.Tensor:
+    """A replay's aux block ``[tail width, F]`` (the late-layer taps ran on
+    the tail alone) as the forward's ``[rows, F]``: each real tail row moved
+    to its forward row (``plan.tail_rows[:plan.filled]``), as native's
+    ``DeepseekV41RuntimeModel._move_aux_rows`` moves its capture buffers.
+    Every other row is zero: the forward computed no aux for it."""
+    width = int(plan.tail.running_tokens)
+    if tail_aux.dim() != 2 or int(tail_aux.shape[0]) != width:
+        raise RuntimeError(
+            f"DeepSeek-V4.1 DSpark replay aux {tuple(tail_aux.shape)} is not the "
+            f"tail's {width} rows"
+        )
+    filled = int(plan.filled)
+    if filled > width or filled > rows:
+        raise RuntimeError(
+            f"DeepSeek-V4.1 DSpark replay fills {filled} tail rows of {width} "
+            f"in a forward of {rows}"
+        )
+    aux = tail_aux.new_zeros(rows, tail_aux.shape[1])
+    if filled:
+        aux[plan.tail_rows[:filled]] = tail_aux[:filled]
+    return aux
+
+
+def _replay_late_start(model) -> int | None:
+    """The first layer a replay runs on the tail alone (`_LateLayers`), or
+    None where the runtime model does not replay."""
+    return int(model.late.first) if model.replay else None
 
 
 def install_v41_dspark_target_surface(wrapper) -> V41DSparkTargetSurface:

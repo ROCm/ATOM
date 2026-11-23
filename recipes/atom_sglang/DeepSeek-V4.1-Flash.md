@@ -53,8 +53,7 @@ The plugin refuses, before loading weights:
 - `--kv-cache-dtype` other than `bfloat16` or `fp8_e4m3`. That includes the default `auto`, which SGLang resolves to
   `fp8_e4m3` for DeepSeek-V4.1, so the launch names the format (`--kv-cache-dtype bfloat16` above);
 - `--enable-decoder-swa-bounded-replay` with `ATOM_SGLANG_V41_DECODER_REPLAY` off (below): decoder SWA bounded replay
-  is on by default, so the flag restates the default and contradicts the variable; the same flag with DSpark (below),
-  which runs without decoder SWA bounded replay;
+  is on by default, so the flag restates the default and contradicts the variable;
 - `--enable-encoder-swa-bounded-replay` (SGLang itself refuses it on hardware other than CUDA and gfx950, MI308X
   included);
 - `--disable-hybrid-swa-memory`: the pool is sized by SGLang's hybrid-SWA full token count;
@@ -100,13 +99,17 @@ export SGLANG_RAGGED_VERIFY_MODE=static
 --speculative-algorithm DSPARK --speculative-dspark-block-size 5 --speculative-num-draft-tokens 6
 ```
 
-DSpark runs eagerly here: launch with `--cuda-graph-backend-decode disabled` instead of `full`; the plugin refuses
-decode CUDA graphs with DSpark. DSpark also runs without decoder SWA bounded replay: every prefill row runs every
-layer. The plugin turns SGLang's radix cache off for DSpark launches, with one warning. The plugin refuses a draft
-token count other than 6 (only a `--speculative-dspark-block-size` other than 5 reaches it: with block 5, SGLang itself
+Decode CUDA graphs cover the target's verify and the draft's block (`--cuda-graph-backend-decode full`, as above);
+with DSpark the plugin also refuses `--disable-cuda-graph-padding`, and warns when the decode buckets stop below
+`--max-running-requests` (larger rounds run eagerly). Decoder SWA bounded replay stays on, as natively. The radix cache
+stays on with DSpark: a hit's replay rows rebuild the draft's context windows too. The plugin refuses a draft token
+count other than 6 (only a `--speculative-dspark-block-size` other than 5 reaches it: with block 5, SGLang itself
 refuses any other `--speculative-num-draft-tokens`), a draft checkpoint other than the target's, non-static verify,
-block verification, `--enable-decoder-swa-bounded-replay`, `SGLANG_DSPARK_EMBED_IN_GRAPH=0` (the ATOM draft embeds its
-own block), and `SGLANG_SIMULATE_ACC_LEN` above 1 (unless `ATOM_SGLANG_V41_DSPARK_ALLOW_SIMULATED_ACC=1`, below).
+block verification, `SGLANG_DSPARK_EMBED_IN_GRAPH=0` (the ATOM draft embeds its own block),
+`SGLANG_SIMULATE_ACC_LEN` above 1 (unless `ATOM_SGLANG_V41_DSPARK_ALLOW_SIMULATED_ACC=1`, below), and full hidden-state
+returns (`--enable-return-hidden-states` or `--return-hidden-states-mode full`) under decoder SWA bounded replay: SGLang
+returns every prompt row of the target's DSpark capture, which the replay leaves zero outside each request's last 128
+rows (`--return-hidden-states-mode last` is served; `ATOM_SGLANG_V41_DECODER_REPLAY=0` serves full returns).
 
 ## Environment variables
 
@@ -114,6 +117,6 @@ Read by the plugin (`atom/plugin/sglang/deepseek_v41_envs.py`):
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| **ATOM_SGLANG_V41_DECODER_REPLAY** | bool | 1 (true) | Decoder SWA bounded replay: a prefill runs V4.1's decoder layers on each request's last 128 rows only, as native ATOM does. `0` / `false` / `no` / `off`, or an empty value, turn it off (every prefill row runs every layer), as native's `--no-decoder-swa-bounded-replay` does. Unlike native, which backs a short resumed chunk off to a full window, a chunk SGLang resumes with fewer rows than the window computes every row, and so does a step in which SGLang reads more than each request's last row (input logprobs, a full hidden-state capture, a prefill-only batch); the plugin's prefill output therefore depends on where SGLang cuts a prompt. DSpark launches run without it whatever the variable says. |
+| **ATOM_SGLANG_V41_DECODER_REPLAY** | bool | 1 (true) | Decoder SWA bounded replay: a prefill runs V4.1's decoder layers on each request's last 128 rows only, as native ATOM does. `0` / `false` / `no` / `off`, or an empty value, turn it off (every prefill row runs every layer), as native's `--no-decoder-swa-bounded-replay` does. Unlike native, which backs a short resumed chunk off to a full window, a chunk SGLang resumes with fewer rows than the window computes every row, and so does a step in which SGLang reads more than each request's last row (input logprobs, a full hidden-state capture, a prefill-only batch); the plugin's prefill output therefore depends on where SGLang cuts a prompt. |
 | **ATOM_SGLANG_V41_RADIX** | bool | 1 (true) | Serve SGLang's radix cache with the replay above whenever it is on. `0` / `false` / `no` / `off`, or an empty value, turn SGLang's radix cache off for the launch (declared through SGLang's model-override registry when the server arguments are resolved, so the tokenizer manager and the schedulers agree; one warning). |
 | **ATOM_SGLANG_V41_DSPARK_ALLOW_SIMULATED_ACC** | bool | 0 (false) | Performance runs only: allow `SGLANG_SIMULATE_ACC_LEN` > 1 (a fixed mean accept length; the output text is then not the model's). |

@@ -20,7 +20,9 @@ hit's span starts at ``P - R``, which the bridge translates into ATOM's
 7. the host-row invalidation that lets overlap run;
 8. the GPU page-check tool (``v41_radix_page_check``);
 9. admission: a 400 at the scheduler's queue door for positional embedding
-   overrides.
+   overrides;
+10. DSpark under the replay: launch policy and refusals, verify rounds that
+    never carry a replay, a DSpark prefill hit.
 """
 
 import importlib.util
@@ -663,6 +665,10 @@ class TestLaunchPolicy:
     ARGS = SimpleNamespace(disable_radix_cache=False, speculative_algorithm=None)
     V41 = SimpleNamespace(model_type="deepseek_v41")
 
+    @staticmethod
+    def _args(spec=None):
+        return SimpleNamespace(disable_radix_cache=False, speculative_algorithm=spec)
+
     def test_default_launch_keeps_radix(self, caplog):
         with caplog.at_level("WARNING", logger="atom"):
             assert radix.v41_radix_launch_override(self.ARGS, self.V41) == {}
@@ -686,22 +692,18 @@ class TestLaunchPolicy:
             assert radix.v41_radix_launch_override(args, self.V41) == {}
         assert not caplog.records
 
-    @pytest.mark.parametrize("pinned", [None, "1"])
-    def test_speculation_turns_radix_off_once(self, monkeypatch, caplog, pinned):
-        if pinned is not None:
-            monkeypatch.setenv("ATOM_SGLANG_V41_RADIX", pinned)
-        args = SimpleNamespace(
-            disable_radix_cache=False, speculative_algorithm="DSPARK"
-        )
+    def test_dspark_keeps_radix(self, caplog):
         with caplog.at_level("WARNING", logger="atom"):
-            for _ in range(3):
-                assert radix.v41_radix_launch_override(args, self.V41) == {
-                    "disable_radix_cache": True
-                }
-        (record,) = caplog.records
-        assert "speculative decoding (DSPARK)" in record.getMessage()
-        args.speculative_algorithm = None
-        assert radix.v41_radix_launch_override(args, self.V41) == {}
+            assert radix.v41_radix_launch_override(self._args("DSPARK"), self.V41) == {}
+        assert not caplog.records
+
+    def test_radix_off_wins_over_dspark(self, monkeypatch, caplog):
+        monkeypatch.setenv("ATOM_SGLANG_V41_RADIX", "0")
+        with caplog.at_level("WARNING", logger="atom"):
+            assert radix.v41_radix_launch_override(self._args("DSPARK"), self.V41) == {
+                "disable_radix_cache": True
+            }
+        assert "ATOM_SGLANG_V41_RADIX is off" in caplog.records[0].getMessage()
 
     # ATOM's text type never reaches SGLang's registry: SGLang's V4.1 config
     # forces ``deepseek_v41``.
@@ -1308,7 +1310,9 @@ class TestFusedMetadata:
         builder = SimpleNamespace(
             cache=object(),
             block_size=PAGE,
-            geometry=SimpleNamespace(history_size=HISTORY, window_size=128),
+            geometry=SimpleNamespace(
+                history_size=HISTORY, window_size=128, speculative_tokens=0
+            ),
             max_bs=8,
             max_num_batched_tokens=4096,
             _decoder_replays=True,
@@ -1694,3 +1698,65 @@ class TestOverrideAdmission:
         assert type(reason).__name__ == "FINISH_ABORT"
         assert reason.message == error and int(reason.status_code) == 400
         assert streamed == [["pe"]] and aborted == [1]
+
+
+# ---------------------------------------------------------------------------
+# 10. DSpark under the replay
+# ---------------------------------------------------------------------------
+
+
+VERIFY = ForwardMode.TARGET_VERIFY
+DSPARK_WIDTH = bridge.V41_DSPARK_VERIFY_TOKENS
+
+
+def _verify_fb(prefix, slots):
+    ends = [p + DSPARK_WIDTH for p in prefix]
+    return SimpleNamespace(
+        forward_mode=VERIFY,
+        rids=[f"v{i}" for i in range(len(slots))],
+        batch_size=len(slots),
+        seq_lens=torch.tensor(ends, dtype=torch.int64),
+        seq_lens_cpu=torch.tensor(ends, dtype=torch.int64),
+        req_pool_indices=torch.tensor(slots, dtype=torch.int64),
+        req_pool_indices_cpu=None,
+        spec_info=SimpleNamespace(
+            draft_token_num=DSPARK_WIDTH,
+            live_seq_lens_cpu=torch.tensor(prefix, dtype=torch.int64),
+        ),
+    )
+
+
+class TestDSparkUnderTheReplay:
+    def test_dspark_is_not_a_radix_refusal(self, launch):
+        launch.bags["spec"].speculative_algorithm = "DSPARK"
+        bags = launch.bags
+        refusals = bridge._radix_refusals(bags["memory"], bags["schedule"])
+        assert [name for name, on in refusals if on] == []
+
+    def test_verify_rounds_read_no_stamps(self, monkeypatch, req_to_token, radix_on):
+        monkeypatch.setattr(
+            bridge, "_radix_stamps", lambda: pytest.fail("verify read stamps")
+        )
+        batch = build_v41_scheduled_batch(_verify_fb([PAGE + 3, 40], [1, 2]), PAGE)
+        assert batch.replaying == {}
+        assert batch.replay_rows.tolist() == [0, 0]
+        assert batch.num_scheduled_tokens.tolist() == [DSPARK_WIDTH] * 2
+
+    def test_the_seam_leaves_verify_batches_alone(self, monkeypatch, radix_on):
+        world = _World(monkeypatch)
+        batch = world.batch([PAGE], [1], mode=VERIFY)
+        assert run_v41_prefix_replay(world.worker, batch) is None
+        assert not world.pool.state_gen.any()
+        assert not radix._LOGGED_FIRST_FUSED
+
+    def test_dspark_prefill_hit_rides_in_its_step(self, monkeypatch, radix_on):
+        """SGLang's ``DSparkWorkerV2._forward_prefill`` hands the target
+        worker the EXTEND ``ScheduleBatch`` (FULL capture): the seam plans the
+        same record as without speculation."""
+        world = _World(monkeypatch)
+        req = _req(range(500, 500 + 2 * PAGE + 9), rid="d")
+        batch = world.batch([2 * PAGE], [3], [req])
+        batch.spec_algorithm = "DSPARK"
+        fused = run_v41_prefix_replay(world.worker, batch)
+        assert fused.starts.tolist() == [2 * PAGE - R]
+        assert fused.ends.tolist() == [2 * PAGE]

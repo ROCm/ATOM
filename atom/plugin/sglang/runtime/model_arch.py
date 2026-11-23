@@ -115,26 +115,6 @@ def _build_glm52_dsa_forward_metadata(
     return _build_glm52_dsa_metadata(atom_config, forward_batch, positions)
 
 
-def _deepseek_v41_decoder_replays(atom_config: Any) -> bool:
-    """Whether V4.1 keeps decoder SWA bounded replay on the SGLang plugin: on
-    as natively unless ATOM_SGLANG_V41_DECODER_REPLAY turns it off. Unlike
-    native, the prefill output here depends on where SGLang cuts a prompt: a
-    resumed chunk shorter than the window computes every row
-    (`deepseek_v41_bridge.v41_extend_replays`).
-
-    Off under DSpark: its aux taps and the in-forward draft context write
-    (`deepseek_v41_dspark.V41DSparkTargetSurface`) consume every row of the
-    plain backbone, and SGLang's DSpark prefill captures FULL hidden states,
-    which `v41_extend_replays` refuses anyway. A tail-only draft context
-    (native's `_late_on_tail`) is a follow-up.
-    """
-    from atom.plugin.sglang.deepseek_v41_bridge import is_v41_dspark_atom_config
-
-    if not deepseek_v41_envs.ATOM_SGLANG_V41_DECODER_REPLAY:
-        return False
-    return not is_v41_dspark_atom_config(atom_config)
-
-
 def _prepare_deepseek_v41_config(atom_config: Any, model_arch: str) -> None:
     del model_arch
     refuse_unsupported_sglang_features()
@@ -143,9 +123,17 @@ def _prepare_deepseek_v41_config(atom_config: Any, model_arch: str) -> None:
     align_atom_config_with_sglang(atom_config)
     # One V4.1 PAGE per SGLang page; Config picked native's 128.
     atom_config.kv_cache_block_size = ATOM_DEEPSEEK_V41_SGLANG_BLOCK_SIZE
-    # Decided before the runtime model decides whether to build its replay
-    # stages.
-    if not _deepseek_v41_decoder_replays(atom_config):
+    # Decoder SWA bounded replay: on as natively, DSpark included, unless
+    # ATOM_SGLANG_V41_DECODER_REPLAY turns it off; decided before the runtime
+    # model builds its replay stages. Unlike native, the prefill output here
+    # depends on where SGLang cuts a prompt: a resumed chunk shorter than the
+    # window computes every row (`deepseek_v41_bridge.v41_extend_replays`).
+    # Under DSpark the draft taps (layers 37-39) run on the tail, and the
+    # in-forward draft context write takes each request's last window rows,
+    # the ones its first draft block reads
+    # (`V41DSparkTargetSurface.finish_forward`, native's `_move_aux_rows` +
+    # `DeepseekV41DSpark.write_context_kv`).
+    if not deepseek_v41_envs.ATOM_SGLANG_V41_DECODER_REPLAY:
         atom_config.enable_decoder_swa_bounded_replay = False
     # Encoder replay rebuilds the state below a prefix hit: on exactly when
     # SGLang's radix cache is (`deepseek_v41_radix`, which it installs). The

@@ -53,10 +53,11 @@ class ATOMV41MarkovHeadAdapter(BaseDSparkMarkovHead):
     """SGLang's Markov-head interface over ATOM's ``DSparkMarkovHead``.
 
     The bias is ATOM's own forward: ``W1[x_{k-1}] @ W2^T`` in fp32
-    (``markov_w{1,2}`` are ``[V, r]``). The vocab is whole on every rank (ATOM
-    keeps both tables replicated), so ``vocab_shard`` stays None and SGLang
-    samples from the gathered base logits. No fused greedy weight: the fused
-    kernel is a separate, single-variable experiment.
+    (``markov_w{1,2}`` are ``[V, r]``), with W2's fp32 cast held once
+    (`refresh_w2_cache`) instead of redone per block position. The vocab is
+    whole on every rank (ATOM keeps both tables replicated), so ``vocab_shard``
+    stays None and SGLang samples from the gathered base logits. No fused
+    greedy weight (SGLang's one-row kernel).
 
     ATOM's head is held outside the module tree so its weights are not
     registered twice.
@@ -75,10 +76,45 @@ class ATOMV41MarkovHeadAdapter(BaseDSparkMarkovHead):
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.atom_markov_head.markov_w1(token_ids.long())
 
+    def refresh_w2_cache(self) -> torch.Tensor:
+        """``markov_w2`` as fp32, cast once instead of on every block position.
+
+        ``DSparkMarkovHead.forward`` casts the whole ``[V, r]`` table per
+        position (5 x 66 MB read + 132 MB write a round).
+        The copy is the same fp32 values in the same layout, so
+        ``emb.float() @ w2.t()`` is the identical GEMM; +V*r*4 B (132 MB) a
+        rank. Built at load (`load_weights`), inside the memory the KV profile
+        sees. A reload refreshes it in place: a captured draft graph reads its
+        address."""
+        weight = self.atom_markov_head.markov_w2.weight
+        cache = self.__dict__.get("_w2_f32")
+        if (
+            cache is not None
+            and cache.shape == weight.shape
+            and cache.device == weight.device
+        ):
+            cache.copy_(weight.detach())
+        else:
+            cache = weight.detach().float().contiguous()
+            self.__dict__["_w2_f32"] = cache
+        self.__dict__["_w2_src"] = weight.data_ptr()
+        return cache
+
+    def _w2_fp32(self) -> torch.Tensor:
+        """The fp32 cache of the live ``markov_w2``: built at load
+        (`load_weights`), refreshed if the parameter was replaced since."""
+        weight = self.atom_markov_head.markov_w2.weight
+        if self.__dict__["_w2_src"] != weight.data_ptr():
+            return self.refresh_w2_cache()
+        return self.__dict__["_w2_f32"]
+
     def step_bias(self, prev_tokens, *, hidden_states, state):
         del hidden_states
-        bias, _ = self.atom_markov_head(prev_tokens.long())
-        return bias, state
+        w2 = self._w2_fp32()
+        embed = self.atom_markov_head.markov_w1(prev_tokens.long())
+        # fp32 matmul, as `DSparkMarkovHead.forward`: the bias enters the
+        # softmax that gates acceptance.
+        return torch.matmul(embed.float(), w2.t()), state
 
     def step_logits_dtype(self, base_dtype: torch.dtype) -> torch.dtype:
         del base_dtype
@@ -245,6 +281,9 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 True,
             )
         self._report_coverage(loaded)
+        # The Markov tables are plain embeddings (no quant post-processing),
+        # final here; a reload refreshes the fp32 W2 in place.
+        self.markov_head.refresh_w2_cache()
         return loaded
 
     def _report_coverage(self, loaded) -> None:
@@ -367,6 +406,19 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             )
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=normed)
 
+    def prepare_v41_draft_graph(self) -> None:
+        """Build the block's lazy caches -- the stages' layer ids and the
+        noise row (a TP all-reduce of the shared embedding) -- before any
+        draft graph capture, so neither is first built under a capture.
+        SGLang attaches the target's embed and head (`attach_shared_modules`)
+        before it sets any graph state up."""
+        embed = self.model.embed
+        with plugin_runtime_scope(
+            framework="sglang", atom_config=self.target_atom_config
+        ):
+            self.model._context_layer_ids(embed.weight.device)
+            self.model._noise_embedding()
+
     def compute_base_logits(self, x: torch.Tensor):
         """The shared target head over the draft's normed rows, full vocab
         (ATOM's head gathers it across TP), as native ``head_and_sample``
@@ -396,9 +448,12 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         produced them wrote them (`V41DSparkTargetSurface.finish_forward`),
         under its own step, before the verdict -- native's order. Rejected
         verify rows sit above the next anchor, masked by the block's indices,
-        in ring slots no committed row of the window shares. So this writes
-        nothing. ``target_hidden`` is the aux block the target forward
-        returned (unprojected: this draft does not pre-project)."""
+        in ring slots no committed row of the window shares. After a radix
+        hit at ``P`` SGLang injects ``[P, L)`` only; the rows below ``P`` the
+        window needs were written by the same forward's replay rows
+        (``deepseek_v41_radix``). So this writes nothing. ``target_hidden`` is
+        the aux block the target forward returned (unprojected: this draft
+        does not pre-project)."""
         del target_hidden, pool, positions, cache_loc, cache_loc_2d, commit_lens
         del target_hidden_is_projected
 

@@ -3,17 +3,18 @@
 
 A prefix hit starts a request's extend at ``P > 0``: SGLang's tree hands back
 the PAGEs below ``P`` (main rows and index planes, shared, read-only), but the
-request's STATE slot (window ring, compressor rings, Engram cursor) holds
-nothing at ``P``. Native ATOM rebuilds it by default, and SGLang's opt-in
-encoder replay the same way, and so does this module: recompute the ``R`` rows
-``[P - R, P)`` into the freshly reset slot, write no shared PAGE (ATOM's
-compress plan writes no group below ``write_from = P``), and seed the Engram
-history from the tokens before ``P - R``. The window rows below
-``P - R + 127`` see a truncated window: a bounded approximation, the one
-native ATOM defaults to (``Config.enable_encoder_swa_bounded_replay=True``,
-``R = 128``, ``REPLAY_ROWS``). SGLang's default is exact instead (its SWA pool
-keeps the window behind a hit); this module has no such pool and always
-replays. It matches native ATOM, not an exact recompute.
+request's STATE slot (window ring, compressor rings, Engram cursor, and under
+DSpark the draft's context windows) holds nothing at ``P``. Native ATOM
+rebuilds it by default, and SGLang's opt-in encoder replay the same way, and so
+does this module: recompute the ``R`` rows ``[P - R, P)`` into the freshly
+reset slot, write no shared PAGE (ATOM's compress plan writes no group below
+``write_from = P``), and seed the Engram history from the tokens before
+``P - R``. The window rows below ``P - R + 127`` see a truncated window: a
+bounded approximation, the one native ATOM defaults to
+(``Config.enable_encoder_swa_bounded_replay=True``, ``R = 128``,
+``REPLAY_ROWS``). SGLang's default is exact instead (its SWA pool keeps the
+window behind a hit); this module has no such pool and always replays. It
+matches native ATOM, not an exact recompute.
 
 The ``R`` rows run as native ATOM runs them (``BlockManager.replay_start``):
 inside the step's own forward, prepended to the hit request's span. ATOM sees
@@ -102,12 +103,45 @@ for every launch, and SGLang itself refuses unified memory (the only KV
 relocation) for this model. With ``--disable-radix-cache`` nothing here is
 installed.
 
+DSpark (SGLang's ``DSparkWorkerV2`` over the V4.1 target, the one speculative
+deployment the bridge serves) runs under the replay unchanged, as native ATOM
+runs DSpark under its prefix cache:
+
+- The draft's per-request state is its three context windows (draft layers
+  40-42), rings in the request's own STATE slot beside the target's 40 (native
+  ``docs/deepseek_v41_dspark.md``: "43 request-owned windows"). The Markov
+  head carries nothing across rounds (its bias is ``W1[x_{k-1}]`` inside a
+  block), SGLang's next draft input is the prefill's bonus token and
+  ``seq_lens``, and the verify's tentative state is committed inside its own
+  round, before any prefill is staged (``require_committed``). So a hit
+  needs exactly what the target needs: the slot rebuilt below ``P``.
+- The rebuild is the replay's own forward. The target wrapper writes the
+  draft's context rows from every row its forward ran
+  (``V41DSparkTargetSurface.finish_forward``, native ``compute_draft_kv``'s
+  "every scheduled row is written"): the widened forward's rows, ``[P - R, P)``
+  included. Native does the same: ``BlockManager.replay_start`` starts a hit's
+  forward a hash block (128 rows) below it and ``compute_draft_kv`` runs on
+  that forward's positions. ``R >= window`` (128, the draft's window too)
+  covers the first draft block's context ``[L - 128, L)``.
+- Decoder SWA bounded replay stays on under DSpark (as natively): a hit's
+  widened span ``[P - R, L)`` is at least the window long, so the step
+  replays, the late layers (and the draft taps on them) run on its last 128
+  rows ``[L - 128, L)`` alone and ``write_context_kv`` writes exactly those --
+  the first draft block's context, reaching into ``[P - R, P)`` when
+  ``L - P < 128``.
+- SGLang's DSpark injection (``write_target_hidden_kv``) still sees only
+  SGLang's rows ``[P, L)``: the wrapper gathers them out of the widened aux.
+  SGLang keeps its own draft KV for ``[0, P)`` in the tree's token slots;
+  this draft has none outside the slot's windows, so there is nothing to
+  reuse and nothing stale.
+- Verify and draft-block graphs never see a hit: the replay runs only on an
+  EXTEND (``is_extend_without_speculative``), and the first verify after it
+  stages off a committed slot like any other.
+
 Radix on by default for V4.1 on the plugin: whenever SGLang's radix cache is
 on (no ``--disable-radix-cache``) and ATOM serves the model. ``ATOM_SGLANG_V41_RADIX=0``
 turns SGLang's radix cache off for such a launch at server-args resolution,
-with one warning (``v41_radix_launch_override``), and so does speculative
-decoding (DSpark): its draft windows and verify lifecycle are not served under
-the replay here.
+with one warning (``v41_radix_launch_override``).
 """
 
 from __future__ import annotations
@@ -157,10 +191,8 @@ def radix_replay_rows() -> int | None:
 
 
 # --- Launch policy (SGLang server-args resolution) ---
-# Radix is on whenever SGLang's radix cache is. Where the replay cannot run
-# (speculative decoding: the DSpark draft windows and the verify lifecycle
-# are not served under a replay here) or the operator turned it off
-# (ATOM_SGLANG_V41_RADIX=0), SGLang's radix cache is turned off with it,
+# Radix is on whenever SGLang's radix cache is. Where the operator turned it
+# off (ATOM_SGLANG_V41_RADIX=0), SGLang's radix cache is turned off with it,
 # through SGLang's own model-override registry: the declaration is resolved
 # once in the launching process, before the tokenizer manager and the
 # schedulers are spawned, so every reader of ``disable_radix_cache`` (the
@@ -186,10 +218,10 @@ def _resolving_view(server_args):
 
 def v41_radix_launch_override(server_args, hf_config) -> dict:
     """SGLang model-override provider: ``disable_radix_cache=True`` for a
-    DeepSeek-V4.1 launch ATOM serves while ``ATOM_SGLANG_V41_RADIX`` is off or
-    the launch speculates, with one warning; nothing otherwise. The entry
-    point registers it on every SGLang launch, so a native V4.1 launch (ATOM
-    not serving the model) is left alone."""
+    DeepSeek-V4.1 launch ATOM serves while ``ATOM_SGLANG_V41_RADIX`` is off,
+    with one warning; nothing otherwise. The entry point registers it on
+    every SGLang launch, so a native V4.1 launch (ATOM not serving the model)
+    is left alone."""
     global _POLICY_WARNED
     from atom.plugin.sglang.register import _is_atom_external_model_enabled
 
@@ -197,26 +229,16 @@ def v41_radix_launch_override(server_args, hf_config) -> dict:
         return {}
     if not _is_atom_external_model_enabled():
         return {}
-    cfg = _resolving_view(server_args)
-    if cfg.disable_radix_cache:
+    if _resolving_view(server_args).disable_radix_cache:
         return {}
-    algorithm = cfg.speculative_algorithm
-    if not envs.ATOM_SGLANG_V41_RADIX:
-        reason = "ATOM_SGLANG_V41_RADIX is off"
-    elif algorithm is not None:
-        reason = (
-            f"speculative decoding ({algorithm}) is not served with the "
-            "DeepSeek-V4.1 radix cache"
-        )
-    else:
+    if envs.ATOM_SGLANG_V41_RADIX:
         return {}
     if not _POLICY_WARNED:
         _POLICY_WARNED = True
         logger.warning(
-            "ATOM DeepSeek-V4.1: %s; turning SGLang's radix cache off for this "
-            "launch (same as --disable-radix-cache). Pass --disable-radix-cache "
-            "to silence this.",
-            reason,
+            "ATOM DeepSeek-V4.1: ATOM_SGLANG_V41_RADIX is off; turning SGLang's "
+            "radix cache off for this launch (same as --disable-radix-cache). "
+            "Pass --disable-radix-cache to silence this."
         )
     return {"disable_radix_cache": True}
 

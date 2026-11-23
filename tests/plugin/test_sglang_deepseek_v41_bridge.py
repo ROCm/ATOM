@@ -977,7 +977,7 @@ class TestForwardMetadata:
     def test_extend_carries_the_replay_verdict(self, monkeypatch, req_to_token):
         builder = _RecordingBuilder(positions=torch.arange(5))
         builder._decoder_replays = True
-        builder.geometry = SimpleNamespace(window_size=128)
+        builder.geometry = SimpleNamespace(window_size=128, speculative_tokens=0)
         fb = _forward_batch(
             ForwardMode.EXTEND,
             req_pool_indices=[1, 2],
@@ -2031,7 +2031,7 @@ class TestGraphBackend:
         backend.init_cuda_graph_state(2, 2)
         fb = _capture_fb(1)
         fb.forward_mode = ForwardMode.TARGET_VERIFY
-        with pytest.raises(NotImplementedError, match="plain decode only"):
+        with pytest.raises(NotImplementedError, match="decode graphs .* TARGET_VERIFY"):
             backend.init_forward_metadata_out_graph(fb, in_capture=True)
 
     def test_replay_stages_through_the_bridge(self, graph_backend, monkeypatch):
@@ -2135,6 +2135,26 @@ class TestExtendReplays:
         last = SimpleNamespace(is_full=lambda: False)
         assert not _replays([4096], [0], capture_hidden_mode=full)
         assert _replays([4096], [0], capture_hidden_mode=last)
+        # DSpark's FULL capture feeds only the no-op injector: the draft
+        # context is written in the forward, from the tail.
+        fb = SimpleNamespace(
+            capture_hidden_mode=full,
+            is_prefill_only=False,
+            return_logprob=False,
+            extend_logprob_start_lens_cpu=None,
+        )
+        batch = SimpleNamespace(
+            num_scheduled_tokens=np.asarray([4096], np.int32),
+            context_lens=np.asarray([4096], np.int64),
+        )
+        assert bridge.v41_extend_replays(fb, batch, 128, dspark_context_in_forward=True)
+        fb.is_prefill_only = True
+        assert not bridge.v41_extend_replays(
+            fb,
+            batch,
+            128,
+            dspark_context_in_forward=True,
+        )
         assert not _replays([4096], [0], is_prefill_only=True)
         # Input logprobs on any row before the last.
         assert not _replays(
