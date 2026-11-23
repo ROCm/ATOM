@@ -29,11 +29,12 @@ python3 -m pytest -q                         # 改了脚本先跑测试
 - 结果开头写全镜像名，以及 ATOM、aiter 的 branch、完整 commit 和日期；跑挂的模型在 Failures 里附复现命令，取自 `../runs/<YYYYMMDD>/<slug>/*_cmd*.sh`。
 - `../pending_fixes.csv` 登记某个模型在 main 上还在等的 PR。这个模型出了问题又没写说法时，`make_report.py` 会在警告下面列出这些 PR，并给出一行可以直接贴进 `followups.csv` 的说法。
 - `../perf_target.csv` 登记每个模型每个场景、每个并发的目标每卡吞吐（guide §4.2）。Results 和 Details 的性能表里 `% of target` 一列写本场每卡吞吐占目标的百分比和目标值，例如 `16.0% of 250`；没设目标的写 —，跑挂的写 N/A。
+- `../pending_optimizations.csv` 登记每个模型还没合入 main 的优化 PR，一个 PR 一行（guide §4.2）。Results 里 `% of target` 后面一列把它们写成 `ATOM-2942`、`aiter-7876` 这样的链接；PR 合入后删掉那一行。
 - 依赖：Python 3.10 以上、matplotlib；跑测试还要 pytest。没有字体文件也能画，会退回 DejaVu Sans。
 
 ## 样例
 
-`examples/` 是 **EXAMPLE（示例）**：一份编出来的数据目录，结构和 `recipes/455-CI/` 一样，数字都不是真实测试数据，结果和图上都标了 EXAMPLE。用它生成的样例结果是 [`recipes/result/example.md`](../../result/example.md)：周六 11-14 那场，8 个模型都测了精度和性能，各种情况都有一个。Qwen-35B-A3B 的 c64 跑挂（说法是复现文档）；DeepSeek R1 回退 5%（说法是我们修好并验证的 PR）；DeepSeek-V4.1-Flash 快了 6%、GSM8K 掉了 5 个点（说法是别人正在修的 PR）；Kimi-K3 上一场跑挂、这场恢复。Kimi-K3、Qwen-35B-A3B 和 GLM-5.2 的 c64 设了编的目标性能，`% of target` 一列里百分比、N/A（跑挂）和 —（没设目标）都有。PR 链接是编的，指不到真实的 PR。周三 11-18 那场只测精度，只用来画精度图（MiniMax-M3 掉了 4.7 个点）。
+`examples/` 是 **EXAMPLE（示例）**：一份编出来的数据目录，结构和 `recipes/455-CI/` 一样，数字都不是真实测试数据，结果和图上都标了 EXAMPLE。用它生成的样例结果是 [`recipes/result/example.md`](../../result/example.md)：周六 11-14 那场，8 个模型都测了精度和性能，各种情况都有一个。Qwen-35B-A3B 的 c64 跑挂（说法是复现文档）；DeepSeek R1 回退 5%（说法是我们修好并验证的 PR）；DeepSeek-V4.1-Flash 快了 6%、GSM8K 掉了 5 个点（说法是别人正在修的 PR）；Kimi-K3 上一场跑挂、这场恢复。Kimi-K3、Qwen-35B-A3B 和 GLM-5.2 的 c64 设了编的目标性能，`% of target` 一列里百分比、N/A（跑挂）和 —（没设目标）都有；Kimi-K3 和 GLM-5.2 还列了编的未合入优化 PR。PR 链接是编的，指不到真实的 PR。周三 11-18 那场只测精度，只用来画精度图（MiniMax-M3 掉了 4.7 个点）。
 
 ![MLPerf Endpoint 每卡吞吐趋势（EXAMPLE）](examples/runs/20261114/charts/perf-endpoint.png)
 

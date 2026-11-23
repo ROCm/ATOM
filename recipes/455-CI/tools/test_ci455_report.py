@@ -365,7 +365,8 @@ def test_summary_row_shows_c64_throughput_before_and_now_with_the_delta():
         "1,040",
         "🟢 +4.0%",
         "—",
-        "−0.2 pts (now 93.9%)",
+        "—",
+        "−0.2 pts",
     ]
 
 
@@ -385,7 +386,8 @@ def test_summary_row_dates_a_previous_value_older_than_the_column():
         "340",
         "+1.2%",
         "—",
-        "−0.1 pts (now 96.1%) (vs 2026-10-31)",
+        "—",
+        "−0.1 pts",
     ]
 
 
@@ -400,7 +402,7 @@ def test_summary_row_of_a_failed_run_shows_na():
         "2026-11-14",
         "2026-11-07",
     )
-    assert row == ["Bravo", "MLPerf Endpoint", "900", "N/A", "N/A", "—", "N/A"]
+    assert row == ["Bravo", "MLPerf Endpoint", "900", "N/A", "N/A", "—", "—", "N/A"]
 
 
 def test_summary_row_of_a_first_run_has_no_delta():
@@ -416,7 +418,8 @@ def test_summary_row_of_a_first_run_has_no_delta():
         "1,000",
         "first",
         "—",
-        "first (now 95.0%)",
+        "—",
+        "first",
     ]
 
 
@@ -439,10 +442,27 @@ def test_a_failed_point_has_no_share_of_its_target():
     assert row[3:6] == ["N/A", "N/A", "N/A"]
 
 
+def test_summary_row_links_the_unmerged_optimization_prs_by_repo_and_number():
+    r = kimi(pc(64, 39.9, None))
+    r.optimization_prs = [
+        "https://github.com/ROCm/ATOM/pull/2942",
+        "https://github.com/ROCm/aiter/pull/7876",
+    ]
+    row = summary_row(r, "2026-11-21", None)
+    assert row[5:] == [
+        "16.0% of 250",
+        (
+            "[ATOM-2942](https://github.com/ROCm/ATOM/pull/2942), "
+            "[aiter-7876](https://github.com/ROCm/aiter/pull/7876)"
+        ),
+        "first",
+    ]
+
+
 def test_the_results_and_details_put_each_concurrency_against_its_own_target():
     text = report_md("2026-11-21", {}, [kimi(pc(64, 39.9, None))], "c", "r")
     assert (
-        "| Model | Scenario | — (tok/s/GPU) | 2026-11-21 (tok/s/GPU) | Delta | % of target | GSM8K delta |"
+        "| Model | Scenario | — (tok/s/GPU) | 2026-11-21 (tok/s/GPU) | Delta | % of target | Unmerged optimization PRs | GSM8K delta |"
         in text
     )
     assert "| tok/s/GPU | vs — | % of target |" in text
@@ -515,7 +535,7 @@ def test_summary_row_of_a_model_that_did_not_run_shows_dashes_not_na():
         "2026-11-14",
         "2026-11-07",
     )
-    assert row == ["Alpha", "MLPerf Endpoint", "1,000", "—", "—", "—", "—"]
+    assert row == ["Alpha", "MLPerf Endpoint", "1,000", "—", "—", "—", "—", "—"]
 
 
 PR_OPEN = "https://github.com/ROCm/aiter/pull/1234"

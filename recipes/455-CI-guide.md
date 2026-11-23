@@ -543,6 +543,13 @@ awk -F, -v d=<YYYY-MM-DD> '$2 == d {print $4}' perf.csv accuracy.csv | sort -u
 
 **目标性能**写在 `perf_target.csv`，一个模型的一个场景、一个并发一行，五列：`model`（§1 的 slug）、`scenario`（`endpoint` 或 `8k1k`）、`concurrency`（`4` 或 `64`）、`tok_s_per_gpu`（目标每卡吞吐，口径同 §4.1）、`source`（谁给的、哪天给的）。报告的 Results 和 Details 的性能表里都有一列 `% of target`：本场每卡吞吐 ÷ 目标，后面带上目标值，例如 Kimi-K3 endpoint c64 本场 39.9、目标 250，写 `16.0% of 250`。没设目标的写 —，跑挂的写 N/A。目标变了就改那一行和它的 `source`；每个点只有一个目标，重新生成旧场次的结果也按新目标算。
 
+**还没合入的优化 PR** 写在 `pending_optimizations.csv`，一个 PR 一行，三列：`model`（§1 的 slug）、`pr`（PR 链接）、`note`（做什么、出处）。报告 Results 里 % of target 后面一列按文件里的顺序列出这些 PR，写成 `ATOM-2942`、`aiter-7876` 这样的链接，没有的写 —。只登记以 main 为目标的 PR：合进别的分支的，CI 用的 main 拿不到。PR 合入 main 或者关掉了，就删掉那一行。每场出报告前查一遍：
+
+```bash
+# 在 recipes/455-CI 下；输出 MERGED 或 CLOSED 的，删掉 pending_optimizations.csv 里那一行
+tail -n +2 pending_optimizations.csv | cut -d, -f2 | xargs -n1 gh pr view --json state,url -q '.state + " " + .url'
+```
+
 ### 4.3 accuracy.csv
 
 每个模型每场写一行（周六、周三都测），规则同 `perf.csv`。
@@ -583,6 +590,7 @@ recipes/
     ├── accuracy.csv       全部历史 GSM8K 精度
     ├── accuracy_baseline.csv   已知正确的 GSM8K 精度：精度图的参考线，也用来检查精度（§4.3）
     ├── perf_target.csv    目标性能：Results 和 Details 性能表里的 % of target（§4.2）
+    ├── pending_optimizations.csv  还没合入 main 的优化 PR：Results 里的 Unmerged optimization PRs（§4.2）
     ├── followups.csv      每个问题的说法：已有 PR、我们的 PR 或复现文档（§3.7）
     ├── pending_fixes.csv  已知还没合入、某个模型在等的 PR（§3.7）
     ├── .gitattributes     三个 CSV 设了 merge=union，两个节点同时提交不冲突（§3.5）
@@ -625,7 +633,7 @@ recipes/
 |---|---|---|
 | `## Lowlights` | 老板 | 问题：跑挂和回退，每行带原因和说法（§5.1）。这一场没有问题就不写这一节 |
 | `## Highlights` | 老板 | 好消息：提升和恢复（§5.1）。没有就不写这一节 |
-| `## Results` | 老板 | 总表：每个模型和上一场比，吞吐还和目标比（§5.2） |
+| `## Results` | 老板 | 总表：每个模型和上一场比，吞吐还和目标比，列出还没合入的优化 PR（§5.2） |
 | `## Environment` | 所有人 | 全镜像名，ATOM 和 aiter 的 branch、完整 commit 和 commit 日期 |
 | `## Findings` | 所有人 | 测试中的发现，取自 `runs/<YYYYMMDD>/findings.md` |
 | `## Details` | 要看细节的人 | 全部数字、趋势图、说法、跑挂 case 的核心 error log 和复现命令（§5.3、§5.4） |
@@ -702,16 +710,16 @@ Lowlights 每一行的 Fix 列都要写上说法，不能只报问题。下面�
 
 ## Results
 
-| Model | Scenario | 2026-11-07 (tok/s/GPU) | 2026-11-14 (tok/s/GPU) | Delta | % of target | GSM8K delta |
-|---|---|---|---|---|---|---|
-| DeepSeek R1 | MLPerf Endpoint | 1,481 | 1,414 | ⚠️ −4.6% | — | −0.7 pts (now 94.8%) (vs 2026-11-11) |
-| DeepSeek-V4.1-Flash | MLPerf Endpoint | 2,658 | 2,838 | 🟢 +6.8% | — | ⚠️ −5.1 pts (now 89.1%) (vs 2026-11-11) |
-| Kimi-K3 (2.8T) | MLPerf Endpoint | 336 (2026-10-31) | 340 | +1.2% | 85.1% of 400 | 0.0 pts (now 95.6%) (vs 2026-11-11) |
-| Qwen-35B-A3B | MLPerf Endpoint | 6,332 | N/A | N/A | N/A | 0.0 pts (now 90.1%) (vs 2026-11-11) |
-| DeepSeek-V4-Pro | 8K/1K | 10,063 | 10,090 | +0.3% | — | 0.0 pts (now 95.5%) (vs 2026-11-11) |
-| GLM-5.2 | 8K/1K | 12,765 | 12,833 | +0.5% | 80.2% of 16,000 | +0.5 pts (now 95.2%) (vs 2026-11-11) |
-| MiniMax-M3 (428B) | 8K/1K | 16,120 | 16,255 | +0.8% | — | +0.4 pts (now 93.5%) (vs 2026-11-11) |
-| Qwen-3.8 Flash | 8K/1K | 26,603 | 26,746 | +0.5% | — | 0.0 pts (now 89.2%) (vs 2026-11-11) |
+| Model | Scenario | 2026-11-07 (tok/s/GPU) | 2026-11-14 (tok/s/GPU) | Delta | % of target | Unmerged optimization PRs | GSM8K delta |
+|---|---|---|---|---|---|---|---|
+| DeepSeek R1 | MLPerf Endpoint | 1,481 | 1,414 | ⚠️ −4.6% | — | — | −0.7 pts |
+| DeepSeek-V4.1-Flash | MLPerf Endpoint | 2,658 | 2,838 | 🟢 +6.8% | — | — | ⚠️ −5.1 pts |
+| Kimi-K3 (2.8T) | MLPerf Endpoint | 336 (2026-10-31) | 340 | +1.2% | 85.1% of 400 | [ATOM-99911](https://github.com/ROCm/ATOM/pull/99911), [aiter-99912](https://github.com/ROCm/aiter/pull/99912) | 0.0 pts |
+| Qwen-35B-A3B | MLPerf Endpoint | 6,332 | N/A | N/A | N/A | — | 0.0 pts |
+| DeepSeek-V4-Pro | 8K/1K | 10,063 | 10,090 | +0.3% | — | — | 0.0 pts |
+| GLM-5.2 | 8K/1K | 12,765 | 12,833 | +0.5% | 80.2% of 16,000 | [aiter-99913](https://github.com/ROCm/aiter/pull/99913) | +0.5 pts |
+| MiniMax-M3 (428B) | 8K/1K | 16,120 | 16,255 | +0.8% | — | — | +0.4 pts |
+| Qwen-3.8 Flash | 8K/1K | 26,603 | 26,746 | +0.5% | — | — | 0.0 pts |
 
 ## Environment
 
@@ -728,10 +736,11 @@ Lowlights 每一行的 Fix 列都要写上说法，不能只报问题。下面�
 ……（§5.3）
 ```
 
-- 总表（Results）一个模型一行，依次是 Model、Scenario、上一场、本场、Delta、% of target、GSM8K delta。表格下面不加说明文字。周三只测精度时是 Model、上一场、本场、Delta 四列，不写 Scenario。
+- 总表（Results）一个模型一行，依次是 Model、Scenario、上一场、本场、Delta、% of target、Unmerged optimization PRs、GSM8K delta。表格下面不加说明文字。周三只测精度时是 Model、上一场、本场、Delta 四列，不写 Scenario。
 - 第三、四列是并发 64 的每卡吞吐（口径见 §4.1：endpoint 是输出 token，8K/1K 是输入加输出 token），表头写上一场和本场的日期。上一场取该模型最近一次成功的那一场：例子里 Kimi-K3 上一场（11-07）跑挂了，就和 10-31 那场比，并在格子里注明日期。
-- Delta 只写百分比，例如 `+6.9%`。GSM8K delta 写掉了多少、现在多少，例如 `−4.6 pts (now 88.1%)`；它和上一次测过精度的那场比，周六的格子里因此写着 `(vs <上周三>)`。
+- Delta 只写百分比，例如 `+6.9%`。GSM8K delta 也只写变了多少个点，例如 `−4.6 pts`，不写现在的分数和比的日期；它和上一次测过精度的那场比，周六比的是上周三。
 - % of target 是并发 64 的每卡吞吐占目标的百分比，后面带目标值，例如 `16.0% of 250`。目标写在 `perf_target.csv`（§4.2），没设目标的写 —。
+- Unmerged optimization PRs 列出这个模型还没合入 main 的优化 PR，写成 `ATOM-2942`、`aiter-7876` 这样的链接，取自 `pending_optimizations.csv`（§4.2），没有的写 —。
 - N/A 表示跑挂、没有值；— 表示没有结果（例如机器挂了没测成，§3.6）；first 表示第一次有数据，没有可比的。
 - Environment 放在 Results 后面、Findings 前面：全镜像名，ATOM 和 aiter 的 branch、完整 commit 和 commit 日期。Details 里的 Environment details 另有 digest 和 commit 标题。
 

@@ -166,7 +166,7 @@ def test_a_wednesday_report_covers_its_own_session_on_its_own_image(ci):
     assert "| GLM-5.2 | 8K/1K | 12,000 | 12,300 | +2.5% |" in report
     assert "MLPerf Endpoint" not in report
     assert (
-        "| Model | Scenario | 2026-11-11 (tok/s/GPU) | 2026-11-18 (tok/s/GPU) | Delta | % of target | GSM8K delta |"
+        "| Model | Scenario | 2026-11-11 (tok/s/GPU) | 2026-11-18 (tok/s/GPU) | Delta | % of target | Unmerged optimization PRs | GSM8K delta |"
         in report
     )
     assert "sha256:wednesday" in report and "| Test date | 2026-11-18 |" in report
@@ -391,6 +391,29 @@ def test_the_target_file_puts_each_point_against_its_target(ci):
     )
     assert "| Kimi-K3 (2.8T) | tp8dcp8 | 4 | 14.3 | first | — |" in text
     assert "| Kimi-K3 (2.8T) | tp8dcp8 | 64 | 39.9 | first | 16.0% of 250 |" in text
+
+
+def test_the_results_list_a_models_unmerged_optimization_prs_and_only_the_gsm8k_change(
+    ci,
+):
+    write_csv(ci / "perf.csv", PERF_COLUMNS, [perf("2026-11-21", 64, "39.90")])
+    write_csv(
+        ci / "accuracy.csv",
+        ACCURACY_COLUMNS,
+        [acc("2026-11-18", "0.963"), acc("2026-11-21", "0.963")],
+    )
+    (ci / "pending_optimizations.csv").write_text(
+        "model,pr,note\n"
+        "kimi-k3,https://github.com/ROCm/ATOM/pull/2942,prefill as token graphs\n"
+        "kimi-k3,https://github.com/ROCm/aiter/pull/7876,wave-per-head MLA reduce\n"
+    )
+    main(["--date", "2026-11-21", "--data-dir", str(ci)])
+    text = result(ci, "20261121").read_text()
+    assert (
+        "| Kimi-K3 (2.8T) | MLPerf Endpoint | — | 39.9 | first | — | "
+        "[ATOM-2942](https://github.com/ROCm/ATOM/pull/2942), "
+        "[aiter-7876](https://github.com/ROCm/aiter/pull/7876) | 0.0 pts |" in text
+    )
 
 
 def test_a_wednesday_gsm8k_session_reports_accuracy_only(ci):

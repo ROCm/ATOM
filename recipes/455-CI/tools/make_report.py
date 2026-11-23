@@ -18,7 +18,9 @@ suggested as a ready followups.csv row.
 GSM8K is also held to the known-good value in accuracy_baseline.csv (model,
 baseline, source), and each point's tok/s per GPU to its target in
 perf_target.csv (model, scenario, concurrency, tok_s_per_gpu, source): the
-"% of target" column of the results and the performance details. Prints the lowlights and highlights, a warning for a problem without a follow-up, and last the
+"% of target" column of the results and the performance details. The
+results also list each model's unmerged optimization PRs from
+pending_optimizations.csv (model, pr, note), as ATOM-<n> / aiter-<n> links. Prints the lowlights and highlights, a warning for a problem without a follow-up, and last the
 report's path. The result tags no one: the owners are added where it is posted.
 The image comes from runs/<image date>/image.json, written when the image was
 built (455-CI-guide.md §2.4), else from the CSV rows.
@@ -139,6 +141,10 @@ def main(argv=None):
             continue
         if target > 0:
             targets.setdefault((r["model"], r["scenario"]), {})[conc] = target
+    optimizations = {}  # model -> links of its unmerged optimization PRs
+    for r in _rows(os.path.join(args.data_dir, "pending_optimizations.csv")):
+        if (r.get("pr") or "").strip():
+            optimizations.setdefault(r.get("model"), []).append(r["pr"].strip())
     results = [
         ModelResult(
             s,
@@ -150,6 +156,7 @@ def main(argv=None):
             commands(os.path.join(run_dir, slug)),
             baseline=baselines.get(slug),
             targets=targets.get((slug, s), {}),
+            optimization_prs=optimizations.get(slug, []),
         )
         for s in scenarios
         for slug, name in MODELS[s]

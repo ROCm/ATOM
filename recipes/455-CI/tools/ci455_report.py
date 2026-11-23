@@ -39,6 +39,8 @@ class ModelResult:
     baseline: float | None = None
     # Target tok/s per GPU by concurrency, perf_target.csv
     targets: dict = field(default_factory=dict)
+    # Links of the model's unmerged optimization PRs, pending_optimizations.csv
+    optimization_prs: list = field(default_factory=list)
 
 
 def pct(x):
@@ -328,11 +330,18 @@ def target_share(c, target):
     return f"{c.value / target * 100:.1f}% of {num(target)}"
 
 
+def pr_link(url):
+    """A PR as a link named by its repo and number: [ATOM-2942](<url>)."""
+    m = PR_URL.match(url)
+    return f"[{m.group(1).split('/')[-1]}-{m.group(2)}]({url})" if m else url
+
+
 def summary_row(r, date, ref):
     """Model, scenario, previous and current c64 tok/s per GPU (dated only
     when the previous one is not from the `ref` session the column is headed
-    with), the delta as a percentage, the share of the c64 target, GSM8K
-    delta. N/A: the run failed."""
+    with), the delta as a percentage, the share of the c64 target, the
+    model's unmerged optimization PRs, and the GSM8K change in points alone.
+    N/A: the run failed."""
     c, a = headline(r), r.acc
     prev = (
         "—"
@@ -349,18 +358,9 @@ def summary_row(r, date, ref):
             delta = "first"
         else:
             delta = f"{perf_flag(c.delta)} {pct(c.delta)}".strip()
-    if a.status == "fail":
-        acc = "N/A"
-    elif a.value is None:
-        acc = "—"
-    elif a.delta is None:
-        acc = f"first (now {score(a.value)})"
-    else:
-        acc = f"{acc_flag(a.delta)} {pts(a.delta)} (now {score(a.value)})".strip()
-        if a.prev_date and a.prev_date != ref:
-            acc += f" (vs {a.prev_date})"
     share = target_share(c, r.targets.get(c.concurrency))
-    return [r.name, LABEL[r.scenario], prev, now, delta, share, acc]
+    prs = ", ".join(map(pr_link, r.optimization_prs)) or "—"
+    return [r.name, LABEL[r.scenario], prev, now, delta, share, prs, _acc_delta(a)]
 
 
 def perf_ran(results):
@@ -450,8 +450,8 @@ def _lights_and_results(date, env, results, followups):
             out += [f"## {title}", "", *table, ""]
     if perf_ran(results):
         table = [
-            f"| Model | Scenario | {ref or '—'} (tok/s/GPU) | {date} (tok/s/GPU) | Delta | % of target | GSM8K delta |",
-            "|---|---|---|---|---|---|---|",
+            f"| Model | Scenario | {ref or '—'} (tok/s/GPU) | {date} (tok/s/GPU) | Delta | % of target | Unmerged optimization PRs | GSM8K delta |",
+            "|---|---|---|---|---|---|---|---|",
             *["| " + " | ".join(summary_row(r, date, ref)) + " |" for r in results],
         ]
     else:

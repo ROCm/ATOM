@@ -19,16 +19,16 @@
 
 ## Results
 
-| Model | Scenario | 2026-11-07 (tok/s/GPU) | 2026-11-14 (tok/s/GPU) | Delta | % of target | GSM8K delta |
-|---|---|---|---|---|---|---|
-| DeepSeek R1 | MLPerf Endpoint | 1,481 | 1,414 | ⚠️ −4.6% | — | −0.7 pts (now 94.8%) (vs 2026-11-11) |
-| DeepSeek-V4.1-Flash | MLPerf Endpoint | 2,658 | 2,838 | 🟢 +6.8% | — | ⚠️ −5.1 pts (now 89.1%) (vs 2026-11-11) |
-| Kimi-K3 (2.8T) | MLPerf Endpoint | 336 (2026-10-31) | 340 | +1.2% | 85.1% of 400 | 0.0 pts (now 95.6%) (vs 2026-11-11) |
-| Qwen-35B-A3B | MLPerf Endpoint | 6,332 | N/A | N/A | N/A | 0.0 pts (now 90.1%) (vs 2026-11-11) |
-| DeepSeek-V4-Pro | 8K/1K | 10,063 | 10,090 | +0.3% | — | 0.0 pts (now 95.5%) (vs 2026-11-11) |
-| GLM-5.2 | 8K/1K | 12,765 | 12,833 | +0.5% | 80.2% of 16,000 | +0.5 pts (now 95.2%) (vs 2026-11-11) |
-| MiniMax-M3 (428B) | 8K/1K | 16,120 | 16,255 | +0.8% | — | +0.4 pts (now 93.5%) (vs 2026-11-11) |
-| Qwen-3.8 Flash | 8K/1K | 26,603 | 26,746 | +0.5% | — | 0.0 pts (now 89.2%) (vs 2026-11-11) |
+| Model | Scenario | 2026-11-07 (tok/s/GPU) | 2026-11-14 (tok/s/GPU) | Delta | % of target | Unmerged optimization PRs | GSM8K delta |
+|---|---|---|---|---|---|---|---|
+| DeepSeek R1 | MLPerf Endpoint | 1,481 | 1,414 | ⚠️ −4.6% | — | — | −0.7 pts |
+| DeepSeek-V4.1-Flash | MLPerf Endpoint | 2,658 | 2,838 | 🟢 +6.8% | — | — | ⚠️ −5.1 pts |
+| Kimi-K3 (2.8T) | MLPerf Endpoint | 336 (2026-10-31) | 340 | +1.2% | 85.1% of 400 | [ATOM-99911](https://github.com/ROCm/ATOM/pull/99911), [aiter-99912](https://github.com/ROCm/aiter/pull/99912) | 0.0 pts |
+| Qwen-35B-A3B | MLPerf Endpoint | 6,332 | N/A | N/A | N/A | — | 0.0 pts |
+| DeepSeek-V4-Pro | 8K/1K | 10,063 | 10,090 | +0.3% | — | — | 0.0 pts |
+| GLM-5.2 | 8K/1K | 12,765 | 12,833 | +0.5% | 80.2% of 16,000 | [aiter-99913](https://github.com/ROCm/aiter/pull/99913) | +0.5 pts |
+| MiniMax-M3 (428B) | 8K/1K | 16,120 | 16,255 | +0.8% | — | — | +0.4 pts |
+| Qwen-3.8 Flash | 8K/1K | 26,603 | 26,746 | +0.5% | — | — | 0.0 pts |
 
 ## Environment
 

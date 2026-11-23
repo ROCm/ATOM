@@ -1,0 +1,11 @@
+model,pr,note
+kimi-k3,https://github.com/ROCm/ATOM/pull/2894,gfx1250 Kimi-K3 monokernel (draft); LLM-Booster#384
+kimi-k3,https://github.com/ROCm/ATOM/pull/2942,record Kimi-K3 prefill as token graphs; LLM-Booster#398
+kimi-k3,https://github.com/ROCm/ATOM/pull/3402,"fold the E8M0 per-1x128 q_b_proj quant into the MLA q/kv norm, with aiter#8017; LLM-Booster#406"
+kimi-k3,https://github.com/ROCm/ATOM/pull/3503,fuse the KDA o_norm into the decode recurrence (draft; ATOM#3461 is the same change on a K3 branch); LLM-Booster#549
+kimi-k3,https://github.com/ROCm/aiter/pull/7876,wave-per-head MLA reduce for wave32 decode with few splits per tile; LLM-Booster#543
+kimi-k3,https://github.com/ROCm/aiter/pull/7937,gfx1250 Lamport two-shot custom all-reduce replaces the LL two-shot; LLM-Booster#399
+kimi-k3,https://github.com/ROCm/aiter/pull/8017,"fused_qk_rmsnorm with FP8 group quant and E8M0 scales, for ATOM#3402; LLM-Booster#406"
+kimi-k3,https://github.com/ROCm/aiter/pull/8031,FP32 cluster TDM and native BF16 GEMM retuning; LLM-Booster#414
+kimi-k3,https://github.com/ROCm/aiter/pull/8246,"fused split-K for the generic a8w8 GEMM, Kimi-K3 mx128 rows retuned; LLM-Booster#591"
+kimi-k3,https://github.com/ROCm/aiter/pull/8348,"Kimi-K3 latent-MoE BF16 GEMM rows for 256 CUs, needs aiter#8031; LLM-Booster#535"

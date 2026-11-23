@@ -11,7 +11,8 @@ c64 (a repro), DeepSeek R1 c64 drops 5% (our verified PR), DeepSeek-V4.1-Flash
 gains 6% but loses 5 GSM8K points (someone else's open PR), and Kimi-K3
 recovers from a failed 11-07. Kimi-K3, Qwen-35B-A3B and GLM-5.2 have made-up
 c64 targets (perf_target.csv), so "% of target" shows a share, an N/A (a
-failed point) and, for the rest, a dash. The Wednesday session after it (11-18) only
+failed point) and, for the rest, a dash; Kimi-K3 and GLM-5.2 list made-up
+unmerged optimization PRs. The Wednesday session after it (11-18) only
 feeds the accuracy charts: MiniMax-M3 loses 4.7 GSM8K points. The charts and
 the result say EXAMPLE.
 """
@@ -26,6 +27,7 @@ import shutil
 from ci455_data import (
     ACCURACY_COLUMNS,
     FOLLOWUP_COLUMNS,
+    OPTIMIZATION_COLUMNS,
     PERF_COLUMNS,
     TARGET_COLUMNS,
 )
@@ -94,6 +96,13 @@ TARGETS = {
     ("qwen-35b-a3b", "endpoint", 64): 8000,
     ("glm-5.2", "8k1k", 64): 16000,
 }
+# Made-up unmerged optimization PRs; like the follow-ups' PR numbers, far
+# beyond any real PR.
+OPTIMIZATIONS = [
+    ("kimi-k3", "https://github.com/ROCm/ATOM/pull/99911"),
+    ("kimi-k3", "https://github.com/ROCm/aiter/pull/99912"),
+    ("glm-5.2", "https://github.com/ROCm/aiter/pull/99913"),
+]
 # Next steps for the example problems (455-CI-guide.md §3.7). The PR numbers
 # are far beyond any real PR, so the links point at nothing.
 FOLLOWUPS = [
@@ -302,6 +311,11 @@ def main():
             }
             for (m, s, c), t in TARGETS.items()
         ],
+    )
+    write_csv(
+        os.path.join(OUT, "pending_optimizations.csv"),
+        OPTIMIZATION_COLUMNS,
+        [{"model": m, "pr": pr, "note": "(mock)"} for m, pr in OPTIMIZATIONS],
     )
     with open(
         os.path.join(run, "qwen-35b-a3b", "error.log"), "w", encoding="utf-8"

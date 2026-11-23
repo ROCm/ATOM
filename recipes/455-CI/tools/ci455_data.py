@@ -64,6 +64,9 @@ PENDING_COLUMNS = ("model", "prs", "note", "since")
 # Columns of perf_target.csv: the target tok/s per GPU of a model's scenario
 # and concurrency, the "% of target" column of the report (455-CI-guide.md §4.2).
 TARGET_COLUMNS = ("model", "scenario", "concurrency", "tok_s_per_gpu", "source")
+# Columns of pending_optimizations.csv: one unmerged optimization PR of a model
+# per row, listed in the report's results (455-CI-guide.md §4.2).
+OPTIMIZATION_COLUMNS = ("model", "pr", "note")
 CONCURRENCIES = (4, 64)
 # The second perf metric of a scenario: endpoint E2E interactivity, 8K/1K ITL P50.
 SECOND = {"endpoint": "interactivity", "8k1k": "itl_p50_ms"}
