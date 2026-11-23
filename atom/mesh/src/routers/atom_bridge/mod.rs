@@ -162,8 +162,9 @@ impl RequestExtras {
     }
 
     /// The extras of a request: its session headers, and the body fields the
-    /// typed request drops. A P/D transfer is refused: it is not carried to
-    /// the engine, and served plainly a prefill hands its decode nothing.
+    /// typed request drops. A P/D request -- `kv_transfer_params`, or
+    /// `/generate`'s bootstrap fields -- is refused: the transfer is not
+    /// carried to the engine, and served plainly its peer waits for nothing.
     fn read(request: &InferenceEnvelope) -> Result<Self, Response> {
         let (dp_session_id, dp_parent_session_id) = session_ids(&request.headers);
         let mut extras = Self {
@@ -172,6 +173,9 @@ impl RequestExtras {
             ..Self::default()
         };
         if let ParsedInference::Generate(body) = &request.parsed {
+            if requests_pd_bootstrap(body) {
+                return Err(pd_refused());
+            }
             extras.data_parallel_rank = body.data_parallel_rank.map(i64::from);
         }
         if !RAW_KEYS
@@ -184,11 +188,7 @@ impl RequestExtras {
             .map_err(|e| error::bad_request("invalid_request", e.to_string()))?;
         let field = |name: &str| raw.get(name).filter(|v| !v.is_null());
         if field("kv_transfer_params").is_some() {
-            return Err(error::bad_request(
-                "pd_unsupported",
-                "kv_transfer_params (P/D) is not supported by the ATOM Rust frontend yet; \
-                 serve P/D workers with the OpenAI server (USE_ATOMESH_ENTRYPOINTS=0)",
-            ));
+            return Err(pd_refused());
         }
         extras.thinking = field("thinking").cloned();
         if let Some(rank) = field("data_parallel_rank") {
@@ -202,6 +202,22 @@ impl RequestExtras {
         }
         Ok(extras)
     }
+}
+
+/// A `/generate` body naming a P/D bootstrap peer.
+fn requests_pd_bootstrap(body: &GenerateRequest) -> bool {
+    body.bootstrap_host.is_some()
+        || body.bootstrap_port.is_some()
+        || body.bootstrap_room.is_some()
+        || body.bootstrap_pair_key.is_some()
+}
+
+fn pd_refused() -> Response {
+    error::bad_request(
+        "pd_unsupported",
+        "P/D (kv_transfer_params, bootstrap fields) is not supported by the ATOM Rust \
+         frontend yet; serve P/D workers with the OpenAI server (USE_ATOMESH_ENTRYPOINTS=0)",
+    )
 }
 
 /// Every request goes to the one local engine; CoreManager picks its DP rank.
@@ -524,6 +540,21 @@ mod tests {
             map.insert(*name, value.parse().unwrap());
         }
         map
+    }
+
+    #[test]
+    fn a_generate_naming_a_bootstrap_peer_is_a_pd_request() {
+        let body = |json: &str| serde_json::from_str::<GenerateRequest>(json).unwrap();
+        assert!(!requests_pd_bootstrap(&body(r#"{"text": "hi"}"#)));
+        for field in [
+            r#""bootstrap_host": "10.0.0.1""#,
+            r#""bootstrap_port": 8998"#,
+            r#""bootstrap_room": 7"#,
+            r#""bootstrap_pair_key": "k""#,
+        ] {
+            let json = format!(r#"{{"text": "hi", {field}}}"#);
+            assert!(requests_pd_bootstrap(&body(&json)), "{field}");
+        }
     }
 
     #[test]

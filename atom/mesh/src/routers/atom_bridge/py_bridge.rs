@@ -135,12 +135,6 @@ impl BridgeRequest {
                 payload.return_hidden_states,
                 "return_hidden_states is not supported by the ATOM engine",
             ),
-            // A bootstrap room is P/D's; served plainly, its peer would wait
-            // for a transfer that never comes.
-            (
-                payload.pd_metadata.is_some(),
-                "P/D bootstrap fields are not supported by the ATOM Rust frontend yet",
-            ),
         ];
         if let Some((_, reason)) = refused.iter().find(|(refuse, _)| *refuse) {
             return Err(reason.to_string());
