@@ -1,9 +1,10 @@
-"""Run the pinned PR 5090 recipe unchanged behind either router."""
+"""Run the pinned PR 5090 worker contract and router acceptance probes."""
 
 import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -13,6 +14,8 @@ from pathlib import Path
 
 def worker_plan(contract, role, model_path, port, host, gpus, inherited):
     spec = contract["roles"][role]
+    if "gpu_ids" in spec:
+        gpus = ",".join(str(index) for index in spec["gpu_ids"])
     fabric = {
         "socket-ifname": inherited["MORI_SOCKET_IFNAME"],
         "rdma-devices": inherited["NCCL_IB_HCA"],
@@ -111,12 +114,22 @@ def functional_probe(contract, router, output):
             False,
         ),
     ]
+    if contract.get("functional_only"):
+        cases.append(
+            (
+                "/v1/completions",
+                {"prompt": "Transfer this context: " + "context block " * 512},
+                False,
+            )
+        )
     for endpoint, payload, stream in cases:
         payload.update(model=model, temperature=0, stream=stream)
         payload.setdefault("max_tokens", 16)
         response = request(router + endpoint, payload, stream)
         if not stream:
             assert response.get("choices") and "error" not in response, response
+            if payload.get("prompt", "").startswith("Transfer this context:"):
+                assert response["usage"]["prompt_tokens"] > 128, response["usage"]
         result["responses"].append(
             {"endpoint": endpoint, "stream": stream, "response": response}
         )
@@ -167,9 +180,85 @@ def scrape(urls, output, tag):
             (output / f"{tag}-worker-{index}.prom").write_bytes(response.read())
 
 
+def transferred_bytes(metrics):
+    values = re.findall(
+        r"^vllm:mooncake_bytes_transferred_sum(?:\{[^\n]*\})?\s+([0-9.eE+-]+)",
+        metrics,
+        re.MULTILINE,
+    )
+    if not values:
+        raise ValueError("Missing Mooncake transferred-byte counter on prefill")
+    return sum(float(value) for value in values)
+
+
+def verify_kv_transfer(workers, output):
+    before = transferred_bytes((output / "before-probe-worker-0.prom").read_text())
+    delta = 0.0
+    for _ in range(15):
+        scrape(workers, output, "after-transfer")
+        after = transferred_bytes((output / "after-transfer-worker-0.prom").read_text())
+        delta = after - before
+        if delta > 0:
+            break
+        time.sleep(1)
+    record = {
+        "metric": "vllm:mooncake_bytes_transferred_sum",
+        "prefill_before": before,
+        "prefill_after": after,
+        "transferred_bytes_delta": delta,
+        "passed": delta > 0,
+    }
+    (output / "kv-transfer.json").write_text(json.dumps(record, indent=2) + "\n")
+    assert delta > 0, "No completed Mooncake byte transfer during functional probes"
+    return record
+
+
 def benchmark(contract, args):
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
+    if contract.get("functional_only") and shutil.which("rocm-smi"):
+        with (output / "gpu-memory.log").open("w") as memory_log:
+            subprocess.run(
+                ["rocm-smi", "--showmemuse"],
+                stdout=memory_log,
+                stderr=subprocess.STDOUT,
+                check=False,
+                timeout=30,
+            )
+    scrape(args.workers, output, "before-probe")
+    functional_probe(contract, args.router, output / "functional.json")
+    transfer = (
+        verify_kv_transfer(args.workers, output)
+        if contract.get("functional_only")
+        else None
+    )
+    cancellation_probe(
+        contract, args.router, args.workers, output / "cancellation.json"
+    )
+    scrape(args.workers, output, "after-probe")
+    if contract.get("functional_only"):
+        (output / "functional-status.json").write_text(
+            json.dumps(
+                {
+                    "http_probes": "passed",
+                    "request_gauges_after_disconnect": "zero",
+                    "performance_run": False,
+                    "kv_transfer_evidence": transfer,
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+        (output.parent / "perf-analysis.md").write_text(
+            "# Functional run\n\nProtocol probes, SSE and request gauges after disconnect passed. "
+            "Completed Mooncake transfer bytes increased; see functional/kv-transfer.json and the raw worker metrics. "
+            "GPU memory evidence: functional/gpu-memory.log when rocm-smi is available. "
+            "This run used srtctl orchestration via remote run-pd-ci. "
+            "TTFT p50/p95/p99, ITL p50/p99, output throughput and AgentX Pareto/SLO are unavailable: "
+            "no performance window was requested. Accuracy evaluation was deferred. "
+            "Slurm and container cleanup are verified separately after this client exits.\n"
+        )
+        return 0
     shared = Path(os.environ["RUN_DIR"]) / "client-venv"
     python = shared / "bin/python"
     if not python.exists():
@@ -214,11 +303,6 @@ def benchmark(contract, args):
     assert version == contract["agentx_version"], version
     freeze = subprocess.check_output([str(python), "-m", "pip", "freeze"], text=True)
     (output / "client-freeze.txt").write_text(freeze)
-    scrape(args.workers, output, "before-probe")
-    functional_probe(contract, args.router, output / "functional.json")
-    cancellation_probe(
-        contract, args.router, args.workers, output / "cancellation.json"
-    )
     scrape(args.workers, output, "before-benchmark")
     model = contract["roles"]["decode"]["args"]["served-model-name"]
     argv = [

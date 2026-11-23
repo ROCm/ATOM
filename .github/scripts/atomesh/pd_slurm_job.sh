@@ -75,6 +75,9 @@ if [[ "${ATOMESH_ENV_ATOMESH_AGENTIC_TORCH_PROFILE:-0}" == "1" ]]; then
 fi
 if [[ "${ATOMESH_ENV_ATOMESH_PR5090_ROUTER_AB:-0}" == 1 ]]; then
   EXECUTION_PHASES=(baseline atomesh)
+  if [[ "${ATOMESH_ENV_ATOMESH_PR5090_FUNCTIONAL_ONLY:-0}" == 1 ]]; then
+    EXECUTION_PHASES=(atomesh)
+  fi
 fi
 ATOMESH_RESTART_PORT_OFFSET="${ATOMESH_RESTART_PORT_OFFSET:-1000}"
 if [[ "${#EXECUTION_PHASES[@]}" -gt 1 && ! "${ATOMESH_RESTART_PORT_OFFSET}" =~ ^[1-9][0-9]*$ ]]; then
@@ -361,6 +364,17 @@ EOF
     mori_socket_ifname="${mori_socket_ifname:-${socket_ifname}}"
   fi
   echo "[network] rank=${rank} ip=${node_ip} NCCL_SOCKET_IFNAME=${nccl_socket_ifname} MORI_SOCKET_IFNAME=${mori_socket_ifname}"
+
+  if [[ "${ATOMESH_ENV_ATOMESH_PR5090_FUNCTIONAL_ONLY:-0}" == 1 ]]; then
+    REPO_ROOT="${REPO_ROOT}" RUN_DIR="${RUN_DIR}" JOB_ID="${JOB_ID}" MODEL_PATH="${MODEL_PATH}" \
+      ATOMESH_ENV_ATOMESH_PR5090_CONTRACT="${ATOMESH_ENV_ATOMESH_PR5090_CONTRACT}" \
+      MORI_SOCKET_IFNAME="${mori_socket_ifname}" NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX}" \
+      ATOMESH_NODE_IP="${node_ip}" \
+      NCCL_IB_HCA=ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7 NCCL_IB_TC=104 \
+      VIDEO_GID="${video_gid}" RENDER_GID="${render_gid}" HOST_IONIC="${host_ionic}" \
+      bash "${REPO_ROOT}/.github/scripts/atomesh/pd_srt_functional.sh"
+    return $?
+  fi
 
   bounded_docker_rm "${container}"
   if [[ "${execution_phase}" != "eval" ]]; then

@@ -17387,3 +17387,47 @@ models:
           slurm_qos: amd-atom-qos
           slurm_submit_runner: atomesh-cicd
           time_limit: 08:00:00
+      - &pr5090_functional
+        name: pr5090-1p1d-single-node-functional
+        topology: 1p1d
+        pd_worker_layout: single_node
+        nodes: []
+        isl: [1024]
+        osl: 128
+        concurrency: [1]
+        prefill:
+          workers: 1
+          tp: 4
+          port: 6100
+        decode:
+          workers: 1
+          tp: 4
+          port: 6101
+        env:
+          common:
+            ATOMESH_PR5090_CONTRACT: .github/benchmark/pr5090-router-ab/single-node-functional.json
+            ATOMESH_PR5090_FUNCTIONAL_ONLY: '1'
+        run_eval: false
+        benchmark:
+          kind: aiperf_agentic
+          benchmark_duration: 0
+          wait_server_timeout: 2700
+          wait_router_timeout: 600
+        runner:
+          slurm_account: amd-atom
+          slurm_partition: amd-spur
+          slurm_qos: amd-atom-qos
+          slurm_submit_runner: atomesh-cicd
+          time_limit: 01:00:00
+      - <<: *pr5090_functional
+        name: pr5090-1p1d-pp4-single-node-functional
+        display_topology: 1P1D-P-TP1PP4-D-TP4
+        prefill:
+          workers: 1
+          tp: 1
+          pp: 4
+          port: 6100
+        env:
+          common:
+            ATOMESH_PR5090_CONTRACT: .github/benchmark/pr5090-router-ab/single-node-pp4-functional.json
+            ATOMESH_PR5090_FUNCTIONAL_ONLY: '1'

@@ -1,5 +1,5 @@
 {
-  "purpose": "Prevent duplicate PR5090 A/B workload after the timed-out workflow",
+  "purpose": "Prevent overlap when replacing the two-node A/B with single-node functionality",
   "jobs": [
     {
       "job_id": "29577",
@@ -10,6 +10,11 @@
       "job_id": "30080",
       "job_name": "pr5090-router-ab-pr5090-c40-router-ab-vllm-45007005300-1",
       "run_id": "45007005300"
+    },
+    {
+      "job_name": "pr5090-router-ab-pr5090-c40-router-ab-vllm-45102483439-1",
+      "run_id": "45102483439",
+      "job_id": "30133"
     }
   ]
 }

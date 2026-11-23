@@ -1,17 +1,30 @@
 import json
-from pathlib import Path
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from pd_recipe_router_ab import cancellation_probe, request, worker_plan
-
+from pd_recipe_router_ab import (
+    benchmark,
+    cancellation_probe,
+    functional_probe,
+    request,
+    transferred_bytes,
+    verify_kv_transfer,
+    worker_plan,
+)
 
 ROOT = Path(__file__).resolve().parents[3]
 CONTRACT = json.loads(
     (ROOT / ".github/benchmark/pr5090-router-ab/contract.json").read_text()
+)
+SINGLE_NODE = json.loads(
+    (
+        ROOT / ".github/benchmark/pr5090-router-ab/single-node-functional.json"
+    ).read_text()
 )
 ENV = {
     "MORI_SOCKET_IFNAME": "rdma0",
@@ -23,6 +36,20 @@ ENV = {
 
 
 class RecipeWorkerTest(unittest.TestCase):
+    def test_single_node_workers_use_disjoint_tp4_devices(self):
+        for role, gpus in (("prefill", "0,1,2,3"), ("decode", "4,5,6,7")):
+            argv, env = worker_plan(
+                SINGLE_NODE, role, "/model", 6100, "10.0.0.1", "0,1,2,3", ENV
+            )
+            self.assertEqual(env["HIP_VISIBLE_DEVICES"], gpus)
+            self.assertEqual(argv[argv.index("--tensor-parallel-size") + 1], "4")
+            self.assertEqual(
+                SINGLE_NODE["roles"][role]["args"], CONTRACT["roles"][role]["args"]
+            )
+            self.assertEqual(
+                SINGLE_NODE["roles"][role]["env"], CONTRACT["roles"][role]["env"]
+            )
+
     def test_preserves_all_source_role_arguments_and_natural_speculation(self):
         for role in ("prefill", "decode"):
             argv, env = worker_plan(
@@ -72,6 +99,116 @@ class RecipeWorkerTest(unittest.TestCase):
         self.assertEqual(left[1], right[1])
 
 
+class FunctionalOnlyTest(unittest.TestCase):
+    def test_functional_mode_skips_client_install_and_performance(self):
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch("pd_recipe_router_ab.scrape"),
+            patch("pd_recipe_router_ab.functional_probe") as probe,
+            patch("pd_recipe_router_ab.cancellation_probe") as cancel,
+            patch(
+                "pd_recipe_router_ab.verify_kv_transfer", return_value={"passed": True}
+            ),
+            patch("pd_recipe_router_ab.shutil.which", return_value=None),
+            patch("pd_recipe_router_ab.subprocess.run") as run,
+            patch("pd_recipe_router_ab.subprocess.check_output") as check_output,
+        ):
+            args = SimpleNamespace(
+                output=str(Path(temporary) / "functional"),
+                router="http://router",
+                workers=["p", "d"],
+            )
+            self.assertEqual(benchmark(SINGLE_NODE, args), 0)
+            probe.assert_called_once()
+            cancel.assert_called_once()
+            run.assert_not_called()
+            check_output.assert_not_called()
+            status = json.loads(
+                (Path(temporary) / "functional" / "functional-status.json").read_text()
+            )
+            self.assertEqual(status["http_probes"], "passed")
+            self.assertFalse(status["performance_run"])
+
+    def test_failed_probe_does_not_publish_success(self):
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch("pd_recipe_router_ab.scrape"),
+            patch(
+                "pd_recipe_router_ab.functional_probe",
+                side_effect=AssertionError("bad response"),
+            ),
+        ):
+            args = SimpleNamespace(
+                output=temporary, router="http://router", workers=["p", "d"]
+            )
+            with self.assertRaises(AssertionError):
+                benchmark(SINGLE_NODE, args)
+            self.assertFalse((Path(temporary) / "functional-status.json").exists())
+
+    def test_single_node_probes_include_context_longer_than_a_kv_block(self):
+        calls = []
+
+        def respond(url, payload=None, stream=False):
+            if payload is None:
+                return {"data": [{"id": SINGLE_NODE["model"]}]}
+            calls.append(payload)
+            return {"choices": [{}], "usage": {"prompt_tokens": 1024}}
+
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch("pd_recipe_router_ab.request", side_effect=respond),
+        ):
+            functional_probe(
+                SINGLE_NODE, "http://router", Path(temporary) / "functional.json"
+            )
+        self.assertEqual(len(calls), 5)
+        self.assertGreater(len(calls[-1]["prompt"].split()), 128)
+
+
+class TransferTest(unittest.TestCase):
+    def test_histogram_sum_handles_multiple_tp_labels(self):
+        self.assertEqual(
+            transferred_bytes(
+                'vllm:mooncake_bytes_transferred_sum{engine="0"} 1e3\nvllm:mooncake_bytes_transferred_sum{engine="1"} 2000\n'
+            ),
+            3000,
+        )
+        with self.assertRaises(ValueError):
+            transferred_bytes("vllm:num_requests_running 0\n")
+
+    def test_transfer_requires_a_positive_delta(self):
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch("pd_recipe_router_ab.time.sleep"),
+        ):
+            output = Path(temporary)
+            (output / "before-probe-worker-0.prom").write_text(
+                "vllm:mooncake_bytes_transferred_sum 100\n"
+            )
+
+            def capture(workers, directory, tag):
+                (directory / f"{tag}-worker-0.prom").write_text(
+                    "vllm:mooncake_bytes_transferred_sum 100\n"
+                )
+
+            with (
+                patch("pd_recipe_router_ab.scrape", side_effect=capture),
+                self.assertRaises(AssertionError),
+            ):
+                verify_kv_transfer(["p", "d"], output)
+            self.assertFalse(
+                json.loads((output / "kv-transfer.json").read_text())["passed"]
+            )
+            (output / "after-transfer-worker-0.prom").write_text(
+                "vllm:mooncake_bytes_transferred_sum 300\n"
+            )
+            with patch("pd_recipe_router_ab.scrape"):
+                self.assertEqual(
+                    verify_kv_transfer(["p", "d"], output)["transferred_bytes_delta"],
+                    200,
+                )
+
+
 class StreamTest(unittest.TestCase):
     def test_cancellation_checks_waiting_requests_as_well_as_running(self):
         class Handler(BaseHTTPRequestHandler):
@@ -111,11 +248,11 @@ class StreamTest(unittest.TestCase):
                     [0, 0],
                 )
                 Handler.waiting = 1
-                with patch(
-                    "pd_recipe_router_ab.time.monotonic", side_effect=[0, 1, 31]
+                with (
+                    patch("pd_recipe_router_ab.time.monotonic", side_effect=[0, 1, 31]),
+                    self.assertRaises(AssertionError),
                 ):
-                    with self.assertRaises(AssertionError):
-                        cancellation_probe(CONTRACT, url, [url], output)
+                    cancellation_probe(CONTRACT, url, [url], output)
         finally:
             server.shutdown()
             server.server_close()

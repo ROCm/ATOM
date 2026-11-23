@@ -1584,7 +1584,7 @@ jobs:
     timeout-minutes: ${{ startsWith(matrix.id, 'pr5090-router-ab-') && 960 || (startsWith(matrix.id, 'kimi-k3-c48-gap-') || contains(matrix.id, '-ax5035-mc-') || (matrix.run_eval && matrix.accuracy.task == 'swebench_lite')) && 780 || 420 }}
     strategy:
       fail-fast: false
-      max-parallel: 1
+      max-parallel: ${{ contains(inputs.case_names, 'single-node-functional') && 2 || 1 }}
       matrix: ${{ fromJson(needs.load-config.outputs.matrix_json) }}
     steps:
       - name: Checkout ATOM repo
@@ -1771,6 +1771,10 @@ jobs:
           print("=== ATOMesh benchmark full cell JSON ===")
           print(json.dumps(cell, indent=2, sort_keys=True))
           PY
+
+      - name: Prepare pinned srtctl for functional GPU workload
+        if: ${{ matrix.env.common.ATOMESH_PR5090_FUNCTIONAL_ONLY == '1' }}
+        run: bash .github/scripts/atomesh/prepare_srt_functional.sh
 
       - name: Run Slurm benchmark cell
         env:
