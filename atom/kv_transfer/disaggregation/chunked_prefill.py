@@ -35,6 +35,8 @@ class PrefillHandoff:
     first_token_id: int  # First output token sampled by P.
     draft_token_ids: tuple[int, ...] = ()  # Drafts for D to verify.
     prefix_cache_hit_tokens: int = 0  # P-side prefix hits for metrics.
+    # V: P's blocks below it may lack draft rows (`BlockManager.draft_rows_from`).
+    draft_rows_from: int | None = None
 
     @classmethod
     def from_wire(cls, req_id, data):
@@ -52,7 +54,12 @@ class PrefillHandoff:
             raise ValueError("invalid prefill draft tokens")
         if type(cached) is not int or cached < 0:
             raise ValueError("invalid prefill cache hit count")
-        return cls(req_id, first, tuple(drafts), cached)
+        draft_rows_from = data.get("draft_rows_from")
+        if draft_rows_from is None:
+            return cls(req_id, first, tuple(drafts), cached)
+        if type(draft_rows_from) is not int or draft_rows_from <= 0:
+            raise ValueError("invalid prefill draft rows boundary")
+        return cls(req_id, first, tuple(drafts), cached, draft_rows_from)
 
 
 class ChunkedPrefill:

@@ -2577,6 +2577,7 @@ class _DSparkSpecConfig:
 
     def __init__(self, num_speculative_tokens: int):
         self.num_speculative_tokens = num_speculative_tokens
+        self.draft_model_hf_config = SimpleNamespace(architectures=["DSparkDraft"])
 
     def use_dspark(self) -> bool:
         return True
@@ -3254,6 +3255,32 @@ class TestOffloadResumeAdmission:
         _, scheduled = sched.schedule()
 
         assert behind.id in scheduled, "starved behind the offload resume"
+
+
+def test_a_tier_load_marks_the_blocks_below_its_draft_start(seq_factory, caplog):
+    """The only link that marks what a target-only tier load published: without
+    it a later hit, and the P/D boundary V, would trust unwritten draft rows."""
+    from atom.spec_decode.draft_window_geometry import DraftReadWindow
+
+    sched = Scheduler(MockConfig(num_kvcache_blocks=16, enable_prefix_caching=True))
+    bm = sched.block_manager
+    bm.draft_read_window = DraftReadWindow(window=8, read_page=2)
+    seq = seq_factory(list(range(24)))
+    bm.allocate(seq)
+    # The load wrote tokens [0, 16), and draft rows only from 8 on.
+    seq.offload_loaded_tokens = 16
+    seq.offload_load_start_tokens = 0
+    seq.offload_draft_start_tokens = 8
+    with caplog.at_level(logging.INFO, logger="atom"):
+        sched._mark_offload_load_ready(seq)
+    marks = [bm.kv.block(block).draft_rows_missing for block in seq.block_table]
+    assert marks == [True, True, False, False, False, False]
+    assert bm.draft_rows_from(seq) == 8
+    assert "draft_from=8" in caplog.text
+    assert seq.num_cached_tokens == 16 and seq.offload_draft_start_tokens is None
+    # A later prompt whose read window covers block 1 stops its hit there.
+    fork = seq_factory(list(range(10)) + [90, 91])
+    assert bm.can_allocate(fork) == 1
 
 
 # ── get_next_batch_info ────────────────────────────────────────────────────

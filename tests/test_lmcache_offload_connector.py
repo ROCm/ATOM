@@ -4074,6 +4074,7 @@ def test_abort_cleans_load_whose_terminal_was_already_consumed(
         num_tokens=8,
         offload_loaded_tokens=4,
         offload_load_start_tokens=4,
+        offload_draft_start_tokens=None,
         offload_joint=OffloadJointRecord(),
     )
 
@@ -4140,6 +4141,7 @@ def test_consume_failed_remote_kv_does_not_repeat_terminal_callback():
         status=SequenceStatus.WAITING_FOR_REMOTE_KVS,
         block_table=[1],
         num_cached_tokens=4,
+        offload_draft_start_tokens=8,
         offload_joint=OffloadJointRecord(),
     )
 
@@ -4159,6 +4161,8 @@ def test_consume_failed_remote_kv_does_not_repeat_terminal_callback():
 
     assert host._consume_failed_remote_kv(seq) is True
     assert calls == []
+    # A failed load marks nothing: a later load plans its own draft start.
+    assert seq.offload_draft_start_tokens is None
 
 
 def test_sidecar_save_waits_for_exact_completed_boundary():

@@ -36,7 +36,11 @@ from atom.sampling_params import SamplingParams
 
 
 def spec(k, dspark=False):
-    return SimpleNamespace(num_speculative_tokens=k, use_dspark=lambda: dspark)
+    return SimpleNamespace(
+        num_speculative_tokens=k,
+        use_dspark=lambda: dspark,
+        draft_model_hf_config=SimpleNamespace(architectures=["DSparkDraft"]),
+    )
 
 
 def make_scheduler(k, block, dspark=False, **overrides):

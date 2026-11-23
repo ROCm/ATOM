@@ -84,6 +84,7 @@ def _published() -> tuple[dict[str, bytes], str]:
         # What `Config` resolves; `BlockManager` reads it at construction.
         offload_min_load_tokens=8192,
         kv_events_config=SimpleNamespace(enable=True),
+        speculative_config=None,
     )
 
     def seq(tokens, **kwargs):

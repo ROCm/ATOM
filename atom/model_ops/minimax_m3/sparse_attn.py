@@ -22,7 +22,7 @@ import triton
 import triton.language as tl
 from aiter.ops.attention import pa_fwd_asm_supports_arch
 
-from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
+from atom.model_ops.minimax_m3.geometry import ASM_PAGE_SIZE, SPARSE_BLOCK_SIZE
 from atom.model_ops.minimax_m3.index_buffers import IndexScoreBuffers
 from atom.model_ops.minimax_m3.index_topk import (
     build_n_valid_column_per_row,
@@ -35,7 +35,6 @@ from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import prefill_row_positions
 # logical sparse block (128 tokens) spans PAGES_PER_SPARSE_BLOCK contiguous
 # physical 16-pages. Used by the fused SHUFFLE KV-insert and the sparse
 # block-table builders.
-ASM_PAGE_SIZE = 16
 PAGES_PER_SPARSE_BLOCK = SPARSE_BLOCK_SIZE // ASM_PAGE_SIZE  # 8
 
 
