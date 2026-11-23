@@ -24,7 +24,7 @@ import zmq.asyncio
 from atom.config import Config
 from atom.distributed.kv_events import offset_endpoint
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-from atom.model_engine.capabilities import pcp_group_size_of
+from atom.model_engine.capabilities import WEIGHT_RELOAD_FEATURE, pcp_group_size_of
 from atom.model_engine.collective_rpc import (
     COLLECTIVE_RPC_CMD,
     DISCARD_WEIGHT_SYNC_CMD,
@@ -57,6 +57,7 @@ from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import (
     FIRE_AND_FORGET_UTILITY_CMDS,
     PAUSE_GENERATION_CMD,
+    RECEIVE_WEIGHTS_RDMA_CMD,
     WEIGHT_UPDATE_UTILITY_CMDS,
     completes_weight_sync,
     kv_change,
@@ -185,14 +186,18 @@ def kv_event_sources(config) -> dict[str, dict[str, Any]]:
     """Where each engine on this node publishes KV events (`/kv_event_sources`),
     keyed by the global DP rank its publisher binds for: the endpoint after the
     per-rank offset (a wildcard host stays a wildcard), the topic, the tokens
-    per hashed block, and the replay endpoint, offset alike, when replay is on.
-    Empty with events off or the null publisher."""
+    per hashed block, the replay endpoint, offset alike, when replay is on, and
+    the Mooncake Store the ranks offload to, if any. Empty with events off or
+    the null publisher."""
     events = config.kv_events_config
     if not events.enable or events.publisher == "null":
         return {}
+    from atom.kv_transfer.offload.report import offload_report
+
     block_size = hash_block_size_for(
         config.kv_cache_block_size, config.decode_context_parallel_size
     )
+    offload = offload_report(config)
     sources = {}
     for rank, _ in iter_dp_rank_assignments(config):
         source = {
@@ -202,6 +207,8 @@ def kv_event_sources(config) -> dict[str, dict[str, Any]]:
         }
         if events.replay_endpoint:
             source["replay_endpoint"] = offset_endpoint(events.replay_endpoint, rank)
+        if offload is not None:
+            source["offload"] = offload
         sources[str(rank)] = source
     return sources
 
@@ -334,6 +341,9 @@ class CoreManager:
         # ranks: a DP rank sizes its pool from its own free memory, so a prompt
         # is only safe to admit if it fits wherever the router sends it.
         self.max_pool_tokens: int | None = None
+        # What some engine's runners cannot take, by feature, as each said at
+        # startup.
+        self._weight_syncs_unavailable: dict[str, str] = {}
         self.engine_core_processes = []
         self._distributed_stores = []
         self.input_sockets = []
@@ -649,10 +659,11 @@ class CoreManager:
 
             try:
                 # No visible-device mask is published here. Device placement is
-                # owned by ModelRunner._setup_device_and_distributed, which
-                # selects an ABSOLUTE cuda:{local_dp_rank*tp_size+rank}. Masking
-                # the child as well would renumber its devices and compound the
-                # two offsets -- see set_device_control_env_var's docstring.
+                # owned by ModelRunner._setup_device_and_distributed (by default
+                # init_model_env in model_setup.py; the rollout runner overrides
+                # it), which selects an ABSOLUTE cuda:{local_dp_rank*tp_size+rank}.
+                # Masking the child as well would renumber its devices and compound
+                # the two offsets -- see set_device_control_env_var's docstring.
                 for info, local_dp_rank in zip(processes_info, local_dp_ranks):
                     dp_rank = info["dp_rank"]
                     logger.info(
@@ -763,9 +774,12 @@ class CoreManager:
         self._asyncio_mode = config.asyncio_mode
 
     def _record_ready_payload(self, data) -> None:
-        """Fold one rank's READY facts into the manager's view of capacity."""
+        """Fold one rank's READY facts into the manager's view of capacity,
+        and of the weight syncs some engine cannot take."""
         if not data:
             return
+        for feature, reason in data.get("weight_syncs_unavailable", {}).items():
+            self._weight_syncs_unavailable.setdefault(feature, reason)
         reported = data.get("max_pool_tokens")
         if reported is None:
             return
@@ -1182,8 +1196,8 @@ class CoreManager:
         """The `prefix_spread` or `share_cache` router, or None.
 
         None for another strategy, and when there is nothing to route: one
-        DP rank, pipeline parallelism (requests enter at stage 0), and, for
-        `share_cache`, RapidServe. The strategy has no effect there, so its
+        DP rank, pipeline parallelism (requests enter at stage 0), and
+        RapidServe. The strategy has no effect there, so its
         requirements are not enforced.
         """
         strategy = self._dp_lb_strategy
@@ -2277,11 +2291,31 @@ class CoreManager:
                 f"broadcast_utility_command instead."
             )
         if cmd in WEIGHT_UPDATE_UTILITY_CMDS:
+            self._refuse_what_an_engine_cannot_take(cmd, owns_sync)
             # Re-entrant, so the weight_sync_session() a bucket belongs to
             # takes it again rather than waiting on itself.
             with self._weight_sync_lock:
                 return self._sync_weight_update(cmd, timeout, owns_sync, kwargs)
         return self._broadcast_and_wait(cmd, timeout, **kwargs)
+
+    def _refuse_what_an_engine_cannot_take(self, cmd: str, in_session: bool) -> None:
+        """Refuse a reload some engine's runners cannot take, before any
+        engine runs it: each engine refuses only what its own cannot, so under
+        PP the head would have written by the time a later stage refused.
+
+        Not a weight stream: its trainer is already broadcasting, so each
+        engine takes it in and refuses it there.
+        """
+        reason = self._weight_syncs_unavailable.get(WEIGHT_RELOAD_FEATURE)
+        if cmd == RECEIVE_WEIGHTS_RDMA_CMD or reason is None:
+            return
+        if in_session:
+            ctx = self._weight_sync_context
+            ctx.failure = ctx.failure or f"{cmd}: refused: {reason}"
+        raise RuntimeError(
+            f"{self.label}: utility command {cmd!r} refused before any engine "
+            f"ran it: {reason}"
+        )
 
     def _sync_weight_update(
         self, cmd: str, timeout: float, in_session: bool, kwargs: dict
@@ -2375,6 +2409,15 @@ class CoreManager:
 
         responses = [by_dp_rank[dp_rank] for dp_rank in sorted(by_dp_rank)]
         missing = sorted(set(sent) - set(by_dp_rank))
+        if missing and cmd == RECEIVE_WEIGHTS_RDMA_CMD:
+            # Still being received: an engine waits for its runners to decide
+            # the stream, and a discard would fence it over what they wrote.
+            raise TimeoutError(
+                f"{self.label}: DP rank(s) {missing} did not answer {cmd!r} "
+                f"within {timeout}s, so whether they wrote the stream is "
+                f"unknown; they stay fenced until a later sync rewrites every "
+                f"parameter"
+            )
         if missing:
             if cmd in WEIGHT_UPDATE_UTILITY_CMDS:
                 self._discard_failed_weight_sync(cmd)

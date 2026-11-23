@@ -361,15 +361,16 @@ class Sequence:
         # `BlockManager._record_checkpoint_demand` at admission; this one is
         # read by `checkpoint_cut` and `checkpointers_at`, which must agree.
         self.checkpoint_demand_pos = 0
-        # Which of the two demand counters this seq has already been put
+        # Which of the three demand counters this seq has already been put
         # against. `can_allocate` re-runs for a sequence the queue keeps
-        # deferring, and the position above cannot serve as the marker for
-        # either one: a declined demand writes 0 back, so it does not remember
-        # the decline, and a decline retracts a demand the recorded counter had
-        # already taken. Both are cleared by `deallocate`, so a re-admitted
+        # deferring, and the position above cannot serve as the marker for any
+        # of them: a declined or dropped demand writes 0 back, so it does not
+        # remember why, and a decline retracts a demand the recorded counter
+        # had already taken. All are cleared by `deallocate`, so a re-admitted
         # request counts again, which it should.
         self.checkpoint_demand_counted = False
         self.checkpoint_demand_declined = False
+        self.checkpoint_demand_dropped = False
         # The demand's sibling: this prompt's own end, floored to the hash
         # grid. 0 = nowhere.
         #
@@ -442,6 +443,9 @@ class Sequence:
         # because the slots are allocated one at a time and need not be
         # adjacent — see `StateSlotPool`.
         self.state_slots: list[int] = []
+        # Batches scheduled with this seq. A checkpoint filed before another
+        # one describes a slot that has moved on; see `take_checkpoint_ops`.
+        self.num_forwards: int = 0
         # Slot the NEXT forward reads its incoming state from, when that is not
         # the slot it writes (`state_slot`). Set by BlockManager on a state fork
         # — resuming from a checkpoint, or taking one — and cleared by the

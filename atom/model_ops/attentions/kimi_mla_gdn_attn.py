@@ -419,7 +419,7 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             f":spec={self.num_spec}"
             ":carry=all"
         )
-        return StateTransfer.copy(layout_id)
+        return StateTransfer.copy(layout_id, decode_keep=self._decode_keep())
 
     def sub_pool_specs(self) -> list[SubPoolSpec]:
         """MLA paged KV for the full-attention layers, plus the KDA/GDN
@@ -513,6 +513,11 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             )
         return total // layers, layers
 
+    def _decode_image_is_conv_and_ssm(self) -> bool:
+        # By the model's kpool, not this stage's planes: under PP only the
+        # stages with indexer layers hold a tail.
+        return self._kpool_size() <= 1
+
     def _checkpoint_plane_shapes(self) -> list[tuple[int, int]]:
         """KDA planes plus the partial kpool keys needed to resume exactly."""
         shapes = super()._checkpoint_plane_shapes()
@@ -599,16 +604,18 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             }
         return out
 
-    def _page_unit_index_cache(self) -> torch.Tensor | None:
-        """The indexer key cache a PAGE unit owns a region of, or `None`.
+    def _page_unit_index_cache(self) -> tuple[torch.Tensor, ...]:
+        """The indexer planes a PAGE unit owns, including FP4 scales.
 
         Read through the same predicate `sub_pool_specs` prices with, so the
         two cannot disagree: a unit owns index-cache bytes exactly when the
         pool was priced with them.
         """
-        if not self.model_runner.has_mla_indexer:
-            return None
-        return None if self.kv_pool.index is None else self.kv_pool.index.view("index")
+        if not self.model_runner.has_mla_indexer or self.kv_pool.index is None:
+            return ()
+        return tuple(
+            self.kv_pool.index.view(field.name) for field in self.kv_pool.index.fields
+        )
 
     def build_kv_cache_tensor(self, module):
         from atom.config import KVCacheTensor
@@ -641,6 +648,7 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             kv_cache = self.kv_pool.layer("kv", row).view(-1, 1, self.kv_pool.entry_dim)
             module.max_model_len = runner.config.max_model_len
             index_cache = None
+            index_scale = None
             if runner.has_mla_indexer and getattr(module, "indexer", None) is not None:
                 # The module's own global layer number, not the bind
                 # ordinal: the map is keyed globally, and on a non-first PP
@@ -653,14 +661,20 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
                 index_cache = self.kv_pool.layer(
                     "index", runner.index_cache_layer_map[module.layer_num]
                 )
-                # Flat row view: `indexer_k_quant_and_cache` addresses a
-                # slot as a single row id, and the pooled writer computes that
-                # id from the block table itself.
-                module.indexer.k_cache.kv_cache[0] = index_cache.view(
-                    index_cache.shape[0] * index_cache.shape[1],
-                    1,
-                    runner.aligned_index_dim,
-                )
+                assert module.indexer._indexer_fp4 == self._indexer_fp4
+                if self._indexer_fp4:
+                    index_scale = self.kv_pool.layer(
+                        "index_scale", runner.index_cache_layer_map[module.layer_num]
+                    )
+                    module.indexer.k_cache.kv_cache[0] = index_cache
+                    module.indexer.k_cache.kv_cache_scale = index_scale
+                else:
+                    # FP8 addresses each slot as a flat row; FP4 stays packed.
+                    module.indexer.k_cache.kv_cache[0] = index_cache.view(
+                        index_cache.shape[0] * index_cache.shape[1],
+                        1,
+                        runner.aligned_index_dim,
+                    )
                 # kpool: this layer's slice of the per-request tail buffer,
                 # bound here for the same reason the index cache is -- the
                 # indexer has no other route to a runner-owned tensor.
@@ -677,6 +691,7 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
                 k_scale=None,
                 v_scale=None,
                 index_cache=index_cache,
+                index_scale=index_scale,
             )
 
         return None
