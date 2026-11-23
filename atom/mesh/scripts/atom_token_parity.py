@@ -197,20 +197,33 @@ def default_requests() -> list[dict]:
     chats = {
         "plain": {},
         "effort_low": {"reasoning_effort": "low"},
+        "effort_medium": {"reasoning_effort": "medium"},
         "effort_high": {"reasoning_effort": "high"},
         "effort_max": {"reasoning_effort": "max"},
+        "effort_minimal": {"reasoning_effort": "minimal"},
+        "effort_xhigh": {"reasoning_effort": "xhigh"},
+        "effort_none": {"reasoning_effort": "none"},
         "effort_unknown": {"reasoning_effort": "ultra"},
         "kwargs_thinking_on": {"chat_template_kwargs": {"enable_thinking": True}},
         "kwargs_thinking_mode_chat": {
             "chat_template_kwargs": {"thinking_mode": "chat"}
         },
         "thinking_enabled": {"thinking": {"type": "enabled"}},
+        "thinking_enabled_effort_none": {
+            "thinking": {"type": "enabled"},
+            "reasoning_effort": "none",
+        },
         "tools_effort_high": {"tools": [TOOL], "reasoning_effort": "high"},
         "tool_history": {
             "tools": [TOOL],
             "messages": [*MESSAGES, *called("README.md")],
         },
         "tool_history_reasoning": {"tools": [TOOL], "messages": reasoned_tool_history},
+        "tool_history_effort_none": {
+            "tools": [TOOL],
+            "messages": reasoned_tool_history,
+            "reasoning_effort": "none",
+        },
         "parallel_tool_calls": {
             "tools": [TOOL],
             "messages": [*MESSAGES, *called("README.md", "LICENSE")],
