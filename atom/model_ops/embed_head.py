@@ -384,7 +384,8 @@ class ParallelLMHead(VocabParallelEmbedding):
 
     # ------------------------------------------------------------------
     # Pure-DP sharded LM head (config ② all-gather / ③ all-to-all, or greedy ids
-    # under ATOM_DP_LM_HEAD_MODE=argmax).    #
+    # under ATOM_DP_LM_HEAD_MODE=argmax).
+    #
     # Precondition (checked by `_can_use_dp_sharded_head`): the model TP group is size 1
     # (pure DP) and the DP group is size > 1. The lm_head weight is currently
     # replicated on every DP rank, so each rank slices out its own vocab shard
