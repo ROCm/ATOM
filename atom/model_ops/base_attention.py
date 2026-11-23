@@ -496,6 +496,7 @@ def _flydsl_prepare_explicit_plan(
     existing_plan,
     plan_step_owner=None,
     plan_cache_owner=None,
+    plan_workgroup_budget=None,
 ):
     """Return the explicit plan aiter #5809 requires.
 
@@ -507,6 +508,8 @@ def _flydsl_prepare_explicit_plan(
     ``plan_cache_owner``: the object that owns plan/scratch storage. Omit it
     for process-lifetime storage (required by captured decode graphs); sparse
     prefill passes its ephemeral metadata so variable row counts are released.
+    ``plan_workgroup_budget``: overrides the budget (a caller that splits its
+    rows into clusters of its own, ``sparse_attn_nvfp4.fused_reduce_split``).
     Plans are window-free: the gate rejects sliding windows.
     """
     from aiter.ops.flydsl.pa_decode import plan_pa_decode
@@ -521,6 +524,8 @@ def _flydsl_prepare_explicit_plan(
     else:
         max_partitions = shape.get("max_partitions")
     workgroup_budget = shape.get("workgroup_budget")
+    if plan_workgroup_budget is not None:
+        workgroup_budget = int(plan_workgroup_budget)
 
     if existing_plan is not None and flydsl_plan_matches(
         existing_plan, num_seqs, num_kv_heads

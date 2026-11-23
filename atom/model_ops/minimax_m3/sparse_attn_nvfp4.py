@@ -22,6 +22,7 @@ that do not. aiter decides which shapes it serves.
 """
 
 import functools
+import inspect
 
 import torch
 import triton
@@ -155,9 +156,34 @@ def nvfp4_page_table(
     return table, ctx
 
 
+@functools.cache
+def _pa_decode_merges_partitions() -> bool:
+    """Whether aiter's FlyDSL paged decode can merge a row's partitions itself
+    (``page_groups`` / ``plan_free``, ROCm/aiter#8462)."""
+    from aiter.ops.flydsl.pa_decode import pa_decode
+
+    return "page_groups" in inspect.signature(pa_decode).parameters
+
+
+def fused_reduce_split(seqs: int, device) -> tuple[int, int | None, int, int]:
+    """(partitions, workgroup budget, page groups, rows a cluster) of decode rows
+    that merge their top-k window inside the paged attention: a cluster of P
+    CTAs a row while every row's cluster stays resident (gfx1250: 15 clusters a
+    16 CUs), else one CTA a row whose four wave groups merge in LDS."""
+    cus = torch.cuda.get_device_properties(device).multi_processor_count
+    if seqs * 8 <= cus:
+        return 8, 8 * seqs, 1, 1
+    if seqs * 4 <= cus:
+        return 4, 4 * seqs, 2, 1
+    if seqs <= cus * 15 // 16:
+        return 4, 4 * seqs, 1, 1
+    return 1, None, 4, 1
+
+
 def _flydsl_attention(
     q, k_payload, k_scale, v_payload, v_scale, table, ctx, sm_scale,
     plan_step_owner, plan_cache_owner, quantized_output=None, output_scale=None,
+    rows_per_request=0,
 ):  # fmt: skip
     """aiter's FlyDSL paged decode over the NVFP4 cache, one length-1 sequence a
     (row, kv head), planned and scratch-cached like the FP8 sparse path's.
@@ -166,7 +192,12 @@ def _flydsl_attention(
     ``[rows, heads * D]`` and E8M0 ``[rows, heads * D // 32]``), written by the
     attention instead of the BF16 output with the BF16 call's split: aiter
     writes it in every output mode, bit for bit the BF16 output quantized as
-    o_proj's ``quantize_fp8`` would."""
+    o_proj's ``quantize_fp8`` would.
+
+    ``rows_per_request``: decode rows a request (its query length), 0 for
+    prefill rows. Decode rows (a full top-k window each) merge their partitions
+    inside the paged attention where aiter can (``fused_reduce_split``), and a
+    request's rows dispatch on one XCD."""
     from aiter.ops.flydsl.pa_decode import pa_decode
     from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 
@@ -202,6 +233,13 @@ def _flydsl_attention(
     ks_view, vs_view = (t.view(torch.float8_e4m3fn) for t in caches[2:])
     # The FP8 sparse path's split: a bounded top-k window per row.
     partitions = get_recommended_splits(seqs, 1)
+    workgroup_budget = None
+    page_groups = None
+    cluster_rows = 1
+    if rows_per_request > 0 and _pa_decode_merges_partitions():
+        partitions, workgroup_budget, page_groups, cluster_rows = fused_reduce_split(
+            seqs, q.device
+        )
     context_bound = table.shape[1] * BLOCK
     plan = _flydsl_prepare_explicit_plan(
         q=q_view,
@@ -214,6 +252,7 @@ def _flydsl_attention(
         existing_plan=None,
         plan_step_owner=plan_step_owner,
         plan_cache_owner=plan_cache_owner,
+        plan_workgroup_budget=workgroup_budget,
     )
     exp_sums, max_logits, partials = _flydsl_plan_scratch(
         plan, 1, group, head_dim, q.dtype, q.device, plan_cache_owner=plan_cache_owner
@@ -235,6 +274,18 @@ def _flydsl_attention(
         work_plan=plan,
         max_context_length=context_bound,
         **quant_args,
+        **(
+            {
+                "page_groups": page_groups,
+                # No plan lookups; a request's rows (which share most selected
+                # pages) dispatch on one XCD.
+                "plan_free": True,
+                "xcd_rows": rows_per_request * num_kv_heads,
+                "cluster_rows": cluster_rows,
+            }
+            if page_groups
+            else {}
+        ),
     )
     return output
 
@@ -256,6 +307,7 @@ def nvfp4_sparse_attention(
     plan_cache_owner=None,
     quantized_output: torch.Tensor | None = None,
     output_scale: torch.Tensor | None = None,
+    rows_per_request: int = 0,
 ) -> torch.Tensor:
     """O ``[rows, num_heads, D]`` of every row over its top-k blocks.
 
@@ -265,7 +317,8 @@ def nvfp4_sparse_attention(
     ``plan_step_owner`` / ``plan_cache_owner``: as for the FP8 sparse path's
     ``sparse_pa_per_row``. ``quantized_output`` / ``output_scale`` (gfx1250):
     o_proj's MXFP8 input, see ``_flydsl_attention``; the returned BF16 output
-    is then unspecified.
+    is then unspecified. ``rows_per_request`` (gfx1250): decode rows a request,
+    0 for prefill rows; see ``_flydsl_attention``.
     """
     if _gluon_kernel():
         if quantized_output is not None:
@@ -301,6 +354,7 @@ def nvfp4_sparse_attention(
         plan_cache_owner,
         quantized_output,
         output_scale,
+        rows_per_request,
     )
 
 

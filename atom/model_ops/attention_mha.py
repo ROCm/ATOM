@@ -1609,6 +1609,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         plan_cache_owner=None,
         quantized_output=None,
         output_scale=None,
+        rows_per_request=0,
     ):
         from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import (
             check_nvfp4_sparse_attention,
@@ -1636,6 +1637,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             plan_cache_owner=plan_cache_owner,
             quantized_output=quantized_output,
             output_scale=output_scale,
+            rows_per_request=rows_per_request,
         )
 
     def _nvfp4_emit_kwargs(self) -> dict:
@@ -2135,6 +2137,8 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 plan_step_owner=decode_md if self.local_blocks >= 1 else None,
                 quantized_output=quantized_output,
                 output_scale=output_scale,
+                # A full top-k window a row: merged inside the paged attention.
+                rows_per_request=max_query_len,
             )
             if quantized_output is not None:
                 output = quantized_output
