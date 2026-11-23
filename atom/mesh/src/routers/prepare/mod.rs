@@ -18,7 +18,7 @@ use crate::{
         generate::GenerateRequest,
     },
     routers::comm::error,
-    tokenizer::{registry::TokenizerRegistry, traits::Tokenizer},
+    tokenizer::{registry::TokenizerEntry, traits::Tokenizer},
 };
 
 pub(crate) mod chat_template;
@@ -61,17 +61,40 @@ fn staged<T>(stage: &'static str, work: impl FnOnce() -> T) -> T {
     done
 }
 
+/// The model's tokenizer entry; while a registration swaps it, the one being replaced.
+fn tokenizer_entry(model_id: &str, components: &AppContext) -> Option<TokenizerEntry> {
+    let registry = &components.tokenizer_registry;
+    let registered = || {
+        registry
+            .get_by_name(model_id)
+            .or_else(|| registry.get_by_id(model_id))
+    };
+    // Missed between a swap's removal and insert: the replaced entry, or, once it
+    // is forgotten, the replacement.
+    let replaced = || {
+        components
+            .tokenizers_replaced
+            .get(model_id)
+            .map(|e| e.clone())
+    };
+    registered().or_else(replaced).or_else(registered)
+}
+
+fn tokenizer_not_found(model_id: &str) -> Response {
+    error!(model = %model_id, "Tokenizer not found for model");
+    error::internal_error(
+        "tokenizer_not_found",
+        format!("Tokenizer not found for model: {}", model_id),
+    )
+}
+
 pub fn lookup_tokenizer(
     model_id: &str,
-    registry: &TokenizerRegistry,
+    components: &AppContext,
 ) -> Result<Arc<dyn Tokenizer>, Response> {
-    registry.get(model_id).ok_or_else(|| {
-        error!(model = %model_id, "Tokenizer not found for model");
-        error::internal_error(
-            "tokenizer_not_found",
-            format!("Tokenizer not found for model: {}", model_id),
-        )
-    })
+    tokenizer_entry(model_id, components)
+        .map(|entry| entry.tokenizer)
+        .ok_or_else(|| tokenizer_not_found(model_id))
 }
 
 pub fn prepare_chat(
@@ -98,10 +121,9 @@ pub fn prepare_chat_declaring(
     })?;
     let workers = components.worker_registry.get_by_model(model_id_str);
     let configured_template = components.router_config.chat_template.is_some();
-    let registry = &components.tokenizer_registry;
-    let built_in_encoder = registry
-        .get_by_name(model_id_str)
-        .or_else(|| registry.get_by_id(model_id_str))
+    let entry = tokenizer_entry(model_id_str, components);
+    let built_in_encoder = entry
+        .as_ref()
         .is_some_and(|entry| components.chats_without_template.read().contains(&entry.id));
     if let Some(gap) = atom_chat_render_gap(&workers, configured_template, built_in_encoder) {
         return Err(error::not_implemented(
@@ -112,7 +134,9 @@ pub fn prepare_chat_declaring(
             ),
         ));
     }
-    let tokenizer = lookup_tokenizer(model_id_str, &components.tokenizer_registry)?;
+    let tokenizer = entry
+        .map(|entry| entry.tokenizer)
+        .ok_or_else(|| tokenizer_not_found(model_id_str))?;
     let default_kwargs = default_template_kwargs(&workers)
         .map_err(|e| error::internal_error("invalid_default_template_kwargs", e))?;
 
@@ -233,7 +257,7 @@ pub fn prepare_generate(
         error!("model_id not set");
         error::internal_error("model_id_not_set", "model_id not set in request")
     })?;
-    let tokenizer = lookup_tokenizer(model_id_str, &components.tokenizer_registry)?;
+    let tokenizer = lookup_tokenizer(model_id_str, components)?;
 
     let (original_text, token_ids) = resolve_generate_input(&req, &tokenizer)
         .map_err(|e| error::bad_request("resolve_input_failed", e))?;

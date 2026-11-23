@@ -10,7 +10,7 @@ import logging
 import threading
 import time
 from argparse import Namespace
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import replace
@@ -76,7 +76,7 @@ UNSERVED_FIELDS = {
 N_STREAMED = "a streamed n above 1 is not served over gRPC; send it unstreamed"
 N_TRANSFERRED = "n above 1 with kv_transfer_params (P/D) is not served over gRPC"
 SESSION_N = "n above 1 is not served over the Session; Generate serves it unstreamed"
-# Submissions a Session admits at once; its reader waits for one to end past it.
+# Submissions a Session admits at once; past it, they wait in order for one to end.
 SESSION_ADMISSIONS = 64
 # ATOM's tool-call formats by atomesh's name for the same syntax. ATOM's `qwen` is the
 # XML one, atomesh's `qwen_xml`; GLM's two dialects are one ATOM parser, so atomesh's
@@ -414,6 +414,18 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
         """Admits and aborts what the client sends, until its side ends. Each submission
         is admitted in a task of its own, so an Abort is read while one is pending."""
         admissions: set[asyncio.Task] = set()
+        waiting: deque[frames.SubmitRequest] = deque()  # past SESSION_ADMISSIONS
+
+        def admit(item: frames.SubmitRequest) -> None:
+            admission = asyncio.create_task(self._admit(session, item))
+            admissions.add(admission)
+            admission.add_done_callback(admitted)
+
+        def admitted(admission: asyncio.Task) -> None:
+            admissions.discard(admission)
+            if waiting:
+                admit(waiting.popleft())
+
         try:
             async for message in request_iterator:
                 kind, items = frames.decode_client(message.frames)
@@ -430,19 +442,20 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
                         )
                         refused.append(_rejected(item.seq_id, in_flight))
                     else:
-                        while len(admissions) >= SESSION_ADMISSIONS:
-                            await asyncio.wait(
-                                admissions, return_when=asyncio.FIRST_COMPLETED
-                            )
-                        session.admitting.add(item.seq_id)
-                        admission = asyncio.create_task(self._admit(session, item))
-                        admissions.add(admission)
-                        admission.add_done_callback(admissions.discard)
+                        session.admitting.add(item.seq_id)  # an Abort waits for it
+                        if len(admissions) < SESSION_ADMISSIONS:
+                            admit(item)
+                        else:
+                            waiting.append(item)
                 session.reject(refused)
             while admissions:  # the client's side ended: what it sent is admitted first
                 await asyncio.wait(admissions)
         finally:
             try:  # a cancelled reader's admissions settle as a cancelled submission does
+                for item in waiting:  # never started: nothing of it to settle
+                    session.admitting.discard(item.seq_id)
+                    session.aborted_while_admitting.discard(item.seq_id)
+                waiting.clear()
                 for admission in admissions:
                     admission.cancel()
                 if admissions:
@@ -522,6 +535,9 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
         except BaseException:
             session.abandon(preprocessing)
             raise
+        if not session.open:  # closed while it preprocessed: close() aborted none of it
+            session.abandon(preprocessing)
+            return
         session.preparing -= 1
         session.add(request.seq_id, seq, request.request_id)
         try:
