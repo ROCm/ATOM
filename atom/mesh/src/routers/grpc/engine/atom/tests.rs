@@ -94,6 +94,7 @@ impl AtomEngine for FakeAtom {
             served_model_name: "m".into(),
             max_context_length: 4096,
             eos_token_ids: vec![2, 7],
+            usage_on_finish: true,
             ..Default::default()
         }))
     }
@@ -652,6 +653,7 @@ async fn the_client_connects_and_reads_health_and_model_and_server_info() {
         ("served_model_name", "m"),
         ("max_context_length", "4096"),
         ("eos_token_ids", "[2,7]"),
+        ("usage_on_finish", "true"),
     ];
     assert_eq!(
         labels,
