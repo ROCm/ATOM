@@ -746,6 +746,40 @@ def test_an_abort_is_applied_while_a_submission_is_in_admission(serve, monkeypat
     assert [seq.id for seq in engine.submitted] == [a, b] and engine.running == {}
 
 
+def test_a_submission_preprocessed_after_its_session_closed_never_runs(
+    serve, monkeypatch
+):
+    engine = FakeEngine()
+    engine.release.clear()
+    servicer = serve(engine)
+    open_session, opened = servicer.sessions.open, []
+    monkeypatch.setattr(
+        servicer.sessions, "open", lambda: opened.append(open_session()) or opened[-1]
+    )
+    ended = asyncio.Event()
+
+    async def client():
+        yield pb.Frames(frames=_submit_batch((3, "a", [1])))
+        await ended.wait()
+
+    async def close_while_it_preprocesses():
+        call = servicer.Session(client(), SimpleNamespace())
+        await anext(call)  # Ready
+        await _until(lambda: engine.preprocessed)
+        session = opened[0]
+        session.close()  # the call ended; its reader has not cancelled the admission
+        engine.release.set()
+        await _until(lambda: not session.admitting)
+        ended.set()
+        await call.aclose()
+        return session
+
+    session = asyncio.run(close_while_it_preprocesses())
+    # Nothing would abort it: close() ran before it was added.
+    assert engine.submitted == [] and engine.io_processor.requests == {}
+    assert session.requests == {} and session.window is None
+
+
 def test_a_session_submission_that_fails_after_a_send_aborts_its_seq(serve):
     engine = FakeEngine()
     servicer = serve(engine)
