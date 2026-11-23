@@ -36,7 +36,9 @@ class FakeEngine:
         self.config = SimpleNamespace(
             max_model_len=1 << 20, tensor_parallel_size=1, pipeline_parallel_size=1
         )
-        self.io_processor = SimpleNamespace(requests={}, preprocess=self.preprocess)
+        self.io_processor = SimpleNamespace(
+            requests={}, preprocess_fanout=self.preprocess_fanout
+        )
         self.aborted, self.made = [], []
         self.core_mgr = SimpleNamespace(
             add_request=self.add_request,
@@ -50,18 +52,21 @@ class FakeEngine:
         self.release.set()
         self.flush = None  # the servicer's per-step flush
 
-    def preprocess(self, prompt, params, *, stream_callback, **kwargs):
+    def preprocess_fanout(self, prompt, params, *, stream_callback, **kwargs):
         self.preprocessed.append((prompt, params, kwargs))
         self.release.wait(10)
-        seq = SimpleNamespace(
-            id=next(self.ids),
-            num_prompt_tokens=len(prompt),
-            max_tokens=params.max_tokens,
-            callback=stream_callback,
-        )
-        self.io_processor.requests[seq.id] = seq
-        self.made.append(seq.id)
-        return seq
+        seqs = []
+        for _ in range(params.n):
+            seq = SimpleNamespace(
+                id=next(self.ids),
+                num_prompt_tokens=len(prompt),
+                max_tokens=params.max_tokens,
+                callback=stream_callback,
+            )
+            self.io_processor.requests[seq.id] = seq
+            self.made.append(seq.id)
+            seqs.append(seq)
+        return seqs
 
     def add_request(self, seqs):
         self.submitted += seqs
@@ -160,7 +165,7 @@ def test_a_complete_without_output_ids_has_no_token_timing(serve, monkeypatch):
 @pytest.mark.parametrize(
     "sampling, message",
     [
-        (v1.SamplingParams(n=2, temperature=1.0), "n above 1"),
+        (v1.SamplingParams(n=2, temperature=1.0), "a streamed n above 1"),
         (v1.SamplingParams(max_tokens=0), "max_tokens must be at least 1"),
         (v1.SamplingParams(logprobs_flag=True), "logprobs_flag"),
         (v1.SamplingParams(top_logprobs=2), "top_logprobs"),
@@ -170,7 +175,7 @@ def test_a_complete_without_output_ids_has_no_token_timing(serve, monkeypatch):
 )
 def test_generate_refuses_what_it_cannot_serve_with_a_400(serve, sampling, message):
     engine = FakeEngine()
-    error = _error(_generate(serve(engine), sampling=sampling))
+    error = _error(_generate(serve(engine), sampling=sampling, stream=True))
     assert error.http_status == 400 and message in error.message
     assert engine.preprocessed == []
 
@@ -182,6 +187,57 @@ def test_session_affinity_ids_reach_preprocess(serve):
     (_, _, given), (_, _, absent) = engine.preprocessed
     assert (given["dp_session_id"], given["dp_parent_session_id"]) == ("s", "p")
     assert (absent["dp_session_id"], absent["dp_parent_session_id"]) == (None, None)
+
+
+def test_n_above_1_answers_one_complete_per_sibling(serve):
+    engine = FakeEngine([([5], None), ([6], "eos")])
+    sampling = v1.SamplingParams(n=2, temperature=1.0)
+    written = _generate(serve(engine), sampling=sampling)
+    assert [r.complete.index for r in written] == [0, 1]
+    assert [list(r.complete.output_ids) for r in written] == [[5, 6], [5, 6]]
+    assert engine.preprocessed[0][1].n == 2 and len(engine.submitted) == 2
+    assert engine.io_processor.requests == {} and engine.aborted == []
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_greedy_n_above_1_is_served_as_1_as_on_http(serve, stream):
+    engine = FakeEngine([([5], "eos")])
+    sampling = v1.SamplingParams(n=3, temperature=0.0)
+    written = _generate(serve(engine), sampling=sampling, stream=stream)
+    assert [r.WhichOneof("response") for r in written][-1] == "complete"
+    assert engine.preprocessed[0][1].n == 1
+
+
+def test_n_above_1_with_kv_transfer_params_is_a_400(serve):
+    engine = FakeEngine()
+    kv = json.dumps({"do_remote_decode": True})
+    sampling = v1.SamplingParams(n=2, temperature=1.0)
+    written = _generate(serve(engine), sampling=sampling, kv_transfer_params_json=kv)
+    error = _error(written)
+    assert error.http_status == 400 and "kv_transfer_params" in error.message
+    assert engine.preprocessed == []
+
+
+def test_abort_ends_every_sibling(serve):
+    engine = FakeEngine([([5], None)])  # both siblings run on after their first step
+    servicer = serve(engine)
+
+    async def abort_running():
+        sampling = v1.SamplingParams(n=2, temperature=1.0)
+        request = pb.GenerateRequest(
+            request_id="r", prompt_token_ids=[1], sampling=sampling
+        )
+        context = Context()
+        call = asyncio.create_task(servicer.Generate(request, context))
+        await _until(lambda: len(engine.running) == 2)
+        await servicer.Abort(pb.AbortRequest(request_id="r"), None)
+        await asyncio.wait_for(call, 10)
+        return context.written
+
+    written = asyncio.run(abort_running())
+    assert [r.complete.finish_reason for r in written] == ["aborted", "aborted"]
+    assert sorted(engine.aborted) == [1, 2] and engine.io_processor.requests == {}
+    assert servicer.live == {}
 
 
 def test_a_prompt_only_in_kv_transfer_params_is_admitted(serve):

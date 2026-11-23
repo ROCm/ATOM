@@ -95,6 +95,10 @@ message GenerateComplete {
   double ttft_s = 7;
   double tpot_s = 8;
   double latency_s = 9;
+  // Which sibling this answers, below the request's n. An n above 1 that greedy
+  // sampling leaves standing (it collapses to 1, as on HTTP) is served unstreamed
+  // and without kv_transfer_params: one complete per sibling, as each ends.
+  uint32 index = 10;
 }
 
 message GenerateError {

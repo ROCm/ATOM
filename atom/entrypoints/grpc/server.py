@@ -67,6 +67,9 @@ UNSERVED_FIELDS = {
     "top_logprobs",
     *STRUCTURED_FIELDS,
 }
+# n above 1 is served unstreamed and without P/D, where atomesh's placement sends it.
+N_STREAMED = "a streamed n above 1 is not served over gRPC; send it unstreamed"
+N_TRANSFERRED = "n above 1 with kv_transfer_params (P/D) is not served over gRPC"
 # ATOM's tool-call formats by atomesh's name for the same syntax. ATOM's `qwen` is the
 # XML one, atomesh's `qwen_xml`; GLM's two dialects are one ATOM parser, so atomesh's
 # model-name mapping picks GLM's.
@@ -116,33 +119,53 @@ def _deliver(outputs: list[tuple[asyncio.Queue, RequestOutput]]) -> None:
         queue.put_nowait(output)
 
 
-class _Timing:
-    """A request's times as generate_async measures them: from its arrival to its first
-    and last output ids, and to its end."""
+class _Sibling:
+    """One seq of a Generate call, n of them for n above 1: what its complete reports,
+    its times measured as generate_async measures them from the call's arrival."""
 
-    def __init__(self):
-        self.started, self.first, self.last = time.time(), None, None
+    def __init__(self, index: int, prompt_tokens: int, started: float):
+        self.index, self.prompt_tokens, self.started = index, prompt_tokens, started
+        self.ids, self.completion_tokens, self.cached = [], 0, 0
+        self.first = self.last = None
+        self.finished = False
 
-    def output_ids(self) -> None:
-        self.last = time.time()
-        if self.first is None:
-            self.first = self.last
+    def add(self, output: RequestOutput, keep_ids: bool) -> None:
+        if output.output_tokens:
+            self.last = time.time()
+            if self.first is None:
+                self.first = self.last
+        self.completion_tokens += len(output.output_tokens)
+        if keep_ids:
+            self.ids += output.output_tokens
+        self.cached = output.num_cached_tokens or self.cached
+        self.finished = output.finished
 
-    def fill(self, complete: pb.GenerateComplete) -> None:
-        complete.latency_s = time.time() - self.started
+    def complete(self, output: RequestOutput) -> pb.GenerateComplete:
+        tokens = self.completion_tokens
+        complete = pb.GenerateComplete(
+            output_ids=self.ids,
+            finish_reason=output.finish_reason,
+            prompt_tokens=self.prompt_tokens,
+            completion_tokens=tokens,
+            cached_tokens=self.cached,
+            latency_s=time.time() - self.started,
+            index=self.index,
+        )
         if self.first is not None:
             complete.ttft_s = self.first - self.started
-        if complete.completion_tokens > 1:
-            complete.tpot_s = (self.last - self.first) / (
-                complete.completion_tokens - 1
-            )
+        if tokens > 1:
+            complete.tpot_s = (self.last - self.first) / (tokens - 1)
+        if output.kv_transfer_params_output is not None:
+            kv_json = json.dumps(output.kv_transfer_params_output)
+            complete.kv_transfer_params_json = kv_json
+        return complete
 
 
 class _Call:
-    """A Generate call as Abort finds it: its seq once made, and whether aborted."""
+    """A Generate call as Abort finds it: its seqs once made, and whether aborted."""
 
     def __init__(self):
-        self.seq_id: int | None = None
+        self.seq_ids: list[int] = []
         self.aborted = False
 
 
@@ -158,14 +181,19 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
 
     async def Generate(self, request, context):
         """Admitted as `/v1/completions` admits its ids, plus its chat's structured
-        output; a refusal answered with its status; streamed one chunk per step."""
-        api, outputs, call, timing = self.api, asyncio.Queue(), _Call(), _Timing()
-        seq, submitted, finished = None, False, False
+        output; a refusal answered with its status; streamed one chunk per step. n above
+        1, unstreamed only, answers one complete per sibling as each ends."""
+        api, outputs, call, started = self.api, asyncio.Queue(), _Call(), time.time()
+        seqs, siblings, submitted = [], {}, False  # siblings by seq id
         self.live.setdefault(request.request_id, set()).add(call)
         self._log(request.request_id, "request", request)
         try:
             _refuse_unserved(request.sampling)
             params, kv_transfer_params, stops = self._admission(request)
+            if params.n > 1 and request.stream:
+                raise ValueError(N_STREAMED)
+            if params.n > 1 and kv_transfer_params is not None:
+                raise ValueError(N_TRANSFERRED)
             # An empty repeated field is an absent one.
             prompt = resolve_prompt_token_ids(
                 list(request.prompt_token_ids) or None, kv_transfer_params
@@ -180,7 +208,7 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
             preprocessing = asyncio.get_running_loop().run_in_executor(
                 None,
                 partial(
-                    api.engine.io_processor.preprocess,
+                    api.engine.io_processor.preprocess_fanout,
                     prompt,
                     params,
                     stream_callback=self.steps.callback(outputs),
@@ -194,70 +222,65 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
                 ),
             )
             try:
-                seq = await asyncio.shield(preprocessing)
-            except asyncio.CancelledError:  # the seq it registers is dropped once made
+                seqs = await asyncio.shield(preprocessing)
+            except asyncio.CancelledError:  # the seqs it makes are dropped once made
                 preprocessing.add_done_callback(partial(_drop_preprocessed, api))
                 raise
-            call.seq_id = seq.id
-            api._validate_sequence_context_length(seq, params)
-            ids, completion_tokens, cached = [], 0, 0
-            if call.aborted:  # before its submission: it never reaches the engine
-                finished, output = True, RequestOutput(seq.id, [], True, "aborted")
+            call.seq_ids = [seq.id for seq in seqs]
+            for index, seq in enumerate(seqs):
+                api._validate_sequence_context_length(seq, params)
+                siblings[seq.id] = _Sibling(index, seq.num_prompt_tokens, started)
+            if call.aborted:  # before its submission: none reaches the engine
+                for seq in seqs:
+                    outputs.put_nowait(RequestOutput(seq.id, [], True, "aborted"))
             else:
-                await api._submit_engine_requests([seq])
+                await api._submit_engine_requests(seqs)
                 submitted = True
                 if call.aborted:  # during its submission
-                    api.engine.core_mgr.abort_request(seq.id)
-            while not finished:
+                    for seq in seqs:
+                        api.engine.core_mgr.abort_request(seq.id)
+            running = len(seqs)
+            while running:
                 output = await outputs.get()
-                finished = output.finished
+                sibling = siblings[output.request_id]
+                if sibling.finished:
+                    continue
+                # A stream's tokens go out in its chunks.
+                sibling.add(output, keep_ids=not request.stream)
                 raise_for_structured_error(output.finish_reason)  # HTTP chat's 500
-                completion_tokens += len(output.output_tokens)
-                if output.output_tokens:
-                    timing.output_ids()
-                if not request.stream:  # a stream's tokens go out in its chunks
-                    ids += output.output_tokens
-                cached = output.num_cached_tokens or cached
                 if request.stream and output.output_tokens:
                     chunk = pb.GenerateStreamChunk(
                         token_ids=output.output_tokens,
-                        prompt_tokens=seq.num_prompt_tokens,
-                        completion_tokens=completion_tokens,
-                        cached_tokens=cached,
+                        prompt_tokens=sibling.prompt_tokens,
+                        completion_tokens=sibling.completion_tokens,
+                        cached_tokens=sibling.cached,
                     )
                     await self._write(
                         context, request, pb.GenerateResponse(chunk=chunk)
                     )
-            complete = pb.GenerateComplete(
-                output_ids=ids,
-                finish_reason=output.finish_reason,
-                prompt_tokens=seq.num_prompt_tokens,
-                completion_tokens=completion_tokens,
-                cached_tokens=cached,
-            )
-            timing.fill(complete)
-            if output.kv_transfer_params_output is not None:
-                kv_json = json.dumps(output.kv_transfer_params_output)
-                complete.kv_transfer_params_json = kv_json
-            await self._write(context, request, pb.GenerateResponse(complete=complete))
+                if sibling.finished:
+                    running -= 1
+                    complete = sibling.complete(output)
+                    response = pb.GenerateResponse(complete=complete)
+                    await self._write(context, request, response)
         except Exception as error:  # noqa: BLE001 - answered as `_completions` does
             refusal = pb.GenerateResponse(error=_refusal(error, "Generate"))
             await self._write(context, request, refusal)
         finally:
             self._forget(request.request_id, call)
-            if seq is not None:
-                if submitted:  # the HTTP stream teardown
-                    api.cleanup_stream(seq.id, aborted=not finished)
+            for seq in seqs:
+                if submitted:  # the HTTP stream teardown, per sibling
+                    api.cleanup_stream(seq.id, aborted=not siblings[seq.id].finished)
                 else:
                     api.engine.io_processor.requests.pop(seq.id, None)
 
     async def Abort(self, request, context):
-        """Ends the request as a dropped HTTP stream ends one, or, before it reaches the
-        engine, keeps it out; an unknown or finished request_id is no error."""
+        """Ends each of the request's seqs as a dropped HTTP stream ends one, or keeps
+        them out of the engine; an unknown or finished request_id is no error."""
         for call in list(self.live.get(request.request_id, ())):
             call.aborted = True
-            if call.seq_id is not None:
-                self.api.cleanup_stream(call.seq_id, aborted=True)
+            for seq_id in call.seq_ids:
+                self.api.cleanup_stream(seq_id, aborted=True)
         return pb.AbortResponse()
 
     async def PrepareStructuredOutput(self, request, context):
@@ -274,8 +297,6 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
         """The SamplingParams `_completions` builds, in its order, with the request's
         kv_transfer_params and its stop ids as given."""
         api, sampling = self.api, request.sampling
-        if sampling.n > 1:
-            raise ValueError("n above 1 is not served over gRPC; send one request each")
         kv_transfer_params = _kv_transfer_params(request)
         api._validate_chunked_receive(kv_transfer_params)
         temperature = _optional(sampling, "temperature", DEFAULT_TEMPERATURE)
@@ -413,7 +434,8 @@ def _refuse_unserved(sampling) -> None:
 
 def _drop_preprocessed(api: ModuleType, preprocessing: asyncio.Future) -> None:
     if not preprocessing.cancelled() and preprocessing.exception() is None:
-        api.engine.io_processor.requests.pop(preprocessing.result().id, None)
+        for seq in preprocessing.result():
+            api.engine.io_processor.requests.pop(seq.id, None)
 
 
 def _json(message, name: str, default=None):
