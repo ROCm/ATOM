@@ -1,126 +1,108 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Run the actual QKV gate on CPU, without importing the GPU-backed model.
+"""When DeepSeek MLA's default fused Q/K norm runs aiter's qkv_a_rmsnorm_fp4.
 
-Only the function AST is compiled: no copy of the gate, no module-level skip,
-and no replacement of ATOM modules. The aiter import is controlled per test;
-kernel correctness and decode performance still require gfx1250 hardware.
+The gate and the call sites are read from the model source on CPU, without
+importing the GPU-backed model; kernel bytes and decode timing need gfx1250.
 """
 
 import ast
-import builtins
-import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-ROOT = Path(__file__).resolve().parents[1]
+SRC = Path(__file__).resolve().parents[1] / "atom/models/deepseek_v2.py"
+TREE = ast.parse(SRC.read_text(encoding="utf-8"))
 
 
-def _load_function(path, name, namespace):
-    tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
-    function = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == name
+def _function(name, cls=None):
+    scope = TREE
+    if cls is not None:
+        scope = next(
+            n for n in TREE.body if isinstance(n, ast.ClassDef) and n.name == cls
+        )
+    return next(
+        n for n in ast.walk(scope) if isinstance(n, ast.FunctionDef) and n.name == name
     )
-    function.decorator_list = []
-    module = ast.Module(body=[function], type_ignores=[])
-    exec(compile(module, path, "exec"), namespace)  # noqa: S102 - test repository code
-    return namespace[name]
 
 
 @pytest.fixture
-def gate(monkeypatch):
-    monkeypatch.setenv("ATOM_USE_MODEL_SENSITIVE_RMSNORM", "0")
-    spec = importlib.util.spec_from_file_location(
-        "qkv_test_envs", ROOT / "atom/utils/envs.py"
-    )
-    envs = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(envs)
-    real_import = builtins.__import__
-    backend = SimpleNamespace(qkv_a_rmsnorm_fp4=object())
+def gate():
+    asked = []
+    served = {"value": True}
+    envs = SimpleNamespace(ATOM_USE_MODEL_SENSITIVE_RMSNORM=False)
 
-    def controlled_import(name, *args, **kwargs):
-        if name == "aiter.ops.rmsnorm":
-            if backend.qkv_a_rmsnorm_fp4 is None:
-                raise ImportError("aiter predates qkv_a_rmsnorm_fp4")
-            return backend
-        return real_import(name, *args, **kwargs)
+    def qkv_a_rmsnorm_fp4_supported(q_dim, kv_dim):
+        asked.append((q_dim, kv_dim))
+        return served["value"]
 
-    monkeypatch.setattr(builtins, "__import__", controlled_import)
-    function = _load_function(
-        "atom/models/deepseek_v2.py",
-        "_qkv_a_norm_fp4_supported",
-        {"nn": SimpleNamespace(Module=object), "envs": envs},
-    )
-    return function, backend, envs
+    function = _function("_qkv_a_norm_fp4_supported")
+    function.decorator_list = []
+    namespace = {
+        "nn": SimpleNamespace(Module=object),
+        "envs": envs,
+        "qkv_a_rmsnorm_fp4_supported": qkv_a_rmsnorm_fp4_supported,
+    }
+    module = ast.Module(body=[function], type_ignores=[])
+    exec(compile(module, str(SRC), "exec"), namespace)  # noqa: S102 - repository code
+    return namespace["_qkv_a_norm_fp4_supported"], asked, served, envs
 
 
 def _attn(**overrides):
-    base = {
-        "q_lora_rank": 1536,
-        "kv_lora_rank": 512,
-        "indexer": None,
-        "q_a_layernorm": SimpleNamespace(x_pad_to_multiple=0),
-        "kv_a_layernorm": SimpleNamespace(x_pad_to_multiple=0),
-    }
-    base.update(overrides)
-    return SimpleNamespace(**base)
+    return SimpleNamespace(
+        **{"q_lora_rank": 1536, "kv_lora_rank": 512, "indexer": None, **overrides}
+    )
 
 
-@pytest.mark.parametrize("q_lora_rank", [1152, 1280, 1408, 1536])
-@pytest.mark.parametrize("kv_lora_rank", [0, 8, 504, 512])
-def test_supported_shapes(gate, q_lora_rank, kv_lora_rank):
-    supported, _, _ = gate
-    assert supported(_attn(q_lora_rank=q_lora_rank, kv_lora_rank=kv_lora_rank))
+def test_aiter_decides_the_widths(gate):
+    supported, asked, served, _ = gate
+    assert supported(_attn()) and asked == [(1536, 512)]
+    served["value"] = False
+    assert not supported(_attn(q_lora_rank=1152, kv_lora_rank=504))
+    assert asked[-1] == (1152, 504)
 
 
-@pytest.mark.parametrize("q_lora_rank", [None, 896, 1024, 1025, 1153, 1537, 1664])
-def test_refuses_unsupported_q_rank(gate, q_lora_rank):
-    supported, _, _ = gate
-    assert not supported(_attn(q_lora_rank=q_lora_rank))
+@pytest.mark.parametrize("overrides", [{"q_lora_rank": None}, {"indexer": object()}])
+def test_refused_without_q_lora_or_with_an_indexer(gate, overrides):
+    supported, asked, _, _ = gate
+    assert not supported(_attn(**overrides)) and not asked
 
 
-@pytest.mark.parametrize("kv_lora_rank", [1, 511, 513, 1024])
-def test_refuses_unsupported_kv_rank(gate, kv_lora_rank):
-    supported, _, _ = gate
-    assert not supported(_attn(kv_lora_rank=kv_lora_rank))
-
-
-def test_refuses_an_indexer(gate):
-    supported, _, _ = gate
-    assert not supported(_attn(indexer=object()))
-
-
-@pytest.mark.parametrize("norm", ["q_a_layernorm", "kv_a_layernorm"])
-def test_refuses_a_padded_norm(gate, norm):
-    supported, _, _ = gate
-    assert not supported(_attn(**{norm: SimpleNamespace(x_pad_to_multiple=8)}))
-
-
-def test_missing_aiter_op_falls_back(gate):
-    supported, backend, _ = gate
-    backend.qkv_a_rmsnorm_fp4 = None
+def test_model_sensitive_rmsnorm_keeps_the_existing_path(gate):
+    supported, _, _, envs = gate
+    envs.ATOM_USE_MODEL_SENSITIVE_RMSNORM = True
     assert not supported(_attn())
 
 
-def test_model_sensitive_rmsnorm_falls_back(gate, monkeypatch):
-    supported, _, _ = gate
-    monkeypatch.setenv("ATOM_USE_MODEL_SENSITIVE_RMSNORM", "1")
-    assert not supported(_attn())
+def _source(node):
+    return ast.unparse(node)
 
 
-def test_env_flag_defaults_off(gate, monkeypatch):
-    _, _, envs = gate
-    monkeypatch.delenv("ATOM_DS_QKV_A_NORM_FP4", raising=False)
-    assert envs.ATOM_DS_QKV_A_NORM_FP4 is False
-
-
-@pytest.mark.parametrize("value, expected", [("0", False), ("1", True)])
-def test_env_flag_is_explicit(gate, monkeypatch, value, expected):
-    _, _, envs = gate
-    monkeypatch.setenv("ATOM_DS_QKV_A_NORM_FP4", value)
-    assert envs.ATOM_DS_QKV_A_NORM_FP4 is expected
+def test_only_the_default_fused_path_takes_it():
+    """`__init__` arms it only with a Q/K norm fusion on, and `forward` calls it
+    only for a bf16 q_c feeding a 32x4-scale MXFP4 q_b_proj, ahead of the
+    default fused norm."""
+    init = _source(_function("__init__", "DeepseekV2MLAAttention"))
+    assert (
+        "self.qkv_a_norm_fp4 = (self.fuse_qknorm_quant or self.fuse_qknorm) "
+        "and _qkv_a_norm_fp4_supported(self)" in init
+    )
+    forward = _function("forward", "DeepseekV2MLAAttention")
+    calls = [
+        n
+        for n in ast.walk(forward)
+        if isinstance(n, ast.If) and "_qkv_a_rmsnorm_fp4(" in _source(n.body[0])
+    ]
+    assert len(calls) == 1, "one call site"
+    test = _source(calls[0].test)
+    for clause in (
+        "self.qkv_a_norm_fp4",
+        "q_c.dtype == torch.bfloat16",
+        "uses_mxfp4_n32k4_scale(self.q_b_proj)",
+    ):
+        assert clause in test, clause
+    assert (
+        _source(calls[0].orelse[0].test) == "self.fuse_qknorm_quant or self.fuse_qknorm"
+    )
