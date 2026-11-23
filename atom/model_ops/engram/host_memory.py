@@ -4,15 +4,14 @@
 `pin_rows` takes the row ranges a device kernel will read across the bus (a
 table's values and, when quantized, its block scales) and returns them as
 page-locked tensors -- copied into `hipHostMalloc` memory of exactly their
-size, or the checkpoint mapping registered in place (`ATOM_ENGRAM_UVA_COPY=0`,
-or no HIP runtime). Whole tables every DP-attention rank of the node holds
-are copied once into memory those ranks share (`_shared_copy`).
+size. Whole tables every DP-attention rank of the node holds are copied once
+into memory those ranks share (`_shared_copy`), page-locked in one call
+(`_PageRuns`).
 
-Registrations go through a process-wide, reference-counted set of page runs
-(`_PageRuns`): ranges are widened to page boundaries, so ranges stored back
-to back (a layer's scales right before its values) share a page, and HIP
-refuses to register a range overlapping one already registered. Gaps are
-registered in 1 GiB pieces.
+A kernel reads a shard from one device address (`shard_device_address`), so
+a shard is always one allocation or one registration: HIP maps each
+registration to a device range of its own, and two of them, however close
+on the host, are not one range on the device.
 
 Every refused or failed HIP call clears HIP's last error (`_clear_hip_error`):
 HIP also leaves it as the runtime's sticky last error, which torch raises at
@@ -22,11 +21,11 @@ meant to allow.
 Ownership: each returned tensor's storage holds the lease on its memory, so
 the memory is released when the last tensor viewing it is collected -- never
 while one is alive, and not leaked when its owner is dropped without an
-explicit release. In-place runs are also `mlock`ed while registered and
-unlocked with their last reference (`_PageRuns`).
+explicit release. A registered run is also `mlock`ed while registered
+(`_PageRuns`).
 
 Release and the device: `hipHostFree` synchronizes the device before freeing,
-and an in-place registration synchronizes before unregistering, so kernels
+and a registration synchronizes before unregistering, so kernels
 already launched on the memory finish first. A CUDA graph captured over the
 memory keeps its address without a reference, so the memory must outlive any
 graph that reads it; Engram releases a shard only when the TP group falls back
@@ -51,18 +50,12 @@ import numpy as np
 import torch
 
 from atom.distributed.group_agreement import group_agree
-from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
 _PAGE = 4096
 _MADV_DONTNEED = 4
-_MADV_POPULATE_READ = 22  # Linux 5.14+; elsewhere EINVAL, and nothing is lost
 _MLOCK_ONFAULT = 1
-# `hipHostRegisterReadOnly`: the GPU only reads the range. Needed for a range
-# the process cannot write (the shared read-only checkpoint mapping), which
-# the default flags would ask to map writable.
-_HOST_REGISTER_READ_ONLY = 0x08
 # Not exported by Python's `mmap`: map at exactly the address given, over
 # whatever was reserved there (`_StitchedMapping`).
 _MAP_FIXED = 0x10
@@ -87,9 +80,6 @@ _MIN_COPY_THREADS = 8
 # source is still mapped before it is dropped (`_source_dropper`).
 _CHUNK_BYTES = 256 << 20
 _MAX_COPY_THREADS = 16
-# Largest single cudaHostRegister. One ioctl covering a whole Engram table
-# does not return when several ranks issue it together.
-_REG_CHUNK_BYTES = 1 << 30
 
 
 @functools.cache
@@ -111,14 +101,6 @@ def _libc():
     ]
     libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
     return libc
-
-
-def _page_span(t: torch.Tensor) -> tuple[int, int]:
-    """`[lo, hi)`: the whole pages `t`'s bytes lie on."""
-    base = t.data_ptr()
-    lo = base - base % _PAGE
-    hi = -(-(base + t.numel() * t.element_size()) // _PAGE) * _PAGE
-    return lo, hi
 
 
 def _mapped_libraries(prefix: str) -> list[str]:
@@ -143,8 +125,8 @@ def _hip_runtime():
     -- or None.
 
     Not `CDLL("libamdhip64.so")`: that is the system's unversioned dev link,
-    which a wheel-only install lacks (the copy would quietly turn into an
-    in-place registration) and which can name a second, different runtime
+    which a wheel-only install lacks (the shard would quietly take the host
+    path) and which can name a second, different runtime
     than torch's, with its own allocations and last error.
     """
     if not torch.version.hip:
@@ -189,17 +171,24 @@ def _host_get_device_pointer():
 def device_address(
     host_ptr: int, base: int | None = None, *, identity_without_hip: bool = False
 ) -> int:
-    """The device's address of `host_ptr`, a byte of the page-locked host
-    range starting at `base` (default: `host_ptr` itself). Not always the host
-    address: memory registered in place is mapped at another device address,
-    and a kernel handed the host one faults.
+    """The device's address of `host_ptr`, a byte of page-locked host memory:
+    in a run this process page-locked (`_PAGE_RUNS`), the run's own device
+    address plus the offset -- the one ROCr's lock returned, else HIP's for
+    the run; else in the HIP allocation starting at `base` (default:
+    `host_ptr` itself). Not always the host address: ROCm may map host
+    memory at another device address (ROCm 7.2), and a kernel handed the host
+    one faults. One registration is one device range; two are not one,
+    however close their host ranges (`shard_device_address`).
 
     Without a HIP runtime to ask it raises, or with `identity_without_hip`
     returns `host_ptr` itself (where the caller's host memory is read at its
-    host address: copies the HIP allocator page-locked, or no device at all).
-    A run ROCr locked for this GPU alone is read at its host address too."""
-    if _PAGE_RUNS.locked_alone(host_ptr if base is None else base):
-        return host_ptr
+    host address: copies the HIP allocator page-locked, or no device at
+    all)."""
+    run = _PAGE_RUNS.containing(host_ptr)
+    if run is not None:
+        if run.device is not None:
+            return run.device + (host_ptr - run.base)
+        base = run.base
     fn = _host_get_device_pointer()
     if fn is None:
         if identity_without_hip:
@@ -216,8 +205,17 @@ def device_address(
 def shard_device_address(shard: torch.Tensor) -> int:
     """The device's address of a page-locked shard tensor (`pin_rows`), for
     a kernel that dereferences it from a table of addresses: its storage
-    starts at its page-locked region's base."""
-    return device_address(shard.data_ptr(), shard.untyped_storage().data_ptr())
+    starts at its page-locked region's base. Raises where the shard is not
+    within one registration, which no single device address reaches."""
+    lo = shard.data_ptr()
+    hi = lo + shard.numel() * shard.element_size()
+    run = _PAGE_RUNS.containing(lo)
+    if run is not None and hi > run.end:
+        raise RuntimeError(
+            f"engram: shard [{lo:#x}, {hi:#x}) runs past its page-locked run "
+            f"[{run.base:#x}, {run.end:#x})"
+        )
+    return device_address(lo, shard.untyped_storage().data_ptr())
 
 
 def _clear_hip_error() -> None:
@@ -285,7 +283,8 @@ class _DeviceLock:
     (`hsa_amd_memory_lock` with its agent). `hipHostRegister` maps a range
     into every visible GPU, whatever its flags: a node's ranks each see all
     of the node's GPUs, so each registration costs one mapping a GPU. The
-    agent's pointer must be the host pointer, which the UVA kernels address."""
+    agent's pointer the lock returns is where the GPU reads the range: not
+    the host pointer on every ROCm."""
 
     def __init__(self, hsa, agent):
         self._lock_fn, self._unlock_fn = (
@@ -302,14 +301,15 @@ class _DeviceLock:
         self._unlock_fn.argtypes = [ctypes.c_void_p]
         self._agents = (_HsaAgent * 1)(agent)
 
-    def lock(self, ptr: int, nbytes: int) -> bool:
+    def lock(self, ptr: int, nbytes: int) -> int | None:
+        """The range locked: the GPU's address of `ptr`; None if refused."""
         out = ctypes.c_void_p()
         if self._lock_fn(ptr, nbytes, self._agents, 1, ctypes.byref(out)) != 0:
-            return False
-        if out.value != ptr:
+            return None
+        if not out.value:
             self._unlock_fn(ptr)
-            return False
-        return True
+            return None
+        return out.value
 
     def unlock(self, ptr: int) -> bool:
         return self._unlock_fn(ptr) == 0
@@ -347,18 +347,20 @@ def _device_lock_for(device: int):
     return _DeviceLock(hsa, agent)
 
 
-def _register_range(rt, ptr: int, nbytes: int, flags: int):
+def _register_range(rt, ptr: int, nbytes: int):
     """Page-lock `[ptr, ptr + nbytes)` for this process's GPU: through ROCr to
-    it alone where it can, else `cudaHostRegister`. `(registered, lock)`: the
-    `_DeviceLock` that holds it, None for HIP's; refused either way, HIP's
-    error cleared."""
+    it alone where it can, else `cudaHostRegister`. `(registered, lock,
+    device)`: the `_DeviceLock` that holds it and the GPU's address of `ptr`
+    it returned, None for HIP's (asked of HIP, `device_address`); refused
+    either way, HIP's error cleared."""
     lock = _device_lock()
-    if lock is not None and lock.lock(ptr, nbytes):
-        return True, lock
-    if int(rt.cudaHostRegister(ptr, nbytes, flags)):
+    device = None if lock is None else lock.lock(ptr, nbytes)
+    if device is not None:
+        return True, lock, device
+    if int(rt.cudaHostRegister(ptr, nbytes, 0)):
         _clear_hip_error()
-        return False, None
-    return True, None
+        return False, None, None
+    return True, None, None
 
 
 def _unregister_range(rt, ptr: int, lock) -> bool:
@@ -423,7 +425,7 @@ class _HipHostAllocator:
 
 def _host_allocator():
     """The page-locked allocator a shard is copied into, or None when there is
-    no HIP runtime to call (the shard is then registered in place)."""
+    no HIP runtime to call."""
     hip = _hip_runtime()
     if hip is None:
         return None
@@ -432,12 +434,6 @@ def _host_allocator():
     except (OSError, AttributeError):
         logger.warning("engram: hipHostMalloc unavailable", exc_info=True)
         return None
-
-
-def copies() -> bool:
-    """Whether a rank's shard is copied into page-locked memory (else
-    registered in place): `ATOM_ENGRAM_UVA_COPY`."""
-    return envs.ATOM_ENGRAM_UVA_COPY
 
 
 def _capturing() -> bool:
@@ -456,12 +452,9 @@ class _Lease:
     """One page-locked region, released exactly once: explicitly, or when the
     last tensor over it is collected."""
 
-    def __init__(self, ptr: int, nbytes: int, release_fn, keep=None):
+    def __init__(self, ptr: int, nbytes: int, release_fn):
         self.ptr, self.nbytes = ptr, nbytes
         self._release_fn = release_fn
-        # What the region lies in, kept alive with it (the checkpoint mapping
-        # of an in-place registration).
-        self._keep = keep
 
     def release(self) -> None:
         ptr, self.ptr = self.ptr, None
@@ -469,8 +462,8 @@ class _Lease:
             return  # at exit the runtime may be gone; the OS reclaims it
         if _capturing():
             # A graph being captured may hold this address and nothing tells
-            # when it can no longer run: keep the region, and what it lies in,
-            # for the life of the process.
+            # when it can no longer run: keep the region for the life of the
+            # process.
             logger.warning(
                 "engram: page-locked shard released during graph capture; "
                 "keeping it for the life of the process"
@@ -479,7 +472,6 @@ class _Lease:
             _RETAINED.append(self)
             return
         self._release_fn(ptr)
-        self._keep = None
 
     def __del__(self):
         try:
@@ -688,46 +680,35 @@ def _as_bytes(t: torch.Tensor) -> torch.Tensor:
 
 def pin_rows(
     sources: list[torch.Tensor],
-    copy: bool = False,
     share: "NodeShare | None" = None,
 ) -> tuple[torch.Tensor, ...] | None:
-    """`sources` (contiguous row ranges) as page-locked tensors of the same
-    dtype and shape, owning their memory; all-or-nothing.
+    """`sources` (contiguous row ranges) copied into page-locked tensors of
+    the same dtype and shape, owning their memory; all-or-nothing. Each is
+    one HIP allocation, so one device range (`shard_device_address`).
 
     `share`: these are whole tables every rank of `share` holds alike (DP
     attention), one copy of them on the node (`_shared_copy`); any failure
     there raises `SharedTablesError` on every rank of `share`.
 
-    `copy` copies whatever `ATOM_ENGRAM_UVA_COPY` says, and never registers
-    in place, not even without an allocator.
-
-    Otherwise None, with everything taken released, on any failure -- no
-    memory, a refused registration, no thread to copy on -- so the group can
-    fall back as one.
+    Otherwise None, with everything taken released, on any failure -- no HIP
+    runtime to allocate with, no memory, no thread to copy on -- so the group
+    can fall back as one.
     """
     if share is not None:
         return _shared_copy(share, sources)
-    plan = ["copy"] if copy or copies() else ["register"]
-    for how in plan:
-        allocator = _host_allocator() if how == "copy" else None
-        if how == "copy" and allocator is None:
-            if copy or "register" in plan:
-                break  # registering is not wanted, or was refused already
-            how = "register"
-        leases: list[_Lease] = []
-        try:
-            if how == "copy":
-                out = _copy(allocator, sources, leases)
-            else:
-                out = _register(sources, leases)
-        except Exception:  # any failure is a fallback
-            logger.warning("engram: page-locking the UVA shard failed", exc_info=True)
-            out = None
-        if out is not None:
-            return out
+    allocator = _host_allocator()
+    if allocator is None:
+        return None
+    leases: list[_Lease] = []
+    try:
+        out = _copy(allocator, sources, leases)
+    except Exception:  # any failure is a fallback
+        logger.warning("engram: page-locking the UVA shard failed", exc_info=True)
+        out = None
+    if out is None:
         for lease in leases:
             lease.release()
-    return None
+    return out
 
 
 def _copy(allocator, sources, leases):
@@ -919,12 +900,12 @@ def _fill_segment(sources, offsets, base: int, lo: int, hi: int) -> bool:
     return True
 
 
-def _unshare(rt, runs, stitched: _StitchedMapping, _ptr: int) -> None:
-    """A shared copy's release: kernels launched on it finish, its runs are
+def _unshare(rt, run, stitched: _StitchedMapping, _ptr: int) -> None:
+    """A shared copy's release: kernels launched on it finish, its run is
     unlocked, every segment unmapped."""
     if torch.cuda.is_initialized():
         torch.cuda.synchronize()
-    _PAGE_RUNS.release(rt, runs)
+    _PAGE_RUNS.release(rt, run)
     stitched.close()
 
 
@@ -954,8 +935,7 @@ def _shared_copy(share: NodeShare, sources):
     each at a page boundary of one layout cut into a segment a rank of the
     node: each rank fills its own memfd, and maps
     every rank's back to back into one contiguous range, which it page-locks
-    -- a memfd's registration is as fast as anonymous memory's, a file-backed
-    mapping registered in place is not. A memfd a rank: the ranks' copies
+    in one call (one device range). A memfd a rank: the ranks' copies
     into one memfd fault its pages in against each other. Every step is
     collective, and a failure on any rank is raised on every rank
     (`SharedTablesError`): each local step votes at the next agreement
@@ -974,7 +954,7 @@ def _shared_copy(share: NodeShare, sources):
     local = members.index(share.rank)
     lo, hi = bounds[local], bounds[local + 1]
     fd = _segment_memfd(hi - lo)
-    stitched = runs = rt = None
+    stitched = run = rt = None
     try:
         try:
             owners = share.all_gather(None if fd is None else (os.getpid(), fd))
@@ -1001,22 +981,21 @@ def _shared_copy(share: NodeShare, sources):
                 "engram: a DP rank could not fill the shared tables"
             )
         rt = _attempt("loading the CUDA runtime", torch.cuda.cudart)
-        # in pieces, as an in-place registration: one call over a whole
-        # table, issued by every rank at once, does not return
+        # the whole range in one call: one registration, one device range
         if rt is not None:
-            runs = _attempt(
+            run = _attempt(
                 "page-locking the shared tables",
-                lambda: _PAGE_RUNS.acquire(rt, ptr, ptr + total, 0),
+                lambda: _PAGE_RUNS.acquire(rt, ptr, ptr + total),
             )
-        if not share.agree(runs is not None):
+        if not share.agree(run is not None):
             raise SharedTablesError(
                 "engram: a DP rank could not page-lock the shared tables"
             )
-        lease = _Lease(ptr, total, functools.partial(_unshare, rt, runs, stitched))
-        stitched = runs = None  # the lease owns them
+        lease = _Lease(ptr, total, functools.partial(_unshare, rt, run, stitched))
+        stitched = run = None  # the lease owns them
     finally:
-        if runs is not None:
-            _PAGE_RUNS.release(rt, runs)
+        if run is not None:
+            _PAGE_RUNS.release(rt, run)
         if stitched is not None:
             stitched.close()
     return tuple(
@@ -1027,140 +1006,75 @@ def _shared_copy(share: NodeShare, sources):
     )
 
 
-def _read_only(lo: int, hi: int) -> bool:
-    """Whether some mapping of `[lo, hi)` is not writable (`/proc/self/maps`)."""
-    try:
-        with open("/proc/self/maps") as maps:
-            for line in maps:
-                fields = line.split(maxsplit=2)
-                a, b = (int(x, 16) for x in fields[0].split("-"))
-                if b > lo and a < hi and "w" not in fields[1]:
-                    return True
-    except (OSError, ValueError, IndexError):
-        pass
-    return False
-
-
-def _reg_chunk_bytes() -> int:
-    """Largest single `cudaHostRegister`, in bytes."""
-    return _REG_CHUNK_BYTES
-
-
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class _Run:
-    """One page-locked run `[base, end)`, its references, and the
-    `_DeviceLock` that holds it (None: registered through HIP)."""
+    """One range `[base, end)` page-locked in one call, the `_DeviceLock` that
+    holds it and the GPU's address of `base` it returned (both None:
+    registered through HIP, which `device_address` asks)."""
 
+    base: int
     end: int
-    refs: int
     lock: object = None
+    device: int | None = None
 
 
 class _PageRuns:
-    """This process's in-place page-locked runs, reference-counted, each
-    `mlock`ed for as long as it is registered.
+    """This process's page-locked runs, each taken in ONE call: one
+    registration is one device range, its device address the run's own plus
+    the offset (`device_address`). A range registered in pieces has no
+    single device address -- HIP maps each piece where it likes -- so a
+    kernel reading it from one base reads the wrong memory.
 
-    `cudaHostRegister` needs page boundaries and refuses a range overlapping
-    one already registered. Ranges stored back to back share their boundary
-    page -- a layer's scales sit right before its values in the checkpoint
-    shard, and a rank holding every hash head (one DP-attention rank per GPU)
-    registers both whole -- so each range takes a reference on the runs that
-    cover it and registers only the gaps between them. A run is unregistered
-    with its last reference.
-
-    Why the `mlock`: a registration pins page-cache pages through a KFD
-    userptr BO, which the kernel still treats as reclaimable. Under host
-    memory pressure kswapd reclaim touches them, and every such MMU notifier
-    evicts all of the process's GPU queues until the BO is revalidated --
-    decode stalls of seconds, or a hang. `mlock` keeps reclaim off the pages;
-    kcompactd still migrates locked pages, firing the same notifier, unless
-    `vm.compact_unevictable_allowed=0`. Runs never overlap, so a run is
-    locked when it is created (`_fault_and_lock`, which also faults it in)
-    and unlocked when its last reference goes, before it is unregistered. A
-    refused lock warns; the registration stands.
+    Each run is `mlock`ed for as long as it is registered: a registration
+    pins its pages through a KFD userptr BO, which the kernel still treats as
+    reclaimable. Under host memory pressure kswapd reclaim touches them, and
+    every such MMU notifier evicts all of the process's GPU queues until the
+    BO is revalidated -- decode stalls of seconds, or a hang. `mlock` keeps
+    reclaim off the pages; kcompactd still migrates locked pages, firing the
+    same notifier, unless `vm.compact_unevictable_allowed=0`. A refused lock
+    warns; the registration stands.
     """
 
     def __init__(self):
         self._runs: dict[int, _Run] = {}
-        self._lock = threading.RLock()
+        self._lock = threading.Lock()
 
-    def acquire(self, rt, lo: int, hi: int, flags: int = 0) -> list[int] | None:
-        """References on the runs covering `[lo, hi)` (page-aligned), the
-        uncovered gaps locked and registered first, in `_REG_CHUNK_BYTES`
-        pieces (`_register_range`); None, holding nothing, if one is refused.
-        A read-only range (`flags`) is faulted in even where its lock is
-        refused. Rollback goes through `_release_locked`, on a refusal or an
-        exception alike."""
+    def acquire(self, rt, lo: int, hi: int) -> _Run | None:
+        """`[lo, hi)` (page-aligned, held by no run) locked and registered in
+        one call (`_register_range`); None, holding nothing, if refused."""
+        _fault_and_lock(lo, hi)
+        registered, lock, device = False, None, None
+        try:
+            registered, lock, device = _register_range(rt, lo, hi - lo)
+        finally:
+            if not registered:
+                _libc().munlock(lo, hi - lo)
+        if not registered:
+            return None
+        run = _Run(lo, hi, lock, device)
         with self._lock:
-            held: list[int] = []
-            created = created_bytes = 0
-            alone = False
-            cursor = lo
-            overlapping = sorted(
-                b for b, run in self._runs.items() if b < hi and run.end > lo
-            )
-            for base in [*overlapping, None]:
-                gap_end = hi if base is None else base
-                if cursor < gap_end:
-                    read_only = bool(flags & _HOST_REGISTER_READ_ONLY)
-                    _fault_and_lock(cursor, gap_end, read_only)
-                    c = cursor
-                    while c < gap_end:
-                        e = min(gap_end, c + _reg_chunk_bytes())
-                        logger.debug("engram: page-locking %.2f GiB", (e - c) / 2**30)
-                        registered, lock = False, None
-                        try:
-                            registered, lock = _register_range(rt, c, e - c, flags)
-                        finally:
-                            if not registered:
-                                _libc().munlock(c, gap_end - c)
-                                self._release_locked(rt, held)
-                        if not registered:
-                            return None
-                        self._runs[c] = _Run(e, 1, lock)
-                        alone = lock is not None
-                        held.append(c)
-                        created += 1
-                        created_bytes += e - c
-                        c = e
-                if base is None:
-                    break
-                self._runs[base].refs += 1
-                held.append(base)
-                cursor = max(cursor, self._runs[base].end)
-            if created_bytes >= _REG_CHUNK_BYTES:
-                logger.info(
-                    "engram: page-locked %.2f GiB in %d piece(s)%s",
-                    created_bytes / 2**30,
-                    created,
-                    " for this GPU alone" if alone else "",
-                )
-            return held
+            self._runs[lo] = run
+        logger.info(
+            "engram: page-locked %.2f GiB%s",
+            (hi - lo) / 2**30,
+            " for this GPU alone" if lock is not None else "",
+        )
+        return run
 
-    def release(self, rt, bases) -> None:
-        """Drop references taken by `acquire`."""
+    def release(self, rt, run: _Run) -> None:
+        """Undo `acquire`."""
         with self._lock:
-            self._release_locked(rt, bases)
+            del self._runs[run.base]
+        _libc().munlock(run.base, run.end - run.base)
+        if not _unregister_range(rt, run.base, run.lock):
+            logger.warning("engram: unregistering a page-locked run failed")
 
-    def _release_locked(self, rt, bases) -> None:
-        """`release` with `self._lock` already held by the caller."""
-        for base in bases:
-            run = self._runs[base]
-            run.refs -= 1
-            if run.refs == 0:
-                del self._runs[base]
-                _libc().munlock(base, run.end - base)
-                if not _unregister_range(rt, base, run.lock):
-                    logger.warning("engram: unregistering a page-locked run failed")
-
-    def locked_alone(self, addr: int) -> bool:
-        """Whether `addr` lies in a run ROCr locked for this GPU alone, which
-        the GPU reads at its host address (`_DeviceLock.lock`) and HIP has no
-        record of."""
+    def containing(self, addr: int) -> _Run | None:
+        """The run `addr` lies in, None in none."""
         with self._lock:
-            return any(
-                base <= addr < run.end and run.lock is not None
-                for base, run in self._runs.items()
+            return next(
+                (run for run in self._runs.values() if run.base <= addr < run.end),
+                None,
             )
 
     def __len__(self) -> int:
@@ -1170,47 +1084,14 @@ class _PageRuns:
 _PAGE_RUNS = _PageRuns()
 
 
-def _fault_and_lock(lo: int, hi: int, populate: bool) -> None:
-    """Lock `[lo, hi)` and fault it in on several threads, ahead of
-    registering it.
-
-    `mlock2(MLOCK_ONFAULT)` marks the whole range locked in one call without
-    faulting it; `MADV_POPULATE_READ` per chunk then faults the pages in, in
-    parallel, and each is locked as it arrives. (A plain `mlock` faults on
-    the calling thread, and per-chunk `mlock`s scale poorly: on a warm 8 GiB
-    shared read-only mapping, 16 threads, this takes
-    0.27 s against 0.40 s for per-chunk `mlock` and 0.49 s for populate then
-    one `mlock`; populate alone 0.15 s.) Registration would otherwise fault
-    every page itself, on one thread and under the HIP runtime lock (which
-    stalls GPU allocations elsewhere in the process). Only a read-only range
-    (`populate`) is faulted in here, as before; the rest is locked as
-    registration faults it. A kernel without `MADV_POPULATE_READ` declines
-    and registration faults the pages as before. A refused lock warns once
-    per process and the range is still faulted in.
-    """
+def _fault_and_lock(lo: int, hi: int) -> None:
+    """Lock `[lo, hi)` ahead of registering it: `mlock2(MLOCK_ONFAULT)` marks
+    the whole range locked in one call without faulting it, and each page is
+    locked as registration faults it (the shared copy's pages are all
+    resident already: its ranks filled them). A refused lock warns once per
+    process."""
     if _libc().mlock2(lo, hi - lo, _MLOCK_ONFAULT) != 0:
         _warn_unlocked(ctypes.get_errno(), hi - lo)
-    if populate:
-        _populate(lo, hi)
-
-
-def _populate(lo: int, hi: int) -> None:
-    """`MADV_POPULATE_READ` over `[lo, hi)`, one chunk per thread."""
-    libc = _libc()
-    pieces = _chunks(lo, hi - lo, _CHUNK_BYTES)
-
-    def fault(piece) -> bool:
-        o, n = piece
-        return libc.madvise(lo + o, n, _MADV_POPULATE_READ) == 0
-
-    threads = min(copy_threads(hi - lo), len(pieces))
-    if threads <= 1:
-        for piece in pieces:
-            if not fault(piece):
-                return
-        return
-    with ThreadPoolExecutor(threads) as pool:
-        list(pool.map(fault, pieces))
 
 
 def _warn_unlocked(err: int, nbytes: int) -> None:
@@ -1232,40 +1113,3 @@ def _warn_unlocked(err: int, nbytes: int) -> None:
 
 # Set once a refused `mlock` has been logged (`_fault_and_lock`).
 _UNLOCKED_WARNED: list = []
-
-
-def _register(sources, leases):
-    """Register the mapping in place; each range is widened to page
-    boundaries, which registration requires (the extra bytes are neighbouring
-    rows the kernel never addresses), and shares any page another range of
-    this process already holds (`_PageRuns`). A read-only mapping (the
-    checkpoint mapping) is registered read-only."""
-    rt = torch.cuda.cudart()
-    spans = []
-    for src in sources:
-        lo, hi = _page_span(src)
-        flags = _HOST_REGISTER_READ_ONLY if _read_only(lo, hi) else 0
-        spans.append((lo, hi, flags))
-    return _register_spans(rt, sources, spans, leases)
-
-
-def _register_spans(rt, sources, spans, leases):
-    out = []
-    for src, (lo, hi, flags) in zip(sources, spans, strict=True):
-        base = src.data_ptr()
-        nbytes = src.numel() * src.element_size()
-        runs = _PAGE_RUNS.acquire(rt, lo, hi, flags)
-        if runs is None:
-            logger.info("engram: page-lock registration of %d bytes refused", hi - lo)
-            return None
-
-        def unregister(_ptr, runs=runs):
-            if torch.cuda.is_initialized():
-                torch.cuda.synchronize()
-            _PAGE_RUNS.release(rt, runs)
-
-        lease = _Lease(lo, hi - lo, unregister, keep=src)
-        leases.append(lease)
-        view = _owning_bytes(lease, base - lo, nbytes)
-        out.append(view.view(src.dtype).view(src.shape))
-    return tuple(out)

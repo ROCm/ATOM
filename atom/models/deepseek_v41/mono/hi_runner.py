@@ -459,7 +459,7 @@ class HiLayers(HiDraft, HiPrograms):
 
     def use_host_tables(self, host, staging) -> None:
         """The Engram kv launch reads each layer's table shard from ATOM's page-locked host shard (``host``: its
-        ``EngramHost``, page-locked at load, a page-locked copy or the mapping registered in place: the same rows
+        ``EngramHost``, page-locked at load, a page-locked copy or the node's shared copy: the same rows
         the hi runtime's ``shard_rows`` names, checked), its pointer tables rebuilt; and ``staging`` (ATOM's
         ``EngramStaging``) skips the step's lookup, all-gather, copies and compressed-id snapshot on the steps the hook
         serves (``EngramStep.served_by_round``, the builder's routing decision: nothing reads its staged rows; the
@@ -1020,7 +1020,7 @@ def check(model, atom_config, engram, draft, tp: int, rank: int) -> None:
 
 def host_shard(host, consts: dict, layer: int, tp: int, rank: int) -> tuple:
     """ATOM's page-locked host shard of Engram layer ``layer`` (``host``: its ``EngramHost``, page-locked at load, a
-    page-locked copy or the mapping registered in place) as the hi runtime reads it -> (codes, scales) uint8
+    page-locked copy or the node's shared copy) as the hi runtime reads it -> (codes, scales) uint8
     [rows, 256] / [rows, 8], their rows [lo, hi) and their device addresses. Raises ``MonoUnsupported`` when the rows
     are not those the hi runtime's ``shard_rows`` names for this rank (``consts``: ``engram_consts``).
     """

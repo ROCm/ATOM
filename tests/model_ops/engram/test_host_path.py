@@ -619,10 +619,8 @@ def _no_real_host_allocator(monkeypatch):
     from atom.model_ops.engram import host_memory
 
     monkeypatch.setattr(host_memory, "_host_allocator", lambda: None)
-    # A clean process-wide registry, so tests do not share page runs, and the
-    # copy policy as a single-GPU or TP rank sees it by default.
+    # A clean process-wide registry, so tests do not share page runs.
     monkeypatch.setattr(host_memory, "_PAGE_RUNS", host_memory._PageRuns())
-    monkeypatch.delenv("ATOM_ENGRAM_UVA_COPY", raising=False)
     # registration through `torch.cuda.cudart` (scripted), not ROCr's lock
     monkeypatch.setattr(host_memory, "_device_lock", lambda: None)
 
@@ -653,97 +651,79 @@ class FakeCudart:
 
 
 def scaled_table() -> HostEmbeddingTable:
-    """A table whose values and scales are two separate registrations.
-
-    The scales live in their own large (page-aligned) allocation: two small
-    tensors can share a page, and a shared page is registered only once.
-    """
+    """A table with values and scales: two sources, two copies."""
     codes = torch.full((1 << 20,), 127, dtype=torch.uint8)  # 2**0 == 1.0
     scale = codes[:8].view(torch.float8_e8m0fnu).view(4, 2)
     return HostEmbeddingTable(torch.ones(4, 8), num_rows=4, head_dim=8, scale=scale)
 
 
-def test_refused_scale_registration_gives_back_the_values_it_pinned(monkeypatch):
-    """The failing half must not leave the succeeding half locked.
-
-    Values and scales are registered in turn; without the rollback the first
-    call's pages stay unswappable for the life of the process, and
-    `disable_uva` cannot find them because the range was never recorded.
-    """
-    cudart = FakeCudart(refuse_call=2)
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
-    table = scaled_table()
-    assert table.enable_uva(0, 4) is False
-    assert cudart.registered == []
-    assert table._uva is None
-
-
-def test_disable_uva_returns_every_registration(monkeypatch):
-    cudart = FakeCudart()
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
-    table = scaled_table()
-    assert table.enable_uva(0, 4) is True
-    assert len(cudart.registered) == 2
-    table.disable_uva()
-    assert cudart.registered == []
-    assert table._uva is None
-    # Idempotent: a second release has nothing to give back and must not try.
-    table.disable_uva()
-    assert cudart.registered == []
-
-
-def test_enabling_the_same_range_twice_registers_once(monkeypatch):
-    cudart = FakeCudart()
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
-    table = scaled_table()
-    assert table.enable_uva(0, 4) is True
-    assert table.enable_uva(0, 4) is True
-    assert cudart.calls == 2
-
-
-WIDE_VALUES = torch.ones(4, 4096)
-
-
-def wide_table() -> HostEmbeddingTable:
-    """One values range of 64 KiB, so a chunk of a page or two splits it."""
-    return HostEmbeddingTable(WIDE_VALUES, num_rows=4, head_dim=4096)
-
-
-def registered_pages(values: torch.Tensor) -> int:
+def test_enabling_the_same_range_twice_copies_once(monkeypatch):
     from atom.model_ops.engram import host_memory
 
-    base = values.data_ptr()
-    nbytes = values.numel() * values.element_size()
-    lo = base - base % host_memory._PAGE
-    hi = -(-(base + nbytes) // host_memory._PAGE) * host_memory._PAGE
-    return (hi - lo) // host_memory._PAGE
+    allocator = FakeHostAllocator()
+    monkeypatch.setattr(host_memory, "_host_allocator", lambda: allocator)
+    table = scaled_table()
+    assert table.enable_uva(0, 4) is True
+    assert table.enable_uva(0, 4) is True
+    assert allocator.calls == 2
 
 
-def test_registration_is_split_into_chunks(monkeypatch):
+def anonymous_pages(pages: int):
+    """`pages` pages of anonymous memory, `(mapping, first byte)`: the mapping
+    keeps them alive."""
+    from atom.model_ops.engram import host_memory
+
+    buf = mmap.mmap(-1, pages * host_memory._PAGE)
+    return buf, np.frombuffer(buf, dtype=np.uint8).ctypes.data
+
+
+def test_a_range_is_page_locked_in_one_call(monkeypatch):
+    """One registration a range, however large: one device range, which the
+    kernel reads from one base."""
     from atom.model_ops.engram import host_memory
 
     cudart = FakeCudart()
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
-    monkeypatch.setattr(host_memory, "_reg_chunk_bytes", lambda: 2 * host_memory._PAGE)
-    table = wide_table()
-    assert table.enable_uva(0, 4) is True
-    assert cudart.calls == -(-registered_pages(WIDE_VALUES) // 2)
-    table.disable_uva()
-    assert cudart.registered == []
+    _buf, lo = anonymous_pages(64)
+    run = host_memory._PAGE_RUNS.acquire(cudart, lo, lo + 64 * host_memory._PAGE)
+    assert cudart.calls == 1 and cudart.registered == [lo]
+    assert host_memory._PAGE_RUNS.containing(lo + 63 * host_memory._PAGE) is run
+    host_memory._PAGE_RUNS.release(cudart, run)
+    assert cudart.registered == [] and len(host_memory._PAGE_RUNS) == 0
+
+
+def test_a_shard_past_its_registration_has_no_device_address(monkeypatch):
+    """Two registrations are two device ranges: a shard reaching from one
+    into the next is refused an address rather than read from the first
+    run's base."""
+    from atom.model_ops.engram import host_memory
+
+    cudart = FakeCudart()
+    monkeypatch.setattr(host_memory, "_host_get_device_pointer", lambda: None)
+    buf, lo = anonymous_pages(8)
+    page = host_memory._PAGE
+    first = host_memory._PAGE_RUNS.acquire(cudart, lo, lo + 4 * page)
+    second = host_memory._PAGE_RUNS.acquire(cudart, lo + 4 * page, lo + 8 * page)
+    across = torch.frombuffer(buf, dtype=torch.uint8)[2 * page : 6 * page]
+    with pytest.raises(RuntimeError, match="runs past its page-locked run"):
+        host_memory.shard_device_address(across)
+    for run in (first, second):
+        host_memory._PAGE_RUNS.release(cudart, run)
 
 
 class FakeDeviceLock:
-    """ROCr's lock to this GPU alone, accounted; `refuse` turns every lock down."""
+    """ROCr's lock to this GPU alone, accounted; `refuse` turns every lock
+    down. The GPU's address of a range is `shift` past its host one (not the
+    host address on every ROCm)."""
 
-    def __init__(self, refuse=False):
-        self.refuse = refuse
+    def __init__(self, refuse=False, shift=0):
+        self.refuse, self.shift = refuse, shift
         self.locked = []
 
     def lock(self, ptr, nbytes):
         if self.refuse:
-            return False
+            return None
         self.locked.append(ptr)
-        return True
+        return ptr + self.shift
 
     def unlock(self, ptr):
         self.locked.remove(ptr)
@@ -754,14 +734,11 @@ def test_runs_lock_to_this_gpu_alone_where_rocr_can(monkeypatch):
     from atom.model_ops.engram import host_memory
 
     cudart, lock = FakeCudart(), FakeDeviceLock()
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
     monkeypatch.setattr(host_memory, "_device_lock", lambda: lock)
-    monkeypatch.setattr(host_memory, "_reg_chunk_bytes", lambda: 2 * host_memory._PAGE)
-    table = wide_table()
-    assert table.enable_uva(0, 4) is True
-    assert len(lock.locked) == -(-registered_pages(WIDE_VALUES) // 2)
-    assert cudart.registered == []
-    table.disable_uva()
+    _buf, lo = anonymous_pages(16)
+    run = host_memory._PAGE_RUNS.acquire(cudart, lo, lo + 16 * host_memory._PAGE)
+    assert lock.locked == [lo] and cudart.registered == []
+    host_memory._PAGE_RUNS.release(cudart, run)
     assert lock.locked == []
 
 
@@ -769,50 +746,44 @@ def test_a_refused_rocr_lock_registers_through_hip(monkeypatch):
     from atom.model_ops.engram import host_memory
 
     cudart, lock = FakeCudart(), FakeDeviceLock(refuse=True)
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
     monkeypatch.setattr(host_memory, "_device_lock", lambda: lock)
-    table = wide_table()
-    assert table.enable_uva(0, 4) is True
-    assert cudart.registered and lock.locked == []
-    table.disable_uva()
+    _buf, lo = anonymous_pages(16)
+    run = host_memory._PAGE_RUNS.acquire(cudart, lo, lo + 16 * host_memory._PAGE)
+    assert cudart.registered == [lo] and lock.locked == []
+    host_memory._PAGE_RUNS.release(cudart, run)
     assert cudart.registered == []
 
 
-def test_a_rocr_locked_run_is_addressed_at_its_host_address(monkeypatch):
+@pytest.mark.parametrize("shift", [0, 1 << 30])
+def test_a_rocr_locked_run_is_addressed_where_the_lock_put_it(monkeypatch, shift):
     """HIP has no record of a run ROCr locked (its `hipHostGetDevicePointer`
-    refuses it): the device address is the host one, without asking HIP."""
+    refuses it): the device address is the one the lock returned, plus the
+    offset, without asking HIP -- the host one only where the two agree."""
     from atom.model_ops.engram import host_memory
 
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: FakeCudart())
-    monkeypatch.setattr(host_memory, "_device_lock", lambda: FakeDeviceLock())
+    lock = FakeDeviceLock(shift=shift)
+    monkeypatch.setattr(host_memory, "_device_lock", lambda: lock)
     monkeypatch.setattr(host_memory, "_host_get_device_pointer", lambda: None)
-    table = wide_table()
-    assert table.enable_uva(0, 4) is True
-    weight, *_ = table.registered_shard()
-    base = weight.untyped_storage().data_ptr()
-    assert host_memory.device_address(weight.data_ptr(), base) == weight.data_ptr()
-    table.disable_uva()
+    _buf, lo = anonymous_pages(4)
+    run = host_memory._PAGE_RUNS.acquire(FakeCudart(), lo, lo + 4 * host_memory._PAGE)
+    assert host_memory.device_address(lo + 100) == lo + shift + 100
+    host_memory._PAGE_RUNS.release(FakeCudart(), run)
 
 
-def test_a_registration_raising_midway_releases_the_pieces_before_it(monkeypatch):
+def test_a_registration_raising_releases_what_it_took(monkeypatch):
     from atom.model_ops.engram import host_memory
 
-    lock = FakeDeviceLock()
-    calls = []
+    libc = RecordingLibc()
+    monkeypatch.setattr(host_memory, "_libc", lambda: libc)
 
-    def register(rt, ptr, nbytes, flags):
-        calls.append(ptr)
-        if len(calls) == 2:
-            raise OSError("ROCr gone")
-        return lock.lock(ptr, nbytes), lock
+    def register(rt, ptr, nbytes):
+        raise OSError("ROCr gone")
 
     monkeypatch.setattr(host_memory, "_register_range", register)
-    monkeypatch.setattr(host_memory, "_reg_chunk_bytes", lambda: host_memory._PAGE)
-    buf = mmap.mmap(-1, 4 * host_memory._PAGE)
-    lo = np.frombuffer(buf, dtype=np.uint8).ctypes.data
+    _buf, lo = anonymous_pages(4)
     with pytest.raises(OSError):
         host_memory._PAGE_RUNS.acquire(FakeCudart(), lo, lo + 4 * host_memory._PAGE)
-    assert len(calls) == 2 and lock.locked == []
+    assert libc.unlocked == libc.locked == [(lo, lo + 4 * host_memory._PAGE)]
     assert len(host_memory._PAGE_RUNS) == 0
 
 
@@ -828,20 +799,6 @@ def test_rocr_is_only_the_copy_already_loaded(monkeypatch):
 
     monkeypatch.setattr(host_memory.ctypes, "CDLL", no_load)
     assert host_memory._device_lock_for.__wrapped__(0) is None
-
-
-def test_refused_chunk_gives_back_the_chunks_before_it(monkeypatch):
-    """A refusal part way through a gap releases the pieces already taken."""
-    from atom.model_ops.engram import host_memory
-
-    cudart = FakeCudart(refuse_call=3)
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
-    monkeypatch.setattr(host_memory, "_reg_chunk_bytes", lambda: host_memory._PAGE)
-    monkeypatch.setenv("ATOM_ENGRAM_UVA_COPY", "0")
-    table = wide_table()
-    assert table.enable_uva(0, 4) is False
-    assert cudart.registered == []
-    assert table._uva is None
 
 
 class RecordingLibc:
@@ -860,44 +817,6 @@ class RecordingLibc:
 
     def madvise(self, addr, n, advice):
         return 0
-
-
-def covered_bytes(ranges) -> int:
-    return sum(hi - lo for lo, hi in ranges)
-
-
-def test_chunked_runs_are_unlocked_with_their_last_reference(monkeypatch):
-    from atom.model_ops.engram import host_memory
-
-    cudart = FakeCudart()
-    libc = RecordingLibc()
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
-    monkeypatch.setattr(host_memory, "_libc", lambda: libc)
-    monkeypatch.setattr(host_memory, "_reg_chunk_bytes", lambda: 2 * host_memory._PAGE)
-    table = wide_table()
-    assert table.enable_uva(0, 4) is True
-    assert (
-        covered_bytes(libc.locked) == registered_pages(WIDE_VALUES) * host_memory._PAGE
-    )
-    assert libc.unlocked == []
-    table.disable_uva()
-    assert cudart.registered == []
-    assert len(libc.unlocked) == cudart.calls
-    assert covered_bytes(libc.unlocked) == covered_bytes(libc.locked)
-
-
-def test_refused_chunk_leaves_nothing_locked(monkeypatch):
-    from atom.model_ops.engram import host_memory
-
-    cudart = FakeCudart(refuse_call=3)
-    libc = RecordingLibc()
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
-    monkeypatch.setattr(host_memory, "_libc", lambda: libc)
-    monkeypatch.setattr(host_memory, "_reg_chunk_bytes", lambda: host_memory._PAGE)
-    table = wide_table()
-    assert table.enable_uva(0, 4) is False
-    assert cudart.registered == []
-    assert covered_bytes(libc.unlocked) == covered_bytes(libc.locked)
 
 
 class FakeHostAllocator:
@@ -974,18 +893,6 @@ def test_a_table_dropped_without_disable_frees_its_shard(monkeypatch):
     assert allocator.live == {}
 
 
-def test_a_held_registration_stays_registered_until_dropped(monkeypatch):
-    cudart = FakeCudart()
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
-    table = scaled_table()
-    assert table.enable_uva(0, 4) is True
-    weight = table.registered_shard()[0]
-    table.disable_uva()
-    assert len(cudart.registered) == 1
-    del weight
-    assert cudart.registered == []
-
-
 def test_enabling_a_different_range_while_one_is_held_raises(monkeypatch):
     from atom.model_ops.engram import host_memory
 
@@ -1019,28 +926,6 @@ def test_a_release_during_graph_capture_is_skipped(monkeypatch):
     gc.collect()
     assert len(allocator.live) == 2
     assert len(host_memory._RETAINED) >= 2
-    host_memory._RETAINED.clear()
-
-
-def test_a_registration_released_during_capture_keeps_its_backing(monkeypatch):
-    """In place, the region is the table's own storage: it must outlive any
-    graph captured over it, so the lease keeps the storage too."""
-    import gc
-
-    from atom.model_ops.engram import host_memory
-
-    cudart = FakeCudart()
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
-    weight = torch.ones(4, 8)
-    address = weight.data_ptr()
-    table = HostEmbeddingTable(weight, num_rows=4, head_dim=8)
-    assert table.enable_uva(0, 4) is True
-    monkeypatch.setattr(host_memory, "_capturing", lambda: True)
-    del table, weight
-    gc.collect()
-    assert len(cudart.registered) == 1
-    kept = [lease._keep for lease in host_memory._RETAINED]
-    assert any(k is not None and k.data_ptr() == address for k in kept)
     host_memory._RETAINED.clear()
 
 
@@ -1436,17 +1321,17 @@ def test_a_copy_that_fails_frees_what_it_took(monkeypatch):
     table.disable_uva()
 
 
-def test_without_a_host_allocator_the_mapping_is_registered_in_place(monkeypatch):
+def test_without_a_host_allocator_the_table_keeps_the_host_path(monkeypatch):
+    """No HIP runtime to allocate with: nothing is page-locked at all (a
+    mapping is never registered in place)."""
     from atom.model_ops.engram import host_memory
 
     cudart = FakeCudart()
     monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
     monkeypatch.setattr(host_memory, "_host_allocator", lambda: None)
     table = scaled_table()
-    assert table.enable_uva(0, 4) is True
-    assert len(cudart.registered) == 2
-    weight, _, _, _ = table.registered_shard()
-    assert weight.data_ptr() == table._tensor.data_ptr()
+    assert table.enable_uva(0, 4) is False
+    assert cudart.calls == 0 and table._uva is None
 
 
 class OverlapRefusingCudart:
@@ -1486,87 +1371,6 @@ class FakeHip:
         return 0
 
 
-def adjacent_tables(rows=1000, width=8):
-    """Two tables back to back in one buffer, the boundary inside a page.
-
-    Like a layer's scales and values in its checkpoint shard, both registered
-    whole by a rank that holds every hash head (one DP-attention rank per GPU).
-    """
-    from atom.model_ops.engram import host_memory
-
-    buf = torch.ones(2 * rows, width)
-    assert (rows * width * buf.element_size()) % host_memory._PAGE
-    return buf, [
-        HostEmbeddingTable(buf[i * rows : (i + 1) * rows], rows, width)
-        for i in range(2)
-    ]
-
-
-def test_adjacent_tables_share_their_boundary_page(monkeypatch):
-    """Both ranges widen to the page they share; HIP would refuse the second
-    registration of it, so it is registered once and released with its last
-    user."""
-    from atom.model_ops.engram import host_memory
-
-    cudart = OverlapRefusingCudart()
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
-    _, (first, second) = adjacent_tables()
-    assert first.enable_uva() is True
-    assert second.enable_uva() is True
-    assert cudart.last_error == 0
-    # The shared page stays locked while the second table still reads it.
-    first.disable_uva()
-    shared_page = second._tensor.data_ptr() // host_memory._PAGE
-    assert any(
-        b // host_memory._PAGE <= shared_page < -(-e // host_memory._PAGE)
-        for b, e in cudart.ranges.items()
-    )
-    second.disable_uva()
-    assert cudart.ranges == {} and len(host_memory._PAGE_RUNS) == 0
-
-
-def test_page_runs_are_counted_per_user(monkeypatch):
-    """Registering the same pages three times locks them once; they go with
-    the last release, not the first."""
-    from atom.model_ops.engram import host_memory
-
-    cudart = OverlapRefusingCudart()
-    runs = host_memory._PAGE_RUNS
-    page = host_memory._PAGE
-    held = [runs.acquire(cudart, 0, 4 * page) for _ in range(3)]
-    assert len(cudart.ranges) == 1
-    # A range reaching past the run registers only the uncovered tail.
-    wider = runs.acquire(cudart, 2 * page, 6 * page)
-    assert cudart.ranges == {0: 4 * page, 4 * page: 6 * page}
-    for refs in held:
-        assert 0 in cudart.ranges
-        runs.release(cudart, refs)
-    # The wider range still reads pages 2-3 of the first run.
-    assert cudart.ranges == {0: 4 * page, 4 * page: 6 * page}
-    runs.release(cudart, wider)
-    assert cudart.ranges == {} and len(runs) == 0
-
-
-def test_refused_registration_releases_only_what_it_took(monkeypatch):
-    from atom.model_ops.engram import host_memory
-
-    cudart = OverlapRefusingCudart()
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
-    _, (first, second) = adjacent_tables()
-    assert first.enable_uva() is True
-    held = dict(cudart.ranges)
-    # Something outside the registry already holds the second table's tail.
-    tail = second._tensor.data_ptr() + second._tensor.nbytes - 1
-    outside = tail - tail % host_memory._PAGE
-    cudart.ranges[outside] = tail + 1
-    assert second.enable_uva() is False
-    assert second._uva is None
-    del cudart.ranges[outside]
-    assert cudart.ranges == held  # the first table's pages are untouched
-    first.disable_uva()
-    assert cudart.ranges == {}
-
-
 def test_a_refused_registration_clears_the_hip_error(monkeypatch):
     """The refusal is also HIP's sticky last error; left there, torch raises
     it at the next kernel launch, in the host path the refusal falls back to."""
@@ -1574,14 +1378,14 @@ def test_a_refused_registration_clears_the_hip_error(monkeypatch):
 
     cudart = OverlapRefusingCudart()
     hip = FakeHip(cudart)
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
     monkeypatch.setattr(host_memory, "_hip_runtime", lambda: hip)
-    _, (table, _) = adjacent_tables()
-    page = host_memory._PAGE
-    base = table._tensor.data_ptr() - table._tensor.data_ptr() % page
-    cudart.ranges[base] = base + page  # held by someone else
-    assert table.enable_uva() is False
+    _buf, lo = anonymous_pages(4)
+    cudart.ranges[lo] = lo + host_memory._PAGE  # held by someone else
+    assert (
+        host_memory._PAGE_RUNS.acquire(cudart, lo, lo + 4 * host_memory._PAGE) is None
+    )
     assert hip.cleared >= 1 and cudart.last_error == 0
+    assert len(host_memory._PAGE_RUNS) == 0
 
 
 def test_failed_hip_allocations_and_frees_clear_the_hip_error(monkeypatch):
@@ -1676,48 +1480,17 @@ def _shared_file_table(tmp_path, rows=512, width=64):
     return HostEmbeddingTable(tensor, rows, width), torch.from_numpy(data.copy())
 
 
-@pytest.mark.parametrize(
-    "env, how",
-    [
-        (None, "copy"),  # #2684's default
-        ("1", "copy"),
-        ("0", "register"),
-    ],
-)
-def test_the_copy_setting_picks_a_copy_or_an_in_place_registration(
-    monkeypatch, env, how
-):
-    from atom.model_ops.engram import host_memory
-
-    if env is not None:
-        monkeypatch.setenv("ATOM_ENGRAM_UVA_COPY", env)
-    allocator = FakeHostAllocator()
-    cudart = FakeCudart()
-    monkeypatch.setattr(host_memory, "_host_allocator", lambda: allocator)
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
-    table = scaled_table()
-    assert table.enable_uva(0, 4) is True
-    assert (len(allocator.live), len(cudart.registered)) == (
-        (2, 0) if how == "copy" else (0, 2)
-    )
-    table.disable_uva()
-    assert allocator.live == {} and cudart.registered == []
-
-
-@pytest.mark.parametrize("env", [None, "0"])
-def test_copy_copies_whatever_the_setting_says(monkeypatch, env):
+def test_a_copy_never_registers(monkeypatch):
     import gc
 
     from atom.model_ops.engram import host_memory
 
-    if env is not None:
-        monkeypatch.setenv("ATOM_ENGRAM_UVA_COPY", env)
     allocator = FakeHostAllocator()
     cudart = FakeCudart()
     monkeypatch.setattr(host_memory, "_host_allocator", lambda: allocator)
     monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
     rows = torch.arange(1 << 18, dtype=torch.float32)
-    pinned = host_memory.pin_rows([rows], copy=True)
+    pinned = host_memory.pin_rows([rows])
     assert pinned is not None and torch.equal(pinned[0], rows)
     assert (len(allocator.live), cudart.calls) == (1, 0)
     del pinned
@@ -1725,42 +1498,11 @@ def test_copy_copies_whatever_the_setting_says(monkeypatch, env):
     assert allocator.live == {}
 
 
-def test_copy_without_an_allocator_is_a_failure(monkeypatch):
-    """With no page-locked allocator `copy=True` fails."""
+def test_a_shared_read_only_mapping_is_copied(monkeypatch, tmp_path):
+    """The checkpoint's shared mapping is copied, and dropping the copied
+    source pages works on it."""
     from atom.model_ops.engram import host_memory
 
-    cudart = FakeCudart()
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
-    rows = torch.ones(1 << 18)
-    assert host_memory.pin_rows([rows], copy=True) is None
-    assert cudart.calls == 0
-
-
-def test_a_shared_read_only_mapping_registers_in_place_read_only(monkeypatch, tmp_path):
-    """The shared mapping cannot be written, so in place it is registered
-    read-only: the view is the page cache itself."""
-    from atom.model_ops.engram import host_memory
-
-    monkeypatch.setenv("ATOM_ENGRAM_UVA_COPY", "0")
-    cudart = OverlapRefusingCudart()
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
-    table, expected = _shared_file_table(tmp_path)
-    assert table.enable_uva(16, 200) is True
-    weight = table.registered_shard()[0]
-    assert weight.data_ptr() == table._tensor[16].data_ptr()
-    assert cudart.flags == [host_memory._HOST_REGISTER_READ_ONLY]
-    assert torch.equal(weight, expected[16:200])
-    del weight
-    table.disable_uva()
-    assert cudart.ranges == {}
-
-
-def test_a_shared_read_only_mapping_still_copies_when_asked(monkeypatch, tmp_path):
-    """`ATOM_ENGRAM_UVA_COPY=1` copies it as #2684 does, and dropping the
-    copied source pages works on the shared mapping too."""
-    from atom.model_ops.engram import host_memory
-
-    monkeypatch.setenv("ATOM_ENGRAM_UVA_COPY", "1")
     allocator = FakeHostAllocator()
     monkeypatch.setattr(host_memory, "_host_allocator", lambda: allocator)
     monkeypatch.setattr(host_memory, "_CHUNK_BYTES", 1 << 14)
@@ -1788,36 +1530,6 @@ def test_a_shared_read_only_mapping_still_copies_when_asked(monkeypatch, tmp_pat
     assert torch.equal(table._tensor, expected)
     del weight
     table.disable_uva()
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-def test_adjacent_tables_register_on_the_device():
-    _, tables_ = adjacent_tables(rows=4099, width=128)
-    assert all(t.enable_uva() for t in tables_)
-    for t in tables_:
-        t.disable_uva()
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-def test_a_refused_registration_leaves_the_host_path_working():
-    """A refused `hipHostRegister` must not poison the host-path fallback:
-    the refusal was left as HIP's last error, which the next kernel launch's
-    check raised ("already mapped")."""
-    from atom.model_ops.engram import host_memory
-
-    buf, (table, _) = adjacent_tables(rows=4099, width=128)
-    rt = torch.cuda.cudart()
-    page = host_memory._PAGE
-    base = buf.data_ptr() - buf.data_ptr() % page
-    assert int(rt.cudaHostRegister(base, page, 0)) == 0
-    try:
-        assert table.enable_uva() is False
-        # The host path's staging buffer: a pinned tensor and its device twin.
-        cpu = torch.zeros(1024, pin_memory=True)
-        torch.zeros_like(cpu, device="cuda").copy_(cpu)
-        torch.cuda.synchronize()
-    finally:
-        rt.cudaHostUnregister(base)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
@@ -1849,12 +1561,9 @@ def test_the_hip_runtime_is_torchs_on_the_device():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-@pytest.mark.parametrize("copy", ["0", "1"])
-def test_a_shared_read_only_mapping_is_read_by_the_uva_kernel(
-    monkeypatch, tmp_path, copy
-):
-    """Registered in place (read-only) or copied, the device kernel reads the
-    rows the file holds."""
+def test_a_shared_read_only_mapping_is_read_by_the_uva_kernel(monkeypatch, tmp_path):
+    """Copied from the file's shared mapping, the device kernel reads the rows
+    the file holds."""
     import warnings
 
     pytest.importorskip("triton")
@@ -1862,7 +1571,6 @@ def test_a_shared_read_only_mapping_is_read_by_the_uva_kernel(
     from atom.model_ops.engram.device.uva import UvaGather
 
     monkeypatch.setattr(host_memory, "_host_allocator", _REAL_HOST_ALLOCATOR)
-    monkeypatch.setenv("ATOM_ENGRAM_UVA_COPY", copy)
     rows, width = 4099, 128
     expected = torch.randn(rows, width).to(torch.bfloat16)
     path = tmp_path / "table.bin"
@@ -1873,8 +1581,7 @@ def test_a_shared_read_only_mapping_is_read_by_the_uva_kernel(
         tensor = torch.frombuffer(raw, dtype=torch.bfloat16).view(rows, width)
     table = HostEmbeddingTable(tensor, rows, width)
     assert table.enable_uva() is True
-    in_place = table.registered_shard()[0].data_ptr() == tensor.data_ptr()
-    assert in_place == (copy == "0")
+    assert table.registered_shard()[0].data_ptr() != tensor.data_ptr()
     # a second table, other rows: one launch reads each layer from its own
     second = torch.randn(rows, width).to(torch.bfloat16)
     other = HostEmbeddingTable(second.clone(), rows, width)
@@ -2317,16 +2024,17 @@ def test_an_empty_shard_registers_nothing(monkeypatch):
 
 def test_uva_survives_a_group_that_agrees(monkeypatch):
     from atom.model_ops.engram import host as engram_host
+    from atom.model_ops.engram import host_memory
 
-    cudart = FakeCudart()
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    allocator = FakeHostAllocator()
+    monkeypatch.setattr(host_memory, "_host_allocator", lambda: allocator)
     patch_tp_group(monkeypatch, FakeGroup(world_size=2))
     monkeypatch.setattr(engram_host, "group_agree", lambda ok, group: ok)
     rt = make_runtime()
     heads = rt.prefetcher._hash_mapping.config.num_hash_heads
     assert rt._enable_uva(rt.prefetcher, heads) is True
-    assert len(cudart.registered) == len(rt._pinned_tables)
+    assert len(allocator.live) == len(rt._pinned_tables)
     # Shutdown is the other place these pages can leak: the mapping they belong
     # to is closed right after it.
     rt.shutdown()
-    assert cudart.registered == []
+    assert allocator.live == {}

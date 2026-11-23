@@ -9,7 +9,7 @@ each, and reports per-rank time, memory, decode-sized gather latency and
 whether the gathered rows match the host path, as one JSON line. Run one
 process per rank at once to reproduce a TP job's contention:
 
-    for r in 0 1; do HIP_VISIBLE_DEVICES=$r ATOM_ENGRAM_UVA_COPY=1 \\
+    for r in 0 1; do HIP_VISIBLE_DEVICES=$r \\
         python tools/engram/bench_uva_shard.py --model DIR --tp 2 --rank $r & done
 
 or a DP-attention job's, where every rank holds the whole tables, one copy of
@@ -19,8 +19,8 @@ them on the node (`host_memory.NodeShare`, its ranks in a gloo group on
     for r in 0 1 2 3; do HIP_VISIBLE_DEVICES=$r \\
         python tools/engram/bench_uva_shard.py --model DIR --dp 4 --rank $r & done
 
-`ATOM_ENGRAM_UVA_COPY` picks a TP rank's copy (1) or in-place registration
-(0), as the server does (`host_memory.copies`). `--cold` drops the engram shards from the page cache
+A TP rank's shard is copied into page-locked memory, as the server does
+(`host_memory.pin_rows`). `--cold` drops the engram shards from the page cache
 first (posix_fadvise; effective only when no other process maps them).
 `--hold` keeps the shard page-locked that many seconds after reporting, so the
 node's memory can be read while every rank holds its shard.
@@ -166,11 +166,7 @@ def main():
     print(
         json.dumps(
             {
-                "mode": (
-                    "shared"
-                    if share is not None
-                    else "copy" if host_memory.copies() else "register"
-                ),
+                "mode": "shared" if share is not None else "copy",
                 "tp": args.tp,
                 "dp": args.dp,
                 "rank": args.rank,

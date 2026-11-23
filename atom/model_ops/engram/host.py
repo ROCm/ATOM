@@ -398,9 +398,8 @@ class EngramHost:
         Sharding is by hash HEAD. Each head owns a disjoint, contiguous row range
         (the mapping's head offsets are their running sum), so a whole number of
         heads is a contiguous row -- and byte -- range. A rank page-locks only
-        that range (`host_memory.pin_rows`: copied into page-locked memory by
-        default, registered in place with ATOM_ENGRAM_UVA_COPY=0): the full
-        table on every rank is what a TP job cannot afford. Under DP attention
+        that range (`host_memory.pin_rows`: copied into page-locked memory):
+        the full table on every rank is what a TP job cannot afford. Under DP attention
         every rank does hold the full table: the node copies it once into
         memory its ranks share (`host_memory.NodeShare`), and a failure to
         raises on every rank (`host_memory.SharedTablesError`).
@@ -499,8 +498,8 @@ class EngramHost:
         """Drop every shard this rank page-locked; those pages are unswappable.
 
         Each table gives up its shard tensors (`disable_uva`). The memory -- a
-        `hipHostMalloc` copy by default, or the registration of the checkpoint
-        mapping in place -- goes with the last tensor over it, after the device
+        `hipHostMalloc` copy, or the node's shared copy -- goes with the last
+        tensor over it, after the device
         has finished with it (`host_memory`), so a lookup still holding one
         keeps it until then."""
         for table in self._pinned_tables:
