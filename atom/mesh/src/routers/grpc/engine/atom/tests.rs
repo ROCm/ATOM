@@ -100,6 +100,7 @@ impl AtomEngine for FakeAtom {
             protocol_version: 1,
             kv_transfer_info_json: r#"{"tp_size":1}"#.into(),
             server_info_json: r#"{"dp_size":2}"#.into(),
+            ..Default::default()
         }))
     }
 
