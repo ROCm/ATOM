@@ -1,0 +1,205 @@
+{
+  "date": "2026-11-23",
+  "execution": "gpool lease + SSH + actual srtctl SweepOrchestrator/DockerLauncher",
+  "worker_image": "vllm/vllm-openai-rocm:minimax-m31-flash-75bc8cf1@sha256:f8e8ab239e5edb7c3070c5802fc7fc0cbb889513bf81183dfc98ce1c77e1dfe1",
+  "model": "amd/MiniMax-M3.1-Flash-Quark-MXFP4",
+  "model_snapshot": "1442d09d4926cb286fa2dc6646c83c4af2b3898c",
+  "cases": [
+    {
+      "case": "tp4",
+      "lease": "Leda2e2",
+      "node": "pit2-p03-g07",
+      "prefill_gpus": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "decode_gpus": [
+        4,
+        5,
+        6,
+        7
+      ],
+      "harness_sha": "82116b1b3ea07dc25764c345f6cf086d2e448184",
+      "router_runtime": {
+        "commit": "69ed5e77bcc93b9d51cb5cf1528badd0e703ed93",
+        "profile": "release",
+        "source_dirty": "false",
+        "cargo": "cargo 1.100.0 (3acc79c0c 2026-11-05)",
+        "binary_sha256": "6237ed6828b0a926ef83811c4fb5ad9128301ae6e343acff90dd97884381db7c",
+        "lockfile_sha256": "86354f5a25283aa2535ea97b2b6a937a7cc5860f6934d378ab91cd2d13db19b7",
+        "image_id": "sha256:594e4c9a7f65efc503586fb8913b51ef4a587b0a054ae07b343e2548ec4465f5",
+        "base_image": "rocm/atom-dev:nightly_202611110332@sha256:19712185deac1eca8db5f21bc25ff2f9a3f44758bfd7cec8cc1c7889fbea097d",
+        "runtime_verified": true
+      },
+      "srt_runtime": {
+        "source_sha": "df706bc365e00bea74e5babe87b4049f624341ea",
+        "installed_hashes": {
+          "core/docker.py": "ab4d438a37299e01735596862fc434ed432f3337ce412bf25e6f8f2254fda0ee",
+          "core/launcher.py": "d8023788365855558dc7226057e31dca514e3969171caad672ff9bbc9364146d",
+          "core/runtime.py": "89f1d051a53a89f1fb6d5ff2671a705af335f0487b57741accdd0baf2df74c02",
+          "core/schema.py": "ff91c29d5d607ddd6367f452bfe8a1f6f00b664f62ff96838673aeb7b38f9f1c",
+          "frontends/atomesh.py": "a313fd62b933b487703baa6857f3fc4b5e7939ed9a0b98d51d8f53009bb9df53"
+        },
+        "python": "3.10.12 (main, Aug 31 2026, 10:18:17) [GCC 11.4.0]"
+      },
+      "workload_rc": 0,
+      "original_pool_exit_rc": 1,
+      "initial_release_rc": 3,
+      "final_cleanup": {
+        "lease_released_at": "2026-11-23T12:36:00Z",
+        "source": "gpool event log, corroborated by release CLI exit 0 and subsequent mine reporting no leases",
+        "owned_containers_remaining": 0,
+        "kfd_processes_remaining": 0,
+        "note": "Initial release was refused during delayed VRAM drain; later release used no force. Original failure exit codes are retained."
+      },
+      "result": "protocol_and_real_pd_transfer_passed",
+      "kv_transfer": {
+        "metric": "vllm:mooncake_bytes_transferred_sum",
+        "prefill_before": 0.0,
+        "prefill_after": 116654080.0,
+        "transferred_bytes_delta": 116654080.0,
+        "passed": true
+      },
+      "request_gauges_after_disconnect": "zero",
+      "http_probe_count": 5,
+      "prefill_rejection": [
+        {
+          "stream": false,
+          "http_status": 400,
+          "elapsed_seconds": 0.003925628960132599,
+          "worker_request_gauges": [
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "error": {
+            "type": "invalid_request_error",
+            "code": "prefill_server_error",
+            "message": "Prefill returned 400 Bad Request"
+          },
+          "recovery_has_choices": true
+        },
+        {
+          "stream": true,
+          "http_status": 200,
+          "elapsed_seconds": 0.003298453986644745,
+          "worker_request_gauges": [
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "error": {
+            "type": "Bad Request",
+            "code": "prefill_server_error",
+            "message": "Prefill returned 400 Bad Request"
+          },
+          "recovery_has_choices": true
+        }
+      ]
+    },
+    {
+      "case": "pp4",
+      "lease": "L42e73a",
+      "node": "pit2-p03-g48",
+      "prefill_gpus": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "decode_gpus": [
+        4,
+        5,
+        6,
+        7
+      ],
+      "harness_sha": "82116b1b3ea07dc25764c345f6cf086d2e448184",
+      "router_runtime": {
+        "commit": "69ed5e77bcc93b9d51cb5cf1528badd0e703ed93",
+        "profile": "release",
+        "source_dirty": "false",
+        "cargo": "cargo 1.100.0 (3acc79c0c 2026-11-05)",
+        "binary_sha256": "2401625f142620cbe523754867490e5f3ad1844ffe0b4379785d1e59218e27b3",
+        "lockfile_sha256": "86354f5a25283aa2535ea97b2b6a937a7cc5860f6934d378ab91cd2d13db19b7",
+        "image_id": "sha256:0257276e210877b805b0637b0ec83bc61676838ed23d7d73eb4344041f1bbb7d",
+        "base_image": "rocm/atom-dev:nightly_202611110332@sha256:19712185deac1eca8db5f21bc25ff2f9a3f44758bfd7cec8cc1c7889fbea097d",
+        "runtime_verified": true
+      },
+      "srt_runtime": {
+        "source_sha": "df706bc365e00bea74e5babe87b4049f624341ea",
+        "installed_hashes": {
+          "core/docker.py": "ab4d438a37299e01735596862fc434ed432f3337ce412bf25e6f8f2254fda0ee",
+          "core/launcher.py": "d8023788365855558dc7226057e31dca514e3969171caad672ff9bbc9364146d",
+          "core/runtime.py": "89f1d051a53a89f1fb6d5ff2671a705af335f0487b57741accdd0baf2df74c02",
+          "core/schema.py": "ff91c29d5d607ddd6367f452bfe8a1f6f00b664f62ff96838673aeb7b38f9f1c",
+          "frontends/atomesh.py": "a313fd62b933b487703baa6857f3fc4b5e7939ed9a0b98d51d8f53009bb9df53"
+        },
+        "python": "3.10.12 (main, Aug 31 2026, 10:18:17) [GCC 11.4.0]"
+      },
+      "workload_rc": 1,
+      "original_pool_exit_rc": 1,
+      "initial_release_rc": 3,
+      "final_cleanup": {
+        "lease_released_at": "2026-11-23T12:35:05Z",
+        "source": "gpool event log, corroborated by release CLI exit 0 and subsequent mine reporting no leases",
+        "owned_containers_remaining": 0,
+        "kfd_processes_remaining": 0,
+        "note": "Initial release was refused during delayed VRAM drain; later release used no force. Original failure exit codes are retained."
+      },
+      "result": "failed_first_chat_request",
+      "http_status": 500,
+      "cause": "Mooncake KV-head re-sharding is not supported for NVFP4 KV cache.",
+      "phase": "P, D and router ready; decode failed loading KV from TP1 producer into TP4 consumer",
+      "prefill_flag_differences_from_tp4": [
+        "TP1 PP4",
+        "enable-dbo removed (unsupported with PP in V2 runner)",
+        "enable-batch-sharded-sampling removed (unsupported at TP1)"
+      ]
+    }
+  ],
+  "pp4_guard_evidence": {
+    "image": "vllm/vllm-openai-rocm:minimax-m31-flash-75bc8cf1@sha256:f8e8ab239e5edb7c3070c5802fc7fc0cbb889513bf81183dfc98ce1c77e1dfe1",
+    "source_path": "/usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py",
+    "source_sha256": "56a614c7d4416cd921937354782431f9ccc7df11511adb910b2ddf044d1d8c09",
+    "gpu_devices_exposed": false,
+    "validation_scope": "Only the inspected layout guard with stubbed non-MLA 8-KV-head metadata; not a worker launch or end-to-end FP8 validation.",
+    "cases": [
+      {
+        "producer_tp": 4,
+        "consumer_tp": 4,
+        "nvfp4": true,
+        "guard_error": null
+      },
+      {
+        "producer_tp": 1,
+        "consumer_tp": 4,
+        "nvfp4": true,
+        "guard_error": "Mooncake KV-head re-sharding is not supported for NVFP4 KV cache."
+      },
+      {
+        "producer_tp": 1,
+        "consumer_tp": 4,
+        "nvfp4": false,
+        "guard_error": null
+      }
+    ]
+  },
+  "limits": [
+    "No accuracy, performance, AgentX or power measurement",
+    "Tool fields accepted; no forced semantic tool-call correctness",
+    "Zero request gauges do not prove all KV memory was released",
+    "No GPU-crash or RDMA-loss fault injection",
+    "Mooncake was tested; MoRI GPU validation remains outstanding",
+    "PP4 config was not silently changed to another KV dtype"
+  ],
+  "follow_up": [
+    "Investigate NVFP4 KV-head redistribution in the vLLM Mooncake connector; preserve packed values and scales",
+    "Validate MoRI READ separately",
+    "Compare routers with matched accuracy/performance settings after functional gates",
+    "Formal SA recipe/sweep waits for user model selection"
+  ]
+}

@@ -13,7 +13,7 @@ unset SLURM_JOB_ID SPUR_JOB_ID SPUR_TASK_OFFSET SPUR_PEER_NODES
 mkdir -p "${RUN_DIR}/bin" "${RUN_DIR}/logs"
 gpool=/share_nfs/yajizhan/gpu-pool/bin/gpool
 finish_pool_test() {
-  local rc=$? cleanup_rc=0 release_rc=0 id
+  local rc=$? cleanup_rc=0 release_rc=0 id attempt
   trap - EXIT INT TERM HUP
   docker ps -aq --filter "label=srtctl.job=${SRTCTL_JOB_ID}" > "${RUN_DIR}/pool-cleanup-ids.txt" || cleanup_rc=$?
   if [[ "${cleanup_rc}" == 0 ]]; then
@@ -21,9 +21,15 @@ finish_pool_test() {
       [[ -z "${id}" ]] || timeout 20 docker rm -f "${id}" >> "${RUN_DIR}/pool-cleanup.log" 2>&1 || cleanup_rc=1
     done < "${RUN_DIR}/pool-cleanup-ids.txt"
   fi
-  sleep 3
-  "${gpool}" release "${GPOOL_LEASE}" --note "M3.1 ${case_name} ATOMesh69ed5e7 workload_rc=${rc} cleanup_rc=${cleanup_rc}" \
-    > "${RUN_DIR}/gpool-release.log" 2>&1 || release_rc=$?
+  : > "${RUN_DIR}/gpool-release.log"
+  # ROCm can retain VRAM briefly after the last container exits.
+  for attempt in {1..13}; do
+    release_rc=0
+    "${gpool}" release "${GPOOL_LEASE}" --note "M3.1 ${case_name} ATOMesh69ed5e7 workload_rc=${rc} cleanup_rc=${cleanup_rc}" \
+      >> "${RUN_DIR}/gpool-release.log" 2>&1 || release_rc=$?
+    [[ "${release_rc}" == 3 && "${attempt}" -lt 13 ]] || break
+    sleep 10
+  done
   printf '%s\n' "${release_rc}" > "${RUN_DIR}/gpool-release.rc"
   printf '%s\n' "${rc}" > "${RUN_DIR}/pool-workload.rc"
   [[ "${cleanup_rc}" == 0 && "${release_rc}" == 0 ]] || rc=1
