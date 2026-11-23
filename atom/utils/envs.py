@@ -819,6 +819,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_REPLICATE_VOCAB_EMBED": lambda: (
         os.getenv("ATOM_REPLICATE_VOCAB_EMBED", "1") == "1"
     ),
+    # Warm every power-of-two prefill token bucket at startup (see
+    # `ModelRunner.warmup_model`); 0 runs the one warmup forward only.
+    "ATOM_WARMUP_PREFILL_BUCKETS": lambda: _flag_env(
+        "ATOM_WARMUP_PREFILL_BUCKETS", "1"
+    ),
     "ATOM_ENABLE_GDN_DECODE_LOSSY_FAST": lambda: (
         os.getenv("ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", "0").lower() == "1"
     ),
