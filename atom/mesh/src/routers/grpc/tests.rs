@@ -1981,3 +1981,132 @@ mod j_atom_stops {
         assert!(!sglang.contains("test"), "{sglang:?}");
     }
 }
+
+mod k_cache_reconcile {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+
+    use crate::core::placement::traits::PdPlanner;
+    use crate::core::placement::types::{PlacementError, PlacementPlan, RequestDescriptor};
+    use crate::core::WorkerType;
+    use crate::observability::{metrics::metrics_labels, route_trace};
+    use crate::protocols::generate::GenerateRequest;
+    use crate::routers::grpc::pipeline::Pipeline;
+    use crate::routers::test_mocks::{self, mock_grpc_worker, MockDispatcher};
+    use crate::routers::token_handle::test_support::synthetic_single_stream;
+    use crate::routers::token_handle::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
+
+    /// Plans one regular worker, or a pair, and expects half the prompt cached on the
+    /// worker that computes it, as a cache-aware policy's selection records.
+    struct EstimatingPlanner {
+        pair: bool,
+    }
+
+    #[async_trait]
+    impl PdPlanner for EstimatingPlanner {
+        async fn plan(&self, _: &RequestDescriptor<'_>) -> Result<PlacementPlan, PlacementError> {
+            if !self.pair {
+                let worker = mock_grpc_worker("grpc://w:1", WorkerType::Regular);
+                route_trace::record_estimate(
+                    metrics_labels::WORKER_REGULAR,
+                    Some(&worker),
+                    Some(0.5),
+                );
+                return Ok(PlacementPlan::Single {
+                    worker,
+                    policy_name: "cache_aware",
+                });
+            }
+            let prefill = mock_grpc_worker(
+                "grpc://p:1",
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+            );
+            let decode = mock_grpc_worker("grpc://d:1", WorkerType::Decode);
+            route_trace::record_estimate(metrics_labels::WORKER_PREFILL, Some(&prefill), Some(0.5));
+            route_trace::record_estimate(metrics_labels::WORKER_DECODE, Some(&decode), Some(0.9));
+            Ok(PlacementPlan::Pair {
+                prefill,
+                decode,
+                prefill_policy: "cache_aware",
+                decode_policy: "cache_aware",
+            })
+        }
+    }
+
+    fn completed() -> TokenChunk {
+        TokenChunk::Complete {
+            token_ids: vec![1],
+            finish_reason: FinishReason::Stop,
+            matched_stop: None,
+            usage: Usage {
+                prompt_tokens: 100,
+                completion_tokens: 1,
+                total_tokens: 101,
+            },
+            logprobs: None,
+            input_logprobs: None,
+            meta: WorkerMeta {
+                cached_tokens: 40,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// The metrics a unary /generate placed by `planner` renders.
+    async fn rendered(pair: bool) -> String {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let dispatcher = MockDispatcher::repeat_with_stream(|| {
+            // n=2: the siblings' one prompt is reconciled once.
+            Ok(synthetic_single_stream(vec![
+                Ok(completed()),
+                Ok(completed()),
+            ]))
+        });
+        let pipeline = Pipeline::with_injected(
+            Arc::new(EstimatingPlanner { pair }),
+            Arc::new(dispatcher),
+            metrics_labels::BACKEND_REGULAR,
+        );
+        let registry = test_mocks::tokenizer_registry_with("m");
+        let ctx = test_mocks::app_context_with_tokenizer_registry(registry);
+        let req: GenerateRequest = serde_json::from_str(r#"{"text": "test"}"#).unwrap();
+        let response = pipeline
+            .execute_generate(Arc::new(req), None, Some("m".to_string()), ctx)
+            .await;
+        assert!(response.status().is_success());
+        axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        handle.render()
+    }
+
+    fn assert_reconciled(rendered: &str, pool: &str) {
+        for line in [
+            format!(r#"mesh_route_cache_tokens_total{{pool="{pool}",kind="prompt"}} 100"#),
+            format!(r#"mesh_route_cache_tokens_total{{pool="{pool}",kind="cached"}} 40"#),
+            format!(
+                r#"mesh_route_cache_estimate_tokens_total{{pool="{pool}",kind="estimated"}} 50"#
+            ),
+            format!(r#"mesh_route_cache_estimate_tokens_total{{pool="{pool}",kind="actual"}} 40"#),
+        ] {
+            assert!(rendered.contains(&line), "missing {line} in\n{rendered}");
+        }
+    }
+
+    #[tokio::test]
+    async fn grpc_cached_tokens_are_reconciled_against_the_estimate() {
+        assert_reconciled(&rendered(false).await, "regular");
+    }
+
+    #[tokio::test]
+    async fn grpc_pd_cached_tokens_are_reconciled_against_the_prefill_estimate() {
+        let rendered = rendered(true).await;
+        assert_reconciled(&rendered, "prefill");
+        assert!(!rendered.contains(r#"pool="decode",kind="#), "{rendered}");
+    }
+}

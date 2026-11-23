@@ -1,8 +1,14 @@
 //! Transport-neutral 4-step gRPC pipeline: prepare → plan → engine.dispatch → render.
 
-use std::{sync::Arc, time::Instant};
+use std::{
+    pin::Pin,
+    sync::Arc,
+    task::{ready, Context, Poll},
+    time::Instant,
+};
 
 use axum::response::Response;
+use futures::Stream;
 use http::HeaderMap;
 use tracing::error;
 
@@ -21,7 +27,10 @@ use crate::{
         worker::RuntimeType,
         AttachedBody, Worker, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
-    observability::metrics::{bool_to_static_str, metrics_labels, MeshMetrics},
+    observability::{
+        metrics::{bool_to_static_str, metrics_labels, MeshMetrics},
+        route_trace,
+    },
     policies::PolicyRegistry,
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionResponse},
@@ -40,7 +49,11 @@ use crate::{
             stop_decoder_builder::create_stop_decoder,
         },
         render,
-        token_handle::engine_error::EngineError,
+        token_handle::{
+            engine_error::EngineError,
+            token_chunk::TokenChunk,
+            token_handle::{SourceClock, TokenHandle, TokenSource},
+        },
     },
     tokenizer::{traits::Tokenizer, StopSequenceDecoder},
 };
@@ -249,19 +262,9 @@ impl Pipeline {
             Ok(t) => t,
             Err(e) => return self.record_chat_err(&model, start, e),
         };
-        let placement = match self.plan_for(&payload, &resp_ctx).await {
-            Ok(p) => p,
+        let (guards, stream) = match self.dispatch(&mut payload, &mut resp_ctx).await {
+            Ok(dispatched) => dispatched,
             Err(e) => return self.record_chat_err(&model, start, e),
-        };
-        self.read_as_atom(&placement, &mut resp_ctx);
-        let guards = self.load_guards(&placement, resp_ctx.headers.as_ref());
-        let stream = match self
-            .engine
-            .dispatch_with_tokenizer(&placement, &mut payload, &resp_ctx.tokenizer)
-            .await
-        {
-            Ok(s) => s,
-            Err(e) => return self.record_chat_err(&model, start, engine_err_to_response(e)),
         };
 
         let is_stream = resp_ctx.original.is_streaming();
@@ -309,25 +312,9 @@ impl Pipeline {
                 Ok(t) => t,
                 Err(e) => return self.record_generate_err(&model_for_metric, start, e),
             };
-        let placement = match self.plan_for(&payload, &resp_ctx).await {
-            Ok(p) => p,
+        let (guards, stream) = match self.dispatch(&mut payload, &mut resp_ctx).await {
+            Ok(dispatched) => dispatched,
             Err(e) => return self.record_generate_err(&model_for_metric, start, e),
-        };
-        self.read_as_atom(&placement, &mut resp_ctx);
-        let guards = self.load_guards(&placement, resp_ctx.headers.as_ref());
-        let stream = match self
-            .engine
-            .dispatch_with_tokenizer(&placement, &mut payload, &resp_ctx.tokenizer)
-            .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                return self.record_generate_err(
-                    &model_for_metric,
-                    start,
-                    engine_err_to_response(e),
-                )
-            }
         };
 
         let is_stream = resp_ctx.original.is_streaming();
@@ -363,16 +350,46 @@ impl Pipeline {
             ));
         }
 
-        let (mut payload, resp_ctx) = prepare::prepare_chat(req, headers, model_id, &components)?;
-        let placement = self.plan_for(&payload, &resp_ctx).await?;
-        let _guards = self.load_guards(&placement, resp_ctx.headers.as_ref());
-        let stream = self
-            .engine
-            .dispatch_with_tokenizer(&placement, &mut payload, &resp_ctx.tokenizer)
-            .await
-            .map_err(engine_err_to_response)?;
+        let (mut payload, mut resp_ctx) =
+            prepare::prepare_chat(req, headers, model_id, &components)?;
+        let (_guards, stream) = self.dispatch(&mut payload, &mut resp_ctx).await?;
 
         render::chat_aggregator::process_typed(stream, resp_ctx).await
+    }
+
+    /// Plan the request, read its output as its producer's, and dispatch it: the loads
+    /// held until the response ends, and its stream, whose cached tokens are reconciled
+    /// with the estimate the plan's selection made on the worker computing the prompt.
+    async fn dispatch(
+        &self,
+        payload: &mut GenerationPayload,
+        ctx: &mut ResponseContext,
+    ) -> Result<(Vec<WorkerLoadGuard>, TokenHandle), Response> {
+        let (dispatched, estimate) = route_trace::estimated(async {
+            let placement = self.plan_for(payload, ctx).await?;
+            self.read_as_atom(&placement, ctx);
+            let guards = self.load_guards(&placement, ctx.headers.as_ref());
+            let stream = self
+                .engine
+                .dispatch_with_tokenizer(&placement, payload, &ctx.tokenizer)
+                .await
+                .map_err(engine_err_to_response)?;
+            Ok::<_, Response>((placement, guards, stream))
+        })
+        .await;
+        let (placement, guards, stream) = dispatched?;
+        // A pair's cached tokens are the ones its prefill reused.
+        let pool = match placement {
+            PlacementPlan::Single { .. } => metrics_labels::WORKER_REGULAR,
+            PlacementPlan::Pair { .. } => metrics_labels::WORKER_PREFILL,
+        };
+        let reconciled = Reconciled {
+            inner: stream,
+            pool,
+            estimate,
+            done: false,
+        };
+        Ok((guards, TokenHandle::new(reconciled)))
     }
 
     /// The loads held until the response ends; none when dispatch holds them.
@@ -434,6 +451,45 @@ impl Pipeline {
             error_type_from_status(resp.status()),
         );
         resp
+    }
+}
+
+/// A stream that records its first Complete's cached prompt tokens against `pool`, and
+/// against the router's `estimate` of them, as the HTTP routers reconcile a response's usage.
+struct Reconciled {
+    inner: TokenHandle,
+    pool: &'static str,
+    estimate: Option<f64>,
+    done: bool,
+}
+
+impl Stream for Reconciled {
+    type Item = Result<TokenChunk, EngineError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let item = ready!(Pin::new(&mut self.inner).poll_next(cx));
+        if let Some(Ok(TokenChunk::Complete { usage, meta, .. })) = &item {
+            // n siblings share one prompt, as their first reports it.
+            if !std::mem::replace(&mut self.done, true) {
+                let (prompt, cached) = (usage.prompt_tokens.into(), meta.cached_tokens.into());
+                MeshMetrics::record_route_cache_tokens(self.pool, prompt, cached);
+                if let Some(ratio) = self.estimate {
+                    let estimated = (ratio * prompt as f64).round() as u64;
+                    MeshMetrics::record_route_cache_estimate(self.pool, prompt, estimated, cached);
+                }
+            }
+        }
+        Poll::Ready(item)
+    }
+}
+
+impl TokenSource for Reconciled {
+    fn mark_completed(&mut self) {
+        self.inner.mark_completed();
+    }
+
+    fn clock(&self) -> Option<SourceClock> {
+        self.inner.clock()
     }
 }
 
