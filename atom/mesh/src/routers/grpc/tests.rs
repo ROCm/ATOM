@@ -71,6 +71,7 @@ mod b_execute_chat {
                     request_id: "req-test".to_string(),
                     weight_version: None,
                     cached_tokens: 0,
+                    timing: None,
                 },
             }),
         ]
@@ -300,6 +301,7 @@ mod c_execute_generate {
                     request_id: "req-test".to_string(),
                     weight_version: None,
                     cached_tokens: 0,
+                    timing: None,
                 },
             }),
         ]
@@ -411,6 +413,7 @@ mod d_execute_for_responses {
                     request_id: "req-test".to_string(),
                     weight_version: None,
                     cached_tokens: 0,
+                    timing: None,
                 },
             }),
         ]
@@ -513,6 +516,7 @@ mod e_metrics_labels {
                 request_id: "req-test".to_string(),
                 weight_version: None,
                 cached_tokens: 0,
+                timing: None,
             },
         })]
     }
@@ -1659,6 +1663,7 @@ mod i_atom_refusals {
                 request_id: "req".to_string(),
                 weight_version: None,
                 cached_tokens: 0,
+                timing: None,
             },
         })]))
     }
@@ -1669,6 +1674,8 @@ mod i_atom_refusals {
             .connection_mode(ConnectionMode::Grpc { port: None })
             .runtime_type(runtime)
             .model_id(model)
+            // An ATOM worker reporting none has its chats refused.
+            .label("chat_template", "{{ messages }}")
             .build();
         Arc::new(worker)
     }
@@ -1807,6 +1814,7 @@ mod j_atom_stops {
                     request_id: "req".to_string(),
                     weight_version: None,
                     cached_tokens: 0,
+                    timing: None,
                 },
             })]))
         };

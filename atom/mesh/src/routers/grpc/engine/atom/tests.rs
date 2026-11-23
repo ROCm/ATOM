@@ -30,7 +30,7 @@ use crate::routers::grpc::engine::{worker_client_cache::GrpcClient, GrpcEngine};
 use crate::routers::prepare::{build_generate_payload, generation_payload::GenerationPayload};
 use crate::routers::test_mocks;
 use crate::routers::token_handle::engine_error::EngineError;
-use crate::routers::token_handle::token_chunk::{FinishReason, MatchedStop, TokenChunk};
+use crate::routers::token_handle::token_chunk::{FinishReason, MatchedStop, SeqTiming, TokenChunk};
 
 type Reply = Result<GenerateResponse, Status>;
 
@@ -44,6 +44,8 @@ struct FakeAtom {
     held: Mutex<Option<mpsc::Sender<Reply>>>,
     /// GetServerInfo's `kv_transfer_info_json`; `{"tp_size":1}` when unset.
     kv_transfer_info: Option<String>,
+    /// GetServerInfo never answers.
+    stall_server_info: bool,
 }
 
 impl FakeAtom {
@@ -98,6 +100,9 @@ impl AtomEngine for FakeAtom {
         &self,
         _: Request<GetServerInfoRequest>,
     ) -> Result<Response<GetServerInfoResponse>, Status> {
+        if self.stall_server_info {
+            std::future::pending::<()>().await;
+        }
         Ok(Response::new(GetServerInfoResponse {
             protocol_version: 1,
             kv_transfer_info_json: self
@@ -195,6 +200,9 @@ fn complete(output_ids: &[u32], finish_reason: &str) -> GenerateResponse {
             completion_tokens: 3,
             cached_tokens: 2,
             kv_transfer_params_json: None,
+            ttft_s: 0.25,
+            tpot_s: 0.125,
+            latency_s: 0.5,
             ..Default::default()
         })),
     }
@@ -212,6 +220,14 @@ fn error(message: &str, http_status: u32) -> GenerateResponse {
 /// A /generate request through atomesh's gRPC pipeline to `worker`, with the
 /// mock tokenizer registered for model "m".
 async fn route_generate(worker: Arc<dyn Worker>, stream: bool) -> axum::response::Response {
+    route_generate_with(worker, stream, None).await
+}
+
+async fn route_generate_with(
+    worker: Arc<dyn Worker>,
+    stream: bool,
+    headers: Option<http::HeaderMap>,
+) -> axum::response::Response {
     let pipeline = test_mocks::pipeline_with(
         Arc::new(test_mocks::MockPdPlanner::repeat_single(worker, "random")),
         Arc::new(GrpcEngine::new()),
@@ -221,11 +237,11 @@ async fn route_generate(worker: Arc<dyn Worker>, stream: bool) -> axum::response
         test_mocks::app_context_with_tokenizer_registry(test_mocks::tokenizer_registry_with("m"));
     let sampling = serde_json::json!({
         "temperature": 0.7, "top_p": 0.9, "top_k": 20, "max_new_tokens": 16, "ignore_eos": true,
-        "stop": ["Hello world", "<|im_end|>", "unseen"],
+        "stop": ["Hello world", "<|im_end|>", "unseen"], "stop_token_ids": [7, 42],
     });
     let body = generate_body(stream, sampling);
     pipeline
-        .execute_generate(body, None, Some("m".to_string()), context)
+        .execute_generate(body, headers, Some("m".to_string()), context)
         .await
 }
 
@@ -250,7 +266,13 @@ async fn a_payload_becomes_the_generate_request_atom_receives() {
             ..Default::default()
         }),
         // The mock tokenizer's ids; "unseen" encodes to nothing and is dropped.
-        stop_token_sequences: vec![TokenIds { ids: vec![1, 2] }, TokenIds { ids: vec![1002] }],
+        // Then each stop id, alone.
+        stop_token_sequences: vec![
+            TokenIds { ids: vec![1, 2] },
+            TokenIds { ids: vec![1002] },
+            TokenIds { ids: vec![7] },
+            TokenIds { ids: vec![42] },
+        ],
         kv_transfer_params_json: None,
         data_parallel_rank: None,
         stream: false,
@@ -258,6 +280,21 @@ async fn a_payload_becomes_the_generate_request_atom_receives() {
         ..Default::default()
     };
     assert_eq!(*fake.requests.lock().unwrap(), vec![expected]);
+}
+
+#[tokio::test]
+async fn session_headers_reach_the_generate_request() {
+    let fake = FakeAtom::new(vec![vec![complete(&[4], "eos")]]);
+    let url = serve(fake.clone()).await;
+    let mut headers = http::HeaderMap::new();
+    headers.insert("x-session-id", "turns".parse().unwrap());
+    headers.insert("x-dynamo-parent-session-id", "root".parse().unwrap());
+
+    let response = route_generate_with(atom_worker(&url), false, Some(headers)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let requests = fake.requests.lock().unwrap();
+    assert_eq!(requests[0].dp_session_id.as_deref(), Some("turns"));
+    assert_eq!(requests[0].dp_parent_session_id.as_deref(), Some("root"));
 }
 
 #[test]
@@ -283,6 +320,24 @@ async fn stop_strings_without_a_tokenizer_fail_before_the_call() {
         .dispatch(&single(atom_worker(&url)), &mut request)
         .await;
     assert!(matches!(result, Err(EngineError::RequestBuildFailed(_))));
+    assert!(fake.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_logprobs_request_fails_before_the_call() {
+    let fake = FakeAtom::new(vec![vec![complete(&[4], "eos")]]);
+    let url = serve(fake.clone()).await;
+    let mut top = payload(false);
+    top.logprob.top_logprobs_num = 2;
+    let mut flag = payload(false);
+    flag.logprob.return_logprob = true;
+
+    for mut request in [top, flag] {
+        let result = GrpcEngine::new()
+            .dispatch(&single(atom_worker(&url)), &mut request)
+            .await;
+        assert!(matches!(result, Err(EngineError::RequestBuildFailed(_))));
+    }
     assert!(fake.requests.lock().unwrap().is_empty());
 }
 
@@ -328,6 +383,12 @@ async fn a_stream_becomes_token_chunks_in_order() {
         usage.total_tokens,
     );
     assert_eq!((counts, meta.cached_tokens), ((3, 3, 6), 2));
+    let timing = SeqTiming {
+        ttft_s: 0.25,
+        tpot_s: 0.125,
+        latency_s: 0.5,
+    };
+    assert_eq!(meta.timing, Some(timing));
 
     // A stream that ends before its Complete fails rather than ending short.
     let cut = collect(&plan, true).await;
@@ -340,6 +401,43 @@ async fn a_stream_becomes_token_chunks_in_order() {
             ]
         ),
         "{cut:?}"
+    );
+}
+
+/// `complete`, answering sibling `index`.
+fn sibling(output_ids: &[u32], index: u32) -> GenerateResponse {
+    let mut response = complete(output_ids, "eos");
+    if let Some(generate_response::Response::Complete(c)) = response.response.as_mut() {
+        c.index = index;
+    }
+    response
+}
+
+#[tokio::test]
+async fn an_unstreamed_call_yields_every_siblings_complete_by_index() {
+    let fake = FakeAtom::new(vec![
+        vec![sibling(&[21], 1), sibling(&[10], 0)],
+        vec![sibling(&[21], 1), error("engine failed", 500)],
+    ]);
+    let plan = single(atom_worker(&serve(fake).await));
+
+    let both = collect(&plan, false).await;
+    let ids: Vec<_> = both
+        .iter()
+        .map(|item| match item {
+            Ok(TokenChunk::Complete { token_ids, .. }) => token_ids.clone(),
+            other => panic!("expected a Complete, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(ids, [vec![10], vec![21]]);
+
+    // An error after a sibling's Complete fails the call.
+    let failed = GrpcEngine::new().dispatch(&plan, &mut payload(false)).await;
+    assert!(
+        matches!(&failed, Err(EngineError::Http { status, .. })
+            if *status == StatusCode::INTERNAL_SERVER_ERROR),
+        "{:?}",
+        failed.err()
     );
 }
 
@@ -369,6 +467,79 @@ async fn an_error_keeps_its_http_status() {
             Err(EngineError::Http { status: StatusCode::INTERNAL_SERVER_ERROR, message }),
         ] if message == "engine failed"),
         "{failed:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_streamed_ttft_includes_the_wait_for_the_first_token() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics = recorder.handle();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let fake = Arc::new(FakeAtom {
+        scripts: Mutex::new(vec![Vec::new()].into()),
+        hold: true,
+        ..Default::default()
+    });
+    let held = fake.clone();
+    tokio::spawn(async move {
+        let sender = loop {
+            if let Some(sender) = held.held.lock().unwrap().take() {
+                break sender;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for reply in [chunk(&[11]), complete(&[], "eos")] {
+            sender.send(Ok(reply)).await.unwrap();
+        }
+    });
+
+    let response = route_generate(atom_worker(&serve(fake).await), true).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let rendered = metrics.render();
+    let ttft: f64 = rendered
+        .lines()
+        .find(|line| line.starts_with("mesh_router_ttft_seconds_sum{"))
+        .and_then(|line| line.rsplit_once(' ')?.1.parse().ok())
+        .unwrap_or_else(|| panic!("no TTFT recorded: {rendered}"));
+    assert!(
+        ttft >= 0.3,
+        "TTFT {ttft} s misses the wait for the first token"
+    );
+}
+
+#[tokio::test]
+async fn an_unstreamed_e2e_latency_includes_the_wait_for_the_complete() {
+    let fake = Arc::new(FakeAtom {
+        scripts: Mutex::new(vec![Vec::new()].into()),
+        hold: true,
+        ..Default::default()
+    });
+    let held = fake.clone();
+    tokio::spawn(async move {
+        let sender = loop {
+            if let Some(sender) = held.held.lock().unwrap().take() {
+                break sender;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        sender.send(Ok(complete(&[4], "eos"))).await.unwrap();
+    });
+
+    let response = route_generate(atom_worker(&serve(fake).await), false).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let latency = body[0]["meta_info"]["e2e_latency"].as_f64().unwrap();
+    assert!(
+        latency >= 0.3,
+        "e2e_latency {latency} s misses the generation"
     );
 }
 
@@ -447,7 +618,7 @@ mod pairs {
 
     use super::*;
     use crate::config::types::{AtomPdRankMappingPolicy, RetryConfig};
-    use crate::core::{WorkerRegistry, WorkerType};
+    use crate::core::{HealthConfig, WorkerRegistry, WorkerType};
     use crate::policies::RoundRobinPolicy;
     use crate::routers::grpc::engine::{atom::pair::AtomPairs, Dispatcher};
     use crate::routers::grpc::pd_router::GrpcPDRouter;
@@ -767,6 +938,165 @@ mod pairs {
         // Its GetServerInfo was read: chunked transfer, and its TP size for D.
         assert_eq!(kv(&first(&p))["chunked_transfer"], json!(true));
         assert_eq!(kv(&first(&d))["remote_tp_size"], json!(2));
+    }
+
+    #[tokio::test]
+    async fn a_prefill_whose_server_info_never_answers_times_out_at_both_reads() {
+        let fake = Arc::new(FakeAtom {
+            stall_server_info: true,
+            ..Default::default()
+        });
+        let url = serve(fake).await;
+        let health = HealthConfig {
+            timeout_secs: 1,
+            ..Default::default()
+        };
+        let stalled: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(&url)
+                .worker_type(PREFILL)
+                .connection_mode(ConnectionMode::Grpc { port: None })
+                .runtime_type(RuntimeType::Atom)
+                .health_config(health)
+                .build(),
+        );
+        let registry = Arc::new(WorkerRegistry::new());
+        registry.register(stalled.clone());
+        let startup = timeout(
+            HANG,
+            AtomPairs::new(registry, AtomPdRankMappingPolicy::Idx2Idx),
+        );
+        let error = startup.await.expect("startup hung").err().unwrap();
+        assert!(error.contains("timed out"), "{error}");
+
+        let pairs = AtomPairs::new(
+            Arc::new(WorkerRegistry::new()),
+            AtomPdRankMappingPolicy::Idx2Idx,
+        )
+        .await
+        .unwrap();
+        let first_pair = timeout(HANG, pairs.adapter_for(&stalled));
+        let error = first_pair
+            .await
+            .expect("the first pair hung")
+            .err()
+            .unwrap();
+        assert!(
+            matches!(error, EngineError::Http { status, .. } if status == StatusCode::GATEWAY_TIMEOUT),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pair_of_an_atom_and_a_non_atom_worker_is_refused_before_either_call() {
+        let (p, p_url) = instance(vec![vec![prefill_done(json!({}))]], false, None).await;
+        let other = test_mocks::mock_http_only_worker("http://d:8000");
+        assert_ne!(other.metadata().runtime_type, RuntimeType::Atom);
+        let plan = PlacementPlan::Pair {
+            prefill: worker(&p_url, PREFILL),
+            decode: other,
+            prefill_policy: "random",
+            decode_policy: "random",
+        };
+        let pairs = AtomPairs::new(
+            Arc::new(WorkerRegistry::new()),
+            AtomPdRankMappingPolicy::Idx2Idx,
+        )
+        .await
+        .unwrap();
+        let refused = GrpcEngine::with_atom_pairs(pairs)
+            .dispatch(&plan, &mut payload(false))
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(&refused, EngineError::Http { status, message }
+                if *status == StatusCode::INTERNAL_SERVER_ERROR && message.contains("mixes runtimes")),
+            "{refused}"
+        );
+        assert!(p.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_prefill_registered_again_at_its_url_has_its_info_read_again() {
+        let p_script = vec![vec![prefill_done(json!({}))]];
+        let (_, p_url) = instance(p_script.clone(), false, prefill_info(2, Some(template()))).await;
+        let (_, replacement_url) = instance(p_script, false, prefill_info(4, None)).await;
+        let d_script = vec![vec![complete(&[21], "eos")], vec![complete(&[22], "eos")]];
+        let (d, d_url) = instance(d_script, false, None).await;
+        let (pw, dw) = (worker(&p_url, PREFILL), worker(&d_url, WorkerType::Decode));
+        let registry = Arc::new(WorkerRegistry::new());
+        registry.register(pw.clone());
+        registry.register(dw.clone());
+        let pairs = AtomPairs::new(registry.clone(), AtomPdRankMappingPolicy::Idx2Idx)
+            .await
+            .unwrap();
+        let engine = GrpcEngine::with_atom_pairs(pairs);
+        let run = |prefill: Arc<dyn Worker>| {
+            let plan = PlacementPlan::Pair {
+                prefill,
+                decode: dw.clone(),
+                prefill_policy: "random",
+                decode_policy: "random",
+            };
+            let engine = engine.clone();
+            async move {
+                let handle = engine.dispatch(&plan, &mut payload(false)).await.unwrap();
+                timeout(HANG, handle.collect::<Vec<_>>()).await.unwrap();
+            }
+        };
+        run(pw).await;
+
+        // Removed, then registered again at the same URL: another instance behind it.
+        registry.remove_by_url(&p_url);
+        let client = GrpcClient::connect(&replacement_url, "atom").await.unwrap();
+        let replacement: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(&p_url)
+                .worker_type(PREFILL)
+                .connection_mode(ConnectionMode::Grpc { port: None })
+                .runtime_type(RuntimeType::Atom)
+                .grpc_client(client)
+                .build(),
+        );
+        registry.register(replacement.clone());
+        run(replacement).await;
+
+        let decodes = d.requests.lock().unwrap().clone();
+        let tp_and_chunked = |request: &GenerateRequest| {
+            let kv = kv(request);
+            (kv["remote_tp_size"].clone(), kv["chunked_transfer"].clone())
+        };
+        assert_eq!(tp_and_chunked(&decodes[0]), (json!(2), json!(true)));
+        assert_eq!(tp_and_chunked(&decodes[1]), (json!(4), Value::Null));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pairs_streamed_ttft_includes_the_prefill() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let metrics = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let (p, p_url) = instance(vec![vec![]], true, prefill_info(2, None)).await;
+        let d_script = vec![vec![chunk(&[21]), complete(&[], "eos")]];
+        let (_, d_url) = instance(d_script, false, None).await;
+        let workers = [worker(&p_url, PREFILL), worker(&d_url, WorkerType::Decode)];
+        let request = start(router(&workers).await, true);
+
+        let prefill_call = calls(&p, 1).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        prefill_call
+            .send(Ok(prefill_done(json!({}))))
+            .await
+            .unwrap();
+        drop(prefill_call);
+        let response = finish(request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let rendered = metrics.render();
+        let ttft: f64 = rendered
+            .lines()
+            .find(|line| line.starts_with("mesh_router_ttft_seconds_sum{"))
+            .and_then(|line| line.rsplit_once(' ')?.1.parse().ok())
+            .unwrap_or_else(|| panic!("no TTFT recorded: {rendered}"));
+        assert!(ttft >= 0.3, "TTFT {ttft} s misses the prefill");
     }
 
     #[tokio::test]
