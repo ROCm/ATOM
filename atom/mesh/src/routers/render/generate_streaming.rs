@@ -143,7 +143,6 @@ async fn run_generate_stream(
                     .map_err(|_| "send chunk".to_string())?;
             }
             TokenChunk::Complete {
-                token_ids,
                 finish_reason,
                 usage,
                 meta,
@@ -151,10 +150,9 @@ async fn run_generate_stream(
                 input_logprobs,
                 ..
             } => {
-                if let Some(rest) = rest {
-                    let (text, _stopped) = process_chunk_tokens(&mut stop_decoder, &rest);
-                    accumulated_text.push_str(&text);
-                }
+                let rest = rest.unwrap_or_default();
+                let (text, _stopped) = process_chunk_tokens(&mut stop_decoder, &rest);
+                accumulated_text.push_str(&text);
                 if let SequenceDecoderOutput::Text(text) = stop_decoder.flush() {
                     accumulated_text.push_str(&text);
                 }
@@ -179,15 +177,9 @@ async fn run_generate_stream(
                 let e2e_latency = start_time.elapsed().as_secs_f64();
                 let fr = finish_reason_to_generate(&finish_reason, usage.completion_tokens);
 
-                let last = token_ids
-                    .last()
-                    .copied()
-                    .map(|t| vec![t])
-                    .unwrap_or_default();
-
                 let response = json!({
                     "text": accumulated_text.clone(),
-                    "output_ids": last,
+                    "output_ids": rest,
                     "meta_info": {
                         "id": index_id,
                         "finish_reason": fr,

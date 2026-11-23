@@ -3565,6 +3565,47 @@ mod e1_generate_streaming_body_content {
         assert!(s.contains("[DONE]"));
     }
 
+    /// The final event carries every id the partials did not, whatever a Complete
+    /// carries.
+    #[tokio::test]
+    async fn test_generate_streaming_final_event_carries_every_unstreamed_id() {
+        let complete = |token_ids: Vec<u32>| TokenChunk::Complete {
+            token_ids,
+            finish_reason: FinishReason::Stop,
+            matched_stop: None,
+            usage: Usage::default(),
+            logprobs: None,
+            input_logprobs: None,
+            meta: meta(),
+        };
+        let partial = TokenChunk::Partial {
+            token_ids: vec![1],
+            logprobs: None,
+        };
+        for (chunks, ids) in [
+            (
+                vec![partial, complete(vec![1, 2, 6])],
+                vec![vec![1], vec![2, 6]],
+            ),
+            (vec![complete(vec![1, 2, 6])], vec![vec![1, 2, 6]]),
+        ] {
+            let stream = synthetic_single_stream(chunks.into_iter().map(Ok).collect());
+            let body = body_of(generate_streaming::process(
+                stream,
+                generate_ctx(),
+                "regular",
+            ));
+            let events: Vec<Vec<u32>> = body
+                .await
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+                .map(|event| serde_json::from_value(event["output_ids"].clone()).unwrap())
+                .collect();
+            assert_eq!(events, ids);
+        }
+    }
+
     #[tokio::test]
     async fn test_generate_streaming_complete_emits_e2e_latency() {
         let stream = synthetic_single_stream(vec![Ok(TokenChunk::Complete {
