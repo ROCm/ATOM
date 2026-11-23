@@ -12,12 +12,23 @@ use crate::routers::token_handle::engine_error::EngineError;
 use crate::tokenizer::traits::Tokenizer;
 
 /// Stop strings are encoded with `tokenizer`, the model's; a request with any
-/// fails without it.
+/// fails without it. A request for logprobs fails.
 pub(crate) fn generate_request(
     payload: &GenerationPayload,
     worker: &dyn Worker,
     tokenizer: Option<&dyn Tokenizer>,
 ) -> Result<GenerateRequest, EngineError> {
+    let logprob = &payload.logprob;
+    if logprob.return_logprob
+        || logprob.top_logprobs_num > 0
+        || logprob.input_logprobs
+        || !logprob.token_ids_logprob.is_empty()
+    {
+        // ATOM's Generate answers no logprobs; atomesh refuses rather than drop them.
+        return Err(EngineError::RequestBuildFailed(
+            "logprobs are not served by ATOM workers over gRPC".into(),
+        ));
+    }
     let stops = match &payload.stop.stop {
         Some(StringOrArray::String(stop)) => std::slice::from_ref(stop),
         Some(StringOrArray::Array(stops)) => stops.as_slice(),

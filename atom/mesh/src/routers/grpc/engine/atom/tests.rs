@@ -308,6 +308,24 @@ async fn stop_strings_without_a_tokenizer_fail_before_the_call() {
 }
 
 #[tokio::test]
+async fn a_logprobs_request_fails_before_the_call() {
+    let fake = FakeAtom::new(vec![vec![complete(&[4], "eos")]]);
+    let url = serve(fake.clone()).await;
+    let mut top = payload(false);
+    top.logprob.top_logprobs_num = 2;
+    let mut flag = payload(false);
+    flag.logprob.return_logprob = true;
+
+    for mut request in [top, flag] {
+        let result = GrpcEngine::new()
+            .dispatch(&single(atom_worker(&url)), &mut request)
+            .await;
+        assert!(matches!(result, Err(EngineError::RequestBuildFailed(_))));
+    }
+    assert!(fake.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn a_stream_becomes_token_chunks_in_order() {
     let fake = FakeAtom::new(vec![
         vec![chunk(&[11, 12]), chunk(&[13]), complete(&[], "stop_13")],
