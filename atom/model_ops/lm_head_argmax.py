@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 import torch
 import triton
 import triton.language as tl
@@ -12,17 +15,32 @@ def _lm_head_argmax_pack_kernel(
     logits_ptr,
     packed_ptr,
     vocab_start_idx,
+    temps_ptr,
+    tag_ptr,
+    seed,
+    rq,
+    vocab_total,
+    greedy_t,
     M: tl.constexpr,
     stride_logits_n: tl.constexpr,
     stride_logits_m: tl.constexpr,
     stride_packed_n: tl.constexpr,
     BLOCK_M: tl.constexpr,
+    DRAW: tl.constexpr,
 ):
+    """Row r's best (value, global id) of this shard; ``DRAW``
+    (``verify_ids.HeadDraw``): a row of temperature T > ``greedy_t`` by its
+    Gumbel-max scores logit / T - log(-log U), U uniform under
+    ``seed`` + the step's tag at offset r ``vocab_total`` + id."""
     row = tl.program_id(0)
     block_offs = tl.arange(0, BLOCK_M)
     best_val = tl.full((), -float("inf"), dtype=tl.float32)
     invalid_idx = tl.full((), M, dtype=tl.int64)
     best_idx = invalid_idx
+    if DRAW:
+        temp = tl.load(temps_ptr + row // rq)
+        draws = temp > greedy_t
+        key = seed + tl.load(tag_ptr)
 
     for block_start in tl.range(0, M, BLOCK_M):
         offs = block_start + block_offs
@@ -32,6 +50,10 @@ def _lm_head_argmax_pack_kernel(
             mask=mask,
             other=-float("inf"),
         ).to(tl.float32)
+        if DRAW:  # noqa: SIM102 (a constexpr branch, then a traced one)
+            if draws:
+                u = tl.rand(key, row * vocab_total + vocab_start_idx + offs)
+                vals = vals / temp - tl.log(-tl.log(u))
 
         block_max = tl.max(vals, axis=0)
         idxs = offs.to(tl.int64)
@@ -59,6 +81,18 @@ def _lm_head_argmax_pack_fake(
 @torch_compile_guard(gen_fake=_lm_head_argmax_pack_fake)
 def lm_head_argmax_pack(logits: torch.Tensor, vocab_start_idx: int) -> torch.Tensor:
     """Reduce and fp32-pack local LM-head argmax in one Triton launch."""
+    return _pack(logits, vocab_start_idx, None, 0)
+
+
+def lm_head_draw_pack(
+    logits: torch.Tensor, vocab_start_idx: int, draw, vocab_total: int
+) -> torch.Tensor:
+    """``lm_head_argmax_pack`` with ``draw``'s rows (``verify_ids.HeadDraw``)
+    by their draw scores over a vocab of ``vocab_total`` ids."""
+    return _pack(logits, vocab_start_idx, draw, vocab_total)
+
+
+def _pack(logits, vocab_start_idx: int, draw, vocab_total: int) -> torch.Tensor:
     if logits.dim() != 2:
         raise ValueError("lm_head_argmax_pack expects a 2-D logits tensor")
 
@@ -76,11 +110,18 @@ def lm_head_argmax_pack(logits: torch.Tensor, vocab_start_idx: int) -> torch.Ten
         logits,
         packed,
         vocab_start_idx,
+        packed if draw is None else draw.temperatures,
+        packed if draw is None else draw.tag,
+        0 if draw is None else draw.seed,
+        1 if draw is None else draw.rq,
+        vocab_total,
+        0.0 if draw is None else draw.greedy_t,
         M=M,
         stride_logits_n=logits.stride(0),
         stride_logits_m=logits.stride(1),
         stride_packed_n=packed.stride(0),
         BLOCK_M=block_m,
+        DRAW=draw is not None,
         num_warps=num_warps,
         num_stages=2,
     )
