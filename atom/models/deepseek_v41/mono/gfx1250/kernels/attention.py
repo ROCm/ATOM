@@ -796,6 +796,11 @@ def _kg_decode(c, t, sm, o, rr):
 def stage_D(c):
     t, b, w, l, sm, o = c["t"], c["b"], c["w"], c["l"], c["sm"], c["o"]
     TR, RPC, QV = c["TR"], c["RPC"], c["QV"]
+    # (code size: D runs cold each layer -- I-cache) t's range known: its divisions / remainders by powers of two are
+    # shifts / masks, not signed-division sequences (t is an opaque value)
+    t = t & I32(THREADS - 1)
+    w = t // 32
+    l = t % 32
     cl = b // CL
     jj = b % CL
     r0 = cl * RPC
@@ -825,6 +830,7 @@ def stage_D(c):
         rpp = hx.gload(c["rpos"] + i64(rrow) * 8, fx.Int64)
         rcv = hx.gload(c["rcos"] + (rpp * 32 + i64(rf0 + 2 * (t % 8))) * 2, BF16, 2)   # this lane's 2 pairs
         rsv = hx.gload(c["rsin"] + (rpp * 32 + i64(rf0 + 2 * (t % 8))) * 2, BF16, 2)   # this lane's 2 pairs
+        msk = _d_merge_sink(c, w, l)   # (c1) the merge's sink weight too
         hx.bar()
         _dstamp(c, 1, t0s)
         if fx.const_expr(kv_fp4_of(c)):   # FP4 KV: the raw key rows staged by async copies (decoded below)
@@ -844,12 +850,20 @@ def stage_D(c):
                     hx.async_to_lds_b128(c["kv"] + (i64(idl[j]) * KG_ROW + i64(cc * 8)) * 2,
                                          sm + o["k"] + ((rr * 48 + kg0 + j) * HP + cc * 8) * 2, 0)
         NZ = RPC * (48 - KC) * HD // 8
-        for it in range(hx.opaque_s(I32((NZ + THREADS - 1) // THREADS))):
-            i = t + it * THREADS
-            if i < NZ:
+        if fx.const_expr(NZ % THREADS == 0 and NZ <= 2 * THREADS):   # (c1: 2 chunks a thread) straight-line, t's range
+            # known: shifts / masks, not a runtime loop's signed-division sequences (D runs cold each layer -- I-cache)
+            for it in range_constexpr(NZ // THREADS):
+                i = t + it * THREADS
                 bb = i // ((48 - KC) * HD // 8)
                 rem = i % ((48 - KC) * HD // 8)
                 hx.lstore(sm + o["k"] + ((bb * 48 + KC + rem // (HD // 8)) * HP + (rem % (HD // 8)) * 8) * 2, fx.Vector.filled(4, 0, I32))
+        else:
+            for it in range(hx.opaque_s(I32((NZ + THREADS - 1) // THREADS))):
+                i = t + it * THREADS
+                if i < NZ:
+                    bb = i // ((48 - KC) * HD // 8)
+                    rem = i % ((48 - KC) * HD // 8)
+                    hx.lstore(sm + o["k"] + ((bb * 48 + KC + rem // (HD // 8)) * HP + (rem % (HD // 8)) * 8) * 2, fx.Vector.filled(4, 0, I32))
         _dstamp(c, 2, t0s)
         if fx.const_expr(kv_fp4_of(c)):   # FP4 KV: the staged key rows -> BF16 key rows, while C still runs
             hx.wait_asynccnt0()
@@ -972,48 +986,86 @@ def stage_D(c):
             if t == 0:
                 hx.put(c["a1flag"] + i64(cl * CL + jj) * 8, I32(0), c["a1tag"])
         else:
+            mg = _d_merge_pre(c, cl, jj, w, l, msk)   # (c1) the merge's operand bases, before the cluster sync
             cluster_sync()
-            _d_merge(c, cl, jj, rcv, rsv)
+            _d_merge(c, cl, jj, rcv, rsv, mg)
             _dstamp(c, 7, t0s)
 
 
+def _d_merge_sink(c, w, l):
+    """(c1, WMERGE) the merge's sink weight of lane l's qv 4 w + l // 8 (wave w < 4; others a clamped copy): loaded at D's
+    entry with the RoPE rows (a load issued just before the cluster sync would hold its release fence)."""
+    QV = c["QV"]
+    if fx.const_expr(not WMERGE(QV)):
+        return None
+    return hx.gload(c["sink"] + i64(fx.min(w * 4 + l // 8, I32(QV - 1)) % H) * 4, F32)
+
+
+def _d_merge_pre(c, cl, jj, w, l, snk):
+    """(c1, WMERGE) the merge's operand bases, before the cluster sync: lane l of wave w < 4 -- its partials' (dim l,
+    qv 4 w ..; partial p at + p * QV * HD * 2 B, immediate offsets), its two (m, l) pairs' (qv 4 w + l // 8, segments
+    2 (l % 8), + 1). The pointers are scalar table loads: issued here, not after the cluster barrier."""
+    QV = c["QV"]
+    if fx.const_expr(not WMERGE(QV)):
+        return None
+    c0 = cl * CL
+    qw = w * 4 + l // 8
+    pvb = c["apart"] + i64(c0 * QV * HD * 2) + i64(((w * HD + jj * 32 + l) * 4) * 2)
+    mlb = c["aml"] + i64(c0 * QV * 2 * 4) + i64(((l % 8) * 2 * QV * 2 + qw * 2) * 4)
+    return pvb, mlb, snk
+
+
 @ASTRewriter.transform
-def _d_merge(c, cl, jj, rcv, rsv):
+def _d_merge(c, cl, jj, rcv, rsv, mg=None):
     """D's merge of row cluster cl, dims jj * 32 .. + 31 of every head: the CL key segments' partials (apart / aml)
     log-sum-exp merged with the sink, RoPE of the last 64 dims, MXFP8 -> o8 / os, the e6 flag."""
     t, w, l, sm, o = c["t"], c["w"], c["l"], c["sm"], c["o"]
     TR, RPC, QV = c["TR"], c["RPC"], c["QV"]
+    t = t & I32(THREADS - 1)   # (code size: t's range known, as in stage_D)
+    w = t // 32
+    l = t % 32
     r0 = cl * RPC
     c0 = cl * CL
     ob = sm + o["k"]
     if fx.const_expr(WMERGE(QV)):
         # c1 (QV 16): wave w < 4 merges qv 4 w .. + 3 (lane l: dim l of this CTA's 32), the qv its RoPE / MXFP8 lanes below
         # read -- every exchange in the merge stays inside the wave (LDS in program order, a wave barrier against code
-        # motion), no CTA barrier. Lanes 0..3 its qv's weights (the arithmetic below, a thread a qv, as before)
+        # motion), no CTA barrier. The weights by all 32 lanes: lane l of qv 4 w + l // 8 its segments 2 (l % 8), + 1 (one
+        # (m, l) load each); the max by xor shuffles (exact in any order); exp / the l * f products as before, the products
+        # summed in segment order by lane l % 8 == 0 (the same values, the same order: bit-identical)
         if w < 4:
-            pv8 = [hx.gload(c["apart"] + i64((c0 + p) * QV * HD + (w * HD + jj * 32 + l) * 4) * 2, BF16, 4) for p in range(CL)]
-            if l < 4:
-                qw = w * 4 + l
-                snk = hx.gload(c["sink"] + i64(qw % H) * 4, F32)
-                mp = [hx.gload(c["aml"] + i64((c0 + p) * QV * 2 + qw * 2) * 4, F32) for p in range(CL)]
-                lp = [hx.gload(c["aml"] + i64((c0 + p) * QV * 2 + qw * 2 + 1) * 4, F32) for p in range(CL)]
-                M = snk
-                for p in range_constexpr(CL):
-                    M = fx.max(M, mp[p])
+            pvb, mlb, snk = mg
+            pv8 = [hx.gload(pvb + i64(p * QV * HD * 2), I32, 2) for p in range(CL)]   # (bf16 qv pairs a dword)
+            ml = [hx.gload(mlb + i64(k * QV * 2 * 4), F32, 2) for k in range(2)]
+            qw = w * 4 + l // 8
+            pa = (l % 8) * 2
+            prd = ob + 4096   # (the key LDS: free past the cluster sync's CTA barrier; ob uses its first 2 KB)
+            M = fx.max(fx.max(snk, ml[0][0]), ml[1][0])
+            for sh in range_constexpr(3):
+                M = fx.max(M, M.shuffle_xor(1 << sh, 32))
+            f0 = expf(ml[0][0] - M)
+            f1 = expf(ml[1][0] - M)
+            hx.lstore(sm + o["wgt"] + (qw * WG + pa) * 4, fx.Vector.from_elements([f0, f1], F32))
+            hx.lstore(prd + (qw * CL + pa) * 4, fx.Vector.from_elements([ml[0][1] * f0, ml[1][1] * f1], F32))
+            _wave_sync()
+            if l % 8 == 0:
                 den = expf(snk - M)
+                pr = [hx.lload(prd + (qw * CL + 4 * k) * 4, F32, 4) for k in range(CL // 4)]
                 for p in range_constexpr(CL):
-                    f = expf(mp[p] - M)
-                    hx.lstore(sm + o["wgt"] + (qw * WG + p) * 4, f)
-                    den = den + lp[p] * f
+                    den = den + pr[p // 4][p % 4]
                 hx.lstore(sm + o["wgt"] + (qw * WG + CL) * 4, F32(1.0) / den)
             _wave_sync()
-            for e in range_constexpr(4):
-                qv = w * 4 + e
-                wq = [hx.lload(sm + o["wgt"] + (qv * WG + 4 * k) * 4, F32, 4) for k in range(CL // 4)]
-                num = F32(0.0)
-                for p in range_constexpr(CL):
-                    num = num + pv8[p][e].to(F32) * wq[p // 4][p % 4]
-                hx.lstore(ob + (qv * 32 + l) * 4, (num * hx.lload(sm + o["wgt"] + (qv * WG + CL) * 4, F32)).to(BF16).to(F32))
+            for h in range(hx.opaque_s(I32(2))):   # a runtime loop over the qv pairs 4 w + 2 h, + 1 (each a dword of the
+                # partials): half the weighted sums' code (the merge runs cold each layer -- I-cache); bf16 -> f32 exact
+                dw = [I32((h == 0).select(pv8[p][0], pv8[p][1])) for p in range(CL)]
+                for e2 in range_constexpr(2):
+                    qv = w * 4 + h * 2 + e2
+                    wq = [hx.lload(sm + o["wgt"] + (qv * WG + 4 * k) * 4, F32, 4) for k in range(CL // 4)]
+                    num = F32(0.0)
+                    for p in range_constexpr(CL):
+                        x = I32((dw[p] << 16) if e2 == 0 else (dw[p] & I32(-65536))).bitcast(F32)
+                        num = num + x * wq[p // 4][p % 4]
+                    hx.lstore(ob + (qv * 32 + l) * 4, (num * hx.lload(sm + o["wgt"] + (qv * WG + CL) * 4, F32)).to(BF16).to(F32))
             _wave_sync()
     else:
         # merge: thread g < QV*4 owns dim dd = g // (QV/8) of this CTA's 32 and 8 consecutive qv: one b128 load a partial
@@ -1100,9 +1152,10 @@ def stage_D2(c):
         rpp = hx.gload(c["rpos"] + i64(rrow) * 8, fx.Int64)
         rcv = hx.gload(c["rcos"] + (rpp * 32 + i64(rf0 + 2 * (t % 8))) * 2, BF16, 2)   # this lane's 2 pairs
         rsv = hx.gload(c["rsin"] + (rpp * 32 + i64(rf0 + 2 * (t % 8))) * 2, BF16, 2)   # this lane's 2 pairs
+        mg = _d_merge_pre(c, cl, jj, w, l, _d_merge_sink(c, w, l))
         hx.wait_flags(c["a1flag"] + i64(cl * CL) * 8, CL, c["a1tag"], w, l, 8)
         hx.bar()
-        _d_merge(c, cl, jj, rcv, rsv)
+        _d_merge(c, cl, jj, rcv, rsv, mg)
 
 
 # ------------------------------------------------------------------ E: wo_a (K quarters, cluster sum, MXFP8 y)
