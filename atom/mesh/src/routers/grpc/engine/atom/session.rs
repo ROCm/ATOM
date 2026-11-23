@@ -32,7 +32,8 @@ use crate::atom_engine::wire::{
 use crate::core::Worker;
 use crate::routers::token_handle::engine_error::EngineError;
 
-/// A Session's seq ids stay below 2^24, the window ATOM maps each Session's ids into.
+/// A Session's seq ids stay below 2^24, the window ATOM maps each Session's ids into:
+/// 1 << `_SEQ_ID_SHIFT` (atom/entrypoints/openai/frontend_workers.py), which this must equal.
 const SEQ_IDS: u64 = 1 << 24;
 
 type Output = Result<GenerateResponse, Status>;
