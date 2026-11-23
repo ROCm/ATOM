@@ -19,6 +19,7 @@ from atom.model_engine.engine_core import (
     HELD_POLL_S,
     EngineCore,
     publish_idle_state_work,
+    yield_gil,
 )
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.observability import tracing
@@ -102,10 +103,12 @@ class PPEngineCoreProc(EngineCore):
                     continue
                 if self._in_flight or not self.scheduler.is_finished():
                     self._run_then_publish_kv_events(self._pp_head_step)
-                elif self.has_pending_kv_work():
-                    self._run_then_publish_kv_events(self._advance_idle_kv_transfer)
                 else:
-                    self._wait_for_input()
+                    if self.has_pending_kv_work():
+                        self._run_then_publish_kv_events(self._advance_idle_kv_transfer)
+                    else:
+                        self._wait_for_input()
+                    yield_gil()
         finally:
             self._drain_kv_work_at_exit()
             try:
