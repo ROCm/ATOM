@@ -181,6 +181,18 @@ def cluster_sync():
     hx.fence_acquire("cluster")
 
 
+def WMERGE(QV):
+    """(c1) D's merge a wave per 4 qv, no CTA barrier: the partials stored [qv / 4][dim][qv % 4] (_d_merge)."""
+    return QV == 16 and THREADS >= 128
+
+
+def _wave_sync():
+    """LDS exchange between the lanes of one wave: no code motion across (the wave's LDS ops run in order)."""
+    hx.fence_release("wavefront")
+    hx.intrin(None, "llvm.amdgcn.wave.barrier", [])
+    hx.fence_acquire("wavefront")
+
+
 handoff = hx.handoff   # (device.handoff: every stage module imports it from here)
 
 
@@ -940,8 +952,14 @@ def stage_D(c):
                             v8 = hx.ds_load_tr16(sm + o["k"] + ((rr * 48 + ks * 32 + blk * 16 + 8 * hh + l % 8) * HP + nd * 16 + 8 * ((l // 8) % 2)) * 2)
                             parts += [v8[e] for e in range(8)]
                     acc = hx.wmma_bf16(av[ks], fx.Vector.from_elements(parts, BF16), acc)
-                hx.gstore(pp + i64((nd * 16 + l % 16) * QV + rr * H + (l // 16) * 8) * 2,
-                          fx.Vector.from_elements([acc[i].to(BF16) for i in range(8)], BF16))
+                if fx.const_expr(WMERGE(QV)):   # [qv / 4][dim][qv % 4]: the merge's wave reads its 4 qv x 32 dims contiguous
+                    qg = (rr * H + (l // 16) * 8) // 4
+                    for h2 in range_constexpr(2):
+                        hx.gstore(pp + i64(((qg + h2) * HD + nd * 16 + l % 16) * 4) * 2,
+                                  fx.Vector.from_elements([acc[4 * h2 + i].to(BF16) for i in range(4)], BF16))
+                else:
+                    hx.gstore(pp + i64((nd * 16 + l % 16) * QV + rr * H + (l // 16) * 8) * 2,
+                              fx.Vector.from_elements([acc[i].to(BF16) for i in range(8)], BF16))
         gpu.barrier()
         _dstamp(c, 6, t0s)
         if t < QV:
@@ -966,38 +984,68 @@ def _d_merge(c, cl, jj, rcv, rsv):
     TR, RPC, QV = c["TR"], c["RPC"], c["QV"]
     r0 = cl * RPC
     c0 = cl * CL
-    # merge: thread g < QV*4 owns dim dd = g // (QV/8) of this CTA's 32 and 8 consecutive qv: one b128 load a partial
-    QW = 4 if QV * 32 // 4 <= THREADS else 8   # qv a thread (all 256 threads busy at 2 rows a cluster)
-    NG8 = QV * 32 // QW
-    QG = QV // QW
-    g8 = fx.min(t, I32(NG8 - 1))
-    dd8 = g8 // QG
-    q08 = (g8 % QG) * QW
-    pv8 = [hx.gload(c["apart"] + i64(((c0 + p) * HD + jj * 32 + dd8) * QV + q08) * 2, BF16, QW) for p in range(CL)]
-    if t < QV:
-        snk = hx.gload(c["sink"] + i64(t % H) * 4, F32)
-        mp = [hx.gload(c["aml"] + i64((c0 + p) * QV * 2 + t * 2) * 4, F32) for p in range(CL)]
-        lp = [hx.gload(c["aml"] + i64((c0 + p) * QV * 2 + t * 2 + 1) * 4, F32) for p in range(CL)]
-        M = snk
-        for p in range_constexpr(CL):
-            M = fx.max(M, mp[p])
-        den = expf(snk - M)
-        for p in range_constexpr(CL):
-            f = expf(mp[p] - M)
-            hx.lstore(sm + o["wgt"] + (t * WG + p) * 4, f)
-            den = den + lp[p] * f
-        hx.lstore(sm + o["wgt"] + (t * WG + CL) * 4, F32(1.0) / den)
-    gpu.barrier()
     ob = sm + o["k"]
-    if t < NG8:
-        for e in range_constexpr(QW):
-            qv = q08 + e
-            wq = [hx.lload(sm + o["wgt"] + (qv * WG + 4 * k) * 4, F32, 4) for k in range(CL // 4)]
-            num = F32(0.0)
+    if fx.const_expr(WMERGE(QV)):
+        # c1 (QV 16): wave w < 4 merges qv 4 w .. + 3 (lane l: dim l of this CTA's 32), the qv its RoPE / MXFP8 lanes below
+        # read -- every exchange in the merge stays inside the wave (LDS in program order, a wave barrier against code
+        # motion), no CTA barrier. Lanes 0..3 its qv's weights (the arithmetic below, a thread a qv, as before)
+        if w < 4:
+            pv8 = [hx.gload(c["apart"] + i64((c0 + p) * QV * HD + (w * HD + jj * 32 + l) * 4) * 2, BF16, 4) for p in range(CL)]
+            if l < 4:
+                qw = w * 4 + l
+                snk = hx.gload(c["sink"] + i64(qw % H) * 4, F32)
+                mp = [hx.gload(c["aml"] + i64((c0 + p) * QV * 2 + qw * 2) * 4, F32) for p in range(CL)]
+                lp = [hx.gload(c["aml"] + i64((c0 + p) * QV * 2 + qw * 2 + 1) * 4, F32) for p in range(CL)]
+                M = snk
+                for p in range_constexpr(CL):
+                    M = fx.max(M, mp[p])
+                den = expf(snk - M)
+                for p in range_constexpr(CL):
+                    f = expf(mp[p] - M)
+                    hx.lstore(sm + o["wgt"] + (qw * WG + p) * 4, f)
+                    den = den + lp[p] * f
+                hx.lstore(sm + o["wgt"] + (qw * WG + CL) * 4, F32(1.0) / den)
+            _wave_sync()
+            for e in range_constexpr(4):
+                qv = w * 4 + e
+                wq = [hx.lload(sm + o["wgt"] + (qv * WG + 4 * k) * 4, F32, 4) for k in range(CL // 4)]
+                num = F32(0.0)
+                for p in range_constexpr(CL):
+                    num = num + pv8[p][e].to(F32) * wq[p // 4][p % 4]
+                hx.lstore(ob + (qv * 32 + l) * 4, (num * hx.lload(sm + o["wgt"] + (qv * WG + CL) * 4, F32)).to(BF16).to(F32))
+            _wave_sync()
+    else:
+        # merge: thread g < QV*4 owns dim dd = g // (QV/8) of this CTA's 32 and 8 consecutive qv: one b128 load a partial
+        QW = 4 if QV * 32 // 4 <= THREADS else 8   # qv a thread (all 256 threads busy at 2 rows a cluster)
+        NG8 = QV * 32 // QW
+        QG = QV // QW
+        g8 = fx.min(t, I32(NG8 - 1))
+        dd8 = g8 // QG
+        q08 = (g8 % QG) * QW
+        pv8 = [hx.gload(c["apart"] + i64(((c0 + p) * HD + jj * 32 + dd8) * QV + q08) * 2, BF16, QW) for p in range(CL)]
+        if t < QV:
+            snk = hx.gload(c["sink"] + i64(t % H) * 4, F32)
+            mp = [hx.gload(c["aml"] + i64((c0 + p) * QV * 2 + t * 2) * 4, F32) for p in range(CL)]
+            lp = [hx.gload(c["aml"] + i64((c0 + p) * QV * 2 + t * 2 + 1) * 4, F32) for p in range(CL)]
+            M = snk
             for p in range_constexpr(CL):
-                num = num + pv8[p][e].to(F32) * wq[p // 4][p % 4]
-            hx.lstore(ob + (qv * 32 + dd8) * 4, (num * hx.lload(sm + o["wgt"] + (qv * WG + CL) * 4, F32)).to(BF16).to(F32))
-    gpu.barrier()
+                M = fx.max(M, mp[p])
+            den = expf(snk - M)
+            for p in range_constexpr(CL):
+                f = expf(mp[p] - M)
+                hx.lstore(sm + o["wgt"] + (t * WG + p) * 4, f)
+                den = den + lp[p] * f
+            hx.lstore(sm + o["wgt"] + (t * WG + CL) * 4, F32(1.0) / den)
+        gpu.barrier()
+        if t < NG8:
+            for e in range_constexpr(QW):
+                qv = q08 + e
+                wq = [hx.lload(sm + o["wgt"] + (qv * WG + 4 * k) * 4, F32, 4) for k in range(CL // 4)]
+                num = F32(0.0)
+                for p in range_constexpr(CL):
+                    num = num + pv8[p][e].to(F32) * wq[p // 4][p % 4]
+                hx.lstore(ob + (qv * 32 + dd8) * 4, (num * hx.lload(sm + o["wgt"] + (qv * WG + CL) * 4, F32)).to(BF16).to(F32))
+        gpu.barrier()
     # RoPE (the last 64 dims) and MXFP8 of each qv's 32 dims in registers: 8 lanes a qv (4 dims = 2 RoPE pairs each; the
     # block amax over the 8 lanes by xor shuffles -- the same values / code / words as one thread's 32: bit-identical)
     assert QV * 8 <= THREADS
