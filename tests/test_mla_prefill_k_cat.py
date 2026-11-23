@@ -60,6 +60,7 @@ mla = ModuleType("mla_dispatch_probe")
 mla.__dict__.update(
     torch=torch,
     cat_prefill_k=kcat.cat_prefill_k,
+    on_kernel_arch=kcat.on_kernel_arch,
     use_triton_gemm=lambda: False,
     flash_attn_varlen_func=None,
     fused_gemm_afp4wfp4_preshuffle_split_cat=None,
@@ -299,13 +300,21 @@ def _impl(fp8_ok, heads, kv=None):
     return impl
 
 
-def test_prepare_prefill_k_zero_rope_pad_is_k_nope():
-    # The pad lanes are sliced off before attention: no copy is made.
+@pytest.mark.parametrize("gfx1250", [True, False])
+def test_prepare_prefill_k_zero_rope_pad(monkeypatch, gfx1250):
+    # On gfx1250 the pad lanes are sliced off before attention, so no copy is
+    # made; other arches concatenate K as on main.
+    monkeypatch.setitem(mla.__dict__, "on_kernel_arch", lambda t: gfx1250)
     k_nope, _, k_rope = _inputs(3, 16)
     impl = _impl(False, 16)
     impl.rope_is_zero_pad = True
-    k, rope = impl._prepare_prefill_k(k_nope, torch.zeros_like(k_rope))
-    assert k is k_nope and rope is None
+    pad = torch.zeros_like(k_rope)
+    k, rope = impl._prepare_prefill_k(k_nope, pad)
+    assert rope is None
+    if gfx1250:
+        assert k is k_nope
+    else:
+        _assert_same(k, _ref(k_nope, pad))
 
 
 def test_prepare_prefill_k_fp8_split_unchanged():

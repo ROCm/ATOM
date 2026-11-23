@@ -77,7 +77,7 @@ from atom.model_ops.triton_fused_qkv_quant import (
     fused_kv_per_tensor_quant,
     fused_qkv_per_tensor_quant,
 )
-from atom.model_ops.triton_mla_prefill_k_cat import cat_prefill_k
+from atom.model_ops.triton_mla_prefill_k_cat import cat_prefill_k, on_kernel_arch
 from atom.model_ops.utils import (
     dynamic_per_batched_tensor_quant,
     get_and_maybe_dequant_weights,
@@ -1112,8 +1112,9 @@ class MLAAttention(nn.Module):
         The slice is deliberately NOT made contiguous. On q and on the gathered
         workspace K it leaves ``stride(-2) == qk_nope_head_dim + pad`` against
         ``size(-1) == qk_nope_head_dim``, and flash-attention takes it as is.
-        K from kv_b_proj is already the split view (row pitch
-        ``qk_nope_head_dim + v_head_dim``, like V), and the slice is a no-op on it.
+        On gfx1250, K from kv_b_proj is already the split view (row pitch
+        ``qk_nope_head_dim + v_head_dim``, like V), and the slice is a no-op on
+        it; other arches slice the concatenated K like q.
         Measured on gfx950 rather than assumed: against a ``.contiguous()``
         copy of the same slice the output is bit-identical (max abs diff 0.0),
         so the kernel takes its row pitch from the stride and not from
@@ -1171,13 +1172,13 @@ class MLAAttention(nn.Module):
     def _prepare_prefill_k(self, k_nope, k_rope):
         """Keep K split for FP8 quantization; materialize it for BF16 attention.
 
-        With a zero rope pad, K is the kv_b_proj split view itself (row pitch
-        ``qk_nope_head_dim + v_head_dim``, like V); `_drop_rope_pad` is then a
-        no-op on it.
+        On gfx1250 with a zero rope pad, K is the kv_b_proj split view itself
+        (row pitch ``qk_nope_head_dim + v_head_dim``, like V); `_drop_rope_pad`
+        is then a no-op on it. Other arches concatenate K as on main.
         """
         if self._flydsl_fp8_mha_ok:
             return k_nope, None if self.rope_is_zero_pad else k_rope
-        if self.rope_is_zero_pad:
+        if self.rope_is_zero_pad and on_kernel_arch(k_nope):
             return k_nope, None
         return cat_prefill_k(k_nope, k_rope), None
 

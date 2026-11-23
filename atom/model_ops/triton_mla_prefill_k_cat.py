@@ -47,10 +47,11 @@ def _prefill_k_cat_kernel(
 # the kernel beats torch.cat at every size (1.3 vs 3.4 us at one token, 65 vs
 # 603 us at 10240 tokens x 128 heads), but a call costs about 9 us more host
 # time (13.3 vs 4.3 us). It saves more than that from 32768 token-heads
-# (16.6 us; 8.9 us at 16384), so it runs from there and torch.cat below. Of
-# head blocks 4..64 and 1..4 warps, head block 16 with one warp was the
-# fastest at 10240 tokens and within noise below that. Other arches are not
-# measured (on gfx9 one warp is a wave64) and keep torch.cat.
+# (16.6 us; 8.9 us at 16384), so it runs from there; below that, and on other
+# arches (not measured; on gfx9 one warp is a wave64), each call site keeps
+# what it did on main: torch.cat, or two copies with `copies=True`. Of head
+# blocks 4..64 and 1..4 warps, head block 16 with one warp was the fastest at
+# 10240 tokens.
 _PREFILL_K_CAT_ARCH = "gfx1250"
 _PREFILL_K_CAT_MIN_TOKEN_HEADS = 32768
 _PREFILL_K_CAT_HEAD_BLOCK = 16
@@ -61,6 +62,11 @@ _PREFILL_K_CAT_NUM_WARPS = 1
 def _kernel_arch(device_index: int) -> bool:
     arch = torch.cuda.get_device_properties(device_index).gcnArchName
     return arch.split(":")[0] == _PREFILL_K_CAT_ARCH
+
+
+def on_kernel_arch(t: torch.Tensor) -> bool:
+    """Whether ``t`` is on a gfx1250 device, the arch this file was measured on."""
+    return t.is_cuda and _kernel_arch(t.device.index)
 
 
 def _prefill_k_cat_supported(k_nope: torch.Tensor, k_rope: torch.Tensor) -> bool:
