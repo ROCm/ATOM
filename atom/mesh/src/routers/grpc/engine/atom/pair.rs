@@ -134,6 +134,8 @@ impl AtomPairs {
         let mut info = self.info.write().unwrap();
         let mut merged = AtomPrefillInfo::clone(&info);
         let mut read_for = self.read_for.write().unwrap();
+        // A URL no registered worker holds any more is forgotten, with its info.
+        read_for.retain(|_, w| w.upgrade().is_some_and(|w| registered(&w)));
         if read_instance {
             // What was read replaces what every rank of this instance took before.
             let ranks: Vec<String> = read_for
@@ -155,11 +157,20 @@ impl AtomPairs {
         }
         merged.tp_sizes.extend(learned.tp_sizes);
         merged.chunked_transfer.extend(learned.chunked_transfer);
-        *info = Arc::new(merged);
         if read_instance {
             read_for.insert(base, this.clone());
         }
         read_for.insert(url.to_string(), this);
+        merged.tp_sizes.retain(|url, _| read_for.contains_key(url));
+        merged
+            .chunked_transfer
+            .retain(|url, _| read_for.contains_key(url));
+        *info = Arc::new(merged);
+        // The gates no first pair is waiting on.
+        self.reading
+            .lock()
+            .unwrap()
+            .retain(|_, gate| Arc::strong_count(gate) > 1);
         Ok(AtomAdapter::new(info.clone()))
     }
 

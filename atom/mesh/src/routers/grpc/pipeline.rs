@@ -53,7 +53,7 @@ use crate::{
             token_handle::{SourceClock, TokenHandle, TokenSource},
         },
     },
-    tokenizer::{traits::Tokenizer, StopSequenceDecoder},
+    tokenizer::StopSequenceDecoder,
 };
 
 #[derive(Clone)]
@@ -558,7 +558,9 @@ mod atom_output_tests {
         routers::test_mocks::{
             dispatcher::MockDispatcher, planner::MockPdPlanner, tokenizer::byte_level_tokenizer_dir,
         },
-        tokenizer::{huggingface::HuggingFaceTokenizer, stop::SequenceDecoderOutput},
+        tokenizer::{
+            huggingface::HuggingFaceTokenizer, stop::SequenceDecoderOutput, traits::Tokenizer,
+        },
     };
 
     /// A `/generate` of `body`, prepared as the router prepares it: its own

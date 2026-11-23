@@ -174,6 +174,14 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                 Ok(tokenizer)
             }
         };
+        // One registration of a name at a time: each reads the tokenizer and template
+        // the previous one left, so none replaces a tokenizer it did not read.
+        let reconciling = app_context
+            .tokenizer_reconciling
+            .entry(name.clone())
+            .or_default()
+            .clone();
+        let _reconciling = reconciling.lock().await;
         let mut result = registry.load(&id, &name, &source, &loader).await;
         // Loaded before with another template (a replaced worker's, or none): load again.
         if let (Ok(LoadOutcome::AlreadyExists { id: loaded }), Some(template)) =
@@ -181,8 +189,7 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
         {
             if app_context.tokenizer_inline_templates.read().get(loaded) != Some(template) {
                 info!("Tokenizer '{name}' is loaded again with its worker's chat template");
-                // Loaded first, then swapped in with no await between, so the model is
-                // never left without one; a failed load keeps the old one.
+                // Loaded first, so a failed load keeps the old one.
                 let replacement = loader().await;
                 result = match replacement {
                     Ok(tokenizer) => {
@@ -492,6 +499,49 @@ mod tests {
         assert_eq!(rendered(), "first: hi");
         register("second: {{ messages[0].content }}").await.unwrap();
         assert_eq!(rendered(), "second: hi");
+    }
+
+    /// Overlapping registrations with other templates replace the tokenizer one at a
+    /// time: each loads its own (none reads "already exists"), and one stays.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_overlapping_template_replacements_each_take_effect() {
+        let context = app_context();
+        let register = |template: String| {
+            let config = TokenizerConfigRequest {
+                id: TokenizerRegistry::generate_id(),
+                name: "m".to_string(),
+                source: hf_tokenizer_path().to_string(),
+                chat_template_path: None,
+                inline_chat_template: Some(template),
+                cache_config: None,
+                fail_on_duplicate: true,
+            };
+            let data = create_tokenizer_workflow_data(config, context.clone());
+            tokio::spawn(async move {
+                let mut workflow = WorkflowContext::new(WorkflowInstanceId::new(), data);
+                LoadTokenizerStep.execute(&mut workflow).await
+            })
+        };
+        register("{{ 'first' }}".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        let jobs = (0..4).map(|i| register(format!("{{{{ 'job {i}' }}}}")));
+        for job in futures::future::join_all(jobs).await {
+            job.unwrap().unwrap();
+        }
+        let (tokenizer, templates) = (
+            &context.tokenizer_registry,
+            &context.tokenizer_inline_templates,
+        );
+        let entry = tokenizer.get_by_name("m").unwrap();
+        let rendered = entry
+            .tokenizer
+            .apply_chat_template(&[], ChatTemplateParams::default())
+            .unwrap();
+        let recorded = templates.read().get(&entry.id).cloned().unwrap();
+        assert_eq!(recorded, format!("{{{{ '{rendered}' }}}}"));
+        assert_eq!((tokenizer.len(), templates.read().len()), (1, 1));
     }
 
     /// A model `--fastokens-models` lists encodes with fastokens, which leaves the
