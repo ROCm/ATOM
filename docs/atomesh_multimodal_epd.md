@@ -6,8 +6,6 @@
 > transport), #3412 (encoder-only server), #3413 (standalone service),
 > #3408 (encode workers), #3409 (E before P), #3414, #3415 and #3416
 > (acceptance harness and CI case), then this document (#3417).
-> One gap is open: P's TP ranks do not agree on a read of E's embeddings
-> (D12).
 
 This document covers image chat requests through ATOMesh for
 MiniMax-M3.1-Flash (M3.1) and Kimi-K3.1 (K3.1). It covers three
@@ -26,10 +24,8 @@ Terms:
   for K3.1. The measurements below were taken on g15, whose HCAs are
   `rocep9s0` to `rocep249s0`.
 
-Code facts were checked against `main` at 36adbfddb and the PR heads #3410
-e15afb221, #3407 e85ef4c2e, #3411 79e955945, #3412 32c3ff7cf, #3413
-0e9ff144f, #3408 b14176026, #3409 ca8689d55, #3414 5a498acd1, #3415
-dfc30920d and #3416 bc360672c.
+Code facts were checked against `main` at 36adbfddb and the heads of the
+stack's PRs on 2026-11-23.
 
 ## Requirement
 
@@ -168,8 +164,8 @@ Any of the following ends with P encoding locally, as in PD:
 - on a P rank: a failed read, a changed generation word, a `cache_seed`
   or dtype mismatch, or embeddings larger than its read buffer.
 
-The first three are ATOMesh's decision for the whole request. The last is
-each P rank's own decision (see the gap in D12).
+The first three are ATOMesh's decision for the whole request. For the
+last, P's ranks agree: if any rank's read fails, every rank encodes (D12).
 
 ```mermaid
 sequenceDiagram
@@ -500,20 +496,19 @@ E's pool (`EcPool`):
   word inside another entry's rows does not match.
 
 P's read (`EcReader.read`): P checks `cache_seed` against its own, reads
-the rows, then rereads the word. A `cache_seed` mismatch, a dtype other
-than the one E stored (`ec_transfer_params` carries it), a failed read, a
-changed word or rows larger than its buffer make it return `None`. The rank
-then logs "Image embeddings from ... are unavailable; running the vision
-tower" and runs its own tower, which P keeps loaded.
+the rows, then rereads the word. A `cache_seed` mismatch, a failed read, a
+changed word or rows larger than its buffer make it return `None`.
 
-**Open gap: P's TP ranks decide alone.** Each rank reads and falls back
-independently, so one request can run on E's rows on some ranks and on the
-local tower's on others. E at TP1 and P's ranks need not produce
-bit-identical rows, so the ranks' activations could diverge. The fix is
-for the ranks to agree before any of them uses the rows. Each rank would
-pass its verdict to `atom/distributed/group_agreement.py: group_agree` on
-the TP group's CPU group, and every rank would run the tower if any read
-failed. This is not implemented in #3412.
+P's ranks agree before any of them uses the rows
+(`ModelRunner.read_image_embeddings`). Each rank passes its verdict to
+`atom/distributed/group_agreement.py: group_agree` on its TP group's CPU
+group, then its PCP group's, as `agree_kv_budget` does. If any rank's read
+failed, every rank logs "Image embeddings from ... are unavailable" and
+runs its own tower, which P keeps loaded. E at TP1 and P's ranks need not
+produce bit-identical rows, so mixing E's rows on some ranks with the
+local tower's on others could split the ranks' activations. Every rank
+reaches the call for the same request at the same point of the step, so
+the collective lines up.
 
 Basis: `MiniMaxM3SparseForConditionalGenerationVL.__init__` builds the
 tower wherever image input is accepted, so the fallback is the existing
@@ -523,10 +518,9 @@ Rejected:
 - P's ranks release each entry after reading. That gives an exact
   lifetime, but needs a channel from the `ModelRunner` subprocesses to E,
   and E has to know P's TP size.
-- For the gap: rank 0 reads and broadcasts to the other ranks. That is
-  consistent by construction, but adds a device broadcast of up to 22 MB to
-  every image request's forward step, where a one-integer CPU all-reduce
-  suffices.
+- Rank 0 reads and broadcasts to the other ranks. That is consistent by
+  construction, but adds a device broadcast of up to 22 MB to every image
+  request's forward step, where a one-integer CPU all-reduce suffices.
 
 **D13. E answers with `ec_transfer_params`, as P answers with
 `kv_transfer_params`.** *#3412; ATOMesh's side in #3409.*
@@ -726,14 +720,13 @@ All were taken on g15 with M3.1, at the recipe's launch flags.
 | #3410 | `atom/entrypoints/openai/api_server.py`, `protocol.py`; `atom/model_engine/sequence.py`, `scheduler.py`, `llm_engine.py` | D4, D5, D6 |
 | #3407 | `atom/mesh/src/routers/prepare/inference.rs`, `routers/ingress.rs`, `observability/route_trace.rs`, `core/placement/backend/atom.rs` | D1, D2, D3, D7 |
 | #3411 | `atom/kv_transfer/disaggregation/mooncake/ec_transport.py`; `atom/utils/envs.py` and `docs/environment_variables.md` (`ATOM_EC_LEASE_S`, `ATOM_MOONCAKE_IB_DEVICE`) | D11, D12 |
-| #3412 | `atom/model_engine/encoder_only.py`, `model_runner.py`, `multimodal_runtime.py`, `arg_utils.py`; `atom/config.py`; `atom/entrypoints/openai/api_server.py`, `protocol.py` | D9, D10, D12, D13 |
+| #3412 | `atom/model_engine/encoder_only.py`, `model_runner.py` (the read and the ranks' agreement), `multimodal_runtime.py`, `arg_utils.py`; `atom/config.py`; `atom/entrypoints/openai/api_server.py`, `protocol.py` | D9, D10, D12, D13 |
 | #3413 | `atom/entrypoints/atomesh/atom_standalone_service.py`, `api_server.py` | D19 |
 | #3408 | `atom/mesh/src/cliargs.rs`, `config/`, `core/worker.rs`, `core/worker_registry.rs`, `policies/registry.rs`, `routers/factory.rs` | D15 |
 | #3409 | `atom/mesh/src/routers/http_pd_router.rs`, `routers/ingress.rs` | D13, D15, D16 |
 | #3414 | `tests/accept/atomesh_mm/`: core, `m31`, `direct`, `single`, `mmstar`, `mmmu-pro`, `distinct` | D3, D20 |
 | #3415 | `.github/benchmark/models_atomesh.yaml`, `.github/scripts/atomesh/pd_matrix.py`, `pd_server_atom.sh`, `pd_submit.sh`; `tests/accept/atomesh_mm/checks/ci_case.*` | D19, D20 |
 | #3416 | `tests/accept/atomesh_mm/`: `pd`, `epd`, `k31`, `ttft`, `hca/*.map`, the repeated red request | D8, D11, D17, D18, D20 |
-| Not yet | P's TP ranks agreeing on a read of E's embeddings (`multimodal_runtime.py` or `model_runner.py`) | D12 gap |
 
 Each PR carries CPU tests under `tests/` and Rust tests in `atom/mesh` for
 what it changes.
