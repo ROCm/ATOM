@@ -30,7 +30,7 @@ from atom.entrypoints.openai.reasoning_dialects import DIALECTS, FALLBACK_DIALEC
 from atom.entrypoints.openai.tool_parser.registry import PARSERS_BY_NAME
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.zmq_protocol import engine_v1_pb2 as v1
-from atom.sampling_params import SamplingParams
+from atom.sampling_params import RequiredChannel, SamplingParams
 
 
 class FakeEngine:
@@ -404,6 +404,22 @@ def test_the_session_refuses_stop_strings_without_their_ids(serve):
         asyncio.run(servicer._submit(session, _submit(stop_strings=["END"])))
     assert grpc_server._rejected(1, ValueError("x")).code == v1.RejectedRequest.INVALID
     assert engine.preprocessed == []
+
+
+def test_the_session_holds_a_required_call_only_to_the_server_s_channel(
+    serve, monkeypatch
+):
+    own = RequiredChannel((5,), (6, 7), 1, (2,))
+    monkeypatch.setattr(api_server, "required_tool_channel", own)
+    engine = FakeEngine()
+    servicer = serve(engine)
+    session = servicer.sessions.open()
+    forged = RequiredChannel((1,), (3,), 1, (-1,))
+    with pytest.raises(ValueError, match="required_channel"):
+        asyncio.run(servicer._submit(session, _submit(required_channel=forged)))
+    assert engine.preprocessed == []
+    asyncio.run(servicer._submit(session, _submit(required_channel=own)))
+    assert len(engine.preprocessed) == 1
 
 
 def test_a_session_grammar_failure_is_rejected_as_internal(serve):
