@@ -752,6 +752,15 @@ class Scheduler:
             if fh_left > 0
             else None
         )
+        # p1 flag (c24opt): least-attained-first serialization of a small decode set.
+        # While 2..MAXN decodes run and the youngest has produced < AGE tokens and
+        # the oldest is > GAP tokens ahead of it, only the youngest decodes (a mono
+        # G1 step, ~20% cheaper per request than a G2 step); the older ones wait.
+        # Their per-request mean ITL barely moves (long), the short one's tail drops.
+        # 0 (default): off.
+        self._serial_maxn = envs.ATOM_P1_SCHED_SERIAL_MAXN
+        self._serial_age = envs.ATOM_P1_SCHED_SERIAL_AGE_TOKENS
+        self._serial_gap = envs.ATOM_P1_SCHED_SERIAL_GAP_TOKENS
         # p1 flag: hold prefill while its stall would push a running request
         # across the target per-request ITL (prefill_itl_risk.py). Off (None)
         # by default.
@@ -3165,12 +3174,26 @@ class Scheduler:
         # they are reconsidered once the head releases them post-postprocess.
         skipped_pp_inflight: list[Sequence] = []
         _pp_block = self._pp_inflight_token_block
+        serial_skip: set[int] | None = None
+        skipped_serial: list[Sequence] = []
+        if self._serial_maxn > 0 and len(self.running) >= 2:
+            dec = [s for s in self.running if not s.is_partial_prefill]
+            if 2 <= len(dec) <= self._serial_maxn:
+                att = {s.id: s.num_completion_tokens for s in dec}
+                young = min(dec, key=lambda s: att[s.id])
+                if att[young.id] < self._serial_age and (
+                    max(att.values()) - att[young.id] > self._serial_gap
+                ):
+                    serial_skip = {s.id for s in dec if s is not young}
         while self.running and num_seqs_decode < self.max_num_seqs:
             if num_decode_tokens + tokens_per_decode_seq > self.max_num_batched_tokens:
                 break
             seq = self.running.popleft()
             if seq.is_partial_prefill:
                 skipped_partial_prefills.append(seq)
+                continue
+            if serial_skip is not None and seq.id in serial_skip:
+                skipped_serial.append(seq)
                 continue
             if _pp_block and seq.id in _pp_block:
                 skipped_pp_inflight.append(seq)
@@ -3255,6 +3278,8 @@ class Scheduler:
             self.running.extend(skipped_partial_prefills)
         if skipped_pp_inflight:
             self.running.extend(skipped_pp_inflight)
+        if skipped_serial:
+            self.running.extend(skipped_serial)
 
         connector_meta_output = None
         if self.kv_connector is not None:

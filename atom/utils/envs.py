@@ -1542,6 +1542,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_SCHED_PREFILL_MAX_WAIT_S": lambda: float(
         os.getenv("ATOM_SCHED_PREFILL_MAX_WAIT_S", "0")
     ),
+    # p1 (c24opt): least-attained-first serialization of 2.._MAXN running decodes
+    # (scheduler.py decode loop). Only the youngest decodes while it has produced
+    # < _AGE_TOKENS tokens and the oldest is > _GAP_TOKENS ahead. 0: off.
+    "ATOM_P1_SCHED_SERIAL_MAXN": lambda: int(
+        os.getenv("ATOM_P1_SCHED_SERIAL_MAXN", "0")
+    ),
+    "ATOM_P1_SCHED_SERIAL_AGE_TOKENS": lambda: int(
+        os.getenv("ATOM_P1_SCHED_SERIAL_AGE_TOKENS", "256")
+    ),
+    "ATOM_P1_SCHED_SERIAL_GAP_TOKENS": lambda: int(
+        os.getenv("ATOM_P1_SCHED_SERIAL_GAP_TOKENS", "64")
+    ),
     # p1 (sched-stalls): finish-aware prefill hold (prefill_finish_hold.py).
     # Hold prefill while a running decode with max_tokens <= _MAX_TOKENS has
     # at most _LEFT tokens to go, for at most _MAX_MS per hold. 0: off.
