@@ -3,6 +3,7 @@
 
 import logging
 import threading
+import weakref
 from contextlib import nullcontext
 from typing import TypeAlias
 
@@ -42,6 +43,55 @@ def _packed_tokens(
     return out
 
 
+def _ubatch_worker_loop(
+    idx: int,
+    jobs: list,
+    job_ready: list[threading.Event],
+    job_done: list[threading.Event],
+    stop: threading.Event,
+    device: torch.device | None,
+) -> None:
+    """A micro-batch worker's loop: run each job handed to slot ``idx`` until
+    ``stop`` is set. It holds the slot's lists, never the wrapper, so a wrapper
+    no one else references is collected and its finalizer stops the pair."""
+    # Bind this long-lived thread to the device ONCE — the HIP per-thread
+    # context (and its getprops storm) is paid here, not every forward.
+    if device is not None:
+        torch.cuda.set_device(device)
+    while True:
+        job_ready[idx].wait()
+        job_ready[idx].clear()
+        if stop.is_set():
+            return
+        job = jobs[idx]
+        jobs[idx] = None
+        try:
+            if job is not None:
+                job()
+        finally:
+            # Drop the closure's tensors before the worker waits for its
+            # next job, including when subsequent steps do not use TBO.
+            job = None
+            job_done[idx].set()
+
+
+def _stop_ubatch_workers(
+    workers: list[threading.Thread],
+    job_ready: list[threading.Event],
+    stop: threading.Event,
+) -> None:
+    """Wake every idle worker with ``stop`` set and join it."""
+    stop.set()
+    for ready in job_ready:
+        ready.set()
+    current = threading.current_thread()
+    for worker in workers:
+        if worker is not current:
+            worker.join(timeout=5.0)
+            if worker.is_alive():
+                logger.warning("[TBO] worker %s did not stop", worker.name)
+
+
 class UBatchWrapper(nn.Module):
     """Wraps a model to split decode batches into micro-batches."""
 
@@ -66,36 +116,63 @@ class UBatchWrapper(nn.Module):
         self._worker_job_ready = [threading.Event() for _ in range(self._num_workers)]
         self._worker_job_done = [threading.Event() for _ in range(self._num_workers)]
         self._workers_device: torch.device | None = None
+        self._workers_stop = threading.Event()
+        self._workers_finalizer: weakref.finalize | None = None
 
     def _worker_loop(self, idx: int):
-        # Bind this long-lived thread to the device ONCE — the HIP per-thread
-        # context (and its getprops storm) is paid here, not every forward.
-        if self._workers_device is not None:
-            torch.cuda.set_device(self._workers_device)
-        while True:
-            self._worker_job_ready[idx].wait()
-            self._worker_job_ready[idx].clear()
-            job = self._worker_jobs[idx]
-            self._worker_jobs[idx] = None
-            try:
-                if job is not None:
-                    job()
-            finally:
-                # Drop the closure's tensors before the worker waits for its
-                # next job, including when subsequent steps do not use TBO.
-                job = None
-                self._worker_job_done[idx].set()
+        _ubatch_worker_loop(
+            idx,
+            self._worker_jobs,
+            self._worker_job_ready,
+            self._worker_job_done,
+            self._workers_stop,
+            self._workers_device,
+        )
 
     def _ensure_workers(self, device: torch.device):
         if self._workers:
             return
         self._workers_device = device
         for i in range(self._num_workers):
+            # The thread gets the slots, not ``self``: a bound method would keep
+            # the wrapper, and with it the model, alive for the process's life.
             t = threading.Thread(
-                target=self._worker_loop, args=(i,), daemon=True, name=f"tbo-ub-{i}"
+                target=_ubatch_worker_loop,
+                args=(
+                    i,
+                    self._worker_jobs,
+                    self._worker_job_ready,
+                    self._worker_job_done,
+                    self._workers_stop,
+                    device,
+                ),
+                daemon=True,
+                name=f"tbo-ub-{i}",
             )
             self._workers.append(t)
             t.start()
+        # Stop the pair when the wrapper is collected or `stop_tbo_workers`
+        # runs; at interpreter exit they are daemons and die with it.
+        self._workers_finalizer = weakref.finalize(
+            self,
+            _stop_ubatch_workers,
+            self._workers,
+            self._worker_job_ready,
+            self._workers_stop,
+        )
+        self._workers_finalizer.atexit = False
+
+    def stop_tbo_workers(self) -> None:
+        """Stop and join this wrapper's micro-batch workers, with no forward in
+        flight. A later split forward starts a new pair."""
+        if self._workers_finalizer is None:
+            return
+        self._workers_finalizer()
+        self._workers_finalizer = None
+        self._workers.clear()
+        self._workers_stop = threading.Event()
+        for ready in self._worker_job_ready:
+            ready.clear()
 
     def _ensure_comm_stream(self):
         if self.comm_stream is None:

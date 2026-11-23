@@ -1186,6 +1186,9 @@ class ModelRunner:
                 if hasattr(self, attr):
                     delattr(self, attr)
             if hasattr(self, "model"):
+                stop_tbo_workers = getattr(self.model, "stop_tbo_workers", None)
+                if stop_tbo_workers is not None:
+                    stop_tbo_workers()
                 del self.model
             if hasattr(self, "drafter"):
                 del self.drafter
