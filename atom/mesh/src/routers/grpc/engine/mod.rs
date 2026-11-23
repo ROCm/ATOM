@@ -118,12 +118,11 @@ impl GrpcEngine {
                     bootstrap_room: (rand::random::<u32>() & (i32::MAX as u32)) as i32,
                 });
                 let payload_ref: &GenerationPayload = payload;
-                let (prefill_result, decode_result) = tokio::join!(
+                // The first leg to fail drops the other, which cancels its call.
+                let (prefill_stream, decode_stream) = tokio::try_join!(
                     self.dispatch_one(prefill, payload_ref, ProtoErrorRole::Prefill, tokenizer),
                     self.dispatch_one(decode, payload_ref, ProtoErrorRole::Decode, tokenizer),
-                );
-                let prefill_stream = prefill_result?;
-                let decode_stream = decode_result?;
+                )?;
                 Ok(merge_pd_streams(
                     prefill_stream,
                     decode_stream,

@@ -578,6 +578,37 @@ async fn a_pairs_unstreamed_e2e_latency_includes_the_wait_for_the_complete() {
 }
 
 #[tokio::test]
+async fn a_pair_leg_that_refuses_fails_the_dispatch_and_cancels_the_other() {
+    let prefill = FakeAtom::new(vec![vec![error("max_tokens must be at least 1", 400)]]);
+    let decode = Arc::new(FakeAtom {
+        hold: true,
+        ..Default::default()
+    });
+    let plan = PlacementPlan::Pair {
+        prefill: atom_worker(&serve(prefill).await),
+        decode: atom_worker(&serve(decode.clone()).await),
+        prefill_policy: "random",
+        decode_policy: "random",
+    };
+    // D has not answered: P's refusal fails the dispatch without waiting for D.
+    let (engine, mut payload) = (GrpcEngine::new(), payload(true));
+    let dispatched = engine.dispatch(&plan, &mut payload);
+    let failed = tokio::time::timeout(Duration::from_secs(5), dispatched)
+        .await
+        .expect("the refusal waited for the other leg");
+    assert!(
+        matches!(&failed, Err(EngineError::Http { status, .. }) if *status == StatusCode::BAD_REQUEST),
+        "{:?}",
+        failed.err()
+    );
+    let sender = decode.held.lock().unwrap().take();
+    let sender = sender.expect("D's call was opened");
+    tokio::time::timeout(Duration::from_secs(60), sender.closed())
+        .await
+        .expect("D's call was not cancelled");
+}
+
+#[tokio::test]
 async fn dropping_the_handle_cancels_the_call() {
     let fake = Arc::new(FakeAtom {
         scripts: Mutex::new(vec![vec![chunk(&[11])]].into()),
