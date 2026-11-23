@@ -105,9 +105,9 @@ def suffix_scan(sm, t):
         o = F32(0.0)
         if t + d < NB:
             o = hx.lload(sm + (t + d) * 4, F32)
-        gpu.barrier()
+        hx.bar()
         hx.lstore(sm + t * 4, v + o)
-        gpu.barrier()
+        hx.bar()
 
 
 @ASTRewriter.transform
@@ -116,7 +116,7 @@ def crossing(sm, t, target):
     the mass still needed inside it, target - suffix(b + 1). Every thread gets the result (via LDS word sm + 1024)."""
     if t == 0:
         hx.lstore(sm + 1024, I32(-1))
-    gpu.barrier()
+    hx.bar()
     sv = hx.lload(sm + t * 4, F32)
     sn = F32(0.0)
     if t + 1 < NB:
@@ -124,10 +124,10 @@ def crossing(sm, t, target):
     if (sv >= target) & (sn < target):
         hx.lstore(sm + 1024, t)
         hx.lstore(sm + 1028, target - sn)
-    gpu.barrier()
+    hx.bar()
     bsel = hx.lload(sm + 1024, I32)
     rem = hx.lload(sm + 1028, F32)
-    gpu.barrier()
+    hx.bar()
     return bsel, rem
 
 
@@ -174,7 +174,7 @@ def xchg_scalar(recv, rank, p, row, c, t, sm, w0, w1, tag):
         got = poll_unit(recv[rank] + roff(p, t, row, 0), tag)
         hx.lstore(sm + HB + t * 8, got[0])
         hx.lstore(sm + HB + t * 8 + 4, got[1])
-    gpu.barrier()
+    hx.bar()
 
 
 @ASTRewriter.transform
@@ -202,13 +202,13 @@ def xchg_hist(recv, rank, p, row, c, t, sm, tag, mid=None):
             for k in range_constexpr(3):
                 if u * 3 + k < NB:
                     hx.lstore(sm + HB + (src * NB + u * 3 + k) * 4, got[k])
-    gpu.barrier()
+    hx.bar()
     tot = hx.lload(sm + HB + t * 4, F32)
     for o in range_constexpr(1, 4):
         tot = tot + hx.lload(sm + HB + (o * NB + t) * 4, F32)
-    gpu.barrier()
+    hx.bar()
     hx.lstore(sm + t * 4, tot)
-    gpu.barrier()
+    hx.bar()
 
 
 def _row_params(sp, row, invT, topp, seed):
@@ -254,7 +254,7 @@ def sample_once(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, invT, topp, s
         m = mn
     hx.lstore(sm + t * 8, m)
     hx.lstore(sm + t * 8 + 4, s)
-    gpu.barrier()
+    hx.bar()
     for k in range_constexpr(8):
         d = 128 >> k
         if t < d:
@@ -265,7 +265,7 @@ def sample_once(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, invT, topp, s
             mn = fx.max(m1, m2)
             hx.lstore(sm + t * 8, mn)
             hx.lstore(sm + t * 8 + 4, s1 * expf(m1 - mn) + s2 * expf(m2 - mn))
-        gpu.barrier()
+        hx.bar()
     if act & (t < 2):
         hx.gstore(rec0 + i64(row * CPR + c) * 8 + i64(t) * 4, hx.lload(sm + t * 4, F32))
     handoff(cnt, t, NCT)
@@ -283,9 +283,9 @@ def sample_once(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, invT, topp, s
     Z = F32(0.0)
     for o in range_constexpr(4):
         Z = Z + hx.lload(sm + HB + o * 8 + 4, F32) * expf(hx.lload(sm + HB + o * 8, F32) - M)
-    gpu.barrier()
+    hx.bar()
     hx.lstore(sm + t * 4, F32(0.0))
-    gpu.barrier()
+    hx.bar()
     lo1 = M - F32(R)
     sc1 = F32(NB / R)
     for k in range(PT):
@@ -293,7 +293,7 @@ def sample_once(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, invT, topp, s
         if z >= lo1:
             bi = fx.min(I32((z - lo1) * sc1), I32(NB - 1))
             hx.latomic_add_f32(sm + bi * 4, expf(z - M))
-    gpu.barrier()
+    hx.bar()
     if act:
         hx.gstore(rec1 + (i64(row * CPR + c) * NB + i64(t)) * 4, hx.lload(sm + t * 4, F32))
     handoff(cnt + i64(4), t, NCT)
@@ -303,12 +303,12 @@ def sample_once(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, invT, topp, s
     for q in range_constexpr(CPR):
         hs = hs + hx.gload(rec1 + (i64(row * CPR + q) * NB + i64(t)) * 4, F32)
     hx.lstore(sm + t * 4, hs)
-    gpu.barrier()
+    hx.bar()
     xchg_hist(recv, rank, 1, row, c, t, sm, tag0 + 1)
     suffix_scan(sm, t)
     b1, rem1 = crossing(sm, t, target)
     hx.lstore(sm + t * 4, F32(0.0))
-    gpu.barrier()
+    hx.bar()
     lo2 = lo1 + F32(b1) * F32(R / NB)
     sc2 = F32(NB * NB / R)
     for k in range(PT):
@@ -317,7 +317,7 @@ def sample_once(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, invT, topp, s
             bi = fx.min(I32((z - lo2) * sc2), I32(NB - 1))   # z == M lands in the last sub-bin of the top bin
             if (z < lo2 + F32(R / NB)) | (b1 == NB - 1):
                 hx.latomic_add_f32(sm + bi * 4, expf(z - M))
-    gpu.barrier()
+    hx.bar()
     if act:
         hx.gstore(rec2 + (i64(row * CPR + c) * NB + i64(t)) * 4, hx.lload(sm + t * 4, F32))
     handoff(cnt + i64(8), t, NCT)
@@ -326,7 +326,7 @@ def sample_once(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, invT, topp, s
     for q in range_constexpr(CPR):
         hs = hs + hx.gload(rec2 + (i64(row * CPR + q) * NB + i64(t)) * 4, F32)
     hx.lstore(sm + t * 4, hs)
-    gpu.barrier()
+    hx.bar()
     xchg_hist(recv, rank, 2, row, c, t, sm, tag0 + 2)
     suffix_scan(sm, t)
     b2, rem2 = crossing(sm, t, rem1)
@@ -334,7 +334,7 @@ def sample_once(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, invT, topp, s
     th = _greedy_th(greedy, th)
     if t == 0:
         hx.lstore(sm + 2048, I64MIN())
-    gpu.barrier()
+    hx.bar()
     best = I64MIN()
     for k in range(PT):
         z = zload(base, c0, CH, V, t, k, invT)
@@ -345,7 +345,7 @@ def sample_once(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, invT, topp, s
         pk = fx.Int64(skey(z + g)) * fx.Int64(1 << 32) + (fx.Int64(c32(0xFFFFFFFF) - (j + rank * V)) & fx.Int64(0xFFFFFFFF))
         best = (z >= th).select(fx.max(best, pk), best)
     latomic_max64(sm + 2048, best)
-    gpu.barrier()
+    hx.bar()
     if act & (t == 0):
         hx.gstore(rec3 + i64(row * CPR + c) * 8, hx.lload(sm + 2048, fx.Int64))
         hx.gstore(rec3 + i64(ROWS * CPR * 8) + i64(row * CPR + c) * 4, th)

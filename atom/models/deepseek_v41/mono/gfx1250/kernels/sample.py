@@ -112,7 +112,7 @@ def xchg6(recv, rank, p, row, c, t, sm, ws, tag, mid=None):
         got = poll_unit(recv[rank] + roff(p, src, row, u), tag)
         for q in range_constexpr(3):
             hx.lstore(sm + HB + src * (12 * nu) + (u * 3 + q) * 4, got[q])
-    gpu.barrier()
+    hx.bar()
 
 
 def _lw(sm, src, q, kind=F32, nw=6):
@@ -199,7 +199,7 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
             hx.lstore(sm + RACE_OFF, I64MIN())
         if t < 32:
             hx.lstore(sm + RACE_OFF + 8 + t * 4, I32(0))
-        gpu.barrier()
+        hx.bar()
     # P0: (max, sum exp) of z = l / T, and of the q row's d * invTd; d(x_k)
     m = F32(-1e30)
     s = F32(0.0)
@@ -247,7 +247,7 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
     hx.lstore(sm + 2048 + t * 12, mq)
     hx.lstore(sm + 2048 + t * 12 + 4, sq)
     hx.lstore(sm + 2048 + t * 12 + 8, dx)
-    gpu.barrier()
+    hx.bar()
     for kr in range_constexpr(8):
         d2 = 128 >> kr
         if t < d2:
@@ -267,7 +267,7 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
             hx.lstore(sm + 2048 + t * 12 + 4, r1 * expf(q1 - qn) + r2 * expf(q2 - qn))
             hx.lstore(sm + 2048 + t * 12 + 8, fx.max(hx.lload(sm + 2048 + t * 12 + 8, F32),
                                                      hx.lload(sm + 2048 + (t + d2) * 12 + 8, F32)))
-        gpu.barrier()
+        hx.bar()
     if act & (t < 2):
         hx.gstore(rec0 + i64(row * CPR + c) * 8 + i64(t) * 4, hx.lload(sm + t * 4, F32))
     if act & (t < 3):   # q statistics after the (m, s) records: [ROWS*CPR][4] f32
@@ -286,7 +286,7 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
     if t < CPR:
         hx.lstore(sm + PRB + t * 8, hx.gload(rec0 + i64(row * CPR + t) * 8, F32, 2))
         hx.lstore(sm + PRB + CPR * 8 + t * 16, hx.gload(qb + i64(t * 16), F32, 4))
-    gpu.barrier()
+    hx.bar()
     lq = t % 32
     mq_ = hx.lload(sm + PRB + lq * 8, F32)
     mr = _bf_max(mq_)
@@ -320,9 +320,9 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
         Z = Z + _lw(sm, o, 1, nw=9) * expf(_lw(sm, o, 0, nw=9) - M)
         ZQ = ZQ + _lw(sm, o, 3, nw=9) * expf(_lw(sm, o, 2, nw=9) - MQ)
     qx = expf(DX - MQ) / ZQ
-    gpu.barrier()
+    hx.bar()
     hx.lstore(sm + t * 4, F32(0.0))
-    gpu.barrier()
+    hx.bar()
     lo1 = M - F32(R)
     # P1 / P2 find the top-p threshold th. A row that is greedy (or a forced-acceptance argmax row) or has top_p >= 1
     # keeps every id: th = -inf whatever they give (top_p 1: the target p Z is above the mass of [M - R, M) unless the
@@ -340,7 +340,7 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
             if z >= lo1:
                 bi = fx.min(I32((z - lo1) * sc1), I32(NB - 1))
                 hx.latomic_add_f32(sm + bi * 4, expf(z - M))
-        gpu.barrier()
+        hx.bar()
         if act:
             hx.gstore(rec1 + (i64(row * CPR + c) * NB + i64(t)) * 4, hx.lload(sm + t * 4, F32))
         handoff(cnt + i64(4), t, NCT)
@@ -350,12 +350,12 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
         for q in range_constexpr(CPR):
             hs = hs + hx.gload(rec1 + (i64(row * CPR + q) * NB + i64(t)) * 4, F32)
         hx.lstore(sm + t * 4, hs)
-        gpu.barrier()
+        hx.bar()
         xchg_hist(recv, rank, 1, row, c, t, sm, tag0 + 1, mid=_ctxmid(ctxp, 1))
         suffix_scan(sm, t)
         b1, rem1 = crossing(sm, t, target)
         hx.lstore(sm + t * 4, F32(0.0))
-        gpu.barrier()
+        hx.bar()
         lo2 = lo1 + F32(b1) * F32(R / NB)
         sc2 = F32(NB * NB / R)
         for kk in range(PT):
@@ -364,7 +364,7 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
                 bi = fx.min(I32((z - lo2) * sc2), I32(NB - 1))
                 if (z < lo2 + F32(R / NB)) | (b1 == NB - 1):
                     hx.latomic_add_f32(sm + bi * 4, expf(z - M))
-        gpu.barrier()
+        hx.bar()
         if act:
             hx.gstore(rec2 + (i64(row * CPR + c) * NB + i64(t)) * 4, hx.lload(sm + t * 4, F32))
         handoff(cnt + i64(8), t, NCT)
@@ -373,7 +373,7 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
         for q in range_constexpr(CPR):
             hs = hs + hx.gload(rec2 + (i64(row * CPR + q) * NB + i64(t)) * 4, F32)
         hx.lstore(sm + t * 4, hs)
-        gpu.barrier()
+        hx.bar()
         xchg_hist(recv, rank, 2, row, c, t, sm, tag0 + 2, mid=_ctxmid(ctxp, 2))
         suffix_scan(sm, t)
         b2, rem2 = crossing(sm, t, rem1)
@@ -382,7 +382,7 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
         if t == 0:
             hx.lstore(sm + 2048, I64MIN())
         hx.lstore(sm + 4096 + t * 4, F32(0.0))
-        gpu.barrier()
+        hx.bar()
         best = I64MIN()
         zn = F32(0.0)
         zx = F32(NEG)
@@ -399,7 +399,7 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
         latomic_max64(sm + 2048, best)
         hx.latomic_add_f32(sm + 4096 + (t % 32) * 4, zn)
         hx.latomic_max_u32(sm + 4096 + 128 + (t % 32) * 4, skey(zx) ^ I32(-2147483648))
-        gpu.barrier()
+        hx.bar()
         if act & (t == 0):
             hx.gstore(rec3 + i64(row * CPR + c) * 8, hx.lload(sm + 2048, fx.Int64))
             hx.gstore(rec3 + i64(ROWS * CPR * 8) + i64(row * CPR + c) * 4, th)
@@ -449,7 +449,7 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
             hx.lstore(sm + 2048, I64MIN())
             hx.lstore(sm + 2056, I64MIN())
         hx.lstore(sm + 4096 + t * 4, F32(0.0))
-        gpu.barrier()
+        hx.bar()
         rm = F32(0.0)
         br = I64MIN()
         bp = I64MIN()
@@ -473,7 +473,7 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
         hx.latomic_add_f32(sm + 4096 + (t % 32) * 4, rm)
         latomic_max64(sm + 2048, br)
         latomic_max64(sm + 2056, bp)
-        gpu.barrier()
+        hx.bar()
         r5 = rec1 + i64(row * CPR + c) * 32
         if act & (t == 0):
             rmc = F32(0.0)

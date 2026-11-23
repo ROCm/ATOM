@@ -235,7 +235,7 @@ def front_A(c):
         i = t + it * 256
         if i < 8 * CP * 2 // 16:
             hx.lstore(sm + O_XN + 8 * CP * 2 + i * 16, zero)
-    gpu.barrier()
+    hx.bar()
 
 
 @ASTRewriter.transform
@@ -269,7 +269,7 @@ def front_B(c):
             acc[n] = hx.wmma_bf16(av, fl, acc[n])
     for n in range_constexpr(2):
         hx.lstore(sm + O_RED + (((w * 2 + n) * 32 + l) * 8) * 4, acc[n])
-    gpu.barrier()
+    hx.bar()
     if t < TG * 24:
         tok = t // 24
         o = t % 24
@@ -293,7 +293,7 @@ def front_C(c):
         for qq in range_constexpr(CL):
             s = s + hx.gload(c["part"] + i64(((g * CL + qq) * TG + t) * 32 + 25) * 4, F32)
         hx.lstore(sm + O_RSTD + t * 4, rsq(s * F32(1.0 / H) + F32(c["norm_eps"])))
-    gpu.barrier()
+    hx.bar()
     rs = hx.lload(sm + O_RSTD + w * 4, F32)
     cs = [l * 8, 256 + fx.min(l, I32(7)) * 8]
     for s_ in range_constexpr(2):
@@ -302,7 +302,7 @@ def front_C(c):
             nv = hx.gload(c["nw"] + i64(c0 + cs[s_]) * 2, BF16, 8, align=16)
             o8 = [bf((xv[e].to(F32) * rs) * nv[e].to(F32)) for e in range(8)]
             hx.lstore(sm + O_XN + (w * CP + cs[s_]) * 2, fx.Vector.from_elements(o8, BF16), align=16)
-    gpu.barrier()
+    hx.bar()
     if t < TG * 10:
         tok = t // 10
         gi = t % 10
@@ -465,7 +465,7 @@ def front_E2(c):
         sb = c["sm"] + O_RED + w * 128
         if l < 25:
             hx.lstore(sb + l * 4, sacc)
-        gpu.barrier()
+        hx.bar()
         rstd = rsq(hx.lload(sb + 24 * 4, F32) * F32(1.0 / (4 * H)) + F32(c["rms_eps"]))
         e = l % 16
         j4 = l % 4
@@ -520,7 +520,7 @@ def front_any(c):
             front_E1(c)
             cluster_sync()
     front_E2(c)
-    gpu.barrier()
+    hx.bar()
 
 
 # ==============================================================================================================
@@ -693,7 +693,7 @@ def router_v2(c, TR):
                 hx.wait_count(c["postcnt"], 160, 11)
             else:
                 hx.wait_count(c["x8pub"], c.get("x8n", FRONT_CTAS), 11)
-    gpu.barrier()
+    hx.bar()
     if fx.const_expr(SELFN):
         # raw x1 rows -> LDS (low registers: nothing held across the barriers), the thread's square sums on the way
         v3 = t + 512 < NCHUNK
@@ -713,20 +713,20 @@ def router_v2(c, TR):
                 s = s + s.shuffle_xor(16 >> o, 32)
             if l == 0:
                 hx.lstore(sm + RS_OFF + (w * 8 + r_) * 4, s)
-        gpu.barrier()
+        hx.bar()
         if t < TR:
             s = F32(0.0)
             for ww in range_constexpr(8):
                 s = s + hx.lload(sm + RS_OFF + (ww * 8 + t) * 4, F32)
             hx.lstore(sm + RS_OFF + 256 + t * 4, rsq(s * F32(1.0 / H) + F32(c["norm_eps"])))
-        gpu.barrier()
+        hx.bar()
         for r_ in range_constexpr(TR):
             rs = hx.lload(sm + RS_OFF + 256 + r_ * 4, F32)
             for j in range_constexpr(3):
                 xr = XA[r_][j]   # (the raw rows kept in registers: no LDS round trip)
                 o8 = [bf((xr[e].to(F32) * rs) * NV[j][e].to(F32)) for e in range(8)]
                 hx.lstore(sm + XN_OFF + r_ * GL_STR + q[j] * 16, fx.Vector.from_elements(o8, BF16), align=16)
-        gpu.barrier()
+        hx.bar()
     am = fx.min(l % 16, I32(EPR_ - 1))        # A row (expert; rows past EPR_ repeat the last: their outputs unused)
     bn = fx.min(l % 16, I32(TR - 1))          # B row (token)
     kh = (l // 16) * 16
@@ -743,7 +743,7 @@ def router_v2(c, TR):
     if (l < TR):
         for i in range_constexpr(EPR_):
             hx.lstore(sm + ((w * EPR_ + i) * 8 + l) * 4, acc[i])
-    gpu.barrier()
+    hx.bar()
     if t < TR * EPR_:
         r_ = t // EPR_
         e = t % EPR_
@@ -756,7 +756,7 @@ def router_v2(c, TR):
     if fx.const_expr("rflag" in c):   # (RFLAG) the CTA's scores landed -> its one LL flag (the top-k polls the 96 flags)
         if fx.const_expr(TR * EPR_ > 32):
             hx.wait_storecnt0()
-            gpu.barrier()
+            hx.bar()
         if w == 0:   # (the puts above: wave 0's lanes)
             hx.wait_storecnt0()
             if l == 0:
@@ -1011,7 +1011,7 @@ def router_v3(c, TR):
     NV = [hx.gload(c["nw"] + i64(q[j] * 8) * 2, BF16, 8, align=16) for j in range(3)]
     ipf(8)
     hx.wait_flags(c["pflag"], 160, c["ptag"], w, l, 11, backoff=True)
-    gpu.barrier()
+    hx.bar()
     rr = fx.min(r, I32(TR - 1))
     X = [hx.gload(c["x1g"] + i64(rr * H + q[j] * 8) * 2, BF16, 8, align=16) for j in range(3)]
     s = F32(0.0)
@@ -1027,7 +1027,7 @@ def router_v3(c, TR):
         s = s + s.shuffle_xor(16 >> o, 32)
     if l == 0:
         hx.lstore(sm + RS_OFF + w * 4, s)
-    gpu.barrier()
+    hx.bar()
     tot = F32(0.0)
     for ww in range_constexpr(8):
         tot = tot + hx.lload(sm + RS_OFF + ww * 4, F32)
@@ -1051,7 +1051,7 @@ def router_v3(c, TR):
     if l == 0:
         for e in range_constexpr(RV3_EPC):
             hx.lstore(sm + RS_OFF + 64 + (w * RV3_EPC + e) * 4, part[e])
-    gpu.barrier()
+    hx.bar()
     if (t < RV3_EPC) & (r < TR):
         sacc = F32(0.0)
         for ww in range_constexpr(8):
@@ -1148,11 +1148,11 @@ def ffn_post_owner(c, TR):
                 for k in range_constexpr(3):
                     hx.stx_dev(c["engp"] + i64((b * 8 + w) * 16 + 4 * k) * 4, fx.Vector.from_elements(pr[4 * k:4 * k + 4], F32))
             hx.wait_storecnt0()
-            gpu.barrier()
+            hx.bar()
             if t == 0:
                 hx.put(c["engflag"] + i64(b) * 8, I32(0), c["engtag"])
             hx.wait_flags(c["engflag"], NOWN, c["engtag"], w, l, 13)
-            gpu.barrier()
+            hx.bar()
             if w < TR:
                 tot = [F32(0.0)] * 12
                 for kq in range_constexpr(NOWN // 32):
@@ -1170,7 +1170,7 @@ def ffn_post_owner(c, TR):
                         sg = (dot < F32(0.0)).select(F32(0.0) - mag, mag)
                         gsel = (l == j).select(frcp(F32(1.0) + fexp(F32(0.0) - sg)), gsel)
                     hx.lstore(sm + 6144 + (w * 4 + l) * 4, gsel)
-            gpu.barrier()
+            hx.bar()
         gts = [hx.lload(sm + 6144 + (r * 4 + j) * 4, F32) for j in range(4)]
         if fx.const_expr("erecv" in c):
             kvv[4] = hx.lload(sm + 6272 + t * 2, BF16).to(F32)
@@ -1203,7 +1203,7 @@ def ffn_post_owner(c, TR):
                 hx.stx_dev(c["xsa"] + i64(r * (H // 32) + b) * 4, acode)   # (i32 codes, as stage_Apub wrote them)
         hx.lstore(sm + 4096 + t * 8, srs)
         hx.lstore(sm + 4096 + t * 8 + 4, x1f * x1f)
-    gpu.barrier()
+    hx.bar()
     # per-row sums of the two squares (rows r < TR: 20 entries each)
     if t < TR:
         a = F32(0.0)
@@ -1214,7 +1214,7 @@ def ffn_post_owner(c, TR):
         hx.stx_dev(c["part2"] + i64((b * 8 + t) * 32 + 24) * 4, a)
         hx.stx_dev(c["part2"] + i64((b * 8 + t) * 32 + 25) * 4, z)
     hx.wait_storecnt0()
-    gpu.barrier()
+    hx.bar()
     if t == 0:
         if fx.const_expr("pflag" in c):   # (v3 e9 / e1) one LL flag an owner, not a 256-way counter
             hx.put(c["pflag"] + i64(b) * 8, I32(0), c["ptag"])
@@ -1248,7 +1248,7 @@ def ffn_mix_owner(c, TR):
             for rr in range_constexpr(TR):
                 hx.stx_dev(c["part2"] + i64((b * 8 + rr) * 32 + o) * 4, wsum[rr])
     hx.wait_storecnt0()
-    gpu.barrier()
+    hx.bar()
     if t == 0:
         hx.atomic_add(c["cnt2"], 1)
 
@@ -1264,7 +1264,7 @@ def ffn_c2(c, TR):
     else:
         if t == 0:
             hx.wait_count(c["cnt"], NOWN, 13)
-    gpu.barrier()
+    hx.bar()
     # wave w = token: lane l sums owners l, l + 32, .. (8 loads in flight), then the wave sum
     pv = [hx.gload(c["part2"] + i64(((l + 32 * k) * 8 + w) * 32 + 25) * 4, F32) for k in range(NOWN // 32)]
     s = F32(0.0)
@@ -1282,7 +1282,7 @@ def ffn_c2(c, TR):
             v = hx.gload(c["x1g"] + i64(tokc * H + c0 + cs[s_]) * 2, BF16, 8, align=16)
             v = fx.Vector.from_elements([(w < TR).select(v[e], BF16(0.0)) for e in range(8)], BF16)
             hx.lstore(sm + O_X1 + (w * CP + cs[s_]) * 2, v, align=16)
-    gpu.barrier()
+    hx.bar()
     rs = hx.lload(sm + O_RSTD + w * 4, F32)
     for s_ in range_constexpr(2):
         if (s_ == 0) | (l < 8):
@@ -1290,7 +1290,7 @@ def ffn_c2(c, TR):
             nv = hx.gload(c["nw"] + i64(c0 + cs[s_]) * 2, BF16, 8, align=16)
             o8 = [bf((xv[e].to(F32) * rs) * nv[e].to(F32)) for e in range(8)]
             hx.lstore(sm + O_XN + (w * CP + cs[s_]) * 2, fx.Vector.from_elements(o8, BF16), align=16)
-    gpu.barrier()
+    hx.bar()
     if t < TG * 10:
         tok = t // 10
         gi = t % 10
@@ -1309,7 +1309,7 @@ def ffn_c2(c, TR):
         for k in range_constexpr(4):
             hx.stx_dev(c["xn"] + i64(row * H + c0 + gi * 32 + 8 * k) * 2, vs[k])
     hx.wait_storecnt0()
-    gpu.barrier()
+    hx.bar()
     if t == 0:
         if fx.const_expr("xflag" in c):   # (v3 e10) one LL flag a c2 CTA
             hx.put(c["xflag"] + i64(b) * 8, I32(0), c["xtag"])
@@ -1329,7 +1329,7 @@ def mix_l1(c, j):
     t = c["t"]
     if t == 0:
         hx.wait_count(c["cnt2"], NOWN, 14)
-    gpu.barrier()
+    hx.bar()
     if t < TG * 25:
         tok = t // 25
         v = t % 25
@@ -1340,7 +1340,7 @@ def mix_l1(c, j):
             s = s + (k0 + k < NOWN).select(pv[k], F32(0.0))
         hx.stx_dev(c["part3"] + i64((j * 8 + tok) * 32 + v) * 4, s)
     hx.wait_storecnt0()
-    gpu.barrier()
+    hx.bar()
     if t == 0:
         hx.atomic_add(c["cnt3"], 1)
 
@@ -1353,7 +1353,7 @@ def sinkhorn2(c):
     row = w
     if t == 0:
         hx.wait_count(c["cnt3"], NL1, 14)
-    gpu.barrier()
+    hx.bar()
     lm = l % 25
     # (counted done: ffn_c2 of this CTA waited before) lane l sums owners l, l + 32, .. of all 25 values, then wave sums
     sb = c["sm"] + O_RED + w * 128
@@ -1363,7 +1363,7 @@ def sinkhorn2(c):
         sacc = sacc + pv[k]
     if l < 25:
         hx.lstore(sb + l * 4, sacc)
-    gpu.barrier()
+    hx.bar()
     rstd = rsq(hx.lload(sb + 24 * 4, F32) * F32(1.0 / (4 * H)) + F32(c["rms_eps"]))
     e = l % 16
     j4 = l % 4
@@ -1401,7 +1401,7 @@ def sinkhorn2(c):
     if l < 16:
         hx.stx_dev(c["ncomb"] + i64(row * 16 + e) * 4, P)
     hx.wait_storecnt0()
-    gpu.barrier()
+    hx.bar()
     if t == 0:
         hx.atomic_add(c["done"], 1)
 
@@ -1432,7 +1432,7 @@ def mix_owner_g(c, TR):
             for rr in range_constexpr(TR):
                 hx.stx_dev(c["part2"] + i64((b * 8 + rr) * 32 + o) * 4, wsum[rr])
     hx.wait_storecnt0()
-    gpu.barrier()
+    hx.bar()
     if t == 0:
         hx.atomic_add(c["cnt2"], 1)
 
@@ -1447,7 +1447,7 @@ def x8_self(c, TR):
     the MXFP8 block of each 32 cols (front_C's arithmetic). c: t w l sm x1g part2 pflag ptag nw norm_eps."""
     t, w, l, sm = c["t"], c["w"], c["l"], c["sm"]
     hx.wait_flags(c["pflag"], NOWN, c["ptag"], w, l, 13, backoff=True)
-    gpu.barrier()
+    hx.bar()
     wr = fx.min(w, I32(TR - 1))
     pv = [hx.gload(c["part2"] + i64(((l + 32 * k) * 8 + wr) * 32 + 25) * 4, F32) for k in range(NOWN // 32)]
     if w < TR:
@@ -1458,7 +1458,7 @@ def x8_self(c, TR):
             s = s + s.shuffle_xor(16 >> o, 32)
         if l == 0:
             hx.lstore(sm + X8LS + 1024 + w * 4, rsq(s * F32(1.0 / H) + F32(c["norm_eps"])))
-    gpu.barrier()
+    hx.bar()
     NBK = TR * (H // 32)
     for it in range_constexpr((NBK + 255) // 256):
         blk = t + it * 256
@@ -1477,7 +1477,7 @@ def x8_self(c, TR):
             hx.lstore(sm + X8LO + rr * H + bc * 32, fx.Vector.from_elements(words[:4], I32), align=16)
             hx.lstore(sm + X8LO + rr * H + bc * 32 + 16, fx.Vector.from_elements(words[4:], I32), align=16)
             hx.lstore(sm + X8LS + rr * (H // 32) + bc, code.to(fx.Int8))
-    gpu.barrier()
+    hx.bar()
 
 
 @ASTRewriter.transform
@@ -1487,7 +1487,7 @@ def xh_out(c, TR):
     pflag ptag nw norm_eps xh."""
     t, b, w, l, sm = c["t"], c["b"], c["w"], c["l"], c["sm"]
     hx.wait_flags(c["pflag"], NOWN, c["ptag"], w, l, 13, backoff=True)
-    gpu.barrier()
+    hx.bar()
     wr = fx.min(w, I32(TR - 1))
     pv = [hx.gload(c["part2"] + i64(((l + 32 * k) * 8 + wr) * 32 + 25) * 4, F32) for k in range(NOWN // 32)]
     if w < TR:
@@ -1498,7 +1498,7 @@ def xh_out(c, TR):
             s = s + s.shuffle_xor(16 >> o, 32)
         if l == 0:
             hx.lstore(sm + 6144 + w * 4, rsq(s * F32(1.0 / H) + F32(c["norm_eps"])))
-    gpu.barrier()
+    hx.bar()
     for it in range_constexpr((TR * 40 + 255) // 256):
         i = t + it * 256
         if i < TR * 40:

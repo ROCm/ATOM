@@ -154,7 +154,7 @@ def stage_engkv(c):
                         col = e % (KCH // 32 // 16)
                         hx.async_to_lds_b128(c["engs"] + i64(row * EG + ch * (KCH // 32) + col * 16), osc + row * (KCH // 32) + col * 16)
             hx.wait_asynccnt0()
-            gpu.barrier()
+            hx.bar()
             for ks in range(0, SPC, EDL):
                 for i in range_constexpr(EDL):
                     bv, bs = ring[i]
@@ -166,7 +166,7 @@ def stage_engkv(c):
                         asc = hx.lload(osc + (mi * 16 + l % 16) * (KCH // 32) + kk * 4, I32)
                         acc[mi] = hx.wmma_mx(av, asc, bv, bs, acc[mi])
                     ring[i] = fb(k0 + fx.min(ks + i + EDL, I32(SPC - 1)))   # (the chunk's last EDL refills: unused)
-            gpu.barrier()   # every wave done with this chunk before the next overwrites it
+            hx.bar()   # every wave done with this chunk before the next overwrites it
         for mi in range_constexpr(MT):
             for i in range_constexpr(8):
                 r = mi * 16 + (l // 16) * 8 + i
@@ -262,7 +262,7 @@ def stage_enga(c, e0, S):
         hx.stx_dev(dst + i64(16), fx.Vector.from_elements(words[4:], I32))
         hx.stx_dev(c["engs"] + i64((sl * RA + row) * EG + g), code.to(fx.Int8))
         hx.wait_storecnt0()
-        gpu.barrier()
+        hx.bar()
         if t == 0:
             hx.atomic_add(c["enga_cnt"], 1)
 
@@ -315,7 +315,7 @@ def stage_engkv_ent(c, e0, ncta, EDL, S):
             # the producers' count (one waiter a CTA, then acquire)
             if t == 0:
                 hx.wait_count(c["enga_cnt"], I32(ENGA_CTAS), 4)
-            gpu.barrier()
+            hx.bar()
             a8 = c["eng8"] + i64(sl * RA * EK)
             as_ = c["engs"] + i64(sl * RA * EG)
             for it in range_constexpr((RA * EK // 16 + 255) // 256):   # the codes: 16 B chunks, each row padded to RSF in LDS
@@ -325,7 +325,7 @@ def stage_engkv_ent(c, e0, ncta, EDL, S):
             if t < RA * EG // 16:
                 hx.async_to_lds_b128(as_ + i64(t) * 16, osc + t * 16)
             hx.wait_asynccnt0()   # (the first EDL B steps' copies as well: the K loop's counts start from zero)
-            gpu.barrier()
+            hx.bar()
         else:   # (MT > 1: the rows quantized in each CTA, as before)
             for it in range((RA * EG + 255) // 256):   # A: RA rows x EG 32-groups, quantized here (rows >= TR: zeros, code 0)
                 e = t + it * 256
@@ -352,7 +352,7 @@ def stage_engkv_ent(c, e0, ncta, EDL, S):
                     hx.lstore(oa + row * RSF + g * 32, fx.Vector.from_elements(words[:4], I32))
                     hx.lstore(oa + row * RSF + g * 32 + 16, fx.Vector.from_elements(words[4:], I32))
                     hx.lstore(osc + row * EG + g, code.to(fx.Int8))
-            gpu.barrier()
+            hx.bar()
         acc = [fx.Vector.filled(8, 0.0, F32) for _ in range(MT)]
         for ks in range(0, NK, EDL):
             for i in range_constexpr(EDL):

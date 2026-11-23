@@ -206,7 +206,7 @@ def stage_score_any(c, isrx):
         hx.lstore(osr + t * 4, cxt)
         hx.lstore(osr + (64 + t) * 4, bdt)
         hx.lstore(osr + (128 + t) * 4, qt)
-    gpu.barrier()
+    hx.bar()
     # the rows' inclusive chunk prefix in every wave's lanes (rows lane, lane + 32; TR <= 64): no serial LDS walks
     ln = hx.fresh(t) % 32
     c0 = hx.lload(ocnt + fx.min(ln, I32(TR - 1)) * 4, I32)
@@ -275,7 +275,7 @@ def stage_score_any(c, isrx):
                 pages_to_lds(base_i)
         else:
             pages_to_lds(base_i)
-        gpu.barrier()
+        hx.bar()
         for k in range(fx.min(nme - gb * RB, I32(RB))):   # (this batch's tasks: a 1-round CTA runs one)
             ik = base_i + k * CTAS
             live = ik < nt   # (a short last batch: the clamped task recomputed, its stores skipped)
@@ -330,7 +330,7 @@ def stage_score_any(c, isrx):
                     if live & (l < 16) & (l % 8 == 0) & (bk < nblk):
                         c["stx"](c["ibmax"] + i64(r * (c["ilw"] // 8) + bk) * 4, m)
 
-        gpu.barrier()
+        hx.bar()
 
 
 def _grouped_key(c, flat, l):
@@ -360,7 +360,7 @@ def iq_wait(iqcnt, hcnt, t, iqonly, niq):
     if iqonly:
         if t == 0:
             hx.wait_count(iqcnt, niq, 4)
-        gpu.barrier()
+        hx.bar()
     else:
         hx.handoff(hcnt, t, True)
 
@@ -390,7 +390,7 @@ def stage_score_grouped(c):
         hx.lstore(osr + t * 4, fx.max(bdt, I32(0)))
         hx.lstore(osr + (64 + t) * 4, bdt)
     q = fx.max(hx.gload(c["ibat"], I32), I32(0))   # (every row is this request's)
-    gpu.barrier()
+    hx.bar()
     ln = hx.fresh(t) % 32
     cmax = TK.wave_max((ln < TR).select(hx.lload(osr + fx.min(ln, I32(TR - 1)) * 4, I32), I32(0)))
     bmax = TK.wave_max((ln < TR).select(hx.lload(osr + (64 + fx.min(ln, I32(TR - 1))) * 4, I32), I32(0)))
@@ -426,7 +426,7 @@ def stage_score_grouped(c):
     if fx.const_expr("prewait" in c):
         c["prewait"]()
     stage_q_slots(c, sm, t, list(range(TR)))   # every row's query and head weights -> LDS slots 0..TR-1
-    gpu.barrier()
+    hx.bar()
     key_of = lambda flat: _grouped_key(c, flat, l)
 
     # the rows' context / bound, read once into VGPRs (opaque: kept per lane, not as 12 uniform SGPRs -- as SGPRs they
@@ -510,7 +510,7 @@ def stage_score_grouped(c):
         if fx.const_expr("segcnt" in c):   # (segsel) the candidate layer: this task's 8192-column segment, one more
             if iprod:
                 hx.wait_storecnt0()
-                gpu.barrier()
+                hx.bar()
                 if t == 0:
                     hx.atomic_add(c["segcnt"] + i64(task * CHUNK // IP.SEG) * 4, 1)
-    gpu.barrier()
+    hx.bar()

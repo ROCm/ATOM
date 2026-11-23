@@ -291,12 +291,12 @@ def moe_union(c, counted=False):
                     hx.lstore(sm + O_PID + p * 4, hx.gload(idp + i64(p) * 4, I32))
                 if fx.const_expr(wts_g):
                     hx.lstore(sm + O_WTS + p * 4, hx.gload(wtp + i64(p) * 4, F32))
-        gpu.barrier()
+        hx.bar()
         for k in range_constexpr((NP + 255) // 256):
             p = t + 256 * k
             if p < NP:
                 union_count(sm, p, hx.lload(sm + O_PID + p * 4, I32))
-        gpu.barrier()
+        hx.bar()
     # overflow chunks (hot experts: > 16 picks). The <= 16 overflowing experts (OVP[0 .. novf), arrival order) are put in
     # expert order by wave 0 (lane l holds one: its order = the listed experts with smaller ids; its chunks (1 or 2) and
     # chunk base = an exclusive prefix over them in that order). Then every overflowing expert's picks are re-placed by
@@ -324,7 +324,7 @@ def moe_union(c, counted=False):
                     if (j < nch) & (vb + j < NOV):
                         hx.lstore(sm + O_VEXP + (vb + j) * 4, e)
                         hx.lstore(sm + O_CNT + (V_OV0 + vb + j) * 4, fx.min(cn - MAXTOK * (j + 1), I32(MAXTOK)))
-        gpu.barrier()
+        hx.bar()
         NR = (NP + 255) // 256
         mine = []
         for k in range_constexpr(NR):
@@ -339,7 +339,7 @@ def moe_union(c, counted=False):
                     hx.lstore(sm + O_OVP + 64 + ((k * 8 + w) * 16 + j) * 4, popc(m))
                 rk = (jj == j).select(mbcnt(m), rk)
             mine.append((p, e, jj, rk))
-        gpu.barrier()
+        hx.bar()
         for k in range_constexpr(NR):
             p, e, jj, rk = mine[k]
             if jj >= 0:
@@ -351,7 +351,7 @@ def moe_union(c, counted=False):
                 dst = inl.select(e * MAXTOK + rank, (V_OV0 + vi) * MAXTOK + rank % MAXTOK)
                 if inl | (vi < NOV):
                     hx.lstore(sm + O_LST + dst * 4, p)
-        gpu.barrier()
+        hx.bar()
     # the union (wave 0) first: it reads the counts only, not the sorted lists
     if w == 0:
         base = I32(0)
@@ -413,7 +413,7 @@ def moe_union(c, counted=False):
                 for q in range_constexpr(2):
                     hx.lstore(sm + O_LST + (e * MAXTOK + 4 * q) * 4, fx.Vector.from_elements(v[4 * q:4 * q + 4], I32),
                               align=16)
-    gpu.barrier()
+    hx.bar()
 
 
 @ASTRewriter.transform
@@ -436,7 +436,7 @@ def moe_combine(c, TR, sm_out, v3=False):
             acc = [acc[j] + vb[k][j].to(F32) for j in range(4)]
         acc = [acc[j] + vsh[j] for j in range(4)]
         hx.lstore(sm_out + (row * OW + c4) * 4, fx.Vector.from_elements(acc, F32), align=16)
-    gpu.barrier()
+    hx.bar()
 
 
 def ug_ring_init(wb, sb, lo, xrow, srow, l, KB):
@@ -522,11 +522,11 @@ def moe_ug(c):
         # the dedicated CTAs: once all NSHU shared units' MID is out (a counter among them), the shared down
         if ded:
             hx.wait_storecnt0()
-            gpu.barrier()
+            hx.bar()
             if t == 0:
                 hx.atomic_add(c["shcnt"], 1)
                 hx.wait_count(c["shcnt"], NDC, 7)
-            gpu.barrier()
+            hx.bar()
             cd = {k: c[k] for k in c if k != "shcnt"}   # a plain dict (LazyC entries evaluated here)
             cd.update(dn8_bi=b - CR, dn8_nct=NDC)
             moe_dn_shared(cd)
@@ -584,11 +584,11 @@ def ug_routed_tile(c, U):
         pk = hx.lload(sm + O_LST + (e * MAXTOK + (tl < n).select(tl, I32(0))) * 4, I32)
         ex = i64(pslot(e, sm))
         acc1 = ug_body1(c, pk, c["w13"] + ex * W13_E + i64(g) * (4 * W13_TS), c["s13"] + ex * S13_E + i64(g) * (2 * W13_KC), tile)
-        gpu.barrier()   # the previous round's epilogue has read the accumulators
+        hx.bar()   # the previous round's epilogue has read the accumulators
         ow = sm + O_RED8 + (w * 32 + l) * 32
         hx.lstore(ow, fx.Vector.from_elements([acc1[i] for i in range(4)], F32), align=16)
         hx.lstore(ow + 16, fx.Vector.from_elements([acc1[i] for i in range(4, 8)], F32), align=16)
-        gpu.barrier()
+        hx.bar()
         if tile == 0:
             acc = []
             for q in range_constexpr(4):
@@ -633,12 +633,12 @@ def ug_routed_ksplit(c, u0, u1):
         acc = ug_body(c, pk, c["w13"] + ex * W13_E + i64(g) * (4 * W13_TS), c["s13"] + ex * S13_E + i64(g) * (2 * W13_KC),
                       ks0p, nstp)
         if ks_ > 1:
-            gpu.barrier()   # the previous round's sums have read the partials
+            hx.bar()   # the previous round's sums have read the partials
             for tile in range_constexpr(4):
                 ow = sm + O_RED8 + ((w * 4 + tile) * 32 + l) * 32
                 hx.lstore(ow, fx.Vector.from_elements([acc[tile][i] for i in range(4)], F32), align=16)
                 hx.lstore(ow + 16, fx.Vector.from_elements([acc[tile][i] for i in range(4, 8)], F32), align=16)
-            gpu.barrier()
+            hx.bar()
             tot = [fx.Vector.filled(8, 0.0, F32) for _ in range(4)]
             for q in range(ks_):
                 for tile in range_constexpr(4):
@@ -738,12 +738,12 @@ def ug_shared8(c, ui, k, g):
         ra = na
         rb = nb
     # partials [w][tile][lane][8] as 2 x 16 B; wave 0 sums them in wave order (a runtime loop over the waves)
-    gpu.barrier()   # the previous unit's sum (wave 0) has read the partials
+    hx.bar()   # the previous unit's sum (wave 0) has read the partials
     for tile in range_constexpr(4):
         ow = sm + O_RED8 + ((w * 4 + tile) * 32 + l) * 32
         hx.lstore(ow, fx.Vector.from_elements([acc[tile][i] for i in range(4)], F32), align=16)
         hx.lstore(ow + 16, fx.Vector.from_elements([acc[tile][i] for i in range(4, 8)], F32), align=16)
-    gpu.barrier()
+    hx.bar()
     tot = [fx.Vector.filled(8, 0.0, F32) for _ in range(4)]
     for ww in range(8):
         for tile in range_constexpr(4):
@@ -798,7 +798,7 @@ def ug_shared_early(c, bi):
             hx.wait_count(c["postcnt"], 256, 6)   # loads would see the count only when they land); the other waves
         ra = [[lda8(ab + (i64(fx.min(k0 + j, I32(39))) * 4 + tile) * UNIT8, l) for tile in range(4)] for j in range(MAXS)]
         NV = [[hx.gload(c["nw"] + i64(cb[cc] + 8 * h) * 2, BF16, 8, align=16) for h in range(2)] for cc in range(4)]
-        gpu.barrier()   # issued theirs before reaching this barrier
+        hx.bar()   # issued theirs before reaching this barrier
         XV = [[hx.gload(c["x1g"] + i64(row * H + cb[cc] + 8 * h) * 2, BF16, 8, align=16) for h in range(2)] for cc in range(4)]
         if w < rows_:
             pv = [hx.gload(c["part2"] + i64(((l + 32 * kq) * 8 + w) * 32 + 25) * 4, F32) for kq in range(256 // 32)]
@@ -809,7 +809,7 @@ def ug_shared_early(c, bi):
                 sq = sq + sq.shuffle_xor(16 >> o, 32)
             if l == 0:
                 hx.lstore(sm + O_WTS + w * 4, rsq(sq * F32(1.0 / H) + F32(c["norm_eps"])))
-        gpu.barrier()
+        hx.bar()
         rs = hx.lload(sm + O_WTS + row * 4, F32)
         words = []
         code4 = I32(0)
@@ -823,7 +823,7 @@ def ug_shared_early(c, bi):
             words = words + q8words(vals, inv_pow2(code))
             code4 = code4 | (code << (8 * cc))
         rb = [(fx.Vector.from_elements(words, I32), code4)]
-        gpu.barrier()   # (the rstd slots in O_WTS are the top-k's after this)
+        hx.bar()   # (the rstd slots in O_WTS are the top-k's after this)
     else:
         if fx.const_expr("x8cnt" in c):   # (v2, TileRT) the weights issued before the wait for x8, not after it
             if fx.const_expr("xflag" in c):   # (v3 e10)
@@ -831,7 +831,7 @@ def ug_shared_early(c, bi):
             else:
                 if c["t"] == 0:
                     hx.wait_count(c["x8cnt"], c["x8n"], 6)
-            gpu.barrier()
+            hx.bar()
         rb = [ldb_x(c, row, fx.min(k0 + j, I32(39)), l) for j in range(MAXS)]
     acc = [fx.Vector.filled(8, 0.0, F32) for _ in range(4)]
     for j in range_constexpr(MAXS):
@@ -842,7 +842,7 @@ def ug_shared_early(c, bi):
         ow = sm + O_RED8 + ((w * 4 + tile) * 32 + l) * 32
         hx.lstore(ow, fx.Vector.from_elements([acc[tile][i] for i in range(4)], F32), align=16)
         hx.lstore(ow + 16, fx.Vector.from_elements([acc[tile][i] for i in range(4, 8)], F32), align=16)
-    gpu.barrier()
+    hx.bar()
     if w == 0:
         for tile in range_constexpr(4):
             tot = fx.Vector.filled(8, 0.0, F32)
@@ -947,7 +947,7 @@ def moe_dn_stage(c):
             hx.lstore(dst, fx.Vector.from_elements([v[j] & m for j in range(4)], I32), align=16)
         else:
             hx.lstore(dst, m.select(v, I32(0x01010101)))
-    gpu.barrier()
+    hx.bar()
 
 
 @ASTRewriter.transform
@@ -1105,7 +1105,7 @@ def moe_dn_shared(c):
     if fx.const_expr(SHE_IN_MOE):   # the shared MID: written by the fin CTAs after the UG -> down handoff
         if t == 0:
             hx.wait_count(c["shfin"], NCH * NUG, 7)
-        gpu.barrier()
+        hx.bar()
     nuni = ufl(hx.lload(sm + O_NUNI, I32))
     bi = c.get("dn8_bi", b)
     nct = c.get("dn8_nct", CTAS)
@@ -1153,7 +1153,7 @@ def she_fin(c):
     if (b >= sb0) & (b < sb0 + NCHs * NUG):
         ug_shared_fin(c, b - sb0)
         hx.wait_storecnt0()
-        gpu.barrier()
+        hx.bar()
         if t == 0:
             hx.atomic_add(c["shfin"], 1)
 
@@ -1230,7 +1230,7 @@ def f0_row(c, r):
     t, w, l, sm = c["t"], c["w"], c["l"], c["sm"]
     NV = [hx.gload(c["nw"] + i64(fx.min(t, I32(159)) * 32 + 8 * h) * 2, BF16, 8, align=16) for h in range(4)]
     hx.wait_flags(c["pflag"], 160, c["ptag"], w, l, 13, backoff=True)
-    gpu.barrier()
+    hx.bar()
     if w == 0:
         pv = [hx.gload(c["part2"] + i64(((l + 32 * k) * 8 + r) * 32 + 25) * 4, F32) for k in range(5)]
         s = F32(0.0)
@@ -1240,7 +1240,7 @@ def f0_row(c, r):
             s = s + s.shuffle_xor(16 >> o, 32)
         if l == 0:
             hx.lstore(sm + X8LS + 1024, rsq(s * F32(1.0 / H) + F32(c["norm_eps"])))
-    gpu.barrier()
+    hx.bar()
     if t < 160:
         rs = hx.lload(sm + X8LS + 1024, F32)
         xv = [hx.gload(c["x1g"] + i64(r * H + t * 32 + 8 * h) * 2, BF16, 8, align=16) for h in range(4)]
@@ -1253,7 +1253,7 @@ def f0_row(c, r):
         hx.lstore(sm + X8LO + t * 32, fx.Vector.from_elements(words[:4], I32), align=16)
         hx.lstore(sm + X8LO + t * 32 + 16, fx.Vector.from_elements(words[4:], I32), align=16)
         hx.lstore(sm + X8LS + t, code.to(fx.Int8))
-    gpu.barrier()
+    hx.bar()
 
 
 def ldb_row(sm, ks, l):
@@ -1343,11 +1343,11 @@ def ug_row(c, s):
                 acc1 = ug_tile_row(c, wb, sb, tl4, I32(0), 40, KB)
             else:
                 acc1 = ug_tile_row(c, wb, sb, tl4, (w % 2) * 20, 20, 4)
-        gpu.barrier()
+        hx.bar()
         ow = sm + O_RED8 + (w * 32 + l) * 32
         hx.lstore(ow, fx.Vector.from_elements([acc1[i] for i in range(4)], F32), align=16)
         hx.lstore(ow + 16, fx.Vector.from_elements([acc1[i] for i in range(4, 8)], F32), align=16)
-        gpu.barrier()
+        hx.bar()
         if fx.const_expr(rd == 0):
             lead = (w % 4 == 0) & live
         else:
@@ -1378,14 +1378,27 @@ def ug_row(c, s):
 @ASTRewriter.transform
 def dn_row(c, s):
     """Row r's down of hidden cols [128 s, + 128): wave k < 6 pick k, wave 6 the shared expert; the 7 partials summed
-    in order in LDS -> 64 packed bf16 words at DRED + 7 * 512."""
+    in order in LDS -> 64 packed bf16 words at DRED + 7 * 512. c["h16"] (the 16-wave CTA: every wave 0..15 here, the
+    helpers woken by the caller): wave w and helper w + 8 the same pick / shared expert, tiles 0..3 / 4..7 (4 a wave,
+    DNPD in flight: the pick's chain past its MID row half as long); the main wave polls the MID row / shared act into
+    LDS as before and tags it, its helper waits the LDS tag (no second poller on the memory system). Every tile's WMMA
+    chain, partial and slot as before (bit for bit)."""
     t, w, l, sm, r = c["t"], c["w"], c["l"], c["sm"], c["row"]
     KT = c.get("ktop", TOPK)   # (draft: top-3; wave KT = the shared expert)
     tl = l % 16
-    if w < KT:
+    H16 = "h16" in c
+    NT = 8 - 4 * int(H16)   # tiles a wave
+    wr = w                  # the wave's role (pick wr / the shared expert) and its first tile
+    j0 = 0
+    if fx.const_expr(H16):
+        wr = w % 8
+        j0 = (w // 8) * 4
+    if fx.const_expr(H16):
+        ws = hx.wave_s()
+    if wr < KT:
         lo = lane_offs(l, False)
-        p = r * KT + w
-        e = pick_id(c, w)
+        p = r * KT + wr
+        e = pick_id(c, wr)
         wt = hx.lload(sm + O_WTS + p * 4, F32)
         # (union UG) the pick's union entry ui (O_UNI[ui] == e) and its token slot pos (O_LST[e][pos] == p)
         if fx.const_expr("udir" in c):
@@ -1400,15 +1413,22 @@ def dn_row(c, s):
             pos = ufl(_rv_wmax(pa))
 
         def tile_loads(j):
-            tt = s * 8 + j
+            tt = s * 8 + j0 + j
             wb = c["w2"] + i64(e) * W2_E + i64(tt) * W2_TS
             sb = c["s2"] + i64(e) * S2_E + i64(tt // 2) * W2_KC + i64(tt % 2) * 64
             return [lda(wb + i64(ks * 1024), sb + i64(ks * 128), lo) for ks in range(DNU)]
 
         ops = [tile_loads(j) for j in range(DNPD)]
         if fx.const_expr("udir" in c):   # the pick's MID row from its LL words -> this wave's LDS row
-            pal = sm + PAL + w * PALW
-            mid_ll(c, mid_row(c, ui, pos), l, pal)
+            pal = sm + PAL + wr * PALW
+            if fx.const_expr(H16):   # (the pick's main wave polls it, its helper waits the row's LDS tag)
+                if ws < 8:
+                    mid_ll(c, mid_row(c, ui, pos), l, pal)
+                    lds_tag_put(sm + DFL + wr * 4, c["mtag"], l)
+                else:
+                    lds_tag_wait(sm + DFL + wr * 4, c["mtag"])
+            else:
+                mid_ll(c, mid_row(c, ui, pos), l, pal)
             B = [(ldb_l(pal, ks, l), hx.lload(pal + 640 + ks * 4, I32)) for ks in range(DNU)]
         else:
             hx.get(c["mflag"] + i64(ui * NUG + fx.min(l, I32(NUG - 1))) * 8, c["mtag"], 7)
@@ -1416,29 +1436,39 @@ def dn_row(c, s):
             crow = c["midc"] + i64(ui * MAXTOK + pos) * CROW
             B = [ldb_g(mrow, crow, ks, l) for ks in range(DNU)]
         sched_barrier()
-        for j in range_constexpr(8):
+        for j in range_constexpr(NT):
             aq = ops[j % DNPD]
             acc = fx.Vector.filled(8, 0.0, F32)
             for ks in range_constexpr(DNU):
                 acc = wmma_fp4(avec(aq[ks]), aq[ks][2], B[ks][0], B[ks][1], acc)
-            if fx.const_expr(j + DNPD < 8):
+            if fx.const_expr(j + DNPD < NT):
                 ops = ops[:j % DNPD] + [tile_loads(j + DNPD)] + ops[j % DNPD + 1:]
             sched_barrier()
             if tl == 0:   # token 0: cols j * 16 + (l // 16) * 8 + jj, the pick's weighted bf16 partial
-                hx.lstore(sm + DRED + (w * 128 + j * 16 + (l // 16) * 8) * 4,
+                hx.lstore(sm + DRED + (wr * 128 + (j0 + j) * 16 + (l // 16) * 8) * 4,
                           fx.Vector.from_elements([(acc[jj] * wt).to(BF16).to(F32) for jj in range(8)], F32), align=16)
-    if w == KT:   # the shared expert (FP8) of row r: its MXFP8 MID row made here from the shared act (sh_act_q8)
-        sh_act_q8(c, r, l, sm)
+    if wr == KT:   # the shared expert (FP8) of row r: its MXFP8 MID row made here from the shared act (sh_act_q8)
+        if fx.const_expr(H16):
+            if ws < 8:
+                sh_act_q8(c, r, l, sm)
+                lds_tag_put(sm + DFL + KT * 4, c["mtag"], l)
+            else:
+                lds_tag_wait(sm + DFL + KT * 4, c["mtag"])
+        else:
+            sh_act_q8(c, r, l, sm)
         B = [(ldb_l(sm + SHAL, ks, l), hx.lload(sm + SHAL + 640 + ks * 4, I32)) for ks in range(DNU)]
-        for j in range(8):
-            ra = [lda8_l(sm + SHDL + (j * DNU + ks) * UNIT8, l) for ks in range(DNU)]
+        for j in range(NT):
+            ra = [lda8_l(sm + SHDL + ((j0 + j) * DNU + ks) * UNIT8, l) for ks in range(DNU)]
             acc = fx.Vector.filled(8, 0.0, F32)
             for ks in range_constexpr(DNU):
                 acc = wmma_fp8(avec8(ra[ks]), ra[ks][4], B[ks][0], B[ks][1], acc)
             if tl == 0:
-                hx.lstore(sm + DRED + (KT * 128 + j * 16 + (l // 16) * 8) * 4,
+                hx.lstore(sm + DRED + (KT * 128 + (j0 + j) * 16 + (l // 16) * 8) * 4,
                           fx.Vector.from_elements([acc[jj] for jj in range(8)], F32), align=16)
-    gpu.barrier()
+    if fx.const_expr(H16):
+        hx.bar_all()
+    else:
+        hx.bar()
     if t < 64:   # 2 cols a thread: the 6 picks in order, then the shared row -> bf16 pair
         lo2 = [hx.lload(sm + DRED + (k * 128 + 2 * t) * 4, F32, 2) for k in range(KT + 1)]
         a0 = lo2[0][0]
@@ -1448,7 +1478,11 @@ def dn_row(c, s):
             a1 = a1 + lo2[k][1]
         wd = a0.to(BF16).bitcast(fx.Int16).to(I32) & 0xFFFF | (a1.to(BF16).bitcast(fx.Int16).to(I32) << 16)
         hx.lstore(sm + DRED + 7 * 512 + t * 4, wd)
-    gpu.barrier()
+    if fx.const_expr(H16):
+        if ws < 8:   # (the helpers are done: back to their park)
+            hx.bar()
+    else:
+        hx.bar()
 
 
 @ASTRewriter.transform
@@ -1530,12 +1564,12 @@ def shared_ug(c, j, TR):
         bq = fx.Vector.from_elements([parts[cc][e] for cc in range(4) for e in range(4)], I32)
         bs = hx.lload(sm + X8LS + rowx * (H // 32) + (ks0 + kk) * 4, I32)
         acc = [wmma_fp8(avec8(ra[q]), ra[q][4], bq, bs, acc[q]) for q in range(SHT_MAX)]
-    gpu.barrier()
+    hx.bar()
     for q in range_constexpr(SHT_MAX):
         ow = sm + O_RED8 + ((w * SHT_MAX + q) * 32 + l) * 32
         hx.lstore(ow, fx.Vector.from_elements([acc[q][i] for i in range(4)], F32), align=16)
         hx.lstore(ow + 16, fx.Vector.from_elements([acc[q][i] for i in range(4, 8)], F32), align=16)
-    gpu.barrier()
+    hx.bar()
     if (w < SHT_MAX) & (t0 + w < t1):
         tot = fx.Vector.filled(8, 0.0, F32)
         for ww in range(8):
@@ -1555,6 +1589,26 @@ def shared_ug(c, j, TR):
 
 
 PAL, PALW = 199168, 672             # (udir) LDS: a pick wave's MXFP8 MID row (fp8 [640], codes [20] at + 640), between SHAL and X8LO
+DFL = PAL + 6 * PALW                # (16-wave dn_row) LDS: a role's MID row in LDS, tagged (int [8])
+LTW = 1 << 20                       # its wait's s_sleep rounds cap (the main wave's own poll is bounded: POLL_TICKS)
+
+
+@ASTRewriter.transform
+def lds_tag_put(a, tag, l):
+    """(16-wave dn_row, the main wave) its LDS MID row written (this wave's LDS stores in order): the tag word at a."""
+    hx.fence_release("workgroup")
+    if l == 0:
+        hx.lstore(a, tag, scope="workgroup")
+
+
+@ASTRewriter.transform
+def lds_tag_wait(a, tag):
+    """(16-wave dn_row, the helper) wait for the main wave's LDS tag at a (LDS reads + s_sleep, no clock; bounded)."""
+    n = I32(0)
+    while (hx.lload(a, I32, scope="workgroup") != tag) & (n < I32(LTW)):
+        hx.s_sleep(1)
+        n = n + 1
+    hx.fence_acquire("workgroup")
 
 
 def mid_row(c, ui, p):
@@ -1642,7 +1696,7 @@ def x8_pub(c, r, lr=0):
     if t < 40:   # the 160 codes as 40 words
         hx.stx_dev(c["xs"] + i64(r * (H // 32) + t * 4), hx.lload(c["sm"] + X8LS + lr * (H // 32) + t * 4, I32))
     hx.wait_storecnt0()
-    gpu.barrier()
+    hx.bar()
     if t == 0:
         hx.put(c["xflag"] + i64(r) * 8, I32(0), c["xtag"])
 
@@ -1749,7 +1803,7 @@ def ug_union(c, i, TR):
         U = nr * NUG
     else:
         hx.wait_flags(c["xflag"], TR, c["xtag"], w, l, 10)
-        gpu.barrier()
+        hx.bar()
         nuni = ufl(hx.lload(sm + O_NUNI, I32))
         U = dn_nuni(c, nuni) * NUG
     u0 = (U * i) // (CTAS_R)
@@ -1798,7 +1852,7 @@ def ug_union(c, i, TR):
         if fx.const_expr(rd == 0 and not UD):
             if c["t"] < 4:   # the groups' arrival counters (rounds 0 / 1)
                 hx.lstore(sm + O_RED8 + 2048 + c["t"] * 4, I32(0))
-        gpu.barrier()
+        hx.bar()
         if (hx.unlikely(live) if rd == 1 else live):
             qq = w % 4
             b0 = w - qq

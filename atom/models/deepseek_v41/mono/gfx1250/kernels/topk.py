@@ -71,10 +71,10 @@ def block_excl_scan(v, lane, wave, buf):
     lane = hx.fresh(lane)
     wave = hx.fresh(wave)
     incl = wave_incl_scan(v, lane)
-    gpu.barrier()
+    hx.bar()
     if lane == 31:
         hx.lstore(buf + wave * 4, incl)
-    gpu.barrier()
+    hx.bar()
     before = I32(0)
     for w in range_constexpr(WAVES):
         cnt = hx.lload(buf + w * 4, I32)
@@ -127,7 +127,7 @@ def lds_topk(n, k, load, emit, sm, tid, ST=None):
             hx.lstore(hist + cz0 * 4, I32(0))
     for r in range_constexpr(NCP * 256 // THREADS):
         hx.lstore(hist8 + (hx.fresh(tid) + r * THREADS) * 4, I32(0))
-    gpu.barrier()
+    hx.bar()
     prefix = I32(0)
     mask = I32(0)
     need = I32(k)
@@ -150,14 +150,14 @@ def lds_topk(n, k, load, emit, sm, tid, ST=None):
                         keyp = kp4[e]
                         if (base + 4 * dq + e < n) & ((keyp & mask) == prefix):
                             hx.latomic_add_i32(hs + hcopy + ((keyp >> shift) & 255) * 4, I32(1))
-                gpu.barrier()
+                hx.bar()
                 tb_ = hx.fresh(tid)   # (thread t: bin t of the NCP copies -> merged, the copies zeroed for the next pass)
                 sm_ = I32(0)
                 for cp in range_constexpr(NCP):
                     sm_ = sm_ + hx.lload(hs + (cp * 256 + tb_) * 4, I32)
                     hx.lstore(hs + (cp * 256 + tb_) * 4, I32(0))
                 hx.lstore(merged + tb_ * 4, sm_)
-                gpu.barrier()
+                hx.bar()
                 v0 = hx.lload(merged + (248 - 8 * lp) * 4, I32, 4)
                 v1 = hx.lload(merged + (252 - 8 * lp) * 4, I32, 4)
                 cs = [v1[3], v1[2], v1[1], v1[0], v0[3], v0[2], v0[1], v0[0]]
@@ -198,7 +198,7 @@ def lds_topk(n, k, load, emit, sm, tid, ST=None):
     incl = wave_incl_scan(pv, lane)
     if lane == 31:
         hx.lstore(sbuf + wave * 4, incl)
-    gpu.barrier()
+    hx.bar()
     bw = I32(0)
     for wv in range_constexpr(WAVES):
         cw = hx.lload(sbuf + wv * 4, I32)
@@ -225,13 +225,13 @@ def lds_topk(n, k, load, emit, sm, tid, ST=None):
         posp = hx.fresh(tid) + THREADS * rp
         if (posp >= n_out) & (posp < k):
             hx.lstore(outs + posp * 8, fx.Vector.from_elements([I32(0), I32(-1)], I32))
-    gpu.barrier()
+    hx.bar()
     for re in range((I32(k) + (THREADS - 1)) // THREADS):
         pose = hx.fresh(tid) + THREADS * re
         if pose < k:
             ve = hx.lload(outs + pose * 8, I32, 2)
             emit(pose, ve[0], ve[1])
-    gpu.barrier()
+    hx.bar()
 
 
 SEG, KSEL, KBLK, NCAND, NLMAX = IP.SEG, IP.KSEL, IP.KBLK, IP.NCAND, IP.NLMAX
@@ -310,7 +310,7 @@ def seg_wait(cnt, nchunk, s0, ns, t):
             sg = s0 + s
             hx.wait_count(cnt + i64(sg) * 4, fx.min(fx.max(nchunk - sg * (SEG // 128), I32(0)), I32(SEG // 128)), 4, acq=False)
         hx.acquire_se()   # (one acquire for the segments' scores)
-    gpu.barrier()
+    hx.bar()
 
 
 @ASTRewriter.transform
@@ -340,7 +340,7 @@ def stage_select_any(c, lev, nlev, mode):
         hx.lstore(orb + t * 4, bdt)
         hx.lstore(orb + (64 + t) * 4, qt)
         hx.lstore(orb + (128 + t) * 4, nnt)
-    gpu.barrier()
+    hx.bar()
     # the rows' inclusive task prefix (rows lane and lane + 32, TR <= 64) in every wave's lanes: no serial LDS walks
     ln = hx.fresh(t) % 32
     c0 = hx.lload(ocnt + fx.min(ln, I32(TR - 1)) * 4, I32)
@@ -419,14 +419,14 @@ def _radix_count(sm, t, rowp, i0, i1, pre, msk, shift):
     lane = t % 32
     for z in range_constexpr(RC_NCP):
         hx.lstore(sm + O_RCH + (z * 256 + t) * 4, I32(0))
-    gpu.barrier()
+    hx.bar()
     hc = sm + O_RCH + (lane % RC_NCP) * 1024
     for i in range(i0 + t, i1, 256 * RC_U):
         ks = [order_key(hx.gload(rowp + i64(fx.min(i + 256 * u, i1 - 1)) * 4, I32)) for u in range(RC_U)]
         for u in range_constexpr(RC_U):
             if ((ks[u] & msk) == pre) & (i + 256 * u < i1):
                 hx.latomic_add_i32(hc + ((ks[u] >> shift) & 255) * 4, I32(1))
-    gpu.barrier()
+    hx.bar()
     v = I32(0)
     for z in range_constexpr(RC_NCP):
         v = v + hx.lload(sm + O_RCH + (z * 256 + t) * 4, I32)
@@ -459,7 +459,7 @@ def select_mc(c, hb, ctr, isrx, G, anc=None, x0=None):
             if isrx:
                 bd = fx.max(rx_context(c, r, bd0), I32(0))
             hx.lstore(sm + O_MC, fx.Vector.from_elements([I32(0), I32(0), k, bd], I32))
-        gpu.barrier()
+        hx.bar()
         n = hx.lload(sm + O_MC + 12, I32)
         CH = (n + (G - 1)) // G
         i0 = g * CH
@@ -475,11 +475,11 @@ def select_mc(c, hb, ctr, isrx, G, anc=None, x0=None):
                     if v != 0:
                         hx.atomic_add(hb + i64(((p * MC_ROWS + r) * 256 + t) * 4), v)
                     hx.wait_storecnt0()   # (every wave its bin atomics done: the count needs no release fence)
-                    gpu.barrier()
+                    hx.bar()
                     if t == 0:
                         hx.atomic_add(ctr + i64((r * 8 + 2 + p) * 4), 1)
                         hx.wait_count(ctr + i64((r * 8 + 2 + p) * 4), G, 8, acq=False)   # (the bins / counts below: agent-scope loads)
-                    gpu.barrier()
+                    hx.bar()
                     if t < 32:   # wave 0: the bin of the k-th key (lds_topk's scan, over the global bins)
                         # (agent-scope loads, no acquire fence: the bins are device-scope atomics, read once a layer, so
                         # loads at their scope see them -- as wait_count's see the count; the fence's cache invalidate
@@ -503,7 +503,7 @@ def select_mc(c, hb, ctr, isrx, G, anc=None, x0=None):
                             hx.lstore(sm + O_MC, fx.Vector.from_elements(
                                 [st4[0] | (((found >> 16) & 255) << shift), st4[1] | (I32(255) << shift), found & 0xFFFF,
                                  (done != 0).select(n | I32(INT_MIN), n)], I32))
-                    gpu.barrier()
+                    hx.bar()
         st4 = hx.lload(sm + O_MC, I32, 4)
         q = fx.max(hx.gload(c["ibat"] + i64(r) * 4, I32), I32(0))
         for i in range(i0 + t, i1, 256):
@@ -551,7 +551,7 @@ def select_ord(c, hb, ctr, oc, r, g, G, n, k, vals, vstride, mode, q, ordered=Tr
     rowp = vals + i64(r) * i64(vstride) * 4
     if t == 0:
         hx.lstore(sm + O_MC, fx.Vector.from_elements([I32(0), I32(0), I32(k), n], I32))
-    gpu.barrier()
+    hx.bar()
     if n > I32(k):
         for p in range(4):
             if hx.lload(sm + O_MC + 12, I32) >= 0:
@@ -561,11 +561,11 @@ def select_ord(c, hb, ctr, oc, r, g, G, n, k, vals, vstride, mode, q, ordered=Tr
                 if v != 0:
                     hx.atomic_add(hb + i64(((p * MC_ROWS + r) * 256 + t) * 4), v)
                 hx.wait_storecnt0()
-                gpu.barrier()
+                hx.bar()
                 if t == 0:
                     hx.atomic_add(ctr + i64((r * 8 + 2 + p) * 4), 1)
                     hx.wait_count(ctr + i64((r * 8 + 2 + p) * 4), G, 8, acq=False)   # (the bins / counts below: agent-scope loads)
-                gpu.barrier()
+                hx.bar()
                 if t < 32:
                     cs = [hx.gload(hb + i64(((p * MC_ROWS + r) * 256 + 255 - 8 * lane - qq) * 4), I32, scope="agent") for qq in range(8)]
                     s4 = cs[0]
@@ -586,7 +586,7 @@ def select_ord(c, hb, ctr, oc, r, g, G, n, k, vals, vstride, mode, q, ordered=Tr
                         hx.lstore(sm + O_MC, fx.Vector.from_elements(
                             [st4[0] | (((found >> 16) & 255) << shift), st4[1] | (I32(255) << shift), found & 0xFFFF,
                              (done != 0).select(n | I32(INT_MIN), n)], I32))
-                gpu.barrier()
+                hx.bar()
     st4 = hx.lload(sm + O_MC, I32, 4)
     big = n > I32(k)
     need = st4[2]
@@ -625,14 +625,14 @@ def select_ord(c, hb, ctr, oc, r, g, G, n, k, vals, vstride, mode, q, ordered=Tr
         ex = block_excl_scan(pk, lane, wv, ob)
         if t == 255:
             hx.lstore(ob + 128, ex + pk)
-        gpu.barrier()
+        hx.bar()
         tot = hx.lload(ob + 128, I32)
         if t == 0:
             c["stx"](oc + i64((r * 64 + g) * 8), fx.Vector.from_elements([tot >> 16, tot & 0xFFFF], I32))
             hx.wait_storecnt0()
             hx.atomic_add(oc + i64(MC_ROWS * OC_ROW + r * 4), 1)
             hx.wait_count(oc + i64(MC_ROWS * OC_ROW + r * 4), G, 8, acq=False)   # (the bins / counts below: agent-scope loads)
-        gpu.barrier()
+        hx.bar()
         if t < 32:   # the group's counts before this CTA (G <= 64: lanes l, l + 32)
             pa = hx.gload(oc + i64((r * 64 + fx.min(lane, I32(G - 1))) * 8), fx.Int64, scope="agent")   # (above | ties << 32)
             pb = hx.gload(oc + i64((r * 64 + fx.min(lane + 32, I32(G - 1))) * 8), fx.Int64, scope="agent")
@@ -643,7 +643,7 @@ def select_ord(c, hb, ctr, oc, r, g, G, n, k, vals, vstride, mode, q, ordered=Tr
                 t0 = t0 + t0.shuffle_xor(off, 32)
             if lane == 0:
                 hx.lstore(ob + 136, fx.Vector.from_elements([a0, t0], I32))
-        gpu.barrier()
+        hx.bar()
         base = hx.lload(ob + 136, I32, 2)
         cA = base[0] + (ex >> 16)
         cT = base[1] + (ex & 0xFFFF)
@@ -749,7 +749,7 @@ def select_ma_prep(c, G, kp):
         if t == 0:
             hx.lstore(sm + O_MAP, fx.Vector.from_elements([n, lo.bitcast(I32), I32(0), I32(0)], I32))
         hx.lstore(sm + O_MAP + 16 + t * 16, fx.Vector.from_elements([ra, pa, rb, pb], I32))
-    gpu.barrier()   # (select_ma reads thread 0's n / lo)
+    hx.bar()   # (select_ma reads thread 0's n / lo)
 
 
 @ASTRewriter.transform
@@ -782,7 +782,7 @@ def select_ma(c, hb, ctr, G, ma, kp):
         xb = hx.gload(rowp + i64(fx.max(fx.min(ib, n - 1), I32(0))) * 4, I32)
         lad = ma + i64(r * 256) * 4
         hx.lstore(sm + O_MCH + t * 4, I32(0))
-        gpu.barrier()
+        hx.bar()
         ba = _ma_bin(xa, lo, inv)
         bb = _ma_bin(xb, lo, inv)
         junk = I32(O_MAL // 4 + 32) + lane
@@ -794,16 +794,16 @@ def select_ma(c, hb, ctr, G, ma, kp):
             hx.latomic_add_i32(sm + O_MCH, nz)
         hx.latomic_add_i32(sm + (va & (za == (I32(0) != I32(0)))).select(I32(O_MCH // 4) + ba, junk) * 4, I32(1))
         hx.latomic_add_i32(sm + (vb & (zb == (I32(0) != I32(0)))).select(I32(O_MCH // 4) + bb, junk) * 4, I32(1))
-        gpu.barrier()
+        hx.bar()
         v = hx.lload(sm + O_MCH + t * 4, I32)
         if v != 0:
             hx.atomic_add(lad + i64(t) * 4, v)
         hx.wait_storecnt0()
-        gpu.barrier()
+        hx.bar()
         if t == 0:
             hx.atomic_add(ctr + i64((r * 8 + 6) * 4), 1)
             hx.wait_count(ctr + i64((r * 8 + 6) * 4), G, 8, acq=False)   # (the bins / counts below: agent-scope loads)
-        gpu.barrier()
+        hx.bar()
         if t < 32:   # wave 0: the bin of the 512-th key (select_mc's scan)
             cs = [hx.gload(lad + i64(255 - 8 * lane - qq) * 4, I32, scope="agent") for qq in range(8)]
             s4 = cs[0]
@@ -821,7 +821,7 @@ def select_ma(c, hb, ctr, G, ma, kp):
             mb = wave_max(mb)
             if lane == 0:
                 hx.lstore(sm + O_MC, fx.Vector.from_elements([found >> 16, mb, found & 0xFFFF, n], I32))
-        gpu.barrier()
+        hx.bar()
         st4 = hx.lload(sm + O_MC, I32, 4)
         j = st4[0]
         need = st4[2]
@@ -836,7 +836,7 @@ def select_ma(c, hb, ctr, G, ma, kp):
             if lane == 0:   # the wave's winners / j-bin counts -> LDS
                 hx.lstore(sm + O_MAL + wave * 8, fx.Vector.from_elements(
                     [_popc(bw[0]) + _popc(bw[1]), _popc(bw[2]) + _popc(bw[3])], I32))
-            gpu.barrier()
+            hx.bar()
             wpre = I32(0)
             mpre = I32(0)
             wtot = I32(0)
@@ -851,7 +851,7 @@ def select_ma(c, hb, ctr, G, ma, kp):
                 hx.lstore(sm + O_MAL + 64, hx.atomic_add(ctr + i64(r * 32), wtot | (mtot << 16)))
                 if g == 0:
                     hx.gstore(kp + i64(MA_KANC) + i64(r) * 4, lo + (j.to(F32) - F32(0.5)) / inv)
-            gpu.barrier()
+            hx.bar()
             bs = hx.lload(sm + O_MAL + 64, I32)
             wb0 = bs & 0xFFFF
             mb0 = (bs >> 16) & 0xFFFF
@@ -865,7 +865,7 @@ def select_ma(c, hb, ctr, G, ma, kp):
                 _ma_put(c, r, k - need + m0, lf[0], lf[1])
             if mb_ & (m1 < need):
                 _ma_put(c, r, k - need + m1, lf[2], lf[3])
-        gpu.barrier()   # (select_mc rewrites O_MC when this returns 0)
+        hx.bar()   # (select_mc rewrites O_MC when this returns 0)
     return done
 
 
@@ -882,7 +882,7 @@ def rank_desc(sm, off, t, n, key, col):
     lo32 = fx.Int64(0xFFFFFFFF)
     p = (((i64(key) & lo32) << fx.Int64(32)) | (i64(~col) & lo32)) ^ fx.Int64(INT64_MIN)
     hx.lstore(sm + off + t * 8, (t < n).select(p, fx.Int64(INT64_MIN)))
-    gpu.barrier()
+    hx.bar()
     beats = I32(0)
     for u in range(0, (n + 7) // 8 * 8, 8):
         for h in range_constexpr(4):
@@ -915,7 +915,7 @@ def select_mf(c, ctr, G, mf, kp):
             hx.lstore(sm + O_MC, fx.Vector.from_elements([I32(0), I32(0), k, fx.max(bd0, I32(0))], I32))
             hx.lstore(sm + O_MAL + 72, fx.Vector.from_elements([I32(0), I32(0)], I32))
         hx.lstore(sm + O_MCH + t * 4, I32(0))
-        gpu.barrier()
+        hx.bar()
         n = hx.lload(sm + O_MC + 12, I32)
         CH = (n + (G - 1)) // G
         i0 = g * CH
@@ -939,17 +939,17 @@ def select_mf(c, ctr, G, mf, kp):
                         hx.latomic_add_i32(sm + O_MCH, _popc(bz))
                     if okk & (bn != I32(0)):
                         hx.latomic_add_i32(sm + O_MCH + bn * 4, I32(1))
-            gpu.barrier()
+            hx.bar()
             lad = mf + i64(r * 256) * 4
             hv = hx.lload(sm + O_MCH + t * 4, I32)   # (kept: this CTA's count of bin t)
             if hv != 0:
                 hx.atomic_add(lad + i64(t) * 4, hv)
             hx.wait_storecnt0()
-            gpu.barrier()
+            hx.bar()
             if t == 0:
                 hx.atomic_add(ctr + i64((r * 8 + 6) * 4), 1)
                 hx.wait_count(ctr + i64((r * 8 + 6) * 4), G, 8, acq=False)   # (the bins below: agent-scope loads)
-            gpu.barrier()
+            hx.bar()
             if t < 32:   # wave 0: the bin of the 512-th key (select_ma's scan)
                 cs = [hx.gload(lad + i64(255 - 8 * lane - qq) * 4, I32, scope="agent") for qq in range(8)]
                 s4 = cs[0]
@@ -967,7 +967,7 @@ def select_mf(c, ctr, G, mf, kp):
                 mb = wave_max(mb)
                 if lane == 0:
                     hx.lstore(sm + O_MC, fx.Vector.from_elements([found >> 16, mb, found & 0xFFFF, n], I32))
-            gpu.barrier()
+            hx.bar()
             st4 = hx.lload(sm + O_MC, I32, 4)
             j = st4[0]
             nb = st4[1]
@@ -979,7 +979,7 @@ def select_mf(c, ctr, G, mf, kp):
                 ms = wave_incl_scan((t == j).select(hv, I32(0)), lane)
                 if lane == 31:
                     hx.lstore(sm + O_MAL + wave * 8, fx.Vector.from_elements([ws, ms], I32))
-                gpu.barrier()
+                hx.bar()
                 if t == 0:
                     wtot = I32(0)
                     mtot = I32(0)
@@ -988,7 +988,7 @@ def select_mf(c, ctr, G, mf, kp):
                         wtot = wtot + pr[0]
                         mtot = mtot + pr[1]
                     hx.lstore(sm + O_MAL + 64, hx.atomic_add(ctr + i64(r * 32), wtot | (mtot << 16)))
-                gpu.barrier()
+                hx.bar()
                 bs = hx.lload(sm + O_MAL + 64, I32)
                 wb0 = bs & 0xFFFF
                 mb0 = (bs >> 16) & 0xFFFF
@@ -1022,13 +1022,13 @@ def select_mf(c, ctr, G, mf, kp):
                     if ism:
                         hx.gstore(lst + i64(mb0 + mbase + _ma_mbcnt(bm)) * 8, fx.Vector.from_elements([x, i], I32))
                 hx.wait_storecnt0()
-                gpu.barrier()
+                hx.bar()
                 if t == 0:
                     hx.atomic_add(ctr + i64((r * 8 + 7) * 4), 1)
                 if g == 0:   # the group's CTA 0: the bin's keys, ranked
                     if t == 0:
                         hx.wait_count(ctr + i64((r * 8 + 7) * 4), G, 8, acq=False)   # (the list: agent-scope loads)
-                    gpu.barrier()
+                    hx.bar()
                     ea = lst + i64(fx.min(t, nb - 1)) * 8
                     ex = hx.gload(ea, I32, scope="agent")
                     ec = hx.gload(ea + 4, I32, scope="agent")
@@ -1039,5 +1039,5 @@ def select_mf(c, ctr, G, mf, kp):
                                       c["lvl"], k - need + beats, I32(0), ec)
                         if beats == need - 1:   # the 512-th: the row's next anchor
                             hx.gstore(kp + i64(MF_KANC) + i64(r) * 4, ex.bitcast(F32))
-        gpu.barrier()   # (select_mc rewrites O_MC when this returns 0)
+        hx.bar()   # (select_mc rewrites O_MC when this returns 0)
     return done

@@ -69,12 +69,12 @@ def head_once_r(x, wb, out, t, l, w, sm, b, D, TW, NPH):
             hx.async_to_lds_b128(x + (i64(row) * HID + i64(part * (HID // TW) + ph * CK + pc * 8)) * 2,
                                  sm + (ph % 2) * BUF + part * SUB + row * XS + pc * 16)
 
-    gpu.barrier()
+    hx.bar()
     stage(0)
     A = [[hx.gload(wt[i] + i64(s * 1024), BF16, 16, nt=True) for s in range(D)] for i in range(TW)]
     for ph in range(NPH):
         hx.wait_asynccnt0()
-        gpu.barrier()
+        hx.bar()
         if ph + 1 < NPH:
             stage(ph + 1)
         xb = sm + (ph % 2) * BUF + kq * SUB
@@ -96,12 +96,12 @@ def head_once_r(x, wb, out, t, l, w, sm, b, D, TW, NPH):
                     hx.gstore(out + (i64(n * 16 + l % 16) * VR + i64(tiles[0] * 16 + (l // 16) * 8 + e)) * 4, acc[0][n][e])
     else:
         # partials of the group through LDS: slot [tile i][kq][n][lane] vec8 f32; wave kq reduces tile kq
-        gpu.barrier()
+        hx.bar()
         gbase = sm + grp * (TW * TW * 3 * 32 * 32)
         for i in range_constexpr(TW):
             for n in range_constexpr(NN):
                 hx.lstore(gbase + (((i * TW + kq) * 3 + n) * 32 + l) * 32, acc[i][n])
-        gpu.barrier()
+        hx.bar()
         tile = b * 8 + grp * TW + kq
         if tile < NT:
             for n in range_constexpr(NN):

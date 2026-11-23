@@ -259,7 +259,7 @@ def stage_A(c):
                     # (seam) x8 / xs written by the TP2 owners themselves (ffn_post_owner, un-normalized): this K half's
                     # 80 owners' apflags, no publisher hop
                     hx.wait_flags(c["apflag"] + i64(kh * 80) * 8, 80, c["aptag"], w, l, 9, backoff=True)
-                    gpu.barrier()
+                    hx.bar()
             if fx.const_expr(NEWA and not PUB):   # (v2) x1 from the TP2 column owners: wait for them, each row's rstd from 256 partials
                 if c["newA"]:
                     # every load in one round: nw (weights) before the wait; after it the x1 blocks and the 256 partials
@@ -271,7 +271,7 @@ def stage_A(c):
                     else:
                         if t == 0:   # (the poll first: a load issued before it would hold the poll until it lands)
                             hx.wait_count(c["attpost"], 160, 9)
-                    gpu.barrier()
+                    hx.bar()
                     nv2 = [[hx.gload(c["anw"] + i64(cols[it] + 8 * h) * 2, BF16, 8, align=16) for h in range(4)] for it in range(NB)]
                     xv2 = [[hx.gload(c["x1a"] + i64((blks[it] // 80) * HID + cols[it] + 8 * h) * 2, BF16, 8, align=16) for h in range(4)] for it in range(NB)]
                     wr = fx.min(w, I32(TR - 1))
@@ -284,7 +284,7 @@ def stage_A(c):
                             sq = sq + sq.shuffle_xor(16 >> o, 32)
                         if l == 0:
                             hx.lstore(sm + 8192 + w * 4, rsq(sq * F32(1.0 / HID) + F32(c["norm_eps"])))
-                    gpu.barrier()
+                    hx.bar()
                     # this CTA's K half of x8 (TR rows x 80 blocks of 32) quantized once into LDS (front_C's arithmetic):
                     # few registers, then the GEMV reads its A operands from LDS
                     for it in range_constexpr(NB):
@@ -309,7 +309,7 @@ def stage_A(c):
                                     for h in range_constexpr(4):
                                         c["stx"](c["axn"] + i64(rr * HID + col + 8 * h) * 2,
                                                  fx.Vector.from_elements([nb[8 * h + e] for e in range(8)], BF16))
-                    gpu.barrier()
+                    hx.bar()
             if w < 5:
                 kk0 = kh * 20 + w * 4
                 arow = c["x8"] + i64(fx.min(l % 16, I32(c["TR"] - 1))) * HID   # (rows past TR: the last row again, cached)
@@ -343,7 +343,7 @@ def stage_A(c):
                 else:
                     acc = mx_loop(4, fa, lambda i: preB[i])
                 hx.lstore(sm + ((w * 32 + l) * 8) * 4, acc)
-            gpu.barrier()
+            hx.bar()
             if w == 0:
                 tot = hx.lload(sm + (l * 8) * 4, F32, 8)
                 for ww in range_constexpr(1, 5):
@@ -369,7 +369,7 @@ def stage_A(c):
 
                 acc = mx_loop(10, fa, fb)
                 hx.lstore(sm + ((w * 32 + l) * 8) * 4, acc)
-                gpu.barrier()
+                hx.bar()
                 if (w < 3) & (w < MT):
                     r0v = hx.lload(sm + ((w * 32 + l) * 8) * 4, F32, 8)
                     r1v = hx.lload(sm + (((w + 3) * 32 + l) * 8) * 4, F32, 8)
@@ -377,7 +377,7 @@ def stage_A(c):
                         v = r0v[i] + r1v[i]
                         hx.gstore(c["qkv_part"] + i64((kh * T + mi * 16 + (l // 16) * 8 + i) * NQKV + n0 + l % 16) * 4, v)
             else:
-                gpu.barrier()
+                hx.bar()
     cluster_sync()
     if (b < 224) & (b % 4 == 0):
         # (a 32-col block's 4 threads a row are adjacent lanes of one wave: the row's sum of squares ((x0 + x1) + x2) + x3
@@ -418,7 +418,7 @@ def stage_A(c):
             hx.atomic_fadd(c["ss"] + i64((c0 < QL).select(I32(0), I32(T)) + r) * 4, rsum)
         if fx.const_expr("a2flag" in c):   # (v3 e3) this 32-col block's q / kv (+ its ss share) out: one LL flag
             hx.wait_storecnt0()
-            gpu.barrier()
+            hx.bar()
             if t == 0:
                 hx.put(c["a2flag"] + i64(b // 4) * 8, I32(0), c["a2tag"])
 
@@ -436,7 +436,7 @@ def stage_Apub(c):
         col = bc * 32
         nv = [hx.gload(c["anw"] + i64(col + 8 * h) * 2, BF16, 8, align=16) for h in range(4)]
         hx.wait_flags(c["apflag"], 160, c["aptag"], w, l, 9, backoff=True)
-        gpu.barrier()
+        hx.bar()
         xv = [hx.gload(c["x1a"] + i64(rr * HID + col + 8 * h) * 2, BF16, 8, align=16) for h in range(4)]
         wr = fx.min(w, I32(TR - 1))
         pv = [hx.gload(c["part2"] + i64(((l + 32 * kq) * 8 + wr) * 32 + 25) * 4, F32) for kq in range(5)]
@@ -448,7 +448,7 @@ def stage_Apub(c):
                 sq = sq + sq.shuffle_xor(16 >> o, 32)
             if l == 0:
                 hx.lstore(sm + 8192 + w * 4, rsq(sq * F32(1.0 / HID) + F32(c["norm_eps"])))
-        gpu.barrier()
+        hx.bar()
         if t < TR * 5:
             rsr = hx.lload(sm + 8192 + rr * 4, F32)
             nb = [bf((xv[h][e].to(F32) * rsr) * nv[h][e].to(F32)) for h in range(4) for e in range(8)]
@@ -465,7 +465,7 @@ def stage_Apub(c):
             for h in range_constexpr(4):
                 c["stx"](c["axn"] + i64(rr * HID + col + 8 * h) * 2, fx.Vector.from_elements([nb[8 * h + e] for e in range(8)], BF16))
         hx.wait_storecnt0()
-        gpu.barrier()
+        hx.bar()
         if t == 0:
             hx.put(c["pubflag"] + i64(p) * 8, I32(0), c["pubtag"])
 
@@ -497,7 +497,7 @@ def stage_kv(c):
     if fx.const_expr("a2flag" in c):   # (v3 e3) the kv blocks of A2 (and their ss share)
         if kvc & (t < 32):
             hx.get(c["a2flag"] + i64(QL // 32 + fx.min(t, I32(NQKV // 32 - QL // 32 - 1))) * 8, c["a2tag"], 8)
-        gpu.barrier()
+        hx.bar()
     if kvc:
         for it in range_constexpr((4 * (KVD // 8) + THREADS - 1) // THREADS):
             i = t + it * THREADS
@@ -548,7 +548,7 @@ def stage_kv(c):
     if fx.const_expr("a2flag" in c):   # (v3 e4) this CTA's kv ring rows out
         if kvc:
             hx.wait_storecnt0()
-            gpu.barrier()
+            hx.bar()
             if t == 0:
                 hx.put(c["kvflag"] + i64(kb) * 8, I32(0), c["kvtag"])
 
@@ -601,7 +601,7 @@ def stage_C(c):
     mi_p = fx.min(w % 3, I32(MT - 1))
     if fx.const_expr("a2flag" in c):   # (v3 e3) the q blocks of A2 (wave 0: 2 flags a lane)
         hx.wait_flags(c["a2flag"], QL // 32, c["a2tag"], w, l, 8)
-        gpu.barrier()
+        hx.bar()
     # the rows' sums of squares (complete once every A2 flag is in): issued before the GEMV, used after it
     ssv = [hx.gload(c["ss"] + i64(mi_p * 16 + (l // 16) * 8 + i) * 4, F32) for i in range(8)]
     if fx.const_expr(MT == 1 and C_WIDE):
@@ -621,7 +621,7 @@ def stage_C(c):
 
         accq = mx_loop(CQ_STEPS, faq, lambda i: preQ[i])
         hx.lstore(c["sm"] + ((w * 32 + l) * 8) * 4, accq)
-        gpu.barrier()
+        hx.bar()
     if (w < 6) & (w % 3 < MT):
         j = w // 3
         mi = w % 3
@@ -659,7 +659,7 @@ def stage_C(c):
             c["stx"](c["q"] + i64((mi * 16 + (l // 16) * 8 + i) * NQ + n0 + l % 16) * 2, res[i].to(BF16))
     if fx.const_expr("a2flag" in c):   # (v3 e4) this CTA's two q tiles out
         hx.wait_storecnt0()
-        gpu.barrier()
+        hx.bar()
         if t == 0:
             hx.put(c["cflag"] + i64(b) * 8, I32(0), c["ctag"])
 
@@ -814,7 +814,7 @@ def stage_D(c):
     if fx.const_expr("cflag" in c):   # (v3 e4) the kv ring rows first: the key rows load while C still runs
         if cl < (TR + RPC - 1) // RPC:
             hx.wait_flags(c["kvflag"], (TR + 3) // 4, c["kvtag"], w, l, 8)
-            gpu.barrier()
+            hx.bar()
     if cl < (TR + RPC - 1) // RPC:
         _kg_rows(c, t, r0, jj, sm, o, RPC, TR)
         # the merge's RoPE cos / sin (last 64 dims; position -> table row: two dependent loads) fetched now, used at the end
@@ -825,7 +825,7 @@ def stage_D(c):
         rpp = hx.gload(c["rpos"] + i64(rrow) * 8, fx.Int64)
         rcv = hx.gload(c["rcos"] + (rpp * 32 + i64(rf0 + 2 * (t % 8))) * 2, BF16, 2)   # this lane's 2 pairs
         rsv = hx.gload(c["rsin"] + (rpp * 32 + i64(rf0 + 2 * (t % 8))) * 2, BF16, 2)   # this lane's 2 pairs
-        gpu.barrier()
+        hx.bar()
         _dstamp(c, 1, t0s)
         if fx.const_expr(kv_fp4_of(c)):   # FP4 KV: the raw key rows staged by async copies (decoded below)
             for rr in range_constexpr(RPC):
@@ -853,18 +853,18 @@ def stage_D(c):
         _dstamp(c, 2, t0s)
         if fx.const_expr(kv_fp4_of(c)):   # FP4 KV: the staged key rows -> BF16 key rows, while C still runs
             hx.wait_asynccnt0()
-            gpu.barrier()
+            hx.bar()
             _dstamp(c, 3, t0s)
             for rr in range_constexpr(RPC):
                 _kg_decode(c, t, sm, o, rr)
         if fx.const_expr("cflag" in c):   # every C CTA's q tiles: only the q copies wait for them (not where dwait is False)
             if fx.const_expr(not dw):
                 hx.wait_flags(c["cflag"], CTAS, c["ctag"], w, l, 8)
-                gpu.barrier()
+                hx.bar()
             else:
                 if hx.likely(dwv):
                     hx.wait_flags(c["cflag"], CTAS, c["ctag"], w, l, 8)
-                    gpu.barrier()
+                    hx.bar()
         _dstamp(c, 4, t0s)
         for it in range(QV * HD // 8 // THREADS):
             i = t + it * THREADS
@@ -877,7 +877,7 @@ def stage_D(c):
                                  sm + o["q"] + (qv * HP + cc * 8) * 2, 0)
         pp = c["apart"] + i64(b * QV * HD) * 2
         hx.wait_asynccnt0()
-        gpu.barrier()
+        hx.bar()
         _dstamp(c, 5, t0s)
         for tt in range(hx.opaque_s(I32(2))):   # (opaque trip count: kept a loop)
             tile = w + tt * 8
@@ -892,7 +892,7 @@ def stage_D(c):
                     acc = hx.wmma_bf16(av, bv, acc)
                 for i in range_constexpr(8):
                     hx.lstore(sm + o["s"] + ((mi * H + (l // 16) * 8 + i) * 48 + ni * 16 + l % 16) * 4, acc[i] * c["scale"])
-        gpu.barrier()
+        hx.bar()
         sg = t % 5
         a5 = t < QV * 5
         sq = fx.min(t // 5, I32(QV - 1))
@@ -906,7 +906,7 @@ def stage_D(c):
             mloc = fx.max(mloc, sv[e])
         if a5:
             hx.lstore(sm + o["red"] + (sq * 5 + sg) * 4, mloc)
-        gpu.barrier()
+        hx.bar()
         if a5:
             m = hx.lload(sm + o["red"] + sq * 5 * 4, F32)
             for g in range_constexpr(1, 5):
@@ -924,7 +924,7 @@ def stage_D(c):
                 hx.lstore(sm + o["p"] + (sq * KP + 56) * 2, z)
                 hx.lstore(sm + o["m"] + sq * 4, m)
             hx.lstore(sm + o["red2"] + (sq * 5 + sg) * 4, ssum)
-        gpu.barrier()
+        hx.bar()
         if t < QV:
             s5 = F32(0.0)
             for g in range_constexpr(5):
@@ -961,14 +961,14 @@ def stage_D(c):
                 else:
                     hx.gstore(pp + i64((nd * 16 + l % 16) * QV + rr * H + (l // 16) * 8) * 2,
                               fx.Vector.from_elements([acc[i].to(BF16) for i in range(8)], BF16))
-        gpu.barrier()
+        hx.bar()
         _dstamp(c, 6, t0s)
         if t < QV:
             hx.gstore(c["aml"] + i64(b * QV * 2 + t * 2) * 4, hx.lload(sm + o["m"] + t * 4, F32))
             hx.gstore(c["aml"] + i64(b * QV * 2 + t * 2 + 1) * 4, hx.lload(sm + o["l"] + t * 4, F32))
         if fx.const_expr("a1flag" in c):   # (design 8: A1) the partials out: one LL flag; the merge runs on the A2 CTAs
             hx.wait_storecnt0()
-            gpu.barrier()
+            hx.bar()
             if t == 0:
                 hx.put(c["a1flag"] + i64(cl * CL + jj) * 8, I32(0), c["a1tag"])
         else:
@@ -1037,7 +1037,7 @@ def _d_merge(c, cl, jj, rcv, rsv):
                 hx.lstore(sm + o["wgt"] + (t * WG + p) * 4, f)
                 den = den + lp[p] * f
             hx.lstore(sm + o["wgt"] + (t * WG + CL) * 4, F32(1.0) / den)
-        gpu.barrier()
+        hx.bar()
         if t < NG8:
             for e in range_constexpr(QW):
                 qv = q08 + e
@@ -1046,7 +1046,7 @@ def _d_merge(c, cl, jj, rcv, rsv):
                 for p in range_constexpr(CL):
                     num = num + pv8[p][e].to(F32) * wq[p // 4][p % 4]
                 hx.lstore(ob + (qv * 32 + dd8) * 4, (num * hx.lload(sm + o["wgt"] + (qv * WG + CL) * 4, F32)).to(BF16).to(F32))
-        gpu.barrier()
+        hx.bar()
     # RoPE (the last 64 dims) and MXFP8 of each qv's 32 dims in registers: 8 lanes a qv (4 dims = 2 RoPE pairs each; the
     # block amax over the 8 lanes by xor shuffles -- the same values / code / words as one thread's 32: bit-identical)
     assert QV * 8 <= THREADS
@@ -1077,7 +1077,7 @@ def _d_merge(c, cl, jj, rcv, rsv):
         c["stx"](c["o8"] + i64(row * NQ + (qm % H) * HD + jj * 32 + pq * 4), word)
     if fx.const_expr("dflag" in c):   # (v3 e6) this (row cluster, key segment)'s o8 / os out: one LL flag
         hx.wait_storecnt0()
-        gpu.barrier()
+        hx.bar()
         if t == 0:
             hx.put(c["dflag"] + i64(cl * CL + jj) * 8, I32(0), c["dtag"])
 
@@ -1101,7 +1101,7 @@ def stage_D2(c):
         rcv = hx.gload(c["rcos"] + (rpp * 32 + i64(rf0 + 2 * (t % 8))) * 2, BF16, 2)   # this lane's 2 pairs
         rsv = hx.gload(c["rsin"] + (rpp * 32 + i64(rf0 + 2 * (t % 8))) * 2, BF16, 2)   # this lane's 2 pairs
         hx.wait_flags(c["a1flag"] + i64(cl * CL) * 8, CL, c["a1tag"], w, l, 8)
-        gpu.barrier()
+        hx.bar()
         _d_merge(c, cl, jj, rcv, rsv)
 
 
@@ -1116,7 +1116,7 @@ def stage_E(c):
     if fx.const_expr("dflag" in c):   # (v3 e6) every (row cluster, key segment) of D: wave 0, lanes poll 3 flags each
         NDF = ((TR + c["RPC"] - 1) // c["RPC"]) * CL
         hx.wait_flags(c["dflag"], NDF, c["dtag"], w, l, 8)
-        gpu.barrier()
+        hx.bar()
     if (w < 6) & (w % 3 < MT):
         jt = w // 3
         mi = w % 3
@@ -1148,7 +1148,7 @@ def stage_E(c):
             v1 = v1 + hx.gload(ypq + i64(4), F32)
         hx.lstore(sm + ((t // 16) * 32 + cp) * 4, v0.to(BF16).to(F32))
         hx.lstore(sm + ((t // 16) * 32 + cp + 1) * 4, v1.to(BF16).to(F32))
-    gpu.barrier()
+    hx.bar()
     if (t < 12) & (kq * 12 + t < TR):
         r = kq * 12 + t
         vq = [hx.lload(sm + (t * 32 + 4 * k) * 4, F32, 4) for k in range(8)]
@@ -1165,7 +1165,7 @@ def stage_E(c):
         c["stx"](yb + i64(16), fx.Vector.from_elements(words[4:], I32))
     if fx.const_expr("eflag" in c):   # (v3 e7) this (col group, K quarter)'s y8 rows out: one LL flag
         hx.wait_storecnt0()
-        gpu.barrier()
+        hx.bar()
         if t == 0:
             hx.put(c["eflag"] + i64(b) * 8, I32(0), c["etag"])
 
@@ -1181,7 +1181,7 @@ def stage_F_cluster(c):
     op = c["opart"] + i64(b * T * 80) * 4
     if fx.const_expr("eflag" in c):   # (v3 e7) y8 cols 512 kq .. + 511: wo_a CTAs (cgp, q) with cgp in 16 kq .. 16 kq + 15
         hx.wait_flags(c["eflag"] + i64(kq * 64) * 8, 64, c["etag"], w, l, 8)   # (cgp, q) = 4 cgp + q: 64 consecutive flags
-        gpu.barrier()
+        hx.bar()
     for pp_ in range_constexpr(2):
         pr = w + pp_ * 8
         nt = pr // 3
@@ -1309,7 +1309,7 @@ def stage_F3(c):
         Bs = [hx.gload(c["wob_s"] + i64(((n0 + l % 16) // 32) * (NWOA // 32) + (kq * 512 + s * 128) // 32), I32, align=4)
               for s in range(4)]
         hx.wait_flags(c["eflag"], NEF, c["etag"], w, l, 8)
-        gpu.barrier()
+        hx.bar()
         lr = fx.min(l % 16, I32(TR - 1))   # (rows past TR: the last row again, cached)
         arow = c["y8"] + i64(lr * NWOA + kq * 512)
         acc = fx.Vector.filled(8, 0.0, F32)
@@ -1318,7 +1318,7 @@ def stage_F3(c):
             sa = hx.gload(c["ys"] + i64(lr * (NWOA // 32) + (kq * 512 + s * 128) // 32), I32, align=4)
             acc = hx.wmma_mx(av, sa, Bw[s], Bs[s], acc)
         hx.lstore(sm + 8192 + ((w * 32 + l) * 8) * 4, acc)
-        gpu.barrier()
+        hx.bar()
         if kq == 0:
             q = [hx.lload(sm + 8192 + (((nt * 4 + qq) * 32 + l) * 8) * 4, F32, 8) for qq in range(4)]
             for i in range_constexpr(8):
@@ -1327,7 +1327,7 @@ def stage_F3(c):
                 if fx.const_expr(i < TR):   # (c1 code size: rows i >= TR are never stored)
                     if r < TR:   # (TP3's payload only: the f32 slice had no reader in global memory)
                         hx.lstore(sm + (r * OWC + nt * 16 + l % 16) * 4, s_)
-        gpu.barrier()
+        hx.bar()
 
 
 @ASTRewriter.transform
@@ -1406,7 +1406,7 @@ def stage_E4(c):
         Bs = [hx.gload(c["woa_s"] + i64(((n0 + l % 16) // 32) * (KWOA // 32) + (kq * 1024 + s * 128) // 32), I32, align=4)
               for s in range(8)]
         hx.wait_flags(c["dflag"], c["NDF"], c["dtag"], w, l, 8)
-        gpu.barrier()
+        hx.bar()
         lr = fx.min(l % 16, I32(TR - 1))   # (rows past TR: the last row again, cached)
         arow = c["o8"] + i64(lr * NQ + g * KWOA + kq * 1024)
         acc = fx.Vector.filled(8, 0.0, F32)
@@ -1415,7 +1415,7 @@ def stage_E4(c):
             sa = hx.gload(c["os"] + i64(lr * (NQ // 32) + (g * KWOA + kq * 1024 + s * 128) // 32), I32, align=4)
             acc = hx.wmma_mx(av, sa, Bw[s], Bs[s], acc)
         hx.lstore(sm + ((w * 32 + l) * 8) * 4, acc)
-        gpu.barrier()
+        hx.bar()
         if kq == 0:
             q = [hx.lload(sm + (((nt * 4 + qq) * 32 + l) * 8) * 4, F32, 8) for qq in range(4)]
             for i in range_constexpr(8):
@@ -1424,7 +1424,7 @@ def stage_E4(c):
                 if fx.const_expr(i < TR):   # (c1 code size: rows i >= TR are never stored)
                     if r < TR:
                         hx.lstore(sm + 8192 + (r * 32 + nt * 16 + l % 16) * 4, s_.to(BF16).to(F32))
-        gpu.barrier()
+        hx.bar()
         if t < TR:
             vq = [hx.lload(sm + 8192 + (t * 32 + 4 * k) * 4, F32, 4) for k in range(8)]
             vals = [vq[e // 4][e % 4] for e in range(32)]
@@ -1439,6 +1439,6 @@ def stage_E4(c):
             c["stx"](yb, fx.Vector.from_elements(words[:4], I32))
             c["stx"](yb + i64(16), fx.Vector.from_elements(words[4:], I32))
         hx.wait_storecnt0()
-        gpu.barrier()
+        hx.bar()
         if t == 0:
             hx.put(c["eflag"] + i64(eb) * 8, I32(0), c["etag"])

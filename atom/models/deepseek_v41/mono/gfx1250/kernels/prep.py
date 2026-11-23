@@ -140,7 +140,7 @@ def build(widths, rows_per_request, bcols, ratios, extra_write, cap, eng=None, a
                     for z in range_constexpr(4):
                         hx.gstore(pls[z] + I64(f) * 4, I32(-1))
             hx.wait_storecnt0()
-            gpu.barrier()
+            hx.bar()
             if t == 0:
                 plans = [(RA, cp1, wp1), (RB, cp2, wp2)]
                 for z in range_constexpr(2):

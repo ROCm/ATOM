@@ -62,10 +62,10 @@ def head_local(t):
     head CTA b wrote (markov_once's tile b * 8 + w = the head's tiles 8b .. 8b + 7; its waves past the vocab read a clamped
     tile they never use) -> a CTA-local release (every wave's s_wait_storecnt 0, barrier) / acquire (t0's acquire_se)."""
     hx.wait_storecnt0()
-    gpu.barrier()
+    hx.bar()
     if t == 0:
         hx.acquire_se()
-    gpu.barrier()
+    hx.bar()
 
 
 def roff(k, src, req):
@@ -92,7 +92,7 @@ def markov_once(base, anchors, w1, w2s, ids_out, emb_out, best, cnt, recv, rank,
         for q in range_constexpr(NREQ):
             np_ = np_ + (hx.gload(sp + i64(q * (TB + 1) * SPW * 4 + 12), I32) == I32(0)).select(I32(1), I32(0))
         anyprob = np_ > I32(0)
-    gpu.barrier()
+    hx.bar()
     # (M1) every load of the rounds that does not depend on x, once: this wave's W2 tile, the rows' base logits of every
     # position (TB x 8 a lane) and the rows' temperature / noise words (the same values the rounds read: bit-identical)
     a = [hx.gload(wrow + i64(ks * 64), BF16, 16) for ks in range(RK // 32)]
@@ -115,7 +115,7 @@ def markov_once(base, anchors, w1, w2s, ids_out, emb_out, best, cnt, recv, rank,
         hx.lstore(sm + req * ES + (t % 32) * 16, hx.gload(w1 + (i64(x) * RK + i64((t % 32) * 8)) * 2, BF16, 8))
         if t < NREQ:
             hx.lstore(sm + LB + t * 8, I64MIN())
-        gpu.barrier()
+        hx.bar()
         acc = fx.Vector.filled(8, 0.0, F32)
         for ks in range_constexpr(RK // 32):
             bv = hx.lload(sm + (l % 16) * ES + (ks * 32 + (l // 16) * 16) * 2, BF16, 16)
@@ -137,7 +137,7 @@ def markov_once(base, anchors, w1, w2s, ids_out, emb_out, best, cnt, recv, rank,
                 bl = gq.select(bl, bp)
         if act & (l % 16 < NREQ):
             latomic_max64(sm + LB + rq * 8, bl)
-        gpu.barrier()
+        hx.bar()
         # the CTA's maxima -> the rank's (global atomics, wave 0) -> count; only CTA 0 waits for the count, reads the rank
         # maxima and pushes them to the peers and to this rank's own slot; every other CTA goes on to poll all 4 sources
         # (no 256-CTA wait on the counter, no 256-CTA re-read of the maxima on CTA 0's path)
@@ -151,7 +151,7 @@ def markov_once(base, anchors, w1, w2s, ids_out, emb_out, best, cnt, recv, rank,
         if b == 0:
             if t == 0:
                 hx.wait_count(cnt + i64(k) * 16, 256, 1)
-            gpu.barrier()
+            hx.bar()
             if t < NREQ:
                 mine = hx.gload(best + i64(k * NREQ + t) * 8, fx.Int64)
                 hx.lstore(sm + LP + (rank * NREQ + t) * 8, mine)
@@ -170,7 +170,7 @@ def markov_once(base, anchors, w1, w2s, ids_out, emb_out, best, cnt, recv, rank,
             got = poll_unit(recv[rank] + roff(k, src, t % NREQ), tag, site=9)
             hx.lstore(sm + LP + t * 8, got[0])
             hx.lstore(sm + LP + t * 8 + 4, got[1])
-        gpu.barrier()
+        hx.bar()
         if t < NREQ:
             g = I64MIN()
             for o in range_constexpr(4):
@@ -183,7 +183,7 @@ def markov_once(base, anchors, w1, w2s, ids_out, emb_out, best, cnt, recv, rank,
                     hx.gstore(ids64 + i64(t * TB + k) * 8, fx.Int64(xi))
                 if fx.const_expr(qids is not None):   # the drafts qlog was kept for (persistent; checked by the verify)
                     hx.gstore(qids + i64(t * TB + k) * 4, xi)
-        gpu.barrier()
+        hx.bar()
         if b == 0:   # W1[x_k] rows for the confidence head: [req][k][256] bf16
             x2 = hx.lload(sm + LX + req * 4, I32)
             hx.gstore(emb_out + (i64(req * TB + k) * RK + i64((t % 32) * 8)) * 2,

@@ -18,6 +18,7 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import arith, llvm
 from flydsl.compiler.ast_rewriter import ASTRewriter as _ASTR
 from flydsl.expr import gpu, rocdl
+from flydsl._mlir.dialects import rocdl as _rd
 from flydsl.expr.typing import T, as_ir_value
 
 # ---------------------------------------------------------------- types
@@ -176,8 +177,102 @@ def wait_storecnt0():
 
 
 def cluster_barrier():
-    """__builtin_amdgcn_s_cluster_barrier()."""
-    intrin(None, "llvm.amdgcn.s.cluster.barrier", [])
+    """__builtin_amdgcn_s_cluster_barrier(); in the 16-wave CTA (NB16) the main waves' barrier, then wave 0 signals the
+    cluster barrier for the CTA and the main waves wait it (the builtin's -1 barrier would wait the parked helpers)."""
+    if not NB16:
+        intrin(None, "llvm.amdgcn.s.cluster.barrier", [])
+        return
+    bar()
+    _cbar16(wave_s())
+
+
+@_ASTR.transform
+def _cbar16(wv):
+    if wv == 0:
+        _rd.s_barrier_signal(-3)
+    _rd.s_barrier_wait(-3)
+
+
+# ---------------------------------------------------------------- the 16-wave CTA (named barriers)
+# The step body runs 16 waves a CTA: waves 0..7 its code as before, waves 8..15 (the helpers) parked in named barrier
+# HB (s_barrier_wait: no clock polls) until wave 0 wakes them for a stage that splits its work over 16 waves (the routed
+# down: dn_row). Every CTA barrier of the main waves is named barrier MB (8 members); a -1 barrier would wait the helpers.
+# NB16 is a trace-time flag: set while the step body is traced (its launch is 512 threads); every other kernel that
+# shares these helpers keeps gpu.barrier().
+NB16 = False
+NB_MAIN, NB_HELP = "mono_nb_main", "mono_nb_help"
+
+
+def _nbar(name):
+    """The named barrier `name` (an LDS global of type target("amdgcn.named.barrier", 0) in the gpu.module, created once;
+    the compiler counts it in the kernel descriptor) -> its pointer."""
+    from flydsl._mlir.dialects import llvm as _ll
+    op = ir.InsertionPoint.current.block.owner
+    while op is not None and op.name not in ("gpu.module", "builtin.module"):
+        op = op.parent
+    body = op.regions[0].blocks[0]
+    if not any(o.name == "llvm.mlir.global" and ir.StringAttr(o.attributes["sym_name"]).value == name
+               for o in body.operations):
+        ty = ir.Type.parse('!llvm.target<"amdgcn.named.barrier", 0>')
+        with ir.InsertionPoint.at_block_begin(body):
+            g = _ll.GlobalOp(ty, name, ir.Attribute.parse("#llvm.linkage<internal>"), addr_space=3)
+            blk = g.initializer.blocks.append()
+            with ir.InsertionPoint(blk):
+                _ll.ReturnOp(arg=_ll.mlir_poison(ty))
+    return _ll.mlir_addressof(ir.Type.parse("!llvm.ptr<3>"), name)
+
+
+def wave_s():
+    """The wave's index (scalar: readfirstlane)."""
+    return fx.Int32(_rd.readfirstlane(i32(), _v(fx.Int32(fx.thread_idx.x) // 32)))
+
+
+def bar():
+    """The main waves' CTA barrier: gpu.barrier(); in the 16-wave CTA named barrier MB (its fences as gpu.barrier's)."""
+    if not NB16:
+        gpu.barrier()
+        return
+    fence_release("workgroup")
+    _rd.s_barrier_signal_var(_nbar(NB_MAIN), 0)
+    _rd.s_barrier_wait(1)
+    fence_acquire("workgroup")
+
+
+def bar_all():
+    """(16-wave CTA) a barrier of all 16 waves (-1: the main waves joined to MB, the helpers to HB, both count)."""
+    fence_release("workgroup")
+    _rd.s_barrier_signal(-1)
+    _rd.s_barrier_wait(-1)
+    fence_acquire("workgroup")
+
+
+@_ASTR.transform
+def nb_enter():
+    """(16-wave CTA, the body's first statement) wave 0 sets up MB (8 members) and HB (the 8 helpers + wave 0's wake
+    signal), a -1 barrier, then each wave joins its own. Returns the wave index (scalar)."""
+    wv = wave_s()
+    if wv == 0:
+        _rd.s_barrier_init(_nbar(NB_MAIN), 8)
+        _rd.s_barrier_init(_nbar(NB_HELP), 9)
+    bar_all()
+    if wv < 8:
+        _rd.s_barrier_join(_nbar(NB_MAIN))
+    else:
+        _rd.s_barrier_join(_nbar(NB_HELP))
+    return wv
+
+
+def nb_park():
+    """(a helper wave) wait in HB until wave 0's wake (nb_wake)."""
+    _rd.s_barrier_signal_var(_nbar(NB_HELP), 0)
+    _rd.s_barrier_wait(1)
+    fence_acquire("workgroup")
+
+
+def nb_wake():
+    """(wave 0) release the parked helpers (a signal on HB without joining it; LDS it wrote before is visible to them)."""
+    fence_release("workgroup")
+    _rd.s_barrier_signal_var(_nbar(NB_HELP), 0)
 
 
 def clock():
@@ -579,18 +674,18 @@ def handoff(cnt, t, hdev, n=256, site=None):
     so no global_wb) and t0 acquires for the CTA after the count (acquire_se)."""
     if fx.const_expr(hdev):
         wait_storecnt0()
-        gpu.barrier()
+        bar()
         if t == 0:
             atomic_add(cnt, 1)
             wait_count(cnt, n, 4 if site is None else site)
-        gpu.barrier()
+        bar()
     else:   # (GFX12.5) release = every wave's s_wait_storecnt 0 (no global_wb); acquire = t0's SE invalidate
         wait_storecnt0()
-        gpu.barrier()
+        bar()
         if t == 0:
             atomic_add(cnt, 1)
             wait_count(cnt, n, 5 if site is None else site)   # (its acquire inside)
-        gpu.barrier()
+        bar()
 
 
 # ==============================================================================================================

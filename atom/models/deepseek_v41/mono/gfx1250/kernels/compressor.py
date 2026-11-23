@@ -240,7 +240,7 @@ def stage_crow(c, r1):
         ws = _lane_sum(comp[0] * comp[0] + comp[1] * comp[1] + comp[2] * comp[2] + comp[3] * comp[3])
         if (l == 0) & (w < 4):
             hx.lstore(red + w * 4, ws)
-        gpu.barrier()
+        hx.bar()
         tot = hx.lload(red, F32)
         for ww in range_constexpr(1, 4):
             tot = tot + hx.lload(red + ww * 4, F32)
@@ -273,7 +273,7 @@ def stage_crow(c, r1):
             i = t + it * 256
             if i < 15 * LAT * 2 // 16:
                 hx.lstore(lb + LAT * 2 + i * 16, fx.Vector.filled(4, 0, I32))
-        gpu.barrier()
+        hx.bar()
         wkr = c["cwk"] + i64((w * 16 + l % 16) * LAT) * 2
         bvs = [hx.gload(wkr + i64(ks * 32 + (l // 16) * 16) * 2, BF16, 16) for ks in range(LAT // 32)]
         acc = fx.Vector.filled(8, 0.0, F32)
@@ -282,7 +282,7 @@ def stage_crow(c, r1):
             acc = hx.wmma_bf16(av, bvs[ks], acc)
         if l < 16:   # lane l (< 16): row 0 (i = 0) of key 16 w + l
             hx.lstore(kb + (w * 16 + l) * 4, acc[0])
-        gpu.barrier()
+        hx.bar()
         if live & (w == 0):
             ka = hx.lload(kb + (l * 4) * 4, F32, 4)
             key = [ka[jj].to(BF16).to(F32) for jj in range(4)]
@@ -353,7 +353,7 @@ def crow_flag(c):
     t, b = c["t"], c["b"]
     if (b >= CROW0) & (b < CROW0 + T):
         hx.wait_storecnt0()
-        gpu.barrier()
+        hx.bar()
         if t == 0:
             hx.put(c["crflag"] + i64(b - CROW0) * 8, I32(0), c["crtag"])
 

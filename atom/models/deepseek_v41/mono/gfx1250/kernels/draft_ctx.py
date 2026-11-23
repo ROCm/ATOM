@@ -90,7 +90,7 @@ def stage_hnorm(c, T, tp=False):
             ss = ss + ss.shuffle_xor(16 >> o, 32)
         if l == 0:
             hx.lstore(sm + w * 4, ss)
-        gpu.barrier()
+        hx.bar()
         tot = F32(0.0)
         for ww in range_constexpr(5):   # (waves 0..4 hold the 160 groups)
             tot = tot + hx.lload(sm + ww * 4, F32)
@@ -108,7 +108,7 @@ def stage_hnorm(c, T, tp=False):
             hx.gstore(dst, fx.Vector.from_elements(words[:4], I32))
             hx.gstore(dst + i64(16), fx.Vector.from_elements(words[4:], I32))
             hx.gstore(c["hs"] + i64(r) * (H // 32) + i64(col // 32), code.to(fx.Int8))
-        gpu.barrier()
+        hx.bar()
 
 
 def ctx_fp8_lane16(ro, inv):
@@ -306,7 +306,7 @@ def _ntile_splitk(c, a8, as_, K, w8, ws, n0, T, out, N, orow0):
         o = sm + ((mi * WAVES + w) * 32 + l) * 32
         hx.lstore(o, fx.Vector.from_elements([accs[mi][i] for i in range(4)], F32), align=16)
         hx.lstore(o + 16, fx.Vector.from_elements([accs[mi][i] for i in range(4, 8)], F32), align=16)
-    gpu.barrier()
+    hx.bar()
     if w < MT:
         tot = [F32(0.0)] * 8
         for ww in range_constexpr(WAVES):
@@ -317,7 +317,7 @@ def _ntile_splitk(c, a8, as_, K, w8, ws, n0, T, out, N, orow0):
             r = w * 16 + (l // 16) * 8 + i
             if r < T:
                 hx.gstore(out + ((i64(orow0) + i64(r)) * N + i64(n0 + l % 16)) * 2, tot[i].to(BF16))
-    gpu.barrier()
+    hx.bar()
 
 
 @ASTRewriter.transform
@@ -347,7 +347,7 @@ def _lds_sum_out(c, accs, MT, NW, T, n0, atomic):
         o = sm + ((mi * WAVES + w) * 32 + l) * 32
         hx.lstore(o, fx.Vector.from_elements([accs[mi][i] for i in range(4)], F32), align=16)
         hx.lstore(o + 16, fx.Vector.from_elements([accs[mi][i] for i in range(4, 8)], F32), align=16)
-    gpu.barrier()
+    hx.bar()
     if w < MT:
         tot = [F32(0.0)] * 8
         for ww in range_constexpr(NW):
@@ -362,7 +362,7 @@ def _lds_sum_out(c, accs, MT, NW, T, n0, atomic):
                     hx.atomic_fadd(dst, tot[i])
                 else:
                     hx.gstore(dst, tot[i])
-    gpu.barrier()
+    hx.bar()
 
 
 @ASTRewriter.transform
@@ -453,7 +453,7 @@ def _lds_sum_push(c, accs, MT, T, tile, tl):
         o = sm + ((mi * WAVES + w) * 32 + l) * 32
         hx.lstore(o, fx.Vector.from_elements([accs[mi][i] for i in range(4)], F32), align=16)
         hx.lstore(o + 16, fx.Vector.from_elements([accs[mi][i] for i in range(4, 8)], F32), align=16)
-    gpu.barrier()
+    hx.bar()
     if w < MT:
         tot = [F32(0.0)] * 8
         for ww in range_constexpr(WAVES):
@@ -464,7 +464,7 @@ def _lds_sum_push(c, accs, MT, T, tile, tl):
             r = w * 16 + (l // 16) * 8 + i
             if r < T:
                 hx.lstore(sm + CX_STAGE + (r * 16 + l % 16) * 2, tot[i].to(BF16))
-    gpu.barrier()
+    hx.bar()
     if t < 3 * T:
         rr = t // 3
         j = t % 3
