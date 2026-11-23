@@ -1323,11 +1323,13 @@ mod c2_chat_streaming_branches {
 
     /// The data events of an ATOM worker's stream whose usage rides on its finish chunk.
     async fn usage_on_finish_events(include_usage: bool) -> Vec<serde_json::Value> {
-        let mut req = ChatCompletionRequest::default();
-        req.stream = true;
-        req.stream_options = include_usage.then_some(StreamOptions {
-            include_usage: Some(true),
-        });
+        let req = ChatCompletionRequest {
+            stream: true,
+            stream_options: include_usage.then_some(StreamOptions {
+                include_usage: Some(true),
+            }),
+            ..Default::default()
+        };
         let mut meta = meta_plain();
         meta.cached_tokens = 2;
         meta.timing = Some(SeqTiming {
@@ -4320,8 +4322,7 @@ mod g_complete_suffix {
         let sse = body(chat_streaming::process(stream, ctx, "regular")).await;
         let last = events(&sse)
             .into_iter()
-            .filter(|e| e["choices"][0]["delta"]["content"] == " .")
-            .last()
+            .rfind(|e| e["choices"][0]["delta"]["content"] == " .")
             .unwrap_or_else(|| panic!("no delta for the unstreamed id: {sse}"));
         let logprobs = &last["choices"][0]["logprobs"]["content"];
         assert_eq!(logprobs[0]["logprob"], -0.25, "{last}");
