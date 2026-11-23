@@ -639,10 +639,21 @@ import sys; sys.path.insert(0, sys.argv[1]); import triage
 forms = ["FP8: x", "MI300: x", "[verified] x.py:1 drops it", "The caller must hold it",
          "[inferred] planner.rs:108 charges only on req.stream",
          "FP8 scale is wrong", "MI300 support is missing",
-         "foo.py:3 — the E2E path never runs", "foo.py:3-5 TP8 is off by one"]
+         "foo.py:3 — the E2E path never runs", "foo.py:3-5 TP8 is off by one",
+         # B1..B7 and C1..C3 are words this codebase uses itself, not only rule ids:
+         # the KV-offload chunk groups (offload/README.md:1084), the MTP4 rows
+         # (glm52/mono/kernels/op.py:131) and the deepseek_v4 capture topology
+         # (mono/session.py). A finding that cites a file and then says "C1/C2 rows
+         # are swapped" is lawful, and refusing it is fatal -- the only way out is an
+         # untrue "-- not reported:". Past the citation only the colon forms are read,
+         # because those are the only ones _publish.first_clause turns into an id-led
+         # published line.
+         "kv_transfer/offload/README.md:1084, B1-B2 stage before B3-B4",
+         "glm52/mono/kernels/op.py:131 — C1/C2 rows for MTP4 are swapped",
+         "mono/session.py:1527 C3 buffers are updated under the C4 capture key"]
 print(sum(1 for f in forms if triage._rule_head(f) is None))' "$S"
 }
-t "and an ordinary opening is left alone" "$(_head_passes)" "9"
+t "and an ordinary opening is left alone" "$(_head_passes)" "12"
 # One shared 4-letter word was far too loose. SKILL.md mandates "**Author must**" on
 # every finding, so `must` alone let any finding claim any path-less FIRE whose reason
 # used it -- silencing the UNREPORTED-FIRE that should have fired for the other rule.

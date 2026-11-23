@@ -2866,6 +2866,16 @@ LEAD_GROUP = re.compile(r"^[\[(]([^\])]{0,60})[\])]")
 BARE_ID = re.compile(r"^([A-Z]+\d+[a-z]?)(?:-[\w-]+)?(?:\s*[/,]\s*[A-Z]+\d+[a-z]?)*"
                      r"(?:\s*\([^)]{0,40}\))?[\s*`_]*"
                      r"(?::|—|–|--|-(?!\w)|\s+(?=[a-z])|(?!\w))")
+# After a citation, only the colon forms. `_publish.first_clause` strips `(?:-\d+)?` and
+# `[,:]` and nothing else, so `foo.py:563-569 A5: …` reaches the reader id-led while
+# `README.md:1084, B1-B2 stage before B3-B4` does not -- and B1..B7 and C1..C3 are this
+# codebase's own words (the KV-offload chunk groups at offload/README.md:1084, MTP4's
+# rows at glm52/mono/kernels/op.py:131, deepseek_v4's capture topology in session.py).
+# Reading them with BARE_ID refuses a lawful finding that merely cites a file and then
+# says "C1/C2 rows are swapped", and a refusal is fatal: the only way out is an untrue
+# `-- not reported:`, the trap this gate's own r41 item 1 exists to close.
+CITED_ID = re.compile(r"^([A-Z]+\d+[a-z]?)(?:-[\w-]+)?(?:\s*[/,]\s*[A-Z]+\d+[a-z]?)*"
+                      r"(?:\s*\([^)]{0,40}\))?[\s*`_]*:")
 
 
 def _rule_head(text):
@@ -2876,9 +2886,10 @@ def _rule_head(text):
     `MI300:` and `GPU0:` share the shape and none of them is a rule.
     """
     rest = text
+    cited = False                            # has a citation been stepped over already?
     for _ in range(6):                       # tag, emphasis, and one wrapped in the other
         rest = LEAD_NOISE.sub("", rest)
-        m = BARE_ID.match(rest)
+        m = (CITED_ID if cited else BARE_ID).match(rest)
         if m:
             return m.group(1) if m.group(1) in REFUSED_IDS else None
         citation = CITATION.match(rest)
@@ -2890,6 +2901,7 @@ def _rule_head(text):
             # are common; real bot cards carry 74 of them.
             rest = re.sub(r"^(?:-\d+)?[\s*`_]*(?:[,:]|—|–|--)?\s*", "",
                           rest[citation.end():])
+            cited = True
             continue
         g = LEAD_GROUP.match(rest)
         if not g:
