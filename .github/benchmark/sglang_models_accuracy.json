@@ -287,8 +287,8 @@
   {
     "model_name": "MI308 Qwen3.5-35B-A3B-PTPC-FP8 TP4",
     "model_path": "sammysun0711/Qwen3.5-35B-A3B-PTPC-FP8",
-    "extraArgs": "--trust-remote-code --reasoning-parser qwen3 --tool-call-parser qwen3_coder --chunked-prefill-size 32768 --max-prefill-tokens 32768 --linear-attn-prefill-backend aiter --attention-backend aiter --kv-cache-dtype fp8_e4m3 --tensor-parallel-size 4 --mem-fraction-static 0.9 --max-running-requests 128 --cuda-graph-max-bs-decode 128 --watchdog-timeout 1200 --disable-radix-cache --enable-strict-thinking",
-    "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0\nSGLANG_DISABLE_CUDNN_CHECK=1\nSGLANG_USE_AITER=1\nAITER_MOE_PADDING_SIZE=64\nSGLANG_USE_IPC_POOL_HANDLE_CACHE=1\nTVM_FFI_DISABLE_TORCH_C_DLPACK=1\nAITER_BYPASS_TUNE_CONFIG=1",
+    "extraArgs": "--trust-remote-code --reasoning-parser qwen3 --tool-call-parser qwen3_coder --chunked-prefill-size 32768 --max-prefill-tokens 32768 --attention-backend aiter --kv-cache-dtype fp8_e4m3 --tensor-parallel-size 4 --mem-fraction-static 0.9 --max-running-requests 128 --cuda-graph-max-bs-decode 128 --watchdog-timeout 1200 --disable-radix-cache --enable-strict-thinking",
+    "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0\nSGLANG_USE_AITER=1\nAITER_MOE_PADDING_SIZE=64\nSGLANG_USE_IPC_POOL_HANDLE_CACHE=1\nTVM_FFI_DISABLE_TORCH_C_DLPACK=1\nAITER_BYPASS_TUNE_CONFIG=1",
     "runner": "atom-mi308-8gpu-plugins-accuracy",
     "test_level": "nightly",
     "lm_eval_num_fewshot": 5,
@@ -306,8 +306,8 @@
   {
     "model_name": "MI308 Qwen3.5-35B-A3B-PTPC-FP8 TP1 DFlash",
     "model_path": "sammysun0711/Qwen3.5-35B-A3B-PTPC-FP8",
-    "extraArgs": "--trust-remote-code --reasoning-parser qwen3 --tool-call-parser qwen3_coder --chunked-prefill-size 32768 --max-prefill-tokens 32768 --linear-attn-prefill-backend aiter --attention-backend aiter --kv-cache-dtype fp8_e4m3 --tensor-parallel-size 1 --mem-fraction-static 0.7 --max-running-requests 32 --cuda-graph-max-bs-decode 32 --watchdog-timeout 1200 --mamba-radix-cache-strategy extra_buffer --page-size 64 --speculative-algorithm DFLASH --speculative-num-draft-tokens 16 --speculative-draft-attention-backend triton --speculative-draft-model-path z-lab/Qwen3.5-35B-A3B-DFlash",
-    "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0\nSGLANG_DISABLE_CUDNN_CHECK=1\nSGLANG_USE_AITER=1\nAITER_MOE_PADDING_SIZE=64\nSGLANG_USE_IPC_POOL_HANDLE_CACHE=1\nTVM_FFI_DISABLE_TORCH_C_DLPACK=1\nAITER_BYPASS_TUNE_CONFIG=1\nSGLANG_USE_AITER_UNIFIED_ATTN=1",
+    "extraArgs": "--trust-remote-code --reasoning-parser qwen3 --tool-call-parser qwen3_coder --chunked-prefill-size 32768 --max-prefill-tokens 32768 --attention-backend aiter --kv-cache-dtype fp8_e4m3 --tensor-parallel-size 1 --mem-fraction-static 0.7 --max-running-requests 32 --cuda-graph-max-bs-decode 32 --watchdog-timeout 1200 --mamba-radix-cache-strategy extra_buffer --page-size 64 --speculative-algorithm DFLASH --speculative-num-draft-tokens 16 --speculative-draft-attention-backend triton --speculative-draft-model-path z-lab/Qwen3.5-35B-A3B-DFlash",
+    "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0\nSGLANG_USE_AITER=1\nAITER_MOE_PADDING_SIZE=64\nSGLANG_USE_IPC_POOL_HANDLE_CACHE=1\nTVM_FFI_DISABLE_TORCH_C_DLPACK=1\nAITER_BYPASS_TUNE_CONFIG=1\nSGLANG_USE_AITER_UNIFIED_ATTN=1",
     "runner": "atom-mi308-8gpu-plugins-accuracy",
     "test_level": "nightly",
     "lm_eval_num_fewshot": 5,
@@ -326,8 +326,8 @@
   {
     "model_name": "MI308 Qwen3.5-397B-A17B-PTPC-FP8 TP8",
     "model_path": "sammysun0711/Qwen3.5-397B-A17B-PTPC-FP8",
-    "extraArgs": "--trust-remote-code --reasoning-parser qwen3 --tool-call-parser qwen3_coder --chunked-prefill-size 32768 --max-prefill-tokens 32768 --linear-attn-prefill-backend aiter --attention-backend aiter --kv-cache-dtype fp8_e4m3 --tensor-parallel-size 8 --mem-fraction-static 0.9 --max-running-requests 128 --cuda-graph-max-bs-decode 128 --watchdog-timeout 3600 --disable-radix-cache",
-    "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0\nSGLANG_DISABLE_CUDNN_CHECK=1\nSGLANG_USE_AITER=1\nAITER_MOE_PADDING_SIZE=64\nSGLANG_USE_IPC_POOL_HANDLE_CACHE=1\nTVM_FFI_DISABLE_TORCH_C_DLPACK=1",
+    "extraArgs": "--trust-remote-code --reasoning-parser qwen3 --tool-call-parser qwen3_coder --chunked-prefill-size 32768 --max-prefill-tokens 32768 --attention-backend aiter --kv-cache-dtype fp8_e4m3 --tensor-parallel-size 8 --mem-fraction-static 0.9 --max-running-requests 128 --cuda-graph-max-bs-decode 128 --watchdog-timeout 3600 --disable-radix-cache",
+    "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0\nSGLANG_USE_AITER=1\nAITER_MOE_PADDING_SIZE=64\nSGLANG_USE_IPC_POOL_HANDLE_CACHE=1\nTVM_FFI_DISABLE_TORCH_C_DLPACK=1",
     "runner": "atom-mi308-8gpu-plugins-accuracy",
     "test_level": "nightly",
     "lm_eval_num_fewshot": 5,
@@ -345,8 +345,8 @@
   {
     "model_name": "MI308 Qwen3.5-397B-A17B-PTPC-FP8 TP8 DFlash",
     "model_path": "sammysun0711/Qwen3.5-397B-A17B-PTPC-FP8",
-    "extraArgs": "--trust-remote-code --reasoning-parser qwen3 --tool-call-parser qwen3_coder --chunked-prefill-size 32768 --max-prefill-tokens 32768 --linear-attn-prefill-backend aiter --attention-backend aiter --kv-cache-dtype fp8_e4m3 --tensor-parallel-size 8 --mem-fraction-static 0.9 --max-running-requests 128 --cuda-graph-max-bs-decode 128 --watchdog-timeout 1200 --mamba-radix-cache-strategy extra_buffer --page-size 64 --speculative-algorithm DFLASH --speculative-num-draft-tokens 16 --speculative-draft-attention-backend triton --speculative-draft-model-path z-lab/Qwen3.5-397B-A17B-DFlash",
-    "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0\nSGLANG_DISABLE_CUDNN_CHECK=1\nSGLANG_USE_AITER=1\nAITER_MOE_PADDING_SIZE=64\nSGLANG_USE_IPC_POOL_HANDLE_CACHE=1\nTVM_FFI_DISABLE_TORCH_C_DLPACK=1\nSGLANG_USE_AITER_UNIFIED_ATTN=1",
+    "extraArgs": "--trust-remote-code --reasoning-parser qwen3 --tool-call-parser qwen3_coder --chunked-prefill-size 32768 --max-prefill-tokens 32768 --attention-backend aiter --kv-cache-dtype fp8_e4m3 --tensor-parallel-size 8 --mem-fraction-static 0.9 --max-running-requests 128 --cuda-graph-max-bs-decode 128 --watchdog-timeout 1200 --mamba-radix-cache-strategy extra_buffer --page-size 64 --speculative-algorithm DFLASH --speculative-num-draft-tokens 16 --speculative-draft-attention-backend triton --speculative-draft-model-path z-lab/Qwen3.5-397B-A17B-DFlash",
+    "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0\nSGLANG_USE_AITER=1\nAITER_MOE_PADDING_SIZE=64\nSGLANG_USE_IPC_POOL_HANDLE_CACHE=1\nTVM_FFI_DISABLE_TORCH_C_DLPACK=1\nSGLANG_USE_AITER_UNIFIED_ATTN=1",
     "runner": "atom-mi308-8gpu-plugins-accuracy",
     "test_level": "nightly",
     "lm_eval_num_fewshot": 5,
