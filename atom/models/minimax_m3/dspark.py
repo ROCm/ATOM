@@ -54,8 +54,13 @@ The draft ships no embedding or LM head; both are the target's.
 from typing import TYPE_CHECKING, ClassVar
 
 import torch
+import triton
+import triton.language as tl
 from aiter import QuantType, dtypes
-from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
+from aiter.dist.parallel_state import (
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+)
 from aiter.rotary_embedding import get_rope
 from torch import nn
 
@@ -149,6 +154,112 @@ def _window_rows(
     out_lens.sub_(start16, alpha=ASM_PAGE_SIZE)
     start16.add_(row_req, alpha=P)  # each row's first entry in the flat buffer
     torch.index_select(bt16_flat.unfold(0, P, 1), 0, start16, out=out_tables)
+
+
+# Request counts, table widths and ids vary per step: no per-value variants
+# (Triton would otherwise specialize on ==1 and divisibility by 16 and compile
+# a new one mid-serving or mid-capture).
+@triton.jit(do_not_specialize=["bt_stride", "vocab_max", "scheduled_bs", "W"])
+def _block_meta_kernel(
+    anchor_ptr,  # [running_bs] int64, each row's anchor position; STAGE: written
+    bt_ptr,  # [running_bs, W] int32 page-128 ids, row stride bt_stride
+    bt_stride,
+    alloc_ptr,  # [running_bs] int32, pages each row holds (pad rows: read as 1)
+    next_ids_ptr,  # STAGE: [scheduled_bs] each row's verified anchor token
+    positions_ptr,  # STAGE: the target step's positions
+    rows_ptr,  # STAGE: [scheduled_bs] each anchor's row in them
+    ids_out_ptr,  # STAGE: [running_bs] the block's anchor ids (0 on pad rows)
+    vocab_max,
+    pos_ptr,  # [running_bs, T] int64 out: the block's positions
+    slot_ptr,  # [running_bs, T] int64 out: its KV slots, -1 dropped
+    ctx_ptr,  # [running_bs] int32 out: anchor + 1 + T (PAD_CTX on pad rows)
+    rows_bt_ptr,  # [running_bs * T, PW] int32 out: each row's page-16 window table
+    rows_len_ptr,  # [running_bs * T] int32 out: each row's key count from its table start
+    scheduled_bs,
+    W,
+    T: tl.constexpr,
+    TP: tl.constexpr,
+    ENTRY: tl.constexpr,
+    WINDOW: tl.constexpr,
+    PW: tl.constexpr,
+    PWP: tl.constexpr,
+    PAD_CTX: tl.constexpr,
+    STAGE: tl.constexpr,
+):
+    """One request row of the block's metadata, everything the generic torch
+    path (``DSparkProposer._build_paged_block_metadata`` + ``prepare_paged_block``)
+    builds in ~30 launches: positions, slots (dropped past the table, past the
+    allocation and on pad rows), the context length, and each block row's
+    page-16 table from the page holding its window's first key, with its key
+    count. The tables hold only the ``PW`` pages a window can span rather than
+    the whole context's; the per-row decode reads a row's table up to its key
+    count, so the read is the same. ``STAGE``: also stages the row's anchor id
+    and position (``_stage_anchors_kernel``) before using them."""
+    i = tl.program_id(0)
+    real = i < scheduled_bs
+    if STAGE:
+        token = tl.load(next_ids_ptr + i, mask=real, other=0)
+        tl.store(
+            ids_out_ptr + i, tl.minimum(tl.maximum(token, 0), vocab_max).to(tl.int32)
+        )
+        row = tl.load(rows_ptr + i, mask=real, other=0)
+        anchor = tl.load(positions_ptr + row, mask=real, other=0).to(tl.int64)
+        tl.store(anchor_ptr + i, anchor)
+    else:
+        anchor = tl.load(anchor_ptr + i)
+    alloc_tok = (
+        tl.where(real, tl.maximum(tl.load(alloc_ptr + i), 1), 1).to(tl.int64) * ENTRY
+    )
+    j = tl.arange(0, TP)
+    jm = j < T
+    pos = anchor + 1 + j
+    tl.store(pos_ptr + i * T + j, pos, mask=jm)
+    page = pos // ENTRY
+    in_table = page < W
+    bt_row = bt_ptr + i.to(tl.int64) * bt_stride
+    pg = tl.load(bt_row + tl.minimum(page, W - 1), mask=jm, other=0).to(tl.int64)
+    slot = pg * ENTRY + pos % ENTRY
+    slot = tl.where(in_table & real & (pos < alloc_tok), slot, -1)
+    tl.store(slot_ptr + i * T + j, slot, mask=jm)
+    ctx = tl.where(real, anchor + 1 + T, PAD_CTX)
+    tl.store(ctx_ptr + i, ctx.to(tl.int32))
+    ctx_eff = tl.minimum(ctx, alloc_tok)
+    start16 = tl.maximum(pos - (WINDOW - 1), 0) // 16
+    start16 = tl.where(real, start16, 0)
+    tl.store(rows_len_ptr + i * T + j, (ctx_eff - start16 * 16).to(tl.int32), mask=jm)
+    e = tl.arange(0, PWP)
+    p16 = start16[:, None] + e[None, :]
+    p128 = p16 // 8
+    em = jm[:, None] & (e[None, :] < PW)
+    pgs = tl.load(bt_row + p128, mask=em & (p128 < W), other=0)
+    entry = tl.where(real, pgs * 8 + (p16 % 8), e[None, :] % 8)
+    out = (i * T + j)[:, None].to(tl.int64) * PW + e[None, :]
+    tl.store(rows_bt_ptr + out, entry.to(tl.int32), mask=em)
+
+
+@triton.jit(do_not_specialize=["vocab_start", "vocab_end", "noise_id"])
+def _block_embed_kernel(
+    anchor_ptr,  # [B] anchor ids
+    weight_ptr,  # [V / tp, D] this rank's rows of the table
+    out_ptr,  # [B * T, D]
+    vocab_start,
+    vocab_end,
+    noise_id,
+    stride_w,
+    D,
+    T: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    r = tl.program_id(0)
+    cols = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
+    tok = tl.where(r % T == 0, tl.load(anchor_ptr + r // T), noise_id)
+    in_range = (tok >= vocab_start) & (tok < vocab_end)
+    emb = tl.load(
+        weight_ptr + (tok - vocab_start).to(tl.int64) * stride_w + cols,
+        mask=in_range & (cols < D),
+        other=0.0,
+    )
+    tl.store(out_ptr + r.to(tl.int64) * D + cols, emb, mask=cols < D)
 
 
 class M3DSparkAttention(nn.Module):
@@ -541,6 +652,94 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         )
         attn_metadata.dspark_bt16_rows = self._bt16_rows[:rows]
         attn_metadata.dspark_ctx_rows = self._ctx_rows[:rows]
+
+    def embed_block(self, input_ids, num_draft):
+        """The base block embedding, each row's id chosen in the lookup kernel
+        (the anchor at column 0, MASK past it); the same masked lookup and
+        all-reduce as the target's ``VocabParallelEmbedding``."""
+        embed = self.embed_tokens
+        if not hasattr(embed, "vocab_start_idx"):
+            return super().embed_block(input_ids, num_draft)
+        weight = embed.weight
+        assert weight.stride(1) == 1
+        rows, dim = input_ids.shape[0] * num_draft, weight.shape[1]
+        out = torch.empty(rows, dim, dtype=weight.dtype, device=weight.device)
+        block_d = 1024
+        _block_embed_kernel[(rows, triton.cdiv(dim, block_d))](
+            input_ids, weight, out, embed.vocab_start_idx,
+            embed.vocab_start_idx + weight.shape[0], self.noise_token_id,
+            weight.stride(0), dim, T=num_draft, BLOCK_D=block_d,
+        )  # fmt: skip
+        if embed.tp_size > 1:
+            out = get_tp_group().all_reduce(out, ca_fp8_quant=False)
+        return out
+
+    def fused_block_metadata_ok(self) -> bool:
+        """Whether `build_block_metadata` serves this draft: a sliding window
+        bounds the pages a block row reads."""
+        return self.sliding_window > 0
+
+    def build_block_metadata(
+        self,
+        attn_metadata,
+        block_tables: torch.Tensor,  # [running_bs, W] page-128 ids
+        anchor_positions: torch.Tensor,  # [running_bs] int64
+        block_positions: torch.Tensor,  # [running_bs, T] int64 out
+        slots: torch.Tensor,  # [running_bs, T] int64 out
+        ctx_lens: torch.Tensor,  # [running_bs] int32 out
+        allocated_pages,  # [>= scheduled_bs] host, or a device int32 tensor
+        scheduled_bs: int,
+        entry_tokens: int,
+        pad_ctx_len: int,
+        stage=None,  # (next_token_ids, positions, rows, ids_out): stage the anchors too
+    ) -> None:
+        """The block's metadata in one launch (`_block_meta_kernel`): what the
+        proposer's generic path and `prepare_paged_block` build, with compact
+        window tables. Buffers are allocated at ``max_num_seqs`` on the first
+        call (the warmup, ahead of any capture) and only sliced after.
+        ``allocated_pages`` as a device tensor (published with the step's
+        inputs) skips the host-to-device copy; ``stage`` writes the anchor ids
+        and positions in the same launch."""
+        running_bs, T = block_positions.shape
+        W = block_tables.shape[1]
+        pw = triton.cdiv(self.sliding_window + T + 16, 16) + 1
+        pw = triton.cdiv(pw, 8) * 8
+        if getattr(self, "_meta_key", None) != (T, pw):
+            max_bs, device = self.max_num_seqs, block_tables.device
+            self._meta_key = (T, pw)
+            self._meta_cap = None
+            self._meta_rows_bt = torch.zeros(
+                max_bs * T, pw, dtype=torch.int32, device=device
+            )
+            self._meta_rows_len = torch.zeros(
+                max_bs * T, dtype=torch.int32, device=device
+            )
+        if isinstance(allocated_pages, torch.Tensor):
+            alloc = allocated_pages
+        else:
+            if self._meta_cap is None:
+                self._meta_cap = AllocationCap(self.max_num_seqs, block_tables.device)
+            alloc = self._meta_cap.upload(allocated_pages, scheduled_bs, running_bs)
+        rows = running_bs * T
+        assert rows <= self._meta_rows_bt.shape[0], (running_bs, T)
+        rows_bt = self._meta_rows_bt[:rows]
+        rows_len = self._meta_rows_len[:rows]
+        if stage is None:
+            next_ids = positions = anchor_rows = ids_out = anchor_positions
+        else:
+            next_ids, positions, anchor_rows, ids_out = stage
+        _block_meta_kernel[(running_bs,)](
+            anchor_positions, block_tables, block_tables.stride(0), alloc,
+            next_ids, positions, anchor_rows, ids_out, int(self.vocab_size) - 1,
+            block_positions, slots, ctx_lens, rows_bt, rows_len,
+            scheduled_bs, W,
+            T=T, TP=triton.next_power_of_2(T), ENTRY=entry_tokens,
+            WINDOW=self.sliding_window, PW=pw, PWP=triton.next_power_of_2(pw),
+            PAD_CTX=pad_ctx_len, STAGE=stage is not None,
+            num_warps=4,  # [T, PW] tiles of one request row; more warps only idle
+        )  # fmt: skip
+        attn_metadata.dspark_bt16_rows = rows_bt
+        attn_metadata.dspark_ctx_rows = rows_len
 
     def head_and_sample(self, hidden, anchor_ids, num_draft):
         bs = anchor_ids.shape[0]

@@ -15,7 +15,7 @@ from atom.spec_decode.drafter import (
     aux_blocks,
     pcp_aux_rows,
 )
-from atom.spec_decode.dspark_lossless import DSparkLossless
+from atom.spec_decode.dspark_lossless import DSparkLossless, _sampling_buffer
 from atom.spec_decode.dspark_verify import VerifyScheduler
 from atom.utils import envs
 from atom.utils.block_convert import kv_indices_generate_triton
@@ -82,6 +82,32 @@ class DSparkProposer(Drafter):
         self.dcp_rank = get_dcp_rank()
         if self._with_draft:
             self._init_draft_block_buffers()
+        # A draft that builds its block metadata in one kernel reads each
+        # request's allocated pages from the step's batched upload
+        # (`ModelRunner.prepare_sample` fills it), not a copy of its own.
+        self._fused_meta = (
+            self._with_draft
+            and not self.model.block_attention_is_mla
+            and self.model.fused_block_metadata_ok()
+        )
+        if self._fused_meta:
+            self.metadata_buffers["draft_alloc_pages"] = _sampling_buffer(
+                self.config.max_num_seqs, self.device
+            )
+        # Requests whose `draft_alloc_pages` this step's `prepare_sample`
+        # published (0: none); consumed, and reset, by `prepare_paged_block`.
+        self.alloc_published = 0
+
+    _fused_meta = False  # set in `__init__` for a draft with a fused block kernel
+    alloc_published = 0
+
+    def _fused_block(self, forward_context) -> bool:
+        """Whether the block's metadata comes from `build_block_metadata`."""
+        return (
+            self._fused_meta
+            and not self._draft_is_dcp_sharded
+            and self._bound_draft_k_cache(forward_context) is not None
+        )
 
     def _arm_lossless_draft(self) -> DSparkLossless | None:
         """Allocates only; the runner binds the draft model (`bind_target`)
@@ -838,6 +864,17 @@ class DSparkProposer(Drafter):
         # slice past the end truncates rather than raising, so the kernels got
         # a slot table shorter than their own grid and read past it.
         pass_ = self._block_pass()
+        if self._fused_block(forward_context):
+            # The anchors are staged by the block-metadata kernel itself.
+            ids = pass_.buffer("anchor_ids", running_bs)
+            anchor_positions = pass_.buffer("anchor_positions", running_bs)
+            stage = (next_token_ids, target_positions, last_token_indices, ids)
+            staged = pass_.stage(
+                running_bs, {"anchor_ids": ids, "anchor_positions": anchor_positions}
+            )
+            return self._propose_with_draft(
+                pass_, forward_context, attn_metadata, staged, scheduled_bs, stage
+            )
         staged = self._stage_anchors(
             pass_, running_bs, next_token_ids, target_positions, last_token_indices
         )
@@ -915,6 +952,7 @@ class DSparkProposer(Drafter):
         *,
         scheduled_bs: int,
         max_seqlen_k: int,
+        stage=None,  # fused metadata only: stage the anchors in the same launch
     ) -> None:
         """Retarget `attn_metadata` from the target's step to this draft block.
 
@@ -954,6 +992,47 @@ class DSparkProposer(Drafter):
         # block -- so the MLA decode runs non-causal. The target rebuilds its
         # own metadata (causal defaults True), so this never leaks back.
         attn_metadata.causal = False
+
+        published, self.alloc_published = self.alloc_published, 0
+        fused = self._fused_block(forward_context)
+        # Warmup/capture runs this unstaged (the anchors are already in place);
+        # the replay's staged launch writes the same buffers.
+        assert fused or stage is None, "anchors staged only by the fused route"
+        if fused:
+            # Everything below for a non-MLA block, in one launch (MiniMax-M3.1).
+            fv = self.runner.forward_vars
+            block_tables = fv["block_tables"].gpu[:running_bs]
+            slots = self._blk_slots[: running_bs * T].view(running_bs, T)
+            ctx_lens = self._blk_ctx_lens[:running_bs]
+            # `prepare_sample` publishes one step's pages per propose, for the
+            # scheduled requests in order.
+            # A count that does not match this step's requests is not used: the
+            # lengths of the block table stand in.
+            published = published if published == scheduled_bs else 0
+            self.model.build_block_metadata(
+                attn_metadata,
+                block_tables,
+                anchor_positions,
+                self._blk_positions[:running_bs],
+                slots,
+                ctx_lens,
+                (
+                    fv["draft_alloc_pages"].gpu[:running_bs]
+                    if published
+                    else block_table_state(fv["block_tables"]).lengths
+                ),
+                scheduled_bs,
+                self._draft_entry_tokens,
+                self._paged_pad_ctx_len,
+                stage=stage,
+            )
+            attn_metadata.slot_mapping = slots.view(-1)
+            attn_metadata.block_tables = block_tables
+            attn_metadata.cu_seqlens_q = self._blk_cu_seqlens_q[: running_bs + 1]
+            attn_metadata.context_lens = ctx_lens
+            attn_metadata.max_seqlen_q = T
+            attn_metadata.max_seqlen_k = max_seqlen_k
+            return
 
         # Filled for the PADDED batch: the backbone runs the pad rows too, so
         # they need positions to embed and rotate.
@@ -1215,6 +1294,7 @@ class DSparkProposer(Drafter):
         attn_metadata,
         staged: dict[str, torch.Tensor],  # the anchors, at `running_bs`
         scheduled_bs: int,
+        stage=None,  # the fused metadata kernel stages the anchors from these
     ) -> torch.Tensor:
         """Kimi-K3 DSpark: one non-causal block pass over the paged latent cache.
 
@@ -1235,6 +1315,7 @@ class DSparkProposer(Drafter):
             # Upper bound rather than a .max() host sync: every context_len is
             # at most the target pass's longest sequence plus the block.
             max_seqlen_k=int(attn_metadata.max_seqlen_k) + T,
+            **({} if stage is None else {"stage": stage}),
         )
 
         # `[bs, T]` against a paged KV cache however the target just ran. Left
