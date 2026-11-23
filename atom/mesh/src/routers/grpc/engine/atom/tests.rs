@@ -207,6 +207,14 @@ fn error(message: &str, http_status: u32) -> GenerateResponse {
 /// A /generate request through atomesh's gRPC pipeline to `worker`, with the
 /// mock tokenizer registered for model "m".
 async fn route_generate(worker: Arc<dyn Worker>, stream: bool) -> axum::response::Response {
+    route_generate_with(worker, stream, None).await
+}
+
+async fn route_generate_with(
+    worker: Arc<dyn Worker>,
+    stream: bool,
+    headers: Option<http::HeaderMap>,
+) -> axum::response::Response {
     let pipeline = test_mocks::pipeline_with(
         Arc::new(test_mocks::MockPdPlanner::repeat_single(worker, "random")),
         Arc::new(GrpcEngine::new()),
@@ -220,7 +228,7 @@ async fn route_generate(worker: Arc<dyn Worker>, stream: bool) -> axum::response
     });
     let body = generate_body(stream, sampling);
     pipeline
-        .execute_generate(body, None, Some("m".to_string()), context)
+        .execute_generate(body, headers, Some("m".to_string()), context)
         .await
 }
 
@@ -253,6 +261,21 @@ async fn a_payload_becomes_the_generate_request_atom_receives() {
         ..Default::default()
     };
     assert_eq!(*fake.requests.lock().unwrap(), vec![expected]);
+}
+
+#[tokio::test]
+async fn session_headers_reach_the_generate_request() {
+    let fake = FakeAtom::new(vec![vec![complete(&[4], "eos")]]);
+    let url = serve(fake.clone()).await;
+    let mut headers = http::HeaderMap::new();
+    headers.insert("x-session-id", "turns".parse().unwrap());
+    headers.insert("x-dynamo-parent-session-id", "root".parse().unwrap());
+
+    let response = route_generate_with(atom_worker(&url), false, Some(headers)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let requests = fake.requests.lock().unwrap();
+    assert_eq!(requests[0].dp_session_id.as_deref(), Some("turns"));
+    assert_eq!(requests[0].dp_parent_session_id.as_deref(), Some("root"));
 }
 
 #[test]
