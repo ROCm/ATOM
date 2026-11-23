@@ -73,6 +73,9 @@ class FakeEngine:
     def register_memory(self, ptr, length):
         return 0
 
+    def unregister_memory(self, ptr):
+        return 0
+
     def transfer_sync_read(self, session, dst, src, length):
         ctypes.memmove(dst, src, length)
         return 0
@@ -316,3 +319,60 @@ def test_weights_load_without_the_language_model(tmp_path, monkeypatch):
 
     assert yielded == ["vision_tower.weight"]
     assert torch.equal(encoder.vision_tower.weight, torch.full((HIDDEN, HIDDEN), 3.0))
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("POST", "/v1/completions"),
+        ("POST", "/beta/completions"),
+        ("POST", "/v1/messages"),
+        ("POST", "/v1/responses"),
+        ("GET", "/server_info"),
+        ("GET", "/kv_transfer_info"),
+        ("POST", "/start_profile"),
+    ],
+)
+def test_engine_routes_are_refused(server, method, path):
+    server.make()
+    body = {"model": "m", "prompt": "hi"} if method == "POST" else None
+
+    response = _request(method, path, body)
+
+    assert response.status_code == 400
+    assert "encoder-only" in response.json()["error"]["message"]
+
+
+def test_weights_load_without_minimax_language_model(tmp_path, monkeypatch):
+    # MiniMax-M3's `weights_mapping` also takes `model.language_model.` names;
+    # skipping matches them before the mapping renames them.
+    save_file(
+        {
+            "vision_tower.weight": torch.full((HIDDEN, HIDDEN), 3.0),
+            "model.language_model.embed_tokens.weight": torch.ones(4, HIDDEN),
+            "model.language_model.lm_head.weight": torch.ones(4, HIDDEN),
+        },
+        str(tmp_path / "model.safetensors"),
+    )
+    yielded = []
+    iterate = encoder_only.safetensors_weights_iterator
+
+    def recording_iterator(*args):
+        for name, tensor in iterate(*args):
+            yielded.append(name)
+            yield name, tensor
+
+    monkeypatch.setattr(
+        encoder_only, "safetensors_weights_iterator", recording_iterator
+    )
+    encoder = _encoder()
+    encoder.weights_mapping = {"model.language_model.": "language_model."}
+    config = SimpleNamespace(
+        model=str(tmp_path),
+        hf_config=SimpleNamespace(num_hidden_layers=1),
+        load_dummy=None,
+    )
+
+    encoder_only.load_vision_weights(encoder, config)
+
+    assert yielded == ["vision_tower.weight"]

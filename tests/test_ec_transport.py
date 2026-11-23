@@ -55,6 +55,10 @@ class FakeEngine:
         self.regions.append((ptr, length))
         return 0
 
+    def unregister_memory(self, ptr):
+        self.regions = [(p, n) for p, n in self.regions if p != ptr]
+        return 0
+
     def _registered(self, ptr, length):
         return any(p <= ptr and ptr + length <= p + n for p, n in self.regions)
 
@@ -184,11 +188,45 @@ def test_read_returns_none_on_foreign_seed_or_failed_read(engines):
     assert reader.read(params, 11, torch.bfloat16) is None
 
 
-def test_reader_refuses_rows_larger_than_its_buffer(engines):
+def test_reader_grows_to_fit_larger_rows(engines):
+    pool = ec.EcPool(4096, "cpu", clock=Clock())
+    reader = ec.EcReader(64, "cpu", max_bytes=4096)
+    params = pool.put(11, rows(1))
+    old_ptr = reader._buf.data_ptr()
+
+    assert torch.equal(reader.read(params, 11, torch.bfloat16), rows(1))
+    # Only the grown buffer stays registered.
+    assert engines[-1].regions == [(reader._buf.data_ptr(), reader._buf.numel())]
+    assert reader._buf.data_ptr() != old_ptr
+    assert reader._buf.numel() - 8 >= params["length"]
+
+
+def test_reader_doubles_when_it_grows(engines):
+    pool = ec.EcPool(4096, "cpu", clock=Clock())
+    reader = ec.EcReader(200, "cpu", max_bytes=4096)
+    params = pool.put(11, rows(1))  # 256 bytes of rows
+
+    assert torch.equal(reader.read(params, 11, torch.bfloat16), rows(1))
+    assert reader._buf.numel() - 8 == 400
+
+
+def test_reader_refuses_rows_past_its_limit(engines):
     pool = ec.EcPool(4096, "cpu", clock=Clock())
     reader = ec.EcReader(64, "cpu")
     params = pool.put(11, rows(1))
     assert reader.read(params, 11, torch.bfloat16) is None
+    assert reader._buf.numel() - 8 == 64
+
+
+def test_reader_failing_to_grow_keeps_its_buffer(engines, monkeypatch):
+    pool = ec.EcPool(4096, "cpu", clock=Clock())
+    reader = ec.EcReader(64, "cpu", max_bytes=4096)
+    params = pool.put(11, rows(1))
+    buf = reader._buf
+    monkeypatch.setattr(engines[-1], "register_memory", lambda *_: -1)
+
+    assert reader.read(params, 11, torch.bfloat16) is None
+    assert reader._buf is buf
 
 
 def test_pool_registers_on_the_configured_device(engines):

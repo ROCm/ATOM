@@ -1143,10 +1143,15 @@ class ModelRunner:
                 EcReader,
             )
 
-            # A request's image rows never outnumber its prompt's tokens.
-            row_bytes = self.config.hf_config.hidden_size * dtype.itemsize
+            # Sized for the first request's rows and grown on demand: a
+            # buffer for the longest prompt is 12 GiB at MiniMax-M3's 1M
+            # context, allocated outside the KV cache's share of the GPU. A
+            # request's image rows never outnumber its prompt's tokens.
+            max_bytes = self.config.max_model_len * (
+                self.config.hf_config.hidden_size * dtype.itemsize
+            )
             self.ec_reader = EcReader(
-                self.config.max_model_len * row_bytes, self.device
+                min(params["length"], max_bytes), self.device, max_bytes=max_bytes
             )
         rows = self.ec_reader.read(params, cache_seed, dtype)
         if rows is None:

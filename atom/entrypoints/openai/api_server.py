@@ -1932,6 +1932,35 @@ async def _publish_frontend_stats_once() -> None:
     board.publish(index, oldest_waiting_since())
 
 
+# What an encoder-only server answers; every other route needs the engine.
+_ENCODER_ONLY_ROUTES = frozenset(
+    (
+        "/v1/chat/completions",
+        "/beta/chat/completions",
+        "/v1/models",
+        "/health",
+        "/metrics",
+    )
+)
+
+
+@app.middleware("http")
+async def _refuse_engine_routes_without_engine(request: Request, call_next):
+    """Under --encoder-only, refuse the routes the absent engine would serve."""
+    if encoder is None or request.url.path in _ENCODER_ONLY_ROUTES:
+        return await call_next(request)
+    return JSONResponse(
+        status_code=400,
+        content={
+            "error": {
+                "message": f"an encoder-only server does not serve {request.url.path}",
+                "type": "invalid_request_error",
+                "code": 400,
+            }
+        },
+    )
+
+
 @app.middleware("http")
 async def _forward_to_frontend_hub(request: Request, call_next):
     """In a front-end worker, relay the engine's management routes (health,

@@ -155,19 +155,49 @@ class EcPool:
 
 
 class EcReader:
-    """P's side: reads rows from E's pool into a registered buffer."""
+    """P's side: reads rows from E's pool into a registered buffer, which
+    grows, at least doubling, up to ``max_bytes`` of rows."""
 
     def __init__(
         self,
         size_bytes: int,
         device: torch.device | str,
         *,
+        max_bytes: int | None = None,
         protocol: str = mc.MOONCAKE_DEFAULT_PROTOCOL,
     ) -> None:
+        self._max_bytes = size_bytes if max_bytes is None else max_bytes
         # The reread generation word, then the rows.
         self._buf = torch.zeros(size_bytes + _WORD, dtype=torch.uint8, device=device)
         self._engine, _ = _open_engine(self._buf.device, protocol)
         _register(self._engine, self._buf)
+
+    def _fit(self, length: int) -> bool:
+        """Whether the buffer holds ``length`` bytes of rows, growing it if
+        ``max_bytes`` allows."""
+        capacity = self._buf.numel() - _WORD
+        if length <= capacity:
+            return True
+        if length > self._max_bytes:
+            logger.warning(
+                "Image embeddings of %d bytes exceed the %d byte read limit",
+                length,
+                self._max_bytes,
+            )
+            return False
+        old = self._buf
+        size = min(max(length, 2 * capacity), self._max_bytes)
+        try:
+            buf = torch.zeros(size + _WORD, dtype=torch.uint8, device=old.device)
+            _register(self._engine, buf)
+        except RuntimeError as e:
+            logger.warning("Cannot grow the image embedding read buffer: %s", e)
+            return False
+        self._buf = buf
+        ret = self._engine.unregister_memory(old.data_ptr())
+        if ret != 0:
+            logger.warning("Mooncake unregister_memory failed (ret=%d)", ret)
+        return True
 
     def read(
         self, params: dict[str, Any], cache_seed: int, dtype: torch.dtype
@@ -176,12 +206,7 @@ class EcReader:
         if params["cache_seed"] != cache_seed:
             return None
         length = params["length"]
-        if length > self._buf.numel() - _WORD:
-            logger.warning(
-                "Image embeddings of %d bytes exceed the %d byte read buffer",
-                length,
-                self._buf.numel() - _WORD,
-            )
+        if not self._fit(length):
             return None
         session, address = params["session"], params["address"]
         ptr = self._buf.data_ptr()
