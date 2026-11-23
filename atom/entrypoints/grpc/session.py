@@ -58,6 +58,8 @@ class Session:
         self.requests: dict[int, _Request] = {}
         self.client_ids: dict[int, int] = {}  # by engine id, each request's seq_id
         self.preparing = 0  # submissions in preprocess: each holds the window too
+        self.admitting: set[int] = set()  # client seq_ids whose submission is pending
+        self.aborted_while_admitting: set[int] = set()  # aborted once it is added
         self.pending: list[RequestOutput] = []  # the step being delivered
         self.put = self.pending.append  # where each output goes as a step is delivered
         self.outbox: asyncio.Queue = asyncio.Queue()  # message frames; None ends them
@@ -104,7 +106,9 @@ class Session:
         """Aborts those in flight as a dropped HTTP stream is aborted; each still ends
         with its Completions item."""
         for client_id in client_ids:
-            if client_id in self.requests:
+            if client_id in self.admitting:  # aborted before the engine may have it
+                self.aborted_while_admitting.add(client_id)
+            elif client_id in self.requests:
                 seq_id = self.requests[client_id].seq.id
                 self.api.cleanup_stream(seq_id, aborted=True)
 

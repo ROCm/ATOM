@@ -688,8 +688,62 @@ def test_a_session_failed_in_structured_admission_aborts_once_its_seq_is_enqueue
             await opened[0].reader  # its submission settled, then aborted
 
     asyncio.run(fail_during_admission())
-    # close() aborted it before it was enqueued, the admission once it was.
-    assert events == ["aborted", "enqueued", "aborted"]
+    # Still in admission when close() ran: aborted once it was enqueued, not before.
+    assert events == ["enqueued", "aborted"]
+
+
+def test_an_abort_is_applied_while_a_submission_is_in_admission(serve, monkeypatch):
+    engine, entered, admit = (
+        FakeEngine([([5], None)]),
+        threading.Event(),
+        threading.Event(),
+    )
+    servicer = serve(engine)
+    open_session, opened = servicer.sessions.open, []
+    monkeypatch.setattr(
+        servicer.sessions, "open", lambda: opened.append(open_session()) or opened[-1]
+    )
+    add_request = engine.add_request
+
+    def admit_structured(seqs):  # B's structured admission waits, on its thread
+        if seqs[0].json_schema is not None:
+            entered.set()
+            admit.wait(10)
+        add_request(seqs)
+
+    monkeypatch.setattr(engine.core_mgr, "add_request", admit_structured)
+    sent = asyncio.Event()
+
+    async def client():
+        yield pb.Frames(frames=_submit_batch((3, "a", [1])))
+        await _until(lambda: engine.running)  # A runs
+        batch = _submit_batch((4, "b", [2]))
+        envelope = v1.Envelope.FromString(batch[0])
+        envelope.submit.requests[0].sampling.json_schema = '{"type": "object"}'
+        yield pb.Frames(frames=[envelope.SerializeToString(), *batch[1:]])
+        await asyncio.to_thread(entered.wait, 10)
+        abort = v1.Envelope(protocol_version=frames.PROTOCOL_VERSION)
+        abort.abort.seq_ids.extend([3, 4])
+        yield pb.Frames(frames=[abort.SerializeToString()])
+        await sent.wait()
+
+    async def abort_both_while_b_is_in_admission():
+        call = servicer.Session(client(), SimpleNamespace())
+        await anext(call)  # Ready
+        await _until(lambda: engine.aborted)
+        aborted_in_admission = list(engine.aborted), not admit.is_set()
+        admit.set()
+        await _until(lambda: len(engine.aborted) == 2)
+        sent.set()
+        await call.aclose()
+        return aborted_in_admission
+
+    aborted_in_admission = asyncio.run(abort_both_while_b_is_in_admission())
+    a, b = engine.made  # A's engine id, then B's
+    assert aborted_in_admission == ([a], True)
+    # B's abort waited for its admission: it reached the engine, then was aborted.
+    assert engine.made == [a, b] and engine.aborted == [a, b]
+    assert [seq.id for seq in engine.submitted] == [a, b] and engine.running == {}
 
 
 def test_a_session_submission_that_fails_after_a_send_aborts_its_seq(serve):
@@ -1057,8 +1111,8 @@ def test_shutdown_during_structured_admission_aborts_once_its_seq_is_enqueued(
     threading.Timer(0.3, admit.set).start()
     stop()
     channel.close()
-    # close() aborted it before it was enqueued, the admission once it was.
-    assert events == ["aborted", "enqueued", "aborted"]
+    # Still in admission when close() ran: aborted once it was enqueued, not before.
+    assert events == ["enqueued", "aborted"]
 
 
 def test_a_step_flushed_after_the_server_stopped_is_dropped():
