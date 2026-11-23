@@ -6,11 +6,7 @@ import pytest
 import torch
 
 MODULE_PATH = (
-    Path(__file__).parents[3]
-    / "atomrl"
-    / "lumen"
-    / "quantize"
-    / "optimizer_manager.py"
+    Path(__file__).parents[3] / "atomrl" / "lumen" / "quantize" / "optimizer_manager.py"
 )
 SPEC = importlib.util.spec_from_file_location("_test_optimizer_manager", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
@@ -132,9 +128,7 @@ def test_distributed_optimizer_state_maps_masters_to_model_parameters() -> None:
     source_state = next(iter(optimizer._inner.state.values()))
     restored_state = next(iter(restored._inner.state.values()))
     torch.testing.assert_close(restored_state["exp_avg"], source_state["exp_avg"])
-    torch.testing.assert_close(
-        restored_state["exp_avg_sq"], source_state["exp_avg_sq"]
-    )
+    torch.testing.assert_close(restored_state["exp_avg_sq"], source_state["exp_avg_sq"])
 
 
 def test_scheduler_state_round_trip_does_not_advance_epoch() -> None:

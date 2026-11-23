@@ -15,27 +15,8 @@ on:
         default: /data/atomrl
 
 jobs:
-  build-image:
-    name: Build AtomRL DAPO validation image
-    runs-on: atom-mi355-8gpu.predownload
-    permissions:
-      contents: read
-    outputs:
-      image_tag: ${{ steps.image.outputs.image_tag }}
-    steps:
-      - uses: actions/checkout@v6
-      - id: image
-        run: |
-          image_tag="${{ inputs.image_tag }}-${{ github.run_id }}-${{ github.run_attempt }}"
-          docker build --pull \
-            --file atomrl/docker/Dockerfile.dev \
-            --tag "$image_tag" \
-            .
-          echo "image_tag=$image_tag" >> "$GITHUB_OUTPUT"
-
   dapo-case:
     name: AtomRL DAPO example ${{ matrix.id }} (${{ matrix.name }})
-    needs: build-image
     if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
     strategy:
       fail-fast: false
@@ -75,12 +56,20 @@ jobs:
       contents: read
     env:
       DATA_ROOT: ${{ inputs.data_root }}
-      IMAGE_TAG: ${{ needs.build-image.outputs.image_tag }}
+      IMAGE_TAG: ${{ inputs.image_tag }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.id }}
       CONTAINER_NAME: atomrl-ex-${{ github.run_id }}-${{ matrix.id }}
 
     steps:
       - name: Checkout ATOM repository
         uses: actions/checkout@v6
+
+      - name: Build case validation image
+        run: |
+          set -euo pipefail
+          docker build --pull \
+            --file atomrl/docker/Dockerfile.dev \
+            --tag "$IMAGE_TAG" \
+            .
 
       - name: Check shared DAPO models and data
         run: |
@@ -143,4 +132,5 @@ jobs:
         if: always()
         run: |
           docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+          docker rmi -f "$IMAGE_TAG" 2>/dev/null || true
           docker container prune -f || true

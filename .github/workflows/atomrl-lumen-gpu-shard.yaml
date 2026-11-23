@@ -10,37 +10,8 @@ on:
         default: atomrl:lumen-ci
 
 jobs:
-  build-image:
-    name: Build Lumen validation image
-    runs-on: atom-mi355-8gpu.predownload
-    permissions:
-      contents: read
-    outputs:
-      image_tag: ${{ steps.image.outputs.image_tag }}
-    steps:
-      - uses: actions/checkout@v6
-      - id: image
-        run: |
-          set -euo pipefail
-          if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
-            engine=docker
-          elif command -v podman >/dev/null && podman info >/dev/null 2>&1; then
-            engine=podman
-          else
-            echo "No usable Docker or Podman engine" >&2
-            exit 1
-          fi
-          image_tag="${{ inputs.image_tag }}-${{ github.run_id }}-${{ github.run_attempt }}"
-          "$engine" build --pull \
-            --build-arg AITER_REF=main \
-            --file atomrl/docker/Dockerfile.lumen \
-            --tag "$image_tag" \
-            .
-          echo "image_tag=$image_tag" >> "$GITHUB_OUTPUT"
-
   lumen-case:
     name: Lumen case ${{ matrix.id }} (${{ matrix.name }})
-    needs: build-image
     if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
     strategy:
       fail-fast: false
@@ -70,7 +41,7 @@ jobs:
       actions: read
     env:
       CONTAINER_NAME: lumen_readme_${{ github.run_id }}_${{ matrix.id }}
-      LUMEN_IMAGE: ${{ needs.build-image.outputs.image_tag }}
+      LUMEN_IMAGE: ${{ inputs.image_tag }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.id }}
     steps:
       - name: Restore workspace ownership
         run: |
@@ -109,6 +80,15 @@ jobs:
           export PATH="$wrapper_dir:$PATH"
           docker version
           echo "Container launcher wrapper delegates docker to $engine_path with Podman group translation"
+
+      - name: Build case validation image
+        run: |
+          set -euo pipefail
+          docker build --pull \
+            --build-arg AITER_REF=main \
+            --file atomrl/docker/Dockerfile.lumen \
+            --tag "$LUMEN_IMAGE" \
+            .
 
       - name: Clean stale case container
         run: |
@@ -295,7 +275,7 @@ jobs:
             -v "$result_dir:/results" \
             -w /workspace/ATOM/atomrl/lumen \
             "$LUMEN_IMAGE" bash -lc \
-            "LUMEN_BUILD_EXTENSIONS=1 python -m pip install --no-build-isolation --no-deps -e /workspace/ATOM &&
+            "LUMEN_BUILD_EXTENSIONS=1 python -m pip install --no-build-isolation --no-deps -e /workspace/ATOM/atomrl &&
              MODEL_PATH=/models/Qwen3-8B TRAIN_DATA_PATH=/ci-data/train.jsonl
              VALID_DATA_PATH=/ci-data/valid.jsonl RESULTS_DIR=/results $CASE_COMMAND" \
             2>&1 | tee "$log_dir/run.log"
@@ -318,6 +298,7 @@ jobs:
           fi
           [[ -n "$engine" ]] || exit 0
           "$engine" rm -f "$CONTAINER_NAME" 2>/dev/null || true
+          "$engine" rmi -f "$LUMEN_IMAGE" 2>/dev/null || true
           for dev in /dev/kfd /dev/dri/renderD*; do
             [[ -e "$dev" ]] && fuser "$dev" 2>/dev/null | xargs -r kill -9 || true
           done

@@ -3,24 +3,15 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 import torch
 from torch import nn
 
+from atom import quant_spec as atom_quant_spec
 from atomrl.quantization.fp8_config import FP8Config
 from atomrl.quantization.weight_quantizer import fp8_e4m3_max
 
 logger = logging.getLogger(__name__)
-
-
-def _try_atom_kv_spec() -> Any:
-    try:
-        from atom import quant_spec as atom_quant_spec  # type: ignore[attr-defined]
-
-        return atom_quant_spec
-    except ImportError:
-        return None
 
 
 class FP8KVCacheQuantizer:
@@ -29,11 +20,7 @@ class FP8KVCacheQuantizer:
     def __init__(self, config: FP8Config) -> None:
         self._config = config
         self._enabled = False
-        self._atom_spec = _try_atom_kv_spec()
-        if self._atom_spec is None:
-            logger.debug(
-                "atom.quant_spec not available; KV cache path uses torch heuristics only."
-            )
+        self._atom_spec = atom_quant_spec
 
     def recalibrate_scales(self, model: nn.Module) -> None:
         """Recompute Q/K/V FP8 scales from current weights (call each RL step)."""
@@ -76,10 +63,9 @@ class FP8KVCacheQuantizer:
         model._atomrl_fp8_kv_cache_enabled = True
         self._enabled = True
         self.recalibrate_scales(model)
-        if self._atom_spec is not None:
-            logger.debug(
-                "atom.quant_spec present; ATOM engine may consume _atomrl_fp8_kv_scale_* buffers."
-            )
+        logger.debug(
+            "ATOM engine may consume the recalibrated _atomrl_fp8_kv_scale_* buffers."
+        )
 
     @property
     def enabled(self) -> bool:

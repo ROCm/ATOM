@@ -1,7 +1,7 @@
-"""vLLM-backed inference engine with subprocess isolation for RL training.
+"""ATOM-backed inference engine with subprocess isolation for RL training.
 
-Uses vLLM's ``LLM`` class for efficient generation with PagedAttention
-and continuous batching.  Runs vLLM in a **separate subprocess** via
+Uses ATOM's ``LLMEngine`` and ``SamplingParams`` APIs for efficient generation.
+Runs ATOM in a **separate subprocess** via
 ``subprocess.Popen`` to get full process isolation from torchrun's
 NCCL process groups.
 
@@ -169,9 +169,9 @@ resp_f.close()
 
 
 class AtomEngine:
-    """vLLM inference engine with subprocess isolation for colocated RL.
+    """ATOM inference engine with subprocess isolation for colocated RL.
 
-    Spawns vLLM in a completely separate process via ``subprocess.Popen``.
+    Spawns ATOM in a completely separate process via ``subprocess.Popen``.
     Uses named FIFOs for JSON communication to avoid stdout/stderr pollution
     from C++ libraries (Gloo, NCCL).
     """
@@ -225,7 +225,7 @@ class AtomEngine:
             self.wake()
 
     def _start_worker(self, model_path: str | None = None) -> None:
-        """Start the vLLM worker subprocess."""
+        """Start the ATOM worker subprocess."""
         if self._proc is not None and self._proc.poll() is None:
             return
 
@@ -286,7 +286,7 @@ class AtomEngine:
         )
 
         logger.info(
-            "AtomEngine: starting vLLM worker for %s (gpu=%d, mem=%.0f%%)",
+            "AtomEngine: starting ATOM worker for %s (gpu=%d, mem=%.0f%%)",
             path,
             gpu_id,
             gpu_mem * 100,
@@ -317,26 +317,26 @@ class AtomEngine:
 
         resp_line = self._resp_f.readline()
         if not resp_line:
-            raise RuntimeError("vLLM worker subprocess exited before ready")
+            raise RuntimeError("ATOM worker subprocess exited before ready")
         resp = json.loads(resp_line)
         if resp.get("status") != "ready":
-            raise RuntimeError(f"vLLM worker failed to start: {resp}")
+            raise RuntimeError(f"ATOM worker failed to start: {resp}")
 
         # FIFO stays open for the worker lifetime.
         self._cmd_f = open(self._cmd_fifo, "w")  # noqa: SIM115 -- lifetime handle
 
         self._initialized = True
-        logger.info("AtomEngine: vLLM worker ready (pid=%d).", self._proc.pid)
+        logger.info("AtomEngine: ATOM worker ready (pid=%d).", self._proc.pid)
 
     def _send_cmd(self, cmd: dict) -> dict:
         """Send a JSON command to the worker and read the response."""
         if self._proc is None or self._proc.poll() is not None:
-            raise RuntimeError("vLLM worker is not running")
+            raise RuntimeError("ATOM worker is not running")
         self._cmd_f.write(json.dumps(cmd) + "\n")
         self._cmd_f.flush()
         resp_line = self._resp_f.readline()
         if not resp_line:
-            raise RuntimeError("vLLM worker closed response FIFO unexpectedly")
+            raise RuntimeError("ATOM worker closed response FIFO unexpectedly")
         return json.loads(resp_line)
 
     def generate(
@@ -344,7 +344,7 @@ class AtomEngine:
         prompts: list[str] | list[list[int]],
         sampling_params: Mapping[str, Any] | None = None,
     ) -> list[str]:
-        """Generate text completions via the vLLM worker."""
+        """Generate text completions via the ATOM worker."""
         if not self.is_awake:
             self._start_worker()
 
@@ -390,14 +390,12 @@ class AtomEngine:
         )
 
     def sleep_inprocess(self, level: int = 1) -> None:
-        """Put vLLM to sleep without killing the subprocess.
+        """Put ATOM to sleep without killing the subprocess.
 
-        Uses vLLM's native ``LLM.sleep(level)`` to offload model weights
-        to CPU and free KV cache memory, keeping the subprocess alive
-        for fast ``wake_inprocess()`` restoration.
-
-        Level 1: offload weights to CPU, discard KV cache (fast restore).
-        Level 2: discard weights and KV cache (lower CPU memory).
+        Closes the worker's ``LLMEngine`` and releases its GPU caches while
+        keeping the FIFO command process alive. ``level`` is retained for the
+        common rollout-engine interface; ATOM currently uses the same release
+        behavior for every level.
         """
         if self._proc is None or self._proc.poll() is not None:
             return
@@ -414,9 +412,9 @@ class AtomEngine:
             self.sleep()
 
     def wake_inprocess(self) -> None:
-        """Wake vLLM from in-process sleep (restore weights + KV cache).
+        """Recreate ATOM's ``LLMEngine`` after in-process sleep.
 
-        If the subprocess died or ``wake_up()`` fails (e.g. ROCm page fault),
+        If the subprocess died or recreation fails (e.g. ROCm page fault),
         kills the subprocess, waits briefly for driver cleanup, then starts
         a fresh subprocess.
         """
@@ -441,7 +439,7 @@ class AtomEngine:
         self.wake()
 
     def sleep(self) -> None:
-        """Kill the vLLM subprocess to free all GPU memory for training.
+        """Kill the ATOM subprocess to free all GPU memory for training.
 
         On ROCm, ``del llm`` within the subprocess doesn't release all
         GPU memory because the HIP context retains it.  Terminating
@@ -477,7 +475,7 @@ class AtomEngine:
         logger.info("AtomEngine: sleep complete (subprocess terminated).")
 
     def wake(self) -> None:
-        """Start a fresh vLLM subprocess for generation.
+        """Start a fresh ATOM subprocess for generation.
 
         If ``_weight_dir`` is set (from a prior ``update_weights`` or
         weight-sync call), loads from that path instead of the original

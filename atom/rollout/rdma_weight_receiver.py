@@ -8,7 +8,7 @@ broadcasts BF16 buckets directly into this engine's parameters. No safetensors
 round-trip, no shared folder, no host bounce.
 
 The wire format is frozen by the sending side
-(``lumenrl.engine.inference.rdma_weight_transfer``) and must match byte for byte:
+(``atomrl.engine.inference.rdma_weight_transfer``) and must match byte for byte:
 
     header   4x int64, broadcast from rank 0:
              [command, metadata_bytes, payload_bytes, version]

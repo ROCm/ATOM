@@ -4,7 +4,7 @@
 """The RDMA weight receiver: the wire format, and keeping every rank in step.
 
 The wire format is frozen by the sender
-(``lumenrl.engine.inference.rdma_weight_transfer``) and is reproduced here from
+(``atomrl.engine.inference.rdma_weight_transfer``) and is reproduced here from
 its own constants rather than copied by eye, so a drift on either side shows up
 as a test failure instead of a 61 GB transfer that decodes to garbage.
 
@@ -1061,7 +1061,7 @@ def test_a_refused_stream_keeps_the_version_the_engine_committed(monkeypatch):
 
 
 def _join(send, group_name):
-    """``init_rdma_weight_group`` through the engine, as LumenRL calls it."""
+    """``init_rdma_weight_group`` through the engine, as AtomRL calls it."""
     return send(
         "collective_rpc",
         method="init_rdma_weight_group",

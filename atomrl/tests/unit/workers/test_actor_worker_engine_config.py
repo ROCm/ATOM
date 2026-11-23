@@ -17,7 +17,6 @@ except ModuleNotFoundError:
     )
 
 from atomrl.core.protocol import DataProto
-from atomrl.engine.training.actor_worker import AtomActorWorker as TrainingActorWorker
 from atomrl.workers.actor_worker import AtomActorWorker
 
 
@@ -36,7 +35,7 @@ def _mock_checkpoint_control_group(monkeypatch) -> object:
     return control_group
 
 
-@pytest.mark.parametrize("worker_type", [AtomActorWorker, TrainingActorWorker])
+@pytest.mark.parametrize("worker_type", [AtomActorWorker])
 def test_rank_local_checkpoint_format_bypasses_dist_checkpoint(
     worker_type,
     monkeypatch,
@@ -72,7 +71,7 @@ def test_rank_local_checkpoint_format_bypasses_dist_checkpoint(
     assert extra["global_step"] == 3
 
 
-@pytest.mark.parametrize("worker_type", [AtomActorWorker, TrainingActorWorker])
+@pytest.mark.parametrize("worker_type", [AtomActorWorker])
 def test_rank_local_checkpoint_format_bypasses_dist_checkpoint_load(
     worker_type,
     monkeypatch,
@@ -108,7 +107,7 @@ def test_rank_local_checkpoint_format_bypasses_dist_checkpoint_load(
     assert torch.equal(module.weight, expected_weight)
 
 
-@pytest.mark.parametrize("worker_type", [AtomActorWorker, TrainingActorWorker])
+@pytest.mark.parametrize("worker_type", [AtomActorWorker])
 def test_rank_local_checkpoint_serializes_ranks_with_barriers(
     worker_type,
     monkeypatch,
@@ -142,7 +141,7 @@ def test_rank_local_checkpoint_serializes_ranks_with_barriers(
     assert (tmp_path / "model_world_size_2_rank_1.pt").is_file()
 
 
-@pytest.mark.parametrize("worker_type", [AtomActorWorker, TrainingActorWorker])
+@pytest.mark.parametrize("worker_type", [AtomActorWorker])
 def test_rank_local_checkpoint_saves_one_rank_per_node_in_parallel(
     worker_type,
     monkeypatch,
@@ -176,7 +175,7 @@ def test_rank_local_checkpoint_saves_one_rank_per_node_in_parallel(
     assert (tmp_path / "model_world_size_4_rank_1.pt").is_file()
 
 
-@pytest.mark.parametrize("worker_type", [AtomActorWorker, TrainingActorWorker])
+@pytest.mark.parametrize("worker_type", [AtomActorWorker])
 def test_rank_local_checkpoint_load_preserves_restored_master_params(
     worker_type,
     monkeypatch,
@@ -223,7 +222,7 @@ def test_rank_local_checkpoint_load_preserves_restored_master_params(
     assert optimizer.reload_calls == 0
 
 
-@pytest.mark.parametrize("worker_type", [AtomActorWorker, TrainingActorWorker])
+@pytest.mark.parametrize("worker_type", [AtomActorWorker])
 def test_rank_local_checkpoint_patches_hybrid_optimizer_before_load(
     worker_type,
     monkeypatch,
@@ -266,7 +265,7 @@ def test_rank_local_checkpoint_patches_hybrid_optimizer_before_load(
     assert calls == ["patch_hybrid_optimizer", "load_optimizer"]
 
 
-@pytest.mark.parametrize("worker_type", [AtomActorWorker, TrainingActorWorker])
+@pytest.mark.parametrize("worker_type", [AtomActorWorker])
 def test_rank_local_checkpoint_propagates_peer_load_failure(
     worker_type,
     monkeypatch,
@@ -316,7 +315,7 @@ def test_rank_local_checkpoint_propagates_peer_load_failure(
     assert barriers == []
 
 
-@pytest.mark.parametrize("worker_type", [AtomActorWorker, TrainingActorWorker])
+@pytest.mark.parametrize("worker_type", [AtomActorWorker])
 def test_rank_local_checkpoint_load_serializes_ranks(
     worker_type,
     monkeypatch,
@@ -378,7 +377,7 @@ def test_dsv4_indexer_launch_tuning_reaches_engine_config() -> None:
     assert engine_config["v4_indexer_num_stages"] == 1
 
 
-@pytest.mark.parametrize("worker_type", [AtomActorWorker, TrainingActorWorker])
+@pytest.mark.parametrize("worker_type", [AtomActorWorker])
 def test_precision_aware_optimizer_reaches_dsv4_engine_config(worker_type) -> None:
     worker = object.__new__(worker_type)
     worker.config = {}
@@ -392,7 +391,7 @@ def test_precision_aware_optimizer_reaches_dsv4_engine_config(worker_type) -> No
     assert engine_config["use_precision_aware_optimizer"] is True
 
 
-@pytest.mark.parametrize("worker_type", [AtomActorWorker, TrainingActorWorker])
+@pytest.mark.parametrize("worker_type", [AtomActorWorker])
 def test_streamed_optimizer_settings_reach_dsv4_engine_config(worker_type) -> None:
     worker = object.__new__(worker_type)
     worker.config = {}
@@ -414,7 +413,7 @@ def test_streamed_optimizer_settings_reach_dsv4_engine_config(worker_type) -> No
     assert engine_config["streamed_optimizer_moment_dtype"] == "bf16"
 
 
-@pytest.mark.parametrize("worker_type", [AtomActorWorker, TrainingActorWorker])
+@pytest.mark.parametrize("worker_type", [AtomActorWorker])
 @pytest.mark.parametrize(
     ("megatron_cfg", "expected_mode", "expected_chunk_size_mib"),
     [
@@ -448,7 +447,7 @@ def test_streamed_optimizer_settings_are_normalized_with_defaults(
     assert engine_config["streamed_optimizer_chunk_size_mib"] == expected_chunk_size_mib
 
 
-@pytest.mark.parametrize("worker_type", [AtomActorWorker, TrainingActorWorker])
+@pytest.mark.parametrize("worker_type", [AtomActorWorker])
 @pytest.mark.parametrize(
     "config_factory",
     [
@@ -481,7 +480,7 @@ def test_mapping_megatron_config_reaches_dsv4_engine_config(
     assert engine_config["tensor_model_parallel_size"] == 8
 
 
-@pytest.mark.parametrize("worker_type", [AtomActorWorker, TrainingActorWorker])
+@pytest.mark.parametrize("worker_type", [AtomActorWorker])
 @pytest.mark.parametrize(
     "config_factory",
     [
@@ -512,7 +511,7 @@ def test_streamed_optimizer_rejects_lossy_chunk_size_coercion(
         )
 
 
-@pytest.mark.parametrize("worker_type", [AtomActorWorker, TrainingActorWorker])
+@pytest.mark.parametrize("worker_type", [AtomActorWorker])
 @pytest.mark.parametrize(
     "config_factory",
     [
@@ -540,7 +539,7 @@ def test_streamed_optimizer_normalizes_integer_chunk_size(
     assert isinstance(engine_config["streamed_optimizer_chunk_size_mib"], int)
 
 
-@pytest.mark.parametrize("worker_type", [AtomActorWorker, TrainingActorWorker])
+@pytest.mark.parametrize("worker_type", [AtomActorWorker])
 def test_actor_grpo_loss_uses_miles_asymmetric_sequence_mean(worker_type) -> None:
     worker = object.__new__(worker_type)
     worker._engine = None
@@ -568,7 +567,7 @@ def test_actor_grpo_loss_uses_miles_asymmetric_sequence_mean(worker_type) -> Non
     assert metrics["loss"] == pytest.approx(float(loss.detach()))
 
 
-@pytest.mark.parametrize("worker_type", [AtomActorWorker, TrainingActorWorker])
+@pytest.mark.parametrize("worker_type", [AtomActorWorker])
 def test_actor_grpo_loss_applies_rollout_importance_weights(worker_type) -> None:
     worker = object.__new__(worker_type)
     worker._engine = None
@@ -596,7 +595,7 @@ def test_actor_grpo_loss_applies_rollout_importance_weights(worker_type) -> None
     assert metrics["loss"] == pytest.approx(float(loss.detach()))
 
 
-@pytest.mark.parametrize("worker_type", [AtomActorWorker, TrainingActorWorker])
+@pytest.mark.parametrize("worker_type", [AtomActorWorker])
 def test_actor_legacy_grpo_loss_applies_rollout_importance_weights(
     worker_type,
 ) -> None:
@@ -608,7 +607,7 @@ def test_actor_legacy_grpo_loss_applies_rollout_importance_weights(
     assert "rollout_is_weights=ris" in grpo_branch
 
 
-@pytest.mark.parametrize("worker_type", [AtomActorWorker, TrainingActorWorker])
+@pytest.mark.parametrize("worker_type", [AtomActorWorker])
 def test_actor_grpo_reports_sum_of_global_microbatch_contributions(
     worker_type,
 ) -> None:

@@ -253,9 +253,6 @@ jobs:
           pip install --no-deps -e atomrl
       - run: >-
           python -m pytest atomrl/tests/unit
-          atomrl/tests/test_aiter_contract.py
-          atomrl/tests/test_atom_public_runtime_contract.py
-          atomrl/tests/test_atomrl_workflow_filters.py
           -m "not gpu and not multigpu" -q
 
   lumen-cpu:

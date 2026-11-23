@@ -25,18 +25,6 @@ def _is_gfx950():
     return "gfx950" in torch.cuda.get_device_properties(0).gcnArchName
 
 
-
-
-
-
-
-
-
-
-
-
-
-
 @pytest.fixture
 def rebuild_at_rounds():
     saved = os.environ.get("LUMEN_SR_PHILOX_ROUNDS")
