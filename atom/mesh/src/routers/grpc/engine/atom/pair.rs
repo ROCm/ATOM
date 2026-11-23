@@ -101,13 +101,14 @@ impl AtomPairs {
             return Ok(AtomAdapter::new(self.info.read().unwrap().clone()));
         }
         let mut learned = AtomPrefillInfo::default();
-        // A rank still registered read this instance: its info serves this sibling too.
-        let sibling = self
-            .read_for
-            .read()
-            .unwrap()
-            .get(&base)
-            .and_then(Weak::upgrade);
+        // A rank still registered read this instance: its info serves this sibling too,
+        // unless this rank replaced one, whose siblings may be the old instance's.
+        let sibling = {
+            let read_for = self.read_for.read().unwrap();
+            let replaced = read_for.contains_key(url);
+            let sibling = read_for.get(&base).and_then(Weak::upgrade);
+            sibling.filter(|_| !replaced)
+        };
         let registered = |w: &Arc<dyn Worker>| {
             self.workers
                 .get_by_url(w.url())
@@ -128,13 +129,29 @@ impl AtomPairs {
         learn(&mut learned, prefill).await?;
         let mut info = self.info.write().unwrap();
         let mut merged = AtomPrefillInfo::clone(&info);
+        let mut read_for = self.read_for.write().unwrap();
+        if read_instance {
+            // What was read replaces what every rank of this instance took before.
+            let ranks: Vec<String> = read_for
+                .iter()
+                .filter(|(_, w)| w.upgrade().is_some_and(|w| base_url(&w) == base))
+                .map(|(rank, _)| rank.clone())
+                .collect();
+            for rank in ranks {
+                learned
+                    .tp_sizes
+                    .insert(rank.clone(), learned.tp_sizes[&base]);
+                if let Some(template) = learned.chunked_transfer.get(&base).cloned() {
+                    learned.chunked_transfer.insert(rank, template);
+                }
+            }
+        }
         for url in learned.tp_sizes.keys() {
             merged.chunked_transfer.remove(url);
         }
         merged.tp_sizes.extend(learned.tp_sizes);
         merged.chunked_transfer.extend(learned.chunked_transfer);
         *info = Arc::new(merged);
-        let mut read_for = self.read_for.write().unwrap();
         if read_instance {
             read_for.insert(base, this.clone());
         }

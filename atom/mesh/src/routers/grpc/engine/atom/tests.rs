@@ -1178,6 +1178,51 @@ mod pairs {
         assert_eq!(tp_and_chunked(&decodes[1]), (json!(4), Value::Null));
     }
 
+    #[tokio::test]
+    async fn a_dp_rank_replaced_before_its_sibling_reads_the_new_instance() {
+        let (_, p_url) = instance(Vec::new(), false, prefill_info(2, Some(template()))).await;
+        let (replacement, replacement_url) =
+            instance(Vec::new(), false, prefill_info(4, None)).await;
+        let registry = Arc::new(WorkerRegistry::new());
+        let pairs = AtomPairs::new(registry.clone(), AtomPdRankMappingPolicy::Idx2Idx)
+            .await
+            .unwrap();
+        let old = ranks(&p_url, PREFILL).await;
+        for worker in old.iter().rev() {
+            registry.register(worker.clone());
+            pairs.adapter_for(worker).await.unwrap();
+        }
+
+        // The instance restarts with four ranks. Rank 2 is new, so it takes its
+        // sibling's info; rank 0 then replaces the old rank 0, rank 1 still registered.
+        let client = GrpcClient::connect(&replacement_url, "atom").await.unwrap();
+        let new_rank = |rank| -> Arc<dyn Worker> {
+            Arc::new(
+                DPAwareWorkerBuilder::new(&p_url, rank, 4)
+                    .worker_type(PREFILL)
+                    .connection_mode(ConnectionMode::Grpc { port: None })
+                    .runtime_type(RuntimeType::Atom)
+                    .grpc_client(client.clone())
+                    .build(),
+            )
+        };
+        let (rank0, rank2) = (new_rank(0), new_rank(2));
+        registry.register(rank2.clone());
+        pairs.adapter_for(&rank2).await.unwrap();
+        registry.remove_by_url(old[0].url());
+        registry.register(rank0.clone());
+        pairs.adapter_for(&rank0).await.unwrap();
+        let info = pairs.adapter_for(&rank2).await.unwrap().prefill_info;
+        for rank in [&rank0, &rank2] {
+            assert_eq!(info.tp_sizes.get(rank.url()), Some(&4));
+            assert!(!info.chunked_transfer.contains_key(rank.url()));
+        }
+        let reads = replacement
+            .server_info_reads
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(reads, 1);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn a_pairs_streamed_ttft_includes_the_prefill() {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
