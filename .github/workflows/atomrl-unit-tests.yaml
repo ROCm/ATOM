@@ -78,13 +78,15 @@ jobs:
               - '!atomrl/tests/lumen/**'
             dapo_shard:
               - '.github/workflows/atomrl-dapo-gpu-shard.yaml'
-            atomrl_gpu_code:
-              - 'atomrl/**/*.{py,sh,bash,yaml,yml,toml,json,c,cc,cpp,cu,hip}'
-              - '!atomrl/setup.py'
-              - '!atomrl/lumen/**'
+            atomrl_gpu_core:
+              - 'atomrl/atomrl/**/*.{py,c,cc,cpp,cu,hip}'
               - '!atomrl/atomrl/lumen/**'
-              - '!atomrl/tests/lumen/**'
-              - '!atomrl/atomrl-docs/**'
+            dapo_gpu_examples:
+              - 'atomrl/examples/{DAPO,GRPO,SDDD,harness}/**/*.{py,sh,bash,yaml,yml,toml,json}'
+            dapo_gpu_runner:
+              - 'atomrl/examples/run.sh'
+            dapo_gpu_catalog:
+              - 'atomrl/examples/examples.yaml'
             atomrl_gpu_docker:
               - 'atomrl/**/Dockerfile*'
               - '!atomrl/lumen/**'
@@ -114,8 +116,11 @@ jobs:
           LUMEN_COMPAT: ${{ steps.classify.outputs.lumen_compat }}
           DAPO_EXAMPLES: ${{ steps.classify.outputs.dapo_examples }}
           DAPO_SHARD: ${{ steps.classify.outputs.dapo_shard }}
-          ATOMRL_GPU_CODE: ${{ steps.classify.outputs.atomrl_gpu_code }}
+          ATOMRL_GPU_CORE: ${{ steps.classify.outputs.atomrl_gpu_core }}
           ATOMRL_GPU_DOCKER: ${{ steps.classify.outputs.atomrl_gpu_docker }}
+          DAPO_GPU_EXAMPLES: ${{ steps.classify.outputs.dapo_gpu_examples }}
+          DAPO_GPU_RUNNER: ${{ steps.classify.outputs.dapo_gpu_runner }}
+          DAPO_GPU_CATALOG: ${{ steps.classify.outputs.dapo_gpu_catalog }}
           LUMEN_GPU_CODE: ${{ steps.classify.outputs.lumen_gpu_code }}
           LUMEN_GPU_DOCKER: ${{ steps.classify.outputs.lumen_gpu_docker }}
           LUMEN_GPU_DEPS: ${{ steps.classify.outputs.lumen_gpu_deps }}
@@ -130,6 +135,9 @@ jobs:
           run_lumen_gpu=false
           run_packaging=false
           if [[ "$ATOMRL" == true || "$DAPO_EXAMPLES" == true ||
+                "$LUMEN_PACKAGE" == true || "$LUMEN_TESTS" == true ||
+                "$LUMEN_GPU_CODE" == true || "$LUMEN_GPU_DEPS" == true ||
+                "$LUMEN_GPU_SETUP" == true ||
                 "$DAPO_SHARD" == true ||
                 "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
             run_atomrl=true
@@ -140,7 +148,10 @@ jobs:
                 "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
             run_lumen=true
           fi
-          if [[ "$ATOMRL_GPU_CODE" == true || "$ATOMRL_GPU_DOCKER" == true ||
+          if [[ "$ATOMRL_GPU_CORE" == true || "$ATOMRL_GPU_DOCKER" == true ||
+                "$LUMEN_PACKAGE" == true || "$LUMEN_GPU_SETUP" == true ||
+                "$DAPO_GPU_EXAMPLES" == true || "$DAPO_GPU_RUNNER" == true ||
+                "$DAPO_GPU_CATALOG" == true ||
                 "$DAPO_SHARD" == true ||
                 "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
             run_atomrl_gpu=true

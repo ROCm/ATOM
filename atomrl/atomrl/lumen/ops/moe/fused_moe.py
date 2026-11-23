@@ -30,15 +30,19 @@ _DEFAULT_MOE_CONFIG: dict[str, int] = {
 
 @functools.lru_cache(maxsize=1)
 def _get_aiter_moe_align_block_size():
-    from aiter.ops.triton.moe.moe_align_block_size import moe_align_block_size_triton
-
-    return moe_align_block_size_triton
+    try:
+        from aiter.ops.moe_op import moe_align_block_size
+    except (ImportError, ModuleNotFoundError):
+        return None
+    return moe_align_block_size
 
 
 @functools.lru_cache(maxsize=1)
 def _get_aiter_fused_moe():
-    from aiter.ops.triton.moe.moe_op import fused_moe
-
+    try:
+        from aiter.ops.triton.moe.moe_op import fused_moe
+    except (ImportError, ModuleNotFoundError):
+        return None
     return fused_moe
 
 
@@ -120,6 +124,9 @@ def _align_tokens(
         (sorted_token_ids, expert_ids, num_tokens_post_pad)
     """
     moe_align = _get_aiter_moe_align_block_size()
+    if moe_align is None:
+        return _align_tokens_torch(topk_ids, num_experts, block_size)
+
     numel = topk_ids.numel()
     max_num_tokens_padded = numel + num_experts * (block_size - 1)
     max_num_m_blocks = _ceil_div(max_num_tokens_padded, block_size)
@@ -132,6 +139,7 @@ def _align_tokens(
         device=device,
     )
     expert_ids = torch.empty(max_num_m_blocks, dtype=torch.int32, device=device)
+    token_nums = torch.empty(max_num_m_blocks, dtype=torch.int32, device=device)
     num_tokens_post_pad = torch.empty(1, dtype=torch.int32, device=device)
 
     moe_align(
@@ -140,6 +148,7 @@ def _align_tokens(
         block_size,
         sorted_token_ids,
         expert_ids,
+        token_nums,
         num_tokens_post_pad,
     )
     torch.cuda.synchronize()
@@ -197,6 +206,20 @@ def fused_moe_triton(
     assert hidden_states.is_cuda, "fused_moe_triton requires CUDA tensors"
 
     fused_moe_fn = _get_aiter_fused_moe()
+    if fused_moe_fn is None:
+        if use_fp8:
+            raise RuntimeError(
+                "The installed AITER does not provide the Triton fused MoE FP8 kernel"
+            )
+        return _fused_moe_torch(
+            hidden_states,
+            expert_weights,
+            topk_ids,
+            topk_weights,
+            k,
+            mul_routed_weight,
+        )
+
     moe_config = config if config is not None else _DEFAULT_MOE_CONFIG
     block_size_m = moe_config["BLOCK_SIZE_M"]
 

@@ -124,12 +124,18 @@ from aiter.ops.gradlib import hipb_create_extension, hipb_mm
 hipb_create_extension()
 candidates = json.loads(sys.argv[1])
 valid = {}
+props = torch.cuda.get_device_properties(torch.cuda.current_device())
+fp8_dtype = (
+    torch.float8_e4m3fn
+    if (props.major, props.minor) >= (9, 5)
+    else torch.float8_e4m3fnuz
+)
 for key, sol_idx in candidates.items():
     M, N, K = (int(x) for x in key.split(","))
     try:
         m = min(M, 64)
-        a = torch.randn(m, K, device="cuda").to(torch.float8_e4m3fnuz)
-        w = torch.randn(N, K, device="cuda").to(torch.float8_e4m3fnuz)
+        a = torch.randn(m, K, device="cuda").to(fp8_dtype)
+        w = torch.randn(N, K, device="cuda").to(fp8_dtype)
         s = torch.tensor([[1.0]], dtype=torch.float32, device="cuda")
         hipb_mm(a, w.t(), sol_idx, out_dtype=torch.bfloat16, scaleA=s, scaleB=s)
         torch.cuda.synchronize()

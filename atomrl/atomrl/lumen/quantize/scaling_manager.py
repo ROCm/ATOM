@@ -969,8 +969,8 @@ class ScalingManager:
     ) -> "torch.Tensor | tuple[torch.Tensor, torch.Tensor]":
         """Fused per-tensor static quant via AITER Triton (x / scale -> fp8).
 
-        When *compute_amax* is True, returns ``(fp8_tensor, amax)`` by piggybacking
-        the amax reduction onto the quantization kernel (zero extra memory passes).
+        When *compute_amax* is True, returns ``(fp8_tensor, amax)``. AITER owns
+        quantization; PyTorch computes the accompanying statistic.
         """
         if tensor.dim() == 2:
             tensor_2d = tensor.contiguous()
@@ -993,17 +993,10 @@ class ScalingManager:
             scale_in = scale_in.to(device=tensor.device)
 
         if compute_amax:
-            from aiter.ops.triton.quant import static_per_tensor_quant_fp8_i8_with_amax
+            from aiter.ops.triton.quant import static_per_tensor_quant_fp8_i8
 
-            from atomrl.lumen.ops.quantize.quant_amax_fused import _get_amax_scratch
-
-            amax_buf = _get_amax_scratch(tensor.device)
-            if os.environ.get("LUMEN_ZERO_OVERLAP", "1") != "1":
-                amax_buf.zero_()
-            static_per_tensor_quant_fp8_i8_with_amax(qx, tensor_2d, scale_in, amax_buf)
-            result = amax_buf.clone()
-            amax_buf.zero_()  # pre-zero for next call; overlaps with subsequent GPU work
-            return qx.view(tensor.shape), result
+            static_per_tensor_quant_fp8_i8(qx, tensor_2d, scale_in)
+            return qx.view(tensor.shape), tensor_2d.abs().amax().float()
         else:
             from aiter.ops.triton.quant import static_per_tensor_quant_fp8_i8
 

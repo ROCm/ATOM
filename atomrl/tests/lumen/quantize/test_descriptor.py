@@ -2,6 +2,7 @@
 import pytest
 import torch
 from atomrl.lumen.ops.quantize.linear import quantize_input
+from atomrl.lumen.quantize.config import _get_float8_e4m3
 from atomrl.lumen.quantize.descriptor import FP8Descriptor
 
 
@@ -57,7 +58,7 @@ class TestFP8Descriptor:
     def test_quantize_input_dynamic_returns_fp8_descriptor(self):
         device = torch.device("cuda")
         x = torch.randn(8, 16, dtype=torch.bfloat16, device=device)
-        fp8_dtype = torch.float8_e4m3fnuz
+        fp8_dtype = _get_float8_e4m3()
         desc = quantize_input(x, "dynamic", fp8_dtype)
         assert isinstance(desc, FP8Descriptor)
         assert desc.data.shape == x.shape
@@ -72,7 +73,7 @@ class TestFP8Descriptor:
     def test_quantize_input_per_token_returns_fp8_descriptor(self):
         device = torch.device("cuda")
         x = torch.randn(4, 32, dtype=torch.bfloat16, device=device)
-        fp8_dtype = torch.float8_e4m3fnuz
+        fp8_dtype = _get_float8_e4m3()
         desc = quantize_input(x, "per_token", fp8_dtype)
         assert isinstance(desc, FP8Descriptor)
         assert desc.data.shape == x.shape
@@ -84,7 +85,7 @@ class TestDispatchGemmDescriptor:
     def test_accepts_descriptors(self):
         from atomrl.lumen.ops.quantize.linear import dispatch_gemm
 
-        fp8_dtype = torch.float8_e4m3fnuz
+        fp8_dtype = _get_float8_e4m3()
         a = FP8Descriptor(
             data=torch.randn(4, 64, device="cuda").to(fp8_dtype),
             scale=torch.tensor(1.0, device="cuda"),

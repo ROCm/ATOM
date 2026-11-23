@@ -119,6 +119,7 @@ def apply_rotary_pos_emb(
         Rotated tensor, same shape as x.
     """
     assert x.dim() == 4, f"Expected 4D BHSD tensor, got {x.dim()}D"
+    assert x.is_cuda, "AITER RoPE requires a CUDA tensor"
 
     rope_cached_fwd = _get_aiter_rope_cached_fwd()
     rotate_style = GPTJ_STYLE if interleaved else NEOX_STYLE
@@ -268,6 +269,7 @@ def apply_rotary_pos_emb_2d(
     Returns:
         Rotated tensor, same shape as x.
     """
+    assert x.is_cuda, "AITER 2D RoPE requires a CUDA tensor"
     rope_fwd_2d = _get_aiter_rope_fwd_2d()
     out = rope_fwd_2d(
         x,
@@ -305,6 +307,7 @@ def apply_rotary_pos_emb_3d(
     Returns:
         Rotated tensor (float32).
     """
+    assert x.is_cuda, "AITER 3D RoPE requires a CUDA tensor"
     rope_fwd_3d = _get_aiter_rope_fwd_3d()
     out = rope_fwd_3d(x, grid_sizes, freqs, sp_size, sp_rank)
     if not _SKIP_SYNC:

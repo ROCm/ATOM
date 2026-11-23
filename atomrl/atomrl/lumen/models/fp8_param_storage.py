@@ -6,6 +6,7 @@ import os
 
 import torch
 
+from atomrl.lumen.quantize.config import _get_float8_e4m3
 from atomrl.lumen.quantize.descriptor import FP8Descriptor
 
 
@@ -21,7 +22,7 @@ def shrink_frozen_weights_to_fp8(model) -> None:
     import torch
     from megatron.training import print_rank_0
 
-    fp8_dtype = torch.float8_e4m3fnuz
+    fp8_dtype = _get_float8_e4m3()
     count = 0
     for _name, module in model.named_modules():
         w = getattr(module, "weight", None)
@@ -86,7 +87,7 @@ def patch_meta_materializer() -> None:
                     continue
                 if id(param) in fp8_data_map:
                     if param.data.device == torch.device("meta"):
-                        fp8_dtype = torch.float8_e4m3fnuz
+                        fp8_dtype = _get_float8_e4m3()
                         new_data = torch.zeros(1, dtype=fp8_dtype, device=device)
                     else:
                         new_data = param.data.to(device)
@@ -324,7 +325,7 @@ def patch_load_checkpoint_for_fp8() -> None:
             print_rank_0(f"> GPU memory right after ckpt load: {alloc:.2f}GB")
 
         targets = ddp_model if isinstance(ddp_model, list) else [ddp_model]
-        fp8_dtype = torch.float8_e4m3fnuz
+        fp8_dtype = _get_float8_e4m3()
         converted = 0
         freed_bytes = 0
         already_fp8 = 0

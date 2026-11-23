@@ -12,7 +12,9 @@ import torch
 
 # Load the example by path. ``examples`` is not a package on the ATOM pytest
 # root, and the image also ships another ``examples`` tree.
-_ENTRY = Path(__file__).resolve().parents[2] / "examples/qwen3/train_qwen3_fsdp.py"
+_ENTRY = (
+    Path(__file__).resolve().parents[3] / "lumen/examples/qwen3/train_qwen3_fsdp.py"
+)
 _spec = importlib.util.spec_from_file_location("train_qwen3_fsdp", _ENTRY)
 _train = importlib.util.module_from_spec(_spec)
 sys.modules["train_qwen3_fsdp"] = _train

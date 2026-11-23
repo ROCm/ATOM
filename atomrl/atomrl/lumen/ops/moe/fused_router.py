@@ -20,25 +20,23 @@ logger = logging.getLogger(__name__)
 
 
 def _aiter_softmax_topk(logits_fp32: Tensor, k: int, need_renorm: bool):
-    """Call AITER HIP softmax_topk, allocating output buffers."""
-    N, E = logits_fp32.shape
+    """Call AITER's public top-k router and return full softmax scores."""
+    num_tokens = logits_fp32.shape[0]
     device = logits_fp32.device
-    scores = torch.empty(N, E, dtype=torch.float32, device=device)
-    topk_weights = torch.empty(N, k, dtype=torch.float32, device=device)
-    topk_indices = torch.empty(N, k, dtype=torch.int32, device=device)
-    token_expert_indices = torch.empty(N, k, dtype=torch.int32, device=device)
+    topk_weights = torch.empty(num_tokens, k, dtype=torch.float32, device=device)
+    topk_indices = torch.empty(num_tokens, k, dtype=torch.int32, device=device)
+    token_expert_indices = torch.empty(num_tokens, k, dtype=torch.int32, device=device)
 
-    from aiter.ops.moe_op import softmax_topk
+    from aiter.ops.moe_op import topk_softmax
 
-    softmax_topk(
-        scores,
+    topk_softmax(
         topk_weights,
         topk_indices,
         token_expert_indices,
         logits_fp32.contiguous(),
-        k,
         need_renorm,
     )
+    scores = torch.softmax(logits_fp32, dim=-1)
     return scores, topk_weights, topk_indices
 
 
@@ -174,19 +172,28 @@ class LumenFusedMoEAuxLoss(torch.autograd.Function):
         ctx.N = probs.shape[0]
         ctx.E = num_experts
 
-        from aiter.ops.triton.moe.moe_aux_loss import moe_aux_loss_fwd
-
+        try:
+            from aiter.ops.triton.moe.moe_aux_loss import moe_aux_loss_fwd
+        except ModuleNotFoundError:
+            return (probs.float().sum(dim=0) * tokens_per_expert.float()).sum() * C
         return moe_aux_loss_fwd(probs.float(), tokens_per_expert.float(), C)
 
     @staticmethod
     def backward(ctx, grad_aux_loss: Tensor):
         (tokens_per_expert,) = ctx.saved_tensors
 
-        from aiter.ops.triton.moe.moe_aux_loss import moe_aux_loss_bwd
-
-        grad_probs = moe_aux_loss_bwd(
-            tokens_per_expert.float(), ctx.C, grad_aux_loss, ctx.N, ctx.E
-        )
+        try:
+            from aiter.ops.triton.moe.moe_aux_loss import moe_aux_loss_bwd
+        except ModuleNotFoundError:
+            grad_probs = (
+                tokens_per_expert.float().unsqueeze(0).expand(ctx.N, ctx.E)
+                * ctx.C
+                * grad_aux_loss
+            )
+        else:
+            grad_probs = moe_aux_loss_bwd(
+                tokens_per_expert.float(), ctx.C, grad_aux_loss, ctx.N, ctx.E
+            )
 
         return grad_probs, None, None, None, None, None
 

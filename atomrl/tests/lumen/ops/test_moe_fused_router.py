@@ -79,7 +79,7 @@ def test_fused_topk_with_score_function(N, E, topk, use_pre_softmax, scaling_fac
     from atomrl.lumen.ops.moe.fused_router import fused_topk_with_score_function
 
     torch.manual_seed(42)
-    logits = torch.randn(N, E, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    logits = torch.randn(N, E, device="cuda", dtype=torch.float32, requires_grad=True)
 
     routing_map, routing_probs = fused_topk_with_score_function(
         logits,
@@ -132,7 +132,7 @@ def test_fused_compute_score_for_moe_aux_loss(N, E, topk):
     from atomrl.lumen.ops.moe.fused_router import fused_compute_score_for_moe_aux_loss
 
     torch.manual_seed(42)
-    logits = torch.randn(N, E, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    logits = torch.randn(N, E, device="cuda", dtype=torch.float32, requires_grad=True)
 
     routing_map, scores = fused_compute_score_for_moe_aux_loss(logits, topk, "softmax")
 

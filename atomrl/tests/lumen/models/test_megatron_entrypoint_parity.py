@@ -9,26 +9,18 @@
 import ast
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
-LLAMA31_EXAMPLE = REPO_ROOT / "examples" / "llama31" / "pretrain_llama31.py"
-LLAMA2_EXAMPLE = REPO_ROOT / "examples" / "llama2" / "finetune_llama2.py"
+LLAMA31_EXAMPLE = REPO_ROOT / "lumen" / "examples" / "llama31" / "pretrain_llama31.py"
+LLAMA2_EXAMPLE = REPO_ROOT / "lumen" / "examples" / "llama2" / "finetune_llama2.py"
 LLAMA31_MEGATRON = (
-    REPO_ROOT.parent
-    / "atomrl"
-    / "lumen"
-    / "models"
-    / "llama31"
-    / "megatron"
-    / "pretrain.py"
+    REPO_ROOT / "atomrl" / "lumen" / "models" / "llama31" / "megatron" / "pretrain.py"
 )
 LLAMA2_MEGATRON = (
-    REPO_ROOT.parent / "atomrl" / "lumen" / "models" / "llama2" / "megatron" / "sft.py"
+    REPO_ROOT / "atomrl" / "lumen" / "models" / "llama2" / "megatron" / "sft.py"
 )
-LLAMA_BUILDERS = (
-    REPO_ROOT.parent / "atomrl" / "lumen" / "patches" / "builders" / "llama.py"
-)
-SHARED_MEGATRON = REPO_ROOT.parent / "atomrl" / "lumen" / "models" / "megatron.py"
+LLAMA_BUILDERS = REPO_ROOT / "atomrl" / "lumen" / "patches" / "builders" / "llama.py"
+SHARED_MEGATRON = REPO_ROOT / "atomrl" / "lumen" / "models" / "megatron.py"
 
 MOVED_SHARED_FLAGS = {
     "--use-ckpt",
