@@ -737,6 +737,37 @@ mod pairs {
     }
 
     #[tokio::test]
+    async fn a_prefill_registered_after_startup_is_read_on_its_first_pair() {
+        let p_script = vec![vec![prefill_done(json!({}))]];
+        let (p, p_url) = instance(p_script, false, prefill_info(2, Some(template()))).await;
+        let (d, d_url) = instance(vec![vec![complete(&[21], "eos")]], false, None).await;
+        let (pw, dw) = (worker(&p_url, PREFILL), worker(&d_url, WorkerType::Decode));
+        let registry = Arc::new(WorkerRegistry::new());
+        registry.register(dw.clone());
+        let pairs = AtomPairs::new(registry.clone(), AtomPdRankMappingPolicy::Idx2Idx)
+            .await
+            .unwrap();
+        registry.register(pw.clone());
+
+        let engine = GrpcEngine::with_atom_pairs(pairs);
+        let plan = PlacementPlan::Pair {
+            prefill: pw,
+            decode: dw,
+            prefill_policy: "random",
+            decode_policy: "random",
+        };
+        let handle = engine.dispatch(&plan, &mut payload(false)).await.unwrap();
+        let chunks = timeout(HANG, handle.collect::<Vec<_>>()).await.unwrap();
+        assert!(
+            matches!(&chunks[..], [Ok(TokenChunk::Complete { .. })]),
+            "{chunks:?}"
+        );
+        // Its GetServerInfo was read: chunked transfer, and its TP size for D.
+        assert_eq!(kv(&first(&p))["chunked_transfer"], json!(true));
+        assert_eq!(kv(&first(&d))["remote_tp_size"], json!(2));
+    }
+
+    #[tokio::test]
     async fn each_rank_takes_its_instances_info_and_idx2idx_runs_prefill_on_decodes_rank() {
         let (p, p_url) = instance(vec![vec![]], true, prefill_info(4, Some(template()))).await;
         let (d, d_url) = instance(vec![vec![complete(&[21], "eos")]], false, None).await;
@@ -752,7 +783,7 @@ mod pairs {
             .await
             .unwrap();
         // The instance's GetServerInfo gives each of its ranks the TP size and template.
-        let info = pairs.adapter.prefill_info.clone();
+        let info = pairs.adapter_for(&prefill[0]).await.unwrap().prefill_info;
         let urls = [p_url.clone(), format!("{p_url}@0"), format!("{p_url}@1")];
         assert_eq!(info.tp_sizes, urls.clone().map(|url| (url, 4)).into());
         assert_eq!(
