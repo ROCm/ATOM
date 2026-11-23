@@ -1052,6 +1052,47 @@ mod pairs {
         );
     }
 
+    /// Concurrent first pairs to a prefill that stops answering fail together, within
+    /// one health-check timeout, rather than one read's timeout after another.
+    #[tokio::test]
+    async fn concurrent_first_pairs_of_a_stalled_prefill_share_one_timeout() {
+        let fake = Arc::new(FakeAtom {
+            stall_server_info: true,
+            ..Default::default()
+        });
+        let url = serve(fake).await;
+        let health = HealthConfig {
+            timeout_secs: 1,
+            ..Default::default()
+        };
+        let stalled: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(&url)
+                .worker_type(PREFILL)
+                .connection_mode(ConnectionMode::Grpc { port: None })
+                .runtime_type(RuntimeType::Atom)
+                .health_config(health)
+                .build(),
+        );
+        let pairs = AtomPairs::new(
+            Arc::new(WorkerRegistry::new()),
+            AtomPdRankMappingPolicy::Idx2Idx,
+        )
+        .await
+        .unwrap();
+        let started = std::time::Instant::now();
+        let reads = (0..4).map(|_| pairs.adapter_for(&stalled));
+        let results = timeout(HANG, futures::future::join_all(reads)).await;
+        let elapsed = started.elapsed();
+        for result in results.unwrap() {
+            let error = result.err().unwrap();
+            assert!(
+                matches!(&error, EngineError::Http { status, .. } if *status == StatusCode::GATEWAY_TIMEOUT),
+                "{error}"
+            );
+        }
+        assert!(elapsed < Duration::from_millis(1800), "{elapsed:?}");
+    }
+
     #[tokio::test]
     async fn concurrent_first_pairs_of_a_prefill_read_its_info_once() {
         let (p, p_url) = instance(Vec::new(), false, prefill_info(2, None)).await;
