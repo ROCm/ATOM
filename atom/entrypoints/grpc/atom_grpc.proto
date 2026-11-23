@@ -131,6 +131,10 @@ message GetModelInfoResponse {
   // server.py's router_parser_names; absent: atomesh's model-name mapping chooses.
   optional string tool_call_parser = 9;
   optional string reasoning_parser = 10;
+  // A streamed chat's usage rides on its finish chunk, and include_usage adds
+  // "usage": null to the chunks before it; false: a usage-only chunk ends every
+  // stream. APICompatibility.usage_on_finish, which the model's encoder selects.
+  bool usage_on_finish = 11;
 }
 
 message GetServerInfoRequest {}

@@ -665,6 +665,21 @@ def test_model_info_names_the_router_parsers(serve, monkeypatch):
     assert not info.HasField("reasoning_parser")
 
 
+@pytest.mark.parametrize(
+    "encoder, usage_on_finish", [(None, False), ("encoding_dsv41", True)]
+)
+def test_model_info_places_streamed_usage_as_the_encoder_does(
+    serve, monkeypatch, encoder, usage_on_finish
+):
+    engine = FakeEngine()
+    engine.config.end_token_ids = [2]
+    monkeypatch.setattr(api_server, "tokenizer", SimpleNamespace(chat_template=None))
+    encoder = encoder and SimpleNamespace(name=encoder)
+    monkeypatch.setattr(api_server, "custom_message_encoder", encoder)
+    info = asyncio.run(serve(engine).GetModelInfo(pb.GetModelInfoRequest(), None))
+    assert info.usage_on_finish is usage_on_finish
+
+
 def test_server_info_carries_the_kv_event_sources_body(serve, monkeypatch):
     engine = FakeEngine()
     sources = {"0": {"endpoint": "tcp://*:5557", "topic": "kv", "block_size": 16}}
