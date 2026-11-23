@@ -577,13 +577,13 @@ def start_grpc_server(api: ModuleType, args: Namespace) -> Callable[[], None]:
         target=_run, args=(address, servicer, listening), name=THREAD_NAME, daemon=True
     )
     thread.start()
-    loop, server = listening.result()
+    loop, stopping = listening.result()
 
     def stop() -> None:
         """Refuses new calls and ends the running ones, their seqs aborted; run before
         the engine closes, which would leave them waiting forever."""
-        asyncio.run_coroutine_threadsafe(server.stop(None), loop).result()
-        thread.join()  # stop returns before the calls' teardown has run
+        loop.call_soon_threadsafe(stopping.set)
+        thread.join()  # server.stop returns before the calls' teardown has run
 
     return stop
 
@@ -605,5 +605,8 @@ async def _serve(address: str, servicer: AtomEngineServicer, listening: Future) 
     except Exception as error:  # noqa: BLE001 - start_grpc_server raises it
         listening.set_exception(error)
         return
-    listening.set_result((asyncio.get_running_loop(), server))
-    await server.wait_for_termination()
+    stopping = asyncio.Event()
+    listening.set_result((asyncio.get_running_loop(), stopping))
+    await stopping.wait()
+    # Stopped here, not from another task: asyncio.run would cancel that one.
+    await server.stop(None)
