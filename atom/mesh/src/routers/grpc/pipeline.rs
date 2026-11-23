@@ -19,7 +19,7 @@ use crate::{
             types::{PlacementError, PlacementPlan, Protocol, RequestDescriptor},
         },
         worker::RuntimeType,
-        AttachedBody, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
+        AttachedBody, Worker, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
     observability::metrics::{bool_to_static_str, metrics_labels, MeshMetrics},
     policies::PolicyRegistry,
@@ -41,6 +41,7 @@ use crate::{
         render,
         token_handle::engine_error::EngineError,
     },
+    tokenizer::{traits::Tokenizer, StopSequenceDecoder},
 };
 
 #[derive(Clone)]
@@ -48,10 +49,64 @@ pub(crate) struct Pipeline {
     planner: Arc<dyn PdPlanner>,
     engine: Arc<dyn Dispatcher>,
     backend_label: &'static str,
+    /// Every output read as ATOM's servers read it (`AtomOutput`), whatever produced
+    /// it; otherwise only an ATOM worker's.
+    atom_output: Option<Arc<AtomOutput>>,
 }
 
-#[cfg(test)]
+/// The label an ATOM worker lists its end-of-sequence ids under, GetModelInfo's.
+const EOS_TOKEN_IDS_LABEL: &str = "eos_token_ids";
+
+/// ATOM's servers' reading of an output: the prompt's opener read first, no stop cut
+/// (ATOM ends where a stop's ids match and returns it all), end-of-sequence ids hidden.
+pub(crate) struct AtomOutput {
+    end_token_ids: Vec<u32>,
+}
+
+impl AtomOutput {
+    pub(crate) fn new(end_token_ids: Vec<u32>) -> Self {
+        Self { end_token_ids }
+    }
+
+    /// An ATOM worker's: the end-of-sequence ids its GetModelInfo listed.
+    fn of_worker(worker: &dyn Worker) -> Self {
+        let listed = worker.metadata().labels.get(EOS_TOKEN_IDS_LABEL);
+        Self::new(
+            listed
+                .and_then(|ids| serde_json::from_str(ids).ok())
+                .unwrap_or_default(),
+        )
+    }
+
+    /// The request's decoder: none of its stops, and the end-of-sequence ids
+    /// hidden unless it asked to run past them.
+    fn stop_decoder(&self, ctx: &ResponseContext) -> StopSequenceDecoder {
+        let (skip_special_tokens, ignore_eos) = match &ctx.original {
+            ProtocolRequest::Chat(req) => (req.skip_special_tokens, req.ignore_eos),
+            ProtocolRequest::Generate(req) => {
+                let params = req.sampling_params.as_ref();
+                (
+                    params.and_then(|p| p.skip_special_tokens).unwrap_or(true),
+                    params.and_then(|p| p.ignore_eos).unwrap_or(false),
+                )
+            }
+        };
+        self.decoder(&ctx.tokenizer, skip_special_tokens, ignore_eos)
+    }
+
+    fn decoder(
+        &self,
+        tokenizer: &Arc<dyn Tokenizer>,
+        skip_special_tokens: bool,
+        ignore_eos: bool,
+    ) -> StopSequenceDecoder {
+        let end_token_ids = (!ignore_eos).then_some(&self.end_token_ids);
+        create_stop_decoder(tokenizer, None, end_token_ids, skip_special_tokens, false)
+    }
+}
+
 impl Pipeline {
+    #[cfg(test)]
     pub(crate) fn with_injected(
         planner: Arc<dyn PdPlanner>,
         engine: Arc<dyn Dispatcher>,
@@ -61,7 +116,35 @@ impl Pipeline {
             planner,
             engine,
             backend_label,
+            atom_output: None,
         }
+    }
+
+    /// Read every output as ATOM's servers read it (`AtomOutput`).
+    #[cfg_attr(not(test), allow(dead_code))] // for an in-process ATOM front end
+    pub(crate) fn reading_output_as_atom(mut self, atom_output: AtomOutput) -> Self {
+        self.atom_output = Some(Arc::new(atom_output));
+        self
+    }
+
+    /// Give a placed request the decoder `AtomOutput` reads with, if its producer's
+    /// output is ATOM's (D's for a pair); any other keeps the router's reading.
+    fn read_as_atom(&self, plan: &PlacementPlan, ctx: &mut ResponseContext) {
+        let producer = match plan {
+            PlacementPlan::Single { worker, .. } => worker,
+            PlacementPlan::Pair { decode, .. } => decode,
+        };
+        let atom = match &self.atom_output {
+            Some(atom) => Arc::clone(atom),
+            None if producer.metadata().runtime_type == RuntimeType::Atom => {
+                Arc::new(AtomOutput::of_worker(producer.as_ref()))
+            }
+            None => {
+                ctx.prompt_opener = None;
+                return;
+            }
+        };
+        ctx.stop_decoder = atom.stop_decoder(ctx);
     }
 }
 
@@ -106,6 +189,7 @@ impl Pipeline {
             planner,
             engine: Arc::new(GrpcEngine::new()),
             backend_label,
+            atom_output: None,
         }
     }
 
@@ -137,7 +221,7 @@ impl Pipeline {
             Ok(p) => p,
             Err(e) => return self.record_chat_err(&model, start, e),
         };
-        drop_stops_for_atom(&placement, &mut resp_ctx);
+        self.read_as_atom(&placement, &mut resp_ctx);
         let guards = self.load_guards(&placement, resp_ctx.headers.as_ref());
         let stream = match self
             .engine
@@ -197,7 +281,7 @@ impl Pipeline {
             Ok(p) => p,
             Err(e) => return self.record_generate_err(&model_for_metric, start, e),
         };
-        drop_stops_for_atom(&placement, &mut resp_ctx);
+        self.read_as_atom(&placement, &mut resp_ctx);
         let guards = self.load_guards(&placement, resp_ctx.headers.as_ref());
         let stream = match self
             .engine
@@ -321,27 +405,6 @@ impl Pipeline {
     }
 }
 
-/// ATOM ends an output where a stop string's ids match, and its HTTP routes return all of it:
-/// so the output of an ATOM worker, or ATOM D, is decoded with none of the request's stops.
-fn drop_stops_for_atom(plan: &PlacementPlan, ctx: &mut ResponseContext) {
-    let producer = match plan {
-        PlacementPlan::Single { worker, .. } => worker,
-        PlacementPlan::Pair { decode, .. } => decode,
-    };
-    if producer.metadata().runtime_type != RuntimeType::Atom {
-        return;
-    }
-    let skip_special_tokens = match &ctx.original {
-        ProtocolRequest::Chat(req) => req.skip_special_tokens,
-        ProtocolRequest::Generate(req) => req
-            .sampling_params
-            .as_ref()
-            .and_then(|p| p.skip_special_tokens)
-            .unwrap_or(true),
-    };
-    ctx.stop_decoder = create_stop_decoder(&ctx.tokenizer, None, None, skip_special_tokens, false);
-}
-
 fn make_load_guards(plan: &PlacementPlan, headers: Option<&HeaderMap>) -> Vec<WorkerLoadGuard> {
     match plan {
         PlacementPlan::Single { worker, .. } => {
@@ -392,5 +455,161 @@ fn engine_err_to_response(err: EngineError) -> Response {
         EngineError::Http { status, message } => {
             error::create_error(status, "engine_error", message)
         }
+    }
+}
+
+#[cfg(test)]
+mod atom_output_tests {
+    use super::*;
+    use crate::{
+        core::BasicWorkerBuilder,
+        protocols::generate::GenerateRequest,
+        routers::test_mocks::{
+            dispatcher::MockDispatcher, planner::MockPdPlanner, tokenizer::byte_level_tokenizer_dir,
+        },
+        tokenizer::{huggingface::HuggingFaceTokenizer, stop::SequenceDecoderOutput},
+    };
+
+    /// A `/generate` of `body`, prepared as the router prepares it: its own
+    /// stops in its decoder.
+    fn generate_ctx(tokenizer: &Arc<dyn Tokenizer>, body: &str) -> ResponseContext {
+        let req: GenerateRequest = serde_json::from_str(body).unwrap();
+        let params = req.sampling_params.as_ref();
+        let stop_decoder = create_stop_decoder(
+            tokenizer,
+            params.and_then(|p| p.stop.as_ref()),
+            None,
+            params.and_then(|p| p.skip_special_tokens).unwrap_or(true),
+            false,
+        );
+        ResponseContext {
+            original: ProtocolRequest::Generate(Arc::new(req)),
+            model_id: None,
+            headers: None,
+            original_text: None,
+            processed_messages: None,
+            tokenizer: Arc::clone(tokenizer),
+            stop_decoder,
+            request_id: "gen-1".to_string(),
+            created: 0,
+            tool_parser_factory: None,
+            reasoning_parser_factory: None,
+            configured_tool_parser: None,
+            configured_reasoning_parser: None,
+            prompt_opener: Some("<think>".to_string()),
+        }
+    }
+
+    /// The text `decoder` makes of `ids`.
+    fn decode(decoder: &mut StopSequenceDecoder, ids: &[u32]) -> String {
+        let mut text = String::new();
+        for &id in ids {
+            match decoder.process_token(id).unwrap() {
+                SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) => {
+                    text.push_str(&t)
+                }
+                SequenceDecoderOutput::Stopped | SequenceDecoderOutput::Held => {}
+            }
+        }
+        if let SequenceDecoderOutput::Text(t) = decoder.flush() {
+            text.push_str(&t);
+        }
+        text
+    }
+
+    fn pipeline() -> Pipeline {
+        Pipeline::with_injected(
+            Arc::new(MockPdPlanner::new(vec![])),
+            Arc::new(MockDispatcher::new(vec![])),
+            "regular",
+        )
+    }
+
+    fn single(runtime: RuntimeType, labels: &[(&str, &str)]) -> PlacementPlan {
+        let mut builder = BasicWorkerBuilder::new("grpc://w:1").runtime_type(runtime);
+        for (key, value) in labels {
+            builder = builder.label(*key, *value);
+        }
+        PlacementPlan::Single {
+            worker: Arc::new(builder.build()),
+            policy_name: "random",
+        }
+    }
+
+    fn byte_level() -> Arc<dyn Tokenizer> {
+        let dir = byte_level_tokenizer_dir(&[], false, serde_json::json!({}));
+        let path = dir.path().join("tokenizer.json");
+        Arc::new(HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap())
+    }
+
+    // "</s>", the second token added after the 256 bytes, ends the output.
+    const EOS: u32 = 257;
+    // Special tokens kept, so only the end ids' hiding keeps "</s>" out.
+    const STOPPED_AT_DOT: &str =
+        r#"{"text": "hi", "sampling_params": {"stop": ["."], "skip_special_tokens": false}}"#;
+
+    fn output() -> Vec<u32> {
+        let ids: Vec<u32> = "ab. c".bytes().map(u32::from).collect();
+        [ids.as_slice(), &[EOS]].concat()
+    }
+
+    #[test]
+    fn atom_output_keeps_the_text_past_a_stop_and_hides_the_end_of_sequence() {
+        let tokenizer = byte_level();
+        let output = output();
+        let plan = single(RuntimeType::Sglang, &[]);
+
+        let mut ctx = generate_ctx(&tokenizer, STOPPED_AT_DOT);
+        pipeline().read_as_atom(&plan, &mut ctx);
+        // The router's own reading cuts at the stop, and keeps no opener.
+        assert_eq!(decode(&mut ctx.stop_decoder, &output), "ab");
+        assert_eq!(ctx.prompt_opener, None);
+
+        let atom = pipeline().reading_output_as_atom(AtomOutput::new(vec![EOS]));
+        let mut ctx = generate_ctx(&tokenizer, STOPPED_AT_DOT);
+        atom.read_as_atom(&plan, &mut ctx);
+        // The engine stopped where the stop's ids matched; the text is all of it.
+        assert_eq!(decode(&mut ctx.stop_decoder, &output), "ab. c");
+        assert_eq!(ctx.prompt_opener.as_deref(), Some("<think>"));
+    }
+
+    #[test]
+    fn an_atom_producer_is_read_with_the_end_ids_its_worker_lists() {
+        let tokenizer = byte_level();
+        let output = output();
+        let eos = EOS.to_string();
+        let listed = format!("[{eos}]");
+        let atom = single(RuntimeType::Atom, &[(EOS_TOKEN_IDS_LABEL, &listed)]);
+
+        let mut ctx = generate_ctx(&tokenizer, STOPPED_AT_DOT);
+        pipeline().read_as_atom(&atom, &mut ctx);
+        assert_eq!(decode(&mut ctx.stop_decoder, &output), "ab. c");
+        assert_eq!(ctx.prompt_opener.as_deref(), Some("<think>"));
+
+        // ignore_eos runs past the end ids, so they stay in the text.
+        let body = r#"{"text": "hi", "sampling_params": {"ignore_eos": true, "skip_special_tokens": false}}"#;
+        let mut ctx = generate_ctx(&tokenizer, body);
+        pipeline().read_as_atom(&atom, &mut ctx);
+        assert_eq!(decode(&mut ctx.stop_decoder, &output), "ab. c</s>");
+
+        // A pair's output is its decode worker's.
+        let PlacementPlan::Single { worker, .. } = atom else {
+            unreachable!()
+        };
+        let PlacementPlan::Single {
+            worker: prefill, ..
+        } = single(RuntimeType::Sglang, &[])
+        else {
+            unreachable!()
+        };
+        let pair = PlacementPlan::Pair {
+            prefill,
+            decode: worker,
+            prefill_policy: "random",
+            decode_policy: "random",
+        };
+        let mut ctx = generate_ctx(&tokenizer, STOPPED_AT_DOT);
+        pipeline().read_as_atom(&pair, &mut ctx);
+        assert_eq!(decode(&mut ctx.stop_decoder, &output), "ab. c");
     }
 }

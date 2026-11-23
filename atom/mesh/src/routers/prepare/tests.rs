@@ -1098,6 +1098,7 @@ mod f_response_context {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         }
     }
 
@@ -1145,6 +1146,7 @@ mod f_response_context {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         };
         assert_eq!(ctx.headers.as_ref().unwrap().get("x-trace").unwrap(), "abc");
     }
@@ -1167,6 +1169,7 @@ mod f_response_context {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         };
         assert!(ctx.processed_messages.is_none());
     }
@@ -1523,11 +1526,22 @@ mod i_atom_structured_output {
 
     use crate::core::{worker::RuntimeType, BasicWorkerBuilder};
     use crate::protocols::chat::ChatCompletionRequest;
-    use crate::routers::prepare::{generation_payload::GenerationPayload, prepare_chat};
+    use crate::routers::prepare::{
+        generation_payload::GenerationPayload, prepare_chat, response_context::ResponseContext,
+    };
     use crate::routers::test_mocks;
 
     /// `body` prepared for model "m", whose one worker runs `runtime` with `labels`.
     fn prepare(body: Value, runtime: RuntimeType, labels: &[(&str, &str)]) -> GenerationPayload {
+        prepared(body, runtime, labels).0
+    }
+
+    /// As `prepare`, with its response context.
+    fn prepared(
+        body: Value,
+        runtime: RuntimeType,
+        labels: &[(&str, &str)],
+    ) -> (GenerationPayload, ResponseContext) {
         let ctx = test_mocks::app_context_with_hf_tokenizer("m");
         let mut worker = BasicWorkerBuilder::new("grpc://worker:1")
             .runtime_type(runtime)
@@ -1539,8 +1553,7 @@ mod i_atom_structured_output {
         }
         ctx.worker_registry.register(Arc::new(worker.build()));
         let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
-        let (payload, _) = prepare_chat(Arc::new(request), None, Some("m".into()), &ctx).unwrap();
-        payload
+        prepare_chat(Arc::new(request), None, Some("m".into()), &ctx).unwrap()
     }
 
     fn parsed(json: Option<String>) -> Option<Value> {
@@ -1572,9 +1585,11 @@ mod i_atom_structured_output {
             ),
             ("reasoning_open_markers", r#"["<mm:think>", "<think>"]"#),
         ];
-        let payload = prepare(body.clone(), RuntimeType::Atom, &labels);
+        let (payload, ctx) = prepared(body.clone(), RuntimeType::Atom, &labels);
 
         assert!(payload.text.ends_with("hi <think>\n"), "{}", payload.text);
+        // The marker it ends on is read before the reply.
+        assert_eq!(ctx.prompt_opener.as_deref(), Some("<think>"));
         let carried = payload.structured_output.expect("an ATOM chat carries one");
         assert_eq!(parsed(carried.tools_json), Some(body["tools"].clone()));
         assert_eq!(
@@ -1596,9 +1611,9 @@ mod i_atom_structured_output {
     fn a_plain_atom_chat_carries_no_fields_and_its_prompt_opens_no_reasoning() {
         let body = json!({"model": "m", "messages": [{"role": "user", "content": "<think> hi"}]});
         let labels = [("reasoning_open_markers", r#"["<think>"]"#)];
-        let carried = prepare(body, RuntimeType::Atom, &labels)
-            .structured_output
-            .expect("an ATOM chat carries one");
+        let (payload, ctx) = prepared(body, RuntimeType::Atom, &labels);
+        assert_eq!(ctx.prompt_opener, None);
+        let carried = payload.structured_output.expect("an ATOM chat carries one");
 
         let fields = [
             carried.tools_json,

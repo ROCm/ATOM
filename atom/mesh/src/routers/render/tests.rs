@@ -27,6 +27,7 @@ mod test_support {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         }
     }
 
@@ -51,6 +52,7 @@ mod test_support {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         }
     }
 }
@@ -214,6 +216,7 @@ mod b2_chat_aggregator_branches {
             reasoning_parser_factory: Some(test_mocks::reasoning_parser_factory()),
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         }
     }
 
@@ -581,6 +584,7 @@ mod b3_chat_aggregator_typed {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         }
     }
 
@@ -993,6 +997,7 @@ mod c2_chat_streaming_branches {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         }
     }
 
@@ -1409,6 +1414,7 @@ mod c3_chat_streaming_parsers {
             reasoning_parser_factory: Some(test_mocks::reasoning_parser_factory()),
             configured_tool_parser: configured_tool.map(|s| s.to_string()),
             configured_reasoning_parser: configured_reasoning.map(|s| s.to_string()),
+            prompt_opener: None,
         }
     }
 
@@ -1617,6 +1623,7 @@ mod c4_chat_streaming_coverage {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         }
     }
 
@@ -1638,6 +1645,7 @@ mod c4_chat_streaming_coverage {
             reasoning_parser_factory: Some(test_mocks::reasoning_parser_factory()),
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         }
     }
 
@@ -1658,6 +1666,7 @@ mod c4_chat_streaming_coverage {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         }
     }
 
@@ -2281,6 +2290,7 @@ mod c4_chat_streaming_coverage {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         };
         let stream = synthetic_single_stream(vec![
             Ok(TokenChunk::Partial {
@@ -3059,6 +3069,7 @@ mod d2_generate_aggregator_branches {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         };
         let stream = synthetic_single_stream(vec![Ok(TokenChunk::Complete {
             token_ids: vec![1, 2, 3],
@@ -3105,6 +3116,7 @@ mod d2_generate_aggregator_branches {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         };
         let lp = TokenLogprobs {
             items: vec![TokenLogprob {
@@ -3517,6 +3529,7 @@ mod e2_generate_streaming_branches {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         }
     }
 
@@ -3888,5 +3901,143 @@ mod e3_generate_streaming_across_chunks {
                 .filter_map(|e| e["choices"][0]["text"].as_str());
             assert_eq!(pieces.collect::<String>(), text);
         }
+    }
+}
+
+mod f_atom_reasoning_opener {
+    use std::sync::Arc;
+
+    use axum::body::to_bytes;
+    use serde_json::Value;
+
+    use crate::protocols::chat::ChatCompletionRequest;
+    use crate::routers::prepare::response_context::{ProtocolRequest, ResponseContext};
+    use crate::routers::prepare::stop_decoder_builder::create_stop_decoder;
+    use crate::routers::render::{chat_aggregator, chat_streaming};
+    use crate::routers::test_mocks;
+    use crate::routers::token_handle::test_support::synthetic_single_stream;
+    use crate::routers::token_handle::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
+    use crate::tokenizer::{huggingface::HuggingFaceTokenizer, traits::Tokenizer};
+
+    /// A byte-level BPE, which encodes any text.
+    fn tokenizer() -> Arc<dyn Tokenizer> {
+        let dir =
+            test_mocks::tokenizer::byte_level_tokenizer_dir(&[], false, serde_json::json!({}));
+        let path = dir.path().join("tokenizer.json");
+        Arc::new(HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap())
+    }
+
+    /// A chat whose reply is read with qwen3, which starts outside reasoning, after
+    /// `opener`, the prompt's.
+    fn ctx(stream: bool, opener: Option<&str>) -> ResponseContext {
+        let tokenizer = tokenizer();
+        let stop_decoder = create_stop_decoder(&tokenizer, None, None, true, false);
+        let req = ChatCompletionRequest {
+            stream,
+            separate_reasoning: true,
+            ..Default::default()
+        };
+        ResponseContext {
+            original: ProtocolRequest::Chat(Arc::new(req)),
+            model_id: Some("m".to_string()),
+            headers: None,
+            original_text: None,
+            processed_messages: None,
+            tokenizer,
+            stop_decoder,
+            request_id: "rid".to_string(),
+            created: 0,
+            tool_parser_factory: None,
+            reasoning_parser_factory: Some(test_mocks::reasoning_parser_factory()),
+            configured_tool_parser: None,
+            configured_reasoning_parser: Some("qwen3".to_string()),
+            prompt_opener: opener.map(str::to_string),
+        }
+    }
+
+    /// `reply`'s ids, streamed one at a time when `partials`, then its Complete.
+    fn chunks(reply: &str, partials: bool) -> Vec<TokenChunk> {
+        let ids = tokenizer()
+            .encode(reply, false)
+            .unwrap()
+            .token_ids()
+            .to_vec();
+        let mut chunks: Vec<TokenChunk> = Vec::new();
+        if partials {
+            chunks.extend(ids.iter().map(|&id| TokenChunk::Partial {
+                token_ids: vec![id],
+                logprobs: None,
+            }));
+        }
+        chunks.push(TokenChunk::Complete {
+            token_ids: if partials { Vec::new() } else { ids.clone() },
+            finish_reason: FinishReason::Stop,
+            matched_stop: None,
+            usage: Usage {
+                prompt_tokens: 1,
+                completion_tokens: ids.len() as u32,
+                total_tokens: 1 + ids.len() as u32,
+            },
+            logprobs: None,
+            input_logprobs: None,
+            meta: WorkerMeta::default(),
+        });
+        chunks
+    }
+
+    /// (reasoning, content) of `reply` answered unary.
+    async fn unary(reply: &str, opener: Option<&str>) -> (String, String) {
+        let stream = synthetic_single_stream(chunks(reply, false).into_iter().map(Ok).collect());
+        let resp = chat_aggregator::process(stream, ctx(false, opener)).await;
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let message = &json["choices"][0]["message"];
+        let text = |key: &str| message[key].as_str().unwrap_or_default().to_string();
+        (text("reasoning_content"), text("content"))
+    }
+
+    /// (reasoning, content) of `reply` streamed, its deltas joined.
+    async fn streamed(reply: &str, opener: Option<&str>) -> (String, String) {
+        let stream = synthetic_single_stream(chunks(reply, true).into_iter().map(Ok).collect());
+        let resp = chat_streaming::process(stream, ctx(true, opener), "regular");
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let (mut reasoning, mut content) = (String::new(), String::new());
+        for line in String::from_utf8_lossy(&body).lines() {
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            let Ok(event) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
+            let delta = &event["choices"][0]["delta"];
+            reasoning.push_str(delta["reasoning_content"].as_str().unwrap_or_default());
+            content.push_str(delta["content"].as_str().unwrap_or_default());
+        }
+        (reasoning, content)
+    }
+
+    #[tokio::test]
+    async fn a_reply_to_a_prompt_that_closed_reasoning_is_content() {
+        // A thinking-off prompt ends in "</think>": no opener.
+        let expected = (String::new(), "Hello world".to_string());
+        assert_eq!(unary("Hello world", None).await, expected);
+        assert_eq!(streamed("Hello world", None).await, expected);
+    }
+
+    #[tokio::test]
+    async fn a_reply_to_a_prompt_that_opened_reasoning_is_reasoning_up_to_its_closer() {
+        let reply = "plan it</think>The answer";
+        let expected = ("plan it".to_string(), "The answer".to_string());
+        assert_eq!(unary(reply, Some("<think>")).await, expected);
+        let (reasoning, content) = streamed(reply, Some("<think>")).await;
+        assert_eq!(
+            (reasoning.trim(), content.trim()),
+            ("plan it", "The answer")
+        );
+
+        // Cut before its closer, it is reasoning all through.
+        let expected = ("still planning".to_string(), String::new());
+        assert_eq!(unary("still planning", Some("<think>")).await, expected);
+        assert_eq!(streamed("still planning", Some("<think>")).await, expected);
     }
 }

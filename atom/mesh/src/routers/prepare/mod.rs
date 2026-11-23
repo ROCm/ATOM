@@ -118,8 +118,15 @@ pub fn prepare_chat(
     let atom = workers
         .iter()
         .any(|worker| worker.metadata().runtime_type == RuntimeType::Atom);
+    let prompt_opener = if atom {
+        let markers = reasoning_open_markers(&workers)
+            .map_err(|e| error::internal_error("invalid_structured_output", e))?;
+        response_context::prompt_opener(&processed.text, &markers)
+    } else {
+        None
+    };
     let structured_output = atom
-        .then(|| structured_output(&req, &processed.text, &template_kwargs, &workers))
+        .then(|| structured_output(&req, &template_kwargs, prompt_opener.is_some()))
         .transpose()
         .map_err(|e| error::internal_error("invalid_structured_output", e))?;
 
@@ -161,6 +168,7 @@ pub fn prepare_chat(
         reasoning_parser_factory: components.reasoning_parser_factory.clone(),
         configured_tool_parser: components.configured_tool_parser.clone(),
         configured_reasoning_parser: components.configured_reasoning_parser.clone(),
+        prompt_opener,
     };
 
     Ok((payload, ctx))
@@ -216,6 +224,7 @@ pub fn prepare_generate(
         reasoning_parser_factory: components.reasoning_parser_factory.clone(),
         configured_tool_parser: components.configured_tool_parser.clone(),
         configured_reasoning_parser: components.configured_reasoning_parser.clone(),
+        prompt_opener: None,
     };
 
     Ok((payload, ctx))
@@ -304,15 +313,9 @@ pub(crate) fn build_chat_payload(
     }
 }
 
-/// What an ATOM worker's chat route derives `req`'s structured output from: its fields
-/// as sent, the `kwargs` that rendered `text`, and whether `text` opens reasoning.
-fn structured_output(
-    req: &ChatCompletionRequest,
-    text: &str,
-    kwargs: &HashMap<String, Value>,
-    workers: &[Arc<dyn Worker>],
-) -> Result<StructuredOutput, String> {
-    let markers: Vec<String> = workers
+/// The markers an ATOM worker of the model lists as opening reasoning; none if none does.
+fn reasoning_open_markers(workers: &[Arc<dyn Worker>]) -> Result<Vec<String>, String> {
+    Ok(workers
         .iter()
         .find_map(|worker| worker.metadata().labels.get(REASONING_OPEN_MARKERS_LABEL))
         .map(|json| {
@@ -320,7 +323,16 @@ fn structured_output(
                 .map_err(|e| format!("Invalid {REASONING_OPEN_MARKERS_LABEL} label {json}: {e}"))
         })
         .transpose()?
-        .unwrap_or_default();
+        .unwrap_or_default())
+}
+
+/// What an ATOM worker's chat route derives `req`'s structured output from: its fields
+/// as sent, the `kwargs` its prompt rendered with, and whether that prompt opens reasoning.
+fn structured_output(
+    req: &ChatCompletionRequest,
+    kwargs: &HashMap<String, Value>,
+    prompt_opens_reasoning: bool,
+) -> Result<StructuredOutput, String> {
     // atomesh's ChatMessage keeps a message's own tools on a developer message only.
     let message_tools: Vec<_> = req
         .messages
@@ -330,7 +342,6 @@ fn structured_output(
             _ => None,
         })
         .collect();
-    let prompt = text.trim_end();
     Ok(StructuredOutput {
         tools_json: req.tools.as_ref().map(to_json).transpose()?,
         tool_choice_json: req.tool_choice.as_ref().map(to_json).transpose()?,
@@ -341,9 +352,7 @@ fn structured_output(
             .then(|| to_json(&message_tools))
             .transpose()?,
         chat_template_kwargs_json: to_json(kwargs)?,
-        prompt_opens_reasoning: markers
-            .iter()
-            .any(|marker| prompt.ends_with(marker.as_str())),
+        prompt_opens_reasoning,
     })
 }
 
