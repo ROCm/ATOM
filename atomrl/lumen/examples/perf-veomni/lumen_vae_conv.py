@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""Route a diffusers VAE's convolutions through aiter's FlyDSL kernel (``veomni_patches.aiter_conv``).
+"""Route a diffusers VAE's convolutions through Lumen's convolution API.
 
 Used by ``train_dit_lumen.py`` (LUMEN_PATCH=vae_conv / vae_conv_video),
-``verify_aiter_conv.py``, which checks it against the unpatched model, and
-``tune_conv3d.py``.
+``verify_aiter_conv.py``, which checks it against the unpatched model.
 
 Why this is safe here
 ---------------------
 ``DiTTrainer._freeze_model_module`` calls ``condition_model.requires_grad_(False)``
 and the task is ``online_training``, so the VAE runs forward-only inside
-``@torch.no_grad()``. FlyDSL has no dgrad/wgrad, and that is exactly the
-constraint this workload already satisfies.
+``@torch.no_grad()``. Lumen's convolution route also supports autograd for
+other callers.
 
 Two rewrites, because images and video are different problems
 -------------------------------------------------------------
@@ -34,7 +33,7 @@ leaving conv3d is worth more than the kernel swap is (2.27x versus 1.13x at
 from the feature cache rather than from zeros. No 2-D identity exists: the
 cached frames are real data, so dropping the other kernel slices would change
 the result. Here the module's own padding is left exactly as it is and only the
-convolution underneath it is replaced, with the FlyDSL ``conv3d`` on the unmodified
+convolution underneath it is replaced, with Lumen ``conv3d`` on the unmodified
 5-D filter. ``nn.Conv3d.forward`` is a single call to
 ``self._conv_forward(input, self.weight, self.bias)``, so rebinding
 ``_conv_forward`` swaps the kernel and nothing else -- the causal padding and the
@@ -43,13 +42,13 @@ the part that would be easy to get wrong.
 
 The second rewrite is what ``video=True`` adds, and it is where a video VAE's
 time goes: at 17 frames of 480x832, 83.3% of one Wan encode's convolution time
-is on T>1 or feature-cache calls, and FlyDSL is 1.60x torch on them.
+is on T>1 or feature-cache calls.
 
 What is left on torch, and why
 ------------------------------
 Pointwise convolutions -- ``conv_shortcut``, ``quant_conv``, and Wan's
 ``time_conv`` (3x1x1, so its *spatial* kernel is 1) -- are launch-bound and
-measure 0.88-1.05x through FlyDSL. ``min_spatial_kernel`` skips them.
+are skipped by ``min_spatial_kernel``.
 
 The plain ``nn.Conv2d`` spatial resamplers are resolution-dependent and so are
 tied to ``video``: 0.88x at Qwen-Image's 256^2, but 1.19-1.86x on Wan's
@@ -93,7 +92,7 @@ def _degenerate_to_conv2d(m):
     return (pad_h_t, pad_w_l)
 
 
-def _bind_flydsl_kernel(m):
+def _bind_lumen_kernel(m):
     """Replace the convolution inside an ``nn.Conv{2,3}d``, leaving its padding alone.
 
     Applies at any time extent, which is the point: the caller keeps whatever
@@ -121,7 +120,7 @@ def _bind_causal_pad_in_kernel(m):
     The stock forward prepends the feature cache, then ``F.pad``s a full copy of
     the input and convolves it with ``padding=0``. Once the cache is prepended the
     temporal padding is zero for every chunk after the second, and the spatial
-    padding is symmetric, which the FlyDSL kernel applies in-kernel with range
+    padding is symmetric, which the Lumen kernel applies in-kernel with range
     masks and no copy. Measured on Wan2.1 at 81x368x544: that ``F.pad`` is ~41 ms
     of every training step. Temporal front padding the cache does not cover still
     needs real zero frames, so only that is materialised, and only in time.
@@ -257,7 +256,7 @@ def patch_vae_convs(
         if video:
             # Puts the kernel underneath the module's own padding, so the calls
             # the identity above cannot claim are covered too.
-            _bind_flydsl_kernel(m)
+            _bind_lumen_kernel(m)
             how.append("conv3d" if isinstance(m, nn.Conv3d) else "conv2d")
 
         if not how:

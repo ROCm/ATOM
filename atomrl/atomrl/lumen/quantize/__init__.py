@@ -604,56 +604,9 @@ def _mxfp4_cached_weight(
     ):
         return wcache, wscale
 
-    from atomrl.lumen.ops.quantize.linear import (
-        _mark_mxfp4_data_shuffled,
-        _mark_mxfp4_scale_swizzled,
-        _mxfp4_can_fuse_b_shuffle,
-        _mxfp4_can_fuse_scale_swizzle,
-        quantize_input,
-    )
-    from atomrl.lumen.ops.quantize.ops import (
-        swizzle_expanded_mxfp4_scale,
-        transpose_packed_fp4,
-    )
+    from atomrl.lumen.ops.quantize.linear import quantize_input
+    from atomrl.lumen.ops.quantize.ops import transpose_packed_fp4
 
-    n_out, k_in = weight.shape
-    # Anything the quantizer has to pad no longer matches the shapes the fusions
-    # were cleared for, and every shape they pay off on is aligned already.
-    unpadded = n_out % block_size == 0 and k_in % block_size == 0
-
-    # Neither weight operand has a consumer other than a GEMM, so when the
-    # backend for its shape reads the shuffled order it is built in that order:
-    # the forward's by the quantizer, DGrad's by the transpose. Each fusion
-    # drops a read+write pass over the whole FP4 weight, once per step.
-    fuse_fwd_shuffle = (
-        unpadded
-        and gemm_rows is not None
-        and _mxfp4_can_fuse_b_shuffle(
-            (gemm_rows, n_out, k_in),
-            n_out,
-            k_in // 2,
-        )
-    )
-    fuse_dgrad_shuffle = (
-        unpadded
-        and gemm_rows is not None
-        and _mxfp4_can_fuse_b_shuffle(
-            (gemm_rows, k_in, n_out),
-            k_in,
-            n_out // 2,
-        )
-    )
-
-    # The two fusions are what the layout depends on, and they are decided from
-    # gemm_rows -- so the cache is keyed on them, not on the module alone.
-    # Keyed on the module, the first micro-batch's row count fixed the layout
-    # for the whole step: a later GEMM whose row count dispatches to a backend
-    # reading the other order either trips the quantizer/dispatch disagreement
-    # assertion or, for the operand with no such check, reads permuted bytes as
-    # if they were in place. A pipeline's last micro-batch and a ragged final
-    # batch both change the row count. Two row counts that agree on both
-    # fusions share the entry, so nothing is rebuilt that need not be.
-    layout = (fuse_fwd_shuffle, fuse_dgrad_shuffle)
     cached = getattr(module, "_mxfp4_w_cache", None)
     # Optimizers update Parameters in-place and increment ``_version``. Keying
     # the cache on that generation makes the generic ``quant.enable(nn.Linear)``
@@ -663,10 +616,9 @@ def _mxfp4_cached_weight(
     weight_version = weight._version
     if (
         cached is not None
-        and cached[0] == layout
         and getattr(module, "_mxfp4_w_cache_version", None) == weight_version
     ):
-        return cached[1], cached[2]
+        return cached[0], cached[1]
 
     desc = quantize_input(
         weight.contiguous(),
@@ -676,38 +628,14 @@ def _mxfp4_cached_weight(
         None,
         None,
         is_weight=True,
-        shuffle_data=fuse_fwd_shuffle,
     )
     data, scale = desc.data, desc.scale
 
-    data_t = transpose_packed_fp4(
-        data,
-        shuffle_data=fuse_dgrad_shuffle,
-        in_shuffled=fuse_fwd_shuffle,
-    )
-    if fuse_dgrad_shuffle:
-        _mark_mxfp4_data_shuffled(data_t)
-
-    # Both operand layouts read the same tile scales, only replicated down a
-    # different axis, and a GEMM is their only consumer. Building each one
-    # directly in the GEMM's order turns five passes over the scales -- two
-    # expansions, two swizzles and a transposing copy -- into two.
-    _is_tile_grid = tuple(scale.shape) == (n_out // block_size, k_in // block_size)
-    if _is_tile_grid and _mxfp4_can_fuse_scale_swizzle(
-        (n_out, k_in // block_size),
-        (k_in, n_out // block_size),
-    ):
-        fwd_scale = _mark_mxfp4_scale_swizzled(
-            swizzle_expanded_mxfp4_scale(scale, block_size=block_size)
-        )
-        dgrad_scale = _mark_mxfp4_scale_swizzled(
-            swizzle_expanded_mxfp4_scale(scale, block_size=block_size, transpose=True)
-        )
-    else:
-        fwd_scale, dgrad_scale = scale, scale.t().contiguous()
+    data_t = transpose_packed_fp4(data)
+    fwd_scale, dgrad_scale = scale, scale.t().contiguous()
 
     data._mxfp4_wt_cached = (data_t, dgrad_scale)
-    module._mxfp4_w_cache = (layout, data, fwd_scale)
+    module._mxfp4_w_cache = (data, fwd_scale)
     module._mxfp4_w_cache_version = weight_version
     return data, fwd_scale
 

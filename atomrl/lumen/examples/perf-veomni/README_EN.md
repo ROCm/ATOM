@@ -6,8 +6,12 @@ A three-level performance ladder for two diffusion-model training workloads on V
 shipped → the best reachable by configuration alone → the best with Lumen optimizations on top of that
 configuration**. The configuration levels change only VeOmni command-line arguments; the Lumen levels are
 runtime patches in this example's `veomni_patches/`, applied by the entry point according to `LUMEN_PATCH`.
-Neither VeOmni's source nor the Lumen library is modified. The VAE convolution is aiter's FlyDSL
-implementation ([ROCm/aiter#5370](https://github.com/ROCm/aiter/pull/5370), merged into aiter main).
+Neither VeOmni's nor AITER's installed source is modified. The current VAE
+convolution route lives in `atomrl.lumen.ops.conv`.
+
+> The performance tables below were recorded with the former experimental
+> FlyDSL route. They are historical evidence, not validation numbers for the
+> current in-package convolution, which must be re-measured.
 
 ---
 
@@ -185,53 +189,13 @@ and aiter's `fmha_bwd` under other; the table below uses the corrected categorie
 - What remains at the best Lumen configuration: for Qwen, communication (25% of GPU time, competing with compute
   for CUs); for Wan, attention (38%, of which `fmha_bwd` is 311 ms).
 
-### 2.5 FlyDSL convolution: aiter's implementation, and the L3 decision
+### 2.5 Convolution: Lumen's in-package integration
 
-**How it is wired.** The example's `veomni_patches/aiter_conv.py` calls aiter's `flydsl_conv_implicit` directly
-([ROCm/aiter#5370](https://github.com/ROCm/aiter/pull/5370), merged into aiter main on 2026-09-24 as `305c421e`).
-Inputs that are not BF16, or that need a gradient (the kernel is forward-only), go to torch convolution instead. The aiter in the image used here (0.1.12.post2)
-predates that PR, so three things are handled, and no installed file is modified:
-
-1. The files the PR adds (the kernels, the tiling policy, the per-model tuned tile tables) live in the example's
-   `aiter_overlay/`, byte-identical to aiter main. `overlay_aiter.py` copies them into the aiter install. It
-   writes only files that do not exist yet, and it can be reverted. On an aiter that already includes the PR,
-   they are found present and skipped.
-2. An older aiter has no `AITER_CONFIGS.AITER_CONFIG_CONV3D_BF16_FILE`, so the tuned table would **silently**
-   load as empty. Lumen adds that property the way the PR does and counts every lookup (exact / borrowed /
-   heuristic).
-3. An older `aiter/ops/flydsl/__init__.py` eagerly imports kernels written against an older flydsl
-   (`fly_values`), so the package cannot be imported at all. On first use Lumen loads the convolution modules
-   without running that `__init__` and then removes the temporary package object, so the rest of aiter looks
-   exactly as it did before.
-
-Steps 2 and 3 try the normal path first; on an aiter that includes the PR they do nothing.
-
-**flydsl version.** The kernel needs `flydsl.expr.struct`, which the image's flydsl 0.1.6 does not have (the import
-fails), so the sidecar flydsl 0.3.2 is used. aiter itself pins 0.3.4.1; on 0.3.2 the numerics are as expected
-(§2.3). The sidecar makes an older aiter disable its CK/HIP ops. VeOmni does not use them, and every level is
-measured in the same environment.
-
-**The L3 key conflict, and what was chosen.** aiter's Wan rows are keyed by the stock call, which runs `F.pad` and
-then convolves with padding=0 (for example C=96, 6×370×546, pad 0). `conv_pad_in_kernel` makes the same
-convolution as 6×368×544 with padding (0,1,1), so none of those rows match. One Wan VAE encode at 81×368×544, on
-one GPU:
-
-| Combination | Encode | Convolution kernel | Tuned-table hits |
-|---|---:|---:|---:|
-| Stock BF16 (torch / CK) | 427.5 ms | — | — |
-| Pre-pad + aiter tuned table | 332.9 ms | 146.3 ms | 515/525 |
-| L3 + aiter's own tables (the L3 shapes miss and take the heuristic) | 314.5 ms | 163.4 ms | 63/525 |
-| **L3 + aiter's own tables + a table for the L3 shapes** | **293.5 ms** | **140.7 ms** | 315/525 |
-
-L3 on the heuristic tiles is 18 ms faster than the tuned table with pre-padding, so the `F.pad` copy it removes is
-worth more than the table. But the table itself makes the convolution 9% faster, and L3 was giving that up. So
-`tune_conv3d.py` tuned the 16 missed L3 shapes into a table of their own
-(`aiter_overlay/.../model_configs/wan21_vae_padk_bf16_tuned_conv3d.csv`). It follows aiter's tuner: the same
-candidates, NDHWC timing, a check against torch at 2e-2, and a row kept only if it beats the heuristic by ≥ 3%.
-Ten shapes made it into the table, gaining up to 22.6% (C=192, 6×184×272); the other six keep the heuristic. The
-latents are bit-identical across all combinations.
-
-On Qwen, all 22 convolution calls hit aiter's own table. Encode goes from 36.5 ms (stock BF16) to 19.5 ms.
+`LumenConfig(aiter_conv=True)` patches supported `nn.Conv2d` and `nn.Conv3d`
+modules through `atomrl.lumen.ops.conv`. Lumen owns the autograd-safe routing;
+the forward calls AITER's public convolution APIs and the backward uses PyTorch
+gradient operators. The example does not copy files into AITER, alter
+`AITER_CONFIGS`, or monkey-patch AITER modules.
 
 ### 2.6 The offline-embedding workflow (optional)
 
@@ -291,22 +255,18 @@ dx 'git clone https://github.com/ByteDance-Seed/VeOmni.git /work/VeOmni &&
 dx ". $EX/env.sh && bash \$EXAMPLE_DIR/setup_env.sh"
 ```
 
-`setup_env.sh` does three things:
-
-1. Installs flydsl 0.3.2 into a separate sidecar directory.
-2. Runs `overlay_aiter.py` to add the files aiter lacks, including PR 5370's convolution and its tables.
-3. Installs VeOmni with `--no-deps`.
+`setup_env.sh` installs VeOmni with `--no-deps` and verifies the Lumen
+convolution entry point.
 
 It should end with:
 
 ```text
-aiter flydsl_conv_implicit: available (must be available)
-aiter conv3d tuned rows   : 86 (86 = 76 from aiter + 10 for conv_pad_in_kernel)
+Lumen convolution: available (must be available)
 SETUP OK
 ```
 
 Do not run `uv sync` or `pip install -e '.[gpu]'`, and do not install any torch, triton, `cu12`/`cu13` or
-`nvidia-*` package. To undo the overlay, run `python overlay_aiter.py --revert`.
+`nvidia-*` package.
 
 ### 3.3 Models and data
 
@@ -415,7 +375,7 @@ VAE patch; Qwen also needs `qwen_offline_fix`.
 | Value | Effect | Code |
 |---|---|---|
 | `vae_bf16` | The frozen VAE runs in BF16; `encode()` returns FP32 latents | `train_dit_lumen.py` |
-| `vae_conv` / `vae_conv_video` | VAE convolutions go to aiter FlyDSL. The first is for images (exact T=1 → conv2d); the second also covers T>1 and the feature cache | `lumen_vae_conv.py`, `veomni_patches/aiter_conv.py` |
+| `vae_conv` / `vae_conv_video` | VAE convolutions use Lumen's AITER-backed Conv2d/Conv3d route. The first is for images (exact T=1 → conv2d); the second also covers T>1 and the feature cache | `lumen_vae_conv.py`, `veomni_patches/aiter_conv.py` |
 | `conv_pad_in_kernel` | Causal convolutions no longer `F.pad` a full copy; the kernel applies the symmetric padding with masks | `lumen_vae_conv.py` |
 | `sdpa_efficient` | SDPA's flash backend off; on ROCm the backward runs aiter's fused `fmha_bwd`. **Nondeterministic** | `veomni_patches/sdpa.py` |
 | `attn_triton_fwd` | DiT attention only (no mask, non-causal, BF16, head_dim 128) gets aiter's Triton forward, with the efficient backward kept; requires `sdpa_efficient` | `veomni_patches/sdpa.py` |
@@ -445,20 +405,12 @@ python3 determinism.py <level> ...                       # do a level's repeats 
 python3 compare_batch_hash.py <log A> <log B>            # did two runs see identical inputs?
 ```
 
-Re-tuning the table for the L3 shapes, which is needed after a hardware or resolution change:
-
-```bash
-dx ". $EX/env.sh && PYTHONPATH=\$LUMEN_PYTHONPATH HIP_VISIBLE_DEVICES=0 CUDA_VISIBLE_DEVICES=0 \
-      python3 \$EXAMPLE_DIR/tune_conv3d.py record --model wan --padk -o /work/untuned.csv"
-dx ". $EX/env.sh && PYTHONPATH=\$LUMEN_PYTHONPATH python3 \$EXAMPLE_DIR/tune_conv3d.py tune \
-      -i /work/untuned.csv -o /work/wan21_vae_padk_bf16_tuned_conv3d.csv"   # 8 GPUs in parallel, ~30 min
-```
-
 ### 3.9 Acceptance criteria
 
 - Every run's `.meta.txt` shows `EXIT_CODE : 0`, and both VeOmni and Lumen report 0 dirty files.
-- A run with a VAE patch logs `FlyDSL implementation: aiter`, 0 `torch` calls in `aiter conv calls`, and a
-  non-zero `exact` count in the aiter table lookups. A `patched` line alone does not prove the kernel ran.
+- A run with a VAE patch logs `Lumen convolution: AITER` and 0 `torch`
+  calls in `aiter conv calls`. A `patched` line alone does not prove the
+  kernel ran.
 - Every L change in a conclusion needs kernel-level evidence (§2.2), not an inference from step time.
 - An increment counts as a gain only if it exceeds the spread of both levels and p < 0.05.
 - Only one 8-GPU job at a time; the runners enforce this with `$LOG_DIR/.run.lock`. Check
@@ -468,10 +420,7 @@ dx ". $EX/env.sh && PYTHONPATH=\$LUMEN_PYTHONPATH python3 \$EXAMPLE_DIR/tune_con
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `module 'flydsl.expr' has no attribute 'struct'` | the image's flydsl 0.1.6 is in use | make sure `$FLYDSL_SIDECAR` is first on `PYTHONPATH` |
-| `cannot import name 'fly_values'` / "CK and HIP ops are disabled" | older aiter vs flydsl 0.3.x API | expected; the convolution works around it, and VeOmni does not use CK/HIP ops |
-| entry point reports `aiter's flydsl_conv_implicit is unavailable` | aiter lacks #5370 and the overlay is not applied, or the sidecar is not on `PYTHONPATH` | rerun `setup_env.sh` |
-| tuned-table `exact` count is 0 | the table was not merged | check that `aiter/configs/model_configs/*bf16_tuned_conv3d*.csv` exist |
+| AITER convolution import fails | the installed AITER lacks the public Conv2d/Conv3d APIs | install a current, compatible AITER release |
 | `IndexError` in the timestep lookup after a BF16 VAE | `encode()` output was not returned to FP32 | use this example's entry point and `vae_bf16` |
 | fewer steps than asked for, yet exit 0 | fewer rows than steps × ranks | provide enough samples |
 | `Conflicting visibility of agent-N` | the two GPU-visibility variables disagree | set both the HIP and CUDA variables |
@@ -487,11 +436,9 @@ dx ". $EX/env.sh && PYTHONPATH=\$LUMEN_PYTHONPATH python3 \$EXAMPLE_DIR/tune_con
 | `ladder.sh` | every ladder level, and repeats run round by round |
 | `run_10steps.sh` / `run_wan_10steps.sh` | one 8-GPU 10-step run; `custom` mode reads `LUMEN_PATCH` and passes the rest through to VeOmni |
 | `profile.sh` | a trace of any level with VeOmni's built-in profiler |
-| `train_dit_lumen.py` | wrapper around VeOmni's training entry: applies the patches from `LUMEN_PATCH`, and reports the convolution implementation, table lookups and routing counts |
+| `train_dit_lumen.py` | wrapper around VeOmni's training entry: applies the patches from `LUMEN_PATCH`, and reports backend routing counts |
 | `lumen_vae_conv.py` | VAE convolution rewrites: exact T=1 → conv2d, kernel swap under T>1, padding in the kernel |
-| `veomni_patches/` | every Lumen-level patch: `aiter_conv.py` (the aiter convolution and lookup counting), `sdpa.py`, `rmsnorm.py`, `local_adamw.py`, `qwen_offline.py` |
-| `overlay_aiter.py` / `aiter_overlay/` | the files an older aiter lacks (the Triton modules Lumen imports, taken from the pinned official AITER commit; #5370's convolution and tables), plus the table for the L3 shapes |
-| `tune_conv3d.py` | records the convolution shapes a table missed, tunes them, and writes an aiter-format table |
+| `veomni_patches/` | every Lumen-level patch: `aiter_conv.py` (public AITER convolution routing), `sdpa.py`, `rmsnorm.py`, `local_adamw.py`, `qwen_offline.py` |
 | `verify_aiter_conv.py` / `verify_sdpa_triton_fwd.py` / `verify_rmsnorm_fuse.py` | single-GPU numerics and speed checks |
 | `test_patches.py` | unit tests for `veomni_patches/` |
 | `summarize.py` | median step, spread, p, peak memory, loss deviation; `--chain` compares level by level |

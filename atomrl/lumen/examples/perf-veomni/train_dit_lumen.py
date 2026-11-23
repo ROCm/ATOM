@@ -12,13 +12,9 @@ Which ops get replaced is set by LUMEN_PATCH (comma-separated):
              autograd.Function. BF16 in, BF16 out, so numerics should be
              unchanged.
     vae_conv 52 QwenImageCausalConv3d.forward in the frozen VAE -> Lumen's
-             conv op on aiter's FlyDSL kernel. See lumen_vae_conv.py for why
+             AITER-backed conv op. See lumen_vae_conv.py for why
              the T=1 causal rewrite is exact and which layers are
-             deliberately left on torch. This is
-             the only patch that touches the condition model rather than the
-             DiT, and the one the FlyDSL kernel was written for: the VAE is
-             frozen and runs under no_grad, which matches the kernel's
-             forward-only limit.
+             deliberately left on torch.
     vae_conv_video
              vae_conv plus the shapes the T=1 rewrite cannot take. On a clip
              the T=1 identity holds only for the encoder's first chunk -- every
@@ -39,9 +35,9 @@ Which ops get replaced is set by LUMEN_PATCH (comma-separated):
     vae_bf16 Cast the frozen VAE to BF16. NOT a Lumen patch and not free --
              it changes what the trainer computes. It is here because
              VeOmni loads this VAE in FP32
-             (modeling_qwen_image_condition.py:83, hardcoded) while the FlyDSL
-             kernel is BF16-only, so without it `vae_conv` silently runs on
-             torch and no FlyDSL code executes at all. Combine the two to
+             (modeling_qwen_image_condition.py:83, hardcoded) while the AITER
+             path is BF16/FP16-only, so without it `vae_conv` runs on
+             torch. Combine the two to
              measure the kernel; use it alone to separate the cost of the dtype
              change from the benefit of the kernel.
     norm     NOT SAFE on this model, and refused below. The DiT's 241
@@ -64,9 +60,9 @@ anything (see that package for what each one does and how it was measured):
     qwen_offline_fix  VeOmni 573848a defect: Qwen-Image offline_training
                       crashes on its first step without it.
 
-vae_conv* run aiter's FlyDSL convolution (ROCm/aiter#5370) with its tuned
-tables (veomni_patches/aiter_conv.py); the run refuses to start if it is
-unavailable. Only `linear` imports the Lumen library.
+vae_conv* route through Lumen's in-package Conv2d/Conv3d implementation
+(`atomrl.lumen.ops.conv`). Only `linear` and the convolution route import the
+Lumen library.
 
 The DiT is constructed under init_device=meta. The linear patch only rebinds
 `forward` and never touches weights, so it is safe there. vae_conv reads
@@ -178,7 +174,7 @@ def _patch_vae_conv(trainer, video):
     vae = _get_vae(trainer, who)
     if vae.dtype is not torch.bfloat16:
         _rank0(
-            f"{who} WARNING: vae dtype is {vae.dtype}, but the FlyDSL kernel is BF16-only. "
+            f"{who} WARNING: vae dtype is {vae.dtype}, but the AITER path is BF16/FP16-only. "
             "Lumen will demote every call to torch, so this measures the conv3d->conv2d "
             "rewrite alone. Add vae_bf16 to LUMEN_PATCH to exercise the kernel."
         )
@@ -195,14 +191,7 @@ def _patch_vae_conv(trainer, video):
         )
     _rank0(f"{who} skipped (left on torch): {[n for n, _ in stats['skipped']]}")
 
-    from veomni_patches import aiter_conv
-
-    if aiter_conv.load() is None:
-        raise SystemExit(
-            f"[lumen] {who}: aiter's flydsl_conv_implicit is unavailable, so every call would run on torch. "
-            "Apply the aiter overlay (overlay_aiter.py --apply) and put the sidecar flydsl on PYTHONPATH."
-        )
-    _rank0(f"{who} FlyDSL implementation: aiter")
+    _rank0(f"{who} Lumen convolution: AITER")
 
 
 _VAE_TIME = {"per_call": [], "shapes": []}
@@ -223,7 +212,7 @@ def _time_vae_encode(trainer):
     magnitude, and worth measuring rather than assuming.
 
     Calls are kept individually rather than summed. The first one carries
-    FlyDSL's JIT and torch's autotune, which on a video VAE's ~66 distinct
+    AITER's JIT and torch's autotune, which on a video VAE's ~66 distinct
     shapes is large enough to swamp nine steady calls and invert the mean -- a
     total alone reported this patch as slower than the run it speeds up.
     """
@@ -348,9 +337,6 @@ def _report_backends():
         from veomni_patches import aiter_conv
 
         _rank0(f"aiter conv calls: {aiter_conv.conv_calls()}")
-        # A table that loads but never matches looks like one that works,
-        # except in the step time; the counts are what tell them apart.
-        _rank0(f"aiter conv tuned-table lookups: {aiter_conv.tuned_lookup_stats()}")
     if "attn_triton_fwd" in _PATCH:
         from veomni_patches import sdpa
 

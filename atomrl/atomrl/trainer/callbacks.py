@@ -127,11 +127,17 @@ class CheckpointCallback(Callback):
                 sd_opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
                 state["model_state_dict"] = get_model_state_dict(model, options=sd_opts)
                 if opt is not None:
-                    state["optimizer_state_dict"] = get_optimizer_state_dict(
-                        model,
-                        opt,
-                        options=sd_opts,
-                    )
+                    if hasattr(opt, "distributed_state_dict"):
+                        state["optimizer_state_dict"] = opt.distributed_state_dict(
+                            model, sd_opts
+                        )
+                        state["optimizer_state_format"] = "fp32_master_dcp"
+                    else:
+                        state["optimizer_state_dict"] = get_optimizer_state_dict(
+                            model,
+                            opt,
+                            options=sd_opts,
+                        )
             else:
                 state["model_state_dict"] = {
                     k: v.cpu() for k, v in model.state_dict().items()
@@ -144,6 +150,7 @@ class CheckpointCallback(Callback):
                 state["fp32_params"] = [p.data.cpu().clone() for p in opt.fp32_params]
             if hasattr(opt, "scheduler"):
                 state["scheduler_last_epoch"] = opt.scheduler.last_epoch
+                state["scheduler_state_dict"] = opt.scheduler.state_dict()
 
         if rank == 0:
             n_model = len(state.get("model_state_dict", {}))

@@ -66,14 +66,99 @@ def _normalize_token_ids(tokenized_output) -> list[int]:
     return [int(t.item() if hasattr(t, "item") else t) for t in token_ids]
 
 
+_ROLE_MAP = {"human": "user", "gpt": "assistant", "system": "system"}
+_RESERVED_CHAT_TOKENS = ("<|im_assistant|>", "<|im_middle|>", "<|im_end|>")
+
+
+def normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Normalize ShareGPT keys and preserve official-template metadata."""
+    normalized = []
+    for message in messages:
+        converted = dict(message)
+        if "role" not in converted:
+            source_role = converted.pop("from", "")
+            converted["role"] = _ROLE_MAP.get(source_role, source_role)
+        if "content" not in converted:
+            converted["content"] = converted.pop("value", None)
+        reasoning = converted.get("reasoning_content")
+        for field in ("thinking", "thinking_content", "reasoning"):
+            candidate = converted.pop(field, None)
+            if reasoning is None and candidate:
+                reasoning = candidate
+        if reasoning is not None:
+            converted["reasoning_content"] = reasoning
+        normalized.append(converted)
+    return normalized
+
+
+def _contains_reserved_chat_token(value: Any) -> bool:
+    if isinstance(value, str):
+        return any(token in value for token in _RESERVED_CHAT_TOKENS)
+    if isinstance(value, dict):
+        return any(_contains_reserved_chat_token(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_reserved_chat_token(item) for item in value)
+    return False
+
+
+def tokenize_chat_messages(
+    tokenizer: PreTrainedTokenizer,
+    messages: list[dict[str, Any]],
+    max_length: int,
+    *,
+    last_turn_only: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Render one official HF template and mark its assistant-content spans."""
+    messages = normalize_messages(messages)
+    if _contains_reserved_chat_token(messages):
+        raise ValueError("message content contains a reserved chat token")
+
+    token_ids = _normalize_token_ids(
+        tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=False,
+            tokenize=True,
+        )
+    )
+    assistant_id = tokenizer.convert_tokens_to_ids("<|im_assistant|>")
+    middle_id = tokenizer.convert_tokens_to_ids("<|im_middle|>")
+    end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+
+    spans = []
+    cursor = 0
+    while cursor < len(token_ids):
+        if token_ids[cursor] != assistant_id:
+            cursor += 1
+            continue
+        try:
+            content_start = token_ids.index(middle_id, cursor + 1) + 1
+            content_end = token_ids.index(end_id, content_start)
+        except ValueError as error:
+            raise ValueError(
+                "malformed assistant segment in HF chat template"
+            ) from error
+        spans.append((content_start, content_end))
+        cursor = content_end + 1
+    if last_turn_only and spans:
+        spans = spans[-1:]
+
+    input_ids = torch.tensor(token_ids[:max_length], dtype=torch.long)
+    loss_mask = torch.zeros(len(input_ids), dtype=torch.long)
+    for start, end in spans:
+        loss_mask[start : min(end, max_length)] = 1
+    attention_mask = torch.ones(len(input_ids), dtype=torch.long)
+    return input_ids, loss_mask, attention_mask
+
+
 def _extract_system_and_gen_prompt(
     tokenizer: PreTrainedTokenizer,
     **apply_chat_template_kwargs,
 ) -> tuple[list[int], list[int]]:
     """Detect system-prompt prefix and assistant generation-prompt token lengths."""
+    empty_user = {"role": "user", "content": ""}
     token1 = _normalize_token_ids(
         tokenizer.apply_chat_template(
-            [{"role": "user", "content": ""}],
+            [empty_user],
             add_generation_prompt=False,
             tokenize=True,
             **apply_chat_template_kwargs,
@@ -81,24 +166,22 @@ def _extract_system_and_gen_prompt(
     )
     token2 = _normalize_token_ids(
         tokenizer.apply_chat_template(
-            [{"role": "user", "content": ""}] * 2,
+            [empty_user, empty_user],
             add_generation_prompt=False,
             tokenize=True,
             **apply_chat_template_kwargs,
         )
     )
     system_prompt = token1[: -(len(token2) - len(token1))]
-
     token3 = _normalize_token_ids(
         tokenizer.apply_chat_template(
-            [{"role": "user", "content": ""}],
+            [empty_user],
             add_generation_prompt=True,
             tokenize=True,
             **apply_chat_template_kwargs,
         )
     )
-    gen_prompt = token3[len(token1) :]
-    return system_prompt, gen_prompt
+    return system_prompt, token3[len(token1) :]
 
 
 class SFTDataset(Dataset):
@@ -140,7 +223,6 @@ class SFTDataset(Dataset):
             data_files = [data_files]
 
         self.system_prompt, self.gen_prompt = _extract_system_and_gen_prompt(tokenizer)
-
         self._load_data(data_files, shuffle, seed, max_samples)
 
     def _load_data(
@@ -190,7 +272,7 @@ class SFTDataset(Dataset):
         index: int,
         message: dict[str, Any],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Tokenize one turn and build its loss_mask."""
+        """Tokenize one turn and build its loss mask."""
         inputs = self.tokenizer.apply_chat_template(
             [message],
             add_generation_prompt=False,
@@ -200,18 +282,14 @@ class SFTDataset(Dataset):
         )
         input_ids = inputs["input_ids"][0]
         attention_mask = inputs["attention_mask"][0]
-
-        # Strip system prompt prefix from non-first turns.
         if index != 0 and message.get("role") != "system":
             input_ids = input_ids[len(self.system_prompt) :]
             attention_mask = attention_mask[len(self.system_prompt) :]
-
         if message.get("role") == "assistant":
             loss_mask = torch.ones_like(attention_mask)
             loss_mask[: len(self.gen_prompt)] = 0
         else:
             loss_mask = torch.zeros_like(attention_mask)
-
         return input_ids, loss_mask, attention_mask
 
     def __getitem__(self, item: int) -> dict[str, torch.Tensor]:
@@ -221,24 +299,25 @@ class SFTDataset(Dataset):
 
             messages = json.loads(messages)
 
-        # Ensure standard format.
         if messages and "from" in messages[0]:
-            role_map = {"human": "user", "gpt": "assistant", "system": "system"}
             messages = [
-                {"role": role_map.get(m["from"], m["from"]), "content": m["value"]}
-                for m in messages
+                {
+                    "role": _ROLE_MAP.get(message["from"], message["from"]),
+                    "content": message["value"],
+                }
+                for message in messages
             ]
-
-        input_ids_parts, loss_mask_parts, attn_mask_parts = [], [], []
-        for i, msg in enumerate(messages):
-            ids, lm, am = self._process_single_message(i, msg)
-            input_ids_parts.append(ids)
-            loss_mask_parts.append(lm)
-            attn_mask_parts.append(am)
-
+        input_ids_parts, loss_mask_parts, attention_mask_parts = [], [], []
+        for index, message in enumerate(messages):
+            input_ids, loss_mask, attention_mask = self._process_single_message(
+                index, message
+            )
+            input_ids_parts.append(input_ids)
+            loss_mask_parts.append(loss_mask)
+            attention_mask_parts.append(attention_mask)
         input_ids = torch.cat(input_ids_parts)
         loss_mask = torch.cat(loss_mask_parts)
-        attention_mask = torch.cat(attn_mask_parts)
+        attention_mask = torch.cat(attention_mask_parts)
         position_ids = torch.arange(len(input_ids), dtype=torch.long)
 
         seq_len = input_ids.shape[0]

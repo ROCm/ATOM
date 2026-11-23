@@ -27,24 +27,19 @@ def _snr(ref, got):
 
 
 @_CUDA
-def test_conv_uses_flydsl_for_bf16_and_torch_otherwise():
+def test_conv_uses_aiter_for_bf16_and_torch_otherwise():
     from veomni_patches import aiter_conv
 
-    if aiter_conv.load() is None:
-        pytest.skip("aiter flydsl_conv_implicit unavailable (overlay_aiter.py --apply)")
     torch.manual_seed(0)
     x = torch.randn(1, 96, 4, 24, 24, device="cuda")
     w = torch.randn(96, 96, 3, 3, 3, device="cuda") * 0.05
     before = aiter_conv.conv_calls()
-    lookups = sum(aiter_conv.tuned_lookup_stats()["calls"].values())
     fp32 = aiter_conv.conv(x, w, None, 1, 1, 1)
     bf16 = aiter_conv.conv(x.bfloat16(), w.bfloat16(), None, 1, 1, 1)
     after = aiter_conv.conv_calls()
     assert (
-        after["torch"] == before["torch"] + 1
-        and after["flydsl"] == before["flydsl"] + 1
+        after["torch"] == before["torch"] + 1 and after["aiter"] == before["aiter"] + 1
     )
-    assert sum(aiter_conv.tuned_lookup_stats()["calls"].values()) == lookups + 1
     assert torch.equal(fp32, F.conv3d(x, w, None, 1, 1, 1))
     assert _snr(fp32, bf16) > 30
 

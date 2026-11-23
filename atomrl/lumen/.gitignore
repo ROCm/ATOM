@@ -23,14 +23,12 @@ examples/results/
 examples/*/results/mock_data/
 examples/*/results/c4_data/
 
-# Run output: logs, autotune cache, shape dumps. Both depths are listed because
+# Run output: logs and shape dumps. Both depths are listed because
 # the FSDP launcher points RESULTS_DIR at a per-run subdirectory, and a single
 # `*` does not cross a slash.
 examples/*/results/lumen_*.log
 examples/qwen3/results/*.log
 examples/*/results/**/*.log
-examples/*/results/mxfp4_autotune_*.json
-examples/*/results/**/mxfp4_autotune_*.json
 examples/*/results/*.shapes.csv
 examples/*/results/*.untuned.csv
 

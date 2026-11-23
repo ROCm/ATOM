@@ -6,8 +6,8 @@ at runtime what it names, and only when its ``LUMEN_PATCH`` entry is set.
 ==================  ==============================================================
 ``LUMEN_PATCH``     module
 ==================  ==============================================================
-``vae_conv*``       :mod:`.aiter_conv` -- aiter's FlyDSL convolution, used by
-                    ``lumen_vae_conv.py``
+``vae_conv*``       :mod:`.aiter_conv` -- Lumen's AITER-backed convolution,
+                    used by ``lumen_vae_conv.py``
 ``sdpa_efficient``  :mod:`.sdpa` -- SDPA flash backend off (aiter ``fmha_bwd``)
 ``attn_triton_fwd`` :mod:`.sdpa` -- aiter Triton forward on DiT attention
 ``rmsnorm_fuse``    :mod:`.rmsnorm` -- diffusers RMSNorm forward via ``torch.compile``

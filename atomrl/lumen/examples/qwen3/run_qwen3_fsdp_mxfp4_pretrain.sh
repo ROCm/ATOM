@@ -93,7 +93,6 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export TORCHDYNAMO_DISABLE="${TORCHDYNAMO_DISABLE:-1}"
 export USE_HIPBLASLT="${USE_HIPBLASLT:-1}"
 export TORCH_BLAS_PREFER_HIPBLASLT="${TORCH_BLAS_PREFER_HIPBLASLT:-1}"
-export LUMEN_MXFP4_AUTOTUNE_CACHE="${LUMEN_MXFP4_AUTOTUNE_CACHE:-${RESULTS_DIR}/mxfp4_autotune_qwen3_fsdp.json}"
 
 torchrun --nproc_per_node="${NPROC}" "${SCRIPT_DIR}/train_qwen3_fsdp.py" \
     --model-name-or-path "${MODEL_PATH}" \

@@ -251,34 +251,6 @@ class AlpacaDataset(Dataset):
         return {"input_ids": torch.LongTensor(ids), "loss_mask": torch.LongTensor(mask)}
 
 
-_CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs")
-
-
-def _configure_mxfp4_dispatch():
-    """Hand Lumen the Qwen3 tuned A4W4 tables before the first MXFP4 GEMM.
-
-    Widens which shapes can reach the prebuilt ASM kernels. Every MXFP4 backend
-    is bit-identical, so this affects speed only. Skipped if the environment
-    variable is already set.
-
-    The per-model table was tuned for Megatron's fused QKV and gate_up, so it
-    misses this path's unfused projections -- but three of its rows are shapes
-    the two paths share (the wgrad pair at K=16384 and the K=12288 dgrad), and
-    without it those fall back to Triton, since Lumen only lets a shape reach
-    ASM when the tuned table has a row for it.
-    """
-    from atomrl.lumen.ops.quantize import mxfp4_autotune
-
-    applied = mxfp4_autotune.configure(
-        tuned_config=[
-            os.path.join(_CONFIG_DIR, "qwen3_8b_a4w4_blockscale_tuned_gemm.csv"),
-            os.path.join(_CONFIG_DIR, "a4w4_blockscale_tuned_gemm.csv"),
-        ],
-        autotune_cache=os.environ.get("LUMEN_MXFP4_AUTOTUNE_CACHE") or None,
-    )
-    rank0(f"> MXFP4 tuned config: {applied['tuned_config'] or '(aiter default)'}")
-
-
 def build_parser():
     p = argparse.ArgumentParser()
     p.add_argument("--model-name-or-path", required=True)
@@ -541,8 +513,6 @@ def main():
         )
 
     # ---- Lumen full-parameter/LoRA training (+ optional quantised linears) ----
-    if args.mode == "mxfp4":
-        _configure_mxfp4_dispatch()
     fmt, scaling, blk = "fp8_e4m3", args.fp8_scaling, 128
     use_fp8, use_fp4 = args.linear_fp8, args.linear_fp4
     cfg = LumenConfig.from_args(

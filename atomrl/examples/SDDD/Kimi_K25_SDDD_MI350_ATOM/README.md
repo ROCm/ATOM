@@ -19,8 +19,9 @@ AtomRL FSDP2                  <---   ATOM / vLLM teacher (TP=4)
 
 The draft takes three auxiliary hidden states from teacher layers 1, N/2−1 and N−4 and is
 trained with a position-decayed forward KL over 4 speculative positions,
-L = Σᵢ 0.8ⁱ · KL(teacherᵢ ‖ draftᵢ), on assistant tokens only. Tokenization and loss
-masking follow [TorchSpec](https://github.com/LightSeek/TorchSpec).
+L = Σᵢ 0.8ⁱ · KL(teacherᵢ ‖ draftᵢ), on assistant tokens only. Tokenization uses
+the Hugging Face tokenizer's own chat template; AtomRL marks assistant turns
+for the loss mask.
 
 ## Recipe
 
@@ -87,4 +88,3 @@ plain HF forward on one GPU in the release image, without vLLM, ATOM or Mooncake
 
 - [lightseekorg/kimi-k2.5-eagle3](https://huggingface.co/lightseekorg/kimi-k2.5-eagle3): training recipe
 - [Kimi K2.5 technical report](https://arxiv.org/abs/2505.01759)
-- [TorchSpec](https://github.com/LightSeek/TorchSpec): data processing reference

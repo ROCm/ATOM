@@ -6,8 +6,7 @@
 
 """Quantization ops — functional API and autograd-aware quantized linear.
 
-``linear`` is loaded lazily. Importing it here would cycle: ``linear`` needs
-``mxfp4_autotune`` from this package while this package is still initializing.
+``linear`` is loaded lazily to keep the functional ops import lightweight.
 """
 
 from atomrl.lumen.ops.quantize.ops import (
@@ -28,7 +27,6 @@ from atomrl.lumen.ops.quantize.ops import (
     quant_fp8_blockwise_impl,
     quant_fp8_blockwise_segment_m_impl,
     quant_fp8_tensorwise_impl,
-    swizzle_mxfp4_scale,
     transpose_packed_fp4,
 )
 
@@ -55,7 +53,6 @@ __all__ = [
     "quant_fp8_blockwise_segment_m_impl",
     "quant_fp8_tensorwise_impl",
     "quantized_linear",
-    "swizzle_mxfp4_scale",
     "transpose_packed_fp4",
 ]
 

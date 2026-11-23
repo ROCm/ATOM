@@ -43,6 +43,44 @@ def get_scaling_manager(model: nn.Module):
     return getattr(unwrapped, "_scaling_manager", None)
 
 
+def build_training_scheduler(optimizer, policy, total_steps: int):
+    """Build a Transformers scheduler from AtomRL's policy fields."""
+    from transformers import get_scheduler
+
+    warmup_steps = int(policy.warmup_ratio * total_steps)
+    style = policy.lr_decay_style.lower()
+    scheduler_kwargs: dict[str, object] = {}
+    if style == "wsd":
+        decay_type = {
+            "minus_sqrt": "1-sqrt",
+        }.get(policy.wsd_decay_style, policy.wsd_decay_style)
+        if decay_type not in {"linear", "cosine", "1-sqrt"}:
+            raise ValueError(
+                "WSD decay style must be linear, cosine, or minus_sqrt; "
+                f"got {policy.wsd_decay_style!r}"
+            )
+        scheduler_name = "warmup_stable_decay"
+        scheduler_kwargs = {
+            "num_decay_steps": int(policy.wsd_decay_ratio * total_steps),
+            "decay_type": decay_type,
+            "min_lr_ratio": policy.min_lr / policy.learning_rate,
+        }
+    elif style == "cosine" and policy.min_lr > 0:
+        scheduler_name = "cosine_with_min_lr"
+        scheduler_kwargs = {"min_lr": policy.min_lr}
+    elif style == "constant" and warmup_steps > 0:
+        scheduler_name = "constant_with_warmup"
+    else:
+        scheduler_name = style
+    return get_scheduler(
+        scheduler_name,
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps,
+        scheduler_specific_kwargs=scheduler_kwargs,
+    )
+
+
 # ---------------------------------------------------------------------------
 # FP32 Master Weight Optimizer
 # ---------------------------------------------------------------------------
@@ -75,13 +113,13 @@ class FP32MasterWeightOptimizer(torch.optim.Optimizer):
     def __init__(self, params, optimizer_cls, **optimizer_kwargs):
         model_params = list(params)
         self._model_params: list[nn.Parameter] = []
-        self._fp32_masters: list[torch.Tensor | None] = []
+        self._fp32_masters: list[nn.Parameter | None] = []
 
         opt_params: list[torch.Tensor] = []
         for p in model_params:
             self._model_params.append(p)
             if p.requires_grad and p.is_floating_point() and p.dtype != torch.float32:
-                fp32 = p.detach().float().clone().requires_grad_(True)
+                fp32 = nn.Parameter(p.detach().float().clone(), requires_grad=True)
                 self._fp32_masters.append(fp32)
                 opt_params.append(fp32)
             else:
@@ -89,6 +127,7 @@ class FP32MasterWeightOptimizer(torch.optim.Optimizer):
                 opt_params.append(p)
 
         self._inner = optimizer_cls(opt_params, **optimizer_kwargs)
+        self._optimizer_params = opt_params
 
         # Initialize Optimizer base class so that LR schedulers pass
         # the ``isinstance(optimizer, Optimizer)`` check.
@@ -108,8 +147,7 @@ class FP32MasterWeightOptimizer(torch.optim.Optimizer):
 
     # ---- Core interface --------------------------------------------------
 
-    def step(self, closure=None):
-        """Copy BF16 grads → FP32, step, sync FP32 → BF16 model params."""
+    def _copy_model_grads_to_masters(self) -> None:
         with torch.no_grad():
             for model_p, fp32_p in zip(self._model_params, self._fp32_masters):
                 if fp32_p is not None and model_p.grad is not None:
@@ -118,14 +156,38 @@ class FP32MasterWeightOptimizer(torch.optim.Optimizer):
                     else:
                         fp32_p.grad.copy_(model_p.grad)
 
-        loss = self._inner.step(closure=closure)
-
+    def _copy_masters_to_model(self) -> None:
         with torch.no_grad():
             for model_p, fp32_p in zip(self._model_params, self._fp32_masters):
                 if fp32_p is not None:
                     model_p.data.copy_(fp32_p.data)
 
+    def step(self, closure=None):
+        """Copy BF16 grads → FP32, step, sync FP32 → BF16 model params."""
+        self._copy_model_grads_to_masters()
+        loss = self._inner.step(closure=closure)
+        self._copy_masters_to_model()
         return loss
+
+    def step_with_grad_norm(self, max_grad_norm: float) -> torch.Tensor:
+        """Clip FP32 gradients, update finite steps, and return their norm."""
+        self._copy_model_grads_to_masters()
+        params = [
+            param
+            for group in self._inner.param_groups
+            for param in group["params"]
+            if param.grad is not None
+        ]
+        grad_norm = torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
+        if torch.isfinite(grad_norm) and grad_norm > 0:
+            self._inner.step()
+            self._copy_masters_to_model()
+        elif not torch.isfinite(grad_norm):
+            logger.warning(
+                "FP32MasterWeightOptimizer: skipping non-finite gradient step (%s)",
+                grad_norm,
+            )
+        return grad_norm
 
     def zero_grad(self, set_to_none=True):
         self._inner.zero_grad(set_to_none=set_to_none)
@@ -158,4 +220,59 @@ class FP32MasterWeightOptimizer(torch.optim.Optimizer):
                     self._model_params[i].data.copy_(self._fp32_masters[i].data)
         # Re-sync shared references after inner load
         self.param_groups = self._inner.param_groups
+        self.state = self._inner.state
+
+    def sync_master_params_from_model(self) -> None:
+        """Refresh FP32 master parameters after loading model-only weights."""
+        with torch.no_grad():
+            for model_p, fp32_p in zip(self._model_params, self._fp32_masters):
+                if fp32_p is not None:
+                    fp32_p.copy_(model_p.float())
+
+    def get_learning_rate(self) -> float:
+        """Return the learning rate used by the first parameter group."""
+        return float(self.param_groups[0]["lr"])
+
+    @property
+    def fp32_params(self) -> list[torch.Tensor]:
+        """FP32 masters exposed for legacy AtomRL checkpoint compatibility."""
+        return [param for param in self._fp32_masters if param is not None]
+
+    def _master_parameter_model(self, model: nn.Module) -> nn.Module:
+        """Expose optimizer parameters under the model's canonical names."""
+        names = {id(param): name for name, param in model.named_parameters()}
+        proxy = nn.Module()
+        for model_param, optimizer_param in zip(
+            self._model_params, self._optimizer_params
+        ):
+            name = names[id(model_param)]
+            parent = proxy
+            parts = name.split(".")
+            for part in parts[:-1]:
+                child = parent._modules.get(part)
+                if child is None:
+                    child = nn.Module()
+                    parent.add_module(part, child)
+                parent = child
+            parent.register_parameter(parts[-1], optimizer_param)
+        return proxy
+
+    def distributed_state_dict(self, model, options) -> dict:
+        """Serialize optimizer state with model parameter names for FSDP2."""
+        from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
+
+        master_model = self._master_parameter_model(model)
+        return get_optimizer_state_dict(master_model, self._inner, options=options)
+
+    def load_distributed_state_dict(self, model, state_dict: dict, options) -> None:
+        """Restore a model-parameter-named FSDP2 optimizer state."""
+        from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
+
+        master_model = self._master_parameter_model(model)
+        set_optimizer_state_dict(
+            master_model,
+            self._inner,
+            state_dict,
+            options=options,
+        )
         self.state = self._inner.state

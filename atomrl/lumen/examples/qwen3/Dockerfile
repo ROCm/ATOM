@@ -58,16 +58,9 @@ ENV TOKENIZER_PATH=/workspace/ATOM/atomrl/lumen/examples/qwen3/tokenizer
 
 # Deliberately not baked:
 #
-#   AITER_CONFIG_GEMM_A4W4 — train_pretrain.sh builds the path list only while
-#     this is empty, and that list is what puts the model's own tuned table in
-#     front of the stock one. The two are disjoint, so any value here costs the
-#     M=16384 shapes their asm kernels.
 #   CUDA_DEVICE_MAX_CONNECTIONS — the tuned value is 8, which Megatron asserts
 #     is exactly 1 once tensor or context parallelism is on.
 #   NCCL_IB_DISABLE, NCCL_SOCKET_IFNAME — single-node values.
-#   LUMEN_MXFP4_AUTOTUNE_CACHE — a cache records which backends were reachable
-#     when it was written, so a fixed path lets one bad run pin "use Triton"
-#     for every shape and every later run inherits it.
 
 WORKDIR /workspace/ATOM/atomrl/lumen/examples/qwen3
 

@@ -14,7 +14,7 @@
 #
 #   LUMEN_ROOT      Lumen checkout
 #   MEGATRON_ROOT   Megatron-LM checkout (needed on PYTHONPATH and for patching)
-#   RESULTS_ROOT    writable dir for logs, mock data and the autotune cache
+#   RESULTS_ROOT    writable dir for logs and mock data
 #   TOKENIZER_PATH  HuggingFace tokenizer directory
 #
 # Optional: MODEL PRECISION NUM_LAYERS TAIL_BF16 MBS GBS SEQ_LEN TRAIN_STEPS
@@ -34,10 +34,8 @@ set -euo pipefail
 MODEL="${MODEL:-qwen3_8b}"
 PRECISION="${PRECISION:-mxfp4}"        # bf16 | fp8 | mxfp4
 
-# Per-model defaults, in one table so the whole benchmark matrix is readable at
-# a glance. MBS x SEQ_LEN is 16384 for all three: the tuned MXFP4 GEMM table
-# keys on exact M/N/K, so a model whose token count drifts silently loses the
-# ASM kernels (docs/mxfp4_feature_parity_plan.md §13).
+# Per-model defaults, in one table so the benchmark matrix is readable at a
+# glance. MBS x SEQ_LEN is 16384 for all three comparison arms.
 #
 # VOCAB_MAX only bounds the random token ids in the mock corpus; it tracks each
 # tokenizer's vocabulary so no id lands outside the embedding table.
@@ -304,37 +302,6 @@ case "${PRECISION}" in
         exit 1
         ;;
 esac
-
-# AITER can only reach its prebuilt A4W4 asm kernels for shapes listed in the
-# tuned table, and Qwen3-8B's fused qkv/gate_up shapes at this token count are
-# absent from the stock one: 8 of the 11 MXFP4 GEMMs fell back to Triton, worth
-# ~132 ms/step (docs/mxfp4_training_report.md §5.5). The extra rows were produced
-# by scripts/mxfp4_tune_shapes.py and each is bit-exact against Triton. They key
-# on the exact M/N/K, so they only fire at MBS x SEQ_LEN = 16384 with TP=1.
-# Setting the variable turns off AITER's own config discovery, hence relisting
-# the stock tables it would otherwise have merged.
-#
-# A model with no tuned table of its own still trains: every shape falls back to
-# Triton, which is correct but slower, so the log says which case it is rather
-# than leaving the step time unexplained.
-if [ "${PRECISION}" = "mxfp4" ] && [ -z "${AITER_CONFIG_GEMM_A4W4:-}" ]; then
-    AITER_CFG_DIR="$(python -c 'import aiter, os; print(os.path.join(os.path.dirname(aiter.__file__), "configs"))')"
-    MODEL_A4W4_CSV="${LUMEN_ROOT}/examples/${MODEL_DIR}/configs/${MODEL}_a4w4_blockscale_tuned_gemm.csv"
-    A4W4_PATHS="${AITER_CFG_DIR}/a4w4_blockscale_tuned_gemm.csv"
-    if [ -f "${MODEL_A4W4_CSV}" ]; then
-        A4W4_PATHS="${MODEL_A4W4_CSV}:${A4W4_PATHS}"
-    else
-        echo "[setup] WARNING: no tuned A4W4 table for ${MODEL} at ${MODEL_A4W4_CSV}"
-        echo "[setup] every MXFP4 GEMM shape this model issues falls back to Triton;"
-        echo "[setup] the step time is correct but not the best this path can do."
-        echo "[setup] Produce one with scripts/mxfp4_tune_shapes.py."
-    fi
-    for f in "${AITER_CFG_DIR}"/model_configs/*a4w4_blockscale_tuned_gemm.csv; do
-        if [ -e "$f" ]; then A4W4_PATHS="${A4W4_PATHS}:${f}"; fi
-    done
-    export AITER_CONFIG_GEMM_A4W4="${A4W4_PATHS}"
-    echo "[setup] AITER_CONFIG_GEMM_A4W4=${AITER_CONFIG_GEMM_A4W4}"
-fi
 
 source "${ARGS_FILE}"
 

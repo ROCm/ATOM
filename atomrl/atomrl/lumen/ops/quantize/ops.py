@@ -546,11 +546,6 @@ def convert_to_mxfp4(
     Uses Lumen SR kernel when ``use_sr=True`` (for gradient quantization only —
     SR on forward tensors is detrimental per NVFP4 paper §4.4).
 
-    With ``swizzle_scale`` the scales come back in the order the gfx950 MXFP4
-    GEMMs read, saving the separate permuting pass into the GEMM; the caller
-    owns making sure every consumer of the scales knows (see
-    ``mxfp4_scale_swizzle_supported`` for the shapes it accepts).
-
     Returns:
         (data_fp4, scales) — packed uint8 + uint8 E8M0 scales.
     """
@@ -569,10 +564,7 @@ def convert_to_mxfp4(
     use_asm = is_cdna4()
 
     if swizzle_scale:
-        assert axis not in (0, -2), "swizzled scales cannot be transposed afterwards"
-        assert mxfp4_scale_swizzle_supported(
-            M, N // block_size
-        ), f"scales ({M}, {N // block_size}) do not tile evenly"
+        raise ValueError("MXFP4 layout conversion is owned by AITER")
 
     if not swizzle_scale and not use_sr and not use_asm:
         # AITER RTN path (non-ASM fallback)
@@ -601,16 +593,10 @@ def convert_to_mxfp4(
             philox_seed = philox_seed or 0
             philox_offset = philox_offset or 0
 
-        from atomrl.lumen.kernels.mxfp4 import MXFP4_SCALE_STRIPE
-
         n_scale_cols = N // block_size
         fp4_packed = torch.empty((M, N // 2), dtype=torch.uint8, device=data_2d.device)
         scales_e8m0 = torch.empty(
-            (
-                (M // MXFP4_SCALE_STRIPE, n_scale_cols * MXFP4_SCALE_STRIPE)
-                if swizzle_scale
-                else (M, n_scale_cols)
-            ),
+            (M, n_scale_cols),
             dtype=torch.uint8,
             device=data_2d.device,
         )
@@ -637,12 +623,7 @@ def convert_to_mxfp4(
             IS_2D_BLOCK=False,
             USE_SR=use_sr,
             USE_ASM=use_asm,
-            SWIZZLE_SCALE=swizzle_scale,
-            NUM_SCALE_COLS=n_scale_cols,
         )
-
-    if swizzle_scale:
-        return fp4_packed.reshape(*orig_shape[:-1], N // 2), scales_e8m0
 
     out_shape = (*orig_shape[:-1], N // 2)
     scale_shape = (*orig_shape[:-1], N // block_size)
@@ -675,11 +656,6 @@ def convert_to_mxfp4_2d(
     ``IS_2D_BLOCK=True``, which makes ``_calculate_fp4_scales`` compute
     per-tile (block×block) amax instead of per-row-block (1×block) amax.
 
-    With ``shuffle_data`` the packed output lands in the B-operand order the
-    gfx950 MXFP4 GEMMs read, saving the separate permuting pass; nothing about
-    the tensor records that, so the caller has to tell its readers (see
-    ``mxfp4_data_shuffle_supported`` for the shapes it accepts).
-
     Returns:
         (data_fp4_packed, scales_2d) where scales_2d has shape
         ``(M//block, N//block)`` in uint8 E8M0 format.
@@ -695,9 +671,8 @@ def convert_to_mxfp4_2d(
     sm, sn = M // block_size, N // block_size
     use_asm = is_cdna4()
 
-    assert not shuffle_data or mxfp4_data_shuffle_supported(
-        M, N // 2
-    ), f"packed ({M}, {N // 2}) does not tile evenly for the B-operand shuffle"
+    if shuffle_data:
+        raise ValueError("MXFP4 layout conversion is owned by AITER")
 
     from atomrl.lumen.kernels.mxfp4 import _convert_to_mxfp4_kernel
 
@@ -737,10 +712,6 @@ def convert_to_mxfp4_2d(
         IS_2D_BLOCK=True,
         USE_SR=use_sr,
         USE_ASM=use_asm,
-        SWIZZLE_SCALE=False,
-        NUM_SCALE_COLS=N // block_size,
-        SHUFFLE_DATA=shuffle_data,
-        NUM_PACKED_COLS=N // 2,
     )
 
     out_shape = (*orig_shape[:-1], N // 2)
@@ -900,24 +871,16 @@ def transpose_packed_fp4(
 
     Uses Lumen Triton kernel (no AITER equivalent).
 
-    With ``shuffle_data`` the result is stored in the MXFP4 GEMM's B-operand
-    order rather than row-major, which saves the caller a separate permuting
-    pass when that GEMM is the only consumer. Callers must check
-    ``mxfp4_data_shuffle_supported`` first and mark the result, since nothing
-    about the tensor itself records the layout. ``in_shuffled`` says the same
-    of the input, for the caller whose quantizer already stored it that way.
+    Layout conversion belongs to AITER; this helper only transposes row-major
+    packed data.
     """
     from atomrl.lumen.kernels.mxfp4 import _transpose_packed_fp4_kernel
 
     M, N_packed = data_fp4.shape
     N = N_packed * 2
     assert M % 2 == 0, f"M={M} must be even for packed transpose"
-    assert not shuffle_data or mxfp4_data_shuffle_supported(
-        N, M // 2
-    ), f"shuffled store needs a ({N}, {M // 2}) shape that tiles exactly"
-    assert not in_shuffled or mxfp4_data_shuffle_supported(
-        M, N_packed
-    ), f"shuffled input needs a ({M}, {N_packed}) shape that tiles exactly"
+    if shuffle_data or in_shuffled:
+        raise ValueError("MXFP4 layout conversion is owned by AITER")
 
     output = torch.empty((N, M // 2), dtype=torch.uint8, device=data_fp4.device)
 
@@ -936,9 +899,6 @@ def transpose_packed_fp4(
         output.stride(1),
         BLOCK_M=BLOCK_M,
         BLOCK_N_PACKED=BLOCK_N_PACKED,
-        SHUFFLE_DATA=shuffle_data,
-        NUM_PACKED_COLS=M // 2,
-        IN_SHUFFLED=in_shuffled,
     )
     return output
 
@@ -1125,16 +1085,6 @@ def dual_layout_quant_mxfp4(
     *x* must be 2D and contiguous, with both dimensions a whole number of quant
     blocks and the row count a whole number of Hadamard groups.
 
-    With *swizzle_scale*, both scale tensors come back already in the layout the
-    gfx950 MXFP4 GEMMs read, saving a separate permuting pass over each. Only
-    valid when both scale shapes tile evenly (see ``swizzle_mxfp4_scale``); the
-    caller is responsible for routing them to a GEMM that expects that layout.
-
-    With *shuffle_col*, the transposed operand's data comes back in the B-operand
-    order as well, for callers that feed it to a GEMM as B (see
-    ``mxfp4_data_shuffle_supported``). The row-major operand is never shuffled:
-    it is always the A operand.
-
     Returns:
         ``(row_fp4, row_scales, col_fp4, col_scales)`` — ``row_*`` matching
         ``convert_to_mxfp4``, ``col_*`` matching ``hadamard_quant_mxfp4(x.t())``.
@@ -1149,6 +1099,8 @@ def dual_layout_quant_mxfp4(
         M % block_size == 0 and N % block_size == 0
     ), f"({M}, {N}) not a whole number of {block_size}-blocks"
     assert M % g == 0, f"M={M} not divisible by g={g}"
+    if swizzle_scale or shuffle_col:
+        raise ValueError("MXFP4 layout conversion is owned by AITER")
 
     # The counter only reaches the kernel through the SR path; an all-RTN call
     # that drew from Python's RNG anyway would also shift the stream every SR
@@ -1162,29 +1114,9 @@ def dual_layout_quant_mxfp4(
         philox_seed = philox_seed or 0
         philox_offset = philox_offset or 0
 
-    from atomrl.lumen.kernels.mxfp4 import MXFP4_SCALE_STRIPE
-
     n_scale_a, n_scale_b = N // block_size, M // block_size
-    if swizzle_scale:
-        assert mxfp4_scale_swizzle_supported(
-            M, n_scale_a
-        ), f"row scales ({M}, {n_scale_a}) do not tile evenly"
-        assert mxfp4_scale_swizzle_supported(
-            N, n_scale_b
-        ), f"col scales ({N}, {n_scale_b}) do not tile evenly"
-    assert not shuffle_col or mxfp4_data_shuffle_supported(
-        N, M // 2
-    ), f"col operand ({N}, {M // 2}) does not tile evenly for the B shuffle"
-    scale_a_shape = (
-        (M // MXFP4_SCALE_STRIPE, n_scale_a * MXFP4_SCALE_STRIPE)
-        if swizzle_scale
-        else (M, n_scale_a)
-    )
-    scale_b_shape = (
-        (N // MXFP4_SCALE_STRIPE, n_scale_b * MXFP4_SCALE_STRIPE)
-        if swizzle_scale
-        else (N, n_scale_b)
-    )
+    scale_a_shape = (M, n_scale_a)
+    scale_b_shape = (N, n_scale_b)
 
     row_fp4 = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
     row_scales = torch.empty(scale_a_shape, dtype=torch.uint8, device=x.device)
@@ -1229,11 +1161,6 @@ def dual_layout_quant_mxfp4(
         USE_SR_A=use_sr_row,
         USE_SR_B=use_sr_transposed,
         USE_ASM=is_cdna4(),
-        SWIZZLE_SCALE=swizzle_scale,
-        NUM_SCALE_COLS_A=n_scale_a,
-        NUM_SCALE_COLS_B=n_scale_b,
-        SHUFFLE_B=shuffle_col,
-        NUM_PACKED_COLS_B=M // 2,
     )
 
     return row_fp4, row_scales, col_fp4, col_scales
@@ -1264,13 +1191,7 @@ def dequant_hadamard_quant_mxfp4(
     Both dimensions must be a whole number of quant blocks and *M* a whole number
     of Hadamard groups, so that every output quant block lies inside one tile.
 
-    ``shuffle_data`` stores the result in the B-operand order the gfx950 MXFP4
-    GEMMs read, which the caller must therefore only ask for when it knows the
-    consumer is one of those kernels — see ``mxfp4_data_shuffle_supported``.
-
-    ``in_scale_swizzled`` reads *scales* in that same GEMM order, for the caller
-    whose forward already stored them that way; the kernel then gathers them
-    instead of a separate pass putting them back row-major.
+    Layout conversion belongs to AITER; inputs and outputs remain row-major.
     """
     assert data_fp4.dim() == 2, f"expected 2D, got {tuple(data_fp4.shape)}"
     M, K_packed = data_fp4.shape
@@ -1280,6 +1201,8 @@ def dequant_hadamard_quant_mxfp4(
     ), f"({M}, {K}) not a whole number of {block_size}-blocks"
     assert M % g == 0, f"M={M} not divisible by g={g}"
     assert g == 16, f"kernel is hardcoded for g=16, got {g}"
+    if swizzle_scale or shuffle_data or in_scale_swizzled:
+        raise ValueError("MXFP4 layout conversion is owned by AITER")
 
     # Activations take this path with RTN, where the kernel never reads the
     # counter; drawing from Python's RNG then would only shift the stream that
@@ -1293,31 +1216,12 @@ def dequant_hadamard_quant_mxfp4(
         philox_seed = philox_seed or 0
         philox_offset = philox_offset or 0
 
-    from atomrl.lumen.kernels.mxfp4 import (
-        MXFP4_SCALE_STRIPE,
-        _dequant_hadamard_quant_mxfp4_kernel,
-    )
+    from atomrl.lumen.kernels.mxfp4 import _dequant_hadamard_quant_mxfp4_kernel
 
     n_scale_cols = M // block_size
-    if swizzle_scale:
-        assert mxfp4_scale_swizzle_supported(
-            K, n_scale_cols
-        ), f"scales ({K}, {n_scale_cols}) do not tile evenly"
-    if in_scale_swizzled:
-        assert mxfp4_scale_swizzle_supported(
-            M, K // block_size
-        ), f"input scales ({M}, {K // block_size}) do not tile evenly"
-    if shuffle_data:
-        assert mxfp4_data_shuffle_supported(
-            K, M // 2
-        ), f"packed output ({K}, {M // 2}) does not tile evenly for the B-operand shuffle"
     out = torch.empty((K, M // 2), dtype=torch.uint8, device=data_fp4.device)
     out_scales = torch.empty(
-        (
-            (K // MXFP4_SCALE_STRIPE, n_scale_cols * MXFP4_SCALE_STRIPE)
-            if swizzle_scale
-            else (K, n_scale_cols)
-        ),
+        (K, n_scale_cols),
         dtype=torch.uint8,
         device=data_fp4.device,
     )
@@ -1351,12 +1255,6 @@ def dequant_hadamard_quant_mxfp4(
         QUANT_BLOCK_SIZE=block_size,
         USE_SR=use_sr,
         USE_ASM=is_cdna4(),
-        SWIZZLE_SCALE=swizzle_scale,
-        NUM_SCALE_COLS=n_scale_cols,
-        SHUFFLE_DATA=shuffle_data,
-        NUM_PACKED_COLS=M // 2,
-        IN_SCALE_SWIZZLED=in_scale_swizzled,
-        NUM_IN_SCALE_COLS=K // block_size,
     )
     return out, out_scales
 
@@ -1403,133 +1301,3 @@ def dequant_transpose_mxfp4(
         QUANT_BLOCK_SIZE=block_size,
     )
     return output
-
-
-def mxfp4_scale_swizzle_supported(rows: int, cols: int) -> bool:
-    """Whether a scale tensor of this shape tiles evenly for the gfx950 swizzle."""
-    from atomrl.lumen.kernels.mxfp4 import MXFP4_SCALE_KCHUNK, MXFP4_SCALE_STRIPE
-
-    return rows % MXFP4_SCALE_STRIPE == 0 and cols % MXFP4_SCALE_KCHUNK == 0
-
-
-def mxfp4_data_shuffle_supported(rows: int, packed_cols: int) -> bool:
-    """Whether a packed FP4 tensor of this shape tiles evenly for the B-operand shuffle."""
-    from atomrl.lumen.kernels.mxfp4 import (
-        MXFP4_SHUFFLE_GROUP_BYTES,
-        MXFP4_SHUFFLE_TILE_ROWS,
-    )
-
-    return (
-        rows % MXFP4_SHUFFLE_TILE_ROWS == 0
-        and packed_cols % MXFP4_SHUFFLE_GROUP_BYTES == 0
-    )
-
-
-def swizzle_mxfp4_scale(scales: torch.Tensor) -> torch.Tensor:
-    """E8M0 GEMM scales → the tiled layout gfx950's MXFP4 GEMMs read.
-
-    Bit-identical to ``aiter.ops.triton.utils.shuffle.shuffle_scale_gemm`` at
-    gfx950's ``(32, 8)`` tiling, but built by a kernel that owns a whole 32-row
-    stripe and so stores coalesced. The reference expresses the same
-    permutation over a 7-D view, which leaves it gathering 4-byte chunks; on the
-    larger training scales that is the difference between ~800 GB/s and enough
-    bandwidth for the copy to stop mattering.
-
-    Callers must pass a contiguous 2D tensor whose rows are a whole number of
-    stripes and columns a whole number of k-chunks; the AITER reference is the
-    fallback for anything else.
-    """
-    from atomrl.lumen.kernels.mxfp4 import (
-        MXFP4_SCALE_KCHUNK,
-        MXFP4_SCALE_STRIPE,
-        _swizzle_mxfp4_scale_gfx950_kernel,
-    )
-
-    assert scales.dim() == 2, f"expected 2D scales, got {tuple(scales.shape)}"
-    assert scales.is_contiguous(), "scales must be contiguous"
-    rows, cols = scales.shape
-    assert mxfp4_scale_swizzle_supported(rows, cols), (
-        f"({rows}, {cols}) is not a whole number of "
-        f"{MXFP4_SCALE_STRIPE}x{MXFP4_SCALE_KCHUNK} scale tiles"
-    )
-
-    out = torch.empty(
-        (rows // MXFP4_SCALE_STRIPE, cols * MXFP4_SCALE_STRIPE),
-        dtype=scales.dtype,
-        device=scales.device,
-    )
-    # One program per stripe per BLOCK_K k-chunks; capping at 8 keeps the
-    # in-register tile at 2048 bytes, and shapes with fewer chunks than that
-    # would only pay for masked-off work.
-    num_kchunks = cols // MXFP4_SCALE_KCHUNK
-    BLOCK_K = min(8, triton.next_power_of_2(num_kchunks))
-    grid = (rows // MXFP4_SCALE_STRIPE, triton.cdiv(num_kchunks, BLOCK_K))
-
-    _swizzle_mxfp4_scale_gfx950_kernel[grid](
-        scales,
-        out,
-        cols,
-        scales.stride(0),
-        STRIPE=MXFP4_SCALE_STRIPE,
-        KCHUNK=MXFP4_SCALE_KCHUNK,
-        BLOCK_K=BLOCK_K,
-    )
-    return out
-
-
-def swizzle_expanded_mxfp4_scale(
-    scales_2d: torch.Tensor,
-    block_size: int = 32,
-    transpose: bool = False,
-) -> torch.Tensor:
-    """2D tile scales → the swizzled per-row scales an MXFP4 GEMM reads.
-
-    Same bytes as expanding the tile grid over its rows and passing the result
-    to :func:`swizzle_mxfp4_scale`, in one pass. ``transpose`` reads the grid
-    transposed, which is what the transposed operand of the same weight needs;
-    a 2D block scale is transpose-invariant, so no requantization is involved.
-
-    Returns the swizzle's natural ``(rows // 32, cols * 32)`` shape, like
-    :func:`swizzle_mxfp4_scale`.
-    """
-    from atomrl.lumen.kernels.mxfp4 import (
-        MXFP4_SCALE_KCHUNK,
-        MXFP4_SCALE_STRIPE,
-        _swizzle_expanded_2d_scale_kernel,
-    )
-
-    assert scales_2d.dim() == 2, f"expected 2D scales, got {tuple(scales_2d.shape)}"
-    tile_rows, tile_cols = scales_2d.shape
-    if transpose:
-        tile_rows, tile_cols = tile_cols, tile_rows
-    rows, cols = tile_rows * block_size, tile_cols
-    assert mxfp4_scale_swizzle_supported(rows, cols), (
-        f"({rows}, {cols}) is not a whole number of "
-        f"{MXFP4_SCALE_STRIPE}x{MXFP4_SCALE_KCHUNK} scale tiles"
-    )
-
-    out = torch.empty(
-        (rows // MXFP4_SCALE_STRIPE, cols * MXFP4_SCALE_STRIPE),
-        dtype=scales_2d.dtype,
-        device=scales_2d.device,
-    )
-    num_kchunks = cols // MXFP4_SCALE_KCHUNK
-    BLOCK_K = min(8, triton.next_power_of_2(num_kchunks))
-    grid = (rows // MXFP4_SCALE_STRIPE, triton.cdiv(num_kchunks, BLOCK_K))
-
-    stride_tile_row, stride_tile_col = scales_2d.stride()
-    if transpose:
-        stride_tile_row, stride_tile_col = stride_tile_col, stride_tile_row
-
-    _swizzle_expanded_2d_scale_kernel[grid](
-        scales_2d,
-        out,
-        cols,
-        stride_tile_row,
-        stride_tile_col,
-        QUANT_BLOCK_SIZE=block_size,
-        STRIPE=MXFP4_SCALE_STRIPE,
-        KCHUNK=MXFP4_SCALE_KCHUNK,
-        BLOCK_K=BLOCK_K,
-    )
-    return out

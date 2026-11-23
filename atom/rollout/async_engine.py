@@ -5,7 +5,7 @@ import logging
 from contextlib import contextmanager
 
 from atom.model_engine.capabilities import EngineCapabilities, WorkerCapabilities
-from atom.model_engine.collective_rpc import DISCARD_WEIGHT_SYNC_CMD, RpcResult
+from atom.model_engine.collective_rpc import RpcResult
 from atom.model_engine.engine_utility import (
     PAUSE_GENERATION_CMD,
     RECEIVE_WEIGHTS_RDMA_CMD,
@@ -13,7 +13,11 @@ from atom.model_engine.engine_utility import (
     WEIGHT_STREAM_TIMEOUT_S,
 )
 from atom.model_engine.llm_engine import LLMEngine
-from atom.rollout.weight_sync import load_weights_via_ipc, load_weights_via_shm
+from atom.rollout.weight_sync import (
+    _abort_weight_sync,
+    load_weights_via_ipc,
+    load_weights_via_shm,
+)
 
 logger = logging.getLogger("atom")
 
@@ -114,9 +118,9 @@ class AsyncLLMEngine(LLMEngine):
             try:
                 yield
             except BaseException as exc:
-                self.core_mgr.broadcast_utility_command_sync(
-                    DISCARD_WEIGHT_SYNC_CMD,
-                    failed_cmd=f"weight_sync_session: {type(exc).__name__}",
+                _abort_weight_sync(
+                    self.core_mgr,
+                    f"weight_sync_session: {type(exc).__name__}",
                 )
                 raise
 

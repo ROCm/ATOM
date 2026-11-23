@@ -111,9 +111,7 @@ export WANDB_DIR="$OUT_DIR/wandb-$RUN"
 export WANDB_SILENT=true
 mkdir -p "$WANDB_DIR"
 
-# Held identical across modes on purpose, including for the baseline: the sidecar
-# flydsl shadows the image's, which makes aiter unimportable, and diffusers
-# probes aiter when choosing an attention backend.
+# Use the same in-tree AtomRL/Lumen source in every comparison mode.
 export PYTHONPATH="$LUMEN_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}"
 if [ -n "$PATCH" ]; then
     export LUMEN_PATCH="$PATCH"

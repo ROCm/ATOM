@@ -22,11 +22,6 @@
 : "${LOG_DIR:=$WORK/logs}"
 : "${HF_HOME:=$WORK/hf-cache}"
 
-# flydsl 0.3.2 installed to its own directory rather than over the one in the
-# image; aiter's FlyDSL convolution needs it. See README section 2.5.
-: "${FLYDSL_SIDECAR:=$WORK/pyenv/flydsl-0.3.2}"
-: "${FLYDSL_VERSION:=0.3.2}"
-
 : "${EXAMPLE_DIR:=$LUMEN_DIR/examples/perf-veomni}"
 
 # VeOmni commit this example is pinned to. Later commits may move the condition
@@ -35,7 +30,7 @@
 
 export WORK ATOM_ROOT ATOMRL_DIR LUMEN_DIR VEOMNI_DIR QWEN_IMAGE_DIR DATA_DIR OUT_DIR LOG_DIR HF_HOME
 export WAN_DIR WAN_DATA_DIR
-export FLYDSL_SIDECAR FLYDSL_VERSION EXAMPLE_DIR VEOMNI_COMMIT
+export EXAMPLE_DIR VEOMNI_COMMIT
 
-# Put the sidecar ahead of the image's flydsl and use the unified AtomRL source.
-export LUMEN_PYTHONPATH="$FLYDSL_SIDECAR:$ATOMRL_DIR"
+# Use the unified AtomRL/Lumen source without modifying installed dependencies.
+export LUMEN_PYTHONPATH="$ATOMRL_DIR"

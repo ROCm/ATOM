@@ -7,14 +7,15 @@ import sys
 import types
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).parents[3]
-SOURCE_ROOT = REPO_ROOT.parent / "atomrl" / "lumen"
+ATOMRL_ROOT = Path(__file__).parents[4]
+REPO_ROOT = ATOMRL_ROOT / "tests"
+SOURCE_ROOT = ATOMRL_ROOT / "atomrl" / "lumen"
 OPS_INIT_PATH = SOURCE_ROOT / "models/dsv4/ops/__init__.py"
 CANONICAL_OPS_INIT_PATH = SOURCE_ROOT / "ops/dsv4/__init__.py"
 COMPRESSOR_PATH = SOURCE_ROOT / "models/dsv4/ops/compressor.py"
 PRETRAIN_PATH = SOURCE_ROOT / "models/dsv4/megatron/pretrain.py"
 PIPELINE_PATH = SOURCE_ROOT / "models/dsv4/megatron/pipeline.py"
-DSV4_EXAMPLES = REPO_ROOT / "examples/dsv4"
+DSV4_EXAMPLES = ATOMRL_ROOT / "lumen" / "examples" / "dsv4"
 
 CANONICAL_OPS = {
     "sparse_mla.py",
@@ -27,17 +28,9 @@ CANONICAL_OPS = {
     "utils.py",
 }
 CANONICAL_KERNELS = {
-    "sparse_mla": {
-        "triton_sparse_mla.py",
-        "tilelang_sparse_mla.py",
-        "tilelang_sparse_mla_fwd.py",
-        "tilelang_sparse_mla_bwd.py",
-    },
+    "sparse_mla": {"triton_sparse_mla.py"},
     "indexer": {
         "aiter_dsv4_indexer.py",
-        "tilelang_indexer.py",
-        "tilelang_indexer_fwd.py",
-        "tilelang_indexer_bwd.py",
     },
     "quant": {"precision_aligned_ops.py", "act_quant.py"},
 }
@@ -53,6 +46,7 @@ def test_dsv4_sources_live_in_canonical_ops_and_kernel_trees():
         assert (canonical_kernels / group / "__init__.py").is_file(), group
         for filename in filenames:
             assert (canonical_kernels / group / filename).is_file(), filename
+    assert not tuple(canonical_kernels.rglob("tilelang_*.py"))
 
     assert not (SOURCE_ROOT / "models/dsv4/ops/kernel").exists()
     for legacy_name in (
@@ -80,7 +74,7 @@ def test_internal_python_imports_use_canonical_dsv4_paths():
         "atomrl.lumen.models.dsv4.ops.qat",
         "atomrl.lumen.models.dsv4.ops.utils",
     )
-    for root in (REPO_ROOT.parent / "atomrl" / "lumen", REPO_ROOT / "examples"):
+    for root in (SOURCE_ROOT, ATOMRL_ROOT / "lumen" / "examples"):
         for path in root.rglob("*.py"):
             source = path.read_text(encoding="utf-8")
             assert not any(old_path in source for old_path in forbidden), path
@@ -103,7 +97,7 @@ def test_canonical_and_model_facades_do_not_eagerly_import_qat_or_kernels():
 
 def test_canonical_dsv4_modules_import_without_model_or_tilekernels(monkeypatch):
     lumen_package = types.ModuleType("atomrl.lumen")
-    lumen_package.__path__ = [str(REPO_ROOT.parent / "atomrl" / "lumen")]
+    lumen_package.__path__ = [str(SOURCE_ROOT)]
     ops_package = types.ModuleType("atomrl.lumen.ops")
     ops_package.__path__ = [str(SOURCE_ROOT / "ops")]
     monkeypatch.setitem(sys.modules, "atomrl.lumen", lumen_package)

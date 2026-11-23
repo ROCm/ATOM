@@ -58,12 +58,6 @@ class TestMXFP4WeightCacheHook:
 
         monkeypatch.setattr(linear_mod, "quantize_input", _quantize)
         monkeypatch.setattr(
-            linear_mod, "_mxfp4_can_fuse_b_shuffle", lambda *_args: False
-        )
-        monkeypatch.setattr(
-            linear_mod, "_mxfp4_can_fuse_scale_swizzle", lambda *_args: False
-        )
-        monkeypatch.setattr(
             ops_mod,
             "transpose_packed_fp4",
             lambda data, **_kwargs: data.t().contiguous(),

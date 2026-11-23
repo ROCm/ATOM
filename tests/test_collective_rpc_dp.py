@@ -716,6 +716,18 @@ def test_a_raw_nonfinal_bucket_requires_an_owned_session():
     assert mgr.sent == []
 
 
+def test_weight_sync_abort_claim_is_once_per_outer_session():
+    mgr = _mgr(1)
+
+    with mgr.weight_sync_session():
+        assert mgr.claim_weight_sync_abort()
+        with mgr.weight_sync_session():
+            assert not mgr.claim_weight_sync_abort()
+
+    with mgr.weight_sync_session():
+        assert mgr.claim_weight_sync_abort()
+
+
 def test_overlapping_weight_sync_sessions_cannot_interleave_their_buckets():
     mgr = _mgr(1)
     mgr.broadcast_utility_command = _answering(

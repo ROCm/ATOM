@@ -2,19 +2,6 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 NOTICES = REPO_ROOT / "atomrl" / "THIRD_PARTY_NOTICES.md"
-TE_KERNEL = (
-    REPO_ROOT
-    / "atomrl"
-    / "lumen"
-    / "examples"
-    / "perf-veomni"
-    / "aiter_overlay"
-    / "aiter"
-    / "ops"
-    / "triton"
-    / "_triton_kernels"
-    / "cross_entropy.py"
-)
 
 
 def test_third_party_notice_lists_imported_sources():
@@ -24,27 +11,13 @@ def test_third_party_notice_lists_imported_sources():
         "atomrl/atomrl/data/sft_dataset.py",
         "atomrl/atomrl/rewards/math_reward.py",
         "atomrl/atomrl/engine/inference/bucketed_weight_transfer.py",
-        "atomrl/atomrl/lumen/kernels/dsv4/indexer/tilelang_*.py",
-        "atomrl/atomrl/lumen/kernels/dsv4/sparse_mla/tilelang_*.py",
         "atomrl/atomrl/lumen/kernels/dsv4/quant/act_quant.py",
-        "atomrl/atomrl/trainer/bf16_optimizer.py",
-        "atomrl/atomrl/data/kimi_k25_parser.py",
     ):
         assert path in text
 
     assert "https://github.com/volcengine/verl" in text
     assert "https://github.com/vllm-project/vllm" in text
     assert "https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro" in text
-    assert "TorchSpec" in text
-    assert "MILES" in text
-
-
-def test_transformer_engine_derived_kernel_keeps_apache_provenance():
-    header = "\n".join(TE_KERNEL.read_text(encoding="utf-8").splitlines()[:6])
-
-    assert "SPDX-License-Identifier: Apache-2.0" in header
-    assert "NVIDIA CORPORATION & AFFILIATES" in header
-    assert "MIT" not in header
 
 
 def test_derived_sources_keep_file_level_license_provenance():
@@ -57,22 +30,6 @@ def test_derived_sources_keep_file_level_license_provenance():
         / "engine"
         / "inference"
         / "bucketed_weight_transfer.py",
-        REPO_ROOT / "atomrl" / "atomrl" / "trainer" / "bf16_optimizer.py",
-        REPO_ROOT / "atomrl" / "atomrl" / "data" / "kimi_k25_parser.py",
-    )
-    apache_files += tuple(
-        path
-        for directory in (
-            REPO_ROOT / "atomrl" / "atomrl" / "lumen" / "kernels" / "dsv4" / "indexer",
-            REPO_ROOT
-            / "atomrl"
-            / "atomrl"
-            / "lumen"
-            / "kernels"
-            / "dsv4"
-            / "sparse_mla",
-        )
-        for path in directory.glob("tilelang_*.py")
     )
 
     for path in apache_files:
@@ -95,3 +52,30 @@ def test_derived_sources_keep_file_level_license_provenance():
     header = "\n".join(deepseek.read_text(encoding="utf-8").splitlines()[:6])
     assert "SPDX-License-Identifier: MIT" in header
     assert "DeepSeek" in header
+
+
+def test_blocked_unapproved_sources_are_not_distributed():
+    blocked = (
+        REPO_ROOT / "atomrl" / "atomrl" / "trainer" / "bf16_optimizer.py",
+        REPO_ROOT / "atomrl" / "atomrl" / "data" / "kimi_k25_parser.py",
+    )
+    assert not any(path.exists() for path in blocked)
+
+    kernel_root = REPO_ROOT / "atomrl" / "atomrl" / "lumen" / "kernels" / "dsv4"
+    assert not tuple(kernel_root.rglob("tilelang_*.py"))
+
+    text = NOTICES.read_text(encoding="utf-8")
+    assert "must not be redistributed" not in text
+    assert "AMD OSS sign-off" not in text
+
+
+def test_gated_example_tokenizers_are_downloaded_not_distributed():
+    examples = REPO_ROOT / "atomrl" / "lumen" / "examples"
+    assert not tuple(examples.glob("*/tokenizer/*"))
+
+    ensure_script = (examples / "scripts" / "ensure_tokenizer.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "meta-llama/Llama-2-7b-hf" in ensure_script
+    assert "meta-llama/Llama-3.1-8B" in ensure_script
+    assert "Qwen/Qwen3-8B-Base" in ensure_script

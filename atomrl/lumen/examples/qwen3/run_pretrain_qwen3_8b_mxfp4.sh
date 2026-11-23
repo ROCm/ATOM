@@ -88,23 +88,8 @@ if [ "${LAUNCH}" = "native" ]; then
         exit 1
     }
 
-    # MXFP4-only: the tuned A4W4 table widens which shapes reach AITER's prebuilt
-    # ASM kernels and the autotune cache makes the per-shape backend choice
-    # reproducible across processes. Every MXFP4 backend is bit-identical, so both
-    # affect speed only (docs/mxfp4_training_report.md §2.2).
     if [ "${PRECISION}" = "mxfp4" ]; then
-        # AITER_CONFIG_GEMM_A4W4 is deliberately left alone. Setting it here to
-        # the generic table shadowed the list train_qwen3_8b.sh builds, which is
-        # the only one carrying Qwen3-8B's fused qkv/gate_up shapes -- every
-        # MXFP4 GEMM then missed the ASM kernels and fell back to Triton.
-        # The autotune cache has to stay overridable: its decisions are recorded
-        # under whatever kernels were reachable at the time, so a run made with
-        # the tuned table missing pins "use Triton" for every shape and later
-        # runs inherit it. A/B work needs to be able to point somewhere fresh.
-        RUNTIME_ENV+=(
-            LUMEN_MXFP4_AUTOTUNE_CACHE="${LUMEN_MXFP4_AUTOTUNE_CACHE:-${RESULTS_DIR}/mxfp4_autotune_qwen3_8b.json}"
-            LUMEN_FAST_QUANT_DISPATCH=1
-        )
+        RUNTIME_ENV+=(LUMEN_FAST_QUANT_DISPATCH=1)
     fi
 
     exec env "${RUNTIME_ENV[@]}" "${CFG_ENV[@]}" \
@@ -119,16 +104,7 @@ fi
 docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true
 
 if [ "${PRECISION}" = "mxfp4" ]; then
-    # AITER_CONFIG_GEMM_A4W4 is left alone here for the same reason as native
-    # mode: train_pretrain.sh only builds the path list while it is empty, and
-    # that list is the only thing that puts qwen3_8b_a4w4_blockscale_tuned_gemm
-    # .csv in front. The two tables are disjoint -- every M=16384 shape this run
-    # issues lives in the model one -- so pinning the stock table alone dropped
-    # 8 of the 11 MXFP4 GEMMs to Triton, ~132 ms/step.
-    RUNTIME_ENV+=(
-        LUMEN_MXFP4_AUTOTUNE_CACHE=/results/mxfp4_autotune_qwen3_8b.json
-        LUMEN_FAST_QUANT_DISPATCH=1
-    )
+    RUNTIME_ENV+=(LUMEN_FAST_QUANT_DISPATCH=1)
 fi
 
 DOCKER_ENV=()

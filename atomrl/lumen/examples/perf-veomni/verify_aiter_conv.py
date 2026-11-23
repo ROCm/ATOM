@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
-"""Single-GPU check of aiter's FlyDSL convolution (ROCm/aiter#5370) in a real VAE.
+"""Single-GPU check of Lumen's AITER-backed convolution in a real VAE.
 
 Encodes one input at the shape training uses through the stock BF16 VAE and
 through the patched one (lumen_vae_conv -> veomni_patches.aiter_conv -> aiter), and reports:
 
   * latents against an FP32 encode, patched next to stock BF16
   * encode time
-  * how aiter resolved every convolution: exact tuned row, borrowed row, or
-    heuristic -- a table that loads but never matches looks like one that works
   * the conv kernels and their GPU time for one encode
   * with --padk, that conv_pad_in_kernel leaves the latents bit-identical
 
     verify_aiter_conv.py --model qwen            # 1 x 1024 x 1024
     verify_aiter_conv.py --model wan --padk      # 81 x 368 x 544
 
-Needs the aiter overlay (overlay_aiter.py --apply) and the sidecar flydsl.
+Requires an AITER release that provides the public Conv2d/Conv3d APIs.
 """
 
 import argparse
@@ -90,13 +88,6 @@ def main():
     ap.add_argument("--iters", type=int, default=5)
     args = ap.parse_args()
 
-    from veomni_patches import aiter_conv
-
-    if aiter_conv.load() is None:
-        raise SystemExit(
-            "aiter flydsl_conv_implicit unavailable; run overlay_aiter.py --apply"
-        )
-
     video = args.model == "wan"
     h = args.height or (368 if video else 1024)
     w = args.width or (544 if video else 1024)
@@ -135,16 +126,13 @@ def main():
             with torch.no_grad():
                 return v.encode(x).latent_dist.parameters
 
-        before = aiter_conv.tuned_lookup_stats()["calls"]
         lat = enc_m().float()
-        after = aiter_conv.tuned_lookup_stats()["calls"]
         ms = timed(enc_m, args.iters)
         kernels = gpu_kernels(enc_m)
         results[mode] = lat
-        lookups = {k: after[k] - before[k] for k in after}
         print(
             f"{mode:15} : {ms:8.1f} ms/encode   SNR vs FP32 {snr_db(ref32, lat):5.1f} dB   "
-            f"{len(stats['patched'])} convs patched   lookups per encode {lookups}"
+            f"{len(stats['patched'])} convs patched"
         )
         conv = sorted(
             (
@@ -165,14 +153,6 @@ def main():
             f"pad-in-kernel vs pre-pad latents max|d| = {d:.3e}"
             + ("  (bit-identical)" if d == 0 else "")
         )
-    print(f"tuned-table lookups, whole run: {aiter_conv.tuned_lookup_stats()}")
-    misses = aiter_conv.tuned_misses()
-    if misses:
-        print(
-            f"shapes on the heuristic tile ({len(misses)}); tune them with tune_conv3d.py:"
-        )
-        for k in misses:
-            print("   ", k)
 
 
 if __name__ == "__main__":

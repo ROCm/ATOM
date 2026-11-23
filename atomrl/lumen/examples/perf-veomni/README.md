@@ -4,7 +4,12 @@
 
 本文给出 VeOmni 上两个扩散模型训练的三级性能阶梯：**示例原样 → 只改配置能调出的最优 →
 在配置最优之上叠加 Lumen 优化后的最优**。配置级只改 VeOmni 的命令行参数；Lumen 级的优化是本示例
-`veomni_patches/` 里的运行时补丁，由入口脚本按 `LUMEN_PATCH` 装配，VeOmni 源码和 Lumen 库本身都不修改。VAE 卷积使用 aiter 的 FlyDSL 实现（[ROCm/aiter#5370](https://github.com/ROCm/aiter/pull/5370)，已合入 aiter main）。
+`veomni_patches/` 里的运行时补丁，由入口脚本按 `LUMEN_PATCH` 装配，VeOmni
+与已安装 AITER 的源码都不修改。当前 VAE 卷积路径位于
+`atomrl.lumen.ops.conv`。
+
+> 下方性能表由旧的实验性 FlyDSL 路径测得，只作为历史记录，不能作为当前
+> 包内卷积实现的验证数据；当前路径需要重新测试。
 
 ---
 
@@ -170,45 +175,12 @@ other，下表已按实际类别更正。
 - 在 Lumen 最优配置下，剩余的大头是：Qwen 的通信（GPU 时间的 25%，与计算争用 CU）；Wan 的 attention
   （38%，其中 `fmha_bwd` 311 ms）。
 
-### 2.5 FlyDSL 卷积：aiter 的实现与 L3 的取舍
+### 2.5 卷积：Lumen 包内实现
 
-**接入方式。** 示例的 `veomni_patches/aiter_conv.py` 直接调用 aiter 的 `flydsl_conv_implicit`（[ROCm/aiter#5370](https://github.com/ROCm/aiter/pull/5370)，
-2026-09-24 合入 aiter main，merge `305c421e`）；输入不是 BF16 或需要梯度时（kernel 只有前向）改走 torch 卷积。本文使用的镜像里的
-aiter（0.1.12.post2）早于该 PR，所以做了三件事，已安装的文件一个都没有改：
-
-1. PR 新增的文件（kernel、调优策略、按模型调好的 tile 表）放在示例的 `aiter_overlay/` 里，与 aiter main 上的
-   版本逐字节相同，由 `overlay_aiter.py` 补进 aiter 的安装目录。它只写入原本不存在的文件，可以回退；对已经
-   包含该 PR 的 aiter，这些文件会被识别为已存在而跳过。
-2. 旧版 aiter 没有 `AITER_CONFIGS.AITER_CONFIG_CONV3D_BF16_FILE`，调优表会**静默**加载为空表。Lumen
-   按 PR 的方式补上这个属性，并对每次查表计数（精确命中 / 借用 / 启发式）。
-3. 旧版 `aiter/ops/flydsl/__init__.py` 会立即导入依赖旧版 flydsl（`fly_values`）的 kernel，导致整个包
-   无法导入。Lumen 在第一次用到卷积时绕过这个 `__init__` 单独加载卷积模块，然后撤掉临时的包对象，其他
-   代码看到的 aiter 与原来完全一样。
-
-后两步都会先尝试正常路径；aiter 包含该 PR 时，它们什么也不做。
-
-**flydsl 版本。** 这个 kernel 需要 `flydsl.expr.struct`，镜像自带的 flydsl 0.1.6 没有这个 API（导入即失败），
-所以要用 sidecar flydsl 0.3.2。aiter 自己钉的是 0.3.4.1；在 0.3.2 上数值符合预期（§2.3）。sidecar 会让旧版 aiter
-关闭 CK/HIP 算子；这对 VeOmni 没有影响，所有级都在同一环境下测量。
-
-**L3 的键冲突与取舍。** aiter 的 Wan 调优行是按原始调用方式建键的：先 `F.pad`，再以 padding=0 卷积（例如
-C=96、6×370×546、pad 0）。`conv_pad_in_kernel` 改为传 6×368×544 加 padding (0,1,1)，所以这些行全部查不到。
-单卡实测 Wan VAE 一次 encode（81×368×544）：
-
-| 组合 | encode | 卷积 kernel | 调优表命中 |
-|---|---:|---:|---:|
-| 原生 BF16（torch / CK） | 427.5 ms | — | — |
-| 预 pad + aiter 调优表 | 332.9 ms | 146.3 ms | 515/525 |
-| L3 + aiter 自带的表（L3 的形状查不到，走启发式） | 314.5 ms | 163.4 ms | 63/525 |
-| **L3 + aiter 自带的表 + 为 L3 另调的表** | **293.5 ms** | **140.7 ms** | 315/525 |
-
-"L3 + 启发式"比"调优表 + 预 pad"快 18 ms，说明省掉的 `F.pad` 拷贝比调优表更值钱；但调优表本身能让卷积快
-9%，这部分 L3 拿不到。所以用 `tune_conv3d.py` 为 L3 的 16 个未命中形状另调了一份表
-（`aiter_overlay/.../model_configs/wan21_vae_padk_bf16_tuned_conv3d.csv`）。方法照搬 aiter 的调优脚本：同一套
-候选，按 NDHWC 计时，与 torch 结果比对（容差 2e-2），比启发式快 ≥3% 才写入。结果 10 个形状入表，收益最高
-22.6%（C=192、6×184×272）；其余 6 个继续用启发式。各组合的 latent 全部逐位一致。
-
-Qwen 的 22 个卷积调用全部命中 aiter 自带的表；encode 从原生 BF16 的 36.5 ms 降到 19.5 ms。
+`LumenConfig(aiter_conv=True)` 通过 `atomrl.lumen.ops.conv` 接管支持的
+`nn.Conv2d` 和 `nn.Conv3d`。Lumen 负责 autograd 安全路由：前向调用 AITER
+公共卷积 API，反向使用 PyTorch gradient 算子。示例不再向 AITER 安装目录
+复制文件、修改 `AITER_CONFIGS` 或 monkey-patch AITER 模块。
 
 ### 2.6 离线嵌入工作流（可选）
 
@@ -264,17 +236,14 @@ dx 'git clone https://github.com/ByteDance-Seed/VeOmni.git /work/VeOmni &&
 dx ". $EX/env.sh && bash \$EXAMPLE_DIR/setup_env.sh"
 ```
 
-`setup_env.sh` 做三件事：把 flydsl 0.3.2 装到独立的 sidecar 目录；用 `overlay_aiter.py` 补上 aiter 缺的文件，
-包括 PR 5370 的卷积和调优表；以 `--no-deps` 安装 VeOmni。期望末尾输出：
+`setup_env.sh` 以 `--no-deps` 安装 VeOmni，并验证 Lumen 卷积入口。期望末尾输出：
 
 ```text
-aiter flydsl_conv_implicit: available (must be available)
-aiter conv3d tuned rows   : 86 (86 = 76 from aiter + 10 for conv_pad_in_kernel)
+Lumen convolution: available (must be available)
 SETUP OK
 ```
 
 不要执行 `uv sync`、`pip install -e '.[gpu]'`，也不要安装任何 torch、triton、`cu12`/`cu13`/`nvidia-*` 包。
-回退 overlay 用 `python overlay_aiter.py --revert`。
 
 ### 3.3 模型与数据
 
@@ -377,7 +346,7 @@ dx ". $EX/env.sh && RUN_NAME=<名字> RUN_SUFFIX=r1 LUMEN_PATCH=<补丁> \
 | 取值 | 作用 | 代码位置 |
 |---|---|---|
 | `vae_bf16` | 冻结的 VAE 以 BF16 运行，`encode()` 出口把 latent 转回 FP32 | `train_dit_lumen.py` |
-| `vae_conv` / `vae_conv_video` | VAE 卷积走 aiter FlyDSL；前者用于图像（T=1 精确转 conv2d），后者还覆盖 T>1 与 feature cache | `lumen_vae_conv.py`、`veomni_patches/aiter_conv.py` |
+| `vae_conv` / `vae_conv_video` | VAE 卷积走 Lumen 的 AITER-backed Conv2d/Conv3d 路径；前者用于图像（T=1 精确转 conv2d），后者还覆盖 T>1 与 feature cache | `lumen_vae_conv.py`、`veomni_patches/aiter_conv.py` |
 | `conv_pad_in_kernel` | 因果卷积不再先 `F.pad` 拷贝整块，改由 kernel 用掩码处理对称 padding | `lumen_vae_conv.py` |
 | `sdpa_efficient` | 关闭 SDPA 的 flash 后端；在 ROCm 上反向改走 aiter 融合 `fmha_bwd`。**引入非确定性** | `veomni_patches/sdpa.py` |
 | `attn_triton_fwd` | 仅对 DiT 的 attention（无 mask、非因果、BF16、head_dim 128）改用 aiter Triton 前向，反向仍用 efficient；需同时加 `sdpa_efficient` | `veomni_patches/sdpa.py` |
@@ -407,20 +376,12 @@ python3 determinism.py <级> ...                          # 同一级的重复�
 python3 compare_batch_hash.py <日志 A> <日志 B>          # 两次运行的输入是否逐字节相同
 ```
 
-为 L3 的形状重新调表（换硬件或换分辨率后需要）：
-
-```bash
-dx ". $EX/env.sh && PYTHONPATH=\$LUMEN_PYTHONPATH HIP_VISIBLE_DEVICES=0 CUDA_VISIBLE_DEVICES=0 \
-      python3 \$EXAMPLE_DIR/tune_conv3d.py record --model wan --padk -o /work/untuned.csv"
-dx ". $EX/env.sh && PYTHONPATH=\$LUMEN_PYTHONPATH python3 \$EXAMPLE_DIR/tune_conv3d.py tune \
-      -i /work/untuned.csv -o /work/wan21_vae_padk_bf16_tuned_conv3d.csv"   # 8 卡并行，约 30 分钟
-```
-
 ### 3.9 验收标准
 
 - 每个 run 的 `.meta.txt` 中 `EXIT_CODE : 0`，VeOmni 与 Lumen 的 dirty 计数均为 0。
-- 带 VAE 补丁的 run，日志里要有 `FlyDSL implementation: aiter`，`aiter conv calls` 中 `torch` 为 0，
-  并且 aiter 调优表的 `exact` 计数不为 0。只看到 `patched` 不足以证明 kernel 真的在运行。
+- 带 VAE 补丁的 run，日志里要有 `Lumen convolution: AITER`，且
+  `aiter conv calls` 中 `torch` 为 0。只看到 `patched` 不足以证明 kernel
+  真的在运行。
 - 结论中每项 L 优化都要有 kernel 级证据（§2.2），不能只凭步时推断。
 - 一项增量只有同时大于两级的组内散布、且 p < 0.05 才算收益。
 - 同一时间只能跑一个 8 卡任务（runner 用 `$LOG_DIR/.run.lock` 保证），开跑前用 `rocm-smi --showpids`
@@ -430,10 +391,7 @@ dx ". $EX/env.sh && PYTHONPATH=\$LUMEN_PYTHONPATH python3 \$EXAMPLE_DIR/tune_con
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
-| `module 'flydsl.expr' has no attribute 'struct'` | 用的是镜像自带的 flydsl 0.1.6 | 确认 `$FLYDSL_SIDECAR` 在 `PYTHONPATH` 的最前面 |
-| `cannot import name 'fly_values'` / "CK and HIP ops are disabled" | 旧版 aiter 与 flydsl 0.3.x 的 API 不一致 | 预期内；卷积已绕开，VeOmni 用不到 CK/HIP 算子 |
-| 入口报 `aiter's flydsl_conv_implicit is unavailable` | aiter 未包含 #5370 且 overlay 未应用，或 sidecar 不在 `PYTHONPATH` | 重跑 `setup_env.sh` |
-| 调优表 `exact` 为 0 | 调优表未合并 | 检查 `aiter/configs/model_configs/*bf16_tuned_conv3d*.csv` 是否存在 |
+| AITER 卷积导入失败 | 已安装 AITER 缺少公共 Conv2d/Conv3d API | 安装当前兼容的 AITER 版本 |
 | BF16 VAE 后 timestep 查找 `IndexError` | `encode()` 输出没有转回 FP32 | 使用本示例的入口与 `vae_bf16` |
 | 实际步数少于目标，但 exit 0 | 数据行数少于 `步数 × rank 数` | 准备足够的样本 |
 | `Conflicting visibility of agent-N` | 两个 GPU 可见性变量不一致 | 同时设置 HIP 与 CUDA 的可见性变量 |
@@ -449,11 +407,9 @@ dx ". $EX/env.sh && PYTHONPATH=\$LUMEN_PYTHONPATH python3 \$EXAMPLE_DIR/tune_con
 | `ladder.sh` | 三级阶梯的全部级定义与按轮次交替的重复 |
 | `run_10steps.sh` / `run_wan_10steps.sh` | 单次 8 卡 10 步运行；`custom` 模式读取 `LUMEN_PATCH`，其余参数透传给 VeOmni |
 | `profile.sh` | 用 VeOmni 自带的 profiler 采任一级的 trace |
-| `train_dit_lumen.py` | VeOmni 训练入口的包装：按 `LUMEN_PATCH` 装配补丁，并报告卷积实现、查表与路由计数 |
+| `train_dit_lumen.py` | VeOmni 训练入口的包装：按 `LUMEN_PATCH` 装配补丁，并报告后端路由计数 |
 | `lumen_vae_conv.py` | VAE 卷积改写：T=1 精确转 conv2d、T>1 替换底层 kernel、padding 交给 kernel |
-| `veomni_patches/` | L 级的全部补丁：`aiter_conv.py`（aiter 卷积接入与查表计数）、`sdpa.py`、`rmsnorm.py`、`local_adamw.py`、`qwen_offline.py` |
-| `overlay_aiter.py` / `aiter_overlay/` | 为旧版 aiter 补齐缺失的文件（Lumen 用到的 Triton 模块，取自固定版本的官方 AITER commit；#5370 的卷积与调优表），以及为 L3 另调的表 |
-| `tune_conv3d.py` | 录制未命中的卷积形状并调优，生成 aiter 格式的调优表 |
+| `veomni_patches/` | L 级的全部补丁：`aiter_conv.py`（AITER 公共卷积路由）、`sdpa.py`、`rmsnorm.py`、`local_adamw.py`、`qwen_offline.py` |
 | `verify_aiter_conv.py` / `verify_sdpa_triton_fwd.py` / `verify_rmsnorm_fuse.py` | 单卡数值与性能校验 |
 | `test_patches.py` | `veomni_patches/` 的单元测试 |
 | `summarize.py` | 步时中位数、散布、p、峰值显存、loss 偏差；`--chain` 逐级比较 |

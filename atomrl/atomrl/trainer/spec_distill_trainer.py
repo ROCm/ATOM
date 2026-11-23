@@ -670,24 +670,24 @@ class SpecDistillTrainer:
                     self._draft_model, {"enabled": True, "strategy": "replicate"}
                 )
 
-        from atomrl.trainer.bf16_optimizer import BF16Optimizer
+        from atomrl.lumen.quantize.optimizer_manager import (
+            FP32MasterWeightOptimizer,
+            build_training_scheduler,
+        )
 
         policy = self.config.policy
-        wsd_decay_ratio = policy.wsd_decay_ratio
-        wsd_decay_style = policy.wsd_decay_style
-        self._optimizer = BF16Optimizer(
-            model=self._draft_model,
+        self._optimizer = FP32MasterWeightOptimizer(
+            self._draft_model.parameters(),
+            torch.optim.AdamW,
             lr=policy.learning_rate,
             weight_decay=policy.weight_decay,
-            max_grad_norm=policy.max_grad_norm,
-            total_steps=self.config.num_training_steps,
-            warmup_ratio=policy.warmup_ratio,
-            decay_style=policy.lr_decay_style,
-            min_lr=policy.min_lr,
-            wsd_decay_ratio=wsd_decay_ratio,
-            wsd_decay_style=wsd_decay_style,
         )
-        self._scheduler = None
+        self._scheduler = build_training_scheduler(
+            self._optimizer,
+            policy,
+            total_steps=int(self.config.num_training_steps),
+        )
+        self._optimizer.scheduler = self._scheduler
 
         # ---- Tokenizer ----
         from transformers import AutoTokenizer
@@ -1304,8 +1304,22 @@ class SpecDistillTrainer:
             )
 
         opt_sd = payload.get("optimizer_state_dict")
+        restored_optimizer_masters = bool(
+            isinstance(opt_sd, dict) and opt_sd.get("_fp32_masters")
+        )
         if opt_sd and self._optimizer is not None:
-            self._optimizer.load_state_dict(opt_sd)
+            if payload.get("optimizer_state_format") == "fp32_master_dcp" and hasattr(
+                self._optimizer, "load_distributed_state_dict"
+            ):
+                from torch.distributed.checkpoint.state_dict import StateDictOptions
+
+                self._optimizer.load_distributed_state_dict(
+                    self._draft_model,
+                    opt_sd,
+                    StateDictOptions(full_state_dict=True, cpu_offload=True),
+                )
+            else:
+                self._optimizer.load_state_dict(opt_sd)
             logger.info(
                 "[rank %d] Loaded optimizer state from step %d",
                 self._rank,
@@ -1319,22 +1333,30 @@ class SpecDistillTrainer:
             logger.info(
                 "[rank %d] Loaded %d FP32 master params", self._rank, len(fp32_params)
             )
-        elif sd and hasattr(self._optimizer, "sync_fp32_params_from_model"):
-            self._optimizer.sync_fp32_params_from_model()
+        elif (
+            sd
+            and not restored_optimizer_masters
+            and hasattr(self._optimizer, "sync_master_params_from_model")
+        ):
+            self._optimizer.sync_master_params_from_model()
             logger.info(
                 "[rank %d] Synced FP32 params from loaded model weights", self._rank
             )
 
+        scheduler_state = payload.get("scheduler_state_dict")
         sched_epoch = payload.get("scheduler_last_epoch")
-        if sched_epoch is not None and hasattr(self._optimizer, "scheduler"):
-            self._optimizer.scheduler.last_epoch = sched_epoch
-            self._optimizer.scheduler.step()
+        if scheduler_state is not None and hasattr(self._optimizer, "scheduler"):
+            self._optimizer.scheduler.load_state_dict(scheduler_state)
             logger.info(
                 "[rank %d] Restored scheduler to epoch %d (lr=%.2e)",
                 self._rank,
-                sched_epoch,
+                self._optimizer.scheduler.last_epoch,
                 self._optimizer.get_learning_rate(),
             )
+        elif sched_epoch is not None and hasattr(self._optimizer, "scheduler"):
+            # Legacy checkpoints stored only the epoch; optimizer_state_dict
+            # already carries the LR for that epoch, so do not step again.
+            self._optimizer.scheduler.last_epoch = sched_epoch
         elif hasattr(self._optimizer, "scheduler") and resumed_step > 0:
             for _ in range(resumed_step):
                 self._optimizer.scheduler.step()
@@ -1358,8 +1380,6 @@ class SpecDistillTrainer:
         Non-overlapping with early training batches (takes from the tail).
         """
         if self._preprocessed is not None:
-            from atomrl.data.kimi_k25_parser import unpack_loss_mask
-
             ds_len = len(self._preprocessed)
             num_samples = min(num_samples, ds_len)
             start_idx = ds_len - num_samples
@@ -1372,7 +1392,7 @@ class SpecDistillTrainer:
                 if isinstance(ids, list):
                     ids = torch.tensor(ids, dtype=torch.long)
                 ids = ids[: max_len - 1]
-                lm = unpack_loss_mask(item["packed_loss_mask"])
+                lm = torch.tensor(item["loss_mask"], dtype=torch.long)
                 lm = lm[: len(ids)]
                 if len(lm) < len(ids):
                     lm = torch.cat(
@@ -1658,8 +1678,6 @@ class SpecDistillTrainer:
         bs = max(1, self.config.policy.train_global_batch_size)
 
         if self._preprocessed is not None:
-            from atomrl.data.kimi_k25_parser import unpack_loss_mask
-
             ds_len = len(self._preprocessed)
             start = (step * bs) % ds_len
             indices = [(start + i) % ds_len for i in range(bs)]
@@ -1672,7 +1690,7 @@ class SpecDistillTrainer:
                 ids = item["input_ids"]
                 if isinstance(ids, list):
                     ids = torch.tensor(ids, dtype=torch.long)
-                lm = unpack_loss_mask(item["packed_loss_mask"])
+                lm = torch.tensor(item["loss_mask"], dtype=torch.long)
                 if len(lm) > len(ids):
                     lm = lm[: len(ids)]
                 elif len(lm) < len(ids):
@@ -1686,7 +1704,7 @@ class SpecDistillTrainer:
                         r_ids = r_item["input_ids"]
                         if isinstance(r_ids, list):
                             r_ids = torch.tensor(r_ids, dtype=torch.long)
-                        r_lm = unpack_loss_mask(r_item["packed_loss_mask"])
+                        r_lm = torch.tensor(r_item["loss_mask"], dtype=torch.long)
                         if len(r_lm) > len(r_ids):
                             r_lm = r_lm[: len(r_ids)]
                         elif len(r_lm) < len(r_ids):
@@ -2472,7 +2490,10 @@ class SpecDistillTrainer:
 
             metrics = {k: v / max(accum_count, 1) for k, v in metrics_accum.items()}
 
-            grad_norm = self._optimizer.step()
+            grad_norm = self._optimizer.step_with_grad_norm(
+                self.config.policy.max_grad_norm
+            )
+            self._scheduler.step()
 
             train_time = time.time() - t1
 
