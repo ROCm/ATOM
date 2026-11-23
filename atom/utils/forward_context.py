@@ -949,6 +949,12 @@ class ForwardContext:
     # forward, so it ignores the flag entirely.
     in_hipgraph: bool = False
 
+    # True while a draft pass that is captured runs its eager warmup forward
+    # and records its graph (`Drafter._warmup_draft_graphs`). Its forward runs
+    # with `in_hipgraph` False, so this tells a component whose kernels depend
+    # on the capture (MegaMoE's route) to warm the ones the recording launches.
+    draft_graph_warmup: bool = False
+
     # TR graphs (`atom/utils/region_graph.py`): "record" while the runner
     # records a token bucket, "record_req" while it records a prefill's request
     # bucket (`ModelRunner._record_prefill_req_graphs`), "replay" while a step

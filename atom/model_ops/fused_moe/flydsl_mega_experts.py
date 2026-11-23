@@ -23,10 +23,10 @@ to retain the configured capacity for all forwards.
 each step (``_max_tokens_hint``), from which AITER (ROCm/aiter#7788 and later)
 picks the staged, small-input or large-input route on the layouts its fused
 kernels support. The large-input route holds one protocol slot per layer id
-of the Mega MoE layers built, target and draft (``_mega_layer_slots``),
-selected by the layer's ``layer_id``. When the main instance's small-input
-route covers the decode capacity, the decode instance is not built: the main
-instance already routes those steps to the same kernel.
+up to the largest one of the Mega MoE layers built, target and draft
+(``_mega_layer_slots``), selected by the layer's ``layer_id``. When the main
+instance's small-input route covers the decode capacity, the decode instance is
+not built: the main instance already routes those steps to the same kernel.
 
 Weight prep uses aiter's own shuffles (``aiter.ops.shuffle``):
   w1/w1_scale: ``shuffle_weight_a16w4(., 16, gate_up=True)`` /
@@ -66,51 +66,86 @@ if _MEGA_DECODE_MTPR not in _MEGA_DECODE_MTPRS:
         f"got {_MEGA_DECODE_MTPR}"
     )
 _MEGA_CAPACITY_LOGGED: set[tuple[bool, int, int]] = set()
-# Layer ids of the MoE layers built with the Mega method (register_mega_layer).
+# Layer ids of the MoE layers built with the Mega method (register_mega_layer),
+# and the prefixes of those built without one.
 _MEGA_LAYER_IDS: set[int] = set()
+_MEGA_LAYERS_WITHOUT_ID: list[str] = []
 
 
 def _os_env(k):
     return os.environ.get(k, "<unset>")
 
 
-def _select_decode_mtpr(mtpr: int, context, *, tbo_active: bool) -> int:
+def _select_decode_mtpr(
+    mtpr: int, context, *, tbo_active: bool, pcp_merge: bool = False
+) -> int:
     """Select from already allocated capacities using the pass's shared shape.
 
     A decode rank can have a prefilling peer. Only ``running_tokens_are_unified``
     proves that every DP rank agreed on this shape. Do not gate on is_prefill or
     on whether the rank has requests: a draft pass also runs on idle peers,
     whose own batch differs. TBO contexts keep the existing capacity. ``running_bs`` counts
-    requests and underestimates MTP verification rows.
+    requests and underestimates MTP verification rows. Under ``pcp_merge`` the
+    rows are padded as the route hint pads them (``_max_tokens_hint``).
     """
     if context is None or not context.running_tokens_are_unified or tbo_active:
         return mtpr
-    if 0 < context.running_tokens <= _MEGA_DECODE_MTPR:
+    rows = _pcp_merged_rows(int(context.running_tokens), pcp_merge)
+    if 0 < rows <= _MEGA_DECODE_MTPR:
         return _MEGA_DECODE_MTPR
     return mtpr
+
+
+def _pcp_merged_rows(rows: int, pcp_merge: bool) -> int:
+    """The rows every PCP rank's experts may run: under PCP merge a split pass
+    gathers the PCP shards of the step's rows padded to a PCP multiple."""
+    if not pcp_merge or rows <= 0:
+        return rows
+    from atom.distributed.pcp_utils import pcp_pad_len
+
+    return pcp_pad_len(rows)
 
 
 def register_mega_layer(layer) -> None:
     """Record the layer id of a MoE layer built with the Mega method.
 
     The large-input route gives each layer id its own protocol slot. Target
-    layers are numbered ``[0, num_hidden_layers)``; the MTP and DSpark draft
+    layers are numbered ``[0, num_hidden_layers)``; the V4 MTP and DSpark draft
     layers follow them (``num_hidden_layers + i``), as many as the draft model
     builds (DSpark: the checkpoint's stages, not ``num_nextn_predict_layers``).
-    The draft model is built before the first forward builds an instance.
+    The draft model is built before the first forward builds an instance, which
+    refuses a layer without an id once it holds the large-input route
+    (``_check_layer_slots``).
     """
     if layer.layer_id is None:
-        raise ValueError(
-            "--moe-backend mega needs the layer_id of every MoE layer, and "
-            f"{layer.prefix!r} has none: its model must pass FusedMoE(layer_id=...)"
-        )
-    _MEGA_LAYER_IDS.add(int(layer.layer_id))
+        _MEGA_LAYERS_WITHOUT_ID.append(layer.prefix)
+    else:
+        _MEGA_LAYER_IDS.add(int(layer.layer_id))
 
 
 def _mega_layer_slots() -> int:
     """Large-input protocol slots of a shared operator: one per layer id up to
     the largest one built (``register_mega_layer``)."""
-    return max(_MEGA_LAYER_IDS) + 1
+    return max(_MEGA_LAYER_IDS, default=0) + 1
+
+
+def _check_layer_slots(mega) -> None:
+    """Every layer of an instance holding the large-input route selects its
+    protocol slot by its layer_id. The other routes select none, so a layout
+    that never builds the large-input route (the DeepSeek-V3/R1 MTP block keeps
+    layer_id None) runs without one."""
+    if mega.large_m_available and _MEGA_LAYERS_WITHOUT_ID:
+        raise ValueError(
+            "MegaMoE's large-input route selects each MoE layer's protocol slot "
+            f"by its layer_id, and {_MEGA_LAYERS_WITHOUT_ID[0]!r} has none: its "
+            "model must pass FusedMoE(layer_id=...)"
+        )
+
+
+def mega_swiglu_limit(layer) -> float:
+    """The SwiGLU clamp a Mega instance for ``layer`` is built with; a model
+    without one sets none on its experts."""
+    return float(getattr(layer, "swiglu_limit", 0.0))
 
 
 def mega_builds_fused_route(
@@ -122,23 +157,22 @@ def mega_builds_fused_route(
     topk: int,
     quant: str,
     swiglu_limit: float,
-    mtpr: int,
 ) -> bool:
-    """Whether the instances ``run_mega_moe`` builds for this layout hold a fused
-    (small- or large-input) route, by AITER's own capability queries.
+    """Whether AITER's fused (small- and large-input) MegaMoEV2 kernels serve
+    this layout, by AITER's own query (``fused_layout_supported``).
 
-    The same on every rank: it reads the layout, the arch and the CU count only.
-    The decode capacity builds a fused route only when the configured capacity
-    builds the small-input one.
+    With ``routed=True`` an instance on such a layout builds the small-input
+    route on 256-CU parts and the large-input route at the capacities AITER
+    lists for it; an instance on any other layout holds the staged route only.
+    The answer reads the layout and the arch, so it is the same on every rank
+    and for every capacity ``run_mega_moe`` builds, the decode one included.
     """
     from aiter.jit.utils.chip_info import get_gfx_runtime
     from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
         fused_layout_supported,
-        large_m_mtprs_for,
-        small_m_cu_supported,
     )
 
-    if not fused_layout_supported(
+    return fused_layout_supported(
         arch=get_gfx_runtime(),
         world_size=world_size,
         model_dim=model_dim,
@@ -147,13 +181,6 @@ def mega_builds_fused_route(
         topk=topk,
         quant=quant,
         swiglu_limit=float(swiglu_limit),
-    ):
-        return False
-    num_cu = torch.cuda.get_device_properties(
-        torch.cuda.current_device()
-    ).multi_processor_count
-    return small_m_cu_supported(num_cu) or mtpr in large_m_mtprs_for(
-        world_size=world_size, model_dim=model_dim, inter_dim=inter_dim
     )
 
 
@@ -163,10 +190,11 @@ def _max_tokens_hint(mega, fc, *, pcp_merge: bool) -> int | None:
     None (the staged route) when no such count is known: plugin bridges, TBO
     ubatches and missing metadata. A graph capture takes the small-input route
     when the rows fit it and the staged route otherwise; the large-input route
-    is never captured. The capture loop's warmup forward (``fc.in_hipgraph``,
-    not yet capturing) takes the same route as the capture that follows it, so
-    the kernels the capture launches are compiled and their workspaces
-    allocated before the capture starts.
+    is never captured. The eager warmup forward before a capture -- the capture
+    loop's (``fc.in_hipgraph``) and a draft pass's (``fc.draft_graph_warmup``)
+    -- takes the same route as the capture that follows it, so the kernels the
+    capture launches are compiled and their workspaces allocated before the
+    capture starts.
 
     ``pcp_merge``: every PCP rank runs the experts over the same rows, which a
     split pass gathers from the PCP shards of the step's rows padded to a PCP
@@ -188,11 +216,12 @@ def _max_tokens_hint(mega, fc, *, pcp_merge: bool) -> int | None:
         return None
     if rows <= 0:
         return None
-    if pcp_merge:
-        from atom.distributed.pcp_utils import pcp_pad_len
-
-        rows = pcp_pad_len(rows)
-    in_capture = fc.in_hipgraph or torch.cuda.is_current_stream_capturing()
+    rows = _pcp_merged_rows(rows, pcp_merge)
+    in_capture = (
+        fc.in_hipgraph
+        or fc.draft_graph_warmup
+        or torch.cuda.is_current_stream_capturing()
+    )
     if in_capture and rows > mega.small_m_mtpr:
         return None
     return rows
@@ -307,6 +336,7 @@ def get_or_build_mega_moe(
                 routed=True,
                 large_m_state_slots=_mega_layer_slots(),
             )
+        _check_layer_slots(m)
         _MEGA_CACHE[key] = m
         if rank == 0:
             logger.info(
@@ -387,6 +417,7 @@ def run_mega_moe(
     # Mega construction has symmetric allocations and barriers; lazily building
     # only the locally selected capacity could leave peers in different calls.
     mega = get_or_build_mega_moe(mtpr=mtpr, **build_args)
+    pcp_merge = layer.moe_parallel_config.pcp_merge
     use_decode_capacity = (
         envs.ATOM_MEGA_DECODE_FAST_PATH
         # Plugin bridges do not all publish native ForwardMode's group-agreed
@@ -411,7 +442,9 @@ def run_mega_moe(
     if use_decode_capacity:
         decode_mega = get_or_build_mega_moe(mtpr=_MEGA_DECODE_MTPR, **build_args)
         context = get_forward_context().context
-        selected_mtpr = _select_decode_mtpr(mtpr, context, tbo_active=False)
+        selected_mtpr = _select_decode_mtpr(
+            mtpr, context, tbo_active=False, pcp_merge=pcp_merge
+        )
         if selected_mtpr != mtpr:
             # The local tensor is a bound check, not an independent protocol
             # selector. All peers must choose using the same context metadata.
@@ -438,9 +471,7 @@ def run_mega_moe(
                     selected_mtpr,
                 )
 
-    max_tokens = _max_tokens_hint(
-        mega, get_forward_context(), pcp_merge=layer.moe_parallel_config.pcp_merge
-    )
+    max_tokens = _max_tokens_hint(mega, get_forward_context(), pcp_merge=pcp_merge)
     if mega.large_m_available:
         # The weights are bound above; select this layer's protocol slot.
         mega.select_layer_state(layer.layer_id)
@@ -546,6 +577,6 @@ class MegaFusedExperts:
             # run_mega_moe selects the small instance using this pass's padded
             # token count; request count alone is insufficient under MTP.
             mtpr=self._mtpr,
-            swiglu_limit=getattr(self._layer, "swiglu_limit", 0.0),
+            swiglu_limit=mega_swiglu_limit(self._layer),
             quant=self._quant,
         )
