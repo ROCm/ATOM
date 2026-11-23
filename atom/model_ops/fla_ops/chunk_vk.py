@@ -246,17 +246,6 @@ def chunk_gated_delta_rule_vk(
             o.is_contiguous()
         ), "chunk_gated_delta_rule_vk: caller-provided o must be contiguous"
 
-    # Optional: dispatch to aiter's end-to-end flydsl prefill pipeline
-    # (K1+K2 fused, K3+K4 fused, K5 flydsl, K6 chunk_fwd_o_opt_vk).
-    # Enabled via ATOM_USE_FLYDSL_GDR_PREFILL=1 and only when the aiter
-    # flydsl-prefill package is importable. We dispatch HERE (not inside
-    # the autograd Function) because flydsl_gdr_prefill is a complete
-    # pipeline that handles l2norm and contiguity itself — bypassing
-    # input_guard and the autograd machinery is cleaner than threading
-    # the dispatch through them. The inplace o= contract is forwarded
-    # directly to aiter's flydsl_gdr_prefill via its `o=` parameter
-    # (which threads into chunk_fwd_o_opt_vk via the same mechanism).
-
     o, final_state = ChunkGatedDeltaRuleFunctionVk.apply(
         q,
         k,

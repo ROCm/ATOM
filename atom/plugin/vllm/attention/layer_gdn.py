@@ -44,13 +44,8 @@ from atom.utils import envs
 from torch import nn
 
 USE_FLYDSL_GDR = envs.ATOM_USE_FLYDSL_GDR
-try:
+if USE_FLYDSL_GDR:
     from aiter.ops.flydsl.linear_attention_kernels import flydsl_gdr_decode
-except ImportError:
-    USE_FLYDSL_GDR = False
-    print(
-        "Failed to import flydsl_gdr_decode. Please make sure you have the latest version of aiter installed."
-    )
 
 
 class ChunkGatedDeltaRule(nn.Module):
@@ -338,8 +333,8 @@ class GatedDeltaNet(nn.Module):
         Uses the fused sigmoid-gating + delta-rule kernel which reads/
         writes ssm_state inplace via the slot table.
 
-        When `ATOM_USE_FLYDSL_GDR` is set and aiter is importable, takes
-        the flydsl decode fast-path instead. `o` is required when the
+        When `ATOM_USE_FLYDSL_GDR=1`, takes the FlyDSL decode fast-path
+        from AITER. `o` is required when the
         flydsl path is selected (it has no `output_final_state` return).
         """
         if USE_FLYDSL_GDR:
