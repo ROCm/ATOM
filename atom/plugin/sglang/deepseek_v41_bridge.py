@@ -14,8 +14,10 @@ backend shim outside the captured region (see "Decode CUDA graphs").
 The translation relies on: SGLang page id == V4.1 PAGE id (block tables are
 ``req_to_token[req, ::256] // 256``; page 0 is SGLang's padding page); STATE
 slot == ``req_pool_idx`` (unique among live requests, row 0 is padding; a
-request starting at position 0 resets its slot, so a prefix hit, which needs
-restored state, is refused); the window lives in the STATE ring, so SGLang
+request starting at position 0 resets its slot; with radix cache on, a prefix
+hit at ``P`` rebuilds its slot in the step's own forward, its span widened to
+start at ``P - R`` (``deepseek_v41_radix``, translated into ATOM's
+``ScheduledBatch.replaying``); the window lives in the STATE ring, so SGLang
 gets a plain paged allocator (``needs_paged_swa_allocator = False``).
 """
 
@@ -30,6 +32,13 @@ from typing import Any
 
 import numpy as np
 import torch
+from sglang.srt.model_executor.forward_context import (
+    get_req_to_token_pool,
+    get_token_to_kv_pool,
+)
+
+from atom.model_engine.sequence import Replay
+from atom.plugin.sglang import deepseek_v41_radix as radix
 
 logger = logging.getLogger("atom")
 
@@ -130,6 +139,47 @@ def refuse_fp8_kv_without_backend(atom_config: Any) -> None:
 # --- Launch contract ---
 
 
+def sglang_radix_cache_enabled() -> bool:
+    """Whether SGLang serves this launch with its radix (prefix) cache."""
+    from sglang.srt.runtime_context import get_memory
+
+    return not get_memory().disable_radix_cache
+
+
+def _radix_refusals(memory, schedule) -> tuple:
+    """What radix cache cannot run beside (``deepseek_v41_radix``).
+
+    Disabled chunked prefill is refused for every launch, and SGLang refuses
+    unified memory (the only KV relocation) for this model itself. A chunk
+    always holds a hit's ``R`` replay rows (``R`` <= chunk): SGLang asserts
+    ``--chunked-prefill-size`` is a multiple of the page size (256 for
+    DeepSeek-V4) before the plugin runs."""
+    return (
+        # The replay seam serves EXTEND batches only.
+        ("mixed chunk with radix cache", schedule.enable_mixed_chunk),
+        (
+            "session radix cache",
+            memory.enable_session_radix_cache,
+        ),
+        (
+            "a custom radix cache backend",
+            memory.radix_cache_backend is not None,
+        ),
+        # Trees that rewrite a live request's row outside
+        # `UnifiedRadixCache.checkpoint_into_tree`, whose rewrites drop the
+        # decode staging's host rows (`deepseek_v41_radix`).
+        (
+            (
+                "a KV storage backend with radix cache (LMCache, FlexKV, "
+                "external cache linker)"
+            ),
+            memory.enable_lmcache
+            or memory.enable_flexkv
+            or memory.enable_unified_cache_external_linker,
+        ),
+    )
+
+
 def refuse_unsupported_sglang_features() -> None:
     """Fail before weights load on SGLang features this bridge cannot serve."""
     from sglang.srt import runtime_context as sglang_config
@@ -152,10 +202,6 @@ def refuse_unsupported_sglang_features() -> None:
         (
             "disabled chunked prefill (--chunked-prefill-size must be > 0)",
             chunk is None or int(chunk) <= 0,
-        ),
-        (
-            "radix cache (launch with --disable-radix-cache)",
-            not memory.disable_radix_cache,
         ),
         ("hierarchical cache", memory.enable_hierarchical_cache),
         # SGLang refuses it itself on hardware other than CUDA and gfx950.
@@ -224,6 +270,17 @@ def refuse_unsupported_sglang_features() -> None:
             not disagg.language_model_only,
         ),
     )
+    if not memory.disable_radix_cache:
+        unsupported += (
+            (
+                (
+                    "radix cache without ATOM_SGLANG_V41_RADIX=1 (launch with "
+                    "--disable-radix-cache)"
+                ),
+                not deepseek_v41_envs.ATOM_SGLANG_V41_RADIX,
+            ),
+        )
+        unsupported += _radix_refusals(memory, schedule)
     refused = [name for name, enabled in unsupported if enabled]
     if refused:
         raise ValueError(
@@ -662,6 +719,12 @@ def _make_proxy_pool_cls():
             self.capture_slot_base = self.num_req_slots
             self.num_slots = self.num_req_slots + self.num_capture_slots
             self.capture_slots = tuple(range(self.capture_slot_base, self.num_slots))
+            # Per request-row STATE slot, the `req_to_token_pool.req_generation`
+            # of the tenant its state was last rebuilt or started for. Written
+            # only by the radix replay seam (`deepseek_v41_radix`), read by the
+            # extend guard; the generation SGLang bumps on every row allocation
+            # is how a new tenant is told from a chunked continuation.
+            self.state_gen = np.zeros(self.num_req_slots, dtype=np.int64)
             total_bytes = _arena_bytes(geometry, self.num_pages, self.num_slots)
             self.raw_arena = torch.empty(total_bytes, dtype=torch.uint8, device=device)
             # Reported by /get_internal_state and the scheduler metrics, in GiB.
@@ -731,7 +794,7 @@ def _make_proxy_pool_cls():
         def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
             raise NotImplementedError(
                 "DeepSeek-V4.1 on the SGLang plugin does not support KV "
-                "relocation yet; launch with --disable-radix-cache"
+                "relocation (--enable-unified-memory) yet"
             )
 
     return ATOMDeepSeekV41ProxyKVPool
@@ -966,8 +1029,6 @@ def _cpu_ints(cpu_value, gpu_value, n: int) -> np.ndarray:
 
 def _req_to_token() -> torch.Tensor:
     # ForwardBatch carries no pools; SGLang's forward context does.
-    from sglang.srt.model_executor.forward_context import get_req_to_token_pool
-
     return get_req_to_token_pool().req_to_token
 
 
@@ -991,12 +1052,14 @@ class HostPageRows:
     That read is a device sync on the forward stream: under overlap
     scheduling it waits for the previous step's graph and serializes the next
     step's host staging behind it. A request's PAGE row only grows, one page
-    every 256 tokens, and only SGLang's allocator writes it (radix cache,
-    whose checkpoint rewrites a live row's tail in place, is refused at
-    launch). An EXTEND (every request's first forward, and again after a
-    retraction) reads the row back anyway and records it here; a decode reads
-    it again only when a request has entered a page its copy does not hold,
-    or the slot's request changed.
+    every 256 tokens, and only SGLang's allocator writes it -- except that
+    with radix cache on a checkpoint repoints a live row at the tree's pages
+    in place, which drops that slot's copy (``forget``, called from the radix
+    seam's ``checkpoint_into_tree`` hook). An EXTEND (every request's first
+    forward, and again after a retraction) reads the row back anyway and
+    records it here; a decode reads it again only when a request has entered
+    a page its copy does not hold, the slot's request changed, or a
+    checkpoint dropped the copy.
 
     Keyed by STATE slot (``req_pool_idx``) and checked against the request id,
     so a copy is never used for another tenant of the slot.
@@ -1008,6 +1071,10 @@ class HostPageRows:
     def record(self, slots, rids, rows):
         for slot, rid, row in zip(slots, rids, rows):
             self._rows[int(slot)] = (rid, row)
+
+    def forget(self, slot) -> None:
+        """Drop ``slot``'s copy: its row was rewritten in place."""
+        self._rows.pop(int(slot), None)
 
     def lookup(self, slots, rids, widths):
         """Each request's first ``widths[i]`` pages, or None if any request's
@@ -1022,6 +1089,11 @@ class HostPageRows:
 
 
 _HOST_ROWS = HostPageRows()
+
+
+def forget_host_page_rows(slot) -> None:
+    """The tree rewrote ``slot``'s ``req_to_token`` row: drop its host copy."""
+    _HOST_ROWS.forget(slot)
 
 
 def _refuse_padding_page(rows) -> None:
@@ -1042,9 +1114,63 @@ def _refuse_shared_or_padding_slots(slots, count: int) -> None:
         )
 
 
+def _radix_stamps():
+    """The proxy pool's per-slot tenant stamps and SGLang's row generations,
+    off the pools of the current forward context."""
+    return (
+        get_token_to_kv_pool().state_gen,
+        get_req_to_token_pool().req_generation,
+    )
+
+
+def _check_radix_resumes(slots, prefix, fused=None) -> None:
+    """With radix cache on, refuse an extend resuming a slot that is neither
+    stamped for its current tenant nor rebuilt by the fused record this
+    forward carries. Runs while the metadata is built, before any kernel."""
+    if radix.radix_replay_rows() is None or not np.any(prefix > 0):
+        return
+    state_gen, generation = _radix_stamps()
+    carried = () if fused is None else fused.slots
+    radix.check_state_stamps(state_gen, generation, slots, prefix, carried)
+
+
+def _stamp_fused_hits(fused) -> None:
+    """Stamp on consume: this forward carries ``fused``, so its hits' slots
+    now belong to their tenants."""
+    state_gen, generation = _radix_stamps()
+    radix.stamp_fused_hits(state_gen, generation, fused)
+
+
+def _fused_replaying(fused):
+    """``ScheduledBatch.replaying`` for a step carrying a fused radix replay
+    (``deepseek_v41_radix.FusedReplay``): each hit's span starts at
+    ``P - R`` in this forward, its slot rebuilt over ``[P - R, P)``. The seam
+    planned the record off the ScheduleBatch this ForwardBatch was built from
+    in the same ``forward_batch_generation`` call: its rows, slots, request
+    ids and ``P`` are this forward's, and its history is the builder's
+    width."""
+    width = int(fused.histories.shape[1])
+    replaying = {}
+    for k, i in enumerate(fused.rows):
+        start = int(fused.starts[k])
+        # Left-padded as SGLang pads; native carries only the real tokens.
+        keep = min(width, start)
+        replaying[int(i)] = Replay(
+            until=int(fused.ends[k]),
+            rebuilds=True,
+            history_ids=tuple(int(t) for t in fused.histories[k, width - keep :]),
+            start=start,
+        )
+    return replaying
+
+
 def build_v41_scheduled_batch(forward_batch, block_size: int):
     """ATOM's scheduled batch for one SGLang ``ForwardBatch``: ``DECODE`` or
-    ``EXTEND`` (the eager runner turns ``MIXED`` into it); others refused."""
+    ``EXTEND`` (the eager runner turns ``MIXED`` into it); others refused. A
+    step carrying a fused radix replay (``deepseek_v41_radix.FUSED_ATTR``)
+    schedules each hit from ``P - R``: its span gains the replay rows
+    (``replay_rows``), the same rows ``expand_v41_forward_inputs`` prepends
+    to its inputs."""
     mode = forward_batch.forward_mode
     if not (mode.is_decode() or mode.is_context_parallel_extend()):
         raise NotImplementedError(
@@ -1074,10 +1200,23 @@ def build_v41_scheduled_batch(forward_batch, block_size: int):
         forward_batch.req_pool_indices_cpu, forward_batch.req_pool_indices, bs
     ).astype(np.int32)
     _refuse_shared_or_padding_slots(slots, bs)
+    rids = list(forward_batch.rids[:bs])
+    fused = getattr(forward_batch, radix.FUSED_ATTR, None)
+    replay_rows = np.zeros(bs, dtype=np.int64)
+    replaying = {}
+    # A fused record rides on an EXTEND only: the seam plans it for EXTEND
+    # batches and refuses a MIXED one.
+    if not mode.is_decode():
+        _check_radix_resumes(slots, prefix, fused)
+    if fused is not None:
+        replaying = _fused_replaying(fused)
+        _stamp_fused_hits(fused)
+        # Each hit's span now starts at P - R; context_lens stay.
+        replay_rows = fused.replay_rows(bs)
+        lengths = lengths + replay_rows
     rows = _block_rows(
         _req_to_token(), forward_batch.req_pool_indices[:bs], ends, block_size
     )
-    rids = list(forward_batch.rids[:bs])
     # Decode replays stage off these copies (`HostPageRows`).
     _HOST_ROWS.record(slots, rids, rows)
     return SimpleNamespace(
@@ -1089,9 +1228,12 @@ def build_v41_scheduled_batch(forward_batch, block_size: int):
         # prompt, so every request counts as finishing (None): under decoder
         # bounded replay a chunk SGLang continues runs the decoder on its last
         # window rows too, whose ring the next chunk then reads if it is
-        # shorter than the window (`v41_extend_replays`).
+        # shorter than the window (`v41_extend_replays`). A fused radix
+        # replay is one span from P - R, at least the window long.
         is_final_chunk=None,
-        replaying={},
+        replaying=replaying,
+        # Rows ATOM runs ahead of each request's own (a fused radix replay).
+        replay_rows=replay_rows,
         # Whether a prefill gets a decoder tail (the builder reads it for
         # every batch, publishes a tail for a prefill only); an EXTEND's is
         # decided on its ForwardBatch (`v41_extend_replays`).
@@ -1116,21 +1258,26 @@ def v41_extend_replays(forward_batch, batch, window: int) -> bool:
     and a tail of fewer rows would truncate their window at the chunk start.
     That covers a MIXED batch's decode rows too. Such a step computes every
     row, reading the decoder rings the previous chunk's tail wrote (every
-    chunk counts as finishing, `build_v41_scheduled_batch`)."""
+    chunk counts as finishing, `build_v41_scheduled_batch`).
+
+    A fused radix replay's rows (``batch.replay_rows``) are ATOM's: they
+    count toward the tail (the span ATOM runs starts at ``P - R``, at least
+    the window long) but not toward SGLang's logprob rows."""
     if forward_batch.is_prefill_only:
         return False
     capture = forward_batch.capture_hidden_mode
     if capture is not None and capture.is_full():
         return False
+    lengths = np.asarray(batch.num_scheduled_tokens, np.int64)
     if forward_batch.return_logprob:
-        # As SGLang's `LogitsMetadata.from_forward_batch` decides it.
+        # As SGLang's `LogitsMetadata.from_forward_batch` decides it, over
+        # SGLang's own rows.
         starts = forward_batch.extend_logprob_start_lens_cpu
         if starts is None:
             return False
-        lengths = np.asarray(batch.num_scheduled_tokens, np.int64)
-        if np.any(lengths - np.asarray(starts[: len(lengths)], np.int64) > 0):
+        own = lengths - np.asarray(batch.replay_rows, np.int64)
+        if np.any(own - np.asarray(starts[: len(own)], np.int64) > 0):
             return False
-    lengths = np.asarray(batch.num_scheduled_tokens, np.int64)
     prefix = np.asarray(batch.context_lens, np.int64) - lengths
     return not bool(np.any((prefix > 0) & (lengths < int(window))))
 
@@ -1145,6 +1292,14 @@ def build_deepseek_v41_forward_metadata(forward_batch):
     builder = get_deepseek_v41_builder()
     batch = build_v41_scheduled_batch(forward_batch, builder.block_size)
     input_ids = forward_batch.input_ids
+    fused = getattr(forward_batch, radix.FUSED_ATTR, None)
+    if fused is not None:
+        # The inputs ATOM executes (`SGLangPluginRuntime`, through the
+        # adapter's `expand_forward_inputs`): each hit's [P - R, P) first,
+        # widened by `SGLangPluginRuntime.__enter__`
+        # (`expand_v41_forward_inputs`) before the forward context builds
+        # this metadata.
+        input_ids = fused.expanded.input_ids
     running_tokens = int(input_ids.shape[0])
     running_bs = batch.total_seqs_num
     if mode.is_decode():

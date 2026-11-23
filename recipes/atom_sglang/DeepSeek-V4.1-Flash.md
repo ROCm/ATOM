@@ -61,9 +61,9 @@ The plugin refuses, before loading weights:
   `--enable-waterfill` also set), and `--moe-dense-tp-size`: either makes SGLang gather attention inputs
   across attention-TP ranks, which the ATOM model does not read, and round its decode-graph batch sizes up past
   `--max-running-requests`;
-- radix cache (launch with `--disable-radix-cache`), hierarchical cache, speculative decoding (SGLang admits DSpark
-  only for DeepSeek-V4.1), PD disaggregation, DP attention, decode context parallelism (`--dcp-size` above 1), and
-  multimodal requests (launch with `--language-model-only`).
+- radix cache unless `ATOM_SGLANG_V41_RADIX=1` (below; otherwise launch with `--disable-radix-cache`), hierarchical
+  cache, speculative decoding (SGLang admits DSpark only for DeepSeek-V4.1), PD disaggregation, DP attention, decode
+  context parallelism (`--dcp-size` above 1), and multimodal requests (launch with `--language-model-only`).
 
 SGLang itself refuses, before the plugin is asked: in its DeepSeek-V4.1 feature check
 (`validate_deepseek_v41_features`), two-batch overlap (`--enable-two-batch-overlap`), HiSparse, pipeline parallelism,
@@ -75,6 +75,15 @@ load when aiter's `get_mla_sparse_prefill_v41_backend` reports no FP8 backend fo
 with aiter a53213dc4 that covers gfx950 / gfx1250 only, so on MI308X (gfx942) launch with `bfloat16`. The indexer's FP8
 index plane is separate and is not affected.
 
+## Radix cache
+
+With `ATOM_SGLANG_V41_RADIX=1` and without `--disable-radix-cache`, the plugin serves SGLang's radix (prefix) cache.
+When a request hits the cache at `P` tokens, the 128 rows below `P` are recomputed into its fresh STATE slot (window
+ring, compressor rings, Engram history) inside the step's own forward, prepended to the request's rows, as native
+ATOM's encoder SWA bounded replay does. The plugin refuses radix cache beside mixed chunks, session radix cache, a
+custom radix cache backend, and a KV storage backend (LMCache, FlexKV, the external cache linker). Unchunked prefill
+and unified memory stay refused for every launch (above).
+
 ## Environment variables
 
 Read by the plugin (`atom/plugin/sglang/deepseek_v41_envs.py`):
@@ -82,3 +91,4 @@ Read by the plugin (`atom/plugin/sglang/deepseek_v41_envs.py`):
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_SGLANG_V41_DECODER_REPLAY** | bool | 1 (true) | Decoder SWA bounded replay: a prefill runs V4.1's decoder layers on each request's last 128 rows only, as native ATOM does. `0` / `false` / `no` / `off`, or an empty value, turn it off (every prefill row runs every layer), as native's `--no-decoder-swa-bounded-replay` does. Unlike native, which backs a short resumed chunk off to a full window, a chunk SGLang resumes with fewer rows than the window computes every row, and so does a step in which SGLang reads more than each request's last row (input logprobs, a full hidden-state capture, a prefill-only batch); the plugin's prefill output therefore depends on where SGLang cuts a prompt. |
+| **ATOM_SGLANG_V41_RADIX** | bool | 0 (false) | Serve SGLang's radix cache with the replay above. Off, a launch that leaves SGLang's radix cache on is refused (launch with `--disable-radix-cache`). |

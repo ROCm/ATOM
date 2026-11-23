@@ -203,6 +203,11 @@ def _supported_bags(**overrides):
             disable_radix_cache=True,
             enable_hierarchical_cache=False,
             enable_unified_memory=False,
+            enable_session_radix_cache=False,
+            radix_cache_backend=None,
+            enable_lmcache=False,
+            enable_flexkv=False,
+            enable_unified_cache_external_linker=False,
         ),
         "exec": SimpleNamespace(
             features=SimpleNamespace(
@@ -232,6 +237,8 @@ def _supported_bags(**overrides):
             max_prefill_tokens=16384,
             max_running_requests=256,
             mem_fraction_static=0.83,
+            enable_mixed_chunk=False,
+            disable_overlap_schedule=False,
         ),
     }
     bags.update(overrides)
@@ -264,7 +271,6 @@ class TestLaunchContract:
     @pytest.mark.parametrize(
         ("bag", "field", "value", "match"),
         [
-            ("memory", "disable_radix_cache", False, "radix cache"),
             ("memory", "enable_hierarchical_cache", True, "hierarchical cache"),
             # The one algorithm SGLang admits for V4.1.
             ("spec", "speculative_algorithm", "DSPARK", "speculative decoding"),
@@ -371,6 +377,21 @@ class TestLaunchContract:
         graphs.decode.backend = "disabled"
         refuse_unsupported_sglang_features()
 
+    def test_radix_cache_needs_the_opt_in(self, sglang_launch, monkeypatch):
+        monkeypatch.delenv("ATOM_SGLANG_V41_RADIX", raising=False)
+        sglang_launch.bags["memory"].disable_radix_cache = False
+        with pytest.raises(ValueError, match="without ATOM_SGLANG_V41_RADIX=1"):
+            refuse_unsupported_sglang_features()
+        # Opted in, radix cache itself is not refused; what it cannot run
+        # beside is (`test_sglang_deepseek_v41_radix.py`). Overlap scheduling
+        # runs beside it (the radix seam drops a slot's host rows on every
+        # checkpoint).
+        monkeypatch.setenv("ATOM_SGLANG_V41_RADIX", "1")
+        refuse_unsupported_sglang_features()
+        sglang_launch.bags["schedule"].enable_mixed_chunk = True
+        with pytest.raises(ValueError, match="mixed chunk with radix cache"):
+            refuse_unsupported_sglang_features()
+
     def test_unpublished_bags_raise(self, real_sglang):
         # Outside a scheduler process SGLang has published no bags; the
         # bridge does not fall back to the raw ServerArgs.
@@ -383,9 +404,11 @@ class TestLaunchContract:
             align_atom_config_with_sglang(SimpleNamespace(max_num_batched_tokens=1))
 
     def test_every_refusal_is_reported_at_once(self, sglang_launch):
-        sglang_launch.bags["memory"].disable_radix_cache = False
+        sglang_launch.bags["memory"].enable_hierarchical_cache = True
         sglang_launch.bags["parallel"].dcp_size = 2
-        with pytest.raises(ValueError, match="radix cache.*decode context parallelism"):
+        with pytest.raises(
+            ValueError, match="hierarchical cache.*decode context parallelism"
+        ):
             refuse_unsupported_sglang_features()
 
     def test_atom_config_takes_sglang_resolved_schedule(self, sglang_launch):
@@ -1095,7 +1118,7 @@ class TestProxyPool:
         assert pool.store_dtype == torch.uint8
         assert pool.dtype == torch.bfloat16
         assert pool.get_state_buf_infos() == ([], [], [])
-        with pytest.raises(NotImplementedError, match="radix-cache"):
+        with pytest.raises(NotImplementedError, match="relocation"):
             pool.move_kv_cache(torch.zeros(1), torch.zeros(1))
         with pytest.raises(NotImplementedError):
             pool.get_kv_buffer(0)
@@ -2057,6 +2080,7 @@ def _replays(lengths, prefix, window=128, **fields):
     batch = SimpleNamespace(
         num_scheduled_tokens=np.asarray(lengths, np.int32),
         context_lens=np.asarray(prefix, np.int64) + np.asarray(lengths, np.int64),
+        replay_rows=np.zeros(len(lengths), np.int64),
     )
     return bridge.v41_extend_replays(fb, batch, window)
 
