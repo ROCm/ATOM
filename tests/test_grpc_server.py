@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 from argparse import Namespace
+from dataclasses import replace
 from types import SimpleNamespace
 
 import grpc
@@ -297,6 +298,48 @@ def test_a_session_ended_during_preprocess_leaves_no_seq(serve):
 
     asyncio.run(end_while_preprocessing())
     assert engine.submitted == [] and session.requests == {}
+
+
+def test_a_session_ended_during_preprocess_keeps_its_window_until_the_seq_drops(serve):
+    engine = FakeEngine()
+    engine.release.clear()
+    servicer = serve(engine)
+    session = servicer.sessions.open()
+    window = session.window
+
+    async def end_while_preprocessing():
+        submit = asyncio.create_task(servicer._submit(session, _submit()))
+        await _until(lambda: engine.preprocessed)
+        submit.cancel()  # as the Session RPC ends: its reader cancelled, then close
+        with pytest.raises(asyncio.CancelledError):
+            await submit
+        session.close()
+        held = window not in servicer.sessions.free
+        engine.release.set()
+        await _until(lambda: engine.made and not engine.io_processor.requests)
+        return held
+
+    assert asyncio.run(end_while_preprocessing())
+    assert window in servicer.sessions.free and session.window is None
+
+
+def test_a_session_admits_a_prompt_only_in_kv_transfer_params(serve):
+    engine = FakeEngine()
+    servicer = serve(engine)
+    kv = {"prompt_token_ids": [4, 5], "do_remote_prefill": False}
+    submit = replace(_submit(prompt=()), kv_transfer_params=kv)
+    asyncio.run(servicer._submit(servicer.sessions.open(), submit))
+    prompt, _, kwargs = engine.preprocessed[0]
+    assert prompt == [4, 5]
+    assert kwargs["kv_transfer_params"] == {"do_remote_prefill": False}
+
+
+def test_a_session_request_without_a_prompt_is_refused(serve):
+    engine = FakeEngine()
+    servicer = serve(engine)
+    with pytest.raises(ValueError, match="prompt_token_ids is required"):
+        asyncio.run(servicer._submit(servicer.sessions.open(), _submit(prompt=())))
+    assert engine.preprocessed == []
 
 
 def test_abort_during_preprocess_keeps_the_request_out_of_the_engine(serve):

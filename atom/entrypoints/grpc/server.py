@@ -374,7 +374,12 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
         )
         structured = {name: getattr(given, name) for name in STRUCTURED_FIELDS}
         params = replace(params, **structured)
-        prompt = resolve_prompt_token_ids(request.prompt_token_ids, kv_transfer_params)
+        # An empty prompt buffer is an absent one, as in Generate.
+        prompt = resolve_prompt_token_ids(
+            request.prompt_token_ids or None, kv_transfer_params
+        )
+        if prompt is None:
+            raise ValueError("prompt_token_ids is required")
         preprocessing = asyncio.get_running_loop().run_in_executor(
             None,
             partial(
@@ -390,11 +395,16 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
                 seq_id=seq_id,
             ),
         )
+        session.preparing += 1  # its seq id stays out of reuse until added or dropped
         try:
             seq = await asyncio.shield(preprocessing)
         except asyncio.CancelledError:  # the Session ended: drop the seq once made
-            preprocessing.add_done_callback(partial(_drop_preprocessed, api))
+            preprocessing.add_done_callback(session.abandon)
             raise
+        except BaseException:
+            session.abandon(preprocessing)
+            raise
+        session.preparing -= 1
         session.add(request.seq_id, seq, request.request_id)
         try:
             api._validate_sequence_context_length(seq, params)
