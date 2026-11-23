@@ -190,6 +190,7 @@ fn complete(output_ids: &[u32], finish_reason: &str) -> GenerateResponse {
             completion_tokens: 3,
             cached_tokens: 2,
             kv_transfer_params_json: None,
+            ..Default::default()
         })),
     }
 }
@@ -249,6 +250,7 @@ async fn a_payload_becomes_the_generate_request_atom_receives() {
         data_parallel_rank: None,
         stream: false,
         structured_output: None,
+        ..Default::default()
     };
     assert_eq!(*fake.requests.lock().unwrap(), vec![expected]);
 }
