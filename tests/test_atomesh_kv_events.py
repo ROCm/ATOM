@@ -379,6 +379,21 @@ class DeepSeekV41ShareCacheCellsTest(unittest.TestCase):
             '--warmup-requests-per-lane "${AIPERF_WARMUP_REQUESTS_PER_LANE}" \\', script
         )
 
+    def test_every_mooncake_process_runs_the_ionic_transport_settings(self):
+        settings = {
+            "MC_NUM_QP_PER_EP": "1",
+            "MC_WORKERS_PER_CTX": "1",
+            "MC_MAX_WR": "64",
+            "MC_IB_PCI_RELAXED_ORDERING": "0",
+        }
+        for cell in self.cells:
+            with self.subTest(cell=cell["name"]):
+                exports = self.submitted_exports(cell)
+                self.assertEqual(
+                    {key: exports.get(f"ATOMESH_ENV_{key}") for key in settings},
+                    settings,
+                )
+
     def test_cells_launch_the_recipe_router_or_the_cache_aware_flow(self):
         self.assertEqual(
             {cell["name"] for cell in self.cells},
