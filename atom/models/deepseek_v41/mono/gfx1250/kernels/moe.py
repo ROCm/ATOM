@@ -685,7 +685,16 @@ def ug_epi_w(c, ui, g, n, x, amx, q):
     """(ug_union) wave q of a group: token l's 8 cols 32 g + 8 q .. of MID row (ui, l) from its silu values x and the
     32-col block's amax -- ug_epilogue's code / cvt (bit for bit): one 8-byte word pair; wave 0 the code (+ the K pad)."""
     l = c["l"]
-    if l < n:
+    if fx.const_expr("udir" in c):   # (udir) an MXFP8 mid channel as gfx950 hi's: the 2 words as LL words (mtag), wave 0 also the
+        if l < n:                     # block's e8m0 code word -- no storecnt wait, no group flag; the down's pick wave polls
+            code = e8m0_of(amx)       # the row (mid_ll)
+            wd = q8words(x, inv_pow2(code))
+            a = mid_row(c, ui, l) + i64(g * 72)
+            hx.put(a + i64(q * 16), wd[0], c["mtag"])
+            hx.put(a + i64(q * 16 + 8), wd[1], c["mtag"])
+            if q == 0:
+                hx.put(a + i64(64), code, c["mtag"])
+    elif l < n:
         code = e8m0_of(amx)
         wd = q8words(x, inv_pow2(code))
         mrow = c["mid8"] + (i64(ui) * MAXTOK + i64(l)) * MROW
@@ -1397,10 +1406,15 @@ def dn_row(c, s):
             return [lda(wb + i64(ks * 1024), sb + i64(ks * 128), lo) for ks in range(DNU)]
 
         ops = [tile_loads(j) for j in range(DNPD)]
-        hx.get(c["mflag"] + i64(ui * NUG + fx.min(l, I32(NUG - 1))) * 8, c["mtag"], 7)
-        mrow = c["mid8"] + i64(ui * MAXTOK + pos) * MROW
-        crow = c["midc"] + i64(ui * MAXTOK + pos) * CROW
-        B = [ldb_g(mrow, crow, ks, l) for ks in range(DNU)]
+        if fx.const_expr("udir" in c):   # the pick's MID row from its LL words -> this wave's LDS row
+            pal = sm + PAL + w * PALW
+            mid_ll(c, mid_row(c, ui, pos), l, pal)
+            B = [(ldb_l(pal, ks, l), hx.lload(pal + 640 + ks * 4, I32)) for ks in range(DNU)]
+        else:
+            hx.get(c["mflag"] + i64(ui * NUG + fx.min(l, I32(NUG - 1))) * 8, c["mtag"], 7)
+            mrow = c["mid8"] + i64(ui * MAXTOK + pos) * MROW
+            crow = c["midc"] + i64(ui * MAXTOK + pos) * CROW
+            B = [ldb_g(mrow, crow, ks, l) for ks in range(DNU)]
         sched_barrier()
         for j in range_constexpr(8):
             aq = ops[j % DNPD]
@@ -1538,6 +1552,43 @@ def shared_ug(c, j, TR):
             a = c["shact"] + i64(l * 288 + (t0 + w) * 4) * 8
             hx.put2(a, _pk_bf2(x[0], x[1]), _pk_bf2(x[2], x[3]), c["mtag"])
             hx.put2(a + i64(16), _pk_bf2(x[4], x[5]), _pk_bf2(x[6], x[7]), c["mtag"])
+
+
+PAL, PALW = 199168, 672             # (udir) LDS: a pick wave's MXFP8 MID row (fp8 [640], codes [20] at + 640), between SHAL and X8LO
+
+
+def mid_row(c, ui, p):
+    """(udir) the LL MID row of union entry ui, token slot p (slots < TR): 18 blocks of 8 MXFP8 words + its code word, each
+    an LL word (8 B, the layer's 32-bit mtag)."""
+    return c["mid8"] + (i64(ui * (c["NP"] // c["topk"])) + i64(p)) * (NUG * 72)
+
+
+@ASTRewriter.transform
+def mid_ll(c, ad, l, dst):
+    """(udir) lane l < 18 polls block l of the LL MID row at ad (its 8 words + code word, tag c["mtag"]) -> LDS dst [32 l ..]
+    and its e8m0 code -> dst + 640 + l; lanes 18, 19: the down's K pad (zeros, code 1) -- the bytes the global MID row /
+    codes had."""
+    if l < NUG:
+        a = ad + i64(l * 72)
+        t0 = hx.clock()
+        pg = [hx.peek(a + i64(8 * k)) for k in range(9)]
+        bad = I32(0)
+        for k in range_constexpr(9):
+            bad = bad | (pg[k][1] != c["mtag"]).select(I32(1), I32(0))
+        while (bad != 0) & (hx.clock() - t0 < I64(hx.POLL_TICKS)):
+            hx.s_sleep(1)
+            pg = [hx.peek(a + i64(8 * k)) for k in range(9)]
+            bad = I32(0)
+            for k in range_constexpr(9):
+                bad = bad | (pg[k][1] != c["mtag"]).select(I32(1), I32(0))
+        hx.lstore(dst + l * 32, fx.Vector.from_elements([pg[k][0] for k in range(4)], I32), align=16)
+        hx.lstore(dst + l * 32 + 16, fx.Vector.from_elements([pg[k][0] for k in range(4, 8)], I32), align=16)
+        hx.lstore(dst + 640 + l, pg[8][0].to(fx.Int8))
+    if (l >= NUG) & (l < 20):
+        zv = fx.Vector.from_elements([I32(0)] * 4, I32)
+        hx.lstore(dst + l * 32, zv, align=16)
+        hx.lstore(dst + l * 32 + 16, zv, align=16)
+        hx.lstore(dst + 640 + l, I32(1).to(fx.Int8))
 
 
 @ASTRewriter.transform
@@ -1744,7 +1795,7 @@ def ug_union(c, i, TR):
             am = fx.max(am, abs(xv))
         ab = sm + O_RED8 + rd * 1024
         hx.lstore(ab + (w * 32 + l) * 4, am)
-        if fx.const_expr(rd == 0):
+        if fx.const_expr(rd == 0 and not UD):
             if c["t"] < 4:   # the groups' arrival counters (rounds 0 / 1)
                 hx.lstore(sm + O_RED8 + 2048 + c["t"] * 4, I32(0))
         gpu.barrier()
@@ -1755,7 +1806,8 @@ def ug_union(c, i, TR):
             for j in range_constexpr(1, 4):
                 amx = fx.max(amx, hx.lload(ab + ((b0 + j) * 32 + l) * 4, F32))
             ug_epi_w(c, ui, g, n, x, amx, qq)
-            hx.wait_storecnt0()
-            if l == 0:   # the group's last wave past its stores puts its flag
-                if latomic_add(sm + O_RED8 + 2048 + (rd * 2 + w // 4) * 4, 1) == 3:
-                    hx.put(c["mflag"] + i64(ui * NUG + g) * 8, I32(0), c["mtag"])
+            if fx.const_expr(not UD):   # (udir: the MID words carry their own tags)
+                hx.wait_storecnt0()
+                if l == 0:   # the group's last wave past its stores puts its flag
+                    if latomic_add(sm + O_RED8 + 2048 + (rd * 2 + w // 4) * 4, 1) == 3:
+                        hx.put(c["mflag"] + i64(ui * NUG + g) * 8, I32(0), c["mtag"])
