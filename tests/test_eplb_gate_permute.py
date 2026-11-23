@@ -1358,3 +1358,22 @@ def test_step_timer_sorts_step_times_by_what_the_step_ran(monkeypatch, caplog):
     assert "dec: n=2 mean=15.00" in text and "pf: n=1 mean=300.00" in text
     assert "idle: n=1 mean=10.00" in text and "tok/step=9000.0" in text
     assert timer.n == 0 and not timer.times
+
+
+def test_step_timer_files_a_sampled_step_and_host_time(monkeypatch, caplog):
+    from types import SimpleNamespace
+
+    timer = eplb._StepTimer(every=2)
+    clock = iter([0.0, 0.010, 0.025])
+    monkeypatch.setattr("time.perf_counter", lambda: next(clock))
+    dec = SimpleNamespace(total_tokens_num=30, total_tokens_num_prefill=0)
+    with caplog.at_level(logging.INFO, logger="atom"):
+        timer.tick(dec)
+        timer.spent("pre", 0.000004)
+        timer.tick(dec)
+        timer.spent("sample", 0.000030, "dec_s")  # this step was sampled
+        timer.spent("post", 0.000002)
+        timer.tick(dec)
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "dec: n=1 mean=10.00" in text and "dec_s: n=1 mean=15.00" in text
+    assert "host sample: n=1 mean=30 us" in text and "host pre: n=1 mean=4 us" in text

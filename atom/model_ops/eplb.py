@@ -2376,6 +2376,10 @@ class EPLBManager:
             and (self._limit > 0 or self._rearms > 0)
         )
 
+    @staticmethod
+    def step_timer():
+        return step_timer()
+
     def _hot_first(self) -> int | bool:
         """ATOM_EPLB_HOT_FIRST for the rebalance being planned: the leading
         slots of a rank kept in order, or True (whole ranks) for the one that
@@ -3393,6 +3397,18 @@ class _StepTimer:
         self.times: dict[str, list[float]] = {}
         self.rows: dict[str, int] = {}
         self.n = 0
+        # Host seconds spent in EPLB's own code, by where: the forward
+        # wrapper before / after the forward, and a decode sample.
+        self.host: dict[str, list[float]] = {}
+
+    def spent(self, where: str, seconds: float, retag: str | None = None) -> None:
+        """EPLB's own host time in the step that is running; ``retag`` files
+        the step's whole time under another kind (a sampled decode step)."""
+        self.host.setdefault(where, [0.0, 0.0])
+        self.host[where][0] += seconds
+        self.host[where][1] += 1
+        if retag is not None:
+            self.prev_kind = retag
 
     def tick(self, batch) -> None:
         import time as _time
@@ -3419,7 +3435,7 @@ class _StepTimer:
 
     def report(self) -> None:
         parts = []
-        for kind in ("dec", "pf", "idle", "dummy"):
+        for kind in ("dec", "dec_s", "pf", "idle", "dummy"):
             values = sorted(self.times.get(kind, ()))
             if not values:
                 continue
@@ -3433,6 +3449,11 @@ class _StepTimer:
                 f"p10={q(0.1):.2f} p50={q(0.5):.2f} p90={q(0.9):.2f} "
                 f"p99={q(0.99):.2f} ms tok/step={self.rows.get(kind, 0) / count:.1f}"
             )
+        for where, (seconds, count) in sorted(self.host.items()):
+            parts.append(
+                f"host {where}: n={int(count)} mean={seconds / max(1, count) * 1e6:.0f} us"
+            )
+        self.host.clear()
         logger.info("[STEP-TIMER] steps=%d | %s", self.n, " | ".join(parts))
         self.times.clear()
         self.rows.clear()
@@ -3465,6 +3486,11 @@ def with_eplb_forward_monitor(fn):
         if manager is None or manager.live_metadata is None:
             return fn(self, batch, *args, **kwargs)
         monitor = manager.monitor
+        timer = _STEP_TIMER[0]
+        if timer is not None:
+            import time as _time
+
+            t_pre = _time.perf_counter()
         if manager.gate_permute is not None:
             manager.gate_permute.sync_count_flag()
         # Gate-permute EPLB counts in prefill passes only, and nothing once
@@ -3476,9 +3502,13 @@ def with_eplb_forward_monitor(fn):
         )
         if counting:
             monitor.on_forward_start()
+        if timer is not None:
+            timer.spent("pre", _time.perf_counter() - t_pre)
         try:
             return fn(self, batch, *args, **kwargs)
         finally:
+            if timer is not None:
+                t_post = _time.perf_counter()
             is_dummy_run = getattr(batch, "is_dummy_run", False)
             # Pure-prefill = has prefill tokens and no decode tokens (batches are
             # not mixed today; the decode==0 check also future-proofs the TODO
@@ -3499,8 +3529,15 @@ def with_eplb_forward_monitor(fn):
             manager.on_forward_pass_end(
                 local_has_prefill, dp_any_has_prefill, is_dummy_run=is_dummy_run
             )
+            if timer is not None:
+                timer.spent("post", _time.perf_counter() - t_post)
 
     return wrapper
+
+
+def step_timer() -> "_StepTimer | None":
+    """The step timer, if ATOM_EPLB_STEP_TIMER is on and a forward has run."""
+    return _STEP_TIMER[0] if _STEP_TIMER else None
 
 
 def _eplb_owns_layer(meta: Any, layer_id: Any) -> bool:

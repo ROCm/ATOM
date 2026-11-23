@@ -784,11 +784,19 @@ class GatePermuteRuntime:
             return
         self.dec_rows += rows
         self.window_rows += rows
-        if key not in self._plans:
+        timer = self.manager.step_timer() if hasattr(self.manager, "step_timer") else None
+        if timer is not None:
+            import time as _time
+
+            t_sample = _time.perf_counter()
+        new_plan = key not in self._plans
+        if new_plan:
             self._plans[key] = self._plan(held)
         plan = self._plans[key]
         if plan is None:
             self.count_decode(held, rows)
+            if timer is not None:
+                timer.spent("sample_slow", _time.perf_counter() - t_sample, "dec_s")
             return
         # Three launches: the held tensors stacked, their slots' addresses in
         # `dec_raw`, and the add. Rows past the live ones are cut off; a pad
@@ -800,6 +808,12 @@ class GatePermuteRuntime:
             self._ones = torch.ones(count, dtype=torch.int64, device=flat.device)
         self.dec_raw.view(-1).scatter_add_(0, flat, self._ones[:count])
         self._raw_dirty = True
+        if timer is not None:
+            timer.spent(
+                "sample_new_key" if new_plan else "sample",
+                _time.perf_counter() - t_sample,
+                "dec_s",
+            )
 
     def _plan(self, held: list[tuple[int, torch.Tensor]]):
         """The held id tensors of a request bucket and their layers' first
