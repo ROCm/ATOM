@@ -98,16 +98,23 @@ start_router
             {tuple(cell["concurrency"]) for cell in self.cells},
             {(1,), (2,), (16,), (32,), (128,), (192,), (256,)},
         )
+        # The role policies replace the cache_aware pair; the tuning flags stay.
         expected = {
             "--policy": "cache_aware",
             "--prefill-policy": "agentic",
             "--decode-policy": "least_load",
+            "--cache-threshold": "0.8",
+            "--balance-rel-threshold": "2.0",
+            "--eviction-interval": "300",
+            "--atom-pd-rank-mapping-policy": "none",
         }
         for cell in self.cells:
             with self.subTest(concurrency=cell["concurrency"]):
+                expected["--balance-abs-threshold"] = (
+                    "40" if cell["concurrency"] == [256] else "20"
+                )
                 args = self.router_args(cell)
                 self.assertIn("--dp-aware", args)
-                self.assertNotIn("--cache-threshold", args)
                 for flag, value in expected.items():
                     self.assertEqual(args.count(flag), 1)
                     self.assertEqual(args[args.index(flag) + 1], value)

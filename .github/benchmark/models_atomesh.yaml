@@ -1835,7 +1835,7 @@ models:
           eval_concurrency: [64, 256]
 
         - name: minimax-m3-fp4-2p1d-dpa-tp4
-          # Drop these two keys to restore the is_agentic_dpa dp_sticky control.
+          # Drop these two keys to restore --policy random on both sides.
           router:
             prefill_policy: agentic
             decode_policy: least_load
