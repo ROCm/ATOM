@@ -676,14 +676,19 @@ forms = ["FP8: x", "MI300: x", "[verified] x.py:1 drops it", "The caller must ho
          "[inferred] planner.rs:108 charges only on req.stream",
          "FP8 scale is wrong", "MI300 support is missing",
          "foo.py:3 — the E2E path never runs", "foo.py:3-5 TP8 is off by one",
-         # B1..B7 and C1..C3 are words this codebase uses itself, not only rule ids:
+         # Many ids are words this codebase uses itself -- 19 of the 54 appear under
+         # atom/ or docs/ as ordinary vocabulary, not as rule codes:
          # the KV-offload chunk groups (offload/README.md:1084), the MTP4 rows
          # (glm52/mono/kernels/op.py:131) and the deepseek_v4 capture topology
          # (mono/session.py). A finding that cites a file and then says "C1/C2 rows
          # are swapped" is lawful, and refusing it is fatal -- the only way out is an
-         # untrue "-- not reported:". Past the citation only the colon forms are read,
-         # because those are the only ones _publish.first_clause turns into an id-led
-         # published line.
+         # untrue "-- not reported:". Past the citation only the colon form is read.
+         # That is a trade, not a clean line: first_clause drops the citation either
+         # way, so "planner.rs:108 A5 charges only on req.stream" still publishes as
+         # "A5 charges only ...", and this gate passes it. Refusing the no-colon form
+         # would take the lawful sentences below with it whenever the diff does not
+         # itself use the word. A refusal is fatal and an id-led index line is
+         # cosmetic, so the cosmetic one is the one left open.
          "kv_transfer/offload/README.md:1084, B1-B2 stage before B3-B4",
          "glm52/mono/kernels/op.py:131 — C1/C2 rows for MTP4 are swapped",
          "mono/session.py:1527 C3 buffers are updated under the C4 capture key"]
@@ -716,7 +721,7 @@ import re, sys, pathlib
 sys.path.insert(0, sys.argv[1]); import triage
 s = pathlib.Path(sys.argv[1], "rules.md").read_text()
 print(len([m for m in re.findall(r"[\u26a0\ufe0f\U0001f4dd\U0001f534/]+\s*([A-Z]+\d+[a-z]?)[-\w\[\]]*\s*:", s)
-           if m in triage.RULE_SET]))' "$S")" "0"
+           if m in triage.REFUSED_IDS]))' "$S")" "0"
 # A verdict writes the path it found; SKILL.md's own good examples write the basename.
 # Matching the verdict's exact string meant the form the skill teaches could not claim
 # the FIRE it was reporting.

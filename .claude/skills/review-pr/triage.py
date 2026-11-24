@@ -2880,18 +2880,24 @@ BARE_ID = re.compile(_ID_HEAD + r"(?::|—|–|--|-(?!\w)|\s+(?=[a-z])|(?!\w))")
 # atom/models/deepseek_v4/mono/session.py). Reading the sentence with BARE_ID refuses a
 # lawful finding, and a refusal here is fatal -- the only way out is an untrue
 # `-- not reported:`, which is the trap the UNREPORTED-FIRE hint below exists to close.
-# `_diff_vocabulary` covers the same class from the other side; this narrowing also
-# holds for a word the diff happens not to contain.
+# This is a trade, not a clean line. first_clause drops the citation either way, so
+# `planner.rs:108 A5 charges only on req.stream` still publishes as `A5 charges only
+# …` and this gate passes it. Refusing that form would take the lawful sentences with
+# it whenever `_diff_vocabulary` does not happen to hold the word. A refusal is fatal
+# and an id-led index line is cosmetic, so the cosmetic gap is the one left open.
 CITED_ID = re.compile(_ID_HEAD + r":")
 
 
 def _diff_vocabulary(diff_text):
     """-> the id-shaped words the code under review uses as its own.
 
-    Eleven of the 54 ids are also this codebase's vocabulary: B1..B7 are the KV-offload
-    chunk groups (atom/kv_transfer/offload/README.md), C1/C2 the MTP4 rows
-    (atom/models/glm52/mono/kernels/op.py) and C3/C4 deepseek_v4's cuda-graph capture
-    topology (atom/models/deepseek_v4/mono/session.py). No shape separates `C1` the rule
+    Nineteen of the 54 ids also appear under atom/ or docs/ as ordinary words: B1..B7
+    are the KV-offload chunk groups (atom/kv_transfer/offload/README.md), C1..C3 the
+    MTP4 rows and deepseek_v4's cuda-graph capture topology
+    (atom/models/glm52/mono/kernels/op.py, atom/models/deepseek_v4/mono/session.py),
+    and D6, D10, E1, E2, G1, G2, H2, I1 and N1 the rest. (C4 belongs to that topology
+    too and is not an id at all, which is the other half of the same problem.) The
+    count is what the tree says today, not a constant. No shape separates `C1` the rule
     from `C1` the row -- that is the lesson of the word lists this gate went through --
     so ask the diff instead, which is the one thing that is not a guess. `_mentions_symbol`
     answers the neighbouring question the same way: by what the text actually says, never
