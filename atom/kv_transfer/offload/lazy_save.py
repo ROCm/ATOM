@@ -16,10 +16,17 @@ together hold more prefixes. No request stores its own prompt:
 * Demotion. The keyed, unsaved, canonical blocks among those the next
   allocations would evict (`BlockPool.next_evicted`) are pinned
   (`BlockPool.claim_unreused`) and stored as one `PrehashedSave` whose
-  chunk i is `block_ids[i]`. A reported store marks them saved; reported or
+  chunk i is `block_ids[i]` (`must_store_all`: a store the tier holds only
+  part of reports a failure). A reported store marks them saved; reported or
   not (a failure, which also pauses demotions, or no report within the save
   abandon window) they are unpinned to the head of their queue
   (`BlockPool.free(coldest=True)`), where they were found.
+* Write-back. Keyed unsaved blocks are the pool's dirty blocks
+  (`BlockPool.set_write_back`): an allocation evicts every clean block with
+  content (vacant, keyless, or one the tier holds) before it evicts one, and
+  the blocks it passed over are the first a demotion takes
+  (`BlockPool.held_blocks`). A block is lost unsaved only when the pool holds
+  nothing clean to evict instead (`lazy_evicted_unsaved`).
 * Lookup. The tier holds what HBM evicted rather than the prefix HBM still
   has, so a lookup asks only past the HBM hit, which the scheduler probes first
   (`needs_hbm_probe_before_lookup`).
@@ -42,13 +49,11 @@ is the dense one (dense and MiniMax-M3), with a worker that stores a
 
 Where it falls short:
 
-* A block is saved only if a demotion reaches it before HBM evicts it. Stores
-  that take longer than about two steps to report, a step that allocates more
-  blocks than the eviction window holds less one demotion, prefix hits inside
-  the window (up to one more demotion's worth), or a free list of two
-  demotions' worth or less (pins would leave the next allocation only a
-  preemption) let keyed blocks be evicted unsaved (`lazy_evicted_unsaved`
-  counts those it rekeys).
+* Dirty blocks outlive clean ones, hotter ones included: HBM keeps what the
+  tier lacks rather than strictly the most recent. Dirty blocks are lost when
+  the free list holds nothing else, which takes demotions slower than the
+  prefills that make new blocks (four demotions of a step's blocks in flight)
+  or a tier that refuses them for long.
 * Pins hold their blocks until the store reports. They leave two demotions'
   worth free when taken, but requests that grow through that before a slow
   store reports are preempted.
@@ -58,9 +63,8 @@ Where it falls short:
 * The saved bit does not follow the CPU tier's own evictions: a block whose
   chunk LMCache dropped stays marked saved, and is lost from both tiers when
   HBM evicts it.
-* A demotion is as best-effort as an eager save: the worker reports success
-  after storing a prefix of the batch when the tier refuses an allocation, and
-  after storing nothing when its engine is unhealthy or frozen.
+* A failed demotion is retried whole, after a backoff; the worker skips the
+  chunks the tier already holds.
 * Under LRU, a block a request hits and releases while its demotion is in
   flight goes back to the cold end with the demotion (SLRU keeps it
   protected).
@@ -70,6 +74,7 @@ from __future__ import annotations
 
 import logging
 import time
+from itertools import chain
 
 from atom.kv_transfer.disaggregation.types import SaveOperationId, req_id_of
 from atom.kv_transfer.offload import config as offcfg
@@ -90,8 +95,10 @@ logger = logging.getLogger("atom")
 # PP the head retires an abandoned save by request id (`PPKVAggregator.forget`),
 # which must not take the other demotions with it. An ATOM request's id is an int.
 _DEMOTION_REQ_ID = "lmcache-lazy-demotion"
-# Demotions in flight at once; each pins its blocks until it reports.
-_MAX_DEMOTIONS_IN_FLIGHT = 2
+# Demotions in flight at once; each pins its blocks until it reports. Four, so
+# demotions outpace a step's new blocks when a store takes three or four steps
+# to report (two kept up only at two).
+_MAX_DEMOTIONS_IN_FLIGHT = 4
 # Seconds without a new demotion after one reports a failure.
 _DEMOTION_BACKOFF_S = 1.0
 
@@ -165,7 +172,13 @@ class LazySaveSchedulerMixin:
         # when a look is owed.
         self._looked_at: tuple[int, int, int, int | None] | None = None
         self._backoff_until = 0.0
-        self.total_lazy_evicted_unsaved = 0
+        # Demotions reported failed (the tier refused one of their chunks, a
+        # fence or an unhealthy engine): their blocks stay dirty.
+        self.total_lazy_demotions_failed = 0
+        # The held count the last look picked nothing from, so an idle engine
+        # does not look again until it moves; -1 when a look is owed.
+        self._held_looked = -1
+        self._last_unsaved_warning = (0.0, 0)
         # The PP head's observer of demotions that will never report
         # (`bind_save_abandoned`); None without PP.
         self._report_abandoned = None
@@ -180,6 +193,17 @@ class LazySaveSchedulerMixin:
         if not block_manager.enable_prefix_caching:
             raise ValueError("save_policy 'lazy' keys blocks by prefix-cache hash")
         super().bind_block_manager(block_manager)
+        block_manager.kv.set_write_back(self._is_dirty)
+
+    def _is_dirty(self, block_id: int) -> bool:
+        """Whether HBM evicting `block_id` loses content the tier lacks: a
+        valid key not yet saved, on the block a lookup would find."""
+        key = self._block_keys.get(block_id)
+        if key is None or key[2]:
+            return False
+        pool = self._block_manager.kv
+        h = pool.blocks[block_id].hash
+        return key[0] == h and pool.index_get(h) == block_id
 
     def _tier_lookup_start(self, seq) -> int:
         return int(seq.offload_hbm_probe_tokens)
@@ -216,7 +240,6 @@ class LazySaveSchedulerMixin:
             old = keys.get(block_id)
             if old is None or old[0] != h:
                 saved = False
-                self.total_lazy_evicted_unsaved += old is not None and not old[2]
             else:
                 saved = old[2]
             keys[block_id] = (h, chain[i], saved or first <= i < end)
@@ -252,9 +275,12 @@ class LazySaveSchedulerMixin:
         return True
 
     def get_statistics(self) -> dict[str, int]:
+        pool = self._block_manager.kv if self._block_manager is not None else None
         return {
             **super().get_statistics(),
-            "lazy_evicted_unsaved": self.total_lazy_evicted_unsaved,
+            "lazy_evicted_unsaved": pool.blocks_evicted_dirty if pool else 0,
+            "lazy_held_blocks": pool.num_held if pool else 0,
+            "lazy_demotions_failed": self.total_lazy_demotions_failed,
         }
 
     # -- demotion ------------------------------------------------------------
@@ -277,6 +303,9 @@ class LazySaveSchedulerMixin:
         change makes a look due after those.
         """
         if self._looked_at is None:
+            return True
+        # Blocks an allocation passed over as dirty are the next to demote.
+        if pool.num_held and pool.num_held != self._held_looked:
             return True
         free, reusable, evicted, slack = self._looked_at
         if slack is None:
@@ -301,7 +330,7 @@ class LazySaveSchedulerMixin:
         pool = self._block_manager.kv
         if self._demotions:
             self._abandon_stalled_demotions()
-        # Both slots taken leaves no budget. Not looking then also keeps the
+        # Every slot taken leaves no budget. Not looking then also keeps the
         # last look's accounting, so a slot that comes back is used at once.
         if (
             len(self._demotions) >= _MAX_DEMOTIONS_IN_FLIGHT
@@ -323,7 +352,8 @@ class LazySaveSchedulerMixin:
         )
         keys, blocks, indexed = self._block_keys, pool.blocks, pool.index_get
         picked: list[tuple[int, int]] = []
-        for block_id in pool.next_evicted(window) if budget > 0 else ():
+        candidates = chain(pool.held_blocks(), pool.next_evicted(window))
+        for block_id in candidates if budget > 0 else ():
             key = keys.get(block_id)
             if key is None or key[2]:
                 continue
@@ -351,7 +381,9 @@ class LazySaveSchedulerMixin:
                     save_spec=SaveSpec(skip_leading_tokens=0),
                     save_operation=operation,
                     prehashed_save=PrehashedSave(
-                        start=0, hashes=tuple(h for _, h in batch)
+                        start=0,
+                        hashes=tuple(h for _, h in batch),
+                        must_store_all=True,
                     ),
                 )
             )
@@ -370,12 +402,30 @@ class LazySaveSchedulerMixin:
         # blocks that brings in can be evicted before the next look, at most
         # one more demotion's worth.
         slack = max(1, min(size, window - 2 * size)) - len(picked)
+        self._held_looked = -1 if picked else pool.num_held
+        self._warn_evicted_unsaved(pool)
         self._looked_at = (
             pool.num_free,
             pool.num_reusable_free,
             pool.blocks_evicted,
             slack if inside and budget > 0 else None,
         )
+
+    def _warn_evicted_unsaved(self, pool) -> None:
+        """At most one line a minute while dirty blocks are being lost."""
+        at, count = self._last_unsaved_warning
+        now = time.monotonic()
+        if pool.blocks_evicted_dirty == count or now - at < 60.0:
+            return
+        logger.warning(
+            "LMCache lazy: %d unsaved blocks evicted from HBM since the last "
+            "report (no clean block left to evict); %d held, %d demotions "
+            "failed so far",
+            pool.blocks_evicted_dirty - count,
+            pool.num_held,
+            self.total_lazy_demotions_failed,
+        )
+        self._last_unsaved_warning = (now, pool.blocks_evicted_dirty)
 
     def _abandon_stalled_demotions(self) -> None:
         """Unpin a demotion that has not reported within the window an eager
@@ -425,7 +475,17 @@ class LazySaveSchedulerMixin:
             return super().connector_completion(completion)
         self._end_demotion(completion.operation_id, stored=completion.succeeded)
         if not completion.succeeded:
-            self._perf_bump("lazy_demotion_failures")
+            self.total_lazy_demotions_failed += 1
+            failed = self.total_lazy_demotions_failed
+            if failed & (failed - 1) == 0:
+                # The 1st, 2nd, 4th, ...: a line, not a line per demotion.
+                logger.warning(
+                    "LMCache lazy demotion failed (%d so far): the CPU tier "
+                    "refused a chunk or the store failed; its blocks stay "
+                    "unsaved and demotions pause %.0fs",
+                    failed,
+                    _DEMOTION_BACKOFF_S,
+                )
             self._backoff_until = time.monotonic() + _DEMOTION_BACKOFF_S
         # Handled, and no request's save terminal.
         return None

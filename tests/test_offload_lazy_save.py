@@ -341,6 +341,12 @@ def _cpu_fences(monkeypatch):
 
 
 @pytest.fixture
+def two_slots(monkeypatch):
+    """Two demotions in flight: the slot accounting, smaller to follow."""
+    monkeypatch.setattr(lazy_save, "_MAX_DEMOTIONS_IN_FLIGHT", 2)
+
+
+@pytest.fixture
 def clock(monkeypatch):
     now = [1000.0]
     monkeypatch.setattr(lazy_save.time, "monotonic", lambda: now[0])
@@ -410,7 +416,7 @@ def test_rekeying_keeps_the_saved_bit_only_under_the_same_hash(lmcache):
     assert sched.get_statistics()["lazy_evicted_unsaved"] == 0
 
 
-def test_rekeying_an_unsaved_block_counts_it_evicted_unsaved(lmcache):
+def test_an_unsaved_block_evicted_with_nothing_clean_left_is_counted(lmcache):
     sched, pool, _ = _lazy(lmcache, 3)
     first = _seq(3)
     _hold(pool, first)
@@ -487,8 +493,12 @@ def test_a_demotion_is_a_prehashed_save_of_the_coldest_keyed_blocks(lmcache):
     first, second = sched.build_connector_meta().requests
     chain = _chain(_seq(4))[::-1]
     assert first.block_ids == cold[:BATCH] and second.block_ids == cold[BATCH:]
-    assert first.prehashed_save == PrehashedSave(0, tuple(chain[:BATCH]))
-    assert second.prehashed_save == PrehashedSave(0, tuple(chain[BATCH:]))
+    assert first.prehashed_save == PrehashedSave(
+        0, tuple(chain[:BATCH]), must_store_all=True
+    )
+    assert second.prehashed_save == PrehashedSave(
+        0, tuple(chain[BATCH:]), must_store_all=True
+    )
     assert first.save_spec.skip_leading_tokens == 0 and first.token_ids == []
     assert first.load_spec is None
     # Each demotion a request of its own: a PP head retires one by request id.
@@ -541,7 +551,7 @@ def test_selection_skips_keyless_saved_and_duplicate_blocks(lmcache):
     assert req.block_ids == [blocks[1], blocks[0]]
 
 
-def test_two_demotions_in_flight_and_one_more_per_freed_slot(lmcache):
+def test_two_demotions_in_flight_and_one_more_per_freed_slot(lmcache, two_slots):
     # 600 blocks: 2% is a window of 12, 8 past the vacant blocks.
     sched, pool, tier, cold, filler = _cold(lmcache, 8, vacant=4, blocks=600)
     first, second = sched.build_connector_meta().requests
@@ -555,7 +565,7 @@ def test_two_demotions_in_flight_and_one_more_per_freed_slot(lmcache):
     assert third.block_ids == cold[4:6]
 
 
-def test_a_slot_back_is_used_at_once_though_its_blocks_stay_held(lmcache):
+def test_a_slot_back_is_used_at_once_though_its_blocks_stay_held(lmcache, two_slots):
     sched, pool, tier, cold, filler = _cold(lmcache, 8, vacant=4, blocks=600)
     first, _second = sched.build_connector_meta().requests
     pool.free(filler.block_table[0])  # the pool moves while both are busy
@@ -568,7 +578,9 @@ def test_a_slot_back_is_used_at_once_though_its_blocks_stay_held(lmcache):
     assert third.block_ids == cold[4:6]
 
 
-def test_a_spent_budget_is_looked_at_again_though_vacant_blocks_came_back(lmcache):
+def test_a_spent_budget_is_looked_at_again_though_vacant_blocks_came_back(
+    lmcache, two_slots
+):
     # A window of 12 inside the free list: 12 keyed blocks once three running
     # requests take the vacant ones for their unhashed tail blocks.
     sched, pool, tier, cold, _ = _cold(lmcache, 12, vacant=3, blocks=600)
@@ -586,7 +598,7 @@ def test_a_spent_budget_is_looked_at_again_though_vacant_blocks_came_back(lmcach
 
 
 def test_one_slots_spent_budget_is_looked_at_again_though_a_vacant_block_came_back(
-    lmcache,
+    lmcache, two_slots
 ):
     # The steady state's boundary: one slot back, the look takes one
     # demotion's worth and leaves exactly no slack. A window of 12 inside a
@@ -610,7 +622,7 @@ def test_one_slots_spent_budget_is_looked_at_again_though_a_vacant_block_came_ba
 
 @pytest.mark.parametrize("deferred", [False, True])
 def test_a_probationary_free_ahead_of_the_protected_queue_is_looked_at(
-    lmcache, deferred
+    lmcache, deferred, two_slots
 ):
     sched, pool, tier = _lazy(lmcache, 600)  # SLRU: a window of 12
     reused = _seq(20)
@@ -716,7 +728,7 @@ def test_a_demotion_whose_fence_fails_is_unsaved_and_backs_off(lmcache, monkeypa
     worker.close()
     sched.process_completions(worker.get_finished())
     assert _saved(sched, cold) == [False, False] and pool.num_free == 6
-    assert not sched._demotions and sched._perf_counters["lazy_demotion_failures"]
+    assert not sched._demotions and sched.total_lazy_demotions_failed == 1
 
 
 def test_a_failed_demotion_is_unsaved_and_retried_after_a_backoff(lmcache, clock):
@@ -1416,7 +1428,11 @@ def _tier_engine(lmcache, codec, block, virtual_block):
 
     return SimpleNamespace(
         token_database=SimpleNamespace(_make_key_by_hash=lambda h, c=None: (h, c)),
-        storage_manager=SimpleNamespace(allocate=allocate, batched_put=batched_put),
+        storage_manager=SimpleNamespace(
+            allocate=allocate,
+            batched_put=batched_put,
+            contains=lambda key, *_a, **_k: "cpu" if key[0] in stored else None,
+        ),
         gpu_connector=connector,
         metadata=ATOMRawBytesLMCacheMetadata(
             SimpleNamespace(chunk_size=chunk),
@@ -1724,7 +1740,7 @@ def test_under_pp_one_stages_failure_fails_the_demotion_once_all_reported(
         assert req.save_operation in sched._demotions
     _poll(head, reports, order[-1], _stored([req]))
     assert _saved(sched, cold) == [False, False] and pool.num_free == 6
-    assert not sched._demotions and sched._perf_counters["lazy_demotion_failures"]
+    assert not sched._demotions and sched.total_lazy_demotions_failed == 1
     assert sched.build_connector_meta().requests == []  # backing off
     clock[0] += lazy_save._DEMOTION_BACKOFF_S
     (retry,) = sched.build_connector_meta().requests
@@ -1934,3 +1950,189 @@ def test_under_pp_the_stages_split_pp_times_the_host_budget_by_layers(lmcache):
     assert len(set(layers)) > 1
     assert sum(budgets) == pytest.approx(PP * 100.0)
     assert budgets == pytest.approx([PP * 100.0 * n / 62 for n in layers])
+
+
+# ------------------------------------------------------ write-back eviction
+def test_an_allocation_evicts_clean_blocks_before_keyed_unsaved_ones(lmcache):
+    """Keyed unsaved blocks are the pool's dirty ones: an allocation passes over
+    them to a clean block (here a keyless one) and a demotion takes the blocks
+    it passed over first, though they are outside the window by then."""
+    sched, pool, _ = _lazy(lmcache, 300)  # a window of 6
+    _hold(pool, _seq(300 - 2 - 6, base=10_000))
+    dirty, clean = _seq(2), _seq(6, base=500)
+    _hold(pool, dirty)
+    _finish(sched, pool, dirty)  # keyed, unsaved, coldest
+    clean_blocks = _hold(pool, clean)
+    for block_id in clean_blocks:  # published, never keyed
+        pool.free(block_id)
+    dirty_blocks = sorted(sched._block_keys)  # `_finish` emptied its table
+    taken = [pool.pop(), pool.pop()]
+    assert taken == clean_blocks[:2]
+    assert sorted(pool.held_blocks()) == dirty_blocks
+    assert sched.get_statistics()["lazy_held_blocks"] == 2
+    (req,) = sched.build_connector_meta().requests
+    assert sorted(req.block_ids) == dirty_blocks
+    assert pool.num_held == 0 and pool.blocks_evicted_dirty == 0
+
+
+def test_a_refused_demotion_leaves_its_blocks_dirty_until_retried(lmcache, clock):
+    sched, _pool, tier, cold, _ = _one_demotion(lmcache)
+    (req,) = sched.build_connector_meta().requests
+    _report(sched, [req], tier, ok=False)  # `must_store_all`: the tier refused
+    assert _saved(sched, cold) == [False, False]
+    assert sched.get_statistics()["lazy_demotions_failed"] == 1
+    # Dirty still: an allocation passes over them while a clean block is left.
+    assert all(sched._is_dirty(b) for b in cold)
+    clock[0] += lazy_save._DEMOTION_BACKOFF_S
+    (retry,) = sched.build_connector_meta().requests
+    assert retry.block_ids == req.block_ids
+
+
+# --------------------------------------------- lookup pins of queued requests
+def test_the_pin_a_waiting_request_holds_is_counted_until_its_load(lmcache):
+    """A tier hit for a request the pool cannot admit yet keeps its pin while
+    it waits (`lookup_pinned_tokens`); the load spends it."""
+    shell = LMCacheOffloadConnectorScheduler(_config(step=4 * BLOCK))
+    engine = _engine_with(shell, 10, step=4 * BLOCK, max_model_len=10**6)
+    tier = lmcache.tier
+    hog = _seq(8, base=5000, sampling_params=SamplingParams(max_tokens=6))
+    engine.add(hog)
+    while hog.num_cached_tokens < hog.num_prompt_tokens:
+        _step(engine)
+    prompt = _seq(6, sampling_params=SamplingParams(max_tokens=1))
+    tier.stored.update(_chain(prompt))
+    engine.add(prompt)
+    meta = _step(engine)
+    assert prompt in engine.waiting
+    assert str(prompt.id) not in meta.lookup_requests_in_step  # still pinned
+    # The tier holds the whole prompt, and pins all of it.
+    assert shell.get_statistics()["lookup_pinned_tokens"] == 6 * BLOCK
+    while prompt.status != SequenceStatus.FINISHED:
+        meta = _step(engine)
+        for req in meta.requests if meta else ():
+            if req.load_spec is not None:
+                engine._update_from_kv_xfer_finished(
+                    KVConnectorOutput(finished_loading={req.load_operation})
+                )
+    assert shell.get_statistics()["lookup_pinned_tokens"] == 0
+
+
+# ------------------------------------------------ a trace replayed end to end
+def _replay(lmcache, *, write_back, pd):
+    """Multi-turn conversations through the real scheduler, P/D or alone, with
+    the lazy tier: each turn re-sends the conversation so far plus new tokens,
+    the worker reports a demotion two steps after it is dispatched and a load
+    one step after, and the tier never evicts. Returns, over the follow-up
+    turns, the blocks of the previous turn neither HBM nor the tier served, and
+    the pool."""
+    shell = LMCacheOffloadConnectorScheduler(_config(step=4 * BLOCK))
+    producer = _Producer()
+    connector = _multi(producer, shell) if pd else shell
+    engine = _engine_with(
+        connector, 48, step=4 * BLOCK, max_num_seqs=8, max_model_len=10**6
+    )
+    pool = engine.block_manager.kv
+    if not write_back:
+        pool.set_write_back(None)  # as before the fix
+    tier = lmcache.tier
+    # (conversation, blocks) in arrival order: five conversations, round robin,
+    # each turn a few blocks longer, so turns of 6..22 blocks arrive while the
+    # pool (48) holds about two conversations.
+    turns = [(c, 6 + 4 * t + c % 3) for t in range(5) for c in range(5)]
+    reports, sends, lost, expected = [], [], 0, 0
+    previous = {}
+    tick = 0
+    for c, n in turns:
+        seq = Sequence(
+            [c * 100_000 + i for i in range(n * BLOCK)],
+            BLOCK,
+            sampling_params=SamplingParams(max_tokens=1),
+            kv_transfer_params={"do_remote_decode": True} if pd else None,
+        )
+        engine.add(seq)
+        first_cached = None
+        while seq.status != SequenceStatus.FINISHED or reports or sends:
+            tick += 1
+            assert tick < 5000, "the replay did not settle"
+            out = KVConnectorOutput()
+            for item in [x for x in reports if x[0] <= tick]:
+                reports.remove(item)
+                req = item[1]
+                if req.load_spec is not None:
+                    out.finished_loading.add(req.load_operation)
+                    continue
+                tier.stored.update(req.prehashed_save.hashes)
+                out.finished_saving.add(req.save_operation)
+                out.connector_completions.add(
+                    ConnectorCompletion(
+                        DENSE_PAGE_STORE_CHANNEL, req.save_operation, True
+                    )
+                )
+            for item in [x for x in sends if x[0] <= tick]:
+                sends.remove(item)
+                producer.send_finished(item[1])
+                out.finished_sending.add(item[1])
+            engine._update_from_kv_xfer_finished(out)
+            result = engine.schedule()
+            if result is None or result[0] is None:
+                meta = (
+                    connector.build_connector_meta()
+                    if connector.has_pending_work()
+                    else None
+                )
+            else:
+                batch, seqs = result
+                if first_cached is None and seq.id in seqs:
+                    # Where its first chunk starts: what HBM and a load served.
+                    first_cached = seq.num_cached_tokens // BLOCK
+                engine.postprocess(
+                    list(seqs.values()),
+                    ScheduledBatchOutput(
+                        req_ids=list(seqs),
+                        token_ids=[(7,)] * len(seqs),
+                        num_rejected=None,
+                        num_bonus=None,
+                        draft_token_ids=None,
+                    ),
+                    batch=batch,
+                )
+                meta = batch.connector_meta_output
+            if (
+                pd
+                and seq.id in producer.sending
+                and not any(s[1] == seq.id for s in sends)
+            ):
+                sends.append((tick + 2, seq.id))
+            for sub in getattr(meta, "metas", None) or ([meta] if meta else []):
+                for req in getattr(sub, "requests", ()):
+                    if req.prehashed_save is not None:
+                        reports.append((tick + 2, req))
+                    elif req.load_spec is not None:
+                        reports.append((tick + 1, req))
+        if c in previous:
+            # Up to the last full block of the previous turn; the last block
+            # of a prompt is always recomputed.
+            want = min(previous[c], n - 1)
+            expected += want
+            lost += max(0, want - (first_cached or 0))
+        previous[c] = n
+    return lost, expected, pool
+
+
+@pytest.mark.parametrize("pd", [False, True], ids=["alone", "multi"])
+def test_a_replayed_trace_loses_no_prefix_while_the_tier_has_room(lmcache, pd):
+    """The prefill node's collapse in miniature: prompts admitted whole evict
+    more blocks at once than the demotion window looks at, and demotions report
+    two steps late. Without write-back HBM evicts keyed blocks no demotion
+    stored, and later turns recompute prefixes an unbounded tier had room for;
+    with it every follow-up turn is served its previous turn from HBM or the
+    tier."""
+    with pytest.MonkeyPatch.context() as patch:
+        # As before the fix: two demotions in flight, no write-back.
+        patch.setattr(lazy_save, "_MAX_DEMOTIONS_IN_FLIGHT", 2)
+        lost, expected, _pool = _replay(lmcache, write_back=False, pd=pd)
+    # 118 of 256 blocks, here and on the code before the fix alike.
+    assert expected > 0 and lost > expected // 4
+    lmcache.tier = None
+    lost, expected, pool = _replay(lmcache, write_back=True, pd=pd)
+    assert lost == 0 and pool.blocks_evicted_dirty == 0

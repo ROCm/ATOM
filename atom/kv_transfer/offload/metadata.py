@@ -153,10 +153,16 @@ class PrehashedSave:
     (``ATOM_OFFLOAD_PREHASHED_SAVE``). ``start`` is chunk-aligned and equals
     the save's ``skip_leading_tokens``; the worker builds each chunk's key with
     LMCache's ``_make_key_by_hash`` and never sees the prefix tokens.
+
+    ``must_store_all``: the save succeeds only if the tier holds every chunk
+    afterwards (a lazy demotion, whose blocks are marked saved on success). The
+    worker skips chunks the tier already holds and reports a failure, not a
+    shorter success, when the tier refuses one or its engine stores nothing.
     """
 
     start: int
     hashes: tuple[int, ...]
+    must_store_all: bool = False
 
 
 @dataclass

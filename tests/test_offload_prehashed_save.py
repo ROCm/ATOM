@@ -86,9 +86,7 @@ class _LookupClient:
             offsets.append(end - start)
         if not hashes:
             return 0
-        responses = self.transport.send_and_recv_all(
-            [hashes, offsets, lookup_id, ""]
-        )
+        responses = self.transport.send_and_recv_all([hashes, offsets, lookup_id, ""])
         return min(int.from_bytes(r, "big") for r in responses)
 
 
@@ -96,7 +94,9 @@ def _scheduler(monkeypatch, *, enabled=True, hit=0):
     monkeypatch.setenv("ATOM_OFFLOAD_PREHASHED_SAVE", "1" if enabled else "0")
     monkeypatch.setenv("PYTHONHASHSEED", "0")
     monkeypatch.setattr(
-        offcfg, "build_lmcache_config", lambda _c=None: SimpleNamespace(chunk_size=CHUNK)
+        offcfg,
+        "build_lmcache_config",
+        lambda _c=None: SimpleNamespace(chunk_size=CHUNK),
     )
     monkeypatch.setattr(offcfg, "build_lmcache_metadata", lambda *_a: object())
     monkeypatch.setattr(offcfg, "lmcache_replica_world_size", lambda _c: 4)
@@ -194,7 +194,9 @@ def test_mismatched_chain_disables(monkeypatch):
     monkeypatch.setattr(
         prehashed,
         "_chunk_list",
-        lambda t, s, e: real(t, s, e) if e - s > CHUNK else [x + 1 for x in real(t, s, e)],
+        lambda t, s, e: (
+            real(t, s, e) if e - s > CHUNK else [x + 1 for x in real(t, s, e)]
+        ),
     )
     seq = _seq(3 * CHUNK)
     assert scheduler._prefix_chunk_hashes(seq, 3) is None
@@ -229,6 +231,11 @@ class _StorageManager:
 
     def batched_put(self, keys, memory_objs, transfer_spec=None, location=None):
         self.put.append((list(keys), list(memory_objs)))
+
+    def contains(self, key, search_range=None, pin=False):
+        """LMCache's: the backend that holds `key`, or None."""
+        held = any(key in keys for keys, _objs in self.put)
+        return "LocalCPUBackend" if held else None
 
 
 class _GpuConnector:
@@ -319,6 +326,80 @@ def test_worker_stops_at_first_refused_allocation():
     worker._do_save_req(req)
     keys, _objs = engine.storage_manager.put[-1]
     assert [k.chunk_hash for k in keys] == [11]
+
+
+def _store_all(req_id, hashes):
+    """A lazy demotion's save: chunk i is block i, all of it or a failure."""
+    return LMCacheReqMeta(
+        req_id=req_id,
+        token_ids=[],
+        block_ids=list(range(len(hashes))),
+        save_spec=SaveSpec(skip_leading_tokens=0),
+        save_operation=SaveOperationId(req_id, 0),
+        prehashed_save=PrehashedSave(
+            start=0, hashes=tuple(hashes), must_store_all=True
+        ),
+    )
+
+
+def _store_reports(worker):
+    from atom.kv_transfer.offload.chunked_scheduler import DENSE_PAGE_STORE_CHANNEL
+
+    return {
+        (c.operation_id.req_id, c.succeeded)
+        for c in worker.get_finished().connector_completions
+        if c.channel == DENSE_PAGE_STORE_CHANNEL
+    }
+
+
+@pytest.mark.parametrize("must_store_all", [False, True])
+def test_a_refused_chunk_fails_only_a_save_that_must_store_all(must_store_all):
+    """The tier refusing the second of three chunks: an eager save reports the
+    prefix it stored as done, as `LMCacheEngine.store` does; a demotion, whose
+    blocks a success marks saved, reports a failure (its stored chunk stays)."""
+    engine = _engine(capacity=1)
+    worker = _worker(engine)
+    worker._early_release = True  # as the M3 worker runs
+    req = _store_all("lmcache-lazy-demotion-0", (11, 12, 13))
+    req.prehashed_save = PrehashedSave(
+        start=0, hashes=(11, 12, 13), must_store_all=must_store_all
+    )
+    worker._do_save_req(req)
+    keys, _objs = engine.storage_manager.put[-1]
+    assert [k.chunk_hash for k in keys] == [11]
+    assert _store_reports(worker) == {("lmcache-lazy-demotion-0", not must_store_all)}
+
+
+def test_a_save_that_must_store_all_skips_chunks_the_tier_holds():
+    engine = _engine(capacity=2)
+    worker = _worker(engine)
+    worker._early_release = True
+    worker._do_save_req(_store_all("a", (11,)))
+    # 11 is held, so the one allocation left goes to 12, the second chunk:
+    # block 1.
+    worker._do_save_req(_store_all("b", (11, 12)))
+    keys, _objs = engine.storage_manager.put[-1]
+    assert [k.chunk_hash for k in keys] == [12]
+    starts, _ends, _kwargs = engine.gpu_connector.calls[-1]
+    assert starts == [CHUNK]
+    assert _store_reports(worker) == {("a", True), ("b", True)}
+
+
+@pytest.mark.parametrize("state", ["unhealthy", "frozen", "passive"])
+def test_an_engine_that_stores_nothing_fails_a_save_that_must_store_all(state):
+    engine = _engine()
+    setattr(
+        engine,
+        {"unhealthy": "is_healthy", "frozen": "is_frozen", "passive": "_is_passive"}[
+            state
+        ],
+        (lambda: False) if state == "unhealthy" else (lambda: True),
+    )
+    worker = _worker(engine)
+    worker._early_release = True
+    worker._do_save_req(_store_all("c", (31, 32)))
+    assert engine.storage_manager.put == []
+    assert _store_reports(worker) == {("c", False)}
 
 
 def test_worker_releases_allocations_when_pack_fails():

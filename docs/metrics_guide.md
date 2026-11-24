@@ -229,6 +229,10 @@ Summed across DP ranks by `LLMEngine.get_metrics_statistics()`.
 | `atom:lmcache_loaded_tokens` / `atom:lmcache_saved_tokens` | Counter, tokens | Tokens loaded from / saved to LMCache. This is transfer volume, **not** admitted reuse — for reuse accounting use `atom:prefix_cache_offload_tokens`. |
 | `atom:lmcache_load_failures` | Counter | Failed LMCache loads. |
 | `atom:lmcache_loads_pending` / `atom:lmcache_saves_pending` | Gauge | Operations currently in flight. |
+| `atom:lmcache_lookup_pinned_tokens` | Gauge, tokens | CPU-tier tokens pinned by lookups whose load is not dispatched yet (a waiting request with a tier hit keeps its pin until its load). Pinned chunks cannot be evicted; a large value next to `atom:lmcache_lazy_demotions_failed` means pins crowd the tier. |
+| `atom:lmcache_lazy_held_blocks` | Gauge, blocks | `save_policy: lazy`: unsaved free HBM blocks an allocation passed over to evict a clean one (one the tier holds, or no content). |
+| `atom:lmcache_lazy_evicted_unsaved_blocks` | Counter, blocks | `save_policy: lazy`: unsaved blocks HBM evicted because no clean block was left. Each is a prefix lost from both tiers; non-zero means demotions do not keep up or the tier refuses them. |
+| `atom:lmcache_lazy_demotions_failed` | Counter | `save_policy: lazy`: demotions reported failed (the tier refused a chunk, a fence or store error, an unhealthy engine). Their blocks stay unsaved and are retried after a 1 s pause. |
 
 ### Process and exporter health
 

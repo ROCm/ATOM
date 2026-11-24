@@ -64,6 +64,13 @@ class BlockPool:
     queue on release. New content remains probationary until claimed, so a
     stream of one-off prefixes cannot evict the whole hot set. Vacant blocks
     still go first; referenced blocks are never candidates in either policy.
+
+    Optional write-back (`set_write_back`): a block a lower tier has not stored
+    yet ("dirty") is recomputed if evicted, one it holds is only reloaded. An
+    allocation that reaches a dirty block moves it to `_held`, still free and
+    claimable, and evicts the next clean one; held blocks go only once no clean
+    block with content is left, coldest first, counted in
+    `blocks_evicted_dirty`. The writer stores them meanwhile (`held_blocks`).
     """
 
     def __init__(
@@ -107,6 +114,10 @@ class BlockPool:
         # stale entries.
         self._vacant: list[int] = list(range(num_blocks))
         self._cached: OrderedDict[int, None] = OrderedDict()
+        # Dirty free blocks an allocation passed over, coldest first (see the
+        # class doc); empty without `set_write_back`.
+        self._held: OrderedDict[int, None] = OrderedDict()
+        self._is_dirty: Callable[[int], bool] | None = None
         self._free: set[int] = set(range(num_blocks))
         self._used: set[int] = set()
         # Raw PAGE units reserved by multi-unit objects such as state checkpoints.
@@ -125,6 +136,8 @@ class BlockPool:
         # hash moves to the block that adopted it.
         self.blocks_evicted: int = 0
         self.blocks_retired: int = 0
+        # Of `blocks_evicted`, held blocks evicted for want of a clean one.
+        self.blocks_evicted_dirty: int = 0
 
     # ------------------------------- counts -------------------------------- #
     @property
@@ -147,9 +160,25 @@ class BlockPool:
         """The free blocks with content that the next `count` allocations
         would evict, coldest first (`_take_free`'s order). Vacant blocks go
         first and lose nothing, so they shorten the list rather than appear in
-        it. Lazy: consume it before changing the pool."""
-        vacant = len(self._free) - len(self._cached) - len(self._protected)
+        it. Lazy: consume it before changing the pool. Held blocks are not in
+        it (`held_blocks`)."""
+        vacant = len(self._free) - self.num_reusable_free
         return islice(chain(self._cached, self._protected), max(0, count - vacant))
+
+    def set_write_back(self, is_dirty: Callable[[int], bool] | None) -> None:
+        """Evict clean blocks before dirty ones (class doc). `is_dirty(block_id)`
+        runs on each free block with content an allocation reaches: keep it
+        cheap. None turns it off; blocks held by then stay last."""
+        self._is_dirty = is_dirty
+
+    def held_blocks(self):
+        """The free blocks an allocation passed over as dirty, coldest first.
+        Lazy: consume it before changing the pool."""
+        return iter(self._held)
+
+    @property
+    def num_held(self) -> int:
+        return len(self._held)
 
     def is_used(self, block_id: int) -> bool:
         return block_id in self._used
@@ -167,7 +196,7 @@ class BlockPool:
         vacant count, which is the number that actually has to reach zero
         before `blocks_evicted` can start moving.
         """
-        return len(self._cached) + len(self._protected)
+        return len(self._cached) + len(self._protected) + len(self._held)
 
     def eviction_stats(self) -> dict[str, int]:
         """Content this pool destroyed, and the headroom it has left.
@@ -179,6 +208,7 @@ class BlockPool:
         return {
             "blocks_evicted": self.blocks_evicted,
             "blocks_retired": self.blocks_retired,
+            "blocks_evicted_dirty": self.blocks_evicted_dirty,
             "blocks_total": self.num_blocks,
             "blocks_used": self.num_used,
             "blocks_free": self.num_free,
@@ -258,6 +288,7 @@ class BlockPool:
         # here rather than left to drift.
         self._cached.clear()
         self._protected.clear()
+        self._held.clear()
         self._reused.clear()
         self._vacant = sorted(self._free)
         heapify(self._vacant)
@@ -272,6 +303,7 @@ class BlockPool:
         """
         block = self.blocks[block_id]
         self._protected.pop(block_id, None)
+        self._held.pop(block_id, None)
         self._reused.discard(block_id)
         dropped = False
         if block.hash != -1 and self._hash_to_block_id.get(block.hash) == block_id:
@@ -300,15 +332,22 @@ class BlockPool:
             if block_id in self._free and self.blocks[block_id].hash == -1:
                 self._free.discard(block_id)
                 return block_id
-        while self._cached:
-            block_id, _ = self._cached.popitem(last=False)
+        is_dirty = self._is_dirty
+        for queue in (self._cached, self._protected):
+            while queue:
+                block_id, _ = queue.popitem(last=False)
+                if block_id in self._free and self.blocks[block_id].hash != -1:
+                    if is_dirty is not None and is_dirty(block_id):
+                        self._held[block_id] = None
+                        continue
+                    self._free.discard(block_id)
+                    return block_id
+        while self._held:
+            block_id, _ = self._held.popitem(last=False)
             if block_id in self._free and self.blocks[block_id].hash != -1:
                 self._free.discard(block_id)
-                return block_id
-        while self._protected:
-            block_id, _ = self._protected.popitem(last=False)
-            if block_id in self._free and self.blocks[block_id].hash != -1:
-                self._free.discard(block_id)
+                if is_dirty is not None and is_dirty(block_id):
+                    self.blocks_evicted_dirty += 1
                 return block_id
         return -1
 
@@ -329,6 +368,7 @@ class BlockPool:
         self._free.discard(block_id)
         self._cached.pop(block_id, None)
         self._protected.pop(block_id, None)
+        self._held.pop(block_id, None)
 
     def allocate(self, block_id: int) -> Block:
         """Take `block_id` for fresh content, evicting whatever it held."""

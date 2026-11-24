@@ -454,3 +454,72 @@ class TestNextEvicted:
         assert list(pool.next_evicted(2)) == []
         # The order is the one allocation follows.
         assert [pool.pop() for _ in range(6)] == [4, 5, 1, 2, 3, 0]
+
+
+class TestWriteBack:
+    """`set_write_back`: an allocation evicts every clean block with content
+    before a dirty one, holding the dirty ones it passes over; a held block is
+    evicted, and counted, only when nothing clean is left."""
+
+    def _pool(self, dirty, n=4, **kwargs):
+        pool = BlockPool(num_blocks=n, **kwargs)
+        for h in range(n):
+            published(pool, pool.pop(), 100 + h)
+        pool.set_write_back(lambda block_id: block_id in dirty)
+        return pool
+
+    def test_clean_blocks_go_first_and_dirty_ones_coldest_first_last(self):
+        dirty = {0, 2}
+        pool = self._pool(dirty)
+        assert [pool.pop(), pool.pop()] == [1, 3]
+        assert list(pool.held_blocks()) == [0, 2] and pool.num_held == 2
+        assert pool.blocks_evicted_dirty == 0
+        assert [pool.pop(), pool.pop()] == [0, 2]
+        assert pool.blocks_evicted_dirty == 2 and pool.num_held == 0
+
+    def test_a_held_block_stays_free_reusable_and_claimable(self):
+        pool = self._pool({0})
+        pool.allocate(pool.pop())  # 1: passes over 0
+        assert list(pool.held_blocks()) == [0]
+        assert pool.num_free == pool.num_reusable_free == 3
+        assert pool.lookup(100) == 0
+        pool.claim(0)  # a prefix hit takes it off the held list
+        assert pool.num_held == 0 and pool.num_free == 2
+        pool.free(0)
+        assert list(pool.next_evicted(4)) == [2, 3, 0]
+
+    def test_a_held_block_stored_meanwhile_is_evicted_as_clean(self):
+        dirty = {0}
+        pool = self._pool(dirty)
+        pool.allocate(pool.pop())  # 1, past held 0
+        pool.claim_unreused(0)  # a demotion pins it
+        dirty.clear()  # and stores it
+        pool.free(0, coldest=True)
+        assert pool.pop() == 0 and pool.blocks_evicted_dirty == 0
+
+    def test_vacant_blocks_still_go_first(self):
+        pool = BlockPool(num_blocks=3)
+        published(pool, pool.pop(), 100)
+        pool.free(0)
+        pool.set_write_back(lambda _block_id: True)
+        assert [pool.pop(), pool.pop()] == [1, 2]
+        assert pool.num_held == 0
+        assert pool.pop() == 0 and pool.blocks_evicted_dirty == 1
+
+    def test_protected_clean_blocks_go_before_held_dirty_ones(self):
+        pool = self._pool({0}, cache_policy="slru", protected_ratio=0.5)
+        pool.claim(3)
+        pool.free(3)  # reused: protected
+        assert [pool.pop() for _ in range(4)] == [1, 2, 3, 0]
+
+    def test_without_write_back_the_order_is_unchanged(self):
+        pool = self._pool({0})
+        pool.set_write_back(None)
+        assert [pool.pop() for _ in range(4)] == [0, 1, 2, 3]
+
+    def test_clearing_the_index_drops_held_blocks_as_vacant(self):
+        pool = self._pool({0, 1})
+        pool.allocate(pool.pop())  # 2, past held 0 and 1
+        pool.clear_index()
+        assert pool.num_held == 0 and pool.num_reusable_free == 0
+        assert pool.eviction_stats()["blocks_evicted_dirty"] == 0

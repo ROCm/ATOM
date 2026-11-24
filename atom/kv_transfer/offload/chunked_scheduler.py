@@ -984,6 +984,20 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._perf_maybe_log()
         return meta
 
+    def get_statistics(self) -> dict[str, int]:
+        statistics = super().get_statistics()
+        # Only a scheduler that carries lookup pins past their step
+        # (`_lookup_results`); kimi_k3 builds this base without them.
+        results = self.__dict__.get("_lookup_results")
+        if results is not None:
+            # Tier tokens pinned by lookups whose load is not dispatched yet:
+            # a waiting request keeps the pin its lookup took until its load.
+            statistics["lookup_pinned_tokens"] = sum(
+                max(0, int(hit) - int(self._tier_lookup_start(seq)))
+                for seq, hit in results.values()
+            )
+        return statistics
+
     def should_defer_free(self, seq) -> bool:
         if self._has_active_load(seq):
             return True

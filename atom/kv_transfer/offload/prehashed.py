@@ -422,6 +422,10 @@ class PrehashedSaveWorkerMixin:
         under ``torch.inference_mode`` as ``store`` is (the KV pool and
         LMCache's buffers may be inference tensors). KV events and LMCache's
         store statistics are not produced.
+
+        ``must_store_all`` (a lazy demotion): chunks the tier already holds are
+        skipped, and a refused allocation or an engine that stores nothing
+        reports a failure instead of ``store``'s shorter success.
         """
         chunk = int(self.chunk_size)
         start = int(prehashed.start)
@@ -439,6 +443,7 @@ class PrehashedSaveWorkerMixin:
         if synchronize is not None:
             synchronize()
         engine = self._engine
+        must_store_all = prehashed.must_store_all
         is_passive = getattr(engine, "_is_passive", None)
         if (
             not engine.is_healthy()
@@ -447,7 +452,7 @@ class PrehashedSaveWorkerMixin:
         ):
             # `store` returns without storing in all three cases, and the token
             # path then reports the save as done.
-            self._record_store_terminal(req, True)
+            self._record_store_terminal(req, not must_store_all)
             return
         token_database = engine.token_database
         storage_manager = engine.storage_manager
@@ -455,21 +460,27 @@ class PrehashedSaveWorkerMixin:
         dtypes = engine.metadata.get_dtypes()
         busy_loop = engine.config.get_extra_config_value("force_store_wait", False)
         keys, memory_objs, starts, ends = [], [], [], []
+        refused = False
         for index, chunk_hash in enumerate(hashes):
+            key = token_database._make_key_by_hash(int(chunk_hash))
+            if must_store_all and storage_manager.contains(key) is not None:
+                continue
             memory_obj = storage_manager.allocate(
                 shapes, dtypes, busy_loop=busy_loop, fmt=engine.fmt
             )
             if memory_obj is None:
+                refused = True
                 logger.warning(
                     "LMCache offload: CPU tier under pressure, storing %d of %d "
-                    "chunks of req=%s",
+                    "chunks of req=%s%s",
                     len(memory_objs),
                     len(hashes),
                     req.req_id,
+                    " (reported failed)" if must_store_all else "",
                 )
                 break
             chunk_start = start + index * chunk
-            keys.append(token_database._make_key_by_hash(int(chunk_hash)))
+            keys.append(key)
             memory_objs.append(memory_obj)
             starts.append(chunk_start)
             ends.append(chunk_start + chunk)
@@ -517,7 +528,7 @@ class PrehashedSaveWorkerMixin:
                 float(stats.get("sync_ms", 0.0)),
                 (time.perf_counter() - t0) * 1000,
             )
-        self._record_store_terminal(req, True)
+        self._record_store_terminal(req, not (refused and must_store_all))
 
 
 __all__ = ["PrehashedSaveSchedulerMixin", "PrehashedSaveWorkerMixin"]
