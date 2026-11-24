@@ -506,3 +506,47 @@ def region_slots(kind, level, bound_max):
         for b, s in trees(kind, bound_max)
         if level < top_level(kind, b, s)
     )
+
+
+# The anchored first pass of a list's select (``topk.radix_select``'s
+# ``anchor``): each list's k-th order key of the step before, a word a list of
+# every tree a selecting layer may run, then its split rows' merge -- [row]
+# [``anchor_row_words``] words in front of the layer's ``isel``, ANCHOR_ROWS
+# rows of them (``runner._allocate``). Any word gives the same selection: a
+# window that misses the k-th runs the four radix passes.
+ANCHOR = True
+ANCHOR_ROWS = 64  # at least a runner's ``max_rows`` (``config.MAX_ROWS``)
+
+
+def anchor_trees(bound_max):
+    """(kind, seg, tree bound) of every tree with anchors, in slot order: the
+    candidate blocks', the columns' and a REINDEX row's (Python ints)."""
+    (full, seg), (reindex, rseg) = trees("sel", bound_max)
+    return (("blk", SEG, bound_max), ("sel", seg, full), ("sel", rseg, reindex))
+
+
+def anchor_base(bound_max, kind, seg, level):
+    """A row's first anchor word of the ``kind`` / ``seg`` tree's ``level``
+    lists (list j's at j past it); kind "merge": the split row's merge, past
+    every tree's (Python ints)."""
+    off = 0
+    for k, s, b in anchor_trees(bound_max):
+        for lv in range(top_level(k, b, s) + 1):
+            if (k, s, lv) == (kind, seg, level):
+                return off
+            off += list_slots(k, lv, b, s)
+    assert kind == "merge", (kind, seg, level)
+    return off
+
+
+def anchor_row_words(bound_max):
+    """A row's anchor words in a build for bounds up to ``bound_max``."""
+    return anchor_base(bound_max, "merge", 0, 0) + 1
+
+
+def anchor_bytes(bound_max):
+    """The anchors in front of a layer's ``isel``, whole 256-byte units (the
+    selection keeps its alignment): 0 with ANCHOR off."""
+    if not ANCHOR:
+        return 0
+    return cdiv(ANCHOR_ROWS * anchor_row_words(bound_max) * 4, 256) * 256

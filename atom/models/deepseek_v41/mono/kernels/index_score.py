@@ -336,6 +336,8 @@ def stage_ilist(
         # are done), lifted to their rows one a thread after the routine
         slot = c["sel_lds"]["hist"]
 
+        # this list's k-th of the step before (``topk.radix_select``)
+        anchor = _anchor(c, t, kind, seg, level, j)
         if const_expr(kind == "sel"):
             # a list above: written by place here (none at the top level)
             listed = (
@@ -345,13 +347,13 @@ def stage_ilist(
             )
             _select_sel(
                 c, t, j, n, per, load, got, level, seg, slots, to_final, listed,
-                col0, split,
+                col0, split, anchor,
             )  # fmt: skip
             if to_final:
                 _final_rows(c, t, slot, split, gathers)
         else:
             idents = _select_blk(
-                c, t, j, n, per, load, got, level, seg, slots, to_final, kind
+                c, t, j, n, per, load, got, level, seg, slots, to_final, kind, anchor
             )
             if final & gathers:
                 _compact(c, t, idents)
@@ -366,7 +368,7 @@ def stage_ilist(
 @traced
 def _select_sel(
     c, t, j, n, per, load, got, level, seg, slots, to_final, listed, col0=0,
-    split=None,
+    split=None, anchor=None,
 ):  # fmt: skip
     """The top-512 of a selection list's ``n`` values (``topk.radix_select``:
     keys in registers, a pass whose digit is taken whole ends the search, the
@@ -375,7 +377,7 @@ def _select_sel(
     pairs to every rank's merge instead (``_put_answer``) --, another's into
     its region ``listed`` (region, put?). A merge's columns go by place
     through ``keys`` (its inputs' own); level 0's are its segment's past the
-    share's first column ``col0``."""
+    share's first column ``col0``. ``anchor``: the list's (``_anchor``)."""
     tid = c["tid"]
     k = ip.TOPK
     keys, slot, rlds = c["sel_lds"]["keys"], c["sel_lds"]["hist"], c["sel_lds"]["hi"]
@@ -388,7 +390,7 @@ def _select_sel(
     if const_expr(level > 0):
         for d in range_constexpr(per):
             fx.ptr_store(got[d][1], keys + (base + d))
-    n_out = radix_select(rlds, tid, us, base, n, k)
+    n_out = radix_select(rlds, tid, us, base, n, k, anchor)
     for p in range_constexpr((k + THREADS - 1) // THREADS):
         place = tid + THREADS * p
         if place < k:
@@ -418,7 +420,9 @@ def _select_sel(
 
 
 @traced
-def _select_blk(c, t, j, n, per, load, got, level, seg, slots, to_final, kind):
+def _select_blk(
+    c, t, j, n, per, load, got, level, seg, slots, to_final, kind, anchor=None
+):
     """The candidate blocks' list: the top-2048 of its ``n`` block maxima
     (``topk.radix_select``, as ``_select_sel``), a place a thread out to
     ``icout`` (a final list) or the level's region. A merge's blocks go by
@@ -437,7 +441,7 @@ def _select_blk(c, t, j, n, per, load, got, level, seg, slots, to_final, kind):
     if const_expr(level > 0):
         for d in range_constexpr(per):
             fx.ptr_store(got[d][1], keys + (base + d))
-    n_out = radix_select(rlds, tid, us, base, n, k)
+    n_out = radix_select(rlds, tid, us, base, n, k, anchor)
     for p in range_constexpr(k // THREADS):
         place = tid + THREADS * p
         u, idx = radix_slot(rlds, place, n_out, k)
@@ -481,6 +485,19 @@ def _compact(c, t, idents):
         place = tid + THREADS * p
         for h in range_constexpr(2):
             st_dev(pair[h], a["ilog"], base + place * TILE + 4 * h)
+
+
+def _anchor(c, t, kind, seg, level, j=0):
+    """List j of ``level`` of token t's ``kind`` / ``seg`` tree's anchor
+    (kind "merge": its split row's merge), (pointer, word): the anchors in
+    front of the layer's ``isel`` (``index_plan.anchor_base``, laid out for the
+    build's bound, ``run_indexer``); None with ``index_plan.ANCHOR`` off."""
+    if const_expr(not ip.ANCHOR):
+        return None
+    bound_max = c["anchor_bound"]
+    row = ip.anchor_row_words(bound_max)
+    ptr = c["args"]["isel"] - fx.Int64(ip.anchor_bytes(bound_max))
+    return ptr, t * row + ip.anchor_base(bound_max, kind, seg, level) + j
 
 
 def _icrdy(c):
@@ -689,6 +706,7 @@ def run_indexer(c, s, bid, bound_max):
     before this launch: plain loads."""
     a = c["args"]
     max_chunks = ip.chunks(bound_max)
+    c["anchor_bound"] = bound_max  # ``_anchor``'s layout
     t0, n = _own_rows(c, s)
     # the FP4 scorer reads its rows' bounds itself: the trees' are loaded past
     # it, none held through its walk
@@ -876,6 +894,9 @@ def stage_imerge(c, t):
     def load(q, i):
         return [got[4 * q + e][0] for e in range(4)]
 
-    _select_sel(c, t, 0, fx.Int32(n), per, load, got, 1, ip.SEG, 0, True, None)
+    _select_sel(
+        c, t, 0, fx.Int32(n), per, load, got, 1, ip.SEG, 0, True, None, 0, None,
+        _anchor(c, t, "merge", 0, 0),
+    )  # fmt: skip
     _final_rows_of(c, t, c["sel_lds"]["hist"])
     _publish_all(c, "irdy", t)

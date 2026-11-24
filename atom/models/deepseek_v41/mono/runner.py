@@ -929,10 +929,19 @@ class V41MonoDecodeRunner:
         width = self.index_bound_max
         self.ilog = torch.empty(s, width, device=dev, dtype=f32)
         self.ibmax = torch.empty(s, ip.blocks(width), device=dev, dtype=f32)
-        self.isel = {
-            layer: torch.empty(s, ip.TOPK, device=dev, dtype=torch.int32)
-            for layer in self.selecting
-        }
+        # each selecting layer's lists' anchors in front of its selection
+        # (``index_plan.anchor_bytes``, read and written by its K2a's selects
+        # step after step; zero: a first step's windows miss)
+        assert s <= ip.ANCHOR_ROWS, (s, ip.ANCHOR_ROWS)
+        anchor_words = ip.anchor_bytes(width) // 4
+
+        def selection():
+            words = torch.zeros(
+                anchor_words + s * ip.TOPK, device=dev, dtype=torch.int32
+            )
+            return words[anchor_words:].view(s, ip.TOPK)
+
+        self.isel = {layer: selection() for layer in self.selecting}
         self.no_bound = torch.zeros(s, device=dev, dtype=torch.int32)
         # the FP4 score stage's FULL-layer tasks a ratio, then each row's share
         # (``index_plan.fill_shares``), each step's written by ``write_step_meta``
