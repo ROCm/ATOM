@@ -367,17 +367,12 @@ class DeepSeekV41ShareCacheCellsTest(unittest.TestCase):
         }
         return self.router_args(cell, **exports)
 
-    def test_cells_warm_each_lane_with_its_snapshot_primers_alone(self):
+    def test_cells_run_the_recipes_scenario_and_warmup(self):
         for cell in self.cells:
             with self.subTest(cell=cell["name"]):
                 exports = self.submitted_exports(cell)
                 self.assertEqual(exports["AIPERF_SCENARIO"], "inferencex-agentx-mvp")
-                self.assertEqual(exports["AIPERF_WARMUP_REQUESTS_PER_LANE"], "0")
-        script = (SCRIPTS / "pd_server_atom.sh").read_text()
-        self.assertIn('if [[ "${AIPERF_WARMUP_REQUESTS_PER_LANE}" != "0" ]]; then', script)
-        self.assertNotIn(
-            '--warmup-requests-per-lane "${AIPERF_WARMUP_REQUESTS_PER_LANE}" \\', script
-        )
+                self.assertEqual(exports["AIPERF_WARMUP_REQUESTS_PER_LANE"], "10")
 
     def test_every_mooncake_process_runs_the_recipes_settings_on_the_lossless_class(
         self,
