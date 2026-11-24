@@ -10,6 +10,7 @@ case "${case_name}" in
   tp4-baseline) contract_file=single-node-tp4-baseline.json; budget=120m ;;
   pp4-dep4) contract_file=single-node-pp4-dep4-functional.json; budget=90m ;;
   pp4-dep4-perf) contract_file=single-node-pp4-dep4-performance.json; budget=120m ;;
+  pp4-dep4-remap) contract_file=single-node-pp4-dep4-remap-performance.json; budget=120m ;;
   *) exit 2 ;;
 esac
 export REPO_ROOT="${3:?checkout path}"

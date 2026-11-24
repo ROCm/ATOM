@@ -1,0 +1,66 @@
+{
+  "lease": "L16d1ca",
+  "node": "pit2-p03-g27",
+  "harness_sha": "be628200bfc8c33f8f024327ce7b51bd1aea9417",
+  "worker_image": "vllm/vllm-openai-rocm:minimax-m31-flash-75bc8cf1@sha256:f8e8ab239e5edb7c3070c5802fc7fc0cbb889513bf81183dfc98ce1c77e1dfe1",
+  "srt_sha": "85ecf60ac3931f38abdb0dd82f909f35057d5e12",
+  "router_sha": "69ed5e77bcc93b9d51cb5cf1528badd0e703ed93",
+  "exit_codes": {
+    "pool-workload.rc": 1,
+    "pool-exit.rc": 1,
+    "gpool-release.rc": 0
+  },
+  "requested_duration_s": 3600,
+  "concurrency": 40,
+  "raw_record_counts": {
+    "warmup:error": 444,
+    "profiling:error": 40
+  },
+  "transfer_failure_log_events": 324,
+  "failure_events_by_pp_rank": {
+    "3": 324
+  },
+  "failure_events_by_physical_gpu_from_mask": {
+    "3": 324
+  },
+  "failure_events_by_peer": {
+    "consumer-peer-1": 74,
+    "consumer-peer-2": 97,
+    "consumer-peer-3": 71,
+    "consumer-peer-4": 82
+  },
+  "first_failed_batch": {
+    "pp_rank": 3,
+    "peer": "consumer-peer-1",
+    "return_code": -1,
+    "elapsed_s": 36.2686656517908,
+    "descriptors": 140,
+    "bytes": 6268416000
+  },
+  "failed_batch_elapsed_s": {
+    "min": 30.005792091600597,
+    "median": 31.175685867201537,
+    "max": 47.591722482815385
+  },
+  "failed_batch_bytes_range": [
+    5698560,
+    17581957120
+  ],
+  "performance_valid": false,
+  "sa_interactivity": null,
+  "sa_token_throughput_per_chip": null,
+  "root_cause": "Unresolved. Failure localized to synchronous Mooncake writes from PP3 in the original mapping; no hardware-fault or router-fault conclusion.",
+  "raw_record_sha256": "7ee710f9eedf4489aeff9d1e44ccd8a3cc87ffd322b9a500234602c5ad18c504",
+  "prefill_log_sha256": "e90ff2cba71b8b488daf745b54c14eaf563dfbcc76884da1d2f1239d048d0f7a",
+  "protocol_probe": {
+    "passed": true,
+    "requests": 5,
+    "transferred_bytes": 101376000.0
+  },
+  "archive_sha256": "68aaf381e650d388fd1d0936bdc5e97657bd45cd07b4783d0da5f8602366fa05",
+  "warmup_elapsed_s": 1115.21,
+  "profiling_send_duration_s": 163.021,
+  "cleanup": "Normal release succeeded; final task-container query empty; gpool mine empty",
+  "next_experiment": "Same g27 and all load/worker parameters, exchange P PP2/PP3 device mapping only; observe role versus physical-path dependence",
+  "peer_labels": "Anonymized endpoint labels, not DP rank numbers; all four decode ranks reported receive failures"
+}

@@ -1,9 +1,16 @@
 import copy
 import json
+import os
+import shutil
+import subprocess
 import unittest
 from pathlib import Path
 
-from pd_srt_functional import verified_router_image
+from pd_srt_functional import (
+    configurations,
+    prefill_remap_preamble,
+    verified_router_image,
+)
 
 CONTRACT = json.loads(
     (
@@ -14,6 +21,60 @@ CONTRACT = json.loads(
 
 
 class RouterBuildTest(unittest.TestCase):
+    def device_config(self, order):
+        return configurations(
+            CONTRACT | {"prefill_device_order": order},
+            "/model",
+            Path("/run"),
+            Path("/experiment"),
+            {
+                "host-ip": "10.0.0.1",
+                "socket-ifname": "eth0",
+                "rdma-devices": "ionic_0",
+                "rdma-gid-index": "1",
+                "rdma-tc": "104",
+            },
+            "1000:1000",
+            "sha256:" + "b" * 64,
+        )
+
+    def test_prefill_device_order_cannot_escape_its_gpu_allocation(self):
+        for order in (
+            [],
+            [0, 1, 2, 4],
+            [0, 1, 1, 3],
+            [False, 1, 2, 3],
+            "0,1,3,2",
+            None,
+        ):
+            with self.subTest(order=order), self.assertRaises(ValueError):
+                self.device_config(order)
+
+    @unittest.skipUnless(
+        shutil.which("bash"), "bash is required for the launch preamble"
+    )
+    def test_prefill_remap_preserves_decode_and_nonworker_masks(self):
+        recipe, _cluster = self.device_config([0, 1, 3, 2])
+        self.assertTrue(recipe["engine"]["set_visible_devices"])
+        for mask, expected in (
+            ("0,1,2,3", "0,1,3,2"),
+            ("4,5,6,7", "4,5,6,7"),
+            (None, "unset"),
+        ):
+            env = dict(os.environ)
+            if mask is None:
+                env.pop("HIP_VISIBLE_DEVICES", None)
+            else:
+                env["HIP_VISIBLE_DEVICES"] = mask
+            command = (
+                prefill_remap_preamble([0, 1, 3, 2])
+                + '; printf "\\n%s\\n" "${HIP_VISIBLE_DEVICES-unset}"'
+            )
+            output = subprocess.check_output(
+                [shutil.which("bash"), "-c", command], env=env, text=True
+            )
+            self.assertEqual(output.strip().splitlines()[-1], expected)
+
     def test_baseline_requires_its_own_image_and_version_evidence(self):
         contract = CONTRACT | {
             "router_arm": "baseline",

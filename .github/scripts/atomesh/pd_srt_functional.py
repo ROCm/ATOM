@@ -12,6 +12,23 @@ from pathlib import Path
 import yaml
 
 
+def prefill_remap_preamble(order):
+    if (
+        not isinstance(order, list)
+        or len(order) != 4
+        or any(type(i) is not int for i in order)
+        or sorted(order) != [0, 1, 2, 3]
+    ):
+        raise ValueError("Prefill device order must permute its allocated GPUs 0-3")
+    mask = ",".join(map(str, order))
+    return (
+        'if [ "${HIP_VISIBLE_DEVICES:-}" = "0,1,2,3" ]; then\n'
+        f"  export HIP_VISIBLE_DEVICES={mask}\n"
+        '  printf "[PP-DEVICE-PROBE] HIP_VISIBLE_DEVICES=%s\\n" "$HIP_VISIBLE_DEVICES"\n'
+        "fi"
+    )
+
+
 def configurations(
     contract, model_path, run_dir, experiment_dir, fabric, uid, router_image
 ):
@@ -111,6 +128,8 @@ def configurations(
     }
     cluster["default_mounts"] = {str(run_dir / "bin"): "/opt/atomesh-ci-bin"}
     cluster["default_bash_preamble"] = "export PATH=/opt/atomesh-ci-bin:$PATH"
+    if "prefill_device_order" in contract:
+        prefill_remap_preamble(contract["prefill_device_order"])
     # Match the existing Spur container's writable cache paths for its required UID.
     cache = f"/tmp/atomesh-cache-{run_dir.name}"
     container_env = {
@@ -213,6 +232,16 @@ def main():
         args.uid,
         router_image,
     )
+    if "prefill_device_order" in contract:
+        # Run after srt exports its managed mask; the cluster preamble runs earlier.
+        wrapper = args.run_dir / "bin/vllm"
+        wrapper.parent.mkdir(exist_ok=True)
+        wrapper.write_text(
+            "#!/usr/bin/env bash\nset -euo pipefail\n"
+            + prefill_remap_preamble(contract["prefill_device_order"])
+            + '\nexec /usr/local/bin/vllm "$@"\n'
+        )
+        wrapper.chmod(0o755)
     (args.run_dir / "recipe.yaml").write_text(yaml.safe_dump(recipe, sort_keys=False))
     (args.run_dir / "srtslurm.yaml").write_text(
         yaml.safe_dump(cluster, sort_keys=False)
