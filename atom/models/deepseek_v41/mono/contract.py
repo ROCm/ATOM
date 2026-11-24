@@ -61,6 +61,10 @@ def k1_regions(key: k1.AttnPreBuild) -> list[RegionDecl]:
         # X8 goes to wqkv_a by a flag a token (``attn_pre.put_x8``)
         RegionDecl("x8f", S, "k1.norm"),
     ]
+    if key.slice_x8:
+        # an ordinary sharded layer's slices put wqkv_a's x8 into every rank's
+        # X8G (``attn_pre.slice_direct_pair``); the norm stage does not run
+        regions += [RegionDecl("x8g", P, "k1.slice")]
     if key.tok_par:
         # every rank's q latent and window rows, gathered in the peer buffer
         regions += [

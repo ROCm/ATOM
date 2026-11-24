@@ -51,6 +51,10 @@ def peer_layout(tokens: int, d: Dims) -> dict[str, tuple[int, int]]:
             ("lssqg", tokens * slices),
             ("pmixg", slices * tokens * SLICE_PART),
             ("pmixgf", slices * tokens * SLICE_PART),
+            # an ordinary layer's seam A (``AttnPreBuild.slice_x8``): every
+            # rank's slices' MXFP8 words of x (bf16(x w), no rstd), each word's
+            # tag carrying its 32 columns' E8M0 code (``Mailbox.put_coded``)
+            ("x8g", tokens * HIDDEN // 4),
             ("ffn", d.ranks * row),
             ("xg", row),
             ("qg", tokens * Q_RANK // 4),

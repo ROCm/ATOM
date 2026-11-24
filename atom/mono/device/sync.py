@@ -238,6 +238,56 @@ class Mailbox:
         at = _word(a, i, len(words))
         self._store(a, at, fx.Vector.from_elements(vals, fx.Int32))
 
+    def put_coded(self, a, i, word, code):
+        """Raw 32-bit ``word`` at pair i as (word, tag | code << 16): a 16-bit
+        ``code`` in the tag's high half, taken with the word by one
+        ``poll_coded`` (no second pair, no second wait). The tag must fit 16
+        bits: a layer's (``layer + 1``), not a launch counter's."""
+        vals = [fx.Int32(word), fx.Int32(self.tag) | (code << 16)]
+        self._store(a, _word(a, i, 1), fx.Vector.from_elements(vals, fx.Int32))
+
+    def poll_coded(self, specs):
+        """``poll`` of ``specs`` in one batch, pairs ``put_coded`` stored: stale
+        while any tag's low half is not this launch's tag. -> each spec's values
+        and its first pair's code. The stale test ORs every tag's XOR with the
+        launch's in VGPRs and compares once (``poll``'s compare a tag, a lane
+        mask each, would hold a large batch's SGPRs)."""
+        cms = [_SCOPE_CM[a.space] for a, _, _ in specs]
+        bases = [_noted(a, "poll") for a, _, _ in specs]
+        tag = self.tag
+
+        def load_all():
+            words = []
+            for b, cm, (a, i, n) in zip(bases, cms, specs):
+                w = fx.Vector(
+                    bo.buffer_load(
+                        rsrc(b),
+                        _pair_word(a, i, n),
+                        vec_width=2 * n,
+                        dtype=T.i32,
+                        cache_modifier=cm,
+                    )
+                )
+                words += [w[e] for e in range(2 * n)]
+            return fx.Vector.from_elements(words, fx.Int32)
+
+        nw = sum(2 * n for _, _, n in specs)
+
+        def pending(v):
+            acc = v[1] ^ tag
+            for e in range_constexpr(3, nw, 2):
+                acc = acc | (v[e] ^ tag)
+            return (acc & 0xFFFF) != 0
+
+        first = specs[0][1]
+        first = first.q * 2 if isinstance(first, Quad) else first
+        v = self.spin(specs[0][0], first, load_all, pending)
+        outs, e = [], 0
+        for _, _, n in specs:
+            outs.append(([v[e + 2 * q] for q in range(n)], v[e + 1] >> 16))
+            e += 2 * n
+        return outs
+
     def spin(self, a, index, load_all, pending):
         """Re-issue ``load_all`` until ``pending`` clears: a wait in region
         ``a`` (its word ``index``), bounded and named in a debug build's

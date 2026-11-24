@@ -11,7 +11,9 @@ token-parallel build, below):
     slice   (160, 32 hidden columns x 4 streams each): the owed post folded into
             the residual (R_new, bf16 out), the collapsed layer input (mailbox
             LIN) and the partial mix projection / sum of squares (mailbox PMIX)
-    norm    (S): attn_norm of LIN -> bf16, then quantize_fp8 of it (mailbox X8)
+    norm    (S): attn_norm of LIN -> bf16, then quantize_fp8 of it (mailbox X8);
+            none in an ordinary sharded layer (``AttnPreBuild.slice_x8``),
+            whose slices quantize x for wqkv_a themselves
     wqkv_a  (112, 16 rows): FP8 GEMV -> the q latent | kv row (mailbox QKV)
     gate    (S): the 160 partials -> post / comb (Sinkhorn) and the next pre:
             the next seam's, so after the stages a CTA may hold with it
@@ -113,6 +115,7 @@ from atom.mono.device.ops import (
     launcher,
     ld_f32,
     ld_i32,
+    load_ptr64,
     rows_to_lds_together,
     rsrc,
     traced,
@@ -165,6 +168,11 @@ QX8_WORDS = Q_RANK // 4
 GATE0 = SLICES
 NORM0 = GATE0 + 8
 WQKV0 = NORM0 + 8
+# a ``slice_x8`` build's: no norm runs, so its gate blocks go onto slice CTAs
+# from SLICE_X8_GB0 (each after its slice) and wqkv_a's tasks start at GATE0 --
+# q's 96 on the CTAs no slice holds, kv's 16 on slice CTAs 0 .. 15 (their
+# weights out only past the slice; kv_norm's path is not wq_b's)
+SLICE_X8_GB0 = 16
 QKV0 = (WQKV0 + WQKV_TASKS) % BLOCKS
 # kv_norm's tokens on CTAs of their own, apart from q_norm's: in the
 # layer kernel between the scores' CTAs and wq_b's (``WQB_LAYER0``)
@@ -275,6 +283,17 @@ class AttnPreBuild:
     # residual; the seam writes the streams to ``res_out`` (no expanded copy
     # before the launch)
     embed_in: bool = False
+
+    @property
+    def slice_x8(self) -> bool:
+        """An ordinary sharded layer (it folds, feeds no indexer, takes no
+        embedding): seam A's slices hand wqkv_a its x themselves, as TK's QKV
+        takes it -- bf16(bf16(LIN) w) without the attention rstd (q_norm and
+        kv_norm cancel the row's scale), MXFP8 over a slice's 32 columns, each
+        word to its destination rank's X8G with its code in its tag
+        (``slice_direct_pair``, ``load_slice_x8``). No norm stage, no LIN /
+        LSSQ pushes, no X8 flag: wqkv_a waits on the words themselves."""
+        return self.shard and self.fold and not self.feeds_index and not self.embed_in
 
     def __post_init__(self):
         assert not (self.shard and self.tok_par), "a seam is sharded by columns or rows"
@@ -545,14 +564,19 @@ def slice_direct_loads(c, c0, q):
 
 
 @traced
-def slice_direct_pair(c, task, q, got):
+def slice_direct_pair(c, task, q, got, wn0=None):
     """``slice_row`` and ``slice_input`` of thread q's streams of its group's
     (row, 2 columns), from ``slice_direct_loads``' values: its streams' R_new
     (out, and into LDS ``rl`` for the norm's squares and the mixes); on the
     group's first lane, from the others' products, the layer input, its
     squares' sum over the row's 16 groups -> LSSQ, the drafter's tap. The same
-    operations in the same order."""
+    operations in the same order. A ``slice_x8`` build quantizes the layer
+    input for wqkv_a instead of putting LIN and LSSQ (its norm weights ``wn0``,
+    loaded with the slice's first loads)."""
     s, a, rl = c["S"], c["args"], c["rl"]
+    # read here, not in the region below: a method call on ``c`` there would
+    # make the rewriter carry ``c`` as the if's state
+    slice_x8 = c.get("slice_x8", False)
     split = slice_split(s)
     own = HC // split
     c0 = task * COLS
@@ -604,8 +628,34 @@ def slice_direct_pair(c, task, q, got):
         # even pair's first lane puts the 4 columns, one 16-byte put (a quad:
         # an even pair's column a multiple of 4)
         nxt = [xshfl(v, split) for v in outs]
+        if const_expr(slice_x8):
+            # x as wqkv_a takes it: bf16(LIN w), no rstd; the group's 32
+            # columns' amax (the squares' strides) -> ATOM's quantize_fp8 code
+            wn = (
+                wn0
+                if wn0 is not None
+                else [ld_bf(a["attn_w"], col + d) for d in range(2)]
+            )
+            yn = [bf16_round(ys[d] * wn[d]) for d in range(2)]
+            am = butterfly(
+                fx.max(abs(yn[0]), abs(yn[1])),
+                tuple(split * k for k in (1, 2, 4, 8)), fx.max,
+            )  # fmt: skip
+            code = code_ceil(
+                fx.max(am, fx.Float32(AMAX_FLOOR)) * fx.Float32(1.0 / FP8_MAX)
+            )
+            inv = rcp_pow2(code)
+            f8 = [clamp_fp8(yn[d] * inv) for d in range(2)]
+            f8n = [xshfl(v, split) for v in f8]
+            word = fp8_pack4(f8[0], f8[1], f8n[0], f8n[1])
         if (g == 0) & (p % 2 == 0):
-            put_out(c, "put_bf", "lin", Quad((t * HIDDEN + col) // 4), outs + nxt)
+            if const_expr(slice_x8):
+                # the 4 columns' word, its group's code in its tag
+                c["put_coded"](
+                    c["x8_dst"], c["x8g_pair0"] + t * X8_WORDS + col // 4, word, code
+                )
+            else:
+                put_out(c, "put_bf", "lin", Quad((t * HIDDEN + col) // 4), outs + nxt)
         if g == 0:
             for d in range_constexpr(len(taps)):
                 bo.buffer_store(
@@ -613,8 +663,9 @@ def slice_direct_pair(c, task, q, got):
                     rsrc(a["aux"]),
                     t * HIDDEN + col + d,
                 )
-        if q % (COLS // 2 * split) == 0:
-            put_out(c, "put", "lssq", t * SLICES + task, sq)
+        if const_expr(not slice_x8):  # noqa: SIM102
+            if q % (COLS // 2 * split) == 0:
+                put_out(c, "put", "lssq", t * SLICES + task, sq)
 
 
 def slice_at(c0, e):
@@ -722,8 +773,21 @@ def stage_slice(c, task, pre=None):
     first loads, already issued (``slice_prefetch``)."""
     s, tid = c["S"], c["tid"]
     c0 = task * COLS
-    fns, rows = slice_issued(c, task, pre)
     direct = slice_direct(c)
+    slice_x8 = c.get("slice_x8", False)
+    wns = None
+    if const_expr(slice_x8 and direct):
+        # the norm weights of each round's columns, which no wait decides, out
+        # before the slice's own loads: at the quantization they were a load
+        # on every slice's path
+        last0 = slice_direct_threads(s) - 1
+        split0 = slice_split(s)
+        wns = []
+        for r in range_constexpr(slice_direct_rounds(s)):
+            q = fx.min(plus(tid, THREADS * r), last0)
+            col = c0 + 2 * (q // split0 % (COLS // 2))
+            wns.append([ld_bf(c["args"]["attn_w"], col + d) for d in range(2)])
+    fns, rows = slice_issued(c, task, pre)
     if const_expr(direct):
         # every round's loads first, then each round's fold
         last = slice_direct_threads(s) - 1
@@ -733,7 +797,8 @@ def stage_slice(c, task, pre=None):
             for r in range(slice_direct_rounds(s))
         ]  # fmt: skip
         for r in range_constexpr(len(got)):
-            slice_direct_pair(c, task, plus(tid, THREADS * r), got[r])
+            slice_direct_pair(c, task, plus(tid, THREADS * r), got[r],
+                              None if wns is None else wns[r])  # fmt: skip
     else:
         batched_rounds(
             tid, s * KT, lambda e: slice_loads(c, c0, e),
@@ -1403,8 +1468,19 @@ def load_x8(c, words_mb, codes_mb, words, groups, xl, xsl, t0=0, n=None):
     gpu.barrier()
 
 
-@traced
 def load_seam_x8(c, t0=0, n=None):
+    """Tokens t0 .. t0 + n's x8 rows into LDS ``xl`` / ``xsl``: the seam
+    norm's (``_load_seam_x8``), or a ``slice_x8`` build's slices' words
+    (``load_slice_x8``)."""
+    if c.get("slice_x8", False):
+        n2 = c["S"] if n is None else n
+        load_slice_x8(c, t0, n2, n2 if isinstance(n2, int) else TILE)
+    else:
+        _load_seam_x8(c, t0, n)
+
+
+@traced
+def _load_seam_x8(c, t0=0, n=None):
     """The seam's normed rows (X8 / X8S: ``stage_norm``) of tokens t0 .. t0 + n
     into LDS ``xl`` / ``xsl`` as ``load_x8`` lays them: their flags (X8F)
     polled, then the plain words; ``n`` traced (a tile a CTA picks at run
@@ -1432,6 +1508,39 @@ def load_seam_x8(c, t0=0, n=None):
         ],
     )
     gpu.barrier()
+
+
+def load_slice_x8(c, t0, n, rows):
+    """A ``slice_x8`` build's x8: tokens t0 .. t0 + n's words from this rank's
+    X8G (every rank's slices put them, ``slice_direct_pair``) into LDS ``xl``,
+    and each 32 columns' code from its words' tags into ``xsl``: one poll of
+    every thread's quads (one batch at 6 rows), no flag and no second round
+    trip for the codes."""
+    tid, groups = c["tid"], HIDDEN // 32
+    nq = rows * X8_WORDS // 2
+    qs = [tid + THREADS * i for i in range(-(-nq // THREADS))]
+    specs = []
+    for e in qs:
+        e = fx.min(e, nq - 1)
+        r, w = e // (X8_WORDS // 2), e % (X8_WORDS // 2) * 2
+        tok = fx.min(plus(t0, fx.min(r, n - 1)), c["S"] - 1)
+        specs.append((c["x8g"], Quad((c["x8g_pair0"] + tok * X8_WORDS + w) // 2), 2))
+    got = c["poll_coded"](specs)
+    for i, e in enumerate(qs):
+        r, w = e // (X8_WORDS // 2), e % (X8_WORDS // 2) * 2
+        vals, code = got[i]
+        _store_if(e < nq, fx.Vector.from_elements(vals, fx.Int32),
+                  c["xl"] + (r * lds_row(X8_WORDS) + w))  # fmt: skip
+        # a group's 8 words: its first quad's thread lands the code
+        _store_if((e < nq) & (e % 4 == 0), code,
+                  c["xsl"] + (r * lds_row(groups) + w // 8))  # fmt: skip
+    gpu.barrier()
+
+
+@traced
+def _store_if(live, v, at):
+    if live:
+        fx.ptr_store(v, at)
 
 
 @traced
@@ -2062,6 +2171,7 @@ def run_attn_pre(
     own_tiles, own_rows_lds = token_tiles(own_n), tile_rows(own_n)
     wqb_per_cta = dims.wqb_tasks // BLOCKS
     fused = c["fused"]
+    slice_x8 = c.get("slice_x8", False)
     enter_stage("k1.slice")
     # a sharded seam (the layer kernel): this rank's quarter of the slices,
     # the same tasks its seam F runs (their SDONE local)
@@ -2077,6 +2187,10 @@ def run_attn_pre(
         assert units <= BLOCKS
         unit = first_task(bid, 0)
         c["dst"] = unit // own
+        if const_expr(slice_x8):
+            # the destination rank's X8G, once a task (not every rank's held
+            # through the fold: SGPRs)
+            c["x8_dst"] = preg(load_ptr64(c["x8_peers"], c["dst"]), 0, "x8g")
         task = c["rank"] * own + unit % own
         if unit < units:
             stage_slice(co, task)
@@ -2095,7 +2209,9 @@ def run_attn_pre(
         # this rank's gate blocks, on the CTAs past its slices'
         enter_stage("k1.gate_block")
         blocks = own // shard_gate_block(dims.tp)
-        for unit in range(first_task(bid, units), blocks, BLOCKS):
+        for unit in range(
+            first_task(bid, SLICE_X8_GB0 if slice_x8 else units), blocks, BLOCKS
+        ):
             stage_gate_block(c, c["rank"] * blocks + unit)
     stamp(timeline, tls, tid, tl0 + 1)
     # the gate's outputs are the next seam's: it runs after the stages
@@ -2103,7 +2219,9 @@ def run_attn_pre(
     enter_stage("k1.norm")
     # past the slices' CTAs and a sharded seam's gate blocks (``units`` ..)
     busy = units + (own // shard_gate_block(dims.tp) if shard else 0)
-    for t in range(first_task(bid, norm0(own_n, busy)), own_n, BLOCKS):
+    for t in range(
+        first_task(bid, norm0(own_n, busy)), 0 if slice_x8 else own_n, BLOCKS
+    ):
         stage_norm(co, t)
     stamp(timeline, tls, tid, tl0 + 2)
     if const_expr(after_norm is not None):
@@ -2113,7 +2231,7 @@ def run_attn_pre(
     # normed row's wait
     assert WQKV_TASKS <= BLOCKS
     if const_expr(len(own_tiles) == 1):
-        wqkv_task = first_task(bid, WQKV0)
+        wqkv_task = first_task(bid, GATE0 if slice_x8 else WQKV0)
         if wqkv_task < WQKV_TASKS:
             wqkv_ops = gemv_fp8_loads(co, a["wqkv"], a["wqkv_s"], HIDDEN, wqkv_task)
             load_seam_x8(co, 0, own_rows_lds)
@@ -2307,6 +2425,7 @@ def attn_pre_context(key, lds, mb, layout, scratch, args, rank, sym, peers):
         "rl": sl.rl.ptr, "fl": sl.fl.ptr, "red": wl.red.ptr,
         "xl": wl.xl.ptr, "xsl": wl.xsl.ptr, "qxl": wl.qxl.ptr, "qxsl": wl.qxsl.ptr,
         "put": mb.put, "put_bf": mb.put_bf, "put_words": mb.put_words, "poll": mb.poll,
+        "put_coded": mb.put_coded, "poll_coded": mb.poll_coded,
         "fan": {}, "shard_f": False, "dst": None,  # outputs put locally (``put_out``)
         "args": args,
         "fold": key.fold, "index": key.feeds_index, "aux": key.aux, "ffn": False,
@@ -2320,6 +2439,14 @@ def attn_pre_context(key, lds, mb, layout, scratch, args, rank, sym, peers):
     if const_expr(key.shard):
         peer = peer_offsets(s, dims)
         shard_seam(c, peer, peer_bases(peers, key.tp), sym, key.tp, "pmixg")
+        if const_expr(key.slice_x8):
+            c["slice_x8"] = True
+            c["x8_peers"] = peers
+            assert peer["x8g"] % 16 == 0
+            # X8G a pair index from the peer buffer's base: one buffer resource
+            # (SGPRs) for this rank's polls and a destination's puts
+            c["x8g_pair0"] = peer["x8g"] // 8
+            c["x8g"] = preg(sym, 0, "x8g")
     if const_expr(not key.tok_par):
         return c, c
     bases = peer_bases(peers, key.tp)
