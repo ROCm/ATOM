@@ -373,7 +373,9 @@ async fn split_reasoning(
     let Some(mut parser) = create_reasoning_parser(factory, configured, model) else {
         return Ok(ParserResult::normal(text.to_string()));
     };
-    let (mut normal, mut reasoning, mut entered) = (String::new(), String::new(), false);
+    // A parser that starts inside reasoning (deepseek_r1) has entered it before any piece.
+    let entered = parser.is_in_reasoning();
+    let (mut normal, mut reasoning, mut entered) = (String::new(), String::new(), entered);
     for piece in opener.into_iter().chain(pieces.iter().map(String::as_str)) {
         let result = parser
             .parse_reasoning_streaming_incremental(piece)
@@ -552,11 +554,26 @@ mod split_reasoning_tests {
     }
 
     async fn split(parts: &[&str], opener: Option<&str>) -> ParserResult {
+        split_by("qwen3", parts, opener).await
+    }
+
+    async fn split_by(parser: &str, parts: &[&str], opener: Option<&str>) -> ParserResult {
         let factory = ReasoningParserFactory::new();
         let text = parts.concat();
-        split_reasoning(&factory, Some("qwen3"), "m", &pieces(parts), &text, opener)
+        split_reasoning(&factory, Some(parser), "m", &pieces(parts), &text, opener)
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_long_reply_closing_an_empty_implicit_reasoning_block_drops_the_marker() {
+        // deepseek_r1 starts inside reasoning: its first piece closes an empty block.
+        for len in [100, ONE_SHOT_MAX_BYTES + 1000] {
+            let answer = "a".repeat(len);
+            let result = split_by("deepseek_r1", &["</think>", &answer], None).await;
+            assert!(result.reasoning_text.is_empty(), "len {len}");
+            assert_eq!(result.normal_text, answer, "len {len}");
+        }
     }
 
     #[tokio::test]
