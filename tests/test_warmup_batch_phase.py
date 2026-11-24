@@ -17,6 +17,8 @@ def test_warmup_batch_is_a_prefill(monkeypatch, max_model_len, warmup_tokens):
         max_model_len=max_model_len,
         max_num_seqs=256,
         enable_dp_attention=True,
+        pipeline_parallel_size=1,
+        speculative_config=None,
     )
     runner.block_size = 16
     runner.label = "test"

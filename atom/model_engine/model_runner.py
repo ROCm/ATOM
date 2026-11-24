@@ -1558,34 +1558,43 @@ class ModelRunner:
                 f"Using {num_seqs} seq(s) with length {seq_len} for warmup."
             )
 
-        seqs = [
-            Sequence(
-                [0] * seq_len,
-                block_size=self.block_size,
+        def dummy_batch():
+            seqs = [
+                Sequence(
+                    [0] * seq_len,
+                    block_size=self.block_size,
+                )
+                for _ in range(num_seqs)
+            ]
+            for seq in seqs:
+                seq.type = SequenceType.PREFILL
+            seqs = {seq.id: seq for seq in seqs}
+
+            num_scheduled_tokens = np.array([seq_len] * num_seqs, dtype=np.int32)
+            total_tokens_num = int(num_scheduled_tokens.sum())
+            return ScheduledBatch(
+                seqs=seqs,
+                num_scheduled_tokens=num_scheduled_tokens,
+                total_tokens_num=total_tokens_num,
+                total_tokens_num_prefill=total_tokens_num,
+                total_seqs_num=num_seqs,
+                total_seqs_num_prefill=num_seqs,
+                is_dummy_run=True,
             )
-            for _ in range(num_seqs)
-        ]
-        for seq in seqs:
-            seq.type = SequenceType.PREFILL
-        seqs = {seq.id: seq for seq in seqs}
 
-        num_scheduled_tokens = np.array([seq_len] * num_seqs, dtype=np.int32)
-        total_tokens_num = int(num_scheduled_tokens.sum())
-
-        dummy_batch = ScheduledBatch(
-            seqs=seqs,
-            num_scheduled_tokens=num_scheduled_tokens,
-            total_tokens_num=total_tokens_num,
-            total_tokens_num_prefill=total_tokens_num,
-            total_seqs_num=num_seqs,
-            total_seqs_num_prefill=num_seqs,
-            is_dummy_run=True,
-        )
-        self.forward(dummy_batch)
+        # Under PP a stage's send of step N (the hidden states, residual and
+        # relayed aux it hands the next stage) stays in flight through step
+        # N+1's forward: it is committed only when N+1 sends. One warmup
+        # forward never has an earlier send pending, so the peak that sizes
+        # the KV cache missed that payload (1.5 GB on M3.1 PP4's stage 2).
+        # A second forward runs with the first one's send in flight. Every
+        # stage runs both, so the sends and receives still pair up.
+        for _ in range(2 if self.config.pipeline_parallel_size > 1 else 1):
+            self.forward(dummy_batch())
         self.tokenID_processor.clean()
         torch.cuda.empty_cache()
         logger.info(
-            f"{self.label}: warmup_model {time.time() - start_time:.2f} seconds with {num_seqs} reqs {total_tokens_num} tokens"
+            f"{self.label}: warmup_model {time.time() - start_time:.2f} seconds with {num_seqs} reqs {num_seqs * seq_len} tokens"
         )
 
     def profile_dynamic_chunking(self):
