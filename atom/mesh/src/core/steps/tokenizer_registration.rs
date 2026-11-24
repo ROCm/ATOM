@@ -277,8 +277,9 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
 
 /// One model, one template across its live workers. An ATOM worker registering at
 /// `urls` whose template (`file`, else `inline`) differs from the one model `name`'s
-/// tokenizer carries is refused while another worker of the model is registered;
-/// changing it is a redeploy. With none, that tokenizer is dropped and loads afresh.
+/// tokenizer carries, or while that loads its registered workers serve, is refused while
+/// another worker of the model is registered; changing it is a redeploy. With none,
+/// that tokenizer is dropped and loads afresh.
 pub(crate) fn admit_model_template(
     app_context: &AppContext,
     name: &str,
@@ -286,22 +287,28 @@ pub(crate) fn admit_model_template(
     file: Option<&str>,
     inline: Option<&str>,
 ) -> Result<(), String> {
-    let Some(entry) = app_context.tokenizer_registry.get_by_name(name) else {
-        return Ok(());
-    };
-    if loaded_template(app_context, &entry.id) == Some(template_fingerprint(file, inline)) {
-        return Ok(());
-    }
+    let template = template_fingerprint(file, inline);
     let registered = app_context.worker_registry.get_by_model(name);
-    if registered
-        .iter()
-        .any(|w| !urls.iter().any(|url| url == w.url()))
-    {
-        return Err(format!(
+    let mut others = (registered.iter()).filter(|w| !urls.iter().any(|url| url == w.url()));
+    let refused = || {
+        Err(format!(
             "its chat template differs from the one model {name}'s registered workers \
              serve; all workers of a model serve one template, so change it by redeploying \
              them"
-        ));
+        ))
+    };
+    let Some(entry) = app_context.tokenizer_registry.get_by_name(name) else {
+        let router_file = app_context.router_config.chat_template.as_deref();
+        return match others.any(|w| served_template(w.as_ref(), router_file) != template) {
+            true => refused(),
+            false => Ok(()),
+        };
+    };
+    if loaded_template(app_context, &entry.id) == Some(template) {
+        return Ok(());
+    }
+    if others.next().is_some() {
+        return refused();
     }
     drop_tokenizer(app_context, name);
     Ok(())
