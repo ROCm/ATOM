@@ -138,7 +138,9 @@ def test_a_backed_off_chunk_has_to_pass_where_it_resumed():
         block_manager=SimpleNamespace(block_size=128),
         _tick_cost_limit=math.inf,  # no DP prefill cost balancing
         _dynamic_chunk_limit=lambda history_len, kind: None,
+        _busy_long_prefill_cap=0,  # no busy-phase cap: the flag's cap stands
     )
+    scheduler._long_prefill_cap = lambda: Scheduler._long_prefill_cap(scheduler)
     scheduler._chunk_alignment = lambda: Scheduler._chunk_alignment(scheduler)
     scheduler._chunked_prefill_size = lambda *a, **kw: Scheduler._chunked_prefill_size(
         scheduler, *a, **kw
