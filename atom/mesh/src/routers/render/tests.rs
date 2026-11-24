@@ -4352,36 +4352,39 @@ mod f_atom_reasoning_opener {
         assert_eq!(streamed("still planning", Some("<think>")).await, expected);
     }
 
+    /// Replayed 256 ids at a time, among them a reply whose closer the 256th id cuts
+    /// after its "<".
     #[tokio::test]
     async fn a_long_reply_arriving_in_its_complete_alone_is_split_as_when_streamed() {
-        let thought = "z".repeat(70_000);
-        let reply = format!("<think>{thought}</think>answer");
-        let ids = tokenizer()
-            .encode(&reply, false)
-            .unwrap()
-            .token_ids()
-            .to_vec();
-        let complete = chunks(&reply, false);
-        let stream = synthetic_single_stream(complete.into_iter().map(Ok).collect());
-        let resp = chat_streaming::process(stream, ctx(true, None), "regular");
-        let body = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
-        let (mut reasoning, mut content) = (String::new(), String::new());
-        for line in String::from_utf8_lossy(&body).lines() {
-            let Some(event) = line
-                .strip_prefix("data: ")
-                .and_then(|data| serde_json::from_str::<Value>(data).ok())
-            else {
-                continue;
-            };
-            let delta = &event["choices"][0]["delta"];
-            reasoning.push_str(delta["reasoning_content"].as_str().unwrap_or_default());
-            content.push_str(delta["content"].as_str().unwrap_or_default());
+        for thought in ["z".repeat(70_000), "z".repeat(248)] {
+            let reply = format!("<think>{thought}</think>answer");
+            let ids = tokenizer()
+                .encode(&reply, false)
+                .unwrap()
+                .token_ids()
+                .to_vec();
+            let complete = chunks(&reply, false);
+            let stream = synthetic_single_stream(complete.into_iter().map(Ok).collect());
+            let resp = chat_streaming::process(stream, ctx(true, None), "regular");
+            let body = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+            let (mut reasoning, mut content) = (String::new(), String::new());
+            for line in String::from_utf8_lossy(&body).lines() {
+                let Some(event) = line
+                    .strip_prefix("data: ")
+                    .and_then(|data| serde_json::from_str::<Value>(data).ok())
+                else {
+                    continue;
+                };
+                let delta = &event["choices"][0]["delta"];
+                reasoning.push_str(delta["reasoning_content"].as_str().unwrap_or_default());
+                content.push_str(delta["content"].as_str().unwrap_or_default());
+            }
+            assert!(ids.len() > 256);
+            assert_eq!(
+                (reasoning.len(), content.as_str()),
+                (thought.len(), "answer")
+            );
         }
-        assert!(ids.len() > 256);
-        assert_eq!(
-            (reasoning.len(), content.as_str()),
-            (thought.len(), "answer")
-        );
     }
 
     #[tokio::test]
