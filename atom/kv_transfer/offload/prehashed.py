@@ -67,12 +67,15 @@ import torch
 
 from atom.kv_transfer.offload.metadata import (
     LMCacheReqMeta,
+    PrehashedLoad,
     PrehashedSave,
     SaveSpec,
 )
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
+# A prehashed load logs LMCache's own retrieve line through LMCache's logger.
+_lmcache_logger = logging.getLogger("lmcache.v1.cache_engine")
 
 # Rebuild the per-request chain table's liveness view every this many inserts.
 _PRUNE_EVERY = 64
@@ -394,6 +397,49 @@ class PrehashedSaveSchedulerMixin:
             ),
         )
 
+    # -- load: ship the loaded chunks' hashes (ATOM_OFFLOAD_PREHASHED_LOAD) --
+    def _build_load_request(self, seq, load_spec, load_operation, transfer_end):
+        """The load as the hashes of chunks ``[hbm, lmc)``, not the prompt prefix.
+
+        The token path pickles ``prompt[:transfer_end]`` into the step's
+        metadata, every worker unpickles it on its forward thread, and its
+        load thread re-hashes the whole prefix chunk by chunk, handing the GIL
+        to the forward thread about twice per chunk.
+        """
+        chunk = int(self.chunk_size)
+        hbm = int(load_spec.hbm_cached_tokens)
+        lmc = int(load_spec.lmcache_cached_tokens)
+        chain = None
+        if (
+            envs.ATOM_OFFLOAD_PREHASHED_LOAD
+            and hbm % chunk == 0
+            and lmc % chunk == 0
+            and transfer_end == lmc
+        ):
+            try:
+                chain = self._prefix_chunk_hashes(seq, lmc // chunk)
+            except Exception:  # noqa: BLE001  # the token path still works
+                logger.warning(
+                    "LMCache prehashed load of %s fell back to tokens",
+                    seq.id,
+                    exc_info=True,
+                )
+        if chain is None:
+            return super()._build_load_request(
+                seq, load_spec, load_operation, transfer_end
+            )
+        self._perf_bump("prehashed_loads")
+        return LMCacheReqMeta(
+            req_id=seq.id,
+            token_ids=[],
+            block_ids=list(seq.block_table),
+            load_spec=load_spec,
+            load_operation=load_operation,
+            prehashed_load=PrehashedLoad(
+                start=hbm, hashes=tuple(chain[hbm // chunk : lmc // chunk])
+            ),
+        )
+
 
 class PrehashedSaveWorkerMixin:
     """Worker half: store a :class:`PrehashedSave` without its tokens.
@@ -529,6 +575,125 @@ class PrehashedSaveWorkerMixin:
                 (time.perf_counter() - t0) * 1000,
             )
         self._record_store_terminal(req, not (refused and must_store_all))
+
+    # -- load ----------------------------------------------------------------
+    def _check_prehashed_load_engine(self) -> None:
+        """Refuse at startup an engine whose retrieve `_retrieve` does not mirror."""
+        if not envs.ATOM_OFFLOAD_PREHASHED_LOAD:
+            return
+        engine = self._engine
+        unsupported = [
+            name
+            for name in (
+                "async_loading",
+                "save_only_first_rank",
+                "remove_after_retrieve",
+            )
+            if getattr(engine, name, False)
+        ]
+        if unsupported:
+            raise ValueError(
+                "ATOM_OFFLOAD_PREHASHED_LOAD does not support an LMCache engine "
+                f"with {', '.join(unsupported)}"
+            )
+
+    @torch.inference_mode()
+    def _retrieve(self, req: LMCacheReqMeta, hbm: int, lmc: int) -> tuple[bool, int]:
+        """``LMCacheEngine.retrieve`` for the chunks ``req.prehashed_load`` names.
+
+        Its synchronous path in the same order -- the lookup pin's location
+        (else the storage manager's prefix block mapping), ``batched_get``,
+        the run of chunks up to the first one that cannot be read,
+        ``batched_to_gpu``, one reference dropped per chunk -- with the keys
+        built from the shipped hashes. LMCache's retrieve statistics and its
+        ``Retrieved ...`` line are kept, so logs and metrics read the same.
+        """
+        prehashed = getattr(req, "prehashed_load", None)
+        if prehashed is None:
+            return super()._retrieve(req, hbm, lmc)
+        chunk = int(self.chunk_size)
+        start = int(prehashed.start)
+        if start != hbm or hbm + len(prehashed.hashes) * chunk != lmc:
+            raise ValueError(
+                f"prehashed load of {req.req_id} covers [{start}, "
+                f"{start + len(prehashed.hashes) * chunk}), not [{hbm}, {lmc})"
+            )
+        engine = self._engine
+        is_passive = getattr(engine, "_is_passive", None)
+        if not engine.is_healthy() or (callable(is_passive) and is_passive()):
+            return False, 0
+        sid = str(req.req_id)
+        stats = engine.stats_monitor.on_retrieve_request(lmc - hbm)
+        storage_manager = engine.storage_manager
+        make_key = engine.token_database._make_key_by_hash
+        infos = [
+            (make_key(int(h)), start + i * chunk, start + (i + 1) * chunk)
+            for i, h in enumerate(prehashed.hashes)
+        ]
+        pins = engine.lookup_pins.get(sid)
+        if pins is not None and len(pins) == 1:
+            block_mapping = {next(iter(pins)): infos}
+        else:
+            block_mapping = storage_manager.get_block_mapping(infos)
+        got: list[tuple[object, int, int]] = []
+        first_missing = None
+        for location, blocks in block_mapping.items():
+            objs = storage_manager.batched_get(
+                keys=[key for key, _s, _e in blocks], location=location
+            )
+            used = 0
+            for (_key, s, e), obj in zip(blocks, objs):
+                if obj is None:
+                    if first_missing is None or s < first_missing:
+                        first_missing = s
+                    break
+                got.append((obj, s, e))
+                used += 1
+            for obj in objs[used:]:
+                if obj is not None:
+                    obj.ref_count_down()
+        if first_missing is not None:
+            kept = []
+            for item in got:
+                if item[2] <= first_missing:
+                    kept.append(item)
+                else:
+                    item[0].ref_count_down()
+            got = kept
+        retrieved = 0
+        nbytes = 0
+        try:
+            if got:
+                objs, starts, ends = zip(*got)
+                nbytes = sum(obj.get_size() for obj in objs)
+                with stats.profile_to_gpu():
+                    engine.gpu_connector.batched_to_gpu(
+                        list(objs),
+                        list(starts),
+                        list(ends),
+                        block_ids=req.block_ids,
+                        req_id=sid,
+                    )
+                retrieved = sum(e - s for _o, s, e in got)
+        finally:
+            for obj, _s, _e in got:
+                obj.ref_count_down()
+        engine.stats_monitor.on_retrieve_finished(stats, retrieved)
+        cost = stats.time_to_retrieve()
+        _lmcache_logger.info(
+            "[req_id=%s] Retrieved %d out of %d required tokens "
+            "(from %d total tokens). size: %.4f gb, "
+            "cost %.4f ms, throughput: %.4f GB/s; prehashed",
+            sid,
+            retrieved,
+            lmc - hbm,
+            lmc,
+            nbytes / 1024**3,
+            cost * 1000,
+            nbytes / cost / 1024**3 if cost > 0 else 0,
+        )
+        # The chunks run from `hbm` with no gap: a missing one ends the run.
+        return retrieved == lmc - hbm, retrieved
 
 
 __all__ = ["PrehashedSaveSchedulerMixin", "PrehashedSaveWorkerMixin"]
