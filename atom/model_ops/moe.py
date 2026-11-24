@@ -77,7 +77,6 @@ from atom.model_ops.fused_moe.routed_rows import (
 )
 from atom.model_ops.fused_moe.shared_expert_dispatch import remap_topk_to_dispatch
 from atom.model_ops.fused_moe.shared_expert_staging import SharedExpertStaging
-from atom.model_ops.linear import padded_partition_size
 from atom.model_ops.topK import (
     init_aiter_topK_meta_data,
     is_rocm_aiter_fuse_routed_scaling_factor,
@@ -91,6 +90,7 @@ from atom.model_ops.utils import (
     _has_module,
     atom_parameter,
     normalize_e4m3fn_to_e4m3fnuz,
+    padded_partition_size,
     per_tensor_dequantize,
     shuffle_weights,
 )

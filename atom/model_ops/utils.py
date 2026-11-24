@@ -17,6 +17,10 @@ from atom.utils import envs
 logger = logging.getLogger("atom")
 
 
+def padded_partition_size(size: int, align: int | None) -> int:
+    return size if not align else (size + align - 1) // align * align
+
+
 def atom_parameter(data: torch.Tensor) -> nn.Parameter:
     """Create an ``nn.Parameter`` with gradient tracking controlled by
     the ``ATOM_REQUIRES_GRAD`` environment variable (default: disabled).
