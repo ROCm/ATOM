@@ -421,6 +421,18 @@ def test_the_session_refuses_logprobs_it_would_not_serve(serve):
     assert engine.preprocessed == []
 
 
+def test_the_session_serves_greedy_n_above_1_as_one_and_refuses_sampled(serve):
+    engine = FakeEngine()
+    servicer = serve(engine)
+    session = servicer.sessions.open()
+    with pytest.raises(ValueError, match="n above 1"):
+        asyncio.run(servicer._submit(session, _submit(n=2, temperature=1.0)))
+    assert engine.preprocessed == []
+    # Greedy siblings would all be the same reply: one is served, as Generate does.
+    asyncio.run(servicer._submit(session, _submit(n=2, temperature=0.0)))
+    assert len(engine.preprocessed) == 1
+
+
 def test_the_session_refuses_stop_strings_without_their_ids(serve):
     engine = FakeEngine()
     servicer = serve(engine)
