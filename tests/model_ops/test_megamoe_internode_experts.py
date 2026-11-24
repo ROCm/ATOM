@@ -249,6 +249,8 @@ def test_cold_graph_step_cannot_allocate_a_budgeted_operator(internode, monkeypa
 
 def test_initialization_is_cached_and_closed(internode):
     first = _instance(internode)
+    # A8W4: the MXFP8 activations DSv4.1's reference runs, on the same weights.
+    assert first["op"].quant == "a8w4"
     assert _instance(internode) is first
     assert len(internode.built) == 1
     first["op"].close.assert_not_called()

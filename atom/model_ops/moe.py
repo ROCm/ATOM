@@ -2766,7 +2766,7 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
 
 
 class MegaInternodeMxfp4MoEMethod(MegaMxfp4MoEMethod):
-    """MXFP4 routed experts backed by the two-node EP16 A4W4 pipeline."""
+    """MXFP4 routed experts backed by the two-node EP16 A8W4 pipeline."""
 
     def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
         parallel = moe.moe_parallel_config
@@ -2788,11 +2788,6 @@ class MegaInternodeMxfp4MoEMethod(MegaMxfp4MoEMethod):
             )
         super().__init__(quant_config, moe)
         self.use_triton_ep = False
-        if self.fp8_activations:
-            raise ValueError(
-                "internode MegaMoE uses A4W4; set ATOM_DSV41_MOE_FP8_ACTIVATIONS=0 "
-                "for DSv4.1"
-            )
 
     _weight_names = ("_mi_w1", "_mi_w1_scale", "_mi_w2", "_mi_w2_scale")
 

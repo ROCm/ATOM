@@ -4,8 +4,9 @@
 """aiter MegaMoEInternode (two-node EP16 fused MoE) as ATOM's routed-experts step.
 
 ``moe_backend="mega"`` on two-node EP16 replaces dispatch + GEMM1 + activation + GEMM2 +
-combine of an MXFP4 MoE layer with aiter's ``MegaMoEInternode`` (A4W4: the op
-quantizes the bf16 rows to MXFP4 itself and sends FP4 on dispatch).
+combine of an MXFP4 MoE layer with aiter's ``MegaMoEInternode`` (A8W4: the op
+quantizes the bf16 rows to MXFP8 itself, the activations DSv4.1's reference
+runs).
 
 Capacities. EP ranks agree on the largest configured token budget at startup.
 The prefill capacity rounds that budget up to a power of two, between 32 and
@@ -26,7 +27,7 @@ carry ``-1`` in every slot (weight 0). The op treats an out-of-range expert id
 as an invalid slot: no dispatch, no GEMM work, and k2 accumulates it as zero,
 so a ragged step costs each rank only its real rows.
 
-Weights: w1/w1 scale in the a4w4 GEMM1 layout (``shuffle_weight`` (16,16) +
+Weights: w1/w1 scale in the GEMM1 layout (``shuffle_weight`` (16,16) +
 ``e8m0_shuffle``), w2/w2 scale in the a16w4 GEMM2 layout
 (``shuffle_weight_a16w4`` / ``shuffle_scale_a16w4``), built from the raw
 checkpoint layout (gate rows then up rows).
@@ -154,7 +155,7 @@ def _get_instance(
                 inter_dim=inter_dim,
                 experts=experts,
                 topk=topk,
-                quant="a4w4",
+                quant="a8w4",
                 w1=layer._mi_w1,
                 w1_scale=layer._mi_w1_scale,
                 w2=layer._mi_w2,

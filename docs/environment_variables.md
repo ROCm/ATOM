@@ -228,12 +228,6 @@ On the deployment they are built for, V4.1 mono decode's served steps run the hi
 
 The hi path serves the step widths 6 to 48 rows (1 to 8 requests verifying DSpark's 5 drafts and the anchor; past 4 requests on the batch bands of 6 and 8) and a context up to 1 Mi tokens (a `--max-model-len` past it keeps ATOM's mono decode). Its builds use FlyDSL's disk cache (`FLYDSL_RUNTIME_CACHE_DIR`), which also holds the gfx950 linear blocks' fitted prefetch depths where the frozen table does not apply (`dsv41_hi_fits`).
 
-## DSv4.1 MoE activations
-
-| Variable | Type | Default | Description |
-|----------|------|---------|-------------|
-| **ATOM_DSV41_MOE_FP8_ACTIVATIONS** | bool | 1 (true) | Use reference MXFP8 activations for DSv4.1 MXFP4 routed experts. Set to `0` for A4W4 execution; the two-node EP16 implementation selected by `--moe-backend mega` requires `0`. Applies to standard and internode MoE. Set consistently on all ranks before startup. |
-
 ## MoE all2all (MoRI) wire format
 
 Both are opt-in and default to off; they only apply with DP attention + expert
