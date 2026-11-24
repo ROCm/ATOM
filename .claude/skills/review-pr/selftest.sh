@@ -694,11 +694,12 @@ forms = ["FP8: x", "MI300: x", "[verified] x.py:1 drops it", "The caller must ho
          "[inferred] planner.rs:108 charges only on req.stream",
          "FP8 scale is wrong", "MI300 support is missing",
          "foo.py:3 — the E2E path never runs", "foo.py:3-5 TP8 is off by one",
-         # Many ids are words this codebase uses itself -- 19 of the 54 appear under
-         # atom/ or docs/ as ordinary vocabulary, not as rule codes:
-         # the KV-offload chunk groups (offload/README.md:1084), the MTP4 rows
-         # (glm52/mono/kernels/op.py:131) and the deepseek_v4 capture topology
-         # (mono/session.py). A finding that cites a file and then says "C1/C2 rows
+         # Many ids are words this codebase uses itself, not rule codes: the KV-offload
+         # chunk groups (offload/README.md:1084), the MTP4 rows
+         # (glm52/mono/kernels/op.py:131), the deepseek_v4 capture topology
+         # (mono/session.py), T1 and D11 in mesh/tests/*.rs. No number here on
+         # purpose -- see _diff_vocabulary.
+         # A finding that cites a file and then says "C1/C2 rows
          # are swapped" is lawful, and refusing it is fatal -- the only way out is an
          # untrue "-- not reported:". Past the citation only the colon form is read.
          # That is a trade, not a clean line: first_clause drops the citation either
@@ -716,6 +717,14 @@ forms = ["FP8: x", "MI300: x", "[verified] x.py:1 drops it", "The caller must ho
 print(sum(1 for f in forms if triage._rule_head(f) is None))' "$S"
 }
 t "and an ordinary opening is left alone" "$(_head_passes)" "14"
+# Four different counts of "how many ids are also ATOM words" were written into these
+# comments during review -- eleven, ten, nineteen, twenty-two -- and every one was
+# wrong, because the answer moves with the tree and with which file extensions the
+# counter happened to grep. Each was fixed in one copy and left standing in another.
+# Prose cannot hold this; a gate can. No comment states such a count.
+t "no comment states a count of the ids that are also ATOM words" \
+  "$(grep -ciE '[0-9]+ of the 54|(ten|eleven|nineteen|twenty[- ]two) of the 54' \
+       "$S/triage.py" "$S/selftest.sh" | awk -F: '{n+=$2} END{print n+0}')" "0"
 # One shared 4-letter word was far too loose. SKILL.md mandates "**Author must**" on
 # every finding, so `must` alone let any finding claim any path-less FIRE whose reason
 # used it -- silencing the UNREPORTED-FIRE that should have fired for the other rule.
