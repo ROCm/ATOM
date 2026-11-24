@@ -236,11 +236,16 @@ def register(host):
 
 ## Seams of the plugin model
 
-`v41.block.ffn`, `v41.block.transition`, `v41.attn.out`, `v41.attn.project_out`,
-`v41.attn.out_full`, `v41.attn.attend_out`, `v41.attn.qk_norm`, `v41.attn.attend`,
-`v41.attn.index_topk`, `v41.moe.shared_act`, `v41.moe.shared_expert`, `v41.moe.topk`,
-`v41.op.quant_fp8_g32`, `v41.draft.ctx`, `v41.draft.markov`, `v41.spec.verify_sample`,
-`v41.mono.install`. Unowned, each binds to its native (no Python on the hot path).
+`v41.block.ffn`, `v41.block.transition`, `v41.block.mhc`, `v41.attn.out`,
+`v41.attn.project_out`, `v41.attn.out_full`, `v41.attn.attend_out`, `v41.attn.qk_norm`,
+`v41.attn.attend`, `v41.attn.index_topk`, `v41.moe.shared_act`, `v41.moe.shared_expert`,
+`v41.moe.topk`, `v41.op.quant_fp8_g32`, `v41.draft.ctx`, `v41.draft.markov`,
+`v41.spec.verify_sample`, `v41.mono.install`. Unowned, each binds to its native (no
+Python on the hot path).
+
+`v41.block.mhc` is the HIP Mega-MHC launch of a sublayer seam (the arguments and the five
+results of AITER's `mega_mhc`); an owner selects the calls it serves and the rest stay
+AITER's.
 
 Spans that contain other spans yield to a finer owner: fused attention (#3645) runs
 only where no plan owns `v41.attn.qk_norm` / `v41.attn.attend`; `v41.attn.out_full`

@@ -45,6 +45,7 @@ EXTENDED = {
     "v41.attn.attend_out",
     "v41.draft.markov",
     "v41.spec.verify_sample",
+    "v41.block.mhc",
 }
 
 

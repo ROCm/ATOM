@@ -428,6 +428,15 @@ def test_select_reads_only_what_the_key_holds():
         "v41.moe.topk": (),
         QUANT: (),
         "v41.attn.index_topk": (),
+        "v41.block.mhc": (
+            "fn",
+            "hc_scale",
+            "hc_base",
+            "rms_eps",
+            "hc_pre_eps",
+            "hc_sinkhorn_eps",
+            "hc_post_mult_value",
+        ),
         "v41.attn.attend": (
             "kv_indices_prefix",
             "kv_indptr_prefix",
@@ -1547,3 +1556,53 @@ def test_a_bound_module_call_traces_like_the_module():
     compiled = torch.compile(toy, backend="eager", fullgraph=True)
     assert torch.allclose(compiled(x), toy.ffn(x))
     torch._dynamo.reset()
+
+
+def test_mhc_seam_hands_the_mega_mhc_call_to_a_planned_owner(monkeypatch):
+    """`v41.block.mhc`: unowned, the call is AITER's `mega_mhc`; a planned owner
+    that selects it gets the same arguments and returns the five results."""
+    from aiter_stub import atom_under_stubs
+
+    with atom_under_stubs() as load:
+        mhc = load("atom.model_ops.deepseek_v41.mhc_pre_delayed")
+    seam = "v41.block.mhc"
+    calls = []
+
+    def native(*args, **kwargs):
+        calls.append(("native", args[8], sorted(kwargs)))
+        return "res", "post", "comb", "normed", "pre"
+
+    def owner(*args, capability=None, valid_rows=None, **kwargs):
+        calls.append(("owner", args[8], sorted(kwargs)))
+        return "res", "post", "comb", "normed", "pre"
+
+    monkeypatch.setattr(mhc, "mega_mhc", native)
+    residual = torch.zeros(16, 4, 64)
+    pre = torch.zeros(16, 4)
+    args = (residual, None, None, None, 1e-6, 1e-6, 1e-6, 2.0, 20, pre)
+    assert mhc._mega_mhc(*args, out_dtype="bf16") == (
+        "res",
+        "post",
+        "comb",
+        "normed",
+        "pre",
+    )
+    _plugins(
+        monkeypatch,
+        small=_offer(
+            seam,
+            "small",
+            impl=owner,
+            select=lambda cap, residual, *a, **k: residual.shape[0] <= 16,
+        ),
+    )
+    host.configure(recipes.resolve([_recipe({seam: ["small"]})]), kill_switch=False)
+    assert mhc._mega_mhc(*args, out_dtype="bf16")[3] == "normed"
+    wide = (torch.zeros(32, 4, 64), *args[1:9], torch.zeros(32, 4))
+    assert mhc._mega_mhc(*wide, out_dtype="bf16")[3] == "normed"
+    assert calls == [
+        ("native", 20, ["out_dtype"]),
+        ("owner", 20, ["out_dtype"]),
+        ("native", 20, ["out_dtype"]),
+    ]
+    assert host.decision_counts()[(seam, "plugin", "selected", "small")] == 1

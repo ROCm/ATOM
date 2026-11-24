@@ -30,6 +30,7 @@ from aiter.ops.triton.fusions.mhc_fused_post_pre_delayed_rmsnorm import (
     mhc_fused_post_pre_delayed_rmsnorm,
 )
 
+from atom import plugin_host
 from atom.utils import envs
 
 # Archs with HIP Mega-MHC kernels.
@@ -58,6 +59,12 @@ def use_asm_seam(hc_mult: int, hidden: int) -> bool:
     return envs.ATOM_DSV41_MHC_BACKEND != "triton" and (
         mhc_fused_post_pre_delayed_asm_supported(hidden, hc_mult)
     )
+
+
+def _mega_mhc(*args, **kwargs):
+    """`mega_mhc` as the `v41.block.mhc` seam: a planned owner may serve the
+    launch; unowned, the call is AITER's."""
+    return plugin_host.call("v41.block.mhc", mega_mhc, *args, **kwargs)
 
 
 def fuse_quant_supported() -> bool:
@@ -215,7 +222,7 @@ def v41_mhc_pre_delayed(
     # on gfx942 where it runs AITER's ASM seam and RMSNorm. fuse_quant implies
     # w_preshuffle_bf16, so the ASM branch always resolves to BF16.
     if w_preshuffle_bf16 or (with_post and use_asm_seam(hc_mult, hidden)):
-        kernel = mega_mhc
+        kernel = _mega_mhc
         options["out_dtype"] = "mxfp8" if fuse_quant else "bf16"
         if w_preshuffle_bf16:
             options["w_preshuffle_bf16"] = True
