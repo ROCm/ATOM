@@ -49,6 +49,7 @@ _ATOM_ENV_VARS = [
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ",
     "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN",
     "ATOM_MINIMAX_M3_PREFILL_TOKEN_GRAPH",
+    "ATOM_PP_CUDAGRAPH",
 ]
 
 _PROFILER_DETAIL_VARS = [
@@ -167,6 +168,9 @@ class TestEnvsDefaults:
 
     def test_minimax_m3_prefill_token_graph_default_disabled(self):
         assert _get_envs().ATOM_MINIMAX_M3_PREFILL_TOKEN_GRAPH is False
+
+    def test_pp_cudagraph_default_disabled(self):
+        assert _get_envs().ATOM_PP_CUDAGRAPH is False
 
     def test_unknown_attr_raises(self):
         with pytest.raises(AttributeError):
