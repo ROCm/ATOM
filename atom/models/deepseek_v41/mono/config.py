@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """The deployments V4.1 mono serves, and why any other is refused."""
 
 from atom.models.deepseek_v41.mono import index_plan as ip
@@ -13,7 +14,7 @@ from atom.utils import envs
 SUPPORTED_TP = (2, 4, 8)
 # DP attention ranks (attention TP 1, the MoE expert parallel over them,
 # ``kernels.dims``): the builds measured
-SUPPORTED_DPA = (2,)
+SUPPORTED_DPA = (2, 8)
 # the rows a step at most, the kernels' widest build (``kernels.attn_pre``): past
 # it TP2's shared expert outgrows one unit a CTA (72 tasks x 4 token tiles > 256
 # CTAs) and K1 / K2 spill VGPRs. Every row carries its own metadata, so a
@@ -25,9 +26,9 @@ MAX_ROWS = 48
 MAX_MOE_ROWS = 96
 # the DSpark draft's blocks a pass at most
 MAX_REQUESTS = 8
-# a token's keys at most: the original decode's 64 splits of one 16-key tile
-# each, which the mono attention reproduces split by split
-ATTENTION_KEYS_MAX = 64 * 16
+# a token's keys at most: the window and the selection (128 + 512), every key's
+# value slice in a merge task's LDS at once (``kernels.attention``)
+ATTENTION_KEYS_MAX = 640
 # (top-k, candidate blocks, rows a block, index heads, index head dim)
 INDEXER_SHAPE = (ip.TOPK, ip.TOPK_BLOCKS, ip.BLOCK_ROWS, ip.HEADS, ip.DIM)
 
@@ -41,6 +42,8 @@ def config_refusal(atom_config) -> str | None:
     keys = hf.sliding_window + hf.index_topk
     checks = [(envs.ATOM_MONO_ENABLE, "switched off")]
     checks += common_refusals(atom_config, Dims, SUPPORTED_TP, SUPPORTED_DPA) + [
+        # the kernels read the native 32x32 FP8 dense weights
+        (not hf.fp4ptpc, "an FP4PTPC checkpoint's per-channel FP8 linears"),
         (
             atom_config.kv_cache_dtype in ("bf16", "fp8"),
             f"kv cache {atom_config.kv_cache_dtype}",
@@ -49,6 +52,9 @@ def config_refusal(atom_config) -> str | None:
             atom_config.index_cache_dtype in ("fp8", "fp4"),
             f"index cache {atom_config.index_cache_dtype}",
         ),
+        # layer 0's seam reads the embedding unexpanded (``embed_in``), which
+        # an Engram layer would have to see as the hc streams first
+        (0 not in hf.engram_layer_ids, "an Engram layer 0"),
         (
             keys <= ATTENTION_KEYS_MAX,
             f"{keys} attention keys a token > {ATTENTION_KEYS_MAX}",
@@ -64,6 +70,16 @@ def config_refusal(atom_config) -> str | None:
             )
             == INDEXER_SHAPE,
             "indexer shape",
+        ),
+        # the candidate producer ranks its blocks over every column, so its
+        # ratio's FULL rows never split over the ranks (``index_plan.splits``)
+        (
+            hf.candidate_source_layer_id < 0
+            or not ip.splits(
+                atom_config.tensor_parallel_size,
+                hf.compress_ratios[hf.candidate_source_layer_id],
+            ),
+            "a candidate producer at a ratio whose rows split",
         ),
         # no drafter, or DSpark, whose aux taps K1 writes: another drafter's
         # hooks on the target layers would never fire under mono
