@@ -2003,6 +2003,32 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             **self._select_page_kwargs,
         )
 
+    def _qout_buffers(self, q, rows: int):
+        """ATOM_M3_ATTN_QOUT: (codes, scales) byte buffers for the attention to write o_proj's MXFP8 input
+        into, parked in ``_qout_result`` for the layer's o_proj (``attn_qout.oproj_input``); None keeps the
+        bf16 output. Only when every row of q is a metadata row (no pad rows)."""
+        self._qout_result = None
+        if (
+            not getattr(self, "_qout_enabled", False)
+            or rows != q.shape[0]
+            or not 8 <= rows <= 128
+        ):
+            return None
+        from atom.model_ops.minimax_m3 import attn_qout
+
+        codes = torch.empty(
+            (rows, q.shape[1] * q.shape[2]), dtype=torch.uint8, device=q.device
+        )
+        scales = torch.empty(
+            (rows, q.shape[1] * q.shape[2] // 32), dtype=torch.uint8, device=q.device
+        )
+        self._qout_result = (
+            codes.view(attn_qout.FP8_DTYPE),
+            scales.view(torch.float8_e8m0fnu),
+            rows,
+        )
+        return codes, scales
+
     def _fused_index_select(self, rows: int, sparse_metadata) -> bool:
         """Whether this decode step lets the NVFP4 attention select the top-16 itself
         (``ATOM_M3_FUSED_INDEX_SELECT``): one-GPU NVFP4 index, a row count aiter measured
@@ -2163,6 +2189,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                         "local_blocks": self.local_blocks,
                     }
                 )
+                qout = self._qout_buffers(q, rows)
+                if qout is not None:
+                    fused_kw["quant_out"] = qout
                 self._sparse_pa_nvfp4_decode(
                     q[:rows],
                     k_cache,
@@ -2170,7 +2199,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                     decode_md.block_table,
                     decode_md.seq_lens,
                     self.scale,
-                    out=output[:rows],
+                    out=output[:rows] if qout is None else None,
                     k_scale=self.nvfp4_k_scale,
                     v_scale=self.nvfp4_v_scale,
                     query_len=max_query_len,

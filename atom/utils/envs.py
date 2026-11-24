@@ -658,6 +658,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # selector launch after the scorer (aiter sparse_pa_nvfp4_decode index_score=).
     # Needs an aiter that has it; 0 keeps the scorer + selector chain.
     "ATOM_M3_FUSED_INDEX_SELECT": lambda: _flag_env("ATOM_M3_FUSED_INDEX_SELECT", "0"),
+    # MiniMax-M3 sparse decode: the NVFP4 attention writes o_proj's MXFP8 input (codes + E8M0
+    # scales) itself (aiter sparse_pa_nvfp4_decode quant_out=), so the activation-quantize
+    # launch between the attention and the o_proj GEMM disappears on 8-128 decode rows.
+    # Needs an aiter with quant_out and a native MXFP8 o_proj; 0 keeps attention + quantize.
+    "ATOM_M3_ATTN_QOUT": lambda: _flag_env("ATOM_M3_ATTN_QOUT", "0"),
     # Fused decode for measured model/deployment/step geometries. Unsupported
     # configurations and forwards keep the production path. 0 disables it.
     "ATOM_MONO_ENABLE": lambda: os.getenv("ATOM_MONO_ENABLE", "1") == "1",

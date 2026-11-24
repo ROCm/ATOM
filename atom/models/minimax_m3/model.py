@@ -618,7 +618,30 @@ class MiniMaxM3SparseAttention(nn.Module):
         attn_output = self.attn(q, k, v, positions, qkv=qkv)
         if isinstance(attn_output, tuple):
             return self.o_proj(*attn_output)
+        if self._attn_qout():
+            from atom.model_ops.minimax_m3 import attn_qout
+
+            x, x_scale = attn_qout.oproj_input(attn_output, self.attn.layer_name)
+            return self.o_proj(x, x_scale=x_scale)
         return self.o_proj(attn_output)
+
+    def _attn_qout(self) -> bool:
+        """ATOM_M3_ATTN_QOUT: the attention writes o_proj's MXFP8 input (needs the aiter ``quant_out`` and a
+        native MXFP8 o_proj); decided once, at the first trace."""
+        ok = getattr(self, "_qout_ok", None)
+        if ok is None:
+            from atom.model_ops.minimax_m3 import attn_qout
+
+            ok = self._qout_ok = bool(
+                envs.ATOM_M3_ATTN_QOUT
+                and attn_qout.aiter_supports()
+                and getattr(self.o_proj, "native_a8_group_rows", None) is not None
+                and self.attn.impl.kv_cache_dtype == "nvfp4"
+                and self.attn.impl.indexer_cp_group is None
+            )
+            if ok:
+                self.attn.impl._qout_enabled = True
+        return ok
 
 
 class MiniMaxM3DecoderLayer(nn.Module):
