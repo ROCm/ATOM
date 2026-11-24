@@ -41,7 +41,7 @@ exec python3 -m atom.entrypoints.openai_server \
   --model "${MODEL}" --trust-remote-code --host 0.0.0.0 \
   --server-port "${D_PORT}" --port 18106 \
   ${PAR} \
-  --kv_cache_dtype fp8 --index-cache-dtype fp8 --block-size 128 \
+  --kv_cache_dtype "${KV_DTYPE}" --index-cache-dtype "${KV_DTYPE}" --block-size 128 \
   --max-model-len 1048576 --max-num-seqs "${SEQS}" --max-num-batched-tokens "${MNBT}" \
   --gpu-memory-utilization "${D_MEM:-0.9}" \
   --cudagraph-capture-sizes "${CG}" \

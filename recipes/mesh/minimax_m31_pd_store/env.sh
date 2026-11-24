@@ -11,13 +11,15 @@ export AITER_LOG_LEVEL=WARNING PYTHONUNBUFFERED=1 PYTHONHASHSEED=0 HF_HUB_OFFLIN
 # One P/D transfer engine QP per endpoint on both sides (the Store's clients need it;
 # endpoints with different QP counts cannot connect), and RDMA rather than HIP IPC.
 export MC_NUM_QP_PER_EP=1 MC_DISABLE_HIP=1
-# InferenceX-compliant numerics: shared expert as its own MXFP8 MLP, bf16 all-reduce.
+# Numerics: shared expert as its own MXFP8 MLP, bf16 all-reduce.
 export ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4=0
 unset AITER_QUICK_REDUCE_QUANTIZATION
 export STORE_MASTER_PORT=${STORE_MASTER_PORT:-26051}
 export STORE_METADATA_PORT=${STORE_METADATA_PORT:-26080}
 export STORE_METRICS_PORT=${STORE_METRICS_PORT:-26090}
 export P_PORT=8010 D_PORT=8020 ROUTER_PORT=8000
+# KV and index cache dtype, the same on both roles: nvfp4 (default) or fp8.
+export KV_DTYPE=${KV_DTYPE:-nvfp4}
 export SPEC_ARGS="--method dspark --draft-model ${MODEL}/dspark --num-speculative-tokens 7"
 # FORCE_AL=4.04 for benchmark runs (InferenceX golden AL for DSpark k=7); empty = real acceptance.
 export FORCE_AL=${FORCE_AL:-}

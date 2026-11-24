@@ -22,7 +22,7 @@ exec python3 -m atom.entrypoints.openai_server \
   --model "${MODEL}" --trust-remote-code --host 0.0.0.0 \
   --server-port "${P_PORT}" --port 18006 \
   -tp 1 --pipeline-parallel-size 4 --enforce-eager \
-  --kv_cache_dtype fp8 --index-cache-dtype fp8 --block-size 128 \
+  --kv_cache_dtype "${KV_DTYPE}" --index-cache-dtype "${KV_DTYPE}" --block-size 128 \
   --max-model-len 1048576 --max-num-seqs 128 --max-num-batched-tokens 8192 \
   --gpu-memory-utilization "${P_MEM:-0.9}" \
   ${SPEC_ARGS} ${AL_ARGS} \

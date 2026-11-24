@@ -17,10 +17,10 @@ Two decode variants:
 
 > Status: written against ATOM main `a62134f99` (2026-11-24) from main's code and earlier M3.1 P/D + Store runs on experiment branches. The commands have not yet been run end to end on this main; please report what breaks.
 
-## Numerics (InferenceX-compliant M3.1)
+## Numerics
 
+- NVFP4 KV and NVFP4 index cache on both roles (`KV_DTYPE=nvfp4`, the default): the M3.1 production setting, as in the InferenceX vLLM MI355X recipe. `KV_DTYPE=fp8` switches both roles to FP8. Main carries what this needs: ROCm/ATOM#3471 and #3472 (NVFP4 over Mooncake P/D and the Store), and ROCm/aiter#8285 in the image (the NVFP4 decode scorer under indexer CP).
 - Native MXFP8 linears. No `--online_quant_config ptpc_fp8`.
-- FP8 KV and FP8 index cache: `--kv_cache_dtype fp8 --index-cache-dtype fp8`.
 - Index top-k on every layer: no `index_topk_freq` override.
 - Shared expert stays its own MXFP8 MLP: `ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4=0`.
 - No `AITER_QUICK_REDUCE_QUANTIZATION`: all-reduce stays bf16.
@@ -107,6 +107,6 @@ Run 1P1D with AgentX traces at **C140** (the concurrency of the whole 1P1D), wit
 
 ## Known limits
 
-- Under DEP4 a request lives on one rank, so its context is capped by one rank's KV pool (about 2.1-2.4M tokens with FP8 KV), not by the instance's.
+- Under DEP4 a request lives on one rank, so its context is capped by one rank's KV pool, not by the instance's.
 - DEP4 replicates attention, shared/dense MLPs, embedding, `lm_head` and the draft on every rank: about 13 GB more weights per GPU than TP4.
 - At C140 the decode is bound by KV capacity rather than step time: the running batch stays at about 40-50 requests while the rest wait for KV. Compare the two decodes at C140 on the same AgentX workload.
