@@ -58,11 +58,12 @@ impl DefaultPlanner {
         }
 
         let hash_ring = self.hash_ring_for(req.model_id);
-        let chosen = apply_policy(&candidates, policy.as_ref(), req, hash_ring).await?;
+        let (worker, binding) = apply_policy(&candidates, policy.as_ref(), req, hash_ring).await?;
 
         Ok(PlacementPlan::Single {
-            worker: chosen,
+            worker,
             policy_name: policy.name(),
+            binding,
         })
     }
 
@@ -87,7 +88,7 @@ impl DefaultPlanner {
 
         let hash_ring = self.hash_ring_for(req.model_id);
 
-        let prefill = apply_policy(
+        let (prefill, prefill_binding) = apply_policy(
             &prefill_candidates,
             prefill_policy.as_ref(),
             req,
@@ -101,7 +102,7 @@ impl DefaultPlanner {
             policy = prefill_policy.name(),
             "prefill worker selected"
         );
-        let decode =
+        let (decode, decode_binding) =
             apply_policy(&decode_candidates, decode_policy.as_ref(), req, hash_ring).await?;
 
         Ok(PlacementPlan::Pair {
@@ -109,6 +110,8 @@ impl DefaultPlanner {
             decode,
             prefill_policy: prefill_policy.name(),
             decode_policy: decode_policy.name(),
+            prefill_binding,
+            decode_binding,
         })
     }
 }

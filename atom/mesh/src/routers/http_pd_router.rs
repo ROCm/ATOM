@@ -90,6 +90,9 @@ impl std::fmt::Debug for PDRouter {
 pub(crate) struct ReservedPair {
     pub prefill: Arc<dyn Worker>,
     pub decode: Arc<dyn Worker>,
+    /// Each selection's binding, for the policies' dispatch hooks.
+    prefill_binding: Option<u64>,
+    decode_binding: Option<u64>,
     load: parking_lot::Mutex<Option<[WorkerLoadGuard; 2]>>,
     canceled: tokio::sync::watch::Sender<bool>,
 }
@@ -173,12 +176,9 @@ impl Drop for WorkerOutcome {
     }
 }
 
-/// A server error or no response: the session may be placed again.
-fn dispatch_failed(response: &Result<WorkerResponse, reqwest::Error>) -> bool {
-    match response {
-        Ok(response) => response.inner.status().is_server_error(),
-        Err(_) => true,
-    }
+/// A server error, or no response (`None`): the session may be placed again.
+fn dispatch_failed(status: Option<StatusCode>) -> bool {
+    status.is_none_or(|status| status.is_server_error())
 }
 
 struct WorkerResponse {
@@ -436,6 +436,8 @@ impl PDRouter {
             decode,
             prefill_policy,
             decode_policy,
+            prefill_binding,
+            decode_binding,
         } = plan
         else {
             return Err(error::internal_error(
@@ -467,6 +469,8 @@ impl PDRouter {
             canceled: tokio::sync::watch::channel(false).0,
             prefill,
             decode,
+            prefill_binding,
+            decode_binding,
         }))
     }
 
@@ -926,6 +930,7 @@ impl PDRouter {
         };
         let prefill_url_for_log = prefill.url().to_string();
         let prefill_worker = prefill.clone();
+        let prefill_binding = placement.prefill_binding;
         let prefill_router = self.clone();
         let prefill_headers = headers.cloned();
         let correlation_for_log = correlation_id.unwrap_or_else(|| "unknown".to_string());
@@ -933,7 +938,12 @@ impl PDRouter {
         let work = async move {
             let _prefill_guard = prefill_guard;
             match prefill_router
-                .send_worker(prefill_post, prefill_worker, prefill_headers.as_ref())
+                .send_worker(
+                    prefill_post,
+                    prefill_worker,
+                    prefill_binding,
+                    prefill_headers.as_ref(),
+                )
                 .await
             {
                 Ok(res) => {
@@ -992,7 +1002,14 @@ impl PDRouter {
             Ok(req) => req,
             Err(resp) => return resp,
         };
-        let decode_result = self.send_worker(decode_post, decode.clone(), headers).await;
+        let decode_result = self
+            .send_worker(
+                decode_post,
+                decode.clone(),
+                placement.decode_binding,
+                headers,
+            )
+            .await;
         events::RequestReceivedEvent {}.emit();
 
         let res = match decode_result {
@@ -1115,9 +1132,7 @@ impl PDRouter {
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
 
-        let prefill_result = self
-            .send_prefill(prefill_post, prefill.clone(), &decode, headers)
-            .await;
+        let prefill_result = self.send_prefill(prefill_post, &placement, headers).await;
         let prefill_resp = match prefill_result {
             Ok(r) => r,
             Err(e) => {
@@ -1247,7 +1262,14 @@ impl PDRouter {
             Ok(req) => req,
             Err(resp) => return resp,
         };
-        let decode_result = self.send_worker(decode_post, decode.clone(), headers).await;
+        let decode_result = self
+            .send_worker(
+                decode_post,
+                decode.clone(),
+                placement.decode_binding,
+                headers,
+            )
+            .await;
         events::RequestReceivedEvent {}.emit();
 
         let res = match decode_result {
@@ -1324,7 +1346,7 @@ impl PDRouter {
         let results = tokio::try_join!(
             async {
                 let response = self
-                    .send_prefill(p, prefill.clone(), &decode, headers)
+                    .send_prefill(p, &placement, headers)
                     .await
                     .map_err(|e| error::bad_gateway("prefill_server_error", e.to_string()))?;
                 if !response.status().is_success() {
@@ -1343,7 +1365,7 @@ impl PDRouter {
             },
             async {
                 let response = self
-                    .send_worker(d, decode.clone(), headers)
+                    .send_worker(d, decode.clone(), placement.decode_binding, headers)
                     .await
                     .map_err(|e| error::bad_gateway("decode_server_error", e.to_string()))?;
                 events::RequestReceivedEvent {}.emit();
@@ -1555,7 +1577,12 @@ impl PDRouter {
         let results = tokio::try_join!(
             async {
                 let result = self
-                    .send_worker(prefill_request, prefill.clone(), headers)
+                    .send_worker(
+                        prefill_request,
+                        prefill.clone(),
+                        placement.prefill_binding,
+                        headers,
+                    )
                     .await;
                 let result = match result {
                     Ok(res) if !res.status().is_success() => {
@@ -1572,7 +1599,12 @@ impl PDRouter {
             },
             async {
                 let res = self
-                    .send_worker(decode_request, decode.clone(), headers)
+                    .send_worker(
+                        decode_request,
+                        decode.clone(),
+                        placement.decode_binding,
+                        headers,
+                    )
                     .await
                     .map_err(|e| {
                         error!(decode_url = %decode.url(), error = %e, "Decode request failed");
@@ -1835,14 +1867,11 @@ impl PDRouter {
         &self,
         request: reqwest::RequestBuilder,
         worker: Arc<dyn Worker>,
+        binding: Option<u64>,
         headers: Option<&HeaderMap>,
     ) -> Result<WorkerResponse, reqwest::Error> {
-        let policy = self.dispatch(&worker, headers);
-        let response = Self::send(request, Arc::clone(&worker), Arc::clone(&policy)).await;
-        if dispatch_failed(&response) {
-            policy.on_dispatch_failed(headers, &worker);
-        }
-        response
+        let policy = self.dispatch(&worker, binding, headers);
+        Self::send(request, worker, policy, binding, headers).await
     }
 
     /// Sends an ATOM prefill. Under idx2idx the prefill rank follows the decode
@@ -1851,18 +1880,22 @@ impl PDRouter {
     async fn send_prefill(
         &self,
         request: reqwest::RequestBuilder,
-        prefill: Arc<dyn Worker>,
-        decode: &Arc<dyn Worker>,
+        placement: &ReservedPair,
         headers: Option<&HeaderMap>,
     ) -> Result<WorkerResponse, reqwest::Error> {
+        let (prefill, decode) = (&placement.prefill, &placement.decode);
         let follows_decode = self.atom_pd_rank_mapping_policy == AtomPdRankMappingPolicy::Idx2Idx
             && prefill.dp_rank().is_some()
             && prefill.dp_rank() == decode.dp_rank();
-        let response = self.send_worker(request, prefill, headers).await;
-        if follows_decode && dispatch_failed(&response) {
-            self.policy_registry
-                .get_decode_policy()
-                .on_dispatch_failed(headers, decode);
+        let response = self
+            .send_worker(request, prefill.clone(), placement.prefill_binding, headers)
+            .await;
+        if follows_decode && dispatch_failed(response.as_ref().ok().map(WorkerResponse::status)) {
+            self.policy_registry.get_decode_policy().on_dispatch_failed(
+                headers,
+                decode,
+                placement.decode_binding,
+            );
         }
         response
     }
@@ -1872,6 +1905,7 @@ impl PDRouter {
     fn dispatch(
         &self,
         worker: &Arc<dyn Worker>,
+        binding: Option<u64>,
         headers: Option<&HeaderMap>,
     ) -> Arc<dyn crate::policies::LoadBalancingPolicy> {
         let (pool, policy) = match worker.worker_type() {
@@ -1885,7 +1919,7 @@ impl PDRouter {
             ),
         };
         // Only a request that is actually sent moves the session.
-        policy.on_dispatch(pool, headers, worker);
+        policy.on_dispatch(pool, headers, worker, binding);
         crate::observability::route_trace::record_dispatch(pool, worker);
         policy
     }
@@ -1894,17 +1928,23 @@ impl PDRouter {
         request: reqwest::RequestBuilder,
         worker: Arc<dyn Worker>,
         policy: Arc<dyn crate::policies::LoadBalancingPolicy>,
+        binding: Option<u64>,
+        headers: Option<&HeaderMap>,
     ) -> Result<WorkerResponse, reqwest::Error> {
         let mut outcome = WorkerOutcome {
             worker: Some(worker),
             policy,
             status: None,
         };
-        match request.send().await {
-            Ok(inner) => {
-                outcome.status = Some(inner.status());
-                Ok(WorkerResponse { inner, outcome })
+        let response = request.send().await;
+        outcome.status = response.as_ref().ok().map(reqwest::Response::status);
+        if dispatch_failed(outcome.status) {
+            if let Some(worker) = &outcome.worker {
+                outcome.policy.on_dispatch_failed(headers, worker, binding);
             }
+        }
+        match response {
+            Ok(inner) => Ok(WorkerResponse { inner, outcome }),
             Err(error) => {
                 outcome.finish(false);
                 Err(error)
@@ -2272,7 +2312,7 @@ mod tests {
                     .build(),
             );
             let response = router
-                .send_worker(router.client.get(&url), worker.clone(), None)
+                .send_worker(router.client.get(&url), worker.clone(), None, None)
                 .await
                 .unwrap();
             assert_eq!(worker.circuit_breaker().total_successes(), 0);
@@ -2354,6 +2394,8 @@ mod tests {
                         decode: decode.clone(),
                         prefill_policy: "round_robin",
                         decode_policy: "round_robin",
+                        prefill_binding: None,
+                        decode_binding: None,
                     },
                     None,
                 )
@@ -2494,6 +2536,8 @@ mod tests {
                     decode: decode.clone(),
                     prefill_policy: "round_robin",
                     decode_policy: "round_robin",
+                    prefill_binding: None,
+                    decode_binding: None,
                 },
                 None,
             )
@@ -2734,6 +2778,8 @@ mod tests {
                     decode: decode_rank_5.clone(),
                     prefill_policy: "round_robin",
                     decode_policy: "round_robin",
+                    prefill_binding: None,
+                    decode_binding: None,
                 },
                 None,
             )
@@ -2804,7 +2850,8 @@ mod tests {
 
         // The session stays pinned to prefill rank 2; idx2idx runs it on the decode rank.
         for decode_rank in [5, 5, 2] {
-            assert_eq!(prefill_policy.select_worker(&prefill, &info).await, Some(0));
+            let (selected, decision) = prefill_policy.select_with_decision(&prefill, &info).await;
+            assert_eq!(selected, Some(0));
             let decode =
                 create_test_dp_worker("http://decode", decode_rank, 8, WorkerType::Decode, true);
             let pair = router
@@ -2814,6 +2861,8 @@ mod tests {
                         decode,
                         prefill_policy: "dp_sticky",
                         decode_policy: "round_robin",
+                        prefill_binding: decision.binding,
+                        decode_binding: None,
                     },
                     Some(&headers),
                 )
@@ -2824,6 +2873,7 @@ mod tests {
                 .send_worker(
                     router.client.get(&url),
                     pair.prefill.clone(),
+                    pair.prefill_binding,
                     Some(&headers),
                 )
                 .await
@@ -2865,11 +2915,13 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(decode_policy.select_worker(&decode, &info).await, Some(0));
+        let (selected, placed) = decode_policy.select_with_decision(&decode, &info).await;
+        assert_eq!(selected, Some(0));
         let result = router
             .send_worker(
                 router.client.get(&closed),
                 decode[0].clone(),
+                placed.binding,
                 Some(&headers),
             )
             .await;
@@ -2913,7 +2965,8 @@ mod tests {
             router
                 .policy_registry
                 .set_decode_policy(decode_policy.clone());
-            assert_eq!(decode_policy.select_worker(&decode, &info).await, Some(0));
+            let (selected, placed) = decode_policy.select_with_decision(&decode, &info).await;
+            assert_eq!(selected, Some(0));
 
             // The prefill runs on decode's rank 0 and fails.
             let prefill = create_test_dp_worker(
@@ -2925,8 +2978,21 @@ mod tests {
                 },
                 true,
             );
+            let pair = router
+                .reserve_pair(
+                    PlacementPlan::Pair {
+                        prefill,
+                        decode: decode[0].clone(),
+                        prefill_policy: "round_robin",
+                        decode_policy: "dp_sticky",
+                        prefill_binding: None,
+                        decode_binding: placed.binding,
+                    },
+                    Some(&headers),
+                )
+                .unwrap();
             let response = router
-                .send_prefill(router.client.get(&url), prefill, &decode[0], Some(&headers))
+                .send_prefill(router.client.get(&url), &pair, Some(&headers))
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);

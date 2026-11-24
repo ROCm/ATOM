@@ -278,7 +278,7 @@ mod b_policy_apply {
         let recorder = RecordingPolicy::wrap(Arc::new(RoundRobinPolicy::new()));
         let descriptor = make_descriptor(Some("m"), None, None, None);
 
-        let chosen = apply_policy(&candidates, &recorder, &descriptor, None)
+        let (chosen, _) = apply_policy(&candidates, &recorder, &descriptor, None)
             .await
             .unwrap();
         assert_eq!(recorder.call_count(), 1);
@@ -291,7 +291,7 @@ mod b_policy_apply {
         let recorder = RecordingPolicy::wrap(Arc::new(RandomPolicy::new()));
         let descriptor = make_descriptor(Some("m"), None, None, None);
 
-        let chosen = apply_policy(&candidates, &recorder, &descriptor, None)
+        let (chosen, _) = apply_policy(&candidates, &recorder, &descriptor, None)
             .await
             .unwrap();
         assert_eq!(recorder.call_count(), 1);
@@ -304,7 +304,7 @@ mod b_policy_apply {
         let recorder = RecordingPolicy::wrap(Arc::new(PowerOfTwoPolicy::new()));
         let descriptor = make_descriptor(Some("m"), None, None, None);
 
-        let chosen = apply_policy(&candidates, &recorder, &descriptor, None)
+        let (chosen, _) = apply_policy(&candidates, &recorder, &descriptor, None)
             .await
             .unwrap();
         assert_eq!(recorder.call_count(), 1);
@@ -360,7 +360,7 @@ mod b_policy_apply {
         let recorder = RecordingPolicy::round_robin();
         let descriptor = make_descriptor(Some("m_no_ring"), None, None, None);
 
-        let chosen = apply_policy(&candidates, &recorder, &descriptor, None)
+        let (chosen, _) = apply_policy(&candidates, &recorder, &descriptor, None)
             .await
             .unwrap();
         let calls = recorder.calls();
@@ -459,7 +459,7 @@ mod b_policy_apply {
         let policy = RandomPolicy::new();
 
         for _ in 0..32 {
-            let chosen = apply_policy(&candidates, &policy, &descriptor, None)
+            let (chosen, _) = apply_policy(&candidates, &policy, &descriptor, None)
                 .await
                 .unwrap();
             assert!(candidate_urls.iter().any(|u| u == chosen.url()));

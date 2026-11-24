@@ -73,12 +73,12 @@ impl Router {
     ) -> Response {
         use super::comm::error::IngressError;
         let metadata = &request.metadata;
-        let (worker, policy_name) = match planner.plan(descriptor).await {
+        let (worker, policy_name, binding) = match planner.plan(descriptor).await {
             Ok(PlacementPlan::Single {
                 worker,
                 policy_name,
-                ..
-            }) => (worker, policy_name),
+                binding,
+            }) => (worker, policy_name, binding),
             Ok(_) => {
                 return IngressError::new(
                     StatusCode::NOT_IMPLEMENTED,
@@ -146,6 +146,7 @@ impl Router {
             metrics_labels::WORKER_REGULAR,
             Some(&request.headers),
             &worker,
+            binding,
         );
         crate::observability::route_trace::record_dispatch(metrics_labels::WORKER_REGULAR, &worker);
         events::RequestSentEvent { url: worker.url() }.emit();
@@ -154,14 +155,14 @@ impl Router {
         let response = match upstream {
             Ok(response) => {
                 if response.status().is_server_error() {
-                    policy.on_dispatch_failed(Some(&request.headers), &worker);
+                    policy.on_dispatch_failed(Some(&request.headers), &worker, binding);
                 }
                 super::comm::proxy_body::ProxyBody::response(response, worker, policy, load)
             }
             Err(err) => {
                 worker.record_outcome(false);
                 policy.on_request_complete(worker.url(), false);
-                policy.on_dispatch_failed(Some(&request.headers), &worker);
+                policy.on_dispatch_failed(Some(&request.headers), &worker, binding);
                 convert_reqwest_error(err)
             }
         };

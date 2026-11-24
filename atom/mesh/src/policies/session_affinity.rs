@@ -368,8 +368,9 @@ impl LoadBalancingPolicy for SessionAffinityPolicy {
         pool: &'static str,
         headers: Option<&http::HeaderMap>,
         worker: &Arc<dyn Worker>,
+        binding: Option<u64>,
     ) {
-        self.inner.on_dispatch(pool, headers, worker);
+        self.inner.on_dispatch(pool, headers, worker, binding);
         let Some(key) = self.binding_key(headers) else {
             return;
         };
@@ -383,8 +384,13 @@ impl LoadBalancingPolicy for SessionAffinityPolicy {
 
     /// A failed request releases its session's binding: the next request, a
     /// retry included, is placed again and counts as `rebind`.
-    fn on_dispatch_failed(&self, headers: Option<&http::HeaderMap>, worker: &Arc<dyn Worker>) {
-        self.inner.on_dispatch_failed(headers, worker);
+    fn on_dispatch_failed(
+        &self,
+        headers: Option<&http::HeaderMap>,
+        worker: &Arc<dyn Worker>,
+        binding: Option<u64>,
+    ) {
+        self.inner.on_dispatch_failed(headers, worker, binding);
         if let Some(key) = self.binding_key(headers) {
             self.table
                 .mark_failed(key, &WorkerIdentity::from_worker(worker));
