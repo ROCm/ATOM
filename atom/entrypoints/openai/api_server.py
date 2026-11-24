@@ -3644,6 +3644,7 @@ async def kv_transfer_info():
                 pp_size=cfg.pipeline_parallel_size,
                 block_size=cfg.kv_cache_block_size,
                 dcp_size=cfg.decode_context_parallel_size,
+                pp_hosts=getattr(cfg, "pp_stage_ips", []),
             )
             break
     return info
@@ -3792,14 +3793,15 @@ def main():
 
     logger.info(f"Initializing engine with model {args.model}...")
     engine_args = EngineArgs.from_cli_args(args)
-    # Remote DP nodes block inside engine startup and never run the API loop.
-    # Expose their local mmap metrics on the same configured HTTP port.
+    # Remote DP nodes, and the later nodes of a pipeline that spans nodes, block
+    # inside engine startup and never run the API loop. Expose their local mmap
+    # metrics on the same configured HTTP port.
     dp_rank = (
         envs.ATOM_DP_RANK
         if envs.is_set("ATOM_DP_RANK")
         else engine_args.data_parallel_rank
     )
-    if dp_rank > 0:
+    if dp_rank > 0 or engine_args.pipeline_parallel_rank > 0:
         from atom.metrics.prometheus import start_metrics_server
 
         server, _ = start_metrics_server(args.host, args.server_port)

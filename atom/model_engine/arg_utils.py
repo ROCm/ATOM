@@ -125,6 +125,9 @@ class EngineArgs:
     tensor_parallel_rank: int = 0
     decode_context_parallel_size: int = 1
     pipeline_parallel_size: int = 1
+    pipeline_parallel_size_local: int | None = None
+    pipeline_parallel_rank: int = 0
+    pipeline_parallel_node_ips: list[str] | None = None
     prefill_context_parallel_size: int = 1
     sequence_parallel_size: int = 1
     data_parallel_size: int = 1
@@ -250,6 +253,39 @@ class EngineArgs:
             default=1,
             help="Pipeline parallel size. Splits the model's layers across "
             "stages (world = tp x pp x pcp).",
+        )
+        parser.add_argument(
+            "--pipeline-parallel-size-local",
+            type=int,
+            default=None,
+            help=(
+                "Number of pipeline stages to run on THIS node. Defaults to "
+                "--pipeline-parallel-size (single-node). Set it lower to spread "
+                "the stages over several nodes; every node then needs "
+                "--data-parallel-master-ip of the node that runs stage 0, the "
+                "same nonzero --data-parallel-base-port and the same "
+                "--pipeline-parallel-node-ips."
+            ),
+        )
+        parser.add_argument(
+            "--pipeline-parallel-rank",
+            type=int,
+            default=0,
+            help=(
+                "First pipeline stage run by this node. Node 0 uses 0 and serves "
+                "the API; the second node of a 2x4 run uses 4 and runs only its "
+                "stages."
+            ),
+        )
+        parser.add_argument(
+            "--pipeline-parallel-node-ips",
+            type=lambda value: [ip.strip() for ip in value.split(",") if ip.strip()],
+            default=None,
+            help=(
+                "Comma-separated IP of each node of a pipeline that spans nodes, "
+                "in stage order (the node of stage 0 first). The head reaches "
+                "the stages of each node there."
+            ),
         )
         parser.add_argument(
             "--prefill-context-parallel-size",
@@ -1070,6 +1106,9 @@ class EngineArgs:
         "data_parallel_base_port",
         "tensor_parallel_size_local",
         "tensor_parallel_rank",
+        "pipeline_parallel_size_local",
+        "pipeline_parallel_rank",
+        "pipeline_parallel_node_ips",
     )
 
     def parallel_config(self) -> ParallelConfig:
@@ -1081,6 +1120,8 @@ class EngineArgs:
         kwargs = {name: getattr(self, name) for name in self._PARALLEL_CONFIG_FIELDS}
         if kwargs["data_parallel_base_port"] is None:
             del kwargs["data_parallel_base_port"]
+        if kwargs["pipeline_parallel_node_ips"] is None:
+            del kwargs["pipeline_parallel_node_ips"]
         return ParallelConfig(**kwargs)
 
     def create_engine(self, tokenizer=None) -> LLMEngine:

@@ -472,6 +472,10 @@ def _receive_block_offset(
 
 
 class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
+    # Where each stage of a pipeline that spans nodes listens, advertised as
+    # `remote_pp_hosts`; empty when every stage is on this host.
+    pp_stage_hosts: tuple[str, ...] = ()
+
     def __init__(self, config: Config) -> None:
         kv_transfer_config = config.kv_transfer_config
         self.is_producer = (
@@ -486,6 +490,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         self.dp_size = config.parallel_config.data_parallel_size
         self.dp_rank = config.parallel_config.data_parallel_rank
         self.pp_size = config.pipeline_parallel_size
+        self.pp_stage_hosts = tuple(getattr(config, "pp_stage_ips", ()))
         self.block_size = config.kv_cache_block_size
         self.dcp_size = config.decode_context_parallel_size
         self.hash_block_size = self.block_size * self.dcp_size
@@ -861,6 +866,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                 pp_size=self.pp_size,
                 block_size=self.block_size,
                 dcp_size=self.dcp_size,
+                pp_hosts=self.pp_stage_hosts,
             ),
             "remote_port": self.handshake_port,
             "tp_size": self.tp_size,
@@ -2021,6 +2027,17 @@ class MooncakeConnector(KVConnectorBase):
             # The consumer sends the same write_request to every stage; each
             # stage writes only its layer window (see _consumer_region_map).
             remote_pp_size = max(1, meta.remote_pp_size)
+            if meta.remote_pp_hosts and len(meta.remote_pp_hosts) != remote_pp_size:
+                logger.error(
+                    "[CONSUMER] req %s: the producer names %d stage hosts for "
+                    "%d stages",
+                    req_id,
+                    len(meta.remote_pp_hosts),
+                    remote_pp_size,
+                )
+                with self._completion_lock:
+                    self.failed_recving.add(req_id)
+                continue
             write_nonce = int.from_bytes(os.urandom(8), "big")
 
             # PD incremental: slice off locally cached prefix blocks; invalid
@@ -2147,7 +2164,14 @@ class MooncakeConnector(KVConnectorBase):
                     remote_pp_size,
                     meta.remote_dp_size,
                 )
-                stage_addrs[stage] = make_zmq_path("tcp", meta.remote_host, remote_port)
+                # A producer whose pipeline spans nodes names each stage's
+                # node; otherwise every stage listens on remote_host.
+                remote_host = (
+                    meta.remote_pp_hosts[stage]
+                    if meta.remote_pp_hosts
+                    else meta.remote_host
+                )
+                stage_addrs[stage] = make_zmq_path("tcp", remote_host, remote_port)
             # KV landing: each stage gets its own write request carrying the
             # landing partition it may write (see landing.py).
             stage_requests: dict[int, bytes] = {}

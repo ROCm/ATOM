@@ -603,6 +603,9 @@ class ReqMeta:
     remote_dp_size: int
     remote_dp_rank: int = 0
     remote_pp_size: int = 1
+    # The node of each producer stage when its pipeline spans nodes; empty
+    # when every stage listens on `remote_host`.
+    remote_pp_hosts: list[str] = field(default_factory=list)
     remote_tp_size: int = 0
     transfer_id: TransferId = 0
     local_slot_index: int = -1
@@ -713,6 +716,7 @@ class ConnectorMetadata:
             remote_dp_size=int(kv_transfer_params.get("remote_dp_size") or 1),
             remote_dp_rank=int(kv_transfer_params.get("remote_dp_rank") or 0),
             remote_pp_size=kv_transfer_params.get("remote_pp_size", 1),
+            remote_pp_hosts=list(kv_transfer_params.get("remote_pp_hosts") or ()),
             remote_tp_size=kv_transfer_params.get("remote_tp_size", 0),
             tp_size=(
                 kv_transfer_params.get("tp_size")

@@ -316,6 +316,150 @@ def test_finished_block_ids_are_lists_of_their_own(is_producer):
         assert block_ids == ([1, 2] if is_producer else [1, 2, 3])
 
 
+# ---------------------------------------------------------------------------
+# a producer whose pipeline spans nodes (Config.pp_stage_ips)
+# ---------------------------------------------------------------------------
+
+_STAGE_HOSTS = ["10.0.0.1", "10.0.0.1", "10.0.0.2", "10.0.0.2"]
+
+
+@pytest.mark.parametrize("stage_hosts", [[], _STAGE_HOSTS])
+def test_producer_advertises_each_stages_node_only_across_nodes(
+    monkeypatch, stage_hosts
+):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    monkeypatch.setattr(mc, "get_ip", lambda: "10.0.0.1")
+    monkeypatch.setattr(mc, "get_open_port", lambda: 40000)
+    sched = mc.MooncakeConnectorScheduler(
+        SimpleNamespace(
+            kv_transfer_config={"kv_role": "kv_producer"},
+            tensor_parallel_size=1,
+            pipeline_parallel_size=4,
+            pp_stage_ips=stage_hosts,
+            parallel_config=SimpleNamespace(data_parallel_size=1, data_parallel_rank=0),
+            kv_cache_block_size=64,
+            decode_context_parallel_size=1,
+        )
+    )
+    seq = SimpleNamespace(
+        output_tokens=[7],
+        spec_token_ids=None,
+        num_prompt_tokens=130,
+        block_table=[1, 2, 3],
+        id=99,
+        state_slot=7,
+        state_slots=[],
+        kv_transfer_params_output=None,
+    )
+    sched.request_finished(seq)
+    params = seq.kv_transfer_params_output
+    assert params["remote_host"] == "10.0.0.1"
+    assert params["remote_pp_size"] == 4
+    if stage_hosts:
+        assert params["remote_pp_hosts"] == stage_hosts
+    else:
+        # A single-node producer advertises what it always did.
+        assert "remote_pp_hosts" not in params
+
+
+def test_build_req_meta_reads_remote_pp_hosts():
+    params = {
+        "remote_block_ids": [5],
+        "remote_host": "10.0.0.1",
+        "remote_handshake_port": 6301,
+        "tp_size": 1,
+        "remote_pp_size": 4,
+    }
+    meta = ConnectorMetadata._build_req_meta("r0", [0], params)
+    assert meta.remote_pp_hosts == []
+    meta = ConnectorMetadata._build_req_meta(
+        "r0", [0], {**params, "remote_pp_hosts": _STAGE_HOSTS}
+    )
+    assert meta.remote_pp_hosts == _STAGE_HOSTS
+
+
+def _queueing_consumer(monkeypatch):
+    """A real consumer that registers no GPU memory and queues its write
+    requests for a worker that is never started."""
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+    monkeypatch.setenv("ATOM_HOST_IP", "10.0.0.9")
+    monkeypatch.delenv("ATOM_MOONCAKE_IB_DEVICE", raising=False)
+    monkeypatch.delenv("MC_FORCE_TCP", raising=False)
+    monkeypatch.setattr(mc.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        mc, "get_tp_group", lambda: SimpleNamespace(rank_in_group=0, world_size=1)
+    )
+    monkeypatch.setattr(
+        mc, "get_dp_group", lambda: SimpleNamespace(rank_in_group=0, world_size=1)
+    )
+    engine = MagicMock()
+    engine.initialize.return_value = 0
+    engine.get_rpc_port.return_value = 16578
+    monkeypatch.setattr(mc, "_MOONCAKE_AVAILABLE", True)
+    monkeypatch.setattr(mc, "TransferEngine", lambda: engine, raising=False)
+    monkeypatch.setattr(mc, "get_open_port", lambda: 41000)
+    monkeypatch.setattr(mc.zmq, "Context", MagicMock())
+    conn = mc.MooncakeConnector(
+        SimpleNamespace(
+            parallel_config=SimpleNamespace(pipeline_parallel_rank=0),
+            pipeline_parallel_size=1,
+            hf_config=SimpleNamespace(num_hidden_layers=2),
+            kv_cache_block_size=16,
+            decode_context_parallel_size=1,
+            dcp_config=SimpleNamespace(interleave_size=1),
+            kv_transfer_config={"kv_role": "kv_consumer", "protocol": "tcp"},
+        )
+    )
+    conn._notification_port = 42000
+    # Nothing is posted: the write-request worker counts as started.
+    conn._write_thread = object()
+    return conn
+
+
+def _receive_from_four_stages(conn, **params):
+    meta = ConnectorMetadata._build_req_meta(
+        req_id="r0",
+        local_block_ids=[0],
+        kv_transfer_params={
+            "remote_block_ids": [1],
+            "remote_host": "10.0.0.1",
+            "remote_handshake_port": 6301,
+            "remote_pp_size": 4,
+            "tp_size": 1,
+            "transfer_id": 9,
+            **params,
+        },
+    )
+    conn.start_load_kv(
+        SimpleNamespace(request_id_to_transfer_id={"r0": 9}, reqs_to_recv={"r0": meta})
+    )
+    return [addr for addr, _ in conn._write_queue]
+
+
+def test_consumer_sends_each_stage_its_write_request_on_its_node(monkeypatch):
+    conn = _queueing_consumer(monkeypatch)
+    assert _receive_from_four_stages(conn, remote_pp_hosts=_STAGE_HOSTS) == [
+        f"tcp://{host}:{6301 + stage}" for stage, host in enumerate(_STAGE_HOSTS)
+    ]
+    assert not conn.failed_recving
+
+
+def test_consumer_reaches_every_stage_at_remote_host_on_one_node(monkeypatch):
+    conn = _queueing_consumer(monkeypatch)
+    assert _receive_from_four_stages(conn) == [
+        f"tcp://10.0.0.1:{6301 + stage}" for stage in range(4)
+    ]
+
+
+def test_consumer_fails_a_receive_whose_stage_hosts_miss_a_stage(monkeypatch):
+    conn = _queueing_consumer(monkeypatch)
+    assert _receive_from_four_stages(conn, remote_pp_hosts=_STAGE_HOSTS[:2]) == []
+    assert conn.failed_recving == {"r0"}
+
+
 @pytest.mark.parametrize(
     "producer_slots",
     [

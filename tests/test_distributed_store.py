@@ -196,8 +196,11 @@ def _model_runner_worker(pc, layout, global_rank):
         prefill_context_parallel_size=pcp,
         pcp_group_size=pcp,
         decode_context_parallel_size=dcp,
+        # One node: what the runner's placement reads off a real Config.
         is_multinode_tp=False,
         tp_rank_start=0,
+        pp_size_local=pp,
+        is_multinode_pp=False,
         master_addr="127.0.0.1",
         port=0,
     )

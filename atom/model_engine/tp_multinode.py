@@ -47,17 +47,17 @@ def managed_store_client(config):
     """A model-runner rank's client of the TCPStore that CoreManager serves.
 
     Every NCCL communicator created on first use takes its unique id from this
-    store. When the TP group spans nodes, its trays reach such a collective
-    apart by as much as their checkpoint loads differ (13 minutes on a tray
-    that cannot page-cache the checkpoint), so torch's default 300 s wait aborts
-    the start. Such a rank waits as long as the rest of the cross-node TP setup
-    does instead.
+    store. When the TP group or the pipeline spans nodes, its trays reach such
+    a collective apart by as much as their checkpoint loads differ (13 minutes
+    on a tray that cannot page-cache the checkpoint), so torch's default 300 s
+    wait aborts the start. Such a rank waits as long as the rest of the
+    cross-node setup does instead.
     """
     from torch.distributed import TCPStore
 
     pc = config.parallel_config
     kwargs = {}
-    if config.is_multinode_tp:
+    if config.is_multinode_tp or config.is_multinode_pp:
         kwargs["timeout"] = timedelta(seconds=envs.ATOM_MULTINODE_TP_TIMEOUT_S)
     return TCPStore(
         pc.data_parallel_master_ip,
