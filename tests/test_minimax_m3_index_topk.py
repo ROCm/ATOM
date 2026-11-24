@@ -1073,7 +1073,7 @@ def test_gfx1250_issue_341_tp4_launch_is_bit_exact(
 
 class TestFp8PrefillRoutes:
     """The FP8 index prefill routes of the TP1 gfx950 path: the fixed workspace's
-    view and aiter's FlyDSL scorer."""
+    view, aiter's FlyDSL scorer and its fused scorer + top-16."""
 
     @staticmethod
     def _q(dtype=torch.bfloat16, tokens=8):
@@ -1110,6 +1110,41 @@ class TestFp8PrefillRoutes:
         assert view.view(40, 129).stride() == (132, 1)
         assert m._prefill_score_view(ws, 4, 11, 129) is None  # past the capacity
         assert m._prefill_score_view(None, 4, 10, 129) is None
+
+    @pytest.mark.parametrize(
+        "batch,q_len,blocks,want",
+        [
+            (1, 8192, 576, True),
+            (1, 8192, 575, False),
+            (1, 4095, 2048, False),
+            (2, 8192, 2048, False),
+        ],
+    )
+    def test_fused_gate(self, monkeypatch, batch, q_len, blocks, want):
+        monkeypatch.setattr(m, "_fused_index_topk_ops", lambda: object())
+        args = (self._q(), batch, q_len, blocks, 16, 0, 1, True, 8, 8, object())
+        assert m._fused_prefill_takes(*args) is want
+
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            (8, 0, 1, True, 8, 8),  # topk
+            (16, 1, 1, True, 8, 8),  # an init block
+            (16, 0, 1, False, 8, 8),  # no page-16 emit (NVFP4 KV)
+            (16, 0, 1, True, 1, 1),  # MXFP4 KV pages
+        ],
+    )
+    def test_fused_takes_only_the_kernels_shape(self, monkeypatch, shape):
+        monkeypatch.setattr(m, "_fused_index_topk_ops", lambda: object())
+        args = (self._q(), 1, 8192, 2048, *shape, object())
+        assert not m._fused_prefill_takes(*args)
+
+    def test_fused_needs_the_workspace_path_and_its_op(self, monkeypatch):
+        args = (self._q(), 1, 8192, 2048, 16, 0, 1, True, 8, 8)
+        monkeypatch.setattr(m, "_fused_index_topk_ops", lambda: object())
+        assert not m._fused_prefill_takes(*args, None)
+        monkeypatch.setattr(m, "_fused_index_topk_ops", lambda: None)
+        assert not m._fused_prefill_takes(*args, object())
 
 
 def _fp8_inputs(qlens, prefixes):
@@ -1163,5 +1198,28 @@ def test_fp8_prefill_workspace_routes_keep_the_selection(qlens, prefixes, bounde
         score_workspace=_workspace(kw),
     )
     torch.cuda.synchronize()
+    for a, b in zip(ref, got):
+        assert torch.equal(a, b)
+
+
+@gpu
+@pytest.mark.parametrize("qlens,prefixes", [([4096], [73728]), ([8192], [122880])])
+def test_fused_index_topk_matches_the_triton_selector(monkeypatch, qlens, prefixes):
+    """aiter's fused scorer + per-chunk top-16 and the merge emit exactly what the
+    Triton scorer + Triton selector emit."""
+    kw = _fp8_inputs(qlens, prefixes)
+    if m._fused_index_topk_ops() is None:
+        pytest.skip("aiter.ops.m3_fused_index_topk is not installed")
+    # the reference: no n_valid bounds, so the Triton selector on a per-call plane
+    ref = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
+    calls, fused = [], m._fused_prefill_index_topk
+    monkeypatch.setattr(
+        m, "_fused_prefill_index_topk", lambda *a: calls.append(1) or fused(*a)
+    )
+    got = m.minimax_m3_index_topk(
+        **kw, emit_sparse_block_table=True, score_workspace=_workspace(kw)
+    )
+    torch.cuda.synchronize()
+    assert calls == [1]
     for a, b in zip(ref, got):
         assert torch.equal(a, b)
