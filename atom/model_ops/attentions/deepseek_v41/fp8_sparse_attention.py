@@ -230,9 +230,9 @@ def sparse_attn_v41_paged_2src_fp8kv(
         "NUM_SPLITS": num_splits,
         "BLOCK_H": _BLOCK_H,
         "D": dim,
-        "BLOCK_K": (split_block_k or _SPLIT_BLOCK_K)
-        if split
-        else (block_k or _BLOCK_K),
+        "BLOCK_K": (
+            (split_block_k or _SPLIT_BLOCK_K) if split else (block_k or _BLOCK_K)
+        ),
         "num_warps": num_warps or _NUM_WARPS,
         "num_stages": _NUM_STAGES,
     }
