@@ -94,18 +94,53 @@ def active_proxy(dec: np.ndarray, rows: float, top_k: int) -> np.ndarray:
     return 1.0 - (1.0 - share) ** (float(rows) * top_k)
 
 
+def expected_tiles(
+    dec: np.ndarray, rows: float, top_k: int, tile_rows: int
+) -> np.ndarray:
+    """E[ceil(X_e / tile_rows)], X_e ~ Poisson(q_e * top_k * rows): the tiles of
+    ``tile_rows`` rows that expert e's rows fill in a decode step of ``rows``
+    rows, q_e its share of the decode picks. While a step gives an expert less
+    than a tile this is `active_proxy` (Poisson for binomial picks); where it
+    gives a hot expert several, it keeps counting them. In units of 2^-20,
+    rounded to integers, so every rank derives the same plan."""
+    dec = np.asarray(dec, dtype=np.float64)
+    total = float(dec.sum())
+    if total <= 0 or rows <= 0 or tile_rows <= 0:
+        return np.zeros(dec.shape, dtype=np.float64)
+    lam = torch.from_numpy(dec * (float(rows) * top_k / total))
+    top = float(lam.max())
+    reach = int(top + 12.0 * (top + 1.0) ** 0.5 + 2 * tile_rows)
+    # E[ceil(X / T)] = sum_j P(X > j T), and P(X > k) = P(k + 1, lam), the
+    # regularized lower incomplete gamma function.
+    ks = torch.arange(0, reach + 1, tile_rows, dtype=torch.float64) + 1.0
+    sf = torch.special.gammainc(ks[None, :], lam.clamp_min(1e-300)[:, None])
+    tiles = torch.where(lam > 0, sf.sum(dim=1), torch.zeros_like(lam))
+    return torch.round(tiles * float(1 << 20)).numpy()
+
+
 def swap_terms(
-    pf: np.ndarray, dec: np.ndarray, rows: float, top_k: int, num_ranks: int
+    pf: np.ndarray,
+    dec: np.ndarray,
+    rows: float,
+    top_k: int,
+    num_ranks: int,
+    tile_rows: int = 0,
 ) -> np.ndarray:
     """[experts, 3] objective terms of one layer from its prefill and decode
-    pick counts; a term with no data is zero (it then weighs nothing)."""
+    pick counts; a term with no data is zero (it then weighs nothing).
+    ``tile_rows`` > 0: the middle term is `expected_tiles` instead of
+    `active_proxy`."""
     pf = np.asarray(pf, dtype=np.float64)
     dec = np.asarray(dec, dtype=np.float64)
     values = np.zeros((pf.shape[0], 3), dtype=np.float64)
     if pf.sum() > 0:
         values[:, 0] = pf / pf.sum() * num_ranks
     if dec.sum() > 0:
-        proxy = active_proxy(dec, rows, top_k)
+        proxy = (
+            expected_tiles(dec, rows, top_k, tile_rows)
+            if tile_rows > 0
+            else active_proxy(dec, rows, top_k)
+        )
         if proxy.sum() > 0:
             values[:, 1] = proxy / proxy.sum() * num_ranks
         values[:, 2] = dec / dec.sum() * num_ranks
@@ -231,6 +266,9 @@ def swap_rebalance(
     layer_ids: list[int] | None = None,
     hot_first: int | bool = 0,
     weights=SWAP_WEIGHTS,
+    tile_rows: int = 0,
+    cold_first: float = 0.0,
+    cold_first_min_swaps: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[int, int]]:
     """The "swap" policy: `rebalance_experts`' result for a placement that
     differs from ``old_p2l`` by at most ``budget`` pairwise swaps a layer.
@@ -238,6 +276,11 @@ def swap_rebalance(
     the rank's first slot (`order_within_ranks`): True or a count at least
     the rank's size orders whole ranks, a smaller count only that many
     leading slots. Which rank holds an expert is the swaps' alone.
+    ``cold_first`` > 0 orders whole ranks the other way, by ascending prefill
+    picks alone, in the layers whose prefill picks are at least that share of
+    the busiest layer's, where this call took at least
+    ``cold_first_min_swaps`` swaps (it then overrides ``hot_first`` there).
+    ``tile_rows``: see `swap_terms`.
 
     ``pf_load`` / ``dec_load``: [layers, logical] pick counts (prefill, sampled
     decode; None: none), ``rows_per_step`` the group's decode rows a step,
@@ -269,8 +312,12 @@ def swap_rebalance(
             "(no redundant experts)"
         )
         l2p[layer, p2l[layer]] = slots
+    volume = pf.sum(axis=1)
+    top_volume = float(volume.max()) if volume.size else 0.0
     for layer in range(num_layers) if layer_ids is None else layer_ids:
-        values = swap_terms(pf[layer], dec[layer], rows_per_step, top_k, num_gpus)
+        values = swap_terms(
+            pf[layer], dec[layer], rows_per_step, top_k, num_gpus, tile_rows
+        )
         rk = l2p[layer] // per
         done = greedy_swaps(
             values, rk, num_gpus, budget=budget, eps=eps, weights=weights
@@ -287,6 +334,15 @@ def swap_rebalance(
                 per,
                 None if hot_first is True else int(hot_first),
             )
+            l2p[layer, p2l[layer]] = slots
+        if (
+            cold_first > 0
+            and len(done) >= max(1, cold_first_min_swaps)
+            and top_volume > 0
+            and float(volume[layer]) >= cold_first * top_volume
+        ):
+            # Ties keep their present slot order (`order_within_ranks`).
+            p2l[layer] = order_within_ranks(p2l[layer], -pf[layer], per, None)
             l2p[layer, p2l[layer]] = slots
     dev = old_p2l.device
     return (
@@ -1083,6 +1139,26 @@ class GatePermuteRuntime:
         return self.apply_commit(
             layer_id, self.stage_commit(layer_id, old_p2l, new_p2l)
         )
+
+    def reset_stats(self) -> None:
+        """Everything counted so far is dropped (ATOM_EPLB_SKIP_STEPS): the
+        loads, the decode samples still held by slot, and the operating
+        point's counters, the drafter's too. A local write; the manager calls
+        it in the same step on every rank."""
+        self.dec_raw.zero_()
+        self._raw_dirty = False
+        self.dec_load.zero_()
+        if self.pf_total is not None:
+            self.pf_total.zero_()
+        self.dec_rows = self.dec_steps = 0
+        self.window_rows = self.window_steps = 0
+        mtp = self.mtp
+        if mtp is not None:
+            mtp.dec_raw.zero_()
+            mtp._raw_dirty = False
+            mtp.dec_load.zero_()
+            mtp.rows = mtp.steps = 0
+            mtp.window_rows = mtp.window_steps = 0
 
     def describe(self) -> str:
         return (

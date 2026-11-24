@@ -1296,6 +1296,39 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and the objective gain (relative to the mean rank load) a swap needs.
     "ATOM_EPLB_SWAP_BUDGET": lambda: max(0, _int_env("ATOM_EPLB_SWAP_BUDGET", 16)),
     "ATOM_EPLB_SWAP_EPS": lambda: float(os.getenv("ATOM_EPLB_SWAP_EPS") or 0.005),
+    # The swap objective's decode term at a high decode load. Its default is the
+    # chance an expert is active in a decode step, which is its tile count while
+    # a step gives an expert at most one tile of rows. Where a step gives nearly
+    # every expert rows and a hot one several tiles (DEP8 c1024: 2500-3500 decode
+    # rows a step in the group) that chance is 1 for all of them and says nothing:
+    # a tile size N > 0 makes the term the expert's expected N-row tiles a step
+    # (0, default: the active chance). The MoE kernels work in 64-row tiles.
+    "ATOM_EPLB_TILE_ROWS": lambda: max(0, _int_env("ATOM_EPLB_TILE_ROWS", 0)),
+    # The swap policy orders the experts of every rank by ascending prefill load
+    # (the coldest in the rank's first slot) in the layers whose prefill picks are
+    # at least this share of the busiest layer's, each time it swaps at least
+    # ATOM_EPLB_COLD_FIRST_MIN_SWAPS experts in such a layer. The large-input
+    # expert kernel sends a rank's experts in slot order and pre-sends the first
+    # ones. 0 (default): off. Takes those layers from ATOM_EPLB_HOT_FIRST.
+    "ATOM_EPLB_COLD_FIRST": lambda: max(
+        0.0, float(os.getenv("ATOM_EPLB_COLD_FIRST") or 0.0)
+    ),
+    "ATOM_EPLB_COLD_FIRST_MIN_SWAPS": lambda: max(
+        1, _int_env("ATOM_EPLB_COLD_FIRST_MIN_SWAPS", 1)
+    ),
+    # A plan of fewer swaps than this over the target layers is dropped: the
+    # evaluation then moves nothing, as one that finds no swap (it counts toward
+    # ATOM_EPLB_FREEZE_IDLE), and the next one plans afresh. A migration stops
+    # every rank for a few tenths of a second whatever it moves, so a placement
+    # that has converged should not keep paying for a handful of swaps. With the
+    # target layers staying, a draft-layer plan (ATOM_EPLB_MTP) of fewer than
+    # ATOM_EPLB_MTP_MIN_SWAPS swaps is dropped too. 0 (default): every plan runs.
+    "ATOM_EPLB_MIN_SWAPS": lambda: max(0, _int_env("ATOM_EPLB_MIN_SWAPS", 0)),
+    "ATOM_EPLB_MTP_MIN_SWAPS": lambda: max(0, _int_env("ATOM_EPLB_MTP_MIN_SWAPS", 0)),
+    # Gate-permute: what is counted in the first N prefill-bearing steps is
+    # dropped before the first rebalance is scheduled (a harness that sends a
+    # synthetic warm-up before its client). 0 (default): everything counts.
+    "ATOM_EPLB_SKIP_STEPS": lambda: max(0, _int_env("ATOM_EPLB_SKIP_STEPS", 0)),
     # Logging only: a placement table (ATOM_EXPERT_PLACEMENT's format) the
     # rebalance metrics are also computed for.
     "ATOM_EPLB_REF_PLACEMENT": lambda: os.getenv("ATOM_EPLB_REF_PLACEMENT") or None,
