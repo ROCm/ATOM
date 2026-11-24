@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Pipeline-parallel EngineCore: one per PP stage.
 # Head (stage 0) owns the Scheduler; downstream stages are stateless executors.
-# Hidden states move over NCCL (pp_comm.py); batch metadata and sampled tokens
-# cross stages via ZMQ (pp_transport.py).
+# Hidden states move over NCCL (pp_comm.py) or HIP IPC (pp_ipc.py); batch
+# metadata and sampled tokens cross stages via ZMQ (pp_transport.py).
 
 import logging
 import queue
 import time
 from collections import deque
 
+from atom.distributed.pp_ipc import pp_ipc_enabled
 from atom.distributed.pp_transport import PPStageTransport
 from atom.kv_transfer.disaggregation.pp_kv_aggregator import PPKVAggregator
 from atom.kv_transfer.disaggregation.types import (
@@ -32,8 +33,10 @@ logger = logging.getLogger("atom")
 _PP_IDLE_POLL_MS = 1
 
 
-def pp_max_inflight(pp_size: int) -> int:
-    return envs.ATOM_PP_MAX_INFLIGHT or pp_size
+def pp_max_inflight(pp_size: int, ipc_boundary: bool = False) -> int:
+    """ATOM_PP_MAX_INFLIGHT, else the stage count, or twice it over the IPC
+    stage boundary (`pp_ipc`), whose transfers overlap compute."""
+    return envs.ATOM_PP_MAX_INFLIGHT or (2 * pp_size if ipc_boundary else pp_size)
 
 
 class PPEngineCoreProc(EngineCore):
@@ -43,7 +46,11 @@ class PPEngineCoreProc(EngineCore):
         self.pp_size = config.pipeline_parallel_size
         self.is_head = self.pp_rank == 0
         self.is_last = self.pp_rank == self.pp_size - 1
-        self.pp_max_inflight = pp_max_inflight(self.pp_size)
+        ipc = pp_ipc_enabled(config)
+        self.pp_max_inflight = pp_max_inflight(self.pp_size, ipc)
+        # Over the IPC boundary the last stage collects a batch's sampled ids
+        # after launching the next forward (`_downstream_busy_loop`).
+        self.pp_last_async_out = self.is_last and ipc
         super().__init__(config, input_address, output_address)
         self.pp_transport = PPStageTransport(
             self.pp_rank,
@@ -475,6 +482,12 @@ class PPEngineCoreProc(EngineCore):
         shutdown = False
         metrics_interval = envs.ATOM_METRICS_UPDATE_INTERVAL_S
         next_metrics_push = 0.0
+        # (batch, forward output) not reported yet, oldest first: over the IPC
+        # boundary the last stage reports a batch after launching the next one.
+        async_last = getattr(self, "pp_last_async_out", False)
+        if async_last:
+            self.runner_mgr.call_func("set_pp_async_out", wait_out=True)
+        unreported: deque = deque()
         try:
             while True:
                 self.utility_handler.process_queue(self.utility_queue, self)
@@ -486,6 +499,8 @@ class PPEngineCoreProc(EngineCore):
                 if shutdown:
                     break
                 if self._is_engine_held():
+                    if unreported:
+                        self._report_last_stage(unreported)
                     # The head waits for every stage's report before a KV
                     # change, so a fenced stage still reports; one whose
                     # weights, and so its KV pool, are released runs nothing.
@@ -493,7 +508,12 @@ class PPEngineCoreProc(EngineCore):
                         self._poll_and_send_kv_status()
                     time.sleep(HELD_POLL_S)
                     continue
-                batch = self.pp_transport.recv_metadata(timeout_ms=metadata_poll_ms)
+                batch = self.pp_transport.recv_metadata(
+                    timeout_ms=0 if unreported else metadata_poll_ms
+                )
+                if batch is None and unreported:
+                    self._report_last_stage(unreported)
+                    continue
                 if batch is None:
                     if self.kv_transfer_enabled:
                         self._poll_and_send_kv_status()
@@ -519,12 +539,23 @@ class PPEngineCoreProc(EngineCore):
                 if self.kv_transfer_enabled:
                     self._poll_and_send_kv_status()
 
-                if self.is_last:
+                if async_last:
+                    # Older batches first (FIFO), now that this one is launched.
+                    self._report_last_stage(unreported)
+                    unreported.append((batch, fwd_out))
+                    if not isinstance(fwd_out, str):
+                        self._report_last_stage(unreported)
+                elif self.is_last:
                     if batch.produces_output():
                         self.pp_transport.send_completion(batch.req_ids, fwd_out)
                     elif batch.pp_completion_ack:
                         self.pp_transport.send_completion(batch.req_ids)
         finally:
+            try:
+                if unreported:
+                    self._report_last_stage(unreported)
+            except Exception:
+                logger.exception("last-stage completions during shutdown failed")
             # One last report so the head's exit drain can still reach its
             # per-stage quorum for saves that landed after the final poll.
             try:
@@ -539,6 +570,18 @@ class PPEngineCoreProc(EngineCore):
             # Only the head publishes KV events; a later stage's scheduler has
             # the null publisher.
             self.scheduler.close_kv_connector()
+
+    def _report_last_stage(self, unreported: deque) -> None:
+        """Last stage: send the completions of `unreported` in order, waiting
+        for a deferred output's sampled ids (`pp_collect_output`)."""
+        while unreported:
+            batch, fwd_out = unreported.popleft()
+            if isinstance(fwd_out, str):
+                fwd_out = self.runner_mgr.call_func("pp_collect_output", wait_out=True)
+            if batch.produces_output():
+                self.pp_transport.send_completion(batch.req_ids, fwd_out)
+            elif batch.pp_completion_ack:
+                self.pp_transport.send_completion(batch.req_ids)
 
     def _poll_and_send_kv_status(self):
         """Downstream: collect TP-aggregated KV status and send to head."""
