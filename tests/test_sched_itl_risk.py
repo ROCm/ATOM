@@ -114,7 +114,9 @@ def _sched(**env):
 
 
 def _decoding(seq_factory, max_tokens, done, first_age_s):
-    seq = seq_factory([1, 2, 3, 4], sampling_params=SamplingParams(max_tokens=max_tokens))
+    seq = seq_factory(
+        [1, 2, 3, 4], sampling_params=SamplingParams(max_tokens=max_tokens)
+    )
     seq.status = SequenceStatus.RUNNING
     seq.type = SequenceType.DECODE
     for _ in range(done):

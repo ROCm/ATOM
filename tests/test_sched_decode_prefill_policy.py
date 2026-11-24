@@ -91,7 +91,7 @@ def test_idle_cap_applies_only_without_decodes(seq_factory):
 
 
 def test_idle_and_decode_caps_together(seq_factory):
-    env = dict(ATOM_SCHED_IDLE_PREFILL_CAP=256, ATOM_SCHED_DECODE_PREFILL_CAP=128)
+    env = {"ATOM_SCHED_IDLE_PREFILL_CAP": 256, "ATOM_SCHED_DECODE_PREFILL_CAP": 128}
     sched = _sched(**env)
     sched.add(seq_factory(list(range(400))))
     batch, _ = sched.schedule()
@@ -107,3 +107,48 @@ def test_idle_and_decode_caps_together(seq_factory):
 def test_idle_cap_off_by_default_and_clamped(seq_factory):
     assert _sched()._idle_prefill_cap == 0
     assert _sched(ATOM_SCHED_IDLE_PREFILL_CAP=4096)._idle_prefill_cap == 512
+
+
+def _sched_no_chunking(**env):
+    with mock.patch.dict("os.environ", {k: str(v) for k, v in env.items()}):
+        return Scheduler(
+            MockConfig(
+                max_num_seqs=4,
+                max_num_batched_tokens=512,
+                max_model_len=4096,
+                num_kvcache_blocks=400,
+                enable_chunked_prefill=False,
+            )
+        )
+
+
+def test_caps_are_ignored_without_chunked_prefill(seq_factory):
+    # A 400-token prompt cannot be split; under a 128-token cap it would have
+    # been rejected as "input tokens > max_num_batched_tokens=128".
+    sched = _sched_no_chunking(ATOM_SCHED_DECODE_PREFILL_CAP=128)
+    assert sched._decode_prefill_cap == 0
+    sched.running = deque([_decoding(seq_factory, [1, 2, 3, 4])])
+    sched.add(seq_factory(list(range(400))))
+    batch, _ = sched.schedule()
+    assert batch.total_tokens_num_prefill == 400
+    assert not sched._rejected
+
+
+def test_capped_tick_judges_capacity_against_the_configured_budget(seq_factory):
+    sched = _sched(ATOM_SCHED_DECODE_PREFILL_CAP=128)
+    seq = seq_factory(list(range(400)))
+    sched.enable_chunked_prefill = False  # atomic prompt (as multimodal is)
+    assert sched._unschedulable_reason(seq) is None  # 400 <= 512
+    sched.max_num_batched_tokens = 128
+    sched._uncapped_max_num_batched_tokens = 512  # inside a capped tick
+    assert sched._unschedulable_reason(seq) is None
+    sched._uncapped_max_num_batched_tokens = None  # same budget, a real limit
+    assert "max_num_batched_tokens=128" in sched._unschedulable_reason(seq)
+
+
+def test_nonpositive_duty_time_constant_is_rejected_at_startup():
+    import pytest
+
+    for bad in ("0", "-1", "nan"):
+        with pytest.raises(ValueError):
+            _sched(ATOM_SCHED_PREFILL_DUTY=0.5, ATOM_SCHED_PREFILL_DUTY_TAU_S=bad)

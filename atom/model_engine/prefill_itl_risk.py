@@ -80,7 +80,8 @@ class ItlRiskHold:
                         self.tokens_per_step = (
                             g
                             if self.tokens_per_step is None
-                            else self.tokens_per_step + _EMA * (g - self.tokens_per_step)
+                            else self.tokens_per_step
+                            + _EMA * (g - self.tokens_per_step)
                         )
         self._last_tokens = tokens
         self._kinds = [self._kinds[1], kind]

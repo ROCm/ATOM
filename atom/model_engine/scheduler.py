@@ -707,6 +707,9 @@ class Scheduler:
         self.prefill_token_graphs = prefill_token_graphs
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
+        # The configured budget while `schedule()` runs one tick under a lower
+        # cap (None otherwise): what static admissibility is judged against.
+        self._uncapped_max_num_batched_tokens: int | None = None
         # Prefill token budget of a step taken while decodes are running: every
         # running decode stalls for the whole prefill step, so a smaller cap
         # bounds each stall. 0 keeps `max_num_batched_tokens`. Never below one
@@ -719,13 +722,21 @@ class Scheduler:
                 else 0
             )
             cap = max(cap, (spec_k + 1) * self.max_num_seqs)
+        idle_cap = envs.ATOM_SCHED_IDLE_PREFILL_CAP
+        if (cap > 0 or idle_cap > 0) and not config.enable_chunked_prefill:
+            # A prompt longer than the capped budget could never be admitted
+            # (it cannot be split), so the caps only make sense with chunking.
+            logger.warning(
+                "ATOM_SCHED_DECODE_PREFILL_CAP / ATOM_SCHED_IDLE_PREFILL_CAP "
+                "ignored: chunked prefill is disabled"
+            )
+            cap = idle_cap = 0
         self._decode_prefill_cap = min(cap, self.max_num_batched_tokens)
         # the same budget for a step taken while NO decode
         # runs (warm-up storms, idle engine). Bounds the largest prefill step,
         # and with it the activation peak the caching allocator keeps, without
         # touching what `max_num_batched_tokens` sizes elsewhere (the profiling
         # forward, the delayer's fill target, chunk geometry). 0 = off.
-        idle_cap = envs.ATOM_SCHED_IDLE_PREFILL_CAP
         self._idle_prefill_cap = (
             min(idle_cap, self.max_num_batched_tokens) if idle_cap > 0 else 0
         )
@@ -1808,9 +1819,11 @@ class Scheduler:
                 seq.arrive_time
                 for seq in itertools.chain(
                     self._waiting_prefills(),
-                    (s for s in self.running if s.is_partial_prefill)
-                    if self._partial_prefill_count
-                    else (),
+                    (
+                        (s for s in self.running if s.is_partial_prefill)
+                        if self._partial_prefill_count
+                        else ()
+                    ),
                 )
             ),
             default=None,
@@ -2213,9 +2226,11 @@ class Scheduler:
             )
         # Only processors with explicit spans and request leases can chunk.
         is_multimodal = self._requires_atomic_prefill(seq)
-        if (
-            not self.enable_chunked_prefill or is_multimodal
-        ) and num_tokens > self.max_num_batched_tokens:
+        # Static capacity is the configured budget, not this tick's cap
+        # (`schedule()` lowers `max_num_batched_tokens` for one tick): a prompt
+        # above the cap only waits for a tick with room, it is not rejected.
+        budget = self._uncapped_max_num_batched_tokens or self.max_num_batched_tokens
+        if (not self.enable_chunked_prefill or is_multimodal) and num_tokens > budget:
             remedy = (
                 "Increase --max-num-batched-tokens or shorten the prompt "
                 "(multimodal prompts without embedding spans are never chunked)."
@@ -2225,7 +2240,7 @@ class Scheduler:
             )
             return (
                 f"input tokens={num_tokens} > max_num_batched_tokens="
-                f"{self.max_num_batched_tokens}. {remedy}"
+                f"{budget}. {remedy}"
             )
         bm = self.block_manager
         total_blocks = bm.kv.num_usable_blocks
@@ -2319,10 +2334,12 @@ class Scheduler:
         if cap:
             full = self.max_num_batched_tokens
             self.max_num_batched_tokens = cap
+            self._uncapped_max_num_batched_tokens = full
             try:
                 result = self._schedule()
             finally:
                 self.max_num_batched_tokens = full
+                self._uncapped_max_num_batched_tokens = None
         else:
             result = self._schedule()
         if self._prefill_duty is not None or self._itl_risk is not None:

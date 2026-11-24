@@ -59,7 +59,9 @@ def _sched(**env):
 
 
 def _decoding(seq_factory, max_tokens):
-    seq = seq_factory([1, 2, 3, 4], sampling_params=SamplingParams(max_tokens=max_tokens))
+    seq = seq_factory(
+        [1, 2, 3, 4], sampling_params=SamplingParams(max_tokens=max_tokens)
+    )
     seq.status = SequenceStatus.RUNNING
     seq.type = SequenceType.DECODE
     return seq
@@ -92,11 +94,11 @@ def test_holds_prefill_while_short_decode_finishes(seq_factory):
 
 
 def test_no_hold_for_long_or_distant_requests(seq_factory):
-    env = dict(
-        ATOM_SCHED_FINISH_HOLD_LEFT=64,
-        ATOM_SCHED_FINISH_HOLD_MAX_MS=500,
-        ATOM_SCHED_FINISH_HOLD_MAX_TOKENS=400,
-    )
+    env = {
+        "ATOM_SCHED_FINISH_HOLD_LEFT": 64,
+        "ATOM_SCHED_FINISH_HOLD_MAX_MS": 500,
+        "ATOM_SCHED_FINISH_HOLD_MAX_TOKENS": 400,
+    }
     for max_tokens in (300, 1000):  # 300 left > 64; 1000 > cap
         sched = _sched(**env)
         sched.running = deque([_decoding(seq_factory, max_tokens)])
