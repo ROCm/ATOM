@@ -252,7 +252,9 @@ def stage_iscore(c, lead, span, span_max, ch0, width, max_chunks):
 
 
 @traced
-def stage_ilist(c, t, j, share, kind, level, bound_max, max_chunks, seg):
+def stage_ilist(
+    c, t, j, share, kind, level, bound_max, max_chunks, seg, gathers_ok=True
+):
     """List j of ``level`` for token t (``share``: its (column bound, columns
     on this rank, split), ``_shares``; a split build's FULL rows carry no
     bound) of a tree of ``seg`` segments; see the module. Only the lists
@@ -269,6 +271,8 @@ def stage_ilist(c, t, j, share, kind, level, bound_max, max_chunks, seg):
     # a candidate producer's row of TOPK_BLOCKS blocks or more: its selection
     # ranks its candidate blocks' rows, compacted to the row's front (``_compact``)
     gathers = False if raw is None else (a["iprod"] != 0) & ip.compacts(raw)
+    if const_expr(not gathers_ok):
+        gathers = False
     if j < ip.list_count(bound, level, k, seg):
         n = ip.list_inputs(bound, level, j, k, seg)
         final = ip.is_final(bound, level, k, seg)
@@ -283,8 +287,9 @@ def stage_ilist(c, t, j, share, kind, level, bound_max, max_chunks, seg):
                 if const_expr(raw is not None):
                     # a compacted row's columns: its candidates' flag instead
                     count = sel(gathers, 0, count)
-                    if gathers & (tid == 0):
-                        c["poll"]([(_icrdy(c), t, 1)])
+                    if const_expr(gathers is not False):  # noqa: SIM102
+                        if gathers & (tid == 0):
+                            c["poll"]([(_icrdy(c), t, 1)])
             else:
                 first, count = ip.block_chunks(raw, j)
             if tid < count:
@@ -664,6 +669,15 @@ def _own_rows(c, s):
     return 0, s
 
 
+# a candidate producer's selection tasks' first CTA when they take every column:
+# past its blk tree's first-level lists (6 rows x 7 segments at 400K columns)
+PROD_SEL0 = 48
+# a candidate producer's widest row up to which its selection takes every
+# column (32 segments: 6 rows' first level within the grid beside the blk tree;
+# at 400K columns, 49 segments, it ran slower than the compacted columns)
+PROD_FULL_MAX = 32 * ip.SEG
+
+
 @traced
 def run_indexer(c, s, bid, bound_max):
     """Every indexer stage of a selecting layer, the tasks of each laid out from
@@ -689,10 +703,28 @@ def run_indexer(c, s, bid, bound_max):
     if a["ilift"] != 0:
         _run_tree(c, t0, n, bid, "sel", _whole(c, t0, n), reindex, max_chunks, rseg)
     elif a["iprod"] != 0:
-        # its candidates' columns (``index_plan.candidate_bound``), apart from
-        # a REINDEX row's tree: that one computes none
-        cols = [ip.candidate_bound(b) for b in _bounds(c, t0, n)]
-        _run_tree(c, t0, n, bid, "sel", (_whole_of, cols), reindex, max_chunks, rseg)
+        bounds = _bounds(c, t0, n)
+        widest = bounds[0]
+        for b in bounds[1:]:
+            widest = fx.max(widest, b)
+        if widest > PROD_FULL_MAX:
+            # past PROD_FULL_MAX columns the full tree's first level outgrows
+            # the grid: its candidates' columns (``index_plan.candidate_bound``)
+            # after the blk tree's compaction, apart from a REINDEX row's tree
+            cols = [ip.candidate_bound(b) for b in bounds]
+            _run_tree(
+                c, t0, n, bid, "sel", (_whole_of, cols), reindex, max_chunks, rseg
+            )
+        else:
+            # every column, a FULL row's tree, on CTAs from PROD_SEL0 (past the
+            # blk tree's first level): the attention waits on this selection
+            # alone, so it runs beside the blk tree and compaction, which only
+            # the later REINDEX layers read (``index_plan.compacts``: the same
+            # answer)
+            _run_tree(
+                c, t0, n, bid, "sel", _whole(c, t0, n), full, max_chunks, seg,
+                PROD_SEL0, False,
+            )  # fmt: skip
     else:
         _run_tree(c, t0, n, bid, "sel", _shares(c, t0, n), full, max_chunks, seg)
         if const_expr(c["index_split"]):
@@ -759,7 +791,9 @@ def run_scores(c, t0, n, bid, bounds, max_chunks):
 
 
 @traced
-def _run_tree(c, t0, n, bid, kind, rows, bound_max, max_chunks, seg):
+def _run_tree(
+    c, t0, n, bid, kind, rows, bound_max, max_chunks, seg, first=0, gathers_ok=True
+):
     k = ip.KINDS[kind]
     decode, words = rows
     for level in range_constexpr(ip.top_level(kind, bound_max, seg) + 1):
@@ -768,10 +802,12 @@ def _run_tree(c, t0, n, bid, kind, rows, bound_max, max_chunks, seg):
             for w in words
         ]
         enter_stage(f"k2a.i{kind}{level}")
-        for task in range(first_task(bid, 0), ip.flat_total(counts), BLOCKS):
+        for task in range(first_task(bid, first), ip.flat_total(counts), BLOCKS):
             t, j = ip.flat_task(counts, task)
             share = decode(pick(words, t))
-            stage_ilist(c, t0 + t, j, share, kind, level, bound_max, max_chunks, seg)
+            stage_ilist(
+                c, t0 + t, j, share, kind, level, bound_max, max_chunks, seg, gathers_ok
+            )
 
 
 @traced
