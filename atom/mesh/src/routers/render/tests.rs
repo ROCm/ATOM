@@ -4479,6 +4479,40 @@ mod g_complete_suffix {
         assert_eq!(last["text"], unary[0]["text"]);
         assert!(last["text"].as_str().unwrap().ends_with('.'), "{last}");
     }
+
+    /// A streamed chat replays a long Complete 256 ids at a time, each piece copied
+    /// alone rather than cut from a copy of the whole remaining suffix.
+    #[test]
+    fn a_replayed_piece_copies_only_its_own_ids() {
+        use crate::routers::token_handle::token_chunk::{TokenLogprob, TokenLogprobs};
+        let ids: Vec<u32> = (0..65_536).collect();
+        let item = TokenLogprob {
+            token_id: 0,
+            logprob: -1.0,
+            decoded_text: None,
+            top: Vec::new(),
+        };
+        let complete = TokenChunk::Complete {
+            token_ids: ids.clone(),
+            finish_reason: FinishReason::Stop,
+            matched_stop: None,
+            usage: Usage::default(),
+            logprobs: Some(TokenLogprobs {
+                items: vec![item; ids.len()],
+            }),
+            input_logprobs: None,
+            meta: WorkerMeta::default(),
+        };
+        let piece = chat_streaming::unstreamed(&complete, 1024, 256).unwrap();
+        assert_eq!((piece[0], piece.len(), piece.capacity()), (1024, 256, 256));
+        let logprobs = chat_streaming::unstreamed_logprobs(&complete, 1024, 256).unwrap();
+        assert_eq!(
+            (logprobs.items.len(), logprobs.items.capacity()),
+            (256, 256)
+        );
+        let whole = chat_streaming::unstreamed(&complete, 1024, usize::MAX).unwrap();
+        assert_eq!(whole.len(), 65_536 - 1024); // /generate's whole suffix
+    }
 }
 
 mod h_atom_native_tool_calls {

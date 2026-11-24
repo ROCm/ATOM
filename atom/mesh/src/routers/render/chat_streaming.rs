@@ -173,14 +173,10 @@ async fn run_chat_stream(
             },
         };
         // A Complete's ids past the partials' are streamed first, as one more partial.
-        let chunk = match unstreamed(&chunk, consumed) {
-            Some(mut rest) => {
-                // In pieces, so no delta outgrows the reasoning and tool parsers' buffers.
-                rest.truncate(SUFFIX_PIECE);
-                let logprobs = unstreamed_logprobs(&chunk, consumed).map(|mut logprobs| {
-                    logprobs.items.truncate(rest.len());
-                    logprobs
-                });
+        // In pieces, so no delta outgrows the reasoning and tool parsers' buffers.
+        let chunk = match unstreamed(&chunk, consumed, SUFFIX_PIECE) {
+            Some(rest) => {
+                let logprobs = unstreamed_logprobs(&chunk, consumed, rest.len());
                 held = Some(chunk);
                 TokenChunk::Partial {
                     token_ids: rest,
@@ -484,27 +480,37 @@ async fn run_chat_stream(
 /// The most ids of a Complete's unstreamed suffix sent as one delta.
 const SUFFIX_PIECE: usize = 256;
 
-/// The ids of a Complete past the `consumed` its partials streamed: SGLang's and vLLM's
-/// carry every output id, ATOM's streamed one none.
-pub(super) fn unstreamed(chunk: &TokenChunk, consumed: usize) -> Option<Vec<u32>> {
+/// The first `limit` ids of a Complete past the `consumed` its partials streamed:
+/// SGLang's and vLLM's carry every output id, ATOM's streamed one none.
+pub(super) fn unstreamed(chunk: &TokenChunk, consumed: usize, limit: usize) -> Option<Vec<u32>> {
     match chunk {
         TokenChunk::Complete { token_ids, .. } => token_ids
             .get(consumed..)
             .filter(|rest| !rest.is_empty())
-            .map(<[u32]>::to_vec),
+            .map(|rest| rest[..rest.len().min(limit)].to_vec()),
         TokenChunk::Partial { .. } => None,
     }
 }
 
 /// The logprobs of those ids, where the Complete's cover every id it carries.
-fn unstreamed_logprobs(chunk: &TokenChunk, consumed: usize) -> Option<TokenLogprobs> {
+pub(super) fn unstreamed_logprobs(
+    chunk: &TokenChunk,
+    consumed: usize,
+    limit: usize,
+) -> Option<TokenLogprobs> {
     match chunk {
         TokenChunk::Complete {
             token_ids,
             logprobs: Some(logprobs),
             ..
         } if logprobs.items.len() == token_ids.len() => Some(TokenLogprobs {
-            items: logprobs.items.get(consumed..)?.to_vec(),
+            items: logprobs
+                .items
+                .get(consumed..)?
+                .iter()
+                .take(limit)
+                .cloned()
+                .collect(),
         }),
         _ => None,
     }
