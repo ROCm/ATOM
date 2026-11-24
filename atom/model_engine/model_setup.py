@@ -155,7 +155,7 @@ def get_model(config: Config, device: torch.device, load: ModelLoader) -> nn.Mod
     # Under a plugin plan the recipe's model class (a plugin package's model,
     # with its seams in it); else ATOM's own model.
     model_class = resolve_obj_by_qualname(
-        plugin_host.model_class_for(arch, support_model_arch_dict[arch])
+        plugin_host.model_class_for(arch, support_model_arch_dict[arch], config)
     )
     # The model construction depends on quant_config,
     # so we must complete the remapping for layers before constructing the model.
@@ -171,6 +171,9 @@ def get_model(config: Config, device: torch.device, load: ModelLoader) -> nn.Mod
 
 def build_model(config: Config, model_class: type, device: torch.device) -> nn.Module:
     """Construct the model on ``device``, without its weights."""
+    from atom import plugin_host
+
+    plugin_host.new_model_build()
     torch.set_default_device(device)
     try:
         return model_class(config)

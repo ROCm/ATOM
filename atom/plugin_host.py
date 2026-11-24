@@ -896,19 +896,44 @@ def plugin_code_digest(roots: Iterable[str]) -> str:
 # model, with its seams in it); without them ATOM's own model, unchanged.
 
 
-def model_class_for(arch: str, default: str) -> str:
+def _recipe_model_options(config: Any):
+    """The recipe's model options from ``config.plugin_source`` in a process that
+    builds the model without configuring the host (the weight-cache daemon:
+    it must build the class the servers it serves build); None without one."""
+    from atom.plugin_recipe import RecipeSource
+    from atom.utils import envs
+
+    source = getattr(config, "plugin_source", None)
+    if not envs.ATOM_PLUGIN_HOST or not isinstance(source, RecipeSource):
+        return None
+    plan = source.resolve()
+    return None if plan is None else plan.model_options
+
+
+def model_class_for(arch: str, default: str, config: Any = None) -> str:
     """The qualname to build for ``arch``: the recipe's
     ``model_options.target_model_cls``, else ATOM's."""
-    if not plugin_model_active():
-        return default
-    return model_options().target_model_cls or default
+    if plugin_model_active():
+        return model_options().target_model_cls or default
+    options = None if _plan is not None else _recipe_model_options(config)
+    return getattr(options, "target_model_cls", None) or default
 
 
-def draft_model_class_for(arch: str, default: str) -> str:
+def draft_model_class_for(arch: str, default: str, config: Any = None) -> str:
     """As `model_class_for`, for a draft architecture."""
-    if not plugin_model_active():
-        return default
-    return model_options().draft_model_cls or default
+    if plugin_model_active():
+        return model_options().draft_model_cls or default
+    options = None if _plan is not None else _recipe_model_options(config)
+    return getattr(options, "draft_model_cls", None) or default
+
+
+def new_model_build() -> None:
+    """A model is about to be built (again): forget the opaque spans of an
+    earlier build of this process (a weight-cache client that fell back to a
+    disk load builds the model twice), so its layers register anew."""
+    with _lock:
+        _spans.clear()
+        _spans_n.clear()
 
 
 def model_options():

@@ -502,3 +502,42 @@ def test_one_inferred_owner_may_serve_several_seams():
 def test_a_recipes_metadata_fields_are_ignored():
     plan = _plan(seams={"toy.block.mix": []}, purpose="layer bench", baseline="x")
     assert plan.providers == ()
+
+
+def test_a_process_without_a_plan_builds_the_recipes_model_class():
+    """The weight-cache daemon builds the model without configuring the host: the class comes from the config's
+    recipe, so the servers it serves can map its weights."""
+    from types import SimpleNamespace
+
+    import json
+
+    doc = {
+        "schema": recipes.RECIPE_SCHEMA,
+        "arch": ARCH,
+        "model_options": {
+            "target_model_cls": "pkg.Model",
+            "draft_model_cls": "pkg.Draft",
+        },
+    }
+    plan = recipes.resolve([doc])
+    source = recipes.RecipeSource(
+        (json.dumps(doc, sort_keys=True),), plan.plan_id, False
+    )
+    config = SimpleNamespace(plugin_source=source)
+    assert host.model_class_for("Arch", "atom.Model", config) == "pkg.Model"
+    assert host.draft_model_class_for("Arch", "atom.Draft", config) == "pkg.Draft"
+    assert host.model_class_for("Arch", "atom.Model") == "atom.Model"
+
+
+def test_a_model_built_again_registers_its_spans_anew():
+    (
+        host.seam({**_TOY, "name": "toy.block.span", "graph": "opaque_op"})
+        if "toy.block.span" not in host.SEAMS
+        else None
+    )
+    host._owned = frozenset({"toy.block.span"})
+    host.span_op("toy.block.span", "L0", lambda x, e: x, lambda x, e: x)
+    with pytest.raises(ValueError, match="not unique"):
+        host.span_op("toy.block.span", "L0", lambda x, e: x, lambda x, e: x)
+    host.new_model_build()
+    host.span_op("toy.block.span", "L0", lambda x, e: x, lambda x, e: x)

@@ -310,7 +310,9 @@ class Drafter(abc.ABC):
         draft_arch = draft_hf.architectures[0]
         model_class = resolve_obj_by_qualname(
             plugin_host.draft_model_class_for(
-                draft_arch, support_draft_model_arch_dict[draft_arch]
+                draft_arch,
+                support_draft_model_arch_dict[draft_arch],
+                self.config,
             )
         )
         self.model = self._build_draft_model(model_class)
