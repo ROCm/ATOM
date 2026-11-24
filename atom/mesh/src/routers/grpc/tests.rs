@@ -1827,6 +1827,9 @@ mod i_atom_refusals {
             .load(&id, "m", "hf-test", || async { Ok(hf_tokenizer()) })
             .await
             .unwrap();
+        ctx.tokenizer_inline_templates
+            .write()
+            .insert(id, "{{ messages }}".into());
         let served = worker("m", runtime, WorkerType::Regular);
         ctx.worker_registry.register(served.clone());
         ctx.worker_registry
