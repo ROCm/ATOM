@@ -108,6 +108,7 @@ from atom.model_engine.sequence import Sequence, SequenceStatus
 from atom.models.utils import get_pp_indices
 from atom.utils import envs, get_open_port, make_zmq_path, zmq_socket_ctx
 from atom.utils.network import get_ip
+from atom.utils.visible_devices import physical_gpu_index
 
 logger = logging.getLogger("atom")
 
@@ -1155,19 +1156,14 @@ class MooncakeConnector(KVConnectorBase):
         phys_idx: int | None = None
         if self.protocol.strip().lower() != "tcp" and not configured_ib_device:
             visible_idx = torch.cuda.current_device()
-            # ROCR first, for the reason in numa_utils._physical_index: it
-            # filters before HIP, so a ROCR-only mask must not fall through to
-            # the identity mapping.
-            visible_env = (
-                os.environ.get("ROCR_VISIBLE_DEVICES")
-                or os.environ.get("HIP_VISIBLE_DEVICES")
-                or os.environ.get("CUDA_VISIBLE_DEVICES")
-            )
-            if visible_env:
-                visible_list = [d for d in visible_env.split(",") if d != ""]
-                phys_idx = int(visible_list[visible_idx])
-            else:
-                phys_idx = visible_idx
+            try:
+                phys_idx = physical_gpu_index(visible_idx)
+            except ValueError as e:
+                raise ValueError(
+                    f"Cannot auto-select the RDMA device: {e}. Set "
+                    "ATOM_MOONCAKE_IB_DEVICE (or kv_transfer_config ib_device) "
+                    "to name the HCA."
+                ) from e
         ib_devices = _select_ib_devices(
             self.protocol,
             configured_ib_device,

@@ -1000,6 +1000,40 @@ def test_mooncake_rdma_requires_gpu_index_without_explicit_device():
         mc._select_ib_device("rdma", "", None)
 
 
+def _rocr_uuid_mask(monkeypatch, tmp_path, mask):
+    """Two AMD GPUs in sysfs, amd-smi's 0 and 1, and a ROCR mask of UUIDs."""
+    root = tmp_path / "drm"
+    for card, bdf, unique_id in (
+        ("card1", "0000:75:00.0", "7c2431bef0a19e9c"),
+        ("card9", "0000:05:00.0", "b9ebac5f14bf98f1"),
+    ):
+        dev = tmp_path / "pci" / bdf
+        dev.mkdir(parents=True)
+        (dev / "vendor").write_text("0x1002\n")
+        (dev / "unique_id").write_text(unique_id + "\n")
+        (root / card).mkdir(parents=True)
+        (root / card / "device").symlink_to(dev)
+    monkeypatch.setattr("atom.utils.visible_devices._DRM_ROOT", str(root))
+    monkeypatch.setenv("ROCR_VISIBLE_DEVICES", mask)
+    monkeypatch.delenv("HIP_VISIBLE_DEVICES", raising=False)
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+
+
+def test_mooncake_rdma_auto_selects_hca_of_rocr_uuid(monkeypatch, tmp_path):
+    # card1 is the GPU at 0000:75:00.0, amd-smi's GPU 1, so NIC 1.
+    _rocr_uuid_mask(monkeypatch, tmp_path, "GPU-7c2431bef0a19e9c")
+    conn = _one_row_staging_consumer(monkeypatch, send=None)
+    assert conn.ib_devices == ["rdma1"]
+
+
+def test_mooncake_unknown_rocr_uuid_names_entry_and_override(monkeypatch, tmp_path):
+    _rocr_uuid_mask(monkeypatch, tmp_path, "GPU-00000000deadbeef")
+    with pytest.raises(
+        ValueError, match="'GPU-00000000deadbeef'.*ATOM_MOONCAKE_IB_DEVICE"
+    ):
+        _one_row_staging_consumer(monkeypatch, send=None)
+
+
 # ---------------------------------------------------------------------------
 # Producer per-layer region mapping (consumer_region_indices)
 # ---------------------------------------------------------------------------
