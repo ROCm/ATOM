@@ -1,0 +1,61 @@
+{
+  "source_run_id": 45233004275,
+  "source_url": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/45233004275",
+  "source_pr": "https://github.com/SemiAnalysisAI/InferenceX/pull/5090",
+  "run_attempt": 1,
+  "run_conclusion": "success",
+  "head_sha": "a911fbfe43e16ed549f9dcdbbf56b28d93fa6fb0",
+  "artifact_id": 14870818341,
+  "model": "amd/MiniMax-M3.1-Flash-Quark-MXFP4",
+  "image": "vllm/vllm-openai-rocm:minimax-m31-flash-75bc8cf1@sha256:f8e8ab239e5edb7c3070c5802fc7fc0cbb889513bf81183dfc98ce1c77e1dfe1",
+  "concurrency": 80,
+  "prefill": {
+    "workers": 1,
+    "tp": 4,
+    "gpus": 4
+  },
+  "decode": {
+    "workers": 2,
+    "tp": 4,
+    "gpus": 8
+  },
+  "total_gpus": 12,
+  "router": {
+    "name": "vllm-router",
+    "version": "0.1.16"
+  },
+  "interactivity_tok_s_user": 323.77594,
+  "token_throughput_per_chip": 49984.36589,
+  "successful_profiling_records": 15243,
+  "request_accounting": {
+    "records_total": 16134,
+    "records_profiled": 15243,
+    "records_dropped_total": 891,
+    "records_warmup_dropped": 884,
+    "records_error_dropped": 891,
+    "error_categories": {
+      "InvalidInferenceResultError": 891
+    }
+  },
+  "duration_seconds": 3610.9094,
+  "recipe_fingerprint": "4da01be4a9b1d0d555cd19d1222e4a0edfc0ebb7cc69a6bfe7e68119754d15b4",
+  "artifact_summary_sha256": "2b4142a90a4cc0f023786397ccb656be7eb265f32ace5c3812548e97913aa88c",
+  "metric_source_fields": [
+    "request_metrics.latency.full_response_intvty.p90",
+    "request_metrics.throughput.per_gpu.total_tput_tps"
+  ],
+  "precision": "Reuse published aggregate values directly. Do not invert the rounded full_response_itl field. No GPU rerun.",
+  "comparison_limits": [
+    "SA uses 1P2D/12 GPUs; PP4/DEP4 uses 1P1D/8 GPUs.",
+    "Node, parallel layout, backend flags and scheduler limits differ; per-chip normalization alone does not isolate a router effect.",
+    "The PR documents SA C80 prefill chunk4096 and GPU memory0.75, two TP4 decoders each max-num-seqs10; PP C80 retains its PP prefill settings and uses DEP4 max-num-seqs20 per rank."
+  ],
+  "tested_inferencex_sha": "258cced2d2f0f370e2a163d3d7d0dfacbedb1e06",
+  "srt_slurm_sha": "cc9db05dca9e775e9c5e2590f31099b39bae1032",
+  "agentx_version": "1.0.14",
+  "slurm_job_id": "55060",
+  "node_count": 2,
+  "recipe_variant": "disagg-mooncake-variants.yaml:override_c80",
+  "profiling_content_errors": 7,
+  "job_event_artifact_id": 14870578530
+}
