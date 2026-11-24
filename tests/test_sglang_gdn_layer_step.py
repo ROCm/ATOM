@@ -316,9 +316,12 @@ def test_conv_window_goes_to_the_slot_the_backend_did_not_cache(gdn, monkeypatch
 @pytest.fixture
 def run(monkeypatch):
     """Run a layer's forward for a forward batch. The plugin runtime, which
-    imports SGLang, is replaced by its current-batch lookup."""
+    imports SGLang, is replaced by batch metadata and its current-batch lookup."""
     current = []
     runtime = ModuleType("atom.plugin.sglang.runtime")
+    runtime.SGLangForwardBatchMetadata = SimpleNamespace(
+        build=lambda fb: SimpleNamespace(forward_batch=fb)
+    )
     runtime.get_current_forward_batch = lambda: current[-1]
     monkeypatch.setitem(sys.modules, runtime.__name__, runtime)
 
@@ -356,6 +359,20 @@ def test_verify_forward_takes_the_verify_path(gdn, monkeypatch, run):
     impl = _layer(gdn, monkeypatch)
     with pytest.raises(RuntimeError, match="TARGET_VERIFY requires an active"):
         run(impl, _batch(None, "verify"))
+
+
+def test_build_keeps_the_step_of_its_own_forward(gdn, monkeypatch, run):
+    ag = gdn.attention_gdn
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(static_forward_context={})
+    )
+    monkeypatch.setattr(ag, "get_current_atom_config", lambda: config)
+    for _ in range(2):
+        fb = _batch(_Linear(_metadata()), "verify")
+        fb.batch_size = 1
+        fb.positions = torch.arange(2)
+        fb.forward_mode.is_idle = lambda: False
+        assert ag.SGLangGDNForwardContext.build(fb).step.forward_batch is fb
 
 
 def test_bind_publishes_the_step_only_inside_the_forward(gdn, monkeypatch):
