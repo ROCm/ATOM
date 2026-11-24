@@ -276,18 +276,19 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
 }
 
 /// One model, one template across its live workers. An ATOM worker registering at
-/// `urls` whose template (`file`, else `inline`) differs from the one model `name`'s
-/// tokenizer carries, or while that loads its registered workers serve, is refused while
-/// another worker of the model is registered; changing it is a redeploy. With none,
-/// that tokenizer is dropped and loads afresh.
+/// `urls` whose template (its own file, else the file model `name`'s tokenizer was
+/// loaded with, else `--chat-template`, else the `advertised` one) differs from the one
+/// that tokenizer carries, or while that loads its registered workers serve, is refused
+/// while another worker of the model is registered; changing it is a redeploy. With
+/// none, that tokenizer is dropped and loads afresh.
 pub(crate) fn admit_model_template(
     app_context: &AppContext,
     name: &str,
     urls: &[String],
-    file: Option<&str>,
-    inline: Option<&str>,
+    own_file: Option<&str>,
+    advertised: Option<&str>,
 ) -> Result<(), String> {
-    let template = template_fingerprint(file, inline);
+    let router_file = app_context.router_config.chat_template.as_deref();
     let registered = app_context.worker_registry.get_by_model(name);
     let mut others = (registered.iter()).filter(|w| !urls.iter().any(|url| url == w.url()));
     let refused = || {
@@ -298,13 +299,17 @@ pub(crate) fn admit_model_template(
         ))
     };
     let Some(entry) = app_context.tokenizer_registry.get_by_name(name) else {
-        let router_file = app_context.router_config.chat_template.as_deref();
+        let template = template_fingerprint(own_file.or(router_file), advertised);
         return match others.any(|w| served_template(w.as_ref(), router_file) != template) {
             true => refused(),
             false => Ok(()),
         };
     };
-    if loaded_template(app_context, &entry.id) == Some(template) {
+    let loaded_file = (app_context.tokenizer_template_files.read())
+        .get(&entry.id)
+        .cloned();
+    let file = own_file.or(loaded_file.as_deref()).or(router_file);
+    if loaded_template(app_context, &entry.id) == Some(template_fingerprint(file, advertised)) {
         return Ok(());
     }
     if others.next().is_some() {
