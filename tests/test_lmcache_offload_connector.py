@@ -5689,6 +5689,80 @@ def test_cpu_budget_split_counts_the_draft_layer_on_the_last_stage(monkeypatch):
     assert budgets[3] < budgets[0]
 
 
+def _m31_pp4_config(pp_rank: int):
+    """MiniMax-M3.1-Flash under PP4 x TP1 with its DSpark drafter, whose config
+    says `num_nextn_predict_layers: 0` and holds five layers of KV."""
+    text = SimpleNamespace(
+        num_hidden_layers=60,
+        num_key_value_heads=4,
+        num_attention_heads=64,
+        hidden_size=6144,
+        head_dim=128,
+        sparse_attention_config={
+            "sparse_attention_freq": [1] * 60,
+            "sparse_index_dim": 128,
+        },
+    )
+    draft = SimpleNamespace(
+        num_hidden_layers=5,
+        num_key_value_heads=4,
+        head_dim=128,
+        num_nextn_predict_layers=0,
+    )
+    return SimpleNamespace(
+        hf_config=SimpleNamespace(text_config=text, num_hidden_layers=60),
+        tensor_parallel_size=1,
+        pipeline_parallel_size=4,
+        kv_cache_dtype="fp8",
+        index_cache_dtype="fp4",
+        parallel_config=SimpleNamespace(pipeline_parallel_rank=pp_rank),
+        speculative_config=SimpleNamespace(draft_model_hf_config=draft),
+    )
+
+
+@pytest.mark.parametrize("split", [(17, 17, 17, 9), (15, 15, 15, 15)])
+@pytest.mark.parametrize("by_bytes", [False, True])
+def test_m31_pp4_stages_reach_one_token_horizon_split_by_kv_bytes(
+    monkeypatch, split, by_bytes
+):
+    """Every PP stage's LMCache chunk holds its own layers' KV, and the last
+    stage's the drafter's too (5,280 B/token): a split by layer count leaves the
+    last stage the shortest horizon, which every load is cut to."""
+    import atom.models.utils as model_utils
+    from atom import config as config_mod
+    from atom.kv_transfer.offload import config as offcfg
+
+    monkeypatch.setenv("ATOM_M3_SPARSE_KV_NVFP4", "1")
+    monkeypatch.setattr(config_mod, "_is_minimax_m3_config", lambda hf: True)
+    starts = [sum(split[:i]) for i in range(4)]
+    monkeypatch.setattr(
+        model_utils,
+        "get_pp_indices",
+        lambda n, r, s: (starts[r], starts[r] + split[r]),
+    )
+    if by_bytes:
+        monkeypatch.setenv("ATOM_OFFLOAD_PP_SPLIT_BY_KV_BYTES", "1")
+    else:
+        monkeypatch.delenv("ATOM_OFFLOAD_PP_SPLIT_BY_KV_BYTES", raising=False)
+    # NVFP4 K/V of 4 heads and an FP4 index key: 648 B/token a layer.
+    stage_bytes = [648 * n for n in split]
+    stage_bytes[-1] += 5280
+    budgets = []
+    for rank in range(4):
+        cfg = SimpleNamespace(max_local_cpu_size=400.0)
+        offcfg.scale_cpu_size_for_pp(cfg, _m31_pp4_config(rank))
+        budgets.append(cfg.max_local_cpu_size)
+    assert sum(budgets) == pytest.approx(1600.0)
+    horizons = [b / n for b, n in zip(budgets, stage_bytes)]
+    # What the tier holds: the shortest stage's horizon, against the budget's.
+    held = min(horizons) / (sum(budgets) / sum(stage_bytes))
+    if by_bytes:
+        assert horizons == pytest.approx([horizons[0]] * 4)
+        assert held == pytest.approx(1.0)
+    else:
+        assert held == pytest.approx(0.596 if split[-1] == 9 else 0.736, abs=1e-3)
+
+
 # ---------------------------------------------------------------------------
 # LMCache engine identity across DP replicas
 # ---------------------------------------------------------------------------
