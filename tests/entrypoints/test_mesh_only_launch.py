@@ -31,7 +31,7 @@ class _Runner:
             "server_config": object(),
         }
 
-    def launch_mesh(self, server_config, standalone_service):
+    def launch_mesh(self, server_config, **_kwargs):
         pass
 
 
