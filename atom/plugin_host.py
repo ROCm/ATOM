@@ -113,6 +113,12 @@ class SeamSpec:
     # owner's ``owns_collectives`` is recorded, never required, so a plugin
     # written for either convention registers alike.
     collectives: tuple[str, ...] = ()
+    # The module path pattern the call site is in (``layers.*.ffn.shared_experts``):
+    # a recipe that plans an owner for an enclosing module slot must plan this
+    # seam too (reachability).
+    scope: str | None = None
+    # The module slot this seam is exactly the span of (either spelling plans it).
+    module_slot: str | None = None
 
 
 COLLECTIVES = ("tp_all_reduce", "ep_all_to_all", "dp_gather")
@@ -126,358 +132,126 @@ def _seam(
     )
 
 
-# The V4.1 seams live in the plugin model (`atom.models.deepseek_v41_plugin`);
-# ATOM's own `atom.models.deepseek_v41` has none.
-_V41 = "atom/models/deepseek_v41_plugin/"
-SEAMS = MappingProxyType(
-    dict(
-        [
-            _seam(
-                "v41.block.transition",
-                1,
-                "region",
-                "window",
-                ("routed", "shared"),
-                (),
-                ("q_lora", "kv_pre"),
-                (),
-                "capture_safe",
-                _V41 + "runtime.py",
-                boundary="collective+state",
-                doc="native MoE combine and mHC with paired pre/post callbacks",
-            ),
-            _seam(
-                "v41.block.ffn",
-                1,
-                "region",
-                "bind",
-                ("x",),
-                (),
-                ("y",),
-                ("x",),
-                "opaque_op",
-                _V41 + "model.py",
-                doc="the FFN sublayer, Block.ffn(normed): bf16 [T,H] -> bf16 [T,H]"
-                "; flags: layer_id, module",
-            ),
-            _seam(
-                "v41.attn.out",
-                1,
-                "region",
-                "bind",
-                ("x_fp8", "x_scale", "wo_a_w", "wo_a_ws"),
-                ("dtype",),
-                ("y", "y_scale"),
-                ("x_fp8", "x_scale"),
-                "capture_safe",
-                _V41 + "attention.py",
-                doc="wo_a: wo_b's input pair (e4m3 + e8m0 g32) or (bf16, None)",
-            ),
-            _seam(
-                "v41.attn.qk_norm",
-                1,
-                "op",
-                "bind",
-                ("q", "k", "q_weight", "k_weight", "eps_q"),
-                ("eps_k", "amax_floor"),
-                ("q_fp8", "q_scale", "k_out"),
-                ("q", "k", "eps_q"),
-                "capture_safe",
-                "atom/model_ops/layernorm.py",
-                doc="dual RMSNorm, q to MXFP8: the kernel DualRMSNormMXFP8 calls",
-            ),
-            _seam(
-                "v41.moe.shared_act",
-                1,
-                "region",
-                "bind",
-                ("combined", "weights"),
-                (),
-                ("act", "act_scale"),
-                ("combined", "weights"),
-                "opaque_op",
-                _V41 + "v4.py",
-                parent="v41.block.ffn",
-                doc="shared expert clamp-act(+quant): w2's input pair or (bf16, None)",
-            ),
-            _seam(
-                "v41.moe.shared_expert",
-                1,
-                "region",
-                "bind",
-                ("x", "weights", "w13_w", "w13_ws"),
-                (),
-                ("act", "act_scale"),
-                ("x", "weights"),
-                "capture_safe",
-                _V41 + "v4.py",
-                parent="v41.block.ffn",
-                doc="shared expert gate_up + clamp-act(+quant): w2's input pair or "
-                "(bf16, None); flags: swiglu_limit, native_fused_act, gate_up_n, "
-                "gate_up_k, gate_up_group_rows",
-            ),
-            _seam(
-                "v41.attn.project_out",
-                1,
-                "region",
-                "bind",
-                ("x_fp8", "x_scale", "wo_a_w", "wo_a_ws", "wo_b_w", "wo_b_ws"),
-                ("dtype",),
-                ("out",),
-                ("x_fp8", "x_scale"),
-                "capture_safe",
-                _V41 + "attention.py",
-                boundary="collective",
-                doc="wo_a + wo_b + TP all-reduce: (e4m3 [M,G,K], e8m0 g32) -> the "
-                "TP-reduced bf16 [M, hidden] on every rank",
-            ),
-            _seam(
-                "v41.attn.out_full",
-                1,
-                "region",
-                "bind",
-                ("o", "positions", "cos", "sin", "wo_a_w", "wo_a_ws"),
-                ("dtype",),
-                ("y", "y_scale"),
-                ("o",),
-                "capture_safe",
-                _V41 + "attention.py",
-                doc="inverse RoPE + g32 quant + wo_a from bf16 attention rows: "
-                "wo_b's input pair or (bf16, None)",
-            ),
-            _seam(
-                "v41.attn.attend_out",
-                1,
-                "region",
-                "bind",
-                (
-                    "query",
-                    "pool",
-                    "kv_indices_prefix",
-                    "kv_indptr_prefix",
-                    "kv",
-                    "kv_indices_extend",
-                    "kv_indptr_extend",
-                    "attn_sink",
-                    "softmax_scale",
-                    "out",
-                    "positions",
-                    "cos_cache",
-                    "sin_cache",
-                    "x_fp8",
-                    "x_scale",
-                ),
-                ("num_groups",),
-                ("x_fp8", "x_scale"),
-                (
-                    "query",
-                    "pool",
-                    "kv",
-                    "attn_sink",
-                    "softmax_scale",
-                    "out",
-                    "positions",
-                    "cos_cache",
-                    "sin_cache",
-                    "x_fp8",
-                    "x_scale",
-                ),
-                "capture_safe",
-                _V41 + "attention.py",
-                doc="FP8-KV decode attention + inverse RoPE + MXFP8 g32, written "
-                "into x_fp8/x_scale (wo_a's input pair); out is the BF16 scratch",
-            ),
-            _seam(
-                "v41.moe.topk",
-                1,
-                "op",
-                "call",
-                (
-                    "topk_weights",
-                    "topk_ids",
-                    "router_logits",
-                    "e_score_correction_bias",
-                    "renormalize",
-                    "route_scale",
-                ),
-                ("score_func", "num_valid_rows"),
-                (),
-                (
-                    "router_logits",
-                    "topk_weights",
-                    "topk_ids",
-                    "e_score_correction_bias",
-                    "renormalize",
-                    "route_scale",
-                ),
-                "capture_safe",
-                "atom/model_ops/moe.py",
-                parent="v41.block.ffn",
-                doc="topk_gating in FusedMoE.select_experts, in place",
-            ),
-            _seam(
-                "v41.op.quant_fp8_g32",
-                1,
-                "op",
-                "call",
-                ("x",),
-                ("dequantize",),
-                ("x_fp8", "x_scale"),
-                ("x",),
-                "capture_safe",
-                "atom/model_ops/blockscale.py",
-                doc="quantize_fp8: e4m3 + e8m0 [..., K/32]; dequantize=True is QAT",
-            ),
-            _seam(
-                "v41.attn.index_topk",
-                1,
-                "op",
-                "call",
-                ("scores", "group", "row_ends", "out", "count", "stride0", "stride1"),
-                ("k", "stable", "row_starts", "plane_width"),
-                (),
-                ("scores", "group", "row_ends", "out", "count", "stride0", "stride1"),
-                "capture_safe",
-                "atom/model_ops/indexer/score.py",
-                doc="packed top_k_per_row_decode, in place into out",
-            ),
-            _seam(
-                "v41.attn.attend",
-                1,
-                "op",
-                "call",
-                (
-                    "q",
-                    "unified_kv",
-                    "kv_indices_prefix",
-                    "kv_indptr_prefix",
-                    "kv",
-                    "kv_indices_extend",
-                    "kv_indptr_extend",
-                    "attn_sink",
-                    "softmax_scale",
-                ),
-                (
-                    "out",
-                    "unified_kv_rope",
-                    "q_packed",
-                    "q_rope",
-                    "k_packed",
-                    "k_rope",
-                    "prefix",
-                ),
-                ("out",),
-                ("q", "unified_kv", "kv", "attn_sink", "softmax_scale"),
-                "capture_safe",
-                "atom/model_ops/v4_kernels/paged_2src.py",
-                doc="sparse_attn_v4_paged_2src; out= is written and returned",
-            ),
-            _seam(
-                "v41.draft.ctx",
-                1,
-                "region",
-                "bind",
-                ("taps", "rows", "running_tokens"),
-                (),
-                ("aux", "aux_scale"),
-                ("taps", "rows", "running_tokens"),
-                "capture_safe",
-                _V41 + "dspark.py",
-                doc="DSpark context taps -> main_proj's input pair or (bf16, None)",
-            ),
-            _seam(
-                "v41.draft.markov",
-                1,
-                "region",
-                "call",
-                (
-                    "base_logits",
-                    "anchor_ids",
-                    "markov_w1",
-                    "markov_w2",
-                    "out_ids",
-                    "markov_embeds",
-                    "vocab_start",
-                    "tp_group",
-                ),
-                ("use_custom",),
-                (),
-                (
-                    "base_logits",
-                    "anchor_ids",
-                    "out_ids",
-                    "markov_embeds",
-                    "vocab_start",
-                ),
-                "capture_safe",
-                _V41 + "dspark.py",
-                boundary="collective",
-                doc="DSpark sharded Markov T-step argmax block, in place into "
-                "out_ids and markov_embeds",
-            ),
-            _seam(
-                "v41.spec.verify_sample",
-                1,
-                "region",
-                "call",
-                (
-                    "logits",
-                    "temperatures",
-                    "target_logits_indices",
-                    "bonus_logits_indices",
-                    "cu_num_draft_tokens",
-                ),
-                ("all_greedy", "top_ks", "top_ps", "needs_independent_noise"),
-                ("bonus_token_ids", "target_token_ids", "target_logits"),
-                (
-                    "logits",
-                    "temperatures",
-                    "target_logits_indices",
-                    "bonus_logits_indices",
-                    "cu_num_draft_tokens",
-                ),
-                "capture_safe",
-                "atom/model_engine/model_runner.py",
-                doc="speculative verification + bonus sampling of a verify step",
-            ),
-            _seam(
-                "v41.mono.install",
-                1,
-                "region",
-                "call",
-                ("model", "atom_config", "drafter"),
-                ("metadata_builder",),
-                ("model",),
-                (),
-                "eager",
-                "atom/model_engine/model_runner.py",
-                boot_only=True,
-                doc="mono_decode_installers' V4.1 installer -> the model to serve",
-            ),
-        ]
-    )
-)
-
-# What a hot-plug boot binds whatever the boot plan owns: the seams the model
-# calls through a ``bind`` made at build. Call seams dispatch by name and need
-# no list (`call` checks `_hotplug`).
-_HOTPLUG_BINDS = frozenset(name for name, spec in SEAMS.items() if spec.form == "bind")
-BOOT_ONLY = frozenset(name for name, spec in SEAMS.items() if spec.boot_only)
-
+# The seam table is a registry: the host declares no model's seams. A model
+# package declares its own (``declare_seams``; entry point group
+# ``atom.seam_specs``), the V4.1 plugin model through ``atom.plugin_seams_v41``.
+SEAM_SPEC_GROUP = "atom.seam_specs"
+_SEAM_SPECS: dict[str, SeamSpec] = {}
+_SEAM_SOURCES: dict[str, str] = {}  # seam -> who declared it
+SEAMS = MappingProxyType(_SEAM_SPECS)
+_SEAM_TO_SLOT: dict[str, str] = {}
+_SLOT_TO_SEAM: dict[str, str] = {}
 # A recipe v2 names module slots (`nn.Module` paths, `*` per path segment) or
-# seams. These seams are spans of exactly one slot, so either spelling plans
-# the same owner: a seam owner listed under its slot is routed as the seam, a
-# module owner under the seam name as the slot.
-SEAM_TO_MODULE_SLOT = MappingProxyType(
-    {
-        "v41.block.ffn": "layers.*.ffn",
-        "v41.moe.shared_expert": "layers.*.ffn.shared_experts",
-        "v41.mono.install": "mono",
-    }
-)
-MODULE_SLOT_TO_SEAM = MappingProxyType(
-    {slot: seam for seam, slot in SEAM_TO_MODULE_SLOT.items()}
-)
+# seams. A seam declared with a ``module_slot`` is the span of exactly that
+# slot, so either spelling plans the same owner.
+SEAM_TO_MODULE_SLOT = MappingProxyType(_SEAM_TO_SLOT)
+MODULE_SLOT_TO_SEAM = MappingProxyType(_SLOT_TO_SEAM)
+_NAME_RE = re.compile(r"^[a-z0-9_]+(\.[a-z0-9_]+)+$")
+_BUILTIN_SEAM_MODULES = ("atom.plugin_seams_v41",)
+_seam_sources_loaded = False
+
+
+def _hotplug_binds() -> frozenset[str]:
+    """What a hot-plug boot binds whatever the boot plan owns: the seams the
+    model calls through a ``bind`` made at build."""
+    return frozenset(n for n, s in _SEAM_SPECS.items() if s.form == "bind")
+
+
+def boot_only() -> frozenset[str]:
+    return frozenset(n for n, s in _SEAM_SPECS.items() if s.boot_only)
+
+
+def _spec_of(raw: Any) -> SeamSpec:
+    if isinstance(raw, SeamSpec):
+        return raw
+    if isinstance(raw, Mapping):
+        fields_ = dict(raw)
+        for name in ("inputs", "kwargs", "returns", "key", "collectives"):
+            if name in fields_:
+                fields_[name] = tuple(fields_[name])
+        return SeamSpec(**fields_)
+    raise TypeError(f"a seam spec is a SeamSpec or a mapping, not {type(raw).__name__}")
+
+
+def _spec_error(spec: SeamSpec, known: Mapping[str, SeamSpec]) -> str | None:
+    if not isinstance(spec.name, str) or not _NAME_RE.match(spec.name):
+        return f"name {spec.name!r} is not dotted lower-case"
+    if not isinstance(spec.contract, int) or spec.contract < 1:
+        return "contract must be a positive int"
+    if spec.kind not in ("op", "region"):
+        return f"kind {spec.kind!r}"
+    if spec.form not in ("bind", "call", "window"):
+        return f"form {spec.form!r}"
+    if spec.graph not in ("eager", "capture_safe", "opaque_op"):
+        return f"graph {spec.graph!r}"
+    if not set(spec.key) <= set(spec.inputs):
+        return "key must name inputs"
+    if spec.parent is not None and spec.parent not in known:
+        return f"parent {spec.parent!r} is not declared"
+    if not set(spec.collectives) <= set(COLLECTIVES):
+        return f"collectives {spec.collectives!r} not in {COLLECTIVES}"
+    if spec.module_slot is not None and not _SLOT_RE.match(spec.module_slot):
+        return f"module_slot {spec.module_slot!r} is not a module path"
+    return None
+
+
+def declare_seams(specs: Iterable[Any], *, source: str) -> list[str]:
+    """Add seams to the table (frozen HOOK_API surface). A spec already
+    declared identically is a no-op; the same name with another spec is
+    refused (``SeamConflict``) -- a seam has one contract per process.
+    Returns the names newly declared."""
+    batch = [_spec_of(raw) for raw in specs]
+    with _lock:
+        known = {**_SEAM_SPECS, **{s.name: s for s in batch}}
+        added = []
+        for spec in batch:
+            error = _spec_error(spec, known)
+            if error is not None:
+                raise SeamConflict(f"{source}: seam {spec.name!r}: {error}")
+            have = _SEAM_SPECS.get(spec.name)
+            if have is not None:
+                if have != spec:
+                    raise SeamConflict(
+                        f"{source}: seam {spec.name!r} conflicts with the spec "
+                        f"{_SEAM_SOURCES.get(spec.name)} declared"
+                    )
+                continue
+            slot = spec.module_slot
+            if slot is not None and _SLOT_TO_SEAM.get(slot, spec.name) != spec.name:
+                raise SeamConflict(f"{source}: slot {slot!r} is already a seam's span")
+            added.append(spec)
+        for spec in added:
+            _SEAM_SPECS[spec.name] = spec
+            _SEAM_SOURCES[spec.name] = source
+            if spec.module_slot is not None:
+                _SEAM_TO_SLOT[spec.name] = spec.module_slot
+                _SLOT_TO_SEAM[spec.module_slot] = spec.name
+    return [s.name for s in added]
+
+
+def _load_builtin_seams() -> None:
+    for name in _BUILTIN_SEAM_MODULES:
+        module = importlib.import_module(name)
+        declare_seams(module.specs(), source=name)
+
+
+def load_seam_specs() -> None:
+    """Declare the built-in and the installed (``atom.seam_specs``) seams, once.
+    An entry point gives a list of specs or a callable returning one; its
+    import must be pure (no GPU, no kernel build): the main process reads it
+    to check a recipe."""
+    global _seam_sources_loaded
+    if _seam_sources_loaded:
+        return
+    with _lock:
+        if _seam_sources_loaded:
+            return
+        _load_builtin_seams()
+        for ep in metadata.entry_points(group=SEAM_SPEC_GROUP):
+            loaded = ep.load()
+            declared = loaded() if callable(loaded) else loaded
+            declare_seams(declared, source=f"{SEAM_SPEC_GROUP}:{ep.name}")
+        _seam_sources_loaded = True
 
 
 @dataclass(frozen=True)
@@ -517,6 +291,10 @@ class RegistrationRefused(ValueError):
     def __init__(self, reason: str, detail: str):
         super().__init__(f"{reason}: {detail}")
         self.reason = reason
+
+
+class SeamConflict(ValueError):
+    """Two declarations of one seam disagree, or a spec is malformed."""
 
 
 class PluginConflict(RuntimeError):
@@ -611,6 +389,8 @@ def register(
     ``owns_collectives``: the collectives the owner runs itself inside the
     span. A seam's own ``collectives`` must be covered; no seam declares any,
     so the argument is accepted and recorded from either kind of plugin."""
+    if seam not in SEAMS:
+        load_seam_specs()
     with _lock:
         unknown = set(owns_collectives) - set(COLLECTIVES)
         if unknown:
@@ -1565,6 +1345,7 @@ def configure(
 
     global _plan, _kill_switch, _strict, _on_decline, _loading, _owned, _requested
     global _hotplug, _dev, _dev_roots
+    load_seam_specs()
     roots = _dev_roots_argument(dev_roots)
     dev = bool(dev)
     if roots and not dev:
@@ -1654,7 +1435,7 @@ def configure(
         _owned = frozenset(s for table in _tables.values() for s in table)
         if _hotplug:
             # Bind the seams no plan owns yet: a later one may claim them.
-            _owned = _owned | _HOTPLUG_BINDS
+            _owned = _owned | _hotplug_binds()
         set_arm(arm if _plan is not None else "plugin", sync_aiter=False)
     _check_plugin_pins(_plan)
     _apply_aiter(force=True)
@@ -1825,7 +1606,7 @@ def _boot_owners(tables) -> dict[tuple[str, str], tuple[str, ...]]:
         (str(key), seam): tuple(route.owner for route in routes)
         for key, table in tables.items()
         for seam, routes in table.items()
-        if seam in BOOT_ONLY and routes
+        if seam in boot_only() and routes
     }
 
 
@@ -1886,7 +1667,7 @@ def _swap_in(plan, arm: str) -> dict[str, Any]:
     if _boot_owners(_tables) != boot:
         raise plugin_recipe.RecipeRefused(
             "recipe-boot-only",
-            f"{sorted(BOOT_ONLY)} serve {boot or 'native'} until a restart",
+            f"{sorted(boot_only())} serve {boot or 'native'} until a restart",
         )
     # Conservative: seams bound before stay bound (their call sites exist), and
     # a seam once planned keeps dispatching even under a plan that drops it.
@@ -2679,3 +2460,8 @@ def _configure_aiter(names: Iterable[str]) -> bool:
         return False
     configure_aiter(source=AITER_SOURCE, enable=list(names))
     return True
+
+
+# The built-in model seams are in the table from import on; installed
+# packages' (``atom.seam_specs``) once a recipe or a plan is read.
+_load_builtin_seams()

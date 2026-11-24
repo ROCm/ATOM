@@ -175,3 +175,101 @@ def test_context_reports_capture_bucket_and_valid_rows(monkeypatch):
     assert ctx.captured and ctx.bucket == 8 and ctx.valid_rows == ("valid", 8)
     assert host.context(rows=5).valid_rows == ("valid", 5)
     assert isinstance(host.context(), types.SimpleNamespace) is False
+
+
+# -- seam spec registry (M2) --------------------------------------------------
+
+
+@pytest.fixture
+def seam_table():
+    saved = (
+        dict(host._SEAM_SPECS),
+        dict(host._SEAM_SOURCES),
+        dict(host._SEAM_TO_SLOT),
+        dict(host._SLOT_TO_SEAM),
+        host._seam_sources_loaded,
+    )
+    yield
+    for live, old in zip(
+        (host._SEAM_SPECS, host._SEAM_SOURCES, host._SEAM_TO_SLOT, host._SLOT_TO_SEAM),
+        saved,
+    ):
+        live.clear()
+        live.update(old)
+    host._seam_sources_loaded = saved[4]
+
+
+_TOY = {
+    "name": "toy.block.mix",
+    "contract": 1,
+    "kind": "region",
+    "form": "bind",
+    "inputs": ("x",),
+    "kwargs": (),
+    "returns": ("y",),
+    "key": ("x",),
+    "graph": "capture_safe",
+    "target": "toy/model.py",
+    "module_slot": "blocks.*.mix",
+}
+
+
+def test_the_builtin_v41_seams_are_declared_through_the_registry():
+    assert host._SEAM_SOURCES["v41.block.ffn"] == "atom.plugin_seams_v41"
+    assert host.SEAM_TO_MODULE_SLOT["v41.block.ffn"] == "layers.*.ffn"
+    assert host.MODULE_SLOT_TO_SEAM["mono"] == "v41.mono.install"
+    assert "v41.mono.install" in host.boot_only()
+
+
+def test_a_package_declares_a_seam_a_recipe_plans_and_a_plugin_serves(
+    seam_table, monkeypatch
+):
+    assert host.declare_seams([_TOY], source="toy") == ["toy.block.mix"]
+    assert host.declare_seams([_TOY], source="again") == []  # identical: a no-op
+    assert host.MODULE_SLOT_TO_SEAM["blocks.*.mix"] == "toy.block.mix"
+
+    def register(h):
+        h.register(
+            seam="toy.block.mix", contract=1, owner="mix-p", impl=lambda x, **k: x + 1
+        )
+
+    monkeypatch.setattr(host, "_entry_points", lambda: {"mix-p": _EntryPoint(register)})
+    host.configure(_plan(seams={"toy.block.mix": ["mix-p"]}), kill_switch=False)
+    router = host.bind("toy.block.mix", lambda x: x)
+    assert router(1) == 2
+
+
+@pytest.mark.parametrize(
+    "change, error",
+    [
+        ({"contract": 2}, "conflicts"),
+        ({"name": "Bad"}, "dotted lower-case"),
+        ({"key": ("z",)}, "key must name inputs"),
+        ({"parent": "toy.none"}, "parent"),
+        ({"graph": "sometimes"}, "graph"),
+    ],
+)
+def test_a_seam_spec_is_checked_and_one_name_has_one_contract(
+    seam_table, change, error
+):
+    host.declare_seams([_TOY], source="toy")
+    with pytest.raises(host.SeamConflict, match=error):
+        host.declare_seams([{**_TOY, **change}], source="other")
+
+
+def test_installed_packages_declare_seams_through_entry_points(seam_table, monkeypatch):
+    class _EP:
+        name = "toy"
+
+        def load(self):
+            return lambda: [_TOY]
+
+    host._seam_sources_loaded = False
+    monkeypatch.setattr(
+        host.metadata,
+        "entry_points",
+        lambda group=None: [_EP()] if group == host.SEAM_SPEC_GROUP else [],
+    )
+    plan = _plan(seams={"toy.block.mix": []})  # the recipe parse loads them
+    assert "toy.block.mix" in host.SEAMS and plan is not None
+    assert host._SEAM_SOURCES["toy.block.mix"] == "atom.seam_specs:toy"

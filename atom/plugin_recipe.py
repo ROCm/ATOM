@@ -558,6 +558,7 @@ def _aiter_names(raw: Any, is_v2: bool) -> tuple[str, ...]:
 
 def _parse(document: Mapping[str, Any], *, model_arch: str | None) -> dict[str, Any]:
     """One recipe document (v1 or v2), checked against this ATOM's contracts."""
+    plugin_host.load_seam_specs()
     if not isinstance(document, Mapping):
         raise RecipeRefused("recipe-schema", "recipe must be a JSON object")
     schema = document.get("schema")
