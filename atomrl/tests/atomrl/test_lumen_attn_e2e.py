@@ -22,9 +22,9 @@ def test_qwen3_lumen_attention_forward_backward():
     model_path = "/dev/shm/atomrl_weight_sync"
     if not os.path.exists(os.path.join(model_path, "config.json")):
         model_path = os.environ.get("MODEL_PATH", model_path)
-    assert os.path.exists(os.path.join(model_path, "config.json")), (
-        f"no model at {model_path}; set MODEL_PATH"
-    )
+    assert os.path.exists(
+        os.path.join(model_path, "config.json")
+    ), f"no model at {model_path}; set MODEL_PATH"
 
     patch_hf_sdpa()
     try:
