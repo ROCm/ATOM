@@ -4901,6 +4901,18 @@ mod h_atom_native_tool_calls {
         }
     }
 
+    /// A bare qwen_xml call cut off in a parameter's name, or in a tag after a closed
+    /// parameter, is kept, as ATOM's HTTP parser keeps it at end of input.
+    #[tokio::test]
+    async fn a_bare_qwen_call_cut_off_in_a_tag_is_kept() {
+        let empty = ("get_weather".to_string(), json!({}));
+        let read = cut_off_call("<function=get_weather><parameter=ci").await;
+        assert_eq!(read, [empty.clone(), empty]);
+        let reply = "<function=get_weather><parameter=city>Paris</parameter></para";
+        let paris = ("get_weather".to_string(), json!({"city": "Paris"}));
+        assert_eq!(cut_off_call(reply).await, [paris.clone(), paris]);
+    }
+
     /// A qwen_xml reply read unary, then streamed, from an ATOM worker or not: (content,
     /// names of the calls) of each.
     async fn read_qwen_xml(reply: &str, reads_as_atom: bool) -> [(String, String); 2] {
@@ -4960,6 +4972,21 @@ mod h_atom_native_tool_calls {
         assert_eq!(read_qwen_xml(reply, true).await, [call.clone(), call]);
         let text = (reply.to_string(), String::new());
         assert_eq!(read_qwen_xml(reply, false).await, [text.clone(), text]);
+    }
+
+    /// An ATOM reply's text streams as it reads unary: prose quoting `<tool_call>`
+    /// before a bare call, and a last tag no call followed, stay text.
+    #[tokio::test]
+    async fn an_atom_reply_s_text_streams_as_it_reads_unary() {
+        let reply = "Use <tool_call> as the wrapper. \
+                     <function=get_weather><parameter=city>Paris</parameter></function>";
+        let prose = "Use <tool_call> as the wrapper. ".to_string();
+        let call = (prose, "get_weather".to_string());
+        assert_eq!(read_qwen_xml(reply, true).await, [call.clone(), call]);
+        for reply in ["The prefix is <fun", "Cut: <tool_call><function=get_wea"] {
+            let text = (reply.to_string(), String::new());
+            assert_eq!(read_qwen_xml(reply, true).await, [text.clone(), text]);
+        }
     }
 
     /// A MiniMax-M3 call cut off inside a parameter keeps its value, as ATOM's HTTP
