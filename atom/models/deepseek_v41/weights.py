@@ -36,13 +36,12 @@ def shared_tensor(path, name: str) -> torch.Tensor:
     """Tensor `name` of safetensors file `path`, as a read-only view of a
     shared mapping of the file (`MAP_SHARED`, `PROT_READ`).
 
-    For the Engram tables. `safe_open` maps a file privately, so page-locking
-    one of its tensors in place copies every page into the process on its
-    write fault -- under DP attention, where every rank holds the whole
-    table, a ~183 GiB copy per rank. A shared read-only mapping is the page
-    cache itself: an in-place registration pins those pages, the same ones
-    for every process. Writing through the view faults; nothing writes a
-    table. The mapping lives as long as a tensor over it.
+    For the Engram tables, copied from it into page-locked memory
+    (`engram.host_memory.pin_rows`). A shared read-only mapping is the page
+    cache itself, the same pages for every process, and the pages a copy
+    has read are clean file pages it can drop from the process as it goes
+    (`host_memory._source_dropper`). Writing through the view faults;
+    nothing writes a table. The mapping lives as long as a tensor over it.
     """
     with open(path, "rb") as stream:
         header_size = struct.unpack("<Q", stream.read(8))[0]

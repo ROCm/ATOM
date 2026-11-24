@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2024-2025 ATOM Project Contributors
 
 import itertools
 import logging
@@ -925,6 +926,14 @@ class InputOutputProcessor:
             sampling_params = replace(
                 sampling_params,
                 required_channel=self._engine_channel(sampling_params.required_channel),
+            )
+        # forced acceptance (``--spec-decode-acceptance-length``) decides each
+        # draft by its configured rates: every row is a greedy pick, whatever
+        # the request's sampling
+        spec = getattr(self.config, "speculative_config", None)
+        if spec is not None and spec.synthetic_acceptance_rates is not None:
+            sampling_params = replace(
+                sampling_params, temperature=0.0, top_k=-1, top_p=1.0
             )
 
         if stream_callbacks is not None and len(stream_callbacks) != n:
