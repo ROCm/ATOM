@@ -1283,7 +1283,8 @@ def test_head_flushes_a_held_chunk_when_its_ack_arrives():
     sched.mark_pp_inflight(batch)
     core = PPEngineCoreProc.__new__(PPEngineCoreProc)
     core.scheduler = sched
-    core.pp_size = 1  # the in-flight chunk fills the window: schedule nothing
+    # The in-flight chunk fills the window: schedule nothing.
+    core.pp_size = core.pp_max_inflight = 1
     core._in_flight = deque([(batch, seqs, False)])
     core._pending_prefix_hash = deque()
     core._defer_prefix_hash = True
