@@ -45,7 +45,14 @@ _DESC_VPOD_ID = 11
 
 
 def is_fabric_backend(kv_transfer_config: dict) -> bool:
-    return str(kv_transfer_config.get("moriio_backend", "rdma")).lower() == "fabric"
+    """Whether ``moriio_backend`` is ``fabric``; raises on a value that is
+    neither that nor ``rdma`` (the default), so a typo does not quietly run
+    RDMA."""
+    value = kv_transfer_config.get("moriio_backend", "rdma")
+    backend = str(value).strip().lower()
+    if backend not in ("rdma", "fabric"):
+        raise ValueError(f"moriio_backend must be 'rdma' or 'fabric', got {value!r}")
+    return backend == "fabric"
 
 
 class _FabricBuffer:

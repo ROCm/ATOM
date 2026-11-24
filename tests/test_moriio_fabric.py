@@ -24,8 +24,10 @@ to the CPU pools.
 
 from __future__ import annotations
 
+import ast
 import collections
 import json
+import sys
 import types
 import warnings
 from functools import partial
@@ -425,6 +427,35 @@ class TestM31RegionCoverage:
         assert stack.fabric._pool_range == (pool.data_ptr(), pool.numel())
 
 
+class TestDigests:
+    """One digest helper for the three verify paths, the same sums as before."""
+
+    @staticmethod
+    def weighted(flat: torch.Tensor, length: int) -> int:
+        weights = torch.arange(length, dtype=torch.int64) % 65521 + 1
+        return int(torch.sum(flat.to(torch.int64) * weights[: flat.numel()]))
+
+    def test_the_layer_digest_is_the_old_one(self, stack):
+        cache = torch.randint(0, 256, (6, 2, 8), dtype=torch.uint8).view(torch.bfloat16)
+        rows = torch.tensor([4, 1])
+        old = cache.index_select(0, rows).view(torch.uint8).reshape(-1)
+        assert stack.conn._byte_digests([cache.index_select(0, rows)]) == [
+            self.weighted(old, old.numel())
+        ]
+
+    def test_state_rows_of_any_shape_including_0_d(self, stack):
+        state = torch.randn(4, 3, 5).transpose(1, 2)  # not contiguous
+        scalar = torch.randn(4)  # one value per slot: a 0-d row
+        old = [
+            state[2].reshape(-1).view(torch.uint8),
+            scalar[2].reshape(-1).view(torch.uint8),
+        ]
+        length = max(row.numel() for row in old)
+        assert stack.conn._byte_digests([state[2], scalar[2]]) == [
+            self.weighted(row, length) for row in old
+        ]
+
+
 # ---------------------------------------------------------------------------
 # The batch plan
 # ---------------------------------------------------------------------------
@@ -584,6 +615,14 @@ class TestConfigPath:
         engine = mock.MagicMock()
         engine.create_backend.side_effect = create_backend
         group = lambda: types.SimpleNamespace(rank_in_group=0, world_size=TP)
+        fake_io = types.ModuleType("mori.io")
+        fake_io.FabricBackendConfig = lambda streams, events: (
+            "fabric",
+            streams,
+            events,
+        )
+        fake_mori = types.ModuleType("mori")
+        fake_mori.io = fake_io
         patches = [
             mock.patch.object(conn_mod, "get_tp_group", group),
             mock.patch.object(conn_mod, "get_dp_group", group),
@@ -598,12 +637,8 @@ class TestConfigPath:
                 types.SimpleNamespace(FABRIC="FABRIC", RDMA="RDMA"),
                 create=True,
             ),
-            mock.patch.object(
-                conn_mod,
-                "FabricBackendConfig",
-                lambda streams, events: ("fabric", streams, events),
-                create=True,
-            ),
+            # `_create_fabric_backend` imports it from mori.io itself.
+            mock.patch.dict(sys.modules, {"mori": fake_mori, "mori.io": fake_io}),
             mock.patch.object(
                 conn_mod, "RdmaBackendConfig", mock.MagicMock(), create=True
             ),
@@ -640,10 +675,55 @@ class TestConfigPath:
 
         def warn(kind, cfg):
             # mori.io.engine._load_fabric_copy_kernel only warns when it fails.
-            warnings.warn("Failed to load fabric_copy kernel", RuntimeWarning)
+            warnings.warn_explicit(
+                "Failed to load fabric_copy kernel (no hipcc)",
+                RuntimeWarning,
+                "/app/mori/python/mori/io/engine.py",
+                113,
+            )
 
-        with pytest.raises(RuntimeWarning, match="fabric_copy"):
+        with pytest.raises(RuntimeError, match="fabric_copy"):
             self.connector(stack, kv_config("kv_producer"), warn)
+
+    def test_another_threads_warning_does_not_fail_the_backend(
+        self, stack, monkeypatch
+    ):
+        monkeypatch.delenv("ATOM_MORIIO_MODE", raising=False)
+
+        def warn(kind, cfg):
+            warnings.warn_explicit("overflow in exp", RuntimeWarning, "numpy.py", 1)
+
+        # Shown again once the backend is built, not raised.
+        with pytest.warns(RuntimeWarning, match="overflow in exp"):
+            conn = self.connector(stack, kv_config("kv_producer"), warn)
+        assert conn.use_fabric
+
+    def test_a_mori_without_the_fabric_backend_still_imports_the_connector(self):
+        # FabricBackendConfig is imported by `_create_fabric_backend`, not with
+        # the RDMA names at module level.
+        tree = ast.parse(
+            (
+                ROOT / "atom/kv_transfer/disaggregation/moriio/moriio_connector.py"
+            ).read_text()
+        )
+        module_level = [
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.If)
+            for stmt in node.body
+            if isinstance(stmt, ast.ImportFrom) and stmt.module == "mori.io"
+            for alias in stmt.names
+        ]
+        assert "IOEngine" in module_level
+        assert "FabricBackendConfig" not in module_level
+
+    def test_a_misspelt_backend_is_refused(self, stack):
+        fabric = stack.fabric
+        assert fabric.is_fabric_backend({"moriio_backend": " Fabric "})
+        assert not fabric.is_fabric_backend({})
+        assert not fabric.is_fabric_backend({"moriio_backend": "rdma"})
+        with pytest.raises(ValueError, match="moriio_backend"):
+            fabric.is_fabric_backend({"moriio_backend": "fabirc"})
 
     def test_a_fabric_consumer_in_read_mode_builds_no_engine(self, stack, monkeypatch):
         monkeypatch.delenv("ATOM_MORIIO_MODE", raising=False)
@@ -681,6 +761,12 @@ def write_path(stack):
     return types.SimpleNamespace(
         make=make, push_request=push_request, FakeStatus=moriio_tests.FakeStatus
     )
+
+
+def moriio_tests_module():
+    import test_moriio_connector
+
+    return test_moriio_connector
 
 
 def cuda_events():
@@ -788,6 +874,46 @@ class TestWriteOrdering:
         conn.get_finished()
         assert asked == ["d1", "d2", "d3"]
         assert not conn._gated_writes
+
+    def test_a_request_that_cannot_be_asked_for_fails_alone(self, write_path):
+        conn = write_path.make(producer=False)
+        conn.request_id_to_transfer_id = {"d1": 1, "d2": 2, "d3": 3}
+        meta = moriio_tests_module().WritePathTest.recv_meta
+        good = [meta(None, [4], [10]), meta(None, [6], [12])]
+        bad = meta(None, [5], [11])
+        bad.remote_handshake_port = "not a port"
+        ready = FakeEvent()
+        ready.done = True
+        conn._gated_writes.append(
+            (ready, [("d1", good[0]), ("d2", bad), ("d3", good[1])])
+        )
+        conn._request_gated_writes()
+        asked = [
+            msgpack.loads(frames[1])["decode_req_id"] for frames, _, _ in conn.sent
+        ]
+        assert asked == ["d1", "d3"]
+        assert set(conn._awaiting_write) == {"d1", "d3"}
+        assert conn._failed_before_read == {"d2"}
+        assert not conn._gated_writes
+
+    def test_a_finished_push_leaves_no_ready_entry_for_a_late_ask(self, write_path):
+        conn = write_path.make(producer=True)
+        conn._kv_ready_events = {}
+        conn._kv_ready_expired = {9: None}
+        statuses = [write_path.FakeStatus("ok")]
+        conn._write_target_ready = lambda request: True
+        conn._write_blocks = lambda request, engine_id: statuses
+        conn._write_requests.put(write_path.push_request())
+        conn._service_write_requests()
+        conn._service_write_requests()
+        assert conn.done_sending == {9}
+        assert 9 not in conn._kv_ready_expired and not conn._source_ready(9)
+        # Long after, `_forget_finished_writes` has dropped the id.
+        conn._write_ids.clear()
+        conn._write_blocks = lambda request, engine_id: pytest.fail("pushed again")
+        conn._write_requests.put(write_path.push_request())
+        conn._service_write_requests()
+        assert len(conn._pending_writes) == 1
 
     def test_the_ready_event_is_recorded_after_the_draft_kv_is_written(self):
         # DSpark writes the draft's context KV in `compute_draft_kv`; the push
