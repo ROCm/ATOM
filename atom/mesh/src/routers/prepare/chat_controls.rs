@@ -1,10 +1,10 @@
 //! The reasoning controls ATOM renders a model's chats under, for the models
 //! whose chat encoder it adapts. ATOM picks them by the `model_type` in the
 //! checkpoint's `config.json` (`chat_encoder_adapters._MODEL_ENCODERS`). HTTP
-//! routing takes such a chat's effort as ATOM does, so that it renders the
-//! chats whose effort the template rejects and ATOM accepts; ATOM renders the
-//! chat again, so a control the router renders otherwise costs prefix hits,
-//! not a different prompt.
+//! routing takes such a chat's effort and mode as ATOM does, for llm-tokenizer
+//! renders it with its port of the model's encoder, whose defaults are not
+//! ATOM's; ATOM renders the chat again, so a control the router renders
+//! otherwise costs prefix hits, not a different prompt.
 //! `test_requests_tokenize_as_on_atom` checks the router's tokens for
 //! DeepSeek-V4.1-Flash chats against ATOM's.
 
@@ -31,8 +31,8 @@ impl ChatControls {
         }
     }
 
-    /// The prompt `request` renders to with `tokenizer`'s template, its effort
-    /// taken as ATOM takes it.
+    /// The prompt `request` renders to with `tokenizer`, its effort and mode
+    /// taken as ATOM takes them.
     pub(crate) fn render(
         self,
         request: &ChatCompletionRequest,
@@ -40,7 +40,10 @@ impl ChatControls {
     ) -> Result<String, String> {
         let mut kwargs = template_kwargs(request);
         match self {
-            Self::DeepseekV41 => deepseek_v41_effort(&mut kwargs),
+            Self::DeepseekV41 => {
+                deepseek_v41_effort(&mut kwargs);
+                deepseek_v41_mode(&mut kwargs)?;
+            }
         }
         Ok(render_chat_messages(request, tokenizer, &kwargs)?.text)
     }
@@ -48,9 +51,9 @@ impl ChatControls {
 
 /// The effort as V4.1's encoder takes it: `minimal` as `low`, `medium` and
 /// `xhigh` as `high` (`normalize_effort`), and `none` as chat mode
-/// (`prepare_kwargs`). V4.1's template rejects `minimal`, `xhigh` and `none`,
-/// and gives `medium` a smaller budget than `high`; other efforts reach it as
-/// sent.
+/// (`prepare_kwargs`). llm-tokenizer's port of the encoder takes `minimal` as
+/// chat mode, and gives `medium` a smaller budget than `high`; other efforts
+/// reach it as sent.
 fn deepseek_v41_effort(kwargs: &mut HashMap<String, Value>) {
     let effort = match kwargs.get("reasoning_effort").and_then(Value::as_str) {
         Some("minimal") => "low",
@@ -65,20 +68,45 @@ fn deepseek_v41_effort(kwargs: &mut HashMap<String, Value>) {
     kwargs.insert("reasoning_effort".to_string(), json!(effort));
 }
 
+/// The mode as V4.1's encoder takes it: `thinking_mode`, `"thinking"` unless
+/// sent (`prepare_kwargs`), or chat mode where `enable_thinking` is false, as
+/// V4.1's template takes that alias. llm-tokenizer's port of the encoder reads
+/// the mode from `thinking` alone, and refuses an `enable_thinking` other than
+/// it.
+fn deepseek_v41_mode(kwargs: &mut HashMap<String, Value>) -> Result<(), String> {
+    let enable_thinking = kwargs.remove("enable_thinking");
+    let thinking = match kwargs.get("thinking_mode") {
+        None => enable_thinking != Some(json!(false)),
+        Some(mode) => match mode.as_str() {
+            Some("thinking") => true,
+            Some("chat") => false,
+            _ => return Err("DeepSeek-V4.1 thinking_mode must be 'thinking' or 'chat'".into()),
+        },
+    };
+    kwargs.insert("thinking".to_string(), json!(thinking));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::routers::prepare::inference::ParsedInference;
+    use crate::{
+        routers::{prepare::inference::ParsedInference, test_mocks::tokenizer::hf_tokenizer_path},
+        tokenizer::factory::create_tokenizer,
+    };
 
-    /// The template kwargs of a V4.1 chat of `fields`, by default a user's "hi".
-    fn kwargs(fields: &Value) -> Value {
+    /// A V4.1 chat of `fields`, by default a user's "hi".
+    fn chat(fields: &Value) -> ParsedInference {
         let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
         body.as_object_mut()
             .unwrap()
             .extend(fields.as_object().unwrap().clone());
-        let parsed =
-            ParsedInference::parse("/v1/chat/completions", body.to_string().as_bytes()).unwrap();
-        let mut kwargs = template_kwargs(parsed.chat().unwrap());
+        ParsedInference::parse("/v1/chat/completions", body.to_string().as_bytes()).unwrap()
+    }
+
+    /// The template kwargs of a V4.1 chat of `fields`.
+    fn kwargs(fields: &Value) -> Value {
+        let mut kwargs = template_kwargs(chat(fields).chat().unwrap());
         deepseek_v41_effort(&mut kwargs);
         json!(kwargs)
     }
@@ -118,6 +146,69 @@ mod tests {
         ];
         for (fields, want) in cases {
             assert_eq!(kwargs(&fields), want, "{fields}");
+        }
+    }
+
+    /// V4.1 chats reach llm-tokenizer's port with the mode ATOM's encoder
+    /// takes, in `thinking`, which the encoder itself does not read.
+    #[test]
+    fn deepseek_v41_modes_are_atoms() {
+        let mode = |kwargs: &Value| {
+            let mut kwargs = serde_json::from_value(kwargs.clone()).unwrap();
+            deepseek_v41_mode(&mut kwargs).map(|()| json!(kwargs))
+        };
+        let cases = [
+            (json!({}), json!({"thinking": true})),
+            (
+                json!({"thinking_mode": "chat"}),
+                json!({"thinking_mode": "chat", "thinking": false}),
+            ),
+            (
+                json!({"thinking_mode": "thinking", "enable_thinking": false}),
+                json!({"thinking_mode": "thinking", "thinking": true}),
+            ),
+            (
+                json!({"enable_thinking": false}),
+                json!({"thinking": false}),
+            ),
+            (json!({"enable_thinking": true}), json!({"thinking": true})),
+            (json!({"thinking": false}), json!({"thinking": true})),
+        ];
+        for (kwargs, want) in cases {
+            assert_eq!(mode(&kwargs), Ok(want), "{kwargs}");
+        }
+        assert!(mode(&json!({"thinking_mode": "auto"})).is_err());
+    }
+
+    /// llm-tokenizer's port of V4.1's encoder renders the mode the controls
+    /// give a chat.
+    #[test]
+    fn deepseek_v41_port_renders_the_mode_the_controls_give() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::copy(hf_tokenizer_path(), dir.path().join("tokenizer.json")).unwrap();
+        let config = json!({"model_type": "deepseek_v41"});
+        std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
+        let tokenizer =
+            create_tokenizer(dir.path().join("tokenizer.json").to_str().unwrap()).unwrap();
+        for (fields, prefill) in [
+            (json!({}), "<think>"),
+            (json!({"reasoning_effort": "minimal"}), "<think>"),
+            (json!({"reasoning_effort": "none"}), "</think>"),
+            (
+                json!({"chat_template_kwargs": {"thinking_mode": "chat"}}),
+                "</think>",
+            ),
+            (
+                json!({"chat_template_kwargs": {"thinking_mode": "thinking", "enable_thinking": false}}),
+                "<think>",
+            ),
+        ] {
+            let parsed = chat(&fields);
+            let prompt = ChatControls::DeepseekV41
+                .render(parsed.chat().unwrap(), &*tokenizer)
+                .unwrap();
+            let end = format!("<｜Assistant｜>{prefill}");
+            assert!(prompt.ends_with(&end), "{fields}: {prompt}");
         }
     }
 }
