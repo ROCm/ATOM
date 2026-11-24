@@ -80,6 +80,18 @@ def _int_env(name: str, default: int) -> int:
     return default if value is None else value
 
 
+def _pp_layer_partition_mode() -> str:
+    """ATOM_PP_LAYER_PARTITION, refused when it names no mode."""
+    from atom.models.pp_partition import PARTITION_MODES
+
+    mode = (os.getenv("ATOM_PP_LAYER_PARTITION") or "even").strip().lower()
+    if mode not in PARTITION_MODES:
+        raise ValueError(
+            f"ATOM_PP_LAYER_PARTITION must be one of {PARTITION_MODES}, got {mode!r}"
+        )
+    return mode
+
+
 def _int_env_or_default(name: str, default: int) -> int:
     raw = os.getenv(name)
     if raw is None or raw == "":
@@ -687,7 +699,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # whole prefill's row count on the own rows + topk_gating; "fused" aiter's FlyDSL router GEMM
     # + top-k launch without split-K (only where it reproduces that GEMM's logits; see the PG
     # tests).
-    "ATOM_M3_SP_MOE_ROUTER": lambda: os.getenv("ATOM_M3_SP_MOE_ROUTER", "gemm").strip() or "gemm",
+    "ATOM_M3_SP_MOE_ROUTER": lambda: os.getenv("ATOM_M3_SP_MOE_ROUTER", "gemm").strip()
+    or "gemm",
     # MiniMax-M3: the routed MoE's A1 quant also writes the shared expert's
     # MXFP8 input (aiter fused_moe `mxfp8_copy_out`), so the shared gate_up
     # skips its own quant. Bitwise the same input; default off for A/B.
@@ -1509,6 +1522,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # sends only its 1/tp_size slice and the receiver all-gathers, cutting PP
     # link traffic by tp_size. Default on; set "0" for full-tensor sends.
     "ATOM_PP_SEND_ALLGATHER": lambda: os.getenv("ATOM_PP_SEND_ALLGATHER", "1") == "1",
+    # How the layers split across PP stages when VLLM_PP_LAYER_PARTITION (an
+    # explicit list, which always wins) is unset: "even" (default) by count;
+    # "kv_balanced" for the split whose largest per-stage KV bytes per token is
+    # smallest, which the drafter's KV on the last stage caps under "even".
+    # See atom/models/pp_partition.py.
+    "ATOM_PP_LAYER_PARTITION": lambda: _pp_layer_partition_mode(),
+    # kv_balanced: layers a stage may hold above the even split's largest
+    # stage, i.e. how much compute balance it may trade for KV pool.
+    "ATOM_PP_PARTITION_MAX_EXTRA_LAYERS": lambda: max(
+        0, _int_env("ATOM_PP_PARTITION_MAX_EXTRA_LAYERS", 1)
+    ),
     # Engram: read the n-gram tables with a device kernel over UVA instead of
     # gathering them on the host. Each rank's shard stays in host memory,
     # page-locked (see ATOM_ENGRAM_UVA_COPY for how), not copied to HBM; the
@@ -1687,7 +1711,8 @@ def __getattr__(name: str):
 # FLA_COMPILER_MODE, FLA_CI_ENV,
 #   FLA_GDN_FIX_BT, FLA_USE_CUDA_GRAPH,
 #   FLA_TRIL_PRECISION             — FLA ops library
-# VLLM_PP_LAYER_PARTITION         — vLLM legacy (still active in models/utils.py)
+# VLLM_PP_LAYER_PARTITION         — vLLM legacy (still active in models/utils.py);
+#                                   wins over ATOM_PP_LAYER_PARTITION
 # VLLM_USE_MODELSCOPE             — vLLM legacy (benchmarks)
 # LMCACHE_EC_PIN_TIMEOUT_SEC      — LMCache library's own source-pin timeout;
 #                                   read in kv_transfer/offload/_offload_common.py

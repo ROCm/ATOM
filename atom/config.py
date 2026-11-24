@@ -2208,6 +2208,11 @@ class Config:
     decode_context_parallel_size: int = 1
     dcp_config: DCPConfig = field(default_factory=DCPConfig)
     pipeline_parallel_size: int = 1
+    # Stage sizes ATOM_PP_LAYER_PARTITION=kv_balanced picked; None when the
+    # split is VLLM_PP_LAYER_PARTITION's or the even one. Resolved once, in
+    # __post_init__, and installed for `get_pp_indices` there and wherever this
+    # config is unpickled (`__setstate__`), so every process uses this split.
+    pp_layer_partition: tuple[int, ...] | None = field(default=None, init=False)
     prefill_context_parallel_size: int = 1
     # Ulysses shards tokens and exchanges them for heads around attention.
     # Its workers form AITER's PCP process group; see `pcp_group_size`.
@@ -2867,6 +2872,10 @@ class Config:
         self._resolve_tbo()
         self._check_pp_support()
         self._check_tbo_support()
+        from atom.models.pp_partition import resolve_pp_layer_partition
+
+        self.pp_layer_partition = resolve_pp_layer_partition(self)
+        self._install_pp_layer_partition()
 
         if self.speculative_config is not None:
             num_spec = self.speculative_config.num_speculative_tokens
@@ -3290,6 +3299,22 @@ class Config:
                 "micro-batches have no per-token metadata. Use --enable-tbo "
                 "(prefill only), or drop speculative decode."
             )
+
+    def __setstate__(self, state: dict) -> None:
+        # Every process that gets this config by pickle -- the per-stage
+        # EngineCores and their workers -- splits the layers as the process
+        # that resolved it did.
+        self.__dict__.update(state)
+        self._install_pp_layer_partition()
+
+    def _install_pp_layer_partition(self) -> None:
+        partition = self.__dict__.get("pp_layer_partition")
+        if partition is not None:
+            from atom.models.utils import install_pp_layer_partition
+
+            hf_config = self.hf_config
+            text_config = getattr(hf_config, "text_config", None) or hf_config
+            install_pp_layer_partition(text_config.num_hidden_layers, partition)
 
     def _check_pp_support(self) -> None:
         """Refuse what PP does not wire yet: TBO, P/D consumers, and speculation
