@@ -48,21 +48,41 @@ pub(crate) fn default_template_kwargs(
         .transpose()
 }
 
+/// The chat template a model's tokenizer was loaded with.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum LoadedTemplate {
+    /// An ATOM worker's, which it advertised.
+    Worker(String),
+    /// A registration's template file, which overrides the workers'.
+    File,
+    /// The tokenizer's own.
+    Own,
+}
+
 /// An ATOM worker among `workers` advertising a chat template when none advertises
-/// `loaded`, the worker template the model's tokenizer was loaded with, and the router
-/// sets none (`configured`): the tokenizer is being loaded again with a live worker's
-/// template, or failed to be.
-pub(crate) fn atom_template_not_loaded<'a>(
-    workers: &'a [Arc<dyn Worker>],
+/// the one the model's tokenizer was `loaded` with, and neither the router
+/// (`configured`) nor a registration's file sets one: the tokenizer is being loaded
+/// again with a live worker's template, or failed to be.
+pub(crate) fn atom_template_not_loaded(
+    workers: &[Arc<dyn Worker>],
     configured: bool,
-    loaded: Option<&str>,
-) -> Option<&'a Arc<dyn Worker>> {
-    let loaded = loaded.filter(|_| !configured)?;
+    loaded: Option<LoadedTemplate>,
+) -> Option<&Arc<dyn Worker>> {
+    if configured || loaded == Some(LoadedTemplate::File) {
+        return None;
+    }
+    let loaded = match loaded? {
+        LoadedTemplate::Worker(template) => Some(template),
+        _ => None,
+    };
     let advertising: Vec<_> = workers
         .iter()
         .filter_map(|worker| advertised_template(worker).map(|template| (worker, template)))
         .collect();
-    if advertising.iter().any(|(_, template)| template == loaded) {
+    if advertising
+        .iter()
+        .any(|(_, template)| Some(template) == loaded.as_ref())
+    {
         return None;
     }
     advertising.first().map(|(worker, _)| *worker)

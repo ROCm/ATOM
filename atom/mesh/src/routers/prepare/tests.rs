@@ -1613,6 +1613,30 @@ mod h_prepare_chat_generate {
         assert_ne!(refused(), Some(http::StatusCode::SERVICE_UNAVAILABLE));
     }
 
+    /// A tokenizer loaded with its own template (no worker's recorded) refuses the
+    /// chats of an ATOM worker advertising one, unless a registration's file set it.
+    #[test]
+    fn test_a_chat_waits_when_its_tokenizer_carries_no_workers_template() {
+        use crate::core::{BasicWorkerBuilder, RuntimeType};
+
+        let registry = test_mocks::tokenizer_registry_with("m");
+        let components = test_mocks::app_context_with_tokenizer_registry(registry.clone());
+        let worker = BasicWorkerBuilder::new("grpc://atom:3")
+            .runtime_type(RuntimeType::Atom)
+            .model_id("m")
+            .label("chat_template", "atom")
+            .build();
+        components.worker_registry.register(Arc::new(worker));
+        let refused = || {
+            let chat = prepare_chat(chat_req(false), None, Some("m".into()), &components);
+            chat.err().map(|refused| refused.status())
+        };
+        assert_eq!(refused(), Some(http::StatusCode::SERVICE_UNAVAILABLE));
+        let loaded = registry.get_by_name("m").unwrap().id;
+        components.tokenizer_template_files.write().insert(loaded);
+        assert_ne!(refused(), Some(http::StatusCode::SERVICE_UNAVAILABLE));
+    }
+
     #[test]
     fn test_prepare_generate_request_ids_unique_per_call() {
         let registry = test_mocks::tokenizer_registry_with("m");
