@@ -215,6 +215,24 @@ def test_each_fallback_reason_is_logged_once(modules, flydsl, monkeypatch, caplo
     assert "budget 1536" in reasons[0] and "graph capture" in reasons[1]
 
 
+def test_removed_attn_env_is_reported(modules, monkeypatch, caplog):
+    """A leftover ATOM_QSA_FLYDSL_ATTN=0 reads as "native kernel". The removed
+    flag cannot do that any more, so the operator is told it is ignored."""
+    monkeypatch.setenv("ATOM_QSA_FLYDSL_ATTN", "0")
+    with caplog.at_level("WARNING"):
+        modules.qsa_attention._warn_removed_attn_env()
+    warnings = [r.getMessage() for r in caplog.records if "no longer used" in r.message]
+    assert len(warnings) == 1
+    assert "ATOM_QSA_FLYDSL_ATTN is no longer used" in warnings[0]
+
+
+def test_removed_attn_env_warns_only_when_set(modules, monkeypatch, caplog):
+    monkeypatch.delenv("ATOM_QSA_FLYDSL_ATTN", raising=False)
+    with caplog.at_level("WARNING"):
+        modules.qsa_attention._warn_removed_attn_env()
+    assert [r for r in caplog.records if "no longer used" in r.message] == []
+
+
 def test_unlaid_forward_logs_nothing(modules, flydsl, caplog):
     """A forward the bridge did not lay out (target verify, warmup, ATOM's own
     runner) is not a fallback."""

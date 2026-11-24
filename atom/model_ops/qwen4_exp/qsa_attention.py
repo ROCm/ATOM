@@ -34,6 +34,7 @@ raw index keys so pooling can read them back.
 
 import functools
 import logging
+import os
 from types import SimpleNamespace
 
 import aiter
@@ -80,6 +81,27 @@ from atom.utils.forward_context import get_forward_context
 logger = logging.getLogger(__name__)
 
 
+def _warn_removed_attn_env() -> None:
+    """Warn if the removed ATOM_QSA_FLYDSL_ATTN is still set.
+
+    It used to turn the FlyDSL prefill off, so a leftover `0` reads as "keep
+    the native kernel". It cannot: the arch and shape gates decide now, and a
+    run that silently ignored the setting would look like the flag still
+    worked. Called once at import, as `base_attention` does for its own
+    removed flag.
+    """
+    if "ATOM_QSA_FLYDSL_ATTN" in os.environ:
+        logger.warning(
+            "ATOM_QSA_FLYDSL_ATTN is no longer used and is ignored; QSA eager "
+            "prefill runs the aiter FlyDSL attention wherever it is supported "
+            "(gfx942, BF16 KV, D256 with 12/6/3 q heads per rank) and the "
+            "native kernel everywhere else."
+        )
+
+
+_warn_removed_attn_env()
+
+
 def qsa_rank_heads(
     num_attention_heads: int, num_key_value_heads: int, tp_size: int
 ) -> tuple[int, int]:
@@ -104,8 +126,10 @@ def flydsl_arch_reason() -> str | None:
     the call raises `ValueError` off gfx942, but ATOM decides the layer's path
     before building the selection: an unguarded miss would pay the host layout,
     the selection and its expansion on a GPU that then refuses the attention.
-    Kept apart from `flydsl_fallback_reason` so the SGLang bridge can consult
-    it before reading the model's head shape or TP size.
+
+    `flydsl_fallback_reason` folds this in as the last gate, so the SGLang
+    bridge reaches it through that one predicate rather than calling this
+    directly: off gfx942 the callers take the native kernel either way.
     """
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
