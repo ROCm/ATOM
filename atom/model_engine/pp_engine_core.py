@@ -404,11 +404,15 @@ class PPEngineCoreProc(EngineCore):
         # When all requests wait, no forward wakes recv_metadata. Poll status
         # at the head's idle cadence instead of adding up to 100 ms to TTFT.
         connector = getattr(self.scheduler, "kv_connector", None)
+        # MoRIIO serves its pushes from this poll as well.
         metadata_poll_ms = (
             _PP_IDLE_POLL_MS
             if self.kv_transfer_enabled
             and getattr(connector, "is_producer", False)
-            and getattr(connector, "enable_chunked_transfer", False)
+            and (
+                getattr(connector, "enable_chunked_transfer", False)
+                or getattr(connector, "pushes_from_worker_poll", False)
+            )
             else 100
         )
         shutdown = False

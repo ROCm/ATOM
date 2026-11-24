@@ -198,6 +198,38 @@ def page_batch(
             f"{len(local_regions)} local PAGE regions against "
             f"{len(remote_regions)} remote ones"
         )
+    src, dst = _checked_blocks(
+        src_blocks, dst_blocks, local_num_blocks, remote_num_blocks
+    )
+    run_src, run_dst, run_len = coalesce_contiguous(src, dst, np.ones_like(src))
+    local_offs, remote_offs, sizes = [], [], []
+    for i, ((l_off, l_unit), (r_off, r_unit)) in enumerate(
+        zip(local_regions, remote_regions)
+    ):
+        if l_unit != r_unit:
+            raise ValueError(
+                f"PAGE region {i}: {l_unit} B per block here, {r_unit} B remote"
+            )
+        local_offs.append(l_off + run_src * l_unit)
+        remote_offs.append(r_off + run_dst * l_unit)
+        sizes.append(run_len * l_unit)
+    if not sizes:
+        return [], [], []
+    return (
+        np.concatenate(local_offs).tolist(),
+        np.concatenate(remote_offs).tolist(),
+        np.concatenate(sizes).tolist(),
+    )
+
+
+def _checked_blocks(
+    src_blocks: Sequence[int],
+    dst_blocks: Sequence[int],
+    local_num_blocks: int,
+    remote_num_blocks: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """The block ids as arrays; raises unless they pair one to one, lie inside
+    their pools, and name no destination twice."""
     if len(src_blocks) != len(dst_blocks):
         raise ValueError(
             f"{len(src_blocks)} source blocks for {len(dst_blocks)} destinations"
@@ -221,19 +253,69 @@ def page_batch(
             f"than once among the {dst.size} a fabric batch writes; its copies "
             "run concurrently, so they must not overlap"
         )
-    run_src, run_dst, run_len = coalesce_contiguous(src, dst, np.ones_like(src))
+    return src, dst
+
+
+def unit_batch(
+    local_regions: Sequence[tuple[int, int]],
+    remote_regions: Sequence[tuple[int, int]],
+    targets: Sequence[int],
+    cuts: Sequence[np.ndarray],
+    src_blocks: Sequence[int],
+    dst_blocks: Sequence[int],
+    local_num_blocks: int,
+    remote_num_blocks: int,
+) -> tuple[list[int], list[int], list[int]]:
+    """Pool-relative ``(local offsets, remote offsets, sizes)`` of a push paired
+    by unit rather than by position.
+
+    Local region ``i`` lands in remote region ``targets[i]``; ``cuts[i]`` is
+    its ``[src offset, dst offset, bytes]`` rows within one block
+    (`consumer_head_slices`), which must fill the remote block in order, so
+    every byte of a destination block is written exactly once. A PP stage
+    holds some of the consumer's regions and a TP1 stage cuts each consumer
+    rank its KV heads. Segments contiguous on both sides are merged; the same
+    block checks as `page_batch` apply.
+    """
+    if not (len(local_regions) == len(targets) == len(cuts)):
+        raise ValueError(
+            f"{len(local_regions)} local PAGE regions, {len(targets)} targets, "
+            f"{len(cuts)} cuts"
+        )
+    if len(set(targets)) != len(targets):
+        raise ValueError("two local PAGE regions land in one remote region")
+    src, dst = _checked_blocks(
+        src_blocks, dst_blocks, local_num_blocks, remote_num_blocks
+    )
     local_offs, remote_offs, sizes = [], [], []
-    for i, ((l_off, l_unit), (r_off, r_unit)) in enumerate(
-        zip(local_regions, remote_regions)
-    ):
-        if l_unit != r_unit:
+    for i, ((l_off, l_unit), c, rows) in enumerate(zip(local_regions, targets, cuts)):
+        if not 0 <= c < len(remote_regions):
             raise ValueError(
-                f"PAGE region {i}: {l_unit} B per block here, {r_unit} B remote"
+                f"PAGE region {i} lands in remote region {c} of "
+                f"{len(remote_regions)}"
             )
-        local_offs.append(l_off + run_src * l_unit)
-        remote_offs.append(r_off + run_dst * l_unit)
-        sizes.append(run_len * l_unit)
-    if not sizes:
+        r_off, r_unit = remote_regions[c]
+        rows = np.asarray(rows, dtype=np.int64).reshape(-1, 3)
+        ends = np.cumsum(rows[:, 2])
+        if (
+            rows[:, 0].min() < 0
+            or (rows[:, 0] + rows[:, 2]).max() > l_unit
+            or not np.array_equal(rows[:, 1], ends - rows[:, 2])
+            or int(ends[-1]) != r_unit
+        ):
+            raise ValueError(
+                f"PAGE region {i}: rows {rows.tolist()[:4]} do not fill remote "
+                f"region {c}'s {r_unit}-byte block in order from a "
+                f"{l_unit}-byte one"
+            )
+        seg_src = (l_off + src[:, None] * l_unit + rows[None, :, 0]).reshape(-1)
+        seg_dst = (r_off + dst[:, None] * r_unit + rows[None, :, 1]).reshape(-1)
+        seg_len = np.broadcast_to(rows[None, :, 2], (src.size, len(rows))).reshape(-1)
+        seg_src, seg_dst, seg_len = coalesce_contiguous(seg_src, seg_dst, seg_len)
+        local_offs.append(seg_src)
+        remote_offs.append(seg_dst)
+        sizes.append(seg_len)
+    if not sizes or src.size == 0:
         return [], [], []
     return (
         np.concatenate(local_offs).tolist(),

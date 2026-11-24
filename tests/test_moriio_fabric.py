@@ -225,6 +225,7 @@ def fabric_connector(stack, *, producer: bool, handle: bytes = b"\x01" * 64):
     conn.kv_cache_block_size = BLOCK
     conn._verify_kv = False
     conn._built_sessions = {}
+    conn._page_plans = {}
     conn.remote_moriio_metadata = {}
     conn.posted = []
 
@@ -577,19 +578,24 @@ class TestConfigPath:
         with pytest.raises(ValueError):
             backend(types.SimpleNamespace(kv_transfer_config=kv_config("kv_consumer")))
 
-    def test_fabric_refuses_dcp_pcp_and_pp(self, stack, monkeypatch):
+    def test_fabric_refuses_dcp_and_pcp(self, stack, monkeypatch):
+        # PP is a producer's to run (each stage pushes its layers); a PP
+        # consumer is refused by `Config._check_pp_support`.
         monkeypatch.delenv("ATOM_MORIIO_MODE", raising=False)
         backend = stack.conn.MoRIIOConnector._fabric_backend_from
         for name in (
             "decode_context_parallel_size",
             "prefill_context_parallel_size",
-            "pipeline_parallel_size",
         ):
             config = types.SimpleNamespace(
                 kv_transfer_config=kv_config("kv_producer"), **{name: 2}
             )
             with pytest.raises(ValueError, match=name):
                 backend(config)
+        config = types.SimpleNamespace(
+            kv_transfer_config=kv_config("kv_producer"), pipeline_parallel_size=4
+        )
+        assert backend(config)
 
     def test_the_factory_hook_reaches_moriio_inside_multi(self, stack, monkeypatch):
         monkeypatch.delenv("ATOM_MORIIO_MODE", raising=False)
@@ -1075,7 +1081,7 @@ class TestWriteOrdering:
         assert conn._sending_writes == {}
         conn._kv_ready_events[9].done = True
         conn._service_write_requests()
-        assert 9 in conn._sending_writes
+        assert (9, 0, 1) in conn._sending_writes
 
         statuses[0].state = "ok"
         conn._service_write_requests()
