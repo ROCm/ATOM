@@ -439,48 +439,28 @@ def test_tbo_and_plugin_steps_take_no_route_hint(runtime, monkeypatch):
     assert _events(runtime, "hint") == [None, None]
 
 
-def test_capture_hints_only_the_small_input_route(runtime):
-    runtime.run(_context(256))
-    runtime.capturing = True
-    runtime.run(_context(SMALL_M_MTPR))
+def test_capture_hints_the_rows_as_eager_does(runtime):
+    # The route depends on the rows alone: a capture, the capture loop's warmup
+    # (in_hipgraph) and a captured draft pass's warmup hint what eager hints, so
+    # the warmup compiles exactly what the recording launches, large-input
+    # route included.
     runtime.run(_context(SMALL_M_MTPR + 1))
-
-    assert _events(runtime, "hint") == [256, SMALL_M_MTPR, None]
-
-
-def test_capture_warmup_hints_like_the_capture(runtime):
-    # The capture loop's warmup forward runs eagerly with in_hipgraph set; it
-    # must take the capture's route, or the capture launches kernels the
-    # warmup never compiled.
     runtime.forward_context.in_hipgraph = True
     runtime.run(_context(SMALL_M_MTPR))
     runtime.run(_context(SMALL_M_MTPR + 1))
+    runtime.run(_context(SMALL_M_MTPR + 1, is_draft=True))
     runtime.capturing = True
-    runtime.run(_context(SMALL_M_MTPR))
     runtime.run(_context(SMALL_M_MTPR + 1))
-    runtime.capturing = False
-    runtime.forward_context.in_hipgraph = False
-    runtime.run(_context(SMALL_M_MTPR + 1))
+    runtime.run(_context(SMALL_M_MTPR + 1, is_draft=True))
 
     assert _events(runtime, "hint") == [
+        SMALL_M_MTPR + 1,
         SMALL_M_MTPR,
-        None,
-        SMALL_M_MTPR,
-        None,
+        SMALL_M_MTPR + 1,
+        SMALL_M_MTPR + 1,
+        SMALL_M_MTPR + 1,
         SMALL_M_MTPR + 1,
     ]
-
-
-def test_draft_graph_warmup_hints_like_its_capture(runtime):
-    # A captured draft pass warms and records under in_hipgraph: its warmup
-    # must take the route the recording takes.
-    runtime.forward_context.in_hipgraph = True
-    runtime.run(_context(SMALL_M_MTPR, is_draft=True))
-    runtime.run(_context(SMALL_M_MTPR + 1, is_draft=True))
-    runtime.capturing = True
-    runtime.run(_context(SMALL_M_MTPR + 1, is_draft=True))
-
-    assert _events(runtime, "hint") == [SMALL_M_MTPR, None, None]
 
 
 def test_each_layer_selects_the_large_input_slot_of_its_layer_id(runtime):

@@ -184,17 +184,14 @@ def mega_builds_fused_route(
     )
 
 
-def _max_tokens_hint(mega, fc, *, pcp_merge: bool) -> int | None:
+def _max_tokens_hint(fc, *, pcp_merge: bool) -> int | None:
     """This step's max rows over the DP group, identical on every EP rank.
 
     None (the staged route) when no such count is known: plugin bridges, TBO
-    ubatches and missing metadata. A graph capture takes the small-input route
-    when the rows fit it and the staged route otherwise; the large-input route
-    is never captured. The eager warmup forward before a capture (the target's
-    capture loop and a captured draft pass both run it under ``fc.in_hipgraph``)
-    takes the same route as the capture that follows it, so the kernels the
-    capture launches are compiled and their workspaces allocated before the
-    capture starts.
+    ubatches and missing metadata. The route depends on the rows alone, so a
+    graph capture takes the route its eager run takes (small-input up to its
+    capacity, large-input above it) and the eager warmup before a capture
+    compiles the kernels and allocates the workspaces the capture launches.
 
     ``pcp_merge``: every PCP rank runs the experts over the same rows, which a
     split pass gathers from the PCP shards of the step's rows padded to a PCP
@@ -216,11 +213,7 @@ def _max_tokens_hint(mega, fc, *, pcp_merge: bool) -> int | None:
         return None
     if rows <= 0:
         return None
-    rows = _pcp_merged_rows(rows, pcp_merge)
-    in_capture = fc.in_hipgraph or torch.cuda.is_current_stream_capturing()
-    if in_capture and rows > mega.small_m_mtpr:
-        return None
-    return rows
+    return _pcp_merged_rows(rows, pcp_merge)
 
 
 def build_mega_weights(layer) -> None:
@@ -467,7 +460,7 @@ def run_mega_moe(
                     selected_mtpr,
                 )
 
-    max_tokens = _max_tokens_hint(mega, get_forward_context(), pcp_merge=pcp_merge)
+    max_tokens = _max_tokens_hint(get_forward_context(), pcp_merge=pcp_merge)
     if mega.large_m_available:
         # The weights are bound above; select this layer's protocol slot.
         mega.select_layer_state(layer.layer_id)
