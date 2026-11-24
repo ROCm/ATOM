@@ -725,11 +725,12 @@ def _parse(document: Mapping[str, Any], *, model_arch: str | None) -> dict[str, 
         for owner in owners:
             ref = plugins.get(owner)
             if ref is None and is_v2 and not has_explicit_plugins:
-                ref = plugins[owner] = {
-                    "name": owner,
-                    "kind": "layer",
-                    "serves": [seam],
-                }
+                ref = plugins[owner] = {"name": owner, "kind": "layer", "serves": []}
+            if is_v2 and not has_explicit_plugins and ref.get("kind") == "layer":
+                # An inferred plugin serves what the recipe plans for it: one
+                # owner may bind several seams (its pattern's bindings).
+                if seam not in ref["serves"]:
+                    ref["serves"].append(seam)
             if ref is None:
                 raise RecipeRefused("recipe-unknown-provider", f"{seam}: {owner}")
             if ref.get("kind", "layer") != "layer":

@@ -511,3 +511,8 @@ def test_hook_api_3_still_loads_hook_api_2_plugins_and_recipes():
     assert host.api_satisfies(">=3,<4") and not host.api_satisfies(">=4")
     assert not host.api_satisfies(">=2,<3", 3)
     _plan(requires={"atom_hook_api": ">=2,<3"})
+
+
+def test_one_inferred_owner_may_serve_several_seams():
+    plan = _plan(seams={"toy.block.mix": ["p"], "toy.block.other": ["p"]})
+    assert plan.providers == ("p",)
