@@ -162,9 +162,9 @@ fn complete_chunk(complete: GenerateComplete) -> TokenChunk {
             weight_version: None,
             cached_tokens: complete.cached_tokens,
             timing: Some(SeqTiming {
-                ttft_s: complete.ttft_s,
-                tpot_s: complete.tpot_s,
-                latency_s: complete.latency_s,
+                ttft: complete.ttft_s,
+                tpot: complete.tpot_s,
+                latency: complete.latency_s,
             }),
         },
         token_ids: complete.output_ids,

@@ -15,12 +15,13 @@ use crate::protocols::{
 };
 
 /// Each message's own tools as sent, in message order; `None` where a message declares none.
-/// Beside them, the top-level tools as sent when one carries a namespace, which the typed
-/// request drops.
+/// Beside them, the top-level tools as sent when one carries a namespace, and a named
+/// `tool_choice` as sent when it carries one, which the typed request drops.
 #[derive(Debug, Clone, Default)]
 pub struct MessageTools(
     pub Arc<Vec<Option<Vec<Value>>>>,
     pub Option<Arc<Vec<Value>>>,
+    pub Option<Arc<Value>>,
 );
 
 #[derive(Deserialize)]
@@ -28,6 +29,8 @@ struct RawChat {
     messages: Vec<RawMessage>,
     #[serde(default)]
     tools: Option<Vec<Value>>,
+    #[serde(default)]
+    tool_choice: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -43,9 +46,13 @@ impl MessageTools {
             serde_json::from_slice(body).map_err(|e| format!("Invalid message tools: {e}"))?;
         let namespaced = |tools: &Vec<Value>| tools.iter().any(|t| namespace(t).is_some());
         let top_level = chat.tools.filter(namespaced).map(Arc::new);
+        let choice = chat
+            .tool_choice
+            .filter(|c| c.is_object() && namespace(c).is_some());
         let declared = Self(
             Arc::new(chat.messages.into_iter().map(|m| m.tools).collect()),
             top_level,
+            choice.map(Arc::new),
         );
         for tool in declared.0.iter().flatten().flatten() {
             qualified(tool).map_err(|e| format!("Invalid message tools: {e}"))?;
@@ -53,7 +60,18 @@ impl MessageTools {
         for tool in declared.1.iter().flat_map(|tools| tools.iter()) {
             qualified(tool).map_err(|e| format!("Invalid tools: {e}"))?;
         }
+        declared
+            .qualified_choice()
+            .transpose()
+            .map_err(|e| format!("Invalid tool_choice: {e}"))?;
         Ok(declared)
+    }
+
+    /// The named `tool_choice`'s `namespace::name`, when it carries a namespace.
+    pub fn qualified_choice(&self) -> Option<Result<String, String>> {
+        let choice = self.2.as_deref()?;
+        let name = choice.get("function")?.get("name")?.as_str()?;
+        Some(qualify(name, choice))
     }
 
     /// The tools the typed `req` keeps: a developer message's.
@@ -65,7 +83,7 @@ impl MessageTools {
             }),
             _ => None,
         });
-        Self(Arc::new(tools.collect()), None)
+        Self(Arc::new(tools.collect()), None, None)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -100,8 +118,20 @@ impl MessageTools {
 /// has a namespace, beside or inside `function`, as a string or `{"name": ...}`.
 fn qualified(tool: &Value) -> Result<Tool, String> {
     let mut parsed: Tool = serde_json::from_value(tool.clone()).map_err(|e| e.to_string())?;
-    let namespace = match namespace(tool) {
-        None => return Ok(parsed),
+    parsed.function.name = qualify(&parsed.function.name, tool)?;
+    Ok(parsed)
+}
+
+/// A tool as sent, named as `qualified` names it; none if it cannot be.
+pub(crate) fn qualified_name(tool: &Value) -> Option<String> {
+    let name = tool.get("function")?.get("name")?.as_str()?;
+    qualify(name, tool).ok()
+}
+
+/// `name` qualified by the namespace `carrier` (a tool or a named choice) has.
+fn qualify(name: &str, carrier: &Value) -> Result<String, String> {
+    let namespace = match namespace(carrier) {
+        None => return Ok(name.to_string()),
         Some(Value::Object(namespace)) => namespace.get("name"),
         Some(namespace) => Some(namespace),
     };
@@ -109,14 +139,10 @@ fn qualified(tool: &Value) -> Result<Tool, String> {
         Some(namespace) if identifier(namespace) => namespace,
         _ => return Err("tool namespace must be a nonempty identifier without '::'".into()),
     };
-    let name = &mut parsed.function.name;
     match name.split_once("::") {
         Some((prefix, _)) if prefix != namespace => Err("conflicting tool namespaces".into()),
-        Some(_) => Ok(parsed),
-        None => {
-            *name = format!("{namespace}::{name}");
-            Ok(parsed)
-        }
+        Some(_) => Ok(name.to_string()),
+        None => Ok(format!("{namespace}::{name}")),
     }
 }
 

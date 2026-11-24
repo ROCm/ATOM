@@ -7,7 +7,6 @@
 use std::future::Future;
 use std::time::{Duration, Instant};
 
-use prost::Message as _;
 use tokio::time::timeout;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::transport::{server::TcpIncoming, Server};
@@ -447,9 +446,9 @@ async fn a_completion_reports_its_ttft_tpot_and_latency_from_its_times() {
     }
 
     let timing = SeqTiming {
-        ttft_s: 0.25,
-        tpot_s: 0.5,
-        latency_s: 1.25,
+        ttft: 0.25,
+        tpot: 0.5,
+        latency: 1.25,
     };
     let streamed = chunks(streamed.unwrap()).await;
     assert!(
@@ -823,20 +822,25 @@ fn a_finished_stream_dropped_after_its_seq_id_is_reused_aborts_nothing() {
     assert!(matches!(&sent()[..], [Command::Abort(0)]));
 }
 
+/// The budget bytes a request with `spec(name)` and an `ids`-long prompt holds unsent.
+fn unsent_bytes(name: &str, ids: usize) -> usize {
+    4 * ids + spec(name).encoded_len()
+}
+
 #[test]
-fn unsent_prompts_are_bounded_and_a_dropped_unsent_request_frees_its_prompt() {
+fn unsent_requests_are_bounded_and_a_dropped_unsent_request_is_not_sent() {
     let (commands, mut queued) = mpsc::unbounded_channel();
     let routes = Routes {
-        unsent_budget: 16,
+        unsent_budget: unsent_bytes("first", 2) + unsent_bytes("secnd", 2),
         ..Default::default()
     };
     let session = Session {
         routes: Arc::new(Mutex::new(routes)),
         commands,
     };
-    // ATOM reads nothing: two 2-id prompts fill the 16 bytes, a third is refused.
+    // ATOM reads nothing: two requests fill the budget, a third is refused.
     let first = session.submit(spec("first"), vec![1, 2], true).unwrap();
-    let second = session.submit(spec("second"), vec![3, 4], true).unwrap();
+    let second = session.submit(spec("secnd"), vec![3, 4], true).unwrap();
     let refused = session.submit(spec("third"), vec![5], true);
     assert!(
         matches!(&refused, Err(EngineError::Http { status, .. }) if status.as_u16() == 503),
@@ -847,21 +851,47 @@ fn unsent_prompts_are_bounded_and_a_dropped_unsent_request_frees_its_prompt() {
     // Dropped unsent, a request frees its prompt and seq_id and sends no Abort...
     let first_id = first.seq_id;
     drop(first);
-    assert_eq!(session.routes.lock().unsent_bytes, 8);
     assert!(!session.routes.lock().open.contains_key(&first_id));
-    let third = session.submit(spec("third"), vec![5], true).unwrap();
-    // ...and the writer sends only the requests still waiting, with their prompts.
+    // ...but its spec is still queued, so its bytes stay held until the writer runs.
+    assert!(session.submit(spec("third"), vec![5], true).is_err());
     let waiting: Vec<_> = std::iter::from_fn(|| queued.try_recv().ok()).collect();
     let sent = session.routes.lock().take_unsent(waiting);
+    let third = session.submit(spec("third"), vec![5], true).unwrap();
+    let waiting: Vec<_> = std::iter::from_fn(|| queued.try_recv().ok()).collect();
     let sent: Vec<_> = sent
-        .iter()
+        .into_iter()
+        .chain(session.routes.lock().take_unsent(waiting))
         .map(|command| match command {
-            Command::Submit(spec, prompt) => (spec.seq_id, prompt.clone()),
+            Command::Submit(spec, prompt) => (spec.seq_id, prompt),
             _ => panic!("only Submits were queued"),
         })
         .collect();
+    // The writer sends only the requests still waiting, with their prompts.
     assert_eq!(sent, [(second.seq_id, vec![3, 4]), (third.seq_id, vec![5])]);
     assert_eq!(session.routes.lock().unsent_bytes, 0);
+}
+
+#[test]
+fn requests_cancelled_while_the_writer_stalls_cannot_queue_without_bound() {
+    let (commands, mut queued) = mpsc::unbounded_channel();
+    let routes = Routes {
+        unsent_budget: 2 * unsent_bytes("r", 1),
+        ..Default::default()
+    };
+    let session = Session {
+        routes: Arc::new(Mutex::new(routes)),
+        commands,
+    };
+    // The writer stalls; each request is cancelled at once, its spec left queued.
+    let cancelled = (0..10)
+        .take_while(|_| session.submit(spec("r"), vec![1], true).is_ok())
+        .count();
+    assert_eq!(cancelled, 2);
+    // Once the writer discards them, requests are taken again.
+    let waiting: Vec<_> = std::iter::from_fn(|| queued.try_recv().ok()).collect();
+    assert_eq!(waiting.len(), 2);
+    assert!(session.routes.lock().take_unsent(waiting).is_empty());
+    assert!(session.submit(spec("r"), vec![1], true).is_ok());
 }
 
 #[test]

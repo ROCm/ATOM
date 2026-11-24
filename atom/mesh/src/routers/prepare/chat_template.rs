@@ -8,7 +8,10 @@ use std::{
 
 use serde_json::{json, Value};
 
-use super::{fast_tokenizer::FastTokenizer, message_tools::MessageTools};
+use super::{
+    fast_tokenizer::FastTokenizer,
+    message_tools::{qualified_name, MessageTools},
+};
 use crate::{
     core::{worker::RuntimeType, Worker},
     protocols::{
@@ -46,54 +49,6 @@ pub(crate) fn default_template_kwargs(
                 .map_err(|e| format!("Invalid {DEFAULT_TEMPLATE_KWARGS_LABEL} label {json}: {e}"))
         })
         .transpose()
-}
-
-/// The chat template a model's tokenizer was loaded with.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum LoadedTemplate {
-    /// An ATOM worker's, which it advertised.
-    Worker(String),
-    /// A registration's template file, which overrides the workers'.
-    File,
-    /// The tokenizer's own.
-    Own,
-}
-
-/// An ATOM worker among `workers` advertising a chat template when none advertises
-/// the one the model's tokenizer was `loaded` with, and neither the router
-/// (`configured`) nor a registration's file sets one: the tokenizer is being loaded
-/// again with a live worker's template, or failed to be.
-pub(crate) fn atom_template_not_loaded(
-    workers: &[Arc<dyn Worker>],
-    configured: bool,
-    loaded: Option<LoadedTemplate>,
-) -> Option<&Arc<dyn Worker>> {
-    if configured || loaded == Some(LoadedTemplate::File) {
-        return None;
-    }
-    let loaded = match loaded? {
-        LoadedTemplate::Worker(template) => Some(template),
-        _ => None,
-    };
-    let advertising: Vec<_> = workers
-        .iter()
-        .filter_map(|worker| advertised_template(worker).map(|template| (worker, template)))
-        .collect();
-    if advertising
-        .iter()
-        .any(|(_, template)| Some(template) == loaded.as_ref())
-    {
-        return None;
-    }
-    advertising.first().map(|(worker, _)| *worker)
-}
-
-/// The chat template `worker` advertises as an ATOM worker without a template file.
-fn advertised_template(worker: &Arc<dyn Worker>) -> Option<String> {
-    let metadata = worker.metadata();
-    let atom = metadata.runtime_type == RuntimeType::Atom && worker.chat_template().is_none();
-    atom.then(|| metadata.labels.get("chat_template").cloned())
-        .flatten()
 }
 
 /// Why atomesh cannot render chats as `workers`' ATOM worker does, if it cannot: the
@@ -219,8 +174,12 @@ pub fn process_chat_messages_with_kwargs(
         })
         .transpose()
         .map_err(|e| format!("Failed to serialize tools: {}", e))?;
-    // Namespaced top-level tools render as sent, those `request` keeps by name.
+    // Namespaced top-level tools render as sent, those `request` keeps by name, or the
+    // one a namespaced named choice qualifies.
     let sent = message_tools.and_then(|declared| declared.1.as_deref());
+    let choice = message_tools
+        .and_then(MessageTools::qualified_choice)
+        .and_then(Result::ok);
     let tools_json = match (tools_json, sent) {
         (Some(_), Some(sent)) => {
             let kept: HashSet<&str> = request
@@ -229,9 +188,10 @@ pub fn process_chat_messages_with_kwargs(
                 .flatten()
                 .map(|tool| tool.function.name.as_str())
                 .collect();
-            let kept = sent
-                .iter()
-                .filter(|tool| sent_name(tool).is_some_and(|n| kept.contains(n)));
+            let kept = sent.iter().filter(|tool| match &choice {
+                Some(choice) => qualified_name(tool).as_ref() == Some(choice),
+                None => sent_name(tool).is_some_and(|n| kept.contains(n)),
+            });
             Some(kept.cloned().collect())
         }
         (typed, _) => typed,

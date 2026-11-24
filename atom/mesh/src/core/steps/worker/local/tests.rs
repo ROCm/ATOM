@@ -139,7 +139,11 @@ impl AtomEngine for FakeAtom {
 }
 
 /// A vLLM instance that answers HealthCheck and GetModelInfo.
-struct FakeVllm;
+#[derive(Default)]
+struct FakeVllm {
+    /// HealthCheck answers unhealthy.
+    unhealthy: bool,
+}
 
 #[tonic::async_trait]
 impl vllm::vllm_engine_server::VllmEngine for FakeVllm {
@@ -164,7 +168,7 @@ impl vllm::vllm_engine_server::VllmEngine for FakeVllm {
         _: Request<vllm::HealthCheckRequest>,
     ) -> Result<Response<vllm::HealthCheckResponse>, Status> {
         Ok(Response::new(vllm::HealthCheckResponse {
-            healthy: true,
+            healthy: !self.unhealthy,
             message: String::new(),
         }))
     }
@@ -439,42 +443,51 @@ async fn the_tokenizer_job_renders_with_the_label_template_without_a_flag() {
     assert_eq!(rendered, "label: hi");
 }
 
-/// A worker registered later for a model whose tokenizer is loaded already, with another
-/// template (a replaced worker's), has the tokenizer loaded again with its own.
+/// Runs the worker removal workflow on `url`, as a RemoveWorker job does.
+async fn remove(ctx: &Arc<AppContext>, url: &str) {
+    let engine = &ctx.workflow_engines.get().unwrap().worker_removal;
+    let data = super::create_worker_removal_workflow_data(url.into(), false, ctx.clone());
+    let id = engine
+        .start_workflow(WorkflowId::new("worker_removal"), data)
+        .await
+        .unwrap();
+    let done = engine.wait_for_completion(id, url, Duration::from_secs(30));
+    done.await.unwrap();
+}
+
+/// All live workers of a model serve one template: a worker advertising another is
+/// refused while one is registered; once the last leaves, its tokenizer goes, and the
+/// next worker's template loads afresh.
 #[tokio::test]
-async fn a_later_worker_s_template_replaces_the_loaded_one() {
+async fn a_worker_with_another_template_is_refused_until_the_model_s_last_worker_leaves() {
     let ctx = context();
-    for template in ["first", "second"] {
-        let info = model_info(
-            "atom-retemplate",
-            &format!("{template}: {{{{ messages[0].content }}}}"),
-            "{}",
-        );
-        register(&ctx, json!({ "url": serve_atom(info, 1).await }))
-            .await
-            .unwrap();
-        let expected = format!("{template}: hi");
-        // Until the tokenizer is loaded with the new worker's template, its chats get 503.
-        let rendered = async {
-            loop {
-                let body = json!({"model": "atom-retemplate",
-                    "messages": [{"role": "user", "content": "hi"}]});
-                let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
-                let model = Some("atom-retemplate".into());
-                match prepare_chat(Arc::new(request), None, model, &ctx) {
-                    Ok((_, resp)) if resp.original_text.as_deref() == Some(&expected) => break,
-                    Err(refused) => {
-                        assert_eq!(refused.status(), http::StatusCode::SERVICE_UNAVAILABLE)
-                    }
-                    Ok(_) => {}
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        };
-        tokio::time::timeout(Duration::from_secs(15), rendered)
-            .await
-            .unwrap_or_else(|_| panic!("the tokenizer never rendered {expected:?}"));
-    }
+    let worker = |template: &str| {
+        let template = format!("{template}: {{{{ messages[0].content }}}}");
+        serve_atom(model_info("atom-retemplate", &template, "{}"), 1)
+    };
+    let first = worker("first").await;
+    register(&ctx, json!({ "url": first })).await.unwrap();
+    assert_eq!(
+        render(&ctx, "atom-retemplate", Value::Null).await,
+        "first: hi"
+    );
+
+    let second = worker("second").await;
+    let refused = register(&ctx, json!({ "url": second })).await.unwrap_err();
+    assert!(refused.contains("redeploying"), "{refused}");
+    assert!(ctx.worker_registry.get_by_url(&second).is_none());
+    assert_eq!(
+        render(&ctx, "atom-retemplate", Value::Null).await,
+        "first: hi"
+    );
+
+    remove(&ctx, &first).await;
+    assert!(!ctx.tokenizer_registry.contains("atom-retemplate"));
+    register(&ctx, json!({ "url": second })).await.unwrap();
+    assert_eq!(
+        render(&ctx, "atom-retemplate", Value::Null).await,
+        "second: hi"
+    );
 }
 
 /// The label template is set before fastokens wraps the tokenizer: a FastTokenizer
@@ -528,9 +541,34 @@ async fn default_template_kwargs_join_the_request_kwargs_the_request_winning() {
     assert_eq!(rendered, "hello request: hi");
 }
 
+/// ATOM's HTTP chat sets `thinking_effort` from a reasoning effort it reads, over the
+/// defaults and the request's kwargs, and drops one its templates do not read.
+#[tokio::test]
+async fn a_reasoning_effort_overrides_the_default_thinking_effort_as_on_http() {
+    let template = "{{ thinking_effort }} {{ reasoning_effort }}: {{ messages[0].content }}";
+    let defaults = r#"{"thinking_effort": "low"}"#;
+    let url = serve_atom(model_info("atom-effort", template, defaults), 1).await;
+    let ctx = context();
+    register(&ctx, json!({ "url": url })).await.unwrap();
+    render(&ctx, "atom-effort", Value::Null).await;
+
+    for (effort, expected) in [("high", "high : hi"), ("medium", "low : hi")] {
+        let body = json!({
+            "model": "atom-effort",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": effort,
+            "chat_template_kwargs": {"thinking_effort": "low"},
+        });
+        let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+        let model = Some("atom-effort".into());
+        let (_, resp) = prepare_chat(Arc::new(request), None, model, &ctx).unwrap();
+        assert_eq!(resp.original_text.as_deref(), Some(expected), "{effort}");
+    }
+}
+
 #[tokio::test]
 async fn a_vllm_worker_is_still_detected_as_vllm() {
-    let service = vllm::vllm_engine_server::VllmEngineServer::new(FakeVllm);
+    let service = vllm::vllm_engine_server::VllmEngineServer::new(FakeVllm::default());
     let url = serve(Server::builder().add_service(service)).await;
     let ctx = context();
     register(&ctx, json!({ "url": url })).await.unwrap();
@@ -539,6 +577,51 @@ async fn a_vllm_worker_is_still_detected_as_vllm() {
     assert_eq!(worker.metadata().runtime_type, RuntimeType::Vllm);
     let labels = &worker.metadata().labels;
     assert_eq!(labels.get("max_context_length").unwrap(), "2048");
+}
+
+/// A reasoning effort of "none" switches the model's reasoning toggle off over its
+/// default, as ATOM's HTTP chat does (`resolve_reasoning_controls`).
+#[tokio::test]
+async fn a_reasoning_effort_of_none_switches_the_default_on_toggle_off_as_on_http() {
+    let template = "thinking={{ enable_thinking }}: {{ messages[0].content }}";
+    let info = GetModelInfoResponse {
+        reasoning_toggle_json: r#"["enable_thinking", false, true]"#.into(),
+        ..model_info("atom-toggle", template, r#"{"enable_thinking": true}"#)
+    };
+    let url = serve_atom(info, 1).await;
+    let ctx = context();
+    register(&ctx, json!({ "url": url })).await.unwrap();
+    assert_eq!(
+        render(&ctx, "atom-toggle", Value::Null).await,
+        "thinking=True: hi"
+    );
+
+    let body = json!({
+        "model": "atom-toggle",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "none",
+    });
+    let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+    let model = Some("atom-toggle".into());
+    let (_, resp) = prepare_chat(Arc::new(request), None, model, &ctx).unwrap();
+    assert_eq!(resp.original_text.as_deref(), Some("thinking=False: hi"));
+}
+
+/// A vLLM worker's HealthCheck answer does not decide its registration, as before
+/// ATOM workers were served: only an ATOM worker's must say healthy.
+#[tokio::test]
+async fn a_vllm_worker_reporting_unhealthy_still_registers() {
+    let fake = FakeVllm { unhealthy: true };
+    let service = vllm::vllm_engine_server::VllmEngineServer::new(fake);
+    let url = serve(Server::builder().add_service(service)).await;
+    let ctx = context_with(RouterConfig {
+        worker_startup_timeout_secs: 2,
+        ..Default::default()
+    });
+    register(&ctx, json!({ "url": url })).await.unwrap();
+
+    let worker = ctx.worker_registry.get_by_url(&url).unwrap();
+    assert_eq!(worker.metadata().runtime_type, RuntimeType::Vllm);
 }
 
 #[tokio::test]

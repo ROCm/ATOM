@@ -160,11 +160,11 @@ impl GrpcPDRouter {
                     pipeline
                         .execute_chat_declaring(
                             request,
-                            message_tools,
-                            thinking,
+                            (message_tools, thinking),
                             headers,
                             model_id,
                             components,
+                            None,
                         )
                         .await
                 }
