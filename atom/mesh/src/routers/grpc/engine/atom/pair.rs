@@ -44,16 +44,20 @@ use crate::tokenizer::traits::Tokenizer;
 /// Runs ATOM pairs as ATOM's HTTP P/D router does: relay, or chunked when P's
 /// instance reports a chunked-transfer template.
 pub(crate) struct AtomPairs {
-    info: RwLock<Arc<AtomPrefillInfo>>,
+    pub(super) info: RwLock<Arc<AtomPrefillInfo>>,
     /// The worker each URL's info was read for, and each instance's (its base URL):
     /// a worker registered again at that URL is another, whose info is read afresh.
-    read_for: RwLock<HashMap<String, Weak<dyn Worker>>>,
+    /// Taken after `info`, as a read publishes both.
+    pub(super) read_for: RwLock<HashMap<String, Weak<dyn Worker>>>,
     /// Per instance, held while its GetServerInfo is read, so concurrent first pairs of
-    /// its ranks read it once.
-    reading: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// its ranks read it once; it keeps a failed read's error, and when.
+    reading: Mutex<HashMap<String, Arc<tokio::sync::Mutex<Option<Failed>>>>>,
     mapping: AtomPdRankMappingPolicy,
     workers: Arc<WorkerRegistry>,
 }
+
+/// A failed GetServerInfo read: when, and the error each pair that waited for it gets.
+type Failed = (Instant, StatusCode, String);
 
 impl AtomPairs {
     /// Reads each registered ATOM prefill's `kv_transfer_info` from GetServerInfo,
@@ -79,18 +83,25 @@ impl AtomPairs {
     }
 
     /// The prefills' info, `prefill`'s read on its first pair when it registered later
-    /// or again.
+    /// or again. Waiting for another pair's read and reading take at most the prefill's
+    /// health-check timeout together; pairs that waited for a read that failed get its
+    /// error.
     pub(super) async fn adapter_for(
         &self,
         prefill: &Arc<dyn Worker>,
     ) -> Result<AtomAdapter, EngineError> {
         let url = prefill.url();
         let this = Arc::downgrade(prefill);
-        let read = |read_for: &HashMap<String, Weak<dyn Worker>>| {
-            read_for.get(url).is_some_and(|known| known.ptr_eq(&this))
+        // The info this prefill was read into, taken with the check that it was, so no
+        // read publishing meanwhile can have pruned it.
+        let cached = || {
+            let info = self.info.read().unwrap();
+            let read_for = self.read_for.read().unwrap();
+            let read = read_for.get(url).is_some_and(|known| known.ptr_eq(&this));
+            read.then(|| AtomAdapter::new(info.clone()))
         };
-        if read(&self.read_for.read().unwrap()) {
-            return Ok(AtomAdapter::new(self.info.read().unwrap().clone()));
+        if let Some(adapter) = cached() {
+            return Ok(adapter);
         }
         let base = base_url(prefill);
         let gate = self
@@ -100,10 +111,45 @@ impl AtomPairs {
             .entry(base.clone())
             .or_default()
             .clone();
-        let _reading = gate.lock().await;
-        if read(&self.read_for.read().unwrap()) {
-            return Ok(AtomAdapter::new(self.info.read().unwrap().clone()));
-        }
+        let started = Instant::now();
+        let deadline = Duration::from_secs(prefill.metadata().health_config.timeout_secs);
+        let read = async {
+            let mut failed = gate.lock().await;
+            if let Some(adapter) = cached() {
+                return Ok(adapter);
+            }
+            if let Some((_, status, message)) = failed.as_ref().filter(|f| f.0 >= started) {
+                let (status, message) = (*status, message.clone());
+                return Err(EngineError::Http { status, message });
+            }
+            let read = self.read(prefill, &base, this.clone()).await;
+            if let Err(e) = &read {
+                *failed = Some(match e {
+                    EngineError::Http { status, message } => {
+                        (Instant::now(), *status, message.clone())
+                    }
+                    e => (Instant::now(), StatusCode::BAD_GATEWAY, e.to_string()),
+                });
+            }
+            read
+        };
+        tokio::time::timeout(deadline, read)
+            .await
+            .map_err(|_| EngineError::Http {
+                status: StatusCode::GATEWAY_TIMEOUT,
+                message: format!("GetServerInfo on {url} timed out after {deadline:?}"),
+            })?
+    }
+
+    /// Reads `prefill`'s info, or its instance's from a sibling rank still registered,
+    /// and publishes it.
+    async fn read(
+        &self,
+        prefill: &Arc<dyn Worker>,
+        base: &str,
+        this: Weak<dyn Worker>,
+    ) -> Result<AtomAdapter, EngineError> {
+        let (url, base) = (prefill.url(), base.to_string());
         let mut learned = AtomPrefillInfo::default();
         // A rank still registered read this instance: its info serves this sibling too,
         // unless this rank replaced one, whose siblings may be the old instance's.

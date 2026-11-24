@@ -58,7 +58,8 @@ class Session:
         self.requests: dict[int, _Request] = {}
         self.client_ids: dict[int, int] = {}  # by engine id, each request's seq_id
         self.preparing = 0  # submissions in preprocess: each holds the window too
-        self.admitting: set[int] = set()  # client seq_ids whose submission is pending
+        # client seq_id -> its pending submission; held until admitted or ended
+        self.admitting: dict[int, object] = {}
         self.aborted_while_admitting: set[int] = set()  # aborted once it is added
         self.pending: list[RequestOutput] = []  # the step being delivered
         self.put = self.pending.append  # where each output goes as a step is delivered
@@ -175,6 +176,9 @@ class Session:
                     self.send(_completed_or_rejected(completion))
         for completion in done:
             request = self._pop(completion.seq_id)
+            # Ended while its admission settles: its seq_id is the client's again.
+            self.admitting.pop(completion.seq_id, None)
+            self.aborted_while_admitting.discard(completion.seq_id)
             self.api.cleanup_stream(request.seq.id)
         self._release()
 

@@ -15,12 +15,19 @@ use crate::protocols::{
 };
 
 /// Each message's own tools as sent, in message order; `None` where a message declares none.
+/// Beside them, the top-level tools as sent when one carries a namespace, which the typed
+/// request drops.
 #[derive(Debug, Clone, Default)]
-pub struct MessageTools(pub Arc<Vec<Option<Vec<Value>>>>);
+pub struct MessageTools(
+    pub Arc<Vec<Option<Vec<Value>>>>,
+    pub Option<Arc<Vec<Value>>>,
+);
 
 #[derive(Deserialize)]
 struct RawChat {
     messages: Vec<RawMessage>,
+    #[serde(default)]
+    tools: Option<Vec<Value>>,
 }
 
 #[derive(Deserialize)]
@@ -34,11 +41,17 @@ impl MessageTools {
     pub fn read(body: &[u8]) -> Result<Self, String> {
         let chat: RawChat =
             serde_json::from_slice(body).map_err(|e| format!("Invalid message tools: {e}"))?;
-        let declared = Self(Arc::new(
-            chat.messages.into_iter().map(|m| m.tools).collect(),
-        ));
+        let namespaced = |tools: &Vec<Value>| tools.iter().any(|t| namespace(t).is_some());
+        let top_level = chat.tools.filter(namespaced).map(Arc::new);
+        let declared = Self(
+            Arc::new(chat.messages.into_iter().map(|m| m.tools).collect()),
+            top_level,
+        );
         for tool in declared.0.iter().flatten().flatten() {
             qualified(tool).map_err(|e| format!("Invalid message tools: {e}"))?;
+        }
+        for tool in declared.1.iter().flat_map(|tools| tools.iter()) {
+            qualified(tool).map_err(|e| format!("Invalid tools: {e}"))?;
         }
         Ok(declared)
     }
@@ -52,7 +65,7 @@ impl MessageTools {
             }),
             _ => None,
         });
-        Self(Arc::new(tools.collect()))
+        Self(Arc::new(tools.collect()), None)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -61,7 +74,7 @@ impl MessageTools {
 
     /// The top-level tools, then every message's, as the reply's tool calls are read
     /// against: one per name, its last declaration, as ATOM's HTTP chat reads them.
-    /// A message's namespaced tool is named `namespace::name`.
+    /// A namespaced tool is named `namespace::name`.
     pub fn with_top_level(&self, top_level: Option<&Vec<Tool>>) -> Vec<Tool> {
         let declared = self
             .0
@@ -69,12 +82,11 @@ impl MessageTools {
             .flatten()
             .flatten()
             .filter_map(|t| qualified(t).ok());
-        let all: Vec<Tool> = top_level
-            .into_iter()
-            .flatten()
-            .cloned()
-            .chain(declared)
-            .collect();
+        let top_level: Vec<Tool> = match &self.1 {
+            Some(sent) => sent.iter().filter_map(|t| qualified(t).ok()).collect(),
+            None => top_level.into_iter().flatten().cloned().collect(),
+        };
+        let all: Vec<Tool> = top_level.into_iter().chain(declared).collect();
         let mut named = HashSet::new();
         let mut last: Vec<Tool> = (all.into_iter().rev())
             .filter(|tool| named.insert(tool.function.name.clone()))
@@ -88,12 +100,8 @@ impl MessageTools {
 /// has a namespace, beside or inside `function`, as a string or `{"name": ...}`.
 fn qualified(tool: &Value) -> Result<Tool, String> {
     let mut parsed: Tool = serde_json::from_value(tool.clone()).map_err(|e| e.to_string())?;
-    let function = tool.get("function");
-    let beside = tool
-        .get("namespace")
-        .filter(|namespace| !namespace.is_null());
-    let namespace = match beside.or_else(|| function?.get("namespace")) {
-        None | Some(Value::Null) => return Ok(parsed),
+    let namespace = match namespace(tool) {
+        None => return Ok(parsed),
         Some(Value::Object(namespace)) => namespace.get("name"),
         Some(namespace) => Some(namespace),
     };
@@ -110,6 +118,14 @@ fn qualified(tool: &Value) -> Result<Tool, String> {
             Ok(parsed)
         }
     }
+}
+
+/// `tool`'s namespace as sent, beside or inside `function`; none when null or absent.
+fn namespace(tool: &Value) -> Option<&Value> {
+    let beside = tool.get("namespace").filter(|n| !n.is_null());
+    beside
+        .or_else(|| tool.get("function")?.get("namespace"))
+        .filter(|n| !n.is_null())
 }
 
 /// A word character, then word characters, dots or dashes.
