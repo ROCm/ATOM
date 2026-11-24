@@ -403,6 +403,11 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
                 return True
         return False
 
+    def tier_probe(self, seq: Any, num_hbm_tokens: int) -> int:
+        """The longest prompt prefix any sub's tier likely holds (ranking only)."""
+        probes = self._sub_methods("tier_probe")
+        return max((int(p(seq, num_hbm_tokens)) for p in probes), default=0)
+
     def _sub_methods(self, name: str) -> list:
         """Bound `name` of every sub-connector that implements it."""
         methods = (getattr(c, name, None) for c in self._connectors)

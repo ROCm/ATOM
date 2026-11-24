@@ -267,6 +267,10 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         callback = getattr(self._impl, "lookup_pending", None)
         return bool(callback(seq)) if callable(callback) else False
 
+    def tier_probe(self, seq, num_hbm_tokens: int) -> int:
+        callback = getattr(self._impl, "tier_probe", None)
+        return int(callback(seq, num_hbm_tokens)) if callable(callback) else 0
+
     @property
     def needs_hbm_probe_before_lookup(self) -> bool:
         return self._impl.needs_hbm_probe_before_lookup

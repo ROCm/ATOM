@@ -89,3 +89,21 @@ def test_order_keeps_every_request_once():
     s = _sched(seqs)
     s._order_waiting(100.0)
     assert sorted(q.name for q in s.waiting) == sorted(q.name for q in seqs)
+
+
+def test_the_connectors_tier_probe_counts_before_any_lookup():
+    # `b`'s lookup has not run (no `kv_prefix_tokens`), but its tier probe
+    # says the tier holds 99,000 tokens past HBM's: 1,000 left against 10,400.
+    a = _seq("a", 100_000, 700)
+    b = _seq("b", 100_000, 10)
+    old = _seq("old", 100_000, 0, arrive=10)  # aged: never probed
+    asked = []
+
+    def tier_probe(seq, hbm):
+        asked.append((seq.name, hbm))
+        return 99_000 if seq is b else 0
+
+    s = _sched([a, old, b])
+    s.kv_connector = SimpleNamespace(tier_probe=tier_probe)
+    assert _order(s) == ["old", "b", "a"]
+    assert sorted(asked) == [("a", 700 * BLOCK), ("b", 10 * BLOCK)]
