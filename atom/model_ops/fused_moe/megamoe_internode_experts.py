@@ -1,4 +1,6 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """aiter MegaMoEInternode (two-node EP16 fused MoE) as ATOM's routed-experts step.
 
 ``moe_backend="mega"`` on two-node EP16 replaces dispatch + GEMM1 + activation + GEMM2 +
@@ -59,6 +61,8 @@ def close_internode_instances() -> None:
     """
     instances = list(_INSTANCES.values())
     _INSTANCES.clear()
+    # A rebuilt runner agrees on its budget again, on every rank alike.
+    _AGREED_BUDGETS.clear()
     if instances:
         logger.info("[MEGA-INTERNODE] closing %d cached capacities", len(instances))
     with ExitStack() as cleanup:
@@ -253,7 +257,7 @@ class MegaInternodeFusedExperts:
         apply_router_weight_on_input: bool = False,
         expert_map=None,
         x_scale=None,
-        moe_extra_args=None,
+        moe_extra_args: dict,
         **_ignored,
     ) -> torch.Tensor:
         from aiter import ActivationType
@@ -263,16 +267,13 @@ class MegaInternodeFusedExperts:
             raise NotImplementedError("internode MegaMoE: apply_router_weight_on_input")
         if activation == ActivationType.Situv2:
             act, limit = "situv2", 0.0
-            extra = moe_extra_args or {}
-            beta = extra.get("beta", getattr(self._layer, "activation_situ_beta", None))
-            linear_beta = extra.get(
-                "linear_beta", getattr(self._layer, "activation_situ_linear_beta", None)
-            )
+            beta = moe_extra_args["beta"]
+            linear_beta = moe_extra_args["linear_beta"]
             beta = 1.0 if beta is None else float(beta)
             linear_beta = 1.0 if linear_beta is None else float(linear_beta)
         elif activation in (None, ActivationType.Silu):
             # SwiGLU; a positive swiglu_limit (DeepSeek-V4: 10) clamps it.
-            act, limit = "silu", float(getattr(self._layer, "swiglu_limit", 0.0) or 0.0)
+            act, limit = "silu", float(moe_extra_args["swiglu_limit"])
             beta = linear_beta = 1.0
         else:
             raise NotImplementedError(

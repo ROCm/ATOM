@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """CPU regressions at the EP16 adapter's AITER/MoRI boundaries."""
 
 import importlib
@@ -44,7 +46,6 @@ def internode(atom_modules, monkeypatch):
     monkeypatch.setattr(module, "_group_max_tokens", lambda max_tokens: max_tokens)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    monkeypatch.delenv("ATOM_TORCH_PROFILER_DIR", raising=False)
     monkeypatch.setattr(module, "_PREFILL_MTPR", 8)
     monkeypatch.setattr(module, "_DECODE_MTPRS", (2, 4))
     yield SimpleNamespace(
@@ -54,6 +55,10 @@ def internode(atom_modules, monkeypatch):
         group_max_tokens=group_max_tokens,
     )
     module.close_internode_instances()
+
+
+# What the inherited `apply` passes for a SwiGLU layer.
+SILU = {"swiglu_limit": 10.0}
 
 
 def _weights(**overrides):
@@ -126,6 +131,7 @@ def test_token_budget_limits_actual_operator_allocations(
         topk_weights=torch.ones(1, 2),
         topk_ids=torch.zeros(1, 2, dtype=torch.int32),
         global_num_experts=256,
+        moe_extra_args=SILU,
     )
     assert torch.equal(result, x)
     assert tuple(op.mtpr for op in internode.built) == expected
@@ -177,6 +183,7 @@ def test_different_rank_budgets_produce_one_preallocation_sequence(
             topk_weights=torch.ones(1, 2),
             topk_ids=torch.zeros(1, 2, dtype=torch.int32),
             global_num_experts=256,
+            moe_extra_args=SILU,
         )
     assert calls == [128, 129]
     assert [op.mtpr for op in internode.built] == [256, 32, 64, 128]
@@ -210,6 +217,7 @@ def test_budgeted_capacities_are_ready_for_padded_and_idle_graph_steps(
             topk_weights=torch.ones(rows, 2),
             topk_ids=ids,
             global_num_experts=256,
+            moe_extra_args=SILU,
         )
 
     run(1, 1)  # Small startup forward must prebuild the wider reachable bucket.
@@ -234,14 +242,12 @@ def test_cold_graph_step_cannot_allocate_a_budgeted_operator(internode, monkeypa
             topk_weights=torch.ones(4, 2),
             topk_ids=torch.zeros(4, 2, dtype=torch.int32),
             global_num_experts=256,
+            moe_extra_args=SILU,
         )
     assert not internode.built
 
 
-@pytest.mark.parametrize("profiler_dir", [None, "", "/unused/trace"])
-def test_initialization_is_cached_and_closed(internode, monkeypatch, profiler_dir):
-    if profiler_dir is not None:
-        monkeypatch.setenv("ATOM_TORCH_PROFILER_DIR", profiler_dir)
+def test_initialization_is_cached_and_closed(internode):
     first = _instance(internode)
     assert _instance(internode) is first
     assert len(internode.built) == 1
@@ -301,6 +307,7 @@ def test_mixed_dp_phase_uses_group_chunks_even_on_an_idle_rank(
         topk_ids=torch.zeros(local_rows, 2, dtype=torch.int32),
         global_num_experts=256,
         activation=internode.moe.ActivationType.Silu,
+        moe_extra_args=SILU,
     )
     assert torch.equal(result, x)
     prefill = next(op for op in internode.built if op.mtpr == 8)
@@ -422,7 +429,6 @@ def test_inherited_apply_passes_model_activation_parameters(
 @pytest.mark.parametrize(
     "extra,expected",
     [
-        (None, (4.0, 25.0)),
         ({"beta": 6.0, "linear_beta": 30.0}, (6.0, 30.0)),
         ({"beta": None, "linear_beta": None}, (1.0, 1.0)),
     ],
@@ -761,3 +767,15 @@ def test_internode_backend_check(atom_modules, monkeypatch, method_name, shared,
         else:
             with pytest.raises((TypeError, ValueError), match=error):
                 moe.FusedMoE._validate_moe_backend(layer)
+
+
+def test_closing_agrees_on_the_budget_again(internode, monkeypatch):
+    calls = _ep_budgets(internode, monkeypatch, [128] * 16)
+    internode.module.MegaInternodeFusedExperts(
+        _weights(), model_dim=64, inter_dim=32, max_tokens=128
+    )
+    internode.module.close_internode_instances()
+    internode.module.MegaInternodeFusedExperts(
+        _weights(), model_dim=64, inter_dim=32, max_tokens=128
+    )
+    assert calls == [128, 128]
