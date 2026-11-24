@@ -489,8 +489,13 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         self.block_size = config.kv_cache_block_size
         self.dcp_size = config.decode_context_parallel_size
         self.hash_block_size = self.block_size * self.dcp_size
-        self.enable_chunked_transfer = kv_transfer_config.get(
-            "enable_chunked_transfer", False
+        # ATOM_PD_EARLY_HANDOFF drives the same chunked machinery from P's own
+        # early HTTP answer (see api_server.generate_async); it is not
+        # advertised to the router, which keeps its legacy relay.
+        self.early_handoff = bool(self.is_producer and envs.ATOM_PD_EARLY_HANDOFF)
+        self.enable_chunked_transfer = (
+            kv_transfer_config.get("enable_chunked_transfer", False)
+            or self.early_handoff
         )
         self._chunked_receiving: dict[ReqId, Sequence] = {}
         self._chunked_admission_timeout_s = float(
@@ -503,6 +508,8 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         self._chunked_waiting: dict[ReqId, tuple[Sequence, float]] = {}
         self._chunked_ready: set[ReqId] = set()
         self._pending_chunked_admissions: dict[ReqId, TransferId] = {}
+        # Early-handoff requests already registered with the worker.
+        self._early_registered: set[ReqId] = set()
         self.host_ip = get_ip()
 
         # Pending requests: req_id -> (Sequence, block ids, state slot).
@@ -789,6 +796,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         params = getattr(seq, "kv_transfer_params", None) or {}
         if self.is_producer and params.get("chunked_transfer"):
             aborted = produced_no_handoff(seq)
+            self._early_registered.discard(seq.id)
             self._chunked_waiting.pop(seq.id, None)
             self._chunked_ready.discard(seq.id)
             params["prefill_aborted"] = aborted
@@ -912,6 +920,18 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             return True  # Already admitted; e.g. resuming a MultiConnector load.
         if seq.status == SequenceStatus.ABORTED:
             return False
+        if params.get("pd_early_handoff") and self.early_handoff:
+            # P answered the router before admission, so D is on its way and
+            # will register a reader whenever it arrives: the source is pinned
+            # from allocation and every reader starts from block 0. Waiting
+            # for D here would put the router->D hop back in front of P.
+            # Register the transfer ID with the worker once, so a D write
+            # request that arrives while P still queues is not expired as
+            # an orphan.
+            if seq.id not in self._early_registered:
+                self._early_registered.add(seq.id)
+                self._pending_chunked_admissions[seq.id] = params["transfer_id"]
+            return True
         now = time.monotonic()
         if seq.id not in self._chunked_waiting:
             self._chunked_waiting[seq.id] = (

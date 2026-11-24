@@ -922,6 +922,95 @@ async def _submit_engine_requests(seqs):
         raise
 
 
+# ---------------------------------------------------------------------------
+# ATOM_PD_EARLY_HANDOFF: answer the PD router's prefill request at DP dispatch.
+# ---------------------------------------------------------------------------
+# Strong references for the detached prefills whose HTTP answer already left.
+_early_handoff_tasks: set[asyncio.Task] = set()
+_early_handoff_endpoint_cache: list[dict[str, Any] | None] = []
+
+
+def _early_handoff_endpoint() -> dict[str, Any] | None:
+    """This P's Mooncake producer endpoint, or None when early handoff cannot
+    apply here (flag off, no Mooncake producer, multi-node DP, or a front-end
+    worker process that does not route DP ranks itself)."""
+    if _early_handoff_endpoint_cache:
+        return _early_handoff_endpoint_cache[0]
+    endpoint = None
+    cfg = engine.config
+    pc = cfg.parallel_config
+    if (
+        envs.ATOM_PD_EARLY_HANDOFF
+        and hasattr(engine.core_mgr, "_add_prepared_requests")
+        and not getattr(pc, "is_multinode_dp", False)
+    ):
+        from atom.kv_transfer.disaggregation.pd_producer import iter_connector_configs
+        from atom.utils.network import get_ip
+
+        for sub, _ in iter_connector_configs(cfg.kv_transfer_config or {}):
+            if (
+                sub.get("kv_connector") == "mooncake"
+                and sub.get("kv_role", "kv_producer") == "kv_producer"
+            ):
+                endpoint = producer_endpoint(
+                    host=get_ip(),
+                    handshake_port=sub.get("handshake_port", DEFAULT_HANDSHAKE_PORT),
+                    pp_size=cfg.pipeline_parallel_size,
+                    block_size=cfg.kv_cache_block_size,
+                    dcp_size=cfg.decode_context_parallel_size,
+                )
+                endpoint["tp_size"] = cfg.tensor_parallel_size
+                break
+    _early_handoff_endpoint_cache.append(endpoint)
+    return endpoint
+
+
+def _early_handoff_params(
+    kv_transfer_params: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """A chunked copy of a plain prefill leg's KV params, or None if this
+    request keeps the legacy answer-after-prefill path."""
+    if (
+        not kv_transfer_params
+        or not kv_transfer_params.get("do_remote_decode")
+        or kv_transfer_params.get("do_remote_prefill")
+        or kv_transfer_params.get("chunked_transfer")
+        or _early_handoff_endpoint() is None
+    ):
+        return None
+    return {
+        **kv_transfer_params,
+        "chunked_transfer": True,
+        "transfer_id": f"early-{uuid.uuid4().hex}",
+        "pd_early_handoff": True,
+    }
+
+
+def _early_handoff_answer(transfer_id: str, dp_rank: int) -> dict[str, Any]:
+    """What the router relays to D: the router's own chunked template plus the
+    DP rank (`dp_rank`, renamed to `remote_dp_rank` by the relay). No first
+    token: D takes it, and the drafts, from the transfer's final handoff."""
+    return {
+        **_early_handoff_endpoint(),
+        "do_remote_prefill": True,
+        "do_remote_decode": False,
+        "chunked_transfer": True,
+        "transfer_id": transfer_id,
+        "dp_rank": dp_rank,
+    }
+
+
+async def _drain_early_handoff(seq, token_queue: asyncio.Queue) -> None:
+    """Keep a detached prefill's bookkeeping until the engine finishes it."""
+    try:
+        while True:
+            item = await token_queue.get()
+            if item.get("finished", False):
+                return
+    finally:
+        engine.io_processor.requests.pop(seq.id, None)
+
+
 async def generate_async(
     prompt_or_tokens: str | list[int] | PrefixEncoding,
     sampling_params: SamplingParams,
@@ -972,6 +1061,10 @@ async def generate_async(
             },
         )
 
+    early_params = _early_handoff_params(kv_transfer_params)
+    if early_params is not None:
+        kv_transfer_params = early_params
+
     def do_preprocess():
         return engine.io_processor.preprocess(
             prompt_or_tokens,
@@ -990,6 +1083,44 @@ async def generate_async(
         engine.io_processor.requests.pop(seq.id, None)
         raise
     await _submit_engine_requests([seq])
+
+    if early_params is not None:
+        dp_rank = getattr(seq, "pd_routed_dp_rank", None)
+        if dp_rank is None:
+            # Admission happened somewhere that does not report the rank, so
+            # no D can find this source. Fail closed instead of stranding P.
+            with contextlib.suppress(Exception):
+                engine.core_mgr.abort_request(seq.id)
+            engine.io_processor.requests.pop(seq.id, None)
+            raise RuntimeError("ATOM_PD_EARLY_HANDOFF: DP rank unknown at dispatch")
+        task = asyncio.create_task(_drain_early_handoff(seq, token_queue))
+        _early_handoff_tasks.add(task)
+        task.add_done_callback(_early_handoff_tasks.discard)
+        response = {
+            "text": "",
+            "token_ids": new_token_ids(),
+            "logprobs": [] if sampling_params.logprobs else None,
+            "finish_reason": "length",
+            "num_tokens_input": seq.num_prompt_tokens,
+            "num_tokens_output": 0,
+            "ttft": 0.0,
+            "tpot": 0.0,
+            "latency": time.time() - started_at,
+            "num_cached_tokens": 0,
+            "kv_transfer_output_meta_info": _early_handoff_answer(
+                early_params["transfer_id"], int(dp_rank)
+            ),
+        }
+        if return_token_ids:
+            response["prompt_token_ids"] = list(seq.prompt_token_ids)
+        logger.debug(
+            "PD early handoff: request %s transfer %s answered at DP rank %d",
+            request_id,
+            early_params["transfer_id"],
+            dp_rank,
+        )
+        yield response
+        return
 
     _finished_ok = False
     try:

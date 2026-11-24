@@ -199,6 +199,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PD_FAILED_WRITE_HOLD_S": lambda: float(
         os.getenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
     ),
+    # Mooncake P/D, prefill (`kv_producer`) only: answer the router's prefill
+    # request as soon as the request has a DP rank, with chunked-transfer
+    # metadata, instead of after prefill. The unchanged legacy router relay
+    # then sends D in while P still queues/computes; D reserves its pages and
+    # P pushes each completed forward's pages plus a final handoff. Does not
+    # advertise chunked transfer in /kv_transfer_info, so the router keeps
+    # its legacy path. Single-node DP only. 0 = off.
+    "ATOM_PD_EARLY_HANDOFF": lambda: _flag_env("ATOM_PD_EARLY_HANDOFF", "0"),
     # MoRIIO P/D, decode side: "read" (the decode pulls) or "write" (the
     # prefill pushes). Unset = kv_transfer_config's moriio_mode, else read.
     "ATOM_MORIIO_MODE": lambda: os.getenv("ATOM_MORIIO_MODE", ""),

@@ -1209,6 +1209,8 @@ class CoreManager:
             # Single routable engine, send all requests
             logger.debug(f"{self.label}: Add {len(seqs)} requests to DP rank 0")
             self._send_request(0, _add_frame(seqs))
+            for seq in seqs:
+                seq.pd_routed_dp_rank = 0
         else:
             self._dispatch_to_dp_ranks(seqs)
 
@@ -1390,6 +1392,10 @@ class CoreManager:
                         with self._lb_lock:
                             self._backlog.note_sent(dp_rank, rank_seqs, self._seq_load)
                         self._flush_credit_updates()
+                # After the frame is pickled: the rank's own copy never sees it.
+                # ATOM_PD_EARLY_HANDOFF answers the router with this rank.
+                for seq in rank_seqs:
+                    seq.pd_routed_dp_rank = dp_rank
                 batch_prefill_tokens = sum(
                     int(getattr(seq, "num_prompt_tokens", 0) or 0) for seq in rank_seqs
                 )
