@@ -1,31 +1,38 @@
 # SPDX-License-Identifier: Apache-2.0
 """``SparseMHAPagedAttentionImpl._fused_index_select``: when a decode step lets the NVFP4
-attention select its own top-16 (ATOM_M3_FUSED_INDEX_SELECT) and when it keeps scorer + selector."""
+attention select its own top-16 (ATOM_M3_FUSED_INDEX_SELECT) and when it keeps scorer + selector.
+"""
 
 import sys
 import types
 from types import SimpleNamespace
 
 import pytest
+from import_guard import skip_if_dependency_missing
 
-from atom.model_ops import attention_mha
-from atom.model_ops.attention_mha import SparseMHAPagedAttentionImpl
-from atom.utils import envs
+try:
+    from atom.model_ops import attention_mha
+    from atom.model_ops.attention_mha import SparseMHAPagedAttentionImpl
+    from atom.utils import envs
+except ImportError as exc:  # no aiter on a CPU-only runner
+    skip_if_dependency_missing(exc, "atom.model_ops.attention_mha")
 
 
 def _impl(**kw):
-    base = dict(
-        kv_cache_dtype="nvfp4",
-        indexer_cp_group=None,
-        index_cache_dtype="nvfp4",
-        topk=16,
-    )
+    base = {
+        "kv_cache_dtype": "nvfp4",
+        "indexer_cp_group": None,
+        "index_cache_dtype": "nvfp4",
+        "topk": 16,
+    }
     base.update(kw)
     return SimpleNamespace(**base)
 
 
 def _md(nvfp4=True, scorer=True):
-    return SimpleNamespace(index_scorer=SimpleNamespace(nvfp4=nvfp4) if scorer else None)
+    return SimpleNamespace(
+        index_scorer=SimpleNamespace(nvfp4=nvfp4) if scorer else None
+    )
 
 
 @pytest.fixture
@@ -69,5 +76,7 @@ def test_flag_off(aiter_with_select, monkeypatch):
 def test_old_aiter_keeps_chain(monkeypatch):
     monkeypatch.setattr(attention_mha, "FP4_CACHE_DTYPES", ("fp4", "nvfp4"))
     monkeypatch.setattr(envs, "ATOM_M3_FUSED_INDEX_SELECT", True, raising=False)
-    monkeypatch.setitem(sys.modules, "aiter.ops.flydsl.kernels.sparse_pa_nvfp4_decode", None)
+    monkeypatch.setitem(
+        sys.modules, "aiter.ops.flydsl.kernels.sparse_pa_nvfp4_decode", None
+    )
     assert not _call(_impl(), 64, _md())

@@ -2006,7 +2006,8 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
     def _fused_index_select(self, rows: int, sparse_metadata) -> bool:
         """Whether this decode step lets the NVFP4 attention select the top-16 itself
         (``ATOM_M3_FUSED_INDEX_SELECT``): one-GPU NVFP4 index, a row count aiter measured
-        it at, an aiter that has ``index_score=``. Anything else keeps scorer + selector."""
+        it at, an aiter that has ``index_score=``. Anything else keeps scorer + selector.
+        """
         if (
             not envs.ATOM_M3_FUSED_INDEX_SELECT
             or self.kv_cache_dtype != "nvfp4"
@@ -2155,12 +2156,12 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 fused_kw = (
                     {}
                     if fused_scores is None
-                    else dict(
-                        index_score=fused_scores,
-                        index_max_seq_len=sparse_metadata.max_seq_len,
-                        init_blocks=self.init_blocks,
-                        local_blocks=self.local_blocks,
-                    )
+                    else {
+                        "index_score": fused_scores,
+                        "index_max_seq_len": sparse_metadata.max_seq_len,
+                        "init_blocks": self.init_blocks,
+                        "local_blocks": self.local_blocks,
+                    }
                 )
                 self._sparse_pa_nvfp4_decode(
                     q[:rows],
