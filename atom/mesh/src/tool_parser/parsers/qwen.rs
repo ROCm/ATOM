@@ -263,9 +263,11 @@ mod coder {
             let mut calls: Vec<ToolCallItem> = vec![];
             let param_types = helpers::param_types_for_function(tools, &self.current_function_name);
 
-            // Find all complete parameter patterns in buffer
+            // Find all complete parameter patterns in the open call, not in calls after it
             let mut new_params = serde_json::Map::new();
-            for cap in self.xml_param_pattern.captures_iter(&self.buffer) {
+            let end = self.buffer.find(self.call_end_token());
+            let call = &self.buffer[..end.unwrap_or(self.buffer.len())];
+            for cap in self.xml_param_pattern.captures_iter(call) {
                 if let (Some(key_match), Some(value_match)) = (cap.get(1), cap.get(2)) {
                     let key = key_match.as_str().trim().to_string();
                     let value = value_match.as_str();
@@ -391,6 +393,14 @@ mod coder {
                 (Some(w), Some(b)) if b < w => Some((b, true)),
                 (Some(w), _) => Some((w, false)),
                 (None, bare) => bare.map(|b| (b, true)),
+            }
+        }
+
+        /// The tag that ends the open call: a bare call's `</function>`, else its wrapper's.
+        fn call_end_token(&self) -> &'static str {
+            match self.bare_call {
+                true => "</function>",
+                false => self.tool_call_end_token,
             }
         }
 
@@ -567,15 +577,21 @@ mod coder {
                     calls.extend(param_calls);
 
                     // Check if tool call is complete
-                    let end_token = match self.bare_call {
-                        true => "</function>",
-                        false => self.tool_call_end_token,
-                    };
+                    let end_token = self.call_end_token();
                     if let Some(end_pos) = self.buffer.find(end_token) {
                         // Close JSON object if we have parameters
                         let current_args =
                             &self.streamed_args_for_tool[self.current_tool_id as usize];
-                        if !current_args.is_empty() {
+                        // A call with no parameters has `{}` for arguments.
+                        if current_args.is_empty() {
+                            calls.push(ToolCallItem {
+                                tool_index: self.current_tool_id as usize,
+                                name: None,
+                                parameters: "{}".to_string(),
+                            });
+                            self.streamed_args_for_tool[self.current_tool_id as usize]
+                                .push_str("{}");
+                        } else {
                             // Count braces to check if JSON is complete
                             let open_braces = current_args.matches('{').count();
                             let close_braces = current_args.matches('}').count();
@@ -637,6 +653,13 @@ mod coder {
             let followers = ["<parameter=", "</function>"];
             let continues = |token: &str| rest.starts_with(token) || token.starts_with(rest);
             if !followers.into_iter().any(continues) {
+                return None;
+            }
+            // Text after the call's `</function>` is not closed into its wrapper.
+            let after = rest
+                .split_once("</function>")
+                .map(|(_, after)| after.trim());
+            if after.is_some_and(|after| !after.is_empty()) {
                 return None;
             }
             let mut closers = String::new();
@@ -890,6 +913,67 @@ mod coder {
                     assert_eq!(read, (reply.to_string(), 0), "{size}-byte pieces");
                 }
             }
+        }
+
+        /// Each call in one delta streams its own arguments, `{}` when it has none.
+        #[tokio::test]
+        async fn calls_in_one_delta_stream_their_own_arguments() {
+            let tool: Tool = serde_json::from_value(serde_json::json!({
+                "type": "function", "function": {"name": "get_weather", "parameters": {}},
+            }))
+            .unwrap();
+            let tools = [tool];
+            let call = |city: &str| match city {
+                "" => "<function=get_weather></function>".to_string(),
+                _ => format!("<function=get_weather><parameter=city>{city}</parameter></function>"),
+            };
+            for (a, b, args) in [
+                (
+                    "Paris",
+                    "London",
+                    [r#"{"city": "Paris"}"#, r#"{"city": "London"}"#],
+                ),
+                ("", "", ["{}", "{}"]),
+            ] {
+                let bare = call(a) + &call(b);
+                let wrapped = format!(
+                    "<tool_call>{}</tool_call><tool_call>{}</tool_call>",
+                    call(a),
+                    call(b)
+                );
+                for reply in [bare, wrapped] {
+                    let mut parser = QwenCoderParser::new();
+                    parser.read_as_atom();
+                    let result = parser.parse_incremental(&reply, &tools).await.unwrap();
+                    let mut streamed = [String::new(), String::new()];
+                    for call in result.calls {
+                        streamed[call.tool_index].push_str(&call.parameters);
+                    }
+                    assert_eq!(streamed, args, "{reply}");
+                }
+            }
+        }
+
+        /// A cut-off wrapper is not closed past text that follows the call's `</function>`.
+        #[tokio::test]
+        async fn text_after_a_cut_off_wrapper_s_function_is_not_closed_into_the_call() {
+            let tool: Tool = serde_json::from_value(serde_json::json!({
+                "type": "function", "function": {"name": "get_weather", "parameters": {}},
+            }))
+            .unwrap();
+            let tools = [tool];
+            let reply = "Before <tool_call><function=get_weather><parameter=city>Paris</parameter></function> After";
+            let mut parser = QwenCoderParser::new();
+            parser.read_as_atom();
+            parser.parse_incremental(reply, &tools).await.unwrap();
+            assert_eq!(parser.end_of_input_closers(&tools), None);
+            let mut parser = QwenCoderParser::new();
+            parser.read_as_atom();
+            let (text, calls) = parser
+                .parse_complete_with_tools(reply, &tools)
+                .await
+                .unwrap();
+            assert!(text.ends_with(" After") && calls.len() == 1, "{text}");
         }
 
         #[test]

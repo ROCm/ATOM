@@ -63,6 +63,8 @@ pub struct AppContext {
     pub tokenizer_template_files: Arc<RwLock<HashMap<String, String>>>,
     /// Per tokenizer name, held while a registration loads its tokenizer.
     pub tokenizer_registering: Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Held while ATOM workers' template is admitted and they are registered.
+    pub template_admission: Arc<parking_lot::Mutex<()>>,
     /// `router_config`'s tokenization byte limits.
     pub(crate) tokenize_limits: TokenizeLimits,
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
@@ -318,6 +320,7 @@ impl AppContextBuilder {
             tokenizer_inline_templates: Default::default(),
             tokenizer_template_files: Default::default(),
             tokenizer_registering: Default::default(),
+            template_admission: Default::default(),
             tokenize_limits,
             reasoning_parser_factory: self.reasoning_parser_factory,
             tool_parser_factory: self.tool_parser_factory,
