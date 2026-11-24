@@ -833,7 +833,7 @@ def test_a_kv_prefill_projects_only_this_ranks_heads(monkeypatch, kv, env, group
     )
     seen = {}
 
-    def q_proj_and_k_up_proj(self, x, x_scale=None, group=False):
+    def q_proj_and_k_up_proj(self, x, x_scale=None, group=False, q_nope_out=None):
         seen["group"] = group
         raise _Stop
 
