@@ -76,6 +76,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger("atom")
 
 _DYNAMIC_CHUNKING_SUPPLY_WINDOW = 16
+# The adaptive decode cap's lower bound (`Scheduler._refresh_decode_cap`): a
+# decode step this small is dominated by its fixed cost, so holding requests
+# back below it buys no step time, and after an idle spell the average starts
+# low.
+DECODE_CAP_FLOOR = 16
 
 
 def defers_output(config, family=None) -> bool:
@@ -874,6 +879,22 @@ class Scheduler:
         self._schedule_tick: int = 0
 
         self._num_parked_remote_kv: int = 0
+
+        # P/D decode slot cap (opt-in, `_refresh_decode_cap`). None = no cap.
+        self._decode_cap_max: int | None = envs.ATOM_DECODE_MAX_RUNNING
+        self._decode_cap_factor: float = envs.ATOM_DECODE_RUN_CAP_FACTOR
+        self._decode_cap_window_s: float = envs.ATOM_DECODE_RUN_CAP_WINDOW_S
+        # Padded to the next captured batch anyway, so a cap between two rungs
+        # rounds up to the upper one.
+        self._decode_cap_ladder: list[int] = (
+            []
+            if getattr(config, "enforce_eager", False)
+            else sorted(getattr(config, "capture_sizes", None) or [])
+        )
+        self._decode_cap: int | None = None
+        self._decode_demand_avg: float | None = None
+        self._decode_demand_time: float = 0.0
+        self._decode_cap_log_time: float = 0.0
 
         # Under PP the head keeps pp_size batches in flight, so schedule() must
         # advance chunked-prefill progress itself rather than defer it to
@@ -2093,6 +2114,7 @@ class Scheduler:
         scheduled_spec_decode_tokens: dict[int, np.ndarray] = {}
 
         self._promote_ready_remote_kv_requests()
+        self._refresh_decode_cap(time.time())
         self._park_ready_offload_partial_prefills()
         # Reclaim aborted heads even when decode protection vetoes Phase 2.
         while self.waiting and self.waiting[0].status == SequenceStatus.ABORTED:
@@ -2295,6 +2317,13 @@ class Scheduler:
             if callable(admission_ready) and not admission_ready(seq):
                 # D may reserve a later request first. Unready P requests own no
                 # source blocks and must not block those that already have D space.
+                skipped_waiting_requests.append(seq)
+                continue
+
+            if self._waits_for_decode_slot(seq):
+                # Its KV has landed; it stays parked, reported and counted as
+                # it was, until a decode slot frees. Not a `break`: the
+                # requests behind it are still allocated and asked for.
                 skipped_waiting_requests.append(seq)
                 continue
 
@@ -5071,6 +5100,82 @@ class Scheduler:
             self.waiting.extend(blocked)
         else:
             self.waiting.extend(blocked)
+
+    def _refresh_decode_cap(self, now: float) -> None:
+        """Set this tick's cap on concurrently decoding P/D requests.
+
+        The decode step grows with the batch, so a user's token rate is set by
+        the batches its request decodes in. Admitting every landed request at
+        once lets bursts from the producer double the batch over its mean, and
+        the slowest users see those peaks. Capping the decoding set near its
+        mean trims the peaks; the request it holds back has its KV here already
+        and waits in front of its first decode step, which is time to the first
+        token, not inter-token time.
+
+        Demand is the decoding set plus the landed requests waiting for a slot.
+        ATOM_DECODE_RUN_CAP_FACTOR > 0: the cap is that factor times the demand
+        averaged over ATOM_DECODE_RUN_CAP_WINDOW_S (an exponential average in
+        wall time), at least `DECODE_CAP_FLOOR`, rounded up to the next
+        captured batch size. The held requests count in the demand, so a
+        lasting rise lifts the cap and the queue cannot grow without bound.
+        ATOM_DECODE_MAX_RUNNING: a fixed cap, or the ceiling of the adaptive
+        one. A kv_consumer only: elsewhere a landed load is not a decode.
+        """
+        if (
+            self._decode_cap_max is None and self._decode_cap_factor <= 0
+        ) or not self._is_pd_consumer():
+            return
+        decoding = len(self.running) - self._partial_prefill_count
+        landed = len(self.finished_recving_kv_req_ids)
+        cap = self._decode_cap_max
+        if self._decode_cap_factor > 0:
+            demand = decoding + landed
+            if self._decode_demand_avg is None:
+                self._decode_demand_avg = float(demand)
+            else:
+                dt = max(0.0, now - self._decode_demand_time)
+                weight = 1.0 - math.exp(-dt / self._decode_cap_window_s)
+                self._decode_demand_avg += weight * (demand - self._decode_demand_avg)
+            self._decode_demand_time = now
+            adaptive = max(
+                DECODE_CAP_FLOOR,
+                math.ceil(self._decode_cap_factor * self._decode_demand_avg),
+            )
+            adaptive = next(
+                (size for size in self._decode_cap_ladder if size >= adaptive),
+                adaptive,
+            )
+            cap = adaptive if cap is None else min(cap, adaptive)
+        self._decode_cap = cap
+        if now - self._decode_cap_log_time >= 10.0:
+            self._decode_cap_log_time = now
+            logger.info(
+                "Decode cap: %d (demand avg %s), decoding %d, landed %d",
+                cap,
+                (
+                    "n/a"
+                    if self._decode_demand_avg is None
+                    else f"{self._decode_demand_avg:.1f}"
+                ),
+                decoding,
+                landed,
+            )
+
+    def _is_pd_consumer(self) -> bool:
+        return (
+            self.kv_connector is not None
+            and not self._connector_flag("is_producer")
+            and not self._connector_flag("is_offload")
+        )
+
+    def _waits_for_decode_slot(self, seq: Sequence) -> bool:
+        """A landed P/D request finds every decode slot taken (`_decode_cap`)."""
+        return (
+            self._decode_cap is not None
+            and seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+            and len(self.running) - self._partial_prefill_count >= self._decode_cap
+            and self._has_req_id(self.finished_recving_kv_req_ids, seq.id)
+        )
 
     def _park_ready_offload_partial_prefills(self) -> None:
         if (

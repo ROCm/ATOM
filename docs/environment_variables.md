@@ -92,6 +92,9 @@ make duplicate prefill useful. Pure-attention models do not use checkpoint waits
 | **ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK** | float\|"" | "" (None) | If set, a prefillable rank below this KV usage force-releases (GPU starving). |
 | **ATOM_PREFILL_DELAYER_MAX_QUEUE_MS** | float\|"" | "" (None) | After decode protection, release coalescing when the oldest schedulable waiting prefill reaches this age since arrival. Empty disables the age guard. Checkpoint dependency waits use `TTFT_MAX_TICKS`. This is not a hard TTFT limit. |
 | **ATOM_PREFILL_DECODE_INTERVAL** | int | 0 | Protect this many scheduler passes after an executed prefill. Ignored with `--prefill-admit-policy adaptive`. On DP=1, PP=1, a positive value also enables local coalescing when the master switch is on; `0` leaves TP scheduling unchanged. On DP>1, `0` disables only the interval. |
+| **ATOM_DECODE_RUN_CAP_FACTOR** | float | 0 (off) | P/D decode (kv_consumer) only. Cap the decoding set at this multiple of the decode demand (decoding plus landed requests waiting for a slot) averaged over `ATOM_DECODE_RUN_CAP_WINDOW_S`, at least 16, rounded up to the next CUDA-graph batch size. A request whose KV has landed waits, still parked, for a slot, oldest arrival first; requests still to be pushed are allocated and asked for as before. The wait is before the first decode step, so it shows in TTFT, not in inter-token time. A preempted request's local recompute is not held. |
+| **ATOM_DECODE_RUN_CAP_WINDOW_S** | float | 30 | Time constant of that average, in seconds. |
+| **ATOM_DECODE_MAX_RUNNING** | int\|"" | "" (none) | P/D decode only: a fixed cap on the decoding set, or with `ATOM_DECODE_RUN_CAP_FACTOR` the ceiling of the adaptive one. |
 | **ATOM_PREFILL_DELAYER_DEBUG** | bool | false | Per-tick FIRE/HOLD debug logging. |
 | **ATOM_PREFILL_DELAYER_LOG_EVERY** | int | 1000 | Emit aggregate stats (per-exit fire counts + hold rate) every N decisions (0 disables). |
 
