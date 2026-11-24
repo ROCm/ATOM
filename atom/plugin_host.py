@@ -2166,7 +2166,11 @@ def check_plan() -> dict[str, Any]:
                     "the recipe does not plan (list owners, or [] for native)",
                 )
     if shadowed:
-        logger.info("plugin_host: owners shadowed by an outer owner: %s", shadowed)
+        logger.info(
+            "plugin_host: owners an outer owner may make unreachable "
+            "(reached only where it declines or calls them): %s",
+            shadowed,
+        )
     return {"shadowed": shadowed}
 
 
