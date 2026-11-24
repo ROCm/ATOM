@@ -32,6 +32,7 @@ forward, ``DSparkGQADecoderLayer``.
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 import torch
@@ -496,6 +497,49 @@ class DSparkGQADecoderLayer(nn.Module):
         self.self_attn.write_context_kv(ctx_hidden, positions, slot_mapping)
 
 
+#: aiter's concat-then-GEMM ring (gfx950) serves five equal taps and at most this many rows.
+_FC_RING_TAPS = 5
+_FC_RING_MAX_ROWS = 128
+
+
+def _fc_ring_module():
+    """aiter's gfx950 concat-then-GEMM ring (+ its weight shuffle), or None where aiter does not ship it."""
+    try:
+        from aiter.ops.flydsl import gemm_a16w16_cat_x_ring, gemm_a16w16_ring
+    except ImportError:
+        return None
+    return SimpleNamespace(
+        cat_x_ring_supported=gemm_a16w16_cat_x_ring.cat_x_ring_supported,
+        gemm_a16w16_cat_x_ring=gemm_a16w16_cat_x_ring.gemm_a16w16_cat_x_ring,
+        warmup_cat_x_ring=gemm_a16w16_cat_x_ring.warmup_cat_x_ring,
+        shuffle_weight_ring=gemm_a16w16_ring.shuffle_weight_ring,
+    )
+
+
+def _taps_fit_ring(taps: Sequence[torch.Tensor], ring_weight: torch.Tensor) -> bool:
+    """Whether ``taps`` are what the ring GEMM takes against ``ring_weight``: five bf16
+    ``[rows, seg_k]`` taps, 1..128 rows, unit column stride, one common 16-byte-aligned row stride.
+    """
+    if len(taps) != _FC_RING_TAPS:
+        return False
+    rows, seg_k = taps[0].shape
+    stride = taps[0].stride(0)
+    return (
+        0 < rows <= _FC_RING_MAX_ROWS
+        and ring_weight.shape[1] == _FC_RING_TAPS * seg_k
+        and (stride * 2) % 16 == 0
+        and all(
+            t.dtype == torch.bfloat16
+            and t.device == ring_weight.device
+            and t.shape == (rows, seg_k)
+            and t.stride(1) == 1
+            and t.stride(0) == stride
+            and t.data_ptr() % 16 == 0
+            for t in taps
+        )
+    )
+
+
 class DSparkDraftModel(nn.Module):
     """What a DSpark draft model must provide to ``DSparkProposer``."""
 
@@ -646,7 +690,54 @@ class DSparkDraftModel(nn.Module):
         A target layer id is that layer's output, the residual stream before
         any final norm, which is what the standalone drafts are trained on.
         """
-        return self.hidden_norm(linear_out(self.fc(self.concat_taps(taps))))
+        return self.hidden_norm(self.fc_taps(taps))
+
+    def fc_taps(self, taps: Sequence[torch.Tensor]) -> torch.Tensor:
+        """``fc(concat(taps))``: aiter's split-K ring GEMM on the taps in place
+        (no ``torch.cat``) for 1..128 rows when ``process_weights_after_loading``
+        built its weight, ``self.fc`` on the concat otherwise."""
+        ring_weight = getattr(self, "_fc_ring_weight", None)
+        if ring_weight is not None and _taps_fit_ring(taps, ring_weight):
+            return _fc_ring_module().gemm_a16w16_cat_x_ring(list(taps), ring_weight)
+        return linear_out(self.fc(self.concat_taps(taps)))
+
+    def process_weights_after_loading(self):
+        """``ATOM_DSPARK_FC_RING=1``: keep a tile-shuffled copy of the bf16
+        ``fc`` weight for aiter's gfx950 concat-then-GEMM ring (``fc_taps``
+        takes it for the rows it covers; +1 ``fc`` weight of memory per rank).
+        A copy, not an in-place shuffle: prefill-sized calls keep ``self.fc``.
+        Runs before ``fc``'s own post-load hook (parents first), so it sees the
+        weight as loaded."""
+        self._fc_ring_weight = None
+        fc = getattr(self, "fc", None)
+        if (
+            not envs.ATOM_DSPARK_FC_RING
+            or fc is None
+            or len(getattr(self, "target_layer_ids", ())) != _FC_RING_TAPS
+            or getattr(fc, "bias", None) is not None
+        ):
+            return
+        ring = _fc_ring_module()
+        w = fc.weight.data
+        if (
+            ring is None
+            or w.dtype != torch.bfloat16
+            or w.dim() != 2
+            or not w.is_contiguous()
+            or w.shape[1] % _FC_RING_TAPS
+            or not ring.cat_x_ring_supported(
+                _FC_RING_MAX_ROWS, w.shape[0], w.shape[1] // _FC_RING_TAPS, w.device
+            )
+        ):
+            return
+        self._fc_ring_weight = ring.shuffle_weight_ring(w)
+        # Compile every row tier now: a first call inside a CUDA-graph capture would bake the compile in.
+        ring.warmup_cat_x_ring(
+            _FC_RING_MAX_ROWS,
+            w.shape[0],
+            w.shape[1] // _FC_RING_TAPS,
+            self._fc_ring_weight,
+        )
 
     @property
     def context_layers(self):

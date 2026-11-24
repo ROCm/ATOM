@@ -1106,6 +1106,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # counters (modes, overridden steps, guard trips), one JSON file per
     # process, rewritten every step. Unset: off.
     "ATOM_V4_CG_INSTR_DIR": lambda: os.getenv("ATOM_V4_CG_INSTR_DIR") or None,
+    # DSpark draft ``fc`` (concat of the five aux taps x bf16 weight) at 1..128 rows on aiter's
+    # gfx950 split-K concat-then-GEMM ring (aiter.ops.flydsl.gemm_a16w16_cat_x_ring): no torch.cat,
+    # fp32 split-K partials summed in a fixed order (deterministic, bf16-rounding-different from
+    # hipBLASLt), one extra fc weight copy per rank. Default off.
+    "ATOM_DSPARK_FC_RING": lambda: os.getenv("ATOM_DSPARK_FC_RING", "0").lower() == "1",
     "ATOM_USE_CUSTOM_ALL_GATHER": lambda: (
         os.getenv("ATOM_USE_CUSTOM_ALL_GATHER", "1").lower() == "1"
     ),

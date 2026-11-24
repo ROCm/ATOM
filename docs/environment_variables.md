@@ -167,6 +167,7 @@ Checked on Qwen3-14B, Qwen3.5-35B-A3B and DeepSeek-V4.1-Flash (with DSpark, DP a
 |----------|------|---------|-------------|
 | **ATOM_DISABLE_VLLM_PLUGIN** | bool | 0 (false) | If set to `1`, disable the vLLM plugin registration entirely. |
 | **ATOM_V4_CG_INSTR_DIR** | str | — (off) | vLLM plugin, DeepSeek-V4 diagnostic: directory for per-process cudagraph dispatch counters (dispatched modes, steps whose uniform decode was overridden for a still-prefilling row, guard trips), one `cg_<pid>.json` per process, rewritten on every step. |
+| **ATOM_DSPARK_FC_RING** | bool | `0` | DSpark draft `fc` (the five aux taps against the bf16 weight) at 1..128 rows on aiter's gfx950 split-K concat-then-GEMM ring (`aiter.ops.flydsl.gemm_a16w16_cat_x_ring`): no `torch.cat`, deterministic fp32 partials with one bf16 rounding (within bf16 rounding of hipBLASLt, not bit-identical), one extra `fc` weight copy per rank. Larger row counts and anything the kernel does not take keep `fc`. |
 
 ## Kernel / backend selection
 
