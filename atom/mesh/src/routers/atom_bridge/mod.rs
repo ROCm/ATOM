@@ -237,6 +237,7 @@ impl PdPlanner for LocalPlanner {
         Ok(PlacementPlan::Single {
             worker: Arc::clone(&self.worker),
             policy_name: "atom_local",
+            prefill_tokens: 0,
         })
     }
 }
