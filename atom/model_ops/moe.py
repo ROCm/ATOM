@@ -2247,6 +2247,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
             return False
         prequant = x_fp4 is not None
+        presort = None
+        if prequant:
+            from atom.model_ops.minimax_m3 import tp1_prefill
+
+            presort = tp1_prefill.moe_presort(
+                layer, topk_ids, topk_weights, scheduled_tokens_gpu
+            )
         inputs = fused_moe_prepare_stage2(
             x_fp4 if prequant else x,
             layer.w13_weight,
@@ -2290,6 +2297,24 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         ):
             from aiter.ops import m3_tp1_prefill as g2
 
+            taken = presort is not None and (
+                sorted_ids.data_ptr() == presort["sorted_token_ids"].data_ptr()
+            )
+            if taken:  # aiter sorted with the presort: its tile list, no tile prepass
+                g2.moe_g2_w8_tiles(
+                    inputs.a2.view(torch.uint8),
+                    inputs.a2_scale.view(torch.uint8),
+                    layer.w2_g2_weight,
+                    layer.w2_g2_scale,
+                    sorted_ids,
+                    kw["sorted_weights"],
+                    presort["g2_tiles"],
+                    presort["g2_ctl"],
+                    routes,
+                    m,
+                    topk,
+                )
+                return True
             # its 8-wave kernel (same bytes) where aiter has it and its offsets reach
             ragged_gemm2 = g2.moe_g2_p6
             if hasattr(g2, "moe_g2_w8") and g2.moe_g2_w8_serves(m, topk):

@@ -117,7 +117,33 @@ def moe_g2_ragged(pp_size: int) -> bool:
         return False
     if not hasattr(_K, "moe_g2_w8"):
         _log_once("MiniMax-M3 TP1 prefill: aiter has no moe_g2_w8, moe_g2_p6 runs")
+    elif not hasattr(_K, "moe_sort"):
+        _log_once(
+            "MiniMax-M3 TP1 prefill: aiter has no moe_sort, the MoE sort runs apart"
+        )
     return True
+
+
+def moe_presort(layer, topk_ids: torch.Tensor, topk_weights: torch.Tensor, local):
+    """aiter's one-launch MoE sort with moe_g2_w8's tile list, registered for the next
+    fused_moe call, where the ragged GEMM2 runs (w2 copy, 128 experts, top-4, rows
+    within moe_sort's and moe_g2_w8's reach); else None. aiter takes it only for its
+    own block size and ``local``, and writes reverse rows past ``local`` as -1."""
+    m, topk = topk_ids.shape
+    if not (
+        hasattr(layer, "w2_g2_weight")
+        and hasattr(_K, "moe_sort")
+        and layer.global_num_experts == 128
+        and topk == _TOPK
+        and m <= _K.MOE_SORT_MAX_TOKENS
+        and _K.moe_g2_w8_serves(m, topk)
+    ):
+        return None
+    from aiter.fused_moe import register_presorted_moe
+
+    presort = _K.moe_sort(topk_ids, topk_weights, local)
+    register_presorted_moe(presort)
+    return presort
 
 
 @functools.cache
