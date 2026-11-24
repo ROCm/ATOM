@@ -613,7 +613,7 @@ def test_a_finished_load_is_sized_as_a_resume_without_rewalking_its_hit():
 
     walks = []
     real = bm.can_allocate_memoized
-    bm.can_allocate_memoized = lambda s: walks.append(s) or real(s)
+    bm.can_allocate_memoized = lambda s, probe=None: walks.append(s) or real(s, probe)
     engine._prioritize_ready_remote_kv_requests()
     assert seq.status == SequenceStatus.WAITING and seq.num_cached_tokens == 36
     assert engine._local_prefill_pending_work()[0]

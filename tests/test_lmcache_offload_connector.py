@@ -3960,6 +3960,8 @@ def test_aborted_parked_load_defers_owned_resources_until_terminal(
     host.finished_recving_kv_req_ids = []
     host.failed_recving_kv_req_ids = []
     host._num_parked_remote_kv = 1
+    host._parked_loads = {}
+    host._receive_reserve = None
     host._rejected = []
 
     host._finish_rejected_waiting(seq)
@@ -4032,6 +4034,8 @@ def test_aborted_parked_load_consumes_already_queued_terminal(queued_field):
     host.failed_recving_kv_req_ids = []
     getattr(host, queued_field).append(seq.id)
     host._num_parked_remote_kv = 1
+    host._parked_loads = {}
+    host._receive_reserve = None
     host._rejected = []
 
     host._finish_rejected_waiting(seq)
@@ -4110,6 +4114,8 @@ def test_abort_cleans_load_whose_terminal_was_already_consumed(
     host.finished_recving_kv_req_ids = []
     host.failed_recving_kv_req_ids = []
     host._num_parked_remote_kv = 1
+    host._parked_loads = {}
+    host._receive_reserve = None
     host._rejected = []
 
     host._update_from_kv_xfer_finished(KVConnectorOutput(**{terminal_field: {seq.id}}))
@@ -4156,6 +4162,8 @@ def test_consume_failed_remote_kv_does_not_repeat_terminal_callback():
     host.kv_connector = _Connector()
     host.failed_recving_kv_req_ids = [seq.id]
     host._num_parked_remote_kv = 0
+    host._parked_loads = {}
+    host._receive_reserve = None
 
     assert host._consume_failed_remote_kv(seq) is True
     assert calls == []
