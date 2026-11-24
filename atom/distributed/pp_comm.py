@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 import torch
 from aiter.dist.parallel_state import (
+    TensorMetadata,
     _split_tensor_dict,
     ensure_model_parallel_initialized,
     get_pp_group,
@@ -15,6 +16,7 @@ from aiter.dist.parallel_state import (
 )
 from aiter.ops.communication import set_custom_all_reduce
 
+from atom.config import get_current_atom_config
 from atom.models.utils import IntermediateTensors
 from atom.utils import envs
 
@@ -112,11 +114,69 @@ def send_intermediate_tensors(it: IntermediateTensors) -> None:
     pp.send_tensor_dict(tensors, dst=dst, all_gather_group=pp_send_allgather_group())
 
 
-def recv_intermediate_tensors() -> IntermediateTensors:
-    """Receive hidden_states/residual from the previous PP stage."""
+# Resident PP payload buffers, one per (direction, key, row shape, dtype,
+# device), each max_num_batched_tokens rows deep.
+_RESIDENT: dict[tuple, torch.Tensor] = {}
+
+
+def _row_bound() -> int:
+    return get_current_atom_config().max_num_batched_tokens
+
+
+def resident_rows(
+    tag: tuple, shape: torch.Size, dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """A ``shape`` view of the resident buffer for ``tag``.
+
+    A payload's rows follow the step's chunk, so a fresh tensor per step asks
+    the caching allocator for a new size every step, and the ones that live
+    across the forward (the received inputs, the send in flight through the
+    next step) pin the blocks around them. Its free cache then fragments and
+    the reserve grows by GiBs over a run (M3.1 PP4 stage 2: 72 -> 96 GiB in
+    5 min at C16). The first use -- the warmup forward -- allocates the row
+    bound instead, so the KV budget covers it, and every later step reuses it.
+    """
+    rows, rest = shape[0], tuple(shape[1:])
+    key = (tag, rest, dtype, device)
+    buf = _RESIDENT.get(key)
+    if buf is None or buf.shape[0] < rows:
+        buf = torch.empty((max(rows, _row_bound()), *rest), dtype=dtype, device=device)
+        _RESIDENT[key] = buf
+    return buf[:rows]
+
+
+def recv_intermediate_tensors(fresh: tuple[str, ...] = ()) -> IntermediateTensors:
+    """Receive hidden_states/residual from the previous PP stage.
+
+    Each tensor lands in this stage's resident buffer for its key, which the
+    next step's receive overwrites: a caller that keeps one past the step
+    names its key in ``fresh`` to get a tensor of its own.
+    """
     pp = get_pp_group()
     src = (pp.rank_in_group - 1) % pp.world_size
-    tensors = pp.recv_tensor_dict(src=src, all_gather_group=pp_send_allgather_group())
+    ag_group = pp_send_allgather_group()
+    if ag_group is not None:
+        tensors = pp.recv_tensor_dict(src=src, all_gather_group=ag_group)
+        return IntermediateTensors(tensors)
+    tensors = {}
+    for key, value in pp.recv_object(src=src):
+        if not isinstance(value, TensorMetadata):
+            tensors[key] = value
+            continue
+        cpu = value.device == "cpu"
+        device = (
+            torch.device("cpu")
+            if cpu
+            else torch.device(value.device, torch.cuda.current_device())
+        )
+        if key in fresh or len(value.size) == 0:
+            tensor = torch.empty(value.size, dtype=value.dtype, device=device)
+        else:
+            tensor = resident_rows(("recv", key), value.size, value.dtype, device)
+        if tensor.numel():
+            group = pp.cpu_group if cpu else pp.device_group
+            torch.distributed.recv(tensor, src=pp.ranks[src], group=group)
+        tensors[key] = tensor
     return IntermediateTensors(tensors)
 
 
@@ -141,8 +201,11 @@ def async_send_intermediate_tensors(
     """Non-blocking send of hidden_states/residual to the next PP stage.
 
     ``owned`` keys name tensors the caller hands over and never touches
-    again: they are sent as they are. The rest are cloned, since the model
-    may overwrite them (a graph's output buffer, say) before the send lands.
+    again: they are sent as they are. The rest are copied, since the model
+    may overwrite them (a graph's output buffer, say) before the send lands:
+    into this stage's resident send buffer for the key (see `resident_rows`),
+    which is free again once the previous send is committed -- the caller
+    commits it before this call.
     """
     pp = get_pp_group()
     dst_local = (pp.rank_in_group + 1) % pp.world_size
@@ -158,13 +221,22 @@ def async_send_intermediate_tensors(
     ag_size = 1 if ag_group is None else ag_group.world_size
     ag_rank = 0 if ag_group is None else ag_group.rank_in_group
 
-    for tensor in tensor_list:
+    keys = [k for k, v in tensors.items() if isinstance(v, torch.Tensor)]
+    for key, tensor in zip(keys, tensor_list):
         if tensor.numel() == 0:
             continue
         is_owned = id(tensor) in owned_ids
         if ag_group is not None and tensor.numel() % ag_size == 0:
             tensor = tensor.reshape(ag_size, -1)[ag_rank]
-        buf = tensor if is_owned else tensor.clone()
+        if is_owned:
+            buf = tensor
+        elif ag_group is None and tensor.dim() > 0:
+            buf = resident_rows(
+                ("send", key), tensor.shape, tensor.dtype, tensor.device
+            )
+            buf.copy_(tensor)
+        else:
+            buf = tensor.clone()
         if buf.device.type == "cpu":
             w = torch.distributed.isend(buf, dst=dst_global, group=pp.cpu_group)
         else:
