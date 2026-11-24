@@ -30,6 +30,23 @@ from dataclasses import dataclass, field
 # that pins a version can refuse to negotiate rather than fail mid-collective.
 COLLECTIVE_RPC_PROTOCOL_VERSION = 1
 
+# The weight syncs a runner may be unable to take, as keys of a capability
+# report's ``unavailable``: a reload in place (direct, SHM, IPC), and a stream
+# over the trainer's RDMA group.
+WEIGHT_RELOAD_FEATURE = "weight_reload"
+RDMA_WEIGHT_RECEIVE_FEATURE = "rdma_weight_receive"
+
+
+def pcp_group_size_of(config) -> int:
+    """Ranks in AITER's PCP process group, which Ulysses SP runs over too.
+
+    Read with defaults: also called on bare stand-in configs.
+    """
+    return max(
+        int(getattr(config, "prefill_context_parallel_size", 1) or 1),
+        int(getattr(config, "sequence_parallel_size", 1) or 1),
+    )
+
 
 @dataclass(frozen=True)
 class WorkerCapabilities:
@@ -70,6 +87,7 @@ class EngineCapabilities:
     data_parallel_size: int
     pipeline_parallel_size: int
     prefill_context_parallel_size: int
+    sequence_parallel_size: int
     workers_per_engine: int
     kv_cache_dtype: str
     # Only what every rank reports. See the module docstring.
@@ -103,6 +121,7 @@ class EngineCapabilities:
         parallel = getattr(config, "parallel_config", None)
         tp_world_size = int(getattr(config, "tp_world_size", len(workers)))
         pcp_size = int(getattr(config, "prefill_context_parallel_size", 1) or 1)
+        sp_size = int(getattr(config, "sequence_parallel_size", 1) or 1)
         return cls(
             protocol_version=versions.pop(),
             tp_world_size=tp_world_size,
@@ -111,7 +130,8 @@ class EngineCapabilities:
                 getattr(config, "pipeline_parallel_size", 1) or 1
             ),
             prefill_context_parallel_size=pcp_size,
-            workers_per_engine=tp_world_size * pcp_size,
+            sequence_parallel_size=sp_size,
+            workers_per_engine=tp_world_size * pcp_group_size_of(config),
             kv_cache_dtype=str(getattr(config, "kv_cache_dtype", "auto")),
             methods=methods,
             features=features,

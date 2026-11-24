@@ -20,11 +20,12 @@ import torch
 
 from atom.model_ops import sparse_indexer_fp4
 from atom.model_ops.attentions.mla_kv_pool import MlaKvPool
-from atom.model_ops.sparse_indexer_chunk import dcp_qsplit_rows
+from atom.model_ops.sparse_indexer_chunk import qsplit_rows
 from atom.model_ops.sparse_indexer_fp4 import (
     FP4_KV_BLOCK_SIZE,
     FP4_QUANT_BLOCK_SIZE,
     assert_fp4_indexer_supported,
+    fp4_index_block_shapes,
     fp4_index_scale_rows,
     fp4_q_scale_shape,
     sparse_indexer_fp4_enabled,
@@ -75,6 +76,21 @@ def _pool(**overrides):
     return MlaKvPool(**args)
 
 
+def test_index_cache_scale_exists_before_pool_allocation():
+    model = _import_or_skip("atom.models.deepseek_v2")
+    cache = model.DeepseekV32IndexerCache(
+        head_dim=132, dtype=torch.uint8, prefix="indexer.k_cache", cache_config="fp8"
+    )
+    # Compilation sees a tensor before allocation rebinds the FP4 plane.
+    assert isinstance(cache.kv_cache_scale, torch.Tensor)
+    assert cache.kv_cache_scale.dtype == torch.uint8
+    assert cache.kv_cache_scale.numel() == 0
+    assert cache.kv_cache[0].numel() == 0
+    allocated = torch.empty((2, 4, 64), dtype=torch.uint8)
+    cache.kv_cache_scale = allocated
+    assert cache.kv_cache_scale is allocated
+
+
 def test_predicate_is_structural_and_never_probes_the_chip_for_fp8(monkeypatch):
     monkeypatch.setattr(sparse_indexer_fp4, "_gfx", lambda: "gfx950")
     assert sparse_indexer_fp4_enabled("fp4", DSA)
@@ -114,25 +130,19 @@ def test_unsupported_fp4_requests_name_the_knob_that_blocked_them():
     def check(**overrides):
         assert_fp4_indexer_supported(
             **{
-                "fused_writer": True,
+                "packed_writer": True,
                 "prefill_context_parallel": False,
-                "prefill_ubatching": False,
                 **overrides,
             }
         )
 
     check()
     with pytest.raises(ValueError, match="fused QK/RoPE/cache"):
-        check(fused_writer=False)
+        check(packed_writer=False)
     # PCP's candidate exchange needs fp32 weights that the FP4 writer does not
     # produce, independently of the native custom op's side-effect-only ABI.
     with pytest.raises(ValueError, match="does not support PCP"):
         check(prefill_context_parallel=True)
-    # Decode micro-batching is supported; only the prefill split is not, because
-    # it rebuilds metadata from declared fields and the schedule rides on
-    # undeclared ones. A blanket TBO refusal would take the decode path with it.
-    with pytest.raises(ValueError, match="prefill micro-batching"):
-        check(prefill_ubatching=True)
 
 
 def test_the_builder_compares_the_indexer_s_fp4_verdict_instead_of_setting_it():
@@ -497,6 +507,39 @@ def test_v4_decode_scorer_takes_ragged_requests_and_padding(on_gfx950):
     assert (got[len(picks) :] == -1).all()
 
 
+def test_v4_prefill_scorer_on_an_idle_dp_rank(on_gfx950):
+    """An idle DP rank's prefill, as the V4 builder publishes it at the running
+    width: no scheduled request, one zero-length padding request on a padded
+    block-table row, one padding row. The row picks nothing."""
+    from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
+    from atom.model_ops.indexer import IndexCache, fp4_rows, score_topk
+
+    table, kv_cache, kv_scale, q_fp4, q_scale, weights, _ = _written_cache_and_queries(
+        1, 1, 768, seed=1
+    )
+    index_rows = fp4_rows(
+        torch.zeros(1, dtype=torch.int32, device="cuda"),
+        1,
+        None,
+        Fp4MqaRaggedMetadata(
+            torch.zeros(2, dtype=torch.int32, device="cuda"),
+            0,
+            torch.zeros_like(table[:1]),
+        ),
+        heads=weights.shape[1],
+        page_size=_BLOCK,
+    )
+    got = score_topk(
+        _fp4_query(q_fp4[:1], q_scale[:1]),
+        weights[:1].bfloat16(),
+        IndexCache(kv_cache, kv_scale, _BLOCK),
+        index_rows,
+        topk=512,
+        weight_scale=WEIGHTS_SCALE,
+    )
+    assert (got == -1).all()
+
+
 def test_dcp_decode_scores_each_query_token_over_its_own_local_window(on_gfx950):
     """The geometry `dcp_decode_candidate_exchange_fused` hands the scorer: one
     row per query token over this rank's shard, each its own sequence, so the
@@ -685,9 +728,8 @@ def test_builder_publishes_the_staging_indices_it_derives(device):
     g_lens = np.array([100, 150], dtype=np.int64)
     g_cu = np.concatenate([[0], np.cumsum(g_lens)]).astype(np.int64)
     table = np.array([[7, 3, 0, 0], [11, 2, 9, 0]], dtype=np.int32)
-    var = {"block_tables": SimpleNamespace(np=table)}
     meta = SimpleNamespace()
-    build(builder, meta, bs, lpad, cu_pad, g_cu, g_lens, var)
+    build(builder, meta, bs, lpad, cu_pad, g_cu, g_lens, table)
 
     read = torch.tensor(
         [7 * block + j for j in range(block)]
@@ -725,28 +767,53 @@ def _assert_picks(got, want, ends, topk):
             assert len(chosen & best) / k > 0.99, r
 
 
-def _prefill_rows(batch, ctx_len, bands=None):
+def _prefill_rows(batch, ctx_len, bands=None, stripe=None, new_rows=None):
     """A ragged FP4 prefill over the writer's cache: one row per query token,
     each seeing `[0, its own position]` of its own sequence, a sequence's
-    rows together -- the rows the MLA builder publishes."""
+    rows together -- the rows the MLA builder publishes. `new_rows`: each
+    sequence's last that many tokens are its rows, the rest keys already
+    cached (a prefix hit); all of them by default. `stripe`: `(rank,
+    world)`, that rank's rows of a striped TP split as the V4 builder cuts
+    them, a sequence's from the sequence's own start."""
+    from atom.distributed.pcp_utils import pcp_owned_rows_by_request
     from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
-    from atom.model_ops.indexer import IndexCache, fp4_rows
+    from atom.model_ops.indexer import IndexCache, RowSplit, fp4_rows
 
     torch.manual_seed(1)
     table, num_blocks, token, seq, slots = _paged_layout(batch, ctx_len)
     q_fp4, q_scale, weights, kv_cache, kv_scale = _fused_fp4(
         slots, token, num_blocks, weight_gain=0.1
     )
+    counts = [ctx_len] * batch if new_rows is None else list(new_rows)
+    if new_rows is not None:
+        picked = torch.cat(
+            [
+                torch.arange((s + 1) * ctx_len - n, (s + 1) * ctx_len, device="cuda")
+                for s, n in enumerate(counts)
+            ]
+        )
+        q_fp4, q_scale, weights = q_fp4[picked], q_scale[picked], weights[picked]
+        token, seq = token[picked], seq[picked]
     ends = (token + 1).to(torch.int32)
-    starts = torch.arange(0, (batch + 1) * ctx_len, ctx_len, device="cuda")
+    starts = torch.from_numpy(np.cumsum([0, *counts])).cuda()
+    max_qlen, split = max(counts), None
+    if stripe is not None:
+        rank, world = stripe
+        split = RowSplit.striped(ends.shape[0], rank, world, group="tp")
+        ends = ends[rank::world].contiguous()
+        owned = pcp_owned_rows_by_request(starts.cpu().numpy(), rank, world, split.end)
+        # As the builder groups them (`_stage_split_query_starts`), an empty rank too.
+        starts = torch.from_numpy(owned).cuda()
+        max_qlen = max(int(np.diff(owned).max()), 1)
     rows = fp4_rows(
         ends,
         ctx_len,
         None,
-        Fp4MqaRaggedMetadata(starts.to(torch.int32), ctx_len, table),
+        Fp4MqaRaggedMetadata(starts.to(torch.int32), max_qlen, table),
         heads=HEADS,
         page_size=_BLOCK,
         bands=bands,
+        split=split,
     )
     want = _oracle(
         q_fp4, q_scale, kv_cache, kv_scale, table, ctx_len, weights,
@@ -789,6 +856,44 @@ def test_prefill_band_selects_as_the_whole_batch(on_gfx950, first):
     part = score_topk(query, weights, cache, band, **kwargs)
     span = slice(first, first + stride)
     assert torch.equal(part[span], full[span])
+
+
+@pytest.mark.parametrize("world", [2, 4, 8])
+@pytest.mark.parametrize(
+    "new_rows",
+    [None, (13, 1, 29), (1, 2)],
+    ids=["whole_sequences", "prefix_hits", "one_row_ranks"],
+)
+def test_prefill_striped_rows_select_as_the_whole_batch(
+    on_gfx950, monkeypatch, new_rows, world
+):
+    """A rank's rows of a striped TP split -- every `world`-th row, planned a
+    sequence's together from its own counts -- select exactly as those rows
+    do in the whole batch, in the rank's own slot: a row grouped
+    under the wrong sequence scores another request's keys. Ragged prefix
+    hits leave a rank one row of a sequence, or none; three rows in all
+    leave a rank a single row, or no rows. One GPU holds one rank's slot, so
+    the gather is left out."""
+    from atom.model_ops.indexer import score as score_module
+    from atom.model_ops.indexer import score_topk
+
+    monkeypatch.setattr(score_module, "_gather_split", lambda out, split: None)
+    batch = 2 if new_rows is None else len(new_rows)
+    query, weights, cache, whole, ends, want = _prefill_rows(
+        batch, 512, new_rows=new_rows
+    )
+    kwargs = {"topk": 256, "weight_scale": WEIGHTS_SCALE, "stable": True}
+    full = score_topk(query, weights, cache, whole, **kwargs)
+    _assert_picks(full, want, ends, topk=256)
+    tokens = full.shape[0]
+    for rank in range(world):
+        *_, rows, _, _ = _prefill_rows(
+            batch, 512, stripe=(rank, world), new_rows=new_rows
+        )
+        got = score_topk(query, weights, cache, rows, **kwargs)
+        split = rows.split
+        mine = got[split.slot : split.slot + split.end]
+        assert torch.equal(mine, full[rank:tokens:world]), rank
 
 
 def _fp4_decode_scorer(monkeypatch, rows, width, seed, max_bs=None):
@@ -836,7 +941,7 @@ def _fp4_decode_scorer(monkeypatch, rows, width, seed, max_bs=None):
 
     def publish(counts, running_bs, max_q):
         """`counts` real sequences padded with empty ones to `running_bs`, as
-        `prepare_cu_seqlens_q` publishes them; per-row bounds zero on the pad
+        `prepare_query_metadata` stages them; per-row bounds zero on the pad
         rows. A new metadata object each step, as the builder makes one."""
         nonlocal metadata
         cu = np.full(running_bs + 1, sum(counts), dtype=np.int32)
@@ -1007,12 +1112,10 @@ def _qsplit_roundtrip(full_topk, world_size, sentinel=-7):
     result rather than just that something moved.
     """
     num_rows, topk = full_topk.shape
-    stride = dcp_qsplit_rows(num_rows, 0, world_size)[0]
+    stride = qsplit_rows(num_rows, 0, world_size)[0]
     gathered = torch.full((stride * world_size, topk), sentinel, dtype=full_topk.dtype)
     for rank in range(world_size):
-        rows_per_rank, slot_lo, row_lo, row_hi = dcp_qsplit_rows(
-            num_rows, rank, world_size
-        )
+        rows_per_rank, slot_lo, row_lo, row_hi = qsplit_rows(num_rows, rank, world_size)
         assert rows_per_rank == stride
         gathered[slot_lo : slot_lo + (row_hi - row_lo)] = full_topk[row_lo:row_hi]
     return gathered[:num_rows]
@@ -1065,9 +1168,7 @@ def test_qsplit_rows_partition_covers_every_row_once(num_rows, world_size):
     strides = set()
     slots = []
     for rank in range(world_size):
-        rows_per_rank, slot_lo, row_lo, row_hi = dcp_qsplit_rows(
-            num_rows, rank, world_size
-        )
+        rows_per_rank, slot_lo, row_lo, row_hi = qsplit_rows(num_rows, rank, world_size)
         strides.add(rows_per_rank)
         assert row_lo <= row_hi <= num_rows
         assert row_hi - row_lo <= rows_per_rank
@@ -1094,4 +1195,105 @@ def test_qsplit_rows_partition_covers_every_row_once(num_rows, world_size):
 
 def test_qsplit_degenerates_to_the_whole_range_without_dcp():
     """At dcp=1 the rank's slice is every row, i.e. the pre-DCP behaviour."""
-    assert dcp_qsplit_rows(4096, 0, 1) == (4096, 0, 0, 4096)
+    assert qsplit_rows(4096, 0, 1) == (4096, 0, 0, 4096)
+
+
+def test_pool_abi_is_explicitly_opt_in():
+    assert fp4_index_block_shapes(64, 128) == ((1, 4, 64, 16), (1, 4, 64))
+    assert fp4_index_block_shapes(64, 128, layout="mfma") == ((4, 64, 16), (2, 32, 4))
+    assert fp4_q_scale_shape(8, 32, 128, layout="mfma") == (8, 2, 32, 2)
+    assert fp4_q_scale_shape(8, 64, 128, layout="mfma") == (8, 2, 32, 4)
+    with pytest.raises(ValueError, match="Unsupported"):
+        fp4_index_block_shapes(64, 128, layout="natural")
+    with pytest.raises(ValueError, match="H=32/64"):
+        fp4_q_scale_shape(8, 16, 128, layout="mfma")
+
+
+def test_dcp_prefill_preserves_opus_rows_and_all_four_exponents(monkeypatch):
+    mod = _import_or_skip("atom.model_ops.indexer.indexer_forward")
+
+    torch.manual_seed(17)
+    data = torch.randint(0, 256, (4, 4, 64, 16), dtype=torch.uint8)
+    natural_scale = torch.randint(0, 256, (4, 64, 4), dtype=torch.uint8)
+    scale = (
+        natural_scale.reshape(4, 2, 32, 2, 2)
+        .permute(0, 4, 2, 3, 1)
+        .contiguous()
+        .reshape(4, 2, 32, 4)
+    )
+    src = torch.randperm(256)[:64]
+    gather = torch.arange(128).reshape(2, 64).T.flatten()
+    dst = torch.arange(128)
+    monkeypatch.setattr(
+        mod,
+        "get_dcp_group",
+        lambda: SimpleNamespace(all_gather=lambda t, dim: torch.cat((t, t), dim=dim)),
+    )
+    staged, ss = mod._dcp_stage_indexer_fp4_prefill(
+        data,
+        scale,
+        SimpleNamespace(
+            dcp_indexer_fp4_read_page=src // 64,
+            dcp_indexer_fp4_read_row=src % 64,
+            dcp_indexer_gather_index=gather,
+            dcp_indexer_fp4_stage_page=dst // 64,
+            dcp_indexer_fp4_stage_row=dst % 64,
+            dcp_indexer_fp4_stage_pages=2,
+        ),
+        "mfma",
+    )
+    source = src[gather % 64]
+    assert torch.equal(
+        staged[dst // 64, :, dst % 64, :], data[source // 64, :, source % 64, :]
+    )
+    unpacked = (
+        ss.reshape(2, 2, 32, 2, 2).permute(0, 4, 2, 3, 1).contiguous().reshape(128, 4)
+    )
+    assert torch.equal(unpacked, natural_scale.reshape(-1, 4)[source])
+
+
+@pytest.mark.parametrize(
+    "layout,rope,fp4",
+    [
+        ("flydsl", 64, False),
+        ("flydsl", 64, True),
+        ("opus", 0, True),
+        ("opus", 64, True),
+    ],
+)
+@pytest.mark.parametrize("dcp", [1, 8])
+def test_hip_writer_adapter_preserves_outputs_and_dcp_semantics(
+    monkeypatch, layout, rope, fp4, dcp
+):
+    attention_mla = _import_or_skip("atom.model_ops.attention_mla")
+
+    captured = []
+    monkeypatch.setattr(attention_mla, "get_dcp_world_size", lambda: dcp)
+    monkeypatch.setattr(
+        attention_mla,
+        "_indexer_qk_rope_quant_and_cache",
+        lambda *args, **kwargs: captured.append((args, kwargs)),
+    )
+    tensors = tuple(object() for _ in range(12))
+    q_scale, k_scale = (object(), object()) if fp4 else (None, None)
+    attention_mla.indexer_qk_rope_quant_and_cache(
+        *tensors,
+        1e-6,
+        32,
+        "ue8m0",
+        0.125,
+        q_scale_out=q_scale,
+        kv_cache_scale=k_scale,
+        scale_layout=layout,
+        rope_dim=rope,
+    )
+    assert len(captured) == 1
+    args, kwargs = captured[0]
+    assert all(actual is original for actual, original in zip(args[:12], tensors))
+    if fp4:
+        assert kwargs["q_scale_out"] is q_scale
+        assert kwargs["kv_cache_scale"] is k_scale
+    else:
+        assert "q_scale_out" not in kwargs and "kv_cache_scale" not in kwargs
+    assert kwargs["compute_all_q_rope"] == (layout == "opus" or dcp > 1)
+    assert kwargs["scale_layout"] == layout and kwargs["rope_dim"] == rope

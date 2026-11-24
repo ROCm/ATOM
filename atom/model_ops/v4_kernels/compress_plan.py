@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2024-2026 ATOM Project Contributors
 
 """SGLang-style packed compression plan for V4 batched compressor kernels.
 
@@ -34,6 +35,7 @@ for the decode CUDAGraph path (padding rows sentinel-filled). See
 `make_compress_plans` for the exact per-mode capacities.
 """
 
+import functools
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -77,6 +79,36 @@ def _prepare_key_rope_positions(plan_buffers, ratio, compress_buffer, count, pub
     return publish(buffer, count)
 
 
+@functools.lru_cache(maxsize=256)
+def _token_layout(extend_key: bytes) -> tuple:
+    """A forward's per-token columns that depend on its extend lengths alone
+    (``extend_key``: their int32 bytes), so a decode's steps reuse them:
+    (batch ids, each token's index in its sequence, the plan rows' template
+    with ragged and batch ids filled). Read-only."""
+    extend = np.frombuffer(extend_key, dtype=np.int32)
+    total = int(extend.sum())
+    batch_ids = np.repeat(np.arange(len(extend), dtype=np.int32), extend)
+    ragged_ids = np.arange(total, dtype=np.int32)
+    cu_extend = np.zeros(len(extend) + 1, dtype=np.int32)
+    np.cumsum(extend, out=cu_extend[1:])
+    j_in_seq = ragged_ids - cu_extend[batch_ids]
+    template = np.empty((total, 4), dtype=np.int32)
+    template[:, 0] = ragged_ids
+    template[:, 1] = batch_ids
+    for array in (batch_ids, j_in_seq, template):
+        array.flags.writeable = False
+    return batch_ids, j_in_seq, template
+
+
+@functools.lru_cache(maxsize=256)
+def _window_lens(extend_key: bytes, K: int) -> np.ndarray:
+    """Each token's leading K-loop iterations read from the state cache,
+    ``max(K - 1 - j_in_seq, 0)`` (``_token_layout``'s tokens). Read-only."""
+    window = np.maximum(K - 1 - _token_layout(extend_key)[1], 0).astype(np.int32)
+    window.flags.writeable = False
+    return window
+
+
 def plan_context_lens(
     positions: np.ndarray, cu_seqlens_q: np.ndarray, extend_lens: np.ndarray
 ) -> np.ndarray:
@@ -99,8 +131,7 @@ def make_compress_plans(
     unique_ratios_overlap: Iterable[tuple[int, bool]],
     *,
     plan_buffers: dict,
-    publication_group=None,
-    defer_to=None,
+    group=None,
     running_bs: int | None = None,
     max_q_len: int | None = None,
     decode_capacity_per_ratio: dict[int, int] | None = None,
@@ -127,12 +158,9 @@ def make_compress_plans(
                     calls (CUDAGraph requirement). Fresh per-call alloc is
                     not supported — that pattern caused allocator-churn
                     races (see `write_v4_paged_decode_indices` docstring).
-      publication_group: optional prebound owner group for these plan buffers.
-                    All sources are filled before a single checked publication.
-                    Independent callers without a group keep direct uploads.
-      defer_to: optional combined group that will publish these plan buffers.
-                    The caller owns its counts and must publish before any GPU
-                    plan consumer; used by V4.1's combined metadata preparation.
+      group: the phase group the plan buffers are counted into; the caller
+                    publishes it before any GPU plan consumer. Independent
+                    callers without one keep direct uploads.
       running_bs: optional int — the CUDAGraph-padded batch size (>= bs). When
                     PROVIDED this selects the DECODE CUDAGraph path: both
                     `compress_plan_gpu` and `write_plan_gpu` are sliced to a
@@ -199,26 +227,17 @@ def make_compress_plans(
     """
     # Check every source acquired by the owner before touching a pinned plan. A
     # repeated call in the same forward must fail before overwriting an
-    # earlier publication, including when that call used checked direct.
-    if defer_to is not None and publication_group is None:
-        raise ValueError("Deferred plans require a publication group")
-    group = publication_group if defer_to is None else defer_to
-    if publication_group is not None:
-        publication_group.check_writable()
-        if defer_to is None:
-            for i in range(len(group.counts)):
-                group.counts[i] = None
+    # earlier publication.
+    if group is not None:
+        for buffers in plan_buffers.values():
+            for buffer in buffers.values():
+                buffer.acquire_write()
 
     def publish(buffer, count):
         if group is None:
             return buffer.copy_to_gpu(count)
         group.set_count(buffer, count)
         return buffer.gpu[:count]
-
-    def finish():
-        if group is not None and defer_to is None:
-            group.publish(group.counts)
-        return out
 
     bs = len(extend_lens_cpu)
     extend_lens_cpu = np.ascontiguousarray(extend_lens_cpu, dtype=np.int32)
@@ -287,25 +306,18 @@ def make_compress_plans(
                     plan_buffers, ratio, cbuf, ccap, publish
                 ),
             )
-        return finish()
+        return out
 
-    # Per-token columns shared across ratios.
-    batch_ids = np.repeat(np.arange(bs, dtype=np.int32), extend_lens_cpu)
-    ragged_ids = np.arange(total, dtype=np.int32)
-    cu_extend = np.empty(bs + 1, dtype=np.int32)
-    cu_extend[0] = 0
-    np.cumsum(extend_lens_cpu, out=cu_extend[1:])
-    j_in_seq = ragged_ids - cu_extend[batch_ids]
-    prefix_lens = context_lens_cpu - extend_lens_cpu
-    positions = prefix_lens[batch_ids] + j_in_seq
-    token_ends = context_lens_cpu[batch_ids]
+    # Per-token columns shared across ratios; what the extend lengths alone
+    # decide is cached (a decode's steps share them).
+    extend_key = extend_lens_cpu.tobytes()
+    batch_ids, j_in_seq, template = _token_layout(extend_key)
+    positions = (context_lens_cpu - extend_lens_cpu)[batch_ids] + j_in_seq
 
     # Only `window_len` depends on the ratio, so the row block is built once and
     # the loop rewrites that one column, after this ratio's rows are copied
     # into its buffers.
-    plan_rows = np.empty((total, 4), dtype=np.int32)
-    plan_rows[:, 0] = ragged_ids
-    plan_rows[:, 1] = batch_ids
+    plan_rows = template.copy()
     plan_rows[:, 2] = positions
 
     for ratio, is_overlap in unique_ratios_overlap:
@@ -316,7 +328,7 @@ def make_compress_plans(
         K_pool_size = K + extra_write
         # window_len = K - min(j_in_seq + 1, K) = max(K - 1 - j_in_seq, 0)
         # Number of leading K-loop iterations that go to state cache.
-        np.maximum(K - 1 - j_in_seq, 0, out=plan_rows[:, 3])
+        plan_rows[:, 3] = _window_lens(extend_key, K)
 
         # compress: token at a compression boundary -- every token at ratio 1
         if ratio == 1 and write_from is None:
@@ -337,8 +349,14 @@ def make_compress_plans(
         # `context_len - STATE_SIZE` is what ATOM's update_compressor_states already
         # uses (state_writes.py:152-154 docstring) and what the fused kernel's
         # state-cache reader expects. Positions are >= 0, so the window is
-        # `positions + K_pool >= context_len`.
-        write_plan = plan_rows[positions + K_pool_size >= token_ends]
+        # `positions + K_pool >= context_len`: every row of a decode whose
+        # query fits the window (a token at most `max_q_len - 1` before its
+        # sequence's last).
+        if running_bs is not None and max_q_len <= K_pool_size:
+            write_plan = plan_rows
+        else:
+            token_ends = context_lens_cpu[batch_ids]
+            write_plan = plan_rows[positions + K_pool_size >= token_ends]
 
         n_compress = int(compress_plan.shape[0])
         n_write = int(write_plan.shape[0])
@@ -382,4 +400,4 @@ def make_compress_plans(
                 plan_buffers, ratio, cbuf, compress_slice, publish
             ),
         )
-    return finish()
+    return out

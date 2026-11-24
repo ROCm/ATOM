@@ -16,12 +16,17 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
 from math import isfinite
 from numbers import Integral
 from typing import Any
 
 import torch
+
+from atom.model_ops.qwen4_exp.qsa_cache_rules import qsa_page_segments
+from atom.utils import envs, get_hf_text_config
+from atom.utils.selector import Family, attn_family
 
 # Version 3 adds the effective index-cache dtype to the PAGE identity. FP4 and
 # FP8 DSV4 indexers have different region counts and byte layouts, so they must
@@ -34,6 +39,7 @@ _OFFLOAD_LAYOUT_ALIASES = {
     "kimi_k3": "kimi_k3",
     "qwen": "qwen",
     "m3": "m3",
+    "dsv41": "dsv41",
     # Compatibility with the names used while the layout split was developed.
     "terminal_unit": "hybrid",
     "page_slot": "hybrid",
@@ -59,33 +65,16 @@ _HF_INTEGER_GEOMETRY_FIELDS = frozenset(_HF_PAGE_FIELDS) - {
     "indexer_dtype",
     "indexer_types",
 }
-# GDN/linear model types carrying a per-request recurrent state but NOT in the
-# `kimi_linear` family `kimi_k3` owns. Same set as `attn_family` resolves to
-# `Family.GDN`, but note the attribute skew: the guard below reads
-# `hf_config.model_type` while `attn_family` reads the text config. On the
-# native path they agree only because `get_hf_config` flattens the text type
-# up; `is_vllm()` drops `qwen3_5`/`qwen3_5_moe` from that flatten, so if
-# offload is ever wired into plugin mode this guard must switch to the text
-# config to stay in sync.
-# Unreachable today -- no plugin caller passes a `kv_transfer_config`.
-# MiniMax-M3 is not here either: it is sparse *paged* attention
-# (`MiniMaxM3SparseForCausalLM` -> `SparseMHAPagedAttentionImpl`), no recurrent
-# state, so it is NOT a GDN/linear model. It does get its own PAGE-only `m3`
-# layout (see `_is_minimax_m3` and offload/hybrid/m3/): its NSA index_cache is
-# delivered only through transfer_tensors.block_regions, so the dense codec --
-# which builds from per-layer KVCacheTensor K/V -- would silently drop it.
-_GDN_LINEAR_MODEL_TYPES = frozenset(
-    {"qwen3_next", "qwen3_next_mtp", "qwen3_5_text", "qwen3_5_moe_text"}
-)
-
 # Layouts that own a tier for a model's per-request *recurrent* state.
 # `kimi_k3` is the kimi_linear KDA state; `qwen` is the same tier over a GDN
-# PAGE image. `hybrid` (DSV4 sparse-attention checkpoints) is not
+# PAGE image; `dsv41` is DeepSeek-V4.1's CSA2 window rings, compressor rings
+# and Engram cursor. `hybrid` (DSV4 sparse-attention checkpoints) is not
 # recurrent-state and dense<->hybrid is a legitimate operator override for
 # namespace separation. An explicit `offload_layout` override may not
 # downgrade a recurrent-state model to a layout that owns no tier for it
 # (silent wrong output) -- see `select_offload_layout`.
-_STATE_OWNING_LAYOUTS = frozenset({"kimi_k3", "qwen"})
+_STATE_OWNING_LAYOUTS = frozenset({"kimi_k3", "qwen", "dsv41"})
+
 
 logger = logging.getLogger("atom")
 
@@ -155,23 +144,35 @@ def select_offload_layout(config) -> str:
             "does not preserve the NSA index cache. Drop the override or set "
             "it to 'm3'."
         )
-    # An override may pick between compatible layouts, but it may not strip a
-    # state-owning model down to a layout with no tier for its per-request state
-    # -- the same silent-wrong-output the GDN refusal pre-empts, reached by a
-    # different door (an explicit `dense` rather than a fall-through).
-    if natural in _STATE_OWNING_LAYOUTS and mapped not in _STATE_OWNING_LAYOUTS:
+    # An override may pick between compatible layouts, but a state-owning
+    # model's state tier is its own: any other layout, state-owning or not,
+    # has no tier for that state -- the same silent-wrong-output the GDN
+    # refusal pre-empts, reached by a different door (an explicit override
+    # rather than a fall-through). `dsv41` on a K3 model, say, reaches the
+    # dense connector with the state tier off.
+    if natural in _STATE_OWNING_LAYOUTS and mapped != natural:
         raise ValueError(
             f"lmcache_offload: offload_layout={override!r} would run a "
             f"{natural!r}-family model (per-request recurrent state) on the "
             f"{mapped!r} layout, which owns no tier for that state -- its KV "
             "prefix would be restored over stale state (silent wrong output). "
-            "Drop the override, or disable offload for this model."
+            f"Drop the override, set it to {natural!r}, or disable offload for "
+            "this model."
+        )
+    # The reverse for the one layout this alias table gained for a single
+    # family: `dsv41` names DeepSeek-V4.1's PAGE+STATE pool, and any other
+    # model would run the dense codec under its namespace with collapse off.
+    if mapped == "dsv41" and natural != "dsv41":
+        raise ValueError(
+            f"lmcache_offload: offload_layout={override!r} is DeepSeek-V4.1's "
+            f"layout; this model resolves to {natural!r}. Drop the override."
         )
     return mapped
 
 
 def _layout_from_model(config) -> str:
-    """The dense/hybrid/kimi_k3/qwen layout the model itself implies (no override).
+    """The layout the model itself implies, without an override: ``m3``,
+    ``kimi_k3``, ``dsv41``, ``hybrid``, ``qwen`` or ``dense``.
 
     GDN selects ``qwen``, a subclass of the K3 tier: that tier packs a PAGE
     image and does not assume KDA shapes. ``dense`` is refused for these
@@ -190,23 +191,30 @@ def _layout_from_model(config) -> str:
         return "m3"
     # Resolve the family off the *text* config, exactly as the model-side
     # predicate this mirrors does (`attn_family(hf_text_config)`, which the
-    # backend selector runs). Two names in `_GDN_LINEAR_MODEL_TYPES` --
-    # `qwen3_5_text`, `qwen3_5_moe_text` -- are literally text-config model
-    # types, so the bare wrapper `model_type` would be the multimodal wrapper's
-    # and neither the `kimi_linear` nor the GDN branch would fire: Qwen3.5 would
-    # fall through to `dense` and die deep in `register_kv_caches` (the exact
-    # failure the refusal below exists to pre-empt), and a `kimi_linear`
-    # checkpoint wrapped in a `text_config` would silently run with no state tier.
-    # Local import: this module is on the early config path, and `atom.utils`
-    # pulls in transformers -- keep it out of module import time.
-    from atom.utils import get_hf_text_config
-
+    # backend selector runs). Qwen3.5's GDN types (`qwen3_5_text`,
+    # `qwen3_5_moe_text`) are text-config model types, so the bare wrapper
+    # `model_type` would be the multimodal wrapper's and neither the
+    # `kimi_linear` nor the GDN branch would fire: Qwen3.5 would fall through to
+    # `dense` and die deep in `register_kv_caches` (the exact failure the
+    # refusal below exists to pre-empt), and a `kimi_linear` checkpoint wrapped
+    # in a `text_config` would silently run with no state tier.
     text_config = get_hf_text_config(hf_config)
     model_type = getattr(text_config, "model_type", None)
     # K3's paged KV is ordinary dense MLA; what makes it its own family is the
     # KDA per-request state that a reusable prefix also needs.
     if model_type == "kimi_linear":
         return "kimi_k3"
+    # DeepSeek-V4.1 before the `compress_ratios` probe below, which it would
+    # otherwise answer: V4.1 declares compress ratios exactly as DSV4 does, but
+    # it also carries per-request CSA2 state (window ring per layer, the
+    # compressor's incomplete group, the Engram cursor) that the `hybrid`
+    # PAGE+SLOT codec owns no tier for. Resolving it to `hybrid` would leave it
+    # outside `_STATE_OWNING_LAYOUTS`, so an `offload_layout: dense` override
+    # would silently restore a KV prefix over a window ring that never
+    # existed. Every spelling (wrapper, text, DSpark) is the selector's CSA2.
+    family = attn_family(text_config)
+    if family is Family.CSA2:
+        return "dsv41"
     if getattr(hf_config, "compress_ratios", None):
         return "hybrid"
     # GDN publishes the same PAGE-image contract the kimi_k3 tier already
@@ -214,7 +222,7 @@ def _layout_from_model(config) -> str:
     # is `qwen` so the shell builds `QwenOffloadConnector`, which inherits
     # that tier and does not assume KDA shapes. `dense` would restore KV
     # over a stale slot.
-    if model_type in _GDN_LINEAR_MODEL_TYPES:
+    if family in (Family.GDN, Family.QSA_GDN):
         return "qwen"
     return "dense"
 
@@ -342,15 +350,31 @@ def build_page_namespace(
     base_model_name = str(
         getattr(config, "model_tag", None) or getattr(config, "model", "atom-model")
     )
+    # A frontend's own stable form when it supplies one
+    # (`Config.offload_speculative_config`): only it knows which of its fields
+    # are per-process.
+    speculative = getattr(config, "offload_speculative_config", None)
+    if speculative is None:
+        speculative = getattr(config, "speculative_config", None)
+    speculative = _stable_config_value(speculative)
+    layout = select_offload_layout(config)
+    kv_dtype = str(getattr(config, "kv_cache_dtype", "auto"))
+    page_mode = {
+        "hybrid": "dsv4-page-regions",
+        "dsv41": "dsv4-page-regions",
+        "m3": "m3-page-regions",
+    }.get(layout, "dense-opaque-block")
+    if layout == "dsv41" and kv_dtype in ("fp4", "fp8"):
+        # Quantized V4.1 now stores contiguous data/scale planes instead of
+        # interleaved rows. Equal-size old PAGE objects must miss even when
+        # replay-based offload has no STATE checkpoint layout_id to check.
+        page_mode = "dsv41-source-buffer-v1"
     document = {
         "schema": "atom-page-namespace",
         "layout_version": layout_version,
         "model": base_model_name,
-        "page_mode": {
-            "hybrid": "dsv4-page-regions",
-            "m3": "m3-page-regions",
-        }.get(select_offload_layout(config), "dense-opaque-block"),
-        "kv_cache_dtype": str(getattr(config, "kv_cache_dtype", "auto")),
+        "page_mode": page_mode,
+        "kv_cache_dtype": kv_dtype,
         "index_cache_dtype": str(getattr(config, "index_cache_dtype", "auto")),
         "block_size": _strict_integer(
             "PAGE block size",
@@ -375,10 +399,15 @@ def build_page_namespace(
         # The config-time snapshot when there is one; see `Config.__post_init__`.
         "hf_geometry": getattr(config, "offload_page_hf_geometry", None)
         or _stable_hf_geometry(hf),
-        "speculative_config": _stable_config_value(
-            getattr(config, "speculative_config", None)
-        ),
+        "speculative_config": speculative,
     }
+    # Snapshot at startup, before scheduler/worker config copies diverge.
+    # Needed even for PAGE-only offload, which has no checkpoint layout_id.
+    index_layout = getattr(config, "index_cache_layout", None)
+    if index_layout is not None:
+        document["index_cache_layout"] = index_layout
+    if attn_family(get_hf_text_config(hf)) is Family.QSA_GDN:
+        document.update(qsa_page_segments(config))
     canonical = json.dumps(
         document,
         sort_keys=True,
@@ -448,7 +477,7 @@ def build_lmcache_config(
 
 
 def lmcache_engine_id(config) -> str:
-    """Return the LMCache engine id for this process, namespaced by DP rank.
+    """Return the LMCache engine id for this process: one per server and DP rank.
 
     A scheduler's ``LookupClient`` and its workers' ``LookupServer`` derive the
     same ZMQ ipc socket path from this id, so it must be identical inside one
@@ -459,16 +488,14 @@ def lmcache_engine_id(config) -> str:
 
     Under ``--enable-dp-attention`` this is the normal case, not a corner case:
     ``CoreManager`` folds TP into DP, so each GPU becomes its own replica with
-    ``tensor_parallel_size == 1``.
+    ``tensor_parallel_size == 1``. The socket directory is per host, so two
+    servers on one host are told apart by ``server_instance_id``.
     """
-    dp_rank = int(
-        getattr(
-            getattr(config, "parallel_config", None),
-            "data_parallel_rank",
-            0,
-        )
-        or 0
-    )
+    pc = getattr(config, "parallel_config", None)
+    dp_rank = int(getattr(pc, "data_parallel_rank", 0) or 0)
+    server = getattr(pc, "server_instance_id", "")
+    if server:
+        return f"atom-offload-{server}-dp{dp_rank}"
     return f"atom-offload-dp{dp_rank}"
 
 
@@ -601,16 +628,60 @@ def scale_cpu_size_for_pp(cfg, config) -> None:
     )
 
 
+def connector_extras(kv_transfer_config: Mapping[str, Any] | None) -> Mapping[str, Any]:
+    """Read one connector's extra settings with a shared mapping contract."""
+    if kv_transfer_config is None:
+        return {}
+    if not isinstance(kv_transfer_config, Mapping):
+        raise ValueError("kv_transfer_config must be a JSON object")  # noqa: TRY004
+    extra = kv_transfer_config.get("kv_connector_extra_config", kv_transfer_config)
+    if extra is None:
+        return {}
+    if not isinstance(extra, Mapping):
+        raise ValueError(  # noqa: TRY004
+            "kv_connector_extra_config must be a JSON object"
+        )
+    return extra
+
+
+def connector_integer(
+    extra: Mapping[str, Any], name: str, default: int, *, minimum: int = 1
+) -> int:
+    """Read integer settings, accepting integer text but rejecting fractional values."""
+    value = extra.get(name, default)
+    if isinstance(value, str):
+        try:
+            value = int(value)
+        except ValueError as exc:
+            raise ValueError(f"{name} must be an integer") from exc
+    return _strict_integer(name, value, minimum=minimum)
+
+
+def lmcache_chunk_tokens(kv_transfer_config: Mapping[str, Any] | None) -> int:
+    """The LMCache chunk the connector is configured for, in tokens: the
+    ``lmcache.chunk_size`` extra, else ``LMCACHE_CHUNK_SIZE`` (`envs`), else
+    LMCache's default 256. Needs no LMCache import, so DP routing can read it
+    at startup."""
+    extra = connector_extras(kv_transfer_config)
+    # Python evaluates function arguments eagerly. An explicit override must
+    # not read (or validate) the lower-priority environment fallback.
+    if "lmcache.chunk_size" in extra:
+        return connector_integer(extra, "lmcache.chunk_size", 256)
+    return connector_integer(extra, "lmcache.chunk_size", envs.LMCACHE_CHUNK_SIZE)
+
+
 def apply_extra_overrides(cfg, kv_transfer_config: dict[str, Any] | None) -> None:
     """Apply ``{"lmcache.<field>": value}`` extras from kv_transfer_config."""
     if not kv_transfer_config:
         return
-    extra = kv_transfer_config.get("kv_connector_extra_config", kv_transfer_config)
+    extra = connector_extras(kv_transfer_config)
     for key, value in (extra or {}).items():
         if isinstance(key, str) and key.startswith("lmcache."):
             field = key[len("lmcache.") :]
             if not field or not hasattr(cfg, field):
                 raise ValueError(f"unknown LMCache override {key!r}")
+            if field == "chunk_size":
+                value = connector_integer(extra, key, 256)
             setattr(cfg, field, value)
 
 
@@ -657,7 +728,6 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
     are only used for key/shape bookkeeping (we override the byte layout in the
     codec), but we fill them faithfully from hf_config so logging/keys are sane.
     """
-    from aiter import dtypes
     from lmcache.v1.metadata import LMCacheMetadata
 
     from atom.models.utils import get_pp_indices
@@ -691,7 +761,9 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
     worker_id = _strict_integer("LMCache worker id", worker_id)
     if worker_id >= world_size:
         raise ValueError("LMCache worker id must be within the world")
-    kv_dtype = dtypes.d_dtypes[config.kv_cache_dtype]
+    from atom.config import kv_cache_torch_dtype
+
+    kv_dtype = kv_cache_torch_dtype(config.kv_cache_dtype)
     model_name = build_page_namespace(config, cfg, world_size)
 
     # MLA (DeepSeek R1/V3, Kimi) stores a single replicated per-layer latent
@@ -754,3 +826,7 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
         # collide on it.
         engine_id=lmcache_engine_id(config),
     )
+
+
+# The smallest tier hit worth loading unless the user or the tier says otherwise.
+DEFAULT_MIN_LOAD_TOKENS = 8192

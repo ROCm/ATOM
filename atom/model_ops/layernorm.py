@@ -19,6 +19,10 @@ from aiter.dist.communication_op import (
 )
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.fused_qk_rmsnorm_group_quant import (
+    fused_qk_rmsnorm_group_quant,
+    fused_qk_rmsnorm_per_token_quant,
+)
 from aiter.ops.gated_rmsnorm_fp8_group_quant import gated_rmsnorm_fp8_group_quant
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
 from aiter.ops.triton.quant.fused_mxfp8_quant import fused_dual_rmsnorm_mxfp8_quant
@@ -764,6 +768,34 @@ def fused_ar_gemma_per_group_supported() -> bool:
     return "gemma_norm" in inspect.signature(method).parameters
 
 
+def fused_ar_gemma_per_token_supported() -> bool:
+    """Whether aiter's fused AR + RMSNorm + per-token FP8 quant takes `gemma_norm`.
+
+    Same failure this guards for per-group -- an aiter that drops the flag
+    normalizes with `x * w` instead of Gemma's `x * (1 + w)` and says nothing --
+    but read off the registered torch.library schema rather than a Python
+    signature, because the per-token branch of
+    `GroupCoordinator.fused_allreduce_rmsnorm_quant` dispatches to ops declared
+    as `(*args, **kwargs)`.
+    """
+    import aiter.dist.parallel_state  # noqa: F401  (importing registers the ops)
+
+    ops = getattr(torch.ops, "aiter", None)
+    if ops is None:
+        return False
+    for name in (
+        "fused_allreduce_rmsnorm_quant_",
+        "fused_allreduce_rmsnorm_quant_emit_bf16_",
+    ):
+        op = getattr(ops, name, None)
+        if op is None:
+            return False
+        schema = str(getattr(op, "_schemas", "")) or str(op.default._schema)
+        if "gemma_norm" not in schema:
+            return False
+    return True
+
+
 class GemmaRMSNorm(nn.Module):
     """RMS normalization for Gemma.
 
@@ -784,27 +816,38 @@ class GemmaRMSNorm(nn.Module):
         self.weight = atom_parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
         self.use_fused_quant = False
+        self.per_token_quant = False
         self.write_bf16 = write_bf16
         if quant_config is not None:
             from aiter import QuantType
 
             if quant_config.quant_type == QuantType.per_1x128:
                 self.use_fused_quant = True
+            elif (
+                quant_config.quant_type == QuantType.per_Token
+                and envs.ATOM_FUSED_NORM_PER_TOKEN_QUANT
+            ):
+                self.use_fused_quant = True
+                self.per_token_quant = True
         # Fold the TP all-reduce of the input (the un-reduced output of the
         # previous row-parallel layer) into this norm.
         self.fused_allreduce = (
             fused_allreduce and get_tensor_model_parallel_world_size() > 1
         )
-        if (
-            self.fused_allreduce
-            and self.use_fused_quant
-            and not fused_ar_gemma_per_group_supported()
-        ):
-            raise ValueError(
-                "GemmaRMSNorm(fused_allreduce=True) with per-group FP8 quant needs "
-                "an aiter whose fused AR + RMSNorm + per-group quant takes "
-                "gemma_norm; this one would silently normalize with x * w"
+        if self.fused_allreduce and self.use_fused_quant:
+            granularity = "per-token" if self.per_token_quant else "per-group"
+            supported = (
+                fused_ar_gemma_per_token_supported()
+                if self.per_token_quant
+                else fused_ar_gemma_per_group_supported()
             )
+            if not supported:
+                raise ValueError(
+                    f"GemmaRMSNorm(fused_allreduce=True) with {granularity} FP8 "
+                    f"quant needs an aiter whose fused AR + RMSNorm + "
+                    f"{granularity} quant takes gemma_norm; this one would "
+                    "silently normalize with x * w"
+                )
 
     @staticmethod
     def forward_static(
@@ -881,6 +924,26 @@ class GemmaRMSNorm(nn.Module):
         from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_group_quant
         from aiter.utility.dtypes import fp8
 
+        if self.per_token_quant:
+            # No gemma_norm on aiter's rmsnorm_quant, so the norm and the quant
+            # stay two kernels here -- the same two this path runs today. The
+            # saving is on `_forward_fused_allreduce`, which has a one-kernel
+            # per-token variant; this branch exists so layer 0 and any
+            # all-reduce-free configuration return the same contract.
+            from aiter import get_hip_quant
+
+            normed = self.forward_cuda(x, residual)
+            res_out = None
+            if residual is not None:
+                normed, res_out = normed
+            out_fp8, out_scale = get_hip_quant(QuantType.per_Token)(
+                normed, quant_dtype=fp8
+            )
+            out_bf16 = normed if self.write_bf16 else None
+            if residual is not None:
+                return out_fp8, out_scale, out_bf16, res_out
+            return out_fp8, out_scale, out_bf16
+
         transpose_scale = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
         group_size = 128
         M = x.shape[0]
@@ -927,16 +990,27 @@ class GemmaRMSNorm(nn.Module):
         # reads the raw weight and applies (1 + w) itself (gemma_norm), so an
         # in-place weight update (rollout sync) is seen on the next call.
         if self.use_fused_quant:
+            # group_size stays at aiter's default 128 for per-token: its fast
+            # one-kernel branch is keyed on `quant_type == "per_token" and
+            # group_size == 128`, and the value is unused there. transpose_scale
+            # is per-group only -- a per-token scale is one column.
+            quant_kwargs = (
+                {"quant_type": "per_token"}
+                if self.per_token_quant
+                else {
+                    "quant_type": "per_group",
+                    "group_size": 128,
+                    "transpose_scale": envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE,
+                }
+            )
             outs = tensor_model_parallel_fused_allreduce_rmsnorm_quant(
                 x.contiguous(),
                 residual,
                 self.weight,
                 self.variance_epsilon,
-                quant_type="per_group",
-                group_size=128,
                 emit_bf16=self.write_bf16,
-                transpose_scale=envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE,
                 gemma_norm=True,
+                **quant_kwargs,
             )
             out_fp8, res_out, out_scale = outs[:3]
             out_bf16 = outs[3] if self.write_bf16 else None
@@ -1309,6 +1383,82 @@ class DualRMSNormMXFP8:
             q_scale = q_scale.view(*lead, -1)
             k_out = k_out.view(*lead, -1)
         return q_fp8, q_scale, k_out
+
+
+def _rows(x: torch.Tensor) -> torch.Tensor:
+    """`x` as unit-stride rows."""
+    x = x.reshape(-1, x.shape[-1])
+    return x if x.stride(-1) == 1 else x.contiguous()
+
+
+class DualRMSNormBF16:
+    """BF16 `DualRMSNormMXFP8`: both norms in one launch (AITER's
+    `fused_qk_rmsnorm_group_quant` without a quant), Q unquantized (scale
+    None), for where the Q GEMMs run in BF16."""
+
+    def __init__(self, q_norm: nn.Module, k_norm: nn.Module, prefix: str = "") -> None:
+        self.q_norm = q_norm
+        self.k_norm = k_norm
+        self.prefix = prefix
+
+    @mark_trace
+    def __call__(self, q: torch.Tensor, k: torch.Tensor):
+        lead = q.shape[:-1]
+        q2, k2 = _rows(q), _rows(k)
+        yk = torch.empty(k2.shape, dtype=k.dtype, device=k.device)
+        yq, sq = self._norm(q2, k2, yk)
+        sq = None if sq is None else sq.view(*lead, 1)
+        return yq.view(*lead, -1), sq, yk.view(*lead, -1)
+
+    def _norm(self, q2, k2, yk):
+        """The launch over rows, K into `yk`; returns Q and its scale."""
+        yq = torch.empty(q2.shape, dtype=q2.dtype, device=q2.device)
+        if q2.shape[0]:
+            fused_qk_rmsnorm_group_quant(
+                q=q2,
+                q_weight=self.q_norm.weight,
+                q_epsilon=self.q_norm.eps,
+                q_out_unquantized=yq,
+                k=k2,
+                k_weight=self.k_norm.weight,
+                k_epsilon=self.k_norm.eps,
+                k_out=yk,
+            )
+        return yq, None
+
+
+class DualRMSNormPerToken(DualRMSNormBF16):
+    """`DualRMSNormBF16` with Q quantized per token in the same launch (AITER's
+    `fused_qk_rmsnorm_per_token_quant`, one F32 scale a row), so per-channel
+    Q readers share one quantization."""
+
+    def __init__(
+        self,
+        q_norm: nn.Module,
+        k_norm: nn.Module,
+        prefix: str = "",
+        *,
+        quant_dtype: torch.dtype,
+    ) -> None:
+        super().__init__(q_norm, k_norm, prefix)
+        self.quant_dtype = quant_dtype
+
+    def _norm(self, q2, k2, yk):
+        yq = torch.empty(q2.shape, dtype=self.quant_dtype, device=q2.device)
+        sq = torch.empty((q2.shape[0], 1), dtype=torch.float32, device=q2.device)
+        if q2.shape[0]:
+            fused_qk_rmsnorm_per_token_quant(
+                yq,
+                sq,
+                q2,
+                self.q_norm.weight,
+                self.q_norm.eps,
+                k=k2,
+                k_weight=self.k_norm.weight,
+                k_epsilon=self.k_norm.eps,
+                k_out=yk,
+            )
+        return yq, sq
 
 
 # ---------------------------------------------------------------------------

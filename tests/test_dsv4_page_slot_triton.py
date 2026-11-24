@@ -368,7 +368,7 @@ def test_triton_wrapper_only_enqueues_on_the_supplied_stream(
     assert calls[4][0] == "kernel"
     assert calls[5] == ("stream-exit", stream)
     _, kernel_args, kernel_kwargs = calls[4]
-    assert kernel_args == (
+    expected_args = (
         buffer,
         "device-ids",
         "region-base",
@@ -381,11 +381,17 @@ def test_triton_wrapper_only_enqueues_on_the_supplied_stream(
         5,
         10,
     )
-    assert kernel_kwargs == {
+    expected_kwargs = {
         "REVERSE": True,
         "TILE": triton_page_slot.TILE_BYTES,
         "num_warps": 8,
     }
+    if wrapper_name == "scatter_region_items":
+        # The chunk stride is a runtime argument, so no new specialization.
+        expected_args += (10,)
+        expected_kwargs.update(ITEMS_PER_CHUNK=1)
+    assert kernel_args == expected_args
+    assert kernel_kwargs == expected_kwargs
 
 
 @pytest.mark.parametrize("unit_bytes", [1023, 1024, 1025, 2049])
@@ -572,3 +578,84 @@ def test_page_slot_non_default_stream_gather_scatter_round_trip():
     assert torch.equal(page_b.cpu(), expected_page_b)
     assert torch.equal(slot_a.cpu(), expected_slot_a)
     assert torch.equal(slot_b.cpu(), expected_slot_b)
+
+
+@pytest.mark.parametrize(
+    ("units", "items_per_chunk", "padding", "start"),
+    [
+        ([1024, 1024, 64], 2, 1536, 0),  # K/V/scale-like regions, padded slots
+        ([1023, 515, 33], 3, 7, 13),  # partial tiles, odd padding, odd start
+        ([584, 64, 128, 1152], 4, 0, 1),  # unpadded stride, mixed widths
+    ],
+)
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _REAL_TRITON_AVAILABLE,
+    reason="requires a real CUDA/HIP device and Triton",
+)
+def test_strided_restore_matches_the_staged_path_byte_for_byte_on_gpu(
+    units, items_per_chunk, padding, start
+):
+    device = torch.device("cuda", torch.cuda.current_device())
+    num_blocks, chunks = 64, 5
+    generator = torch.Generator().manual_seed(7)
+    tensors = [
+        torch.randint(
+            0, 256, (num_blocks * unit,), dtype=torch.uint8, generator=generator
+        )
+        for unit in units
+    ]
+    gpu = [tensor.to(device) for tensor in tensors]
+    codec = DSV4PageSlotCodec(
+        [_gpu_region(t, u, reverse_indexed=False) for t, u in zip(gpu, units)],
+        [],
+        num_blocks=num_blocks,
+        num_slots=0,
+        device=device,
+    )
+    chunk_bytes = items_per_chunk * sum(units)
+    stride = chunk_bytes + padding
+    ids = torch.randperm(num_blocks, generator=generator)[: chunks * items_per_chunk]
+    groups = [
+        [
+            ids[c * items_per_chunk : (c + 1) * items_per_chunk].tolist()
+            for c in range(chunks)
+        ]
+    ]
+    slots = torch.randint(  # the padding holds random bytes the restore must skip
+        0,
+        256,
+        (start + (chunks - 1) * stride + chunk_bytes,),
+        dtype=torch.uint8,
+        generator=generator,
+    ).to(device)
+    run = slots[start:]
+    packed = torch.cat(
+        [run[c * stride : c * stride + chunk_bytes] for c in range(chunks)]
+    )
+    stream = torch.cuda.Stream(device=device)
+
+    def restore(copy):
+        for target, original in zip(gpu, tensors):
+            target.copy_(original)
+        owner = codec.prepare_block_id_groups(groups, device=device, stream=stream)
+        copy(owner)
+        stream.synchronize()
+        return [target.cpu() for target in gpu]
+
+    staged = restore(
+        lambda owner: codec.chunk_major_device_buffer_to_gpu_prepared(
+            packed, owner, 0, stream=stream
+        )
+    )
+    strided = restore(
+        lambda owner: codec.chunk_major_strided_buffer_to_gpu_prepared(
+            run,
+            owner,
+            0,
+            stream=stream,
+            items_per_chunk=items_per_chunk,
+            chunk_stride_bytes=stride,
+        )
+    )
+    assert any(not torch.equal(a, b) for a, b in zip(staged, tensors))
+    assert all(torch.equal(a, b) for a, b in zip(strided, staged))

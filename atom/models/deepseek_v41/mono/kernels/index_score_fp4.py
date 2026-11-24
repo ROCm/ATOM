@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """K2a's indexer scores on the FP4 index plane: 8-row pages in the row-group
 layout (aiter ``pa_mqa_logits_fp4_rowgroup``, page 8), E2M1 keys with an E8M0
 per 32 dims, E2M1 queries with theirs. The logits and block maxima land where
@@ -8,6 +9,10 @@ selection trees are shared.
 
     kv  [pages, 4 (key % 4), 4 (K chunk), 2 (key // 4 % 2), 16 B]
     ks  [pages, 4 (K chunk), 8 (key)] E8M0
+
+With ``index_mfma``, keys/scales instead use OPUS 64-row groups, addressed
+from the same logical 8-row page IDs. The query and arithmetic stay the same.
+
     iq  [S, HEADS, DIM / 2] E2M1, iqs [S, 4 (K chunk), 16 (head % 16), 4
         (head // 16, padded)] E8M0, iw [S, HEADS] f32
 
@@ -36,10 +41,15 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, T, as_ir_value
 
 from atom.models.deepseek_v41.mono import index_plan as ip
+from atom.models.deepseek_v41.mono.kernels.index_query import (
+    await_queries,
+    step_queried,
+)
 from atom.mono.device.mx import FP4, mfma_scaled
 from atom.mono.device.ops import (
     CM_DEV,
     butterfly,
+    fresh,
     global_load,
     ld_i32,
     permlane_swap,
@@ -84,7 +94,7 @@ def _vop(asm, *args):
     )
 
 
-def _sload4(addr):
+def sload4(addr):
     """Four words at a wave-uniform address, a scalar load (the constant
     address space): the scalar cache's round trip, not the vector memory's."""
     ptr = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<4>"), as_ir_value(addr)).result
@@ -105,6 +115,13 @@ def _stage_args(c):
     """The kernel arguments this stage may read: ``STAGE_ARGS`` alone, so a
     read of any other fails while tracing rather than going unread up front."""
     return {name: c["args"][name] for name in STAGE_ARGS}
+
+
+def _lane_lg(tid):
+    """The lane's (l, g) = (lane % 16, lane // 16), each one instruction on the
+    thread id: LLVM recomputes it at a use instead of holding it, a VGPR the
+    walk needs, from the stage's start to its end (a spill at 256 VGPRs)."""
+    return tid & 15, (tid >> 4) & 3
 
 
 def _read_all(args):
@@ -142,6 +159,8 @@ def _stage_rows(c, lead, span, first_keys=None):
     its read. Reads, keys and stores in one branch (a store behind it let LLVM
     sink the reads past the keys)."""
     a, tid = _stage_args(c), c["tid"]
+    # the layer kernel: the rows' queries from this launch's K1
+    await_queries(c, lead, span, ip.WALK_ROWS)
     lds = c["sel_lds"]["keys"]
     q_units, qs_units = ip.HEADS * ip.DIM // 32, ip.HEADS * 2 // 4
     # (the branches' result: a value of its type first)
@@ -189,8 +208,8 @@ def _rows(c, rows):
     """The piece's first ``rows`` rows as a wave holds them, from LDS:
     (bound, query operands [mi], scale dword, half-weights [mi][e]) a row;
     rows past the span repeat its last and write nothing (bound 0)."""
-    lane, lds = c["lane"], c["sel_lds"]["keys"]
-    l, g = lane % 16, lane // 16
+    lds = c["sel_lds"]["keys"]
+    l, g = _lane_lg(c["tid"])
     v4 = fx.Vector.make_type(4, fx.Int32)
     out = []
     for r in range_constexpr(rows):
@@ -217,7 +236,7 @@ def _page(c, trow, st):
     """This lane's page of step st: keys 4 l .. 4 l + 3, off table row
     ``trow``, whose entries name 2 ** ishift pages each (a request's PAGE
     table; a REINDEX token's candidates, ishift 0)."""
-    a, l = _stage_args(c), c["lane"] % 16
+    a, l = _stage_args(c), _lane_lg(c["tid"])[0]
     shift = a["ishift"]
     blk = fx.min(st * (ip.STEP // PAGE) + l // 2, (a["itab_len"] << shift) - 1)
     entry = ld_i32(a["itab"], trow * a["itab_stride"] + (blk >> shift))
@@ -229,10 +248,27 @@ def _keys(c, page, nt):
     ``nt``: nontemporal, for keys no other wave reads (a piece's rows all on
     one wave) -- not a REINDEX row's candidate pages, its request's other
     rows' too."""
-    a, lane = _stage_args(c), c["lane"]
-    l, g = lane % 16, lane // 16
+    a = _stage_args(c)
+    l, g = _lane_lg(c["tid"])
     # 64-bit addresses: a pool past 4 GiB is out of a buffer offset's reach
     page = fx.Int64(page)
+    if const_expr(c["index_mfma"]):
+        # A logical page names eight rows inside a 64-row OPUS group.
+        # Keep this scorer's 16x16x128 operands and query layout: only the
+        # key/scale addresses change, preserving Mono's accumulation order.
+        group = page // 8
+        row = (page % 8) * 8 + fx.Int64((l % 2) * 4)
+        base = a["plane"] + group * 4096 + fx.Int64(g * 1024) + row * 16
+        kv = [fx.Vector(global_load(base + t * 16, 4, nt)) for t in range(4)]
+        scale_base = (
+            a["pscale"] + group * 256 + fx.Int64((g % 2) * 128) + (row % 32) * 4
+        )
+        byte = fx.Int32(g // 2 * 2) + fx.Int32(row // 32)
+        kvs = fx.Int32(0)
+        for t in range_constexpr(4):
+            word = fx.Int32(global_load(scale_base + t * 4))
+            kvs = kvs | (((word >> (byte * 8)) & 255) << (t * 8))
+        return kv, kvs
     kvs = fx.Int32(
         global_load(a["pscale"] + page * PAGE_SCALES + fx.Int64(g * 8 + (l % 2) * 4))
     )
@@ -255,8 +291,8 @@ def _first_keys(c, pages, nt):
 def _step(c, lead, rows, outs, kv, kvs, st, after_mfmas):
     """Step st's logits of every row (and block maxima on a candidate
     producer); ``after_mfmas`` once its keys are read."""
-    a, lane = _stage_args(c), c["lane"]
-    l, g = lane % 16, lane // 16
+    a = _stage_args(c)
+    l, g = _lane_lg(c["tid"])
     zero = fx.Vector.filled(4, 0.0, fx.Float32)
     per_tile = []
     for nt in range_constexpr(4):
@@ -318,8 +354,10 @@ def _block_maxima(c, lead, rows, totals, key, st):
     pair in the wave's two halves, a permlane16 swap two pairs in its four
     quarters -- then over l's low bit, 7 cross-lane ops for 6 rows (each
     row alone: 18)."""
-    a, lane = _stage_args(c), c["lane"]
-    l, g = lane % 16, lane // 16
+    a = _stage_args(c)
+    # afresh a step: the store's row term is invariant over the walk, and
+    # hoisted it is a VGPR held through every step
+    l, g = _lane_lg(fresh(c["tid"]))
     vals = []
     for r in range_constexpr(len(rows)):
         best = fx.Float32(fx.isnan(totals[r]).select(fx.Float32(NEG), totals[r]))
@@ -465,6 +503,39 @@ def stage_iscore4(c, lead, span, ch0, ch1, max_chunks, rows):
 
 
 @traced
+def await_new_keys(c, reached=None):
+    """A compressing layer kernel: this launch's new index keys in the plane
+    (every compress plan row's CRDY, a lane each; the compressor writes them
+    through) before a walk reads it. ``reached``: whether the walk's chunks
+    reach them (``new_keys_reached``; None: assumed)."""
+    fresh = c.get("cp_ratio")
+    if const_expr(fresh):
+        live = c["cp_ncap"] > 0
+        if const_expr(reached is not None):
+            live = live & reached
+        if live:
+            c["k1_poll"]([(c["crdy"], fx.min(c["lane"], c["cp_ncap"] - 1), 1)])
+
+
+def new_keys_reached(c, lead, span, ch1):
+    """Whether a FULL piece's walk up to chunk ``ch1`` reaches a column this
+    launch's compressor writes: a request's new entries start at its first
+    step position // ratio (``attention._selected_row``), at most S // ratio +
+    1 columns before the piece's largest bound (its rows ``lead`` .. ``lead +
+    span`` are one request's, within S positions of each other); 0 for a build
+    without a compressor. Read before the stage: tested inside it, the walk's
+    page addresses stayed live across the CRDY poll and spilled."""
+    ratio = c.get("cp_ratio")
+    if const_expr(not ratio):
+        return fx.Int32(0) > 0
+    bound = _stage_args(c)["ibound"]
+    top = ld_i32(bound, lead)
+    for r in range_constexpr(1, ip.WALK_ROWS):
+        top = fx.max(top, ld_i32(bound, lead + fx.min(fx.Int32(r), span - 1)))
+    return ch1 * ip.CHUNK > top - (c["S"] // ratio + 2)
+
+
+@traced
 def run_scores4(c, t0, n, bid, max_chunks):
     """The FP4 score stage over rows t0 .. t0 + n: this CTA's task, if any. A
     FULL layer's comes from the step's plan (``iplan``: (lead, span, ch0, ch1)
@@ -475,13 +546,19 @@ def run_scores4(c, t0, n, bid, max_chunks):
     _read_all(a.values())
     enter_stage("k2a.iscore")
     if a["ilift"] != 0:
+        # a step that scores no row writes no chunk (``ip.chunk_written``), and
+        # in the layer kernel its rows have no queries to wait for (K1's
+        # ``step_queried``): the same test, so no walk waits on them
         per = ip.reindex_split(n, BLOCKS, REINDEX_TASK_CHUNKS)
-        if bid < n * per:
+        if (bid < n * per) & step_queried(c):
             ch0, ch1 = ip.reindex_chunks(bid % per, per)
+            await_new_keys(c)
             stage_iscore4(c, t0 + bid // per, fx.Int32(1), ch0, ch1, max_chunks, 1)
     else:
-        task = _sload4(a["iplan"] + fx.Int64(bid) * 16)
+        task = sload4(a["iplan"] + fx.Int64(bid) * 16)
         if task[1] > 0:
+            # this launch's new keys only where the piece's chunks reach them
+            await_new_keys(c, new_keys_reached(c, task[0], task[1], task[3]))
             stage_iscore4(
                 c, task[0], task[1], task[2], task[3], max_chunks, ip.WALK_ROWS
             )

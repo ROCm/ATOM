@@ -6,16 +6,21 @@ import copy
 from types import SimpleNamespace
 
 import pytest
-
-pytest.importorskip("aiter", reason="needs AITER's MoE interfaces")
-
 import torch
+from aiter_stub import atom_without_aiter
 
-import atom.model_ops.fused_moe.moonep_mega_experts as mme
+
+@pytest.fixture(autouse=True)
+def _modules():
+    global mme, NARROW
+    with atom_without_aiter() as load:
+        mme = load("atom.model_ops.fused_moe.moonep_mega_experts")
+        NARROW = (WORLD * EPR, mme._MEGA_DECODE_MTPR)
+        yield
+
 
 EPR, B, WORLD = 48, 8, 8
 WIDE = (WORLD * (EPR + B), 4096)
-NARROW = (WORLD * EPR, mme._MEGA_DECODE_MTPR)
 
 
 class _FakePool:

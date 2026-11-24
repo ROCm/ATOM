@@ -22,6 +22,7 @@ import importlib.util
 import sys
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 pytest.importorskip("triton", reason="base_attention defines @triton.jit kernels")
@@ -35,6 +36,20 @@ pytest.importorskip("aiter", reason="base_attention imports the AITER runtime")
 import aiter as _aiter
 
 _FP8 = _aiter.dtypes.fp8
+
+
+@pytest.fixture(autouse=True)
+def _gluon_decode_present(monkeypatch):
+    """Most tests here describe gfx950, which has gluon decode: pinned so they
+    read the same on gfx1250. TestNoGluonFlyDSLRouting overrides it."""
+    from aiter.jit.utils import chip_info
+
+    from atom.model_ops import attention_mha as mha
+    from atom.model_ops import base_attention as ba
+
+    monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(ba, "pa_decode_gluon_supports_arch", lambda: True)
+    monkeypatch.setattr(mha, "pa_decode_gluon_supports_arch", lambda: True)
 
 
 def _fake_ctx(n):
@@ -307,6 +322,74 @@ def _route(monkeypatch, max_qlen, block_size=128, unified=False, force=False, **
         lambda: SimpleNamespace(kv_cache_block_size=block_size),
     )
     return mha.PagedAttentionImpl._dispatch_decode(_Layer(**kw), max_qlen)
+
+
+class TestRaggedQueries:
+    """Which decode kernels read each sequence's query rows off `cu_seqlens_q`
+    (ragged decode safe), measured against varlen references on gfx950:
+    `pa_fwd_asm` and unified do; `run_pa_decode` takes `max_qlen` only and the
+    persistent PA kernels lay sequences `max_qlen` rows apart."""
+
+    @staticmethod
+    def _reads_ragged(monkeypatch, max_qlen, **kw):
+        from atom.model_ops import attention_mha as mha
+
+        flags = {k: kw.pop(k) for k in ("block_size", "unified", "force") if k in kw}
+        _route(monkeypatch, max_qlen, **flags, **kw)
+        layer = _Layer(**kw)
+        layer._dispatch_decode = lambda q: mha.PagedAttentionImpl._dispatch_decode(
+            layer, q
+        )
+        layer._flydsl_may_take_decode = (
+            lambda: mha.PagedAttentionImpl._flydsl_may_take_decode(layer)
+        )
+        return mha.PagedAttentionImpl.decode_reads_ragged_queries(layer, max_qlen)
+
+    def test_asm_reads_ragged_queries(self, monkeypatch):
+        assert self._reads_ragged(monkeypatch, 1)
+
+    def test_run_pa_decode_does_not(self, monkeypatch):
+        assert not self._reads_ragged(monkeypatch, 4)
+        assert not self._reads_ragged(monkeypatch, 1, use_triton_attn=True)
+
+    def test_unified_reads_ragged_queries(self, monkeypatch):
+        assert self._reads_ragged(monkeypatch, 5)
+
+    def test_persistent_pa_does_not(self, monkeypatch):
+        assert not self._reads_ragged(monkeypatch, 1, block_size=256, unified=True)
+
+    @pytest.mark.parametrize("rectangular", [False, True])
+    def test_a_ragged_step_is_refused_only_with_a_rectangular_layer(self, rectangular):
+        from atom.model_ops import attention_mha as mha
+        from atom.model_ops.attentions import aiter_attention as aa
+
+        def impl(reads_ragged):
+            cls = type(
+                "Impl",
+                (mha.PagedAttentionImpl,),
+                {"decode_reads_ragged_queries": lambda self, q: reads_ragged},
+            )
+            return cls.__new__(cls)
+
+        sfc = {
+            "layers.0.attn": SimpleNamespace(impl=impl(True)),
+            "layers.1.attn": SimpleNamespace(impl=impl(not rectangular)),
+            "layers.1.mlp": SimpleNamespace(),
+        }
+        builder = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                config=SimpleNamespace(
+                    compilation_config=SimpleNamespace(static_forward_context=sfc)
+                )
+            )
+        )
+        refuse = aa.AiterAttentionMetadataBuilder._refuse_ragged_on_rectangular_layers
+        lengths = np.array([2, 1], dtype=np.int32)
+        if rectangular:
+            with pytest.raises(ValueError, match=r"layers\.1\.attn .*one query length"):
+                refuse(builder, lengths, 2)
+        else:
+            refuse(builder, lengths, 2)
 
 
 class TestDecodeRouting:
@@ -617,6 +700,14 @@ class TestWorkPlanWiring:
                 _FakePlan(capacity=1024), 4, 16, 128, torch.bfloat16, dev
             )
             assert big[0].shape[1] == 1024
+
+            global_keys = set(_FLYDSL_PLAN_SCRATCH)
+            step = SimpleNamespace()
+            _flydsl_plan_scratch(
+                _FakePlan(capacity=512), 4, 16, 128, torch.bfloat16, dev, step
+            )
+            assert len(step._flydsl_plan_scratch) == 1
+            assert set(_FLYDSL_PLAN_SCRATCH) == global_keys
         finally:
             # The cache is a module global with no eviction; leaving ~25 MB of
             # live CUDA buffers behind would charge every later test for it.
@@ -815,7 +906,7 @@ class TestWorkPlanWiring:
         guard in the op rebuilds a compatible explicit plan, so the defect
         would come back as extra planner work instead of a crash.
 
-        AST rather than behaviour, because ``prepare_decode`` needs a model
+        AST rather than behaviour, because ``finish_decode`` needs a model
         runner to drive. It is exact about the one thing that went wrong -- the
         expression handed to ``refresh_flydsl_plan`` -- and goes red on any
         slice at the two target sites, or on a draft slice that stops naming
@@ -857,7 +948,7 @@ class TestWorkPlanWiring:
         assert creates.get(
             "build_for_cudagraph_capture"
         ), "capture must pass create=; without it no plan is ever minted"
-        assert not creates.get("prepare_decode"), (
+        assert not creates.get("finish_decode"), (
             "replay must not mint plans: that is a mid-serving kernel "
             "specialization for a batch no graph replays"
         )
@@ -865,7 +956,7 @@ class TestWorkPlanWiring:
 
         # Target passes: the whole buffer, which is already running_bs long
         # with the padded tail zeroed. A zero-length row gets no work.
-        for name in ("prepare_decode", "build_for_cudagraph_capture"):
+        for name in ("finish_decode", "build_for_cudagraph_capture"):
             assert name in args, f"{name} no longer builds a plan"
             for arg in args[name]:
                 assert isinstance(arg, ast.Attribute) and arg.attr == "context_lens", (
@@ -906,7 +997,8 @@ class TestWorkPlanWiring:
         monkeypatch.delenv("ATOM_PA_FLYDSL", raising=False)
         assert envs.ATOM_PA_FLYDSL is False, "FlyDSL must be opt-in"
 
-        src = inspect.getsource(ba.run_pa_decode)
+        assert "flydsl_decode_seqs(" in inspect.getsource(ba.run_pa_decode)
+        src = inspect.getsource(ba.flydsl_decode_seqs)
         assert (
             "flydsl_seqs = envs.ATOM_PA_FLYDSL and _flydsl_pa_decode_num_seqs" in src
         ), "the env gate is gone, or no longer short-circuits the capability check"
@@ -1025,7 +1117,17 @@ class TestExplicitPlan:
         )
         return ba, built
 
-    def _call(self, ba, owner=None, existing_plan=None, cap=8, head_dim=128):
+    def _call(
+        self,
+        ba,
+        owner=None,
+        cache_owner=None,
+        existing_plan=None,
+        cap=8,
+        head_dim=128,
+        segment=0,
+        budget=None,
+    ):
         import torch
 
         n = 16
@@ -1039,7 +1141,24 @@ class TestExplicitPlan:
             context_bound=2048,
             existing_plan=existing_plan,
             plan_step_owner=owner,
+            plan_cache_owner=cache_owner,
+            plan_segment=segment,
+            plan_workgroup_budget=budget,
         )
+
+    def test_segments_of_one_call_keep_their_own_plans(self, monkeypatch):
+        """Equal-size slices of one call's rows must not share a plan: each is
+        refreshed from its own lengths (MXFP4 sparse decode runs more rows than
+        one plan takes in segments)."""
+        ba, built = self._setup(monkeypatch)
+        step = SimpleNamespace()
+        first = self._call(ba, owner=step, segment=0)
+        second = self._call(ba, owner=step, segment=1)
+        assert first is not second and len(built) == 2
+        # a later layer of the same step finds each segment's own plan
+        assert self._call(ba, owner=step, segment=0) is first
+        assert self._call(ba, owner=step, segment=1) is second
+        assert len(built) == 2
 
     def test_default_budget_needs_no_tuning_module(self, monkeypatch):
         """#5809 ships no tuned budgets and its old tuner module is gone."""
@@ -1058,13 +1177,17 @@ class TestExplicitPlan:
         """All sparse layers of one step share lengths, so one refresh serves 57."""
         ba, _ = self._setup(monkeypatch)
         step = SimpleNamespace()
-        plans = [self._call(ba, owner=step) for _ in range(57)]
+        plans = [self._call(ba, owner=step, cache_owner=step) for _ in range(57)]
         assert all(p is plans[0] for p in plans)
         assert plans[0].refreshed == 0, "only the build may fill it in this step"
-        step = SimpleNamespace()  # next step: the builder makes new metadata
-        self._call(ba, owner=step)
-        self._call(ba, owner=step)
-        assert plans[0].refreshed == 1, "a new step must refresh exactly once"
+        next_step = SimpleNamespace()
+        assert self._call(ba, owner=next_step, cache_owner=next_step) is not plans[0]
+        assert ba._FLYDSL_RUNTIME_PLANS == {}, "step plans must not become process-wide"
+
+        changing = SimpleNamespace()
+        plan = self._call(ba, cache_owner=changing)
+        assert self._call(ba, cache_owner=changing) is plan
+        assert plan.refreshed == 1, "unshared layer lengths must refresh every call"
 
     def test_the_forward_context_is_not_the_step(self, monkeypatch):
         """The vLLM plugin never sets ATOM's ForwardContext for this model.
@@ -1077,10 +1200,10 @@ class TestExplicitPlan:
         ba, _ = self._setup(monkeypatch)
         stale = SimpleNamespace()
         monkeypatch.setattr(fc, "get_forward_context", lambda: stale)
-        plan = self._call(ba, owner=SimpleNamespace())
-        self._call(ba, owner=SimpleNamespace())
-        self._call(ba, owner=SimpleNamespace())
-        assert plan.refreshed == 2, "each step's metadata must refresh once"
+        steps = [SimpleNamespace() for _ in range(3)]
+        plans = [self._call(ba, owner=s, cache_owner=s) for s in steps]
+        assert len({id(plan) for plan in plans}) == 3
+        assert ba._FLYDSL_RUNTIME_PLANS == {}
 
     def test_capture_records_its_own_refresh(self, monkeypatch):
         """Warmup and capture share one metadata object and stream.
@@ -1091,6 +1214,8 @@ class TestExplicitPlan:
         ba, _ = self._setup(monkeypatch)
         step = SimpleNamespace()
         plan = self._call(ba, owner=step)  # warmup: builds it
+        assert not hasattr(step, "_flydsl_runtime_plans")
+        assert plan in ba._FLYDSL_RUNTIME_PLANS.values()
         self._call(ba, owner=step)
         assert plan.refreshed == 0
         self.capturing = True  # capture forward, same metadata
@@ -1130,18 +1255,34 @@ class TestExplicitPlan:
         assert capped is not uncapped
         assert [kw.get("workgroup_budget") for kw in built] == [256, None], built
 
+    def test_a_caller_budget_is_the_plans(self, monkeypatch):
+        """A caller's budget replaces aiter's (the sparse PA writing FP8 passes one)."""
+        ba, built = self._setup(monkeypatch)
+        self._call(ba, cap=8, budget=128, head_dim=256)
+        assert built[-1] == {
+            "max_partitions": 8,
+            "query_length": 1,
+            "workgroup_budget": 128,
+        }, built[-1]
+
     @staticmethod
-    def _call_kwargs(relpath, func):
-        """Keyword arguments of every call to ``func`` in an atom source file."""
+    def _call_kwargs(relpath, func, within=None):
+        """Keyword arguments of every call to ``func`` in an atom source file,
+        or only in its functions named ``within``."""
         import ast
         import pathlib
 
         import atom
 
-        src = (pathlib.Path(atom.__file__).parent / relpath).read_text()
+        tree = ast.parse((pathlib.Path(atom.__file__).parent / relpath).read_text())
+        roots = [tree] if within is None else [
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == within
+        ]  # fmt: skip
         calls = [
             {k.arg: k.value for k in node.keywords}
-            for node in ast.walk(ast.parse(src))
+            for root in roots
+            for node in ast.walk(root)
             if isinstance(node, ast.Call)
             and (getattr(node.func, "id", None) or getattr(node.func, "attr", None))
             == func
@@ -1167,21 +1308,36 @@ class TestExplicitPlan:
                     "max_context_partition_num"
                 ), f"{relpath}: plan cap is not the static split count"
 
+    def test_callers_leave_gluon_scratch_to_aiter(self):
+        """No caller keeps its own copy of the kernel's scratch shapes."""
+        scratch = {"exp_sums", "max_logits", "temporary_output"}
+        for relpath in (
+            "model_ops/attention_mha.py",
+            "model_ops/minimax_m3/sparse_attn.py",
+            "plugin/vllm/attention/layer_mha.py",
+            "plugin/sglang/attention_backend/full_attention/full_attention_backend.py",
+        ):
+            for kw in self._call_kwargs(relpath, "run_pa_decode"):
+                assert not scratch & kw.keys(), relpath
+
     def test_both_sparse_decode_sites_scope_refresh_to_the_step(self):
         """Native and vLLM must hand their per-step decode metadata down.
 
         Checks the argument only. That ``decode_md`` is built fresh every step
         is the builders' doing: ``make_sparse_decode_metadata`` from
-        ``AiterAttentionMetadataBuilder.prepare_decode`` (native) and
+        ``AiterAttentionMetadataBuilder.finish_decode`` (native) and
         ``MinimaxM3SparseAttentionMetadataBuilder.build`` (vLLM).
         """
         import ast
 
-        for relpath in (
-            "model_ops/attention_mha.py",
-            "plugin/vllm/attention/minimax_m3_attnetion.py",
+        decode = "minimax_m3_sparse_attn_decode_asm"
+        for relpath, func, within in (
+            ("model_ops/attention_mha.py", decode, None),
+            ("plugin/vllm/attention/minimax_m3_attnetion.py", decode, None),
+            # the FP8 output's PA, in the same scope
+            ("model_ops/attention_mha.py", "sparse_pa_fp8_per_row", "_sparse_decode"),
         ):
-            for kw in self._call_kwargs(relpath, "minimax_m3_sparse_attn_decode_asm"):
+            for kw in self._call_kwargs(relpath, func, within):
                 owner = kw.get("plan_step_owner")
                 # `decode_md if self.local_blocks >= 1 else None`: once per
                 # step only while the tail block is forced.
@@ -1189,6 +1345,27 @@ class TestExplicitPlan:
                 assert getattr(owner.body, "id", None) == "decode_md", relpath
                 assert getattr(owner.orelse, "value", 0) is None, relpath
                 assert "local_blocks" in ast.unparse(owner.test), relpath
+                assert "plan_cache_owner" not in kw, relpath
+
+    def test_sparse_prefill_sites_scope_plan_to_their_metadata(self):
+        """Variable prefill rows must not enter the process-wide plan cache."""
+        import ast
+
+        prefill = "minimax_m3_sparse_attn_prefill_asm"
+        for relpath, func, within in (
+            ("model_ops/attention_mha.py", prefill, None),
+            ("plugin/vllm/attention/minimax_m3_attnetion.py", prefill, None),
+            # the FP8 output's PA, in the same scope
+            ("model_ops/attention_mha.py", "sparse_pa_fp8_per_row", "_sparse_prefill"),
+        ):
+            calls = self._call_kwargs(relpath, func, within)
+            assert len(calls) == 1
+            owner = calls[0].get("plan_step_owner")
+            assert isinstance(owner, ast.IfExp), f"{relpath}: {owner}"
+            assert getattr(owner.body, "id", None) == "prefill_md", relpath
+            assert getattr(owner.orelse, "value", 0) is None, relpath
+            assert "local_blocks" in ast.unparse(owner.test), relpath
+            assert getattr(calls[0].get("plan_cache_owner"), "id", None) == "prefill_md"
 
     def test_tbo_ubatches_do_not_share_a_step_plan(self, monkeypatch):
         """TBO ubatches share one compute stream; each needs its own plan."""
@@ -1197,34 +1374,13 @@ class TestExplicitPlan:
         ba, _ = self._setup(monkeypatch)
         ubatch = [0]
         monkeypatch.setattr(ubatching, "tbo_current_ubatch_id", lambda: ubatch[0])
-        ub0 = self._call(ba, owner=SimpleNamespace())
+        step = SimpleNamespace()
+        ub0 = self._call(ba, owner=step, cache_owner=step)
         ubatch[0] = 1
-        ub1 = self._call(ba, owner=SimpleNamespace())
+        ub1 = self._call(ba, owner=step, cache_owner=step)
         assert ub1 is not ub0, "ub1 would overwrite ub0's lengths mid-step"
         ubatch[0] = 0
-        assert self._call(ba, owner=SimpleNamespace()) is ub0
-
-    def test_old_aiter_api_takes_gluon(self, monkeypatch):
-        """An aiter without #5809's required work plan must not be routed."""
-        from atom.model_ops import base_attention as ba
-
-        mod = importlib.import_module("aiter.ops.flydsl.pa_decode")
-
-        def optional_plan(output, *a, work_plan=None, max_context_length=None):
-            raise AssertionError("not called")
-
-        def no_bound(output, *a, work_plan, sinks=None):
-            raise AssertionError("not called")
-
-        try:
-            for old in (optional_plan, no_bound):
-                monkeypatch.setattr(mod, "pa_decode", old)
-                ba._flydsl_explicit_plan_api.cache_clear()
-                assert ba._flydsl_explicit_plan_api() is False, old.__name__
-        finally:
-            monkeypatch.undo()
-            ba._flydsl_explicit_plan_api.cache_clear()
-        assert ba._flydsl_explicit_plan_api() is True
+        assert self._call(ba, owner=step, cache_owner=step) is ub0
 
     def test_dense_site_leaves_the_bound_to_the_block_table(self):
         """max_seqlen_k differs between graph and eager and picks the kernel."""
@@ -1248,6 +1404,45 @@ class TestExplicitPlan:
         assert plans[0].refreshed == 2
 
 
+class TestGluonScratch:
+    """Leaving scratch to aiter covers every gluon caller, FlyDSL or not."""
+
+    def test_omitted_scratch_is_left_to_gluon(self, monkeypatch):
+        """pa_decode_gluon sizes its own scratch from the query it is given."""
+        import torch
+
+        from atom.model_ops import base_attention as ba
+
+        monkeypatch.setattr(ba.envs, "ATOM_PA_FLYDSL", False)
+        seen = {}
+
+        def record(*args, **kwargs):
+            seen.update(kwargs)
+
+        monkeypatch.setattr(torch.ops.aiter, "pa_decode_gluon", record)
+        meta = lambda *shape, dtype=torch.bfloat16: torch.empty(
+            shape, dtype=dtype, device="meta"
+        )
+        ba.run_pa_decode(
+            output=meta(8, 16, 128),
+            q=meta(8, 16, 128),
+            k_cache=meta(8, 2, 8, 16, 16),
+            v_cache=meta(8, 2, 1, 128, 16),
+            context_lens=meta(8, dtype=torch.int32),
+            block_tables=meta(8, 8, dtype=torch.int32),
+            softmax_scale=1.0,
+            max_seqlen_q=2,
+            max_context_partition_num=4,
+            context_partition_size=256,
+            compute_type=torch.bfloat16,
+            q_scale=None,
+            k_scale=None,
+            v_scale=None,
+        )
+        scratch = ("exp_sums", "max_logits", "temporary_output")
+        assert all(seen[name] is None for name in scratch), seen
+
+
 @pytest.mark.skipif(not _HAS_FLYDSL_PA, reason="needs aiter FlyDSL pa_decode")
 class TestPlanBatchLimit:
     """aiter's planner rejects more than 4096 rows and every FlyDSL call now
@@ -1260,6 +1455,8 @@ class TestPlanBatchLimit:
         from atom.model_ops import base_attention as ba
 
         n = ba._FLYDSL_PLAN_MAX_BATCH + 1
+        # The real cap reads the device's LDS.
+        monkeypatch.setattr(ba, "_flydsl_plan_max_batch", lambda: n - 1)
         monkeypatch.setattr(ba.envs, "ATOM_PA_FLYDSL", True)
         monkeypatch.setattr(ba, "_flydsl_pa_decode_num_seqs", lambda **kw: n)
 
@@ -1718,6 +1915,7 @@ class TestFlyDSLConstantsMatchAiter:
         from atom.model_ops.base_attention import (
             _FLYDSL_PA_TILE,
             _FLYDSL_PLAN_MAX_BATCH,
+            _FLYDSL_PLAN_SCAN_LDS_BYTES,
         )
 
         src = self._aiter_src("ops/flydsl/pa_decode.py")
@@ -1728,3 +1926,196 @@ class TestFlyDSLConstantsMatchAiter:
         assert (
             str(_FLYDSL_PLAN_MAX_BATCH) in plan_src
         ), "aiter's planner batch cap moved"
+        assert (
+            f"_PLAN_SCAN_LDS_BYTES = {_FLYDSL_PLAN_SCAN_LDS_BYTES}" in plan_src
+        ), "aiter's planner scan storage moved"
+
+
+class TestNoGluonFlyDSLRouting:
+    """gfx1250 has no gluon decode: with ATOM_PA_FLYDSL=1 FlyDSL is its paged
+    kernel, and a dense call FlyDSL refuses stays on unified."""
+
+    @staticmethod
+    def _no_gluon(monkeypatch):
+        from aiter.jit.utils import chip_info
+
+        from atom.model_ops import attention_mha as mha
+        from atom.model_ops import base_attention as ba
+
+        monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx1250")
+        monkeypatch.setattr(ba, "pa_decode_gluon_supports_arch", lambda: False)
+        monkeypatch.setattr(mha, "pa_decode_gluon_supports_arch", lambda: False)
+        monkeypatch.setattr(ba.envs, "ATOM_PA_FLYDSL", False)
+        return mha, ba
+
+    @staticmethod
+    def _meta(*shape):
+        import torch
+
+        return torch.empty(shape, device="meta")
+
+    @pytest.mark.parametrize(
+        "env, seqs, match",
+        [(False, False, "set ATOM_PA_FLYDSL=1"), (True, None, "no gluon fallback")],
+    )
+    def test_no_gluon_fallback_raises_instead(self, monkeypatch, env, seqs, match):
+        import torch
+
+        _mha, ba = self._no_gluon(monkeypatch)
+        monkeypatch.setattr(ba.envs, "ATOM_PA_FLYDSL", env)
+        monkeypatch.setattr(ba, "flydsl_decode_seqs", lambda **kw: seqs)
+        m = self._meta
+        with pytest.raises(RuntimeError, match=match):
+            ba.run_pa_decode(
+                *(m(4, 16, 128), m(4, 16, 128), m(8, 1, 8, 16, 16)),
+                *(m(8, 1, 128, 16), m(4), m(4, 8), 1.0, 1, 8, 256),
+                *(torch.bfloat16, None, None, None),
+                exp_sums=None,
+                max_logits=None,
+                temporary_output=None,
+            )
+
+    def test_dense_decode_without_gluon_takes_the_unified_arm(self, monkeypatch):
+        self._no_gluon(monkeypatch)
+        assert _route(monkeypatch, 1) == "paged_attention_unified"
+        assert _route(monkeypatch, 4) == "paged_attention_unified"
+
+    @pytest.mark.parametrize(
+        "env, accepts, error",
+        [
+            (True, True, None),
+            (False, False, "set ATOM_PA_FLYDSL=1"),
+            (True, False, "did not take this call"),
+        ],
+    )
+    def test_unified_arm_reports_no_gluon_route(self, monkeypatch, env, accepts, error):
+        mha, _ba = self._no_gluon(monkeypatch)
+        monkeypatch.setattr(mha.envs, "ATOM_PA_FLYDSL", env)
+        monkeypatch.setattr(
+            mha, "flydsl_decode_seqs", lambda **kw: 4 if accepts else None
+        )
+        monkeypatch.setattr(mha, "dense_decode_splits", lambda n, h: 8)
+        layer = mha.PagedAttentionImpl.__new__(mha.PagedAttentionImpl)
+        layer.sliding_window, layer.kv_cache_dtype, layer.sinks = -1, "fp8", None
+        layer.layer_num = 0
+        layer.paged_attention_triton = lambda *a: "flydsl"
+        m = self._meta
+        md = SimpleNamespace(context_lens=m(4), block_tables=m(4, 8), max_seqlen_q=1)
+        call = lambda: mha.PagedAttentionImpl.paged_attention_unified(
+            layer,
+            m(4, 16, 128),
+            None,
+            None,
+            m(8, 1, 8, 128, 16),
+            m(8, 1, 128, 128),
+            m(8, 1, 128),
+            m(8, 1, 128),
+            SimpleNamespace(attn_metadata=md),
+        )
+        if error is None:
+            assert call() == "flydsl"
+        else:
+            # Per-token FP8 scales on unified attention: refused, not wrong.
+            with pytest.raises(NotImplementedError, match=error):
+                call()
+
+    def test_use_unified_attn_keeps_decode_off_flydsl(self, monkeypatch):
+        mha, _ba = self._no_gluon(monkeypatch)
+        monkeypatch.setattr(mha.envs, "ATOM_USE_UNIFIED_ATTN", True)
+        monkeypatch.setattr(mha, "flydsl_decode_seqs", lambda **kw: 4)
+        layer = mha.PagedAttentionImpl.__new__(mha.PagedAttentionImpl)
+        layer.sliding_window = -1
+        assert not layer._flydsl_takes_decode(None, None, None, None)
+
+    @pytest.mark.parametrize("arch", ["gfx942", "gfx950"])
+    def test_plan_cap_stays_4096_off_gfx1250(self, monkeypatch, arch):
+        """Only gfx1250, without gluon for sparse decode, raises aiter's cap."""
+        from aiter.jit.utils import chip_info
+
+        from atom.model_ops import base_attention as ba
+
+        monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: arch)
+        ba._flydsl_plan_max_batch.cache_clear()
+        try:
+            assert ba._flydsl_plan_max_batch() == ba._FLYDSL_PLAN_MAX_BATCH
+        finally:
+            ba._flydsl_plan_max_batch.cache_clear()
+
+    def test_plan_cap_follows_lds_on_gfx1250(self, monkeypatch):
+        """320 KiB of LDS per block: (327680 - 512) // 16 * 16 // 4 = 81792."""
+        from aiter.jit.utils import chip_info
+
+        from atom.model_ops import base_attention as ba
+
+        monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx1250")
+        monkeypatch.setattr(ba.torch.cuda, "current_device", lambda: 0)
+        monkeypatch.setattr(
+            ba.torch.cuda,
+            "get_device_properties",
+            lambda d: SimpleNamespace(shared_memory_per_block=327680),
+        )
+        ba._flydsl_plan_max_batch.cache_clear()
+        try:
+            assert ba._flydsl_plan_max_batch() == 81792
+        finally:
+            ba._flydsl_plan_max_batch.cache_clear()
+
+    @pytest.mark.parametrize("gluon", [True, False])
+    def test_v_cache_goes_to_flydsl_as_its_5d_shuffle_view(self, monkeypatch, gluon):
+        """A 4D V reads as the plain layout on gfx1250, a silent wrong answer."""
+        mha, _ba = self._no_gluon(monkeypatch)
+        monkeypatch.setattr(mha, "pa_decode_gluon_supports_arch", lambda: gluon)
+        layer = mha.PagedAttentionImpl.__new__(mha.PagedAttentionImpl)
+        v = self._meta(8, 1, 128, 128)
+        out = layer._shuffle_v_for_flydsl(v, self._meta(8, 1, 8, 128, 16))
+        assert out.shape == ((8, 1, 128, 128) if gluon else (8, 1, 8, 128, 16))
+
+    def test_sparse_rows_skip_asm_without_its_kernels(self, monkeypatch):
+        from atom.model_ops.minimax_m3 import sparse_attn
+
+        monkeypatch.setattr(sparse_attn, "pa_fwd_asm_supports_arch", lambda: False)
+        m = self._meta
+        assert not sparse_attn._sparse_pa_ran_on_asm(
+            m(4096, 16, 128),
+            m(8, 1, 8, 16, 16),
+            m(8, 1, 1, 128, 16),
+            m(4096, 128),
+            m(4096),
+            m(8, 1, 16),
+            m(8, 1, 16),
+            m(4096, 16, 128),
+        )
+
+
+@pytest.mark.parametrize("num_seqs", [4096, 4097])
+def test_plans_past_4096_set_max_batch_size(monkeypatch, num_seqs):
+    """A refresh keeps max_batch_size, so a plan past 4096 must set it: sparse
+    prefill folds one row per token, up to --max-num-batched-tokens."""
+    import aiter.ops.flydsl.pa_decode as fly
+
+    from atom.model_ops import base_attention as ba
+
+    seen = {}
+
+    def plan_pa_decode(lengths, num_kv_heads, **kw):
+        seen.update(kw)
+        return SimpleNamespace(max_partitions=1, capacity=1)
+
+    monkeypatch.setattr(fly, "plan_pa_decode", plan_pa_decode)
+    monkeypatch.setattr(ba, "_FLYDSL_RUNTIME_PLANS", {})
+    monkeypatch.setattr(
+        ba.torch.cuda,
+        "current_stream",
+        lambda device=None: SimpleNamespace(cuda_stream=0),
+    )
+    ba._flydsl_prepare_explicit_plan(
+        q=SimpleNamespace(device=SimpleNamespace(index=0), shape=(1, 16, 128)),
+        k_cache=SimpleNamespace(shape=(1, 1)),
+        context_lens=list(range(num_seqs)),
+        num_seqs=num_seqs,
+        query_length=1,
+        plan_partition_cap=None,
+        context_bound=2048,
+        existing_plan=None,
+    )
+    assert seen.get("max_batch_size") == (num_seqs if num_seqs > 4096 else None)

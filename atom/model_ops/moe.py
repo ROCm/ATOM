@@ -6,7 +6,7 @@ from abc import abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from functools import lru_cache
+from functools import cache, lru_cache
 
 import torch
 from aiter import ActivationType, QuantType, dtypes, get_hip_quant, topk_gating
@@ -20,6 +20,7 @@ from aiter.ops.shuffle import (
     moe_shuffle_scale,
     moe_shuffle_weight,
 )
+from aiter.ops.topk import _FLYDSL_HERD_MAX_M, _FLYDSL_HERD_MIN_M, _FLYDSL_USE_HERD
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -28,10 +29,12 @@ from atom.config import (
     QuantizationConfig,
     get_current_atom_config,
 )
+from atom.distributed.comm_utils import gather_rows
 from atom.distributed.pcp_utils import (
     pcp_all_reduce,
     pcp_reduce_scatter,
 )
+from atom.distributed.ulysses_sp import sp_is_enabled
 from atom.model_loader.weight_utils import set_weight_attrs
 from atom.model_ops.base_config import QuantizeMethodBase
 from atom.model_ops.eplb import (
@@ -63,15 +66,15 @@ from atom.model_ops.fused_moe.modular_kernel import (
 )
 from atom.model_ops.fused_moe.mori_prepare_finalize import (
     MoriPrepareAndFinalize,
+    use_mori_low_latency,
 )
-from atom.model_ops.fused_moe.mxfp8_shared_into_mxfp4 import Mxfp8SharedIntoMxfp4
 from atom.model_ops.fused_moe.routed_rows import (
     RoutedRowsWire,
-    gather_rows,
     pack_routed_rows,
     resolve_routed_rows_wire,
 )
 from atom.model_ops.fused_moe.shared_expert_dispatch import remap_topk_to_dispatch
+from atom.model_ops.fused_moe.shared_expert_staging import SharedExpertStaging
 from atom.model_ops.topK import (
     init_aiter_topK_meta_data,
     is_rocm_aiter_fuse_routed_scaling_factor,
@@ -94,6 +97,7 @@ from atom.quant_spec import (
     NVFP4_GROUP_SIZE,
     LayerQuantConfig,
     fuses_mxfp8_shared_into_mxfp4,
+    fuses_ptpc_shared_into_online_ptpc,
     should_skip_online_quant,
     should_stream_online_quant,
     validate_nvfp4_global_scales,
@@ -109,16 +113,10 @@ from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import get_forward_context, pass_scheduled_tokens_gpu
-from atom.utils.tbo.ubatching import (
-    tbo_active,
-    tbo_enabled,
-    tbo_switch_to_compute_sync,
-    tbo_yield_and_switch_from_compute_to_comm,
-)
+from atom.utils.tbo.ubatch_splitting import NUM_TBO_UBATCHES
+from atom.utils.tbo.ubatching import tbo_enabled, tbo_on_comm
 
 logger = logging.getLogger("atom")
-
-_NUM_TBO_UBATCHES = 2
 
 
 class MoEActivationQuant(Enum):
@@ -236,8 +234,16 @@ class FusedMoEParallelConfig:
     pcp_merge: bool = False
 
     @property
+    def exchanges_tokens(self) -> bool:
+        """Whether routed tokens actually cross ranks: expert parallelism over
+        more than one real DP rank. TP-only EP (one DP rank) reduces instead,
+        and simulated DP (``dp_logical_ratio`` > 1) has a finer expert map than
+        the launched process group, so neither exchanges tokens."""
+        return self.use_ep and self.dp_size > 1 and self.dp_logical_ratio == 1
+
+    @property
     def selected_all2all_backend(self) -> str | None:
-        if self.dp_size <= 1 or not self.use_ep or self.dp_logical_ratio != 1:
+        if not self.exchanges_tokens:
             return None
         if self.requested_all2all_backend == "none":
             return None
@@ -320,12 +326,10 @@ class FusedMoEParallelConfig:
             get_prefill_context_model_parallel_world_size,
         )
 
-        pcp_merge = (
-            envs.ATOM_PCP_MOE_MERGE
-            and get_prefill_context_model_parallel_world_size() > 1
-        )
+        pcp_size = get_prefill_context_model_parallel_world_size()
+        # SP always folds its group, which shares the PCP rank dimension.
+        pcp_merge = pcp_size > 1 and (envs.ATOM_PCP_MOE_MERGE or sp_is_enabled())
         if pcp_merge:
-            pcp_size = get_prefill_context_model_parallel_world_size()
             pcp_rank = get_prefill_context_model_parallel_rank()
             tp_rank = pcp_rank * tp_size + tp_rank
             tp_size = pcp_size * tp_size
@@ -474,10 +478,10 @@ def dp_gather_routed_rows(
     """
     if dp_eager_mode:
         sizes = ctx.dp_metadata.get_sizes_across_dp()
-        # Eager means nothing was padded, so the context's two heights agree
-        # and either is the row count to unpad back to. Taken from the context
-        # rather than the tensor for the reason `pad_for_all_gather` gives.
-        local_tokens = ctx.context.scheduled_tokens
+        # The rows this rank runs, which its entry in `sizes` counts. Taken
+        # from the context rather than the tensor for the reason
+        # `pad_for_all_gather` gives.
+        local_tokens = ctx.context.running_tokens
         assert rows[0].shape[0] == local_tokens, (
             f"MoE was handed {rows[0].shape[0]} rows on an eager step "
             f"expecting {local_tokens}"
@@ -523,13 +527,13 @@ def _select_logical(
         num_fused_shared_experts=num_fused_shared_experts,
         fused_shared_experts_scoring_func=layer.shared_expert_scoring_func,
         routed_scaling_factor=layer.routed_scaling_factor,
-        # TODO: a -1 route faults the TP a16w4 MoE; until that consumer is
-        # found, pure TP routes and runs its pad rows like real ones.
-        mask_pad_rows=layer.use_ep,
     )
 
 
 class FusedMoEMethodBase(QuantizeMethodBase):
+    # Set by a method that fixes OCP E4M3 bytes up to E4M3FNUZ after loading.
+    need_normalize_e4m3fn_to_e4m3fnuz: bool = False
+
     def __init__(self, moe: FusedMoEConfig):
         super().__init__()
         self.moe = moe
@@ -645,23 +649,25 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 ),
             )
 
+        # gfx1250: MegaMoE over mori's cco instead of the gfx942/950-only v1
+        # kernels. Gated by ATOM_MORI_V2, and decided before anything reads
+        # .all2all_manager, which would pin the default (v1) manager.
+        if moe.use_mori_kernels and envs.ATOM_MORI_V2:
+            from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
+                make_mori_v2_prepare_finalize,
+            )
+
+            return make_mori_v2_prepare_finalize(
+                moe,
+                ep_group.device_communicator.get_or_create_all2all_manager("mori_v2"),
+            )
+
         all2all_manager = ep_group.device_communicator.all2all_manager
         assert all2all_manager is not None
 
         # TODO: could allow this now
         # assert not moe.use_flashinfer_cutlass_kernels, "Must be created in modelopt.py"
         if moe.use_mori_kernels:
-            from atom.utils import envs as _atom_envs
-
-            # gfx1250: use mori dispatch_combine_v2 (cco/FlyDSL) instead of the
-            # gfx942/950-only v1 kernels. Gated by ATOM_MORI_V2.
-            if _atom_envs.ATOM_MORI_V2:
-                from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
-                    make_mori_v2_prepare_finalize,
-                )
-
-                return make_mori_v2_prepare_finalize(moe, all2all_manager)
-
             assert quant_config is not None
 
             # One branch decides the whole wire format: the dtype dispatch() will
@@ -689,7 +695,9 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # dtype above -- MoRI infers dispatch from the tensor, combine from this.
             mori_combine_quant_type = envs.ATOM_MORI_COMBINE_QUANT
             tbo_is_enabled = tbo_enabled()
-            low_latency = moe.moe_parallel_config.low_latency
+            low_latency = use_mori_low_latency(
+                moe.moe_parallel_config.low_latency, all2all_manager.internode
+            )
             if all2all_manager.internode and mori_combine_quant_type != "none":
                 # MoRI registers no blockwise combine kernel for these; without
                 # this it fails later, at kernel lookup.
@@ -725,7 +733,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # TBO and regular forwards are mutually exclusive. Slot 0 serves
             # regular forwards and TBO ubatch 0; slot 1 exists only for the
             # concurrently running second ubatch.
-            num_mori_ops = _NUM_TBO_UBATCHES if tbo_is_enabled else 1
+            num_mori_ops = NUM_TBO_UBATCHES if tbo_is_enabled else 1
             mori_ops = [
                 all2all_manager.get_handle(all_to_all_args, index=slot)
                 for slot in range(num_mori_ops)
@@ -794,9 +802,11 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # told the expert-GEMM recipe that only the layer + this quant method
             # know. Here is also the last point before any cudagraph capture, and
             # it allocates a cco arena and JIT-compiles its kernels.
-            bind_mega = getattr(prepare_finalize, "bind_mega_transport", None)
-            if bind_mega is not None:
-                bind_mega(layer, self)
+            if mori_v2:
+                prepare_finalize.bind_mega_transport(layer, self)
+                assert (
+                    prepare_finalize.mega is not None
+                ), "MoriV2ModularKernel has no MegaMoE to run"
 
         comm_fused = getattr(layer, "_comm_fused_moe", None)
         if comm_fused is not None:
@@ -1258,7 +1268,7 @@ def rocm_aiter_fused_moe_fake(
     return torch.empty_like(hidden_states)
 
 
-direct_register_custom_op(
+rocm_aiter_fused_moe_op = direct_register_custom_op(
     op_name="rocm_aiter_fused_moe",
     op_func=rocm_aiter_fused_moe_impl,
     mutates_args=[],
@@ -1452,6 +1462,49 @@ class Nvfp4MoEMethod(FusedMoEMethodBase):
         )
 
 
+@cache
+def _aiter_serves_flydsl_herd() -> bool:
+    """Whether aiter's fused_moe(herd_topk) serves DeepSeek-V4 and Kimi-K3:
+    aiter v0.1.29 (ROCm/aiter#7494) or later. Older ones abort the process on
+    Kimi-K3's Top-17 candidates with an FP32 correction bias."""
+    # In aiter since the HERD constants above (v0.1.26, ROCm/aiter#5693).
+    from aiter.ops.flydsl import herd_topk
+
+    if hasattr(herd_topk, "herd_route_psum"):
+        return True
+    logger.warning(
+        "AITER_FLYDSL_USE_HERD=1 needs aiter v0.1.29 (ROCm/aiter#7494) or "
+        "later; HERD stays off"
+    )
+    return False
+
+
+def _herd_sees_own_rows(parallel_config: FusedMoEParallelConfig) -> bool:
+    """Whether the experts run only their pass's rows, whose trailing pad rows
+    aiter's HERD drop leaves out by the count fused_moe gets. A DP-attention or
+    PCP gather, and simulated DP's repeat, interleave every rank's -1 pad rows,
+    pass no count, and can exceed the 1024 rows fused_moe(herd_topk) takes."""
+    return not (
+        parallel_config.pcp_merge
+        or parallel_config.dp_logical_ratio > 1
+        or (
+            parallel_config.dp_size > 1
+            and get_current_atom_config().enable_dp_attention
+        )
+    )
+
+
+def _herd_routing(layer: torch.nn.Module) -> bool:
+    """DeepSeek-V4's sqrtsoftplus top-k or Kimi-K3's sigmoid grouped top-k over
+    one group: the routings HERD serves, both folding the routed scale in."""
+    if layer.use_grouped_topk:
+        return layer.scoring_func == "sigmoid" and (
+            layer.num_expert_group,
+            layer.topk_group,
+        ) == (1, 1)
+    return layer.scoring_func == "sqrtsoftplus"
+
+
 class Mxfp4MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
         super().__init__(moe)
@@ -1461,14 +1514,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.quant_method = quant_config.quant_method or ""
         self.static_input_scales = not quant_config.is_dynamic
         self.fp8_activations = moe.mxfp4_fp8_activations
-        self.is_guinterleave = envs.ATOM_MOE_GU_ITLV or self.fp8_activations
+        gfx = get_gfx()
+        self.is_gfx1250 = gfx == "gfx1250"
+        # aiter's gfx1250 fused_moe rejects the separated gate/up layout for every
+        # G1U1 MoE, so on gfx1250 GU interleave is required, not opt-in.
+        self.is_guinterleave = (
+            envs.ATOM_MOE_GU_ITLV or self.fp8_activations or self.is_gfx1250
+        )
         self.pad_align = 256
         self.block_quant = (
             self.quant_type == QuantType.per_1x128
             or self.quant_type == QuantType.per_1x32
         )
-        gfx = get_gfx()
-        self.is_gfx1250 = gfx == "gfx1250"
         self.act_quant = MoEActivationQuant.from_model_config(moe.a_quant_dtype)
         ep_moe = self.moe.use_ep
         if envs.is_set("ATOM_USE_TRITON_MOE"):
@@ -1511,6 +1568,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.use_triton = False
             self.use_triton_decode = False
             self.use_triton_ep = False
+
+        # AITER_FLYDSL_USE_HERD: aiter's gfx1250 HERD drop, TP only (no expert_mask).
+        self.use_flydsl_herd = (
+            _FLYDSL_USE_HERD
+            and self.is_gfx1250
+            and self.is_guinterleave
+            and not ep_moe
+            and not getattr(get_current_atom_config(), "eplb_enable", False)
+            and _herd_sees_own_rows(self.moe.moe_parallel_config)
+            and _aiter_serves_flydsl_herd()
+        )
 
         # Triton MoE under EP exists only for gfx95x and gfx125x -- those are the
         # arches whose branch-A weight prep and gluon experts are wired up. The
@@ -1615,7 +1683,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.intermediate_pad = (
             self.intermediate_size - layer.intermediate_size_per_partition
         )
-        # MXFP4 is target-only: it is never dequantized as an online source.
         # Fused gate_up_proj (column parallel)
         w13_weight = atom_parameter(
             torch.empty(
@@ -1778,15 +1845,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if self.use_triton_decode:
             assert self.is_gfx1250 and self.is_guinterleave and is_silu, (
                 "ATOM_USE_TRITON_MOE_DECODE=1 shares one weight copy between the "
-                "FlyDSL and Triton kernels, which only matches on gfx1250 + "
-                "ATOM_MOE_GU_ITLV=1 + SiLU (got gfx1250="
-                f"{self.is_gfx1250}, gu_itlv={self.is_guinterleave}, silu={is_silu}). "
-                "NOTE the ATOM_MOE_GU_ITLV requirement is INVERTED from earlier "
-                "builds: this flag used to be skipped when GU interleaving was on "
-                "and to run with ATOM_MOE_GU_ITLV=0, which is now the "
-                "unsupported combination. A launch line carrying "
-                "ATOM_MOE_GU_ITLV=0 with ATOM_USE_TRITON_MOE_DECODE=1 needs "
-                "ATOM_MOE_GU_ITLV=1, or drop ATOM_USE_TRITON_MOE_DECODE."
+                "FlyDSL and Triton kernels, which only matches on gfx1250 + SiLU "
+                "with the gate/up interleaved layout, which gfx1250 always uses "
+                f"(got gfx1250={self.is_gfx1250}, interleaved={self.is_guinterleave}, "
+                f"silu={is_silu}). Elsewhere, drop ATOM_USE_TRITON_MOE_DECODE."
             )
             # FlyDSL trims the create_weights padding via hidden_pad /
             # intermediate_pad; the Triton kernels take no such argument and read
@@ -2060,12 +2122,42 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_scale=layer.w2_weight_scale,
         )
 
+    def activation_dtype(self, layer, tokens):
+        """The activation dtype fused_moe quantizes `tokens` rows to."""
+        from aiter.fused_moe import resolve_activation_dtype
+
+        return resolve_activation_dtype(
+            self.quant_type,
+            layer.w13_weight.dtype,
+            activation=layer.activation,
+            gate_mode=(
+                GateMode.INTERLEAVE if self.is_guinterleave else GateMode.SEPARATED
+            ),
+            M=tokens,
+            gate_up_interleave=getattr(layer.w13_weight, "gate_up_interleave", None),
+        )
+
     @mark_trace
     def select_experts(
         self, layer: torch.nn.Module, x: torch.Tensor, router_logits: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """The base routing over the layer's logical experts, its prefilled
         shared column widened in where the legacy layout fuses one."""
+        if self._flydsl_herd_step(layer, router_logits):
+            # Raw Top-(K+1) scores; fused_moe(herd_topk=K) drops and scales.
+            # Pad rows route to -1, and the drop keeps them out of its
+            # popularity only by the count apply() passes as num_local_tokens.
+            return FusedMoE.select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                top_k=layer.top_k + 1,
+                use_grouped_topk=layer.use_grouped_topk,
+                topk_group=layer.topk_group,
+                num_expert_group=layer.num_expert_group,
+                renormalize=False,
+                scoring_func=layer.scoring_func,
+                e_score_correction_bias=layer.e_score_correction_bias,
+            )
         layout = layer.expert_layout
         return _select_logical(
             layer,
@@ -2112,6 +2204,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         prefix: str = "",
         x_scale: torch.Tensor | None = None,
         scheduled_tokens_gpu: torch.Tensor | None = None,
+        shared_add: torch.Tensor | None = None,
+        shared_ready: torch.cuda.Event | None = None,
     ) -> torch.Tensor:
         # ATOM_USE_TRITON_MOE_DECODE splits the two kernels by phase: the weights
         # sit in the FlyDSL layout, so prefill falls through to the FlyDSL tail
@@ -2156,6 +2250,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # block further down.
         if self.use_triton and self.use_triton_decode:
             use_triton_now = all_ranks_decode
+        # `shared_add` (FusedMoE.combine_accepts_shared) is only handed down to
+        # the modular kernel, whose combine adds it.
+        if shared_add is not None and (use_triton_now or self.fused_experts is None):
+            raise RuntimeError(
+                "a shared output to add reached an expert path without a combine "
+                "that adds it"
+            )
 
         if use_triton_now:
             from atom.model_ops.fused_moe_triton import (
@@ -2252,6 +2353,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 )
             return _moe_result
 
+        # The step select_experts routed Top-(K+1) HERD candidates for: the same
+        # decision over the same rows (it reads their count; HERD never runs on
+        # gathered rows), not a guess from the ids' width.
+        herd_topk = (
+            layer.top_k
+            if self.use_flydsl_herd and self._flydsl_herd_step(layer, x)
+            else 0
+        )
         a1_scale = getattr(layer, "w13_input_scale", None)
         a2_scale = getattr(layer, "w2_input_scale", None)
         moe_extra_args = {
@@ -2269,6 +2378,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             moe_extra_args["linear_beta"] = getattr(
                 layer, "activation_situ_linear_beta", None
             )
+        if herd_topk:
+            moe_extra_args["herd_topk"] = herd_topk
+            # Both _herd_routing routings fold the routed scale in.
+            moe_extra_args["herd_routed_scaling_factor"] = layer.routed_scaling_factor
         _ep_triton_now = False
         if self.use_triton_ep and self.using_modular_kernel:
             # Phase split, transport version. FusedMoEModularKernel.forward runs
@@ -2444,6 +2557,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 num_local_tokens=scheduled_tokens_gpu,
                 **moe_extra_args,
             )
+        # Only the mori v2 modular kernel takes a shared output
+        # (FusedMoE.combine_accepts_shared); the other kernels are not passed one.
+        shared_kwargs = (
+            {}
+            if shared_add is None
+            else {"shared_add": shared_add, "shared_ready": shared_ready}
+        )
         return self.fused_experts(
             hidden_states=x,
             w1=layer.w13_weight,
@@ -2467,6 +2587,36 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             intermediate_pad=self.intermediate_pad,
             moe_extra_args=moe_extra_args,
             x_scale=x_scale,
+            **shared_kwargs,
+        )
+
+    def _flydsl_herd_step(
+        self, layer: torch.nn.Module, router_logits: torch.Tensor
+    ) -> bool:
+        """Whether this step routes Top-(K+1) candidates for fused_moe(herd_topk):
+        decode steps in aiter's HERD window that reach the FlyDSL experts, on
+        a `_herd_routing` routing (the drop renormalises the kept K)."""
+        tokens = router_logits.shape[0]
+        if (
+            not self.use_flydsl_herd
+            or self.use_triton
+            or self.fused_experts is not None
+            or not _FLYDSL_HERD_MIN_M <= tokens <= _FLYDSL_HERD_MAX_M
+            or not layer.renormalize
+            or layer.custom_routing_function is not None
+            or layer.apply_router_weight_on_input
+            or layer.num_fused_shared_experts > 0
+            or not _herd_routing(layer)
+        ):
+            return False
+        comm_fused = getattr(layer, "_comm_fused_moe", None)
+        if comm_fused is not None and comm_fused.supports(tokens):
+            return False
+        ctx = get_forward_context().context
+        return (
+            ctx is not None
+            and not ctx.is_prefill
+            and bool(getattr(ctx, "running_tokens_are_unified", True))
         )
 
     def _apply_shared_experts_dense(self, layer, x, activation):
@@ -2626,7 +2776,8 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
 def _make_mxfp4_moe_method(
     quant_config: LayerQuantConfig, moe: FusedMoEConfig
 ) -> Mxfp4MoEMethod:
-    if get_current_atom_config().moe_backend == "mega":
+    # Under SP, `mega` runs SP MegaMoE over the native weights instead.
+    if get_current_atom_config().moe_backend == "mega" and not sp_is_enabled():
         return MegaMxfp4MoEMethod(quant_config, moe)
     return Mxfp4MoEMethod(quant_config, moe)
 
@@ -2979,7 +3130,7 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
                 x_scale=x_scale,
             )
         else:
-            return torch.ops.aiter.rocm_aiter_fused_moe(
+            return rocm_aiter_fused_moe_op(
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
@@ -3014,7 +3165,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         quant_config: The quantization config (LayerQuantConfig).
     """
 
-    def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
+    def __init__(
+        self,
+        quant_config: LayerQuantConfig,
+        moe: FusedMoEConfig,
+        *,
+        fnuz_fixup: bool = True,
+    ):
         super().__init__(moe)
         self.quant_config = quant_config
         self.quant_type = quant_config.quant_type
@@ -3024,8 +3181,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             or self.quant_type == QuantType.per_1x32
         )
         self.channel_quant = self.quant_type == QuantType.per_Token
+        # False where the weights already hold target-dtype values (online requant).
         self.need_normalize_e4m3fn_to_e4m3fnuz = (
-            self.quant_dtype == torch.float8_e4m3fnuz
+            fnuz_fixup and self.quant_dtype == torch.float8_e4m3fnuz
         )
 
     def create_weights(
@@ -3387,7 +3545,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             "swiglu_limit": getattr(layer, "swiglu_limit", 0.0),
         }
         if self.quant_type == QuantType.per_Tensor or self.fused_experts is None:
-            return torch.ops.aiter.rocm_aiter_fused_moe(
+            return rocm_aiter_fused_moe_op(
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
@@ -3444,7 +3602,7 @@ def moe_forward_fake(
     return torch.empty_like(hidden_states)
 
 
-direct_register_custom_op(
+moe_forward_op = direct_register_custom_op(
     op_name="moe_forward",
     op_func=moe_forward,
     mutates_args=["hidden_states"],
@@ -3475,8 +3633,8 @@ class FusedMoE(torch.nn.Module):
         quant_config: Quantization configure.
     """
 
-    # Set in __init__ for an MXFP8 shared expert fused into MXFP4 experts.
-    shared_mxfp8_into_mxfp4: Mxfp8SharedIntoMxfp4 | None = None
+    # Set in __init__ for a shared expert staged into its fused slot.
+    shared_expert_staging: SharedExpertStaging | None = None
 
     def __init__(
         self,
@@ -3541,6 +3699,8 @@ class FusedMoE(torch.nn.Module):
         self.moe_parallel_config = FusedMoEParallelConfig.make(
             tp_size, dp_size, atom_config
         )
+        # Attached by `initialize_sp_mega_moe` under -sp --moe-backend mega.
+        self.sp_mega_moe = None
         self._comm_fused_moe = None
         if enable_comm_fused:
             from atom.model_ops.fused_moe.comm_fused_moe import (
@@ -3572,17 +3732,22 @@ class FusedMoE(torch.nn.Module):
             getattr(config, "n_shared_experts", 0) if fuse_shared_experts else 0
         )
 
-        # An MXFP8 shared expert fused into MXFP4 routed experts is staged
-        # while loading and re-quantized into its slot afterwards.
-        stage_shared_mxfp8 = bool(
-            num_fused_shared_experts
-            and layer_quant_config is not None
-            and fuses_mxfp8_shared_into_mxfp4(
-                quant_config.get_layer_quant_config(
-                    shared_expert_prefix, check_children=True
-                ),
-                layer_quant_config,
+        # A shared expert in another format is staged, then written into its slot.
+        shared_spec = (
+            quant_config.get_layer_quant_config(
+                shared_expert_prefix, check_children=True
             )
+            if num_fused_shared_experts and layer_quant_config is not None
+            else None
+        )
+        stage_shared_ptpc = shared_spec is not None and (
+            fuses_ptpc_shared_into_online_ptpc(
+                quant_config, prefix, shared_spec, layer_quant_config
+            )
+        )
+        stage_shared = stage_shared_ptpc or bool(
+            shared_spec is not None
+            and fuses_mxfp8_shared_into_mxfp4(shared_spec, layer_quant_config)
         )
 
         eplb_enabled = self.use_ep and getattr(atom_config, "eplb_enable", False)
@@ -3830,11 +3995,15 @@ class FusedMoE(torch.nn.Module):
         )
         self._load_device = torch.empty(0).device if self._stream_online_quant else None
         self.quant_method.create_weights(layer=self, **self.moe_quant_params)
-        self.shared_mxfp8_into_mxfp4 = (
-            Mxfp8SharedIntoMxfp4(
-                self, quant_config, hidden_size, self.intermediate_size_per_partition
+        self.shared_expert_staging = (
+            SharedExpertStaging(
+                self,
+                quant_config,
+                hidden_size,
+                self.intermediate_size_per_partition,
+                ptpc=stage_shared_ptpc,
             )
-            if stage_shared_mxfp8
+            if stage_shared
             else None
         )
         compilation_config = atom_config.compilation_config
@@ -3898,12 +4067,12 @@ class FusedMoE(torch.nn.Module):
 
     def process_weights_after_loading(self):
         self._online_quant()
-        if self.shared_mxfp8_into_mxfp4 is not None:
-            self.shared_mxfp8_into_mxfp4.fuse(self)
+        if self.shared_expert_staging is not None:
+            self.shared_expert_staging.fuse(self)
         self._validate_moe_backend()
 
     def _validate_moe_backend(self) -> None:
-        if get_current_atom_config().moe_backend != "mega":
+        if get_current_atom_config().moe_backend != "mega" or sp_is_enabled():
             return
         if not isinstance(self.quant_method, MegaMxfp4MoEMethod):
             raise TypeError(
@@ -3929,14 +4098,29 @@ class FusedMoE(torch.nn.Module):
     ) -> None:
         """Batch row-local experts to accelerate streaming online quantization."""
         batch_size = 8
+        inter = self.intermediate_size_per_partition
 
-        def _quantize(source, scale):
+        # Drop the source's intermediate padding (MXFP4).
+        def _trim_w13(bf16):
+            half = bf16.shape[1] // 2
+            if half > inter:
+                bf16 = torch.cat([bf16[:, :inter], bf16[:, half : half + inter]], dim=1)
+            return bf16
+
+        def _trim_w2(bf16):
+            return bf16[..., :inter]
+
+        def _quantize(source, scale, trim):
+            count, rows = source.shape[:2]
+            # Returned flattened over experts.
             bf16 = dequant_moe_weight_online(
                 source,
                 scale,
                 source_quant_type,
                 source_quant_dtype,
             )
+            bf16 = trim(bf16.view(count, rows, -1))
+            bf16 = bf16.reshape(-1, bf16.shape[-1]).contiguous()
             quantized, quant_scale = quant_weight_online(
                 bf16,
                 online_quant_type=online_quant_type,
@@ -4008,10 +4192,9 @@ class FusedMoE(torch.nn.Module):
             source_w13_scale = (
                 old_w13_scale[start:end] if old_w13_scale is not None else None
             )
-            w13_q, w13_s = _quantize(source_w13, source_w13_scale)
-            source_w13_rows = source_w13.shape[1]
-            source_half_rows = source_w13_rows // 2
-            w13_q = w13_q.reshape(count, source_w13_rows, w13_q.shape[1])
+            w13_q, w13_s = _quantize(source_w13, source_w13_scale, _trim_w13)
+            w13_q = w13_q.reshape(count, -1, w13_q.shape[1])
+            source_half_rows = w13_q.shape[1] // 2
             w13_s = _reshape_scale(w13_s, count)
 
             target_w13 = self.w13_weight.data[start:end]
@@ -4036,15 +4219,14 @@ class FusedMoE(torch.nn.Module):
             source_w2_scale = (
                 old_w2_scale[start:end] if old_w2_scale is not None else None
             )
-            w2_q, w2_s = _quantize(source_w2, source_w2_scale)
-            source_w2_rows = source_w2.shape[1]
-            w2_q = w2_q.reshape(count, source_w2_rows, w2_q.shape[1])
+            w2_q, w2_s = _quantize(source_w2, source_w2_scale, _trim_w2)
+            w2_q = w2_q.reshape(count, -1, w2_q.shape[1])
             w2_s = _reshape_scale(w2_s, count)
 
             target_w2 = self.w2_weight.data[start:end]
             target_w2_scale = self.w2_weight_scale.data[start:end]
             FusedMoE._copy_quant_storage(
-                target_w2[:, :source_w2_rows, : w2_q.shape[2]],
+                target_w2[:, : w2_q.shape[1], : w2_q.shape[2]],
                 w2_q,
             )
             _copy_scale(target_w2_scale, w2_s, split_gate_up=False)
@@ -4128,6 +4310,15 @@ class FusedMoE(torch.nn.Module):
             QuantType.per_1x128,
             QuantType.per_1x32,
         )
+        # Its consumers keep an MXFP4 source's hidden padding (GPT-OSS pads the
+        # input) and expert bias, which the target does not carry.
+        if source_quant_dtype == dtypes.fp4x2 and (
+            self.quant_method.hidden_pad or self.w13_bias is not None
+        ):
+            raise NotImplementedError(
+                f"{self.layer_name}: online quantization of MXFP4 experts with "
+                "hidden padding or expert bias"
+            )
 
         def _dequant_func(
             w: torch.Tensor,
@@ -4191,6 +4382,10 @@ class FusedMoE(torch.nn.Module):
         # For per_1x128 source we also need the old scales for dequantization.
         old_w13_data = self.w13_weight.data
         old_w2_data = self.w2_weight.data
+        if self.quant_method.need_normalize_e4m3fn_to_e4m3fnuz:
+            # Still OCP E4M3 bytes; the source method's FNUZ fixup never runs.
+            old_w13_data = old_w13_data.view(torch.float8_e4m3fn)
+            old_w2_data = old_w2_data.view(torch.float8_e4m3fn)
         old_w13_scale = self.w13_weight_scale.data if need_dequant else None
         old_w2_scale = self.w2_weight_scale.data if need_dequant else None
         old_w13_scale_2 = self.w13_weight_scale_2.data if source_is_nvfp4 else None
@@ -4224,7 +4419,10 @@ class FusedMoE(torch.nn.Module):
 
         # Switch quant_method and allocate target quantized-type buffers.
         if online_quant_dtype == dtypes.fp8:
-            self.quant_method = Fp8MoEMethod(online_quant_config, self.moe_config)
+            # The quantizer emits target-dtype values: no FNUZ fixup.
+            self.quant_method = Fp8MoEMethod(
+                online_quant_config, self.moe_config, fnuz_fixup=False
+            )
         elif online_quant_dtype == dtypes.fp4x2:
             self.quant_method = _make_mxfp4_moe_method(
                 online_quant_config, self.moe_config
@@ -4253,7 +4451,8 @@ class FusedMoE(torch.nn.Module):
             QuantType.per_1x128,
         )
         target_rows_are_batchable = online_quant_type != QuantType.per_1x128 or (
-            old_w13_data.shape[1] // 2 % 128 == 0 and old_w2_data.shape[1] % 128 == 0
+            self.intermediate_size_per_partition % 128 == 0
+            and self.hidden_size % 128 == 0
         )
         if (
             not source_is_nvfp4
@@ -4280,6 +4479,7 @@ class FusedMoE(torch.nn.Module):
             )
             return
 
+        inter = self.intermediate_size_per_partition
         for expert_id in range(self.local_num_experts):
             # --- w13 column-parallel ---
             w13_local = old_w13_data[expert_id]
@@ -4301,6 +4501,9 @@ class FusedMoE(torch.nn.Module):
             else:
                 w1_bf16 = w13_local[:w1_size]
                 w3_bf16 = w13_local[w1_size:]
+            # Drop the source's padding.
+            w1_bf16 = w1_bf16[:inter].contiguous()
+            w3_bf16 = w3_bf16[:inter].contiguous()
 
             w1_q, w1_s = _quant_weight(w1_bf16)
             w3_q, w3_s = _quant_weight(w3_bf16)
@@ -4366,6 +4569,8 @@ class FusedMoE(torch.nn.Module):
                     old_w2_scale[expert_id],
                     old_w2_scale_2[expert_id] if source_is_nvfp4 else None,
                 )
+            # And from w2, before the gather.
+            w2_local = w2_local[:, :inter].contiguous()
             if need_gather_w2:
                 w2_full = tp_group.all_gather(w2_local, dim=1)
                 w2_q, w2_s = _quant_weight(w2_full)
@@ -5096,9 +5301,8 @@ class FusedMoE(torch.nn.Module):
         expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
         if expert_id == -1:
             return
-        # getattr: test doubles borrow this loader without subclassing FusedMoE.
-        shared_mxfp8 = getattr(self, "shared_mxfp8_into_mxfp4", None)
-        if shared_mxfp8 is not None and shared_mxfp8.load(
+        staging = self.shared_expert_staging
+        if staging is not None and staging.load(
             self, param, loaded_weight, shard_id, expert_id
         ):
             return
@@ -5209,7 +5413,6 @@ class FusedMoE(torch.nn.Module):
         num_fused_shared_experts: int = 0,
         fused_shared_experts_scoring_func: str | None = None,
         routed_scaling_factor: float = 1.0,
-        mask_pad_rows: bool = True,
     ):
 
         # custom_routing_function takes precedence (e.g. DeepSeek-V4 hash routing
@@ -5227,9 +5430,7 @@ class FusedMoE(torch.nn.Module):
 
         # Every kernel below routes the rows at or past the pass's real row
         # count to -1, which dispatch and the experts skip.
-        num_valid_rows = (
-            pass_scheduled_tokens_gpu(router_logits.shape[0]) if mask_pad_rows else None
-        )
+        num_valid_rows = pass_scheduled_tokens_gpu(router_logits.shape[0])
         # DeekSeekv2 uses grouped_top_k
         if use_grouped_topk:
             assert topk_group is not None
@@ -5309,22 +5510,54 @@ class FusedMoE(torch.nn.Module):
 
         return topk_weights, topk_ids
 
-    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
-        if self.balance_router_logits is not None:
-            # Match the dtype of the logits being replaced. The table is built
-            # once at the default dtype, but aiter's `biased_grouped_topk`
-            # dispatches on `gating_output.dtype()` and then reinterpret_casts
-            # `correction_bias` to that same scalar_t -- so handing it a bf16
-            # table for a router whose bias is fp32 makes the kernel read that
-            # fp32 buffer at half width, i.e. garbage bias over half the
-            # experts. Only fake-EPLB reaches this, so the cast costs nothing
-            # on a real run.
-            router_logits = self.balance_router_logits[: hidden_states.shape[0]].to(
-                router_logits.dtype
-            )
-        return torch.ops.aiter.moe_forward(
-            hidden_states, router_logits, self.layer_name
+    def _routing_logits(
+        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
+    ) -> torch.Tensor:
+        if self.balance_router_logits is None:
+            return router_logits
+        # Match the dtype of the logits being replaced. The table is built
+        # once at the default dtype, but aiter's `biased_grouped_topk`
+        # dispatches on `gating_output.dtype()` and then reinterpret_casts
+        # `correction_bias` to that same scalar_t -- so handing it a bf16
+        # table for a router whose bias is fp32 makes the kernel read that
+        # fp32 buffer at half width, i.e. garbage bias over half the
+        # experts. Only fake-EPLB reaches this, so the cast costs nothing
+        # on a real run.
+        return self.balance_router_logits[: hidden_states.shape[0]].to(
+            router_logits.dtype
         )
+
+    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+        # The custom op is an opaque boundary for torch.compile and for
+        # TorchDispatchMode (FakeTensorMode, make_fx); eager calls skip it.
+        return moe_forward_op(
+            hidden_states,
+            self._routing_logits(hidden_states, router_logits),
+            self.layer_name,
+        )
+
+    def combine_accepts_shared(self, rows: int) -> bool:
+        """Whether this layer's routed combine adds a shared-expert output
+        (`forward_maybe_comm_fused`'s ``shared_ready``) on a `rows`-row step:
+        MegaMoE behind the mori v2 modular kernel, on a step the comm-fused
+        backend (which joins the shared output its own way) and the SP MegaMoE
+        do not take, with no reduction after the combine that would count the
+        shared output more than once."""
+        backend = self._comm_fused_moe
+        if backend is not None and backend.supports(rows):
+            return False
+        if self.sp_mega_moe is not None and self.sp_mega_moe.runs(rows):
+            return False
+        parallel = self.moe_parallel_config
+        if self.reduce_results or parallel.pcp_merge or parallel.dp_logical_ratio > 1:
+            return False
+        if not isinstance(self.quant_method, Mxfp4MoEMethod):
+            return False
+        from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
+            MoriV2ModularKernel,
+        )
+
+        return isinstance(self.quant_method.fused_experts, MoriV2ModularKernel)
 
     def forward_maybe_comm_fused(
         self,
@@ -5334,10 +5567,16 @@ class FusedMoE(torch.nn.Module):
         before_stage2_for_rows: Callable[[int], torch.Tensor] | None = None,
         before_shared_add: Callable[[], None] | None = None,
         stage2_stream: torch.cuda.Stream | None = None,
+        shared_ready: torch.cuda.Event | None = None,
     ) -> tuple[torch.Tensor, bool]:
         """Return ``(output, complete)`` after fused or ordinary dispatch.
 
         A complete output already contains the shared expert and TP reduction.
+        Off the comm-fused path, ``shared_ready`` (recorded on the stream that
+        produced ``shared_partial``; `combine_accepts_shared` must hold) has
+        the routed combine add ``shared_partial``: the output then contains the
+        shared expert, but not the TP reduction. Without it the caller adds
+        ``shared_partial`` itself.
         """
         backend = self._comm_fused_moe
         if backend is not None and backend.supports(hidden_states.shape[0]):
@@ -5353,7 +5592,27 @@ class FusedMoE(torch.nn.Module):
                 ),
                 True,
             )
-        return self(hidden_states, router_logits), False
+        if shared_ready is None:
+            return self(hidden_states, router_logits), False
+        if shared_partial is None or not self.combine_accepts_shared(
+            hidden_states.shape[0]
+        ):
+            raise RuntimeError(
+                "the routed combine was asked to add a shared output it cannot "
+                "take; check combine_accepts_shared first"
+            )
+        # Like the comm-fused backend, called directly rather than through the
+        # moe_forward custom op, which cannot carry the event: the caller runs
+        # inside its own opaque dual-stream op.
+        return (
+            self.forward_impl(
+                hidden_states,
+                self._routing_logits(hidden_states, router_logits),
+                shared_add=shared_partial,
+                shared_ready=shared_ready,
+            ),
+            False,
+        )
 
     def _run_experts(
         self,
@@ -5362,19 +5621,26 @@ class FusedMoE(torch.nn.Module):
         topk_ids: torch.Tensor,
         x_scale: torch.Tensor | None = None,
         gathered: bool = False,
+        shared_add: torch.Tensor | None = None,
+        shared_ready: torch.cuda.Event | None = None,
     ) -> torch.Tensor:
         """The experts on the routed rows (`x_scale`: they are in the method's
         `routed_rows_wire` already), still on logical experts: placed on the
         physical ones (`place_experts`) after every gather. `gathered`: a DP
-        gather made them the group's. Where ATOM_PCP_MOE_MERGE folds the PCP
-        group into the expert sharding, every PCP rank runs them over the same
-        rows: a split pass gathers its rows rank-major first, in that wire,
-        and reduce-scatters the partial sums back; any other real pass already
-        holds the same rows on every PCP rank and all-reduces. Only rows no
-        gather moved are counted (`pass_scheduled_tokens_gpu`)."""
+        gather made them the group's. Where ATOM_PCP_MOE_MERGE or SP folds the
+        PCP group into the expert sharding, every PCP rank runs them over the
+        same rows: a split pass (every SP pass) gathers its rows rank-major
+        first, in that wire, and reduce-scatters the partial sums back; any
+        other real pass already holds the same rows on every PCP rank and
+        all-reduces. Rows no gather moved are counted
+        (`pass_scheduled_tokens_gpu`), and so are an SP gather's: its shards
+        are contiguous, so the step's real rows lead. `shared_add` /
+        `shared_ready`: see `forward_maybe_comm_fused`."""
         context = get_forward_context().context
-        pcp = self.moe_parallel_config.pcp_merge and not context.is_dummy_run
-        split = pcp and context.pcp_split
+        merge = self.moe_parallel_config.pcp_merge
+        pcp = merge and not context.is_dummy_run
+        # SP marks its dummy and captured passes split too.
+        split = merge and context.pcp_split and (pcp or sp_is_enabled())
         if split:
             rows = pack_routed_rows(
                 self.quant_method.routed_rows_wire,
@@ -5383,22 +5649,26 @@ class FusedMoE(torch.nn.Module):
                 topk_ids,
                 x_scale,
             )
-            tbo = tbo_active()
-            if tbo:
-                tbo_yield_and_switch_from_compute_to_comm()
             # One grouped collective, rank-major: every PCP shard is one height.
             pcp_group = get_pcp_group()
             heights = [hidden_states.shape[0]] * pcp_group.world_size
-            hidden_states, topk_weights, topk_ids, *scale = gather_rows(
-                lambda ts: all_gatherv(ts, heights, pcp_group), rows
-            )
+
+            def gather():
+                out = gather_rows(lambda ts: all_gatherv(ts, heights, pcp_group), rows)
+                reassign_gathered_shared_ids(self, out[2])
+                return out
+
+            hidden_states, topk_weights, topk_ids, *scale = tbo_on_comm(gather)
             x_scale = scale[0] if scale else None
-            reassign_gathered_shared_ids(self, topk_ids)
-            if tbo:
-                tbo_switch_to_compute_sync()
         gathered = gathered or split
         topk_weights, topk_ids = self.quant_method.place_experts(
             self, topk_weights, topk_ids, gathered
+        )
+        # Only Mxfp4MoEMethod takes a shared output (combine_accepts_shared).
+        shared_kwargs = (
+            {}
+            if shared_add is None
+            else {"shared_add": shared_add, "shared_ready": shared_ready}
         )
         output = self.quant_method.apply(
             layer=self,
@@ -5411,24 +5681,29 @@ class FusedMoE(torch.nn.Module):
             apply_router_weight_on_input=self.apply_router_weight_on_input,
             prefix=f"{self.prefix}.fused_moe",
             x_scale=x_scale,
+            # Pure-TP padded graphs require ROCm/aiter#7294: its FlyDSL,
+            # FlyDSL-v2, and native-MXFP4 stage2 paths reject the sorting
+            # sentinel at the real token count instead of scattering every
+            # padded expert slot into that row.
             scheduled_tokens_gpu=(
-                None
-                if gathered or not self.use_ep
-                else pass_scheduled_tokens_gpu(topk_ids.shape[0])
+                context.scheduled_tokens_gpu
+                if split and sp_is_enabled()
+                else None if gathered else pass_scheduled_tokens_gpu(topk_ids.shape[0])
             ),
+            **shared_kwargs,
         )
         if split:
-            if tbo:
-                tbo_yield_and_switch_from_compute_to_comm()
-            output = pcp_reduce_scatter(output)
-            if tbo:
-                tbo_switch_to_compute_sync()
+            output = tbo_on_comm(pcp_reduce_scatter, output)
         elif pcp:
             output = pcp_all_reduce(output)
         return output
 
     def forward_impl_graph(
-        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        shared_add: torch.Tensor | None = None,
+        shared_ready: torch.cuda.Event | None = None,
     ):
         # There are three mode
         # 1. Pure DP mode: only DP is used
@@ -5462,29 +5737,33 @@ class FusedMoE(torch.nn.Module):
                 topk_ids,
             )
 
-            _tbo = tbo_active()
-            if _tbo:
-                tbo_yield_and_switch_from_compute_to_comm()
-
-            rows, local_tokens, sizes = dp_gather_routed_rows(
-                rows, dp_eager_mode, ctx, dp_group
-            )
-
             # Stand in for the DP ranks a simulated run did not launch. Same row
             # order for every tensor, so a copied token keeps its own routing.
             dp_repeat = self.moe_parallel_config.dp_logical_ratio
-            gathered_rows = rows[0].shape[0]
-            if dp_repeat > 1:
-                rows = tuple(repeat_rows(t, dp_repeat) for t in rows)
-            hidden_states, topk_weights, topk_ids, *scale = rows
-            x_scale = scale[0] if scale else None
-            reassign_gathered_shared_ids(self, topk_ids)
 
-            if _tbo:
-                tbo_switch_to_compute_sync()
+            def gather():
+                out, local_tokens, sizes = dp_gather_routed_rows(
+                    rows, dp_eager_mode, ctx, dp_group
+                )
+                gathered_rows = out[0].shape[0]
+                if dp_repeat > 1:
+                    out = tuple(repeat_rows(t, dp_repeat) for t in out)
+                reassign_gathered_shared_ids(self, out[2])
+                return out, local_tokens, sizes, gathered_rows
+
+            # Not held, like the TP all-reduce: see `tbo_on_comm`.
+            out, local_tokens, sizes, gathered_rows = tbo_on_comm(gather, hold=False)
+            hidden_states, topk_weights, topk_ids, *scale = out
+            x_scale = scale[0] if scale else None
 
         final_hidden_states = self._run_experts(
-            hidden_states, topk_weights, topk_ids, x_scale, use_dp_gather_scatter
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            x_scale,
+            use_dp_gather_scatter,
+            shared_add=shared_add,
+            shared_ready=shared_ready,
         )
 
         # Use reduce_scatter when DP > 1 but not using mori all2all kernels
@@ -5492,18 +5771,17 @@ class FusedMoE(torch.nn.Module):
             # `sizes` and the scatter below are sized for the real ranks.
             if dp_repeat > 1:
                 final_hidden_states = final_hidden_states[:gathered_rows]
-            if _tbo:
-                tbo_yield_and_switch_from_compute_to_comm()
             if dp_eager_mode:
-                final_hidden_states = reduce_scatterv(
-                    final_hidden_states, sizes, dp_group
+                final_hidden_states = tbo_on_comm(
+                    reduce_scatterv, final_hidden_states, sizes, dp_group, hold=False
                 )
             else:
-                final_hidden_states = reduce_scatter_with_unpadding(
-                    final_hidden_states, local_tokens
+                final_hidden_states = tbo_on_comm(
+                    reduce_scatter_with_unpadding,
+                    final_hidden_states,
+                    local_tokens,
+                    hold=False,
                 )
-            if _tbo:
-                tbo_switch_to_compute_sync()
 
         if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
             # Default set to False. (May have to add shared expert outputs.)
@@ -5513,11 +5791,29 @@ class FusedMoE(torch.nn.Module):
 
         return final_hidden_states
 
-    def forward_impl(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+    def forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        shared_add: torch.Tensor | None = None,
+        shared_ready: torch.cuda.Event | None = None,
+    ):
+        """`shared_add` / `shared_ready`: see `forward_maybe_comm_fused`."""
         assert self.quant_method is not None
 
+        # Decided here, at run time: the row count is symbolic while compiling.
+        if self.sp_mega_moe is not None and self.sp_mega_moe.runs(
+            hidden_states.shape[0]
+        ):
+            return self.sp_mega_moe.forward(self, hidden_states, router_logits)
+
         if get_dp_group().world_size > 1:
-            return self.forward_impl_graph(hidden_states, router_logits)
+            return self.forward_impl_graph(
+                hidden_states,
+                router_logits,
+                shared_add=shared_add,
+                shared_ready=shared_ready,
+            )
 
         # Simulated DP with no peers to gather from: the absent ranks' token
         # shards are stood in for locally, same as after the gather in
@@ -5536,7 +5832,12 @@ class FusedMoE(torch.nn.Module):
         # The stand-in copies make the rows the logical group's, as a gather
         # would.
         final_hidden_states = self._run_experts(
-            hidden_states, topk_weights, topk_ids, gathered=dp_repeat > 1
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            gathered=dp_repeat > 1,
+            shared_add=shared_add,
+            shared_ready=shared_ready,
         )
 
         if dp_repeat > 1:

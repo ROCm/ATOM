@@ -7,7 +7,7 @@ import logging
 import sys
 import threading
 import types
-from collections import deque
+from collections import OrderedDict
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -33,8 +33,9 @@ except ModuleNotFoundError:
     _torch_stub = types.ModuleType("torch")
     sys.modules["torch"] = _torch_stub
 
-from conftest import MockConfig
+from conftest import MockConfig, with_min_load
 
+from atom.config import KVCacheTensor
 from atom.kv_transfer.disaggregation import (
     ConnectorCompletion,
     KVConnectorOutput,
@@ -45,11 +46,17 @@ from atom.kv_transfer.disaggregation.types import (
     LoadOperationId,
     SaveOperationId,
     StateStoreOperationId,
+    StateTouchId,
+    connector_metadata_has_work,
 )
 from atom.kv_transfer.offload import _block_gpu_connector
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
-from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
+from atom.kv_transfer.offload._offload_common import (
+    OffloadSchedulerMixin,
+    SaveLifecycle,
+    wait_save_fence,
+)
 from atom.kv_transfer.offload.dense.connector import (
     DenseOffloadConnector,
     DenseOffloadScheduler,
@@ -74,20 +81,34 @@ from atom.kv_transfer.offload.hybrid.dsv4.policy import (
 )
 from atom.kv_transfer.offload.hybrid.kimi_k3.connector import (
     STATE_INDEX_CHANNEL,
+    STATE_TOUCH_CHANNEL,
+    STATE_TOUCH_REFRESH_CHANNEL,
     KimiK3OffloadConnector,
     KimiK3OffloadScheduler,
     save_stall_seconds,
 )
-from atom.kv_transfer.offload.hybrid.kimi_k3.state_tier import _JointPark
-from atom.kv_transfer.offload.hybrid.qwen.connector import QwenOffloadScheduler
+from atom.kv_transfer.offload.hybrid.kimi_k3.state_object import (
+    StateByteCodec,
+    TouchResult,
+)
+from atom.kv_transfer.offload.hybrid.kimi_k3.state_tier import (
+    StateOffloadTier,
+    _JointPark,
+)
+from atom.kv_transfer.offload.hybrid.qwen.connector import (
+    QwenOffloadConnector,
+    QwenOffloadScheduler,
+)
 from atom.kv_transfer.offload.metadata import (
     ATOMRawBytesLMCacheMetadata,
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
+    SaveSpec,
     SlotLoadSpec,
     SlotSaveSpec,
 )
 from atom.model_engine.block_manager import BlockManager
+from atom.model_engine.early_load import EarlyLoadState
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import OffloadJointRecord, SequenceStatus
 from atom.sampling_params import SamplingParams
@@ -218,6 +239,7 @@ def _stateful_seq(
         num_cached_tokens=num_cached_tokens,
         block_table=list(range((num_prompt_tokens + 255) // 256)),
         has_per_req_cache=True,
+        cache_seed=-1,
         state_slot=group,
         prefix_hashes_published=True,
         _state_initialized_after_alloc=True,
@@ -230,10 +252,9 @@ def _commit_sidecar(
     seq: SimpleNamespace,
     boundary: int,
 ) -> int:
-    boundary_hash = _chained_prefix_hashes(
-        seq.token_ids,
-        sched.hash_block_size,
-    )[boundary]
+    boundary_hash = _chained_prefix_hashes(seq.token_ids, sched.hash_block_size, -1)[
+        boundary
+    ]
     sched._committed_sidecar_hashes.add(boundary_hash)
     return boundary_hash
 
@@ -407,9 +428,11 @@ def _install_fake_fused_chunk_major(codec: DenseKVByteCodec) -> None:
 
 def _registration_connector() -> LMCacheOffloadConnector:
     connector = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
-    connector._config = SimpleNamespace(
-        kv_transfer_config={},
-        kv_cache_block_size=4,
+    connector._config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={},
+            kv_cache_block_size=4,
+        )
     )
     connector.block_size = 4
     connector.chunk_size = None
@@ -423,10 +446,12 @@ def _registration_connector() -> LMCacheOffloadConnector:
 
 def _dense_registration_connector() -> DenseOffloadConnector:
     connector = DenseOffloadConnector.__new__(DenseOffloadConnector)
-    connector._config = SimpleNamespace(
-        kv_transfer_config={},
-        kv_cache_block_size=4,
-        decode_context_parallel_size=1,
+    connector._config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={},
+            kv_cache_block_size=4,
+            decode_context_parallel_size=1,
+        )
     )
     connector.block_size = 4
     connector.virtual_block_size = 4
@@ -620,7 +645,8 @@ def test_dense_backend_registers_dense_kv_byte_codec(monkeypatch):
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     connector = _dense_registration_connector()
     kv_caches = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=torch.zeros((3, 8), dtype=torch.uint8),
             v_cache=None,
             k_scale=None,
@@ -985,7 +1011,8 @@ def test_lmcache_connector_maps_token_ranges_to_block_ids():
         pytest.skip("real torch is unavailable")
 
     kv_caches = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
             v_cache=(torch.arange(6 * 3, dtype=torch.uint8).reshape(6, 3) + 51),
             k_scale=None,
@@ -1026,7 +1053,8 @@ def test_dense_codec_rejects_per_request_state_by_default():
         pytest.skip("real torch is unavailable")
 
     kv_caches = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
             v_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
             k_scale=None,
@@ -1080,7 +1108,8 @@ def _fp4_index_kv_caches(torch, num_blocks, *, with_scale=True):
         + 3
     ).reshape(num_blocks, _FP4_K_TILES, _FP4_NTPW, _FP4_ROWS)
     return {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=kv,
             v_cache=None,
             k_scale=None,
@@ -1108,7 +1137,8 @@ def test_dense_codec_moves_the_fp4_index_scale_plane():
     num_blocks = 4
     original = _fp4_index_kv_caches(torch, num_blocks)
     kv_caches = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=original["l0"].k_cache.clone(),
             v_cache=None,
             k_scale=None,
@@ -1196,6 +1226,112 @@ def test_dense_codec_fp8_indexer_layout_is_unchanged():
     )
 
 
+def test_dense_codec_keeps_qsa_side_caches_and_ignores_absent_ones():
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    blocks = 4
+    k = torch.zeros(blocks, 8, dtype=torch.bfloat16)
+    v = torch.zeros(blocks, 8, dtype=torch.bfloat16)
+    raw = torch.zeros(blocks, 4, dtype=torch.bfloat16)
+    comp = torch.zeros(blocks, 2, dtype=torch.bfloat16)
+    qsa = KVCacheTensor(
+        layer_num=0,
+        k_cache=k,
+        v_cache=v,
+    )
+    qsa.extra_planes = (("index_raw", raw), ("index_compressed", comp))
+    plain = KVCacheTensor(layer_num=1, k_cache=k, v_cache=v)
+    qsa_codec = DenseKVByteCodec({"qsa": qsa}, num_blocks=blocks)
+    plain_codec = DenseKVByteCodec({"mha": plain}, num_blocks=blocks)
+    assert qsa_codec.bytes_per_block == (8 + 8 + 4 + 2) * 2
+    assert plain_codec.bytes_per_block == (8 + 8) * 2
+
+
+def _block_planes(blocks, *widths):
+    import torch
+
+    return [torch.zeros(blocks, width, dtype=torch.uint8) for width in widths]
+
+
+def test_mp_page_layout_publishes_qsa_side_planes_by_name():
+    """The vLLM MP publisher names each extra plane after its field, whichever
+    of them a layer's formats leave out, and a layer with none publishes only
+    its KV."""
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+    from atom.plugin.vllm.kv_transfer.mp_page_layout import build_mp_transfer_tensors
+
+    blocks = 4
+    k, v, raw, comp, scale, latent = _block_planes(blocks, 8, 8, 4, 2, 1, 8)
+    # No `rope_positions`: the layout has no image input.
+    qsa = KVCacheTensor(
+        layer_num=0,
+        k_cache=k,
+        v_cache=v,
+    )
+    qsa.extra_planes = (
+        ("index_raw", raw),
+        ("index_compressed", comp),
+        ("index_compressed_scale", scale),
+    )
+    mla = KVCacheTensor(layer_num=1, k_cache=latent)
+    pages = build_mp_transfer_tensors([qsa, mla], num_blocks=blocks).pages
+    assert [page.region.semantic_role for page in pages] == [
+        "L0000.k_cache",
+        "L0000.v_cache",
+        "L0000.index_raw",
+        "L0000.index_compressed",
+        "L0000.index_compressed_scale",
+        "L0001.k_cache",
+    ]
+
+
+def test_every_qsa_side_plane_is_published_under_its_own_name():
+    """LMCache keys a layer's MP regions by these roles: each QSA side plane
+    publishes under its own name."""
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+    from atom.plugin.vllm.kv_transfer.mp_page_layout import build_mp_transfer_tensors
+
+    names = (
+        "index_raw",
+        "index_compressed",
+        "rope_positions",
+        "index_compressed_scale",
+    )
+    blocks = 4
+    k, v, *sides = _block_planes(blocks, 8, 8, 4, 2, 3, 1)
+    tensor = KVCacheTensor(layer_num=0, k_cache=k, v_cache=v)
+    tensor.extra_planes = tuple(zip(names, sides))
+    pages = build_mp_transfer_tensors([tensor], num_blocks=blocks).pages
+    assert [page.region.semantic_role for page in pages] == [
+        "L0000.k_cache",
+        "L0000.v_cache",
+        *(f"L0000.{name}" for name in names),
+    ]
+
+
+def test_mp_page_layout_refuses_an_extra_plane_it_cannot_name():
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+    from atom.plugin.vllm.kv_transfer.mp_page_layout import build_mp_transfer_tensors
+
+    k, other = _block_planes(4, 8, 2)
+    tensor = KVCacheTensor(layer_num=0, k_cache=k)
+    tensor.extra_planes = (("other", other),)
+    with pytest.raises(ValueError, match="other"):
+        build_mp_transfer_tensors([tensor], num_blocks=4)
+
+
 def test_lmcache_connector_maps_dcp_ranges_on_virtual_block_grid():
     import torch
 
@@ -1203,7 +1339,8 @@ def test_lmcache_connector_maps_dcp_ranges_on_virtual_block_grid():
         pytest.skip("real torch is unavailable")
 
     kv_caches = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
             v_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
             k_scale=None,
@@ -1258,6 +1395,9 @@ def test_staged_pipeline_allocates_on_first_consumer_stream(
         def record(self, stream):
             trace.append(("record", self.name, stream.name))
 
+        def synchronize(self):
+            trace.append(("host_wait", self.name))
+
     class _StreamContext:
         def __init__(self, state, stream):
             self.state = state
@@ -1273,6 +1413,9 @@ def test_staged_pipeline_allocates_on_first_consumer_stream(
             self.state.current_stream = None
 
     class _FakeState:
+        def begin_transfer(self):
+            pass
+
         def __init__(self):
             self.current_stream = None
             self.staging_buffer = SimpleNamespace(
@@ -1355,7 +1498,13 @@ def test_staged_pipeline_skips_the_handshake_on_a_shared_stream(shared_stream):
         def record(self, stream):
             calls.append(("record", self.name))
 
+        def synchronize(self):
+            calls.append(("host_wait", self.name))
+
     class _FakeState:
+        def begin_transfer(self):
+            pass
+
         def __init__(self):
             self.staging_buffer = SimpleNamespace(
                 tensor=None,
@@ -1430,7 +1579,13 @@ def _exception_pipeline(monkeypatch, direction: str, *, failed_stream: str | Non
         def record(self, stream) -> None:
             self.record_calls += 1
 
+        def synchronize(self) -> None:
+            pass
+
     class _FakeState:
+        def begin_transfer(self):
+            pass
+
         def __init__(self) -> None:
             self.pack_stream = _FakeStream("pack")
             self.copy_stream = _FakeStream("copy")
@@ -1589,7 +1744,8 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
     # one metadata upload and launch each group by index.
     monkeypatch.setenv("OFFLOAD_GPU_STAGING_CHUNKS", "1")
     original = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
             v_cache=(torch.arange(6 * 3, dtype=torch.uint8).reshape(6, 3) + 51),
             k_scale=None,
@@ -1597,7 +1753,8 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
         )
     }
     kv_caches = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=original["l0"].k_cache.clone(),
             v_cache=original["l0"].v_cache.clone(),
             k_scale=None,
@@ -1621,6 +1778,9 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
     monkeypatch.setattr(connector, "_ensure_staging_buffer", _ensure_staging_buffer)
 
     class _FakeState:
+        def begin_transfer(self):
+            pass
+
         def __init__(self) -> None:
             # Real streams and events, not doubles: the connector hands these
             # to `torch.cuda.stream()` and to `Stream.wait_event`, which read a
@@ -1711,7 +1871,8 @@ def test_lmcache_connector_requires_fused_chunk_major_staging():
         pytest.skip("real torch is unavailable")
 
     kv_caches = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
             v_cache=(torch.arange(4 * 3, dtype=torch.uint8).reshape(4, 3) + 51),
             k_scale=None,
@@ -1742,7 +1903,8 @@ def test_lmcache_connector_rejects_oversized_memory_obj():
         pytest.skip("real torch is unavailable")
 
     kv_caches = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
             v_cache=(torch.arange(4 * 3, dtype=torch.uint8).reshape(4, 3) + 51),
             k_scale=None,
@@ -1772,7 +1934,8 @@ def test_lmcache_connector_respects_staging_buffer_chunks_env(monkeypatch):
 
     monkeypatch.setenv("OFFLOAD_GPU_STAGING_CHUNKS", "3")
     kv_caches = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=torch.arange(2 * 2, dtype=torch.uint8).reshape(2, 2),
             v_cache=torch.arange(2 * 3, dtype=torch.uint8).reshape(2, 3),
             k_scale=None,
@@ -1792,7 +1955,8 @@ def _tiny_staging_codec():
     import torch
 
     kv_caches = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=torch.arange(2 * 2, dtype=torch.uint8).reshape(2, 2),
             v_cache=torch.arange(2 * 3, dtype=torch.uint8).reshape(2, 3),
             k_scale=None,
@@ -1887,7 +2051,8 @@ def test_codec_chunk_major_device_buffer_layout():
         pytest.skip("real torch is unavailable")
 
     original = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
             v_cache=(torch.arange(4 * 3, dtype=torch.uint8).reshape(4, 3) + 51),
             k_scale=None,
@@ -1895,7 +2060,8 @@ def test_codec_chunk_major_device_buffer_layout():
         )
     }
     kv_caches = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=original["l0"].k_cache.clone(),
             v_cache=original["l0"].v_cache.clone(),
             k_scale=None,
@@ -1938,13 +2104,15 @@ def test_codec_chunk_major_handles_tail_and_sparse_blocks():
         pytest.skip("real torch is unavailable")
 
     original = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
             v_cache=(torch.arange(6 * 4, dtype=torch.uint8).reshape(6, 4) + 31),
             k_scale=(torch.arange(6, dtype=torch.uint8).reshape(6, 1) + 101),
             v_scale=None,
         ),
-        "l1": SimpleNamespace(
+        "l1": KVCacheTensor(
+            layer_num=1,
             k_cache=(torch.arange(6 * 3, dtype=torch.uint8).reshape(6, 3) + 151),
             v_cache=(torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2) + 201),
             k_scale=None,
@@ -1952,7 +2120,8 @@ def test_codec_chunk_major_handles_tail_and_sparse_blocks():
         ),
     }
     kv_caches = {
-        name: SimpleNamespace(
+        name: KVCacheTensor(
+            layer_num=layer.layer_num,
             k_cache=layer.k_cache.clone(),
             v_cache=layer.v_cache.clone(),
             k_scale=layer.k_scale.clone() if layer.k_scale is not None else None,
@@ -1993,7 +2162,8 @@ def test_codec_chunk_major_rejects_duplicate_block_ids():
         pytest.skip("real torch is unavailable")
 
     kv_caches = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
             v_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
             k_scale=None,
@@ -2014,7 +2184,8 @@ def test_dense_prepared_ids_preserve_per_pipeline_group_validation():
         pytest.skip("real torch is unavailable")
 
     kv_caches = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
             v_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
             k_scale=None,
@@ -2049,12 +2220,14 @@ def test_scheduler_alignment_uses_dcp_hash_blocks_and_lmcache_chunks(monkeypatch
         lambda _config: SimpleNamespace(chunk_size=24),
     )
     monkeypatch.setattr(offcfg, "build_lmcache_metadata", lambda *_args: object())
-    config = SimpleNamespace(
-        kv_transfer_config={},
-        kv_cache_block_size=4,
-        decode_context_parallel_size=2,
-        state_checkpoint_interval_tokens=16,
-        tensor_parallel_size=1,
+    config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={},
+            kv_cache_block_size=4,
+            decode_context_parallel_size=2,
+            state_checkpoint_interval_tokens=16,
+            tensor_parallel_size=1,
+        )
     )
 
     sched = LMCacheOffloadConnectorScheduler(config)
@@ -2071,12 +2244,14 @@ def test_scheduler_snaps_checkpoint_interval_before_sidecar_cadence(monkeypatch)
         lambda _config: SimpleNamespace(chunk_size=24),
     )
     monkeypatch.setattr(offcfg, "build_lmcache_metadata", lambda *_args: object())
-    config = SimpleNamespace(
-        kv_transfer_config={},
-        kv_cache_block_size=4,
-        decode_context_parallel_size=2,
-        state_checkpoint_interval_tokens=25,
-        tensor_parallel_size=1,
+    config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={},
+            kv_cache_block_size=4,
+            decode_context_parallel_size=2,
+            state_checkpoint_interval_tokens=25,
+            tensor_parallel_size=1,
+        )
     )
 
     sched = LMCacheOffloadConnectorScheduler(config)
@@ -2093,12 +2268,14 @@ def test_zero_checkpoint_interval_keeps_terminal_alignment(monkeypatch):
         lambda _config: SimpleNamespace(chunk_size=24),
     )
     monkeypatch.setattr(offcfg, "build_lmcache_metadata", lambda *_args: object())
-    config = SimpleNamespace(
-        kv_transfer_config={},
-        kv_cache_block_size=4,
-        decode_context_parallel_size=2,
-        state_checkpoint_interval_tokens=0,
-        tensor_parallel_size=1,
+    config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={},
+            kv_cache_block_size=4,
+            decode_context_parallel_size=2,
+            state_checkpoint_interval_tokens=0,
+            tensor_parallel_size=1,
+        )
     )
 
     sched = LMCacheOffloadConnectorScheduler(config)
@@ -2112,11 +2289,13 @@ def test_dsv4_scheduler_invalid_lmcache_config_fails_fast(monkeypatch):
         raise ValueError("invalid LMCache storage")
 
     monkeypatch.setattr(offcfg, "build_lmcache_config", invalid_config)
-    config = SimpleNamespace(
-        kv_transfer_config={},
-        kv_cache_block_size=4,
-        decode_context_parallel_size=2,
-        tensor_parallel_size=1,
+    config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={},
+            kv_cache_block_size=4,
+            decode_context_parallel_size=2,
+            tensor_parallel_size=1,
+        )
     )
 
     with pytest.raises(ValueError, match="invalid LMCache storage"):
@@ -2134,11 +2313,13 @@ def test_dsv4_scheduler_invalid_lmcache_metadata_fails_fast(monkeypatch):
         raise ValueError("invalid LMCache TP geometry")
 
     monkeypatch.setattr(offcfg, "build_lmcache_metadata", invalid_metadata)
-    config = SimpleNamespace(
-        kv_transfer_config={},
-        kv_cache_block_size=4,
-        decode_context_parallel_size=2,
-        tensor_parallel_size=1,
+    config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={},
+            kv_cache_block_size=4,
+            decode_context_parallel_size=2,
+            tensor_parallel_size=1,
+        )
     )
 
     with pytest.raises(ValueError, match="invalid LMCache TP geometry"):
@@ -2151,11 +2332,13 @@ def test_dsv4_scheduler_rejects_fractional_lmcache_chunk(monkeypatch):
         "build_lmcache_config",
         lambda _config: SimpleNamespace(chunk_size=24.5),
     )
-    config = SimpleNamespace(
-        kv_transfer_config={},
-        kv_cache_block_size=4,
-        decode_context_parallel_size=2,
-        tensor_parallel_size=1,
+    config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={},
+            kv_cache_block_size=4,
+            decode_context_parallel_size=2,
+            tensor_parallel_size=1,
+        )
     )
 
     with pytest.raises(ValueError, match="LMCache chunk size must be an integer"):
@@ -2167,9 +2350,11 @@ def test_dsv4_scheduler_rejects_fractional_lmcache_chunk(monkeypatch):
     [LMCacheOffloadConnector, LMCacheOffloadConnectorScheduler],
 )
 def test_unknown_kv_role_fails_fast(connector_cls):
-    config = SimpleNamespace(
-        kv_transfer_config={"kv_role": "unknown"},
-        kv_cache_block_size=4,
+    config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={"kv_role": "unknown"},
+            kv_cache_block_size=4,
+        )
     )
 
     with pytest.raises(ValueError, match="kv_role"):
@@ -2327,6 +2512,54 @@ def test_a_prefix_the_tier_dropped_is_not_retrieved():
     assert "742" not in sched._load_specs
 
 
+def test_dsv4_a_load_the_tier_lost_stores_the_recomputed_span_back():
+    """Evicted between the lookup and the dispatch: the request recomputes
+    `[HBM, hit)`, the span the tier no longer holds, so it is saved again
+    from the HBM frontier rather than counted as persisted up to the hit."""
+    sched = _scheduler()
+    sched._lookup_client = _LookupClient(hit=12)
+    seq = SimpleNamespace(
+        id=744,
+        num_prompt_tokens=16,
+        token_ids=list(range(16)),
+        num_cached_tokens=0,
+        block_table=[1, 2, 3, 4],
+        has_per_req_cache=False,
+    )
+    assert sched.get_num_new_matched_tokens(seq) == (12, True)
+    sched.update_state_after_alloc(seq)
+    assert sched._save_tracker["744"][1] == 12
+    sched._lookup_client.hit = 4
+
+    meta = sched.build_connector_meta()
+
+    assert [req for req in meta.requests if req.load_spec is not None] == []
+    assert sched._save_tracker["744"][1] == 0
+
+
+def test_dsv4_a_lookup_that_did_not_answer_reopens_nothing():
+    """A timeout or an RPC error is a non-answer: the load is dropped, but the
+    tier most likely still holds the prefix, so it is not stored again."""
+    sched = _scheduler()
+    sched._lookup_client = _LookupClient(hit=12)
+    seq = SimpleNamespace(
+        id=745,
+        num_prompt_tokens=16,
+        token_ids=list(range(16)),
+        num_cached_tokens=0,
+        block_table=[1, 2, 3, 4],
+        has_per_req_cache=False,
+    )
+    assert sched.get_num_new_matched_tokens(seq) == (12, True)
+    sched.update_state_after_alloc(seq)
+    sched._lookup_client.hit = None
+
+    meta = sched.build_connector_meta()
+
+    assert [req for req in meta.requests if req.load_spec is not None] == []
+    assert sched._save_tracker["745"][1] == 12
+
+
 def test_a_failed_load_leaves_no_remembered_hit_behind():
     """A hit that the transfer could not honour must not be replayed.
 
@@ -2383,7 +2616,11 @@ def test_engine_core_dispatches_idle_lookup_unpin_metadata(monkeypatch):
 
     core = EngineCore.__new__(EngineCore)
     core.kv_transfer_enabled = True
-    core.scheduler = SimpleNamespace(kv_connector=_Connector())
+    core.scheduler = SimpleNamespace(
+        kv_connector=_Connector(),
+        _publish_state_loads=lambda: None,
+        _publish_state_stores=lambda: None,
+    )
     core.runner_mgr = SimpleNamespace(
         call_func=lambda name, value: dispatched.append((name, value))
     )
@@ -2402,7 +2639,7 @@ def test_chained_prefix_hashes_match_block_manager_with_dcp_hash_size():
     block_manager = BlockManager(config)
     tokens = list(range(32))
 
-    actual = _chained_prefix_hashes(tokens, block_manager.hash_block_size)
+    actual = _chained_prefix_hashes(tokens, block_manager.hash_block_size, -1)
     expected = {}
     parent = -1
     for boundary in range(
@@ -2820,9 +3057,9 @@ def test_sidecar_hashes_are_computed_once_per_sequence_lifecycle(monkeypatch):
     calls = []
     original = _chained_prefix_hashes
 
-    def counted(token_ids, hash_block_size):
+    def counted(token_ids, hash_block_size, **kwargs):
         calls.append(len(token_ids) // hash_block_size)
-        return original(token_ids, hash_block_size)
+        return original(token_ids, hash_block_size, **kwargs)
 
     monkeypatch.setattr(
         "atom.kv_transfer.offload.hybrid.dsv4.connector._chained_prefix_hashes",
@@ -2873,7 +3110,7 @@ def test_sidecar_save_emits_at_regular_checkpoint_boundary():
         group=2,
     )
     sched._save_tracker["706"] = [seq, 0]
-    boundary_hash = _chained_prefix_hashes(seq.token_ids, 256)[16_384]
+    boundary_hash = _chained_prefix_hashes(seq.token_ids, 256, -1)[16_384]
 
     meta = sched.build_connector_meta()
 
@@ -2940,7 +3177,7 @@ def test_off_interval_terminal_saves_page_without_slot():
         group=2,
     )
     sched._save_tracker["707"] = [seq, 16_384]
-    regular_hash = _chained_prefix_hashes(seq.token_ids, 256)[16_384]
+    regular_hash = _chained_prefix_hashes(seq.token_ids, 256, -1)[16_384]
     sched._committed_sidecar_hashes.add(regular_hash)
     meta = sched.build_connector_meta()
 
@@ -2976,7 +3213,7 @@ def test_sidecar_only_save_emits_when_page_boundary_is_already_stored():
         group=2,
     )
     sched._save_tracker["708"] = [seq, 8192]
-    boundary_hash = _chained_prefix_hashes(seq.token_ids, 256)[8192]
+    boundary_hash = _chained_prefix_hashes(seq.token_ids, 256, -1)[8192]
 
     meta = sched.build_connector_meta()
 
@@ -3528,6 +3765,7 @@ def test_tp_cross_generation_reports_do_not_clear_or_commit_until_matched():
     boundary_hash = boundary.slot_save_spec.boundary_block_hash
     aggregator = KVOutputAggregator(world_size=2)
     host = Scheduler.__new__(Scheduler)
+    host._early_load = EarlyLoadState()
     host.kv_connector = sched
     host.deferred_free_blocks = {}
     host.finished_recving_kv_req_ids = []
@@ -3622,6 +3860,7 @@ def test_collapsed_sidecar_and_save_completion_clears_page_inflight():
     sched._save_inflight["723"] = {prior_operation}
     boundary_operation = sched.build_connector_meta().requests[0].save_operation
     host = Scheduler.__new__(Scheduler)
+    host._early_load = EarlyLoadState()
     host.kv_connector = sched
     host.deferred_free_blocks = {}
     host.finished_recving_kv_req_ids = []
@@ -3685,6 +3924,8 @@ def test_aborted_parked_load_defers_owned_resources_until_terminal(
     seq = SimpleNamespace(
         id=729,
         status=SequenceStatus.ABORTED,
+        offload_loaded=False,
+        offload_load_failed=False,
         block_table=[10, 11],
         has_per_req_cache=True,
         state_slot=3,
@@ -3710,6 +3951,8 @@ def test_aborted_parked_load_defers_owned_resources_until_terminal(
         value.state_slot = -1
 
     host = Scheduler.__new__(Scheduler)
+
+    host._early_load = EarlyLoadState()
     host._inflight_prefix_wait = {}
     host.kv_connector = _Connector()
     host.block_manager = SimpleNamespace(deallocate=deallocate)
@@ -3719,7 +3962,7 @@ def test_aborted_parked_load_defers_owned_resources_until_terminal(
     host._num_parked_remote_kv = 1
     host._rejected = []
 
-    host._reject_aborted_waiting(seq)
+    host._finish_rejected_waiting(seq)
 
     assert host._rejected == [seq]
     assert host.deferred_free_blocks[seq.id] is seq
@@ -3752,6 +3995,8 @@ def test_aborted_parked_load_consumes_already_queued_terminal(queued_field):
     seq = SimpleNamespace(
         id=731,
         status=SequenceStatus.ABORTED,
+        offload_loaded=False,
+        offload_load_failed=False,
         block_table=[12, 13],
         has_per_req_cache=True,
         state_slot=4,
@@ -3777,6 +4022,8 @@ def test_aborted_parked_load_consumes_already_queued_terminal(queued_field):
         value.state_slot = -1
 
     host = Scheduler.__new__(Scheduler)
+
+    host._early_load = EarlyLoadState()
     host._inflight_prefix_wait = {}
     host.kv_connector = _Connector()
     host.block_manager = SimpleNamespace(deallocate=deallocate)
@@ -3787,7 +4034,7 @@ def test_aborted_parked_load_consumes_already_queued_terminal(queued_field):
     host._num_parked_remote_kv = 1
     host._rejected = []
 
-    host._reject_aborted_waiting(seq)
+    host._finish_rejected_waiting(seq)
 
     assert events == [
         ("request_finished", seq.id),
@@ -3851,6 +4098,8 @@ def test_abort_cleans_load_whose_terminal_was_already_consumed(
         value.state_slot = -1
 
     host = Scheduler.__new__(Scheduler)
+
+    host._early_load = EarlyLoadState()
     host._inflight_prefix_wait = {}
     host.kv_connector = _Connector()
     host.block_manager = SimpleNamespace(
@@ -3864,13 +4113,13 @@ def test_abort_cleans_load_whose_terminal_was_already_consumed(
     host._rejected = []
 
     host._update_from_kv_xfer_finished(KVConnectorOutput(**{terminal_field: {seq.id}}))
-    assert host._resolve_waiting_remote_kv(seq, deque()) is False
+    host._resolve_offload_load(seq)
     assert getattr(seq, consumed_flag) is True
     assert host.finished_recving_kv_req_ids == []
     assert host.failed_recving_kv_req_ids == []
 
     seq.status = SequenceStatus.ABORTED
-    host._reject_aborted_waiting(seq)
+    host._finish_rejected_waiting(seq)
 
     assert events == [
         (terminal_callback, seq.id),
@@ -3889,6 +4138,7 @@ def test_consume_failed_remote_kv_does_not_repeat_terminal_callback():
     seq = SimpleNamespace(
         id=730,
         status=SequenceStatus.WAITING_FOR_REMOTE_KVS,
+        block_table=[1],
         num_cached_tokens=4,
         offload_joint=OffloadJointRecord(),
     )
@@ -3901,6 +4151,8 @@ def test_consume_failed_remote_kv_does_not_repeat_terminal_callback():
             calls.append(req_id)
 
     host = Scheduler.__new__(Scheduler)
+
+    host._early_load = EarlyLoadState()
     host.kv_connector = _Connector()
     host.failed_recving_kv_req_ids = [seq.id]
     host._num_parked_remote_kv = 0
@@ -4038,6 +4290,7 @@ def test_tp_partial_sidecar_completion_never_commits():
     save_operation = meta.requests[0].save_operation
     boundary_hash = meta.requests[0].slot_save_spec.boundary_block_hash
     host = Scheduler.__new__(Scheduler)
+    host._early_load = EarlyLoadState()
     host.kv_connector = sched
     host.deferred_free_blocks = {}
     aggregator = KVOutputAggregator(world_size=2)
@@ -4098,6 +4351,7 @@ def test_tp_sidecar_failure_prevents_commit_after_all_workers_terminal():
     save_operation = meta.requests[0].save_operation
     boundary_hash = meta.requests[0].slot_save_spec.boundary_block_hash
     host = Scheduler.__new__(Scheduler)
+    host._early_load = EarlyLoadState()
     host.kv_connector = sched
     host.deferred_free_blocks = {}
     aggregator = KVOutputAggregator(world_size=2)
@@ -4222,7 +4476,7 @@ def test_prefill_chunk_does_not_recut_committed_or_inflight_boundary():
         num_cached_tokens=12_288,
         group=2,
     )
-    boundary_hash = _chained_prefix_hashes(seq.token_ids, 256)[16_384]
+    boundary_hash = _chained_prefix_hashes(seq.token_ids, 256, -1)[16_384]
 
     sched._committed_sidecar_hashes.add(boundary_hash)
     assert sched.adjust_prefill_chunk_after_alloc(seq, 8192) == 8192
@@ -4776,6 +5030,7 @@ def test_worker_save_uses_lmcache_engine_store():
 
     req = SimpleNamespace(
         req_id=987,
+        cache_salt="",
         token_ids=list(range(12)),
         block_ids=[3, 4, 5],
         is_last_prefill=True,
@@ -4823,6 +5078,7 @@ def test_worker_save_waits_for_forward_event_before_store():
 
     req = SimpleNamespace(
         req_id=988,
+        cache_salt="",
         token_ids=list(range(8)),
         block_ids=[3, 4],
         is_last_prefill=True,
@@ -4836,7 +5092,10 @@ def test_worker_save_waits_for_forward_event_before_store():
     assert conn._done_save == {988}
 
 
-def test_worker_load_uses_lmcache_engine_retrieve_and_marks_done():
+@pytest.mark.parametrize(
+    "cache_salt, configs", [("", None), ("11", {"lmcache.tag.cache_salt": "11"})]
+)
+def test_worker_load_uses_lmcache_engine_retrieve_and_marks_done(cache_salt, configs):
     import torch
 
     if not hasattr(torch, "tensor"):
@@ -4866,6 +5125,7 @@ def test_worker_load_uses_lmcache_engine_retrieve_and_marks_done():
 
     req = SimpleNamespace(
         req_id=988,
+        cache_salt=cache_salt,
         token_ids=list(range(16)),
         block_ids=[3, 4, 5, 6],
         load_spec=SimpleNamespace(hbm_cached_tokens=4, lmcache_cached_tokens=12),
@@ -4881,6 +5141,7 @@ def test_worker_load_uses_lmcache_engine_retrieve_and_marks_done():
     assert mask == [False, False, False, False] + [True] * 8
     assert kwargs["block_ids"] == [3, 4, 5, 6]
     assert kwargs["req_id"] == "988"
+    assert kwargs.get("request_configs") == configs
 
 
 def test_worker_load_partial_retrieve_marks_failed():
@@ -5045,6 +5306,7 @@ def test_chunked_prefill_save_uses_computed_frontier_and_serializes_inflight(
     pending_send = {str(seq.id)}
     freed = []
     engine_sched = Scheduler.__new__(Scheduler)
+    engine_sched._early_load = EarlyLoadState()
     engine_sched.deferred_free_blocks = {seq.id: seq}
     engine_sched.block_manager = SimpleNamespace(deallocate=freed.append)
     engine_sched.kv_connector = SimpleNamespace(
@@ -5147,6 +5409,8 @@ def test_finished_saving_releases_deferred_free_with_string_req_id():
             return str(seq.id) in self.inflight
 
     sched = Scheduler.__new__(Scheduler)
+
+    sched._early_load = EarlyLoadState()
     sched.block_manager = _BlockManager()
     sched.kv_connector = _Connector()
     seq = SimpleNamespace(id=9)
@@ -5176,6 +5440,8 @@ def test_producer_waits_for_send_and_final_save(send_first):
             return self.pending_save or self.pending_send
 
     host = Scheduler.__new__(Scheduler)
+
+    host._early_load = EarlyLoadState()
     host.kv_connector = Connector()
     freed = []
     host.block_manager = SimpleNamespace(deallocate=lambda seq: freed.append(seq.id))
@@ -5194,6 +5460,7 @@ def test_producer_waits_for_send_and_final_save(send_first):
 
 def test_finished_recv_matches_string_req_id():
     sched = Scheduler.__new__(Scheduler)
+    sched._early_load = EarlyLoadState()
     sched.finished_recving_kv_req_ids = ["123"]
     # kv_events disabled: skip the remote-store recording path so this test
     # only exercises string/int req_id matching in _pop_req_id.
@@ -5304,7 +5571,8 @@ def test_codec_mla_token_major_block_accounting():
     # MLA: single latent k_cache, token-major (num_blocks*block_size, 1, latent),
     # no V / scale tensors.
     kv_caches = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=torch.arange(
                 num_blocks * block_size * latent, dtype=torch.uint8
             ).reshape(num_blocks * block_size, 1, latent),
@@ -5324,7 +5592,8 @@ def test_codec_mla_token_major_block_accounting():
     with pytest.raises(ValueError):
         DenseKVByteCodec(
             {
-                "l0": SimpleNamespace(
+                "l0": KVCacheTensor(
+                    layer_num=0,
                     k_cache=torch.arange(7, dtype=torch.uint8),
                     v_cache=None,
                     k_scale=None,
@@ -5347,8 +5616,12 @@ def test_codec_mla_round_trip_byte_identical():
         num_blocks * block_size, 1, latent
     )
     kv_caches = {
-        "l0": SimpleNamespace(
-            k_cache=original.clone(), v_cache=None, k_scale=None, v_scale=None
+        "l0": KVCacheTensor(
+            layer_num=0,
+            k_cache=original.clone(),
+            v_cache=None,
+            k_scale=None,
+            v_scale=None,
         )
     }
     codec = DenseKVByteCodec(kv_caches, num_blocks=num_blocks)
@@ -5386,7 +5659,8 @@ def test_codec_dsa_includes_index_cache_segment():
         num_blocks * block_size * index_dim, dtype=torch.uint8
     ).reshape(num_blocks, block_size, index_dim)
     kv_caches = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=k_cache.clone(),
             v_cache=None,
             k_scale=None,
@@ -5480,7 +5754,8 @@ def test_codec_dsa_fp8_multilayer_including_mtp_round_trip():
     # which shares the pool and is registered identically.
     layers = {f"layer_{i}": _make_layer(i) for i in range(3)}
     kv_caches = {
-        name: SimpleNamespace(
+        name: KVCacheTensor(
+            layer_num=int(name.removeprefix("layer_")),
             k_cache=k.clone(),
             v_cache=None,
             k_scale=None,
@@ -5672,6 +5947,27 @@ def test_engine_id_defaults_to_replica_zero():
     assert offcfg.lmcache_engine_id(SimpleNamespace()) == "atom-offload-dp0"
 
 
+def _server_config(server_id, dp_rank: int = 0, **kw):
+    cfg = _dp_config(dp_rank, **kw)
+    cfg.parallel_config.server_instance_id = server_id
+    return cfg
+
+
+def test_engine_id_splits_servers_on_one_host_and_their_replicas():
+    # One TP1 server per GPU: every one is DP rank 0 under one host directory.
+    same = {
+        offcfg.lmcache_engine_id(
+            _server_config("a", 3, pp_size=2, tp_size=4, pp_rank=pp)
+        )
+        for pp in range(2)
+    }
+    assert same == {"atom-offload-a-dp3"}
+    servers = [_server_config(str(gpu)) for gpu in range(8)]
+    replicas = [_server_config("0", rank) for rank in range(1, 8)]
+    ids = {offcfg.lmcache_engine_id(cfg) for cfg in servers + replicas}
+    assert len(ids) == 15
+
+
 def test_replica_world_size_counts_pp_and_tp_but_not_dp():
     # Worker ids index the replica-local PP x TP grid. Folding DP in would push
     # every replica but the first past lookup_server_worker_ids=[0], leaving
@@ -5738,7 +6034,11 @@ def _idle_engine(meta: LMCacheOffloadMetadata):
     )
     return SimpleNamespace(
         kv_transfer_enabled=True,
-        scheduler=SimpleNamespace(kv_connector=connector),
+        scheduler=SimpleNamespace(
+            kv_connector=connector,
+            _publish_state_loads=lambda: None,
+            _publish_state_stores=lambda: None,
+        ),
         runner_mgr=_RecordingRunnerMgr(),
         pp_transport=_RecordingPPTransport(),
     )
@@ -5788,6 +6088,22 @@ def test_dispatch_skips_metadata_with_no_work_at_all():
     assert engine.pp_transport.sent == []
 
 
+def test_pp_head_shutdown_drain_publishes_no_state_work():
+    from atom.model_engine.pp_engine_core import PPEngineCoreProc
+
+    published = []
+    engine = _idle_engine(LMCacheOffloadMetadata())
+    engine.scheduler._publish_state_loads = lambda: published.append("loads")
+    engine.scheduler._publish_state_stores = lambda: published.append("stores")
+    engine._dispatch_connector_only_batch = lambda batch: None
+
+    PPEngineCoreProc._dispatch_idle_offload_work(engine, dispatch_new=False)
+    assert published == []
+
+    PPEngineCoreProc._dispatch_idle_offload_work(engine)
+    assert published == ["loads", "stores"]
+
+
 def test_multi_metadata_exposes_sub_meta_unpins():
     # The prefill node runs offload inside a `multi` connector, so the idle
     # dispatch only ever sees the wrapper. Without this aggregate it reads as
@@ -5822,6 +6138,10 @@ def _k3_scheduler() -> KimiK3OffloadScheduler:
     s._save_rr_last = None
     s._pending_state_loads = []
     s._pending_state_stores = []
+    s._pending_state_touches = []
+    s._touch_generation = 0
+    s._state_touch_verdicts = {}
+    s._state_touches_unrefreshed = 0
     s._save_inflight_since = {}
     s._save_stalled = False
     s._warned_save_stalled = False
@@ -5831,6 +6151,104 @@ def _k3_scheduler() -> KimiK3OffloadScheduler:
     s._do_save = True
     s._max_pending_saves = 4
     return s
+
+
+def test_only_k3_scales_the_default_pending_saves_with_pp(monkeypatch):
+    monkeypatch.delenv("OFFLOAD_MAX_PENDING_SAVES", raising=False)
+    monkeypatch.setenv("OFFLOAD_COPY_WORKERS", "1")
+    monkeypatch.setattr(DenseOffloadScheduler, "__init__", lambda self, config: None)
+    config = SimpleNamespace(kv_transfer_config={}, pipeline_parallel_size=8)
+    monkeypatch.setattr(offcfg, "select_offload_layout", lambda _config: "kimi_k3")
+    assert KimiK3OffloadScheduler(config)._max_pending_saves == 16
+    monkeypatch.setattr(offcfg, "select_offload_layout", lambda _config: "qwen")
+    assert QwenOffloadScheduler(config)._max_pending_saves == 2
+
+
+def _pp2_stage_tier(monkeypatch, cls, layout, stage, spec):
+    """`cls`'s worker tier for one stage of a PP2 x TP2 run, at TP rank 0."""
+    import torch
+
+    from atom.kv_transfer.offload.hybrid.kimi_k3 import connector as k3_connector
+
+    monkeypatch.setattr(offcfg, "select_offload_layout", lambda _config: layout)
+    monkeypatch.setattr(offcfg, "build_lmcache_config", lambda _kvc: None)
+    monkeypatch.setattr(
+        offcfg, "build_lmcache_metadata", lambda *_: SimpleNamespace(model_name="m")
+    )
+    monkeypatch.setattr(k3_connector, "StagedTransfer", lambda *_a, **_k: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.dist.parallel_state",
+        SimpleNamespace(
+            get_tp_group=lambda: SimpleNamespace(world_size=2, rank_in_group=0)
+        ),
+    )
+    image = spec.image_bytes if spec else 1 << 20
+    backend = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            state_runtime=SimpleNamespace(checkpoint_spec=spec)
+        ),
+        state_entry_views=lambda _slot: [torch.empty(image, dtype=torch.uint8)],
+        page_unit_views=lambda *_: [],
+    )
+    worker = cls.__new__(cls)
+    worker._config = SimpleNamespace(
+        kv_transfer_config={},
+        pipeline_parallel_size=2,
+        parallel_config=SimpleNamespace(pipeline_parallel_rank=stage),
+    )
+    worker._engine = SimpleNamespace(
+        gpu_connector=SimpleNamespace(
+            device="cpu", release_gpu_staging_after_transfer=False
+        ),
+        storage_manager=None,
+    )
+    worker._state_tier = None
+    worker._build_state_tier(SimpleNamespace(state_backend=backend))
+    return worker._state_tier
+
+
+def test_pp_stages_build_k3_tiers_that_key_apart_and_match_the_engine_cap(
+    monkeypatch,
+):
+    """The 2 MiB and 1 MiB stages pool 2 GiB over a 3 MiB joint image, so both
+    keep 682 images, the cap the engine's index mirrors for the same spec."""
+    from atom.model_engine.state_offload import state_tier_cpu_entries
+
+    monkeypatch.setenv("OFFLOAD_STATE_CPU_SIZE", "1")
+    tiers = []
+    for stage, image in ((0, 2 << 20), (1, 1 << 20)):
+        # what each stage's checkpoint spec gives the tier
+        spec = SimpleNamespace(
+            layout_id="pp2-joint:tier-test",
+            image_bytes=image,
+            pipeline_op_bytes=3 << 20,
+        )
+        tier = _pp2_stage_tier(
+            monkeypatch, KimiK3OffloadConnector, "kimi_k3", stage, spec
+        )
+        tiers.append(tier)
+        assert tier.codec._max_entries == state_tier_cpu_entries(
+            spec, SimpleNamespace(pipeline_parallel_size=2)
+        )
+    for tier in tiers:
+        tier.shutdown()
+    assert [t.codec._max_entries for t in tiers] == [682, 682]
+    # Stage 1's TP rank 0 is worker 2 of 4, not stage 0's worker 0.
+    assert [(t.codec._worker_id, t.codec._world_size) for t in tiers] == [
+        (0, 4),
+        (2, 4),
+    ]
+
+
+def test_a_qwen_pp_worker_logs_the_pipeline_refusal(monkeypatch, caplog):
+    with caplog.at_level(logging.INFO, logger="atom"):
+        tier = _pp2_stage_tier(monkeypatch, QwenOffloadConnector, "qwen", 0, None)
+    assert tier is None
+    assert "layout 'qwen' keeps no state tier at pipeline_parallel_size=2" in (
+        caplog.text
+    )
+    assert "layout id" not in caplog.text
 
 
 def _k3_seq(*, hbm: int, joint: int = 0, kv: int = 0, claimed: int = 0):
@@ -5866,6 +6284,7 @@ def test_bounded_saves_are_shared_round_robin_not_head_first():
     s.block_size = 256
     s._do_save = True
     s._do_load = False
+    s._lookup_client = None
     s._reqs_need_recv = {}
     s._lookup_in_step = []
     s._save_tracker = {}
@@ -5905,8 +6324,10 @@ def test_bounded_saves_are_shared_round_robin_not_head_first():
 def test_layout_selection_picks_kimi_k3_for_a_kda_config():
     """K3's paged KV is ordinary dense MLA, so the layout cannot be read off
     the KV shape -- the KDA state is what makes it its own family."""
-    cfg = SimpleNamespace(
-        hf_config=SimpleNamespace(model_type="kimi_linear"), kv_transfer_config={}
+    cfg = with_min_load(
+        SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="kimi_linear"), kv_transfer_config={}
+        )
     )
     assert offcfg.select_offload_layout(cfg) == "kimi_k3"
 
@@ -6345,6 +6766,12 @@ def test_a_step_whose_only_work_is_a_state_store_reaches_the_worker():
 
     meta = LMCacheOffloadMetadata()
     meta.state_stores = [(111, (1, 2))]
+    assert connector_metadata_has_work(meta)
+
+
+def test_a_step_whose_only_work_is_a_state_touch_reaches_the_worker():
+    meta = LMCacheOffloadMetadata()
+    meta.state_touches = [StateTouchId(7, 0)]
     assert connector_metadata_has_work(meta)
 
 
@@ -7168,7 +7595,397 @@ class TestStateStoreCompletionsCarryAGeneration:
         assert failed == set()
 
 
+class _Obj:
+    """A MemoryObj's reference count, and nothing else."""
+
+    def __init__(self, size: int = 1024) -> None:
+        self.refs = 1
+        self.size = size
+
+    def ref_count_up(self) -> None:
+        self.refs += 1
+
+    def ref_count_down(self) -> None:
+        assert self.refs > 0, "reference discharged twice"
+        self.refs -= 1
+
+    def get_ref_count(self) -> int:
+        return self.refs
+
+    def get_size(self) -> int:
+        return self.size
+
+
+class _LRUPolicy:
+    """LMCache's `LRUCachePolicy.update_on_hit`."""
+
+    def update_on_hit(self, key, cache) -> None:
+        cache.move_to_end(key)
+
+
+class _LocalCPU:
+    """`storage_manager` over LocalCPU's rules.
+
+    `batched_put` adopts an object with its own reference unless the key is
+    already resident (LocalCPU refuses duplicates), then drops the caller's.
+    `get` does not touch the LRU (`get_blocking` only takes a reference).
+    `evict_oldest` is the pool making room for KV: oldest first, skipping
+    anything another holder still references.
+    """
+
+    def __init__(self) -> None:
+        self.hot: OrderedDict = OrderedDict()
+        # A second backend (LocalDisk) for presence only: `contains` answers
+        # from it, `get` does not read it (no test loads a disk-only image).
+        self.disk: dict = {}
+        self.puts = 0
+        self.local_cpu_backend = SimpleNamespace(
+            cpu_lock=threading.Lock(), hot_cache=self.hot, cache_policy=_LRUPolicy()
+        )
+
+    def batched_put(self, keys, objs) -> None:
+        self.puts += 1
+        for k, o in zip(keys, objs, strict=True):
+            if k not in self.hot:
+                o.ref_count_up()
+                self.hot[k] = o
+            o.ref_count_down()
+
+    def get(self, key):
+        o = self.hot.get(key)
+        if o is not None:
+            o.ref_count_up()
+        return o
+
+    def contains(self, key):
+        if key in self.hot:
+            return "LocalCPUBackend"
+        return "LocalDiskBackend" if key in self.disk else None
+
+    def spill_to_disk(self, key) -> None:
+        """LocalCPU evicted `key`; the disk backend still holds a copy."""
+        self.disk[key] = True
+        self.hot.pop(key).ref_count_down()
+
+    def remove(self, key) -> int:
+        o = self.hot.pop(key, None)
+        if o is None:
+            return 0
+        o.ref_count_down()
+        return 1
+
+    def evict_oldest(self):
+        for k, o in self.hot.items():
+            if o.get_ref_count() == 1:
+                self.hot.pop(k).ref_count_down()
+                return k
+        return None
+
+
+def _lru_codec(storage, max_entries):
+    codec = StateByteCodec(
+        backend=SimpleNamespace(
+            page_unit_views=lambda units: [], state_entry_views=lambda slot: []
+        ),
+        staged=SimpleNamespace(pack=lambda views, obj: None, unpack=lambda o, v: None),
+        entry_bytes=1024,
+        model_name="qwen",
+        world_size=1,
+        worker_id=0,
+        layout_id="L",
+        max_cache_bytes=None if max_entries is None else max_entries * 1024,
+    )
+    codec.bind_storage_manager(storage)
+    allocated = []
+
+    def allocate(nbytes):
+        allocated.append(_Obj(nbytes))
+        return allocated[-1]
+
+    codec._allocate = allocate
+    return codec, allocated
+
+
+def _kv(pool, name):
+    pool.hot[name] = _Obj()
+
+
+# ── the codec: touch, get and re-store refresh LMCache's LRU ───────────────
+
+
+class TestCodecRefresh:
+    def test_a_touch_moves_the_image_past_older_kv(self, lmcache_key):
+        pool = _LocalCPU()
+        codec, _ = _lru_codec(pool, max_entries=None)
+        assert codec.put(1, [])
+        _kv(pool, "kv-chunk")
+        assert codec.touch(1) is TouchResult.REFRESHED
+        assert pool.evict_oldest() == "kv-chunk"
+        assert codec.key(1) in pool.hot
+
+    def test_a_touch_reports_an_evicted_image_gone(self, lmcache_key):
+        pool = _LocalCPU()
+        codec, _ = _lru_codec(pool, max_entries=3)
+        assert codec.put(1, []) and codec.put(2, []) and codec.put(3, [])
+        assert pool.remove(codec.key(2))
+        assert codec.touch(2) is TouchResult.GONE
+        assert codec.put(4, [])
+        assert codec.key(1) in pool.hot, "a gone image no longer counts against the cap"
+
+    def test_a_resume_refreshes_the_image(self, lmcache_key):
+        """`get_blocking` takes a reference and nothing else."""
+        pool = _LocalCPU()
+        codec, objs = _lru_codec(pool, max_entries=None)
+        assert codec.put(1, [])
+        _kv(pool, "kv-chunk")
+        assert codec.get(1, 0)
+        assert objs[0].refs == 1, "the load's reference is discharged"
+        assert pool.evict_oldest() == "kv-chunk"
+
+    def test_a_resident_image_is_refreshed_not_stored_twice(self, lmcache_key):
+        pool = _LocalCPU()
+        codec, objs = _lru_codec(pool, max_entries=2)
+        released = []
+        assert codec.put(1, [])
+        _kv(pool, "kv-chunk")
+        assert codec.put(1, [], on_source_released=lambda: released.append(True))
+
+        assert len(objs) == 1, "no second image-sized allocation and D2H"
+        assert released == [True], "the source units must still be handed back"
+        assert pool.evict_oldest() == "kv-chunk"
+
+    def test_an_evicted_image_is_stored_again(self, lmcache_key):
+        pool = _LocalCPU()
+        codec, objs = _lru_codec(pool, max_entries=2)
+        assert codec.put(1, [])
+        pool.evict_oldest()
+        assert codec.put(1, [])
+        assert len(objs) == 2 and codec.key(1) in pool.hot
+
+    def test_the_cap_retires_the_least_recently_used_image(self, lmcache_key):
+        """Not the oldest store: the image a touch kept warm survives."""
+        pool = _LocalCPU()
+        codec, objs = _lru_codec(pool, max_entries=2)
+        assert codec.put(1, []) and codec.put(2, [])
+        assert codec.touch(1) is TouchResult.REFRESHED
+        assert codec.put(3, [])
+
+        assert codec.key(2) not in pool.hot
+        assert objs[1].refs == 0, "a retired image goes back to the allocator"
+        assert codec.key(1) in pool.hot and codec.key(3) in pool.hot
+
+    @pytest.mark.parametrize(
+        "missing",
+        [
+            "local_cpu_backend",
+            "local_cpu_backend.cpu_lock",
+            "local_cpu_backend.hot_cache",
+            "local_cpu_backend.cache_policy",
+            "cache_policy.update_on_hit",
+        ],
+    )
+    def test_without_the_lru_internals_a_touch_only_confirms_presence(
+        self, lmcache_key, missing, caplog
+    ):
+        """An LMCache whose internals moved keeps serving loads; bind warns
+        once, naming what is missing, and a touch adds no second warning."""
+        pool = _LocalCPU()
+        if missing == "local_cpu_backend":
+            del pool.local_cpu_backend
+        elif missing == "cache_policy.update_on_hit":
+            pool.local_cpu_backend.cache_policy = SimpleNamespace()
+        else:
+            setattr(pool.local_cpu_backend, missing.split(".")[1], None)
+        with caplog.at_level(logging.WARNING, logger="atom"):
+            codec, _ = _lru_codec(pool, max_entries=None)
+            assert codec.put(1, [])
+            assert codec.touch(1) is TouchResult.PRESENT
+        warned = [r.message for r in caplog.records]
+        assert len(warned) == 1 and missing in warned[0]
+        pool.hot.clear()
+        assert codec.touch(1) is TouchResult.GONE
+
+    def test_the_lru_is_resolved_once_at_bind(self, lmcache_key):
+        pool = _LocalCPU()
+        codec, _ = _lru_codec(pool, max_entries=None)
+        assert codec.put(1, [])
+        _kv(pool, "kv-chunk")
+        pool.local_cpu_backend = None
+        assert codec.touch(1) is TouchResult.REFRESHED
+        assert pool.evict_oldest() == "kv-chunk"
+
+    def test_a_presence_only_touch_is_warned_once(self, lmcache_key, caplog):
+        """A disk-only image is still readable, but its LRU was not refreshed:
+        that must not be silent, and must not be one warning per touch."""
+        pool = _LocalCPU()
+        codec, _ = _lru_codec(pool, max_entries=None)
+        assert codec.put(1, []) and codec.put(2, [])
+        pool.spill_to_disk(codec.key(2))
+        with caplog.at_level(logging.WARNING, logger="atom"):
+            assert codec.touch(1) is TouchResult.REFRESHED
+            assert codec.touch(2) is TouchResult.PRESENT
+            assert codec.touch(2) is TouchResult.PRESENT
+            assert codec.touch(3) is TouchResult.GONE
+        warned = [r for r in caplog.records if "touches_unrefreshed" in r.message]
+        assert len(warned) == 1
+
+    def test_a_disk_only_image_is_stored_back_into_the_cpu_tier(self, lmcache_key):
+        """The put fast path is for an image LocalCPU still holds, not for
+        one only the disk does."""
+        pool = _LocalCPU()
+        codec, objs = _lru_codec(pool, max_entries=None)
+        assert codec.put(1, [])
+        pool.spill_to_disk(codec.key(1))
+        released = []
+        assert codec.put(1, [], on_source_released=lambda: released.append(True))
+        assert pool.puts == 2 and len(objs) == 2
+        assert codec.key(1) in pool.hot
+        assert released == [True]
+
+
+# ── the connector: touches out in the metadata, verdicts back by quorum ────
+
+
+def _touch_worker(tier):
+    c = KimiK3OffloadConnector.__new__(KimiK3OffloadConnector)
+    c._state_tier = tier
+    c._touch_verdicts = {}
+    c._warned_touch_failure = False
+    return c
+
+
+def _reported(worker):
+    out = KVConnectorOutput()
+    worker._emit_touch_verdicts(out)
+    return out.connector_completions
+
+
+def _reports(touch_id, *, resident, refreshed):
+    return {
+        ConnectorCompletion(STATE_TOUCH_CHANNEL, touch_id, resident),
+        ConnectorCompletion(STATE_TOUCH_REFRESH_CHANNEL, touch_id, refreshed),
+    }
+
+
+class TestConnectorTouches:
+    def test_the_worker_touches_and_reports_each_verdict(self):
+        touched = []
+
+        found = {1: TouchResult.REFRESHED, 2: TouchResult.GONE, 3: TouchResult.PRESENT}
+
+        def touch(h):
+            touched.append(h)
+            return found[h]
+
+        worker = _touch_worker(SimpleNamespace(codec=SimpleNamespace(touch=touch)))
+        ids = [StateTouchId(1, 0), StateTouchId(2, 1), StateTouchId(3, 2)]
+        worker._touch_states(SimpleNamespace(state_touches=ids))
+        assert touched == [1, 2, 3]
+        # Only a present-but-unrefreshed image reports unrefreshed.
+        assert _reported(worker) == (
+            _reports(ids[0], resident=True, refreshed=True)
+            | _reports(ids[1], resident=False, refreshed=True)
+            | _reports(ids[2], resident=True, refreshed=False)
+        )
+        assert _reported(worker) == set(), "drained once"
+
+    def test_start_load_kv_touches(self, monkeypatch):
+        monkeypatch.setattr(DenseOffloadConnector, "start_load_kv", lambda s, m: None)
+        worker = _touch_worker(
+            SimpleNamespace(
+                codec=SimpleNamespace(touch=lambda h: TouchResult.REFRESHED)
+            )
+        )
+        meta = LMCacheOffloadMetadata()
+        meta.state_touches = [StateTouchId(7, 0)]
+        worker.start_load_kv(meta)
+        assert _reported(worker) == _reports(
+            StateTouchId(7, 0), resident=True, refreshed=True
+        )
+
+    def test_with_no_tier_every_image_is_gone(self):
+        worker = _touch_worker(None)
+        worker._touch_states(SimpleNamespace(state_touches=[StateTouchId(1, 0)]))
+        assert _reported(worker) == _reports(
+            StateTouchId(1, 0), resident=False, refreshed=True
+        )
+
+    def test_a_failing_touch_is_unrefreshed_and_logged_once(self, caplog):
+        """A raising touch keeps the image (resident) but is not a refresh;
+        a drifted LMCache raises on every touch, so one traceback."""
+
+        def touch(h):
+            raise RuntimeError("backend hiccup")
+
+        worker = _touch_worker(SimpleNamespace(codec=SimpleNamespace(touch=touch)))
+        ids = [StateTouchId(1, 0), StateTouchId(2, 1), StateTouchId(1, 2)]
+        with caplog.at_level(logging.WARNING, logger="atom"):
+            worker._touch_states(SimpleNamespace(state_touches=ids[:2]))
+            worker._touch_states(SimpleNamespace(state_touches=ids[2:]))
+        assert _reported(worker) == set().union(
+            *(_reports(i, resident=True, refreshed=False) for i in ids)
+        )
+        assert [r.exc_info is not None for r in caplog.records] == [True]
+
+    def _scheduler(self, monkeypatch):
+        monkeypatch.setattr(
+            DenseOffloadScheduler,
+            "build_connector_meta",
+            lambda self: LMCacheOffloadMetadata(),
+        )
+        s = _k3_scheduler()
+        s._refresh_save_stall = lambda: None
+        return s
+
+    def test_each_touch_is_a_distinct_identity_drained_once(self, monkeypatch):
+        s = self._scheduler(monkeypatch)
+        assert s.enqueue_state_touches([5, 5])
+        meta = s.build_connector_meta()
+        assert meta.state_touches == [StateTouchId(5, 0), StateTouchId(5, 1)]
+        assert s.build_connector_meta().state_touches == []
+
+    def test_one_rank_missing_the_image_makes_it_gone(self, monkeypatch):
+        s = self._scheduler(monkeypatch)
+        for op, ok in ((StateTouchId(5, 0), True), (StateTouchId(5, 1), False)):
+            handled = s.connector_completion(
+                ConnectorCompletion(STATE_TOUCH_CHANNEL, op, ok)
+            )
+            assert handled is None, "handled, but not a terminal save"
+        s.connector_completion(
+            ConnectorCompletion(STATE_TOUCH_CHANNEL, StateTouchId(6, 2), True)
+        )
+        assert s.take_state_touch_verdicts() == {5: False, 6: True}
+        assert s.take_state_touch_verdicts() == {}
+
+    def test_both_touch_reports_reach_quorum_across_tp(self, monkeypatch):
+        """Each rank files a residency and a refresh report per touch; one
+        rank that only found the image present counts the touch unrefreshed
+        without making it gone."""
+        touch = StateTouchId(5, 0)
+        outputs = []
+        for result in (TouchResult.REFRESHED, TouchResult.PRESENT):
+            worker = _touch_worker(
+                SimpleNamespace(codec=SimpleNamespace(touch=lambda h, r=result: r))
+            )
+            worker._touch_states(SimpleNamespace(state_touches=[touch]))
+            outputs.append(KVConnectorOutput(connector_completions=_reported(worker)))
+        merged = KVOutputAggregator(world_size=2).aggregate(outputs)
+        s = self._scheduler(monkeypatch)
+        monkeypatch.setattr(
+            OffloadSchedulerMixin, "get_statistics", lambda self: {"load_requests": 3}
+        )
+        for completion in merged.connector_completions:
+            assert s.connector_completion(completion) is None, "not a save"
+        assert s.take_state_touch_verdicts() == {5: True}
+        assert s.get_statistics() == {
+            "load_requests": 3,
+            "state_touches_unrefreshed": 1,
+        }
+
+
 # ── kimi_k3: loads must not queue behind a backlog of stores ───────────────
+
+_COPY_DONE = SimpleNamespace(synchronize=lambda: None)
 
 
 class TestStateLoadsAndStoresRunInSeparateLanes:
@@ -7206,7 +8023,7 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
         tier = self._tier(codec)
         try:
             for gen in range(4):
-                tier.submit_store(StateStoreOperationId(gen, gen + 1), (0,))
+                tier.submit_store(StateStoreOperationId(gen, gen + 1), (0,), _COPY_DONE)
             tier.submit_load("r1", 77, 0)
             assert codec.loaded.wait(
                 timeout=5
@@ -7228,7 +8045,7 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
         tier = self._tier(codec, staging_lanes=1)
         try:
             for gen in range(3):
-                tier.submit_store(StateStoreOperationId(gen, gen + 1), (0,))
+                tier.submit_store(StateStoreOperationId(gen, gen + 1), (0,), _COPY_DONE)
             tier.submit_load("r1", 77, 0)
             assert not codec.loaded.wait(timeout=0.2), "held by the in-flight store"
             codec.gate.set()
@@ -7242,7 +8059,7 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
         tier = self._tier(codec)
         try:
             assert tier.oldest_store_age_s() == 0.0
-            tier.submit_store(StateStoreOperationId(1, 1), (0,))
+            tier.submit_store(StateStoreOperationId(1, 1), (0,), _COPY_DONE)
             assert tier.oldest_store_age_s() >= 0.0
             assert len(tier._store_submitted_at) == 1
         finally:
@@ -7279,7 +8096,7 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
         tier = self._tier(codec)
         op = StateStoreOperationId(1, 1)
         try:
-            tier.submit_store(op, (0,))
+            tier.submit_store(op, (0,), _COPY_DONE)
             assert codec.released.wait(timeout=5), "the D2H callback never fired"
             # Early: units handed back while the CPU put is still running.
             assert tier.take_source_releases() == {op}
@@ -7307,7 +8124,7 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
         tier = self._tier(_RefuseCodec())
         op = StateStoreOperationId(2, 1)
         try:
-            tier.submit_store(op, (0,))
+            tier.submit_store(op, (0,), _COPY_DONE)
             tier.drain()
             assert tier.take_source_releases() == {op}
             assert tier.take_store_reports() == (set(), {op})
@@ -7329,9 +8146,343 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
         tier = self._tier(_ThrowCodec())
         op = StateStoreOperationId(3, 1)
         try:
-            tier.submit_store(op, (0,))
+            tier.submit_store(op, (0,), _COPY_DONE)
             tier.drain()
             assert tier.take_source_releases() == {op}
             assert tier.take_store_reports() == (set(), {op})
         finally:
             tier.shutdown()
+
+
+@pytest.fixture(autouse=True)
+def _synthetic_stream_operation_completion(monkeypatch):
+    # Synthetic CPU streams model completion via synchronize(). Real streams
+    # keep the actual event fence; its ordering has dedicated contract tests.
+    from atom.kv_transfer.offload import atom_lmcache_staging as staging
+
+    original = staging.fence_submitted_work
+
+    def complete(stream):
+        if hasattr(stream, "cuda_stream"):
+            return original(stream)
+        return stream.synchronize()
+
+    monkeypatch.setattr(staging, "fence_submitted_work", complete)
+
+
+@pytest.mark.parametrize("cache_seed, salt", [(11, "11"), (12, "12"), (-1, "")])
+def test_a_dsv4_prompt_carries_its_media_salt_to_lookup_save_and_load(cache_seed, salt):
+    asked = []
+
+    class _SaltLookupClient(_LookupClient):
+        def lookup(self, token_ids, lookup_id, **kwargs):
+            asked.append(kwargs)
+            return self.hit
+
+    sched = _scheduler()
+    sched._lookup_client = _SaltLookupClient(hit=12)
+    loader, saver = _consumer_seq(950), _consumer_seq(951)
+    loader.cache_seed = saver.cache_seed = cache_seed
+    saver.num_cached_tokens = 16
+    sched._save_tracker["951"] = [saver, 0]
+
+    sched.get_num_new_matched_tokens(loader)
+    sched.update_state_after_alloc(loader)
+    load, save = sched.build_connector_meta().requests
+
+    expected = {"request_configs": {"lmcache.tag.cache_salt": salt}} if salt else {}
+    assert asked and all(kwargs == expected for kwargs in asked)
+    assert (load.load_spec is not None, load.cache_salt) == (True, salt)
+    assert (save.save_spec is not None, save.cache_salt) == (True, salt)
+
+
+@pytest.mark.parametrize("cache_seed", [11, -1])
+def test_a_dsv4_slot_boundary_hash_chains_from_the_cache_seed(cache_seed):
+    """The SLOT boundary hash is the one `BlockManager` chains from the same
+    `cache_seed`."""
+    sched = _stateful_scheduler(hit=0)
+    seq = _stateful_seq(
+        req_id=730, num_prompt_tokens=16_384, num_cached_tokens=8192, group=2
+    )
+    seq.cache_seed = cache_seed
+    sched._save_tracker["730"] = [seq, 0]
+
+    request = sched.build_connector_meta().requests[0]
+
+    parent = cache_seed
+    for start in range(0, 8192, 256):
+        parent = BlockManager.compute_hash(seq.token_ids[start : start + 256], parent)
+    assert request.slot_save_spec.boundary_block_hash == parent
+
+
+class TestAStateStoreWaitsForTheCopyThatFillsItsUnits:
+    """A checkpoint is READY once the batch carrying its slot->PAGE copy is
+    issued, not once the copy has run, and its store rides a later step's
+    metadata. The gather runs on the packer's own stream, so without a fence it
+    could read the PAGE units before the copy lands and file their previous
+    occupant's bytes under a valid prefix hash. The connector records one event
+    on the current stream per step and the tier waits on it before `put`."""
+
+    class _Event:
+        def __init__(self, log, fail=False):
+            self.log, self.fail, self.stream = log, fail, None
+
+        def record(self, stream):
+            self.stream = stream
+            self.log.append("record")
+
+        def synchronize(self):
+            self.log.append("synchronize")
+            if self.fail:
+                raise RuntimeError("HIP error: an illegal memory access")
+
+    class _Codec:
+        def __init__(self, log):
+            self.log = log
+
+        def put(self, h, unit_ids, on_source_released):
+            self.log.append("put")
+            on_source_released()
+            return True
+
+    def test_the_tier_waits_on_the_fence_before_it_gathers(self):
+        log = []
+        tier = StateOffloadTier(self._Codec(log))
+        op = StateStoreOperationId(1, 1)
+        try:
+            tier.submit_store(op, (0,), self._Event(log))
+            tier.drain()
+            assert log == ["synchronize", "put"]
+            assert tier.take_store_reports() == ({op}, set())
+        finally:
+            tier.shutdown()
+
+    def test_a_fence_that_raises_fails_the_store_and_releases_its_units(self):
+        log = []
+        tier = StateOffloadTier(self._Codec(log))
+        op = StateStoreOperationId(2, 1)
+        try:
+            tier.submit_store(op, (0,), self._Event(log, fail=True))
+            tier.drain()
+            assert "put" not in log
+            assert tier.take_source_releases() == {op}
+            assert tier.take_store_reports() == (set(), {op})
+        finally:
+            tier.shutdown()
+
+    def _worker(self, log):
+        submitted = []
+
+        class _Tier:
+            def submit_store(self, *args):
+                log.append("submit")
+                submitted.append(args)
+
+        worker = _k3_worker()
+        worker._state_tier = _Tier()
+        worker._store_failed_no_tier = set()
+        return worker, submitted
+
+    def test_one_fence_on_the_current_stream_rides_every_store(self, monkeypatch):
+        log, events, stream = [], [], object()
+
+        def _event():
+            events.append(self._Event(log))
+            return events[-1]
+
+        monkeypatch.setattr(torch.cuda, "Event", _event)
+        monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+        worker, submitted = self._worker(log)
+        a, b = StateStoreOperationId(1, 1), StateStoreOperationId(2, 1)
+        worker._start_state_stores(
+            SimpleNamespace(state_stores=[(a, [3, 4]), (b, [5])])
+        )
+        assert len(events) == 1 and events[0].stream is stream
+        assert log == ["record", "submit", "submit"]
+        assert submitted == [(a, (3, 4), events[0]), (b, (5,), events[0])]
+        assert worker._store_failed_no_tier == set()
+
+    def test_no_fence_fails_the_step_stores_instead_of_gathering(self, monkeypatch):
+        class _BrokenEvent:
+            @staticmethod
+            def record(_stream):
+                raise RuntimeError("sticky HIP error")
+
+        monkeypatch.setattr(torch.cuda, "Event", _BrokenEvent)
+        monkeypatch.setattr(torch.cuda, "current_stream", object)
+        worker, submitted = self._worker([])
+        a, b = StateStoreOperationId(1, 1), StateStoreOperationId(2, 1)
+        worker._start_state_stores(SimpleNamespace(state_stores=[(a, [3]), (b, [5])]))
+        assert submitted == []
+        assert worker._store_failed_no_tier == {a, b}
+
+
+class TestBothSavePathsKeepTheAsyncSaveContract:
+    """The dense KV save and the Kimi-K3 state store keep the contract written
+    out in `_offload_common.py`: one fence per step on the current stream,
+    carried into the save thread and waited on before the source is read, and
+    per save at most one source release and exactly one terminal. The state
+    store's release and failure paths are covered in the two classes above."""
+
+    _Event = TestAStateStoreWaitsForTheCopyThatFillsItsUnits._Event
+
+    @staticmethod
+    def _worker(log):
+        worker = KimiK3OffloadConnector(
+            SimpleNamespace(
+                kv_transfer_config={"kv_role": "offload"},
+                kv_cache_block_size=4,
+                decode_context_parallel_size=1,
+                tensor_parallel_size=1,
+            )
+        )
+        worker.chunk_size = 8
+        stored = []
+
+        class _Engine:
+            gpu_connector = object()
+
+            @staticmethod
+            def store(_tokens, **kwargs):
+                log.append("store")
+                stored.append(kwargs["producer_event"])
+
+        worker._engine = _Engine()
+        terminals = []
+        record = worker._record_store_terminal
+
+        def _record_store_terminal(req, succeeded):
+            terminals.append(succeeded)
+            record(req, succeeded)
+
+        worker._record_store_terminal = _record_store_terminal
+        return worker, stored, terminals
+
+    @staticmethod
+    def _save(req_id=51):
+        return LMCacheReqMeta(
+            req_id=req_id,
+            token_ids=list(range(8)),
+            block_ids=[3],
+            save_spec=SaveSpec(skip_leading_tokens=0),
+            save_operation=SaveOperationId(req_id=req_id, generation=1),
+        )
+
+    @staticmethod
+    def _join(worker):
+        worker._save_executor.shutdown(wait=True)
+        worker._load_executor.shutdown(wait=True)
+
+    def test_each_path_fences_before_it_submits_and_waits_before_it_reads(
+        self, monkeypatch
+    ):
+        log, events, stream = [], [], object()
+
+        def _event():
+            events.append(self._Event(log))
+            return events[-1]
+
+        monkeypatch.setattr(torch.cuda, "Event", _event)
+        monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+        worker, stored, terminals = self._worker(log)
+        submitted = []
+
+        class _Tier:
+            def submit_store(self, *args):
+                log.append("submit_store")
+                submitted.append(args)
+
+        worker._state_tier = _Tier()
+        op = StateStoreOperationId(7, 1)
+        metadata = LMCacheOffloadMetadata()
+        metadata.requests.append(self._save())
+        metadata.state_stores.append((op, [4, 5]))
+        try:
+            worker.start_load_kv(metadata)
+        finally:
+            self._join(worker)
+        state_fence, kv_fence = events
+        assert state_fence.stream is stream and kv_fence.stream is stream
+        assert submitted == [(op, (4, 5), state_fence)]
+        assert stored == [kv_fence]
+        assert log == ["record", "submit_store", "record", "synchronize", "store"]
+        assert terminals == [True]
+
+    def test_a_kv_fence_that_raises_fails_the_save_once_before_it_reads(self):
+        log = []
+        worker, stored, terminals = self._worker(log)
+        req = self._save()
+        try:
+            worker._guard(
+                "save",
+                worker._do_save_req,
+                req,
+                producer_event=self._Event(log, fail=True),
+            )
+            assert worker.get_finished().finished_saving == {req.save_operation}
+            assert worker.get_finished().finished_saving == set()
+        finally:
+            self._join(worker)
+        assert log == ["synchronize"] and stored == []
+        assert terminals == [False]
+
+    def test_a_kv_store_that_raises_reports_one_failed_terminal(self):
+        log = []
+        worker, _stored, terminals = self._worker(log)
+
+        def _store(_tokens, **_kwargs):
+            log.append("store")
+            raise RuntimeError("LocalCPU allocation failed")
+
+        worker._engine.store = _store
+        try:
+            worker._guard(
+                "save",
+                worker._do_save_req,
+                self._save(),
+                producer_event=self._Event(log),
+            )
+        finally:
+            self._join(worker)
+        assert log == ["synchronize", "store"]
+        assert terminals == [False]
+
+    def test_a_state_store_handed_no_fence_fails_before_it_reads(self):
+        with pytest.raises(ValueError):
+            wait_save_fence(None)
+        log = []
+        codec = TestAStateStoreWaitsForTheCopyThatFillsItsUnits._Codec(log)
+        tier = StateOffloadTier(codec)
+        op = StateStoreOperationId(8, 1)
+        try:
+            tier.submit_store(op, (0,), None)
+            tier.drain()
+        finally:
+            tier.shutdown()
+        assert log == []
+        assert tier.take_source_releases() == {op}
+        assert tier.take_store_reports() == (set(), {op})
+
+    @staticmethod
+    def _lifecycle(log):
+        return SaveLifecycle(
+            threading.Lock(),
+            release_source=lambda: log.append("release"),
+            report_terminal=lambda ok: log.append(("terminal", ok)),
+        )
+
+    def test_a_lifecycle_releases_once_and_reports_one_terminal(self):
+        log = []
+        lifecycle = self._lifecycle(log)
+        lifecycle.release_source()
+        lifecycle.release_source()
+        lifecycle.finish(True)
+        lifecycle.finish(False)
+        assert log == ["release", ("terminal", True)]
+
+    def test_a_terminal_with_no_earlier_release_releases_first(self):
+        log = []
+        lifecycle = self._lifecycle(log)
+        lifecycle.finish(False)
+        lifecycle.release_source()
+        assert log == ["release", ("terminal", False)]

@@ -286,7 +286,8 @@ current multi-chunk native schedule is slower. Set `ENABLE_MONO=0` to run C1/C2
 on the production path (MTP5, AL 3.61) for an A/B.
 
 Check the server log before using a mono number: an armed run logs
-`GLM-5.2 MonoKernel on: S=<width> ...` on its first served step, and a refused
+`GLM-5.2 MonoKernel on: atom::glm5_mono_s<width>_tp<N>_...` (the kernels it
+launched, by name) on its first served step at each width, and a refused
 deployment logs `GLM-5.2 MonoKernel off: <why>` and serves on the production
 path without any other sign.
 
@@ -374,8 +375,9 @@ TP=8 CONC=2   # C2: --max-num-seqs 2
 # then run the server block above unchanged
 ```
 
-An armed run logs `GLM-5.2 MonoKernel on: S=<width> ... indexer=external` on its
-first served step at each width (`S=4` for one request, `S=8` for two).
+An armed run logs `GLM-5.2 MonoKernel on: atom::glm5_mono_s<width>_tp8_..._ix0_...` (`ix0`:
+the external indexer) on its first served step at each width (`s4` for one
+request, `s8` for two).
 
 The numbers below are C1 only; TP8 C2 has not been measured yet.
 
@@ -437,6 +439,10 @@ decoding stays on: `C16`-`C40` use four draft tokens and `C48` uses three.
 > on MI355X TP4/DCP4 (64K prompt: 4.73 s to 3.74 s; 16K: 1.23 s to 1.00 s), measured
 > as the time to the first token of a unique prompt with `max_tokens=1`, mean of
 > 4 runs per setting; the per-flag breakdown is in ROCm/ATOM#2506.
+> These apply to the `q` sparse-prefill transport. By default
+> (`ATOM_DCP_SPARSE_PREFILL=auto`) most prefill steps take the `kv` transport
+> instead, which all-gathers KV rows and uses neither; only a long cached
+> prefix with few new tokens stays on `q`. See `docs/environment_variables.md`.
 >
 > The sparse-prefill indexer is also split across the DCP group by query row
 > instead of by key (ROCm/ATOM#2496). This has no switch and is always on under
@@ -453,7 +459,7 @@ export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_USE_FLYDSL_MOE_SORTING=1
 export ATOM_MONO_ENABLE=0
 
-# DCP sparse prefill: local query heads (QREP); the non-persistent MLA kernel is on by default
+# DCP sparse prefill, q transport only: local query heads (QREP); the non-persistent MLA kernel is on by default
 export ATOM_DCP_PREFILL_QREP=1
 
 # LMCache-related settings

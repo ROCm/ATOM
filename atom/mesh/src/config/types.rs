@@ -1,7 +1,9 @@
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
-use super::ConfigResult;
-use crate::core::ConnectionMode;
+use super::{ConfigError, ConfigResult};
+use crate::core::{prepare_pool::PoolConfig, runtime::default_prepare_workers, ConnectionMode};
 
 /// Backend runtime type for inference workers.
 /// Determines PD-disaggregation protocol (SGLang dual-dispatch+bootstrap vs vLLM Mooncake kv_transfer_params).
@@ -16,15 +18,16 @@ pub enum BackendType {
     Atom,
 }
 
-/// Strategy used by the ATOM PD router to map a selected prefill DP rank to
-/// the selected decode DP rank.
+/// How the ATOM PD router pairs prefill and decode DP ranks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum AtomPdRankMappingPolicy {
     /// Do not rewrite the planner-selected prefill/decode DP ranks.
     #[default]
     #[serde(rename = "none")]
     None,
-    /// Map prefill rank N to decode rank N when both sides expose DP workers.
+    /// Run prefill on the decode's DP rank N when both sides expose DP workers: the
+    /// planner selects decode first and prefill among the workers on rank N, and the
+    /// router moves a prefill selected elsewhere to rank N.
     #[serde(rename = "idx2idx")]
     Idx2Idx,
 }
@@ -56,6 +59,10 @@ pub struct RouterConfig {
     #[cfg(feature = "ext-proc")]
     #[serde(default)]
     pub ext_proc: crate::ext_proc::ExtProcConfig,
+    #[serde(default)]
+    pub prepare_pool: PreparePoolConfig,
+    #[serde(default)]
+    pub fastokens: FastokensConfig,
     pub mode: RoutingMode,
     #[serde(default)]
     pub backend: BackendType,
@@ -74,6 +81,12 @@ pub struct RouterConfig {
     pub worker_startup_timeout_secs: u64,
     pub worker_startup_check_interval_secs: u64,
     pub dp_aware: bool,
+    /// Follow the KV cache events each worker reports at `/kv_event_sources`.
+    #[serde(default)]
+    pub kv_events: bool,
+    /// The admin port of each master of the Mooncake Store a worker offloads to.
+    #[serde(default = "default_mooncake_admin_port")]
+    pub mooncake_admin_port: u16,
     pub api_key: Option<String>,
     pub metrics: Option<MetricsConfig>,
     pub log_dir: Option<String>,
@@ -105,6 +118,117 @@ pub struct RouterConfig {
     pub tool_call_parser: Option<String>,
     #[serde(default)]
     pub tokenizer_cache: TokenizerCacheConfig,
+}
+
+/// Default `--prepare-queue-timeout-ms`.
+pub const DEFAULT_PREPARE_QUEUE_TIMEOUT_MS: u64 = 250;
+/// Default `--prepare-timeout-ms`.
+pub const DEFAULT_PREPARE_TIMEOUT_MS: u64 = 5000;
+/// Default `--prepare-max-tokenize-bytes`.
+pub const DEFAULT_MAX_TOKENIZE_BYTES: usize = 1024 * 1024;
+/// Waiting jobs per preparation thread when `--prepare-queue-capacity` is unset.
+pub const PREPARE_QUEUE_SLOTS_PER_WORKER: usize = 10;
+
+/// Shared CPU preparation limits for HTTP, PD and external processing.
+#[derive(Debug, Clone, clap::Args, Serialize, Deserialize, PartialEq, Eq)]
+#[command(next_help_heading = "Request Preparation")]
+#[serde(default)]
+pub struct PreparePoolConfig {
+    /// Preparation threads (default: half the available CPUs, at least 1).
+    /// Overrides --ext-proc-parser-concurrency.
+    #[arg(id = "prepare_workers", long = "prepare-workers")]
+    pub workers: Option<usize>,
+    /// Jobs waiting for a preparation thread (default: 10 per thread).
+    #[arg(id = "prepare_queue_capacity", long = "prepare-queue-capacity")]
+    pub queue_capacity: Option<usize>,
+    /// Queue wait limit.
+    #[arg(
+        id = "prepare_queue_timeout_ms",
+        long = "prepare-queue-timeout-ms",
+        default_value_t = DEFAULT_PREPARE_QUEUE_TIMEOUT_MS
+    )]
+    pub queue_timeout_ms: u64,
+    /// Deadline shared by parsing and tokenization.
+    #[arg(
+        id = "prepare_timeout_ms",
+        long = "prepare-timeout-ms",
+        default_value_t = DEFAULT_PREPARE_TIMEOUT_MS
+    )]
+    pub prepare_timeout_ms: u64,
+    /// Tokenization byte limit (default: 1 MiB); overrides --ext-proc-max-tokenize-bytes.
+    /// The models fastokens encodes have the larger of this limit and 64 MiB,
+    /// unless --fastokens-max-tokenize-bytes sets theirs.
+    #[arg(id = "prepare_max_tokenize_bytes", long = "prepare-max-tokenize-bytes")]
+    pub max_tokenize_bytes: Option<usize>,
+}
+
+impl Default for PreparePoolConfig {
+    fn default() -> Self {
+        Self {
+            workers: None,
+            queue_capacity: None,
+            queue_timeout_ms: DEFAULT_PREPARE_QUEUE_TIMEOUT_MS,
+            prepare_timeout_ms: DEFAULT_PREPARE_TIMEOUT_MS,
+            max_tokenize_bytes: None,
+        }
+    }
+}
+
+/// Default `--fastokens-max-tokenize-bytes`, unless the other models' limit is
+/// larger.
+pub const DEFAULT_FASTOKENS_MAX_TOKENIZE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Default `--fastokens-segment-cache-mb`. A segment costing more than 1/64 of
+/// the budget is never cached, so this one caches tool outputs of up to about
+/// 8 MB of text.
+pub const DEFAULT_FASTOKENS_SEGMENT_CACHE_MB: usize = 1024;
+
+/// Encoding prompts with fastokens rather than HuggingFace `tokenizers`.
+#[derive(Debug, Clone, Default, clap::Args, Serialize, Deserialize, PartialEq, Eq)]
+#[command(next_help_heading = "Tokenizer")]
+#[serde(default)]
+pub struct FastokensConfig {
+    /// Models whose prompts encode with fastokens, by the name or source their
+    /// tokenizer registers under, or `*` for every model. Decoding and chat
+    /// templates stay with HuggingFace. A model whose prompts fastokens does
+    /// not encode as HuggingFace does stays with HuggingFace.
+    #[arg(
+        id = "fastokens_models",
+        long = "fastokens-models",
+        num_args = 1..,
+        value_delimiter = ','
+    )]
+    pub models: Vec<String>,
+    /// Fail to register such a model's tokenizer instead of keeping HuggingFace.
+    #[arg(id = "fastokens_strict", long = "fastokens-strict")]
+    pub strict: bool,
+    /// Tokenization byte limit for those models (default: the larger of 64 MiB
+    /// and the other models' limit).
+    #[arg(
+        id = "fastokens_max_tokenize_bytes",
+        long = "fastokens-max-tokenize-bytes"
+    )]
+    pub max_tokenize_bytes: Option<usize>,
+    /// fastokens' segment cache per tokenizer, in MiB; 0 turns it off
+    /// (default: 1024). It holds the ids of the text between special tokens,
+    /// which an agent's requests re-send with its history.
+    #[arg(id = "fastokens_segment_cache_mb", long = "fastokens-segment-cache-mb")]
+    pub segment_cache_mb: Option<usize>,
+}
+
+impl FastokensConfig {
+    /// Whether the tokenizer registered as `name` from `source` encodes with fastokens.
+    pub fn covers(&self, name: &str, source: &str) -> bool {
+        self.models
+            .iter()
+            .any(|model| model == "*" || model == name || model == source)
+    }
+
+    pub fn segment_cache_bytes(&self) -> usize {
+        self.segment_cache_mb
+            .unwrap_or(DEFAULT_FASTOKENS_SEGMENT_CACHE_MB)
+            .saturating_mul(1024 * 1024)
+    }
 }
 
 /// Tokenizer cache configuration
@@ -371,11 +495,18 @@ impl Default for MetricsConfig {
     }
 }
 
+/// Mooncake's `--metrics_port`.
+fn default_mooncake_admin_port() -> u16 {
+    9003
+}
+
 impl Default for RouterConfig {
     fn default() -> Self {
         Self {
             #[cfg(feature = "ext-proc")]
             ext_proc: Default::default(),
+            prepare_pool: PreparePoolConfig::default(),
+            fastokens: FastokensConfig::default(),
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },
@@ -388,6 +519,8 @@ impl Default for RouterConfig {
             worker_startup_timeout_secs: 1800, // 30 minutes for large model loading
             worker_startup_check_interval_secs: 30,
             dp_aware: false,
+            kv_events: false,
+            mooncake_admin_port: default_mooncake_admin_port(),
             api_key: None,
             metrics: None,
             log_dir: None,
@@ -416,6 +549,76 @@ impl Default for RouterConfig {
 }
 
 impl RouterConfig {
+    /// Preparation settings, with the legacy ext-proc options filling unset
+    /// values when the external-processing transport is enabled.
+    fn effective_prepare_pool(&self) -> PreparePoolConfig {
+        let config = self.prepare_pool.clone();
+        #[cfg(feature = "ext-proc")]
+        if self.ext_proc.enabled {
+            return PreparePoolConfig {
+                workers: config.workers.or(self.ext_proc.parser_concurrency),
+                max_tokenize_bytes: config
+                    .max_tokenize_bytes
+                    .or(self.ext_proc.max_tokenize_bytes),
+                ..config
+            };
+        }
+        config
+    }
+
+    pub fn resolved_prepare_pool(&self) -> ConfigResult<PoolConfig> {
+        let config = self.effective_prepare_pool();
+        let workers = config.workers.unwrap_or_else(default_prepare_workers);
+        let queue_capacity = match config.queue_capacity {
+            Some(capacity) => capacity,
+            None => workers
+                .checked_mul(PREPARE_QUEUE_SLOTS_PER_WORKER)
+                .ok_or_else(|| ConfigError::InvalidValue {
+                    field: "prepare_pool.queue_capacity".to_string(),
+                    value: format!("{PREPARE_QUEUE_SLOTS_PER_WORKER} * {workers}"),
+                    reason: "Automatic queue capacity exceeds the platform limit".to_string(),
+                })?,
+        };
+        let pool = PoolConfig {
+            workers,
+            queue_capacity,
+            queue_timeout: Duration::from_millis(config.queue_timeout_ms),
+            prepare_timeout: Duration::from_millis(config.prepare_timeout_ms),
+        };
+        pool.validate()?;
+        Ok(pool)
+    }
+
+    pub fn resolved_prepare_workers(&self) -> usize {
+        self.effective_prepare_pool()
+            .workers
+            .unwrap_or_else(default_prepare_workers)
+    }
+
+    pub fn resolved_max_tokenize_bytes(&self) -> usize {
+        self.effective_prepare_pool()
+            .max_tokenize_bytes
+            .unwrap_or(DEFAULT_MAX_TOKENIZE_BYTES)
+    }
+
+    /// The tokenization byte limit for the models fastokens encodes.
+    pub fn resolved_fastokens_max_tokenize_bytes(&self) -> usize {
+        self.fastokens.max_tokenize_bytes.unwrap_or_else(|| {
+            DEFAULT_FASTOKENS_MAX_TOKENIZE_BYTES.max(self.resolved_max_tokenize_bytes())
+        })
+    }
+
+    /// Whether the HTTP PD router's and ext-proc's planners select decode first and
+    /// prefill on the decode's DP rank: the ATOM backend with idx2idx rank mapping. gRPC
+    /// PD does not map ranks.
+    pub fn prefill_on_decode_rank(&self) -> bool {
+        matches!(self.backend, BackendType::Atom)
+            && matches!(
+                self.atom_pd_rank_mapping_policy,
+                AtomPdRankMappingPolicy::Idx2Idx
+            )
+    }
+
     /// Create a new configuration with mode and policy
     pub fn new(mode: RoutingMode, policy: PolicyConfig) -> Self {
         Self {
@@ -465,6 +668,112 @@ impl RouterConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_atom_with_idx2idx_plans_prefill_on_the_decode_rank() {
+        for backend in [BackendType::Sglang, BackendType::Vllm, BackendType::Atom] {
+            for mapping in [
+                AtomPdRankMappingPolicy::None,
+                AtomPdRankMappingPolicy::Idx2Idx,
+            ] {
+                let config = RouterConfig {
+                    backend,
+                    atom_pd_rank_mapping_policy: mapping,
+                    ..Default::default()
+                };
+                assert_eq!(
+                    config.prefill_on_decode_rank(),
+                    matches!(
+                        (backend, mapping),
+                        (BackendType::Atom, AtomPdRankMappingPolicy::Idx2Idx)
+                    ),
+                    "{backend:?} {mapping}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prepare_pool_defaults_overrides_and_legacy_config_deserialization() {
+        let config = RouterConfig::default();
+        let workers = default_prepare_workers();
+        assert_eq!(config.resolved_prepare_workers(), workers);
+        let pool = config.resolved_prepare_pool().unwrap();
+        assert_eq!(pool.queue_capacity, workers * 10);
+        assert_eq!(pool.queue_timeout, Duration::from_millis(250));
+        assert_eq!(pool.prepare_timeout, Duration::from_secs(5));
+        assert_eq!(config.prepare_pool.queue_capacity, None);
+        assert_eq!(config.resolved_max_tokenize_bytes(), 1024 * 1024);
+        let mut legacy = serde_json::to_value(&config).unwrap();
+        legacy.as_object_mut().unwrap().remove("prepare_pool");
+        let restored: RouterConfig = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.prepare_pool, PreparePoolConfig::default());
+
+        // Removed options in saved configs are ignored.
+        let partial: PreparePoolConfig = serde_json::from_str(
+            r#"{"workers":2,"shutdown_grace_ms":3000,"parse_inline_max_bytes":1024,
+                "max_retained_input_bytes":1024}"#,
+        )
+        .unwrap();
+        assert_eq!(partial.workers, Some(2));
+        assert_eq!(partial.queue_capacity, None);
+        let config = RouterConfig {
+            prepare_pool: partial,
+            ..Default::default()
+        };
+        assert_eq!(config.resolved_prepare_pool().unwrap().queue_capacity, 20);
+
+        // An explicit queue capacity overrides the per-worker multiplier.
+        let prepare_pool = serde_json::from_str(r#"{"workers":2,"queue_capacity":6}"#).unwrap();
+        let config = RouterConfig {
+            prepare_pool,
+            ..Default::default()
+        };
+        config.validate().unwrap();
+        assert_eq!(config.resolved_prepare_pool().unwrap().queue_capacity, 6);
+    }
+
+    #[cfg(feature = "ext-proc")]
+    #[test]
+    fn prepare_pool_resolves_enabled_legacy_options_and_common_overrides() {
+        let mut config = RouterConfig::default();
+        config.ext_proc.enabled = true;
+        let workers = default_prepare_workers();
+        assert_eq!(config.resolved_prepare_workers(), workers);
+        config.ext_proc.enabled = false;
+        config.ext_proc.parser_concurrency = Some(3);
+        config.ext_proc.max_tokenize_bytes = Some(4096);
+        // Merely compiling ext-proc must not change the ordinary HTTP limits.
+        assert_eq!(config.resolved_prepare_workers(), workers);
+        assert_eq!(config.resolved_max_tokenize_bytes(), 1024 * 1024);
+        config.ext_proc.enabled = true;
+        assert_eq!(config.resolved_prepare_workers(), 3);
+        assert_eq!(config.resolved_prepare_pool().unwrap().queue_capacity, 30);
+        assert_eq!(config.resolved_max_tokenize_bytes(), 4096);
+        config.prepare_pool.workers = Some(1);
+        config.prepare_pool.max_tokenize_bytes = Some(8192);
+        assert_eq!(config.resolved_prepare_workers(), 1);
+        assert_eq!(config.resolved_prepare_pool().unwrap().queue_capacity, 10);
+        assert_eq!(config.resolved_max_tokenize_bytes(), 8192);
+    }
+
+    #[cfg(feature = "ext-proc")]
+    #[test]
+    fn legacy_ext_proc_config_file_still_sets_preparation_limits() {
+        let mut legacy = serde_json::to_value(RouterConfig::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("prepare_pool");
+        legacy["ext_proc"] = serde_json::json!({
+            "enabled": true,
+            "parser_concurrency": 3,
+            "max_tokenize_bytes": 4096,
+        });
+        let config: RouterConfig = serde_json::from_value(legacy).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.ext_proc.parser_concurrency, Some(3));
+        assert_eq!(config.resolved_prepare_workers(), 3);
+        assert_eq!(config.resolved_prepare_pool().unwrap().queue_capacity, 30);
+        assert_eq!(config.resolved_max_tokenize_bytes(), 4096);
+    }
 
     #[test]
     fn test_router_config_default() {

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Device-side primitives of the mono kernels: wave reductions and shuffles, the
 approximate hardware math, bf16 / fp8 packing, buffer resources, the
 execution-model constants and the kernel symbol naming.
@@ -28,7 +29,6 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
-from aiter.ops.flydsl.kernels.kernels_common import kernel_signature
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.compiler.ast_rewriter import ASTRewriter
@@ -36,7 +36,9 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T, as_ir_value
 
+from atom.mono.plan.build_key import kernel_symbol  # noqa: F401
 from atom.mono.plan.execution import THREADS, WAVES
+from atom.mono.polling import SPIN_PAUSE_ASM
 
 # gfx95x cache policy bits (LLVM CPol): SC0 = 1, SC1 = 16. SC1 alone is device
 # scope (past the per-XCD caches); SC0 | SC1 is system scope (peers over XGMI).
@@ -47,16 +49,8 @@ CM_SYS = 17
 
 
 # NT = 2: nontemporal. A weight a layer reads once streams past the caches it
-# would only evict the step's reused data from (K2b at 48 rows: 143 -> 133 us)
+# would only evict the step's reused data from
 CM_NT = 2
-
-
-def kernel_symbol(stem, **params):
-    """Kernel symbol that profilers demangle to ``atom::<stem>_<params>``. The
-    amdhsa assembler rejects ``::`` in a symbol, so it is Itanium-mangled, as
-    aiter's ``_ZN5aiter...E`` kernels are."""
-    name = f"{stem}_{kernel_signature(**params)}"
-    return f"_ZN4atom{len(name)}{name}E"
 
 
 def launcher(symbol):
@@ -107,6 +101,11 @@ def readlane(v, src_lane):
     return r.bitcast(fx.Float32) if isinstance(v, fx.Float32) else r
 
 
+def readlane64(v, src_lane):
+    """Lane ``src_lane``'s 64-bit value of v (wave-uniform)."""
+    return fx.Int64(rocdl.readlane(T.i64, fx.Int64(v), fx.Int32(src_lane)))
+
+
 def memrealtime():
     """s_memrealtime: the 100 MHz device clock (no FlyDSL wrapper)."""
     return fx.Int64(llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], []))
@@ -115,7 +114,7 @@ def memrealtime():
 def unlikely(cond):
     """``cond`` marked cold (llvm.expect): LLVM lays the branch out of the hot
     path. A rare path's code inline among the hot stages costs them even when it
-    never runs (the long-context selection: S = 16, 3k context +1.4 us)."""
+    never runs."""
     return fx.Boolean(
         llvm.call_intrinsic(
             ir.IntegerType.get_signless(1),
@@ -161,6 +160,30 @@ def hw_rcp(x):
 
 def hw_exp2(x):
     return _hw_f32("llvm.amdgcn.exp2.f32", x)
+
+
+def hw_log2(x):
+    """v_log_f32 (no libm denormal fixup: the caller keeps x normal)."""
+    return _hw_f32("llvm.amdgcn.log.f32", x)
+
+
+def rms_rstd(total, n: int, eps: float):
+    """aiter's RMSNorm rstd (``rmsnorm2d_fwd``'s HIP kernel, built with
+    -ffast-math) of a row whose squares sum to ``total`` over ``n`` columns:
+    the mean as ``total`` times the reciprocal of ``n`` (its v_rcp_f32 of a
+    runtime ``n``, the correctly rounded 1/n at the widths a mono norm takes,
+    512 and 5120), ``eps`` added in f64, then v_rsq_f32."""
+    mean = fx.Float32(total) * fx.Float32(1.0 / n)
+    return hw_rsq(fx.Float32(fx.Float64(mean) + fx.Float64(eps)))
+
+
+LOG2E = 1.4426950408889634
+
+
+def exp_f32(x):
+    """``tl.exp``: exp2(x log2(e)) through ``llvm.exp2.f32``, its denormal
+    range kept (``hw_exp2`` is the bare v_exp_f32)."""
+    return _hw_f32("llvm.exp2.f32", fx.Float32(x) * fx.Float32(LOG2E))
 
 
 def div_rn(x, d, r):
@@ -219,6 +242,73 @@ def butterfly(v, offsets, op=_add):
     return v
 
 
+def butterflies(vs, offsets, op=_add):
+    """``butterfly`` of each of ``vs``, an offset of all of them before the next:
+    independent reductions issued side by side, so their cross-lane latencies
+    overlap instead of adding up. Each value's order is ``butterfly``'s."""
+    for off in offsets:
+        vs = [xred(v, off, op) for v in vs]
+    return vs
+
+
+def _scatter_offsets(n, offsets):
+    """The offsets ``lane_reduce_scatter`` halves over: the first log2(n)."""
+    k = n.bit_length() - 1
+    assert n == 1 << k and k <= len(offsets), (n, offsets)
+    assert all(off <= 16 for off in offsets[:k]), offsets
+    return offsets[:k]
+
+
+def lane_reduce_scatter(vs, offsets, lane):
+    """``butterflies(vs, offsets)`` (a power-of-two count of f32 sums over the
+    lanes the offsets span) when a lane needs one of the sums: over the first
+    log2(len(vs)) offsets a lane keeps half of what it carries -- the values
+    its offset bit selects -- adding the partner's same value, then reduces
+    the one left. -> (the sum, its index in ``vs``). Each sum adds the same
+    pairs in the same order as ``butterflies``: the same bits."""
+    scat = _scatter_offsets(len(vs), offsets)
+    row = fx.Int32(0)
+    for off in scat:
+        h = len(vs) // 2
+        bit = (lane & off) != 0
+        if off == 16:
+            # v_permlane16_swap(x, y): the even row gets (its x, the odd row's
+            # x), the odd row (the even row's y, its y): the low half's sum on
+            # the even row, the high half's on the odd -- low + high both
+            pairs = [permlane_swap(16, vs[i].bitcast(fx.Int32), vs[i + h].bitcast(fx.Int32))
+                     for i in range(h)]  # fmt: skip
+            vs = [a.bitcast(fx.Float32) + b.bitcast(fx.Float32) for a, b in pairs]
+        else:
+            keep = [bit.select(vs[i + h], vs[i]) for i in range(h)]
+            send = [bit.select(vs[i], vs[i + h]) for i in range(h)]
+            vs = [fx.Float32(k) + xshfl(fx.Float32(s), off) for k, s in zip(keep, send)]
+        row = row + bit.select(fx.Int32(h), fx.Int32(0))
+    (v,) = vs
+    return butterfly(v, offsets[len(scat) :]), row
+
+
+def lane_all_gather(v, n, offsets, lane):
+    """Every lane all n sums of ``lane_reduce_scatter(.., offsets, ..)`` from its own
+    one (v), in ``vs``' order: the halving undone, the last offset first."""
+    vs = [v]
+    for off in reversed(_scatter_offsets(n, offsets)):
+        if off == 16:
+            # x = y: the even row gets (its own, the odd row's), the odd row
+            # (the even row's, its own) -- (low half's, high half's) both
+            pairs = [permlane_swap(16, x.bitcast(fx.Int32), x.bitcast(fx.Int32))
+                     for x in vs]  # fmt: skip
+            vs = [a.bitcast(fx.Float32) for a, _ in pairs] + [
+                b.bitcast(fx.Float32) for _, b in pairs
+            ]
+        else:
+            bit = (lane & off) != 0
+            other = [xshfl(x, off) for x in vs]
+            vs = [fx.Float32(bit.select(o, x)) for x, o in zip(vs, other)] + [
+                fx.Float32(bit.select(x, o)) for x, o in zip(vs, other)
+            ]
+    return vs
+
+
 def wave_sum(v):
     return butterfly(v, (32, 16, 8, 4, 2, 1))
 
@@ -263,10 +353,27 @@ def _xpartner(v, off, lane):
     return ((lane & off) != 0).select(a, b)
 
 
-def wave_incl_scan(v, lane):
-    """Inclusive prefix sum of an Int32 over the wave, in lane order."""
+def wave_prefix_dpp(v, op=_add):
+    """Inclusive prefix ``op`` (sum by default; ``fx.max`` of values >= 0) of an
+    Int32 or Float32 over the wave's 64 lanes in lane order: DPP row shifts
+    within 16-lane rows, then the row broadcasts 15 and 31 (gfx9; six DPP steps,
+    no exchange and select a step as ``wave_incl_scan``). A lane shifted in from
+    outside its row reads 0 (+0.0)."""
+    is_f = isinstance(v, fx.Float32)
+    v = v if is_f else fx.Int32(v)
+    for ctrl, rows in ((0x111, 0xF), (0x112, 0xF), (0x114, 0xF), (0x118, 0xF),
+                       (0x142, 0xA), (0x143, 0xC)):  # fmt: skip
+        bits = v.bitcast(fx.Int32) if is_f else v
+        moved = fx.Int32(update_dpp_i32(fx.Int32(0), bits, ctrl, rows, 0xF, False))
+        v = op(v, moved.bitcast(fx.Float32) if is_f else moved)
+    return v
+
+
+def wave_incl_scan(v, lane, lanes=64):
+    """Inclusive prefix sum of an Int32 in lane order, within each run of
+    ``lanes`` (a power of two) lanes: the whole wave by default."""
     blk = v
-    for off in (1, 2, 4, 8, 16, 32):
+    for off in (1, 2, 4, 8, 16, 32)[: (lanes - 1).bit_length()]:
         o = _xpartner(blk, off, lane)
         v = v + ((lane & off) != 0).select(o, 0)
         blk = blk + o
@@ -306,6 +413,19 @@ def global_load(addr, words=1, nt=False):
 def ld_i32(ptr, i):
     """Word ``i`` of a buffer, a plain Int32 load."""
     return fx.Int32(bo.buffer_load(rsrc(ptr), i, vec_width=1, dtype=T.i32))
+
+
+def ld_f32(ptr, i, dtype=None):
+    """Element ``i`` of a buffer of ``dtype`` (f32 when None, or bf16 widened)
+    as f32. (``T.f32`` needs an MLIR context: not a default argument.)"""
+    dtype = T.f32 if dtype is None else dtype
+    return fx.Float32(bo.buffer_load(rsrc(ptr), i, vec_width=1, dtype=dtype))
+
+
+def st_dev(v, ptr, i):
+    """Word ``i`` of a buffer stored at device scope: past the per-XCD L2, so
+    another CTA reads it after the flag that follows."""
+    bo.buffer_store(v, rsrc(ptr), i, cache_modifier=CM_DEV)
 
 
 def row_live(batch_ids, k):
@@ -383,6 +503,23 @@ def row_sum(red, r, t, waves=None):
     return tot
 
 
+def head_sum(terms):
+    """The sum over 32 index heads of w_h relu(dot_h), in the order aiter's
+    gluon ``deepgemm_fp8_paged_mqa_logits`` reduces it: ``terms[h, e]`` =
+    (relu term, weight) of head 16 h + 4 (lane // 16) + e; k = 4 h + e, pairs
+    (0,2)(1,3)(4,6)(5,7) as fma(w_a r_a, w_b r_b), (s0 + s2) + (s1 + s3), then
+    the lane groups xor 32, then xor 16."""
+    rw = [terms[k // 4, k % 4] for k in range(8)]
+    firsts = [
+        fx.Float32(fmath.fma(rw[a][0], rw[a][1], rw[b][0] * rw[b][1]))
+        for a, b in ((0, 2), (1, 3), (4, 6), (5, 7))
+    ]
+    v = (firsts[0] + firsts[2]) + (firsts[1] + firsts[3])
+    for off in (32, 16):
+        v = xred(v, off, lambda x, y: x + y)
+    return v
+
+
 def mfma_fp8(a, b, c):
     """16x16x32 fp8 x fp8 MFMA, unscaled: ``a`` / ``b`` an i64 of 8 E4M3 each."""
     return fx.Vector(
@@ -437,6 +574,32 @@ def bf16_pair(a, b):
     )
 
 
+def bf16_words(vals):
+    """Eight f32 -> four packed bf16 pair words (RNE)."""
+    return fx.Vector.from_elements(
+        [bf16_pair(vals[2 * e], vals[2 * e + 1]).bitcast(fx.Int32) for e in range(4)],
+        fx.Int32,
+    )
+
+
+def i64_of(lo, hi):
+    """The Int64 of words (lo, hi)."""
+    return fx.Vector.from_elements([fx.Int32(lo), fx.Int32(hi)], fx.Int32).bitcast(
+        fx.Int64
+    )[0]
+
+
+def i64_words(v):
+    """An Int64's words (lo, hi)."""
+    w = fx.Vector.from_elements([fx.Int64(v)], fx.Int64).bitcast(fx.Int32)
+    return w[0], w[1]
+
+
+def words4(ptr, at):
+    """Words ``at`` .. + 3 of the buffer at ``ptr``, one 16-byte load."""
+    return fx.Vector(bo.buffer_load(rsrc(ptr), at, vec_width=4, dtype=T.i32))
+
+
 def lds_bytes(struct) -> int:
     """The LDS an ``fx.struct`` class takes, alignment included."""
     return struct.__dsl_size_of__()
@@ -485,9 +648,10 @@ def uniform_f32(value):
 
 
 def spin_pause() -> None:
-    """Keep tagged-mailbox polling loads inside the retry loop."""
+    """Keep tagged-mailbox polling loads inside the retry loop and sleep
+    ``POLL_SLEEP_UNITS`` between polls (``s_nop 0`` at 1; see ``atom.mono.polling``)."""
 
-    llvm.InlineAsmOp(None, [], "s_nop 0", "", has_side_effects=True)
+    llvm.InlineAsmOp(None, [], SPIN_PAUSE_ASM, "", has_side_effects=True)
 
 
 def read_lane_i32(value, lane):

@@ -117,6 +117,49 @@ def test_fp4_indexer_serves_lmcache_mp():
     assert _passes_the_gate(_fp4_builder({"kv_connector": "lmcache_mp"}))
 
 
+@pytest.mark.parametrize("heads,rope", [(32, 0), (32, 64), (64, 64)])
+@pytest.mark.parametrize("connector", [None, "lmcache_mp", "lmcache_offload", "multi"])
+def test_opus_constructor_admits_only_standalone_mp(
+    monkeypatch, heads, rope, connector
+):
+    from atom.models import deepseek_v2
+
+    class PastGate(Exception):
+        pass
+
+    def allocate(*args, **kwargs):
+        raise PastGate
+
+    monkeypatch.setattr(deepseek_v2, "sparse_indexer_fp4_enabled", lambda *a: True)
+    monkeypatch.setattr(deepseek_v2, "ReplicatedLinear", allocate)
+    config = SimpleNamespace(
+        index_cache_dtype="fp4",
+        index_cache_layout="mfma",
+        plugin_config=None,
+        kv_transfer_config={"kv_connector": connector} if connector else None,
+    )
+    hf = SimpleNamespace(
+        index_topk=2048,
+        index_n_heads=heads,
+        index_head_dim=128,
+        index_rope_dim=rope,
+        qk_rope_head_dim=64,
+    )
+
+    def construct():
+        return deepseek_v2.Indexer(config, hf, 128, 128, None, "fp8")
+
+    with pytest.raises(PastGate if connector in (None, "lmcache_mp") else ValueError):
+        construct()
+    config.plugin_config = {"mode": "vllm"}
+    with pytest.raises(ValueError, match="plugin routes"):
+        construct()
+    config.plugin_config = None
+    config.index_cache_layout = "preshuffle"
+    with pytest.raises(PastGate):
+        construct()
+
+
 def test_fp4_indexer_serves_multi_whose_only_region_reader_is_lmcache_mp():
     builder = _fp4_builder(
         {
@@ -235,6 +278,7 @@ def test_region_map_verdict_comes_from_the_registration():
             KVConnectorFactory._requires_pd_staging.pop(name, None)
             KVConnectorFactory._reads_block_regions.pop(name, None)
             KVConnectorFactory._copies_whole_block_regions.pop(name, None)
+            KVConnectorFactory._reads_page_images.pop(name, None)
 
 
 def test_fp4_service_comes_from_the_registration_not_the_name():
@@ -293,6 +337,7 @@ def test_fp4_service_comes_from_the_registration_not_the_name():
             KVConnectorFactory._requires_pd_staging.pop(name, None)
             KVConnectorFactory._reads_block_regions.pop(name, None)
             KVConnectorFactory._copies_whole_block_regions.pop(name, None)
+            KVConnectorFactory._reads_page_images.pop(name, None)
 
 
 def test_fp4_gate_reads_the_shared_connector_predicate():
@@ -316,3 +361,31 @@ def test_fp4_gate_reads_the_shared_connector_predicate():
                 AiterMLAMetadataBuilder.get_kv_transfer_tensors(builder)
         else:
             assert AiterMLAMetadataBuilder.get_kv_transfer_tensors(builder) is None
+
+
+@pytest.mark.parametrize("connector", ["lmcache_mp"])
+def test_fp4_indexer_serves_whole_block_offload_and_multi(connector):
+    assert _passes_the_gate(_fp4_builder({"kv_connector": connector}))
+    assert _passes_the_gate(
+        _fp4_builder(
+            {
+                "kv_connector": "multi",
+                "connectors": [
+                    {"kv_connector": "lmcache_offload", "kv_role": "offload"},
+                    {"kv_connector": connector, "kv_role": "offload"},
+                ],
+            }
+        )
+    )
+    with pytest.raises(NotImplementedError, match="region map"):
+        AiterMLAMetadataBuilder.get_kv_transfer_tensors(
+            _fp4_builder(
+                {
+                    "kv_connector": "multi",
+                    "connectors": [
+                        {"kv_connector": connector, "kv_role": "offload"},
+                        {"kv_connector": "mooncake", "kv_role": "kv_producer"},
+                    ],
+                }
+            )
+        )

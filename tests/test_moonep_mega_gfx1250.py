@@ -8,14 +8,19 @@ import sys
 from types import SimpleNamespace
 
 import pytest
-
-pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
-
 import torch
+from aiter_stub import atom_without_aiter
 
-import atom.model_ops.fused_moe.moonep_mega_gfx1250 as moonep
-import atom.model_ops.fused_moe.mori_v2_prepare_finalize as mv2
-import atom.utils.forward_context as fc
+
+@pytest.fixture(autouse=True)
+def _modules():
+    global moonep, mv2, fc
+    with atom_without_aiter() as load:
+        moonep = load("atom.model_ops.fused_moe.moonep_mega_gfx1250")
+        mv2 = load("atom.model_ops.fused_moe.mori_v2_prepare_finalize")
+        fc = load("atom.utils.forward_context")
+        yield
+
 
 TOPK = 9
 DIM = 16
@@ -121,7 +126,7 @@ def test_forward_hands_mega_the_virtual_ids_and_pool_windows(monkeypatch):
     pf = SimpleNamespace(
         mega=FakeMega(),
         num_dispatchers=lambda: 4,
-        combine_quant_for_step=lambda: "bf16",
+        combine_wire_for_step=lambda: "bf16",
         moonep=layer_moonep,
     )
     object.__setattr__(kernel, "prepare_finalize", pf)
@@ -149,8 +154,95 @@ def test_moonep_needs_the_fused_transport(monkeypatch):
         SimpleNamespace(get_ep_group=lambda: SimpleNamespace(ranks=[0])),
     )
     monkeypatch.setenv("ATOM_ENABLE_MOONEP", "1")
-    monkeypatch.setattr(mv2, "_resolve_transport", lambda: "gather")
+    monkeypatch.setenv("ATOM_MEGA_STAGE2_FUSED", "0")
     moe = SimpleNamespace(num_experts=260)
     manager = SimpleNamespace(world_size=4, rank=0)
     with pytest.raises(ValueError, match="fused MegaMoE transport"):
         mv2.make_mori_v2_prepare_finalize(moe, manager)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_factory_keeps_logical_experts_separate_from_recipe_geometry(
+    monkeypatch, enabled
+):
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.dist.parallel_state",
+        SimpleNamespace(get_ep_group=lambda: SimpleNamespace(ranks=[4])),
+    )
+    monkeypatch.setenv("ATOM_ENABLE_MOONEP", "1" if enabled else "0")
+    monkeypatch.setenv("ATOM_MEGA_STAGE2_FUSED", "1")
+    monkeypatch.setenv("MOONEP_PREFETCH_SLOTS", "8")
+    monkeypatch.setattr(
+        moonep,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(eplb_enable=False, fake_eplb=False),
+    )
+    monkeypatch.setattr(mv2, "MORI_AVAILABLE", True)
+    manager = SimpleNamespace(world_size=4, rank=1)
+    moe = SimpleNamespace(
+        num_experts=260, hidden_dim=DIM, max_num_tokens=256, experts_per_token=TOPK
+    )
+
+    pf = mv2.make_mori_v2_prepare_finalize(moe, manager)
+
+    assert pf._all2all_manager is manager
+    assert pf._mega_geometry["num_experts"] == (292 if enabled else 260)
+    assert pf._moonep_experts == (260 if enabled else None)
+    assert pf._mega_geometry["ep_rank"] == 1
+    assert pf._mega_geometry["ep_src_global_rank"] == 4
+    assert pf.mega is None and pf.moonep is None
+
+
+def test_bind_builds_the_pool_for_logical_experts_and_borrows_the_manager(monkeypatch):
+    calls = {}
+
+    def build_mega(**kwargs):
+        calls["mega"] = kwargs
+        return object()
+
+    def build_pool(layer, **kwargs):
+        calls["pool"] = (layer, kwargs)
+        return object()
+
+    monkeypatch.setattr(mv2, "MORI_AVAILABLE", True)
+    monkeypatch.setattr(mv2, "_check_mega_weights", lambda *_: None)
+    monkeypatch.setattr(mv2, "init_mega_transport", build_mega)
+    monkeypatch.setattr(moonep, "MoonEPLayer", build_pool)
+    manager = object()
+    geometry = {
+        "ep_rank": 1,
+        "ep_size": 4,
+        "ep_src_global_rank": 4,
+        "hidden_dim": DIM,
+        "max_num_inp_token_per_rank": 256,
+        "num_experts": 292,
+        "num_experts_per_token": TOPK,
+    }
+    pf = mv2.MoriV2PrepareAndFinalize(256, 4, geometry, manager, moonep_experts=260)
+    layer = SimpleNamespace(activation="silu")
+    method = SimpleNamespace(
+        intermediate_size=32,
+        is_guinterleave=True,
+        quant_type="mxfp4",
+        hidden_pad=0,
+        intermediate_pad=0,
+    )
+
+    pf.bind_mega_transport(layer, method)
+    pf.bind_mega_transport(layer, method)
+
+    assert calls["mega"]["num_experts"] == 292
+    assert calls["mega"]["all2all_manager"] is manager
+    assert calls["pool"] == (
+        layer,
+        {
+            "ep_rank": 1,
+            "ep_size": 4,
+            "ep_src_global_rank": 4,
+            "num_experts": 260,
+            "topk": TOPK,
+            "max_tokens_per_rank": 256,
+        },
+    )
+    assert pf.mega is not None and pf.moonep is not None

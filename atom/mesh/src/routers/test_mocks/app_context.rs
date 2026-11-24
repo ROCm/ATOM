@@ -30,13 +30,27 @@ pub(crate) fn app_context_with_hf_tokenizer(model_name: &str) -> Arc<AppContext>
     app_context_full(Vec::new(), tokenizer_registry_with_hf(model_name))
 }
 
+pub(crate) fn app_context_with_router_config(config: RouterConfig) -> Arc<AppContext> {
+    app_context_configured(Vec::new(), Arc::new(TokenizerRegistry::new()), config)
+}
+
 fn app_context_full(
     workers: Vec<Arc<dyn Worker>>,
     tokenizer_registry: Arc<TokenizerRegistry>,
 ) -> Arc<AppContext> {
+    app_context_configured(workers, tokenizer_registry, RouterConfig::default())
+}
+
+fn app_context_configured(
+    workers: Vec<Arc<dyn Worker>>,
+    tokenizer_registry: Arc<TokenizerRegistry>,
+    config: RouterConfig,
+) -> Arc<AppContext> {
+    // These fixtures exercise synchronous native pipeline helpers, not ingress.
     let ctx = AppContextBuilder::new()
+        .prepare_pool(crate::core::prepare_pool::PrepareHandle::closed())
         .client(reqwest::Client::new())
-        .router_config(RouterConfig::default())
+        .router_config(config)
         .tokenizer_registry(tokenizer_registry)
         .reasoning_parser_factory(Some(reasoning_parser_factory()))
         .tool_parser_factory(Some(tool_parser_factory()))

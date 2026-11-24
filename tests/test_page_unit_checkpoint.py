@@ -4,10 +4,12 @@
 
 import pickle
 from dataclasses import FrozenInstanceError
+from types import SimpleNamespace
 
 import pytest
 
 from atom.model_engine.block_pool import BlockPool
+from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import (
     COPYING,
     EVICTING,
@@ -15,6 +17,14 @@ from atom.model_engine.page_unit_checkpoint import (
     PagedStateCheckpointCoordinator,
     PagedStateCheckpointSpec,
     PageUnitCheckpointStore,
+    published_page_unit_bytes,
+)
+from atom.model_engine.state_cache import KEEP_SETTLED, KEEP_SNAPSHOT
+from atom.model_engine.state_pool import StateSlotPool
+from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
+    page_pool,
+    plan_pools,
+    state_pool,
 )
 
 
@@ -646,6 +656,9 @@ class TestTheTierVotes:
         def could_serve(self, h):
             return h in self.hashes
 
+        def want_touch(self, h):
+            pass
+
     @staticmethod
     def coordinator(num_units=40, offload=None):
         from atom.model_engine.page_unit_checkpoint import (
@@ -700,3 +713,112 @@ class TestTheTierVotes:
         assert c.resumable_hit(self.seq(), 3, [11, 77, 99]) == 2
         index.hashes.discard(77)  # what `fail_load` -> `forget` does
         assert c.resumable_hit(self.seq(), 3, [11, 77, 99]) == 0
+
+
+class _Builder:
+    def __init__(self, specs, published="absent"):
+        self._specs = specs
+        if published != "absent":
+            self.checkpoint_page_unit_bytes = lambda: published
+
+    def sub_pool_specs(self):
+        return self._specs
+
+
+def test_page_unit_is_the_target_share_not_the_merged_class():
+    target = _Builder(
+        [page_pool(1000), state_pool(STATE_SLOT_CLASS, 64, entries_per_req=2)]
+    )
+    draft = _Builder([page_pool(300)])
+    plan = plan_pools(target.sub_pool_specs() + draft.sub_pool_specs(), 10**6, 4)
+
+    assert plan.entry_bytes[plan.paged_class] == 1300
+    assert published_page_unit_bytes(target) == 1000
+
+
+def test_page_unit_defaults_to_the_target_share_without_a_draft():
+    target = _Builder([page_pool(1000), state_pool("s", 64, entries_per_req=1)])
+    plan = plan_pools(target.sub_pool_specs(), 10**6, 4)
+
+    assert published_page_unit_bytes(target) == plan.entry_bytes[plan.paged_class]
+    assert published_page_unit_bytes(_Builder(target._specs, None)) == 1000
+
+
+def test_backend_published_unit_overrides_the_share():
+    specs = [page_pool(1024), state_pool("s", 64, entries_per_req=1)]
+
+    assert published_page_unit_bytes(_Builder(specs, 1000)) == 1000
+    for bad in (0, 1025):
+        with pytest.raises(RuntimeError, match="checkpoint PAGE unit"):
+            published_page_unit_bytes(_Builder(specs, bad))
+
+
+def test_page_unit_needs_target_page_bytes():
+    with pytest.raises(RuntimeError, match="declares no PAGE bytes"):
+        published_page_unit_bytes(_Builder([state_pool("s", 64, entries_per_req=1)]))
+
+
+def _snapshot_coordinator(free_slots, decode_keep=KEEP_SNAPSHOT):
+    c = PagedStateCheckpointCoordinator(
+        BlockPool(20),
+        PagedStateCheckpointSpec(10, 25, "layout-v1", image_bytes=25),
+        enabled=True,
+        decode_keep=decode_keep,
+    )
+    pool = StateSlotPool(free_slots)
+    c.attach_midstep_scratch(pool, 8)
+    return c, pool
+
+
+def _seq(slot, spec_slots=()):
+    return SimpleNamespace(
+        has_per_req_cache=True,
+        state_slot=slot,
+        state_slots=[slot, *spec_slots],
+        num_forwards=0,
+    )
+
+
+@pytest.mark.parametrize(
+    "staged, forwards, kept", [(False, 0, 1), (False, 1, 0), (True, 1, 1), (True, 2, 0)]
+)
+def test_a_boundary_is_stored_only_while_the_slot_holds_it(staged, forwards, kept):
+    """One filed after its forward expects no other before the drain; one staged
+    with its forward in the batch being built expects that one."""
+    c, _ = _snapshot_coordinator(1, KEEP_SETTLED)
+    seq = _seq(5)
+    if staged:
+        c.checkpoint_when_scheduled(seq, 101)
+        assert c.take_checkpoint_ops()[0] == ()  # held back from its own batch
+    else:
+        c.checkpoint(seq, 8, 101)
+    seq.num_forwards += forwards
+    stores, _ = c.take_checkpoint_ops()
+    assert (len(stores), c.checkpoints_dropped) == (kept, 1 - kept)
+
+
+@pytest.mark.parametrize("spec_slots, step_slot", [((), 5), ((6, 7, 8), 7)])
+def test_a_decode_image_names_the_slot_its_step_is_in(spec_slots, step_slot):
+    """A slot per verify step, or one for all of them (ReplaySSM)."""
+    c, _ = _snapshot_coordinator(1)
+    c.checkpoint(_seq(5, spec_slots), 8, 101, step=2)
+    (op,), _ = c.take_checkpoint_ops()
+    assert (op.src_slot, op.step, op.scratch_slot, op.step_slot) == (5, 2, 0, step_slot)
+
+
+def test_a_decode_boundary_with_no_scratch_free_is_dropped():
+    c, _ = _snapshot_coordinator(0)
+    c.checkpoint(_seq(5), 8, 101, step=0)
+    stores, _ = c.take_checkpoint_ops()
+    assert stores == ()
+    assert c.checkpoints_dropped == 1
+
+
+@pytest.mark.parametrize("decode_keep, step", [(KEEP_SETTLED, 2), (KEEP_SNAPSHOT, -1)])
+def test_a_slot_copied_as_is_borrows_nothing(decode_keep, step):
+    """A backend keeping its slot as it stands, or a slot a prefill wrote whole."""
+    c, pool = _snapshot_coordinator(1, decode_keep)
+    c.checkpoint(_seq(5), 8, 101, step=step)
+    stores, _ = c.take_checkpoint_ops()
+    assert [(op.src_slot, op.step, op.scratch_slot) for op in stores] == [(5, -1, -1)]
+    assert pool.has_free()

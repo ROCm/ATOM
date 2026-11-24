@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -7,16 +8,25 @@ use data_connector::{
     ConversationItemStorage, ConversationStorage, MemoryConversationItemStorage,
     MemoryConversationStorage, MemoryResponseStorage, ResponseStorage,
 };
+use parking_lot::RwLock;
 use reqwest::Client;
 
 use crate::{
     config::RouterConfig,
-    core::{steps::WorkflowEngines, JobQueue, LoadMonitor, WorkerRegistry, WorkerService},
+    core::{
+        prepare_pool::PrepareHandle, steps::WorkflowEngines, JobQueue, LoadMonitor, WorkerRegistry,
+        WorkerService,
+    },
+    kv_events::KvEventMonitor,
+    kv_storage::StorageSources,
     middleware::TokenBucket,
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
     reasoning_parser::ParserFactory as ReasoningParserFactory,
-    routers::{atom_standalone::AtomStandaloneRuntime, router_manager::RouterManager},
+    routers::{
+        atom_bridge::AtomBridgeRuntime, prepare::fast_tokenizer::TokenizeLimits,
+        router_manager::RouterManager,
+    },
     tokenizer::registry::TokenizerRegistry,
     tool_parser::ParserFactory as ToolParserFactory,
 };
@@ -35,11 +45,18 @@ impl std::error::Error for AppContextBuildError {}
 
 #[derive(Clone)]
 pub struct AppContext {
+    pub prepare_pool: PrepareHandle,
     pub client: Client,
     pub router_config: RouterConfig,
     pub rate_limiter: Option<Arc<TokenBucket>>,
     pub admission: Arc<crate::core::admission::AdmissionController>,
     pub tokenizer_registry: Arc<TokenizerRegistry>,
+    /// Registry ids of the tokenizers whose chats llm-tokenizer renders without
+    /// their Jinja template, found as each registers. HTTP routing does not
+    /// tokenize those chats.
+    pub chats_without_template: Arc<RwLock<HashSet<String>>>,
+    /// `router_config`'s tokenization byte limits.
+    pub(crate) tokenize_limits: TokenizeLimits,
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
     pub tool_parser_factory: Option<ToolParserFactory>,
     pub worker_registry: Arc<WorkerRegistry>,
@@ -55,7 +72,13 @@ pub struct AppContext {
     pub workflow_engines: Arc<OnceLock<WorkflowEngines>>,
     pub worker_service: Arc<WorkerService>,
     pub inflight_tracker: Arc<InFlightRequestTracker>,
-    pub atom_standalone_runtime: Option<Arc<AtomStandaloneRuntime>>,
+    /// ATOM standalone (`USE_ATOMESH_ENTRYPOINTS=1`): the OpenAI API served by
+    /// Rust down to LLMEngine.
+    pub atom_bridge_runtime: Option<Arc<AtomBridgeRuntime>>,
+    /// Set with `kv_events` in the router config.
+    pub kv_event_monitor: Option<Arc<KvEventMonitor>>,
+    /// Set with `kv_events` in the router config.
+    pub kv_storage: Option<Arc<StorageSources>>,
 }
 
 impl std::fmt::Debug for AppContext {
@@ -67,6 +90,7 @@ impl std::fmt::Debug for AppContext {
 }
 
 pub struct AppContextBuilder {
+    prepare_pool: Option<PrepareHandle>,
     client: Option<Client>,
     router_config: Option<RouterConfig>,
     rate_limiter: Option<Arc<TokenBucket>>,
@@ -82,7 +106,7 @@ pub struct AppContextBuilder {
     load_monitor: Option<Arc<LoadMonitor>>,
     worker_job_queue: Option<Arc<OnceLock<Arc<JobQueue>>>>,
     workflow_engines: Option<Arc<OnceLock<WorkflowEngines>>>,
-    atom_standalone_runtime: Option<Arc<AtomStandaloneRuntime>>,
+    atom_bridge_runtime: Option<Arc<AtomBridgeRuntime>>,
 }
 
 impl AppContext {
@@ -90,14 +114,15 @@ impl AppContext {
         AppContextBuilder::new()
     }
 
-    /// Create AppContext from config with all components initialized
-    /// This is the main entry point that replaces ~194 lines of initialization in server.rs
+    /// Build a context with the caller-owned preparation pool.
     pub async fn from_config(
         router_config: RouterConfig,
         request_timeout_secs: u64,
+        prepare_pool: PrepareHandle,
     ) -> Result<Self, String> {
         AppContextBuilder::from_config(router_config, request_timeout_secs)
             .await?
+            .prepare_pool(prepare_pool)
             .build()
             .map_err(|e| e.to_string())
     }
@@ -106,6 +131,7 @@ impl AppContext {
 impl AppContextBuilder {
     pub fn new() -> Self {
         Self {
+            prepare_pool: None,
             client: None,
             router_config: None,
             rate_limiter: None,
@@ -121,12 +147,18 @@ impl AppContextBuilder {
             load_monitor: None,
             worker_job_queue: None,
             workflow_engines: None,
-            atom_standalone_runtime: None,
+            atom_bridge_runtime: None,
         }
     }
 
     pub fn client(mut self, client: Client) -> Self {
         self.client = Some(client);
+        self
+    }
+
+    /// The caller owns the runtime and must keep it alive.
+    pub fn prepare_pool(mut self, prepare_pool: PrepareHandle) -> Self {
+        self.prepare_pool = Some(prepare_pool);
         self
     }
 
@@ -209,8 +241,8 @@ impl AppContextBuilder {
         self
     }
 
-    pub fn atom_standalone_runtime(mut self, runtime: Option<Arc<AtomStandaloneRuntime>>) -> Self {
-        self.atom_standalone_runtime = runtime;
+    pub fn atom_bridge_runtime(mut self, runtime: Option<Arc<AtomBridgeRuntime>>) -> Self {
+        self.atom_bridge_runtime = runtime;
         self
     }
 
@@ -239,7 +271,27 @@ impl AppContextBuilder {
             &router_config,
             self.rate_limiter.clone(),
         ));
+        let kv_event_monitor = router_config
+            .kv_events
+            .then(|| KvEventMonitor::start().map(Arc::new))
+            .transpose()
+            .map_err(|e| {
+                tracing::error!(error = %e, "Cannot start the KV event monitor's thread");
+                AppContextBuildError("kv_event_monitor")
+            })?;
+        let policy_registry = self
+            .policy_registry
+            .ok_or(AppContextBuildError("policy_registry"))?;
+        if let Some(monitor) = &kv_event_monitor {
+            policy_registry.set_kv_events(monitor.clone());
+        }
+        let kv_storage = (router_config.kv_events)
+            .then(|| Arc::new(StorageSources::new(router_config.mooncake_admin_port)));
+        let tokenize_limits = TokenizeLimits::new(&router_config);
         Ok(AppContext {
+            prepare_pool: self
+                .prepare_pool
+                .ok_or(AppContextBuildError("prepare_pool"))?,
             admission,
             client: self.client.ok_or(AppContextBuildError("client"))?,
             router_config,
@@ -247,12 +299,12 @@ impl AppContextBuilder {
             tokenizer_registry: self
                 .tokenizer_registry
                 .ok_or(AppContextBuildError("tokenizer_registry"))?,
+            chats_without_template: Default::default(),
+            tokenize_limits,
             reasoning_parser_factory: self.reasoning_parser_factory,
             tool_parser_factory: self.tool_parser_factory,
             worker_registry,
-            policy_registry: self
-                .policy_registry
-                .ok_or(AppContextBuildError("policy_registry"))?,
+            policy_registry,
             router_manager: self.router_manager,
             response_storage: self
                 .response_storage
@@ -272,12 +324,13 @@ impl AppContextBuilder {
                 .ok_or(AppContextBuildError("workflow_engines"))?,
             worker_service,
             inflight_tracker: InFlightRequestTracker::new(),
-            atom_standalone_runtime: self.atom_standalone_runtime,
+            atom_bridge_runtime: self.atom_bridge_runtime,
+            kv_event_monitor,
+            kv_storage,
         })
     }
 
-    /// Initialize AppContext from config - creates ALL components
-    /// This replaces ~194 lines of initialization logic from server.rs
+    /// Initialize components from config.
     pub async fn from_config(
         router_config: RouterConfig,
         request_timeout_secs: u64,
@@ -334,7 +387,9 @@ impl AppContextBuilder {
     /// Create reasoning parser factory for gRPC mode
     fn with_reasoning_parser_factory(mut self) -> Self {
         // Initialize reasoning parser factory
-        self.reasoning_parser_factory = Some(ReasoningParserFactory::new());
+        let factory = ReasoningParserFactory::new();
+        crate::reasoning::register(&factory);
+        self.reasoning_parser_factory = Some(factory);
         self
     }
 

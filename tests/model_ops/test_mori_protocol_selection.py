@@ -8,6 +8,7 @@ dispatch/receive only for intra-node low latency; the inter-node low-latency
 kernel uses the comm-stream protocol.
 """
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -78,3 +79,45 @@ def test_supports_async_requires_active_tbo_and_a_second_slot():
     with patch("atom.utils.tbo.ubatching.tbo_active", return_value=True):
         assert _prepare_finalize(num_ops=1).supports_async() is False
         assert _prepare_finalize(num_ops=2).supports_async() is True
+
+
+@pytest.mark.parametrize(
+    "v1_ll,requested,internode,expected",
+    [
+        # Off: aiter's mapping, AsyncLL within a node.
+        (False, True, False, True),
+        (False, True, True, True),
+        # On: IntraNode within a node, InterNodeV1LL across nodes.
+        (True, True, False, False),
+        (True, True, True, True),
+        (True, False, True, False),
+    ],
+)
+def test_v1_ll_asks_for_low_latency_only_across_nodes(
+    v1_ll, requested, internode, expected, monkeypatch
+):
+    monkeypatch.setenv("ATOM_MORI_V1_LL", "1" if v1_ll else "0")
+    assert mpf.use_mori_low_latency(requested, internode) is expected
+
+
+@pytest.mark.parametrize(
+    "is_prefill,num_tokens", [(True, 256), (False, 8), (False, 256)]
+)
+def test_v1_ll_launches_inter_node_ll_at_its_handle_geometry(
+    is_prefill, num_tokens, monkeypatch
+):
+    """Only InterNodeV1LL under ATOM_MORI_V1_LL drops the per-call geometry."""
+    context = SimpleNamespace(context=SimpleNamespace(is_prefill=is_prefill))
+    monkeypatch.setattr(mpf, "get_forward_context", lambda: context)
+    monkeypatch.setattr(mpf, "get_cu_num", lambda: 256)
+
+    monkeypatch.setenv("ATOM_MORI_V1_LL", "1")
+    v1_ll = _prepare_finalize(low_latency=True, internode=True)
+    assert v1_ll._launch_geometry(num_tokens) == (-1, -1)
+    per_call = _prepare_finalize(low_latency=False, internode=True)
+    block_num, warp_per_block = per_call._launch_geometry(num_tokens)
+    assert block_num > 0 and warp_per_block > 0
+
+    monkeypatch.setenv("ATOM_MORI_V1_LL", "0")
+    unchanged = _prepare_finalize(low_latency=True, internode=True)
+    assert unchanged._launch_geometry(num_tokens) == (block_num, warp_per_block)

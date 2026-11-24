@@ -12,12 +12,12 @@ use axum::{
     extract::{Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::{signal, spawn};
+use tokio::signal;
 use tracing::{debug, info, warn, Level};
 use wfaas::LoggingSubscriber;
 
@@ -36,23 +36,20 @@ use crate::{
         metrics::{self, MetricsRouteFactory, PrometheusConfig},
     },
     protocols::{
-        chat::ChatCompletionRequest,
-        completion::CompletionRequest,
-        generate::GenerateRequest,
         parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
-        responses::{ResponsesGetParams, ResponsesRequest},
-        tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
-        validated::ValidatedJson,
+        tokenize::AddTokenizerRequest,
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
     },
     routers::{
-        atom_standalone::AtomStandaloneRuntime,
+        atom_bridge::AtomBridgeRuntime,
         comm::{conversations, parse, tokenize},
+        ingress::EndpointSpec,
         router_manager::RouterManager,
         RouterTrait,
     },
     tokenizer::TokenizerRegistry,
 };
+
 #[derive(Clone)]
 pub struct AppState {
     pub router: Arc<dyn RouterTrait>,
@@ -114,96 +111,6 @@ async fn v1_models(State(state): State<Arc<AppState>>, req: Request) -> Response
 
 async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Response {
     state.router.get_model_info(req).await
-}
-
-async fn generate(
-    State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
-    Json(body): Json<GenerateRequest>,
-) -> Response {
-    let model_id = body.model.as_deref();
-    state
-        .router
-        .route_generate(Some(&headers), &body, model_id)
-        .await
-}
-
-async fn v1_chat_completions(
-    State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
-    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
-) -> Response {
-    state
-        .router
-        .route_chat(Some(&headers), &body, Some(&body.model))
-        .await
-}
-
-async fn v1_completions(
-    State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
-    Json(body): Json<CompletionRequest>,
-) -> Response {
-    state
-        .router
-        .route_completion(Some(&headers), &body, Some(&body.model))
-        .await
-}
-
-async fn v1_responses(
-    State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
-    ValidatedJson(body): ValidatedJson<ResponsesRequest>,
-) -> Response {
-    state
-        .router
-        .route_responses(Some(&headers), &body, Some(&body.model))
-        .await
-}
-
-async fn v1_responses_get(
-    State(state): State<Arc<AppState>>,
-    Path(response_id): Path<String>,
-    headers: http::HeaderMap,
-    Query(params): Query<ResponsesGetParams>,
-) -> Response {
-    state
-        .router
-        .get_response(Some(&headers), &response_id, &params)
-        .await
-}
-
-async fn v1_responses_cancel(
-    State(state): State<Arc<AppState>>,
-    Path(response_id): Path<String>,
-    headers: http::HeaderMap,
-) -> Response {
-    state
-        .router
-        .cancel_response(Some(&headers), &response_id)
-        .await
-}
-
-async fn v1_responses_delete(
-    State(state): State<Arc<AppState>>,
-    Path(response_id): Path<String>,
-    headers: http::HeaderMap,
-) -> Response {
-    state
-        .router
-        .delete_response(Some(&headers), &response_id)
-        .await
-}
-
-async fn v1_responses_list_input_items(
-    State(state): State<Arc<AppState>>,
-    Path(response_id): Path<String>,
-    headers: http::HeaderMap,
-) -> Response {
-    state
-        .router
-        .list_response_input_items(Some(&headers), &response_id)
-        .await
 }
 
 async fn v1_conversations_create(
@@ -337,6 +244,20 @@ async fn list_workers_rest(State(state): State<Arc<AppState>>) -> Response {
     state.context.worker_service.list_workers().into_response()
 }
 
+async fn kv_event_sources(State(state): State<Arc<AppState>>) -> Response {
+    match &state.context.kv_event_monitor {
+        Some(monitor) => Json(monitor.sources()).into_response(),
+        None => (StatusCode::NOT_FOUND, "KV events are off (--kv-events)").into_response(),
+    }
+}
+
+async fn kv_storage_sources(State(state): State<Arc<AppState>>) -> Response {
+    match &state.context.kv_storage {
+        Some(storage) => Json(storage.status(&state.context.client).await).into_response(),
+        None => (StatusCode::NOT_FOUND, "KV events are off (--kv-events)").into_response(),
+    }
+}
+
 async fn get_worker(
     State(state): State<Arc<AppState>>,
     Path(worker_id_raw): Path<String>,
@@ -382,18 +303,12 @@ async fn update_worker(
 // Tokenize / Detokenize Handlers
 // ============================================================================
 
-async fn v1_tokenize(
-    State(state): State<Arc<AppState>>,
-    Json(request): Json<TokenizeRequest>,
-) -> Response {
-    tokenize::tokenize(&state.context.tokenizer_registry, request).await
+async fn v1_tokenize(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    tokenize::tokenize(&state.context, request).await
 }
 
-async fn v1_detokenize(
-    State(state): State<Arc<AppState>>,
-    Json(request): Json<DetokenizeRequest>,
-) -> Response {
-    tokenize::detokenize(&state.context.tokenizer_registry, request).await
+async fn v1_detokenize(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    tokenize::detokenize(&state.context, request).await
 }
 
 async fn v1_tokenizers_add(
@@ -442,12 +357,13 @@ pub struct ServerConfig {
     pub log_dir: Option<String>,
     pub log_level: Option<String>,
     pub json_log: bool,
+    pub route_log_sample_rate: f64,
     pub prometheus_config: Option<PrometheusConfig>,
     pub request_timeout_secs: u64,
     pub request_id_headers: Option<Vec<String>>,
     pub shutdown_grace_period_secs: u64,
     pub tls: Option<ServerTlsConfig>,
-    pub atom_standalone_runtime: Option<Arc<AtomStandaloneRuntime>>,
+    pub atom_bridge_runtime: Option<Arc<AtomBridgeRuntime>>,
 }
 
 pub fn build_app(
@@ -464,21 +380,9 @@ pub fn build_app(
     let inference_routes = if ext_proc_enabled {
         Router::new()
     } else {
-        Router::new()
-            .route("/generate", post(generate))
-            .route("/v1/chat/completions", post(v1_chat_completions))
-            .route("/v1/completions", post(v1_completions))
-            .route("/v1/responses", post(v1_responses))
-            .route("/v1/responses/{response_id}", get(v1_responses_get))
-            .route(
-                "/v1/responses/{response_id}/cancel",
-                post(v1_responses_cancel),
-            )
-            .route("/v1/responses/{response_id}", delete(v1_responses_delete))
-            .route(
-                "/v1/responses/{response_id}/input_items",
-                get(v1_responses_list_input_items),
-            )
+        EndpointSpec::ALL
+            .iter()
+            .fold(Router::new(), |router, spec| spec.register(router))
     };
     let protected_routes = inference_routes
         .route("/v1/conversations", post(v1_conversations_create))
@@ -514,6 +418,8 @@ pub fn build_app(
     let admin_routes = Router::new()
         .route("/flush_cache", post(flush_cache))
         .route("/get_loads", get(get_loads))
+        .route("/kv_events/sources", get(kv_event_sources))
+        .route("/kv_storage/sources", get(kv_storage_sources))
         .route("/parse/function_call", post(parse_function_call))
         .route("/parse/reasoning", post(parse_reasoning))
         // Tokenizer management endpoints
@@ -544,8 +450,9 @@ pub fn build_app(
         .merge(admin_routes)
         .merge(worker_routes)
         .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
-        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+        .layer(axum::middleware::from_fn_with_state(
             max_payload_size,
+            middleware::payload_limit_middleware,
         ))
         .layer(middleware::create_logging_layer())
         .layer(axum::middleware::from_fn_with_state(
@@ -616,13 +523,44 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.max_payload_size / (1024 * 1024)
     );
 
+    let prepare_config = config.router_config.resolved_prepare_pool()?;
+    let mut prepare_runtime =
+        crate::core::prepare_pool::PreparePoolRuntime::new(prepare_config.clone())?;
+    info!(
+        workers = prepare_config.workers,
+        tokio_workers = tokio::runtime::Handle::current().metrics().num_workers(),
+        queue_capacity = prepare_config.queue_capacity,
+        max_tokenize_bytes = config.router_config.resolved_max_tokenize_bytes(),
+        "Request preparation pool started"
+    );
+    // Drain the pool on both normal shutdown and startup failure.
+    let result = serve_with_prepare_pool(&config, http_address, prepare_runtime.handle()).await;
+    // Keep submissions open until transport drain ends.
+    let remaining_workers = prepare_runtime.shutdown().await;
+    if remaining_workers != 0 {
+        warn!(
+            remaining_workers,
+            "Preparation shutdown deadline reached; synchronous jobs are still finishing"
+        );
+    }
+    result
+}
+
+async fn serve_with_prepare_pool(
+    config: &ServerConfig,
+    http_address: std::net::SocketAddr,
+    prepare_pool: crate::core::prepare_pool::PrepareHandle,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Drop aborts the signal listener on any exit.
+    let mut signal_tasks = tokio::task::JoinSet::new();
     let app_context = Arc::new(
         crate::app_context::AppContextBuilder::from_config(
             config.router_config.clone(),
             config.request_timeout_secs,
         )
         .await?
-        .atom_standalone_runtime(config.atom_standalone_runtime.clone())
+        .prepare_pool(prepare_pool)
+        .atom_bridge_runtime(config.atom_bridge_runtime.clone())
         .build()
         .map_err(|e| e.to_string())?,
     );
@@ -668,9 +606,15 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             .get()
             .expect("JobQueue should be initialized");
 
+        // The Rust frontend prepares every request for the one served model,
+        // by that name.
+        let name = config
+            .atom_bridge_runtime
+            .as_ref()
+            .map_or_else(|| tokenizer_source.clone(), |r| r.served_model_name.clone());
         let tokenizer_config = TokenizerConfigRequest {
             id: TokenizerRegistry::generate_id(),
-            name: tokenizer_source.clone(),
+            name,
             source: tokenizer_source.clone(),
             chat_template_path: config.router_config.chat_template.clone(),
             cache_config: config.router_config.tokenizer_cache.to_option(),
@@ -790,6 +734,14 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.max_payload_size,
         request_id_headers,
     );
+    let app = if config.route_log_sample_rate > 0.0 {
+        app.layer(axum::middleware::from_fn_with_state(
+            config.route_log_sample_rate,
+            crate::observability::route_trace::scope,
+        ))
+    } else {
+        app
+    };
 
     let listener = std::net::TcpListener::bind(http_address).map_err(|error| {
         io::Error::new(
@@ -817,7 +769,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let handle_clone = handle.clone();
     let app_state_clone = app_state.clone();
     let grace_period = Duration::from_secs(config.shutdown_grace_period_secs);
-    spawn(async move {
+    signal_tasks.spawn(async move {
         shutdown_signal().await;
         #[cfg(feature = "ext-proc")]
         if let Some(shutdown) = ext_proc_shutdown {
@@ -842,7 +794,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             result = runtime.wait() => {
                 if let Err(error) = result {
                     handle.shutdown();
-                    return Err(error);
+                    return Err(error as Box<dyn std::error::Error>);
                 }
                 // SIGTERM also starts HTTP's graceful shutdown. Let it finish.
                 http.await?;
@@ -854,9 +806,6 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     #[cfg(not(feature = "ext-proc"))]
     http.await?;
-
-    // HA handler shutdown is handled by the signal in mesh_run! macro
-    // No need to manually shutdown here
 
     Ok(())
 }

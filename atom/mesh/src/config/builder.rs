@@ -1,6 +1,7 @@
 use super::{
-    AtomPdRankMappingPolicy, BackendType, CircuitBreakerConfig, ConfigResult, HealthCheckConfig,
-    MetricsConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig,
+    AtomPdRankMappingPolicy, BackendType, CircuitBreakerConfig, ConfigResult, FastokensConfig,
+    HealthCheckConfig, MetricsConfig, PolicyConfig, PreparePoolConfig, RetryConfig, RouterConfig,
+    RoutingMode, TokenizerCacheConfig,
 };
 use crate::core::ConnectionMode;
 
@@ -12,6 +13,16 @@ pub struct RouterConfigBuilder {
 }
 
 impl RouterConfigBuilder {
+    pub fn prepare_pool(mut self, config: PreparePoolConfig) -> Self {
+        self.config.prepare_pool = config;
+        self
+    }
+
+    pub fn fastokens(mut self, config: FastokensConfig) -> Self {
+        self.config.fastokens = config;
+        self
+    }
+
     #[cfg(feature = "ext-proc")]
     pub fn ext_proc(mut self, config: crate::ext_proc::ExtProcConfig) -> Self {
         self.config.ext_proc = config;
@@ -355,6 +366,16 @@ impl RouterConfigBuilder {
 
     pub fn dp_aware(mut self, enable: bool) -> Self {
         self.config.dp_aware = enable;
+        self
+    }
+
+    pub fn kv_events(mut self, enable: bool) -> Self {
+        self.config.kv_events = enable;
+        self
+    }
+
+    pub fn mooncake_admin_port(mut self, port: u16) -> Self {
+        self.config.mooncake_admin_port = port;
         self
     }
 

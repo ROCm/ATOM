@@ -3,10 +3,10 @@
 
 """Reasoning-channel dialects (model-specific data for the general engine).
 
-The engine in ``reasoning.py`` is dialect-agnostic: it iterates ``DIALECTS`` to
-detect/split the reasoning channel. All model-specific marker knowledge lives
-here. Adding a model = add one ``ReasoningDialect`` entry (and its ``split`` for
-whole-response separation).
+The engine in ``reasoning.py`` is dialect-agnostic: ``resolve_dialect`` picks
+a model's entry from ``DIALECTS`` once, at startup, and the one reader reads
+the reasoning channel with it. All model-specific marker knowledge lives
+here. Adding a model = add one ``ReasoningDialect`` entry.
 
 Two dialects today, named by format rather than model:
   - inline ``<think>...</think>`` (DeepSeek-R1, Qwen3, Kimi-K2, MiniMax, ...).
@@ -20,43 +20,9 @@ Two dialects today, named by format rather than model:
     such model would add its own entry with its own tokens.
 """
 
-import re
-from collections.abc import Callable
 from dataclasses import dataclass
 
 from . import kimi_k3_tokens as k3
-
-# Structured-channel format tokens (``<|open|>SECTION<|sep|>`` ... framing).
-# Named by the format concept, not the model: channel formats are a cross-model
-# pattern (e.g. gpt-oss/Harmony uses the same idea with different framing tokens).
-# The token *values* below are Kimi-K3's — a different channel-format model would
-# declare its own values. Declared locally so this module is self-contained
-# (each parser owns the token strings it uses); the tool-call parser keeps its
-# own copies of the subset it needs.
-CHANNEL_THINK_START = "<|open|>think<|sep|>"
-CHANNEL_THINK_END = "<|close|>think<|sep|>"
-CHANNEL_RESPONSE_START = "<|open|>response<|sep|>"
-CHANNEL_RESPONSE_END = "<|close|>response<|sep|>"
-CHANNEL_MESSAGE_END = "<|close|>message<|sep|>"
-CHANNEL_END_OF_MSG = "<|end_of_msg|>"
-CHANNEL_TOOLS_START = "<|open|>tools<|sep|>"
-CHANNEL_CALL_PREFIX = '<|open|>call tool="'
-
-# Result of splitting a full response: (reasoning_content or None, content).
-#
-# **Both halves come back byte-for-byte.** What may be removed is a marker a
-# dialect declares; everything else, and whitespace in particular, survives.
-# This is the rule `ToolCallParser.parse` already states for the stage after
-# this one, and it exists for the same reason: the streaming filter releases
-# bytes as they arrive and owns nothing to tidy them with, so any trimming
-# done only here is a divergence a client sees.
-#
-# It was not applied here, and the symptom was the one that rule cites
-# verbatim -- a trailing `.strip()` cost a code-block answer its final
-# newline. Measured across 12544 (dialect, shape, chunking) comparisons,
-# stripping put `stream=false` and `stream=true` at 50% byte-agreement on
-# content; without it they agree exactly.
-SplitResult = tuple[str | None, str]
 
 
 @dataclass(frozen=True)
@@ -68,8 +34,6 @@ class ReasoningDialect:
     - ``output_open_marker``: the marker the model *emits* to open reasoning
       mid-stream (``<think>``); ``None`` when the template injects it instead.
     - ``think_end_marker``: the marker that ends the reasoning channel.
-    - ``split``: whole-response separator returning ``SplitResult`` or ``None``
-      if this dialect does not apply to the text.
     - ``template_efforts``: reasoning-effort levels this model's chat template
       accepts (e.g. K3's ``low``/``high``/``max``); empty when the model has no
       effort control.
@@ -78,7 +42,6 @@ class ReasoningDialect:
     prompt_open_marker: str
     output_open_marker: str | None
     think_end_marker: str
-    split: Callable[[str, bool], SplitResult | None]
     template_efforts: frozenset[str] = frozenset()
     # The literals whose presence in a *chat template* says the model speaks
     # this dialect. Read once at startup, exactly as the tool-call format is:
@@ -86,114 +49,43 @@ class ReasoningDialect:
     # exhibits whatever it happens to contain.
     template_markers: tuple[str, ...] = ()
     # Literals this format wraps every answer in, which are neither the
-    # channel's own delimiters nor any tool format's. Removed from both halves
-    # of the split and dropped by the streaming filter, so the two agree
-    # without either of them depending on which tool-call parser happened to
-    # be resolved -- the tool parser removes the same tokens, and a K3
+    # channel's own delimiters nor any tool format's. Dropped by the reasoning
+    # filter, so the answer does not depend on which tool-call parser happened
+    # to be resolved -- the tool parser removes the same tokens, and a K3
     # deployment whose template refused the tools probe has none.
     content_framing: tuple[str, ...] = ()
-    # Every marker that ends the reasoning channel, `think_end_marker`
-    # included. A channel format can leave the think channel by *opening*
-    # another one, and the streaming filter knew only the explicit close: a
-    # K3 answer that goes straight to `<|open|>response<|sep|>` -- which its
-    # own docs call the common path -- was streamed entirely as
-    # `reasoning_content` with an empty `content`, while the non-streaming
-    # split read it correctly.
+    # Every marker that ends the reasoning channel besides `think_end_marker`.
+    # A channel format can leave the think channel by *opening* another one:
+    # a K3 answer that goes straight to `<|open|>response<|sep|>` -- which its
+    # own docs call the common path -- would otherwise be read entirely as
+    # `reasoning_content` with an empty `content`.
     extra_end_markers: tuple[str, ...] = ()
+    # Markers that close the *answer*. A channel whose last words, whitespace
+    # and framing aside, are one of these, and that ends at the end of the
+    # output or at a channel other than the answer's own, was the reply,
+    # written where reasoning goes; see `ReasoningFilter._close_channel`.
+    answer_end_markers: tuple[str, ...] = ()
+    # What opens the answer after `think_end_marker`, in a format that gives
+    # the answer a channel of its own; empty when the answer follows the
+    # closer directly. Kimi-K3's encoder renders every assistant turn as
+    # think, then `<|open|>response<|sep|>`, and opens `response` directly
+    # when thinking is off.
+    answer_open_marker: str = ""
 
     @property
     def end_markers(self) -> tuple[str, ...]:
         return (self.think_end_marker, *self.extra_end_markers)
-
-    def strip_framing(self, text: str) -> str:
-        for marker in self.content_framing:
-            text = text.replace(marker, "")
-        return text
 
     def taught_by(self, template_source: str) -> bool:
         """Does this template teach the model this dialect?"""
         return any(m in template_source for m in self.template_markers)
 
 
-# --- Structured-channel dialect ---
-
-
-# Every literal that ends this format's reasoning channel, and the only place
-# they are listed. `_split_channel` reads this and `_CHANNEL_DIALECT` derives
-# `extra_end_markers` from it, so the non-streaming split and the streaming
-# filter cannot be told different things; adding a marker in
-# one place alone used to change only the streamed path.
-_CHANNEL_END_MARKERS = (CHANNEL_THINK_END, CHANNEL_RESPONSE_START, k3.TOOLS_START)
-
-
-def _split_channel(text: str, starts_thinking: bool = False) -> SplitResult | None:
-    """One rule: the reasoning channel ends at whichever closer comes first.
-
-    This was three branches, and the middle one -- `<|open|>response<|sep|>`
-    with no `<|close|>think<|sep|>` immediately before it -- returned
-    `reasoning=None` and threw away everything ahead of the marker. A single
-    byte between the two markers was enough to reach it, and the chain of
-    thought then appeared in neither field. Silent data loss, not a
-    divergence.
-
-    The content comes back with its channel framing still on it, and that is
-    deliberate: removing a tool-format's literals is the tool parser's job and
-    it does it on both delivery paths, from one declared list. Doing it here
-    too meant the reasoning stage removed them when the response was not
-    streamed and left them when it was -- the streaming filter has no such
-    step -- so the two paths only agreed by way of a *third* stage, and only
-    when a K3 parser had been resolved. This one also truncated at
-    `<|end_of_msg|>` rather than removing it, so anything after that token was
-    deleted on one path alone.
-
-    Gated on `starts_thinking`, which the two other branches were not: these
-    markers only mean anything if a reasoning channel was actually opened.
-    Ungated, any model's answer that *quotes* one had the text before it
-    deleted -- an answer about K3's wire format lost 19 characters on
-    `stream=false` and kept them on `stream=true`. That is the inference
-    `parse_tool_calls` was changed to stop making, in the half that was left
-    still making it; a prompt that opens some *other* dialect's channel can
-    still reach this one, and the structural answer is to resolve the dialect
-    at startup as the tool-call format now is.
-    """
-    before = ""
-    if not starts_thinking:
-        # A prompt that left thinking off does not stop the model opening a
-        # channel of its own. The two inline dialects have always read that;
-        # returning `None` here let the tool parser strip the framing and glue
-        # the trace onto the answer, on both paths, so parity could not see it.
-        at = text.find(CHANNEL_THINK_START)
-        if at != -1:
-            # Searched, and what precedes it is content -- the two rulings
-            # `_split_inline_tag` makes. Anchoring at 0 instead put this out
-            # of step with the streaming filter on `\n\n<|open|>think<|sep|>`.
-            before, text = text[:at], text[at + len(CHANNEL_THINK_START) :]
-        elif text.startswith(CHANNEL_THINK_END):
-            # Declined to think; offset 0 only, see `_split_inline_tag`.
-            return (None, text[len(CHANNEL_THINK_END) :])
-        else:
-            return None
-    best_at, best = len(text), None
-    for marker in _CHANNEL_END_MARKERS:
-        at = text.find(marker)
-        if 0 <= at < best_at:
-            best_at, best = at, marker
-    if best is None:
-        # Never closed. Seeded, that is a trace cut off at `max_tokens` and
-        # `separate_reasoning`'s fallback says so; self-opened, the channel's
-        # start is already known.
-        if starts_thinking:
-            return None
-        return (text or None, before)
-    reasoning = text[:best_at]
-    content = before + text[best_at + len(best) :]
-    return (reasoning or None, content)
-
-
 # --- Generic <think>...</think> dialect (K2/DeepSeek/Qwen3/MiniMax/...) ---
 
 # No `\s*` after `</think>`. The newline a model puts before its answer is
-# not a marker this dialect declares, so it survives -- see `SplitResult`.
+# not a marker this dialect declares, so it survives -- see
+# `ReasoningChannel.split`.
 THINK_OPEN_MARKER = "<think>"
 THINK_END_MARKER = "</think>"
 
@@ -208,111 +100,17 @@ MM_THINK_OPEN_MARKER = "<mm:think>"
 MM_THINK_END_MARKER = "</mm:think>"
 
 
-def _inline_tag_split(open_marker: str, end_marker: str) -> Callable:
-    """A split for one `OPEN ... END` inline-tag dialect.
-
-    Built per dialect from that dialect's own markers rather than reading
-    module constants, because a second inline-tag format arrived and the
-    single hardcoded pair would have silently split its output with the wrong
-    tags -- the dialect declaring one thing and its split doing another is the
-    two-sources shape this module exists to retire.
-    """
-    closed_re = re.compile(
-        re.escape(open_marker) + r"(.*?)" + re.escape(end_marker) + r"(.*)",
-        flags=re.DOTALL,
-    )
-    open_re = re.compile(re.escape(open_marker) + r"(.*)", flags=re.DOTALL)
-
-    def split(text: str, starts_thinking: bool = False) -> SplitResult | None:
-        return _split_inline_tag(text, starts_thinking, end_marker, closed_re, open_re)
-
-    return split
-
-
-def _split_inline_tag(
-    text: str,
-    starts_thinking: bool,
-    end_marker: str,
-    closed_re,
-    open_re,
-) -> SplitResult | None:
-    # Ordered as the streaming filter's state machine is, because that is what
-    # this has to agree with. `starts_thinking` means the prompt already
-    # opened the channel, so the output *begins* in it: the first `</think>`
-    # closes it and any `<think>` before that is literal text inside the
-    # reasoning, not an opener. Letting the searches below run first read one
-    # as an opener and dropped everything ahead of it.
-    if starts_thinking:
-        # `</think>` with no `<think>`. Reasoning only because the prompt says
-        # the channel is open -- ungated, this guessed, and disagreed with the
-        # streaming path, which cannot honour an end marker it has no opener
-        # for without waiting for one, and waiting is the stall. vLLM's
-        # non-streaming path still guesses here and its streaming path does
-        # not; the two do not agree, and this is the half worth copying.
-        if end_marker in text:
-            reasoning, _, content = text.partition(end_marker)
-            return (reasoning or None, content)
-        # Never closed: all reasoning, no answer. That is what a reasoning
-        # model stopped at `max_tokens` looks like, and `separate_reasoning`'s
-        # own fallback says it -- returning `None` defers to it rather than
-        # writing the same answer twice.
-        return None
-
-    # A closer with nothing before it: the model declined to think this turn.
-    # MiniMax-M3's template renders every earlier no-thinking assistant turn
-    # as a bare `</mm:think>`, so that is the trained form -- measured live,
-    # 0 of 10 single-turn replies and 7 of 30 multi-turn. vLLM and SGLang both
-    # carry code for it.
-    #
-    # Offset 0 only. Honouring the marker anywhere is the guess `0858a50d4`
-    # removed for cause: it made an ordinary answer wait for a marker that
-    # never came, and fed pre-marker text to the tool-call sniffer. Neither
-    # reaches here -- nothing precedes offset 0, and the decision is made
-    # within one marker's length, which the scanner already buffers.
-    if text.startswith(end_marker):
-        return (None, text[len(end_marker) :])
-
-    # Closed block: <think>...</think> answer.
-    #
-    # Searched, not anchored at position 0: a block does not have to open the
-    # output. Anchoring meant a model that answers, opens a `<think>` block
-    # and answers again matched nothing, so the client was handed the literal
-    # tags with the chain of thought inside `content`.
-    #
-    # What precedes the block is content because it *is* content -- text
-    # outside the reasoning channel. Nothing about the split needs the
-    # streaming filter to justify it; this function has the whole output.
-    #
-    # The *first* block only, and that one IS a parity choice rather than a
-    # reading of the format: the streaming filter closes the channel on the
-    # first `</think>` and never reopens it, so splitting every block here
-    # would make `stream=false` disagree with `stream=true` on any output
-    # with two -- swapping one divergence for another. Whether *both* should
-    # reopen is a separate question, and answering it means changing the
-    # filter, not this.
-    match = closed_re.search(text)
-    if match:
-        return (match.group(1) or None, text[: match.start()] + match.group(2))
-    # Unclosed block (truncated response). Searched, and split, for the same
-    # reasons as the closed one above.
-    match = open_re.search(text)
-    if match:
-        return (match.group(1) or None, text[: match.start()])
-    return None
-
-
 # "Channel" here follows the established meaning from OpenAI's Harmony format:
 # one output stream carrying several named sections (think / response / tools),
 # each wrapped in framing tokens, that we de-multiplex into separate fields.
 # Harmony's analysis/final/commentary channels map onto K3's think/response/tools.
-# We name the tokens by this cross-model concept (CHANNEL_*) rather than by the
-# model. Channel-format models differ in their framing tokens, so each gets its
-# own DIALECTS entry; the entry below carries Kimi-K3's token values.
+# Channel-format models differ in their framing tokens, so each gets its own
+# DIALECTS entry; the entry below carries Kimi-K3's, read from
+# `kimi_k3_tokens`, the one module that spells them.
 #
 # Detection/priority order: structured-channel dialects before inline-tag ones,
-# so a specific channel marker is tried before the generic <think> tag.
-# separate_reasoning() returns the first dialect whose split() matches. A dialect
-# is identified by its markers/split behavior, not a label.
+# so `resolve_dialect` tries a specific channel marker before the generic
+# <think> tag. A dialect is identified by its markers, not a label.
 
 # Read from the module both consumers read, not restated here -- a second
 # hand-kept copy is how the two lists drifted apart. The tool-region brackets
@@ -321,14 +119,14 @@ def _split_inline_tag(
 _CHANNEL_CONTENT_FRAMING = k3.CHANNEL_FRAMING
 
 _CHANNEL_DIALECT = ReasoningDialect(
-    prompt_open_marker=CHANNEL_THINK_START,
+    prompt_open_marker=k3.THINK_START,
     # The same literal, not `None`. "The template injects it, so the model
     # never writes one" is false when the prompt leaves thinking off and the
     # model opens a channel anyway -- and `ReasoningFilter` builds
     # `_open_markers` from this field, so state 0 had nothing to leave itself
     # on and delivered the whole trace as the answer.
-    output_open_marker=CHANNEL_THINK_START,
-    think_end_marker=CHANNEL_THINK_END,
+    output_open_marker=k3.THINK_START,
+    think_end_marker=k3.THINK_END,
     # `response` is what the trained format always opens next -- Kimi-K3's
     # encoder emits a complete response section before any tools section, so
     # `tools` is reachable only from a malformed generation. Listed anyway,
@@ -336,15 +134,18 @@ _CHANNEL_DIALECT = ReasoningDialect(
     # `<|open|>tools<|sep|>` puts the entire tool call in `reasoning_content`
     # with empty `content`, on both delivery paths, and on `/v1/messages`
     # where reasoning is dropped by default the client gets nothing at all.
-    extra_end_markers=tuple(m for m in _CHANNEL_END_MARKERS if m != CHANNEL_THINK_END),
-    split=_split_channel,
+    extra_end_markers=(k3.RESPONSE_START, k3.TOOLS_START),
+    # The answer's closer, which the trained format writes only after
+    # `<|open|>response<|sep|>`.
+    answer_end_markers=(k3.RESPONSE_END,),
+    answer_open_marker=k3.RESPONSE_START,
     template_efforts=frozenset({"low", "high", "max"}),  # Kimi-K3
-    template_markers=(CHANNEL_THINK_START, CHANNEL_THINK_END),
+    template_markers=(k3.THINK_START, k3.THINK_END),
     content_framing=_CHANNEL_CONTENT_FRAMING,
 )
 
 DIALECTS: tuple[ReasoningDialect, ...] = (
-    # Structured channel format — Kimi-K3 token values (see CHANNEL_* above)
+    # Structured channel format — Kimi-K3's token values
     _CHANNEL_DIALECT,
     # MiniMax-M3: the inline-tag shape in its own spelling. Before the generic
     # entry, so its longer markers are matched first -- though the two sets do
@@ -353,7 +154,6 @@ DIALECTS: tuple[ReasoningDialect, ...] = (
         prompt_open_marker=MM_THINK_OPEN_MARKER,
         output_open_marker=MM_THINK_OPEN_MARKER,
         think_end_marker=MM_THINK_END_MARKER,
-        split=_inline_tag_split(MM_THINK_OPEN_MARKER, MM_THINK_END_MARKER),
         template_markers=(MM_THINK_OPEN_MARKER, MM_THINK_END_MARKER),
     ),
     # Generic <think>...</think> (K2/DeepSeek/Qwen3/...)
@@ -361,7 +161,6 @@ DIALECTS: tuple[ReasoningDialect, ...] = (
         prompt_open_marker=THINK_OPEN_MARKER,
         output_open_marker=THINK_OPEN_MARKER,
         think_end_marker=THINK_END_MARKER,
-        split=_inline_tag_split(THINK_OPEN_MARKER, THINK_END_MARKER),
         template_markers=(THINK_OPEN_MARKER, THINK_END_MARKER),
     ),
 )

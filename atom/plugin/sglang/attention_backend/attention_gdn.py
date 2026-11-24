@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import copy
 import logging
+from collections import OrderedDict
 from collections.abc import Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,6 +21,7 @@ from atom.model_ops.attentions.gdn_attn import (
     compute_causal_conv1d_metadata,
 )
 from atom.model_ops.fla_ops import fused_recurrent_gated_delta_rule
+from atom.model_ops.fla_ops.chunk import pop_last_intermediate_states
 from atom.model_ops.fla_ops.replayssm import replayssm_gated_delta_rule
 from atom.model_ops.mamba_ops.causal_conv1d import causal_conv1d_update
 from atom.plugin.sglang.attention_backend.backend_resolver import (
@@ -50,11 +53,23 @@ logger = logging.getLogger(__name__)
 
 
 def _align_flydsl_decode_slots(index: torch.Tensor, batch: int) -> torch.Tensor:
-    """Contiguous int32 prefix of length ``batch`` for FlyDSL decode."""
+    """Contiguous int32 prefix of length ``batch`` for FlyDSL decode.
+
+    Must stay a view into Hybrid's static cuda-graph buffer. A ``.clone()`` /
+    fresh ``.contiguous()`` allocation here bakes a throwaway address into the
+    decode graph (see ``_linear_static_ple_slots``).
+    """
     if index.shape[0] != batch:
         index = index[:batch]
-    if index.dtype != torch.int32 or not index.is_contiguous():
-        index = index.to(dtype=torch.int32).contiguous()
+    if index.dtype != torch.int32:
+        raise RuntimeError(
+            f"GDN decode slot index must be int32 static buffer, got {index.dtype}"
+        )
+    if not index.is_contiguous():
+        raise RuntimeError(
+            "GDN decode slot index must be a contiguous view of the Hybrid "
+            "cuda-graph mamba_cache_indices buffer"
+        )
     return index
 
 
@@ -94,9 +109,8 @@ def _ensure_flydsl_policy(state: torch.Tensor):
         return policy
     from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy, select_policy
 
-    # ReplaySSM addresses the same contiguous checkpoint Triton prefill
-    # writes. FlyDSL's VK view is a different layout; Native keeps both
-    # stages off once the ring is on.
+    # Under ReplaySSM the ring addresses the raw contiguous checkpoint, so
+    # `select_policy` keeps decode (and its VK view) off; prefill runs only on gfx942.
     policy = select_policy(
         allowed=True,
         replayssm=replayssm_enabled(),
@@ -111,11 +125,14 @@ def _ensure_flydsl_policy(state: torch.Tensor):
     return policy
 
 
-# (lengths, cu_seqlens data_ptr, tensor version) -> schedule.
+# (lengths, cu_seqlens data_ptr, tensor version) -> schedule, oldest first.
 # AITER binds the schedule to that exact offset tensor. Reuse only when the
 # same buffer is unchanged (CUDA-graph replay). A new eager batch rebuilds
 # from the host length list and does not read query_start_loc back to the host.
-_PREFILL_SCHEDULES: dict[tuple, object] = {}
+# Every schedule pins its offset tensor and a fresh eager batch never hits, so
+# keep only the most recent few, like FLA's `tensor_cache`.
+_PREFILL_SCHEDULES: OrderedDict[tuple, object] = OrderedDict()
+_PREFILL_SCHEDULES_MAX = 8
 
 
 def _host_prefill_lengths(forward_batch: Any, num_seqs: int) -> tuple[int, ...] | None:
@@ -169,6 +186,7 @@ def _flydsl_prefill_metadata(
     key = (lengths, int(query_start_loc.data_ptr()), int(query_start_loc._version))
     cached = _PREFILL_SCHEDULES.get(key)
     if cached is not None:
+        _PREFILL_SCHEDULES.move_to_end(key)
         return cached
     if capturing:
         # AITER refuses to build a schedule on the capturing stream. The eager
@@ -179,7 +197,253 @@ def _flydsl_prefill_metadata(
     metadata = build_prefill_metadata(lengths, query_start_loc)
     if metadata is not None:
         _PREFILL_SCHEDULES[key] = metadata
+        while len(_PREFILL_SCHEDULES) > _PREFILL_SCHEDULES_MAX:
+            _PREFILL_SCHEDULES.popitem(last=False)
     return metadata
+
+
+def _track_mamba_radix_slots(forward_batch: Any, layer_id: int) -> None:
+    """Decode-side mamba track after Native GDN compute.
+
+    Community bakes ``_track_mamba_state_decode`` inside the decode CUDA graph.
+    Native GDN + FlyDSL has repeatedly faulted with that binding under
+    radix/extra_buffer, so decode-graph capture **skips** track here and
+    ``track_mamba_radix_after_decode_graph`` (post-replay epilogue) performs
+    the same snapshot with live Hybrid metadata. Eager decode tracks inline.
+    Never host-sync on ``mask.any()``.
+
+    Decode only: a decode step's live state IS the state at its track point.
+    Extend is tracked by ``SGLangGatedDeltaNet._track_mamba_states``, which
+    reads the chunk-boundary state an unaligned track point needs; a row copy
+    of the finished state here would overwrite that snapshot.
+
+    ``check_freed_slots=True`` skips ``src/dst == -1`` (graph pad / tombstones);
+    the track kernel otherwise faults on ``ptr + (-1)*stride``.
+    """
+    if getattr(forward_batch, "mamba_track_mask", None) is None:
+        return
+    if not forward_batch.forward_mode.is_decode_or_idle():
+        return
+    # Do not bake track into the full decode graph; epilogue owns decode track.
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        return
+    attn_backend = SGLangGDNForwardContext._resolve_attn_backend(forward_batch)
+    if attn_backend is None:
+        return
+    linear = SGLangGDNForwardContext._linear_attn_backend(attn_backend)
+    if linear is None or getattr(linear, "forward_metadata", None) is None:
+        return
+    fm = linear.forward_metadata
+    pool = getattr(linear, "req_to_token_pool", None)
+    if pool is None:
+        return
+    try:
+        layer_cache = pool.mamba2_layer_cache(layer_id)
+    except Exception:  # noqa: BLE001
+        return
+    cache_indices = getattr(fm, "mamba_cache_indices", None)
+    track_indices = getattr(fm, "mamba_track_indices", None)
+    if cache_indices is None or track_indices is None:
+        return
+
+    bs = int(forward_batch.batch_size)
+    # Match PR #32555 / Hybrid replay: only the refreshed [:bs] prefix is live.
+    if cache_indices.shape[0] != bs:
+        cache_indices = cache_indices[:bs]
+    if track_indices.shape[0] != bs:
+        track_indices = track_indices[:bs]
+    track_mask = forward_batch.mamba_track_mask
+    if track_mask is not None and track_mask.shape[0] != bs:
+        track_mask = track_mask[:bs]
+
+    # Prefer community coalesced all-layers track at the last mamba layer
+    # (same as ``GDNAttnBackend.forward_decode(..., layer.layer_id)``). Always
+    # pass check_freed_slots=True: Flash full-graph pads use PAD_SLOT_ID=-1 and
+    # the track kernel faults on ``ptr + (-1)*stride`` when that flag is off.
+    from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+        track_mamba_states_if_needed,
+    )
+
+    track_pools = getattr(linear, "_track_pools", None)
+    pools = track_pools() if callable(track_pools) else None
+    if pools is not None:
+        conv_pool, ssm_pool, last_pool_idx = pools
+        if pool.mamba_map.get(layer_id) == last_pool_idx:
+            from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+                track_mamba_states_all_layers,
+            )
+
+            track_mamba_states_all_layers(
+                conv_pool,
+                ssm_pool,
+                cache_indices,
+                track_mask,
+                track_indices,
+                bs,
+                check_freed_slots=True,
+            )
+        return
+
+    track_mamba_states_if_needed(
+        layer_cache.conv[0],
+        layer_cache.temporal,
+        cache_indices,
+        track_mask,
+        track_indices,
+        bs,
+        check_freed_slots=True,
+    )
+
+
+def track_mamba_radix_after_decode_graph(
+    forward_batch: Any, attn_backend: Any = None
+) -> None:
+    """Post-replay mamba track (Native epilogue).
+
+    Community bakes track inside the graph; ``_track_mamba_radix_slots`` skips
+    capture, so for a replayed decode graph this epilogue is the only snapshot:
+    it runs the coalesced track with the *live* Hybrid metadata after replay.
+    Cheap relative to the graphed decode body.
+
+    ``attn_backend`` must be passed from ``DecodeCudaGraphRunner`` — after
+    ``execute`` returns, SGLang's forward context is gone so
+    ``resolve_attn_backend(forward_batch)`` is usually ``None``.
+    """
+    if forward_batch is None:
+        return
+    if getattr(forward_batch, "mamba_track_mask", None) is None:
+        return
+    mode = getattr(forward_batch, "forward_mode", None)
+    if mode is None or not callable(getattr(mode, "is_decode_or_idle", None)):
+        return
+    if not mode.is_decode_or_idle():
+        return
+    if attn_backend is None:
+        attn_backend = SGLangGDNForwardContext._resolve_attn_backend(forward_batch)
+    if attn_backend is None:
+        return
+    # Ensure resolve paths inside ``_track_mamba_radix_slots`` see the backend.
+    try:
+        if getattr(forward_batch, "attn_backend", None) is None:
+            forward_batch.attn_backend = attn_backend
+    except Exception:  # noqa: BLE001, S110
+        pass
+    SGLangGDNForwardContext._patch_forward_batch_pools(forward_batch, attn_backend)
+    linear = SGLangGDNForwardContext._linear_attn_backend(attn_backend)
+    pool = getattr(linear, "req_to_token_pool", None) if linear is not None else None
+    mamba_map = getattr(pool, "mamba_map", None) if pool is not None else None
+    if not mamba_map:
+        return
+    track_pools = getattr(linear, "_track_pools", None)
+    pools = track_pools() if callable(track_pools) else None
+    if pools is not None:
+        # Coalesced all-layers track fires only at the last mamba layer.
+        _track_mamba_radix_slots(forward_batch, int(max(mamba_map.keys())))
+        return
+    for layer_id in mamba_map:
+        _track_mamba_radix_slots(forward_batch, int(layer_id))
+
+
+class _MambaLayerViews:
+    """Each mamba layer's conv and SSM state view of SGLang's mamba pool, by
+    pool index.
+
+    `MambaPool.State.at_layer_idx` builds a new view of every state field on
+    each call. The pool's state tensors are allocated once at startup, so the
+    two views the GDN wrapper reads are taken from them once per state object.
+    """
+
+    __slots__ = ("conv", "pool", "state", "temporal")
+
+    def __init__(self, pool: Any) -> None:
+        state = pool.mamba_pool.mamba_cache
+        indices = range(len(pool.mamba_map))
+        self.pool = pool
+        self.state = state
+        self.conv = tuple(state.conv[0][i] for i in indices)
+        self.temporal = tuple(state.temporal[i] for i in indices)
+
+
+_LAYER_VIEWS: _MambaLayerViews | None = None
+
+
+def _layer_states(pool: Any, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """`conv[0]` and `temporal` of `pool.mamba2_layer_cache(layer_id)`."""
+    global _LAYER_VIEWS
+    # `mamba2_layer_index` also holds the layer's HiCache transfer wait.
+    index = pool.mamba2_layer_index(layer_id)
+    views = _LAYER_VIEWS
+    if (
+        views is None
+        or views.pool is not pool
+        or views.state is not pool.mamba_pool.mamba_cache
+    ):
+        views = _LAYER_VIEWS = _MambaLayerViews(pool)
+    return views.conv[index], views.temporal[index]
+
+
+class _GDNStep:
+    """What every GDN layer of one forward reads after its compute.
+
+    `SGLangGDNForwardContext.build` makes one per forward and `bind` publishes
+    it for the forward batch it was built from (`current`). For an extend with
+    radix tracking it holds SGLang's linear backend, its track metadata and
+    the conv destination slots.
+    """
+
+    __slots__ = (
+        "conv_idx",
+        "conv_slots",
+        "decode_track",
+        "forward_batch",
+        "linear_backend",
+        "metadata",
+        "verify",
+    )
+
+    def __init__(self, forward_batch: Any) -> None:
+        mode = forward_batch.forward_mode
+        self.forward_batch = forward_batch
+        self.verify = bool(mode.is_target_verify())
+        self.decode_track = False
+        self.linear_backend = self.metadata = self.conv_idx = self.conv_slots = None
+        if self.verify or forward_batch.mamba_track_mask is None:
+            return
+        if mode.is_decode_or_idle():
+            self.decode_track = True
+            return
+        if not mode.is_extend():
+            return
+        attn_backend = SGLangGDNForwardContext._resolve_attn_backend(forward_batch)
+        if attn_backend is None:
+            return
+        linear_backend = SGLangGDNForwardContext._linear_attn_backend(attn_backend)
+        metadata = linear_backend.forward_metadata
+        if metadata is None:
+            return
+        self.linear_backend, self.metadata = linear_backend, metadata
+        conv_idx = metadata.track_conv_indices
+        if conv_idx is not None and conv_idx.numel() > 0:
+            # Only SGLang's GDN backend caches the destination slots; indexing
+            # the pool with a None would broadcast over every slot.
+            dst = metadata.conv_states_mask_indices
+            if dst is None:
+                rows = forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
+                dst = metadata.mamba_track_indices[rows]
+            self.conv_idx, self.conv_slots = conv_idx, dst
+
+    @classmethod
+    def current(cls, forward_batch: Any) -> _GDNStep:
+        """The bound step of `forward_batch`, or one built for it here."""
+        step = _GDN_STEP.get()
+        if step is not None and step.forward_batch is forward_batch:
+            return step
+        return cls(forward_batch)
+
+
+_GDN_STEP: ContextVar[_GDNStep | None] = ContextVar(
+    "atom_sglang_gdn_step", default=None
+)
 
 
 class SGLangGatedDeltaNet(GatedDeltaNet):
@@ -196,7 +460,8 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
         from atom.plugin.sglang.runtime import get_current_forward_batch
 
         forward_batch = get_current_forward_batch()
-        if forward_batch is None or not forward_batch.forward_mode.is_target_verify():
+        step = None if forward_batch is None else _GDNStep.current(forward_batch)
+        if step is None or not step.verify:
             if mixed_qkv.stride(-1) != 1:
                 mixed_qkv = mixed_qkv.contiguous()
             dtype = mixed_qkv.dtype
@@ -209,22 +474,8 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
                     self.dt_bias.detach().to(dtype=dtype), requires_grad=False
                 )
             out = super().forward(mixed_qkv, b, a, core_attn_out, layer_name)
-            # Chunked prefill rewrites the checkpoint in place. The ring
-            # cursor has to drop the previous tenant's records or the next
-            # verify folds them on top of that new state.
-            mode = None if forward_batch is None else forward_batch.forward_mode
-            draft_extend = bool(
-                mode is not None
-                and callable(getattr(mode, "is_draft_extend_v2", None))
-                and mode.is_draft_extend_v2()
-            )
-            if (
-                replayssm_enabled()
-                and mode is not None
-                and mode.is_extend()
-                and not draft_extend
-            ):
-                note_full_state_write(self._verify_cache_slots(forward_batch))
+            if step is not None:
+                self._track_mamba_states(step, mixed_qkv)
             return out
 
         attn_backend = SGLangGDNForwardContext._resolve_attn_backend(forward_batch)
@@ -310,16 +561,49 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
 
         return core_attn_out
 
-    def _verify_cache_slots(self, forward_batch: Any) -> torch.Tensor | None:
-        attn_backend = SGLangGDNForwardContext._resolve_attn_backend(forward_batch)
-        if attn_backend is None:
-            return None
-        linear = SGLangGDNForwardContext._linear_attn_backend(attn_backend)
-        metadata = getattr(linear, "forward_metadata", None)
-        indices = getattr(metadata, "mamba_cache_indices", None)
-        if indices is None:
-            return None
-        return indices[: int(forward_batch.batch_size)]
+    def _track_mamba_states(self, step: _GDNStep, mixed_qkv: torch.Tensor) -> None:
+        """Fill SGLang's mamba radix cache (extra_buffer) track slots.
+
+        SGLang's HybridLinearAttnBackend owns the prefix cache and computes the
+        track metadata, but the snapshot calls live inside its own GDN kernels,
+        which the plugin replaces. They are made here, after the ATOM forward,
+        through SGLang's helpers so the snapshot semantics stay defined there.
+        Every source is final by now: the conv window is read from the pre-conv
+        input, the SSM state from the prefill kernel's chunk states `h` (Triton
+        or FlyDSL) or the runtime slot. What is the same for every layer of the
+        forward (backend, metadata, destination slots) comes from `step`.
+
+        Decode goes through `_track_mamba_radix_slots`, which also covers the
+        replayed decode graph via the post-replay epilogue.
+        """
+        if step.decode_track:
+            _track_mamba_radix_slots(step.forward_batch, int(self.layer_num))
+            return
+        metadata = step.metadata
+        if metadata is None:
+            return
+        conv_states, ssm_states = _layer_states(
+            step.linear_backend.req_to_token_pool, self.layer_num
+        )
+        # `h` is in the logical [K, V] layout; FlyDSL decode stores VK.
+        policy = getattr(self, "gdn_flydsl_policy", None)
+        if policy is not None and policy.decode:
+            ssm_states = ssm_states.transpose(-1, -2)
+
+        h = pop_last_intermediate_states()
+        if not metadata.has_mamba_track_mask:
+            return
+        if step.conv_idx is not None:
+            # [rows, state_len, dim] -> the pool's [slot, dim, state_len].
+            conv_states[step.conv_slots] = mixed_qkv[step.conv_idx].transpose(1, 2)
+        if metadata.track_ssm_h_src.numel() > 0 and h is None:
+            raise RuntimeError(
+                "SGLang mamba radix cache needs the GDN chunk kernel's "
+                "intermediate states, but this prefill kept none."
+            )
+        step.linear_backend._track_mamba_state_extend(
+            step.forward_batch, h, ssm_states, metadata
+        )
 
     def _verify_replayssm(
         self,
@@ -338,10 +622,11 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
     ) -> None:
         """Verify the draft window through Native ReplaySSM.
 
-        The live checkpoint is the contiguous pool Triton prefill writes.
+        The live checkpoint is the contiguous pool the prefill writes.
         The kernel appends records and does not publish a per-step SSM
         snapshot; ``update_mamba_state_after_mtp_verify`` advances the cursor
-        once the accept length is known and scatters only the conv window.
+        once the accept length is known, scatters the conv window, and
+        rebuilds the SSM state of any radix-tracked step into its track slot.
         """
         del ssm_states  # logical view; the ring addresses the raw pool
         # FlyDSL's transpose view is not the ReplaySSM layout. The policy
@@ -381,7 +666,9 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
                     "int32 view during CUDA graph capture."
                 )
             slot_idx = slot_idx.to(dtype=torch.int32).contiguous()
-        block_output = replayssm_gated_delta_rule(
+        # Every verify row is a spec row, so the kernel writes the layer's
+        # output in place, as Native does for a pure spec-decode batch.
+        replayssm_gated_delta_rule(
             q=query,
             k=key,
             v=value,
@@ -398,9 +685,7 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
             use_qk_l2norm_in_kernel=True,
             is_kda=False,
             route=envs.ATOM_REPLAYSSM_ROUTE,
-        )
-        output_blocks.copy_(
-            block_output.view(bs, draft_token_num, *output_blocks.shape[2:])
+            o=output_blocks.view(bs * draft_token_num, *output_blocks.shape[2:]),
         )
 
     def _spec_ssm_slot_table(
@@ -534,12 +819,11 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
         conv_phys = self._spec_conv_window_phys(
             layer_cache.intermediate_conv_window[0], draft_token_num
         )
-        # One wide-window spec call. ATOM writes
-        # [history2..historyM, draft1..draftN] -- exactly the physical row
-        # behind SGLang's dedup view, so every per-step window materialises
-        # for free and the live conv state is only read, never written.
-        state_len = conv_states.shape[-1]
-        conv_phys[:bs, :, :state_len] = conv_states[cache_indices]
+        # One wide-window spec call. It reads the history from the live conv
+        # state and writes [history2..historyM, draft1..draftN] -- exactly the
+        # physical row behind SGLang's dedup view, so every per-step window
+        # materialises for free and the live conv state is only read, never
+        # written.
         query_all, key_all, value_all = causal_conv1d_update(
             mixed_blocks.reshape(num_tokens, -1),
             conv_phys,
@@ -549,6 +833,8 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
             self.conv1d.bias,
             self.activation,
             conv_state_indices=self._spec_conv_slot_table(bs, mixed_blocks.device),
+            conv_state_indices_in=cache_indices.view(bs, 1),
+            conv_state_in=conv_states,
             num_accepted_tokens=self._spec_conv_accepted(bs, mixed_blocks.device),
             query_start_loc=self._spec_cu_seqlens(
                 bs, draft_token_num, mixed_blocks.device
@@ -637,7 +923,7 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
     def _spec_conv_accepted(self, bs: int, device: torch.device) -> torch.Tensor:
         """`num_accepted_tokens` of all ones: the conv kernel reads its initial
         history from column `num_accepted_tokens - 1`, and verify always starts
-        from the committed live state seeded at column 0."""
+        from the committed live state at column 0."""
         cache = getattr(self, "_spec_conv_accepted_cache", None)
         if cache is None:
             cache = {}
@@ -690,6 +976,7 @@ class SGLangGDNForwardContext:
     kv_cache_data: dict[str, KVCacheTensor]
     context: Context
     num_tokens: int
+    step: _GDNStep
 
     @staticmethod
     def _linear_attn_backend(attn_backend: Any) -> Any:
@@ -730,32 +1017,18 @@ class SGLangGDNForwardContext:
             return {}
 
         mamba_map = getattr(pool, "mamba_map", None)
-        if mamba_map is None:
+        if not mamba_map:
             return {}
 
-        first_temporal = None
-        layer_caches: list[tuple[int, Any]] = []
-        for layer_id in mamba_map:
-            layer_cache = pool.mamba2_layer_cache(layer_id)
-            layer_caches.append((layer_id, layer_cache))
-            if first_temporal is None:
-                first_temporal = layer_cache.temporal
-        policy = (
-            _ensure_flydsl_policy(first_temporal)
-            if first_temporal is not None
-            else None
-        )
+        states = [(layer_id, *_layer_states(pool, layer_id)) for layer_id in mamba_map]
+        policy = _ensure_flydsl_policy(states[0][2])
         use_kv_view = bool(policy is not None and policy.decode)
-
         out: dict[str, KVCacheTensor] = {}
-        for layer_id, layer_cache in layer_caches:
-            v_cache = layer_cache.temporal
-            if use_kv_view:
-                v_cache = v_cache.transpose(-1, -2)
+        for layer_id, conv, temporal in states:
             out[f"layer_{layer_id}"] = KVCacheTensor(
                 layer_num=layer_id,
-                k_cache=layer_cache.conv[0],
-                v_cache=v_cache,
+                k_cache=conv,
+                v_cache=temporal.transpose(-1, -2) if use_kv_view else temporal,
                 k_scale=None,
                 v_scale=None,
                 # Slot-addressed recurrent state, not paged KV -- see
@@ -829,18 +1102,33 @@ class SGLangGDNForwardContext:
             if reconstructed is None:
                 return None
             query_start_loc, idx = reconstructed
+            num_query_tokens = None
+        else:
+            # Extend only: SGLang's host sum of extend_seq_lens, i.e. the value
+            # of query_start_loc[-1].
+            num_query_tokens = fm.logical_num_tokens
+        live_slots = idx
         device = query_start_loc.device
-        idx = idx.to(dtype=torch.int32, device=device)
-        # Native GDN pad clone. Hybrid already pads Flash like 2.4T;
-        # drop this after Native GDN consumes Hybrid buffers directly.
-        # See apply_gdn_pad_sentinels in qwen4_exp_gdn_pad.py.
-        idx, query_start_loc = apply_gdn_pad_sentinels(
-            forward_batch, idx, query_start_loc, mode, bs
-        )
+        # Decode cuda-graph: keep Hybrid's static buffers (already pad=-1 on
+        # dead rows in ``_replay_metadata``). Cloning here bakes a throwaway
+        # address into the full decode graph and Native GDN keeps writing the
+        # capture-time slots → GPU fault under radix/extra_buffer recycle.
+        # Prefill/extend is eager; pad-sentinel clone is fine there.
         if mode.is_decode_or_idle():
-            # FlyDSL checks the slot vector against q's batch axis. The graph
-            # buffer is the capture bucket; keep a contiguous int32 prefix.
+            # Never ``.to()`` / clone here — that bakes a throwaway address into
+            # the full decode graph. Hybrid ``state_indices_list`` is already
+            # int32 on device; ``_align_flydsl_decode_slots`` enforces the view.
+            if query_start_loc.device != device:
+                raise RuntimeError(
+                    "GDN decode query_start_loc must already live on the Hybrid "
+                    f"cuda-graph device ({device}), got {query_start_loc.device}"
+                )
             idx = _align_flydsl_decode_slots(idx, bs)
+        else:
+            idx = idx.to(dtype=torch.int32, device=device)
+            idx, query_start_loc = apply_gdn_pad_sentinels(
+                forward_batch, idx, query_start_loc, mode, bs
+            )
         common_kwargs = {
             "num_spec_decodes": 0,
             "num_spec_decode_tokens": 0,
@@ -875,20 +1163,27 @@ class SGLangGDNForwardContext:
             )
 
         if mode.is_extend():
+            if replayssm_enabled():
+                # Chunked prefill rewrites the checkpoint in place. The ring
+                # cursor, shared by every GDN layer, has to drop the previous
+                # tenant's records once per forward or the next verify folds
+                # them on top of that new state.
+                note_full_state_write(live_slots[:bs])
             # SGLang's seq_lens_sum includes cached prefix tokens for some
             # hybrid batches; GDN only receives the active query tokens.
-            seq_sum = int(query_start_loc[-1].item())
+            if num_query_tokens is None:
+                # Reconstructed metadata has no host count.
+                num_query_tokens = query_start_loc[-1].item()
+            seq_sum = int(num_query_tokens)
             epl = forward_batch.extend_prefix_lens
             has_initial_state = None if epl is None else epl > 0
             nums_dict, batch_ptr, token_chunk_offset_ptr = (
-                compute_causal_conv1d_metadata(
-                    query_start_loc.diff().cpu().numpy(), query_start_loc.device
-                )
+                compute_causal_conv1d_metadata(query_start_loc, seq_sum)
             )
             # GatedDeltaNet's prefill reads these once-per-step fields (#2534)
             # instead of casting per layer. The native builder fills them; a
-            # None here makes the non-FlyDSL prefill (e.g. ReplaySSM under MTP)
-            # and the state write-back fail. Read and write slots are the same.
+            # None here makes the Triton prefill and the state write-back
+            # fail. Read and write slots are the same.
             idx_i64 = idx.long()
             no_initial_state = None if has_initial_state is None else ~has_initial_state
             return GDNAttentionMetadata(
@@ -906,6 +1201,10 @@ class SGLangGDNForwardContext:
                 non_spec_state_indices_in_i64=idx_i64,
                 flydsl_prefill_metadata=_flydsl_prefill_metadata(
                     query_start_loc, forward_batch
+                ),
+                # SGLangGatedDeltaNet snapshots radix-cache states out of `h`.
+                keep_intermediate_states=bool(
+                    getattr(fm, "has_mamba_track_mask", False)
                 ),
                 **common_kwargs,
             )
@@ -952,6 +1251,7 @@ class SGLangGDNForwardContext:
             kv_cache_data=kv_cache_data,
             context=context,
             num_tokens=num_tokens,
+            step=_GDNStep(forward_batch),
         )
 
     @classmethod
@@ -971,6 +1271,7 @@ class SGLangGDNForwardContext:
         if reuse_current_context:
             active_kv = dict(prev_context_kv or {})
             active_kv.update(forward_context.kv_cache_data)
+        step_token = _GDN_STEP.set(forward_context.step)
         try:
             set_kv_cache_data(active_kv)
             attn_md = (
@@ -999,6 +1300,7 @@ class SGLangGDNForwardContext:
                 )
             yield
         finally:
+            _GDN_STEP.reset(step_token)
             if reuse_current_context:
                 current_context.attn_metadata = prev_attn_metadata
                 current_context.kv_cache_data = prev_context_kv

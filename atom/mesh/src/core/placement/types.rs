@@ -19,6 +19,7 @@ pub struct RequestDescriptor<'a> {
     pub tokens: Option<&'a [u32]>,
     pub headers: Option<&'a HeaderMap>,
     pub stream: bool,
+    pub carries_media: bool,
 }
 
 #[derive(Debug)]

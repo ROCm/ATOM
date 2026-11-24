@@ -65,7 +65,7 @@ A request flows through the system in ten steps:
 
 2. **`InputOutputProcessor.preprocess()`** — each prompt is tokenized via the HuggingFace tokenizer. A `Sequence` object is created to track the request's state, timing, and block allocation. `arrive_time` is recorded.
 
-3. **`CoreManager.add_request()`** — the list of `Sequence` objects is serialized with `pickle` and sent over a ZMQ `ROUTER` socket. When multiple DP ranks are active, requests are routed by a configurable load-balancing strategy (`least_requests` by default; `round_robin` and `least_tokens` also available).
+3. **`CoreManager.add_request()`** — the list of `Sequence` objects is serialized with `pickle` and sent over a ZMQ `ROUTER` socket. When multiple DP ranks are active, requests are routed by a configurable load-balancing strategy (`least_requests` by default; `round_robin`, `least_tokens` and `prefix_spread` also available).
 
 4. **`EngineCore.process_input_sockets()`** — an I/O thread on the `EngineCore` process receives the serialized data on a ZMQ `DEALER` socket, deserializes it, and places the sequences into the `input_queue`.
 
@@ -75,8 +75,9 @@ A request flows through the system in ten steps:
 
 7. **`ModelRunner.forward()`** — executes the three-phase forward pass:
    - `prepare_model()` — assembles input IDs (handling deferred output from previous steps), builds attention metadata, and gathers sampling temperatures.
-   - `run_model()` — runs the model forward. Prefill and large batches run eagerly; decode batches replay captured CUDA graphs. Returns logits and hidden states.
-   - `postprocess()` — samples tokens (or runs rejection sampling for speculative decoding), prepares deferred output via `tokenIDProcessor`, and optionally proposes draft tokens through `EagleProposer`.
+   - `run_model()` — runs the model forward. Prefill and large batches run eagerly; decode batches replay captured CUDA graphs. Returns the hidden states.
+   - `run_lm_head()` — the LM head on the forward's stream: a verify head's ids where they stand for the step, else the logits (`compute_logits()`).
+   - `postprocess()` — samples tokens from the head's output (or runs rejection sampling for speculative decoding), prepares deferred output via `tokenIDProcessor`, and optionally proposes draft tokens through `EagleProposer`.
 
 8. **`Scheduler.postprocess()`** — appends sampled tokens to each `Sequence`, records `first_token_time`, checks stop conditions (EOS, stop token IDs, stop token sequences, `max_tokens`), and moves finished sequences out of the running queue. The `BlockManager` deallocates blocks for finished sequences.
 
@@ -111,6 +112,69 @@ ATOM uses a module-level global `ForwardContext` to pass metadata through CUDA g
 | `set_kv_cache_data(kv_cache_data)` | Register KV cache tensors at initialization |
 
 This pattern enables stateless dispatch: attention backends and model operators call `get_forward_context()` to access metadata without requiring it as a function parameter, which is critical for CUDA graph compatibility.
+
+## Model hooks (verify head, deferred status, decode round)
+
+Two switches of `ModelRunner` let a model take over part of a step; neither
+is specific to one model, and a model that uses neither runs exactly as before.
+
+- **The verify head.** `ModelRunner.run_model` returns the forward's hidden
+  states; a decode graph records the forward alone, and the head runs after it,
+  eagerly, on the forward's stream (`ModelRunner.run_lm_head`, whose `LmHeadOutput`
+  `postprocess` takes; under RapidServe inside the CU-masked decode stream).
+  A verify head (`atom/model_ops/verify_head.py`
+  `VerifyHead`, bound once at install by `ModelRunner._bind_verify_head`: the
+  model's own `verify_head`, else for a drafted model whose logits are its
+  `ParallelLMHead` the shared mono LM head launch, `atom/mono/lm_head`, in
+  front of ATOM's Triton `ArgmaxVerifyHead` on the steps it does not serve)
+  picks each row's id itself and
+  verifies the drafts on them: `sample_token_ids(hidden_states)` gives a
+  speculative verify's output token ids `[requests, num_spec_steps + 1]` and
+  spec status `[3, requests]` (accepted, rejected, anchor row: the rejection
+  sampler's layout; `verify_ids.VerifyOutput`), or None where it serves no
+  such step. `run_lm_head` asks it only where its ids stand for the step
+  (`VerifyHead.samples_step`: nothing reads the logits but each row's pick --
+  no logprobs, structured output or required channel, exact or forced
+  acceptance -- every request verifies the full draft span, and the rows are
+  all greedy or all sampled the ways the head draws, `samples` /
+  `draws_top_p(rows)`: the mono LM head draws a row within its top-p in the
+  launch, `atom/mono/lm_head/top_p*.py`) and
+  no lossless drafter verifies a sampled step by the probability ratio;
+  otherwise, or where it gives None, the logits (`ModelRunner.compute_logits`,
+  which an RLHF rollout masks past the true vocabulary, binding no verify head),
+  the sampler and the rejection sampler run as before. As on every other step,
+  the output ids are broadcast over TP unless the head's agree
+  (`VerifyHead.ids_agree`), and each request's next id (the next forward's
+  ids, the drafter's anchor) is gathered from the broadcast ids.
+- **The deferrable status wait.** An attention builder may say a step consumes
+  the previous verify's verdict on the device rather than its host-side status
+  (`AttentionMetadataBuilder.consumes_device_verdict`, asked once a step in
+  `prepare_model`): `tokenIDProcessor.prepare_input_ids` then builds the step
+  from zero rejected / bonus counts and the runner takes the status
+  (`take_deferred_spec_status`) right after the target's launch, where
+  `postprocess` needs it.
+
+DeepSeek-V4.1's metadata builder also takes a model's decode round
+(`atom/model_engine/model_hooks.py`, `DecodeRound`, handed over by the model's
+install: `DeepseekV41MetadataBuilder.use_decode_round`) and asks it at its own
+points of a step: `consumes_device_verdict` (its answer to the runner),
+`service` before the layout, `laid_out` after it and `committed` before the
+speculative commit (at the anchors the runner commits). `DecodeRound.service`
+is the step's one routing decision, `AttentionMetaData.served_by_round`
+(`RoundService`): `NONE`, or `FORWARD` (the model's own forward runs every
+layer, looks its Engram rows up itself and writes the DSpark draft's context
+KV), `LEAN` (laid out without the compress plans and step planners nothing it
+runs reads) and `DEVICE` (positions advanced on the device from the previous
+verdict). The builder decides it once before the step's layout; the builder,
+its cache, Engram staging (`EngramStep.served_by_round`), the DSpark proposer
+and the model's forward all read it, so they agree on every step.
+
+DeepSeek-V4.1's high-interactivity monokernels (`atom/models/deepseek_v41/mono/hi_*.py`,
+`round/`, the FlyDSL runtime in `hi/`; `ATOM_DSV41_MONO_HI`, on by default where
+`hi_gate` says they serve: MI355X at TP2, TP4 or TP8) use all three: `hi_dispatch` wraps the model
+(`HiDecodeModel`, whose verify head, `HiVerifyHead`, takes the in-graph head and
+post-verify's outputs, `round/post_verify.py`), and `round.HiRound` is its decode round
+(the device round, `round/device_round.py`, consumes the device verdict).
 
 ## Multi-process architecture
 
@@ -167,7 +231,7 @@ ATOM uses a multi-process design with ZMQ sockets for inter-process communicatio
 
 **Data-parallel variant** (`DPEngineCoreProc`):
 
-When `data_parallel_size > 1`, each EngineCore process is a `DPEngineCoreProc` that synchronizes with other DP ranks via `torch.distributed.all_reduce` on a Gloo process group. The `busy_loop()` override ensures all DP ranks stay in lockstep: if one rank has a prefill batch while another does not, the idle rank executes a dummy prefill (`dummy_prefill_execution()`) to keep NCCL collectives synchronized.
+When `data_parallel_size > 1`, each EngineCore process is a `DPEngineCoreProc` that synchronizes with other DP ranks via `torch.distributed.all_reduce` on a Gloo process group. The `busy_loop()` override ensures all DP ranks stay in lockstep: a rank with no request runs a step with none (`dummy_execution()`) in the group's phase, to keep NCCL collectives synchronized.
 
 ### Collective worker RPC
 
@@ -200,21 +264,54 @@ RPC targets must not perform cross-DP collectives: each EngineCore dequeues
 control work independently, so another DP engine may already be waiting in the
 busy loop's state all-reduce.
 
-Direct, SHM and IPC weight updates are fenced sessions. The first bucket stops
-serving; CoreManager clears the fence only after every DP engine completes the
-final bucket. Built-in senders abort from ``finally`` if iteration stops early,
-and asynchronous weight-update utility sends are rejected because they have no
-owner to finish or abort them. ``AsyncLLMEngine.get_weight_sync_status()``
-reports a fence, an in-progress session and its last failure.
+Direct, SHM, IPC and RDMA (``AsyncLLMEngine.receive_weights_rdma``) weight
+updates are fenced sessions. The first bucket stops serving; CoreManager clears
+the fence only after every DP engine completes the final bucket. Built-in
+senders abort from ``finally`` if iteration stops early, and asynchronous
+weight-update utility sends are rejected because they have no owner to finish
+or abort them. ``AsyncLLMEngine.get_weight_sync_status()`` reports a fence, an
+in-progress session, its last failure, and whether the weights are whole.
 
 Every update carries the id of the sync it belongs to: one per
 ``weight_sync_session()`` until that sync finishes, and one per update sent
 outside a session. A session whose update failed sends nothing more, and an
 engine refuses the remaining updates and the finish of a failed or aborted
 sync, so the rest of a failed sync cannot commit as a new one. Recovering takes
-a new, complete sync. Weights may be resumed while fenced, since after
+a new sync that rewrites every parameter: once a sync has failed or been
+abandoned between buckets, the runners refuse to complete one that leaves any
+parameter as it was. Weights may be resumed while fenced, since after
 ``sleep(level=2)`` only a resume gives released parameters storage again; the
 fence keeps serving off until that complete sync commits.
+
+What syncs the runners can take is asked once, at engine startup, when
+``Config.weight_sync_runner`` says they answer ``get_worker_capabilities``
+(``AsyncLLMEngine`` sets it); a runner that cannot answer fails startup. Each
+engine reports the answer in its READY, and CoreManager refuses a reload that
+any engine's runners cannot take before any engine runs it -- under PP, one
+stage's runners alone may be the ones that cannot. Such a sync -- a model a
+reload cannot rewrite in place, such as MLA, prefill context parallelism,
+expert-parallel or redundant-expert MoE, or weights in a format a
+full-precision write cannot produce -- writes nothing and fences nothing. The
+engine and the runners refuse it too, before writing. A sync whose updates
+every rank refused before writing, or that never reached a rank, leaves the
+fence and the prefix cache as they were when the sync began. Weights a sleep
+discards are not whole either: the engine stays fenced until a sync that
+rewrites every parameter.
+
+An RDMA stream is decided by the runners. Each waits for every broadcast for
+at most its weight group's ``timeout_s``, and the group is built to abort its
+communicator on a timeout rather than end the process. So a trainer that dies
+mid-stream fails the stream on every rank once that timeout has passed since
+the last frame each rank received, and the group has been torn down. The group
+then has to be joined again, and the engine stays fenced until a sync rewrites
+every parameter. A caller that stops waiting before the engine answers does
+not learn whether the stream was written, and the engine stays fenced the same
+way. A stream's version is used up only once FINISH commits it, so a sync the
+engine failed can be retried at the same version. The engine keeps each group's
+committed version, and forgets it when the runners join that group anew or
+leave it; so ``collective_rpc`` takes ``group_name`` only as a keyword for
+``init_rdma_weight_group`` and ``destroy_rdma_weight_group``, and refuses
+either call otherwise.
 
 ## Sequence lifecycle
 
@@ -287,7 +384,7 @@ The `embed_tokens` layer is always shared when shapes match and pipeline paralle
 
 ### Propose loop: metadata is the backend's, not the proposer's
 
-The `propose()` method iterates `mtp_k` draft steps. Every step calls
+`EagleProposer._propose()` (the flavor body `Drafter.propose` calls) iterates `mtp_k` draft steps. Every step calls
 `runner.attn_metadata_builder.prepare_mtp_decode()` and merges the dict it
 returns into `attn_metadata`, so *which* fields a step updates — `kv_indptr`
 and `kv_indices` for MLA, `block_tables` and `context_lens` for MHA — is the
@@ -298,7 +395,7 @@ rejected speculative tokens are taken back out.
 One thing does branch, on a builder capability rather than a model family:
 `fuse_mtp_decode_position_update`. Where a builder sets it, the per-step
 position bump and the `context_lens` increment ride into its kernel through
-`update_context_lens` / `positions_out`; where it does not, `propose()` does
+`update_context_lens` / `positions_out`; where it does not, `_propose()` does
 both itself before the call.
 
 ### `prepare_mtp_decode()`
@@ -316,6 +413,13 @@ Each attention backend provides its own `prepare_mtp_decode()` implementation:
 | `atom/model_engine/engine_core.py` | `EngineCore` main execution loop, `DPEngineCoreProc` data-parallel variant, `EngineCoreRequestType` message protocol |
 | `atom/model_engine/engine_core_mgr.py` | `CoreManager` ZMQ orchestration, process launching, load-balanced DP dispatch |
 | `atom/model_engine/model_runner.py` | `ModelRunner` per-GPU execution (model loading, CUDA graph capture, forward pass), `tokenIDProcessor` deferred output handling |
+| `atom/model_engine/model_hooks.py` | `DecodeRound`, the decode round a model's install may give DeepSeek-V4.1's metadata builder |
+| `atom/model_engine/dp_routing/prefix_spread.py` | `PrefixSpreadRouter`: the `--dp-load-balance prefix_spread` prefix index and placement rule `CoreManager` calls under its load-balancing lock |
+| `atom/model_engine/dp_routing/share_cache.py` | `ShareCacheRouter`: the `--dp-load-balance share_cache` placement over the prefix index, balanced on each rank's reported prefill backlog |
+| `atom/model_engine/dp_routing/backlog.py` | `BacklogLedger`: per-rank prefill backlog as `CoreManager` sees it (reports plus the charges they do not cover yet) |
+| `atom/model_engine/dp_routing/policies.py` | Stateless, session-affinity, prefix-spread and share-cache placement policies with common request lifecycle hooks |
+| `atom/model_engine/dp_routing/route.py` | Placement rank, prefix credit, moved tokens and routing counter/label names |
+| `atom/model_engine/dp_routing/topology.py` | Effective prefix-routing topology used by the manager and MP deployment checks |
 | `atom/model_engine/scheduler.py` | `Scheduler` prefill-first scheduling, `ScheduledBatch` batch descriptor, `ScheduledBatchOutput` forward results |
 | `atom/model_engine/engine_stats.py` | `EngineStats` — MTP acceptance, prefix-cache hits, and the periodic engine-status line, each on its own cadence |
 | `atom/model_engine/sequence.py` | `Sequence` request state, `SequenceStatus` and `SequenceType` enums |

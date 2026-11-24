@@ -58,7 +58,7 @@ def moonep_balance_step() -> bool:
     """Balance a step that prefills and is big enough to pay for its prefetch.
 
     Every EP rank must take the same branch (planning is collective), so both
-    tests are DP-agreed.  Prefill is the test ``combine_quant_for_step`` uses:
+    tests are DP-agreed.  Prefill is the test ``combine_wire_for_step`` uses:
     ``is_prefill`` only speaks for dp_size == 1, ``running_tokens_are_unified``
     for the group.  Size is the group's token sum: a slot fill costs the same
     whatever the step, so a step where one rank prefills a little next to

@@ -16,12 +16,12 @@ import numpy as np
 from atom.config import Config, DCPConfig
 from atom.distributed.kv_events import (
     MEDIUM_GPU,
-    MEDIUM_REMOTE,
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
     KVCacheEvent,
 )
+from atom.kv_transfer.offload.load_math import chunk_floor, tier_load_tokens
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import (
@@ -36,7 +36,7 @@ from atom.model_engine.prefix_hash import (
     prompt_fingerprint,
 )
 from atom.model_engine.sequence import Sequence
-from atom.model_engine.state_cache import StateCache, StateCheckpointCache
+from atom.model_engine.state_cache import KEEP_NONE, StateCache, StateCheckpointCache
 from atom.model_engine.state_pool import StateSlotPool
 from atom.model_engine.state_runtime import (
     DEFAULT_STATE_RUNTIME,
@@ -58,6 +58,7 @@ def _make_block_stored(
     block_size: int,
     medium: str = MEDIUM_GPU,
     token_offset: int | None = None,
+    cache_seed: int = -1,
 ) -> BlockStored:
     """Construct a BlockStored event from a coalesced run of new blocks.
 
@@ -67,6 +68,14 @@ def _make_block_stored(
     `block_size` here is the hash block size (block_size * dcp_world_size),
     the span of one block-table entry in global tokens, so the offset must be
     computed in the same unit.
+
+    `cache_seed` is the seq's. A multimodal seq's (anything but -1) seeds its
+    whole hash chain, so no block of it can be named from its tokens alone.
+    Every block of such a seq, text-only ones included, then carries
+    `extra_keys` `((seed, 0),)`, the seed in 16 hex digits at a fixed offset 0:
+    an ATOM marker that the hash is seeded by media and the block must not be
+    matched by tokens. It borrows the shape of vLLM's `(mm_identifier, offset)`
+    pair, but not its meaning (vLLM's offset is the media's position).
     """
     # A list, not the `array("i")` the publish paths carry: the event is
     # msgpack-encoded and msgspec has no encoding for an array. The publisher
@@ -75,12 +84,18 @@ def _make_block_stored(
     assert isinstance(
         tokens, list
     ), f"BlockStored.token_ids must be a list, got {type(tokens).__name__}"
+    extra_keys = None
+    if cache_seed != -1:
+        extra_keys = [((format(cache_seed & (2**64 - 1), "016x"), 0),)] * len(hashes)
     return BlockStored(
         block_hashes=hashes,
         parent_block_hash=parent,
         token_ids=tokens,
         block_size=block_size,
+        lora_id=None,
         medium=medium,
+        lora_name=None,
+        extra_keys=extra_keys,
         token_offset=token_offset,
     )
 
@@ -143,11 +158,13 @@ class AdmissionProbe:
 _RECENT_INDEX_CHANGES = 8192
 
 
-def draft_kv_lookahead(num_speculative_tokens: int) -> int:
-    """KV positions past `len(seq)` that one forward's MTP draft round writes.
+def draft_kv_lookahead(
+    num_speculative_tokens: int, *, block_drafter: bool = False
+) -> int:
+    """KV positions past `len(seq)` that one forward's draft round writes.
 
-    `EagleProposer.propose` runs the draft `k = num_speculative_tokens` times
-    per forward. Step 0 writes the target's own slots; each of the `k - 1`
+    Serial MTP (`EagleProposer._propose`) runs the draft `k = num_speculative_tokens`
+    times per forward. Step 0 writes the target's own slots; each of the `k - 1`
     mid-steps after it bumps `context_lens` and writes one token at
     `context_lens - 1`. So a forward whose target context ends at `C` writes
     draft KV through position `C + k - 2`, and `C <= len(seq)` at schedule time
@@ -155,11 +172,20 @@ def draft_kv_lookahead(num_speculative_tokens: int) -> int:
     placeholders the scheduler appended assume full acceptance). The draft
     therefore needs `k - 1` positions past `len(seq)`.
 
-    A position past the row's allocated blocks reads its block id from the
-    zeroed tail of the block table, so the write lands in physical block 0 --
-    another request's KV, or the units of a PAGE state checkpoint.
+    A block drafter (DSpark) instead writes its whole block in one pass: the
+    `T = k` positions `anchor + 1 .. anchor + k` after the last verified token
+    (`DSparkProposer._build_paged_block_metadata`). The anchor is at most
+    `C - 1`, so it writes through `C + k - 1` and needs `k` positions past
+    `len(seq)` -- one more than the serial count.
+
+    A position past the row's allocated blocks resolves to physical block 0
+    through the zeroed block-table tail. PAGE-capable pools keep that block
+    reserved for padding; other pools may use it for live KV. Neither is a
+    valid destination for this row's draft writes, so its whole reach must
+    have allocated blocks even when a padding block is reserved.
     """
-    return max(0, int(num_speculative_tokens or 0) - 1)
+    k = max(0, int(num_speculative_tokens or 0))
+    return k if block_drafter else max(0, k - 1)
 
 
 # Blocks `_hit_walk` hashes per round past the cached prompt chain, doubling
@@ -206,6 +232,7 @@ class BlockManager:
         *,
         state_runtime: StateRuntime = DEFAULT_STATE_RUNTIME,
     ):
+        self._min_load_tokens = config.offload_min_load_tokens
         block_size = config.kv_cache_block_size
         num_blocks = config.num_kvcache_blocks
         assert num_blocks > 0
@@ -271,6 +298,7 @@ class BlockManager:
             cache_policy=envs.ATOM_PREFIX_CACHE_POLICY,
             protected_ratio=envs.ATOM_PREFIX_CACHE_PROTECTED_RATIO,
             on_remap=self._note_index_change,
+            reserve_null_block=state_runtime.checkpoint_spec is not None,
         )
         # Per-request cache slot pool. Used by attention types with a
         # stateful per-request buffer (GDN recurrent state, V4 compressor
@@ -336,7 +364,8 @@ class BlockManager:
         from atom.model_engine.state_offload import (
             state_tier_capability,
             state_tier_chunk_tokens,
-            state_tier_cpu_bytes,
+            state_tier_cpu_entries,
+            state_tier_verified_for_s,
         )
 
         # A capability derived from the whole config, not the connector's name.
@@ -367,6 +396,7 @@ class BlockManager:
                 checkpoint_spec,
                 enabled=enabled,
                 readable_midstep=state_runtime.transfer.readable_midstep,
+                decode_keep=state_runtime.transfer.decode_keep,
             )
         # The rolling state class: per-request slots plus a content index over
         # the free ones. A checkpoint IS a free slot whose content is still
@@ -389,9 +419,10 @@ class BlockManager:
         self.midstep_grid = state_runtime.transfer.midstep_grid
         self.midstep_min_offset = state_runtime.transfer.midstep_min_offset
         if self.paged_state_checkpoints is not None:
-            # A PAGE midstep checkpoint is copied into a scratch slot from
-            # this pool, then stored from there, within the copy budget the
-            # runner's descriptor staging is sized to: one definition for both.
+            # A PAGE midstep checkpoint or decode image is built in a scratch
+            # slot from this pool, then stored from there, within the copy
+            # budget the runner's descriptor staging is sized to: one
+            # definition for both.
             self.paged_state_checkpoints.attach_midstep_scratch(
                 self.state,
                 checkpoint_copy_ops_per_batch(getattr(config, "max_num_seqs", 0)),
@@ -511,10 +542,11 @@ class BlockManager:
                 # (DSpark3: 42.45 vs 29.51 MiB), and dividing by it would cap
                 # this index a third below the codec, hiding images it holds.
                 max_cpu_entries=(
-                    state_tier_cpu_bytes() // checkpoint_spec.image_bytes
+                    state_tier_cpu_entries(checkpoint_spec, config)
                     if checkpoint_spec is not None
                     else None
                 ),
+                verified_for_s=state_tier_verified_for_s(config),
             )
             # Attached rather than passed at construction: the coordinator is
             # built before the switch is read (it needs `checkpoint_spec`,
@@ -532,6 +564,10 @@ class BlockManager:
         self.demands_recorded: int = 0
         self.chunks_cut_for_demand: int = 0
         self.demands_declined_no_room: int = 0
+        # Dropped because the demand's chunk floor is a nonzero hit: the shape a
+        # floored anchor leaves the next turn, and also a real fork under one
+        # chunk above a grid rung (`_record_checkpoint_demand`).
+        self.demands_dropped_at_grid_hit: int = 0
         # The anchor's own cut counter, kept separate from the demand's: the
         # anchor fires on nearly every prompt and would drown the convergence
         # signal `chunks_cut_for_demand` exists to expose.
@@ -727,7 +763,7 @@ class BlockManager:
         Under DCP a rank stores only its interleaved shard, so this is a factor
         of `dcp_world_size` below the global `ceil(seq_len / block_size)`. The
         pool is sized in these same per-rank units, so this is the only count
-        that may be compared against `kv.num_blocks` — whether to draw from the
+        that may be compared against `kv.num_usable_blocks` — whether to draw from the
         pool (`can_allocate`/`allocate`) or to reject a prompt as too large for
         it (`Scheduler._unschedulable_reason`).
         """
@@ -770,10 +806,11 @@ class BlockManager:
         frontend can predict that verdict and refuse an oversized prompt with an
         error while it is still answering the client, instead of leaving the
         scheduler to discover it once the client is already waiting. The API
-        server needs it published because `num_kvcache_blocks` is measured in
-        the engine subprocess and its own Config never learns the value.
+        server needs it published because the engine measures the physical
+        `num_kvcache_blocks`, while this limit uses `kv.num_usable_blocks`
+        after reserving padding; the frontend's Config knows neither value.
         """
-        capacity = self.kv.num_blocks
+        capacity = self.kv.num_usable_blocks
         # A prompt this long needs more than `capacity` blocks on some rank, so
         # it bounds the search from above: each rank holds at least
         # `1 / dcp_world_size` of it, i.e. over `capacity` blocks' worth.
@@ -818,7 +855,7 @@ class BlockManager:
             return hit
         # The connector skips a load under OFFLOAD_MIN_LOAD_TOKENS, so neither
         # LMCache figure counts unless it clears that above where it starts.
-        min_load = envs.OFFLOAD_MIN_LOAD_TOKENS
+        min_load = self._min_load_tokens
         resume = hit * hbs
         tier_hit = int(seq.offload_joint.kv_prefix_tokens or 0)
         if tier_hit - resume >= min_load:
@@ -964,7 +1001,7 @@ class BlockManager:
         return {
             "used": used,
             "free": free,
-            "total": self.kv.num_blocks,
+            "total": self.kv.num_usable_blocks,
             "hashed": hashed,
             "retained": max(0, hashed - used),
             "evicted_total": self.total_evicted_blocks,
@@ -1222,10 +1259,13 @@ class BlockManager:
         if seq.has_per_req_cache and not self.state.has_free(self.state_slots_per_req):
             return -1
         if not self.enable_prefix_caching:
-            if not self._has_page_units(
-                self.num_pool_blocks(len(seq)) + self.draft_lookahead_blocks(len(seq))
-            ):
+            num_new_blocks = self.num_pool_blocks(
+                len(seq)
+            ) + self.draft_lookahead_blocks(len(seq))
+            if not self._has_page_units(num_new_blocks):
                 return -1
+            if probe is not None:
+                probe.num_new_blocks = num_new_blocks
             return 0
         # Step 1: compressed prefix (CSA/HCA/indexer share the block hash and
         # read the WHOLE history, so this stays a full front-to-back chained
@@ -1536,14 +1576,152 @@ class BlockManager:
             or self.kv.lookup(memo.boundary_hash) == memo.boundary_id
         )
 
-    def record_allocation(self, seq: Sequence, probe: AdmissionProbe) -> None:
-        """Commit the fit probe before any allocation changes the pool."""
+    def record_allocation(
+        self,
+        seq: Sequence,
+        probe: AdmissionProbe,
+        *,
+        defer_unverified: bool = False,
+    ) -> bool:
+        """Commit the fit probe before any allocation changes the pool.
+
+        With `defer_unverified`, returns False and commits nothing when the
+        state offload asks to hold the admission over the state it would
+        restore from outside HBM (`StateOffloadIndex.hold_admission`). The
+        caller retries the request a pass later.
+        """
         if self.enable_prefix_caching:
             decision = self._joint_kv_boundary(
                 seq, probe.num_cached_blocks, probe.block_hashes
             )
             decision = self._fit_joint(decision, probe)
+            if (
+                defer_unverified
+                and self.state_offload is not None
+                and self.state_offload.hold_admission(
+                    self._resume_hash_off_hbm(
+                        seq, probe.num_cached_blocks, probe.block_hashes, decision
+                    )
+                )
+            ):
+                return False
             self._commit_joint_boundary(seq, decision)
+        return True
+
+    def _resume_hash_off_hbm(
+        self,
+        seq: Sequence,
+        num_cached_blocks: int,
+        block_hashes: list[int],
+        decision: JointBoundaryDecision,
+    ) -> int:
+        """The `_state_resume_hash` `allocate` would restore from, when HBM
+        does not hold it; -1 for no state, an HBM-held one, or a replay."""
+        if not seq.has_per_req_cache:
+            return -1
+        joint = decision.skip_reason is None
+        if joint and decision.state_from_hbm:
+            return -1
+        hit_hash = (
+            block_hashes[num_cached_blocks - 1]
+            if 0 < num_cached_blocks <= len(block_hashes)
+            else -1
+        )
+        h = self._state_resume_hash(
+            seq, decision.boundary_hash if joint else -1, hit_hash
+        )
+        if h != -1 and not joint:
+            in_hbm = (
+                self.paged_state_checkpoints.contains(h)
+                if self.paged_state_checkpoints is not None
+                else self.state.lookup(h) >= 0
+            )
+            if in_hbm:
+                return -1
+        return h
+
+    def _state_resume_hash(self, seq: Sequence, joint_hash: int, hit_hash: int) -> int:
+        """The hash whose state `seq` resumes from, or -1 for none.
+
+        The joint boundary when there is one (above the HBM hit by
+        construction), else the HBM hit's last block. A replay rebuilds the
+        state instead of restoring it, so it resumes from none.
+        """
+        if joint_hash != -1:
+            return joint_hash
+        return -1 if self.tier_resume_replays(seq) else hit_hash
+
+    def lower_hit_to_chunk(
+        self,
+        seq: Sequence,
+        probe: AdmissionProbe,
+        chunk: int,
+        tier_hit: int,
+    ) -> bool:
+        """Lower an unaligned HBM hit to the tier's chunk floor, so a load can
+        start there.
+
+        A tier moves whole `chunk`-token chunks, so a load starts only on a
+        chunk boundary. Without lowering, an HBM hit that ends inside a chunk
+        needs a hand-off prefill up to the next boundary, then the load, then
+        the rest: two prefill releases. Lowering treats the part of the hit
+        past the floor as a miss. `allocate` then claims only the blocks below the floor
+        and fills the rest with fresh ones, which the load writes whole; the
+        shared blocks past the floor are left alone. The tier re-supplies at
+        most `chunk - hash_block` tokens that HBM already held.
+
+        Lowers `probe` in place and returns True when:
+          - the hit is a chunk multiple off, and the tier's hit reaches past
+            the HBM hit and, from the floor, clears `min_load`;
+          - the hit can be lowered at all: no joint boundary, and a request
+            state that is rebuilt by replay (or none);
+          - every cache class still accepts the lowered boundary -- the same
+            SWA-window and state gates `can_allocate` applied to the original,
+            so a lowered hit never claims a block whose window is gone;
+          - the pool can give the extra fresh blocks.
+        Otherwise leaves `probe` untouched and returns False.
+        """
+        hbs = self.hash_block_size
+        hit_blocks = probe.num_cached_blocks
+        if hit_blocks <= 0 or probe.num_new_blocks is None:
+            return False
+        if chunk <= 0 or chunk % hbs:
+            return False
+        hit = hit_blocks * hbs
+        floor = chunk_floor(hit, chunk)
+        if (
+            floor == hit
+            or tier_hit <= hit
+            or not tier_load_tokens(floor, tier_hit, chunk, self._min_load_tokens)
+        ):
+            return False
+        if seq.offload_joint.boundary_tokens:
+            return False
+        if seq.has_per_req_cache and not self.state.transfer.replays:
+            # A checkpointed state cannot be rebuilt below the hit it was
+            # taken at.
+            return False
+        lowered = floor // hbs
+        chain = probe.block_hashes
+        if lowered > len(chain):
+            return False
+        if lowered and self._gated_hit(seq, lowered, chain) != lowered:
+            return False
+        # `probe.num_new_blocks` already counts a cached-free block of the hit
+        # as one to allocate: claiming it or taking a fresh one costs the same
+        # unit. Only a dropped block some request still holds is a new unit.
+        in_use = 0
+        for i in range(lowered, hit_blocks):
+            block_id = self.kv.lookup(chain[i])
+            if block_id != -1 and self.kv.is_used(block_id):
+                in_use += 1
+        demand = probe.num_new_blocks + in_use
+        protected = chain[lowered - 1] if lowered else None
+        if not self._has_page_units(demand, protected):
+            return False
+        probe.num_cached_blocks = lowered
+        probe.num_new_blocks = demand
+        return True
 
     def retreat_joint_to_hbm(self, seq: Sequence) -> bool:
         """Drop a failed unaligned joint and resume at the HBM hit it lowered.
@@ -1740,13 +1918,16 @@ class BlockManager:
             # last one actually claimed, whichever way the loop exits.
             if i < num_cached_blocks:
                 hit_hash = h
-        if self.state_replay_tokens and seq.replays_hit:
-            # A replay starts from a fresh state slot, never a checkpoint: it
-            # rebuilds the state below whatever the claim above reached.
-            hit_hash = -1
-            if num_cached_blocks < requested_blocks:
-                # A KV-only load past the hit would start above a gap.
-                seq.replay_kv_load = False
+        # A replay starts from a fresh state slot, never a checkpoint: it
+        # rebuilds the state below whatever the claim above reached
+        # (`_state_resume_hash` gives it none). A KV-only load past the hit
+        # would start above a gap.
+        if (
+            self.state_replay_tokens
+            and seq.replays_hit
+            and num_cached_blocks < requested_blocks
+        ):
+            seq.replay_kv_load = False
         # Pin the restore before fresh blocks can evict its checkpoint.
         state_holds = True
         if seq.has_per_req_cache and self.paged_state_checkpoints is not None:
@@ -1762,9 +1943,9 @@ class BlockManager:
             # joint boundary and `_claim_after_load` raised `num_cached_tokens`
             # to it, so the forward resumed over a prefix the state does not
             # cover. Silent wrong output, no exception.
-            joint_hash = seq.offload_joint.boundary_hash
             state_holds = self._attach_state_slots(
-                seq, joint_hash if joint_hash != -1 else hit_hash
+                seq,
+                self._state_resume_hash(seq, seq.offload_joint.boundary_hash, hit_hash),
             )
         for _ in range(len(seq.block_table), self.num_pool_blocks(len(seq))):
             seq.block_table.append(self._fresh_block())
@@ -1781,9 +1962,9 @@ class BlockManager:
             # above the HBM hit by construction. `num_cached_tokens` stays at
             # the HBM prefix until the KV leg lands, so the forward covers
             # `[hbm, num_prompt)` if anything goes wrong from here.
-            joint_hash = seq.offload_joint.boundary_hash
             state_holds = self._attach_state_slots(
-                seq, joint_hash if joint_hash != -1 else hit_hash
+                seq,
+                self._state_resume_hash(seq, seq.offload_joint.boundary_hash, hit_hash),
             )
         if seq.has_per_req_cache:
             seq._state_initialized_after_alloc = False
@@ -2310,6 +2491,7 @@ class BlockManager:
         next_forward_tokens: int | None = None,
         aimed: bool = True,
         replay_until: int | None = None,
+        snapshot_step: int = -1,
     ) -> None:
         """Register hashes for blocks finalized by the most recent step.
 
@@ -2337,6 +2519,8 @@ class BlockManager:
         replay has rebuilt the state whole there, so that may be checkpointed.
         Left unset it reads `seq.replay_until`, which under pipeline
         parallelism a later chunk's scheduling may already have moved.
+
+        `snapshot_step` reaches `StateCache.checkpoint`; see `hash_decode_blocks`.
         """
         if not self.enable_prefix_caching:
             return
@@ -2384,12 +2568,17 @@ class BlockManager:
                     store_run_parent,
                     hbs,
                     token_offset=start * hbs,
+                    cache_seed=seq.cache_seed,
                 )
             )
         pos = base + num_new_tokens
-        kept = self.checkpointers_at(seq, pos, next_forward_tokens, aimed)
+        kept = (
+            self.checkpointers_at(seq, pos, next_forward_tokens, aimed, snapshot_step)
+            if pos > seq.scheduled_checkpoint_pos
+            else []
+        )
         for cache in kept:
-            cache.checkpoint(seq, end, h)
+            cache.checkpoint(seq, end, h, snapshot_step)
         if kept:
             seq.last_checkpoint_pos = pos
         # The midstep half of the same moment. Here rather than at each of the
@@ -2399,8 +2588,39 @@ class BlockManager:
         # reserved, so decode and unreadable backends pay a branch.
         self.commit_midstep(seq)
 
+    def checkpoint_when_scheduled(self, seq: Sequence, pos: int) -> bool:
+        """Decide the checkpoint a prefill chunk ending at `pos` lands on, as
+        the chunk is scheduled rather than when it retires.
+
+        With several forwards in flight, the chunk after the rung is issued
+        before this one retires and writes the slot retire would file from.
+        A PAGE image is a copy the runner makes out of the slot, so filing it
+        now, to be carried by the next batch, puts the copy between the two
+        forwards. A fork hands the slot itself over at filing time, which only
+        retire can do: False when any class kept here is of that kind, and the
+        caller holds the next chunk back instead.
+
+        True also covers keeping nothing; either way retire files nothing up
+        to `pos`.
+        """
+        kept = self.checkpointers_at(seq, pos)
+        if any(c is not self.paged_state_checkpoints for c in kept):
+            return False
+        seq.scheduled_checkpoint_pos = max(seq.scheduled_checkpoint_pos, pos)
+        if kept:
+            chain = self._chain_to(seq, [], pos // self.hash_block_size)
+            h = chain[-1] if chain else seq.cache_seed
+            self.paged_state_checkpoints.checkpoint_when_scheduled(seq, h)
+            seq.last_checkpoint_pos = pos
+        return True
+
     def hash_decode_blocks(
-        self, seq: Sequence, committed_kv_len: int, next_forward_tokens: int = 0
+        self,
+        seq: Sequence,
+        committed_kv_len: int,
+        next_forward_tokens: int = 0,
+        *,
+        snapshot_step: int,
     ) -> None:
         """Register hashes for generated blocks filled up to `committed_kv_len`.
 
@@ -2423,6 +2643,9 @@ class BlockManager:
         `next_forward_tokens` reaches `checkpointers_at`; see there. It
         defaults to "no next forward", i.e. hash but never checkpoint, so a
         caller opts into decode-point checkpointing rather than out of it.
+
+        `snapshot_step` is the step of the slot's last verify window that
+        `committed_kv_len` ends on, as the slot stands when the store runs.
         """
         if not self.enable_prefix_caching:
             return
@@ -2437,6 +2660,7 @@ class BlockManager:
                 # speculative one, so it is held to spacing rather than to the
                 # grid.
                 aimed=False,
+                snapshot_step=snapshot_step,
             )
 
     def cancel_state_fork(self, seq: Sequence) -> bool:
@@ -2538,8 +2762,11 @@ class BlockManager:
         The shape that pays for this is a template header whose checkpoint is
         invalidated before anyone reaches it — there each request cuts a chunk
         and none collects. What bounds that is convergence rather than a
-        threshold: found once, filled once, gone. `chunks_cut_for_demand`
-        against `demands_recorded` is where it would show if it did not.
+        threshold: found once, filled once, gone. On the LMCache chunk grid
+        the rung can settle at the header's chunk floor rather than at the
+        header, and every fork then recomputes the gap (below).
+        `chunks_cut_for_demand` against `demands_recorded` is where it would
+        show if it did not converge.
 
         `--no-state-checkpoint-demand` drops the rung and leaves the prompt-end
         anchor alone. Worth measuring: the rung is most of the write traffic
@@ -2573,6 +2800,46 @@ class BlockManager:
         # hit included (`scheduler._cut_floor` lets it land there).
         if seq.replays_hit:
             demand = 0
+        # Onto the LMCache chunk grid when the joint load serves this tier, as
+        # the prompt-end anchor is (`_record_checkpoint_end`), and for the same
+        # missing chunk. A demand sits where prompts fork, so the chunk covering
+        # it also holds tokens past the fork, and LMCache keys a chunk by all of
+        # its tokens: the next fork's lookup stops at the chunk floor. Once the
+        # prefix leaves HBM, `_joint_kv_boundary` takes rungs only up to that
+        # lookup, so an off-grid demand is never reached and the fork recomputes
+        # from its HBM hit (`no_rung_above_hbm`). An unaligned HBM hit is not
+        # the problem; the joint load reloads its partial chunk. Flooring costs
+        # each fork under one chunk while the prefix is still in HBM.
+        #
+        # A floor below an unaligned hit would be no rung at all, so the demand
+        # stays where it was and serves HBM alone. A floor right at a nonzero
+        # hit is what a floored prompt-end anchor leaves the next turn: the hit
+        # stops at the anchor while the KV runs on to the unfloored end. The
+        # demand is dropped there and this forward recomputes the gap, instead
+        # of cutting a second chunk and storing a second image every turn. A
+        # real fork that close above a grid rung is dropped too: later requests
+        # through it recompute at least that gap while the prefix is in HBM,
+        # and past HBM its off-grid demand is out of reach anyway. The rung can
+        # be the fork's own floor: a shared header S at least a chunk long and
+        # off the grid has its first demand floored to G, every later fork
+        # then hits G and drops its demand, and each request recomputes S - G
+        # for as long as the prefix stays in HBM, where one more cut would
+        # have let them resume at S. A hit at 0 is no floored anchor (one under
+        # a chunk never is), so a short shared header keeps its rung.
+        chunk = self._joint_chunk_tokens
+        hit_tokens = hit * self.hash_block_size
+        if (
+            demand
+            and chunk > self.hash_block_size
+            and chunk % self.hash_block_size == 0
+        ):
+            floor = demand - demand % chunk
+            if floor > hit_tokens:
+                demand = floor
+            elif floor == hit_tokens > 0:
+                self.demands_dropped_at_grid_hit += not seq.checkpoint_demand_dropped
+                seq.checkpoint_demand_dropped = True
+                demand = 0
         # A demand is an instruction to cut a prefill chunk onto a rung, and
         # that cut costs the request a forward. Buying one for a store
         # `begin_store` is about to refuse is the only part of this funnel
@@ -2693,6 +2960,29 @@ class BlockManager:
         # than merely getting no better. Capping costs the continuation at most
         # one block of reuse — the same trade `room` above already takes.
         end = min(end, (self._n_hash_blocks(seq) - 1) * self.hash_block_size)
+        # Onto the LMCache chunk grid when the joint load serves this tier and
+        # its chunk is a multiple of the hash block, coarser than it. HBM
+        # keeps a checkpoint only as long as its KV (`_record_evicted`), so past
+        # an eviction the anchor resumes only through `_joint_kv_boundary`,
+        # whose KV leg needs the whole chunk covering it -- and for an off-grid
+        # anchor that chunk runs past this prompt, so no store ever holds it.
+        # A hash block finer than the chunk (block 128 against chunk 1024
+        # without DCP) otherwise loses 7 anchors in 8 once the prompt leaves
+        # HBM. While it is still there, the next turn resumes from the floored
+        # anchor, under one chunk below the stepped-back end, and the demand its
+        # KV would ask for just above is dropped (`_record_checkpoint_demand`).
+        # If the step-back above (`room`, the last-block cap) crosses a chunk
+        # boundary, the demand is kept and cut, as it would be without the
+        # floor. Either way the floor costs no extra cut. An anchor below one
+        # chunk stays put: the joint load has no whole chunk to restore it from,
+        # so flooring it to 0 would only take away its HBM reuse.
+        chunk = self._joint_chunk_tokens
+        if (
+            chunk > self.hash_block_size
+            and chunk % self.hash_block_size == 0
+            and end >= chunk
+        ):
+            end -= end % chunk
         if end > 0:
             seq.checkpoint_end_pos = end
 
@@ -2978,6 +3268,7 @@ class BlockManager:
         return {
             "demands_recorded": self.demands_recorded,
             "demands_declined_no_room": self.demands_declined_no_room,
+            "demands_dropped_at_grid_hit": self.demands_dropped_at_grid_hit,
             "chunks_cut_for_demand": self.chunks_cut_for_demand,
             "chunks_cut_for_end": self.chunks_cut_for_end,
             "midstep_positions_unreadable": self.midstep_positions_unreadable,
@@ -3025,6 +3316,7 @@ class BlockManager:
         pos: int,
         next_forward_tokens: int | None = None,
         aimed: bool = True,
+        snapshot_step: int = -1,
     ) -> list[StateCache]:
         """State classes that should keep a checkpoint at `pos`, in class order.
 
@@ -3039,12 +3331,13 @@ class BlockManager:
         `next_forward_tokens` is how many tokens the forward right after this
         one carries, and is what each class's `successor_room` is compared
         against. Unset means the prompt's remainder, the prefill answer; decode
-        passes one. Everything else follows from that one number — a class
+        passes 1 or 0. Everything else follows from that one number — a class
         needing a long hand-over (V4's ring, 131) simply never qualifies
         mid-generation, one that hands nothing over (a retaining SWA pool, 0)
         always does, one that cannot keep a checkpoint at all (`inf`) never
         does, and a request stopping on this step passes 0 and keeps nothing
-        that nothing will ever resume from.
+        that nothing will ever resume from. A decode boundary (`snapshot_step`
+        >= 0) is kept only by a class whose `decode_keep` is not `KEEP_NONE`.
 
         The position must be exact. A checkpoint holds state as of the forward's
         last token, so a forward that overshoots a rung is ahead of the hash it
@@ -3113,7 +3406,13 @@ class BlockManager:
             # aimed placements are both prompt positions, so nothing here is
             # reachable and generation keeps no checkpoints under -1.
             return []
-        elif pos % self.hash_block_size or pos - seq.last_checkpoint_pos < interval:
+        elif (
+            # A finishing step: the slot is freed, and a stop may have cut the
+            # end inside the window `snapshot_step` names.
+            next_forward_tokens == 0
+            or pos % self.hash_block_size
+            or pos - seq.last_checkpoint_pos < interval
+        ):
             return []
         if next_forward_tokens is None:
             next_forward_tokens = seq.num_prompt_tokens - pos
@@ -3135,6 +3434,7 @@ class BlockManager:
             if not (aimed and c.readable_midstep)
             and c.applies(seq)
             and next_forward_tokens >= c.successor_room
+            and (snapshot_step < 0 or c.decode_keep != KEEP_NONE)
         ]
 
     def publish_loaded_prefix(
@@ -3241,6 +3541,7 @@ class BlockManager:
                             parent_hash if parent_hash != -1 else None,
                             hbs,
                             token_offset=i * hbs,
+                            cache_seed=seq.cache_seed,
                         )
                     )
 
@@ -3421,10 +3722,11 @@ class BlockManager:
         seq.replays_hit = seq.replay_kv_load = False
         # Likewise the demand: it describes one admission against one cache
         # state, and a re-admitted seq gets a fresh answer from `can_allocate`
-        # — including a fresh place in both funnel counters.
+        # — including a fresh place in each funnel counter.
         seq.checkpoint_demand_pos = 0
         seq.checkpoint_demand_counted = False
         seq.checkpoint_demand_declined = False
+        seq.checkpoint_demand_dropped = False
         # The anchor is derived from `num_prompt_tokens` alone, so it would
         # still be correct on re-admission — but `_record_checkpoint_end` runs
         # unconditionally in `can_allocate`, and leaving a stale value here
@@ -3432,6 +3734,7 @@ class BlockManager:
         # re-validated against the current `state_caches`.
         seq.checkpoint_end_pos = 0
         seq.last_checkpoint_pos = 0
+        seq.scheduled_checkpoint_pos = 0
         # An uncommitted checkpoint describes state in a slot that is about to
         # go back on the free list, so the intent dies with it.
         if self.paged_state_checkpoints is not None:
@@ -3512,7 +3815,7 @@ class BlockManager:
         `lookahead` positions past that (`draft_kv_lookahead`). Checking that
         the pool has room (`can_append`) is not the same as allocating it: a
         position past the last allocated block reads block id 0 from the zeroed
-        block-table tail, and the write lands in whoever owns physical block 0.
+        block-table tail, overwriting the padding block or unrelated live KV.
         """
         # Note: in disaggregated (P/D) mode the scheduler skips the
         # `num_new_tokens` half on the first decode step after remote prefill,
@@ -3575,13 +3878,16 @@ class BlockManager:
         token_ids: list[int],
         parent_block_hash: int | None = None,
         token_offset: int | None = None,
+        cache_seed: int = -1,
     ) -> None:
-        """Emit a BlockStored(medium=REMOTE) for blocks received from a remote
-        KV transfer producer (Mooncake/MoriIO decode side). Called by the
-        KVConnector worker once the transfer completes so external KV-cache
-        consumers (LMCache, etc.) can track remote-resident blocks.
+        """Emit a BlockStored for blocks received from a remote KV transfer
+        producer (Mooncake/MoriIO decode side). Called by the KVConnector
+        worker once the transfer completes so external KV-cache consumers
+        (LMCache, etc.) can track them. The KV now sits in this engine's HBM,
+        so the medium is GPU like any block computed here.
 
-        `token_offset` is the sequence position of the first remote block."""
+        `token_offset` is the sequence position of the first remote block;
+        `cache_seed` is the seq's (see `_make_block_stored`)."""
         if self._event_log is None or not block_hashes:
             return
         self._event_log.append(
@@ -3590,7 +3896,7 @@ class BlockManager:
                 token_ids,
                 parent_block_hash,
                 self.hash_block_size,
-                medium=MEDIUM_REMOTE,
                 token_offset=token_offset,
+                cache_seed=cache_seed,
             )
         )

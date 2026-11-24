@@ -330,6 +330,26 @@ def _record_whole(fn: Callable, *args, pool=None, **kwargs) -> tuple[_Segments, 
     return _Segments([_SegmentReplay(graph)], weak), output
 
 
+def allocated_by(value: Any, pool) -> Any:
+    """Which of ``value``'s tensors lie in memory ``pool`` holds, in
+    ``value``'s structure (a tuple of them, or one; anything else False):
+    ``torch.cuda.memory_snapshot``'s segments of that pool."""
+    spans = [
+        (seg["address"], seg["address"] + seg["total_size"])
+        for seg in torch.cuda.memory_snapshot()
+        if seg["segment_pool_id"] == pool
+    ]
+
+    def mark(v):
+        if isinstance(v, torch.Tensor):
+            return any(lo <= v.data_ptr() < hi for lo, hi in spans)
+        if isinstance(v, tuple):
+            return tuple(mark(x) for x in v)
+        return False
+
+    return mark(value)
+
+
 def graph_pool():
     """The one pool every `TokenGraph` and `ReqGraph` records into."""
     if TokenGraph._pool is None:
@@ -380,8 +400,15 @@ class TokenGraph:
         # a recording without a phase serves both, but only a phase that
         # records counts it among its own (`captured_sizes`).
         self._captured: dict[tuple, set[str]] = {}
+        # (phase or None, bucket) -> the step's rows, when the forward ran a
+        # shard of them (`Context.step_rows`).
+        self._rows: dict[tuple, int] = {}
         # Argument position or name -> the buffer every bucket's input slices.
         self._buffers: dict[int | str, torch.Tensor] = {}
+        # (phase or None, bucket) -> the pool its recording allocated in, and
+        # which of its output's tensors that was (`allocated`)
+        self._recorded_in: dict[tuple, Any] = {}
+        self._allocated: dict[tuple, Any] = {}
         # The pools this records into, each retired when this goes.
         self._pools: set = set()
         type(self)._live.add(self)
@@ -398,9 +425,9 @@ class TokenGraph:
             sizes = TokenGraph._sizes[phase] = tuple(
                 sorted(
                     {
-                        key[0][0]
+                        graph._rows.get(bucket, bucket[1][0][0])
                         for graph in TokenGraph._live
-                        for (_, key), phases in graph._captured.items()
+                        for bucket, phases in graph._captured.items()
                         if phase is None or phase in phases
                     }
                 )
@@ -431,10 +458,26 @@ class TokenGraph:
         dropped = len(self._buckets)
         self._buckets.clear()
         self._captured.clear()
+        self._rows.clear()
+        self._recorded_in.clear()
+        self._allocated.clear()
         TokenGraph._sizes.clear()
         TokenGraph._pool = None
         self._buffers.clear()
         return dropped
+
+    def allocated(self, key, value, phase: str | None = None):
+        """Which of ``value``'s tensors -- ``key``'s recorded output, as a
+        replay hands it back -- its recording allocated in the pool, in
+        ``value``'s structure: storage the pool may re-issue to a later
+        recording, which a caller keeping the output past the next replay
+        must copy. A tensor outside it (a buffer the forward owns) is not.
+        Worked out once a recording (``allocated_by``)."""
+        got = self._allocated.get((phase, key))
+        if got is None:
+            pool = self._recorded_in[(phase, key)]
+            got = self._allocated[(phase, key)] = allocated_by(value, pool)
+        return got
 
     @staticmethod
     def key(args, kwargs) -> tuple:
@@ -469,7 +512,12 @@ class TokenGraph:
         drain_nccl_works()
         segments, output = self._record(forward, *inputs, pool=pool, **kw)
         self._buckets[(phase, key)] = (segments, inputs, kw)
+        self._recorded_in[(phase, key)] = pool
+        self._allocated.pop((phase, key), None)
         self._captured[(phase, key)] = {_phase()}
+        context = getattr(forward_context.get_forward_context(), "context", None)
+        if getattr(context, "step_rows", 0):
+            self._rows[(phase, key)] = context.step_rows
         TokenGraph._sizes.clear()
         return output
 

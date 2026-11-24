@@ -12,6 +12,7 @@ from torch import nn
 from atom.model_loader.weight_names import WeightsMapper
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.deepseek_v41.mhc_pre_delayed import (
+    fuse_quant_supported,
     pack_mhc_fn,
     pre_delayed,
 )
@@ -32,7 +33,7 @@ from atom.utils.forward_context import get_forward_context
 
 from .attention import Attention
 from .config import build_attention_topology
-from .layers import native_quant_config
+from .layers import converted_linear_config, converted_linear_spec
 from .moe import MoE
 
 
@@ -88,6 +89,9 @@ class Block(nn.Module):
                     atom_parameter(torch.empty(shape, dtype=torch.float32)),
                 )
             self.register_buffer(f"hc_{sublayer}_fn_packed", None, persistent=False)
+        # Set with the packs: attention's fused MXFP8 norm output, where the
+        # HIP kernel can write row-major scales (`fuse_quant_supported`).
+        self.hc_fuse_quant = False
         self.engram = None
         if spec.layer_id in config.engram_layer_ids:
             width = (
@@ -101,7 +105,7 @@ class Block(nn.Module):
                 width,
                 hc,
                 config.rms_norm_eps,
-                quant_config=native_quant_config(),
+                quant_config=converted_linear_config(config),
             )
 
     def process_weights_after_loading(self):
@@ -113,6 +117,14 @@ class Block(nn.Module):
                 f"hc_{sublayer}_fn_packed",
                 pack_mhc_fn(getattr(self, f"hc_{sublayer}_fn")),
             )
+        # Only a native group32 `wqkv_a` reads MXFP8; a per-channel one
+        # quantizes its input per token.
+        self.hc_fuse_quant = (
+            self.hc_attn_fn_packed is not None
+            and fuse_quant_supported()
+            and self.attn.wqkv_a.native_a8_group_rows is not None
+            and not self.attn.wqkv_a.runs_bf16
+        )
 
     def attention_forward(self, normed, cache, step, rope):
         """Keep BF16 for auxiliary readers and reuse the optional QKV quant."""
@@ -151,7 +163,7 @@ class Block(nn.Module):
             **self.hc_options,
             norm_eps=self.attn_norm.eps,
             w_preshuffle_bf16=hc_fn is not None,
-            fuse_quant=hc_fn is not None,
+            fuse_quant=self.hc_fuse_quant,
             sublayer_output=state.pending,
             post_mix=state.post_mix,
             combination=state.combination,
@@ -251,9 +263,16 @@ class DeepseekV41ForCausalLM(nn.Module):
         self.embed = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         # One shared configuration owns all expert source/online quantization
         # rules. Native attention and Engram projections own their A8 layouts.
+        # Shared experts keep the converted spec; online patterns may convert
+        # the routed experts.
         self.moe_quant_config = make_v4_quant_config(
-            config, online_quant_config=online_quant_config
+            config,
+            online_quant_config=online_quant_config,
+            shared_expert_spec=converted_linear_spec(config),
+            online_routed_experts=True,
         )
+        # Read by the loader's shared-expert rename (`_fuse_shared_expert`).
+        self.quant_config = self.moe_quant_config
         # A stream earns a hardware queue only where two branches are live at
         # once -- overlapping lifetimes, not independent data. One per model
         # rather than per layer, because layers do not overlap.

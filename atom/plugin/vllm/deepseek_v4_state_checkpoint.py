@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
+from inspect import getattr_static
 from types import SimpleNamespace
 
 import numpy as np
@@ -33,6 +34,7 @@ from atom.plugin.vllm.paged_state_checkpoint import (
     PagedStateCheckpointBackend,
     PagedStateCheckpointLayer,
     install,
+    native_checkpoint_defaults,
     register_state_checkpoint_adapter,
     register_state_checkpoint_layers,
     state_checkpoint_copy_funcs,
@@ -192,7 +194,8 @@ def _attach_native() -> None:
         return
     native = _native_builder_cls()
     for name in _NATIVE_COPY_METHODS:
-        setattr(_PluginV4StateCopier, name, native.__dict__[name])
+        # Find inherited methods without binding descriptors to the native class.
+        setattr(_PluginV4StateCopier, name, getattr_static(native, name))
     _PluginV4StateCopier._checkpoint_staging = _native_staging_fn()
     _PluginV4StateCopier._native_attached = True
 
@@ -439,16 +442,6 @@ def deepseek_v4_state_checkpoint_copy_funcs(mamba_types):
     return {t: state_checkpoint_copy_funcs() for t in mamba_types}
 
 
-def _native_checkpoint_defaults() -> tuple[int, bool]:
-    from atom.config import Config
-
-    fields = Config.__dataclass_fields__
-    return (
-        int(fields["state_checkpoint_interval_tokens"].default),
-        bool(fields["state_checkpoint_demand"].default),
-    )
-
-
 @dataclass(frozen=True)
 class V4StateCheckpointPlacement(StateCheckpointPlacement):
     """Native placement at V4's 128-token block."""
@@ -459,7 +452,7 @@ class V4StateCheckpointPlacement(StateCheckpointPlacement):
     def from_env(
         cls, defaults=None, block=_V4_STATE_CHECKPOINT_BLOCK_SIZE
     ) -> V4StateCheckpointPlacement:
-        return super().from_env(defaults or _native_checkpoint_defaults(), block)
+        return super().from_env(defaults or native_checkpoint_defaults(), block)
 
 
 V4SchedulerStateCheckpoints = SchedulerStateCheckpoints
@@ -495,9 +488,6 @@ class DeepseekV4StateCheckpointAdapter(PagedStateCheckpointAdapter):
 
     def state_checkpoint_layer_names(self, k: int) -> list[str]:
         return deepseek_v4_state_checkpoint_layer_names(k)
-
-    def checkpoint_defaults(self) -> tuple[int, bool]:
-        return _native_checkpoint_defaults()
 
     def drafter_state_in_checkpoint(self, vllm_config) -> bool:
         return v4_drafter_in_target_slot(vllm_config)

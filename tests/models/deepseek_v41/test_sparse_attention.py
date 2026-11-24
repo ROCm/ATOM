@@ -51,7 +51,9 @@ def test_v4_bf16_counts_sink_once_for_swa_and_global(small_config, length):
     step = begin_step(cache, spans)
     spec = LayerAttentionSpec(0, 1, AttentionMode.FULL, 0, 0)
     # Index row 0 for every query row: the same row its window already holds.
-    step.selected[0] = torch.zeros(1, step.width, 1, device="cuda", dtype=torch.int32)
+    step.selected[0] = torch.zeros(
+        1, step.running_tokens, 1, device="cuda", dtype=torch.int32
+    )
     q = torch.zeros(2 * length, 8, 512, dtype=torch.bfloat16, device="cuda")
     kv = torch.full((1, 2 * length, 512), 6.0, dtype=torch.bfloat16, device="cuda")
     sink = torch.zeros(8, device="cuda")
@@ -126,3 +128,51 @@ def test_v4_bf16_sparse_attention_matches_independent_oracle(length, count):
     actual = actual.view_as(q)
     torch.testing.assert_close(actual, expected, rtol=1 / 64, atol=2**-10)
     assert (actual.float() - expected.float()).norm() / expected.float().norm() < 3e-3
+
+
+@pytest.mark.parametrize("count", [192, 640])
+def test_csa_split_kv_matches_the_unsplit_kernel(monkeypatch, count):
+    """A few-token CSA step splits each row's keys over programs; the combine,
+    sink included, gives the unsplit kernel's output."""
+    from atom.model_ops.v4_kernels import paged_2src
+
+    torch.manual_seed(7)
+    batch, length, heads, dim = 2, 3, 8, 512
+    q = torch.randn(batch * length, heads, dim, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(batch * count, dim, device="cuda", dtype=torch.bfloat16)
+    sink = torch.randn(heads, device="cuda", dtype=torch.float32)
+    rows = torch.arange(batch, device="cuda", dtype=torch.int32).repeat_interleave(
+        length
+    )
+    half = count // 2
+    keys = torch.arange(count, device="cuda", dtype=torch.int32)
+    prefix = (rows[:, None] * count + keys[:half]).flatten()
+    extend = (rows[:, None] * count + keys[half:]).flatten()
+    ptr = torch.arange(batch * length + 1, device="cuda", dtype=torch.int32)
+    args = (
+        q,
+        kv,
+        prefix,
+        ptr * half,
+        kv,
+        extend,
+        ptr * (count - half),
+        sink,
+        dim**-0.5,
+    )
+
+    monkeypatch.setattr(paged_2src, "_cu_count", lambda: 80)
+    chosen = []
+    real = paged_2src._csa_num_splits
+    monkeypatch.setattr(
+        paged_2src,
+        "_csa_num_splits",
+        lambda *a: chosen.append(real(*a)) or chosen[-1],
+    )
+    split = paged_2src._sparse_attn_v4_paged_2src_triton(*args)
+    assert chosen and chosen[-1] > 1
+    monkeypatch.setattr(paged_2src, "_csa_num_splits", lambda *a: 1)
+    whole = paged_2src._sparse_attn_v4_paged_2src_triton(*args)
+    torch.testing.assert_close(split, whole, rtol=1 / 64, atol=2**-10)
+    # A step with no tokens has no programs to split.
+    assert real(0, 1, 640.0) == 1

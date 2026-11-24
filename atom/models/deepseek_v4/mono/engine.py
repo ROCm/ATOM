@@ -9,7 +9,8 @@ import logging
 
 import torch
 
-from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed, tp_agree
+from atom.distributed.group_agreement import group_agree
+from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
 from atom.utils.forward_context import get_forward_context, request_bucket
 from atom.utils.region_graph import ReqGraph
 
@@ -178,7 +179,7 @@ class V4MonoEngine:
 
     def bind_graphs(self):
         mono = self.session
-        if not tp_agree(not mono.live_started, mono.group):
+        if not group_agree(not mono.live_started, mono.group):
             raise MonoUnsupported(
                 "retire/reset live requests before recapturing V4 Mono"
             )

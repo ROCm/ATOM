@@ -5,6 +5,12 @@ import logging
 
 from atom.model_engine.capabilities import EngineCapabilities, WorkerCapabilities
 from atom.model_engine.collective_rpc import RpcResult
+from atom.model_engine.engine_utility import (
+    PAUSE_GENERATION_CMD,
+    RECEIVE_WEIGHTS_RDMA_CMD,
+    RESUME_GENERATION_CMD,
+    WEIGHT_STREAM_TIMEOUT_S,
+)
 from atom.model_engine.llm_engine import LLMEngine
 from atom.rollout.weight_sync import load_weights_via_ipc, load_weights_via_shm
 
@@ -31,6 +37,7 @@ class AsyncLLMEngine(LLMEngine):
             "runner_qualname",
             "atom.rollout.model_runner_ext.RLHFModelRunner",
         )
+        kwargs.setdefault("weight_sync_runner", True)
         super().__init__(model, **kwargs)
 
     def collective_rpc(
@@ -128,6 +135,46 @@ class AsyncLLMEngine(LLMEngine):
         logger.info(f"AsyncLLMEngine wake_up: tags={tags}")
         self.core_mgr.broadcast_utility_command_sync("resume_memory", tags=tags)
         logger.info("AsyncLLMEngine wake_up: completed")
+
+    def pause_generation(self, mode: str = "keep", timeout: float = 300.0) -> None:
+        """Schedule nothing on any engine until ``resume_generation``.
+
+        What is running waits; a weight update in between preempts it, and once
+        resumed it recomputes its context on the new weights. Only ``"keep"``.
+        """
+        self.core_mgr.broadcast_utility_command_sync(
+            PAUSE_GENERATION_CMD, timeout=timeout, mode=mode
+        )
+
+    def resume_generation(self, timeout: float = 300.0) -> None:
+        """Let every engine schedule again after ``pause_generation``."""
+        self.core_mgr.broadcast_utility_command_sync(
+            RESUME_GENERATION_CMD, timeout=timeout
+        )
+
+    def receive_weights_rdma(
+        self,
+        group_name: str,
+        version: int,
+        timeout: float = WEIGHT_STREAM_TIMEOUT_S,
+    ) -> list[int]:
+        """Take one weight stream over the RDMA group the workers joined
+        (``collective_rpc("init_rdma_weight_group", ...)``) as a weight sync.
+
+        The number of tensors each engine wrote, in DP-rank order. Raises if
+        an engine failed or refused the stream, or did not answer within
+        *timeout*; on a timeout whether it wrote the stream is unknown, and
+        the engine stays fenced until a sync rewrites every parameter. The
+        default waits as long as the engines do: they answer once their
+        runners have decided the stream, however long it takes.
+        """
+        replies = self.core_mgr.broadcast_utility_command_sync(
+            RECEIVE_WEIGHTS_RDMA_CMD,
+            timeout=timeout,
+            group_name=group_name,
+            version=int(version),
+        )
+        return [reply["result"] for reply in replies]
 
     def get_weight_sync_status(self) -> list[dict]:
         """Fence state for each DP engine, in DP-rank order."""

@@ -28,6 +28,7 @@ from aiter.utility import fp4_utils
 from torch import nn
 
 from atom.config import QuantizationConfig, get_current_atom_config
+from atom.model_ops.blockscale import dequantize_fp8_weight
 from atom.model_ops.communication_op import tensor_model_parallel_all_reduce
 from atom.model_ops.utils import (
     atom_parameter,
@@ -39,6 +40,7 @@ from atom.quant_spec import (
     NVFP4_DTYPE,
     NVFP4_GROUP_SIZE,
     LayerQuantConfig,
+    effective_layer_quant,
     should_skip_online_quant,
     should_stream_online_quant,
     validate_nvfp4_global_scales,
@@ -70,11 +72,15 @@ def use_mxfp4_n32k4_scale(weight: torch.Tensor) -> bool:
     The owner can still require the legacy layout for direct scale readers.
     AITER's gemm_a4w4 selects the FlyDSL or ASM backend for each shape.
     """
-    if (
-        not envs.ATOM_FP4_MXSCALE_USE_32X4_SCALE_SHUFFLE
-        or use_fp4_non_shuffle_triton_gemm()
-        or weight.dim() != 2
-        or weight.shape[1] * 2 % 128  # 32x4 packs 4 scales of 32 K: K % 128
+    if weight.dim() != 2 or weight.shape[1] * 2 % 128:  # 32x4 packs 4x32 K
+        return False
+    return _mxfp4_n32k4_backend()
+
+
+def _mxfp4_n32k4_backend() -> bool:
+    """Whether eligible per_1x32 FP4 weights get the 32x4 scale layout here."""
+    if not envs.ATOM_FP4_MXSCALE_USE_32X4_SCALE_SHUFFLE or (
+        use_fp4_non_shuffle_triton_gemm()
     ):
         return False
     from aiter.jit.utils.chip_info import get_gfx_runtime
@@ -136,6 +142,148 @@ if use_fp4_non_shuffle_triton_gemm():
         gemm_afp4wfp4 = None
 else:
     gemm_afp4wfp4 = None
+
+
+# Preshuffled MXFP4 GEMMs on the e8m0-shuffled scale layout step K by 256 and do
+# not mask a tail; gfx1250's 32x4 layout steps by 128; non-shuffle Triton masks.
+MXFP4_PRESHUFFLE_K_ALIGN = 256
+MXFP4_N32K4_K_ALIGN = 128
+
+
+def check_mxfp4_preshuffle_k(prefix: str, weight: torch.Tensor) -> None:
+    k = weight.shape[-1] * 2  # fp4x2 packs two K elements per byte
+    if k % MXFP4_PRESHUFFLE_K_ALIGN:
+        raise RuntimeError(
+            f"{prefix}: preshuffled MXFP4 GEMM needs K % "
+            f"{MXFP4_PRESHUFFLE_K_ALIGN} == 0, got K={k}. Pad the MLP pair via "
+            "mxfp4_k_pad_align(), list the layer in exclude_layer of "
+            "--online_quant_config, or set ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM=1."
+        )
+
+
+def native_group32_runs_bf16() -> bool:
+    """Whether native group32 FP8 linears run in BF16: AITER has no group32 GEMM
+    for a 32x32 weight in the layout `weight_is_stored_preshuffled` keeps."""
+    from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_group32_supported
+
+    return not gemm_a8w8_blockscale_group32_supported(
+        "32x32",
+        bpreshuffle=weight_is_stored_preshuffled(
+            QuantType.per_1x32, dtypes.fp8, native_group_rows=32
+        ),
+    )
+
+
+def _is_per_1x32(quant_type) -> bool:
+    # By value: plugin-mode QuantType members do not compare equal under `==`.
+    return quant_type is not None and quant_type.value == QuantType.per_1x32.value
+
+
+def _is_mxfp4(quant_type, quant_dtype) -> bool:
+    return _is_per_1x32(quant_type) and quant_dtype == dtypes.fp4x2
+
+
+def mxfp4_k_pad_align(quant_config, prefix: str) -> int | None:
+    """K step an MLP pair pads its intermediate to; ``prefix`` is down_proj's.
+
+    Pass the result as gate_up's output_pad_align and down's input_pad_align.
+    """
+    if quant_config is None or use_fp4_non_shuffle_triton_gemm():
+        return None
+    if not _is_mxfp4(*effective_layer_quant(quant_config, prefix)):
+        return None
+    return MXFP4_N32K4_K_ALIGN if _mxfp4_n32k4_backend() else MXFP4_PRESHUFFLE_K_ALIGN
+
+
+# AITER's gfx950 group32 FP8 GEMM on a preshuffled weight (bmm_a8w8_mxscale_gfx950)
+# steps K in 64s and zero-fills no 32-wide tail; gfx1250's runs a ragged K (a 32x32
+# w_scale), and a row-major group32 weight runs any K the 32-groups divide.
+# TODO(ROCm/aiter#7967): a temporary stand-in for that kernel's K step, restated
+# here only until the kernel takes a 32-wide K tail; then this constant, the align
+# below and V4.1 mono's SHARED_PAD (kernels/dims.py) go. Not a pattern for other
+# shapes.
+GROUP32_FP8_K_ALIGN = 64
+
+
+def _is_fp8_group32(quant_type, quant_dtype) -> bool:
+    return _is_per_1x32(quant_type) and quant_dtype == dtypes.fp8
+
+
+def fp8_group32_k_pad_align(quant_config, prefix: str) -> int | None:
+    """K step an MLP pair pads its intermediate to where its down projection
+    (``prefix``) is a native 32x32 group32 FP8 linear that the load holds
+    preshuffled on gfx950 (``weight_is_stored_preshuffled``, the load's own
+    decision): the weight AITER's preshuffled group32 GEMM reads. None elsewhere:
+    a row-major weight (ATOM_GROUP32_WEIGHT_PRESHUFFLE=0) runs its K as it is,
+    and a native 1x32 weight goes to the MXFP8 backend, whose K rule this step
+    does not meet. Pass it as gate_up's output_pad_align and down's
+    input_pad_align, as ``mxfp4_k_pad_align``'s (DeepSeek-V4.1's shared expert at
+    TP8: 288 -> 320). A padded pair's down projection sets no
+    ``needs_preshuffled_weight`` override.
+
+    TODO(ROCm/aiter#7967): drop the align once bmm_a8w8_mxscale_gfx950 takes a
+    32-wide K tail.
+    """
+    if quant_config is None:
+        return None
+    quant_type, quant_dtype = effective_layer_quant(quant_config, prefix)
+    if not _is_fp8_group32(quant_type, quant_dtype):
+        return None
+    from aiter.jit.utils.chip_info import get_gfx
+
+    if get_gfx() != "gfx950":
+        return None
+    # a native 32x32 source, as LinearBase reads one (native_a8_group_rows 32)
+    cfg = quant_config.get_layer_quant_config(prefix)
+    if (
+        cfg.quant_dtype != torch.float8_e4m3fn
+        or cfg.weight_block_size != (32, 32)
+        or will_online_requant(quant_config, prefix, cfg.quant_type, cfg.quant_dtype)
+    ):
+        return None
+    preshuffled = weight_is_stored_preshuffled(
+        cfg.quant_type, cfg.quant_dtype, native_group_rows=32
+    )
+    return GROUP32_FP8_K_ALIGN if preshuffled else None
+
+
+def _zero_pad_tail(param, dim: int, start: int, length: int) -> None:
+    """Zero a K-padded pair's pad behind the real shard a load just wrote.
+    Allocation zeroes it too, but a weight sync's loader writes the real shard
+    over a weight already preshuffled, whose bytes in the pad's place belong to
+    other tiles; re-shuffled, they would land in the pad."""
+    if length > 0:
+        param.data.narrow(dim, start, length).view(torch.uint8).zero_()
+
+
+def padded_partition_size(size: int, align: int | None) -> int:
+    return size if not align else (size + align - 1) // align * align
+
+
+def _zero_k_pad(layer: nn.Module, quant_config, prefix: str) -> None:
+    """Like MoE's intermediate_pad: a half that is MXFP4, group32 FP8 or bf16
+    in the checkpoint is padded, zeroed at allocation (byte 0 is finite in
+    e8m0: zero codes under it are exact zeros); loads fill the front. A bf16
+    half may be requantized online (zero rows quantize to zero); other sources
+    would need their scales padded and are refused."""
+    qt, dt = layer.quant_type, layer.params_dtype
+    if qt.value == QuantType.No.value:
+        pass
+    elif will_online_requant(quant_config, prefix, qt, dt):
+        raise NotImplementedError(
+            f"{prefix}: K padding can't pad a {qt.name} checkpoint that is "
+            "requantized online; list this MLP in exclude_layer of "
+            "--online_quant_config."
+        )
+    elif not (_is_mxfp4(qt, dt) or _is_fp8_group32(qt, dt)):
+        raise NotImplementedError(
+            f"{prefix}: K padding needs both halves of the MLP pair to be MXFP4, "
+            f"group32 FP8 or unquantized in the checkpoint; got {qt.name}."
+        )
+    for name in ("weight", "weight_scale", "bias"):
+        p = getattr(layer, name, None)
+        if p is not None:
+            p.data.view(torch.uint8).zero_()
 
 
 if use_triton_gemm():
@@ -608,11 +756,13 @@ def weight_is_stored_preshuffled(
     forward.
 
     ``native_group_rows`` marks a native group32 weight, otherwise read as
-    checkpoint bytes. Only an FP8 32x32 one is shuffled: on gfx950 for AITER's
-    preshuffled group32 GEMM (ATOM_GROUP32_WEIGHT_PRESHUFFLE, on by default),
-    always on gfx1250, whose only group32 GEMM is AITER's preshuffled FlyDSL
-    one (it reads the 32x32 scales as stored), and always under
-    ``needs_preshuffled_weight`` (V4.1's grouped ``wo_a``).
+    checkpoint bytes. Native 1x32 and 32x32 weights are shuffled alike: always
+    on gfx1250, whose only group32 GEMM is AITER's preshuffled FlyDSL one; on
+    gfx950 for AITER's preshuffled group32 GEMM under
+    ATOM_GROUP32_WEIGHT_PRESHUFFLE (on by default); and anywhere the
+    ``needs_preshuffled_weight`` override is set. A shuffled 1x32 weight's
+    scale takes the layout of aiter's ``shuffle_mxfp8_bpreshuffle_scale``; a
+    32x32 weight's scale stays row-major.
 
     Says nothing about rank. Only 2D weights are shuffled -- Qwen3-Next's GDN
     conv1d expands its weight to 3D and must stay row-major -- so the caller
@@ -632,7 +782,7 @@ def weight_is_stored_preshuffled(
     side backwards.
     """
     if native_group_rows is not None:
-        if native_group_rows != 32 or params_dtype != dtypes.fp8:
+        if params_dtype != dtypes.fp8 or native_group_rows not in (1, 32):
             return False
         if needs_preshuffled_weight:
             return True
@@ -670,8 +820,14 @@ class LinearBase(nn.Module):
         prefix: str = "",
         override_tp_size: int | None = None,
         override_tp_rank: int | None = None,
+        output_row_alignment: int | None = None,
     ):
         self.prefix = prefix
+        # An unquantised weight's output rows (N) are zero-padded to a multiple
+        # of this after loading, for a shape whose N the GEMM backends have no
+        # kernel for (Qwen3-Next / Qwen3.5's 513-row router); `forward` slices
+        # the padding off. None: never padded.
+        self.output_row_alignment = output_row_alignment
         layer_quant_config = (
             quant_config.get_layer_quant_config(prefix)
             if quant_config is not None
@@ -774,6 +930,7 @@ class LinearBase(nn.Module):
         self.params_dtype = params_dtype
         self.scale_dtype = _quant_scale_dtype(quant_type, quant_config)
         self.native_a8_group_rows = None
+        self.runs_bf16 = False
         source_block = layer_quant_config.weight_block_size
         native_fp8 = params_dtype == torch.float8_e4m3fn and source_block in (
             (1, 32),
@@ -807,6 +964,10 @@ class LinearBase(nn.Module):
                     "Native group32 A8 requires dynamic activations and native weights"
                 )
             self.native_a8_group_rows = layer_quant_config.weight_block_size[0]
+            # No group32 FP8 GEMM here: dequantized to BF16 at load.
+            self.runs_bf16 = (
+                params_dtype == torch.float8_e4m3fn and native_group32_runs_bf16()
+            )
             if self.input_size % 32 or any(
                 size % self.native_a8_group_rows for size in self.output_partition_sizes
             ):
@@ -920,7 +1081,7 @@ class LinearBase(nn.Module):
         """Number of weight rows represented by one row of source scales."""
         if self.native_a8_group_rows is not None:
             return self.native_a8_group_rows
-        return 128 if self.quant_type == QuantType.per_1x128 else 1
+        return 128 if self.quant_type.value == QuantType.per_1x128.value else 1
 
     @staticmethod
     def weight_loader_process(
@@ -1080,6 +1241,11 @@ class LinearBase(nn.Module):
             self.quant_type, self.params_dtype, online_layer_quant_config
         ):
             return
+        if self.params_dtype == torch.float4_e2m1fn_x2:
+            # Only MoE experts convert from MXFP4.
+            raise ValueError(
+                f"{self.prefix}: an MXFP4 linear is not an online quantization source"
+            )
 
         assert online_quant_dtype in [
             dtypes.fp8,
@@ -1260,8 +1426,23 @@ class LinearBase(nn.Module):
         catch exactly that skipped along with the padding.
         """
         # A native group32 weight keeps its compact scales, and its bytes too
-        # unless it is one the preshuffled group32 GEMM reads.
+        # unless it is one the preshuffled group32 GEMM reads; with
+        # `runs_bf16` it becomes a BF16 weight without scales.
         if self.native_a8_group_rows is not None:
+            if self.runs_bf16:
+                # No group32 FP8 GEMM here: a BF16 weight, never shuffled.
+                if self.weight.numel() and self.weight.dtype == torch.float8_e4m3fn:
+                    self.weight = atom_parameter(
+                        dequantize_fp8_weight(
+                            self.weight.data,
+                            self.weight_scale.data,
+                            group_rows=self.native_a8_group_rows,
+                        )
+                    )
+                    # A fresh Parameter: weight_loader() reads this off it.
+                    self.weight.weight_loader_process = self.weight_loader_process
+                    self.weight_scale = None
+                return
             if self.weight.numel() and weight_is_stored_preshuffled(
                 self.quant_type,
                 self.params_dtype,
@@ -1271,6 +1452,13 @@ class LinearBase(nn.Module):
                 native_group_rows=self.native_a8_group_rows,
             ):
                 shuffle_weights(self.weight)
+                if self.native_a8_group_rows == 1:
+                    # Needs aiter with ROCm/aiter#8084.
+                    from aiter.ops.shuffle import shuffle_mxfp8_bpreshuffle_scale
+
+                    self.weight_scale.data = shuffle_mxfp8_bpreshuffle_scale(
+                        self.weight_scale.data
+                    )
             return
         if self.weight.numel() == 0:
             return
@@ -1360,6 +1548,8 @@ class LinearBase(nn.Module):
             if need_shuffle and self.weight.dim() == 2:
                 self.is_output_padded = self._maybe_pad_a8w8_preshuffle_output()
                 shuffle_weights(self.weight)
+            elif self._maybe_pad_unquantized_output():
+                self.is_output_padded = True
                 # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         # shuffle weight scale once so no reshuffling for every gemm
         self.fp4_n32k4_scale = False
@@ -1377,7 +1567,36 @@ class LinearBase(nn.Module):
                 self.fp4_n32k4_scale = True
                 self.weight_scale.data = shuffle_mxfp8fp4_scale(self.weight_scale.data)
             else:
+                if self.params_dtype == dtypes.fp4x2 and self.weight.dim() == 2:
+                    check_mxfp4_preshuffle_k(getattr(self, "prefix", ""), self.weight)
                 self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
+
+    def _maybe_pad_unquantized_output(self) -> bool:
+        """Zero-pad an unquantised 2D weight's output rows to a multiple of
+        `output_row_alignment` (and the bias with it). True if it padded; a
+        weight already aligned, including one padded by an earlier call, is
+        left alone."""
+        align = self.output_row_alignment
+        if (
+            not align
+            or self.quant_type.value != QuantType.No.value
+            or self.weight.dim() != 2
+        ):
+            return False
+        output_size = self.weight.shape[0]
+        padding_size = -output_size % align
+        if padding_size == 0:
+            return False
+        self._output_size_before_padding = output_size
+        self.weight.data = torch.nn.functional.pad(
+            self.weight.data, (0, 0, 0, padding_size)
+        )
+        if self.bias is not None:
+            b = self.bias.data
+            self.bias.data = torch.cat(
+                [b, b.new_zeros((padding_size, *b.shape[1:]))], dim=0
+            )
+        return True
 
     def _maybe_pad_a8w8_preshuffle_output(self) -> bool:
         # The other half of the shuffle decision `process_weights_after_loading`
@@ -1464,12 +1683,12 @@ class LinearBase(nn.Module):
         """
         if self.native_a8_group_rows is not None:
             return False
+        if self.is_output_padded:  # a padded N overruns `out`
+            return False
         if self.quant_type.value == QuantType.No.value:
             return True
-        return (
-            self.quant_type.value == QuantType.per_1x128.value
-            and bool(envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE)
-            and not self.is_output_padded  # a padded N overruns `out`
+        return self.quant_type.value == QuantType.per_1x128.value and bool(
+            envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
         )
 
     @mark_trace
@@ -1491,7 +1710,17 @@ class LinearBase(nn.Module):
             "Linear out= requested but this quant path does not support it "
             f"(quant_type={self.quant_type})."
         )
-        if self.native_a8_group_rows is not None:
+        # The per-token quant and the a8w8 GEMMs take rows: flatten the leading
+        # dims here and restore them on the way out.
+        lead = None
+        if x.dim() > 2 and self.quant_type.value == QuantType.per_Token.value:
+            lead, x = x.shape[:-1], x.flatten(0, -2)
+            if x_scale is not None:
+                x_scale = x_scale.flatten(0, -2)
+        if self.runs_bf16:
+            assert x_scale is None, "the BF16 fallback takes unquantized input"
+            y = tgemm.mm(x, self.weight, self.bias, otype=otype)
+        elif self.native_a8_group_rows is not None:
             from atom.model_ops.blockscale import native_quant_linear
 
             y = native_quant_linear(
@@ -1648,6 +1877,8 @@ class LinearBase(nn.Module):
             y = y[..., : self._output_size_before_padding]
         if self.tp_dim == 1 and self.tp_size > 1 and self.reduce_results:
             y = tensor_model_parallel_all_reduce(y)
+        if lead is not None:
+            y = y.reshape(*lead, y.shape[-1])
         return y
 
     def make_row_view(self, start: int, length: int) -> "LinearBase":
@@ -1670,6 +1901,12 @@ class LinearBase(nn.Module):
                 "a shuffled weight may only be row-sliced on 16-row boundaries "
                 f"(shuffle block size); got start={start} length={length}"
             )
+            # Its 1x32 scale may be in 32-row tiles (n32k4 on gfx1250).
+            if self.native_a8_group_rows == 1 and (start % 32 or length % 32):
+                raise ValueError(
+                    "a shuffled native 1x32 weight may only be row-sliced on "
+                    f"32-row boundaries; got start={start} length={length}"
+                )
 
         view = copy.copy(self)
         # nn.Module bookkeeping is shared by the shallow copy; give the view its
@@ -1739,6 +1976,7 @@ class ReplicatedLinear(LinearBase):
         quant_config: QuantizationConfig | None = None,
         source_quant_dtype: torch.dtype = None,
         prefix: str = "",
+        output_row_alignment: int | None = None,
         **kwargs,
     ):
         super().__init__(
@@ -1749,6 +1987,7 @@ class ReplicatedLinear(LinearBase):
             quant_config=quant_config,
             source_quant_dtype=source_quant_dtype,
             prefix=prefix,
+            output_row_alignment=output_row_alignment,
         )
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -1799,8 +2038,19 @@ class MergedColumnParallelLinear(LinearBase):
         quant_config: QuantizationConfig | None = None,
         source_quant_dtype: torch.dtype = None,
         prefix: str = "",
+        output_pad_align: int | None = None,
         **kwargs,
     ):
+        # Pads each per-rank shard with zero rows (gate_up of a K-padded pair,
+        # see mxfp4_k_pad_align and fp8_group32_k_pad_align); the checkpoint
+        # keeps the real sizes.
+        self._ckpt_output_sizes = list(output_sizes)
+        if output_pad_align:
+            tp = get_tp_group().world_size
+            output_sizes = [
+                padded_partition_size(divide(s, tp), output_pad_align) * tp
+                for s in output_sizes
+            ]
         self.output_sizes = output_sizes
         super().__init__(
             input_size,
@@ -1811,6 +2061,8 @@ class MergedColumnParallelLinear(LinearBase):
             source_quant_dtype=source_quant_dtype,
             prefix=prefix,
         )
+        if self.output_sizes != self._ckpt_output_sizes:
+            _zero_k_pad(self, quant_config, prefix)
 
     def weight_loader(
         self,
@@ -1838,7 +2090,7 @@ class MergedColumnParallelLinear(LinearBase):
 
             # Split loaded_weight by the requested shard sizes (pre-TP),
             # then load each shard individually.
-            shard_sizes = [self.output_sizes[i] for i in loaded_shard_id]
+            shard_sizes = [self._ckpt_output_sizes[i] for i in loaded_shard_id]
             current_offset = 0
             for shard_id, shard_size in zip(loaded_shard_id, shard_sizes):
                 if param is getattr(self, "weight_scale", None) or param is getattr(
@@ -1863,14 +2115,16 @@ class MergedColumnParallelLinear(LinearBase):
             ) or param is getattr(self, "input_scale", None)
 
             # For fused weight, need to match param shape
-            if param_data.shape == loaded_weight.shape:
+            # A padded param can match the unsharded shape (TP2); always split.
+            padded = self.output_sizes != self._ckpt_output_sizes
+            if not padded and param_data.shape == loaded_weight.shape:
                 # Shapes match - direct copy
                 param.weight_loader_process(param_data, loaded_weight)
                 return
 
             # Otherwise, split the fused weight and load each output shard
             current_offset = 0
-            for shard_id, output_size in enumerate(self.output_sizes):
+            for shard_id, output_size in enumerate(self._ckpt_output_sizes):
                 shard_size = output_size
                 if is_scale_param and self.weight_scale_row_group > 1:
                     shard_size //= self.weight_scale_row_group
@@ -1881,8 +2135,10 @@ class MergedColumnParallelLinear(LinearBase):
             return
 
         param_data = param.data
+        # Padded offset; the real shard goes at the front of its slot.
         shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
-        shard_size = self.output_sizes[loaded_shard_id] // self.tp_size
+        shard_size = self._ckpt_output_sizes[loaded_shard_id] // self.tp_size
+        slot_size = self.output_sizes[loaded_shard_id] // self.tp_size
         if param is getattr(self, "weight_scale", None) or param is getattr(
             self, "input_scale", None
         ):
@@ -1890,6 +2146,7 @@ class MergedColumnParallelLinear(LinearBase):
                 group = self.weight_scale_row_group
                 shard_offset = (shard_offset + group - 1) // group
                 shard_size = (shard_size + group - 1) // group
+                slot_size = (slot_size + group - 1) // group
             elif self.quant_type == QuantType.per_Tensor:
                 param_data = param_data.narrow(self.tp_dim, loaded_shard_id, 1)
                 if (
@@ -1915,6 +2172,9 @@ class MergedColumnParallelLinear(LinearBase):
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
         loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
         param.weight_loader_process(param_data, loaded_weight)
+        _zero_pad_tail(
+            param, self.tp_dim, shard_offset + shard_size, slot_size - shard_size
+        )
 
 
 class QKVZBAParallelLinear(ColumnParallelLinear):
@@ -2654,9 +2914,16 @@ class RowParallelLinear(LinearBase):
         reduce_results: bool = True,
         source_quant_dtype: torch.dtype = None,
         prefix: str = "",
+        input_pad_align: int | None = None,
         **kwargs,
     ):
         self.tp_rank = get_tp_group().rank_in_group
+        # Pads the per-rank K with zero columns (down of a K-padded pair).
+        real_k, self._k_padded = input_size, False
+        if input_pad_align:
+            tp = get_tp_group().world_size
+            input_size = padded_partition_size(divide(real_k, tp), input_pad_align) * tp
+            self._k_padded = input_size != real_k
         super().__init__(
             input_size,
             output_size,
@@ -2667,6 +2934,8 @@ class RowParallelLinear(LinearBase):
             source_quant_dtype=source_quant_dtype,
             prefix=prefix,
         )
+        if self._k_padded:
+            _zero_k_pad(self, quant_config, prefix)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
@@ -2689,12 +2958,22 @@ class RowParallelLinear(LinearBase):
             shard_size = param_data.size(self.tp_dim)
             if loaded_weight.size(self.tp_dim) == 1 and self.tp_size > 1:
                 loaded_weight = loaded_weight.repeat(1, self.tp_size)
+            elif self._k_padded:  # real K, as MoE: sized by the checkpoint
+                shard_size = divide(loaded_weight.size(self.tp_dim), self.tp_size)
+                param_data = param_data.narrow(self.tp_dim, 0, shard_size)
             start_idx = self.tp_rank * shard_size
             loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
         else:
             if self.tp_size > 0 and self.tp_rank != 0:
                 loaded_weight.zero_()
         param.weight_loader_process(param_data, loaded_weight)
+        if self._k_padded and param is not getattr(self, "bias", None):
+            _zero_pad_tail(
+                param,
+                self.tp_dim,
+                shard_size,
+                param.data.size(self.tp_dim) - shard_size,
+            )
 
 
 class MergedReplicatedLinear(ReplicatedLinear):
@@ -2706,6 +2985,7 @@ class MergedReplicatedLinear(ReplicatedLinear):
         quant_config: QuantizationConfig | None = None,
         source_quant_dtype: torch.dtype = None,
         prefix: str = "",
+        output_row_alignment: int | None = None,
         **kwargs,
     ):
         self.output_sizes = output_size
@@ -2716,6 +2996,7 @@ class MergedReplicatedLinear(ReplicatedLinear):
             quant_config=quant_config,
             source_quant_dtype=source_quant_dtype,
             prefix=prefix,
+            output_row_alignment=output_row_alignment,
         )
 
     def shard_view(self, index: int) -> "LinearBase":

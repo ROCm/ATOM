@@ -28,7 +28,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from atom.model_engine.collective_rpc import COLLECTIVE_RPC_METHODS
+from atom.model_engine.collective_rpc import (
+    COLLECTIVE_RPC_METHODS,
+    WeightReloadRefused,
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from aiter_stub import stubbed_aiter
@@ -44,6 +47,54 @@ with stubbed_aiter():
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
+
+
+def test_worker_death_reports_failure_before_blocking_cleanup(monkeypatch):
+    mgr = object.__new__(AsyncIOProcManager)
+    proc = SimpleNamespace(
+        sentinel=17, name="ModelRunner0", exitcode=1, join=lambda timeout: None
+    )
+    mgr.procs = [proc]
+    mgr._dead_ranks = {}
+    mgr.runner_label = mgr.label = "test"
+    calls = []
+    mgr.on_worker_failure = lambda: calls.append("notify")
+    mgr.exit = lambda: calls.append("cleanup")
+    targets = []
+    monkeypatch.setattr(
+        async_proc_module,
+        "Thread",
+        lambda **kw: SimpleNamespace(start=lambda: targets.append(kw["target"])),
+    )
+    monkeypatch.setattr(
+        async_proc_module.multiprocessing.connection,
+        "wait",
+        lambda sentinels, timeout=None: [17],
+    )
+    mgr.monitor_procs()
+    targets[0]()
+    assert calls == ["notify", "cleanup"]
+    assert mgr._dead_ranks == {0: 1}
+
+
+def test_expected_worker_shutdown_does_not_report_failure(monkeypatch):
+    mgr = object.__new__(AsyncIOProcManager)
+    mgr.procs = [SimpleNamespace(sentinel=17)]
+    mgr.runner_label = "test"
+    targets = []
+    monkeypatch.setattr(
+        async_proc_module,
+        "Thread",
+        lambda **kw: SimpleNamespace(start=lambda: targets.append(kw["target"])),
+    )
+    monkeypatch.setattr(
+        async_proc_module.multiprocessing.connection,
+        "wait",
+        lambda sentinels, timeout=None: [17],
+    )
+    mgr.monitor_procs()
+    mgr.keep_monitoring = False
+    targets[0]()  # Must return without notifying or running failure cleanup.
 
 
 class _Runner:
@@ -249,6 +300,34 @@ def test_a_return_that_is_not_plain_data_is_refused_on_the_worker(value):
     assert "not plain data" in out.error
 
 
+class _NotWritten(WeightReloadRefused):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("exc", "refused"),
+    [
+        (WeightReloadRefused("MLA"), True),
+        (_NotWritten("a subclass"), True),
+        (RuntimeError("WeightReloadRefused: only the text"), False),
+    ],
+    ids=["refusal", "subclass", "lookalike-text"],
+)
+def test_a_refusal_before_writing_is_marked_on_the_reply(exc, refused):
+    """The engine read the refusal off the error text, which a subclass's
+    name changes and any message could imitate."""
+
+    def raise_it():
+        raise exc
+
+    runner = SimpleNamespace(raise_it=raise_it)
+    out = _proc(runners=[runner])._run_generic_rpc(
+        runner, "raise_it", (), {}, RpcPayload("refused")
+    )
+    assert not out.ok
+    assert out.refused_before_writing is refused
+
+
 @pytest.mark.parametrize(
     "value",
     [None, True, 7, 2.5, "text", b"bytes", [1, (2, "x")], {"k": [1, {"n": None}]}],
@@ -392,7 +471,7 @@ def _mgr(proc_num=4, *, procs=None):
     """
     mgr = object.__new__(AsyncIOProcManager)
     mgr.label = "test-mgr"
-    mgr.proc_num = proc_num
+    mgr.proc_num = mgr.local_proc_num = proc_num
     # The transport tests drive stand-in method names.
     mgr._PUBLIC_RPC_METHODS = COLLECTIVE_RPC_METHODS | _STAND_IN_METHODS
     mgr.rpc_broadcast_mq = _Mq()
@@ -534,6 +613,16 @@ def test_a_broken_barrier_is_not_reused_or_unsafely_reset():
     results = mgr.collective_rpc("m", RpcPayload("br", barrier=True), timeout=5)
 
     assert all("restart the runner manager" in r.error for r in results)
+    assert mgr.rpc_broadcast_mq.sent == []
+
+
+def test_a_barrier_call_is_refused_when_ranks_run_on_other_nodes():
+    mgr = _mgr(8)
+    mgr.local_proc_num = 4
+
+    results = mgr.collective_rpc("m", RpcPayload("mn", barrier=True), timeout=5)
+
+    assert all("share no barrier" in r.error for r in results)
     assert mgr.rpc_broadcast_mq.sent == []
 
 
@@ -684,6 +773,23 @@ def test_a_dead_rank_breaks_the_barrier_so_the_survivors_answer():
     assert mgr.all_ranks_barrier.broken
     assert results[0].error == "barrier broke"
     assert "died" in results[1].error
+
+
+@pytest.mark.parametrize("unsent", ["past its deadline", "broken barrier"])
+def test_a_call_that_was_never_sent_wrote_nothing(unsent):
+    """A sync's first update that waited in the engine's queue past its
+    deadline ran on no rank, yet its replies read as written, and a healthy
+    engine was marked not whole."""
+    mgr = _mgr(2)
+    if unsent == "broken barrier":
+        mgr.all_ranks_barrier = _Abortable(on_abort=lambda: None)
+        mgr.all_ranks_barrier.broken = True
+        results = mgr.collective_rpc("m", RpcPayload("u1", barrier=True), timeout=5)
+    else:
+        results = mgr.collective_rpc("m", RpcPayload("u2"), timeout=0)
+
+    assert mgr.rpc_broadcast_mq.sent == []
+    assert all(not r.ok and r.refused_before_writing for r in results)
 
 
 def test_a_slow_rank_does_not_break_the_barrier():

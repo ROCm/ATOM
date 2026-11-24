@@ -58,7 +58,8 @@ def test_the_plugin_region_reads_the_live_step():
         _fork_select=lambda *a, **k: None,
         wq_b=lambda *a, **k: SimpleNamespace(unflatten=lambda *_: None),
     )
-    frozen, live = SimpleNamespace(width=8), SimpleNamespace(width=4)
+    frozen = SimpleNamespace(running_tokens=8)
+    live = SimpleNamespace(running_tokens=4)
     cache = SimpleNamespace(current_step=live)
     # Suppressed rather than required: what is pinned is which step reached
     # the first use, not that the stubbed tensors eventually fail.
@@ -86,7 +87,7 @@ def test_the_plugin_falls_back_when_no_pool_is_bound_yet():
         _fork_select=lambda *a, **k: None,
         wq_b=lambda *a, **k: SimpleNamespace(unflatten=lambda *_: None),
     )
-    given = SimpleNamespace(width=8)
+    given = SimpleNamespace(running_tokens=8)
     with suppress(Exception):
         mod._attend_block(stub, None, None, None, SimpleNamespace(), given, None, None)
     assert seen and seen[0] is given
