@@ -84,6 +84,8 @@ class StagingEntry:
     # because `decline`'s flush could not have covered a region that had not
     # landed yet. Written and read under the pool lock, never the entry lock.
     disowned: bool = False
+    # Which of a parameter's entries this is; see `ExpertStagingPool._writes`.
+    serial: int = 0
 
     @property
     def complete(self) -> bool:
@@ -104,6 +106,12 @@ class StagingReport:
     """What the pool still held when loading finished."""
 
     incomplete: list[str] = field(default_factory=list)
+    # Regions whose FINAL content cannot be shown to be their own expert's.
+    mismatches: list[str] = field(default_factory=list)
+    verified_regions: int = 0
+    # Regions another expert also wrote, harmlessly: before the slot's own
+    # expert started, or after the parameter had been written back.
+    overwritten_wrong: int = 0
 
 
 class ExpertStagingPool:
@@ -125,6 +133,21 @@ class ExpertStagingPool:
         self._alloc_count = 0
         self._alloc_bytes = 0
         self._alloc_seconds = 0.0
+        # A record of every staged write and every write-back, kept after the
+        # entries are gone, so the end of the load can say what each region
+        # finally holds. A region count cannot: a region written by the wrong
+        # expert counts like any other, and completes the count that triggers
+        # the write-back. Stamps come from one counter: a write is stamped
+        # before its copy starts and again once it is in `filled`; a
+        # write-back before and after it copies. {id(param): {(slot, shard):
+        # [(begin, end, global expert id, entry serial)]}} and {id(param):
+        # [(entry serial, start, end)]}.
+        self._seq = 0
+        self._seq_lock = threading.Lock()
+        self._entry_serial = 0
+        self._writes: dict[int, dict[tuple[int, str], list[tuple]]] = {}
+        self._flushes: dict[int, list[tuple[int, int, int]]] = {}
+        self._written_params: dict[int, tuple[str, Any]] = {}
 
     def is_batchable(self, param: torch.nn.Parameter, full_param_name: str) -> bool:
         """Whether arrivals for this parameter should go through the pool."""
@@ -194,6 +217,7 @@ class ExpertStagingPool:
         # An entry read straight from the table may have been published by
         # another thread that has not finished allocating its buffer yet.
         self._ensure_staging(entry)
+        begin = self._stamp()  # before the copy below starts
         staged = moe.stage_expert_weight(
             param=param,
             staging=entry.staging,
@@ -215,6 +239,15 @@ class ExpertStagingPool:
         with entry.lock:
             entry.filled.add((local_eid, shard_id))
             complete = entry.complete
+            # Stamped under the entry lock, like a write-back's start: a
+            # write that is in `filled` when a write-back begins always has
+            # the smaller stamp.
+            with self._seq_lock:
+                self._seq += 1
+                self._written_params.setdefault(pid, (full_param_name, moe))
+                self._writes.setdefault(pid, {}).setdefault(
+                    (local_eid, shard_id), []
+                ).append((begin, self._seq, global_expert_id, entry.serial))
         # Two ways this thread owes the write-back. `claimed` is the ordinary
         # one: this arrival was the last, so it takes the entry and flushes it.
         # `disowned` is the race -- `decline` took the entry while this thread
@@ -229,7 +262,7 @@ class ExpertStagingPool:
             disowned = entry.disowned
         if claimed or disowned:
             with entry.lock:
-                moe.flush_staged(param, entry.staging, entry.filled)
+                self._flush_entry(entry)
 
     def decline(self, param: torch.nn.Parameter) -> None:
         """Hand this parameter over to another loader path.
@@ -251,7 +284,7 @@ class ExpertStagingPool:
         # region back once it lands.
         if entry is not None and entry.staging is not None:
             with entry.lock:
-                entry.moe.flush_staged(param, entry.staging, entry.filled)
+                self._flush_entry(entry)
 
     def flush_pending(self) -> StagingReport:
         """Write back and drop every entry still held, after the drain.
@@ -267,8 +300,9 @@ class ExpertStagingPool:
         for entry in pending:
             with entry.lock:
                 if entry.staging is not None:
-                    entry.moe.flush_staged(entry.param, entry.staging, entry.filled)
+                    self._flush_entry(entry)
                 report.incomplete.append(entry.missing_description())
+        self._verify_writes(report)
         # One allocation per batched parameter is the floor. A count above it
         # means buffers are being built and dropped again.
         logger.info(
@@ -280,6 +314,94 @@ class ExpertStagingPool:
         return report
 
     # ── internals ─────────────────────────────────────────────────────────
+
+    def _stamp(self) -> int:
+        with self._seq_lock:
+            self._seq += 1
+            return self._seq
+
+    def _flush_entry(self, entry: StagingEntry) -> None:
+        """Write `entry` back, stamped. The caller holds `entry.lock`."""
+        start = self._stamp()
+        entry.moe.flush_staged(entry.param, entry.staging, entry.filled)
+        with self._seq_lock:
+            self._seq += 1
+            self._flushes.setdefault(id(entry.param), []).append(
+                (entry.serial, start, self._seq)
+            )
+
+    def _verify_writes(self, report: StagingReport) -> None:
+        """Show, for every staged region, that it ends up holding its own expert.
+
+        Runs after the drain, on the thread that called `flush_pending`; each
+        writer's slot is asked for again here, when nothing else is running.
+        A region passes only if its own expert's write was finished before the
+        last write-back of the entry it went into began, and every write by
+        another expert either ended before that write started or began after
+        that write-back ended (into a buffer nobody reads again). Anything
+        else -- no write by its own expert, copies that overlap, its own
+        expert arriving during or after the write-back, a second entry --
+        cannot be shown right and is reported. Nothing is read from the
+        checkpoint or the device.
+        """
+        with self._seq_lock:
+            written = [
+                (pid, self._written_params[pid], {k: list(v) for k, v in regions.items()})
+                for pid, regions in self._writes.items()
+            ]
+            flushes = {pid: list(v) for pid, v in self._flushes.items()}
+        slot_cache: dict[tuple[int, int], int] = {}
+
+        def _slot_of(moe, expert: int) -> int:
+            key = (id(moe), expert)
+            if key not in slot_cache:
+                slot_cache[key] = moe._map_global_expert_id_to_local_expert_id(expert)
+            return slot_cache[key]
+
+        for pid, (name, moe), regions in written:
+            for (slot, shard_id), writes in sorted(regions.items()):
+                report.verified_regions += 1
+                own = [w for w in writes if _slot_of(moe, w[2]) == slot]
+                others = [w for w in writes if _slot_of(moe, w[2]) != slot]
+                reason = None
+                if not own:
+                    reason = "its own expert never wrote it"
+                else:
+                    last_own = max(own, key=lambda w: w[1])
+                    backs = [f for f in flushes.get(pid, []) if f[0] == last_own[3]]
+                    if any(w[3] != last_own[3] for w in writes):
+                        reason = "it was written through two staging entries"
+                    elif not backs:
+                        reason = "it was never written back"
+                    else:
+                        back = max(backs, key=lambda f: f[1])
+                        if not last_own[1] < back[1]:
+                            reason = (
+                                "its own expert's write was not finished when "
+                                "the write-back began"
+                            )
+                        elif any(
+                            not (w[1] < last_own[0] or w[0] > back[2]) for w in others
+                        ):
+                            reason = (
+                                "another expert's write overlapped or followed "
+                                "its own expert's before the write-back"
+                            )
+                if reason is None:
+                    report.overwritten_wrong += bool(others)
+                    continue
+                num_experts = getattr(moe, "global_num_experts", None)
+                owners = (
+                    [e for e in range(num_experts) if _slot_of(moe, e) == slot]
+                    if isinstance(num_experts, int)
+                    else "unknown"
+                )
+                report.mismatches.append(
+                    f"{name}: slot {slot} shard {shard_id} belongs to checkpoint "
+                    f"expert {owners}; {reason}. Writes as (expert, begin, end, "
+                    f"entry): {[(w[2], w[0], w[1], w[3]) for w in writes]}; "
+                    f"write-backs as (entry, start, end): {flushes.get(pid, [])}"
+                )
 
     def _get_or_create_entry(self, param, moe, name: str) -> StagingEntry | None:
         pid = id(param)
@@ -295,6 +417,8 @@ class ExpertStagingPool:
                     expected=moe.expected_batched_arrivals(param),
                     name=name,
                 )
+                self._entry_serial += 1
+                entry.serial = self._entry_serial
                 self._entries[pid] = entry
         self._ensure_staging(entry)
         return entry

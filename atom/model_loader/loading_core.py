@@ -368,6 +368,29 @@ def load_weights_into_model(
                     "anyway, leaving those expert slots at their init values."
                 )
             logger.warning("%s\nLoading anyway (strict coverage disabled).", message)
+        # The count above cannot tell which expert a region ends up holding;
+        # the pool kept the order of every write and write-back.
+        if staging_report.mismatches:
+            detail = "\n  ".join(staging_report.mismatches[:20])
+            message = (
+                f"Batched loader: {len(staging_report.mismatches)} (expert slot, "
+                f"shard) region(s) cannot be shown to hold the checkpoint "
+                f"expert their slot belongs to:\n  {detail}"
+            )
+            if envs.ATOM_LOADER_STRICT_COVERAGE:
+                raise RuntimeError(
+                    f"{message}\nThose slots may hold another expert's weights; "
+                    "refusing to serve them."
+                )
+            logger.warning("%s\nLoading anyway (strict coverage disabled).", message)
+        logger.info(
+            "[%s] expert staging verified: %d regions, %d mismatches, "
+            "%d overwritten wrong writes",
+            rank_tag(),
+            staging_report.verified_regions,
+            len(staging_report.mismatches),
+            staging_report.overwritten_wrong,
+        )
     finally:
         if executor is not None:
             executor.shutdown(wait=True)

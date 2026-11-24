@@ -33,6 +33,10 @@ from atom.model_loader.weight_iterator import (
 # call sites (models, vLLM/SGLang/RTP-LLM plugins) keep working.
 from atom.model_loader.weight_names import WeightsMapper, WeightsMapping  # noqa: F401
 from atom.model_ops.base_config import QuantizeMethodBase
+from atom.model_ops.fused_moe.expert_placement import (
+    apply_gate_placement,
+    preload_placement,
+)
 from atom.model_ops.moe import FusedMoEMethodBase
 from atom.model_ops.topK import (
     is_rocm_aiter_fusion_shared_expert_enabled,
@@ -329,6 +333,10 @@ def load_model(
     # only changes checkpoint-name selection; it must not disable materialization.
     online_quant_streamer = OnlineQuantStreamer.maybe_create(model, load_dummy)
 
+    # ATOM_EXPERT_PLACEMENT: read the table here, on the thread that enters
+    # the loader, before any loader worker thread can ask for it.
+    preload_placement()
+
     loaded_weights_record = load_weights_into_model(
         model=model,
         model_name_or_path=model_name_or_path,
@@ -388,6 +396,10 @@ def load_model(
             rank_tag(),
         )
     pp_start = time.perf_counter()
+
+    # ATOM_EXPERT_PLACEMENT: the expert weights loaded into their
+    # renumbered slots; move the gates' rows to match before post-processing.
+    apply_gate_placement(model)
 
     # Parent-first traversal is significant for streaming-deferred children:
     # their parent first combines source weights, then the child's normal hook

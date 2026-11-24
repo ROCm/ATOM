@@ -60,6 +60,7 @@ from atom.model_ops.fused_moe.expert_layout import (
     expert_shard_view,
     physical_expert_id,
 )
+from atom.model_ops.fused_moe.expert_placement import placement_for
 from atom.model_ops.fused_moe.modular_kernel import (
     FusedMoEModularKernel,
     FusedMoEPrepareAndFinalize,
@@ -4987,6 +4988,10 @@ class FusedMoE(torch.nn.Module):
             expert_data.copy_(loaded_weight)
 
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
+        # ATOM_EXPERT_PLACEMENT: checkpoint expert id -> its renumbered id.
+        placement = placement_for(self.prefix)
+        if placement is not None and expert_id < len(placement):
+            expert_id = placement[expert_id]
         if self.expert_map is None:
             return expert_id
         return self.expert_map[

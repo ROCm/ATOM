@@ -19,6 +19,14 @@ except ImportError:
     # stays selected.
     batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant = None
     batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported = None
+try:
+    # Whether the fused epilogue runs a row count on the tuned row's own tile
+    # (`ATOM_DSV41_WOA_FUSE_TUNED_ROWS`); an aiter without the query has none.
+    from aiter.ops.batched_gemm_op_a8w8 import (
+        batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_tuned,
+    )
+except ImportError:
+    batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_tuned = None
 from aiter.ops.inverse_rope_group_quant import inverse_rope_group_quant
 from torch import nn
 
@@ -26,7 +34,9 @@ from atom.model_ops.attentions.deepseek_v41.a8w4_attention import (
     supports_a8w4_attention,
 )
 from atom.model_ops.attentions.deepseek_v41.fp8_attention import (
+    attend_quantized_enabled,
     sparse_attn_v41_paged_2src,
+    sparse_attn_v41_paged_2src_quantized,
 )
 from atom.model_ops.attentions.deepseek_v41.packed_attention import (
     packed_decode,
@@ -336,6 +346,13 @@ class Attention(nn.Module):
         # Set in `process_weights_after_loading`, once wo_a's shape is known.
         # Unsupported shapes stay on the unfused bf16 GEMM + quantize_fp8 path.
         self._fuse_woa_quant = False
+        # `ATOM_DSV41_WOA_FUSE_MIN_ROWS`: fewest rows the fused epilogue is
+        # taken for (0: every call). `ATOM_DSV41_WOA_FUSE_TUNED_ROWS`: below
+        # that, the row range in which it is still taken where aiter runs the
+        # tuned row's tile, and that answer per row count.
+        self._fuse_woa_min_rows = 0
+        self._fuse_woa_tuned_rows = (0, 0)
+        self._fuse_woa_tuned = {}
         self.compressor = (
             Compressor(
                 config.hidden_size, self.head_dim, spec.ratio, config.rms_norm_eps
@@ -415,6 +432,24 @@ class Attention(nn.Module):
                 tuple(wo_a_ws.shape), self.o_rank, k
             )
         )
+        self._fuse_woa_min_rows = envs.ATOM_DSV41_WOA_FUSE_MIN_ROWS
+        self._fuse_woa_tuned_rows = envs.ATOM_DSV41_WOA_FUSE_TUNED_ROWS
+        if (
+            self._fuse_woa_quant
+            and self._fuse_woa_min_rows > 0
+            and not getattr(_log_woa_quant_path, "rows", False)
+        ):
+            # once per process: which row counts take the epilogue
+            _log_woa_quant_path.rows = True
+            lo, hi = self._fuse_woa_tuned_rows
+            logger.info(
+                "dsv41 wo_a quant rows: fused from %d rows; tuned tile at %d..%d "
+                "rows (aiter tuned-tile query: %s)",
+                self._fuse_woa_min_rows,
+                lo,
+                hi,
+                batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_tuned is not None,
+            )
         _log_woa_quant_path(
             self._fuse_woa_quant,
             "mxfp8 epilogue" if self._fuse_woa_quant else "shape unsupported",
@@ -451,26 +486,54 @@ class Attention(nn.Module):
             num_groups=self.groups,
             quant_group_size=32,
         )
+        # Through the class: tests drive this method on stand-in layers.
+        return Attention._project_quantized_out(
+            self, x_fp8, x_scale, output.shape[:-2], output.dtype
+        )
+
+    def _project_quantized_out(self, x_fp8, x_scale, lead, dtype):
+        """`wo_a` and `wo_b` on the inverse-rotated MXFP8 attention output
+        `(x_fp8 [rows, groups, 8 * head_dim], x_scale)`: `_project_out`'s
+        second half, and all of it where the attention launch wrote that pair
+        itself (`_attend`'s ``tail``). ``lead``: the output's leading dims."""
         wo_a_w = self.wo_a.weight.view(self.groups, self.o_rank, -1)
         wo_a_ws = self.wo_a.weight_scale.view(self.groups, self.o_rank // 32, -1)
-        if self._fuse_woa_quant:
+        rows = x_fp8.shape[0]
+        # A layer built without the row threshold fuses every call.
+        if self._fuse_woa_quant and (
+            rows >= getattr(self, "_fuse_woa_min_rows", 0)
+            or Attention._woa_tuned_tile(self, rows, x_fp8, wo_a_w, wo_a_ws)
+        ):
             # wo_a GEMM emits the (e4m3, e8m0) pair wo_b reads directly, so the
             # standalone quantize_fp8 between wo_a and wo_b is removed.
             y8, y_scale = batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant(
                 x_fp8, wo_a_w, x_scale, wo_a_ws
             )
-            return self.wo_b(
-                y8.view(*output.shape[:-2], -1),
-                x_scale=y_scale.view(*output.shape[:-2], -1),
-            )
+            return self.wo_b(y8.view(*lead, -1), x_scale=y_scale.view(*lead, -1))
         y = batched_gemm_a8w8_mxscale_bpreshuffle(
             x_fp8,
             wo_a_w,
             x_scale,
             wo_a_ws,
-            dtype=output.dtype,
+            dtype=dtype,
         )
-        return self.wo_b(y.view(*output.shape[:-2], -1))
+        return self.wo_b(y.view(*lead, -1))
+
+    def _woa_tuned_tile(self, rows, x_fp8, wo_a_w, wo_a_ws) -> bool:
+        """Below the row threshold: whether aiter's fused entry runs ``rows``
+        on the tuned row's own tile (the same bytes, one launch fewer), inside
+        the configured row range. Asked once per row count."""
+        lo, hi = getattr(self, "_fuse_woa_tuned_rows", (0, 0))
+        tuned = batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_tuned
+        if tuned is None or not lo <= rows <= hi:
+            return False
+        known = self._fuse_woa_tuned.get(rows)
+        if known is None:
+            groups, n, k = wo_a_w.shape
+            known = self._fuse_woa_tuned[rows] = bool(
+                tuned(groups, rows, n, k, tuple(wo_a_ws.shape), x_fp8.device)
+            )
+        return known
 
     def _use_a8w4_attention(self, query, cache):
         """The choice precedes RoPE: Q8 production does not rotate BF16 Q."""
@@ -545,12 +608,24 @@ class Attention(nn.Module):
         # joined -- with or without a forked scorer (`ATOM_DSV41_SIDE_STREAMS`
         # 1 forks the compressor alone).
         join_stream(self.index_stream, self.compress_stream)
-        output = self._attend(query, cache, step, queries, prepared)
-        return self._project_out(
-            output.view_as(query),
-            rope,
-            cache.rope_positions(step) if queries is None else queries.positions,
+        positions = cache.rope_positions(step) if queries is None else queries.positions
+        # `AITER_MLA_V41_REDUCE_IRGQ` unset (or an aiter without it): no tail,
+        # and `_attend` is the call it always was.
+        tail = (
+            (rope, positions)
+            if queries is None
+            and not self.wo_a.runs_bf16
+            and attend_quantized_enabled()
+            else None
         )
+        output = self._attend(query, cache, step, queries, prepared, tail=tail)
+        if isinstance(output, tuple):
+            # The split attend's reduce launch wrote wo_a's input pair; there
+            # is no BF16 output to rotate.
+            return Attention._project_quantized_out(
+                self, *output, query.shape[:-2], query.dtype
+            )
+        return self._project_out(output.view_as(query), rope, positions)
 
     def _prepare_attention(self, query, kv_normed, cache, step, rope, queries):
         """Capture fixed-shape preparation; stage variable sources live.
@@ -596,7 +671,12 @@ class Attention(nn.Module):
         return a8w4, query_fp8, kv, window_kv
 
     @eager_region(live=_live_rows)
-    def _attend(self, query, cache, step, queries, prepared=None):
+    def _attend(self, query, cache, step, queries, prepared=None, tail=None):
+        """``tail``: `(rope, positions)` of the rows when the caller can take
+        wo_a's input pair instead of the BF16 output -- a decode over FP8 KV
+        then returns `(x_fp8, x_scale)` where AITER merges the split attend's
+        reduce with the inverse RoPE + quant (`AITER_MLA_V41_REDUCE_IRGQ`),
+        and the BF16 output in every other case."""
         if not step.requests:  # a dummy prefill on a token graph
             return query
         if prepared is None:
@@ -635,6 +715,30 @@ class Attention(nn.Module):
             else:
                 # The window, this step's rows included, is read through the
                 # ring: the second source, beside the selection in the pool.
+                if (
+                    tail is not None
+                    and attend is sparse_attn_v41_paged_2src
+                    and not a8w4
+                ):
+                    rope, positions = tail
+                    quantized = sparse_attn_v41_paged_2src_quantized(
+                        attending,
+                        pool,
+                        prefix,
+                        prefix_indptr,
+                        cache.ring_view(self.spec.layer_id),
+                        second,
+                        second_indptr,
+                        self.attn_sink,
+                        self.softmax_scale,
+                        positions.flatten(),
+                        rope.cos_cache,
+                        rope.sin_cache,
+                        self.groups,
+                        flat_query,
+                    )
+                    if quantized is not None:
+                        return quantized
                 output = attend(
                     attending,
                     pool,

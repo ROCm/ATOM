@@ -2814,12 +2814,25 @@ class Expert(nn.Module):
         weights: torch.Tensor | None = None,  # [num_tokens, 1]  optional gate
     ) -> torch.Tensor:  # [num_tokens, dim]
 
-        dtype = x.dtype
         # Single fused GEMM. Layout is [gate | up] concat on last dim — matches
         # aiter silu_and_mul's split([d, d], dim=-1) contract. The kernel does
         # silu/clamp/mul in fp32 internally regardless of input dtype, so we
         # feed the bf16 GEMM output directly.
         combined = self.gate_up_proj(x)  # [num_tokens, 2*inter_dim_per_tp]
+        return self.act_down(combined, weights, dtype=x.dtype)
+
+    def act_down(
+        self,
+        combined: torch.Tensor,  # [num_tokens, 2*inter_dim_per_tp]
+        weights: torch.Tensor | None = None,  # [num_tokens, 1]  optional gate
+        *,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:  # [num_tokens, dim]
+        """The activation and `w2` on `gate_up_proj`'s output: `forward`'s
+        second half, for a caller that ran the first GEMM itself (``dtype``:
+        the unfused activation's output dtype, `combined`'s unless given)."""
+        if dtype is None:
+            dtype = combined.dtype
         # A BF16 w2 (no group32 FP8 GEMM here) takes no quantized input, and a
         # per-channel one quantizes its own.
         scale_kwargs = fused_scale_kwargs(
@@ -3181,6 +3194,14 @@ class MoE(nn.Module):
         the traced graph keeps the separate add in `combine_outputs`.
         """
         shared = self.shared_experts(x) if self.shared_experts is not None else None
+        return self._single_stream_with_shared(x, shared)
+
+    def _single_stream_with_shared(
+        self,
+        x: torch.Tensor,  # [num_tokens, dim]
+        shared: torch.Tensor | None,  # [num_tokens, dim]
+    ) -> torch.Tensor:  # [num_tokens, dim]
+        """`single_stream_moe_forward` from the shared expert's output on."""
         if (
             shared is not None
             and not torch.compiler.is_compiling()

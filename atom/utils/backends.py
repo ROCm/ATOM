@@ -599,6 +599,14 @@ class VllmBackend:
             compiler_hash = self.compiler_manager.compute_hash(vllm_config)
             factors.append(compiler_hash)
 
+            # 4. ATOM_DSV41_SEG_FUSE picks another forward out of the same
+            #    traced files, so the graphs of a server with items on must not
+            #    share a cache directory with one that has none. Unset or empty
+            #    adds nothing: every existing key stays what it was.
+            seg_fuse_items = os.environ.get("ATOM_DSV41_SEG_FUSE", "").strip()
+            if seg_fuse_items:
+                factors.append("ATOM_DSV41_SEG_FUSE=" + seg_fuse_items)
+
             # combine all factors to generate the cache dir
             import hashlib
 

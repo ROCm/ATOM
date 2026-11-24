@@ -6,8 +6,15 @@ the current batch's rings followed by the current chunk; decode uses the ring di
 Legacy packed rows remain accepted by the standalone wrappers.
 """
 
+import sys
+
 import torch
 from aiter.ops.mla_sparse_prefill import mla_sparse_prefill_v41
+
+try:  # an AITER without the merged reduce + inverse RoPE + quant launch
+    from aiter.ops.mla_sparse_prefill import mla_sparse_prefill_v41_reduce_irgq
+except ImportError:
+    mla_sparse_prefill_v41_reduce_irgq = None
 
 from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE
 from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src_reference
@@ -73,6 +80,68 @@ def sparse_attn_v41_paged_2src(
         softmax_scale,
         out=out,
         num_kv_splits=num_kv_splits,
+    )
+
+
+def attend_quantized_enabled() -> bool:
+    """AITER has the merged reduce + inverse RoPE + quant launch and it is
+    switched on (`AITER_MLA_V41_REDUCE_IRGQ=1`, read by AITER at its import).
+    False: `sparse_attn_v41_paged_2src_quantized` would decline every call."""
+    if mla_sparse_prefill_v41_reduce_irgq is None:
+        return False
+    owner = sys.modules.get(mla_sparse_prefill_v41_reduce_irgq.__module__)
+    return bool(getattr(owner, "_V41_REDUCE_IRGQ", False))
+
+
+@mark_trace
+def sparse_attn_v41_paged_2src_quantized(
+    query,
+    pool,
+    kv_indices_prefix,
+    kv_indptr_prefix,
+    kv,
+    kv_indices_extend,
+    kv_indptr_extend,
+    attn_sink,
+    softmax_scale,
+    positions,
+    cos_cache,
+    sin_cache,
+    groups,
+    out,
+):
+    """`sparse_attn_v41_paged_2src` and the `inverse_rope_group_quant(...,
+    num_groups=groups, quant_group_size=32)` that reads its output, where
+    AITER runs the pair as the split attend plus ONE launch
+    (`AITER_MLA_V41_REDUCE_IRGQ=1`: the split reduce also rotates and
+    quantizes; the same bytes, one launch fewer).
+
+    Returns wo_a's input pair `(x_fp8 [T, groups, H * D / groups], x_scale)`,
+    or None when AITER does not serve the call that way (switch unset, an
+    unsplit attend, another kernel family): nothing was launched and the
+    caller runs the two ops. `out`, the BF16 `[T, H, D]` buffer the attend
+    would write, is validated and left as it is.
+    """
+    if mla_sparse_prefill_v41_reduce_irgq is None:
+        return None
+    values, scales = query
+    dim = values.shape[-1]
+    return mla_sparse_prefill_v41_reduce_irgq(
+        values,
+        scales,
+        *_split(pool, dim),
+        kv_indices_prefix,
+        kv_indptr_prefix,
+        *_split(kv, dim),
+        kv_indices_extend,
+        kv_indptr_extend,
+        attn_sink,
+        softmax_scale,
+        positions,
+        cos_cache,
+        sin_cache,
+        groups,
+        out=out,
     )
 
 

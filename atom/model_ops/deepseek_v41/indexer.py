@@ -137,7 +137,7 @@ def _maxima_lanes(rows):
     rows and 2k to 256k context. gfx1250 needs more programs in flight to keep
     its loads coming, so its grid is wider.
     """
-    target = 16384 if _gfx1250() else 2048
+    target = 16384 if _gfx1250() else _maxima_grid()
     return min(256, max(1, target // max(rows, 1)))
 
 
@@ -296,3 +296,21 @@ def _block_maxima(logits, visible, maxima, block_size, blocks, tile, packed=None
         PACKED=packed is not None,
     )
     return ends
+
+
+def _maxima_grid():
+    """Programs in `_block_maxima_kernel`'s grid on archs other than gfx1250:
+    `ATOM_DSV41_MAXIMA_GRID`, 2048 unless set.
+
+    `_maxima_lanes`' sweep had every row at one context. A decode step's rows
+    are not: the launch lasts as long as the lanes of its longest row, and
+    2048 leaves that row 5 of them at 384 rows. The maxima are the same bytes
+    at any lane count.
+
+    Defined below the kernels, with its import inside, so that no line above
+    it moves: Triton keys a compiled kernel by its source and by the line it
+    starts on, and a shifted kernel is compiled again on first use.
+    """
+    from atom.utils import envs
+
+    return envs.ATOM_DSV41_MAXIMA_GRID

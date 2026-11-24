@@ -31,6 +31,7 @@ from atom.models.deepseek_v4 import (
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
+from . import seg_fuse
 from .attention import Attention
 from .config import build_attention_topology
 from .layers import converted_linear_config, converted_linear_spec
@@ -39,6 +40,11 @@ from .moe import MoE
 
 class Block(nn.Module):
     attention_cls = Attention
+    # ATOM_DSV41_SEG_FUSE item 1 (default off): the FFN seam writes the MXFP8
+    # pair of its normed output too, for the shared expert's `gate_up_proj`.
+    # Set in `process_weights_after_loading`; a class default, so a block
+    # assembled without `__init__` has it.
+    hc_ffn_fuse_quant = False
 
     def __init__(
         self,
@@ -125,6 +131,15 @@ class Block(nn.Module):
             and self.attn.wqkv_a.native_a8_group_rows is not None
             and not self.attn.wqkv_a.runs_bf16
         )
+        if seg_fuse.ITEMS:
+            self.hc_ffn_fuse_quant = (
+                self.ffn.seg_fuse_input_pair
+                and self.hc_ffn_fn_packed is not None
+                and fuse_quant_supported()
+            )
+            seg_fuse.note_layer(
+                self.layer_name, self.hc_ffn_fuse_quant, self.ffn.seg_fuse_act_quant
+            )
 
     def attention_forward(self, normed, cache, step, rope):
         """Keep BF16 for auxiliary readers and reuse the optional QKV quant."""
@@ -184,6 +199,7 @@ class Block(nn.Module):
             **self.hc_options,
             norm_eps=self.ffn_norm.eps,
             w_preshuffle_bf16=hc_fn is not None,
+            fuse_quant=self.hc_ffn_fuse_quant,
             sublayer_output=output,
             post_mix=post,
             combination=comb,
@@ -214,6 +230,9 @@ class Block(nn.Module):
         normed, residual, pre, post, comb = self.prepare_ffn(
             output, residual, pre, post, comb
         )
+        if isinstance(normed, tuple):
+            # ATOM_DSV41_SEG_FUSE item 1: (bf16, fp8, e8m0 scale) of one norm.
+            return self.finish_ffn(self.ffn(*normed), residual, pre, post, comb)
         return self.finish_ffn(self.ffn(normed), residual, pre, post, comb)
 
 

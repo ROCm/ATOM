@@ -259,6 +259,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_SESSION_AFFINITY": lambda: (
         os.getenv("ATOM_DP_SESSION_AFFINITY", "0").lower() in {"1", "true", "yes", "on"}
     ),
+    # With ATOM_DP_SESSION_AFFINITY: a NEW session (a sub-agent's first request
+    # is one) goes to the rank whose prefix cache already holds the longest
+    # finished prefix of its prompt, instead of the lightest rank, when that
+    # rank holds at least this many tokens more than the lightest one would
+    # serve it (0 = off, the default: placement by load only). Later turns
+    # stay on the session's rank as before. Needs --enable_prefix_caching and
+    # ATOM_FRONTEND_PREFIX_HASH=1 (the prompt hash chain).
+    "ATOM_DP_SESSION_PREFIX_OWNER_TOKENS": lambda: _nonnegative_int_env(
+        "ATOM_DP_SESSION_PREFIX_OWNER_TOKENS", 0
+    ),
+    # Load guard of that rule: the prefix's rank is taken only while it has at
+    # most this many more requests in flight than the least loaded rank, so a
+    # fan-out of siblings sharing one prefix cannot pile onto one rank.
+    "ATOM_DP_SESSION_PREFIX_OWNER_MAX_EXTRA_REQS": lambda: _nonnegative_int_env(
+        "ATOM_DP_SESSION_PREFIX_OWNER_MAX_EXTRA_REQS", 8
+    ),
     # --- DP prefill cost balancing (DP attention with more than one rank) ---
     # Under DP attention every rank prefills in the same lockstep step and the
     # step lasts as long as the slowest rank. With the same token budget, a rank
@@ -694,6 +710,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # periods and the noise floor under them are in the environment doc, and
     # end-to-end throughput is too coarse to see an effect that size.
     "ATOM_DSV41_SIDE_STREAMS": lambda: int(os.getenv("ATOM_DSV41_SIDE_STREAMS", "0")),
+    # V4.1 candidate block maxima (the index source layer's
+    # `_block_maxima_kernel`): programs in the launch grid on archs other than
+    # gfx1250, shared out as grid // rows lanes a row (1..256). 2048 is right
+    # for rows of one context length. A decode batch mixes long and short
+    # sessions and the launch waits for its longest row: on gfx950 at 1024
+    # users, 384 rows, 136 us at 2048 and 47-50 us at 16384-32768. The maxima
+    # are the same bytes at any value.
+    "ATOM_DSV41_MAXIMA_GRID": lambda: max(
+        1, _int_env_or_default("ATOM_DSV41_MAXIMA_GRID", 2048)
+    ),
+    # Fewest rows for which wo_a takes aiter's fused quant epilogue (when aiter
+    # offers one for the arch); below it the tuned bf16 GEMM + quantize_fp8 pair
+    # runs. 0 (default) fuses every call. On gfx950 the fused FlyDSL kernel only
+    # wins from ~2048 rows (prefill); decode-sized calls are faster on the
+    # tuned kernels.
+    "ATOM_DSV41_WOA_FUSE_MIN_ROWS": lambda: int(
+        os.getenv("ATOM_DSV41_WOA_FUSE_MIN_ROWS", "0")
+    ),
+    # Below that threshold: "lo:hi", the row counts for which wo_a still takes
+    # the fused epilogue where aiter runs it on the tuned row's own tile (same
+    # bytes, no standalone quantize_fp8). Unset or "0:0": none. Needs an aiter
+    # with `batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_tuned`; without
+    # it no row count qualifies.
+    "ATOM_DSV41_WOA_FUSE_TUNED_ROWS": lambda: tuple(
+        int(v)
+        for v in (os.getenv("ATOM_DSV41_WOA_FUSE_TUNED_ROWS", "") or "0:0").split(":")
+    ),
     # Direct NVFP4 CSA / MXFP8 SWA attention; off retains the BF16 adapter.
     "ATOM_DSV41_A8W4_ATTN": lambda: os.getenv("ATOM_DSV41_A8W4_ATTN", "auto")
     .strip()
@@ -1336,6 +1379,74 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # A nonzero interval also enables local coalescing on TP without PP.
     "ATOM_PREFILL_DECODE_INTERVAL": lambda: int(
         os.getenv("ATOM_PREFILL_DECODE_INTERVAL", "0")
+    ),
+    # Load-switched form of the interval (0 = off, the default): after a prefill
+    # forward that leaves at least ATOM_PREFILL_DECODE_INTERVAL_BUSY_SEQS
+    # sequences decoding in the DP group, protect this many decode passes
+    # instead of ATOM_PREFILL_DECODE_INTERVAL. A prefill step stalls every
+    # decoding stream, so the same step costs more under load; a lightly
+    # loaded group keeps the short interval and its TTFT.
+    "ATOM_PREFILL_DECODE_INTERVAL_BUSY": lambda: int(
+        os.getenv("ATOM_PREFILL_DECODE_INTERVAL_BUSY", "0")
+    ),
+    "ATOM_PREFILL_DECODE_INTERVAL_BUSY_SEQS": lambda: int(
+        os.getenv("ATOM_PREFILL_DECODE_INTERVAL_BUSY_SEQS", "48")
+    ),
+    # DP prefill cost balancing: how a rank's chunk cost is rounded into the
+    # PrefillDelayer's integer reduce. 0 (default) truncates: the rank whose
+    # cost sets the step's target then gets a target up to 0.5 below its own
+    # cost, takes one token less and loses the rest of that chunk-grid block
+    # to the next prefill step. 1 rounds up (ROCm/ATOM #3196), so that rank
+    # prefills its chunk whole. Every DP rank must run with the same value.
+    "ATOM_PREFILL_COST_CEIL": lambda: (
+        os.getenv("ATOM_PREFILL_COST_CEIL", "0").lower() in ("1", "true")
+    ),
+    # Busy-phase form of --long-prefill-token-threshold (0 = off, the default):
+    # while at least ATOM_PREFILL_LONG_CAP_BUSY_SEQS sequences decode in the DP
+    # group, a prompt contributes at most this many new tokens to one prefill
+    # step (the lower of this and the flag when both are set). A step costs what
+    # its busiest rank's rows cost, so capping the long prompts lets the other
+    # ranks' prompts share the steps they need anyway; a lightly loaded group
+    # keeps the flag's cap and its TTFT.
+    "ATOM_PREFILL_LONG_CAP_BUSY": lambda: int(
+        os.getenv("ATOM_PREFILL_LONG_CAP_BUSY", "0")
+    ),
+    "ATOM_PREFILL_LONG_CAP_BUSY_SEQS": lambda: int(
+        os.getenv("ATOM_PREFILL_LONG_CAP_BUSY_SEQS", "48")
+    ),
+    # Short requests first (0 = off, the default: arrival order). On a prefill
+    # step a rank schedules the requests with at most this many new tokens left
+    # to prefill ahead of its longer prompts, whose chunks otherwise take the
+    # step's budget first and leave a short request queued for several steps.
+    # "Left to prefill" is after the prefix-cache hit, not the prompt length.
+    # Two things bound what this costs a long prompt. The long prompts in
+    # progress keep ATOM_PREFILL_SHORT_FIRST_LONG_ROWS tokens of every step's
+    # --max-num-batched-tokens, and the oldest of them may take that many past
+    # the DP cost-balance target. And a request that
+    # ATOM_PREFILL_SHORT_FIRST_MAX_SKIPS steps have passed over (steps that
+    # scheduled other prefill on its rank and none of its own; 0 = no bound),
+    # like one that was preempted, goes ahead of the short requests from then
+    # on, in arrival order. Ignored with a KV connector (P/D, offload tiers).
+    "ATOM_PREFILL_SHORT_FIRST_ROWS": lambda: int(
+        os.getenv("ATOM_PREFILL_SHORT_FIRST_ROWS", "0")
+    ),
+    "ATOM_PREFILL_SHORT_FIRST_LONG_ROWS": lambda: int(
+        os.getenv("ATOM_PREFILL_SHORT_FIRST_LONG_ROWS", "4096")
+    ),
+    "ATOM_PREFILL_SHORT_FIRST_MAX_SKIPS": lambda: int(
+        os.getenv("ATOM_PREFILL_SHORT_FIRST_MAX_SKIPS", "32")
+    ),
+    # Decode balance (negative = off, the default; needs
+    # ATOM_PREFILL_SHORT_FIRST_ROWS and DP attention). Every DP rank decodes
+    # in lock-step at the width of the rank holding the most sequences, so a
+    # sequence released on that rank costs every stream more than one released
+    # elsewhere. On a prefill step in which a rank holds more decoding
+    # sequences than the DP group's mean plus this band, its two groups trade
+    # places for that step: the long prompts (in progress, then waiting) take
+    # the step's tokens first and the short requests what they leave, so the
+    # rank releases few sequences while it is ahead.
+    "ATOM_PREFILL_DECODE_BALANCE_BAND": lambda: float(
+        os.getenv("ATOM_PREFILL_DECODE_BALANCE_BAND", "-1")
     ),
     # Memoise a waiting request's prefix walk across the per-tick probes (the
     # delayer, the DP chunk-cost estimate; `BlockManager.can_allocate_memoized`).

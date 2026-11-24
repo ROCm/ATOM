@@ -40,6 +40,8 @@ from atom.models.deepseek_v4 import MoE as V4MoE
 from atom.models.deepseek_v41.config import FP4PTPC_RECIPE
 from atom.utils.forward_context import get_forward_context, pass_scheduled_tokens_gpu
 
+from . import seg_fuse
+
 
 @torch_compile_guard(mutates_args=["output"], gen_fake=lambda output: None)
 def v41_record_tbo_expert_output(output: torch.Tensor) -> None:
@@ -51,6 +53,19 @@ def v41_record_tbo_expert_output(output: torch.Tensor) -> None:
 
 
 class MoE(V4MoE):
+    # ATOM_DSV41_SEG_FUSE (default empty: every field keeps the value here and
+    # the forward is the path it was; see `seg_fuse`). Class defaults, so a
+    # layer assembled without `__init__` has them too.
+    # Item 1: `gate_up_proj` reads the FFN seam's MXFP8 pair.
+    seg_fuse_input_pair = False
+    # Item 7: SiLU-mul + `w2`'s input quant in one launch (the op, or None).
+    _seg_fuse_act_op = None
+    # Item 10: `w2` and the top-k selection in one launch (the op, or None),
+    # and the selection (logits, weights, ids) it made for this forward's
+    # routed call.
+    _seg_fuse_tail_op = None
+    _seg_fuse_sel = None
+
     def __init__(
         self,
         config,
@@ -72,8 +87,95 @@ class MoE(V4MoE):
         )
 
         self.experts.custom_routing_function = self._topk
+        if seg_fuse.ITEMS:
+            self._init_seg_fuse(layer_id, getattr(config, "num_hidden_layers", None))
+
+    @property
+    def seg_fuse_act_quant(self) -> bool:
+        return self._seg_fuse_act_op is not None
+
+    def _init_seg_fuse(self, layer_id: int, layers: int | None):
+        """Which `ATOM_DSV41_SEG_FUSE` items this layer's shared expert takes
+        where it runs on the layer's own stream (`single_stream_moe_forward`):
+        its two GEMMs must be native MXFP8, its activation the unfused one."""
+        shared = self.shared_experts
+        if (
+            shared is not None
+            and not shared.use_fused_clamp_act_mul
+            and shared.gate_up_proj.native_a8_group_rows is not None
+            and shared.w2.native_a8_group_rows is not None
+            and not shared.gate_up_proj.runs_bf16
+            and not shared.w2.runs_bf16
+        ):
+            # The seam's pair comes in through `forward`, which hands only the
+            # bf16 rows to the dual-stream / comm-fused op.
+            self.seg_fuse_input_pair = seg_fuse.enabled(1) and not (
+                self._use_dual_stream or self._use_comm_fused_dispatch
+            )
+            if seg_fuse.enabled(7):
+                self._seg_fuse_act_op = seg_fuse.act_quant_op(shared.w2.input_size)
+        if seg_fuse.enabled(10) and seg_fuse.tail_layer(self, layer_id, layers):
+            from atom.model_ops.deepseek_v41.seg_fuse_ops import v41_down_topk
+
+            self._seg_fuse_tail_op = v41_down_topk
+
+    def _seg_fuse_shared(self, x, x_fp8, x_scale):
+        """`Expert.forward` of the shared expert with the fused launches."""
+        shared = self.shared_experts
+        if x_fp8 is None:
+            combined = shared.gate_up_proj(x)
+        else:
+            combined = shared.gate_up_proj(x_fp8, x_scale=x_scale)
+        if self._seg_fuse_act_op is None:
+            return shared.act_down(combined, dtype=x.dtype)
+        # Item 10: the router GEMM goes in front of the activation, and `w2`
+        # carries the selection in its launch. Not on an image step (two-bias
+        # routing) nor on a `w2` that is not preshuffled.
+        tail = (
+            self._seg_fuse_tail_op is not None
+            and getattr(shared.w2.weight, "is_shuffled", False)
+            and getattr(get_forward_context().attn_metadata, "image_mask", None) is None
+        )
+        if tail:
+            logits = self.router_logits(x)
+        act_fp8, act_scale = self._seg_fuse_act_op(combined, shared.swiglu_limit)
+        if not tail:
+            return shared.w2(act_fp8, x_scale=act_scale)
+        out, weights, ids = self._seg_fuse_tail_op(
+            act_fp8,
+            act_scale,
+            shared.w2.weight,
+            shared.w2.weight_scale,
+            logits,
+            self.gate.e_score_correction_bias,
+            self.experts.top_k,
+            self.experts.renormalize,
+            self.routed_scaling_factor,
+        )
+        self._seg_fuse_sel = (logits, weights, ids)
+        return out
+
+    def single_stream_moe_forward(self, x, x_fp8=None, x_scale=None):
+        """V4's, with `_seg_fuse_shared` as its shared expert where an
+        `ATOM_DSV41_SEG_FUSE` item applies; `x_fp8` / `x_scale` are the FFN
+        seam's MXFP8 pair of `x`, or None. Every single-stream caller lands
+        here: `forward`, and the dual-stream op above its row threshold."""
+        if x_fp8 is None and self._seg_fuse_act_op is None:
+            return super().single_stream_moe_forward(x)
+        return self._single_stream_with_shared(
+            x, self._seg_fuse_shared(x, x_fp8, x_scale)
+        )
 
     def _topk(self, hidden_states, gating_output, topk, renormalize):
+        sel = self._seg_fuse_sel
+        if (
+            sel is not None
+            and gating_output.data_ptr() == sel[0].data_ptr()
+            and gating_output.shape == sel[0].shape
+            and topk == sel[2].shape[1]
+        ):
+            # Item 10: these logits were selected in `w2`'s launch.
+            return sel[1], sel[2]
         image_mask = getattr(get_forward_context().attn_metadata, "image_mask", None)
         num_shared = self.experts.num_fused_shared_experts
         if image_mask is None:
@@ -131,15 +233,32 @@ class MoE(V4MoE):
         stage2_stream: torch.cuda.Stream | None = None,
         shared_ready: torch.cuda.Event | None = None,
     ) -> tuple[torch.Tensor, bool]:
-        routed, is_complete = self.experts.forward_maybe_comm_fused(
-            x,
-            self.router_logits(x),
-            shared_partial,
-            before_stage2_for_rows=before_stage2_for_rows,
-            before_shared_add=before_shared_add,
-            stage2_stream=stage2_stream,
-            shared_ready=shared_ready,
-        )
+        if self._seg_fuse_sel is None:
+            routed, is_complete = self.experts.forward_maybe_comm_fused(
+                x,
+                self.router_logits(x),
+                shared_partial,
+                before_stage2_for_rows=before_stage2_for_rows,
+                before_shared_add=before_shared_add,
+                stage2_stream=stage2_stream,
+                shared_ready=shared_ready,
+            )
+        else:
+            # ATOM_DSV41_SEG_FUSE item 10: the logits `_seg_fuse_shared` made
+            # (and selected: `_topk` hands the selection over). Cleared
+            # whatever happens, so no later forward can meet a stale one.
+            try:
+                routed, is_complete = self.experts.forward_maybe_comm_fused(
+                    x,
+                    self._seg_fuse_sel[0],
+                    shared_partial,
+                    before_stage2_for_rows=before_stage2_for_rows,
+                    before_shared_add=before_shared_add,
+                    stage2_stream=stage2_stream,
+                    shared_ready=shared_ready,
+                )
+            finally:
+                self._seg_fuse_sel = None
         # create_comm_fused_moe_backend excludes TBO (and DP > 1), so TBO
         # returns the fallback routed output before shared combine/mHC.
         # This marker protects consumers after dispatch returns; it cannot
@@ -147,5 +266,13 @@ class MoE(V4MoE):
         v41_record_tbo_expert_output(routed)
         return routed, is_complete
 
-    def forward(self, hidden):
+    def forward(self, hidden, hidden_fp8=None, hidden_scale=None):
+        if hidden_fp8 is not None:
+            # ATOM_DSV41_SEG_FUSE item 1 (`seg_fuse_input_pair`: never the
+            # dual-stream / comm-fused op): the pair goes with its rows.
+            return self.single_stream_moe_forward(
+                hidden.reshape(-1, hidden.shape[-1]),
+                hidden_fp8.reshape(-1, hidden_fp8.shape[-1]),
+                hidden_scale.reshape(-1, hidden_scale.shape[-1]),
+            ).view_as(hidden)
         return super().forward(hidden.reshape(-1, hidden.shape[-1])).view_as(hidden)
