@@ -63,6 +63,23 @@ KV_IDLE_DRAIN_INTERVAL_S = 0.001
 # How long a busy loop that finds its engine held sleeps before it looks again.
 HELD_POLL_S = 0.01
 
+
+def yield_gil() -> None:
+    """Hand the GIL to this process's other threads now.
+
+    A busy loop holds the GIL for as long as it does not block: an idle pass
+    blocks nowhere, and neither does the stretch between queuing a step's
+    outputs and the loop's next blocking call. A thread that is ready to run
+    meanwhile -- the output sender with a request's last chunk, the input
+    reader with a new request -- then gets the GIL only when CPython forces a
+    switch, after `sys.getswitchinterval()` (5 ms by default): the last chunk
+    of every request sat that long in `output_queue` once the engine went
+    idle. `time.sleep(0)` drops and retakes the GIL around a zero-length
+    sleep, so such a thread runs at once; the loop pays microseconds.
+    """
+    time.sleep(0)
+
+
 # Upper bound on the drain that runs after the loop exits. A peer that died
 # mid-transfer leaves a completion that never arrives; exiting late beats
 # never exiting.
@@ -573,10 +590,12 @@ class EngineCore:
                         self.scheduler.engine_stats.bump_step()
                     else:
                         self.scheduler.engine_stats.note_idle(now)
+                        yield_gil()
                 else:
                     self.scheduler.engine_stats.note_idle(now)
                     if self.has_pending_kv_work():
                         self._advance_idle_kv_transfer()
+                    yield_gil()
         finally:
             try:
                 # Teardown runs even on exceptions so the sender thread/socket
@@ -714,6 +733,8 @@ class EngineCore:
         if finished_seqs:
             self._release_request_resources(finished_seqs)
             self.output_queue.put_nowait(finished_seqs)
+        # The sender ships them now, not a switch interval later (`yield_gil`).
+        yield_gil()
 
     def has_pending_kv_work(self) -> bool:
         """True while KV transfer work outlives the scheduler queues.
@@ -1725,6 +1746,8 @@ class DecodeEngineCore(EngineCore):
             pass
         if finished_seqs:
             self.output_queue.put_nowait(finished_seqs)
+        # The sender ships them now, not a switch interval later (`yield_gil`).
+        yield_gil()
         return True
 
     @staticmethod
