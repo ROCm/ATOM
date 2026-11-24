@@ -264,15 +264,17 @@ impl LoadBalancingPolicy for AgenticPolicy {
             (Some(device), Some((tokens, provider))) if provider.store_weight() > 0.0 => {
                 let weight = provider.store_weight();
                 let cached = provider.cached_tokens(tokens, workers, &device).await;
-                let prompt = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
                 // A store that does not answer (its lookup timed out, or its breaker
-                // is open) is taken to hold the prompt: one that serves holds most of
-                // it, and counting none would charge the worker the whole prompt
-                // until its prefill ends.
+                // is open) is taken to hold the longest prefix on a device, which the
+                // engine that computed it offloads: a device hit then weighs what it
+                // does while the store answers. It is not taken to hold the prompt, or
+                // a burst of cold prompts would be charged nothing and pile onto the
+                // few workers that seem free.
+                let known = device.iter().flatten().copied().max().unwrap_or(0);
                 let held: Vec<_> = device
                     .iter()
                     .zip(&cached)
-                    .map(|(&device, &cached)| Some(cached.unwrap_or(prompt).max(device?)))
+                    .map(|(&device, &cached)| Some(cached.unwrap_or(known).max(device?)))
                     .collect();
                 let credited = device.iter().zip(&held).map(|(&device, &held)| {
                     let (device, held) = (device?, held?);
@@ -607,7 +609,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_store_that_does_not_answer_is_taken_to_hold_the_prompt() {
+    async fn a_store_that_does_not_answer_is_taken_to_hold_what_a_device_does() {
         let workers = workers();
         let tokens: Vec<u32> = (0..100).collect();
         let info = SelectWorkerInfo {
@@ -615,17 +617,21 @@ mod tests {
             ..Default::default()
         };
         // a's device holds 40 of the 100 tokens, b's none, and the store both read
-        // does not answer: a keeps its lead, and is charged none of the 60 it is
-        // taken to load.
+        // does not answer: a keeps its lead, and is charged the 60 it computes.
         let policy = agentic(512, None);
         policy.set_kv_events(Arc::new(Stored(vec![(40, None), (0, None)], 0.5)));
-        let hit = (Some(0), "hit", Some(1.0), Some(0));
+        let hit = (Some(0), "hit", Some(0.4), Some(60));
         assert_eq!(decide(&policy, &workers, &info).await, hit);
-        // With nothing on a device, the workers tie and neither is charged.
+        // b, chosen over a's queue, is taken to load those 40 and charged as much.
+        workers[0].charge_prefill_tokens(1000);
+        let relocate = (Some(1), "relocate", Some(0.4), Some(60));
+        assert_eq!(decide(&policy, &workers, &info).await, relocate);
+        workers[0].release_prefill_tokens(1000);
+        // With nothing on a device, the one chosen is charged the whole prompt.
         let policy = agentic(512, None);
         policy.set_kv_events(Arc::new(Stored(vec![(0, None), (0, None)], 0.5)));
         let (_, branch, ratio, charge) = decide(&policy, &workers, &info).await;
-        assert_eq!((branch, ratio, charge), ("hit", Some(1.0), Some(0)));
+        assert_eq!((branch, ratio, charge), ("miss", Some(0.0), Some(100)));
     }
 
     #[tokio::test]
