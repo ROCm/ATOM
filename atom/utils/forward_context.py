@@ -21,6 +21,7 @@ from atom.utils.tbo.ubatching import sync_dp_metadata
 
 if TYPE_CHECKING:
     from atom.distributed.pcp_utils import PcpBalGroup
+    from atom.model_ops.dcp_ops import DcpSparsePrefillKV
     from atom.model_ops.indexer import IndexRows
 
 
@@ -691,13 +692,18 @@ class AttentionMetaData:
     # The padded running-width buffer is shared by eager, graph and TBO paths.
     dcp_local_context_lens: torch.Tensor | None = None
     # Where this forward's sparse (DSA) selection lives: the selected KV slots
-    # at `sparse_kv_indptr`, and under DCP each query token's compacted
-    # offsets and owned counts. The indexer writes them and every sparse MLA
-    # layer reads them, a layer reusing an earlier layer's selection
-    # (IndexShare) included, so a forward's share is never another's.
+    # at `sparse_kv_indptr`, and under DCP decode or a "q" DCP prefill each
+    # query token's compacted offsets and owned counts (a "kv" step writes
+    # gathered-KV rows at `sparse_kv_indptr` and uses neither). The indexer
+    # writes them and every sparse MLA layer reads them, a layer reusing an
+    # earlier layer's selection (IndexShare) included, so a forward's share is
+    # never another's.
     sparse_kv_indices: torch.Tensor | None = None
     dcp_sparse_kv_indptr: torch.Tensor | None = None
     dcp_owned_counts: torch.Tensor | None = None
+    # A DCP sparse prefill taking the "kv" transport: the step's gathered-KV
+    # layout; None takes "q".
+    dcp_sparse_prefill_kv: "DcpSparsePrefillKV | None" = None
     # Whether this prefill runs sparse (DSA) MLA, decided once a step by the
     # attention builder: the indexer, MLA and PCP all follow it.
     run_sparse: bool = False

@@ -23,6 +23,9 @@ type NodeRef = Arc<Node>;
 const ROOT_SHARD_COUNT: usize = 32;
 const NODE_SHARD_COUNT: usize = 8;
 
+/// Holders of a node above which crediting looks each candidate up instead of scanning.
+const FEW_HOLDERS: usize = 8;
+
 /// Create a children DashMap for non-root nodes
 #[inline]
 fn new_children_map() -> DashMap<char, NodeRef, CharHasherBuilder> {
@@ -44,10 +47,30 @@ pub type TenantId = Arc<str>;
 pub struct PrefixMatchResult {
     /// The tenant that owns the matched prefix (zero-copy)
     pub tenant: TenantId,
+    /// Position of `tenant` among the candidates the match was asked about
+    pub candidate: Option<usize>,
     /// Number of characters matched
     pub matched_char_count: usize,
     /// Total number of characters in the input text
     pub input_char_count: usize,
+}
+
+/// Tenants a match may credit, by position.
+pub trait Candidates {
+    fn count(&self) -> usize;
+    fn name(&self, index: usize) -> &str;
+    fn position(&self, tenant: &str) -> Option<usize> {
+        (0..self.count()).find(|&index| self.name(index) == tenant)
+    }
+}
+
+impl Candidates for [&str] {
+    fn count(&self) -> usize {
+        self.len()
+    }
+    fn name(&self, index: usize) -> &str {
+        self[index]
+    }
 }
 
 /// A fast identity hasher for single-character keys (used in children DashMap).
@@ -111,6 +134,7 @@ fn advance_by_chars(s: &str, n: usize) -> &str {
 
 /// Get the first N characters of a string as a new String.
 /// More efficient than chars().take(n).collect() for known bounds.
+#[cfg(test)]
 #[inline]
 fn take_chars(s: &str, n: usize) -> String {
     if n == 0 {
@@ -237,9 +261,50 @@ struct Node {
     tenant_last_access_time: DashMap<TenantId, u64>,
     /// Parent pointer for upward traversal during timestamp updates
     parent: RwLock<Option<NodeRef>>,
-    /// Cached last-accessed tenant for O(1) lookup during prefix match.
-    /// Avoids O(shards) DashMap iteration in the common case.
-    last_tenant: parking_lot::RwLock<Option<TenantId>>,
+    /// The holder with the newest timestamp above 0, so a match need not scan holders
+    newest: parking_lot::RwLock<Option<TenantId>>,
+}
+
+impl Node {
+    /// Records `tenant`'s access at `epoch`, newer than every holder's, while it holds the
+    /// node: a tenant evicted or removed since it was read is not put back.
+    fn stamp(&self, tenant: &TenantId, epoch: u64) {
+        if let Some(mut accessed) = self.tenant_last_access_time.get_mut(tenant.as_ref()) {
+            *accessed = epoch;
+            // `forget` reads the holders while holding `newest`: release the holder first.
+            drop(accessed);
+            *self.newest.write() = Some(Arc::clone(tenant));
+        }
+    }
+
+    /// Removes `tenant`, finding the newest holder again if it was that one.
+    fn forget(&self, tenant: &str) {
+        self.tenant_last_access_time.remove(tenant);
+        let mut newest = self.newest.write();
+        if newest.as_deref() == Some(tenant) {
+            *newest = self
+                .tenant_last_access_time
+                .iter()
+                .filter(|entry| *entry.value() > 0)
+                .max_by_key(|entry| *entry.value())
+                .map(|entry| Arc::clone(entry.key()));
+        }
+    }
+}
+
+/// The newest of the candidates offered so far, the first one on a tie.
+#[derive(Default)]
+struct Newest(Option<(u64, usize, TenantId)>);
+
+impl Newest {
+    fn offer(&mut self, accessed: u64, index: usize, tenant: &TenantId) {
+        let newer = self.0.as_ref().is_none_or(|(newest, first, _)| {
+            accessed > *newest || (accessed == *newest && index < *first)
+        });
+        if newer {
+            self.0 = Some((accessed, index, Arc::clone(tenant)));
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -353,7 +418,7 @@ impl Tree {
                 text: RwLock::new(NodeText::empty()),
                 tenant_last_access_time: DashMap::with_shard_amount(ROOT_SHARD_COUNT),
                 parent: RwLock::new(None),
-                last_tenant: parking_lot::RwLock::new(None),
+                newest: parking_lot::RwLock::new(None),
             }),
             tenant_char_count: DashMap::with_shard_amount(ROOT_SHARD_COUNT),
         }
@@ -406,7 +471,7 @@ impl Tree {
                         text: RwLock::new(NodeText::new(remaining.to_string())),
                         tenant_last_access_time: new_tenant_map(),
                         parent: RwLock::new(Some(Arc::clone(&prev))),
-                        last_tenant: parking_lot::RwLock::new(Some(Arc::clone(&tenant_id))),
+                        newest: parking_lot::RwLock::new(Some(Arc::clone(&tenant_id))),
                     });
 
                     // Attach tenant to the new leaf node with timestamp
@@ -446,9 +511,7 @@ impl Tree {
                             children: new_children_map(),
                             parent: RwLock::new(Some(Arc::clone(&prev))),
                             tenant_last_access_time: matched_node.tenant_last_access_time.clone(),
-                            last_tenant: parking_lot::RwLock::new(
-                                matched_node.last_tenant.read().clone(),
-                            ),
+                            newest: parking_lot::RwLock::new(matched_node.newest.read().clone()),
                         });
 
                         let first_new_char = contracted_text.first_char().unwrap();
@@ -521,175 +584,127 @@ impl Tree {
 
         // Loop exited normally (remaining empty) - prev is the leaf node
         // Update its timestamp for LRU ordering
-        let epoch = get_epoch();
-        prev.tenant_last_access_time
-            .insert(Arc::clone(&tenant_id), epoch);
+        prev.stamp(&tenant_id, get_epoch());
     }
 
-    /// Performs prefix matching and returns detailed result with char counts.
-    /// Optimized: no string allocations, deferred char counting.
-    pub fn prefix_match_with_counts(&self, text: &str) -> PrefixMatchResult {
+    /// The deepest node on `text`'s path through nodes `holds` accepts, and the characters
+    /// matched up to it. A partial match into a node counts.
+    fn deepest_match(&self, text: &str, holds: impl Fn(&Node) -> bool) -> (NodeRef, usize) {
         let mut remaining = text;
         let mut matched_chars = 0;
-        let mut prev = Arc::clone(&self.root);
-
-        while !remaining.is_empty() {
-            let first_char = remaining.chars().next().unwrap();
-
-            let child_node = prev.children.get(&first_char).map(|e| e.value().clone());
-
-            if let Some(matched_node) = child_node {
-                let matched_text_guard = matched_node.text.read().unwrap();
-                let matched_node_text_count = matched_text_guard.char_count();
-
-                // Use slice-based comparison - no allocation
-                let shared_count = shared_prefix_count(remaining, matched_text_guard.as_str());
-                drop(matched_text_guard);
-
-                if shared_count == matched_node_text_count {
-                    // Full match with current node's text, continue to next node
-                    matched_chars += shared_count;
-                    remaining = advance_by_chars(remaining, shared_count);
-                    prev = matched_node;
-                } else {
-                    // Partial match - still use this node for tenant selection
-                    matched_chars += shared_count;
-                    prev = matched_node;
-                    break;
-                }
-            } else {
-                // No match found, stop here
+        let mut curr = Arc::clone(&self.root);
+        while let Some(first_char) = remaining.chars().next() {
+            let Some(child) = curr.children.get(&first_char).map(|e| e.value().clone()) else {
+                break;
+            };
+            if !holds(&child) {
                 break;
             }
-        }
-
-        let curr = prev;
-
-        // Try cached tenant first (O(1)) before falling back to O(shards) DashMap iteration.
-        // The cache is valid if the tenant still exists in tenant_last_access_time.
-        let tenant: TenantId = {
-            let cached = curr.last_tenant.read();
-            if let Some(ref t) = *cached {
-                if curr.tenant_last_access_time.contains_key(t.as_ref()) {
-                    Arc::clone(t)
-                } else {
-                    drop(cached);
-                    // Cache stale, fall back to iteration and update cache
-                    let t = curr
-                        .tenant_last_access_time
-                        .iter()
-                        .next()
-                        .map(|kv| Arc::clone(kv.key()))
-                        .unwrap_or_else(|| Arc::from("empty"));
-                    *curr.last_tenant.write() = Some(Arc::clone(&t));
-                    t
-                }
-            } else {
-                drop(cached);
-                // No cache, iterate and populate cache
-                let t = curr
-                    .tenant_last_access_time
-                    .iter()
-                    .next()
-                    .map(|kv| Arc::clone(kv.key()))
-                    .unwrap_or_else(|| Arc::from("empty"));
-                *curr.last_tenant.write() = Some(Arc::clone(&t));
-                t
+            // Use slice-based comparison - no allocation
+            let child_text = child.text.read().unwrap();
+            let child_chars = child_text.char_count();
+            let shared = shared_prefix_count(remaining, child_text.as_str());
+            drop(child_text);
+            matched_chars += shared;
+            curr = child;
+            if shared < child_chars {
+                break;
             }
-        };
+            remaining = advance_by_chars(remaining, shared);
+        }
+        (curr, matched_chars)
+    }
 
-        // Update timestamp probabilistically (1 in 8 matches) to reduce DashMap contention.
-        // LRU eviction doesn't need perfect accuracy - approximate timestamps suffice.
+    /// The candidate holding `node` with the newest recorded timestamp, the first one on a
+    /// tie, and its position among `tenants`.
+    fn credit<C: Candidates + ?Sized>(node: &Node, tenants: &C) -> Option<(usize, TenantId)> {
+        let holders = &node.tenant_last_access_time;
+        let newest = node.newest.read().clone();
+        let credited = match newest {
+            // Usually the newest holder is a candidate, and no holder needs a look.
+            Some(newest) if holders.contains_key(newest.as_ref()) => tenants
+                .position(&newest)
+                .map(|index| (index, newest))
+                .or_else(|| Self::newest_candidate(node, tenants)),
+            Some(_) => Self::newest_candidate(node, tenants),
+            // No holder has a timestamp, so they all tie.
+            None => (0..tenants.count()).find_map(|index| {
+                let entry = holders.get(tenants.name(index))?;
+                Some((index, Arc::clone(entry.key())))
+            }),
+        }?;
+        // Refresh 1 in 8 matches to reduce DashMap contention; LRU eviction only needs
+        // approximate timestamps.
         let epoch = get_epoch();
         if epoch & 0x7 == 0 {
-            curr.tenant_last_access_time
-                .insert(Arc::clone(&tenant), epoch);
+            node.stamp(&credited.1, epoch);
         }
-
-        // Compute input char count directly from input text.
-        // This is equivalent to matched_chars + remaining.chars().count() but avoids
-        // needing to track remaining precisely through the traversal.
-        let input_char_count = text.chars().count();
-
-        PrefixMatchResult {
-            tenant,
-            matched_char_count: matched_chars,
-            input_char_count,
-        }
+        Some(credited)
     }
 
-    /// Legacy prefix_match API for backward compatibility.
-    /// Note: This computes matched_text which has allocation overhead.
-    pub fn prefix_match(&self, text: &str) -> (String, String) {
-        let result = self.prefix_match_with_counts(text);
-        let matched_text = take_chars(text, result.matched_char_count);
-        (matched_text, result.tenant.to_string())
-    }
-
-    #[allow(dead_code)]
-    pub fn prefix_match_tenant(&self, text: &str, tenant: &str) -> String {
-        // Use slice-based traversal - no Vec<char> allocation
-
-        // Intern tenant ID once for efficient lookups
-        let tenant_id = intern_tenant(tenant);
-
-        let mut remaining = text;
-        let mut matched_chars = 0;
-        let mut prev = Arc::clone(&self.root);
-
-        while !remaining.is_empty() {
-            let first_char = remaining.chars().next().unwrap();
-
-            let child_node = prev.children.get(&first_char).map(|e| e.value().clone());
-
-            if let Some(matched_node) = child_node {
-                // Only continue matching if this node belongs to the specified tenant
-                if !matched_node
-                    .tenant_last_access_time
-                    .contains_key(tenant_id.as_ref())
-                {
-                    break;
-                }
-
-                let matched_text_guard = matched_node.text.read().unwrap();
-                let matched_node_text_count = matched_text_guard.char_count();
-
-                // Use slice-based comparison - no allocation
-                let shared_count = shared_prefix_count(remaining, matched_text_guard.as_str());
-                drop(matched_text_guard);
-
-                if shared_count == matched_node_text_count {
-                    // Full match with current node's text, continue to next node
-                    matched_chars += shared_count;
-                    remaining = advance_by_chars(remaining, shared_count);
-                    prev = matched_node;
-                } else {
-                    // Partial match - still use this node for timestamp update
-                    matched_chars += shared_count;
-                    prev = matched_node;
-                    break;
-                }
-            } else {
-                // No match found, stop here
+    /// [`Self::credit`] when the newest holder is not a candidate: scans a node few
+    /// tenants hold, and looks each candidate up past [`FEW_HOLDERS`].
+    fn newest_candidate<C: Candidates + ?Sized>(
+        node: &Node,
+        tenants: &C,
+    ) -> Option<(usize, TenantId)> {
+        let holders = &node.tenant_last_access_time;
+        let mut newest = Newest::default();
+        let mut scanned = 0;
+        for entry in holders.iter() {
+            scanned += 1;
+            if scanned > FEW_HOLDERS {
                 break;
             }
+            if let Some(index) = tenants.position(entry.key()) {
+                newest.offer(*entry.value(), index, entry.key());
+            }
         }
-
-        let curr = prev;
-
-        // Only update timestamp if we found a match for the specified tenant.
-        // Update matched node only - ancestor propagation is unnecessary.
-        if curr
-            .tenant_last_access_time
-            .contains_key(tenant_id.as_ref())
-        {
-            let epoch = get_epoch();
-            curr.tenant_last_access_time
-                .insert(Arc::clone(&tenant_id), epoch);
+        if scanned > FEW_HOLDERS {
+            newest = Newest::default();
+            for index in 0..tenants.count() {
+                if let Some(entry) = holders.get(tenants.name(index)) {
+                    newest.offer(*entry.value(), index, entry.key());
+                }
+            }
         }
+        newest.0.map(|(_, index, tenant)| (index, tenant))
+    }
 
-        // Build result from original input using char count
-        take_chars(text, matched_chars)
+    /// The longest prefix of `text` any of `tenants` holds, credited to the one with the
+    /// newest recorded timestamp at the deepest matched node, the first in `tenants` on a
+    /// tie ("empty" if none holds the root). `insert` records a timestamp only where a text
+    /// ends or a node is created, so on a shared node this is usually its creator.
+    pub fn prefix_match_among(&self, text: &str, tenants: &[&str]) -> PrefixMatchResult {
+        self.prefix_match_in(text, tenants)
+    }
+
+    /// [`Self::prefix_match_among`] for any [`Candidates`].
+    pub fn prefix_match_in<C: Candidates + ?Sized>(
+        &self,
+        text: &str,
+        tenants: &C,
+    ) -> PrefixMatchResult {
+        // Walk freely first: a tenant of the deepest node holds the whole path, and one of
+        // them is usually a candidate. Walk only through candidates' nodes when none is.
+        let (mut node, mut matched_chars) = self.deepest_match(text, |_| true);
+        let mut credited = Self::credit(&node, tenants);
+        if credited.is_none() {
+            (node, matched_chars) = self.deepest_match(text, |node| {
+                (0..tenants.count()).any(|index| {
+                    node.tenant_last_access_time
+                        .contains_key(tenants.name(index))
+                })
+            });
+            credited = Self::credit(&node, tenants);
+        }
+        let (candidate, tenant) = credited.unzip();
+        PrefixMatchResult {
+            tenant: tenant.unwrap_or_else(|| Arc::from("empty")),
+            candidate,
+            matched_char_count: matched_chars,
+            input_char_count: text.chars().count(),
+        }
     }
 
     /// Return the list of tenants for which this node is a leaf.
@@ -774,7 +789,7 @@ impl Tree {
                 });
 
             // Remove tenant from node
-            node.tenant_last_access_time.remove(tenant.as_ref());
+            node.forget(tenant.as_ref());
 
             // Get parent reference outside of the borrow scope
             let parent_opt = node.parent.read().unwrap().clone();
@@ -854,7 +869,7 @@ impl Tree {
         // 2. Start from the leaves and traverse up to the root, removing the tenant from each node
         while let Some(curr) = queue.pop_front() {
             // Remove tenant from node
-            curr.tenant_last_access_time.remove(tenant_id.as_ref());
+            curr.forget(tenant_id.as_ref());
 
             // Get parent reference outside of the borrow scope
             let parent_opt = curr.parent.read().unwrap().clone();
@@ -987,6 +1002,43 @@ impl Tree {
     }
 }
 
+#[cfg(test)]
+impl Tree {
+    /// [`Self::prefix_match_among`] over every tenant.
+    pub fn prefix_match_with_counts(&self, text: &str) -> PrefixMatchResult {
+        let (node, matched_chars) = self.deepest_match(text, |_| true);
+        let tenants: Vec<TenantId> = node
+            .tenant_last_access_time
+            .iter()
+            .map(|entry| Arc::clone(entry.key()))
+            .collect();
+        let names: Vec<&str> = tenants.iter().map(AsRef::as_ref).collect();
+        let (candidate, tenant) = Self::credit(&node, names.as_slice()).unzip();
+        PrefixMatchResult {
+            tenant: tenant.unwrap_or_else(|| Arc::from("empty")),
+            candidate,
+            matched_char_count: matched_chars,
+            input_char_count: text.chars().count(),
+        }
+    }
+
+    pub fn prefix_match(&self, text: &str) -> (String, String) {
+        let result = self.prefix_match_with_counts(text);
+        let matched_text = take_chars(text, result.matched_char_count);
+        (matched_text, result.tenant.to_string())
+    }
+
+    /// The prefix of `text` that `tenant` holds, refreshing its timestamp there.
+    pub fn prefix_match_tenant(&self, text: &str, tenant: &str) -> String {
+        let holds = |node: &Node| node.tenant_last_access_time.contains_key(tenant);
+        let (node, matched_chars) = self.deepest_match(text, holds);
+        if holds(&node) {
+            node.stamp(&intern_tenant(tenant), get_epoch());
+        }
+        take_chars(text, matched_chars)
+    }
+}
+
 //  Unit tests
 #[cfg(test)]
 mod tests {
@@ -1094,6 +1146,100 @@ mod tests {
 
         assert_eq!(matched_text, "");
         assert_eq!(tenant, "empty");
+    }
+
+    #[test]
+    fn test_match_on_a_tenantless_node_records_no_tenant() {
+        let tree = Tree::new();
+
+        // A match refreshes a timestamp once in eight epochs, and the epoch is
+        // process-wide: enough matches to cross several refreshes.
+        for _ in 0..256 {
+            let (_, tenant) = tree.prefix_match("key1");
+            assert_eq!(tenant, "empty");
+        }
+
+        assert_eq!(
+            tree.get_used_size_per_tenant(),
+            HashMap::new(),
+            "the placeholder tenant was recorded on the root"
+        );
+    }
+
+    #[test]
+    fn test_prefix_match_among_ignores_other_tenants() {
+        // Twice, so "a"'s timestamp is above 0 should it have taken the first epoch.
+        let tree = Tree::new();
+        tree.insert("hello world", "a");
+        tree.insert("hello world", "a");
+        tree.insert("hello there", "b");
+        let matched = |text: &str, tenants: &[&str]| {
+            let result = tree.prefix_match_among(text, tenants);
+            (result.matched_char_count, result.tenant.to_string())
+        };
+
+        // The shared node was created by "a", yet "b" is credited what it holds.
+        assert_eq!(
+            tree.prefix_match_with_counts("hello you").tenant.as_ref(),
+            "a"
+        );
+        assert_eq!(matched("hello you", &["b"]), (6, "b".into()));
+        assert_eq!(matched("hello world", &["b"]), (6, "b".into()));
+        assert_eq!(matched("hello world", &["a", "b"]), (11, "a".into()));
+        assert_eq!(matched("hello world", &["c"]), (0, "empty".into()));
+    }
+
+    #[test]
+    fn test_prefix_match_among_credits_the_newest_timestamp_then_the_first() {
+        // Passing through a node records no timestamp, so its creator is credited. The
+        // second insert keeps "a"'s timestamp above 0 should it have taken the first epoch.
+        let tree = Tree::new();
+        tree.insert("hello world", "a");
+        tree.insert("hello world", "a");
+        for _ in 0..3 {
+            tree.insert("hello there", "b");
+        }
+        let credited = tree.prefix_match_among("hello you", &["b", "a"]);
+        assert_eq!(credited.tenant.as_ref(), "a");
+
+        // Both are at 0 on the root: the first candidate.
+        let tree = Tree::new();
+        tree.insert("abc", "a");
+        tree.insert("xyz", "b");
+        assert_eq!(
+            tree.prefix_match_among("q", &["b", "a"]).tenant.as_ref(),
+            "b"
+        );
+    }
+
+    #[test]
+    fn test_prefix_match_among_credits_the_newest_of_many_holders() {
+        let tree = Tree::new();
+        let tenants: Vec<String> = (0..10).map(|i| format!("t{i}")).collect();
+        for tenant in &tenants {
+            tree.insert("shared", tenant);
+        }
+        tree.insert("shared", "t7");
+        let all: Vec<&str> = tenants.iter().map(String::as_str).collect();
+        let credited = tree.prefix_match_among("shared", &all);
+        assert_eq!(
+            (credited.tenant.as_ref(), credited.candidate),
+            ("t7", Some(7))
+        );
+
+        // Without the newest holder, each candidate is looked up past FEW_HOLDERS.
+        let others: Vec<&str> = all.iter().copied().filter(|&t| t != "t7").collect();
+        assert_eq!(
+            tree.prefix_match_among("shared", &others).tenant.as_ref(),
+            "t9"
+        );
+
+        // Removing the newest holder finds the next one.
+        tree.remove_tenant("t7");
+        assert_eq!(
+            tree.prefix_match_among("shared", &all).tenant.as_ref(),
+            "t9"
+        );
     }
 
     #[test]
@@ -1730,7 +1876,8 @@ mod tests {
     fn test_empty_string_input() {
         let tree = Tree::new();
 
-        // Insert empty string
+        // Insert empty string, twice so its timestamp is above 0 even from the first epoch
+        tree.insert("", "tenant1");
         tree.insert("", "tenant1");
 
         // Match empty string
@@ -2038,7 +2185,9 @@ mod tests {
     fn test_emoji_handling() {
         let tree = Tree::new();
 
-        // Emoji are multi-byte UTF-8
+        // Emoji are multi-byte UTF-8. Twice, so the timestamp is above 0 even from the
+        // first epoch.
+        tree.insert("hello 👋", "tenant1");
         tree.insert("hello 👋", "tenant1");
         tree.insert("hello 👋🌍", "tenant2");
 
@@ -2110,10 +2259,10 @@ mod tests {
         );
     }
 
-    // ==================== Last Tenant Cache Tests ====================
+    // ==================== Shared Path Tests ====================
 
     #[test]
-    fn test_last_tenant_cache_update() {
+    fn test_match_after_another_tenant_inserts_the_same_path() {
         let tree = Tree::new();
 
         // Insert for tenant1
@@ -2126,20 +2275,17 @@ mod tests {
         // Insert for tenant2 on same path
         tree.insert("hello", "tenant2");
 
-        // Match again - should still work (cache or iteration)
+        // Match again
         let (matched, _) = tree.prefix_match("hello");
         assert_eq!(matched, "hello");
     }
 
     #[test]
-    fn test_stale_cache_after_tenant_removal() {
+    fn test_match_after_a_tenant_is_removed() {
         let tree = Tree::new();
 
         tree.insert("hello", "tenant1");
         tree.insert("hello", "tenant2");
-
-        // Access to populate cache
-        let _ = tree.prefix_match("hello");
 
         // Remove tenant1
         tree.remove_tenant("tenant1");
