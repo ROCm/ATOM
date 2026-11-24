@@ -22,7 +22,11 @@ def engine_step(monkeypatch):
     sleep = event.wait
     monkeypatch.setattr(engine_core.tracing, "record_forward", Mock())
     batch = SimpleNamespace(
-        req_ids=[], connector_meta_output=None, total_seqs_num_prefill=0
+        req_ids=[],
+        connector_meta_output=None,
+        total_seqs_num_prefill=0,
+        total_seqs_num_decode=0,
+        total_tokens_num=0,
     )
     scheduler = SimpleNamespace(
         schedule=Mock(return_value=(batch, {})),
@@ -41,8 +45,15 @@ def engine_step(monkeypatch):
         utility_queue=queue.Queue(),
         _postprocess=Mock(),
         label="test",
+        _sched_timer=None,
+        _st_last_end=None,
+        _forward_kind=engine_core.EngineCore._forward_kind,
     )
     engine._wait_for_kv_progress = lambda: engine_core.EngineCore._wait_for_kv_progress(
+        engine
+    )
+    # the step's Mono gate (no GPU guard, no tier hazard here)
+    engine._mono_block_reason = lambda: engine_core.EngineCore._mono_block_reason(
         engine
     )
     return engine_core, engine, batch, sleep

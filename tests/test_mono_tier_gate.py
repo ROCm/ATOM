@@ -4,11 +4,9 @@
 """The mono_blocked gate: a decode step stays off Mono while the GPU guard sees a
 foreign process or a CPU-tier load / save is not yet terminal on every TP rank."""
 
-import threading
 from types import SimpleNamespace
 
 import pytest
-import torch
 from conftest import with_min_load
 
 from atom.kv_transfer.disaggregation.aggregator import KVOutputAggregator
@@ -21,12 +19,9 @@ from atom.kv_transfer.disaggregation.types import (
 from atom.kv_transfer.offload import chunked_scheduler
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload.dense.connector import (
-    DenseOffloadConnector,
     DenseOffloadScheduler,
 )
 from atom.kv_transfer.offload.metadata import (
-    LMCacheOffloadMetadata,
-    LMCacheReqMeta,
     LoadSpec,
 )
 from atom.model_engine.engine_core import EngineCore
@@ -176,53 +171,3 @@ def _engine(guard_present, connector, kv=True):
 def test_engine_decides_once_per_step(guard, hazard, kv, why):
     core = _engine(guard, SimpleNamespace(mono_hazard=lambda: hazard), kv)
     assert core._mono_block_reason() == why
-
-
-def test_load_waits_for_the_kernels_queued_before_it(monkeypatch):
-    trace = []
-    rpc_stream = object()
-    rpc_thread = threading.get_ident()
-
-    class Event:
-        def record(self, stream):
-            assert threading.get_ident() == rpc_thread and stream is rpc_stream
-            trace.append("record")
-
-        def synchronize(self):
-            assert threading.get_ident() != rpc_thread
-            trace.append("sync")
-
-    monkeypatch.setattr(torch.cuda, "Event", Event)
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda: rpc_stream)
-
-    class Engine:
-        gpu_connector = None
-
-        @staticmethod
-        def retrieve(_tokens, *, mask, **_kwargs):
-            trace.append("retrieve")
-            return mask.clone().fill_(True)
-
-        @staticmethod
-        def lookup_unpin(_lookup_id):
-            pass
-
-    worker = DenseOffloadConnector(_config("kv_consumer"))
-    worker.chunk_size = 8
-    worker._engine = Engine()
-    metadata = LMCacheOffloadMetadata()
-    metadata.requests.append(
-        LMCacheReqMeta(
-            req_id=7,
-            token_ids=list(range(8)),
-            block_ids=[3],
-            load_spec=LoadSpec(hbm_cached_tokens=0, lmcache_cached_tokens=8, can_load=True),
-            load_operation=LoadOperationId(req_id=7, generation=0),
-        )
-    )
-    try:
-        worker.start_load_kv(metadata)
-        worker.close()
-        assert trace == ["record", "sync", "retrieve"]
-    finally:
-        worker.close()

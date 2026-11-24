@@ -123,6 +123,10 @@ class EngineCore:
     # Whether the engine reports its prefill backlog to the CoreManager
     # (`share_cache` routing); the data-parallel engine turns it on.
     _report_backlog = False
+    # p1 step timer (`sched_timing`, off unless enabled) and the end of the last
+    # timed step; set per engine in __init__
+    _sched_timer = None
+    _st_last_end = None
 
     def __init__(self, config: Config, input_address: str, output_address: str):
         self.label = "Engine Core"

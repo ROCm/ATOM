@@ -49,7 +49,7 @@ def decode(bm: BlockManager, s, gen):
     for t in gen:
         s.append_token(t)
         bm.may_append(s)
-    bm.hash_decode_blocks(s, len(s))
+    bm.hash_decode_blocks(s, len(s), snapshot_step=0)
 
 
 def finish(bm: BlockManager, s):

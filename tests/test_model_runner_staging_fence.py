@@ -82,7 +82,8 @@ def test_dummy_forward_participates_in_staging_lifetime():
     synchronization.  Skipping either side of the lifetime protocol lets the
     following forward overwrite a still-copying dummy source buffer.
     """
-    method = _method("forward")
+    # the step body (`forward` wraps it in the optional p1 step timer)
+    method = _method("_forward")
     parents = _parent_map(method)
     expected_counts = {
         "_advance_forward_vars": 1,
@@ -125,7 +126,8 @@ def test_draft_lockstep_reads_pipeline_parallel_not_deferred_output():
 
 
 def test_prefill_ready_events_are_recorded_after_model_submission():
-    method = _method("forward")
+    # the step body (`forward` wraps it in the optional p1 step timer)
+    method = _method("_forward")
     helper = _method("_record_kv_cache_ready")
     run_model = _attribute_calls(method, "run_model")
     ready_events = _attribute_calls(method, "_record_kv_cache_ready")
