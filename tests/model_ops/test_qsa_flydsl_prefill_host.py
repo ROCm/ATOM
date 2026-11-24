@@ -89,7 +89,6 @@ def _attend(modules, layer, qsa, query=None, columns=None):
 def flydsl(modules, monkeypatch):
     qa = modules.qsa_attention
     calls = []
-    monkeypatch.setenv("ATOM_QSA_FLYDSL_ATTN", "1")
     qa.log_flydsl_fallback.cache_clear()
     qa._log_flydsl_active.cache_clear()
     monkeypatch.setattr(qa, "qsa_sparse_prefill_widths", lambda: WIDTHS)
@@ -163,13 +162,6 @@ def test_aiter_unavailable_falls_back(modules, flydsl, monkeypatch, caplog):
     assert "does not run on this GPU" in _warnings(caplog)[0]
 
 
-def test_flag_off_falls_back(modules, flydsl, monkeypatch):
-    monkeypatch.setenv("ATOM_QSA_FLYDSL_ATTN", "0")
-    qsa = _qsa(modules)
-    assert _attend(modules, _layer(), qsa) is None
-    assert flydsl == [] and not qsa.flydsl_prefill.laid_out
-
-
 def _warnings(caplog):
     return [r.getMessage() for r in caplog.records if "native kernel" in r.message]
 
@@ -187,16 +179,13 @@ def test_each_fallback_reason_is_logged_once(modules, flydsl, monkeypatch, caplo
     assert "budget 1536" in reasons[0] and "graph capture" in reasons[1]
 
 
-def test_unlaid_forward_and_flag_off_log_nothing(modules, flydsl, monkeypatch, caplog):
+def test_unlaid_forward_logs_nothing(modules, flydsl, caplog):
     """A forward the bridge did not lay out (target verify, warmup, ATOM's own
-    runner) is not a fallback, and with the flag off nothing is."""
+    runner) is not a fallback."""
     unlaid = _qsa(modules)
     unlaid.host_lens = None
     with caplog.at_level("WARNING"):
         assert _attend(modules, _layer(), unlaid) is None
-        monkeypatch.setenv("ATOM_QSA_FLYDSL_ATTN", "0")
-        ratio_8 = _layer(indexer=SimpleNamespace(compress_ratio=8, token_topk=2048))
-        assert _attend(modules, ratio_8, _qsa(modules)) is None
     assert _warnings(caplog) == [] and flydsl == []
 
 

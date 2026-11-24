@@ -75,7 +75,6 @@ from atom.model_ops.qwen4_exp.qsa_cache_rules import (
     qsa_row_space,
 )
 from atom.plugin.prepare import is_plugin_mode
-from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger(__name__)
@@ -113,7 +112,7 @@ def flydsl_fallback_reason(
     its selection would give wrong output. The one authority for the layer's
     fallback and the SGLang bridge's layout build; the per-call conditions
     (host layout, selection byte span, graph capture, query dtype) stay with
-    the layer. `ATOM_QSA_FLYDSL_ATTN` is checked by the callers."""
+    the layer."""
     if not kv_bf16:
         return "the KV cache is not BF16"
     widths = qsa_sparse_prefill_widths()
@@ -131,11 +130,10 @@ def flydsl_fallback_reason(
 
 @functools.cache
 def log_flydsl_fallback(reason: str) -> None:
-    """Warn once per distinct reason, so a server with the FlyDSL QSA attention
-    enabled shows whether, and why, QSA attention stays on the native kernel."""
+    """Warn once per distinct reason, so a server shows whether, and why, QSA
+    attention stays on the native kernel."""
     logger.warning(
-        "FlyDSL QSA prefill attention is enabled, but QSA attention uses the "
-        "native kernel: %s",
+        "QSA attention uses the native kernel instead of the FlyDSL one: %s",
         reason,
     )
 
@@ -194,8 +192,6 @@ class _FlyDSLPrefill:
         self.laid_out = False
         self.reason = self.width = self.query_lens = self.prefix_lens = None
         self.indices = None
-        if not envs.ATOM_QSA_FLYDSL_ATTN:
-            return
         # The prefixed path reads raw cache rows; the kernel takes BF16 only.
         reason = flydsl_fallback_reason(
             ratio, topk, heads, kv_heads, head_dim, kv_bf16=kv_bf16
@@ -725,8 +721,8 @@ class Qwen4ExpAttention(nn.Module):
     def _flydsl_attention(self, query, key, value, plan, qsa):
         """aiter FlyDSL sparse attention for an eager prefill, or None for the
         native kernel. `plan` is the forward's layout; when it is ready the
-        selection was written into `plan.indices`. With the flag on, the first
-        FlyDSL call and each distinct fallback reason are logged once."""
+        selection was written into `plan.indices`. The first FlyDSL call and
+        each distinct fallback reason are logged once."""
         if not plan.laid_out:
             return None
         if plan.reason is not None:

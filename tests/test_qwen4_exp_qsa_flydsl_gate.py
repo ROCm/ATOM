@@ -77,7 +77,6 @@ def test_mixed_prefix_batch_reads_full_contexts_through_the_slot_table(monkeypat
     rows = torch.arange(pages * block, device=device, dtype=torch.bfloat16)
     k_cache = rows.view(pages, block, 1, 1).expand(-1, -1, 1, 256).contiguous()
     calls = []
-    monkeypatch.setenv("ATOM_QSA_FLYDSL_ATTN", "1")
     # Any GPU: the kernel is replaced, only the layout is checked.
     monkeypatch.setattr(
         qsa_attention, "qsa_sparse_prefill_widths", lambda: (1027, 2051, 3075, 4099)
@@ -127,7 +126,7 @@ def test_mixed_prefix_batch_reads_full_contexts_through_the_slot_table(monkeypat
     ],
     ids=["7", "300", "512", "prefix-200+300", "mixed-3-requests", "1000-unpadded"],
 )
-def test_short_context_matches_native_kernel(monkeypatch, prefixes, extends):
+def test_short_context_matches_native_kernel(prefixes, extends):
     """Short contexts shrink the selection (its width follows max_seq_len, not
     the budget), so it is padded with -1 to the next FlyDSL width, past the
     budget's own layout. Every row still lists all its complete blocks, then
@@ -141,7 +140,6 @@ def test_short_context_matches_native_kernel(monkeypatch, prefixes, extends):
 
     if not qsa_attention.qsa_sparse_prefill_widths():
         pytest.skip("aiter's FlyDSL QSA prefill does not run on this GPU")
-    monkeypatch.setenv("ATOM_QSA_FLYDSL_ATTN", "1")
 
     device, block, ratio, budget, heads, dim = "cuda", 64, 4, 2048, 6, 256
     gen = torch.Generator(device=device).manual_seed(0)
@@ -238,7 +236,7 @@ def test_short_context_matches_native_kernel(monkeypatch, prefixes, extends):
     ],
     ids=["8192-hit-6080", "second-chunk", "mixed-unaligned", "short", "no-prefix"],
 )
-def test_in_place_reads_match_gathered_rows_bit_for_bit(monkeypatch, prefixes, extends):
+def test_in_place_reads_match_gathered_rows_bit_for_bit(prefixes, extends):
     """The real kernel on the slot table (pool read in place, selection written
     into the kernel-width buffer, two layers sharing one layout) gives the same
     bits as the kernel on every context row gathered and a padded copy of the
@@ -248,7 +246,6 @@ def test_in_place_reads_match_gathered_rows_bit_for_bit(monkeypatch, prefixes, e
 
     if not qsa_attention.qsa_sparse_prefill_widths():
         pytest.skip("aiter's FlyDSL QSA prefill does not run on this GPU")
-    monkeypatch.setenv("ATOM_QSA_FLYDSL_ATTN", "1")
 
     device, block, ratio, budget, heads, dim, pages = "cuda", 64, 4, 2048, 12, 256, 512
     gen = torch.Generator(device=device).manual_seed(0)

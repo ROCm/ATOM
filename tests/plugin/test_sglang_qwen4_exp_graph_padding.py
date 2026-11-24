@@ -1171,8 +1171,9 @@ def test_eager_prefill_max_seq_len_ignores_stale_decode_graph_flag(monkeypatch):
     """Leftover ``_DECODE_GRAPH.active`` must not score a prefill at context_length."""
     from atom.plugin.sglang import qwen4_exp_bridge as bridge
 
-    # Not about FlyDSL: the config below has no head shape for its gate.
-    monkeypatch.setenv("ATOM_QSA_FLYDSL_ATTN", "0")
+    # Not about FlyDSL: the config below has no head shape for its gate, which
+    # would otherwise read the TP group no CPU runner initializes.
+    monkeypatch.setattr(bridge, "_flydsl_layout_needed", lambda *a, **kw: False)
 
     class _Prefill:
         @staticmethod
@@ -1395,14 +1396,13 @@ def test_flydsl_prefill_layout_falls_back_unless_tokens_are_the_extends(
 
 
 def _flydsl_gate_env(monkeypatch, tp=4, arch=True):
-    """Flag on, `tp` ranks, `arch` for a GPU aiter's FlyDSL QSA prefill runs
-    on; returns the layer module."""
+    """`tp` ranks, `arch` for a GPU aiter's FlyDSL QSA prefill runs on;
+    returns the layer module."""
     qsa_attention = pytest.importorskip(
         "atom.model_ops.qwen4_exp.qsa_attention", exc_type=ImportError
     )
     from aiter.dist import parallel_state
 
-    monkeypatch.setenv("ATOM_QSA_FLYDSL_ATTN", "1")
     widths = (1027, 2051, 3075, 4099) if arch else ()
     monkeypatch.setattr(qsa_attention, "qsa_sparse_prefill_widths", lambda: widths)
     monkeypatch.setattr(
@@ -1421,35 +1421,33 @@ _FLASH_CONFIG = SimpleNamespace(
 
 
 @pytest.mark.parametrize(
-    "flag,arch,kv_dtype,ratio,budget,tp,needed",
+    "arch,kv_dtype,ratio,budget,tp,needed",
     [
-        ("1", True, torch.bfloat16, 4, 2048, 4, True),
-        ("1", True, torch.bfloat16, 4, 2048, 2, True),  # 12 q heads per rank
-        ("1", True, torch.bfloat16, 4, 2048, 8, True),  # 3 q heads per rank
-        ("1", True, torch.bfloat16, 4, 2048, 1, False),  # 24 q / 2 kv heads
-        ("1", True, None, 4, 4096, 4, False),  # dtype unreadable: native
-        ("0", True, torch.bfloat16, 4, 2048, 4, False),  # flag off
-        ("1", False, torch.bfloat16, 4, 2048, 4, False),  # aiter: not this GPU
-        ("1", True, torch.float8_e4m3fn, 4, 2048, 4, False),  # FP8 KV pool
-        ("1", True, torch.bfloat16, 8, 2048, 4, False),  # compression ratio
-        ("1", True, torch.bfloat16, 4, 1536, 4, False),  # budget the kernel lacks
+        (True, torch.bfloat16, 4, 2048, 4, True),
+        (True, torch.bfloat16, 4, 2048, 2, True),  # 12 q heads per rank
+        (True, torch.bfloat16, 4, 2048, 8, True),  # 3 q heads per rank
+        (True, torch.bfloat16, 4, 2048, 1, False),  # 24 q / 2 kv heads
+        (True, None, 4, 4096, 4, False),  # dtype unreadable: native
+        (False, torch.bfloat16, 4, 2048, 4, False),  # aiter: not this GPU
+        (True, torch.float8_e4m3fn, 4, 2048, 4, False),  # FP8 KV pool
+        (True, torch.bfloat16, 8, 2048, 4, False),  # compression ratio
+        (True, torch.bfloat16, 4, 1536, 4, False),  # budget the kernel lacks
     ],
 )
 def test_flydsl_layout_built_only_when_the_kernel_can_run(
-    monkeypatch, flag, arch, kv_dtype, ratio, budget, tp, needed
+    monkeypatch, arch, kv_dtype, ratio, budget, tp, needed
 ):
     """The FlyDSL host layout (host lengths, and an H2D of the context rows
     when prefixed) is only worth building when a QSA layer can take the
     kernel; otherwise every prefill would pay for it and fall back."""
     _flydsl_gate_env(monkeypatch, tp=tp, arch=arch)
-    monkeypatch.setenv("ATOM_QSA_FLYDSL_ATTN", flag)
     pool = SimpleNamespace() if kv_dtype is None else SimpleNamespace(dtype=kv_dtype)
     batch = SimpleNamespace(token_to_kv_pool=pool)
     assert _flydsl_layout_needed(batch, _FLASH_CONFIG, ratio, budget) is needed
 
 
 def test_flydsl_layout_logs_each_fallback_reason_once(monkeypatch, caplog):
-    """With the flag on, a fallback names its reason in the log, once."""
+    """A fallback names its reason in the log, once."""
     _flydsl_gate_env(monkeypatch, tp=1)
     batch = SimpleNamespace(token_to_kv_pool=SimpleNamespace(dtype=torch.bfloat16))
     with caplog.at_level("WARNING"):
