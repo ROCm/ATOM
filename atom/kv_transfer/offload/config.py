@@ -587,6 +587,24 @@ def validate_lmcache_lookup_scope(cfg: Any, world_size: int) -> None:
         )
 
 
+def _pp_stage_kv_bytes(config, pp_size: int) -> list[int] | None:
+    """Each PP stage's KV bytes per token, as its pool and so its LMCache
+    chunks hold them (the drafter's KV on the last stage included), or None
+    when no estimate covers the model (`minimax_m3_stage_kv_costs`)."""
+    from atom.models.pp_partition import minimax_m3_stage_kv_costs
+    from atom.models.utils import get_pp_indices
+
+    costs = minimax_m3_stage_kv_costs(config)
+    if costs is None:
+        return None
+    layers, draft = costs
+    out = []
+    for rank in range(pp_size):
+        start, end = get_pp_indices(len(layers), rank, pp_size)
+        out.append(sum(layers[start:end]) + (draft if rank == pp_size - 1 else 0))
+    return out if all(b > 0 for b in out) else None
+
+
 def scale_cpu_size_for_pp(cfg, config) -> None:
     """Split the CPU offload budget across PP stages by layer count.
 
@@ -596,6 +614,13 @@ def scale_cpu_size_for_pp(cfg, config) -> None:
 
     The last PP stage binds the draft KV layer (spec decode), so its
     layer count is one more than its target-model slice.
+
+    With ATOM_OFFLOAD_PP_SPLIT_BY_KV_BYTES, a model whose per-stage KV bytes
+    are known (MiniMax-M3) is split by those bytes instead: a layer count
+    misses a drafter whose KV is not one target layer's (M3.1's DSpark: five
+    layers, 5,280 B/token at TP1, and `num_nextn_predict_layers` 0), and with
+    it the last stage's horizon -- 60% of the budget's under the kv_balanced
+    PP4 split, 74% under the even one.
     """
     pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
     if pp_size <= 1:
@@ -606,8 +631,8 @@ def scale_cpu_size_for_pp(cfg, config) -> None:
         return
 
     from atom.models.utils import get_pp_indices
+    from atom.utils import envs
 
-    num_hidden_layers = int(config.hf_config.num_hidden_layers)
     pp_rank = int(
         getattr(
             getattr(config, "parallel_config", None),
@@ -615,6 +640,31 @@ def scale_cpu_size_for_pp(cfg, config) -> None:
             0,
         )
     )
+    stage_bytes = (
+        _pp_stage_kv_bytes(config, pp_size)
+        if envs.ATOM_OFFLOAD_PP_SPLIT_BY_KV_BYTES
+        else None
+    )
+    if stage_bytes is not None:
+        scaled = configured * pp_size * stage_bytes[pp_rank] / sum(stage_bytes)
+        try:
+            cfg.max_local_cpu_size = scaled
+        except AttributeError:
+            return
+        logger.info(
+            "LMCache CPU budget for PP stage %d/%d: %.2fGB -> %.2fGB "
+            "(%d of %d KV B/token; total across stages unchanged at %.2fGB)",
+            pp_rank,
+            pp_size,
+            configured,
+            scaled,
+            stage_bytes[pp_rank],
+            sum(stage_bytes),
+            configured * pp_size,
+        )
+        return
+
+    num_hidden_layers = int(config.hf_config.num_hidden_layers)
     start, end = get_pp_indices(num_hidden_layers, pp_rank, pp_size)
     local_layers = end - start
 
