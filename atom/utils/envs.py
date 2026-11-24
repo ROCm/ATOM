@@ -568,6 +568,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_STATE_CHECKPOINT_DEMAND": lambda: (
         os.getenv("ATOM_STATE_CHECKPOINT_DEMAND", "1") == "1"
     ),
+    # Set to 0 so that restoring a PAGE-backed state checkpoint refreshes its
+    # place in the store's LRU only from its second restore on. A multi-turn
+    # session resumes from its last prompt-end anchor once and files a new one
+    # at the end of the same prefill, so the old image is spent the moment it
+    # is read; refreshed, it holds a slot as long as the live one, and a store
+    # full of such pairs keeps half the sessions it could. An image read twice
+    # (a prefix sessions share) is refreshed as before.
+    "ATOM_STATE_CHECKPOINT_REFRESH_FIRST_RESTORE": lambda: (
+        os.getenv("ATOM_STATE_CHECKPOINT_REFRESH_FIRST_RESTORE", "1") == "1"
+    ),
     # Tokens kept between the prompt-end state checkpoint and the prompt end,
     # at least; the backend's own successor room still applies when it is
     # larger. A chat template rewrites the tail of an assistant turn when the

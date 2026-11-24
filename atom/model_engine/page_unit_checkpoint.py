@@ -18,6 +18,7 @@ from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.sequence import Sequence
 from atom.model_engine.state_cache import KEEP_SETTLED, KEEP_SNAPSHOT
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import page_entry_bytes
+from atom.utils import envs
 
 _CHANGE_LOG_LIMIT = 4096
 
@@ -300,6 +301,8 @@ class CheckpointRecord:
     unit_ids: tuple[int, ...]
     state: str = COPYING
     pin_count: int = 0
+    # Restores begun from this image; see `PageUnitCheckpointStore.begin_restore`.
+    restores: int = 0
 
 
 @dataclass(frozen=True)
@@ -359,6 +362,9 @@ class PageUnitCheckpointStore:
         self.records: dict[int, CheckpointRecord] = {}
         self._pending_by_hash: dict[int, int] = {}
         self._lru: OrderedDict[int, None] = OrderedDict()
+        # Whether an image's first restore refreshes its LRU place, or only a
+        # later one does (ATOM_STATE_CHECKPOINT_REFRESH_FIRST_RESTORE).
+        self._refresh_first_restore = envs.ATOM_STATE_CHECKPOINT_REFRESH_FIRST_RESTORE
         self._inflight_stores: list[int] = []
         self._queued_restores: list[tuple[int, CheckpointRestoreOp]] = []
         self._inflight_restores: list[int] = []
@@ -561,7 +567,13 @@ class PageUnitCheckpointStore:
             return None
         record = self.records[checkpoint_id]
         record.pin_count += 1
-        self._lru.move_to_end(checkpoint_id)
+        record.restores += 1
+        # A session's prompt-end anchor is read once, by its next turn, which
+        # files the anchor that replaces it; left where it was filed it ages
+        # out ahead of the live anchors instead of beside them. An image read
+        # again is shared, and kept warm.
+        if self._refresh_first_restore or record.restores > 1:
+            self._lru.move_to_end(checkpoint_id)
         op = CheckpointRestoreOp(
             dst_slot=dst_slot,
             unit_ids=record.unit_ids,

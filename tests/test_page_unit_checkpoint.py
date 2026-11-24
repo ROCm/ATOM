@@ -1017,3 +1017,49 @@ def test_a_plan_carries_the_store_as_a_class_of_its_own():
         plan.with_entry_class(STATE_CHECKPOINT_CLASS, 1, 600)
     with pytest.raises(ValueError, match="not a pool"):
         plan.with_entry_class("bad", 1, 0)
+
+
+def _read(store, prefix_hash):
+    """One restore from `prefix_hash`'s image, carried through its batch."""
+    assert store.begin_restore(prefix_hash, dst_slot=4) is not None
+    assert len(store.take_restore_ops()) == 1
+    store.complete_inflight()
+
+
+def test_a_restore_refreshes_the_image_it_reads_by_default():
+    _, store = make_store(num_units=9)
+    ready(store, 101)
+    ready(store, 202)
+    ready(store, 303)
+    _read(store, 101)
+    # A fourth image spends the least recently used: 202, as 101 was just read.
+    ready(store, 404)
+    assert store.lookup(101) >= 0
+    assert store.lookup(202) == -1
+
+
+def test_an_image_read_once_ages_from_where_it_was_filed(monkeypatch):
+    """ATOM_STATE_CHECKPOINT_REFRESH_FIRST_RESTORE=0: a session's anchor, read
+    once by its next turn (which files the anchor replacing it), is spent ahead
+    of images filed after it; an image read a second time is shared and kept."""
+    monkeypatch.setenv("ATOM_STATE_CHECKPOINT_REFRESH_FIRST_RESTORE", "0")
+    _, store = make_store(num_units=9)
+    ready(store, 101)
+    ready(store, 202)
+    ready(store, 303)
+    _read(store, 101)
+    ready(store, 404)
+    assert store.lookup(101) == -1
+    assert store.lookup(202) >= 0
+    assert store.records[store.lookup(202)].restores == 0
+
+    _read(store, 202)
+    _read(store, 202)
+    assert store.records[store.lookup(202)].restores == 2
+    # 202 was refreshed by its second read, so 303 goes next, then 404.
+    ready(store, 505)
+    assert store.lookup(303) == -1
+    assert store.lookup(202) >= 0
+    ready(store, 606)
+    assert store.lookup(404) == -1
+    assert store.lookup(202) >= 0
