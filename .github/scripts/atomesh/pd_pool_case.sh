@@ -13,6 +13,7 @@ case "${case_name}" in
   pp4-dep4-remap) contract_file=single-node-pp4-dep4-remap-performance.json; budget=120m ;;
   pp4-dep4-c80) contract_file=single-node-pp4-dep4-c80-performance.json; budget=120m ;;
   pp4-dep4-sender1) contract_file=single-node-pp4-dep4-sender1-diagnostic.json; budget=60m ;;
+  pp4-dep4-c80-sender1) contract_file=single-node-pp4-dep4-c80-sender1-diagnostic.json; budget=60m ;;
   *) exit 2 ;;
 esac
 export REPO_ROOT="${3:?checkout path}"
