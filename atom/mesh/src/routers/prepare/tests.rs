@@ -2072,6 +2072,38 @@ mod i_atom_structured_output {
         assert_eq!(rendered.unwrap().text, "files.search;web.search;");
     }
 
+    /// A named choice with a namespace reaches ATOM as sent, which reads it as
+    /// `files::search` beside the tool it names, and the prompt keeps that tool alone.
+    #[test]
+    fn a_namespaced_named_choice_keeps_its_namespace() {
+        let search = |namespace: &str| {
+            json!({"type": "function", "namespace": namespace,
+                "function": {"name": "search", "parameters": {}}})
+        };
+        let choice = json!({"type": "function", "namespace": "files",
+            "function": {"name": "search"}});
+        let body = json!({"model": "m", "tools": [search("files"), search("web")],
+            "tool_choice": choice.clone(), "messages": [{"role": "user", "content": "hi"}]});
+        let (payload, _) = prepared_raw(body.clone(), RuntimeType::Atom);
+        let carried = payload.structured_output.expect("an ATOM chat carries one");
+        assert_eq!(parsed(carried.tool_choice_json), Some(choice));
+
+        use crate::routers::prepare::chat_template::process_chat_messages_with_kwargs;
+        use crate::routers::prepare::tool_constraints::filter_chat_request_by_tool_choice;
+        use crate::tokenizer::{traits::Tokenizer, HuggingFaceTokenizer};
+        let mut tokenizer =
+            HuggingFaceTokenizer::from_file(test_mocks::tokenizer::hf_tokenizer_path()).unwrap();
+        let template = "{% for t in tools %}{{ t.namespace }}.{{ t.function.name }};{% endfor %}";
+        tokenizer.set_chat_template(template.to_string()).unwrap();
+        let declared = MessageTools::read(&serde_json::to_vec(&body).unwrap()).unwrap();
+        let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+        let kept = filter_chat_request_by_tool_choice(&request);
+        let kwargs = Default::default();
+        let rendered =
+            process_chat_messages_with_kwargs(&kept, &tokenizer, &kwargs, Some(&declared));
+        assert_eq!(rendered.unwrap().text, "files.search;");
+    }
+
     #[test]
     fn a_tool_with_two_namespaces_is_refused() {
         let tool = json!({"type": "function", "namespace": "files",

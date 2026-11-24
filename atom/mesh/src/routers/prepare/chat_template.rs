@@ -8,7 +8,10 @@ use std::{
 
 use serde_json::{json, Value};
 
-use super::{fast_tokenizer::FastTokenizer, message_tools::MessageTools};
+use super::{
+    fast_tokenizer::FastTokenizer,
+    message_tools::{qualified_name, MessageTools},
+};
 use crate::{
     core::{worker::RuntimeType, Worker},
     protocols::{
@@ -219,8 +222,12 @@ pub fn process_chat_messages_with_kwargs(
         })
         .transpose()
         .map_err(|e| format!("Failed to serialize tools: {}", e))?;
-    // Namespaced top-level tools render as sent, those `request` keeps by name.
+    // Namespaced top-level tools render as sent, those `request` keeps by name, or the
+    // one a namespaced named choice qualifies.
     let sent = message_tools.and_then(|declared| declared.1.as_deref());
+    let choice = message_tools
+        .and_then(MessageTools::qualified_choice)
+        .and_then(Result::ok);
     let tools_json = match (tools_json, sent) {
         (Some(_), Some(sent)) => {
             let kept: HashSet<&str> = request
@@ -229,9 +236,10 @@ pub fn process_chat_messages_with_kwargs(
                 .flatten()
                 .map(|tool| tool.function.name.as_str())
                 .collect();
-            let kept = sent
-                .iter()
-                .filter(|tool| sent_name(tool).is_some_and(|n| kept.contains(n)));
+            let kept = sent.iter().filter(|tool| match &choice {
+                Some(choice) => qualified_name(tool).as_ref() == Some(choice),
+                None => sent_name(tool).is_some_and(|n| kept.contains(n)),
+            });
             Some(kept.cloned().collect())
         }
         (typed, _) => typed,

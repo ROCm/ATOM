@@ -174,7 +174,7 @@ pub fn prepare_chat_declaring(
     // Only ATOM reads the tools a message declares.
     let message_tools = atom
         .then(|| message_tools.unwrap_or_else(|| MessageTools::of(&req)))
-        .filter(|declared| !declared.is_empty() || declared.1.is_some());
+        .filter(|declared| !declared.is_empty() || declared.1.is_some() || declared.2.is_some());
 
     let template_kwargs = if atom {
         let toggle = reasoning_toggle(&workers)
@@ -566,9 +566,14 @@ fn structured_output(
         Some(sent) => Some(to_json(sent)?),
         None => req.tools.as_ref().map(to_json).transpose()?,
     };
+    // A namespaced named choice goes as sent too, so ATOM names it as it names the tool.
+    let tool_choice_json = match message_tools.and_then(|declared| declared.2.as_deref()) {
+        Some(sent) => Some(to_json(sent)?),
+        None => req.tool_choice.as_ref().map(to_json).transpose()?,
+    };
     Ok(StructuredOutput {
         tools_json,
-        tool_choice_json: req.tool_choice.as_ref().map(to_json).transpose()?,
+        tool_choice_json,
         response_format_json: req.response_format.as_ref().map(to_json).transpose()?,
         message_tools_json: message_tools
             .filter(|declared| !declared.is_empty())
