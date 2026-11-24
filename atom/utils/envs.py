@@ -1506,6 +1506,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PREFILL_DECODE_INTERVAL": lambda: int(
         os.getenv("ATOM_PREFILL_DECODE_INTERVAL", "0")
     ),
+    # P/D decode (kv_consumer) only, opt-in: how many sequences may decode at
+    # once. A request whose pushed KV has landed waits, still parked, for a
+    # decode slot; requests still to be pushed are allocated and asked for as
+    # before. ATOM_DECODE_RUN_CAP_FACTOR > 0 sets the cap to that multiple of
+    # the decode demand (decoding plus landed-and-waiting) averaged over
+    # ATOM_DECODE_RUN_CAP_WINDOW_S seconds, never below 16; ATOM_DECODE_MAX_RUNNING
+    # is a fixed cap, or with the factor its ceiling. See
+    # `Scheduler._refresh_decode_cap`.
+    "ATOM_DECODE_MAX_RUNNING": lambda: _optional_int_env(
+        "ATOM_DECODE_MAX_RUNNING", min_value=1
+    ),
+    "ATOM_DECODE_RUN_CAP_FACTOR": lambda: _finite_float_env(
+        "ATOM_DECODE_RUN_CAP_FACTOR", 0.0, allow_zero=True
+    ),
+    "ATOM_DECODE_RUN_CAP_WINDOW_S": lambda: _finite_float_env(
+        "ATOM_DECODE_RUN_CAP_WINDOW_S", 30.0, allow_zero=False
+    ),
     # Order of the waiting queue at prefill admission (`Scheduler._order_waiting`).
     # "fcfs": arrival order. "cached_first": the fewest prompt tokens left to
     # compute (prompt minus the HBM prefix hit or the offload tier's known
