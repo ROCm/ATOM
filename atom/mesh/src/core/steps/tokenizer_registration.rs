@@ -228,6 +228,10 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
             let templates = &app_context.tokenizer_inline_templates;
             templates.write().insert(loaded.clone(), template);
         }
+        if let (Ok(LoadOutcome::Loaded { id: loaded }), Some(_)) = (&result, &chat_template) {
+            let files = &app_context.tokenizer_template_files;
+            files.write().insert(loaded.clone());
+        }
 
         match result {
             Ok(outcome) => {
@@ -561,6 +565,10 @@ mod tests {
         register(None, path).await.unwrap();
         assert_eq!(loaded().id, file_loaded);
         assert!(context.tokenizer_inline_templates.read().is_empty());
+        assert!(context
+            .tokenizer_template_files
+            .read()
+            .contains(&file_loaded));
         assert!(context.tokenizers_replaced.is_empty());
     }
 

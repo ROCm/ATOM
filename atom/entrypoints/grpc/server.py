@@ -494,7 +494,8 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
         for it, with the structured fields PrepareStructuredOutput answered."""
         api, given = self.api, request.sampling_params
         seq_id = session.seq_id(request.seq_id)
-        if given.n > 1:
+        # Greedy siblings collapse to one, as Generate's admission collapses them.
+        if api._coerce_n(given.n, given.temperature) > 1:
             raise ValueError(SESSION_N)
         if given.logprobs or given.top_logprobs:
             raise ValueError("logprobs are not served over the Session")

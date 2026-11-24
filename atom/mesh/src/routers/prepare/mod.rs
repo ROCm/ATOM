@@ -36,7 +36,7 @@ mod tests;
 
 use chat_template::{
     atom_chat_render_gap, atom_template_not_loaded, default_template_kwargs,
-    merged_template_kwargs, process_chat_messages_with_kwargs,
+    merged_template_kwargs, process_chat_messages_with_kwargs, LoadedTemplate,
 };
 use generation_payload::{
     GenerationPayload, LogprobConfig, SamplingParams, StopConfig, StructuredOutput,
@@ -130,7 +130,12 @@ pub fn prepare_chat_declaring(
             .as_ref()
             .is_some_and(|entry| marked.contains(&entry.id));
         let templates = components.tokenizer_inline_templates.read();
-        let loaded = entry.as_ref().and_then(|e| templates.get(&e.id).cloned());
+        let files = components.tokenizer_template_files.read();
+        let loaded = entry.as_ref().map(|e| match templates.get(&e.id) {
+            Some(template) => LoadedTemplate::Worker(template.clone()),
+            None if files.contains(&e.id) => LoadedTemplate::File,
+            None => LoadedTemplate::Own,
+        });
         (entry, built_in, loaded)
     };
     if let Some(gap) = atom_chat_render_gap(&workers, configured_template, built_in_encoder) {
@@ -142,8 +147,7 @@ pub fn prepare_chat_declaring(
             ),
         ));
     }
-    let loaded = loaded_template.as_deref();
-    if let Some(worker) = atom_template_not_loaded(&workers, configured_template, loaded) {
+    if let Some(worker) = atom_template_not_loaded(&workers, configured_template, loaded_template) {
         return Err(error::service_unavailable(
             "chat_template_loading",
             format!(
