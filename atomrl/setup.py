@@ -9,6 +9,17 @@ import shutil
 from pathlib import Path
 
 from setuptools import setup
+from setuptools.command.build_py import build_py as _build_py
+
+
+class CleanBuildPy(_build_py):
+    """Remove stale package files before copying the current source tree."""
+
+    def run(self):
+        package_root = Path(self.build_lib) / "atomrl"
+        if package_root.exists():
+            shutil.rmtree(package_root)
+        super().run()
 
 
 def lumen_hip_extensions():
@@ -73,6 +84,8 @@ def lumen_hip_extensions():
 
 
 ext_modules, build_ext = lumen_hip_extensions()
-cmdclass = {"build_ext": build_ext} if build_ext is not None else {}
+cmdclass = {"build_py": CleanBuildPy}
+if build_ext is not None:
+    cmdclass["build_ext"] = build_ext
 
 setup(ext_modules=ext_modules, cmdclass=cmdclass)

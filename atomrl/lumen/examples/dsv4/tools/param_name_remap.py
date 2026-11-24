@@ -1,3 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2023-2024 SGLang Team
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+#
+# Modified by Advanced Micro Devices, Inc.
+# Source: https://github.com/sgl-project/sglang/blob/88c10654aedd7d3cc8ae7f16699020aff53efee0/python/sglang/srt/models/deepseek_v4.py
+
 """Weight name remap for DeepSeek-V4 native FP8 checkpoints (no SGLang dependency)."""
 
 from __future__ import annotations
