@@ -173,6 +173,8 @@ def test_v2_options_parse_and_key_the_plan():
         {"model_options": {"qpath_fuse": "kv,q"}},
         {"model_options": {"qpath_fuse": ["k"]}},
         {"model_options": {"rope_window_reference": "on"}},
+        {"model_options": {"wq_b_before_index": 1}},
+        {"dspark_options": {"context_taps_concat": "yes"}},
         {"model_options": {"seg_fuse": "1,7"}},
         {"model_options": {"seg_fuse": [1], "ffn_mhc_fuse_quant": True}},
         {"model_options": {"seg_fuse": [7], "shared_act_quant": True}},

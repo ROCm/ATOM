@@ -914,14 +914,25 @@ class Attention(nn.Module):
                 )
             else:
                 qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)
+            # model_options.wq_b_before_index: wq_b ahead of the scorer, on
+            # the rows it is asked for; the scorer still reads every row's qr.
+            early = not fused and plugin_host.model_options().wq_b_before_index
+            if early:
+                rows, rows_scale = (
+                    (qr, qr_scale) if queries is None else queries.take(qr, qr_scale)
+                )
+                query = self.wq_b(rows, x_scale=rows_scale).unflatten(
+                    -1, (self.heads, self.head_dim)
+                )
             self._fork_select(
                 hidden, qr, qr_scale, cache, step, rope, compressed=compressed
             )
-            if queries is not None:
-                qr, qr_scale = queries.take(qr, qr_scale)
-            query = self.wq_b(qr, x_scale=qr_scale).unflatten(
-                -1, (self.heads, self.head_dim)
-            )
+            if not early:
+                if queries is not None:
+                    qr, qr_scale = queries.take(qr, qr_scale)
+                query = self.wq_b(qr, x_scale=qr_scale).unflatten(
+                    -1, (self.heads, self.head_dim)
+                )
             prepared = (
                 None
                 if fused

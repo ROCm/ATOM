@@ -476,6 +476,11 @@ class DeepseekV41DSpark(DSparkDraftModel):
         taps = (taps,) if isinstance(taps, torch.Tensor) else taps
         if rows is not None:
             taps = tuple(tap[rows] for tap in taps)
+        if plugin_host.dspark_options().context_taps_concat:
+            # main_proj's input as the taps' bf16 cat, which it quantizes
+            # itself: a copy and a quantize in place of the one launch.
+            taps = [tap[:running_tokens] for tap in taps]
+            return (taps[0] if len(taps) == 1 else torch.cat(taps, dim=-1)), None
         return quantize_fp8_taps([tap[:running_tokens] for tap in taps])
 
     def _ctx_capability(self, *inputs, **kwargs):

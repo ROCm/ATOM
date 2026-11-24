@@ -374,3 +374,34 @@ def test_the_keys_are_stage_major_with_or_without_the_fused_tail(
     )
     assert keys(draft, "hidden", "scale", positions, packed=packed) == "tail-keys"
     assert tails == [((1, rows, 2, width), "nw", (rows,), "cos", "sin", 1e-5, packed)]
+
+
+# -- dspark_options.context_taps_concat -------------------------------------------
+
+
+def test_the_taps_are_quantized_where_they_lie_unless_the_recipe_concatenates(
+    monkeypatch,
+):
+    calls = []
+    monkeypatch.setattr(
+        dspark_module,
+        "quantize_fp8_taps",
+        lambda taps: calls.append([tuple(t.shape) for t in taps]) or ("fp8", "scale"),
+    )
+    taps = [torch.full((5, 4), float(i)) for i in range(3)]
+    concat = dspark_module.DeepseekV41DSpark._concat_taps
+    monkeypatch.setattr(dspark_module.plugin_host, "_plan", None)
+    assert concat(taps, None, 3) == ("fp8", "scale")
+    assert calls == [[(3, 4)] * 3]
+    plan = SimpleNamespace(
+        dspark_options=recipe_module.DSparkOptions(context_taps_concat=True)
+    )
+    monkeypatch.setattr(dspark_module.plugin_host, "_plan", plan)
+    joined, scale = concat(taps, None, 3)
+    assert scale is None and len(calls) == 1
+    assert joined.shape == (3, 12) and torch.equal(joined, torch.cat(taps, -1)[:3])
+    rows = torch.tensor([4, 0])
+    joined, _ = concat(taps, rows, 2)
+    assert torch.equal(joined, torch.cat(taps, -1)[rows])
+    single, scale = concat(taps[1], None, 2)
+    assert scale is None and torch.equal(single, taps[1][:2])

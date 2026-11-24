@@ -720,3 +720,36 @@ def test_the_layout_rule_of_the_plan_is_the_reference_modules(
     assert qpath.reference_program_heads(63, 64, cuda) == 1
     assert qpath.reference_program_heads(64, 64, cuda) == 8
     assert reference.query_fp8_heads(64, 64, cuda) == 8
+
+
+# -- model_options.wq_b_before_index ---------------------------------------------
+
+
+def test_wq_b_before_index_changes_only_the_order(fuse, monkeypatch):
+    """An unplanned step (a prefill, say): the same launches, wq_b ahead of
+    the scorer with the option, after it without."""
+    base = [
+        "compress",
+        "wqkv_a",
+        "qk_norm",
+        "select",
+        "wq_b",
+        "rope_window",
+        "attend",
+        "project_out",
+    ]
+    assert _forward_layer(monkeypatch, (None, None)) == base
+    plan = SimpleNamespace(model_options=recipe.ModelOptions(wq_b_before_index=True))
+    monkeypatch.setattr(host, "_plan", plan)
+    early = _forward_layer(monkeypatch, (None, None))
+    assert early == [
+        "compress",
+        "wqkv_a",
+        "qk_norm",
+        "wq_b",
+        "select",
+        "rope_window",
+        "attend",
+        "project_out",
+    ]
+    assert sorted(early) == sorted(base)

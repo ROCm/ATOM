@@ -384,6 +384,9 @@ class ModelOptions:
     # The RoPE / window launch runs the kernel `qpath_fuse` records its
     # rotation forms from (`atom.model_ops.deepseek_v41.rope_window_reference`).
     rope_window_reference: bool = False
+    # wq_b runs ahead of the index scorer on every step (the order of the
+    # steps `qpath_fuse` plans).
+    wq_b_before_index: bool = False
 
     @classmethod
     def from_mapping(cls, raw: Any) -> ModelOptions:
@@ -462,6 +465,10 @@ class ModelOptions:
                 raw.get("rope_window_reference", defaults.rope_window_reference),
                 "model_options.rope_window_reference",
             ),
+            wq_b_before_index=_strict_bool(
+                raw.get("wq_b_before_index", defaults.wq_b_before_index),
+                "model_options.wq_b_before_index",
+            ),
         )
         for item, other in ((1, "ffn_mhc_fuse_quant"), (7, "shared_act_quant")):
             if item in options.seg_fuse and getattr(options, other):
@@ -504,6 +511,10 @@ class DSparkOptions:
     # The independent-noise draw as the race and then the greedy rows' argmax
     # and select, three calls, in place of the one fused call.
     sampler_split_independent_noise: bool = False
+    # The draft's context projection reads the taps' bf16 concatenation and
+    # quantizes it itself, in place of the one launch that quantizes the taps
+    # where they lie.
+    context_taps_concat: bool = False
 
     @classmethod
     def from_mapping(cls, raw: Any) -> DSparkOptions:
@@ -561,6 +572,10 @@ class DSparkOptions:
                     defaults.sampler_split_independent_noise,
                 ),
                 "dspark_options.sampler_split_independent_noise",
+            ),
+            context_taps_concat=_strict_bool(
+                raw.get("context_taps_concat", defaults.context_taps_concat),
+                "dspark_options.context_taps_concat",
             ),
         )
 

@@ -162,6 +162,9 @@ weights layout, loader, runtime (graphs, bounded replay, guarded ops) and mono d
   the kernel `qpath_fuse`'s record was read from, so with both options the fused and the unfused
   steps of a deployment round alike, bit for bit. `fused_attn`'s own launch
   (`norm_rope_quant_window`) is not affected.
+- `model_options.wq_b_before_index`: on every step `fused_attn` does not serve, `wq_b` is launched
+  ahead of the index scorer instead of after it, as on the steps `qpath_fuse` plans. The same
+  launches with the same inputs; only their order on the stream changes.
 - `dspark_options.dp_sharded_head`: under pure DP attention (TP 1) the draft block's rows and
   anchors are all-gathered over the DP group, each rank projects every row onto its own
   `V / dp` slice of the replicated LM head, and each position's id is picked from the
@@ -172,6 +175,10 @@ weights layout, loader, runtime (graphs, bounded replay, guarded ops) and mono d
   instead of the fused race-and-override call). `verify_skip_unused_target_draw`: under forced
   acceptance only the noise of the target's own draw is drawn. Neither applies inside an
   owner of `v41.spec.verify_sample`, nor to an all-greedy verify (`verify_argmax_once`).
+  `context_taps_concat`: the draft's context projection (`write_context_kv`) gets the taps as
+  their BF16 concatenation, which `main_proj` quantizes itself (a copy and a `quantize_fp8`), in
+  place of the one launch that quantizes the taps where they lie (`quantize_fp8_taps`); the same
+  bytes. An owner of `v41.draft.ctx` is unaffected.
   `sampler_split_independent_noise`: a draw on independent noise is the race
   (`mixed_sample_outer_exponential`), then the greedy rows' argmax and the select, as three
   calls with the ids of the one fused call (`fused_mixed_sample`) they replace.
