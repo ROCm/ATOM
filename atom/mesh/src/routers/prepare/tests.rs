@@ -952,6 +952,7 @@ mod e_generation_payload {
             structured_output: None,
             dp_session_id: None,
             dp_parent_session_id: None,
+            chat_template: None,
         }
     }
 

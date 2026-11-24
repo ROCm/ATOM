@@ -446,6 +446,7 @@ impl Pipeline {
             headers: resp_ctx.headers.as_ref(),
             stream: resp_ctx.original.is_streaming(),
             carries_media: false,
+            chat_template: payload.chat_template.as_ref(),
         };
         self.planner
             .plan(&descriptor)

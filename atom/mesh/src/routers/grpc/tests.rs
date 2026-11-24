@@ -259,6 +259,65 @@ mod b_execute_chat {
         let p = pipeline_regular();
         _assert_signature(&p);
     }
+
+    /// A chat goes only to the ATOM workers that serve the template its prompt rendered
+    /// with, here beside one registered with another; with none of them, a retryable 503.
+    #[tokio::test]
+    async fn test_a_chat_is_placed_only_on_workers_serving_its_template() {
+        use crate::core::{
+            placement::{
+                planner::DefaultPlanner,
+                registry_adapters::{PolicyRegistryAdapter, WorkerRegistryAdapter},
+            },
+            BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker,
+        };
+
+        let ctx = shared();
+        let loaded = ctx.tokenizer_registry.get_by_name("m").unwrap().id;
+        ctx.tokenizer_inline_templates
+            .write()
+            .insert(loaded, "old".into());
+        for (url, template) in [("grpc://atom:1", "old"), ("grpc://atom:2", "new")] {
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .connection_mode(ConnectionMode::Grpc { port: None })
+                    .runtime_type(RuntimeType::Atom)
+                    .model_id("m")
+                    .label("chat_template", template)
+                    .build(),
+            );
+            ctx.worker_registry.register(worker);
+        }
+        let planner = DefaultPlanner::new(
+            Arc::new(WorkerRegistryAdapter::new(ctx.worker_registry.clone())),
+            Arc::new(PolicyRegistryAdapter::new(ctx.policy_registry.clone())),
+        );
+        let dispatcher = Arc::new(test_mocks::MockDispatcher::repeat_with_stream(|| {
+            Ok(synthetic_single_stream(scripted_chunks()))
+        }));
+        let p = test_mocks::pipeline_with(
+            Arc::new(planner),
+            dispatcher.clone(),
+            metrics_labels::BACKEND_REGULAR,
+        );
+        let chat = || p.execute_chat(chat_req(false), None, Some("m".to_string()), ctx.clone());
+        for _ in 0..8 {
+            assert_eq!(chat().await.status(), StatusCode::OK);
+        }
+        let placed: Vec<_> = dispatcher
+            .calls()
+            .into_iter()
+            .map(|c| c.worker_url)
+            .collect();
+        assert_eq!(placed, vec!["grpc://atom:1"; 8]);
+
+        ctx.worker_registry.remove_by_url("grpc://atom:1");
+        let resp = chat().await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.contains("chat_template_changed"), "{body}");
+    }
 }
 
 mod c_execute_generate {

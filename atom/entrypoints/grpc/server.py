@@ -466,8 +466,9 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
                         )
                 session.reject(refused)
         finally:
-            # Its side ended or it was cancelled: the Session ends, and its admissions
-            # settle as a cancelled submission does, not after admitting what close aborts.
+            # Its side ended or it was cancelled: what runs aborts now, and its admissions
+            # settle as a cancelled submission does, each aborted once it is enqueued.
+            session.close()
             try:
                 for item, _ in waiting:  # never started: nothing of it to settle
                     session.admitting.pop(item.seq_id, None)
