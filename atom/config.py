@@ -1012,8 +1012,11 @@ def minimax_m3_prefill_token_graph_refusal(config: "Config") -> str | None:
         return f"data_parallel_size must be 1, got {dp_size}"
 
     pp_size = int(getattr(config, "pipeline_parallel_size", 1))
-    if pp_size != 1:
-        return f"pipeline_parallel_size must be 1, got {pp_size}"
+    if pp_size != 1 and not envs.ATOM_PP_CUDAGRAPH:
+        return (
+            f"pipeline_parallel_size must be 1 without ATOM_PP_CUDAGRAPH, "
+            f"got {pp_size}"
+        )
 
     pcp_size = int(getattr(config, "prefill_context_parallel_size", 1))
     if pcp_size != 1:

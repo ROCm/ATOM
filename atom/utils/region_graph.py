@@ -43,6 +43,7 @@ from typing import Any, ClassVar
 import torch
 
 from atom.distributed.nccl_watchdog import drain_nccl_works
+from atom.models.utils import IntermediateTensors
 from atom.utils import forward_context, weak_ref_tensor, weak_ref_tensors
 from atom.utils.graph_holders import register_graph_holder
 
@@ -76,7 +77,27 @@ def _storage(t: torch.Tensor) -> int:
 
 
 def _tensors(args, kwargs):
-    return [a for a in (*args, *kwargs.values()) if isinstance(a, torch.Tensor)]
+    """The tensor arguments, those a PP stage's `IntermediateTensors` holds
+    included."""
+    tensors = []
+    for a in (*args, *kwargs.values()):
+        if isinstance(a, torch.Tensor):
+            tensors.append(a)
+        elif isinstance(a, IntermediateTensors):
+            tensors.extend(t for t in a.tensors.values() if t is not None)
+    return tensors
+
+
+def _weak_output(output):
+    """A recording's output as a replay hands it back: without storage, a
+    non-last PP stage's `IntermediateTensors` included."""
+    if output is None:
+        return None
+    if isinstance(output, IntermediateTensors):
+        return IntermediateTensors(
+            {k: weak_ref_tensor(v) for k, v in output.tensors.items()}
+        )
+    return weak_ref_tensors(output)
 
 
 def _weak(value):
@@ -251,8 +272,7 @@ class _Recorder:
                 "a recorded forward left side-stream regions unjoined; "
                 "call join_stream before the forward returns"
             )
-        weak = output if output is None else weak_ref_tensors(output)
-        return _Segments(self._steps, weak)
+        return _Segments(self._steps, _weak_output(output))
 
 
 def _record_segments(fn: Callable, *args, pool=None, **kwargs) -> tuple[_Segments, Any]:
@@ -414,8 +434,7 @@ def _record_whole(fn: Callable, *args, pool=None, **kwargs) -> tuple[_Segments, 
         capture_error_mode="thread_local",
     ):
         output = fn(*args, **kwargs)
-    weak = output if output is None else weak_ref_tensors(output)
-    return _Segments([_SegmentReplay(graph)], weak), output
+    return _Segments([_SegmentReplay(graph)], _weak_output(output)), output
 
 
 def graph_pool():
@@ -461,7 +480,7 @@ class TokenGraph:
     # graph's `_captured`, or which graphs live, clears it.
     _sizes: ClassVar[dict[str | None, tuple[int, ...]]] = {}
 
-    def __init__(self):
+    def __init__(self, inputs_of: "TokenGraph | None" = None):
         # (phase or None, bucket) -> recording.
         self._buckets: dict[tuple, tuple[_Segments, tuple, dict]] = {}
         # (phase or None, bucket) -> the phases whose record pass asked for it:
@@ -472,7 +491,10 @@ class TokenGraph:
         # shard of them (`Context.step_rows`).
         self._rows: dict[tuple, int] = {}
         # Argument position or name -> the buffer every bucket's input slices.
-        self._buffers: dict[int | str, torch.Tensor] = {}
+        # Shared with ``inputs_of`` when given: another variant of the same
+        # module (`_variant_graph`), whose replays run in stream order with
+        # this one's, so one copy-in buffer serves both.
+        self._buffers: dict = {} if inputs_of is None else inputs_of._buffers
         # The pools this records into, each retired when this goes.
         self._pools: set = set()
         type(self)._live.add(self)
@@ -569,7 +591,12 @@ class TokenGraph:
         return output
 
     def _input(self, slot, value):
-        """``value`` copied into a leading slice of ``slot``'s buffer."""
+        """``value`` copied into a leading slice of ``slot``'s buffer; each
+        tensor of an `IntermediateTensors` into a buffer of its own."""
+        if isinstance(value, IntermediateTensors):
+            return IntermediateTensors(
+                {k: self._input((slot, k), v) for k, v in value.tensors.items()}
+            )
         if not isinstance(value, torch.Tensor):
             return value
         buffer = self._buffers.get(slot)
@@ -591,12 +618,24 @@ class TokenGraph:
         segments, inputs, kw = self._buckets[
             (phase, self.key(args, kwargs) if key is None else key)
         ]
-        for src, dst in zip(
-            (*args, *kwargs.values()), (*inputs, *(kw[k] for k in kwargs))
-        ):
-            if isinstance(src, torch.Tensor) and src.data_ptr() != dst.data_ptr():
-                dst.copy_(src)
+        sources = (*args, *kwargs.values())
+        targets = (*inputs, *(kw[k] for k in kwargs))
+        if _tensors(sources[len(targets) :], {}):
+            # Passed positionally here but by name when recorded: copying
+            # nothing in would replay on the recording's stale inputs.
+            raise TypeError("a replay passes tensors its recording did not take")
+        for src, dst in zip(sources, targets):
+            _copy_in(src, dst)
         return segments.replay()
+
+
+def _copy_in(src, dst) -> None:
+    """A replay's argument into the input its recording reads."""
+    if isinstance(src, IntermediateTensors):
+        for k, t in src.tensors.items():
+            _copy_in(t, dst.tensors[k])
+    elif isinstance(src, torch.Tensor) and src.data_ptr() != dst.data_ptr():
+        dst.copy_(src)
 
 
 class ReqGraph(TokenGraph):
@@ -660,17 +699,34 @@ def _phase() -> str | None:
     return "decode"
 
 
+def _variant_graph(owner, variant: int) -> TokenGraph:
+    """``owner``'s `TokenGraph` for ``variant`` (`ForwardContext.
+    token_graph_variant`): the step's copy of the staging buffers its segments
+    read, one per PP in-flight slot. Variant 0 is the one every other
+    deployment records and replays; another records its own segments, so each
+    bakes its own slot's addresses, and shares variant 0's input buffers. A
+    bucket a variant lacks runs eagerly (`_run_token_graph`)."""
+    graph = owner.__dict__.get("_token_graph")
+    if graph is None:
+        graph = owner.__dict__["_token_graph"] = TokenGraph()
+    if variant == 0:
+        return graph
+    variants = owner.__dict__.setdefault("_token_graph_variants", {})
+    if variant not in variants:
+        variants[variant] = TokenGraph(inputs_of=graph)
+    return variants[variant]
+
+
 def _run_token_graph(owner, forward: Callable, args, kwargs, per_phase=False):
     """``owner``'s forward under the step's graph mode
     (`ForwardContext.tr_graph`): recorded once per token bucket (and phase,
     when ``per_phase``) in a "record" pass, replayed where its bucket was
     recorded in a "replay" one, and run directly otherwise."""
-    mode = getattr(forward_context.get_forward_context(), "tr_graph", None)
+    fc = forward_context.get_forward_context()
+    mode = getattr(fc, "tr_graph", None)
     if mode is None or _recorder() is not None:
         return forward(*args, **kwargs)
-    graph = owner.__dict__.get("_token_graph")
-    if graph is None:
-        graph = owner.__dict__["_token_graph"] = TokenGraph()
+    graph = _variant_graph(owner, getattr(fc, "token_graph_variant", 0))
     key = TokenGraph.key(args, kwargs)
     phase = _phase() if per_phase else None
     if graph.has(key, phase):

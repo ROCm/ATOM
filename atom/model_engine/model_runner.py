@@ -1701,10 +1701,12 @@ class ModelRunner:
             logger.info("forward_vars ring: 1 slot (staging reuse gated on its H2D)")
             return
 
-        assert self.enforce_eager, (
+        assert self.enforce_eager or envs.ATOM_PP_CUDAGRAPH, (
             "pipeline_parallel_size > 1 requires eager execution "
             "(--enforce-eager): the forward_vars ring swaps metadata "
-            "buffers per microbatch, which is incompatible with CUDAGraph replay."
+            "buffers per microbatch, so a graph recorded on one slot reads "
+            "the wrong one on replay. ATOM_PP_CUDAGRAPH=1 records one set "
+            "of prefill token graphs per slot instead."
         )
 
         def _clone_slot(src: dict) -> dict:
@@ -1803,7 +1805,13 @@ class ModelRunner:
         """
         if len(self._fv_ring) == 1:
             return
-        self._fv_idx = (self._fv_idx + 1) % len(self._fv_ring)
+        self._select_forward_vars((self._fv_idx + 1) % len(self._fv_ring))
+
+    def _select_forward_vars(self, index: int) -> None:
+        """Make ring slot ``index`` the one the next forward stages into and
+        reads (and the token graphs it records or replays,
+        `ForwardContext.token_graph_variant`)."""
+        self._fv_idx = index
         # Select the slot now; _gate_staging_reuse waits on its existing event
         # before any producer writes. Avoid waiting twice on the same event.
         self.forward_vars = self._fv_ring[self._fv_idx]
@@ -2891,6 +2899,7 @@ class ModelRunner:
             spec_decode_metadata=spec_decode_metadata,
             ubatch_slices=forward_mode.ubatch_slices,
             ub_tokens_across_dp=sync.ub_tokens_across_dp,
+            token_graph_variant=self._fv_idx,
         )
 
     @h2d_producer("sampling")
@@ -4525,6 +4534,18 @@ class ModelRunner:
         # this deployment can actually schedule (see the bound below).
         self.capture_sizes = self.config.capture_sizes
         self.capture_sizes.sort(reverse=True)
+        pp_graphs = len(self._fv_ring) > 1
+        if pp_graphs:
+            # ATOM_PP_CUDAGRAPH: only prefill token graphs, one set per ring
+            # slot (`_record_tr_graphs`). A decode request graph would need the
+            # same per-slot recording and a static receive buffer; an empty
+            # ladder leaves every decode on the eager path (`ForwardMode`).
+            logger.info(
+                "PP CUDA graphs: recording prefill token graphs for %d "
+                "forward_vars slots; decode runs eagerly.",
+                len(self._fv_ring),
+            )
+            self.capture_sizes = []
 
         # Drop any capture size the scheduler could never produce. `schedule_decode`
         # bounds a decode batch two ways: at most `max_num_seqs` sequences, and at
@@ -4571,7 +4592,7 @@ class ModelRunner:
                 max_bs,
                 self.capture_sizes,
             )
-        assert self.capture_sizes, (
+        assert self.capture_sizes or pp_graphs, (
             f"no cudagraph capture sizes left: the scheduler can only reach "
             f"bs <= min(max_num_seqs={max_seq_bs}, "
             f"max_num_batched_tokens={self.config.max_num_batched_tokens} // "
@@ -4910,7 +4931,15 @@ class ModelRunner:
             return
         if self.attn_metadata_builder.supports_token_graph:
             self._record_tr_graphs()
-        self._record_prefill_req_graphs()
+        if len(self._fv_ring) > 1:
+            # A request graph is one whole recording of slot 0's buffers.
+            if self.attn_metadata_builder.prefill_req_graph_sizes:
+                logger.warning(
+                    "PP CUDA graphs: prefill request graphs are not recorded "
+                    "per forward_vars slot; those prefills run eagerly."
+                )
+        else:
+            self._record_prefill_req_graphs()
         reset_forward_context()
         # The recording forwards' eager halves cached activations outside the
         # graphs' pool; nothing holds them now.
@@ -4927,22 +4956,35 @@ class ModelRunner:
         sizes = sorted(
             {n for n in envs.ATOM_TOKEN_GRAPH_SIZES if 0 < n <= limit}, reverse=True
         )
+        current = self._fv_idx
         for running_tokens in sizes:
             # Every rank records this bucket at once and replays it only
             # together, a decoding rank included (`ForwardMode.
             # _pad_to_token_graph`), so the recording's collectives -- the
             # MoE's DP exchange among them -- are sized for every rank at it.
             self.running_tokens_per_dp_rank.fill(running_tokens)
-            # A fresh step for each pass: a replaying forward spends its
-            # step's indptrs on the tail (`rows_of`).
-            for mode in (None, "record"):
-                self._run_capture_prefill(
-                    *self._build_capture(
-                        builder.build_for_token_graph_capture, running_tokens
-                    ),
-                    mode,
-                )
+            # One recording per forward_vars slot: a segment reads the staging
+            # buffers of the slot it was recorded on (the step's
+            # `scheduled_tokens_gpu` among them), and a PP step replays its
+            # own slot's (`ForwardContext.token_graph_variant`). One slot
+            # without PP.
+            for slot in range(len(self._fv_ring)):
+                self._select_forward_vars(slot)
+                if slot != current:
+                    self.h2d_owner.begin()
+                    builder.blank_cache_write_targets()
+                    self.h2d_owner.finish()
+                # A fresh step for each pass: a replaying forward spends its
+                # step's indptrs on the tail (`rows_of`).
+                for mode in (None, "record"):
+                    self._run_capture_prefill(
+                        *self._build_capture(
+                            builder.build_for_token_graph_capture, running_tokens
+                        ),
+                        mode,
+                    )
             torch.cuda.synchronize()
+        self._select_forward_vars(current)
         if sizes and self.rank == 0:
             logger.info(
                 "Token graphs recorded for prefill buckets %s",
@@ -5002,11 +5044,22 @@ class ModelRunner:
             context=context,
             running_tokens_per_dp_rank=self.running_tokens_per_dp_rank,
             in_hipgraph=True,
+            token_graph_variant=self._fv_idx,
         )
         get_forward_context().tr_graph = mode
+        kwargs = {}
+        pp_group = get_pp_group()
+        if pp_group.world_size > 1 and not pp_group.is_first_rank:
+            # What the previous stage hands over; the recording reads its own
+            # copy (`TokenGraph._input`), which a replay copies the received
+            # tensors into.
+            kwargs["intermediate_tensors"] = self.model.make_empty_intermediate_tensors(
+                context.scheduled_tokens, self.config.torch_dtype, self.device
+            )
         self.model(
             self.forward_vars["input_ids"].gpu[: context.scheduled_tokens],
             context.positions,
+            **kwargs,
         )
 
     @torch.inference_mode()

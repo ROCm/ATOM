@@ -921,6 +921,10 @@ class ForwardContext:
     # replays a token bucket, None everywhere else -- a module with no
     # recording for its rows then runs as it always did.
     tr_graph: str | None = None
+    # Which of a module's `TokenGraph`s the step records or replays
+    # (`region_graph._variant_graph`): the PP forward_vars ring slot whose
+    # staging buffers the step reads (`ModelRunner._fv_idx`), 0 without PP.
+    token_graph_variant: int = 0
 
     def __post_init__(self):
         if not hasattr(self, "no_compile_layers") or self.no_compile_layers is None:
@@ -1082,6 +1086,7 @@ def set_forward_context(
     in_hipgraph: bool = False,
     ub_max_tokens_across_dp: tuple | None = None,
     ub_tokens_across_dp: tuple | None = None,
+    token_graph_variant: int = 0,
 ) -> None:
     """``running_tokens_per_dp_rank``: the rows every DP rank's forward runs,
     this rank's included (`DPMetadata.gather_running_tokens` when only that
@@ -1113,6 +1118,7 @@ def set_forward_context(
         tr_graph=(
             "replay" if forward_mode is not None and forward_mode.token_graph else None
         ),
+        token_graph_variant=token_graph_variant,
     )  # _forward_context.attn_metadata = attn_metadata
     # _forward_context.no_compile_layers = atom_config.compilation_config.static_forward_context
     # _forward_context = ForwardContext(no_compile_layers=atom_config.compilation_config.static_forward_context, attn_metadata=attn_metadata)
