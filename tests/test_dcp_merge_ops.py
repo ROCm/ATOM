@@ -2097,7 +2097,10 @@ def test_speculative_dcp_decode_refuses_without_a_persistent_kernel(monkeypatch)
     monkeypatch.setattr(
         attention_mla_module,
         "get_current_atom_config",
-        lambda: SimpleNamespace(speculative_config=spec),
+        lambda: SimpleNamespace(
+            speculative_config=spec,
+            dspark=SimpleNamespace(confidence_schedule=False),
+        ),
     )
     _ask_aiter(monkeypatch, 16)
     monkeypatch.setattr(
@@ -2116,15 +2119,26 @@ def test_speculative_dcp_decode_refuses_without_a_persistent_kernel(monkeypatch)
 
 
 def _spec_dcp_layer(
-    monkeypatch, *, causal=True, sparse=False, decode_query_len=0, k=4, num_heads=8
+    monkeypatch,
+    *,
+    causal=True,
+    sparse=False,
+    decode_query_len=0,
+    k=4,
+    num_heads=8,
+    schedule=False,
 ):
-    """A bare MLAAttention under speculative decode with k drafted tokens
-    (verify q = k + 1)."""
+    """A bare MLAAttention under native speculative decode with k drafted tokens
+    (verify q = k + 1), with DSpark's confidence_schedule on or off."""
     spec = SimpleNamespace(num_speculative_tokens=k)
     monkeypatch.setattr(
         attention_mla_module,
         "get_current_atom_config",
-        lambda: SimpleNamespace(speculative_config=spec, max_num_batched_tokens=16384),
+        lambda: SimpleNamespace(
+            speculative_config=spec,
+            max_num_batched_tokens=16384,
+            dspark=SimpleNamespace(confidence_schedule=schedule),
+        ),
     )
     monkeypatch.setattr(
         attention_mla_module, "mla_dcp_decode_shape_support", _no_shape()
@@ -2191,8 +2205,8 @@ def test_speculative_dcp_decode_refuses_when_aiter_names_no_width(monkeypatch):
     with pytest.raises(
         ValueError,
         match=r"persistent round-robin MLA decode for 16 gathered query heads at "
-        r"every query length the layer decodes \(1, 2, 3, 4, 5\) .*aiter on gfx942: "
-        r"q=1: no persistent decode kernel",
+        r"every query length the layer decodes \(1, 5\) .*aiter on gfx942: q=1: "
+        r"no persistent decode kernel",
     ) as err:
         layer._configure_dcp_decode_head_padding(2)
     assert "num_speculative_tokens" not in str(err.value)
@@ -2254,20 +2268,20 @@ def test_draft_builder_plans_the_width_its_layers_pad_to(monkeypatch, rules, k):
     )
 
 
-# Q head counts aiter's get_mla_decode_num_heads pads to.
-_AITER_PAD_WIDTHS = (16, 32, 64, 96, 128)
-
-
 def _use_aiter_rules(monkeypatch, runs):
     """Faithful stand-ins for aiter's two answers the width logic reads, from
     one rule: ``runs(width, q)``, whether aiter runs ``width`` gathered heads
     persistent at ``q`` rows with the LSE the DCP merge reads.
-    get_mla_decode_num_heads is aiter's own loop over it (the requested count,
-    then each kernel head count above it); dcp_persistent_supported is its
-    one-row answer."""
+    get_mla_decode_num_heads is aiter's own loop over it: the requested count
+    where mla_decode_fwd dispatches it at all (16, or a multiple of 16 up to
+    128), then each kernel head count above it, from aiter's own list
+    (``MLA_DECODE_KERNEL_HEAD_COUNTS``), so it never answers a count no aiter
+    does (65, 129). dcp_persistent_supported is its one-row answer."""
+    counts = attention_mla_module.MLA_DECODE_KERNEL_HEAD_COUNTS
 
     def get_mla_decode_num_heads(heads, q, *_args, **_kwargs):
-        for width in sorted({heads, *(w for w in _AITER_PAD_WIDTHS if w > heads)}):
+        dispatched = {heads} if heads <= 128 and heads % 16 == 0 else set()
+        for width in sorted(dispatched | {w for w in counts if w > heads}):
             if runs(width, q):
                 return width
         return None
@@ -2285,15 +2299,28 @@ def _use_aiter_rules(monkeypatch, runs):
 
 @needs_dcp_ops
 @pytest.mark.parametrize(
-    "k,expected", [(0, (1,)), (1, (1, 2)), (3, (1, 2, 3, 4))], ids=["no_spec", "1", "3"]
+    "plugin,schedule,k,expected",
+    [
+        (False, False, 0, (1,)),
+        (False, False, 1, (1, 2)),
+        (False, False, 3, (1, 4)),
+        (True, False, 3, (1, 2, 3, 4)),
+        (False, True, 3, (1, 2, 3, 4)),
+    ],
+    ids=["no_spec", "native_k1", "native_k3", "plugin", "confidence_schedule"],
 )
-def test_dense_layer_decodes_at_every_length(k, expected):
-    """A dense causal layer under speculative decode runs every length from 1
-    to k + 1: the verify, the one-row MTP draft steps, and shorter verifies
-    (vLLM plugin requests verifying fewer drafted tokens, DSpark's
-    confidence_schedule buckets)."""
+def test_dense_layer_decode_query_lens(monkeypatch, plugin, schedule, k, expected):
+    """A dense causal layer under native speculative decode runs the verify's
+    k + 1 and the one-row MTP draft steps only: native MTP / Eagle, and DSpark
+    without confidence_schedule, verify all k drafted tokens every step. Every
+    length from 1 to k + 1 only where shorter verifies run: vLLM plugin
+    requests verifying fewer drafted tokens, DSpark's confidence_schedule
+    buckets."""
+    monkeypatch.setattr(attention_mla_module, "is_plugin_mode", lambda: plugin)
     spec = SimpleNamespace(num_speculative_tokens=k) if k else None
-    config = SimpleNamespace(speculative_config=spec)
+    config = SimpleNamespace(
+        speculative_config=spec, dspark=SimpleNamespace(confidence_schedule=schedule)
+    )
     assert attention_mla_module.mla_dcp_decode_query_lens(config) == expected
 
 
@@ -2304,7 +2331,7 @@ def test_mtp_dcp_refuses_where_no_width_has_lse_at_one_row(
 ):
     """Dense MLA, MTP k=2, DCP8, where aiter runs every width past one row but
     none at one row with the final LSE the DCP merge reads (the one-row MTP
-    draft steps would merge garbage). The width is decided over every length:
+    draft steps would merge garbage). The width is decided over both lengths:
     not persistent, and the verify is refused -- never persistent at one row
     on a route without LSE."""
     _use_aiter_rules(monkeypatch, runs=lambda width, q: q > 1)
@@ -2318,20 +2345,20 @@ def test_mtp_dcp_refuses_where_no_width_has_lse_at_one_row(
     )
     assert (
         attention_mla_module.mla_dcp_persistent_width(
-            num_heads, 8, 16, kv_cache_dtype="fp8", query_lens=(1, 2, 3)
+            num_heads, 8, 16, kv_cache_dtype="fp8", query_lens=(1, 3)
         )
         is None
     )
     with pytest.raises(
-        ValueError, match=r"every query length the layer decodes \(1, 2, 3\)"
+        ValueError, match=r"every query length the layer decodes \(1, 3\)"
     ):
         layer._configure_dcp_decode_head_padding(8)
 
 
 @needs_dcp_ops
 def test_mtp_dcp_stays_persistent_where_every_length_shares_a_width(monkeypatch):
-    """96 gathered heads that run at every length from 1 to the 5-row verify:
-    one persistent width for all of them, no refusal."""
+    """96 gathered heads that run at one row and at the 5-row verify: one
+    persistent width for both, no refusal."""
     _use_aiter_rules(monkeypatch, runs=lambda width, q: True)
     layer = _spec_dcp_layer(monkeypatch, k=4, num_heads=12)
     layer._configure_dcp_decode_head_padding(8)
@@ -2403,6 +2430,30 @@ def test_mtp_dcp_layer_pads_past_a_one_row_route_without_lse(monkeypatch, num_he
     layer._configure_dcp_decode_head_padding(8)
     assert layer.dcp_persistent_supported is True
     assert layer.dcp_kernel_num_heads == 96
+
+
+@needs_dcp_ops
+@pytest.mark.parametrize(
+    "num_heads,schedule,expected",
+    [(2, False, 16), (6, False, 48), (2, True, 32), (6, True, 64)],
+    ids=["16_native", "48_native", "16_schedule", "48_schedule"],
+)
+def test_native_mtp_keeps_the_gathered_width_where_only_a_short_verify_pads(
+    monkeypatch, num_heads, schedule, expected
+):
+    """gfx950 fp8 (not experimental), MTP k = 2, DCP8, 16 or 48 gathered heads:
+    aiter has no lse + round-robin kernel at 2 rows for those widths. Native
+    MTP never decodes 2 rows (only the 3-row verify and 1-row draft steps), so
+    the layer keeps the gathered width. DSpark's confidence_schedule adds the
+    2-row verify, and only then does the layer pad, to 32 / 64."""
+    _use_aiter_rules(
+        monkeypatch,
+        runs=lambda width, q: (width, q) not in _GFX950_FP8_NO_LSE_CPRR_KERNEL,
+    )
+    layer = _spec_dcp_layer(monkeypatch, k=2, num_heads=num_heads, schedule=schedule)
+    layer._configure_dcp_decode_head_padding(8)
+    assert layer.dcp_persistent_supported is True
+    assert layer.dcp_kernel_num_heads == expected
 
 
 @needs_dcp_ops

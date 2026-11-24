@@ -597,8 +597,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # draft plans its own descriptors (DSparkProposer). Sparse / DSA layers
         # decode and run MTP verify as per-token q_len=1 rows (no round-robin
         # KV), so they plan that call, as their layers size it. Dense layers
-        # plan every query length they run, 1 to k + 1: the one-row MTP draft
-        # steps reuse this plan (prepare_mtp_decode).
+        # plan every query length they run (mla_dcp_decode_query_lens): the
+        # verify, the one-row MTP draft steps, which reuse this plan
+        # (prepare_mtp_decode), and any shorter verifies.
         query_lens = (1,) if self.is_sparse else mla_dcp_decode_query_lens(config)
         dcp_persistent = (
             mla_dcp_persistent_width(

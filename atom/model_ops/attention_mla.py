@@ -34,7 +34,7 @@ except ImportError:
 from aiter.dist.parallel_state import get_dp_group, get_tensor_model_parallel_rank
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
-from aiter.ops.attention import get_mla_decode_num_heads
+from aiter.ops.attention import MLA_DECODE_KERNEL_HEAD_COUNTS, get_mla_decode_num_heads
 from aiter.ops.triton.attention.mla import mla_decode_fwd as triton_mla_decode_fwd
 from aiter.ops.triton.fusions.fused_kv_cache import (
     fused_qk_rope_cat_and_cache_mla as triton_fused_qk_rope_cat_and_cache_mla,
@@ -90,6 +90,7 @@ from atom.model_ops.utils import (
     get_and_maybe_dequant_weights,
     quant_fp8_per_tensor,
 )
+from atom.plugin import is_plugin_mode
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import (
@@ -328,17 +329,26 @@ def mla_dcp_decode_query_len(atom_config) -> int:
 
 
 def mla_dcp_decode_query_lens(atom_config) -> tuple[int, ...]:
-    """Every query length a dense causal layer's DCP decode runs at: 1 without
-    speculative decode, every length from 1 to k + 1 with k drafted tokens. The
-    verify takes k + 1 rows; the MTP draft steps after the first run one row per
-    sequence on layers of the same kind (``deepseek_mtp`` builds
-    ``DeepseekV2DecoderLayer``), on the target's persistent work plan
-    (``prepare_mtp_decode``); and a decode batch also carries shorter verifies
-    (requests verifying fewer drafted tokens under the vLLM plugin, DSpark's
-    ``confidence_schedule`` buckets). The layer and the metadata builders size
-    the gathered width from this one set, so they agree on it.
+    """Every query length a dense causal layer's DCP decode runs at.
+
+    Without speculative decode, 1. With k drafted tokens, the verify's k + 1 and
+    1: the MTP draft steps after the first run one row per sequence on layers of
+    the same kind (``deepseek_mtp`` builds ``DeepseekV2DecoderLayer``), on the
+    target's persistent work plan (``prepare_mtp_decode``). Native MTP / Eagle,
+    and DSpark without ``confidence_schedule``, verify all k drafted tokens on
+    every step (``num_spec_step`` is k; DSpark's ``apply_q_bucket`` is a no-op
+    without the schedule). Every length from 1 to k + 1 only where a decode batch
+    also carries shorter verifies: under the vLLM plugin (requests verifying
+    fewer drafted tokens) and with DSpark's ``confidence_schedule`` (its
+    per-step q buckets). The layer and the metadata builders size the gathered
+    width from this one set, so they agree on it.
     """
-    return tuple(range(1, mla_dcp_decode_query_len(atom_config) + 1))
+    verify = mla_dcp_decode_query_len(atom_config)
+    if verify == 1:
+        return (1,)
+    if is_plugin_mode() or atom_config.dspark.confidence_schedule:
+        return tuple(range(1, verify + 1))
+    return (1, verify)
 
 
 def _layer_dcp_decode_query_lens(layer) -> tuple[int, ...]:
@@ -398,11 +408,6 @@ def _persistent_multi_token_num_heads(
     )
 
 
-# Q head counts aiter's MLA decode kernels are built for: the counts its
-# get_mla_decode_num_heads pads a query to.
-_MLA_DECODE_PAD_WIDTHS = (16, 32, 64, 96, 128)
-
-
 def _persistent_width(
     gathered: int,
     query_lens: tuple[int, ...],
@@ -446,7 +451,7 @@ def _persistent_width(
         )
 
     widest = max(named.values())
-    for width in (widest, *(w for w in _MLA_DECODE_PAD_WIDTHS if w > widest)):
+    for width in (widest, *(w for w in MLA_DECODE_KERNEL_HEAD_COUNTS if w > widest)):
         if all(runs(width, q) for q in lens):
             return width
     return None
@@ -1203,8 +1208,8 @@ class MLAAttention(nn.Module):
             )
         # Whether aiter runs this layer's DCP decode persistent, at one width
         # the persistent path gathers to for every call this layer makes: a
-        # dense layer under speculative decode decodes every length from 1 to
-        # k + 1 on the same width.
+        # dense layer under speculative decode decodes the verify, the one-row
+        # draft steps and any shorter verifies on the same width.
         query_lens = _layer_dcp_decode_query_lens(self)
         max_seqlen_q = max(query_lens)
         self.dcp_persistent_supported = (

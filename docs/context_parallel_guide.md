@@ -552,7 +552,8 @@ Tips:
 - `--kv_cache_dtype fp8` further lowers KV memory; DCP uses a per-tensor scale
   (per-token / per-group fp8 layouts are not yet supported).
 - **MTP under DCP needs a persistent decode aiter serves at every query length
-  the layer runs** (every length from 1 to k + 1): gfx950, or
+  the layer runs** (the verify's k + 1 and the one-row draft steps; every length
+  from 1 to k + 1 under the vLLM plugin or DSpark's `confidence_schedule`): gfx950, or
   gfx1250 with `AITER_MLA_DECODE_PS1_FLYDSL=1` below 128 gathered heads (PS1
   takes 128 heads at one query row only, so e.g. DeepSeek-R1 at `-tp 8 -dcp 8`
   is refused there). Sparse / DSA layers with MTP under DCP are gfx950-only.
@@ -595,22 +596,29 @@ memory DCP frees on K3 is the MLA share only, not the whole attention footprint.
 
 **Query-head width is the K3-specific constraint.** K3 has 96 query heads, so at
 `-tp 8` each rank owns 12 and the DCP decode gathers `12 × dcp`: 24 at dcp2, 48
-at dcp4, 96 at dcp8. aiter's `mla_decode_fwd` dispatches natively on 16 / 32 / 64
-/ 128 heads only; the remaining multiples of 16 (48, 80, 96, 112) are folded onto
-the 16-head kernel, and that fold reinterprets head groups as extra sequence rows
-(`total_s *= ori_nhead // 16`) without touching `kv_indptr`, which desynchronises
-the row-to-global-position mapping the round-robin causal mask depends on. So the
-**gathered** width is padded up to the next natively dispatched one (24 → 32,
-48 → 64, 96 → 128) by `mla_dcp_kernel_num_heads`. The pad lives entirely inside
-`_forward_decode` — applied after the all-gather and stripped before the
-cross-rank LSE combine — so it never costs collective traffic. Under speculative
-decode a layer decodes every query length from 1 to k + 1 and instead pads to one
-width that runs at all of them: the widest aiter names for those calls
-(`get_mla_decode_num_heads`, 96 included), or else the next kernel head count
-that runs at every length; where there is none, speculative decode + DCP refuses
-at model construction. At one query row, widths past 128 have no kernel and abort
-in `mla_decode_fwd` (ATOM warns at model construction); lower `-dcp` or raise
-`-tp` if you hit it.
+at dcp4, 96 at dcp8. Which width the decode runs at is picked on the **gathered**
+width by `mla_dcp_kernel_num_heads`, and depends on the decode:
+
+- **One query row, persistent:** the gathered width as is, up to 128: a dedicated
+  kernel where the route has one, else a fold onto the 16-head kernel. So K3 at
+  `-tp 8 -dcp 8` decodes at 96.
+- **One query row, non-persistent:** there is no fold, so the width is padded onto
+  one with its own kernel: 16 / 32 / 128 with bf16 KV, 16 / 128 with fp8 KV (64 is
+  excluded on both). 24 → 32 (bf16) or 128 (fp8); 48 and 96 → 128.
+- **More than one query row (speculative decode):** the fold reinterprets head
+  groups as extra sequence rows (`total_s *= ori_nhead // 16`) without touching
+  `kv_indptr`, which would desynchronise the row-to-global-position mapping the
+  round-robin causal mask depends on. So the layer pads to one width that runs at
+  every query length it decodes (see
+  [DCP + Speculative Decode](#dcp--speculative-decode-mtp--dspark)): the widest
+  aiter names for those calls (`get_mla_decode_num_heads`, 96 included), or else
+  the next kernel head count that runs at every length. Where there is none,
+  speculative decode + DCP refuses at model construction.
+
+The pad lives entirely inside `_forward_decode` — applied after the all-gather and
+stripped before the cross-rank LSE combine — so it never costs collective traffic.
+Widths past 128 have no kernel and abort in `mla_decode_fwd` (ATOM warns at model
+construction); lower `-dcp` or raise `-tp` if you hit it.
 
 DeepSeek-R1 never needed this: 128 heads at `-tp 8` is 16 per rank, and the dcp8
 gather lands on 128 exactly.
@@ -696,7 +704,7 @@ sharded index cache, so there is no intra-block mask to place.
 
 | | Supported |
 |---|---|
-| GPU arch | Dense MLA: gfx950 (`cprr` kernel), or gfx1250 with `AITER_MLA_DECODE_PS1_FLYDSL=1` (PS1 kernel, which takes `g_kv_indptr`); both persistent-only, and gfx942 has no such kernel. The width must run at every query length the layer decodes (every length from 1 to k + 1), so on gfx1250, where PS1 takes 128 heads at one row only, 128 gathered heads (e.g. DeepSeek-R1 at `-tp 8 -dcp 8`) is refused. Needs `ATOM_MLA_PAGE_SIZE <= 1`. Sparse / DSA: gfx950 only |
+| GPU arch | Dense MLA: gfx950 (`cprr` kernel), or gfx1250 with `AITER_MLA_DECODE_PS1_FLYDSL=1` (PS1 kernel, which takes `g_kv_indptr`); both persistent-only, and gfx942 has no such kernel. The width must run at every query length the layer decodes (the verify's k + 1 and the one-row draft steps; every length from 1 to k + 1 under the vLLM plugin or DSpark's `confidence_schedule`), so on gfx1250, where PS1 takes 128 heads at one row only, 128 gathered heads (e.g. DeepSeek-R1 at `-tp 8 -dcp 8`) is refused. On gfx950, `AITER_MLA_USE_OPUS=1` refuses it too: the one-row decode then routes to opus, which ATOM does not count as a persistent decode with the merge's LSE. Needs `ATOM_MLA_PAGE_SIZE <= 1`. Sparse / DSA: gfx950 only |
 | Method | `--method mtp` (dense MLA: `num_speculative_tokens` 1, 2, or 3 validated above; sparse / DSA has no runtime bound and the [GLM-5.2 recipe](../recipes/Agentic-GLM-5.2.md) runs it at 4 and 5 — see the Model row) |
 | KV cache dtype | **bf16 and fp8** both work for all of `num_speculative_tokens` 1/2/3 (dense MLA) |
 | DCP size | dcp2 / dcp4 / dcp8 all validated (`tp8`, dense MLA) |
@@ -715,11 +723,13 @@ Plugin path (`vllm serve`): add `--speculative-config '{"method":"mtp","num_spec
 
 > **Not on gfx942.** Speculative decode + DCP raises at model construction
 > wherever aiter has no persistent decode for the layer's gathered head width at
-> every query length it runs, 1 to k + 1
+> every query length it runs — the verify's k + 1 and the one-row draft steps
 > (`MLAAttention._configure_dcp_decode_head_padding`). On gfx942 the
 > non-persistent decode fallback ignores the `cprr` masking and would silently
 > produce wrong output, so it is rejected rather than run; on gfx1250 the same
-> refusal covers 128 gathered heads. Sparse / DSA layers never take `cprr` and
+> refusal covers 128 gathered heads, and on gfx950 it covers
+> `AITER_MLA_USE_OPUS=1` (the one-row decode routes to opus, which ATOM does not
+> count as persistent). Sparse / DSA layers never take `cprr` and
 > are refused off gfx950, where this path is not validated. Disable either DCP
 > or speculative decode there.
 
@@ -776,7 +786,7 @@ MLA rows; see the [recipe](../recipes/DSpark.md)).
 | fp8 KV cache | Supported, **per-tensor scale only** (per-token / per-group not supported) |
 | prefix caching / chunked prefill | Supported (dense and sparse / DSA). On **Kimi-K3** the validated configuration has prefix caching **off**, per its recipe |
 | Kimi-K3 KDA layers | Not sharded — the KDA recurrent state is per-request, not paged, so DCP frees only the MLA share of attention memory |
-| Kimi-K3 gathered head width | One query row: padded to a natively dispatched MLA width (16 / 32 / 64 / 128); past 128 there is no kernel and `mla_decode_fwd` aborts (ATOM warns at model construction). Speculative decode: one width that runs at every query length the layer decodes (the target 1 to k + 1, the DSpark draft block its width T): the widest aiter names (96 included), or else the next kernel head count that runs at all of them; where there is none, speculative decode + DCP refuses at model construction. Lower `-dcp` or raise `-tp` |
+| Kimi-K3 gathered head width | One query row: a persistent decode keeps the gathered width up to 128 (96 at `-tp 8 -dcp 8`); a non-persistent one pads to 16 / 32 / 128 (bf16 KV) or 16 / 128 (fp8 KV). Past 128 there is no kernel and `mla_decode_fwd` aborts (ATOM warns at model construction). Speculative decode: one width that runs at every query length the layer decodes (the target's verify and one-row draft steps, plus every shorter verify with DSpark's `confidence_schedule`; the DSpark draft block its width T): the widest aiter names (96 included), or else the next kernel head count that runs at all of them; where there is none, speculative decode + DCP refuses at model construction. Lower `-dcp` or raise `-tp` |
 | gathered head width 64 | Native sparse / DSA prefill on the `q` transport (bf16 KV, or fp8 KV with `ATOM_DCP_SPARSE_PREFILL=q` or a step `auto` keeps on `q`) and q_len=1 decode (fp8 KV) rebuild persistent metadata, where aiter runs DCP decode persistent (validated on gfx950), per full IndexShare layer and run gqa64 directly; unsupported non-persistent paths still pad to 128 — see [Sparse DCP persistent attention and gqa=64](#sparse-dcp-persistent-attention-and-gqa64) |
 | speculative decode (MTP), dense MLA | Supported on gfx950 (bf16/fp8, `num_speculative_tokens` 1–3); gfx1250 takes the same persistent PS1 path with `AITER_MLA_DECODE_PS1_FLYDSL=1` but is not validated; raises at model construction where aiter has no persistent kernel at every query length the layer runs (gfx942; gfx1250 at 128 gathered heads, e.g. DeepSeek-R1 `-tp 8 -dcp 8`) |
 | speculative decode (DSpark), Kimi-K3 | Supported on gfx950, and on gfx1250 with `AITER_MLA_DECODE_PS1_FLYDSL=1` (TP8 + DCP8 on two MI455X nodes; with ROCm/aiter#7913 the 64-head draft runs unpadded); needs ROCm/aiter#8181 on every arch; validated at `tp8 -dcp 8` with `num_speculative_tokens 2` (Inferact MLA draft) and 5 (RadixArk DSpark GQA draft, which runs outside the DCP group); on gfx1250 validated at `tp8 -dcp 8` with `num_speculative_tokens 4` |
