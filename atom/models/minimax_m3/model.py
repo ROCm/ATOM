@@ -24,7 +24,6 @@ from transformers import PretrainedConfig
 
 from atom.config import Config, QuantizationConfig, get_current_atom_config
 from atom.distributed.indexer_cp import indexer_cp_enabled
-from atom.distributed.ulysses_sp import local_num_kv_heads
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.attention_mha import SparseMHAPagedAttentionImpl
 from atom.model_ops.base_attention import (
@@ -32,7 +31,6 @@ from atom.model_ops.base_attention import (
     _flydsl_arch_supported,
     _flydsl_explicit_plan_api,
     _flydsl_output_quant_api,
-    _flydsl_plan_max_batch,
 )
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import (
@@ -135,7 +133,11 @@ def _get_text_config(config: PretrainedConfig) -> PretrainedConfig:
 def _validate_sparse_flydsl_config(
     atom_config: Config, config: PretrainedConfig
 ) -> None:
-    """Reject gfx1250 M3 sparse PA configurations that cannot be served."""
+    """Reject gfx1250 M3 sparse PA configurations that cannot be served.
+
+    Any ``max_num_batched_tokens`` is: the sparse attention runs rows past one
+    FlyDSL plan (tokens x local KV heads, e.g. PP x TP1) in chunks
+    (``flydsl_row_chunks``)."""
     if not _sparse_attention_layer_ids(config) or pa_decode_gluon_supports_arch():
         return
     if not envs.ATOM_PA_FLYDSL:
@@ -152,18 +154,6 @@ def _validate_sparse_flydsl_config(
         raise ValueError(
             "MiniMax-M3 sparse paged attention requires aiter's FlyDSL "
             "explicit-plan API (#5809) because there is no gluon fallback"
-        )
-    local_kv_heads = local_num_kv_heads(int(config.num_key_value_heads))
-    max_tokens = int(atom_config.max_num_batched_tokens)
-    max_rows = max_tokens * local_kv_heads
-    plan_limit = _flydsl_plan_max_batch()
-    if max_rows > plan_limit:
-        raise ValueError(
-            "MiniMax-M3 sparse paged attention can schedule at most "
-            f"{plan_limit} FlyDSL rows, but max_num_batched_tokens "
-            f"({max_tokens}) * local num_kv_heads ({local_kv_heads}) "
-            f"= {max_rows}; lower --max-num-batched-tokens to at most "
-            f"{plan_limit // local_kv_heads}"
         )
 
 

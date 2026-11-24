@@ -410,7 +410,8 @@ def _flydsl_plan_max_batch() -> int:
     gfx1250 only, where sparse decode has no gluon to fall back to: past
     _FLYDSL_PLAN_MAX_BATCH a plan sets max_batch_size (aiter #6462), bounded by
     the planner's LDS: the 16-byte-rounded task_ends array plus scan storage
-    must fit one block (81792 sequences on gfx1250).
+    must fit one block (81792 sequences on gfx1250). Sparse callers past it
+    split their rows with ``flydsl_row_chunks``.
     """
     import inspect
 
@@ -427,6 +428,24 @@ def _flydsl_plan_max_batch() -> int:
     ).shared_memory_per_block
     by_lds = (lds - _FLYDSL_PLAN_SCAN_LDS_BYTES) // 16 * 16 // 4
     return max(_FLYDSL_PLAN_MAX_BATCH, by_lds)
+
+
+def flydsl_row_chunks(rows: int, num_kv_heads: int) -> list[tuple[int, int]]:
+    """Balanced query-row ranges ``[start, end)`` whose (row, kv head)
+    sequences each fit one FlyDSL plan (``_flydsl_plan_max_batch``).
+
+    Sparse paged attention plans a sequence a (row, kv head); a PP x TP1 prefill
+    keeps every KV head, so 32768 rows x 4 heads outgrow gfx1250's 81792. One
+    range -- the whole call -- whenever it fits.
+    """
+    if rows * num_kv_heads <= _FLYDSL_PLAN_MAX_BATCH:  # every plan's floor
+        return [(0, rows)]
+    per_chunk = _flydsl_plan_max_batch() // num_kv_heads
+    chunks = -(-rows // per_chunk)
+    if chunks <= 1:
+        return [(0, rows)]
+    step = -(-rows // chunks)
+    return [(start, min(start + step, rows)) for start in range(0, rows, step)]
 
 
 _FLYDSL_RUNTIME_PLANS: dict[tuple, object] = {}

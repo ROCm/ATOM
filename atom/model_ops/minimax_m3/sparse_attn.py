@@ -21,8 +21,10 @@ import torch
 import triton
 import triton.language as tl
 from aiter.ops.attention import pa_fwd_asm_supports_arch
+from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon_supports_arch
 
 from atom.model_ops.minimax_m3.index_topk import build_n_valid_column_per_row
+from atom.utils import envs
 
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128
@@ -1435,6 +1437,7 @@ def sparse_pa_per_row(
 
     from atom.model_ops.base_attention import (
         _flydsl_output_quant_option,
+        flydsl_row_chunks,
         run_pa_decode,
     )
 
@@ -1449,6 +1452,36 @@ def sparse_pa_per_row(
     # kvh), matching the collapsed cache view. Zero-copy; Hkv == 1 is identity.
     assert q.is_contiguous(), "contiguous q required for the kv-head view"
     T, num_q_heads_total, head_size = q.shape
+    chunks = (
+        flydsl_row_chunks(T, num_kv_heads)
+        if envs.ATOM_PA_FLYDSL and not pa_decode_gluon_supports_arch()
+        else [(0, T)]
+    )
+    if len(chunks) > 1:
+        # Past one FlyDSL plan's sequences, whole-token chunks, each one plan.
+        # Equal chunks share a plan key, so none keeps a step-scoped plan.
+        for start, end in chunks:
+            tail = None if end == T else end  # a padded bucket's rows
+            seq_slice = slice(start * num_kv_heads, end * num_kv_heads)
+            sparse_pa_per_row(
+                q[start:end],
+                k_cache,
+                v_cache,
+                sparse_bt[seq_slice],
+                sparse_ctx[seq_slice],
+                num_kv_heads,
+                sm_scale,
+                output[start:end],
+                k_scale,
+                v_scale,
+                quantized_output=(
+                    None if quantized_output is None else quantized_output[start:tail]
+                ),
+                output_scale=None if output_scale is None else output_scale[start:tail],
+                plan_cache_owner=plan_cache_owner,
+                quantized_direct=quantized_direct,
+            )
+        return
     g = num_q_heads_total // num_kv_heads
     q_view = q.view(T * num_kv_heads, g, head_size)
     out_view = output.view(T * num_kv_heads, g, head_size)
