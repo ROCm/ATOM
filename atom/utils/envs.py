@@ -1436,6 +1436,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # PP stage boundary over HIP IPC (`pp_ipc.py`) on a MiniMax-M3 P/D prefill
     # producer with one rank a stage on gfx950; 0 keeps NCCL everywhere.
     "ATOM_PP_IPC": lambda: os.getenv("ATOM_PP_IPC", "1") == "1",
+    # P/D producer prefill step under PP; the full budget only while prefill in flight
+    # and queued fills pp_size + 2 full steps (a longer prompt keeps it). 0: off.
+    "ATOM_PREFILL_STEP_TOKENS": lambda: (
+        _optional_int_env("ATOM_PREFILL_STEP_TOKENS", min_value=0) or 0
+    ),
     # Startup dummy forwards at [Kx]TOKENS steps besides the max_num_batched_tokens
     # one, building per-step-size kernels before the first request. Empty: none.
     "ATOM_WARMUP_STEPS": lambda: _warmup_shapes_env("ATOM_WARMUP_STEPS"),

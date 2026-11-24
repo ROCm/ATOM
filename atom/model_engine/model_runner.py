@@ -80,6 +80,7 @@ from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import (
     ScheduledBatch,
     ScheduledBatchOutput,
+    adaptive_prefill_step,
     defers_output,
 )
 from atom.model_engine.sequence import (
@@ -1474,8 +1475,12 @@ class ModelRunner:
 
     def warmup_steps(self) -> list[tuple[int, int]]:
         """(requests, tokens each) of the startup dummy forwards after the
-        first: `ATOM_WARMUP_STEPS`, each within the warmup token budget."""
-        steps = envs.ATOM_WARMUP_STEPS
+        first: `ATOM_WARMUP_STEPS` and the small prefill step
+        (`adaptive_prefill_step`), each within the warmup token budget."""
+        steps = list(envs.ATOM_WARMUP_STEPS)
+        small = adaptive_prefill_step(self.config)
+        if small and (1, small) not in steps:
+            steps.append((1, small))
         limit = self.warmup_max_tokens()
         for count, tokens in steps:
             if count * tokens > limit or count > self.config.max_num_seqs:
