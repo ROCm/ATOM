@@ -653,8 +653,8 @@ def _qkv_a_rmsnorm_fp4(
 
 
 def _qkv_a_norm_fp4_supported(attn: nn.Module) -> bool:
-    # The kernel uses the standard RMSNorm rounding order. Keep the separate
-    # RMSNorm path when model-sensitive precision is requested.
+    # The fused Q/K-norm kernels ignore ATOM_USE_MODEL_SENSITIVE_RMSNORM; with it
+    # set, keep main's fused route unchanged.
     return (
         not envs.ATOM_USE_MODEL_SENSITIVE_RMSNORM
         and attn.q_lora_rank is not None
