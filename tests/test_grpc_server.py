@@ -412,6 +412,35 @@ def _submit(prompt=(1, 2), **sampling):
     )
 
 
+def test_session_token_times_are_taken_as_the_engine_delivers_them(serve, monkeypatch):
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(grpc_server, "time", SimpleNamespace(time=lambda: clock.now))
+    engine = FakeEngine()
+
+    def add_request(seqs):  # the steps end at 1 s and 2 s; the loop reads them at 10 s
+        for now, tokens, reason in ((1.0, [5], None), (2.0, [6, 7], "eos")):
+            clock.now = now
+            seqs[0].callback(
+                RequestOutput(seqs[0].id, tokens, reason is not None, reason)
+            )
+            engine.flush()
+        clock.now = 10.0
+
+    engine.core_mgr.add_request = add_request
+    servicer = serve(engine)
+    session = servicer.sessions.open()
+
+    async def submitted():
+        await servicer._submit(session, _submit())
+        for _ in range(5):  # the steps' deliveries, run on this loop
+            await asyncio.sleep(0)
+
+    asyncio.run(submitted())
+    messages = [_envelope(session.outbox.get_nowait()) for _ in range(3)]
+    (done,) = messages[-1].completions.items
+    assert (done.first_token_time, done.leave_time) == (1.0, 2.0)
+
+
 def test_the_session_refuses_logprobs_it_would_not_serve(serve):
     engine = FakeEngine()
     servicer = serve(engine)
@@ -487,7 +516,7 @@ def test_a_session_grammar_failure_is_rejected_as_internal(serve):
     seq = SimpleNamespace(id=session.seq_id(1), num_prompt_tokens=2, arrive_time=0.0)
     engine.io_processor.requests[seq.id] = seq
     session.add(1, seq, "r")
-    session.put(RequestOutput(seq.id, [], True, "structured_output_error"))
+    session.put((RequestOutput(seq.id, [], True, "structured_output_error"), 0.0))
     session.flush()
     rejected = _envelope(session.outbox.get_nowait()).rejected.items
     assert [(r.seq_id, r.code) for r in rejected] == [(1, v1.RejectedRequest.INTERNAL)]
