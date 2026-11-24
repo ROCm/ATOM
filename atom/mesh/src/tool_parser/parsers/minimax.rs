@@ -29,6 +29,8 @@ pub struct MiniMaxParser {
     invoke_complete: Regex,
     invoke_name_attr: Regex,
     parameter: Regex,
+    /// A parameter's opening tag.
+    parameter_open: Regex,
     buffer: String,
     prev_tool_call_arr: Vec<Value>,
     current_tool_id: i32,
@@ -57,6 +59,7 @@ impl MiniMaxParser {
             // both tag names and verify their equality while parsing.
             parameter: Regex::new(r"(?s)<([\w-]+)>(.*?)</([\w-]+)>")
                 .expect("valid MiniMax parameter pattern"),
+            parameter_open: Regex::new(r"<([\w-]+)>").expect("valid MiniMax opening tag pattern"),
             buffer: String::new(),
             prev_tool_call_arr: Vec::new(),
             current_tool_id: -1,
@@ -457,6 +460,41 @@ impl ToolParser for MiniMaxParser {
 
     fn has_tool_markers(&self, text: &str) -> bool {
         text.contains(MINIMAX_NS)
+    }
+
+    /// As `minimax_tool_parser._is_truncated_call` reads an open `<invoke name=...>` at
+    /// end of input: a call when nothing, or a parameter tag (a declared one, when the
+    /// tool declares any), whole or cut off, follows it; then its open tags are closed.
+    fn end_of_input_closers(&self, tools: &[Tool]) -> Option<String> {
+        if !(self.in_tool_call && self.function_name_sent) {
+            return None;
+        }
+        let rest = self.buffer.trim_start();
+        let types = helpers::param_types_for_function(tools, &self.current_function_name);
+        let followers: Vec<String> = match types.is_empty() {
+            true => vec!["<".to_string()],
+            false => types.keys().map(|tag| format!("<{tag}>")).collect(),
+        };
+        let continues =
+            |token: &String| rest.starts_with(token.as_str()) || token.starts_with(rest);
+        if !rest.is_empty() && !followers.iter().any(continues) {
+            return None;
+        }
+        let mut closers = String::new();
+        let last_open = self
+            .parameter_open
+            .captures_iter(rest)
+            .filter(|tag| tag.get(1).is_some_and(|name| name.as_str() != "invoke"))
+            .last();
+        if let Some(open) = last_open {
+            let (whole, tag) = (open.get(0).unwrap(), &open[1]);
+            if !rest[whole.end()..].contains(&format!("</{tag}>")) {
+                closers.push_str(&format!("</{tag}>"));
+            }
+        }
+        closers.push_str(self.invoke_end_token);
+        closers.push_str(self.tool_call_end_token);
+        Some(closers)
     }
 
     fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {

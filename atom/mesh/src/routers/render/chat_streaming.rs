@@ -3,7 +3,7 @@
 
 use std::{io, sync::Arc, time::Instant};
 
-use super::chat_aggregator::{cut_off_call_closers, RELEASE};
+use super::chat_aggregator::RELEASE;
 use axum::{body::Body, http::StatusCode, response::Response};
 use bytes::Bytes;
 use futures::StreamExt;
@@ -158,8 +158,6 @@ async fn run_chat_stream(
 
     let mut reasoning_parser: Option<Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>> = None;
     let mut tool_parser: Option<Arc<tokio::sync::Mutex<Box<dyn ToolParser>>>> = None;
-    // What an ATOM reply fed the tool parser, to close a native call it was cut off in.
-    let mut tool_text = String::new();
     let mut sse_buffer = Vec::with_capacity(512);
 
     let mut consumed = 0;
@@ -269,9 +267,6 @@ async fn run_chat_stream(
                             history_tool_calls_count,
                         )
                     } else {
-                        if ctx.reads_as_atom {
-                            tool_text.push_str(&delta);
-                        }
                         process_tool_calls_stream(
                             &delta,
                             &mut tool_parser,
@@ -360,9 +355,6 @@ async fn run_chat_stream(
                             history_tool_calls_count,
                         )
                     } else {
-                        if ctx.reads_as_atom {
-                            tool_text.push_str(&text);
-                        }
                         process_tool_calls_stream(
                             &text,
                             &mut tool_parser,
@@ -408,8 +400,11 @@ async fn run_chat_stream(
         }
     }
 
-    if let (Some(_), Some(tools)) = (&tool_parser, tools.as_ref()) {
-        if let Some(closers) = cut_off_call_closers(&tool_text, tools) {
+    // An ATOM reply cut off inside a native call has the call closed, as its parser
+    // reads one at end of input.
+    if let (Some(parser), Some(tools), true) = (&tool_parser, tools.as_ref(), ctx.reads_as_atom) {
+        let closers = parser.lock().await.end_of_input_closers(tools);
+        if let Some(closers) = closers {
             let chunks = process_tool_calls_stream(
                 &closers,
                 &mut tool_parser,

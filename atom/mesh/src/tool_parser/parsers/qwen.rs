@@ -522,6 +522,29 @@ mod coder {
             helpers::get_unstreamed_args(&self.prev_tool_call_arr, &self.streamed_args_for_tool)
         }
 
+        /// As `QwenXmlParser._is_truncated_call` reads an open `<function=NAME>` at end
+        /// of input: a call when what follows the declared name is a parameter or the
+        /// function's close, whole or cut off; then its open tags are closed.
+        fn end_of_input_closers(&self, _tools: &[Tool]) -> Option<String> {
+            if !(self.in_tool_call && self.current_tool_name_sent) {
+                return None;
+            }
+            let rest = self.buffer.trim_start();
+            let continues = |token: &str| rest.starts_with(token) || token.starts_with(rest);
+            if !["<parameter=", "</function>"].into_iter().any(continues) {
+                return None;
+            }
+            let mut closers = String::new();
+            if rest.rfind("<parameter=") > rest.rfind("</parameter>") {
+                closers.push_str("</parameter>");
+            }
+            if !rest.contains("</function>") {
+                closers.push_str("</function>");
+            }
+            closers.push_str(self.tool_call_end_token);
+            Some(closers)
+        }
+
         fn reset(&mut self) {
             helpers::reset_parser_state(
                 &mut self.buffer,
@@ -537,6 +560,32 @@ mod coder {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// Closing a call cut off at the end of a long reply reads only the open call the
+        /// parser still holds: the prose before it is released, not kept.
+        #[tokio::test]
+        async fn end_of_input_closers_read_only_the_open_call() {
+            let tool: Tool = serde_json::from_value(serde_json::json!({
+                "type": "function", "function": {"name": "get_weather", "parameters": {}},
+            }))
+            .unwrap();
+            let tools = [tool];
+            let mut parser = QwenCoderParser::new();
+            let prose = "word ".repeat(200_000);
+            parser.parse_incremental(&prose, &tools).await.unwrap();
+            let call = "<tool_call><function=get_weather><parameter=city>Paris";
+            parser.parse_incremental(call, &tools).await.unwrap();
+            assert!(
+                parser.buffer.len() < 64,
+                "{} bytes held",
+                parser.buffer.len()
+            );
+            let closers = parser.end_of_input_closers(&tools);
+            assert_eq!(
+                closers.as_deref(),
+                Some("</parameter></function></tool_call>")
+            );
+        }
 
         #[test]
         fn test_html_unescape_basic() {

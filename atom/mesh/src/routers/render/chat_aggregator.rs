@@ -40,7 +40,7 @@ use crate::{
         traits::Tokenizer,
     },
     tool_parser::{
-        registry::{check_tool_parser_availability, get_tool_parser},
+        registry::{check_tool_parser_availability, create_tool_parser, get_tool_parser},
         ParserFactory as ToolParserFactory,
     },
 };
@@ -281,10 +281,15 @@ async fn process_choice(
             if let Some(factory) = tool_parser_factory {
                 let tools = chat_request.tools.as_deref().unwrap_or_default();
                 // An ATOM reply cut off inside a native call is read with the call closed.
-                let closed = reads_as_atom
-                    .then(|| cut_off_call_closers(&processed_text, tools))
-                    .flatten()
-                    .map(|closers| format!("{processed_text}{closers}"));
+                let closers = match reads_as_atom {
+                    true => {
+                        let model = &chat_request.model;
+                        let (text, configured) = (&processed_text, configured_tool_parser);
+                        cut_off_call_closers(factory, configured, model, text, tools).await
+                    }
+                    false => None,
+                };
+                let closed = closers.map(|closers| format!("{processed_text}{closers}"));
                 let parse = |text: String| {
                     let model = &chat_request.model;
                     async move {
@@ -402,33 +407,18 @@ async fn split_reasoning(
     Ok(ParserResult::new(normal, reasoning))
 }
 
-/// The markup that closes a native `<function=NAME>` call `text` was cut off in, when
-/// it is one, as ATOM's HTTP parser reads such a call (`_is_truncated_call`): NAME is
-/// a declared tool and what follows it is still call syntax, not prose.
-pub(super) fn cut_off_call_closers(text: &str, tools: &[Tool]) -> Option<String> {
-    let start = text.rfind("<function=")?;
-    let call = &text[start + "<function=".len()..];
-    if call.contains("</function>") {
-        return None;
-    }
-    let (name, rest) = call.split_once('>')?;
-    let name = name.trim();
-    if !tools.iter().any(|tool| tool.function.name == name) {
-        return None;
-    }
-    let rest = rest.trim_start();
-    if !(rest.is_empty() || rest.starts_with("<parameter=") || "<parameter=".starts_with(rest)) {
-        return None;
-    }
-    let mut closers = String::new();
-    if rest.rfind("<parameter=") > rest.rfind("</parameter>") {
-        closers.push_str("</parameter>");
-    }
-    closers.push_str("</function>");
-    if text[..start].rfind("<tool_call>") > text[..start].rfind("</tool_call>") {
-        closers.push_str("</tool_call>");
-    }
-    Some(closers)
+/// The markup that closes the call `text` was cut off in, as the reply's own tool parser
+/// reads one at end of input (`ToolParser::end_of_input_closers`), when there is one.
+async fn cut_off_call_closers(
+    factory: &ToolParserFactory,
+    configured: Option<&str>,
+    model: &str,
+    text: &str,
+    tools: &[Tool],
+) -> Option<String> {
+    let mut parser = create_tool_parser(factory, configured, model)?;
+    parser.parse_incremental(text, tools).await.ok()?;
+    parser.end_of_input_closers(tools)
 }
 
 async fn parse_tool_calls(
