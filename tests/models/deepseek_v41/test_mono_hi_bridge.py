@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """The V4.1 mono hi hook's cache bridge and round kernels (``atom/models/deepseek_v41/mono``) in the Triton
 interpreter, no GPU.
 
@@ -1514,15 +1515,15 @@ def check_post_verify():
             st = cache.tentative_staging.gpu
             spec_mod._commit_cursors[(nb,)](cur, st, vd[2], step.cu_seqlens_q[:nb], step.slots, cur.stride(0),
                                             st.stride(0), st.stride(1), WIDTH=W, BLOCK=4)  # fmt: skip
-            got["graph == eager"] &= (torch.equal(b["out"], out) and torch.equal(b["verdict"], vd)
+            got["graph == eager"] &= (torch.equal(b.out, out) and torch.equal(b.spec_status, vd)
                                       and torch.equal(cache.cursor, cur))  # fmt: skip
-    # the head output and the commit
+    # the width's verify and the commit
     hook, cache, step, meta = world(2, None)
     pv = pvm.PostVerify([12, 6], {12: (2, 6), 6: (1, 6)}, dev)
     pv.launch(hook, cache, step, 12)
     out, vd = pv.output(12)
-    got["the width's outputs are the head output"] = (
-        out is pv.bufs[12]["out"] and vd is pv.bufs[12]["verdict"]
+    got["the width's outputs are its verify"] = (
+        out is pv.bufs[12].out and vd is pv.bufs[12].spec_status
     )
     # the commit: at the outputs' anchors (the runner took them) none is launched (the tentative state released as
     # ``commit_tentative`` releases it); at any other anchors: ATOM's

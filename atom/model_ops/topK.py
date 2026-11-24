@@ -12,7 +12,10 @@ from atom.model_ops.fused_moe.expert_layout import SharedExpertMode
 from atom.model_ops.fused_moe.gathered_shared_ids import copy_shared_expert_ids_
 from atom.model_ops.triton_topk_softmax import triton_topk_softmax
 from atom.model_ops.utils import _has_module
-from atom.quant_spec import fuses_mxfp8_shared_into_mxfp4
+from atom.quant_spec import (
+    fuses_mxfp8_shared_into_mxfp4,
+    fuses_ptpc_shared_into_online_ptpc,
+)
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.forward_context import get_forward_context
@@ -26,6 +29,9 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
     config = get_current_atom_config()
     if quant_config is None:
         quant_config = config.quant_config
+
+    if not getattr(quant_config, "fuse_shared_experts", True):
+        return False
 
     dp_size = config.parallel_config.data_parallel_size
     # Shared-expert fusion is incompatible with the flattened DP x TP MoE-EP
@@ -64,13 +70,20 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
             else quant_config.global_quant_config
         )
         return (
-            shared_spec.quant_dtype == routed_spec.quant_dtype
-            and shared_spec.quant_type == routed_spec.quant_type
-            and shared_spec.is_dynamic == routed_spec.is_dynamic
-        ) or (
-            fuses_mxfp8_shared_into_mxfp4(shared_spec, routed_spec)
-            # A DSpark drafter (mtp.*) loads its shared expert as its own MLP.
-            and not (routed_expert_prefix or "").startswith("mtp.")
+            (
+                shared_spec.quant_dtype == routed_spec.quant_dtype
+                and shared_spec.quant_type == routed_spec.quant_type
+                and shared_spec.is_dynamic == routed_spec.is_dynamic
+            )
+            or fuses_mxfp8_shared_into_mxfp4(shared_spec, routed_spec)
+            or (
+                routed_expert_prefix is not None
+                # The FP8 online method has no all2all shared-expert dispatch.
+                and not (dp_size > 1 and config.enable_expert_parallel)
+                and fuses_ptpc_shared_into_online_ptpc(
+                    quant_config, routed_expert_prefix, shared_spec, routed_spec
+                )
+            )
         )
 
     # Resolve actual dtypes for shared experts vs routed experts.

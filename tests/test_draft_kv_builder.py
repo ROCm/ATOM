@@ -16,11 +16,14 @@ runs on CI, which is where such a regression would land.
 
 from __future__ import annotations
 
+import sys
+import types
 from types import SimpleNamespace
 
 import pytest
 import torch
 from torch import nn
+from transformers import PretrainedConfig
 
 from atom.kv_transfer.disaggregation.sharded_transfer import consumer_head_slices
 from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
@@ -31,6 +34,7 @@ from atom.spec_decode.draft_kv import (
     draft_kv_builder,
     draft_owns_kv_pool,
 )
+from atom.utils.selector import Family
 
 
 class _PagedAttention(nn.Module):
@@ -243,7 +247,7 @@ def test_draft_exports_zero_copy_mp_views_and_disables_tp_collapse():
     assert [(p.unit_spec.namespace, p.unit_spec.layer) for p in transfer.pages] == [
         ("draft", 9)
     ] * 2
-    assert {p.head_major_runs for p in transfer.pages} == {(1, 4)}
+    assert {p.head_major_runs for p in transfer.pages} == {(4, (128 * 128 * 2,))}
     assert [tuple(view.shape[:2]) for view in transfer.block_tensor_views] == [
         (2, 1),
         (2, 1),
@@ -370,6 +374,35 @@ def test_the_count_tracks_the_model_it_walked(draft_layers):
     assert asked == [(draft_layers, TARGET_BLOCK)]
 
 
+def _spec_config(method="dspark", draft_hf="draft-hf"):
+    return SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            method=method, draft_model_hf_config=draft_hf
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "config, family, want",
+    [
+        (_spec_config(), Family.MHA, True),
+        (_spec_config(), Family.MLA, False),  # a family outside DRAFT_POOL_FAMILIES
+        (_spec_config("eagle3"), Family.MHA, True),  # a draft model of its own
+        (_spec_config("eagle3"), Family.MLA, False),  # binds into the target's
+        (_spec_config("mtp"), Family.MHA, False),  # MTP runs the target's layers
+        (_spec_config(draft_hf=None), Family.MHA, False),
+        (SimpleNamespace(speculative_config=None), Family.MHA, False),
+    ],
+)
+def test_a_native_draft_owns_a_pool_when_its_family_is_in_the_draft_pool_table(
+    monkeypatch, config, family, want
+):
+    from atom.utils import selector
+
+    monkeypatch.setattr(selector, "attn_family", lambda _hf: family)
+    assert draft_owns_kv_pool(config) is want
+
+
 def test_a_plugin_config_answers_no_without_reading_native_draft_fields(monkeypatch):
     """The vLLM offload adapter hands over vLLM's own SpeculativeConfig: `method`, no
     `draft_model_hf_config`; and the selector has no backend for every draft flavor
@@ -387,10 +420,65 @@ def test_a_plugin_config_answers_no_without_reading_native_draft_fields(monkeypa
 
 
 @pytest.mark.parametrize(
-    "target, pool_dtype", [("fp4", "bf16"), ("fp8", "fp8")]  # fp4 has no draft layout
+    "target, draft",
+    [
+        ("fp8", "bf16"),  # the draft below its target
+        ("bf16", "fp8"),  # ... and above it
+        ("fp8", "fp8"),  # no mismatch: the same answer either way
+    ],
+)
+def test_the_real_builder_builds_the_pool_at_the_drafts_dtype_not_the_targets(
+    monkeypatch, target, draft
+):
+    """`draft_kv_builder` hands `make_kv_pool` the dtype of `speculative_config.
+    draft_kv_dtype`; reading the target's `config.kv_cache_dtype` there instead
+    would allocate the pool at one dtype while the draft's attention (built from
+    `draft_kv_dtype`) reads it at another. Every other test replaces the builder,
+    so this one runs the real one, stubbing only its two lookups: the backend
+    (`selector.get_attn_backend`, whose `make_kv_pool` records its arguments)
+    and aiter's dtype map (`aiter.dtypes.d_dtypes`)."""
+    from atom.utils import selector
+
+    seen = {}
+
+    class _Backend:
+        @staticmethod
+        def make_kv_pool(hf, *, world_size, kv_dtype, **kw):
+            seen["kv_dtype"] = kv_dtype
+            return object()
+
+    d_dtypes = {"bf16": torch.bfloat16, "fp8": torch.float8_e4m3fn}
+    aiter = types.ModuleType("aiter")
+    aiter.dtypes = types.SimpleNamespace(d_dtypes=d_dtypes)
+    monkeypatch.setitem(sys.modules, "aiter", aiter)
+    monkeypatch.setattr(selector, "get_attn_backend", lambda _family: _Backend)
+
+    runner = _runner(draft_layers=2)
+    runner.world_size = 1
+    runner.config = SimpleNamespace(
+        kv_cache_dtype=target,
+        speculative_config=SimpleNamespace(draft_kv_dtype=draft),
+    )
+    builder = draft_kv_builder(
+        runner, PretrainedConfig(model_type="llama"), model=nn.Module()
+    )
+    assert builder is not None
+    assert builder.kv_pool is not None  # builds the pool, through the backend
+
+    assert seen == {"kv_dtype": d_dtypes[draft]}
+
+
+@pytest.mark.parametrize(
+    "target, asked, pool_dtype",
+    [
+        ("fp4", None, "bf16"),  # fp4 has no draft layout
+        ("fp8", None, "fp8"),
+        ("fp8", "bf16", "bf16"),  # --spec-decode-kv-cache-dtype, either way round
+        ("bf16", "fp8", "fp8"),
+    ],
 )
 def test_an_eagle3_draft_attention_is_built_at_the_dtype_of_its_pool(
-    target, pool_dtype
+    target, asked, pool_dtype
 ):
     """The draft's attention reads its dtype off the config it is built with and its
     pool is built at `draft_kv_dtype`: one value; the target's config keeps its own."""
@@ -400,7 +488,7 @@ def test_an_eagle3_draft_attention_is_built_at_the_dtype_of_its_pool(
     from atom.config import CompilationConfig, resolve_draft_kv_dtype
 
     spec = SimpleNamespace(method="eagle3", draft_model_hf_config=SimpleNamespace())
-    spec.draft_kv_dtype = resolve_draft_kv_dtype(target, own_pool=True)
+    spec.draft_kv_dtype = resolve_draft_kv_dtype(target, own_pool=True, requested=asked)
     assert spec.draft_kv_dtype == pool_dtype
     p = mod.EagleProposer.__new__(mod.EagleProposer)
     p.speculative_config, p.runner = spec, SimpleNamespace()
@@ -607,3 +695,59 @@ def test_a_declared_scale_other_than_unit_is_refused():
 
     with pytest.raises(ValueError, match="declares a KV scale of 0.5"):
         draft_kv_builder(SimpleNamespace(), None, _Draft())
+
+
+@pytest.mark.parametrize(
+    "draft_kind", ["disabled", "pp_non_last", "shared", "independent"]
+)
+def test_serving_binding_uses_the_drafts_builder_before_target_fallback(draft_kind):
+    from atom.model_engine.kv_cache_binding import kv_cache_bindings
+
+    target, draft, shared = [_PagedAttention() for _ in range(3)]
+    norm = _Norm()
+    target.layer_num, draft.layer_num, shared.layer_num = 17, 29, 31
+    target_calls, draft_calls = [], []
+    tensors = {
+        target: torch.zeros(1),
+        draft: torch.ones(1),
+        shared: torch.full((1,), 2),
+    }
+
+    def target_bind(module):
+        target_calls.append(module)
+        return tensors.get(module)
+
+    def draft_bind(module):
+        draft_calls.append(module)
+        return tensors[draft] if module is draft else None
+
+    runner = SimpleNamespace(
+        model=SimpleNamespace(modules=lambda: [target, norm]),
+        config=SimpleNamespace(speculative_config=draft_kind != "disabled"),
+        attn_metadata_builder=SimpleNamespace(build_kv_cache_tensor=target_bind),
+    )
+    if draft_kind != "pp_non_last":
+        runner.drafter = SimpleNamespace(
+            model=SimpleNamespace(modules=lambda: [draft, shared])
+        )
+    if draft_kind == "independent":
+        runner.draft_kv_builder = SimpleNamespace(build_kv_cache_tensor=draft_bind)
+    bound = [
+        (module, tensor)
+        for module, tensor in kv_cache_bindings(runner)
+        if tensor is not None
+    ]
+    assert [module.layer_num for module, _ in bound] == (
+        [17] if draft_kind in ("disabled", "pp_non_last") else [17, 29, 31]
+    )
+    assert all(tensor is tensors[module] for module, tensor in bound)
+    assert (
+        target_calls
+        == {
+            "disabled": [target, norm],
+            "pp_non_last": [target, norm],
+            "shared": [target, norm, draft, shared],
+            "independent": [target, norm, shared],
+        }[draft_kind]
+    )
+    assert draft_calls == ([draft, shared] if draft_kind == "independent" else [])

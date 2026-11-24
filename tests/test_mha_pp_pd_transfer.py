@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from atom.kv_transfer.disaggregation.page_region import page_region
+from atom.kv_transfer.disaggregation.types import PageUnitSpec
 from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
 from atom.model_ops.attentions.pool_layout.entry_arena import EntryField
 from atom.model_ops.attentions.pool_layout.pool_rows import KvGeometry
@@ -83,6 +84,9 @@ def _producer(pages, mem, heads, partition, rank, monkeypatch):
             mc._pack_unit_layout(pages) and tuple(p.unit_spec for p in pages)
         ),
         _block_region_consumer_indices=None,
+        _slot_region_consumer_indices=None,
+        _slot_region_tp_segments=None,
+        _slot_region_tp_replicated=None,
         _unit_plans={},
         _slot_regions=[],
         _swa_block_regions=[],
@@ -95,7 +99,7 @@ def _producer(pages, mem, heads, partition, rank, monkeypatch):
         num_hidden_layers=LAYERS,
         _start_layer=sum(partition[:rank]),
         block_size=BLOCK,
-        _mla_staging=None,
+        _kv_staging=None,
         _MAX_RDMA_ENTRIES_PER_BATCH=7,
         _rdma_write=lambda target, s, d, n, *a, **k: mem.write(s, d, n) or True,
     )
@@ -149,7 +153,7 @@ def test_stage_fills_each_tp4_rank_with_its_head(
             for s, d in zip(src_ids, dst_ids):
                 want = src[s]
                 if runs is not None and heads > 1:
-                    want = want.reshape(runs[0], heads, -1)[:, consumer_rank]
+                    want = want.reshape(len(runs[1]), heads, -1)[:, consumer_rank]
                 assert np.array_equal(dst[d], want.ravel()), page.unit_spec
             assert not dst[[1, 3]].any()
     held = {p.unit_spec for p in ours}
@@ -158,6 +162,20 @@ def test_stage_fills_each_tp4_rank_with_its_head(
             if spec not in held:
                 assert not mem.at(base, 4 * page.region.unit_bytes).any()
     assert len(producer._unit_plans) == 4  # one plan per consumer rank
+
+
+def test_equal_tp_pairs_named_widths_after_the_wire(monkeypatch):
+    # One spelling on both ends, still equal once msgpack turned its tuples to lists.
+    page = page_region(
+        torch.zeros(4, 24, dtype=torch.uint8),
+        semantic_role="kv",
+        head_major_runs=(1, (8, 4, 8, 4)),
+        unit_spec=PageUnitSpec("mha", "kv", 0, 1, "torch.uint8"),
+    )
+    producer = _producer([page], _Memory(), 1, (1,), 0, monkeypatch)
+    layout = msgpack.loads(mc._pack_unit_layout([page]))
+    plan = producer._unit_plan(layout, 4, 2, 1)
+    assert (plan.cmap, plan.cuts) == ([0], None)
 
 
 def _refused(producer, request, mem, match, slot=False):
@@ -274,7 +292,7 @@ def test_the_backend_views_sparse_layers_as_the_sparse_writer_lays_heads_out():
     )
     pages = builder.get_kv_transfer_tensors().pages
     by_unit = {(p.unit_spec.field, p.unit_spec.layer): p for p in pages}
-    assert by_unit["k", 5].head_major_runs == (1, 4)
+    assert by_unit["k", 5].head_major_runs == (4, (BLOCK * HEAD_DIM,))
     assert by_unit["index", 6].head_major_runs is None
     views = sparse_attn.to_page16_shuffle(*pool.kv_views(1), *pool.scale_views(1))
     for view in views:
@@ -282,7 +300,8 @@ def test_the_backend_views_sparse_layers_as_the_sparse_writer_lays_heads_out():
             view.view(torch.uint8)[:, head].fill_(head + 1)
     for field in ("k", "v", "k_scale", "v_scale"):
         page = by_unit[field, 6]
-        runs, heads = page.head_major_runs
+        heads, widths = page.head_major_runs
+        runs = len(widths)
         assert runs == BLOCK // sparse_attn.ASM_PAGE_SIZE
         unit = page.view[2].view(runs, heads, -1)
         for head in range(heads):
