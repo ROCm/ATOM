@@ -56,6 +56,7 @@ def _batch(temps=(0.0,), **over):
         "any_logprobs": False,
         "structured_requests": {},
         "required_channel": None,
+        "presence_penalties": None,
         "needs_independent_noise": np.zeros(n, dtype=bool),
     }
     b.update(over)
