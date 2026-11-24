@@ -189,9 +189,10 @@ class DSparkProposer(Drafter):
         it does all_gather the vocab shard; ``capture_epilogue`` says whether
         that one collective is captured with the rest.
 
-        Its ids are what `DraftGraph.run` copies out of the pool: deferred
-        output feeds them back as the next step's `input_ids`, so they are the
-        one thing here that outlives the pass.
+        Its ids are what `DraftGraph.run` copies out of the pool where the
+        recording allocated them (a mono head writes its own buffers, none):
+        deferred output feeds them back as the next step's `input_ids`, so
+        they are the one thing here that outlives the pass.
 
         It must be WARMED regardless: the head has its own per-shape flydsl
         builder, and leaving it out of the warm is exactly how
@@ -455,9 +456,9 @@ class DSparkProposer(Drafter):
         )
         from atom.spec_decode.draft_kv import draft_kv_builder
 
-        # Whether this draft needs a pool of its own is answered by the backend
-        # its own config resolves to -- a draft whose rows are the target's
-        # latent binds into the target's pool and answers None. ModelRunner
+        # Whether this draft needs a pool of its own is decided by its attention
+        # family (`selector.DRAFT_POOL_FAMILIES`) -- a draft whose rows are the
+        # target's latent binds into the target's pool and answers None. ModelRunner
         # keys its draft-pool allocation and per-module binding off the
         # presence of this attribute, so None simply never sets it.
         builder = draft_kv_builder(self.runner, draft_hf, model)

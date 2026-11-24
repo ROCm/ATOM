@@ -19,6 +19,7 @@ from atom.model_engine.engine_core import (
     HELD_POLL_S,
     EngineCore,
     publish_idle_state_work,
+    yield_gil,
 )
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.observability import tracing
@@ -101,9 +102,11 @@ class PPEngineCoreProc(EngineCore):
                     time.sleep(HELD_POLL_S)
                     continue
                 if self._in_flight or not self.scheduler.is_finished():
-                    self._pp_head_step()
-                elif self.has_pending_kv_work():
-                    self._advance_idle_kv_transfer()
+                    self._run_then_publish_kv_events(self._pp_head_step)
+                else:
+                    if self.has_pending_kv_work():
+                        self._run_then_publish_kv_events(self._advance_idle_kv_transfer)
+                    yield_gil()
         finally:
             self._drain_kv_work_at_exit()
             try:
@@ -533,11 +536,8 @@ class PPEngineCoreProc(EngineCore):
                 self.runner_mgr.call_func("flush_pp_send", wait_out=True)
             except Exception:
                 logger.exception("flush_pp_send during shutdown failed")
-            try:
-                self.scheduler.publish_kv_events()
-            except Exception:
-                logger.exception("KV event publish during shutdown failed")
-            self.scheduler.shutdown_kv_events()
+            # Only the head publishes KV events; a later stage's scheduler has
+            # the null publisher.
             self.scheduler.close_kv_connector()
 
     def _poll_and_send_kv_status(self):
