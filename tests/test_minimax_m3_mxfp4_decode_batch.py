@@ -1,22 +1,26 @@
 # SPDX-License-Identifier: MIT
-"""Which requests the sparse decode runs under the MXFP4 index cache, and that
-scorer's buffers (CPU, aiter importable; the scorer itself is in
+"""Which requests the sparse decode runs, under the MXFP4 index cache and the others,
+and that scorer's buffers (CPU; the scorer itself is in
 test_minimax_m3_mxfp4_index.py)."""
 
 import types
 
 import pytest
 import torch
+from aiter_stub import atom_without_aiter
 
 HEADS = 2
 
 
 @pytest.fixture
-def mod():
-    pytest.importorskip("aiter")
-    from atom.model_ops.attentions import aiter_attention
+def load():
+    with atom_without_aiter() as load:
+        yield load
 
-    return aiter_attention
+
+@pytest.fixture
+def mod(load):
+    return load("atom.model_ops.attentions.aiter_attention")
 
 
 @pytest.mark.parametrize("max_bs", [16, 15])
@@ -66,21 +70,29 @@ def test_the_scorer_buffers_are_one_workspace_and_a_map_per_decode_ubatch(
     )
 
 
-@pytest.mark.parametrize("phase", ["decode", "prefill"])
-@pytest.mark.parametrize("kv,index", [("fp4", "fp4"), ("fp8", "fp4"), ("fp8", "fp8")])
+@pytest.mark.parametrize(
+    "phase,indexer_cp", [("decode", False), ("decode", True), ("prefill", False)]
+)
+@pytest.mark.parametrize(
+    "kv,index,fp8_out",
+    [("fp4", "fp4", False), ("fp8", "fp4", False), ("fp8", "fp8", False)]
+    + [("fp8", "fp4", True), ("fp8", "fp8", True)],
+)
 @pytest.mark.parametrize("q_rows", [6, 12])  # exactly the metadata's rows / a DP pad
 def test_the_sparse_attention_runs_only_the_rows_the_metadata_covers(
-    monkeypatch, phase, kv, index, q_rows
+    load, monkeypatch, phase, indexer_cp, kv, index, fp8_out, q_rows
 ):
-    """One row rule for decode and prefill. With the MXFP4 index the scorer, selector
-    and attention get the rows the metadata covers; the pad rows past them are never
-    read and the output is zero there. Another index cache keeps every row."""
-    pytest.importorskip("aiter")
-    from atom.model_ops import attention_mha
-    from atom.model_ops.minimax_m3 import index_topk, sparse_attn
+    """A decode (under indexer CP too) with any index cache, and a prefill with the
+    MXFP4 index, give the scorer, selector and attention the rows the metadata covers;
+    the pad rows past them are never read and the output is zero there. Another index
+    cache's prefill keeps every row. An FP8 output (an FP8 KV only) goes whole to its
+    own PA, which writes its pad rows, and is what the impl returns."""
+    attention_mha = load("atom.model_ops.attention_mha")
+    index_topk = load("atom.model_ops.minimax_m3.index_topk")
+    sparse_attn = load("atom.model_ops.minimax_m3.sparse_attn")
 
     batch, mq, heads = 3, 2, 1
-    rows = batch * mq if index == "fp4" else q_rows
+    rows = batch * mq if index == "fp4" or phase == "decode" else q_rows
     seen = {}
 
     def topk(idx_q, cache, block_table, *a, **kw):
@@ -101,16 +113,24 @@ def test_the_sparse_attention_runs_only_the_rows_the_metadata_covers(
         seen["attend"] = q.shape[0]
         (a[3] if phase == "decode" else a[5]).fill_(1)
 
+    def attend_fp8_out(q, *a, **kw):
+        seen["attend"], out_q = q.shape[0], a[8]
+        seen["fp8 rows"] = out_q.shape[0]
+        out_q[: q.shape[0]].fill_(1)  # q's rows, then the pad rows it zeroes
+        out_q[q.shape[0] :].zero_()
+
     monkeypatch.setattr(
         index_topk, f"minimax_m3_index_topk{'_decode' * (phase == 'decode')}", topk
     )
     monkeypatch.setattr(sparse_attn, f"minimax_m3_sparse_attn_{phase}_asm", attend_fp8)
+    monkeypatch.setattr(sparse_attn, "sparse_pa_fp8_per_row", attend_fp8_out)
     layer = object.__new__(attention_mha.SparseMHAPagedAttentionImpl)
     torch.nn.Module.__init__(layer)
     layer.kv_cache_dtype, layer.index_cache_dtype = kv, index
     layer._sparse_pa_mxfp4, layer._select_page_kwargs = attend_fp4, {}
     layer.skip_index_topk, layer.index_topk_cache_state = False, {}
-    layer.indexer_cp_group = None
+    layer.indexer_cp_group = object() if indexer_cp else None
+    layer._cp_index_topk_decode = lambda idx_q, bt, sl, *a, **kw: topk(idx_q, 0, bt, sl)
     layer.topk, layer.init_blocks, layer.local_blocks = 2, 1, 0
     layer.num_kv_heads, layer.scale = 1, 1.0
     layer.index_cache, layer.layer_num, layer.sparse_layer_ordinal = None, 0, 0
@@ -134,8 +154,17 @@ def test_the_sparse_attention_runs_only_the_rows_the_metadata_covers(
         attn_metadata=types.SimpleNamespace(sparse_attention_metadata=md)
     )
     q = v = torch.zeros(q_rows, 4, 8)
-    out = getattr(layer, f"_sparse_{phase}")(q, None, v, None, None, None, None, ctx)
+    fp8 = {}
+    if fp8_out:
+        # a sentinel, so the zero pad rows below are the PA's own writes
+        fp8 = {"quantized_output": torch.full_like(q, 7), "output_scale": q[:, 0, :1]}
+    out = getattr(layer, f"_sparse_{phase}")(
+        q, None, v, None, None, None, None, ctx, **fp8
+    )
     assert out.shape == q.shape
+    if fp8_out:
+        assert out.data_ptr() == fp8["quantized_output"].data_ptr()
+        assert seen["fp8 rows"] == q_rows
     assert seen["scorer"] == (rows, batch, batch) and seen["attend"] == rows
     assert (out[:rows] == 1).all() and (out[rows:] == 0).all()
 
@@ -144,12 +173,14 @@ def test_the_sparse_attention_runs_only_the_rows_the_metadata_covers(
     "mxfp4, scheduled, rows, q, ubatches, want",
     [
         (True, 3, 24, 8, None, 3),  # a DP step padded past its requests: rows decide
-        (False, 3, 24, 8, None, 8),  # the other index caches keep the padded batch
+        (False, 3, 24, 8, None, 3),  # with any index cache
+        (False, 8, 16, 2, None, 8),  # a unified step keeps the whole batch
         (True, 9, 24, 8, None, ValueError),  # fewer rows than scheduled: refused
+        (False, 9, 24, 8, None, ValueError),  # with any index cache
         (True, 8, 8, 1, [1, 2], "split"),  # a split decode builds no whole-batch scorer
     ],
 )
-def test_the_decode_row_rule_and_the_split_step_are_the_mxfp4_indexs(
+def test_the_decode_row_rule_and_the_mxfp4_split_step(
     mod, monkeypatch, mxfp4, scheduled, rows, q, ubatches, want
 ):
     running_bs = 8
@@ -191,6 +222,7 @@ def test_the_decode_row_rule_and_the_split_step_are_the_mxfp4_indexs(
         assert seen[0]["index_scorer"] is None
     else:
         assert seen[0]["seq_lens"].shape[0] == want
+        assert seen[0]["block_table"].shape[0] == want
 
 
 @pytest.mark.parametrize("planned", [True, False])

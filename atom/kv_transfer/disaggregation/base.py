@@ -83,6 +83,13 @@ class KVConnectorBase(ABC):
     def publish_prefill_chunks(self, batch: Any) -> None:
         """Publish completed prefill chunks; no-op without chunked P/D transfer."""
 
+    def note_state_stages(self, stages: dict) -> None:
+        """The runner just copied these (live slot, transfer slot) pairs on this
+        stream. Only handed to a connector with state transfer slots."""
+        raise NotImplementedError(
+            f"{type(self).__name__} has no state transfer slots to stage into"
+        )
+
     def get_finished_recv_blocks(self) -> list[int]:
         """Return block IDs from recently completed receives for GPU memory fence.
 
@@ -101,6 +108,9 @@ class KVConnectorSchedulerBase(ABC):
     """
 
     is_offload = False
+    # True only when `cancel_undispatched_load` can return True; the engine
+    # skips the call for an aborted in-flight load unless this is True.
+    cancels_undispatched_loads = False
     is_producer: bool
 
     # Offload-tier hooks the scheduler reads from any connector; one without a
@@ -129,6 +139,13 @@ class KVConnectorSchedulerBase(ABC):
     def cancel_pending_load(self, seq: Any) -> None:
         """Forget the load armed for `seq`."""
 
+    def cancel_undispatched_load(self, seq: Any) -> bool:
+        """Cancel a parked load only if no worker owns its destination.
+
+        False preserves the existing terminal-report cleanup contract.
+        """
+        return False
+
     def cancel_preadmission(self, seq: Any) -> None:
         """Take back an admission the scheduler withdraws before any dispatch;
         by default that is cancelling the pending load."""
@@ -138,6 +155,13 @@ class KVConnectorSchedulerBase(ABC):
         """Release threads or sockets the connector holds at engine shutdown."""
 
     supports_pd_admission = False
+
+    def stage_state_for_send(self, seq: Any, src_slot: int, dst_slot: int) -> None:
+        """Have the workers copy a finished request's state into its transfer
+        slot before its push. Only asked when transfer slots were sized."""
+        raise NotImplementedError(
+            f"{type(self).__name__} has no state transfer slots to stage into"
+        )
 
     def pd_receive_block_offset(
         self, seq: Any, num_blocks: int, num_cached_blocks: int

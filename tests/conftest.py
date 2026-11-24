@@ -19,6 +19,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 # ── 1. Resolve ATOM root and ensure it's on sys.path ──────────────────────
 
@@ -99,6 +100,7 @@ class MockConfig:
             "decode_context_parallel_size": 1,
             "pipeline_parallel_size": 1,
             "kv_transfer_config": {},
+            "state_transfer_slots": 0,
             "max_model_len": 64,
             "bos_token_id": 1,
             "eos_token_id": 2,
@@ -304,10 +306,12 @@ def seq_factory():
 
 class ReqGraphRecordings:
     """What a warmup's capture leaves in request graphs, held on the CPU: a
-    bucket of ``running_bs`` requests replays to ``out``."""
+    bucket of ``running_bs`` requests replays to ``out``, every tensor of it
+    the pool's but those in ``owned`` (buffers the forward owns)."""
 
     def __init__(self):
         self.by_requests = {}
+        self.owned = []
 
     def add(self, running_bs, out, on_replay=None):
         def replay():
@@ -331,9 +335,22 @@ def req_graph_recordings(monkeypatch):
         held.clear()
         return dropped
 
+    def allocated(self, key, value, phase=None):
+        # a recording's outputs are the pool's unless the test owns them
+        # (``recordings.owned``)
+        def mark(v):
+            if isinstance(v, torch.Tensor):
+                return not any(v.data_ptr() == o.data_ptr() for o in recordings.owned)
+            if isinstance(v, tuple):
+                return tuple(mark(x) for x in v)
+            return False
+
+        return mark(value)
+
     monkeypatch.setattr(ReqGraph, "has", lambda self, key, phase=None: key in held)
     monkeypatch.setattr(ReqGraph, "replay", lambda self, key=None, **_: held[key]())
     monkeypatch.setattr(ReqGraph, "release_graphs", release_graphs)
+    monkeypatch.setattr(ReqGraph, "allocated", allocated)
     return recordings
 
 

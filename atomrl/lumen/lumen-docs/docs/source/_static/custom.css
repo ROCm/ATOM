@@ -1,0 +1,18 @@
+.sidebar-github-link {
+  display: flex;
+  align-items: center;
+  padding: 0.5rem 0.75rem;
+  margin: 0.25rem 0.5rem;
+  border-radius: 6px;
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: var(--color-foreground-secondary);
+  text-decoration: none;
+  transition: background 0.15s, color 0.15s;
+}
+
+.sidebar-github-link:hover {
+  background: var(--color-background-hover);
+  color: var(--color-foreground-primary);
+  text-decoration: none;
+}

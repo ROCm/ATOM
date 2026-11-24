@@ -1,0 +1,190 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
+# Megatron-Native Qwen3-30B-A3B DAPO long run at a 4k response budget.
+#
+# Purpose: reproduce the response-length trajectory in hours instead of days.
+# The 20480-budget runs (`lepges5o`, `p819dsox`) both needed ~140 steps at
+# ~9.3 min/step before the collapse showed up. Everything here is the verl
+# reference recipe from dapo_qwen3moe_a3b_ray_megatron_verlref_longrun.yaml with
+# two knobs turned down so a step costs a few minutes:
+#   * response budget 20480 -> 4096 (prompt stays 2048, total 6144)
+#   * train_prompt_bsz 128 -> 16, so 16 x 16 = 256 sequences per update
+# Shrinking the batch is safe for this particular question because the collapse
+# tracks optimizer steps, not samples: `lepges5o` (2048 sequences) and
+# `p819dsox` (512) both turned over at step ~140. The 4k smoke measures 111s per
+# step at 128 sequences with 81% of it in generation, so 256 lands near 3.5 min
+# and 200 steps -- past the historical turning point -- fits in a shift.
+#
+# Everything that defines the optimization problem otherwise matches the 20k
+# config: grpo advantages, token-mean aggregation, clip 0.2/0.28/10, lr 1e-6
+# with no warmup, wd 0.1, clip_grad 1.0, filter_groups on acc with 10 rounds,
+# overlong_buffer 512/1.0, token-level TIS at C=2.0, temperature/top_p/top_k
+# 1.0/1.0/-1.
+#
+# Topology matches the FSDP2 data-parallel width: TP=1, PP=1, CP=1, EP=8 -> DP=8.
+#
+# MEMORY: the first attempt ran 91 steps and then hit HIP OOM inside the update,
+# on 3.44 GiB for the fp32 logits upcast, because a second job landed on the node
+# at 07:12 and took 41.9 GiB per card. Our own footprint was 156 GiB peak
+# reserved on the actor plus 86 GiB of vLLM at 0.30 utilization = 242 of 288 GiB,
+# so the ~46 GiB of headroom the run relied on disappeared. The settings below
+# bring the peak down far enough to coexist with a ~42 GiB neighbour:
+# recomputation on, packed bins halved, and vLLM at 0.25 (which is close to its
+# floor -- the 30.5B policy alone is ~61 GiB, so 0.25 x 288 leaves ~11 GiB of KV
+# cache and going lower stops the engine loading at all).
+#
+# Routers are fp32 on both sides (`moe_router_dtype: fp32` here plus
+# ATOMRL_FP32_MOE_ROUTER=1 in the launcher, which is the half that reaches the
+# vLLM worker). The two must always be flipped together.
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 8
+
+controller:
+  ray:
+    enabled: true
+    fuse_actor_ref: false
+    actor:
+      num_workers: 8
+      dispatch_mode: dp_compute_proto
+
+policy:
+  model_name: "${oc.env:DATA_ROOT}/models/Qwen3-30B-A3B-Base"
+  training_backend: megatron_native
+  generation_backend: vllm
+  max_total_sequence_length: 6144       # 2048 prompt + 4096 response
+  max_response_length: 4096
+  train_global_batch_size: 256          # 16 prompts x 16 generations
+  gen_batch_size: 48                    # 16 * 3, verl's train:gen ratio
+  train_micro_batch_size: 1
+  max_token_len_per_gpu: 6144
+  learning_rate: 1.0e-6
+  lr_warmup_steps: 0
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  lr_decay_style: constant
+  training:
+    optimizer_dtype: bf16               # COMPUTE dtype; master weights stay fp32
+    megatron_cfg:
+      use_distributed_optimizer: true
+      tensor_model_parallel_size: 1
+      pipeline_model_parallel_size: 1
+      context_parallel_size: 1
+      expert_model_parallel_size: 8
+      sequence_parallel: false
+      moe_grouped_gemm: true
+      moe_permute_fusion: true
+      moe_token_dispatcher_type: alltoall
+      moe_flex_dispatcher_backend: mori
+      moe_mori_max_tokens_per_rank: null
+      moe_mori_kernel_type: null
+      moe_aux_loss_coeff: 0.0
+      moe_router_dtype: fp32
+      # Full activation recomputation. Not needed to fit a 4k response on its
+      # own, but it is the cheapest ~20 GiB off the update transient when the
+      # card is shared.
+      recompute_granularity: full
+      recompute_method: uniform
+      recompute_num_layers: 1
+      log_probs_chunk_size: 1024
+      enable_dynamic_batch: true
+      # Note this does NOT bound the worst case: _build_bins gives any row longer
+      # than the budget a bin of its own, and prompt 2048 + response 4096 means a
+      # single row can reach ~5.1k tokens. It does stop every *packed* bin from
+      # also reaching 6k, which is what matters for the allocate/free churn.
+      max_tokens_per_gpu: 3072
+    fsdp_cfg:
+      param_offload: false
+      optimizer_offload: false
+  generation:
+    vllm_cfg:
+      transport: ray_http
+      ray_http_start_server: false
+      gpu_memory_utilization: 0.25
+      max_model_len: 6144
+      dtype: bfloat16
+      enforce_eager: true
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 8192
+      max_num_seqs: 256
+      quantization: ""
+      calculate_log_probs: true
+      enable_sleep_mode: false
+      update_weights_bucket_megabytes: 512
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1
+
+moe:
+  r3:
+    rollout_replay: false
+
+algorithm:
+  name: dapo
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  loss_agg_mode: token-mean
+  dapo:
+    num_generations: 16
+    kl_coeff: 0.0
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    clip_ratio_c: 10.0
+    dynamic_sampling: true
+    token_level_pg: true
+    overlong_reward_shaping: true
+    max_resp_len: 4096
+    filter_groups:
+      enable: true
+      metric: acc
+      max_num_gen_batches: 10
+    overlong_buffer:
+      enable: true
+      len: 512
+      penalty_factor: 1.0
+      log: false
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+  rollout_correction:
+    rollout_is: token                   # verl rollout_is=token
+    rollout_is_threshold: 2.0           # verl C=2
+    rollout_is_batch_normalize: false
+
+reward:
+  type: function
+  function: atomrl.rewards.math_reward.dapo_math_reward
+  dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet"
+  shuffle: true
+  shuffle_seed: 10086
+
+val_dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/aime-2024.filtered.parquet"
+val_steps: 20
+val_batch_size: 0
+eval:
+  enabled: false
+  num_samples: 0
+
+checkpointing:
+  # A directory of its own: this run starts from step 0 and must not pick up the
+  # 20k run's state, and the two backends never share a checkpoint format.
+  checkpoint_dir: "${oc.env:SCRATCH_ROOT}/ckpts/atomrl-dapo/verlref-moe-a3b-megatron-ep8-4k"
+  save_steps: 50
+  save_total_limit: 1
+  resume: false
+
+logger:
+  wandb_enabled: true
+  log_interval: 1
+  wandb:
+    project: ATOMRL-MOE
+    name: verlref-moe-a3b-megatron-ep8-4k-maskfix
+
+num_training_steps: 300
+seed: 10086

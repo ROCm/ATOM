@@ -8,7 +8,7 @@ broadcasts BF16 buckets directly into this engine's parameters. No safetensors
 round-trip, no shared folder, no host bounce.
 
 The wire format is frozen by the sending side
-(``lumenrl.engine.inference.rdma_weight_transfer``) and must match byte for byte:
+(``atomrl.engine.inference.rdma_weight_transfer``) and must match byte for byte:
 
     header   4x int64, broadcast from rank 0:
              [command, metadata_bytes, payload_bytes, version]
@@ -41,15 +41,12 @@ from aiter.dist.parallel_state import get_world_group
 
 from atom.distributed.group_agreement import group_min_each
 from atom.model_engine.collective_rpc import WeightReloadRefused
+from atom.rollout import rdma_protocol
 from atom.rollout.weight_bucket import decode_bucket
 from atom.rollout.weight_updater import _discard_sync_state_on_error, _one_update
 from atom.utils.distributed import utils as dist_utils
 
 logger = logging.getLogger("atom")
-
-_CMD_END = 0
-_CMD_BUCKET = 1
-_HEADER_WORDS = 4  # command, metadata bytes, payload bytes, version
 
 # What a header is held to before anything is allocated for it. Metadata is a
 # JSON entry per tensor, which this ceiling holds hundreds of thousands of, and
@@ -151,7 +148,7 @@ def _frames_no_bucket(
     bucket, its broadcasts are ones the sender may never post, and every later
     frame would be read out of step.
     """
-    if command != _CMD_BUCKET:
+    if command != rdma_protocol.CMD_BUCKET:
         return f"command {command} is neither a bucket nor the end marker"
     if metadata_bytes == 0 or payload_bytes == 0:
         return "a bucket without metadata or without a payload"
@@ -183,7 +180,7 @@ def _unreceivable(
 def _recv_header(
     group, *, device: torch.device, timeout: timedelta
 ) -> tuple[int, int, int, int]:
-    header = torch.empty(_HEADER_WORDS, dtype=torch.int64, device=device)
+    header = torch.empty(rdma_protocol.HEADER_WORDS, dtype=torch.int64, device=device)
     _receive(header, group, timeout)
     command, metadata_bytes, payload_bytes, version = (
         int(v) for v in header.cpu().tolist()
@@ -322,7 +319,7 @@ def _take_frames(
                 f"RDMA weight version mismatch: expected {version}, "
                 f"got {frame_version}"
             )
-        if command == _CMD_END:
+        if command == rdma_protocol.CMD_END:
             # The contract is [END, 0, 0, version].
             if got.failure is None and (metadata_bytes != 0 or payload_bytes != 0):
                 got.failure = RuntimeError(
