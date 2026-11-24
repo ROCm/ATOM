@@ -24,7 +24,9 @@ from typing import Any
 
 import torch
 
-from atom.utils import envs
+from atom.model_ops.qwen4_exp.qsa_cache_rules import qsa_page_segments
+from atom.utils import envs, get_hf_text_config
+from atom.utils.selector import Family, attn_family
 
 # Version 3 adds the effective index-cache dtype to the PAGE identity. FP4 and
 # FP8 DSV4 indexers have different region counts and byte layouts, so they must
@@ -63,25 +65,6 @@ _HF_INTEGER_GEOMETRY_FIELDS = frozenset(_HF_PAGE_FIELDS) - {
     "indexer_dtype",
     "indexer_types",
 }
-# GDN/linear model types carrying a per-request recurrent state but NOT in the
-# `kimi_linear` family `kimi_k3` owns. Same set as `attn_family` resolves to
-# `Family.GDN`, but note the attribute skew: the guard below reads
-# `hf_config.model_type` while `attn_family` reads the text config. On the
-# native path they agree only because `get_hf_config` flattens the text type
-# up; `is_vllm()` drops `qwen3_5`/`qwen3_5_moe` from that flatten, so if
-# offload is ever wired into plugin mode this guard must switch to the text
-# config to stay in sync.
-# Unreachable today -- no plugin caller passes a `kv_transfer_config`.
-# MiniMax-M3 is not here either: it is sparse *paged* attention
-# (`MiniMaxM3SparseForCausalLM` -> `SparseMHAPagedAttentionImpl`), no recurrent
-# state, so it is NOT a GDN/linear model. It does get its own PAGE-only `m3`
-# layout (see `_is_minimax_m3` and offload/hybrid/m3/): its NSA index_cache is
-# delivered only through transfer_tensors.block_regions, so the dense codec --
-# which builds from per-layer KVCacheTensor K/V -- would silently drop it.
-_GDN_LINEAR_MODEL_TYPES = frozenset(
-    {"qwen3_next", "qwen3_next_mtp", "qwen3_5_text", "qwen3_5_moe_text"}
-)
-
 # Layouts that own a tier for a model's per-request *recurrent* state.
 # `kimi_k3` is the kimi_linear KDA state; `qwen` is the same tier over a GDN
 # PAGE image; `dsv41` is DeepSeek-V4.1's CSA2 window rings, compressor rings
@@ -208,17 +191,13 @@ def _layout_from_model(config) -> str:
         return "m3"
     # Resolve the family off the *text* config, exactly as the model-side
     # predicate this mirrors does (`attn_family(hf_text_config)`, which the
-    # backend selector runs). Two names in `_GDN_LINEAR_MODEL_TYPES` --
-    # `qwen3_5_text`, `qwen3_5_moe_text` -- are literally text-config model
-    # types, so the bare wrapper `model_type` would be the multimodal wrapper's
-    # and neither the `kimi_linear` nor the GDN branch would fire: Qwen3.5 would
-    # fall through to `dense` and die deep in `register_kv_caches` (the exact
-    # failure the refusal below exists to pre-empt), and a `kimi_linear`
-    # checkpoint wrapped in a `text_config` would silently run with no state tier.
-    # Local import: this module is on the early config path, and `atom.utils`
-    # pulls in transformers -- keep it out of module import time.
-    from atom.utils import get_hf_text_config
-
+    # backend selector runs). Qwen3.5's GDN types (`qwen3_5_text`,
+    # `qwen3_5_moe_text`) are text-config model types, so the bare wrapper
+    # `model_type` would be the multimodal wrapper's and neither the
+    # `kimi_linear` nor the GDN branch would fire: Qwen3.5 would fall through to
+    # `dense` and die deep in `register_kv_caches` (the exact failure the
+    # refusal below exists to pre-empt), and a `kimi_linear` checkpoint wrapped
+    # in a `text_config` would silently run with no state tier.
     text_config = get_hf_text_config(hf_config)
     model_type = getattr(text_config, "model_type", None)
     # K3's paged KV is ordinary dense MLA; what makes it its own family is the
@@ -233,9 +212,8 @@ def _layout_from_model(config) -> str:
     # outside `_STATE_OWNING_LAYOUTS`, so an `offload_layout: dense` override
     # would silently restore a KV prefix over a window ring that never
     # existed. Every spelling (wrapper, text, DSpark) is the selector's CSA2.
-    from atom.utils.selector import Family, attn_family
-
-    if attn_family(text_config) is Family.CSA2:
+    family = attn_family(text_config)
+    if family is Family.CSA2:
         return "dsv41"
     if getattr(hf_config, "compress_ratios", None):
         return "hybrid"
@@ -244,7 +222,7 @@ def _layout_from_model(config) -> str:
     # is `qwen` so the shell builds `QwenOffloadConnector`, which inherits
     # that tier and does not assume KDA shapes. `dense` would restore KV
     # over a stale slot.
-    if model_type in _GDN_LINEAR_MODEL_TYPES:
+    if family in (Family.GDN, Family.QSA_GDN):
         return "qwen"
     return "dense"
 
@@ -428,6 +406,8 @@ def build_page_namespace(
     index_layout = getattr(config, "index_cache_layout", None)
     if index_layout is not None:
         document["index_cache_layout"] = index_layout
+    if attn_family(get_hf_text_config(hf)) is Family.QSA_GDN:
+        document.update(qsa_page_segments(config))
     canonical = json.dumps(
         document,
         sort_keys=True,
@@ -748,7 +728,6 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
     are only used for key/shape bookkeeping (we override the byte layout in the
     codec), but we fill them faithfully from hf_config so logging/keys are sane.
     """
-    from aiter import dtypes
     from lmcache.v1.metadata import LMCacheMetadata
 
     from atom.models.utils import get_pp_indices
@@ -782,7 +761,9 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
     worker_id = _strict_integer("LMCache worker id", worker_id)
     if worker_id >= world_size:
         raise ValueError("LMCache worker id must be within the world")
-    kv_dtype = dtypes.d_dtypes[config.kv_cache_dtype]
+    from atom.config import kv_cache_torch_dtype
+
+    kv_dtype = kv_cache_torch_dtype(config.kv_cache_dtype)
     model_name = build_page_namespace(config, cfg, world_size)
 
     # MLA (DeepSeek R1/V3, Kimi) stores a single replicated per-layer latent

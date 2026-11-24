@@ -1,7 +1,11 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Triton helpers every verify kernel shares: the draft token a row verifies,
 and the bonus, -1 tail and verdict a request ends with. The exact-match,
-synthetic and relaxed kernels (`rejection_sampler`) and the ratio accept
-(`ratio_verify`) all call them."""
+synthetic and relaxed kernels (`rejection_sampler`), the ratio accept
+(`ratio_verify`) and the verify from a head's ids (`_verify_by_ids`:
+`verify_ids._verify_ids_kernel`, the V4.1 hi post-verify) all call them."""
 
 import triton
 import triton.language as tl
@@ -49,3 +53,49 @@ def _finish_request(
     tl.store(verdict_ptr + req_idx, num_accepted)
     tl.store(verdict_ptr + batch_size + req_idx, num_spec_steps - num_accepted)
     tl.store(verdict_ptr + 2 * batch_size + req_idx, anchor + num_accepted)
+
+
+@triton.jit
+def _verify_by_ids(
+    out_ptr, verdict_ptr, cu_ptr, input_ids_ptr, target_idx_ptr, bonus_idx_ptr,
+    head_ids_ptr, cond_rates_ptr, seed, b, num_spec_steps,
+    SP: tl.constexpr, SYNTHETIC: tl.constexpr,
+):  # fmt: skip
+    """Program b, request b, from a head that picked each step row's id
+    (``head_ids``, a row's target): its rows at once -- the first rejected a
+    min over them -- then ``_finish_request``. ``SYNTHETIC`` (forced
+    acceptance): a draft is kept, and emitted, when a uniform from ``seed``
+    falls below its position's conditional rate. -> its anchor row."""
+    if b == 0:
+        start = 0
+    else:
+        start = tl.load(cu_ptr + b - 1)
+    n = tl.load(cu_ptr + b) - start
+    p = tl.arange(0, SP)
+    live = p < n
+    vrow = tl.load(target_idx_ptr + start + p, mask=live, other=0)
+    target = tl.load(head_ids_ptr + vrow, mask=live, other=0).to(tl.int32)
+    draft = tl.load(input_ids_ptr + vrow + 1, mask=live, other=0).to(tl.int32)
+    if SYNTHETIC:
+        u = tl.rand(seed, start + p)
+        ok = u < tl.load(cond_rates_ptr + p, mask=live, other=0.0)
+        kept = draft
+    else:
+        ok = draft == target
+        kept = target
+    first_rejected = tl.min(tl.where(live & (ok == 0), p, n), axis=0)
+    rejected = first_rejected < n
+    INVALID: tl.constexpr = -1
+    row = tl.where(
+        p < first_rejected, kept, tl.where(p == first_rejected, target, INVALID)
+    )
+    tl.store(out_ptr + b * (num_spec_steps + 1) + p, row, mask=live)
+    brow = tl.load(bonus_idx_ptr + b)
+    # ``_finish_request`` reads request b's bonus at its pointer + b: here
+    # the head's id at the request's bonus row
+    last_checked = tl.where(rejected, first_rejected, n - 1)
+    _finish_request(
+        out_ptr, verdict_ptr, head_ids_ptr + brow - b, bonus_idx_ptr, b, n,
+        last_checked, rejected, num_spec_steps,
+    )  # fmt: skip
+    return brow - n + tl.where(rejected, first_rejected, n)

@@ -1,5 +1,6 @@
 //! Shared HTTP proxy contract. The routing view never replaces the original payload.
 use std::{
+    collections::HashSet,
     sync::{Arc, LazyLock},
     time::Instant,
 };
@@ -13,6 +14,7 @@ use axum::{
 use bytes::Bytes;
 use dashmap::DashSet;
 use http::{HeaderMap, Uri};
+use parking_lot::RwLock;
 use tracing::warn;
 
 use crate::{
@@ -28,7 +30,10 @@ use crate::{
     policies::{LoadBalancingPolicy, PolicyRegistry},
     routers::{
         comm::error::{IngressError, MeshLocalError},
-        prepare::inference::{InferenceMetadata, InferenceRequest, ParsedInference},
+        prepare::{
+            fast_tokenizer::TokenizeLimits,
+            inference::{InferenceMetadata, InferenceRequest, ParsedInference},
+        },
     },
     server::AppState,
     tokenizer::TokenizerRegistry,
@@ -629,8 +634,10 @@ pub struct IngressRouting {
     policy_registry: Arc<PolicyRegistry>,
     worker_registry: Arc<WorkerRegistry>,
     tokenizer_registry: Arc<TokenizerRegistry>,
+    chats_without_template: Arc<RwLock<HashSet<String>>>,
     pd: bool,
-    max_tokenize_bytes: usize,
+    tokenize_limits: TokenizeLimits,
+    prefill_on_decode_rank: bool,
 }
 
 impl IngressRouting {
@@ -639,8 +646,10 @@ impl IngressRouting {
             policy_registry: app.policy_registry.clone(),
             worker_registry: app.worker_registry.clone(),
             tokenizer_registry: app.tokenizer_registry.clone(),
+            chats_without_template: app.chats_without_template.clone(),
             pd: app.router_config.mode.is_pd_mode(),
-            max_tokenize_bytes: app.router_config.resolved_max_tokenize_bytes(),
+            tokenize_limits: app.tokenize_limits,
+            prefill_on_decode_rank: app.router_config.prefill_on_decode_rank(),
         }
     }
 
@@ -777,6 +786,7 @@ impl IngressRouting {
             )),
             policies,
         )
+        .with_prefill_on_decode_rank(self.prefill_on_decode_rank)
     }
 
     pub(crate) fn candidates(
@@ -863,13 +873,16 @@ impl IngressRouting {
                     "token routing requires input_ids or a model with a registered tokenizer",
                 )
             })?;
-        let limit = self.max_tokenize_bytes;
+        let limit = self.tokenize_limits.of(&*entry.tokenizer);
         if metadata.text.len() > limit {
             return Err(IngressError::tokenizer_input_too_large());
         }
         ctx.check()?;
         let template_started = Instant::now();
         let prompt = if let Some(chat) = parsed.chat() {
+            if self.chats_without_template.read().contains(&entry.id) {
+                return Err(IngressError::new(http::StatusCode::NOT_IMPLEMENTED, "token_routing_unsupported", "this model's chats render with a built-in encoder whose defaults are not the engine's; use a policy that does not require exact tokens"));
+            }
             super::prepare::chat_template::process_chat_messages(chat, &*entry.tokenizer)
                 .map_err(IngressError::invalid)?
                 .text
@@ -898,3 +911,7 @@ impl IngressRouting {
 #[cfg(test)]
 #[path = "../../tests/routing/ingress_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../tests/routing/token_parity.rs"]
+mod token_parity;
