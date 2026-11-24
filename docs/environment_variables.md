@@ -190,12 +190,17 @@ cannot affect a server that does not use the feature.
 | **ATOM_GLM5_FORCE_DENSE_MLA** | bool | 0 (false) | Disable sparse MLA for short-context bring-up comparisons. |
 | **ATOM_GLM5_DISABLE_FUSED_MHC** | bool | 0 (false) | Force the PyTorch mHC reference path instead of AITER's fused kernels. |
 
+### Kimi-K3 KDA
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_KIMI_K3_KDA_FUSED_DECODE** | bool | 1 (true) | Fuse the native Kimi-K3 and inherited GLM-5.3 ReplaySSM KDA conv, `f_b_proj` and recurrence on gfx950. Requires BF16 activations/conv state and unquantized BF16 `f_b_proj`, head dimension 128, width-4 SiLU conv, a supported state layout and a 1–8-token window. The padded request count times local heads must fit the one-wave admission limit. TP rank 0 logs the bucket, head and CU geometry when that limit selects the separate path; repeated geometry is deduplicated. Other steps retain the separate operations; `0` forces them throughout. Set before graph capture. vLLM metadata without ReplaySSM retains its existing path; served Mono layers use their own kernels. |
+
 ### Native model decode
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_MONO_ENABLE** | bool | 1 (true) | Enable fused decode for supported GLM-5.2, Kimi-K3, MiniMax-M3, DeepSeek-V4.1, and Qwen3.8-Flash-Next deployments and step geometries. Unsupported configurations and forwards keep the production path; `0` disables every Mono runner. Qwen3.8-Flash-Next (Quark MXFP4, TP1, MTP3) runs either GDN verify (ReplaySSM by default, or classic with `ATOM_ENABLE_REPLAYSSM=0`); see `recipes/Qwen3.8-Flash-Next-Mono-Program.md`. |
-| **ATOM_KIMI_K3_KDA_FUSED_DECODE** | bool | 1 (true) | Fuse the native Kimi-K3 and inherited GLM-5.3 ReplaySSM KDA conv, `f_b_proj` and recurrence on gfx950. Requires BF16 activations/conv state and unquantized BF16 `f_b_proj`, head dimension 128, width-4 SiLU conv, a supported state layout and a 1–8-token window. The padded request count times local heads must fit the one-wave admission limit. TP rank 0 logs the bucket, head and CU geometry when that limit selects the separate path; repeated geometry is deduplicated. Other steps retain the separate operations; `0` forces them throughout. Set before graph capture. vLLM metadata without ReplaySSM retains its existing path; served Mono layers use their own kernels. |
 
 ### MiniMax-M3
 
