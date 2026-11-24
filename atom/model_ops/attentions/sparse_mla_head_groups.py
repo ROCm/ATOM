@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Independent head groups for small BF16 persistent sparse-prefill batches."""
+"""Independent head groups for small BF16 persistent sparse-prefill batches,
+and the work-plan helpers shared by every sparse-prefill planner."""
 
 import torch
 import triton
@@ -25,6 +26,15 @@ PERSISTENT_WORK_BUFFERS = (
     "reduce_final_map",
     "reduce_partial_map",
 )
+
+
+def sparse_prefill_kv_granularity(dtype_q, dtype_kv, row_width, page_size=1):
+    """kv_granularity of a sparse-prefill work plan. A BF16 row is planned
+    whole: splitting its candidates by batch occupancy changes the reduction
+    order, so a row's output would depend on what it is batched with."""
+    if dtype_q == dtype_kv == torch.bfloat16:
+        return max(triton.next_power_of_2(row_width), page_size, 16)
+    return max(page_size, 16)
 
 
 @triton.jit

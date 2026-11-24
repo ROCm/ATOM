@@ -62,6 +62,7 @@ from atom.model_ops.attentions.sparse_mla_head_groups import (
 )
 from atom.model_ops.attentions.sparse_mla_head_groups import (
     SparsePrefillHeadGroups,
+    sparse_prefill_kv_granularity,
 )
 from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
 from atom.model_ops.glm5_next.geometry import (
@@ -570,6 +571,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         )
         self.dtype_kv = kv_cache_torch_dtype(config.kv_cache_dtype)
         self.dtype_q = self.dtype_kv
+        self.sparse_prefill_kv_granularity = sparse_prefill_kv_granularity(
+            self.dtype_q, self.dtype_kv, self.index_topk_out, self.block_size
+        )
 
         self.dcp_world_size = get_dcp_world_size()
         self.dcp_rank = get_dcp_rank()
@@ -2311,7 +2315,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             page_size=self.block_size,
             dtype_q=self.dtype_q,
             dtype_kv=self.dtype_kv,
-            kv_granularity=max(self.block_size, 16),
+            kv_granularity=self.sparse_prefill_kv_granularity,
             max_seqlen_qo=1,
             uni_seqlen_qo=1,
             fast_mode=1,

@@ -277,6 +277,7 @@ def _builder(monkeypatch, plan, nonps):
     b.sparse_prefill_num_heads = 64
     b.block_size = 1
     b.dtype_q = b.dtype_kv = torch.float8_e4m3fn
+    b.sparse_prefill_kv_granularity = 16
     b.model_runner = SimpleNamespace(
         forward_vars={f"sparse_prefill_{n}": n for n in PERSISTENT_WORK_BUFFERS}
     )
@@ -386,6 +387,7 @@ def _work_sizer(mode, local, gathered):
     b.padded_num_attention_heads = local
     b.sparse_prefill_num_heads = gathered
     b.dtype_q = b.dtype_kv = torch.float8_e4m3fn
+    b.sparse_prefill_kv_granularity = 16
     return b
 
 

@@ -14,6 +14,9 @@ import torch
 from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
 from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
 
+from atom.model_ops.attentions.sparse_mla_head_groups import (
+    sparse_prefill_kv_granularity,
+)
 from atom.plugin.sglang.runtime.attention_backend_resolver import (
     resolve_sglang_runtime,
 )
@@ -649,6 +652,7 @@ def make_mla_work_buffers(
     dtype_q,
     dtype_kv,
     page_size: int,
+    kv_granularity: int | None = None,
 ) -> dict[str, torch.Tensor]:
     num_seqs = max(1, int(cu_seqlens_q.numel()) - 1)
     max_q_len = 1
@@ -709,7 +713,9 @@ def make_mla_work_buffers(
         page_size=page_size,
         dtype_q=dtype_q,
         dtype_kv=dtype_kv,
-        kv_granularity=max(page_size, 16),
+        kv_granularity=(
+            max(page_size, 16) if kv_granularity is None else kv_granularity
+        ),
         max_seqlen_qo=max_q_len,
         uni_seqlen_qo=max_q_len,
         fast_mode=True,
@@ -772,6 +778,9 @@ def _maybe_apply_pcp_prefill_reindex(
         dtype_q=dtype_q,
         dtype_kv=dtype_q,
         page_size=attention_page_size(token_to_kv_pool),
+        kv_granularity=sparse_prefill_kv_granularity(
+            dtype_q, dtype_q, topk, attention_page_size(token_to_kv_pool)
+        ),
     )
     for key, value in sparse_work.items():
         setattr(md, f"sparse_prefill_{key}", value)
@@ -1801,6 +1810,9 @@ def build_mtp_draft_extend_prefill_metadata(
             dtype_q=dtype_q,
             dtype_kv=dtype_q,
             page_size=attention_page_size(token_to_kv_pool),
+            kv_granularity=sparse_prefill_kv_granularity(
+                dtype_q, dtype_q, topk, attention_page_size(token_to_kv_pool)
+            ),
         )
         for key, value in sparse_work.items():
             setattr(md, f"sparse_prefill_{key}", value)
@@ -1936,6 +1948,9 @@ def build_prefill_metadata(
             dtype_q=dtype_q,
             dtype_kv=dtype_q,
             page_size=attention_page_size(token_to_kv_pool),
+            kv_granularity=sparse_prefill_kv_granularity(
+                dtype_q, dtype_q, topk, attention_page_size(token_to_kv_pool)
+            ),
         )
         for key, value in sparse_work.items():
             setattr(md, f"sparse_prefill_{key}", value)
