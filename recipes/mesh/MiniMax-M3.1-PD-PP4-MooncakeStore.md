@@ -82,6 +82,10 @@ All scripts are in [`minimax_m31_pd_store/`](minimax_m31_pd_store/).
    - `gsm8k.sh <label> 32 200` for a 200-question GSM8K through the router (20-shot chat, real acceptance).
    - `store.sh status` for Store capacity, keys and evictions.
 
+## Benchmark point
+
+Run 1P1D with AgentX traces at **C140** (the concurrency of the whole 1P1D), with `FORCE_AL=4.04` on both roles. Earlier 1P1D + Store runs on experiment branches peaked at C140, and C160 was 4% lower. Report the decode running batch and KV usage next to tok/s: at C140 a TP4 decode runs about 40-50 requests at a time.
+
 ## Settings and why
 
 - Prefill:
@@ -105,4 +109,4 @@ All scripts are in [`minimax_m31_pd_store/`](minimax_m31_pd_store/).
 
 - Under DEP4 a request lives on one rank, so its context is capped by one rank's KV pool (about 2.1-2.4M tokens with FP8 KV), not by the instance's.
 - DEP4 replicates attention, shared/dense MLPs, embedding, `lm_head` and the draft on every rank: about 13 GB more weights per GPU than TP4.
-- At about C100 an M3.1 decode is bound by KV capacity rather than step time. Compare the two decodes on the same AgentX workload, and report the decode running batch together with tok/s.
+- At C140 the decode is bound by KV capacity rather than step time: the running batch stays at about 40-50 requests while the rest wait for KV. Compare the two decodes at C140 on the same AgentX workload.
