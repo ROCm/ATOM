@@ -278,6 +278,7 @@ class LMCacheOffloadMetadata(ConnectorMetadata):
         "state_loads",
         "state_stores",
         "state_touches",
+        "tier_cold_chunks",
     )
 
     def __init__(self) -> None:
@@ -299,6 +300,10 @@ class LMCacheOffloadMetadata(ConnectorMetadata):
         # StateTouchId per voted state image, refreshed and reported by each
         # worker.
         self.state_touches: list[StateTouchId] = []
+        # LMCache chunk hashes whose CPU-tier copies the worker puts first in
+        # line for eviction: chunks a lazy exclusive tier loaded into HBM, which
+        # demotes them again before it evicts them (`ATOM_OFFLOAD_LAZY_EXCLUSIVE`).
+        self.tier_cold_chunks: list[int] = []
 
     def add_request(self, meta: LMCacheReqMeta) -> None:
         self.requests.append(meta)

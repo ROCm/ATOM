@@ -60,6 +60,7 @@ import logging
 import os
 import queue
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 
@@ -547,12 +548,63 @@ class PrehashedSaveSchedulerMixin:
         )
 
 
+def _make_coldest(backend, key) -> None:
+    """Put a CPU-tier chunk first in its backend's eviction order."""
+    coldest = getattr(backend.cache_policy, "make_coldest", None)
+    if coldest is not None:
+        coldest(key)
+    elif isinstance(backend.hot_cache, OrderedDict):
+        # LMCache's LRU evicts in the mapping's order.
+        backend.hot_cache.move_to_end(key, last=False)
+
+
+def _make_recent(backend, key) -> None:
+    """Count a CPU-tier chunk as hit, as a retrieve does."""
+    backend.cache_policy.update_on_hit(key, backend.hot_cache)
+
+
 class PrehashedSaveWorkerMixin:
     """Worker half: store a :class:`PrehashedSave` without its tokens.
 
     Mixed in ahead of ``DenseOffloadConnector`` (or a subclass). A request
     without ``prehashed_save`` takes the parent's token path unchanged.
     """
+
+    def start_load_kv(self, metadata) -> None:
+        cold = getattr(metadata, "tier_cold_chunks", None)
+        if cold:
+            self._tier_backends_do(cold, _make_coldest)
+        super().start_load_kv(metadata)
+
+    def _tier_backends_do(self, hashes, op) -> None:
+        """Apply `op(backend, key)` to the CPU tier's entries for `hashes`,
+        under the backend's cache lock, as LMCache calls its cache policy.
+
+        For a lazy exclusive tier (`ATOM_OFFLOAD_LAZY_EXCLUSIVE`): the scheduler
+        names the chunks HBM holds again, whose tier copies go to the front of
+        the eviction order, and a demotion finding a chunk still held makes it
+        recent again. Best effort: a copy left where it was costs only room.
+        """
+        try:
+            engine = self._engine
+            make_key = engine.token_database._make_key_by_hash
+            keys = [make_key(int(h)) for h in hashes]
+            for backend in engine.storage_manager.storage_backends.values():
+                hot = getattr(backend, "hot_cache", None)
+                lock = getattr(backend, "cpu_lock", None)
+                if hot is None or lock is None:
+                    continue
+                with lock:
+                    for key in keys:
+                        if key in hot:
+                            op(backend, key)
+        except Exception:
+            if not getattr(self, "_tier_order_failure_logged", False):
+                logger.warning(
+                    "LMCache lazy exclusive: reordering CPU-tier chunks failed",
+                    exc_info=True,
+                )
+                self._tier_order_failure_logged = True
 
     def _do_save_req(self, req: LMCacheReqMeta, *, producer_event=None) -> None:
         prehashed = getattr(req, "prehashed_save", None)
@@ -625,10 +677,12 @@ class PrehashedSaveWorkerMixin:
         )
         busy_loop = engine.config.get_extra_config_value("force_store_wait", False)
         keys, memory_objs, starts, ends = [], [], [], []
+        held = []  # chunks the tier holds already: HBM is evicting its copy
         refused = False
         for index, chunk_hash in enumerate(hashes):
             key = token_database._make_key_by_hash(int(chunk_hash))
             if must_store_all and storage_manager.contains(key) is not None:
+                held.append(chunk_hash)
                 continue
             memory_obj = storage_manager.allocate(
                 shapes if exact is None else [exact[index]],
@@ -696,6 +750,8 @@ class PrehashedSaveWorkerMixin:
                 float(stats.get("sync_ms", 0.0)),
                 (time.perf_counter() - t0) * 1000,
             )
+        if held and envs.ATOM_OFFLOAD_LAZY_EXCLUSIVE:
+            self._tier_backends_do(held, _make_recent)
         self._record_store_terminal(req, not (refused and must_store_all))
 
     # -- load ----------------------------------------------------------------
