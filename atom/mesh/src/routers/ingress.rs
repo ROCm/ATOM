@@ -643,6 +643,7 @@ pub struct IngressRouting {
     /// with one digest of the chat up to its last media in front
     /// ([`RoutingChat::front`]); vLLM and SGLang get only the in-place digests.
     front_media_digest: bool,
+    prefill_on_decode_rank: bool,
 }
 
 impl IngressRouting {
@@ -655,6 +656,7 @@ impl IngressRouting {
             pd: app.router_config.mode.is_pd_mode(),
             tokenize_limits: app.tokenize_limits,
             front_media_digest: app.router_config.backend == crate::config::BackendType::Atom,
+            prefill_on_decode_rank: app.router_config.prefill_on_decode_rank(),
         }
     }
 
@@ -803,6 +805,7 @@ impl IngressRouting {
             )),
             policies,
         )
+        .with_prefill_on_decode_rank(self.prefill_on_decode_rank)
     }
 
     pub(crate) fn candidates(

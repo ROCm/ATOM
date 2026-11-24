@@ -87,7 +87,7 @@ from atom.models.dspark_draft import (
     draft_rope_kwargs,
     linear_out,
 )
-from atom.models.kimi_k3 import _RMS_FUSABLE_QUANT_TYPES
+from atom.models.kimi_k3 import _RMS_FUSABLE_QUANT_TYPES, _is_e8m0_blockscale
 from atom.models.utils import is_neox_rope_style
 from atom.quant_spec import effective_layer_quant
 
@@ -284,6 +284,7 @@ class K3DSparkMLAAttention(nn.Module):
         qknorm_type, qknorm_dtype = effective_layer_quant(
             quant_config, f"{prefix}.q_b_proj"
         )
+        self.qknorm_e8m0_scale = _is_e8m0_blockscale(quant_config, qknorm_type)
         self.fuse_qknorm_quant = qknorm_dtype in (dtypes.fp8, dtypes.fp4x2)
         self.qknorm_dtype = qknorm_dtype if self.fuse_qknorm_quant else torch.bfloat16
         self.qknorm_quant_type_value = (
@@ -385,6 +386,7 @@ class K3DSparkMLAAttention(nn.Module):
             quant_type=self.qknorm_quant_type_value,
             output_unquantized_inp1=False,
             transpose_scale=True,
+            e8m0_scale=self.qknorm_e8m0_scale,
         )
         return self.mla_attn(q_c, kv_c, k_pe, positions, q_scale=q_scale)
 
