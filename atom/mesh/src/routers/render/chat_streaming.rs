@@ -174,8 +174,13 @@ async fn run_chat_stream(
         };
         // A Complete's ids past the partials' are streamed first, as one more partial.
         let chunk = match unstreamed(&chunk, consumed) {
-            Some(rest) => {
-                let logprobs = unstreamed_logprobs(&chunk, consumed);
+            Some(mut rest) => {
+                // In pieces, so no delta outgrows the reasoning and tool parsers' buffers.
+                rest.truncate(SUFFIX_PIECE);
+                let logprobs = unstreamed_logprobs(&chunk, consumed).map(|mut logprobs| {
+                    logprobs.items.truncate(rest.len());
+                    logprobs
+                });
                 held = Some(chunk);
                 TokenChunk::Partial {
                     token_ids: rest,
@@ -475,6 +480,9 @@ async fn run_chat_stream(
 
     Ok(())
 }
+
+/// The most ids of a Complete's unstreamed suffix sent as one delta.
+const SUFFIX_PIECE: usize = 256;
 
 /// The ids of a Complete past the `consumed` its partials streamed: SGLang's and vLLM's
 /// carry every output id, ATOM's streamed one none.
