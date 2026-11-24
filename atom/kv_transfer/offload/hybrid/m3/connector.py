@@ -139,6 +139,7 @@ class M3OffloadConnector(PrehashedSaveWorkerMixin, DenseOffloadConnector):
             rank=rank,
         )
         self.chunk_size = int(cfg.chunk_size)
+        self._check_prehashed_load_engine()
 
         try:
             from lmcache.v1.lookup_client.factory import LookupClientFactory

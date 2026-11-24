@@ -41,6 +41,30 @@ def memory_object_as_uint8(memory_obj: Any, nbytes: int) -> torch.Tensor:
     return flat[: int(nbytes)]
 
 
+def memory_object_bytes(memory_obj: Any, nbytes: int) -> torch.Tensor:
+    """:func:`memory_object_as_uint8` without a tensor op when it can.
+
+    Each tensor op called from Python releases the GIL and takes it back, a
+    hand-off to the forward thread per call. A LocalCPU ``TensorMemoryObj``
+    keeps its bytes as a flat uint8 ``raw_tensor`` whose leading ``nbytes``
+    are exactly what ``memory_object_as_uint8`` returns; when it is exactly
+    that size it is used as is. Anything else takes the validated path.
+    """
+    raw = getattr(memory_obj, "raw_tensor", None)
+    meta = getattr(memory_obj, "meta", None)
+    if (
+        isinstance(raw, torch.Tensor)
+        and raw.dtype == torch.uint8
+        and raw.dim() == 1
+        and raw.numel() == int(nbytes)
+        and raw.is_contiguous()
+        and getattr(meta, "dtype", None) == torch.uint8
+        and memory_obj.get_size() == int(nbytes)
+    ):
+        return raw
+    return memory_object_as_uint8(memory_obj, nbytes)
+
+
 class _NullCtx:
     def __enter__(self):
         return None

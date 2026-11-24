@@ -1644,6 +1644,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ships a save as the hashes of its new chunks instead of the whole token
     # prefix, so the TP workers do no O(context) work per save. Off by default.
     "ATOM_OFFLOAD_PREHASHED_SAVE": lambda: _flag_env("ATOM_OFFLOAD_PREHASHED_SAVE"),
+    # With ATOM_OFFLOAD_PREHASHED_SAVE: a tier load ships the hashes of the
+    # chunks it loads instead of the prompt prefix, and the worker retrieves
+    # them without re-hashing the prefix. Off by default.
+    "ATOM_OFFLOAD_PREHASHED_LOAD": lambda: _flag_env("ATOM_OFFLOAD_PREHASHED_LOAD"),
     # With ATOM_OFFLOAD_PREHASHED_SAVE: tier lookups run on a scheduler-side
     # thread, and a request whose HBM prefix leaves too little uncached to load
     # is admitted without waiting for its lookup. Off by default.
@@ -1682,6 +1686,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT": lambda: _flag_env(
         "OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT", "1"
     ),
+    # Copy a staging group's LMCache chunks with one host call and take each
+    # chunk's bytes without a tensor op, instead of several calls per chunk.
+    # Off by default.
+    "OFFLOAD_BATCHED_HOST_COPY": lambda: _flag_env("OFFLOAD_BATCHED_HOST_COPY"),
     # Experimental: run the staging pack and copy legs on one stream.
     "OFFLOAD_SINGLE_STREAM": lambda: _flag_env("OFFLOAD_SINGLE_STREAM"),
     # GPU staging buffer size in LMCache chunks, and an upper bound in bytes.

@@ -311,7 +311,6 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         assert ls is not None
         hbm = int(ls.hbm_cached_tokens)
         lmc = int(ls.lmcache_cached_tokens)
-        toks = req.token_ids[:lmc]
         t_total0 = time.perf_counter()
         if lmc <= hbm:
             self._lookup_unpin(req.req_id)
@@ -333,21 +332,12 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 self._record_load_error_blocks(req)
             return
 
-        mask = torch.ones(len(toks), dtype=torch.bool)
-        mask[:hbm] = False
-
         t_retrieve0 = time.perf_counter()
         self._reset_gpu_connector_transfer_stats()
-        ret_mask = self._engine.retrieve(
-            tokens_to_tensor(toks),
-            mask=mask,
-            block_ids=req.block_ids,
-            req_id=str(req.req_id),
-        )
+        loaded, retrieved = self._retrieve(req, hbm, lmc)
         retrieve_ms = (time.perf_counter() - t_retrieve0) * 1000
         transfer_stats = self._last_gpu_connector_transfer_stats()
         self._lookup_unpin(req.req_id)
-        loaded = bool(ret_mask[hbm:lmc].all().item())
         with self._lock:
             if loaded:
                 self._done_load.add(self._load_completion_id(req))
@@ -369,7 +359,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 req.req_id,
                 hbm,
                 lmc,
-                int(ret_mask.sum().item()),
+                retrieved,
                 "ok" if loaded else "miss",
                 int(transfer_stats.get("chunks", 0)),
                 int(transfer_stats.get("groups", 0)),
@@ -387,6 +377,22 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 retrieve_ms,
                 total_ms,
             )
+
+    def _retrieve(self, req: LMCacheReqMeta, hbm: int, lmc: int) -> tuple[bool, int]:
+        """Retrieve tokens ``[hbm, lmc)`` into ``req.block_ids``.
+
+        Returns whether all of them arrived and how many tokens did.
+        """
+        toks = req.token_ids[:lmc]
+        mask = torch.ones(len(toks), dtype=torch.bool)
+        mask[:hbm] = False
+        ret_mask = self._engine.retrieve(
+            tokens_to_tensor(toks),
+            mask=mask,
+            block_ids=req.block_ids,
+            req_id=str(req.req_id),
+        )
+        return bool(ret_mask[hbm:lmc].all().item()), int(ret_mask.sum().item())
 
     def _do_save_req(self, req: LMCacheReqMeta, *, producer_event=None) -> None:
         ss = req.save_spec
