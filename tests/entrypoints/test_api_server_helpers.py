@@ -16,6 +16,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import inspect
+import os
 import sys
 import textwrap
 import threading
@@ -1391,3 +1392,54 @@ def test_reasoning_and_tool_setup_publishes_every_module_global(
     assert api_server.tool_call_parser_cls == "parser"
     assert api_server.preserve_tool_call_arguments is preserve
     assert api_server.required_tool_channel == "channel"
+
+
+# --api-server-count > 1: the front-end workers are spawned with jemalloc
+# preloaded, and only they are.
+
+
+@pytest.fixture
+def no_preload(monkeypatch):
+    monkeypatch.delenv("LD_PRELOAD", raising=False)
+
+
+def test_preload_is_set_only_while_the_workers_are_spawned(monkeypatch, no_preload):
+    monkeypatch.setattr(api_server, "_find_jemalloc", lambda: "/lib/libjemalloc.so.2")
+    with api_server._frontend_allocator_env() as lib:
+        assert lib == "/lib/libjemalloc.so.2"
+        assert os.environ["LD_PRELOAD"] == "/lib/libjemalloc.so.2"
+    assert "LD_PRELOAD" not in os.environ
+
+
+def test_an_existing_preload_is_kept_behind_jemalloc_and_restored(monkeypatch):
+    monkeypatch.setenv("LD_PRELOAD", "/lib/libother.so")
+    monkeypatch.setattr(api_server, "_find_jemalloc", lambda: "/lib/libjemalloc.so.2")
+    with api_server._frontend_allocator_env():
+        assert os.environ["LD_PRELOAD"] == "/lib/libjemalloc.so.2:/lib/libother.so"
+    assert os.environ["LD_PRELOAD"] == "/lib/libother.so"
+
+
+def test_a_preload_that_already_has_jemalloc_is_left_alone(monkeypatch):
+    monkeypatch.setenv("LD_PRELOAD", "/opt/libjemalloc.so.2")
+    monkeypatch.setattr(
+        api_server, "_find_jemalloc", lambda: pytest.fail("must not search")
+    )
+    with api_server._frontend_allocator_env() as lib:
+        assert lib == "/opt/libjemalloc.so.2"
+    assert os.environ["LD_PRELOAD"] == "/opt/libjemalloc.so.2"
+
+
+def test_without_jemalloc_the_workers_keep_glibc(monkeypatch, no_preload, caplog):
+    monkeypatch.setattr(api_server, "_find_jemalloc", lambda: None)
+    with api_server._frontend_allocator_env() as lib:
+        assert lib is None
+        assert "LD_PRELOAD" not in os.environ
+    assert "LD_PRELOAD" not in os.environ
+    assert any("libjemalloc.so.2 not found" in r.message for r in caplog.records)
+
+
+def test_the_preload_is_restored_when_a_spawn_fails(monkeypatch, no_preload):
+    monkeypatch.setattr(api_server, "_find_jemalloc", lambda: "/lib/libjemalloc.so.2")
+    with pytest.raises(RuntimeError), api_server._frontend_allocator_env():
+        raise RuntimeError("spawn failed")
+    assert "LD_PRELOAD" not in os.environ
