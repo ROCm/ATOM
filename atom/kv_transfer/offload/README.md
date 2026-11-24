@@ -1573,7 +1573,17 @@ boundary, and a demotion moves only KV pages. It is refused at startup unless:
 - prehashed saves are on: `ATOM_OFFLOAD_PREHASHED_SAVE=1`, `PYTHONHASHSEED`
   set for the builtin hash, no blending;
 - LMCache KV events are off;
-- prefix caching is on, `pipeline_parallel_size` is 1, and the role saves.
+- prefix caching is on and the role saves.
+
+Under pipeline parallelism the head's scheduler demotes for every stage: each
+stage stores its own layers of the demoted blocks under its own LMCache worker
+id (`pp_rank * tp + tp_rank`), the blocks stay pinned until every stage has
+reported (`PPKVAggregator`), and any stage's failure leaves them unsaved. A
+load likewise completes only once every stage has loaded. A lookup counts a
+chunk only if every worker it asks holds it, so leave
+`LMCACHE_LOOKUP_SERVER_WORKER_IDS` unset or list all PP x TP workers.
+`LMCACHE_MAX_LOCAL_CPU_SIZE` is still per GPU: the stages share PP times it in
+proportion to their layers (`scale_cpu_size_for_pp`).
 
 Use it when the sessions that come back hold more KV than the CPU tier keeps
 on its own: eager's tier is then full, most of it copies of blocks HBM still

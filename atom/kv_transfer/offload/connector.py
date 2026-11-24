@@ -248,6 +248,11 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         if callable(callback):
             callback(block_manager)
 
+    def bind_save_abandoned(self, report) -> None:
+        callback = getattr(self._impl, "bind_save_abandoned", None)
+        if callable(callback):
+            callback(report)
+
     def prefetch_lookups(self, seqs) -> None:
         callback = getattr(self._impl, "prefetch_lookups", None)
         if callable(callback):
