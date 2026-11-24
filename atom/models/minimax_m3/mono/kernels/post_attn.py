@@ -20,26 +20,20 @@ S = 1..MAX_TOKENS tokens (each token's stage tasks side by side); for one token:
             -> acc = bf16(sum) + h   (h_mid = bf16(acc), mailbox ``a`` = acc)
     router: gemma RMSNorm(acc) in the fused all-reduce's reduction order -> bf16
             gate GEMV -> logits; publishes its slice of the normalized input
-            (MXFP4 for the routed experts, MXFP8 for the shared one;
-            ``fused_shared``: MXFP8 alone)
+            (MXFP4 for the routed experts, MXFP8 for the shared one)
     moe   : sigmoid + bias top-4 -> a4w4 up/gate (MXFP4 xn x MXFP4 weights on
             aiter's shuffled layout) -> swiglu -> mid (bf16-rounded); the
             unfused MXFP8 shared expert's up/gate runs beside them;
             the CTA's down task reuses that routing, its weights prefetched
             under the up/gate GEMV: route-weighted down GEMV on the MXFP4 mids
             (+ the shared expert's MXFP8 one) -> push bf16 partial rows ->
-            rank-ordered sum -> ar_out = bf16(sum). ``fused_shared``: the
-            shared expert is the MXFP4 tables' expert ``SHARED_EXPERT``, a
-            fifth slot, and every slot runs a8w4 (MXFP8 xn and mids x MXFP4
-            weights)
+            rank-ordered sum -> ar_out = bf16(sum)
 
 From ``WIDE_FROM`` tokens the MoE groups its work by expert (``wide_moe``): the
 router tasks publish xn as plain words, each up / gate task pair runs one distinct
 expert's 32 rows for every token routed to it (a B column per token) and publishes
-mid rows and their codes (MXFP4 ``mid4p`` / ``mids4p``, the shared expert's pairs
-after the grouped loop MXFP8 ``mid8p`` / ``midsp``; ``fused_shared``: every slot's
-MXFP8 ``mid8f`` / ``midsf``), and a down task sums over the step's (expert, token)
-mids. From ``AG_RS_FROM`` tokens both all-reduces are a reduce-scatter to
+MXFP4 mid rows and their codes, and a down task sums over the step's (expert,
+token) mids. From ``AG_RS_FROM`` tokens both all-reduces are a reduce-scatter to
 the row group's owner rank, which sums in rank order and all-gathers the result.
 
 The next layer's K1 takes (ar_out, h_mid) exactly as the original path's fused
@@ -182,6 +176,7 @@ class K4Build:
     attn_mxfp8: bool = (
         False  # qkv / o_proj are native MXFP8 1x32 (E8M0 scales), not ptpc fp8
     )
+    w13_gugu: bool = False  # routed w13 16-row blocks gate / up interleaved
     fused_shared: bool = False
 
 
@@ -203,6 +198,7 @@ def build_post_attn_kernel(
     kv_nvfp4: bool = False,
     index_nvfp4: bool = False,
     attn_mxfp8: bool = False,
+    w13_gugu: bool = False,
     fused_shared: bool = False,
 ):
     """``@flyc.jit`` launcher of K4 for one rank of an ``npes``-way TP group and a
@@ -240,7 +236,8 @@ def build_post_attn_kernel(
         index_topk=index_topk, fuse_k1=fuse_k1, sm_scale=sm_scale, eps=eps,
         route_scale=route_scale, shared_weight=shared_weight,
         swiglu_limit=swiglu_limit, debug=debug, kv_nvfp4=kv_nvfp4,
-        index_nvfp4=index_nvfp4, attn_mxfp8=attn_mxfp8, fused_shared=fused_shared,
+        index_nvfp4=index_nvfp4, attn_mxfp8=attn_mxfp8, w13_gugu=w13_gugu,
+        fused_shared=fused_shared,
     )  # fmt: skip
     build_key = key_tuple(key, SOURCES)  # the launcher references it: keyed
     # a debug build's wait records name a region by its ``region_id``
@@ -350,8 +347,7 @@ def build_post_attn_kernel(
         wave = tid // 64
         g4 = lane // 16
         l16 = lane % 16
-        smem = fx.SharedAllocator()
-        lds = smem.allocate(Smem).peek()
+        lds = fx.SharedAllocator().allocate(Smem).peek()
         xs = lds.x.ptr
         red = lds.red.ptr
         p8 = lds.p8.ptr
@@ -421,6 +417,10 @@ def build_post_attn_kernel(
         def peer_addr(w):
             return load_ptr64(peers, w)
 
+        def own_task(t):
+            """Whether this rank sums (and gathers) row group t's all-reduce."""
+            return t % W == rank
+
         def start(name):
             return first_task(bid, BASE[name])
 
@@ -483,7 +483,6 @@ def build_post_attn_kernel(
                 index_nvfp4=index_nvfp4,
                 attn_mxfp8=attn_mxfp8,
                 xsc=xs + tokens * (HIDDEN // 4) if attn_mxfp8 else None,
-                alloc=smem,
             )  # fmt: skip
             gpu.barrier()
             k1_mbox = Mailbox(layer, diag, REGION_IDS)
@@ -608,20 +607,14 @@ def build_post_attn_kernel(
         W_MIDSC = (MID_ROWS + 1) * MID_ROW
         # up / gate tasks go in pairs, a CTA runs both: an MXFP8 block is 32 rows
         UG_PAIRS = UG_PER_SLOT // 2
-        # the MXFP8 shared expert's pairs sit on UG_PAIRS CTAs, one each, that take
-        # UG_SHARED_UNITS routed pairs fewer (``stage_moe_wide``); a shared pair costs
-        # its host as much as that many routed pairs: measured
-        # layer time at S = 8 / 16 with 2 / 3 / 4 / 5 / 6: 87.2 / 83.2 / 83.2 / 82.8 / 84.5
-        # and 127.3 / 123.0 / 123.0 / 122.7 / 124.5 us (the shared pair's loads and
-        # sync are latency, not bytes, so it weighs more than its 2 pairs' bytes)
-        UG_SHARED_UNITS = 4
-        # up / gate tasks a CTA runs (``fused_shared``: the shared expert is the
-        # union's last expert, its pairs dealt as the routed ones)
+        # up / gate tasks a routed CTA runs. ``fused_shared``: the shared expert is the
+        # union's last expert, its pairs dealt over every CTA as the routed ones; else the
+        # MXFP8 shared expert's pairs sit on the last UG_PAIRS CTAs, one each and no routed
+        # pair (``stage_moe_wide``): the routed pairs go to the other G - UG_PAIRS
         UGW_ITERS = (
             2 * ((U_MAX * UG_PAIRS + G - 1) // G)
             if fused_shared
-            else 2
-            * (((U_MAX - 1) * UG_PAIRS + UG_SHARED_UNITS * UG_PAIRS + G - 1) // G)
+            else 2 * (((U_MAX - 1) * UG_PAIRS + G - UG_PAIRS - 1) // (G - UG_PAIRS))
         )
         # (expert, chunk) units whose weights are in flight
         DN_DEPTH = 12 if fused_shared else 20

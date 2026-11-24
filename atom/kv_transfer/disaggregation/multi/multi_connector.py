@@ -65,6 +65,7 @@ from atom.kv_transfer.disaggregation.base import (
 )
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.disaggregation.types import (
+    mono_offload_hazard,
     ConnectorMetadata,
     KVConnectorOutput,
     connector_metadata_has_work,
@@ -936,6 +937,11 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             c.has_pending_work()
             for c in self._connectors
             if hasattr(c, "has_pending_work")
+        )
+
+    def mono_hazard(self) -> bool:
+        return any(
+            mono_offload_hazard(c) for c in self._connectors
         )
 
     def admission_ready(self, seq: Any) -> bool:

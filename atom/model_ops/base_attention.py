@@ -1074,6 +1074,67 @@ def unified_attention_fp8(
     return output
 
 
+def _attention_ak_oproj_fake(
+    q: torch.Tensor,
+    q_scale: torch.Tensor | None,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    qkv: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    ak_weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    return torch.empty(
+        (q.shape[0], weight.shape[0]), dtype=torch.bfloat16, device=q.device
+    )
+
+
+@mark_spliting_op(is_custom=True, gen_fake=_attention_ak_oproj_fake, mutates_args=[])
+@eager_region()
+def unified_attention_ak_oproj(
+    q: torch.Tensor,
+    q_scale: torch.Tensor | None,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    qkv: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    ak_weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    """``unified_attention_with_output_base`` followed by its MXFP8 o_proj (no bias, no reduce)
+    (ATOM_M3_AK_DECODE_QOUT, p1/attn-decode). When the impl's amd-kernels decode route wrote
+    o_proj's MXFP8 input itself (``impl._ak_qout_result``) the GEMM reads those codes
+    (``mxfp8_gemm_prequant`` layout); every other path (prefill, > 16 requests, < 8 rows,
+    dummy runs) returns bf16 and o_proj runs exactly as before (``ak_mxfp8_linear``)."""
+    from atom.model_ops.ak_gemm import ak_mxfp8_linear
+    from atom.model_ops.minimax_m3 import ak_kernels
+
+    self = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    impl = self.impl
+    impl._ak_qout_n = weight.shape[0]
+    impl._ak_qout_result = None
+    try:
+        out = impl.forward(
+            query=q, key=k, value=v, position=positions, q_scale=q_scale, qkv=qkv
+        )
+        res = impl._ak_qout_result
+    finally:
+        impl._ak_qout_n = None
+        impl._ak_qout_result = None
+    if res is not None:
+        quant_out, rows = res
+        return ak_kernels.prequant_linear(quant_out, rows, weight, ak_weight_scale)
+    return ak_mxfp8_linear(
+        out.view(q.shape[0], -1), weight, weight_scale, ak_weight_scale
+    )
+
+
 def linear_attention_with_output_base_fake(
     mixed_qkv: torch.Tensor,
     b: torch.Tensor,

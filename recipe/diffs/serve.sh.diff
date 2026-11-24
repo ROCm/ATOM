@@ -1,0 +1,25 @@
+--- /shared_nfs/ygan/max/bin/serve.sh	2026-11-19 05:18:46.000727959 +0000
++++ /shared_nfs/ygan/p1/milestone2/recipe/serve.sh	2026-11-19 19:50:24.476966333 +0000
+@@ -16,10 +16,10 @@
+ MAX_SEQS=${MAX_SEQS:-$((2 * CONC))}
+ MODEL=/shared_nfs/models/amd/MiniMax-M3.1-Flash-Quark-MXFP4
+ D=/shared_nfs/ygan/max
+-LOG=$D/logs/server_${TAG}.log
++LOG=/shared_nfs/ygan/p1/milestone2/logs/server_${TAG}.log
+ export PYTHONPATH=${PYPATH_PRE:+$PYPATH_PRE:}$REPO
+-export HOME=$D/home/$TAG; mkdir -p "$HOME"
+-export FLYDSL_RUNTIME_CACHE_DIR=${FLYDSL_RUNTIME_CACHE_DIR:-$D/flydsl_cache}; mkdir -p "$FLYDSL_RUNTIME_CACHE_DIR"
++export HOME=/mnt/m2m_nobackup/ygan/p1/milestone/home/$TAG; mkdir -p "$HOME"
++export FLYDSL_RUNTIME_CACHE_DIR=${FLYDSL_RUNTIME_CACHE_DIR:-/mnt/m2m_nobackup/ygan/p1/milestone/flydsl}; mkdir -p "$FLYDSL_RUNTIME_CACHE_DIR"
+ export USER=ygan LOGNAME=ygan ARCH=gfx950 HSA_ENABLE_IPC_MODE_LEGACY=1
+ export NCCL_IB_DISABLE=1 RCCL_IB_DISABLE=1 AITER_LOG_LEVEL=WARNING ATOM_FORCE_ATTN_TRITON=1 PYTHONHASHSEED=0
+ export ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4=0
+@@ -34,7 +34,7 @@
+ [ "$AL" != real ] && spec+=(--spec-decode-acceptance-length "$AL")
+ cd "$REPO" || exit 1
+ { echo "### $(date -Is) tag=$TAG conc=$CONC max_seqs=$MAX_SEQS port=$PORT k=$DSPARK_K al=$AL mem=$MEM gpus=${HIP_VISIBLE_DEVICES:-?} repo=$REPO"
+-  git -C "$REPO" log -1 --format="### atom commit: %h %s"; echo "### extra: ${EXTRA:-}"; env | grep -E '^(ATOM_|AITER_|LMCACHE_)' | sort | sed 's/^/### env /'; } > "$LOG"
++  git -c safe.directory='*' -C "$REPO" log -1 --format="### atom commit: %h %s"; echo "### extra: ${EXTRA:-}"; env | grep -E '^(ATOM_|AITER_|LMCACHE_)' | sort | sed 's/^/### env /'; } > "$LOG"
+ exec python3 -u -m atom.entrypoints.openai_server \
+   --model "$MODEL" --served-model-name minimax-m3.1 \
+   --host 0.0.0.0 --port $((PORT + 6)) --server-port "$PORT" \

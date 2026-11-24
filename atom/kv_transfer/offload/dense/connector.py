@@ -69,6 +69,7 @@ from atom.kv_transfer.offload.metadata import (
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
 )
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -508,10 +509,17 @@ class DenseOffloadScheduler(ChunkedOffloadSchedulerBase):
             from lmcache.v1.lookup_client.factory import LookupClientFactory
 
             lookup_client = LookupClientFactory.create_lookup_client(cfg, meta)
+            if envs.OFFLOAD_INPROC_ASYNC_LOOKUP:
+                from atom.kv_transfer.offload.inproc_async_lookup import (
+                    AsyncInprocLookup,
+                )
+
+                lookup_client = AsyncInprocLookup(lookup_client)
             logger.info(
-                "LMCache offload scheduler: lookup client on %s (world=%d)",
+                "LMCache offload scheduler: lookup client on %s (world=%d, %s)",
                 meta.engine_id,
                 world,
+                "async" if envs.OFFLOAD_INPROC_ASYNC_LOOKUP else "sync",
             )
         except Exception as e:  # noqa: BLE001  # optional lookup service
             logger.warning(

@@ -75,6 +75,7 @@ from atom.model_engine.page_unit_checkpoint import (
     PagedStateCheckpointSpec,
     published_page_unit_bytes,
 )
+from atom.model_engine import sched_timing
 from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import (
     ScheduledBatch,
@@ -346,7 +347,7 @@ class tokenIDProcessor:
         if not cpu_tensor_handle:
             return torch.empty(0, dtype=torch.int32, device="cpu")
         cpu_tensor, copy_done, _ = cpu_tensor_handle[0]
-        copy_done.synchronize()
+        sched_timing.timed_sync(copy_done)
         # Pop only after the wait: the pop drops the GPU sources, and the
         # allocator may reuse them once the copy has completed.
         cpu_tensor_handle.pop(0)
@@ -852,6 +853,8 @@ class ModelRunner:
     # past the target's launch (`prepare_model`).
     verify_head: VerifyHead | None = None
     spec_status_deferred = False
+    _sched_timer = None
+    _st_marks = [0.0, 0.0, 0.0]
 
     def __init__(self, rank: int, config: Config):
         self.config = config
@@ -1069,6 +1072,12 @@ class ModelRunner:
         self._init_forward_vars_ring()
         self._init_h2d_publication()
         self.forward_done_event = torch.cuda.Event()
+        self._st_marks = [0.0, 0.0, 0.0]
+        self._st_last_end = None
+        self._sched_timer = None
+        if sched_timing.ENABLED and rank == 0:
+            self._sched_timer = sched_timing.StepTimer("worker0")
+            self._st_gpu = sched_timing.GpuGapTimer(self._sched_timer)
         initialize_eplb_runtime(self)
         self._maybe_warmup()
 
@@ -1408,6 +1417,28 @@ class ModelRunner:
         start_time = time.time()
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
+        # Diagnostic: the allocator history of the profiling forward, whose peak
+        # sizes every non-KV byte the budget reserves.
+        memsnap = os.environ.get("ATOM_WARMUP_MEMSNAP")
+        if memsnap:
+            torch.cuda.memory._record_memory_history(max_entries=2_000_000)
+        resident = torch.cuda.memory_allocated()
+        try:
+            self._warmup_model(start_time)
+        finally:
+            logger.info(
+                "%s: profiling forward over %.2f GiB resident: peak %.2f GiB "
+                "(+%.2f GiB activations)",
+                self.label,
+                resident / (1 << 30),
+                torch.cuda.max_memory_allocated() / (1 << 30),
+                (torch.cuda.max_memory_allocated() - resident) / (1 << 30),
+            )
+            if memsnap:
+                torch.cuda.memory._dump_snapshot(f"{memsnap}.rank{self.rank}.pickle")
+                torch.cuda.memory._record_memory_history(enabled=None)
+
+    def _warmup_model(self, start_time: float):
         max_model_len = self.config.max_model_len
         dp_size = get_dp_group().world_size
         warmup_max_tokens = self.warmup_max_tokens()
@@ -2203,7 +2234,8 @@ class ModelRunner:
             f"free={free / (1 << 30):.2f}GB, "
             f"utilization={config.gpu_memory_utilization}, "
             f"budget={budget / (1 << 30):.2f}GB, "
-            f"peak_torch={peak_torch / (1 << 30):.2f}GB, "
+            f"peak_torch={peak_torch / (1 << 30):.2f}GB "
+            f"(current={current / (1 << 30):.2f}GB), "
             f"non_torch={non_torch / (1 << 30):.2f}GB, "
             f"cudagraph_est={cudagraph_overhead / (1 << 30):.2f}GB, "
             f"safety={safety_margin / (1 << 30):.2f}GB, "
@@ -2828,16 +2860,31 @@ class ModelRunner:
             ] = batch.required_channel_states
             channel_count = bs
 
+        # Each request's allocated pages for a DSpark draft that builds its
+        # block metadata on the device (`DSparkProposer._fused_meta`): the
+        # length of its block table, which is what the table staged for this
+        # step holds. Only where every request of the batch has one, in order.
+        alloc_count = None
+        alloc_buf = self.forward_vars.get("draft_alloc_pages")
+        if alloc_buf is not None:
+            tables = getattr(batch, "block_tables", None)
+            published = tables is not None and len(tables) == bs
+            if published:
+                alloc_buf.np[:bs] = [len(table) for table in tables]
+                alloc_count = bs
+            self.drafter.alloc_published = published
+
         # Published with the token inputs (`prepare_input_ids`).
-        publication_group.set_counts(
-            {
-                "temperatures": bs,
-                "top_ks": top_k_count,
-                "top_ps": top_p_count,
-                "required_channel_states": channel_count,
-                "logprob_request_indices": logprob_count,
-            }
-        )
+        counts = {
+            "temperatures": bs,
+            "top_ks": top_k_count,
+            "top_ps": top_p_count,
+            "required_channel_states": channel_count,
+            "logprob_request_indices": logprob_count,
+        }
+        if alloc_buf is not None:
+            counts["draft_alloc_pages"] = alloc_count
+        publication_group.set_counts(counts)
         # The draft's own inputs (its Philox key and where its q goes), staged into
         # the same publication so the upload stays a single batched H2D and is
         # covered by this forward's staging window.
@@ -2859,8 +2906,55 @@ class ModelRunner:
 
         return temperatures, top_ks, top_ps, all_greedy, needs_independent_noise
 
+    def _may_take_mono(self, batch: ScheduledBatch) -> bool:
+        """Whether this step's target forward can run Mono kernels: a decode of
+        at most the model's Mono rows (a graph only pads rows up), not kept off
+        Mono by the GPU guard."""
+        rows_max = getattr(self.model, "mono_rows_max", 0)
+        return (
+            bool(rows_max)
+            and not batch.total_seqs_num_prefill
+            and not getattr(batch, "mono_blocked", False)
+            and batch.total_seqs_num * (batch.num_spec_step + 1) <= rows_max
+        )
+
+    def _fence_side_copies(self, before: bool) -> None:
+        """Keep the async D2H stream's copies off the target forward's kernels.
+
+        ROCm runs these small D2H copies as blit kernels on their own queue. A
+        Mono step's CTAs spin on each other, and a kernel dispatched beside
+        them can stall the step until the GPU's queues are remapped
+        (ROCm/ATOM#3369; base0_c8 hung 212 s). Before the forward the compute
+        stream waits for every copy queued so far; after its launch the copy
+        stream waits for the compute stream, so a copy queued later starts once
+        the target forward is done. The copies are a few hundred bytes.
+        """
+        if torch.cuda.is_current_stream_capturing():
+            return
+        copies = self.tokenID_processor.async_copy_stream
+        main = torch.cuda.current_stream()
+        if before:
+            main.wait_stream(copies)
+        else:
+            copies.wait_stream(main)
+
+    def _mono_blocked_step(self, batch: ScheduledBatch) -> bool:
+        """Whether this step must stay off Mono (the engine's GPU guard saw another
+        process on the TP GPUs, ``atom.utils.gpu_guard``): the model is told, and
+        True when a graph captured on Mono could replay it, so it runs eagerly."""
+        blocked = bool(getattr(batch, "mono_blocked", False))
+        setter = getattr(self.model, "mono_set_blocked", None)
+        if setter is not None:
+            setter(blocked)
+        tokens = getattr(self.model, "mono_graph_tokens", None)
+        if not blocked or not tokens or batch.total_seqs_num_prefill:
+            return False
+        # a graph only pads rows up, so a step past the largest Mono graph replays none
+        return batch.total_seqs_num * (batch.num_spec_step + 1) <= max(tokens)
+
     @_profile_runner_stage
     def prepare_model(self, batch: ScheduledBatch):
+        mono_blocked = self._mono_blocked_step(batch)
         shrunk_q = self._dspark_apply_q_bucket(batch)
         # The step's shape, settled once. Here rather than in prepare_inputs
         # because DSpark under DP needs the reduced query length BEFORE
@@ -2872,7 +2966,8 @@ class ModelRunner:
             dp_size=dp_size,
             dp_group=get_dp_group().cpu_group if dp_size > 1 else None,
             enforce_eager=self.enforce_eager,
-            step_needs_eager=self.attn_metadata_builder.step_needs_eager(batch),
+            step_needs_eager=self.attn_metadata_builder.step_needs_eager(batch)
+            or mono_blocked,
             capture_sizes=self.capture_sizes_np,
             is_block_drafter=(
                 hasattr(self, "drafter") and self.drafter.is_block_drafter
@@ -3351,6 +3446,9 @@ class ModelRunner:
                         running_bs, forward_context.attn_metadata.max_seqlen_q
                     )
                 )
+                note = getattr(self.model, "mono_note_replay", None)
+                if note is not None:
+                    note(running_tokens)
                 # Drafter aux buffers (if any) refresh on replay: their in-place
                 # copy ops were captured into the graph.
                 hidden_states = self.forward_vars["outputs"][:running_tokens]
@@ -3752,6 +3850,34 @@ class ModelRunner:
     @torch.inference_mode()
     @with_eplb_forward_monitor
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
+        st = self._sched_timer
+        if st is None or batch.is_dummy_run:
+            return self._forward(batch)
+        t0 = time.perf_counter()
+        if self._st_last_end is not None:
+            st.add("wk_idle", t0 - self._st_last_end)
+        self._st_gpu.start()
+        sched_timing.SYNC_WAIT[0] = 0.0
+        out = self._forward(batch)
+        kind = "p" if batch.total_seqs_num_prefill else "d"
+        self._st_gpu.end(
+            sched_timing.prefill_kind(batch.total_tokens_num_prefill)
+            if kind == "p"
+            else kind
+        )
+        t1 = time.perf_counter()
+        st.add(f"wk_sync_{kind}", sched_timing.SYNC_WAIT[0])
+        marks = self._st_marks
+        st.add("wk_gate", marks[0] - t0)
+        st.add("wk_prepare", marks[1] - marks[0])
+        st.add("wk_launch", marks[2] - marks[1])
+        st.add(f"wk_post_{kind}", t1 - marks[2])
+        st.add(f"wk_fwd_{kind}", t1 - t0)
+        self._st_last_end = t1
+        st.step_done()
+        return out
+
+    def _forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
         # Make this forward's staging buffers safe to overwrite before
         # prepare_inputs writes them: rotate to a free slot if there is a ring,
         # otherwise wait out the previous forward's copies.
@@ -3761,6 +3887,8 @@ class ModelRunner:
         # race the dummy's still-pending H2D copies.
         self._advance_forward_vars()
         self._gate_staging_reuse()
+        marks = self._st_marks
+        marks[0] = time.perf_counter()
         (
             input_ids,
             temperatures,
@@ -3773,7 +3901,14 @@ class ModelRunner:
         prepare_token_constraints(
             self, batch, get_forward_context().spec_decode_metadata
         )
+        marks[1] = time.perf_counter()
+        fence = self._may_take_mono(batch)
+        if fence:
+            self._fence_side_copies(before=True)
         hidden_states = self.run_model(input_ids, batch)
+        if fence:
+            self._fence_side_copies(before=False)
+        marks[2] = time.perf_counter()
         # The status this step deferred (`prepare_model`), after the launch.
         if self.spec_status_deferred:
             self.tokenID_processor.take_deferred_spec_status()
@@ -4229,6 +4364,10 @@ class ModelRunner:
 
         full_q_len = self.drafter.mtp_k + 1 if hasattr(self, "drafter") else 1
         warmup_exchange(self.device, self.config.max_num_seqs * full_q_len)
+        # p1/indexer-cp (ATOM_P1_INDEXER_SPLIT4): the four-GPU decode indexer's buffers, before any capture
+        from atom.model_ops.minimax_m3 import ak_kernels
+
+        ak_kernels.init_split4(self.device, full_q_len, self.config.max_num_seqs, self.config.max_model_len)
 
         tr_hybrid = self._tr_hybrid_active()
         if tr_hybrid:
@@ -4392,7 +4531,10 @@ class ModelRunner:
             # made by the drafter and ragged bucket builder.
             return self._build_capture(stage_and_build, *args, **kwargs)
 
-        with pause_gc(), graph_capture(), self.capture_profiler as prof:
+        from atom.model_ops.layernorm import ak_ar_norm_capture
+        from atom.models.minimax_m3.draft_fused import draft_ar_capture
+
+        with pause_gc(), graph_capture(), ak_ar_norm_capture(), draft_ar_capture(), self.capture_profiler as prof:
             for max_q_len in q_buckets:
                 capture_range = (
                     tqdm.tqdm(self.capture_sizes)

@@ -529,7 +529,6 @@ def o_defs(k4ctx):
     mr = k4ctx["mr"]
     peer_addr = k4ctx["peer_addr"]
     push_rows = k4ctx["push_rows"]
-    rank = k4ctx["rank"]
     rdone_mb = k4ctx["rdone_mb"]
     red = k4ctx["red"]
     s_o = k4ctx["s_o"]
@@ -539,6 +538,7 @@ def o_defs(k4ctx):
     tid = k4ctx["tid"]
     tokens = k4ctx["tokens"]
     v4f = k4ctx["v4f"]
+    own_task = k4ctx["own_task"]
     w_o = k4ctx["w_o"]
     wave = k4ctx["wave"]
     xs = k4ctx["xs"]
@@ -706,7 +706,7 @@ def o_defs(k4ctx):
             if const_expr(AG_RS):  # noqa: SIM102
                 # the owner sums every peer's partials in rank order and gathers
                 # the sums to every rank's a_ag (h_mid: the router tasks)
-                if (t % W == rank) & (tid < O_ROWS // 2 * tokens):
+                if own_task(t) & (tid < O_ROWS // 2 * tokens):
                     ptk = tid // (O_ROWS // 2)
                     row = t * O_ROWS + (tid % (O_ROWS // 2)) * 2
                     own = preg(sym, SY["attn"], "attn")

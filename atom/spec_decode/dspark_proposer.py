@@ -82,6 +82,50 @@ class DSparkProposer(Drafter):
         self.dcp_rank = get_dcp_rank()
         if self._with_draft:
             self._init_draft_block_buffers()
+        # A draft that builds its block metadata in one kernel reads each
+        # request's allocated pages from the step's batched upload
+        # (`ModelRunner.prepare_sample` fills it), not a copy of its own.
+        self._fused_meta = (
+            self._with_draft
+            and not self.model.block_attention_is_mla
+            and getattr(self.model, "fused_block_metadata_ok", lambda: False)()
+        )
+        if self._fused_meta:
+            from atom.utils import CpuGpuBuffer
+
+            self.metadata_buffers["draft_alloc_pages"] = CpuGpuBuffer(
+                self.config.max_num_seqs,
+                dtype=torch.int32,
+                device=self.device,
+                pin_memory=torch.device(self.device).type != "cpu",
+                publication_group="sampling",
+            )
+        # Whether this step's `draft_alloc_pages` were published (host flag).
+        self.alloc_published = False
+
+    def _pinned_draft_bs(self, running_bs: int, context) -> int:
+        """``ATOM_P1_DRAFT_BS_LADDER``: the batch a step's block runs at, the
+        smallest ladder entry >= ``running_bs`` (``running_bs`` itself when the
+        flag is off, lossless sampling is armed or nothing on the ladder is
+        large enough). A prefill step's draft is pinned too: the block pass
+        clears ``is_prefill`` and publishes its own ``[running_bs, T]`` shape
+        before it runs, so ``pad_for_all_gather`` checks it like a decode's.
+        A function of the group-agreed ``running_bs`` alone, so every rank
+        picks the same."""
+        ladder = getattr(self, "_p1_bs_ladder", None)
+        if ladder is None:
+            raw = envs.ATOM_P1_DRAFT_BS_LADDER.strip()
+            ladder = sorted({int(x) for x in raw.split(",") if x.strip()}) if raw else []
+            ladder = [b for b in ladder if b <= self.config.max_num_seqs]
+            self._p1_bs_ladder = ladder
+            if ladder:
+                logger.info("ATOM_P1_DRAFT_BS_LADDER: DSpark block batch pinned to %s", ladder)
+        if not ladder or self.lossless is not None:
+            return running_bs
+        for b in ladder:
+            if b >= running_bs:
+                return b
+        return running_bs
 
     def _arm_lossless_draft(self) -> DSparkLossless | None:
         """Allocates only; the runner binds the draft model (`bind_target`)
@@ -738,6 +782,13 @@ class DSparkProposer(Drafter):
         if metadata is not None and metadata.served_by_round:
             return
         forward_context = get_forward_context()
+        # A decode step whose target forward wrote the context rows in its graph
+        # (`MiniMaxM3DSpark.context_in_target`).
+        if (
+            getattr(self.model, "context_in_target", False)
+            and not forward_context.context.is_prefill
+        ):
+            return
         scheduled_bs = forward_context.context.scheduled_bs
         num_rows = positions.shape[0]
         n = hidden_states.shape[0]
@@ -829,6 +880,11 @@ class DSparkProposer(Drafter):
         # doing is its own business, so a rank that skipped this would leave
         # the others waiting in the exchange.
         running_bs = context.running_bs
+        pinned_bs = self._pinned_draft_bs(running_bs, context)
+        if pinned_bs != running_bs:
+            # ATOM_P1_DRAFT_BS_LADDER: the block runs at the ladder's batch; the
+            # rows past the target's are pad rows like any widened batch.
+            context.running_bs = running_bs = pinned_bs
         # The target's own padding does not reach here: its pad rows end at the
         # graph boundary, and the anchors come from the sampler, which runs
         # after the graph over real rows only. So the block pads its own inputs.
@@ -839,6 +895,21 @@ class DSparkProposer(Drafter):
         # slice past the end truncates rather than raising, so the kernels got
         # a slot table shorter than their own grid and read past it.
         pass_ = self._block_pass()
+        if (
+            self._fused_meta
+            and not self._draft_is_dcp_sharded
+            and self._bound_draft_k_cache(forward_context) is not None
+        ):
+            # The anchors are staged by the block-metadata kernel itself.
+            ids = pass_.buffer("anchor_ids", running_bs)
+            anchor_positions = pass_.buffer("anchor_positions", running_bs)
+            stage = (next_token_ids, target_positions, last_token_indices, ids)
+            staged = pass_.stage(
+                running_bs, {"anchor_ids": ids, "anchor_positions": anchor_positions}
+            )
+            return self._propose_with_draft(
+                pass_, forward_context, attn_metadata, staged, scheduled_bs, stage
+            )
         staged = self._stage_anchors(
             pass_, running_bs, next_token_ids, target_positions, last_token_indices
         )
@@ -916,6 +987,7 @@ class DSparkProposer(Drafter):
         *,
         scheduled_bs: int,
         max_seqlen_k: int,
+        stage=None,  # fused metadata only: stage the anchors in the same launch
     ) -> None:
         """Retarget `attn_metadata` from the target's step to this draft block.
 
@@ -955,6 +1027,43 @@ class DSparkProposer(Drafter):
         # block -- so the MLA decode runs non-causal. The target rebuilds its
         # own metadata (causal defaults True), so this never leaks back.
         attn_metadata.causal = False
+
+        if (
+            self._fused_meta
+            and not self._draft_is_dcp_sharded
+            and self._bound_draft_k_cache(forward_context) is not None
+        ):
+            # Everything below for a non-MLA block, in one launch (MiniMax-M3.1).
+            fv = self.runner.forward_vars
+            block_tables = fv["block_tables"].gpu[:running_bs]
+            slots = self._blk_slots[: running_bs * T].view(running_bs, T)
+            ctx_lens = self._blk_ctx_lens[:running_bs]
+            published = self.alloc_published
+            self.alloc_published = False
+            self.model.build_block_metadata(
+                attn_metadata,
+                block_tables,
+                anchor_positions,
+                self._blk_positions[:running_bs],
+                slots,
+                ctx_lens,
+                (
+                    fv["draft_alloc_pages"].gpu[:running_bs]
+                    if published
+                    else block_table_state(fv["block_tables"]).lengths
+                ),
+                scheduled_bs,
+                self._draft_entry_tokens,
+                self._paged_pad_ctx_len,
+                stage=stage,
+            )
+            attn_metadata.slot_mapping = slots.view(-1)
+            attn_metadata.block_tables = block_tables
+            attn_metadata.cu_seqlens_q = self._blk_cu_seqlens_q[: running_bs + 1]
+            attn_metadata.context_lens = ctx_lens
+            attn_metadata.max_seqlen_q = T
+            attn_metadata.max_seqlen_k = max_seqlen_k
+            return
 
         # Filled for the PADDED batch: the backbone runs the pad rows too, so
         # they need positions to embed and rotate.
@@ -1216,6 +1325,7 @@ class DSparkProposer(Drafter):
         attn_metadata,
         staged: dict[str, torch.Tensor],  # the anchors, at `running_bs`
         scheduled_bs: int,
+        stage=None,  # the fused metadata kernel stages the anchors from these
     ) -> torch.Tensor:
         """Kimi-K3 DSpark: one non-causal block pass over the paged latent cache.
 
@@ -1236,6 +1346,7 @@ class DSparkProposer(Drafter):
             # Upper bound rather than a .max() host sync: every context_len is
             # at most the target pass's longest sequence plus the block.
             max_seqlen_k=int(attn_metadata.max_seqlen_k) + T,
+            stage=stage,
         )
 
         # `[bs, T]` against a paged KV cache however the target just ran. Left

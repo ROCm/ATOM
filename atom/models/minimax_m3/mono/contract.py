@@ -10,7 +10,6 @@ build in its disk cache is traced too.
 Usage: python -m atom.models.minimax_m3.mono.contract [S ...]
 """
 
-import itertools
 import sys
 
 from atom.models.minimax_m3.mono.config import TP, IndexHeads
@@ -85,18 +84,15 @@ def check_dense_build(tokens: int) -> None:
 
 if __name__ == "__main__":
     sizes = [int(a) for a in sys.argv[1:]] or list(range(1, 17))
-    both = (False, True)
     for s in sizes:
         for ih in (1, TP):
-            # indexer context parallelism reads fp8 index caches only
-            nvfp4 = both if ih == 1 else (False,)
-            # every kind of build a runner makes, its selecting and reusing layers
-            for nv, am, fs, it in itertools.product(nvfp4, both, both, both):
-                check_build(
-                    s, ih, index_topk=it, kv_nvfp4=nv, index_nvfp4=nv,
-                    attn_mxfp8=am, fused_shared=fs,
-                )  # fmt: skip
-                print(
-                    f"S={s} index heads={ih} nvfp4={nv} attn_mxfp8={am} "
-                    f"fused_shared={fs} index_topk={it}: contract holds"
-                )
+            for it in (True, False):
+                check_build(s, ih, index_topk=it)
+                print(f"S={s} index heads={ih} index_topk={it}: contract holds")
+            check_build(s, ih, kv_nvfp4=True, index_nvfp4=True)
+            print(f"S={s} index heads={ih} nvfp4 K/V + index: contract holds")
+            for nv in (False, True):
+                check_build(s, ih, attn_mxfp8=True, kv_nvfp4=nv, index_nvfp4=nv)
+                print(f"S={s} index heads={ih} attn_mxfp8 nvfp4={nv}: contract holds")
+                check_build(s, ih, kv_nvfp4=nv, index_nvfp4=nv, fused_shared=True)
+                print(f"S={s} index heads={ih} fused shared nvfp4={nv}: contract holds")

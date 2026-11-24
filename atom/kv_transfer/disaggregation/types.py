@@ -127,6 +127,18 @@ def raw_req_id(completion: Any) -> ReqId:
     return getattr(completion, "req_id", completion)
 
 
+def mono_offload_hazard(connector: Any) -> bool:
+    """Whether a scheduler-side connector may have worker copy kernels in
+    flight (``mono_hazard``; ``has_pending_work`` for connectors without it)."""
+    if connector is None:
+        return False
+    hazard = getattr(connector, "mono_hazard", None)
+    if callable(hazard):
+        return bool(hazard())
+    pending = getattr(connector, "has_pending_work", None)
+    return bool(pending()) if callable(pending) else False
+
+
 def req_id_of(completion: Any) -> str:
     """`raw_req_id` as a string key."""
     return str(raw_req_id(completion))

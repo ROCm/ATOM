@@ -1757,6 +1757,15 @@ class DSparkConfig:
         if self.draft_kv_dtype == "auto":
             return
         spec = config.speculative_config
+        if (
+            _is_minimax_m3_config(config.hf_config)
+            and spec is not None
+            and spec.method == "dspark"
+            and config.plugin_config is None
+        ):
+            # The M3.1 draft's own pool takes the per-token fp8 rows its fp8-KV
+            # deployments already write, whatever the target's cache is.
+            return
         target_dtypes = ("fp8", "fp4")
         if (
             config.hf_config.model_type != "deepseek_v41_text"
@@ -2040,6 +2049,14 @@ def _check_fp4_kv(kv_cache_dtype: str, *, is_m3: bool, is_v41: bool) -> None:
         )
     if kv_cache_dtype == "nvfp4" and not is_m3:
         raise ValueError("--kv-cache-dtype nvfp4 is supported by MiniMax-M3 only")
+
+
+def _requested_draft_kv_dtype(spec, dspark, is_m3: bool) -> str | None:
+    """``--spec-decode-kv-cache-dtype``; for MiniMax-M3 also the p1 recipes'
+    spelling of an fp8 draft pool, ``--dspark-config draft_kv_dtype=fp8``."""
+    if spec.kv_cache_dtype is None and is_m3 and dspark.draft_kv_dtype == "fp8":
+        return "fp8"
+    return spec.kv_cache_dtype
 
 
 def resolve_draft_kv_dtype(
@@ -3354,7 +3371,7 @@ class Config:
             spec.draft_kv_dtype = resolve_draft_kv_dtype(
                 self.kv_cache_dtype,
                 own_pool=draft_owns_kv_pool(self),
-                requested=spec.kv_cache_dtype,
+                requested=_requested_draft_kv_dtype(spec, self.dspark, is_m3),
             )
             from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
             from atom.models.minimax_m3.config import draft_dtype_moves

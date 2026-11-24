@@ -3,10 +3,11 @@
 """Mono's split-K sparse attention over NVFP4 K/V pages (gfx950, single-buffer 18432 B
 pages, f16 MFMA over the exact dequantized products): the partitions' output, max
 and sum against a torch float64 reference of the same pages, and the merged
-attention against aiter's ``sparse_pa_nvfp4_decode`` (``aiter.ops.flydsl``).
+attention against aiter's ``minimax_m3_sparse_pa_nvfp4_decode``.
 
-Needs ``ATOM_NVFP4_VLLM_REF`` (vLLM's ``tests/kernels/attention``: the page writer);
-skips without it."""
+Needs ``ATOM_NVFP4_VLLM_REF`` (vLLM's ``tests/kernels/attention``: the page writer) and,
+for the aiter comparison, ``ATOM_NVFP4_PA_KERNELS`` (the aiter
+``aiter/ops/flydsl/kernels`` directory of the nvfp4 sparse pa); skips without them."""
 
 import os
 import sys
@@ -17,6 +18,7 @@ import torch
 pytest.importorskip("aiter")
 pytest.importorskip("flydsl")
 VLLM_REF = os.environ.get("ATOM_NVFP4_VLLM_REF")
+PA_KERNELS = os.environ.get("ATOM_NVFP4_PA_KERNELS")
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
     or "gfx950" not in torch.cuda.get_device_properties(0).gcnArchName
@@ -24,51 +26,26 @@ pytestmark = pytest.mark.skipif(
     reason="needs gfx950 and the vLLM reference tree (see the module doc)",
 )
 
-from aiter.ops.flydsl import sparse_pa_nvfp4_decode
-
 from atom.models.minimax_m3.mono.config import HEAD_DIM
-from atom.models.minimax_m3.mono.kernels.common import (
-    KV_K_SCALE_AT,
-    KV_V_SCALE_AT,
-    nvfp4_k_scale_at,
-)
+from atom.models.minimax_m3.mono.kernels.common import KV_V_SCALE_AT, nvfp4_k_scale_at
 from atom.models.minimax_m3.mono.kernels.split_nvfp4 import build_split_nvfp4_kernel
 from atom.models.minimax_m3.mono.layout import N_SPLIT, O_K, SPLIT_KEYS, H
 
 SM_SCALE = HEAD_DIM**-0.5
 
 
-@pytest.fixture
-def ref(monkeypatch):
-    """vLLM's reference module; the import path and ``sys.modules`` (the modules
-    imported from the tree gone, the ones they replaced back) are put back after the
-    test."""
-    import importlib
+def _ref():
+    sys.path.insert(0, VLLM_REF)
+    import minimax_m3_nvfp4_ref as ref
 
-    modules = dict(sys.modules)
-    try:
-        monkeypatch.syspath_prepend(VLLM_REF)
-        sys.modules.pop("minimax_m3_nvfp4_ref", None)
-        yield importlib.import_module("minimax_m3_nvfp4_ref")
-    finally:
-        _restore_modules(modules, (os.path.abspath(VLLM_REF),))
+    return ref
 
 
-def _restore_modules(before, trees):
-    """Every module in ``sys.modules`` loaded from a directory of ``trees``: back to
-    ``before``'s, or gone."""
-    for name, mod in list(sys.modules.items()):
-        if (getattr(mod, "__file__", None) or "").startswith(trees):
-            if name in before:
-                sys.modules[name] = before[name]
-            else:
-                del sys.modules[name]
-
-
-def _case(ref, seed, n_logical, n_sel, tail, k_gs, v_gs, tokens=1):
+def _case(seed, n_logical, n_sel, tail, k_gs, v_gs, tokens=1):
     """A cache of ``n_logical`` blocks (random keys / values written by vLLM's
     writer), a request of ``n_logical`` logical blocks whose last holds ``tail`` keys,
     ``n_sel`` selected blocks (the last logical one among them)."""
+    ref = _ref()
     g = torch.Generator(device="cuda").manual_seed(seed)
     blocks = n_logical
     n = blocks * 128
@@ -137,16 +114,14 @@ def _reference(ref, pages, page_of, sel, q, n_keys, k_gs, v_gs):
 )
 @pytest.mark.parametrize("poison", [False, True])
 def test_split_partitions_match_the_exact_reference(
-    ref, n_logical, n_sel, tail, k_gs, v_gs, poison
+    n_logical, n_sel, tail, k_gs, v_gs, poison
 ):
-    ref, pages, page_of, sel, q, _ctx, _ = _case(
-        ref, 1, n_logical, n_sel, tail, k_gs, v_gs
-    )
+    ref, pages, page_of, sel, q, _ctx, _ = _case(1, n_logical, n_sel, tail, k_gs, v_gs)
     if poison:  # the tail block's keys past the context: NaN scales (stale bytes)
         last = pages[int(page_of[sel[-1]])]
         for t in range(tail, 128):
             for j in range(8):
-                last[KV_K_SCALE_AT + nvfp4_k_scale_at(t, j)] = 0xFF
+                last[8192 + nvfp4_k_scale_at(t, j)] = 0xFF
             for j in range(8):
                 last[KV_V_SCALE_AT + j * 128 + t] = 0xFF
     tbl, n_keys, _n_part = _tables(page_of, sel, tail, 1)
@@ -157,7 +132,7 @@ def test_split_partitions_match_the_exact_reference(
     launch = build_split_nvfp4_kernel(SM_SCALE, N_SPLIT)
     launch(
         tbl.data_ptr(), q.data_ptr(), pages.data_ptr(), gs.data_ptr(),
-        sp_o.data_ptr(), sp_m.data_ptr(), sp_l.data_ptr(),
+        sp_o.data_ptr(), sp_m.data_ptr(), sp_l.data_ptr(), 0,
     )  # fmt: skip
     torch.cuda.synchronize()
     want = _reference(ref, pages, page_of, sel, q, n_keys, k_gs, v_gs)
@@ -170,11 +145,15 @@ def test_split_partitions_match_the_exact_reference(
         assert err < 6e-3, (t, err.item())
 
 
-def test_merged_split_equals_aiter_sparse_pa_decode(ref):
+@pytest.mark.skipif(not PA_KERNELS, reason="needs the aiter nvfp4 sparse pa kernels")
+def test_merged_split_equals_aiter_sparse_pa_decode():
+    import aiter.ops.flydsl.kernels as pkg
+
+    pkg.__path__.insert(0, PA_KERNELS)
+    from aiter.ops.flydsl.kernels import minimax_m3_sparse_pa_nvfp4_decode as pa
+
     n_logical, n_sel, tail, k_gs, v_gs = 40, 16, 77, 0.8, 1.3
-    _ref, pages, page_of, sel, q, ctx, _ = _case(
-        ref, 2, n_logical, n_sel, tail, k_gs, v_gs
-    )
+    _ref, pages, page_of, sel, q, ctx, _ = _case(2, n_logical, n_sel, tail, k_gs, v_gs)
     tbl, _n_keys, n_part = _tables(page_of, sel, tail, 1)
     gs = torch.tensor([k_gs, v_gs], device="cuda", dtype=torch.float32)
     sp_o = torch.zeros(N_SPLIT, O_K, device="cuda", dtype=torch.bfloat16)
@@ -182,7 +161,7 @@ def test_merged_split_equals_aiter_sparse_pa_decode(ref):
     sp_l = torch.zeros(N_SPLIT, H, device="cuda", dtype=torch.float32)
     build_split_nvfp4_kernel(SM_SCALE, N_SPLIT)(
         tbl.data_ptr(), q.data_ptr(), pages.data_ptr(), gs.data_ptr(),
-        sp_o.data_ptr(), sp_m.data_ptr(), sp_l.data_ptr(),
+        sp_o.data_ptr(), sp_m.data_ptr(), sp_l.data_ptr(), 0,
     )  # fmt: skip
     torch.cuda.synchronize()
     m, l, o = (
@@ -197,7 +176,7 @@ def test_merged_split_equals_aiter_sparse_pa_decode(ref):
     topk[0, 0, : len(sel)] = torch.tensor(sel, dtype=torch.int32, device="cuda")
     bt = page_of.view(1, -1).contiguous()
     seq = torch.tensor([ctx], dtype=torch.int32, device="cuda")
-    theirs = sparse_pa_nvfp4_decode(
+    theirs = pa.minimax_m3_sparse_pa_nvfp4_decode(
         q,
         pages,
         topk,
