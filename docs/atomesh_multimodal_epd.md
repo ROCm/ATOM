@@ -3,10 +3,10 @@
 > **Status: design of an open PR stack.** Each decision names the PR that
 > implements it. None of them is on `main` until that PR merges. The stack,
 > in merge order: #3410 (engine PD), #3407 (routing), #3411 (embedding
-> transport), #3412 (encoder-only server), #3413 (standalone service),
-> #3408 (encode workers), #3409 (E before P), #3415 (CI case), then this
-> document (#3417). The acceptance harness is kept out of ROCm/ATOM; each
-> acceptance result is posted on the PR it checks.
+> transport), #3412 (encoder-only server), #3408 (encode workers), #3409
+> (E before P), #3415 (CI case), then this document (#3417). The
+> acceptance harness is kept out of ROCm/ATOM; each acceptance result is
+> posted on the PR it checks.
 
 This document covers image chat requests through ATOMesh for
 MiniMax-M3.1-Flash (M3.1) and Kimi-K3.1 (K3.1). It covers three
@@ -206,7 +206,7 @@ sequenceDiagram
     participant A as ATOM via openai_server
     participant L as lm_eval client
     H->>Y: read the M3.1 image cell's server args and eval task
-    H->>A: launch with USE_ATOMESH_ENTRYPOINTS=1
+    H->>A: launch one aggregated TP4 server
     H->>L: run the cell's image eval task
     L->>A: image chat requests
     L-->>H: score
@@ -632,11 +632,13 @@ topology; no code of its own.*
 - Rejected: a smaller TP to fit one node, which the recipe rules out.
 
 **D19. The CI case is an M3.1 aggregated cell in `models_atomesh.yaml`.**
-*#3415; #3413 serves images through the ATOMesh standalone service.*
+*#3415.*
 - The cell `minimax-m31-flash-mxfp4-agg-tp4-mmmu` serves the recipe's
-  aggregated TP4 server through ATOMesh's standalone service
-  (`USE_ATOMESH_ENTRYPOINTS=1`) and scores MMMU through chat completions,
+  aggregated TP4 ATOM OpenAI server, without ATOMesh, from
+  `atomesh-benchmark.yaml`, and scores MMMU through chat completions,
   with a threshold of 0.77. Only a manual dispatch runs it.
+- ATOM standalone (`USE_ATOMESH_ENTRYPOINTS=1`) serves no image request:
+  since #3698 its Rust frontend refuses one with a 400.
 - An eval-only cell may run MMMU and name its metric, model arguments and
   generation arguments (`pd_matrix.py`, `pd_submit.sh`, `pd_server_atom.sh:
   run_eval`). Every other cell keeps GSM8K's eval.
@@ -722,7 +724,6 @@ All were taken on g15 with M3.1, at the recipe's launch flags.
 | #3407 | `atom/mesh/src/routers/prepare/inference.rs`, `routers/ingress.rs`, `observability/route_trace.rs`, `core/placement/backend/atom.rs` | D1, D2, D3, D7 |
 | #3411 | `atom/kv_transfer/disaggregation/mooncake/ec_transport.py`; `atom/utils/envs.py` and `docs/environment_variables.md` (`ATOM_EC_LEASE_S`, `ATOM_MOONCAKE_IB_DEVICE`) | D11, D12 |
 | #3412 | `atom/model_engine/encoder_only.py`, `model_runner.py` (the reader's size and the ranks' agreement), `multimodal_runtime.py`, `arg_utils.py`; `atom/config.py`; `atom/entrypoints/openai/api_server.py`, `protocol.py` | D9, D10, D12, D13 |
-| #3413 | `atom/entrypoints/atomesh/atom_standalone_service.py`, `api_server.py` | D19 |
 | #3408 | `atom/mesh/src/cliargs.rs`, `config/`, `core/worker.rs`, `core/worker_registry.rs`, `policies/registry.rs`, `routers/factory.rs` | D15 |
 | #3409 | `atom/mesh/src/routers/http_pd_router.rs`, `routers/ingress.rs` | D13, D15, D16 |
 | #3415 | `.github/benchmark/models_atomesh.yaml`, `.github/scripts/atomesh/pd_matrix.py`, `pd_server_atom.sh`, `pd_submit.sh`; `tests/test_atomesh_pd_matrix.py` | D19 |
