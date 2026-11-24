@@ -12,7 +12,8 @@ pushing only the prompt blocks past the decode's own prefix-cache hit.
   `_write_blocks` on the real M3.1 pools; D's held blocks keep their bytes,
   every other destination block is what the full push writes there (and, at
   equal TP, P's source block), nothing else is touched.
-- ATOM_MORIIO_VERIFY digests cover the pushed part only.
+- ATOM_MORIIO_VERIFY compares the pushed part with what P pushed, and D's
+  held prefix blocks with P's source blocks at the same positions.
 - No hit, or the flag off: the full push. Refusals still refuse.
 
 CPU only, on the aiter stand-ins, like `test_moriio_pp_fabric.py`.
@@ -140,7 +141,12 @@ def ask_and_push(stack, write_path, pools, topology, rank, k, dst_pool, verify=F
                 written[ro : ro + n] += 1
         if verify:
             conn._record_write_report(
-                "d", True, None, request["page_digest"], stage=stage
+                "d",
+                True,
+                None,
+                request["page_digest"],
+                stage=stage,
+                held_digest=request.get("held_digest"),
             )
     return conn, requests, written
 
@@ -203,38 +209,118 @@ def test_the_partial_push_lands_byte_exact(stack, write_path, pools, topology, k
                     assert torch.equal(incr[lo : lo + n], p_side.pool[plo : plo + n])
 
 
+def verify_lines(stack, conn, caplog):
+    """`_verify_page_landed`'s lines: (pushed part, held prefix)."""
+    caplog.clear()
+    # On a mismatch the equal-TP check reads again after a device sync.
+    with (
+        caplog.at_level("INFO", logger="atom"),
+        mock.patch("torch.cuda.synchronize", lambda: None),
+        mock.patch.object(stack.conn.time, "sleep", lambda s: None),
+    ):
+        conn._verify_page_landed("d")
+    lines = [r.getMessage() for r in caplog.records if "moriio-verify" in r.msg]
+    held = [line for line in lines if "locally held" in line]
+    return [line for line in lines if line not in held], held
+
+
 @pytest.mark.parametrize("topology", ["tp4", "pp4"])
-def test_verify_digests_cover_the_pushed_part_only(
+def test_verify_digests_the_pushed_part_and_the_held_prefix(
     stack, write_path, pools, topology, caplog
 ):
     rank, d_side = 1, pools.d_ranks[1]
     original = d_side.pool.clone()
     try:
-        conn, _, _ = ask_and_push(
+        # A full push first: D's prefix blocks hold the prompt's KV, as its
+        # own prefix cache does after an earlier turn.
+        ask_and_push(stack, write_path, pools, topology, rank, 0, d_side.pool)
+        conn, requests, _ = ask_and_push(
             stack, write_path, pools, topology, rank, 3, d_side.pool, verify=True
         )
         assert conn._verify_page_dst["d"] == DST[3:]
-        # A byte of D's own held prefix: not the push's business.
-        d_side.tt.pages[7].view[DST[0]].view(-1)[5] ^= 1
-        with caplog.at_level("INFO", logger="atom"):
-            conn._verify_page_landed("d")
-        assert "match the producer" in caplog.text, caplog.text
+        assert conn._verify_held_dst["d"] == DST[:3]
+        # Every producer stage digests the held blocks' source.
+        assert all(r["verify_held_src_block_ids"] == SRC[:3] for r in requests)
+        pushed, held = verify_lines(stack, conn, caplog)
+        assert "of 2 blocks match the producer" in pushed[0], pushed
+        assert (
+            len(held) == 1
+            and "3 locally held prefix blocks match the producer" in held[0]
+        ), held
 
         conn, _, _ = ask_and_push(
             stack, write_path, pools, topology, rank, 3, d_side.pool, verify=True
         )
         d_side.tt.pages[7].view[DST[3]].view(-1)[5] ^= 1  # a pushed block
-        caplog.clear()
-        # On a mismatch the equal-TP check reads again after a device sync.
-        with (
-            caplog.at_level("INFO", logger="atom"),
-            mock.patch("torch.cuda.synchronize", lambda: None),
-            mock.patch.object(stack.conn.time, "sleep", lambda s: None),
-        ):
-            conn._verify_page_landed("d")
-        assert "differ from the producer" in caplog.text, caplog.text
+        pushed, held = verify_lines(stack, conn, caplog)
+        assert "differ from the producer" in pushed[0], pushed
+        assert "match the producer" in held[0], held
     finally:
         d_side.pool.copy_(original)
+
+
+@pytest.mark.parametrize("topology", ["tp4", "pp4"])
+@pytest.mark.parametrize("region", [0, 7, -1])  # first, a middle one, the last
+@pytest.mark.parametrize("block", [0, 2])  # the held body, the last held block
+def test_verify_reports_a_corrupt_held_prefix_block(
+    stack, write_path, pools, topology, region, block, caplog
+):
+    """A byte of D's prefix-cache hit that is not P's: decode would attend over
+    it, though the push never touched it."""
+    rank, d_side = 2, pools.d_ranks[2]
+    original = d_side.pool.clone()
+    try:
+        ask_and_push(stack, write_path, pools, topology, rank, 0, d_side.pool)
+        conn, _, _ = ask_and_push(
+            stack, write_path, pools, topology, rank, 3, d_side.pool, verify=True
+        )
+        d_side.tt.pages[region].view[DST[block]].view(-1)[3] ^= 1
+        pushed, held = verify_lines(stack, conn, caplog)
+        assert "of 2 blocks match the producer" in pushed[0], pushed
+        assert len(held) == 1, held
+        assert (
+            "1 of " in held[0]
+            and "3 locally held prefix blocks differ from the producer" in held[0]
+        ), held
+    finally:
+        d_side.pool.copy_(original)
+
+
+def test_verify_names_held_regions_no_stage_digested(stack, write_path, pools, caplog):
+    """PP4: a stage whose report carries no held digest leaves its layers'
+    held regions unchecked, which is reported, not taken as a match."""
+    rank, d_side = 0, pools.d_ranks[0]
+    original = d_side.pool.clone()
+    try:
+        ask_and_push(stack, write_path, pools, "pp4", rank, 0, d_side.pool)
+        real = stack.conn.MoRIIOConnector._held_source
+        calls = []
+
+        def stage_2_digests_nothing(self, request):
+            calls.append(self.pp_rank)
+            return [] if self.pp_rank == 2 else real(self, request)
+
+        with mock.patch.object(
+            stack.conn.MoRIIOConnector, "_held_source", stage_2_digests_nothing
+        ):
+            conn, _, _ = ask_and_push(
+                stack, write_path, pools, "pp4", rank, 3, d_side.pool, verify=True
+            )
+        assert sorted(calls) == [0, 1, 2, 3]
+        _, held = verify_lines(stack, conn, caplog)
+        assert "digested by none of the 4 producer stages" in held[0], held
+    finally:
+        d_side.pool.copy_(original)
+
+
+def test_without_verify_no_held_digest_is_asked_or_made(stack, write_path, pools):
+    """The held check costs nothing with ATOM_MORIIO_VERIFY off."""
+    d_side = pools.d_ranks[0]
+    scratch = d_side.pool.clone()
+    conn, requests, _ = ask_and_push(stack, write_path, pools, "pp4", 0, 3, scratch)
+    assert not conn._verify_held_dst
+    assert all("verify_held_src_block_ids" not in r for r in requests)
+    assert all("held_digest" not in r for r in requests)
 
 
 # ---------------------------------------------------------------------------
