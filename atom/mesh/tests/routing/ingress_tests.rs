@@ -290,8 +290,8 @@ async fn chats_tokenize_with_the_effort_their_model_takes() {
     for (controls, effort, want) in [
         (None, "medium", Ok("hi/-/medium")),
         (None, "minimal", Err("invalid_request")),
-        (v41, "minimal", Ok("hi/-/low")),
-        (v41, "medium", Ok("hi/-/high")),
+        (v41, "minimal", Ok("hi/thinking/low")),
+        (v41, "medium", Ok("hi/thinking/high")),
         (v41, "none", Ok("hi/chat/-")),
         (v41, "ultra", Err("invalid_request")),
     ] {

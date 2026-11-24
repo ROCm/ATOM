@@ -41,7 +41,7 @@ pub fn process_chat_messages(
 }
 
 /// The template kwargs `process_chat_messages` renders `request` with.
-pub(crate) fn template_kwargs(request: &ChatCompletionRequest) -> HashMap<String, Value> {
+fn template_kwargs(request: &ChatCompletionRequest) -> HashMap<String, Value> {
     let kwargs_capacity = 1 + request.chat_template_kwargs.as_ref().map_or(0, |k| k.len());
     let mut combined_template_kwargs = HashMap::with_capacity(kwargs_capacity);
 

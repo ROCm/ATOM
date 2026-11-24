@@ -204,7 +204,16 @@ def default_requests() -> list[dict]:
         "effort_xhigh": {"reasoning_effort": "xhigh"},
         "effort_none": {"reasoning_effort": "none"},
         "effort_unknown": {"reasoning_effort": "ultra"},
+        "effort_over_kwargs_effort": {
+            "reasoning_effort": "max",
+            "chat_template_kwargs": {"reasoning_effort": "low"},
+        },
+        "effort_over_kwargs_mode": {
+            "reasoning_effort": "high",
+            "chat_template_kwargs": {"thinking_mode": "chat"},
+        },
         "kwargs_thinking_on": {"chat_template_kwargs": {"enable_thinking": True}},
+        "kwargs_thinking_off": {"chat_template_kwargs": {"enable_thinking": False}},
         "kwargs_thinking_mode_chat": {
             "chat_template_kwargs": {"thinking_mode": "chat"}
         },
