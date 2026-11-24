@@ -190,8 +190,10 @@ gated behind environment variables:
   combine into the next mix.
 * shared expert: routed through the fused MoE as expert 512 (top-k + 1),
   scoring with sigmoid.
-* batch-1 MoE: the scoped MI308X PTPC configuration uses AITER; other supported
-  layouts retain the routing/expert Triton specialization.
+* batch-1 MoE: the scoped gfx942/80 CU pure TP2/TP4 setup (EP1, DP1) uses
+  AITER for both CT PTPC FP8 and BF16. Outside it, `moe_decode_single_token`
+  remains available for compatible fused FP8 experts with per-channel scales
+  and intermediate width 320; other calls use their normal FusedMoE path.
 * QSA indexer scoring: matrix cores for prefill, CUDA cores for decode-sized
   batches.
 

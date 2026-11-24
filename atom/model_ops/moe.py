@@ -839,9 +839,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
         stream_online_quant = getattr(layer, "_stream_online_quant", False)
         weight_device = "meta" if stream_online_quant else None
 
-        # Padding belongs to the runtime method, not a temporary source for
-        # online conversion. Check the layer policy even with streaming off;
-        # excluded BF16 layers (including MTP) still need runtime padding.
+        # BF16 sources awaiting online conversion keep the logical width,
+        # independently of streaming. The online per-token FP8 target keeps
+        # that width; other target formats own their alignment. BF16 runtime
+        # layers excluded from conversion (including MTP) still honor pad_align.
         pad_align = self.pad_align
         if will_online_requant(
             layer.quant_config, layer.prefix, QuantType.No, params_dtype

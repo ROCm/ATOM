@@ -194,8 +194,6 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
 class Qwen4ExpMTP(nn.Module):
     weights_mapping = Qwen4ExpForConditionalGeneration.weights_mapping
     packed_modules_mapping = Qwen4ExpForConditionalGeneration.packed_modules_mapping
-    disable_fused_shared_loading = True
-    fused_shared_experts = 0
     get_expert_mapping = Qwen4ExpForConditionalGeneration.get_expert_mapping
     draft_graph_supports_mrope = True
     reuse_draft_graph_step_buffers = True

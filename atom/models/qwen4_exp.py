@@ -133,10 +133,11 @@ class _Qwen4ExpQuantizationConfig:
         return getattr(self._config, field + "global_spec")
 
 
-# The sigmoid-gated shared expert rides through the fused MoE as expert
-# `num_experts` (top-k + 1) and batch-1 MoE goes through
-# `moe_decode_single_token` outside the scoped gfx942 PTPC path. The same
-# customer configuration enables shared-expert fusion for BF16 MTP.
+# When fused, the sigmoid-gated shared expert occupies slot `num_experts`
+# (top-k + 1). The scoped gfx942/80 CU TP2/TP4 setup (EP off, DP1) uses AITER
+# for both CT PTPC FP8 and BF16, including batch 1, and enables BF16 MTP fusion.
+# Outside that scope, `moe_decode_single_token` is used only when its FP8
+# per-channel, 320-wide expert layout checks pass.
 
 
 def _is_dynamic_ptpc_fp8(policy: LayerQuantConfig) -> bool:
@@ -296,14 +297,18 @@ def moe_pad_align(
     config=None,
     fuse_shared_expert: bool = False,
 ) -> int | None:
-    """Limit the 64-aligned layout to the validated MI308X customer setup.
+    """Choose the alignment of each rank's expert intermediate.
 
-    This is an explicit support scope, not an AITER tuned-coverage query.
-    Callers pass a runtime policy, never a source awaiting online conversion.
-    The shared expert makes 512/top-10 into 513/top-11 for this layout.
+    The 64-aligned policy requires gfx942/80 CU, TP2/TP4, EP off, DP1,
+    H2560, routed/shared I640, SiLU, and the fused 513-expert/top-k-11 layout.
+    Runtime weights must be BF16 or dynamic CT PTPC FP8 without block scales.
+    Callers exclude sources awaiting online conversion. This is an explicit
+    customer support scope, not an AITER tuned-coverage query.
 
-    TP1 keeps Qwen3.8-Flash-Next's 640 instead of padding it to 768; other
-    configurations retain the existing MXFP4 alignment policy.
+    Otherwise keep the previous hint: 128 for an already 128-aligned shard,
+    or None to retain the quantization method's default. For MXFP4 this
+    preserves TP1's 640-wide shard instead of rounding it to 768 with its
+    default alignment of 256.
     """
     if (
         quant is not None
@@ -367,7 +372,7 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
             )
         )
         # A source awaiting online conversion is not the runtime MoE format.
-        # In particular, Fp8MoEMethod does not use this CT/PTPC padded layout.
+        # Online per-token FP8 uses Fp8MoEMethod at the logical shard width.
         runtime_quant = (
             None
             if will_online_requant(

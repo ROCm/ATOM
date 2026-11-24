@@ -115,6 +115,9 @@ def test_mtp_maps_stacked_and_per_expert_checkpoints(source, target):
     from atom.models.qwen4_exp_mtp import Qwen4ExpMTP
 
     model = Qwen4ExpMTP.__new__(Qwen4ExpMTP)
+    torch.nn.Module.__init__(model)
+    model.fused_shared_experts = 0
+    model.disable_fused_shared_loading = True
     rewriter = CheckpointNameRewriter(
         weights_mapping=model.weights_mapping,
         mtp_remap=model.remap_mtp_weight_name,
