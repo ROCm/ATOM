@@ -3399,6 +3399,18 @@ class ModelRunner:
                         input_ids, positions, inputs_embeds=inputs_embeds
                     )
                 self._dynamic_chunking.finish_sample(chunk_sample)
+                if envs.ATOM_STEP_MEM_LOG:
+                    free, _ = torch.cuda.mem_get_info()
+                    logger.info(
+                        "step mem: stage %d rows %d free %.2fGiB reserved %.2fGiB "
+                        "allocated %.2fGiB peak %.2fGiB",
+                        pp_group.rank_in_group,
+                        input_ids.shape[0],
+                        free / (1 << 30),
+                        torch.cuda.memory_reserved() / (1 << 30),
+                        torch.cuda.memory_allocated() / (1 << 30),
+                        torch.cuda.max_memory_allocated() / (1 << 30),
+                    )
                 if pp_enabled and not pp_group.is_last_rank:
                     # GLM-5.2 IndexShare: carry top-k for next rank's shared layers.
                     if self._pp_send_needs_sparse:
