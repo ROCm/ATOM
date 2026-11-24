@@ -1725,6 +1725,36 @@ mod i_atom_structured_output {
     }
 
     #[test]
+    fn an_atom_chats_reasoning_effort_reaches_its_kwargs_as_atoms_http_chat_applies_it() {
+        let toggle = (
+            "reasoning_toggle_json",
+            r#"["enable_thinking", false, true]"#,
+        );
+        let defaults = (
+            "default_chat_template_kwargs_json",
+            r#"{"enable_thinking": true}"#,
+        );
+        let kwargs = |effort: &str, labels: &[(&str, &str)]| {
+            let body = json!({
+                "model": "m", "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": effort,
+            });
+            let (payload, _) = prepared(body, RuntimeType::Atom, labels);
+            parsed(Some(
+                payload.structured_output.unwrap().chat_template_kwargs_json,
+            ))
+        };
+        // "none" switches reasoning off over a default that has it on, and sets no effort.
+        let off = Some(json!({"enable_thinking": false}));
+        assert_eq!(kwargs("none", &[toggle, defaults]), off);
+        assert_eq!(kwargs("none", &[toggle]), off);
+        // A template effort is `thinking_effort`; another one is dropped.
+        let high = Some(json!({"enable_thinking": true, "thinking_effort": "high"}));
+        assert_eq!(kwargs("high", &[toggle, defaults]), high);
+        assert_eq!(kwargs("medium", &[toggle]), Some(json!({})));
+    }
+
+    #[test]
     fn an_atom_chat_carries_its_fields_as_sent_its_kwargs_and_its_reasoning_opening() {
         let tool =
             |name: &str| json!({"type": "function", "function": {"name": name, "parameters": {}}});
@@ -1763,7 +1793,7 @@ mod i_atom_structured_output {
         assert_eq!(parsed(carried.response_format_json), Some(format));
         let message_tools = json!([[tool("lookup")], null]);
         assert_eq!(parsed(carried.message_tools_json), Some(message_tools));
-        let kwargs = json!({"flag": "request", "kept": 1, "reasoning_effort": "high"});
+        let kwargs = json!({"flag": "request", "kept": 1, "thinking_effort": "high"});
         assert_eq!(
             parsed(Some(carried.chat_template_kwargs_json)),
             Some(kwargs)
