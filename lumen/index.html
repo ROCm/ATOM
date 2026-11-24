@@ -1,0 +1,479 @@
+<!doctype html>
+<html class="no-js" lang="en" data-content_root="./">
+  <head><meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta name="color-scheme" content="light dark"><meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="index" title="Index" href="genindex.html"><link rel="search" title="Search" href="search.html"><link rel="next" title="Installation" href="quickstart/install.html">
+
+    <!-- Generated with Sphinx 9.1.1 and Furo 2025.12.19 -->
+        <title>Lumen Documentation</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=d111a655" />
+    <link rel="stylesheet" type="text/css" href="_static/styles/furo.css?v=7bdb33bb" />
+    <link rel="stylesheet" type="text/css" href="_static/styles/furo-extensions.css?v=8dab3a3b" />
+    <link rel="stylesheet" type="text/css" href="_static/custom.css?v=a9f7d8bd" />
+    
+    
+
+
+<style>
+  body {
+    --color-code-background: #f2f2f2;
+  --color-code-foreground: #1e1e1e;
+  --color-brand-primary: #2d3036;
+  --color-brand-content: #c41922;
+  
+  }
+  @media not print {
+    body[data-theme="dark"] {
+      --color-code-background: #202020;
+  --color-code-foreground: #d0d0d0;
+  --color-brand-primary: #e0e0e0;
+  --color-brand-content: #ff4654;
+  
+    }
+    @media (prefers-color-scheme: dark) {
+      body:not([data-theme="light"]) {
+        --color-code-background: #202020;
+  --color-code-foreground: #d0d0d0;
+  --color-brand-primary: #e0e0e0;
+  --color-brand-content: #ff4654;
+  
+      }
+    }
+  }
+</style></head>
+  <body>
+    
+    <script>
+      document.body.dataset.theme = localStorage.getItem("theme") || "auto";
+    </script>
+    
+
+<svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+  <symbol id="svg-toc" viewBox="0 0 24 24">
+    <title>Contents</title>
+    <svg stroke="currentColor" fill="currentColor" stroke-width="0" viewBox="0 0 1024 1024">
+      <path d="M408 442h480c4.4 0 8-3.6 8-8v-56c0-4.4-3.6-8-8-8H408c-4.4 0-8 3.6-8 8v56c0 4.4 3.6 8 8 8zm-8 204c0 4.4 3.6 8 8 8h480c4.4 0 8-3.6 8-8v-56c0-4.4-3.6-8-8-8H408c-4.4 0-8 3.6-8 8v56zm504-486H120c-4.4 0-8 3.6-8 8v56c0 4.4 3.6 8 8 8h784c4.4 0 8-3.6 8-8v-56c0-4.4-3.6-8-8-8zm0 632H120c-4.4 0-8 3.6-8 8v56c0 4.4 3.6 8 8 8h784c4.4 0 8-3.6 8-8v-56c0-4.4-3.6-8-8-8zM115.4 518.9L271.7 642c5.8 4.6 14.4.5 14.4-6.9V388.9c0-7.4-8.5-11.5-14.4-6.9L115.4 505.1a8.74 8.74 0 0 0 0 13.8z"/>
+    </svg>
+  </symbol>
+  <symbol id="svg-menu" viewBox="0 0 24 24">
+    <title>Menu</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather-menu">
+      <line x1="3" y1="12" x2="21" y2="12"></line>
+      <line x1="3" y1="6" x2="21" y2="6"></line>
+      <line x1="3" y1="18" x2="21" y2="18"></line>
+    </svg>
+  </symbol>
+  <symbol id="svg-arrow-right" viewBox="0 0 24 24">
+    <title>Expand</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather-chevron-right">
+      <polyline points="9 18 15 12 9 6"></polyline>
+    </svg>
+  </symbol>
+  <symbol id="svg-sun" viewBox="0 0 24 24">
+    <title>Light mode</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round" class="feather-sun">
+      <circle cx="12" cy="12" r="5"></circle>
+      <line x1="12" y1="1" x2="12" y2="3"></line>
+      <line x1="12" y1="21" x2="12" y2="23"></line>
+      <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line>
+      <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line>
+      <line x1="1" y1="12" x2="3" y2="12"></line>
+      <line x1="21" y1="12" x2="23" y2="12"></line>
+      <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line>
+      <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>
+    </svg>
+  </symbol>
+  <symbol id="svg-moon" viewBox="0 0 24 24">
+    <title>Dark mode</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round" class="icon-tabler-moon">
+      <path stroke="none" d="M0 0h24v24H0z" fill="none" />
+      <path d="M12 3c.132 0 .263 0 .393 0a7.5 7.5 0 0 0 7.92 12.446a9 9 0 1 1 -8.313 -12.454z" />
+    </svg>
+  </symbol>
+  <symbol id="svg-sun-with-moon" viewBox="0 0 24 24">
+    <title>Auto light/dark, in light mode</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round"
+      class="icon-custom-derived-from-feather-sun-and-tabler-moon">
+      <path style="opacity: 50%" d="M 5.411 14.504 C 5.471 14.504 5.532 14.504 5.591 14.504 C 3.639 16.319 4.383 19.569 6.931 20.352 C 7.693 20.586 8.512 20.551 9.25 20.252 C 8.023 23.207 4.056 23.725 2.11 21.184 C 0.166 18.642 1.702 14.949 4.874 14.536 C 5.051 14.512 5.231 14.5 5.411 14.5 L 5.411 14.504 Z"/>
+      <line x1="14.5" y1="3.25" x2="14.5" y2="1.25"/>
+      <line x1="14.5" y1="15.85" x2="14.5" y2="17.85"/>
+      <line x1="10.044" y1="5.094" x2="8.63" y2="3.68"/>
+      <line x1="19" y1="14.05" x2="20.414" y2="15.464"/>
+      <line x1="8.2" y1="9.55" x2="6.2" y2="9.55"/>
+      <line x1="20.8" y1="9.55" x2="22.8" y2="9.55"/>
+      <line x1="10.044" y1="14.006" x2="8.63" y2="15.42"/>
+      <line x1="19" y1="5.05" x2="20.414" y2="3.636"/>
+      <circle cx="14.5" cy="9.55" r="3.6"/>
+    </svg>
+  </symbol>
+  <symbol id="svg-moon-with-sun" viewBox="0 0 24 24">
+    <title>Auto light/dark, in dark mode</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round"
+      class="icon-custom-derived-from-feather-sun-and-tabler-moon">
+      <path d="M 8.282 7.007 C 8.385 7.007 8.494 7.007 8.595 7.007 C 5.18 10.184 6.481 15.869 10.942 17.24 C 12.275 17.648 13.706 17.589 15 17.066 C 12.851 22.236 5.91 23.143 2.505 18.696 C -0.897 14.249 1.791 7.786 7.342 7.063 C 7.652 7.021 7.965 7 8.282 7 L 8.282 7.007 Z"/>
+      <line style="opacity: 50%" x1="18" y1="3.705" x2="18" y2="2.5"/>
+      <line style="opacity: 50%" x1="18" y1="11.295" x2="18" y2="12.5"/>
+      <line style="opacity: 50%" x1="15.316" y1="4.816" x2="14.464" y2="3.964"/>
+      <line style="opacity: 50%" x1="20.711" y1="10.212" x2="21.563" y2="11.063"/>
+      <line style="opacity: 50%" x1="14.205" y1="7.5" x2="13.001" y2="7.5"/>
+      <line style="opacity: 50%" x1="21.795" y1="7.5" x2="23" y2="7.5"/>
+      <line style="opacity: 50%" x1="15.316" y1="10.184" x2="14.464" y2="11.036"/>
+      <line style="opacity: 50%" x1="20.711" y1="4.789" x2="21.563" y2="3.937"/>
+      <circle style="opacity: 50%" cx="18" cy="7.5" r="2.169"/>
+    </svg>
+  </symbol>
+  <symbol id="svg-pencil" viewBox="0 0 24 24">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round" class="icon-tabler-pencil-code">
+      <path d="M4 20h4l10.5 -10.5a2.828 2.828 0 1 0 -4 -4l-10.5 10.5v4" />
+      <path d="M13.5 6.5l4 4" />
+      <path d="M20 21l2 -2l-2 -2" />
+      <path d="M17 17l-2 2l2 2" />
+    </svg>
+  </symbol>
+  <symbol id="svg-eye" viewBox="0 0 24 24">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round" class="icon-tabler-eye-code">
+      <path stroke="none" d="M0 0h24v24H0z" fill="none" />
+      <path d="M10 12a2 2 0 1 0 4 0a2 2 0 0 0 -4 0" />
+      <path
+        d="M11.11 17.958c-3.209 -.307 -5.91 -2.293 -8.11 -5.958c2.4 -4 5.4 -6 9 -6c3.6 0 6.6 2 9 6c-.21 .352 -.427 .688 -.647 1.008" />
+      <path d="M20 21l2 -2l-2 -2" />
+      <path d="M17 17l-2 2l2 2" />
+    </svg>
+  </symbol>
+</svg>
+
+<input type="checkbox" class="sidebar-toggle" name="__navigation" id="__navigation" aria-label="Toggle site navigation sidebar">
+<input type="checkbox" class="sidebar-toggle" name="__toc" id="__toc" aria-label="Toggle table of contents sidebar">
+<label class="overlay sidebar-overlay" for="__navigation"></label>
+<label class="overlay toc-overlay" for="__toc"></label>
+
+<a class="skip-to-content muted-link" href="#furo-main-content">Skip to content</a>
+
+
+
+<div class="page">
+  <header class="mobile-header">
+    <div class="header-left">
+      <label class="nav-overlay-icon" for="__navigation">
+        <span class="icon"><svg><use href="#svg-menu"></use></svg></span>
+      </label>
+    </div>
+    <div class="header-center">
+      <a href="#"><div class="brand">Lumen Documentation</div></a>
+    </div>
+    <div class="header-right">
+      <div class="theme-toggle-container theme-toggle-header">
+        <button class="theme-toggle" aria-label="Toggle Light / Dark / Auto color theme">
+          <svg class="theme-icon-when-auto-light"><use href="#svg-sun-with-moon"></use></svg>
+          <svg class="theme-icon-when-auto-dark"><use href="#svg-moon-with-sun"></use></svg>
+          <svg class="theme-icon-when-dark"><use href="#svg-moon"></use></svg>
+          <svg class="theme-icon-when-light"><use href="#svg-sun"></use></svg>
+        </button>
+      </div>
+      <label class="toc-overlay-icon toc-header-icon no-toc" for="__toc">
+        <span class="icon"><svg><use href="#svg-toc"></use></svg></span>
+      </label>
+    </div>
+  </header>
+  <aside class="sidebar-drawer">
+    <div class="sidebar-container">
+      
+      <div class="sidebar-sticky"><a class="sidebar-brand" href="#">
+  
+  <span class="sidebar-brand-text">Lumen Documentation</span>
+  
+</a><form class="sidebar-search-container" method="get" action="search.html" role="search">
+  <input class="sidebar-search" placeholder="Search" name="q" aria-label="Search">
+  <input type="hidden" name="check_keywords" value="yes">
+  <input type="hidden" name="area" value="default">
+</form>
+<div id="searchbox"></div><div class="sidebar-scroll"><div class="sidebar-tree">
+  <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="quickstart/install.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart/quick_start.html">Quick Start</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="architecture.html">Architecture</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="examples/llama2_sft.html">LLaMA-2 SFT</a></li>
+<li class="toctree-l1"><a class="reference internal" href="examples/llama31_pretrain.html">LLaMA 3.1 Pre-training</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Advanced Features</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="advance/fp8_training.html">FP8 Quantized Training</a></li>
+<li class="toctree-l1"><a class="reference internal" href="advance/lora.html">LoRA Support</a></li>
+<li class="toctree-l1"><a class="reference internal" href="advance/distributed.html">Distributed Training</a></li>
+<li class="toctree-l1"><a class="reference internal" href="advance/feature_catalog.html">Lumen Feature Catalog</a></li>
+<li class="toctree-l1"><a class="reference internal" href="advance/patch_registry.html">Megatron Patch Registry</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="api/quantize.html">atomrl.lumen.quantize</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api/modules.html">atomrl.lumen.modules</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api/ops.html">atomrl.lumen.ops</a></li>
+</ul>
+
+</div><a class="sidebar-github-link" href="https://github.com/ROCm/ATOM/tree/main/atomrl/lumen" target="_blank" rel="noopener">
+  <svg stroke="currentColor" fill="currentColor" stroke-width="0" viewBox="0 0 16 16" width="16" height="16" style="vertical-align: text-bottom; margin-right: 6px;">
+    <path fill-rule="evenodd" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"></path>
+  </svg>
+  GitHub
+</a></div>
+      </div>
+      
+    </div>
+  </aside>
+  <div class="main">
+    <div class="content">
+      <div class="article-container">
+        <a href="#" class="back-to-top muted-link">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+            <path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8v12z"></path>
+          </svg>
+          <span>Back to top</span>
+        </a>
+        <div class="content-icon-container">
+          <div class="view-this-page">
+  <a class="muted-link" href="https://github.com/ROCm/ATOM/blob/main/atomrl/lumen/lumen-docs/docs/source/index.md?plain=true" title="View this page">
+    <svg><use href="#svg-eye"></use></svg>
+    <span class="visually-hidden">View this page</span>
+  </a>
+</div><div class="edit-this-page">
+  <a class="muted-link" href="https://github.com/ROCm/ATOM/edit/main/atomrl/lumen/lumen-docs/docs/source/index.md" rel="edit" title="Edit this page">
+    <svg><use href="#svg-pencil"></use></svg>
+    <span class="visually-hidden">Edit this page</span>
+  </a>
+</div><div class="theme-toggle-container theme-toggle-content">
+            <button class="theme-toggle" aria-label="Toggle Light / Dark / Auto color theme">
+              <svg class="theme-icon-when-auto-light"><use href="#svg-sun-with-moon"></use></svg>
+              <svg class="theme-icon-when-auto-dark"><use href="#svg-moon-with-sun"></use></svg>
+              <svg class="theme-icon-when-dark"><use href="#svg-moon"></use></svg>
+              <svg class="theme-icon-when-light"><use href="#svg-sun"></use></svg>
+            </button>
+          </div>
+          <label class="toc-overlay-icon toc-content-icon no-toc" for="__toc">
+            <span class="icon"><svg><use href="#svg-toc"></use></svg></span>
+          </label>
+        </div>
+        <article role="main" id="furo-main-content">
+          <section id="welcome-to-lumen">
+<h1>Welcome to Lumen<a class="headerlink" href="#welcome-to-lumen" title="Link to this heading">¶</a></h1>
+<p><strong>Lumen</strong>: Light Unified Model Engine for AITER.</p>
+<p>Lumen is an <strong>AMD GPU model-training optimization engine built on <a class="reference external" href="https://github.com/ROCm/aiter">AITER</a></strong>. It combines AITER-optimized training kernels with model-level integrations for quantized pretraining, fine-tuning, and post-training.</p>
+<p>Lumen manages the <strong>quantized training lifecycle</strong> — the vertical path a low-precision tensor takes through forward, backward, optimizer, and communication — and delegates optimizer execution, data loading, and distributed orchestration to the training backend.</p>
+<p>Lumen is <strong>non-invasive</strong> with:</p>
+<ul class="simple">
+<li><p><strong>One-line enablement</strong> — <code class="docutils literal notranslate"><span class="pre">quant.enable(model)</span></code> patches an existing model for quantized training without changing model code or checkpoint format.</p></li>
+<li><p><strong>Unified <code class="docutils literal notranslate"><span class="pre">QuantConfig</span></code></strong> — A single configuration object governs format, scaling strategy, amax algorithm, activation/gradient quantization, and all precision-related knobs.</p></li>
+<li><p><strong>Backend-agnostic</strong> — The same quantization semantics work across <strong>FSDP</strong>, <strong>FSDP2</strong>, and <strong>Megatron-LM</strong> backends, so switching parallelism strategies does not require re-engineering precision paths. RL training (GRPO, PPO, DAPO) works with both <strong>SGLang</strong> and <strong>vLLM</strong> rollout engines on ROCm.</p></li>
+</ul>
+<p>Lumen is <strong>fast</strong> with:</p>
+<ul class="simple">
+<li><p><strong>FP8 formats</strong> — FP8 E4M3, E5M2, MXFP8, and Hybrid precision with up to <strong>2× peak FLOPS</strong> over BF16 on AMD Instinct MI300X.</p></li>
+<li><p><strong><a class="reference external" href="https://github.com/ROCm/aiter">AITER kernels</a></strong> — High-performance fused operators for attention, GEMM, normalization, RoPE, MoE, MLP, cross-entropy, and quantization with ASM → CK → Triton fallback.</p></li>
+<li><p><strong><a class="reference external" href="https://github.com/ROCm/mori">MORI communication</a></strong> — Optional native RDMA + GPU communication with FP8 parameter all-gather (~2× bandwidth saving) and compute–communication overlap.</p></li>
+</ul>
+<hr class="docutils" />
+<div class="toctree-wrapper compound">
+<p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="quickstart/install.html">Installation</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/install.html#requirements">Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/install.html#user-install-recommended">User Install (recommended)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/install.html#developer-install">Developer Install</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/install.html#third-party-libraries">Third-party Libraries</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/install.html#verify-installation">Verify Installation</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart/quick_start.html">Quick Start</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/quick_start.html#unified-training-optimization">Unified Training Optimization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/quick_start.html#fp8-attention-module-api">FP8 Attention (Module API)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/quick_start.html#functional-api">Functional API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/quick_start.html#training-backends">Training Backends</a></li>
+</ul>
+</li>
+</ul>
+</div>
+<div class="toctree-wrapper compound">
+<p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="architecture.html">Architecture</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="architecture.html#layered-design">Layered Design</a></li>
+<li class="toctree-l2"><a class="reference internal" href="architecture.html#key-components">Key Components</a></li>
+<li class="toctree-l2"><a class="reference internal" href="architecture.html#project-structure">Project Structure</a></li>
+</ul>
+</li>
+</ul>
+</div>
+<div class="toctree-wrapper compound">
+<p class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="examples/llama2_sft.html">LLaMA-2 SFT</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="examples/llama2_sft.html#overview">Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/llama2_sft.html#quick-launch">Quick Launch</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/llama2_sft.html#enabling-fp8">Enabling FP8</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/llama2_sft.html#lora-support">LoRA Support</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/llama2_sft.html#configuration-reference">Configuration Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/llama2_sft.html#source">Source</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="examples/llama31_pretrain.html">LLaMA 3.1 Pre-training</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="examples/llama31_pretrain.html#overview">Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/llama31_pretrain.html#quick-launch">Quick Launch</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/llama31_pretrain.html#fp8-hybrid-training">FP8 Hybrid Training</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/llama31_pretrain.html#mxfp8-attention">MXFP8 Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/llama31_pretrain.html#distributed-configuration">Distributed Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/llama31_pretrain.html#performance">Performance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/llama31_pretrain.html#source">Source</a></li>
+</ul>
+</li>
+</ul>
+</div>
+<div class="toctree-wrapper compound">
+<p class="caption" role="heading"><span class="caption-text">Advanced Features</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="advance/fp8_training.html">FP8 Quantized Training</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="advance/fp8_training.html#supported-formats">Supported Formats</a></li>
+<li class="toctree-l2"><a class="reference internal" href="advance/fp8_training.html#scaling-strategies">Scaling Strategies</a></li>
+<li class="toctree-l2"><a class="reference internal" href="advance/fp8_training.html#configuration-reference">Configuration Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="advance/fp8_training.html#fp8-in-the-training-loop">FP8 in the Training Loop</a></li>
+<li class="toctree-l2"><a class="reference internal" href="advance/fp8_training.html#memory-savings">Memory Savings</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="advance/lora.html">LoRA Support</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="advance/lora.html#overview">Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="advance/lora.html#enabling-lora">Enabling LoRA</a></li>
+<li class="toctree-l2"><a class="reference internal" href="advance/lora.html#configuration">Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="advance/lora.html#memory-impact">Memory Impact</a></li>
+<li class="toctree-l2"><a class="reference internal" href="advance/lora.html#checkpoint-handling">Checkpoint Handling</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="advance/distributed.html">Distributed Training</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="advance/distributed.html#backend-comparison">Backend Comparison</a></li>
+<li class="toctree-l2"><a class="reference internal" href="advance/distributed.html#fsdp-backend">FSDP Backend</a></li>
+<li class="toctree-l2"><a class="reference internal" href="advance/distributed.html#megatron-lm-backend">Megatron-LM Backend</a></li>
+<li class="toctree-l2"><a class="reference internal" href="advance/distributed.html#fp8-communication">FP8 Communication</a></li>
+<li class="toctree-l2"><a class="reference internal" href="advance/distributed.html#hardware-requirements">Hardware Requirements</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="advance/feature_catalog.html">Lumen Feature Catalog</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="advance/feature_catalog.html#quantization-features">1. Quantization Features</a></li>
+<li class="toctree-l2"><a class="reference internal" href="advance/feature_catalog.html#distributed-features">2. Distributed Features</a></li>
+<li class="toctree-l2"><a class="reference internal" href="advance/feature_catalog.html#lora-features">3. LoRA Features</a></li>
+<li class="toctree-l2"><a class="reference internal" href="advance/feature_catalog.html#cross-cutting-features">4. Cross-Cutting Features</a></li>
+<li class="toctree-l2"><a class="reference internal" href="advance/feature_catalog.html#cli-flag-quick-reference">5. CLI Flag Quick Reference</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="advance/patch_registry.html">Megatron Patch Registry</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="advance/patch_registry.html#refactoring-framework">Refactoring framework</a></li>
+<li class="toctree-l2"><a class="reference internal" href="advance/patch_registry.html#patch-phases">Patch phases</a></li>
+<li class="toctree-l2"><a class="reference internal" href="advance/patch_registry.html#discovery-and-apply">Discovery and apply</a></li>
+<li class="toctree-l2"><a class="reference internal" href="advance/patch_registry.html#source-patches-dsv4-megatron-on-disk">SOURCE patches (DSV4 Megatron on-disk)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="advance/patch_registry.html#import-patches-megatron-runtime-monkey-patches">IMPORT patches (Megatron runtime monkey-patches)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="advance/patch_registry.html#training-patches-megatron-setup-eval-hooks">TRAINING patches (Megatron setup / eval hooks)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="advance/patch_registry.html#config-build-args-model-build-patches">CONFIG_BUILD / ARGS / MODEL_BUILD patches</a></li>
+<li class="toctree-l2"><a class="reference internal" href="advance/patch_registry.html#per-patch-details-selected">Per-patch details (selected)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="advance/patch_registry.html#hf-checkpoint-conversion-not-in-registry">HF checkpoint conversion (not in registry)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="advance/patch_registry.html#adding-a-new-patch">Adding a new patch</a></li>
+<li class="toctree-l2"><a class="reference internal" href="advance/patch_registry.html#related-files">Related files</a></li>
+</ul>
+</li>
+</ul>
+</div>
+<div class="toctree-wrapper compound">
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="api/quantize.html">atomrl.lumen.quantize</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/quantize.html#quant-enable">quant.enable</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/quantize.html#quantconfig">QuantConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/quantize.html#quantformat">QuantFormat</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/quantize.html#scalingtype">ScalingType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/quantize.html#amaxalgo">AmaxAlgo</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api/modules.html">atomrl.lumen.modules</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/modules.html#module-summary">Module Summary</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/modules.html#attention">Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/modules.html#linear">Linear</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/modules.html#fused-mlp">Fused MLP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/modules.html#moe">MoE</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/modules.html#communication-overlap">Communication Overlap</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api/ops.html">atomrl.lumen.ops</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/ops.html#dispatch-architecture">Dispatch Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/ops.html#attention">Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/ops.html#quantized-linear-gemm">Quantized Linear &amp; GEMM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/ops.html#normalization">Normalization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/ops.html#fused-mlp">Fused MLP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/ops.html#moe-routing">MoE Routing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/ops.html#rope">RoPE</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/ops.html#cross-entropy">Cross-Entropy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/ops.html#sdma">SDMA</a></li>
+</ul>
+</li>
+</ul>
+</div>
+</section>
+
+        </article>
+      </div>
+      <footer>
+        
+        <div class="related-pages">
+          <a class="next-page" href="quickstart/install.html">
+              <div class="page-info">
+                <div class="context">
+                  <span>Next</span>
+                </div>
+                <div class="title">Installation</div>
+              </div>
+              <svg class="furo-related-icon"><use href="#svg-arrow-right"></use></svg>
+            </a>
+          
+        </div>
+        <div class="bottom-of-page">
+          <div class="left-details">
+            <div class="copyright">
+                Copyright &#169; 2026, AMD
+            </div>
+            Made with <a href="https://www.sphinx-doc.org/">Sphinx</a> and <a class="muted-link" href="https://pradyunsg.me">@pradyunsg</a>'s
+            
+            <a href="https://github.com/pradyunsg/furo">Furo</a>
+            
+          </div>
+          <div class="right-details">
+            <div class="icons">
+              <a class="muted-link " href="https://github.com/ROCm/ATOM/tree/main/atomrl/lumen" aria-label="GitHub"><svg stroke="currentColor" fill="currentColor" stroke-width="0" viewBox="0 0 16 16"><path fill-rule="evenodd" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"></path></svg></a>
+              
+            </div>
+          </div>
+        </div>
+        
+      </footer>
+    </div>
+    <aside class="toc-drawer no-toc">
+      
+      
+      
+    </aside>
+  </div>
+</div><script src="_static/documentation_options.js?v=01f34227"></script>
+    <script src="_static/doctools.js?v=fd6eb6e6"></script>
+    <script src="_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <script src="_static/scripts/furo.js?v=46bd48cc"></script>
+    </body>
+</html>

@@ -1,0 +1,1256 @@
+<!doctype html>
+<html class="no-js" lang="en" data-content_root="../">
+  <head><meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta name="color-scheme" content="light dark"><meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="index" title="Index" href="../genindex.html"><link rel="search" title="Search" href="../search.html"><link rel="next" title="Megatron Patch Registry" href="patch_registry.html"><link rel="prev" title="Distributed Training" href="distributed.html">
+
+    <!-- Generated with Sphinx 9.1.1 and Furo 2025.12.19 -->
+        <title>Lumen Feature Catalog - Lumen Documentation</title>
+      <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=d111a655" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/furo.css?v=7bdb33bb" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/furo-extensions.css?v=8dab3a3b" />
+    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=a9f7d8bd" />
+    
+    
+
+
+<style>
+  body {
+    --color-code-background: #f2f2f2;
+  --color-code-foreground: #1e1e1e;
+  --color-brand-primary: #2d3036;
+  --color-brand-content: #c41922;
+  
+  }
+  @media not print {
+    body[data-theme="dark"] {
+      --color-code-background: #202020;
+  --color-code-foreground: #d0d0d0;
+  --color-brand-primary: #e0e0e0;
+  --color-brand-content: #ff4654;
+  
+    }
+    @media (prefers-color-scheme: dark) {
+      body:not([data-theme="light"]) {
+        --color-code-background: #202020;
+  --color-code-foreground: #d0d0d0;
+  --color-brand-primary: #e0e0e0;
+  --color-brand-content: #ff4654;
+  
+      }
+    }
+  }
+</style></head>
+  <body>
+    
+    <script>
+      document.body.dataset.theme = localStorage.getItem("theme") || "auto";
+    </script>
+    
+
+<svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+  <symbol id="svg-toc" viewBox="0 0 24 24">
+    <title>Contents</title>
+    <svg stroke="currentColor" fill="currentColor" stroke-width="0" viewBox="0 0 1024 1024">
+      <path d="M408 442h480c4.4 0 8-3.6 8-8v-56c0-4.4-3.6-8-8-8H408c-4.4 0-8 3.6-8 8v56c0 4.4 3.6 8 8 8zm-8 204c0 4.4 3.6 8 8 8h480c4.4 0 8-3.6 8-8v-56c0-4.4-3.6-8-8-8H408c-4.4 0-8 3.6-8 8v56zm504-486H120c-4.4 0-8 3.6-8 8v56c0 4.4 3.6 8 8 8h784c4.4 0 8-3.6 8-8v-56c0-4.4-3.6-8-8-8zm0 632H120c-4.4 0-8 3.6-8 8v56c0 4.4 3.6 8 8 8h784c4.4 0 8-3.6 8-8v-56c0-4.4-3.6-8-8-8zM115.4 518.9L271.7 642c5.8 4.6 14.4.5 14.4-6.9V388.9c0-7.4-8.5-11.5-14.4-6.9L115.4 505.1a8.74 8.74 0 0 0 0 13.8z"/>
+    </svg>
+  </symbol>
+  <symbol id="svg-menu" viewBox="0 0 24 24">
+    <title>Menu</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather-menu">
+      <line x1="3" y1="12" x2="21" y2="12"></line>
+      <line x1="3" y1="6" x2="21" y2="6"></line>
+      <line x1="3" y1="18" x2="21" y2="18"></line>
+    </svg>
+  </symbol>
+  <symbol id="svg-arrow-right" viewBox="0 0 24 24">
+    <title>Expand</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather-chevron-right">
+      <polyline points="9 18 15 12 9 6"></polyline>
+    </svg>
+  </symbol>
+  <symbol id="svg-sun" viewBox="0 0 24 24">
+    <title>Light mode</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round" class="feather-sun">
+      <circle cx="12" cy="12" r="5"></circle>
+      <line x1="12" y1="1" x2="12" y2="3"></line>
+      <line x1="12" y1="21" x2="12" y2="23"></line>
+      <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line>
+      <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line>
+      <line x1="1" y1="12" x2="3" y2="12"></line>
+      <line x1="21" y1="12" x2="23" y2="12"></line>
+      <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line>
+      <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>
+    </svg>
+  </symbol>
+  <symbol id="svg-moon" viewBox="0 0 24 24">
+    <title>Dark mode</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round" class="icon-tabler-moon">
+      <path stroke="none" d="M0 0h24v24H0z" fill="none" />
+      <path d="M12 3c.132 0 .263 0 .393 0a7.5 7.5 0 0 0 7.92 12.446a9 9 0 1 1 -8.313 -12.454z" />
+    </svg>
+  </symbol>
+  <symbol id="svg-sun-with-moon" viewBox="0 0 24 24">
+    <title>Auto light/dark, in light mode</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round"
+      class="icon-custom-derived-from-feather-sun-and-tabler-moon">
+      <path style="opacity: 50%" d="M 5.411 14.504 C 5.471 14.504 5.532 14.504 5.591 14.504 C 3.639 16.319 4.383 19.569 6.931 20.352 C 7.693 20.586 8.512 20.551 9.25 20.252 C 8.023 23.207 4.056 23.725 2.11 21.184 C 0.166 18.642 1.702 14.949 4.874 14.536 C 5.051 14.512 5.231 14.5 5.411 14.5 L 5.411 14.504 Z"/>
+      <line x1="14.5" y1="3.25" x2="14.5" y2="1.25"/>
+      <line x1="14.5" y1="15.85" x2="14.5" y2="17.85"/>
+      <line x1="10.044" y1="5.094" x2="8.63" y2="3.68"/>
+      <line x1="19" y1="14.05" x2="20.414" y2="15.464"/>
+      <line x1="8.2" y1="9.55" x2="6.2" y2="9.55"/>
+      <line x1="20.8" y1="9.55" x2="22.8" y2="9.55"/>
+      <line x1="10.044" y1="14.006" x2="8.63" y2="15.42"/>
+      <line x1="19" y1="5.05" x2="20.414" y2="3.636"/>
+      <circle cx="14.5" cy="9.55" r="3.6"/>
+    </svg>
+  </symbol>
+  <symbol id="svg-moon-with-sun" viewBox="0 0 24 24">
+    <title>Auto light/dark, in dark mode</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round"
+      class="icon-custom-derived-from-feather-sun-and-tabler-moon">
+      <path d="M 8.282 7.007 C 8.385 7.007 8.494 7.007 8.595 7.007 C 5.18 10.184 6.481 15.869 10.942 17.24 C 12.275 17.648 13.706 17.589 15 17.066 C 12.851 22.236 5.91 23.143 2.505 18.696 C -0.897 14.249 1.791 7.786 7.342 7.063 C 7.652 7.021 7.965 7 8.282 7 L 8.282 7.007 Z"/>
+      <line style="opacity: 50%" x1="18" y1="3.705" x2="18" y2="2.5"/>
+      <line style="opacity: 50%" x1="18" y1="11.295" x2="18" y2="12.5"/>
+      <line style="opacity: 50%" x1="15.316" y1="4.816" x2="14.464" y2="3.964"/>
+      <line style="opacity: 50%" x1="20.711" y1="10.212" x2="21.563" y2="11.063"/>
+      <line style="opacity: 50%" x1="14.205" y1="7.5" x2="13.001" y2="7.5"/>
+      <line style="opacity: 50%" x1="21.795" y1="7.5" x2="23" y2="7.5"/>
+      <line style="opacity: 50%" x1="15.316" y1="10.184" x2="14.464" y2="11.036"/>
+      <line style="opacity: 50%" x1="20.711" y1="4.789" x2="21.563" y2="3.937"/>
+      <circle style="opacity: 50%" cx="18" cy="7.5" r="2.169"/>
+    </svg>
+  </symbol>
+  <symbol id="svg-pencil" viewBox="0 0 24 24">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round" class="icon-tabler-pencil-code">
+      <path d="M4 20h4l10.5 -10.5a2.828 2.828 0 1 0 -4 -4l-10.5 10.5v4" />
+      <path d="M13.5 6.5l4 4" />
+      <path d="M20 21l2 -2l-2 -2" />
+      <path d="M17 17l-2 2l2 2" />
+    </svg>
+  </symbol>
+  <symbol id="svg-eye" viewBox="0 0 24 24">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round" class="icon-tabler-eye-code">
+      <path stroke="none" d="M0 0h24v24H0z" fill="none" />
+      <path d="M10 12a2 2 0 1 0 4 0a2 2 0 0 0 -4 0" />
+      <path
+        d="M11.11 17.958c-3.209 -.307 -5.91 -2.293 -8.11 -5.958c2.4 -4 5.4 -6 9 -6c3.6 0 6.6 2 9 6c-.21 .352 -.427 .688 -.647 1.008" />
+      <path d="M20 21l2 -2l-2 -2" />
+      <path d="M17 17l-2 2l2 2" />
+    </svg>
+  </symbol>
+</svg>
+
+<input type="checkbox" class="sidebar-toggle" name="__navigation" id="__navigation" aria-label="Toggle site navigation sidebar">
+<input type="checkbox" class="sidebar-toggle" name="__toc" id="__toc" aria-label="Toggle table of contents sidebar">
+<label class="overlay sidebar-overlay" for="__navigation"></label>
+<label class="overlay toc-overlay" for="__toc"></label>
+
+<a class="skip-to-content muted-link" href="#furo-main-content">Skip to content</a>
+
+
+
+<div class="page">
+  <header class="mobile-header">
+    <div class="header-left">
+      <label class="nav-overlay-icon" for="__navigation">
+        <span class="icon"><svg><use href="#svg-menu"></use></svg></span>
+      </label>
+    </div>
+    <div class="header-center">
+      <a href="../index.html"><div class="brand">Lumen Documentation</div></a>
+    </div>
+    <div class="header-right">
+      <div class="theme-toggle-container theme-toggle-header">
+        <button class="theme-toggle" aria-label="Toggle Light / Dark / Auto color theme">
+          <svg class="theme-icon-when-auto-light"><use href="#svg-sun-with-moon"></use></svg>
+          <svg class="theme-icon-when-auto-dark"><use href="#svg-moon-with-sun"></use></svg>
+          <svg class="theme-icon-when-dark"><use href="#svg-moon"></use></svg>
+          <svg class="theme-icon-when-light"><use href="#svg-sun"></use></svg>
+        </button>
+      </div>
+      <label class="toc-overlay-icon toc-header-icon" for="__toc">
+        <span class="icon"><svg><use href="#svg-toc"></use></svg></span>
+      </label>
+    </div>
+  </header>
+  <aside class="sidebar-drawer">
+    <div class="sidebar-container">
+      
+      <div class="sidebar-sticky"><a class="sidebar-brand" href="../index.html">
+  
+  <span class="sidebar-brand-text">Lumen Documentation</span>
+  
+</a><form class="sidebar-search-container" method="get" action="../search.html" role="search">
+  <input class="sidebar-search" placeholder="Search" name="q" aria-label="Search">
+  <input type="hidden" name="check_keywords" value="yes">
+  <input type="hidden" name="area" value="default">
+</form>
+<div id="searchbox"></div><div class="sidebar-scroll"><div class="sidebar-tree">
+  <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../quickstart/install.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quickstart/quick_start.html">Quick Start</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../architecture.html">Architecture</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../examples/llama2_sft.html">LLaMA-2 SFT</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/llama31_pretrain.html">LLaMA 3.1 Pre-training</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Advanced Features</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="fp8_training.html">FP8 Quantized Training</a></li>
+<li class="toctree-l1"><a class="reference internal" href="lora.html">LoRA Support</a></li>
+<li class="toctree-l1"><a class="reference internal" href="distributed.html">Distributed Training</a></li>
+<li class="toctree-l1 current current-page"><a class="current reference internal" href="#">Lumen Feature Catalog</a></li>
+<li class="toctree-l1"><a class="reference internal" href="patch_registry.html">Megatron Patch Registry</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../api/quantize.html">atomrl.lumen.quantize</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/modules.html">atomrl.lumen.modules</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/ops.html">atomrl.lumen.ops</a></li>
+</ul>
+
+</div><a class="sidebar-github-link" href="https://github.com/ROCm/ATOM/tree/main/atomrl/lumen" target="_blank" rel="noopener">
+  <svg stroke="currentColor" fill="currentColor" stroke-width="0" viewBox="0 0 16 16" width="16" height="16" style="vertical-align: text-bottom; margin-right: 6px;">
+    <path fill-rule="evenodd" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"></path>
+  </svg>
+  GitHub
+</a></div>
+      </div>
+      
+    </div>
+  </aside>
+  <div class="main">
+    <div class="content">
+      <div class="article-container">
+        <a href="#" class="back-to-top muted-link">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+            <path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8v12z"></path>
+          </svg>
+          <span>Back to top</span>
+        </a>
+        <div class="content-icon-container">
+          <div class="view-this-page">
+  <a class="muted-link" href="https://github.com/ROCm/ATOM/blob/main/atomrl/lumen/lumen-docs/docs/source/advance/feature_catalog.md?plain=true" title="View this page">
+    <svg><use href="#svg-eye"></use></svg>
+    <span class="visually-hidden">View this page</span>
+  </a>
+</div><div class="edit-this-page">
+  <a class="muted-link" href="https://github.com/ROCm/ATOM/edit/main/atomrl/lumen/lumen-docs/docs/source/advance/feature_catalog.md" rel="edit" title="Edit this page">
+    <svg><use href="#svg-pencil"></use></svg>
+    <span class="visually-hidden">Edit this page</span>
+  </a>
+</div><div class="theme-toggle-container theme-toggle-content">
+            <button class="theme-toggle" aria-label="Toggle Light / Dark / Auto color theme">
+              <svg class="theme-icon-when-auto-light"><use href="#svg-sun-with-moon"></use></svg>
+              <svg class="theme-icon-when-auto-dark"><use href="#svg-moon-with-sun"></use></svg>
+              <svg class="theme-icon-when-dark"><use href="#svg-moon"></use></svg>
+              <svg class="theme-icon-when-light"><use href="#svg-sun"></use></svg>
+            </button>
+          </div>
+          <label class="toc-overlay-icon toc-content-icon" for="__toc">
+            <span class="icon"><svg><use href="#svg-toc"></use></svg></span>
+          </label>
+        </div>
+        <article role="main" id="furo-main-content">
+          <section id="lumen-feature-catalog">
+<h1>Lumen Feature Catalog<a class="headerlink" href="#lumen-feature-catalog" title="Link to this heading">¶</a></h1>
+<p>Last updated: 04/09/2026.</p>
+<p>A comprehensive inventory of all Lumen features organized by domain: <strong>Quantization</strong>, <strong>Distributed Training</strong>, and <strong>LoRA</strong>. Each section provides a capability overview table (for team leads and architects) followed by API reference subsections with function signatures, parameters, and return types (for developers).</p>
+<hr class="docutils" />
+<section id="quantization-features">
+<span id="1-quantization-features"></span><h2>1. Quantization Features<a class="headerlink" href="#quantization-features" title="Link to this heading">¶</a></h2>
+<section id="capability-overview">
+<span id="11-capability-overview"></span><h3>1.1 Capability Overview<a class="headerlink" href="#capability-overview" title="Link to this heading">¶</a></h3>
+<div class="table-wrapper colwidths-auto docutils container">
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Feature</p></th>
+<th class="head"><p>Description</p></th>
+<th class="head"><p>CLI Flag / Entry Point</p></th>
+<th class="head"><p>Scaling Types</p></th>
+<th class="head"><p>Status</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">quant.enable()</span></code></p></td>
+<td><p>One-call FP8 enablement – patches all <code class="docutils literal notranslate"><span class="pre">nn.Linear</span></code> modules for FP8 training</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">quant.enable(model)</span></code></p></td>
+<td><p>All</p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+<tr class="row-odd"><td><p>FP8 Quantization Kernels</p></td>
+<td><p>Per-tensor, blockwise, MXFP8 quantization primitives</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">atomrl.lumen.ops.quantize.ops</span></code></p></td>
+<td><p>delayed, dynamic, per_token, blockwise, mxfp8</p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+<tr class="row-even"><td><p>FP8 Linear (Forward + Backward)</p></td>
+<td><p>Quantized linear with 7 scaling modes, full forward/dgrad/wgrad dispatch</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--linear-fp8</span></code></p></td>
+<td><p>delayed, dynamic, per_token, blockwise, mxfp8, blockwise2d, none</p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+<tr class="row-odd"><td><p>MXFP4 Linear (Forward + Backward)</p></td>
+<td><p>Dedicated MXFP4 linear training path with 32-element block scales</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--linear-fp4</span></code></p></td>
+<td><p>mxfp4</p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+<tr class="row-even"><td><p>Fused Norm + Quantize</p></td>
+<td><p>RMSNorm/LayerNorm with fused FP8 output – single kernel pass</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--lumen-norm</span></code></p></td>
+<td><p>delayed, dynamic, per_token, blockwise, mxfp8</p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+<tr class="row-odd"><td><p>FP8 Attention</p></td>
+<td><p>FP8 quantized QKV in dot-product attention (DPA) or multi-head attention (MHA)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--lumen-fp8-attn</span> <span class="pre">dpa|mha</span></code></p></td>
+<td><p>blockwise, dynamic, delayed, per_token, mxfp8, blockwise2d</p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+<tr class="row-even"><td><p>FP8 Grouped GEMM (MoE)</p></td>
+<td><p>FP8 expert GEMM for MoE layers, fused and sequential fallback</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--moe-grouped-gemm</span></code></p></td>
+<td><p>delayed, dynamic, per_token, blockwise, mxfp8</p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+<tr class="row-odd"><td><p>FP8 Activation Store</p></td>
+<td><p>Save MLP activations as FP8 uint8 in backward pass (~50% memory reduction)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--lumen-fp8-activation-store</span></code></p></td>
+<td><p>dynamic (quantize to FP8)</p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+<tr class="row-even"><td><p>FP8 Weight Gradients</p></td>
+<td><p>FP8 GEMM in wgrad path (MXFP8 only; others forced BF16)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--linear-fp8-wgrad</span></code></p></td>
+<td><p>mxfp8</p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+<tr class="row-odd"><td><p>FP8 Param All-Gather (Layer 1)</p></td>
+<td><p>Store parameters in FP8 with lazy re-quant on access + optimizer hook</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--lumen-fp8-param-gather</span></code></p></td>
+<td><p>–</p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+<tr class="row-even"><td><p>FP8 Param Manager (FSDP2)</p></td>
+<td><p>In-place FP8 param storage for FSDP2, -25% VRAM (no offload) or -5% (offload)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">FP8_PARAM_MANAGER=1</span></code></p></td>
+<td><p>–</p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+<tr class="row-odd"><td><p>FP8 Param Manager (Megatron)</p></td>
+<td><p>On-the-fly BF16→FP8 quantization for Megatron ColumnParallel/RowParallel, -29% VRAM</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">FP8_PARAM_MANAGER=1</span></code></p></td>
+<td><p>–</p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+<tr class="row-even"><td><p>Scaling Manager</p></td>
+<td><p>Amax history tracking, delayed scaling lifecycle, cross-rank sync, warmup + reset</p></td>
+<td><p>Internal (<code class="docutils literal notranslate"><span class="pre">ScalingManager</span></code>)</p></td>
+<td><p>delayed</p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+<tr class="row-odd"><td><p>Blockwise2D Quantization</p></td>
+<td><p>2D block FP8 scaling for attention and linear backward (Lumen-only)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--linear-fp8-scaling</span> <span class="pre">blockwise2d</span></code></p></td>
+<td><p>blockwise2d</p></td>
+<td><p>LUMEN-ONLY</p></td>
+</tr>
+<tr class="row-even"><td><p>Per-Token FP8 Scaling</p></td>
+<td><p>Per-row FP8 quantization for attention (Lumen-only)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">scaling_type=per_token</span></code></p></td>
+<td><p>per_token</p></td>
+<td><p>LUMEN-ONLY</p></td>
+</tr>
+<tr class="row-odd"><td><p>FP8 Checkpoint</p></td>
+<td><p>Save/restore FP8 scaling state across checkpoints</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">lumen_checkpoint</span></code></p></td>
+<td><p>All</p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+<tr class="row-even"><td><p>First/Last Layers BF16</p></td>
+<td><p>Keep first and last transformer layers in BF16 for numerical stability</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">first_last_layers_bf16</span></code></p></td>
+<td><p>–</p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="api-reference">
+<span id="12-api-reference"></span><h3>1.2 API Reference<a class="headerlink" href="#api-reference" title="Link to this heading">¶</a></h3>
+<section id="quant-enable">
+<h4><code class="docutils literal notranslate"><span class="pre">quant.enable()</span></code><a class="headerlink" href="#quant-enable" title="Link to this heading">¶</a></h4>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">quant</span><span class="o">.</span><span class="n">enable</span><span class="p">(</span>
+    <span class="n">model</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">,</span>
+    <span class="n">config</span><span class="p">:</span> <span class="n">QuantConfig</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span>
+</pre></div>
+</div>
+<p>Patches all <code class="docutils literal notranslate"><span class="pre">nn.Linear</span></code> layers in the model for FP8 training in one call. Replaces linear modules with Lumen’s quantized linear implementation, wires up the <code class="docutils literal notranslate"><span class="pre">ScalingManager</span></code>, and registers optimizer hooks for FP8 parameter management.</p>
+<p><strong>Parameters:</strong></p>
+<div class="table-wrapper colwidths-auto docutils container">
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Parameter</p></th>
+<th class="head"><p>Type</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">model</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">torch.nn.Module</span></code></p></td>
+<td><p>(required)</p></td>
+<td><p>The model to patch for FP8 training</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">config</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">QuantConfig</span> <span class="pre">|</span> <span class="pre">None</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>Quantization configuration. If <code class="docutils literal notranslate"><span class="pre">None</span></code>, uses default delayed scaling</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>Returns:</strong> The patched model (same object, modified in-place).</p>
+<p><strong>Example:</strong></p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">atomrl.lumen</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">atomrl.lumen.quantize</span><span class="w"> </span><span class="kn">import</span> <span class="n">QuantConfig</span>
+
+<span class="n">model</span> <span class="o">=</span> <span class="n">build_my_model</span><span class="p">()</span>
+<span class="n">atomrl</span><span class="o">.</span><span class="n">lumen</span><span class="o">.</span><span class="n">quant</span><span class="o">.</span><span class="n">enable</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">QuantConfig</span><span class="p">(</span><span class="n">scaling_type</span><span class="o">=</span><span class="s2">"blockwise"</span><span class="p">))</span>
+</pre></div>
+</div>
+</section>
+<section id="quantconfig">
+<h4><code class="docutils literal notranslate"><span class="pre">QuantConfig</span></code><a class="headerlink" href="#quantconfig" title="Link to this heading">¶</a></h4>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">QuantConfig</span><span class="p">:</span>
+    <span class="n">scaling_type</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"delayed"</span>       <span class="c1"># delayed | dynamic | per_token | blockwise | blockwise2d | mxfp8</span>
+    <span class="n">fp8_format</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"hybrid"</span>          <span class="c1"># hybrid (e4m3 fwd / e5m2 bwd) | e4m3 | e5m2</span>
+    <span class="n">amax_history_len</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1024</span>        <span class="c1"># Number of steps to track for amax history</span>
+    <span class="n">amax_algo</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"most_recent"</span>      <span class="c1"># most_recent | max</span>
+    <span class="n">margin</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.0</span>                 <span class="c1"># FP8 scaling margin</span>
+    <span class="n">fp8_wgrad</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>             <span class="c1"># Enable FP8 weight gradients (MXFP8 only)</span>
+    <span class="n">first_last_layers_bf16</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span> <span class="c1"># Keep first/last layers in BF16</span>
+    <span class="n">reduce_amax</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>            <span class="c1"># Cross-rank amax synchronization</span>
+</pre></div>
+</div>
+<p>Configuration dataclass controlling all FP8 quantization behavior. Passed to <code class="docutils literal notranslate"><span class="pre">quant.enable()</span></code> or used internally by Lumen modules.</p>
+</section>
+<section id="scalingmanager">
+<h4><code class="docutils literal notranslate"><span class="pre">ScalingManager</span></code><a class="headerlink" href="#scalingmanager" title="Link to this heading">¶</a></h4>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">ScalingManager</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">QuantConfig</span><span class="p">,</span> <span class="n">dp_group</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">tp_group</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span> <span class="o">...</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">quantize</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tensor</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">]:</span> <span class="o">...</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">quantize_bwd_delayed</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tensor</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">]:</span> <span class="o">...</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">step</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span> <span class="o">...</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">enable_fp8_params</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">model</span><span class="p">:</span> <span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span> <span class="o">...</span>
+</pre></div>
+</div>
+<p>Manages the FP8 scaling lifecycle: amax history collection, scale computation, delayed vs dynamic dispatch, cross-rank amax reduction, and warmup/reset logic.</p>
+<div class="table-wrapper colwidths-auto docutils container">
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Method</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">quantize(tensor)</span></code></p></td>
+<td><p>Quantize a tensor to FP8 using current scaling state; returns <code class="docutils literal notranslate"><span class="pre">(fp8_tensor,</span> <span class="pre">scale)</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">quantize_bwd_delayed(tensor)</span></code></p></td>
+<td><p>Delayed per-tensor quantization for backward pass (blockwise2d linear)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">step()</span></code></p></td>
+<td><p>Update amax history and recompute scales (call once per training step)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">enable_fp8_params(model)</span></code></p></td>
+<td><p>Enable FP8 parameter storage with lazy re-quant and optimizer hooks</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="fp8-quantization-primitives">
+<h4>FP8 Quantization Primitives<a class="headerlink" href="#fp8-quantization-primitives" title="Link to this heading">¶</a></h4>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># Per-tensor (delayed / dynamic)</span>
+<span class="n">static_per_tensor_quant</span><span class="p">(</span><span class="n">tensor</span><span class="p">,</span> <span class="n">scale</span><span class="p">,</span> <span class="n">fp8_dtype</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span>   <span class="c1"># C++ kernel</span>
+<span class="n">per_tensor_quant_hip</span><span class="p">(</span><span class="n">tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">]</span>          <span class="c1"># CK/HIP</span>
+<span class="n">per_tensor_quant_triton</span><span class="p">(</span><span class="n">tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">]</span>       <span class="c1"># Triton fallback</span>
+
+<span class="c1"># Per-token</span>
+<span class="n">per_token_quant_hip</span><span class="p">(</span><span class="n">tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">]</span>           <span class="c1"># CK/HIP</span>
+
+<span class="c1"># Blockwise</span>
+<span class="n">quant_fp8_blockwise_impl</span><span class="p">(</span><span class="n">tensor</span><span class="p">,</span> <span class="n">block_size</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">]</span>  <span class="c1"># Triton</span>
+
+<span class="c1"># MXFP8</span>
+<span class="n">convert_to_mxfp8</span><span class="p">(</span><span class="n">tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">]</span>             <span class="c1"># Triton</span>
+<span class="n">convert_from_mxfp8</span><span class="p">(</span><span class="n">tensor</span><span class="p">,</span> <span class="n">scale</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span>                    <span class="c1"># Triton</span>
+</pre></div>
+</div>
+<p><strong>Source:</strong> <code class="docutils literal notranslate"><span class="pre">lumen/ops/quantize/ops.py</span></code></p>
+</section>
+<section id="fp8-linear">
+<h4>FP8 Linear<a class="headerlink" href="#fp8-linear" title="Link to this heading">¶</a></h4>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">LumenColumnParallelLinear</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_size</span><span class="p">,</span> <span class="n">output_size</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">bias</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+                 <span class="n">scaling_type</span><span class="o">=</span><span class="s2">"delayed"</span><span class="p">,</span> <span class="n">tp_group</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">sp</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span> <span class="o">...</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">LumenRowParallelLinear</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_size</span><span class="p">,</span> <span class="n">output_size</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">bias</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+                 <span class="n">scaling_type</span><span class="o">=</span><span class="s2">"delayed"</span><span class="p">,</span> <span class="n">tp_group</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">sp</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span> <span class="o">...</span>
+</pre></div>
+</div>
+<p><strong>Forward dispatch:</strong> Input quantization -&gt; FP8 GEMM -&gt; optional bias. 7 scaling modes with backend priority: hipBLASLt -&gt; CK -&gt; Triton.</p>
+<p><strong>Backward dispatch:</strong> dgrad uses same GEMM as forward; wgrad forced BF16 (except MXFP8).</p>
+</section>
+<section id="fused-norm-quantize">
+<h4>Fused Norm + Quantize<a class="headerlink" href="#fused-norm-quantize" title="Link to this heading">¶</a></h4>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">LumenRMSNorm</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_size</span><span class="p">,</span> <span class="n">eps</span><span class="o">=</span><span class="mf">1e-5</span><span class="p">,</span> <span class="n">scaling_type</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span> <span class="o">...</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span> <span class="o">|</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">]:</span> <span class="o">...</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">LumenLayerNorm</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_size</span><span class="p">,</span> <span class="n">eps</span><span class="o">=</span><span class="mf">1e-5</span><span class="p">,</span> <span class="n">scaling_type</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span> <span class="o">...</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span> <span class="o">|</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">]:</span> <span class="o">...</span>
+</pre></div>
+</div>
+<p>When <code class="docutils literal notranslate"><span class="pre">scaling_type</span></code> is set, the norm operation fuses FP8 quantization into the same kernel call, avoiding an extra memory round-trip. Returns <code class="docutils literal notranslate"><span class="pre">(normed_fp8,</span> <span class="pre">scale)</span></code> when fused, or just <code class="docutils literal notranslate"><span class="pre">normed_bf16</span></code> when <code class="docutils literal notranslate"><span class="pre">scaling_type=None</span></code>.</p>
+</section>
+<section id="fp8-attention">
+<h4>FP8 Attention<a class="headerlink" href="#fp8-attention" title="Link to this heading">¶</a></h4>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># BF16 attention</span>
+<span class="n">attention</span><span class="p">(</span>
+    <span class="n">query</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span>
+    <span class="n">attn_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">dropout_p</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span> <span class="n">is_causal</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+    <span class="n">backend_type</span><span class="o">=</span><span class="s2">"auto"</span><span class="p">,</span>       <span class="c1"># auto | aiter_csrc | aiter_triton</span>
+    <span class="n">cp_param_bundle</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+    <span class="n">return_lse</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span> <span class="o">|</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">]</span>
+
+<span class="c1"># FP8 attention</span>
+<span class="n">attention_fp8_quant</span><span class="p">(</span>
+    <span class="n">query</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span>
+    <span class="n">quant_type</span><span class="o">=</span><span class="s2">"blockwise"</span><span class="p">,</span>    <span class="c1"># blockwise | dynamic | delayed | per_token | mxfp8 | blockwise2d | none</span>
+    <span class="n">scaling_manager</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+    <span class="n">cp_param_bundle</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+    <span class="n">return_lse</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span> <span class="o">|</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">]</span>
+</pre></div>
+</div>
+<p><strong>Source:</strong> <code class="docutils literal notranslate"><span class="pre">lumen/ops/attention/attention.py</span></code></p>
+</section>
+<section id="fp8-grouped-gemm-moe">
+<h4>FP8 Grouped GEMM (MoE)<a class="headerlink" href="#fp8-grouped-gemm-moe" title="Link to this heading">¶</a></h4>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">grouped_gemm</span><span class="p">(</span>
+    <span class="n">lhs</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>           <span class="c1"># [total_tokens, K]</span>
+    <span class="n">rhs</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>           <span class="c1"># [num_experts, N, K]</span>
+    <span class="n">group_sizes</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>   <span class="c1"># [num_experts]</span>
+    <span class="n">scaling_type</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"none"</span><span class="p">,</span>
+    <span class="o">...</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span>               <span class="c1"># [total_tokens, N]</span>
+
+<span class="n">grouped_gemm_wgrad</span><span class="p">(</span>
+    <span class="n">grad_output</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+    <span class="n">input_tensor</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+    <span class="n">group_sizes</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+    <span class="n">scaling_type</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"none"</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span>
+</pre></div>
+</div>
+<p><strong>Source:</strong> <code class="docutils literal notranslate"><span class="pre">lumen/ops/gemm/grouped_gemm.py</span></code></p>
+</section>
+<section id="fp8-activation-store">
+<h4>FP8 Activation Store<a class="headerlink" href="#fp8-activation-store" title="Link to this heading">¶</a></h4>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">fused_gated_mlp_fp8_store</span><span class="p">(</span>
+    <span class="n">x</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">w_up</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">w_gate</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">w_down</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+    <span class="n">activation</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+    <span class="n">bias_up</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">bias_gate</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">bias_down</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+    <span class="n">fp8_dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float8_e4m3fn</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span>
+
+<span class="n">fused_mlp_fp8_store</span><span class="p">(</span>
+    <span class="n">x</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">w_up</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">w_down</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+    <span class="n">activation</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+    <span class="n">bias_up</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">bias_down</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+    <span class="n">fp8_dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float8_e4m3fn</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span>
+</pre></div>
+</div>
+<p>Forward pass uses BF16 GEMM; activations are quantized to FP8 uint8 + scale before <code class="docutils literal notranslate"><span class="pre">save_for_backward</span></code>. Backward dequantizes and computes gradients in BF16. ~50% activation memory reduction.</p>
+<p><strong>Source:</strong> <code class="docutils literal notranslate"><span class="pre">lumen/ops/mlp/fused_mlp.py</span></code></p>
+</section>
+</section>
+</section>
+<hr class="docutils" />
+<section id="distributed-features">
+<span id="2-distributed-features"></span><h2>2. Distributed Features<a class="headerlink" href="#distributed-features" title="Link to this heading">¶</a></h2>
+<section id="id1">
+<span id="21-capability-overview"></span><h3>2.1 Capability Overview<a class="headerlink" href="#id1" title="Link to this heading">¶</a></h3>
+<div class="table-wrapper colwidths-auto docutils container">
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Feature</p></th>
+<th class="head"><p>Description</p></th>
+<th class="head"><p>CLI Flag / Entry Point</p></th>
+<th class="head"><p>Status</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Column-Parallel Linear</p></td>
+<td><p>TP column-parallel linear with FP8 support (all scaling modes)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">LumenColumnParallelLinear</span></code></p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+<tr class="row-odd"><td><p>Row-Parallel Linear</p></td>
+<td><p>TP row-parallel linear with FP8 support (all scaling modes)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">LumenRowParallelLinear</span></code></p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+<tr class="row-even"><td><p>LayerNorm + Linear (fused)</p></td>
+<td><p>Fused norm -&gt; quantize -&gt; column-parallel linear in one module</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">LumenLayerNormLinear</span></code></p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+<tr class="row-odd"><td><p>Sequence Parallelism (SP)</p></td>
+<td><p>Sequence-parallel scatter/gather integrated into TP linear modules</p></td>
+<td><p>Built-in to TP modules (<code class="docutils literal notranslate"><span class="pre">sp=True</span></code>)</p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+<tr class="row-even"><td><p>TP Comm-GEMM Overlap (SDMA)</p></td>
+<td><p>Async SDMA-based all-gather/reduce-scatter overlapped with GEMM</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--lumen-sdma</span></code></p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+<tr class="row-odd"><td><p>TP Comm-GEMM Overlap (Pipeline)</p></td>
+<td><p>NCCL chunk pipelining with double-buffered staging (BF16 only)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--lumen-tp-comm-overlap-mode</span> <span class="pre">pipeline</span></code></p></td>
+<td><p>PARTIAL</p></td>
+</tr>
+<tr class="row-even"><td><p>SDMA Collectives</p></td>
+<td><p>mori SDMA for intra-node all-gather / all-reduce on MI300X shared memory</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--lumen-sdma</span></code></p></td>
+<td><p>LUMEN-ONLY</p></td>
+</tr>
+<tr class="row-odd"><td><p>SDMA Cross-Entropy</p></td>
+<td><p>SDMA-routed all-gather in vocab-parallel cross-entropy</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--lumen-sdma-cross-entropy</span></code></p></td>
+<td><p>LUMEN-ONLY</p></td>
+</tr>
+<tr class="row-even"><td><p>Context Parallelism – P2P</p></td>
+<td><p>Ring send/recv for context parallelism</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">cp_comm_type=&quot;p2p&quot;</span></code></p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+<tr class="row-odd"><td><p>Context Parallelism – A2A</p></td>
+<td><p>All-to-all context parallelism with optional SDMA</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">cp_comm_type=&quot;a2a&quot;</span></code></p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+<tr class="row-even"><td><p>FSDP</p></td>
+<td><p>FSDP integration with FP8 – non-invasive wrap via <code class="docutils literal notranslate"><span class="pre">apply_fp8_training()</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">apply_fp8_training(model,</span> <span class="pre">args)</span></code></p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+<tr class="row-odd"><td><p>FSDP2</p></td>
+<td><p>PyTorch <code class="docutils literal notranslate"><span class="pre">fully_shard</span></code> integration</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">apply_fsdp2</span></code> / <code class="docutils literal notranslate"><span class="pre">--fsdp-version</span> <span class="pre">2</span></code></p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+<tr class="row-even"><td><p>Amax Reduction (DP)</p></td>
+<td><p>Cross-rank amax synchronization for FP8 delayed scaling</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">reduce_amax</span></code> with <code class="docutils literal notranslate"><span class="pre">dp_group</span></code></p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+<tr class="row-odd"><td><p>Gradient Accumulation Fusion</p></td>
+<td><p>Fuse weight gradient accumulation into backward pass</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--lumen-gradient-accumulation-fusion</span></code></p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+<tr class="row-even"><td><p>Delay wgrad Compute</p></td>
+<td><p>Defer weight gradient computation for better comm-compute overlap</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--lumen-delay-wgrad</span></code></p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="id2">
+<span id="22-api-reference"></span><h3>2.2 API Reference<a class="headerlink" href="#id2" title="Link to this heading">¶</a></h3>
+<section id="tp-parallel-linear-modules">
+<h4>TP Parallel Linear Modules<a class="headerlink" href="#tp-parallel-linear-modules" title="Link to this heading">¶</a></h4>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">LumenColumnParallelLinear</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Column-parallel linear with FP8 quantization and optional SDMA comm overlap."""</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">output_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span>
+                 <span class="n">bias</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+                 <span class="n">scaling_type</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"delayed"</span><span class="p">,</span>
+                 <span class="n">tp_group</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">sp</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+                 <span class="n">sdma_comm</span><span class="p">:</span> <span class="n">SdmaTpComm</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">gradient_accumulation_fusion</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">):</span> <span class="o">...</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span><span class="p">:</span> <span class="o">...</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">LumenRowParallelLinear</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Row-parallel linear with FP8 quantization and optional SDMA comm overlap."""</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">output_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span>
+                 <span class="n">bias</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+                 <span class="n">scaling_type</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"delayed"</span><span class="p">,</span>
+                 <span class="n">tp_group</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">sp</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+                 <span class="n">sdma_comm</span><span class="p">:</span> <span class="n">SdmaTpComm</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">gradient_accumulation_fusion</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">):</span> <span class="o">...</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span><span class="p">:</span> <span class="o">...</span>
+</pre></div>
+</div>
+<p><strong>Source:</strong> <code class="docutils literal notranslate"><span class="pre">lumen/modules/parallel_linear.py</span></code></p>
+</section>
+<section id="layernorm-linear-fused">
+<h4>LayerNorm + Linear (Fused)<a class="headerlink" href="#layernorm-linear-fused" title="Link to this heading">¶</a></h4>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">LumenLayerNormLinear</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Fused LayerNorm -&gt; FP8 quantize -&gt; column-parallel linear."""</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">output_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span>
+                 <span class="n">eps</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1e-5</span><span class="p">,</span>
+                 <span class="n">scaling_type</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"delayed"</span><span class="p">,</span>
+                 <span class="n">zero_centered_gamma</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+                 <span class="n">tp_group</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="n">sp</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">):</span> <span class="o">...</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span><span class="p">:</span> <span class="o">...</span>
+</pre></div>
+</div>
+<p><strong>Source:</strong> <code class="docutils literal notranslate"><span class="pre">lumen/modules/layernorm_linear.py</span></code></p>
+</section>
+<section id="sdma-communication">
+<h4>SDMA Communication<a class="headerlink" href="#sdma-communication" title="Link to this heading">¶</a></h4>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">SdmaAllgather</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Wrapper around mori.ccl.AllgatherSdma. Supports uint32/int32/float32/float64."""</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">SdmaContext</span><span class="p">):</span> <span class="o">...</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__call__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="nb">input</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">output</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span> <span class="o">...</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">SdmaAllreduce</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Wrapper around mori.ccl.AllreduceSdma. Supports uint32/int32/float32/float16/bfloat16."""</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">SdmaContext</span><span class="p">):</span> <span class="o">...</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__call__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="nb">input</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">output</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span> <span class="o">...</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">sdma_allgather_max</span><span class="p">(</span><span class="n">local_amax</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">SdmaContext</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""All-gather + element-wise max for cross-rank amax sharing."""</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">SdmaTpComm</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""TP-integrated SDMA: async all-gather for column-parallel, reduce-scatter for row-parallel."""</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tp_group</span><span class="p">,</span> <span class="n">sdma_ctx</span><span class="p">:</span> <span class="n">SdmaContext</span><span class="p">):</span> <span class="o">...</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">allgather_async</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="nb">input</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span><span class="p">:</span> <span class="o">...</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">reduce_scatter</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="nb">input</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span><span class="p">:</span> <span class="o">...</span>
+</pre></div>
+</div>
+<p><strong>Source:</strong> <code class="docutils literal notranslate"><span class="pre">lumen/ops/sdma.py</span></code>, <code class="docutils literal notranslate"><span class="pre">lumen/modules/sdma_comm.py</span></code></p>
+</section>
+<section id="fsdp-fsdp2-integration">
+<h4>FSDP / FSDP2 Integration<a class="headerlink" href="#fsdp-fsdp2-integration" title="Link to this heading">¶</a></h4>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">apply_fp8_training</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">,</span> <span class="n">args</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Non-invasive FP8 enablement for FSDP-wrapped models.</span>
+<span class="sd">    Patches norms, linears, and wires ScalingManager before FSDP wrap."""</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">apply_fsdp2</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Wrap model with PyTorch fully_shard (FSDP2)."""</span>
+</pre></div>
+</div>
+<p><strong>Source:</strong> <code class="docutils literal notranslate"><span class="pre">lumen/models/fsdp.py</span></code></p>
+</section>
+<section id="context-parallelism">
+<h4>Context Parallelism<a class="headerlink" href="#context-parallelism" title="Link to this heading">¶</a></h4>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># P2P (ring)</span>
+<span class="n">attention</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">cp_param_bundle</span><span class="o">=</span><span class="n">CpParamBundle</span><span class="p">(</span><span class="n">comm_type</span><span class="o">=</span><span class="s2">"p2p"</span><span class="p">,</span> <span class="o">...</span><span class="p">))</span> <span class="o">-&gt;</span> <span class="n">Tensor</span>
+
+<span class="c1"># A2A (all-to-all)</span>
+<span class="n">attention</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">cp_param_bundle</span><span class="o">=</span><span class="n">CpParamBundle</span><span class="p">(</span><span class="n">comm_type</span><span class="o">=</span><span class="s2">"a2a"</span><span class="p">,</span> <span class="o">...</span><span class="p">))</span> <span class="o">-&gt;</span> <span class="n">Tensor</span>
+<span class="n">attention_fp8_quant</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">cp_param_bundle</span><span class="o">=</span><span class="n">CpParamBundle</span><span class="p">(</span><span class="n">comm_type</span><span class="o">=</span><span class="s2">"a2a"</span><span class="p">,</span> <span class="o">...</span><span class="p">))</span> <span class="o">-&gt;</span> <span class="n">Tensor</span>
+</pre></div>
+</div>
+<p>Context parallelism splits the sequence dimension across ranks. P2P uses ring send/recv; A2A uses all-to-all with optional SDMA transport. Both work with BF16 and FP8 attention.</p>
+</section>
+<section id="comm-gemm-overlap-pipeline">
+<h4>Comm-GEMM Overlap (Pipeline)<a class="headerlink" href="#comm-gemm-overlap-pipeline" title="Link to this heading">¶</a></h4>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">PipelinedAllgatherGemm</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Double-buffered NCCL all-gather overlapped with chunked GEMM (BF16)."""</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tp_group</span><span class="p">,</span> <span class="n">num_chunks</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">4</span><span class="p">):</span> <span class="o">...</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__call__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="nb">input</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">weight</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span><span class="p">:</span> <span class="o">...</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">PipelinedGemmReduceScatter</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Double-buffered GEMM overlapped with NCCL reduce-scatter (BF16)."""</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tp_group</span><span class="p">,</span> <span class="n">num_chunks</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">4</span><span class="p">):</span> <span class="o">...</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__call__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="nb">input</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">weight</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span><span class="p">:</span> <span class="o">...</span>
+</pre></div>
+</div>
+<p><strong>CLI:</strong> <code class="docutils literal notranslate"><span class="pre">--lumen-tp-comm-overlap-mode</span> <span class="pre">pipeline</span></code></p>
+<p><strong>Limitation:</strong> BF16 only; FP8 pipeline overlap is pending.</p>
+</section>
+</section>
+</section>
+<hr class="docutils" />
+<section id="lora-features">
+<span id="3-lora-features"></span><h2>3. LoRA Features<a class="headerlink" href="#lora-features" title="Link to this heading">¶</a></h2>
+<section id="id3">
+<span id="31-capability-overview"></span><h3>3.1 Capability Overview<a class="headerlink" href="#id3" title="Link to this heading">¶</a></h3>
+<div class="table-wrapper colwidths-auto docutils container">
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Feature</p></th>
+<th class="head"><p>Description</p></th>
+<th class="head"><p>Entry Point</p></th>
+<th class="head"><p>Status</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>LoRA (FSDP path)</p></td>
+<td><p>HuggingFace PEFT LoRA adapters with FSDP/FSDP2 distributed training</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">apply_lora(model,</span> <span class="pre">args)</span></code> when <code class="docutils literal notranslate"><span class="pre">lora_rank</span> <span class="pre">&gt;</span> <span class="pre">0</span></code></p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+<tr class="row-odd"><td><p>LoRA (Megatron path)</p></td>
+<td><p>Megatron-Core LoraAdapter integration for TP-aware LoRA</p></td>
+<td><p>Via Megatron config</p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+<tr class="row-even"><td><p>LoRA + FP8</p></td>
+<td><p>LoRA adapters on top of FP8-quantized base model</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">quant.enable(model)</span></code> then <code class="docutils literal notranslate"><span class="pre">apply_lora(model,</span> <span class="pre">args)</span></code></p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="id4">
+<span id="32-api-reference"></span><h3>3.2 API Reference<a class="headerlink" href="#id4" title="Link to this heading">¶</a></h3>
+<section id="lora-application-fsdp-path">
+<h4>LoRA Application (FSDP Path)<a class="headerlink" href="#lora-application-fsdp-path" title="Link to this heading">¶</a></h4>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">apply_lora</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">,</span> <span class="n">args</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Apply HuggingFace PEFT LoRA adapters when args.lora_rank &gt; 0.</span>
+<span class="sd">    Compatible with both FSDP and FSDP2 wrapping."""</span>
+</pre></div>
+</div>
+<p><strong>CLI:</strong> <code class="docutils literal notranslate"><span class="pre">--lora-rank</span> <span class="pre">N</span></code></p>
+<p><strong>Typical usage with FP8:</strong></p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">atomrl.lumen</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">atomrl.lumen.quantize</span><span class="w"> </span><span class="kn">import</span> <span class="n">QuantConfig</span>
+
+<span class="n">model</span> <span class="o">=</span> <span class="n">build_model</span><span class="p">()</span>
+
+<span class="c1"># Step 1: Enable FP8 on the base model</span>
+<span class="n">atomrl</span><span class="o">.</span><span class="n">lumen</span><span class="o">.</span><span class="n">quant</span><span class="o">.</span><span class="n">enable</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">QuantConfig</span><span class="p">(</span><span class="n">scaling_type</span><span class="o">=</span><span class="s2">"blockwise"</span><span class="p">))</span>
+
+<span class="c1"># Step 2: Apply LoRA adapters (LoRA weights stay in BF16)</span>
+<span class="n">apply_lora</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">args</span><span class="p">)</span>  <span class="c1"># args.lora_rank = 32</span>
+
+<span class="c1"># Step 3: Wrap with FSDP</span>
+<span class="n">model</span> <span class="o">=</span> <span class="n">FSDP</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+</section>
+</section>
+<section id="cross-cutting-features">
+<span id="4-cross-cutting-features"></span><h2>4. Cross-Cutting Features<a class="headerlink" href="#cross-cutting-features" title="Link to this heading">¶</a></h2>
+<p>Features that span multiple domains and are used across quantization, distributed, and LoRA workflows.</p>
+<div class="table-wrapper colwidths-auto docutils container">
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Feature</p></th>
+<th class="head"><p>Module / Function</p></th>
+<th class="head"><p>Description</p></th>
+<th class="head"><p>CLI Flag</p></th>
+<th class="head"><p>Status</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>HIP Graphs</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">LumenGraphedCallable</span></code>, <code class="docutils literal notranslate"><span class="pre">LumenGraphedModule</span></code></p></td>
+<td><p>Graph-capture training steps for reduced kernel launch overhead</p></td>
+<td><p>–</p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+<tr class="row-odd"><td><p>CPU Offload</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CPUOffloadManager</span></code>, <code class="docutils literal notranslate"><span class="pre">get_cpu_offload_context</span></code></p></td>
+<td><p>Async GPU-&gt;CPU-&gt;GPU activation offload via <code class="docutils literal notranslate"><span class="pre">saved_tensors_hooks</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--lumen-cpu-offload</span></code></p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+<tr class="row-even"><td><p>TE Checkpointing</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">lumen_checkpoint</span></code>, <code class="docutils literal notranslate"><span class="pre">_FP8ScalingContext</span></code></p></td>
+<td><p>Save/restore FP8 scaling state across activation checkpoints</p></td>
+<td><p>–</p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+<tr class="row-odd"><td><p>Fused RoPE</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">apply_rotary_pos_emb</span></code>, <code class="docutils literal notranslate"><span class="pre">fused_rope</span></code></p></td>
+<td><p>AITER Triton fused rotary position embeddings (text, vision, video)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--lumen-fused-rope</span></code></p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+<tr class="row-even"><td><p>Fused MLP</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">LumenFusedMLP</span></code>, <code class="docutils literal notranslate"><span class="pre">LumenGatedMLP</span></code></p></td>
+<td><p>Fused gated/ungated MLP via AITER Triton (BF16 GEMM + fused activation)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--lumen-fused-mlp</span></code></p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+<tr class="row-odd"><td><p>Fused MoE Routing</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fused_topk</span></code>, <code class="docutils literal notranslate"><span class="pre">fused_permute</span></code>, <code class="docutils literal notranslate"><span class="pre">fused_unpermute</span></code></p></td>
+<td><p>AITER ASM/HIP fused MoE gating, token sort, scatter-back</p></td>
+<td><p>–</p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+<tr class="row-even"><td><p>Parallel Cross-Entropy</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">lumen_parallel_cross_entropy</span></code></p></td>
+<td><p>Vocab-parallel cross-entropy with Triton kernel + optional SDMA</p></td>
+<td><p>–</p></td>
+<td><p>SUPPORTED</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<section id="id5">
+<span id="41-api-reference"></span><h3>4.1 API Reference<a class="headerlink" href="#id5" title="Link to this heading">¶</a></h3>
+<section id="fused-rope">
+<h4>Fused RoPE<a class="headerlink" href="#fused-rope" title="Link to this heading">¶</a></h4>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">apply_rotary_pos_emb</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">cos</span><span class="p">,</span> <span class="n">sin</span><span class="p">,</span> <span class="n">interleaved</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span>
+    <span class="c1"># x: [B, H, S, D]</span>
+
+<span class="n">fused_rope</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">cos</span><span class="p">,</span> <span class="n">sin</span><span class="p">,</span> <span class="n">interleaved</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">]</span>
+    <span class="c1"># Fused Q+K RoPE in one call</span>
+
+<span class="n">apply_rotary_pos_emb_2d</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">cos_h</span><span class="p">,</span> <span class="n">sin_h</span><span class="p">,</span> <span class="n">cos_w</span><span class="p">,</span> <span class="n">sin_w</span><span class="p">,</span> <span class="n">img_height</span><span class="p">,</span> <span class="n">img_width</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span>
+    <span class="c1"># 2D RoPE for vision models</span>
+
+<span class="n">apply_rotary_pos_emb_3d</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">grid_sizes</span><span class="p">,</span> <span class="n">freqs</span><span class="p">,</span> <span class="n">sp_size</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">sp_rank</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span>
+    <span class="c1"># 3D RoPE for video models</span>
+</pre></div>
+</div>
+<p><strong>Source:</strong> <code class="docutils literal notranslate"><span class="pre">lumen/ops/rope.py</span></code></p>
+</section>
+<section id="fused-mlp">
+<h4>Fused MLP<a class="headerlink" href="#fused-mlp" title="Link to this heading">¶</a></h4>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">fused_gated_mlp</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w_up</span><span class="p">,</span> <span class="n">w_gate</span><span class="p">,</span> <span class="n">w_down</span><span class="p">,</span> <span class="n">activation</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span>
+<span class="n">fused_mlp</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w_up</span><span class="p">,</span> <span class="n">w_down</span><span class="p">,</span> <span class="n">activation</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span>
+</pre></div>
+</div>
+<p><strong>Supported activations:</strong> <code class="docutils literal notranslate"><span class="pre">swiglu</span></code>, <code class="docutils literal notranslate"><span class="pre">geglu</span></code>, <code class="docutils literal notranslate"><span class="pre">reglu</span></code>, <code class="docutils literal notranslate"><span class="pre">gelu</span></code>, <code class="docutils literal notranslate"><span class="pre">relu</span></code>, <code class="docutils literal notranslate"><span class="pre">silu</span></code></p>
+<p><strong>Source:</strong> <code class="docutils literal notranslate"><span class="pre">lumen/ops/mlp/fused_mlp.py</span></code></p>
+</section>
+<section id="fused-moe-routing">
+<h4>Fused MoE Routing<a class="headerlink" href="#fused-moe-routing" title="Link to this heading">¶</a></h4>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">fused_topk</span><span class="p">(</span><span class="n">logits</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">softmax_first</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">]</span>
+    <span class="c1"># Returns (weights: float32, indices: int64) of shape [num_tokens, k]</span>
+
+<span class="n">fused_permute</span><span class="p">(</span><span class="n">tokens</span><span class="p">,</span> <span class="n">indices</span><span class="p">,</span> <span class="n">weights</span><span class="p">,</span> <span class="n">num_experts</span><span class="p">,</span> <span class="n">block_size</span><span class="o">=</span><span class="mi">32</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span>
+    <span class="c1"># Returns (sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf)</span>
+
+<span class="n">fused_unpermute</span><span class="p">(</span><span class="n">expert_output</span><span class="p">,</span> <span class="n">sort_order</span><span class="p">,</span> <span class="n">num_tokens</span><span class="p">,</span> <span class="n">k</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span>
+    <span class="c1"># Scatter expert outputs back to original token order</span>
+</pre></div>
+</div>
+<p><strong>Source:</strong> <code class="docutils literal notranslate"><span class="pre">lumen/ops/moe/fused_routing.py</span></code></p>
+</section>
+<section id="parallel-cross-entropy">
+<h4>Parallel Cross-Entropy<a class="headerlink" href="#parallel-cross-entropy" title="Link to this heading">¶</a></h4>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">lumen_parallel_cross_entropy</span><span class="p">(</span>
+    <span class="n">logits</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>       <span class="c1"># [B, SQ, V]</span>
+    <span class="n">targets</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>      <span class="c1"># [B, SQ]</span>
+    <span class="o">*</span><span class="p">,</span>
+    <span class="n">label_smoothing</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.0</span><span class="p">,</span>
+    <span class="n">use_sdma</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+    <span class="n">dist_group</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">is_cg_capturable</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span>
+</pre></div>
+</div>
+<p><strong>Source:</strong> <code class="docutils literal notranslate"><span class="pre">lumen/ops/cross_entropy.py</span></code></p>
+</section>
+<section id="cpu-offload">
+<h4>CPU Offload<a class="headerlink" href="#cpu-offload" title="Link to this heading">¶</a></h4>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">CPUOffloadManager</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Async GPU-&gt;CPU-&gt;GPU activation offload via torch.autograd.graph.saved_tensors_hooks."""</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">enabled</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">):</span> <span class="o">...</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__enter__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span> <span class="o">...</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__exit__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">):</span> <span class="o">...</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">get_cpu_offload_context</span><span class="p">(</span><span class="n">enabled</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">ContextManager</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Returns a context manager for CPU activation offload."""</span>
+</pre></div>
+</div>
+</section>
+</section>
+</section>
+<hr class="docutils" />
+<section id="cli-flag-quick-reference">
+<span id="5-cli-flag-quick-reference"></span><h2>5. CLI Flag Quick Reference<a class="headerlink" href="#cli-flag-quick-reference" title="Link to this heading">¶</a></h2>
+<p>A flat, searchable table of all Lumen CLI flags.</p>
+<div class="table-wrapper colwidths-auto docutils container">
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>CLI Flag</p></th>
+<th class="head"><p>Feature</p></th>
+<th class="head"><p>Category</p></th>
+<th class="head"><p>Values / Notes</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--linear-fp8</span></code></p></td>
+<td><p>FP8 Linear GEMM (forward + dgrad)</p></td>
+<td><p>Quantization</p></td>
+<td><p>Enable FP8 linear</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--linear-fp4</span></code></p></td>
+<td><p>MXFP4 Linear GEMM (forward + dgrad + wgrad)</p></td>
+<td><p>Quantization</p></td>
+<td><p>Dedicated MXFP4 enable switch; mutually exclusive with <code class="docutils literal notranslate"><span class="pre">--linear-fp8</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--linear-fp8-wgrad</span></code></p></td>
+<td><p>FP8 weight gradient GEMM</p></td>
+<td><p>Quantization</p></td>
+<td><p>MXFP8 only</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--linear-fp8-scaling</span></code></p></td>
+<td><p>FP8 scaling type for linear</p></td>
+<td><p>Quantization</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">delayed|dynamic|per_token|blockwise|blockwise2d|mxfp8</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--lumen-fp8-attn</span></code></p></td>
+<td><p>FP8 attention</p></td>
+<td><p>Quantization</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">none|dpa|mha</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--lumen-fp8-activation-store</span></code></p></td>
+<td><p>FP8 activation storage in MLP backward</p></td>
+<td><p>Quantization</p></td>
+<td><p>Boolean</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--lumen-fp8-param-gather</span></code></p></td>
+<td><p>FP8 parameter storage + lazy re-quant</p></td>
+<td><p>Quantization</p></td>
+<td><p>Boolean</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--lumen-norm</span></code></p></td>
+<td><p>Fused norm (RMSNorm/LayerNorm) via AITER</p></td>
+<td><p>Quantization</p></td>
+<td><p>Boolean</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--lumen-fused-mlp</span></code></p></td>
+<td><p>Fused MLP via AITER Triton</p></td>
+<td><p>Cross-Cutting</p></td>
+<td><p>Boolean</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--lumen-fused-rope</span></code></p></td>
+<td><p>Fused RoPE via AITER Triton</p></td>
+<td><p>Cross-Cutting</p></td>
+<td><p>Boolean</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--lumen-sdma</span></code></p></td>
+<td><p>SDMA for TP communication</p></td>
+<td><p>Distributed</p></td>
+<td><p>Boolean</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--lumen-sdma-cross-entropy</span></code></p></td>
+<td><p>SDMA all-gather in cross-entropy</p></td>
+<td><p>Distributed</p></td>
+<td><p>Boolean</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--lumen-tp-comm-overlap-mode</span></code></p></td>
+<td><p>TP comm-GEMM overlap mode</p></td>
+<td><p>Distributed</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">sdma|pipeline</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--lumen-gradient-accumulation-fusion</span></code></p></td>
+<td><p>Fuse wgrad accumulation</p></td>
+<td><p>Distributed</p></td>
+<td><p>Boolean</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--lumen-delay-wgrad</span></code></p></td>
+<td><p>Defer weight gradient computation</p></td>
+<td><p>Distributed</p></td>
+<td><p>Boolean</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--lumen-cpu-offload</span></code></p></td>
+<td><p>CPU activation offload</p></td>
+<td><p>Cross-Cutting</p></td>
+<td><p>Boolean</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--use-sdma</span></code></p></td>
+<td><p>Enable mori SDMA (alias)</p></td>
+<td><p>Distributed</p></td>
+<td><p>Boolean</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--moe-grouped-gemm</span></code></p></td>
+<td><p>Grouped GEMM for MoE</p></td>
+<td><p>Quantization</p></td>
+<td><p>Boolean</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--lora-rank</span></code></p></td>
+<td><p>LoRA adapter rank</p></td>
+<td><p>LoRA</p></td>
+<td><p>Integer (recommended &gt;= 32 for RL)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--fsdp-version</span></code></p></td>
+<td><p>FSDP version</p></td>
+<td><p>Distributed</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1|2</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--grad-quant-type</span></code></p></td>
+<td><p>Gradient quantization type</p></td>
+<td><p>Quantization</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fp8|mxfp8</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--warmup-steps</span></code></p></td>
+<td><p>BF16 warmup steps before FP8 + scaling reset</p></td>
+<td><p>Quantization</p></td>
+<td><p>Integer</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+</section>
+
+        </article>
+      </div>
+      <footer>
+        
+        <div class="related-pages">
+          <a class="next-page" href="patch_registry.html">
+              <div class="page-info">
+                <div class="context">
+                  <span>Next</span>
+                </div>
+                <div class="title">Megatron Patch Registry</div>
+              </div>
+              <svg class="furo-related-icon"><use href="#svg-arrow-right"></use></svg>
+            </a>
+          <a class="prev-page" href="distributed.html">
+              <svg class="furo-related-icon"><use href="#svg-arrow-right"></use></svg>
+              <div class="page-info">
+                <div class="context">
+                  <span>Previous</span>
+                </div>
+                
+                <div class="title">Distributed Training</div>
+                
+              </div>
+            </a>
+        </div>
+        <div class="bottom-of-page">
+          <div class="left-details">
+            <div class="copyright">
+                Copyright &#169; 2026, AMD
+            </div>
+            Made with <a href="https://www.sphinx-doc.org/">Sphinx</a> and <a class="muted-link" href="https://pradyunsg.me">@pradyunsg</a>'s
+            
+            <a href="https://github.com/pradyunsg/furo">Furo</a>
+            
+          </div>
+          <div class="right-details">
+            <div class="icons">
+              <a class="muted-link " href="https://github.com/ROCm/ATOM/tree/main/atomrl/lumen" aria-label="GitHub"><svg stroke="currentColor" fill="currentColor" stroke-width="0" viewBox="0 0 16 16"><path fill-rule="evenodd" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"></path></svg></a>
+              
+            </div>
+          </div>
+        </div>
+        
+      </footer>
+    </div>
+    <aside class="toc-drawer">
+      
+      
+      <div class="toc-sticky toc-scroll">
+        <div class="toc-title-container">
+          <span class="toc-title">
+            On this page
+          </span>
+        </div>
+        <div class="toc-tree-container">
+          <div class="toc-tree">
+            <ul>
+<li><a class="reference internal" href="#">Lumen Feature Catalog</a><ul>
+<li><a class="reference internal" href="#quantization-features">1. Quantization Features</a><ul>
+<li><a class="reference internal" href="#capability-overview">1.1 Capability Overview</a></li>
+<li><a class="reference internal" href="#api-reference">1.2 API Reference</a><ul>
+<li><a class="reference internal" href="#quant-enable"><code class="docutils literal notranslate"><span class="pre">quant.enable()</span></code></a></li>
+<li><a class="reference internal" href="#quantconfig"><code class="docutils literal notranslate"><span class="pre">QuantConfig</span></code></a></li>
+<li><a class="reference internal" href="#scalingmanager"><code class="docutils literal notranslate"><span class="pre">ScalingManager</span></code></a></li>
+<li><a class="reference internal" href="#fp8-quantization-primitives">FP8 Quantization Primitives</a></li>
+<li><a class="reference internal" href="#fp8-linear">FP8 Linear</a></li>
+<li><a class="reference internal" href="#fused-norm-quantize">Fused Norm + Quantize</a></li>
+<li><a class="reference internal" href="#fp8-attention">FP8 Attention</a></li>
+<li><a class="reference internal" href="#fp8-grouped-gemm-moe">FP8 Grouped GEMM (MoE)</a></li>
+<li><a class="reference internal" href="#fp8-activation-store">FP8 Activation Store</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li><a class="reference internal" href="#distributed-features">2. Distributed Features</a><ul>
+<li><a class="reference internal" href="#id1">2.1 Capability Overview</a></li>
+<li><a class="reference internal" href="#id2">2.2 API Reference</a><ul>
+<li><a class="reference internal" href="#tp-parallel-linear-modules">TP Parallel Linear Modules</a></li>
+<li><a class="reference internal" href="#layernorm-linear-fused">LayerNorm + Linear (Fused)</a></li>
+<li><a class="reference internal" href="#sdma-communication">SDMA Communication</a></li>
+<li><a class="reference internal" href="#fsdp-fsdp2-integration">FSDP / FSDP2 Integration</a></li>
+<li><a class="reference internal" href="#context-parallelism">Context Parallelism</a></li>
+<li><a class="reference internal" href="#comm-gemm-overlap-pipeline">Comm-GEMM Overlap (Pipeline)</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li><a class="reference internal" href="#lora-features">3. LoRA Features</a><ul>
+<li><a class="reference internal" href="#id3">3.1 Capability Overview</a></li>
+<li><a class="reference internal" href="#id4">3.2 API Reference</a><ul>
+<li><a class="reference internal" href="#lora-application-fsdp-path">LoRA Application (FSDP Path)</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li><a class="reference internal" href="#cross-cutting-features">4. Cross-Cutting Features</a><ul>
+<li><a class="reference internal" href="#id5">4.1 API Reference</a><ul>
+<li><a class="reference internal" href="#fused-rope">Fused RoPE</a></li>
+<li><a class="reference internal" href="#fused-mlp">Fused MLP</a></li>
+<li><a class="reference internal" href="#fused-moe-routing">Fused MoE Routing</a></li>
+<li><a class="reference internal" href="#parallel-cross-entropy">Parallel Cross-Entropy</a></li>
+<li><a class="reference internal" href="#cpu-offload">CPU Offload</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li><a class="reference internal" href="#cli-flag-quick-reference">5. CLI Flag Quick Reference</a></li>
+</ul>
+</li>
+</ul>
+
+          </div>
+        </div>
+      </div>
+      
+      
+    </aside>
+  </div>
+</div><script src="../_static/documentation_options.js?v=01f34227"></script>
+    <script src="../_static/doctools.js?v=fd6eb6e6"></script>
+    <script src="../_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <script src="../_static/scripts/furo.js?v=46bd48cc"></script>
+    </body>
+</html>

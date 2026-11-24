@@ -1,0 +1,1538 @@
+<!doctype html>
+<html class="no-js" lang="en" data-content_root="../">
+  <head><meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta name="color-scheme" content="light dark"><meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="index" title="Index" href="../genindex.html"><link rel="search" title="Search" href="../search.html"><link rel="next" title="atomrl.lumen.quantize" href="../api/quantize.html"><link rel="prev" title="Lumen Feature Catalog" href="feature_catalog.html">
+
+    <!-- Generated with Sphinx 9.1.1 and Furo 2025.12.19 -->
+        <title>Megatron Patch Registry - Lumen Documentation</title>
+      <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=d111a655" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/furo.css?v=7bdb33bb" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/furo-extensions.css?v=8dab3a3b" />
+    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=a9f7d8bd" />
+    
+    
+
+
+<style>
+  body {
+    --color-code-background: #f2f2f2;
+  --color-code-foreground: #1e1e1e;
+  --color-brand-primary: #2d3036;
+  --color-brand-content: #c41922;
+  
+  }
+  @media not print {
+    body[data-theme="dark"] {
+      --color-code-background: #202020;
+  --color-code-foreground: #d0d0d0;
+  --color-brand-primary: #e0e0e0;
+  --color-brand-content: #ff4654;
+  
+    }
+    @media (prefers-color-scheme: dark) {
+      body:not([data-theme="light"]) {
+        --color-code-background: #202020;
+  --color-code-foreground: #d0d0d0;
+  --color-brand-primary: #e0e0e0;
+  --color-brand-content: #ff4654;
+  
+      }
+    }
+  }
+</style></head>
+  <body>
+    
+    <script>
+      document.body.dataset.theme = localStorage.getItem("theme") || "auto";
+    </script>
+    
+
+<svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+  <symbol id="svg-toc" viewBox="0 0 24 24">
+    <title>Contents</title>
+    <svg stroke="currentColor" fill="currentColor" stroke-width="0" viewBox="0 0 1024 1024">
+      <path d="M408 442h480c4.4 0 8-3.6 8-8v-56c0-4.4-3.6-8-8-8H408c-4.4 0-8 3.6-8 8v56c0 4.4 3.6 8 8 8zm-8 204c0 4.4 3.6 8 8 8h480c4.4 0 8-3.6 8-8v-56c0-4.4-3.6-8-8-8H408c-4.4 0-8 3.6-8 8v56zm504-486H120c-4.4 0-8 3.6-8 8v56c0 4.4 3.6 8 8 8h784c4.4 0 8-3.6 8-8v-56c0-4.4-3.6-8-8-8zm0 632H120c-4.4 0-8 3.6-8 8v56c0 4.4 3.6 8 8 8h784c4.4 0 8-3.6 8-8v-56c0-4.4-3.6-8-8-8zM115.4 518.9L271.7 642c5.8 4.6 14.4.5 14.4-6.9V388.9c0-7.4-8.5-11.5-14.4-6.9L115.4 505.1a8.74 8.74 0 0 0 0 13.8z"/>
+    </svg>
+  </symbol>
+  <symbol id="svg-menu" viewBox="0 0 24 24">
+    <title>Menu</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather-menu">
+      <line x1="3" y1="12" x2="21" y2="12"></line>
+      <line x1="3" y1="6" x2="21" y2="6"></line>
+      <line x1="3" y1="18" x2="21" y2="18"></line>
+    </svg>
+  </symbol>
+  <symbol id="svg-arrow-right" viewBox="0 0 24 24">
+    <title>Expand</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather-chevron-right">
+      <polyline points="9 18 15 12 9 6"></polyline>
+    </svg>
+  </symbol>
+  <symbol id="svg-sun" viewBox="0 0 24 24">
+    <title>Light mode</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round" class="feather-sun">
+      <circle cx="12" cy="12" r="5"></circle>
+      <line x1="12" y1="1" x2="12" y2="3"></line>
+      <line x1="12" y1="21" x2="12" y2="23"></line>
+      <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line>
+      <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line>
+      <line x1="1" y1="12" x2="3" y2="12"></line>
+      <line x1="21" y1="12" x2="23" y2="12"></line>
+      <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line>
+      <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>
+    </svg>
+  </symbol>
+  <symbol id="svg-moon" viewBox="0 0 24 24">
+    <title>Dark mode</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round" class="icon-tabler-moon">
+      <path stroke="none" d="M0 0h24v24H0z" fill="none" />
+      <path d="M12 3c.132 0 .263 0 .393 0a7.5 7.5 0 0 0 7.92 12.446a9 9 0 1 1 -8.313 -12.454z" />
+    </svg>
+  </symbol>
+  <symbol id="svg-sun-with-moon" viewBox="0 0 24 24">
+    <title>Auto light/dark, in light mode</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round"
+      class="icon-custom-derived-from-feather-sun-and-tabler-moon">
+      <path style="opacity: 50%" d="M 5.411 14.504 C 5.471 14.504 5.532 14.504 5.591 14.504 C 3.639 16.319 4.383 19.569 6.931 20.352 C 7.693 20.586 8.512 20.551 9.25 20.252 C 8.023 23.207 4.056 23.725 2.11 21.184 C 0.166 18.642 1.702 14.949 4.874 14.536 C 5.051 14.512 5.231 14.5 5.411 14.5 L 5.411 14.504 Z"/>
+      <line x1="14.5" y1="3.25" x2="14.5" y2="1.25"/>
+      <line x1="14.5" y1="15.85" x2="14.5" y2="17.85"/>
+      <line x1="10.044" y1="5.094" x2="8.63" y2="3.68"/>
+      <line x1="19" y1="14.05" x2="20.414" y2="15.464"/>
+      <line x1="8.2" y1="9.55" x2="6.2" y2="9.55"/>
+      <line x1="20.8" y1="9.55" x2="22.8" y2="9.55"/>
+      <line x1="10.044" y1="14.006" x2="8.63" y2="15.42"/>
+      <line x1="19" y1="5.05" x2="20.414" y2="3.636"/>
+      <circle cx="14.5" cy="9.55" r="3.6"/>
+    </svg>
+  </symbol>
+  <symbol id="svg-moon-with-sun" viewBox="0 0 24 24">
+    <title>Auto light/dark, in dark mode</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round"
+      class="icon-custom-derived-from-feather-sun-and-tabler-moon">
+      <path d="M 8.282 7.007 C 8.385 7.007 8.494 7.007 8.595 7.007 C 5.18 10.184 6.481 15.869 10.942 17.24 C 12.275 17.648 13.706 17.589 15 17.066 C 12.851 22.236 5.91 23.143 2.505 18.696 C -0.897 14.249 1.791 7.786 7.342 7.063 C 7.652 7.021 7.965 7 8.282 7 L 8.282 7.007 Z"/>
+      <line style="opacity: 50%" x1="18" y1="3.705" x2="18" y2="2.5"/>
+      <line style="opacity: 50%" x1="18" y1="11.295" x2="18" y2="12.5"/>
+      <line style="opacity: 50%" x1="15.316" y1="4.816" x2="14.464" y2="3.964"/>
+      <line style="opacity: 50%" x1="20.711" y1="10.212" x2="21.563" y2="11.063"/>
+      <line style="opacity: 50%" x1="14.205" y1="7.5" x2="13.001" y2="7.5"/>
+      <line style="opacity: 50%" x1="21.795" y1="7.5" x2="23" y2="7.5"/>
+      <line style="opacity: 50%" x1="15.316" y1="10.184" x2="14.464" y2="11.036"/>
+      <line style="opacity: 50%" x1="20.711" y1="4.789" x2="21.563" y2="3.937"/>
+      <circle style="opacity: 50%" cx="18" cy="7.5" r="2.169"/>
+    </svg>
+  </symbol>
+  <symbol id="svg-pencil" viewBox="0 0 24 24">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round" class="icon-tabler-pencil-code">
+      <path d="M4 20h4l10.5 -10.5a2.828 2.828 0 1 0 -4 -4l-10.5 10.5v4" />
+      <path d="M13.5 6.5l4 4" />
+      <path d="M20 21l2 -2l-2 -2" />
+      <path d="M17 17l-2 2l2 2" />
+    </svg>
+  </symbol>
+  <symbol id="svg-eye" viewBox="0 0 24 24">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round" class="icon-tabler-eye-code">
+      <path stroke="none" d="M0 0h24v24H0z" fill="none" />
+      <path d="M10 12a2 2 0 1 0 4 0a2 2 0 0 0 -4 0" />
+      <path
+        d="M11.11 17.958c-3.209 -.307 -5.91 -2.293 -8.11 -5.958c2.4 -4 5.4 -6 9 -6c3.6 0 6.6 2 9 6c-.21 .352 -.427 .688 -.647 1.008" />
+      <path d="M20 21l2 -2l-2 -2" />
+      <path d="M17 17l-2 2l2 2" />
+    </svg>
+  </symbol>
+</svg>
+
+<input type="checkbox" class="sidebar-toggle" name="__navigation" id="__navigation" aria-label="Toggle site navigation sidebar">
+<input type="checkbox" class="sidebar-toggle" name="__toc" id="__toc" aria-label="Toggle table of contents sidebar">
+<label class="overlay sidebar-overlay" for="__navigation"></label>
+<label class="overlay toc-overlay" for="__toc"></label>
+
+<a class="skip-to-content muted-link" href="#furo-main-content">Skip to content</a>
+
+
+
+<div class="page">
+  <header class="mobile-header">
+    <div class="header-left">
+      <label class="nav-overlay-icon" for="__navigation">
+        <span class="icon"><svg><use href="#svg-menu"></use></svg></span>
+      </label>
+    </div>
+    <div class="header-center">
+      <a href="../index.html"><div class="brand">Lumen Documentation</div></a>
+    </div>
+    <div class="header-right">
+      <div class="theme-toggle-container theme-toggle-header">
+        <button class="theme-toggle" aria-label="Toggle Light / Dark / Auto color theme">
+          <svg class="theme-icon-when-auto-light"><use href="#svg-sun-with-moon"></use></svg>
+          <svg class="theme-icon-when-auto-dark"><use href="#svg-moon-with-sun"></use></svg>
+          <svg class="theme-icon-when-dark"><use href="#svg-moon"></use></svg>
+          <svg class="theme-icon-when-light"><use href="#svg-sun"></use></svg>
+        </button>
+      </div>
+      <label class="toc-overlay-icon toc-header-icon" for="__toc">
+        <span class="icon"><svg><use href="#svg-toc"></use></svg></span>
+      </label>
+    </div>
+  </header>
+  <aside class="sidebar-drawer">
+    <div class="sidebar-container">
+      
+      <div class="sidebar-sticky"><a class="sidebar-brand" href="../index.html">
+  
+  <span class="sidebar-brand-text">Lumen Documentation</span>
+  
+</a><form class="sidebar-search-container" method="get" action="../search.html" role="search">
+  <input class="sidebar-search" placeholder="Search" name="q" aria-label="Search">
+  <input type="hidden" name="check_keywords" value="yes">
+  <input type="hidden" name="area" value="default">
+</form>
+<div id="searchbox"></div><div class="sidebar-scroll"><div class="sidebar-tree">
+  <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../quickstart/install.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quickstart/quick_start.html">Quick Start</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../architecture.html">Architecture</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../examples/llama2_sft.html">LLaMA-2 SFT</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/llama31_pretrain.html">LLaMA 3.1 Pre-training</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Advanced Features</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="fp8_training.html">FP8 Quantized Training</a></li>
+<li class="toctree-l1"><a class="reference internal" href="lora.html">LoRA Support</a></li>
+<li class="toctree-l1"><a class="reference internal" href="distributed.html">Distributed Training</a></li>
+<li class="toctree-l1"><a class="reference internal" href="feature_catalog.html">Lumen Feature Catalog</a></li>
+<li class="toctree-l1 current current-page"><a class="current reference internal" href="#">Megatron Patch Registry</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../api/quantize.html">atomrl.lumen.quantize</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/modules.html">atomrl.lumen.modules</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/ops.html">atomrl.lumen.ops</a></li>
+</ul>
+
+</div><a class="sidebar-github-link" href="https://github.com/ROCm/ATOM/tree/main/atomrl/lumen" target="_blank" rel="noopener">
+  <svg stroke="currentColor" fill="currentColor" stroke-width="0" viewBox="0 0 16 16" width="16" height="16" style="vertical-align: text-bottom; margin-right: 6px;">
+    <path fill-rule="evenodd" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"></path>
+  </svg>
+  GitHub
+</a></div>
+      </div>
+      
+    </div>
+  </aside>
+  <div class="main">
+    <div class="content">
+      <div class="article-container">
+        <a href="#" class="back-to-top muted-link">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+            <path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8v12z"></path>
+          </svg>
+          <span>Back to top</span>
+        </a>
+        <div class="content-icon-container">
+          <div class="view-this-page">
+  <a class="muted-link" href="https://github.com/ROCm/ATOM/blob/main/atomrl/lumen/lumen-docs/docs/source/advance/patch_registry.md?plain=true" title="View this page">
+    <svg><use href="#svg-eye"></use></svg>
+    <span class="visually-hidden">View this page</span>
+  </a>
+</div><div class="edit-this-page">
+  <a class="muted-link" href="https://github.com/ROCm/ATOM/edit/main/atomrl/lumen/lumen-docs/docs/source/advance/patch_registry.md" rel="edit" title="Edit this page">
+    <svg><use href="#svg-pencil"></use></svg>
+    <span class="visually-hidden">Edit this page</span>
+  </a>
+</div><div class="theme-toggle-container theme-toggle-content">
+            <button class="theme-toggle" aria-label="Toggle Light / Dark / Auto color theme">
+              <svg class="theme-icon-when-auto-light"><use href="#svg-sun-with-moon"></use></svg>
+              <svg class="theme-icon-when-auto-dark"><use href="#svg-moon-with-sun"></use></svg>
+              <svg class="theme-icon-when-dark"><use href="#svg-moon"></use></svg>
+              <svg class="theme-icon-when-light"><use href="#svg-sun"></use></svg>
+            </button>
+          </div>
+          <label class="toc-overlay-icon toc-content-icon" for="__toc">
+            <span class="icon"><svg><use href="#svg-toc"></use></svg></span>
+          </label>
+        </div>
+        <article role="main" id="furo-main-content">
+          <section id="megatron-patch-registry">
+<h1>Megatron Patch Registry<a class="headerlink" href="#megatron-patch-registry" title="Link to this heading">¶</a></h1>
+<p>Last updated: 09/01/2026.</p>
+<p>Lumen integrates with upstream <strong>Megatron-LM</strong> through a centralized <strong>patch registry</strong>
+(<code class="docutils literal notranslate"><span class="pre">lumen/patches/</span></code>). Each patch is registered with a <strong>phase</strong> (when it runs), <strong>tags</strong>
+(for filtering), and optional <strong>environment gates</strong>.</p>
+<p>Repository docs: <a class="reference external" href="https://github.com/ROCm/ATOM/tree/main/atomrl/lumen/lumen-docs">Lumen documentation</a>
+Source tree: <a class="reference external" href="https://github.com/ROCm/ATOM/tree/main/atomrl/lumen/lumen-docs">lumen-docs on GitHub</a></p>
+<hr class="docutils" />
+<section id="refactoring-framework">
+<h2>Refactoring framework<a class="headerlink" href="#refactoring-framework" title="Link to this heading">¶</a></h2>
+<p>This section describes the design behind the <code class="docutils literal notranslate"><span class="pre">dev_patch</span></code> migration: why the registry
+exists, how patches are classified, and how legacy code was folded in.</p>
+<section id="problem-before">
+<h3>Problem (before)<a class="headerlink" href="#problem-before" title="Link to this heading">¶</a></h3>
+<p>Megatron integration changes were spread across:</p>
+<div class="table-wrapper colwidths-auto docutils container">
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Location</p></th>
+<th class="head"><p>Issue</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">examples/*/scripts/patch_*.py</span></code></p></td>
+<td><p>One-off disk scripts; hard to list, test, or compose</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">lumen/models/megatron.py</span></code></p></td>
+<td><p>Large inline monkey-patches (IMPORT, MODEL_BUILD, LoRA, cross-entropy)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">lumen/models/megatron_patches.py</span></code></p></td>
+<td><p>Monolithic ~1.3k-line import-time patch file</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">lumen/models/dsv4/megatron/spec.py</span></code></p></td>
+<td><p>Eager side-effect patches at import</p></td>
+</tr>
+<tr class="row-even"><td><p>DSV4 entry scripts</p></td>
+<td><p>Redundant <code class="docutils literal notranslate"><span class="pre">install_mmap_checkpoint()</span></code> without full IMPORT bootstrap</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Consequences: duplicate apply sites, unclear ordering, no single catalog, fragile CI/host workflows.</p>
+</section>
+<section id="solution-phase-driven-registry">
+<h3>Solution: phase-driven registry<a class="headerlink" href="#solution-phase-driven-registry" title="Link to this heading">¶</a></h3>
+<p>Each patch is a <strong>single named unit</strong> registered with <code class="docutils literal notranslate"><span class="pre">&#64;register_patch</span></code> and applied only in its phase:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>SOURCE          → modify Megatron-LM checkout on disk (container bootstrap)
+IMPORT          → monkey-patch Megatron modules before model classes load
+ARGS            → register CLI flags on an ArgumentParser
+CONFIG_BUILD    → mutate TransformerConfig after args → config
+MODEL_BUILD     → side effects during spec / model construction
+TRAINING        → setup_model_and_optimizer / evaluate hooks
+</pre></div>
+</div>
+<p><strong>Separation of concerns by directory:</strong></p>
+<div class="table-wrapper colwidths-auto docutils container">
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Directory</p></th>
+<th class="head"><p>Phase(s)</p></th>
+<th class="head"><p>Responsibility</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">lumen/patches/source/</span></code></p></td>
+<td><p>SOURCE</p></td>
+<td><p>On-disk Megatron file edits (DSV4, ROCm, LLaMA, LoRA)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">lumen/patches/runtime/</span></code></p></td>
+<td><p>IMPORT</p></td>
+<td><p>Import-time monkey-patches (<code class="docutils literal notranslate"><span class="pre">megatron_import.py</span></code>, <code class="docutils literal notranslate"><span class="pre">moe_fused_router.py</span></code>)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">lumen/patches/builders/</span></code></p></td>
+<td><p>ARGS, CONFIG_BUILD, MODEL_BUILD</p></td>
+<td><p>Per-workflow builder hooks (<code class="docutils literal notranslate"><span class="pre">dsv4</span></code>, <code class="docutils literal notranslate"><span class="pre">llama</span></code>, generic GPT)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">lumen/patches/training/</span></code></p></td>
+<td><p>TRAINING</p></td>
+<td><p>Training-loop hooks (FP8 gather, HIP graphs, early stop)</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="migration-map-legacy-registry">
+<span id="migration-map-legacy--registry"></span><h3>Migration map (legacy → registry)<a class="headerlink" href="#migration-map-legacy-registry" title="Link to this heading">¶</a></h3>
+<div class="table-wrapper colwidths-auto docutils container">
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Legacy location</p></th>
+<th class="head"><p>Registry destination</p></th>
+<th class="head"><p>Status</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">examples/dsv4/patch_rocm_megatron_dsv4.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">source/dsv4.py</span></code> + <code class="docutils literal notranslate"><span class="pre">source/rocm.py</span></code></p></td>
+<td><p>Deprecated wrapper</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">examples/llama2/scripts/patch_gpt_layer_specs.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">source/llama.py</span></code></p></td>
+<td><p>Deprecated wrapper</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">examples/llama2/scripts/patch_*_lora*.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">source/llama_lora.py</span></code></p></td>
+<td><p>Deprecated wrapper</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">examples/llama2/scripts/patch_mlp_fp8_store.py</span></code>, <code class="docutils literal notranslate"><span class="pre">patch_swiglu_fp8_dtype.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">runtime/megatron_import.py</span></code></p></td>
+<td><p>OBSOLETE headers</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">lumen/models/megatron_patches.py</span></code> (body)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">runtime/megatron_import.py</span></code></p></td>
+<td><p>Shim re-export only</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">megatron.py</span></code> TRAINING hooks</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">training/megatron_hooks.py</span></code></p></td>
+<td><p>Migrated</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">megatron.py</span></code> shared ARGS</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">builders/megatron_args.py</span></code></p></td>
+<td><p>Migrated</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">megatron.py</span></code> GPT MODEL_BUILD</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">builders/megatron_model.py</span></code></p></td>
+<td><p>Migrated</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">megatron.py</span></code> <code class="docutils literal notranslate"><span class="pre">_patch_cross_entropy</span></code></p></td>
+<td><p>IMPORT <code class="docutils literal notranslate"><span class="pre">cross_entropy</span></code> (opt-in)</p></td>
+<td><p>Migrated; alias kept</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">megatron.py</span></code> <code class="docutils literal notranslate"><span class="pre">_patch_lora_for_layernorm_linear</span></code></p></td>
+<td><p>MODEL_BUILD <code class="docutils literal notranslate"><span class="pre">lora_layernorm_linear</span></code></p></td>
+<td><p>Migrated; alias kept</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">megatron.py</span></code> FP8 param storage</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">lumen/models/fp8_param_storage.py</span></code></p></td>
+<td><p>Extracted helper</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">deepseek_v4.py</span></code> inline EAV spec hooks</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">builders/dsv4.py::build_dsv4_transformer_block_spec</span></code></p></td>
+<td><p>Migrated</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">spec.py</span></code> eager bootstrap patch</p></td>
+<td><p>MODEL_BUILD <code class="docutils literal notranslate"><span class="pre">dsv4_megatron_bootstrap</span></code></p></td>
+<td><p>Removed eager call</p></td>
+</tr>
+<tr class="row-odd"><td><p>DSV4 entries <code class="docutils literal notranslate"><span class="pre">install_mmap_checkpoint()</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">install_all()</span></code></p></td>
+<td><p>Unified bootstrap</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>Intentionally out of registry:</strong> <code class="docutils literal notranslate"><span class="pre">LumenConfig</span></code> (<code class="docutils literal notranslate"><span class="pre">lumen/config.py</span></code>),
+mbridge convert (<code class="docutils literal notranslate"><span class="pre">examples/dsv4/tools/lumen_mbridge.py</span></code>).</p>
+</section>
+<section id="apply-patterns-how-patches-get-triggered">
+<h3>Apply patterns (how patches get triggered)<a class="headerlink" href="#apply-patterns-how-patches-get-triggered" title="Link to this heading">¶</a></h3>
+<p>Patches are <strong>not</strong> all applied at import time. Each phase has explicit call sites:</p>
+<div class="table-wrapper colwidths-auto docutils container">
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Pattern</p></th>
+<th class="head"><p>API</p></th>
+<th class="head"><p>When</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Disk bootstrap</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">python3</span> <span class="pre">examples/dsv4/patch_megatron_source.py</span> <span class="pre">&lt;megatron_root&gt;</span></code></p></td>
+<td><p>Host/container before training</p></td>
+</tr>
+<tr class="row-odd"><td><p>IMPORT (default set)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">install_all()</span></code> or <code class="docutils literal notranslate"><span class="pre">import</span> <span class="pre">atomrl.lumen.models.megatron</span></code></p></td>
+<td><p>Before Megatron model/checkpoint load</p></td>
+</tr>
+<tr class="row-even"><td><p>IMPORT (opt-in)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">install_cross_entropy()</span></code> etc.</p></td>
+<td><p>CLI flag or explicit call</p></td>
+</tr>
+<tr class="row-odd"><td><p>ARGS</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">apply_args_patches(parser,</span> <span class="pre">tags={...})</span></code></p></td>
+<td><p>Entry script <code class="docutils literal notranslate"><span class="pre">add_*_args</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>CONFIG_BUILD</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">apply_config_build(config,</span> <span class="pre">args,</span> <span class="pre">tags={...})</span></code></p></td>
+<td><p>After <code class="docutils literal notranslate"><span class="pre">core_transformer_config_from_args</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>MODEL_BUILD</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">apply_model_build(config,</span> <span class="pre">args,</span> <span class="pre">tags={...})</span></code> or <code class="docutils literal notranslate"><span class="pre">names={...}</span></code></p></td>
+<td><p>Spec/builder hooks</p></td>
+</tr>
+<tr class="row-even"><td><p>TRAINING</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">apply_training_patches(names={...})</span></code></p></td>
+<td><p>Entry script before <code class="docutils literal notranslate"><span class="pre">pretrain()</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>SOURCE CLI tag filtering:</strong></p>
+<ul class="simple">
+<li><p>Comma in one <code class="docutils literal notranslate"><span class="pre">--tag</span></code> → <strong>OR</strong> (e.g. <code class="docutils literal notranslate"><span class="pre">--tag</span> <span class="pre">dsv4,rocm</span></code>, <code class="docutils literal notranslate"><span class="pre">--tag</span> <span class="pre">llama,lora</span></code>)</p></li>
+<li><p>Repeat <code class="docutils literal notranslate"><span class="pre">--tag</span></code> → <strong>AND</strong> (e.g. <code class="docutils literal notranslate"><span class="pre">--tag</span> <span class="pre">dsv4</span> <span class="pre">--tag</span> <span class="pre">rocm</span></code>)</p></li>
+<li><p>No <code class="docutils literal notranslate"><span class="pre">--tag</span></code> → all <code class="docutils literal notranslate"><span class="pre">default=True</span></code> SOURCE patches (dsv4 + rocm + llama)</p></li>
+</ul>
+<p><strong>CONFIG_BUILD / MODEL_BUILD tag filtering</strong> uses subset (AND) semantics — a patch matches when <code class="docutils literal notranslate"><span class="pre">filter_tags</span> <span class="pre">⊆</span> <span class="pre">patch.tags</span></code>:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">apply_model_build</span><span class="p">(</span><span class="n">config</span><span class="o">=</span><span class="n">config</span><span class="p">,</span> <span class="n">args</span><span class="o">=</span><span class="n">args</span><span class="p">,</span> <span class="n">tags</span><span class="o">=</span><span class="p">{</span><span class="s2">"dsv4"</span><span class="p">,</span> <span class="s2">"spec"</span><span class="p">})</span>
+<span class="c1"># Runs MODEL_BUILD patches tagged with both dsv4 and spec</span>
+</pre></div>
+</div>
+<p><strong>Explicit <code class="docutils literal notranslate"><span class="pre">names=</span></code></strong> bypasses tag filtering and is used for opt-in MODEL_BUILD patches
+(e.g. LoRA layernorm fix after adapter wrapping).</p>
+<p><strong><code class="docutils literal notranslate"><span class="pre">default_only=True</span></code></strong> (used by <code class="docutils literal notranslate"><span class="pre">install_all()</span></code>): skip patches with <code class="docutils literal notranslate"><span class="pre">default=False</span></code>. SOURCE CLI
+<code class="docutils literal notranslate"><span class="pre">--tag</span> <span class="pre">lora</span></code> explicitly includes opt-in patches when that tag is requested.</p>
+</section>
+<section id="naming-and-metadata-conventions">
+<h3>Naming and metadata conventions<a class="headerlink" href="#naming-and-metadata-conventions" title="Link to this heading">¶</a></h3>
+<ul class="simple">
+<li><p><strong>Patch name:</strong> <code class="docutils literal notranslate"><span class="pre">{workflow}_{concern}</span></code> — e.g. <code class="docutils literal notranslate"><span class="pre">dsv4_megatron_bootstrap</span></code>, <code class="docutils literal notranslate"><span class="pre">lora_layernorm_linear</span></code>.</p></li>
+<li><p><strong>Avoid ambiguous suffixes</strong> — e.g. <code class="docutils literal notranslate"><span class="pre">_no_te</span></code> was renamed to <code class="docutils literal notranslate"><span class="pre">dsv4_megatron_bootstrap</span></code> because it
+describes Megatron core init shims for the DSV4 spec path, not “model without TE”.</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">default=False</span></code></strong> for opt-in patches; document the CLI flag or env gate in <code class="docutils literal notranslate"><span class="pre">description</span></code>.</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">enabled=lambda:</span> <span class="pre">...</span></code></strong> for env-gated patches (both SOURCE and IMPORT).</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">depends_on</span></code></strong> for SOURCE ordering only; cycles raise <code class="docutils literal notranslate"><span class="pre">ValueError</span></code>.</p></li>
+<li><p><strong>Backward-compatible aliases</strong> — keep thin <code class="docutils literal notranslate"><span class="pre">_patch_*</span></code> wrappers in <code class="docutils literal notranslate"><span class="pre">megatron.py</span></code> /
+<code class="docutils literal notranslate"><span class="pre">megatron_model.py</span></code> when tests or external scripts still import them.</p></li>
+</ul>
+</section>
+<section id="torch-less-testing-strategy">
+<h3>Torch-less testing strategy<a class="headerlink" href="#torch-less-testing-strategy" title="Link to this heading">¶</a></h3>
+<ul class="simple">
+<li><p>SOURCE patches and registry logic run without PyTorch (<code class="docutils literal notranslate"><span class="pre">patch_megatron_source.py</span></code> stubs <code class="docutils literal notranslate"><span class="pre">atomrl.lumen</span></code>).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">runtime/__init__.py</span></code> eagerly loads only <code class="docutils literal notranslate"><span class="pre">moe_fused_router</span></code> (no torch); <code class="docutils literal notranslate"><span class="pre">megatron_import.py</span></code>
+loads on <code class="docutils literal notranslate"><span class="pre">install_all()</span></code>.</p></li>
+<li><p>Tests use <code class="docutils literal notranslate"><span class="pre">PatchRegistry.clear()</span></code> + module <code class="docutils literal notranslate"><span class="pre">reload()</span></code> to re-register patches per case
+(<code class="docutils literal notranslate"><span class="pre">tests/patches/</span></code>).</p></li>
+</ul>
+</section>
+<section id="adding-a-new-patch-decision-tree">
+<h3>Adding a new patch (decision tree)<a class="headerlink" href="#adding-a-new-patch-decision-tree" title="Link to this heading">¶</a></h3>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>Need to change Megatron?
+├─ Edit files under Megatron-LM checkout?
+│  └─ SOURCE → lumen/patches/source/&lt;workflow&gt;.py
+├─ Monkey-patch at Python import?
+│  └─ IMPORT → lumen/patches/runtime/megatron_import.py (or new runtime module)
+├─ New CLI flag?
+│  └─ ARGS → lumen/patches/builders/&lt;workflow&gt;.py
+├─ Mutate TransformerConfig?
+│  └─ CONFIG_BUILD → builders
+├─ Change during spec/model construction?
+│  └─ MODEL_BUILD → builders
+└─ Hook training loop / optimizer?
+   └─ TRAINING → lumen/patches/training/
+</pre></div>
+</div>
+<p>Then: register → <code class="docutils literal notranslate"><span class="pre">--list</span></code> or unit test → update this catalog.</p>
+</section>
+<section id="patch-inventory-current">
+<h3>Patch inventory (current)<a class="headerlink" href="#patch-inventory-current" title="Link to this heading">¶</a></h3>
+<div class="table-wrapper colwidths-auto docutils container">
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Phase</p></th>
+<th class="head text-right"><p>Count</p></th>
+<th class="head"><p>Module(s)</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><strong>SOURCE</strong></p></td>
+<td class="text-right"><p>21</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">source/dsv4.py</span></code> (12), <code class="docutils literal notranslate"><span class="pre">source/rocm.py</span></code> (2), <code class="docutils literal notranslate"><span class="pre">source/llama.py</span></code> (3), <code class="docutils literal notranslate"><span class="pre">source/llama_lora.py</span></code> (4)</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>IMPORT</strong></p></td>
+<td class="text-right"><p>16</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">runtime/megatron_import.py</span></code> (15), <code class="docutils literal notranslate"><span class="pre">runtime/moe_fused_router.py</span></code> (1)</p></td>
+</tr>
+<tr class="row-even"><td><p><strong>ARGS</strong></p></td>
+<td class="text-right"><p>3</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">builders/megatron_args.py</span></code>, <code class="docutils literal notranslate"><span class="pre">builders/dsv4.py</span></code>, <code class="docutils literal notranslate"><span class="pre">builders/llama.py</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>CONFIG_BUILD</strong></p></td>
+<td class="text-right"><p>4</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">builders/dsv4.py</span></code>, <code class="docutils literal notranslate"><span class="pre">builders/llama.py</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><strong>MODEL_BUILD</strong></p></td>
+<td class="text-right"><p>8</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">builders/dsv4.py</span></code>, <code class="docutils literal notranslate"><span class="pre">builders/megatron_model.py</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>TRAINING</strong></p></td>
+<td class="text-right"><p>4</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">training/megatron_hooks.py</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><strong>Total</strong></p></td>
+<td class="text-right"><p><strong>56</strong></p></td>
+<td><p></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>IMPORT patches: <strong>14 default-on</strong>, <strong>2 opt-in</strong> (<code class="docutils literal notranslate"><span class="pre">split_along_dim</span></code>, <code class="docutils literal notranslate"><span class="pre">cross_entropy</span></code>).</p>
+</section>
+</section>
+<hr class="docutils" />
+<section id="patch-phases">
+<h2>Patch phases<a class="headerlink" href="#patch-phases" title="Link to this heading">¶</a></h2>
+<div class="table-wrapper colwidths-auto docutils container">
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Phase</p></th>
+<th class="head"><p>When</p></th>
+<th class="head"><p>Typical trigger</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><strong>SOURCE</strong></p></td>
+<td><p>Megatron checkout on disk</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">prepare_rocm_megatron.sh</span></code>, container bootstrap</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>IMPORT</strong></p></td>
+<td><p>Python import, before model classes load</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">import</span> <span class="pre">atomrl.lumen.models.megatron</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><strong>ARGS</strong></p></td>
+<td><p>CLI argument registration</p></td>
+<td><p>DSV4 pretrain entry scripts</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>CONFIG_BUILD</strong></p></td>
+<td><p>After <code class="docutils literal notranslate"><span class="pre">core_transformer_config_from_args</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">dsv4_gpt_builder</span></code>, <code class="docutils literal notranslate"><span class="pre">lumen_gpt_builder</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><strong>MODEL_BUILD</strong></p></td>
+<td><p>During spec / model construction</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">get_dsv4_spec</span></code>, <code class="docutils literal notranslate"><span class="pre">lumen_gpt_builder</span></code>, <code class="docutils literal notranslate"><span class="pre">apply_lora</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>TRAINING</strong></p></td>
+<td><p>Training loop hooks</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">apply_training_patches(names={...})</span></code> in entry scripts</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Tag filtering uses <strong>AND</strong> semantics: <code class="docutils literal notranslate"><span class="pre">tags={&quot;dsv4&quot;,</span> <span class="pre">&quot;builder&quot;}</span></code> matches patches whose tag
+set is a <strong>superset</strong> of both tags.</p>
+</section>
+<hr class="docutils" />
+<section id="discovery-and-apply">
+<h2>Discovery and apply<a class="headerlink" href="#discovery-and-apply" title="Link to this heading">¶</a></h2>
+<section id="list-source-patches-no-pytorch-required">
+<h3>List SOURCE patches (no PyTorch required)<a class="headerlink" href="#list-source-patches-no-pytorch-required" title="Link to this heading">¶</a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># From Lumen repo root</span>
+<span class="nv">PYTHONPATH</span><span class="o">=</span>.<span class="w"> </span>python3<span class="w"> </span>examples/dsv4/patch_megatron_source.py<span class="w"> </span>--list
+<span class="nv">PYTHONPATH</span><span class="o">=</span>.<span class="w"> </span>python3<span class="w"> </span>examples/dsv4/patch_megatron_source.py<span class="w"> </span>--list<span class="w"> </span>--tag<span class="w"> </span>dsv4
+<span class="nv">PYTHONPATH</span><span class="o">=</span>.<span class="w"> </span>python3<span class="w"> </span>examples/dsv4/patch_megatron_source.py<span class="w"> </span>--list<span class="w"> </span>--tag<span class="w"> </span>rocm
+</pre></div>
+</div>
+</section>
+<section id="apply-source-patches">
+<h3>Apply SOURCE patches<a class="headerlink" href="#apply-source-patches" title="Link to this heading">¶</a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">PYTHONPATH</span><span class="o">=</span>.<span class="w"> </span>python3<span class="w"> </span>examples/dsv4/patch_megatron_source.py<span class="w"> </span>/path/to/Megatron-LM
+
+<span class="c1"># Dry-run (no file changes)</span>
+<span class="nv">PYTHONPATH</span><span class="o">=</span>.<span class="w"> </span>python3<span class="w"> </span>examples/dsv4/patch_megatron_source.py<span class="w"> </span>/path/to/Megatron-LM<span class="w"> </span>--tag<span class="w"> </span>llama<span class="w"> </span>--dry-run
+<span class="nv">PYTHONPATH</span><span class="o">=</span>.<span class="w"> </span>python3<span class="w"> </span>examples/dsv4/patch_megatron_source.py<span class="w"> </span>/path/to/Megatron-LM<span class="w"> </span>--tag<span class="w"> </span>llama,lora<span class="w"> </span>--dry-run
+</pre></div>
+</div>
+<p>Inside a training container (prefer <code class="docutils literal notranslate"><span class="pre">patch_megatron_source.py</span></code> — no full Lumen import):</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>examples/dsv4/patch_megatron_source.py<span class="w"> </span>--list<span class="w"> </span>--tag<span class="w"> </span>dsv4
+python3<span class="w"> </span>examples/dsv4/patch_megatron_source.py<span class="w"> </span>/path/to/Megatron-LM
+python3<span class="w"> </span>examples/dsv4/patch_megatron_source.py<span class="w"> </span>/path/to/Megatron-LM<span class="w"> </span>--tag<span class="w"> </span>llama,lora
+</pre></div>
+</div>
+<p>Equivalent module entry (requires full Lumen env):</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>-m<span class="w"> </span>atomrl.lumen.patches<span class="w"> </span>--list<span class="w"> </span>--tag<span class="w"> </span>dsv4
+python3<span class="w"> </span>-m<span class="w"> </span>atomrl.lumen.patches<span class="w"> </span>/path/to/Megatron-LM
+</pre></div>
+</div>
+<p>Patches are <strong>idempotent</strong> — re-applying prints <code class="docutils literal notranslate"><span class="pre">skipped</span></code> for already-patched files.</p>
+</section>
+<section id="runtime-patches-automatic">
+<h3>Runtime patches (automatic)<a class="headerlink" href="#runtime-patches-automatic" title="Link to this heading">¶</a></h3>
+<div class="table-wrapper colwidths-auto docutils container">
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Call site</p></th>
+<th class="head"><p>Phases applied</p></th>
+<th class="head"><p>Tags / names</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">install_all()</span></code> / <code class="docutils literal notranslate"><span class="pre">import</span> <span class="pre">atomrl.lumen.models.megatron</span></code></p></td>
+<td><p>IMPORT (default set)</p></td>
+<td><p>—</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">_override_te_args_for_lumen</span></code> + <code class="docutils literal notranslate"><span class="pre">--lumen-cross-entropy</span></code></p></td>
+<td><p>IMPORT (opt-in)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">install_cross_entropy()</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">dsv4_gpt_builder()</span></code></p></td>
+<td><p>CONFIG_BUILD</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">{dsv4,</span> <span class="pre">builder}</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">get_dsv4_spec()</span></code></p></td>
+<td><p>CONFIG_BUILD + MODEL_BUILD</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">{dsv4,</span> <span class="pre">spec}</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">lumen_gpt_builder()</span></code> / <code class="docutils literal notranslate"><span class="pre">lumen_gpt_builder_with_spec()</span></code></p></td>
+<td><p>CONFIG_BUILD + MODEL_BUILD</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">{lumen,</span> <span class="pre">builder}</span></code> + spec/model tags</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">apply_lora()</span></code></p></td>
+<td><p>MODEL_BUILD</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">names={&quot;lora_layernorm_linear&quot;}</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+</section>
+<hr class="docutils" />
+<section id="source-patches-dsv4-megatron-on-disk">
+<h2>SOURCE patches (DSV4 Megatron on-disk)<a class="headerlink" href="#source-patches-dsv4-megatron-on-disk" title="Link to this heading">¶</a></h2>
+<p>Module: <code class="docutils literal notranslate"><span class="pre">lumen/patches/source/dsv4.py</span></code>
+Applied by: <code class="docutils literal notranslate"><span class="pre">prepare_rocm_megatron.sh</span></code>, <code class="docutils literal notranslate"><span class="pre">setup_dsv4_container_env()</span></code></p>
+<div class="table-wrapper colwidths-auto docutils container">
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Name</p></th>
+<th class="head"><p>Tags</p></th>
+<th class="head"><p>Depends on</p></th>
+<th class="head"><p>Env gate</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">dsv4_transformer_config</span></code></p></td>
+<td><p>dsv4, config, megatron</p></td>
+<td><p>—</p></td>
+<td><p>—</p></td>
+<td><p>Add <code class="docutils literal notranslate"><span class="pre">dsv4</span></code> to <code class="docutils literal notranslate"><span class="pre">experimental_attention_variant</span></code>; add <code class="docutils literal notranslate"><span class="pre">dsv4_*</span></code> TransformerConfig fields</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">moe_sqrtsoftplus</span></code></p></td>
+<td><p>dsv4, moe, megatron</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">dsv4_transformer_config</span></code></p></td>
+<td><p>—</p></td>
+<td><p>Add <code class="docutils literal notranslate"><span class="pre">sqrtsoftplus</span></code> MoE router score function</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">dsv4_training_config</span></code></p></td>
+<td><p>dsv4, config, megatron</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">dsv4_transformer_config</span></code></p></td>
+<td><p>—</p></td>
+<td><p>Finetune flags: clamp shared expert, freeze gate / e-score bias</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">moe_router_freeze</span></code></p></td>
+<td><p>dsv4, moe, megatron</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">dsv4_training_config</span></code></p></td>
+<td><p>—</p></td>
+<td><p>Honor <code class="docutils literal notranslate"><span class="pre">moe_router_freeze_gate</span></code> in TopKRouter</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">dsv4_hash_routing</span></code></p></td>
+<td><p>dsv4, moe, megatron</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">moe_sqrtsoftplus</span></code></p></td>
+<td><p>—</p></td>
+<td><p>Hash routing via <code class="docutils literal notranslate"><span class="pre">tid2eid[input_ids]</span></code> for early MoE layers</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">skip_none_router_expert_bias</span></code></p></td>
+<td><p>dsv4, moe, megatron</p></td>
+<td><p>—</p></td>
+<td><p>—</p></td>
+<td><p>Skip expert-bias grad updates when <code class="docutils literal notranslate"><span class="pre">expert_bias</span> <span class="pre">is</span> <span class="pre">None</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">dist_ckpt_skip_dsv4_norms</span></code></p></td>
+<td><p>dsv4, checkpoint, megatron</p></td>
+<td><p>—</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">LUMEN_DSV4_SKIP_OPTIONAL_NORMS=1</span></code> (default)</p></td>
+<td><p>Skip missing optional q/kv norm and router expert_bias ckpt keys</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">shared_expert_clamp</span></code></p></td>
+<td><p>dsv4, moe, megatron</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">dsv4_training_config</span></code></p></td>
+<td><p>—</p></td>
+<td><p>Honor <code class="docutils literal notranslate"><span class="pre">activation_func_clamp_shared_expert</span></code> on shared experts</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">dsv4_transformer_block</span></code></p></td>
+<td><p>dsv4, hc, megatron</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">dsv4_transformer_config</span></code></p></td>
+<td><p>—</p></td>
+<td><p>mHC expand/collapse hooks in TransformerBlock</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">dsv4_transformer_layer</span></code></p></td>
+<td><p>dsv4, hc, megatron</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">dsv4_transformer_config</span></code></p></td>
+<td><p>—</p></td>
+<td><p>Per-layer HC params; mHC pre/post around attention and MLP</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">dsv4_eav_specs</span></code></p></td>
+<td><p>dsv4, attention, megatron</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">dsv4_transformer_config</span></code></p></td>
+<td><p>—</p></td>
+<td><p>Add <code class="docutils literal notranslate"><span class="pre">dsv4</span></code> branch to experimental attention variant specs</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">tp_layers_condition_init</span></code></p></td>
+<td><p>dsv4, tp, megatron, rocm</p></td>
+<td><p>—</p></td>
+<td><p>—</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">condition_init_method</span></code> shim for Lumen parallel linears</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<section id="source-patches-rocm-platform">
+<h3>SOURCE patches (ROCm platform)<a class="headerlink" href="#source-patches-rocm-platform" title="Link to this heading">¶</a></h3>
+<p>Module: <code class="docutils literal notranslate"><span class="pre">lumen/patches/source/rocm.py</span></code>
+Applied by: same entry points as DSV4 SOURCE patches (default set includes both)</p>
+<div class="table-wrapper colwidths-auto docutils container">
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Name</p></th>
+<th class="head"><p>Tags</p></th>
+<th class="head"><p>Depends on</p></th>
+<th class="head"><p>Env gate</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">disable_batch_p2p_comm</span></code></p></td>
+<td><p>rocm, pipeline, megatron</p></td>
+<td><p>—</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">MEGATRON_NO_BATCH_P2P_COMM=1</span></code></p></td>
+<td><p>Inject env check → <code class="docutils literal notranslate"><span class="pre">batch_p2p_comm=False</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">cpu_offload_torch_gpu_adam</span></code></p></td>
+<td><p>rocm, optimizer, megatron</p></td>
+<td><p>—</p></td>
+<td><p>—</p></td>
+<td><p>Use CPUAdam for GPU hybrid-offload partitions (MI325 gfx950 TE Adam workaround)</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="source-patches-llama-gpt">
+<span id="source-patches-llama--gpt"></span><h3>SOURCE patches (LLaMA / GPT)<a class="headerlink" href="#source-patches-llama-gpt" title="Link to this heading">¶</a></h3>
+<p>Module: <code class="docutils literal notranslate"><span class="pre">lumen/patches/source/llama.py</span></code>
+Applied by: <code class="docutils literal notranslate"><span class="pre">run_pretrain_llama2_7b.sh</span></code>, <code class="docutils literal notranslate"><span class="pre">run_pretrain_llama31_8b.sh</span></code>, <code class="docutils literal notranslate"><span class="pre">run_pretrain.sh</span></code> (Megatron), Qwen3 pretrain (<code class="docutils literal notranslate"><span class="pre">--tag</span> <span class="pre">llama</span></code>)</p>
+<div class="table-wrapper colwidths-auto docutils container">
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Name</p></th>
+<th class="head"><p>Tags</p></th>
+<th class="head"><p>Depends on</p></th>
+<th class="head"><p>Env gate</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">llama_megatron_fused_rmsnorm</span></code></p></td>
+<td><p>llama, norm, megatron</p></td>
+<td><p>—</p></td>
+<td><p>—</p></td>
+<td><p>Add <code class="docutils literal notranslate"><span class="pre">MegatronFusedRMSNorm</span></code> wrapper for apex FusedRMSNorm + sequence parallel</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">llama_gpt_layer_specs_rmsnorm</span></code></p></td>
+<td><p>llama, norm, megatron</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">llama_megatron_fused_rmsnorm</span></code></p></td>
+<td><p>—</p></td>
+<td><p>Select MegatronFusedRMSNorm in <code class="docutils literal notranslate"><span class="pre">gpt_layer_specs</span></code> when normalization is RMSNorm</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">llama_transformer_block_rmsnorm</span></code></p></td>
+<td><p>llama, norm, megatron</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">llama_megatron_fused_rmsnorm</span></code></p></td>
+<td><p>—</p></td>
+<td><p>Use MegatronFusedRMSNorm as <code class="docutils literal notranslate"><span class="pre">LayerNormImpl</span></code> in <code class="docutils literal notranslate"><span class="pre">transformer_block</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># LLaMA pretrain bootstrap (inside container)</span>
+<span class="nv">PYTHONPATH</span><span class="o">=</span>/workspace/ATOM/atomrl<span class="w"> </span>python3<span class="w"> </span>examples/dsv4/patch_megatron_source.py<span class="w"> </span>/path/to/Megatron-LM<span class="w"> </span>--tag<span class="w"> </span>llama
+</pre></div>
+</div>
+<p>Deprecated wrapper: <code class="docutils literal notranslate"><span class="pre">examples/llama2/scripts/patch_gpt_layer_specs.py</span></code> (forwards to registry).</p>
+</section>
+<section id="source-patches-llama-lora-finetune">
+<h3>SOURCE patches (LLaMA LoRA finetune)<a class="headerlink" href="#source-patches-llama-lora-finetune" title="Link to this heading">¶</a></h3>
+<p>Module: <code class="docutils literal notranslate"><span class="pre">lumen/patches/source/llama_lora.py</span></code>
+Applied by: <code class="docutils literal notranslate"><span class="pre">run_lora_finetune_llama2_70b.sh</span></code> (<code class="docutils literal notranslate"><span class="pre">--tag</span> <span class="pre">llama,lora</span></code>, opt-in / <code class="docutils literal notranslate"><span class="pre">default=False</span></code>)</p>
+<div class="table-wrapper colwidths-auto docutils container">
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Name</p></th>
+<th class="head"><p>Tags</p></th>
+<th class="head"><p>Depends on</p></th>
+<th class="head"><p>Env gate</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">lora_requires_grad</span></code></p></td>
+<td><p>lora, finetune, megatron</p></td>
+<td><p>—</p></td>
+<td><p>—</p></td>
+<td><p>Force <code class="docutils literal notranslate"><span class="pre">hidden_states.requires_grad</span></code> before activation checkpointing</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">lora_checkpoint_load</span></code></p></td>
+<td><p>lora, finetune, megatron</p></td>
+<td><p>—</p></td>
+<td><p>—</p></td>
+<td><p>LoRA <code class="docutils literal notranslate"><span class="pre">base_layer</span></code> ckpt remap + <code class="docutils literal notranslate"><span class="pre">mmap=True</span></code> torch.load</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">lora_adapter_scaling</span></code></p></td>
+<td><p>lora, finetune, megatron</p></td>
+<td><p>—</p></td>
+<td><p>—</p></td>
+<td><p>LoRA <code class="docutils literal notranslate"><span class="pre">alpha/rank</span></code> scaling (NeMo / PEFT)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">lora_sft_loss_default</span></code></p></td>
+<td><p>lora, finetune, megatron</p></td>
+<td><p>—</p></td>
+<td><p>—</p></td>
+<td><p>Default <code class="docutils literal notranslate"><span class="pre">--sft=True</span></code> for MLPerf val loss norm</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># MLPerf LoRA finetune bootstrap (RMSNorm + LoRA in one OR command)</span>
+<span class="nv">PYTHONPATH</span><span class="o">=</span>/workspace/ATOM/atomrl<span class="w"> </span>python3<span class="w"> </span>examples/dsv4/patch_megatron_source.py<span class="w"> </span>/path/to/Megatron-LM<span class="w"> </span>--tag<span class="w"> </span>llama,lora
+</pre></div>
+</div>
+</section>
+<section id="config-fields-introduced-source">
+<h3>Config fields introduced (SOURCE)<a class="headerlink" href="#config-fields-introduced-source" title="Link to this heading">¶</a></h3>
+<div class="table-wrapper colwidths-auto docutils container">
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Field</p></th>
+<th class="head"><p>Patch</p></th>
+<th class="head"><p>Purpose</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">dsv4_mode</span></code>, <code class="docutils literal notranslate"><span class="pre">dsv4_hc_mult</span></code>, <code class="docutils literal notranslate"><span class="pre">dsv4_hc_sinkhorn_iters</span></code>, <code class="docutils literal notranslate"><span class="pre">dsv4_hc_eps</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">dsv4_transformer_config</span></code></p></td>
+<td><p>Hyper-Connection (mHC)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">dsv4_compress_ratios</span></code>, <code class="docutils literal notranslate"><span class="pre">dsv4_compress_rope_theta</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">dsv4_transformer_config</span></code></p></td>
+<td><p>Compressor layers</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">dsv4_o_groups</span></code>, <code class="docutils literal notranslate"><span class="pre">dsv4_o_lora_rank</span></code>, <code class="docutils literal notranslate"><span class="pre">dsv4_n_hash_layers</span></code>, <code class="docutils literal notranslate"><span class="pre">dsv4_window_size</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">dsv4_transformer_config</span></code></p></td>
+<td><p>Attention / hash MoE</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">activation_func_clamp_shared_expert</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">dsv4_training_config</span></code></p></td>
+<td><p>Shared expert clamp control</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">freeze_e_score_correction_bias</span></code>, <code class="docutils literal notranslate"><span class="pre">moe_router_freeze_gate</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">dsv4_training_config</span></code></p></td>
+<td><p>Finetune freeze flags</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">moe_router_score_function</span> <span class="pre">+=</span> <span class="pre">'sqrtsoftplus'</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">moe_sqrtsoftplus</span></code></p></td>
+<td><p>DeepSeek V4 default routing</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+</section>
+<hr class="docutils" />
+<section id="import-patches-megatron-runtime-monkey-patches">
+<h2>IMPORT patches (Megatron runtime monkey-patches)<a class="headerlink" href="#import-patches-megatron-runtime-monkey-patches" title="Link to this heading">¶</a></h2>
+<p>Module: <code class="docutils literal notranslate"><span class="pre">lumen/patches/runtime/megatron_import.py</span></code>
+Re-export: <code class="docutils literal notranslate"><span class="pre">lumen/models/megatron_patches.py</span></code>
+Applied by: <code class="docutils literal notranslate"><span class="pre">install_all()</span></code> on <code class="docutils literal notranslate"><span class="pre">import</span> <span class="pre">atomrl.lumen.models.megatron</span></code></p>
+<div class="table-wrapper colwidths-auto docutils container">
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Name</p></th>
+<th class="head"><p>Tags</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Env gate</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">fused_layer_norm</span></code></p></td>
+<td><p>core, norm, megatron</p></td>
+<td><p>yes</p></td>
+<td><p>—</p></td>
+<td><p>Replace <code class="docutils literal notranslate"><span class="pre">FusedLayerNorm</span></code> with Lumen RMSNorm / LayerNorm</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">language_module_checkpoint_guard</span></code></p></td>
+<td><p>core, checkpoint, lora, megatron</p></td>
+<td><p>yes</p></td>
+<td><p>—</p></td>
+<td><p>Guard <code class="docutils literal notranslate"><span class="pre">LanguageModule.sharded_state_dict</span></code> for LoRA <code class="docutils literal notranslate"><span class="pre">output_layer</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">mmap_checkpoint</span></code></p></td>
+<td><p>core, checkpoint, megatron</p></td>
+<td><p>yes</p></td>
+<td><p>—</p></td>
+<td><p>Inject <code class="docutils literal notranslate"><span class="pre">mmap=True</span></code> into Megatron <code class="docutils literal notranslate"><span class="pre">torch.load</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">requires_grad_fix</span></code></p></td>
+<td><p>core, lora, recompute, megatron</p></td>
+<td><p>yes</p></td>
+<td><p>—</p></td>
+<td><p>Fix <code class="docutils literal notranslate"><span class="pre">requires_grad</span></code> for LoRA + activation checkpointing</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">moe_fused_router</span></code></p></td>
+<td><p>core, moe, megatron</p></td>
+<td><p>yes</p></td>
+<td><p>—</p></td>
+<td><p>Lumen fused MoE router top-k and aux-loss ops in <code class="docutils literal notranslate"><span class="pre">moe_utils</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">swiglu_fp8</span></code></p></td>
+<td><p>core, fp8, fusion, megatron</p></td>
+<td><p>yes</p></td>
+<td><p>—</p></td>
+<td><p>ROCm FP8 SwiGLU dtype (<code class="docutils literal notranslate"><span class="pre">e4m3fnuz</span></code>) + chunked backward</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">fused_swiglu_triton</span></code></p></td>
+<td><p>fusion, fp8, megatron</p></td>
+<td><p>yes</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">LUMEN_FUSED_SWIGLU=1</span></code></p></td>
+<td><p>AITER Triton fused SwiGLU</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">mlp_fp8_store</span></code></p></td>
+<td><p>fp8, mlp, megatron</p></td>
+<td><p>yes</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">LUMEN_MLP_FP8_STORE=1</span></code></p></td>
+<td><p>Store MLP SwiGLU intermediates in FP8</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">mlp_recompute</span></code></p></td>
+<td><p>recompute, mlp, megatron</p></td>
+<td><p>yes</p></td>
+<td><p>—</p></td>
+<td><p>MLP-only recompute for non-recomputed layers (<code class="docutils literal notranslate"><span class="pre">LUMEN_MLP_RECOMPUTE=1</span></code> checked at forward time, not import time)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">fused_rope</span></code></p></td>
+<td><p>fusion, rope, megatron</p></td>
+<td><p>yes</p></td>
+<td><p>—</p></td>
+<td><p>Apex fused RoPE in <code class="docutils literal notranslate"><span class="pre">rope_utils</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">eval_recompute</span></code></p></td>
+<td><p>recompute, eval, megatron</p></td>
+<td><p>yes</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">LUMEN_EVAL_RECOMPUTE=1</span></code></p></td>
+<td><p>Keep activation checkpointing during <code class="docutils literal notranslate"><span class="pre">model.eval()</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">post_eval_cache_clear</span></code></p></td>
+<td><p>eval, memory, megatron</p></td>
+<td><p>yes</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">LUMEN_POST_EVAL_CACHE_CLEAR=1</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">empty_cache</span></code> / gc after Megatron <code class="docutils literal notranslate"><span class="pre">evaluate()</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">fused_residual_norm</span></code></p></td>
+<td><p>fusion, norm, megatron</p></td>
+<td><p>yes</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">LUMEN_FUSED_RESIDUAL_NORM=1</span></code></p></td>
+<td><p>Deferred BDA + fused residual + RMSNorm</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">optimizer_patches</span></code></p></td>
+<td><p>optimizer, megatron</p></td>
+<td><p>yes</p></td>
+<td><p>—</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">DistributedOptimizer</span></code> batched <code class="docutils literal notranslate"><span class="pre">_foreach_copy_</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">split_along_dim</span></code></p></td>
+<td><p>te, attention, megatron</p></td>
+<td><p><strong>no</strong></p></td>
+<td><p>—</p></td>
+<td><p>Lumen <code class="docutils literal notranslate"><span class="pre">SplitAlongDim</span></code> shim for TE attention (disabled in <code class="docutils literal notranslate"><span class="pre">install_all</span></code>)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">cross_entropy</span></code></p></td>
+<td><p>core, fusion, lumen, megatron</p></td>
+<td><p><strong>no</strong></p></td>
+<td><p>—</p></td>
+<td><p>Lumen Triton parallel cross-entropy for <code class="docutils literal notranslate"><span class="pre">--lumen-cross-entropy</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<hr class="docutils" />
+<section id="training-patches-megatron-setup-eval-hooks">
+<span id="training-patches-megatron-setup--eval-hooks"></span><h2>TRAINING patches (Megatron setup / eval hooks)<a class="headerlink" href="#training-patches-megatron-setup-eval-hooks" title="Link to this heading">¶</a></h2>
+<p>Module: <code class="docutils literal notranslate"><span class="pre">lumen/patches/training/megatron_hooks.py</span></code>
+Applied by: <code class="docutils literal notranslate"><span class="pre">apply_training_patches(names={...})</span></code> from entry scripts (not at import time)</p>
+<p>Implementation helpers live in <code class="docutils literal notranslate"><span class="pre">lumen/models/fp8_param_storage.py</span></code> (meta materializer,
+checkpoint quant, embedding/output dequant hooks).</p>
+<div class="table-wrapper colwidths-auto docutils container">
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Name</p></th>
+<th class="head"><p>Tags</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Depends on</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">fp8_param_gather_hook</span></code></p></td>
+<td><p>fp8, training, megatron</p></td>
+<td><p>no</p></td>
+<td><p>—</p></td>
+<td><p>Optimizer post-step hook for FP8 param gather / weight quant once</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">fp8_param_storage_hook</span></code></p></td>
+<td><p>fp8, training, megatron</p></td>
+<td><p>no</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fp8_param_gather_hook</span></code></p></td>
+<td><p>Meta init + FP8 placeholders for frozen weights (<code class="docutils literal notranslate"><span class="pre">--fp8-param-storage</span></code>)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">hip_graphs_hook</span></code></p></td>
+<td><p>training, megatron</p></td>
+<td><p>no</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fp8_param_gather_hook</span></code>, <code class="docutils literal notranslate"><span class="pre">fp8_param_storage_hook</span></code></p></td>
+<td><p>Lazy HIP graph capture on transformer layers (<code class="docutils literal notranslate"><span class="pre">--lumen-hip-graphs</span></code>)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">val_loss_early_stop_hook</span></code></p></td>
+<td><p>training, megatron, eval</p></td>
+<td><p>no</p></td>
+<td><p>—</p></td>
+<td><p>Collective early stop when reduced validation loss hits <code class="docutils literal notranslate"><span class="pre">--val-loss-target</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>Entry script usage</strong></p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">atomrl.lumen.patches</span><span class="w"> </span><span class="kn">import</span> <span class="n">apply_training_patches</span>
+
+<span class="c1"># LLaMA 3.1 pretrain</span>
+<span class="n">apply_training_patches</span><span class="p">(</span><span class="n">names</span><span class="o">=</span><span class="p">{</span><span class="s2">"fp8_param_gather_hook"</span><span class="p">})</span>
+
+<span class="c1"># LLaMA 2 LoRA finetune (all hooks; dependency order is automatic)</span>
+<span class="n">apply_training_patches</span><span class="p">(</span>
+    <span class="n">names</span><span class="o">=</span><span class="p">{</span>
+        <span class="s2">"fp8_param_gather_hook"</span><span class="p">,</span>
+        <span class="s2">"fp8_param_storage_hook"</span><span class="p">,</span>
+        <span class="s2">"hip_graphs_hook"</span><span class="p">,</span>
+        <span class="s2">"val_loss_early_stop_hook"</span><span class="p">,</span>
+    <span class="p">}</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">atomrl.lumen.models.megatron</span></code> re-exports the <code class="docutils literal notranslate"><span class="pre">install_*</span></code> helpers for backward compatibility.</p>
+</section>
+<hr class="docutils" />
+<section id="config-build-args-model-build-patches">
+<span id="config_build--args--model_build-patches"></span><h2>CONFIG_BUILD / ARGS / MODEL_BUILD patches<a class="headerlink" href="#config-build-args-model-build-patches" title="Link to this heading">¶</a></h2>
+<section id="shared-megatron-args-lumen-patches-builders-megatron-args-py">
+<span id="shared-megatron-args-lumenpatchesbuildersmegatron_argspy"></span><h3>Shared Megatron ARGS (<code class="docutils literal notranslate"><span class="pre">lumen/patches/builders/megatron_args.py</span></code>)<a class="headerlink" href="#shared-megatron-args-lumen-patches-builders-megatron-args-py" title="Link to this heading">¶</a></h3>
+<div class="table-wrapper colwidths-auto docutils container">
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Name</p></th>
+<th class="head"><p>Phase</p></th>
+<th class="head"><p>Tags</p></th>
+<th class="head"><p>Trigger</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">common_megatron_args</span></code></p></td>
+<td><p>ARGS</p></td>
+<td><p>megatron, lumen</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">apply_args_patches(names={&quot;common_megatron_args&quot;})</span></code></p></td>
+<td><p>Shared CLI: backend, Lumen kernels, LoRA, linear FP8, checkpoint, experiment</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="llama-builder-lumen-patches-builders-llama-py">
+<span id="llama-builder-lumenpatchesbuildersllamapy"></span><h3>LLaMA builder (<code class="docutils literal notranslate"><span class="pre">lumen/patches/builders/llama.py</span></code>)<a class="headerlink" href="#llama-builder-lumen-patches-builders-llama-py" title="Link to this heading">¶</a></h3>
+<div class="table-wrapper colwidths-auto docutils container">
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Name</p></th>
+<th class="head"><p>Phase</p></th>
+<th class="head"><p>Tags</p></th>
+<th class="head"><p>Trigger</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">llama_pretrain_args</span></code></p></td>
+<td><p>ARGS</p></td>
+<td><p>llama, pretrain, megatron</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">add_pretrain_args</span></code></p></td>
+<td><p>mlperf Docker compatibility flags (<code class="docutils literal notranslate"><span class="pre">--size</span></code>, <code class="docutils literal notranslate"><span class="pre">--nodes</span></code>, …)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">lumen_gpt_config</span></code></p></td>
+<td><p>CONFIG_BUILD</p></td>
+<td><p>lumen, builder</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">lumen_gpt_builder</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">persist_layer_norm=False</span></code>, <code class="docutils literal notranslate"><span class="pre">bias_swiglu_fusion=False</span></code>; optional FP8 activation store</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="generic-gpt-model-build-lumen-patches-builders-megatron-model-py">
+<span id="generic-gpt-model_build-lumenpatchesbuildersmegatron_modelpy"></span><h3>Generic GPT MODEL_BUILD (<code class="docutils literal notranslate"><span class="pre">lumen/patches/builders/megatron_model.py</span></code>)<a class="headerlink" href="#generic-gpt-model-build-lumen-patches-builders-megatron-model-py" title="Link to this heading">¶</a></h3>
+<div class="table-wrapper colwidths-auto docutils container">
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Name</p></th>
+<th class="head"><p>Phase</p></th>
+<th class="head"><p>Tags</p></th>
+<th class="head"><p>Trigger</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">core_attention_spec</span></code></p></td>
+<td><p>MODEL_BUILD</p></td>
+<td><p>megatron, lumen, builder, spec</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">lumen_gpt_builder</span></code> (local spec)</p></td>
+<td><p>Inject <code class="docutils literal notranslate"><span class="pre">LumenDotProductAttention</span></code> into layer spec</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">norms_in_spec</span></code></p></td>
+<td><p>MODEL_BUILD</p></td>
+<td><p>megatron, lumen, builder, spec</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">lumen_gpt_builder</span></code> (local spec)</p></td>
+<td><p>Inject Lumen norm factories into layer spec</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">mla_attention_spec</span></code></p></td>
+<td><p>MODEL_BUILD</p></td>
+<td><p>megatron, lumen, builder, spec, mla</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">lumen_gpt_builder_with_spec</span></code></p></td>
+<td><p>Inject <code class="docutils literal notranslate"><span class="pre">LumenDotProductAttentionMLA</span></code> when <code class="docutils literal notranslate"><span class="pre">--multi-latent-attention</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">model_norms</span></code></p></td>
+<td><p>MODEL_BUILD</p></td>
+<td><p>megatron, lumen, builder, model</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">lumen_gpt_builder</span></code></p></td>
+<td><p>Replace built norms when <code class="docutils literal notranslate"><span class="pre">--lumen-rmsnorm</span></code> / <code class="docutils literal notranslate"><span class="pre">--lumen-norm</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">fused_swiglu_mlp</span></code></p></td>
+<td><p>MODEL_BUILD</p></td>
+<td><p>megatron, lumen, builder, model, mlp</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">lumen_gpt_builder_with_spec</span></code></p></td>
+<td><p>AITER fused SwiGLU when <code class="docutils literal notranslate"><span class="pre">--lumen-fused-mlp</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">lora_layernorm_linear</span></code></p></td>
+<td><p>MODEL_BUILD</p></td>
+<td><p>lora, lumen, megatron, model</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">apply_lora</span></code></p></td>
+<td><p>LoRA forward fix for <code class="docutils literal notranslate"><span class="pre">LumenLayerNormLinear</span></code> base layers</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="dsv4-builder-lumen-patches-builders-dsv4-py">
+<span id="dsv4-builder-lumenpatchesbuildersdsv4py"></span><h3>DSV4 builder (<code class="docutils literal notranslate"><span class="pre">lumen/patches/builders/dsv4.py</span></code>)<a class="headerlink" href="#dsv4-builder-lumen-patches-builders-dsv4-py" title="Link to this heading">¶</a></h3>
+<div class="table-wrapper colwidths-auto docutils container">
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Name</p></th>
+<th class="head"><p>Phase</p></th>
+<th class="head"><p>Tags</p></th>
+<th class="head"><p>Trigger</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">dsv4_config_core</span></code></p></td>
+<td><p>CONFIG_BUILD</p></td>
+<td><p>dsv4, builder</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">dsv4_gpt_builder</span></code></p></td>
+<td><p>Set <code class="docutils literal notranslate"><span class="pre">dsv4_mode=True</span></code>, unpadded <code class="docutils literal notranslate"><span class="pre">vocab_size</span></code> for hash routing</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">dsv4_config_pipeline</span></code></p></td>
+<td><p>CONFIG_BUILD</p></td>
+<td><p>dsv4, builder</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">dsv4_gpt_builder</span></code> (PP &gt; 1)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">variable_seq_lengths=True</span></code>, <code class="docutils literal notranslate"><span class="pre">batch_p2p_comm=False</span></code>, mHC P2P shape exchange</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">dsv4_spec_config</span></code></p></td>
+<td><p>CONFIG_BUILD</p></td>
+<td><p>dsv4, spec</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">get_dsv4_spec</span></code></p></td>
+<td><p>Set <code class="docutils literal notranslate"><span class="pre">dsv4_dsa_topk_backend</span></code> from CLI</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">dsv4_pretrain_args</span></code></p></td>
+<td><p>ARGS</p></td>
+<td><p>dsv4</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">add_dsv4_pretrain_args</span></code></p></td>
+<td><p>Register DSV4 CLI flags (YaRN, freeze gate, DSA backend, …)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">dsv4_megatron_bootstrap</span></code></p></td>
+<td><p>MODEL_BUILD</p></td>
+<td><p>dsv4, spec</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">get_dsv4_spec</span></code></p></td>
+<td><p>One-time Megatron core init shims (optimizer, MoE, JIT)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">dsv4_moe_mori</span></code></p></td>
+<td><p>MODEL_BUILD</p></td>
+<td><p>dsv4, spec, moe</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">get_dsv4_spec</span></code></p></td>
+<td><p>MoEMori token dispatcher when <code class="docutils literal notranslate"><span class="pre">LUMEN_DSV4_MOE_MORI=1</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">get_dsv4_spec</span></code> delegates transformer block construction to
+<code class="docutils literal notranslate"><span class="pre">build_dsv4_transformer_block_spec()</span></code> (temporary EAV module hooks for DSV4 attention).</p>
+<p><strong>Entry script usage</strong></p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">atomrl.lumen.patches.builders</span><span class="w"> </span><span class="kn">import</span> <span class="n">apply_args_patches</span>
+
+<span class="c1"># LLaMA 3.1 pretrain (after model-specific default overrides)</span>
+<span class="n">apply_args_patches</span><span class="p">(</span><span class="n">parser</span><span class="p">,</span> <span class="n">names</span><span class="o">=</span><span class="p">{</span><span class="s2">"common_megatron_args"</span><span class="p">,</span> <span class="s2">"llama_pretrain_args"</span><span class="p">})</span>
+
+<span class="c1"># LLaMA 2 finetune</span>
+<span class="n">apply_args_patches</span><span class="p">(</span><span class="n">parser</span><span class="p">,</span> <span class="n">names</span><span class="o">=</span><span class="p">{</span><span class="s2">"common_megatron_args"</span><span class="p">})</span>
+
+<span class="c1"># DSV4 pretrain</span>
+<span class="n">apply_args_patches</span><span class="p">(</span><span class="n">parser</span><span class="p">,</span> <span class="n">tags</span><span class="o">=</span><span class="p">{</span><span class="s2">"dsv4"</span><span class="p">})</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">atomrl.lumen.models.megatron.add_common_megatron_args</span></code> remains a backward-compatible re-export.</p>
+</section>
+</section>
+<hr class="docutils" />
+<section id="per-patch-details-selected">
+<h2>Per-patch details (selected)<a class="headerlink" href="#per-patch-details-selected" title="Link to this heading">¶</a></h2>
+<section id="dsv4-hash-routing-source">
+<span id="dsv4_hash_routing-source"></span><h3><code class="docutils literal notranslate"><span class="pre">dsv4_hash_routing</span></code> (SOURCE)<a class="headerlink" href="#dsv4-hash-routing-source" title="Link to this heading">¶</a></h3>
+<p>Threads <code class="docutils literal notranslate"><span class="pre">input_ids</span></code> from <code class="docutils literal notranslate"><span class="pre">GPTModel</span></code> through <code class="docutils literal notranslate"><span class="pre">TransformerBlock</span></code> → <code class="docutils literal notranslate"><span class="pre">TransformerLayer</span></code> →
+<code class="docutils literal notranslate"><span class="pre">MoELayer</span></code> → <code class="docutils literal notranslate"><span class="pre">TopKRouter</span></code>. For layers <code class="docutils literal notranslate"><span class="pre">1</span> <span class="pre">…</span> <span class="pre">dsv4_n_hash_layers</span></code>, expert selection uses
+<code class="docutils literal notranslate"><span class="pre">tid2eid[input_ids]</span></code> while sqrt-softplus logits remain as combine weights.</p>
+<p><strong>Why:</strong> Converted checkpoints store per-token expert tables for early MoE layers.</p>
+</section>
+<section id="dsv4-config-core-config-build">
+<span id="dsv4_config_core-config_build"></span><h3><code class="docutils literal notranslate"><span class="pre">dsv4_config_core</span></code> (CONFIG_BUILD)<a class="headerlink" href="#dsv4-config-core-config-build" title="Link to this heading">¶</a></h3>
+<p>Sets <code class="docutils literal notranslate"><span class="pre">config.vocab_size</span></code> to the <strong>unpadded</strong> vocab size from CLI. Hash-routed MoE
+allocates <code class="docutils literal notranslate"><span class="pre">tid2eid</span></code> with shape <code class="docutils literal notranslate"><span class="pre">[vocab_size,</span> <span class="pre">topk]</span></code> matching the checkpoint, even though
+GPT embeddings use <code class="docutils literal notranslate"><span class="pre">padded_vocab_size</span></code>.</p>
+</section>
+<section id="mmap-checkpoint-import">
+<span id="mmap_checkpoint-import"></span><h3><code class="docutils literal notranslate"><span class="pre">mmap_checkpoint</span></code> (IMPORT)<a class="headerlink" href="#mmap-checkpoint-import" title="Link to this heading">¶</a></h3>
+<p>Prevents every rank from loading a full checkpoint into CPU RAM during distributed
+checkpoint restore. Critical for large models on ROCm.</p>
+</section>
+<section id="fused-swiglu-triton-import">
+<span id="fused_swiglu_triton-import"></span><h3><code class="docutils literal notranslate"><span class="pre">fused_swiglu_triton</span></code> (IMPORT)<a class="headerlink" href="#fused-swiglu-triton-import" title="Link to this heading">¶</a></h3>
+<p>Replaces Megatron’s decomposed SwiGLU (6–8 elementwise kernels) with AITER Triton
+single-kernel forward/backward. Typical saving: ~400–600 ms/step at LLaMA-70B scale.</p>
+</section>
+</section>
+<hr class="docutils" />
+<section id="hf-checkpoint-conversion-not-in-registry">
+<h2>HF checkpoint conversion (not in registry)<a class="headerlink" href="#hf-checkpoint-conversion-not-in-registry" title="Link to this heading">¶</a></h2>
+<p>HF → Megatron config mapping for <strong>mbridge</strong> convert stays in
+<code class="docutils literal notranslate"><span class="pre">examples/dsv4/tools/lumen_mbridge.py</span></code> via <code class="docutils literal notranslate"><span class="pre">&#64;register_model(&quot;deepseek_v4&quot;)</span></code>. This path
+is separate from the Megatron training patch registry.</p>
+</section>
+<hr class="docutils" />
+<section id="adding-a-new-patch">
+<h2>Adding a new patch<a class="headerlink" href="#adding-a-new-patch" title="Link to this heading">¶</a></h2>
+<ol class="arabic simple">
+<li><p>Choose the phase using the decision tree in <strong>Refactoring framework</strong> above.</p></li>
+<li><p>Implement in the matching module under <code class="docutils literal notranslate"><span class="pre">lumen/patches/</span></code>.</p></li>
+<li><p>Register:</p></li>
+</ol>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">atomrl.lumen.patches.registry</span><span class="w"> </span><span class="kn">import</span> <span class="n">PatchPhase</span><span class="p">,</span> <span class="n">register_patch</span>
+
+<span class="nd">@register_patch</span><span class="p">(</span>
+    <span class="s2">"my_patch"</span><span class="p">,</span>
+    <span class="n">PatchPhase</span><span class="o">.</span><span class="n">IMPORT</span><span class="p">,</span>
+    <span class="n">description</span><span class="o">=</span><span class="s2">"What it does"</span><span class="p">,</span>
+    <span class="n">tags</span><span class="o">=</span><span class="nb">frozenset</span><span class="p">({</span><span class="s2">"dsv4"</span><span class="p">,</span> <span class="s2">"megatron"</span><span class="p">}),</span>
+    <span class="n">enabled</span><span class="o">=</span><span class="k">lambda</span><span class="p">:</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"MY_FLAG"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"1"</span><span class="p">,</span>  <span class="c1"># optional</span>
+    <span class="n">depends_on</span><span class="o">=</span><span class="p">(</span><span class="s2">"other_patch"</span><span class="p">,),</span>  <span class="c1"># SOURCE only</span>
+    <span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+<span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">install_my_patch</span><span class="p">():</span>
+    <span class="o">...</span>
+</pre></div>
+</div>
+<ol class="arabic simple" start="4">
+<li><p>Wire a call site — IMPORT via <code class="docutils literal notranslate"><span class="pre">install_all()</span></code> or explicit installer; builders via
+<code class="docutils literal notranslate"><span class="pre">apply_*_build(tags=...)</span></code>; TRAINING via entry script.</p></li>
+<li><p>Verify with <code class="docutils literal notranslate"><span class="pre">--list</span></code> (SOURCE) or a short training smoke test (runtime patches).</p></li>
+<li><p>Update this catalog.</p></li>
+</ol>
+</section>
+<hr class="docutils" />
+<section id="related-files">
+<h2>Related files<a class="headerlink" href="#related-files" title="Link to this heading">¶</a></h2>
+<div class="table-wrapper colwidths-auto docutils container">
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Path</p></th>
+<th class="head"><p>Role</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">lumen/patches/registry.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&#64;register_patch</span></code>, <code class="docutils literal notranslate"><span class="pre">apply_patches</span></code>, <code class="docutils literal notranslate"><span class="pre">list_patches</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">lumen/patches/source/dsv4.py</span></code></p></td>
+<td><p>DSV4 Megatron on-disk patches</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">lumen/patches/source/rocm.py</span></code></p></td>
+<td><p>ROCm platform on-disk patches</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">lumen/patches/source/llama.py</span></code></p></td>
+<td><p>LLaMA/GPT on-disk patches (fused RMSNorm)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">lumen/patches/source/llama_lora.py</span></code></p></td>
+<td><p>LLaMA LoRA finetune on-disk patches</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">lumen/patches/builders/dsv4.py</span></code></p></td>
+<td><p>DSV4 CONFIG_BUILD / ARGS / MODEL_BUILD</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">lumen/patches/runtime/megatron_import.py</span></code></p></td>
+<td><p>Megatron IMPORT monkey-patches</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">lumen/patches/runtime/moe_fused_router.py</span></code></p></td>
+<td><p>MoE fused router IMPORT patch</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">lumen/models/megatron_patches.py</span></code></p></td>
+<td><p>Backward-compatible re-export shim</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">examples/dsv4/patch_megatron_source.py</span></code></p></td>
+<td><p>Torch-less host entry for SOURCE patches</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">examples/dsv4/patch_rocm_megatron_dsv4.py</span></code></p></td>
+<td><p>Deprecated alias for <code class="docutils literal notranslate"><span class="pre">patch_megatron_source.py</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">examples/dsv4/PATCHES.md</span></code></p></td>
+<td><p>Quick reference (links here for full catalog)</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+</section>
+
+        </article>
+      </div>
+      <footer>
+        
+        <div class="related-pages">
+          <a class="next-page" href="../api/quantize.html">
+              <div class="page-info">
+                <div class="context">
+                  <span>Next</span>
+                </div>
+                <div class="title">atomrl.lumen.quantize</div>
+              </div>
+              <svg class="furo-related-icon"><use href="#svg-arrow-right"></use></svg>
+            </a>
+          <a class="prev-page" href="feature_catalog.html">
+              <svg class="furo-related-icon"><use href="#svg-arrow-right"></use></svg>
+              <div class="page-info">
+                <div class="context">
+                  <span>Previous</span>
+                </div>
+                
+                <div class="title">Lumen Feature Catalog</div>
+                
+              </div>
+            </a>
+        </div>
+        <div class="bottom-of-page">
+          <div class="left-details">
+            <div class="copyright">
+                Copyright &#169; 2026, AMD
+            </div>
+            Made with <a href="https://www.sphinx-doc.org/">Sphinx</a> and <a class="muted-link" href="https://pradyunsg.me">@pradyunsg</a>'s
+            
+            <a href="https://github.com/pradyunsg/furo">Furo</a>
+            
+          </div>
+          <div class="right-details">
+            <div class="icons">
+              <a class="muted-link " href="https://github.com/ROCm/ATOM/tree/main/atomrl/lumen" aria-label="GitHub"><svg stroke="currentColor" fill="currentColor" stroke-width="0" viewBox="0 0 16 16"><path fill-rule="evenodd" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"></path></svg></a>
+              
+            </div>
+          </div>
+        </div>
+        
+      </footer>
+    </div>
+    <aside class="toc-drawer">
+      
+      
+      <div class="toc-sticky toc-scroll">
+        <div class="toc-title-container">
+          <span class="toc-title">
+            On this page
+          </span>
+        </div>
+        <div class="toc-tree-container">
+          <div class="toc-tree">
+            <ul>
+<li><a class="reference internal" href="#">Megatron Patch Registry</a><ul>
+<li><a class="reference internal" href="#refactoring-framework">Refactoring framework</a><ul>
+<li><a class="reference internal" href="#problem-before">Problem (before)</a></li>
+<li><a class="reference internal" href="#solution-phase-driven-registry">Solution: phase-driven registry</a></li>
+<li><a class="reference internal" href="#migration-map-legacy-registry">Migration map (legacy → registry)</a></li>
+<li><a class="reference internal" href="#apply-patterns-how-patches-get-triggered">Apply patterns (how patches get triggered)</a></li>
+<li><a class="reference internal" href="#naming-and-metadata-conventions">Naming and metadata conventions</a></li>
+<li><a class="reference internal" href="#torch-less-testing-strategy">Torch-less testing strategy</a></li>
+<li><a class="reference internal" href="#adding-a-new-patch-decision-tree">Adding a new patch (decision tree)</a></li>
+<li><a class="reference internal" href="#patch-inventory-current">Patch inventory (current)</a></li>
+</ul>
+</li>
+<li><a class="reference internal" href="#patch-phases">Patch phases</a></li>
+<li><a class="reference internal" href="#discovery-and-apply">Discovery and apply</a><ul>
+<li><a class="reference internal" href="#list-source-patches-no-pytorch-required">List SOURCE patches (no PyTorch required)</a></li>
+<li><a class="reference internal" href="#apply-source-patches">Apply SOURCE patches</a></li>
+<li><a class="reference internal" href="#runtime-patches-automatic">Runtime patches (automatic)</a></li>
+</ul>
+</li>
+<li><a class="reference internal" href="#source-patches-dsv4-megatron-on-disk">SOURCE patches (DSV4 Megatron on-disk)</a><ul>
+<li><a class="reference internal" href="#source-patches-rocm-platform">SOURCE patches (ROCm platform)</a></li>
+<li><a class="reference internal" href="#source-patches-llama-gpt">SOURCE patches (LLaMA / GPT)</a></li>
+<li><a class="reference internal" href="#source-patches-llama-lora-finetune">SOURCE patches (LLaMA LoRA finetune)</a></li>
+<li><a class="reference internal" href="#config-fields-introduced-source">Config fields introduced (SOURCE)</a></li>
+</ul>
+</li>
+<li><a class="reference internal" href="#import-patches-megatron-runtime-monkey-patches">IMPORT patches (Megatron runtime monkey-patches)</a></li>
+<li><a class="reference internal" href="#training-patches-megatron-setup-eval-hooks">TRAINING patches (Megatron setup / eval hooks)</a></li>
+<li><a class="reference internal" href="#config-build-args-model-build-patches">CONFIG_BUILD / ARGS / MODEL_BUILD patches</a><ul>
+<li><a class="reference internal" href="#shared-megatron-args-lumen-patches-builders-megatron-args-py">Shared Megatron ARGS (<code class="docutils literal notranslate"><span class="pre">lumen/patches/builders/megatron_args.py</span></code>)</a></li>
+<li><a class="reference internal" href="#llama-builder-lumen-patches-builders-llama-py">LLaMA builder (<code class="docutils literal notranslate"><span class="pre">lumen/patches/builders/llama.py</span></code>)</a></li>
+<li><a class="reference internal" href="#generic-gpt-model-build-lumen-patches-builders-megatron-model-py">Generic GPT MODEL_BUILD (<code class="docutils literal notranslate"><span class="pre">lumen/patches/builders/megatron_model.py</span></code>)</a></li>
+<li><a class="reference internal" href="#dsv4-builder-lumen-patches-builders-dsv4-py">DSV4 builder (<code class="docutils literal notranslate"><span class="pre">lumen/patches/builders/dsv4.py</span></code>)</a></li>
+</ul>
+</li>
+<li><a class="reference internal" href="#per-patch-details-selected">Per-patch details (selected)</a><ul>
+<li><a class="reference internal" href="#dsv4-hash-routing-source"><code class="docutils literal notranslate"><span class="pre">dsv4_hash_routing</span></code> (SOURCE)</a></li>
+<li><a class="reference internal" href="#dsv4-config-core-config-build"><code class="docutils literal notranslate"><span class="pre">dsv4_config_core</span></code> (CONFIG_BUILD)</a></li>
+<li><a class="reference internal" href="#mmap-checkpoint-import"><code class="docutils literal notranslate"><span class="pre">mmap_checkpoint</span></code> (IMPORT)</a></li>
+<li><a class="reference internal" href="#fused-swiglu-triton-import"><code class="docutils literal notranslate"><span class="pre">fused_swiglu_triton</span></code> (IMPORT)</a></li>
+</ul>
+</li>
+<li><a class="reference internal" href="#hf-checkpoint-conversion-not-in-registry">HF checkpoint conversion (not in registry)</a></li>
+<li><a class="reference internal" href="#adding-a-new-patch">Adding a new patch</a></li>
+<li><a class="reference internal" href="#related-files">Related files</a></li>
+</ul>
+</li>
+</ul>
+
+          </div>
+        </div>
+      </div>
+      
+      
+    </aside>
+  </div>
+</div><script src="../_static/documentation_options.js?v=01f34227"></script>
+    <script src="../_static/doctools.js?v=fd6eb6e6"></script>
+    <script src="../_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <script src="../_static/scripts/furo.js?v=46bd48cc"></script>
+    </body>
+</html>

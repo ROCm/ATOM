@@ -1,0 +1,562 @@
+<!doctype html>
+<html class="no-js" lang="en" data-content_root="../">
+  <head><meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta name="color-scheme" content="light dark"><meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="index" title="Index" href="../genindex.html"><link rel="search" title="Search" href="../search.html"><link rel="next" title="Lumen Feature Catalog" href="feature_catalog.html"><link rel="prev" title="LoRA Support" href="lora.html">
+
+    <!-- Generated with Sphinx 9.1.1 and Furo 2025.12.19 -->
+        <title>Distributed Training - Lumen Documentation</title>
+      <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=d111a655" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/furo.css?v=7bdb33bb" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/furo-extensions.css?v=8dab3a3b" />
+    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=a9f7d8bd" />
+    
+    
+
+
+<style>
+  body {
+    --color-code-background: #f2f2f2;
+  --color-code-foreground: #1e1e1e;
+  --color-brand-primary: #2d3036;
+  --color-brand-content: #c41922;
+  
+  }
+  @media not print {
+    body[data-theme="dark"] {
+      --color-code-background: #202020;
+  --color-code-foreground: #d0d0d0;
+  --color-brand-primary: #e0e0e0;
+  --color-brand-content: #ff4654;
+  
+    }
+    @media (prefers-color-scheme: dark) {
+      body:not([data-theme="light"]) {
+        --color-code-background: #202020;
+  --color-code-foreground: #d0d0d0;
+  --color-brand-primary: #e0e0e0;
+  --color-brand-content: #ff4654;
+  
+      }
+    }
+  }
+</style></head>
+  <body>
+    
+    <script>
+      document.body.dataset.theme = localStorage.getItem("theme") || "auto";
+    </script>
+    
+
+<svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+  <symbol id="svg-toc" viewBox="0 0 24 24">
+    <title>Contents</title>
+    <svg stroke="currentColor" fill="currentColor" stroke-width="0" viewBox="0 0 1024 1024">
+      <path d="M408 442h480c4.4 0 8-3.6 8-8v-56c0-4.4-3.6-8-8-8H408c-4.4 0-8 3.6-8 8v56c0 4.4 3.6 8 8 8zm-8 204c0 4.4 3.6 8 8 8h480c4.4 0 8-3.6 8-8v-56c0-4.4-3.6-8-8-8H408c-4.4 0-8 3.6-8 8v56zm504-486H120c-4.4 0-8 3.6-8 8v56c0 4.4 3.6 8 8 8h784c4.4 0 8-3.6 8-8v-56c0-4.4-3.6-8-8-8zm0 632H120c-4.4 0-8 3.6-8 8v56c0 4.4 3.6 8 8 8h784c4.4 0 8-3.6 8-8v-56c0-4.4-3.6-8-8-8zM115.4 518.9L271.7 642c5.8 4.6 14.4.5 14.4-6.9V388.9c0-7.4-8.5-11.5-14.4-6.9L115.4 505.1a8.74 8.74 0 0 0 0 13.8z"/>
+    </svg>
+  </symbol>
+  <symbol id="svg-menu" viewBox="0 0 24 24">
+    <title>Menu</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather-menu">
+      <line x1="3" y1="12" x2="21" y2="12"></line>
+      <line x1="3" y1="6" x2="21" y2="6"></line>
+      <line x1="3" y1="18" x2="21" y2="18"></line>
+    </svg>
+  </symbol>
+  <symbol id="svg-arrow-right" viewBox="0 0 24 24">
+    <title>Expand</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather-chevron-right">
+      <polyline points="9 18 15 12 9 6"></polyline>
+    </svg>
+  </symbol>
+  <symbol id="svg-sun" viewBox="0 0 24 24">
+    <title>Light mode</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round" class="feather-sun">
+      <circle cx="12" cy="12" r="5"></circle>
+      <line x1="12" y1="1" x2="12" y2="3"></line>
+      <line x1="12" y1="21" x2="12" y2="23"></line>
+      <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line>
+      <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line>
+      <line x1="1" y1="12" x2="3" y2="12"></line>
+      <line x1="21" y1="12" x2="23" y2="12"></line>
+      <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line>
+      <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>
+    </svg>
+  </symbol>
+  <symbol id="svg-moon" viewBox="0 0 24 24">
+    <title>Dark mode</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round" class="icon-tabler-moon">
+      <path stroke="none" d="M0 0h24v24H0z" fill="none" />
+      <path d="M12 3c.132 0 .263 0 .393 0a7.5 7.5 0 0 0 7.92 12.446a9 9 0 1 1 -8.313 -12.454z" />
+    </svg>
+  </symbol>
+  <symbol id="svg-sun-with-moon" viewBox="0 0 24 24">
+    <title>Auto light/dark, in light mode</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round"
+      class="icon-custom-derived-from-feather-sun-and-tabler-moon">
+      <path style="opacity: 50%" d="M 5.411 14.504 C 5.471 14.504 5.532 14.504 5.591 14.504 C 3.639 16.319 4.383 19.569 6.931 20.352 C 7.693 20.586 8.512 20.551 9.25 20.252 C 8.023 23.207 4.056 23.725 2.11 21.184 C 0.166 18.642 1.702 14.949 4.874 14.536 C 5.051 14.512 5.231 14.5 5.411 14.5 L 5.411 14.504 Z"/>
+      <line x1="14.5" y1="3.25" x2="14.5" y2="1.25"/>
+      <line x1="14.5" y1="15.85" x2="14.5" y2="17.85"/>
+      <line x1="10.044" y1="5.094" x2="8.63" y2="3.68"/>
+      <line x1="19" y1="14.05" x2="20.414" y2="15.464"/>
+      <line x1="8.2" y1="9.55" x2="6.2" y2="9.55"/>
+      <line x1="20.8" y1="9.55" x2="22.8" y2="9.55"/>
+      <line x1="10.044" y1="14.006" x2="8.63" y2="15.42"/>
+      <line x1="19" y1="5.05" x2="20.414" y2="3.636"/>
+      <circle cx="14.5" cy="9.55" r="3.6"/>
+    </svg>
+  </symbol>
+  <symbol id="svg-moon-with-sun" viewBox="0 0 24 24">
+    <title>Auto light/dark, in dark mode</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round"
+      class="icon-custom-derived-from-feather-sun-and-tabler-moon">
+      <path d="M 8.282 7.007 C 8.385 7.007 8.494 7.007 8.595 7.007 C 5.18 10.184 6.481 15.869 10.942 17.24 C 12.275 17.648 13.706 17.589 15 17.066 C 12.851 22.236 5.91 23.143 2.505 18.696 C -0.897 14.249 1.791 7.786 7.342 7.063 C 7.652 7.021 7.965 7 8.282 7 L 8.282 7.007 Z"/>
+      <line style="opacity: 50%" x1="18" y1="3.705" x2="18" y2="2.5"/>
+      <line style="opacity: 50%" x1="18" y1="11.295" x2="18" y2="12.5"/>
+      <line style="opacity: 50%" x1="15.316" y1="4.816" x2="14.464" y2="3.964"/>
+      <line style="opacity: 50%" x1="20.711" y1="10.212" x2="21.563" y2="11.063"/>
+      <line style="opacity: 50%" x1="14.205" y1="7.5" x2="13.001" y2="7.5"/>
+      <line style="opacity: 50%" x1="21.795" y1="7.5" x2="23" y2="7.5"/>
+      <line style="opacity: 50%" x1="15.316" y1="10.184" x2="14.464" y2="11.036"/>
+      <line style="opacity: 50%" x1="20.711" y1="4.789" x2="21.563" y2="3.937"/>
+      <circle style="opacity: 50%" cx="18" cy="7.5" r="2.169"/>
+    </svg>
+  </symbol>
+  <symbol id="svg-pencil" viewBox="0 0 24 24">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round" class="icon-tabler-pencil-code">
+      <path d="M4 20h4l10.5 -10.5a2.828 2.828 0 1 0 -4 -4l-10.5 10.5v4" />
+      <path d="M13.5 6.5l4 4" />
+      <path d="M20 21l2 -2l-2 -2" />
+      <path d="M17 17l-2 2l2 2" />
+    </svg>
+  </symbol>
+  <symbol id="svg-eye" viewBox="0 0 24 24">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round" class="icon-tabler-eye-code">
+      <path stroke="none" d="M0 0h24v24H0z" fill="none" />
+      <path d="M10 12a2 2 0 1 0 4 0a2 2 0 0 0 -4 0" />
+      <path
+        d="M11.11 17.958c-3.209 -.307 -5.91 -2.293 -8.11 -5.958c2.4 -4 5.4 -6 9 -6c3.6 0 6.6 2 9 6c-.21 .352 -.427 .688 -.647 1.008" />
+      <path d="M20 21l2 -2l-2 -2" />
+      <path d="M17 17l-2 2l2 2" />
+    </svg>
+  </symbol>
+</svg>
+
+<input type="checkbox" class="sidebar-toggle" name="__navigation" id="__navigation" aria-label="Toggle site navigation sidebar">
+<input type="checkbox" class="sidebar-toggle" name="__toc" id="__toc" aria-label="Toggle table of contents sidebar">
+<label class="overlay sidebar-overlay" for="__navigation"></label>
+<label class="overlay toc-overlay" for="__toc"></label>
+
+<a class="skip-to-content muted-link" href="#furo-main-content">Skip to content</a>
+
+
+
+<div class="page">
+  <header class="mobile-header">
+    <div class="header-left">
+      <label class="nav-overlay-icon" for="__navigation">
+        <span class="icon"><svg><use href="#svg-menu"></use></svg></span>
+      </label>
+    </div>
+    <div class="header-center">
+      <a href="../index.html"><div class="brand">Lumen Documentation</div></a>
+    </div>
+    <div class="header-right">
+      <div class="theme-toggle-container theme-toggle-header">
+        <button class="theme-toggle" aria-label="Toggle Light / Dark / Auto color theme">
+          <svg class="theme-icon-when-auto-light"><use href="#svg-sun-with-moon"></use></svg>
+          <svg class="theme-icon-when-auto-dark"><use href="#svg-moon-with-sun"></use></svg>
+          <svg class="theme-icon-when-dark"><use href="#svg-moon"></use></svg>
+          <svg class="theme-icon-when-light"><use href="#svg-sun"></use></svg>
+        </button>
+      </div>
+      <label class="toc-overlay-icon toc-header-icon" for="__toc">
+        <span class="icon"><svg><use href="#svg-toc"></use></svg></span>
+      </label>
+    </div>
+  </header>
+  <aside class="sidebar-drawer">
+    <div class="sidebar-container">
+      
+      <div class="sidebar-sticky"><a class="sidebar-brand" href="../index.html">
+  
+  <span class="sidebar-brand-text">Lumen Documentation</span>
+  
+</a><form class="sidebar-search-container" method="get" action="../search.html" role="search">
+  <input class="sidebar-search" placeholder="Search" name="q" aria-label="Search">
+  <input type="hidden" name="check_keywords" value="yes">
+  <input type="hidden" name="area" value="default">
+</form>
+<div id="searchbox"></div><div class="sidebar-scroll"><div class="sidebar-tree">
+  <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../quickstart/install.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quickstart/quick_start.html">Quick Start</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../architecture.html">Architecture</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../examples/llama2_sft.html">LLaMA-2 SFT</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/llama31_pretrain.html">LLaMA 3.1 Pre-training</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Advanced Features</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="fp8_training.html">FP8 Quantized Training</a></li>
+<li class="toctree-l1"><a class="reference internal" href="lora.html">LoRA Support</a></li>
+<li class="toctree-l1 current current-page"><a class="current reference internal" href="#">Distributed Training</a></li>
+<li class="toctree-l1"><a class="reference internal" href="feature_catalog.html">Lumen Feature Catalog</a></li>
+<li class="toctree-l1"><a class="reference internal" href="patch_registry.html">Megatron Patch Registry</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../api/quantize.html">atomrl.lumen.quantize</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/modules.html">atomrl.lumen.modules</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/ops.html">atomrl.lumen.ops</a></li>
+</ul>
+
+</div><a class="sidebar-github-link" href="https://github.com/ROCm/ATOM/tree/main/atomrl/lumen" target="_blank" rel="noopener">
+  <svg stroke="currentColor" fill="currentColor" stroke-width="0" viewBox="0 0 16 16" width="16" height="16" style="vertical-align: text-bottom; margin-right: 6px;">
+    <path fill-rule="evenodd" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"></path>
+  </svg>
+  GitHub
+</a></div>
+      </div>
+      
+    </div>
+  </aside>
+  <div class="main">
+    <div class="content">
+      <div class="article-container">
+        <a href="#" class="back-to-top muted-link">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+            <path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8v12z"></path>
+          </svg>
+          <span>Back to top</span>
+        </a>
+        <div class="content-icon-container">
+          <div class="view-this-page">
+  <a class="muted-link" href="https://github.com/ROCm/ATOM/blob/main/atomrl/lumen/lumen-docs/docs/source/advance/distributed.md?plain=true" title="View this page">
+    <svg><use href="#svg-eye"></use></svg>
+    <span class="visually-hidden">View this page</span>
+  </a>
+</div><div class="edit-this-page">
+  <a class="muted-link" href="https://github.com/ROCm/ATOM/edit/main/atomrl/lumen/lumen-docs/docs/source/advance/distributed.md" rel="edit" title="Edit this page">
+    <svg><use href="#svg-pencil"></use></svg>
+    <span class="visually-hidden">Edit this page</span>
+  </a>
+</div><div class="theme-toggle-container theme-toggle-content">
+            <button class="theme-toggle" aria-label="Toggle Light / Dark / Auto color theme">
+              <svg class="theme-icon-when-auto-light"><use href="#svg-sun-with-moon"></use></svg>
+              <svg class="theme-icon-when-auto-dark"><use href="#svg-moon-with-sun"></use></svg>
+              <svg class="theme-icon-when-dark"><use href="#svg-moon"></use></svg>
+              <svg class="theme-icon-when-light"><use href="#svg-sun"></use></svg>
+            </button>
+          </div>
+          <label class="toc-overlay-icon toc-content-icon" for="__toc">
+            <span class="icon"><svg><use href="#svg-toc"></use></svg></span>
+          </label>
+        </div>
+        <article role="main" id="furo-main-content">
+          <section id="distributed-training">
+<h1>Distributed Training<a class="headerlink" href="#distributed-training" title="Link to this heading">¶</a></h1>
+<p>Lumen integrates with two distributed training backends: <strong>FSDP</strong> (PyTorch native) and <strong>Megatron-LM</strong> (NVIDIA). The same <code class="docutils literal notranslate"><span class="pre">quant.enable(model)</span></code> call works with both — Lumen detects the active backend and applies the appropriate FP8 parameter lifecycle.</p>
+<section id="backend-comparison">
+<h2>Backend Comparison<a class="headerlink" href="#backend-comparison" title="Link to this heading">¶</a></h2>
+<div class="table-wrapper colwidths-auto docutils container">
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Feature</p></th>
+<th class="head"><p>FSDP / FSDP2</p></th>
+<th class="head"><p>Megatron-LM</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><strong>Ecosystem</strong></p></td>
+<td><p>HuggingFace Transformers + Accelerate</p></td>
+<td><p>NVIDIA NeMo / standalone</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>Parallelism</strong></p></td>
+<td><p>Data parallel + full shard</p></td>
+<td><p>TP + PP + DP + EP</p></td>
+</tr>
+<tr class="row-even"><td><p><strong>Best for</strong></p></td>
+<td><p>Quick prototyping, medium scale, community models</p></td>
+<td><p>Large-scale pre-training, MoE, production</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>Lumen FP8 support</strong></p></td>
+<td><p>Full (weights, activations, all-gather)</p></td>
+<td><p>Full (weights, activations, all-gather)</p></td>
+</tr>
+<tr class="row-even"><td><p><strong>LoRA</strong></p></td>
+<td><p>Supported</p></td>
+<td><p>Supported</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="fsdp-backend">
+<h2>FSDP Backend<a class="headerlink" href="#fsdp-backend" title="Link to this heading">¶</a></h2>
+<section id="how-lumen-integrates">
+<h3>How Lumen Integrates<a class="headerlink" href="#how-lumen-integrates" title="Link to this heading">¶</a></h3>
+<p>With FSDP (<code class="docutils literal notranslate"><span class="pre">FULL_SHARD</span></code>), each GPU holds a shard of the model parameters. During forward/backward, parameters are gathered via all-gather. Lumen optimizes this path:</p>
+<ol class="arabic simple">
+<li><p><strong>FP8 parameter storage</strong> — Shards are stored as FP8, reducing per-GPU memory</p></li>
+<li><p><strong>FP8 all-gather</strong> — Parameters are gathered as uint8, cutting communication volume by ~50%</p></li>
+<li><p><strong>Overlap</strong> — All-gather is overlapped with forward computation; reduce-scatter is overlapped with backward</p></li>
+</ol>
+</section>
+<section id="usage">
+<h3>Usage<a class="headerlink" href="#usage" title="Link to this heading">¶</a></h3>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">torch.distributed.fsdp</span><span class="w"> </span><span class="kn">import</span> <span class="n">FullyShardedDataParallel</span> <span class="k">as</span> <span class="n">FSDP</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">atomrl.lumen.quantize</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">quant</span>
+
+<span class="n">model</span> <span class="o">=</span> <span class="n">build_model</span><span class="p">()</span>
+<span class="n">quant</span><span class="o">.</span><span class="n">enable</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="nb">format</span><span class="o">=</span><span class="s2">"fp8_e4m3"</span><span class="p">,</span> <span class="n">scaling</span><span class="o">=</span><span class="s2">"delayed"</span><span class="p">)</span>
+<span class="n">model</span> <span class="o">=</span> <span class="n">FSDP</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">sharding_strategy</span><span class="o">=</span><span class="n">ShardingStrategy</span><span class="o">.</span><span class="n">FULL_SHARD</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="fsdp2">
+<h3>FSDP2<a class="headerlink" href="#fsdp2" title="Link to this heading">¶</a></h3>
+<p>Lumen also supports PyTorch’s FSDP2 API, which provides finer-grained control over sharding:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">torch.distributed._composable.fsdp</span><span class="w"> </span><span class="kn">import</span> <span class="n">fully_shard</span>
+
+<span class="n">quant</span><span class="o">.</span><span class="n">enable</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="nb">format</span><span class="o">=</span><span class="s2">"fp8_e4m3"</span><span class="p">,</span> <span class="n">scaling</span><span class="o">=</span><span class="s2">"delayed"</span><span class="p">)</span>
+<span class="n">fully_shard</span><span class="p">(</span><span class="n">model</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="megatron-lm-backend">
+<h2>Megatron-LM Backend<a class="headerlink" href="#megatron-lm-backend" title="Link to this heading">¶</a></h2>
+<section id="id1">
+<span id="how-lumen-integrates-1"></span><h3>How Lumen Integrates<a class="headerlink" href="#id1" title="Link to this heading">¶</a></h3>
+<p>Lumen provides a shared Megatron stack (<code class="docutils literal notranslate"><span class="pre">lumen/models/megatron.py</span></code>) that:</p>
+<ol class="arabic simple">
+<li><p><strong>Patches the model spec</strong> — Replaces standard Megatron layers with Lumen’s FP8 equivalents via spec patching (no model code changes)</p></li>
+<li><p><strong>Manages FP8 buffers</strong> — Contiguous FP8 parameter and gradient buffers aligned with Megatron’s distributed optimizer</p></li>
+<li><p><strong>Handles communication</strong> — FP8 all-gather within TP groups, overlap with compute</p></li>
+</ol>
+</section>
+<section id="parallelism-strategies">
+<h3>Parallelism Strategies<a class="headerlink" href="#parallelism-strategies" title="Link to this heading">¶</a></h3>
+<div class="table-wrapper colwidths-auto docutils container">
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Strategy</p></th>
+<th class="head"><p>Flag</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Tensor Parallelism (TP)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--tensor-model-parallel-size</span></code></p></td>
+<td><p>Splits layers across GPUs within a node</p></td>
+</tr>
+<tr class="row-odd"><td><p>Pipeline Parallelism (PP)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--pipeline-model-parallel-size</span></code></p></td>
+<td><p>Splits layers across nodes in stages</p></td>
+</tr>
+<tr class="row-even"><td><p>Data Parallelism (DP)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--data-parallel-size</span></code></p></td>
+<td><p>Replicates model across groups</p></td>
+</tr>
+<tr class="row-odd"><td><p>Expert Parallelism (EP)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--expert-model-parallel-size</span></code></p></td>
+<td><p>Distributes MoE experts via MORI-EP</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="id2">
+<span id="usage-1"></span><h3>Usage<a class="headerlink" href="#id2" title="Link to this heading">¶</a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>train.py<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--tensor-model-parallel-size<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--quant-format<span class="w"> </span>fp8_e4m3<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--scaling<span class="w"> </span>delayed<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--fp8-all-gather
+</pre></div>
+</div>
+</section>
+</section>
+<section id="fp8-communication">
+<h2>FP8 Communication<a class="headerlink" href="#fp8-communication" title="Link to this heading">¶</a></h2>
+<section id="all-gather">
+<h3>All-Gather<a class="headerlink" href="#all-gather" title="Link to this heading">¶</a></h3>
+<p>In standard BF16 training, all-gather communicates 2 bytes per parameter. With FP8:</p>
+<ul class="simple">
+<li><p>Parameters are communicated as <strong>1 byte (uint8)</strong> + a small scale tensor</p></li>
+<li><p>This achieves approximately <strong>48% bandwidth saving</strong></p></li>
+<li><p>Scales are broadcast separately (negligible overhead for large models)</p></li>
+</ul>
+</section>
+<section id="compute-communication-overlap">
+<h3>Compute-Communication Overlap<a class="headerlink" href="#compute-communication-overlap" title="Link to this heading">¶</a></h3>
+<p>Lumen supports overlapping communication with computation:</p>
+<div class="table-wrapper colwidths-auto docutils container">
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Overlap</p></th>
+<th class="head"><p>Phase</p></th>
+<th class="head"><p>Effect</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>AG ↔ Forward</p></td>
+<td><p>All-gather of next layer overlaps with forward of current layer</p></td>
+<td><p>Hides gather latency</p></td>
+</tr>
+<tr class="row-odd"><td><p>RS ↔ Backward</p></td>
+<td><p>Reduce-scatter of current layer’s gradients overlaps with backward of next layer</p></td>
+<td><p>Hides scatter latency</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Enable with:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">quant</span><span class="o">.</span><span class="n">enable</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="nb">format</span><span class="o">=</span><span class="s2">"fp8_e4m3"</span><span class="p">,</span> <span class="n">scaling</span><span class="o">=</span><span class="s2">"delayed"</span><span class="p">)</span>
+<span class="c1"># Overlap is enabled by default when using Lumen's distributed modules</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="hardware-requirements">
+<h2>Hardware Requirements<a class="headerlink" href="#hardware-requirements" title="Link to this heading">¶</a></h2>
+<div class="table-wrapper colwidths-auto docutils container">
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Configuration</p></th>
+<th class="head"><p>Minimum hardware</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Single-GPU experimentation</p></td>
+<td><p>1× MI300X (192 GB HBM3)</p></td>
+</tr>
+<tr class="row-odd"><td><p>7B–13B full fine-tuning</p></td>
+<td><p>1–2× MI300X</p></td>
+</tr>
+<tr class="row-even"><td><p>70B full fine-tuning</p></td>
+<td><p>8× MI300X</p></td>
+</tr>
+<tr class="row-odd"><td><p>70B+ pre-training</p></td>
+<td><p>Multi-node MI300X cluster</p></td>
+</tr>
+<tr class="row-even"><td><p>MoE models</p></td>
+<td><p>Multi-node with high-bandwidth interconnect</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+</section>
+
+        </article>
+      </div>
+      <footer>
+        
+        <div class="related-pages">
+          <a class="next-page" href="feature_catalog.html">
+              <div class="page-info">
+                <div class="context">
+                  <span>Next</span>
+                </div>
+                <div class="title">Lumen Feature Catalog</div>
+              </div>
+              <svg class="furo-related-icon"><use href="#svg-arrow-right"></use></svg>
+            </a>
+          <a class="prev-page" href="lora.html">
+              <svg class="furo-related-icon"><use href="#svg-arrow-right"></use></svg>
+              <div class="page-info">
+                <div class="context">
+                  <span>Previous</span>
+                </div>
+                
+                <div class="title">LoRA Support</div>
+                
+              </div>
+            </a>
+        </div>
+        <div class="bottom-of-page">
+          <div class="left-details">
+            <div class="copyright">
+                Copyright &#169; 2026, AMD
+            </div>
+            Made with <a href="https://www.sphinx-doc.org/">Sphinx</a> and <a class="muted-link" href="https://pradyunsg.me">@pradyunsg</a>'s
+            
+            <a href="https://github.com/pradyunsg/furo">Furo</a>
+            
+          </div>
+          <div class="right-details">
+            <div class="icons">
+              <a class="muted-link " href="https://github.com/ROCm/ATOM/tree/main/atomrl/lumen" aria-label="GitHub"><svg stroke="currentColor" fill="currentColor" stroke-width="0" viewBox="0 0 16 16"><path fill-rule="evenodd" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"></path></svg></a>
+              
+            </div>
+          </div>
+        </div>
+        
+      </footer>
+    </div>
+    <aside class="toc-drawer">
+      
+      
+      <div class="toc-sticky toc-scroll">
+        <div class="toc-title-container">
+          <span class="toc-title">
+            On this page
+          </span>
+        </div>
+        <div class="toc-tree-container">
+          <div class="toc-tree">
+            <ul>
+<li><a class="reference internal" href="#">Distributed Training</a><ul>
+<li><a class="reference internal" href="#backend-comparison">Backend Comparison</a></li>
+<li><a class="reference internal" href="#fsdp-backend">FSDP Backend</a><ul>
+<li><a class="reference internal" href="#how-lumen-integrates">How Lumen Integrates</a></li>
+<li><a class="reference internal" href="#usage">Usage</a></li>
+<li><a class="reference internal" href="#fsdp2">FSDP2</a></li>
+</ul>
+</li>
+<li><a class="reference internal" href="#megatron-lm-backend">Megatron-LM Backend</a><ul>
+<li><a class="reference internal" href="#id1">How Lumen Integrates</a></li>
+<li><a class="reference internal" href="#parallelism-strategies">Parallelism Strategies</a></li>
+<li><a class="reference internal" href="#id2">Usage</a></li>
+</ul>
+</li>
+<li><a class="reference internal" href="#fp8-communication">FP8 Communication</a><ul>
+<li><a class="reference internal" href="#all-gather">All-Gather</a></li>
+<li><a class="reference internal" href="#compute-communication-overlap">Compute-Communication Overlap</a></li>
+</ul>
+</li>
+<li><a class="reference internal" href="#hardware-requirements">Hardware Requirements</a></li>
+</ul>
+</li>
+</ul>
+
+          </div>
+        </div>
+      </div>
+      
+      
+    </aside>
+  </div>
+</div><script src="../_static/documentation_options.js?v=01f34227"></script>
+    <script src="../_static/doctools.js?v=fd6eb6e6"></script>
+    <script src="../_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <script src="../_static/scripts/furo.js?v=46bd48cc"></script>
+    </body>
+</html>
