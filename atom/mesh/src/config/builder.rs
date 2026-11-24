@@ -389,6 +389,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn kv_storage_load_cost(mut self, tokens: u32) -> Self {
+        self.config.kv_storage_load_cost = tokens;
+        self
+    }
+
     pub fn kv_share_weight(mut self, weight: f64) -> Self {
         self.config.kv_share_weight = weight;
         self

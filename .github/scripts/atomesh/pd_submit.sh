@@ -207,6 +207,7 @@ exports = {
     "ROUTER_CACHE_THRESHOLD": router.get("cache_threshold", ""),
     "ROUTER_KV_EVENTS": str(router.get("kv_events", False)).lower(),
     "ROUTER_KV_STORAGE_WEIGHT": router.get("kv_storage_weight", ""),
+    "ROUTER_KV_STORAGE_LOAD_COST": router.get("kv_storage_load_cost", ""),
     "ROUTER_EXTRA_ARGS": router.get("extra_args", ""),
     "PROMETHEUS_PORT": router.get("prometheus_port", 29100),
     "KV_CACHE_DTYPE": server_args.get("kv_cache_dtype", "fp8"),

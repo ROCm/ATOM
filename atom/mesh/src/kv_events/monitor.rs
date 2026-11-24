@@ -73,7 +73,7 @@ pub struct KvEventMonitor {
     /// while its partition has no lane left.
     predictors: DashMap<String, Option<Predictor>>,
     partitions: DashMap<(String, &'static str, u32), Arc<Partition>>,
-    stores: OnceLock<(Arc<StorageSources>, f64)>,
+    stores: OnceLock<(Arc<StorageSources>, f64, u32)>,
     share_weight: OnceLock<f64>,
     /// The subscriptions of ranks in a share group; below two, no rank copies from another.
     shared_ranks: AtomicUsize,
@@ -268,9 +268,10 @@ impl KvEventMonitor {
     }
 
     /// Counts, in what a worker's engine will report cached, what it loads from the store
-    /// it reads among `stores`, and in its match rate `weight` of each of those tokens.
-    pub fn read_stores(&self, stores: Arc<StorageSources>, weight: f64) {
-        let _ = self.stores.set((stores, weight));
+    /// it reads among `stores`, and in its match rate `weight` of each of those tokens; a
+    /// load costs a request no less than `load_cost` tokens of prefill queued ahead of it.
+    pub fn read_stores(&self, stores: Arc<StorageSources>, weight: f64, load_cost: u32) {
+        let _ = self.stores.set((stores, weight, load_cost));
     }
 
     /// Counts, in what a worker's device cache will hold, what its engine copies in from
@@ -423,7 +424,7 @@ impl PrefixMatchProvider for KvEventMonitor {
         device: &[Option<u32>],
     ) -> Vec<Option<u32>> {
         let mut cached = device.to_vec();
-        let Some((stores, _)) = self.stores.get() else {
+        let Some((stores, ..)) = self.stores.get() else {
             return cached;
         };
         // A decode worker takes the prompt's KV from its prefill worker.
@@ -442,7 +443,11 @@ impl PrefixMatchProvider for KvEventMonitor {
     }
 
     fn store_weight(&self) -> f64 {
-        self.stores.get().map_or(0.0, |(_, weight)| *weight)
+        self.stores.get().map_or(0.0, |(_, weight, _)| *weight)
+    }
+
+    fn store_load_cost(&self) -> u32 {
+        self.stores.get().map_or(0, |(.., load_cost)| *load_cost)
     }
 }
 
@@ -1383,7 +1388,7 @@ mod tests {
             stores.add(url, "model", &report);
         }
         let monitor = KvEventMonitor::start().unwrap();
-        monitor.read_stores(Arc::new(stores), 1.0);
+        monitor.read_stores(Arc::new(stores), 1.0, 0);
         let decode = BasicWorkerBuilder::new(urls[0]).worker_type(WorkerType::Decode);
         let workers: Vec<Arc<dyn Worker>> = vec![
             Arc::new(decode.build()),

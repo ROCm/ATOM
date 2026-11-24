@@ -94,6 +94,10 @@ pub struct RouterConfig {
     /// device; 0 asks no store.
     #[serde(default)]
     pub kv_storage_weight: f64,
+    /// The least a load from a store costs a request in `agentic`, in tokens of prefill
+    /// queued ahead of it; 0 costs a load by its size alone.
+    #[serde(default)]
+    pub kv_storage_load_cost: u32,
     /// What a token a worker copies in from its share group counts for in routing, against
     /// one on its device; 0 ignores share groups.
     #[serde(default = "default_kv_share_weight")]
@@ -586,6 +590,7 @@ impl Default for RouterConfig {
             mooncake_admin_port: default_mooncake_admin_port(),
             kv_storage_deadline_ms: default_kv_storage_deadline_ms(),
             kv_storage_weight: 0.0,
+            kv_storage_load_cost: 0,
             kv_share_weight: default_kv_share_weight(),
             api_key: None,
             metrics: None,
