@@ -300,7 +300,11 @@ impl AppContextBuilder {
         });
         if let Some(monitor) = &kv_event_monitor {
             if let Some(storage) = &kv_storage {
-                monitor.read_stores(storage.clone(), router_config.kv_storage_weight);
+                monitor.read_stores(
+                    storage.clone(),
+                    router_config.kv_storage_weight,
+                    router_config.kv_storage_load_cost,
+                );
             }
             monitor.share_pools(router_config.kv_share_weight);
             policy_registry.set_kv_events(monitor.clone());

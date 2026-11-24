@@ -78,4 +78,10 @@ pub(crate) trait PrefixMatchProvider: Send + Sync + Debug {
     fn store_weight(&self) -> f64 {
         0.0
     }
+
+    /// The least a load from that store costs a request, in tokens of prefill queued
+    /// ahead of it, however few it loads: 0 while a load costs by its size alone.
+    fn store_load_cost(&self) -> u32 {
+        0
+    }
 }

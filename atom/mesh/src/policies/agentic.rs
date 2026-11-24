@@ -47,7 +47,8 @@ pub struct Candidate {
     /// Index in the caller's worker list, preserved even after health filtering.
     pub worker_index: usize,
     /// Leading prompt tokens the worker's GPU KV cache is estimated to hold, with
-    /// those its engine will load from a store counted at the store's weight.
+    /// those its engine will load from a store counted at the store's weight; a
+    /// load takes at least the store's load cost off the sum.
     /// `None` means unknown and receives no cache credit; `Some(0)` is a known
     /// miss. Both stay eligible.
     pub cached_tokens: Option<usize>,
@@ -258,11 +259,13 @@ impl LoadBalancingPolicy for AgenticPolicy {
             .map(|(tokens, provider)| provider.match_workers(tokens, workers))
             .filter(|hits| healthy.iter().any(|&idx| hits[idx].is_some()));
         // With a store, `held` is what each worker's engine reports cached once it has
-        // loaded from it. The hits count a load at the store's weight, which ranks the
-        // workers; the one selected is estimated and charged by what it will hold.
+        // loaded from it. The hits count a load at the store's weight and at no less
+        // than its load cost, which ranks the workers; the one selected is estimated and
+        // charged by what it will hold.
         let (index_hits, held) = match (index_hits, matchable.zip(provider)) {
             (Some(device), Some((tokens, provider))) if provider.store_weight() > 0.0 => {
                 let weight = provider.store_weight();
+                let load_cost = provider.store_load_cost();
                 let cached = provider.cached_tokens(tokens, workers, &device).await;
                 // A store that does not answer (its lookup timed out, or its breaker
                 // is open) is taken to hold the longest prefix on a device, which the
@@ -278,7 +281,14 @@ impl LoadBalancingPolicy for AgenticPolicy {
                     .collect();
                 let credited = device.iter().zip(&held).map(|(&device, &held)| {
                     let (device, held) = (device?, held?);
-                    Some(device + (weight * f64::from(held - device)).round() as u32)
+                    let weighed = device + (weight * f64::from(held - device)).round() as u32;
+                    // The engine admits a loaded prefix about as much later whatever its
+                    // size. Priced by its size alone, a load of a turn's few tokens is
+                    // nearly free, and the next turn leaves the worker that holds them
+                    // all for one that held the conversation earlier and has a slightly
+                    // shorter queue.
+                    let loads = held > device;
+                    Some(weighed.min(held.saturating_sub(if loads { load_cost } else { 0 })))
                 });
                 (Some(credited.collect::<Vec<_>>()), Some(held))
             }
@@ -553,9 +563,10 @@ mod tests {
     }
 
     /// Each worker's device hit and what its engine reports cached once it loads from a
-    /// store (None when the store does not answer), and the weight of those loads.
+    /// store (None when the store does not answer), the weight of those loads, and what
+    /// a load costs at least.
     #[derive(Debug)]
-    struct Stored(Vec<(u32, Option<u32>)>, f64);
+    struct Stored(Vec<(u32, Option<u32>)>, f64, u32);
 
     #[async_trait]
     impl PrefixMatchProvider for Stored {
@@ -575,6 +586,10 @@ mod tests {
 
         fn store_weight(&self) -> f64 {
             self.1
+        }
+
+        fn store_load_cost(&self) -> u32 {
+            self.2
         }
     }
 
@@ -599,6 +614,7 @@ mod tests {
             policy.set_kv_events(Arc::new(Stored(
                 vec![(40, Some(40)), (0, b_cached)],
                 weight,
+                0,
             )));
             assert_eq!(
                 decide(&policy, &workers, &info).await,
@@ -606,6 +622,42 @@ mod tests {
                 "weight {weight}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_store_load_costs_no_less_than_the_store_load_cost() {
+        let workers = workers();
+        let tokens: Vec<u32> = (0..100).collect();
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        // b's device holds 98 of the 100 tokens, as it ran the turn before; a's 90, from
+        // an earlier turn, and its store the 8 more. Either is estimated to report 98
+        // and charged the 2 it computes.
+        let stored = |load_cost| Stored(vec![(90, Some(98)), (98, Some(98))], 0.5, load_cost);
+        let stays = (Some(1), "hit", Some(0.98), Some(2));
+        let moves = (Some(0), "relocate", Some(0.98), Some(2));
+        // By its size the load costs 4 tokens: 5 queued on b send the turn to a.
+        let policy = agentic(512, None);
+        policy.set_kv_events(Arc::new(stored(0)));
+        assert_eq!(decide(&policy, &workers, &info).await, stays);
+        workers[1].charge_prefill_tokens(5);
+        assert_eq!(decide(&policy, &workers, &info).await, moves);
+        // At 50 tokens a load, the turn stays until b's queue is over 50 ahead of a's.
+        let policy = agentic(512, None);
+        policy.set_kv_events(Arc::new(stored(50)));
+        workers[1].charge_prefill_tokens(44);
+        assert_eq!(decide(&policy, &workers, &info).await, stays);
+        workers[1].charge_prefill_tokens(2);
+        assert_eq!(decide(&policy, &workers, &info).await, moves);
+        // A load costs no more than computing all the worker would hold.
+        let policy = agentic(512, None);
+        policy.set_kv_events(Arc::new(stored(1000)));
+        workers[1].charge_prefill_tokens(46);
+        assert_eq!(decide(&policy, &workers, &info).await, stays);
+        workers[1].charge_prefill_tokens(2);
+        assert_eq!(decide(&policy, &workers, &info).await, moves);
     }
 
     #[tokio::test]
@@ -619,7 +671,7 @@ mod tests {
         // a's device holds 40 of the 100 tokens, b's none, and the store both read
         // does not answer: a keeps its lead, and is charged the 60 it computes.
         let policy = agentic(512, None);
-        policy.set_kv_events(Arc::new(Stored(vec![(40, None), (0, None)], 0.5)));
+        policy.set_kv_events(Arc::new(Stored(vec![(40, None), (0, None)], 0.5, 0)));
         let hit = (Some(0), "hit", Some(0.4), Some(60));
         assert_eq!(decide(&policy, &workers, &info).await, hit);
         // b, chosen over a's queue, is taken to load those 40 and charged as much.
@@ -629,7 +681,7 @@ mod tests {
         workers[0].release_prefill_tokens(1000);
         // With nothing on a device, the one chosen is charged the whole prompt.
         let policy = agentic(512, None);
-        policy.set_kv_events(Arc::new(Stored(vec![(0, None), (0, None)], 0.5)));
+        policy.set_kv_events(Arc::new(Stored(vec![(0, None), (0, None)], 0.5, 0)));
         let (_, branch, ratio, charge) = decide(&policy, &workers, &info).await;
         assert_eq!((branch, ratio, charge), ("miss", Some(0.0), Some(100)));
     }

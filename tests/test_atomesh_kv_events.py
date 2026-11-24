@@ -439,6 +439,14 @@ class DeepSeekV41ShareCacheCellsTest(unittest.TestCase):
                 self.assertIn("--kv-events", flags)
                 self.assertEqual(float(value["--kv-storage-weight"]), 0.87)
 
+    def test_a_cells_store_load_cost_reaches_the_router(self):
+        cell = next(cell for cell in self.cells if cell["name"] != self.BASELINE)
+        self.assertNotIn("--kv-storage-load-cost", self.submitted_router_args(cell))
+        router = dict(cell["service"]["router"], kv_storage_load_cost=65536)
+        service = dict(cell["service"], router=router)
+        args = self.submitted_router_args(dict(cell, service=service))
+        self.assertEqual(args[args.index("--kv-storage-load-cost") + 1], "65536")
+
 
 if __name__ == "__main__":
     unittest.main()

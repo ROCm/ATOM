@@ -2349,6 +2349,9 @@ start_router() {
     if [[ -n "${ROUTER_KV_STORAGE_WEIGHT:-}" ]]; then
       router_kv_events_args+=(--kv-storage-weight "${ROUTER_KV_STORAGE_WEIGHT}")
     fi
+    if [[ -n "${ROUTER_KV_STORAGE_LOAD_COST:-}" ]]; then
+      router_kv_events_args+=(--kv-storage-load-cost "${ROUTER_KV_STORAGE_LOAD_COST}")
+    fi
   fi
   local -a router_cmd=(
     "${mesh_binary}" launch
