@@ -23,6 +23,7 @@ from atom.model_ops.base_attention import (
     run_pa_decode,
     run_pa_fwd_asm,
 )
+from atom.model_ops.minimax_m3 import tp1_qknorm
 from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
@@ -1551,6 +1552,15 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 dtype=index_q_dtype,
                 device=qkv.device,
             )
+        if tp1_qknorm.serves(self, qkv):
+            # fused_qknorm_idxrqknorm's writes, byte for byte
+            kv = (k_cache, v_cache, fused_k_scale, fused_v_scale)
+            tp1_qknorm.run(
+                self, qkv, q_out, index_q, cos_sin_cache, position, slot_mapping, kv
+            )
+            q = q_out.view(-1, self.num_heads, self.head_dim)
+            self._stash_index_q(index_q, num_tokens, index_q_dtype, qkv.device)
+            return q, k, v, k_cache, v_cache, k_scale, v_scale
         aiter.fused_qknorm_idxrqknorm(
             qkv,
             self.q_norm.weight,
