@@ -1496,7 +1496,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             # Teardown may already have returned the source blocks to the pool.
             # A missing cache entry is safer than a retry against recycled KV.
             self._retire_finished_save(sid, seq)
-            self._save_given_up.add(operation.req_id)
+            self._report_given_up_save(operation.req_id)
             return False
         retries = self._failed_save_retries.get(sid)
         if retries is None or retries[0] is not seq:
@@ -1518,7 +1518,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 previous,
             )
             self._retire_finished_save(sid, seq)
-            self._save_given_up.add(operation.req_id)
+            self._report_given_up_save(operation.req_id)
             return False
         entry[1] = min(int(entry[1]), previous)
         logger.warning(
@@ -1530,6 +1530,16 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             self._max_failed_save_retries,
         )
         return True
+
+    #: Whether a save given up on is queued for `process_completions` to report
+    #: as finished. A frontend that never calls it turns this off, or the queue
+    #: would never drain (see `PluginSchedulerMixin`).
+    _reports_given_up_saves = True
+
+    def _report_given_up_save(self, req_id) -> None:
+        """Queue ``req_id`` for the next `process_completions` to report."""
+        if self._reports_given_up_saves:
+            self._save_given_up.add(req_id)
 
     def _ensure_save_retry_state(self) -> None:
         """Create the failed-save retry bookkeeping, once.
