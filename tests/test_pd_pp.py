@@ -2522,7 +2522,7 @@ def test_mooncake_records_one_ready_event_for_a_prefill_batch(monkeypatch):
     "staging,recorded",
     [
         ({"_staging_slot_bytes": 4}, True),
-        ({"_mla_staging": object()}, True),
+        ({"_kv_staging": object()}, True),
         ({}, False),
     ],
 )
@@ -2540,7 +2540,7 @@ def test_mooncake_records_a_ready_event_for_any_staged_path(
     connector = object.__new__(mc.MooncakeConnector)
     connector.is_producer = True
     connector._index_staging_pool_size = 0
-    connector._mla_staging = None
+    connector._kv_staging = None
     connector._staging_slot_bytes = 0
     connector._cuda_device = 3
     connector._kv_cache_ready_events = {}
