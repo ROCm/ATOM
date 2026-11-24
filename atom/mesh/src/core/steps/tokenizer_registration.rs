@@ -150,6 +150,7 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                                 l0_max_entries: cfg.l0_max_entries,
                                 enable_l1: cfg.enable_l1,
                                 l1_max_memory: cfg.l1_max_memory,
+                                ..CacheConfig::default()
                             };
                             Arc::new(CachedTokenizer::new(base_tokenizer, cache_config))
                         }
@@ -270,10 +271,12 @@ async fn probe_chat_render(
 
 /// Whether `tokenizer` renders chats without its Jinja template, as llm-tokenizer
 /// does with the encoders it has built in for the architectures in `config.json`
-/// (DeepSeek V3.2 and V4 in 1.4.2). Such a render ignores `--chat-template`, and
-/// its defaults are not ATOM's: DeepSeek renders chat mode unless `thinking` is
-/// true, where ATOM's encoder renders thinking mode. Replaces the template, so
-/// probe a copy.
+/// (in 2.0.0 DeepSeek V3.2 and V4.1, and V4 without a template of its own).
+/// Such a render ignores `--chat-template`, and its defaults are not ATOM's:
+/// DeepSeek V3.2 and V4 render chat mode unless `thinking` is true, where
+/// ATOM's encoder renders thinking mode, and V4.1's port takes `thinking: true`
+/// over `reasoning_effort: "none"`, where ATOM's renders chat mode. Replaces the
+/// template, so probe a copy.
 fn renders_without_template(tokenizer: &mut dyn Tokenizer) -> bool {
     const PROBE: &str = "probe";
     tokenizer.set_chat_template(PROBE.to_string()).is_ok()
@@ -363,13 +366,17 @@ mod tests {
         dir
     }
 
-    /// llm-tokenizer picks its DeepSeek V3.2 and V4 encoders from `config.json`,
-    /// and they ignore the template.
+    /// llm-tokenizer picks its DeepSeek V3.2, V4 and V4.1 encoders from
+    /// `config.json`, and they ignore the template.
     #[test]
     fn test_deepseek_renders_without_template() {
         let mut jinja = HuggingFaceTokenizer::from_file(hf_tokenizer_path()).unwrap();
         assert!(!renders_without_template(&mut jinja));
-        for architecture in ["DeepseekV32ForCausalLM", "DeepseekV4ForCausalLM"] {
+        for architecture in [
+            "DeepseekV32ForCausalLM",
+            "DeepseekV4ForCausalLM",
+            "DeepseekV41ForCausalLM",
+        ] {
             let dir = tokenizer_dir(architecture);
             let path = dir.path().join("tokenizer.json");
             let mut deepseek = HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap();
