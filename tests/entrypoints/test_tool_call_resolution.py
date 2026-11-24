@@ -171,7 +171,7 @@ class TestUnresolvedMeansUnparsed:
 
 
 class TestABadNameIsCaughtBeforeTheWeightsLoad:
-    """`AtomStandaloneService` raises on an unknown name, and it is built once
+    """The tool parser resolution raises on an unknown name, and it runs once
     the model is in memory -- so a typo cost a full load before saying so.
     """
 
@@ -283,19 +283,25 @@ class TestTheTwoVocabulariesCoexist:
             [*self.BASE, "--tool-call-parser", name]
         )
 
+    @staticmethod
+    def _forwarded(args):
+        return args.mesh_args[args.mesh_args.index("--tool-call-parser") + 1]
+
     @pytest.mark.parametrize("name", ["json", "python", "xml", "hermes"])
     def test_a_router_name_starts_and_reaches_the_router(self, name):
         args = self._parse(name)
-        assert args.mesh_args[-2:] == ["--tool-call-parser", name]
+        assert self._forwarded(args) == name
         assert (
             args.engine_args.tool_call_parser is None
         ), "a name ATOM does not know must leave ATOM reading the template"
 
     @pytest.mark.parametrize("name", sorted(PARSERS_BY_NAME))
     def test_an_atom_name_binds_atom_and_still_reaches_the_router(self, name):
+        """In the router's own name for the same syntax, where it has one."""
         args = self._parse(name)
         assert args.engine_args.tool_call_parser == name
-        assert args.mesh_args[-2:] == ["--tool-call-parser", name]
+        mesh_name = atomesh_server.MESH_TOOL_CALL_PARSERS.get(name, name)
+        assert self._forwarded(args) == mesh_name
 
     def test_unset_forwards_nothing_and_binds_nothing(self):
         args = atomesh_server.parse_standalone_args(self.BASE)
