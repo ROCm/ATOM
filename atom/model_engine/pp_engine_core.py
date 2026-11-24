@@ -35,6 +35,8 @@ class PPEngineCoreProc(EngineCore):
         self.is_head = self.pp_rank == 0
         self.is_last = self.pp_rank == self.pp_size - 1
         super().__init__(config, input_address, output_address)
+        # Every stage's manager has a rank 0, so its stall warnings name the stage.
+        self.runner_mgr.label = f"{self.runner_mgr.label}[PP{self.pp_rank}]"
         self.pp_transport = PPStageTransport(
             self.pp_rank,
             self.pp_size,

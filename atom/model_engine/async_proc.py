@@ -538,6 +538,7 @@ class AsyncIOProcManager:
             queue.Queue() for _ in range(proc_num)
         ]
         self._pending_kv_aggregation: _PendingKvAggregation | None = None
+        self._kv_agg_stall_s = envs.ATOM_KV_AGG_STALL_S
         self.kv_output_threads: list[threading.Thread] = []
 
         # Generic collective-RPC reply channels, one per rank
@@ -958,7 +959,9 @@ class AsyncIOProcManager:
         self._pending_kv_aggregation = pending
         return pending
 
-    def call_func_with_aggregation(self, func_name: str, *args, timeout: float = 10.0):
+    def call_func_with_aggregation(
+        self, func_name: str, *args, timeout: float | None = None
+    ):
         """RPC call with KV output aggregation across all workers.
 
         At most one aggregation is outstanding. The first call starts it;
@@ -970,7 +973,8 @@ class AsyncIOProcManager:
 
         Args:
             func_name: Method name to invoke on each worker's runner.
-            timeout: Seconds an incomplete aggregation may age before logging.
+            timeout: Seconds an incomplete aggregation may age before logging;
+                ``None`` reads ``ATOM_KV_AGG_STALL_S`` (10 s by default).
 
         Returns:
             Aggregated :class:`KVConnectorOutput`, or ``None`` while the
@@ -998,17 +1002,23 @@ class AsyncIOProcManager:
 
         missing = pending.missing_worker_ranks()
         if missing:
+            if timeout is None:
+                timeout = self._kv_agg_stall_s
             waited = time.monotonic() - pending.started_at
             if timeout > 0 and waited >= timeout and not pending.wait_warning_logged:
                 logger.error(
                     "%s: KV aggregation still waiting for workers %s after %.1fs; "
-                    "their thread stacks follow",
+                    "their thread stacks follow, then this process's",
                     self.label,
                     self._worker_names(missing),
                     waited,
                 )
                 pending.wait_warning_logged = True
                 self._dump_worker_stacks(missing)
+                # And this process's own: whether the loop that kept polling
+                # was idle, waiting on another stage, or holding back requests
+                # is what tells a stuck worker from one starved of work.
+                faulthandler.dump_traceback(all_threads=True)
             return None
 
         kv_output = self.kv_output_aggregator.aggregate(

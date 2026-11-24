@@ -33,6 +33,7 @@ def _manager(world_size=2):
     manager.kv_output_aggregator = None
     manager.kv_outputs_queues = [queue.Queue() for _ in range(world_size)]
     manager._pending_kv_aggregation = None
+    manager._kv_agg_stall_s = async_proc.envs.ATOM_KV_AGG_STALL_S
     return manager
 
 
@@ -290,3 +291,50 @@ def test_stack_dump_signal_prints_stacks_and_keeps_the_process():
     assert done.returncode == 0
     assert done.stdout.strip() == "alive"
     assert "most recent call first" in done.stderr
+
+
+@pytest.mark.parametrize("env, threshold", [(None, 10.0), ("3", 3.0), ("0", 10.0)])
+def test_stall_threshold_comes_from_env_and_dumps_this_process_too(
+    monkeypatch, env, threshold
+):
+    if env is None:
+        monkeypatch.delenv("ATOM_KV_AGG_STALL_S", raising=False)
+    else:
+        monkeypatch.setenv("ATOM_KV_AGG_STALL_S", env)
+    manager = _manager(world_size=1)
+    manager.procs = [Mock(pid=101)]
+    clock = [100.0]
+    monkeypatch.setattr(async_proc.time, "monotonic", lambda: clock[0])
+    kill = Mock()
+    monkeypatch.setattr(async_proc.os, "kill", kill)
+    own = Mock()
+    monkeypatch.setattr(async_proc.faulthandler, "dump_traceback", own)
+
+    assert manager.call_func_with_aggregation(_POLL) is None
+    clock[0] += threshold - 0.01
+    assert manager.call_func_with_aggregation(_POLL) is None
+    kill.assert_not_called()
+    own.assert_not_called()
+
+    clock[0] += 0.01
+    assert manager.call_func_with_aggregation(_POLL) is None
+    kill.assert_called_once_with(101, async_proc.STACK_DUMP_SIGNAL)
+    own.assert_called_once_with(all_threads=True)
+
+    clock[0] += 60.0
+    assert manager.call_func_with_aggregation(_POLL) is None
+    assert kill.call_count == own.call_count == 1
+
+
+def test_explicit_zero_timeout_still_never_logs(monkeypatch):
+    monkeypatch.setenv("ATOM_KV_AGG_STALL_S", "1")
+    manager = _manager(world_size=1)
+    manager.procs = [Mock(pid=101)]
+    clock = [100.0]
+    monkeypatch.setattr(async_proc.time, "monotonic", lambda: clock[0])
+    kill = Mock()
+    monkeypatch.setattr(async_proc.os, "kill", kill)
+    assert _poll(manager) is None
+    clock[0] += 100.0
+    assert _poll(manager) is None
+    kill.assert_not_called()
