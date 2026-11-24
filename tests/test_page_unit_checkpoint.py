@@ -2,6 +2,7 @@
 
 """Control-plane invariants for PAGE-backed state checkpoint images."""
 
+import math
 import pickle
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
@@ -17,7 +18,11 @@ from atom.model_engine.page_unit_checkpoint import (
     PagedStateCheckpointCoordinator,
     PagedStateCheckpointSpec,
     PageUnitCheckpointStore,
+    PipelineCheckpointStage,
+    checkpoint_store_entry_bytes,
+    pipeline_kv_blocks,
     published_page_unit_bytes,
+    size_pipeline_checkpoint_store,
 )
 from atom.model_engine.state_cache import KEEP_SETTLED, KEEP_SNAPSHOT
 from atom.model_engine.state_pool import StateSlotPool
@@ -822,3 +827,150 @@ def test_a_slot_copied_as_is_borrows_nothing(decode_keep, step):
     stores, _ = c.take_checkpoint_ops()
     assert [(op.src_slot, op.step, op.scratch_slot) for op in stores] == [(5, -1, -1)]
     assert pool.has_free()
+
+
+# ── PP: a checkpoint store per stage ───────────────────────────────────────
+
+GIB = 1 << 30
+# Kimi-K3 at PP8 x TP1 on MI455X, as the measured runs logged it: an MLA row is
+# 128 tokens x 576 B a block, a KDA layer's image (conv + SSM) 6,807,552 B and
+# its slot 8,380,416 B (with ReplaySSM's records), 64 slots a stage.
+MLA_ROW = 128 * 576
+KDA_IMAGE = 6_807_552
+KDA_SLOT = 8_380_416
+# `VLLM_PP_LAYER_PARTITION` and each stage's logged `available_for_kv` (GiB).
+SPLIT = (13, 13, 13, 13, 13, 12, 12, 4)
+AVAILABLE_GIB = (137.32, 137.37, 157.57, 138.30, 138.54, 152.46, 153.11, 276.36)
+DEFAULT_SPLIT = (11, 11, 12, 12, 12, 12, 12, 11)
+DEFAULT_AVAILABLE_GIB = (188.09, 169.20, 154.19, 153.47, 153.42, 154.48, 152.54, 169.45)
+
+
+def k3_stages(split, available_gib, slots=None, kv_share=0.5):
+    """Each stage's numbers: layers 4, 8, ..., 92 and 93 (1-indexed) are MLA,
+    the other 69 KDA, and the last stage also holds the drafter's 5 MLA rows."""
+    mla = set(range(4, 93, 4)) | {93}
+    stages, first = [], 1
+    for i, (n, gib) in enumerate(zip(split, available_gib)):
+        rows = sum(layer in mla for layer in range(first, first + n))
+        kda = n - rows
+        rows += 5 if i == len(split) - 1 else 0
+        first += n
+        stages.append(
+            PipelineCheckpointStage(
+                budget_bytes=int(gib * GIB) - 64 * kda * KDA_SLOT,
+                page_bytes=rows * MLA_ROW,
+                image_bytes=kda * KDA_IMAGE,
+                slots=slots,
+                kv_share=kv_share,
+            )
+        )
+    return stages
+
+
+def own_blocks(stage):
+    return -(-stage.image_bytes // stage.page_bytes)
+
+
+def agreed(stages, unit_bytes):
+    """Each stage's spec after `ModelRunner._agree_pipeline_checkpoint_spec`,
+    its unit `unit_bytes(stage)`: a KV block, or a checkpoint-store entry."""
+    specs = [
+        PagedStateCheckpointSpec(unit_bytes(s), s.image_bytes, "kda", s.image_bytes)
+        for s in stages
+    ]
+    units = max(spec.units_per_checkpoint for spec in specs)
+    op_bytes = sum(s.image_bytes for s in stages)
+    return [spec.for_pipeline("pp8-joint:test", units, op_bytes) for spec in specs]
+
+
+class TestAPipelineCheckpointStore:
+    """Under PP every stage writes its own part of an image under the one unit
+    id the head names. In KV blocks an id is a block on every stage, so each
+    image took the largest stage's block count everywhere; a store entry is a
+    whole image at each stage's own size."""
+
+    def test_a_stage_pays_its_own_image_not_the_largest_stages_blocks(self):
+        stages = k3_stages(SPLIT, AVAILABLE_GIB)
+        in_blocks = agreed(stages, lambda s: s.page_bytes)
+        in_store = agreed(stages, lambda s: checkpoint_store_entry_bytes(s.image_bytes))
+
+        for stage, kv, store in zip(stages, in_blocks, in_store):
+            assert kv.units_per_checkpoint == 308
+            assert store.units_per_checkpoint == 1
+            paid = store.units_per_checkpoint * store.page_unit_bytes
+            # Its own image, rounded to its own entry, never more than its own
+            # block count would have cost it.
+            assert paid == checkpoint_store_entry_bytes(stage.image_bytes)
+            assert stage.image_bytes <= paid <= own_blocks(stage) * stage.page_bytes
+            assert store.op_bytes == kv.op_bytes == sum(s.image_bytes for s in stages)
+        # The last stage: a 13.6 MB image used to take 308 of its 516 KB blocks.
+        last = stages[-1]
+        assert in_blocks[-1].units_per_checkpoint * last.page_bytes == 158_957_568
+        assert in_store[-1].page_unit_bytes == last.image_bytes == 13_615_104
+
+    @pytest.mark.parametrize(
+        "split, available, images, before, after",
+        [
+            (SPLIT, AVAILABLE_GIB, 1000, 179_166, 279_416),
+            (SPLIT, AVAILABLE_GIB, 1500, 25_166, 175_541),
+            # 416 blocks an image: 1,000 of them did not fit at all.
+            (DEFAULT_SPLIT, DEFAULT_AVAILABLE_GIB, 1000, -147_459, 196_726),
+            (DEFAULT_SPLIT, DEFAULT_AVAILABLE_GIB, 500, 60_541, 232_633),
+        ],
+    )
+    def test_the_kv_blocks_left_for_a_number_of_images(
+        self, split, available, images, before, after
+    ):
+        stages = k3_stages(split, available)
+        largest = max(own_blocks(s) for s in stages)
+        assert pipeline_kv_blocks(stages, 0) - images * largest == before
+        assert pipeline_kv_blocks(stages, images) == after
+        # Every stage still backs that many blocks beside its own images.
+        for s in stages:
+            assert (
+                after * s.page_bytes
+                + images * checkpoint_store_entry_bytes(s.image_bytes)
+                <= s.budget_bytes
+            )
+
+    def test_an_explicit_count_is_taken_as_given_or_refused(self):
+        """Stages 0 and 1 hold 2,087 images and one KV block at most; a
+        negative count keeps the images in KV blocks."""
+        for slots in (0, 1000, 2087):
+            stages = k3_stages(SPLIT, AVAILABLE_GIB, slots)
+            assert size_pipeline_checkpoint_store(stages) == slots
+        with pytest.raises(ValueError, match=r"stages \[0, 1\].*at most 2087"):
+            size_pipeline_checkpoint_store(k3_stages(SPLIT, AVAILABLE_GIB, 2088))
+        assert (
+            size_pipeline_checkpoint_store(k3_stages(SPLIT, AVAILABLE_GIB, -1)) is None
+        )
+
+    def test_by_default_the_images_stay_in_kv_blocks(self):
+        """Neither setting given: no store. A store's KV blocks are never lent
+        back, so a deployment opts into one."""
+        stages = k3_stages(SPLIT, AVAILABLE_GIB, kv_share=None)
+        assert size_pipeline_checkpoint_store(stages) is None
+
+    @pytest.mark.parametrize(
+        "share, images, left",
+        [(0.25, 586, 365_425), (0.5, 1172, 243_683), (0.75, 1691, 121_921)],
+    )
+    def test_a_share_keeps_the_rest_of_the_kv_blocks(self, share, images, left):
+        """The store takes as many images as leave `1 - share` of the KV
+        blocks every stage could back without one (487,166 here), and not one
+        more."""
+        stages = k3_stages(SPLIT, AVAILABLE_GIB, kv_share=share)
+        kept = math.ceil((1 - share) * pipeline_kv_blocks(stages, 0))
+        assert size_pipeline_checkpoint_store(stages) == images
+        assert pipeline_kv_blocks(stages, images) == left
+        assert left >= kept > pipeline_kv_blocks(stages, images + 1)
+
+    @pytest.mark.parametrize(
+        "share, stage_5_share, match",
+        [(0.5, 0.25, "launched with different"), (1.0, 1.0, "KV_SHARE")],
+    )
+    def test_a_bad_or_mixed_share_is_refused(self, share, stage_5_share, match):
+        stages = k3_stages(SPLIT, AVAILABLE_GIB, kv_share=share)
+        stages[5] = stages[5]._replace(kv_share=stage_5_share)
+        with pytest.raises(ValueError, match=match):
+            size_pipeline_checkpoint_store(stages)

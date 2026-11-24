@@ -527,6 +527,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_STATE_CHECKPOINT_CHECK_BLOCKS": lambda: (
         os.getenv("ATOM_STATE_CHECKPOINT_CHECK_BLOCKS", "0") == "1"
     ),
+    # Kimi-K3 under PP: how many state checkpoint images the per-stage store
+    # holds, every stage the same count at its own image size. Unset sizes it
+    # from ATOM_PP_STATE_CHECKPOINT_KV_SHARE. With both unset (the default), or
+    # negative, there is no store: the images stay in KV blocks, where each
+    # takes the largest stage's block count on every stage.
+    "ATOM_PP_STATE_CHECKPOINT_SLOTS": lambda: _optional_int_env(
+        "ATOM_PP_STATE_CHECKPOINT_SLOTS"
+    ),
+    # Kimi-K3 under PP, ATOM_PP_STATE_CHECKPOINT_SLOTS unset: the share of the
+    # KV blocks the checkpoint store may cost, in [0, 1). Unset: no store.
+    "ATOM_PP_STATE_CHECKPOINT_KV_SHARE": lambda: (
+        _finite_float_env("ATOM_PP_STATE_CHECKPOINT_KV_SHARE", 0.0, allow_zero=True)
+        if os.getenv("ATOM_PP_STATE_CHECKPOINT_KV_SHARE")
+        else None
+    ),
     # Set to 1 to read Qwen GDN state checkpoints out of the chunk kernel's
     # interior states instead of cutting prefill chunks onto them, on both the
     # PAGE and the fork-slot path; see `StateCache.publish_midstep`. Not

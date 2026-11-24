@@ -5,7 +5,9 @@
 
 The destination side of a K3 PAGE-copy checkpoint: given logical block (PAGE
 unit) ids, it gives the addresses and tensor views of the KV pool a checkpoint
-copy lands on. `_KimiMLAGDNCommon` mixes it in over `GDNStateMixin`.
+copy lands on. `_KimiMLAGDNCommon` mixes it in over `GDNStateMixin`. Under
+pipeline parallelism a unit is instead one entry of the checkpoint store, a
+whole image at this stage's own size (`checkpoint_store_of`).
 
 Pure over `self.model_runner`, and here rather than beside that builder for the
 reason the package exists (see `pool_layout/__init__.py`): the geometry deciding
@@ -19,6 +21,39 @@ from collections.abc import Sequence
 
 import numpy as np
 import torch
+
+
+def checkpoint_store_of(runner) -> torch.Tensor | None:
+    """The `(entries, entry_bytes)` uint8 store a PP stage keeps its images in,
+    one an entry, which `GDNStateMixin.allocate_per_req_cache` publishes when
+    the pool plan sizes one; None, and a unit is a KV block. A spec priced for
+    entries cannot fall back to KV rows unnoticed: the granularity check below
+    refuses a unit the size of an image."""
+    return getattr(runner, "state_checkpoint_cache", None)
+
+
+def checkpoint_store_regions(
+    store: torch.Tensor, runner
+) -> tuple[np.ndarray, np.ndarray]:
+    """One region per unit, a whole entry, strided by the entry: what
+    `_page_unit_bases` and `_page_unit_stream_sizes` read off a KV row."""
+    if store.dim() != 2 or store.dtype != torch.uint8 or not store.is_contiguous():
+        raise RuntimeError(
+            "the checkpoint store must be a contiguous (entries, bytes) uint8 "
+            f"tensor, not {tuple(store.shape)} {store.dtype}"
+        )
+    entry = int(store.shape[1])
+    runtime = getattr(runner, "state_runtime", None)
+    spec = None if runtime is None else runtime.checkpoint_spec
+    if spec is not None and spec.page_unit_bytes != entry:
+        raise RuntimeError(
+            f"a checkpoint unit is {spec.page_unit_bytes} B but a checkpoint "
+            f"store entry holds {entry} B"
+        )
+    return (
+        np.array([store.data_ptr()], dtype=np.int64),
+        np.array([entry], dtype=np.int64),
+    )
 
 
 class PageUnitGeometryMixin:
@@ -60,8 +95,13 @@ class PageUnitGeometryMixin:
         `runner.block_size` tokens wide by construction rather than by
         remembering that the allocation pages at 1 (K3's `block_ratio` is 128).
         The granularity assertion below still checks the relation.
+
+        Under a checkpoint store (PP) a unit is one store entry instead.
         """
         runner = self.model_runner
+        store = checkpoint_store_of(runner)
+        if store is not None:
+            return checkpoint_store_regions(store, runner)
         cache = self._page_unit_kv_cache()
         index_caches = self._page_unit_index_cache()
         # Key on the full layout, not `data_ptr()` alone. The pool is rebuilt in
@@ -183,22 +223,29 @@ class PageUnitGeometryMixin:
         `_page_unit_regions` runs first only for its side effect (the contiguity
         and granularity checks). Its return is for the Triton descriptor, not
         this view path -- called bare, not unpacked.
+
+        Under a checkpoint store a unit is one entry: a plane of one region.
         """
         self._page_unit_regions()
-        cache = self._page_unit_kv_cache()
-        rows, entry = cache.shape[0], cache.shape[3]
-        block = self.model_runner.block_size
-        # Logical blocks the pool holds, which is what a unit id indexes.
-        # Range-checked against THIS count, not the physical one: the physical
-        # count is `block_ratio` times smaller, so checking it would pass ids
-        # that address past the end of the tensor.
-        logical_blocks = (cache.shape[1] * cache.shape[2]) // block
-        planes = [cache[row].view(-1, entry) for row in range(rows)]
-        index_planes = [
-            plane
-            for index_cache in self._page_unit_index_cache()
-            for plane in index_cache
-        ]
+        store = checkpoint_store_of(self.model_runner)
+        if store is not None:
+            planes, index_planes, block = [store], [], 1
+            logical_blocks = int(store.shape[0])
+        else:
+            cache = self._page_unit_kv_cache()
+            rows, entry = cache.shape[0], cache.shape[3]
+            block = self.model_runner.block_size
+            # Logical blocks the pool holds, which is what a unit id indexes.
+            # Range-checked against THIS count, not the physical one: the
+            # physical count is `block_ratio` times smaller, so checking it
+            # would pass ids that address past the end of the tensor.
+            logical_blocks = (cache.shape[1] * cache.shape[2]) // block
+            planes = [cache[row].view(-1, entry) for row in range(rows)]
+            index_planes = [
+                plane
+                for index_cache in self._page_unit_index_cache()
+                for plane in index_cache
+            ]
         views: list[torch.Tensor] = []
         for unit in unit_ids:
             unit = int(unit)

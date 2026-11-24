@@ -61,7 +61,7 @@ from atom.kv_transfer.disaggregation import (
 )
 from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
 from atom.model_engine.dynamic_chunking_worker import DynamicChunkingWorker
-from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_engine.kv_block import STATE_CHECKPOINT_CLASS, STATE_SLOT_CLASS
 from atom.model_engine.model_setup import (
     build_model,
     construct_drafter,
@@ -72,7 +72,11 @@ from atom.model_engine.model_setup import (
 from atom.model_engine.output_transfer import D2HQueue
 from atom.model_engine.page_unit_checkpoint import (
     PagedStateCheckpointSpec,
+    PipelineCheckpointStage,
+    checkpoint_store_entry_bytes,
+    pipeline_kv_blocks,
     published_page_unit_bytes,
+    size_pipeline_checkpoint_store,
 )
 from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import (
@@ -1903,18 +1907,96 @@ class ModelRunner:
         """
         return freeze_gc_heap(worker_process_name(self.config, self.rank))
 
-    def _local_checkpoint_spec(
-        self, transfer, slot_bytes: int
-    ) -> PagedStateCheckpointSpec:
-        """This worker's own checkpoint geometry, before any PP agreement."""
+    def _local_checkpoint_image_bytes(self, slot_bytes: int) -> int:
+        """Bytes of this worker's checkpoint image, out of a `slot_bytes` slot."""
         # None means the backend has not narrowed its image: carry it all.
         narrowed = self.attn_metadata_builder.checkpoint_image_bytes()
+        return slot_bytes if narrowed is None else int(narrowed)
+
+    def _local_checkpoint_spec(
+        self, transfer, slot_bytes: int, store_entry_bytes: int = 0
+    ) -> PagedStateCheckpointSpec:
+        """This worker's own checkpoint geometry, before any PP agreement. A
+        unit is a checkpoint-store entry when the plan has a store, else this
+        builder's share of a KV block."""
         return PagedStateCheckpointSpec(
-            page_unit_bytes=published_page_unit_bytes(self.attn_metadata_builder),
+            page_unit_bytes=(
+                store_entry_bytes
+                or published_page_unit_bytes(self.attn_metadata_builder)
+            ),
             slot_bytes=slot_bytes,
-            image_bytes=slot_bytes if narrowed is None else int(narrowed),
+            image_bytes=self._local_checkpoint_image_bytes(slot_bytes),
             layout_id=transfer.paged_layout_id,
         )
+
+    def _plan_pipeline_checkpoint_store(
+        self, plan: PoolPlan, available_for_kv: int
+    ) -> tuple[int, int] | None:
+        """`(images, entry bytes)` of this PP stage's checkpoint store, or None.
+
+        Only the head schedules, so an op names one unit id for every stage. As
+        KV blocks a unit is a block on every stage at once, and each image took
+        the largest stage's block count everywhere (PP8: 308 blocks of a last
+        stage whose 13.6 MB image needs 27). A store entry is one image, sized
+        per stage as the state pool sizes its slots, so a stage pays for its own
+        image alone, out of the paged budget (`size_pipeline_checkpoint_store`).
+
+        A store only in a PP run whose checkpoints span its stages, and only
+        when the launch sets ATOM_PP_STATE_CHECKPOINT_SLOTS or
+        ATOM_PP_STATE_CHECKPOINT_KV_SHARE; None otherwise, and None on every
+        stage when one holds no recurrent state or no PAGE class, which the
+        refusals below name. Collective over the PP group, whose gather also
+        refuses stages launched with different settings.
+        """
+        config = self.config
+        builder = self.attn_metadata_builder
+        if (
+            config.pipeline_parallel_size <= 1
+            or not getattr(builder, "paged_checkpoints_span_pipeline", False)
+            or not builder.state_transfer().copies
+            or not torch.distributed.is_initialized()
+        ):
+            return None
+        slot_bytes = int(plan.entry_bytes.get(STATE_SLOT_CLASS, 0))
+        stage = PipelineCheckpointStage(
+            budget_bytes=available_for_kv
+            - sum(
+                b for name, b in plan.reserved_bytes.items() if name != plan.paged_class
+            ),
+            page_bytes=int(plan.entry_bytes.get(plan.paged_class, 0)),
+            image_bytes=(
+                self._local_checkpoint_image_bytes(slot_bytes) if slot_bytes else 0
+            ),
+            slots=envs.ATOM_PP_STATE_CHECKPOINT_SLOTS,
+            kv_share=envs.ATOM_PP_STATE_CHECKPOINT_KV_SHARE,
+        )
+        pp = get_pp_group()
+        stages: list = [None] * pp.world_size
+        torch.distributed.all_gather_object(stages, stage, group=pp.cpu_group)
+        # Decided on what every stage put in, so all of them decide alike.
+        if any(s.image_bytes <= 0 or s.page_bytes <= 0 for s in stages):
+            return None
+        images = size_pipeline_checkpoint_store(stages)
+        if images is None:
+            return None
+        # Nothing would store an image; keep the layout, spend no memory.
+        if (
+            not config.enable_prefix_caching
+            or not config.state_checkpoint_interval_tokens
+        ):
+            images = 0
+        logger.info(
+            "PP state checkpoint store: %d images (ATOM_PP_STATE_CHECKPOINT_SLOTS="
+            "%s, ATOM_PP_STATE_CHECKPOINT_KV_SHARE=%s), entry bytes per stage %s; "
+            "KV blocks every stage can back: %d without the store, %d with it",
+            images,
+            stage.slots,
+            stage.kv_share,
+            [checkpoint_store_entry_bytes(s.image_bytes) for s in stages],
+            pipeline_kv_blocks(stages, 0),
+            pipeline_kv_blocks(stages, images),
+        )
+        return images, checkpoint_store_entry_bytes(stage.image_bytes)
 
     def _agree_pipeline_checkpoint_spec(
         self, spec: PagedStateCheckpointSpec | None
@@ -1922,12 +2004,14 @@ class ModelRunner:
         """Put every PP stage's checkpoint images on one set of unit ids.
 
         Only the head schedules, so a store or restore op it builds names the
-        same unit ids on every stage. Each stage holds its own layers' state in
-        its own unit size, so the stages need different counts; all take the
-        largest, and a stage needing fewer leaves its tail units unwritten. An
-        op is checked against the joint layout id and the summed image bytes,
-        which change whenever any stage's geometry does. Collective over the
-        PP group, which holds one rank per stage in stage order.
+        same unit ids on every stage. With the images in KV blocks (no store,
+        the default) the stages need different counts of their own blocks; all
+        take the largest, and a stage needing fewer leaves its tail units
+        unwritten. With a checkpoint store a unit is one entry, sized to each
+        stage's own image, so every stage needs one. An op is checked against
+        the joint layout id and the summed image bytes, which change whenever
+        any stage's geometry does. Collective over the PP group, which holds
+        one rank per stage in stage order.
 
         A stage that holds no recurrent state passes None, and then every
         stage refuses with the same error: one raising alone would leave the
@@ -1963,10 +2047,11 @@ class ModelRunner:
         layout_id = f"pp{len(stages)}-joint:{digest}"
         logger.info(
             "PAGE-backed state checkpoints span %d PP stages: units=%d "
-            "(per stage %s), op_bytes=%d, layout=%s",
+            "(per stage %s, unit bytes per stage %s), op_bytes=%d, layout=%s",
             len(stages),
             units,
             [entry[3] for entry in stages],
+            [entry[2] for entry in stages],
             op_bytes,
             layout_id,
         )
@@ -2079,6 +2164,15 @@ class ModelRunner:
                 )
             raise RuntimeError(base_msg + fix_msg) from exc
 
+        # Under PP the checkpoint images get a store of their own, whose bytes
+        # come out of the paged pool's budget before the paged pool is sized.
+        store = self._plan_pipeline_checkpoint_store(plan, available_for_kv)
+        if store is not None:
+            images, entry_bytes = store
+            plan = plan_pools(
+                specs, available_for_kv - images * entry_bytes, config.max_num_seqs
+            ).with_entry_class(STATE_CHECKPOINT_CLASS, images, entry_bytes)
+
         # PP stages, and TP ranks on another node, compute different block
         # counts; block ids must be valid on every rank's KV tensor, so reduce
         # to the global minimum (kv_blocks_differ_across_ranks). Fold the
@@ -2136,7 +2230,11 @@ class ModelRunner:
             slot_bytes = int(plan.entry_bytes[STATE_SLOT_CLASS])
             # A PP stage without a linear-attention layer has no image.
             local_spec = (
-                self._local_checkpoint_spec(transfer, slot_bytes)
+                self._local_checkpoint_spec(
+                    transfer,
+                    slot_bytes,
+                    int(plan.entry_bytes.get(STATE_CHECKPOINT_CLASS, 0)),
+                )
                 if slot_bytes
                 else None
             )

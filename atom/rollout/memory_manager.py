@@ -341,6 +341,7 @@ class MemoryManagerMixin:
             "mamba_k_cache",
             "mamba_v_cache",
             "kpool_tail_cache",
+            "state_checkpoint_cache",
             "_kv_cache_backup",
         ):
             if hasattr(self, attr) and getattr(self, attr) is not None:
