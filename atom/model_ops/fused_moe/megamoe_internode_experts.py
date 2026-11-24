@@ -42,10 +42,13 @@ logger = logging.getLogger("atom")
 # Decode capacities, smallest first. A unified decode step (incl. speculative
 # verify: bs * (1 + num_spec)) runs on the smallest capacity that fits.
 _DECODE_MTPRS = (32, 64, 128, 256, 512, 1024)
+# Prefill capacity cap: each capacity owns its symmetric buffers and
+# communicator, so a larger prefill step runs in chunks of this size instead.
 _PREFILL_MTPR = 4096
-_OP_MAX_MTPR = 4096
 
 _INSTANCES: dict = {}
+# This process's token budget -> the budget the EP group agreed on.
+_AGREED_BUDGETS: dict[int, int] = {}
 
 
 def close_internode_instances() -> None:
@@ -82,7 +85,8 @@ def build_internode_weights(layer) -> None:
             f"internode MegaMoE: local weights {E} != local_num_experts "
             f"{layer.local_num_experts}"
         )
-    # Same calls as the op's unit test (op_tests/.../megamoe_internode_inputs.py):
+    # Same calls as aiter's
+    # op_tests/multigpu_tests/test_megamoe_internode.py::prepare_weights:
     # 3-D packed weights, 2-D (E*rows, K/32) scales.
     layer._mi_w1 = shuffle_weight(w13, layout=(16, 16)).contiguous()
     layer._mi_w1_scale = e8m0_shuffle(
@@ -202,7 +206,11 @@ def _group_max_tokens(max_tokens: int) -> int:
 
     Runs during weight initialization, before warmup/capture. Even nodes with
     different scheduler budgets must construct the same sequence of operators.
+    One collective per process: every MoE layer reuses the agreed budget.
     """
+    agreed = _AGREED_BUDGETS.get(max_tokens)
+    if agreed is not None:
+        return agreed
     import torch.distributed as dist
     from aiter.dist.parallel_state import get_ep_group
 
@@ -212,7 +220,8 @@ def _group_max_tokens(max_tokens: int) -> int:
         dist.all_gather_object(budgets, max_tokens, group=group.cpu_group)
     if any(n <= 0 for n in budgets):
         raise ValueError(f"internode MegaMoE token budgets must be positive: {budgets}")
-    return max(budgets)
+    agreed = _AGREED_BUDGETS[max_tokens] = max(budgets)
+    return agreed
 
 
 class MegaInternodeFusedExperts:
@@ -223,14 +232,12 @@ class MegaInternodeFusedExperts:
         self._model_dim = model_dim
         self._inter_dim = inter_dim
         max_tokens = _group_max_tokens(max_tokens)
-        # AITER decodes source IDs with power-of-two shifts. Keep the existing
-        # minimum decode capacity; the larger capacities are needed only when
-        # a rank's budget can reach them. EP keeps rows local and the runner
-        # caps graph token rows at this same scheduler budget.
+        # The op takes a power-of-two capacity. Keep the minimum decode
+        # capacity; the larger ones are built only when a rank's budget can
+        # reach them. EP keeps rows local and the runner caps graph token rows
+        # at this same scheduler budget.
         rounded_tokens = 1 << (max_tokens - 1).bit_length()
-        self._prefill_mtpr = min(
-            _PREFILL_MTPR, _OP_MAX_MTPR, max(_DECODE_MTPRS[0], rounded_tokens)
-        )
+        self._prefill_mtpr = min(_PREFILL_MTPR, max(_DECODE_MTPRS[0], rounded_tokens))
         self._decode_mtprs = tuple(m for m in _DECODE_MTPRS if m < self._prefill_mtpr)
 
     def __call__(

@@ -2238,8 +2238,7 @@ def is_internode_mega(config: "Config") -> bool:
     return (
         config.moe_backend == "mega"
         and config.sequence_parallel_size == 1
-        and config.parallel_config.data_parallel_size_local
-        < config.parallel_config.data_parallel_size
+        and config.parallel_config.is_multinode_dp
     )
 
 

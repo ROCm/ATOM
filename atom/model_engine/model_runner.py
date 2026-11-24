@@ -31,7 +31,7 @@ from aiter.dist.parallel_state import (
 from torch.profiler import record_function
 
 from atom import structured_output
-from atom.config import Config, set_current_atom_config
+from atom.config import Config, is_internode_mega, set_current_atom_config
 from atom.distributed.group_agreement import agree_kv_budget, group_min
 from atom.distributed.pcp_utils import (
     PcpBalGroup,
@@ -1203,10 +1203,7 @@ class ModelRunner:
                     )
 
                     cleanup.callback(close_mega_transports)
-                if (
-                    getattr(getattr(self, "config", None), "moe_backend", None)
-                    == "mega"
-                ):
+                if is_internode_mega(self.config):
                     from atom.model_ops.fused_moe.megamoe_internode_experts import (
                         close_internode_instances,
                     )

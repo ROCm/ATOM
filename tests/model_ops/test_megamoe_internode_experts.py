@@ -39,6 +39,7 @@ def internode(atom_modules, monkeypatch):
     kernel = importlib.import_module("aiter.ops.flydsl.kernels.mega_moe_internode")
     monkeypatch.setattr(kernel, "MegaMoEInternode", Operator)
     monkeypatch.setattr(module, "_INSTANCES", {})
+    monkeypatch.setattr(module, "_AGREED_BUDGETS", {})
     monkeypatch.setattr(module, "_rank_world", lambda: (0, 16))
     monkeypatch.setattr(module, "_group_max_tokens", lambda max_tokens: max_tokens)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
@@ -445,15 +446,22 @@ def test_situ_defaults_and_explicit_parameters(internode, monkeypatch, extra, ex
     ] == [expected] * 3
 
 
+def _dp(size, local):
+    """A ParallelConfig double: `local` of `size` DP ranks on this node."""
+    return SimpleNamespace(
+        data_parallel_size=size,
+        data_parallel_size_local=local,
+        is_multinode_dp=local < size,
+    )
+
+
 def _config(**overrides):
     settings = {
         "moe_backend": "mega",
         "enable_expert_parallel": True,
         "enable_dp_attention": True,
         "tensor_parallel_size": 1,
-        "parallel_config": SimpleNamespace(
-            data_parallel_size=16, data_parallel_size_local=8
-        ),
+        "parallel_config": _dp(16, 8),
     }
     settings.update(overrides)
     return atom_config_double(**settings)
@@ -488,9 +496,7 @@ def test_mega_implementation_is_selected_by_topology(backend, sp, dp, local, exp
     config = _config(
         moe_backend=backend,
         sequence_parallel_size=sp,
-        parallel_config=SimpleNamespace(
-            data_parallel_size=dp, data_parallel_size_local=local
-        ),
+        parallel_config=_dp(dp, local),
     )
     Config._init_moe_backend(config)
     assert is_internode_mega(config) is expected
@@ -510,19 +516,11 @@ def test_removed_internode_selector_is_rejected():
         ({"enable_expert_parallel": False}, "two-node EP16"),
         ({"dp_logical_size": 32}, "two-node EP16"),
         (
-            {
-                "parallel_config": SimpleNamespace(
-                    data_parallel_size=32, data_parallel_size_local=8
-                )
-            },
+            {"parallel_config": _dp(32, 8)},
             "two-node EP16",
         ),
         (
-            {
-                "parallel_config": SimpleNamespace(
-                    data_parallel_size=16, data_parallel_size_local=4
-                )
-            },
+            {"parallel_config": _dp(16, 4)},
             "two-node EP16",
         ),
         ({"enable_tbo": True}, "disable TBO"),
@@ -550,9 +548,7 @@ def test_method_factory_preserves_single_node_and_sp_mega(
     config = _config(
         moe_backend=backend,
         sequence_parallel_size=sp,
-        parallel_config=SimpleNamespace(
-            data_parallel_size=dp, data_parallel_size_local=local
-        ),
+        parallel_config=_dp(dp, local),
     )
     methods = {}
     for name in ("Mxfp4MoEMethod", "MegaMxfp4MoEMethod", "MegaInternodeMxfp4MoEMethod"):
@@ -657,3 +653,111 @@ def test_supported_method_keeps_rows_on_the_alltoall_path(
     with use_custom_atom_config(config):
         method = moe.MegaInternodeMxfp4MoEMethod(quant, fused_config)
     assert parallel.use_all2all_kernels and not method.use_triton_ep
+
+
+def test_the_token_budget_is_agreed_once_for_every_layer(internode, monkeypatch):
+    calls = _ep_budgets(internode, monkeypatch, [128] * 16)
+    for _ in range(3):
+        internode.module.MegaInternodeFusedExperts(
+            _weights(), model_dim=64, inter_dim=32, max_tokens=128
+        )
+    assert calls == [128]
+
+
+def _raw_weights(experts=2, local=2, inter=64, hidden=128):
+    return SimpleNamespace(
+        w13_weight=torch.zeros(experts, 2 * inter, hidden // 2, dtype=torch.uint8),
+        w13_weight_scale=torch.zeros(experts, 2 * inter, hidden // 32),
+        w2_weight=torch.zeros(experts, hidden, inter // 2, dtype=torch.uint8),
+        w2_weight_scale=torch.zeros(experts, hidden, inter // 32),
+        w13_bias=None,
+        w2_bias=None,
+        local_num_experts=local,
+    )
+
+
+@pytest.fixture
+def layouts(monkeypatch):
+    """The aiter layout calls `build_internode_weights` makes, recorded."""
+    seen = {}
+    shuffle = importlib.import_module("aiter.ops.shuffle")
+    fp4 = importlib.import_module("aiter.utility.fp4_utils")
+
+    def record(name):
+        def call(tensor, *args, **kwargs):
+            seen[name] = (tuple(tensor.shape), args, kwargs)
+            return tensor.clone()
+
+        return call
+
+    monkeypatch.setattr(shuffle, "shuffle_weight", record("w1"), raising=False)
+    monkeypatch.setattr(shuffle, "shuffle_weight_a16w4", record("w2"), raising=False)
+    monkeypatch.setattr(
+        shuffle, "shuffle_scale_a16w4", record("w2_scale"), raising=False
+    )
+    monkeypatch.setattr(fp4, "e8m0_shuffle", record("w1_scale"), raising=False)
+    return seen
+
+
+def test_weights_take_the_ops_layouts(internode, layouts):
+    layer = _raw_weights()
+    internode.module.build_internode_weights(layer)
+    assert layouts == {
+        "w1": ((2, 128, 64), (), {"layout": (16, 16)}),
+        "w1_scale": ((256, 4), (), {}),
+        "w2": ((2, 128, 32), (16, False), {}),
+        "w2_scale": ((256, 2), (2, False), {}),
+    }
+    assert all(
+        getattr(layer, name).is_contiguous()
+        for name in ("_mi_w1", "_mi_w1_scale", "_mi_w2", "_mi_w2_scale")
+    )
+
+
+def test_weights_must_be_this_ranks_experts(internode, layouts):
+    with pytest.raises(RuntimeError, match="local weights 2 != local_num_experts 4"):
+        internode.module.build_internode_weights(_raw_weights(local=4))
+    assert not layouts
+
+
+@pytest.mark.parametrize("bias", ["w13_bias", "w2_bias"])
+def test_expert_biases_are_refused(internode, layouts, bias):
+    method = object.__new__(internode.moe.MegaInternodeMxfp4MoEMethod)
+    layer = _raw_weights()
+    setattr(layer, bias, torch.zeros(1))
+    with pytest.raises(NotImplementedError, match="expert biases"):
+        method._process_weight_layout_after_loading(layer)
+    assert not layouts
+
+
+def test_raw_weights_and_scales_are_released(internode, layouts):
+    method = object.__new__(internode.moe.MegaInternodeMxfp4MoEMethod)
+    layer = _raw_weights()
+    method._process_weight_layout_after_loading(layer)
+    for name in ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale"):
+        assert getattr(layer, name).numel() == 0, name
+    assert method.get_eplb_weight_views(layer)[0].shape[0] == 2
+
+
+@pytest.mark.parametrize(
+    "method_name,shared,error",
+    [
+        ("MegaInternodeMxfp4MoEMethod", 0, None),
+        ("MegaInternodeMxfp4MoEMethod", 1, "separate shared experts"),
+        ("MegaMxfp4MoEMethod", 0, "only MXFP4 routed experts"),
+        ("Mxfp4MoEMethod", 0, "only MXFP4 routed experts"),
+    ],
+)
+def test_internode_backend_check(atom_modules, monkeypatch, method_name, shared, error):
+    moe = atom_modules.moe
+    monkeypatch.setattr(moe, "sp_is_enabled", lambda: False)
+    layer = SimpleNamespace(
+        quant_method=object.__new__(getattr(moe, method_name)),
+        num_fused_shared_experts=shared,
+    )
+    with use_custom_atom_config(_config()):
+        if error is None:
+            moe.FusedMoE._validate_moe_backend(layer)
+        else:
+            with pytest.raises((TypeError, ValueError), match=error):
+                moe.FusedMoE._validate_moe_backend(layer)

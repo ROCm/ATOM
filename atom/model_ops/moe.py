@@ -2706,13 +2706,19 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
         self.use_triton = False
         self.use_triton_decode = False
 
-    def _process_weight_layout_after_loading(self, layer) -> None:
+    # The prepared weights (`_build_weights`), expert-major for EPLB.
+    _weight_names = ("_mega_w1", "_mega_w1_scale", "_mega_w2", "_mega_w2_scale")
+
+    def _build_weights(self, layer) -> None:
         from atom.model_ops.fused_moe.flydsl_mega_experts import build_mega_weights
 
         build_mega_weights(layer)
 
-        # Mega reads only _mega_* weights. Release the raw AITER weight copies
-        # and skip the standard shuffle so both layouts are not retained.
+    def _process_weight_layout_after_loading(self, layer) -> None:
+        self._build_weights(layer)
+
+        # Mega reads only its prepared weights. Release the raw AITER weight
+        # copies and skip the standard shuffle so both layouts are not retained.
         layer.w13_weight.data = torch.empty(
             0, dtype=layer.w13_weight.dtype, device=layer.w13_weight.device
         )
@@ -2744,12 +2750,7 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
         """Return expert-major views owned by EPLB."""
         views: list[torch.Tensor] = []
         local_num_experts = layer.local_num_experts
-        for name in (
-            "_mega_w1",
-            "_mega_w1_scale",
-            "_mega_w2",
-            "_mega_w2_scale",
-        ):
+        for name in self._weight_names:
             tensor = getattr(layer, name, None)
             if not isinstance(tensor, torch.Tensor):
                 raise TypeError(f"MegaMoE weight {name!r} was not prepared")
@@ -2764,7 +2765,7 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
         return views
 
 
-class MegaInternodeMxfp4MoEMethod(Mxfp4MoEMethod):
+class MegaInternodeMxfp4MoEMethod(MegaMxfp4MoEMethod):
     """MXFP4 routed experts backed by the two-node EP16 A4W4 pipeline."""
 
     def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
@@ -2786,16 +2787,16 @@ class MegaInternodeMxfp4MoEMethod(Mxfp4MoEMethod):
                 "ATOM_DISABLE_MORI_EP"
             )
         super().__init__(quant_config, moe)
-        self.use_triton = False
         self.use_triton_ep = False
-        self.use_triton_decode = False
         if self.fp8_activations:
             raise ValueError(
                 "internode MegaMoE uses A4W4; set ATOM_DSV41_MOE_FP8_ACTIVATIONS=0 "
                 "for DSv4.1"
             )
 
-    def _process_weight_layout_after_loading(self, layer) -> None:
+    _weight_names = ("_mi_w1", "_mi_w1_scale", "_mi_w2", "_mi_w2_scale")
+
+    def _build_weights(self, layer) -> None:
         from atom.model_ops.fused_moe.megamoe_internode_experts import (
             build_internode_weights,
         )
@@ -2805,10 +2806,10 @@ class MegaInternodeMxfp4MoEMethod(Mxfp4MoEMethod):
                 "internode MegaMoE does not support expert biases"
             )
         build_internode_weights(layer)
-        for name in ("w13_weight", "w2_weight"):
+        # The raw scales are rebuilt into the op's layouts as well.
+        for name in ("w13_weight_scale", "w2_weight_scale"):
             tensor = getattr(layer, name)
             tensor.data = torch.empty(0, dtype=tensor.dtype, device=tensor.device)
-        logger.info("Prepared MegaMoEInternode A4W4 weights for fused MoE layer")
 
     def init_prepare_finalize(self, layer: torch.nn.Module):
         from atom.model_ops.fused_moe.megamoe_internode_experts import (
@@ -2823,18 +2824,6 @@ class MegaInternodeMxfp4MoEMethod(Mxfp4MoEMethod):
             max_tokens=self.moe.max_num_tokens,
         )
         self.routed_rows_wire = None
-
-    def get_eplb_weight_views(self, layer: torch.nn.Module) -> list[torch.Tensor]:
-        local_experts = layer.local_num_experts
-        views = []
-        for name in ("_mi_w1", "_mi_w1_scale", "_mi_w2", "_mi_w2_scale"):
-            tensor = getattr(layer, name)
-            if not tensor.is_contiguous() or tensor.numel() % local_experts:
-                raise RuntimeError(
-                    f"internode MegaMoE weight {name} is not expert-major"
-                )
-            views.append(tensor.view(local_experts, -1))
-        return views
 
 
 def _make_mxfp4_moe_method(
