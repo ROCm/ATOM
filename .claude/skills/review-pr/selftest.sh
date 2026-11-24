@@ -512,9 +512,11 @@ t "an A5: card against an A5 FIRE is refused for the id, not for tracing" \
   "$(_card_kinds "$_CARD_ID" "$_V_PATH" "$_DIFF")" "RULE-CODE-IN-CARD"
 t "the same card without the id traces by path" \
   "$(_card_kinds "$_CARD_PATH" "$_V_PATH" "$_DIFF")" ""
-# Eleven of the 54 ids are also this codebase's vocabulary: B1..B7 are the KV-offload
-# chunk groups, C1/C2 the MTP4 rows, C3/C4 deepseek_v4's capture topology. No shape
-# separates `B1` the rule from `B1` the chunk group, so the diff decides. Refusing a
+# Nineteen of the 54 ids also appear under atom/ or docs/ as ordinary words: B1..B7 are
+# the KV-offload chunk groups, C1..C3 the MTP4 rows and deepseek_v4's capture topology,
+# and D6, D10, E1, E2, G1, G2, H2, I1 and N1 the rest. (C4 belongs to that topology too
+# and is not an id at all.) The count is what the tree says today, not a constant. No
+# shape separates `B1` the rule from `B1` the chunk group, so the diff decides. Refusing a
 # lawful finding is fatal -- the way out is an untrue `-- not reported:` -- while
 # shipping an id-led line is cosmetic, so a word the PR uses itself is not read as an id.
 _DIFF_B1='diff --git a/atom/kv_transfer/offload/README.md b/atom/kv_transfer/offload/README.md
@@ -679,10 +681,11 @@ forms = ["**[verified] B1:** x", "**[verified]** B1: x", "`[verified]` B1: x",
          "B1+D4:", "B1 FIRE:", "`foo.py:3`: A5: broken",
          "foo.py:3 A5: broken", "foo.py:3 (A5)", "[verified, A5] broken",
          "atom/foo.py:563-569 A5: broken", "`atom/foo.py:563`, A5: broken",
-         "foo.py:563 — A5: broken"]
+         "foo.py:563 — A5: broken", "foo.py:3. A5: guard missing",
+         "foo.py:3 - A5: broken"]
 print(sum(1 for f in forms if triage._rule_head(f)))' "$S"
 }
-t "a rule id hidden behind decoration or a citation is still refused" "$(_head_forms)" "25"
+t "a rule id hidden behind decoration or a citation is still refused" "$(_head_forms)" "27"
 _head_passes() {  # -> how many ordinary openings are left alone
   python3 -c '
 import sys; sys.path.insert(0, sys.argv[1]); import triage
@@ -705,10 +708,13 @@ forms = ["FP8: x", "MI300: x", "[verified] x.py:1 drops it", "The caller must ho
          # cosmetic, so the cosmetic one is the one left open.
          "kv_transfer/offload/README.md:1084, B1-B2 stage before B3-B4",
          "glm52/mono/kernels/op.py:131 — C1/C2 rows for MTP4 are swapped",
-         "mono/session.py:1527 C3 buffers are updated under the C4 capture key"]
+         "mono/session.py:1527 C3 buffers are updated under the C4 capture key",
+         # the same two separators, with no colon after them: nothing lawful is lost
+         "README.md:1084. B1-B2 stage before B3-B4",
+         "README.md:1084 - B1-B2 stage before B3-B4"]
 print(sum(1 for f in forms if triage._rule_head(f) is None))' "$S"
 }
-t "and an ordinary opening is left alone" "$(_head_passes)" "12"
+t "and an ordinary opening is left alone" "$(_head_passes)" "14"
 # One shared 4-letter word was far too loose. SKILL.md mandates "**Author must**" on
 # every finding, so `must` alone let any finding claim any path-less FIRE whose reason
 # used it -- silencing the UNREPORTED-FIRE that should have fired for the other rule.

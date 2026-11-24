@@ -2959,7 +2959,14 @@ def _rule_head(text, vocab=frozenset()):
             # `(?:-\d+)?` and `[,:]`, so `foo.py:563-569 A5: …` still reached the reader
             # as `A5: …` -- the id-led line this gate exists to refuse. Range citations
             # are common; real bot cards carry 74 of them.
-            rest = re.sub(r"^(?:-\d+)?[\s*`_]*(?:[,:]|—|–|--)?\s*", "",
+            # The separator class is every punctuation a citation is written against,
+            # not only the ones first_clause names: `foo.py:3. A5: guard missing` and
+            # `foo.py:3 - A5: broken` reached the reader id-led the same way. Closing
+            # them refuses nothing lawful, because what follows the strip still has to
+            # be the colon form -- `README.md:1084. B1-B2 stage before B3-B4` has no
+            # colon and passes. `--` precedes `-` in the alternation so the long form
+            # wins, and a line range is already eaten by `(?:-\d+)?` before any of it.
+            rest = re.sub(r"^(?:-\d+)?[\s*`_]*(?:[,:.]|—|–|--|-)?\s*", "",
                           rest[citation.end():])
             cited = True
             continue
