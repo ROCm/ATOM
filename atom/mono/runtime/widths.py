@@ -12,6 +12,10 @@ from atom.mono.runtime.consensus import MonoUnsupported
 
 logger = logging.getLogger("atom")
 
+# ``lean`` rebuilds a width at most this many times (each one steps every
+# spilled build down its own, finite, chain of leaner builds)
+_MAX_LEAN_ROUNDS = 8
+
 
 class WidthBuilds:
     """``build(width)`` on a width's first step, its kernels (``kernels(built)``:
@@ -29,7 +33,9 @@ class WidthBuilds:
     resident CTAs then waiting for ever on the rest. ``lean(built, spilled)``,
     when given, first rebuilds the kernels whose launchers spilled with fewer
     registers (a build returned with those swapped, or None when it has none
-    leaner), every rank together: the width is refused only if those spill too."""
+    leaner), every rank together, again while the rebuild still spills and
+    ``lean`` returns a different build: the width is refused only when nothing
+    leaner is left."""
 
     def __init__(self, build, kernels, group, what: str, lean=None) -> None:
         self._build, self._kernels, self._lean = build, kernels, lean
@@ -54,17 +60,22 @@ class WidthBuilds:
         spilled = [launcher for launcher, n in scratch.items() if n]
         # any rank's spill sends every rank through the lean rebuild together,
         # if every rank has a leaner build (``lean`` None: nothing to swap),
-        # each leaving out the kernels any rank's spilled: one structure
-        if self._lean is not None and not group_agree(not spilled, self._group):
+        # each leaving out the kernels any rank's spilled: one structure;
+        # again while a rebuild still spills and ``lean`` has a leaner one
+        for _ in range(_MAX_LEAN_ROUNDS):
+            if self._lean is None or group_agree(not spilled, self._group):
+                break
             spilled = self._spilled_anywhere(scratch)
             lean = self._lean(built, spilled)
-            if group_agree(lean is not None, self._group):
-                logger.info(
-                    "%s: %s need scratch, rebuilt lean",
-                    self._what,
-                    ", ".join(sorted({n for f in spilled for n in kernel_names(f)})),
-                )
-                built, scratch = self._compiled(width, lambda: lean)
+            if not group_agree(lean is not None and lean != built, self._group):
+                break
+            logger.info(
+                "%s: %s need scratch, rebuilt lean",
+                self._what,
+                ", ".join(sorted({n for f in spilled for n in kernel_names(f)})),
+            )
+            built, scratch = self._compiled(width, lambda lean=lean: lean)
+            spilled = [launcher for launcher, n in scratch.items() if n]
         if built is not None and not self._scratch_free(scratch):
             built = None
         if not group_agree(built is not None, self._group):

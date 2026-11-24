@@ -70,6 +70,17 @@ def _preload_mode() -> str:
     )
 
 
+def _strict_flag_env(name: str, default: bool) -> bool:
+    """``0`` or ``1`` (stripped; unset or empty reads as ``default``); anything
+    else raises, so a typo fails the load instead of reading as either."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    if raw not in ("0", "1"):
+        raise ValueError(f"{name} must be 0 or 1, got {raw!r}")
+    return raw == "1"
+
+
 def _profiler_detail_env(name: str) -> bool:
     # Unset or empty falls back to ATOM_PROFILER_MORE, so the per-option flag
     # always wins when given and ATOM_PROFILER_MORE=1 alone still enables all.
@@ -703,6 +714,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # checked by atom/mono/polling.py at import, which needs no ATOM import; 1
     # restores the pre-backoff polling (ROCm/ATOM#3369).
     "ATOM_MONO_POLL_SLEEP_UNITS": lambda: os.getenv("ATOM_MONO_POLL_SLEEP_UNITS"),
+    # Kimi-K3 mono: on each full-attention (MLA) layer that runs K2, the v-up
+    # BMM, g_proj, sigmoid and mul become K2's first stage (kernels/stages/
+    # mla_post.py) instead of four kernels between the MLA decode and K2. Needs
+    # g_proj and kv_b_proj in the FP8 online quant (they are in the recipe).
+    # Not bit-identical to the four kernels (GEMM summation order). On by
+    # default; 0 turns it off. Anything but 0 / 1 raises.
+    "ATOM_MONO_MLA_POST": lambda: _strict_flag_env("ATOM_MONO_MLA_POST", True),
+    # Kimi-K3 mono: the NEXT MLA layer's prep as tail stages of the preceding
+    # layer's K2 (kernels/stages/mla_prep.py: the attention seam + per-token
+    # FP8 quant (P0) and the fused q_a / kv_a projection (P1);
+    # kernels/stages/mla_prep_qkv.py: its two RMSNorms (P2), q_b, the absorb
+    # BMM, rope and the FP8 KV-cache write (P3 .. P5)). Not bit-identical
+    # (row-reduction / GEMM order). On by default; 0 turns it off. Anything but
+    # 0 / 1 raises.
+    "ATOM_MONO_MLA_PREP": lambda: _strict_flag_env("ATOM_MONO_MLA_PREP", True),
     # DeepSeek-V4.1: how many of an attention layer's branches leave the main
     # stream. 0 none; 1 the compressor, on the MoE's `alt_stream`, waited at
     # the scorer that first reads it; 2 the indexer as well, on one of its own.

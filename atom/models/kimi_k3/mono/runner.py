@@ -51,6 +51,7 @@ from atom.models.kimi_k3.mono.config import (
     layer_block,
     num_blocks,
 )
+from atom.models.kimi_k3.mono.folds import MlaFolds
 from atom.models.kimi_k3.mono.kernels import layer as k2
 from atom.models.kimi_k3.mono.kernels.attention import kda as k1
 from atom.models.kimi_k3.mono.kernels.stages import moe as k2b
@@ -111,7 +112,7 @@ class WidthBuild:
         ix = [] if self.indexer is None else [(self.indexer, kix.ABI)]
         return (
             [(f, k1.ABI) for f in self.k1_launchers.values()]
-            + [(f, k2.ABI) for f in self.k2_launchers.values()]
+            + [(f, k2.abi_for(key)) for key, f in self.k2_launchers.items()]
             + ix
         )
 
@@ -124,20 +125,67 @@ def ix_peer_offset(max_rows: int) -> int:
     return -(-k2.peer_bytes(max_rows) // 256) * 256
 
 
+def _next_fold_build(key: "k2.K2Build") -> "k2.K2Build":
+    """The build a fold build that needs scratch is rebuilt as: the next of
+    ``k2.FOLD_SCHEDULERS``, then its layer's default build. The scheduler
+    steps work around an LLVM bug (an orphaned SGPR spill slot).
+    Tracked in: https://github.com/llvm/llvm-project/issues/242766
+    They can go once the LLVM that FlyDSL ships has the fix; the default build
+    stays the last step."""
+    order = ("", *k2.FOLD_SCHEDULERS)
+    at = order.index(key.sched)
+    if at + 1 < len(order):
+        return replace(key, sched=order[at + 1])
+    return k2.unfolded(key)
+
+
 def _lean_width(built: WidthBuild, spilled: list) -> WidthBuild | None:
     """``built`` with each K1 build whose launcher spilled staged a column group
     a GEMV unit (``KdaPreBuild.gemv_unit``): half the weights in flight, slower
-    where ``kda.gemv_staging`` keeps two groups, so only where those do not fit.
-    None when no spilled launcher is such a K1 build (a K2 or indexer spill, or
-    a K1 at one group a unit already): there is nothing leaner to build."""
+    where ``kda.gemv_staging`` keeps two groups, so only where those do not fit;
+    and each K2 build with the MLA post / prep folds whose launcher spilled
+    rebuilt one step down ``_next_fold_build``: under another LLVM scheduler,
+    and past the last of those as its layer's default build (``k2.unfolded``),
+    where that layer runs its attention tail / seam unfolded at this width (the
+    forward follows the width's K2 keys) and the width stays mono. The fold
+    builds sit at K2's register limit, where the backend can leave an
+    unreferenced SGPR spill slot (a private segment, never accessed) that the
+    scratch guard refuses (``k2.FOLD_SCHEDULERS``). ``WidthBuilds.prepare``
+    calls this again while a rebuild still spills.
+    None when no spilled launcher is such a K1 or K2 build (a default K2 or
+    indexer spill, or a K1 at one group a unit already): there is nothing
+    leaner to build."""
     lean = {
         key: replace(key, gemv_unit=1)
         for key, launcher in built.k1_launchers.items()
         if launcher in spilled and key.gemv_unit > 1
     }
-    if not lean:
+    plain = {
+        key: _next_fold_build(key)
+        for key, launcher in built.k2_launchers.items()
+        if launcher in spilled
+        and isinstance(key, k2.K2Build)
+        and (key.mla_post or key.mla_prep)
+    }
+    if not lean and not plain:
         return None
+    for sched in (*k2.FOLD_SCHEDULERS, ""):
+        moved = {key for key, new in plain.items() if new.sched == sched}
+        if not moved:
+            continue
+        logger.info(
+            "Kimi-K3 mono: %d-row K2 of layers %s %s (their fold builds need"
+            " scratch)",
+            next(iter(moved)).tokens,
+            sorted(layer for layer, key in built.k2_keys.items() if key in moved),
+            (
+                f"rebuilt with amdgpu-sched-strategy={sched}"
+                if sched
+                else "without the MLA folds"
+            ),
+        )
     k1_keys = {layer: lean.get(key, key) for layer, key in built.k1_keys.items()}
+    k2_keys = {layer: plain.get(key, key) for layer, key in built.k2_keys.items()}
     return replace(
         built,
         k1_keys=k1_keys,
@@ -145,12 +193,18 @@ def _lean_width(built: WidthBuild, spilled: list) -> WidthBuild | None:
             key: k1.build(key) if key in lean.values() else built.k1_launchers[key]
             for key in set(k1_keys.values())
         },
+        k2_keys=k2_keys,
+        k2_launchers={
+            key: built.k2_launchers.get(key) or k2.build(key)
+            for key in set(k2_keys.values())
+        },
     )
 
 
-class K3MonoDecodeRunner:
+class K3MonoDecodeRunner(MlaFolds):
     """Binds every rank's weights and buffers, or none: a rank that cannot is a
-    refusal every rank agrees on before anything collective."""
+    refusal every rank agrees on before anything collective. The MLA post /
+    prep folds' host side is ``folds.MlaFolds``."""
 
     max_rows = MAX_ROWS
 
@@ -218,6 +272,9 @@ class K3MonoDecodeRunner:
         except MonoUnsupported as why:
             logger.info("mono DSA indexer off: %s", why)
             self.ix = None
+        # before ``_allocate``: an ``mla_post`` K2 key adds scratch (its pairs)
+        self._bind_mla_post()
+        self._bind_mla_prep()
         self._allocate()
 
     def _state_len(self) -> int:
@@ -417,6 +474,7 @@ class K3MonoDecodeRunner:
                 out_eps=p.moe.seam.out_eps,
                 ln_eps=p.moe.ln_eps,
                 diag=self.debug,
+                **self._fold_key(p.layer_id, rows),
             )
             for p in self.plans
             if p.moe is not None
@@ -464,12 +522,24 @@ class K3MonoDecodeRunner:
         serving = (
             nullcontext() if self.ix is None else self.ix.hook.serving(build.indexer)
         )
+        self._fold_step(positions)
+        # the production prefix's pool block (``_seam_mirror``), released where
+        # the production prefix is: when a later layer returns a new prefix
+        hold = None
         with serving:
             for plan in self.plans:
-                prefix, add, add2 = self._layer(
+                res = self._layer(
                     build, plan, positions, prefix, blocks, add, add2, metadata
                 )
+                if self._pref_hold_next is not None or res[0] is not prefix:
+                    # a folded seam's mirror block replaces the held one, and any
+                    # other new prefix releases it, as production releases its
+                    # previous prefix there
+                    hold, self._pref_hold_next = self._pref_hold_next, None
+                prefix, add, add2 = res
+                del res
         hidden, _ = self.inner.output_attn_res(prefix, blocks, add, add2)
+        del hold
         self._raise_on_given_up_waits(rows)
         return hidden
 
@@ -507,7 +577,16 @@ class K3MonoDecodeRunner:
                     f"an {rows}-row step"
                 )
         else:
-            if plan.ffn_only:
+            post = keep = None
+            if (
+                plan.ffn_only
+                and plan.layer_id in self.mla_post
+                and build.k2_keys[plan.layer_id].mla_post
+            ):
+                core, prefix, post, keep = self._post_core(
+                    plan, positions, prefix, blocks, add, add2
+                )
+            elif plan.ffn_only:
                 core, prefix = self._pre_o_core(
                     plan, positions, prefix, blocks, add, add2
                 )
@@ -516,7 +595,11 @@ class K3MonoDecodeRunner:
                 core = self._k1(build, plan, prefix, delta, blocks, metadata)
             # K2 updates ``prefix`` in place: on a block-write layer it restarts
             # it at the all-reduced o_proj output, which K1 has already banked
-            out = (prefix, self._k2(build, plan, core, prefix, blocks), None)
+            k2_args = (build, plan, core, prefix, blocks)
+            ffn = self._k2(*k2_args) if post is None else self._k2(*k2_args, post)
+            out = (prefix, ffn, None)
+            # ``keep`` holds what the launch was handed pointers to until now
+            del keep
         self._write_aux(plan.layer_id, out, blocks)
         return out
 
@@ -529,8 +612,14 @@ class K3MonoDecodeRunner:
         seam's ``prefix`` is a fresh tensor (the previous layer always hands an
         FFN output, so it takes the ``add`` branch), which K2 updates in place
         exactly as it does on a KDA layer."""
-        layer, normed, prefix, _, _ = self._seam(plan, prefix, blocks, add, add2)
-        core = layer.self_attn.forward_pre_o(positions, normed)
+        # the mirror lives as long as the production ``normed``
+        layer, normed, prefix, _mirror, q_out = self._prepped_seam(
+            plan, prefix, blocks, add, add2
+        )
+        if q_out is not None:
+            core = layer.self_attn.forward_prepped(*normed, q_out)
+        else:
+            core = layer.self_attn.forward_pre_o(positions, normed)
         rows = prefix.size(0)
         if (
             core.dim() != 2
@@ -675,12 +764,14 @@ class K3MonoDecodeRunner:
             self._replay_tables[layer_id] = (table, ptrs)
         return table.data_ptr()
 
-    def _k2(self, build, plan, core, prefix, blocks) -> torch.Tensor:
+    def _k2(self, build, plan, core, prefix, blocks, post=None) -> torch.Tensor:
+        """``post`` (an ``mla_post`` build): the post stage's arguments, ``core``
+        then being the buffer the stage writes and o_proj reads."""
         w = plan.moe
         key = build.k2_keys[plan.layer_id]
         out = torch.empty_like(prefix)
         p = torch.Tensor.data_ptr
-        args = k2.ABI.pack({
+        args = k2.abi_for(key).pack({
             "core": p(core), "w_o": p(w.w_o), "prefix": p(prefix),
             "blocks": p(blocks), "blk_sm": blocks.stride(0),
             "blk_sr": blocks.stride(1), "ares_nw": p(w.seam.nw),
@@ -699,6 +790,7 @@ class K3MonoDecodeRunner:
             # a block-write layer's MLP seam restarts its prefix
             "reset": int(plan.moe.write_idx >= 0),
             "diag": self._diag_ptr(), "tl": 0,
+            **self._fold_args(key, plan.layer_id, prefix, post),
         })  # fmt: skip
         _run_compiled(build.k2_launchers[key], *args, torch.cuda.current_stream())
         return out

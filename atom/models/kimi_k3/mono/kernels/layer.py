@@ -27,11 +27,11 @@ shared gate/up GEMVs issue their weights before they first wait.
                      lnorm (56 .. 83), up (0 .. 55), reduce (200 .. 255)
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import const_expr, range_constexpr
+from flydsl.expr import const_expr
 from flydsl.expr.typing import Int32, Int64
 
 from atom.models.kimi_k3.mono.kernels.attention import back as k2a
@@ -39,17 +39,24 @@ from atom.models.kimi_k3.mono.kernels.attention.kda import (
     _SOURCES,
     COLS,
     HIDDEN,
+    LDS_LIMIT,
     NA,
     TG,
     groups,
-    slice_compute,
-    slice_loads,
-    stage_gate,
-    stage_mix,
 )
+from atom.models.kimi_k3.mono.kernels.layer_stages import (
+    O0,
+    oproj,
+    stage_attnres,
+    stage_attnres_far,
+    stage_routes,
+)
+from atom.models.kimi_k3.mono.kernels.stages import mla_post as mp
+from atom.models.kimi_k3.mono.kernels.stages import mla_prep as pr
+from atom.models.kimi_k3.mono.kernels.stages import mla_prep_qkv as pq
 from atom.models.kimi_k3.mono.kernels.stages import moe as k2b
 from atom.mono.device import gemv
-from atom.mono.device.ops import kernel_symbol, load_ptr64, traced
+from atom.mono.device.ops import kernel_symbol, lds_bytes, load_ptr64, traced
 from atom.mono.device.ranks import peer_bases
 from atom.mono.device.stamps import stamp, stamp_begin, stamp_flush
 from atom.mono.device.sync import Mailbox, preg, sreg
@@ -60,18 +67,6 @@ from atom.mono.plan.trace import enter_stage
 from atom.mono.runtime.abi import KernelAbi
 from atom.mono.runtime.debug import region_ids
 
-O0 = NA  # the CTAs past AttnRes's: o_proj's first round, then the early GEMVs
-OTASKS = k2a.OTASKS  # 448
-O_ROUNDS = (OTASKS + BLOCKS - 1) // BLOCKS  # 2: every CTA takes o_proj tasks
-
-
-def o_slot(bid):
-    """CTA bid's first o_proj task: CTAs O0 .. take 0 .., the AttnRes CTAs the
-    last 56 slots, whose second task is past OTASKS (one task each: their
-    reduce waits on the slowest partial)."""
-    return (bid + BLOCKS - O0) % BLOCKS
-
-
 E0 = 160  # router / latent CTAs (their weights in flight under their o_proj)
 # timeline points: 0 start, 1 o_proj done / AR reduced, 2 early done / slice,
 # 3 ug, 4 down/sdown, 5 lnorm, 6 up, 7 reduce, 8 gate, 9 mix (x published),
@@ -81,7 +76,9 @@ TL_POINTS = 18  # + 14 route's logits polled, 15 lnorm's latent sums in, 16 down
 
 assert E0 + k2b.R_TASKS + k2b.L_TASKS <= BLOCKS and k2b.G_TASKS <= E0 - O0
 
-REGIONS = ("part", "wgt", "msq", "xrdy", "ar", "dg") + k2b.REGIONS
+REGIONS = (
+    ("part", "wgt", "msq", "xrdy", "ar", "dg") + k2b.REGIONS + mp.REGIONS + pr.REGIONS
+)
 
 _STREAM = fx.Stream(None)
 
@@ -99,6 +96,29 @@ class K2Build:
     reduce: bool = field(default=True, metadata={"sym": "r"})
     diag: bool = field(default=False, metadata={"sym": "g"})
     timeline: bool = field(default=False, metadata={"sym": "t"})
+    # ``ATOM_MONO_MLA_POST``: an MLA layer's v-up, g_proj and sigmoid * mul as
+    # this launch's first stage (``stages.mla_post``); in the symbol only when
+    # set, so the default build's symbol is unchanged
+    mla_post: bool = False
+    # ``ATOM_MONO_MLA_PREP``: the NEXT (MLA) layer's prep as this launch's tail
+    # stages (``stages.mla_prep``: its attention seam, P0; the q_a / kv_a GEMV
+    # and RMSNorms, P1 / P2; q_b, the absorb, rope and the FP8 KV-cache write,
+    # P3 .. P5), on a seam of ``prep_nblocks`` blocks; in the symbol only when
+    # set
+    mla_prep: bool = False
+    prep_nblocks: int = 0
+    prep_eps: float = 1e-6
+    prep_out_eps: float = 1e-6
+    qa_eps: float = 1e-6  # q_a_layernorm
+    kva_eps: float = 1e-6  # kv_a_layernorm
+    # the MLA layer's rotary module (neox style; cos / sin rows)
+    rope_neox: bool = True
+    rope_maxpos: int = 1
+    # a fold build's LLVM machine scheduler (``amdgpu-sched-strategy``, one of
+    # ``FOLD_SCHEDULERS``), "" for LLVM's default. Set only by the width guard's
+    # lean rebuild (``runner._lean_width``) when the default build needs
+    # scratch; in the symbol only when set
+    sched: str = ""
 
 
 ABI = KernelAbi(
@@ -137,6 +157,52 @@ ABI = KernelAbi(
         "tl",
     )
 )
+# an ``mla_post`` build: the stage's inputs past K2's own
+ABI_POST = KernelAbi(ABI.names + mp.ARGS)
+# an ``mla_prep`` build: the post stage's (0 unless the key is also
+# ``mla_post``), then the prep stages'
+ABI_PREP = KernelAbi(ABI_POST.names + pr.ARGS)
+
+
+def abi_for(key: K2Build) -> KernelAbi:
+    if key.mla_prep:
+        return ABI_PREP
+    return ABI_POST if key.mla_post else ABI
+
+
+# the fields only the MLA post / prep folds read
+FOLD_FIELDS = (
+    "mla_post",
+    "mla_prep",
+    "prep_nblocks",
+    "prep_eps",
+    "prep_out_eps",
+    "qa_eps",
+    "kva_eps",
+    "rope_neox",
+    "rope_maxpos",
+    "sched",
+)
+
+# The schedulers a fold build that needs scratch is rebuilt with, in order,
+# before its layer falls back to the default build. Near K2's register limit
+# the allocator can rematerialize every reload of a spilled SGPR value (a
+# kernel-argument load) and leave its spill slot unreferenced; SILowerSGPRSpills
+# frees only the slots it moved to VGPR lanes, so the orphan, and the emergency
+# slot frame finalization adds for it, become a private segment no instruction
+# touches, which the scratch guard refuses all the same. Another schedule
+# changes which values the allocator spills; the computation is the same.
+# Tracked in: https://github.com/llvm/llvm-project/issues/242766
+# This retry chain (and ``K2Build.sched``) can go once the LLVM that FlyDSL
+# ships has the fix.
+FOLD_SCHEDULERS = ("iterative-ilp", "iterative-minreg")
+
+
+def unfolded(key: K2Build) -> K2Build:
+    """``key`` without the MLA post / prep folds: the default build of its
+    layer (the same key, so the same launcher and code object)."""
+    fields = K2Build.__dataclass_fields__
+    return replace(key, **{name: fields[name].default for name in FOLD_FIELDS})
 
 
 def peer_layout(s):
@@ -158,6 +224,13 @@ def scratch_layout(key: K2Build) -> dict:
     lay = dict(a)
     for name, (o, n) in b.items():
         lay[name] = ((end + 15) // 16 * 16 + o, n)
+    if key.mla_post:
+        end = max(o + n for o, n in lay.values())
+        lay.update(pair_layout(mp.scratch_pairs().items(), start=end))
+    if key.mla_prep:
+        end = max(o + n for o, n in lay.values())
+        pairs = pr.scratch_pairs(s, key.prep_nblocks + 1)
+        lay.update(pair_layout(pairs.items(), start=end))
     return lay
 
 
@@ -179,68 +252,264 @@ def plain_bytes(key: K2Build) -> int:
 
 
 @traced
-def stage_oproj(c, gi):
-    """o_proj tasks gi, gi + 256 (< 448): every task's weights in flight at
-    once (one memory latency, not two), then the MFMAs, a token group's core
-    rows at a time. A CTA with one task loads its own slab again for the
-    round it skips (cache hits), not task 447's on 64 CTAs at once."""
-    # K2's bf16 GEMV weights (here, the MoE's early / shared down / up) a load
-    # two slabs of 8 rows (``gemv.chunk_ops`` paired)
-    ops = [
-        k2a.o_loads(c, k2a.o_task_or(gi, gi + BLOCKS * j), paired=True)
-        for j in range(O_ROUNDS)
-    ]
-    for g in range_constexpr(c["G"]):
-        # ``stage_o`` ends at a barrier: the previous group's core rows are read
-        cg = k2a.group_view(c, g)
-        k2a.load_core(cg)
-        for j in range_constexpr(O_ROUNDS):
-            t = gi + BLOCKS * j
-            if t < OTASKS:
-                k2a.stage_o(cg, t, ops[j])
-
-
-@traced
-def stage_attnres(c, task, g, on, tls):
-    """Task ``task`` (< NA) of token group g's AttnRes seam: the reduced o_proj
-    -> slice -> gate (tasks 0 .. 15) -> mix -> x rows, XRDY. Group g runs on
-    CTAs 56 g ..: the groups' hand-off chains side by side."""
-    cg = k2a.group_view(c, g)
-    enter_stage("k2.ar")
-    # the slice's sources and weights in flight across the reduce's wait
-    sld = slice_loads(cg, task)
-    k2a.stage_reduce(cg, task)
-    stamp(on, tls, c["tid"], 1)
-    enter_stage("k2.slice")
-    slice_compute(cg, task, sld)
-    stamp(on, tls, c["tid"], 2)
-    enter_stage("k2.gate")
-    if task < cg["S"]:
-        stage_gate(cg, task)
-    stamp(on, tls, c["tid"], 8)
-    enter_stage("k2.mix")
-    stage_mix(cg, task)
-    stamp(on, tls, c["tid"], 9)
-
-
-@traced
-def stage_attnres_far(c, bid, on, tls):
-    """CTA bid's AttnRes task of the groups past the first (CTAs 56 .., after
-    their o_proj, before their early GEMV: that waits for every group's x)."""
-    for g in range_constexpr(1, c["G"]):
-        if (bid >= NA * g) & (bid < NA * (g + 1)):
-            stage_attnres(c, bid - NA * g, g, on, tls)
-
-
-@traced
-def stage_routes(c, bid):
-    """CTA bid (< NA) after the AttnRes seam: route tokens bid, bid + 56, .."""
-    s = c["S"]
-    enter_stage("k2.route")
-    for i in range_constexpr(-(-s // NA)):
-        if bid + NA * i < s:
-            k2b.stage_route(c, bid + NA * i)
-    stamp(c["tl_on"], c["tls"], c["tid"], 10)
+def _body(
+    bk,
+    core: Int64,
+    w_o: Int64,
+    prefix: Int64,
+    blocks: Int64,
+    blk_sm: Int32,
+    blk_sr: Int32,
+    ares_nw: Int64,
+    ares_qk: Int64,
+    in_nw: Int64,
+    w_gate: Int64,
+    bias: Int64,
+    w_ld: Int64,
+    w_sgu: Int64,
+    w_sd: Int64,
+    w13: Int64,
+    w13s: Int64,
+    w2: Int64,
+    w2s: Int64,
+    ln_w: Int64,
+    w_up: Int64,
+    out: Int64,
+    scratch: Int64,
+    plain: Int64,
+    queue: Int64,
+    peers: Int64,
+    rank: Int32,
+    layer: Int32,
+    reset: Int32,
+    diag: Int64,
+    tl: Int64,
+    ext=None,
+):
+    """K2's kernel body, given ``build``'s constants ``bk`` and the kernel's
+    arguments; ``ext``: the MLA post / prep stages' (an ``mla_post`` /
+    ``mla_prep`` build's kernel)."""
+    key, s, G, ns = bk["key"], bk["s"], bk["G"], bk["ns"]
+    lay, plain_lay, play = bk["lay"], bk["plain_lay"], bk["play"]
+    Smem, RouteLds, StageLds = bk["Smem"], bk["RouteLds"], bk["StageLds"]
+    post_slabs = bk["post_slabs"]
+    tid = fx.thread_idx.x
+    bid = fx.block_idx.x
+    alloc = fx.SharedAllocator()
+    lds = alloc.allocate(Smem).peek()
+    rl = alloc.allocate(RouteLds).peek()
+    st = alloc.allocate(StageLds)
+    el, al, ul, dl = st.early.peek(), st.attn.peek(), st.ug.peek(), st.down.peek()
+    rsel = st.rsel.peek()
+    # ``layer`` is this launch's slot of the step; the step's first kernel
+    # finds every pair zeroed and peer-fenced
+    if const_expr(key.diag):
+        mb = Mailbox(layer, diag, region_ids(REGIONS))
+    else:
+        mb = Mailbox(layer)
+    bases = peer_bases(peers, TP_)
+    own = load_ptr64(peers, rank)
+    peer = {}
+    for region in k2b.PEER_REGIONS + ("ar", "dg"):
+        off = play[region][0]
+        peer[region] = [preg(b, off, region) for b in bases]
+        peer[region + "_own"] = preg(own, off, region)
+    c = {
+        "S": s,
+        "G": G,
+        "NS": ns,
+        "NB": key.nblocks,
+        "tid": tid,
+        "bid": bid,
+        "lane": tid % 64,
+        "wave": tid // 64,
+        "rank": rank,
+        "delta": True,
+        "reset": reset,
+        "debug": False,
+        "eps": key.eps,
+        "out_eps": key.out_eps,
+        "ln_eps": key.ln_eps,
+        "put": mb.put,
+        "put_bf": mb.put_bf,
+        "put_words": mb.put_words,
+        "poll": mb.poll,
+        "queue": queue,
+        "red": lds.red.ptr,
+        "peer": peer,
+        "ar_peer": peer["ar"],
+        "ar_own": peer["ar_own"],
+        "dg_peer": peer["dg"],
+        "dg_own": peer["dg_own"],
+        "xl": el.xl.ptr,
+        "rcand": rsel.cand.ptr,
+        "rsig": rsel.sig.ptr,
+        "vals": al.vals.ptr,
+        "delta_lds": al.dl.ptr,
+        "latq": ul.latq.ptr,
+        "latsc": ul.latsc.ptr,
+        "av": ul.av.ptr,
+        "contrib": dl.contrib.ptr,
+        "scan": rl.scan.ptr,
+        "rt": k2b.route_table(rl, st.rmask.peek()),
+        "xbuf": plain + fx.Int64(plain_lay["xrow"][0]),
+        "xflags": NA * G,
+        "tl_on": key.timeline,
+        "tls": lds.tls.ptr,
+        "inter": plain + fx.Int64(plain_lay["inter"][0]),
+        "isc": plain + fx.Int64(plain_lay["isc"][0]),
+        "ln": plain + fx.Int64(plain_lay["ln"][0]),
+        "shp": plain + fx.Int64(plain_lay["shp"][0]),
+        "args": {
+            "core": core,
+            "w_o": w_o,
+            "prefix": prefix,
+            "blocks": blocks,
+            "blk_sm": blk_sm,
+            "blk_sr": blk_sr,
+            "ares_nw": ares_nw,
+            "ares_qk": ares_qk,
+            "in_nw": in_nw,
+            "x_dbg": 0,
+            "w_gate": w_gate,
+            "bias": bias,
+            "w_ld": w_ld,
+            "w_sgu": w_sgu,
+            "w_sd": w_sd,
+            "w13": w13,
+            "w13s": w13s,
+            "w2": w2,
+            "w2s": w2s,
+            "ln_w": ln_w,
+            "w_up": w_up,
+            "out": out,
+            **({} if ext is None else ext),
+        },
+    }
+    for region in (
+        "part",
+        "wgt",
+        "msq",
+        "xrdy",
+        "sgu",
+        "h",
+        "rpart",
+        "lpart",
+        "route",
+        "ugf",
+        "lmsq",
+        "lnrdy",
+        "shrdy",
+    ):
+        c[region] = sreg(scratch, lay[region][0], region)
+    if const_expr(key.mla_post):
+        c["mpdone"] = sreg(scratch, lay["mpdone"][0], "mpdone")
+        c["post_xl"] = st.post.peek().xq.ptr
+        c["post_slabs"] = post_slabs
+    if const_expr(key.mla_prep):
+        for region in pr.REGIONS:
+            c[region] = sreg(scratch, lay[region][0], region)
+        # P1 stages x8 where the post stage stages g_proj's x
+        c["prep_xl"] = st.post.peek().xq.ptr
+        c["prep_slabs"] = post_slabs
+        c["qa_eps"] = key.qa_eps
+        c["kva_eps"] = key.kva_eps
+        c["rope_neox"] = key.rope_neox
+        c["rope_maxpos"] = key.rope_maxpos
+    on, tls = key.timeline, lds.tls.ptr
+    stamp_begin(on, tls, tid, TL_POINTS)
+    # ---- o_proj on every CTA (``layer_stages.o_slot``)
+    eb = bid - E0
+    lb = eb - k2b.R_TASKS
+    is_r = (bid >= E0) & (eb < k2b.R_TASKS)
+    is_l = (bid >= E0 + k2b.R_TASKS) & (lb < k2b.L_TASKS)
+    # o_proj first (every AttnRes CTA waits on the slowest partial; loads
+    # retire in order), the early weights after: they land before x does
+    if bid >= O0:
+        enter_stage("k2.o")
+        oproj(c, key, bid)
+        stamp(on, tls, tid, 1)
+        stage_attnres_far(c, bid, on, tls)
+    enter_stage("k2.early")
+    if is_r:
+        rops = k2b.early_loads(c, 0, eb // k2b.R_PARTS, eb % k2b.R_PARTS)
+        k2b.early_compute(c, 0, eb // k2b.R_PARTS, eb % k2b.R_PARTS, rops)
+    if is_l:
+        lops = k2b.early_loads(c, 1, lb // k2b.L_PARTS, lb % k2b.L_PARTS)
+        k2b.early_compute(c, 1, lb // k2b.L_PARTS, lb % k2b.L_PARTS, lops)
+    if (bid >= O0) & ~is_r & ~is_l & (bid - O0 < k2b.G_TASKS):
+        gi = bid - O0
+        k2b.early_compute(c, 2, gi, 0, k2b.early_loads(c, 2, gi, 0))
+    # ---- AttnRes: the reduced o_proj -> x; then route
+    if bid < NA:
+        enter_stage("k2.o")
+        oproj(c, key, bid)
+        stage_attnres(c, bid, 0, on, tls)
+        stamp(on, tls, tid, 13)
+        stage_routes(c, bid)
+    if bid >= NA:
+        stamp(on, tls, tid, 2)
+    # ---- the routed experts
+    # the route table first: its bitmaps share LDS with the latent
+    # (``k2b.mask_lds``)
+    enter_stage("k2.ug")
+    nu = k2b.load_route(c)
+    stamp(on, tls, tid, 11)
+    k2b.load_latq(c)
+    stamp(on, tls, tid, 12)
+    k2b.run_ug(c, bid, nu)
+    stamp(on, tls, tid, 3)
+    # the shared SiTU after ug, on the shared down's CTAs: only the shared
+    # down reads it (before ug it held the AttnRes CTAs' ug start back)
+    enter_stage("k2.h")
+    k2b.run_h(c, bid)
+    enter_stage("k2.down")
+    if bid < k2b.DOWN_TASKS:
+        # the first w2 batch in flight before any ug flag is waited for
+        dops = k2b.down_loads(c, bid, nu, fx.min(c["wave"], nu - 1))
+        k2b.stage_down(c, bid, nu, dops)
+        stamp(on, tls, tid, 16)
+    enter_stage("k2.sdown")
+    k2b.run_sdown(c, bid, w_sd)
+    stamp(on, tls, tid, 4)
+    enter_stage("k2.lnorm")
+    if (bid >= k2b.LN0) & (bid < k2b.LN0 + k2b.LN_TASKS):
+        k2b.stage_lnorm(c, bid - k2b.LN0)
+    # a wide step's lnorm tasks' second halves on CTAs 0 .., which wait
+    # for LN anyway (up's)
+    if const_expr(k2b.ln_halves(c["S"]) > 1):  # noqa: SIM102
+        if bid < k2b.LN_TASKS:
+            k2b.stage_lnorm(c, bid, 1)
+    stamp(on, tls, tid, 5)
+    enter_stage("k2.up")
+    k2b.run_up(c, bid)
+    stamp(on, tls, tid, 6)
+    # compile-time gate outside, traced condition inside: `and` does not
+    # combine a Python bool with a traced value
+    enter_stage("k2.final")
+    if const_expr(key.reduce):  # noqa: SIM102
+        if (bid >= k2b.RED0) & (bid < k2b.RED0 + k2b.RED_TASKS):
+            k2b.stage_reduce(c, bid - k2b.RED0)
+    stamp(on, tls, tid, 7)
+    if const_expr(key.mla_prep):
+        # the next (MLA) layer's prep: P0, its attention seam, on the AttnRes
+        # CTAs (which wrote prefix(M-1)'s slices) once FING is in
+        enter_stage("k2.mlaprep")
+        cp = pr.prep_context(c, key.prep_nblocks + 1, key.prep_eps, key.prep_out_eps)
+        if bid < NA:
+            pr.p0_seam(cp, bid)
+        # P1 past the lnorm CTAs, after their own work; P2 on P0's first 2 S
+        # CTAs, after it (it waits on P1, P1 on P0)
+        if (bid >= pr.P1_CTA0) & (bid < pr.P1_CTA0 + pr.P1_TASKS):
+            pr.p1_task(c, bid - pr.P1_CTA0)
+        if bid < 2 * s:
+            pq.p2_norm(c, bid)
+        # P3 on the lnorm CTAs and P1's (after it), P4 past them
+        if (bid >= pr.P3_CTA0) & (bid < pr.P3_CTA0 + pr.P3_TASKS):
+            pq.p3_task(c, bid - pr.P3_CTA0)
+        if bid >= pr.P4_CTA0:
+            pq.p4_task(c, bid - pr.P4_CTA0)
+    stamp_flush(on, tls, tl, tid, bid, TL_POINTS)
 
 
 _BUILDS: dict = {}
@@ -276,22 +545,81 @@ def build(key: K2Build):
         vals: fx.Array[fx.Float32, sg * ns * COLS, 16]
         dl: fx.Array[fx.Float32, sg * COLS, 16]
 
-    @fx.union
-    class StageLds:
-        early: EarlyLds
-        attn: AttnLds
-        ug: k2b.ug_lds(s)
-        down: k2b.down_lds(s)
-        rmask: k2b.mask_lds(s)
-        rsel: k2b.RouteSelLds
-
     @fx.struct
     class Smem:
         red: fx.Array[fx.Float32, WAVES * 64 * 4, 16]
         tls: fx.Array[fx.Int64, TL_POINTS, 16]
 
+    assert not key.sched or key.mla_post or key.mla_prep, "sched is a fold build's"
+    if key.mla_prep:
+        # P2 on P0's first 2 S CTAs
+        assert 2 * s <= NA
+        assert s <= pr.MAX_ROWS, f"MLA prep: {s} rows past {pr.MAX_ROWS}"
+        # P0 stages layer M's sources in this build's ``vals``
+        assert 1 <= key.prep_nblocks < ns, (key.prep_nblocks, ns)
+        assert pr.red_fits(s, key.prep_nblocks + 1)
+    if key.mla_post or key.mla_prep:
+        assert s <= mp.MAX_ROWS, f"MLA post: {s} rows past {mp.MAX_ROWS}"
+        # the post stage stages x in whatever LDS is left past the fixed parts
+        budget = (LDS_LIMIT - lds_bytes(Smem) - lds_bytes(RouteLds) - 256) // 16 * 16
+        post_slabs = tuple(mp.slabs(s, budget))
+        if key.mla_prep:
+            # P3 stages all of q8 (K 1536) at once
+            assert mp.lds_words(s, budget) * 4 >= s * (pr.QB_K + mp.XPAD)
+
+        @fx.struct
+        class PostLds:
+            xq: fx.Array[fx.Int32, mp.lds_words(s, budget), 16]
+
+        @fx.union
+        class StageLds:
+            early: EarlyLds
+            attn: AttnLds
+            ug: k2b.ug_lds(s)
+            down: k2b.down_lds(s)
+            rmask: k2b.mask_lds(s)
+            rsel: k2b.RouteSelLds
+            post: PostLds
+
+    else:
+        post_slabs = ()
+
+        @fx.union
+        class StageLds:
+            early: EarlyLds
+            attn: AttnLds
+            ug: k2b.ug_lds(s)
+            down: k2b.down_lds(s)
+            rmask: k2b.mask_lds(s)
+            rsel: k2b.RouteSelLds
+
     keyed = key_tuple(key, _SOURCES)
-    name = kernel_symbol("k3_mono_k2", **symbol_params(key))
+    ext_sym = {"mp": 1} if key.mla_post else {}
+    if key.mla_prep:
+        ext_sym["pp"] = 1
+    if key.sched:
+        ext_sym["ss"] = key.sched.removeprefix("iterative-")
+    name = kernel_symbol("k3_mono_k2", **symbol_params(key), **ext_sym)
+
+    bk = {
+        "key": key,
+        "s": s,
+        "G": G,
+        "ns": ns,
+        "lay": lay,
+        "plain_lay": plain_lay,
+        "play": play,
+        "Smem": Smem,
+        "RouteLds": RouteLds,
+        "StageLds": StageLds,
+        "post_slabs": post_slabs,
+    }
+    if key.mla_post or key.mla_prep:
+        # (imported here: ``layer_folds`` builds on this module's ``_body``)
+        from atom.models.kimi_k3.mono.kernels import layer_folds
+
+        _BUILDS[key] = launch = layer_folds.build(key, name, keyed, bk)
+        return launch
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def k2(
@@ -327,190 +655,39 @@ def build(key: K2Build):
         tl: Int64,
     ):
         _ = keyed
-        tid = fx.thread_idx.x
-        bid = fx.block_idx.x
-        alloc = fx.SharedAllocator()
-        lds = alloc.allocate(Smem).peek()
-        rl = alloc.allocate(RouteLds).peek()
-        st = alloc.allocate(StageLds)
-        el, al, ul, dl = st.early.peek(), st.attn.peek(), st.ug.peek(), st.down.peek()
-        rsel = st.rsel.peek()
-        # ``layer`` is this launch's slot of the step; the step's first kernel
-        # finds every pair zeroed and peer-fenced
-        if const_expr(key.diag):
-            mb = Mailbox(layer, diag, region_ids(REGIONS))
-        else:
-            mb = Mailbox(layer)
-        bases = peer_bases(peers, TP_)
-        own = load_ptr64(peers, rank)
-        peer = {}
-        for region in k2b.PEER_REGIONS + ("ar", "dg"):
-            off = play[region][0]
-            peer[region] = [preg(b, off, region) for b in bases]
-            peer[region + "_own"] = preg(own, off, region)
-        c = {
-            "S": s,
-            "G": G,
-            "NS": ns,
-            "NB": key.nblocks,
-            "tid": tid,
-            "bid": bid,
-            "lane": tid % 64,
-            "wave": tid // 64,
-            "rank": rank,
-            "delta": True,
-            "reset": reset,
-            "debug": False,
-            "eps": key.eps,
-            "out_eps": key.out_eps,
-            "ln_eps": key.ln_eps,
-            "put": mb.put,
-            "put_bf": mb.put_bf,
-            "put_words": mb.put_words,
-            "poll": mb.poll,
-            "queue": queue,
-            "red": lds.red.ptr,
-            "peer": peer,
-            "ar_peer": peer["ar"],
-            "ar_own": peer["ar_own"],
-            "dg_peer": peer["dg"],
-            "dg_own": peer["dg_own"],
-            "xl": el.xl.ptr,
-            "rcand": rsel.cand.ptr,
-            "rsig": rsel.sig.ptr,
-            "vals": al.vals.ptr,
-            "delta_lds": al.dl.ptr,
-            "latq": ul.latq.ptr,
-            "latsc": ul.latsc.ptr,
-            "av": ul.av.ptr,
-            "contrib": dl.contrib.ptr,
-            "scan": rl.scan.ptr,
-            "rt": k2b.route_table(rl, st.rmask.peek()),
-            "xbuf": plain + fx.Int64(plain_lay["xrow"][0]),
-            "xflags": NA * G,
-            "tl_on": key.timeline,
-            "tls": lds.tls.ptr,
-            "inter": plain + fx.Int64(plain_lay["inter"][0]),
-            "isc": plain + fx.Int64(plain_lay["isc"][0]),
-            "ln": plain + fx.Int64(plain_lay["ln"][0]),
-            "shp": plain + fx.Int64(plain_lay["shp"][0]),
-            "args": {
-                "core": core,
-                "w_o": w_o,
-                "prefix": prefix,
-                "blocks": blocks,
-                "blk_sm": blk_sm,
-                "blk_sr": blk_sr,
-                "ares_nw": ares_nw,
-                "ares_qk": ares_qk,
-                "in_nw": in_nw,
-                "x_dbg": 0,
-                "w_gate": w_gate,
-                "bias": bias,
-                "w_ld": w_ld,
-                "w_sgu": w_sgu,
-                "w_sd": w_sd,
-                "w13": w13,
-                "w13s": w13s,
-                "w2": w2,
-                "w2s": w2s,
-                "ln_w": ln_w,
-                "w_up": w_up,
-                "out": out,
-            },
-        }
-        for region in (
-            "part",
-            "wgt",
-            "msq",
-            "xrdy",
-            "sgu",
-            "h",
-            "rpart",
-            "lpart",
-            "route",
-            "ugf",
-            "lmsq",
-            "lnrdy",
-            "shrdy",
-        ):
-            c[region] = sreg(scratch, lay[region][0], region)
-        on, tls = key.timeline, lds.tls.ptr
-        stamp_begin(on, tls, tid, TL_POINTS)
-        # ---- o_proj on every CTA (``o_slot``)
-        eb = bid - E0
-        lb = eb - k2b.R_TASKS
-        is_r = (bid >= E0) & (eb < k2b.R_TASKS)
-        is_l = (bid >= E0 + k2b.R_TASKS) & (lb < k2b.L_TASKS)
-        # o_proj first (every AttnRes CTA waits on the slowest partial; loads
-        # retire in order), the early weights after: they land before x does
-        if bid >= O0:
-            enter_stage("k2.o")
-            stage_oproj(c, o_slot(bid))
-            stamp(on, tls, tid, 1)
-            stage_attnres_far(c, bid, on, tls)
-        enter_stage("k2.early")
-        if is_r:
-            rops = k2b.early_loads(c, 0, eb // k2b.R_PARTS, eb % k2b.R_PARTS)
-            k2b.early_compute(c, 0, eb // k2b.R_PARTS, eb % k2b.R_PARTS, rops)
-        if is_l:
-            lops = k2b.early_loads(c, 1, lb // k2b.L_PARTS, lb % k2b.L_PARTS)
-            k2b.early_compute(c, 1, lb // k2b.L_PARTS, lb % k2b.L_PARTS, lops)
-        if (bid >= O0) & ~is_r & ~is_l & (bid - O0 < k2b.G_TASKS):
-            gi = bid - O0
-            k2b.early_compute(c, 2, gi, 0, k2b.early_loads(c, 2, gi, 0))
-        # ---- AttnRes: the reduced o_proj -> x; then route
-        if bid < NA:
-            enter_stage("k2.o")
-            stage_oproj(c, o_slot(bid))
-            stage_attnres(c, bid, 0, on, tls)
-            stamp(on, tls, tid, 13)
-            stage_routes(c, bid)
-        if bid >= NA:
-            stamp(on, tls, tid, 2)
-        # ---- the routed experts
-        # the route table first: its bitmaps share LDS with the latent
-        # (``k2b.mask_lds``)
-        enter_stage("k2.ug")
-        nu = k2b.load_route(c)
-        stamp(on, tls, tid, 11)
-        k2b.load_latq(c)
-        stamp(on, tls, tid, 12)
-        k2b.run_ug(c, bid, nu)
-        stamp(on, tls, tid, 3)
-        # the shared SiTU after ug, on the shared down's CTAs: only the shared
-        # down reads it (before ug it held the AttnRes CTAs' ug start back)
-        enter_stage("k2.h")
-        k2b.run_h(c, bid)
-        enter_stage("k2.down")
-        if bid < k2b.DOWN_TASKS:
-            # the first w2 batch in flight before any ug flag is waited for
-            dops = k2b.down_loads(c, bid, nu, fx.min(c["wave"], nu - 1))
-            k2b.stage_down(c, bid, nu, dops)
-            stamp(on, tls, tid, 16)
-        enter_stage("k2.sdown")
-        k2b.run_sdown(c, bid, w_sd)
-        stamp(on, tls, tid, 4)
-        enter_stage("k2.lnorm")
-        if (bid >= k2b.LN0) & (bid < k2b.LN0 + k2b.LN_TASKS):
-            k2b.stage_lnorm(c, bid - k2b.LN0)
-        # a wide step's lnorm tasks' second halves on CTAs 0 .., which wait
-        # for LN anyway (up's)
-        if const_expr(k2b.ln_halves(c["S"]) > 1):  # noqa: SIM102
-            if bid < k2b.LN_TASKS:
-                k2b.stage_lnorm(c, bid, 1)
-        stamp(on, tls, tid, 5)
-        enter_stage("k2.up")
-        k2b.run_up(c, bid)
-        stamp(on, tls, tid, 6)
-        # compile-time gate outside, traced condition inside: `and` does not
-        # combine a Python bool with a traced value
-        enter_stage("k2.final")
-        if const_expr(key.reduce):  # noqa: SIM102
-            if (bid >= k2b.RED0) & (bid < k2b.RED0 + k2b.RED_TASKS):
-                k2b.stage_reduce(c, bid - k2b.RED0)
-        stamp(on, tls, tid, 7)
-        stamp_flush(on, tls, tl, tid, bid, TL_POINTS)
+        _body(
+            bk,
+            core,
+            w_o,
+            prefix,
+            blocks,
+            blk_sm,
+            blk_sr,
+            ares_nw,
+            ares_qk,
+            in_nw,
+            w_gate,
+            bias,
+            w_ld,
+            w_sgu,
+            w_sd,
+            w13,
+            w13s,
+            w2,
+            w2s,
+            ln_w,
+            w_up,
+            out,
+            scratch,
+            plain,
+            queue,
+            peers,
+            rank,
+            layer,
+            reset,
+            diag,
+            tl,
+        )
 
     @flyc.jit
     def launch(
