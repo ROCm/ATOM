@@ -230,15 +230,17 @@ impl Pipeline {
         model_id: Option<String>,
         components: Arc<AppContext>,
     ) -> Response {
-        self.execute_chat_declaring(req, None, headers, model_id, components)
+        self.execute_chat_declaring(req, None, None, headers, model_id, components)
             .await
     }
 
-    /// `execute_chat`, with the tools its messages declare read from its raw body.
+    /// `execute_chat`, with the tools its messages declare and its `thinking` control
+    /// read from its raw body.
     pub async fn execute_chat_declaring(
         &self,
         req: Arc<ChatCompletionRequest>,
         message_tools: Option<MessageTools>,
+        thinking: Option<serde_json::Value>,
         headers: Option<HeaderMap>,
         model_id: Option<String>,
         components: Arc<AppContext>,
@@ -258,6 +260,7 @@ impl Pipeline {
         let (mut payload, mut resp_ctx) = match prepare::prepare_chat_declaring(
             req,
             message_tools,
+            thinking,
             headers,
             model_id,
             &components,

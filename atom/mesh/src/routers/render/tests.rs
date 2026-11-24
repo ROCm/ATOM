@@ -3978,6 +3978,54 @@ mod e2_generate_streaming_branches {
     }
 }
 
+/// Streaming metrics count the output a Complete carries past the partials too.
+mod e4_generate_streaming_output_tokens {
+    use axum::body::to_bytes;
+
+    use super::test_support::generate_ctx;
+    use crate::routers::render::generate_streaming;
+    use crate::routers::token_handle::test_support::synthetic_single_stream;
+    use crate::routers::token_handle::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
+
+    #[tokio::test]
+    async fn test_output_tokens_are_the_complete_s_count() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let partial = |id| {
+            Ok(TokenChunk::Partial {
+                token_ids: vec![id],
+                logprobs: None,
+            })
+        };
+        let complete = Ok(TokenChunk::Complete {
+            token_ids: vec![1, 2, 3],
+            finish_reason: FinishReason::Stop,
+            matched_stop: None,
+            usage: Usage {
+                prompt_tokens: 1,
+                completion_tokens: 3,
+                total_tokens: 4,
+            },
+            logprobs: None,
+            input_logprobs: None,
+            meta: WorkerMeta::default(),
+        });
+        let stream = synthetic_single_stream(vec![partial(1), partial(2), complete]);
+        let resp = generate_streaming::process(stream, generate_ctx(), "regular");
+        to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let rendered = handle.render();
+        let output = rendered
+            .lines()
+            .find(|line| {
+                line.starts_with("mesh_router_tokens_total{")
+                    && line.contains("token_type=\"output\"")
+            })
+            .and_then(|line| line.rsplit_once(' ')?.1.parse::<f64>().ok());
+        assert_eq!(output, Some(3.0), "{rendered}");
+    }
+}
+
 mod e3_generate_streaming_across_chunks {
     use std::sync::Arc;
 
@@ -4254,6 +4302,38 @@ mod f_atom_reasoning_opener {
         let expected = ("still planning".to_string(), String::new());
         assert_eq!(unary("still planning", Some("<think>")).await, expected);
         assert_eq!(streamed("still planning", Some("<think>")).await, expected);
+    }
+
+    #[tokio::test]
+    async fn a_long_reply_arriving_in_its_complete_alone_is_split_as_when_streamed() {
+        let thought = "z".repeat(70_000);
+        let reply = format!("<think>{thought}</think>answer");
+        let ids = tokenizer()
+            .encode(&reply, false)
+            .unwrap()
+            .token_ids()
+            .to_vec();
+        let complete = chunks(&reply, false);
+        let stream = synthetic_single_stream(complete.into_iter().map(Ok).collect());
+        let resp = chat_streaming::process(stream, ctx(true, None), "regular");
+        let body = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let (mut reasoning, mut content) = (String::new(), String::new());
+        for line in String::from_utf8_lossy(&body).lines() {
+            let Some(event) = line
+                .strip_prefix("data: ")
+                .and_then(|data| serde_json::from_str::<Value>(data).ok())
+            else {
+                continue;
+            };
+            let delta = &event["choices"][0]["delta"];
+            reasoning.push_str(delta["reasoning_content"].as_str().unwrap_or_default());
+            content.push_str(delta["content"].as_str().unwrap_or_default());
+        }
+        assert!(ids.len() > 256);
+        assert_eq!(
+            (reasoning.len(), content.as_str()),
+            (thought.len(), "answer")
+        );
     }
 
     #[tokio::test]
@@ -4566,6 +4646,89 @@ mod h_atom_native_tool_calls {
             let arguments: Value = serde_json::from_str(&arguments).unwrap();
             assert_eq!(arguments, json!({"city": "Paris"}), "{choice}");
         }
+    }
+
+    /// A qwen_xml reply cut off by max_tokens inside a call: (name, arguments) of the call
+    /// read unary, then streamed.
+    async fn cut_off_call(reply: &str) -> [(String, Value); 2] {
+        let tool = json!({"type": "function", "function": {"name": "get_weather", "parameters": {
+            "type": "object", "properties": {"city": {"type": "string"}},
+        }}});
+        let ids = tokenizer()
+            .encode(reply, false)
+            .unwrap()
+            .token_ids()
+            .to_vec();
+        let mut read = Vec::new();
+        for stream in [false, true] {
+            let req: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "m", "messages": [{"role": "user", "content": "hi"}],
+                "tools": [tool.clone()], "stream": stream,
+            }))
+            .unwrap();
+            let mut ctx = ctx(stream, json!("auto"));
+            ctx.original = ProtocolRequest::Chat(Arc::new(req));
+            ctx.configured_tool_parser = Some("qwen_xml".to_string());
+            let mut chunks: Vec<TokenChunk> = Vec::new();
+            if stream {
+                chunks.extend(ids.chunks(3).map(|ids| TokenChunk::Partial {
+                    token_ids: ids.to_vec(),
+                    logprobs: None,
+                }));
+            }
+            chunks.push(TokenChunk::Complete {
+                token_ids: if stream { Vec::new() } else { ids.clone() },
+                finish_reason: FinishReason::Length,
+                matched_stop: None,
+                usage: Usage::default(),
+                logprobs: None,
+                input_logprobs: None,
+                meta: WorkerMeta::default(),
+            });
+            let stream_of = synthetic_single_stream(chunks.into_iter().map(Ok).collect());
+            let (mut name, mut arguments) = (String::new(), String::new());
+            if stream {
+                let resp = chat_streaming::process(stream_of, ctx, "regular");
+                let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+                for line in String::from_utf8_lossy(&body).lines() {
+                    let Some(event) = line
+                        .strip_prefix("data: ")
+                        .and_then(|data| serde_json::from_str::<Value>(data).ok())
+                    else {
+                        continue;
+                    };
+                    let calls = event["choices"][0]["delta"]["tool_calls"]
+                        .as_array()
+                        .cloned();
+                    for call in calls.into_iter().flatten() {
+                        name.push_str(call["function"]["name"].as_str().unwrap_or_default());
+                        let delta = call["function"]["arguments"].as_str().unwrap_or_default();
+                        arguments.push_str(delta);
+                    }
+                }
+            } else {
+                let resp = chat_aggregator::process(stream_of, ctx).await;
+                let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+                let json: Value = serde_json::from_slice(&body).unwrap();
+                let call = &json["choices"][0]["message"]["tool_calls"][0]["function"];
+                name.push_str(call["name"].as_str().unwrap_or_default());
+                arguments.push_str(call["arguments"].as_str().unwrap_or_default());
+            }
+            let arguments = serde_json::from_str(&arguments).unwrap_or(Value::Null);
+            read.push((name, arguments));
+        }
+        read.try_into().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_native_call_cut_off_by_max_tokens_keeps_its_arrived_value() {
+        let reply = "<tool_call><function=get_weather><parameter=city>Paris";
+        let expected = ("get_weather".to_string(), json!({"city": "Paris"}));
+        assert_eq!(cut_off_call(reply).await, [expected.clone(), expected]);
+        // Prose quoting the syntax is not a call.
+        let prose = "You write <function=get_weather> and then its parameters";
+        let none = (String::new(), Value::Null);
+        assert_eq!(cut_off_call(prose).await, [none.clone(), none]);
     }
 }
 

@@ -6,7 +6,6 @@ engine step one StreamBatch per Session, then an id-free item per request it end
 
 import asyncio
 import logging
-import time
 from collections import deque
 from dataclasses import dataclass, replace
 
@@ -61,7 +60,8 @@ class Session:
         # client seq_id -> its pending submission; held until admitted or ended
         self.admitting: dict[int, object] = {}
         self.aborted_while_admitting: set[int] = set()  # aborted once it is added
-        self.pending: list[RequestOutput] = []  # the step being delivered
+        # The step being delivered: each output with when the engine delivered it.
+        self.pending: list[tuple[RequestOutput, float]] = []
         self.put = self.pending.append  # where each output goes as a step is delivered
         self.outbox: asyncio.Queue = asyncio.Queue()  # message frames; None ends them
         self.open = True
@@ -146,22 +146,22 @@ class Session:
         item, or a Rejected one, for each request the step ended."""
         pending = self.pending[:]
         self.pending.clear()  # the list `put` appends to
-        requests, now = self.requests, time.time()
+        requests = self.requests
         entries, done = [], []
-        for output in pending:
+        for output, delivered in pending:
             client_id = self.client_ids.get(output.request_id)
             if client_id is None:  # dropped when its submission failed
                 continue
             request = requests[client_id]
             if output.output_tokens:
                 if not request.first_token_time:
-                    request.first_token_time = now
+                    request.first_token_time = delivered
                 streamed = output
                 if output.kv_transfer_params_output is not None:
                     streamed = _streamed(output)
                 entries.append((client_id, streamed))
             if output.finished:
-                done.append(_completion(client_id, request, output, now))
+                done.append(_completion(client_id, request, output, delivered))
         if self.open and entries:
             self.send(frames.encode_stream(entries))
         failed = [c for c in done if c.leave_reason == STRUCTURED_ERROR]
@@ -198,7 +198,7 @@ def _streamed(output: RequestOutput) -> RequestOutput:
     return replace(output, kv_transfer_params_output=None)
 
 
-def _completion(client_id, request, output, now: float) -> frames.Completion:
+def _completion(client_id, request, output, delivered: float) -> frames.Completion:
     """Its Completions item: no ids, which its StreamBatch entries carried."""
     seq = request.seq
     return frames.Completion(
@@ -209,7 +209,7 @@ def _completion(client_id, request, output, now: float) -> frames.Completion:
         num_cached_tokens=seq.num_prompt_tokens if request.first_token_time else 0,
         arrive_time=seq.arrive_time,
         first_token_time=request.first_token_time,
-        leave_time=now,
+        leave_time=delivered,
         kv_transfer_params_output=output.kv_transfer_params_output,
         external_request_id=request.external_request_id,
     )

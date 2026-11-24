@@ -30,7 +30,7 @@ use crate::{
     },
     routers::{
         comm::error,
-        prepare::{inference::ParsedInference, message_tools::MessageTools},
+        prepare::{inference::ParsedInference, message_tools::MessageTools, read_thinking},
         RouterTrait,
     },
 };
@@ -133,6 +133,7 @@ impl GrpcPDRouter {
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
         message_tools: Option<MessageTools>,
+        thinking: Option<serde_json::Value>,
         model_id: Option<&str>,
     ) -> Response {
         debug!(
@@ -151,6 +152,7 @@ impl GrpcPDRouter {
             |_attempt| {
                 let request = Arc::clone(&request);
                 let message_tools = message_tools.clone();
+                let thinking = thinking.clone();
                 let headers = headers_cloned.clone();
                 let model_id = model_id_cloned.clone();
                 let components = Arc::clone(&components);
@@ -159,6 +161,7 @@ impl GrpcPDRouter {
                         .execute_chat_declaring(
                             request,
                             message_tools,
+                            thinking,
                             headers,
                             model_id,
                             components,
@@ -250,7 +253,8 @@ impl RouterTrait for GrpcPDRouter {
         if let Some(refused) = atom_chat_refusal(&self.worker_registry, body, model_id) {
             return refused;
         }
-        self.route_chat_impl(headers, body, None, model_id).await
+        self.route_chat_impl(headers, body, None, None, model_id)
+            .await
     }
 
     async fn route_chat_body(
@@ -267,8 +271,10 @@ impl RouterTrait for GrpcPDRouter {
             Ok(declared) => declared,
             Err(refused) => return refused,
         };
+        // ATOM's alone, as message tools are.
+        let thinking = message_tools.as_ref().and_then(|_| read_thinking(&raw));
         drop(raw);
-        self.route_chat_impl(headers, body, message_tools, model_id)
+        self.route_chat_impl(headers, body, message_tools, thinking, model_id)
             .await
     }
 

@@ -1721,7 +1721,7 @@ mod i_atom_structured_output {
     use crate::routers::prepare::{
         generation_payload::GenerationPayload,
         message_tools::MessageTools,
-        prepare_chat, prepare_chat_declaring,
+        prepare_chat, prepare_chat_declaring, read_thinking,
         response_context::{ProtocolRequest, ResponseContext},
     };
     use crate::routers::test_mocks;
@@ -1784,6 +1784,47 @@ mod i_atom_structured_output {
         let high = Some(json!({"enable_thinking": true, "thinking_effort": "high"}));
         assert_eq!(kwargs("high", &[toggle, defaults]), high);
         assert_eq!(kwargs("medium", &[toggle]), Some(json!({})));
+    }
+
+    #[test]
+    fn an_atom_chats_thinking_reaches_its_kwargs_as_atoms_http_chat_resolves_it() {
+        let kwargs = |controls: Value, default_on: bool| {
+            let ctx = test_mocks::app_context_with_hf_tokenizer("m");
+            let defaults = json!({"enable_thinking": default_on}).to_string();
+            let worker = BasicWorkerBuilder::new("grpc://worker:1")
+                .runtime_type(RuntimeType::Atom)
+                .model_id("m")
+                .label("chat_template", "{{ messages }}")
+                .label(
+                    "reasoning_toggle_json",
+                    r#"["enable_thinking", false, true]"#,
+                )
+                .label("default_chat_template_kwargs_json", defaults);
+            ctx.worker_registry.register(Arc::new(worker.build()));
+            test_mocks::app_context::loaded_with_worker_template(&ctx, "m", "{{ messages }}");
+            let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+            body.as_object_mut()
+                .unwrap()
+                .extend(controls.as_object().unwrap().clone());
+            let raw = serde_json::to_vec(&body).unwrap();
+            let thinking = read_thinking(&raw);
+            let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+            let model = Some("m".to_string());
+            let prepared =
+                prepare_chat_declaring(Arc::new(request), None, thinking, None, model, &ctx);
+            let carried = prepared.unwrap().0.structured_output.unwrap();
+            parsed(Some(carried.chat_template_kwargs_json)).unwrap()
+        };
+        let disabled = json!({"thinking": {"type": "disabled"}});
+        assert_eq!(kwargs(disabled, true), json!({"enable_thinking": false}));
+        let enabled = json!({"thinking": {"type": "enabled"}});
+        assert_eq!(kwargs(enabled, false), json!({"enable_thinking": true}));
+        // thinking.effort sets the effort; a top-level "none" still switches it off.
+        let effort = json!({"thinking": {"effort": "high"}});
+        let expected = json!({"enable_thinking": true, "thinking_effort": "high"});
+        assert_eq!(kwargs(effort, true), expected);
+        let none = json!({"thinking": {"type": "enabled"}, "reasoning_effort": "none"});
+        assert_eq!(kwargs(none, true), json!({"enable_thinking": false}));
     }
 
     #[test]
@@ -1900,7 +1941,7 @@ mod i_atom_structured_output {
         let declared = MessageTools::read(&raw).unwrap();
         let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
         let model = Some("m".to_string());
-        prepare_chat_declaring(Arc::new(request), Some(declared), None, model, &ctx).unwrap()
+        prepare_chat_declaring(Arc::new(request), Some(declared), None, None, model, &ctx).unwrap()
     }
 
     fn tool_names(ctx: &ResponseContext) -> Vec<String> {

@@ -161,6 +161,8 @@ async fn run_generate_stream(
                     accumulated_text.push_str(&text);
                 }
                 prompt_tokens_seen = usage.prompt_tokens;
+                // The terminal count covers the ids the Complete carried past the partials.
+                completion_tokens = usage.completion_tokens;
                 if weight_version.is_none() {
                     weight_version = meta.weight_version.clone();
                 }
