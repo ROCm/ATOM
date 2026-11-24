@@ -46,7 +46,7 @@ const OPENING: Duration = Duration::from_secs(10);
 const SWEEP: Duration = Duration::from_secs(1);
 
 /// The request bytes (prompt and RequestSpec) a Session may hold unsent, a dropped one's
-/// until the writer discards it; past them a request is refused with 503.
+/// until the writer discards it; past them a request is refused with 503, or 400 alone.
 const UNSENT_BYTES: usize = 256 << 20;
 
 /// The outputs a streamed request may leave unread; past them it fails and is aborted.
@@ -226,7 +226,16 @@ impl Session {
     ) -> Result<SessionStream, EngineError> {
         let mut routes = self.routes.lock();
         let bytes = 4 * prompt.len() + spec.encoded_len();
-        if !routes.unsent.is_empty() && routes.unsent_bytes + bytes > routes.unsent_budget {
+        if bytes > routes.unsent_budget {
+            return Err(EngineError::Http {
+                status: StatusCode::BAD_REQUEST,
+                message: format!(
+                    "the request's {bytes} bytes exceed the {} an ATOM Session holds unsent",
+                    routes.unsent_budget
+                ),
+            });
+        }
+        if routes.unsent_bytes + bytes > routes.unsent_budget {
             return Err(EngineError::Http {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 message: "the ATOM Session is not reading the requests sent to it".to_string(),

@@ -872,6 +872,27 @@ fn unsent_requests_are_bounded_and_a_dropped_unsent_request_is_not_sent() {
 }
 
 #[test]
+fn a_first_request_larger_than_the_budget_is_refused() {
+    let (commands, _queued) = mpsc::unbounded_channel();
+    let routes = Routes {
+        unsent_budget: unsent_bytes("big", 2) - 1,
+        ..Default::default()
+    };
+    let session = Session {
+        routes: Arc::new(Mutex::new(routes)),
+        commands,
+    };
+    let refused = session.submit(spec("big"), vec![1, 2], true);
+    assert!(
+        matches!(&refused, Err(EngineError::Http { status, .. }) if status.as_u16() == 400),
+        "{:?}",
+        refused.err()
+    );
+    assert_eq!(session.routes.lock().unsent_bytes, 0);
+    assert!(session.submit(spec("big"), vec![1], true).is_ok());
+}
+
+#[test]
 fn requests_cancelled_while_the_writer_stalls_cannot_queue_without_bound() {
     let (commands, mut queued) = mpsc::unbounded_channel();
     let routes = Routes {

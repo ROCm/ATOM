@@ -40,7 +40,7 @@ use crate::{
         traits::Tokenizer,
     },
     tool_parser::{
-        registry::{check_tool_parser_availability, create_tool_parser, get_tool_parser},
+        registry::{check_tool_parser_availability, create_reply_tool_parser, get_tool_parser},
         ParserFactory as ToolParserFactory,
     },
 };
@@ -300,6 +300,7 @@ async fn process_choice(
                             tools,
                             model,
                             history_tool_calls_count,
+                            reads_as_atom,
                         )
                         .await;
                         parsed
@@ -416,7 +417,7 @@ async fn cut_off_call_closers(
     text: &str,
     tools: &[Tool],
 ) -> Option<String> {
-    let mut parser = create_tool_parser(factory, configured, model)?;
+    let mut parser = create_reply_tool_parser(factory, configured, model, true)?;
     parser.parse_incremental(text, tools).await.ok()?;
     parser.end_of_input_closers(tools)
 }
@@ -428,8 +429,14 @@ async fn parse_tool_calls(
     tools: &[Tool],
     model: &str,
     history_tool_calls_count: usize,
+    reads_as_atom: bool,
 ) -> (Option<Vec<ToolCall>>, String) {
-    let pooled = get_tool_parser(factory, configured, model);
+    // An ATOM worker's reply is read by a parser of its own, set to read it as ATOM's.
+    let own = reads_as_atom.then(|| create_reply_tool_parser(factory, configured, model, true));
+    let pooled = match own.flatten() {
+        Some(parser) => Arc::new(tokio::sync::Mutex::new(parser)),
+        None => get_tool_parser(factory, configured, model),
+    };
     let result = {
         let parser = pooled.lock().await;
         // The declared schemas type each argument, as the streamed reply's parser has them.
