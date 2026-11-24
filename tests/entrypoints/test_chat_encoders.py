@@ -8,7 +8,7 @@ import pathlib
 import pytest
 from jinja2 import TemplateError
 
-from atom.entrypoints.atomesh import atom_standalone_service
+from atom.entrypoints.atomesh import token_bridge
 from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.chat_encoder_adapters import (
     build_message_encoder_adapter,
@@ -207,7 +207,7 @@ class TestChatTemplateSource:
         """Both entry points asked `getattr(tokenizer, "chat_template", None)`
         directly, which is the shape that answers False for a whole class of
         model. Neither body is reachable from a unit test."""
-        for module in (api_server, atom_standalone_service):
+        for module in (api_server, token_bridge):
             src = pathlib.Path(module.__file__).read_text()
             assert "template_opens_reasoning_implicitly(" in src
             assert "chat_template_source(" in src, f"{module.__name__} reads it raw"
