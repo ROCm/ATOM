@@ -77,7 +77,8 @@ and draft share the embedding and output head.
   are resolved. Image prompts must fit within `--max-num-batched-tokens`.
 - Preserve the checkpoint's quantization exclusions and `ple_embedding_dtype`
   when present. GDN inputs support unquantized weights or per-channel FP8 QKV/Z
-  with unquantized B/A. GDN input online quantization is not supported.
+  with unquantized B/A. GDN input online quantization supports only matching
+  `ptpc_fp8` targets on QKV/Z; B/A retain their source precision.
 - PTPC (`compressed-tensors`) checkpoint loading is supported, but end-to-end
   execution on gfx950 is blocked by the default small-batch MoE dispatch:
   its second-stage kernel requires a 256-aligned intermediate size, whereas
@@ -131,8 +132,9 @@ FP8 KV, BF16 index keys, prefix caching, and three-token MTP. It covers the
 historical curve's eight concurrency points: 1, 2, 4, 8, 16, 32, 48, and 64.
 The Mono split below follows the November 20, 2026 full-curve preparation
 recipe. Only c8 and c64 were measured with this setup on ATOM
-`40a4d6d57bb16600c84ac758fff00e3379f133fa`; the other six points are prepared
-configurations. The commands use a checkout containing
+`40a4d6d57bb16600c84ac758fff00e3379f133fa` (a pre-merge #2636 branch commit,
+not on main); the other six points are prepared configurations. The commands
+below instead require a checkout containing
 [#2636](https://github.com/ROCm/ATOM/pull/2636); no point has been performance
 tested on current main here.
 `--spec-decode-acceptance-length 2.32` forces synthetic acceptance for
@@ -229,8 +231,8 @@ PY
 
 Use the same unmodified model directory for server weights and the client
 tokenizer. Prepare the model and dataset cache before starting the server;
-the timed replay runs with `HF_DATASETS_OFFLINE=1` and archived assistant
-responses. The model revision is
+the timed replay runs with `HF_DATASETS_OFFLINE=1`. Replaying archived
+assistant responses is the pinned client's fixed behavior. The model revision is
 `b2091c3809eb51902f46a163973362d8176f9e58`.
 
 Use a dedicated dataset cache so the client's unversioned public-dataset
@@ -272,6 +274,11 @@ All points use the same server command, with these differences:
 |---|---|---|---|---|---|
 | 1, 2, 4, 8, 16 | 1 | 160 | None | — | — |
 | 32, 48, 64 | 0 | 64 | `lmcache_offload` | 208.6 | 104.3 |
+
+The c1-c16 configuration uses the same `--max-num-seqs 160` and online
+quantization settings as the [Mono deployment guide](Qwen3.8-Flash-Next-Mono-Program.md).
+See that guide for Mono's log lines and deployment refusal rules.
+`ATOM_MONO_ENABLE=1` below explicitly restates the default for this deployment.
 
 Set the desired concurrency in the container, for example `export CONC=16`,
 then run the block below; it defaults to 8 when `CONC` is unset or empty. After
@@ -338,7 +345,7 @@ export CONC="${CONC:-8}" HTTP_PORT=8000 MODEL_PATH=/assets/model
 export MODEL_ID=amd/Qwen3.8-Flash-Next-Quark-MXFP4
 export HF_HOME=/assets/hf-cache HF_HUB_ENABLE_HF_TRANSFER=0
 unset HF_HUB_OFFLINE
-export HF_DATASETS_OFFLINE=1 AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES=0
+export HF_DATASETS_OFFLINE=1
 export AIPERF_DATASET_CONFIGURATION_TIMEOUT=1800
 export AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT=1800
 export AIPERF_UI_REALTIME_METRICS_ENABLED=true
