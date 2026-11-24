@@ -142,6 +142,10 @@ pub trait ToolParser: Send + Sync {
         None
     }
 
+    /// Read replies as ATOM's HTTP parser for the format does, where that differs from
+    /// SGLang's and vLLM's; set on a parser made for an ATOM worker's reply.
+    fn read_as_atom(&mut self) {}
+
     /// Reset the parser state for reuse across requests.
     /// This should clear all buffers and reset state to initial values.
     fn reset(&mut self) {

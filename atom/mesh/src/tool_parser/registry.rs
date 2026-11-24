@@ -376,6 +376,21 @@ pub(crate) fn create_tool_parser(
     }
 }
 
+/// `create_tool_parser`, reading the reply as ATOM's HTTP parser for its format does when
+/// an ATOM worker wrote it (`ToolParser::read_as_atom`).
+pub(crate) fn create_reply_tool_parser(
+    factory: &ParserFactory,
+    configured_parser: Option<&str>,
+    model: &str,
+    reads_as_atom: bool,
+) -> Option<Box<dyn ToolParser>> {
+    let mut parser = create_tool_parser(factory, configured_parser, model)?;
+    if reads_as_atom {
+        parser.read_as_atom();
+    }
+    Some(parser)
+}
+
 #[cfg(test)]
 mod tests {
     use super::ParserFactory;

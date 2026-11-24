@@ -38,7 +38,7 @@ use crate::{
     },
     tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoder},
     tool_parser::{
-        registry::{check_tool_parser_availability, create_tool_parser},
+        registry::{check_tool_parser_availability, create_reply_tool_parser},
         ParserFactory as ToolParserFactory, StreamingParseResult, ToolParser,
     },
 };
@@ -280,6 +280,7 @@ async fn run_chat_stream(
                             system_fingerprint.as_deref(),
                             history_tool_calls_count,
                             used_json_schema,
+                            ctx.reads_as_atom,
                         )
                         .await
                     };
@@ -368,6 +369,7 @@ async fn run_chat_stream(
                             system_fingerprint.as_deref(),
                             history_tool_calls_count,
                             used_json_schema,
+                            ctx.reads_as_atom,
                         )
                         .await
                     };
@@ -418,6 +420,7 @@ async fn run_chat_stream(
                 system_fingerprint.as_deref(),
                 history_tool_calls_count,
                 used_json_schema,
+                ctx.reads_as_atom,
             )
             .await;
             for c in chunks {
@@ -695,6 +698,7 @@ async fn process_tool_calls_stream(
     system_fingerprint: Option<&str>,
     history_tool_calls_count: usize,
     use_json_parser: bool,
+    reads_as_atom: bool,
 ) -> Vec<ChatCompletionStreamResponse> {
     let mut chunks = Vec::new();
     if tool_parser.is_none() {
@@ -707,7 +711,7 @@ async fn process_tool_calls_stream(
         } else {
             configured
         };
-        match create_tool_parser(factory, configured, model) {
+        match create_reply_tool_parser(factory, configured, model, reads_as_atom) {
             Some(p) => *tool_parser = Some(Arc::new(tokio::sync::Mutex::new(p))),
             None => return chunks,
         }
