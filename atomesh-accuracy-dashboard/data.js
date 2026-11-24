@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795502330151,
+  "lastUpdate": 1795548501457,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -5390,6 +5390,40 @@ window.BENCHMARK_DATA = {
             "value": 0.8908,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/45334861481 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611221510 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1463 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "honglie",
+            "username": "yhl-amd",
+            "email": "hyi@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "3598884c3b393dc6dae76af27ea9050df97e1da7",
+          "message": "ci: run the vLLM and SGLang PR tests only for plugin changes or their labels (#3804)\n\n* ci: run the vLLM and SGLang PR tests only for plugin changes or their labels\n\nAn approval used to open the vLLM and SGLang accuracy matrices on every PR\noutside a short ignore list, so a core-only change queued both plugin\nmatrices behind its required gates. Scope them like the ATOMesh gate: an\ninclude list of the plugin's own code under atom/plugin/, its CI scripts,\nmodel list and release images. ci:vllm / ci:sglang / ci:full still ask for\nthem on any change; core-only changes are left to the nightly.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* ci: cover the plugin test scripts in the vLLM/SGLang include lists\n\nThe vLLM CI also runs atom_oot_test.sh and check_mtp_acceptance.sh, and the\nSGLang CI runs atom_sglang_test.sh and reads SGLANG_REF from\ndocker-release.yaml. With both an include and an ignore list, the gate now\nsays paths-not-included when nothing matched the include list, and\nignored-paths-only only when the ignore list dropped what it matched.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-24T16:27:12Z",
+          "url": "https://github.com/ROCm/ATOM/commit/3598884c3b393dc6dae76af27ea9050df97e1da7"
+        },
+        "date": 1795548500803,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9492,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/45434441460 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202611241524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9454 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b-1p1d accuracy (GSM8K)",
+            "value": 0.8992,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/45434441460 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611241524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1585 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
