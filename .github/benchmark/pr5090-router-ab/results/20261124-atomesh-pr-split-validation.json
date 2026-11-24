@@ -1,0 +1,25 @@
+{
+  "original_combined_head": "dd75e895d8abf9460a3b2f52792387dff77f86f0",
+  "mooncake": {
+    "pr": 3782,
+    "head": "82636338124e4dc0115e54cda7999bef2e459eae",
+    "base": "a62134f991d056b27955ec936738d5e3d3c45956",
+    "red_failed": 6,
+    "http_pd_passed": 51,
+    "files": 2,
+    "additions": 146,
+    "deletions": 3
+  },
+  "mori": {
+    "pr": 3593,
+    "head": "aff13617b4a066e5cb728b7c631dea033f909e63",
+    "http_pd_passed": 50,
+    "mori_passed": 9,
+    "config_passed": 95,
+    "unique_passed": 148
+  },
+  "independent_merge_tree": "3a3cd74457230bd6da719b529d573e1b5fcd8363",
+  "recombined_atom_mesh_tree_equals_original": true,
+  "new_heads_gpu_validated": false,
+  "gpu_runs_remain_pinned_to": "69ed5e77bcc93b9d51cb5cf1528badd0e703ed93"
+}

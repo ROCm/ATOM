@@ -1,0 +1,29 @@
+{
+  "observed_at": "2026-11-24T13:34:44Z",
+  "original_order": {
+    "old_queue": "Rffc4da",
+    "remote_outcome": "timeout at 2026-11-24T11:08:43Z",
+    "local_ssh_exit": 255,
+    "new_queue": "R5917f7",
+    "new_controller_root": "/home/hexwang@amd.com/atomesh-control/20261124-213213-pp4-dep4-perf"
+  },
+  "c80": {
+    "old_queue": "Re13292",
+    "lost_handoff_lease": "Ldf9622",
+    "node": "pit2-p03-g48",
+    "grant_utc": "2026-11-24T10:17:48Z",
+    "picked_utc": "2026-11-24T10:17:49Z",
+    "idle_reclaim_utc": "2026-11-24T10:48:45Z",
+    "local_ssh_exit": 255,
+    "task_directory_exists": false,
+    "matching_container_ids": [],
+    "new_lease": "Lb6034c",
+    "new_controller_root": "/home/hexwang@amd.com/atomesh-control/20261124-213120-pp4-dep4-c80"
+  },
+  "change": "Acquire, durable run metadata, GPU launch and read-only monitor now live on the jump host; Windows only reads existing state.",
+  "controller_cpu_checks": [
+    "successful grant-to-launch",
+    "release after setup failure before launch",
+    "retain lease and flag inspection when launch acknowledgement and marker lookup are uncertain"
+  ]
+}
