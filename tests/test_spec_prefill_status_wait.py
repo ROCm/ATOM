@@ -6,10 +6,16 @@ An output prefill carries no request over, so nothing before its launch reads
 that status (only `postprocess` reports it): `ModelRunner.prepare_model`
 defers its wait past the target's launch. A decode that carries requests over
 shifts its attention metadata by the rejected counts and still waits before.
+The builder is asked every step, a prefill's included: the V4.1 mono device
+round (`DeviceRound.consumes`) learns from that call which forward ran last.
 
 Pure Python against stand-ins: the real `prepare_model` deferral decision and
-`tokenIDProcessor.prepare_input_ids`, every other producer stubbed."""
+`tokenIDProcessor.prepare_input_ids`, every other producer stubbed; the device
+round is the real one, its Triton kernel never launched."""
 
+import importlib.util
+import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -24,15 +30,40 @@ def runner_module():
         yield load("atom.model_engine.model_runner")
 
 
+@pytest.fixture(scope="module")
+def device_round():
+    """`mono/round/device_round.py` loaded by path, as the mono host tests do."""
+    pytest.importorskip("triton")
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "atom/models/deepseek_v41/mono/round/device_round.py"
+    )
+    old = os.environ.get("TRITON_INTERPRET")
+    os.environ["TRITON_INTERPRET"] = "1"
+    try:
+        spec = importlib.util.spec_from_file_location("_spec_status_dr", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    finally:
+        if old is None:
+            os.environ.pop("TRITON_INTERPRET")
+        else:
+            os.environ["TRITON_INTERPRET"] = old
+    return module
+
+
 # The previous output forward's (rejected, bonus) counts, one per request.
 STATUS = (np.array([2, 1], np.int32), np.array([1, 0], np.int32))
 
 
-def _batch(*, prefill, final=True):
+def _batch(*, prefill, final=True, req_ids=(7, 8)):
     """Two requests: prefills on their last chunk (or a middle one), or decodes
     carried over from the previous forward."""
     return SimpleNamespace(
         total_seqs_num=2,
+        total_seqs_num_prefill=2 if prefill else 0,
+        req_ids=list(req_ids),
+        is_dummy_run=False,
         total_tokens_num=12 if prefill else 4,
         has_prefill=prefill,
         num_spec_step=0 if prefill else 1,
@@ -79,6 +110,8 @@ def _runner(runner_module, monkeypatch, batch, *, builder_defers=False):
         query_lengths=lambda *a: None,
         prepare_query_metadata=lambda *a: {},
         consumes_device_verdict=mock.Mock(return_value=builder_defers),
+        settles_spec_status=lambda *a: False,
+        take_spec_status=lambda processor: None,
     )
     runner = runner_module.ModelRunner.__new__(runner_module.ModelRunner)
     runner.config = SimpleNamespace(
@@ -162,3 +195,69 @@ def test_a_decode_the_builder_advances_on_the_device_waits_after(
     _launch(runner, processor, events)
     assert events == ["metadata", "launch", "wait"]
     processor.recv_spec_status.assert_called_once_with()
+
+
+def _round_step(runner_module, monkeypatch, rnd, batch):
+    """`prepare_model` of one forward with the V4.1 mono builder's answer: the
+    real device round behind `consumes_device_verdict`."""
+    runner, _, builder, _ = _runner(runner_module, monkeypatch, batch)
+    builder.consumes_device_verdict = rnd.consumes
+    runner_module.ModelRunner.prepare_model(runner, batch)
+    return runner
+
+
+def _serve(device_round, rnd, requests=2):
+    """The builder's layout and the commit of a served lean verify
+    (`HiRound.laid_out` / `committed`): it leaves its verdict to the next
+    step."""
+    metadata = SimpleNamespace(
+        served_by_round=device_round.RoundService.LEAN,
+        step=SimpleNamespace(slots=np.zeros(requests), running_tokens=2 * requests),
+    )
+    rnd.laid_out(metadata)
+    rnd.committed(metadata, np.zeros(requests, np.int32))
+
+
+def _hook():
+    """A hook serving two-request verifies of one draft (width 4)."""
+    return SimpleNamespace(
+        lean_host=True,
+        runs_every_layer=True,
+        served_widths={4},
+        split={4: (2, 2)},
+        bmax=2,
+    )
+
+
+def test_a_prefill_between_two_served_verifies_ends_the_device_round(
+    runner_module, device_round, monkeypatch
+):
+    """A decode advances on the device from the previous forward's verdict
+    only when that forward was a served verify of the same requests. A middle
+    prefill chunk of other requests runs between them: the host takes that
+    verdict after the prefill's launch, so the next verify waits for its own
+    status instead of advancing a second time."""
+    rnd = device_round.DeviceRound(_hook())
+    runner = _round_step(runner_module, monkeypatch, rnd, _batch(prefill=False))
+    assert not runner.spec_status_deferred  # no verdict on the device yet
+    _serve(device_round, rnd)
+    assert rnd.state.ready == (7, 8)
+    middle = _batch(prefill=True, final=False, req_ids=(9, 10))
+    _round_step(runner_module, monkeypatch, rnd, middle)
+    assert rnd.state.ready is None
+    runner = _round_step(runner_module, monkeypatch, rnd, _batch(prefill=False))
+    assert not runner.spec_status_deferred
+    assert rnd.state.advance_from is None
+
+
+def test_the_first_verify_after_its_prefill_skips_the_wait(
+    runner_module, device_round, monkeypatch
+):
+    """The prefill's status is known (nothing rejected), so the first served
+    verify of the requests it prefilled waits after its launch
+    (`device_round.first_step`)."""
+    rnd = device_round.DeviceRound(_hook())
+    _round_step(runner_module, monkeypatch, rnd, _batch(prefill=True))
+    assert rnd.state.prefilled == (7, 8)
+    runner = _round_step(runner_module, monkeypatch, rnd, _batch(prefill=False))
+    assert runner.spec_status_deferred and rnd.state.first
