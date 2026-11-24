@@ -1453,16 +1453,25 @@ def test_flydsl_layout_built_only_when_the_kernel_can_run(
 
 
 def test_flydsl_layout_names_a_non_gfx942_gpu(monkeypatch, caplog):
-    """The arch gate comes first: off gfx942 the head shape is never read (the
-    config below has none) and the log names the arch, not a shape."""
+    """Off gfx942 the log names the arch -- after the model's own gates, so a
+    config this kernel cannot serve is never blamed on the GPU."""
     _flydsl_gate_env(monkeypatch, gfx942=False)
     batch = SimpleNamespace(token_to_kv_pool=SimpleNamespace(dtype=torch.bfloat16))
     with caplog.at_level("WARNING"):
-        assert not _flydsl_layout_needed(
-            batch, SimpleNamespace(hf_config=None), 4, 2048
-        )
+        assert not _flydsl_layout_needed(batch, _FLASH_CONFIG, 4, 2048)
     reasons = [r.getMessage() for r in caplog.records if "native kernel" in r.message]
     assert len(reasons) == 1 and "not gfx942" in reasons[0]
+
+
+def test_flydsl_layout_blames_the_model_before_the_gpu(monkeypatch, caplog):
+    """A head shape the kernel cannot serve is reported as such even on a GPU
+    that cannot run the kernel either: the arch is the last gate."""
+    _flydsl_gate_env(monkeypatch, tp=1, gfx942=False)
+    batch = SimpleNamespace(token_to_kv_pool=SimpleNamespace(dtype=torch.bfloat16))
+    with caplog.at_level("WARNING"):
+        assert not _flydsl_layout_needed(batch, _FLASH_CONFIG, 4, 2048)
+    reasons = [r.getMessage() for r in caplog.records if "native kernel" in r.message]
+    assert len(reasons) == 1 and "24 q / 2 kv heads" in reasons[0]
 
 
 def test_flydsl_layout_needs_widths_from_aiter(monkeypatch):

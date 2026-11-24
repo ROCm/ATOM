@@ -126,29 +126,32 @@ def flydsl_fallback_reason(
 ) -> str | None:
     """Why QSA layers with this indexer, per-rank head shape and KV format
     cannot take the aiter FlyDSL attention, or None if they can. The kernel
-    is gfx942's: aiter builds it for that arch alone and raises on any other,
-    so that is checked first and everywhere else is a fallback. It also
     expects min(v // 4, T) blocks for a row with v visible tokens (width
     4T + 3); another budget or ratio selects a different number, so padding
     its selection would give wrong output. The one authority for the layer's
     fallback and the SGLang bridge's layout build; the per-call conditions
     (host layout, selection byte span, graph capture, query dtype) stay with
-    the layer."""
-    arch_reason = flydsl_arch_reason()
-    if arch_reason is not None:
-        return arch_reason
+    the layer. The arch comes last, so a model this kernel cannot serve for
+    its own reasons is reported as such before the GPU is blamed."""
     if not kv_bf16:
         return "the KV cache is not BF16"
-    widths = qsa_sparse_prefill_widths()
-    if not widths:
-        return "this aiter has no FlyDSL QSA prefill"
-    if compress_ratio != 4 or token_topk + 3 not in widths:
-        return f"indexer compress ratio {compress_ratio} / budget {token_topk}"
     if num_kv_heads != 1 or num_heads not in (12, 6, 3) or head_dim != 256:
         return (
             f"per-rank head shape {num_heads} q / {num_kv_heads} kv heads "
             f"x {head_dim} (needs 12, 6 or 3 q / 1 kv x 256)"
         )
+    # The kernel is gfx942's alone: aiter builds it for that arch and raises
+    # on any other.
+    arch_reason = flydsl_arch_reason()
+    if arch_reason is not None:
+        return arch_reason
+    # aiter reports no widths off gfx942 too, so this is only worth saying
+    # once the arch is known to be able to run the kernel at all.
+    widths = qsa_sparse_prefill_widths()
+    if not widths:
+        return "this aiter has no FlyDSL QSA prefill"
+    if compress_ratio != 4 or token_topk + 3 not in widths:
+        return f"indexer compress ratio {compress_ratio} / budget {token_topk}"
     return None
 
 
