@@ -40,7 +40,7 @@ def test_kept_ties_take_a_per_row_k_without_readback(monkeypatch, rows, k_rows):
     monkeypatch.setattr(
         sampler, "aiter_ops", SimpleNamespace(top_k_top_p_sampling_from_probs=joint)
     )
-    monkeypatch.setattr(sampler, "_apply_greedy_tokens", lambda p, t, tokens: tokens)
+    monkeypatch.setattr(sampler, "_apply_greedy_tokens", lambda p, t, tokens, *_: tokens)
     instance = sampler.Sampler()
     instance.keep_ties(torch.full((8,), 4, dtype=torch.int32))
     probs, temperatures = torch.full((rows, 8), 1 / 8), torch.ones(rows)
@@ -67,7 +67,7 @@ def test_kept_ties_read_a_uniform_k_from_the_published_rows(monkeypatch):
     monkeypatch.setattr(
         sampler, "aiter_ops", SimpleNamespace(top_k_top_p_sampling_from_probs=joint)
     )
-    monkeypatch.setattr(sampler, "_apply_greedy_tokens", lambda p, t, tokens: tokens)
+    monkeypatch.setattr(sampler, "_apply_greedy_tokens", lambda p, t, tokens, *_: tokens)
     published = torch.full((8,), 6, dtype=torch.int32)
     instance = sampler.Sampler()
     instance.keep_ties(published)
