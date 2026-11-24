@@ -23,6 +23,18 @@ together hold more prefixes. No request stores its own prompt:
 * Lookup. The tier holds what HBM evicted rather than the prefix HBM still
   has, so a lookup asks only past the HBM hit, which the scheduler probes first
   (`needs_hbm_probe_before_lookup`).
+* Pipeline parallelism. This scheduler and its pool live once, on the head;
+  every stage holds its own layers under the same block ids. The head sends
+  each metadata it builds, demotions included, to every stage, whose workers
+  store and look up under their own LMCache worker id (`pp_rank * tp +
+  tp_rank`, `pp_aware_rank_and_world`), and its `PPKVAggregator` reports a
+  store or a load only once every stage has, failed if any stage failed: the
+  pins hold until the last stage stores, and a stage's failure ends the
+  demotion unsaved. A lookup takes the shortest run any worker it asks holds,
+  so with every worker asked (`lookup_server_worker_ids` unset or all of
+  them) a chunk counts only if every stage holds it. Each demotion is a
+  request of its own, so the head retires an abandoned one, and only it,
+  from the aggregator (`bind_save_abandoned`).
 
 The shell builds :class:`LazyOffloadScheduler` for the layouts whose scheduler
 is the dense one (dense and MiniMax-M3), with a worker that stores a
@@ -74,7 +86,9 @@ from atom.kv_transfer.offload.prehashed import (
 
 logger = logging.getLogger("atom")
 
-# The request id of every demotion's save operation; an ATOM request's is an int.
+# The prefix of a demotion's request id, which its generation completes: under
+# PP the head retires an abandoned save by request id (`PPKVAggregator.forget`),
+# which must not take the other demotions with it. An ATOM request's id is an int.
 _DEMOTION_REQ_ID = "lmcache-lazy-demotion"
 # Demotions in flight at once; each pins its blocks until it reports.
 _MAX_DEMOTIONS_IN_FLIGHT = 2
@@ -107,10 +121,6 @@ class LazySaveSchedulerMixin:
                 f"spans ({self.virtual_block_size}: the block size, times the "
                 f"DCP size under DCP)"
             )
-        # A demotion reports per stage, and only the engine can retire a stage
-        # that never reports (`PPKVAggregator.forget`).
-        if int(getattr(self._config, "pipeline_parallel_size", 1) or 1) > 1:
-            raise ValueError("save_policy 'lazy' does not support pipeline parallelism")
         if not self._prehashed:
             raise ValueError(
                 "save_policy 'lazy' needs prehashed saves "
@@ -156,6 +166,15 @@ class LazySaveSchedulerMixin:
         self._looked_at: tuple[int, int, int, int | None] | None = None
         self._backoff_until = 0.0
         self.total_lazy_evicted_unsaved = 0
+        # The PP head's observer of demotions that will never report
+        # (`bind_save_abandoned`); None without PP.
+        self._report_abandoned = None
+
+    def bind_save_abandoned(self, report) -> None:
+        """Take the PP head's observer of abandoned saves, called with the
+        request id of each demotion that did not report: the head drops its
+        stages' partial tally (`PPEngineCoreProc._forget_pp_save_quorum`)."""
+        self._report_abandoned = report
 
     def bind_block_manager(self, block_manager) -> None:
         if not block_manager.enable_prefix_caching:
@@ -321,11 +340,12 @@ class LazySaveSchedulerMixin:
             block_ids = [block_id for block_id, _ in batch]
             for block_id in block_ids:
                 pool.claim_unreused(block_id)
-            operation = SaveOperationId(_DEMOTION_REQ_ID, self._save_nonce)
+            nonce = self._save_nonce
+            operation = SaveOperationId(f"{_DEMOTION_REQ_ID}-{nonce}", nonce)
             self._save_nonce += 1
             meta.add_request(
                 LMCacheReqMeta(
-                    req_id=_DEMOTION_REQ_ID,
+                    req_id=operation.req_id,
                     token_ids=[],
                     block_ids=block_ids,
                     save_spec=SaveSpec(skip_leading_tokens=0),
@@ -374,6 +394,8 @@ class LazySaveSchedulerMixin:
                     timeout,
                 )
                 self._end_demotion(operation, stored=False)
+                if self._report_abandoned is not None:
+                    self._report_abandoned(operation.req_id)
 
     def _end_demotion(self, operation, *, stored: bool) -> None:
         """Mark a demotion's blocks saved if it `stored`, and unpin them to the

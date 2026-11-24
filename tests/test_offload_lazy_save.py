@@ -31,10 +31,12 @@ from atom.kv_transfer.disaggregation.types import (
     ConnectorMetadata,
     KVConnectorOutput,
     LoadOperationId,
+    connector_metadata_has_work,
 )
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload import lazy_save, prehashed
 from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
+from atom.kv_transfer.offload._offload_common import pp_aware_rank_and_world
 from atom.kv_transfer.offload.chunked_scheduler import (
     DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL,
     DENSE_PAGE_SOURCE_SAFE_CHANNEL,
@@ -72,6 +74,9 @@ BLOCK = 4  # tokens per KV block, and per LMCache chunk
 STEP = 8  # max_num_batched_tokens
 BATCH = STEP // BLOCK  # blocks per demotion: what one step's tokens fill
 RESERVE = 2 * BATCH  # free blocks a demotion leaves
+PP = 4  # pipeline stages of the PP tests, as the M3.1 prefill node runs
+# Before the `lmcache` fixture stands it in.
+_REPLICA_WORLD_SIZE = offcfg.lmcache_replica_world_size
 
 
 class _TokenDatabase:
@@ -159,9 +164,9 @@ def _multi(*subs):
     return multi
 
 
-def _config(*, step=STEP, layout="m3", hf_config=None, dcp=1, **kvc):
+def _config(*, step=STEP, layout="m3", hf_config=None, dcp=1, pp=1, **kvc):
     """An offload config: M3 by override, or the layout `hf_config`'s model
-    resolves to when `layout` is None."""
+    resolves to when `layout` is None; `pp` pipeline stages of one TP rank."""
     if layout is not None:
         kvc = {"offload_layout": layout, **kvc}
     return SimpleNamespace(
@@ -175,7 +180,7 @@ def _config(*, step=STEP, layout="m3", hf_config=None, dcp=1, **kvc):
         kv_cache_block_size=BLOCK,
         decode_context_parallel_size=dcp,
         tensor_parallel_size=1,
-        pipeline_parallel_size=1,
+        pipeline_parallel_size=pp,
         offload_min_load_tokens=BLOCK,
         max_num_batched_tokens=step,
     )
@@ -226,9 +231,9 @@ def lmcache(monkeypatch):
     return state
 
 
-def _lazy(lmcache, blocks):
+def _lazy(lmcache, blocks, pp=1):
     """The lazy M3 scheduler, built through its shell, over a pool of `blocks`."""
-    shell = LMCacheOffloadConnectorScheduler(_config())
+    shell = LMCacheOffloadConnectorScheduler(_config(pp=pp))
     pool = BlockPool(blocks, cache_policy="slru")
     shell.bind_block_manager(SimpleNamespace(kv=pool, enable_prefix_caching=True))
     return shell._impl, pool, lmcache.tier
@@ -265,12 +270,12 @@ def _finish(sched, pool, seq):
     del seq.block_table[:]
 
 
-def _cold(lmcache, keyed, *, vacant, blocks):
+def _cold(lmcache, keyed, *, vacant, blocks, pp=1):
     """A pool of `blocks` whose coldest free blocks with content are a finished
     request's `keyed`, behind `vacant` vacant ones; a running request holds the
     rest. Returns the scheduler, the pool, the tier, the keyed blocks coldest
     first, and the running request."""
-    sched, pool, tier = _lazy(lmcache, blocks)
+    sched, pool, tier = _lazy(lmcache, blocks, pp)
     seq = _seq(keyed)
     cold = _hold(pool, seq)[::-1]
     filler = _seq(blocks - keyed - vacant, base=10_000)
@@ -279,10 +284,10 @@ def _cold(lmcache, keyed, *, vacant, blocks):
     return sched, pool, tier, cold, filler
 
 
-def _one_demotion(lmcache):
+def _one_demotion(lmcache, pp=1):
     """Two keyed blocks a single demotion takes: 300 blocks make a window of 6,
     the two past the four vacant ones that are the demotion's reserve."""
-    return _cold(lmcache, 2, vacant=RESERVE, blocks=300)
+    return _cold(lmcache, 2, vacant=RESERVE, blocks=300, pp=pp)
 
 
 def _chain(seq, chunk=BLOCK):
@@ -486,8 +491,11 @@ def test_a_demotion_is_a_prehashed_save_of_the_coldest_keyed_blocks(lmcache):
     assert second.prehashed_save == PrehashedSave(0, tuple(chain[BATCH:]))
     assert first.save_spec.skip_leading_tokens == 0 and first.token_ids == []
     assert first.load_spec is None
-    assert first.req_id == lazy_save._DEMOTION_REQ_ID
-    assert first.save_operation != second.save_operation
+    # Each demotion a request of its own: a PP head retires one by request id.
+    for req in (first, second):
+        op = req.save_operation
+        assert req.req_id == op.req_id == f"lmcache-lazy-demotion-{op.generation}"
+    assert first.req_id != second.req_id
     # Pinned for the store, without counting as a reuse.
     assert all(pool.is_used(b) for b in cold)
     assert not set(cold) & pool._reused
@@ -746,6 +754,7 @@ def test_a_demotion_that_never_reports_is_unpinned_unsaved(lmcache, clock, monke
     (again,) = sched.build_connector_meta().requests
     assert again.block_ids == stalled.block_ids
     assert stalled.save_operation not in sched._demotions
+    assert sched._report_abandoned is None  # no PP head to tell
     assert _saved(sched, cold) == [False, False]
     assert sched.get_statistics()["saves_pending"] == 1
     # The late report changes nothing: no mark, no second unpin.
@@ -1001,13 +1010,6 @@ def test_a_chain_lmcache_would_not_compute_is_refused_at_startup(lmcache, monkey
 def test_an_unsupported_config_is_refused(lmcache, overrides, match):
     with pytest.raises(ValueError, match=match):
         LMCacheOffloadConnectorScheduler(_config(**overrides))
-
-
-def test_pipeline_parallelism_is_refused(lmcache):
-    config = _config()
-    config.pipeline_parallel_size = 2
-    with pytest.raises(ValueError, match="pipeline parallelism"):
-        LMCacheOffloadConnectorScheduler(config)
 
 
 def test_lazy_needs_prefix_caching(lmcache):
@@ -1607,3 +1609,328 @@ def test_a_dense_model_reloads_the_kv_it_demoted(
     assert hbm < end and end % model.vbs == 0
     # Every prompt block: the HBM hit, what the tier gave back, what it ran.
     assert model.holds(again, first.num_prompt_tokens // model.vbs)
+
+
+# ------------------------------------------------------- pipeline parallelism
+class _StageReports:
+    """What the PP head polls: stage 0's TP-aggregated report through its
+    runner manager, the downstream stages' through its PP transport. `post`
+    queues one stage's report for the next poll."""
+
+    def __init__(self):
+        self.queued: list[tuple[int, KVConnectorOutput]] = []
+
+    def post(self, stage, output):
+        self.queued.append((stage, output))
+
+    def call_func_with_aggregation(self, name):
+        assert name == "async_proc_aggregation"
+        local = [out for stage, out in self.queued if stage == 0]
+        return local[0] if local else KVConnectorOutput()
+
+    def recv_kv_status(self, timeout_ms=0):
+        downstream = [(stage, out) for stage, out in self.queued if stage != 0]
+        self.queued = []
+        return downstream
+
+
+def _pp_head(monkeypatch, connector, scheduler=None):
+    """The PP head's engine core over `connector`, built through its own
+    `__init__` with `EngineCore`'s stood in for. Its scheduler is `scheduler`,
+    or one that hands what the head passes on to `connector`. Returns the head
+    and the stage reports it polls."""
+    from aiter_stub import stubbed_aiter
+
+    with stubbed_aiter():
+        from atom.model_engine import pp_engine_core
+
+    if scheduler is None:
+        scheduler = SimpleNamespace(
+            kv_connector=connector,
+            block_manager=SimpleNamespace(enable_prefix_caching=True),
+            _update_from_kv_xfer_finished=connector.process_completions,
+        )
+
+    def core_init(self, _config, *_args):
+        self.scheduler, self.kv_transfer_enabled, self.label = scheduler, True, "head"
+
+    reports = _StageReports()
+    monkeypatch.setattr(pp_engine_core.EngineCore, "__init__", core_init)
+    monkeypatch.setattr(pp_engine_core, "PPStageTransport", lambda *a, **k: reports)
+    config = SimpleNamespace(
+        pipeline_parallel_size=PP,
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_rank=0, pp_meta_addrs=[], pp_token_addr=""
+        ),
+    )
+    head = pp_engine_core.PPEngineCoreProc(config, None, None)
+    head.runner_mgr = reports
+    return head, reports
+
+
+def _stored(reqs, ok=True):
+    """One stage's report of storing its layers of `reqs`."""
+    operations = {req.save_operation for req in reqs}
+    return KVConnectorOutput(
+        finished_saving=set(operations),
+        connector_completions={
+            ConnectorCompletion(DENSE_PAGE_STORE_CHANNEL, op, ok) for op in operations
+        },
+    )
+
+
+def _poll(head, reports, stage, output):
+    reports.post(stage, output)
+    head._poll_kv_transfer_progress()
+
+
+def test_under_pp_the_lazy_classes_are_built(lmcache):
+    assert _shells(_config(pp=PP)) == (LazyOffloadScheduler, M3OffloadConnector)
+
+
+def test_under_pp_a_demotion_stays_pinned_until_every_stage_stored(
+    lmcache, monkeypatch
+):
+    sched, pool, _, cold, _ = _one_demotion(lmcache, pp=PP)
+    head, reports = _pp_head(monkeypatch, sched)
+    meta = sched.build_connector_meta()
+    (req,) = meta.requests
+    # A demotion alone is work the head ships to every stage.
+    assert connector_metadata_has_work(meta)
+    for stage in (3, 0, 2):
+        _poll(head, reports, stage, _stored([req]))
+        assert req.save_operation in sched._demotions
+        assert all(pool.is_used(b) for b in cold)
+        assert _saved(sched, cold) == [False, False]
+    assert head._pp_kv_aggregator.has_pending()
+    _poll(head, reports, 1, _stored([req]))
+    assert _saved(sched, cold) == [True, True] and not sched._demotions
+    assert pool.num_free == 6 and not head._pp_kv_aggregator.has_pending()
+    assert sched.get_statistics()["saves_pending"] == 0
+
+
+@pytest.mark.parametrize("failing", [0, 3])
+def test_under_pp_one_stages_failure_fails_the_demotion_once_all_reported(
+    lmcache, monkeypatch, clock, failing
+):
+    sched, pool, _, cold, _ = _one_demotion(lmcache, pp=PP)
+    head, reports = _pp_head(monkeypatch, sched)
+    (req,) = sched.build_connector_meta().requests
+    order = [failing] + [stage for stage in range(PP) if stage != failing]
+    for stage in order[:-1]:
+        _poll(head, reports, stage, _stored([req], ok=stage != failing))
+        # The other stages may still be storing into the pinned blocks.
+        assert all(pool.is_used(b) for b in cold)
+        assert req.save_operation in sched._demotions
+    _poll(head, reports, order[-1], _stored([req]))
+    assert _saved(sched, cold) == [False, False] and pool.num_free == 6
+    assert not sched._demotions and sched._perf_counters["lazy_demotion_failures"]
+    assert sched.build_connector_meta().requests == []  # backing off
+    clock[0] += lazy_save._DEMOTION_BACKOFF_S
+    (retry,) = sched.build_connector_meta().requests
+    assert retry.block_ids == req.block_ids
+
+
+def test_under_pp_an_abandoned_demotion_is_retired_alone(lmcache, clock, monkeypatch):
+    sched, pool, _, cold, _ = _one_demotion(lmcache, pp=PP)
+    monkeypatch.setattr(sched, "save_abandon_timeout_s", lambda: 30.0)
+    head, reports = _pp_head(monkeypatch, sched)
+    assert sched._report_abandoned == head._forget_pp_save_quorum
+    (stalled,) = sched.build_connector_meta().requests
+    for stage in range(PP - 1):
+        _poll(head, reports, stage, _stored([stalled]))
+    assert head._pp_kv_aggregator.has_pending()
+    clock[0] += 30.0
+    (again,) = sched.build_connector_meta().requests
+    assert again.block_ids == stalled.block_ids
+    assert again.req_id != stalled.req_id
+    # The head dropped the stalled demotion's partial tally: nothing pending.
+    assert not head._pp_kv_aggregator.has_pending()
+    # Its last stage's late report completes nothing.
+    _poll(head, reports, PP - 1, _stored([stalled]))
+    assert again.save_operation in sched._demotions
+    assert all(pool.is_used(b) for b in cold)
+    assert _saved(sched, cold) == [False, False]
+    # The next demotion still reports, once every stage has.
+    for stage in range(PP):
+        _poll(head, reports, stage, _stored([again]))
+    assert _saved(sched, cold) == [True, True] and not sched._demotions
+    assert not head._pp_kv_aggregator.has_pending()
+
+
+def test_the_shells_hand_the_pp_head_their_lazy_tier(lmcache):
+    shell = LMCacheOffloadConnectorScheduler(_config(pp=PP))
+    multi = _multi(_Producer(), shell)
+
+    def report(_req_id):
+        pass
+
+    multi.bind_save_abandoned(report)
+    assert shell._impl._report_abandoned is report
+
+
+def test_under_pp_a_load_completes_once_every_stage_loaded(lmcache, monkeypatch):
+    sched, pool, _ = _lazy(lmcache, 12, pp=PP)
+    head, reports = _pp_head(monkeypatch, sched)
+    for ok in (True, False):
+        seq = _seq(4, base=100 if ok else 200)
+        blocks = _hold(pool, seq)
+        operation = LoadOperationId(seq.id, 0)
+        sched._active_load_operations[str(seq.id)] = (seq, operation)
+        seq.offload_load_start_tokens = BLOCK
+        seq.offload_loaded_tokens = 3 * BLOCK
+        for stage in range(PP):
+            if stage == PP - 1:
+                assert str(seq.id) in sched._active_load_operations
+                assert sched._loaded_chunks == {}
+            failed = not ok and stage == 1
+            _poll(
+                head,
+                reports,
+                stage,
+                KVConnectorOutput(
+                    finished_loading=set() if failed else {operation},
+                    failed_loading={operation} if failed else set(),
+                ),
+            )
+        assert str(seq.id) not in sched._active_load_operations
+        _finish(sched, pool, seq)
+        saved = _saved(sched, blocks)
+        assert saved == ([False, True, True, False] if ok else [False] * 4)
+    assert not head._pp_kv_aggregator.has_pending()
+
+
+class _StageTiers:
+    """The lookup servers of a PP x TP replica: one answer per worker, each
+    the contiguous run its own stage's tier holds."""
+
+    def __init__(self, stored, chunk=BLOCK):
+        self.stored, self.chunk = stored, chunk
+        self.lookups: list[list[int]] = []
+
+    def send_and_recv_all(self, message):
+        self.lookups.append(list(message[0]))
+        answers = []
+        for held in self.stored:
+            run = 0
+            for chunk_hash in message[0]:
+                if chunk_hash not in held:
+                    break
+                run += 1
+            answers.append((run * self.chunk).to_bytes(4, "big"))
+        return answers
+
+
+def test_under_pp_a_lookup_counts_the_shortest_run_any_stage_holds(
+    lmcache, monkeypatch
+):
+    worlds = []
+    monkeypatch.setattr(offcfg, "lmcache_replica_world_size", _REPLICA_WORLD_SIZE)
+    monkeypatch.setattr(
+        offcfg,
+        "build_lmcache_metadata",
+        lambda _c, _cfg, world, rank: worlds.append((world, rank))
+        or SimpleNamespace(engine_id="m3"),
+    )
+    config = _config(pp=PP)
+    config.tensor_parallel_size = 2
+    sched = LMCacheOffloadConnectorScheduler(config)._impl
+    # The lookup client asks every worker of the PP x TP replica.
+    assert worlds == [(PP * 2, 0)]
+    seq = _seq(6)
+    chain = _chain(seq)
+    seq.offload_hbm_probe_tokens = BLOCK
+    # Past the HBM hit of one block, stages hold runs of 4, 2, 3 and 4.
+    runs = [5, 3, 4, 5]
+    sched._lookup_client.transport = _StageTiers(
+        [set(chain[1:end]) for end in runs for _tp in range(2)]
+    )
+    assert sched.get_num_new_matched_tokens(seq) == (3 * BLOCK, True)
+    assert sched._load_specs[str(seq.id)].lmcache_cached_tokens == 3 * BLOCK
+
+
+def test_under_pp_each_stage_stores_a_demotion_under_its_own_worker_id(
+    lmcache, monkeypatch
+):
+    pytest.importorskip("lmcache")
+    from lmcache.v1.token_database import ChunkedTokenDatabase
+    from test_offload_prehashed_save import _engine
+
+    tp = 2
+    config = _config(pp=PP)
+    config.tensor_parallel_size = tp
+    world = _REPLICA_WORLD_SIZE(config)
+    assert world == PP * tp
+    sched, pool, _ = _lazy(lmcache, 300, pp=PP)
+    _hold(pool, _seq(300 - 2 - RESERVE, base=10_000))
+    seq = _seq(2)
+    _hold(pool, seq)
+    _finish(sched, pool, seq)
+    meta = sched.build_connector_meta()
+    (req,) = meta.requests
+    _cpu_fences(monkeypatch)
+    stored = {}
+    for pp_rank in range(PP):
+        for tp_rank in range(tp):
+            config.parallel_config = SimpleNamespace(pipeline_parallel_rank=pp_rank)
+            rank, size = pp_aware_rank_and_world(
+                config, SimpleNamespace(world_size=tp, rank_in_group=tp_rank)
+            )
+            assert (rank, size) == (pp_rank * tp + tp_rank, world)
+            engine = _engine()
+            engine.token_database = ChunkedTokenDatabase(
+                SimpleNamespace(
+                    chunk_size=BLOCK,
+                    save_unfull_chunk=False,
+                    pre_caching_hash_algorithm="builtin",
+                    remote_url=None,
+                    enable_pd=False,
+                    get_extra_config_value=lambda _name, default=None: default,
+                ),
+                SimpleNamespace(
+                    model_name="m3",
+                    world_size=size,
+                    worker_id=rank,
+                    kv_dtype=torch.uint8,
+                    use_mla=False,
+                    is_first_rank=lambda: False,
+                ),
+            )
+            worker = M3OffloadConnector.__new__(M3OffloadConnector)
+            worker._init_worker_common(
+                SimpleNamespace(kv_transfer_config={"kv_role": "offload"})
+            )
+            worker.chunk_size, worker._engine, worker._rank = BLOCK, engine, rank
+            worker._early_release = True
+            worker.start_load_kv(meta)
+            worker.close()
+            keys, _objs = engine.storage_manager.put[-1]
+            stored[rank] = keys
+    # The same chunks on every worker, each under its own worker id.
+    assert sorted(stored) == list(range(world))
+    for rank, keys in stored.items():
+        assert [key.worker_id for key in keys] == [rank] * 2
+        assert [key.chunk_hash for key in keys] == list(req.prehashed_save.hashes)
+    assert len({key for keys in stored.values() for key in keys}) == 2 * world
+
+
+def test_under_pp_the_stages_split_pp_times_the_host_budget_by_layers(lmcache):
+    from atom.models.utils import get_pp_indices
+
+    # 62 layers over 4 stages split unevenly; each stage's worker sizes its
+    # own engine.
+    budgets, layers = [], []
+    for pp_rank in range(PP):
+        config = _config(pp=PP)
+        config.hf_config = SimpleNamespace(num_hidden_layers=62)
+        config.parallel_config = SimpleNamespace(pipeline_parallel_rank=pp_rank)
+        config.speculative_config = None
+        assert _REPLICA_WORLD_SIZE(config) == PP
+        cfg = SimpleNamespace(max_local_cpu_size=100.0)
+        offcfg.scale_cpu_size_for_pp(cfg, config)
+        budgets.append(cfg.max_local_cpu_size)
+        start, end = get_pp_indices(62, pp_rank, PP)
+        layers.append(end - start)
+    assert len(set(layers)) > 1
+    assert sum(budgets) == pytest.approx(PP * 100.0)
+    assert budgets == pytest.approx([PP * 100.0 * n / 62 for n in layers])

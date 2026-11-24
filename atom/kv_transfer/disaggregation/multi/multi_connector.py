@@ -389,6 +389,12 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             if callable(bind):
                 bind(block_manager)
 
+    def bind_save_abandoned(self, report: Any) -> None:
+        """Hand the PP head's abandoned-save observer to each sub that gives
+        up on saves of its own (a lazy offload tier's demotions)."""
+        for bind in self._sub_methods("bind_save_abandoned"):
+            bind(report)
+
     def lookup_pending(self, seq: Any) -> bool:
         """True while any sub's external-tier lookup for `seq` is in flight."""
         for connector in self._connectors:

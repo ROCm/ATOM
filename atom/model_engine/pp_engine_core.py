@@ -57,6 +57,11 @@ class PPEngineCoreProc(EngineCore):
         # scheduler already decides when a save is beyond hope; this is the
         # only way that decision reaches a dict it has no handle on.
         self.scheduler.on_save_abandoned = self._forget_pp_save_quorum
+        # A lazy offload tier gives up on its own demotions, which the
+        # scheduler does not track.
+        bind = getattr(self.scheduler.kv_connector, "bind_save_abandoned", None)
+        if callable(bind):
+            bind(self._forget_pp_save_quorum)
         logger.info(
             f"{self.label}: PP stage {self.pp_rank}/{self.pp_size} "
             f"(head={self.is_head}, last={self.is_last}) ready"
@@ -237,8 +242,9 @@ class PPEngineCoreProc(EngineCore):
     def _forget_pp_save_quorum(self, req_id) -> None:
         """Drop a request's partial stage tallies once its save is abandoned.
 
-        Fires from `Scheduler._reconcile_stalled_deferred_saves`, so the
-        aggregator gives up on exactly the requests the scheduler already has,
+        Fires from `Scheduler._reconcile_stalled_deferred_saves`, and from a
+        lazy offload tier for each demotion it abandons (`bind_save_abandoned`),
+        so the aggregator gives up on exactly the saves those already have,
         and the two cannot drift.
         """
         # A save can time out before any stage reports. Its first late report
