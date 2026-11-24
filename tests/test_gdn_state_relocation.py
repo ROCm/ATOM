@@ -480,13 +480,18 @@ def test_a_pd_connector_that_cannot_move_the_state_is_refused(monkeypatch):
         builder.get_kv_transfer_tensors()
 
 
-def test_moriio_keeps_refusing_pp():
-    """Only the Mooncake path places a PP stage's rows by layer; MoRIIO reads
-    none of that placement."""
+def test_moriio_gets_a_pp_stages_placement_and_tp_shards():
+    """MoRIIO places a PP stage's PAGE regions in a whole-model consumer's list
+    and splits its state over a consumer at a larger TP from the same answer
+    the Mooncake path reads."""
     builder = kimi_builder({"kv_connector": "moriio"}, pp_size=2)
 
-    with pytest.raises(NotImplementedError, match="over moriio does not support"):
-        builder.get_kv_transfer_tensors()
+    tensors = builder.get_kv_transfer_tensors()
+
+    assert tensors.block_region_consumer_indices == [1]
+    assert tensors.slot_region_consumer_indices == [3, 4, 5, 9, 10, 11]
+    assert len(tensors.slot_region_tp_segments) == len(tensors.slot_regions)
+    assert all(seg is not None for seg in tensors.slot_region_tp_segments)
 
 
 def test_a_sparse_mla_model_keeps_refusing_pp():

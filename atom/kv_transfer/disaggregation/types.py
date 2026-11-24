@@ -607,6 +607,9 @@ class ReqMeta:
     # when every stage listens on `remote_host`.
     remote_pp_hosts: list[str] = field(default_factory=list)
     remote_tp_size: int = 0
+    # The producer's DCP size (its `dcp_size` field); 0 when it did not say,
+    # which MoRIIO reads as this side's own.
+    remote_dcp_size: int = 0
     transfer_id: TransferId = 0
     local_slot_index: int = -1
     # Producer's final committed state slot. This is distinct from
@@ -718,6 +721,7 @@ class ConnectorMetadata:
             remote_pp_size=kv_transfer_params.get("remote_pp_size", 1),
             remote_pp_hosts=list(kv_transfer_params.get("remote_pp_hosts") or ()),
             remote_tp_size=kv_transfer_params.get("remote_tp_size", 0),
+            remote_dcp_size=int(kv_transfer_params.get("dcp_size") or 0),
             tp_size=(
                 kv_transfer_params.get("tp_size")
                 if "tp_size" in kv_transfer_params

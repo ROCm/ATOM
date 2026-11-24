@@ -163,8 +163,11 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         config = self.model_runner.config
         model_type = config.hf_config.model_type
 
-        # Mooncake moves the slot regions published below; MoRIIO registers the
-        # same pools itself, from the `per_request_state` tensors in kv_caches.
+        # Mooncake moves the slot regions published below. MoRIIO registers the
+        # same pools itself, from the `per_request_state` tensors in kv_caches,
+        # and reads the rest: where a PP stage's MLA rows sit in a whole-model
+        # peer (`block_region_consumer_indices`) and how each slot region splits
+        # over a peer at a larger TP (`slot_region_tp_segments`).
         if connector not in ("mooncake", "moriio"):
             raise NotImplementedError(
                 f"{model_type} disaggregated serving requires the mooncake or "
@@ -173,19 +176,6 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
                 "other connector would move the full-attention layers and "
                 "silently drop the state of the KDA layers."
             )
-
-        if connector == "moriio":
-            # MoRIIO reads none of the placement the Mooncake path below
-            # publishes for a PP stage's MLA rows and KDA slots.
-            if config.pipeline_parallel_size > 1:
-                raise NotImplementedError(
-                    f"{model_type} disaggregated serving over moriio does not "
-                    "support pipeline parallelism (pipeline_parallel_size="
-                    f"{config.pipeline_parallel_size}). Use the mooncake "
-                    "connector, or run the P and D instances with PP=1."
-                )
-            tensors.slot_regions, tensors.num_slots = self.state_slot_regions()
-            return tensors
 
         if config.pipeline_parallel_size > 1 and self.model_runner.has_mla_indexer:
             # A PP stage places its MLA rows and KDA slots by layer; a sparse

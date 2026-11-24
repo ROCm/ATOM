@@ -190,15 +190,26 @@ def page_digest(views: list[torch.Tensor], block_ids: list[int]) -> int:
     return sum(page_region_digests(views, block_ids))
 
 
-def page_region_digests(views: list[torch.Tensor], block_ids: list[int]) -> list[int]:
-    """Each PAGE view's term of `page_digest`, in view order."""
+def page_region_digests(
+    views: list[torch.Tensor],
+    block_ids: list[int],
+    region_ids: list[int] | None = None,
+) -> list[int]:
+    """Each PAGE view's term of `page_digest`, in view order.
+
+    A term is weighted by its region's id, by default its position. A PP stage
+    holds only its own layers' regions, so it passes ``region_ids``, the
+    consumer's index of each (``block_region_consumer_indices``): its terms
+    then equal the consumer's terms for the same regions.
+    """
     device = views[0].device
     idx = torch.as_tensor(block_ids, dtype=torch.int64, device=device)
     terms = []
     for i, view in enumerate(views):
+        rid = i if region_ids is None else int(region_ids[i])
         rows = view.index_select(0, idx).reshape(-1).to(torch.int64)
         weights = (
-            torch.arange(rows.numel(), dtype=torch.int64, device=device) + 7919 * i
+            torch.arange(rows.numel(), dtype=torch.int64, device=device) + 7919 * rid
         ) % 65521 + 1
         terms.append(torch.sum(rows * weights))
     return [int(t) for t in torch.stack(terms).tolist()]

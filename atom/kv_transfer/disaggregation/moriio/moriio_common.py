@@ -176,6 +176,11 @@ class MoRIIOConstants:
     # blocks it allocated, and the producer reports back once it has.
     WRITE_REQ = b"write_req"
     WRITE_DONE = b"write_done"
+    # A PP producer's stages index one block table, which stage 0's scheduler
+    # owns: a consumer rank that has every stage's WRITE_DONE for a request
+    # tells stage 0, which frees the request's blocks once every consumer rank
+    # reading it has.
+    RELEASE = b"release"
     OVER = b"OVER"
     COMPLETION_PREFIX = "cmpl"
 

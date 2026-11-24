@@ -140,6 +140,21 @@ class PageDigestTest(unittest.TestCase):
             [s == d for s, d in zip(src_terms, dst_terms)], [True, True, False]
         )
 
+    def test_a_stage_weights_its_regions_as_the_consumer_does(self):
+        """A PP stage holds only its own layers' regions: given their index on
+        the consumer, its terms equal the consumer's terms for those regions."""
+        consumer = self.views(0)
+        stage = [consumer[1].clone(), consumer[2].clone()]
+        self.assertEqual(
+            fabric.page_region_digests(stage, [1, 2], region_ids=[1, 2]),
+            fabric.page_region_digests(consumer, [1, 2])[1:],
+        )
+        # By position they are weighted as the consumer's regions 0 and 1.
+        self.assertNotEqual(
+            fabric.page_region_digests(stage, [1, 2]),
+            fabric.page_region_digests(consumer, [1, 2])[1:],
+        )
+
     def test_swapped_regions_change_the_digest(self):
         a = torch.arange(32, dtype=torch.uint8).view(2, 1, 16)
         b = (torch.arange(32, dtype=torch.uint8) + 1).view(2, 1, 16)
@@ -275,7 +290,7 @@ class StateWiringTest(unittest.TestCase):
             fabric_branch.index("self._write_pages("),
         )
         self.assertIn(
-            "for session, size, local_offset, remote_offset in state_writes",
+            "for session, sizes, local_offsets, remote_offsets in state_writes",
             fabric_branch,
         )
 
