@@ -280,6 +280,7 @@ def _input_phase(sp: SeqShard, layer, embeddings: torch.Tensor):
     scales = torch.empty(
         (sp.padded, hidden // 32), dtype=torch.float8_e8m0fnu, device=dev
     )
+
     def run(coll):
         r = sp.shard(embeddings)
         x = layer.input_layernorm.forward_cuda(r)
@@ -310,7 +311,7 @@ def _expert_tables(moe):
     """(w13, w2, w13 scale, w2 scale) of the routed experts, aiter-preshuffled,
     and the factor their output still needs (FHMoE folds it into the weights)."""
     experts = moe.experts
-    if moe.fhmoe is not None:
+    if getattr(moe, "fhmoe", None) is not None:
         return moe.fhmoe.routed_tables, 1.0
     tables = (
         experts.w13_weight,
