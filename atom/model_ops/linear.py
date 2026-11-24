@@ -1412,6 +1412,23 @@ class LinearBase(nn.Module):
                 native_group_rows=self.native_a8_group_rows,
             ):
                 shuffle_weights(self.weight)
+                from atom.model_ops import ak_gemm
+
+                if (
+                    ak_gemm.ENABLED
+                    and self.native_a8_group_rows == 1
+                    and self.weight.dtype == torch.float8_e4m3fn
+                    and ak_gemm.shape_supported(*self.weight.shape)
+                ):
+                    self._ak_weight_scale = ak_gemm.prepare(
+                        self.weight,
+                        self.weight_scale,
+                        ak_gemm.MAX_TOKENS,
+                    )
+                    if getattr(self, "_p1_front", False):
+                        from atom.model_ops.minimax_m3 import p1_front
+
+                        p1_front.warm(self.weight, self._ak_weight_scale)
             return
         if self.weight.numel() == 0:
             return
@@ -1663,7 +1680,31 @@ class LinearBase(nn.Module):
             "Linear out= requested but this quant path does not support it "
             f"(quant_type={self.quant_type})."
         )
-        if self.native_a8_group_rows is not None:
+        ak_scale = getattr(self, "_ak_weight_scale", None)
+        if (
+            ak_scale is not None
+            and x_scale is not None
+            and otype == dtypes.bf16
+            and getattr(x_scale, "_p1_ak_preshuffled", False)
+        ):
+            # p1 SP prefill: codes + AITER-shuffled scales made by amd_kernels' quantizer (sp_prefill.py)
+            from atom.model_ops.ak_gemm import ak_mxfp8_gemm_preshuffled
+
+            y = ak_mxfp8_gemm_preshuffled(x, x_scale, self.weight, ak_scale)
+            if self.bias is not None:
+                y += self.bias
+        elif ak_scale is not None and x_scale is None and otype == dtypes.bf16:
+            from atom.model_ops.ak_gemm import ak_mxfp8_linear
+
+            if getattr(self, "_p1_front", False):
+                from atom.model_ops.minimax_m3 import p1_front
+
+                y = p1_front.qkv_front(x, self.weight, self.weight_scale, ak_scale)
+            else:
+                y = ak_mxfp8_linear(x, self.weight, self.weight_scale, ak_scale)
+            if self.bias is not None:
+                y += self.bias
+        elif self.native_a8_group_rows is not None:
             from atom.model_ops.blockscale import native_quant_linear
 
             y = native_quant_linear(

@@ -52,6 +52,7 @@ from atom.models.minimax_m3.mono.config import (
     TP,
     IndexHeads,
 )
+from atom.models.minimax_m3.mono.kernels.common import KV_PAGE_BYTES
 from atom.models.minimax_m3.mono.kernels.dense_post import (
     DENSE_POST_ABI,
     build_dense_post_kernel,
@@ -93,6 +94,8 @@ from atom.utils.forward_context import get_forward_context
 logger = logging.getLogger("atom")
 
 N_DENSE = 3
+# LLVM options of the rebuild of a layer kernel that needs scratch (``MonoDecodeRunner._lean_layer_kernels``)
+LEAN_LLVM_OPTIONS = {"amdgpu-use-amdgpu-trackers": True}
 # a width's kernels by kind (``_build_layer_kernels``): the sparse ones' is K4's
 _KERNEL_ABI = {
     "dense_pre0": K1_ABI,
@@ -103,6 +106,12 @@ _KERNEL_ABI = {
 
 def _ptr(t: torch.Tensor) -> int:
     return t.data_ptr()
+
+
+def _opt_ptr(t: torch.Tensor | None) -> int:
+    """An argument the build does not read (``fused_shared``: the MXFP8 shared
+    expert's weights) is 0."""
+    return 0 if t is None else t.data_ptr()
 
 
 def _sparse_metadata(fwd):
@@ -158,8 +167,13 @@ class MonoDecodeRunner:
         # kernel of each kind the layers use (``self.k4[n][lw.index_topk]``) and,
         # with a mono dense prefix, the dense layers' (``self.k4[n]["dense_pre0"
         # | "dense_pre" | "dense_post"]``), built and compiled on its first step
+        self._width_of: dict[int, int] = {}
         self.k4 = WidthBuilds(
-            self._build_layer_kernels, self._layer_kernels, group, "MiniMax-M3 mono"
+            self._build_layer_kernels,
+            self._layer_kernels,
+            group,
+            "MiniMax-M3 mono",
+            lean=self._lean_layer_kernels,
         )
 
     def _build_layer_kernels(self, n: int) -> dict:
@@ -171,7 +185,22 @@ class MonoDecodeRunner:
             kernels["dense_pre0"] = self._build_dense_pre(n, plain_norm=True)
             kernels["dense_pre"] = self._build_dense_pre(n)
             kernels["dense_post"] = self._build_dense_post(n)
+        self._width_of[id(kernels)] = n
         return kernels
+
+    def _lean_layer_kernels(self, built: dict, spilled: list) -> dict | None:
+        """A width whose layer kernel needs scratch (fp8 caches + a4w4 at 6 and 8 tokens: the
+        compiler keeps a 36 B frame of two SGPR spill slots that no instruction touches, and any
+        schedule change flips it) is rebuilt unchanged except for the machine scheduler's
+        register-pressure trackers (``LEAN_LLVM_OPTIONS``), scratch-free at every width 1..16
+        (same arithmetic: only the instruction order moves)."""
+        lean = dict(built)
+        for kind, launch in built.items():
+            if isinstance(kind, bool) and launch in spilled:
+                n = self._width_of[id(built)]
+                lean[kind] = self._build_k4(n, index_topk=kind)
+                lean[kind].compile_hints["llvm_options"] = LEAN_LLVM_OPTIONS
+        return lean
 
     @staticmethod
     def _layer_kernels(kernels: dict) -> list:
@@ -227,12 +256,61 @@ class MonoDecodeRunner:
         experts = layers[N_DENSE].block_sparse_moe.experts
         eps = config.rms_norm_eps
         route_scale = float(layers[N_DENSE].block_sparse_moe.routed_scaling_factor)
-        # the fused shared expert's routing weight is whatever the topK metadata holds
-        # read through the module: the metadata is assigned after this file is imported
-        total_w, total_ids = topk_meta.aiter_topK_meta_data
-        if int(total_ids[0, TOP_K].item()) != N_ROUTED:
-            raise MonoUnsupported("fused shared expert id")
-        shared_weight = float(total_w[0, TOP_K].item())
+        # NVFP4 K/V + index pages (single-buffer): every layer alike, both caches together
+        self.nvfp4 = impl.kv_cache_dtype == "nvfp4"
+        if self.nvfp4 and self.index_heads > 1:
+            # the in-kernel CP scorer has not been checked against NVFP4 index
+            # pages, and there is no build that reads the CP projection's
+            # replicated index q heads but scores the rank's own head alone
+            raise MonoUnsupported("indexer CP with NVFP4 caches")
+        kv = get_forward_context().kv_cache_data[f"layer_{self.sparse[0].layer_id}"]
+        pools = [t for t in (kv.k_cache, kv.v_cache) if t is not None]
+        if max(t.numel() * t.element_size() for t in pools) > 1 << 32:
+            raise MonoUnsupported("KV cache over 4 GiB a layer (32-bit buffer offsets)")
+        if any(
+            lw.attn_impl.kv_cache_dtype != impl.kv_cache_dtype for lw in self.sparse
+        ):
+            raise MonoUnsupported("KV cache dtype differs between layers")
+        # the checkpoint's MXFP8 1x32 attention linears (native quantization) or the
+        # ptpc-FP8 requantization: every layer alike (the K1 / K4 builds read one kind)
+        self.attn_mxfp8 = self.sparse[0].attn_mxfp8
+        self.w13_gugu = self.sparse[0].w13_gugu
+        if any(lw.w13_gugu != self.w13_gugu for lw in self.sparse):
+            raise MonoUnsupported("routed w13 layouts differ between layers")
+        if any(lw.attn_mxfp8 != self.attn_mxfp8 for lw in self.sparse):
+            raise MonoUnsupported("attention linears quantized differently per layer")
+        if self.attn_mxfp8 and self.dense_mono:
+            raise MonoUnsupported("native MXFP8 attention with a mono dense prefix")
+        # the shared expert fused into the routed tables (expert N_ROUTED) or an MXFP8
+        # MLP of its own: every layer alike (the K4 builds read one kind)
+        self.fused_shared = self.sparse[0].fused_shared
+        if any(lw.fused_shared != self.fused_shared for lw in self.sparse):
+            raise MonoUnsupported("shared expert fused in some layers only")
+        if self.fused_shared and self.w13_gugu:
+            raise MonoUnsupported("fused shared expert with the interleaved routed w13")
+        logger.info(
+            "MiniMax-M3 mono: attention linears %s, shared expert %s",
+            "native MXFP8 1x32" if self.attn_mxfp8 else "ptpc FP8",
+            "fused (MXFP4, a8w4)" if self.fused_shared else "MXFP8 MLP",
+        )
+        routed_only = envs.ATOM_MONO_CHECK and envs.ATOM_MONO_CHECK_ROUTED_ONLY
+        if self.fused_shared:
+            # the original layers' fused shared expert cannot be left out of the check
+            if routed_only:
+                raise MonoUnsupported(
+                    "ATOM_MONO_CHECK_ROUTED_ONLY with a fused shared expert"
+                )
+            # the fused shared expert's routing weight is whatever the topK metadata
+            # holds, read through the module: the metadata is assigned after this
+            # file is imported
+            total_w, total_ids = topk_meta.aiter_topK_meta_data
+            if int(total_ids[0, TOP_K].item()) != N_ROUTED:
+                raise MonoUnsupported("fused shared expert id")
+            shared_weight = float(total_w[0, TOP_K].item())
+        else:
+            # the shared expert is added to the routed sum as it is (a check of the
+            # routed experts alone: not at all)
+            shared_weight = 0.0 if routed_only else 1.0
         self.sm_scale = impl.scale
         if abs(self.sm_scale - HEAD_DIM**-0.5) > 1e-12:
             raise MonoUnsupported(f"softmax scale {self.sm_scale}")
@@ -266,6 +344,11 @@ class MonoDecodeRunner:
             timeline=self.timeline is not None,
             heads=heads,
             debug=self.debug,
+            kv_nvfp4=self.nvfp4,
+            index_nvfp4=self.nvfp4,
+            attn_mxfp8=self.attn_mxfp8,
+            w13_gugu=self.w13_gugu,
+            fused_shared=self.fused_shared,
         )
         # a dense layer's kernels around its original attention
         if self.dense_mono:
@@ -482,9 +565,19 @@ class MonoDecodeRunner:
         block_table, seq_lens = rows
         stream = torch.cuda.current_stream()
         kv = fwd.kv_cache_data[f"layer_{lw.layer_id}"]
-        k16, v16, ks16, vs16 = to_page16_shuffle(
-            kv.k_cache, kv.v_cache, kv.k_scale, kv.v_scale
-        )
+        if self.nvfp4:
+            # the pool's page view is both K and V; the kernels step pages by KV_PAGE_BYTES
+            pages = kv.k_cache
+            if pages.stride() != (KV_PAGE_BYTES, 1) or pages.dtype != torch.uint8:
+                raise MonoUnsupported(
+                    f"NVFP4 KV pages {pages.dtype} {tuple(pages.shape)} {pages.stride()}"
+                )
+            k16 = v16 = pages
+            ks16, vs16 = lw.attn_impl.nvfp4_k_scale, lw.attn_impl.nvfp4_v_scale
+        else:
+            k16, v16, ks16, vs16 = to_page16_shuffle(
+                kv.k_cache, kv.v_cache, kv.k_scale, kv.v_scale
+            )
         args = {
             "h_in": _ptr(self.h), "q": _ptr(self.q), "block_table": _ptr(block_table),
             "seq_lens": _ptr(seq_lens), "k_cache": _ptr(k16), "v_cache": _ptr(v16),
@@ -500,6 +593,8 @@ class MonoDecodeRunner:
             "k1_args": _ptr(self.k1_args[i]), "positions": _ptr(positions),
             "slot_mapping": _ptr(sparse_md.slot_mapping), "res": _ptr(res),
             "batch_ids": _ptr(fwd.attn_metadata.batch_id_per_q_token),
+            "w13s": _opt_ptr(lw.w13s), "s13s": _opt_ptr(lw.s13s),
+            "w2s": _opt_ptr(lw.w2s), "s2s": _opt_ptr(lw.s2s),
         }  # fmt: skip
         _run_compiled(self.k4[n][lw.index_topk], *K4_ABI.pack(args), stream)
         return self.h_mids[(i + 1) % 2][:n]

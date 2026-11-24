@@ -1735,6 +1735,15 @@ class DSparkConfig:
         if self.draft_kv_dtype == "auto":
             return
         spec = config.speculative_config
+        if (
+            _is_minimax_m3_config(config.hf_config)
+            and spec is not None
+            and spec.method == "dspark"
+            and config.plugin_config is None
+        ):
+            # The M3.1 draft's own pool takes the per-token fp8 rows its fp8-KV
+            # deployments already write, whatever the target's cache is.
+            return
         target_dtypes = ("fp8", "fp4")
         if (
             config.hf_config.model_type != "deepseek_v41_text"
@@ -2009,10 +2018,16 @@ def _check_fp4_kv(kv_cache_dtype: str, *, is_m3: bool, is_v41: bool) -> None:
         raise ValueError("--kv-cache-dtype nvfp4 is supported by MiniMax-M3 only")
 
 
-def resolve_draft_kv_dtype(target_dtype: str, *, own_pool: bool) -> str:
+def resolve_draft_kv_dtype(
+    target_dtype: str, *, own_pool: bool, requested: str = "auto"
+) -> str:
     """The KV dtype of a speculative draft's pages: the target's, except bf16 for a
     draft with a pool of its own (``own_pool``) under an FP4 target, which has no
-    draft layout. A draft in the target's pool has the target's dtype."""
+    draft layout. A draft in the target's pool has the target's dtype. A draft
+    with a pool of its own takes ``requested`` fp8 (``--dspark-config
+    draft_kv_dtype``) whatever the target's dtype."""
+    if own_pool and requested == "fp8":
+        return "fp8"
     return "bf16" if own_pool and target_dtype in FP4_CACHE_DTYPES else target_dtype
 
 
@@ -3279,7 +3294,9 @@ class Config:
             # downstream (the draft builder, the proposer, the calibration identity)
             # reads `spec.draft_kv_dtype`.
             spec.draft_kv_dtype = resolve_draft_kv_dtype(
-                self.kv_cache_dtype, own_pool=draft_owns_kv_pool(self)
+                self.kv_cache_dtype,
+                own_pool=draft_owns_kv_pool(self),
+                requested=self.dspark.draft_kv_dtype if is_m3 else "auto",
             )
         if is_m3:
             from atom.models.minimax_m3.config import validate_runtime_config

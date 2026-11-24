@@ -508,6 +508,27 @@ def test_logprob_execution_admission_is_shared(option, value, kwargs):
     SamplingParams(logprobs=False).validate_logprob_options(config, **kwargs)
 
 
+@pytest.mark.parametrize(
+    "kvc,admitted",
+    [
+        ({"kv_connector": "lmcache_offload", "kv_role": "offload"}, True),
+        ({"kv_connector": "mooncake", "kv_role": "kv_producer"}, False),
+        ({"kv_connector": "mooncake", "kv_role": "kv_consumer"}, False),
+        ({"kv_connector": "multi", "kv_role": "kv_both"}, False),
+    ],
+)
+def test_logprobs_with_an_offload_tier_only(kvc, admitted):
+    from atom.sampling_params import SamplingParams
+
+    config = SimpleNamespace(kv_transfer_config=kvc)
+    params = SamplingParams(logprobs=True)
+    if admitted:
+        params.validate_logprob_options(config)
+    else:
+        with pytest.raises(ValueError, match="P/D"):
+            params.validate_logprob_options(config)
+
+
 @pytest.mark.parametrize("size", [1, 1000, 8192])
 @pytest.mark.parametrize("answer", ["Paris.", "a" * 4100])
 @pytest.mark.parametrize("finish_reason", ["stop", "max_tokens"])

@@ -178,7 +178,14 @@ class SamplingParams:
             return
         if getattr(config, "enable_rapidserve", False):
             raise ValueError("logprobs is unavailable with RapidServe")
-        if kv_transfer or getattr(config, "kv_transfer_config", None):
+        kvc = getattr(config, "kv_transfer_config", None)
+        # A CPU/NVMe offload tier (kv_role "offload") serves every request on
+        # this engine; only a P/D handoff splits one across engines.
+        offload_only = (
+            isinstance(kvc, dict)
+            and str(kvc.get("kv_role", "")).strip().casefold() == "offload"
+        )
+        if kv_transfer or (kvc and not offload_only):
             raise ValueError("logprobs is unavailable with P/D transfer")
         if multimodal:
             raise ValueError("Chat logprobs currently supports text input only")

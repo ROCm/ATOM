@@ -11,10 +11,12 @@ import time
 from atom.kv_transfer.disaggregation.base import KVConnectorSchedulerBase
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
+    KVConnectorOutput,
     LoadOperationId,
     SaveCompletionId,
     SaveOperationId,
     SaveSourceGroupId,
+    raw_req_id,
 )
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._offload_common import (
@@ -35,6 +37,10 @@ from atom.model_engine.sequence import SequenceStatus, resumes_offload_prefill
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
+
+# A worker transfer without a terminal report keeps Mono off at most this long, so a
+# lost report cannot disable Mono for good.
+MONO_TIER_GATE_MAX_S = 600.0
 
 DENSE_PAGE_SOURCE_SAFE_CHANNEL = "dense.page.source_safe"
 DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL = "dense.page.source_quiescent"
@@ -152,6 +158,10 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._load_nonce = 0
         self._load_lifecycles: dict[str, object] = {}
         self._active_load_operations: dict[str, tuple[object, LoadOperationId]] = {}
+        # Every load / save handed to the workers until its TP-wide terminal comes
+        # back (operation -> dispatch time). Unlike ``_active_load_operations`` a
+        # cancel or abort does not clear it: the worker job runs on regardless.
+        self._worker_ops: dict[object, float] = {}
         self._lookup_in_step: list[str] = []
         self._lookup_results: dict[str, tuple[object, int]] = {}
         self._handoff_loads: set[str] = set()
@@ -991,6 +1001,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             load_operation = self._new_load_operation(seq)
             seq._load_operation = load_operation
             self._active_load_operations[sid] = (seq, load_operation)
+            self._note_worker_op(load_operation)
             self._track_load_statistics(load_operation, lmc - hbm)
             transfer_end = (
                 lmc if ls.transfer_end_tokens is None else int(ls.transfer_end_tokens)
@@ -1081,6 +1092,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             self._save_previous_frontier[save_operation] = saved
             self._save_previous_owner[save_operation] = seq
             self._save_inflight[sid] = save_operation
+            self._note_worker_op(save_operation)
             self._refresh_save_reclaim_clock(seq)
             self._save_rr_last = sid
             if getattr(self, "_early_release", False):
@@ -1104,6 +1116,14 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._lookup_in_step = [
             sid for sid in self._lookup_in_step if sid not in dispatched
         ]
+        # Answers an asynchronous client got and nobody consumed still hold
+        # worker pins; the workers unpin what this list names (minus loads).
+        take_unpins = getattr(self._lookup_client, "take_unpins", None)
+        if callable(take_unpins):
+            for sid in take_unpins():
+                if sid not in dispatched and sid not in loading_sids:
+                    meta.lookup_requests_in_step.append(sid)
+                    self._perf_bump("async_lookup_unpins")
         self._reqs_need_recv.clear()
         self._perf_bump("build_meta_us", int((time.perf_counter() - _perf_t0) * 1e6))
         self._perf_bump("build_meta_n")
@@ -1277,6 +1297,51 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             or pending_finished_save
             or any(sid not in self._load_specs for sid in self._lookup_in_step)
         )
+
+    def _note_worker_op(self, operation) -> None:
+        self.__dict__.setdefault("_worker_ops", {})[operation] = time.monotonic()
+
+    def mono_hazard(self) -> bool:
+        """Whether a worker may be running (or about to run) this tier's copy
+        kernels: a load or save dispatchable or handed to the workers and not yet
+        terminal on every rank. A Mono step beside them can stall the TP group
+        (ROCm/ATOM#3369), so the engine keeps such steps off Mono. Scheduler
+        state only, hence the same answer on every rank."""
+        ops = self.__dict__.setdefault("_worker_ops", {})
+        if ops:
+            cutoff = time.monotonic() - MONO_TIER_GATE_MAX_S
+            for op in [op for op, t in ops.items() if t < cutoff]:
+                logger.warning(
+                    "offload: no terminal for %s after %.0f s; Mono no longer "
+                    "waits for it",
+                    op,
+                    MONO_TIER_GATE_MAX_S,
+                )
+                ops.pop(op, None)
+        return bool(ops) or self.has_pending_work()
+
+    def _settle_worker_ops(self, output: KVConnectorOutput) -> None:
+        """Drop the operations ``output`` reports terminal on every rank."""
+        ops = self.__dict__.get("_worker_ops")
+        if not ops:
+            return
+        done = set(output.finished_loading) | set(output.failed_loading)
+        done |= set(output.finished_saving)
+        done |= {c.operation_id for c in output.connector_completions}
+        raw = set()
+        for value in done:
+            if ops.pop(value, None) is None and not isinstance(
+                value, (LoadOperationId, SaveOperationId)
+            ):
+                raw.add(str(value))
+        if raw:
+            # a legacy report names the request, not the operation
+            for op in [o for o in ops if str(raw_req_id(o)) in raw]:
+                ops.pop(op, None)
+
+    def process_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
+        self._settle_worker_ops(output)
+        return super().process_completions(output)
 
     def save_finished(self, req_id) -> None:
         sid = str(req_id.req_id if isinstance(req_id, SaveOperationId) else req_id)

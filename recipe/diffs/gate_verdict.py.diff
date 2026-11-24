@@ -1,0 +1,11 @@
+--- /shared_nfs/ygan/max/bin/gate_verdict.py	2026-11-18 14:04:04.233183889 +0000
++++ /shared_nfs/ygan/p1/milestone2/recipe/gate_verdict.py	2026-11-19 19:50:24.500836094 +0000
+@@ -101,7 +101,7 @@
+     print(head)
+     print("\n".join(lines))
+     lng_s = f"{sum(r['hit'] for r in lng)}/{len(lng)}" if lng is not None else "-"
+-    with open(os.path.join(A, "gates", "index.tsv"), "a") as f:
++    with open("/shared_nfs/ygan/p1/milestone2/gates/index.tsv", "a") as f:
+         f.write(
+             "\t".join(
+                 map(str, [time.strftime("%Y-%m-%dT%H:%M"), gtag, "PASS" if ok else "FAIL",

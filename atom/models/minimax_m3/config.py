@@ -7,6 +7,15 @@ imports neither the model nor AITER until the architecture check needs it."""
 from atom.config import FP4_CACHE_DTYPES
 
 
+def _is_page_offload(kv_transfer_config) -> bool:
+    """Whether ``kv_transfer_config`` is the in-process LMCache CPU/NVMe offload."""
+    if not isinstance(kv_transfer_config, dict):
+        return False
+    connector = str(kv_transfer_config.get("kv_connector", "")).strip().casefold()
+    role = str(kv_transfer_config.get("kv_role", "")).strip().casefold()
+    return connector == "lmcache_offload" and role == "offload"
+
+
 def _fp4_kv_refusal(config) -> str | None:
     """Why ``--kv-cache-dtype fp4|nvfp4`` cannot run this MiniMax-M3 here, or None.
 
@@ -20,9 +29,15 @@ def _fp4_kv_refusal(config) -> str | None:
         # aiter's FP4 writers and sparse PA only handle bf16; an fp16 model fails in its
         # first forward.
         return f"it needs a bfloat16 model, got {config.torch_dtype}"
-    if config.kv_transfer_config:
-        # Offload / P-D transfer moves pages by a layout that does not know this format.
-        return "it does not run with KV offload or --kv-transfer-config"
+    if config.kv_transfer_config and not _is_page_offload(config.kv_transfer_config):
+        # P/D transfer moves pages by a layout that does not know this format. The
+        # in-process LMCache offload does: its M3 PAGE codec copies every published
+        # region (K/V pages with their inline scales, the index pages, the draft's
+        # pool) as opaque bytes, block for block.
+        return (
+            "it runs with the in-process lmcache_offload connector only, not P/D "
+            "or another --kv-transfer-config"
+        )
     if config.sequence_parallel_size > 1:
         # Ulysses leaves a top-k reusing layer's qkv without index columns; the fused
         # FP4 writer checks the row width and needs them.
@@ -68,8 +83,9 @@ def validate_runtime_config(config):
       only and the sparse readers take global lengths: M3 has no DCP gather/merge);
     - an FP4 KV also: the same FP4 index cache (the default when omitted, an explicit other value is refused;
       MXFP4 and NVFP4 never pair),
-      every attention layer an indexed sparse one (M3.1), a bf16 model, no sequence parallelism, no KV offload
-      or ``--kv-transfer-config``, and no speculative draft left with FP4 KV.
+      every attention layer an indexed sparse one (M3.1), a bf16 model, no sequence parallelism, no
+      ``--kv-transfer-config`` other than the in-process ``lmcache_offload`` one, and no speculative
+      draft left with FP4 KV.
     """
     from atom.config import is_plugin_mode
 

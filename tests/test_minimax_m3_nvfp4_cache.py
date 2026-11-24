@@ -135,7 +135,7 @@ def test_the_shared_refusals_hold_for_nvfp4():
         check(kv_cache_block_size=16, **NV)
     with pytest.raises(ValueError, match="indexed sparse"):
         check(hf=sparse_hf(freq=[1, 1, 0, 1]), **NV)
-    with pytest.raises(ValueError, match="KV offload"):
+    with pytest.raises(ValueError, match="lmcache_offload connector only"):
         check(kv_transfer_config={"kv_connector": "x"}, **NV)
     with pytest.raises(ValueError, match="draft would have FP4 KV"):
         check(

@@ -442,6 +442,50 @@ def build_page_namespace(
     return f"{base_model_name}::atom-page-v{layout_version}-{digest}"
 
 
+def _online_numa_nodes() -> int:
+    try:
+        with open("/sys/devices/system/node/online") as f:
+            spec = f.read().strip()
+    except OSError:
+        return 1
+    count = 0
+    for part in spec.split(","):
+        lo, _, hi = part.partition("-")
+        count += int(hi or lo) - int(lo) + 1
+    return max(1, count)
+
+
+def _normalize_numa_mapping(cfg) -> None:
+    """Integer keys for ``extra_config.gpu_to_numa_mapping``, or a split mapping.
+
+    ``LMCACHE_NUMA_MODE=manual`` places each rank's pinned CPU pool on the NUMA
+    node this mapping names for the rank's (process-local) device id, which
+    LMCache looks up as an int; JSON from ``LMCACHE_EXTRA_CONFIG`` only has
+    string keys, so without this every rank fails its assertion.
+
+    ``ATOM_OFFLOAD_NUMA_SPLIT=1`` (and no explicit mode) spreads the visible
+    devices' pools evenly over the online NUMA nodes instead: a TP group on one
+    socket otherwise pins every rank's pool from that socket's memory, which is
+    slow (the kernel reclaims page cache for all of it) or fails outright.
+    """
+    import os
+
+    extra = getattr(cfg, "extra_config", None)
+    mapping = (extra or {}).get("gpu_to_numa_mapping")
+    if isinstance(mapping, dict):
+        extra["gpu_to_numa_mapping"] = {int(k): int(v) for k, v in mapping.items()}
+    elif os.environ.get("ATOM_OFFLOAD_NUMA_SPLIT") == "1" and not getattr(
+        cfg, "numa_mode", None
+    ):
+        devices = torch.cuda.device_count() if torch.cuda.is_available() else 1
+        nodes = _online_numa_nodes()
+        cfg.numa_mode = "manual"
+        cfg.extra_config = dict(extra or {})
+        cfg.extra_config["gpu_to_numa_mapping"] = {
+            d: (d * nodes) // max(1, devices) for d in range(devices)
+        }
+
+
 def build_lmcache_config(
     kv_transfer_config: dict[str, Any] | None = None,
 ) -> Any:
@@ -472,6 +516,7 @@ def build_lmcache_config(
     if getattr(cfg, "lookup_server_worker_ids", None) is None:
         cfg.lookup_server_worker_ids = []
     apply_extra_overrides(cfg, kv_transfer_config)
+    _normalize_numa_mapping(cfg)
     # Async lookup has a separate polling/cancellation contract. This
     # connector currently implements only synchronous lookup; do not let an
     # unsupported mode issue duplicate lookups or release late-arriving pins.
@@ -782,7 +827,9 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
     worker_id = _strict_integer("LMCache worker id", worker_id)
     if worker_id >= world_size:
         raise ValueError("LMCache worker id must be within the world")
-    kv_dtype = dtypes.d_dtypes[config.kv_cache_dtype]
+    # The FP4 caches have no AITER dtype name; their pages (data and scales in
+    # one buffer) are moved as the raw bytes they are.
+    kv_dtype = dtypes.d_dtypes.get(config.kv_cache_dtype, torch.uint8)
     model_name = build_page_namespace(config, cfg, world_size)
 
     # MLA (DeepSeek R1/V3, Kimi) stores a single replicated per-layer latent

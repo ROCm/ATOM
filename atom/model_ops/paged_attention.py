@@ -166,3 +166,19 @@ class Attention(BaseAttention):
             query, q_scale, key, value, positions, self.layer_name, self.use_mla, qkv
         )
         return output
+
+    def forward_ak_oproj(self, query, key, value, positions, qkv, o_proj):
+        """Attention + its amd-kernels MXFP8 o_proj in one op (ATOM_M3_AK_DECODE_QOUT):
+        bf16 [tokens, N], o_proj's output."""
+        return torch.ops.aiter.unified_attention_ak_oproj(
+            query,
+            None,
+            key,
+            value,
+            positions,
+            self.layer_name,
+            qkv,
+            o_proj.weight,
+            o_proj.weight_scale,
+            o_proj._ak_weight_scale,
+        )

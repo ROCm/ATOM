@@ -5,6 +5,8 @@ from collections import deque
 
 import torch
 
+from atom.model_engine.sched_timing import timed_sync
+
 
 class _D2HSlot:
     def __init__(self, capacity: int, dtype: torch.dtype):
@@ -74,7 +76,7 @@ class D2HQueue:
         if not self._pending:
             return None
         slot = self._pending[0]
-        slot.copy_done.synchronize()
+        timed_sync(slot.copy_done)
         output = self._copy_output(slot.array_view)
         # The copy has completed; only now may the allocator reuse the source.
         slot.source = None

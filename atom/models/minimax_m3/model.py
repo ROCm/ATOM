@@ -5,6 +5,9 @@
 
 from typing import ClassVar
 
+import functools
+import os
+
 import torch
 from aiter import ActivationType, QuantType, dtypes
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
@@ -31,6 +34,7 @@ from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import (
     GemmaRMSNorm,
     fused_allreduce_gemma_rms_norm,
+    fused_allreduce_gemma_rms_norm_qkv_codes,
     fused_allreduce_gemma_rms_norm_quant,
 )
 from atom.model_ops.linear import (
@@ -45,8 +49,11 @@ from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
 )
 from atom.model_ops.moe import FusedMoE
+from atom.model_ops.mx8_fused import swiglu_oai_quant_fp8
 from atom.model_ops.swiglu_oai import swiglu_oai_split
 from atom.model_ops.utils import atom_parameter
+from atom.models.minimax_m3 import ak_moe
+from atom.models.minimax_m3 import sp_prefill
 from atom.models.minimax_m3.mono.dispatch import MonoDecode
 from atom.models.utils import (
     IntermediateTensors,
@@ -59,7 +66,86 @@ from atom.models.utils import (
 from atom.quant_spec import effective_layer_quant
 from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
+from atom.utils.forward_context import get_forward_context
 from atom.utils.region_graph import token_graph
+from atom.utils.custom_register import direct_register_custom_op
+
+# ---- ATOM_P1_DSPARK_AUX_NEXT (p1/decode-g9-16; integration-only, default 0 = off; value = minimum rows) ----
+# A DSpark-tapped layer's aux is its output residual stream, ``all_reduce(hidden) + residual`` (``aux_hidden_state``):
+# an AITER all-reduce + an add per tap per target forward (5 taps). The next fused all-reduce + add + Gemma norm (the
+# next layer's input tail, or the final norm after the last layer) all-reduces the same partial into the same
+# residual and returns ``bf16(fp32(x) + fp32(residual))`` with x = AITER's two-stage bits (amd_kernels
+# gemma_add_rmsnorm_h6144/reference.py: "x of the all-reduce paths and the residual out: bit for bit"). On
+# pure-decode forwards of at least this many rows (rows % 4 == 0) the tap skips its all-reduce + add and the next
+# tail copies its residual out into the tap's capture buffer instead (``set_aux_hidden_state_rows``).
+_P1_AUX_NEXT_MIN_ROWS = int(os.environ.get("ATOM_P1_DSPARK_AUX_NEXT", "0") or 0)
+
+
+def _p1_aux_offset(rows: int) -> int:
+    """The tap's first token when this forward defers its aux to the next tail, else -1 (same decision in the tap
+    and in the tail: rows and the forward context only)."""
+    if _P1_AUX_NEXT_MIN_ROWS <= 0 or rows < _P1_AUX_NEXT_MIN_ROWS or rows % 4:
+        return -1
+    try:
+        ctx = get_forward_context().context
+    except Exception:  # noqa: BLE001
+        return -1
+    if ctx is None or ctx.is_prefill or getattr(ctx, "is_draft", False) or ctx.ubatch_token_order is not None:
+        return -1
+    return int(ctx.ubatch_token_offset or 0)
+
+
+_P1_AUX_BUFS: dict = {}  # tapped layer id -> the drafter's capture buffer (set_aux_hidden_state_rows)
+
+
+def _p1_aux_rows(ctx, n: int):
+    """The capture rows of this forward's n tokens (``drafter._aux_hook``'s rule)."""
+    order = getattr(ctx, "ubatch_token_order", None) if ctx is not None else None
+    if order is not None:
+        return order
+    off = int(getattr(ctx, "ubatch_token_offset", 0) or 0) if ctx is not None else 0
+    return slice(off, off + n)
+
+
+def _p1_aux_tap(hidden_states: torch.Tensor, residual: torch.Tensor, layer: int) -> None:
+    """The tap of ``layer`` (writes its capture buffer itself, the hook records nothing): on deferred forwards
+    nothing (the next tail writes it), else ``all_reduce(hidden) + residual`` as before. ``hidden_states`` is
+    declared mutated only to keep the call ordered and alive in the compiled graph; it is not written."""
+    if _p1_aux_offset(hidden_states.shape[0]) >= 0:
+        return
+    try:
+        ctx = get_forward_context().context
+    except Exception:  # noqa: BLE001
+        ctx = None
+    if ctx is not None and getattr(ctx, "is_draft", False):
+        return
+    buf = _P1_AUX_BUFS[layer]
+    buf[_p1_aux_rows(ctx, hidden_states.shape[0])] = tensor_model_parallel_all_reduce(hidden_states) + residual
+
+
+def _p1_aux_tap_fake(hidden_states: torch.Tensor, residual: torch.Tensor, layer: int) -> None:
+    return None
+
+
+def _p1_aux_capture(residual: torch.Tensor, layer: int) -> None:
+    """The fused tail after ``layer``: on deferred forwards copy its residual out (== the tap's aux) into the
+    tap's capture buffer. ``residual`` is declared mutated only to keep the call ordered; it is not written."""
+    off = _p1_aux_offset(residual.shape[0])
+    if off >= 0:
+        _P1_AUX_BUFS[layer][off: off + residual.shape[0]].copy_(residual)
+
+
+def _p1_aux_capture_fake(residual: torch.Tensor, layer: int) -> None:
+    return None
+
+
+if _P1_AUX_NEXT_MIN_ROWS > 0:
+    # the capture buffers are NOT op arguments: as a graph input mutated twice (the hook and the tail) the compiled
+    # graph cloned and copied back each whole buffer every step (+1.6 ms at 96 rows, L2 run)
+    p1_aux_tap_op = direct_register_custom_op("p1_minimax_aux_tap", _p1_aux_tap, ["hidden_states"],
+                                              _p1_aux_tap_fake)
+    p1_aux_capture_op = direct_register_custom_op("p1_minimax_aux_capture", _p1_aux_capture, ["residual"],
+                                                  _p1_aux_capture_fake)
 
 
 def _get_text_config(config: PretrainedConfig) -> PretrainedConfig:
@@ -231,6 +317,29 @@ def make_minimax_m3_expert_params_mapping(
     return mapping
 
 
+# p1/dense-gemm ``ATOM_DG_DENSE_AK=1`` (default off): dense layers 0-2 at the measured-win rows only: ATOM's gate_up,
+# then amd-kernels' SwiGLU-OAI writing tiled MXFP8 codes (bit-identical codes+scales to swiglu_oai_quant_fp8 at
+# every measured M) and its prequant down GEMM. Measured (p1/dense-gemm/NOTES.md): M32 -0.10 us, M64 -0.68 us
+# (bit-identical), M128 -0.92 us, M384 -2.95 us (fp32 summation order in the down GEMM, <= 1 bf16 ulp).
+# Slower at M4/8/16/256: those rows keep the ATOM chain.
+_DG_DENSE_AK = os.environ.get("ATOM_DG_DENSE_AK", "0") == "1"
+_DG_DENSE_AK_ROWS = frozenset((32, 64, 128, 384))
+_DG_DENSE_AK_WARM = [False]
+
+
+def _dg_dense_ak_ready(device) -> bool:
+    """Compile the SwiGLU and prequant down kernels on the first eager call; never inside a graph capture."""
+    if _DG_DENSE_AK_WARM[0]:
+        return True
+    if torch.cuda.is_current_stream_capturing():
+        return False
+    from amd_kernels.activation.swiglu_oai_mxfp8_i3072 import warmup_swiglu_oai_mxfp8
+
+    warmup_swiglu_oai_mxfp8(device, forms=("fp32",))
+    _DG_DENSE_AK_WARM[0] = True
+    return True
+
+
 class MiniMaxM3MLP(nn.Module):
     def __init__(
         self,
@@ -271,11 +380,38 @@ class MiniMaxM3MLP(nn.Module):
         self.swiglu_alpha = getattr(config, "swiglu_alpha", 1.702)
         self.swiglu_beta = getattr(config, "swiglu_beta", 1.0)
         self.swiglu_limit = getattr(config, "swiglu_limit", 7.0)
+        # A native MXFP8 1x32 down_proj quantizes its input to E4M3 / E8M0 group 32
+        # itself; the activation kernel emits those bytes directly instead.
+        self.act_quant_fp8 = (
+            getattr(self.down_proj, "native_a8_group_rows", None) == 1
+            and self.down_proj.params_dtype == torch.float8_e4m3fn
+        )
 
     def forward(
         self, x: torch.Tensor, x_scale: torch.Tensor | None = None
     ) -> torch.Tensor:
         gate_up = self.gate_up_proj(x, x_scale=x_scale)
+        dg_ws = getattr(self.down_proj, "_ak_weight_scale", None) if _DG_DENSE_AK else None
+        if (dg_ws is not None and self.act_quant_fp8 and gate_up.shape[-1] == 6144 and gate_up.dim() == 2
+                and gate_up.shape[0] in _DG_DENSE_AK_ROWS and _dg_dense_ak_ready(gate_up.device)):
+            # p1/dense-gemm ATOM_DG_DENSE_AK=1: same fp32 SwiGLU-OAI + bf16 rounding + MXFP8 rule as
+            # swiglu_oai_quant_fp8, codes written where amd-kernels' down GEMM reads them (no quantizer launch)
+            from amd_kernels.activation.swiglu_oai_mxfp8_i3072 import swiglu_oai_mxfp8
+            from amd_kernels.gemm.mxfp8_common import gemm as _akg
+
+            m = gate_up.shape[0]
+            tile = _akg.prequant_code_tile_rows(m, 6144, 3072, torch.bfloat16)
+            qd, sd = swiglu_oai_mxfp8(gate_up, self.swiglu_alpha, self.swiglu_beta, self.swiglu_limit, tile,
+                                      form="fp32")
+            return _akg.mxfp8_gemm_prequant(qd, sd, self.down_proj.weight, dg_ws, torch.bfloat16, m)
+        if self.act_quant_fp8:
+            xq, xs = swiglu_oai_quant_fp8(
+                gate_up,
+                alpha=self.swiglu_alpha,
+                beta=self.swiglu_beta,
+                limit=self.swiglu_limit,
+            )
+            return self.down_proj(xq, x_scale=xs)
         x = swiglu_oai_split(
             gate_up,
             alpha=self.swiglu_alpha,
@@ -357,8 +493,23 @@ class MiniMaxM3MoE(nn.Module):
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
             )
+        # last child: its post-load hook runs after the experts' and shared expert's
+        self.ak_moe = (
+            ak_moe.AkMoe(self, prefix)
+            if ak_moe.enabled() and self.shared_experts is not None
+            else None
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.ak_moe is None:
+            return self.aiter_forward(hidden_states)
+        orig_shape = hidden_states.shape
+        out = ak_moe.ak_moe_op(
+            hidden_states.view(-1, orig_shape[-1]), self.ak_moe.prefix
+        )
+        return out.view(orig_shape)
+
+    def aiter_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, orig_shape[-1])
         router_logits = self.gate(hidden_states)
@@ -546,6 +697,14 @@ class MiniMaxM3SparseAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
+        # SP prefill's replicated o_proj (sp_prefill.py), None unless enabled.
+        self.o_proj_full = sp_prefill.make_o_proj_full(
+            self.o_proj,
+            self.total_num_heads * self.head_dim,
+            self.hidden_size,
+            quant_config,
+            f"{prefix}.o_proj",
+        )
 
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -595,13 +754,24 @@ class MiniMaxM3SparseAttention(nn.Module):
             per_token_fp8_out=effective_layer_quant(quant_config, f"{prefix}.o_proj")
             == (QuantType.per_Token, dtypes.fp8),
         )
+        # p1/glue-front (default off): decode rows the chain takes run this qkv linear as MXFP8 quant only and the
+        # attention op's insert as the fused QKV GEMM + norm/RoPE/NVFP4 insert (decided at run time, p1_front.take).
+        from atom.model_ops.minimax_m3 import p1_front
 
-    def forward(
+        impl = self.attn.impl
+        self.qkv_proj._p1_front = p1_front.layer_ok(
+            self.num_heads, self.num_kv_heads, self.num_idx_heads, rotary_dim, cache_config,
+            getattr(impl, "index_cache_dtype", None), self.skip_index_topk, getattr(impl, "per_token_fp8_out", False),
+        )
+
+    def attend(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         hidden_states_scale: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        fuse_oproj: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """qkv + attention: this rank's heads of every token (o_proj's input)."""
         # Keep index Q/K packed with main QKV. Layers that reuse cached top-k skip
         # the indexer norm/rope/top-k path, but still compute the packed GEMM.
         qkv = self.qkv_proj(hidden_states, x_scale=hidden_states_scale)
@@ -615,13 +785,42 @@ class MiniMaxM3SparseAttention(nn.Module):
             ],
             dim=-1,
         )
-        attn_output = self.attn(q, k, v, positions, qkv=qkv)
+        if fuse_oproj:
+            # ATOM_M3_AK_DECODE_QOUT: attention + o_proj in one op (decode only; the caller checked _ak_oproj)
+            return self.attn.forward_ak_oproj(q, k, v, positions, qkv, self.o_proj)
+        return self.attn(q, k, v, positions, qkv=qkv)
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        hidden_states_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self._ak_oproj():
+            return self.attend(positions, hidden_states, hidden_states_scale, fuse_oproj=True)
+        attn_output = self.attend(positions, hidden_states, hidden_states_scale)
         if isinstance(attn_output, tuple):
             return self.o_proj(*attn_output)
         return self.o_proj(attn_output)
 
+    def _ak_oproj(self) -> bool:
+        """ATOM_M3_AK_DECODE_QOUT (p1/attn-decode, default off): attention + o_proj in one op so
+        the amd-kernels decode attention can write o_proj's MXFP8 input. Needs the o_proj on
+        amd-kernels' MXFP8 GEMM (ATOM_AK_MXFP8_GEMM=1) and the bf16 attention output."""
+        from atom.model_ops.minimax_m3 import ak_kernels
+
+        return (
+            ak_kernels.QOUT
+            and ak_kernels.DECODE
+            and getattr(self.o_proj, "_ak_weight_scale", None) is not None
+            and getattr(self.o_proj, "bias", None) is None
+            and not getattr(self.attn, "per_token_fp8_out", False)
+            and getattr(self.attn, "sp_columns", None) is None
+        )
+
 
 class MiniMaxM3DecoderLayer(nn.Module):
+    _p1_aux_prev = None  # ATOM_P1_DSPARK_AUX_NEXT: id of the tapped layer before this one
     def __init__(
         self,
         config: PretrainedConfig,
@@ -676,10 +875,13 @@ class MiniMaxM3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         capture_aux: bool = False,
+        sp: "sp_prefill.SeqParallelPrefill | None" = None,
     ) -> (
         tuple[torch.Tensor, torch.Tensor]
         | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     ):
+        if sp is not None:
+            return sp.layer_forward(self, positions, hidden_states, residual)
         hidden_states_scale = None
         fuse_input_ar_rmsnorm_quant = _linear_consumes_per_token_fp8(
             self.self_attn.qkv_proj
@@ -697,6 +899,12 @@ class MiniMaxM3DecoderLayer(nn.Module):
                     hidden_states, residual, self.input_layernorm
                 )
             )
+        elif self._p1_ar_codes():
+            # p1/ar-epilogue chain Y: the tail emits the qkv entry's MXFP8 codes (hidden_states not computed on
+            # the chain's rows; only this layer's qkv linear reads it)
+            hidden_states, residual = fused_allreduce_gemma_rms_norm_qkv_codes(
+                hidden_states, residual, self.input_layernorm
+            )
         else:
             hidden_states, residual = fused_allreduce_gemma_rms_norm(
                 hidden_states, residual, self.input_layernorm
@@ -706,6 +914,8 @@ class MiniMaxM3DecoderLayer(nn.Module):
         # layer (post input-norm). Captured here, not as `hidden_states + residual`
         # in the model loop, because M3's fused all-reduce RMSNorm leaves that sum
         # TP-partial / NaN-prone under CUDAGraph.
+        if self._p1_aux_prev is not None:  # ATOM_P1_DSPARK_AUX_NEXT: the previous layer's deferred tap
+            p1_aux_capture_op(residual, self._p1_aux_prev)
         aux_hidden_state = residual.clone() if capture_aux else None
 
         hidden_states = self.self_attn(
@@ -730,6 +940,19 @@ class MiniMaxM3DecoderLayer(nn.Module):
             return hidden_states, residual, aux_hidden_state
         return hidden_states, residual
 
+    def _p1_ar_codes(self) -> bool:
+        """ATOM_P1_AR_QKV_CODES (p1/ar-epilogue, default off): this layer's qkv linear runs p1_front's chain on
+        amd-kernels' MXFP8 GEMM, so its pre-attention tail may emit the codes (decided per call at run time)."""
+        from atom.model_ops.minimax_m3 import p1_front
+
+        qkv = self.self_attn.qkv_proj
+        return (
+            p1_front.AR_CODES
+            and getattr(qkv, "_p1_front", False)
+            and getattr(qkv, "_ak_weight_scale", None) is not None
+            and getattr(qkv, "bias", None) is None
+        )
+
     @staticmethod
     def aux_hidden_state(output: tuple) -> torch.Tensor:
         """This layer's output as a DSpark draft reads it: the residual stream
@@ -740,10 +963,22 @@ class MiniMaxM3DecoderLayer(nn.Module):
         reduced here first. That costs one all-reduce per tapped layer per
         target forward, only when a DSpark drafter taps this layer.
         """
+        if isinstance(output, sp_prefill.ShardedOutput):
+            return output.sp.aux_hidden_state(output)
         hidden_states, residual = output[0], output[1]
         if get_tensor_model_parallel_world_size() > 1:
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         return hidden_states + residual
+
+
+def _p1_aux_hidden_state(output, layer: int):
+    """``MiniMaxM3DecoderLayer.aux_hidden_state`` with ATOM_P1_DSPARK_AUX_NEXT: ``_p1_aux_tap`` writes the capture
+    buffer (or leaves it to the next tail), so the hook records nothing (None)."""
+    if isinstance(output, sp_prefill.ShardedOutput):
+        return output.sp.aux_hidden_state(output)
+    hidden_states, residual = output[0], output[1]
+    p1_aux_tap_op(hidden_states, residual, layer)
+    return None
 
 
 @token_graph
@@ -798,6 +1033,26 @@ class MiniMaxM3Model(nn.Module):
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
+        self._p1_aux_last = None
+
+    def set_aux_hidden_state_rows(self, layer_ids, buffers) -> None:
+        """ATOM_P1_DSPARK_AUX_NEXT: register each DSpark tap's capture buffer, bind the tap to the fused tail after
+        the tapped layer (the next layer's input tail; the final norm after the last layer) and route the tap
+        through ``_p1_aux_tap``. Called once by the drafter after it installed its hooks; no-op with the flag off."""
+        if _P1_AUX_NEXT_MIN_ROWS <= 0 or get_tensor_model_parallel_world_size() <= 1:
+            return
+        for lid, buf in zip(layer_ids, buffers):
+            if lid < self.start_layer or lid >= self.end_layer or buf.numel() == 0:
+                continue
+            if lid + 1 < self.end_layer:
+                self.layers[lid + 1]._p1_aux_prev = lid
+            else:
+                # the last layer keeps its own tap: the final norm's residual out has no later reader, so a capture
+                # op "mutating" it is dead code to the compiler and was dropped (S2: layer 59's aux went stale)
+                continue
+            _P1_AUX_BUFS[lid] = buf
+            # instance attribute over the staticmethod: the hook gets None (records nothing), the op writes
+            self.layers[lid].aux_hidden_state = functools.partial(_p1_aux_hidden_state, layer=lid)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -838,9 +1093,11 @@ class MiniMaxM3Model(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
-        hidden_states, _ = fused_allreduce_gemma_rms_norm(
+        hidden_states, residual = fused_allreduce_gemma_rms_norm(
             hidden_states, residual, self.norm
         )
+        if self._p1_aux_last is not None:  # ATOM_P1_DSPARK_AUX_NEXT: the last layer's deferred tap
+            p1_aux_capture_op(residual, self._p1_aux_last)
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
@@ -853,6 +1110,8 @@ class MiniMaxM3Model(nn.Module):
 
 
 class MiniMaxM3SparseForCausalLM(nn.Module):
+    # The verify head (`compute_head`) draws from the temperature alone.
+    head_ids_top_p = False
     packed_modules_mapping: ClassVar[dict[str, tuple[str, str | int]]] = {
         ".index_q_proj": (".qkv_proj", "index_q"),
         ".index_k_proj": (".qkv_proj", "index_k"),
@@ -895,6 +1154,22 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             self.model.make_empty_intermediate_tensors
         )
         self._mono = MonoDecode(self, atom_config)
+        # The in-graph DSpark verify head (`verify_head.M3VerifyHead`), bound by
+        # `install_mono_decode`; it reads the step's input ids `forward` saw.
+        self._verify_head = None
+        self._step_input_ids = None
+        # (positions, slot_mapping) -> None: the DSpark draft's context write of
+        # a decode step, bound by `install_mono_decode`.
+        self._draft_context_writer = None
+        self._sp = sp_prefill.SeqParallelPrefill.create(
+            self.model,
+            _linear_consumes_per_token_fp8,
+            atom_config.max_num_batched_tokens,
+        )
+        if envs.ATOM_M3_SP_DUMP:
+            sp_prefill.install_dump_hooks(
+                self, self.model, envs.ATOM_M3_SP_DUMP_LAYERS
+            )
         # Set by a VL model with a vision tower: its compiled MiniMaxM3Model is
         # captured once, so it must always see inputs_embeds -- a text-only
         # capture would replay without them and drop the image embeddings.
@@ -927,19 +1202,63 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         **_: object,
     ) -> torch.Tensor | IntermediateTensors:
+        self._step_input_ids = input_ids
         # Outside the compiled MiniMaxM3Model on purpose: a supported decode step of
         # up to MAX_TOKENS tokens runs the mono kernels, everything else the
         # original model.
         if self._mono.supports(
             input_ids, positions, intermediate_tensors, inputs_embeds
         ):
-            return self._mono.forward(input_ids, positions)
-        if self.embed_before_model and inputs_embeds is None:
-            inputs_embeds = self.embed_input_ids(input_ids)
-        return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
+            out = self._mono.forward(input_ids, positions)
+        elif self._sp is not None and self._sp.supports(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        ):
+            out = self._sp.forward(input_ids, positions)
+        else:
+            if self.embed_before_model and inputs_embeds is None:
+                inputs_embeds = self.embed_input_ids(input_ids)
+            out = self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
+        if self._draft_context_writer is not None:
+            self._write_draft_context(positions)
+        return out
+
+    def _write_draft_context(self, positions: torch.Tensor) -> None:
+        """A decode step's DSpark context K/V, inside the forward (so inside its
+        graph); the proposer skips its own write on the same steps
+        (`MiniMaxM3DSpark.context_in_target`)."""
+        fwd = get_forward_context()
+        ctx = fwd.context
+        md = fwd.attn_metadata
+        if (
+            ctx is None
+            or ctx.is_prefill
+            or ctx.is_draft
+            or md is None
+            or md.slot_mapping is None
+        ):
+            return
+        slots = md.slot_mapping[: positions.shape[0]]
+        head = self._verify_head
+        stream = None if head is None else head.ctx_stream
+        if stream is not None:
+            head.join_ctx()  # a write no head joined (none should be left)
+            # below this many rows the graph runs the forked write before the LM
+            # head, not beside it (measured), so the fork only adds its join
+            if positions.shape[0] < envs.ATOM_M3_DRAFT_CTX_OVERLAP_MIN_ROWS:
+                stream = None
+        held = self._draft_context_writer(positions, slots, stream)
+        if held is not None:
+            head.ctx_pending, head.ctx_held = True, held
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.lm_head(hidden_states)
+
+    def compute_head(self, hidden_states: torch.Tensor):
+        """A DSpark verify step's output ids and verdict from the in-graph
+        verify head, or None (the runner computes the logits)."""
+        if self._verify_head is None:
+            return None
+        return self._verify_head(hidden_states)
 
     def make_empty_intermediate_tensors(
         self, batch_size: int, dtype: torch.dtype, device: torch.device
@@ -961,6 +1280,11 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
 
 class MiniMaxM3SparseForConditionalGenerationTextOnly(nn.Module):
     """Native ATOM text-only view of a MiniMax-M3 VL checkpoint."""
+
+    # The verify head (`compute_head`) draws from the temperature alone, and
+    # every TP rank picks the same ids from the same all-gathered pairs.
+    head_ids_top_p = False
+    head_ids_rank_uniform = True
 
     packed_modules_mapping = MiniMaxM3SparseForCausalLM.packed_modules_mapping
     quant_exclude_name_mapping: ClassVar[dict[str, str]] = {
@@ -1020,6 +1344,9 @@ class MiniMaxM3SparseForConditionalGenerationTextOnly(nn.Module):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
+
+    def compute_head(self, hidden_states: torch.Tensor):
+        return self.language_model.compute_head(hidden_states)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.language_model.get_expert_mapping()

@@ -204,6 +204,13 @@ def build_dense_post_kernel(
         def peer_addr(w):
             return load_ptr64(peers, w)
 
+        def own_task(t):
+            """Whether this rank sums (and gathers) row group t's all-reduce."""
+            return t % W == rank
+
+        # read by the shared o_proj stage: the dense layers' o_proj input is per-token fp8
+        attn_mxfp8 = False
+
         def start(name):
             return first_task(bid, BASE[name])
 
