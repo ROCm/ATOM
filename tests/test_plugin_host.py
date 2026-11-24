@@ -17,6 +17,12 @@ import torch
 from atom import plugin_host as host
 from atom import plugin_recipe as recipes
 
+
+def _v41_seams():
+    """The V4.1 plugin model's seams (``atom.plugin_seams_v41``), not the host's own."""
+    return {n: s for n, s in host.SEAMS.items() if n.startswith("v41.")}
+
+
 OUT = "v41.attn.out"
 QUANT = "v41.op.quant_fp8_g32"
 FFN = "v41.block.ffn"
@@ -417,7 +423,7 @@ def test_select_reads_only_what_the_key_holds():
     per-call-site constant (weights) or a per-step index (CSR) by contract."""
     unkeyed = {
         name: tuple(i for i in spec.inputs if i not in spec.key)
-        for name, spec in host.SEAMS.items()
+        for name, spec in _v41_seams().items()
         if spec.form != "window"  # a window has no per-tensor select callback
     }
     assert unkeyed == {
@@ -732,7 +738,7 @@ def test_overhead_probe_reports_the_three_costs(monkeypatch):
 
 # -- hot-plug ------------------------------------------------------------------
 
-BINDS = sorted(name for name, spec in host.SEAMS.items() if spec.form == "bind")
+BINDS = sorted(name for name, spec in _v41_seams().items() if spec.form == "bind")
 
 
 def test_a_hotplug_boot_binds_every_seam_and_installs_a_plan_later(monkeypatch):
@@ -1254,7 +1260,7 @@ def test_every_seam_is_reached_exactly_once_from_its_target():
         name: [
             ("site" if s.form == "call" and s.name in _DECORATED else s.form, s.target)
         ]
-        for name, s in host.SEAMS.items()
+        for name, s in _v41_seams().items()
         if s.form != "window"  # verified as a paired scope by test_together_plugin_ab
     }
     assert found == expected
@@ -1274,7 +1280,7 @@ def test_only_the_shared_act_seam_builds_its_own_span():
 
 
 def test_seam_specs_are_self_consistent():
-    for name, spec in host.SEAMS.items():
+    for name, spec in _v41_seams().items():
         assert spec.name == name and spec.contract >= 1
         assert spec.kind in ("op", "region") and spec.form in ("bind", "call", "window")
         assert spec.graph in ("eager", "capture_safe", "opaque_op")

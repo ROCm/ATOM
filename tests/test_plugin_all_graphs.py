@@ -17,6 +17,12 @@ from atom import plugin_recipe as recipes
 from atom.utils import forward_context
 from atom.utils.region_graph import ReqGraph
 
+
+def _v41_seams():
+    """The V4.1 plugin model's seams (``atom.plugin_seams_v41``), not the host's own."""
+    return {n: s for n, s in host.SEAMS.items() if n.startswith("v41.")}
+
+
 WINDOW = "v41.block.transition"
 DRAFT = "v41.draft.ctx"
 CASES = (
@@ -49,7 +55,7 @@ EXTENDED = {
 
 
 def test_capture_contract_catalog_is_complete():
-    captured = {n: s for n, s in host.SEAMS.items() if n != BOOT_ONLY}
+    captured = {n: s for n, s in _v41_seams().items() if n != BOOT_ONLY}
     assert set(captured) == set(CASES) | {WINDOW} | EXTENDED
     assert host.SEAMS[BOOT_ONLY].graph == "eager"
     assert all(s.graph in {"capture_safe", "opaque_op"} for s in captured.values())

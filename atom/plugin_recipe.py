@@ -37,7 +37,7 @@ MODES = ("any", "eager", "capture")
 ON_DECLINE = ("native", "error")
 SHADOW = ("error", "shadow", "nested")
 MONO_MODES = ("auto", "off")
-_SLOT_RE = re.compile(r"^[A-Za-z0-9_*]+(\.[A-Za-z0-9_*]+)*$")
+_SLOT_RE = re.compile(r"^[A-Za-z0-9_*]+(\.[A-Za-z0-9_*]+)*(:[A-Za-z_][A-Za-z0-9_]*)?$")
 
 
 class RecipeRefused(ValueError):
@@ -368,6 +368,9 @@ class Plan:
     # Process environment a v2 recipe sets for the server it configures
     # (`apply_env`): native ATOM / AITER switches that are not recipe options.
     env: Mapping[str, str] = MappingProxyType({})
+    # Options for plugin packages, by name (a provider or a model package):
+    # ATOM passes them through unread (``plugin_host.plugin_options``).
+    plugin_options: Mapping[str, Any] = MappingProxyType({})
 
     @property
     def has_options(self) -> bool:
@@ -376,6 +379,7 @@ class Plan:
             or self.model_options != ModelOptions()
             or self.dspark_options != DSparkOptions()
             or bool(self.env)
+            or bool(self.plugin_options)
         )
 
     @property
@@ -390,7 +394,7 @@ class Plan:
         state["modules"] = {
             k: None if t is None else dict(t) for k, t in self.modules.items()
         }
-        for name in ("arms", "expect", "requires", "env"):
+        for name in ("arms", "expect", "requires", "env", "plugin_options"):
             state[name] = dict(state[name])
         return _rebuild_plan, (state,)
 
@@ -425,6 +429,7 @@ class Plan:
             "model_options": self.model_options.dump(),
             "dspark_options": self.dspark_options.dump(),
             "env": dict(self.env),
+            "plugin_options": json.loads(_canonical(dict(self.plugin_options))),
         }
         return out
 
@@ -442,7 +447,7 @@ def _rebuild_plan(state: dict[str, Any]) -> Plan:
             for k, t in state.get("modules", {}).items()
         }
     )
-    for name in ("arms", "expect", "requires", "env"):
+    for name in ("arms", "expect", "requires", "env", "plugin_options"):
         state[name] = MappingProxyType(state.get(name, {}))
     return Plan(**state)
 
@@ -626,6 +631,20 @@ def _parse(document: Mapping[str, Any], *, model_arch: str | None) -> dict[str, 
     model_opts = ModelOptions.from_mapping(document.get("model_options"))
     dspark_opts = DSparkOptions.from_mapping(document.get("dspark_options"))
     env = _parse_env(document.get("env"), is_v2)
+    plugin_opts = document.get("plugin_options", {})
+    if plugin_opts and not is_v2:
+        raise RecipeRefused("recipe-schema", "plugin_options requires schema 2")
+    if not isinstance(plugin_opts, Mapping) or not all(
+        isinstance(k, str) and k and isinstance(v, Mapping)
+        for k, v in plugin_opts.items()
+    ):
+        raise RecipeRefused(
+            "recipe-schema", "plugin_options maps a plugin name -> an object"
+        )
+    try:
+        plugin_opts = json.loads(json.dumps(plugin_opts))
+    except (TypeError, ValueError) as error:
+        raise RecipeRefused("recipe-schema", f"plugin_options: {error}") from error
 
     raw_plugins = document.get("plugins")
     has_explicit_plugins = raw_plugins is not None
@@ -800,6 +819,7 @@ def _parse(document: Mapping[str, Any], *, model_arch: str | None) -> dict[str, 
         "on_decline": on_decline,
         "expect": dict(expect),
         "requires": dict(requires),
+        "plugin_options": plugin_opts,
         "engine": engine_opts,
         "model_options": model_opts,
         "dspark_options": dspark_opts,
@@ -889,6 +909,7 @@ def resolve(
                 "model_options": first["model_options"].dump(),
                 "dspark_options": first["dspark_options"].dump(),
                 "env": dict(sorted(first["env"].items())),
+                "plugin_options": first["plugin_options"],
             }
         )
     plan_id = _digest(id_payload)
@@ -911,6 +932,7 @@ def resolve(
         model_options=first["model_options"],
         dspark_options=first["dspark_options"],
         env=MappingProxyType(dict(first["env"])),
+        plugin_options=MappingProxyType(dict(first["plugin_options"])),
         schema_version=schema_version,
     )
 

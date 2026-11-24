@@ -1035,16 +1035,29 @@ class ModelRunner:
         if plugin_host.model_options().mono_mode == "off":
             # A recipe's model_options.mono_mode: serve the layer path only.
             installer = None
-        if installer is not None:
+
+        def install_native(model, atom_config, drafter, **kwargs):
+            """The model's own installers (and V4.1's v41.mono.install seam)."""
+            if installer is None:
+                return model
             install = resolve_obj_by_qualname(installer)
-            kwargs = {"metadata_builder": self.attn_metadata_builder}
             if mono_arch == "DeepseekV41ForCausalLM":
                 # Boot-only seam: a planned plugin may install its own instead.
-                self.model = plugin_host.call(
-                    "v41.mono.install", install, self.model, config, drafter, **kwargs
+                return plugin_host.call(
+                    "v41.mono.install", install, model, atom_config, drafter, **kwargs
                 )
-            else:
-                self.model = install(self.model, config, drafter, **kwargs)
+            return install(model, atom_config, drafter, **kwargs)
+
+        # The generic boot hook (`model.install`): a planned plugin may wrap or
+        # replace the model to serve; native runs the model's own installers.
+        self.model = plugin_host.call(
+            plugin_host.MODEL_INSTALL,
+            install_native,
+            self.model,
+            config,
+            drafter,
+            metadata_builder=self.attn_metadata_builder,
+        )
         # The installed model's own head output, where it has one: its
         # forward's logits, or a verify's token ids and verdict (`_head_output`).
         self.compute_head = getattr(self.model, "compute_head", None)

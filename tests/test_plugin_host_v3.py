@@ -13,6 +13,7 @@ import sys
 import types
 
 import pytest
+import torch
 
 from atom import plugin_host as host
 from atom import plugin_recipe as recipes
@@ -273,3 +274,78 @@ def test_installed_packages_declare_seams_through_entry_points(seam_table, monke
     plan = _plan(seams={"toy.block.mix": []})  # the recipe parse loads them
     assert "toy.block.mix" in host.SEAMS and plan is not None
     assert host._SEAM_SOURCES["toy.block.mix"] == "atom.seam_specs:toy"
+
+
+# -- M4: method takeover, plugin_options, model.install -----------------------
+
+
+class _Mix(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.scale = 2
+
+    def forward(self, x):
+        return self.combine(x) + 1
+
+    def combine(self, x):
+        return x * self.scale
+
+
+class _Net(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.blocks = torch.nn.ModuleList([_Mix(), _Mix()])
+
+
+def test_a_method_is_taken_over_like_a_forward_and_restored():
+    def register(h):
+        h.register_module(
+            slot="blocks.*",
+            method="combine",
+            owner="comb-p",
+            factory=lambda module, cap: (lambda x: x * 10),
+            select=lambda cap, x: cap.flags["method"] == "combine" and x.numel() < 4,
+        )
+
+    host._entry_points = lambda: {"comb-p": _EntryPoint(register)}
+    host.configure(_plan(modules={"blocks.*:combine": ["comb-p"]}), kill_switch=False)
+    net = _Net()
+    assert host.install_modules(net) == ["blocks.0:combine", "blocks.1:combine"]
+    x = torch.ones(2)
+    assert torch.equal(net.blocks[0](x), x * 10 + 1)  # forward reaches the owner
+    assert torch.equal(net.blocks[1](torch.ones(5)), torch.ones(5) * 2 + 1)  # declined
+    host._uninstall_modules()
+    assert "combine" not in net.blocks[0].__dict__
+    assert torch.equal(net.blocks[0](x), x * 2 + 1)
+
+
+def test_plugin_options_pass_through_unread():
+    plan = _plan(plugin_options={"dsv41": {"fused_attn": True, "grid": [1, 2]}})
+    assert dict(plan.plugin_options) == {"dsv41": {"fused_attn": True, "grid": [1, 2]}}
+    other = _plan(plugin_options={"dsv41": {"fused_attn": False, "grid": [1, 2]}})
+    assert plan.plan_id != other.plan_id
+    host.configure(plan, kill_switch=False)
+    assert host.plugin_options("dsv41")["grid"] == [1, 2]
+    assert dict(host.plugin_options("other")) == {}
+    with pytest.raises(recipes.RecipeRefused, match="plugin_options"):
+        _plan(plugin_options={"dsv41": 3})
+
+
+def test_model_install_is_a_core_boot_hook():
+    spec = host.SEAMS[host.MODEL_INSTALL]
+    assert spec.boot_only and spec.form == "call"
+    assert host._SEAM_SOURCES[host.MODEL_INSTALL] == "atom.plugin_host"
+
+    def register(h):
+        h.register(
+            seam=host.MODEL_INSTALL,
+            contract=1,
+            owner="wrap-p",
+            graph="eager",
+            impl=lambda model, cfg, drafter, **k: ("wrapped", model),
+        )
+
+    host._entry_points = lambda: {"wrap-p": _EntryPoint(register)}
+    host.configure(_plan(seams={host.MODEL_INSTALL: ["wrap-p"]}), kill_switch=False)
+    out = host.call(host.MODEL_INSTALL, lambda m, c, d, **k: m, "m", None, None)
+    assert out == ("wrapped", "m")

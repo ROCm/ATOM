@@ -148,6 +148,33 @@ SEAM_TO_MODULE_SLOT = MappingProxyType(_SEAM_TO_SLOT)
 MODULE_SLOT_TO_SEAM = MappingProxyType(_SLOT_TO_SEAM)
 _NAME_RE = re.compile(r"^[a-z0-9_]+(\.[a-z0-9_]+)+$")
 _BUILTIN_SEAM_MODULES = ("atom.plugin_seams_v41",)
+# Model-agnostic seams of the host itself (frozen HOOK_API surface).
+MODEL_INSTALL = "model.install"
+
+
+def _core_specs() -> list[SeamSpec]:
+    return [
+        SeamSpec(
+            MODEL_INSTALL,
+            1,
+            "region",
+            "call",
+            ("model", "atom_config", "drafter"),
+            ("metadata_builder",),
+            ("model",),
+            (),
+            "eager",
+            "atom/model_engine/model_runner.py",
+            doc=(
+                "boot hook: after the load, before KV sizing and capture, the "
+                "model to serve (an owner wraps or replaces it; native: the "
+                "model's own installers)"
+            ),
+            boot_only=True,
+        )
+    ]
+
+
 _seam_sources_loaded = False
 
 
@@ -230,6 +257,7 @@ def declare_seams(specs: Iterable[Any], *, source: str) -> list[str]:
 
 
 def _load_builtin_seams() -> None:
+    declare_seams(_core_specs(), source="atom.plugin_host")
     for name in _BUILTIN_SEAM_MODULES:
         module = importlib.import_module(name)
         declare_seams(module.specs(), source=name)
@@ -481,8 +509,16 @@ def register_module(
     contract: int = 1,
     requires_api: str = f">={HOOK_API},<{HOOK_API + 1}",
     fake: Callable[..., Any] | None = None,
+    method: str | None = None,
 ) -> Registration:
     """Offer ``owner`` for every module at ``slot`` (whole-subtree takeover).
+
+    ``method`` (or a ``slot`` written ``path:method``) takes over that method of
+    the matched modules instead of ``forward``: any Python method boundary is a
+    takeover point without a declared seam. The host installs and restores it,
+    routes it per call and per capture bucket, and makes it one opaque op under
+    compile, exactly as for ``forward``; the factory's callable is called as
+    that method.
 
     ``factory(module, capability)`` runs once per matched module after the
     load, before warmup and capture, and returns the callable that serves it:
@@ -493,6 +529,8 @@ def register_module(
     input). A slot that is the span of a seam (`SLOT`/`SEAM` aliases) is
     registered as that seam, so either form serves the same calls.
     """
+    if method is not None:
+        slot = f"{slot}:{method}"
     if not callable(factory) or (select is not None and not callable(select)):
         _refuse(slot, owner, "not-callable", "factory and select must be callable")
     seam = MODULE_SLOT_TO_SEAM.get(slot)
@@ -539,7 +577,13 @@ def register_module(
         return Registration(slot, owner, True, "registered")
 
 
-_SLOT_RE = re.compile(r"^[A-Za-z0-9_*]+(\.[A-Za-z0-9_*]+)*$")
+# ``path`` (the module's ``forward``) or ``path:method`` (one of its methods).
+_SLOT_RE = re.compile(r"^[A-Za-z0-9_*]+(\.[A-Za-z0-9_*]+)*(:[A-Za-z_][A-Za-z0-9_]*)?$")
+
+
+def _split_slot(slot: str) -> tuple[str, str]:
+    path, _, method = slot.partition(":")
+    return path, method or "forward"
 
 
 def _slot_matches(slot: str, path: str) -> bool:
@@ -597,10 +641,12 @@ def _module_routes(slots, captured: bool, bucket: int | None):
 
 
 class _ModuleRouter:
-    """A taken-over module's ``forward``: the planned owners, else its own."""
+    """A taken-over module's ``forward`` (or ``attr``, a method): the planned
+    owners, else its own."""
 
-    def __init__(self, path, slots, module, native):
+    def __init__(self, path, slots, module, native, attr="forward"):
         self.path, self.slots, self.module, self.native = path, slots, module, native
+        self.attr = attr
         self.impls: dict[str, Callable[..., Any]] = {}
         self._op = None
 
@@ -608,7 +654,9 @@ class _ModuleRouter:
         """Every owner's callable for this module, once, outside any capture."""
         cap = Capability(
             f"module:{self.slots[0]}",
-            flags=MappingProxyType({"path": self.path, "module": self.module}),
+            flags=MappingProxyType(
+                {"path": self.path, "module": self.module, "method": self.attr}
+            ),
         )
         routes = {
             r.owner: r
@@ -644,7 +692,8 @@ class _ModuleRouter:
                 ),
                 self._native_fake,
             )
-            self._op = span_n(f"module:{self.path}", self.run, fake)
+            key = self.path if self.attr == "forward" else f"{self.path}:{self.attr}"
+            self._op = span_n(f"module:{key}", self.run, fake)
         return self._op
 
     def _native_fake(self, *xs):
@@ -686,7 +735,9 @@ class _ModuleRouter:
             rows=_rows_of(args[0]) if args else 0,
             captured=captured,
             bucket=bucket,
-            flags=MappingProxyType({"path": self.path, "module": self.module}),
+            flags=MappingProxyType(
+                {"path": self.path, "module": self.module, "method": self.attr}
+            ),
         )
         declined = 0
         for route in routes:
@@ -733,29 +784,37 @@ def _install_into(model, prefix: str) -> list[str]:
         return []
     found = []
     for path, module in model.named_modules(prefix=prefix):
-        matched = [s for s in slots if path and _slot_matches(s, path)]
-        if matched:
-            found.append((path, module, matched))
+        by_attr: dict[str, list[str]] = {}
+        for s in slots:
+            pattern, attr = _split_slot(s)
+            if path and _slot_matches(pattern, path):
+                by_attr.setdefault(attr, []).append(s)
+        for attr, matched in by_attr.items():
+            if not callable(getattr(module, attr, None)):
+                raise TypeError(f"{path} has no method {attr!r} to take over")
+            found.append((path, module, attr, matched))
     # Deepest first: an outer owner's fallback is the module's own forward,
     # which reaches the inner owners already installed.
     found.sort(key=lambda item: -item[0].count("."))
     installed = []
-    for path, module, matched in found:
-        router = _ModuleRouter(path, tuple(matched), module, module.forward)
+    for path, module, attr, matched in found:
+        router = _ModuleRouter(
+            path, tuple(matched), module, getattr(module, attr), attr
+        )
         router.build()
-        module.forward = router
+        setattr(module, attr, router)
         _installed.append(router)
-        installed.append(path)
+        installed.append(path if attr == "forward" else f"{path}:{attr}")
     return installed
 
 
 def _uninstall_modules() -> None:
     while _installed:
         router = _installed.pop()
-        if router.module.__dict__.get("forward") is router:
-            del router.module.forward
+        if router.module.__dict__.get(router.attr) is router:
+            delattr(router.module, router.attr)
             if getattr(router.native, "__self__", None) is not router.module:
-                router.module.forward = router.native  # an earlier instance patch
+                setattr(router.module, router.attr, router.native)  # an earlier patch
 
 
 def install_modules(model, *, prefix: str = "") -> list[str]:
@@ -872,6 +931,14 @@ def model_options():
 
     plan = _plan
     return getattr(plan, "model_options", None) or ModelOptions()
+
+
+def plugin_options(name: str) -> Mapping[str, Any]:
+    """The plan's ``plugin_options[name]`` (frozen HOOK_API surface): options a
+    recipe passes to a plugin package unread by ATOM; empty without a plan."""
+    plan = _plan
+    raw = getattr(plan, "plugin_options", None) or {}
+    return MappingProxyType(dict(raw.get(name, {})))
 
 
 def dspark_options():
