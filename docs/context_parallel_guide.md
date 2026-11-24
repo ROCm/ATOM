@@ -604,6 +604,10 @@ hit it.
 DeepSeek-R1 never needed this: 128 heads at `-tp 8` is 16 per rank, and the dcp8
 gather lands on 128 exactly.
 
+At dcp1 nothing is gathered, and K3's 12 heads a rank can dispatch as 12
+instead of 16; "Decode query-head width" in the model ops guide lists when.
+Under DCP the per-rank floor stays 16; only the gathered width matters.
+
 ### Sparse DCP persistent attention and gqa=64
 
 This section is about DCP decode and the `q` transport of sparse prefill, which
