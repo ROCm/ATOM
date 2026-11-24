@@ -343,6 +343,7 @@ class _Route:
     impl: Callable[..., Any]
     select: Callable[..., Any] | None
     graph: str
+    collectives: tuple[str, ...] = ()
 
 
 _lock = threading.RLock()
@@ -456,7 +457,9 @@ def register(
         if not _planned(seam, owner):
             _refusals.append(Registration(seam, owner, False, "not-planned"))
             return _refusals[-1]
-        _registered.setdefault(seam, {})[owner] = _Route(owner, impl, select, graph)
+        _registered.setdefault(seam, {})[owner] = _Route(
+            owner, impl, select, graph, tuple(owns_collectives)
+        )
         return Registration(seam, owner, True, "registered")
 
 
@@ -758,13 +761,15 @@ class _ModuleRouter:
             if _arm == "identity":
                 _record(Decision(name, "plugin", "identity", route.owner, declined))
                 return self.native(*args, **kwargs)
-            _record(
-                Decision(
-                    name, "plugin", "selected", route.owner, declined, captured, bucket
-                )
+            chosen = Decision(
+                name, "plugin", "selected", route.owner, declined, captured, bucket
             )
+            _record(chosen)
+            _note_route(chosen)
             return self.impls[route.owner](*args, **kwargs)
-        _record(Decision(name, "native", "declined", None, declined, captured, bucket))
+        missed = Decision(name, "native", "declined", None, declined, captured, bucket)
+        _record(missed)
+        _note_route(missed)
         if _on_decline == "error":
             raise PluginDeclined(f"{name}: every owner declined")
         return self.native(*args, **kwargs)
@@ -2118,6 +2123,120 @@ def _decide(seam, routes, cap, inputs, kwargs, strict) -> tuple[Decision, Any]:
     return Decision(seam, "plugin", "selected", chosen.owner, declined, **where), chosen
 
 
+# -- recipe reachability: what each seam / module actually routed to ----------
+
+# (seam, "captured" | "eager") -> owner (or "native") -> buckets (captured) or
+# the rows seen (eager, capped).
+_route_log: dict[tuple[str, str], dict[str, set]] = {}
+_ROUTE_LOG_ROWS = 64
+
+
+def _note_route(decision: Decision) -> None:
+    mode = "captured" if decision.captured else "eager"
+    owners = _route_log.setdefault((decision.seam, mode), {})
+    seen = owners.setdefault(decision.owner or "native", set())
+    if decision.captured or len(seen) < _ROUTE_LOG_ROWS:
+        seen.add(decision.bucket)
+
+
+def route_report() -> dict[str, Any]:
+    """What the plan's seams and module slots routed to, captured (per bucket)
+    and eager, and the recipe owners that no call reached
+    (``planned_but_unreached``): the check that captured graphs and eager
+    prefill follow the recipe."""
+    routed: dict[str, dict[str, dict[str, list]]] = {}
+    reached: set[tuple[str, str]] = set()
+    for (seam, mode), owners in sorted(_route_log.items()):
+        for owner, seen in owners.items():
+            routed.setdefault(seam, {}).setdefault(mode, {})[owner] = sorted(
+                (x for x in seen if x is not None), key=str
+            )
+            reached.add((seam, owner))
+    planned: dict[str, set[str]] = {}
+    for table in _tables.values():
+        for seam, routes in table.items():
+            planned.setdefault(seam, set()).update(r.owner for r in routes)
+    for table in _module_tables.values():
+        for slot, routes in table.items():
+            planned.setdefault(f"module:{slot}", set()).update(r.owner for r in routes)
+    unreached = sorted(
+        f"{seam}:{owner}"
+        for seam, owners in planned.items()
+        for owner in owners
+        if (seam, owner) not in reached
+    )
+    unplanned = sorted(
+        f"{seam}:{owner}"
+        for seam, owner in reached
+        if owner != "native" and owner not in planned.get(seam, ())
+    )
+    return {
+        "routed": routed,
+        "planned_but_unreached": unreached,
+        "unplanned": unplanned,
+    }
+
+
+def log_route_report(stage: str) -> dict[str, Any]:
+    """Log ``route_report`` (after capture: every bucket's route is fixed)."""
+    report = route_report()
+    if _plan is not None:
+        logger.info("plugin_host: routes after %s: %s", stage, report["routed"])
+        if report["planned_but_unreached"]:
+            logger.warning(
+                "plugin_host: planned owners no call reached after %s: %s",
+                stage,
+                report["planned_but_unreached"],
+            )
+        if report["unplanned"]:
+            logger.error(
+                "plugin_host: owners outside the plan: %s", report["unplanned"]
+            )
+    return report
+
+
+# -- cross-rank agreement for owners that run collectives ---------------------
+
+
+def _agree(decision: Decision, route):
+    """A captured decision whose candidates run collectives: every TP rank must
+    take the same owner, or a rank waits in a collective the others never
+    enter. The ranks exchange their choice (CPU group); any disagreement makes
+    all of them run native for that call site and bucket."""
+    try:
+        import torch.distributed as dist
+        from aiter.dist.parallel_state import get_tp_group
+
+        group = get_tp_group()
+        if group.world_size <= 1 or group.cpu_group is None:
+            return decision, route
+        mine = decision.owner
+        agreed = [None] * group.world_size
+        dist.all_gather_object(agreed, mine, group=group.cpu_group)
+    except Exception:  # noqa: BLE001 -- no TP group (CPU tests, single rank)
+        return decision, route
+    if all(owner == mine for owner in agreed):
+        return decision, route
+    logger.warning(
+        "plugin_host: %s bucket %s: TP ranks chose %s; all run native",
+        decision.seam,
+        decision.bucket,
+        agreed,
+    )
+    return (
+        Decision(
+            decision.seam,
+            "native",
+            "rank-disagree",
+            None,
+            decision.declined,
+            decision.captured,
+            decision.bucket,
+        ),
+        None,
+    )
+
+
 def _record(decision: Decision) -> None:
     global _last
     _last = decision
@@ -2174,6 +2293,9 @@ def _dispatch(seam, native, capability, inputs, kwargs):
             flags=MappingProxyType(dict(static.get("flags", {}))),
         )
         decision, route = _decide(seam, routes, cap, inputs, kwargs, _strict)
+        if captured and route is not None and any(r.collectives for r in routes):
+            decision, route = _agree(decision, route)
+        _note_route(decision)
         if len(_cache) >= _CACHE_LIMIT:  # keys with per-step values grow it
             _cache.clear()
         hit = (decision, route, cap)
@@ -2450,6 +2572,7 @@ def status() -> dict[str, Any]:
         "modules_installed": [router.path for router in _installed],
         "plugin_model": plugin_model_active(),
         "aiter": {"enabled": list(_aiter_applied or ()), "status": _aiter_status()},
+        "routes": route_report(),
     }
 
 
@@ -2505,6 +2628,7 @@ def _reset_for_testing() -> None:
         _spans_n.clear()
         _refusals.clear()
         _counts.clear()
+        _route_log.clear()
         _warned_misses.clear()
         _plan, _owned, _last, _requested = None, frozenset(), None, None
         _kill_switch, _strict, _on_decline = False, False, "native"

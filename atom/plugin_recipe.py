@@ -491,6 +491,17 @@ def shorthand(enable: Iterable[str] | str | None) -> Plan | None:
     )
 
 
+def _scope_inside(scope: str, slot: str) -> bool:
+    """Whether a seam's call-site module path lies in (or at) module ``slot``."""
+    import fnmatch
+
+    have, want = scope.split("."), slot.split(".")
+    return len(have) >= len(want) and all(
+        h == w or fnmatch.fnmatchcase(h, w) or fnmatch.fnmatchcase(w, h)
+        for h, w in zip(have, want)
+    )
+
+
 def _check_slot_pattern(slot: str) -> None:
     if not isinstance(slot, str) or not slot or not _SLOT_RE.match(slot):
         raise RecipeRefused("recipe-schema", f"invalid module slot pattern {slot!r}")
@@ -777,6 +788,32 @@ def _parse(document: Mapping[str, Any], *, model_arch: str | None) -> dict[str, 
             seam_alias = plugin_host.MODULE_SLOT_TO_SEAM.get(slot)
             if seam_alias is not None and seam_alias not in table:
                 table[seam_alias] = owners
+
+    # A module owner at the outside: the seams inside that module must be
+    # planned too (owners, or [] for native), so the recipe says what runs
+    # when the module owner declines and what it makes unreachable.
+    for slot, owners in module_table.items():
+        path, _, method = slot.partition(":")
+        if (
+            not owners
+            or (method and method != "forward")
+            or path in plugin_host.MODULE_SLOT_TO_SEAM  # a seam: parent/child rules
+        ):
+            continue
+        missing = sorted(
+            name
+            for name, spec in plugin_host.SEAMS.items()
+            if spec.scope is not None
+            and spec.module_slot != path
+            and _scope_inside(spec.scope, path)
+            and name not in seams
+        )
+        if missing:
+            raise RecipeRefused(
+                "recipe-inner-unplanned",
+                f"modules[{slot}] takes over a module whose seams {missing} the "
+                "recipe does not plan (list owners, or [] for native)",
+            )
 
     shadowed: list[tuple[str, str, str]] = []
     for child, owners in table.items():

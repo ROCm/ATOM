@@ -4781,6 +4781,9 @@ class ModelRunner:
                 f"{(usage_ratio - self.config.gpu_memory_utilization):.1%}. "
                 f"Consider reducing gpu_memory_utilization."
             )
+        # Every captured bucket's route is fixed now: report it against the
+        # recipe (planned owners no bucket reached are named).
+        plugin_host.log_route_report("capture")
 
         return time.time() - start_time, self.capture_sizes, _pool_bytes
 

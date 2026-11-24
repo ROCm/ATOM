@@ -349,3 +349,76 @@ def test_model_install_is_a_core_boot_hook():
     host.configure(_plan(seams={host.MODEL_INSTALL: ["wrap-p"]}), kill_switch=False)
     out = host.call(host.MODEL_INSTALL, lambda m, c, d, **k: m, "m", None, None)
     assert out == ("wrapped", "m")
+
+
+# -- M5: route report, cross-rank agreement, inner seams of a taken-over module
+
+
+def test_route_report_names_unreached_planned_owners(seam_table, monkeypatch):
+    host.declare_seams([_TOY], source="toy")
+
+    def reg_a(h):
+        h.register(
+            seam="toy.block.mix", contract=1, owner="mix-a", impl=lambda x, **k: x
+        )
+
+    def reg_b(h):
+        h.register(
+            seam="toy.block.mix",
+            contract=1,
+            owner="mix-b",
+            impl=lambda x, **k: x,
+            select=lambda cap, x: False,
+        )
+
+    monkeypatch.setattr(
+        host,
+        "_entry_points",
+        lambda: {"mix-a": _EntryPoint(reg_a), "mix-b": _EntryPoint(reg_b)},
+    )
+    host.configure(
+        _plan(seams={"toy.block.mix": ["mix-b", "mix-a"]}), kill_switch=False
+    )
+    monkeypatch.setattr(host, "_graph_state", lambda: (True, 16))
+    host.bind("toy.block.mix", lambda x: x)(torch.ones(16, 4))
+    report = host.route_report()
+    assert report["routed"]["toy.block.mix"]["captured"] == {"mix-a": [16]}
+    assert report["planned_but_unreached"] == ["toy.block.mix:mix-b"]
+    assert report["unplanned"] == []
+
+
+def test_owners_running_collectives_must_agree_across_ranks(monkeypatch):
+    import torch.distributed as dist
+
+    group = types.SimpleNamespace(world_size=2, cpu_group=object())
+    fake_ps = types.ModuleType("aiter.dist.parallel_state")
+    fake_ps.get_tp_group = lambda: group
+    monkeypatch.setitem(sys.modules, "aiter.dist.parallel_state", fake_ps)
+    monkeypatch.setitem(sys.modules, "aiter.dist", types.ModuleType("aiter.dist"))
+    others = ["x"]
+
+    def gather(out, mine, group=None):
+        out[0], out[1] = mine, others[0]
+
+    monkeypatch.setattr(dist, "all_gather_object", gather)
+    decision = host.Decision("s", "plugin", "selected", "x", 0, True, 8)
+    assert host._agree(decision, "route") == (decision, "route")
+    others[0] = "y"
+    agreed, route = host._agree(decision, "route")
+    assert (
+        route is None and agreed.reason == "rank-disagree" and agreed.route == "native"
+    )
+
+
+def test_a_taken_over_module_needs_its_inner_seams_planned():
+    with pytest.raises(recipes.RecipeRefused, match="recipe-inner-unplanned"):
+        _plan(modules={"layers.*.attn": ["attn-p"]})
+    inner = [
+        n
+        for n, s in host.SEAMS.items()
+        if s.scope and s.scope.startswith("layers.*.attn")
+    ]
+    plan = _plan(modules={"layers.*.attn": ["attn-p"]}, seams={n: [] for n in inner})
+    assert plan.modules["any"]["layers.*.attn"] == ("attn-p",)
+    # a method takeover replaces one method: no inner seam to plan
+    _plan(modules={"layers.*.attn:_wo_a": ["wo-p"]})

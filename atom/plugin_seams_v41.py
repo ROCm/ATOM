@@ -30,6 +30,22 @@ _SLOTS = {
 }
 
 
+# The module path each seam's call site is in (recipe reachability checks).
+_SCOPES = {
+    "v41.block.ffn": "layers.*",
+    "v41.attn.out": "layers.*.attn",
+    "v41.attn.qk_norm": "layers.*.attn",
+    "v41.attn.project_out": "layers.*.attn",
+    "v41.attn.out_full": "layers.*.attn",
+    "v41.attn.attend_out": "layers.*.attn",
+    "v41.attn.attend": "layers.*.attn",
+    "v41.attn.index_topk": "layers.*.attn.indexer",
+    "v41.moe.shared_act": "layers.*.ffn.shared_experts",
+    "v41.moe.shared_expert": "layers.*.ffn",
+    "v41.moe.topk": "layers.*.ffn.experts",
+}
+
+
 def specs() -> list[SeamSpec]:
     from dataclasses import replace
 
@@ -357,4 +373,7 @@ def specs() -> list[SeamSpec]:
             doc="mono_decode_installers' V4.1 installer -> the model to serve",
         ),
     ]
-    return [replace(s, module_slot=_SLOTS.get(s.name)) for s in out]
+    return [
+        replace(s, module_slot=_SLOTS.get(s.name), scope=_SCOPES.get(s.name))
+        for s in out
+    ]
