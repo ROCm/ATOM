@@ -199,3 +199,42 @@ performance. For a load-bearing performance claim, rerun the full 3600s
 point from these same checkouts (expensive; not done this pass), or at
 minimum a same-duration same-condition control from the original
 `/shared_nfs/ygan/work/p1-c17` tree to isolate the sampling effect.
+
+## 2026-11-24: vendored amd_kernels (colleague-testing branch only, NOT upstream form)
+
+Per explicit user instruction, this branch is a **private reproduction branch for
+a colleague to test/reproduce performance — it is NOT a PR and is NOT meant to be
+upstreamed as-is.** The "zero amd_kernels dependency" goal still applies to anything
+actually proposed upstream to ROCm/aiter or ROCm/ATOM; it does not apply here.
+
+To make this branch runnable by a colleague WITHOUT a separate, private
+`Inferact/amd-kernels` checkout, the `amd_kernels` Python package is now vendored
+directly at the repo root (`amd_kernels/`), copied verbatim from
+`https://github.com/Inferact/amd-kernels` @ commit `fd233ef5f1872bc431907d747f76721a130378c3`
+(Apache-2.0 license, preserved at `LICENSE-amd-kernels`).
+
+**Verified this session** (node 034, `p1` container, real torch/flydsl/ROCm env):
+- With PYTHONPATH limited to ONLY `<this aiter checkout>:<this ATOM checkout>` (no
+  external amd_kernels overlay on the path at all), `import amd_kernels`,
+  `import aiter`, and `import atom` all resolve to the two checked-out repos (not a
+  baked container copy, not an external snapshot).
+- All 17 files in this tree that `import amd_kernels` (`ak_gemm.py`, `layernorm.py`,
+  `ak_kernels.py`, `p1_front.py`, `prefill_fast.py`, `prefill_kernels.py`,
+  `p1_lmhead_ring.py`, `p1_markov_block.py`, `ak_moe.py`, `ak_moe_g1prio.py`,
+  `ak_moe_tiles.py`, `dspark.py`, `mbf_back.py`, `model.py`, `sp_moe_compact.py`,
+  `sp_prefill.py`, `verify_head.py`) import cleanly against the vendored copy.
+
+**NOT verified this session:** a full 3600s-class end-to-end performance run against
+the vendored copy. The previously-measured C17-chain performance numbers in this
+HANDOFF come from runs against the external (non-vendored) amd_kernels snapshot at
+the same commit (`fd233ef`) -- since the vendored copy is byte-identical to that
+snapshot (verified via `diff -r`), the numbers should carry over, but this was not
+re-run end-to-end this session. A colleague reproducing full performance should
+still follow the real recipe at `/shared_nfs/ygan/p1/grid2/c1/recipe/env_armC17.sh`
+(or this HANDOFF's `PYPATH_PRE` instructions) but can now drop the amd_kernels
+snapshot entry from `PYPATH_PRE` and rely on this repo's own `amd_kernels/` instead.
+
+Colleague recipe: clone this branch and the `p1-integration` aiter branch side by
+side, `git submodule update --init --recursive` in the aiter checkout, then set
+`PYTHONPATH=<aiter_checkout>:<this_checkout>` (no amd_kernels entry needed) before
+running the C17 recipe env scripts.
