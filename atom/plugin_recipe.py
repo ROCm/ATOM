@@ -299,9 +299,15 @@ def _parse(document: Mapping[str, Any], *, model_arch: str | None) -> dict[str, 
         raise RecipeRefused(
             "recipe-schema", f"expected schema {RECIPE_SCHEMA!r}, got {schema!r}"
         )
-    unknown = sorted(set(document) - _TOP_LEVEL)
-    if unknown:
-        raise RecipeRefused("recipe-schema", f"unknown recipe field(s): {unknown}")
+    # Other top-level fields are the document's own metadata (a tool's plan_id,
+    # purpose, baseline, notes...): ATOM reads none of them. Sections this ATOM
+    # no longer has are refused rather than silently dropped.
+    removed = sorted(set(document) & {"engine", "dspark_options"})
+    if removed:
+        raise RecipeRefused(
+            "recipe-schema",
+            f"{removed}: not a recipe section (model options go in plugin_options)",
+        )
     arch = document.get("arch", document.get("model_arch"))
     if not isinstance(arch, str) or not arch:
         raise RecipeRefused("recipe-schema", "arch is required")

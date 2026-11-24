@@ -497,3 +497,8 @@ def test_shared_weights_are_prepared_once_for_every_configuration():
 def test_one_inferred_owner_may_serve_several_seams():
     plan = _plan(seams={"toy.block.mix": ["p"], "toy.block.other": ["p"]})
     assert plan.providers == ("p",)
+
+
+def test_a_recipes_metadata_fields_are_ignored():
+    plan = _plan(seams={"toy.block.mix": []}, purpose="layer bench", baseline="x")
+    assert plan.providers == ()
