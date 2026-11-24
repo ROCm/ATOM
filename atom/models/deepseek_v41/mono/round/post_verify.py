@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """A served verify step's verdict and Engram cursor commit inside the target graph (the V4.1 mono hi hook,
 ``ATOM_DSV41_MONO_HI``): the forward's head output.
 
@@ -18,11 +19,9 @@ end of its forward (``HiLayers.end_step``), so a captured graph replays it:
   the device on served steps) into its slot's Engram cursor (a padding request of a bs-B graph commits nothing: its
   slot entry is padding, which names some other slot).
 
-The outputs are the forward's head output (``HiDecodeModel.compute_head`` -> ``ModelRunner._head_output``, recorded
-with the forward). The runner takes them for its step's requests (the first of the width's) where they stand for it
-(``ModelRunner._head_ids_serve``: every request verifying the full span, the rows' picks all it reads), else ATOM's
-path runs on the logits. The commit (``commit_speculative_state``) then skips its launch exactly when the anchors it
-commits are these outputs' (``PostVerify.committed``): the runner took them, and the kernel committed them; on any
+The outputs (``output``, read by ``HiLayers.token_ids``) are recorded with the forward. The runner takes them for its
+step's requests (the first of the width's) where they stand for the step, else ATOM's path runs on the logits. The
+commit (``commit_speculative_state``) then skips its launch exactly when the anchors it commits are these outputs' (``PostVerify.committed``): the runner took them, and the kernel committed them; on any
 other step ATOM's commit rewrites the cursor, so the in-graph write it never asked for is overwritten. The ids that
 feed the next step are not staged here: the runner broadcasts the output ids over TP and gathers each request's next
 id from them, and the DSpark proposer stages its anchors from those, as on ATOM's logits path. The outputs are a
@@ -39,6 +38,12 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.model_ops.rejection_sampler import (
+    _SYNTHETIC_RNG_BASE_SEED,
+    _get_synthetic_cond_rates,
+)
+from atom.model_ops.verify_ids import IdVerifier, VerifyOutput
+from atom.model_ops.verify_kernels import _verify_by_ids
 from atom.models.deepseek_v41.mono.hi_bridge import REQ_LIVE
 
 logger = logging.getLogger("atom")
@@ -61,38 +66,11 @@ def _post_verify_kernel(
     seed = seed_base + tl.load(step_ptr).to(tl.int64)
     if b == 0:
         tl.store(used_seed_ptr, seed)
-    if b == 0:
-        start = 0
-    else:
-        start = tl.load(cu_ptr + b - 1)
-    n = tl.load(cu_ptr + b) - start
-    p = tl.arange(0, SP)
-    live = p < n
-    vrow = tl.load(target_idx_ptr + start + p, mask=live, other=0)
-    target = tl.load(head_ids_ptr + vrow, mask=live, other=0).to(tl.int32)
-    draft = tl.load(input_ids_ptr + vrow + 1, mask=live, other=0).to(tl.int32)
-    if SYNTHETIC:
-        u = tl.rand(seed, start + p)
-        ok = u < tl.load(cond_rates_ptr + p, mask=live, other=0.0)
-        kept = draft  # a forced accept emits the draft
-    else:
-        ok = draft == target
-        kept = target
-    # the first rejected row, n if none
-    k = tl.min(tl.where(live & (ok == 0), p, n), axis=0)
-    rejected = k < n
-    brow = tl.load(bonus_idx_ptr + b)
-    bonus = tl.load(head_ids_ptr + brow).to(tl.int32)
-    INVALID: tl.constexpr = -1
-    row = tl.where(p < n, tl.where(p < k, kept, tl.where(p == k, target, INVALID)),
-                   tl.where((p == n) & (rejected == 0), bonus, INVALID))  # fmt: skip
-    tl.store(out_ptr + b * (num_spec_steps + 1) + p, row, mask=p < num_spec_steps + 1)
-    accepted = tl.where(rejected, k, n)
-    anchor = brow - n + accepted
-    nreq = tl.num_programs(0)
-    tl.store(verdict_ptr + b, accepted)
-    tl.store(verdict_ptr + nreq + b, num_spec_steps - accepted)
-    tl.store(verdict_ptr + 2 * nreq + b, anchor)
+    anchor = _verify_by_ids(
+        out_ptr, verdict_ptr, cu_ptr, input_ids_ptr, target_idx_ptr, bonus_idx_ptr,
+        head_ids_ptr, cond_rates_ptr, seed, b, num_spec_steps,
+        SP=SP, SYNTHETIC=SYNTHETIC,
+    )  # fmt: skip
     cols = tl.arange(0, BLOCK)
     keep = cols < WIDTH
     prefix = anchor - tl.load(starts_ptr + b)
@@ -116,30 +94,17 @@ class PostVerify:
     """
 
     def __init__(self, widths, split, device):
-        from atom.model_ops.rejection_sampler import _SYNTHETIC_RNG_BASE_SEED
-
         self.split = split
         self.seed_base = _SYNTHETIC_RNG_BASE_SEED
         self.used_seed = torch.zeros(1, dtype=torch.int64, device=device)
-        self.bufs, self.launched = {}, set()
-        i32 = {"dtype": torch.int32, "device": device}
-        for rows in widths:
-            nb, rq = split[rows]
-            s = rq - 1
-            self.bufs[rows] = {
-                "out": torch.zeros(nb, rq, **i32), "verdict": torch.zeros(3, nb, **i32),
-                "cu": torch.arange(1, nb + 1, **i32) * s,
-                "target": torch.tensor([b * rq + j for b in range(nb) for j in range(s)], dtype=torch.long,
-                                       device=device),
-                "bonus": torch.tensor([b * rq + s for b in range(nb)], dtype=torch.long, device=device),
-            }  # fmt: skip
+        self.launched = set()
+        # a width's row layout and outputs (its own kernel launches them)
+        self.bufs = {rows: IdVerifier(*split[rows], device) for rows in widths}
 
     def launch(self, hook, cache, step, rows: int) -> None:
         """At the end of a served forward (``HiLayers.end_step``; a capture records it): the kernel on this
         width's fixed buffers. Every input is a fixed address of this width: the head's ids, the step's input ids,
         query starts and slots, ATOM's cursor and tentative staging plane."""
-        from atom.model_ops.rejection_sampler import _get_synthetic_cond_rates
-
         nb, rq = self.split[rows]
         bufs = self.bufs[rows]
         sampler = (
@@ -155,23 +120,22 @@ class PostVerify:
         cond = (
             _get_synthetic_cond_rates(rates, self.used_seed.device)
             if rates is not None
-            else bufs["out"]
+            else bufs.out
         )
         staging, cursor = cache.tentative_staging.gpu, cache.cursor
         self.launched.add(rows)
         _post_verify_kernel[(nb,)](
-            bufs["out"], bufs["verdict"], bufs["cu"], hook.step_ids, bufs["target"], bufs["bonus"], hook.head_ids,
+            bufs.out, bufs.spec_status, bufs.cu, hook.step_ids, bufs.target, bufs.bonus, hook.head_ids,
             cond, hook.step, self.used_seed, cursor, cursor.stride(0), staging, staging.stride(0), staging.stride(1),
             step.cu_seqlens_q, step.slots, hook.req[REQ_LIVE:], rq - 1, self.seed_base, WIDTH=cache.cursor.shape[1],
             BLOCK=triton.next_power_of_2(cache.cursor.shape[1]), SP=triton.next_power_of_2(rq),
             SYNTHETIC=rates is not None, SHADOW=False, num_warps=1,
         )  # fmt: skip
 
-    def output(self, rows: int):
-        """Width ``rows``' outputs, the forward's head output (``HiLayers.head_output``): (output ids [B, rq], verdict
-        [3, B])."""
+    def output(self, rows: int) -> VerifyOutput:
+        """Width ``rows``' verify (``HiLayers.token_ids``)."""
         b = self.bufs[rows]
-        return b["out"], b["verdict"]
+        return VerifyOutput(b.out, b.spec_status)
 
     def committed(self, metadata, anchors) -> bool:
         """The builder's commit (``HiRound.committed``) at ``anchors``: a step whose anchors are a width's in-graph
@@ -184,7 +148,7 @@ class PostVerify:
             return False
         ptr = anchors.data_ptr()
         if not any(
-            ptr == self.bufs[rows]["verdict"][2].data_ptr() for rows in self.launched
+            ptr == self.bufs[rows].spec_status[2].data_ptr() for rows in self.launched
         ):
             return False
         if pending.step is not metadata.step:

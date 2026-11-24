@@ -63,6 +63,23 @@ KV_IDLE_DRAIN_INTERVAL_S = 0.001
 # How long a busy loop that finds its engine held sleeps before it looks again.
 HELD_POLL_S = 0.01
 
+
+def yield_gil() -> None:
+    """Hand the GIL to this process's other threads now.
+
+    A busy loop holds the GIL for as long as it does not block: an idle pass
+    blocks nowhere, and neither does the stretch between queuing a step's
+    outputs and the loop's next blocking call. A thread that is ready to run
+    meanwhile -- the output sender with a request's last chunk, the input
+    reader with a new request -- then gets the GIL only when CPython forces a
+    switch, after `sys.getswitchinterval()` (5 ms by default): the last chunk
+    of every request sat that long in `output_queue` once the engine went
+    idle. `time.sleep(0)` drops and retakes the GIL around a zero-length
+    sleep, so such a thread runs at once; the loop pays microseconds.
+    """
+    time.sleep(0)
+
+
 # Upper bound on the drain that runs after the loop exits. A peer that died
 # mid-transfer leaves a completion that never arrives; exiting late beats
 # never exiting.
@@ -479,8 +496,10 @@ class EngineCore:
     def _report_held_kv_work(self) -> None:
         """Let transfers already in flight report back while no forward runs.
 
-        Starts none, and runs nothing while the weights (and so the KV pool)
-        may be released.
+        Starts no new transfer, except that with ``ATOM_STORE_ASYNC_RENEW`` the
+        metadata build may dispatch the GET of a load parked on its lease
+        renewal. Runs nothing while the weights (and so the KV pool) may be
+        released.
         """
         if not self._is_rl_weights_offloaded and self.has_pending_kv_work():
             self._advance_idle_kv_transfer(dispatch_new=False)
@@ -502,7 +521,9 @@ class EngineCore:
     def prepare_kv_change(self, *, weights: bool, deadline: float) -> None:
         """Get the KV pool ready to be zeroed, freed or recomputed, or raise.
 
-        Waits until KV transfers in flight have reported back, then preempts
+        Waits until KV transfers in flight have reported back (with
+        ``ATOM_STORE_ASYNC_RENEW`` a load parked on its lease renewal counts,
+        and the metadata build may dispatch its GET meanwhile), then preempts
         what is running so it recomputes on what follows. When the weights
         change, the KV connector must also drop what it keeps for later
         requests. Raises with the reason, changing nothing that was running.
@@ -569,10 +590,12 @@ class EngineCore:
                         self.scheduler.engine_stats.bump_step()
                     else:
                         self.scheduler.engine_stats.note_idle(now)
+                        yield_gil()
                 else:
                     self.scheduler.engine_stats.note_idle(now)
                     if self.has_pending_kv_work():
                         self._advance_idle_kv_transfer()
+                    yield_gil()
         finally:
             try:
                 # Teardown runs even on exceptions so the sender thread/socket
@@ -589,15 +612,18 @@ class EngineCore:
                 tracing.shutdown()
 
     def _process_engine_step(self):
+        return self._run_then_publish_kv_events(self._process_engine_step_inner)
+
+    def _run_then_publish_kv_events(self, step):
         try:
-            return self._process_engine_step_inner()
+            return step()
         finally:
             # Swallow publisher errors so they cannot mask an exception from
-            # the engine step itself.
+            # the step itself.
             try:
                 self.scheduler.publish_kv_events()
             except Exception:
-                logger.exception("KV event publish in engine-step finally failed")
+                logger.exception("KV event publish after engine step failed")
 
     def _release_request_resources(self, sequences):
         structured_ids = [seq.id for seq in sequences if is_structured(seq)]
@@ -707,6 +733,8 @@ class EngineCore:
         if finished_seqs:
             self._release_request_resources(finished_seqs)
             self.output_queue.put_nowait(finished_seqs)
+        # The sender ships them now, not a switch interval later (`yield_gil`).
+        yield_gil()
 
     def has_pending_kv_work(self) -> bool:
         """True while KV transfer work outlives the scheduler queues.
@@ -745,7 +773,9 @@ class EngineCore:
         # No forward batch will run this tick, but offload load/save work may
         # still need to be dispatched or reported back to the scheduler.
         # `dispatch_new=False` on the shutdown drain: report in-flight work
-        # back, but start no new transfers (see `_dispatch_idle_offload_work`).
+        # back, but start no new transfers (see `_dispatch_idle_offload_work`);
+        # with `ATOM_STORE_ASYNC_RENEW` the metadata build may still dispatch
+        # the GET of a load parked on its lease renewal.
         now = time.monotonic()
         if now < self._next_idle_kv_drain:
             return
@@ -764,7 +794,9 @@ class EngineCore:
         transfers finish and report, but must not publish new state loads/stores.
         A fresh store dispatched here spills bytes nothing will read back, and --
         worse -- keeps `has_pending_kv_work()` True, so this very loop could
-        manufacture its own work and never converge before the deadline.
+        manufacture its own work and never converge before the deadline. The
+        one exception: with `ATOM_STORE_ASYNC_RENEW` the metadata build may
+        dispatch the GET of a load already parked on its lease renewal.
         """
         if not self.kv_transfer_enabled:
             return
@@ -852,7 +884,9 @@ class EngineCore:
         # read back, and -- worse -- each fresh store keeps `has_pending_kv_work`
         # True, so the drain loop that waits on it manufactures its own exit
         # condition and never converges. Still build/process the meta so
-        # already-dispatched transfers finish and report.
+        # already-dispatched transfers finish and report (with
+        # `ATOM_STORE_ASYNC_RENEW` that build may dispatch the GET of a load
+        # parked on its lease renewal).
         if dispatch_new:
             publish_idle_state_work(self.scheduler)
         meta = connector.build_connector_meta()
@@ -1675,7 +1709,7 @@ class DecodeEngineCore(EngineCore):
             self._send_block_assignment(seq)
         return False
 
-    def _process_engine_step(self):
+    def _process_engine_step_inner(self):
         """Override: handle None from DecodeScheduler when prefill_waiting is
         non-empty but running is empty (sequences are still being prefilled)."""
         if not self.scheduler.has_requests():
@@ -1711,6 +1745,8 @@ class DecodeEngineCore(EngineCore):
             pass
         if finished_seqs:
             self.output_queue.put_nowait(finished_seqs)
+        # The sender ships them now, not a switch interval later (`yield_gil`).
+        yield_gil()
         return True
 
     @staticmethod

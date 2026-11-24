@@ -24,8 +24,11 @@ ATOM (AiTer Optimized Model) wraps AITER kernels with model-level abstractions f
 | `SiluAndMul` | `activation.py` | `aiter.silu_and_mul` | SiLU gated activation |
 | `VocabParallelEmbedding` | `embed_head.py` | `F.embedding` + TP all-reduce | Vocab embedding |
 | `ParallelLMHead` | `embed_head.py` | `tgemm.mm` + `tensor_model_parallel_all_gather` | LM output head |
+| `shared_peer_embedding` | `peer_embedding.py` | Triton `_peer_embedding_kernel` (HIP IPC) | A vocab-parallel embedding read from each row's owner rank's shard in one launch (a DSpark draft shares its target's) |
+| `VerifyHead`, `ShardedPicks`, `ArgmaxVerifyHead`, `argmax_lm_head` | `verify_head.py`, `lm_head_argmax.py` | `tgemm.mm` + Triton `_lm_head_argmax_pack_kernel` | What `ModelRunner` asks of a verify head after the forward (`VerifyHead`: `sample_token_ids`, `samples_step`), a vocab-sharded head's picks (`ShardedPicks`), and a drafted model's Triton verify head (`ArgmaxVerifyHead`, behind the shared mono LM head launch `atom/mono/lm_head` where that serves): each row's id over the vocab shards (greedy, or a temperature row's Gumbel-max draw) and the verify on them, in place of the logits' gather, the sampler and the rejection sampler |
+| `IdVerifiers`, `IdVerifier`, `VerifyOutput`, `HeadDraw` | `verify_ids.py` | Triton `_verify_ids_kernel` | A verify's output ids and spec status from a head's ids (exact match, or forced acceptance), at fixed addresses per width; the step's draw parameters |
 | `RotaryEmbedding` | `rotary_embedding.py` | `aiter.rope_cached_positions_2c_fwd_inplace` | Rotary position embedding |
-| `Sampler` | `sampler.py` | `aiter.mixed_sample_outer_exponential`, `aiter.ops.triton.topk.topk`, `aiter.ops.triton.softmax.softmax` | Token sampling |
+| `Sampler` | `sampler.py` | `aiter.mixed_sample_outer_exponential`, `aiter.ops.triton.fusions.fused_mixed_sample.fused_mixed_sample`, `aiter.ops.triton.topk.topk`, `aiter.ops.triton.softmax.softmax` | Token sampling |
 | `RejectionSampler` | `rejection_sampler.py`, `verify_kernels.py`, `spec_sampling/` (`ratio_verify.py`, `ratio_target_p.py`) | Triton `rejection_greedy_sample_kernel`, `_ratio_*`, `rejection_relaxed_sample_kernel`, `rejection_synthetic_sample_kernel` | Speculative decoding |
 | `apply_packed_bitmask` | `triton_structured_output.py` | Triton packed-bitmask kernel | JSON grammar masks on selected target logits |
 | `constrain_logits`, `advance_states` | `triton_required_channel.py` | Triton `_constrain_logits_kernel`, `_advance_states_kernel` | `tool_choice="required"` channel mask (Kimi-K3) |
@@ -496,6 +499,8 @@ def forward(self, logits, temperatures) -> sampled_tokens:
 **Fallback methods** (currently unreachable due to early return):
 - `greedy_sample()`: `aiter.ops.triton.topk.topk(logits, 1)`
 - `random_sample()`: `aiter.ops.triton.softmax.softmax(logits)` followed by exponential sampling and `topk`.
+
+**Per-row noise.** When a batch needs independent noise and has no top-k/top-p, the sampler draws a `(num_tokens, vocab_size)` `exponential_` tensor (one noise row per token) and calls aiter's `fused_mixed_sample` (ROCm/aiter#7416): the same race as `mixed_sample_outer_exponential` plus the greedy override (rows at or below `SAMPLER_EPS` take the lowest-id argmax), in one aiter call. That covers the speculative bonus token and exact-match verification rows of a non-greedy batch, any batch with `n>1` fan-out siblings, and every unfiltered batch under `--sampler-independent-noise` that is not all greedy (an all-greedy batch takes the argmax first and draws no noise). A sampling row can differ from `mixed_sample_outer_exponential` only on a near tie of its two best race keys. Other unfiltered batches share one broadcast noise row and keep `mixed_sample_outer_exponential` + `topk_select`.
 
 ### Shared token constraints
 
