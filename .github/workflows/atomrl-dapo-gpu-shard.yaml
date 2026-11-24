@@ -26,6 +26,8 @@ jobs:
     permissions:
       contents: read
     env:
+      DATA_ROOT: ${{ inputs.data_root }}
+      DSV3_REVISION: 634c1d1f51816415fa371e51281e435ce4422469
       IMAGE_TAG: ${{ inputs.image_tag }}-${{ github.run_id }}-${{ github.run_attempt }}-unit
       CONTAINER_NAME: atomrl_gpu_unit_${{ github.run_id }}_${{ github.run_attempt }}
     steps:
@@ -40,6 +42,23 @@ jobs:
             --tag "$IMAGE_TAG" \
             .
 
+      - name: Prepare AtomRL GPU unit models
+        run: |
+          set -euo pipefail
+          qwen_path="$DATA_ROOT/models/Qwen3-8B-Base"
+          if [[ ! -f "$qwen_path/config.json" ]]; then
+            echo "::error title=Missing AtomRL GPU model::$qwen_path"
+            exit 1
+          fi
+
+          mkdir -p "$DATA_ROOT/hf"
+          docker run --rm --network=host \
+            -e HF_HOME=/data/rl_data/hf \
+            -e DSV3_REVISION="$DSV3_REVISION" \
+            -v "$DATA_ROOT/hf:/data/rl_data/hf" \
+            "$IMAGE_TAG" python -c \
+            "import os; from huggingface_hub import snapshot_download; snapshot_download('bzantium/tiny-deepseek-v3', revision=os.environ['DSV3_REVISION'])"
+
       - name: Run AtomRL GPU unit tests
         run: |
           set -euo pipefail
@@ -48,6 +67,8 @@ jobs:
             --ipc=host --network=host --privileged \
             --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
             --ulimit memlock=-1 --ulimit stack=67108864 \
+            -v "$DATA_ROOT/models/Qwen3-8B-Base:/dev/shm/atomrl_weight_sync:ro" \
+            -v "$DATA_ROOT/hf:/data/rl_data/hf:ro" \
             -w /opt/atomrl/ATOM \
             "$IMAGE_TAG" bash -lc \
             'python3 -m pytest atomrl/tests/unit atomrl/tests/atomrl \
