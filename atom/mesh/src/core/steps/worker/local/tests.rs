@@ -139,7 +139,11 @@ impl AtomEngine for FakeAtom {
 }
 
 /// A vLLM instance that answers HealthCheck and GetModelInfo.
-struct FakeVllm;
+#[derive(Default)]
+struct FakeVllm {
+    /// HealthCheck answers unhealthy.
+    unhealthy: bool,
+}
 
 #[tonic::async_trait]
 impl vllm::vllm_engine_server::VllmEngine for FakeVllm {
@@ -164,7 +168,7 @@ impl vllm::vllm_engine_server::VllmEngine for FakeVllm {
         _: Request<vllm::HealthCheckRequest>,
     ) -> Result<Response<vllm::HealthCheckResponse>, Status> {
         Ok(Response::new(vllm::HealthCheckResponse {
-            healthy: true,
+            healthy: !self.unhealthy,
             message: String::new(),
         }))
     }
@@ -555,7 +559,7 @@ async fn a_reasoning_effort_overrides_the_default_thinking_effort_as_on_http() {
 
 #[tokio::test]
 async fn a_vllm_worker_is_still_detected_as_vllm() {
-    let service = vllm::vllm_engine_server::VllmEngineServer::new(FakeVllm);
+    let service = vllm::vllm_engine_server::VllmEngineServer::new(FakeVllm::default());
     let url = serve(Server::builder().add_service(service)).await;
     let ctx = context();
     register(&ctx, json!({ "url": url })).await.unwrap();
@@ -564,6 +568,23 @@ async fn a_vllm_worker_is_still_detected_as_vllm() {
     assert_eq!(worker.metadata().runtime_type, RuntimeType::Vllm);
     let labels = &worker.metadata().labels;
     assert_eq!(labels.get("max_context_length").unwrap(), "2048");
+}
+
+/// A vLLM worker's HealthCheck answer does not decide its registration, as before
+/// ATOM workers were served: only an ATOM worker's must say healthy.
+#[tokio::test]
+async fn a_vllm_worker_reporting_unhealthy_still_registers() {
+    let fake = FakeVllm { unhealthy: true };
+    let service = vllm::vllm_engine_server::VllmEngineServer::new(fake);
+    let url = serve(Server::builder().add_service(service)).await;
+    let ctx = context_with(RouterConfig {
+        worker_startup_timeout_secs: 2,
+        ..Default::default()
+    });
+    register(&ctx, json!({ "url": url })).await.unwrap();
+
+    let worker = ctx.worker_registry.get_by_url(&url).unwrap();
+    assert_eq!(worker.metadata().runtime_type, RuntimeType::Vllm);
 }
 
 #[tokio::test]
