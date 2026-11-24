@@ -139,13 +139,17 @@ class ConnectorSourceTest(unittest.TestCase):
             for node in ast.walk(tree)
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
-            and node.func.id == "get_port_offset"
+            and node.func.id in ("get_port_offset", "side_channel_port_offset")
         ]
-        # Side channel, read notify, early-failure notify, handshake, write
-        # request, write report.
-        self.assertEqual(len(calls), 6)
+        # Side channel, a producer stage's port (early-failure notify, write
+        # request, release), read notify, write report, handshake.
+        self.assertEqual(len(calls), 5)
         for call in calls:
-            self.assertEqual(len(call.args), 3, ast.unparse(call))
+            self.assertGreaterEqual(len(call.args), 3, ast.unparse(call))
+            if call.func.id == "side_channel_port_offset":
+                # The PP stride needs every size: (dp, tp, tp_size, pp, pp_size,
+                # dp_size).
+                self.assertEqual(len(call.args), 6, ast.unparse(call))
 
     def test_a_short_remote_list_is_caught_before_the_pairing(self):
         body = self.segment("_read_blocks")
@@ -462,6 +466,7 @@ class ConnectorBehaviourTest(unittest.TestCase):
             send_notify=lambda transfer_id, host, port: notified.append(transfer_id),
         )
         conn.tp_rank = 0
+        conn.tp_size = 8
         meta = types.SimpleNamespace(
             num_computed_blocks=0,
             src_block_skip_factor=1,
@@ -657,6 +662,13 @@ class WritePathTest(unittest.TestCase):
         conn._done_sending_lock = threading.Lock()
         conn._write_ids = {}
         conn._finished_writes = collections.deque()
+        conn._pushes_done = {}
+        conn._page_plans = {}
+        conn._release_ranks = {}
+        conn._released_transfers = collections.OrderedDict()
+        conn._write_reports_expected = {}
+        conn._write_report_counts = {}
+        conn._stage_digests = {}
         # The prefill of the transfer push_request asks for has finished.
         prefilled = types.SimpleNamespace(query=lambda: True)
         conn._kv_ready_events = {9: prefilled}
@@ -908,7 +920,7 @@ class WritePathTest(unittest.TestCase):
         conn._write_requests.put(self.push_request())
 
         conn._service_write_requests()
-        self.assertIn(9, conn._sending_writes)
+        self.assertIn((9, 0, 1), conn._sending_writes)
         self.assertEqual(conn.done_sending, set())
         self.assertEqual(conn.sent, [])
 
@@ -990,7 +1002,7 @@ class WritePathTest(unittest.TestCase):
 
         self.assertIsNone(conn._write_target_ready(request))
         self.assertIsNone(conn._write_target_ready(request))
-        self.assertEqual(submitted, [("10.0.0.2", 7400, 8, "10.0.0.2:7400_dp0", 0)])
+        self.assertEqual(submitted, [("10.0.0.2", 7400, 8, "10.0.0.2:7400_dp0", 0, 1)])
 
         future.set_result({"agent"})
         self.assertTrue(conn._write_target_ready(request))

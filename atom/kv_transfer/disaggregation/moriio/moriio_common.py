@@ -76,6 +76,10 @@ class MoRIIOAgentMetadata(
     # order, ``[offset in that buffer, bytes per block, semantic role]``.
     page_desc: bytes | None = None
     page_regions: list[list[Any]] | None = None
+    # Per PAGE region, its unit (``PageUnitSpec`` fields, then its head runs
+    # ``[runs, heads]`` or None): how a producer holding other layers (a PP
+    # stage) or other heads (a TP1 stage) finds where its regions land.
+    page_units: list[list[Any]] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +180,10 @@ class MoRIIOConstants:
     # blocks it allocated, and the producer reports back once it has.
     WRITE_REQ = b"write_req"
     WRITE_DONE = b"write_done"
+    # A consumer rank tells stage 0 of a PP producer (or a producer rank that
+    # feeds several consumer ranks) that every push into it has been reported:
+    # the source blocks are free once every consumer rank has said so.
+    RELEASE = b"release"
     OVER = b"OVER"
     COMPLETION_PREFIX = "cmpl"
 
