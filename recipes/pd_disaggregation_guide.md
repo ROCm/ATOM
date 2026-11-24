@@ -60,6 +60,19 @@ the reserve until its load lands and it runs. D must have PP=1, DCP=1, PCP=1,
 SP=1 and a single paged KV pool. Metrics are listed under `atom:pd_admission_*`
 in the [metrics guide](../docs/metrics_guide.md#scheduler).
 
+## Producer state transfer slots
+
+A producer of a KDA/GDN model (Kimi-K3, Qwen3-Next) holds a
+finished request's state slots until the decode takes its KV, which can fill
+P's state pool and block new prefills when D is full. Set the key in a MoRIIO
+producer's top-level `--kv-transfer-config`:
+
+| Option | Meaning |
+| --- | --- |
+| `state_transfer_slots` | State slots per rank kept past the live ones. A finished request's state moves to one and its live slots return to admission. Each costs one state slot's bytes from the KV budget. Only a MoRIIO producer of a KDA/GDN model, as the only connector, uses them; set anywhere else, the key sizes nothing and logs a warning. A non-negative integer; default `0`. |
+
+See the [scheduling guide](../docs/scheduling_kv_cache_guide.md#pd-producer-state-transfer-slots).
+
 ## Prerequisites
 
 - Two nodes with AMD MI300X GPUs (8 GPUs each for TP=8)

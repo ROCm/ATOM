@@ -1,0 +1,9 @@
+# Miles site-packages copied into bootstrap (see prepare_bootstrap.sh copy_site_pkg).
+# Keep alphabetized; exclude transformer_engine (PyTorch ABI mismatch on lumen/tests:latest).
+compressed_tensors
+mbridge
+mooncake
+ring_flash_attn
+tile_kernels
+torch_memory_saver
+tvm_ffi

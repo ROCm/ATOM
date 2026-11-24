@@ -1,0 +1,105 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
+ARG BASE_IMAGE=rocm/atom-dev:latest
+FROM ${BASE_IMAGE}
+
+WORKDIR /workspace
+
+# System build tools + mori build dependencies:
+#   cmake/ninja    — mori CMake build
+#   libopenmpi-dev — MPI (mori bootstrap)
+#   libibverbs-dev, rdma-core — RDMA verbs + mlx5 provider (mori transport)
+#   libpci-dev     — PCI topology detection
+# Base image ships an internal AMD artifactory source that 404s outside AMD network.
+# ROCm is already installed in the base layer; only Ubuntu packages are needed here.
+RUN apt-get update && \
+    apt --fix-broken install -y && \
+    apt-get install -y --no-install-recommends \
+        build-essential git ninja-build cmake \
+        libopenmpi-dev libibverbs-dev rdma-core libpci-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy project source
+COPY . /workspace/ATOM
+RUN rm -rf /workspace/Lumen && \
+    ln -s /workspace/ATOM/atomrl/lumen /workspace/Lumen
+
+# AITER is supplied by rocm/atom-dev:latest outside the bind-mounted checkout.
+# Reuse that checkout when it is already at the upstream ref; otherwise refresh
+# it in place. This keeps the image build aligned with Dockerfile.dev and avoids
+# cloning the large AITER repository and its composable-kernel submodule twice.
+ARG AITER_REPOSITORY=https://github.com/ROCm/aiter.git
+ARG AITER_REF=main
+ARG AITER_DIR=/app/aiter-test
+ENV AITER_DIR=${AITER_DIR}
+RUN set -eux; \
+    latest="$(git ls-remote "${AITER_REPOSITORY}" "refs/heads/${AITER_REF}" | awk 'NR == 1 { print $1 }')"; \
+    test -n "${latest}"; \
+    current="$(git -C "${AITER_DIR}" rev-parse HEAD 2>/dev/null || true)"; \
+    if [ "${current}" = "${latest}" ]; then \
+        echo "Reusing AITER ${current} from the base image"; \
+    else \
+        if [ -d "${AITER_DIR}/.git" ]; then \
+            git -C "${AITER_DIR}" fetch --depth=1 origin "${AITER_REF}"; \
+            git -C "${AITER_DIR}" checkout --detach "${latest}"; \
+        else \
+            rm -rf "${AITER_DIR}"; \
+            git clone --depth=1 --branch "${AITER_REF}" "${AITER_REPOSITORY}" "${AITER_DIR}"; \
+        fi; \
+    fi; \
+    flydsl_site="$(python -c 'import site; print(site.getsitepackages()[0])')"; \
+    find "${flydsl_site}" -maxdepth 1 -iname 'flydsl*' -exec rm -rf {} +; \
+    pip install -r "${AITER_DIR}/requirements.txt"; \
+    pip install --no-build-isolation --no-deps -e "${AITER_DIR}"
+
+# MORI is provided by the ATOM base image (amd-mori-nightly).
+RUN python -c "import mori; print(f'mori: {mori.__file__}')" && \
+    pip show amd-mori-nightly
+
+# torchao (quantization reference)
+RUN pip install --no-deps "torchao>=0.8"
+
+# Megatron-LM-AMD (for Megatron backend)
+ARG MEGATRON_COMMIT=8dd45f5a51378ec1ee7937dee3c20d8626df4763
+RUN rm -rf megatron_lm && \
+    git init megatron_lm && \
+    cd megatron_lm && \
+    git remote add origin https://github.com/ROCm/Megatron-LM.git && \
+    git fetch --depth=1 origin "${MEGATRON_COMMIT}" && \
+    git checkout --detach FETCH_HEAD && \
+    git submodule update --init --recursive
+RUN pip uninstall -y megatron-core
+RUN cd megatron_lm && git checkout ${MEGATRON_COMMIT} \
+    && pip install -e .  -U --force-reinstall --no-deps \
+    && cd megatron/core/datasets && make
+
+ENV PYTHONPATH="/workspace/megatron_lm:"
+ENV PYTHONPATH="/app/aiter-test:${PYTHONPATH:-}"
+
+# ATOM's setuptools-scm backend requires the matching vcs_versioning module.
+RUN pip install --upgrade "setuptools>=77" setuptools-scm
+
+# Lumen + AtomRL dependencies. Install the two distributions separately so
+# ATOM's inference package does not absorb AtomRL's Ray/OmegaConf dependencies.
+RUN pip install --no-deps -r /workspace/ATOM/atomrl/lumen/requirements.txt && \
+    pip install --no-cache-dir "protobuf>=7.36.1" && \
+    pip install datasets "math_verify[antlr4_13_2]" safetensors \
+        pytest pytest-xdist && \
+    pip install --no-deps 'peft==0.21.2' 'accelerate==1.15.0' && \
+    cd /workspace/ATOM && \
+    pip install --no-build-isolation --no-deps -e . && \
+    LUMEN_BUILD_EXTENSIONS=1 pip install --no-build-isolation -e ./atomrl
+
+# Environment
+ENV PYTHONPATH="/workspace/ATOM/atomrl:${PYTHONPATH}"
+ENV HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+ENV MORI_ENABLE_SDMA=1
+RUN python -c "import torch; assert torch.version.hip is not None, 'ROCm PyTorch was replaced'; print(torch.__version__, torch.version.hip)"
+RUN python -c "import torch, pathlib; print(pathlib.Path(torch.__file__).parent / 'lib')" \
+        > /etc/ld.so.conf.d/torch.conf && ldconfig
+
+WORKDIR /workspace/ATOM/atomrl/lumen
+
+CMD ["pytest", "tests/ops/", "-v", "--tb=short"]

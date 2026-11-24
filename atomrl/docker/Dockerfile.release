@@ -1,0 +1,103 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
+# AtomRL release image. This is the validated Dockerfile.dev stack with the
+# source revisions fixed for reproducibility. The root ATOM Dockerfile is built
+# first as rocm/atom-dev:latest; this file does not modify it.
+
+ARG BASE_IMAGE=rocm/atom-dev:vllm-latest
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-lc"]
+WORKDIR /opt/atomrl
+
+ARG PYTORCH_ROCM_ARCH=gfx950
+ARG AITER_REPO=https://github.com/ROCm/aiter.git
+ARG AITER_SHA=c813348adc360f077c9bd040ee8de68bb7ade0f7
+ARG AITER_DIR=/app/aiter-test
+ARG MEGATRON_COMMIT=8dd45f5a51378ec1ee7937dee3c20d8626df4763
+ARG APEX_SHA=daed85255d51476425080e7e6203f0bee6d7e4cc
+ARG TE_SHA=6e541a10419a6e31bdc98b1516db04eb81a463b6
+ARG WITH_MEGATRON=1
+
+ENV RL_ROOT=/opt/atomrl \
+    ATOM_DIR=/opt/atomrl/ATOM \
+    AITER_DIR=${AITER_DIR} \
+    PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH} \
+    GPU_ARCHS=${PYTORCH_ROCM_ARCH} \
+    MORI_ENABLE_SDMA=1 \
+    VLLM_USE_V1=1 \
+    TORCHDYNAMO_DISABLE=1 \
+    NVTE_FRAMEWORK=pytorch \
+    NVTE_USE_ROCM=1 \
+    NVTE_ROCM_ARCH=${PYTORCH_ROCM_ARCH} \
+    VLLM_ROCM_ATTN_BACKEND=ROCM_AITER_FA \
+    VLLM_ROCM_ATTN_BACKEND_FALLBACK=ROCM_AITER_UNIFIED_ATTN
+
+RUN apt-get update && \
+    apt --fix-broken install -y && \
+    apt-get install -y --no-install-recommends \
+      build-essential git ninja-build cmake libopenmpi-dev libibverbs-dev \
+      rdma-core libpci-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY . /opt/atomrl/ATOM
+
+# Reuse the ATOM image's AITER checkout when it is the validated revision;
+# otherwise update that checkout in place. No AITER or ATOM source is changed.
+RUN set -eux; \
+    current="$(git -C "${AITER_DIR}" rev-parse HEAD 2>/dev/null || true)"; \
+    if [ "${current}" != "${AITER_SHA}" ]; then \
+      if [ -d "${AITER_DIR}/.git" ]; then \
+        git -C "${AITER_DIR}" fetch --depth=1 origin "${AITER_SHA}" && \
+        git -C "${AITER_DIR}" checkout --detach "${AITER_SHA}"; \
+      else \
+        rm -rf "${AITER_DIR}" && \
+        git clone --depth=1 "${AITER_REPO}" "${AITER_DIR}" && \
+        git -C "${AITER_DIR}" checkout --detach "${AITER_SHA}"; \
+      fi; \
+    fi; \
+    pip install -r "${AITER_DIR}/requirements.txt"; \
+    pip install --no-build-isolation --no-deps -e "${AITER_DIR}"
+
+RUN pip install --upgrade "setuptools>=77,<80" setuptools-scm && \
+    pip install datasets "math_verify[antlr4_13_2]" safetensors \
+      pytest pytest-xdist ruff mypy && \
+    pip install onnxscript && \
+    pip install --no-deps accelerate && \
+    cd /opt/atomrl/ATOM && \
+    pip install --no-build-isolation --no-deps -e . && \
+    LUMEN_BUILD_EXTENSIONS=1 pip install --no-build-isolation -e ./atomrl
+
+RUN if [ "${WITH_MEGATRON}" = "1" ]; then \
+      git clone --recursive https://github.com/ROCm/Megatron-LM.git /opt/atomrl/megatron_lm && \
+      cd /opt/atomrl/megatron_lm && git checkout "${MEGATRON_COMMIT}" && \
+      pip install -e . -U --force-reinstall --no-deps && \
+      cd megatron/core/datasets && make; \
+    fi
+
+COPY atomrl/release/build_apex_te.sh /tmp/build_apex_te.sh
+RUN if [ "${WITH_MEGATRON}" = "1" ]; then \
+      APEX_SHA="${APEX_SHA}" TE_SHA="${TE_SHA}" \
+      PYTORCH_ROCM_ARCH="${PYTORCH_ROCM_ARCH}" GPU_ARCHS="${PYTORCH_ROCM_ARCH}" \
+      bash /tmp/build_apex_te.sh; \
+    fi
+
+COPY atomrl/release/patch_vllm_aiter_rmsnorm.py /opt/atomrl/patch_vllm_aiter_rmsnorm.py
+RUN python /opt/atomrl/patch_vllm_aiter_rmsnorm.py
+
+ENV PYTHONPATH=/opt/atomrl/megatron_lm:/opt/atomrl/ATOM:/app/aiter-test:/opt/atomrl/ATOM/atomrl:${PYTHONPATH:-} \
+    AITER_JIT_DIR=/opt/atomrl/aiter-jit
+
+RUN python -c "import torch; assert torch.version.hip is not None; print(torch.__version__, torch.version.hip)" && \
+    if [ "${WITH_MEGATRON}" = "1" ]; then \
+      python -c "import transformer_engine; print(transformer_engine.__version__)"; \
+    fi && \
+    python -c "import atom, atomrl; print(atom.__file__, atomrl.__file__)"
+
+RUN python -c "import torch, pathlib; print(pathlib.Path(torch.__file__).parent / 'lib')" \
+      > /etc/ld.so.conf.d/torch.conf && ldconfig
+
+WORKDIR /opt/atomrl/ATOM/atomrl
+CMD ["/bin/bash"]

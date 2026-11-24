@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
+# Repository-wide entries and the images shared by the examples.
+# See README.md for the format; `bash examples/run.sh list` for everything.
+
+images:
+  # The release image: pinned ROCm, PyTorch, aiter, ATOM, Megatron, Apex/TE and
+  # precompiled aiter kernels, built from this repository by the `build` steps
+  # and published. The checkout running the examples is mounted over the copy
+  # of AtomRL inside, so code changes need no rebuild.
+  release:
+    ref: rocm/atom-dev:atomrl-dapo-gfx950-rocm7.2.3-261119
+    atomrl_mount: /opt/atomrl/ATOM/atomrl
+    atom_mount: /opt/atomrl/ATOM
+    env: {RL_ROOT: /opt/atomrl}
+    build: >-
+      TAG=atomrl:release-base bash atomrl/release/build_image.sh &&
+      TAG=atomrl:release-base OUT_TAG=atomrl:release bash atomrl/release/precompile_kernels.sh
+
+examples:
+  - id: unit-tests
+    title: "AtomRL unit tests (tests/unit, atomrl/tests), GPU tests included"
+    tier: t0
+    status: validated
+    gpus_per_node: 8
+    log_mode: stdout
+    command: >-
+      cd {atomrl} && PYTHONPATH={atomrl}:$PYTHONPATH
+      python3 -m pytest tests/unit atomrl/tests -q -p no:cacheprovider -rfE
+    smoke:
+      timeout_min: 120
+      stall_min: 30
+      checks:
+        pytest: true
+        forbid: []
+        weight_sync_buckets: false
+        last_step: false
+
+  - id: quickstart-grpo-qwen3-0.6b
+    title: "Quick start: GRPO on Qwen3-0.6B, FSDP2 + ATOM, one GPU, no Ray (configs/grpo_dense_bf16.yaml)"
+    tier: t1
+    status: validated
+    gpus_per_node: 1
+    log_mode: stdout
+    # The config names the model and dataset by Hub id. The run reads both from
+    # local copies with the Hub offline, so a rate-limited Hub (429) cannot fail it.
+    requires: [models/Qwen3-0.6B, data_cached/openmathinstruct-2.cached]
+    prepare: >-
+      python3 -c "from huggingface_hub import snapshot_download as get;
+      get('Qwen/Qwen3-0.6B', local_dir='{data_root}/models/Qwen3-0.6B')" &&
+      HF_HOME={data_root}/hf_home python3 -c "import datasets;
+      datasets.load_dataset('nvidia/OpenMathInstruct-2', split='train')" &&
+      mkdir -p {data_root}/data_cached && touch {data_root}/data_cached/openmathinstruct-2.cached
+    env:
+      HF_HOME: "{data_root}/hf_home"
+      HF_HUB_OFFLINE: "1"
+      HF_DATASETS_OFFLINE: "1"
+    command: >-
+      cd {atomrl} && CUDA_VISIBLE_DEVICES=0 python3 examples/run_grpo.py --config {config}
+      policy.model_name={data_root}/models/Qwen3-0.6B
+      num_training_steps={steps}
+      checkpointing.checkpoint_dir={data_root}/ckpts/atomrl-examples/{id}
+      logger.wandb_enabled=false {overrides}
+    smoke:
+      config: ../configs/grpo_dense_bf16.yaml
+      steps: 2
+      timeout_min: 60
+      checks: {marker: "callbacks", weight_sync_buckets: false}

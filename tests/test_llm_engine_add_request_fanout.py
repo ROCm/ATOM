@@ -138,7 +138,7 @@ def test_generate_hands_back_the_siblings_prompt_major():
     caller pairing prompts with outputs expands its own list by `n`; it does not
     get a list of lists, and nothing downstream regroups the siblings. Pinned
     because it is now the only statement of that ordering that a change can
-    break: `Lumen-RL`'s ATOM server groups equal prompts, sets `n` to the group
+    break: AtomRL's ATOM server groups equal prompts, sets `n` to the group
     size, and zips the result against the same expansion.
     """
     outputs = _GeneratingEngine().generate(

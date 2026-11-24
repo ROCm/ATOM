@@ -1,0 +1,121 @@
+# Wan2.1-T2V-1.3B DiT SFT, online training -- the video (T>1) side of the example.
+#
+# Derived from VeOmni's configs/dit/wan2.1_I2V_1.3B_lora.yaml and
+# docs/examples/wan2.1_I2V_1.3B.md section 3.4 (the online workflow). Everything
+# here that departs from those is either to make an A/B measurable or to get
+# around something that does not run at VeOmni 573848a; both kinds are noted
+# where they occur, because they are the sort of thing that looks arbitrary
+# later.
+#
+# Why the 1.3B T2V model and not wan_sft.yaml: that config wants
+# Wan2.1-I2V-14B-480P and ulysses_size 4. The 1.3B T2V model carries the same
+# VAE -- AutoencoderKLWan, the only part the conv patch touches -- at a size
+# that leaves room to repeat runs, which the comparison needs more than it needs
+# a big DiT. The upstream config's own model_path says I2V-1.3B, which is not a
+# public repo; the doc drives it with T2V-1.3B and VeOmni's Wan condition model
+# is T2V-only, so both paths are overridden on the command line anyway.
+#
+# mm_configs is a plain dict, so fps/max_frames cannot be set from the command
+# line -- that is why this is a separate file rather than a few CLI flags.
+# max_frames 81 is what the upstream config asks for and what the VAE trace was
+# taken at.
+model:
+  model_path: /work/models-extra/Wan2.1-T2V-1.3B/transformer
+  condition_model_path: /work/models-extra/Wan2.1-T2V-1.3B
+  ops_implementation:
+    # Wan's RoPE has a non-standard signature (rope_apply takes a single tensor
+    # plus freqs/head_dim kwargs) so the framework's default liger_kernel RoPE
+    # cannot drop in.
+    rotary_pos_emb_implementation: eager
+    # Not the default (flash_attention_2). That path asserts BF16 by reading
+    # attn.to_q.weight (modeling_wan_transformer.py:129) and, under
+    # mixed_precision, the weight it finds is FP32. "eager" here is a misnomer
+    # worth knowing: wan_eager_attention_forward calls
+    # F.scaled_dot_product_attention (modeling_wan_transformer.py:49), so it is
+    # memory-efficient attention, not a materialised score matrix. It is also
+    # what the Qwen-Image side of this example runs.
+    attn_implementation: eager
+
+# No lora_config, unlike the upstream file, and not by preference: LoRA does not
+# run against Wan at this VeOmni commit. The attention processor reaches for
+# attn.to_q.weight and attn.to_out[0].weight
+# (modeling_wan_transformer.py:57 and :266) on modules that lora_config replaces
+# with LoraLinear, whose weight lives at base_layer.weight, so the first step
+# raises AttributeError. Full-parameter SFT of the 1.3B DiT is also what the
+# Qwen-Image side does, which keeps the two halves of the example comparable.
+
+data:
+  train_path: /work/data/tom-and-jerry-parquet
+  source_name: Tom-and-Jerry-VideoGeneration-Dataset
+  # data_type is left at the default ("conversation"), as the upstream Wan
+  # config leaves it. Setting it to "diffusion" like qwen_image_sft.yaml does
+  # would also require text_keys, which arguments_types.py:1560 only fills in for
+  # the other four data types; the parquet columns are read through
+  # source_name's registry entry either way.
+  datasets_type: mapping
+  dataloader:
+    type: native
+    num_workers: 0
+    drop_last: true
+    pin_memory: false
+    persistent_workers: false
+    use_background_prefetcher: false
+  shuffle: false
+  mm_configs:
+    fps: 24
+    max_frames: 81
+
+train:
+  training_task: online_training
+  accelerator:
+    dp_replicate_size: 1
+    ulysses_size: 1
+    enable_async: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+      # Left at the default (enable: true), unlike qwen_image_1024.yaml, and
+      # load-bearing rather than a preference. VeOmni builds the DiT in BF16
+      # when mixed precision is off (dit_trainer.py:296) and only installs
+      # FSDP2's MixedPrecisionPolicy -- hence cast_forward_inputs -- when it is
+      # on (torch_parallelize.py:480). Wan's forward has no equivalent of
+      # Qwen-Image's hidden_states.to(self.dtype), so with mixed precision off
+      # the condition model's FP32 latents reach a BF16 patch_embedding and the
+      # run dies with "Input type (float) and bias type (c10::BFloat16)".
+    offload_config:
+      enable_activation: false
+  gradient_checkpointing:
+    enable: true
+  torch_compile:
+    enable: false
+  broadcast_model_weights_from_rank0: true
+  global_batch_size: 8
+  micro_batch_size: 1
+  bsz_warmup_ratio: 0
+  dyn_bsz: false
+  optimizer:
+    type: adamw
+    lr: 1.0e-5
+    lr_warmup_ratio: 0
+    lr_decay_style: constant
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+  init_device: meta
+  enable_full_determinism: false
+  empty_cache_steps: 1
+  max_steps: 10
+  num_train_epochs: 1
+  eval_steps: 0
+  eval_epochs: 0
+  checkpoint:
+    output_dir: /work/outputs/wan-video
+    manager: dcp
+    save_steps: 0
+    save_epochs: 0
+    hf_save_steps: 0
+    hf_save_epochs: 0
+    save_hf_weights: false
+  wandb:
+    enable: false
+    project: Wan2.1-FlyDSL
+    name: wan-video

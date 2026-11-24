@@ -1,0 +1,88 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
+# Eagle3 draft distillation for Kimi K2.5 (README.md). The smoke trains a
+# one-layer Eagle3 head on a Qwen3-8B teacher through plain HF forward, so it
+# checks the draft model, loss and optimizer path without vLLM, ATOM or
+# Mooncake. The two phases are full-size runs on the example's own image.
+
+images:
+  kimi-sddd:
+    ref: atomrl-vllm-mi350:latest
+    atomrl_mount: /root/atomrl
+    atom_mount: /root/ATOM
+    run_args: ["-v", "/dev/shm:/dev/shm", "--group-add=render"]
+    build: bash atomrl/examples/SDDD/Kimi_K25_SDDD_MI350_ATOM/docker/build.sh
+
+examples:
+  - id: sddd-eagle3-smoke-hf
+    title: "Eagle3 draft distillation smoke: Qwen3-8B HF teacher, one GPU, two steps"
+    tier: t1
+    status: validated
+    image: release
+    gpus_per_node: 1
+    log_mode: stdout
+    requires: [models/Qwen3-8B]
+    prepare: python3 {examples}/DAPO/tools/prepare_data.py --data-root {data_root} --models Qwen3-8B
+    command: >-
+      cd {atomrl} && CUDA_VISIBLE_DEVICES=0 python3 -m atomrl.trainer.main --config {config}
+      policy.model_name={data_root}/models/Qwen3-8B
+      algorithm.teacher.model_name={data_root}/models/Qwen3-8B
+      checkpointing.checkpoint_dir={data_root}/ckpts/atomrl-examples/{id}
+      num_training_steps={steps} {overrides}
+    smoke:
+      config: configs/smoke_test_hf.yaml
+      steps: 2
+      timeout_min: 30
+      stall_min: 15
+      checks:
+        marker: "loss="
+        weight_sync_buckets: false
+        # A freshly initialised draft starts each position's loss around
+        # ln(vocab) = ln(151936) = 11.9; the total is the 0.8-decayed sum over
+        # spec_length 4 (factor 2.95). The draft's random initialisation moves the
+        # start: four runs on MI355X gave 12.2-15.0 and 36.0-44.2. So the checks
+        # bound them rather than hold them to a reference.
+        metrics:
+          - {name: step_0_loss, min: 10.0, max: 20.0}
+          - {name: loss, min: 29.0, max: 60.0}
+          - {name: grad_norm, info: true}
+
+  - id: sddd-kimi-k25-eagle3-phase1
+    title: "Kimi K2.5 Eagle3 phase 1: ATOM MXFP4 teacher on GPUs 4-7, FSDP2 draft on GPUs 0-3"
+    tier: long
+    status: unvalidated
+    image: kimi-sddd
+    log_mode: stdout
+    requires: [/dev/shm/Kimi-K2.5-MXFP4, /dev/shm/kimi-mtp-dataset]
+    notes: >-
+      Models and data live in /dev/shm (README.md, Quick Start step 1). Phase 2
+      resumes from phase 1's checkpoint.
+    env: &kimi_env
+      CUDA_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
+      PYTORCH_ROCM_ARCH: gfx950
+      HIP_FORCE_DEV_KERNARG: "1"
+      ATOMRL_TEACHER_READY_TIMEOUT_SECONDS: "1800"
+      ATOM_WARMUP_MAX_TOKENS: "8192"
+      ATOM_USE_TRITON_MOE: "1"
+      WANDB_MODE: disabled
+    command: bash {ex_dir}/run_full_training.sh
+    smoke:
+      timeout_min: 20160
+      stall_min: 120
+      checks: {marker: "loss=", metrics: [], last_step: false, weight_sync_buckets: false}
+
+  - id: sddd-kimi-k25-eagle3-phase2
+    title: "Kimi K2.5 Eagle3 phase 2: mixed-domain data, resumed from phase 1"
+    tier: long
+    status: unvalidated
+    image: kimi-sddd
+    log_mode: stdout
+    requires: [/dev/shm/Kimi-K2.5-BF16, /dev/shm/checkpoints/kimi_k25_eagle3_v2_phase1]
+    env: *kimi_env
+    command: bash {ex_dir}/run_full_training.sh --phase2-only
+    smoke:
+      timeout_min: 20160
+      stall_min: 120
+      checks: {marker: "loss=", metrics: [], last_step: false, weight_sync_buckets: false}

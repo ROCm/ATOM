@@ -14,8 +14,11 @@ import pytest
 import torch
 
 from atom.config import DCPConfig, _check_fp4_kv, resolve_draft_kv_dtype
+from atom.kv_transfer.disaggregation.sharded_transfer import consumer_head_slices
 from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
 from atom.model_ops.minimax_m3.nvfp4_pages import (
+    HEAD_DATA_BYTES,
+    HEAD_SCALE_BYTES,
     INDEX_PAGE_BYTES,
     Nvfp4KvLayout,
     head_regions,
@@ -143,8 +146,6 @@ def test_the_shared_refusals_hold_for_nvfp4():
         check(kv_cache_block_size=16, **NV)
     with pytest.raises(ValueError, match="indexed sparse"):
         check(hf=sparse_hf(freq=[1, 1, 0, 1]), **NV)
-    with pytest.raises(ValueError, match="KV offload"):
-        check(kv_transfer_config={"kv_connector": "x"}, **NV)
     with pytest.raises(ValueError, match="draft would have FP4 KV"):
         check(
             speculative_config=types.SimpleNamespace(
@@ -223,7 +224,51 @@ def test_nvfp4_index_cache_is_one_9216_byte_uint8_page():
         b._index_cache_spec(256)
 
 
+NV_WIDTHS = (8192, 1024, 8192, 1024)
+
+
+@pytest.mark.parametrize("heads", [1, 4])
+def test_transfer_pages_declare_the_four_runs_of_a_page(heads):
+    p = pool(layers=2, heads=heads)
+    p.allocate(3, "cpu")
+    pages = p.transfer_pages("mha", "mha.x", [10, 11], [16, 16])
+    assert [pg.head_major_runs for pg in pages] == [(heads, NV_WIDTHS)] * 2
+    assert pages[0].region.unit_bytes == kv_page_bytes(heads)
+    # each run's heads tile the page in order: K data, K scales, V data, V scales
+    assert sum(heads * w for w in NV_WIDTHS) == kv_page_bytes(heads)
+    assert head_regions(1, 0, heads)[0] == heads * (8192 + 1024)
+
+
+def _kv_page(heads):
+    p = pool(layers=1, heads=heads)
+    p.allocate(1, "cpu")
+    return p.transfer_pages("mha", "mha.x", [10])[0]
+
+
+@pytest.mark.parametrize("rank", range(4))
+def test_a_tp4_rank_cuts_its_head_of_each_run_of_a_tp1_page(rank):
+    # each row is that head's K / V data or scales, where head_regions puts them
+    src, dst = _kv_page(4), _kv_page(1)
+    cuts = consumer_head_slices(
+        src.region.unit_bytes,
+        dst.region.unit_bytes,
+        src.head_major_runs,
+        dst.head_major_runs,
+        rank,
+        4,
+        "kv",
+    )
+    sizes = (HEAD_DATA_BYTES, HEAD_SCALE_BYTES)
+    assert cuts.tolist() == [
+        [head_regions(side, rank, 4)[k], head_regions(side, 0, 1)[k], sizes[k]]
+        for side in (0, 1)
+        for k in (0, 1)
+    ]
+
+
 MORIIO = {"kv_connector": "moriio", "kv_role": "kv_both"}
+PD = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
+STORE = {"kv_connector": "mooncake_store", "kv_role": "offload"}
 LMCACHE_BY_ANY_NAME = [
     OFFLOAD,
     {"kv_connector": "LMCacheConnectorV1", "kv_role": "offload"},
@@ -237,21 +282,72 @@ def test_lmcache_offload_takes_nvfp4_by_any_name(kvt):
 
 
 @pytest.mark.parametrize(
-    "kvt", [MORIIO, {"kv_connector": "multi", "connectors": [MORIIO, OFFLOAD]}]
+    "kvt",
+    [
+        PD,
+        {**PD, "kv_role": "kv_consumer"},
+        STORE,
+        {"kv_connector": "multi", "connectors": [PD, STORE]},
+    ],
 )
-def test_a_transport_outside_the_set_refuses_nvfp4_even_beside_lmcache(kvt):
-    with pytest.raises(ValueError, match="only under lmcache_offload"):
+def test_nvfp4_pages_run_under_mooncake_pd_and_store(kvt):
+    check(kv_transfer_config=kvt, **NV)
+
+
+@pytest.mark.parametrize(
+    "kvt",
+    [
+        MORIIO,
+        {"kv_connector": "multi", "connectors": [MORIIO, OFFLOAD]},
+        # every leaf, not any: P/D beside an offload tier that moves no NVFP4 page
+        {
+            "kv_connector": "multi",
+            "connectors": [PD, {"kv_connector": "lmcache_mp", "kv_role": "offload"}],
+        },
+    ],
+)
+def test_one_transport_that_moves_no_nvfp4_pages_refuses_nvfp4(kvt):
+    with pytest.raises(
+        ValueError, match="only under lmcache_offload, mooncake, mooncake_store$"
+    ):
         check(kv_transfer_config=kvt, **NV)
 
 
-def test_lmcache_offload_still_refuses_mxfp4():
+def test_an_unknown_connector_keeps_the_factory_error(monkeypatch):
+    with pytest.raises(ValueError, match="unknown KV connector 'x'"):
+        check(kv_transfer_config={"kv_connector": "x"}, **NV)
+    # with a DSpark draft of its own dtype too: refused before the draft check
+    spec = _dspark_spec()
+    spec.kv_cache_dtype = "fp8"
+    with pytest.raises(ValueError, match="unknown KV connector 'x'"):
+        _m3(
+            monkeypatch,
+            hf=sparse_hf(),
+            kv_transfer_config={"kv_connector": "x"},
+            speculative_config=spec,
+            **NV,
+        )
+
+
+@pytest.mark.parametrize("kvt", [OFFLOAD, PD, STORE])
+def test_mxfp4_still_refuses_every_transport(kvt):
     with pytest.raises(ValueError, match="fp4: it does not run with KV offload"):
-        check(kv_transfer_config=OFFLOAD)
+        check(kv_transfer_config=kvt)
 
 
-@pytest.mark.parametrize("kvt", LMCACHE_BY_ANY_NAME)
+DRAFT_DTYPE_TRANSPORTS = [
+    *LMCACHE_BY_ANY_NAME,
+    PD,
+    {**PD, "kv_role": "kv_consumer"},
+    STORE,
+    {"kv_connector": "multi", "connectors": [PD, STORE]},
+    {"kv_connector": "multi", "connectors": [PD, OFFLOAD]},
+]
+
+
+@pytest.mark.parametrize("kvt", DRAFT_DTYPE_TRANSPORTS)
 @pytest.mark.parametrize("asked, draft", [("fp8", "fp8"), (None, "bf16")])
-def test_lmcache_offload_takes_nvfp4_with_a_draft_of_its_own_dtype(
+def test_nvfp4_takes_a_dspark_draft_of_its_own_dtype_under_each_declaring_transport(
     monkeypatch, kvt, asked, draft
 ):
     spec = _dspark_spec()
@@ -267,9 +363,10 @@ def test_lmcache_offload_takes_nvfp4_with_a_draft_of_its_own_dtype(
     assert config.speculative_config.draft_kv_dtype == draft
 
 
+@pytest.mark.parametrize("kvt", [OFFLOAD, PD, STORE])
 @pytest.mark.parametrize("asked", ["fp8", None])
-def test_lmcache_offload_still_refuses_an_eagle3_draft_dtype_beside_nvfp4(
-    monkeypatch, asked
+def test_every_transport_still_refuses_an_eagle3_draft_dtype_beside_nvfp4(
+    monkeypatch, kvt, asked
 ):
     spec = _eagle3_spec()
     spec.kv_cache_dtype = asked
@@ -279,35 +376,79 @@ def test_lmcache_offload_still_refuses_an_eagle3_draft_dtype_beside_nvfp4(
             kv_cache_dtype="nvfp4",
             index_cache_dtype="nvfp4",
             hf=sparse_hf(),
-            kv_transfer_config=OFFLOAD,
+            kv_transfer_config=kvt,
             speculative_config=spec,
         )
 
 
-def test_a_transport_that_moves_nvfp4_pages_does_not_take_a_draft_dtype(monkeypatch):
-    from atom.models.minimax_m3 import config as m3_config
+def test_moving_nvfp4_pages_does_not_imply_moving_a_draft_dtype(monkeypatch):
+    # The two declarations are separate: one without the other refuses the draft.
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 
-    monkeypatch.setattr(
-        m3_config, "NVFP4_PAGE_CONNECTORS", frozenset({"lmcache_offload", "mooncake"})
-    )
-    mooncake = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
+    monkeypatch.setitem(KVConnectorFactory._moves_own_dtype_draft, "mooncake", False)
     nvfp4 = {"kv_cache_dtype": "nvfp4", "index_cache_dtype": "nvfp4", "hf": sparse_hf()}
-    for kvt in (mooncake, {"kv_connector": "multi", "connectors": [mooncake, OFFLOAD]}):
+    for kvt in (PD, {"kv_connector": "multi", "connectors": [PD, STORE]}):
+        # still declared for NVFP4 pages: only the draft flag was taken away
+        topology = types.SimpleNamespace(kv_transfer_config=kvt)
+        assert KVConnectorFactory.topology_moves_nvfp4_pages(topology)
         spec = _dspark_spec()
         spec.kv_cache_dtype = "fp8"
-        with pytest.raises(ValueError, match="draft KV dtype fp8 differs"):
+        with pytest.raises(
+            ValueError,
+            match="draft KV dtype fp8 differs.*under lmcache_offload, mooncake_store",
+        ):
             _m3(monkeypatch, kv_transfer_config=kvt, speculative_config=spec, **nvfp4)
 
 
-def test_a_pd_connector_still_refuses_a_draft_dtype_beside_nvfp4(monkeypatch):
+def test_the_store_namespace_hashes_the_draft_kv_dtype(monkeypatch):
+    # What `moves_own_dtype_draft` on lmcache_offload / mooncake_store rests on.
+    from atom.kv_transfer.offload.config import build_page_namespace
+
+    chunk = types.SimpleNamespace(chunk_size=256)
+
+    def built(asked):
+        spec = _dspark_spec()
+        spec.kv_cache_dtype = asked
+        return _m3(
+            monkeypatch,
+            hf=sparse_hf(),
+            kv_transfer_config=STORE,
+            speculative_config=spec,
+            **NV,
+        )
+
+    fp8, bf16 = built("fp8"), built(None)
+    assert bf16.speculative_config.draft_kv_dtype == "bf16"
+    assert build_page_namespace(fp8, chunk, 1) != build_page_namespace(bf16, chunk, 1)
+
+
+LMCACHE_MP = {"kv_connector": "lmcache_mp", "kv_role": "offload"}
+
+
+@pytest.mark.parametrize(
+    "kvt",
+    [
+        MORIIO,
+        # every leaf, not any: declaring transports beside one that does not declare
+        {"kv_connector": "multi", "connectors": [PD, LMCACHE_MP]},
+        {
+            "kv_connector": "multi",
+            "connectors": [{**MORIIO, "kv_role": "kv_producer"}, STORE],
+        },
+    ],
+)
+def test_one_transport_that_moves_no_own_dtype_draft_refuses_it(monkeypatch, kvt):
     spec = _dspark_spec()
     spec.kv_cache_dtype = "fp8"
-    with pytest.raises(ValueError, match="draft KV dtype fp8 differs"):
+    with pytest.raises(
+        ValueError,
+        match="draft KV dtype fp8 differs.*under lmcache_offload, mooncake, mooncake_store",
+    ):
         _m3(
             monkeypatch,
             kv_cache_dtype="nvfp4",
             index_cache_dtype="nvfp4",
             hf=sparse_hf(),
-            kv_transfer_config=MORIIO,
+            kv_transfer_config=kvt,
             speculative_config=spec,
         )

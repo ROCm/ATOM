@@ -1,0 +1,185 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
+# DeepSeek-V4-Flash GRPO smoke — Megatron-DSV4 TP4/PP4/EP4 + vLLM FP8 rollout (MI308X)
+#
+# 3-node training/inference separation:
+#   Nodes 0-1: Megatron-DSV4 training (16 workers, TP=4, PP=4, EP=4, 256 experts)
+#   Node 2:    vLLM inference (TP=8, FP8 per-block quantized, 8 GPUs)
+#
+# MILES-aligned hyperparams, reduced scale for fast validation:
+#   3 steps, batch=8 (1 prompt x 8 gen), short sequences (512/256)
+#
+# Training: Megatron-DSV4 (TP=4, PP=4, EP=4, ETP=1, sequence-parallel,
+#   distributed optimizer, flash attention, chunked log-prob,
+#   optimizer_cpu_offload 75%)
+#
+# Rollout: vLLM AsyncLLM (FP8 per-block weights + FP8 KV cache, TP=8,
+#   enforce_eager, AITER kernels)
+#
+# PP layer distribution: first stage=11 layers, last stage=10 layers
+
+cluster:
+  num_nodes: 3
+  gpus_per_node: 8
+  ray_address: "auto"
+
+weight_sync:
+  enabled: true
+  backend: rdma
+  shared_folder: "${oc.env:DATA_ROOT}/weight_sync/dsv4-flash"
+  bucket_size_mb: 2048
+  timeout_s: 1200
+  verify_full_load: true
+  fp8_quantization_location: inference
+  rdma:
+    backend: rccl
+    require_rdma: true
+    hca: mlx5_0
+    interface: ens14np0
+    gid_index: 3
+    gdr_mode: auto
+    online_staging: cpu  # held FusedMoE modules (~12 GB) don't fit on the GPU
+
+controller:
+  ray:
+    enabled: true
+    fuse_actor_ref: false
+    actor:
+      num_workers: 16
+      dispatch_mode: dp_compute_proto
+      process_on_nodes: [8, 8]
+    rollout:
+      num_workers: 8
+      process_on_nodes: [8]
+
+policy:
+  model_name: "${oc.env:DATA_ROOT}/models/DeepSeek-V4-Flash-BF16"
+  training_backend: megatron_lumen_dsv4
+  generation_backend: vllm
+  max_total_sequence_length: 512
+  max_response_length: 256
+  train_global_batch_size: 8
+  gen_batch_size: 8
+  train_micro_batch_size: 1
+  max_token_len_per_gpu: 512
+  optimizer_type: sgd
+  sgd_momentum: 0.0
+  learning_rate: 1.0e-6
+  lr_warmup_steps: 0
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  lr_decay_style: constant
+  adam_beta1: 0.9
+  adam_beta2: 0.98
+  training:
+    optimizer_dtype: fp32
+    megatron_cfg:
+      tensor_model_parallel_size: 4
+      pipeline_model_parallel_size: 4
+      expert_model_parallel_size: 4
+      expert_tensor_parallel_size: 1
+      num_experts: 256
+      num_layers_in_first_pipeline_stage: 11
+      num_layers_in_last_pipeline_stage: 10
+      moe_grouped_gemm: true
+      moe_token_dispatcher_type: alltoall
+      use_distributed_optimizer: true
+      # DistributedOptimizer already keeps FP32 master parameters. FP32 grad
+      # buffers make HybridDeviceOptimizer receive non-leaf buffer views.
+      grad_reduce_in_fp32: false
+      attention_softmax_in_fp32: true
+      sequence_parallel: true
+      # MI300X has 64 KiB LDS; the TileLang defaults require over 96 KiB.
+      v4_indexer_block_n: 64
+      v4_indexer_num_stages: 1
+      recompute_granularity: full
+      recompute_method: uniform
+      recompute_num_layers: 1
+      attention_backend: flash
+      use_packed_sequences: true
+      log_probs_chunk_size: 1024
+      numa_affinity: true
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 1.0
+    fsdp_cfg:
+      param_offload: false
+      optimizer_offload: false
+      reshard_after_forward: true
+  generation:
+    vllm_cfg:
+      transport: ray_http
+      ray_http_start_server: true
+      tensor_parallel_size: 8
+      quantization: fp8_per_block
+      enforce_eager: true
+      disable_custom_all_reduce: true
+      kv_cache_dtype: fp8_e4m3
+      gpu_memory_utilization: 0.92
+      max_model_len: 512
+      dtype: bfloat16
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 8192
+      max_num_seqs: 32
+      calculate_log_probs: true
+      enable_sleep_mode: false
+      sleep_level: 0
+      update_weights_bucket_megabytes: 2048
+      temperature: 0.8
+      top_p: 1.0
+      top_k: -1
+
+algorithm:
+  name: grpo
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  loss_agg_mode: seq-mean-token-mean
+  clip_ratio_high: 0.28
+  grpo:
+    num_generations: 8
+    kl_coeff: 0.0
+    clip_ratio: 0.2
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+  rollout_correction:
+    rollout_is: null
+    rollout_is_threshold: 2.0
+    rollout_is_batch_normalize: false
+
+moe:
+  r3:
+    enabled: true
+    record_router_logits: false
+    replay_mode: hard_assignment
+
+reward:
+  type: function
+  function: atomrl.rewards.math_reward.dapo_math_reward
+  dataset: "${oc.env:DATA_ROOT}/data/dsv4-flash/dapo-math-17k/dapo-math-17k.jsonl"
+  shuffle: true
+  shuffle_seed: 10086
+
+val_dataset: "${oc.env:DATA_ROOT}/data/dsv4-flash/aime-2024/aime-2024.jsonl"
+val_steps: 0
+val_batch_size: 0
+eval:
+  enabled: false
+  num_samples: 0
+
+checkpointing:
+  checkpoint_dir: "${oc.env:DATA_ROOT}/ckpts/dsv4-flash/smoke"
+  save_steps: 9999
+  save_total_limit: 1
+  resume: false
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 3
+seed: 10086

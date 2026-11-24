@@ -8,6 +8,7 @@ import logging
 from collections import OrderedDict
 from collections.abc import Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
@@ -20,6 +21,7 @@ from atom.model_ops.attentions.gdn_attn import (
     compute_causal_conv1d_metadata,
 )
 from atom.model_ops.fla_ops import fused_recurrent_gated_delta_rule
+from atom.model_ops.fla_ops.chunk import pop_last_intermediate_states
 from atom.model_ops.fla_ops.replayssm import replayssm_gated_delta_rule
 from atom.model_ops.mamba_ops.causal_conv1d import causal_conv1d_update
 from atom.plugin.sglang.attention_backend.backend_resolver import (
@@ -89,14 +91,6 @@ def _flydsl_linear_impls() -> list[Any]:
     return impls
 
 
-def _flydsl_prefill_supported(device: torch.device) -> bool:
-    """FlyDSL prefill GEMM is valid on gfx942. gfx950 hits hipBLAS internally."""
-    if torch.version.hip is None or device.type != "cuda":
-        return True
-    arch = torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
-    return arch == "gfx942"
-
-
 def _ensure_flydsl_policy(state: torch.Tensor):
     """Bind Native `select_policy` once, same as `_build_gdn_cache_tensor`."""
     impls = _flydsl_linear_impls()
@@ -105,7 +99,11 @@ def _ensure_flydsl_policy(state: torch.Tensor):
     policy = impls[0].gdn_flydsl_policy
     if policy is not None:
         return policy
-    from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy, select_policy
+    from atom.model_ops.fla_ops.gdn_flydsl import (
+        GDNFlyDSLPolicy,
+        _validated_on_gfx942,
+        select_policy,
+    )
 
     # Under ReplaySSM the ring addresses the raw contiguous checkpoint, so
     # `select_policy` keeps decode (and its VK view) off; prefill runs only on gfx942.
@@ -116,7 +114,8 @@ def _ensure_flydsl_policy(state: torch.Tensor):
         state=state,
         activation_dtype=impls[0].dt_bias.dtype,
     )
-    if policy.prefill and not _flydsl_prefill_supported(state.device):
+    # FlyDSL prefill is validated only on gfx942, with or without ReplaySSM.
+    if policy.prefill and not _validated_on_gfx942():
         policy = GDNFlyDSLPolicy(prefill=False, decode=policy.decode)
     for impl in impls:
         impl.gdn_flydsl_policy = policy
@@ -163,9 +162,11 @@ def _flydsl_prefill_metadata(
     if not impls:
         return None
     policy = impls[0].gdn_flydsl_policy
-    # Metadata is sometimes built before the KV bind on this step. Native gates
-    # on `_flydsl_prefill_enabled`; if policy is still unset, still try — the
-    # helper returns None when the backend is Triton or AITER ops are missing.
+    # `build` binds the policy first (`_build_kv_cache_tensors` ->
+    # `_ensure_flydsl_policy`); None means no bind ran (e.g. a direct
+    # `_build_gdn_metadata` call). Native gates on `_flydsl_prefill_enabled`;
+    # with no policy, still try — the helper returns None when the backend is
+    # Triton or without HIP (ROCm).
     if policy is not None and not policy.prefill:
         return None
     num_seqs = int(query_start_loc.shape[0]) - 1
@@ -342,6 +343,108 @@ def track_mamba_radix_after_decode_graph(
         _track_mamba_radix_slots(forward_batch, int(layer_id))
 
 
+class _MambaLayerViews:
+    """Each mamba layer's conv and SSM state view of SGLang's mamba pool, by
+    pool index.
+
+    `MambaPool.State.at_layer_idx` builds a new view of every state field on
+    each call. The pool's state tensors are allocated once at startup, so the
+    two views the GDN wrapper reads are taken from them once per state object.
+    """
+
+    __slots__ = ("conv", "pool", "state", "temporal")
+
+    def __init__(self, pool: Any) -> None:
+        state = pool.mamba_pool.mamba_cache
+        indices = range(len(pool.mamba_map))
+        self.pool = pool
+        self.state = state
+        self.conv = tuple(state.conv[0][i] for i in indices)
+        self.temporal = tuple(state.temporal[i] for i in indices)
+
+
+_LAYER_VIEWS: _MambaLayerViews | None = None
+
+
+def _layer_states(pool: Any, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """`conv[0]` and `temporal` of `pool.mamba2_layer_cache(layer_id)`."""
+    global _LAYER_VIEWS
+    # `mamba2_layer_index` also holds the layer's HiCache transfer wait.
+    index = pool.mamba2_layer_index(layer_id)
+    views = _LAYER_VIEWS
+    if (
+        views is None
+        or views.pool is not pool
+        or views.state is not pool.mamba_pool.mamba_cache
+    ):
+        views = _LAYER_VIEWS = _MambaLayerViews(pool)
+    return views.conv[index], views.temporal[index]
+
+
+class _GDNStep:
+    """What every GDN layer of one forward reads after its compute.
+
+    `SGLangGDNForwardContext.build` makes one per forward and `bind` publishes
+    it for the forward batch it was built from (`current`). For an extend with
+    radix tracking it holds SGLang's linear backend, its track metadata and
+    the conv destination slots.
+    """
+
+    __slots__ = (
+        "conv_idx",
+        "conv_slots",
+        "decode_track",
+        "forward_batch",
+        "linear_backend",
+        "metadata",
+        "verify",
+    )
+
+    def __init__(self, forward_batch: Any) -> None:
+        mode = forward_batch.forward_mode
+        self.forward_batch = forward_batch
+        self.verify = bool(mode.is_target_verify())
+        self.decode_track = False
+        self.linear_backend = self.metadata = self.conv_idx = self.conv_slots = None
+        if self.verify or forward_batch.mamba_track_mask is None:
+            return
+        if mode.is_decode_or_idle():
+            self.decode_track = True
+            return
+        if not mode.is_extend():
+            return
+        attn_backend = SGLangGDNForwardContext._resolve_attn_backend(forward_batch)
+        if attn_backend is None:
+            return
+        linear_backend = SGLangGDNForwardContext._linear_attn_backend(attn_backend)
+        metadata = linear_backend.forward_metadata
+        if metadata is None:
+            return
+        self.linear_backend, self.metadata = linear_backend, metadata
+        conv_idx = metadata.track_conv_indices
+        if conv_idx is not None and conv_idx.numel() > 0:
+            # Only SGLang's GDN backend caches the destination slots; indexing
+            # the pool with a None would broadcast over every slot.
+            dst = metadata.conv_states_mask_indices
+            if dst is None:
+                rows = forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
+                dst = metadata.mamba_track_indices[rows]
+            self.conv_idx, self.conv_slots = conv_idx, dst
+
+    @classmethod
+    def current(cls, forward_batch: Any) -> _GDNStep:
+        """The bound step of `forward_batch`, or one built for it here."""
+        step = _GDN_STEP.get()
+        if step is not None and step.forward_batch is forward_batch:
+            return step
+        return cls(forward_batch)
+
+
+_GDN_STEP: ContextVar[_GDNStep | None] = ContextVar(
+    "atom_sglang_gdn_step", default=None
+)
+
+
 class SGLangGatedDeltaNet(GatedDeltaNet):
     """Run batched ATOM GDN while filling SGLang's verify snapshots."""
 
@@ -356,7 +459,8 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
         from atom.plugin.sglang.runtime import get_current_forward_batch
 
         forward_batch = get_current_forward_batch()
-        if forward_batch is None or not forward_batch.forward_mode.is_target_verify():
+        step = None if forward_batch is None else _GDNStep.current(forward_batch)
+        if step is None or not step.verify:
             if mixed_qkv.stride(-1) != 1:
                 mixed_qkv = mixed_qkv.contiguous()
             dtype = mixed_qkv.dtype
@@ -369,7 +473,8 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
                     self.dt_bias.detach().to(dtype=dtype), requires_grad=False
                 )
             out = super().forward(mixed_qkv, b, a, core_attn_out, layer_name)
-            self._track_mamba_states(forward_batch, mixed_qkv)
+            if step is not None:
+                self._track_mamba_states(step, mixed_qkv)
             return out
 
         attn_backend = SGLangGDNForwardContext._resolve_attn_backend(forward_batch)
@@ -455,7 +560,7 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
 
         return core_attn_out
 
-    def _track_mamba_states(self, forward_batch: Any, mixed_qkv: torch.Tensor) -> None:
+    def _track_mamba_states(self, step: _GDNStep, mixed_qkv: torch.Tensor) -> None:
         """Fill SGLang's mamba radix cache (extra_buffer) track slots.
 
         SGLang's HybridLinearAttnBackend owns the prefix cache and computes the
@@ -464,60 +569,40 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
         through SGLang's helpers so the snapshot semantics stay defined there.
         Every source is final by now: the conv window is read from the pre-conv
         input, the SSM state from the prefill kernel's chunk states `h` (Triton
-        or FlyDSL) or the runtime slot.
+        or FlyDSL) or the runtime slot. What is the same for every layer of the
+        forward (backend, metadata, destination slots) comes from `step`.
 
         Decode goes through `_track_mamba_radix_slots`, which also covers the
         replayed decode graph via the post-replay epilogue.
         """
-        if (
-            forward_batch is None
-            or getattr(forward_batch, "mamba_track_mask", None) is None
-        ):
+        if step.decode_track:
+            _track_mamba_radix_slots(step.forward_batch, int(self.layer_num))
             return
-        mode = forward_batch.forward_mode
-        if mode.is_decode_or_idle():
-            _track_mamba_radix_slots(forward_batch, int(self.layer_num))
-            return
-        if not mode.is_extend():
-            return
-        attn_backend = SGLangGDNForwardContext._resolve_attn_backend(forward_batch)
-        if attn_backend is None:
-            return
-        linear_backend = SGLangGDNForwardContext._linear_attn_backend(attn_backend)
-        metadata = getattr(linear_backend, "forward_metadata", None)
+        metadata = step.metadata
         if metadata is None:
             return
-        layer_cache = linear_backend.req_to_token_pool.mamba2_layer_cache(
-            self.layer_num
+        conv_states, ssm_states = _layer_states(
+            step.linear_backend.req_to_token_pool, self.layer_num
         )
-        conv_states = layer_cache.conv[0]
         # `h` is in the logical [K, V] layout; FlyDSL decode stores VK.
-        ssm_states = layer_cache.temporal
         policy = getattr(self, "gdn_flydsl_policy", None)
         if policy is not None and policy.decode:
             ssm_states = ssm_states.transpose(-1, -2)
 
-        from atom.model_ops.fla_ops.chunk import pop_last_intermediate_states
-
         h = pop_last_intermediate_states()
         if not metadata.has_mamba_track_mask:
             return
-        track_conv_indices = metadata.track_conv_indices
-        if track_conv_indices is not None and track_conv_indices.numel() > 0:
-            # Only SGLang's GDN backend caches the destination slots; indexing
-            # the pool with a None would broadcast over every slot.
-            dst = getattr(metadata, "conv_states_mask_indices", None)
-            if dst is None:
-                rows = forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
-                dst = metadata.mamba_track_indices[rows]
+        if step.conv_idx is not None:
             # [rows, state_len, dim] -> the pool's [slot, dim, state_len].
-            conv_states[dst] = mixed_qkv[track_conv_indices].transpose(1, 2)
+            conv_states[step.conv_slots] = mixed_qkv[step.conv_idx].transpose(1, 2)
         if metadata.track_ssm_h_src.numel() > 0 and h is None:
             raise RuntimeError(
                 "SGLang mamba radix cache needs the GDN chunk kernel's "
                 "intermediate states, but this prefill kept none."
             )
-        linear_backend._track_mamba_state_extend(forward_batch, h, ssm_states, metadata)
+        step.linear_backend._track_mamba_state_extend(
+            step.forward_batch, h, ssm_states, metadata
+        )
 
     def _verify_replayssm(
         self,
@@ -890,6 +975,7 @@ class SGLangGDNForwardContext:
     kv_cache_data: dict[str, KVCacheTensor]
     context: Context
     num_tokens: int
+    step: _GDNStep
 
     @staticmethod
     def _linear_attn_backend(attn_backend: Any) -> Any:
@@ -930,32 +1016,18 @@ class SGLangGDNForwardContext:
             return {}
 
         mamba_map = getattr(pool, "mamba_map", None)
-        if mamba_map is None:
+        if not mamba_map:
             return {}
 
-        first_temporal = None
-        layer_caches: list[tuple[int, Any]] = []
-        for layer_id in mamba_map:
-            layer_cache = pool.mamba2_layer_cache(layer_id)
-            layer_caches.append((layer_id, layer_cache))
-            if first_temporal is None:
-                first_temporal = layer_cache.temporal
-        policy = (
-            _ensure_flydsl_policy(first_temporal)
-            if first_temporal is not None
-            else None
-        )
+        states = [(layer_id, *_layer_states(pool, layer_id)) for layer_id in mamba_map]
+        policy = _ensure_flydsl_policy(states[0][2])
         use_kv_view = bool(policy is not None and policy.decode)
-
         out: dict[str, KVCacheTensor] = {}
-        for layer_id, layer_cache in layer_caches:
-            v_cache = layer_cache.temporal
-            if use_kv_view:
-                v_cache = v_cache.transpose(-1, -2)
+        for layer_id, conv, temporal in states:
             out[f"layer_{layer_id}"] = KVCacheTensor(
                 layer_num=layer_id,
-                k_cache=layer_cache.conv[0],
-                v_cache=v_cache,
+                k_cache=conv,
+                v_cache=temporal.transpose(-1, -2) if use_kv_view else temporal,
                 k_scale=None,
                 v_scale=None,
                 # Slot-addressed recurrent state, not paged KV -- see
@@ -1178,6 +1250,7 @@ class SGLangGDNForwardContext:
             kv_cache_data=kv_cache_data,
             context=context,
             num_tokens=num_tokens,
+            step=_GDNStep(forward_batch),
         )
 
     @classmethod
@@ -1197,6 +1270,7 @@ class SGLangGDNForwardContext:
         if reuse_current_context:
             active_kv = dict(prev_context_kv or {})
             active_kv.update(forward_context.kv_cache_data)
+        step_token = _GDN_STEP.set(forward_context.step)
         try:
             set_kv_cache_data(active_kv)
             attn_md = (
@@ -1225,6 +1299,7 @@ class SGLangGDNForwardContext:
                 )
             yield
         finally:
+            _GDN_STEP.reset(step_token)
             if reuse_current_context:
                 current_context.attn_metadata = prev_attn_metadata
                 current_context.kv_cache_data = prev_context_kv

@@ -394,6 +394,7 @@ def test_bind_preserves_outer_attention_metadata(monkeypatch):
     forward_context = SimpleNamespace(
         gdn_metadata=gdn_metadata,
         kv_cache_data=inner_kv,
+        step=None,
     )
     kv_updates = []
 
@@ -444,18 +445,19 @@ def _qwen4_flydsl_atom_config():
 
 class _TemporalPool:
     def __init__(self, temporal):
-        self.mamba_map = {0: None}
-        self._cache = SimpleNamespace(
-            conv=[torch.zeros(2, 4)],
-            temporal=temporal,
+        self.mamba_map = {0: 0}
+        self.mamba_pool = SimpleNamespace(
+            mamba_cache=SimpleNamespace(
+                conv=[torch.zeros(1, 2, 4)], temporal=temporal[None]
+            )
         )
 
     @staticmethod
     def get_mamba_indices(req_pool_indices):
         return req_pool_indices
 
-    def mamba2_layer_cache(self, layer_id):
-        return self._cache
+    def mamba2_layer_index(self, layer_id):
+        return self.mamba_map[layer_id]
 
 
 def test_extend_attaches_flydsl_prefill_metadata_for_qwen4(monkeypatch):
@@ -625,6 +627,9 @@ def test_ensure_flydsl_policy_binds_qwen4_impls_once(monkeypatch):
         "atom.model_ops.fla_ops.gdn_flydsl.select_policy",
         _select_policy,
     )
+    monkeypatch.setattr(
+        "atom.model_ops.fla_ops.gdn_flydsl._validated_on_gfx942", lambda: True
+    )
     state = torch.zeros(2, 24, 128, 128)
     first = attention_gdn._ensure_flydsl_policy(state)
     second = attention_gdn._ensure_flydsl_policy(state)
@@ -644,7 +649,7 @@ def test_gfx950_keeps_flydsl_prefill_off(monkeypatch):
         lambda **kwargs: GDNFlyDSLPolicy(prefill=True, decode=False),
     )
     monkeypatch.setattr(
-        attention_gdn, "_flydsl_prefill_supported", lambda device: False
+        "atom.model_ops.fla_ops.gdn_flydsl._validated_on_gfx942", lambda: False
     )
     state = torch.zeros(2, 24, 128, 128)
     policy = attention_gdn._ensure_flydsl_policy(state)
@@ -692,5 +697,5 @@ def test_kv_cache_keeps_mamba_layout_without_qwen4_flydsl(monkeypatch):
         SimpleNamespace(req_to_token_pool=pool),
     )
     view = out["layer_0"].v_cache
-    assert view is raw
+    assert view.data_ptr() == raw.data_ptr() and view.shape == raw.shape
     assert view.stride()[-2:] == (128, 1)
