@@ -490,6 +490,30 @@ async fn a_worker_with_another_template_is_refused_until_the_model_s_last_worker
     );
 }
 
+/// While the model's tokenizer is still loading, a worker with another template is
+/// refused too: the registered workers' template is the one loading.
+#[tokio::test]
+async fn a_worker_with_another_template_is_refused_while_the_tokenizer_loads() {
+    let ctx = context();
+    let worker = |template: &str| {
+        let template = format!("{template}: {{{{ messages[0].content }}}}");
+        serve_atom(model_info("atom-loading", &template, "{}"), 1)
+    };
+    let loading = ctx.tokenizer_registering.entry("atom-loading".into());
+    let loading = loading.or_default().clone();
+    let held = loading.lock().await; // the first worker's tokenizer job waits on this
+    let first = worker("first").await;
+    register(&ctx, json!({ "url": first })).await.unwrap();
+    assert!(!ctx.tokenizer_registry.contains("atom-loading"));
+
+    let second = worker("second").await;
+    let refused = register(&ctx, json!({ "url": second })).await.unwrap_err();
+    assert!(refused.contains("redeploying"), "{refused}");
+    assert!(ctx.worker_registry.get_by_url(&second).is_none());
+    drop(held);
+    assert_eq!(render(&ctx, "atom-loading", Value::Null).await, "first: hi");
+}
+
 /// The label template is set before fastokens wraps the tokenizer: a FastTokenizer
 /// refuses `set_chat_template`.
 #[tokio::test]
