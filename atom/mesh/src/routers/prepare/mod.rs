@@ -103,14 +103,16 @@ pub fn prepare_chat(
     model_id: Option<String>,
     components: &AppContext,
 ) -> Result<(GenerationPayload, ResponseContext), Response> {
-    prepare_chat_declaring(req, None, headers, model_id, components)
+    prepare_chat_declaring(req, None, None, headers, model_id, components)
 }
 
 /// `prepare_chat`, with the tools its messages declare read from its raw body
-/// (`MessageTools::read`); without them, the typed request's.
+/// (`MessageTools::read`), without them the typed request's, and its `thinking`
+/// control (`read_thinking`), which the typed request has no field for.
 pub fn prepare_chat_declaring(
     req: Arc<ChatCompletionRequest>,
     message_tools: Option<MessageTools>,
+    thinking: Option<Value>,
     headers: Option<HeaderMap>,
     model_id: Option<String>,
     components: &AppContext,
@@ -177,7 +179,13 @@ pub fn prepare_chat_declaring(
     let template_kwargs = if atom {
         let toggle = reasoning_toggle(&workers)
             .map_err(|e| error::internal_error("invalid_reasoning_toggle", e))?;
-        atom_template_kwargs(&body_ref, default_kwargs.as_ref(), toggle)
+        atom_template_kwargs(
+            &body_ref,
+            thinking.as_ref(),
+            default_kwargs.as_ref(),
+            toggle,
+        )
+        .map_err(|e| error::bad_request("invalid_reasoning_effort", e))?
     } else {
         merged_template_kwargs(&body_ref, default_kwargs.as_ref())
     };
@@ -450,29 +458,73 @@ fn reasoning_toggle(workers: &[Arc<dyn Worker>]) -> Result<Option<(String, Value
 }
 
 /// The kwargs ATOM's HTTP chat renders `request` with: the defaults, the request's own,
-/// then its `reasoning_effort` (`apply_reasoning_controls`): "none" sets `toggle` off,
-/// a template effort becomes `thinking_effort`, and any other is dropped.
+/// then its `thinking` and `reasoning_effort` resolved (`resolve_reasoning_controls`)
+/// and applied (`apply_reasoning_controls`): a stated toggle sets `toggle`, an effort
+/// becomes `thinking_effort`.
 fn atom_template_kwargs(
     request: &ChatCompletionRequest,
+    thinking: Option<&Value>,
     default_kwargs: Option<&HashMap<String, Value>>,
     toggle: Option<(String, Value, Value)>,
-) -> HashMap<String, Value> {
+) -> Result<HashMap<String, Value>, String> {
     let mut kwargs = default_kwargs.cloned().unwrap_or_default();
     if let Some(own) = &request.chat_template_kwargs {
         kwargs.extend(own.iter().map(|(key, value)| (key.clone(), value.clone())));
     }
-    match request.reasoning_effort.as_deref() {
-        Some("none") => {
-            if let Some((name, off, _)) = toggle {
-                kwargs.insert(name, off);
-            }
-        }
-        Some(effort) if ATOM_TEMPLATE_EFFORTS.contains(&effort) => {
-            kwargs.insert("thinking_effort".into(), Value::String(effort.into()));
-        }
-        _ => {}
+    let (enabled, effort) = reasoning_controls(thinking, request.reasoning_effort.as_deref())?;
+    if let (Some((name, off, on)), Some(enabled)) = (toggle, enabled) {
+        kwargs.insert(name, if enabled { on } else { off });
     }
-    kwargs
+    if let Some(effort) = effort {
+        kwargs.insert("thinking_effort".into(), effort);
+    }
+    Ok(kwargs)
+}
+
+/// Whether thinking is on, if stated, and the effort, as ATOM's HTTP chat resolves its
+/// `thinking` and `reasoning_effort` (`resolve_reasoning_controls`, chat rules).
+fn reasoning_controls(
+    thinking: Option<&Value>,
+    effort: Option<&str>,
+) -> Result<(Option<bool>, Option<Value>), String> {
+    let field = |name: &str| {
+        let value = thinking.and_then(Value::as_object)?.get(name);
+        value.filter(|value| !value.is_null())
+    };
+    let mut enabled = field("type").map(|kind| kind.as_str() != Some("disabled"));
+    if effort == Some("none") {
+        enabled = Some(false);
+    }
+    let effort = field("effort")
+        .cloned()
+        .or_else(|| effort.map(|e| Value::String(e.into())));
+    let effort = match effort {
+        Some(Value::Bool(_)) => {
+            return Err("reasoning effort must be an integer in [1, 100]".into())
+        }
+        Some(Value::Number(n)) if n.is_f64() => {
+            return Err("reasoning effort must be an integer in [1, 100]".into())
+        }
+        Some(Value::Number(n)) => match n.as_i64() {
+            Some(1..=100) => Some(Value::Number(n)),
+            _ => return Err("reasoning effort must be an integer in [1, 100]".into()),
+        },
+        Some(Value::String(e)) if ATOM_TEMPLATE_EFFORTS.contains(&e.as_str()) => {
+            Some(Value::String(e))
+        }
+        _ => None,
+    };
+    Ok((enabled, effort))
+}
+
+/// A chat's raw `body`'s `thinking` control, which the typed request has no field for.
+pub fn read_thinking(body: &[u8]) -> Option<Value> {
+    #[derive(serde::Deserialize)]
+    struct Raw {
+        #[serde(default)]
+        thinking: Option<Value>,
+    }
+    serde_json::from_slice::<Raw>(body).ok()?.thinking
 }
 
 /// The opener an ATOM worker of the model reports its replies start after with no
