@@ -1247,6 +1247,45 @@ def test_generate_admits_a_chat_with_the_fields_prepare_answers(chat):
     assert engine.submitted and engine.io_processor.requests == {}
 
 
+def test_a_generate_cancelled_twice_aborts_once_its_structured_seq_is_enqueued(
+    chat, monkeypatch
+):
+    engine, entered, admit, events = (
+        FakeEngine(),
+        threading.Event(),
+        threading.Event(),
+        [],
+    )
+
+    def add_request(seqs):  # the structured submission, on its thread
+        entered.set()
+        admit.wait(10)
+        events.append("enqueued")
+
+    monkeypatch.setattr(engine.core_mgr, "add_request", add_request)
+    monkeypatch.setattr(
+        engine.core_mgr, "abort_request", lambda seq_id: events.append("aborted")
+    )
+    servicer = chat(engine)
+    structured = pb.StructuredOutput(response_format_json=RESPONSE_FORMAT)
+
+    async def cancel_twice_while_submitting():
+        request = pb.GenerateRequest(
+            request_id="r", prompt_token_ids=[1, 2], structured_output=structured
+        )
+        call = asyncio.create_task(servicer.Generate(request, Context()))
+        await _until(entered.is_set)
+        call.cancel()
+        await asyncio.sleep(0.05)
+        call.cancel()  # as asyncio.run's teardown cancels it again
+        threading.Timer(0.3, admit.set).start()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+
+    asyncio.run(cancel_twice_while_submitting())
+    assert events[0] == "enqueued" and "aborted" in events, events
+
+
 def test_message_declared_tools_reach_the_tool_call_grammar(chat, monkeypatch):
     seen = {}
 
