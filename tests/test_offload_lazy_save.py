@@ -13,6 +13,7 @@ producer. Only the worker test runs LMCache itself.
 
 import array
 import sys
+import time
 import types
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -65,6 +66,7 @@ from atom.kv_transfer.offload.metadata import (
     LMCacheOffloadMetadata,
     PrehashedSave,
 )
+from atom.kv_transfer.offload.tier_index import TierIndex
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus
@@ -2136,3 +2138,131 @@ def test_a_replayed_trace_loses_no_prefix_while_the_tier_has_room(lmcache, pd):
     lmcache.tier = None
     lost, expected, pool = _replay(lmcache, write_back=True, pd=pd)
     assert lost == 0 and pool.blocks_evicted_dirty == 0
+
+
+# ------------------------------------- cached_first ranks by the tier, unasked
+def _ranked_engine(lmcache, monkeypatch, order="cached_first", horizon=1000, pd=False):
+    """A lazy prefill node whose tier holds `first`'s prompt past the two
+    blocks HBM kept, a `cold` short request queued ahead of `first`'s prompt
+    sent again (`again`); nothing admitted yet."""
+    monkeypatch.setenv("ATOM_PREFILL_ORDER", order)
+    monkeypatch.setattr(
+        offcfg,
+        "lmcache_tier_horizon_tokens",
+        lambda _c: horizon and horizon * BLOCK,
+        raising=False,
+    )
+    shell = LMCacheOffloadConnectorScheduler(_config(step=4 * BLOCK))
+    engine = _engine_with(
+        _multi(_Producer(), shell) if pd else shell, 10, step=4 * BLOCK
+    )
+    tier = lmcache.tier
+    first = _seq(6, sampling_params=SamplingParams(max_tokens=1))
+    _serve(engine, first)
+    _demote_and_store(engine, tier)
+    filler = _seq(6, base=1000, sampling_params=SamplingParams(max_tokens=1))
+    _demote_and_store(engine, tier, _serve(engine, filler))
+    assert tier.stored >= set(_chain(first)[2:])
+    cold = _seq(3, base=3000, sampling_params=SamplingParams(max_tokens=1))
+    prompt = list(first.token_ids[: first.num_prompt_tokens])
+    again = Sequence(prompt, BLOCK, sampling_params=SamplingParams(max_tokens=1))
+    engine.waiting.extend([cold, again])
+    now = max(cold.arrive_time, again.arrive_time)
+    return engine, shell, cold, again, now
+
+
+def _waiting(engine, now):
+    engine._order_waiting(now)
+    return list(engine.waiting)
+
+
+@pytest.mark.parametrize("pd", [False, True], ids=["alone", "multi"])
+@pytest.mark.parametrize("prehashed_load", ["0", "1"])
+def test_cached_first_ranks_a_queued_request_by_its_tier_prefix(
+    lmcache, monkeypatch, prehashed_load, pd
+):
+    """HBM holds two of `again`'s six blocks and the tier the other four, but no
+    lookup has asked: before, it ranked with 16 tokens left behind `cold`'s 12
+    and waited there; it has none left."""
+    monkeypatch.setenv("ATOM_OFFLOAD_PREHASHED_LOAD", prehashed_load)
+    engine, shell, cold, again, now = _ranked_engine(lmcache, monkeypatch, pd=pd)
+    lookups = len(lmcache.tier.lookups)
+    assert _waiting(engine, now) == [again, cold]
+    # Nothing sent, so nothing pinned: no lookup, nothing to unpin.
+    impl = shell._impl
+    assert len(lmcache.tier.lookups) == lookups
+    assert impl._lookup_results == {} and impl._lookup_in_step == []
+    assert shell.get_statistics().get("lookup_pinned_tokens", 0) == 0
+    # The estimate is the lookup's own: admission loads those four blocks.
+    batch, _ = engine.schedule()
+    (load,) = [r for r in batch.connector_meta_output.requests if r.load_spec]
+    assert load.req_id == again.id
+    assert load.load_spec.lmcache_cached_tokens == 5 * BLOCK
+
+
+def test_cached_first_keeps_aging_ahead_of_the_tier(lmcache, monkeypatch):
+    engine, _shell, cold, again, now = _ranked_engine(lmcache, monkeypatch)
+    cold.arrive_time = now - 61.0
+    assert _waiting(engine, now) == [cold, again]
+
+
+@pytest.mark.parametrize(
+    "order,horizon", [("fcfs", 1000), ("cached_first", 0)], ids=["fcfs", "no-size"]
+)
+def test_without_cached_first_or_a_tier_size_nothing_is_indexed(
+    lmcache, monkeypatch, order, horizon
+):
+    engine, shell, cold, again, now = _ranked_engine(
+        lmcache, monkeypatch, order=order, horizon=horizon
+    )
+    assert shell._impl._tier_index is None
+    assert shell.tier_probe(again, 2 * BLOCK) == 0
+    # The order as before: `again` looks 16 tokens from done, `cold` 12.
+    assert _waiting(engine, now) == [cold, again]
+
+
+def test_a_lookup_that_stops_short_drops_the_chunk_from_the_index(lmcache, monkeypatch):
+    _engine, shell, _cold, again, _now = _ranked_engine(lmcache, monkeypatch)
+    impl, chain = shell._impl, _chain(again)
+    assert shell.tier_probe(again, 2 * BLOCK) == 6 * BLOCK
+    # LMCache evicts block 4 unreported; the index still claims it.
+    lmcache.tier.stored.discard(chain[4])
+    assert chain[4] in impl._tier_index
+    impl._tier_lookup(again, str(again.id))  # admission's lookup
+    assert chain[4] not in impl._tier_index and chain[3] in impl._tier_index
+    clock = [time.monotonic() + 2.0]  # past the probe's reuse
+    monkeypatch.setattr(prehashed.time, "monotonic", lambda: clock[0])
+    assert shell.tier_probe(again, 2 * BLOCK) == 4 * BLOCK
+
+
+def test_a_probe_hashes_a_steps_share_and_walks_on_the_next(lmcache, monkeypatch):
+    monkeypatch.setattr(prehashed, "_TIER_PROBE_HASH_CHUNKS", 3)
+    _engine, shell, _cold, again, _now = _ranked_engine(lmcache, monkeypatch)
+    impl = shell._impl
+    impl._prehash_chains.pop(str(again.id), None)
+    impl._tier_probe_hash_left = 3
+    # Three chunks hashed: past HBM's two, the run reaches the third.
+    assert shell.tier_probe(again, 2 * BLOCK) == 3 * BLOCK
+    assert shell.tier_probe(again, 2 * BLOCK) == 3 * BLOCK  # spent this step
+    shell.build_connector_meta()
+    assert shell.tier_probe(again, 2 * BLOCK) == 6 * BLOCK
+
+
+def test_the_index_keeps_the_newest_chunks_up_to_the_tier_size():
+    index = TierIndex(3)
+    index.touch([1, 2, 3])
+    index.touch([1, 4])
+    assert list(index._chunks) == [3, 1, 4]
+    index.observe_lookup([3, 1, 4], 1)
+    # Found: 3, newest now. Missing: 1, dropped.
+    assert list(index._chunks) == [4, 3]
+
+
+def test_eager_without_prehashed_saves_probes_nothing(lmcache, monkeypatch):
+    monkeypatch.setenv("ATOM_PREFILL_ORDER", "cached_first")
+    monkeypatch.setenv("ATOM_OFFLOAD_PREHASHED_SAVE", "0")
+    monkeypatch.setattr(offcfg, "lmcache_tier_horizon_tokens", lambda _c: 10**6)
+    shell = LMCacheOffloadConnectorScheduler(_config(save_policy="eager"))
+    seq = _seq(3)
+    assert isinstance(shell._impl, M3OffloadScheduler)
+    assert shell._impl._tier_index is None and shell.tier_probe(seq, 0) == 0

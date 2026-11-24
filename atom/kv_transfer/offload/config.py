@@ -605,6 +605,25 @@ def _pp_stage_kv_bytes(config, pp_size: int) -> list[int] | None:
     return out if all(b > 0 for b in out) else None
 
 
+def lmcache_tier_horizon_tokens(config) -> int | None:
+    """Prompt tokens the CPU tier's budget holds, or None when the budget or
+    the model's KV bytes per token are unknown (`_pp_stage_kv_bytes`).
+
+    `max_local_cpu_size` per rank of each stage, `pipeline_parallel_size`
+    stages: exact for one stage and for the split by KV bytes; the layer split
+    (`scale_cpu_size_for_pp`) gives the shortest stage less.
+    """
+    cfg = build_lmcache_config(getattr(config, "kv_transfer_config", None))
+    gib = float(getattr(cfg, "max_local_cpu_size", 0.0) or 0.0)
+    if gib <= 0:
+        return None
+    pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
+    stage_bytes = _pp_stage_kv_bytes(config, pp_size)
+    if stage_bytes is None:
+        return None
+    return int(gib * 2**30 * pp_size / sum(stage_bytes))
+
+
 def scale_cpu_size_for_pp(cfg, config) -> None:
     """Split the CPU offload budget across PP stages by layer count.
 

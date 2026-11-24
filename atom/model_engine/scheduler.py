@@ -3302,9 +3302,12 @@ class Scheduler:
         to compute, ties by arrival; a request that does not fit right now goes
         last, as admission stops at the first refusal. The hit is the memoised
         exact probe (`can_allocate_memoized`), the one the delayer already asks
-        per tick, or the offload tier's known prefix when that is longer.
+        per tick, or the offload tier's prefix when that is longer: its lookup's
+        answer, or before admission looked it up, the connector's pin-free
+        estimate (`tier_probe`).
         """
         bm = self.block_manager
+        tier_probe = getattr(getattr(self, "kv_connector", None), "tier_probe", None)
 
         def key(item: tuple[int, Sequence]) -> tuple[int, int, int]:
             pos, seq = item
@@ -3317,8 +3320,11 @@ class Scheduler:
             cached_blocks = bm.can_allocate_memoized(seq)
             if cached_blocks < 0:
                 return (3, 0, pos)
+            hbm = cached_blocks * bm.hash_block_size
             cached = max(
-                cached_blocks * bm.hash_block_size, seq.offload_joint.kv_prefix_tokens
+                hbm,
+                seq.offload_joint.kv_prefix_tokens,
+                tier_probe(seq, hbm) if tier_probe is not None else 0,
             )
             return (2, max(0, seq.num_prompt_tokens - cached), pos)
 

@@ -208,6 +208,9 @@ class LazySaveSchedulerMixin:
     def _tier_lookup_start(self, seq) -> int:
         return int(seq.offload_hbm_probe_tokens)
 
+    def _tier_probe_start(self, num_hbm_tokens: int) -> int:
+        return int(num_hbm_tokens)
+
     # -- keys ----------------------------------------------------------------
     def _key_blocks(self, seq) -> None:
         """Key `seq`'s published prompt blocks, which it is about to free.
@@ -455,6 +458,8 @@ class LazySaveSchedulerMixin:
             keys = self._block_keys
             for block_id in block_ids:
                 keys[block_id] = (*keys[block_id][:2], True)
+            if self._tier_index is not None:
+                self._tier_index.touch(keys[block_id][1] for block_id in block_ids)
             self._finish_save_statistics(operation)
         else:
             self._cancel_save_statistics(operation)

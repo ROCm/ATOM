@@ -1528,6 +1528,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # compute (prompt minus the HBM prefix hit or the offload tier's known
     # prefix) first, ties by arrival; a request waiting
     # ATOM_PREFILL_ORDER_MAX_WAIT_S or longer goes first, in arrival order.
+    # A request the LMCache offload tier has not been asked about yet ranks by
+    # the scheduler's pin-free record of the tier's chunks (prehashed saves and
+    # a tier size estimate needed, `offload/tier_index.py`).
     "ATOM_PREFILL_ORDER": lambda: os.getenv("ATOM_PREFILL_ORDER", "fcfs").strip(),
     "ATOM_PREFILL_ORDER_MAX_WAIT_S": lambda: _finite_float_env(
         "ATOM_PREFILL_ORDER_MAX_WAIT_S", 60.0, allow_zero=True
