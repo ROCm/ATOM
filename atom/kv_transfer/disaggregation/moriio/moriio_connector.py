@@ -76,7 +76,6 @@ from atom.utils.network import get_ip
 if _MORIIO_AVAILABLE:
     from mori.io import (
         BackendType,
-        FabricBackendConfig,
         IOEngine,
         IOEngineConfig,
         PollCqMode,
@@ -97,7 +96,7 @@ def _byte_digests(rows: list[Any]) -> list[int]:
     """
     import torch
 
-    flat = [row.contiguous().view(torch.uint8).reshape(-1) for row in rows]
+    flat = [row.reshape(-1).view(torch.uint8) for row in rows]
     weights = (
         torch.arange(
             max(row.numel() for row in flat), dtype=torch.int64, device=flat[0].device
@@ -397,15 +396,38 @@ class MoRIIOConnector(KVConnectorBase):
     def _create_fabric_backend(self, kv_transfer_config: dict) -> None:
         import warnings
 
+        # Here, not at module level: a mori without the FABRIC backend still
+        # serves RDMA.
+        from mori.io import FabricBackendConfig
+
         num_streams = int(kv_transfer_config.get("fabric_num_streams", 64))
         num_events = int(kv_transfer_config.get("fabric_num_events", 64))
         # mori only warns when its fabric copy kernel fails to load, and without
-        # it every copy of 4 MiB or more fails.
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", RuntimeWarning)
+        # it every copy of 4 MiB or more fails, so that warning is an error.
+        # Recorded rather than raised: the filter is process-wide, and another
+        # thread's RuntimeWarning in this window must not raise in that thread.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
             self.moriio_wrapper.set_backend_type(
                 BackendType.FABRIC, FabricBackendConfig(num_streams, num_events)
             )
+        failed = None
+        for warning in caught:
+            from_mori = "mori" in str(warning.filename) or "fabric_copy" in str(
+                warning.message
+            )
+            if (
+                failed is None
+                and issubclass(warning.category, RuntimeWarning)
+                and from_mori
+            ):
+                failed = warning
+            else:
+                warnings.showwarning(
+                    warning.message, warning.category, warning.filename, warning.lineno
+                )
+        if failed is not None:
+            raise RuntimeError(f"moriio_backend fabric: {failed.message}")
         logger.info(
             "FabricBackendConfig: streams=%d, events=%d, transfer_mode=%s",
             num_streams,
@@ -1008,11 +1030,23 @@ class MoRIIOConnector(KVConnectorBase):
         return False
 
     def _request_gated_writes(self) -> None:
-        """Ask for the pushes whose step's earlier forwards have finished."""
+        """Ask for the pushes whose step's earlier forwards have finished.
+
+        A request that cannot be asked for fails alone, before anything was
+        sent for it: the rest of its step is still asked for, and the failure
+        frees its blocks and lets the producer release its source.
+        """
         while self._gated_writes and self._gated_writes[0][0].query():
             _, reqs = self._gated_writes.popleft()
             for req_id, meta in reqs:
-                self._request_write(req_id, meta)
+                try:
+                    self._request_write(req_id, meta)
+                except Exception:
+                    # On the worker's busy loop, like the read path.
+                    logger.exception(
+                        "req %s: could not ask the producer to push KV", req_id
+                    )
+                    self._fail_before_transfer(req_id, meta)
 
     def record_kv_cache_ready(self, req_ids: list[ReqId]) -> None:
         """Record when this prefill batch's KV writes are done on the GPU.
@@ -2176,9 +2210,11 @@ class MoRIIOConnector(KVConnectorBase):
                 stats[0] - request.get("_accepted_at", stats[0]),
             )
         # A second ask for this transfer is refused by `_write_ids` from here
-        # on, so its ready event has no reader left.
+        # on, so its ready entry has no reader left; one arriving after
+        # `_forget_finished_writes` must not find its source ready either.
         with self._kv_ready_lock:
             self._kv_ready_events.pop(transfer_id, None)
+            self._kv_ready_expired.pop(transfer_id, None)
         finished = time.monotonic()
         self._write_ids[transfer_id] = finished
         self._finished_writes.append((finished, transfer_id))
