@@ -10,9 +10,7 @@ use crate::{
     app_context::AppContext,
     core::{
         circuit_breaker::CircuitBreakerConfig,
-        steps::{
-            tokenizer_registration::admit_model_template, workflow_data::LocalWorkerWorkflowData,
-        },
+        steps::workflow_data::LocalWorkerWorkflowData,
         worker::{HealthConfig, RuntimeType, WorkerType},
         BasicWorkerBuilder, ConnectionMode, DPAwareWorkerBuilder, Worker, UNKNOWN_MODEL_ID,
     },
@@ -98,7 +96,6 @@ impl StepExecutor<LocalWorkerWorkflowData> for CreateLocalWorkerStep {
 
         // Get runtime type (for gRPC workers)
         let runtime_type = determine_runtime_type(connection_mode, &context.data, config);
-        let atom = runtime_type == RuntimeType::Atom;
 
         // Build circuit breaker config
         let circuit_breaker_config = build_circuit_breaker_config(app_context);
@@ -143,18 +140,6 @@ impl StepExecutor<LocalWorkerWorkflowData> for CreateLocalWorkerStep {
                 &final_labels,
             )
         };
-
-        if atom {
-            let advertised = final_labels.get("chat_template").map(String::as_str);
-            let urls: Vec<String> = workers.iter().map(|w| w.url().to_string()).collect();
-            let own_file = config.chat_template.as_deref();
-            let admitted =
-                admit_model_template(app_context, &model_id, &urls, own_file, advertised);
-            admitted.map_err(|e| WorkflowError::StepFailed {
-                step_id: StepId::new("create_worker"),
-                message: format!("Refused {}: {e}", config.url),
-            })?;
-        }
 
         // Update workflow data
         context.data.actual_workers = Some(workers);
