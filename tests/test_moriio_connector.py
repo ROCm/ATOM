@@ -681,7 +681,6 @@ class WritePathTest(unittest.TestCase):
         conn._write_reports_expected = {}
         conn._write_report_counts = {}
         conn._stage_digests = {}
-        conn._stage_held_digests = {}
         conn._push_wakeup = threading.Event()
         conn._push_stop = threading.Event()
         conn._push_error = None
@@ -693,9 +692,9 @@ class WritePathTest(unittest.TestCase):
         conn._kv_ready_lock = threading.Lock()
         conn._gated_writes = collections.deque()
         conn._verify_page_dst = {}
-        conn._verify_held_dst = {}
-        conn._write_held_digests = {}
         conn._write_page_digests = {}
+        conn._verify_block_sums = {}
+        conn._verify_held = {}
         conn._state_tensors = {}
         conn._num_state_slots = 0
         conn._built_state_sessions = {}

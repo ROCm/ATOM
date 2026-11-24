@@ -12,8 +12,7 @@ pushing only the prompt blocks past the decode's own prefix-cache hit.
   `_write_blocks` on the real M3.1 pools; D's held blocks keep their bytes,
   every other destination block is what the full push writes there (and, at
   equal TP, P's source block), nothing else is touched.
-- ATOM_MORIIO_VERIFY compares the pushed part with what P pushed, and D's
-  held prefix blocks with P's source blocks at the same positions.
+- ATOM_MORIIO_VERIFY digests cover the pushed part only.
 - No hit, or the flag off: the full push. Refusals still refuse.
 
 CPU only, on the aiter stand-ins, like `test_moriio_pp_fabric.py`.
@@ -109,16 +108,31 @@ def asker(write_path, rank, verify_side=None):
     return conn
 
 
-def ask_and_push(stack, write_path, pools, topology, rank, k, dst_pool, verify=False):
-    """D rank ``rank`` asks with ``k`` blocks held; every producer serves its
-    WRITE_REQ into ``dst_pool``. Returns the asker, the requests, the bytes
-    written per destination byte."""
+def ask_and_push(
+    stack,
+    write_path,
+    pools,
+    topology,
+    rank,
+    k,
+    dst_pool,
+    verify=False,
+    conn=None,
+    not_received=(),
+):
+    """D rank ``rank`` asks with ``k`` blocks held (``not_received`` of them
+    not published from a push); every producer serves its WRITE_REQ into
+    ``dst_pool``. Returns the asker (``conn`` again if given), the requests,
+    the bytes written per destination byte."""
     d_side = pools.d_ranks[rank]
     producers = producers_for(stack, pools, topology, rank)
-    conn = asker(write_path, rank, d_side if verify else None)
+    if conn is None:
+        conn = asker(write_path, rank, d_side if verify else None)
+    conn.sent = []
     meta = write_path.recv_meta(DST, SRC, remote_pp_size=len(producers))
     meta.tp_size = 1 if topology == "pp4" else D_TP
     meta.num_computed_blocks = k
+    meta.verify_held_not_received = list(not_received)
     conn._request_write("d", meta)
     requests = [msgpack.loads(frames[1]) for frames, _host, _port in conn.sent]
     assert len(requests) == len(producers)
@@ -141,12 +155,7 @@ def ask_and_push(stack, write_path, pools, topology, rank, k, dst_pool, verify=F
                 written[ro : ro + n] += 1
         if verify:
             conn._record_write_report(
-                "d",
-                True,
-                None,
-                request["page_digest"],
-                stage=stage,
-                held_digest=request.get("held_digest"),
+                "d", True, None, request["page_digest"], stage=stage
             )
     return conn, requests, written
 
@@ -225,36 +234,65 @@ def verify_lines(stack, conn, caplog):
 
 
 @pytest.mark.parametrize("topology", ["tp4", "pp4"])
-def test_verify_digests_the_pushed_part_and_the_held_prefix(
+def test_verify_checks_the_pushed_part_against_the_producer(
     stack, write_path, pools, topology, caplog
 ):
     rank, d_side = 1, pools.d_ranks[1]
     original = d_side.pool.clone()
     try:
-        # A full push first: D's prefix blocks hold the prompt's KV, as its
-        # own prefix cache does after an earlier turn.
-        ask_and_push(stack, write_path, pools, topology, rank, 0, d_side.pool)
-        conn, requests, _ = ask_and_push(
-            stack, write_path, pools, topology, rank, 3, d_side.pool, verify=True
-        )
-        assert conn._verify_page_dst["d"] == DST[3:]
-        assert conn._verify_held_dst["d"] == DST[:3]
-        # Every producer stage digests the held blocks' source.
-        assert all(r["verify_held_src_block_ids"] == SRC[:3] for r in requests)
-        pushed, held = verify_lines(stack, conn, caplog)
-        assert "of 2 blocks match the producer" in pushed[0], pushed
-        assert (
-            len(held) == 1
-            and "3 locally held prefix blocks match the producer" in held[0]
-        ), held
-
         conn, _, _ = ask_and_push(
             stack, write_path, pools, topology, rank, 3, d_side.pool, verify=True
         )
+        assert conn._verify_page_dst["d"] == DST[3:]
         d_side.tt.pages[7].view[DST[3]].view(-1)[5] ^= 1  # a pushed block
-        pushed, held = verify_lines(stack, conn, caplog)
+        pushed, _ = verify_lines(stack, conn, caplog)
         assert "differ from the producer" in pushed[0], pushed
-        assert "match the producer" in held[0], held
+        # A push that did not match is not recorded for a later held check.
+        assert not set(DST) & conn._verify_block_sums.keys()
+    finally:
+        d_side.pool.copy_(original)
+
+
+def push_then_hold(stack, write_path, pools, topology, rank, caplog, **kw):
+    """Turn 1 pushes every block (recorded once it matches), turn 2 holds the
+    first three: the asker of turn 2, before its landing is verified."""
+    d_side = pools.d_ranks[rank]
+    conn, _, _ = ask_and_push(
+        stack, write_path, pools, topology, rank, 0, d_side.pool, verify=True
+    )
+    pushed, held = verify_lines(stack, conn, caplog)
+    assert "of 5 blocks match the producer" in pushed[0] and not held, pushed
+    # All but the last block: past the prompt decode writes its slots.
+    assert sorted(conn._verify_block_sums) == sorted(DST[:-1])
+    conn, _, _ = ask_and_push(
+        stack, write_path, pools, topology, rank, 3, d_side.pool, True, conn, **kw
+    )
+    assert conn._verify_held["d"][0] == DST[:3]
+    return conn
+
+
+@pytest.mark.parametrize("topology", ["tp4", "pp4"])
+def test_verify_holds_each_held_block_to_its_own_push(
+    stack, write_path, pools, topology, caplog
+):
+    """D's held blocks are compared with what their push landed, not with the
+    producer's blocks now: those may be another, equally valid computation
+    of the same tokens, and the producer is not asked for them."""
+    rank, d_side = 1, pools.d_ranks[1]
+    original = d_side.pool.clone()
+    try:
+        conn = push_then_hold(stack, write_path, pools, topology, rank, caplog)
+        for frames, _host, _port in conn.sent:
+            assert not any("held" in key for key in msgpack.loads(frames[1]))
+        pushed, held = verify_lines(stack, conn, caplog)
+        assert "of 2 blocks match the producer" in pushed[0], pushed
+        assert held == [
+            (
+                "[moriio-verify] req d: 3 of the 3 locally held prefix blocks hold "
+                "what their push landed (0 completed by this decode, 0 with no "
+                "matching push recorded: not compared)"
+            )
+        ], held
     finally:
         d_side.pool.copy_(original)
 
@@ -262,65 +300,49 @@ def test_verify_digests_the_pushed_part_and_the_held_prefix(
 @pytest.mark.parametrize("topology", ["tp4", "pp4"])
 @pytest.mark.parametrize("region", [0, 7, -1])  # first, a middle one, the last
 @pytest.mark.parametrize("block", [0, 2])  # the held body, the last held block
-def test_verify_reports_a_corrupt_held_prefix_block(
+def test_verify_reports_a_held_block_changed_since_its_push(
     stack, write_path, pools, topology, region, block, caplog
 ):
-    """A byte of D's prefix-cache hit that is not P's: decode would attend over
-    it, though the push never touched it."""
     rank, d_side = 2, pools.d_ranks[2]
     original = d_side.pool.clone()
     try:
-        ask_and_push(stack, write_path, pools, topology, rank, 0, d_side.pool)
-        conn, _, _ = ask_and_push(
-            stack, write_path, pools, topology, rank, 3, d_side.pool, verify=True
-        )
+        conn = push_then_hold(stack, write_path, pools, topology, rank, caplog)
         d_side.tt.pages[region].view[DST[block]].view(-1)[3] ^= 1
         pushed, held = verify_lines(stack, conn, caplog)
         assert "of 2 blocks match the producer" in pushed[0], pushed
-        assert len(held) == 1, held
-        assert (
-            "1 of " in held[0]
-            and "3 locally held prefix blocks differ from the producer" in held[0]
-        ), held
+        assert held == [
+            (
+                f"[moriio-verify] req d: 1 of the 3 locally held prefix blocks "
+                f"changed since their push landed (positions [{block}]) -- decode "
+                "will attend over a prefix-cache hit that is not the prompt's"
+            )
+        ], held
     finally:
         d_side.pool.copy_(original)
 
 
-def test_verify_names_held_regions_no_stage_digested(stack, write_path, pools, caplog):
-    """PP4: a stage whose report carries no held digest leaves its layers'
-    held regions unchecked, which is reported, not taken as a match."""
+def test_verify_counts_a_held_block_this_decode_completed(
+    stack, write_path, pools, caplog
+):
+    """A held block decode's prefix cache did not publish from a push (its
+    own decode filled it) has nothing to be compared with."""
     rank, d_side = 0, pools.d_ranks[0]
     original = d_side.pool.clone()
     try:
-        ask_and_push(stack, write_path, pools, "pp4", rank, 0, d_side.pool)
-        real = stack.conn.MoRIIOConnector._held_source
-        calls = []
-
-        def stage_2_digests_nothing(self, request):
-            calls.append(self.pp_rank)
-            return [] if self.pp_rank == 2 else real(self, request)
-
-        with mock.patch.object(
-            stack.conn.MoRIIOConnector, "_held_source", stage_2_digests_nothing
-        ):
-            conn, _, _ = ask_and_push(
-                stack, write_path, pools, "pp4", rank, 3, d_side.pool, verify=True
-            )
-        assert sorted(calls) == [0, 1, 2, 3]
+        conn = push_then_hold(
+            stack, write_path, pools, "pp4", rank, caplog, not_received=[1]
+        )
+        d_side.tt.pages[7].view[DST[1]].view(-1)[3] ^= 1
         _, held = verify_lines(stack, conn, caplog)
-        assert "written by none of the 4 producer stages" in held[0], held
+        assert held == [
+            (
+                "[moriio-verify] req d: 2 of the 3 locally held prefix blocks hold "
+                "what their push landed (1 completed by this decode, 0 with no "
+                "matching push recorded: not compared)"
+            )
+        ], held
     finally:
         d_side.pool.copy_(original)
-
-
-def test_without_verify_no_held_digest_is_asked_or_made(stack, write_path, pools):
-    """The held check costs nothing with ATOM_MORIIO_VERIFY off."""
-    d_side = pools.d_ranks[0]
-    scratch = d_side.pool.clone()
-    conn, requests, _ = ask_and_push(stack, write_path, pools, "pp4", 0, 3, scratch)
-    assert not conn._verify_held_dst
-    assert all("verify_held_src_block_ids" not in r for r in requests)
-    assert all("held_digest" not in r for r in requests)
 
 
 # ---------------------------------------------------------------------------
@@ -336,6 +358,7 @@ def consumer_scheduler(stack, hash_block_size=128):
         _reqs_need_recv={},
         request_id_to_transfer_id={},
         transfer_id_to_request_id={},
+        _block_manager=None,
     )
     return sched
 
@@ -384,23 +407,39 @@ def test_the_received_suffix_is_published_for_the_next_turn(stack):
 
     bm = BlockManager(MockConfig(enable_prefix_caching=True, num_kvcache_blocks=32))
     sched = consumer_scheduler(stack, hash_block_size=bm.hash_block_size)
+    sched.bind_block_manager(bm)
 
     def receive(tokens):
         seq = Sequence(tokens, 4, sampling_params=SamplingParams())
         seq.kv_transfer_params = {"do_remote_prefill": True, "transfer_id": seq.id}
         bm.allocate(seq, bm.can_allocate(seq))
-        with flag(stack, True):
+        with (
+            flag(stack, True),
+            mock.patch.object(stack.conn.envs, "ATOM_MORIIO_VERIFY", True),
+        ):
             sched.update_state_after_alloc(seq)
         held = seq.kv_transfer_params["num_computed_blocks"]
         bm.register_received_prefix(seq)  # the push landed
         return seq, held
 
     turn1, held1 = receive(list(range(1, 11)))  # 2 full blocks + 2 tokens
+    assert [bm.kv.block(b).received for b in turn1.block_table] == [1, 1, 0]
     turn2, held2 = receive(list(range(1, 19)))  # turn 1's prompt grown
     turn3, held3 = receive(list(range(1, 23)))
     assert (held1, held2, held3) == (0, 2, 4)
     assert turn2.block_table[:2] == turn1.block_table[:2]
     assert turn3.block_table[:4] == turn2.block_table[:4]
+    # ATOM_MORIIO_VERIFY: every held block came from a push.
+    assert turn3.kv_transfer_params["verify_held_not_received"] == []
+
+    # Turn 2's last full block published by its own decode instead (here, by
+    # hand): turn 4 holds it, and says it was not pushed.
+    block = bm.kv.block(turn2.block_table[3])
+    bm.kv.publish(block.block_id, block.hash, block.token_ids)
+    assert not block.received
+    _turn4, held4 = receive(list(range(1, 23)))
+    assert held4 == 5
+    assert _turn4.kv_transfer_params["verify_held_not_received"] == [3]
 
 
 # ---------------------------------------------------------------------------

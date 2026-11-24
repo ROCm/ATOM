@@ -3475,6 +3475,7 @@ class BlockManager:
             indexed_block_id = self.kv.lookup(h)
             if indexed_block_id == -1:
                 self.kv.publish(block_id, h, token_ids)
+                block.received = True
             else:
                 indexed_block = self.kv.block(indexed_block_id)
                 if indexed_block.token_ids != token_ids:

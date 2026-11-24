@@ -289,11 +289,12 @@ class MoRIIOConnector(KVConnectorBase):
         # blocks, and the producer's digest of its source blocks.
         self._verify_page_dst: dict[ReqId, list[int]] = {}
         self._write_page_digests: dict[ReqId, list[Any]] = {}
-        # Likewise for the leading blocks an incremental push leaves out (this
-        # decode's own prefix-cache hit): held here, never pushed, and compared
-        # with the producer's source blocks at the same positions.
-        self._verify_held_dst: dict[ReqId, list[int]] = {}
-        self._write_held_digests: dict[ReqId, Any] = {}
+        # With ATOM_MORIIO_INCREMENTAL_PUSH, the blocks this decode holds
+        # (`_verify_held_landed`): each pushed block's digest once its push
+        # matched the producer, by block id, and each request's held blocks
+        # with the positions its prefix cache did not publish from a push.
+        self._verify_block_sums: dict[int, int] = {}
+        self._verify_held: dict[ReqId, tuple[list[int], set[int]]] = {}
 
         # Per-layer local metadata (populated in register_kv_caches)
         self.layer_name_to_local_kv_cache_metadata: dict[str, list[bytes]] = {}
@@ -416,7 +417,6 @@ class MoRIIOConnector(KVConnectorBase):
         # ATOM_MORIIO_VERIFY: a PP receive's stage digests, merged by the region
         # index here until every stage has reported (`_merge_stage_digests`).
         self._stage_digests: dict[ReqId, dict[int, Any]] = {}
-        self._stage_held_digests: dict[ReqId, dict[int, Any]] = {}
         self._write_timeout_s = envs.ATOM_MORIIO_WRITE_TIMEOUT_S
 
         # Failed receives, held until the given time before they are reported.
@@ -1278,7 +1278,6 @@ class MoRIIOConnector(KVConnectorBase):
         state_digest: Any = None,
         page_digest: Any = None,
         stage: int = 0,
-        held_digest: Any = None,
     ) -> None:
         """Count one producer stage's report on a push into this rank.
 
@@ -1288,8 +1287,7 @@ class MoRIIOConnector(KVConnectorBase):
         stage is still writing. Under ATOM_MORIIO_VERIFY a single producer's
         digests are kept as sent; a PP producer's stages each cover their own
         layers, so theirs are merged (`_merge_stage_digests`) and kept once the
-        last stage has reported. ``held_digest``, of the blocks an incremental
-        push left out (`_verify_held_landed`), is kept the same way.
+        last stage has reported.
         """
         with self._write_reports_lock:
             expected = self._write_reports_expected.get(req_id, 1)
@@ -1311,32 +1309,25 @@ class MoRIIOConnector(KVConnectorBase):
             # stage's are merged. Positional ones cover the whole table.
             by_region = isinstance(page_digest, dict)
             if verify and by_region:
-                self._merge_stage_digests(self._stage_digests, req_id, page_digest)
-            if verify and isinstance(held_digest, dict):
-                self._merge_stage_digests(self._stage_held_digests, req_id, held_digest)
+                self._merge_stage_digests(req_id, page_digest)
             if len(stages) < expected:
                 self._write_report_counts[req_id] = (stages, all_ok)
                 return
             self._write_reports_expected.pop(req_id, None)
             self._write_reports[req_id] = all_ok
             merged = self._stage_digests.pop(req_id, None)
-            merged_held = self._stage_held_digests.pop(req_id, None)
             if verify:
                 if state_digest is not None:
                     self._write_state_digests[req_id] = state_digest
-                for store, regions, digest in (
-                    (self._write_page_digests, merged, page_digest),
-                    (self._write_held_digests, merged_held, held_digest),
-                ):
-                    if regions is not None:
-                        store[req_id] = {"regions": regions, "stages": expected}
-                    elif digest is not None and not isinstance(digest, dict):
-                        store[req_id] = digest
+                if merged is not None:
+                    self._write_page_digests[req_id] = {
+                        "regions": merged,
+                        "stages": expected,
+                    }
+                elif page_digest is not None and not by_region:
+                    self._write_page_digests[req_id] = page_digest
 
-    @staticmethod
-    def _merge_stage_digests(
-        store: dict[ReqId, dict[int, Any]], req_id: ReqId, page_digest: Any
-    ) -> None:
+    def _merge_stage_digests(self, req_id: ReqId, page_digest: Any) -> None:
         """Fold one PP stage's PAGE digests into its receive's.
 
         The stages hold disjoint layers, so their regions never overlap: the
@@ -1344,7 +1335,7 @@ class MoRIIOConnector(KVConnectorBase):
         with them (`_push_digests`). A stage that sends none cannot be placed,
         and its regions are reported as never digested.
         """
-        merged = store.setdefault(req_id, {})
+        merged = self._stage_digests.setdefault(req_id, {})
         if isinstance(page_digest, dict):
             merged.update(
                 zip(
@@ -1473,7 +1464,7 @@ class MoRIIOConnector(KVConnectorBase):
         # still paired by position. At least the last block is pushed (a hit
         # never covers it), so every push and its report stay as they were.
         skip = max(0, min(int(meta.num_computed_blocks or 0), len(dst) - 1))
-        held_src, held_dst = src[:skip], dst[:skip]
+        held = dst[:skip]
         src, dst = src[skip : len(dst)], dst[skip:]
         src_slot = int(getattr(meta, "remote_slot_index", -1))
         dst_slot = int(getattr(meta, "local_slot_index", -1))
@@ -1520,8 +1511,14 @@ class MoRIIOConnector(KVConnectorBase):
 
         if self._verify_kv and self.use_fabric:
             self._verify_page_dst[req_id] = dst
-            if held_dst:
-                self._verify_held_dst[req_id] = held_dst
+            # Rewritten by this push; recorded again once it matches.
+            for block in dst:
+                self._verify_block_sums.pop(block, None)
+            if held:
+                self._verify_held[req_id] = (
+                    held,
+                    set(meta.verify_held_not_received),
+                )
         elif self._verify_kv:
             first_layer = next(iter(self.layer_name_to_local_kv_cache_metadata))
             is_mla = self.kv_caches[first_layer].v_cache is None
@@ -1552,10 +1549,6 @@ class MoRIIOConnector(KVConnectorBase):
             "src_slot_index": src_slot,
             "dst_slot_index": dst_slot,
         }
-        if req_id in self._verify_held_dst:
-            # ATOM_MORIIO_VERIFY: the producer digests the held blocks' source
-            # too (`_held_source`).
-            request["verify_held_src_block_ids"] = held_src
         if stages > 1:
             with self._write_reports_lock:
                 self._write_reports_expected[req_id] = stages
@@ -1590,7 +1583,7 @@ class MoRIIOConnector(KVConnectorBase):
                 self._write_reports_expected.pop(req_id, None)
                 self._write_report_counts.pop(req_id, None)
             self._verify_page_dst.pop(req_id, None)
-            self._verify_held_dst.pop(req_id, None)
+            self._verify_held.pop(req_id, None)
             self._verify_rows.pop(req_id, None)
             self._verify_before.pop(req_id, None)
             self._verify_state_before.pop(req_id, None)
@@ -1947,37 +1940,10 @@ class MoRIIOConnector(KVConnectorBase):
                 if plan is None
                 else self._plan_digests(plan, src)
             )
-            held = self._held_source(request)
-            if held:
-                request["held_digest"] = (
-                    self._page_digests(held)
-                    if plan is None
-                    else self._plan_digests(plan, held)
-                )
         request["_page_stats"] = (time.monotonic(), sum(sizes), len(dst), len(sizes))
         return [
             self.moriio_wrapper.write_remote_data_status(sizes, l_offs, r_offs, session)
         ]
-
-    def _held_source(self, request: dict[str, Any]) -> list[int]:
-        """ATOM_MORIIO_VERIFY: the source of the leading blocks the consumer
-        holds and an incremental push leaves out. They are the head of this
-        request's prompt KV, claimed with the rest until the push is released
-        (`request_finished`), so resident at push time."""
-        held = request.get("verify_held_src_block_ids")
-        if not isinstance(held, list) or not held:
-            return []
-        held = [int(b) for b in held]
-        if not all(0 <= b < self.num_blocks for b in held):
-            logger.error(
-                "[moriio-verify] transfer %s: held source blocks %s outside "
-                "this rank's %d; not digested",
-                request["transfer_id"],
-                held[:8],
-                self.num_blocks,
-            )
-            return []
-        return held
 
     def _page_plan(
         self, engine_id: EngineId, consumer_tp: int, consumer_rank: int
@@ -2180,74 +2146,79 @@ class MoRIIOConnector(KVConnectorBase):
                 self._changed_regions(before[0], after[0]),
             )
 
+    def _block_sums(self, block_ids: list[int]) -> list[int]:
+        """One digest per block over all its PAGE regions (`_byte_digests`
+        per block, each region weighted apart so two never cancel)."""
+        import torch
+
+        device = self._page_views[0].device
+        ids = torch.as_tensor(block_ids, dtype=torch.int64, device=device)
+        total = torch.zeros(len(block_ids), dtype=torch.int64, device=device)
+        weights = None
+        for i, view in enumerate(self._page_views):
+            rows = view.index_select(0, ids).reshape(len(block_ids), -1)
+            rows = rows.view(torch.uint8).to(torch.int64)
+            if weights is None or weights.numel() < rows.shape[1]:
+                weights = (
+                    torch.arange(rows.shape[1], dtype=torch.int64, device=device)
+                    % 65521
+                    + 1
+                )
+            total += (rows * weights[: rows.shape[1]]).sum(1) * (2 * i + 1)
+        return [int(v) for v in total.tolist()]
+
     def _verify_held_landed(self, req_id: ReqId) -> None:
-        """Compare the leading blocks this decode holds (its own prefix-cache
-        hit, left out of an incremental push) with the producer's source
-        blocks at the same positions: decode attends over them as the prompt's.
-        All are full prompt blocks, so the last of them counts like the rest.
+        """The leading blocks an incremental push left out (this decode's own
+        prefix-cache hit) must still hold what their own push landed: decode
+        attends over them as the prompt's.
+
+        Not compared with the producer's blocks at the same positions: those
+        can be another computation of the same tokens (P recomputed them, or
+        cached a concurrent sibling request's copy), bit-different and as
+        valid. A held block this decode completed itself (the last block of an
+        earlier push, filled by its decode) was never pushed whole: counted,
+        not compared.
         """
-        held = self._verify_held_dst.pop(req_id, None)
-        with self._write_reports_lock:
-            source = self._write_held_digests.pop(req_id, None)
-        if held is None:
+        entry = self._verify_held.pop(req_id, None)
+        if entry is None:
             return
-        if source is None:
-            logger.error(
-                "[moriio-verify] req %s: the producer sent no PAGE digest of the "
-                "%d locally held prefix blocks",
-                req_id,
-                len(held),
-            )
-            return
-        if isinstance(source, dict):
-            regions, stages = source["regions"], source.get("stages", 1)
-        else:
-            regions, stages = dict(enumerate(zip(*source))), 1
-        local = self._page_digests(held)
-        missing = [i for i in range(len(self._page_regions)) if i not in regions]
-        differ = [
-            i for i, sums in regions.items() if (local[0][i], local[1][i]) != sums
+        held, not_received = entry
+        recorded = [
+            (i, b)
+            for i, b in enumerate(held)
+            if i not in not_received and b in self._verify_block_sums
         ]
-
-        def roles(ids: list[int]) -> list[str]:
-            return [self._page_regions[i][2] for i in ids[:8]]
-
-        if missing:
+        sums = self._block_sums([b for _, b in recorded]) if recorded else []
+        changed = [
+            i for (i, b), s in zip(recorded, sums) if self._verify_block_sums[b] != s
+        ]
+        if changed:
             logger.error(
-                "[moriio-verify] req %s: %d of %d PAGE regions of the %d locally "
-                "held prefix blocks were written by none of the %d producer "
-                "stages' digests (first %s)",
+                "[moriio-verify] req %s: %d of the %d locally held prefix blocks "
+                "changed since their push landed (positions %s) -- decode will "
+                "attend over a prefix-cache hit that is not the prompt's",
                 req_id,
-                len(missing),
-                len(self._page_regions),
+                len(changed),
                 len(held),
-                stages,
-                roles(missing),
+                changed[:8],
             )
-        if differ:
-            logger.error(
-                "[moriio-verify] req %s: %d of %d regions of the %d locally held "
-                "prefix blocks differ from the producer's (first %s) -- decode "
-                "will attend over a prefix-cache hit that is not the prompt's",
-                req_id,
-                len(differ),
-                len(regions),
-                len(held),
-                roles(differ),
-            )
-        if not (missing or differ):
-            logger.info(
-                "[moriio-verify] req %s: all %d PAGE regions of the %d locally "
-                "held prefix blocks match the producer's %d stage(s)",
-                req_id,
-                len(self._page_regions),
-                len(held),
-                stages,
-            )
+            return
+        logger.info(
+            "[moriio-verify] req %s: %d of the %d locally held prefix blocks "
+            "hold what their push landed%s (%d completed by this decode, %d "
+            "with no matching push recorded: not compared)",
+            req_id,
+            len(recorded),
+            len(held),
+            "" if recorded else " -- none compared",
+            len(not_received),
+            len(held) - len(not_received) - len(recorded),
+        )
 
     def _verify_page_landed(self, req_id: ReqId) -> None:
         """Compare the destination blocks with the producer's source digest,
-        and the blocks an incremental push left out (`_verify_held_landed`)."""
+        and the blocks an incremental push left out (`_verify_held_landed`).
+        A matching push's blocks but the last are recorded for the latter."""
         self._verify_held_landed(req_id)
         dst = self._verify_page_dst.pop(req_id, None)
         with self._write_reports_lock:
@@ -2261,8 +2232,20 @@ class MoRIIOConnector(KVConnectorBase):
             return
         landed = self._page_digests(dst)
         if isinstance(source, dict):
-            self._verify_regions_landed(req_id, len(dst), source, landed)
-            return
+            body_ok = self._verify_regions_landed(req_id, len(dst), source, landed)
+        else:
+            body_ok = self._verify_positions_landed(req_id, dst, source, landed)
+        if body_ok and len(dst) > 1:
+            # The last block is left out: past the prompt its slots are
+            # written by this decode, as `_page_digests` says.
+            body = dst[:-1]
+            self._verify_block_sums.update(zip(body, self._block_sums(body)))
+
+    def _verify_positions_landed(
+        self, req_id: ReqId, dst: list[int], source: Any, landed: list[list[int]]
+    ) -> bool:
+        """`_verify_page_landed` for a push paired by position. Whether the
+        blocks before the last match."""
         if landed[0] != source[0]:
             import torch
 
@@ -2281,7 +2264,8 @@ class MoRIIOConnector(KVConnectorBase):
                 self._changed_regions(source[0], landed[0]),
                 "they match" if again else "still different",
             )
-        elif landed[1] != source[1]:
+            return False
+        if landed[1] != source[1]:
             logger.warning(
                 "[moriio-verify] req %s: only the last of %d blocks differs "
                 "(%s): the producer wrote its slots past the prompt during "
@@ -2298,13 +2282,15 @@ class MoRIIOConnector(KVConnectorBase):
                 len(self._page_regions),
                 len(dst),
             )
+        return True
 
     def _verify_regions_landed(
         self, req_id: ReqId, blocks: int, source: dict, landed: list[list[int]]
-    ) -> None:
+    ) -> bool:
         """`_verify_page_landed` for pushes paired by unit: every PP stage sent
         the digests of the regions it wrote, merged by region here, so a region
-        no stage wrote is an error too (layers decode would read unwritten)."""
+        no stage wrote is an error too (layers decode would read unwritten).
+        Whether every region of the blocks before the last matches."""
         regions: dict[int, tuple[int, int]] = source["regions"]
         missing = [i for i in range(len(self._page_regions)) if i not in regions]
         body = [i for i, (b, _) in regions.items() if landed[0][i] != b]
@@ -2354,6 +2340,7 @@ class MoRIIOConnector(KVConnectorBase):
                 blocks,
                 source.get("stages", 1),
             )
+        return not (missing or body)
 
     def _verify_rows_for(self, local_block_ids: list[int], is_mla: bool) -> Any:
         """Row indices into dim 0 covered by the given blocks.
@@ -3017,8 +3004,6 @@ class MoRIIOConnector(KVConnectorBase):
             report["state_digest"] = request["state_digest"]
         if ok and "page_digest" in request:
             report["page_digest"] = request["page_digest"]
-        if ok and "held_digest" in request:
-            report["held_digest"] = request["held_digest"]
         try:
             self.moriio_wrapper.send_message(
                 [MoRIIOConstants.WRITE_DONE, msgpack.dumps(report)],
@@ -3093,7 +3078,6 @@ class MoRIIOConnector(KVConnectorBase):
                     self._write_reports_expected.pop(req_id, None)
                     self._write_report_counts.pop(req_id, None)
                     self._stage_digests.pop(req_id, None)
-                    self._stage_held_digests.pop(req_id, None)
                 failed_recving.add(req_id)
                 # In case the WRITE_REQ never arrived and the producer still
                 # holds the source blocks.
@@ -3194,18 +3178,12 @@ class MoRIIOConnector(KVConnectorBase):
                         req_id, ok = report["decode_req_id"], bool(report["ok"])
                         state_digest = report.get("state_digest")
                         page_digest = report.get("page_digest")
-                        held_digest = report.get("held_digest")
                         stage = int(report.get("pp_rank", 0))
                     except Exception:
                         logger.exception("Dropping undecodable WRITE_DONE")
                         continue
                     self._record_write_report(
-                        req_id,
-                        ok,
-                        state_digest,
-                        page_digest,
-                        stage=stage,
-                        held_digest=held_digest,
+                        req_id, ok, state_digest, page_digest, stage=stage
                     )
 
                 elif msg == MoRIIOConstants.RELEASE:
@@ -3496,10 +3474,9 @@ class MoRIIOConnector(KVConnectorBase):
                 self._verify_state_landed(req_id)
             for req_id in failed_recving:
                 self._verify_page_dst.pop(req_id, None)
-                self._verify_held_dst.pop(req_id, None)
+                self._verify_held.pop(req_id, None)
                 with self._write_reports_lock:
                     self._write_page_digests.pop(req_id, None)
-                    self._write_held_digests.pop(req_id, None)
                 self._verify_rows.pop(req_id, None)
                 self._verify_before.pop(req_id, None)
                 self._verify_state_before.pop(req_id, None)
@@ -3552,6 +3529,7 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
             "handshake_port", MoRIIOConstants.DEFAULT_HANDSHAKE_PORT
         )
         self.engine_id = "None"
+        self._block_manager: Any = None
         self.tp_size = config.tensor_parallel_size
         self.pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
         self.dp_size = config.parallel_config.data_parallel_size
@@ -3650,13 +3628,28 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
                 getattr(seq, "state_slot", -1),
             )
             params["do_remote_prefill"] = False
-            params["num_computed_blocks"] = self._local_prefix_blocks(seq)
+            held = self._local_prefix_blocks(seq)
+            params["num_computed_blocks"] = held
+            if held and envs.ATOM_MORIIO_VERIFY and self._block_manager is not None:
+                # The worker compares only held blocks a push filled with
+                # what that push landed (`_verify_held_landed`).
+                pool = self._block_manager.kv
+                params["verify_held_not_received"] = [
+                    i
+                    for i, block_id in enumerate(seq.block_table[:held])
+                    if not pool.block(block_id).received
+                ]
             logger.debug(
                 "Queued req %s for remote KV loading (%d blocks, %d held here)",
                 seq.id,
                 len(seq.block_table),
                 params["num_computed_blocks"],
             )
+
+    def bind_block_manager(self, block_manager: Any) -> None:
+        """The scheduler's block manager, for ATOM_MORIIO_VERIFY's provenance
+        of the held prefix blocks (`update_state_after_alloc`)."""
+        self._block_manager = block_manager
 
     def _local_prefix_blocks(self, seq: Sequence) -> int:
         """ATOM_MORIIO_INCREMENTAL_PUSH: the leading block-table entries whose
