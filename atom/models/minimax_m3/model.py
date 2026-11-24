@@ -47,6 +47,7 @@ from atom.model_ops.minimax_m3.sparse_attn import (
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.swiglu_oai import swiglu_oai_split
 from atom.model_ops.utils import atom_parameter
+from atom.models.minimax_m3 import decode_moe
 from atom.models.minimax_m3.mono.dispatch import MonoDecode
 from atom.models.utils import (
     IntermediateTensors,
@@ -358,7 +359,23 @@ class MiniMaxM3MoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
             )
 
+        # last child: its post-load hook runs after the experts' and shared expert's
+        self.decode_moe = (
+            decode_moe.DecodeMoe(self, prefix)
+            if decode_moe.enabled() and self.shared_experts is not None
+            else None
+        )
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.decode_moe is None:
+            return self.default_forward(hidden_states)
+        orig_shape = hidden_states.shape
+        out = decode_moe.decode_moe_op(
+            hidden_states.view(-1, orig_shape[-1]), self.decode_moe.prefix
+        )
+        return out.view(orig_shape)
+
+    def default_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, orig_shape[-1])
         router_logits = self.gate(hidden_states)
