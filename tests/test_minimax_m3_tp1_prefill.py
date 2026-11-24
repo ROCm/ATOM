@@ -218,6 +218,21 @@ def test_psc_layout_needs_an_unsplit_8wave_row_1024_rows_and_k_256(monkeypatch):
     assert not T.psc_layout(8192, 9856, 6000)  # K not a multiple of 256
 
 
+def test_gateup_swiglu_fuses_where_both_gemms_take_psc(monkeypatch):
+    psc = {(8192, 6144, 6144), (8192, 6144, 3072)}
+    monkeypatch.setattr(T, "psc_layout", lambda m, n, k: (m, n, k) in psc)
+    monkeypatch.setattr(T, "_gateup_swiglu_op", lambda: object())
+    mlp = SimpleNamespace(swiglu_limit=7.0)
+    assert T.gateup_swiglu_fused(8192, 6144, 6144, 6144, mlp)
+    unclamped = SimpleNamespace(swiglu_limit=None)
+    assert not T.gateup_swiglu_fused(8192, 6144, 6144, 6144, unclamped)
+    psc.discard((8192, 6144, 3072))  # down on a bmm / mxpsh row: row-major scales
+    assert not T.gateup_swiglu_fused(8192, 6144, 6144, 6144, mlp)
+    psc.add((8192, 6144, 3072))
+    monkeypatch.setattr(T, "_gateup_swiglu_op", lambda: None)  # an aiter without it
+    assert not T.gateup_swiglu_fused(8192, 6144, 6144, 6144, mlp)
+
+
 def test_the_ragged_gemm2_copy_needs_pp_the_switch_and_the_op(monkeypatch):
     monkeypatch.setattr(T, "_K", SimpleNamespace(moe_g2_p6=object()))
     monkeypatch.setenv("ATOM_M3_TP1_MOE_G2_P6", "1")
@@ -516,7 +531,7 @@ def test_linears_equal_native_quant_linear(dev, n, k):
 
 @gpu
 @pytest.mark.parametrize("inter", [3072, 12288])
-@pytest.mark.parametrize("m", (37, 1000, 3001, 8192))
+@pytest.mark.parametrize("m", (37, 1000, 3001, 8192, 16384))
 def test_mlp_equals_the_generic_mlp(dev, inter, m):
     from atom.model_ops.blockscale import native_quant_linear, quantize_fp8
     from atom.model_ops.swiglu_oai import swiglu_oai_split
@@ -552,6 +567,9 @@ def test_mlp_equals_the_generic_mlp(dev, inter, m):
     want = linear(act, dn)
     q8, s8 = T.quant_mxfp8(x, 2 * inter)
     assert _bytes_equal(T.mlp_forward(mlp, q8, s8), want)
+    # where gate_up and down both take psc rows, gate_up carries the SwiGLU
+    both = T.psc_layout(m, 2 * inter, h) and T.psc_layout(m, h, inter)
+    assert T.gateup_swiglu_fused(m, 2 * inter, h, h, mlp) == both
     if m >= 1024:  # the SwiGLU's w4 scales, as the down GEMM reads them
         from atom.model_ops.minimax_m3.tp1_swiglu import swiglu_oai_mxfp8_w4
 
