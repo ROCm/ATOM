@@ -129,6 +129,8 @@ class _DraftKVBinding(nn.Module):
 
     base_attention = None
     use_mla = False
+    # `KVCacheBinding.page_tokens`: the draft reads and writes page-16 SHUFFLE.
+    page_tokens = 16
 
     def __init__(self, layer_num: int):
         super().__init__()
