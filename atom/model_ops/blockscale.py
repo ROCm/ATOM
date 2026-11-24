@@ -52,19 +52,39 @@ def _check_quant_input(x, group):
     return x.contiguous()
 
 
-def quantize_fp8(x: torch.Tensor, *, dequantize: bool = False):
-    """E4M3, group32 E8M0 ceil scales; optionally return QAT values in x.dtype."""
+def quantize_fp8(
+    x: torch.Tensor,
+    *,
+    dequantize: bool = False,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
+):
+    """E4M3, group32 E8M0 ceil scales; optionally return QAT values in x.dtype.
+
+    `out`: contiguous (values, scales) buffers of the result's shapes and
+    dtypes to write instead of new tensors; not with `dequantize`."""
     x = _check_quant_input(x, 32)
-    output = torch.empty_like(x, dtype=x.dtype if dequantize else FP8_DTYPE)
-    scales = (
-        None
-        if dequantize
-        else torch.empty(
-            (*x.shape[:-1], x.shape[-1] // 32),
-            device=x.device,
-            dtype=torch.float8_e8m0fnu,
+    if out is not None:
+        output, scales = out
+        if dequantize or not (
+            output.shape == x.shape
+            and output.dtype == FP8_DTYPE
+            and scales.shape == (*x.shape[:-1], x.shape[-1] // 32)
+            and scales.dtype == torch.float8_e8m0fnu
+            and output.is_contiguous()
+            and scales.is_contiguous()
+        ):
+            raise ValueError("out must be quantize_fp8's (values, scales) buffers")
+    else:
+        output = torch.empty_like(x, dtype=x.dtype if dequantize else FP8_DTYPE)
+        scales = (
+            None
+            if dequantize
+            else torch.empty(
+                (*x.shape[:-1], x.shape[-1] // 32),
+                device=x.device,
+                dtype=torch.float8_e8m0fnu,
+            )
         )
-    )
     if x.numel():
         quantize_fp8_kernel[(triton.cdiv(x.numel(), 1024),)](
             x,

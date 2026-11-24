@@ -3586,14 +3586,13 @@ def fill_mxfp8_copy(
 ) -> None:
     """Write `mxfp8_copy_out` with the shared expert's own input quant, where
     the experts' quant did not take it (a path other than aiter's fused_moe,
-    or rows the experts never see as they are here)."""
+    or rows the experts never see as they are here): the one quant launch the
+    shared expert would have run, into the copy's buffers."""
     if mxfp8_copy_out is None:
         return
     from atom.model_ops.blockscale import quantize_fp8
 
-    payload, scale = quantize_fp8(hidden_states)
-    mxfp8_copy_out[0].copy_(payload)
-    mxfp8_copy_out[1].copy_(scale)
+    quantize_fp8(hidden_states, out=mxfp8_copy_out)
 
 
 def moe_forward(

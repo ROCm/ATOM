@@ -189,14 +189,30 @@ def test_rows_the_experts_do_not_see_are_quantized_here(mods, monkeypatch, case)
     assert "mxfp8_copy_out" not in seen.get("apply", {})
 
 
-def test_fill_mxfp8_copy_writes_quantize_fp8(mods, monkeypatch):
-    q = torch.arange(T * H, dtype=torch.uint8).reshape(T, H)
-    s = torch.arange(T * H // 32, dtype=torch.uint8).reshape(T, H // 32)
-    monkeypatch.setattr(mods.blockscale, "quantize_fp8", lambda x: (q, s))
-    copy = _copy()
-    mods.moe.fill_mxfp8_copy(torch.randn(T, H), copy)
-    assert torch.equal(copy[0], q) and torch.equal(copy[1], s)
-    mods.moe.fill_mxfp8_copy(torch.randn(T, H), None)  # nothing asked, nothing done
+def test_fill_mxfp8_copy_quantizes_into_the_copy(mods, monkeypatch):
+    """The fallback is the shared expert's one quant launch, written straight
+    into the copy's buffers (no second launch to copy it there)."""
+    calls = []
+    monkeypatch.setattr(
+        mods.blockscale, "quantize_fp8", lambda x, **kw: calls.append((x, kw))
+    )
+    x, copy = torch.randn(T, H), _copy()
+    mods.moe.fill_mxfp8_copy(x, copy)
+    assert len(calls) == 1 and calls[0][0] is x and calls[0][1] == {"out": copy}
+    mods.moe.fill_mxfp8_copy(x, None)  # nothing asked, nothing done
+    assert len(calls) == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton quant on a GPU")
+def test_quantize_fp8_out_matches_its_own_outputs(mods):
+    x = torch.randn(T, 256, device="cuda", dtype=torch.bfloat16)
+    want = mods.blockscale.quantize_fp8(x)
+    got = tuple(torch.full_like(t.view(torch.uint8), 0x5A).view(t.dtype) for t in want)
+    mods.blockscale.quantize_fp8(x, out=got)
+    for g, w in zip(got, want):
+        assert torch.equal(g.view(torch.uint8), w.view(torch.uint8))
+    with pytest.raises(ValueError):
+        mods.blockscale.quantize_fp8(x, out=(got[0][:1], got[1]))
 
 
 def test_op_returns_the_copy_its_fake_describes(mods, monkeypatch):
