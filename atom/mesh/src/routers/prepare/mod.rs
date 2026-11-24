@@ -99,7 +99,7 @@ pub fn prepare_chat(
         let files = components.tokenizer_template_files.read();
         let loaded = entry.as_ref().map(|e| match templates.get(&e.id) {
             Some(template) => LoadedTemplate::Worker(template.clone()),
-            None if files.contains(&e.id) => LoadedTemplate::File,
+            None if files.contains_key(&e.id) => LoadedTemplate::File,
             None => LoadedTemplate::Own,
         });
         (entry, built_in, loaded)
