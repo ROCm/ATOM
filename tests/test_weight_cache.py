@@ -211,6 +211,17 @@ def test_the_quantization_config_is_in_the_key(tmp_path, monkeypatch):
     assert key._diff_key(a, b) == ["quant: daemon=fp8 client=online"]
 
 
+def test_the_m3_tp1_prefill_switch_is_in_the_key(tmp_path, monkeypatch):
+    # On, loading keeps preshuffled weight-scale copies a daemon without it lacks.
+    from atom.model_ops.minimax_m3 import tp1_prefill
+
+    keys = []
+    for on in (False, True):
+        monkeypatch.setattr(tp1_prefill, "path_enabled", lambda config, on=on: on)
+        keys.append(_key(tmp_path, monkeypatch))
+    assert key._diff_key(*keys) == ["m3_tp1_prefill: daemon=False client=True"]
+
+
 # --------------------------------------------------------------------------
 # Values, checksums, key filters
 # --------------------------------------------------------------------------

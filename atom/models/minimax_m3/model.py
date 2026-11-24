@@ -45,10 +45,11 @@ from atom.model_ops.linear import (
     RowParallelLinear,
     mxfp4_k_pad_align,
 )
+from atom.model_ops.minimax_m3 import tp1_prefill
 from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
 )
-from atom.model_ops.moe import FusedMoE
+from atom.model_ops.moe import FusedMoE, Mxfp4MoEMethod
 from atom.model_ops.mx8_fused import swiglu_oai_quant_fp8
 from atom.model_ops.swiglu_oai import swiglu_oai_split
 from atom.model_ops.utils import atom_parameter
@@ -775,6 +776,12 @@ class MiniMaxM3SparseAttention(nn.Module):
         # Keep index Q/K packed with main QKV. Layers that reuse cached top-k skip
         # the indexer norm/rope/top-k path, but still compute the packed GEMM.
         qkv = self.qkv_proj(hidden_states, x_scale=hidden_states_scale)
+        return self.attend_qkv(positions, qkv, fuse_oproj)
+
+    def attend_qkv(
+        self, positions: torch.Tensor, qkv: torch.Tensor, fuse_oproj: bool = False
+    ):
+        """The attention on the packed qkv projection, before o_proj."""
         q, k, v, _, _ = qkv.split(
             [
                 self.q_size,
@@ -868,6 +875,121 @@ class MiniMaxM3DecoderLayer(nn.Module):
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        # Set by MiniMaxM3Model: this layer runs on tp1_prefill's fused ops, and a
+        # MoE layer with tp1_defer hands the next layer (routed, shared), unfolded.
+        self.tp1 = False
+        self.tp1_defer = False
+        self.tp1_ffn_name = ""
+
+    def enable_tp1(self, prefix: str) -> None:
+        """Run this layer on tp1_prefill's fused ops if its parts allow it: the
+        sparse attention, native MXFP8 1x32 linears and, in a MoE layer, MXFP4
+        routed experts (top-4) with an unfused MXFP8 shared expert scaled by 2.
+        Registers the FFN for the op that runs it."""
+        attn = self.self_attn
+        if not isinstance(attn, MiniMaxM3SparseAttention):
+            return
+        if self.is_moe_layer:
+            ffn = self.block_sparse_moe
+            if (
+                ffn.fuse_shared_experts
+                or ffn.shared_experts is None
+                or ffn.routed_scaling_factor != 2.0
+                or ffn.experts.top_k != 4
+                or not isinstance(ffn.experts.quant_method, Mxfp4MoEMethod)
+            ):
+                return
+            mlp = ffn.shared_experts
+        else:
+            ffn = mlp = self.mlp
+        linears = (attn.qkv_proj, attn.o_proj, mlp.gate_up_proj, mlp.down_proj)
+        if not all(tp1_prefill.linear_supported(linear) for linear in linears):
+            return
+        tp1_prefill.want_w4_scales(*linears)
+        from atom.config import get_current_atom_config
+
+        atom_config = get_current_atom_config()
+        if self.is_moe_layer:
+            experts = ffn.experts
+            experts.tp1_g2_relayout = (
+                experts.hidden_size == 6144
+                and experts.intermediate_size_per_partition == 3072
+                and tp1_prefill.moe_g2_ragged(atom_config.pipeline_parallel_size)
+            )
+        context = atom_config.compilation_config.static_forward_context
+        self.tp1_ffn_name = f"{prefix}.tp1_ffn"
+        if self.tp1_ffn_name in context:
+            raise ValueError(f"Duplicate layer: {self.tp1_ffn_name}")
+        context[self.tp1_ffn_name] = ffn
+        self.tp1 = True
+
+    def _forward_tp1(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        residual: torch.Tensor | None,
+        capture_aux: bool,
+    ) -> tuple:
+        """`forward` on tp1_prefill's fused ops, same bits. ``hidden_states`` may
+        be the previous MoE layer's (routed, shared) pair; this layer returns its
+        own pair when ``tp1_defer``."""
+        attn = self.self_attn
+        qkv_proj, o_proj = attn.qkv_proj, attn.o_proj
+        norm = self.input_layernorm
+        qkv_w = (qkv_proj.weight, qkv_proj.weight_scale, qkv_proj.weight_scale_w4)
+        if residual is None:
+            residual = hidden_states
+            qkv = tp1_prefill.linear_bf16(norm(hidden_states), *qkv_w)
+        else:
+            routed, shared = (
+                hidden_states
+                if isinstance(hidden_states, tuple)
+                else (hidden_states, None)
+            )
+            residual, xq, xs = tp1_prefill.norm_mxfp8(
+                routed,
+                shared,
+                residual,
+                norm.weight,
+                norm.variance_epsilon,
+                qkv_proj.weight.shape[0],
+            )
+            qkv = tp1_prefill.linear_q(xq, xs, *qkv_w)
+        aux_hidden_state = residual.clone() if capture_aux else None
+        attn_out = tp1_prefill.linear_bf16(
+            attn.attend_qkv(positions, qkv).view(-1, attn.q_size),
+            o_proj.weight,
+            o_proj.weight_scale,
+            o_proj.weight_scale_w4,
+        )
+        norm = self.post_attention_layernorm
+        if self.is_moe_layer:
+            moe = self.block_sparse_moe
+            normed, residual, q8, s8, q4, s4 = tp1_prefill.norm_moe_input(
+                attn_out,
+                residual,
+                norm.weight,
+                norm.variance_epsilon,
+                moe.shared_experts.gate_up_proj.weight.shape[0],
+            )
+            out = tp1_prefill.moe_ffn(
+                normed, q8, s8, q4, s4, moe.gate(normed), self.tp1_ffn_name
+            )
+            if not self.tp1_defer:
+                out = tp1_prefill.materialize(*out)
+        else:
+            residual, q8, s8 = tp1_prefill.norm_mxfp8(
+                attn_out,
+                None,
+                residual,
+                norm.weight,
+                norm.variance_epsilon,
+                self.mlp.gate_up_proj.weight.shape[0],
+            )
+            out = tp1_prefill.mlp(q8, s8, self.tp1_ffn_name)
+        if aux_hidden_state is not None:
+            return out, residual, aux_hidden_state
+        return out, residual
 
     def forward(
         self,
@@ -882,6 +1004,8 @@ class MiniMaxM3DecoderLayer(nn.Module):
     ):
         if sp is not None:
             return sp.layer_forward(self, positions, hidden_states, residual)
+        if self.tp1:
+            return self._forward_tp1(positions, hidden_states, residual, capture_aux)
         hidden_states_scale = None
         fuse_input_ar_rmsnorm_quant = _linear_consumes_per_token_fp8(
             self.self_attn.qkv_proj
@@ -966,6 +1090,8 @@ class MiniMaxM3DecoderLayer(nn.Module):
         if isinstance(output, sp_prefill.ShardedOutput):
             return output.sp.aux_hidden_state(output)
         hidden_states, residual = output[0], output[1]
+        if isinstance(hidden_states, tuple):  # a tp1_prefill MoE layer's pair
+            hidden_states = tp1_prefill.materialize(*hidden_states)
         if get_tensor_model_parallel_world_size() > 1:
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         return hidden_states + residual
@@ -1025,6 +1151,8 @@ class MiniMaxM3Model(nn.Module):
             self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
+        if tp1_prefill.model_enabled(atom_config, config.hidden_size):
+            self._enable_tp1(f"{prefix}.layers")
 
         # Eagle3 aux hidden-state capture layer ids. Empty unless an Eagle3 drafter
         # registers them via MiniMaxM3SparseForCausalLM.set_aux_hidden_state_layers.
@@ -1053,6 +1181,16 @@ class MiniMaxM3Model(nn.Module):
             _P1_AUX_BUFS[lid] = buf
             # instance attribute over the staticmethod: the hook gets None (records nothing), the op writes
             self.layers[lid].aux_hidden_state = functools.partial(_p1_aux_hidden_state, layer=lid)
+
+    def _enable_tp1(self, prefix: str) -> None:
+        """tp1_prefill's fused ops on this stage's layers that allow them. A MoE
+        layer leaves its fold to the next layer when that one runs them too; the
+        stage's last layer always hands on h."""
+        for idx in range(self.start_layer, self.end_layer):
+            self.layers[idx].enable_tp1(f"{prefix}.{idx}")
+        for idx in range(self.start_layer, self.end_layer - 1):
+            layer, nxt = self.layers[idx], self.layers[idx + 1]
+            layer.tp1_defer = layer.tp1 and layer.is_moe_layer and nxt.tp1
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
