@@ -505,9 +505,12 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         self._pending_chunked_admissions: dict[ReqId, TransferId] = {}
         self.host_ip = get_ip()
 
-        # Pending requests: req_id -> (Sequence, block_table)
-        self._reqs_need_recv: dict[ReqId, tuple[Any, list[int]]] = {}
-        self._reqs_need_save: dict[ReqId, tuple[Any, list[int]]] = {}
+        # Pending requests: req_id -> (Sequence, block ids, state slot).
+        # Recv and chunked save entries hold the full block table; build_connector_meta
+        # trims chunked saves to the prompt's pages (_prompt_block_ids). A non-chunked
+        # save is queued already trimmed.
+        self._reqs_need_recv: dict[ReqId, tuple[Any, list[int], int]] = {}
+        self._reqs_need_save: dict[ReqId, tuple[Any, list[int], int]] = {}
 
         # Source-block ownership: the scheduler frees a finished request's HBM
         # only once every connector stops claiming it. Claimed in
@@ -593,12 +596,22 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
     def get_num_new_matched_tokens(self, seq: Sequence) -> tuple[int, bool]:
         params = seq.kv_transfer_params or {}
 
-        if params.get("do_remote_prefill") and not getattr(
-            seq, "kv_async_tagged", False
-        ):
+        if params.get("do_remote_prefill"):
             return len(seq.prompt_token_ids), True
 
         return 0, False
+
+    def _prompt_block_ids(self, seq: Sequence, block_ids: list[int]) -> list[int]:
+        """The pages of `block_ids` that hold `seq`'s prompt, all D allocates.
+
+        P can hold more: MTP lookahead pages, and with deferred output the page
+        a finished prefill's one extra step takes when the prompt fills its
+        last page. D computes the first token's KV itself, and the producer
+        aborts the send unless D's destination page count equals
+        ceil(source pages / src_block_skip_factor).
+        """
+        page_tokens = self.block_size * self.dcp_size
+        return block_ids[: -(-seq.num_prompt_tokens // page_tokens)]
 
     def build_connector_meta(self) -> ConnectorMetadata:
         # Sweep even behind a capacity-blocked head, and on idle PP ticks.
@@ -627,12 +640,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             assert req.kv_transfer_params is not None
             req.kv_transfer_params["local_slot_index"] = slot_idx
             if req.kv_transfer_params.get("chunked_transfer"):
-                # MTP owns lookahead pages beyond the prompt on P. D reserves
-                # only prompt pages; keep the extra pages pinned on the sequence
-                # but leave them out of both initial and final transfer metadata.
-                page_tokens = self.block_size * self.dcp_size
-                prompt_blocks = (req.num_prompt_tokens + page_tokens - 1) // page_tokens
-                block_ids = block_ids[:prompt_blocks]
+                # Pages past the prompt stay pinned on the sequence, but out
+                # of both initial and final transfer metadata.
+                block_ids = self._prompt_block_ids(req, block_ids)
             meta.add_new_req_to_save(
                 request_id=req_id,
                 local_block_ids=block_ids,
@@ -809,6 +819,12 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             seq.kv_transfer_params_output = None
             return
 
+        # On D the live table, only copied into the output below; P queues a
+        # list of its own.
+        prefill_block_ids = seq.block_table
+        if self.is_producer:
+            prefill_block_ids = self._prompt_block_ids(seq, list(prefill_block_ids))
+
         # Claim iff we will send: the same `do_remote_decode` gate that fills
         # `_reqs_need_save`.
         if self.is_producer and (getattr(seq, "kv_transfer_params", None) or {}).get(
@@ -821,7 +837,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             # aborted load releases the allocation.
             self._reqs_need_save[seq.id] = (
                 seq,
-                list(seq.block_table),
+                prefill_block_ids,
                 seq.state_slot,
             )
 
@@ -834,7 +850,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         seq.kv_transfer_params_output = {
             "do_remote_prefill": True,
             "do_remote_decode": False,
-            "remote_block_ids": list(seq.block_table),
+            "remote_block_ids": list(prefill_block_ids),
             # The consumer's SWA ring slot; the producer keys the SWA region
             # transfer by it. Empty for backends with no SWA state.
             "remote_swa_block_ids": _swa_ring_ids(seq),
@@ -982,8 +998,9 @@ class _UnitPlan:
     """Where a producer's PAGE regions land on one consumer rank."""
 
     cmap: list[int]
-    # Per region, when cutting heads: (consumer block bytes, slice rows).
-    cuts: list[tuple[int, np.ndarray]] | None
+    # Per region, when cutting heads: (consumer block bytes, slice rows, their
+    # staged gather).
+    cuts: list[tuple[int, np.ndarray, GatherLayout]] | None
     num_consumer_regions: int = 0
 
 
@@ -1230,7 +1247,7 @@ class MooncakeConnector(KVConnectorBase):
         self._block_region_roles: list[str | None] = []
         # Per PAGE region: its head runs, and its spec where the backend names
         # its units (MHA); `_unit_layout` is the three packed for a producer.
-        self._block_head_major_runs: tuple[tuple[int, int] | None, ...] = ()
+        self._block_head_major_runs: tuple[tuple[int, tuple[int, ...]] | None, ...] = ()
         self._block_unit_specs: tuple[PageUnitSpec, ...] | None = None
         self._unit_layout: bytes | None = None
         self._unit_plans: dict[tuple, _UnitPlan] = {}
@@ -3190,7 +3207,8 @@ class MooncakeConnector(KVConnectorBase):
         """Pair our units with consumer rank `rank` of `tp` by spec, and cut
         heads where that rank holds fewer than we do."""
         specs = [PageUnitSpec(*unit[:5]) for unit in layout]
-        runs = [None if unit[5] is None else tuple(unit[5]) for unit in layout]
+        # msgpack hands back lists; head runs compare as `(heads, widths)` tuples.
+        runs = [None if u[5] is None else (u[5][0], tuple(u[5][1])) for u in layout]
         widths = [unit[6] for unit in layout]
         end = None
         if self.pp_rank < self.pp_size - 1:
@@ -3211,15 +3229,13 @@ class MooncakeConnector(KVConnectorBase):
                 f"DCP; got producer TP {self.tp_size} DCP {self.dcp_size}, "
                 f"consumer TP {tp} DCP {dcp}"
             )
-        cuts = [
-            (
-                widths[c],
-                consumer_head_slices(
-                    ours[i][1], widths[c], ours[i][0], runs[c], rank, tp, str(specs[c])
-                ),
+        cuts = []
+        for i, c in enumerate(cmap):
+            rows = consumer_head_slices(
+                ours[i][1], widths[c], ours[i][0], runs[c], rank, tp, str(specs[c])
             )
-            for i, c in enumerate(cmap)
-        ]
+            gather = GatherLayout.from_slices(ours[i][1], widths[c], rows)
+            cuts.append((widths[c], rows, gather))
         return _UnitPlan(cmap, cuts, len(specs))
 
     def _consumer_dcp_plan(
@@ -3372,7 +3388,7 @@ class MooncakeConnector(KVConnectorBase):
             role = self._block_region_roles[region_idx]
             if plan.cuts is not None:
                 # Write this consumer's heads of every head-major run.
-                dst_bpb, cuts = plan.cuts[region_idx]
+                dst_bpb, cuts, _ = plan.cuts[region_idx]
                 src = source_blocks[:, None] * bpb + cuts[:, 0]
                 dst = destination_blocks[:, None] * dst_bpb + cuts[:, 1]
                 if not batch.add(
@@ -3489,15 +3505,8 @@ class MooncakeConnector(KVConnectorBase):
         return self._check_staging_sources(
             page_transfer_plan(
                 [
-                    PlannedRegion(
-                        region,
-                        consumer,
-                        bases[consumer],
-                        GatherLayout.from_slices(
-                            self._per_block_bytes_list[region], dst_bytes, rows
-                        ),
-                    )
-                    for region, (consumer, (dst_bytes, rows)) in enumerate(
+                    PlannedRegion(region, consumer, bases[consumer], gather)
+                    for region, (consumer, (_, _, gather)) in enumerate(
                         zip(plan.cmap, plan.cuts)
                     )
                 ],

@@ -33,7 +33,7 @@ def _head(head_type, shards=True):
 
 def _runner(mr, heads, spec=None):
     runner = object.__new__(mr.ModelRunner)
-    runner.compute_head = None
+    runner.verify_head = None
     runner.config = SimpleNamespace(speculative_config=spec)
     runner.model = SimpleNamespace(modules=lambda: iter(heads))
     runner.sampler = sampler = mock.Mock(return_value="sampled")
@@ -91,7 +91,7 @@ def test_argmax_mode_takes_the_one_dp_sharded_head(monkeypatch, modules, subclas
 
 
 @pytest.mark.parametrize(
-    "case", ["compute_head", "speculative", "unsharded", "two_heads", "no_head"]
+    "case", ["verify_head", "speculative", "unsharded", "two_heads", "no_head"]
 )
 def test_argmax_mode_fails_at_startup(monkeypatch, modules, case):
     mr, eh, _ = modules
@@ -102,8 +102,8 @@ def test_argmax_mode_fails_at_startup(monkeypatch, modules, case):
         "no_head": [],
     }.get(case, [_head(eh.ParallelLMHead)])
     runner, _ = _runner(mr, heads, spec=object() if case == "speculative" else None)
-    if case == "compute_head":
-        runner.compute_head = mock.Mock()
+    if case == "verify_head":
+        runner.verify_head = mock.Mock()
     with pytest.raises(ValueError, match="ATOM_DP_LM_HEAD_MODE=argmax"):
         runner._init_dp_argmax_head()
 

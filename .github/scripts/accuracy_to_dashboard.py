@@ -50,8 +50,11 @@ def build_entries(
             continue
         strict_score = gsm8k.get("exact_match,strict-match")
 
-        # Lookup model config for threshold and baseline
-        cfg = model_configs.get(model_name, {})
+        # Lookup model config for threshold and baseline; an ATOMesh 1P1D case
+        # is held to its model's.
+        cfg = model_configs.get(model_name) or model_configs.get(
+            model_name.removesuffix("-1p1d"), {}
+        )
 
         # Build extra metadata
         extra_parts = []
