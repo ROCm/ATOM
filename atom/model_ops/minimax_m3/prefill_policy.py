@@ -113,7 +113,8 @@ def _default_prefill_score_config(
         num_stages=num_stages,
         store_group=1,
         prefetch_pages=False,
-        post_reduce_scale=False,
+        # Same scores (a positive scale commutes with the block max), fewer multiplies.
+        post_reduce_scale=arch == "gfx950",
     )
 
 

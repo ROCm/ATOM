@@ -524,6 +524,7 @@ class TestSelectorDispatch:
             arch="gfx950",
             selector_rows=1,
             compute_units=256,
+            num_idx_heads=1,
         )
 
     def test_narrow_rows_stay_on_triton(self):
@@ -559,8 +560,35 @@ class TestSelectorDispatch:
                 arch="gfx1250",
                 selector_rows=selector_rows,
                 compute_units=256,
+                num_idx_heads=1,
             )
             == want
+        )
+
+    @pytest.mark.parametrize(
+        "width,selector_rows,heads,decode_max_q,want",
+        [
+            (159, 32768, 4, 0, False),
+            (160, 32768, 4, 0, True),
+            (160, 4095, 4, 0, False),
+            (160, 32768, 4, 4, False),  # decode keeps the width-only gate
+            (160, 32768, 1, 0, False),  # TP4 (one index head) keeps it too
+        ],
+    )
+    def test_gfx950_tp1_prefill_takes_aiter_from_160_blocks(
+        self, width, selector_rows, heads, decode_max_q, want
+    ):
+        assert (
+            m._aiter_selector_wins(
+                width,
+                emit=True,
+                arch="gfx950",
+                selector_rows=selector_rows,
+                compute_units=256,
+                num_idx_heads=heads,
+                decode_max_q=decode_max_q,
+            )
+            is want
         )
 
     @pytest.mark.parametrize(
@@ -580,10 +608,43 @@ class TestSelectorDispatch:
                 arch="gfx1250",
                 selector_rows=65536,
                 compute_units=256,
+                num_idx_heads=1,
                 decode_max_q=4,
             )
             is want
         )
+
+
+def test_aiter_support_is_asked_once_per_width_k_and_device(monkeypatch):
+    """Steps of any length share one cached answer per (width, k, device); bounds
+    shorter than the rows decline before the cache."""
+    asked, ran = [], []
+
+    def supported(score, bounds, idx, k):
+        asked.append(score.shape[1])
+        return score.shape[1] <= 512
+
+    monkeypatch.setattr(m, "_AITER_SERVES", {})
+    monkeypatch.setattr(
+        m, "_small_k_selector", lambda: (lambda *a: ran.append(a[0].shape), supported)
+    )
+
+    def select(heads, total_q, width, bounds=None):
+        meta = {"device": "meta"}
+        return m._select_with_aiter(
+            torch.empty(heads, total_q, width, **meta),
+            torch.empty(heads, total_q, TOPK, dtype=torch.int32, **meta),
+            torch.empty(bounds or heads * total_q, dtype=torch.int32, **meta),
+            TOPK,
+            0,
+            1,
+        )
+
+    assert [select(4, t, 300) for t in (1024, 2048, 3001)] == [True] * 3
+    assert [select(4, t, 600) for t in (1024, 2048)] == [False] * 2
+    assert asked == [300, 600] and len(m._AITER_SERVES) == 2
+    assert not select(1, 8, 300, bounds=4)  # decode bounds shorter than the rows
+    assert asked == [300, 600] and len(ran) == 3
 
 
 @gpu
@@ -1008,3 +1069,157 @@ def test_gfx1250_issue_341_tp4_launch_is_bit_exact(
         previous = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
     torch.cuda.synchronize()
     assert all(torch.equal(a, b) for a, b in zip(tuned, previous))
+
+
+class TestFp8PrefillRoutes:
+    """The FP8 index prefill routes of the TP1 gfx950 path: the fixed workspace's
+    view, aiter's FlyDSL scorer and its fused scorer + top-16."""
+
+    @staticmethod
+    def _q(dtype=torch.bfloat16, tokens=8):
+        return torch.empty(tokens, 4, 128, device="meta", dtype=dtype)
+
+    @pytest.mark.parametrize(
+        "batch,q_len,blocks,want",
+        [
+            (1, 8192, 128, True),
+            (1, 8192, 127, False),
+            (2, 8192, 1024, False),  # ragged steps keep Triton
+            (1, 6143, 1023, False),
+            (1, 6144, 129, True),
+            (1, 1024, 1024, True),
+            (1, 8192, 8192, True),  # 1M context: a 1 GiB plane
+            (1, 32768, 8192, False),  # 4 GiB: past aiter's 32-bit addressing
+        ],
+    )
+    def test_flydsl_scorer_gate(self, batch, q_len, blocks, want):
+        q = self._q(tokens=q_len)
+        assert m._fp8_prefill_takes_flydsl(q, batch, q_len, blocks) is want
+
+    def test_flydsl_scorer_needs_a_bf16_query(self):
+        assert not m._fp8_prefill_takes_flydsl(self._q(torch.float16), 1, 8192, 4096)
+
+    def test_score_view_rows_are_four_aligned_and_bounded(self):
+        from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
+
+        ws = LogitsWorkspace(4 * 10 * 132, "cpu")
+        view = m._prefill_score_view(ws, 4, 10, 129)
+        assert view.shape == (4, 10, 129)
+        assert view.stride() == (10 * 132, 132, 1)
+        # the selectors flatten (heads, rows): still a view
+        assert view.view(40, 129).stride() == (132, 1)
+        assert m._prefill_score_view(ws, 4, 11, 129) is None  # past the capacity
+        assert m._prefill_score_view(None, 4, 10, 129) is None
+
+    @pytest.mark.parametrize(
+        "batch,q_len,blocks,want",
+        [
+            (1, 8192, 576, True),
+            (1, 8192, 575, False),
+            (1, 4095, 2048, False),
+            (2, 8192, 2048, False),
+        ],
+    )
+    def test_fused_gate(self, monkeypatch, batch, q_len, blocks, want):
+        monkeypatch.setattr(m, "_fused_index_topk_ops", lambda: object())
+        args = (self._q(), batch, q_len, blocks, 16, 0, 1, True, 8, 8, object())
+        assert m._fused_prefill_takes(*args) is want
+
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            (8, 0, 1, True, 8, 8),  # topk
+            (16, 1, 1, True, 8, 8),  # an init block
+            (16, 0, 1, False, 8, 8),  # no page-16 emit (NVFP4 KV)
+            (16, 0, 1, True, 1, 1),  # MXFP4 KV pages
+        ],
+    )
+    def test_fused_takes_only_the_kernels_shape(self, monkeypatch, shape):
+        monkeypatch.setattr(m, "_fused_index_topk_ops", lambda: object())
+        args = (self._q(), 1, 8192, 2048, *shape, object())
+        assert not m._fused_prefill_takes(*args)
+
+    def test_fused_needs_the_workspace_path_and_its_op(self, monkeypatch):
+        args = (self._q(), 1, 8192, 2048, 16, 0, 1, True, 8, 8)
+        monkeypatch.setattr(m, "_fused_index_topk_ops", lambda: object())
+        assert not m._fused_prefill_takes(*args, None)
+        monkeypatch.setattr(m, "_fused_index_topk_ops", lambda: None)
+        assert not m._fused_prefill_takes(*args, object())
+
+
+def _fp8_inputs(qlens, prefixes):
+    if m.get_gfx_runtime() != "gfx950":
+        pytest.skip("the FP8 index workspace routes are gfx950's")
+    kw = _inputs(qlens, prefixes, 4, "cuda")
+    kw["index_kv_cache"] = kw["index_kv_cache"].to(torch.float8_e4m3fn)
+    return kw
+
+
+def _workspace(kw):
+    from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
+
+    blocks = -(-kw["max_seq_len"] // SPARSE_BLOCK_SIZE)
+    ws = LogitsWorkspace(4 * kw["idx_q"].shape[0] * (-(-blocks // 4) * 4), "cuda")
+    ws._logits.fill_(3e38)  # stale cells must never reach a selection
+    return ws
+
+
+@gpu
+@pytest.mark.parametrize("bounded", [True, False])
+@pytest.mark.parametrize(
+    "qlens,prefixes",
+    [
+        ([8192], [24576]),  # FlyDSL (>= 6144 new tokens), aiter selector
+        ([2300], [131000]),  # FlyDSL (>= 1024 blocks), a padded row
+        ([3001, 2192], [100000, 0]),  # ragged: Triton into the workspace
+        ([1000], [3100]),  # 33 blocks in rows 36 wide: Triton scorer and selector
+    ],
+)
+def test_fp8_prefill_workspace_routes_keep_the_selection(qlens, prefixes, bounded):
+    """Scores into the fixed workspace (FlyDSL or Triton) select exactly what the
+    per-call Triton plane selects; without row bounds the Triton selector reads it."""
+    kw = _fp8_inputs(qlens, prefixes)
+    valid = m.build_n_valid_column_per_row(
+        kw["cu_seqlens_q"],
+        kw["prefix_lens"],
+        batch=len(qlens),
+        total_q=kw["idx_q"].shape[0],
+        num_idx_heads=4,
+        decode_max_q=0,
+    )
+    valid = valid if bounded else None
+    ref = m.minimax_m3_index_topk(
+        **kw, emit_sparse_block_table=True, n_valid_column_per_row=valid
+    )
+    got = m.minimax_m3_index_topk(
+        **kw,
+        emit_sparse_block_table=True,
+        n_valid_column_per_row=valid,
+        score_workspace=_workspace(kw),
+    )
+    torch.cuda.synchronize()
+    for a, b in zip(ref, got):
+        assert torch.equal(a, b)
+
+
+@gpu
+@pytest.mark.parametrize("qlens,prefixes", [([4096], [73728]), ([8192], [122880])])
+def test_fused_index_topk_matches_the_triton_selector(monkeypatch, qlens, prefixes):
+    """aiter's fused scorer + per-chunk top-16 and the merge emit exactly what the
+    Triton scorer + Triton selector emit."""
+    kw = _fp8_inputs(qlens, prefixes)
+    if m._fused_index_topk_ops() is None:
+        pytest.skip("aiter.ops.m3_fused_index_topk is not installed")
+    # the reference: no n_valid bounds, so the Triton selector on a per-call plane
+    ref = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
+    calls, fused = [], m._fused_prefill_index_topk
+    monkeypatch.setattr(
+        m, "_fused_prefill_index_topk", lambda *a: calls.append(1) or fused(*a)
+    )
+    got = m.minimax_m3_index_topk(
+        **kw, emit_sparse_block_table=True, score_workspace=_workspace(kw)
+    )
+    torch.cuda.synchronize()
+    assert calls == [1]
+    for a, b in zip(ref, got):
+        assert torch.equal(a, b)

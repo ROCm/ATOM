@@ -2070,6 +2070,37 @@ class TestNoGluonFlyDSLRouting:
         out = layer._shuffle_v_for_flydsl(v, self._meta(8, 1, 8, 128, 16))
         assert out.shape == ((8, 1, 128, 128) if gluon else (8, 1, 8, 128, 16))
 
+    def test_sparse_rows_run_on_asm_in_launches_of_at_most_65536(self, monkeypatch):
+        """gqa16 rows go to the heuristic's own kernel, sliced at the grid-y cap."""
+        import torch
+
+        from atom.model_ops import base_attention
+        from atom.model_ops.minimax_m3 import sparse_attn
+
+        monkeypatch.setattr(sparse_attn, "pa_fwd_asm_supports_arch", lambda: True)
+        monkeypatch.setattr(sparse_attn, "_gluon_one_pass_max_rows", lambda _: 64)
+        calls = []
+        monkeypatch.setattr(
+            base_attention, "run_pa_fwd_asm", lambda **kw: calls.append(kw)
+        )
+        rows = (1 << 16) + 3
+        fp8 = torch.float8_e4m3fn
+        m = self._meta
+        q = m(rows, 16, 128)
+        assert sparse_attn._sparse_pa_ran_on_asm(
+            q,
+            torch.empty(8, 1, 8, 16, 16, device="meta", dtype=fp8),
+            torch.empty(8, 1, 1, 128, 16, device="meta", dtype=fp8),
+            m(rows, 128),
+            m(rows),
+            m(8, 1, 16),
+            m(8, 1, 16),
+            m(rows, 16, 128),
+        )
+        assert [c["q"].shape[0] for c in calls] == [1 << 16, 3]
+        assert [c["block_tables"].shape[0] for c in calls] == [1 << 16, 3]
+        assert all("kernel_name" not in c and "qo_indptr" not in c for c in calls)
+
     def test_sparse_rows_skip_asm_without_its_kernels(self, monkeypatch):
         from atom.model_ops.minimax_m3 import sparse_attn
 
@@ -2085,6 +2116,43 @@ class TestNoGluonFlyDSLRouting:
             m(8, 1, 16),
             m(4096, 16, 128),
         )
+
+
+@pytest.mark.skipif(not _HAS_CUDA, reason="runs aiter's paged-attention ASM kernel")
+def test_gqa16_sparse_rows_with_a_partial_16th_page_are_finite_and_near_fp32():
+    """Contexts of 241-255 tokens (a partial 16th page) once gave NaN on aiter's GQA-16
+    kernel, which sparse prefill split into two GQA-8 queries to avoid."""
+    import torch
+
+    from atom.model_ops.minimax_m3 import sparse_attn
+
+    if not sparse_attn.pa_fwd_asm_supports_arch():
+        pytest.skip("no paged-attention ASM kernel on this GPU")
+    torch.manual_seed(0)
+    dev, rows, pages, npg = "cuda", 1024, 2048, 19  # npg: pages of 300 tokens
+    lens = torch.arange(rows, dtype=torch.int32, device=dev) % 300 + 1
+    lens[: rows // 2] = lens[: rows // 2] % 15 + 241  # half the rows at 241-255
+    q = torch.randn(rows, 16, 128, device=dev, dtype=torch.bfloat16)
+    k = (torch.randn(pages, 1, 8, 16, 16, device=dev) / 4).to(_FP8)
+    v = (torch.randn(pages, 1, 1, 128, 16, device=dev) / 4).to(_FP8)
+    k_scale = torch.rand(pages, 1, 16, device=dev) + 0.5
+    v_scale = torch.rand(pages, 1, 16, device=dev) + 0.5
+    bt = torch.randint(0, pages, (rows, 128), dtype=torch.int32, device=dev)
+    out = torch.empty_like(q)
+    assert sparse_attn._sparse_pa_ran_on_asm(q, k, v, bt, lens, k_scale, v_scale, out)
+
+    # fp32 reference over each row's first lens[r] keys: page p, slot t
+    kd = k.float().permute(0, 1, 3, 2, 4).reshape(pages, 16, 128)
+    vd = v.float().permute(0, 1, 2, 4, 3).reshape(pages, 16, 128)
+    pick = bt[:, :npg].long()
+    keys = (kd * k_scale.view(pages, 16, 1))[pick].reshape(rows, npg * 16, 128)
+    vals = (vd * v_scale.view(pages, 16, 1))[pick].reshape(rows, npg * 16, 128)
+    s = torch.einsum("rhd,rkd->rhk", q.float(), keys) * 128**-0.5
+    s = s.masked_fill(torch.arange(npg * 16, device=dev) >= lens[:, None, None], -1e30)
+    ref = torch.einsum("rhk,rkd->rhd", s.softmax(-1), vals)
+    assert not out.isnan().any()
+    err = (out.float() - ref).flatten(1).norm(dim=1) / ref.flatten(1).norm(dim=1)
+    assert float(err.max()) < 0.1
 
 
 @pytest.mark.parametrize("num_seqs", [4096, 4097])

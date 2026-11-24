@@ -3,6 +3,7 @@
 scorer's buffers (CPU, aiter importable; the scorer itself is in
 test_minimax_m3_mxfp4_index.py)."""
 
+import sys
 import types
 
 import pytest
@@ -64,6 +65,42 @@ def test_the_scorer_buffers_are_one_workspace_and_a_map_per_decode_ubatch(
         allocate_index_scorers(config, "cpu", max_bs=4, max_qlen=1, num_idx_heads=1)
         == {}
     )
+
+
+@pytest.mark.parametrize(
+    "index,heads,gfx,flydsl,want",
+    [
+        ("fp8", 4, "gfx950", True, True),
+        ("fp4", 4, "gfx950", True, False),
+        ("fp8", 1, "gfx950", True, False),  # TP4: one index head a rank
+        ("fp8", 4, "gfx942", True, False),
+        ("fp8", 4, "gfx950", False, False),  # no FlyDSL: a plane per call
+    ],
+)
+def test_the_fp8_prefill_workspace_is_the_tp1_gfx950_shapes(
+    monkeypatch, index, heads, gfx, flydsl, want
+):
+    from atom.model_ops.minimax_m3 import index_buffers
+
+    fake = types.ModuleType("aiter.ops.flydsl")
+    if flydsl:
+        fake.minimax_m3_index_score_prefill_flydsl = object()
+    monkeypatch.setitem(sys.modules, "aiter.ops.flydsl", fake)
+    # 1M context at 8192 tokens a chunk: 8192 blocks, so 1 GiB of fp32
+    config = types.SimpleNamespace(
+        max_model_len=1 << 20, max_num_batched_tokens=8192, index_cache_dtype=index
+    )
+    ws = index_buffers.allocate_prefill_scores(
+        config, "meta", num_idx_heads=heads, gfx=gfx
+    )
+    assert (ws is not None) is want
+    if want:
+        assert ws.capacity * 4 == 1 << 30
+        # 129 blocks: every row rounds up to 132, the FlyDSL merged-store stride
+        config.max_model_len = 129 * 128
+        assert index_buffers.prefill_score_capacity(config, num_idx_heads=4) == (
+            4 * 8192 * 132
+        )
 
 
 @pytest.mark.parametrize("phase", ["decode", "prefill"])
@@ -140,7 +177,7 @@ def test_the_sparse_attention_runs_only_the_rows_the_metadata_covers(
         prefill=types.SimpleNamespace(
             cu_seqlens_q=torch.arange(batch + 1, dtype=torch.int32) * mq,
             seq_lens=seq, context_lens=seq, block_table=table, max_query_len=mq,
-            max_seq_len=100, qo_indptr=cover,
+            max_seq_len=100, qo_indptr=cover, score_workspace=None,
         ),
     )  # fmt: skip
     ctx = types.SimpleNamespace(
