@@ -94,6 +94,15 @@ def test_prefill_token_graph_capability_matrix(overrides, expected):
         assert reason is not None and expected in reason
 
 
+def test_prefill_token_graphs_admit_pp_only_with_pp_cudagraph(monkeypatch):
+    """PP records one graph set per forward_vars slot, which is opt-in."""
+    config = _prefill_graph_config(pipeline_parallel_size=4)
+    monkeypatch.setenv("ATOM_PP_CUDAGRAPH", "0")
+    assert "ATOM_PP_CUDAGRAPH" in minimax_m3_prefill_token_graph_refusal(config)
+    monkeypatch.setenv("ATOM_PP_CUDAGRAPH", "1")
+    assert minimax_m3_prefill_token_graph_refusal(config) is None
+
+
 # ─────────────────────────────────────────────────────── topology gate ──
 
 

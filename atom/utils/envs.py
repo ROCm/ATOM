@@ -691,11 +691,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # end-to-end throughput is too coarse to see an effect that size.
     "ATOM_DSV41_SIDE_STREAMS": lambda: int(os.getenv("ATOM_DSV41_SIDE_STREAMS", "0")),
     # Experimental MiniMax-M3 prefill token graphs at `ATOM_TOKEN_GRAPH_SIZES`.
-    # The attention builder refuses DP/PP/PCP, EP, TBO and plugin mode, and a
-    # prefill carrying images stays eager; either way the eager path is unchanged.
+    # The attention builder refuses DP/PCP, EP, TBO, plugin mode and PP without
+    # ATOM_PP_CUDAGRAPH, and a prefill carrying images stays eager; either way
+    # the eager path is unchanged.
     "ATOM_MINIMAX_M3_PREFILL_TOKEN_GRAPH": lambda: _flag_env(
         "ATOM_MINIMAX_M3_PREFILL_TOKEN_GRAPH"
     ),
+    # Experimental: CUDA graphs under pipeline parallelism. Each PP in-flight
+    # slot (the forward_vars ring) records its own prefill token graphs, so a
+    # replay reads its own slot's staging buffers; decode runs eagerly. Off,
+    # pipeline_parallel_size > 1 still requires --enforce-eager.
+    "ATOM_PP_CUDAGRAPH": lambda: _flag_env("ATOM_PP_CUDAGRAPH"),
     # MiniMax-M3, prefill sizes (an all-reduce input of at least aiter's ar2s floor, 32 MiB): keep the
     # residual stream sequence-parallel -- each TP rank holds only the rows it owns in aiter's two-shot
     # AR + RMSNorm -- so the owner normalizes (and MXFP8-quantizes) its rows and the all-gather carries
