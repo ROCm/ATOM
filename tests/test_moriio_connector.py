@@ -582,6 +582,9 @@ class WritePathTest(unittest.TestCase):
         cls.connector = import_connector()
         if cls.connector is None:
             raise unittest.SkipTest("moriio_connector needs aiter, torch and a GPU")
+        import sys
+        import types
+
         import msgpack
         import torch
 
@@ -591,7 +594,9 @@ class WritePathTest(unittest.TestCase):
 
         cls.msgpack = msgpack
         cls.torch = torch
+        cls.types = types
         cls.constants = MoRIIOConstants
+        cls.connector_module = sys.modules[cls.connector.__module__]
 
     def make(self, *, producer: bool, layers: int = 2, blocks: int = 8):
         """A connector holding only what the write path reads.
@@ -757,8 +762,42 @@ class WritePathTest(unittest.TestCase):
             )
         return caches
 
-    def register(self, conn, kv_caches):
-        """Run `register_kv_caches` with the listener stubbed; return its metadata."""
+    def replay_caches(self, slots: int = 6):
+        """`hybrid_caches` under ReplaySSM, plus a second KDA layer, and the one
+        cursor both layers' (k, u, g) records share."""
+        import types
+
+        caches = self.hybrid_caches(slots)
+        cursor = self.torch.full((slots,), -1, dtype=self.torch.int32)
+
+        def records(state):
+            state.replay_buf_k = self.torch.zeros(
+                (slots, 2, 4, 8), dtype=self.torch.bfloat16
+            )
+            state.replay_buf_u = self.torch.zeros(
+                (slots, 2, 4, 8), dtype=self.torch.bfloat16
+            )
+            state.replay_buf_g = self.torch.zeros(
+                (slots, 2, 4, 8), dtype=self.torch.float32
+            )
+            return state
+
+        records(caches["layer_0"])
+        caches["layer_3"] = records(
+            types.SimpleNamespace(
+                k_cache=self.torch.zeros((slots, 3, 8), dtype=self.torch.bfloat16),
+                v_cache=self.torch.zeros((slots, 2, 4, 4), dtype=self.torch.float32),
+                per_request_state=True,
+            )
+        )
+        return caches, cursor
+
+    def register(self, conn, kv_caches, cursor=None):
+        """Run `register_kv_caches` with the listener stubbed; return its metadata.
+
+        The cursor comes as the runner hands it over: the transfer tensors'
+        state backend (the attention builder) answers `replay_cursor()`.
+        """
         conn.kv_cache_shape = None
         conn.blocks_per_chunk = None
         conn.layer_name_to_local_kv_cache_metadata = {}
@@ -766,7 +805,10 @@ class WritePathTest(unittest.TestCase):
         conn.side_channel_port = 7401
         advertised = []
         conn._handshake_listener = lambda metadata, *_rest: advertised.append(metadata)
-        conn.register_kv_caches(kv_caches)
+        backend = self.types.SimpleNamespace(replay_cursor=lambda: cursor)
+        conn.register_kv_caches(
+            kv_caches, self.types.SimpleNamespace(state_backend=backend)
+        )
         conn._handshake_listener_thread.join(timeout=5)
         return advertised[0]
 
@@ -1347,13 +1389,59 @@ class WritePathTest(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             self.register(conn, self.hybrid_caches())
 
-    def test_replayssm_buffers_are_refused(self):
+    def test_replayssm_records_and_cursor_are_registered_as_state(self):
         conn = self.make(producer=True)
-        state = self.hybrid_caches()["layer_0"]
-        state.replay_buf_k = self.torch.zeros(1)
-        with self.assertRaises(NotImplementedError):
-            conn._register_state("layer_0", state)
-        self.assertEqual(conn._state_tensors, {})
+        conn.transfer_mode = "write"
+        advertised = self.register(conn, *self.replay_caches())
+
+        layer = ["k", "v", "replay_k", "replay_u", "replay_g"]
+        self.assertEqual(
+            list(conn._state_tensors),
+            [f"layer_0.{part}" for part in layer]
+            + [f"layer_3.{part}" for part in layer]
+            + [self.connector_module.REPLAY_CURSOR],
+        )
+        # One int32 per slot, registered once for every layer.
+        self.assertEqual(
+            advertised.state_slot_bytes[self.connector_module.REPLAY_CURSOR], 4
+        )
+        self.assertEqual(advertised.state_slot_bytes["layer_3.replay_g"], 256)
+        self.assertEqual(advertised.num_state_slots, 6)
+
+    def test_replayssm_records_without_their_cursor_are_refused(self):
+        conn = self.make(producer=True)
+        conn.transfer_mode = "write"
+        caches, _cursor = self.replay_caches()
+        with self.assertRaises(ValueError) as caught:
+            self.register(conn, caches)
+        self.assertIn("replay_cursor()", str(caught.exception))
+
+    def test_the_cursor_is_pushed_and_digested_with_the_slot(self):
+        conn = self.make(producer=True)
+        conn.transfer_mode = "write"
+        self.register(conn, *self.replay_caches())
+        cursor_name = self.connector_module.REPLAY_CURSOR
+        _desc, _bytes, cursor = conn._state_tensors[cursor_name]
+        conn.remote_moriio_metadata = {
+            "engine": self.types.SimpleNamespace(num_state_slots=6)
+        }
+        conn._get_or_build_state_sessions = lambda engine_id: [
+            (f"S-{name}", slot_bytes)
+            for name, (_d, slot_bytes, _t) in conn._state_tensors.items()
+        ]
+        writes = conn._state_writes(
+            self.push_request(src_slot_index=2, dst_slot_index=5), "engine"
+        )
+        self.assertIn((f"S-{cursor_name}", 4, 8, 20), writes)
+        self.assertEqual(len(writes), len(conn._state_tensors))
+
+        before = conn._state_digest(2)
+        cursor[2] = 7
+        after = conn._state_digest(2)
+        self.assertNotEqual(before[cursor_name], after[cursor_name])
+        self.assertEqual(
+            {name for name in before if before[name] != after[name]}, {cursor_name}
+        )
 
     def test_a_state_slot_that_is_not_one_run_is_refused(self):
         conn = self.make(producer=True)
@@ -1508,6 +1596,26 @@ class WritePathTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     conn._get_or_build_state_sessions("engine")
                 self.assertEqual(conn._built_state_sessions, {})
+
+    def test_a_replayssm_mismatch_names_the_record_tensor(self):
+        conn = self.stateful_peer(
+            self.make(producer=True),
+            state_slot_bytes={"kda.k": 24, "kda.v": 128, "kda.replay_k": 64},
+            state_descs={"kda.k": b"k-theirs", "kda.v": b"v-theirs"},
+        )
+        with self.assertRaises(ValueError) as caught:
+            conn._get_or_build_state_sessions("engine")
+        self.assertIn(
+            "kda.replay_k: ours None B/slot, theirs 64", str(caught.exception)
+        )
+        # The operator sees the message: it names every knob that sizes a slot.
+        for knob in (
+            "--num-speculative-tokens",
+            "model dtype",
+            "ATOM_REPLAYSSM_CACHE_LEN",
+            "ATOM_GDN_SSM_DTYPE",
+        ):
+            self.assertIn(knob, str(caught.exception))
 
     def test_state_sessions_refuse_our_own_descriptors(self):
         conn = self.stateful_peer(
