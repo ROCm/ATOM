@@ -9,7 +9,6 @@ on fresh values. No timing or full serving accuracy claim is made here.
 import json
 import os
 import types
-from pathlib import Path
 
 import pytest
 import torch

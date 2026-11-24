@@ -47,6 +47,7 @@ def _extract(class_name: str, method: str):
         "tracing": SimpleNamespace(shutdown=lambda: None),
         "time": SimpleNamespace(monotonic=lambda: 0.0, sleep=lambda _: None),
         "HELD_POLL_S": 0.0,
+        "yield_gil": lambda: None,
     }
     exec(  # noqa: S102 - execute only AST nodes from this repository's source.
         compile(ast.Module([func], []), str(ENGINE_CORE), "exec"), scope

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """V4.1's router GEMV for decode: bf16 x [T, 5120] times the gate weight
 [384, 5120] -> bf16 logits, T <= 16, in one fixed summation order.
 
@@ -60,7 +61,7 @@ def router_tile(x, w, task, part, s, lane, wave, red):
     router_tile_mfma(wvs, xvs, lane, wave, red)
 
 
-def _k0s(part, lane, wave):
+def router_k_offsets(part, lane, wave):
     """The K offsets of this lane's loads in part ``part`` (8 bf16 each)."""
     per_wave = HIDDEN // 32 // WAVES // PARTS
     assert per_wave * 32 * WAVES * PARTS == HIDDEN
@@ -85,7 +86,7 @@ def router_weight_loads(w, task, part, lane, wave, w_cm=0):
                 cache_modifier=w_cm,
             )
         )
-        for k0 in _k0s(part, lane, wave)
+        for k0 in router_k_offsets(part, lane, wave)
     ]
 
 
@@ -106,7 +107,7 @@ def router_x_loads(x, part, s, lane, wave, x_cm=0, t0=0):
                 cache_modifier=x_cm,
             )
         )
-        for k0 in _k0s(part, lane, wave)
+        for k0 in router_k_offsets(part, lane, wave)
     ]
 
 

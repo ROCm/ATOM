@@ -78,11 +78,10 @@ def fake_pin(monkeypatch):
     """`pin_rows` as copies into fresh host memory, weakly kept in `pinned`;
     `fail_at` refuses one shard (by its first row), as a full page-locked pool
     would."""
-    state = SimpleNamespace(calls=0, fail_at=None, copy=[], pinned=[])
+    state = SimpleNamespace(calls=0, fail_at=None, pinned=[])
 
-    def pin_rows(sources, copy=False):
+    def pin_rows(sources):
         state.calls += 1
-        state.copy.append(copy)
         if state.fail_at is not None and state.calls == state.fail_at:
             return None
         pinned = tuple(s.clone() for s in sources)
@@ -121,7 +120,7 @@ def test_shard_addresses_find_every_row(fake_pin, dtype):
     host = _host(dtype=dtype)
     _load(table, host)
     bases = host.shard_bases(NUM_SHARDS)
-    assert host.on_host and fake_pin.copy == [True] * NUM_SHARDS
+    assert host.on_host and fake_pin.calls == NUM_SHARDS
     assert host.pinned_bytes == table.nbytes
     ids = _probe_ids(TABLE_ROWS)
     assert _bitwise_equal(_follow(bases, ids, 0, TABLE_ROWS, dtype), table[ids])
@@ -628,7 +627,7 @@ def _device_host(table, mode, monkeypatch, tmp_path, start=0, end=None):
     """`PleHostTable` loaded with the real page-locking in `mode`."""
     end = table.shape[0] if end is None else end
     if mode == "hbm":
-        monkeypatch.setattr(host_memory, "pin_rows", lambda sources, copy=None: None)
+        monkeypatch.setattr(host_memory, "pin_rows", lambda sources: None)
     host = _host(start, end, table.dtype, "cuda")
     _load(table, host, start, end, _checkpoint_shards(table, tmp_path))
     bases = host.shard_bases(NUM_SHARDS).cuda()
@@ -818,7 +817,7 @@ def test_released_weights_free_the_hbm_fallback(ngram_layer, monkeypatch):
     """A refused page-lock leaves the table in HBM as the module's `weight`:
     releasing the weights frees it, and after resuming and syncing the
     weights the lookups read the new allocation."""
-    monkeypatch.setattr(host_memory, "pin_rows", lambda sources, copy=None: None)
+    monkeypatch.setattr(host_memory, "pin_rows", lambda sources: None)
     host_layer, hbm_layer = ngram_layer(True), ngram_layer(False)
     table = _layer_table(host_layer)
     for layer in (host_layer, hbm_layer):
@@ -937,7 +936,7 @@ def test_an_fp8_table_in_hbm_syncs_the_ranks_rows_and_refuses_bf16_rows(
 
     group = SimpleNamespace(world_size=tp, rank_in_group=tp - 1)
     monkeypatch.setattr(ple_layer, "get_tp_group", lambda: group)
-    monkeypatch.setattr(host_memory, "pin_rows", lambda sources, copy=None: None)
+    monkeypatch.setattr(host_memory, "pin_rows", lambda sources: None)
     config = SimpleNamespace(**vars(_NGRAM_CONFIG), ple_embedding_dtype="float8_e4m3fn")
     layer = ngram_layer(uva, config)
     embedding = layer.ngram_embedding

@@ -19,6 +19,7 @@ from atom.model_engine.engine_core import (
     HELD_POLL_S,
     EngineCore,
     publish_idle_state_work,
+    yield_gil,
 )
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.observability import tracing
@@ -105,9 +106,7 @@ class PPEngineCoreProc(EngineCore):
                 else:
                     if self.has_pending_kv_work():
                         self._run_then_publish_kv_events(self._advance_idle_kv_transfer)
-                    # Block, don't spin: the output thread needs the GIL to
-                    # send the last step's output (see `IDLE_WAIT_S`).
-                    self._wait_for_work()
+                    yield_gil()
         finally:
             self._drain_kv_work_at_exit()
             try:

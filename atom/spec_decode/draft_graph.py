@@ -20,33 +20,21 @@ if TYPE_CHECKING:
     from atom.config import Config
 
 
-_OUTSIDE_POOL = "_atom_outside_graph_pool"
-
-
 def outside_pool(tensor: torch.Tensor) -> torch.Tensor:
-    """Mark a pass's output as storage it owns outside the graph pool, so a
-    replay hands it back uncopied (`_owned`). Only for storage allocated before
-    the capture that nothing but the pass's own next replay rewrites."""
-    setattr(tensor, _OUTSIDE_POOL, True)
+    """Kept for callers that mark a pass's own storage: the graph knows
+    which outputs its pool allocated (``ReqGraph.allocated``), so a mark
+    changes nothing."""
     return tensor
 
 
-def _owned(value: Any, staged: tuple[torch.Tensor, ...] = ()) -> Any:
-    """A copy the graph pool cannot re-issue.
-
-    Outputs that alias declared staged inputs, or that the pass marked as its
-    own storage (`outside_pool`), already live outside the graph pool and can
-    be handed back directly. Clone every other tensor because the pool may
-    re-issue its storage on a later replay.
-    """
+def _owned(value: Any, clones: Any) -> Any:
+    """``value`` with every tensor ``clones`` marks (``ReqGraph.allocated``:
+    in the graph pool) cloned out of it; the rest -- a staged input, a buffer
+    the model owns -- handed back as they are, as the eager pass hands them."""
     if isinstance(value, torch.Tensor):
-        if getattr(value, _OUTSIDE_POOL, False) or any(
-            value.data_ptr() == tensor.data_ptr() for tensor in staged
-        ):
-            return value
-        return value.clone()
+        return value.clone() if clones else value
     if isinstance(value, tuple):
-        return tuple(_owned(v, staged) for v in value)
+        return tuple(_owned(v, c) for v, c in zip(value, clones, strict=True))
     return value
 
 
@@ -299,15 +287,17 @@ class DraftGraph:
         What leaves here is a VALUE. A replay hands back the tensors the
         capture allocated, and the pool re-issues those addresses to sizes
         captured later -- a reference does not hold them the way the eager
-        allocator's does. Only ``capture_epilogue`` can put a survivor in
-        there; the eager path allocates normally and needs no copy.
+        allocator's does: those it clones, as the recording found them
+        (``ReqGraph.allocated``); an output in a buffer the model owns is handed back as
+        the eager pass hands it. Only ``capture_epilogue`` can put a survivor
+        in there; the eager path allocates normally and needs no copy.
         """
         if running_bs not in self._graph:
             out = self._to_capture(running_bs, **staged)
         else:
             out = self._graph.replay(key=running_bs)
             if self.capture_epilogue:
-                out = _owned(out, tuple(staged.values()))
+                out = _owned(out, self._graph.allocated(running_bs, out))
         return (
             out
             if self.capture_epilogue
@@ -335,6 +325,9 @@ class DraftGraph:
         self._forward_and_epilogue(running_bs, **staged)
         if not self.will_capture:
             return
-        self._graph.record(
+        out = self._graph.record(
             lambda: self._to_capture(running_bs, **staged), key=running_bs
         )
+        if self.capture_epilogue:
+            # which outputs a replay copies, worked out here, not mid-serving
+            self._graph.allocated(running_bs, out)
