@@ -184,6 +184,11 @@ class ConnectorSourceTest(unittest.TestCase):
         # The listener thread must not touch the RDMA engine.
         self.assertIn("self._write_requests.put(", body)
         self.assertNotIn("_write_blocks", body)
+        # ATOM_MORIIO_WRITE_THREAD: each request wakes the push thread.
+        self.assertLess(
+            body.index("self._write_requests.put("),
+            body.index("self._push_wakeup.set()"),
+        )
 
     def test_a_bad_write_frame_cannot_kill_the_listener(self):
         body = self.segment("_handshake_listener")
@@ -268,7 +273,13 @@ class ConnectorSourceTest(unittest.TestCase):
         self.assertNotIn("os.environ", self.source)
         defined = (ROOT / "atom/utils/envs.py").read_text()
         documented = (ROOT / "docs/environment_variables.md").read_text()
-        for suffix in ("MODE", "HANDSHAKE_TIMEOUT_S", "WRITE_TIMEOUT_S", "VERIFY"):
+        for suffix in (
+            "MODE",
+            "HANDSHAKE_TIMEOUT_S",
+            "WRITE_TIMEOUT_S",
+            "VERIFY",
+            "WRITE_THREAD",
+        ):
             name = f"ATOM_MORIIO_{suffix}"
             self.assertIn(f"envs.{name}", self.source)
             self.assertIn(f'"{name}"', defined)
@@ -669,6 +680,9 @@ class WritePathTest(unittest.TestCase):
         conn._write_reports_expected = {}
         conn._write_report_counts = {}
         conn._stage_digests = {}
+        conn._push_wakeup = threading.Event()
+        conn._push_stop = threading.Event()
+        conn._push_error = None
         # The prefill of the transfer push_request asks for has finished.
         prefilled = types.SimpleNamespace(query=lambda: True)
         conn._kv_ready_events = {9: prefilled}

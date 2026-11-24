@@ -160,6 +160,12 @@ class MoRIIOConnector(KVConnectorBase):
     pp_size = 1
     pp_rank = 0
     _stage_layers: tuple[int, int | None] = (0, None)
+    # ATOM_MORIIO_WRITE_THREAD (producer): the thread serving pushes, None
+    # when get_finished serves them; how long it sleeps between passes while
+    # a push waits or is in flight, and at most while idle.
+    _push_thread: threading.Thread | None = None
+    _PUSH_POLL_S = 1e-4
+    _PUSH_IDLE_WAIT_S = 0.1
     # Finished prefills whose ready event aged out, remembered up to this many.
     _KV_READY_EXPIRED_MAX = 1 << 16
 
@@ -357,6 +363,12 @@ class MoRIIOConnector(KVConnectorBase):
         # rank at a smaller TP (a TP1 PP stage) serves several
         # (`_consumers_per_push`).
         self._pushes_done: dict[int, int] = {}
+        # ATOM_MORIIO_WRITE_THREAD: set by the listener on each WRITE_REQ; the
+        # push thread's stop flag; the exception that stopped it, raised on
+        # the worker thread by the next get_finished.
+        self._push_wakeup = threading.Event()
+        self._push_stop = threading.Event()
+        self._push_error: BaseException | None = None
         # When each finished prefill's KV writes are done on the GPU, recorded
         # by the runner after the forward of its final chunk. A push must not
         # read its source blocks before then. The consumer asks once the head
@@ -747,6 +759,77 @@ class MoRIIOConnector(KVConnectorBase):
             name="moriio-handshake-listener",
         )
         self._handshake_listener_thread.start()
+        # Whatever this producer's own moriio_mode: the consumer picks it.
+        if self.is_producer and envs.ATOM_MORIIO_WRITE_THREAD:
+            self._start_push_thread()
+
+    def _start_push_thread(self) -> None:
+        """ATOM_MORIIO_WRITE_THREAD: serve pushes on their own thread.
+
+        From here on that thread is the only caller of
+        `_service_write_requests` and so the only one to touch the push
+        bookkeeping, post a push or report one; get_finished only drains
+        ``done_sending``, which the thread fills once a push has settled or,
+        when the consumers release the source (`_released_by_consumers`: PP,
+        or one rank feeding several), the listener does on the last RELEASE.
+        Either way the source blocks go back at a step after every push from
+        them landed. Under PP each stage's connector runs a thread of its own.
+        """
+        import atexit
+
+        import torch
+
+        # mori launches the fabric copy on the calling thread's device.
+        device = torch.cuda.current_device() if torch.cuda.is_available() else None
+        self._push_thread = threading.Thread(
+            target=self._push_loop,
+            args=(device,),
+            daemon=True,
+            name="moriio-push",
+        )
+        self._push_thread.start()
+        atexit.register(self.stop_push_thread)
+        logger.info("MoRIIO: pushes are served on their own thread")
+
+    def stop_push_thread(self, timeout: float = 5.0) -> None:
+        """Stop the push thread after its current pass. Pushes still queued
+        are left to the consumer's deadline and hold."""
+        thread = self._push_thread
+        if thread is None:
+            return
+        self._push_stop.set()
+        self._push_wakeup.set()
+        thread.join(timeout)
+        if thread.is_alive():
+            logger.warning("MoRIIO: the push thread did not stop in %.0fs", timeout)
+
+    def _push_loop(self, device: int | None) -> None:
+        """Serve pushes as WRITE_REQs arrive and report each as it lands.
+
+        Rather than at the engine step that next reaches get_finished: a
+        WRITE_REQ waits up to a step to be taken up there, and a landed push
+        up to another to be reported to the consumer. The KV-ready event still
+        gates every push (`_source_ready`). An exception stops the thread and
+        is raised on the worker thread by get_finished, as it would have been
+        from the step.
+        """
+        if device is not None:
+            import torch
+
+            torch.cuda.set_device(device)
+        try:
+            while not self._push_stop.is_set():
+                if not (self._pending_writes or self._sending_writes):
+                    self._push_wakeup.wait(self._PUSH_IDLE_WAIT_S)
+                # Cleared before the pass, so a WRITE_REQ queued during it is
+                # served by the next pass rather than after the idle wait.
+                self._push_wakeup.clear()
+                self._service_write_requests()
+                if self._pending_writes or self._sending_writes:
+                    self._push_stop.wait(self._PUSH_POLL_S)
+        except Exception as error:
+            logger.exception("MoRIIO: the push thread failed")
+            self._push_error = error
 
     def _register_regions(self, transfer_tensors: Any) -> MoRIIOAgentMetadata:
         """Register a backend's PAGE and full-SLOT regions for RDMA.
@@ -1904,7 +1987,9 @@ class MoRIIOConnector(KVConnectorBase):
         ``wait_ms`` from there to posting the batch (the handshake and the
         prefill's KV-ready event), ``write_ms`` from posting to the step that
         saw it settle. Pushes are served from ``get_finished``, once per engine
-        step, so the first and the last include up to a step each.
+        step, so the first and the last include up to a step each; with
+        ATOM_MORIIO_WRITE_THREAD, by a thread that polls every
+        ``_PUSH_POLL_S``.
         """
         posted, nbytes, blocks, segments = request["_page_stats"]
         accepted = request.get("_accepted_at", posted)
@@ -2454,7 +2539,8 @@ class MoRIIOConnector(KVConnectorBase):
 
         Runs on the worker thread from ``get_finished``, which the engine keeps
         calling while finished prefills hold deferred blocks, so a request is
-        served even when no batch is running.
+        served even when no batch is running; with ATOM_MORIIO_WRITE_THREAD,
+        on the push thread only (`_push_loop`).
         """
         while True:
             try:
@@ -2897,6 +2983,7 @@ class MoRIIOConnector(KVConnectorBase):
                             # For ATOM_MORIIO_TRANSFER_STATS' queue_ms.
                             request["_received_at"] = time.monotonic()
                         self._write_requests.put(request)
+                        self._push_wakeup.set()
                     except Exception:
                         logger.exception("Dropping undecodable WRITE_REQ")
 
@@ -3170,7 +3257,12 @@ class MoRIIOConnector(KVConnectorBase):
         if self.is_producer:
             # Before done_sending is read below, so a push that finishes this
             # step releases its blocks this step.
-            self._service_write_requests()
+            if self._push_thread is None:
+                self._service_write_requests()
+            elif self._push_error is not None:
+                raise RuntimeError(
+                    "MoRIIO: the push thread failed"
+                ) from self._push_error
         else:
             if self._gated_writes:
                 self._request_gated_writes()
@@ -3258,8 +3350,12 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
         self.host_ip = get_ip()
         # A producer's pushes are served from the workers' `get_finished`, so
         # a downstream PP stage polls it at the idle cadence rather than every
-        # 100 ms (`PPEngineCoreProc._downstream_busy_loop`).
-        self.pushes_from_worker_poll = self.is_producer
+        # 100 ms (`PPEngineCoreProc._downstream_busy_loop`); with
+        # ATOM_MORIIO_WRITE_THREAD each stage's push thread serves them, and
+        # under PP a stage's source is freed by stage 0's RELEASE, not its poll.
+        self.pushes_from_worker_poll = (
+            self.is_producer and not envs.ATOM_MORIIO_WRITE_THREAD
+        )
 
         # Pending receive requests: req_id -> (Sequence, block_table, state slot)
         self._reqs_need_recv: dict[ReqId, tuple[Any, list[int], int]] = {}
