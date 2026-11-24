@@ -10,8 +10,15 @@
 
 ```bash
 python -m atom.examples.simple_inference --model /models/GLM-5.3-Flash -tp 4 \
-    --kv_cache_dtype bf16 --max-tokens 64
+    --kv_cache_dtype fp8 --max-tokens 64
 ```
+
+Serve with fp8 KV. With bf16 KV, aiter's MLA decode misreads KV stored 4 GiB
+or more into one layer's cache ([#3120](https://github.com/ROCm/ATOM/issues/3120)).
+At serving sizes each MLA layer's bf16 cache is about 15 GB, so a server that runs
+long enough, or keeps blocks cached for prefix reuse, decodes from that range.
+Replies stay fluent but wrong. fp8 KV reads correctly past 4 GiB, and the PR
+accuracy gate runs fp8 (§7).
 
 Needs an aiter with `chunk_kimi_delta_attn` and `mla_decode_fwd(causal=...)` —
 `rocm/atom-dev:nightly_202608270231` or newer. Earlier images fail with
@@ -348,9 +355,11 @@ throughput from 409.96 to 559.98 tok/s (+36.59%).
 | 3-shot (dense MLA) | 2048 | **0.9682** | **0.9689** |
 | 16-shot (pooled k-pool) | 8192 | **0.9659** | **0.9666** |
 
-Guarded by the `GLM-5.3-Flash` and `GLM-5.3-Flash-kpool-16shot` entries in
-`.github/benchmark/models_accuracy.json` (threshold 0.94). SGLang publishes
-0.9704–0.9757 for this model, so the port is in line.
+The rows above are bf16 KV. The guard is the `GLM-5.3-Flash-kpool-16shot`
+entry in `.github/benchmark/models_accuracy.json` (threshold 0.94). It runs the
+16-shot row with fp8 KV (see the note under the launch command) and scored
+flexible-extract 0.9682 and 0.9697 over two runs. SGLang publishes 0.9704–0.9757
+for this model, so the port is in line.
 
 Post-review validation on 2026-09-01, after merging current `main` and enabling
 level-3 compilation, produced **0.9682 / 0.9682**. The final ATOM-style refactor
