@@ -535,6 +535,27 @@ def _parse_env(raw: Any, is_v2: bool) -> dict[str, str]:
     return out
 
 
+_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def _aiter_names(raw: Any, is_v2: bool) -> tuple[str, ...]:
+    """The AITER providers, in priority order. A v2 recipe may group them by
+    the AITER op they serve (``{op: [providers]}``): the order is op by op,
+    each op's list in order, a provider named twice kept at its first place
+    (AITER's enable list is one global order)."""
+    if isinstance(raw, Mapping):
+        if not is_v2:
+            raise RecipeRefused("recipe-schema", "aiter by op requires schema 2")
+        ordered: dict[str, None] = {}
+        for op, names in raw.items():
+            if not isinstance(op, str) or not op:
+                raise RecipeRefused("recipe-schema", "aiter ops must be names")
+            for name in _names(names, f"aiter.{op}"):
+                ordered.setdefault(name, None)
+        return tuple(ordered)
+    return _names(raw, "aiter") if raw else ()
+
+
 def _parse(document: Mapping[str, Any], *, model_arch: str | None) -> dict[str, Any]:
     """One recipe document (v1 or v2), checked against this ATOM's contracts."""
     if not isinstance(document, Mapping):
@@ -582,6 +603,14 @@ def _parse(document: Mapping[str, Any], *, model_arch: str | None) -> dict[str, 
         raise RecipeRefused(
             "recipe-pin-mismatch", f"atom_hook_api {api} vs {plugin_host.HOOK_API}"
         )
+    pins = requires.get("plugins", {})
+    if not isinstance(pins, Mapping) or not all(
+        isinstance(k, str) and isinstance(v, str) and _DIGEST_RE.match(v)
+        for k, v in pins.items()
+    ):
+        raise RecipeRefused(
+            "recipe-schema", "requires.plugins maps provider -> 'sha256:<64 hex>'"
+        )
     for seam, contract in dict(requires.get("seams", {})).items():
         spec = plugin_host.SEAMS.get(seam)
         if spec is None:
@@ -615,9 +644,7 @@ def _parse(document: Mapping[str, Any], *, model_arch: str | None) -> dict[str, 
             _names(raw.get("serves", []), f"{name}.serves")
         plugins[name] = raw
 
-    extra_aiter = (
-        _names(document.get("aiter", ()), "aiter") if "aiter" in document else ()
-    )
+    extra_aiter = _aiter_names(document.get("aiter", ()), is_v2)
     for name in extra_aiter:
         plugins.setdefault(name, {"name": name, "kind": "aiter", "serves": []})
 

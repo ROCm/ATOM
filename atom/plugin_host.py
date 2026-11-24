@@ -560,6 +560,7 @@ _last: Decision | None = None
 _hotplug = False  # bind every seam; a plan may be installed after the build
 _dev = False  # developer mode: re-import plugin code from disk on a reload
 _dev_roots: tuple[str, ...] = ()  # resolved allowlist of plugin source trees
+_aiter_applied: tuple[str, ...] | None = None  # the enable list AITER last got
 
 
 def api_satisfies(requires: str, api: int = HOOK_API) -> bool:
@@ -1369,7 +1370,7 @@ def _prepare_providers(plan: Any, device: Any) -> tuple[list[str], dict[str, Any
     for name in plan.providers:
         entry_point = available.get(name)
         if entry_point is None:
-            continue  # an AITER-only provider has no Python module to prepare
+            continue  # an AITER-only provider: prepared below
         try:
             module = _entry_point_module(entry_point)
         except Exception as error:
@@ -1395,7 +1396,74 @@ def _prepare_providers(plan: Any, device: Any) -> tuple[list[str], dict[str, Any
             device,
             native[name],
         )
+    # The plan's AITER providers: their ``prepare(device)`` (an AITER Provider
+    # builds and warms its kernels there), before any capture, like the rest.
+    aiter_points = _aiter_entry_points()
+    for name in getattr(plan, "aiter", ()):
+        if name in prepared or name not in aiter_points:
+            continue
+        try:
+            provider = aiter_points[name].load()
+            prepare = getattr(provider, "prepare", None)
+            result = prepare(device) if callable(prepare) else None
+        except Exception as error:
+            raise RuntimeError(
+                f"AITER provider {name!r} prepare(device={device!r}) failed: "
+                f"{type(error).__name__}: {error}"
+            ) from error
+        if callable(prepare):
+            prepared.append(name)
+            native[name] = _jsonable(result)
     return prepared, native
+
+
+def _aiter_entry_points() -> dict[str, metadata.EntryPoint]:
+    return {ep.name: ep for ep in metadata.entry_points(group="aiter.plugins")}
+
+
+# -- plugin pins -------------------------------------------------------------
+
+
+def provider_code_roots(name: str) -> tuple[Path, ...]:
+    """The source trees a provider's code digest covers: its entry point
+    module's package directory, plus the absolute paths it lists in an optional
+    module-level ``PLUGIN_CODE_ROOTS`` (e.g. its kernel sources)."""
+    points = {**_aiter_entry_points(), **_entry_points()}
+    if name not in points:
+        raise LookupError(f"plugin provider {name!r} is not installed")
+    module = _entry_point_module(points[name])
+    path = None if module is None else _module_file(module)
+    if path is None:
+        raise LookupError(f"plugin provider {name!r} has no source on disk")
+    roots = [path.parent]
+    for extra in getattr(module, "PLUGIN_CODE_ROOTS", ()) or ():
+        roots.append(Path(extra))
+    return tuple(dict.fromkeys(r.resolve() for r in roots))
+
+
+def provider_digest(name: str) -> str:
+    """``sha256:`` digest of a provider's code (``provider_code_roots``, the
+    ``plugin_code_digest`` layout): what a recipe's ``requires.plugins`` pins."""
+    return plugin_code_digest(str(r) for r in provider_code_roots(name))
+
+
+def _check_plugin_pins(plan) -> None:
+    """A recipe's ``requires.plugins``: each pinned provider's code must hash
+    to the pin, else the start is refused (no ATOM or AITER version is pinned)."""
+    from atom import plugin_recipe
+
+    pins = {} if plan is None else dict(plan.requires.get("plugins", {}) or {})
+    for name, expected in pins.items():
+        try:
+            got = provider_digest(name)
+        except (LookupError, OSError, ValueError) as error:
+            raise plugin_recipe.RecipeRefused(
+                "recipe-plugin-drift", f"{name}: {error}"
+            ) from error
+        if got != expected:
+            raise plugin_recipe.RecipeRefused(
+                "recipe-plugin-drift", f"{name}: code {got} != pinned {expected}"
+            )
 
 
 def _check_provider_roots(plan: Any, roots: tuple[Path, ...]) -> dict[str, Path]:
@@ -1587,8 +1655,9 @@ def configure(
         if _hotplug:
             # Bind the seams no plan owns yet: a later one may claim them.
             _owned = _owned | _HOTPLUG_BINDS
-        set_arm(arm if _plan is not None else "plugin")
-    _configure_aiter(() if kill or plan is None else plan.aiter)
+        set_arm(arm if _plan is not None else "plugin", sync_aiter=False)
+    _check_plugin_pins(_plan)
+    _apply_aiter(force=True)
     if plan is not None:
         logger.info("plugin_host: %s", status())
 
@@ -1617,10 +1686,11 @@ def _route_tables(plan, shorthand: bool) -> dict[Any, dict[str, tuple[_Route, ..
     return tables
 
 
-def set_arm(arm: str) -> None:
+def set_arm(arm: str, *, sync_aiter: bool = True) -> None:
     """Which planned providers serve: ``plugin`` (all), ``native`` (none, the
     plugin topology kept), ``identity`` (decide as plugin, run native) or a
-    recipe arm. Only the route table changes; binds and opaque ops stay."""
+    recipe arm. Only the route table changes; binds and opaque ops stay. The
+    AITER providers of the plan follow the same arm (``_aiter_for_arm``)."""
     global _arm, _active
     with _lock:
         arms = _plan.arms if _plan is not None else {}
@@ -1637,6 +1707,34 @@ def set_arm(arm: str) -> None:
         _set_module_arm(arm, allowed)
         _arm = arm
         _cache.clear()
+    if sync_aiter:
+        _apply_aiter(force=False)
+
+
+def _aiter_for_arm() -> tuple[str, ...]:
+    """The plan's AITER providers the arm lets serve: all on ``plugin`` (and on
+    ``identity``, which AITER has no form of: its providers keep serving), none
+    on ``native``, a named arm's members otherwise."""
+    if _kill_switch or _plan is None:
+        return ()
+    names = tuple(_plan.aiter)
+    if _arm in ("plugin", "identity"):
+        return names
+    if _arm == "native":
+        return ()
+    members = set(_plan.arms.get(_arm, ()))
+    return tuple(n for n in names if n in members)
+
+
+def _apply_aiter(*, force: bool) -> None:
+    """Hand AITER the arm's enable list (``aiter.plugin.configure``): always on
+    ``configure``, on an arm change only when the list changed."""
+    global _aiter_applied
+    names = _aiter_for_arm()
+    if not force and names == _aiter_applied:
+        return
+    _configure_aiter(names)
+    _aiter_applied = names
 
 
 # -- hot-plug -----------------------------------------------------------------
@@ -2021,6 +2119,26 @@ def has_capture_owner(seam: str, rows: int, *, explicit=False) -> bool:
     """Check the installed plan, even in its native arm, to keep A/B topology."""
     table = _tables.get(rows, {} if explicit else _tables.get("any", {}))
     return any(route.graph == "capture_safe" for route in table.get(seam, ()))
+
+
+@dataclass(frozen=True)
+class Context:
+    """Where a call runs, for code a seam's capability does not reach (an
+    AITER provider, a module owner's inner kernels): inside a CUDA-graph
+    capture or not, the capture bucket (padded rows), and the rows of the
+    step that are real, as a device tensor a captured kernel reads."""
+
+    captured: bool
+    bucket: int | None
+    valid_rows: torch.Tensor | None
+
+
+def context(rows: int | None = None) -> Context:
+    """The execution context of the current forward (frozen HOOK_API surface).
+    ``rows``: the padded rows of the caller's tensor, for ``valid_rows``."""
+    captured, bucket = _graph_state()
+    padded = rows if rows is not None else bucket
+    return Context(captured, bucket, None if padded is None else _valid_rows(padded))
 
 
 def _graph_state() -> tuple[bool, int | None]:
@@ -2483,7 +2601,20 @@ def status() -> dict[str, Any]:
         },
         "modules_installed": [router.path for router in _installed],
         "plugin_model": plugin_model_active(),
+        "aiter": {"enabled": list(_aiter_applied or ()), "status": _aiter_status()},
     }
+
+
+def _aiter_status() -> Any:
+    try:
+        from aiter import plugin as aiter_plugin
+    except Exception:  # noqa: BLE001 -- absent or broken
+        return None
+    status_fn = getattr(aiter_plugin, "status", None)
+    try:
+        return _jsonable(status_fn()) if callable(status_fn) else None
+    except Exception as error:  # noqa: BLE001 -- status is best effort
+        return f"error: {type(error).__name__}: {error}"
 
 
 def overhead_probe(
@@ -2531,7 +2662,9 @@ def _reset_for_testing() -> None:
         _kill_switch, _strict, _on_decline = False, False, "native"
         _hotplug = False
         _dev, _dev_roots = False, ()
-        set_arm("plugin")
+        set_arm("plugin", sync_aiter=False)
+        global _aiter_applied
+        _aiter_applied = None
 
 
 def _configure_aiter(names: Iterable[str]) -> bool:
