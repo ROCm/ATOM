@@ -4,7 +4,8 @@
 //! selected for that session. A new session goes to the worker holding the
 //! fewest live sessions (load breaks ties); requests without a session ID use
 //! minimum-load balancing. A stale mapping is replaced when its worker is no
-//! longer healthy or the session has been idle for too long.
+//! longer healthy or a candidate (another DP rank under idx2idx), or the session
+//! has been idle for too long.
 
 use std::{
     collections::HashMap,
@@ -225,7 +226,8 @@ impl LoadBalancingPolicy for DpStickyPolicy {
             return;
         };
         let identity = Self::worker_identity(worker);
-        // Without a reassignment, only rank mapping can move a pinned session.
+        // Without a reassignment, rank mapping moved the pinned session, or another in-flight
+        // request of the session took the reassignment.
         let reason = assignment
             .reassigned
             .take()

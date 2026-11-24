@@ -318,7 +318,8 @@ pub struct CliArgs {
     )]
     pub encode_policy: Option<String>,
 
-    /// ATOM-only policy for mapping selected prefill DP ranks to decode DP ranks
+    /// ATOM-only policy for mapping selected prefill DP ranks to decode DP ranks; idx2idx
+    /// selects decode first and prefill among the workers on its rank
     #[arg(long, default_value = "none", value_parser = ["none", "idx2idx"], help_heading = "PD Disaggregation")]
     pub atom_pd_rank_mapping_policy: String,
 
