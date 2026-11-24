@@ -49,8 +49,12 @@ def _randn(*shape, dtype=torch.bfloat16, offset=0, scale=1.0, seed=0, device="cu
     numel = 1
     for size in shape:
         numel *= size
-    flat = torch.randn(numel + offset, generator=gen, device=device)
-    return (flat[offset:].view(shape) * scale).to(dtype)
+    flat = (torch.randn(numel + offset, generator=gen, device=device) * scale).to(dtype)
+    # Slice after allocating operations so offset cases stay misaligned.
+    out = flat[offset:].view(shape)
+    assert out.storage_offset() == offset
+    assert out.data_ptr() % 16 == (offset * out.element_size()) % 16
+    return out
 
 
 # --- GDN: q/k L2 norm, causal conv1d, gating -------------------------------
