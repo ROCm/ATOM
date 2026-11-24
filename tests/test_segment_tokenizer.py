@@ -171,7 +171,7 @@ def test_eviction_by_another_request_mid_encode_is_harmless(tok, monkeypatch):
     assert seg._encode_cached(longer) == tok.encode(longer)
 
 
-def _normalized_tokenizer(normalizer):
+def _normalized_tokenizer(normalizer, normalized_token=True):
     rng = random.Random(7)
     backend = Tokenizer(models.BPE(unk_token="[UNK]"))
     if normalizer is not None:
@@ -182,7 +182,8 @@ def _normalized_tokenizer(normalizer):
         trainers.BpeTrainer(vocab_size=280, special_tokens=["[UNK]"]),
     )
     backend.add_special_tokens([AddedToken("<|User|>", special=True)])
-    backend.add_tokens([AddedToken("\u0301", normalized=True)])
+    if normalized_token:
+        backend.add_tokens([AddedToken("\u0301", normalized=True)])
     return transformers.PreTrainedTokenizerFast(tokenizer_object=backend)
 
 
@@ -200,6 +201,26 @@ def test_normalized_added_tokens_need_an_identity_normalizer():
     seg._verified = seg_mod._VERIFY_FIRST
     prompt = "<|User|>a\u0301 caf\u0301e" * 3
     assert seg._encode_cached(prompt) == tok.encode(prompt)
+
+
+def test_any_normalizer_is_exact_without_normalized_added_tokens():
+    """The backend normalizes each piece between non-normalized added tokens
+    on its own (MiniMax-M3.1: NFC), so the pieces encode the same alone."""
+    from tokenizers import normalizers
+
+    seg = SegmentTokenizer.maybe_create(
+        _normalized_tokenizer(normalizers.NFC(), normalized_token=False), 10**6
+    )
+    assert seg is not None
+    tok = seg._tokenizer
+    seg._verified = seg_mod._VERIFY_FIRST
+    # Composing and singleton-mapped characters on both sides of a token.
+    edge = "e\u0301 \u212a\u2126\u037e a\u0308\u0304 "
+    prompt = "<|User|>" + "alpha beta " * 2000  # past the prefix bucket key
+    for _ in range(6):
+        prompt += f"<|User|>\u0301{edge}alpha {edge}e<|User|>\u0308 beta"
+        assert seg.encode_with_prefix(prompt, 4).token_ids == tok.encode(prompt)
+    assert seg.enabled and seg._stats[4] > 0  # later prompts reused the stored one
 
 
 def test_segments_that_encode_to_nothing_are_not_cached(tok, monkeypatch):
