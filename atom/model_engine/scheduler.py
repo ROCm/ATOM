@@ -769,6 +769,12 @@ class Scheduler:
         # Latency of the last prompt step
         self.last_prompt_latency = 0.0
         self.delay_factor = config.scheduler_delay_factor
+        self._prefill_order = envs.ATOM_PREFILL_ORDER
+        if self._prefill_order not in ("fcfs", "cached_first"):
+            raise ValueError(
+                f"ATOM_PREFILL_ORDER must be fcfs or cached_first, got {self._prefill_order!r}"
+            )
+        self._prefill_order_max_wait_s = envs.ATOM_PREFILL_ORDER_MAX_WAIT_S
 
         # Speculative decoding. A P/D producer is excluded for the same reason
         # `PrefillScheduler` is: it prefills, samples T0 and hands the request
@@ -2091,6 +2097,8 @@ class Scheduler:
         # Reclaim aborted heads even when decode protection vetoes Phase 2.
         while self.waiting and self.waiting[0].status == SequenceStatus.ABORTED:
             self._reject_aborted_waiting(self.waiting.popleft())
+        if self._prefill_order == "cached_first" and len(self.waiting) > 1:
+            self._order_waiting(time.time())
         if self.enable_dynamic_chunking:
             self._record_prefill_supply()
         if self.kv_connector is not None and self.waiting:
@@ -3255,6 +3263,39 @@ class Scheduler:
         seq.offload_joint.load_hash = -1
         seq.offload_joint.boundary_tokens = 0
         seq.offload_joint.boundary_hash = -1
+
+    def _order_waiting(self, now: float) -> None:
+        """ATOM_PREFILL_ORDER=cached_first: reorder ``self.waiting`` in place.
+
+        Aborted requests and offload resumes (they already hold blocks) keep
+        the front, then requests waiting ATOM_PREFILL_ORDER_MAX_WAIT_S or
+        longer in arrival order, then the rest by the fewest prompt tokens left
+        to compute, ties by arrival; a request that does not fit right now goes
+        last, as admission stops at the first refusal. The hit is the memoised
+        exact probe (`can_allocate_memoized`), the one the delayer already asks
+        per tick, or the offload tier's known prefix when that is longer.
+        """
+        bm = self.block_manager
+
+        def key(item: tuple[int, Sequence]) -> tuple[int, int, int]:
+            pos, seq = item
+            if seq.status == SequenceStatus.ABORTED or self._is_offload_prefill_resume(
+                seq
+            ):
+                return (0, 0, pos)
+            if now - seq.arrive_time >= self._prefill_order_max_wait_s:
+                return (1, 0, pos)
+            cached_blocks = bm.can_allocate_memoized(seq)
+            if cached_blocks < 0:
+                return (3, 0, pos)
+            cached = max(
+                cached_blocks * bm.hash_block_size, seq.offload_joint.kv_prefix_tokens
+            )
+            return (2, max(0, seq.num_prompt_tokens - cached), pos)
+
+        ordered = [seq for _, seq in sorted(enumerate(self.waiting), key=key)]
+        self.waiting.clear()
+        self.waiting.extend(ordered)
 
     def _is_offload_prefill_resume(self, seq: Sequence) -> bool:
         """True when offload already owns blocks and should resume suffix prefill.
