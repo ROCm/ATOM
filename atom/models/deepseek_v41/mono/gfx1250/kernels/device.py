@@ -238,6 +238,22 @@ def bar():
     fence_acquire("workgroup")
 
 
+def bar_lds():
+    """(nsw) The main waves' CTA barrier ordering LDS only: s_wait_dscnt 0 (waits for LDS / dscnt only, not for stores:
+    global stores may still be in flight), then the named barrier, then a compiler-only memory clobber (no fence
+    instruction, no workgroup acquire). Only where no global store of this CTA is read by its other waves past it."""
+    llvm.inline_asm(None, [], "s_wait_dscnt 0x0", "~{memory}", has_side_effects=True)
+    if not NB16:
+        _rd.s_barrier_signal(-1)
+        _rd.s_barrier_wait(-1)
+    else:
+        _rd.s_barrier_signal_var(_nbar(NB_MAIN), 0)
+        _rd.s_barrier_wait(1)
+    # (no workgroup acquire fence: the memory legalizer emits s_wait_storecnt_dscnt 0 for it; a compiler-only barrier
+    # keeps the LDS reads below it -- LDS is coherent in the work-group)
+    llvm.inline_asm(None, [], "", "~{memory}", has_side_effects=True)
+
+
 def bar_all():
     """(16-wave CTA) a barrier of all 16 waves (-1: the main waves joined to MB, the helpers to HB, both count)."""
     fence_release("workgroup")

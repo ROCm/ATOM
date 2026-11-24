@@ -112,7 +112,7 @@ def xchg6(recv, rank, p, row, c, t, sm, ws, tag, mid=None):
         got = poll_unit(recv[rank] + roff(p, src, row, u), tag)
         for q in range_constexpr(3):
             hx.lstore(sm + HB + src * (12 * nu) + (u * 3 + q) * 4, got[q])
-    hx.bar()
+    hx.bar_lds()   # (nsw3) LDS only: the pushes need no local drain
 
 
 def _lw(sm, src, q, kind=F32, nw=6):

@@ -586,8 +586,7 @@ def layer_part(E, Ly, part):
             MS.push_row(cdn, ss_, par * 2 + 1, 2 * Ly + 2)
         if b < FS.NOWN:   # (J) the owner's 32 cols of y2 from the 4 ranks' row partials
             MS.recv_owner(dict(t=t, b=b, rank=rank, recv=c["recv"], ytgt=fptr(fp, "y2"), ylds=sm + FLO + Y2L), par * 2 + 1, 2 * Ly + 2, TR)
-        hx.wait_storecnt0()
-        hx.bar()
+        hx.bar_lds()   # (nsw) LDS only: push_row's puts need no local drain (the next publish drains them)
 
         # ---- the attention mHC post of layer Ly + 1 in the 160 owners (-> apflag of Ly + 1); the last layer: xh
         if b < FS.NOWN:
@@ -1004,8 +1003,7 @@ def layer_part(E, Ly, part):
     AS.stage_E4(cwith(c, **v3f, **v3e))   # (wo_a with the head sum in the CTA: no fold hop)
     AS.stage_F3(cwith(c, **v3f, NEF=64))
     AS.tp3(cwith(c, ylds=sm + FLO + Y2L), par * 2, 2 * Ly + 1)   # (the sum -> the owner's FFN post through LDS)
-    hx.wait_storecnt0()
-    hx.bar()
+    hx.bar_lds()   # (nsw) LDS only: the puts to the peers need no local drain (the next publish drains them)
 
     # ---- FFN mHC post in the 160 owners (-> pflag); the router's gate rows issued first; mix partials
     tq6 = hx.opaque_v(fx.thread_idx.x)
@@ -1014,7 +1012,7 @@ def layer_part(E, Ly, part):
     if newA:   # pre / post / comb from this layer's attention-side Sinkhorn
         if tq6 == 0:
             hx.wait_count(lc + i64(ASINK), 1, 15)
-        hx.bar()
+        hx.bar_lds()   # (nsw4) t0's count ends with acquire_se; no storecnt drain here (the tp3 puts' acknowledgements)
     if b < FS.NOWN:
         FS.ffn_post_owner(dict(t=tq6, b=b, w=tq6 // 32, l=tq6 % 32, sm=sm + FLO, ylds=sm + FLO + Y2L,
                                R=fptr(fp, "aRout"), Rout=fptr(fp, "Rout"), x1g=plog(X1F),

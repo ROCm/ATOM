@@ -170,7 +170,7 @@ def markov_once(base, anchors, w1, w2s, ids_out, emb_out, best, cnt, recv, rank,
             got = poll_unit(recv[rank] + roff(k, src, t % NREQ), tag, site=9)
             hx.lstore(sm + LP + t * 8, got[0])
             hx.lstore(sm + LP + t * 8 + 4, got[1])
-        hx.bar()
+        hx.bar_lds()   # (nsw3) LDS only: CTA 0's push and qlog need no local drain (readers: peers by tag, later stages)
         if t < NREQ:
             g = I64MIN()
             for o in range_constexpr(4):

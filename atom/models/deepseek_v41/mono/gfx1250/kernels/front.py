@@ -1203,7 +1203,7 @@ def ffn_post_owner(c, TR):
                 hx.stx_dev(c["xsa"] + i64(r * (H // 32) + b) * 4, acode)   # (i32 codes, as stage_Apub wrote them)
         hx.lstore(sm + 4096 + t * 8, srs)
         hx.lstore(sm + 4096 + t * 8 + 4, x1f * x1f)
-    hx.bar()
+    hx.bar_lds()   # (nsw2) LDS only: the Rout / x1g / x8a / xsa stores' readers are past pflag (drained there)
     # per-row sums of the two squares (rows r < TR: 20 entries each)
     if t < TR:
         a = F32(0.0)

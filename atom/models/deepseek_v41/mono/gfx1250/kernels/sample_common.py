@@ -174,7 +174,7 @@ def xchg_scalar(recv, rank, p, row, c, t, sm, w0, w1, tag):
         got = poll_unit(recv[rank] + roff(p, t, row, 0), tag)
         hx.lstore(sm + HB + t * 8, got[0])
         hx.lstore(sm + HB + t * 8 + 4, got[1])
-    hx.bar()
+    hx.bar_lds()   # (nsw3) LDS only: the pushes need no local drain
 
 
 @ASTRewriter.transform
@@ -202,7 +202,7 @@ def xchg_hist(recv, rank, p, row, c, t, sm, tag, mid=None):
             for k in range_constexpr(3):
                 if u * 3 + k < NB:
                     hx.lstore(sm + HB + (src * NB + u * 3 + k) * 4, got[k])
-    hx.bar()
+    hx.bar_lds()   # (nsw3) LDS only: the pushes need no local drain
     tot = hx.lload(sm + HB + t * 4, F32)
     for o in range_constexpr(1, 4):
         tot = tot + hx.lload(sm + HB + (o * NB + t) * 4, F32)
