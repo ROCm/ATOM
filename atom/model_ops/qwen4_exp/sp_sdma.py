@@ -216,12 +216,23 @@ class _MoriSdma:
 
         self.rank = dist.get_rank(cpu_group)
         self.world = dist.get_world_size(cpu_group)
-        uid = [bytes(Communicator.get_unique_id()) if self.rank == 0 else None]
+        # Rank 0 sends its error with the uid, so every rank leaves the
+        # broadcast and raises alike instead of waiting on a uid never sent.
+        uid, err = None, None
+        if self.rank == 0:
+            try:
+                uid = bytes(Communicator.get_unique_id())
+            except Exception as e:  # noqa: BLE001 - every rank must reach the broadcast
+                err = f"mori get_unique_id failed on rank 0: {e}"
+        msg = [(uid, err)]
         dist.broadcast_object_list(
-            uid, src=dist.get_global_rank(cpu_group, 0), group=cpu_group
+            msg, src=dist.get_global_rank(cpu_group, 0), group=cpu_group
         )
+        uid, err = msg[0]
+        if err is not None:
+            raise RuntimeError(err)
         self._comm = Communicator.init(
-            self.world, self.rank, UniqueId.from_bytes(uid[0]), per_rank_vmm=64 << 20
+            self.world, self.rank, UniqueId.from_bytes(uid), per_rank_vmm=64 << 20
         )
         reqs = CCODevCommRequirements()
         reqs.gda_connection_type = GDA_CONNECTION_NONE
