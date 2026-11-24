@@ -44,6 +44,9 @@ const OPENING: Duration = Duration::from_secs(10);
 /// How often requests look for Sessions whose instance has no registered worker.
 const SWEEP: Duration = Duration::from_secs(1);
 
+/// The prompt bytes a Session may hold unsent; past them a request is refused with 503.
+const UNSENT_BYTES: usize = 256 << 20;
+
 /// The outputs a streamed request may leave unread; past them it fails and is aborted.
 const ROUTE_BUFFER: usize = 4096;
 
@@ -186,6 +189,8 @@ struct Session {
 
 enum Command {
     Submit(Box<pb::RequestSpec>, Vec<u32>),
+    /// A Submit whose prompt waits in `Routes::unsent` under this ticket.
+    Queued(Box<pb::RequestSpec>, u64),
     Abort(u64),
 }
 
@@ -218,6 +223,13 @@ impl Session {
         stream: bool,
     ) -> Result<SessionStream, EngineError> {
         let mut routes = self.routes.lock();
+        let bytes = 4 * prompt.len();
+        if !routes.unsent.is_empty() && routes.unsent_bytes + bytes > routes.unsent_budget {
+            return Err(EngineError::Http {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: "the ATOM Session is not reading the requests sent to it".to_string(),
+            });
+        }
         let seq_id = routes.free_seq_id().ok_or_else(|| EngineError::Http {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: "every seq_id of the ATOM Session is in use".to_string(),
@@ -233,15 +245,20 @@ impl Session {
             cached_tokens: 0,
             ids: Vec::new(),
         };
-        let command = Command::Submit(Box::new(spec), prompt);
+        let ticket = routes.next_ticket;
+        let command = Command::Queued(Box::new(spec), ticket);
         if routes.closed || self.commands.send(command).is_err() {
             return Err(EngineError::Transport(Status::unavailable(
                 "the ATOM Session has ended",
             )));
         }
+        routes.next_ticket += 1;
+        routes.unsent_bytes += bytes;
+        routes.unsent.insert(ticket, prompt);
         routes.open.insert(seq_id, route);
         Ok(SessionStream {
             seq_id,
+            ticket,
             rx,
             session: self.clone(),
         })
@@ -268,7 +285,7 @@ fn run(
     };
     runtime.block_on(async move {
         let started = tokio::select! {
-            started = tokio::time::timeout(bound, start(&url, queued)) => {
+            started = tokio::time::timeout(bound, start(&url, queued, routes.clone())) => {
                 started.unwrap_or_else(|_| Err(EngineError::Transport(Status::deadline_exceeded(
                     format!("ATOM Session: no Ready within {bound:?}"),
                 ))))
@@ -293,12 +310,13 @@ fn run(
 async fn start(
     url: &str,
     queued: mpsc::UnboundedReceiver<Command>,
+    routes: Arc<Mutex<Routes>>,
 ) -> Result<(AtomClient, Streaming<Frames>), EngineError> {
     let client = AtomClient::connect(url)
         .await
         .map_err(|_| EngineError::ConnectionAcquireFailed(url.to_string()))?;
     let mut inbound = client
-        .session(writer(queued))
+        .session(writer(queued, routes))
         .await
         .map_err(EngineError::Transport)?;
     let first = inbound.message().await.map_err(EngineError::Transport)?;
@@ -316,14 +334,22 @@ fn refused(reason: &str) -> EngineError {
 }
 
 /// The writer: what is queued when it runs goes out as SubmitBatches and Aborts in
-/// queue order, so an Abort never goes before its request nor after a later one.
-fn writer(queued: mpsc::UnboundedReceiver<Command>) -> impl Stream<Item = Frames> + Send + 'static {
-    stream::unfold(queued, |mut queued| async move {
-        let mut commands = vec![queued.recv().await?];
-        while let Ok(command) = queued.try_recv() {
-            commands.push(command);
+/// queue order, so an Abort never goes before its request nor after a later one. A
+/// request dropped before its prompt was taken is not sent.
+fn writer(
+    queued: mpsc::UnboundedReceiver<Command>,
+    routes: Arc<Mutex<Routes>>,
+) -> impl Stream<Item = Frames> + Send + 'static {
+    stream::unfold(queued, move |mut queued| {
+        let routes = routes.clone();
+        async move {
+            let mut commands = vec![queued.recv().await?];
+            while let Ok(command) = queued.try_recv() {
+                commands.push(command);
+            }
+            let commands = routes.lock().take_unsent(commands);
+            Some((encode(commands), queued))
         }
-        Some((encode(commands), queued))
     })
     .flat_map(stream::iter)
 }
@@ -349,6 +375,7 @@ fn encode(commands: Vec<Command>) -> Vec<Frames> {
                 requests.push(*spec);
             }
             Command::Abort(seq_id) => aborts.push(seq_id),
+            Command::Queued(..) => unreachable!("the writer takes each Queued's prompt first"),
         }
     }
     flush(&mut messages, &mut requests, &mut prompts, &mut aborts);
@@ -409,13 +436,32 @@ async fn read(
     routes.lock().fail(&status);
 }
 
-#[derive(Default)]
 struct Routes {
     /// Requests by seq_id, each from its submit to its last message.
     open: HashMap<u64, Route>,
     next_seq_id: u64,
     /// The call has ended; no request is routed after.
     closed: bool,
+    /// Prompts queued and not yet taken by the writer, by ticket, and their bytes.
+    unsent: HashMap<u64, Vec<u32>>,
+    unsent_bytes: usize,
+    /// UNSENT_BYTES but in tests.
+    unsent_budget: usize,
+    next_ticket: u64,
+}
+
+impl Default for Routes {
+    fn default() -> Self {
+        Self {
+            open: HashMap::new(),
+            next_seq_id: 0,
+            closed: false,
+            unsent: HashMap::new(),
+            unsent_bytes: 0,
+            unsent_budget: UNSENT_BYTES,
+            next_ticket: 0,
+        }
+    }
 }
 
 /// Where a request's outputs go, and what its Complete reports.
@@ -561,9 +607,24 @@ impl Routes {
         Ok(overflowed)
     }
 
+    /// `commands` with each Queued's prompt taken; one whose prompt is gone is dropped.
+    fn take_unsent(&mut self, commands: Vec<Command>) -> Vec<Command> {
+        let take = |command| match command {
+            Command::Queued(spec, ticket) => {
+                let prompt = self.unsent.remove(&ticket)?;
+                self.unsent_bytes -= 4 * prompt.len();
+                Some(Command::Submit(spec, prompt))
+            }
+            command => Some(command),
+        };
+        commands.into_iter().filter_map(take).collect()
+    }
+
     /// Ends every open request with `status`; the Session takes no request after.
     fn fail(&mut self, status: &Status) {
         self.closed = true;
+        self.unsent.clear();
+        self.unsent_bytes = 0;
         for (_, route) in self.open.drain() {
             if !route.overflowed {
                 let _ = route.tx.try_send(Err(status.clone()));
@@ -624,6 +685,8 @@ fn json(value: &pb::Value) -> Result<Json, String> {
 /// Dropped before its last message, it aborts the request.
 pub(crate) struct SessionStream {
     seq_id: u64,
+    /// Its prompt's ticket in `Routes::unsent` until the writer takes it.
+    ticket: u64,
     rx: mpsc::Receiver<Output>,
     session: Session,
 }
@@ -640,7 +703,13 @@ impl Drop for SessionStream {
     fn drop(&mut self) {
         // Only its own route: once it has ended, a later request may hold its seq_id.
         self.rx.close();
-        let routes = self.session.routes.lock();
+        let mut routes = self.session.routes.lock();
+        // Never sent: its prompt is freed and its seq_id released, with nothing to abort.
+        if let Some(prompt) = routes.unsent.remove(&self.ticket) {
+            routes.unsent_bytes -= 4 * prompt.len();
+            routes.open.remove(&self.seq_id);
+            return;
+        }
         if routes
             .open
             .get(&self.seq_id)

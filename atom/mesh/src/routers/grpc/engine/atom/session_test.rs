@@ -800,7 +800,13 @@ fn a_finished_stream_dropped_after_its_seq_id_is_reused_aborts_nothing() {
     let (commands, mut queued) = mpsc::unbounded_channel();
     let routes = Arc::new(Mutex::new(Routes::default()));
     let session = Session { routes, commands };
+    // What the writer sends of the queue, taking each prompt.
+    let mut sent = || {
+        let queued: Vec<_> = std::iter::from_fn(|| queued.try_recv().ok()).collect();
+        session.routes.lock().take_unsent(queued)
+    };
     let finished = session.submit(spec("finished"), vec![1], true).unwrap();
+    assert!(matches!(&sent()[..], [Command::Submit(..)]));
     let ended = done(vec![(completion(finished.seq_id, "eos"), Vec::new())]);
     let ended = Inbound::decode(ended.unwrap().frames).unwrap();
     session.routes.lock().route(&ended).unwrap();
@@ -808,16 +814,54 @@ fn a_finished_stream_dropped_after_its_seq_id_is_reused_aborts_nothing() {
     session.routes.lock().next_seq_id = finished.seq_id;
     let reused = session.submit(spec("reused"), vec![2], true).unwrap();
     assert_eq!(reused.seq_id, finished.seq_id);
+    assert!(matches!(&sent()[..], [Command::Submit(..)]));
 
     drop(finished);
-    let sent: Vec<_> = std::iter::from_fn(|| queued.try_recv().ok()).collect();
-    assert!(matches!(
-        &sent[..],
-        [Command::Submit(..), Command::Submit(..)]
-    ));
+    assert!(sent().is_empty());
     // Dropped unfinished, the request now holding the seq_id is aborted.
     drop(reused);
-    assert!(matches!(queued.try_recv(), Ok(Command::Abort(id)) if id == 0));
+    assert!(matches!(&sent()[..], [Command::Abort(0)]));
+}
+
+#[test]
+fn unsent_prompts_are_bounded_and_a_dropped_unsent_request_frees_its_prompt() {
+    let (commands, mut queued) = mpsc::unbounded_channel();
+    let routes = Routes {
+        unsent_budget: 16,
+        ..Default::default()
+    };
+    let session = Session {
+        routes: Arc::new(Mutex::new(routes)),
+        commands,
+    };
+    // ATOM reads nothing: two 2-id prompts fill the 16 bytes, a third is refused.
+    let first = session.submit(spec("first"), vec![1, 2], true).unwrap();
+    let second = session.submit(spec("second"), vec![3, 4], true).unwrap();
+    let refused = session.submit(spec("third"), vec![5], true);
+    assert!(
+        matches!(&refused, Err(EngineError::Http { status, .. }) if status.as_u16() == 503),
+        "{:?}",
+        refused.err()
+    );
+
+    // Dropped unsent, a request frees its prompt and seq_id and sends no Abort...
+    let first_id = first.seq_id;
+    drop(first);
+    assert_eq!(session.routes.lock().unsent_bytes, 8);
+    assert!(!session.routes.lock().open.contains_key(&first_id));
+    let third = session.submit(spec("third"), vec![5], true).unwrap();
+    // ...and the writer sends only the requests still waiting, with their prompts.
+    let waiting: Vec<_> = std::iter::from_fn(|| queued.try_recv().ok()).collect();
+    let sent = session.routes.lock().take_unsent(waiting);
+    let sent: Vec<_> = sent
+        .iter()
+        .map(|command| match command {
+            Command::Submit(spec, prompt) => (spec.seq_id, prompt.clone()),
+            _ => panic!("only Submits were queued"),
+        })
+        .collect();
+    assert_eq!(sent, [(second.seq_id, vec![3, 4]), (third.seq_id, vec![5])]);
+    assert_eq!(session.routes.lock().unsent_bytes, 0);
 }
 
 #[test]

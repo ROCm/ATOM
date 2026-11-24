@@ -51,10 +51,14 @@ async fn do_grpc_health_check(
         .map_err(|e| format!("gRPC connection failed: {}", e))?;
 
     let health_future = client.health_check();
-    tokio::time::timeout(Duration::from_secs(timeout_secs), health_future)
+    let health = tokio::time::timeout(Duration::from_secs(timeout_secs), health_future)
         .await
         .map_err(|_| "gRPC health check timeout".to_string())?
         .map_err(|e| format!("gRPC health check failed: {}", e))?;
+    // As an HTTP worker's /health must answer 2xx.
+    if !health.healthy {
+        return Err(format!("gRPC health check: unhealthy: {}", health.message));
+    }
 
     tokio::time::timeout(Duration::from_secs(timeout_secs), client.protocol_refusal())
         .await

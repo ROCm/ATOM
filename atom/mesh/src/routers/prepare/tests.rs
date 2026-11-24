@@ -1633,7 +1633,10 @@ mod h_prepare_chat_generate {
         };
         assert_eq!(refused(), Some(http::StatusCode::SERVICE_UNAVAILABLE));
         let loaded = registry.get_by_name("m").unwrap().id;
-        components.tokenizer_template_files.write().insert(loaded);
+        components
+            .tokenizer_template_files
+            .write()
+            .insert(loaded, "t.jinja".into());
         assert_ne!(refused(), Some(http::StatusCode::SERVICE_UNAVAILABLE));
     }
 
@@ -1656,7 +1659,10 @@ mod h_prepare_chat_generate {
         };
         assert_eq!(status(), Some(http::StatusCode::NOT_IMPLEMENTED));
         let loaded = registry.get_by_name("m").unwrap().id;
-        components.tokenizer_template_files.write().insert(loaded);
+        components
+            .tokenizer_template_files
+            .write()
+            .insert(loaded, "t.jinja".into());
         // Past both template checks (the mock tokenizer then fails to render).
         let served = status();
         assert_ne!(served, Some(http::StatusCode::NOT_IMPLEMENTED));
