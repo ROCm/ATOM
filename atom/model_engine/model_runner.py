@@ -3405,15 +3405,23 @@ class ModelRunner:
                 self._dynamic_chunking.finish_sample(chunk_sample)
                 if envs.ATOM_STEP_MEM_LOG:
                     free, _ = torch.cuda.mem_get_info()
+                    stats = torch.cuda.memory_stats()
                     logger.info(
                         "step mem: stage %d rows %d free %.2fGiB reserved %.2fGiB "
-                        "allocated %.2fGiB peak %.2fGiB",
+                        "allocated %.2fGiB peak %.2fGiB inactive_split %.2fGiB "
+                        "segments %d device_allocs %d device_frees %d "
+                        "alloc_retries %d",
                         pp_group.rank_in_group,
                         input_ids.shape[0],
                         free / (1 << 30),
                         torch.cuda.memory_reserved() / (1 << 30),
                         torch.cuda.memory_allocated() / (1 << 30),
                         torch.cuda.max_memory_allocated() / (1 << 30),
+                        stats.get("inactive_split_bytes.all.current", 0) / (1 << 30),
+                        stats.get("segment.all.current", 0),
+                        stats.get("num_device_alloc", 0),
+                        stats.get("num_device_free", 0),
+                        stats.get("num_alloc_retries", 0),
                     )
                 if pp_enabled and not pp_group.is_last_rank:
                     # GLM-5.2 IndexShare: carry top-k for next rank's shared layers.

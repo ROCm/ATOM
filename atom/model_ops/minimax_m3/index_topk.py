@@ -966,8 +966,9 @@ def _require_packable(max_block: int) -> None:
         )
 
 
-# Per (device, stream) flat FP32 buffer behind the prefill block scores.
-_PREFILL_SCORE_WORKSPACE: dict[tuple[int, int], torch.Tensor] = {}
+# Per device: the flat FP32 buffer behind the prefill block scores, and the
+# stream that last used it.
+_PREFILL_SCORE_WORKSPACE: dict[int, tuple[torch.Tensor, object]] = {}
 
 
 def prefill_score_buffer(
@@ -988,16 +989,21 @@ def prefill_score_buffer(
 
     With ``reserve`` = (rows, blocks), the batch and context bounds, the first
     call allocates the buffer at that bound -- the warmup's forward, so the KV
-    budget covers it -- and every later call reuses it. One buffer per stream,
-    since layers on one stream run in order. Under graph capture the scores
-    stay a tensor of their own, as before.
+    budget covers it -- and every later call reuses it. One buffer per device:
+    a call on another stream than the last one's (a token graph recording runs
+    its eager regions on the capture stream) first waits for that stream, so
+    no stream ever needs a second copy. Under graph capture the scores stay a
+    tensor of their own, as before.
     """
     shape = (num_idx_heads, total_q, max_block)
     if reserve is None or torch.cuda.is_current_stream_capturing():
         return torch.empty(shape, dtype=torch.float32, device=device)
     need = num_idx_heads * total_q * max_block
-    key = (device.index, torch.cuda.current_stream(device).cuda_stream)
-    flat = _PREFILL_SCORE_WORKSPACE.get(key)
+    stream = torch.cuda.current_stream(device)
+    flat, last = _PREFILL_SCORE_WORKSPACE.get(device.index, (None, None))
+    if flat is not None and last != stream:
+        stream.wait_stream(last)
+        flat.record_stream(stream)
     if flat is None or flat.numel() < need:
         rows, blocks = reserve
         flat = torch.empty(
@@ -1005,7 +1011,7 @@ def prefill_score_buffer(
             dtype=torch.float32,
             device=device,
         )
-        _PREFILL_SCORE_WORKSPACE[key] = flat
+    _PREFILL_SCORE_WORKSPACE[device.index] = (flat, stream)
     return flat[:need].view(shape)
 
 
