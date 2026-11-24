@@ -4685,6 +4685,11 @@ mod h_atom_native_tool_calls {
     /// A qwen_xml reply cut off by max_tokens inside a call: (name, arguments) of the call
     /// read unary, then streamed.
     async fn cut_off_call(reply: &str) -> [(String, Value); 2] {
+        cut_off_call_reasoned(reply, None).await
+    }
+
+    /// `cut_off_call`, its reasoning separated by the `reasoning` parser.
+    async fn cut_off_call_reasoned(reply: &str, reasoning: Option<&str>) -> [(String, Value); 2] {
         let tool = json!({"type": "function", "function": {"name": "get_weather", "parameters": {
             "type": "object", "properties": {"city": {"type": "string"}},
         }}});
@@ -4703,6 +4708,10 @@ mod h_atom_native_tool_calls {
             let mut ctx = ctx(stream, json!("auto"));
             ctx.original = ProtocolRequest::Chat(Arc::new(req));
             ctx.configured_tool_parser = Some("qwen_xml".to_string());
+            if let Some(parser) = reasoning {
+                ctx.reasoning_parser_factory = Some(test_mocks::reasoning_parser_factory());
+                ctx.configured_reasoning_parser = Some(parser.to_string());
+            }
             let mut chunks: Vec<TokenChunk> = Vec::new();
             if stream {
                 chunks.extend(ids.chunks(3).map(|ids| TokenChunk::Partial {
@@ -4763,6 +4772,16 @@ mod h_atom_native_tool_calls {
         let prose = "You write <function=get_weather> and then its parameters";
         let none = (String::new(), Value::Null);
         assert_eq!(cut_off_call(prose).await, [none.clone(), none]);
+    }
+
+    /// A last "<" the reasoning parser holds until the Complete releases it still reaches
+    /// the call it ends, streamed as unary.
+    #[tokio::test]
+    async fn a_cut_off_call_keeps_a_last_character_the_reasoning_parser_held() {
+        let reply = "<tool_call><function=get_weather><parameter=city>Paris<";
+        let expected = ("get_weather".to_string(), json!({"city": "Paris<"}));
+        let read = cut_off_call_reasoned(reply, Some("qwen3")).await;
+        assert_eq!(read, [expected.clone(), expected]);
     }
 }
 

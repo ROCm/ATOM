@@ -340,7 +340,50 @@ async fn run_chat_stream(
                         text = released.normal_text.trim_end_matches(RELEASE).to_string();
                     }
                 }
-                if !text.is_empty() {
+                let tool_choice_enabled =
+                    !matches!(tool_choice, Some(ToolChoice::Value(ToolChoiceValue::None)));
+                // Read as a partial's text is: it may end a tool call.
+                if !text.is_empty()
+                    && tool_choice_enabled
+                    && tools.is_some()
+                    && (tool_parser_available || used_json_schema)
+                {
+                    let tool_chunks = if is_specific_function {
+                        process_specific_function_stream(
+                            &text,
+                            &mut has_tool_call,
+                            tool_choice,
+                            request_id,
+                            model,
+                            created,
+                            system_fingerprint.as_deref(),
+                            history_tool_calls_count,
+                        )
+                    } else {
+                        if ctx.reads_as_atom {
+                            tool_text.push_str(&text);
+                        }
+                        process_tool_calls_stream(
+                            &text,
+                            &mut tool_parser,
+                            &mut has_tool_call,
+                            tools.as_ref().unwrap(),
+                            ctx.tool_parser_factory.as_ref(),
+                            ctx.configured_tool_parser.as_deref(),
+                            request_id,
+                            model,
+                            created,
+                            system_fingerprint.as_deref(),
+                            history_tool_calls_count,
+                            used_json_schema,
+                        )
+                        .await
+                    };
+                    for c in tool_chunks {
+                        format_sse_chunk_into(&mut sse_buffer, &c, null_usage);
+                        send_bytes(tx, &sse_buffer, "flushed tool call chunk")?;
+                    }
+                } else if !text.is_empty() {
                     let chunk = ChatCompletionStreamResponse::builder(request_id, model)
                         .created(created)
                         .add_choice_content(INDEX, "assistant", text)
