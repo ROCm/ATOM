@@ -1165,6 +1165,28 @@ class TestWriteOrdering:
         conn._service_write_requests()
         assert len(conn._pending_writes) == 1
 
+    def test_transfer_stats_split_a_push_into_queue_wait_and_write(
+        self, stack, write_path, caplog
+    ):
+        conn = write_path.make(producer=True)
+        conn._transfer_stats = True
+        request = write_path.push_request()
+        # Arrived on the listener, taken up a step later, posted, seen settled.
+        request.update(
+            _received_at=100.0, _accepted_at=100.25, _page_stats=(100.5, 10**9, 4, 760)
+        )
+        clock = types.SimpleNamespace(monotonic=lambda: 101.0, time=lambda: 0.0)
+        with (
+            mock.patch.object(stack.conn, "time", clock),
+            caplog.at_level("INFO", logger="atom"),
+        ):
+            conn._finish_write(request, ok=True)
+        [line] = [
+            r.getMessage() for r in caplog.records if "transfer stats" in r.getMessage()
+        ]
+        assert "queue_ms=250.000 wait_ms=250.000 write_ms=500.000" in line
+        assert "GB_per_s=2.0 segments=760" in line
+
     def test_the_ready_event_is_recorded_after_the_draft_kv_is_written(self):
         # DSpark writes the draft's context KV in `compute_draft_kv`; the push
         # gate is the event `_record_kv_cache_ready` records after it.
