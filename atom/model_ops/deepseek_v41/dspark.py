@@ -536,11 +536,11 @@ def _draft_prologue_kernel(
     ENTRIES: tl.constexpr,  # next_pow2(ring + width)
 ):
     """`_draft_step_kernel`, the anchors' embedding gather and
-    `_block_state_kernel` in one launch.
+    `build_block_state` in one launch.
 
     Grid ``(B * width, H_BLOCKS + 1)``: program ``(row, part)`` with
     ``part < H_BLOCKS`` writes one H tile of one block row's state, as
-    `_block_state_kernel` does, reading the anchor's row straight out of the
+    `build_block_state` does, reading the anchor's row straight out of the
     table; ``part == H_BLOCKS`` writes that row's index list, as
     `_draft_step_kernel` does. Copies and integer arithmetic only, so the five
     outputs are the three launches' own, bit for bit.
