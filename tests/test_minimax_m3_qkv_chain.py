@@ -169,6 +169,7 @@ def test_one_shot_activity_log(monkeypatch, caplog):
     st.update(calls=0, layers_on=3, layers_not_preshuffled=1, done=False)
     monkeypatch.setattr(qkv_chain, "_stats", st)
     monkeypatch.setattr(qkv_chain, "_LOG_AFTER", 5)
+    monkeypatch.setattr(qkv_chain, "split_available", lambda: False)  # the 17-64 window
     monkeypatch.setattr(
         qkv_chain, "aiter_features", lambda: "qkv_chain_cooperative_insert"
     )
