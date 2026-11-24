@@ -29,8 +29,10 @@ use crate::{
     },
     config::RouterConfig,
     core::{
-        placement::PlacementPlan, steps::WorkflowEngines, worker::RuntimeType, JobQueue,
-        JobQueueConfig,
+        placement::PlacementPlan,
+        steps::{TokenizerConfigRequest, WorkflowEngines},
+        worker::RuntimeType,
+        Job, JobQueue, JobQueueConfig,
     },
     protocols::{
         chat::ChatCompletionRequest, generate::GenerateRequest as GenerateBody,
@@ -46,6 +48,7 @@ use crate::{
             tokenizer::{byte_level_tokenizer_dir, hf_tokenizer_path, BYTE_LEVEL_MERGES},
         },
     },
+    tokenizer::TokenizerRegistry,
 };
 
 type Empty<T> = tokio_stream::Empty<Result<T, Status>>;
@@ -512,6 +515,39 @@ async fn a_worker_with_another_template_is_refused_while_the_tokenizer_loads() {
     assert!(ctx.worker_registry.get_by_url(&second).is_none());
     drop(held);
     assert_eq!(render(&ctx, "atom-loading", Value::Null).await, "first: hi");
+}
+
+/// A model's tokenizer loaded with a template file keeps it: a worker that only
+/// advertises a template serves that file, which ranks above an advertised one.
+#[tokio::test]
+async fn a_tokenizer_s_template_file_wins_over_an_advertised_template() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let file = dir.path().join("file.jinja");
+    std::fs::write(&file, "file: {{ messages[0].content }}").unwrap();
+    let ctx = context();
+    let config = TokenizerConfigRequest {
+        id: TokenizerRegistry::generate_id(),
+        name: "atom-file".into(),
+        source: hf_tokenizer_path().into(),
+        chat_template_path: Some(file.to_str().unwrap().into()),
+        inline_chat_template: None,
+        worker_url: None,
+        cache_config: None,
+        fail_on_duplicate: false,
+    };
+    let job = Job::AddTokenizer {
+        config: Box::new(config),
+    };
+    let queue = ctx.worker_job_queue.get().unwrap();
+    queue.submit(job).await.unwrap();
+    assert_eq!(render(&ctx, "atom-file", Value::Null).await, "file: hi");
+
+    for _ in 0..2 {
+        let info = model_info("atom-file", "label: {{ messages[0].content }}", "{}");
+        let url = serve_atom(info, 1).await;
+        register(&ctx, json!({ "url": url })).await.unwrap();
+    }
+    assert_eq!(render(&ctx, "atom-file", Value::Null).await, "file: hi");
 }
 
 /// The label template is set before fastokens wraps the tokenizer: a FastTokenizer

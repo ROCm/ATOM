@@ -497,6 +497,14 @@ impl ToolParser for MiniMaxParser {
         Some(closers)
     }
 
+    /// Outside a call, the partial marker the parser holds is text.
+    fn end_of_input_text(&mut self) -> String {
+        match self.in_tool_call {
+            true => String::new(),
+            false => std::mem::take(&mut self.buffer),
+        }
+    }
+
     fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {
         helpers::get_unstreamed_args(&self.prev_tool_call_arr, &self.streamed_args_for_tool)
     }
@@ -733,6 +741,25 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert!(calls[0].function.arguments.contains("Paris"));
         assert!(calls[1].function.arguments.contains("London"));
+    }
+
+    /// Text held at end of input as a possible marker, outside a call, is text.
+    #[tokio::test]
+    async fn a_held_partial_marker_is_text_at_end_of_input() {
+        for reply in ["The prefix is <tool_c", "The prefix is ]<]minim"] {
+            for size in 1..=5 {
+                let (tools, mut parser) = (weather_tools(), MiniMaxParser::new());
+                let mut text = String::new();
+                for piece in reply.as_bytes().chunks(size) {
+                    let piece = std::str::from_utf8(piece).unwrap();
+                    let result = parser.parse_incremental(piece, &tools).await.unwrap();
+                    text.push_str(&result.normal_text);
+                }
+                assert!(parser.end_of_input_closers(&tools).is_none());
+                text.push_str(&parser.end_of_input_text());
+                assert_eq!(text, reply, "{size}-byte pieces");
+            }
+        }
     }
 
     #[test]
