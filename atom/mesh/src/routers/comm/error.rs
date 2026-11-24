@@ -236,6 +236,13 @@ impl IngressError {
             PlacementError::ModelNotFound { model_id } => {
                 ("model_not_found", format!("Model not found: {}", model_id))
             }
+            PlacementError::ChatTemplateChanged => (
+                "chat_template_changed",
+                format!(
+                    "The chat template of model {model} changed while the prompt rendered; \
+                     retry the request"
+                ),
+            ),
         };
         Self::new(StatusCode::SERVICE_UNAVAILABLE, code, message)
     }

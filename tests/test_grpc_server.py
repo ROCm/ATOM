@@ -1047,6 +1047,60 @@ def test_the_end_of_the_client_s_side_aborts_without_waiting_for_an_admission(se
     assert engine.aborted == [engine.made[0]] and len(engine.submitted) == 1
 
 
+def test_the_end_of_the_client_s_side_aborts_before_a_structured_admission_settles(
+    serve, monkeypatch
+):
+    engine, entered, admit = (
+        FakeEngine([([5], None)]),
+        threading.Event(),
+        threading.Event(),
+    )
+    add_request, abort_request, events = (
+        engine.core_mgr.add_request,
+        engine.core_mgr.abort_request,
+        [],
+    )
+
+    def add(seqs):  # B's structured submission blocks on its thread
+        if seqs[0].json_schema is None:
+            return add_request(seqs)
+        entered.set()
+        admit.wait(10)
+        events.append(("enqueued", seqs[0].id))
+
+    def abort(seq_id):
+        events.append(("aborted", seq_id))
+        abort_request(seq_id)
+
+    monkeypatch.setattr(engine.core_mgr, "add_request", add)
+    monkeypatch.setattr(engine.core_mgr, "abort_request", abort)
+    servicer = serve(engine)
+    batch = _submit_batch((4, "b", [2]))
+    structured = v1.Envelope.FromString(batch[0])
+    structured.submit.requests[0].sampling.json_schema = '{"type": "object"}'
+
+    async def client():
+        yield pb.Frames(frames=_submit_batch((3, "a", [1])))
+        await _until(lambda: engine.running)  # A runs
+        yield pb.Frames(frames=[structured.SerializeToString(), *batch[1:]])
+        await _until(entered.is_set)  # then the side ends
+
+    async def end_while_b_is_submitted():
+        call = servicer.Session(client(), SimpleNamespace())
+        reading = asyncio.create_task(_drain(call))
+        try:
+            await _until(lambda: engine.made and ("aborted", engine.made[0]) in events)
+        finally:
+            admit.set()
+            await asyncio.wait_for(reading, 10)
+
+    asyncio.run(end_while_b_is_submitted())
+    a, b = engine.made
+    # A aborted while B's submission was still blocked; B once it was enqueued.
+    assert events.index(("aborted", a)) < events.index(("enqueued", b))
+    assert events[-1] == ("aborted", b)
+
+
 async def _drain(call):
     async for _ in call:
         pass
@@ -1245,6 +1299,45 @@ def test_generate_admits_a_chat_with_the_fields_prepare_answers(chat):
     params = engine.preprocessed[0][1]
     assert json.loads(params.json_schema) == SCHEMA
     assert engine.submitted and engine.io_processor.requests == {}
+
+
+def test_a_generate_cancelled_twice_aborts_once_its_structured_seq_is_enqueued(
+    chat, monkeypatch
+):
+    engine, entered, admit, events = (
+        FakeEngine(),
+        threading.Event(),
+        threading.Event(),
+        [],
+    )
+
+    def add_request(seqs):  # the structured submission, on its thread
+        entered.set()
+        admit.wait(10)
+        events.append("enqueued")
+
+    monkeypatch.setattr(engine.core_mgr, "add_request", add_request)
+    monkeypatch.setattr(
+        engine.core_mgr, "abort_request", lambda seq_id: events.append("aborted")
+    )
+    servicer = chat(engine)
+    structured = pb.StructuredOutput(response_format_json=RESPONSE_FORMAT)
+
+    async def cancel_twice_while_submitting():
+        request = pb.GenerateRequest(
+            request_id="r", prompt_token_ids=[1, 2], structured_output=structured
+        )
+        call = asyncio.create_task(servicer.Generate(request, Context()))
+        await _until(entered.is_set)
+        call.cancel()
+        await asyncio.sleep(0.05)
+        call.cancel()  # as asyncio.run's teardown cancels it again
+        threading.Timer(0.3, admit.set).start()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+
+    asyncio.run(cancel_twice_while_submitting())
+    assert events[0] == "enqueued" and "aborted" in events, events
 
 
 def test_message_declared_tools_reach_the_tool_call_grammar(chat, monkeypatch):

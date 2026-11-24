@@ -114,6 +114,7 @@ impl StepExecutor<LocalWorkerWorkflowData> for SubmitTokenizerJobStep {
                 source: tokenizer_path,
                 chat_template_path: chat_template.clone(),
                 inline_chat_template: inline_chat_template.clone(),
+                worker_url: Some(worker.url().to_string()),
                 cache_config: cache_config.clone(),
                 fail_on_duplicate: false,
             };

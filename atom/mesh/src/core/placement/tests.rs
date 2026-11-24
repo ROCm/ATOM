@@ -585,6 +585,7 @@ mod c_regular_planning {
                 headers: None,
                 stream: false,
                 carries_media: false,
+                chat_template: None,
             })
             .await
             .unwrap();
@@ -618,6 +619,7 @@ mod c_regular_planning {
                 headers: None,
                 stream: false,
                 carries_media: false,
+                chat_template: None,
             })
             .await
             .unwrap();
@@ -642,6 +644,7 @@ mod c_regular_planning {
                 headers: None,
                 stream: false,
                 carries_media: false,
+                chat_template: None,
             })
             .await
             .unwrap();
@@ -979,6 +982,7 @@ mod d_pd_planning {
                 headers: None,
                 stream: false,
                 carries_media: false,
+                chat_template: None,
             })
             .await
             .unwrap();
@@ -1093,6 +1097,7 @@ mod d_pd_planning {
                 headers: None,
                 stream: false,
                 carries_media: false,
+                chat_template: None,
             })
             .await
             .unwrap();
@@ -2352,6 +2357,7 @@ mod h_integration {
             headers: Some(&headers),
             stream: false,
             carries_media: false,
+            chat_template: None,
         };
 
         for _ in 0..2 {

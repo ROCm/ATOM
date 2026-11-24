@@ -56,6 +56,7 @@ mod a_payload_to_proto {
             structured_output: None,
             dp_session_id: None,
             dp_parent_session_id: None,
+            chat_template: None,
         }
     }
 
@@ -823,6 +824,7 @@ mod e_engine_dispatch {
             structured_output: None,
             dp_session_id: None,
             dp_parent_session_id: None,
+            chat_template: None,
         }
     }
 

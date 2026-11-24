@@ -3,7 +3,7 @@ use std::sync::Arc;
 use http::HeaderMap;
 use thiserror::Error;
 
-use crate::core::Worker;
+use crate::core::{steps::tokenizer_registration::served_template, RuntimeType, Worker};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
@@ -20,6 +20,27 @@ pub struct RequestDescriptor<'a> {
     pub headers: Option<&'a HeaderMap>,
     pub stream: bool,
     pub carries_media: bool,
+    /// The template a chat's prompt rendered with: the chat goes only to the ATOM
+    /// workers that serve it.
+    pub chat_template: Option<&'a RenderedTemplate>,
+}
+
+/// The chat template a chat's prompt rendered with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedTemplate {
+    /// `template_fingerprint` of the template.
+    pub fingerprint: u64,
+    /// `--chat-template`, which an ATOM worker without its own file serves.
+    pub router_file: Option<String>,
+}
+
+impl RenderedTemplate {
+    /// Whether `worker` reads this chat's prompt ids as rendered: a worker other than
+    /// ATOM is sent the text as well; an ATOM worker must serve the same template.
+    pub fn served_by(&self, worker: &dyn Worker) -> bool {
+        worker.metadata().runtime_type != RuntimeType::Atom
+            || served_template(worker, self.router_file.as_deref()) == self.fingerprint
+    }
 }
 
 #[derive(Debug)]
@@ -50,6 +71,8 @@ pub enum PlacementError {
     PolicyReturnedNone,
     #[error("model not found: {model_id}")]
     ModelNotFound { model_id: String },
+    #[error("no worker serves the chat template the prompt rendered with")]
+    ChatTemplateChanged,
 }
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
