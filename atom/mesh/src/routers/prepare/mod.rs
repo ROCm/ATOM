@@ -138,7 +138,9 @@ pub fn prepare_chat_declaring(
         });
         (entry, built_in, loaded)
     };
-    if let Some(gap) = atom_chat_render_gap(&workers, configured_template, built_in_encoder) {
+    // A template file the tokenizer was loaded with is a template, as --chat-template is.
+    let templated = configured_template || loaded_template == Some(LoadedTemplate::File);
+    if let Some(gap) = atom_chat_render_gap(&workers, templated, built_in_encoder) {
         return Err(error::not_implemented(
             "chat_template_unavailable",
             format!(
@@ -172,7 +174,13 @@ pub fn prepare_chat_declaring(
         .then(|| message_tools.unwrap_or_else(|| MessageTools::of(&req)))
         .filter(|declared| !declared.is_empty() || declared.1.is_some());
 
-    let template_kwargs = merged_template_kwargs(&body_ref, default_kwargs.as_ref());
+    let template_kwargs = if atom {
+        let toggle = reasoning_toggle(&workers)
+            .map_err(|e| error::internal_error("invalid_reasoning_toggle", e))?;
+        atom_template_kwargs(&body_ref, default_kwargs.as_ref(), toggle)
+    } else {
+        merged_template_kwargs(&body_ref, default_kwargs.as_ref())
+    };
     let processed = staged("template", || {
         process_chat_messages_with_kwargs(
             &body_ref,
@@ -422,6 +430,49 @@ fn reasoning_open_markers(workers: &[Arc<dyn Worker>]) -> Result<Vec<String>, St
         })
         .transpose()?
         .unwrap_or_default())
+}
+
+/// The efforts ATOM's chat templates read (`VALID_TEMPLATE_EFFORTS` in
+/// atom/entrypoints/openai/reasoning.py); ATOM's HTTP chat drops any other.
+const ATOM_TEMPLATE_EFFORTS: [&str; 3] = ["low", "high", "max"];
+
+/// An ATOM worker's reasoning toggle, `[name, off value, on value]`, from GetModelInfo.
+fn reasoning_toggle(workers: &[Arc<dyn Worker>]) -> Result<Option<(String, Value, Value)>, String> {
+    let labels = workers.iter().map(|w| &w.metadata().labels);
+    labels
+        .filter_map(|labels| labels.get(REASONING_TOGGLE_LABEL))
+        .next()
+        .map(|json| {
+            serde_json::from_str(json)
+                .map_err(|e| format!("Invalid {REASONING_TOGGLE_LABEL} label {json}: {e}"))
+        })
+        .transpose()
+}
+
+/// The kwargs ATOM's HTTP chat renders `request` with: the defaults, the request's own,
+/// then its `reasoning_effort` (`apply_reasoning_controls`): "none" sets `toggle` off,
+/// a template effort becomes `thinking_effort`, and any other is dropped.
+fn atom_template_kwargs(
+    request: &ChatCompletionRequest,
+    default_kwargs: Option<&HashMap<String, Value>>,
+    toggle: Option<(String, Value, Value)>,
+) -> HashMap<String, Value> {
+    let mut kwargs = default_kwargs.cloned().unwrap_or_default();
+    if let Some(own) = &request.chat_template_kwargs {
+        kwargs.extend(own.iter().map(|(key, value)| (key.clone(), value.clone())));
+    }
+    match request.reasoning_effort.as_deref() {
+        Some("none") => {
+            if let Some((name, off, _)) = toggle {
+                kwargs.insert(name, off);
+            }
+        }
+        Some(effort) if ATOM_TEMPLATE_EFFORTS.contains(&effort) => {
+            kwargs.insert("thinking_effort".into(), Value::String(effort.into()));
+        }
+        _ => {}
+    }
+    kwargs
 }
 
 /// The opener an ATOM worker of the model reports its replies start after with no

@@ -4255,6 +4255,18 @@ mod f_atom_reasoning_opener {
         assert_eq!(unary("still planning", Some("<think>")).await, expected);
         assert_eq!(streamed("still planning", Some("<think>")).await, expected);
     }
+
+    #[tokio::test]
+    async fn a_streamed_reply_ending_in_a_delimiter_s_first_characters_keeps_them() {
+        // Ended inside reasoning on "<", or in content on "</".
+        let expected = ("plan <".to_string(), String::new());
+        assert_eq!(streamed("plan <", Some("<think>")).await, expected);
+        let expected = ("plan".to_string(), "3 </".to_string());
+        assert_eq!(
+            streamed("plan</think>3 </", Some("<think>")).await,
+            expected
+        );
+    }
 }
 
 mod g_complete_suffix {
