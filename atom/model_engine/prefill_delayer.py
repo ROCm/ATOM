@@ -419,9 +419,10 @@ class PrefillDelayer:
             )
             prefill_decode_interval = 0
         self.prefill_decode_interval = prefill_decode_interval
-        # Initial ramp: while every rank can fill target_fill of a prefill chunk
-        # from resumable partials plus waiting requests that fit its free seq
-        # slots, release at once ahead of the decode interval and adaptive rule.
+        # Initial ramp: while admission's own probe on every rank counts a fresh
+        # request into a free seq slot and fills target_fill of a prefill chunk
+        # (or the batch budget cannot take the next request; partials alone never
+        # count), release at once ahead of the decode interval and adaptive rule.
         # Only those two ever hold prefill back, so only they arm it.
         self.prefill_ramp = bool(prefill_ramp) and (
             prefill_decode_interval > 0 or admit_policy == "adaptive"
@@ -567,8 +568,9 @@ class PrefillDelayer:
     @property
     def ramp_active(self) -> bool:
         """The initial ramp is on: prefill is released at once, whatever the
-        admit policy, while every rank can still fill target_fill of a prefill
-        chunk."""
+        admit policy, while admission's probe on every rank counts a fresh
+        request into a free seq slot and fills target_fill of a prefill chunk
+        (or stops because the batch budget cannot take the next request)."""
         return self.prefill_ramp and not self._ramp_done
 
     def protects_decode(self, running_decode_batch: int) -> bool:
