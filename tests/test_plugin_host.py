@@ -1615,3 +1615,46 @@ def test_mhc_seam_hands_the_mega_mhc_call_to_a_planned_owner(monkeypatch):
         ("native", 20, ["out_dtype"]),
     ]
     assert host.decision_counts()[(seam, "plugin", "selected", "small")] == 1
+
+
+def test_index_topk_seam_takes_plane_and_packed_calls(monkeypatch):
+    """`v41.attn.index_topk`: the index scorer's plane call, its packed call and
+    the block picker all go through `score.index_topk`; the capability says
+    which kind a call is, and unowned the call is AITER's."""
+    from aiter_stub import atom_under_stubs
+
+    with atom_under_stubs() as load:
+        score = load("atom.model_ops.indexer.score")
+        indexer = load("atom.model_ops.deepseek_v41.indexer")
+    seam = "v41.attn.index_topk"
+    assert indexer.index_topk is score.index_topk
+    seen = []
+
+    def native(*args, **kwargs):
+        seen.append(("native", sorted(kwargs)))
+
+    def owner(*args, capability=None, valid_rows=None, **kwargs):
+        seen.append(("owner", capability.flags["packed"]))
+
+    monkeypatch.setattr(score, "top_k_per_row_decode", native)
+    scores = torch.zeros(4, 64)
+    ends = torch.zeros(4, dtype=torch.int32)
+    out = torch.zeros(4, 8, dtype=torch.int32)
+    score.index_topk(scores, 1, ends, out, 4, 64, 1, k=8, stable=True)
+    _plugins(monkeypatch, top=_offer(seam, "top", impl=owner))
+    host.configure(recipes.resolve([_recipe({seam: ["top"]})]), kill_switch=False)
+    score.index_topk(scores, 1, ends, out, 4, 64, 1, k=8, stable=True)
+    score.index_topk(
+        scores.view(-1),
+        1,
+        ends,
+        out,
+        4,
+        0,
+        1,
+        k=8,
+        stable=True,
+        row_starts=ends,
+        plane_width=64,
+    )
+    assert seen == [("native", ["k", "stable"]), ("owner", False), ("owner", True)]

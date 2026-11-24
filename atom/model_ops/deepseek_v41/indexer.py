@@ -14,8 +14,9 @@ import functools
 import torch
 import triton
 import triton.language as tl
-from aiter.ops.topk import top_k_per_row_decode
 from triton.language.extra import libdevice
+
+from atom.model_ops.indexer.score import index_topk
 
 
 def _blocks(width, block_size):
@@ -233,7 +234,7 @@ def pick_candidate_blocks(logits, visible, block_size, out, tile=None):
     ends = _block_maxima(logits, visible, maxima, block_size, blocks, tile)
     # The decode entry point: its prefill sibling would want a row-start array
     # as well, and every row here starts at zero.
-    top_k_per_row_decode(
+    index_topk(
         maxima,
         1,
         ends,
@@ -273,7 +274,7 @@ def pick_candidate_blocks_packed(
         tile,
         packed=(offsets, block_offsets),
     )
-    top_k_per_row_decode(
+    index_topk(
         maxima,
         1,
         ends,

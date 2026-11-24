@@ -399,7 +399,8 @@ SEAMS = MappingProxyType(
                 ("scores", "group", "row_ends", "out", "count", "stride0", "stride1"),
                 "capture_safe",
                 "atom/model_ops/indexer/score.py",
-                doc="packed top_k_per_row_decode, in place into out",
+                doc="top_k_per_row_decode of a plane or of packed rows (row_starts), "
+                "in place into out; flags: packed",
             ),
             _seam(
                 "v41.attn.attend",
@@ -2365,7 +2366,9 @@ _call_capability: dict[str, Callable[..., Mapping[str, Any]]] = {
         "flags": {"score_func": score_func}
     },
     "v41.op.quant_fp8_g32": lambda *a, **kw: {"quant": MX},
-    "v41.attn.index_topk": lambda *a, **kw: {"flags": {"packed": True}},
+    "v41.attn.index_topk": lambda *a, row_starts=None, **kw: {
+        "flags": {"packed": row_starts is not None}
+    },
     "v41.attn.attend": lambda *a, unified_kv_rope=None, **kw: {
         "flags": {"kv_layout": "bf16" if unified_kv_rope is None else "fp8_2buff"}
     },

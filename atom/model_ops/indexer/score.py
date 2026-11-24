@@ -212,7 +212,7 @@ def _score_paged(query, weights, cache, rows, topk, weight_scale, stable, on_ban
         if on_band is not None:
             on_band(scores, span)
         if offsets is None:
-            top_k_per_row_decode(
+            index_topk(
                 scores,
                 group,
                 rows.row_ends[items],
@@ -226,9 +226,7 @@ def _score_paged(query, weights, cache, rows, topk, weight_scale, stable, on_ban
         else:
             # Packed: a row's logits start at its offset; the top-k is told
             # the plane width the rows stand for, so it picks as that would.
-            plugin_host.call(
-                "v41.attn.index_topk",
-                top_k_per_row_decode,
+            index_topk(
                 scores,
                 1,
                 rows.row_ends[span],
@@ -241,6 +239,24 @@ def _score_paged(query, weights, cache, rows, topk, weight_scale, stable, on_ban
                 row_starts=offsets,
                 plane_width=rows.width,
             )
+
+
+def index_topk(scores, group, row_ends, out, count, stride0, stride1, **kwargs):
+    """AITER's `top_k_per_row_decode`, in place into ``out``, as the
+    `v41.attn.index_topk` seam: a plane of rows, or packed rows
+    (``row_starts`` / ``plane_width``). Unowned, the call is AITER's."""
+    return plugin_host.call(
+        "v41.attn.index_topk",
+        top_k_per_row_decode,
+        scores,
+        group,
+        row_ends,
+        out,
+        count,
+        stride0,
+        stride1,
+        **kwargs,
+    )
 
 
 def _score_concat_passes(query, weights, cache, rows, topk, stable, out):

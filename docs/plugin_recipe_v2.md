@@ -247,7 +247,9 @@ def register(host):
 `v41.mono.install`. Unowned, each binds to its native (no Python on the hot path).
 Two more are single launches: `v41.block.mhc` and `v41.attn.query_rope_quant`.
 
-`v41.block.mhc` is the HIP Mega-MHC launch of a sublayer seam (the arguments and the five
+`v41.attn.index_topk` is every decode top-k call of the index scorer and of its block
+picker (a plane of rows, or packed rows with `row_starts`); the capability's `packed` flag
+says which. `v41.block.mhc` is the HIP Mega-MHC launch of a sublayer seam (the arguments and the five
 results of AITER's `mega_mhc`); an owner selects the calls it serves and the rest stay
 AITER's. `v41.attn.query_rope_quant` is `model_options.qpath_fuse` item `"q"`'s launch;
 the fused query path decides a step before the norm has run, so it asks the seam's owner
