@@ -44,13 +44,16 @@ pub(crate) struct AtomPairs {
     /// The worker each URL's info was read for, and each instance's (its base URL):
     /// a worker registered again at that URL is another, whose info is read afresh.
     /// Taken after `info`, as a read publishes both. Each with its instance's base URL.
-    pub(super) read_for: RwLock<HashMap<String, (Weak<dyn Worker>, String)>>,
+    pub(super) read_for: RwLock<HashMap<String, ReadFor>>,
     /// Per instance, held while its GetServerInfo is read, so concurrent first pairs of
     /// its ranks read it once; it keeps a failed read's error, and when.
     reading: Mutex<HashMap<String, Arc<tokio::sync::Mutex<Option<Failed>>>>>,
     mapping: AtomPdRankMappingPolicy,
     workers: Arc<WorkerRegistry>,
 }
+
+/// The worker a URL's info was read for, and its instance's base URL.
+type ReadFor = (Weak<dyn Worker>, String);
 
 /// A failed GetServerInfo read: when, and the error each pair that waited for it gets.
 type Failed = (Instant, StatusCode, String);
