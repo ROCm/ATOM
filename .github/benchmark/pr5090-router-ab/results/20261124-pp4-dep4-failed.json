@@ -20,9 +20,10 @@
   "failure_events_by_pp_rank": {
     "3": 324
   },
-  "failure_events_by_physical_gpu_from_mask": {
+  "failure_events_by_original_hip_ordinal": {
     "3": 324
   },
+  "device_numbering": "Mask values are original HIP ordinals, not AMD-SMI indices. A subsequent hipDeviceGetPCIBusId probe on the same g27 with the original mask maps HIP ordinal 3 to PCI 0000:15:00.0. The remap assigns this PCI device to PP2 and PCI 0000:65:00.0 to PP3.",
   "failure_events_by_peer": {
     "consumer-peer-1": 74,
     "consumer-peer-2": 97,

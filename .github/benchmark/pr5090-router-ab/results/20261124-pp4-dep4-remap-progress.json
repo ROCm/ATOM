@@ -1,0 +1,107 @@
+{
+  "lease": "L1e57ce",
+  "node": "pit2-p03-g27",
+  "gpus": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "harness_sha": "4148dc59135de806c31a2ca2a0e5be27743db324",
+  "srt_sha": "85ecf60ac3931f38abdb0dd82f909f35057d5e12",
+  "router_sha": "69ed5e77bcc93b9d51cb5cf1528badd0e703ed93",
+  "observed_at": "2026-11-24T06:42:12.991854+00:00",
+  "state": "profiling_in_progress",
+  "performance_valid": null,
+  "worker_image_unchanged": true,
+  "worker_source_patched": false,
+  "transfer_timeout_unchanged": true,
+  "purpose": "Reproduce the failed PP4/DEP4 c40 load with only the P PP2/PP3 device order exchanged on the same node",
+  "effective_prefill_hip_visible_devices": "0,1,3,2",
+  "effective_decode_hip_visible_devices": "4,5,6,7",
+  "MC_DISABLE_HIP": "1 on both roles",
+  "hip_device_get_pci_bus_id_probe": {
+    "prefill_parent": {
+      "mask": "0,1,3,2",
+      "pci_by_hip_ordinal": [
+        "0000:75:00.0",
+        "0000:05:00.0",
+        "0000:15:00.0",
+        "0000:65:00.0"
+      ]
+    },
+    "prefill_original-prefill": {
+      "mask": "0,1,2,3",
+      "pci_by_hip_ordinal": [
+        "0000:75:00.0",
+        "0000:05:00.0",
+        "0000:65:00.0",
+        "0000:15:00.0"
+      ]
+    },
+    "decode_parent": {
+      "mask": "4,5,6,7",
+      "pci_by_hip_ordinal": [
+        "0000:f5:00.0",
+        "0000:85:00.0",
+        "0000:e5:00.0",
+        "0000:95:00.0"
+      ]
+    }
+  },
+  "unchanged_cache_setup": {
+    "prefill_gpu_kv_tokens": 12058752,
+    "cpu_blocks_per_pp_rank": 177544,
+    "cpu_tensors_by_pp_rank": [
+      30,
+      30,
+      30,
+      35
+    ]
+  },
+  "warmup": {
+    "requests": 444,
+    "completed": 444,
+    "cancelled": 0,
+    "control_plane_errors": 0,
+    "elapsed_s": 220.99
+  },
+  "profiling": {
+    "started_at_utc": "2026-11-24T06:35:12.313Z",
+    "requested_duration_s": 3600,
+    "latest_client_progress": [
+      "06:42:02.468 INFO     [realtime 06:50 profiling] (records_manager.py:1521)",
+      "06:42:02.468 INFO       rps=3.3 (avg 1.9)  tput_in=198,846/s  tput_out=1,398/s  done=786 ok=786 err=0 (records_manager.py:1521)"
+    ],
+    "sa_interactivity": null,
+    "sa_token_throughput_per_chip": null
+  },
+  "prefill_transfer_failure_events": 0,
+  "rdma_observation": {
+    "baseline_at": "2026-11-24T06:15:36.689972+00:00",
+    "ports": 8,
+    "counters": 440,
+    "read_errors": 0,
+    "nonzero_error_or_timeout_deltas": {
+      "rdma0/1": {},
+      "rdma1/1": {},
+      "rdma2/1": {},
+      "rdma3/1": {},
+      "rdma4/1": {},
+      "rdma5/1": {},
+      "rdma6/1": {},
+      "rdma7/1": {}
+    },
+    "limits": "ECN/CNP and duplicate-response counters did grow. No matched before/after RDMA snapshot exists for the failed run; the current counters do not rule out a past transient fault."
+  },
+  "limits": [
+    "This is an in-progress snapshot, not a completed benchmark or fix validation.",
+    "A single remap run cannot distinguish mapping dependence, timing sensitivity, transient path failure or the effect of restarting.",
+    "No confirmed hardware or router root cause."
+  ],
+  "local_snapshot_sha256": "d637df7b66a29ae6ffbb5e3553579dc48b4b7cf215723b87b2a3cb15b88261d2"
+}
