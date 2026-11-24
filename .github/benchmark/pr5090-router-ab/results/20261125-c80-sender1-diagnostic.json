@@ -1,0 +1,179 @@
+{
+  "lease": "La786a5",
+  "node": "pit2-p03-g48",
+  "gpus": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "harness_sha": "9c63b1c0237e330a8a01654fea214745fbdc1224",
+  "router_sha": "69ed5e77bcc93b9d51cb5cf1528badd0e703ed93",
+  "srt_sha": "85ecf60ac3931f38abdb0dd82f909f35057d5e12",
+  "worker_image": "vllm/vllm-openai-rocm:minimax-m31-flash-75bc8cf1@sha256:f8e8ab239e5edb7c3070c5802fc7fc0cbb889513bf81183dfc98ce1c77e1dfe1",
+  "diagnostic_only": true,
+  "concurrency": 80,
+  "requested_duration_s": 900,
+  "send_duration_s": 900.003,
+  "raw_record_counts": {
+    "warmup:error": 782,
+    "warmup:valid": 102,
+    "profiling:valid": 3056,
+    "profiling:cancelled": 0
+  },
+  "agentx_submission_valid": true,
+  "phase_notices": [
+    "22:51:33.918 NOTICE   Phase warmup (warmup) started | target: 884 requests (runner.py:600)",
+    "22:57:30.487 NOTICE   Phase warmup (warmup) sending complete | sent=884, completed=873, in_flight=11 | sessions: sent=82, completed=24 (runner.py:1047)",
+    "22:57:31.490 NOTICE   Phase warmup (warmup) complete | completed=884, cancelled=0, errors=0 | sessions: completed=25, cancelled=0 | elapsed=357.57s (runner.py:1170)",
+    "22:57:31.648 NOTICE   Phase profiling (profiling) started | phase_index=0 | profiling_index=0 | target: 900.0s duration (runner.py:600)",
+    "23:12:31.651 NOTICE   Phase profiling (profiling) sending complete | sent=3,059, completed=3,027, in_flight=32 | sessions: sent=93, completed=29 | timeout_triggered=True (runner.py:1047)",
+    "23:13:01.650 NOTICE   Phase profiling (profiling) complete | completed=3,056, cancelled=3, errors=0 | sessions: completed=29, cancelled=0 | elapsed=930.00s | grace_period_timeout=True (runner.py:1170)",
+    "23:13:01.650 NOTICE   All credits completed (phase_orchestrator.py:252)",
+    "23:13:01.650 NOTICE   All requests have completed, please wait for the results to be processed (currently 3,056 of 3,056 records processed)... (records_manager.py:1227)"
+  ],
+  "kv_probe": {
+    "metric": "vllm:mooncake_bytes_transferred_sum",
+    "prefill_before": 0.0,
+    "prefill_after": 101376000.0,
+    "transferred_bytes_delta": 101376000.0,
+    "passed": true
+  },
+  "failed_sends_by_pp_rank": {},
+  "final_worker_metrics": {
+    "prefill": [
+      {
+        "metric": "vllm:mooncake_num_failed_transfers_total{engine=\"0\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:mooncake_num_failed_recvs_total{engine=\"0\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:mooncake_num_kv_expired_reqs_total{engine=\"0\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:num_requests_running{engine=\"0\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:num_requests_waiting{engine=\"0\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      }
+    ],
+    "decode": [
+      {
+        "metric": "vllm:mooncake_num_failed_transfers_total{engine=\"0\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:mooncake_num_failed_transfers_total{engine=\"1\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:mooncake_num_failed_transfers_total{engine=\"2\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:mooncake_num_failed_transfers_total{engine=\"3\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:mooncake_num_failed_recvs_total{engine=\"0\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:mooncake_num_failed_recvs_total{engine=\"1\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:mooncake_num_failed_recvs_total{engine=\"2\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:mooncake_num_failed_recvs_total{engine=\"3\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:mooncake_num_kv_expired_reqs_total{engine=\"0\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:mooncake_num_kv_expired_reqs_total{engine=\"1\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:mooncake_num_kv_expired_reqs_total{engine=\"2\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:mooncake_num_kv_expired_reqs_total{engine=\"3\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:num_requests_running{engine=\"0\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:num_requests_running{engine=\"1\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:num_requests_running{engine=\"2\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:num_requests_running{engine=\"3\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:num_requests_waiting{engine=\"0\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:num_requests_waiting{engine=\"1\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:num_requests_waiting{engine=\"2\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:num_requests_waiting{engine=\"3\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      }
+    ]
+  },
+  "exit_codes": {
+    "pool-workload.rc": 0,
+    "pool-exit.rc": 0,
+    "gpool-release.rc": 0
+  },
+  "source_comparison": "Same g48 C80 worker configuration as Lb6034c, except P num_workers10->1; observation shortened to900s",
+  "interpretation": "A successful diagnostic supports sender concurrency or queue pressure as a factor; it does not identify the root cause or establish full-run reliability.",
+  "sa_performance_point": null,
+  "raw_records_sha256": "c1ba07c4c0b3bb2f1fff96424498e84f8a58f36712b9a17cad93fc3808ff5b77",
+  "transfer_and_cleanup_passed": true,
+  "raw_error_counts_by_phase_and_type": {
+    "warmup:InvalidInferenceResultError": 782
+  },
+  "warmup_note": "Control log reports884 completed/errors0, but raw exports include782 empty-content warmup errors and102 valid records. Existing TP C40 arms each had444 empty-content warmup records. These are retained, excluded from profiling, and not evidence of zero content errors during warmup.",
+  "drain_cancelled_requests": 3,
+  "drain_cancel_note": "Control log sent3059/completed3056/cancelled3 after30s grace; raw exports contain3056 profiling records, so cancelled requests have no exported per-request record.",
+  "remaining_run_containers": [],
+  "archive_sha256": "2edc453b94abe5ea3bac29a079e007e595c2041213c96fddf9c0dedd1950a136",
+  "rdma_observation": {
+    "first": "2026-11-24T22:27:14.657813+00:00",
+    "last": "2026-11-24T23:13:44.313409+00:00",
+    "samples": 62,
+    "counter_count": 200,
+    "nonzero_error_counter_deltas": {},
+    "limits": "Host-level counters do not identify individual QPs or rule out every transport fault."
+  }
+}

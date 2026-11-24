@@ -42,7 +42,7 @@
         "dbo-prefill-token-threshold": 16384,
         "dbo-decode-token-threshold": 32768,
         "compilation-config": "{\"max_cudagraph_capture_size\":2048}",
-        "kv-transfer-config": "{\"kv_connector\":\"MultiConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"connectors\":[{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"kv_producer\",\"kv_connector_extra_config\":{\"mooncake_protocol\":\"rdma\",\"num_workers\":10}},{\"kv_connector\":\"SimpleCPUOffloadConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":1349000000000,\"lazy_offload\":false,\"cpu_lru_eviction\":true}}]}}",
+        "kv-transfer-config": "{\"kv_connector\":\"MultiConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"connectors\":[{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"kv_producer\",\"kv_connector_extra_config\":{\"mooncake_protocol\":\"rdma\",\"num_workers\":1}},{\"kv_connector\":\"SimpleCPUOffloadConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":1349000000000,\"lazy_offload\":false,\"cpu_lru_eviction\":true}}]}}",
         "max-num-seqs": 80,
         "pipeline-parallel-size": 4
       },
@@ -187,7 +187,7 @@
     "orchestration": "native srtctl SweepOrchestrator and DockerLauncher under an owned GPU-pool lease"
   },
   "functional_only": false,
-  "purpose": "Single-node PP4 to DEP4 C80 full performance with decode max-num-seqs20 per rank; compare against existing SA TP C80 results without another TP GPU run",
+  "purpose": "Single-node PP4 to DEP4 C80 full 3600s performance with P sender1 and D max-num-seqs20 per rank, following La786a5 diagnostic; reuse the existing SA TP C80 result.",
   "layout": "single_node",
   "case_name": "pr5090-1p1d-pp4-dep4-c80-3600s",
   "router_build": {
@@ -228,7 +228,8 @@
   "comparison_limits": [
     "Reuse the existing SA TP C80 result; no TP C80 experiment is authorized.",
     "Record and disclose node/GPU-count, topology, software and workload differences from the SA result; no isolated router-gain claim.",
-    "C80 also changes decode max-num-seqs from 5 to 20 per DP rank and expands DSpark capture sizes to 160 tokens, as approved by the user."
+    "C80 also changes decode max-num-seqs from 5 to 20 per DP rank and expands DSpark capture sizes to 160 tokens, as approved by the user.",
+    "P sender count is reduced from 10 to 1; this also reduces asynchronous sender tasks from 20 to 2. Do not attribute the observation to a single native concurrency mechanism."
   ],
   "prefill_device_order": [
     0,
@@ -266,5 +267,22 @@
     ],
     "decode_max_cudagraph_capture_size": 160,
     "tp_c80_baseline": "Reuse existing SA submission result; do not run TP C80"
+  },
+  "sender_concurrency_adjustment": {
+    "reference_lease": "Lb6034c",
+    "diagnostic_lease": "La786a5",
+    "parameter": "prefill Mooncake num_workers",
+    "previous": 10,
+    "current": 1,
+    "effective_sender_threads": [
+      10,
+      1
+    ],
+    "effective_async_sender_tasks": [
+      20,
+      2
+    ],
+    "admission": "Dispatch only after the 900s diagnostic completes without transfer failures and releases its GPU lease.",
+    "interpretation": "Candidate mitigation and performance measurement; the PP3 root cause is not established."
   }
 }
