@@ -326,6 +326,9 @@ async fn process_choice(
 /// refuses a longer text outright.
 const ONE_SHOT_MAX_BYTES: usize = 65536;
 
+/// Fed last to the piece-by-piece parse: no reasoning delimiter starts with it.
+const RELEASE: &str = "\0";
+
 /// A whole reply (`text`, decoded as `pieces`) split into content and reasoning, the
 /// prompt's `opener` read first; one over the one-shot limit is parsed piece by piece.
 async fn split_reasoning(
@@ -359,6 +362,13 @@ async fn split_reasoning(
         normal.push_str(&result.normal_text);
         reasoning.push_str(&result.reasoning_text);
     }
+    // A last piece that could start a delimiter ("<", "</") is held back; a character
+    // no delimiter starts with releases it, and is dropped again.
+    let held = parser
+        .parse_reasoning_streaming_incremental(RELEASE)
+        .map_err(|e| e.to_string())?;
+    normal.push_str(held.normal_text.trim_end_matches(RELEASE));
+    reasoning.push_str(held.reasoning_text.trim_end_matches(RELEASE));
     if !entered {
         // The one-shot parse hands back a reply without reasoning untouched.
         return Ok(ParserResult::normal(text.to_string()));
@@ -528,5 +538,19 @@ mod split_reasoning_tests {
         // Without the opener the same reply has no reasoning to find.
         let result = split(&["plain", "</think>", "Done."], None).await;
         assert!(result.reasoning_text.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_reply_ending_in_a_delimiter_s_first_characters_keeps_them() {
+        for len in [100, ONE_SHOT_MAX_BYTES + 1000] {
+            let thought = "z".repeat(len);
+            // Generation ended inside reasoning, then after it, on a lone "<" or "</".
+            let result = split(&["<think>", &thought, "<"], None).await;
+            assert_eq!(result.reasoning_text, format!("{thought}<"), "len {len}");
+            assert!(result.normal_text.is_empty(), "len {len}");
+            let result = split(&["<think>", &thought, "</think>", "3 ", "</"], None).await;
+            assert_eq!(result.reasoning_text, thought, "len {len}");
+            assert_eq!(result.normal_text, "3 </", "len {len}");
+        }
     }
 }
