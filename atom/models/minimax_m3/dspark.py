@@ -26,7 +26,8 @@ config to the MHA backend, which owns a pool laid out like the target's and
 binds it onto each layer's ``KVCacheBinding``. Both writes -- context rows and the
 block's own rows -- go through ``triton_fused_norm_rope_cache`` with an explicit
 slot mapping, the kernel the target's dense layers use for the same norm, RoPE
-and per-token fp8 cache format.
+and per-token fp8 cache format. The context rows of every layer come from one stacked
+K/V GEMM and one norm/RoPE/cache launch (``write_context_rows``), at any TP.
 
 The block attention is ``B * T`` independent q_len=1 paged decode rows --
 non-causal by construction -- over each request's ``[context | block]``,
