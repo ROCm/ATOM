@@ -379,12 +379,13 @@ class DeepSeekV41ShareCacheCellsTest(unittest.TestCase):
             '--warmup-requests-per-lane "${AIPERF_WARMUP_REQUESTS_PER_LANE}" \\', script
         )
 
-    def test_every_mooncake_process_runs_the_ionic_transport_settings(self):
+    def test_every_mooncake_process_runs_the_recipes_transport_settings(self):
         settings = {
             "MC_NUM_QP_PER_EP": "1",
-            "MC_WORKERS_PER_CTX": "1",
-            "MC_MAX_WR": "64",
-            "MC_IB_PCI_RELAXED_ORDERING": "0",
+            "MC_WORKERS_PER_CTX": None,
+            "MC_MAX_WR": None,
+            "MC_IB_PCI_RELAXED_ORDERING": None,
+            "MC_ENABLE_DEST_DEVICE_AFFINITY": None,
         }
         for cell in self.cells:
             with self.subTest(cell=cell["name"]):
@@ -394,13 +395,10 @@ class DeepSeekV41ShareCacheCellsTest(unittest.TestCase):
                     settings,
                 )
 
-    def test_store_reads_prefer_the_owner_nic_on_the_requesters_rail(self):
+    def test_each_decode_node_owner_serves_on_all_of_its_numa_nodes_nics(self):
         for cell in self.cells:
             with self.subTest(cell=cell["name"]):
                 exports = self.submitted_exports(cell)
-                self.assertEqual(
-                    exports.get("ATOMESH_ENV_MC_ENABLE_DEST_DEVICE_AFFINITY"), "1"
-                )
                 owners = exports["ATOMESH_PREFILL_ENV_MOONCAKE_STORE_DECODE_OWNERS"]
                 self.assertEqual(
                     [entry.split(":")[2] for entry in owners.split(";")],
