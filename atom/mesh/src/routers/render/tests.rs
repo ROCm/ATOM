@@ -27,6 +27,7 @@ mod test_support {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         }
     }
 
@@ -51,6 +52,7 @@ mod test_support {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         }
     }
 }
@@ -214,6 +216,7 @@ mod b2_chat_aggregator_branches {
             reasoning_parser_factory: Some(test_mocks::reasoning_parser_factory()),
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         }
     }
 
@@ -552,6 +555,7 @@ mod b3_chat_aggregator_typed {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         }
     }
 
@@ -964,6 +968,7 @@ mod c2_chat_streaming_branches {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         }
     }
 
@@ -1329,6 +1334,7 @@ mod c3_chat_streaming_parsers {
             reasoning_parser_factory: Some(test_mocks::reasoning_parser_factory()),
             configured_tool_parser: configured_tool.map(|s| s.to_string()),
             configured_reasoning_parser: configured_reasoning.map(|s| s.to_string()),
+            prompt_opener: None,
         }
     }
 
@@ -1537,6 +1543,7 @@ mod c4_chat_streaming_coverage {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         }
     }
 
@@ -1558,6 +1565,7 @@ mod c4_chat_streaming_coverage {
             reasoning_parser_factory: Some(test_mocks::reasoning_parser_factory()),
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         }
     }
 
@@ -1578,6 +1586,7 @@ mod c4_chat_streaming_coverage {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         }
     }
 
@@ -2201,6 +2210,7 @@ mod c4_chat_streaming_coverage {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         };
         let stream = synthetic_single_stream(vec![
             Ok(TokenChunk::Partial {
@@ -2979,6 +2989,7 @@ mod d2_generate_aggregator_branches {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         };
         let stream = synthetic_single_stream(vec![Ok(TokenChunk::Complete {
             token_ids: vec![1, 2, 3],
@@ -3025,6 +3036,7 @@ mod d2_generate_aggregator_branches {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         };
         let lp = TokenLogprobs {
             items: vec![TokenLogprob {
@@ -3272,6 +3284,54 @@ mod e1_generate_streaming_body_content {
     }
 
     #[tokio::test]
+    async fn test_generate_streaming_decodes_a_character_split_across_steps() {
+        use std::sync::Arc;
+
+        use crate::routers::{
+            prepare::stop_decoder_builder::create_stop_decoder,
+            test_mocks::tokenizer::byte_level_tokenizer_dir,
+        };
+        use crate::tokenizer::{huggingface::HuggingFaceTokenizer, traits::Tokenizer};
+
+        let dir = byte_level_tokenizer_dir(&[], false, serde_json::json!({}));
+        let path = dir.path().join("tokenizer.json");
+        let tokenizer: Arc<dyn Tokenizer> =
+            Arc::new(HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap());
+        let mut ctx = generate_ctx();
+        ctx.stop_decoder = create_stop_decoder(&tokenizer, None, None, true, false);
+        ctx.tokenizer = tokenizer;
+        // "你" is three bytes, one token each in a byte-level vocabulary; the
+        // engine hands over the first in one step and the rest in the next.
+        let ids: Vec<u32> = "你".bytes().map(u32::from).collect();
+        let partial = |token_ids: &[u32]| {
+            Ok(TokenChunk::Partial {
+                token_ids: token_ids.to_vec(),
+                logprobs: None,
+            })
+        };
+        let stream = synthetic_single_stream(vec![
+            partial(&ids[..1]),
+            partial(&ids[1..]),
+            Ok(TokenChunk::Complete {
+                token_ids: ids.clone(),
+                finish_reason: FinishReason::Stop,
+                matched_stop: None,
+                usage: Usage {
+                    prompt_tokens: 1,
+                    completion_tokens: 3,
+                    total_tokens: 4,
+                },
+                logprobs: None,
+                input_logprobs: None,
+                meta: meta(),
+            }),
+        ]);
+        let s = body_of(generate_streaming::process(stream, ctx, "regular")).await;
+        assert!(s.contains("\"text\":\"你\""), "{s}");
+        assert!(!s.contains('\u{FFFD}'), "{s}");
+    }
+
+    #[tokio::test]
     async fn test_generate_streaming_partial_accumulates_text() {
         let stream = synthetic_single_stream(vec![
             Ok(TokenChunk::Partial {
@@ -3437,6 +3497,7 @@ mod e2_generate_streaming_branches {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         }
     }
 

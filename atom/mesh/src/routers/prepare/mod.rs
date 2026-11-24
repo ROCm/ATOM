@@ -33,7 +33,7 @@ mod tests;
 
 use chat_template::{
     atom_chat_render_gap, atom_template_not_loaded, default_template_kwargs,
-    process_chat_messages_with_defaults, AtomChat, LoadedTemplate,
+    process_chat_messages_with_defaults, AtomChat, LoadedTemplate, ProcessedMessages,
 };
 use generation_payload::{GenerationPayload, LogprobConfig, SamplingParams, StopConfig};
 use response_context::{ProtocolRequest, ResponseContext};
@@ -115,23 +115,57 @@ fn template_loading(model_id: &str, worker: &Arc<dyn Worker>) -> Response {
     )
 }
 
+/// A chat prompt rendered outside the router, for a model whose template the
+/// router cannot render (ATOM's Python message encoders).
+#[derive(Debug, Clone)]
+pub struct RenderedChat {
+    pub text: String,
+    pub token_ids: Vec<u32>,
+    /// The channel opener the prompt ends on (`ResponseContext::prompt_opener`).
+    pub prompt_opener: Option<String>,
+}
+
 pub fn prepare_chat(
     req: Arc<ChatCompletionRequest>,
     headers: Option<HeaderMap>,
     model_id: Option<String>,
     components: &AppContext,
 ) -> Result<(GenerationPayload, ResponseContext), Response> {
-    let (payload, ctx, _) = prepare_chat_rendered(req, headers, model_id, components)?;
-    Ok((payload, ctx))
+    prepare_chat_with(req, headers, model_id, components, None, false)
 }
 
-/// `prepare_chat`, with the template its prompt rendered with.
-pub(crate) fn prepare_chat_rendered(
+/// `prepare_chat`, taking the prompt as `rendered` when it is given, and,
+/// with `reads_prompt_opener`, naming the opener a prompt it renders ends on
+/// (`ResponseContext::prompt_opener`; a rendered prompt names its own).
+pub fn prepare_chat_with(
     req: Arc<ChatCompletionRequest>,
     headers: Option<HeaderMap>,
     model_id: Option<String>,
     components: &AppContext,
-) -> Result<(GenerationPayload, ResponseContext, RenderedTemplate), Response> {
+    rendered: Option<RenderedChat>,
+    reads_prompt_opener: bool,
+) -> Result<(GenerationPayload, ResponseContext), Response> {
+    let prepared = prepare_chat_checked(
+        req,
+        headers,
+        model_id,
+        components,
+        rendered,
+        reads_prompt_opener,
+    )?;
+    Ok((prepared.0, prepared.1))
+}
+
+/// `prepare_chat_with`, with the template a prompt it renders is rendered with; a
+/// prompt rendered outside the router is not checked against any.
+pub(crate) fn prepare_chat_checked(
+    req: Arc<ChatCompletionRequest>,
+    headers: Option<HeaderMap>,
+    model_id: Option<String>,
+    components: &AppContext,
+    rendered: Option<RenderedChat>,
+    reads_prompt_opener: bool,
+) -> Result<(GenerationPayload, ResponseContext, Option<RenderedTemplate>), Response> {
     let model_id_str = model_id.as_deref().ok_or_else(|| {
         error!("model_id not set");
         error::internal_error("model_id_not_set", "model_id not set in request")
@@ -157,7 +191,12 @@ pub(crate) fn prepare_chat_rendered(
     };
     // A template file the tokenizer was loaded with is a template, as --chat-template is.
     let templated = configured_template || loaded_template == Some(LoadedTemplate::File);
-    if let Some(gap) = atom_chat_render_gap(&workers, templated, built_in_encoder) {
+    // A prompt rendered outside the router needs neither.
+    let renders = rendered.is_none();
+    if let Some(gap) = renders
+        .then(|| atom_chat_render_gap(&workers, templated, built_in_encoder))
+        .flatten()
+    {
         return Err(error::not_implemented(
             "chat_template_unavailable",
             format!(
@@ -166,12 +205,15 @@ pub(crate) fn prepare_chat_rendered(
             ),
         ));
     }
-    let rendered = RenderedTemplate {
+    let template = renders.then(|| RenderedTemplate {
         model_id: model_id_str.to_string(),
         configured: configured_template,
         loaded: loaded_template.clone(),
-    };
-    if let Some(worker) = atom_template_not_loaded(&workers, configured_template, loaded_template) {
+    });
+    if let Some(worker) = template
+        .as_ref()
+        .and_then(|_| atom_template_not_loaded(&workers, configured_template, loaded_template))
+    {
         return Err(template_loading(model_id_str, worker));
     }
     let tokenizer = entry
@@ -188,18 +230,33 @@ pub(crate) fn prepare_chat_rendered(
         .transpose()
         .map_err(|e| error::internal_error("invalid_reasoning_toggle", e))?;
 
-    let processed = process_chat_messages_with_defaults(
-        &body_ref,
-        &*tokenizer,
-        default_kwargs.as_ref(),
-        atom.as_ref(),
-    )
-    .map_err(|e| error::bad_request("process_messages_failed", e))?;
-
-    let encoding = tokenizer
-        .encode(&processed.text, false)
-        .map_err(|e| error::internal_error("tokenization_failed", format!("{}", e)))?;
-    let token_ids = encoding.token_ids().to_vec();
+    let (processed, token_ids, prompt_opener) = match rendered {
+        Some(rendered) => (
+            ProcessedMessages {
+                text: rendered.text,
+                stop_sequences: body_ref.stop.clone(),
+            },
+            rendered.token_ids,
+            rendered.prompt_opener,
+        ),
+        None => {
+            let processed = process_chat_messages_with_defaults(
+                &body_ref,
+                &*tokenizer,
+                default_kwargs.as_ref(),
+                atom.as_ref(),
+            )
+            .map_err(|e| error::bad_request("process_messages_failed", e))?;
+            let encoding = tokenizer
+                .encode(&processed.text, false)
+                .map_err(|e| error::internal_error("tokenization_failed", format!("{}", e)))?;
+            let token_ids = encoding.token_ids().to_vec();
+            let prompt_opener = reads_prompt_opener
+                .then(|| response_context::prompt_opener(&processed.text))
+                .flatten();
+            (processed, token_ids, prompt_opener)
+        }
+    };
 
     let tool_constraints = if let Some(tools) = body_ref.tools.as_ref() {
         generate_tool_constraints(tools, &req.tool_choice, &req.model)
@@ -245,9 +302,10 @@ pub(crate) fn prepare_chat_rendered(
         reasoning_parser_factory: components.reasoning_parser_factory.clone(),
         configured_tool_parser: components.configured_tool_parser.clone(),
         configured_reasoning_parser: components.configured_reasoning_parser.clone(),
+        prompt_opener,
     };
 
-    Ok((payload, ctx, rendered))
+    Ok((payload, ctx, template))
 }
 
 pub fn prepare_generate(
@@ -300,6 +358,7 @@ pub fn prepare_generate(
         reasoning_parser_factory: components.reasoning_parser_factory.clone(),
         configured_tool_parser: components.configured_tool_parser.clone(),
         configured_reasoning_parser: components.configured_reasoning_parser.clone(),
+        prompt_opener: None,
     };
 
     Ok((payload, ctx))

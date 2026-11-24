@@ -13,6 +13,7 @@ pub mod middleware;
 pub mod observability;
 pub mod policies;
 pub mod python;
+pub mod reasoning;
 pub use openai_protocol as protocols;
 pub use reasoning_parser;
 pub mod routers;

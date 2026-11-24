@@ -1022,6 +1022,36 @@ def test_an_abort_is_applied_while_admissions_are_at_their_cap(serve, monkeypatc
     assert [prompt for prompt, *_ in engine.preprocessed] == [[1], [2], [3], [4]]
 
 
+def test_the_end_of_the_client_s_side_aborts_without_waiting_for_an_admission(serve):
+    engine = FakeEngine([([5], None)])
+    servicer = serve(engine)
+
+    async def client():
+        yield pb.Frames(frames=_submit_batch((3, "a", [1])))
+        await _until(lambda: engine.running)  # A runs
+        engine.release.clear()  # B holds its admission in preprocess
+        yield pb.Frames(frames=_submit_batch((4, "b", [2])))
+        await _until(lambda: len(engine.preprocessed) == 2)  # then the side ends
+
+    async def end_while_b_is_admitted():
+        call = servicer.Session(client(), SimpleNamespace())
+        reading = asyncio.create_task(_drain(call))
+        try:
+            await _until(lambda: engine.aborted)
+            return not engine.release.is_set()
+        finally:
+            engine.release.set()
+            await asyncio.wait_for(reading, 10)
+
+    assert asyncio.run(end_while_b_is_admitted())  # A aborted while B preprocessed
+    assert engine.aborted == [engine.made[0]] and len(engine.submitted) == 1
+
+
+async def _drain(call):
+    async for _ in call:
+        pass
+
+
 def test_a_submission_past_the_waiting_bound_is_rejected_overloaded(serve, monkeypatch):
     monkeypatch.setattr(grpc_server, "SESSION_ADMISSIONS", 1)
     monkeypatch.setattr(grpc_server, "SESSION_WAITING", 1)

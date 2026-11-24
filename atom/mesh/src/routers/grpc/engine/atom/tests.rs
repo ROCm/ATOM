@@ -406,9 +406,9 @@ async fn a_stream_becomes_token_chunks_in_order() {
     );
     assert_eq!((counts, meta.cached_tokens), ((3, 3, 6), 2));
     let timing = SeqTiming {
-        ttft_s: 0.25,
-        tpot_s: 0.125,
-        latency_s: 0.5,
+        ttft: 0.25,
+        tpot: 0.125,
+        latency: 0.5,
     };
     assert_eq!(meta.timing, Some(timing));
 
