@@ -3596,8 +3596,7 @@ class ModelRunner:
                     target_logits_indices,
                     bonus_logits_indices,
                     spec_decode_metadata.cu_num_draft_tokens,
-                    # the seam's contract is a Python bool (a NumPy reduction is not)
-                    all_greedy=bool(all_greedy),
+                    all_greedy=all_greedy,
                     top_ks=top_ks,
                     top_ps=top_ps,
                     needs_independent_noise=needs_independent_noise or not all_greedy,
