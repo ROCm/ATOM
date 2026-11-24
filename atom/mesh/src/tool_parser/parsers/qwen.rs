@@ -66,11 +66,13 @@ mod coder {
     /// A call ATOM's HTTP parser reads outside a `<tool_call>` wrapper too.
     const BARE_CALL_START: &str = "<function=";
 
-    /// Wrapped calls, and bare ones, as ATOM's HTTP parser reads them.
+    /// Wrapped calls, and bare ones, as ATOM's HTTP parser reads them; a bare one's last
+    /// parameter may be cut off in its name, which is then no parameter.
     static WRAPPED_OR_BARE_CALLS: LazyLock<Regex> = LazyLock::new(|| {
         let pattern = concat!(
             r"(?s)<tool_call>\s*(.*?)\s*</tool_call>",
-            r"|(<function=[^<>]*>(?:\s*<parameter=[^>]*>.*?</parameter>)*\s*</function>)",
+            r"|(<function=[^<>]*>(?:\s*<parameter=[^>]*>.*?</parameter>)*",
+            r"(?:\s*<parameter=[^<>]*)?\s*</function>)",
         );
         Regex::new(pattern).expect("Valid regex pattern")
     });
@@ -445,13 +447,27 @@ mod coder {
                 // Look for tool call start
                 if !self.in_tool_call {
                     if let Some((s, bare)) = self.call_start(&self.buffer) {
-                        normal_text.push_str(&self.buffer[..s]);
                         // A bare call keeps its `<function=`, read as the name next.
                         let opener = if bare {
                             0
                         } else {
                             self.tool_call_start_token.len()
                         };
+                        // As ATOM reads it, a `<tool_call>` no `<function=` follows is text.
+                        let rest = self.buffer[s + opener..].trim_start();
+                        if self.bare_calls && !bare && !rest.starts_with(BARE_CALL_START) {
+                            let quoted = match BARE_CALL_START.starts_with(rest) {
+                                true => s,
+                                false => s + opener,
+                            };
+                            normal_text.push_str(&self.buffer[..quoted]);
+                            self.buffer.drain(..quoted);
+                            if quoted == s {
+                                break;
+                            }
+                            continue;
+                        }
+                        normal_text.push_str(&self.buffer[..s]);
                         self.buffer = self.buffer[s + opener..].to_string();
                         self.in_tool_call = true;
                         self.bare_call = bare;
@@ -617,22 +633,20 @@ mod coder {
                 return None;
             }
             let mut closers = String::new();
-            // Outside a value, a tag cut off where a parameter or the close starts is
-            // completed, so a bare call rereads whole (an empty name is no parameter).
+            // Outside a value, a tag cut off is completed, so a bare call rereads whole.
             if rest.rfind("<parameter=") <= rest.rfind("</parameter>") {
                 let cut = |tag: &'static str| {
                     helpers::ends_with_partial_token(rest, tag).map(|arrived| &tag[arrived..])
                 };
-                if let Some(completion) = followers.into_iter().find_map(cut) {
-                    closers.push_str(completion);
-                    if completion.ends_with('=') {
-                        closers.push('>');
-                    }
-                }
+                let tags = ["<parameter=", "</function>", "</parameter>"];
+                closers.extend(tags.into_iter().find_map(cut));
             }
             let rest = format!("{rest}{closers}");
-            if rest.rfind("<parameter=") > rest.rfind("</parameter>") {
-                closers.push_str("</parameter>");
+            // A value is closed; a parameter's cut-off name is no parameter, as on HTTP.
+            if let Some(open) = rest.rfind("<parameter=") {
+                if Some(open) > rest.rfind("</parameter>") && rest[open..].contains('>') {
+                    closers.push_str("</parameter>");
+                }
             }
             if !rest.contains("</function>") {
                 closers.push_str("</function>");
@@ -641,6 +655,20 @@ mod coder {
                 closers.push_str(self.tool_call_end_token);
             }
             Some(closers)
+        }
+
+        fn end_of_input_text(&mut self) -> String {
+            if self.in_tool_call && self.current_tool_name_sent {
+                return String::new();
+            }
+            let opener = match self.in_tool_call && !self.bare_call {
+                true => self.tool_call_start_token,
+                false => "",
+            };
+            let text = format!("{opener}{}", self.buffer);
+            self.buffer.clear();
+            self.reset_streaming_state();
+            text
         }
 
         /// ATOM's HTTP parser reads a bare `<function=...>` call as a call; SGLang's and
@@ -770,6 +798,53 @@ mod coder {
                 .await
                 .unwrap();
             assert_eq!((text.as_str(), calls.len()), (prose, 1));
+            for size in 1..=9 {
+                let (streamed, calls) = stream(&reply, size).await;
+                assert_eq!((streamed.as_str(), calls), (prose, 1), "{size}-byte pieces");
+            }
+        }
+
+        /// What `reply` streams in `size`-byte pieces, then at end of input, read as ATOM
+        /// with get_weather declared: (text, calls named).
+        async fn stream(reply: &str, size: usize) -> (String, usize) {
+            let tool: Tool = serde_json::from_value(serde_json::json!({
+                "type": "function", "function": {"name": "get_weather", "parameters": {}},
+            }))
+            .unwrap();
+            let tools = [tool];
+            let mut parser = QwenCoderParser::new();
+            parser.read_as_atom();
+            let mut read = Vec::new();
+            for piece in reply.as_bytes().chunks(size) {
+                let piece = std::str::from_utf8(piece).unwrap();
+                read.push(parser.parse_incremental(piece, &tools).await.unwrap());
+            }
+            if let Some(closers) = parser.end_of_input_closers(&tools) {
+                read.push(parser.parse_incremental(&closers, &tools).await.unwrap());
+            }
+            let calls = read.iter().flat_map(|result| &result.calls);
+            let calls = calls.filter(|call| call.name.is_some()).count();
+            let mut text: String = read.iter().map(|result| &*result.normal_text).collect();
+            text.push_str(&parser.end_of_input_text());
+            (text, calls)
+        }
+
+        /// Text a parser holds at end of input as a call's possible start, and that never
+        /// became one, is text.
+        #[tokio::test]
+        async fn a_held_opener_no_call_followed_is_text_at_end_of_input() {
+            for reply in [
+                "The prefix is <fun",
+                "The prefix is <tool_c",
+                "Cut: <function=get_wea",
+                "Cut: <tool_call><function=get_wea",
+                "Quote: <tool_call>\n",
+            ] {
+                for size in 1..=5 {
+                    let read = stream(reply, size).await;
+                    assert_eq!(read, (reply.to_string(), 0), "{size}-byte pieces");
+                }
+            }
         }
 
         #[test]

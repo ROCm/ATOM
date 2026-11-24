@@ -142,6 +142,12 @@ pub trait ToolParser: Send + Sync {
         None
     }
 
+    /// After `end_of_input_closers` is read: the text the parser still holds as the
+    /// possible start of a call that never came, which is the reply's text.
+    fn end_of_input_text(&mut self) -> String {
+        String::new()
+    }
+
     /// Read replies as ATOM's HTTP parser for the format does, where that differs from
     /// SGLang's and vLLM's; set on a parser made for an ATOM worker's reply.
     fn read_as_atom(&mut self) {}

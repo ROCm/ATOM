@@ -431,6 +431,20 @@ async fn run_chat_stream(
                 send_bytes(tx, &sse_buffer, "cut-off tool call")?;
             }
         }
+        // What it held as the start of a call that never came is text.
+        let held = match &tool_parser {
+            Some(parser) => parser.lock().await.end_of_input_text(),
+            None => String::new(),
+        };
+        if !held.is_empty() {
+            let chunk = ChatCompletionStreamResponse::builder(request_id, model)
+                .created(created)
+                .add_choice_content(INDEX, "assistant", held)
+                .maybe_system_fingerprint(system_fingerprint.clone())
+                .build();
+            format_sse_chunk_into(&mut sse_buffer, &chunk, null_usage);
+            send_bytes(tx, &sse_buffer, "held text")?;
+        }
     }
     if let Some(parser) = &tool_parser {
         let guard = parser.lock().await;
