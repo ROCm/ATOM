@@ -2578,13 +2578,17 @@ models:
         ATOM_DISABLE_MMAP: "true"
         ATOM_PD_RANK_MAPPING_POLICY: none
         MC_NUM_QP_PER_EP: "1"
-        # pit2-p03's ionic NICs, as the MI350X cells: when the C1228 lanes
-        # start their Store loads, every P NIC stops completing reads with
-        # 2 workers x 256 WRs outstanding. One worker per context, a smaller
-        # WR depth and no relaxed ordering.
+        # pit2-p03's ionic NICs, as the MI350X cells: one worker per context,
+        # a smaller WR depth and no relaxed ordering.
         MC_WORKERS_PER_CTX: "1"
         MC_MAX_WR: "64"
         MC_IB_PCI_RELAXED_ORDERING: "0"
+        # A Store read goes to the owner's NIC of its requester's name, on the
+        # requester's rail, where the owner has one (as the other models'
+        # cells). Without it seven reads in eight crossed rails, and at C1228
+        # the Store reads stopped completing while P->D, on its own rails,
+        # went on.
+        MC_ENABLE_DEST_DEVICE_AFFINITY: "1"
         MC_LOG_LEVEL: INFO
         MOONCAKE_DISABLE_HIP_DMABUF: "1"
         HSA_ENABLE_IPC_MODE_LEGACY: "1"
@@ -2598,9 +2602,10 @@ models:
         OFFLOAD_COPY_WORKERS: "4"
         MOONCAKE_STORE: "1"
         MOONCAKE_STORE_OWNERS: none
-        # On each decode node. NUMA0 takes more: NUMA1 keeps page cache the
-        # drop cannot reach (the GLM kv_events cells).
-        MOONCAKE_STORE_DECODE_OWNERS: "0:448:rdma2,rdma3;1:339:rdma6,rdma7"
+        # On each decode node, every owner on all of its NUMA node's NICs: each
+        # prefill NIC then has a namesake on half the owners. NUMA0 takes more:
+        # NUMA1 keeps page cache the drop cannot reach (the GLM kv_events cells).
+        MOONCAKE_STORE_DECODE_OWNERS: "0:448:rdma0,rdma1,rdma2,rdma3;1:339:rdma4,rdma5,rdma6,rdma7"
         MOONCAKE_STORE_LOAD_POOL_MIB: "1024"
         MOONCAKE_STORE_SAVE_POOL_MIB: "1024"
         MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: "${ATOMESH_MODEL_ROOT}"
