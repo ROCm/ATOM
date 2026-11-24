@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Qwen MTP history recovery must equal execution of accepted tokens only."""
 
 import sys
@@ -435,7 +436,7 @@ def test_qwen_replay_uses_shared_record_dtype_and_preserves_state_dtype(monkeypa
 
     config = SimpleNamespace(
         torch_dtype=torch.bfloat16,
-        hf_config=SimpleNamespace(mamba_ssm_dtype="float32"),
+        hf_config=SimpleNamespace(mamba_ssm_dtype="float32", ple_layer_ids=[]),
     )
     qwen = object.__new__(Qwen4ExpMetadataBuilder)
     qwen.model_runner = SimpleNamespace(config=config)
