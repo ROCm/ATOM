@@ -7866,3 +7866,37 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
             assert tier.take_store_reports() == (set(), {op})
         finally:
             tier.shutdown()
+
+
+@pytest.mark.parametrize("pp", [1, 4])
+def test_m31_tier_horizon_is_the_budget_over_kv_bytes_per_token(monkeypatch, pp):
+    """`lmcache_tier_horizon_tokens`, the size of cached_first's tier index:
+    each rank's budget over its KV bytes per token, summed over the stages."""
+    import atom.models.utils as model_utils
+    from atom import config as config_mod
+    from atom.kv_transfer.offload import config as offcfg
+
+    monkeypatch.setenv("ATOM_M3_SPARSE_KV_NVFP4", "1")
+    monkeypatch.setattr(config_mod, "_is_minimax_m3_config", lambda hf: True)
+    split = (60,) if pp == 1 else (17, 17, 17, 9)
+    starts = [sum(split[:i]) for i in range(pp)]
+    monkeypatch.setattr(
+        model_utils, "get_pp_indices", lambda n, r, s: (starts[r], starts[r] + split[r])
+    )
+    monkeypatch.setattr(
+        offcfg,
+        "build_lmcache_config",
+        lambda _kvc=None: SimpleNamespace(max_local_cpu_size=400.0),
+    )
+    config = _m31_pp4_config(0)
+    config.pipeline_parallel_size = pp
+    per_token = 648 * 60 + 5280
+    assert offcfg.lmcache_tier_horizon_tokens(config) == int(
+        400 * 2**30 * pp / per_token
+    )
+    monkeypatch.setattr(
+        offcfg,
+        "build_lmcache_config",
+        lambda _kvc=None: SimpleNamespace(max_local_cpu_size=0.0),
+    )
+    assert offcfg.lmcache_tier_horizon_tokens(config) is None

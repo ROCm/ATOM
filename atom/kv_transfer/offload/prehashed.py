@@ -65,12 +65,14 @@ from contextlib import nullcontext
 
 import torch
 
+from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload.metadata import (
     LMCacheReqMeta,
     PrehashedLoad,
     PrehashedSave,
     SaveSpec,
 )
+from atom.kv_transfer.offload.tier_index import TierIndex
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -79,6 +81,11 @@ _lmcache_logger = logging.getLogger("lmcache.v1.cache_engine")
 
 # Rebuild the per-request chain table's liveness view every this many inserts.
 _PRUNE_EVERY = 64
+# `tier_probe`: how long a waiting request's probed tier hit is reused, and the
+# prompt chunks all probes together may hash per scheduler step (the chain the
+# request's lookup and keys hash anyway, a step's share of it at a time).
+_TIER_PROBE_REFRESH_S = 1.0
+_TIER_PROBE_HASH_CHUNKS = 1024
 
 
 def _chunk_list(tokens, start: int, end: int) -> list[int]:
@@ -107,6 +114,12 @@ class PrehashedSaveSchedulerMixin:
         # on, and the answers of detached lookups for the scheduler thread.
         self._lookup_pool: ThreadPoolExecutor | None = None
         self._detached_answers: queue.SimpleQueue = queue.SimpleQueue()
+        # ATOM_PREFILL_ORDER=cached_first: what the tier is known to hold
+        # (`tier_probe`), and sid -> (weak ref, start chunk, hit, reuse until).
+        self._tier_index: TierIndex | None = None
+        self._tier_probes: dict[str, tuple[object, int, int, float]] = {}
+        self._tier_probes_prune_at = 4 * _PRUNE_EVERY
+        self._tier_probe_hash_left = _TIER_PROBE_HASH_CHUNKS
         if not envs.ATOM_OFFLOAD_PREHASHED_SAVE:
             if envs.ATOM_OFFLOAD_ASYNC_TIER_LOOKUP:
                 logger.warning(
@@ -149,6 +162,25 @@ class PrehashedSaveSchedulerMixin:
             int(self.chunk_size),
             "on" if self._lookup_pool is not None else "off",
         )
+        if envs.ATOM_PREFILL_ORDER == "cached_first" and self._do_load:
+            self._init_tier_index()
+
+    def _init_tier_index(self) -> None:
+        horizon = offcfg.lmcache_tier_horizon_tokens(self._config)
+        chunks = (horizon or 0) // int(self.chunk_size)
+        if chunks <= 0:
+            logger.warning(
+                "ATOM_PREFILL_ORDER=cached_first: no CPU tier size estimate for "
+                "this model and budget; waiting requests rank by the tier only "
+                "after their lookup"
+            )
+            return
+        self._tier_index = TierIndex(chunks)
+        logger.info(
+            "ATOM_PREFILL_ORDER=cached_first: waiting requests rank by the "
+            "tier's known chunks (index of up to %d chunks)",
+            chunks,
+        )
 
     # -- the chain ---------------------------------------------------------
     def _prune_prehash_chains(self) -> None:
@@ -157,7 +189,12 @@ class PrehashedSaveSchedulerMixin:
             seq = ref()
             if seq is None:
                 continue
-            if sid in self._save_tracker or self._load_lifecycles.get(sid) is seq:
+            probe = self._tier_probes.get(sid)
+            if (
+                sid in self._save_tracker
+                or self._load_lifecycles.get(sid) is seq
+                or (probe is not None and probe[0]() is seq)
+            ):
                 live.append(sid)
         self._prehash_chains = {sid: self._prehash_chains[sid] for sid in live}
 
@@ -234,6 +271,71 @@ class PrehashedSaveSchedulerMixin:
         self._prehash_verified = True
         return True
 
+    # -- tier_probe: the ranking's tier hit, without a lookup ---------------
+    def _tier_probe_start(self, num_hbm_tokens: int) -> int:
+        """Where a lookup past an HBM hit of `num_hbm_tokens` would start
+        (`_tier_lookup_start`): the whole prompt here."""
+        return 0
+
+    def tier_probe(self, seq, num_hbm_tokens: int) -> int:
+        """The prompt tokens the tier likely holds, by :class:`TierIndex`: the
+        end of the run of indexed chunks from where `seq`'s lookup would start,
+        0 if none. For `Scheduler._order_waiting` only.
+
+        Sends nothing and pins nothing. Reused for `_TIER_PROBE_REFRESH_S`
+        while the start holds; hashes at most `_TIER_PROBE_HASH_CHUNKS` new
+        prompt chunks a step across requests, a run cut short by that answering
+        what it reached and walking on at the next call.
+        """
+        index = self._tier_index
+        if index is None or not self._prehashed:
+            return 0
+        chunk = int(self.chunk_size)
+        n_chunks = int(seq.num_prompt_tokens) // chunk
+        start = min(self._tier_probe_start(num_hbm_tokens) // chunk, n_chunks)
+        sid = str(seq.id)
+        now = time.monotonic()
+        memo = self._tier_probes.get(sid)
+        if memo is not None and memo[0]() is seq and memo[1] == start and now < memo[3]:
+            return memo[2]
+        chain = self._prefix_chunk_hashes(seq, 0)
+        pos, complete = start, True
+        while pos < n_chunks:
+            if pos >= len(chain):
+                left = self._tier_probe_hash_left
+                if left <= 0:
+                    complete = False
+                    break
+                have = len(chain)
+                grow = min(n_chunks, have + min(left, max(pos + 1 - have, 64)))
+                chain = self._prefix_chunk_hashes(seq, grow)
+                if chain is None:
+                    return 0
+                self._tier_probe_hash_left = left - (grow - have)
+                if pos >= len(chain):
+                    continue
+            if chain[pos] not in index:
+                break
+            pos += 1
+        hit = pos * chunk if pos > start else 0
+        if len(self._tier_probes) >= self._tier_probes_prune_at:
+            # Admitted and finished requests are probed no more.
+            self._tier_probes = {
+                k: v
+                for k, v in self._tier_probes.items()
+                if v[0]() is not None and now - v[3] < 4 * _TIER_PROBE_REFRESH_S
+            }
+            self._tier_probes_prune_at = max(
+                4 * _PRUNE_EVERY, 2 * len(self._tier_probes)
+            )
+        self._tier_probes[sid] = (
+            self._weak_seq(seq),
+            start,
+            hit,
+            now + _TIER_PROBE_REFRESH_S if complete else now,
+        )
+        return hit
+
     # -- lookup: LMCache's own message, built from the cached chain ---------
     def _lookup_rpc(self, hashes: list[int], sid: str) -> int | None:
         """`LMCacheLookupClient.lookup` minus its hashing; None if no rank answered.
@@ -275,6 +377,9 @@ class PrehashedSaveSchedulerMixin:
             hit = self._lookup_pool.submit(self._lookup_rpc, hashes, sid).result()
         else:
             hit = self._lookup_rpc(hashes, sid)
+        if hit is not None and self._tier_index is not None:
+            self._tier_index.observe_lookup(hashes, int(hit) // chunk)
+            self._tier_probes.pop(sid, None)
         # LMCacheLookupClient answers 0, not None, when the transport failed.
         # The tier's contiguous run from `start` counts from the prompt's head;
         # none at all is no hit.
@@ -356,6 +461,7 @@ class PrehashedSaveSchedulerMixin:
     def build_connector_meta(self):
         if self._lookup_pool is not None:
             self._drain_detached_answers()
+        self._tier_probe_hash_left = _TIER_PROBE_HASH_CHUNKS
         return super().build_connector_meta()
 
     # -- save: ship the new chunks' hashes ---------------------------------
