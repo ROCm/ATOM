@@ -440,7 +440,10 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
                 for item in items:
                     if isinstance(item, frames.Rejection):  # the codec's INVALID
                         refused.append(item)
-                    elif item.seq_id in session.admitting:
+                    elif (
+                        item.seq_id in session.admitting
+                        or item.seq_id in session.requests
+                    ):
                         in_flight = ValueError(
                             f"seq_id {item.seq_id} is already in flight"
                         )
@@ -478,7 +481,9 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
         try:
             await self._submit(session, request)
         except Exception as error:  # noqa: BLE001 - refused as Generate is
-            session.reject([_rejected(client_id, error)])
+            # One that ended first had its Completion; its seq_id may be another's now.
+            if session.admitting.get(client_id) is request:
+                session.reject([_rejected(client_id, error)])
         finally:
             # Unless it ended first and the client has sent its seq_id again.
             aborted = False
@@ -556,7 +561,7 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
         try:
             api._validate_sequence_context_length(seq, params)
         except BaseException:
-            session.drop(request.seq_id)
+            session.drop(request.seq_id, seq)
             raise
         try:
             await api._submit_engine_requests([seq])
@@ -566,7 +571,7 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
             raise
         except BaseException:  # a failed send may have reached one engine (P/D: decode)
             api.cleanup_stream(seq.id, aborted=True)
-            session.drop(request.seq_id)
+            session.drop(request.seq_id, seq)
             raise
 
     async def _write(self, context, request, response) -> None:
