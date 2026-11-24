@@ -99,6 +99,8 @@ def build_offload_engine(
     world: int,
     rank: int,
     cfg=None,
+    sharded_bytes_per_block: int = 0,
+    shard_world: int = 1,
 ):
     """Build + post_init a per-rank LMCache engine for opaque uint8 offload.
 
@@ -106,7 +108,9 @@ def build_offload_engine(
     ``GPUConnectorInterface`` once the validated chunk size and uint8 metadata
     exist. Returns ``(engine, cfg, meta)``. The metadata forces uint8 shapes;
     ``fmt`` is a tensor-accepting ``MemoryFormat`` purely to satisfy the
-    LocalCPU allocator.
+    LocalCPU allocator. ``sharded_bytes_per_block`` / ``shard_world``: a chunk
+    also carries this rank's share of a block-sharded cache
+    (`metadata.chunk_bytes`).
     """
     from lmcache.v1.cache_engine import LMCacheEngineBuilder
     from lmcache.v1.memory_management import MemoryFormat
@@ -120,7 +124,11 @@ def build_offload_engine(
     offcfg.scale_cpu_size_for_pp(cfg, config)
     base_meta = offcfg.build_lmcache_metadata(config, cfg, world, rank)
     meta = ATOMRawBytesLMCacheMetadata(
-        base_meta, atom_block_size=int(block_size), bytes_per_block=int(bytes_per_block)
+        base_meta,
+        atom_block_size=int(block_size),
+        bytes_per_block=int(bytes_per_block),
+        sharded_bytes_per_block=sharded_bytes_per_block,
+        shard_world=shard_world,
     )
     gpu_connector = gpu_connector_factory(cfg, meta)
     engine = LMCacheEngineBuilder.get_or_create(
