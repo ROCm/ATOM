@@ -2832,8 +2832,20 @@ CLAIM_SYMBOL = re.compile(r"`([^`\n]{2,60})`")
 
 
 def _claim_symbols(reason):
-    """-> the backticked symbols a reason offers as its handle."""
-    return {m.strip() for m in CLAIM_SYMBOL.findall(reason) if m.strip()}
+    """-> the backticked symbols a reason offers as its handle.
+
+    A span has to carry a word character. Punctuation on its own -- `==`, `--`, `()`,
+    `::` -- names nothing: `_mentions_symbol` puts no boundary around an end that is
+    already punctuation (it cannot, or `.cuda()` would be rejected after `x`), so a
+    reason backticking `==` was claimed by any finding with `==` anywhere in it, and the
+    UNREPORTED-FIRE that exists to force that rule onto the card never fired. Symbols
+    that mix the two -- `.cuda()`, `->data`, `::empty` -- keep their claim.
+
+    A reason that backticks only punctuation has no claim route, which is where a reason
+    that backticks nothing already was.
+    """
+    return {m.strip() for m in CLAIM_SYMBOL.findall(reason)
+            if m.strip() and re.search(r"\w", m)}
 
 
 def _mentions_symbol(text, symbol):

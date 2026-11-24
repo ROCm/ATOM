@@ -608,6 +608,20 @@ Validation (deterministic): N/A -- no runtime surface changed
 📝 x.cuda() runs before set_device. **Author must** move it.' \
      "B1 FIRE -- \`.cuda()\` runs before set_device" \
      "diff --git a/foo.py b/foo.py")" ""
+# ...but punctuation ON ITS OWN names nothing, and no boundary can be put around it:
+# a reason backticking `==` was claimed by any finding with `==` anywhere in it, so the
+# UNREPORTED-FIRE that forces that rule onto the card never fired.
+t "a reason backticking only punctuation is not claimed by an unrelated finding" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ foo.py:3 the tuned config lookup uses == on floats. **Author must** use isclose.' \
+     "B1 FIRE -- the \`==\` check silently equates None and 0" \
+     "diff --git a/foo.py b/foo.py" | grep -c UNREPORTED-FIRE)" "1"
 # Without backticks the reason offers no handle, whatever its words look like. FP32,
 # MI355X, GSM8K, num_tokens and head_dim all used to pass as names.
 t "a reason that backticks nothing is not claimed by look-alike words" \
