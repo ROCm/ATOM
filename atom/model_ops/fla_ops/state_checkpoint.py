@@ -176,8 +176,10 @@ def write_state_checkpoints(
     ``h`` is a logical ``[..., H, K, V]`` tensor whose states are stored
     either KV (the Triton chunk kernel's ``h``, ``h_snap``) or VK (FlyDSL's
     snapshot, handed over as its ``transpose(-1, -2)``); like the pool's, the
-    layout is read off its strides. Any other inner layout is rejected. Rows
-    are ``ssm_state.stride(0)`` apart in both.
+    layout is read off its strides. Callers must pass that transpose view for
+    VK storage: when K == V, a raw VK tensor has the same strides as KV and
+    would be read as KV. Any other inner layout is rejected. Rows are
+    ``ssm_state.stride(0)`` apart in both.
     """
     n = rows.numel()
     if n == 0:
