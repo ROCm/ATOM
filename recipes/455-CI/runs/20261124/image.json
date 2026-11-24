@@ -1,0 +1,16 @@
+{
+ "image": "rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261124",
+ "digest": "sha256:3964130782bf7c829812fd5aca7a6c464753ffe90fda50795301f1f81e4e1555",
+ "base_image": "amddcgpuce/rocm-rel:ub24-dcgpu-rk-10.2.0-pyt2.14.0-rocmtri3.9-24d5394c-atomsrc-gfx1250-b1123",
+ "atom": {
+  "commit": "dc6cd23bbc5a281910f8ba1aa222bd59c73f09a9",
+  "date": "2026-11-24",
+  "title": "refactor(kv): share target and draft cache binding (#3733)"
+ },
+ "aiter": {
+  "commit": "2989e550fce8a863424e1bbfaa4a2ee11ce1cb52",
+  "date": "2026-11-24",
+  "title": "[HIP] [JIT] Add gfx950 K-pool indexer cache writers (#7374)"
+ },
+ "dependency_changes": []
+}
