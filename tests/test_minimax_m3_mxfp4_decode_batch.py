@@ -73,8 +73,9 @@ def test_the_scorer_buffers_are_one_workspace_and_a_map_per_decode_ubatch(
     + [("fp8", "fp4", True), ("fp8", "fp8", True)],
 )
 @pytest.mark.parametrize("q_rows", [6, 12])  # exactly the metadata's rows / a DP pad
+@pytest.mark.parametrize("token_tiled", [False, True])
 def test_the_sparse_attention_runs_only_the_rows_the_metadata_covers(
-    monkeypatch, phase, kv, index, fp8_out, q_rows
+    monkeypatch, phase, kv, index, fp8_out, q_rows, token_tiled
 ):
     """One row rule for decode and prefill. With the MXFP4 index the scorer, selector
     and attention get the rows the metadata covers; the pad rows past them are never
@@ -118,6 +119,13 @@ def test_the_sparse_attention_runs_only_the_rows_the_metadata_covers(
     )
     monkeypatch.setattr(sparse_attn, f"minimax_m3_sparse_attn_{phase}_asm", attend_fp8)
     monkeypatch.setattr(sparse_attn, "sparse_pa_fp8_per_row", attend_fp8_out)
+
+    def attend_tt(q, *a):
+        seen["attend"], seen["token-tiled"] = q.shape[0], True
+        a[-1].fill_(1)
+
+    monkeypatch.setattr(attention_mha.tt_prefill, "_MIN_ROWS", 1)
+    monkeypatch.setattr(attention_mha.tt_prefill, "run", attend_tt)
     layer = object.__new__(attention_mha.SparseMHAPagedAttentionImpl)
     torch.nn.Module.__init__(layer)
     layer.kv_cache_dtype, layer.index_cache_dtype = kv, index
@@ -127,6 +135,7 @@ def test_the_sparse_attention_runs_only_the_rows_the_metadata_covers(
     layer.topk, layer.init_blocks, layer.local_blocks = 2, 1, 0
     layer.num_kv_heads, layer.scale = 1, 1.0
     layer.index_cache, layer.layer_num, layer.sparse_layer_ordinal = None, 0, 0
+    layer._tt_prefill = token_tiled  # the token-tiled prefill kernel's layer gate
     layer._index_q, layer._index_q_cache_key_info = torch.zeros(q_rows, heads, 8), None
 
     seq = torch.zeros(batch, dtype=torch.int32)
@@ -160,6 +169,9 @@ def test_the_sparse_attention_runs_only_the_rows_the_metadata_covers(
         assert seen["fp8 rows"] == q_rows
     assert seen["scorer"] == (rows, batch, batch) and seen["attend"] == rows
     assert (out[:rows] == 1).all() and (out[rows:] == 0).all()
+    # an FP8 KV's bf16 prefill output is the token-tiled kernel's, unless rows are padded
+    tt_served = token_tiled and phase == "prefill" and kv == "fp8" and not fp8_out
+    assert seen.get("token-tiled", False) == (tt_served and rows == batch * mq)
 
 
 @pytest.mark.parametrize(
