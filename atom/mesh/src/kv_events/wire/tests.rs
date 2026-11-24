@@ -16,10 +16,11 @@ const EXPECTED: &str = r#"
 startup_clear         | rank 0: cleared
 stored_root           | rank 0: stored 2
 stored_child          | rank 0: stored 1 child
-removed               | rank 0: removed 1; removed 1; removed 1
+removed               | rank 0: removed 3
 remote_kv_gpu         | rank 0: stored 2 child
 multimodal_extra_keys | rank 0: drop namespace
 dp_rank_2             | rank 2: stored 2
+loaded_prefix         | rank 0: stored 3
 "#;
 
 fn render(batch: &DecodedBatch) -> String {

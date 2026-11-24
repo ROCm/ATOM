@@ -37,8 +37,8 @@ NOTES = {
     " and lora_name null, and ATOM's own token_offset 0, which the router ignores.",
     "stored_child": "A longer prompt hits stored_root's two blocks and stores one"
     " more: parent_block_hash is stored_root's last hash, token_offset 8.",
-    "removed": "Eviction of the three cached blocks for a new prompt: one"
-    " BlockRemoved per hash, medium GPU, no group_idx.",
+    "removed": "Eviction of the three cached blocks for a new prompt: evictions"
+    " in a row are one BlockRemoved, medium GPU, no group_idx.",
     "remote_kv_gpu": "KV received from a PD prefill producer (decode side), medium"
     " GPU like any block in this engine's HBM. Two blocks after a locally cached"
     " one: parent_block_hash set, token_offset 4.",
@@ -49,6 +49,9 @@ NOTES = {
     "dp_rank_2": "Batch from data-parallel rank 2 (seq 1, after that publisher's"
     " startup clear); ATOM fills data_parallel_rank on every batch, 0 in the other"
     " samples.",
+    "loaded_prefix": "Blocks a Store load put on the device: the three it indexed"
+    " in a row as one BlockStored, whose token_ids ATOM encodes itself, each a"
+    " 5-byte uint32 whatever its value.",
 }
 
 
@@ -138,14 +141,22 @@ def _published() -> tuple[dict[str, bytes], str]:
         pub_dp = publisher("inproc://mesh-samples-dp", 2)
         admit(BlockManager(config), seq(list(range(100, 108))), pub_dp)
 
+        # After the samples above, whose timestamps follow the publish order.
+        loaded = seq([7, 200, 300, 65535, 65536, 70000, 150000, 199999, 1, 2, 3, 4])
+        bm = BlockManager(config)
+        bm.allocate(loaded)
+        assert bm.publish_loaded_prefix(loaded, start_token=0, end_token=12) == 12
+        pub.publish(bm.take_events())
+
     try:
-        published = _replay(pub, "inproc://mesh-samples", 0, 6)
+        published = _replay(pub, "inproc://mesh-samples", 0, 7)
         published_dp = _replay(pub_dp, "inproc://mesh-samples-dp", 2, 2)
     finally:
         pub.shutdown()
         pub_dp.shutdown()
     payloads = dict(zip(list(NOTES)[:6], published))
     payloads["dp_rank_2"] = published_dp[1]
+    payloads["loaded_prefix"] = published[6]
     return payloads, format(mm.cache_seed & (2**64 - 1), "016x")
 
 

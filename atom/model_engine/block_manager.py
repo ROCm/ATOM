@@ -12,6 +12,7 @@ from time import monotonic
 from typing import Any
 from weakref import WeakKeyDictionary
 
+import msgspec
 import numpy as np
 
 from atom.config import Config, DCPConfig
@@ -21,6 +22,7 @@ from atom.distributed.kv_events import (
     BlockRemoved,
     BlockStored,
     KVCacheEvent,
+    pack_token_ids,
 )
 from atom.kv_transfer.offload.load_math import chunk_floor, tier_load_tokens
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
@@ -79,12 +81,13 @@ def _make_block_stored(
     matched by tokens. It borrows the shape of vLLM's `(mm_identifier, offset)`
     pair, but not its meaning (vLLM's offset is the media's position).
     """
-    # A list, not the `array("i")` the publish paths carry: the event is
-    # msgpack-encoded and msgspec has no encoding for an array. The publisher
-    # counts encode failures rather than raising, so an array here takes the
-    # event stream down without stopping anything.
+    # A list, or the array already encoded (`pack_token_ids`), not the
+    # `array("i")` the publish paths carry: the event is msgpack-encoded and
+    # msgspec has no encoding for an array. The publisher counts encode
+    # failures rather than raising, so an array here takes the event stream
+    # down without stopping anything.
     assert isinstance(
-        tokens, list
+        tokens, (list, msgspec.Raw)
     ), f"BlockStored.token_ids must be a list, got {type(tokens).__name__}"
     extra_keys = None
     if cache_seed != -1:
@@ -696,7 +699,13 @@ class BlockManager:
         self.total_evicted_blocks += 1
         self._note_index_change(h)
         if self._event_log is not None:
-            self._event_log.append(_make_block_removed([h]))
+            # Evictions in a row report as one event: a load evicts a block for
+            # each it brings in, a thousand at a time.
+            last = self._event_log[-1] if self._event_log else None
+            if type(last) is BlockRemoved:
+                last.block_hashes.append(h)
+            else:
+                self._event_log.append(_make_block_removed([h]))
         self._state_checkpoint_cache.unindex(h)
 
     def _fresh_block(self) -> int:
@@ -3675,6 +3684,10 @@ class BlockManager:
             return 0
 
         indexed_tokens = 0
+        record = self._event_log is not None
+        # Blocks indexed in a row report as one run, as `hash_blocks` reports a
+        # forward's. One already indexed reports nothing, and ends the run.
+        run_start, run_parent, run_hashes = start_block, parent_hash, []
         for i in range(start_block, end_block):
             token_ids = self._hash_block_tokens(seq, i)
             block_id = seq.block_table[i]
@@ -3710,27 +3723,44 @@ class BlockManager:
                 # is safe because `_unindex` only drops an entry that still
                 # points at the block being reused.
                 block.update(block_hash, token_ids)
+                if run_hashes:
+                    self._record_loaded_run(seq, run_start, run_hashes, run_parent)
+                    run_hashes = []
             else:
                 self.kv.publish(block_id, block_hash, token_ids)
-                if self._event_log is not None:
-                    self._event_log.append(
-                        _make_block_stored(
-                            [block_hash],
-                            # The only BlockStored site fed straight from
-                            # `_hash_block_tokens`; the other two accumulate
-                            # into a list already. See `_make_block_stored`.
-                            list(token_ids),
-                            parent_hash if parent_hash != -1 else None,
-                            hbs,
-                            token_offset=i * hbs,
-                            cache_seed=seq.cache_seed,
-                        )
-                    )
+                if record:
+                    if not run_hashes:
+                        run_start, run_parent = i, parent_hash
+                    run_hashes.append(block_hash)
 
             indexed_tokens += hbs
             parent_hash = block_hash
 
+        if run_hashes:
+            self._record_loaded_run(seq, run_start, run_hashes, run_parent)
         return indexed_tokens
+
+    def _record_loaded_run(
+        self, seq: Sequence, start_block: int, hashes: list[int], parent: int
+    ) -> None:
+        """One BlockStored for the blocks from `start_block` a load indexed in a row.
+
+        A load indexes a thousand blocks at a time. An event for each, its
+        tokens boxed into a list, more than doubled what the load costs the
+        scheduler thread.
+        """
+        hbs = self._hash_block_size()
+        tokens = seq.token_ids[start_block * hbs : (start_block + len(hashes)) * hbs]
+        self._event_log.append(
+            _make_block_stored(
+                hashes,
+                pack_token_ids(tokens),
+                parent if parent != -1 else None,
+                hbs,
+                token_offset=start_block * hbs,
+                cache_seed=seq.cache_seed,
+            )
+        )
 
     def register_received_prefix(self, seq: Sequence) -> int:
         """Hash received prompt blocks into the prefix cache so subsequent

@@ -13,11 +13,13 @@ import queue
 import threading
 import time
 from abc import ABC, abstractmethod
+from array import array
 from collections import deque
 from collections.abc import Iterable
 from typing import Any, Final
 
 import msgspec
+import numpy as np
 
 logger = logging.getLogger("atom")
 
@@ -51,11 +53,38 @@ class KVCacheEvent(
     """
 
 
+# A token as msgpack writes a uint32: the 0xce marker, then its four bytes.
+_PACKED_TOKEN: Final = np.dtype([("marker", "u1"), ("token", ">u4")])
+
+
+def pack_token_ids(tokens: array) -> msgspec.Raw:
+    """`tokens` as the msgpack array a `BlockStored` carries, laid out by numpy.
+
+    A list costs one PyInt per token to build and another visit to encode, on
+    the scheduler thread, and a Store load promotes a hundred thousand tokens
+    at a time. Here every token takes msgpack's 5-byte uint32 form, which a
+    decoder reads as the integer it is.
+    """
+    n = len(tokens)
+    packed = np.empty(n, dtype=_PACKED_TOKEN)
+    packed["marker"] = 0xCE
+    packed["token"] = np.asarray(tokens)
+    if n < 16:
+        head = bytes([0x90 | n])
+    elif n < 1 << 16:
+        head = b"\xdc" + n.to_bytes(2, "big")
+    else:
+        head = b"\xdd" + n.to_bytes(4, "big")
+    return msgspec.Raw(head + packed.tobytes())
+
+
 class BlockStored(KVCacheEvent):
     """A run of contiguous prefix-cacheable blocks just became resident."""
 
     block_hashes: list[int]
     parent_block_hash: int | None
+    # What a decoder reads. An event being published may instead hold the
+    # array already encoded, as `pack_token_ids` returns it.
     token_ids: list[int]
     block_size: int
     lora_id: int | None
