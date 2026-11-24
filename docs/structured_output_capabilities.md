@@ -1,7 +1,7 @@
 # Structured output and deployment discovery
 
 The native Chat and Responses endpoints support JSON output constraints through
-the optional `atom[structured-output]` dependency. This is separate from the
+llguidance and RE2, which the base install includes. This is separate from the
 SGLang plugin's structured-output implementation.
 
 ## Code organization
@@ -80,7 +80,7 @@ preventing an executor task from enqueueing after cancellation cleanup.
 Only local references are allowed, including references reached transitively
 through a local pointer into an otherwise literal `const` or `enum` value.
 Every runtime validator also disables external resource retrieval. Schema regexes
-use the non-backtracking RE2 evaluator from the optional `google-re2` dependency
+use the non-backtracking RE2 evaluator from the `google-re2` dependency
 for candidate filtering and final validation, including property-name matching.
 Each compiled regex has a 2 MiB memory limit; patterns are limited to 262,144
 characters and the cache retains at most 32 compiled expressions. Unsupported

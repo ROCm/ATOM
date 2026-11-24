@@ -84,7 +84,7 @@ duplicate qualified names are rejected.
 
 Reasoning is delivered in reasoning_content, answer text in content, and calls
 in tool_calls. The existing tool_choice="none" suppression is preserved.
-With the optional structured-output backend, `response_format` constrains JSON
+With the structured-output backend, `response_format` constrains JSON
 during decoding and allows declared DSML tool calls as a separate alternative.
 See [structured output](structured_output_capabilities.md) for supported formats
 and deployment limits.

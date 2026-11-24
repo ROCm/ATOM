@@ -648,15 +648,13 @@ RUN pip install rocm-trace-lite && \
 ARG CACHEBUST=1
 # Optional Cargo features; ext-proc is excluded unless explicitly requested.
 ARG ATOM_MESH_FEATURES=""
-# With the structured-output extra (llguidance, RE2): without it, response_format
-# json_object/json_schema and strict tools are refused. The vLLM image built on
-# this one pins llguidance <1.8 and downgrades it; there vLLM's own structured
-# output serves, and ATOM's native server reports it unavailable.
+# The vLLM image built on this one pins llguidance <1.8 and downgrades it; there
+# vLLM's own structured output serves. ATOM's native backend needs 1.9.1.
 RUN git clone $ATOM_REPO /app/ATOM && \
     cd /app/ATOM && \
     git checkout $ATOM_COMMIT && \
     ulimit -n 65536 && \
-    ATOM_MESH_BUILD=1 ATOM_MESH_FEATURES="${ATOM_MESH_FEATURES}" python -m pip install -e ".[structured-output]"
+    ATOM_MESH_BUILD=1 ATOM_MESH_FEATURES="${ATOM_MESH_FEATURES}" python -m pip install -e .
 RUN pip show atom || true
 RUN python -c "import llguidance, re2; from importlib.metadata import version; print('structured output: llguidance', version('llguidance'))"
 
