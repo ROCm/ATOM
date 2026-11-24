@@ -1713,7 +1713,7 @@ class KimiDecoderLayer(nn.Module):
             getattr(self, "self_attention_res_norm", None),
             out_norm=self.input_layernorm,
             enabled=self.use_attn_residuals,
-            # Only this site calls maybe_close_block to bank the running prefix.
+            # Only this site closes blocks to bank the running prefix.
             block_size=getattr(config, "attn_res_block_size", None),
             layer_idx=layer_num,
         )
@@ -1754,10 +1754,7 @@ class KimiDecoderLayer(nn.Module):
         # post_attention_layernorm are its out_norms, so hidden_states comes
         # back already normed at both.
         hidden_states, prefix_sum = self.self_attention_attn_res(
-            hidden_states, block_residual, pending_add, pending_add2
-        )
-        block_residual, prefix_sum = self.self_attention_attn_res.maybe_close_block(
-            prefix_sum, block_residual
+            hidden_states, block_residual, pending_add, pending_add2, close_block=True
         )
 
         if self.is_linear_attn:

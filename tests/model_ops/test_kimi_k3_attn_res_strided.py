@@ -3,6 +3,8 @@
 
 """apply_attn_res must read a strided slice of a block bank exactly as its copy."""
 
+import json
+
 import pytest
 import torch
 
@@ -124,6 +126,121 @@ def test_strided_hidden_dim_is_still_copied():
     _assert_bitwise(
         _call(x, bank, 2, True, False), _call(x, bank.contiguous(), 2, True, False)
     )
+
+
+@pytest.mark.parametrize(
+    "tokens,adds,quant,strided",
+    [
+        (1, 0, False, False),
+        (4096, 2, False, False),
+        (16, 1, True, False),
+        (16, 2, True, True),
+    ],
+)
+@torch.inference_mode()
+def test_close_block_matches_copy_and_replays(
+    tokens, adds, quant, strided, record_property
+):
+    from torch._inductor import metrics
+
+    from atom.model_ops.kimi_k3.attention_residual import apply_attn_res
+
+    torch.cuda.reset_peak_memory_stats()
+    x = _inputs(tokens, 20261124 + tokens)
+    storage = torch.full(
+        (tokens + 2, BANK + 2, HIDDEN * (2 if strided else 1)),
+        -7,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    bank = storage[1:-1, 1:-1, :: 2 if strided else 1]
+    bank.copy_(x["bank"])
+    blocks = 3
+
+    def reset_bank():
+        storage.fill_(-7)
+        bank.copy_(x["bank"])
+
+    def close(prefix, bank, add, add2):
+        return apply_attn_res(
+            prefix,
+            bank,
+            x["score_weight"],
+            1e-6,
+            add,
+            x["out_norm"],
+            add_hidden2=add2,
+            quant_dtype=dtypes.fp8 if quant else None,
+            num_blocks=blocks,
+            close_block=True,
+        )
+
+    add = x["adds"][0] if adds else None
+    add2 = x["adds"][1] if adds == 2 else None
+    want = _call(x, bank, adds, True, quant, blocks)
+    expected = storage.clone()
+    expected[1:-1, 1 + blocks, :: 2 if strided else 1].copy_(want[-1])
+
+    def check(result):
+        output, prefix = result
+        assert prefix is None
+        _assert_bitwise(output if quant else (output,), want[:-1])
+        _assert_bitwise((storage,), (expected,))
+
+    check(close(x["prefix"], bank, add, add2))
+    compiled = torch.compile(close, fullgraph=True)
+    reset_bank()
+    generated_before = metrics.generated_kernel_count
+    check(compiled(x["prefix"], bank, add, add2))
+    if not strided:
+        # The custom op is one external launch. An Inductor-generated copy
+        # would reintroduce the full-bank materialization this path avoids.
+        assert metrics.generated_kernel_count == generated_before
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        replay_output = close(x["prefix"], bank, add, add2)
+    for _ in range(2):
+        reset_bank()
+        graph.replay()
+        check(replay_output)
+
+    def explicit_copy():
+        mixed, prefix = apply_attn_res(
+            x["prefix"],
+            bank,
+            x["score_weight"],
+            1e-6,
+            add,
+            x["out_norm"],
+            add_hidden2=add2,
+            quant_dtype=dtypes.fp8 if quant else None,
+            num_blocks=blocks,
+        )
+        bank[:, blocks].copy_(prefix)
+        return mixed
+
+    def fused_close():
+        return close(x["prefix"], bank, add, add2)
+
+    for _ in range(10):
+        explicit_copy()
+        fused_close()
+    samples = {"explicit_copy_us": [], "fused_close_us": []}
+    for trial in range(3):
+        order = (("explicit_copy_us", explicit_copy), ("fused_close_us", fused_close))
+        for name, call in (order if trial % 2 == 0 else reversed(order)):
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
+                enable_timing=True
+            )
+            start.record()
+            for _ in range(50):
+                call()
+            end.record()
+            end.synchronize()
+            samples[name].append(start.elapsed_time(end) * 1000 / 50)
+    record_property("close_latency", json.dumps(samples))
+    record_property("peak_allocated_bytes", torch.cuda.max_memory_allocated())
 
 
 @pytest.mark.parametrize(

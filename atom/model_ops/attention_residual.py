@@ -156,7 +156,8 @@ class AttnRes(nn.Module):
         block_residual: torch.Tensor | None = None,
         add_hidden: torch.Tensor | None = None,
         add_hidden2: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor | tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+        close_block: bool = False,
+    ) -> tuple[torch.Tensor | tuple[torch.Tensor, torch.Tensor], torch.Tensor | None]:
         """Returns ``(mixed_output, prefix_out)``.
 
         The addends are the caller's ``prefix_sum = prefix_sum + ...``, folded
@@ -168,10 +169,19 @@ class AttnRes(nn.Module):
         ``mixed_output`` is a ``(quantized, scale)`` tuple when ``out_norm``
         fuses a per-token quant, on BOTH branches below -- the kernel folds it,
         and the fallback gets it from calling that same out_norm.
+
+        ``close_block`` banks the prefix at block boundaries and returns None
+        for it, so the next site starts a fresh prefix.
         """
         if prefix_sum is None:
             prefix_sum, add_hidden, add_hidden2 = add_hidden, add_hidden2, None
         assert prefix_sum is not None
+        close_block = (
+            close_block
+            and self.enabled
+            and self.block_size is not None
+            and self.layer_idx % self.block_size == 0
+        )
         if (
             self.enabled
             and block_residual is not None
@@ -199,6 +209,7 @@ class AttnRes(nn.Module):
                 add_hidden2,
                 self.out_quant_dtype,
                 self.num_blocks,
+                close_block=close_block,
             )
 
         # Nothing to mix (residuals off, or no candidates yet). Apply by hand
@@ -208,6 +219,8 @@ class AttnRes(nn.Module):
             if add_hidden2 is not None:
                 prefix_sum = prefix_sum + add_hidden2
         mixed = prefix_sum if self.out_norm is None else self.out_norm(prefix_sum)
+        if close_block:
+            _, prefix_sum = self.maybe_close_block(prefix_sum, block_residual)
         return mixed, prefix_sum
 
     def window(self, block_residual: torch.Tensor | None) -> torch.Tensor | None:
