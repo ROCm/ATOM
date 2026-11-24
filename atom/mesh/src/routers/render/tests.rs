@@ -4738,6 +4738,15 @@ mod h_atom_native_tool_calls {
 
     /// `cut_off_call`, its reasoning separated by the `reasoning` parser.
     async fn cut_off_call_reasoned(reply: &str, reasoning: Option<&str>) -> [(String, Value); 2] {
+        cut_off_call_with(reply, "qwen_xml", reasoning).await
+    }
+
+    /// `cut_off_call_reasoned`, its tool calls read by `parser`.
+    async fn cut_off_call_with(
+        reply: &str,
+        parser: &str,
+        reasoning: Option<&str>,
+    ) -> [(String, Value); 2] {
         let tool = json!({"type": "function", "function": {"name": "get_weather", "parameters": {
             "type": "object", "properties": {"city": {"type": "string"}},
         }}});
@@ -4755,7 +4764,7 @@ mod h_atom_native_tool_calls {
             .unwrap();
             let mut ctx = ctx(stream, json!("auto"));
             ctx.original = ProtocolRequest::Chat(Arc::new(req));
-            ctx.configured_tool_parser = Some("qwen_xml".to_string());
+            ctx.configured_tool_parser = Some(parser.to_string());
             if let Some(parser) = reasoning {
                 ctx.reasoning_parser_factory = Some(test_mocks::reasoning_parser_factory());
                 ctx.configured_reasoning_parser = Some(parser.to_string());
@@ -4829,6 +4838,52 @@ mod h_atom_native_tool_calls {
         let reply = "<tool_call><function=get_weather><parameter=city>Paris<";
         let expected = ("get_weather".to_string(), json!({"city": "Paris<"}));
         let read = cut_off_call_reasoned(reply, Some("qwen3")).await;
+        assert_eq!(read, [expected.clone(), expected]);
+    }
+
+    /// A qwen_xml call cut off after its function closed but before its wrapper did is
+    /// kept, as ATOM's HTTP parser keeps it; a name prose follows is not closed as one.
+    #[tokio::test]
+    async fn a_qwen_call_cut_off_before_its_wrapper_closes_is_kept() {
+        let reply = "<tool_call><function=get_weather><parameter=city>Paris</parameter></function>";
+        let expected = ("get_weather".to_string(), json!({"city": "Paris"}));
+        assert_eq!(cut_off_call(reply).await, [expected.clone(), expected]);
+        let prose = "<tool_call><function=get_weather> and then its parameters";
+        let [unary, _] = cut_off_call(prose).await;
+        assert_eq!(unary, (String::new(), Value::Null));
+    }
+
+    /// A qwen_xml call outside a `<tool_call>` wrapper is a call, whole or cut off, as
+    /// ATOM's HTTP parser reads one; a bare name prose follows is not.
+    #[tokio::test]
+    async fn a_bare_qwen_function_call_is_a_call() {
+        let expected = ("get_weather".to_string(), json!({"city": "Paris"}));
+        for reply in [
+            "<function=get_weather><parameter=city>Paris</parameter></function>",
+            "Checking.\n<function=get_weather>\n<parameter=city>Paris",
+        ] {
+            assert_eq!(
+                cut_off_call(reply).await,
+                [expected.clone(), expected.clone()]
+            );
+        }
+        let prose = "Write <function=get_weather> and then its parameters.";
+        let none = (String::new(), Value::Null);
+        assert_eq!(cut_off_call(prose).await, [none.clone(), none]);
+        // Nor does a name quoted before a call take that call's parameters.
+        let quoted = "Use <function=search> here. \
+                      <tool_call><function=get_weather><parameter=city>Paris</parameter></function></tool_call>";
+        assert_eq!(cut_off_call(quoted).await, [expected.clone(), expected]);
+    }
+
+    /// A MiniMax-M3 call cut off inside a parameter keeps its value, as ATOM's HTTP
+    /// parser does at end of input.
+    #[tokio::test]
+    async fn a_minimax_call_cut_off_inside_a_parameter_keeps_its_value() {
+        let ns = crate::tool_parser::parsers::minimax::MINIMAX_NS;
+        let reply = format!("{ns}<tool_call>{ns}<invoke name=\"get_weather\">{ns}<city>Paris");
+        let expected = ("get_weather".to_string(), json!({"city": "Paris"}));
+        let read = cut_off_call_with(&reply, "minimax", None).await;
         assert_eq!(read, [expected.clone(), expected]);
     }
 }

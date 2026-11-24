@@ -18,11 +18,13 @@ use wfaas::{
     BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, StepExecutor, StepId, StepResult,
     WorkflowContext, WorkflowDefinition, WorkflowError, WorkflowResult,
 };
+use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use super::workflow_data::TokenizerWorkflowData;
 use crate::{
     app_context::AppContext,
     config::TokenizerCacheConfig,
+    core::Worker,
     routers::prepare::fast_tokenizer::{with_fastokens, FastTokenizer, STRICT_REFUSAL},
     tokenizer::{
         cache::{CacheConfig, CachedTokenizer},
@@ -46,6 +48,10 @@ pub struct TokenizerConfigRequest {
     pub chat_template_path: Option<String>,
     /// Chat template content, used when `chat_template_path` is unset
     pub inline_chat_template: Option<String>,
+    /// The worker whose registration submitted this job, if one did: what it loads is
+    /// kept only while that worker is registered serving the job's template.
+    #[serde(default)]
+    pub worker_url: Option<String>,
     /// Optional cache configuration. If provided, wraps a tokenizer that encodes
     /// with HuggingFace with CachedTokenizer; one that encodes with fastokens is
     /// not wrapped, and has fastokens' segment cache instead, sized by
@@ -193,6 +199,11 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
             files.write().insert(id.clone(), path.clone());
         }
         let result = registry.load(&id, &name, &source, &loader).await;
+        if registry.contains_id(&id) && worker_left(&app_context, config) {
+            info!("Tokenizer '{name}' dropped: the worker that registered it left");
+            drop_tokenizer(&app_context, &name);
+            return Ok(StepResult::Success);
+        }
         if !registry.contains_id(&id) {
             app_context.forget_tokenizer(&id); // what it recorded for a tokenizer not loaded
         }
@@ -278,24 +289,10 @@ pub(crate) fn admit_model_template(
     let Some(entry) = app_context.tokenizer_registry.get_by_name(name) else {
         return Ok(());
     };
-    let carried_file = app_context
-        .tokenizer_template_files
-        .read()
-        .get(&entry.id)
-        .cloned();
-    let carried_inline = app_context
-        .tokenizer_inline_templates
-        .read()
-        .get(&entry.id)
-        .cloned();
-    let same = match file {
-        Some(file) => carried_file.as_deref() == Some(file),
-        None => carried_file.is_none() && carried_inline.as_deref() == inline,
-    };
-    let registered = app_context.worker_registry.get_by_model(name);
-    if same {
+    if loaded_template(app_context, &entry.id) == Some(template_fingerprint(file, inline)) {
         return Ok(());
     }
+    let registered = app_context.worker_registry.get_by_model(name);
     if registered
         .iter()
         .any(|w| !urls.iter().any(|url| url == w.url()))
@@ -308,6 +305,60 @@ pub(crate) fn admit_model_template(
     }
     drop_tokenizer(app_context, name);
     Ok(())
+}
+
+/// A chat template's identity: its file, else its text; neither is the tokenizer's own.
+pub(crate) fn template_fingerprint(file: Option<&str>, inline: Option<&str>) -> u64 {
+    match (file, inline) {
+        (Some(file), _) => xxh3_64_with_seed(file.as_bytes(), 1),
+        (None, Some(text)) => xxh3_64_with_seed(text.as_bytes(), 2),
+        (None, None) => 0,
+    }
+}
+
+/// The chat template an ATOM worker serves, as its registration chose it: its own file,
+/// else the router's (`router_file`), else the one it advertised.
+pub(crate) fn served_template(worker: &dyn Worker, router_file: Option<&str>) -> u64 {
+    let file = worker.chat_template().or(router_file);
+    let labels = &worker.metadata().labels;
+    let inline = file
+        .is_none()
+        .then(|| labels.get("chat_template"))
+        .flatten();
+    template_fingerprint(file, inline.map(String::as_str))
+}
+
+/// The chat template tokenizer `id` was loaded with, while it is loaded.
+pub(crate) fn loaded_template(app_context: &AppContext, id: &str) -> Option<u64> {
+    let file = app_context.tokenizer_template_files.read().get(id).cloned();
+    let inline = app_context
+        .tokenizer_inline_templates
+        .read()
+        .get(id)
+        .cloned();
+    let fingerprint = template_fingerprint(file.as_deref(), inline.as_deref());
+    // Read before the check: a removed tokenizer's records go after it does.
+    app_context
+        .tokenizer_registry
+        .contains_id(id)
+        .then_some(fingerprint)
+}
+
+/// Whether the worker that submitted `config` is no longer registered serving its
+/// template: a removed worker's job must not load the tokenizer its successor needs.
+fn worker_left(app_context: &AppContext, config: &TokenizerConfigRequest) -> bool {
+    let Some(url) = &config.worker_url else {
+        return false;
+    };
+    let job_template = template_fingerprint(
+        config.chat_template_path.as_deref(),
+        config.inline_chat_template.as_deref(),
+    );
+    let router_file = app_context.router_config.chat_template.as_deref();
+    app_context
+        .worker_registry
+        .get_by_url(url)
+        .is_none_or(|worker| served_template(worker.as_ref(), router_file) != job_template)
 }
 
 /// Drops model `name`'s tokenizer and what its registration recorded.
@@ -485,6 +536,7 @@ mod tests {
                 source: source.to_string(),
                 chat_template_path: None,
                 inline_chat_template: None,
+                worker_url: None,
                 cache_config: None,
                 fail_on_duplicate: true,
             };
@@ -517,6 +569,7 @@ mod tests {
                 source: hf_tokenizer_path().to_string(),
                 chat_template_path: path.map(str::to_string),
                 inline_chat_template: inline.map(str::to_string),
+                worker_url: None,
                 cache_config: None,
                 fail_on_duplicate: false,
             };
@@ -553,6 +606,7 @@ mod tests {
                 source: hf_tokenizer_path().to_string(),
                 chat_template_path: None,
                 inline_chat_template: Some(template.to_string()),
+                worker_url: None,
                 cache_config: None,
                 fail_on_duplicate: strict,
             };
@@ -577,6 +631,65 @@ mod tests {
         assert_eq!(recorded.as_deref(), Some("first"));
     }
 
+    /// A job its worker's registration submitted, run after that worker left and a
+    /// successor with another template registered (at its URL or another), loads
+    /// nothing: the successor's own job loads the model's tokenizer with its template.
+    #[tokio::test]
+    async fn test_a_left_worker_s_job_leaves_the_tokenizer_to_its_successor() {
+        use crate::core::{BasicWorkerBuilder, RuntimeType};
+
+        for successor_url in ["grpc://atom:1", "grpc://atom:2"] {
+            let context = app_context();
+            let worker = |url: &str, template: &str| -> Arc<dyn Worker> {
+                Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .runtime_type(RuntimeType::Atom)
+                        .model_id("m")
+                        .label("chat_template", template)
+                        .build(),
+                )
+            };
+            let job = |url: &str, template: &str| {
+                let config = TokenizerConfigRequest {
+                    id: TokenizerRegistry::generate_id(),
+                    name: "m".to_string(),
+                    source: hf_tokenizer_path().to_string(),
+                    chat_template_path: None,
+                    inline_chat_template: Some(template.to_string()),
+                    worker_url: Some(url.to_string()),
+                    cache_config: None,
+                    fail_on_duplicate: false,
+                };
+                let data = create_tokenizer_workflow_data(config, context.clone());
+                async move {
+                    let mut workflow = WorkflowContext::new(WorkflowInstanceId::new(), data);
+                    LoadTokenizerStep.execute(&mut workflow).await
+                }
+            };
+            let (old, new) = (
+                "old: {{ messages[0].content }}",
+                "new: {{ messages[0].content }}",
+            );
+            context
+                .worker_registry
+                .register(worker("grpc://atom:1", old));
+            let left_workers_job = job("grpc://atom:1", old);
+            context.worker_registry.remove_by_url("grpc://atom:1");
+            context.worker_registry.register(worker(successor_url, new));
+
+            left_workers_job.await.unwrap();
+            assert!(context.tokenizer_registry.get_by_name("m").is_none());
+            assert!(context.tokenizer_inline_templates.read().is_empty());
+            job(successor_url, new).await.unwrap();
+            let tokenizer = context.tokenizer_registry.get("m").unwrap();
+            let hi = json!({"role": "user", "content": "hi"});
+            let rendered = tokenizer
+                .apply_chat_template(&[hi], ChatTemplateParams::default())
+                .unwrap();
+            assert_eq!(rendered, "new: hi", "successor at {successor_url}");
+        }
+    }
+
     /// A template file is recorded before its tokenizer is visible: a chat that finds
     /// the model's tokenizer finds the template it was loaded with.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -597,6 +710,7 @@ mod tests {
                 source: hf_tokenizer_path().to_string(),
                 chat_template_path: Some(path.to_string()),
                 inline_chat_template: None,
+                worker_url: None,
                 cache_config: None,
                 fail_on_duplicate: false,
             };
@@ -658,6 +772,7 @@ mod tests {
                 source: source.to_string(),
                 chat_template_path: None,
                 inline_chat_template: None,
+                worker_url: None,
                 cache_config: Some(TokenizerCacheConfig {
                     enable_l0: true,
                     l0_max_entries: 16,
@@ -753,6 +868,7 @@ mod tests {
             source: "meta-llama/Llama-2-7b-hf".to_string(),
             chat_template_path: None,
             inline_chat_template: None,
+            worker_url: None,
             cache_config: None,
             fail_on_duplicate: false,
         };
@@ -788,6 +904,7 @@ mod tests {
             source: "meta-llama/Llama-2-7b-hf".to_string(),
             chat_template_path: None,
             inline_chat_template: None,
+            worker_url: None,
             cache_config: None,
             fail_on_duplicate: true,
         };
@@ -805,6 +922,7 @@ mod tests {
             source: "meta-llama/Llama-2-7b-hf".to_string(),
             chat_template_path: None,
             inline_chat_template: None,
+            worker_url: None,
             cache_config: Some(TokenizerCacheConfig {
                 enable_l0: true,
                 l0_max_entries: 1000,

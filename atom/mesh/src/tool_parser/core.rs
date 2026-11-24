@@ -135,6 +135,13 @@ pub trait ToolParser: Send + Sync {
         None
     }
 
+    /// After `parse_incremental` has read a whole reply, the markup that closes the
+    /// call the reply was cut off in, as ATOM's HTTP parser for the format keeps such a
+    /// call at end of input; `None` when no call is open, or the open one reads as prose.
+    fn end_of_input_closers(&self, _tools: &[Tool]) -> Option<String> {
+        None
+    }
+
     /// Reset the parser state for reuse across requests.
     /// This should clear all buffers and reset state to initial values.
     fn reset(&mut self) {
