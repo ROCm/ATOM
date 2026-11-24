@@ -145,21 +145,12 @@ impl StepExecutor<LocalWorkerWorkflowData> for CreateLocalWorkerStep {
         };
 
         if atom {
-            let file = (config.chat_template.as_deref())
-                .or(app_context.router_config.chat_template.as_deref());
-            let inline = file
-                .is_none()
-                .then(|| final_labels.get("chat_template"))
-                .flatten();
+            let advertised = final_labels.get("chat_template").map(String::as_str);
             let urls: Vec<String> = workers.iter().map(|w| w.url().to_string()).collect();
-            admit_model_template(
-                app_context,
-                &model_id,
-                &urls,
-                file,
-                inline.map(String::as_str),
-            )
-            .map_err(|e| WorkflowError::StepFailed {
+            let own_file = config.chat_template.as_deref();
+            let admitted =
+                admit_model_template(app_context, &model_id, &urls, own_file, advertised);
+            admitted.map_err(|e| WorkflowError::StepFailed {
                 step_id: StepId::new("create_worker"),
                 message: format!("Refused {}: {e}", config.url),
             })?;
