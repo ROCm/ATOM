@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """Full-layer eager text backbone. Checkpoint I/O and request preparation live outside."""
 
+import logging
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import ClassVar
@@ -41,6 +42,8 @@ from atom.utils.forward_context import get_forward_context
 from . import seg_fuse
 from .attention import Attention
 from .moe import MoE
+
+logger = logging.getLogger("atom")
 
 
 class Block(nn.Module):
@@ -303,6 +306,22 @@ class Block(nn.Module):
         return op(hidden, hidden_fp8, hidden_scale)
 
 
+def build_out_quant_rope_tables(layers, ropes) -> bool:
+    """`model_options.attn_out_quant_fuse`: the fused attention tail reads fp32
+    RoPE tables, so where a layer has the option on each of ``ropes`` gets its
+    fp32 twins (`RotaryEmbedding.build_fp32_tables`). At model build: a
+    tensor first made inside a graph capture would live in the capture's pool."""
+    if not any(layer.attn._fuse_attn_out_quant for layer in layers):
+        return False
+    size = 0
+    for rope in ropes:
+        size += sum(t.numel() * t.element_size() for t in rope.build_fp32_tables())
+    logger.info(
+        "dsv41 attention output quant: fp32 RoPE tables built (%d MiB)", size >> 20
+    )
+    return True
+
+
 class DeepseekV41ForCausalLM(nn.Module):
     """Text backbone and offline interface; TP and EP share the same rank group.
 
@@ -405,6 +424,7 @@ class DeepseekV41ForCausalLM(nn.Module):
             beta_fast=scaling["beta_fast"],
             beta_slow=scaling["beta_slow"],
         )
+        build_out_quant_rope_tables(self.layers, (self.window_rope, self.global_rope))
 
     @property
     def model(self):

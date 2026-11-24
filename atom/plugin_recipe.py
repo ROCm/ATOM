@@ -371,6 +371,10 @@ class ModelOptions:
     # shared expert's MXFP8 input pair; 7, the shared expert's SiLU-mul and
     # w2's input quant as AITER's one launch.
     seg_fuse: tuple[int, ...] = ()
+    # A decode step's MXFP8 attention also writes the inverse RoPE group
+    # quant of its output, wo_a's input pair (AITER's
+    # `mla_sparse_prefill_v41_inv_rope_quant`).
+    attn_out_quant_fuse: bool = False
 
     @classmethod
     def from_mapping(cls, raw: Any) -> ModelOptions:
@@ -435,6 +439,10 @@ class ModelOptions:
                 raw.get("seg_fuse", defaults.seg_fuse),
                 "model_options.seg_fuse",
                 SEG_FUSE_ITEMS,
+            ),
+            attn_out_quant_fuse=_strict_bool(
+                raw.get("attn_out_quant_fuse", defaults.attn_out_quant_fuse),
+                "model_options.attn_out_quant_fuse",
             ),
         )
         for item, other in ((1, "ffn_mhc_fuse_quant"), (7, "shared_act_quant")):

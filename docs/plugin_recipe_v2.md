@@ -99,6 +99,7 @@ weights layout, loader, runtime (graphs, bounded replay, guarded ops) and mono d
 | `model_options.expert_placement` (path or `{layer: perm}`) | `ATOM_MOE_EXPERT_PLACEMENT` (#3645) |
 | `model_options.block_transition` | `ATOM_V41_TRANSITION_AB` (#3529, still read) |
 | `model_options.seg_fuse` (items `1`, `7`) | `ATOM_DSV41_SEG_FUSE` |
+| `model_options.attn_out_quant_fuse` | `ATOM_DSV41_ATTN_OUT_QUANT_FUSE` |
 | `model_options.mono_mode: "off"` | skipping the mono installer |
 | `dspark_options.fused_prologue` | `ATOM_DSPARK_FUSED_PROLOGUE` (#3639) |
 | `dspark_options.two_buffer_attn` | `ATOM_V41_DRAFT_ATTN_NO_CAT` (#3645) |
@@ -127,6 +128,15 @@ weights layout, loader, runtime (graphs, bounded replay, guarded ops) and mono d
   (gfx950). Item 1 asks for the Mega-MHC launch `ffn_mhc_fuse_quant` asks for and item 7
   replaces the launches `shared_act_quant` replaces, by another kernel: a recipe that sets an
   item and that option is refused.
+- `model_options.attn_out_quant_fuse`: a decode step's MXFP8 sparse attention (gfx950, 64
+  heads of 512 in 8 groups, FP8 KV, not packed, all rows) is called through AITER's
+  `mla_sparse_prefill_v41_inv_rope_quant`, which also writes the inverse-RoPE'd,
+  group-quantized pair `wo_a` reads, so the separate `inverse_rope_group_quant` call goes
+  away. It is the span of the `v41.attn.attend_out` seam, served natively: a planned owner
+  of that seam, of `v41.attn.attend` or of `v41.attn.out_full` keeps its calls. The fused
+  tail reads fp32 RoPE tables; the model's are BF16, so fp32 twins of them, value for value,
+  are built with the model. Prefill, bounded replay, A8W4 and an AITER without the op are
+  unchanged.
 - `dspark_options.dp_sharded_head`: under pure DP attention (TP 1) the draft block's rows and
   anchors are all-gathered over the DP group, each rank projects every row onto its own
   `V / dp` slice of the replicated LM head, and each position's id is picked from the

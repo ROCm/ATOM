@@ -30,7 +30,9 @@ from atom.model_ops.attentions.deepseek_v41.fp8_attention import (
     attend_out_native,
     fused_attention_available,
     fused_sparse_attn_v41_paged_2src,
+    mla_sparse_prefill_v41_inv_rope_quant,
     sparse_attn_v41_paged_2src,
+    sparse_attn_v41_paged_2src_inv_rope_quant,
 )
 from atom.model_ops.attentions.deepseek_v41.packed_attention import (
     packed_decode,
@@ -44,6 +46,7 @@ from atom.model_ops.deepseek_v41.paged_scoring import (
     score_topk_paged,
     score_topk_quantized,
 )
+from atom.model_ops.deepseek_v41.rotary import fp32_tables
 from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
 from atom.model_ops.layernorm import (
     DualRMSNormBF16,
@@ -78,6 +81,29 @@ def _live_rows():
     """`_live_step` plus bounded replay's query rows."""
     metadata = forward_context.get_forward_context().attn_metadata
     return {**_live_step(), "queries": metadata.queries}
+
+
+def _attn_out_quant_fuse_supported(heads: int, head_dim: int, groups: int) -> bool:
+    """`model_options.attn_out_quant_fuse` on the one shape AITER fuses:
+    gfx950, 64 heads of 512 in 8 groups. Logged once per process."""
+    if not plugin_host.model_options().attn_out_quant_fuse:
+        return False
+    state = getattr(_attn_out_quant_fuse_supported, "state", None)
+    if mla_sparse_prefill_v41_inv_rope_quant is None:
+        ok, why = False, "aiter has no mla_sparse_prefill_v41_inv_rope_quant"
+    elif (heads, head_dim, groups) != (64, 512, 8):
+        ok, why = False, f"shape {heads}x{head_dim}/{groups} unsupported"
+    else:
+        from aiter.jit.utils.chip_info import get_gfx_runtime
+
+        gfx = get_gfx_runtime()
+        ok, why = gfx == "gfx950", f"arch {gfx}"
+    if state != (ok, why):
+        _attn_out_quant_fuse_supported.state = (ok, why)
+        logger.info(
+            "dsv41 attention output quant: %s (%s)", "fused" if ok else "unfused", why
+        )
+    return ok
 
 
 def _log_woa_quant_path(fused: bool, why: str, *, final: bool = True) -> None:
@@ -349,6 +375,11 @@ class Attention(nn.Module):
         # Set in `process_weights_after_loading`, once wo_a's shape is known.
         # Unsupported shapes stay on the unfused bf16 GEMM + quantize_fp8 path.
         self._fuse_woa_quant = False
+        # `model_options.attn_out_quant_fuse`: decode's attention writes wo_a's
+        # input pair. Off, nothing below reads it.
+        self._fuse_attn_out_quant = _attn_out_quant_fuse_supported(
+            self.heads, self.head_dim, self.groups
+        )
         self._wo_a_seam = plugin_host.bind(
             "v41.attn.out", self._wo_a, capability=self._wo_a_capability
         )
@@ -587,18 +618,23 @@ class Attention(nn.Module):
             },
         }
 
-    def _attend_out_tail(self, query, cache, step, queries, rope):
+    def _attend_out_tail(self, query, cache, step, queries, rope, prepared=None):
         """`(positions, cos, sin, x_fp8, x_scale)` for `v41.attn.attend_out`,
         or None: no plan owns the seam, or the call is not the one it covers --
         FP8 KV, decode, unpacked (so not A8W4), no bounded-replay rows, group32
         FP8 `wo_a`. The pair is allocated here, in the recorded forward, so an
-        eager-region replay writes it in place."""
+        eager-region replay writes it in place.
+
+        With no owner, `model_options.attn_out_quant_fuse` asks for the same
+        span from AITER's fused attention tail (`_attn_out_quant_tail`)."""
         if (
             self._attend_out_seam is attend_out_native
             or queries is not None
             or not plugin_host.owns("v41.attn.attend_out")
         ):
-            return None
+            return self._attn_out_quant_tail(
+                query, cache, step, queries, rope, prepared
+            )
         if self.wo_a.runs_bf16 or not (
             step.decode and cache.kv_fp8 and not cache.packed
         ):
@@ -623,10 +659,71 @@ class Attention(nn.Module):
             x_scale,
         )
 
+    def _attn_out_quant_tail(self, query, cache, step, queries, rope, prepared):
+        """`_attend_out_tail`'s five for `model_options.attn_out_quant_fuse`,
+        and two more that mark them (the fp32 RoPE tables the fused tail
+        reads), or None where the attention and `inverse_rope_group_quant`
+        stay two calls: anything but a decode step's MXFP8 attention over all
+        rows with the spans it covers native."""
+        if not self._fuse_attn_out_quant:
+            return None
+        if not step.decode or queries is not None or prepared is None:
+            return None
+        if prepared[0] or not cache.kv_fp8 or cache.packed or self.wo_a.runs_bf16:
+            return None
+        if any(
+            plugin_host.owns(seam)
+            for seam in ("v41.attn.attend", "v41.attn.attend_out", "v41.attn.out_full")
+        ):
+            return None
+        # The fused tail reads fp32 tables. Over BF16 ones it takes their
+        # fp32 twins: `inverse_rope_group_quant` widens each entry and then
+        # rounds as its fp32-table kernel does (the sine products on their
+        # own, the cosine ones fused), which is what the tail reproduces.
+        tables = fp32_tables(rope, widened=True)
+        if tables is None:
+            return None
+        positions = cache.rope_positions(step)
+        if positions.dtype != torch.int64:
+            return None
+        rows = query.shape[:-2].numel()
+        width = self.heads * self.head_dim // self.groups
+        x_fp8 = torch.empty(
+            (rows, self.groups, width), dtype=FP8_DTYPE, device=query.device
+        )
+        x_scale = torch.empty(
+            (rows, self.groups, width // 32),
+            dtype=torch.float8_e8m0fnu,
+            device=query.device,
+        )
+        return (
+            positions.flatten(),
+            rope.cos_cache,
+            rope.sin_cache,
+            x_fp8,
+            x_scale,
+            *tables,
+        )
+
     def _quantize_tail(self, output, tail):
         """A path the span does not cover: the native quant into its buffers."""
-        positions, cos, sin, x_fp8, x_scale = tail
+        positions, cos, sin, x_fp8, x_scale = tail[:5]
         rows = output.shape[:-2].numel() if output.dim() > 2 else output.shape[0]
+        if len(tail) > 5:
+            # model_options.attn_out_quant_fuse: the pair is read whatever the
+            # step holds; the rows are quantized as the unfused path does,
+            # straight into the buffers.
+            inverse_rope_group_quant(
+                output.reshape(rows, self.heads, self.head_dim),
+                positions,
+                cos,
+                sin,
+                num_groups=self.groups,
+                quant_group_size=32,
+                x_fp8=x_fp8,
+                x_scale=x_scale,
+            )
+            return
         values, scales = inverse_rope_group_quant(
             output.reshape(rows, self.heads, self.head_dim),
             positions,
@@ -828,10 +925,10 @@ class Attention(nn.Module):
             return self._project_quantized_out(
                 x_fp8, x_scale, query.shape[:-2], query.dtype
             )
-        tail = self._attend_out_tail(query, cache, step, queries, rope)
+        tail = self._attend_out_tail(query, cache, step, queries, rope, prepared)
         if tail is not None:
             self._attend(query, cache, step, queries, prepared, tail=tail)
-            return self._project_out(query, rope, tail[0], quantized=tail[3:])
+            return self._project_out(query, rope, tail[0], quantized=tail[3:5])
         output = self._attend(query, cache, step, queries, prepared)
         return self._project_out(
             output.view_as(query),
@@ -928,8 +1025,10 @@ class Attention(nn.Module):
         `fused=True` writes inverse-rotated MXFP8 into the caller's `out` and
         `out_scale` graph buffers and returns None. With ``tail``
         (`_attend_out_tail`) it writes wo_a's input pair into the tail's
-        buffers through `v41.attn.attend_out` and returns None. Otherwise
-        return BF16 attention for `_project_out`.
+        buffers through `v41.attn.attend_out`, or, for a tail of
+        `model_options.attn_out_quant_fuse`, by AITER's attention that also
+        writes the inverse RoPE group quant of its output, and returns None.
+        Otherwise return BF16 attention for `_project_out`.
         """
         if fused:
             assert out is not None and out_scale is not None
@@ -988,6 +1087,35 @@ class Attention(nn.Module):
                     self.attn_sink,
                     self.softmax_scale,
                 )
+            elif (
+                tail is not None
+                and len(tail) > 5
+                and attend is sparse_attn_v41_paged_2src
+                and not a8w4
+            ):
+                # model_options.attn_out_quant_fuse: as below, with the
+                # output's inverse RoPE group quant written by the same call,
+                # over the tables' fp32 twins. The spans it covers are native.
+                positions, _, _, x_fp8, x_scale, cos, sin = tail
+                sparse_attn_v41_paged_2src_inv_rope_quant(
+                    attending,
+                    pool,
+                    prefix,
+                    prefix_indptr,
+                    cache.ring_view(self.spec.layer_id),
+                    second,
+                    second_indptr,
+                    self.attn_sink,
+                    self.softmax_scale,
+                    positions,
+                    cos,
+                    sin,
+                    out=flat_query,
+                    x_fp8=x_fp8,
+                    x_scale=x_scale,
+                    num_groups=self.groups,
+                )
+                return None
             elif tail is not None and attend is sparse_attn_v41_paged_2src and not a8w4:
                 # The same call plus the inverse RoPE + quant, as one span.
                 positions, cos, sin, x_fp8, x_scale = tail

@@ -37,6 +37,48 @@ def rope_frequencies(
     return frequencies
 
 
+def fp32_tables(rope, *, widened=False):
+    """``rope``'s ``(cos, sin)`` as contiguous fp32 ``[positions, pairs]``
+    tensors (``pairs`` the tables' last dim, ``rope_dim // 2``), or None: what
+    a kernel that indexes ``table[position * pairs + pair]`` in fp32 can be
+    handed.
+
+    Tables that are fp32 already come back as 2-D views of their own memory,
+    whatever singleton dims sit between the position and the pair (V4 keeps
+    ``[positions, 1, 1, pairs]``); every kernel of this seam reads them by
+    that flat index. BF16 tables -- this model's -- have no fp32 memory of
+    their own; ``widened`` hands out the twins `build_fp32_tables` registered
+    (None before it ran). A caller may only ask for them where the launch it
+    stands in for widens each BF16 entry and then computes in fp32 exactly as
+    the fp32-table launch does; that is a property of the compiled reference
+    kernel, not of the table.
+    """
+    cos, sin = rope.cos_cache, rope.sin_cache
+    if (
+        cos.dim() < 2
+        or cos.shape != sin.shape
+        or cos.dtype != sin.dtype
+        or any(n != 1 for n in cos.shape[1:-1])
+        or not (cos.is_contiguous() and sin.is_contiguous())
+    ):
+        return None
+    pairs = cos.shape[-1]
+    if cos.dtype == torch.float32:
+        return cos.view(-1, pairs), sin.view(-1, pairs)
+    if not widened:
+        return None
+    twins = getattr(rope, "cos_fp32", None), getattr(rope, "sin_fp32", None)
+    if any(
+        t is None
+        or t.dtype != torch.float32
+        or t.shape != (cos.shape[0], pairs)
+        or not t.is_contiguous()
+        for t in twins
+    ):
+        return None
+    return twins
+
+
 class RotaryEmbedding(nn.Module):
     def __init__(
         self,
@@ -72,6 +114,20 @@ class RotaryEmbedding(nn.Module):
             frequencies.imag.to(torch.bfloat16).contiguous(),
             persistent=False,
         )
+
+    def build_fp32_tables(self):
+        """Register ``cos_fp32`` / ``sin_fp32``: the caches widened to fp32,
+        value for value, for a kernel that reads an fp32 table and must
+        compute what a kernel widening the BF16 one computes (`fp32_tables`).
+
+        Call while the model is built: a tensor first made inside a graph
+        capture would live in the capture's pool. Twice the caches' bytes.
+        """
+        if "cos_fp32" not in self._buffers:
+            for name in ("cos", "sin"):
+                table = getattr(self, f"{name}_cache").float().contiguous()
+                self.register_buffer(f"{name}_fp32", table, persistent=False)
+        return self.cos_fp32, self.sin_fp32
 
     @property
     def frequencies(self):

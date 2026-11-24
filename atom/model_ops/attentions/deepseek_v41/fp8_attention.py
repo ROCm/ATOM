@@ -4,8 +4,13 @@
 CSA and SWA have independent row spaces. A prefill's SWA source contains
 the current batch's rings followed by the current chunk; decode uses the ring directly.
 The fused MXFP8 path consumes the same independent data/scale planes.
+`sparse_attn_v41_paged_2src_inv_rope_quant` (a recipe's
+`model_options.attn_out_quant_fuse`) is the MXFP8 attention that also writes
+the inverse RoPE group quant of its output.
 Legacy packed rows remain accepted by the standalone wrappers.
 """
+
+import logging
 
 import torch
 
@@ -22,6 +27,17 @@ except ImportError:  # kopt r2: an AITER without ROCm/aiter#8279's support query
 
 
 from aiter.ops.mla_sparse_prefill import mla_sparse_prefill_v41
+
+try:
+    from aiter.ops.mla_sparse_prefill import (
+        mla_sparse_prefill_v41_inv_rope_quant,
+        mla_sparse_prefill_v41_inv_rope_quant_fuses,
+    )
+except ImportError:
+    # An aiter without the fused output tail: the attention and the inverse
+    # RoPE group quant stay two calls.
+    mla_sparse_prefill_v41_inv_rope_quant = None
+    mla_sparse_prefill_v41_inv_rope_quant_fuses = None
 
 from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE
 from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src_reference
@@ -91,6 +107,105 @@ def sparse_attn_v41_paged_2src(
         out=out,
         num_kv_splits=num_kv_splits,
     )
+
+
+logger = logging.getLogger("atom")
+
+# What the fused entry's first calls launched, for a server log: AITER folds
+# the quant into the attention only where that splits K, and says so nowhere.
+# Asked for the first calls only (host scalars, but a recorded region runs
+# this Python on every replay), and until one of them fused.
+_OUT_QUANT_PROBES = 256
+_out_quant_seen = {"calls": 0, "logged": set()}
+
+
+def _log_out_quant_launch(values, pool, kv, prefix, extend, cos, groups, group_size):
+    seen = _out_quant_seen
+    if seen["calls"] >= _OUT_QUANT_PROBES or True in seen["logged"]:
+        return
+    seen["calls"] += 1
+    if mla_sparse_prefill_v41_inv_rope_quant_fuses is None:
+        return
+    splits = mla_sparse_prefill_v41_inv_rope_quant_fuses(
+        values, pool, kv, prefix, extend, cos, groups, group_size
+    )
+    if (splits > 0) in seen["logged"]:
+        return
+    seen["logged"].add(splits > 0)
+    logger.info(
+        "dsv41 attention output quant: first %s (%d rows, %d index entries)",
+        (
+            f"launch with the split-K fold, {splits} splits"
+            if splits
+            else "call that does not split K: two launches"
+        ),
+        values.shape[0],
+        prefix.numel() + extend.numel(),
+    )
+
+
+@mark_trace
+def sparse_attn_v41_paged_2src_inv_rope_quant(
+    query,
+    pool,
+    kv_indices_prefix,
+    kv_indptr_prefix,
+    kv,
+    kv_indices_extend,
+    kv_indptr_extend,
+    attn_sink,
+    softmax_scale,
+    positions,
+    cos_cache,
+    sin_cache,
+    *,
+    out,
+    x_fp8,
+    x_scale,
+    num_groups,
+    quant_group_size=32,
+):
+    """`sparse_attn_v41_paged_2src`, then `inverse_rope_group_quant` of its
+    output into the caller's `(x_fp8, x_scale)`.
+
+    AITER folds the two into the attention's split-K fold where it splits and
+    runs them as two launches where it does not; the pair is written either
+    way. `out` is the `[T, H, D]` bf16 buffer the unfused attention writes.
+    """
+    values, scales = query
+    dim = values.shape[-1]
+    if not torch.compiler.is_compiling():
+        _log_out_quant_launch(
+            values,
+            _split(pool, dim)[0],
+            _split(kv, dim)[0],
+            kv_indices_prefix,
+            kv_indices_extend,
+            cos_cache,
+            num_groups,
+            quant_group_size,
+        )
+    mla_sparse_prefill_v41_inv_rope_quant(
+        values,
+        scales,
+        *_split(pool, dim),
+        kv_indices_prefix,
+        kv_indptr_prefix,
+        *_split(kv, dim),
+        kv_indices_extend,
+        kv_indptr_extend,
+        attn_sink,
+        softmax_scale,
+        positions,
+        cos_cache,
+        sin_cache,
+        out,
+        x_fp8,
+        x_scale,
+        num_groups,
+        quant_group_size,
+    )
+    return x_fp8, x_scale
 
 
 @mark_trace
