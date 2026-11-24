@@ -253,12 +253,14 @@ def stage_iscore(c, lead, span, span_max, ch0, width, max_chunks):
 
 @traced
 def stage_ilist(
-    c, t, j, share, kind, level, bound_max, max_chunks, seg, gathers_ok=True
-):
+    c, t, j, share, kind, level, bound_max, max_chunks, seg, gathers_ok=True,
+    compact=None,
+):  # fmt: skip
     """List j of ``level`` for token t (``share``: its (column bound, columns
     on this rank, split), ``_shares``; a split build's FULL rows carry no
     bound) of a tree of ``seg`` segments; see the module. Only the lists
-    ``index_plan.list_count`` gives a token run."""
+    ``index_plan.list_count`` gives a token run. ``compact`` (the blk tree,
+    traced): whether its rows are compacted (``run_indexer``)."""
     tid = c["tid"]
     a = c["args"]
     k = ip.KINDS[kind]
@@ -273,6 +275,8 @@ def stage_ilist(
     gathers = False if raw is None else (a["iprod"] != 0) & ip.compacts(raw)
     if const_expr(not gathers_ok):
         gathers = False
+    if const_expr(compact is not None and gathers is not False):
+        gathers = gathers & compact
     if j < ip.list_count(bound, level, k, seg):
         n = ip.list_inputs(bound, level, j, k, seg)
         final = ip.is_final(bound, level, k, seg)
@@ -695,8 +699,17 @@ def run_indexer(c, s, bid, bound_max):
     # a candidate producer's blocks first: its long rows' selection ranks
     # only their rows (``index_plan.compacts``), a CTA's tasks in this order
     if a["iprod"] != 0:
+        # its long rows compacted (``_compact``) only where its selection then
+        # ranks the compacted columns (``_wide``). Beside the full-column tree
+        # a compaction would rewrite the columns that tree's level 0 is still
+        # reading, and nothing would read it: a REINDEX layer scores its
+        # candidates afresh (``index_plan.compacts``); ICRDY says its blocks
+        # are out either way
         ((blk, bseg),) = ip.trees("blk", bound_max)
-        _run_tree(c, t0, n, bid, "blk", _whole(c, t0, n), blk, max_chunks, bseg)
+        _run_tree(
+            c, t0, n, bid, "blk", _whole(c, t0, n), blk, max_chunks, bseg,
+            compact=_wide(c, t0, n),
+        )  # fmt: skip
     # the selection's trees (``index_plan.trees``): the columns', a REINDEX
     # row's -- a candidate producer's too, over its candidates
     (full, seg), (reindex, rseg) = ip.trees("sel", bound_max)
@@ -704,10 +717,7 @@ def run_indexer(c, s, bid, bound_max):
         _run_tree(c, t0, n, bid, "sel", _whole(c, t0, n), reindex, max_chunks, rseg)
     elif a["iprod"] != 0:
         bounds = _bounds(c, t0, n)
-        widest = bounds[0]
-        for b in bounds[1:]:
-            widest = fx.max(widest, b)
-        if widest > PROD_FULL_MAX:
+        if _wide(c, t0, n):
             # past PROD_FULL_MAX columns the full tree's first level outgrows
             # the grid: its candidates' columns (``index_plan.candidate_bound``)
             # after the blk tree's compaction, apart from a REINDEX row's tree
@@ -733,6 +743,17 @@ def run_indexer(c, s, bid, bound_max):
 
 def _bounds(c, t0, n):
     return [ld_i32(c["args"]["ibound"], t0 + t) for t in range(n)]
+
+
+def _wide(c, t0, n):
+    """Is a candidate producer's widest row past PROD_FULL_MAX? Its
+    selection then ranks its rows' candidate columns, compacted by its blk
+    tree, else every column beside that tree (``run_indexer``)."""
+    bounds = _bounds(c, t0, n)
+    widest = bounds[0]
+    for b in bounds[1:]:
+        widest = fx.max(widest, b)
+    return widest > PROD_FULL_MAX
 
 
 def _whole(c, t0, n):
@@ -792,8 +813,9 @@ def run_scores(c, t0, n, bid, bounds, max_chunks):
 
 @traced
 def _run_tree(
-    c, t0, n, bid, kind, rows, bound_max, max_chunks, seg, first=0, gathers_ok=True
-):
+    c, t0, n, bid, kind, rows, bound_max, max_chunks, seg, first=0, gathers_ok=True,
+    compact=None,
+):  # fmt: skip
     k = ip.KINDS[kind]
     decode, words = rows
     for level in range_constexpr(ip.top_level(kind, bound_max, seg) + 1):
@@ -806,8 +828,9 @@ def _run_tree(
             t, j = ip.flat_task(counts, task)
             share = decode(pick(words, t))
             stage_ilist(
-                c, t0 + t, j, share, kind, level, bound_max, max_chunks, seg, gathers_ok
-            )
+                c, t0 + t, j, share, kind, level, bound_max, max_chunks, seg,
+                gathers_ok, compact,
+            )  # fmt: skip
 
 
 @traced
