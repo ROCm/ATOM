@@ -63,7 +63,8 @@ pub struct AppContext {
     pub tokenizer_template_files: Arc<RwLock<HashMap<String, String>>>,
     /// Per tokenizer name, held while a registration loads its tokenizer.
     pub tokenizer_registering: Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// Held while ATOM workers' template is admitted and they are registered.
+    /// Held while ATOM workers' template is admitted and they are registered, and
+    /// while a model's last worker leaving drops its tokenizer.
     pub template_admission: Arc<parking_lot::Mutex<()>>,
     /// `router_config`'s tokenization byte limits.
     pub(crate) tokenize_limits: TokenizeLimits,

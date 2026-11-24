@@ -33,7 +33,7 @@ use crate::{
     config::RouterConfig,
     core::{
         placement::PlacementPlan,
-        steps::{TokenizerConfigRequest, WorkflowEngines},
+        steps::{workflow_data::LocalWorkerWorkflowData, TokenizerConfigRequest, WorkflowEngines},
         worker::RuntimeType,
         Job, JobQueue, JobQueueConfig,
     },
@@ -520,6 +520,24 @@ async fn a_worker_with_another_template_is_refused_while_the_tokenizer_loads() {
     assert_eq!(render(&ctx, "atom-loading", Value::Null).await, "first: hi");
 }
 
+/// Registration of the worker at `url` run up to, not including, its register step.
+async fn created_worker(
+    ctx: &Arc<AppContext>,
+    url: &str,
+) -> WorkflowContext<LocalWorkerWorkflowData> {
+    let config = serde_json::from_value(json!({ "url": url })).unwrap();
+    let data = create_local_worker_workflow_data(config, ctx.clone());
+    let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);
+    DetectConnectionModeStep
+        .execute(&mut context)
+        .await
+        .unwrap();
+    DiscoverMetadataStep.execute(&mut context).await.unwrap();
+    DiscoverDPInfoStep.execute(&mut context).await.unwrap();
+    CreateLocalWorkerStep.execute(&mut context).await.unwrap();
+    context
+}
+
 /// Of two registrations with different templates that both pass worker creation
 /// before either registers, exactly one is admitted.
 #[tokio::test]
@@ -529,17 +547,7 @@ async fn of_two_concurrent_registrations_with_different_templates_one_is_admitte
     for template in ["first", "second"] {
         let template = format!("{template}: {{{{ messages[0].content }}}}");
         let url = serve_atom(model_info("atom-race", &template, "{}"), 1).await;
-        let config = serde_json::from_value(json!({ "url": url })).unwrap();
-        let data = create_local_worker_workflow_data(config, ctx.clone());
-        let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);
-        DetectConnectionModeStep
-            .execute(&mut context)
-            .await
-            .unwrap();
-        DiscoverMetadataStep.execute(&mut context).await.unwrap();
-        DiscoverDPInfoStep.execute(&mut context).await.unwrap();
-        CreateLocalWorkerStep.execute(&mut context).await.unwrap();
-        created.push(context);
+        created.push(created_worker(&ctx, &url).await);
     }
     let mut registered = Vec::new();
     for context in &mut created {
@@ -554,6 +562,38 @@ async fn of_two_concurrent_registrations_with_different_templates_one_is_admitte
     let refused = registered[1].as_ref().unwrap_err();
     assert!(refused.contains("redeploying"), "{refused}");
     assert_eq!(ctx.worker_registry.get_by_model("atom-race").len(), 1);
+}
+
+/// A model's last worker leaving does not drop the tokenizer that a worker admitted
+/// meanwhile with the same template uses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_leaving_last_worker_keeps_the_tokenizer_a_same_template_worker_was_admitted_with() {
+    let ctx = context();
+    let info = || model_info("atom-handover", "same: {{ messages[0].content }}", "{}");
+    let first = serve_atom(info(), 1).await;
+    register(&ctx, json!({ "url": first })).await.unwrap();
+    assert_eq!(render(&ctx, "atom-handover", Value::Null).await, "same: hi");
+    let second = created_worker(&ctx, &serve_atom(info(), 1).await).await;
+
+    // The second worker is admitted against the loaded tokenizer and registered
+    // under this lock, after the first left the registry.
+    let admitting = ctx.template_admission.lock();
+    let removal = tokio::spawn({
+        let (ctx, first) = (ctx.clone(), first.clone());
+        async move { remove(&ctx, &first).await }
+    });
+    while ctx.worker_registry.get_by_url(&first).is_some() {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(200)); // the removal's tokenizer check
+    for worker in second.data.actual_workers.as_ref().unwrap() {
+        ctx.worker_registry.register(worker.clone());
+    }
+    drop(admitting);
+    removal.await.unwrap();
+
+    assert!(ctx.tokenizer_registry.contains("atom-handover"));
+    assert_eq!(render(&ctx, "atom-handover", Value::Null).await, "same: hi");
 }
 
 /// A model's tokenizer loaded with a template file keeps it: a worker that only
