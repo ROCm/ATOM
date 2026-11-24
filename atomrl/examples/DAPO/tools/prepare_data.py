@@ -14,7 +14,9 @@ Produces, under the data root:
 Prompts longer than 1024 tokens are dropped; without that the trainer starts with a
 slow scan for overlong prompts. Qwen3-8B-Base and the Qwen3-30B-A3B models share a
 byte-identical tokenizer, so one filtered set serves every example. Anything already
-present is kept. ``--source modelscope`` uses ModelScope with the same IDs.
+present at the configured immutable revision is kept; legacy or mismatched model
+directories are refreshed. ``--source modelscope`` uses ModelScope with the same IDs
+and source-specific immutable revisions.
 """
 
 from __future__ import annotations
@@ -22,13 +24,41 @@ from __future__ import annotations
 import argparse
 import glob
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
+
+@dataclass(frozen=True)
+class ModelSpec:
+    repo: str
+    hf_revision: str
+    modelscope_revision: str
+
+    def revision(self, source: str) -> str:
+        return self.hf_revision if source == "hf" else self.modelscope_revision
+
+
 MODELS = {
-    "Qwen3-8B-Base": "Qwen/Qwen3-8B-Base",
-    "Qwen3-8B": "Qwen/Qwen3-8B",
-    "Qwen3-30B-A3B-Base": "Qwen/Qwen3-30B-A3B-Base",
-    "Qwen3-30B-A3B": "Qwen/Qwen3-30B-A3B",
+    "Qwen3-8B-Base": ModelSpec(
+        "Qwen/Qwen3-8B-Base",
+        "49e3418fbbbca6ecbdf9608b4d22e5a407081db4",
+        "932bc907a0f908fd665867dec24af47c2f57e719",
+    ),
+    "Qwen3-8B": ModelSpec(
+        "Qwen/Qwen3-8B",
+        "b968826d9c46dd6066d109eabc6255188de91218",
+        "26028140be3ee69b82b1d1450179ab71bb1121b9",
+    ),
+    "Qwen3-30B-A3B-Base": ModelSpec(
+        "Qwen/Qwen3-30B-A3B-Base",
+        "1b75feb79f60b8dc6c5bc769a898c206a1c6a4f9",
+        "b4a03a639a3d9d5ece1ff5f6a5a4678669e70e05",
+    ),
+    "Qwen3-30B-A3B": ModelSpec(
+        "Qwen/Qwen3-30B-A3B",
+        "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39",
+        "8143878278a202cc0ff9ef1bbe00b2abb1adf86d",
+    ),
 }
 DATASETS = {
     "DAPO-Math-17k": "BytedTsinghua-SIA/DAPO-Math-17k",
@@ -51,22 +81,41 @@ FILTERED = "data_cached/qwen3-8b-maxprompt1024"
 DONE = ".download_complete"
 
 
-def present(dest: Path, dataset: bool) -> bool:
-    if (dest / DONE).exists():
+def present(dest: Path, dataset: bool, expected_marker: str | None = None) -> bool:
+    marker = dest / DONE
+    if dataset and marker.exists():
         return True
     if dataset:
         return bool(glob.glob(f"{dest}/**/*.parquet", recursive=True))
-    return (dest / "config.json").exists() and bool(glob.glob(f"{dest}/*.safetensors"))
+    complete = (dest / "config.json").exists() and bool(
+        glob.glob(f"{dest}/*.safetensors")
+    )
+    return (
+        complete
+        and marker.exists()
+        and marker.read_text(encoding="utf-8").strip() == expected_marker
+    )
 
 
 def snapshot(
-    source: str, repo: str, dest: Path, patterns: list[str], dataset: bool
+    source: str,
+    repo: str,
+    dest: Path,
+    patterns: list[str],
+    dataset: bool,
+    revision: str | None = None,
 ) -> None:
-    if present(dest, dataset):
-        print(f"[skip] {repo}: {dest} is present")
+    expected_marker = f"{source}@{revision}" if revision else None
+    if present(dest, dataset, expected_marker):
+        suffix = f" at {revision}" if revision else ""
+        print(f"[skip] {repo}{suffix}: {dest} is present")
         return
-    print(f"[download] {repo} -> {dest}")
+    suffix = f" at {revision}" if revision else ""
+    print(f"[download] {repo}{suffix} -> {dest}")
+    dest.mkdir(parents=True, exist_ok=True)
     kwargs = {"repo_type": "dataset"} if dataset else {}
+    if revision:
+        kwargs["revision"] = revision
     if source == "modelscope":
         from modelscope.hub.snapshot_download import snapshot_download
 
@@ -77,7 +126,7 @@ def snapshot(
         from huggingface_hub import snapshot_download
 
         snapshot_download(repo, local_dir=str(dest), allow_patterns=patterns, **kwargs)
-    (dest / DONE).touch()
+    (dest / DONE).write_text(expected_marker or "complete", encoding="utf-8")
 
 
 def first_parquet(pattern: str) -> str:
@@ -134,18 +183,27 @@ def main() -> None:
         "--models", nargs="*", default=[TOKENIZER_MODEL], choices=sorted(MODELS)
     )
     p.add_argument("--source", choices=("hf", "modelscope"), default="hf")
+    p.add_argument(
+        "--models-only",
+        action="store_true",
+        help="prepare the selected pinned models without datasets or prompt filtering",
+    )
     args = p.parse_args()
     if not args.data_root:
         p.error("--data-root (or DATA_ROOT) is required")
     root = Path(args.data_root)
     for name in dict.fromkeys([TOKENIZER_MODEL, *args.models]):
+        model = MODELS[name]
         snapshot(
             args.source,
-            MODELS[name],
+            model.repo,
             root / "models" / name,
             MODEL_FILES,
             dataset=False,
+            revision=model.revision(args.source),
         )
+    if args.models_only:
+        return
     for name, repo in DATASETS.items():
         snapshot(args.source, repo, root / "raw" / name, DATA_FILES, dataset=True)
     filter_prompts(root)

@@ -4,13 +4,21 @@
 
 ## 3.1 Download
 
+The canonical repo IDs and immutable Hugging Face/ModelScope revisions live in
+`examples/DAPO/tools/prepare_data.py`; `bash examples/run.sh prepare 1 6` uses those
+pins and records the selected source and revision in each model directory.
+
 ```bash
 sudo docker exec "$CONTAINER" bash -lc '
 python3 - <<PY
 from huggingface_hub import snapshot_download
+from pathlib import Path
 import os; D = os.environ["DATA_ROOT"]
 snapshot_download("Qwen/Qwen3-8B-Base", local_dir=f"{D}/models/Qwen3-8B-Base",
+                  revision="49e3418fbbbca6ecbdf9608b4d22e5a407081db4",
                   allow_patterns=["*.json","*.txt","*.safetensors","*.model","tokenizer*"])
+Path(f"{D}/models/Qwen3-8B-Base/.download_complete").write_text(
+    "hf@49e3418fbbbca6ecbdf9608b4d22e5a407081db4")
 snapshot_download("BytedTsinghua-SIA/DAPO-Math-17k", repo_type="dataset",
                   local_dir=f"{D}/raw/DAPO-Math-17k")
 snapshot_download("BytedTsinghua-SIA/AIME-2024", repo_type="dataset",
@@ -21,7 +29,10 @@ PY
 # Additionally for examples 6 and 7 (~57G)
 sudo docker exec "$CONTAINER" bash -lc '
 hf download Qwen/Qwen3-30B-A3B-Base \
-  --local-dir "$DATA_ROOT/models/Qwen3-30B-A3B-Base" --max-workers 8'
+  --revision 1b75feb79f60b8dc6c5bc769a898c206a1c6a4f9 \
+  --local-dir "$DATA_ROOT/models/Qwen3-30B-A3B-Base" --max-workers 8
+printf %s hf@1b75feb79f60b8dc6c5bc769a898c206a1c6a4f9 \
+  > "$DATA_ROOT/models/Qwen3-30B-A3B-Base/.download_complete"'
 ```
 
 From a restricted network use ModelScope instead. The IDs are identical
@@ -34,11 +45,15 @@ sudo docker exec "$CONTAINER" bash -lc '
 pip install modelscope
 python3 - <<PY
 from modelscope.hub.snapshot_download import snapshot_download
+from pathlib import Path
 import os
 D = os.environ["DATA_ROOT"]
 snapshot_download("Qwen/Qwen3-8B-Base", local_dir=f"{D}/models/Qwen3-8B-Base",
+    revision="932bc907a0f908fd665867dec24af47c2f57e719",
     allow_patterns=["*.json","*.txt","*.safetensors","*.model","tokenizer*","*.py","*.tiktoken"],
     max_workers=8)
+Path(f"{D}/models/Qwen3-8B-Base/.download_complete").write_text(
+    "modelscope@932bc907a0f908fd665867dec24af47c2f57e719")
 for rid, sub in (("BytedTsinghua-SIA/DAPO-Math-17k", "DAPO-Math-17k"),
                  ("BytedTsinghua-SIA/AIME-2024", "AIME-2024")):
     snapshot_download(repo_id=rid, repo_type="dataset", local_dir=f"{D}/raw/{sub}",

@@ -45,13 +45,14 @@ jobs:
       - name: Prepare AtomRL GPU unit models
         run: |
           set -euo pipefail
-          qwen_path="$DATA_ROOT/models/Qwen3-8B-Base"
-          if [[ ! -f "$qwen_path/config.json" ]]; then
-            echo "::error title=Missing AtomRL GPU model::$qwen_path"
-            exit 1
-          fi
-
           mkdir -p "$DATA_ROOT/hf"
+          docker run --rm --network=host \
+            -v "$DATA_ROOT:$DATA_ROOT" \
+            "$IMAGE_TAG" python \
+            examples/DAPO/tools/prepare_data.py \
+              --data-root "$DATA_ROOT" \
+              --models Qwen3-8B-Base \
+              --models-only
           docker run --rm --network=host \
             -e HF_HOME=/data/rl_data/hf \
             -e DSV3_REVISION="$DSV3_REVISION" \
@@ -137,6 +138,20 @@ jobs:
             --tag "$IMAGE_TAG" \
             .
 
+      - name: Prepare pinned DAPO models and data
+        run: |
+          set -euo pipefail
+          models=(Qwen3-8B-Base)
+          if [[ "${{ matrix.id }}" == "6" || "${{ matrix.id }}" == "7" || "${{ matrix.id }}" == "9" ]]; then
+            models+=(Qwen3-30B-A3B-Base)
+          fi
+          docker run --rm --network=host \
+            -v "$DATA_ROOT:$DATA_ROOT" \
+            "$IMAGE_TAG" python \
+            examples/DAPO/tools/prepare_data.py \
+              --data-root "$DATA_ROOT" \
+              --models "${models[@]}"
+
       - name: Check shared DAPO models and data
         run: |
           set -euo pipefail
@@ -168,20 +183,10 @@ jobs:
       - name: Run DAPO example
         run: |
           set -euo pipefail
-          extra_env=()
-          # The 30B FSDP2 workers concurrently page the same safetensors from
-          # the shared model cache. Ray counts that reclaimable page cache as
-          # process pressure and kills a worker at its default 95% threshold.
-          # Linux can reclaim it safely; cases 6/9 were validated with the Ray
-          # monitor disabled on the 1.5-TB MI350X runner.
-          if [[ "${{ matrix.id }}" == "6" || "${{ matrix.id }}" == "9" ]]; then
-            extra_env+=(--env RAY_memory_monitor_refresh_ms=0)
-          fi
           bash atomrl/examples/run.sh "${{ matrix.id }}" \
             --data-root "$DATA_ROOT" \
             --image "release=${IMAGE_TAG}" \
             --results "$GITHUB_WORKSPACE/atomrl/output/regression" \
-            "${extra_env[@]}" \
             --strict
 
       - name: Upload DAPO regression result

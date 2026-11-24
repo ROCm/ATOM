@@ -283,17 +283,23 @@ export DATA_ROOT=/path/to/data
 bash examples/run.sh prepare 1 6       # 8B 与 30B-A3B 模型、两个数据集，并完成过滤
 ```
 
-`prepare` 在镜像里运行 `examples/DAPO/tools/prepare_data.py`，已有的内容会保留；
-`run.sh <N> --prepare` 会在 §8.3.3 有缺项时先做同样的准备。它在容器里做的事，分步如下：
+`prepare` 在镜像里运行 `examples/DAPO/tools/prepare_data.py`。只有
+`.download_complete` 与脚本中配置的 immutable revision 一致时才会复用模型；
+旧目录或版本不匹配的目录会重新准备。`run.sh <N> --prepare` 会在 §8.3.3
+有缺项时先做同样的准备。它在容器里做的事，分步如下：
 
 ```bash
 # 1) 模型与原始数据集
 docker exec -e DATA_ROOT="$DATA_ROOT" atomrl-ex-release bash -lc '
 python3 - <<PY
 from huggingface_hub import snapshot_download
+from pathlib import Path
 import os; D = os.environ["DATA_ROOT"]
 snapshot_download("Qwen/Qwen3-8B-Base", local_dir=f"{D}/models/Qwen3-8B-Base",
+                  revision="49e3418fbbbca6ecbdf9608b4d22e5a407081db4",
                   allow_patterns=["*.json","*.txt","*.safetensors","*.model","tokenizer*"])
+Path(f"{D}/models/Qwen3-8B-Base/.download_complete").write_text(
+    "hf@49e3418fbbbca6ecbdf9608b4d22e5a407081db4")
 snapshot_download("BytedTsinghua-SIA/DAPO-Math-17k", repo_type="dataset",
                   local_dir=f"{D}/raw/DAPO-Math-17k")
 snapshot_download("BytedTsinghua-SIA/AIME-2024", repo_type="dataset",
@@ -303,7 +309,10 @@ PY'
 # 例子 6、7、9 追加（约 57 GB）
 docker exec -e DATA_ROOT="$DATA_ROOT" atomrl-ex-release bash -lc '
 hf download Qwen/Qwen3-30B-A3B-Base \
-  --local-dir "$DATA_ROOT/models/Qwen3-30B-A3B-Base" --max-workers 8'
+  --revision 1b75feb79f60b8dc6c5bc769a898c206a1c6a4f9 \
+  --local-dir "$DATA_ROOT/models/Qwen3-30B-A3B-Base" --max-workers 8
+printf %s hf@1b75feb79f60b8dc6c5bc769a898c206a1c6a4f9 \
+  > "$DATA_ROOT/models/Qwen3-30B-A3B-Base/.download_complete"'
 ```
 
 ```bash

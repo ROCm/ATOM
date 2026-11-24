@@ -310,18 +310,24 @@ export DATA_ROOT=/path/to/data
 bash examples/run.sh prepare 1 6       # 8B and 30B-A3B models, both datasets, filtered
 ```
 
-`prepare` runs `examples/DAPO/tools/prepare_data.py` in the image and keeps whatever is
-already there; `run.sh <N> --prepare` does the same before a run when something in §8.3.3
-is missing. What it does, step by step, inside the container:
+`prepare` runs `examples/DAPO/tools/prepare_data.py` in the image. Models are reused only
+when their `.download_complete` marker matches the immutable revision configured by that
+script; legacy or mismatched directories are refreshed. `run.sh <N> --prepare` does the
+same before a run when something in §8.3.3 is missing. What it does, step by step, inside
+the container:
 
 ```bash
 # 1) models and raw datasets
 docker exec -e DATA_ROOT="$DATA_ROOT" atomrl-ex-release bash -lc '
 python3 - <<PY
 from huggingface_hub import snapshot_download
+from pathlib import Path
 import os; D = os.environ["DATA_ROOT"]
 snapshot_download("Qwen/Qwen3-8B-Base", local_dir=f"{D}/models/Qwen3-8B-Base",
+                  revision="49e3418fbbbca6ecbdf9608b4d22e5a407081db4",
                   allow_patterns=["*.json","*.txt","*.safetensors","*.model","tokenizer*"])
+Path(f"{D}/models/Qwen3-8B-Base/.download_complete").write_text(
+    "hf@49e3418fbbbca6ecbdf9608b4d22e5a407081db4")
 snapshot_download("BytedTsinghua-SIA/DAPO-Math-17k", repo_type="dataset",
                   local_dir=f"{D}/raw/DAPO-Math-17k")
 snapshot_download("BytedTsinghua-SIA/AIME-2024", repo_type="dataset",
@@ -331,7 +337,10 @@ PY'
 # extra for examples 6, 7 and 9 (about 57 GB)
 docker exec -e DATA_ROOT="$DATA_ROOT" atomrl-ex-release bash -lc '
 hf download Qwen/Qwen3-30B-A3B-Base \
-  --local-dir "$DATA_ROOT/models/Qwen3-30B-A3B-Base" --max-workers 8'
+  --revision 1b75feb79f60b8dc6c5bc769a898c206a1c6a4f9 \
+  --local-dir "$DATA_ROOT/models/Qwen3-30B-A3B-Base" --max-workers 8
+printf %s hf@1b75feb79f60b8dc6c5bc769a898c206a1c6a4f9 \
+  > "$DATA_ROOT/models/Qwen3-30B-A3B-Base/.download_complete"'
 ```
 
 ```bash
