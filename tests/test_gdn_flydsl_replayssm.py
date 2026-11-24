@@ -27,7 +27,10 @@ pytest.importorskip(
 )
 
 from atom.model_ops import attention_gdn as gdn
-from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
+from atom.model_ops.attentions.gdn_attn import (
+    LINEAR_STATE_ROWS,
+    GDNAttentionMetadataBuilder,
+)
 from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpMetadataBuilder
 from atom.model_ops.fla_ops import chunk, state_checkpoint
 from atom.model_ops.fla_ops import gdn_flydsl as fly
@@ -58,10 +61,16 @@ def test_qwen_binding_keeps_the_replayssm_checkpoint_contiguous(
     monkeypatch.setattr(fly, "_validated_on_gfx942", lambda: gfx942)
     builder = object.__new__(Qwen4ExpMetadataBuilder)
     builder.replayssm = replayssm
+    builder._state_shape_for_runner = lambda: ((), tuple(raw.shape[1:]))
+    builder._state_dtypes = lambda: (raw.dtype, raw.dtype)
     attention = SimpleNamespace(allow_aiter_flydsl=True, dt_bias=raw)
-    cache = builder.build_kv_cache_tensor(
-        SimpleNamespace(base_linear_attention=None, impl=attention)
+    module = Mock(
+        spec=["base_linear_attention", "impl"],
+        base_linear_attention=None,
+        impl=attention,
     )
+    builder._pool_rows = {LINEAR_STATE_ROWS: {module: 0}}
+    cache = builder.build_kv_cache_tensor(module)
     policy = attention.gdn_flydsl_policy
     # Off gfx942, ReplaySSM keeps the Triton prefill and no FlyDSL schedule.
     prefill = gfx942 or not replayssm

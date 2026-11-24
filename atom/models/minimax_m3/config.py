@@ -6,48 +6,29 @@ imports neither the model nor AITER until the architecture check needs it."""
 
 from atom.config import FP4_CACHE_DTYPES
 
-# An NVFP4 page is self-contained (data and e4m3 scales inline, the per-layer global
-# K/V scale a constant 1.0) and an NVFP4 index entry is one page: the in-process
-# LMCache offload moves both as opaque per-block bytes.
-NVFP4_PAGE_CONNECTORS = frozenset({"lmcache_offload"})
-
-# A draft whose KV dtype differs from the target's has been verified (save and restore)
-# only as a DSpark draft under these, whatever NVFP4_PAGE_CONNECTORS grows to take.
-DRAFT_DTYPE_CONNECTORS = frozenset({"lmcache_offload"})
-
-
-def _leaves_within(config, names) -> bool:
-    """Whether every configured transport, ``multi`` expanded, is one of ``names``."""
-    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-
-    try:
-        leaves = KVConnectorFactory.leaf_connectors(config)
-    except ValueError:  # an unknown connector: refused by the caller
-        return False
-    return bool(leaves) and all(name in names for name, _ in leaves)
-
-
-def _connectors_move_nvfp4_pages(config) -> bool:
-    """Whether every configured transport can move NVFP4 pages."""
-    return _leaves_within(config, NVFP4_PAGE_CONNECTORS)
-
 
 def nvfp4_pages_move(config) -> bool:
     """Whether this config's NVFP4 KV and index pages move under every transport it
-    runs."""
-    return config.kv_cache_dtype == "nvfp4" and _connectors_move_nvfp4_pages(config)
+    runs: each registered with ``moves_nvfp4_pages``."""
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    return config.kv_cache_dtype == "nvfp4" and (
+        KVConnectorFactory.topology_moves_nvfp4_pages(config)
+    )
 
 
 def draft_dtype_moves(config) -> bool:
     """Whether an own-pool draft may keep a KV dtype other than the target's under this
-    config's transports: a DSpark draft beside an NVFP4 KV, every transport in
-    ``DRAFT_DTYPE_CONNECTORS``."""
+    config's transports: a DSpark draft beside an NVFP4 KV, every transport registered
+    with ``moves_own_dtype_draft``."""
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
     spec = config.speculative_config
     return (
         config.kv_cache_dtype == "nvfp4"
         and spec is not None
         and spec.method == "dspark"
-        and _leaves_within(config, DRAFT_DTYPE_CONNECTORS)
+        and KVConnectorFactory.topology_moves_own_dtype_draft(config)
     )
 
 
@@ -66,11 +47,13 @@ def _fp4_kv_refusal(config) -> str | None:
         return f"it needs a bfloat16 model, got {config.torch_dtype}"
     if config.kv_transfer_config and not nvfp4_pages_move(config):
         # Not verified: MXFP4 pages under any transport, NVFP4 pages under one
-        # outside NVFP4_PAGE_CONNECTORS.
+        # not registered with moves_nvfp4_pages.
         if config.kv_cache_dtype == "nvfp4":
+            from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
             return (
                 "it runs with KV offload or --kv-transfer-config only under "
-                + ", ".join(sorted(NVFP4_PAGE_CONNECTORS))
+                + ", ".join(KVConnectorFactory.nvfp4_page_connectors())
             )
         return "it does not run with KV offload or --kv-transfer-config"
     if config.sequence_parallel_size > 1:
@@ -119,8 +102,8 @@ def validate_runtime_config(config):
     - an FP4 KV also: the same FP4 index cache (the default when omitted, an explicit other value is refused;
       MXFP4 and NVFP4 never pair),
       every attention layer an indexed sparse one (M3.1), a bf16 model, no sequence parallelism, no KV offload
-      or ``--kv-transfer-config`` (an NVFP4 KV excepted where every transport, ``multi`` expanded, is in
-      ``NVFP4_PAGE_CONNECTORS``), and no speculative draft left with FP4 KV.
+      or ``--kv-transfer-config`` (an NVFP4 KV excepted where every transport, ``multi`` expanded, is
+      registered with ``moves_nvfp4_pages``), and no speculative draft left with FP4 KV.
     """
     from atom.config import is_plugin_mode
 
