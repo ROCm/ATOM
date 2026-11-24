@@ -476,6 +476,7 @@ def _fused_rms_fp8_quant_fake(
     quant_type: int | None = None,
     output_unquantized_inp1: bool = False,
     transpose_scale: bool = False,
+    e8m0_scale: bool = False,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -495,7 +496,11 @@ def _fused_rms_fp8_quant_fake(
         out1_bs = torch.empty((m, 1), dtype=torch.float32, device=x1.device)
     else:
         num_bs_cols = (n1 + group_size - 1) // group_size
-        out1_bs = torch.empty((m, num_bs_cols), dtype=torch.float32, device=x1.device)
+        out1_bs = torch.empty(
+            (m, num_bs_cols),
+            dtype=dtypes.fp8_e8m0 if e8m0_scale else torch.float32,
+            device=x1.device,
+        )
     out1_unquantized = torch.empty_like(x1) if output_unquantized_inp1 else None
     out2 = None
     if x2 is not None:
@@ -545,7 +550,9 @@ def _fuse_rmsnorm_fp4_quant(
     return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
 
 
-@torch_compile_guard(gen_fake=_fused_rms_fp8_quant_fake)
+# Its outputs are fresh tensors: as a mutating op, Inductor could not remove the
+# auto_functionalized_v2 around it once it returns an E8M0 scale.
+@torch_compile_guard(gen_fake=_fused_rms_fp8_quant_fake, mutates_args=[])
 def _fused_rms_fp8_quant(
     x1: torch.Tensor,
     x1_weight: torch.Tensor,
@@ -559,6 +566,7 @@ def _fused_rms_fp8_quant(
     quant_type: int | None = None,
     output_unquantized_inp1: bool = False,
     transpose_scale: bool = False,
+    e8m0_scale: bool = False,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -580,6 +588,7 @@ def _fused_rms_fp8_quant(
             quant_type,
             output_unquantized_inp1,
             transpose_scale,
+            e8m0_scale,
         )
     )
 
@@ -624,6 +633,7 @@ def _fuse_rmsnorm_quant(
     quant_type: int | None = None,
     output_unquantized_inp1: bool = False,
     transpose_scale: bool = False,
+    e8m0_scale: bool = False,
 ):
     if dtype_quant == dtypes.fp4x2:
         out1_quantized, out1_bs, out1_unquantized, out2, out_res1 = (
@@ -655,6 +665,7 @@ def _fuse_rmsnorm_quant(
                 quant_type=quant_type,
                 output_unquantized_inp1=output_unquantized_inp1,
                 transpose_scale=transpose_scale,
+                e8m0_scale=e8m0_scale,
             )
         )
     else:
