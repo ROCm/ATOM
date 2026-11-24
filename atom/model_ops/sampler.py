@@ -52,6 +52,13 @@ def _announce_no_greedy() -> None:
     )
 
 
+def _split_independent_noise() -> bool:
+    """A recipe's ``dspark_options.sampler_split_independent_noise``."""
+    from atom import plugin_host
+
+    return plugin_host.dspark_options().sampler_split_independent_noise
+
+
 def host_no_greedy_rows(temperatures: np.ndarray) -> bool:
     """Whether no row of a batch is greedy, decided on the host.
 
@@ -270,7 +277,14 @@ class Sampler(nn.Module):
         if not self._needs_filtering(top_ks, top_ps):
             if needs_independent_noise:
                 if no_greedy:
+                    _announce_no_greedy()
                     return self._independent_noise_draw(logits, temperatures)
+                if _split_independent_noise():
+                    # dspark_options.sampler_split_independent_noise: the race,
+                    # then the greedy rows' argmax and the select, as calls of
+                    # their own.
+                    sampled = self._independent_noise_draw(logits, temperatures)
+                    return _apply_greedy_tokens(logits, temperatures, sampled)
                 return self._independent_noise_sample(logits, temperatures)
             sampled = self._temperature_sample(logits, temperatures)
             return _apply_greedy_tokens(logits, temperatures, sampled, no_greedy)
@@ -355,12 +369,14 @@ class Sampler(nn.Module):
         logits: torch.Tensor,
         temperatures: torch.Tensor,
     ) -> torch.Tensor:
-        """`_independent_noise_sample` for a batch the host knows to hold no
-        greedy row (`host_no_greedy_rows`): the override would change no row,
-        so the race alone runs, ``mixed_sample_outer_exponential`` on the same
-        ``(num_tokens, vocab_size)`` noise, and its draw is returned.
+        """The race of `_independent_noise_sample` alone:
+        ``mixed_sample_outer_exponential`` on the same ``(num_tokens,
+        vocab_size)`` noise, with no greedy override. For a batch the host
+        knows to hold no greedy row (`host_no_greedy_rows`) the override
+        would change no row and this is the draw; under
+        ``dspark_options.sampler_split_independent_noise`` the caller applies
+        the override itself (`_apply_greedy_tokens`).
         """
-        _announce_no_greedy()
         num_tokens, vocab_size = logits.shape
         sampled_tokens = torch.empty(num_tokens, dtype=torch.int, device=logits.device)
         exponential = torch.empty(

@@ -504,6 +504,13 @@ def _store_ring(
             )
 
 
+def _reference_kernel() -> bool:
+    """A recipe's `model_options.rope_window_reference`."""
+    from atom import plugin_host
+
+    return plugin_host.model_options().rope_window_reference
+
+
 def rope_quant_window(
     query,
     kv,
@@ -530,7 +537,27 @@ def rope_quant_window(
     `ring`'s pool is either `(data, scale)` with contiguous uint8 planes or a
     `[rows, head_dim]` BF16 tensor. `window_row` returns a row index in both
     layouts; the data and scale planes have their own row strides.
+
+    With a recipe's `model_options.rope_window_reference` the launch is
+    `rope_window_reference`'s: the same arguments, that module's kernel and
+    its heads-a-program rule.
     """
+    if _reference_kernel():
+        from atom.model_ops.deepseek_v41 import rope_window_reference
+
+        return rope_window_reference.rope_quant_window(
+            query,
+            kv,
+            cos,
+            sin,
+            positions,
+            rope_dim=rope_dim,
+            qat=qat,
+            values=values,
+            scales=scales,
+            ring=ring,
+            query_fp8=query_fp8,
+        )
     tokens, heads, dim = query.shape
     kv_half = ring is not None or qat is not None or values is not None
     pool, step, window = ring or (None, None, None)

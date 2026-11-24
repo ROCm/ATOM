@@ -172,6 +172,7 @@ def test_v2_options_parse_and_key_the_plan():
         {"model_options": {"attn_out_quant_fuse": "1"}},
         {"model_options": {"qpath_fuse": "kv,q"}},
         {"model_options": {"qpath_fuse": ["k"]}},
+        {"model_options": {"rope_window_reference": "on"}},
         {"model_options": {"seg_fuse": "1,7"}},
         {"model_options": {"seg_fuse": [1], "ffn_mhc_fuse_quant": True}},
         {"model_options": {"seg_fuse": [7], "shared_act_quant": True}},
@@ -180,6 +181,7 @@ def test_v2_options_parse_and_key_the_plan():
         {"dspark_options": {"dp_sharded_head_max_rows": 0}},
         {"dspark_options": {"sampler_skip_greedy_pick": 1}},
         {"dspark_options": {"verify_skip_unused_target_draw": None}},
+        {"dspark_options": {"sampler_split_independent_noise": 0}},
         {"modules": {"layers..ffn": ["a"]}},
     ],
 )

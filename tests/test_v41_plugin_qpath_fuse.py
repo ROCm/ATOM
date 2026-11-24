@@ -274,7 +274,8 @@ def test_the_log_says_whether_the_reference_kernel_is_the_recorded_one(
     fuse("kv", "q")
     with caplog.at_level("INFO", logger="atom"):
         assert _plan(6) == ("G", "G")
-    assert "is not the recorded reference (fingerprint 0123456789abcdef)" in caplog.text
+    assert "is not the recorded reference (fingerprint 0123456789abcdef;" in caplog.text
+    assert "model_options.rope_window_reference selects the recorded" in caplog.text
     caplog.clear()
     monkeypatch.setattr(qpath, "_logged", set())
     proven = next(iter(qpath.PROVEN_FINGERPRINTS))
@@ -579,3 +580,143 @@ def test_fused_attention_serves_its_steps_first(fuse, monkeypatch):
     with pytest.raises(StopIteration):
         attention.Attention.forward(layer, "hidden", None, None, "step", "rope")
     assert asked == []
+
+
+# -- model_options.rope_window_reference ----------------------------------------
+
+
+@pytest.fixture
+def rope_modules():
+    with atom_without_aiter() as load:
+        yield (
+            load("atom.model_ops.deepseek_v41.rope_window"),
+            load("atom.model_ops.deepseek_v41.rope_window_reference"),
+        )
+
+
+class _Launch:
+    """A stand-in for a Triton kernel: records the grid and the arguments."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __getitem__(self, grid):
+        return lambda *args, **kwargs: self.calls.append((grid, args, kwargs))
+
+
+def _reference(monkeypatch, on):
+    plan = SimpleNamespace(model_options=recipe.ModelOptions(rope_window_reference=on))
+    monkeypatch.setattr(host, "_plan", plan)
+
+
+def test_the_reference_kernel_is_a_recipe_option_off_by_default(monkeypatch):
+    assert not recipe.ModelOptions().rope_window_reference
+    with pytest.raises(recipe.RecipeRefused):
+        recipe.ModelOptions.from_mapping({"rope_window_reference": 1})
+    on = recipe.ModelOptions.from_mapping({"rope_window_reference": True})
+    assert on.rope_window_reference
+
+
+def test_off_the_launch_is_rope_windows_own_kernel(monkeypatch, rope_modules):
+    rope_window, reference = rope_modules
+    _reference(monkeypatch, False)
+    own, other = _Launch(), _Launch()
+    monkeypatch.setattr(rope_window, "_rope_window_kernel", own)
+    monkeypatch.setattr(reference, "_rope_window_kernel", other)
+    monkeypatch.setattr(rope_window, "_fp8_heads", lambda tokens, heads, device: 4)
+    query = torch.zeros(6, 64, 512)
+    q_fp8 = (torch.zeros(6, 64, 512), torch.zeros(6, 64, 16))
+    rope_window.rope_quant_window(
+        query, None, "cos", "sin", "positions", rope_dim=64, query_fp8=q_fp8
+    )
+    ((grid, _, kwargs),) = own.calls
+    assert grid == (6 * 16,) and kwargs["FP8_HEADS"] == 4 and other.calls == []
+
+
+def test_on_every_launch_is_the_reference_kernel_with_its_layout(
+    monkeypatch, rope_modules
+):
+    rope_window, reference = rope_modules
+    _reference(monkeypatch, True)
+    own, other = _Launch(), _Launch()
+    monkeypatch.setattr(rope_window, "_rope_window_kernel", own)
+    monkeypatch.setattr(reference, "_rope_window_kernel", other)
+    monkeypatch.setattr(reference, "_cu_count", lambda device: CU)
+    q_fp8 = (torch.zeros(6, 64, 512), torch.zeros(6, 64, 16))
+    kv = torch.zeros(6, 512)
+    ring = (
+        ("data", "scale"),
+        SimpleNamespace(batch_ids=1, cu_seqlens_q=2, slots=3),
+        SimpleNamespace(
+            ring_start=0, ring_slots=4, slot_rows=5, ring_stride=6, run_rows=7
+        ),
+    )
+    # a decode step's full launch below the grouped-heads threshold: a program
+    # a head and one for the KV row
+    rope_window.rope_quant_window(
+        torch.zeros(6, 64, 512),
+        kv,
+        "cos",
+        "sin",
+        "positions",
+        rope_dim=64,
+        ring=ring,
+        query_fp8=q_fp8,
+    )
+    # the query alone, from the threshold up: 8 heads a program
+    rope_window.rope_quant_window(
+        torch.zeros(64, 64, 512),
+        None,
+        "cos",
+        "sin",
+        "positions",
+        rope_dim=64,
+        query_fp8=(torch.zeros(64, 64, 512), torch.zeros(64, 64, 16)),
+    )
+    assert own.calls == []
+    (full_grid, full_args, full_kwargs), (q_grid, _, q_kwargs) = other.calls
+    assert full_grid == (6 * 65,) and full_kwargs["FP8_HEADS"] == 1
+    assert full_kwargs["WRITE_RING"] and full_kwargs["PLANAR_RING"]
+    assert full_kwargs["RING_SLOTS"] == 4 and full_args[2:5] == (
+        "cos",
+        "sin",
+        "positions",
+    )
+    assert q_grid == (64 * 8,) and q_kwargs["FP8_HEADS"] == 8
+    assert not q_kwargs["WRITE_RING"]
+
+
+def test_the_fingerprint_is_of_the_kernel_the_process_launches(
+    monkeypatch, rope_modules
+):
+    import sys
+    import types
+
+    rope_window, reference = rope_modules
+    monkeypatch.setattr(
+        rope_window, "_rope_window_kernel", SimpleNamespace(cache_key="own")
+    )
+    monkeypatch.setattr(
+        reference, "_rope_window_kernel", SimpleNamespace(cache_key="recorded")
+    )
+    cache = types.ModuleType("triton.runtime.cache")
+    cache.triton_key = lambda: "build"
+    monkeypatch.setitem(sys.modules, "triton.runtime.cache", cache)
+    prints = {}
+    for on in (False, True):
+        _reference(monkeypatch, on)
+        qpath.reference_fingerprint.cache_clear()
+        prints[on] = qpath.reference_fingerprint()
+    qpath.reference_fingerprint.cache_clear()
+    assert len(prints[False]) == 16 and prints[False] != prints[True]
+
+
+def test_the_layout_rule_of_the_plan_is_the_reference_modules(
+    monkeypatch, rope_modules
+):
+    _, reference = rope_modules
+    monkeypatch.setattr(reference, "_cu_count", lambda device: CU)
+    cuda = SimpleNamespace(type="cuda")
+    assert qpath.reference_program_heads(63, 64, cuda) == 1
+    assert qpath.reference_program_heads(64, 64, cuda) == 8
+    assert reference.query_fp8_heads(64, 64, cuda) == 8

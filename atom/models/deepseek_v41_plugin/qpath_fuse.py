@@ -42,12 +42,13 @@ from. `plan_forms` opens only for a table dtype and program in the record and
 names the recorded form.
 
 On the recorded build the fused output is bit for bit what the two launches
-give. `rope_window`'s kernel in this tree is not the recorded one
-(`reference_fingerprint`): the fused launches still compute the recorded
-forms, which are fixed by the record and not by this tree's compiler, so
-against this tree's own RoPE / window launch a rotated value may differ in
-its last bit, at the rate above. One line in the log says which case a
-process is in. Recording this tree's kernel takes its compiled gfx950 code.
+give. The recorded kernel is `rope_window_reference`, which a recipe selects
+with `model_options.rope_window_reference`; `rope_window`'s own kernel is
+another source (`reference_fingerprint`). Without that option the fused
+launches still compute the recorded forms, which are fixed by the record and
+not by the compiler, so against `rope_window`'s own launch a rotated value
+may differ in its last bit, at the rate above. One line in the log says which
+case a process is in. Recording another kernel takes its compiled gfx950 code.
 """
 
 import functools
@@ -89,10 +90,6 @@ REFERENCE_FORMS = {
 }
 # `reference_fingerprint()` of the builds `REFERENCE_FORMS` was read from.
 PROVEN_FINGERPRINTS = frozenset({"10aa874fab0393fd"})
-# The reference's layout rule: this many heads a query program where that
-# leaves this many programs a CU, else a program a head.
-REFERENCE_FP8_HEADS = 8
-REFERENCE_MIN_PROGRAMS_PER_CU = 2
 
 # Seams whose native body the fused path stands in for. An owner of any of
 # them keeps the calls it would have got.
@@ -153,14 +150,19 @@ def _aiter_rope_quant():
 
 @functools.lru_cache(maxsize=1)
 def reference_fingerprint() -> str:
-    """What `REFERENCE_FORMS` is a property of: the source of
-    `_rope_window_kernel` and of everything it calls (Triton's own hash of
-    it) and the Triton build that compiles it. "" when it cannot be taken."""
+    """What `REFERENCE_FORMS` is a property of: the source of the
+    `_rope_window_kernel` this process launches (`rope_window_reference`'s
+    under `model_options.rope_window_reference`, else `rope_window`'s) and
+    of everything it calls (Triton's own hash of it), and the Triton build
+    that compiles it. "" when it cannot be taken."""
     try:
         from triton.runtime.cache import triton_key
 
-        from atom.model_ops.deepseek_v41 import rope_window
+        from atom import plugin_host
+        from atom.model_ops.deepseek_v41 import rope_window, rope_window_reference
 
+        if plugin_host.model_options().rope_window_reference:
+            rope_window = rope_window_reference
         text = f"{rope_window._rope_window_kernel.cache_key}-{triton_key()}"
         return hashlib.sha256(text.encode()).hexdigest()[:16]
     except Exception:  # noqa: BLE001
@@ -182,9 +184,10 @@ def _log_reference() -> None:
         _log_once(
             "reference:other",
             "[QPATH-FUSE] rotation forms: the RoPE / window kernel or the Triton "
-            "build is not the recorded reference (fingerprint %s); the fused "
-            "launches compute the recorded forms, and a rotated value may differ "
-            "in its last bit from this tree's own RoPE / window launch",
+            "build is not the recorded reference (fingerprint %s; "
+            "model_options.rope_window_reference selects the recorded kernel); "
+            "the fused launches compute the recorded forms, and a rotated value "
+            "may differ in its last bit from this process's RoPE / window launch",
             fingerprint or "unavailable",
         )
 
@@ -213,29 +216,25 @@ def rope_tables(rope):
 
 def reference_program_heads(rows: int, heads: int, device):
     """How many heads one query program of the reference launch takes at
-    ``rows`` (1 or `REFERENCE_FP8_HEADS`), or None when it cannot be told:
-    which record of `REFERENCE_FORMS` a step's fused launches compute. From
-    the row count and the device's CU count, so every rank of a group answers
-    alike for the same rows."""
+    ``rows`` (`rope_window_reference.query_fp8_heads`: 1 or 8), or None when
+    it cannot be told: which record of `REFERENCE_FORMS` a step's fused
+    launches compute. Asked with that launch's own inputs, the row count and
+    the device's CU count, so every rank of a group answers alike for the
+    same rows."""
+    from atom.model_ops.deepseek_v41 import rope_window_reference
+
     try:
-        if device.type == "cuda":
-            cu = torch.cuda.get_device_properties(device).multi_processor_count
-        else:
+        cu = None
+        if device.type != "cuda":
             # Nothing launches without a device (a wiring check): AITER's count.
             from aiter.jit.utils.chip_info import get_cu_num
 
             cu = int(get_cu_num())
-        if cu <= 0:
-            return None
+            if cu <= 0:
+                return None
+        return int(rope_window_reference.query_fp8_heads(rows, heads, device, cu))
     except Exception:  # noqa: BLE001 - no CU count to size the programs by
         return None
-    grouped = REFERENCE_FP8_HEADS
-    if (
-        heads % grouped == 0
-        and rows * heads // grouped >= REFERENCE_MIN_PROGRAMS_PER_CU * cu
-    ):
-        return grouped
-    return 1
 
 
 def _aiter_norm_may_be_served() -> bool:

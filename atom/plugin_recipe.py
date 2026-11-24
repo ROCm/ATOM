@@ -381,6 +381,9 @@ class ModelOptions:
     # also rotates, quantizes and stores the KV row; "q", wq_b also writes
     # the rotated MXFP8 query.
     qpath_fuse: tuple[str, ...] = ()
+    # The RoPE / window launch runs the kernel `qpath_fuse` records its
+    # rotation forms from (`atom.model_ops.deepseek_v41.rope_window_reference`).
+    rope_window_reference: bool = False
 
     @classmethod
     def from_mapping(cls, raw: Any) -> ModelOptions:
@@ -455,6 +458,10 @@ class ModelOptions:
                 "model_options.qpath_fuse",
                 QPATH_FUSE_ITEMS,
             ),
+            rope_window_reference=_strict_bool(
+                raw.get("rope_window_reference", defaults.rope_window_reference),
+                "model_options.rope_window_reference",
+            ),
         )
         for item, other in ((1, "ffn_mhc_fuse_quant"), (7, "shared_act_quant")):
             if item in options.seg_fuse and getattr(options, other):
@@ -494,6 +501,9 @@ class DSparkOptions:
     # the scoring of the target's own draw.
     sampler_skip_greedy_pick: bool = False
     verify_skip_unused_target_draw: bool = False
+    # The independent-noise draw as the race and then the greedy rows' argmax
+    # and select, three calls, in place of the one fused call.
+    sampler_split_independent_noise: bool = False
 
     @classmethod
     def from_mapping(cls, raw: Any) -> DSparkOptions:
@@ -544,6 +554,13 @@ class DSparkOptions:
                     defaults.verify_skip_unused_target_draw,
                 ),
                 "dspark_options.verify_skip_unused_target_draw",
+            ),
+            sampler_split_independent_noise=_strict_bool(
+                raw.get(
+                    "sampler_split_independent_noise",
+                    defaults.sampler_split_independent_noise,
+                ),
+                "dspark_options.sampler_split_independent_noise",
             ),
         )
 

@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Ops of `model_options.qpath_fuse` (see
-`atom.models.deepseek_v41_plugin.qpath_fuse`).
+"""Ops of `model_options.qpath_fuse` (`atom.models.deepseek_v41_plugin.qpath_fuse`).
 
 `dual_rmsnorm_mxfp8_kv_window` is AITER's fused q / kv RMSNorm launch with
 the KV row's half of `rope_quant_window` appended to each row's program: the

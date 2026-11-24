@@ -126,6 +126,42 @@ def test_no_greedy_returns_the_same_ids_without_the_argmax(independent):
     assert torch.equal(torch.get_rng_state(), state_full)
 
 
+def test_split_independent_noise_is_the_race_then_the_argmax_and_select(monkeypatch):
+    """dspark_options.sampler_split_independent_noise: the fused call's ids,
+    greedy rows included, from the three calls it stands in for, with the
+    generator left where the fused call leaves it."""
+    logits = _logits(6)
+    temperatures_np = np.array([1.0, 0.0, 1.0, 0.0, 0.8, 1.2])
+    temperatures = torch.from_numpy(
+        np.maximum(temperatures_np, sampler_module.SAMPLER_EPS).astype(np.float32)
+    )
+    sampler = sampler_module.Sampler()
+    torch.manual_seed(5)
+    fused = sampler(logits, temperatures, needs_independent_noise=True)
+    state = torch.get_rng_state()
+    assert CALLS == ["fused"]
+    CALLS.clear()
+    _options(monkeypatch, sampler_split_independent_noise=True)
+    torch.manual_seed(5)
+    split = sampler(logits, temperatures, needs_independent_noise=True)
+    assert CALLS == ["score", "argmax"]
+    assert split.dtype == fused.dtype and torch.equal(split, fused)
+    assert torch.equal(torch.get_rng_state(), state)
+    # shared noise is not an independent-noise draw: unchanged
+    CALLS.clear()
+    sampler(logits, temperatures)
+    assert CALLS == ["score", "argmax"]
+    # with no greedy row and the skip, the race alone
+    CALLS.clear()
+    sampler(
+        logits,
+        torch.linspace(0.3, 1.7, 6),
+        needs_independent_noise=True,
+        no_greedy=True,
+    )
+    assert CALLS == ["score"]
+
+
 def test_a_greedy_row_changes_the_ids_so_the_host_must_not_claim_none():
     """The select is not a no-op when a row is greedy: the gate is what makes
     the shortcut exact, and the gate says no here."""

@@ -109,6 +109,7 @@ weights layout, loader, runtime (graphs, bounded replay, guarded ops) and mono d
 | `dspark_options.dp_sharded_head` / `_max_rows` | `ATOM_DP_DSPARK_SHARDED_HEAD` / `_MAX_ROWS` |
 | `dspark_options.sampler_skip_greedy_pick` | `ATOM_SAMPLER_SKIP_GREEDY_PICK` |
 | `dspark_options.verify_skip_unused_target_draw` | `ATOM_SPEC_SKIP_UNUSED_TARGET_DRAW` |
+| `dspark_options.sampler_split_independent_noise` | none (the draw as the tree those two come from makes it) |
 
 - `engine.prefill_decode_interval_slope` (a number, 0 = off) with `_slope_from`: after an
   executed prefill that leaves `g` sequences decoding in the DP group, the decode interval is
@@ -149,10 +150,18 @@ weights layout, loader, runtime (graphs, bounded replay, guarded ops) and mono d
   A half that is not fused runs the launch it has alone. The rotation is computed with explicit
   `fma` in one of two roundings, named per step from a record of what one reference build of
   the RoPE / window kernel compiles to (`qpath_fuse.REFERENCE_FORMS`). On that build the output
-  is bit for bit the two launches'; on another kernel source or Triton build (this branch's
-  `rope_window` is one) the fused launches still compute the recorded forms, and a rotated
-  value may differ in its last bit from the tree's own RoPE / window launch, about once in a
-  million values. The log says which case a process is in.
+  is bit for bit the two launches'. The recorded kernel is
+  `atom/model_ops/deepseek_v41/rope_window_reference.py`; `rope_window`'s own kernel is another
+  source, so without `rope_window_reference` (below) the fused launches still compute the
+  recorded forms, and a rotated value may differ in its last bit from the RoPE / window launch
+  of the same process, about once in a million values. The log says which case a process is in.
+- `model_options.rope_window_reference`: every RoPE / window launch (`rope_quant_window`: a decode
+  step or half of one that `qpath_fuse` does not fuse, a prefill, bounded replay's query rows, the
+  draft) runs the kernel of `rope_window_reference` with its layout rule (8 query heads a program
+  where that leaves two programs a CU, else a program a head) instead of `rope_window`'s. It is
+  the kernel `qpath_fuse`'s record was read from, so with both options the fused and the unfused
+  steps of a deployment round alike, bit for bit. `fused_attn`'s own launch
+  (`norm_rope_quant_window`) is not affected.
 - `dspark_options.dp_sharded_head`: under pure DP attention (TP 1) the draft block's rows and
   anchors are all-gathered over the DP group, each rank projects every row onto its own
   `V / dp` slice of the replicated LM head, and each position's id is picked from the
@@ -163,6 +172,9 @@ weights layout, loader, runtime (graphs, bounded replay, guarded ops) and mono d
   instead of the fused race-and-override call). `verify_skip_unused_target_draw`: under forced
   acceptance only the noise of the target's own draw is drawn. Neither applies inside an
   owner of `v41.spec.verify_sample`, nor to an all-greedy verify (`verify_argmax_once`).
+  `sampler_split_independent_noise`: a draw on independent noise is the race
+  (`mixed_sample_outer_exponential`), then the greedy rows' argmax and the select, as three
+  calls with the ids of the one fused call (`fused_mixed_sample`) they replace.
 - `engine.thp_disable`: no transparent huge pages for the server's processes
   (`PR_SET_THP_DISABLE`), set in the server's main process where the recipe's `env` is applied,
   before any worker starts, and again by each worker at its own start.
