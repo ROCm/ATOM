@@ -24,23 +24,46 @@ def _running_max(a, b):
 
 
 @triton.jit
+def _tree_depth(n, SEG: tl.constexpr, FAN: tl.constexpr):
+    """``index_plan.tree_depth``: up to three levels (FAN^3 segments)."""
+    m = (n + SEG - 1) // SEG
+    depth = tl.zeros_like(m)
+    for _ in tl.static_range(3):
+        deeper = m > 1
+        depth += deeper.to(depth.dtype)
+        m = tl.where(deeper, (m + FAN - 1) // FAN, m)
+    return depth
+
+
+@triton.jit
 def _walk_plan(
     plan,
     batch_ids,
     positions,
     lo,
     hi,
+    rank,
     RATIO: tl.constexpr,
+    TP: tl.constexpr,
+    SPLIT: tl.constexpr,
     CTAS: tl.constexpr,
     WALK_ROWS: tl.constexpr,
     TOPK: tl.constexpr,
     CHUNK: tl.constexpr,
+    SPLIT_FROM: tl.constexpr,
+    SPLIT_UNIT: tl.constexpr,
+    SPLIT_BIT: tl.constexpr,
+    SPLIT_DEEP_ROWS: tl.constexpr,
+    SEG: tl.constexpr,
+    FAN: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     """``index_plan.fill_walk_plan`` over ``index_plan.walk_pieces`` of rows lo
-    .. hi, each row's bound its visible columns at ``RATIO``: ``plan`` [CTAS, 4]
-    gets a (lead, span, ch0, ch1) a task, piece after piece, and zeros past the
-    last."""
+    .. hi, each row's bound its visible columns at ``RATIO`` and its share on
+    ``rank`` (``index_plan.row_shares``; ``SPLIT``: ``index_plan.splits``):
+    ``plan`` [CTAS + rows, 4] gets a (lead, span, ch0, ch1) a task, piece after
+    piece, zeros past the last, then a row's (first column, ``share_word``, 0,
+    0) (``index_plan.fill_shares``)."""
     t = lo + tl.arange(0, BLOCK)
     m = t < hi
     owner = tl.load(batch_ids + t, mask=m, other=0)
@@ -53,9 +76,26 @@ def _walk_plan(
     end = tl.min(tl.where(lead[None, :] & after, t[None, :], hi), 1)
     pos = tl.load(positions + t, mask=m, other=0)
     bound = ((pos + 1) // RATIO).to(tl.int32)
+    # a row's share: its request's largest bound decides the split
+    same = (owner[None, :] == owner[:, None]) & m[None, :]
+    whole = tl.max(tl.where(same, bound[None, :], 0), 1)
+    q = (whole + TP * SPLIT_UNIT - 1) // (TP * SPLIT_UNIT) * SPLIT_UNIT
+    # ``index_plan.split_gains``: a split keeps the levels, or the step is wide
+    keeps = _tree_depth(q, SEG, FAN) + 1 <= _tree_depth(whole, SEG, FAN)
+    gains = keeps | (hi - lo >= SPLIT_DEEP_ROWS)
+    split = (whole > SPLIT_FROM) & gains & SPLIT
+    col0 = tl.where(split, rank * q, 0)
+    cols = tl.where(split, tl.minimum(tl.maximum(bound - col0, 0), q), bound)
+    share = plan + (CTAS + t) * 4
+    tl.store(share, col0, mask=m)
+    tl.store(share + 1, cols | (split.to(tl.int32) << SPLIT_BIT), mask=m)
+    tl.store(share + 2, tl.zeros([BLOCK], dtype=tl.int32), mask=m)
+    tl.store(share + 3, tl.zeros([BLOCK], dtype=tl.int32), mask=m)
     inside = (t[None, :] >= t[:, None]) & (t[None, :] < end[:, None])
     top = tl.max(tl.where(inside, bound[None, :], 0), 1)
-    need = tl.where(lead & (top > TOPK), (top + CHUNK - 1) // CHUNK, 0)
+    top_cols = tl.max(tl.where(inside, cols[None, :], 0), 1)
+    need = tl.where(lead & (top > TOPK), (top_cols + CHUNK - 1) // CHUNK, 0)
+    first_chunk = col0 // CHUNK
     # the narrowest width a chunk run that leaves every piece a task fits in CTAS
     total = tl.sum(need, 0)
     width = tl.maximum((total + CTAS - 1) // CTAS, 1)
@@ -69,13 +109,14 @@ def _walk_plan(
     task_span = tl.sum(tl.where(hit, (end - t)[None, :], 0), 1)
     task_need = tl.sum(tl.where(hit, need[None, :], 0), 1)
     task_k = tl.maximum(tl.sum(tl.where(hit, k[None, :], 0), 1), 1)
+    task_chunk = tl.sum(tl.where(hit, first_chunk[None, :], 0), 1)
     i = tl.arange(0, CTAS) - tl.sum(tl.where(hit, first[None, :], 0), 1)
     live = tl.sum(hit.to(tl.int32), 1) > 0
     row = plan + tl.arange(0, CTAS) * 4
     tl.store(row, tl.where(live, task_lead, 0))
     tl.store(row + 1, tl.where(live, task_span, 0))
-    tl.store(row + 2, tl.where(live, i * task_need // task_k, 0))
-    tl.store(row + 3, tl.where(live, (i + 1) * task_need // task_k, 0))
+    tl.store(row + 2, tl.where(live, task_chunk + i * task_need // task_k, 0))
+    tl.store(row + 3, tl.where(live, task_chunk + (i + 1) * task_need // task_k, 0))
 
 
 @triton.jit
@@ -93,12 +134,21 @@ def _step_meta_kernel(
     ring_slots,
     window_size,
     n,
+    rank,
     WORDS: tl.constexpr,
     RATIOS: tl.constexpr,
+    TP: tl.constexpr,
+    SPLITS: tl.constexpr,
     CTAS: tl.constexpr,
     WALK_ROWS: tl.constexpr,
     TOPK: tl.constexpr,
     CHUNK: tl.constexpr,
+    SPLIT_FROM: tl.constexpr,
+    SPLIT_UNIT: tl.constexpr,
+    SPLIT_BIT: tl.constexpr,
+    SPLIT_DEEP_ROWS: tl.constexpr,
+    SEG: tl.constexpr,
+    FAN: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     # program 0 the per-token integers, program 1 + r ratio r's walk plan
@@ -110,11 +160,20 @@ def _step_meta_kernel(
                 positions,
                 walk_lo,
                 walk_hi,
+                rank,
                 RATIOS[r],
+                TP,
+                SPLITS[r],
                 CTAS,
                 WALK_ROWS,
                 TOPK,
                 CHUNK,
+                SPLIT_FROM,
+                SPLIT_UNIT,
+                SPLIT_BIT,
+                SPLIT_DEEP_ROWS,
+                SEG,
+                FAN,
                 BLOCK,
             )
     if tl.program_id(0) != 0:
@@ -139,20 +198,22 @@ def _step_meta_kernel(
 
 
 def write_step_meta(
-    step, geometry, window, ring_rel, key_meta, walk_plans, walk_rows
+    step, geometry, window, ring_rel, key_meta, walk_plans, walk_rows, tp=1, rank=0
 ) -> None:
     """``ring_rel`` [S] int32: each token's window row before the layer's ring
     start, -1 for a pad row. ``key_meta`` [S, KMETA] int32: its first window
     position, window count (0 for a pad), block table offset and slot row base.
-    ``walk_plans``: ratio -> [BLOCKS, 4] int32, the FP4 score stage's FULL-layer
-    tasks over this step's rows (``index_plan.fill_walk_plan``); none on the
-    FP8 plane. ``walk_rows``: (first row, rows) the plans cover."""
+    ``walk_plans``: ratio -> [BLOCKS + rows, 4] int32, the FP4 score stage's
+    FULL-layer tasks over this step's rows (``index_plan.fill_walk_plan``), then
+    each row's share on ``rank`` of ``tp`` (``index_plan.fill_shares``); none
+    on the FP8 plane. ``walk_rows``: (first row, rows) the plans cover."""
     n = ring_rel.shape[0]
     walk_lo, walk_n = walk_rows
     assert key_meta.shape == (n, KMETA) and key_meta.is_contiguous()
     # a piece a row at most, and each needs a task of its own: else the width
     # search never ends
     assert n < BLOCKS or not walk_plans, n
+    assert all(p.shape[0] >= BLOCKS + n for p in walk_plans.values())
     ratios = tuple(walk_plans)
     _step_meta_kernel[(1 + len(ratios),)](
         step.batch_ids,
@@ -168,12 +229,21 @@ def write_step_meta(
         window.ring_slots,
         geometry.window_size,
         n,
+        rank,
         WORDS=KMETA,
         RATIOS=ratios,
+        TP=tp,
+        SPLITS=tuple(ip.splits(tp, r) for r in ratios),
         CTAS=BLOCKS,
         WALK_ROWS=ip.WALK_ROWS,
         TOPK=ip.TOPK,
         CHUNK=ip.CHUNK,
+        SPLIT_FROM=ip.SPLIT_FROM,
+        SPLIT_UNIT=ip.SPLIT_UNIT,
+        SPLIT_BIT=ip.SPLIT_BIT,
+        SPLIT_DEEP_ROWS=ip.SPLIT_DEEP_ROWS,
+        SEG=ip.SEG,
+        FAN=ip.fan(ip.TOPK),
         BLOCK=triton.next_power_of_2(n),
     )
 

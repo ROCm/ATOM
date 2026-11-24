@@ -819,9 +819,11 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             seq.kv_transfer_params_output = None
             return
 
-        prefill_block_ids = list(seq.block_table)
+        # On D the live table, only copied into the output below; P queues a
+        # list of its own.
+        prefill_block_ids = seq.block_table
         if self.is_producer:
-            prefill_block_ids = self._prompt_block_ids(seq, prefill_block_ids)
+            prefill_block_ids = self._prompt_block_ids(seq, list(prefill_block_ids))
 
         # Claim iff we will send: the same `do_remote_decode` gate that fills
         # `_reqs_need_save`.

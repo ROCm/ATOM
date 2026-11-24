@@ -18,15 +18,16 @@ pub enum BackendType {
     Atom,
 }
 
-/// Strategy used by the ATOM PD router to map a selected prefill DP rank to
-/// the selected decode DP rank.
+/// How the ATOM PD router pairs prefill and decode DP ranks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum AtomPdRankMappingPolicy {
     /// Do not rewrite the planner-selected prefill/decode DP ranks.
     #[default]
     #[serde(rename = "none")]
     None,
-    /// Map prefill rank N to decode rank N when both sides expose DP workers.
+    /// Run prefill on the decode's DP rank N when both sides expose DP workers: the
+    /// planner selects decode first and prefill among the workers on rank N, and the
+    /// router moves a prefill selected elsewhere to rank N.
     #[serde(rename = "idx2idx")]
     Idx2Idx,
 }
@@ -607,6 +608,17 @@ impl RouterConfig {
         })
     }
 
+    /// Whether the HTTP PD router's and ext-proc's planners select decode first and
+    /// prefill on the decode's DP rank: the ATOM backend with idx2idx rank mapping. gRPC
+    /// PD does not map ranks.
+    pub fn prefill_on_decode_rank(&self) -> bool {
+        matches!(self.backend, BackendType::Atom)
+            && matches!(
+                self.atom_pd_rank_mapping_policy,
+                AtomPdRankMappingPolicy::Idx2Idx
+            )
+    }
+
     /// Create a new configuration with mode and policy
     pub fn new(mode: RoutingMode, policy: PolicyConfig) -> Self {
         Self {
@@ -656,6 +668,30 @@ impl RouterConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_atom_with_idx2idx_plans_prefill_on_the_decode_rank() {
+        for backend in [BackendType::Sglang, BackendType::Vllm, BackendType::Atom] {
+            for mapping in [
+                AtomPdRankMappingPolicy::None,
+                AtomPdRankMappingPolicy::Idx2Idx,
+            ] {
+                let config = RouterConfig {
+                    backend,
+                    atom_pd_rank_mapping_policy: mapping,
+                    ..Default::default()
+                };
+                assert_eq!(
+                    config.prefill_on_decode_rank(),
+                    matches!(
+                        (backend, mapping),
+                        (BackendType::Atom, AtomPdRankMappingPolicy::Idx2Idx)
+                    ),
+                    "{backend:?} {mapping}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn prepare_pool_defaults_overrides_and_legacy_config_deserialization() {

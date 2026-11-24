@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2024-2026 ATOM Project Contributors
 
 """CPU unit tests for the Prefill Context Parallel (PCP) pure helpers.
 
@@ -504,6 +505,8 @@ def test_needs_id_sync_is_one_predicate_for_both_groups():
     assert mr._needs_id_sync(True, False) is True
     assert mr._needs_id_sync(False, True) is True
     assert mr._needs_id_sync(True, True) is True
+    # ids the group's ranks already hold alike need no sync
+    assert mr._needs_id_sync(True, True, ids_agree=True) is False
 
 
 def test_settle_target_pcp_split_snapshots_pcp_split(monkeypatch):
