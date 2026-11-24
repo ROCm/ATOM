@@ -688,14 +688,13 @@ async fn a_session_is_released_once_no_worker_of_its_instance_is_registered() {
     let (_other_call, next) = opening(&mut other_calls, PROTOCOL_VERSION, next).await;
     assert!(next.is_ok());
 
-    // The running request keeps its Session to its end; then the client's half ends.
+    // The running request keeps its Session to its end; then the client ends the call,
+    // though ATOM keeps its half open.
     let ended = done(vec![(completion(running_id, "eos"), Vec::new())]);
     call.outbound.send(ended).unwrap();
     let running: Vec<_> = timeout(HANG, running.unwrap().collect()).await.unwrap();
     assert!(matches!(&running[..], [Ok(_)]), "{running:?}");
-    let sent = timeout(Duration::from_secs(5), call.inbound.message()).await;
-    let sent = sent.expect("the released Session's call stayed open");
-    assert!(!matches!(sent, Ok(Some(_))), "{sent:?}");
+    assert_ends(call).await;
 }
 
 #[test]
@@ -755,7 +754,7 @@ fn a_submit_queued_after_an_abort_goes_out_after_it() {
 fn a_finished_stream_dropped_after_its_seq_id_is_reused_aborts_nothing() {
     let (commands, mut queued) = mpsc::unbounded_channel();
     let routes = Arc::new(Mutex::new(Routes::default()));
-    let session = Session { routes, commands };
+    let (session, _) = Session::new(routes, commands);
     // What the writer sends of the queue, taking each prompt.
     let mut sent = || {
         let queued: Vec<_> = std::iter::from_fn(|| queued.try_recv().ok()).collect();
@@ -791,10 +790,7 @@ fn unsent_requests_are_bounded_and_a_dropped_unsent_request_is_not_sent() {
         unsent_budget: unsent_bytes("first", 2) + unsent_bytes("secnd", 2),
         ..Default::default()
     };
-    let session = Session {
-        routes: Arc::new(Mutex::new(routes)),
-        commands,
-    };
+    let (session, _) = Session::new(Arc::new(Mutex::new(routes)), commands);
     // ATOM reads nothing: two requests fill the budget, a third is refused.
     let first = session.submit(spec("first"), vec![1, 2], true).unwrap();
     let second = session.submit(spec("secnd"), vec![3, 4], true).unwrap();
@@ -835,10 +831,7 @@ fn a_first_request_larger_than_the_budget_is_refused() {
         unsent_budget: unsent_bytes("big", 2) - 1,
         ..Default::default()
     };
-    let session = Session {
-        routes: Arc::new(Mutex::new(routes)),
-        commands,
-    };
+    let (session, _) = Session::new(Arc::new(Mutex::new(routes)), commands);
     let refused = session.submit(spec("big"), vec![1, 2], true);
     assert!(
         matches!(&refused, Err(EngineError::Http { status, .. }) if status.as_u16() == 400),
@@ -856,10 +849,7 @@ fn requests_cancelled_while_the_writer_stalls_cannot_queue_without_bound() {
         unsent_budget: 2 * unsent_bytes("r", 1),
         ..Default::default()
     };
-    let session = Session {
-        routes: Arc::new(Mutex::new(routes)),
-        commands,
-    };
+    let (session, _) = Session::new(Arc::new(Mutex::new(routes)), commands);
     // The writer stalls; each request is cancelled at once, its spec left queued.
     let cancelled = (0..10)
         .take_while(|_| session.submit(spec("r"), vec![1], true).is_ok())
@@ -876,7 +866,7 @@ fn requests_cancelled_while_the_writer_stalls_cannot_queue_without_bound() {
 fn a_stream_left_unread_fails_alone_and_is_aborted_once_keeping_its_seq_id() {
     let (commands, mut queued) = mpsc::unbounded_channel();
     let routes = Arc::new(Mutex::new(Routes::default()));
-    let session = Session { routes, commands };
+    let (session, _) = Session::new(routes, commands);
     let mut unread = session.submit(spec("unread"), vec![1], true).unwrap();
     let mut read = session.submit(spec("read"), vec![2], true).unwrap();
     let (unread_id, read_id) = (unread.seq_id, read.seq_id);

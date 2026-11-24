@@ -181,12 +181,14 @@ fn cloned(e: &EngineError) -> EngineError {
     }
 }
 
-/// One Session call, shared by its clones and its requests' streams; the
-/// client's half of the call ends once all of them have dropped.
+/// One Session call, shared by its clones and its requests' streams; the call
+/// ends once all of them have dropped.
 #[derive(Clone)]
 struct Session {
     routes: Arc<Mutex<Routes>>,
     commands: mpsc::UnboundedSender<Command>,
+    /// Dropped with the last handle, which ends the reader whether or not ATOM ends the call.
+    _owners: Arc<oneshot::Sender<()>>,
 }
 
 enum Command {
@@ -197,6 +199,23 @@ enum Command {
 }
 
 impl Session {
+    /// A handle on `routes` and `commands`; what it returns resolves once its last clone drops.
+    fn new(
+        routes: Arc<Mutex<Routes>>,
+        commands: mpsc::UnboundedSender<Command>,
+    ) -> (Self, oneshot::Receiver<()>) {
+        let (owners, released) = oneshot::channel();
+        let _owners = Arc::new(owners);
+        (
+            Self {
+                routes,
+                commands,
+                _owners,
+            },
+            released,
+        )
+    }
+
     /// Opens the call on a connection and thread of its own, off the router's runtime;
     /// waits up to `bound` for ATOM's Ready, refusing one of another protocol version.
     /// Dropped before it opens, it ends the call and the thread.
@@ -205,13 +224,14 @@ impl Session {
         let routes = Arc::new(Mutex::new(Routes::default()));
         let (opened, ready) = oneshot::channel();
         let (read_into, aborts) = (routes.clone(), commands.downgrade());
+        let (session, released) = Self::new(routes, commands);
         thread::Builder::new()
             .name("atom-session".into())
-            .spawn(move || run(url, bound, queued, read_into, aborts, opened))
+            .spawn(move || run(url, bound, queued, read_into, aborts, opened, released))
             .map_err(|e| EngineError::Transport(Status::internal(e.to_string())))?;
         let gone = |_| EngineError::Transport(Status::internal("the Session thread ended"));
         ready.await.map_err(gone).and_then(|opened| opened)?;
-        Ok(Self { routes, commands })
+        Ok(session)
     }
 
     fn is_open(&self) -> bool {
@@ -278,8 +298,8 @@ impl Session {
 }
 
 /// The Session's thread: a runtime of its own, which connects, opens the call within
-/// `bound` and reads it until it ends; `opened` gets how the opening went. With no one
-/// left to tell, it ends the call.
+/// `bound` and reads it until it ends or is `released`; `opened` gets how the opening
+/// went. With no one left to tell, it ends the call.
 fn run(
     url: String,
     bound: Duration,
@@ -287,6 +307,7 @@ fn run(
     routes: Arc<Mutex<Routes>>,
     aborts: mpsc::WeakUnboundedSender<Command>,
     mut opened: oneshot::Sender<Result<(), EngineError>>,
+    released: oneshot::Receiver<()>,
 ) {
     let runtime = match runtime::Builder::new_current_thread().enable_all().build() {
         Ok(runtime) => runtime,
@@ -307,7 +328,7 @@ fn run(
         match started {
             Ok((_client, inbound)) => {
                 if opened.send(Ok(())).is_ok() {
-                    read(inbound, routes, aborts, url).await;
+                    read(inbound, routes, aborts, url, released).await;
                 }
             }
             Err(e) => {
@@ -419,15 +440,21 @@ fn flush(
 
 /// The reader: hands each message's outputs to their requests, aborting those that
 /// overflow, until the call ends or sends one it cannot read; then fails the
-/// requests still open.
+/// requests still open. Once the Session is `released`, it ends the call.
 async fn read(
     mut inbound: Streaming<Frames>,
     routes: Arc<Mutex<Routes>>,
     aborts: mpsc::WeakUnboundedSender<Command>,
     url: String,
+    mut released: oneshot::Receiver<()>,
 ) {
     let status = loop {
-        match inbound.message().await {
+        let message = tokio::select! {
+            message = inbound.message() => message,
+            // No request is left to read for; ATOM aborts the call's requests.
+            _ = &mut released => return,
+        };
+        match message {
             Ok(Some(message)) => {
                 let routed = Inbound::decode(message.frames).and_then(|m| routes.lock().route(&m));
                 match routed {
