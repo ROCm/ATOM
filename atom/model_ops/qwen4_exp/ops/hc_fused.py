@@ -593,6 +593,8 @@ def hc_combine_norm(
     h_new = h
     if combine:
         h_new = torch.empty_like(h) if h_out is None else h_out
+    # The kernels write h_new at h's strides.
+    assert h_new.stride() == h.stride(), "h_out strides must match h"
     ba = 1 << (hidden.bit_length() - 1)
     bb = hidden - ba
     if m >= COMBINE_NORM_ROWS_MIN_M and bb > 0 and bb & (bb - 1) == 0:

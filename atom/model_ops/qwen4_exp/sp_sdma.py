@@ -379,16 +379,16 @@ class SdmaCollectives:
         self.error = None
         rs_rows = 2 * (world - 1) * self.capacity
         ag_rows = 2 * world * self.capacity
-        hip = HipRuntime()
         exported = None
         try:
+            hip = HipRuntime()
             # One allocation, so a peer maps exactly one IPC handle per rank.
             buf = torch.empty(rs_rows + ag_rows, hidden, dtype=dtype, device=device)
             torch.cuda.synchronize(device)
             # The caching allocator hands out sub-ranges; handles cover whole blocks.
             base = hip.get_allocation_base(buf.data_ptr())
             exported = (hip.get_ipc_handle(base), buf.data_ptr() - base)
-        except RuntimeError as e:  # HIP errors and torch OOM
+        except (RuntimeError, OSError) as e:  # HIP errors and torch OOM
             self.error = f"cannot export the SDMA buffer: {e}"
         handles = [None] * world
         dist.all_gather_object(handles, exported, group=cpu_group)
@@ -405,9 +405,12 @@ class SdmaCollectives:
         else:
             self.error = self.error or "a peer cannot export its SDMA buffer"
             return
-        self._sdma = _MoriSdma(cpu_group, device)
-        if self._sdma.queues < 1:
-            self.error = "mori set up no SDMA queue (built without BUILD_CCO_SDMA?)"
+        try:
+            self._sdma = _MoriSdma(cpu_group, device)
+            if self._sdma.queues < 1:
+                self.error = "mori set up no SDMA queue (built without BUILD_CCO_SDMA?)"
+        except Exception as e:  # noqa: BLE001 - mori / FlyDSL setup: agree, fall back
+            self.error = self.error or f"mori SDMA setup failed: {e}"
         if self.error is not None:
             return
         row_bytes = hidden * buf.element_size()

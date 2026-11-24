@@ -142,9 +142,8 @@ class _FakeAllGatherWriter:
 
     def finish(self):
         assert len(self.pushed) == self.pushes
-        assert [r for a, b in self.pushed for r in (a, b)][1:-1:2] == [
-            b for _, b in self.pushed[:-1]
-        ]
+        assert all(a < b for a, b in self.pushed)
+        assert all(b0 == a1 for (_, b0), (a1, _) in itertools.pairwise(self.pushed))
         assert self.pushed[0][0] == 0 and self.pushed[-1][1] == self.buf.shape[0]
         return qwen4_exp.get_tp_group().all_gather(self.buf)[: self.num_tokens]
 
