@@ -56,6 +56,7 @@ Inferact/Kimi-K3.1-DSpark (67 tensors) is the same tree with 96 heads (q_b_proj
 and no embed_tokens; its ``rope_interleave: true`` is the same interleaved rope.
 """
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, ClassVar
 
 import torch
@@ -86,7 +87,7 @@ from atom.models.dspark_draft import (
     draft_rope_kwargs,
     linear_out,
 )
-from atom.models.kimi_k3 import _RMS_FUSABLE_QUANT_TYPES
+from atom.models.kimi_k3 import _RMS_FUSABLE_QUANT_TYPES, _is_e8m0_blockscale
 from atom.models.utils import is_neox_rope_style
 from atom.quant_spec import effective_layer_quant
 
@@ -283,6 +284,7 @@ class K3DSparkMLAAttention(nn.Module):
         qknorm_type, qknorm_dtype = effective_layer_quant(
             quant_config, f"{prefix}.q_b_proj"
         )
+        self.qknorm_e8m0_scale = _is_e8m0_blockscale(quant_config, qknorm_type)
         self.fuse_qknorm_quant = qknorm_dtype in (dtypes.fp8, dtypes.fp4x2)
         self.qknorm_dtype = qknorm_dtype if self.fuse_qknorm_quant else torch.bfloat16
         self.qknorm_quant_type_value = (
@@ -384,6 +386,7 @@ class K3DSparkMLAAttention(nn.Module):
             quant_type=self.qknorm_quant_type_value,
             output_unquantized_inp1=False,
             transpose_scale=True,
+            e8m0_scale=self.qknorm_e8m0_scale,
         )
         return self.mla_attn(q_c, kv_c, k_pe, positions, q_scale=q_scale)
 
@@ -589,11 +592,11 @@ class KimiK3DSpark(DSparkDraftModel):
 
     # ---- drafting entry points (called by the proposer) --------------------
 
-    def project_context(self, aux_concat: torch.Tensor) -> torch.Tensor:
-        """``context_norm(context_proj(concat(aux)))`` -- the shared context.
+    def project_context(self, taps: Sequence[torch.Tensor]) -> torch.Tensor:
+        """``context_norm(context_proj(concat(taps)))`` -- the shared context.
 
         Computed ONCE per step and reused by every layer: the reference hands
         the same projected tensor to all five, which each apply their own KV
         projection to it.
         """
-        return self.context_norm(linear_out(self.context_proj(aux_concat)))
+        return self.context_norm(linear_out(self.context_proj(self.concat_taps(taps))))

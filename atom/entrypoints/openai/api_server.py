@@ -49,7 +49,7 @@ from atom.kv_transfer.disaggregation.mooncake.endpoint import (
     producer_endpoint,
 )
 from atom.model_engine.arg_utils import EngineArgs
-from atom.model_engine.llm_engine import load_tokenizer
+from atom.model_engine.llm_engine import InputOutputProcessor, load_tokenizer
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.segment_tokenizer import PrefixEncoding
 from atom.model_engine.sequence import new_token_ids
@@ -1328,6 +1328,17 @@ def _validate_chunked_receive(params: dict[str, Any] | None) -> None:
         raise HTTPException(
             status_code=400,
             detail="Chunked P/D requires D PP=1 and D TP a multiple of positive P TP",
+        )
+    # Not checkable at startup: chunked transfer is P's setting, and P learns
+    # D's DCP only from a request.
+    if (
+        cfg.decode_context_parallel_size > 1
+        and cfg.hf_config.model_type
+        in InputOutputProcessor._per_req_cache_model_types()
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Chunked P/D does not send per-request state to a DCP decode",
         )
 
 
@@ -3776,6 +3787,16 @@ def main():
     args = parser.parse_args()
     if args.api_server_count < 1:
         parser.error("--api-server-count must be at least 1")
+    if envs.ATOM_PRELOAD == "daemon":
+        # A weight cache daemon serves weights, not requests.
+        from atom.model_loader.weight_cache.daemon import run_daemon
+
+        run_daemon(EngineArgs.from_cli_args(args))
+        return
+    if envs.ATOM_PRELOAD == "server":
+        from atom.model_loader.weight_cache.preload import record_launch
+
+        record_launch()  # the runners start a daemon with it
 
     _setup_frontend(args)
 

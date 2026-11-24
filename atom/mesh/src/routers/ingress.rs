@@ -1,5 +1,9 @@
 //! Shared HTTP proxy contract. The routing view never replaces the original payload.
-use std::{sync::Arc, time::Instant};
+use std::{
+    collections::HashSet,
+    sync::{Arc, LazyLock},
+    time::Instant,
+};
 
 use axum::{
     extract::{FromRequestParts, Path, RawQuery, Request, State},
@@ -8,7 +12,10 @@ use axum::{
     Router,
 };
 use bytes::Bytes;
+use dashmap::DashSet;
 use http::{HeaderMap, Uri};
+use parking_lot::RwLock;
+use tracing::warn;
 
 use crate::{
     app_context::AppContext,
@@ -20,14 +27,53 @@ use crate::{
         prepare_pool::{JobContext, PrepareHandle},
         ConnectionMode, Worker, WorkerRegistry, WorkerType,
     },
-    policies::PolicyRegistry,
+    policies::{LoadBalancingPolicy, PolicyRegistry},
     routers::{
         comm::error::{IngressError, MeshLocalError},
-        prepare::inference::{InferenceMetadata, InferenceRequest, ParsedInference},
+        prepare::{
+            fast_tokenizer::TokenizeLimits,
+            inference::{InferenceMetadata, InferenceRequest, ParsedInference},
+        },
     },
     server::AppState,
     tokenizer::TokenizerRegistry,
 };
+
+/// What a request's policies do with its tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tokens {
+    Unused,
+    /// Used when the router can tokenize the request and it carries no media.
+    Wanted,
+    /// `wanted`: another policy wants them as well, so they are encoded as for `Wanted`;
+    /// `prefix_hash`, which needs them, only hashes them.
+    Needed {
+        wanted: bool,
+    },
+}
+
+/// Models whose requests could not be tokenized for the KV event index, each warned of
+/// once. A request names its own model, so no more than this many are kept.
+static UNTOKENIZED_MODELS: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
+const MAX_UNTOKENIZED_MODELS: usize = 64;
+
+/// Counts a request that `cache_aware` places by its text, as the router cannot tokenize it.
+fn untokenized(model: Option<&str>, error: &IngressError) {
+    metrics::counter!("mesh_kv_events_untokenized_total", "reason" => error.code).increment(1);
+    let model = model.unwrap_or_default();
+    let models = &UNTOKENIZED_MODELS;
+    if models.len() < MAX_UNTOKENIZED_MODELS
+        && !models.contains(model)
+        && models.insert(model.to_string())
+    {
+        warn!(
+            model,
+            reason = error.code,
+            error = %error.message,
+            "Placing the model's requests by their text: the router cannot tokenize them for the KV event index"
+        );
+    }
+}
 
 const MAX_RESPONSE_ID_BYTES: usize = 256;
 /// Worker label listing the inference paths a backend serves.
@@ -489,14 +535,14 @@ impl InferenceEnvelope {
         if let Some(routed) = self.routed.take() {
             return Ok((self, routed));
         }
-        let (needs_text, needs_tokens) = routing.admit(&self.metadata)?;
-        if !needs_text && !needs_tokens {
+        let (needs_text, tokens) = routing.admit(&self.metadata)?;
+        if !needs_text && tokens == Tokens::Unused {
             let metadata = self.metadata.execution_metadata();
             return Ok((self, (metadata, None)));
         }
         let routing = routing.clone();
         self.prepare(pool, move |request, ctx| {
-            routing.prepare_text_and_tokens(&request.parsed, needs_tokens, ctx)
+            routing.prepare_text_and_tokens(&request.parsed, tokens, ctx)
         })
         .await
     }
@@ -588,8 +634,10 @@ pub struct IngressRouting {
     policy_registry: Arc<PolicyRegistry>,
     worker_registry: Arc<WorkerRegistry>,
     tokenizer_registry: Arc<TokenizerRegistry>,
+    chats_without_template: Arc<RwLock<HashSet<String>>>,
     pd: bool,
-    max_tokenize_bytes: usize,
+    tokenize_limits: TokenizeLimits,
+    prefill_on_decode_rank: bool,
 }
 
 impl IngressRouting {
@@ -598,8 +646,10 @@ impl IngressRouting {
             policy_registry: app.policy_registry.clone(),
             worker_registry: app.worker_registry.clone(),
             tokenizer_registry: app.tokenizer_registry.clone(),
+            chats_without_template: app.chats_without_template.clone(),
             pd: app.router_config.mode.is_pd_mode(),
-            max_tokenize_bytes: app.router_config.resolved_max_tokenize_bytes(),
+            tokenize_limits: app.tokenize_limits,
+            prefill_on_decode_rank: app.router_config.prefill_on_decode_rank(),
         }
     }
 
@@ -611,27 +661,34 @@ impl IngressRouting {
             .then(|| Self::new(app))
     }
 
-    fn requirements(&self, model: Option<&str>) -> (bool, bool) {
+    fn requirements(&self, model: Option<&str>) -> (bool, Tokens) {
         let registry = &self.policy_registry;
-        if self.pd {
-            let prefill = registry.get_prefill_policy();
-            let decode = registry.get_decode_policy();
-            (
-                prefill.needs_request_text() || decode.needs_request_text(),
-                prefill.needs_tokens() || decode.needs_tokens(),
-            )
+        let policies = if self.pd {
+            [registry.get_prefill_policy(), registry.get_decode_policy()]
         } else {
             let policy = match model {
                 Some(model) => registry.get_policy_or_default(model),
                 None => registry.get_default_policy(),
             };
-            (policy.needs_request_text(), policy.needs_tokens())
-        }
+            [policy.clone(), policy]
+        };
+        let any = |uses: fn(&dyn LoadBalancingPolicy) -> bool| {
+            policies.iter().any(|policy| uses(policy.as_ref()))
+        };
+        let wanted = any(|policy| policy.wants_tokens());
+        let tokens = if any(|policy| policy.needs_tokens()) {
+            Tokens::Needed { wanted }
+        } else if wanted {
+            Tokens::Wanted
+        } else {
+            Tokens::Unused
+        };
+        (any(|policy| policy.needs_request_text()), tokens)
     }
 
     #[cfg(feature = "ext-proc")]
     pub(crate) fn needs_tokens(&self, model: Option<&str>) -> bool {
-        self.requirements(model).1
+        matches!(self.requirements(model).1, Tokens::Needed { .. })
     }
 
     /// Validate the request against this topology and prepare what its policy needs.
@@ -642,34 +699,53 @@ impl IngressRouting {
     ) -> Result<RoutingPreparation, IngressError> {
         ctx.check()?;
         let metadata = parsed.metadata_with_text(false);
-        let (needs_text, needs_tokens) = self.admit(&metadata)?;
-        if !needs_text && !needs_tokens {
+        let (needs_text, tokens) = self.admit(&metadata)?;
+        if !needs_text && tokens == Tokens::Unused {
             return Ok((metadata, None));
         }
-        self.prepare_text_and_tokens(parsed, needs_tokens, ctx)
+        self.prepare_text_and_tokens(parsed, tokens, ctx)
     }
 
     /// Validate the API and topology, then return whether the policy needs
-    /// request text and tokens.
-    fn admit(&self, metadata: &InferenceMetadata) -> Result<(bool, bool), IngressError> {
+    /// request text, and what it does with tokens.
+    fn admit(&self, metadata: &InferenceMetadata) -> Result<(bool, Tokens), IngressError> {
         let endpoint = EndpointSpec::find(metadata.route)
             .ok_or_else(|| IngressError::invalid("unsupported inference API"))?;
         endpoint.validate_topology(self.pd)?;
         Ok(self.requirements(metadata.model.as_deref()))
     }
 
-    /// Routing text, and tokens when `needs_tokens`, for an admitted request.
+    /// Routing text, and tokens as the policies use them, for an admitted request.
     fn prepare_text_and_tokens(
         &self,
         parsed: &ParsedInference,
-        needs_tokens: bool,
+        tokens: Tokens,
         ctx: &JobContext,
     ) -> Result<RoutingPreparation, IngressError> {
         let metadata = parsed.metadata();
-        let tokens = if needs_tokens {
-            Some(self.tokens(parsed, &metadata, ctx)?)
-        } else {
-            None
+        let tokens = match tokens {
+            Tokens::Needed { wanted } => Some(self.tokens(parsed, &metadata, ctx, wanted)?),
+            // The index cannot match media, and these APIs have no token-routing template.
+            Tokens::Wanted
+                if metadata.carries_media
+                    || matches!(
+                        parsed,
+                        ParsedInference::Messages(_) | ParsedInference::Responses(_)
+                    ) =>
+            {
+                None
+            }
+            // With the special tokens, as ATOM's `tokenizer.encode(prompt)` stores the blocks.
+            Tokens::Wanted => match self.tokens(parsed, &metadata, ctx, true) {
+                Ok(tokens) => Some(tokens),
+                // Routed by its text, unless the job is cancelled or late.
+                Err(error) => {
+                    ctx.check()?;
+                    untokenized(metadata.model.as_deref(), &error);
+                    None
+                }
+            },
+            Tokens::Unused => None,
         };
         Ok((metadata, tokens))
     }
@@ -710,6 +786,7 @@ impl IngressRouting {
             )),
             policies,
         )
+        .with_prefill_on_decode_rank(self.prefill_on_decode_rank)
     }
 
     pub(crate) fn candidates(
@@ -762,11 +839,14 @@ impl IngressRouting {
         Ok(())
     }
 
+    /// The request's `input_ids`, or its prompt encoded, with the tokenizer's special tokens
+    /// when `add_special_tokens`.
     fn tokens(
         &self,
         parsed: &ParsedInference,
         metadata: &InferenceMetadata,
         ctx: &JobContext,
+        add_special_tokens: bool,
     ) -> Result<Vec<u32>, IngressError> {
         ctx.check()?;
         if let Some(ids) = parsed.input_tokens().map_err(IngressError::invalid)? {
@@ -793,13 +873,16 @@ impl IngressRouting {
                     "token routing requires input_ids or a model with a registered tokenizer",
                 )
             })?;
-        let limit = self.max_tokenize_bytes;
+        let limit = self.tokenize_limits.of(&*entry.tokenizer);
         if metadata.text.len() > limit {
             return Err(IngressError::tokenizer_input_too_large());
         }
         ctx.check()?;
         let template_started = Instant::now();
         let prompt = if let Some(chat) = parsed.chat() {
+            if self.chats_without_template.read().contains(&entry.id) {
+                return Err(IngressError::new(http::StatusCode::NOT_IMPLEMENTED, "token_routing_unsupported", "this model's chats render with a built-in encoder whose defaults are not the engine's; use a policy that does not require exact tokens"));
+            }
             super::prepare::chat_template::process_chat_messages(chat, &*entry.tokenizer)
                 .map_err(IngressError::invalid)?
                 .text
@@ -815,7 +898,7 @@ impl IngressRouting {
         let encoder = super::prepare::thread_tokenizer::encoder(&entry);
         let encode_started = Instant::now();
         let tokens = encoder
-            .encode(&prompt, false)
+            .encode(&prompt, add_special_tokens)
             .map_err(|e| IngressError::invalid(e.to_string()))?
             .token_ids()
             .to_vec();
@@ -828,3 +911,7 @@ impl IngressRouting {
 #[cfg(test)]
 #[path = "../../tests/routing/ingress_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../tests/routing/token_parity.rs"]
+mod token_parity;

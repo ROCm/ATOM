@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """The V4.1 mono hi runtime (``atom/models/deepseek_v41/mono/hi``): of ATOM it imports only the shared mono pieces
 (``atom.mono``), the hook and its entry modules import, and no file of the tree carries the name of the project the runtime grew out of.
 """

@@ -51,7 +51,7 @@ is one of:
 | _(none, i.e. BF16/FP16 model)_ | Quantized directly from float weights. |
 | `fp8` (block FP8, `QuantType.per_1x128`) | FP8 block weights are dequantized to BF16 first, then re-quantized. |
 | `quark` / `modelopt` with NVFP4 layers | Packed group-16 NVFP4 weights are decoded with their E4M3 block scales and required FP32 global weight scales, then converted to MXFP4. This source currently supports only an `mxfp4` online target; direct NVFP4 inference is rejected. |
-| `mxfp4` | **Not re-quantized.** Source MXFP4 weights are currently passed through unchanged — there is no dequant path for `per_1x32`, so the requested target format does not take effect on these layers. |
+| `mxfp4` | MXFP4 MoE experts are dequantized to BF16 first, then re-quantized; experts with hidden padding or an expert bias are rejected. MXFP4 dense linears are rejected. |
 
 ## Configuration syntax
 
@@ -244,8 +244,9 @@ quantization activates only for a supported source format (see § 1).
 When online quantization runs, rank 0 writes
 `online_quant_info_<timestamp>_<ns>.json` to:
 
-1. `$ATOM_TORCH_PROFILER_DIR` if the env var is set, otherwise
-2. the current working directory.
+1. `$ATOM_ONLINE_QUANT_INFO_DIR` if the env var is set, otherwise
+2. `$ATOM_TORCH_PROFILER_DIR` if that one is set, otherwise
+3. the current working directory.
 
 A representative payload:
 

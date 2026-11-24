@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from conftest import atom_config_double
 from safetensors import safe_open
 from safetensors.torch import save_file
 
@@ -22,6 +23,7 @@ from atom.model_ops.engram import host_memory
 from atom.model_ops.qwen4_exp.ple_host_table import HostTableHooks, PleHostTable
 from atom.rollout.memory_manager import MemoryManagerMixin
 from atom.rollout.weight_updater import WeightUpdaterMixin
+from atom.utils.selector import Family
 
 DIM = 160
 SHARD_ROWS = 37
@@ -76,11 +78,10 @@ def fake_pin(monkeypatch):
     """`pin_rows` as copies into fresh host memory, weakly kept in `pinned`;
     `fail_at` refuses one shard (by its first row), as a full page-locked pool
     would."""
-    state = SimpleNamespace(calls=0, fail_at=None, copy=[], pinned=[])
+    state = SimpleNamespace(calls=0, fail_at=None, pinned=[])
 
-    def pin_rows(sources, copy=False):
+    def pin_rows(sources):
         state.calls += 1
-        state.copy.append(copy)
         if state.fail_at is not None and state.calls == state.fail_at:
             return None
         pinned = tuple(s.clone() for s in sources)
@@ -119,7 +120,7 @@ def test_shard_addresses_find_every_row(fake_pin, dtype):
     host = _host(dtype=dtype)
     _load(table, host)
     bases = host.shard_bases(NUM_SHARDS)
-    assert host.on_host and fake_pin.copy == [True] * NUM_SHARDS
+    assert host.on_host and fake_pin.calls == NUM_SHARDS
     assert host.pinned_bytes == table.nbytes
     ids = _probe_ids(TABLE_ROWS)
     assert _bitwise_equal(_follow(bases, ids, 0, TABLE_ROWS, dtype), table[ids])
@@ -205,6 +206,7 @@ class _Embedding(HostTableHooks, torch.nn.Module):
 
 def _runner(model, device="cpu"):
     runner = MemoryManagerMixin()
+    runner._init_memory_manager()
     runner.model, runner.device, runner.label = model, torch.device(device), "ple"
     runner.enforce_eager = True
     return runner
@@ -417,12 +419,15 @@ class _Model(torch.nn.Module):
 def _updater(model, device="cpu"):
     class _Updater(WeightUpdaterMixin):
         label, rank, world_size = "ple", 0, 1
+        config = atom_config_double()
+        attn_family = Family.MHA
 
         def clear_kv_cache(self):
             pass
 
     updater = _Updater()
     updater.model, updater.device = model, torch.device(device)
+    updater._init_weight_updater()
     return updater
 
 
@@ -467,7 +472,8 @@ def test_an_update_waits_for_the_lookups_once_before_any_row(
     fake_pin, monkeypatch, fail_at
 ):
     """The rows are written from the host, after one device-wide wait per
-    update for the lookups of the step that ended -- not one per shard."""
+    update for the lookups of the step that ended -- not one per shard. A
+    sync's completion may wait again, for its writes, once the rows are in."""
     fake_pin.fail_at = fail_at
     old, new = _table(), _table().neg()
     model = _Model()
@@ -488,8 +494,9 @@ def test_an_update_waits_for_the_lookups_once_before_any_row(
         waits.clear()
         shards = _sync_tensors(after, torch.ones(4, 4), True)[:NUM_SHARDS]
         assert updater.update_weights(shards) == NUM_SHARDS
-        assert [device for device, _ in waits] == [torch.device("cuda")]
+        assert waits and {device for device, _ in waits} == {torch.device("cuda")}
         assert _bitwise_equal(waits[0][1], before[ids])
+        assert all(_bitwise_equal(seen, after[ids]) for _, seen in waits[1:])
         assert _bitwise_equal(rows(), after[ids])
 
 
@@ -620,7 +627,7 @@ def _device_host(table, mode, monkeypatch, tmp_path, start=0, end=None):
     """`PleHostTable` loaded with the real page-locking in `mode`."""
     end = table.shape[0] if end is None else end
     if mode == "hbm":
-        monkeypatch.setattr(host_memory, "pin_rows", lambda sources, copy=None: None)
+        monkeypatch.setattr(host_memory, "pin_rows", lambda sources: None)
     host = _host(start, end, table.dtype, "cuda")
     _load(table, host, start, end, _checkpoint_shards(table, tmp_path))
     bases = host.shard_bases(NUM_SHARDS).cuda()
@@ -810,7 +817,7 @@ def test_released_weights_free_the_hbm_fallback(ngram_layer, monkeypatch):
     """A refused page-lock leaves the table in HBM as the module's `weight`:
     releasing the weights frees it, and after resuming and syncing the
     weights the lookups read the new allocation."""
-    monkeypatch.setattr(host_memory, "pin_rows", lambda sources, copy=None: None)
+    monkeypatch.setattr(host_memory, "pin_rows", lambda sources: None)
     host_layer, hbm_layer = ngram_layer(True), ngram_layer(False)
     table = _layer_table(host_layer)
     for layer in (host_layer, hbm_layer):
@@ -929,7 +936,7 @@ def test_an_fp8_table_in_hbm_syncs_the_ranks_rows_and_refuses_bf16_rows(
 
     group = SimpleNamespace(world_size=tp, rank_in_group=tp - 1)
     monkeypatch.setattr(ple_layer, "get_tp_group", lambda: group)
-    monkeypatch.setattr(host_memory, "pin_rows", lambda sources, copy=None: None)
+    monkeypatch.setattr(host_memory, "pin_rows", lambda sources: None)
     config = SimpleNamespace(**vars(_NGRAM_CONFIG), ple_embedding_dtype="float8_e4m3fn")
     layer = ngram_layer(uva, config)
     embedding = layer.ngram_embedding

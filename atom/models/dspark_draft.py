@@ -30,8 +30,9 @@ The standalone GQA drafts (Kimi-K3 DSpark GQA, MiniMax-M3.1) also share one laye
 forward, ``DSparkGQADecoderLayer``.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 import torch
 from torch import nn
@@ -83,6 +84,16 @@ class DraftSampling:
     #: [max_bs] fp32, the request's top-p, over the unfiltered q and
     #: intersected with top-k (aiter's rule); 1.0 is off.
     top_p: torch.Tensor
+
+
+class VocabShard(NamedTuple):
+    """This TP rank's slice of a sharded LM head: the base logits a sampler
+    is handed hold vocab ids ``start`` on only, and ``group`` (the TP group)
+    holds the rest. ``use_custom`` picks its custom all-gather."""
+
+    start: int
+    group: Any
+    use_custom: bool
 
 
 def linear_out(output):
@@ -228,6 +239,7 @@ class DSparkMarkovHead(nn.Module):
         base_logits: torch.Tensor,  # [B, T, V]
         anchor_ids: torch.Tensor,  # [B]
         sampling: "DraftSampling | None",
+        shard: VocabShard | None = None,
     ) -> torch.Tensor:
         """The block, left to right, each position from ``x_{k-1}`` into its
         own column of one ``[B, T + 1]`` block whose first column is the
@@ -241,18 +253,28 @@ class DSparkMarkovHead(nn.Module):
         Kimi-K3's loop: one for greedy and lossless, so the column convention
         and the noise counters cannot drift apart. V4, V4.1 and MiniMax-M3.1
         keep their own greedy loops, because their confidence head reads each
-        position's ``W1[x_{k-1}]``, which the sampled op does not produce.
-        Lossless, each row writes its q
-        straight into the row block its request owns (``sampling.q_row_base``),
-        which the accept kernel reads a step later. The branch on
-        ``sampling`` is python, so a recording holds one side; an armed
-        drafter records both (`DSparkProposer.block_greedy`).
+        position's ``W1[x_{k-1}]``, which the sampled op does not produce
+        (V4.1's sampled block takes this loop and gathers those rows after
+        it). Lossless, each row writes its q straight into the row block its
+        request owns (``sampling.q_row_base``), which the accept kernel reads a
+        step later. The branch on ``sampling`` is python, so a recording holds
+        one side; an armed drafter records both (`DSparkProposer.block_greedy`).
+
+        ``shard``: ``base_logits`` is this rank's ``[B, T, V / tp]`` slice of a
+        sharded LM head, which the sampled op keeps sharded
+        (`dspark_markov_sample_tp`); it draws and stores what it would from
+        the whole vocab. Lossless only: a greedy flavor that shards its head
+        runs its own loop.
         """
         bs, num_draft, vocab = base_logits.shape
+        if shard is not None:
+            assert sampling is not None, "only the sampled block keeps a shard"
+            vocab *= shard.group.world_size
         if sampling is not None:
             # Imported here for the reason `sample_next` gives.
             from atom.model_ops.spec_sampling.dspark_markov_sample import (
                 dspark_markov_sample,
+                dspark_markov_sample_tp,
             )
 
             # The noise counter stride is the buffer's max batch, not this
@@ -268,7 +290,7 @@ class DSparkMarkovHead(nn.Module):
                 # written twice.
                 self.sample_next(out_ids[:, k], base_logits[:, k], out_ids[:, k + 1])
                 continue
-            dspark_markov_sample(
+            args = (
                 base_logits[:, k],
                 out_ids[:, k],
                 self.markov_w1.weight,
@@ -284,6 +306,10 @@ class DSparkMarkovHead(nn.Module):
                 k * position_stride,
                 sampling.scratch,
             )
+            if shard is None:
+                dspark_markov_sample(*args)
+            else:
+                dspark_markov_sample_tp(*args, *shard)
         return out_ids[:, 1:]
 
 
@@ -320,16 +346,28 @@ class DSparkConfidenceHead(nn.Module):
         # probabilities). The checkpoint head is BF16 [1, hidden + rank]: the
         # GEMV takes it as is and accumulates and writes FP32, which is what
         # casting both operands to FP32 first would compute, minus the casts.
-        # aiter is imported here, not at module load: this module imports
-        # without it.
-        x = torch.cat([hidden_states, markov_embeds], dim=-1)
         weight, bias = self.proj.weight, self.proj.bias
+        if hidden_states.is_cuda:
+            # Triton is imported here, not at module load: this module imports
+            # without it.
+            from atom.model_ops.dspark_confidence import (
+                can_fuse_confidence,
+                fused_confidence,
+            )
+
+            if can_fuse_confidence(hidden_states, markov_embeds, weight, bias):
+                # FP32 accumulation in one launch, without the concatenated
+                # copy (its reduction order differs from the GEMM's).
+                return fused_confidence(hidden_states, markov_embeds, weight)
+        x = torch.cat([hidden_states, markov_embeds], dim=-1)
         if not x.is_cuda:
             logit = torch.nn.functional.linear(
                 x.float(), weight.float(), None if bias is None else bias.float()
             )
             return torch.sigmoid(logit).squeeze(-1)
 
+        # aiter is imported here, not at module load: this module imports
+        # without it.
         import aiter
         from aiter.tuned_gemm import tgemm
 
@@ -476,6 +514,12 @@ class DSparkDraftModel(nn.Module):
     #: ``DSparkProposer`` binds sampling buffers only where it is set.
     supports_lossless_draft = False
 
+    #: Once lossless sampling arms, verify a sampled request's drafts as one
+    #: block (Sun et al. 2024; `ratio_verify`) rather than token by token: the
+    #: same output law, never fewer accepted drafts in expectation. A class
+    #: flag beside ``supports_lossless_draft``, set where it has been run.
+    lossless_block_verify: ClassVar[bool] = False
+
     #: The buffers the block sampler draws into, set once lossless speculative
     #: sampling arms (`DSparkLossless.bind_target`), before any warmup or
     #: capture; None keeps the greedy block sampler, as does
@@ -528,12 +572,17 @@ class DSparkDraftModel(nn.Module):
 
     def write_context_kv(
         self,
-        aux_concat: torch.Tensor,  # [N, target_hidden * num_target_layers]
+        taps: Sequence[torch.Tensor],  # per tap [N, target_hidden]
         positions: torch.Tensor,  # [N] absolute positions
         slot_mapping: torch.Tensor | None = None,  # [N] paged-pool slots
         pcp_num_tokens: int | None = None,
     ) -> None:
         """Absorb one target forward's hidden states into this draft's KV.
+
+        ``taps`` are the target's aux hidden states in tap order, as
+        ``Drafter.aux_for`` serves them; under PP the leading entry may be
+        several taps already joined, relayed from earlier stages. Joining
+        them is the model's business, in ``project_context``.
 
         Where those rows land -- a private rolling window, a paged pool -- is
         the layer's business, not this method's. A paged layer writes at
@@ -543,12 +592,12 @@ class DSparkDraftModel(nn.Module):
 
         That makes the call site load-bearing: this must run while
         ``attn_metadata`` still describes the TARGET forward that produced
-        ``aux_concat``. A drafter that has already retargeted the metadata to
+        ``taps``. A drafter that has already retargeted the metadata to
         its own block pass (see ``DSparkProposer._propose_with_draft``) is
         past the point where these rows can be placed.
 
         After a PCP row-split target prefill of ``pcp_num_tokens`` rows,
-        ``aux_concat`` is only this rank's round-robin stripe of them
+        each tap is only this rank's round-robin stripe of them
         (``pcp_aux_rows``); see ``write_split_context_kv``.
         """
         from atom.utils.forward_context import get_forward_context
@@ -562,37 +611,42 @@ class DSparkDraftModel(nn.Module):
         if get_forward_context().context.is_dummy_run:
             return
         if pcp_num_tokens is not None:
-            self.write_split_context_kv(
-                aux_concat, positions, pcp_num_tokens, slot_mapping
-            )
+            self.write_split_context_kv(taps, positions, pcp_num_tokens, slot_mapping)
             return
-        ctx_hidden = self.project_context(aux_concat)
+        ctx_hidden = self.project_context(taps)
         for layer in self.context_layers:
             layer.write_context_kv(ctx_hidden, positions, slot_mapping)
 
     def write_split_context_kv(
         self,
-        aux_local: torch.Tensor,  # this PCP rank's round-robin stripe
+        taps_local: Sequence[torch.Tensor],  # this PCP rank's stripe of each tap
         positions: torch.Tensor,  # [num_tokens] absolute positions
         num_tokens: int,
         slot_mapping: torch.Tensor | None = None,
     ) -> None:
         """`write_context_kv` from this rank's stripe of the aux rows: gather
-        them, then write as usual. A draft that projects its context KV row by
-        row overrides this to gather the (smaller) KV rows instead."""
-        from atom.distributed.pcp_utils import pcp_allgather_rerange
+        every tap in one collective, then write as usual. A draft that projects
+        its context KV row by row overrides this to gather the (smaller) KV
+        rows instead."""
+        from atom.distributed.pcp_utils import pcp_allgather_rerange_many
 
-        aux = pcp_allgather_rerange(aux_local)[:num_tokens]
-        self.write_context_kv(aux, positions, slot_mapping)
+        taps = [t[:num_tokens] for t in pcp_allgather_rerange_many(list(taps_local))]
+        self.write_context_kv(taps, positions, slot_mapping)
 
-    def project_context(self, aux_concat: torch.Tensor) -> torch.Tensor:
-        """Fuse the concatenated target aux hidden states into one [N, hidden]
-        context tensor, shared by every layer: ``hidden_norm(fc(aux))``.
+    @staticmethod
+    def concat_taps(taps: Sequence[torch.Tensor]) -> torch.Tensor:
+        """The taps as one ``[N, target_hidden * num_taps]`` tensor, for a
+        projection that wants it; no copy when they arrive already joined."""
+        return taps[0] if len(taps) == 1 else torch.cat(tuple(taps), dim=-1)
+
+    def project_context(self, taps: Sequence[torch.Tensor]) -> torch.Tensor:
+        """Fuse the target aux taps into one [N, hidden] context tensor,
+        shared by every layer: ``hidden_norm(fc(concat(taps)))``.
 
         A target layer id is that layer's output, the residual stream before
         any final norm, which is what the standalone drafts are trained on.
         """
-        return self.hidden_norm(linear_out(self.fc(aux_concat)))
+        return self.hidden_norm(linear_out(self.fc(self.concat_taps(taps))))
 
     @property
     def context_layers(self):

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """The mono framework's host mechanisms that need no GPU: TP agreement, kernel
 argument tables, compile-only builds, and the framework's dependency rules."""
 
@@ -12,7 +13,7 @@ import pytest
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from atom.distributed.group_agreement import group_agree
+from atom.distributed.group_agreement import group_agree, group_min_each
 from atom.mono.runtime.abi import KernelAbi
 from atom.mono.runtime.compile import (
     _COMPILE_ONLY,
@@ -121,6 +122,26 @@ def test_one_refusing_rank_turns_every_rank_down(refuser):
     assert dict(out) == {r: refuser is None for r in range(world)}
 
 
+def _min_each_worker(rank, world, init, out):
+    dist.init_process_group("gloo", init_method=init, rank=rank, world_size=world)
+    out[rank] = group_min_each((rank, -rank, 7), dist.group.WORLD)
+    dist.destroy_process_group()
+
+
+def test_each_position_is_decided_on_its_own_in_one_collective():
+    world = 3
+    with tempfile.TemporaryDirectory() as d:
+        out = mp.Manager().dict()
+        mp.spawn(
+            _min_each_worker,
+            args=(world, f"file://{d}/store", out),
+            nprocs=world,
+            join=True,
+        )
+    assert dict(out) == {r: (0, -2, 7) for r in range(world)}
+    assert group_min_each((3, 1), None) == (3, 1)
+
+
 def _module_files():
     return sorted(FRAMEWORK.rglob("*.py"))
 
@@ -145,6 +166,7 @@ def test_the_framework_package_is_found():
 
 # --------------------------------------------------------------- shared runner parts
 from atom.mono.runtime import route
+from atom.mono.runtime import widths as widths_module
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
 from atom.mono.runtime.widths import WidthBuilds
 
@@ -274,8 +296,6 @@ def test_a_width_is_built_and_compiled_once():
 def test_each_rank_compiles_its_own_share_of_a_width_first(monkeypatch):
     """Rank r of w compiles every w-th kernel from r first (the ranks side by
     side, not queued on one cache lock), then loads all of them."""
-    from atom.mono.runtime import widths as widths_module
-
     monkeypatch.setattr(widths_module.dist, "get_rank", lambda group: 1)
     monkeypatch.setattr(widths_module.dist, "get_world_size", lambda group: 3)
     widths = WidthBuilds(lambda key: key, lambda k: [], object(), "test")
@@ -284,6 +304,20 @@ def test_each_rank_compiles_its_own_share_of_a_width_first(monkeypatch):
         0,
         1,
     ]
+
+
+def test_a_lean_rebuild_leaves_out_what_any_rank_spilled(monkeypatch):
+    """A rank whose own kernels did not spill still leaves out the ones at the
+    places another rank's spilled: every rank rebuilds into one structure."""
+
+    def all_gather_object(every, places, group):
+        every[:] = [places, {1}]  # the other rank spilled the second kernel
+
+    monkeypatch.setattr(widths_module.dist, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(widths_module.dist, "all_gather_object", all_gather_object)
+    widths = WidthBuilds(lambda key: key, lambda k: [], object(), "test")
+    a, b, c = object(), object(), object()
+    assert widths._spilled_anywhere({a: 0, b: 0, c: 52}) == [b, c]
 
 
 def test_a_built_width_logs_its_kernels_names(caplog):
@@ -619,3 +653,46 @@ def test_bind_aux_taps_refuses_an_extract_the_kernels_do_not_compute():
     assert bind_aux_taps(_aux_drafter(aux_extract=kernel), 8, kernel).extract is kernel
     # a runner that calls the extract itself takes any
     assert bind_aux_taps(_aux_drafter(aux_extract=other), 8).extract is other
+
+
+@pytest.mark.parametrize("before", [None, "7"])
+def test_srcloc_scoped_keeps_depth_frames_then_flydsls_own_setting(monkeypatch, before):
+    pytest.importorskip("flydsl")
+    from atom.mono.runtime import srcloc
+
+    if before is None:
+        monkeypatch.delenv(srcloc._DEPTH_ENV, raising=False)
+    else:
+        monkeypatch.setenv(srcloc._DEPTH_ENV, before)
+    with srcloc.scoped():
+        assert os.environ[srcloc._DEPTH_ENV] == str(srcloc.DEPTH)
+    assert os.environ.get(srcloc._DEPTH_ENV) == before
+
+
+def test_srcloc_unlocated_captures_no_location_in_any_holder(monkeypatch):
+    pytest.importorskip("flydsl")
+    from atom.mono.runtime import srcloc
+
+    monkeypatch.delenv("FLYDSL_DEBUG_ENABLE_DEBUG_INFO", raising=False)
+    before = [mod.capture_user_location for mod in srcloc._HOLDERS]
+    # restored on an error too
+    with pytest.raises(KeyError), srcloc.unlocated():
+        for mod in srcloc._HOLDERS:
+            assert mod.capture_user_location is srcloc._unknown_location
+        raise KeyError
+    assert [mod.capture_user_location for mod in srcloc._HOLDERS] == before
+
+
+def test_srcloc_unlocated_keeps_locations_when_debug_info_is_on(monkeypatch):
+    """With debug info the locations are in the binary: ``scoped()``'s
+    locations, not none."""
+    pytest.importorskip("flydsl")
+    from atom.mono.runtime import srcloc
+
+    monkeypatch.setenv("FLYDSL_DEBUG_ENABLE_DEBUG_INFO", "1")
+    monkeypatch.delenv(srcloc._DEPTH_ENV, raising=False)
+    before = [mod.capture_user_location for mod in srcloc._HOLDERS]
+    with srcloc.unlocated():
+        assert [mod.capture_user_location for mod in srcloc._HOLDERS] == before
+        assert os.environ[srcloc._DEPTH_ENV] == str(srcloc.DEPTH)
+    assert srcloc._DEPTH_ENV not in os.environ

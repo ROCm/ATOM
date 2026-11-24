@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """AITER selection preserves ATOM cache ownership, SP groups and YaRN axes."""
 
 import math
@@ -143,6 +144,24 @@ def test_groups_exclude_causal_tail(device, monkeypatch):
         output_width=width,
     )
     _check(inputs, selected)
+
+
+def test_prefill_selection_into_attention_buffer(device, monkeypatch):
+    inputs = _inputs(device, padding=0)
+    inputs.update(query_lens=(8, 1), prefix_lens=(0, 2999))
+    _forbid_fallback(monkeypatch)
+    # The upstream attention planner reuses a kernel-width buffer across layers.
+    # Its row stride can exceed the indexer's logical output width.
+    buffer = torch.full(
+        (inputs["q"].shape[0], 4099), -1, dtype=torch.int32, device=device
+    )
+    for _ in range(2):
+        selected = qsa.qsa_select_paged_tokens(**inputs, out=buffer)
+        assert selected.data_ptr() == buffer.data_ptr()
+        assert selected.stride(0) == buffer.stride(0)
+        _check(inputs, selected)
+        assert bool((buffer[:, 2051:] == -1).all())
+        inputs["q"].neg_()
 
 
 @pytest.mark.parametrize(

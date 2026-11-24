@@ -77,6 +77,8 @@ def producer(pp_rank=0, pp_size=1, num_tokens=10):
     c._unit_layout = None
     c._block_region_roles = [None]
     c._per_block_bytes_list = [4]
+    c._kv_staging_reserve = 0
+    c._landing_spec = None
     c._completed_prefills_lock = threading.Lock()
     c._completed_prefills_cv = threading.Condition(c._completed_prefills_lock)
     c._chunked_prefills = {}
@@ -269,6 +271,8 @@ def consumer(expected=2):
     c = mc.MooncakeConnector.__new__(mc.MooncakeConnector)
     c.is_producer = False
     c._cuda_device = 0
+    c._kv_staging_reserve = 0
+    c._landing_spec = None
     # Drive the real receive queue by hand; CPU tests have no GPU worker.
     c._write_queue = []
     c._write_cv = threading.Condition()
@@ -292,7 +296,7 @@ def consumer(expected=2):
     c._pending_recv_blocks = {21: [2, 9, 4]}
     c._pending_recv_slots = {}
     c._swa_block_regions = []
-    c._pending_handoffs = {21: {"failed": False, "metadata": None}}
+    c._pending_handoffs = {21: mc._PendingHandoff()}
     c._release_targets = {}
     c._blocks_pending_fence = []
     c.done_recving = set()
@@ -603,6 +607,9 @@ def test_mutable_slot_is_sent_once_after_final_metadata():
     slot_dst = (ctypes.c_ubyte * 8)()
     c._block_regions = [(c.kv_caches_base_addr[0], 4)]
     c._slot_regions = [(ctypes.addressof(slot_src), 4)]
+    c._slot_region_consumer_indices = None
+    c._slot_region_tp_segments = None
+    c._slot_region_tp_replicated = None
     c._swa_block_regions = []
     c._fp4_index_layout = False
     c._gather_slot = None
@@ -693,12 +700,12 @@ def test_swa_only_pool_transfers_final_relocated_slot(monkeypatch, reverse_index
         },
         local_swa_block_ids=[2],
     )
-    d._mla_landing = MagicMock()
+    d._landing = MagicMock()
     d.start_load_kv(meta)
     d._send_on_socket.assert_not_called()
     post_write_requests(d, monkeypatch)
-    d._mla_landing.advertise.assert_not_called()
-    d._mla_landing.begin.assert_not_called()
+    d._landing.advertise.assert_not_called()
+    d._landing.begin.assert_not_called()
     assert meta.reqs_to_recv.keys() <= d._pending_handoffs.keys()
     _, (_, payload) = d._send_on_socket.call_args.args
     request = msgpack.loads(payload)
@@ -753,7 +760,8 @@ def test_terminal_without_consumer_expires_but_live_rdma_cannot_expire(monkeypat
 
 
 @pytest.mark.parametrize("pp_size", [1, 3])
-def test_idle_engine_dispatches_terminal_metadata_to_all_stages(pp_size):
+@pytest.mark.parametrize("chunked", [False, True])
+def test_idle_engine_dispatches_terminal_metadata_to_all_stages(pp_size, chunked):
     from aiter_stub import stubbed_aiter
 
     with stubbed_aiter():
@@ -769,7 +777,7 @@ def test_idle_engine_dispatches_terminal_metadata_to_all_stages(pp_size):
         kv_connector=SimpleNamespace(
             is_producer=True,
             is_offload=False,
-            enable_chunked_transfer=True,
+            enable_chunked_transfer=chunked,
             build_connector_meta=lambda: meta,
         ),
         _publish_state_loads=lambda: None,
@@ -1290,14 +1298,14 @@ def test_terminal_transfer_history_is_bounded_without_retaining_sources(monkeypa
 @pytest.mark.parametrize(
     "is_offload,enabled,is_producer,dispatches",
     [
-        (False, False, True, False),
+        (False, False, True, True),
         (False, False, False, False),
         (False, True, False, False),
         (False, True, True, True),
         (True, False, False, True),
     ],
 )
-def test_idle_dispatch_remains_opt_in(
+def test_idle_dispatch_accepts_terminal_producers_and_offload(
     pp_size, is_offload, enabled, is_producer, dispatches
 ):
     with stubbed_aiter():
@@ -1447,6 +1455,7 @@ def test_opposite_admission_order_progresses_without_recompute(
             assert d.pd_admission.pending_bytes == 12
             if ds is db:
                 assert not da.block_table
+                assert d.pd_admission.deferred == {"bytes": 1, "free_kv": 0}
         dw.start_load_kv(batch.connector_meta_output)
         # Reserving D's pages alone cannot admit P: the write request still
         # waits in D's queue until prior GPU writes to those pages finish.
@@ -2238,3 +2247,52 @@ def test_a_preempted_producer_request_rejected_on_readmission_hands_nothing_off(
     assert str(seq.id) not in producer._awaiting_send
     assert seq.id not in producer._reqs_need_save
     assert seq.id not in sched.deferred_free_blocks
+
+
+def test_a_withdrawn_producer_admission_dispatches_no_source_blocks(
+    monkeypatch, seq_factory
+):
+    """A chunked producer is told of every allocation (`update_state_after_alloc`
+    queues its block ids for the worker). An admission the scheduler takes back
+    after that must be cancelled before its blocks are freed, or the same tick's
+    metadata sends the freed ids and claims the source."""
+    from conftest import MockConfig
+
+    from atom.model_engine.scheduler import Scheduler
+
+    sched = Scheduler(
+        MockConfig(
+            max_num_batched_tokens=64,
+            num_kvcache_blocks=100,
+            kv_cache_block_size=4,
+            max_num_seqs=8,
+        )
+    )
+    producer = sched.kv_connector = scheduler_connector(monkeypatch, True)
+
+    def producer_seq(transfer_id):
+        return seq_factory(
+            list(range(10)),
+            kv_transfer_params={
+                "chunked_transfer": True,
+                "do_remote_decode": True,
+                "transfer_id": transfer_id,
+            },
+        )
+
+    first, withdrawn = producer_seq("a"), producer_seq("b")
+    sched.add(first)
+    sched.add(withdrawn)
+    producer._chunked_ready.update({first.id, withdrawn.id})  # D reserved both
+    # The post-allocation re-assert withdraws the second request's admission.
+    monkeypatch.setattr(
+        sched,
+        "_waits_below_resume",
+        lambda seq, start, chunk, resume: seq is withdrawn and bool(seq.block_table),
+    )
+    batch, scheduled = sched.schedule()
+    meta = batch.connector_meta_output
+    assert list(scheduled) == [first.id]
+    assert set(meta.reqs_to_save) == {first.id}
+    assert str(withdrawn.id) not in producer._awaiting_send
+    assert not withdrawn.block_table

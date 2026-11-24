@@ -659,3 +659,19 @@ def test_decoder_stages_run_each_layer_under_its_counts():
     assert all(sizes == (384, 40) for i, sizes in log if i < 39)
     assert log[-1] == (39, (3, 40))
     assert forward.dp_metadata.get_sizes_across_dp() == [512, 40]
+
+
+def test_query_rows_take_keeps_a_none_scale(monkeypatch):
+    """A BF16 Q has no scale: the Q is gathered, its None passes through."""
+    from atom.models.deepseek_v41 import bounded_replay
+
+    monkeypatch.setattr(
+        bounded_replay,
+        "_gather_rows",
+        lambda rows, *tensors, dim: tuple(t.index_select(dim, rows) for t in tensors),
+    )
+    rows = torch.tensor([2, 0])
+    q = torch.arange(12.0).view(1, 3, 4)
+    taken = bounded_replay.QueryRows.take(SimpleNamespace(rows=rows), q, None)
+    assert len(taken) == 2 and taken[1] is None
+    assert torch.equal(taken[0], q[:, [2, 0]])

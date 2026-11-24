@@ -74,6 +74,7 @@ def _atom_config(**overrides):
         "pipeline_parallel_size": 1,
         "decode_context_parallel_size": 1,
         "prefill_context_parallel_size": 1,
+        "is_multinode_tp": False,
         "enable_tbo": False,
         "enable_tbo_decode": False,
         "compilation_config": SimpleNamespace(level=3, cudagraph_mode=None),
@@ -902,16 +903,15 @@ def _bitwise_equal(a, b):
 def fake_pin(monkeypatch):
     """`pin_rows` as copies into fresh host memory; `fail_at` refuses one
     shard (by its first row), as a full page-locked pool would."""
-    state = SimpleNamespace(calls=0, fail_at=None, copy=[])
+    state = SimpleNamespace(calls=0, fail_at=None)
 
-    def pin_rows(sources, copy=True):
+    def pin_rows(sources):
         state.calls += 1
-        state.copy.append(copy)
         if state.fail_at is not None and state.calls == state.fail_at:
             return None
         return tuple(s.clone() for s in sources)
 
-    monkeypatch.setattr(_ple(), "pin_rows", pin_rows)
+    monkeypatch.setattr(_ple().host_memory, "pin_rows", pin_rows)
     # Copies in plain memory: the device would see them where the host does.
     monkeypatch.setattr(_ple(), "device_address", lambda address, **_: address)
     return state
@@ -988,7 +988,7 @@ def _device_host(table, mode, monkeypatch, tmp_path, start=0, end=None):
     """`PleHostTable` loaded with the real page-locking in `mode`."""
     end = table.shape[0] if end is None else end
     if mode == "hbm":
-        monkeypatch.setattr(_ple(), "pin_rows", lambda sources: None)
+        monkeypatch.setattr(_ple().host_memory, "pin_rows", lambda sources: None)
     host = _host(start, end, table.dtype, "cuda")
     _load(table, host, start, end, _checkpoint_shards(table, tmp_path))
     bases = host.shard_bases(NUM_SHARDS).cuda()
