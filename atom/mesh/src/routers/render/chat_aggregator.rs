@@ -373,16 +373,9 @@ async fn split_reasoning(
         // The one-shot parse hands back a reply without reasoning untouched.
         return Ok(ParserResult::normal(text.to_string()));
     }
-    // It trims the text after the opener, and then what follows the closer.
-    let reasoning = if parser.is_in_reasoning() {
-        reasoning.trim()
-    } else {
-        reasoning.trim_start()
-    };
-    Ok(ParserResult::new(
-        normal.trim().to_string(),
-        reasoning.to_string(),
-    ))
+    // Byte for byte what the model wrote minus the delimiters, as ATOM's HTTP chat
+    // splits it, and as the streamed reply carries it.
+    Ok(ParserResult::new(normal, reasoning))
 }
 
 async fn parse_tool_calls(
@@ -538,6 +531,14 @@ mod split_reasoning_tests {
         // Without the opener the same reply has no reasoning to find.
         let result = split(&["plain", "</think>", "Done."], None).await;
         assert!(result.reasoning_text.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_long_reply_keeps_its_answer_s_whitespace() {
+        let thought = "z".repeat(ONE_SHOT_MAX_BYTES + 1000);
+        let result = split(&["<think>", &thought, "</think>", "    print(1)\n"], None).await;
+        assert_eq!(result.reasoning_text, thought);
+        assert_eq!(result.normal_text, "    print(1)\n");
     }
 
     #[tokio::test]
