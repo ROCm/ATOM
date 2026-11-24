@@ -42,6 +42,7 @@ from atom.kv_transfer.disaggregation.moriio.fabric import (
     is_fabric_backend,
     page_batch,
     page_table,
+    shard_pairs,
 )
 from atom.kv_transfer.disaggregation.moriio.moriio_common import (
     _MORIIO_AVAILABLE,
@@ -154,6 +155,14 @@ class MoRIIOConnector(KVConnectorBase):
         )
         self.transfer_mode = self._transfer_mode_from(kv_transfer_config)
         self.use_fabric = self._fabric_backend_from(config)
+        if config.dcp_config.index_shard and not self.use_fabric:
+            # The RDMA paths register and move whole regions (MiniMax-M3's
+            # per-layer one moves no index cache at all).
+            raise ValueError(
+                "ATOM_M3_INDEX_SHARD=1 (dcp_config.index_shard) needs "
+                "moriio_backend fabric, which moves a rank's share of the index "
+                "cache; MoRIIO's RDMA paths move whole regions"
+            )
         if (
             self.transfer_mode == "write"
             and not self.is_producer
@@ -203,10 +212,11 @@ class MoRIIOConnector(KVConnectorBase):
             self._create_rdma_backend(kv_transfer_config)
 
         # PAGE layout (fabric): the one registered buffer's descriptor, its
-        # size, and per PAGE region (offset in it, bytes per block, role).
+        # size, and per PAGE region (offset in it, bytes per block, role, shard
+        # rank, shard world: `fabric.page_table`).
         self._page_desc: bytes | None = None
         self._page_pool_bytes = 0
-        self._page_regions: list[tuple[int, int, str]] = []
+        self._page_regions: list[tuple[int, int, str, int, int]] = []
         self._page_views: list[Any] | None = None
         self._transfer_stats = envs.ATOM_MORIIO_TRANSFER_STATS
         # ATOM_MORIIO_VERIFY on the consumer: each pushed request's destination
@@ -622,10 +632,11 @@ class MoRIIOConnector(KVConnectorBase):
         self.num_blocks = blocks
         self.block_len = self.kv_cache_block_size
         logger.info(
-            "MoRIIO fabric: registered %d PAGE regions (%d B per block) as one "
-            "buffer of %.2f GiB at %#x, %d blocks, vPOD %d",
+            "MoRIIO fabric: registered %d PAGE regions (%d B per block, %d of "
+            "them sharded) as one buffer of %.2f GiB at %#x, %d blocks, vPOD %d",
             len(entries),
-            sum(unit for _, unit, _ in entries),
+            sum(entry[1] // entry[4] for entry in entries),
+            sum(entry[4] > 1 for entry in entries),
             size / (1 << 30),
             base,
             self.num_blocks,
@@ -1427,23 +1438,34 @@ class MoRIIOConnector(KVConnectorBase):
                 f"{engine_id} advertised no PAGE layout; both ends need "
                 "moriio_backend fabric"
             )
-        theirs = [(int(o), int(u), str(r)) for o, u, r in remote.page_regions]
+        # A peer from before region shards advertises (offset, unit, role).
+        theirs = [
+            (int(o), int(u), str(r), *(int(x) for x in (shard or (0, 1))))
+            for o, u, r, *shard in remote.page_regions
+        ]
         if engine_id not in self._built_sessions:
             if remote.page_desc == self._page_desc:
                 raise ValueError(
                     f"{engine_id} advertised our own PAGE descriptor; every "
                     "transfer would copy this rank onto itself"
                 )
-            ours = [(unit, role) for _, unit, role in self._page_regions]
-            if ours != [(unit, role) for _, unit, role in theirs]:
+            ours = [entry[1:] for entry in self._page_regions]
+            if ours != [entry[1:] for entry in theirs]:
                 first = next(
-                    (
-                        i
-                        for i, (a, b) in enumerate(zip(ours, theirs))
-                        if a != (b[1], b[2])
-                    ),
+                    (i for i, (a, b) in enumerate(zip(ours, theirs)) if a != b[1:]),
                     min(len(ours), len(theirs)),
                 )
+                if first < min(len(ours), len(theirs)) and (
+                    ours[first][:2] == theirs[first][1:3]
+                ):
+                    # Same region, other shard: one end keeps the whole index
+                    # cache and the other a rank's share of it.
+                    raise ValueError(
+                        f"{engine_id} holds PAGE region {ours[first][1]!r} as "
+                        f"shard {theirs[first][3:]} (rank, of) where this rank "
+                        f"holds {ours[first][2:]}: run P and D both with or "
+                        "both without ATOM_M3_INDEX_SHARD=1, at one TP"
+                    )
                 raise ValueError(
                     f"{engine_id} published {len(theirs)} PAGE regions to our "
                     f"{len(ours)}; first difference at region {first}"
@@ -1475,7 +1497,7 @@ class MoRIIOConnector(KVConnectorBase):
             )
         return (
             self._built_sessions[engine_id][0],
-            [(o, u) for o, u, _ in theirs],
+            [(entry[0], entry[1]) for entry in theirs],
             int(remote.num_blocks),
         )
 
@@ -1493,14 +1515,21 @@ class MoRIIOConnector(KVConnectorBase):
         session, remote_regions, remote_blocks = self._get_or_build_page_session(
             engine_id
         )
-        l_offs, r_offs, sizes = page_batch(
-            [(offset, unit) for offset, unit, _ in self._page_regions],
-            remote_regions,
-            src,
-            dst,
-            self.num_blocks,
-            remote_blocks,
-        )
+        # One batch: the whole regions' blocks, then each shard's own ones.
+        l_offs, r_offs, sizes = [], [], []
+        for (rank, world), positions in self._page_shard_groups().items():
+            pairs = (src, dst) if world == 1 else shard_pairs(src, dst, rank, world)
+            for into, part in zip(
+                (l_offs, r_offs, sizes),
+                page_batch(
+                    [self._page_regions[i][:2] for i in positions],
+                    [remote_regions[i] for i in positions],
+                    *pairs,
+                    self.num_blocks // world,
+                    remote_blocks // world,
+                ),
+            ):
+                into.extend(part)
         if self._verify_kv:
             request["page_digest"] = self._page_digests(src)
             request["_page_src"] = list(src)
@@ -1541,19 +1570,39 @@ class MoRIIOConnector(KVConnectorBase):
             self.tp_rank,
         )
 
+    def _page_shard_groups(self) -> dict[tuple[int, int], list[int]]:
+        """The PAGE regions by ``(shard rank, shard world)``, in table order."""
+        groups: dict[tuple[int, int], list[int]] = {}
+        for i, entry in enumerate(self._page_regions):
+            groups.setdefault((entry[3], entry[4]), []).append(i)
+        return groups
+
     def _page_digests(self, block_ids: list[int]) -> list[list[int]]:
         """Per PAGE region, the digest of ``block_ids`` but the last, and of
-        the last. Past the prompt the last block holds slots that both ends
-        write after the push (the producer's deferred-output decode, the
-        consumer's own first decode), so it is compared on its own."""
+        the last (a sharded region's: of those it holds). Past the prompt the
+        last block holds slots that both ends write after the push (the
+        producer's deferred-output decode, the consumer's own first decode),
+        so it is compared on its own."""
         import torch
 
         device = self._page_views[0].device
-        body = torch.as_tensor(block_ids[:-1], dtype=torch.int64, device=device)
-        tail = torch.as_tensor(block_ids[-1:], dtype=torch.int64, device=device)
+
+        def units(blocks):
+            """Per shard, the units of ``blocks`` its regions hold."""
+            return {
+                (rank, world): torch.as_tensor(
+                    [b // world for b in blocks if b % world == rank],
+                    dtype=torch.int64,
+                    device=device,
+                )
+                for rank, world in self._page_shard_groups()
+            }
+
+        body, tail = units(block_ids[:-1]), units(block_ids[-1:])
+        pairs = list(zip(self._page_views, self._page_regions))
         sums = _byte_digests(
-            [view.index_select(0, body) for view in self._page_views]
-            + [view.index_select(0, tail) for view in self._page_views]
+            [view.index_select(0, body[entry[3:]]) for view, entry in pairs]
+            + [view.index_select(0, tail[entry[3:]]) for view, entry in pairs]
         )
         n = len(self._page_views)
         return [sums[:n], sums[n:]]
