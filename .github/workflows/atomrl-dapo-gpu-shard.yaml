@@ -15,6 +15,50 @@ on:
         default: /data/atomrl
 
 jobs:
+  atomrl-gpu-unit:
+    name: AtomRL GPU unit tests
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
+    runs-on: atom-mi355-8gpu.predownload
+    timeout-minutes: 120
+    concurrency:
+      group: atomrl-dapo-atom-mi355-8gpu.predownload
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    env:
+      IMAGE_TAG: ${{ inputs.image_tag }}-${{ github.run_id }}-${{ github.run_attempt }}-unit
+      CONTAINER_NAME: atomrl_gpu_unit_${{ github.run_id }}_${{ github.run_attempt }}
+    steps:
+      - name: Checkout ATOM repository
+        uses: actions/checkout@v6
+
+      - name: Build AtomRL GPU unit image
+        run: |
+          set -euo pipefail
+          docker build --pull \
+            --file atomrl/docker/Dockerfile.dev \
+            --tag "$IMAGE_TAG" \
+            .
+
+      - name: Run AtomRL GPU unit tests
+        run: |
+          set -euo pipefail
+          docker run --rm --name "$CONTAINER_NAME" \
+            --device=/dev/kfd --device=/dev/dri --group-add video \
+            --ipc=host --network=host --privileged \
+            --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+            --ulimit memlock=-1 --ulimit stack=67108864 \
+            -w /opt/atomrl/ATOM \
+            "$IMAGE_TAG" bash -lc \
+            'python3 -m pytest atomrl/tests/unit atomrl/tests/atomrl \
+              -m "gpu or multigpu" -q'
+
+      - name: Clean up AtomRL GPU unit image
+        if: always()
+        run: |
+          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+          docker rmi -f "$IMAGE_TAG" 2>/dev/null || true
+
   dapo-case:
     name: AtomRL DAPO example ${{ matrix.id }} (${{ matrix.name }})
     if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
