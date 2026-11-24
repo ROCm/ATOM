@@ -15,14 +15,25 @@ from atom.model_ops.minimax_m3 import index_topk as m
 CPU = torch.device("cpu")
 
 
+class FakeStream:
+    """A stream (CPU torch has none) that records the streams it waited on."""
+
+    def __init__(self):
+        self.waited = []
+
+    def wait_stream(self, other):
+        self.waited.append(other)
+
+
 @pytest.fixture
 def stream(monkeypatch):
-    """A fake current stream (CPU torch has none) the test can switch."""
-    current = SimpleNamespace(cuda_stream=1)
-    monkeypatch.setattr(m.torch.cuda, "current_stream", lambda device=None: current)
+    """The current fake stream; the test switches it through `stream.now`."""
+    holder = SimpleNamespace(now=FakeStream())
+    monkeypatch.setattr(m.torch.cuda, "current_stream", lambda device=None: holder.now)
     monkeypatch.setattr(m.torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(m.torch.Tensor, "record_stream", lambda self, s: None)
     monkeypatch.setattr(m, "_PREFILL_SCORE_WORKSPACE", {})
-    return current
+    return holder
 
 
 def test_first_call_allocates_the_bound_and_longer_contexts_reuse_it(stream):
@@ -46,11 +57,20 @@ def test_past_the_bound_it_grows_and_keeps_the_larger_buffer(stream):
     assert again.untyped_storage().data_ptr() == big.untyped_storage().data_ptr()
 
 
-def test_each_stream_has_its_own_buffer(stream):
+def test_another_stream_reuses_the_buffer_after_waiting_for_the_last_one(stream):
+    # A token graph recording runs its eager regions on the capture stream: it
+    # must not get a second full-size buffer the KV budget never saw.
+    warmup = stream.now
     a = m.prefill_score_buffer(4, 8, 4, CPU, (8, 4))
-    stream.cuda_stream = 2
+    capture = stream.now = FakeStream()
     b = m.prefill_score_buffer(4, 8, 4, CPU, (8, 4))
-    assert a.untyped_storage().data_ptr() != b.untyped_storage().data_ptr()
+    assert a.untyped_storage().data_ptr() == b.untyped_storage().data_ptr()
+    assert capture.waited == [warmup]
+    m.prefill_score_buffer(4, 8, 4, CPU, (8, 4))
+    assert capture.waited == [warmup]  # same stream again: stream order suffices
+    stream.now = warmup
+    m.prefill_score_buffer(4, 8, 4, CPU, (8, 4))
+    assert warmup.waited == [capture]
 
 
 def test_no_reserve_or_capture_keeps_a_tensor_per_call(stream, monkeypatch):
