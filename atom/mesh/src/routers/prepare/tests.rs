@@ -1546,6 +1546,49 @@ mod h_prepare_chat_generate {
         assert_ne!(status(), Some(http::StatusCode::NOT_IMPLEMENTED));
     }
 
+    /// A chat rendered with the tokenizer's template file is placed on an ATOM worker
+    /// without a template of its own, as that file outranks the worker's.
+    #[test]
+    fn test_a_template_files_chat_is_served_by_a_worker_without_a_template() {
+        use crate::core::{BasicWorkerBuilder, RuntimeType};
+
+        let components = test_mocks::app_context_with_hf_tokenizer("m");
+        let loaded = components.tokenizer_registry.get_by_name("m").unwrap().id;
+        let files = &components.tokenizer_template_files;
+        files.write().insert(loaded, "t.jinja".into());
+        let worker = BasicWorkerBuilder::new("grpc://atom:4")
+            .runtime_type(RuntimeType::Atom)
+            .model_id("m")
+            .label("chat_template", "{{ messages }}")
+            .build();
+        let (payload, _) = prepare_chat(chat_req(false), None, Some("m".into()), &components)
+            .expect("HF tokenizer must succeed");
+        let template = payload.chat_template.expect("rendered here");
+        assert!(template.served_by(&worker));
+    }
+
+    /// A tokenizer found by its id is checked against what it was loaded with, as one
+    /// found by name is: the tokenizer and its entry come from one lookup.
+    #[test]
+    fn test_a_tokenizer_found_by_id_keeps_its_built_in_encoder_refusal() {
+        use crate::core::{BasicWorkerBuilder, RuntimeType};
+
+        let registry = test_mocks::tokenizer_registry_with("m");
+        let id = registry.get_by_name("m").unwrap().id;
+        let components = test_mocks::app_context_with_tokenizer_registry(registry);
+        components.chats_without_template.write().insert(id.clone());
+        let worker = BasicWorkerBuilder::new("grpc://atom:4")
+            .runtime_type(RuntimeType::Atom)
+            .model_id(id.as_str())
+            .label("chat_template", "{{ messages }}")
+            .build();
+        components.worker_registry.register(Arc::new(worker));
+        let refused = prepare_chat(chat_req(false), None, Some(id), &components)
+            .err()
+            .expect("a built-in encoder's chat is refused");
+        assert_eq!(refused.status(), http::StatusCode::NOT_IMPLEMENTED);
+    }
+
     #[test]
     fn test_prepare_generate_request_ids_unique_per_call() {
         let registry = test_mocks::tokenizer_registry_with("m");

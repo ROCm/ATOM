@@ -30,8 +30,9 @@ pub struct RequestDescriptor<'a> {
 pub struct RenderedTemplate {
     /// `template_fingerprint` of the template.
     pub fingerprint: u64,
-    /// `--chat-template`, which an ATOM worker without its own file serves.
-    pub router_file: Option<String>,
+    /// The file the tokenizer was loaded with, else `--chat-template`: what an ATOM
+    /// worker without its own file serves, as the fingerprint ranks them.
+    pub fallback_file: Option<String>,
 }
 
 impl RenderedTemplate {
@@ -39,7 +40,7 @@ impl RenderedTemplate {
     /// ATOM is sent the text as well; an ATOM worker must serve the same template.
     pub fn served_by(&self, worker: &dyn Worker) -> bool {
         worker.metadata().runtime_type != RuntimeType::Atom
-            || served_template(worker, self.router_file.as_deref()) == self.fingerprint
+            || served_template(worker, self.fallback_file.as_deref()) == self.fingerprint
     }
 }
 
