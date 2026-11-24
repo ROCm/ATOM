@@ -69,6 +69,9 @@ _NON_PAGE_ROLES: frozenset[str] = frozenset(
         "replay_buf_k",
         "replay_buf_u",
         "replay_buf_g",
+        # ReplaySSM's record cursor, one [num_slots] tensor every layer shares:
+        # slot-addressed like the records, and moved with them by P/D only.
+        "replay_write_pos",
         # Not a plane but a verdict on the ones above: True marks this whole
         # entry as per-request recurrent state, addressed by request slot. It
         # is checked rather than merely skipped -- see `build_mp_transfer_tensors`.

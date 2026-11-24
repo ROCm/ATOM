@@ -73,6 +73,9 @@ if _MORIIO_AVAILABLE:
 
 logger = logging.getLogger("atom")
 
+# State name of ReplaySSM's record cursor, one tensor shared by every layer.
+REPLAY_CURSOR = "replayssm.write_pos"
+
 
 # ===================================================================
 # MoRIIOConnector — worker-side connector (runs inside each TP rank)
@@ -361,6 +364,7 @@ class MoRIIOConnector(KVConnectorBase):
             self.blocks_per_chunk,
         )
         if self._state_tensors:
+            self._check_replay_cursor()
             if not self.is_producer and self.transfer_mode == "read":
                 raise NotImplementedError(
                     "moriio read mode moves block-addressed KV only, and this "
@@ -559,47 +563,63 @@ class MoRIIOConnector(KVConnectorBase):
     def _register_state(self, layer_name: str, kv_cache: Any) -> None:
         """Register one layer's per-request state, one slot per dim-0 row.
 
-        The KDA forward binds its conv state as ``k_cache`` and its SSM state as
-        ``v_cache``, each ``(num_slots, ...)`` and contiguous, so a slot is one
-        run of ``stride(0)`` elements and moves as a single write.
+        The KDA forward binds its conv state as ``k_cache``, its SSM state as
+        ``v_cache`` and its ReplaySSM records as ``replay_buf_{k,u,g}``, each
+        ``(num_slots, ...)`` and contiguous, so a slot is one run of
+        ``stride(0)`` elements and moves as a single write. The records'
+        cursor is one tensor shared by every layer, registered once.
         """
-        if any(
-            getattr(kv_cache, name, None) is not None
-            for name in ("replay_buf_k", "replay_buf_u", "replay_buf_g")
-        ):
-            # Under ReplaySSM the records and the cursor are part of the state,
-            # and this connector moves neither.
-            raise NotImplementedError(
-                f"{layer_name}: ReplaySSM record buffers are per-request state "
-                "MoRIIO does not move; serve P/D with ATOM_ENABLE_REPLAYSSM=0"
-            )
-        for part, tensor in (("k", kv_cache.k_cache), ("v", kv_cache.v_cache)):
+        parts = (
+            ("k", kv_cache.k_cache),
+            ("v", kv_cache.v_cache),
+            ("replay_k", getattr(kv_cache, "replay_buf_k", None)),
+            ("replay_u", getattr(kv_cache, "replay_buf_u", None)),
+            ("replay_g", getattr(kv_cache, "replay_buf_g", None)),
+        )
+        for part, tensor in parts:
             if tensor is None or tensor.numel() == 0:
                 continue
-            name = f"{layer_name}.{part}"
-            if not tensor.is_contiguous():
-                raise ValueError(
-                    f"{name}: state shaped {tuple(tensor.shape)} with strides "
-                    f"{tensor.stride()} is not one run of bytes per slot"
-                )
-            num_slots = tensor.shape[0]
-            if self._num_state_slots not in (0, num_slots):
-                raise ValueError(
-                    f"{name} has {num_slots} slots, the state registered before "
-                    f"it {self._num_state_slots}"
-                )
-            slot_bytes = tensor.stride(0) * tensor.element_size()
-            if num_slots * slot_bytes > MAX_RDMA_CHUNK_BYTES:
-                raise ValueError(
-                    f"{name}: {num_slots} slots of {slot_bytes} bytes exceed one "
-                    "RDMA registration"
-                )
-            device_id = tensor.device.index if tensor.device.index is not None else -1
-            desc = self.moriio_wrapper.register_local_buffer(
-                tensor.data_ptr(), num_slots * slot_bytes, device_id
+            self._register_state_tensor(f"{layer_name}.{part}", tensor)
+        cursor = getattr(kv_cache, "replay_write_pos", None)
+        if cursor is not None and REPLAY_CURSOR not in self._state_tensors:
+            self._register_state_tensor(REPLAY_CURSOR, cursor)
+
+    def _register_state_tensor(self, name: str, tensor: Any) -> None:
+        """Register one ``(num_slots, ...)`` state tensor under ``name``."""
+        if not tensor.is_contiguous():
+            raise ValueError(
+                f"{name}: state shaped {tuple(tensor.shape)} with strides "
+                f"{tensor.stride()} is not one run of bytes per slot"
             )
-            self._num_state_slots = num_slots
-            self._state_tensors[name] = (desc, slot_bytes, tensor)
+        num_slots = tensor.shape[0]
+        if self._num_state_slots not in (0, num_slots):
+            raise ValueError(
+                f"{name} has {num_slots} slots, the state registered before "
+                f"it {self._num_state_slots}"
+            )
+        slot_bytes = tensor.stride(0) * tensor.element_size()
+        if num_slots * slot_bytes > MAX_RDMA_CHUNK_BYTES:
+            raise ValueError(
+                f"{name}: {num_slots} slots of {slot_bytes} bytes exceed one "
+                "RDMA registration"
+            )
+        device_id = tensor.device.index if tensor.device.index is not None else -1
+        desc = self.moriio_wrapper.register_local_buffer(
+            tensor.data_ptr(), num_slots * slot_bytes, device_id
+        )
+        self._num_state_slots = num_slots
+        self._state_tensors[name] = (desc, slot_bytes, tensor)
+
+    def _check_replay_cursor(self) -> None:
+        """Refuse ReplaySSM records registered without their cursor."""
+        records = [name for name in self._state_tensors if ".replay_" in name]
+        if records and REPLAY_CURSOR not in self._state_tensors:
+            # Pushed alone, the records land under the consumer slot's stale
+            # cursor, and its first decode folds the previous tenant's records.
+            raise ValueError(
+                f"{len(records)} ReplaySSM record tensors (first {records[0]}) "
+                "came without the record cursor `replay_write_pos`"
+            )
 
     @staticmethod
     def _transfer_mode_from(
@@ -1060,9 +1080,18 @@ class MoRIIOConnector(KVConnectorBase):
             }
             theirs = remote.state_slot_bytes or {}
             if theirs != ours:
+                differ = sorted(
+                    name
+                    for name in ours.keys() | theirs.keys()
+                    if ours.get(name) != theirs.get(name)
+                )
+                # ReplaySSM and the draft length shape the state; both ends
+                # must run the same ATOM_ENABLE_REPLAYSSM and DSpark size.
                 raise ValueError(
                     f"{engine_id} registered {len(theirs)} per-request state "
-                    f"tensors to our {len(ours)}, or with other slot sizes"
+                    f"tensors to our {len(ours)}; {len(differ)} differ, first "
+                    f"{differ[0]}: ours {ours.get(differ[0])} B/slot, theirs "
+                    f"{theirs.get(differ[0])} B/slot"
                 )
             unpack = self.moriio_wrapper.get_unpack_memory_metadata
             sessions = []
