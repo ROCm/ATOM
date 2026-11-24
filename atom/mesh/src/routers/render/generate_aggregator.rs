@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::{
@@ -13,7 +14,7 @@ use crate::{
         comm::error,
         prepare::response_context::{ProtocolRequest, ResponseContext},
         render::{
-            atom_usage::AtomUsage,
+            atom_usage::MetaInfoTiming,
             logprob_conversion::{input_logprobs_to_generate, output_logprobs_to_generate},
         },
         token_handle::{
@@ -143,16 +144,33 @@ pub async fn process(stream: TokenHandle, ctx: ResponseContext) -> Response {
         return axum::Json(result_array).into_response();
     }
     // An ATOM worker's: each sequence's timing, which /v1/completions reports.
-    let mut value = match serde_json::to_value(&result_array) {
-        Ok(value) => value,
-        Err(e) => return error::internal_error("serialization_failed", e.to_string()),
-    };
-    if let Some(items) = value.as_array_mut() {
-        for (item, meta) in items.iter_mut().zip(metas) {
-            AtomUsage::add_timing(&mut item["meta_info"], meta);
-        }
-    }
-    axum::Json(value).into_response()
+    let timed: Vec<_> = (result_array.iter().zip(metas))
+        .map(|(response, meta)| TimedResponse {
+            text: &response.text,
+            output_ids: &response.output_ids,
+            meta_info: TimedMetaInfo {
+                info: &response.meta_info,
+                timing: meta.timing.map(MetaInfoTiming::from),
+            },
+        })
+        .collect();
+    axum::Json(timed).into_response()
+}
+
+/// A `GenerateResponse` serialized with its sequence's timing added to `meta_info`.
+#[derive(Serialize)]
+struct TimedResponse<'a> {
+    text: &'a str,
+    output_ids: &'a [u32],
+    meta_info: TimedMetaInfo<'a>,
+}
+
+#[derive(Serialize)]
+struct TimedMetaInfo<'a> {
+    #[serde(flatten)]
+    info: &'a GenerateMetaInfo,
+    #[serde(flatten)]
+    timing: Option<MetaInfoTiming>,
 }
 
 async fn collect_completes(mut stream: TokenHandle) -> Result<Vec<TokenChunk>, Response> {

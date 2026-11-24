@@ -4,6 +4,7 @@
 //! ATOM's additions to an OpenAI `usage`, as `serving_chat.py` and `serving_completion.py`
 //! write them; only an ATOM worker's sequences carry the timing (`WorkerMeta.timing`).
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::routers::token_handle::token_chunk::{SeqTiming, TokenChunk, WorkerMeta};
@@ -31,8 +32,24 @@ pub(crate) const COMPLETION: Fields = Fields {
     timing: true,
 };
 
-/// The `/generate` meta_info keys a sequence's timing travels under to the completions adapter.
-const TIMING_KEYS: [&str; 3] = ["ttft_s", "tpot_s", "latency_s"];
+/// A sequence's timing under the `/generate` meta_info keys it travels in to the
+/// completions adapter.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct MetaInfoTiming {
+    ttft_s: f64,
+    tpot_s: f64,
+    latency_s: f64,
+}
+
+impl From<SeqTiming> for MetaInfoTiming {
+    fn from(timing: SeqTiming) -> Self {
+        Self {
+            ttft_s: timing.ttft,
+            tpot_s: timing.tpot,
+            latency_s: timing.latency,
+        }
+    }
+}
 
 pub(crate) struct AtomUsage {
     /// The prompt the siblings share, which ATOM counts once.
@@ -81,30 +98,19 @@ impl AtomUsage {
         Some(usage)
     }
 
-    /// `meta_info` with the timing of `meta`, if ATOM timed it.
-    pub fn add_timing(meta_info: &mut Value, meta: &WorkerMeta) {
-        let (Some(timing), Some(info)) = (meta.timing, meta_info.as_object_mut()) else {
-            return;
-        };
-        let values = [timing.ttft, timing.tpot, timing.latency];
-        for (key, value) in TIMING_KEYS.into_iter().zip(values) {
-            info.insert(key.into(), json!(value));
-        }
-    }
-
-    /// The request's, from the `/generate` meta_infos `add_timing` filled.
+    /// The request's, from the `/generate` meta_infos carrying `MetaInfoTiming`.
     pub fn of_meta_infos(meta_infos: &[&Value]) -> Option<Self> {
         let metas = meta_infos
             .iter()
             .map(|info| {
-                let field = |key: &str| info.get(key).and_then(Value::as_f64);
-                let [ttft_s, tpot_s, latency_s] = TIMING_KEYS.map(field);
+                let timing = MetaInfoTiming::deserialize(*info).ok()?;
+                let cached = info.get("cached_tokens").and_then(Value::as_f64);
                 Some(WorkerMeta {
-                    cached_tokens: field("cached_tokens").unwrap_or(0.0) as u32,
+                    cached_tokens: cached.unwrap_or(0.0) as u32,
                     timing: Some(SeqTiming {
-                        ttft: ttft_s?,
-                        tpot: tpot_s?,
-                        latency: latency_s?,
+                        ttft: timing.ttft_s,
+                        tpot: timing.tpot_s,
+                        latency: timing.latency_s,
                     }),
                     ..Default::default()
                 })
@@ -146,7 +152,7 @@ impl AtomUsage {
     }
 
     /// `response` serialized, its `usage` extended with `fields`.
-    pub fn extend_response<T: serde::Serialize>(
+    pub fn extend_response<T: Serialize>(
         &self,
         response: &T,
         fields: Fields,

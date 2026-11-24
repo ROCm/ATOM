@@ -499,6 +499,18 @@ mod coder {
 
                 // We're in a tool call, try to parse function name if not sent yet
                 if !self.current_tool_name_sent {
+                    // As unary reads it, a bare header's name holds no `<`: up to one, it is prose.
+                    if self.bare_call {
+                        let name = &self.buffer[BARE_CALL_START.len()..];
+                        let ends = name.find(['<', '>']);
+                        if let Some(cut) = ends.filter(|&at| name[at..].starts_with('<')) {
+                            let cut = BARE_CALL_START.len() + cut;
+                            normal_text.push_str(&self.buffer[..cut]);
+                            self.buffer.drain(..cut);
+                            self.reset_streaming_state();
+                            continue;
+                        }
+                    }
                     if let Some(captures) = self.xml_function_pattern.captures(&self.buffer) {
                         let declared = captures.get(0).unwrap().end();
                         // A bare one is a call only when it names a tool and call syntax
@@ -874,6 +886,27 @@ mod coder {
             assert_eq!((text.as_str(), calls.len()), (reply, 0));
             for size in 1..=9 {
                 assert_eq!(stream(reply, size).await, (reply.to_string(), 0));
+            }
+        }
+
+        /// A bare header whose name runs into a `<` is text, and a call after it is read,
+        /// unary as streamed.
+        #[tokio::test]
+        async fn a_call_after_an_unclosed_bare_header_is_read() {
+            let tool: Tool = serde_json::from_value(serde_json::json!({
+                "type": "function", "function": {"name": "get_weather", "parameters": {}},
+            }))
+            .unwrap();
+            let prose = "Example <function=NAME ... ";
+            let reply = format!("{prose}<function=get_weather></function>");
+            let mut parser = QwenCoderParser::new();
+            parser.read_as_atom();
+            let unary = parser.parse_complete_with_tools(&reply, &[tool]).await;
+            let (text, calls) = unary.unwrap();
+            assert_eq!((text.as_str(), calls.len()), (prose, 1));
+            for size in 1..=9 {
+                let (streamed, calls) = stream(&reply, size).await;
+                assert_eq!((streamed.as_str(), calls), (prose, 1), "{size}-byte pieces");
             }
         }
 
