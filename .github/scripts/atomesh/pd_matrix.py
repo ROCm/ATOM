@@ -286,9 +286,12 @@ def role_env(
     env = merged_role_env(
         defaults, backend_cfg, model_cfg, suite_cfg, role, slurm_submit_runner
     )
-    # ROLE_IP and HANDSHAKE_PORT are filled in by pd_server_atom.sh at
-    # launch time (host IP and 6301 + ATOMESH_SERVICE_PORT_OFFSET).
-    env = resolve_env_refs_in_value(env, preserve_names={"ROLE_IP", "HANDSHAKE_PORT"})
+    # ROLE_IP, HANDSHAKE_PORT and WORKER_RDMA_DEVICES are filled in by
+    # pd_server_atom.sh at launch time (host IP, 6301 +
+    # ATOMESH_SERVICE_PORT_OFFSET, and the NICs of the worker's GPUs).
+    env = resolve_env_refs_in_value(
+        env, preserve_names={"ROLE_IP", "HANDSHAKE_PORT", "WORKER_RDMA_DEVICES"}
+    )
     return {str(key): str(value) for key, value in env.items()}
 
 

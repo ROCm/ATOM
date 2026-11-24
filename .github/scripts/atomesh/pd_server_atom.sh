@@ -488,6 +488,44 @@ kv_transfer_config() {
   printf '%s' "${override}"
 }
 
+# with_worker_rdma_devices <kv-transfer-config>: replaces ${WORKER_RDMA_DEVICES}
+# with this worker's NICs, rdma<N> (ionic_<N> where rdma<N> is absent) for each
+# GPU N of HIP_VISIBLE_DEVICES, read through ROCR_VISIBLE_DEVICES when set. A
+# packed node runs workers on both halves; one role config then keeps each on
+# its own half's NICs ("ib_device":"${WORKER_RDMA_DEVICES}").
+with_worker_rdma_devices() {
+  local config="$1" ib_root="${ATOMESH_IB_SYSFS_ROOT:-/sys/class/infiniband}"
+  local placeholder='${WORKER_RDMA_DEVICES}'
+  if [[ "${config}" != *"${placeholder}"* ]]; then
+    printf '%s' "${config}"
+    return 0
+  fi
+  local -a gpus=() rocr=() nics=()
+  local gpu
+  IFS=',' read -r -a gpus <<< "${HIP_VISIBLE_DEVICES:-}"
+  IFS=',' read -r -a rocr <<< "${ROCR_VISIBLE_DEVICES:-}"
+  for gpu in "${gpus[@]}"; do
+    if [[ "${gpu}" =~ ^[0-9]+$ && "${#rocr[@]}" -gt 0 ]]; then
+      gpu="${rocr[gpu]:-}"
+    fi
+    if [[ ! "${gpu}" =~ ^[0-9]+$ ]]; then
+      echo "ERROR: ${placeholder} needs numeric GPU ordinals (HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-}, ROCR_VISIBLE_DEVICES=${ROCR_VISIBLE_DEVICES:-})" >&2
+      return 2
+    fi
+    if [[ ! -e "${ib_root}/rdma${gpu}" && -e "${ib_root}/ionic_${gpu}" ]]; then
+      nics+=("ionic_${gpu}")
+    else
+      nics+=("rdma${gpu}")
+    fi
+  done
+  if [[ "${#nics[@]}" -eq 0 ]]; then
+    echo "ERROR: ${placeholder} needs HIP_VISIBLE_DEVICES" >&2
+    return 2
+  fi
+  local IFS=,
+  printf '%s' "${config//"${placeholder}"/${nics[*]}}"
+}
+
 host_ip="$(echo "${IPADDRS}" | tr ',' '\n' | sed -n "$((NODE_RANK + 1))p")"
 if [[ -z "${host_ip}" ]]; then
   host_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
@@ -1047,6 +1085,9 @@ purge_lmcache_disk() {
 #    each prefill stage its GPU's NIC and, under one shared master, refuses one
 #    an owner uses: owners and requesters sharing NICs stall concurrent reads.
 #  - MOONCAKE_STORE_MASTER_NUMA (default 1): the NUMA node the masters run on.
+#  - MOONCAKE_STORE_EVICTION_HIGH_WATERMARK (default 0.90) and
+#    MOONCAKE_STORE_EVICTION_RATIO (default 0.05): a master evicts the ratio
+#    of its pool, least recently used first, once the watermark is in use.
 #  - MOONCAKE_STORE_POOLS=per_nic (default shared), for owners that must share
 #    the stages' NICs: one master per owner NIC, every owner on exactly one
 #    NIC, and each stage reads its own NIC's pool (mooncake_store.pools).
@@ -1356,8 +1397,8 @@ kv_transfer_offload_connector() {
 # Store setting that is not one of its kind, before anything starts. The
 # helpers and bash arithmetic would misread it later: a compaction timeout of 0
 # skips the compaction, and a wait timeout bash cannot add aborts the wait
-# without stopping what it waited for. Kinds: positive_integer, integer (>= 0)
-# and positive (a decimal).
+# without stopping what it waited for. Kinds: positive_integer, integer (>= 0),
+# positive (a decimal) and fraction (a decimal in (0, 1)).
 require_mooncake_store_number() {
   local name="$1" value valid=0
   value="$(mooncake_setting "$1" "$2")"
@@ -1365,6 +1406,7 @@ require_mooncake_store_number() {
     positive_integer) [[ "${value}" =~ ^[0-9]{1,15}$ ]] && ((10#${value} > 0)) && valid=1 ;;
     integer) [[ "${value}" =~ ^[0-9]{1,15}$ ]] && valid=1 ;;
     positive) [[ "${value}" =~ ^[0-9]{1,15}([.][0-9]+)?$ && "${value}" =~ [1-9] ]] && valid=1 ;;
+    fraction) [[ "${value}" =~ ^0?[.][0-9]+$ && "${value}" =~ [1-9] ]] && valid=1 ;;
   esac
   if ((!valid)); then
     echo "[mooncake-store][FAIL] ${name}=${value} is not a ${3//_/ } number" >&2
@@ -1431,6 +1473,8 @@ check_mooncake_store_settings() {
   require_mooncake_store_number MOONCAKE_STORE_COMPACT_TIMEOUT 600 positive
   require_mooncake_store_number MOONCAKE_STORE_WAIT_TIMEOUT 1200 positive_integer
   require_mooncake_store_number MOONCAKE_STORE_MASTER_NUMA 1 integer
+  require_mooncake_store_number MOONCAKE_STORE_EVICTION_HIGH_WATERMARK 0.90 fraction
+  require_mooncake_store_number MOONCAKE_STORE_EVICTION_RATIO 0.05 fraction
   plan_mooncake_store_owners
   plan_mooncake_store_pools
   check_mooncake_store_ports
@@ -1903,7 +1947,8 @@ start_mooncake_store() {
       --http_metadata_server_port="$(mooncake_pool_port "${ATOMESH_MOONCAKE_METADATA_PORT}" "${pool}")"
       --metrics_port="$(mooncake_pool_port "${ATOMESH_MOONCAKE_METRICS_PORT}" "${pool}")"
       --default_kv_lease_ttl=10000
-      --eviction_high_watermark_ratio=0.90 --eviction_ratio=0.05
+      --eviction_high_watermark_ratio="$(mooncake_setting MOONCAKE_STORE_EVICTION_HIGH_WATERMARK 0.90)"
+      --eviction_ratio="$(mooncake_setting MOONCAKE_STORE_EVICTION_RATIO 0.05)"
       --allocation_strategy=random --memory_allocator=offset --client_ttl=10
     )
     dump_launch_info "MOONCAKE_MASTER" "${store_env[@]}" "${cmd[@]}"
@@ -2061,6 +2106,7 @@ start_prefill() {
   fi
   local prefill_kv_transfer_config
   prefill_kv_transfer_config="$(kv_transfer_config kv_producer "${PREFILL_KV_TRANSFER_CONFIG}" "${host_ip}" "${handshake_port}")" || exit 2
+  prefill_kv_transfer_config="$(with_worker_rdma_devices "${prefill_kv_transfer_config}")" || exit 2
   local -a prefill_profiler_args=()
   build_torch_profiler_args "${log_name}" prefill_profiler_args
   echo "[prefill] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${prefill_cudagraph_args[*]:-none}"
@@ -2124,6 +2170,7 @@ start_decode() {
   fi
   local decode_kv_transfer_config
   decode_kv_transfer_config="$(kv_transfer_config kv_consumer "${DECODE_KV_TRANSFER_CONFIG}" "${host_ip}" "${handshake_port}")" || exit 2
+  decode_kv_transfer_config="$(with_worker_rdma_devices "${decode_kv_transfer_config}")" || exit 2
   local -a decode_profiler_args=()
   build_torch_profiler_args "${log_name}" decode_profiler_args
   echo "[decode] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${decode_cudagraph_args[*]:-none}"

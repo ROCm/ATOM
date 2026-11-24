@@ -1254,6 +1254,10 @@ if stop_mooncake_store; then echo "STOP rc=0"; else echo "STOP rc=$?"; fi
                     ("COMPACT_TIMEOUT", "nan", "positive number"),
                     ("WAIT_TIMEOUT", "20m", "positive integer number"),
                     ("MASTER_NUMA", "-1", "integer number"),
+                    ("EVICTION_HIGH_WATERMARK", "1.5", "fraction number"),
+                    ("EVICTION_HIGH_WATERMARK", "0", "fraction number"),
+                    ("EVICTION_RATIO", "0.00", "fraction number"),
+                    ("EVICTION_RATIO", "5%", "fraction number"),
                 )
             ),
         ):
@@ -1261,6 +1265,55 @@ if stop_mooncake_store; then echo "STOP rc=0"; else echo "STOP rc=$?"; fi
                 result = self.run_shell("start_mooncake_store\n", expect_rc=2, **env)
                 self.assertIn(message, result.stderr)
         self.assertEqual(self.store_calls("mooncake_master"), [])
+
+    def test_the_eviction_settings_reach_every_master(self):
+        self.run_shell(
+            "start_mooncake_store\nstop_mooncake_store\n",
+            MOONCAKE_STORE_POOLS="per_nic",
+            MOONCAKE_STORE_OWNERS="0:8:rdma0;0:8:rdma1",
+            MOONCAKE_STORE_EVICTION_HIGH_WATERMARK="0.89",
+            MOONCAKE_STORE_EVICTION_RATIO=".02",
+        )
+        masters = self.store_calls("mooncake_master")
+        self.assertEqual(len(masters), 2)
+        for master in masters:
+            self.assertIn(" --eviction_high_watermark_ratio=0.89 ", f"{master} ")
+            self.assertIn(" --eviction_ratio=.02 ", f"{master} ")
+
+    def test_worker_rdma_devices_name_the_nics_of_the_workers_gpus(self):
+        config = '{"kv_connector":"mooncake","ib_device":"${WORKER_RDMA_DEVICES}"}'
+        (self.ib / "ionic_9" / "ports/1").mkdir(parents=True)
+        for env, devices in (
+            ({"HIP_VISIBLE_DEVICES": "4,5,6,7"}, "rdma4,rdma5,rdma6,rdma7"),
+            ({"HIP_VISIBLE_DEVICES": "0,1,2,3"}, "rdma0,rdma1,rdma2,rdma3"),
+            # HIP numbers the GPUs ROCR leaves visible.
+            (
+                {"HIP_VISIBLE_DEVICES": "0,1,2,3", "ROCR_VISIBLE_DEVICES": "4,5,6,7"},
+                "rdma4,rdma5,rdma6,rdma7",
+            ),
+            ({"HIP_VISIBLE_DEVICES": "9"}, "ionic_9"),
+        ):
+            with self.subTest(env=env):
+                result = self.run_shell(
+                    "with_worker_rdma_devices '" + config + "'\n", **env
+                )
+                self.assertEqual(
+                    result.stdout,
+                    config.replace("${WORKER_RDMA_DEVICES}", devices),
+                )
+        # A config without the placeholder passes untouched, whatever the GPUs.
+        result = self.run_shell(
+            'with_worker_rdma_devices \'{"ib_device":"rdma4"}\'\n',
+            HIP_VISIBLE_DEVICES="GPU-abc",
+        )
+        self.assertEqual(result.stdout, '{"ib_device":"rdma4"}')
+        result = self.run_shell(
+            "with_worker_rdma_devices '" + config + "'\n",
+            expect_rc=2,
+            HIP_VISIBLE_DEVICES="0",
+            ROCR_VISIBLE_DEVICES="GPU-abc",
+        )
+        self.assertIn("needs numeric GPU ordinals", result.stderr)
 
     def test_an_aggregated_cell_with_the_store_is_refused(self):
         # start_prefill starts the Store, and an aggregated cell has no prefill.
