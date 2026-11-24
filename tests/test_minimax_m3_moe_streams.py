@@ -142,6 +142,8 @@ def test_moe_registers_dual_stream_dispatch(
     )
 
     assert moe._use_dual_stream
+    # the row bounds main's dual-stream dispatch reads
+    assert moe._dual_stream_decode_token_threshold == moe._dual_stream_token_threshold
     assert moe.alt_stream is stream
     assert context[prefix] is moe
 
