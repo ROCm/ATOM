@@ -2167,23 +2167,49 @@ _weight_marks: dict[str, tuple] = {}
 _weight_models: list[tuple[Any, str]] = []
 
 
-def _weight_mark(tensor: torch.Tensor) -> tuple:
-    return (
-        tensor.data_ptr(),
-        tuple(tensor.shape),
-        tensor.dtype,
-        tuple(tensor.stride()),
-        tensor._version,
-    )
+_SAMPLES = 512  # elements a tensor's content checksum reads
+
+
+def _content_sums(tensors: list[torch.Tensor]) -> list[int]:
+    """An order-sensitive checksum of a strided sample of each tensor's bytes
+    (one device-to-host copy for all of them). A re-preparation (repacking,
+    re-quantizing, padding) rewrites every element, so a sample sees it; the
+    in-place version counter cannot be used (custom ops that only read a weight
+    still bump it)."""
+    sums = []
+    for tensor in tensors:
+        flat = tensor.detach().reshape(-1)
+        n = flat.numel()
+        if n == 0:
+            sums.append(torch.zeros((), dtype=torch.int64, device=tensor.device))
+            continue
+        step = max(1, n // _SAMPLES)
+        raw = flat[::step][:_SAMPLES].contiguous().view(torch.uint8).to(torch.int64)
+        weights = torch.arange(1, raw.numel() + 1, device=raw.device, dtype=torch.int64)
+        sums.append((raw * weights).sum())
+    if not sums:
+        return []
+    return [int(v) for v in torch.stack([s.to("cpu") for s in sums]).tolist()]
 
 
 def _weights_now() -> dict[str, tuple]:
-    marks = {}
+    named = []
     for model, prefix in _weight_models:
         for name, tensor in (*model.named_parameters(), *model.named_buffers()):
             if isinstance(tensor, torch.Tensor) and tensor.device.type != "meta":
-                marks[f"{prefix}.{name}" if prefix else name] = _weight_mark(tensor)
-    return marks
+                named.append((f"{prefix}.{name}" if prefix else name, tensor))
+    unique = list({id(t): t for _, t in named}.values())  # a tied weight once
+    sums = dict(zip((id(t) for t in unique), _content_sums(unique)))
+    return {
+        name: (
+            tensor.data_ptr(),
+            tuple(tensor.shape),
+            tensor.dtype,
+            tuple(tensor.stride()),
+            sums[id(tensor)],
+        )
+        for name, tensor in named
+    }
 
 
 def freeze_weights(*models, prefixes: Iterable[str] = ()) -> int:
@@ -2219,7 +2245,7 @@ def log_route_report(stage: str) -> dict[str, Any]:
     report["weights_changed"] = changed
     if changed:
         now = _weights_now()
-        fields_ = ("storage", "shape", "dtype", "stride", "in-place writes")
+        fields_ = ("storage", "shape", "dtype", "stride", "contents")
         detail = {
             name: [
                 f
