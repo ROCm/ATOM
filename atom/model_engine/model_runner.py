@@ -2791,16 +2791,31 @@ class ModelRunner:
             ] = batch.required_channel_states
             channel_count = bs
 
+        # Each request's allocated pages for a DSpark draft that builds its
+        # block metadata on the device (`DSparkProposer._fused_meta`): the
+        # length of its block table, which is what the table staged for this
+        # step holds. Only where every request of the batch has one, in order.
+        alloc_count = None
+        alloc_buf = self.forward_vars.get("draft_alloc_pages")
+        if alloc_buf is not None:
+            tables = getattr(batch, "block_tables", None)
+            published = tables is not None and len(tables) == bs
+            if published:
+                alloc_buf.np[:bs] = [len(table) for table in tables]
+                alloc_count = bs
+            self.drafter.alloc_published = bs if published else 0
+
         # Published with the token inputs (`prepare_input_ids`).
-        publication_group.set_counts(
-            {
-                "temperatures": bs,
-                "top_ks": top_k_count,
-                "top_ps": top_p_count,
-                "required_channel_states": channel_count,
-                "logprob_request_indices": logprob_count,
-            }
-        )
+        counts = {
+            "temperatures": bs,
+            "top_ks": top_k_count,
+            "top_ps": top_p_count,
+            "required_channel_states": channel_count,
+            "logprob_request_indices": logprob_count,
+        }
+        if alloc_buf is not None:
+            counts["draft_alloc_pages"] = alloc_count
+        publication_group.set_counts(counts)
         # The draft's own inputs (its Philox key and where its q goes), staged into
         # the same publication so the upload stays a single batched H2D and is
         # covered by this forward's staging window.
