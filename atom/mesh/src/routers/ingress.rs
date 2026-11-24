@@ -641,6 +641,7 @@ pub struct IngressRouting {
     chat_controls: Arc<RwLock<HashMap<String, ChatControls>>>,
     pd: bool,
     tokenize_limits: TokenizeLimits,
+    prefill_on_decode_rank: bool,
 }
 
 impl IngressRouting {
@@ -653,6 +654,7 @@ impl IngressRouting {
             chat_controls: app.chat_controls.clone(),
             pd: app.router_config.mode.is_pd_mode(),
             tokenize_limits: app.tokenize_limits,
+            prefill_on_decode_rank: app.router_config.prefill_on_decode_rank(),
         }
     }
 
@@ -789,6 +791,7 @@ impl IngressRouting {
             )),
             policies,
         )
+        .with_prefill_on_decode_rank(self.prefill_on_decode_rank)
     }
 
     pub(crate) fn candidates(

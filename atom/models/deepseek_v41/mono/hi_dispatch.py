@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Which V4.1 forwards the hi hook serves (``ATOM_DSV41_MONO_HI``), and its installation.
 
 ``install_hi`` is ``dispatch.install_mono_decode``'s hi branch: it builds the hook (``hi_runner``) and
@@ -11,8 +12,8 @@ unless ``hi_gate.decide`` says yes.
 - ``HiDecodeModel``: the forwards the builder's routing decision gives the hook (``AttentionMetaData.served_by_round``,
   ``round.HiRound.service``) run every decoder layer on hi (``HiDecodeModel._hi_forward``); every other forward takes
   ATOM's path as before (a decode step ATOM's K1 / K2, their runner created on the first such step only) and
-  invalidates the hook's incremental import for its requests. Its head output (``compute_head``): a served verify
-  step's output ids and verdict from the head and the post-verify inside the forward, which the runner takes instead
+  invalidates the hook's incremental import for its requests. Its verify head (``HiVerifyHead``): a served verify
+  step's output ids and spec status from the head and the post-verify inside the forward, which the runner takes instead
   of the logits where they stand for the step.
 - ``HiDraftModel``: the DSpark draft's block draft on the hi path (``block_backbone``); its context-KV write on a
   served step is the target forward's (the proposer skips ATOM's on such a step).
@@ -27,6 +28,7 @@ import logging
 import torch
 from torch import nn
 
+from atom.model_ops.verify_head import VerifyHead
 from atom.models.deepseek_v41.mono import hi_runner
 from atom.models.deepseek_v41.mono import round as hi_round
 from atom.models.deepseek_v41.mono.dispatch import (
@@ -52,15 +54,21 @@ class HiDecodeModel(MonoDecodeModel):
     def __init__(
         self, model, drafter, max_model_len, index_fp4, dp_ranks, hook
     ) -> None:
-        super().__init__(model, drafter, max_model_len, index_fp4, dp_ranks)
+        # ATOM's K1 / K2 on the steps the hook does not serve, with their own
+        # output buffer; no mono LM head (the hook's verify head runs) and no
+        # draft context launch (the draft writes its own context there)
+        super().__init__(
+            model, drafter, max_model_len, index_fp4, dp_ranks, None, None,
+            draft_context=False,
+        )  # fmt: skip
         self._hi = hook
+        # the hook's in-graph verify, not ATOM's mono LM head
+        self.verify_head = HiVerifyHead(hook)
 
     def forward(self, input_ids, positions, inputs_embeds=None):
         rows = input_ids.numel()
-        supported = step_supported(input_ids, inputs_embeds, self._dp_ranks)
+        supported = step_supported(rows, inputs_embeds is not None, self._dp_ranks)
         hook = self._hi
-        # set again by a step whose post-verify ran (``compute_head``)
-        hook.verified = 0
         fwd = get_forward_context()
         metadata = fwd.attn_metadata
         if metadata is not None and metadata.served_by_round:
@@ -125,11 +133,25 @@ class HiDecodeModel(MonoDecodeModel):
         model.end_forward(hidden, None)
         return hidden.squeeze(0)
 
-    def compute_head(self, hidden_states):
-        """The head output of the forward that just ran (``ModelRunner._head_output``, recorded with a captured one):
-        on a step the hook served, its in-graph verify's output ids and verdict (``round.post_verify``); else None
-        (the runner computes the logits)."""
-        return self._hi.head_output(hidden_states.shape[0])
+
+class HiVerifyHead(VerifyHead):
+    """The hook's in-graph verify as the verify head (``round.post_verify``): on a step the hook served, its output
+    ids and spec status, a sampled row drawn within its top-p in the forward (``HiLayers.token_ids``); its ids
+    broadcast over TP as any head's."""
+
+    samples = True
+
+    def __init__(self, hook) -> None:
+        self.hook = hook
+
+    def draws_top_p(self, rows: int) -> bool:
+        return True
+
+    def sample_token_ids(self, hidden: torch.Tensor):
+        metadata = get_forward_context().attn_metadata
+        if metadata is None:  # no step laid out (a calibration's head)
+            return None
+        return self.hook.token_ids(metadata, hidden.shape[0])
 
 
 class HiDraftModel(MonoDraftModel):
@@ -160,12 +182,12 @@ class HiDraftModel(MonoDraftModel):
             return _HI_DRAFT
         return super().block_backbone(input_ids, positions, num_draft)
 
-    def head_and_sample(self, out, anchor_ids, num_draft):
+    def head_and_sample(self, out, anchor_ids, num_draft, *, greedy=False):
         if out is _HI_DRAFT:
             # a row of ids a request (``draft_run``)
             requests = self.hi.dr_requests
             return self.hi.mk_ids[:requests].view(requests, -1), None
-        return self.model.head_and_sample(out, anchor_ids, num_draft)
+        return super().head_and_sample(out, anchor_ids, num_draft, greedy=greedy)
 
 
 def _tp() -> tuple:

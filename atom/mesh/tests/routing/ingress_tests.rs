@@ -474,6 +474,77 @@ async fn lightweight_http_routing_needs_no_second_pool_submission() {
     }
 }
 
+/// The PD router's and ext-proc's planners select decode first under ATOM's idx2idx only.
+#[tokio::test]
+async fn idx2idx_planners_select_prefill_on_the_decode_rank() {
+    use crate::config::{AtomPdRankMappingPolicy, BackendType};
+    use crate::core::{
+        placement::{test_support::make_descriptor, PdPlanner, PlacementPlan},
+        DPAwareWorkerBuilder,
+    };
+    use crate::routers::http_pd_router::PDRouter;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let kv_transfer_info = Router::new().route(
+        "/kv_transfer_info",
+        get(|| async { axum::Json(json!({"tp_size": 1, "kv_role": "kv_producer"})) }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, kv_transfer_info).await });
+    let pool = PreparePoolRuntime::new(default_pool()).unwrap();
+    let descriptor = make_descriptor(Some("m"), None, None, None);
+    for (backend, decode_first) in [(BackendType::Atom, true), (BackendType::Sglang, false)] {
+        let config = crate::config::RouterConfig {
+            backend,
+            atom_pd_rank_mapping_policy: AtomPdRankMappingPolicy::Idx2Idx,
+            ..Default::default()
+        };
+        let app = Arc::new(
+            AppContext::from_config(config, 5, pool.handle())
+                .await
+                .unwrap(),
+        );
+        let prefill = WorkerType::Prefill {
+            bootstrap_port: None,
+        };
+        let workers: Vec<Arc<dyn Worker>> = [
+            (base.as_str(), 0, prefill.clone()),
+            (base.as_str(), 1, prefill),
+            ("http://d", 1, WorkerType::Decode),
+        ]
+        .into_iter()
+        .map(|(url, rank, kind)| {
+            let builder = DPAwareWorkerBuilder::new_with_type(url, rank, 2, kind);
+            Arc::new(builder.model_id("m").build()) as Arc<dyn Worker>
+        })
+        .collect();
+        for worker in &workers {
+            app.worker_registry.register(worker.clone());
+        }
+        app.policy_registry
+            .set_prefill_policy(Arc::new(crate::policies::RoundRobinPolicy::new()));
+        let policies = Arc::new(PolicyRegistryAdapter::new(app.policy_registry.clone()));
+        let ingress = IngressRouting::new(&app).planner(workers, policies);
+        let router = PDRouter::new(&app).await.unwrap();
+
+        for planner in [&ingress as &dyn PdPlanner, router.planner.as_ref()] {
+            let mut ranks = HashSet::new();
+            for _ in 0..4 {
+                match planner.plan(&descriptor).await.unwrap() {
+                    PlacementPlan::Pair { prefill, .. } => ranks.insert(prefill.dp_rank()),
+                    other => panic!("expected Pair, got {other:?}"),
+                };
+            }
+            assert_eq!(
+                ranks == HashSet::from([Some(1)]),
+                decode_first,
+                "{backend:?}"
+            );
+        }
+    }
+    server.abort();
+}
+
 #[tokio::test]
 async fn regular_cached_tokens_are_reconciled_against_the_estimate() {
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
