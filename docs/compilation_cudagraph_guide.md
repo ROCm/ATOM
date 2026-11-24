@@ -223,12 +223,17 @@ def run_model(self, input_ids):
         graph_key = request_bucket(
             context.running_bs, forward_context.attn_metadata.max_seqlen_q
         )
-        logits = self._decode_graph(graph_key)()  # ReqGraph.replay
+        self._decode_graph(graph_key)()  # ReqGraph.replay
         num_tokens = context.batch_size * max_q_len
         hidden_states = self.forward_vars["outputs"][:num_tokens]
 
-    return self.model.compute_logits(hidden_states), hidden_states
+    return hidden_states
 ```
+
+A decode graph records the forward alone: the head (a verify head's ids or
+the logits, `ModelRunner.run_lm_head`) runs after it, eagerly, on the forward's
+stream, so a model whose head is not graph-safe (a sampling launch, a head
+with its own peer buffers) still replays its forward from a graph.
 
 Key decisions:
 - **Prefill**: Always eager (variable sequence lengths make CUDA graphs impractical).
