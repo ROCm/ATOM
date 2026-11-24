@@ -29,6 +29,23 @@ def _cdiv(a: int, b: int) -> int:
     return -(-int(a) // int(b))
 
 
+def chunk_bytes(
+    blocks: int,
+    bytes_per_block: int,
+    sharded_bytes_per_block: int = 0,
+    shard_world: int = 1,
+) -> int:
+    """Bytes of an LMCache chunk of ``blocks`` blocks: every block's
+    ``bytes_per_block``, and ``sharded_bytes_per_block`` for each block a rank
+    keeps of a cache sharded ``shard_world`` ways by block id (MiniMax-M3's index
+    cache, `hybrid/m3/codec.py`). LMCache sizes a chunk by its token count
+    alone, so a chunk reserves the most any run of ``blocks`` consecutive blocks
+    holds: ``ceil(blocks / shard_world)``."""
+    return blocks * bytes_per_block + _cdiv(blocks, shard_world) * (
+        sharded_bytes_per_block
+    )
+
+
 class ATOMRawBytesLMCacheMetadata:
     """Proxy around ``LMCacheMetadata`` with ATOM raw-byte allocation shapes."""
 
@@ -38,11 +55,16 @@ class ATOMRawBytesLMCacheMetadata:
         *,
         atom_block_size: int,
         bytes_per_block: int,
+        sharded_bytes_per_block: int = 0,
+        shard_world: int = 1,
     ) -> None:
         self._atom_base_metadata = base_metadata
         self.__dict__.update(vars(base_metadata))
         self.atom_block_size = int(atom_block_size)
         self.atom_bytes_per_block = int(bytes_per_block)
+        # A chunk's share of a block-sharded cache (`chunk_bytes`).
+        self.atom_sharded_bytes_per_block = int(sharded_bytes_per_block)
+        self.atom_shard_world = int(shard_world)
         chunk_size = int(base_metadata.chunk_size)
         if self.atom_block_size <= 0:
             raise ValueError("ATOM raw-byte metadata: atom_block_size must be > 0")
@@ -63,6 +85,9 @@ class ATOMRawBytesLMCacheMetadata:
                 self._atom_base_metadata == other._atom_base_metadata
                 and self.atom_block_size == other.atom_block_size
                 and self.atom_bytes_per_block == other.atom_bytes_per_block
+                and self.atom_sharded_bytes_per_block
+                == other.atom_sharded_bytes_per_block
+                and self.atom_shard_world == other.atom_shard_world
             )
         return False
 
@@ -76,7 +101,18 @@ class ATOMRawBytesLMCacheMetadata:
         if num_tokens is None:
             num_tokens = int(self.chunk_size)
         nblocks = _cdiv(int(num_tokens), self.atom_block_size)
-        return [torch.Size((nblocks * self.atom_bytes_per_block,))]
+        return [
+            torch.Size(
+                (
+                    chunk_bytes(
+                        nblocks,
+                        self.atom_bytes_per_block,
+                        self.atom_sharded_bytes_per_block,
+                        self.atom_shard_world,
+                    ),
+                )
+            )
+        ]
 
     def get_num_groups(self) -> int:
         return 1

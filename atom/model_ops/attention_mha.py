@@ -1654,6 +1654,14 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         self.index_scale: torch.Tensor | None = None
         self.index_stage: torch.Tensor | None = None
         self.index_stage_slots: torch.Tensor | None = None
+        # ``(rank, P)`` of a sharded index cache (`minimax_m3/index_shard.py`):
+        # the planes above hold the blocks ``b % P == rank`` at ``b // P``, and
+        # the ``*_by_page`` views address them by block id for the CP decode
+        # scorers. ``(0, 1)`` and the planes themselves when it is replicated.
+        # Bound with the planes.
+        self.index_shard: tuple[int, int] = (0, 1)
+        self.index_cache_by_page: torch.Tensor | None = None
+        self.index_scale_by_page: torch.Tensor | None = None
         # The K/V format this layer's pool is built in ("nvfp4", or "" for the
         # cache dtype's own), fixed here: the metadata builder sizes and binds
         # the pool by it (`_module_kinds`), and a forward traced before the
@@ -1697,7 +1705,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         )
 
     def _fused_qkv_chain(self, x, x_scale, q, position, k_cache, v_cache, k_scale,
-                         v_scale, slot_mapping):  # fmt: skip
+                         v_scale, slot_mapping, index_slot_mapping):  # fmt: skip
         """The QKV GEMM + norm / RoPE + NVFP4 K/V and index inserts in one aiter
         launch, writing what fused_qknorm_idxrqknorm writes; (q_out, index_q), or
         None where the chain does not take the call."""
@@ -1754,7 +1762,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             _minimax_m3_cos_sin_cache(self.rotary_emb, q),
             position,
             slot_mapping,
-            slot_mapping,
+            index_slot_mapping,
             k_cache,
             v_cache,
             k_scale,
@@ -1819,12 +1827,13 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         if sparse_metadata is None:
             sparse_metadata = attn_metadata
         slot_mapping = sparse_metadata.slot_mapping
+        index_slot_mapping = self._index_slot_mapping(sparse_metadata)
         x_scale, self._fused_x_scale = self._fused_x_scale, None
         if x_scale is not None:
             # ATOM_M3_FUSED_QKV_CHAIN: `qkv` is the QKV GEMM's MXFP8 input.
             fused = self._fused_qkv_chain(
                 qkv, x_scale, q, position, k_cache, v_cache, k_scale, v_scale,
-                slot_mapping,
+                slot_mapping, index_slot_mapping,
             )  # fmt: skip
             if fused is not None:
                 q_out, index_q = fused
@@ -1874,13 +1883,13 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             fused_index_cache = self.index_cache
             fused_index_scale = self.index_scale
             fused_index_cache_dtype = "nvfp4"
-            fused_index_slot_mapping = slot_mapping
+            fused_index_slot_mapping = index_slot_mapping
         elif index_fp4:
             fused_index_cache = _step_stage(self.index_stage, num_tokens, page_dim=1)
             fused_index_slot_mapping = self.index_stage_slots[:num_tokens]
         else:
             fused_index_cache = self.index_cache
-            fused_index_slot_mapping = slot_mapping
+            fused_index_slot_mapping = index_slot_mapping
 
         if self.skip_index_topk:
             from atom.model_ops.triton_fused_qkv_norm_rope_cache import (
@@ -1970,7 +1979,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
 
             index_fp4_store(
                 self.index_stage.view(-1, self.index_head_dim),
-                slot_mapping,
+                index_slot_mapping,
                 self.index_cache,
                 self.index_scale,
             )
@@ -2005,6 +2014,19 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         if fwd_ctx.context.is_prefill:
             return self._sparse_prefill
         return self._sparse_decode
+
+    def _index_slot_mapping(self, sparse_metadata) -> torch.Tensor:
+        """Where this step's index rows go: the K/V slots, or under a sharded
+        index cache this rank's own rows at its local slots
+        (`index_shard.owned_index_slots`, built once a step)."""
+        if self.index_shard[1] == 1:
+            return sparse_metadata.slot_mapping
+        if sparse_metadata.index_slot_mapping is None:
+            raise RuntimeError(
+                "a sharded MiniMax-M3 index cache needs the step's index slot "
+                "mapping; writing at the K/V slots would run past its planes"
+            )
+        return sparse_metadata.index_slot_mapping
 
     def decode_reads_ragged_queries(self, max_qlen: int) -> bool:
         """No: the sparse decode (top-k and attention) takes one
@@ -2247,6 +2269,31 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 # exactly the head this rank would have projected alone, so the
                 # slice is an identity, not an approximation.
                 index_q = index_q[:, self.indexer_cp_rank : self.indexer_cp_rank + 1]
+            index_cache, index_scale, score_table = (
+                self.index_cache,
+                self.index_scale,
+                None,
+            )
+            if self.index_shard[1] > 1:
+                # The scorer reads every block of its requests, and this rank
+                # keeps the index of 1/P of them: gather the batch's from
+                # their owners, then score those rows through the gather's
+                # table. The same bytes at the same logical blocks, so the same
+                # top-k.
+                from atom.model_ops.minimax_m3.index_shard import (
+                    gather_index_pages,
+                )
+
+                gather = prefill_md.index_gather
+                if gather is None:
+                    raise RuntimeError(
+                        "a sharded MiniMax-M3 index cache needs the prefill's "
+                        "index gather (AiterAttentionMetadataBuilder)"
+                    )
+                index_cache, index_scale = gather_index_pages(
+                    gather, self.index_cache, self.index_scale, self.indexer_cp_group
+                )
+                score_table = gather.score_table
             # NVFP4: the attention's page-128 table instead of the page-16 one.
             emit_kw = (
                 self._nvfp4_emit_kwargs()
@@ -2256,7 +2303,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             emit = emit_kw["emit_sparse_block_table"]
             selected = minimax_m3_index_topk(
                 index_q,
-                self.index_cache,
+                index_cache,
                 block_tables,
                 cu_seqlens_q,
                 seq_lens,
@@ -2269,7 +2316,8 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 self.num_kv_heads,
                 self.scale,
                 n_valid_column_per_row=sparse_metadata.n_valid_column_per_row,
-                index_kv_scale=self.index_scale,
+                index_kv_scale=index_scale,
+                score_block_table=score_table,
                 **emit_kw,
             )
             # NVFP4 on gfx1250: the paged decode's compacted page-128 table,
@@ -2400,9 +2448,11 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             {} if pages_per_block is None else {"pages_per_block": pages_per_block}
         )
         global_blocks = block_table.shape[1]
+        # By block id: this rank's own planes under a sharded index cache,
+        # which hold every block it scores (`index_shard.page_view`).
         scores = indexer_context_scores(
             index_q,
-            self.index_cache,
+            self.index_cache_by_page,
             block_table,
             seq_lens,
             max_seq_len,
@@ -2410,7 +2460,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             self.indexer_cp_world,
             max_query_len,
             self.scale,
-            index_scale=self.index_scale,
+            index_scale=self.index_scale_by_page,
             # Both readers below stop at each row's live blocks (`_shard_winners`).
             fill_dead_slots=False,
         )

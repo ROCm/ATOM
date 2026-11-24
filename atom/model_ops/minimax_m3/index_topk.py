@@ -2178,6 +2178,7 @@ def minimax_m3_index_topk(
     n_valid_column_per_row: torch.Tensor | None = None,
     index_kv_scale: torch.Tensor | None = None,
     emit_pages_per_block: int = PAGES_PER_SPARSE_BLOCK,
+    score_block_table: torch.Tensor | None = None,
 ):
     """Index block-score + top-k selection. block_size_q == 1 (per-token).
 
@@ -2212,6 +2213,11 @@ def minimax_m3_index_topk(
     ``[total_q * num_kv_heads, topk]`` instead, the one
     ``sparse_attn_nvfp4.nvfp4_page_table`` builds. Rows past
     ``cu_seqlens_q[-1]`` are not written, as for the page-16 table.
+    ``score_block_table`` ``[batch, >= max blocks]`` int32: where the scorer
+    finds block j of request b in ``index_kv_cache`` when that is not the
+    paged cache (a sharded index cache's gathered pages,
+    `minimax_m3/index_shard.py`); the selector still emits from
+    ``block_table``. None: ``block_table``.
     """
     total_q, num_idx_heads, head_dim = idx_q.shape
     assert (
@@ -2260,6 +2266,8 @@ def minimax_m3_index_topk(
     iks = index_kv_scale if is_fp4 else index_kv_cache
     if is_fp4:
         _check_fp4_index(index_kv_cache, index_kv_scale, head_dim)
+    if score_block_table is None:
+        score_block_table = block_table
     flydsl_score = _flydsl_prefill_scorer(
         idx_q, index_kv_cache, index_kv_scale, max_query_len
     )
@@ -2272,7 +2280,7 @@ def minimax_m3_index_topk(
             index_kv_cache,
             index_kv_scale,
             score,
-            block_table,
+            score_block_table,
             cu_seqlens_q,
             seq_lens,
             prefix_lens,
@@ -2286,7 +2294,7 @@ def minimax_m3_index_topk(
             index_kv_cache,
             iks,
             score,
-            block_table,
+            score_block_table,
             cu_seqlens_q,
             seq_lens,
             prefix_lens,
@@ -2305,7 +2313,7 @@ def minimax_m3_index_topk(
             score.stride(0),
             score.stride(1),
             score.stride(2),
-            block_table.stride(0),
+            score_block_table.stride(0),
             BLOCK_SIZE_Q=score_config.block_size_q,
             BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
             STORE_GROUP=score_config.store_group,

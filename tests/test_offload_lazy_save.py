@@ -635,7 +635,7 @@ def test_a_probationary_free_ahead_of_the_protected_queue_is_looked_at(
     _finish(sched, pool, reused)
     _hold(pool, reused)  # hit again: protected from now on
     _finish(sched, pool, reused)
-    assert len(pool._cached) == 0 and len(pool._protected) == 20
+    assert len(pool._cached[0]) == 0 and len(pool._protected[0]) == 20
     # The window is the 12 coldest protected blocks; demotions store them.
     for _ in range(10):
         if not sched.has_pending_work():

@@ -69,7 +69,8 @@ def pool_state(bm):
     kv = bm.kv
     blocks = [(b.ref_count, b.hash, list(b.token_ids)) for b in kv.blocks]
     sets = [sorted(kv._used), sorted(kv._free), sorted(kv._reused)]
-    order = [list(kv._cached), list(kv._protected), bm.total_evicted_blocks]
+    order = [list(map(list, kv._cached)), list(map(list, kv._protected))]
+    order.append(bm.total_evicted_blocks)
     return [blocks, dict(kv._hash_to_block_id), sets, order]
 
 
@@ -194,7 +195,7 @@ def test_allocate_claims_the_probe_ids_unless_stale(monkeypatch, fast, stale):
     want = list(map(bm.kv.lookup, bm._prompt_hashes(seq)))
     if stale:  # republish block 3's content elsewhere between probe and allocate
         victim = bm.kv.block(want[3])
-        want[3] = bm._fresh_block()
+        want[3] = bm._fresh_block(3)
         bm.kv.publish(want[3], victim.hash, victim.token_ids)
     else:
         monkeypatch.setattr(bm.kv, "lookup", lambda h: pytest.fail("walked again"))
@@ -275,7 +276,7 @@ def test_only_a_moved_or_dropped_hash_bumps_the_index_version():
     kv.publish(block.block_id, block.hash, block.token_ids)
     published(range(100, 140), bm)
     assert kv.index_version == version
-    kv.publish(bm._fresh_block(), block.hash, block.token_ids)  # remapped
+    kv.publish(bm._fresh_block(0), block.hash, block.token_ids)  # remapped
     assert kv.index_version == version + 1
 
 
@@ -329,7 +330,7 @@ def test_the_memo_follows_only_remaps_of_what_its_walk_read(watched):
         list(range(0 if watched else 500, 540)), BLOCK, 0, 4, -1
     )
     victim = bm.kv.block(bm.kv.lookup(moved[3]))
-    fresh = bm._fresh_block()
+    fresh = bm._fresh_block(0)
     bm.kv.publish(fresh, moved[3], victim.token_ids)  # remapped, nothing evicted
     assert bm.total_evicted_blocks == 0
     walks = []

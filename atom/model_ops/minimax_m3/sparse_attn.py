@@ -71,6 +71,9 @@ class MiniMaxM3SparsePrefillMetadata:
     block_table: torch.Tensor
     max_query_len: int
     max_seq_len: int
+    # A sharded index cache: where the batch's index pages are gathered from
+    # their owners for the scorer (`index_shard.IndexGather`).
+    index_gather: object | None = None
 
 
 @dataclass
@@ -99,6 +102,9 @@ class MiniMaxM3SparseMetadata:
     `deepseek_v4_attn.csa_n_committed_per_token` hoists out for the sibling
     indexer. `index_topk` consumes it and never derives its own.
     """
+    # A sharded index cache: the step's index rows this rank writes, at its
+    # local slots, -1 for the rest (`index_shard.owned_index_slots`).
+    index_slot_mapping: torch.Tensor | None = None
 
 
 def make_sparse_prefill_metadata(

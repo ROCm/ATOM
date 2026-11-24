@@ -51,6 +51,7 @@ from atom.kv_transfer.offload.dense.connector import (
     DenseOffloadScheduler,
 )
 from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
+from atom.kv_transfer.offload.hybrid.m3.codec import M3ShardedPageCodec
 from atom.kv_transfer.offload.prehashed import (
     PrehashedSaveSchedulerMixin,
     PrehashedSaveWorkerMixin,
@@ -105,13 +106,22 @@ class M3OffloadConnector(PrehashedSaveWorkerMixin, DenseOffloadConnector):
 
         # Build the codec from the ordered region list (NOT from kv_caches), so
         # the NSA index_cache regions are included. slot_regions empty ->
-        # DSV4PageSlotCodec runs pure-PAGE (num_slots=0).
-        self._codec = DSV4PageSlotCodec(
-            page_regions=block_regions,
-            slot_regions=(),
-            num_blocks=int(page_num_blocks),
-            num_slots=0,
-            device=torch.device("cuda", torch.cuda.current_device()),
+        # DSV4PageSlotCodec runs pure-PAGE (num_slots=0). A sharded index cache
+        # (ATOM_M3_INDEX_SHARD) stores this rank's share of a chunk's index.
+        device = torch.device("cuda", torch.cuda.current_device())
+        sharded = any(region.shard_world > 1 for region in block_regions)
+        self._codec = (
+            M3ShardedPageCodec(
+                block_regions, num_blocks=int(page_num_blocks), device=device
+            )
+            if sharded
+            else DSV4PageSlotCodec(
+                page_regions=block_regions,
+                slot_regions=(),
+                num_blocks=int(page_num_blocks),
+                num_slots=0,
+                device=device,
+            )
         )
         if not self._codec.has_fused_chunk_major_staging:
             raise RuntimeError(
@@ -124,11 +134,20 @@ class M3OffloadConnector(PrehashedSaveWorkerMixin, DenseOffloadConnector):
             engine_id=f"{offcfg.lmcache_engine_id(self._config)}-{rank}",
             block_size=self.virtual_block_size,
             bytes_per_block=self._codec.bytes_per_block,
+            **(
+                {
+                    "sharded_bytes_per_block": self._codec.sharded_bytes_per_block,
+                    "shard_world": self._codec.shard_world,
+                }
+                if sharded
+                else {}
+            ),
             gpu_connector_factory=lambda cfg, meta: BlockGPUConnector(
                 self._codec,
                 self.block_size,
                 chunk_size=int(cfg.chunk_size),
                 virtual_block_size=self.virtual_block_size,
+                chunk_bytes=self._codec.chunk_bytes if sharded else None,
                 source_safe_callback=(
                     self._source_group_safe
                     if getattr(self, "_early_release", False)

@@ -242,6 +242,13 @@ class KVTransferRegion:
     # and list positions are process-local implementation details; a named role
     # makes equal-sized planes distinguishable across code versions.
     semantic_role: str | None = None
+    # A rank's share of a region sharded by block id (MiniMax-M3's index cache
+    # under `dcp_config.index_shard`): it holds block b, at unit b //
+    # shard_world, iff b % shard_world == shard_rank, and nothing of the
+    # others. Every transport of such a region moves only those blocks
+    # (`shard_units`); `Config` refuses the transports that cannot.
+    shard_rank: int = 0
+    shard_world: int = 1
 
     @staticmethod
     def unit_offset(
@@ -274,6 +281,16 @@ class KVTransferRegion:
         return self.base_addr + self.unit_offset(
             index, self.total_bytes, self.unit_bytes, self.reverse_indexed
         )
+
+    def shard_units(self, block_ids) -> tuple[list[int], list[int]]:
+        """``(positions, units)``: which of ``block_ids`` this region holds,
+        by position in the list, and their units. Every block of an unsharded
+        region, at its own id."""
+        if self.shard_world == 1:
+            return list(range(len(block_ids))), list(block_ids)
+        world, rank = self.shard_world, self.shard_rank
+        positions = [i for i, b in enumerate(block_ids) if b % world == rank]
+        return positions, [block_ids[i] // world for i in positions]
 
 
 @dataclass(frozen=True)
@@ -488,7 +505,8 @@ class KVTransferTensors:
                     f"PAGE region {name} does not divide into whole blocks: "
                     f"{region.total_bytes} B in units of {region.unit_bytes} B"
                 )
-            held = region.total_bytes // region.unit_bytes
+            # A sharded region holds a 1/shard_world share of the blocks.
+            held = region.total_bytes // region.unit_bytes * region.shard_world
             if held != num_blocks:
                 raise ValueError(
                     f"PAGE region {name} holds {held} blocks but the scheduler "

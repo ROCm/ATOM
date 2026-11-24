@@ -224,10 +224,9 @@ class BlockManager:
         assert num_blocks > 0
         self.block_size = block_size
         self.dcp_world_size = config.decode_context_parallel_size
+        dcp_config = getattr(config, "dcp_config", DCPConfig())
         # DCP KV-cache interleave granularity S (1 = token-level round-robin).
-        self.cp_kv_cache_interleave_size = getattr(
-            config, "dcp_config", DCPConfig()
-        ).interleave_size
+        self.cp_kv_cache_interleave_size = dcp_config.interleave_size
         # dcp_rank is always 0 here: BlockManager runs only on the scheduler
         # (rank 0). DCP rank is used only to compute local token counts for
         # memory reservation; the actual per-rank routing is done in the workers.
@@ -278,12 +277,16 @@ class BlockManager:
         # The compressed KV blocks. Same class the sliding window uses for its
         # own index space — hash eviction has to happen at the same moment in
         # both or a prefix hit could be honoured by one pool and not the other.
+        # Under MiniMax-M3 index sharding, logical block j takes a block of
+        # lane j % P (`_fresh_block`): the block id names its index's owner,
+        # one of the P = TP ranks (`index_shard.index_shard_world`).
         self.kv = BlockPool(
             num_blocks,
             on_evict=self._record_evicted,
             cache_policy=envs.ATOM_PREFIX_CACHE_POLICY,
             protected_ratio=envs.ATOM_PREFIX_CACHE_PROTECTED_RATIO,
             on_remap=self._note_index_change,
+            residues=config.tensor_parallel_size if dcp_config.index_shard else 1,
         )
         # Per-request cache slot pool. Used by attention types with a
         # stateful per-request buffer (GDN recurrent state, V4 compressor
@@ -342,6 +345,9 @@ class BlockManager:
                 "the only checkpoint placement."
             )
         checkpoint_spec = state_runtime.checkpoint_spec
+        if checkpoint_spec is not None and self.kv.residues > 1:
+            # Checkpoints reserve and spend PAGE units from the pool as a whole.
+            raise ValueError("PAGE-backed state checkpoints with a laned block pool")
         # Read here rather than beside `state_offload` below, because the
         # coordinator has to know at construction whether anything can carry a
         # store: without a sink it must nominate nothing, since a pin nobody
@@ -627,8 +633,10 @@ class BlockManager:
             self._event_log.append(_make_block_removed([h]))
         self._state_checkpoint_cache.unindex(h)
 
-    def _fresh_block(self) -> int:
-        """Take a block for content this step is about to compute.
+    def _fresh_block(self, position: int) -> int:
+        """Take a block for content this step is about to compute, for logical
+        block `position` of its table (it comes from lane ``position %
+        residues``, see `BlockPool`).
 
         The raise is unreachable through `Scheduler` and the checkpoint cache
         cannot make it reachable: a READY unpinned checkpoint counts as
@@ -651,9 +659,9 @@ class BlockManager:
         starts running alongside this pass's pins and the argument has to be
         redone.
         """
-        if not self._ensure_page_units(1):
+        if not self._ensure_page_units(self._span_demand(position, position + 1)):
             raise AssertionError("No PAGE unit available for a fresh KV block")
-        block_id = self.kv.pop()
+        block_id = self.kv.pop(position % self.kv.residues)
         self.kv.allocate(block_id)
         return block_id
 
@@ -684,19 +692,20 @@ class BlockManager:
         if not self.enable_prefix_caching:
             return True
         table = seq.block_table
-        n_shared = sum(
-            1
+        shared = [
+            table[i]
             for i in range(keep_blocks, len(table))
             if self.kv.block(table[i]).hash != -1
             and self.kv.block(table[i]).ref_count > 1
-        )
-        if n_shared and not self._ensure_page_units(n_shared):
+        ]
+        # A copy takes a block of the lane its position's block came from.
+        if shared and not self._ensure_page_units(self._lane_demand(shared)):
             return False
         for i in range(keep_blocks, len(table)):
             if self.kv.block(table[i]).hash == -1:
                 continue  # already-private fresh tail (or a prior disown)
             self.kv.free(table[i])
-            table[i] = self._fresh_block()
+            table[i] = self._fresh_block(i)
         return True
 
     def _checkpoint_has_room(
@@ -725,18 +734,42 @@ class BlockManager:
         )
 
     def _has_page_units(
-        self, count: int, protected_checkpoint_hash: int | None = None
+        self, demand: list[int], protected_checkpoint_hash: int | None = None
     ) -> bool:
+        """Whether the pool backs `demand`, fresh blocks per lane
+        (`_span_demand`). Checkpoints spend units of the whole pool, which has
+        one lane then."""
         if self.paged_state_checkpoints is None:
-            return self.kv.has_free(count)
+            return self.kv.has_free_per_residue(demand)
         return self.paged_state_checkpoints.has_available_units(
-            count, protected_hash=protected_checkpoint_hash
+            sum(demand), protected_hash=protected_checkpoint_hash
         )
 
-    def _ensure_page_units(self, count: int) -> bool:
+    def _ensure_page_units(self, demand: list[int]) -> bool:
         if self.paged_state_checkpoints is None:
-            return self.kv.has_free(count)
-        return self.paged_state_checkpoints.ensure_free_units(count)
+            return self.kv.has_free_per_residue(demand)
+        return self.paged_state_checkpoints.ensure_free_units(sum(demand))
+
+    def _span_demand(self, first: int, end: int, held=()) -> list[int]:
+        """Per pool lane, the free blocks logical blocks ``[first, end)`` of a
+        table take (`_fresh_block`, or a cached block a hit claims), less the
+        ``held`` block ids some sequence holds already, which a hit claims
+        without one. One lane: the plain count."""
+        lanes = self.kv.residues
+        demand = [
+            len(range(first + (lane - first) % lanes, end, lanes))
+            for lane in range(lanes)
+        ]
+        for block_id in held:
+            demand[block_id % lanes] -= 1
+        return demand
+
+    def _lane_demand(self, block_ids) -> list[int]:
+        """Per pool lane, one free block for each of ``block_ids``."""
+        demand = [0] * self.kv.residues
+        for block_id in block_ids:
+            demand[block_id % self.kv.residues] += 1
+        return demand
 
     def num_pool_blocks(self, seq_len: int) -> int:
         """KV pool blocks a `seq_len`-token sequence occupies on this rank.
@@ -1240,7 +1273,11 @@ class BlockManager:
             return -1
         if not self.enable_prefix_caching:
             if not self._has_page_units(
-                self.num_pool_blocks(len(seq)) + self.draft_lookahead_blocks(len(seq))
+                self._span_demand(
+                    0,
+                    self.num_pool_blocks(len(seq))
+                    + self.draft_lookahead_blocks(len(seq)),
+                )
             ):
                 return -1
             return 0
@@ -1278,11 +1315,9 @@ class BlockManager:
         # (shared ref); blocks we drop from the hit become fresh → counted.
         # Plus the draft round's lookahead past the prompt, which the scheduler
         # allocates right after `allocate` (`may_append(..., lookahead=)`).
-        num_new_blocks = (
-            self._n_hash_blocks(seq)
-            - self.kv.count_used(walk.ids, num_cached_blocks)
-            + self.draft_lookahead_blocks(len(seq))
-        )
+        held = self.kv.used_among(walk.ids, num_cached_blocks)
+        span = self._n_hash_blocks(seq) + self.draft_lookahead_blocks(len(seq))
+        num_new_blocks = span - len(held)
         protected_hash = (
             block_hashes[num_cached_blocks - 1] if num_cached_blocks else None
         )
@@ -1301,7 +1336,7 @@ class BlockManager:
             protected_hash=protected_hash,
         )
         self._record_checkpoint_end(seq)
-        if not self._has_page_units(num_new_blocks, protected_hash):
+        if not self._has_page_units(self._span_demand(0, span, held), protected_hash):
             return -1
         # `record_allocation` re-checks a joint against this demand instead of
         # walking the hit again.
@@ -1376,7 +1411,8 @@ class BlockManager:
         if not decision.state_from_hbm and extra == 0:
             return decision
         protected = decision.boundary_hash if decision.state_from_hbm else None
-        if self._has_page_units(num_new_blocks + extra, protected):
+        # A joint has PAGE checkpoints behind it, which spend the whole pool.
+        if self._has_page_units([num_new_blocks + extra], protected):
             return decision
         reason = (
             "partial_chunk_no_room"
@@ -1852,8 +1888,8 @@ class BlockManager:
                 seq,
                 self._state_resume_hash(seq, seq.offload_joint.boundary_hash, hit_hash),
             )
-        for _ in range(len(seq.block_table), self.num_pool_blocks(len(seq))):
-            seq.block_table.append(self._fresh_block())
+        for position in range(len(seq.block_table), self.num_pool_blocks(len(seq))):
+            seq.block_table.append(self._fresh_block(position))
         seq.num_cached_tokens = num_cached_blocks * hbs
 
         # Per-request cache: claim this seq's slot indices from the
@@ -3656,8 +3692,7 @@ class BlockManager:
         ebs = self._effective_block_size()
         reach = seq_len + max(num_new_tokens, lookahead)
         needed_blocks = (reach + ebs - 1) // ebs
-        new_blocks_needed = max(0, needed_blocks - current_blocks)
-        return self._has_page_units(new_blocks_needed)
+        return self._has_page_units(self._span_demand(current_blocks, needed_blocks))
 
     def may_append(self, seq: Sequence, num_new_tokens: int = 1, lookahead: int = 0):
         """Allocate every block this step's KV writes land in.
@@ -3686,7 +3721,7 @@ class BlockManager:
             # Decode-generated blocks: token not finalized yet (depends on
             # sampling / speculative verification), so we cannot compute a
             # correct hash here.  Just allocate the block without hashing.
-            block_table.append(self._fresh_block())
+            block_table.append(self._fresh_block(len(block_table)))
 
     def draft_writes_allocated(self, seq: Sequence) -> bool:
         """Whether `seq`'s blocks reach the end of this forward's draft round.

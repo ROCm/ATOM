@@ -421,6 +421,12 @@ def build_page_namespace(
         document["index_cache_layout"] = index_layout
     from atom.utils import envs
 
+    dcp_config = getattr(config, "dcp_config", None)
+    if dcp_config is not None and dcp_config.index_shard:
+        # A rank's chunk holds its share of the index cache: replicated and
+        # sharded tiers must never share an object (`hybrid/m3/codec.py`).
+        # Added only when set, so every other server's namespace is unchanged.
+        document["index_shard"] = "block-mod-tp"
     if envs.ATOM_M3_SPARSE_KV_NVFP4:
         # NVFP4 sparse K/V bytes at the same block size: only the env says so,
         # and an FP8 tier's chunk would load into them. Added only when set,

@@ -417,7 +417,7 @@ class TestDemotionPins:
         # Back at the head first, so the full queue demotes 0 rather than the
         # hotter 1; freed to the tail, 1 would have gone instead. Either way
         # the queue is trimmed back to its limit.
-        assert len(pool._protected) == 2 and len(pool._reused) == 2
+        assert len(pool._protected[0]) == 2 and len(pool._reused) == 2
         assert [pool.pop() for _ in range(4)] == order
 
     def test_a_pinned_block_is_held_like_a_claimed_one(self):
