@@ -1,0 +1,21 @@
+{
+  "lease": "L9ee89c",
+  "node": "pit2-p03-g27",
+  "harness_sha": "10a9446c8cd0719d137d5a07a697dafe350d0f0c",
+  "status": "interrupted_before_agentx_load; diagnostic inconclusive",
+  "protocol_probes_passed": 5,
+  "kv_transfer_bytes": 101376000,
+  "warmup_started": false,
+  "benchmark_command_written": false,
+  "normal_exit_markers_present": false,
+  "parent_process_present_at_inspection": false,
+  "matching_containers_at_inspection": [],
+  "lease_end": "idle-reclaim",
+  "lease_end_utc": "2026-11-24T15:56:39Z",
+  "monitor_last_sample_utc": "2026-11-24T15:24:59.859834Z",
+  "confirmed_storage_problem": "Shared home rejected mkdir with Disk quota exceeded; filesystem-wide free space was still available.",
+  "termination_cause": "Not proven. Own journal shows user-manager shutdown, but full system/OOM logs were unavailable; neither host rebooted.",
+  "hypothesis_result": "No conclusion about sender concurrency; workload stopped during client dependency installation, before requests that reproduce PP3 timeouts.",
+  "archive_sha256": "947149be3eac7dcd881584e5313a682127a4c5a7f8c8c2f6e7f9617fea1acc91",
+  "recovery": "Clean only regenerable client virtualenvs of archived completed task runs; preserve logs/results. Add quota-tolerant pool cleanup, foreground workload SSH ownership, exit-status supervision and control logs outside shared home."
+}

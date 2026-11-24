@@ -24,27 +24,31 @@ unset SLURM_JOB_ID SPUR_JOB_ID SPUR_TASK_OFFSET SPUR_PEER_NODES
 mkdir -p "${RUN_DIR}/bin" "${RUN_DIR}/logs"
 gpool=/share_nfs/yajizhan/gpu-pool/bin/gpool
 finish_pool_test() {
-  local rc=$? cleanup_rc=0 release_rc=0 id attempt
+  local rc=$? cleanup_rc=0 release_rc=0 log_rc=0 id attempt ids='' output=''
   trap - EXIT INT TERM HUP
-  docker ps -aq --filter "label=srtctl.job=${SRTCTL_JOB_ID}" > "${RUN_DIR}/pool-cleanup-ids.txt" || cleanup_rc=$?
+  # Quota exhaustion must not prevent the commands that free GPUs from running.
+  ids=$(docker ps -aq --filter "label=srtctl.job=${SRTCTL_JOB_ID}") || cleanup_rc=$?
+  printf '%s' "${ids}" > "${RUN_DIR}/pool-cleanup-ids.txt" || log_rc=1
   if [[ "${cleanup_rc}" == 0 ]]; then
     while IFS= read -r id; do
-      [[ -z "${id}" ]] || timeout 20 docker rm -f "${id}" >> "${RUN_DIR}/pool-cleanup.log" 2>&1 || cleanup_rc=1
-    done < "${RUN_DIR}/pool-cleanup-ids.txt"
+      [[ -z "${id}" ]] && continue
+      output=$(timeout 20 docker rm -f "${id}" 2>&1) || cleanup_rc=1
+      printf '%s\n' "${output}" >> "${RUN_DIR}/pool-cleanup.log" || log_rc=1
+    done <<< "${ids}"
   fi
-  : > "${RUN_DIR}/gpool-release.log"
+  : > "${RUN_DIR}/gpool-release.log" || log_rc=1
   # ROCm can retain VRAM briefly after the last container exits.
   for attempt in {1..13}; do
     release_rc=0
-    "${gpool}" release "${GPOOL_LEASE}" --note "M3.1 ${case_name} ATOMesh69ed5e7 workload_rc=${rc} cleanup_rc=${cleanup_rc}" \
-      >> "${RUN_DIR}/gpool-release.log" 2>&1 || release_rc=$?
+    output=$("${gpool}" release "${GPOOL_LEASE}" --note "M3.1 ${case_name} ATOMesh69ed5e7 workload_rc=${rc} cleanup_rc=${cleanup_rc}" 2>&1) || release_rc=$?
+    printf '%s\n' "${output}" >> "${RUN_DIR}/gpool-release.log" || log_rc=1
     [[ "${release_rc}" == 3 && "${attempt}" -lt 13 ]] || break
     sleep 10
   done
-  printf '%s\n' "${release_rc}" > "${RUN_DIR}/gpool-release.rc"
-  printf '%s\n' "${rc}" > "${RUN_DIR}/pool-workload.rc"
-  [[ "${cleanup_rc}" == 0 && "${release_rc}" == 0 ]] || rc=1
-  printf '%s\n' "${rc}" > "${RUN_DIR}/pool-exit.rc"
+  printf '%s\n' "${release_rc}" > "${RUN_DIR}/gpool-release.rc" || log_rc=1
+  printf '%s\n' "${rc}" > "${RUN_DIR}/pool-workload.rc" || log_rc=1
+  [[ "${cleanup_rc}" == 0 && "${release_rc}" == 0 && "${log_rc}" == 0 ]] || rc=1
+  printf '%s\n' "${rc}" > "${RUN_DIR}/pool-exit.rc" || rc=1
   exit "${rc}"
 }
 trap finish_pool_test EXIT
