@@ -389,7 +389,8 @@ def test_the_taps_are_quantized_where_they_lie_unless_the_recipe_concatenates(
         lambda taps: calls.append([tuple(t.shape) for t in taps]) or ("fp8", "scale"),
     )
     taps = [torch.full((5, 4), float(i)) for i in range(3)]
-    concat = dspark_module.DeepseekV41DSpark._concat_taps
+    draft = SimpleNamespace(_concat_taps=dspark_module.DeepseekV41DSpark._concat_taps)
+    concat = dspark_module.DeepseekV41DSpark._ctx_native.__get__(draft)
     monkeypatch.setattr(dspark_module.plugin_host, "_plan", None)
     assert concat(taps, None, 3) == ("fp8", "scale")
     assert calls == [[(3, 4)] * 3]

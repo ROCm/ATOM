@@ -329,7 +329,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
         # main_norm's own weight tensor, so loads and weight syncs reach it.
         self._build_main_norm_quant()
         self._ctx_seam = plugin_host.bind(
-            "v41.draft.ctx", self._concat_taps, capability=self._ctx_capability
+            "v41.draft.ctx", self._ctx_native, capability=self._ctx_capability
         )
 
     def _build_main_norm_quant(self):
@@ -476,12 +476,20 @@ class DeepseekV41DSpark(DSparkDraftModel):
         taps = (taps,) if isinstance(taps, torch.Tensor) else taps
         if rows is not None:
             taps = tuple(tap[rows] for tap in taps)
-        if plugin_host.dspark_options().context_taps_concat:
-            # main_proj's input as the taps' bf16 cat, which it quantizes
-            # itself: a copy and a quantize in place of the one launch.
-            taps = [tap[:running_tokens] for tap in taps]
-            return (taps[0] if len(taps) == 1 else torch.cat(taps, dim=-1)), None
         return quantize_fp8_taps([tap[:running_tokens] for tap in taps])
+
+    def _ctx_native(self, taps, rows, running_tokens):
+        """`v41.draft.ctx`'s native: `_concat_taps`, or with a recipe's
+        dspark_options.context_taps_concat main_proj's input as the taps'
+        bf16 cat, which it quantizes itself (a copy and a quantize in place
+        of the one launch)."""
+        if not plugin_host.dspark_options().context_taps_concat:
+            return self._concat_taps(taps, rows, running_tokens)
+        taps = (taps,) if isinstance(taps, torch.Tensor) else taps
+        if rows is not None:
+            taps = tuple(tap[rows] for tap in taps)
+        taps = [tap[:running_tokens] for tap in taps]
+        return (taps[0] if len(taps) == 1 else torch.cat(taps, dim=-1)), None
 
     def _ctx_capability(self, *inputs, **kwargs):
         group32 = self.mtp[0].main_proj.native_a8_group_rows == 32
