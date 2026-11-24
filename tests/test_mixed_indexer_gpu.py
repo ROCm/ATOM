@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Mixed indexer top-k vs independent forwards with real preshuffled FP8 GEMM."""
 
 from types import SimpleNamespace

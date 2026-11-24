@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 
 """Code outside the mixed path that splits a batch into prefill and decode
 rows. A mixed batch is `[prefill | decode]`; a pure batch has one kind, so the

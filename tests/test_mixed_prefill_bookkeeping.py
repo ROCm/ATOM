@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Exercise chunk settlement, batch snapshots and advancement through schedule()."""
 
 from unittest.mock import patch
