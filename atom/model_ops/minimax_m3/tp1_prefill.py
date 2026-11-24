@@ -15,12 +15,15 @@ A layer runs:
   activation and weight scales where aiter's tuned row is that kernel
   (``psc_layout``: the scale producer and the GEMM agree on it by shape);
 * o_proj's activation quant as a HIP kernel (``linear_bf16``);
-* a MoE layer's post-attention norm as one kernel: bf16 for the router and the
-  routed experts, MXFP8 for the shared expert (``norm_moe_input``);
+* a MoE layer's post-attention norm as one kernel: bf16 for the router, MXFP8
+  for the shared expert and, from aiter's 4096-row MoE bucket, MXFP4 for the
+  routed experts (``norm_moe_input``);
 * the shared expert with SwiGLU-OAI fused into its MXFP8 quant, and the routed
-  experts (``moe_ffn``). The pair (routed sum, shared output) goes to the next
+  experts (``moe_ffn``). The pair (routed rows, shared output) goes to the next
   layer, whose input norm folds it; the stage's last layer and DSpark taps fold
-  it themselves (``materialize``).
+  it themselves (``materialize``). Where aiter runs its reduce GEMM2 (from the
+  4096-row bucket, ``route_bucket``) the routed rows are its four per-route rows,
+  which the fold sums in moe_reduction's order; elsewhere, their sum.
 
 Every op is an opaque custom op: the model runs under torch.compile even with
 --enforce-eager. Kernels: aiter's ``m3_tp1_prefill`` (``norm_mx``,
@@ -52,6 +55,10 @@ _BF16 = torch.bfloat16
 _HIDDEN = 6144
 # Preshuffled scales from this M: below it the tuned rows are bmm / mxpsh kernels.
 _PSC_MIN_M = 1024
+# aiter's MoE tuning bucket (get_padded_M) from which its MiniMax-M3.1 rows run
+# the reduce GEMM2, whose per-route rows the next norm sums.
+_ROUTE_MIN_PADDED_M = 4096
+_TOPK = 4
 
 
 def kernels_available() -> bool:
@@ -254,6 +261,29 @@ linear_q = direct_register_custom_op(
 # ---------------------------------------------------------------------------
 
 
+def route_bucket(m: int) -> bool:
+    """Whether a MoE call of m rows may hand on per-route rows; the MoE op
+    records whether it did (`_ROUTE_MODE`)."""
+    from aiter.fused_moe import get_padded_M
+
+    return get_padded_M(m) >= _ROUTE_MIN_PADDED_M
+
+
+# get_padded_M(m) -> whether moe_ffn handed on route rows. A reader runs after the
+# moe_ffn whose output it takes; Inductor may move the rest, all storing the same value.
+_ROUTE_MODE: dict[int, bool] = {}
+
+
+def _routed_input(routed: torch.Tensor, m: int, h: int):
+    """``routed`` [m, 4, h] as norm_mx reads it: (whether the route rows are
+    summed first, the rows or their sum in the first m * h elements)."""
+    from aiter.fused_moe import get_padded_M
+
+    if _ROUTE_MODE.get(get_padded_M(m), False):
+        return True, routed
+    return False, routed.view(-1)[: m * h].view(m, h)
+
+
 def _norm_mxfp8(
     x: torch.Tensor,
     shared: torch.Tensor | None,
@@ -264,13 +294,17 @@ def _norm_mxfp8(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Residual add + Gemma RMSNorm + MXFP8 quant for an n_out-row weight ->
     (residual out, e4m3, e8m0). With ``shared``, ``x`` is a MoE layer's routed
-    sum and the added hidden state is ``x * 2 + shared``."""
+    rows (`moe_ffn`) and the added hidden state is ``routed * 2 + shared``."""
     m, h = residual.shape
     res_out = torch.empty_like(residual)
     xq, xs = _empty_mxfp8(m, h, residual.device)
     if m:
+        flags = _K.NORM_INPUT_MX8
+        if shared is not None:
+            routes, x = _routed_input(x, m, h)
+            flags = _K.NORM_RED4_FOLD_MX8 if routes else _K.NORM_FOLD_MX8
         _K.norm_mx(
-            _K.NORM_INPUT_MX8 if shared is None else _K.NORM_FOLD_MX8,
+            flags,
             x.contiguous(),
             shared,
             residual.contiguous(),
@@ -309,17 +343,24 @@ def _norm_moe_input(
     weight: torch.Tensor,
     eps: float,
     n_out: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
     """Residual add + Gemma RMSNorm -> (bf16 for the router and the routed
     experts, residual out, MXFP8 e4m3 and e8m0 for the shared expert's n_out-row
-    gate_up)."""
+    gate_up, and in a `route_bucket` the routed experts' MXFP4 input: aiter's
+    per-1x32 codes and row-major e8m0 scales)."""
     m, h = residual.shape
+    dev = residual.device
     normed = torch.empty_like(residual)
     res_out = torch.empty_like(residual)
-    q8, s8 = _empty_mxfp8(m, h, residual.device)
+    q8, s8 = _empty_mxfp8(m, h, dev)
+    q4 = torch.empty((m, h // 2), dtype=torch.uint8, device=dev)
+    s4 = torch.empty((m, h // 32), dtype=torch.uint8, device=dev)
     if m:
+        fp4 = route_bucket(m)
         _K.norm_mx(
-            _K.NORM_POST_BF16_MX8,
+            _K.NORM_POST_BF16_MX8_MX4 if fp4 else _K.NORM_POST_BF16_MX8,
             x.contiguous(),
             None,
             residual.contiguous(),
@@ -328,14 +369,14 @@ def _norm_moe_input(
             normed,
             q8,
             s8,
-            None,
-            None,
+            q4 if fp4 else None,
+            s4 if fp4 else None,
             eps,
             m,
             h,
             psc_layout(m, n_out, h),
         )
-    return normed, res_out, q8, s8
+    return normed, res_out, q8, s8, q4, s4
 
 
 def _norm_moe_input_fake(x, residual, weight, eps, n_out):
@@ -345,6 +386,8 @@ def _norm_moe_input_fake(x, residual, weight, eps, n_out):
         torch.empty_like(residual),
         residual.new_empty((m, h), dtype=_FP8),
         residual.new_empty((scale_rows(m), h // 32), dtype=torch.uint8),
+        residual.new_empty((m, h // 2), dtype=torch.uint8),
+        residual.new_empty((m, h // 32), dtype=torch.uint8),
     )
 
 
@@ -354,13 +397,14 @@ norm_moe_input = direct_register_custom_op(
 
 
 def _materialize(routed: torch.Tensor, shared: torch.Tensor) -> torch.Tensor:
-    """A MoE layer's hidden output ``bf16(routed * 2 + shared)`` (the stage's last
-    layer, DSpark taps)."""
-    m, h = routed.shape
-    out = torch.empty_like(routed)
+    """A MoE layer's hidden output ``bf16(routed * 2 + shared)`` from its routed
+    rows (`moe_ffn`) and shared output (the stage's last layer, DSpark taps)."""
+    m, h = shared.shape
+    out = torch.empty_like(shared)
     if m:
+        routes, routed = _routed_input(routed, m, h)
         _K.norm_mx(
-            _K.NORM_FOLD_H,
+            _K.NORM_RED4_FOLD_H if routes else _K.NORM_FOLD_H,
             routed,
             shared,
             None,
@@ -380,7 +424,7 @@ def _materialize(routed: torch.Tensor, shared: torch.Tensor) -> torch.Tensor:
 
 
 def _materialize_fake(routed, shared):
-    return torch.empty_like(routed)
+    return torch.empty_like(shared)
 
 
 materialize = direct_register_custom_op(
@@ -427,18 +471,35 @@ def _moe_ffn(
     x: torch.Tensor,
     q8: torch.Tensor,
     s8: torch.Tensor,
+    q4: torch.Tensor,
+    s4: torch.Tensor,
     router_logits: torch.Tensor,
     layer_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """One MoE layer's (routed experts' top-k sum, shared expert's output); the
-    routed scale (2) and the sum are the consumer's."""
+    """One MoE layer's (routed rows [M, 4, H], shared expert's output [M, H]):
+    the four per-route rows where the MoE records route mode for the bucket,
+    else their top-k sum in the first M * H elements. The routed scale (2) and
+    the sum are the consumer's."""
+    from aiter.fused_moe import get_padded_M
+
     moe = _module(layer_name)
+    m, h = x.shape
+    routes = torch.empty((m, _TOPK, h), dtype=_BF16, device=x.device)
     shared = mlp_forward(moe.shared_experts, q8, s8)
-    return moe.experts(hidden_states=x, router_logits=router_logits), shared
+    fp4 = route_bucket(m)
+    _ROUTE_MODE[get_padded_M(m)] = moe.experts.forward_tp1_routes(
+        x,
+        router_logits,
+        q4.view(torch.float4_e2m1fn_x2) if fp4 else None,
+        s4.view(_E8M0) if fp4 else None,
+        routes,
+        allow_routes=fp4,
+    )
+    return routes, shared
 
 
-def _moe_ffn_fake(x, q8, s8, router_logits, layer_name):
-    return torch.empty_like(x), torch.empty_like(x)
+def _moe_ffn_fake(x, q8, s8, q4, s4, router_logits, layer_name):
+    return x.new_empty((x.shape[0], _TOPK, x.shape[1])), torch.empty_like(x)
 
 
 moe_ffn = direct_register_custom_op(

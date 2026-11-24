@@ -133,13 +133,48 @@ def test_fake_impls_give_the_real_shapes():
         ((m, h), torch.bfloat16),
         ((m, h), _FP8),
         ((512, h // 32), torch.uint8),
+        ((m, h // 2), torch.uint8),
+        ((m, h // 32), torch.uint8),
     ]
-    assert T._materialize_fake(x, x).shape == (m, h)
+    routes = torch.empty(m, 4, h, dtype=torch.bfloat16, device="meta")
+    assert T._materialize_fake(routes, x).shape == (m, h)
     w = torch.empty(9856, h, dtype=_FP8, device="meta")
     assert T._linear_q_fake(xq, xs, w, None, None).shape == (m, 9856)
     assert T._linear_bf16_fake(x, w, None, None).shape == (m, 9856)
     assert T._mlp_fake(xq, xs, "x").shape == (m, h)
-    assert [t.shape for t in T._moe_ffn_fake(x, xq, xs, None, "x")] == [(m, h)] * 2
+    pair = T._moe_ffn_fake(x, xq, xs, None, None, None, "x")
+    assert [t.shape for t in pair] == [(m, 4, h), (m, h)]
+
+
+@pytest.fixture
+def padded_m(monkeypatch):
+    """aiter.fused_moe.get_padded_M (the next power of two below 32768)."""
+    import sys
+    from types import ModuleType
+
+    aiter = sys.modules.get("aiter") or ModuleType("aiter")
+    fused_moe = ModuleType("aiter.fused_moe")
+    fused_moe.get_padded_M = lambda m: min(1 << (m - 1).bit_length(), 32768)
+    monkeypatch.setitem(sys.modules, "aiter", aiter)
+    monkeypatch.setitem(sys.modules, "aiter.fused_moe", fused_moe)
+    monkeypatch.setattr(aiter, "fused_moe", fused_moe, raising=False)
+
+
+@pytest.mark.parametrize("m,routes", [(1, False), (2048, False), (2049, True)])
+def test_route_rows_start_at_the_4096_bucket(padded_m, m, routes):
+    assert T.route_bucket(m) is routes
+
+
+def test_the_route_mode_is_read_per_bucket(padded_m, monkeypatch):
+    """The norm after a MoE layer reads the mode the MoE recorded for its bucket:
+    the four route rows, or their sum in the first M * H elements."""
+    monkeypatch.setattr(T, "_ROUTE_MODE", {8192: True, 4096: False})
+    routed = torch.arange(5000 * 4 * 2, dtype=torch.float32).view(5000, 4, 2)
+    assert T._routed_input(routed, 5000, 2)[0]  # bucket 8192
+    summed, x = T._routed_input(routed, 3000, 2)  # bucket 4096
+    assert not summed and x.shape == (3000, 2)
+    assert x.data_ptr() == routed.data_ptr()
+    assert not T._routed_input(routed, 100, 2)[0]  # a bucket nothing recorded
 
 
 def _w4_index(rows: int, k: int) -> torch.Tensor:
@@ -213,8 +248,8 @@ def _fake_ops(monkeypatch, seen):
     rec("linear_bf16", lambda x, w, *_: x.new_full((x.shape[0], w.shape[0]), 1.0))
     rec("linear_q", lambda xq, xs, w, *_: xq.new_full((xq.shape[0], w.shape[0]), 1.0))
     rec("norm_mxfp8", lambda x, s, res, w, eps, n: (res + 1, res, res))
-    rec("norm_moe_input", lambda x, res, w, eps, n: (x, res + 2, x, x))
-    rec("moe_ffn", lambda x, q8, s8, logits, name: (x + 3, x + 4))
+    rec("norm_moe_input", lambda x, res, w, eps, n: (x, res + 2, x, x, x, x))
+    rec("moe_ffn", lambda x, q8, s8, q4, s4, logits, name: (x + 3, x + 4))
     rec("mlp", lambda q8, s8, name: q8 + 5)
     rec("materialize", lambda r, s: r * 2 + s)
 
@@ -358,11 +393,19 @@ def test_norms_equal_add_rmsnorm_then_quantize_fp8(dev, m):
             got = T.norm_mxfp8(x, shared, res, norm.weight, 1e-6, n_out)
             assert _bytes_equal(got[0], res_out) and _bytes_equal(got[1], q)
             assert _scales_equal(got[2], qs, m, n_out)
-    normed, res_out, q8, s8 = T.norm_moe_input(x, res, norm.weight, 1e-6, 6144)
+    normed, res_out, q8, s8, q4, s4 = T.norm_moe_input(x, res, norm.weight, 1e-6, 6144)
     norm_ref, res_ref = norm(x, res)
     q, qs = quantize_fp8(norm_ref)
     assert _bytes_equal(normed, norm_ref) and _bytes_equal(res_out, res_ref)
     assert _bytes_equal(q8, q) and _scales_equal(s8, qs, m, 6144)
+    if T.route_bucket(m):  # the routed experts' MXFP4 input, as aiter quantizes it
+        from aiter import dtypes
+        from aiter.ops.quant import per_1x32_f4_quant
+
+        q4_ref, s4_ref = per_1x32_f4_quant(
+            norm_ref, quant_dtype=dtypes.fp4x2, shuffle=False
+        )
+        assert _bytes_equal(q4, q4_ref) and _bytes_equal(s4, s4_ref)
     assert _bytes_equal(T.materialize(x, s), x * 2 + s)
 
 
@@ -452,6 +495,133 @@ def test_mlp_equals_the_generic_mlp(dev, inter, m):
         assert _bytes_equal(s.view(-1)[rows], qs.view(torch.uint8).view(-1))
 
 
+@pytest.fixture(scope="module")
+def moe_layer():
+    """A MiniMax-M3.1 MoE layer's MXFP4 experts (128 x 6144 x 3072) as
+    Mxfp4MoEMethod holds them on gfx950, its raw w2, and the method's flags."""
+    if not _gfx950_with_ops():
+        pytest.skip("needs a gfx950 GPU and aiter's m3_tp1_prefill ops")
+    from aiter import ActivationType, QuantType, dtypes
+    from aiter.ops.quant import per_1x32_f4_quant
+    from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
+
+    e, h, inter, dev = 128, 6144, 3072, "cuda"
+    g = torch.Generator(device=dev).manual_seed(0)
+
+    def quant(rows, cols):
+        q = torch.empty(e, rows, cols // 2, dtype=torch.uint8, device=dev)
+        s = torch.empty(e, rows, cols // 32, dtype=torch.uint8, device=dev)
+        for i in range(e):
+            w = torch.randn(rows, cols, generator=g, device=dev) * 0.02
+            qi, si = per_1x32_f4_quant(
+                w.to(torch.bfloat16), quant_dtype=dtypes.fp4x2, shuffle=False
+            )
+            q[i], s[i] = qi.view(torch.uint8), si.view(torch.uint8)
+        return q, s
+
+    (w13_q, w13_s), (w2_q, w2_s) = quant(2 * inter, h), quant(h, inter)
+
+    def shuffle(q, s, gate_up):
+        w = moe_shuffle_weight(
+            q.view(dtypes.fp4x2), experts_cnt=e, is_guinterleave=False, gate_up=gate_up
+        )
+        scale = moe_shuffle_scale(
+            s.view(-1, s.shape[-1]), e, is_guinterleave=False, gate_up=gate_up
+        )
+        return w, scale
+
+    w13, s13 = shuffle(w13_q, w13_s, True)
+    w2, s2 = shuffle(w2_q, w2_s, False)
+    layer = SimpleNamespace(
+        w13_weight=w13,
+        w2_weight=w2,
+        w13_weight_scale=s13,
+        w2_weight_scale=s2,
+        w13_input_scale=None,
+        w2_input_scale=None,
+        w13_bias=None,
+        w2_bias=None,
+        expert_mask=None,
+        activation=ActivationType.Swiglu,
+        swiglu_limit=7.0,
+        apply_router_weight_on_input=False,
+    )
+    method = SimpleNamespace(
+        quant_type=QuantType.per_1x32,
+        is_guinterleave=False,
+        fused_experts=None,
+        use_triton=False,
+        fp8_activations=False,
+    )
+    return SimpleNamespace(layer=layer, method=method, w2_raw=(w2_q, w2_s))
+
+
+def _routing(m, seed, two_hot):
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    ids = torch.rand(m, 128, generator=g, device="cuda").topk(4).indices.int()
+    weights = torch.rand(m, 4, generator=g, device="cuda").softmax(-1)
+    if two_hot:  # any order of a bf16 atomic sum of two values agrees
+        weights[:, 2:] = 0
+    return weights, ids
+
+
+def _routes(moe_layer, x, weights, ids, prequant):
+    from aiter import dtypes
+    from aiter.ops.quant import per_1x32_f4_quant
+
+    from atom.model_ops.moe import Mxfp4MoEMethod
+
+    m, h = x.shape
+    q4 = s4 = None
+    if prequant:
+        q4, s4 = per_1x32_f4_quant(x, quant_dtype=dtypes.fp4x2, shuffle=False)
+        s4 = s4.view(torch.float8_e8m0fnu)
+    routes = torch.full((m, 4, h), float("nan"), dtype=torch.bfloat16, device="cuda")
+    ntok = torch.tensor([m], dtype=torch.int32, device="cuda")
+    used = Mxfp4MoEMethod.apply_tp1_routes(
+        moe_layer.method, moe_layer.layer, x, q4, s4, weights, ids, ntok, routes, True
+    )
+    return used, routes
+
+
+@gpu
+@pytest.mark.parametrize("m", (1000, 3001, 5000, 8192, 16384))
+def test_moe_route_rows_fold_to_the_generic_moe_output(dev, moe_layer, m, monkeypatch):
+    """Route rows (the reduce GEMM2 in aiter's 4096+ buckets) or the summed
+    output, with and without the post norm's MXFP4 input: folded with a shared
+    output they give the generic MoE's ``routed * 2 + shared``."""
+    from aiter import ActivationType, QuantType
+    from aiter.fused_moe import fused_moe, get_padded_M
+    from aiter.ops.flydsl.moe_common import GateMode
+
+    monkeypatch.setattr(T, "_ROUTE_MODE", {})
+    lay = moe_layer.layer
+    for seed in (0, 1):
+        x, shared = _acts(m, 6144, seed, dev, 0.25), _acts(m, 6144, seed + 9, dev)
+        weights, ids = _routing(m, seed, two_hot=get_padded_M(m) < 4096)
+        want = fused_moe(
+            x,
+            lay.w13_weight,
+            lay.w2_weight,
+            weights,
+            ids,
+            expert_mask=None,
+            activation=ActivationType.Swiglu,
+            quant_type=QuantType.per_1x32,
+            w1_scale=lay.w13_weight_scale,
+            w2_scale=lay.w2_weight_scale,
+            num_local_tokens=torch.tensor([m], dtype=torch.int32, device=dev),
+            gate_mode=GateMode.SEPARATED.value,
+            swiglu_limit=7.0,
+        )
+        for prequant in (False, True):
+            used, routes = _routes(moe_layer, x, weights, ids, prequant)
+            T._ROUTE_MODE[get_padded_M(m)] = used
+            assert _bytes_equal(T.materialize(routes, shared), want * 2 + shared)
+            if used:
+                assert not torch.isnan(routes.float()).any()
+
+
 @gpu
 def test_the_ops_compile_to_the_eager_bytes(dev):
     """The fake impls under torch.compile (dynamic rows): the traced chain gives
@@ -463,7 +633,7 @@ def test_the_ops_compile_to_the_eager_bytes(dev):
     def chain(x, shared, res):
         res, xq, xs = T.norm_mxfp8(x, shared, res, norm.weight, 1e-6, 9856)
         y = T.linear_q(xq, xs, w, ws, ws_w4)[:, :h]
-        normed, res, q8, s8 = T.norm_moe_input(y, res, norm.weight, 1e-6, 6144)
+        normed, res, q8, s8, _, _ = T.norm_moe_input(y, res, norm.weight, 1e-6, 6144)
         return T.materialize(normed, res), q8, s8
 
     compiled = torch.compile(chain, dynamic=True, fullgraph=True)
