@@ -2953,6 +2953,51 @@ mod d_generate_aggregator {
         assert!(s.contains("meta_info"), "got: {s}");
     }
 
+    /// An ATOM worker's timed reply is the response with its timing keys appended to
+    /// `meta_info`, byte for byte.
+    #[tokio::test]
+    async fn test_generate_aggregator_appends_atom_s_timing_to_meta_info() {
+        use crate::routers::token_handle::token_chunk::SeqTiming;
+        let mut timed = meta();
+        timed.timing = Some(SeqTiming {
+            ttft: 0.1,
+            tpot: 0.01,
+            latency: 1.0,
+        });
+        let stream = synthetic_single_stream(vec![Ok(TokenChunk::Complete {
+            token_ids: vec![10, 20],
+            finish_reason: FinishReason::Stop,
+            matched_stop: None,
+            usage: Usage {
+                prompt_tokens: 1,
+                completion_tokens: 2,
+                total_tokens: 3,
+            },
+            logprobs: None,
+            input_logprobs: None,
+            meta: timed,
+        })]);
+        let resp = generate_aggregator::process(stream, generate_ctx()).await;
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let got: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let info = &got[0]["meta_info"];
+        let expected = serde_json::json!([{
+            "text": got[0]["text"],
+            "output_ids": [10, 20],
+            "meta_info": {
+                "id": info["id"],
+                "finish_reason": {"type": "stop"},
+                "prompt_tokens": 1,
+                "weight_version": "default",
+                "completion_tokens": 2,
+                "cached_tokens": 0,
+                "e2e_latency": info["e2e_latency"],
+                "ttft_s": 0.1, "tpot_s": 0.01, "latency_s": 1.0,
+            },
+        }]);
+        assert_eq!(body, serde_json::to_vec(&expected).unwrap());
+    }
+
     #[tokio::test]
     async fn test_generate_aggregator_propagates_engine_error() {
         use crate::routers::token_handle::engine_error::EngineError;

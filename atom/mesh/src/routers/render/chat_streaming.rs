@@ -578,8 +578,9 @@ pub(super) fn process_chunk_tokens(
     stop_decoder: &mut StopSequenceDecoder,
     token_ids: &[u32],
 ) -> (String, bool) {
-    let (pieces, stopped) = process_chunk_pieces(stop_decoder, token_ids);
-    (pieces.concat(), stopped)
+    let mut text = String::new();
+    let stopped = decode_chunk(stop_decoder, token_ids, |piece| text.push_str(&piece));
+    (text, stopped)
 }
 
 /// `process_chunk_tokens`, the text in the pieces the decoder wrote it in.
@@ -588,6 +589,16 @@ fn process_chunk_pieces(
     token_ids: &[u32],
 ) -> (Vec<String>, bool) {
     let mut pieces = Vec::new();
+    let stopped = decode_chunk(stop_decoder, token_ids, |piece| pieces.push(piece));
+    (pieces, stopped)
+}
+
+/// Decodes `token_ids`, handing each piece of text to `write`; whether a stop was hit.
+fn decode_chunk(
+    stop_decoder: &mut StopSequenceDecoder,
+    token_ids: &[u32],
+    mut write: impl FnMut(String),
+) -> bool {
     for &token_id in token_ids {
         match stop_decoder.process_token(token_id).unwrap_or_else(|e| {
             debug!(
@@ -596,16 +607,16 @@ fn process_chunk_pieces(
             );
             SequenceDecoderOutput::Held
         }) {
-            SequenceDecoderOutput::Text(t) => pieces.push(t),
+            SequenceDecoderOutput::Text(t) => write(t),
             SequenceDecoderOutput::StoppedWithText(t) => {
-                pieces.push(t);
-                return (pieces, true);
+                write(t);
+                return true;
             }
-            SequenceDecoderOutput::Stopped => return (pieces, true),
+            SequenceDecoderOutput::Stopped => return true,
             SequenceDecoderOutput::Held => {}
         }
     }
-    (pieces, false)
+    false
 }
 
 #[allow(clippy::too_many_arguments)]
