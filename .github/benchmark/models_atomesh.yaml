@@ -2329,6 +2329,396 @@ models:
             max_gen_toks: 4096
             apply_chat_template: true
 
+  # DeepSeek-V4.1-Flash AgentX curves (dispatch-only, suite=mooncake_store): one
+  # case per concurrency so every point starts from a fresh service.
+  DeepSeek-V4.1-Flash:
+    backend: atom
+    model_path: "${ATOMESH_MODEL_ROOT}/deepseek-ai/DeepSeek-V4.1-Flash/"
+    precision: FP4
+    env:
+      common:
+        MC_GID_INDEX: "1"
+        MC_DISABLE_HIP: "1"
+        MOONCAKE_DISABLE_HIP_DMABUF: "1"
+        ATOM_MOONCAKE_MATCHED_RAILS: auto
+        HSA_ENABLE_IPC_MODE_LEGACY: "1"
+        NCCL_IB_DISABLE: "0"
+        ATOM_DISABLE_MMAP: "true"
+        ATOM_MONO_ENABLE: "1"
+        ATOM_DSV41_MOE_FP8_ACTIVATIONS: "0"
+        ATOM_DSPARK_DISABLE_COMPILE: "1"
+        ATOM_USE_CUSTOM_ALL_GATHER: "0"
+        ATOM_FRONTEND_PREFIX_HASH: "1"
+        ATOM_DP_SESSION_AFFINITY: "0"
+        MORI_SHMEM_HEAP_SIZE: "17179869184"
+        ATOM_DP_MASTER_PORT: "29510"
+        ATOM_DP_BASE_PORT: "29610"
+      prefill: {}
+      decode: {}
+    server:
+      common_args:
+        trust_remote_code: true
+        kv_cache_dtype: fp8
+        block_size: 16
+        enable_prefix_caching: true
+        gpu_memory_utilization: 0.9
+        max_model_len: ""
+        max_num_seqs: 128
+        decode_max_num_seqs: 128
+        max_num_batched_tokens: 16384
+        decode_max_num_batched_tokens: 1024
+        method: dspark
+        num_speculative_tokens: 5
+        # Golden AgentX AL of the five-token DSpark draft.
+        spec_decode_acceptance_length: 3.51
+        state_checkpoint_interval_tokens: 8192
+        extra_args: '--index-cache-dtype fp4 --attn-prefill-chunk-size 16384 --tool-call-parser dsml_v41 --dspark-config {"confidence_schedule":false}'
+    suites:
+      mooncake_store:
+        - &dsv41f_pd_base
+          name: dsv41f-1p1d-dep4-dep4-mcstore-c32
+          topology: 1p1d
+          display_topology: 1P1D-DEP4-DEP4-MEGA-MCSTORE
+          pd_worker_layout: single_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [1048576]
+          osl: 1024
+          concurrency: [32]
+          router:
+            policy: cache_aware
+          env:
+            common:
+              ATOM_ENABLE_PREFILL_DELAYER: "0"
+            prefill: &dsv41f_p_env
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+              OFFLOAD_LOAD_WORKERS: "1"
+              ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS: "20"
+              ATOM_PD_EARLY_HANDOFF: "1"
+              MOONCAKE_STORE: "1"
+              # 256 GiB on NUMA1's rdma7, which no prefill rank uses (E19).
+              MOONCAKE_STORE_OWNERS: "1:256:rdma7"
+              MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: "${ATOMESH_MODEL_ROOT}/deepseek-ai/DeepSeek-V4.1-Flash"
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+            decode: &dsv41f_d_dep4_env
+              HIP_VISIBLE_DEVICES: "4,5,6,7"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+          prefill: &dsv41f_p
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,4,8,16,24,32,48,64,96,128]"
+            cudagraph_mode: FULL
+            compilation_level: 3
+            extra_args: "--enable-dp-attention --enable-expert-parallel --moe-backend mega --all2all-backend high-throughput --dp-load-balance share_cache --long-prefill-token-threshold 8192"
+          decode: &dsv41f_d_dep4
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,4,6,8,10,12,14,16,18,20,22,24,28,32,36,40,44,48,64,96,128]"
+            cudagraph_mode: FULL
+            compilation_level: 3
+            extra_args: "--enable-dp-attention --enable-expert-parallel --moe-backend mega --all2all-backend high-throughput --dp-load-balance least_requests"
+          benchmark: *agentic_1m_aiperf
+          run_eval: false
+
+        - <<: *dsv41f_pd_base
+          name: dsv41f-1p1d-dep4-dep4-mcstore-c64
+          concurrency: [64]
+
+        - <<: *dsv41f_pd_base
+          name: dsv41f-1p1d-dep4-dep4-mcstore-c128
+          concurrency: [128]
+
+        - <<: *dsv41f_pd_base
+          name: dsv41f-1p1d-dep4-dep4-mcstore-c256
+          concurrency: [256]
+
+        - &dsv41f_pd_dep4_tp4
+          <<: *dsv41f_pd_base
+          name: dsv41f-1p1d-dep4-tp4mono-mcstore-c1
+          display_topology: 1P1D-DEP4-TP4MONO-MCSTORE
+          concurrency: [1]
+          env:
+            common:
+              ATOM_ENABLE_PREFILL_DELAYER: "0"
+            prefill: *dsv41f_p_env
+            decode: &dsv41f_d_tp4_env
+              <<: *dsv41f_d_dep4_env
+              ATOM_DISABLE_MORI_EP: "1"
+          server:
+            common_args:
+              decode_max_num_seqs: 64
+          decode: &dsv41f_d_tp4
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,4,6,8,10,12,14,16,18,20,22,24,28,32,36,40,44,48,64]"
+            cudagraph_mode: FULL
+            compilation_level: 3
+            extra_args: "--moe-backend standard --all2all-backend none --gpu-memory-utilization 0.65"
+
+        - <<: *dsv41f_pd_dep4_tp4
+          name: dsv41f-1p1d-dep4-tp4mono-mcstore-c2
+          concurrency: [2]
+
+        - <<: *dsv41f_pd_dep4_tp4
+          name: dsv41f-1p1d-dep4-tp4mono-mcstore-c4
+          concurrency: [4]
+
+        - <<: *dsv41f_pd_dep4_tp4
+          name: dsv41f-1p1d-dep4-tp4mono-mcstore-c8
+          concurrency: [8]
+
+        - <<: *dsv41f_pd_dep4_tp4
+          name: dsv41f-1p1d-dep4-tp4mono-mcstore-c16
+          concurrency: [16]
+
+        - <<: *dsv41f_pd_dep4_tp4
+          name: dsv41f-1p1d-dep4-tp4mono-mcstore-c32
+          concurrency: [32]
+
+        - <<: *dsv41f_pd_dep4_tp4
+          name: dsv41f-1p1d-dep4-tp4mono-mcstore-c64
+          concurrency: [64]
+
+        - &dsv41f_4p8d_tp8
+          <<: *dsv41f_pd_base
+          name: dsv41f-4p8d-dep4-tp8mono-mcstore-c1
+          display_topology: 1P1D-DEP4-TP8MONO-MCSTORE-2N
+          pd_worker_layout: multi_node
+          concurrency: [1]
+          env:
+            common:
+              ATOM_ENABLE_PREFILL_DELAYER: "0"
+            prefill: *dsv41f_p_env
+            decode: &dsv41f_d_8gpu_tp_env
+              HIP_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
+              ATOM_DISABLE_MORI_EP: "1"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+          server:
+            common_args:
+              decode_max_num_seqs: 64
+          decode:
+            workers: 1
+            tp: 8
+            cudagraph: "[1,2,4,6,8,10,12,14,16,18,20,22,24,28,32,36,40,44,48,64]"
+            cudagraph_mode: FULL
+            compilation_level: 3
+            extra_args: "--moe-backend standard --all2all-backend none --gpu-memory-utilization 0.65"
+
+        - &dsv41f_4p8d_dep8
+          <<: *dsv41f_pd_base
+          name: dsv41f-4p8d-dep4-dep8-mcstore-c32
+          display_topology: 1P1D-DEP4-DEP8-MEGA-MCSTORE-2N
+          pd_worker_layout: multi_node
+          concurrency: [32]
+          env:
+            common:
+              ATOM_ENABLE_PREFILL_DELAYER: "0"
+            prefill: *dsv41f_p_env
+            decode: &dsv41f_d_8gpu_dep_env
+              HIP_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+          decode:
+            <<: *dsv41f_d_dep4
+            tp: 8
+
+        - <<: *dsv41f_4p8d_tp8
+          name: dsv41f-4p8d-dep4-tp8mono-mcstore-c2
+          concurrency: [2]
+
+        - <<: *dsv41f_4p8d_tp8
+          name: dsv41f-4p8d-dep4-tp8mono-mcstore-c4
+          concurrency: [4]
+
+        - <<: *dsv41f_4p8d_tp8
+          name: dsv41f-4p8d-dep4-tp8mono-mcstore-c8
+          concurrency: [8]
+
+        - <<: *dsv41f_4p8d_tp8
+          name: dsv41f-4p8d-dep4-tp8mono-mcstore-c16
+          concurrency: [16]
+
+        - <<: *dsv41f_4p8d_tp8
+          name: dsv41f-4p8d-dep4-tp8mono-mcstore-c32
+          concurrency: [32]
+
+        - <<: *dsv41f_4p8d_tp8
+          name: dsv41f-4p8d-dep4-tp8mono-mcstore-c64
+          concurrency: [64]
+
+        - <<: *dsv41f_4p8d_dep8
+          name: dsv41f-4p8d-dep4-dep8-mcstore-c64
+          concurrency: [64]
+
+        - <<: *dsv41f_4p8d_dep8
+          name: dsv41f-4p8d-dep4-dep8-mcstore-c128
+          concurrency: [128]
+
+        - <<: *dsv41f_4p8d_dep8
+          name: dsv41f-4p8d-dep4-dep8-mcstore-c256
+          concurrency: [256]
+
+        - <<: *dsv41f_4p8d_dep8
+          name: dsv41f-4p8d-dep4-dep8-mcstore-c384
+          concurrency: [384]
+
+        - &dsv41f_agg_tp4
+          name: dsv41f-agg-tp4-c1
+          topology: agg
+          display_topology: AGG-TP4
+          pd_worker_layout: single_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [1048576]
+          osl: 1024
+          concurrency: [1]
+          router:
+            policy: cache_aware
+          prefill: {}
+          server:
+            common_args:
+              # DSpark's block-drafter warmup needs two sequences.
+              max_num_seqs: 2
+              decode_max_num_seqs: 2
+              decode_max_num_batched_tokens: 16384
+          env:
+            decode: &dsv41f_agg_tp4_env
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+              ATOM_NUMA_BIND: "0"
+              ATOM_ENABLE_PREFILL_DELAYER: "1"
+              ATOM_PREFILL_DECODE_INTERVAL: "1000000"
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2]"
+            cudagraph_mode: FULL
+            compilation_level: 3
+            extra_args: ""
+          benchmark: *agentic_1m_aiperf
+          run_eval: false
+
+        - <<: *dsv41f_agg_tp4
+          name: dsv41f-agg-tp4-c2
+          concurrency: [2]
+          server:
+            common_args:
+              max_num_seqs: 128
+              decode_max_num_seqs: 128
+              decode_max_num_batched_tokens: 16384
+          env:
+            decode:
+              <<: *dsv41f_agg_tp4_env
+              ATOM_PREFILL_DECODE_INTERVAL: "192"
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,4,6,8,10,12,14,16,18,20,22,24,28,32,36,40,44,48,64,96,128]"
+            cudagraph_mode: FULL
+            compilation_level: 3
+            extra_args: ""
+
+        - <<: *dsv41f_agg_tp4
+          name: dsv41f-agg-tp4-c4
+          concurrency: [4]
+          server:
+            common_args:
+              max_num_seqs: 128
+              decode_max_num_seqs: 128
+              decode_max_num_batched_tokens: 16384
+          env:
+            decode:
+              <<: *dsv41f_agg_tp4_env
+              ATOM_PREFILL_DECODE_INTERVAL: "192"
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,4,6,8,10,12,14,16,18,20,22,24,28,32,36,40,44,48,64,96,128]"
+            cudagraph_mode: FULL
+            compilation_level: 3
+            extra_args: ""
+
+        - <<: *dsv41f_agg_tp4
+          name: dsv41f-agg-tp4-c8
+          concurrency: [8]
+          server:
+            common_args:
+              max_num_seqs: 128
+              decode_max_num_seqs: 128
+              decode_max_num_batched_tokens: 16384
+          env:
+            decode:
+              <<: *dsv41f_agg_tp4_env
+              ATOM_PREFILL_DECODE_INTERVAL: "192"
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,4,6,8,10,12,14,16,18,20,22,24,28,32,36,40,44,48,64,96,128]"
+            cudagraph_mode: FULL
+            compilation_level: 3
+            extra_args: ""
+
+        - <<: *dsv41f_agg_tp4
+          name: dsv41f-agg-tp4-c16
+          concurrency: [16]
+          server:
+            common_args:
+              max_num_seqs: 128
+              decode_max_num_seqs: 128
+              decode_max_num_batched_tokens: 16384
+          env:
+            decode:
+              <<: *dsv41f_agg_tp4_env
+              ATOM_PREFILL_DECODE_INTERVAL: "96"
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,4,6,8,10,12,14,16,18,20,22,24,28,32,36,40,44,48,64,96,128]"
+            cudagraph_mode: FULL
+            compilation_level: 3
+            extra_args: ""
+
+        - <<: *dsv41f_agg_tp4
+          name: dsv41f-agg-tp4-c32
+          concurrency: [32]
+          server:
+            common_args:
+              max_num_seqs: 128
+              decode_max_num_seqs: 128
+              decode_max_num_batched_tokens: 16384
+          env:
+            decode:
+              <<: *dsv41f_agg_tp4_env
+              ATOM_PREFILL_DECODE_INTERVAL: "16"
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,4,6,8,10,12,14,16,18,20,22,24,28,32,36,40,44,48,64,96,128]"
+            cudagraph_mode: FULL
+            compilation_level: 3
+            extra_args: ""
+
+        - <<: *dsv41f_agg_tp4
+          name: dsv41f-agg-tp4-c64
+          concurrency: [64]
+          server:
+            common_args:
+              max_num_seqs: 128
+              decode_max_num_seqs: 128
+              decode_max_num_batched_tokens: 16384
+          env:
+            decode:
+              <<: *dsv41f_agg_tp4_env
+              ATOM_PREFILL_DECODE_INTERVAL: "10"
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,4,6,8,10,12,14,16,18,20,22,24,28,32,36,40,44,48,64,96,128]"
+            cudagraph_mode: FULL
+            compilation_level: 3
+            extra_args: ""
+
+
   # Bring-up model for the MoRI IO PD KV path. Text-only, ships a real
   # tokenizer.json so the router can register one, and its FP8 weights keep
   # quantization out of the picture -- but the KV path under test is the same
