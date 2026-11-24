@@ -4963,7 +4963,7 @@ mod h_atom_native_tool_calls {
     }
 
     /// An ATOM reply's text streams as it reads unary: prose quoting `<tool_call>`
-    /// before a bare call stays text.
+    /// before a bare call, and a last tag no call followed, stay text.
     #[tokio::test]
     async fn an_atom_reply_s_text_streams_as_it_reads_unary() {
         let reply = "Use <tool_call> as the wrapper. \
@@ -4971,6 +4971,10 @@ mod h_atom_native_tool_calls {
         let prose = "Use <tool_call> as the wrapper. ".to_string();
         let call = (prose, "get_weather".to_string());
         assert_eq!(read_qwen_xml(reply, true).await, [call.clone(), call]);
+        for reply in ["The prefix is <fun", "Cut: <tool_call><function=get_wea"] {
+            let text = (reply.to_string(), String::new());
+            assert_eq!(read_qwen_xml(reply, true).await, [text.clone(), text]);
+        }
     }
 
     /// A MiniMax-M3 call cut off inside a parameter keeps its value, as ATOM's HTTP

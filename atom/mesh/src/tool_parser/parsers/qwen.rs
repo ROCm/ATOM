@@ -657,6 +657,20 @@ mod coder {
             Some(closers)
         }
 
+        fn end_of_input_text(&mut self) -> String {
+            if self.in_tool_call && self.current_tool_name_sent {
+                return String::new();
+            }
+            let opener = match self.in_tool_call && !self.bare_call {
+                true => self.tool_call_start_token,
+                false => "",
+            };
+            let text = format!("{opener}{}", self.buffer);
+            self.buffer.clear();
+            self.reset_streaming_state();
+            text
+        }
+
         /// ATOM's HTTP parser reads a bare `<function=...>` call as a call; SGLang's and
         /// vLLM's return it as text.
         fn read_as_atom(&mut self) {
@@ -810,8 +824,27 @@ mod coder {
             }
             let calls = read.iter().flat_map(|result| &result.calls);
             let calls = calls.filter(|call| call.name.is_some()).count();
-            let text: String = read.iter().map(|result| &*result.normal_text).collect();
+            let mut text: String = read.iter().map(|result| &*result.normal_text).collect();
+            text.push_str(&parser.end_of_input_text());
             (text, calls)
+        }
+
+        /// Text a parser holds at end of input as a call's possible start, and that never
+        /// became one, is text.
+        #[tokio::test]
+        async fn a_held_opener_no_call_followed_is_text_at_end_of_input() {
+            for reply in [
+                "The prefix is <fun",
+                "The prefix is <tool_c",
+                "Cut: <function=get_wea",
+                "Cut: <tool_call><function=get_wea",
+                "Quote: <tool_call>\n",
+            ] {
+                for size in 1..=5 {
+                    let read = stream(reply, size).await;
+                    assert_eq!(read, (reply.to_string(), 0), "{size}-byte pieces");
+                }
+            }
         }
 
         #[test]
