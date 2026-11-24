@@ -185,7 +185,9 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
         let mut result = registry.load(&id, &name, &source, &loader).await;
         // Template precedence: a template file > a worker's inline template > none. Loaded
         // before with a lower one, or another worker's: load again.
-        if let Ok(LoadOutcome::AlreadyExists { id: loaded }) = &result {
+        // A strict registration (fail_on_duplicate) replaces nothing: it fails below.
+        let reconciles = !config.fail_on_duplicate;
+        if let (true, Ok(LoadOutcome::AlreadyExists { id: loaded })) = (reconciles, &result) {
             let recorded = app_context
                 .tokenizer_inline_templates
                 .read()
@@ -612,6 +614,42 @@ mod tests {
         assert!(context.tokenizer_inline_templates.read().is_empty());
     }
 
+    /// A strict registration of a loaded model fails and leaves its tokenizer, even with
+    /// another template.
+    #[tokio::test]
+    async fn test_a_strict_registration_with_another_template_replaces_nothing() {
+        let context = app_context();
+        let register = |template: &str, strict: bool| {
+            let config = TokenizerConfigRequest {
+                id: TokenizerRegistry::generate_id(),
+                name: "m".to_string(),
+                source: hf_tokenizer_path().to_string(),
+                chat_template_path: None,
+                inline_chat_template: Some(template.to_string()),
+                cache_config: None,
+                fail_on_duplicate: strict,
+            };
+            let data = create_tokenizer_workflow_data(config, context.clone());
+            async move {
+                let mut workflow = WorkflowContext::new(WorkflowInstanceId::new(), data);
+                LoadTokenizerStep.execute(&mut workflow).await
+            }
+        };
+        register("first", false).await.unwrap();
+        let loaded = context.tokenizer_registry.get_by_name("m").unwrap().id;
+        assert!(register("second", true).await.is_err());
+        assert_eq!(
+            context.tokenizer_registry.get_by_name("m").unwrap().id,
+            loaded
+        );
+        let recorded = context
+            .tokenizer_inline_templates
+            .read()
+            .get(&loaded)
+            .cloned();
+        assert_eq!(recorded.as_deref(), Some("first"));
+    }
+
     /// Overlapping registrations with other templates replace the tokenizer one at a
     /// time: each loads its own (none reads "already exists"), and one stays.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -625,7 +663,7 @@ mod tests {
                 chat_template_path: None,
                 inline_chat_template: Some(template),
                 cache_config: None,
-                fail_on_duplicate: true,
+                fail_on_duplicate: false,
             };
             let data = create_tokenizer_workflow_data(config, context.clone());
             tokio::spawn(async move {
