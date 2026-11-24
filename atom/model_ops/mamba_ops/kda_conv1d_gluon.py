@@ -13,10 +13,44 @@ partial sum before the TDM wait; generated code overlaps history/weight products
 with the transfer, while additions may follow the wait. Five convolution steps
 are unrolled. This overlap is not a steady multistage token pipeline.
 Read/write state slots may differ, and writes preserve the unused state tail.
+
+Metadata is read as one uniform scalar-memory group before pad/empty filtering.
+The host must provide contiguous int32 query bounds with at least batch + 1
+entries and accepted-token counts with at least batch entries. Both int32 slot
+index arrays must cover batch entries with the same positive stride. Metadata
+storage must also cover padded and empty requests; their values never drive
+input, state, or output accesses after the inactive-request check.
 """
 
 import triton.experimental.gluon.language as gl
 from triton.experimental import gluon
+
+
+@gluon.jit
+def _load_metadata_smem_group(in_slot_ptr, bounds_ptr, accepted_ptr, out_slot_ptr):
+    # All pointers are uniform, valid global addresses. Complete every scalar
+    # read inside this block so LLVM cannot reuse a source/output register while
+    # its memory operation is pending. Early-clobber outputs stay disjoint from
+    # all input pointer pairs. The memory clobber describes hidden memory reads.
+    return gl.inline_asm_elementwise(
+        asm="""
+        s_load_b32 $0, $4, 0x0
+        s_load_b64 $1, $5, 0x0
+        s_load_b32 $2, $6, 0x0
+        s_load_b32 $3, $7, 0x0
+        s_wait_kmcnt 0x0
+        """,
+        constraints="=&s,=&s,=&s,=&s,s,s,s,s,~{memory}",
+        args=(
+            in_slot_ptr.to(gl.uint64),
+            bounds_ptr.to(gl.uint64),
+            accepted_ptr.to(gl.uint64),
+            out_slot_ptr.to(gl.uint64),
+        ),
+        dtype=(gl.int32, gl.int64, gl.int32, gl.int32),
+        is_pure=False,
+        pack=1,
+    )
 
 
 @gluon.jit
@@ -85,24 +119,36 @@ def kda_conv1d_gluon_tdm_kernel(
         return
     state_init = 0
     state_last = 0
-    in_slot = gl.load(
-        conv_state_indices_in_ptr + idx_seq * stride_state_indices + state_init
-    ).to(gl.int64)
-    if USE_PAD_SLOT:  # noqa: SIM102 - specialize before the runtime slot check
-        if in_slot == pad_slot_id:
-            return
-    start = gl.load(query_start_loc_ptr + idx_seq).to(gl.int64)
-    end = gl.load(query_start_loc_ptr + idx_seq + 1).to(gl.int64)
-    actual_t = end - start
+    raw_in_slot, raw_bounds, early_accepted_tokens, early_out_slot = (
+        _load_metadata_smem_group(
+            conv_state_indices_in_ptr + idx_seq * stride_state_indices + state_init,
+            query_start_loc_ptr + idx_seq,
+            num_accepted_tokens_ptr + idx_seq,
+            conv_state_indices_ptr + idx_seq * stride_state_indices + state_last,
+        )
+    )
+    in_slot = raw_in_slot.to(gl.int64)
+    # Each half is a signed int32 before extension, matching the original
+    # independent loads even when a bound has its high bit set.
+    start = raw_bounds.to(gl.int32).to(gl.int64)
+    end = (raw_bounds >> 32).to(gl.int32).to(gl.int64)
     total_tokens = gl.load(query_start_loc_ptr + batch).to(gl.int64)
+    actual_t = end - start
     q_base = start * stride_q_seq
     k_base = start * stride_k_seq
     v_base = start * stride_v_seq
     q_t_stride = stride_q_seq
     k_t_stride = stride_k_seq
     v_t_stride = stride_v_seq
-    if actual_t == 0:
+    inactive = actual_t == 0
+    if USE_PAD_SLOT:
+        # Bitwise OR evaluates both predicates; neither load is made
+        # control-dependent on the other predicate at the source level.
+        inactive = inactive | (in_slot == pad_slot_id)
+    if inactive:
         return
+    accepted_offset = early_accepted_tokens.to(gl.int64) - 1
+    out_slot = early_out_slot.to(gl.int64)
     layout: gl.constexpr = gl.BlockedLayout([2], [32], [gl.num_warps()], [0])
     row_layout: gl.constexpr = gl.BlockedLayout(
         [1, 2], [1, 32], [1, gl.num_warps()], [1, 0]
@@ -127,7 +173,6 @@ def kda_conv1d_gluon_tdm_kernel(
         set_bounds=[actual_t.to(gl.int32), dim - channel_base],
     )
     gl.amd.cdna5.tdm.async_load(desc, dest=x_buf, warp_used_hint=1)
-    accepted_offset = gl.load(num_accepted_tokens_ptr + idx_seq).to(gl.int64) - 1
     history_base = (
         conv_state_ptr
         + in_slot * stride_conv_state_seq
@@ -166,9 +211,6 @@ def kda_conv1d_gluon_tdm_kernel(
     w2 = gl.convert_layout(w2, layout)
     w3 = gl.convert_layout(w3, layout)
     bias = gl.full((BLOCK_N,), 0, gl.float32, layout)
-    out_slot = gl.load(
-        conv_state_indices_ptr + idx_seq * stride_state_indices + state_last
-    ).to(gl.int64)
     state_desc = gl.amd.cdna5.buffer.make_buffer_descriptor(
         conv_state_ptr + out_slot * stride_conv_state_seq,
         ((seqlen + 1) * stride_conv_state_tok + dim * stride_conv_state_dim) * 2,
