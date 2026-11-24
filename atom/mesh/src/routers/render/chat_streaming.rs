@@ -3,7 +3,7 @@
 
 use std::{io, sync::Arc, time::Instant};
 
-use super::chat_aggregator::RELEASE;
+use super::chat_aggregator::{cut_off_call_closers, RELEASE};
 use axum::{body::Body, http::StatusCode, response::Response};
 use bytes::Bytes;
 use futures::StreamExt;
@@ -158,6 +158,8 @@ async fn run_chat_stream(
 
     let mut reasoning_parser: Option<Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>> = None;
     let mut tool_parser: Option<Arc<tokio::sync::Mutex<Box<dyn ToolParser>>>> = None;
+    // What an ATOM reply fed the tool parser, to close a native call it was cut off in.
+    let mut tool_text = String::new();
     let mut sse_buffer = Vec::with_capacity(512);
 
     let mut consumed = 0;
@@ -266,6 +268,9 @@ async fn run_chat_stream(
                             history_tool_calls_count,
                         )
                     } else {
+                        if ctx.reads_as_atom {
+                            tool_text.push_str(&delta);
+                        }
                         process_tool_calls_stream(
                             &delta,
                             &mut tool_parser,
@@ -359,6 +364,29 @@ async fn run_chat_stream(
         }
     }
 
+    if let (Some(_), Some(tools)) = (&tool_parser, tools.as_ref()) {
+        if let Some(closers) = cut_off_call_closers(&tool_text, tools) {
+            let chunks = process_tool_calls_stream(
+                &closers,
+                &mut tool_parser,
+                &mut has_tool_call,
+                tools,
+                ctx.tool_parser_factory.as_ref(),
+                ctx.configured_tool_parser.as_deref(),
+                request_id,
+                model,
+                created,
+                system_fingerprint.as_deref(),
+                history_tool_calls_count,
+                used_json_schema,
+            )
+            .await;
+            for c in chunks {
+                format_sse_chunk_into(&mut sse_buffer, &c, null_usage);
+                send_bytes(tx, &sse_buffer, "cut-off tool call")?;
+            }
+        }
+    }
     if let Some(parser) = &tool_parser {
         let guard = parser.lock().await;
         if let Some(unstreamed) = guard.get_unstreamed_tool_args() {

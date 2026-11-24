@@ -279,15 +279,35 @@ async fn process_choice(
             );
         } else if tool_available {
             if let Some(factory) = tool_parser_factory {
-                (tool_calls, processed_text) = parse_tool_calls(
-                    factory,
-                    configured_tool_parser,
-                    &processed_text,
-                    chat_request.tools.as_deref().unwrap_or_default(),
-                    &chat_request.model,
-                    history_tool_calls_count,
-                )
-                .await;
+                let tools = chat_request.tools.as_deref().unwrap_or_default();
+                // An ATOM reply cut off inside a native call is read with the call closed.
+                let closed = reads_as_atom
+                    .then(|| cut_off_call_closers(&processed_text, tools))
+                    .flatten()
+                    .map(|closers| format!("{processed_text}{closers}"));
+                let parse = |text: String| {
+                    let model = &chat_request.model;
+                    async move {
+                        let parsed = parse_tool_calls(
+                            factory,
+                            configured_tool_parser,
+                            &text,
+                            tools,
+                            model,
+                            history_tool_calls_count,
+                        )
+                        .await;
+                        parsed
+                    }
+                };
+                let mut parsed = None;
+                if let Some(closed) = closed {
+                    parsed = Some(parse(closed).await).filter(|(calls, _)| calls.is_some());
+                }
+                (tool_calls, processed_text) = match parsed {
+                    Some(parsed) => parsed,
+                    None => parse(std::mem::take(&mut processed_text)).await,
+                };
             }
         }
     }
@@ -376,6 +396,35 @@ async fn split_reasoning(
     // Byte for byte what the model wrote minus the delimiters, as ATOM's HTTP chat
     // splits it, and as the streamed reply carries it.
     Ok(ParserResult::new(normal, reasoning))
+}
+
+/// The markup that closes a native `<function=NAME>` call `text` was cut off in, when
+/// it is one, as ATOM's HTTP parser reads such a call (`_is_truncated_call`): NAME is
+/// a declared tool and what follows it is still call syntax, not prose.
+pub(super) fn cut_off_call_closers(text: &str, tools: &[Tool]) -> Option<String> {
+    let start = text.rfind("<function=")?;
+    let call = &text[start + "<function=".len()..];
+    if call.contains("</function>") {
+        return None;
+    }
+    let (name, rest) = call.split_once('>')?;
+    let name = name.trim();
+    if !tools.iter().any(|tool| tool.function.name == name) {
+        return None;
+    }
+    let rest = rest.trim_start();
+    if !(rest.is_empty() || rest.starts_with("<parameter=") || "<parameter=".starts_with(rest)) {
+        return None;
+    }
+    let mut closers = String::new();
+    if rest.rfind("<parameter=") > rest.rfind("</parameter>") {
+        closers.push_str("</parameter>");
+    }
+    closers.push_str("</function>");
+    if text[..start].rfind("<tool_call>") > text[..start].rfind("</tool_call>") {
+        closers.push_str("</tool_call>");
+    }
+    Some(closers)
 }
 
 async fn parse_tool_calls(
