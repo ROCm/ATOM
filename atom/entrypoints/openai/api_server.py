@@ -753,42 +753,30 @@ def _has_multimodal_content(messages: list[Any]) -> bool:
     )
 
 
-def load_multimodal_processor(config, tokenizer, custom_message_encoder):
-    """The processor that turns a chat with images into the engine's input."""
-    processor = get_native_multimodal_processor(
-        config, tokenizer, custom_message_encoder
-    )
-    if processor is None:
-        # The checkpoint path: model_name may be --served-model-name.
-        processor = AutoProcessor.from_pretrained(config.model, trust_remote_code=True)
-        # A checkpoint that ships its template for the tokenizer only
-        # (MiniMax-M3.1) renders with the server's, --chat-template included.
-        if processor.chat_template is None:
-            processor.chat_template = tokenizer.chat_template
-    return processor
-
-
 def _get_multimodal_processor():
     global processor
     if processor is None:
         logger.info(f"Loading multimodal processor from {model_name}...")
-        processor = load_multimodal_processor(
+        processor = get_native_multimodal_processor(
             _get_engine_config(), tokenizer, custom_message_encoder
         )
+        if processor is None:
+            # The checkpoint path: model_name may be --served-model-name.
+            processor = AutoProcessor.from_pretrained(
+                _get_engine_config().model, trust_remote_code=True
+            )
+            # A checkpoint that ships its template for the tokenizer only
+            # (MiniMax-M3.1) renders with the server's, --chat-template included.
+            if processor.chat_template is None:
+                processor.chat_template = tokenizer.chat_template
     return processor
 
 
-def prepare_chat_multimodal_inputs(
-    config,
-    processor,
+def _prepare_multimodal_inputs(
     messages: list[Any],
     chat_template_kwargs: dict[str, Any],
     tools: Any = None,
-    *,
-    preserve_tool_call_arguments: bool,
 ) -> tuple[list[int], dict[str, Any]]:
-    """The prompt token ids and multimodal data for ``messages``, whose image
-    parts ``check_chat_images`` has checked. Blocking: it fetches the images."""
     # The images arrive decoded: the processor's media loader reads any
     # source it is given, server paths included.
     conversation, media = parse_chat_messages(
@@ -805,27 +793,12 @@ def prepare_chat_multimodal_inputs(
         )
     )
     return prepare_multimodal_inputs(
-        config,
-        processor,
+        _get_engine_config(),
+        _get_multimodal_processor(),
         conversation,
         media,
         chat_template_kwargs,
         tools=tools,
-    )
-
-
-def _prepare_multimodal_inputs(
-    messages: list[Any],
-    chat_template_kwargs: dict[str, Any],
-    tools: Any = None,
-) -> tuple[list[int], dict[str, Any]]:
-    return prepare_chat_multimodal_inputs(
-        _get_engine_config(),
-        _get_multimodal_processor(),
-        messages,
-        chat_template_kwargs,
-        tools,
-        preserve_tool_call_arguments=preserve_tool_call_arguments,
     )
 
 
