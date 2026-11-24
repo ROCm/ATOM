@@ -2,7 +2,7 @@
 """CPU tests for per-rail registration ownership and concurrent first use."""
 
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
+from threading import Barrier, Event
 from unittest.mock import Mock, call
 
 import pytest
@@ -82,6 +82,63 @@ def test_concurrent_first_use_registers_one_engine_per_rail(pool_fixture):
         assert selected[0].regions == [(1024, 64), (2048, 128), (3072, 256)]
     assert pool.get("ionic_2") is primary
     assert not primary.regions  # The connector already registered this engine.
+
+
+def test_a_built_rail_is_returned_while_another_rail_builds():
+    # Registering every chunk on a new engine takes about a minute, and a
+    # request on a rail that has its engine must not wait for that.
+    building, finish = Event(), Event()
+
+    class SlowEngine(FakeEngine):
+        def register_memory(self, ptr, size):
+            if self.device == "ionic_6":
+                building.set()
+                assert finish.wait(timeout=10)
+            return super().register_memory(ptr, size)
+
+    pool = RailEnginePool(
+        SlowEngine,
+        FakeEngine(),
+        "ionic_2",
+        ["ionic_2", "ionic_4", "ionic_6"],
+        lambda device: "127.0.0.1",
+    )
+    pool.set_regions([1024], [64])
+    built = pool.get("ionic_4")
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        slow = executor.submit(pool.get, "ionic_6")
+        assert building.wait(timeout=10)
+        try:
+            assert executor.submit(pool.get, "ionic_4").result(timeout=5) is built
+            assert pool.needs_build("ionic_6")
+        finally:
+            finish.set()
+        assert slow.result(timeout=10).device == "ionic_6"
+    assert not pool.needs_build("ionic_6")
+
+
+def test_only_a_configured_rail_without_an_engine_needs_a_build(pool_fixture):
+    pool, _, created = pool_fixture
+    assert pool.needs_build("ionic_4") and pool.needs_build("ionic_6")
+    pool.get("ionic_4")
+    for device in ("ionic_2", "ionic_4", None, "", "ionic_0", ["ionic_6"]):
+        assert not pool.needs_build(device)
+    assert len(created) == 1
+
+    failed = FakeEngine()
+    failed.init_result = -1
+    pool = RailEnginePool(
+        lambda: failed,
+        FakeEngine(),
+        "ionic_2",
+        ["ionic_2", "ionic_6"],
+        lambda device: "127.0.0.1",
+    )
+    pool.set_regions([1024], [64])
+    with pytest.raises(RuntimeError, match="initialize"):
+        pool.get("ionic_6")
+    # A failed rail answers at once: get raises without building again.
+    assert not pool.needs_build("ionic_6")
 
 
 @pytest.mark.parametrize(

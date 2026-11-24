@@ -142,7 +142,9 @@ PREFILL_LOOKUP_TIMEOUT = 60
 PREFILL_LOOKUP_POLL_INTERVAL = 0.01
 # A producer stage starts no RDMA write for a request this long after its write
 # listener received a legacy request, or a chunked send worker started it.
-# Chunked admission waits do not consume this window.
+# Chunked admission waits do not consume this window, nor does building the
+# engine of a matched rail that has none yet: a legacy request that needs one
+# opens its window once it is built (_transfer_once_rail_built).
 PD_TRANSFER_DEADLINE_S = 120.0
 # Added to a producer's write window (see _write_window_s) for the 1 ns per
 # byte Mooncake adds to a sync write's timeout, up to 60 GB per batch.
@@ -1393,6 +1395,16 @@ class MooncakeConnector(KVConnectorBase):
                 initializer=torch.cuda.set_device,
                 initargs=(self._cuda_device,),
             )
+            if self._rail_pool is not None:
+                # Builds the rails that legacy write requests find without an
+                # engine, so a build holds no send worker
+                # (_transfer_once_rail_built).
+                self._rail_builder = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="mooncake-rail-build",
+                    initializer=torch.cuda.set_device,
+                    initargs=(self._cuda_device,),
+                )
         else:
             # Consumer: write requests queue here and one daemon worker posts
             # them, in issue order, once the device has drained
@@ -2492,12 +2504,16 @@ class MooncakeConnector(KVConnectorBase):
 
                     elif msg_type == MSG_WRITE_REQUEST:
                         request_data = msgpack.loads(parts[2])
-                        if not request_data.get("chunked_transfer"):
-                            request_data["_deadline"] = (
-                                time.monotonic() + PD_TRANSFER_DEADLINE_S
+                        chunked = request_data.get("chunked_transfer")
+                        awaits_rail = (
+                            not chunked
+                            and self._rail_pool is not None
+                            and self._rail_pool.needs_build(
+                                request_data.get("consumer_ib_device")
                             )
-                            if request_data.get("write_ack"):
-                                self._ack_write_request(request_data)
+                        )
+                        if not chunked and not awaits_rail:
+                            self._start_write_window(request_data)
                         logger.debug(
                             "[PRODUCER] Received write_request for req %s "
                             "(transfer_id=%s, consumer=%s:%s)",
@@ -2522,12 +2538,16 @@ class MooncakeConnector(KVConnectorBase):
                                 logger.exception(
                                     "[PRODUCER] adopting a landing partition failed"
                                 )
-                        if request_data.get("chunked_transfer"):
+                        if chunked:
                             with self._completed_prefills_lock:
                                 self._pending_chunked_requests.append(
                                     (request_data, time.monotonic())
                                 )
                             self._dispatch_ready_chunked_requests()
+                        elif awaits_rail:
+                            self._rail_builder.submit(
+                                self._transfer_once_rail_built, request_data
+                            )
                         else:
                             self._send_executor.submit(
                                 self._execute_transfer, request_data
@@ -2556,6 +2576,39 @@ class MooncakeConnector(KVConnectorBase):
         except BaseException as exc:
             self._publish_listener_state(exc)
             raise
+
+    def _start_write_window(self, request_data: dict) -> None:
+        """Stamp the request's transfer deadline, then acknowledge it if asked."""
+        request_data["_deadline"] = time.monotonic() + PD_TRANSFER_DEADLINE_S
+        if request_data.get("write_ack"):
+            self._ack_write_request(request_data)
+
+    def _transfer_once_rail_built(self, request_data: dict) -> None:
+        """Build the request's matched rail, then queue its transfer.
+
+        Registering every chunk on a new engine takes about a minute and rails
+        build one at a time, so the wait can outlast ``PD_TRANSFER_DEADLINE_S``.
+        The request's write window therefore opens only once the engine
+        exists; until its ack the consumer waits for this rank without a
+        deadline. A rail that failed to build fails the request in
+        ``_execute_transfer``.
+        """
+        try:
+            self._rail_pool.get(request_data.get("consumer_ib_device"))
+        except Exception:
+            logger.exception(
+                "[PRODUCER] building the matched rail for req %s failed",
+                request_data.get("request_id"),
+            )
+        self._start_write_window(request_data)
+        try:
+            self._send_executor.submit(self._execute_transfer, request_data)
+        except Exception:
+            logger.exception(
+                "[PRODUCER] queueing the transfer of req %s failed",
+                request_data.get("request_id"),
+            )
+            self._notify_transfer_result(request_data, success=False)
 
     def _ack_write_request(self, request_data: dict) -> None:
         """Tell the consumer this rank has the request, and for how long it writes.
@@ -2977,11 +3030,13 @@ class MooncakeConnector(KVConnectorBase):
     ) -> None:
         """Send an already-claimed source; only the dispatcher admits readers."""
         try:
+            engine = self.transfer_engine
+            if self._rail_pool is not None:
+                # Building a rail's engine can outlast the write window.
+                engine = self._rail_pool.get(request_data.get("consumer_ib_device"))
             # The admission deadline covers waiting for P capacity. Start the
             # write window only once a send worker actually starts this reader.
-            request_data["_deadline"] = time.monotonic() + PD_TRANSFER_DEADLINE_S
-            if request_data.get("write_ack"):
-                self._ack_write_request(request_data)
+            self._start_write_window(request_data)
             req_id = request_data["request_id"]
             if request_data.get("prompt_digest") != state.prompt_digest:
                 raise ValueError("P/D prompt token IDs differ")
@@ -3010,9 +3065,6 @@ class MooncakeConnector(KVConnectorBase):
             target = (
                 f"{request_data['consumer_host']}:{request_data['consumer_rpc_port']}"
             )
-            engine = self.transfer_engine
-            if self._rail_pool is not None:
-                engine = self._rail_pool.get(request_data.get("consumer_ib_device"))
             prefill_data = {
                 "slot_index": state.slot_index,
                 "swa_block_ids": state.swa_block_ids,

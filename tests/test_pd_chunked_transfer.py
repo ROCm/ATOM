@@ -204,6 +204,34 @@ def test_decode_prefix_is_skipped_even_before_source_blocks_are_available():
     assert bytes(dst[0][8:12]) == bytes(4)
 
 
+def test_a_chunked_reader_opens_its_write_window_once_its_rail_is_built(
+    monkeypatch,
+):
+    # Building a matched rail's engine can outlast PD_TRANSFER_DEADLINE_S.
+    c, state, req, src, dest = producer()
+    now = [1000.0]
+    monkeypatch.setattr(mc.time, "monotonic", lambda: now[0])
+
+    def build(_device):
+        now[0] += 2 * mc.PD_TRANSFER_DEADLINE_S
+        return c.transfer_engine
+
+    c._rail_pool = SimpleNamespace(get=build)
+    c._ack_write_request = MagicMock()
+    publish(state, 10)
+    state.finish({"first_token_id": 42})
+
+    dispatch(c, dict(req, write_ack=True))
+
+    c._ack_write_request.assert_called_once()
+    assert c._ack_write_request.call_args.args[0]["_deadline"] == (
+        1000.0 + 3 * mc.PD_TRANSFER_DEADLINE_S
+    )
+    c._notify_transfer_result.assert_called_once()
+    assert c._notify_transfer_result.call_args.kwargs == {"success": True}
+    assert bytes(dest[0][8:12]) == bytes(src[20:24])
+
+
 def test_no_delta_page_until_whole_dcp_destination_is_ready():
     state = ChunkedPrefill(1, [4, 9, 1, 7, 8], 18, 4, timeout=0.01)
     publish(state, 6)
