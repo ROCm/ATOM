@@ -743,6 +743,8 @@ class TestPushThreadUnderPP:
             kv_transfer_config={"kv_role": "kv_producer"},
             tensor_parallel_size=1,
             pipeline_parallel_size=4,
+            kv_cache_block_size=16,
+            decode_context_parallel_size=1,
             parallel_config=types.SimpleNamespace(
                 data_parallel_size=1, data_parallel_rank=0
             ),
