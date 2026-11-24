@@ -1217,6 +1217,10 @@ class ModelRunner:
             )
             apply_simulated_tp(config)
 
+        from atom.utils.tbo.ubatching import initialize_dp_metadata_sync
+
+        initialize_dp_metadata_sync(get_dp_group())
+
     def _get_cumsum_and_arange(
         self,
         num_tokens: np.ndarray,

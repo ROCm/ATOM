@@ -108,11 +108,64 @@ def _gloo_all_gather(local: torch.Tensor, dp_size: int, dp_group) -> list:
 # Called by the worker's scheduling thread; each call finishes before reuse.
 _DEVICE_SYNC_STATE: dict = {}
 _DEVICE_SYNC_CALLS = [0]
+_DP_SYNC_CONFIG: tuple[str, int] | None = None
+
+
+def initialize_dp_metadata_sync(dp_group) -> tuple[str, int]:
+    """Validate and freeze transport settings before this worker serves steps.
+
+    All DP ranks participate even when a rank's environment is invalid, so
+    peers fail here together rather than hanging in mismatched collectives.
+    """
+    from atom.distributed.group_agreement import group_max_each
+
+    global _DP_SYNC_CONFIG
+    _DP_SYNC_CONFIG = None
+    _DEVICE_SYNC_STATE.clear()
+    _DEVICE_SYNC_CALLS[0] = 0
+    backend, verify = "gloo", 0
+    invalid_backend = invalid_verify = 0
+    try:
+        backend = envs.ATOM_DP_SYNC_BACKEND
+    except ValueError:
+        invalid_backend = 1
+    try:
+        verify = envs.ATOM_DP_SYNC_VERIFY
+    except ValueError:
+        invalid_verify = 1
+    backend_id = int(backend == "rccl")
+    bad_backend, bad_verify, hi_backend, neg_lo_backend, hi_verify, neg_lo_verify = (
+        group_max_each(
+            (invalid_backend, invalid_verify, backend_id, -backend_id, verify, -verify),
+            dp_group.cpu_group if dp_group.world_size > 1 else None,
+        )
+    )
+    if bad_backend or bad_verify:
+        names = []
+        if bad_backend:
+            names.append("ATOM_DP_SYNC_BACKEND (gloo or rccl)")
+        if bad_verify:
+            names.append("ATOM_DP_SYNC_VERIFY (nonnegative int64)")
+        raise ValueError("Invalid DP sync setting on a DP rank: " + ", ".join(names))
+    if hi_backend != -neg_lo_backend or hi_verify != -neg_lo_verify:
+        raise ValueError(
+            "ATOM_DP_SYNC_BACKEND and ATOM_DP_SYNC_VERIFY must agree across DP ranks"
+        )
+    _DP_SYNC_CONFIG = (backend, verify)
+    return _DP_SYNC_CONFIG
+
+
+def _dp_sync_config() -> tuple[str, int]:
+    # Standalone callers/tests have no ModelRunner. Production initializes
+    # once, so changing the process environment cannot change wire ordering.
+    if _DP_SYNC_CONFIG is not None:
+        return _DP_SYNC_CONFIG
+    return envs.ATOM_DP_SYNC_BACKEND, envs.ATOM_DP_SYNC_VERIFY
 
 
 def _device_all_gather(local: torch.Tensor, dp_size: int, dp_group) -> torch.Tensor:
     """`local` from every DP rank as a [dp_size, n] CPU tensor, over the DP
-    device group on a side stream, so it does not queue behind compute."""
+    device group on a side stream, ordered after the caller's compute work."""
     from aiter.dist.parallel_state import get_dp_group
 
     dp = get_dp_group()
@@ -127,7 +180,7 @@ def _device_all_gather(local: torch.Tensor, dp_size: int, dp_group) -> torch.Ten
         stream = torch.cuda.Stream(device=dev)
         # Even empty buffers can reuse allocator memory with pending work on
         # their allocation stream. Allocate on the stream that uses them so
-        # no compute-stream wait is needed for this CPU-produced metadata.
+        # storage reuse is ordered there. The collective dependency is below.
         with torch.cuda.stream(stream):
             src = torch.empty(n, dtype=torch.int32, device=dev)
             dst = torch.empty(dp_size * n, dtype=torch.int32, device=dev)
@@ -137,13 +190,18 @@ def _device_all_gather(local: torch.Tensor, dp_size: int, dp_group) -> torch.Ten
         state = (device_group, stream, src, dst, host)
         _DEVICE_SYNC_STATE[key] = state
     _, stream, src, dst, host = state
+    # The DP communicator can also carry the previous forward's LM-head
+    # all_to_all, including inside a replayed graph. Order it before this
+    # gather on every call, including cache reuse. TBO rejoins its comm stream
+    # onto the caller's compute stream before the next step prepares metadata.
+    stream.wait_stream(torch.cuda.current_stream(dev))
     with torch.cuda.stream(stream):
         src.copy_(local)
         torch.distributed.all_gather_into_tensor(dst, src, group=device_group)
         host.copy_(dst, non_blocking=True)
     stream.synchronize()
     out = host.view(dp_size, n).clone()
-    verify = envs.ATOM_DP_SYNC_VERIFY
+    verify = _dp_sync_config()[1]
     if verify > 0:
         _DEVICE_SYNC_CALLS[0] += 1
         if _DEVICE_SYNC_CALLS[0] % verify == 0:
@@ -243,10 +301,9 @@ def sync_dp_metadata(
     # A group of one is its own row, with nothing to exchange.
     gathered = [local]
     if dp_size > 1:
-        if (
-            envs.ATOM_DP_SYNC_BACKEND == "rccl"
-            and not torch.cuda.is_current_stream_capturing()
-        ):
+        # ForwardMode.decide runs in prepare_model before forward/replay.
+        # Capture builds synthetic contexts without this host-facing gather.
+        if _dp_sync_config()[0] == "rccl":
             gathered = list(_device_all_gather(local, dp_size, dp_group).unbind(0))
         else:
             gathered = _gloo_all_gather(local, dp_size, dp_group)

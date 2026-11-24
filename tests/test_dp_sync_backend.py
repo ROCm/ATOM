@@ -20,7 +20,13 @@ from atom.utils.tbo import ubatching as ub
 @pytest.fixture
 def transport(monkeypatch):
     runtime = SimpleNamespace(
-        active=None, device=0, streams=[], allocations=[], gloo_calls=0, rccl_calls=0
+        active=None,
+        device=0,
+        streams=[],
+        allocations=[],
+        gloo_calls=0,
+        rccl_calls=0,
+        compute=SimpleNamespace(pending=[]),
     )
     runtime.dp = SimpleNamespace(
         cpu_group=object(), device_group=object(), world_size=2
@@ -32,6 +38,7 @@ def transport(monkeypatch):
     )
     monkeypatch.setattr(ub, "_DEVICE_SYNC_STATE", {})
     monkeypatch.setattr(ub, "_DEVICE_SYNC_CALLS", [0])
+    monkeypatch.setattr(ub, "_DP_SYNC_CONFIG", None)
     monkeypatch.setenv("ATOM_DP_SYNC_VERIFY", "0")
     monkeypatch.setenv("ATOM_DP_SYNC_BACKEND", "rccl")
 
@@ -52,6 +59,12 @@ def transport(monkeypatch):
             for operation in self.pending:
                 operation()
             self.pending.clear()
+
+        def wait_stream(self, compute):
+            assert compute is runtime.compute
+            prior = tuple(compute.pending)
+            compute.pending.clear()
+            self.pending.append(lambda: [operation() for operation in prior])
 
     class Buffer:
         def __init__(self, n):
@@ -95,7 +108,7 @@ def transport(monkeypatch):
     monkeypatch.setattr(torch.cuda, "Stream", Stream)
     monkeypatch.setattr(torch.cuda, "stream", lambda stream: stream)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: runtime.device)
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *args: runtime.compute)
     monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", rccl)
     monkeypatch.setattr(torch.distributed, "all_gather", gloo)
     return runtime
@@ -123,6 +136,30 @@ def test_cache_changes_with_device_or_recreated_device_group(transport):
     ub._device_all_gather(local, 2, transport.dp.cpu_group)
     assert len(transport.streams) == 3
     assert len(ub._DEVICE_SYNC_STATE) == 2
+
+
+def test_previous_forward_collective_finishes_before_gather_on_every_call(
+    transport, monkeypatch
+):
+    completed = [False]
+    gather = torch.distributed.all_gather_into_tensor
+
+    def ordered(out, local, group):
+        # This assertion models GPU execution, not CPU launch order.
+        def check():
+            assert completed[0], "metadata raced the previous forward's collective"
+
+        transport.active.pending.append(check)
+        gather(out, local, group)
+
+    monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", ordered)
+    for step in range(2):
+        completed[0] = False
+        transport.compute.pending.append(lambda: completed.__setitem__(0, True))
+        local = torch.arange(5, dtype=torch.int32) + step
+        result = ub._device_all_gather(local, 2, transport.dp.cpu_group)
+        assert torch.equal(result, torch.stack((local, local + 100)))
+    assert len(transport.streams) == 1  # second call reuses buffers
 
 
 @pytest.mark.parametrize("wrong_size", [False, True])
@@ -165,10 +202,13 @@ def test_device_failure_propagates_without_switching_collectives(
     assert transport.gloo_calls == 0
 
 
-@pytest.mark.parametrize("backend,capturing", [("gloo", False), ("rccl", True)])
-def test_default_and_capture_use_cpu_group(transport, monkeypatch, backend, capturing):
-    monkeypatch.setenv("ATOM_DP_SYNC_BACKEND", backend)
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+def test_default_uses_cpu_group_without_touching_cuda(transport, monkeypatch):
+    monkeypatch.setenv("ATOM_DP_SYNC_BACKEND", "gloo")
+
+    def refused(*args):
+        raise AssertionError("gloo touched CUDA")
+
+    monkeypatch.setattr(torch.cuda, "current_stream", refused)
     result = ub.sync_dp_metadata(
         dp_group=transport.dp.cpu_group,
         dp_size=2,
@@ -189,7 +229,7 @@ def test_singleton_does_not_touch_cuda_or_a_collective(monkeypatch):
     def refused(*args, **kwargs):
         raise AssertionError("singleton touched CUDA or a collective")
 
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", refused)
+    monkeypatch.setattr(torch.cuda, "current_stream", refused)
     monkeypatch.setattr(torch.distributed, "all_gather", refused)
     monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", refused)
     result = ub.sync_dp_metadata(
