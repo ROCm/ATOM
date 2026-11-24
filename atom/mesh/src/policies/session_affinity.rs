@@ -125,15 +125,6 @@ impl SessionTable {
         }
     }
 
-    /// A hit: the binding is used again, and the workers it failed on are
-    /// forgotten. Returns the binding.
-    fn touch(&self, key: &str, now: Instant) -> Option<u64> {
-        let mut entry = self.assignments.get_mut(key)?;
-        entry.last_access = now;
-        entry.avoid.clear();
-        Some(entry.binding)
-    }
-
     /// Record where a request of `key` placed on `binding` was sent. Returns
     /// why the session moved when this worker differs from the one its previous
     /// request was sent to.
@@ -231,12 +222,29 @@ impl SessionAffinityPolicy {
         now.saturating_duration_since(assignment.last_access) > self.ttl
     }
 
-    fn fresh_index(&self, key: &str, workers: &[Arc<dyn Worker>], now: Instant) -> Option<usize> {
-        let assignment = self.table.assignments.get(key)?;
+    /// The bound worker serves the request when the session is not idle for
+    /// too long, no request failed since it was placed, and the worker is
+    /// usable. A hit forgets the workers the session failed on. One entry
+    /// lock covers the check and the binding read, so a placement in between
+    /// cannot hand this request the new binding for the old worker.
+    fn hit(
+        &self,
+        key: &str,
+        workers: &[Arc<dyn Worker>],
+        now: Instant,
+    ) -> Option<(Option<usize>, RouteDecision)> {
+        let mut assignment = self.table.assignments.get_mut(key)?;
         if assignment.failed || self.is_expired(&assignment, now) {
             return None;
         }
-        healthy_index(workers, &assignment.worker)
+        let index = healthy_index(workers, &assignment.worker)?;
+        assignment.last_access = now;
+        assignment.avoid.clear();
+        let decision = RouteDecision {
+            binding: Some(assignment.binding),
+            ..RouteDecision::branch(AFFINITY_HIT)
+        };
+        Some((Some(index), decision))
     }
 
     fn miss_result(&self, key: &str, now: Instant) -> &'static str {
@@ -258,15 +266,6 @@ impl SessionAffinityPolicy {
                     .unwrap_or(0)
             })
             .collect()
-    }
-
-    /// The bound worker at `index` serves the request.
-    fn hit(&self, key: &str, index: usize, now: Instant) -> (Option<usize>, RouteDecision) {
-        let decision = RouteDecision {
-            binding: self.table.touch(key, now),
-            ..RouteDecision::branch(AFFINITY_HIT)
-        };
-        (Some(index), decision)
     }
 
     fn record_placement(
@@ -380,13 +379,13 @@ impl LoadBalancingPolicy for SessionAffinityPolicy {
             return self.inner.select_with_decision(workers, info).await;
         };
         let now = Instant::now();
-        if let Some(index) = self.fresh_index(key, workers, now) {
-            return self.hit(key, index, now);
+        if let Some(hit) = self.hit(key, workers, now) {
+            return hit;
         }
 
         let _assign_guard = self.assign_lock.lock().await;
-        if let Some(index) = self.fresh_index(key, workers, now) {
-            return self.hit(key, index, now);
+        if let Some(hit) = self.hit(key, workers, now) {
+            return hit;
         }
         self.place(key, workers, info, now).await
     }
