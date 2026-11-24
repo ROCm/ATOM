@@ -1654,6 +1654,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_OFFLOAD_ASYNC_TIER_LOOKUP": lambda: _flag_env(
         "ATOM_OFFLOAD_ASYNC_TIER_LOOKUP"
     ),
+    # PP: split the LMCache CPU budget across stages by their KV bytes per
+    # token where ATOM estimates them (MiniMax-M3), not by layer count, which
+    # misses a drafter's KV on the last stage. Off by default.
+    "ATOM_OFFLOAD_PP_SPLIT_BY_KV_BYTES": lambda: _flag_env(
+        "ATOM_OFFLOAD_PP_SPLIT_BY_KV_BYTES"
+    ),
     # lmcache_mp sends tier lookups for the head of the waiting queue ahead of
     # admission; this is how many waiting requests per scheduling pass.
     "OFFLOAD_ASYNC_LOOKUP_DEPTH": lambda: _nonnegative_int_env(
