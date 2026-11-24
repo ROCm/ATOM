@@ -956,6 +956,7 @@ mod routed {
         let (new_url, _, mut new_calls) = serve("{}").await;
         let old = worker(&old_url, WorkerType::Regular);
         let context = test_mocks::app_context_with_hf_tokenizer("m");
+        test_mocks::app_context::loaded_with_worker_template(&context, "m", "{{ messages }}");
         let context = over_sessions(context, &[&old]);
         let router = Arc::new(GrpcRouter::new(&context).await.unwrap());
 
@@ -987,6 +988,7 @@ mod routed {
     async fn a_chat_runs_over_the_session_after_atom_prepares_its_structured_output() {
         let (url, fake, mut calls) = serve("{}").await;
         let context = test_mocks::app_context_with_hf_tokenizer("m");
+        test_mocks::app_context::loaded_with_worker_template(&context, "m", "{{ messages }}");
         let context = over_sessions(context, &[&worker(&url, WorkerType::Regular)]);
         let router = GrpcRouter::new(&context).await.unwrap();
         let format = json!({"type": "json_schema", "json_schema": {"name": "a", "schema": {}}});
