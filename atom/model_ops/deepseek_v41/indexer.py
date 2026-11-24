@@ -120,25 +120,37 @@ def restrict_to_candidates_reference(logits, candidates, visible, block_size, ti
 
 @functools.cache
 def _gfx1250():
-    """gfx1250 takes the wider maxima grid and the 128-wide candidate tile;
-    other archs keep the values they were tuned with."""
+    """gfx1250 takes the 128-wide candidate tile; other archs keep the value
+    they were tuned with."""
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
     return get_gfx_runtime() == "gfx1250"
 
 
+@functools.cache
+def _maxima_grid():
+    """Programs in `_block_maxima_kernel`'s grid: 16384 on gfx1250 and gfx950,
+    2048 elsewhere."""
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    return 16384 if get_gfx_runtime() in ("gfx1250", "gfx950") else 2048
+
+
 def _maxima_lanes(rows):
-    """Programs per row for `_block_maxima_kernel`, about 2048 in the grid
-    (16384 on gfx1250).
+    """Programs per row for `_block_maxima_kernel`, `_maxima_grid()` in the
+    grid shared out over the rows.
 
     A tile is one load and one max, so extra lanes have little latency to hide
     and an idle one is pure launch cost: the grid wants to fill the machine
     once and no more. Within about 10% of the best lane count from 6 to 8191
     rows and 2k to 256k context. gfx1250 needs more programs in flight to keep
-    its loads coming, so its grid is wider.
+    its loads coming, so its grid is wider. gfx950 takes the same wider grid
+    for a different reason: a decode step's rows are not at one context. The
+    launch lasts as long as its longest row's lanes take, and the narrow grid
+    leaves that row few of them once a step has a few hundred rows. The
+    maxima are the same bytes at any lane count.
     """
-    target = 16384 if _gfx1250() else 2048
-    return min(256, max(1, target // max(rows, 1)))
+    return min(256, max(1, _maxima_grid() // max(rows, 1)))
 
 
 @triton.jit(do_not_specialize=["lanes"])
