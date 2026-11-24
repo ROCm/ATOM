@@ -11,7 +11,9 @@ import torch
 from aiter_stub import atom_without_aiter
 
 TOKENS = 8
-# aiter's answers on gfx942 (ROCm/aiter#8083), where the CPU job has no aiter.
+# aiter's answers on gfx942 (ROCm/aiter#8083), the one arch its FlyDSL QSA
+# prefill runs on. The CPU job has no aiter, so the arch gate and the widths
+# are stubbed here.
 WIDTHS = (1027, 2051, 3075, 4099)
 
 
@@ -91,6 +93,7 @@ def flydsl(modules, monkeypatch):
     calls = []
     qa.log_flydsl_fallback.cache_clear()
     qa._log_flydsl_active.cache_clear()
+    _stub_arch(monkeypatch, "gfx942")
     monkeypatch.setattr(qa, "qsa_sparse_prefill_widths", lambda: WIDTHS)
     monkeypatch.setattr(
         qa, "qsa_sparse_prefill_supports_selection", _supports_selection
@@ -159,7 +162,40 @@ def test_aiter_unavailable_falls_back(modules, flydsl, monkeypatch, caplog):
     with caplog.at_level("WARNING"):
         assert _attend(modules, _layer(), _qsa(modules)) is None
     assert flydsl == []
-    assert "does not run on this GPU" in _warnings(caplog)[0]
+    assert "no FlyDSL QSA prefill" in _warnings(caplog)[0]
+
+
+def _stub_arch(monkeypatch, gfx):
+    """Pin the arch aiter would report for this process."""
+    import sys
+    import types
+
+    chip_info = types.ModuleType("aiter.jit.utils.chip_info")
+    chip_info.get_gfx_runtime = lambda: gfx
+    monkeypatch.setitem(sys.modules, chip_info.__name__, chip_info)
+
+
+@pytest.mark.parametrize(
+    ("gfx", "off_arch"), [("gfx942", False), ("gfx950", True), ("gfx1250", True)]
+)
+def test_flydsl_arch_reason_is_gfx942_only(modules, monkeypatch, gfx, off_arch):
+    """The kernel is built for gfx942 alone, which is what aiter's own
+    availability check and the call's arch guard say too."""
+    _stub_arch(monkeypatch, gfx)
+    reason = modules.qsa_attention.flydsl_arch_reason()
+    assert (reason is not None) is off_arch
+
+
+@pytest.mark.parametrize("gfx", ["gfx950", "gfx1250"], ids=["MI355X", "gfx1250"])
+def test_other_archs_fall_back(modules, flydsl, monkeypatch, caplog, gfx):
+    """Every other GPU takes the native kernel on the arch gate, before the
+    layer builds a layout or a selection, and says why."""
+    _stub_arch(monkeypatch, gfx)
+    qsa = _qsa(modules)
+    with caplog.at_level("WARNING"):
+        assert _attend(modules, _layer(), qsa) is None
+    assert flydsl == [] and qsa.flydsl_prefill.indices is None
+    assert "not gfx942" in _warnings(caplog)[0]
 
 
 def _warnings(caplog):

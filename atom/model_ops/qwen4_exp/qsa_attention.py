@@ -96,6 +96,25 @@ def qsa_rank_heads(
     return num_attention_heads // tp_size, 1
 
 
+def flydsl_arch_reason() -> str | None:
+    """Why the live GPU cannot run the aiter FlyDSL QSA prefill, or None when
+    it is gfx942 -- the one arch aiter builds that kernel for.
+
+    Its `flydsl_qsa_sparse_prefill_available()` answers the same question, and
+    the call raises `ValueError` off gfx942, but ATOM decides the layer's path
+    before building the selection: an unguarded miss would pay the host layout,
+    the selection and its expansion on a GPU that then refuses the attention.
+    Kept apart from `flydsl_fallback_reason` so the SGLang bridge can consult
+    it before reading the model's head shape or TP size.
+    """
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    # lru_cached in aiter, so a call per layer and per forward costs a lookup.
+    if get_gfx_runtime() != "gfx942":
+        return "the GPU is not gfx942"
+    return None
+
+
 def flydsl_fallback_reason(
     compress_ratio: int,
     token_topk: int,
@@ -107,17 +126,22 @@ def flydsl_fallback_reason(
 ) -> str | None:
     """Why QSA layers with this indexer, per-rank head shape and KV format
     cannot take the aiter FlyDSL attention, or None if they can. The kernel
+    is gfx942's: aiter builds it for that arch alone and raises on any other,
+    so that is checked first and everywhere else is a fallback. It also
     expects min(v // 4, T) blocks for a row with v visible tokens (width
     4T + 3); another budget or ratio selects a different number, so padding
     its selection would give wrong output. The one authority for the layer's
     fallback and the SGLang bridge's layout build; the per-call conditions
     (host layout, selection byte span, graph capture, query dtype) stay with
     the layer."""
+    arch_reason = flydsl_arch_reason()
+    if arch_reason is not None:
+        return arch_reason
     if not kv_bf16:
         return "the KV cache is not BF16"
     widths = qsa_sparse_prefill_widths()
     if not widths:
-        return "aiter's FlyDSL QSA prefill does not run on this GPU"
+        return "this aiter has no FlyDSL QSA prefill"
     if compress_ratio != 4 or token_topk + 3 not in widths:
         return f"indexer compress ratio {compress_ratio} / budget {token_topk}"
     if num_kv_heads != 1 or num_heads not in (12, 6, 3) or head_dim != 256:

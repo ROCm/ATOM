@@ -1,5 +1,7 @@
 """CUDA-graph pad rows must not keep a finished request's QSA page table."""
 
+import sys
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -1395,15 +1397,19 @@ def test_flydsl_prefill_layout_falls_back_unless_tokens_are_the_extends(
     assert _flydsl_layout(extends, seqs, live_bs, num_tokens) == (None, None)
 
 
-def _flydsl_gate_env(monkeypatch, tp=4, arch=True):
-    """`tp` ranks, `arch` for a GPU aiter's FlyDSL QSA prefill runs on;
-    returns the layer module."""
+def _flydsl_gate_env(monkeypatch, tp=4, gfx942=True, widths=None):
+    """`tp` ranks, a `gfx942` or other GPU, and `widths` for what aiter reports
+    (default: the four gfx942 widths); returns the layer module."""
     qsa_attention = pytest.importorskip(
         "atom.model_ops.qwen4_exp.qsa_attention", exc_type=ImportError
     )
     from aiter.dist import parallel_state
 
-    widths = (1027, 2051, 3075, 4099) if arch else ()
+    chip_info = types.ModuleType("aiter.jit.utils.chip_info")
+    chip_info.get_gfx_runtime = lambda: "gfx942" if gfx942 else "gfx950"
+    monkeypatch.setitem(sys.modules, chip_info.__name__, chip_info)
+    if widths is None:
+        widths = (1027, 2051, 3075, 4099)
     monkeypatch.setattr(qsa_attention, "qsa_sparse_prefill_widths", lambda: widths)
     monkeypatch.setattr(
         parallel_state, "get_tensor_model_parallel_world_size", lambda: tp
@@ -1421,29 +1427,50 @@ _FLASH_CONFIG = SimpleNamespace(
 
 
 @pytest.mark.parametrize(
-    "arch,kv_dtype,ratio,budget,tp,needed",
+    "gfx942,kv_dtype,ratio,budget,tp,needed",
     [
         (True, torch.bfloat16, 4, 2048, 4, True),
         (True, torch.bfloat16, 4, 2048, 2, True),  # 12 q heads per rank
         (True, torch.bfloat16, 4, 2048, 8, True),  # 3 q heads per rank
         (True, torch.bfloat16, 4, 2048, 1, False),  # 24 q / 2 kv heads
         (True, None, 4, 4096, 4, False),  # dtype unreadable: native
-        (False, torch.bfloat16, 4, 2048, 4, False),  # aiter: not this GPU
+        (False, torch.bfloat16, 4, 2048, 4, False),  # the kernel is gfx942's
         (True, torch.float8_e4m3fn, 4, 2048, 4, False),  # FP8 KV pool
         (True, torch.bfloat16, 8, 2048, 4, False),  # compression ratio
         (True, torch.bfloat16, 4, 1536, 4, False),  # budget the kernel lacks
     ],
 )
 def test_flydsl_layout_built_only_when_the_kernel_can_run(
-    monkeypatch, arch, kv_dtype, ratio, budget, tp, needed
+    monkeypatch, gfx942, kv_dtype, ratio, budget, tp, needed
 ):
     """The FlyDSL host layout (host lengths, and an H2D of the context rows
     when prefixed) is only worth building when a QSA layer can take the
     kernel; otherwise every prefill would pay for it and fall back."""
-    _flydsl_gate_env(monkeypatch, tp=tp, arch=arch)
+    _flydsl_gate_env(monkeypatch, tp=tp, gfx942=gfx942)
     pool = SimpleNamespace() if kv_dtype is None else SimpleNamespace(dtype=kv_dtype)
     batch = SimpleNamespace(token_to_kv_pool=pool)
     assert _flydsl_layout_needed(batch, _FLASH_CONFIG, ratio, budget) is needed
+
+
+def test_flydsl_layout_names_a_non_gfx942_gpu(monkeypatch, caplog):
+    """The arch gate comes first: off gfx942 the head shape is never read (the
+    config below has none) and the log names the arch, not a shape."""
+    _flydsl_gate_env(monkeypatch, gfx942=False)
+    batch = SimpleNamespace(token_to_kv_pool=SimpleNamespace(dtype=torch.bfloat16))
+    with caplog.at_level("WARNING"):
+        assert not _flydsl_layout_needed(
+            batch, SimpleNamespace(hf_config=None), 4, 2048
+        )
+    reasons = [r.getMessage() for r in caplog.records if "native kernel" in r.message]
+    assert len(reasons) == 1 and "not gfx942" in reasons[0]
+
+
+def test_flydsl_layout_needs_widths_from_aiter(monkeypatch):
+    """gfx942 is necessary, not sufficient: an aiter without the FlyDSL QSA
+    prefill reports no widths, and the layout is not built."""
+    _flydsl_gate_env(monkeypatch, widths=())
+    batch = SimpleNamespace(token_to_kv_pool=SimpleNamespace(dtype=torch.bfloat16))
+    assert not _flydsl_layout_needed(batch, _FLASH_CONFIG, 4, 2048)
 
 
 def test_flydsl_layout_logs_each_fallback_reason_once(monkeypatch, caplog):

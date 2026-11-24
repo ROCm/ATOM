@@ -55,6 +55,9 @@ def test_mixed_prefix_batch_reads_full_contexts_through_the_slot_table(monkeypat
     query / prefix lengths."""
     from atom.plugin.sglang.qwen4_exp_bridge import _flydsl_prefill_layout
 
+    if qsa_attention.flydsl_arch_reason() is not None:
+        pytest.skip("the FlyDSL QSA attention is gfx942 only")
+
     device, block, pages = "cuda", 4, 12
     prefixes, extends = (5, 0, 2), (3, 6, 1)
     seqs = tuple(p + e for p, e in zip(prefixes, extends))

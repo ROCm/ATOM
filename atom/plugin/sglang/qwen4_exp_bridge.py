@@ -1233,11 +1233,18 @@ def _flydsl_layout_needed(
     the predicate the layer's fallback uses, on the per-rank head shape of
     this model's config and the KV dtype of the pool the QSA caches are bound
     from. An FP8 SGLang KV pool binds no scale planes, so the layer cannot
-    detect it; a pool whose dtype cannot be read keeps the native kernel. Each
-    reason is logged once."""
-    from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
-
+    detect it; a pool whose dtype cannot be read keeps the native kernel. The
+    kernel is gfx942's, so every other GPU short-circuits on the arch before
+    the head shape is read. Each reason is logged once."""
     from atom.model_ops.qwen4_exp import qsa_attention
+
+    # The kernel is gfx942's: off it, nothing else about this model matters.
+    arch_reason = qsa_attention.flydsl_arch_reason()
+    if arch_reason is not None:
+        qsa_attention.log_flydsl_fallback(arch_reason)
+        return False
+
+    from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 
     hf = _hf_text_config(atom_config)
     num_heads, num_kv_heads = qsa_attention.qsa_rank_heads(
