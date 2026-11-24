@@ -773,10 +773,20 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # regular forwards and TBO ubatch 0; slot 1 exists only for the
             # concurrently running second ubatch.
             num_mori_ops = NUM_TBO_UBATCHES if tbo_is_enabled else 1
-            mori_ops = [
-                all2all_manager.get_handle(all_to_all_args, index=slot)
-                for slot in range(num_mori_ops)
-            ]
+            from atom.model_ops.fused_moe.deferred_mori_op import (
+                DeferredMoriOp,
+                defer_mori_handles,
+            )
+
+            if defer_mori_handles():
+                # Off by default: a server whose plan never takes the native
+                # path does without the handles (deferred_mori_op.py).
+                mori_ops = [DeferredMoriOp(slot) for slot in range(num_mori_ops)]
+            else:
+                mori_ops = [
+                    all2all_manager.get_handle(all_to_all_args, index=slot)
+                    for slot in range(num_mori_ops)
+                ]
 
             prepare_finalize = MoriPrepareAndFinalize(
                 mori_ops,

@@ -158,6 +158,12 @@ def test_v2_options_parse_and_key_the_plan():
         {"engine": {"prefill_admit_order": "shortest"}},
         {"engine": {"prefill_admit_max_age_ms": -1}},
         {"engine": {"thp_disable": 1}},
+        {"engine": {"mori_defer_handles": "1"}},
+        {"engine": {"prefill_warmup_ladder": [8, 0]}},
+        {"engine": {"prefill_warmup_ladder": 8}},
+        {"engine": {"decode_warmup_widths": "all"}},
+        {"engine": {"decode_warmup_widths": 32}},
+        {"engine": {"decode_warmup_tails": "1-"}},
         {"engine": {"engram_pin_pages": "1"}},
         {"engine": {"prefill_short_first_rows": 96, "prefill_admit_order": "srpt"}},
         {"model_options": {"fused_attn": "yes"}},
@@ -213,6 +219,34 @@ def test_the_dspark_options_of_a_sharded_head_and_the_samplers_unread_work():
     assert options.sampler_skip_greedy_pick and options.lean_head
     assert options.verify_argmax_once and not options.verify_skip_unused_target_draw
     assert plan.plan_id != _plan(dspark_options={"dp_sharded_head": True}).plan_id
+
+
+def test_the_start_up_options_parse_and_key_the_plan():
+    off = recipes.EngineOptions()
+    assert not off.mori_defer_handles and off.prefill_warmup_ladder is None
+    assert off.decode_warmup_widths is None and off.decode_warmup_tails is None
+    plan = _plan(
+        engine={
+            "mori_defer_handles": True,
+            "prefill_warmup_ladder": [2, 64, 4096],
+            "decode_warmup_widths": "capture",
+            "decode_warmup_tails": "0",
+        }
+    )
+    assert plan.engine.mori_defer_handles
+    assert plan.engine.prefill_warmup_ladder == (2, 64, 4096)
+    assert plan.engine.decode_warmup_widths == "capture"
+    assert plan.engine.decode_warmup_tails == "0"
+    copy = pickle.loads(pickle.dumps(plan))
+    assert copy == plan and copy.dump() == plan.dump()
+    by_path = _plan(
+        engine={
+            "prefill_warmup_ladder": "ladder.txt",
+            "decode_warmup_widths": "1-32,48,64",
+        }
+    )
+    assert by_path.engine.prefill_warmup_ladder == "ladder.txt"
+    assert by_path.plan_id != plan.plan_id
 
 
 def test_the_host_options_reach_code_without_a_config():
@@ -315,6 +349,10 @@ def test_no_new_environment_variable_carries_a_recipe_option():
         "ATOM_SAMPLER_SKIP_GREEDY_PICK",
         "ATOM_SPEC_SKIP_UNUSED_TARGET_DRAW",
         "ATOM_THP_DISABLE",
+        "ATOM_MORI_DEFER_HANDLES",
+        "ATOM_PREFILL_WARMUP_LADDER",
+        "ATOM_DECODE_WARMUP_WIDTHS",
+        "ATOM_DECODE_WARMUP_TAILS",
         "ATOM_ENGRAM_PIN_PAGES",
     ):
         assert name not in envs, name

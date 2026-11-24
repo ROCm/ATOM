@@ -524,13 +524,31 @@ class DeepseekV41DSpark(DSparkDraftModel):
                 )
                 cache.write_window(attention.spec.layer_id, keys, step)
             return
-        weight, weight_scale, group_rows, width, preshuffled = fused
         if envs.ATOM_USE_MODEL_SENSITIVE_RMSNORM:
             hidden, hidden_scale = self.project_context(taps), None
         else:
             # The norm emits the GEMM's quantized input, so the GEMM does not
             # run its own quantize_fp8 on the bf16 norm output.
             hidden, hidden_scale = self.project_context_quant(taps)
+        keys = self._fused_context_keys(
+            hidden, hidden_scale, positions, packed=cache.window_fp8
+        )
+        for i, attention in enumerate(layers):
+            cache.write_window(
+                attention.spec.layer_id,
+                (
+                    tuple(t[i : i + 1] for t in keys)
+                    if cache.window_fp8
+                    else keys[i : i + 1]
+                ),
+                step,
+            )
+
+    def _fused_context_keys(self, hidden, hidden_scale, positions, *, packed):
+        """Every stage's wkv in one GEMM, then each stage's norm, RoPE and
+        quant; stage-major keys, to the windows after."""
+        layers = self.context_layers
+        weight, weight_scale, group_rows, width, preshuffled = self._context_kv_fusion()
         kv = native_quant_linear(
             hidden,
             weight,
@@ -555,32 +573,60 @@ class DeepseekV41DSpark(DSparkDraftModel):
                     for i, a in enumerate(layers)
                 ]
             )
-            keys = quantize_fp8(
-                self.rope(kv, positions.flatten()), dequantize=not cache.window_fp8
+            return quantize_fp8(
+                self.rope(kv, positions.flatten()), dequantize=not packed
             )
+        # Same stage-major result, one kernel: the cat is not fused but
+        # deleted, each program writing its row straight to its stage slot.
+        norm_weight, eps = tail
+        return fused_draft_kv_tail(
+            kv,
+            norm_weight,
+            positions.flatten(),
+            self.rope.cos_cache,
+            self.rope.sin_cache,
+            eps,
+            packed=packed,
+        )
+
+    @torch.inference_mode()
+    def warm_context_projection(self, num_rows: int, packed) -> None:
+        """`write_context_kv` on ``num_rows`` constant rows, up to (not
+        including) its window writes: the same calls through the same seams,
+        so the same kernels (a recipe's ``engine.decode_warmup_widths``).
+        ``packed``: the cache's ``window_fp8``, None when it is not known.
+        Nothing is written and no collective runs."""
+        proj = self.mtp[0].main_proj
+        dtype = get_current_atom_config().torch_dtype
+        device = self.mtp[0].main_norm.weight.device
+        tap = torch.ones(num_rows, proj.output_size, dtype=dtype, device=device)
+        taps = [tap] * (proj.input_size // proj.output_size)
+        positions = torch.zeros(1, num_rows, dtype=torch.int64, device=device)
+        fused = self._context_kv_fusion()
+        if fused is None:
+            hidden = self.project_context(taps)
+            if packed is not None:
+                for attention in self.context_layers:
+                    attention.project_context(
+                        hidden, positions, self.rope, packed=packed
+                    )
+            return
+        if envs.ATOM_USE_MODEL_SENSITIVE_RMSNORM:
+            hidden, hidden_scale = self.project_context(taps), None
         else:
-            # Same stage-major result, one kernel: the cat is not fused but
-            # deleted, each program writing its row straight to its stage slot.
-            norm_weight, eps = tail
-            keys = fused_draft_kv_tail(
-                kv,
-                norm_weight,
-                positions.flatten(),
-                self.rope.cos_cache,
-                self.rope.sin_cache,
-                eps,
-                packed=cache.window_fp8,
-            )
-        for i, attention in enumerate(layers):
-            cache.write_window(
-                attention.spec.layer_id,
-                (
-                    tuple(t[i : i + 1] for t in keys)
-                    if cache.window_fp8
-                    else keys[i : i + 1]
-                ),
-                step,
-            )
+            hidden, hidden_scale = self.project_context_quant(taps)
+        if packed is not None:
+            self._fused_context_keys(hidden, hidden_scale, positions, packed=packed)
+            return
+        weight, weight_scale, group_rows, _, preshuffled = fused
+        native_quant_linear(
+            hidden,
+            weight,
+            weight_scale,
+            weight_group_rows=group_rows,
+            weight_preshuffled=preshuffled,
+            x_scale=hidden_scale,
+        )
 
     def _context_kv_fusion(self):
         """The stages' `wkv` weights concatenated once, or None to stay per stage.

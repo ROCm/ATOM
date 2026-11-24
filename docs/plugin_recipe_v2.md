@@ -89,6 +89,9 @@ weights layout, loader, runtime (graphs, bounded replay, guarded ops) and mono d
 | `engine.prefill_admit_order` / `prefill_admit_max_age_ms` | `ATOM_PREFILL_ADMIT_ORDER` / `ATOM_PREFILL_ADMIT_MAX_AGE_MS` |
 | `engine.thp_disable` | `ATOM_THP_DISABLE` |
 | `engine.engram_pin_pages` | `ATOM_ENGRAM_PIN_PAGES` |
+| `engine.mori_defer_handles` | `ATOM_MORI_DEFER_HANDLES` |
+| `engine.prefill_warmup_ladder` (path or row counts) | `ATOM_PREFILL_WARMUP_LADDER` |
+| `engine.decode_warmup_widths` / `decode_warmup_tails` | `ATOM_DECODE_WARMUP_WIDTHS` / `ATOM_DECODE_WARMUP_TAILS` |
 | `model_options.ffn_mhc_fuse_quant` | `ATOM_DSV41_FFN_SEAM_QUANT` (#3645) |
 | `model_options.shared_act_quant` | `ATOM_DSV41_SHARED_ACT_QUANT` (#3645) |
 | `model_options.fused_attn` / `fused_attn_min_rows` | `ATOM_DSV41_FUSED_ATTN*` (#3645) |
@@ -129,6 +132,17 @@ weights layout, loader, runtime (graphs, bounded replay, guarded ops) and mono d
 - `engine.engram_pin_pages`: the page-locked copy of an Engram shard is also registered as fixed
   buffers of an `io_uring` instance that does no I/O, which pins its pages against page
   migration, and marked `MADV_DONTFORK`. A refused pin warns and the copy stays as it was.
+- `engine.mori_defer_handles`: the standard MoE backend builds no MoRI EP op handle at model
+  build; each is a stand-in that raises at first use. Only for a plan whose owners serve every
+  FFN (`v41.block.ffn`) and never decline to the native path.
+- `engine.prefill_warmup_ladder`: after the model warm-up, one dummy prefill forward per listed
+  row count (a list of ints, or a path to a file of them, as the server process opens it),
+  largest first, so each row-count bucket's kernels are first launched before serving.
+- `engine.decode_warmup_widths` (`"capture"` for the declared capture sizes, or a list such as
+  `"1-32,48,64"`): the draft's context projection (`write_context_kv` up to its window writes,
+  `warm_context_projection` of the plugin draft model) once per row count a decode of those
+  request widths, or the decoder tail of a prefill, hands it. `decode_warmup_tails` gives the
+  tails' request counts: unset, the same widths; `"0"`, none.
 
 None of these are environment variables in this branch. The host keeps its own:
 `ATOM_PLUGIN_HOST` (kill switch), `ATOM_PLUGIN_HOST_STRICT`, `ATOM_PLUGIN_HOTPLUG`,

@@ -1158,7 +1158,142 @@ class ModelRunner:
         """Run model warmup. Override point: the rapidserve decode process
         skips warmup since it imports weights/kvcache from prefill later."""
         self.warmup_model()
+        self._warmup_prefill_ladder()
+        self._warmup_decode_draft_context()
         logger.info(f"Model warmup done: {self.config.model}")
+
+    def _warmup_prefill_ladder(self):
+        """A recipe's ``engine.prefill_warmup_ladder`` (row counts, or a file
+        of them; off when unset): one dummy prefill forward per listed row
+        count, largest first.
+
+        A FlyDSL kernel variant is traced the first time a process launches
+        it, even when its binary is in the disk cache, and the linear layers
+        pick a variant per row-count bucket. A prefill step whose row count a
+        rank has not seen yet therefore waits for that trace -- and, under
+        DP / EP, so does every rank waiting on it. Running the buckets here
+        moves those first launches out of serving."""
+        ladder = plugin_host.engine_options().prefill_warmup_ladder
+        if not ladder:
+            return
+        if isinstance(ladder, str):
+            with open(ladder) as f:
+                ladder = [int(tok) for tok in f.read().split()]
+        ladder = sorted(set(ladder), reverse=True)
+        cap = self.warmup_max_tokens()
+        start_time = time.time()
+        done = failed = 0
+        for total in ladder:
+            if total < 2 or total > cap:
+                continue
+            lens = [total - total // 2, total // 2]
+            seqs = [Sequence([0] * n, block_size=self.block_size) for n in lens]
+            for seq in seqs:
+                seq.type = SequenceType.PREFILL
+            batch = ScheduledBatch(
+                seqs={seq.id: seq for seq in seqs},
+                num_scheduled_tokens=np.array(lens, dtype=np.int32),
+                total_tokens_num=total,
+                total_tokens_num_prefill=total,
+                total_seqs_num=len(seqs),
+                total_seqs_num_prefill=len(seqs),
+                is_dummy_run=True,
+            )
+            try:
+                self.forward(batch)
+                done += 1
+            # A bucket that cannot run as a dummy forward is skipped.
+            except Exception as e:  # noqa: BLE001
+                failed += 1
+                logger.warning(
+                    f"{self.label}: prefill ladder warmup at {total} rows failed: {e}"
+                )
+            self.tokenID_processor.clean()
+            if (done + failed) % 50 == 0:
+                logger.info(
+                    f"{self.label}: prefill ladder warmup {done + failed} sizes, "
+                    f"{time.time() - start_time:.0f} s (now at {total} rows)"
+                )
+        torch.cuda.empty_cache()
+        logger.info(
+            f"{self.label}: prefill ladder warmup done: {done} sizes ({failed} failed) "
+            f"in {time.time() - start_time:.1f} s"
+        )
+
+    @torch.inference_mode()
+    def _warmup_decode_draft_context(self):
+        """A recipe's ``engine.decode_warmup_widths`` (decode request widths;
+        off when unset): the draft's context projection once per row count a
+        real step can hand it, on every rank, before serving.
+
+        `write_context_kv` runs after every real target forward, outside the
+        graph, on `step.running_tokens` rows: a decode's request bucket times
+        its rows per request, or the decoder tail of a prefill finishing a
+        prompt (request bucket x window). Its two GEMMs -- main_proj and the
+        stages' fused wkv -- take an AITER FlyDSL kernel per tuned row-count
+        bucket, and every dummy run (warmup, the prefill ladder, graph capture)
+        returns before them. So each bucket's first use is a trace made in
+        service, by all DP ranks at once the first time the group reaches a
+        new decode width. This runs them here instead.
+
+        The value is "capture" (the declared capture ladder) or a list such as
+        "1-32,48,64,128,256". ``engine.decode_warmup_tails`` is the tails'
+        request counts: unset, the same widths; "0", none; else a list of its
+        own. Constant rows in, nothing written, no collective: the ranks need
+        not agree on anything here. The draft model runs it
+        (`warm_context_projection`); a draft without one is skipped."""
+        options = plugin_host.engine_options()
+        spec = (options.decode_warmup_widths or "").strip()
+        drafter = getattr(self, "drafter", None)
+        model = getattr(drafter, "model", None)
+        if not spec or model is None:
+            return
+        warm = getattr(model, "warm_context_projection", None)
+        if warm is None:
+            logger.info(
+                f"{self.label}: decode ladder warmup: no draft context GEMM, skipped"
+            )
+            return
+
+        def counts(text):
+            if text.lower() == "capture":
+                return sorted({w for w in self.config.capture_sizes if w > 0})
+            found = set()
+            for tok in text.replace(",", " ").split():
+                low, _, high = tok.partition("-")
+                found.update(range(int(low), int(high or low) + 1))
+            return sorted(w for w in found if w > 0)
+
+        widths = counts(spec)
+        cap = self.config.max_num_batched_tokens
+        q_buckets = self._dspark_capture_q_buckets(drafter.mtp_k + 1)
+        rows = {w * q for w in widths for q in q_buckets}
+        geometry = getattr(self.attn_metadata_builder, "geometry", None)
+        window = getattr(geometry, "window_size", None)
+        tails = (options.decode_warmup_tails or "").strip()
+        if window and tails != "0":
+            rows.update(min(w * window, cap) for w in (counts(tails) or widths))
+        rows = sorted(r for r in rows if r <= cap)
+        packed = getattr(geometry, "window_fp8", None)
+        start_time = time.time()
+        done = failed = 0
+        for num_rows in rows:
+            try:
+                warm(num_rows, packed)
+                done += 1
+            # A width that cannot run here is skipped.
+            except Exception as e:  # noqa: BLE001
+                failed += 1
+                logger.warning(
+                    f"{self.label}: decode ladder warmup at {num_rows} rows failed: {e}"
+                )
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        logger.info(
+            f"{self.label}: decode ladder warmup done: {len(widths)} widths "
+            f"in {time.time() - start_time:.1f} s ({done} row counts, {failed} failed, "
+            f"rows {rows[0] if rows else 0}..{rows[-1] if rows else 0})"
+        )
 
     def _kv_budget_extra_reserve(self, total_bytes: int) -> int:
         """Extra GPU bytes to hold back from the KV cache budget beyond the

@@ -89,6 +89,34 @@ def _opt_str(value: Any, where: str) -> str | None:
     return value.strip()
 
 
+def _row_counts(value: Any, where: str) -> str | tuple[int, ...] | None:
+    """A file of row counts (a path) or the row counts themselves."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return _opt_str(value, where)
+    if not isinstance(value, (list, tuple)) or not all(
+        isinstance(x, int) and not isinstance(x, bool) and x > 0 for x in value
+    ):
+        raise RecipeRefused(
+            "recipe-schema", f"{where} must be a path or a list of positive ints"
+        )
+    return tuple(value)
+
+
+_WIDTHS_RE = re.compile(r"^\d+(-\d+)?([ ,]+\d+(-\d+)?)*$")
+
+
+def _widths(value: Any, where: str, *, words: tuple[str, ...]) -> str | None:
+    """Request widths: one of ``words``, or a list such as "1-32,48,64"."""
+    text = _opt_str(value, where)
+    if text is None or text.lower() in words or _WIDTHS_RE.match(text):
+        return text
+    raise RecipeRefused(
+        "recipe-schema", f"{where} must be one of {words} or a list like '1-32,48'"
+    )
+
+
 def _freeze_placement(
     value: Any, where: str
 ) -> str | tuple[tuple[str, tuple[int, ...]], ...] | None:
@@ -149,6 +177,14 @@ class EngineOptions:
     # Pin the pages of a copied Engram shard against page migration
     # (`atom.model_ops.engram.host_memory._pin_pages`).
     engram_pin_pages: bool = False
+    # Start-up: no MoRI EP op handles at model build
+    # (`atom.model_ops.fused_moe.deferred_mori_op`); dummy prefill forwards
+    # at these row counts and the draft's context projection at these decode
+    # widths before serving (`ModelRunner._maybe_warmup`).
+    mori_defer_handles: bool = False
+    prefill_warmup_ladder: str | tuple[int, ...] | None = None
+    decode_warmup_widths: str | None = None
+    decode_warmup_tails: str | None = None
 
     @classmethod
     def from_mapping(cls, raw: Any) -> EngineOptions:
@@ -263,6 +299,24 @@ class EngineOptions:
             engram_pin_pages=_strict_bool(
                 raw.get("engram_pin_pages", defaults.engram_pin_pages),
                 "engine.engram_pin_pages",
+            ),
+            mori_defer_handles=_strict_bool(
+                raw.get("mori_defer_handles", defaults.mori_defer_handles),
+                "engine.mori_defer_handles",
+            ),
+            prefill_warmup_ladder=_row_counts(
+                raw.get("prefill_warmup_ladder", defaults.prefill_warmup_ladder),
+                "engine.prefill_warmup_ladder",
+            ),
+            decode_warmup_widths=_widths(
+                raw.get("decode_warmup_widths", defaults.decode_warmup_widths),
+                "engine.decode_warmup_widths",
+                words=("capture",),
+            ),
+            decode_warmup_tails=_widths(
+                raw.get("decode_warmup_tails", defaults.decode_warmup_tails),
+                "engine.decode_warmup_tails",
+                words=("capture",),
             ),
         )
         if options.prefill_decode_interval_slope > 0 and (
