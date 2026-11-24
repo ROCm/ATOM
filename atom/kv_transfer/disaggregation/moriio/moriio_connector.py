@@ -2193,8 +2193,8 @@ class MoRIIOConnector(KVConnectorBase):
             return
         if source is None:
             logger.error(
-                "[moriio-verify] req %s: the producer sent no digest of the %d "
-                "locally held prefix blocks",
+                "[moriio-verify] req %s: the producer sent no PAGE digest of the "
+                "%d locally held prefix blocks",
                 req_id,
                 len(held),
             )
@@ -2208,20 +2208,23 @@ class MoRIIOConnector(KVConnectorBase):
         differ = [
             i for i, sums in regions.items() if (local[0][i], local[1][i]) != sums
         ]
-        roles = [self._page_regions[i][2] for i in (missing or differ)[:8]]
+
+        def roles(ids: list[int]) -> list[str]:
+            return [self._page_regions[i][2] for i in ids[:8]]
+
         if missing:
             logger.error(
                 "[moriio-verify] req %s: %d of %d PAGE regions of the %d locally "
-                "held prefix blocks were digested by none of the %d producer "
-                "stages (first %s)",
+                "held prefix blocks were written by none of the %d producer "
+                "stages' digests (first %s)",
                 req_id,
                 len(missing),
                 len(self._page_regions),
                 len(held),
                 stages,
-                roles,
+                roles(missing),
             )
-        elif differ:
+        if differ:
             logger.error(
                 "[moriio-verify] req %s: %d of %d regions of the %d locally held "
                 "prefix blocks differ from the producer's (first %s) -- decode "
@@ -2230,9 +2233,9 @@ class MoRIIOConnector(KVConnectorBase):
                 len(differ),
                 len(regions),
                 len(held),
-                roles,
+                roles(differ),
             )
-        else:
+        if not (missing or differ):
             logger.info(
                 "[moriio-verify] req %s: all %d PAGE regions of the %d locally "
                 "held prefix blocks match the producer's %d stage(s)",

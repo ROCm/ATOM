@@ -308,7 +308,7 @@ def test_verify_names_held_regions_no_stage_digested(stack, write_path, pools, c
             )
         assert sorted(calls) == [0, 1, 2, 3]
         _, held = verify_lines(stack, conn, caplog)
-        assert "digested by none of the 4 producer stages" in held[0], held
+        assert "written by none of the 4 producer stages" in held[0], held
     finally:
         d_side.pool.copy_(original)
 
