@@ -394,6 +394,19 @@ class DeepSeekV41ShareCacheCellsTest(unittest.TestCase):
                     settings,
                 )
 
+    def test_store_reads_prefer_the_owner_nic_on_the_requesters_rail(self):
+        for cell in self.cells:
+            with self.subTest(cell=cell["name"]):
+                exports = self.submitted_exports(cell)
+                self.assertEqual(
+                    exports.get("ATOMESH_ENV_MC_ENABLE_DEST_DEVICE_AFFINITY"), "1"
+                )
+                owners = exports["ATOMESH_PREFILL_ENV_MOONCAKE_STORE_DECODE_OWNERS"]
+                self.assertEqual(
+                    [entry.split(":")[2] for entry in owners.split(";")],
+                    ["rdma0,rdma1,rdma2,rdma3", "rdma4,rdma5,rdma6,rdma7"],
+                )
+
     def test_cells_launch_the_recipe_router_or_the_cache_aware_flow(self):
         self.assertEqual(
             {cell["name"] for cell in self.cells},
