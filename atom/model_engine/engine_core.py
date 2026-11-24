@@ -106,6 +106,7 @@ class EngineCore:
         self._last_backlog_report: tuple[int, int] | None = None
         self._next_backlog_report = 0.0
         self._kv_progress_event = threading.Event()
+        self._waited_for_kv = False
         self.input_queue = queue.Queue[Sequence]()
         self.output_queue = queue.Queue[list[Sequence]]()
         self.stream_output_queue = (
@@ -576,12 +577,12 @@ class EngineCore:
                         self.scheduler.engine_stats.bump_step()
                     else:
                         self.scheduler.engine_stats.note_idle(now)
-                        time.sleep(IDLE_YIELD_S)
+                        self._yield_on_idle_pass()
                 else:
                     self.scheduler.engine_stats.note_idle(now)
                     if self.has_pending_kv_work():
                         self._advance_idle_kv_transfer()
-                    time.sleep(IDLE_YIELD_S)
+                    self._yield_on_idle_pass()
         finally:
             try:
                 # Teardown runs even on exceptions so the sender thread/socket
@@ -596,6 +597,14 @@ class EngineCore:
                 self.scheduler.close_kv_connector()
             finally:
                 tracing.shutdown()
+
+    def _yield_on_idle_pass(self) -> None:
+        # Skip it when this pass already blocked on KV progress (the GIL was
+        # released) or queued work is waiting to be picked up.
+        waited, self._waited_for_kv = self._waited_for_kv, False
+        if waited or not self.input_queue.empty() or not self.utility_queue.empty():
+            return
+        time.sleep(IDLE_YIELD_S)
 
     def _process_engine_step(self):
         return self._run_then_publish_kv_events(self._process_engine_step_inner)
@@ -693,6 +702,7 @@ class EngineCore:
         # Work queued before the event was cleared must also prevent sleeping.
         if not self.input_queue.empty() or not self.utility_queue.empty():
             return
+        self._waited_for_kv = True
         self._kv_progress_event.wait(KV_IDLE_DRAIN_INTERVAL_S)
 
     def _postprocess(self, seqs, fwd_out, batch):

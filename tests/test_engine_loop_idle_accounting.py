@@ -26,6 +26,7 @@ ENGINE_CORE = Path(__file__).resolve().parents[1] / "atom/model_engine/engine_co
 INTERVAL_STEPS = 4
 
 WORK, STALLED, IDLE, OFFLOAD = "work", "stalled", "idle", "offload"
+KV_WAITED, QUEUED = "kv_waited", "queued"  # STALLED variants
 
 
 def _extract(class_name: str, method: str):
@@ -91,7 +92,9 @@ class _Engine:
             shutdown_kv_events=lambda: None,
             close_kv_connector=lambda: None,
         )
-        self.utility_queue = None
+        self.utility_queue = SimpleNamespace(empty=lambda: True)
+        self.input_queue = SimpleNamespace(empty=lambda: self._state is not QUEUED)
+        self._waited_for_kv = False
         self.utility_handler = SimpleNamespace(
             process_queue=lambda *a: self._advance(),
             push_metrics=lambda: None,
@@ -135,6 +138,8 @@ class _Engine:
         )
 
     def _process_engine_step(self):
+        if self._state is KV_WAITED:
+            self._waited_for_kv = True
         if self._state is not WORK:
             return False
         self.forwards += 1
@@ -159,6 +164,9 @@ def _run(class_name, schedule, sleeps=None, **kw):
     scope["time"].monotonic = engine.now
     if sleeps is not None:
         scope["time"].sleep = sleeps.append
+    yield_, yield_scope = _extract("EngineCore", "_yield_on_idle_pass")
+    yield_scope["time"] = scope["time"]
+    engine._yield_on_idle_pass = yield_.__get__(engine)
     with pytest.raises(StopIteration):
         loop(engine)
     return engine
@@ -276,3 +284,14 @@ def test_the_base_loop_yields_only_on_passes_without_a_forward():
     )
     assert engine.forwards == 3
     assert sleeps == [2e-4] * 4
+
+
+def test_the_base_loop_skips_the_yield_after_a_kv_wait_or_with_queued_work():
+    """The KV wait already released the GIL; queued work is picked up at once."""
+    sleeps: list = []
+    _run(
+        "EngineCore",
+        [(0.0, KV_WAITED), (1.0, QUEUED), (2.0, STALLED), (3.0, IDLE)],
+        sleeps=sleeps,
+    )
+    assert sleeps == [2e-4] * 2
