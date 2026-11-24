@@ -247,13 +247,15 @@ def bar_all():
 
 
 @_ASTR.transform
-def nb_enter():
+def nb_enter(hwoff):
     """(16-wave CTA, the body's first statement) wave 0 sets up MB (8 members) and HB (the 8 helpers + wave 0's wake
-    signal), a -1 barrier, then each wave joins its own. Returns the wave index (scalar)."""
+    signal), and zeroes the helpers' wake word (LDS byte hwoff past the dynamic LDS base: nb_park / nb_wake), a -1
+    barrier, then each wave joins its own. Returns the wave index (scalar)."""
     wv = wave_s()
     if wv == 0:
         _rd.s_barrier_init(_nbar(NB_MAIN), 8)
         _rd.s_barrier_init(_nbar(NB_HELP), 9)
+        lstore(lds_base() + hwoff, fx.Int32(0), scope="workgroup")
     bar_all()
     if wv < 8:
         _rd.s_barrier_join(_nbar(NB_MAIN))
@@ -262,17 +264,22 @@ def nb_enter():
     return wv
 
 
-def nb_park():
-    """(a helper wave) wait in HB until wave 0's wake (nb_wake)."""
-    _rd.s_barrier_signal_var(_nbar(NB_HELP), 0)
-    _rd.s_barrier_wait(1)
+@_ASTR.transform
+def nb_park(hwoff, tok):
+    """(a helper wave) wait until wave 0's wake word (LDS hwoff) reaches this layer's token tok (nb_wake): an LDS poll,
+    bounded (POLL_TICKS), not named barrier HB -- a wave waiting in a named barrier lost its arrival across a whole-GPU
+    freeze (CT11_STEPRUN §13: the helpers never left HB, the step never ended); LDS and wave state survive it."""
+    rn = fx.Int32(0)
+    while (lload(lds_base() + hwoff, fx.Int32, scope="workgroup") < tok) & (rn < fx.Int32(1 << 30)):   # (no clock in a helper wave's loop)
+        s_sleep(1)
+        rn = rn + 1
     fence_acquire("workgroup")
 
 
-def nb_wake():
-    """(wave 0) release the parked helpers (a signal on HB without joining it; LDS it wrote before is visible to them)."""
+def nb_wake(hwoff, tok):
+    """(wave 0) release the parked helpers: the layer's token into the wake word (LDS it wrote before is visible to them)."""
     fence_release("workgroup")
-    _rd.s_barrier_signal_var(_nbar(NB_HELP), 0)
+    lstore(lds_base() + hwoff, tok, scope="workgroup")
 
 
 def clock():

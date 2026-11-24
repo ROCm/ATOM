@@ -260,6 +260,8 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
     NDR = ndr
     TRD = TR if trd is None else trd
     LD = smem_layout(TRD)
+    # (hbsw) the helpers' wake word: 16 B past the body's dynamic LDS (the launch's smem: HWOFF + 16)
+    HWOFF = -(-max(L["LDS"], ST.HEAD_LDS if ndr else 0, FRONT_LDS_OFF + max(FS.FRONT_LDS, MS.MOE_LDS), RKOFF + FS.RK_BYTES) // 16) * 16
 
     @flyc.kernel(known_block_size=[BLOCK, 1, 1])
     def body(recv0: Int64, recv1: Int64, recv2: Int64, recv3: Int64, cnt: Int64, scale: fx.Float32, fp: Int64,
@@ -267,7 +269,7 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
         # (16-wave CTA) waves 0..7 run the step as the 8-wave CTA did; the helpers 8..15 join only the layers' routed
         # down (target_layer). Every CTA barrier traced here is the main waves' named barrier (hx.bar, hx.NB16).
         hx.NB16 = True
-        wv = hx.nb_enter()
+        wv = hx.nb_enter(HWOFF)
         recv = [recv0, recv1, recv2, recv3]
         stops = [r + i64(STOP_OFF) for r in recv]
         recv, tep = tp_epoch_begin(recv, fp, rank, (lo == fx.Int32(0)) if split else None)
@@ -363,7 +365,7 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
                 # shape (TRD rows, 128 experts top-3, the draft metadata) and its head input dh
                 target_layer(dict(S=sys.modules[__name__], fp=fp, cnt=cnt, scale=scale, tep=tep, rank=rank, ifp4=index_fp4, kvfp4=kv_fp4,
                                      TR=TRD if DRS else TR, NL=NL, L0=seg_lo, LEND=seg_hi, DRS=DRS,
-                                     moe_ids="ids" if DRS else moe_ids, dh=ST.tptr(tp, "dh") if DRS else None), Ly)
+                                     moe_ids="ids" if DRS else moe_ids, dh=ST.tptr(tp, "dh") if DRS else None, HWOFF=HWOFF), Ly)
         if fx.const_expr(part == "target"):   # the step's first launch ends with the head, sampling and verification
             if wv < 8:
                 t = hx.opaque_v(fx.thread_idx.x)
@@ -394,7 +396,7 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
         attention softmax scale; fp: the pointer table (FPTRS, ATAB, layer rows); tp: the step tail's table."""
         _ = keyed
         body(recv0, recv1, recv2, recv3, cnt, scale, fp, tp, lo, hi).launch(
-            grid=(CTAS,), block=(BLOCK,), smem=max(L["LDS"], ST.HEAD_LDS if ndr else 0, FRONT_LDS_OFF + max(FS.FRONT_LDS, MS.MOE_LDS), RKOFF + FS.RK_BYTES), cluster=(CL, 1, 1), stream=stream)
+            grid=(CTAS,), block=(BLOCK,), smem=HWOFF + 16, cluster=(CL, 1, 1), stream=stream)
 
     # (13:00 four-arm A/B, e15) at most 4 waves a SIMD's worth of VGPRs (256) with the routed down's 2 tiles in flight
     # (moe.DNPD): the body's register peak is past the down too (index, UG); either alone was flat or slower
@@ -465,12 +467,12 @@ def target_layer(E, Ly):
         if fx.const_expr(UD):   # (udir: a routed CTA woke them at its UG's entry, in part 0)
             b = hx.opaque_s(fx.block_idx.x)
             if (wv == 0) & (b >= MS.SC0) & (b < MS.SC0 + MS.NSC):
-                hx.nb_wake()
+                hx.nb_wake(E["HWOFF"], Ly - E["L0"] + 1)
         else:
             if wv == 0:
-                hx.nb_wake()
+                hx.nb_wake(E["HWOFF"], Ly - E["L0"] + 1)
     else:
-        hx.nb_park()
+        hx.nb_park(E["HWOFF"], Ly - E["L0"] + 1)
     layer_part(E, Ly, 1)
     if wv < 8:
         layer_part(E, Ly, 2)
@@ -1111,5 +1113,5 @@ def layer_part(E, Ly, part):
             MS.ug_union(crr, rr_ * MS.NRC + ss_, TR)
         else:   # (udir) the helpers out for the UG's second round (ug_union_help, part 1); the first round here
             if hx.wave_s() == 0:
-                hx.nb_wake()
+                hx.nb_wake(E["HWOFF"], Ly - E["L0"] + 1)
             MS.ug_union(dict(crr, u16=1), rr_ * MS.NRC + ss_, TR)
