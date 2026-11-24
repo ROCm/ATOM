@@ -40,9 +40,11 @@ from atom.distributed.kv_events import (
     ZmqEventPublisher,
     make_publisher,
     offset_endpoint,
+    pack_token_ids,
 )
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.scheduler import Scheduler
+from atom.model_engine.sequence import new_token_ids
 
 # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -62,6 +64,13 @@ def _bm_with_events(**overrides) -> BlockManager:
     cfg = MockConfig(**kwargs)
     cfg.kv_events_config = _KVEventsConfig()
     return BlockManager(cfg)
+
+
+def _token_ids(event: BlockStored) -> list[int]:
+    """An event's tokens as a decoder reads them: a loaded prefix's are
+    already encoded (`pack_token_ids`)."""
+    tokens = event.token_ids
+    return msgspec.msgpack.decode(tokens) if isinstance(tokens, msgspec.Raw) else tokens
 
 
 def _dcp_bm_with_events(monkeypatch) -> BlockManager:
@@ -269,6 +278,28 @@ class TestBlockManagerHooks:
         assert removed, f"expected BlockRemoved on eviction, got: {events}"
         assert removed[0].medium == MEDIUM_GPU
 
+    def test_evictions_in_a_row_are_one_block_removed(self, seq_factory):
+        # A prompt taking the pool's four cached blocks evicts them one after
+        # the other: one event names all four. The blocks it then stores start
+        # the next event, and so does an eviction after them.
+        bm = _bm_with_events(num_kvcache_blocks=4, kv_cache_block_size=4)
+        s1 = seq_factory(list(range(16)))
+        _admit(bm, s1)
+        (cached,) = [e for e in bm.take_events() if isinstance(e, BlockStored)]
+        bm.deallocate(s1)
+
+        s2 = seq_factory(list(range(100, 116)))
+        _admit(bm, s2)
+        removed, stored = bm.take_events()
+        assert isinstance(removed, BlockRemoved) and isinstance(stored, BlockStored)
+        assert sorted(removed.block_hashes) == sorted(cached.block_hashes)
+        bm.deallocate(s2)
+
+        _admit(bm, seq_factory(list(range(200, 204))))
+        again, _ = bm.take_events()
+        assert isinstance(again, BlockRemoved) and len(again.block_hashes) == 1
+        assert again.block_hashes[0] in stored.block_hashes
+
     def test_cache_hit_reuse_does_not_emit_block_removed(self, seq_factory):
         bm = _bm_with_events(num_kvcache_blocks=8, kv_cache_block_size=4)
         s1 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
@@ -347,8 +378,8 @@ class TestBlockManagerHooks:
         seq = seq_factory(list(range(8)), multimodal_data={"cache_seed": 7})
         bm.allocate(seq)
         assert bm.publish_loaded_prefix(seq, start_token=0, end_token=8) == 8
-        events = [e for e in bm.take_events() if isinstance(e, BlockStored)]
-        assert [e.extra_keys for e in events] == [[(("0000000000000007", 0),)]] * 2
+        (event,) = [e for e in bm.take_events() if isinstance(e, BlockStored)]
+        assert event.extra_keys == [(("0000000000000007", 0),)] * 2
 
     def test_text_blocks_leave_extra_keys_off_the_wire(self, seq_factory):
         import msgpack
@@ -361,8 +392,8 @@ class TestBlockManagerHooks:
 
     def test_publish_loaded_prefix_offset_after_cached_prefix(self, seq_factory):
         # Blocks 0-1 hashed by the prefill path, blocks 2-3 restored by the
-        # offload loader: one BlockStored per loaded block, positioned at
-        # tokens 8 and 12, the first chained off block 1's hash.
+        # offload loader: one BlockStored for the two loaded blocks, positioned
+        # at token 8 and chained off block 1's hash.
         bm = _bm_with_events()
         seq = seq_factory(list(range(16)))
         bm.allocate(seq)
@@ -372,13 +403,54 @@ class TestBlockManagerHooks:
 
         assert bm.publish_loaded_prefix(seq, start_token=8, end_token=16) == 8
 
-        loaded = [e for e in bm.take_events() if isinstance(e, BlockStored)]
-        assert [e.token_offset for e in loaded] == [8, 12]
-        assert all(e.block_size == 4 for e in loaded)
-        assert loaded[0].parent_block_hash == local[0].block_hashes[-1]
-        assert loaded[1].parent_block_hash == loaded[0].block_hashes[0]
-        assert loaded[0].token_ids == list(range(8, 12))
-        assert loaded[1].token_ids == list(range(12, 16))
+        (loaded,) = [e for e in bm.take_events() if isinstance(e, BlockStored)]
+        assert (loaded.token_offset, loaded.block_size) == (8, 4)
+        assert loaded.parent_block_hash == local[0].block_hashes[-1]
+        assert loaded.block_hashes == [bm.kv.block(b).hash for b in seq.block_table[2:]]
+        assert _token_ids(loaded) == list(range(8, 16))
+
+    def test_a_loaded_run_ends_at_a_block_already_indexed(self, seq_factory):
+        # Another request indexed the prompt's second block of four meanwhile:
+        # the load reports the block before it and the two after it, each run
+        # chained off the block it follows.
+        bm = _bm_with_events(num_kvcache_blocks=16)
+        tokens = list(range(16))
+        hashes = []
+        for i in range(4):
+            parent = hashes[-1] if hashes else -1
+            hashes.append(bm.compute_hash(seq_factory(tokens).token_ids[i * 4 : i * 4 + 4], parent))
+        other = seq_factory(tokens[:8])
+        bm.allocate(other)
+        bm.kv.publish(other.block_table[1], hashes[1], other.token_ids[4:8])
+
+        seq = seq_factory(tokens)
+        bm.allocate(seq)
+        bm.take_events()
+        assert bm.publish_loaded_prefix(seq, start_token=0, end_token=16) == 16
+
+        first, rest = [e for e in bm.take_events() if isinstance(e, BlockStored)]
+        assert (first.block_hashes, first.parent_block_hash) == (hashes[:1], None)
+        assert (first.token_offset, _token_ids(first)) == (0, tokens[:4])
+        assert (rest.block_hashes, rest.parent_block_hash) == (hashes[2:], hashes[1])
+        assert (rest.token_offset, _token_ids(rest)) == (8, tokens[8:])
+
+    def test_packed_token_ids_decode_as_the_list(self):
+        # The array header changes form at 16 and at 65536 tokens.
+        for n in (0, 1, 15, 16, 4096, 65535, 65536, 70000):
+            tokens = new_token_ids((i * 7919) % 200_000 for i in range(n))
+            event = BlockStored(
+                block_hashes=[1],
+                parent_block_hash=None,
+                token_ids=pack_token_ids(tokens),
+                block_size=max(n, 1),
+                lora_id=None,
+                medium=MEDIUM_GPU,
+                lora_name=None,
+            )
+            wire = msgspec.msgpack.Decoder(BlockStored).decode(
+                msgspec.msgpack.encode(event)
+            )
+            assert wire.token_ids == tokens.tolist(), n
 
     def test_record_remote_store_carries_token_offset(self, seq_factory):
         bm = _bm_with_events()
@@ -409,7 +481,7 @@ class TestDCPBlockStoredGranularity:
     def _assert_hash_block_aligned(event, expected_hashes):
         assert event.block_size == 8
         assert len(event.block_hashes) == expected_hashes
-        assert len(event.token_ids) == expected_hashes * event.block_size
+        assert len(_token_ids(event)) == expected_hashes * event.block_size
 
     def test_hash_blocks_reports_hash_block_size(self, seq_factory, monkeypatch):
         bm = _dcp_bm_with_events(monkeypatch)
@@ -433,7 +505,7 @@ class TestDCPBlockStoredGranularity:
 
         event = self._only_stored_event(bm)
         self._assert_hash_block_aligned(event, expected_hashes=1)
-        assert event.token_ids == list(range(8))
+        assert _token_ids(event) == list(range(8))
 
     def test_publish_loaded_prefix_offset_after_cached_prefix_dcp(
         self, seq_factory, monkeypatch
@@ -453,7 +525,7 @@ class TestDCPBlockStoredGranularity:
         self._assert_hash_block_aligned(event, expected_hashes=1)
         assert event.token_offset == 8
         assert event.parent_block_hash == local.block_hashes[-1]
-        assert event.token_ids == list(range(8, 16))
+        assert _token_ids(event) == list(range(8, 16))
 
     def test_record_remote_store_reports_hash_block_size(self, monkeypatch):
         bm = _dcp_bm_with_events(monkeypatch)
