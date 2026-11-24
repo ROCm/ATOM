@@ -375,9 +375,12 @@ def prepare_consumer(conn):
     conn._write_report_counts = {}
     conn._write_reports = {}
     conn._stage_digests = {}
+    conn._stage_held_digests = {}
     conn._write_page_digests = {}
     conn._write_state_digests = {}
     conn._verify_page_dst = {}
+    conn._verify_held_dst = {}
+    conn._write_held_digests = {}
 
 
 class TestRefusals:
