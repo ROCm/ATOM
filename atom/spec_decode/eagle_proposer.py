@@ -237,8 +237,8 @@ class EagleProposer(Drafter):
             # Shallow-copy instead of deepcopy: with MLA targets (K2.6), the
             # atom_config holds non-picklable cuda.Stream objects under
             # downstream fields that deepcopy can't traverse. We only mutate
-            # hf_config and compilation_config.level on the draft, so
-            # isolating just those two attrs is sufficient.
+            # hf_config, compilation_config.level and kv_cache_dtype on the
+            # draft, so isolating just those attrs is sufficient.
             draft_atom_config = copy.copy(self.config)
             draft_atom_config.hf_config = draft_model_hf_config
             draft_atom_config.compilation_config = copy.copy(
@@ -256,8 +256,9 @@ class EagleProposer(Drafter):
                 layer_offset=self.config.hf_config.num_hidden_layers,
             )
             # Whether this draft needs a KV pool of its own is a property of
-            # the draft's config, answered by the backend that config resolves
-            # to. A draft whose rows are the target's latent (K2.6 EAGLE 3.1)
+            # the draft's config, decided by the draft's attention family
+            # (`selector.DRAFT_POOL_FAMILIES`, the answer `draft_owns_kv_pool`
+            # gives). A draft whose rows are the target's latent (K2.6 EAGLE 3.1)
             # binds into the target's pool and gets None here; model_runner
             # accounts for its +1 layer via num_nextn_predict_layers.
             builder = draft_kv_builder(self.runner, draft_model_hf_config, model)
