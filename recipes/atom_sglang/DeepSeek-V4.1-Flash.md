@@ -11,7 +11,7 @@ ATOM's step metadata.
 The FP4PTPC checkpoint runs only with its routed experts converted to per-channel FP8 at load, as in native ATOM: the
 launch passes ATOM's online quantization through `--model-loader-extra-config` (below). Without it the plugin refuses
 the checkpoint before loading weights, as native ATOM refuses it without `--online_quant_config`. Use aiter a53213dc4
-or later, the commit native ATOM's DeepSeek-V4.1-Flash recipe pins.
+or later (the commit native ATOM's DeepSeek-V4.1-Flash recipe pins).
 
 ## Launching Server
 
