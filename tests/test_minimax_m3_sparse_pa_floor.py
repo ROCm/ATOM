@@ -100,18 +100,21 @@ def test_real_device_agrees_with_aiter(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "gluon, enabled, arch, api, max_tokens, error",
+    "gluon, enabled, arch, api, max_tokens, shards, error",
     [
-        (True, False, False, False, 65536, None),
-        (False, False, True, True, 32768, "requires ATOM_PA_FLYDSL=1"),
-        (False, True, False, True, 32768, "GPU supported"),
-        (False, True, True, False, 32768, "explicit-plan API"),
-        (False, True, True, True, 32768, None),
-        (False, True, True, True, 65536, "lower --max-num-batched-tokens"),
+        (True, False, False, False, 65536, 4, None),
+        (False, False, True, True, 32768, 4, "requires ATOM_PA_FLYDSL=1"),
+        (False, True, False, True, 32768, 4, "GPU supported"),
+        (False, True, True, False, 32768, 4, "explicit-plan API"),
+        (False, True, True, True, 32768, 4, None),
+        # Past one plan's rows the sparse attention chunks them
+        # (`flydsl_row_chunks`): PP x TP1 keeps 4 KV heads, 32768 x 4 > 81792.
+        (False, True, True, True, 131072, 4, None),
+        (False, True, True, True, 32768, 1, None),
     ],
 )
 def test_flydsl_startup_config(
-    monkeypatch, gluon, enabled, arch, api, max_tokens, error
+    monkeypatch, gluon, enabled, arch, api, max_tokens, shards, error
 ):
     monkeypatch.setattr(
         minimax_m3_model, "pa_decode_gluon_supports_arch", lambda: gluon
@@ -119,11 +122,14 @@ def test_flydsl_startup_config(
     monkeypatch.setattr(minimax_m3_model.envs, "ATOM_PA_FLYDSL", enabled)
     monkeypatch.setattr(minimax_m3_model, "_flydsl_arch_supported", lambda: arch)
     monkeypatch.setattr(minimax_m3_model, "_flydsl_explicit_plan_api", lambda: api)
-    monkeypatch.setattr(ulysses_sp, "attn_head_shard_size", lambda: 4)
-    monkeypatch.setattr(minimax_m3_model, "_flydsl_plan_max_batch", lambda: 81792)
+    monkeypatch.setattr(ulysses_sp, "attn_head_shard_size", lambda: shards)
+    # gfx1250's plan; the validator no longer reads it (raising=False).
+    monkeypatch.setattr(
+        minimax_m3_model, "_flydsl_plan_max_batch", lambda: 81792, raising=False
+    )
     atom_config = SimpleNamespace(max_num_batched_tokens=max_tokens)
     model_config = SimpleNamespace(
-        num_key_value_heads=8,
+        num_key_value_heads=4,
         sparse_attention_config={"sparse_attention_freq": [1]},
     )
     call = lambda: minimax_m3_model._validate_sparse_flydsl_config(
