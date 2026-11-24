@@ -2903,13 +2903,20 @@ CITED_ID = re.compile(_ID_HEAD + r":")
 def _diff_vocabulary(diff_text):
     """-> the id-shaped words the code under review uses as its own.
 
-    Nineteen of the 54 ids also appear under atom/ or docs/ as ordinary words: B1..B7
-    are the KV-offload chunk groups (atom/kv_transfer/offload/README.md), C1..C3 the
-    MTP4 rows and deepseek_v4's cuda-graph capture topology
+    Many of the 54 ids also appear under atom/ as ordinary words: B1..B7 are the
+    KV-offload chunk groups (atom/kv_transfer/offload/README.md), C1..C3 the MTP4 rows
+    and deepseek_v4's cuda-graph capture topology
     (atom/models/glm52/mono/kernels/op.py, atom/models/deepseek_v4/mono/session.py),
-    and D6, D10, E1, E2, G1, G2, H2, I1 and N1 the rest. (C4 belongs to that topology
-    too and is not an id at all, which is the other half of the same problem.) The
-    count is what the tree says today, not a constant. No shape separates `C1` the rule
+    T1 and D11 label obligations in atom/mesh/tests/*.rs, and there are more.
+    (C4 belongs to that topology too and is not an id at all, which is the other half
+    of the same problem.)
+
+    Deliberately no number here. Four were written into this comment during review --
+    eleven, ten, nineteen, twenty-two -- and every one of them was wrong, because the
+    answer moves with the tree and with which file extensions the counter happened to
+    grep. A constant in a comment is the thing that rots; the examples are not.
+
+    No shape separates `C1` the rule
     from `C1` the row -- that is the lesson of the word lists this gate went through --
     so ask the diff instead, which is the one thing that is not a guess. `_mentions_symbol`
     answers the neighbouring question the same way: by what the text actually says, never

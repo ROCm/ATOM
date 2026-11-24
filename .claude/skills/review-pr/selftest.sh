@@ -512,10 +512,11 @@ t "an A5: card against an A5 FIRE is refused for the id, not for tracing" \
   "$(_card_kinds "$_CARD_ID" "$_V_PATH" "$_DIFF")" "RULE-CODE-IN-CARD"
 t "the same card without the id traces by path" \
   "$(_card_kinds "$_CARD_PATH" "$_V_PATH" "$_DIFF")" ""
-# Nineteen of the 54 ids also appear under atom/ or docs/ as ordinary words: B1..B7 are
-# the KV-offload chunk groups, C1..C3 the MTP4 rows and deepseek_v4's capture topology,
-# and D6, D10, E1, E2, G1, G2, H2, I1 and N1 the rest. (C4 belongs to that topology too
-# and is not an id at all.) The count is what the tree says today, not a constant. No
+# Many of the 54 ids also appear under atom/ as ordinary words: B1..B7 are the
+# KV-offload chunk groups, C1..C3 the MTP4 rows and deepseek_v4's capture topology,
+# T1 and D11 label obligations in atom/mesh/tests/*.rs, and there are more. (C4 belongs
+# to that topology too and is not an id at all.) No number here on purpose -- see
+# _diff_vocabulary: four were written during review and all four were wrong. No
 # shape separates `B1` the rule from `B1` the chunk group, so the diff decides. Refusing a
 # lawful finding is fatal -- the way out is an untrue `-- not reported:` -- while
 # shipping an id-led line is cosmetic, so a word the PR uses itself is not read as an id.
