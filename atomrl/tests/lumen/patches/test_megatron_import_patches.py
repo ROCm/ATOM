@@ -40,7 +40,6 @@ class TestMegatronImportPatches:
         assert spec.fn is self.moe_fused_router.install_moe_fused_router
 
     def test_install_moe_fused_router_patches_moe_utils(self):
-        pytest.importorskip("torch")
         from atomrl.lumen.ops.moe.fused_router import (
             fused_compute_score_for_moe_aux_loss,
             fused_moe_aux_loss,
@@ -173,10 +172,54 @@ class TestMegatronImportModuleLocation:
         PatchRegistry.clear()
 
     def test_megatron_import_registers_core_patches(self):
-        pytest.importorskip("torch")
         _load_megatron_import()
         names = {
             spec.name for spec in PatchRegistry.all() if spec.phase is PatchPhase.IMPORT
         }
         assert "fused_layer_norm" in names
         assert "mmap_checkpoint" in names
+
+    def test_mmap_checkpoint_does_not_replace_global_torch_load(self, monkeypatch):
+        import io
+
+        import torch
+
+        megatron_import = _load_megatron_import()
+
+        checkpointing = types.ModuleType("megatron.training.checkpointing")
+        common = types.ModuleType("megatron.core.dist_checkpointing.strategies.common")
+        checkpointing.torch = torch
+        common.torch = torch
+        for name in (
+            "megatron",
+            "megatron.training",
+            "megatron.core",
+            "megatron.core.dist_checkpointing",
+            "megatron.core.dist_checkpointing.strategies",
+        ):
+            monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+        monkeypatch.setitem(
+            sys.modules, "megatron.training.checkpointing", checkpointing
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "megatron.core.dist_checkpointing.strategies.common",
+            common,
+        )
+
+        calls = []
+
+        def fake_load(*args, **kwargs):
+            calls.append((args, kwargs))
+            return "loaded"
+
+        monkeypatch.setattr(torch, "load", fake_load)
+        megatron_import.install_mmap_checkpoint()
+
+        assert torch.load is fake_load
+        assert checkpointing.torch is not torch
+        assert common.torch is not torch
+        assert checkpointing.torch.load("checkpoint.pt") == "loaded"
+        assert calls[-1][1]["mmap"] is True
+        assert common.torch.load(io.BytesIO(b"checkpoint")) == "loaded"
+        assert "mmap" not in calls[-1][1]

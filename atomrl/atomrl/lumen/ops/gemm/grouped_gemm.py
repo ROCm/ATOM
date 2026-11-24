@@ -11,18 +11,17 @@ used in Mixture-of-Experts architectures.
 Backends:
     - **Triton GMM**: ``gmm`` / ``ptgmm`` / ``nptgmm`` (BF16/FP16 only)
     - **Triton MOE GEMM**: ``moe_gemm_a8w8``, ``moe_gemm_a8w8_blockscale``
-    - **Triton MOE per-token**: ``moe_gemm_per_token`` (fused per-token scale)
-    - **Triton MOE MXFP8**: ``moe_gemm_mxfp8`` (fused MXFP8 microscaling)
+    - **Sequential AITER GEMM**: per-token and MXFP8 grouped execution
     - **CKTile DeepGEMM**: ``deepgemm`` (BF16/FP16/FP8 grouped flat MM)
 
 Quantization modes:
     - ``none``       — BF16 GMM/ptgmm via AITER Triton
     - ``delayed``    — per-tensor FP8 MOE GEMM via AITER Triton
     - ``dynamic``    — per-tensor FP8 MOE GEMM via AITER Triton
-    - ``per_token``  — per-token FP8 fused MOE GEMM via AITER Triton
+    - ``per_token``  — per-token FP8 via sequential AITER GEMM
     - ``blockwise``  — per-block FP8 MOE GEMM via AITER Triton
     - ``blockwise2d`` — same as blockwise (shared kernel)
-    - ``mxfp8``      — MXFP8 fused MOE GEMM via AITER Triton
+    - ``mxfp8``      — MXFP8 via sequential AITER GEMM
 """
 
 import logging
@@ -165,6 +164,7 @@ def grouped_gemm(
     bias: torch.Tensor | None = None,
     block_size: int = 128,
     fp8_dtype: torch.dtype = torch.float8_e4m3fn,
+    output_features: int | None = None,
 ) -> torch.Tensor:
     """Grouped GEMM dispatch with multi-backend fallback (all AITER).
 
@@ -185,6 +185,8 @@ def grouped_gemm(
         bias: Per-expert bias ``[num_experts, N]`` or ``None``.
         block_size: Block size for blockwise mode.
         fp8_dtype: Target FP8 dtype.
+        output_features: Original unpadded output width for pre-quantized MXFP8
+            weights. Required when their stored row count includes padding.
 
     Returns:
         Output tensor ``[total_tokens, N]``.
@@ -194,27 +196,55 @@ def grouped_gemm(
         return try_backends(backends, op_name="grouped_gemm_bf16")
 
     if scaling_type in ("delayed", "dynamic"):
-        backends = []
 
         def _moe_a8w8():
+            from atomrl.lumen.ops.quantize.linear import quantize_input
+
             fn = _get_moe_gemm_a8w8()
-            return fn(lhs, rhs, x_scale, w_scale, group_sizes)
+            x_data, x_static_scale = lhs, x_scale
+            w_data, w_expt_scale = rhs, w_scale
+            if lhs.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+                x_desc = quantize_input(lhs, "dynamic", fp8_dtype)
+                x_data, x_static_scale = x_desc.data, x_desc.scale
+            if rhs.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+                descriptors = [
+                    quantize_input(weight.T.contiguous(), "dynamic", fp8_dtype)
+                    for weight in rhs
+                ]
+                w_data = torch.stack([descriptor.data.T for descriptor in descriptors])
+                w_expt_scale = torch.stack(
+                    [descriptor.scale.reshape(()) for descriptor in descriptors]
+                )
 
-        backends.append((Backend.TRITON, _moe_a8w8))
-
-        def _sequential_fallback():
-            return _grouped_gemm_fp8_sequential(
-                lhs,
-                rhs,
-                group_sizes,
-                x_scale,
-                w_scale,
-                scaling_type,
-                bias,
+            routing_data = _build_routing_data_from_group_sizes(
+                group_sizes, int(group_sizes.sum().item())
+            )
+            static_weight_scale = None
+            expert_weight_scale = None
+            if w_expt_scale is not None:
+                if w_expt_scale.numel() == 1:
+                    static_weight_scale = w_expt_scale.reshape(1)
+                elif w_expt_scale.numel() == len(group_sizes):
+                    expert_weight_scale = w_expt_scale.reshape(-1).float()
+                else:
+                    raise ValueError(
+                        "per-tensor grouped weight scales must contain one value "
+                        f"per expert, got {tuple(w_expt_scale.shape)}"
+                    )
+            return fn(
+                x_data,
+                w_data,
+                None,
+                None,
+                x_static_scale=x_static_scale,
+                w_static_scale=static_weight_scale,
+                bias=bias,
+                routing_data=routing_data,
+                out_dtype=torch.bfloat16,
+                w_expt_scale=expert_weight_scale,
             )
 
-        backends.append((Backend.TRITON, _sequential_fallback))
-        return try_backends(backends, op_name="grouped_gemm_per_tensor")
+        return _moe_a8w8()
 
     if scaling_type in ("blockwise", "blockwise2d"):
         backends = []
@@ -272,54 +302,28 @@ def grouped_gemm(
         return try_backends(backends, op_name="grouped_gemm_blockscale")
 
     if scaling_type == "per_token":
-        backends = []
-
-        def _moe_per_token():
-            from aiter.ops.triton.moe.moe_gemm_per_token import moe_gemm_per_token
-
-            return moe_gemm_per_token(
-                lhs, rhs, x_scale, w_scale, group_sizes, bias=bias
-            )
-
-        backends.append((Backend.TRITON, _moe_per_token))
-
-        def _sequential_fallback():
-            return _grouped_gemm_fp8_sequential(
-                lhs,
-                rhs,
-                group_sizes,
-                x_scale,
-                w_scale,
-                scaling_type,
-                bias,
-            )
-
-        backends.append((Backend.TRITON, _sequential_fallback))
-        return try_backends(backends, op_name="grouped_gemm_per_token")
+        return _grouped_gemm_fp8_sequential(
+            lhs,
+            rhs,
+            group_sizes,
+            x_scale,
+            w_scale,
+            scaling_type,
+            bias,
+            output_features=output_features,
+        )
 
     if scaling_type == "mxfp8":
-        backends = []
-
-        def _moe_mxfp8():
-            from aiter.ops.triton.moe.moe_gemm_mxfp8 import moe_gemm_mxfp8
-
-            return moe_gemm_mxfp8(lhs, rhs, x_scale, w_scale, group_sizes, bias=bias)
-
-        backends.append((Backend.TRITON, _moe_mxfp8))
-
-        def _sequential_fallback():
-            return _grouped_gemm_fp8_sequential(
-                lhs,
-                rhs,
-                group_sizes,
-                x_scale,
-                w_scale,
-                scaling_type,
-                bias,
-            )
-
-        backends.append((Backend.TRITON, _sequential_fallback))
-        return try_backends(backends, op_name="grouped_gemm_mxfp8")
+        return _grouped_gemm_fp8_sequential(
+            lhs,
+            rhs,
+            group_sizes,
+            x_scale,
+            w_scale,
+            scaling_type,
+            bias,
+            output_features=output_features,
+        )
 
     raise ValueError(f"Unknown scaling_type={scaling_type!r}")
 
@@ -334,20 +338,41 @@ def _grouped_gemm_fp8_sequential(
     bias=None,
     block_size=128,
     fp8_dtype=torch.float8_e4m3fn,
+    output_features=None,
 ):
     """Sequential per-expert FP8 GEMM via AITER Triton GEMM backends."""
     from atomrl.lumen.ops.quantize.linear import dispatch_gemm, quantize_input
 
     outputs = []
     offset = 0
+    total_tokens = int(group_sizes.sum().item())
     for g, size in enumerate(group_sizes):
         size = int(size)
         if size == 0:
             continue
         x_g = lhs[offset : offset + size]
-        w_g = rhs[g]
-        xs = x_scale[g] if x_scale is not None and x_scale.dim() > 0 else x_scale
-        ws = w_scale[g] if w_scale is not None and w_scale.dim() > 0 else w_scale
+        # Grouped AITER kernels consume [E, K, N], while dispatch_gemm follows
+        # torch.nn.Linear and consumes each expert weight as [N, K].
+        w_g = rhs[g].transpose(0, 1).contiguous()
+        if x_scale is None or x_scale.ndim == 0 or x_scale.numel() == 1:
+            xs = x_scale
+        elif x_scale.shape[0] >= total_tokens:
+            xs = x_scale[offset : offset + size]
+        else:
+            raise ValueError(
+                "activation scale must be scalar or token-aligned: "
+                f"got {tuple(x_scale.shape)} for {total_tokens} tokens"
+            )
+
+        if w_scale is None or w_scale.ndim == 0 or w_scale.numel() == 1:
+            ws = w_scale
+        elif w_scale.shape[0] == len(group_sizes):
+            ws = w_scale[g]
+        else:
+            raise ValueError(
+                "weight scale must be scalar or expert-aligned: "
+                f"got {tuple(w_scale.shape)} for {len(group_sizes)} experts"
+            )
         b_g = bias[g] if bias is not None else None
 
         if xs is None and scaling_type != "none":
@@ -358,10 +383,15 @@ def _grouped_gemm_fp8_sequential(
             w_g, ws = desc.data, desc.scale
 
         out_g = dispatch_gemm(x_g, w_g, xs, ws, scaling_type, b_g)
-        outputs.append(out_g)
+        width = output_features if output_features is not None else rhs.shape[-1]
+        outputs.append(out_g[:size, :width])
         offset += size
     if not outputs:
-        N = rhs.shape[-1] if rhs.dim() == 3 else rhs.shape[1]
+        N = (
+            output_features
+            if output_features is not None
+            else rhs.shape[-1] if rhs.dim() == 3 else rhs.shape[1]
+        )
         return torch.empty(0, N, device=lhs.device, dtype=torch.bfloat16)
     return torch.cat(outputs, dim=0)
 

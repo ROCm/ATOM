@@ -30,8 +30,8 @@ if [ ! -d "${HOST_DATA}" ]; then
     exit 1
 fi
 
-# Same fetch as the Megatron cases: examples/llama2/tokenizer, not the model dir.
-# The repo is gated, so this uses HF_TOKEN when the directory is still empty.
+# Same public NousResearch fetch as the Megatron cases:
+# examples/llama2/tokenizer, not the model directory.
 source "${SCRIPT_DIR}/../scripts/ensure_tokenizer.sh"
 example_tokenizer llama2 "${SCRIPT_DIR}/tokenizer" || exit 1
 

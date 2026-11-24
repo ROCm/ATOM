@@ -45,8 +45,7 @@ done
 
 # ---- Validate tokenizer path (fall back to script-relative path) -------------
 # An empty examples/llama2/tokenizer directory still exists; only a real
-# tokenizer_config.json counts. meta-llama/Llama-2-7b-hf is gated, so the
-# fetch needs HF_TOKEN.
+# tokenizer_config.json counts. The fallback uses the public NousResearch mirror.
 if [ ! -f "${TOKENIZER:-}/tokenizer_config.json" ]; then
     _FALLBACK="${SCRIPT_DIR}/tokenizer"
     source "${SCRIPT_DIR}/../scripts/ensure_tokenizer.sh"
@@ -55,8 +54,8 @@ if [ ! -f "${TOKENIZER:-}/tokenizer_config.json" ]; then
         export TOKENIZER="${_FALLBACK}"
     else
         echo "ERROR: Tokenizer directory not found: ${TOKENIZER:-<unset>}"
-        echo "  Set TOKENIZER=/path/to/tokenizer before running, or export HF_TOKEN"
-        echo "  so ${_FALLBACK} can be fetched from meta-llama/Llama-2-7b-hf."
+        echo "  Set TOKENIZER=/path/to/tokenizer or allow ${_FALLBACK}"
+        echo "  to be fetched from NousResearch/Llama-2-7b-hf."
         exit 1
     fi
 fi

@@ -159,7 +159,7 @@ aiter_missing() {
     done
 }
 aiter_copy_hint() {
-    echo "  reinstall ROCm/aiter at ff745fb09d669f40cf81d15d3e7598b61fe2a61c"
+    echo "  reinstall ROCm/aiter at adbb6ac8b84110134e0cf4dc513b250d2cc0a75c or newer"
 }
 
 mapfile -t MISSING_REQUIRED < <(aiter_missing "${AITER_REQUIRED[@]}")

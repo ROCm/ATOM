@@ -25,7 +25,7 @@ overrides still apply.
 
 | # | File | Lumen Features Exercised | Requirements |
 |---|------|--------------------------|-------------|
-| 1 | `bench_kernel_launch.py` | FP8 quantized_linear (7 scaling modes), fused MoE, FP8 activation store, attention backends (csrc/triton), norm+GEMM pipeline | 1 GPU + AITER |
+| 1 | `bench_kernel_launch.py` | FP8 quantized_linear (7 scaling modes), FP8 activation store, attention backends (csrc/triton), norm+GEMM pipeline | 1 GPU + AITER |
 | 2 | `bench_comm_overlap.py` | SdmaTpComm async allgather/reduce-scatter, column/row parallel overlap patterns, NCCL vs SDMA comparison, fixed-profile shape sweep | 2+ GPUs |
 | 3 | `bench_fp8_param_allgather.py` | FP8ParamManager, dequant hooks, param compression SNR, **Layer 2 FP8 all-gather** (quant→gather→dequant), profiled E2E gather+forward / pipeline experiments, tail latency profiling, multi-GPU scaling efficiency | 1 GPU (sections 1-5), 2+ GPUs (sections 6-8), 4+ GPUs (sections 9-10) |
 | 4 | `bench_rope_fusion.py` | apply_rotary_pos_emb (1D), fused_rope (Q+K), 2D vision RoPE, 3D video RoPE, GQA configs, NeoX vs GPT-J | 1 GPU + AITER |
@@ -177,14 +177,13 @@ python -m benchmarks.run_traces
 
 # Single group
 python -m benchmarks.run_traces --only kernel   # kernel launch
-python -m benchmarks.run_traces --only comm     # comm-compute overlap
 python -m benchmarks.run_traces --only wgrad    # wgrad delay
 python -m benchmarks.run_traces --only rope     # RoPE fusion
 python -m benchmarks.run_traces --only fp8      # FP8 param
 
 # Single trace function (or multiple)
-python -m benchmarks.run_traces --run trace_fused_moe
-python -m benchmarks.run_traces --run trace_fused_moe trace_fused_qk_rope
+python -m benchmarks.run_traces --run trace_scaling_modes
+python -m benchmarks.run_traces --run trace_scaling_modes trace_fused_qk_rope
 
 # List all available trace function names
 python -m benchmarks.run_traces --list
@@ -195,9 +194,8 @@ Trace files are written to `benchmarks/traces/` (git-ignored). Open them at
 
 | Group | Trace Files | What to Look For |
 |-------|-------------|------------------|
-| kernel | `kernel_fused_moe.json`, `kernel_manual_moe.json`, `kernel_scaling_*.json`, `kernel_attn_*.json` | Kernel count reduction, kernel names, fused vs decomposed |
-| comm | `comm_column_*.json`, `comm_pipeline_*.json` | Stream concurrency: allgather on comm stream overlapping GEMM on compute stream |
-| wgrad | `wgrad_sequential.json`, `wgrad_overlapped.json`, `wgrad_4layer_*.json` | Deferred wgrad on secondary stream overlapping forward on default stream |
+| kernel | `kernel_scaling_*.json`, `kernel_attn_*.json` | Kernel names and scaling/backend differences |
+| wgrad | `wgrad_comm_sequential.json`, `wgrad_comm_overlapped.json`, `wgrad_4layer_*.json` | Deferred wgrad on secondary stream overlapping forward on default stream |
 | rope | `rope_fused_s2048.json`, `rope_pytorch_s2048.json`, `rope_fused_qk.json` | Single fused kernel vs 4+ decomposed PyTorch ops |
 | fp8 | `fp8_quant.json`, `fp8_dequant.json`, `fp8_forward_*.json` | Quant/dequant kernel overhead, BF16 vs FP8 param forward pipeline |
 
@@ -208,7 +206,6 @@ Trace files are written to `benchmarks/traces/` (git-ignored). Open them at
 | Feature | What's Measured |
 |---------|----------------|
 | `quantized_linear` scaling modes | Latency of all 7 modes: none, delayed, dynamic, per_token, blockwise, blockwise2d, mxfp8 |
-| `fused_moe_triton` | End-to-end fused MoE vs individual `fused_topk` + per-expert GEMMs + `fused_unpermute` |
 | `fp8_activation_store` | `LumenGatedMLP(fp8_activation_store=True)` vs `False`: fwd, bwd, and activation memory |
 | Attention backends | `aiter_csrc` vs `aiter_triton`: causal, GQA (32Q/8KV), sliding window, seqlen sweep |
 | Norm + GEMM pipeline | `rmsnorm` → `quantized_linear` with different FP8 scaling modes |

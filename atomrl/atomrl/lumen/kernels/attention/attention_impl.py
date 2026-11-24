@@ -95,7 +95,7 @@ _CSRC_OPS: dict[str, bool] = {}
 def _get_aiter_mha():
     global _aiter_mha
     if _aiter_mha is None:
-        from aiter.ops import mha as _mod
+        import aiter.ops.mha as _mod
 
         _aiter_mha = _mod
     return _aiter_mha

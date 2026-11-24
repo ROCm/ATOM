@@ -561,7 +561,7 @@ def get_args() -> argparse.Namespace:
         "--model-name-or-path",
         type=str,
         default=None,
-        help="HuggingFace model name or local path (e.g. meta-llama/Llama-2-7b-hf).",
+        help="HuggingFace model name or local path (e.g. NousResearch/Llama-2-7b-hf).",
     )
     m.add_argument("--hidden-size", type=int, default=4096)
     m.add_argument("--intermediate-size", type=int, default=11008)
@@ -571,7 +571,7 @@ def get_args() -> argparse.Namespace:
     m.add_argument("--vocab-size", type=int, default=32000)
     m.add_argument("--seq-length", type=int, default=4096)
     m.add_argument(
-        "--tokenizer-name-or-path", type=str, default="meta-llama/Llama-2-7b-hf"
+        "--tokenizer-name-or-path", type=str, default="NousResearch/Llama-2-7b-hf"
     )
     add_common_fsdp_args(parser)
     return parser.parse_args()

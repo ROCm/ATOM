@@ -20,7 +20,7 @@
 #
 # Environment variables:
 #   MEGATRON_ROOT   - path to Megatron-LM-AMD (REQUIRED)
-#   MODEL_NAME      - HF model name (default: meta-llama/Llama-2-70b-hf)
+#   MODEL_NAME      - HF model name (default: NousResearch/Llama-2-70b-hf)
 #   MODEL_SIZE      - Megatron model size tag (default: llama2-70B)
 #   TP              - target tensor parallel size (default: 8)
 #   HF_MODEL_DIR    - directory for HF checkpoint (default: /model)
@@ -53,7 +53,13 @@ fi
 
 export MEGATRON_ROOT
 
-MODEL_NAME=${MODEL_NAME:-"meta-llama/Llama-2-70b-hf"}
+_DEFAULT_MODEL_NAME="NousResearch/Llama-2-70b-hf"
+MODEL_NAME=${MODEL_NAME:-"${_DEFAULT_MODEL_NAME}"}
+if [ "${MODEL_NAME}" != "${_DEFAULT_MODEL_NAME}" ] && [ -z "${MODEL_REVISION:-}" ]; then
+    echo "ERROR: MODEL_REVISION is required when MODEL_NAME overrides ${_DEFAULT_MODEL_NAME}" >&2
+    exit 1
+fi
+MODEL_REVISION=${MODEL_REVISION:-"d955dd853c3a2e520ba165462ae3208e7ddbe1e7"}
 MODEL_SIZE=${MODEL_SIZE:-"llama2-70B"}
 TP=${TP:-8}
 HF_MODEL_DIR=${HF_MODEL_DIR:-"/model"}
@@ -83,6 +89,7 @@ else
     echo "[Step 1/4] Downloading HuggingFace model ..."
     python "${SCRIPT_DIR}/download_model.py" \
         --model_name "${MODEL_NAME}" \
+        --revision "${MODEL_REVISION}" \
         --output_dir "${HF_MODEL_DIR}"
 fi
 

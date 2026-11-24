@@ -90,6 +90,17 @@ def install_language_module_checkpoint_guard():
 # ── 3. Memory-mapped checkpoint loading ─────────────────────────────────────
 
 
+class _TorchLoadProxy:
+    """Module-local torch view with an isolated ``load`` implementation."""
+
+    def __init__(self, torch_module, load):
+        self._torch_module = torch_module
+        self.load = load
+
+    def __getattr__(self, name):
+        return getattr(self._torch_module, name)
+
+
 def install_mmap_checkpoint():
     """Inject ``mmap=True`` into Megatron's ``torch.load`` calls.
 
@@ -118,7 +129,7 @@ def install_mmap_checkpoint():
             continue
         if getattr(mod, "_lumen_mmap_patched", False):
             continue
-        mod.torch.load = _mmap_torch_load
+        mod.torch = _TorchLoadProxy(torch, _mmap_torch_load)
         mod._lumen_mmap_patched = True
 
     _ckpt_mod._lumen_mmap_patched = True

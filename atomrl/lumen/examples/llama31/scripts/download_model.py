@@ -5,7 +5,7 @@
 Thin CLI wrapper around :func:`atomrl.lumen.models.utils.download_hf_model`.
 
 Usage:
-    python download_model.py --model_name meta-llama/Llama-3.1-8B --output_dir /data/model
+    python download_model.py --model_name NousResearch/Meta-Llama-3.1-8B --output_dir /data/model
     python download_model.py --output_dir /data/model --verify
 """
 
@@ -16,6 +16,9 @@ from atomrl.lumen.models.utils import download_hf_model
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
+DEFAULT_MODEL = "NousResearch/Meta-Llama-3.1-8B"
+DEFAULT_REVISION = "1f47e50cdbe801ad8a5174156ec3a0655108fb9f"
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -24,9 +27,8 @@ def main():
     parser.add_argument(
         "--model_name",
         type=str,
-        default="meta-llama/Llama-3.1-8B",
-        help="HuggingFace model name (e.g. meta-llama/Llama-3.1-8B, "
-        "meta-llama/Llama-3.1-8B-Instruct)",
+        default=DEFAULT_MODEL,
+        help="HuggingFace model name; custom repositories require --revision",
     )
     parser.add_argument(
         "--output_dir",
@@ -35,13 +37,28 @@ def main():
         help="Directory to save the downloaded model",
     )
     parser.add_argument(
+        "--revision",
+        default=None,
+        help="Immutable HuggingFace commit",
+    )
+    parser.add_argument(
         "--verify",
         action="store_true",
         default=False,
         help="Compute and print SHA-256 hashes of downloaded weight files.",
     )
     args = parser.parse_args()
-    download_hf_model(args.model_name, args.output_dir, verify=args.verify)
+    revision = args.revision
+    if revision is None:
+        if args.model_name != DEFAULT_MODEL:
+            parser.error("--revision is required with a custom --model_name")
+        revision = DEFAULT_REVISION
+    download_hf_model(
+        args.model_name,
+        args.output_dir,
+        verify=args.verify,
+        revision=revision,
+    )
 
 
 if __name__ == "__main__":

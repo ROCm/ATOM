@@ -80,7 +80,7 @@ def prefer_efficient_backend() -> None:
 
 def _triton_forward(q, k, v, scale):
     """Run AITER's public Triton forward and return SDPA-layout output/LSE."""
-    from aiter.ops.triton.mha import flash_attn_func
+    from aiter.ops.triton.attention.mha import flash_attn_func
 
     qs, ks, vs = (tensor.transpose(1, 2) for tensor in (q, k, v))
     output, lse = flash_attn_func(
@@ -181,7 +181,7 @@ def install_triton_forward(min_seq: int = 1024) -> None:
     _min_seq = int(min_seq)
     if not _claim_mode("dit"):
         return
-    from aiter.ops.triton.mha import flash_attn_func  # noqa: F401
+    from aiter.ops.triton.attention.mha import flash_attn_func  # noqa: F401
 
     F.scaled_dot_product_attention = dit_scaled_dot_product_attention
     logger.info("Installed Lumen DiT SDPA route for sequence lengths >= %d", _min_seq)

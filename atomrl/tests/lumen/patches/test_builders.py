@@ -31,13 +31,10 @@ class TestBuilderPatches:
         importlib.reload(llama_builders)
 
     def _load_megatron_model_builders(self):
-        pytest.importorskip("torch")
-        import importlib
-
-        import atomrl.lumen.patches.builders.megatron_model as megatron_model_builders
-
-        importlib.reload(megatron_model_builders)
-        return megatron_model_builders
+        module_name = "atomrl.lumen.patches.builders.megatron_model"
+        if module_name in sys.modules:
+            return importlib.reload(sys.modules[module_name])
+        return importlib.import_module(module_name)
 
     def test_dsv4_builder_patches_registered(self):
         names = {
@@ -146,3 +143,86 @@ class TestBuilderPatches:
         megatron_model_builders.patch_core_attention(spec)
 
         assert sa_subs.core_attention == ModuleSpec(module=LumenDotProductAttention)
+
+    @pytest.mark.skipif(
+        not __import__("torch").cuda.is_available(), reason="ROCm GPU required"
+    )
+    def test_fused_swiglu_training_uses_updated_weights(self, monkeypatch):
+        import torch
+        import torch.nn.functional as F
+        from megatron.core.transformer import mlp as megatron_mlp
+
+        megatron_model_builders = self._load_megatron_model_builders()
+
+        class FakeMLP(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = SimpleNamespace(
+                    gated_linear_unit=True,
+                    add_bias_linear=False,
+                    tensor_model_parallel_size=1,
+                    activation_func=F.silu,
+                    activation_func_clamp_value=None,
+                    glu_linear_offset=0.0,
+                )
+                self.original_calls = 0
+                self.linear_fc1 = torch.nn.Linear(64, 256, bias=False)
+                self.linear_fc2 = torch.nn.Linear(128, 64, bias=False)
+
+            def forward(self, hidden_states, per_token_scale=None):
+                self.original_calls += 1
+                gate, up = F.linear(hidden_states, self.linear_fc1.weight).chunk(
+                    2, dim=-1
+                )
+                return F.linear(F.silu(gate) * up, self.linear_fc2.weight), None
+
+        monkeypatch.setattr(megatron_mlp, "MLP", FakeMLP)
+        mlp = FakeMLP().to(device="cuda", dtype=torch.bfloat16)
+        model = torch.nn.Sequential(mlp)
+        megatron_model_builders.patch_fused_swiglu_mlp(model)
+
+        optimizer = torch.optim.SGD(mlp.parameters(), lr=0.01)
+        x = torch.randn(4, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        output, _ = mlp(x)
+        output.float().square().mean().backward()
+        assert all(parameter.grad is not None for parameter in mlp.parameters())
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
+        output_after_step, _ = mlp(x.detach())
+        gate, up = F.linear(x.detach(), mlp.linear_fc1.weight).chunk(2, dim=-1)
+        expected = F.linear(F.silu(gate) * up, mlp.linear_fc2.weight)
+        torch.testing.assert_close(output_after_step, expected, atol=0.2, rtol=0.1)
+        assert mlp.original_calls == 0
+
+        mlp(x.detach(), per_token_scale=torch.ones(4, device="cuda"))
+        assert mlp.original_calls == 1
+
+    def test_fused_swiglu_does_not_bypass_tensor_parallel_collective(self, monkeypatch):
+        import torch
+        from megatron.core.transformer import mlp as megatron_mlp
+
+        megatron_model_builders = self._load_megatron_model_builders()
+
+        class FakeMLP(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = SimpleNamespace(
+                    gated_linear_unit=True,
+                    add_bias_linear=False,
+                    tensor_model_parallel_size=2,
+                    activation_func=torch.nn.functional.silu,
+                    activation_func_clamp_value=None,
+                    glu_linear_offset=0.0,
+                )
+                self.linear_fc1 = torch.nn.Linear(8, 16, bias=False)
+                self.linear_fc2 = torch.nn.Linear(8, 8, bias=False)
+
+            def forward(self, hidden_states, per_token_scale=None):
+                return hidden_states, None
+
+        monkeypatch.setattr(megatron_mlp, "MLP", FakeMLP)
+        mlp = FakeMLP()
+        original_forward = mlp.forward.__func__
+        megatron_model_builders.patch_fused_swiglu_mlp(torch.nn.Sequential(mlp))
+        assert mlp.forward.__func__ is original_forward

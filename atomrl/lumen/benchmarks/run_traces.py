@@ -11,8 +11,8 @@ Usage::
 
     python -m benchmarks.run_traces                          # all traces
     python -m benchmarks.run_traces --only kernel            # one group
-    python -m benchmarks.run_traces --run trace_fused_moe    # one function
-    python -m benchmarks.run_traces --run trace_fused_moe trace_fused_qk_rope
+    python -m benchmarks.run_traces --run trace_scaling_modes # one function
+    python -m benchmarks.run_traces --run trace_scaling_modes trace_fused_qk_rope
     python -m benchmarks.run_traces --list                   # show all names
 """
 
@@ -24,11 +24,6 @@ import os
 import torch
 from torch import nn
 
-from benchmarks.bench_comm_overlap import (
-    _apply_patches,
-    _make_column_parallel,
-    _make_row_parallel,
-)
 from benchmarks.bench_utils import (
     TRACE_DIR,
     format_bytes,
@@ -44,67 +39,12 @@ B, S = 2, 2048
 H, D = 32, 128
 HIDDEN = H * D  # 4096
 FFN_HIDDEN = 14336
-NUM_EXPERTS = 8
-TOP_K = 2
 ROTARY_DIM = D
 
 M = B * S  # tokens
 K = HIDDEN
 N = FFN_HIDDEN
 TP_SIZE = 2
-
-
-# ===================================================================
-# 1. Kernel-launch traces
-# ===================================================================
-
-
-def trace_fused_moe() -> list[str]:
-    """Trace fused_moe_triton vs manual per-expert GEMMs."""
-    from atomrl.lumen.ops.moe import fused_moe_triton
-    from atomrl.lumen.ops.moe.fused_routing import fused_topk
-    from atomrl.lumen.ops.quantize.linear import gemm_bf16
-
-    hidden = torch.randn(M, HIDDEN, device="cuda", dtype=torch.bfloat16)
-    expert_w = (
-        torch.randn(
-            NUM_EXPERTS, FFN_HIDDEN, HIDDEN, device="cuda", dtype=torch.bfloat16
-        )
-        * 0.02
-    )
-    logits = torch.randn(M, NUM_EXPERTS, device="cuda", dtype=torch.float32)
-    topk_weights, topk_ids = fused_topk(logits, TOP_K)
-    topk_ids_i32 = topk_ids.to(torch.int32)
-
-    def _fused():
-        fused_moe_triton(
-            hidden,
-            expert_w,
-            topk_ids_i32,
-            topk_weights,
-            num_experts=NUM_EXPERTS,
-            k=TOP_K,
-        )
-
-    def _manual():
-        for eid in range(NUM_EXPERTS):
-            mask = (topk_ids == eid).any(dim=1)
-            if mask.any():
-                gemm_bf16(hidden[mask], expert_w[eid])
-
-    paths = [
-        trace_fn(
-            _fused,
-            os.path.join(TRACE_DIR, "kernel_fused_moe.json"),
-            label="fused_moe_triton",
-        ),
-        trace_fn(
-            _manual,
-            os.path.join(TRACE_DIR, "kernel_manual_moe.json"),
-            label="manual per-expert GEMMs",
-        ),
-    ]
-    return paths
 
 
 def trace_scaling_modes() -> list[str]:
@@ -151,75 +91,6 @@ def trace_attention_backends() -> list[str]:
             label=f"attention causal ({backend})",
         )
         paths.append(p)
-    return paths
-
-
-# ===================================================================
-# 2. Comm-overlap traces (single-GPU, mocked comm)
-# ===================================================================
-
-
-def trace_column_parallel_overlap() -> list[str]:
-    """Trace LumenColumnParallelLinear with overlap=True vs False."""
-    patches = _apply_patches()
-    try:
-        col_ovl = _make_column_parallel(overlap=True)
-        col_no_ovl = _make_column_parallel(overlap=False)
-        col_no_ovl.weight.data.copy_(col_ovl.weight.data)
-        x = torch.randn(B, S, K, device="cuda", dtype=torch.bfloat16)
-
-        paths = [
-            trace_fn(
-                lambda: col_no_ovl(x),
-                os.path.join(TRACE_DIR, "comm_column_no_overlap.json"),
-                label="ColumnParallel tp_comm_overlap=False",
-            ),
-            trace_fn(
-                lambda: col_ovl(x),
-                os.path.join(TRACE_DIR, "comm_column_overlap.json"),
-                label="ColumnParallel tp_comm_overlap=True",
-            ),
-        ]
-    finally:
-        for p in patches:
-            p.stop()
-    return paths
-
-
-def trace_column_row_pipeline() -> list[str]:
-    """Trace full column->row pipeline with and without overlap."""
-    patches = _apply_patches()
-    try:
-        col_ovl = _make_column_parallel(overlap=True)
-        row_ovl = _make_row_parallel(overlap=True, seq_parallel=True)
-        col_no_ovl = _make_column_parallel(overlap=False)
-        row_no_ovl = _make_row_parallel(overlap=False, seq_parallel=True)
-        col_no_ovl.weight.data.copy_(col_ovl.weight.data)
-        row_no_ovl.weight.data.copy_(row_ovl.weight.data)
-
-        x = torch.randn(B, S, K, device="cuda", dtype=torch.bfloat16)
-
-        def _pipeline(col, row):
-            out, _ = col(x)
-            out2d = out.reshape(-1, out.shape[-1])
-            result, _ = row(out2d)
-            return result
-
-        paths = [
-            trace_fn(
-                lambda: _pipeline(col_no_ovl, row_no_ovl),
-                os.path.join(TRACE_DIR, "comm_pipeline_no_overlap.json"),
-                label="column->row pipeline overlap=False",
-            ),
-            trace_fn(
-                lambda: _pipeline(col_ovl, row_ovl),
-                os.path.join(TRACE_DIR, "comm_pipeline_overlap.json"),
-                label="column->row pipeline overlap=True",
-            ),
-        ]
-    finally:
-        for p in patches:
-            p.stop()
     return paths
 
 
@@ -477,8 +348,7 @@ def trace_fp8_forward() -> list[str]:
 # ===================================================================
 
 TRACE_GROUPS = {
-    "kernel": [trace_fused_moe, trace_scaling_modes, trace_attention_backends],
-    "comm": [trace_column_parallel_overlap, trace_column_row_pipeline],
+    "kernel": [trace_scaling_modes, trace_attention_backends],
     "wgrad": [trace_deferred_wgrad_overlap, trace_multi_layer_pipeline],
     "rope": [trace_rope_fused_vs_pytorch, trace_fused_qk_rope],
     "fp8": [trace_fp8_quant_dequant, trace_fp8_forward],
@@ -550,12 +420,8 @@ def main():
             print(f"\n{'=' * 72}")
             print(f"  Trace: {fn_name}  (group: {grp})")
             print("=" * 72)
-            try:
-                paths = fn()
-                all_paths.extend(paths)
-            # Trace-group dispatch skips unsupported optional benchmark families.
-            except Exception as e:  # noqa: BLE001 -- boundary
-                print(f"  [SKIP] {fn_name}: {e}")
+            paths = fn()
+            all_paths.extend(paths)
     else:
         groups = {args.only: TRACE_GROUPS[args.only]} if args.only else TRACE_GROUPS
         for group_name, trace_fns in groups.items():
@@ -567,12 +433,8 @@ def main():
             print("=" * 72)
 
             for fn in trace_fns:
-                try:
-                    paths = fn()
-                    all_paths.extend(paths)
-                # Individual traces may fail in optional backends without aborting the suite.
-                except Exception as e:  # noqa: BLE001 -- boundary
-                    print(f"  [SKIP] {fn.__name__}: {e}")
+                paths = fn()
+                all_paths.extend(paths)
 
     # Summary
     print(f"\n{'=' * 72}")

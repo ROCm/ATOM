@@ -5,8 +5,6 @@ import sys
 import types
 from pathlib import Path
 
-import pytest
-
 if "atomrl.lumen" not in sys.modules:
     _lumen = types.ModuleType("atomrl.lumen")
     _lumen.__path__ = [
@@ -17,7 +15,6 @@ if "atomrl.lumen" not in sys.modules:
 
 class TestFp8ParamStorageModule:
     def test_public_helpers_exported(self):
-        pytest.importorskip("torch")
         mod = importlib.import_module("atomrl.lumen.models.fp8_param_storage")
         for name in (
             "shrink_frozen_weights_to_fp8",
@@ -31,19 +28,16 @@ class TestFp8ParamStorageModule:
             assert hasattr(mod, name), name
 
     def test_legacy_private_aliases(self):
-        pytest.importorskip("torch")
         mod = importlib.import_module("atomrl.lumen.models.fp8_param_storage")
         assert mod._shrink_frozen_weights_to_fp8 is mod.shrink_frozen_weights_to_fp8
         assert mod._patch_meta_materializer is mod.patch_meta_materializer
 
     def test_megatron_reexports_fp8_storage(self):
-        pytest.importorskip("torch")
         megatron = importlib.import_module("atomrl.lumen.models.megatron")
         assert megatron.register_fp8_param_optimizer_hook is not None
         assert megatron._patch_meta_materializer is not None
 
     def test_prepare_hipblaslt_noop_without_hybrid(self):
-        pytest.importorskip("torch")
         from types import SimpleNamespace
 
         from atomrl.lumen.models.fp8_param_storage import (

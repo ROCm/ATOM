@@ -7,8 +7,6 @@ Exercises Lumen's fused-kernel features that reduce kernel-launch overhead:
 
   * **FP8 quantized_linear**: All 7 scaling modes (delayed, dynamic,
     per_token, blockwise, blockwise2d, mxfp8, none/BF16).
-  * **Fused MoE**: ``fused_moe_triton`` (end-to-end) vs individual
-    ``fused_topk`` + per-expert GEMM + ``fused_unpermute``.
   * **FP8 activation store**: ``LumenGatedMLP(fp8_activation_store=True)``
     vs ``fp8_activation_store=False``.
   * **Attention backends**: ``aiter_csrc`` vs ``aiter_triton``.
@@ -44,8 +42,6 @@ H, D = 32, 128
 H_KV = 8
 HIDDEN = H * D  # 4096
 FFN_HIDDEN = 14336
-NUM_EXPERTS = 8
-TOP_K = 2
 
 
 # ---------------------------------------------------------------------------
@@ -137,146 +133,7 @@ class TestQuantizedLinearScalingModes:
 
 
 # ---------------------------------------------------------------------------
-# 2. Fused MoE — end-to-end vs individual routing
-# ---------------------------------------------------------------------------
-
-
-@CUDA
-@AITER
-class TestFusedMoE:
-    """fused_moe_triton (end-to-end) vs individual fused_topk + per-expert GEMMs."""
-
-    def _make_moe_inputs(self, num_tokens=B * S):
-        hidden = torch.randn(num_tokens, HIDDEN, device="cuda", dtype=torch.bfloat16)
-        expert_w = (
-            torch.randn(
-                NUM_EXPERTS,
-                FFN_HIDDEN,
-                HIDDEN,
-                device="cuda",
-                dtype=torch.bfloat16,
-            )
-            * 0.02
-        )
-        logits = torch.randn(
-            num_tokens, NUM_EXPERTS, device="cuda", dtype=torch.float32
-        )
-        return hidden, expert_w, logits
-
-    # Expected: fused_moe_triton launches a single Triton kernel that handles
-    # token alignment, expert dispatch, and GEMM in one pass. This avoids
-    # NUM_EXPERTS separate GEMM launches and the Python-loop overhead of
-    # iterating over experts. Should be significantly faster than individual.
-    def test_fused_moe_triton_latency(self):
-        """End-to-end fused MoE via AITER Triton."""
-        from atomrl.lumen.ops.moe import fused_moe_triton
-        from atomrl.lumen.ops.moe.fused_routing import fused_topk
-
-        hidden, expert_w, logits = self._make_moe_inputs()
-        topk_weights, topk_ids = fused_topk(logits, TOP_K)
-        topk_ids = topk_ids.to(torch.int32)
-
-        r = cuda_timer(
-            lambda: fused_moe_triton(
-                hidden,
-                expert_w,
-                topk_ids,
-                topk_weights,
-                num_experts=NUM_EXPERTS,
-                k=TOP_K,
-            ),
-            label="fused_moe_triton (end-to-end)",
-        )
-        print_report("Fused MoE (End-to-End)", [r])
-        assert r.avg_ms > 0
-
-    # Expected: Slower than fused_moe_triton. Each expert requires a separate
-    # GEMM kernel launch (8 experts = 8 launches), plus fused_topk and
-    # fused_permute overhead. The Python loop and per-expert masking add
-    # host-side latency that the fused kernel avoids entirely.
-    def test_individual_routing_latency(self):
-        """Individual routing: fused_topk + per-expert GEMMs (no fusion)."""
-        from atomrl.lumen.ops.moe.fused_routing import fused_permute, fused_topk
-        from atomrl.lumen.ops.quantize.linear import gemm_bf16
-
-        hidden, expert_w, logits = self._make_moe_inputs()
-        block_size = 32
-
-        def _individual_moe():
-            weights, indices = fused_topk(logits, TOP_K)
-            sorted_ids, _sorted_w, _sorted_expert_ids, _num_valid, _moe_buf = (
-                fused_permute(
-                    hidden,
-                    indices,
-                    weights,
-                    NUM_EXPERTS,
-                    block_size=block_size,
-                )
-            )
-            # sorted_ids is now decoded: flat_idx = token_id * k + slot_id
-            # so sorted_ids // k == token_id, range [0, num_tokens * k)
-            n_slots = sorted_ids.shape[0]
-            expert_out = torch.zeros(
-                n_slots,
-                FFN_HIDDEN,
-                device="cuda",
-                dtype=torch.bfloat16,
-            )
-            # Group slots by expert assignment (via original indices)
-            token_ids = (sorted_ids.long() // TOP_K).clamp(max=hidden.shape[0] - 1)
-            slot_expert = indices[token_ids, sorted_ids.long() % TOP_K]
-            for eid in range(NUM_EXPERTS):
-                mask = slot_expert == eid
-                if mask.any():
-                    inp = hidden[token_ids[mask]]
-                    expert_out[mask] = gemm_bf16(inp, expert_w[eid])
-            return expert_out
-
-        r = cuda_timer(_individual_moe, label="individual routing + per-expert GEMMs")
-        print_report("MoE: Individual Routing", [r])
-        assert r.avg_ms > 0
-
-    # Expected: fused_moe_triton should show >2x speedup over manual per-expert
-    # GEMMs. The fused kernel eliminates NUM_EXPERTS kernel launches, removes
-    # Python-loop scheduling overhead, and performs token-to-expert routing
-    # inside the GPU without round-tripping through host memory.
-    def test_fused_vs_individual_comparison(self):
-        """Direct comparison of fused vs individual MoE."""
-        from atomrl.lumen.ops.moe import fused_moe_triton
-        from atomrl.lumen.ops.moe.fused_routing import fused_topk
-        from atomrl.lumen.ops.quantize.linear import gemm_bf16
-
-        hidden, expert_w, logits = self._make_moe_inputs()
-        topk_weights, topk_ids = fused_topk(logits, TOP_K)
-        topk_ids_i32 = topk_ids.to(torch.int32)
-
-        r_fused = cuda_timer(
-            lambda: fused_moe_triton(
-                hidden,
-                expert_w,
-                topk_ids_i32,
-                topk_weights,
-                num_experts=NUM_EXPERTS,
-                k=TOP_K,
-            ),
-            label="fused_moe_triton",
-        )
-
-        def _manual():
-            for eid in range(NUM_EXPERTS):
-                mask = (topk_ids == eid).any(dim=1)
-                if mask.any():
-                    gemm_bf16(hidden[mask], expert_w[eid])
-
-        r_manual = cuda_timer(_manual, label="manual per-expert GEMMs")
-
-        speedup = r_manual.avg_ms / max(r_fused.avg_ms, 1e-6)
-        r_fused.extra["speedup"] = round(speedup, 2)
-        print_report("Fused MoE vs Manual Per-Expert GEMMs", [r_fused, r_manual])
-
-
-# ---------------------------------------------------------------------------
-# 3. FP8 activation store — memory / latency tradeoff
+# 2. FP8 activation store — memory / latency tradeoff
 # ---------------------------------------------------------------------------
 
 
@@ -769,7 +626,7 @@ def _count_kernels(fn, warmup=2, active=1):
             torch.cuda.synchronize()
 
     kernel_count = sum(
-        1
+        evt.count
         for evt in prof.key_averages()
         if evt.device_type == torch.autograd.DeviceType.CUDA and evt.count > 0
     )
@@ -785,65 +642,6 @@ class TestKernelLaunchCount:
     kernel-launch reduction.' Uses torch.profiler to count distinct CUDA
     kernels launched by fused Lumen ops vs decomposed alternatives.
     """
-
-    # Expected: fused_moe_triton should launch significantly fewer kernels
-    # than the manual per-expert loop. The fused kernel handles all expert
-    # dispatch, permutation, and GEMM in 1-2 kernels; the unfused path
-    # launches fused_topk + NUM_EXPERTS separate GEMMs + fused_unpermute
-    # (at least 10+ kernels for 8 experts).
-    def test_moe_kernel_count(self):
-        from atomrl.lumen.ops.moe import fused_moe_triton
-        from atomrl.lumen.ops.moe.fused_routing import fused_topk
-        from atomrl.lumen.ops.quantize.linear import gemm_bf16
-
-        hidden = torch.randn(B * S, HIDDEN, device="cuda", dtype=torch.bfloat16)
-        expert_w = (
-            torch.randn(
-                NUM_EXPERTS,
-                FFN_HIDDEN,
-                HIDDEN,
-                device="cuda",
-                dtype=torch.bfloat16,
-            )
-            * 0.02
-        )
-        logits = torch.randn(B * S, NUM_EXPERTS, device="cuda", dtype=torch.float32)
-        topk_weights, topk_ids = fused_topk(logits, TOP_K)
-        topk_ids_i32 = topk_ids.to(torch.int32)
-
-        def _fused():
-            fused_moe_triton(
-                hidden,
-                expert_w,
-                topk_ids_i32,
-                topk_weights,
-                num_experts=NUM_EXPERTS,
-                k=TOP_K,
-            )
-
-        def _unfused():
-            for eid in range(NUM_EXPERTS):
-                mask = (topk_ids == eid).any(dim=1)
-                if mask.any():
-                    gemm_bf16(hidden[mask], expert_w[eid])
-
-        n_fused, _ = _count_kernels(_fused)
-        n_unfused, _ = _count_kernels(_unfused)
-
-        reduction = n_unfused - n_fused
-        pct = reduction / max(n_unfused, 1) * 100
-        sep = "=" * 56
-        print(f"\n{sep}")
-        print("  MoE Kernel Launch Analysis")
-        print(sep)
-        print(f"  fused_moe_triton:     {n_fused:3d} kernels")
-        print(f"  per-expert GEMMs:     {n_unfused:3d} kernels")
-        print("  ─────────────────────────────────")
-        print(f"  Reduction:            {reduction:3d} kernels  ({pct:.0f}% fewer)")
-        print(sep)
-        assert (
-            n_fused < n_unfused
-        ), f"Fused ({n_fused}) should use fewer kernels than unfused ({n_unfused})"
 
     # Expected: LumenGatedMLP fuses gate_proj + up_proj + activation + down_proj
     # into fewer kernels than doing separate GEMMs + activation. The fused path
@@ -887,6 +685,9 @@ class TestKernelLaunchCount:
         print("  ─────────────────────────────────")
         print(f"  Reduction:                {reduction:3d} kernels  ({pct:.0f}% fewer)")
         print(sep)
+        assert (
+            n_fused < n_unfused
+        ), f"Fused ({n_fused}) should use fewer kernels than unfused ({n_unfused})"
 
 
 # ---------------------------------------------------------------------------
@@ -900,8 +701,6 @@ def main():
 
     from atomrl.lumen.modules.fused_mlp import LumenGatedMLP
     from atomrl.lumen.ops.attention import attention
-    from atomrl.lumen.ops.moe import fused_moe_triton
-    from atomrl.lumen.ops.moe.fused_routing import fused_topk
     from atomrl.lumen.ops.quantize.linear import quantized_linear
     from atomrl.lumen.quantize.config import _get_float8_e4m3
 
@@ -912,7 +711,15 @@ def main():
     x = torch.randn(B * S, HIDDEN, device="cuda", dtype=torch.bfloat16)
     w = torch.randn(FFN_HIDDEN, HIDDEN, device="cuda", dtype=torch.bfloat16)
     bf16_ms = None
-    for mode in ["none", "delayed", "dynamic", "per_token", "blockwise", "mxfp8"]:
+    for mode in [
+        "none",
+        "delayed",
+        "dynamic",
+        "per_token",
+        "blockwise",
+        "blockwise2d",
+        "mxfp8",
+    ]:
         r = cuda_timer(
             lambda m=mode: quantized_linear(x, w, scaling_type=m, fp8_dtype=fp8_dtype),
             label=f"quantized_linear({mode})",
@@ -964,29 +771,6 @@ def main():
         )
         mlp_results[1].extra["vs_bf16"] = f"{overhead:+.1f}%"
     results.extend(mlp_results)
-
-    # Fused MoE
-    hidden = torch.randn(B * S, HIDDEN, device="cuda", dtype=torch.bfloat16)
-    expert_w = (
-        torch.randn(
-            NUM_EXPERTS, FFN_HIDDEN, HIDDEN, device="cuda", dtype=torch.bfloat16
-        )
-        * 0.02
-    )
-    logits = torch.randn(B * S, NUM_EXPERTS, device="cuda", dtype=torch.float32)
-    topk_weights, topk_ids = fused_topk(logits, TOP_K)
-    r = cuda_timer(
-        lambda: fused_moe_triton(
-            hidden,
-            expert_w,
-            topk_ids.to(torch.int32),
-            topk_weights,
-            num_experts=NUM_EXPERTS,
-            k=TOP_K,
-        ),
-        label="fused_moe_triton",
-    )
-    results.append(r)
 
     print_report("Lumen Single-GPU Feature Benchmarks", results)
 

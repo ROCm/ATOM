@@ -35,7 +35,7 @@ COPY . /workspace/ATOM
 # install time.  Without it, the first CK call triggers JIT compilation
 # which SIGSEGV's inside mp.spawn subprocesses (fork + HIP driver issue).
 ARG AITER_REPOSITORY=https://github.com/ROCm/aiter.git
-ARG AITER_SHA=ff745fb09d669f40cf81d15d3e7598b61fe2a61c
+ARG AITER_SHA=adbb6ac8b84110134e0cf4dc513b250d2cc0a75c
 RUN git clone "${AITER_REPOSITORY}" /opt/aiter && \
     cd /opt/aiter && \
     git checkout --detach "${AITER_SHA}" && \

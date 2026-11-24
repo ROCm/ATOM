@@ -55,7 +55,15 @@ ALL_SCALING_TYPES = [
 # mxfp4 reaches full backward by a different route: DGrad reads a transposed
 # packed-FP4 weight and WGrad applies a Hadamard rotation before quantizing, so
 # neither leg depends on a scale surviving transposition.
-BWD_SCALING_TYPES = ["delayed", "dynamic", "blockwise", "blockwise2d", "mxfp4", "none"]
+BWD_SCALING_TYPES = [
+    "delayed",
+    "dynamic",
+    "blockwise",
+    "blockwise2d",
+    "mxfp8",
+    "mxfp4",
+    "none",
+]
 
 # SNR floors per scaling type — coarser quantization ⇒ lower expected SNR.
 # mxfp8 uses E8M0 exponent-only scales; blockwise has block granularity.
@@ -117,21 +125,6 @@ def _skip_if_unaligned(config, scaling_type, *, bwd=False):
     # the FP8 path is what's being exercised.
     if bwd and scaling_type == "blockwise2d" and config.M % block_size != 0:
         pytest.skip(f"blockwise2d bwd needs M={config.M} divisible by {block_size}")
-    if scaling_type == "mxfp8":
-        try:
-            from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_blockscale import (
-                _get_config,
-            )
-
-            cfg, _ = _get_config(config.M, config.N, config.K)
-            kernel_block_k = cfg.get("BLOCK_SIZE_K", 128)
-            if block_size != kernel_block_k:
-                pytest.skip(
-                    f"mxfp8 quant_block_size={block_size} != kernel BLOCK_SIZE_K={kernel_block_k} "
-                    f"for M={config.M}, N={config.N}, K={config.K}"
-                )
-        except ImportError:
-            pass
 
 
 # ===================================================================
@@ -169,6 +162,46 @@ def test_fp8_linear_fwd(config, scaling_type):
     assert (
         snr > floor
     ), f"FP8 linear fwd ({scaling_type}) SNR: {snr:.1f} dB (expected > {floor})"
+
+
+def test_mxfp8_forward_slices_padded_output():
+    arch = torch.cuda.get_device_properties(0).gcnArchName
+    if not arch.startswith(("gfx950", "gfx1250")):
+        pytest.skip(f"AITER native MXFP8 GEMM is unavailable on {arch}")
+
+    x = torch.randn(17, 128, device="cuda", dtype=torch.bfloat16) * 0.1
+    weight = torch.randn(50, 128, device="cuda", dtype=torch.bfloat16) * 0.02
+    reference = x @ weight.T
+    result = linear_ops.quantized_linear(x, weight, scaling_type="mxfp8")
+
+    assert result.shape == (17, 50)
+    assert compute_snr(reference, result) > _FWD_SNR["mxfp8"]
+
+
+def test_mxfp8_backward_slices_padded_operands():
+    arch = torch.cuda.get_device_properties(0).gcnArchName
+    if not arch.startswith(("gfx950", "gfx1250")):
+        pytest.skip(f"AITER native MXFP8 GEMM is unavailable on {arch}")
+
+    x = (
+        torch.randn(17, 128, device="cuda", dtype=torch.bfloat16) * 0.1
+    ).requires_grad_()
+    weight = (
+        torch.randn(50, 128, device="cuda", dtype=torch.bfloat16) * 0.02
+    ).requires_grad_()
+    x_ref = x.detach().clone().requires_grad_(True)
+    weight_ref = weight.detach().clone().requires_grad_(True)
+    grad = torch.randn(17, 50, device="cuda", dtype=torch.bfloat16)
+
+    result = linear_ops.quantized_linear(x, weight, scaling_type="mxfp8")
+    reference = x_ref @ weight_ref.T
+    result.backward(grad)
+    reference.backward(grad)
+
+    assert x.grad.shape == x.shape
+    assert weight.grad.shape == weight.shape
+    assert compute_snr(x_ref.grad, x.grad) > _BWD_DX_SNR["mxfp8"]
+    assert compute_snr(weight_ref.grad, weight.grad) > _BWD_DW_SNR["mxfp8"]
 
 
 # ===================================================================

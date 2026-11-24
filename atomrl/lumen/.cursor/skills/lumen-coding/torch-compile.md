@@ -16,7 +16,7 @@ Make Lumen's forward and backward passes compatible with `torch.compile`:
 | 1 | `try_backends` try/except dispatch | Critical | `dispatch.py` (all ops) |
 | 2 | `torch.cuda.synchronize()` on success path | Critical | Inside `try_backends` |
 | 3 | 15 unregistered `autograd.Function` subclasses | Major | MLP, norm, CE, CP, SDMA |
-| 4 | Data-dependent `.item()` calls | Major | `grouped_gemm.py`, `scaling_manager.py`, `fused_moe.py` |
+| 4 | Data-dependent `.item()` calls | Major | `grouped_gemm.py`, `scaling_manager.py` |
 | 5 | Manual CUDA stream usage | Moderate | SDMA overlap, HIP graphs, CPU offload |
 | 6 | Runtime try/except import guards | Minor | `attention.py`, `grouped_gemm.py` |
 
@@ -73,7 +73,6 @@ def quant_fp8_blockwise_impl(data, output, scale, block_size, fp8_max):
 |----------|-----|
 | `grouped_gemm.py`: `int(group_sizes.sum().item())` | Use symbolic size or pre-compute |
 | `scaling_manager.py`: amax `.item()` | Keep in eager only; defer in compile mode |
-| `fused_moe.py`: seed `.item()` | Use `torch.randint` directly |
 
 ### SDMA Exclusion
 

@@ -439,6 +439,13 @@ def _safe_fp8_desc(x_fp8, x_scale, fp8_dtype):
     return FP8Descriptor(data=x_fp8, scale=x_scale, fp8_dtype=fp8_dtype)
 
 
+def _mxfp8_k_alignment(x: torch.Tensor) -> int:
+    if not x.is_cuda:
+        return 32
+    arch = torch.cuda.get_device_properties(x.device).gcnArchName
+    return 128 if arch.startswith("gfx1250") else 32
+
+
 def quantize_input(
     x_2d,
     scaling_type,
@@ -535,13 +542,20 @@ def quantize_input(
         from atomrl.lumen.ops.quantize.ops import convert_to_mxfp8
         from atomrl.lumen.ops.quantize.padding import pad_to_block
 
-        mxfp8_block = 32 if block_size > 64 else block_size
+        unpadded_shape = x_2d.shape
+        mxfp8_block = 32
+        k_alignment = _mxfp8_k_alignment(x_2d)
         x_2d, _orig_m = pad_to_block(x_2d, mxfp8_block, dim=0)
-        x_2d, _orig_n = pad_to_block(x_2d, mxfp8_block, dim=-1)
+        x_2d, _orig_n = pad_to_block(x_2d, k_alignment, dim=-1)
         x_fp8, x_scale = convert_to_mxfp8(
             x_2d, block_size=mxfp8_block, axis=-1, float8_dtype_pt=fp8_dtype
         )
-        return FP8Descriptor(data=x_fp8, scale=x_scale, fp8_dtype=fp8_dtype)
+        return FP8Descriptor(
+            data=x_fp8,
+            scale=x_scale,
+            fp8_dtype=fp8_dtype,
+            unpadded_shape=unpadded_shape,
+        )
 
     if scaling_type == "mxfp4":
         from atomrl.lumen.ops.quantize.ops import convert_to_mxfp4, convert_to_mxfp4_2d
@@ -1070,50 +1084,34 @@ def gemm_blockscale_with_bias(a_fp8, w_fp8, scale_a, scale_w, bias):
     return try_backends(backends, op_name="gemm_blockscale_fused_bias")
 
 
-def _e8m0_to_fp32(scales_e8m0):
-    """E8M0 byte -> FP32, including the two values a numeric cast gets wrong.
+def _gemm_mxfp8_aiter(a_fp8, w_fp8, scale_a, scale_w):
+    """Call AITER's native MXFP8 GEMM with its required preshuffled layouts."""
+    arch = torch.cuda.get_device_properties(a_fp8.device).gcnArchName
+    if not arch.startswith(("gfx950", "gfx1250")):
+        raise NotImplementedError(
+            "AITER native MXFP8 GEMM supports gfx950/gfx1250, "
+            f"not {arch.split(':', 1)[0]}"
+        )
+    from aiter.ops.gemm_op_a8w8 import gemm_a8w8_mxfp8_bpreshuffle
+    from aiter.ops.shuffle import (
+        shuffle_mxfp8_bpreshuffle_scale,
+        shuffle_weight,
+    )
 
-    The byte is a biased exponent, so ``0`` is ``2**-127`` and ``0xFF`` is a
-    NaN. Casting the byte to int32 and shifting it into the exponent field
-    turns those into ``0.0`` and ``+inf``. Use the same conversion Lumen's
-    MXFP4 path already uses.
-    """
-    from aiter.utility.fp4_utils import e8m0_to_f32
-
-    return e8m0_to_f32(scales_e8m0)
-
-
-def _gemm_mxfp8_triton(a_fp8, w_fp8, scale_a, scale_w):
-    # AITER dropped its ``gemm_mxfp8`` wrapper; it was only an E8M0 -> FP32
-    # scale conversion in front of the block-scale GEMM, so do that here.
-    from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import gemm_a8w8_blockscale
-
-    M, K = a_fp8.shape
-    assert K == w_fp8.shape[1], "Incompatible K dimensions"
-    block_size = K // scale_a.shape[-1]
-    expected_scale_k = K // block_size
-    assert tuple(scale_a.shape) == (
-        M,
-        expected_scale_k,
-    ), f"scale_a shape {tuple(scale_a.shape)} != expected ({M}, {expected_scale_k})"
-    assert (
-        scale_w.shape[1] == expected_scale_k
-    ), f"scale_w K-dim {scale_w.shape[1]} != expected {expected_scale_k}"
-    return gemm_a8w8_blockscale(
+    w_preshuffled = shuffle_weight(w_fp8, layout=(16, 16))
+    w_scale_preshuffled = shuffle_mxfp8_bpreshuffle_scale(scale_w)
+    return gemm_a8w8_mxfp8_bpreshuffle(
         a_fp8,
-        w_fp8,
-        _e8m0_to_fp32(scale_a),
-        _e8m0_to_fp32(scale_w),
+        w_preshuffled,
+        scale_a,
+        w_scale_preshuffled,
         dtype=torch.bfloat16,
     )
 
 
 def gemm_mxfp8(a_fp8, w_fp8, scale_a, scale_w):
-    """MXFP8 GEMM: Y = X @ W^T with E8M0 block scales via AITER Triton."""
-    backends = [
-        (Backend.TRITON, lambda: _gemm_mxfp8_triton(a_fp8, w_fp8, scale_a, scale_w))
-    ]
-    return try_backends(backends, op_name="gemm_mxfp8")
+    """MXFP8 GEMM through AITER's public native MXFP8 operator."""
+    return _gemm_mxfp8_aiter(a_fp8, w_fp8, scale_a, scale_w)
 
 
 _mxfp4_bwd_fallback_warned = set()
@@ -1291,14 +1289,18 @@ def dispatch_gemm(a, w, scale_a=None, scale_w=None, scaling_type="none", bias=No
         Output tensor ``(M, N)``.
     """
     w_transposed = None
+    a_unpadded_shape = None
+    w_unpadded_shape = None
     # scale_f32_1x1 collapses the scale to (1,1) for hipBLASLt's per-tensor
     # epilogue; that is only valid for per-tensor scalings. block/token/mx
     # scalings carry multi-element scales that must be passed through as-is.
     _per_tensor = scaling_type in ("delayed", "dynamic")
     if isinstance(a, FP8Descriptor):
+        a_unpadded_shape = a.unpadded_shape
         scale_a = a.scale_f32_1x1 if (_PREFER_HIPBLASLT and _per_tensor) else a.scale
         a = a.data
     if isinstance(w, FP8Descriptor):
+        w_unpadded_shape = w.unpadded_shape
         scale_w = w.scale_f32_1x1 if (_PREFER_HIPBLASLT and _per_tensor) else w.scale
         if w._transpose is not None:
             w_transposed = w._transpose
@@ -1310,7 +1312,6 @@ def dispatch_gemm(a, w, scale_a=None, scale_w=None, scaling_type="none", bias=No
     _fuse_bias = (
         bias is not None
         and scaling_type in ("delayed", "dynamic")
-        and _PREFER_HIPBLASLT
         and _PREFER_HIPBLASLT
     )
 
@@ -1336,6 +1337,11 @@ def dispatch_gemm(a, w, scale_a=None, scale_w=None, scaling_type="none", bias=No
         out = gemm_mxfp4_dispatch(a, w, scale_a, scale_w)
     else:
         raise ValueError(f"Unknown scaling_type={scaling_type!r}")
+
+    if scaling_type == "mxfp8":
+        rows = a_unpadded_shape[0] if a_unpadded_shape is not None else out.shape[0]
+        columns = w_unpadded_shape[0] if w_unpadded_shape is not None else out.shape[1]
+        out = out[:rows, :columns]
 
     if bias is not None and not _fuse_bias and not _fuse_blockscale_bias:
         out = out + bias
@@ -2393,6 +2399,99 @@ class QuantizedLinearFunction(torch.autograd.Function):
 
         grad_flat = grad_output.reshape(-1, grad_output.shape[-1])
 
+        if scaling_type == "mxfp8":
+            from atomrl.lumen.ops.quantize.ops import convert_from_mxfp8
+
+            input_rows = 1
+            for size in ctx.input_shape[:-1]:
+                input_rows *= size
+            input_width = ctx.input_shape[-1]
+            weight_shape = ctx.weight_ref.shape
+            input_bf16 = convert_from_mxfp8(
+                input_data,
+                input_scale,
+                output_dtype=torch.bfloat16,
+                block_size=32,
+            )[:input_rows, :input_width]
+            weight_bf16 = convert_from_mxfp8(
+                weight_data,
+                weight_scale,
+                output_dtype=torch.bfloat16,
+                block_size=32,
+            )[: weight_shape[0], : weight_shape[1]]
+
+            grad_bf16 = grad_flat.bfloat16().contiguous()
+            grad_input = dispatch_gemm(
+                grad_bf16,
+                weight_bf16.t().contiguous(),
+                None,
+                None,
+                "none",
+            ).view(ctx.input_shape)
+
+            def _compute_mxfp8_wgrad():
+                return dispatch_gemm(
+                    grad_bf16.t().contiguous(),
+                    input_bf16.t().contiguous(),
+                    None,
+                    None,
+                    "none",
+                )
+
+            if ctx.delay_wgrad and ctx.deferred_wgrad is not None:
+                w_ref = ctx.weight_ref
+                gaf = ctx.gradient_accumulation_fusion
+                manager = ctx.scaling_manager
+
+                def _wgrad_fn():
+                    grad = _compute_mxfp8_wgrad()
+                    if manager is not None:
+                        grad = manager.quantize_grad(grad)
+                    if gaf and hasattr(w_ref, "main_grad"):
+                        w_ref.main_grad.add_(grad)
+                    elif w_ref.grad is not None:
+                        w_ref.grad.add_(grad)
+                    else:
+                        w_ref.grad = grad
+
+                ctx.deferred_wgrad.defer(_wgrad_fn)
+                grad_weight = None
+            else:
+                grad_weight = _compute_mxfp8_wgrad()
+                if ctx.scaling_manager is not None:
+                    grad_weight = ctx.scaling_manager.quantize_grad(grad_weight)
+                if ctx.gradient_accumulation_fusion and hasattr(
+                    ctx.weight_ref, "main_grad"
+                ):
+                    ctx.weight_ref.main_grad.add_(grad_weight)
+                    grad_weight = None
+
+            grad_bias = (
+                grad_output.sum(dim=tuple(range(grad_output.dim() - 1)))
+                if ctx.has_bias
+                else None
+            )
+            return (
+                grad_input,
+                grad_weight,
+                grad_bias,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+
         # Check FP8 grad cache: if a previous layer's dgrad produced FP8
         # output, reuse it directly instead of re-quantizing BF16->FP8.
         _cached = _fp8_cache_pop(
@@ -2656,6 +2755,10 @@ class FP8StoredLinearFunction(torch.autograd.Function):
         pre_quantized_input: tuple | None = None,
     ) -> torch.Tensor:
         input_2d = _to_2d(input)
+        if scaling_type == "mxfp8":
+            raise NotImplementedError(
+                "FP8StoredLinear does not carry MXFP8 unpadded weight metadata"
+            )
 
         if pre_quantized_input is not None:
             input_fp8, input_scale = pre_quantized_input

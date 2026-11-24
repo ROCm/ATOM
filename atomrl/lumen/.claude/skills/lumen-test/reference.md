@@ -15,7 +15,6 @@
 | `test_fused_rope.py` | 277 | 17 | RoPE assertions, probes, layout adapters, correctness vs reference |
 | `test_grouped_gemm.py` | 221 | 6 | Grouped GEMM fwd, bias, wgrad, FP8 scaling, zero groups |
 | `test_linear.py` | 361 | 7 | FP8 linear fwd+bwd (all 7 scaling types), bias, weight-only, bf16 wgrad |
-| `test_moe_fused.py` | 298 | 17 | fused_moe_triton assertions, config, API, correctness, _align_tokens |
 | `test_moe_routing.py` | 280 | 14 | fused_topk/permute/unpermute assertions + correctness |
 | `test_normalization.py` | 682 | 10 | RMSNorm/LayerNorm fwd+bwd, fused quant (all scaling types), MXFP8 |
 | `test_quantize.py` | 458 | 10 | FP8 tensorwise, blockwise, MXFP8 vs torchao references |
@@ -171,7 +170,7 @@
 | CPU Offload | Supported | `test_cpu_offload.py` | Full |
 | Fused RoPE | Supported | `test_fused_rope.py` | Full |
 | MoE Permute/Unpermute | Partial | `test_moe_routing.py` | Full |
-| MoE TopK / Aux Loss | Partial | `test_moe_routing.py`, `test_moe_fused.py` | **No aux loss** |
+| MoE TopK / Aux Loss | Partial | `test_moe_routing.py`, `test_moe_fused_router.py` | AITER top-k; PyTorch aux-loss formula |
 | FP8 Padding/Unpadding | Missing | -- | None |
 | FSDP2 | Supported | `test_fsdp2.py` | **Thin** |
 | LoRA | Supported | `test_megatron.py`, `test_fsdp.py` | Full |

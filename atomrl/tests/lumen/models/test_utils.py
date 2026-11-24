@@ -20,6 +20,7 @@ import sys
 import tempfile
 from unittest import mock
 
+import pytest
 from atomrl.lumen.models.utils import (
     download_hf_dataset,
     download_hf_model,
@@ -169,9 +170,10 @@ class TestDownloadHfModel:
     def test_calls_snapshot_download(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             with mock.patch("huggingface_hub.snapshot_download") as mock_snap:
-                result = download_hf_model("meta-llama/test", tmpdir)
+                result = download_hf_model("meta-llama/test", tmpdir, revision="abc123")
             mock_snap.assert_called_once_with(
                 repo_id="meta-llama/test",
+                revision="abc123",
                 local_dir=tmpdir,
                 local_dir_use_symlinks=False,
             )
@@ -181,7 +183,7 @@ class TestDownloadHfModel:
         with tempfile.TemporaryDirectory() as base:
             outdir = os.path.join(base, "sub", "dir")
             with mock.patch("huggingface_hub.snapshot_download"):
-                download_hf_model("test/model", outdir)
+                download_hf_model("test/model", outdir, revision="abc123")
             assert os.path.isdir(outdir)
 
     def test_verify_prints_hashes(self):
@@ -191,8 +193,17 @@ class TestDownloadHfModel:
                 f.write(b"test data")
 
             with mock.patch("huggingface_hub.snapshot_download"):
-                result = download_hf_model("test/model", tmpdir, verify=True)
+                result = download_hf_model(
+                    "test/model", tmpdir, verify=True, revision="abc123"
+                )
             assert result == tmpdir
+
+    def test_requires_immutable_revision(self):
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(ValueError, match="revision"),
+        ):
+            download_hf_model("test/model", tmpdir)
 
 
 # ===================================================================

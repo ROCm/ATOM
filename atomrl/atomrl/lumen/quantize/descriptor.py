@@ -37,6 +37,7 @@ class FP8Descriptor:
     data: torch.Tensor
     scale: torch.Tensor
     fp8_dtype: torch.dtype
+    unpadded_shape: torch.Size | None = None
     _transpose: torch.Tensor | None = field(default=None, repr=False)
     _scale_f32_1x1: torch.Tensor | None = field(default=None, repr=False)
 

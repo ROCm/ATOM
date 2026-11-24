@@ -9,6 +9,7 @@ import os
 import atomrl.lumen.kernels.mxfp4 as mxfp4_kernels
 import pytest
 import torch
+from aiter.utility.fp4_utils import mxfp4_to_f32
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
@@ -45,9 +46,7 @@ def rebuild_at_rounds():
 
 
 def _dequant(packed, scales, block):
-    fp4_utils = pytest.importorskip("aiter.utility.fp4_utils", reason="AITER required")
-
-    codes = fp4_utils.mxfp4_to_f32(packed)
+    codes = mxfp4_to_f32(packed)
     mult = (scales.to(torch.int32) << 23).view(torch.float32)
     return codes * mult.repeat_interleave(block, dim=-1)
 

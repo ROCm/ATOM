@@ -5,11 +5,11 @@ from __future__ import annotations
 import argparse
 
 import torch
-from aiter import dtypes
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale_preshuffle,
 )
+from aiter.utility.dtypes import fp8
 
 BLOCK = 128
 SHAPES = (
@@ -25,10 +25,8 @@ SHAPES = (
 
 
 def make_inputs(m: int, n: int, k: int) -> tuple[torch.Tensor, ...]:
-    x = (torch.rand((m, k), dtype=torch.float32, device="cuda") / 10).to(dtypes.fp8)
-    weight = (torch.rand((n, k), dtype=torch.float32, device="cuda") / 10).to(
-        dtypes.fp8
-    )
+    x = (torch.rand((m, k), dtype=torch.float32, device="cuda") / 10).to(fp8)
+    weight = (torch.rand((n, k), dtype=torch.float32, device="cuda") / 10).to(fp8)
     weight = shuffle_weight(weight, layout=(16, 16))
     scale_k = k // BLOCK
     x_scale = torch.rand((m, scale_k), dtype=torch.float32, device="cuda")

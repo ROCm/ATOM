@@ -8,8 +8,6 @@ import textwrap
 import pytest
 import torch
 
-pytest.importorskip("triton")
-
 DEVICE = "cuda"
 _CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 

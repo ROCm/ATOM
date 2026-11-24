@@ -19,6 +19,8 @@ RUN apt-get update && \
 
 # Copy project source
 COPY . /workspace/ATOM
+RUN rm -rf /workspace/Lumen && \
+    ln -s /workspace/ATOM/atomrl/lumen /workspace/Lumen
 
 # AITER is supplied by rocm/atom-dev:latest outside the bind-mounted checkout.
 # Reuse that checkout when it is already at the upstream ref; otherwise refresh
@@ -42,10 +44,11 @@ RUN set -eux; \
             rm -rf "${AITER_DIR}"; \
             git clone --depth=1 --branch "${AITER_REF}" "${AITER_REPOSITORY}" "${AITER_DIR}"; \
         fi; \
-        pip install -r "${AITER_DIR}/requirements.txt"; \
-        pip install --no-build-isolation --no-deps -e "${AITER_DIR}"; \
     fi; \
-    true
+    flydsl_site="$(python -c 'import site; print(site.getsitepackages()[0])')"; \
+    find "${flydsl_site}" -maxdepth 1 -iname 'flydsl*' -exec rm -rf {} +; \
+    pip install -r "${AITER_DIR}/requirements.txt"; \
+    pip install --no-build-isolation --no-deps -e "${AITER_DIR}"
 
 # MORI is provided by the ATOM base image (amd-mori-nightly).
 RUN python -c "import mori; print(f'mori: {mori.__file__}')" && \
@@ -56,7 +59,8 @@ RUN pip install --no-deps "torchao>=0.8"
 
 # Megatron-LM-AMD (for Megatron backend)
 ARG MEGATRON_COMMIT=8dd45f5a51378ec1ee7937dee3c20d8626df4763
-RUN git init megatron_lm && \
+RUN rm -rf megatron_lm && \
+    git init megatron_lm && \
     cd megatron_lm && \
     git remote add origin https://github.com/ROCm/Megatron-LM.git && \
     git fetch --depth=1 origin "${MEGATRON_COMMIT}" && \

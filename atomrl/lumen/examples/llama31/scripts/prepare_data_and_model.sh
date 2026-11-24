@@ -18,7 +18,7 @@
 # Environment variables:
 #   BACKEND           - training backend: megatron or fsdp (default: megatron)
 #   MEGATRON_ROOT     - path to Megatron-LM-AMD (required for megatron backend)
-#   MODEL_NAME        - HF model name (default: meta-llama/Llama-3.1-8B)
+#   MODEL_NAME        - HF model name (default: NousResearch/Meta-Llama-3.1-8B)
 #   MODEL_SIZE        - Megatron model size tag (default: llama3.1-8B)
 #   TP                - target tensor parallel size (default: 1)
 #   HF_MODEL_DIR      - directory for HF checkpoint (default: /model)
@@ -33,7 +33,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 BACKEND=${BACKEND:-"megatron"}
-MODEL_NAME=${MODEL_NAME:-"meta-llama/Llama-3.1-8B"}
+_DEFAULT_MODEL_NAME="NousResearch/Meta-Llama-3.1-8B"
+MODEL_NAME=${MODEL_NAME:-"${_DEFAULT_MODEL_NAME}"}
+if [ "${MODEL_NAME}" != "${_DEFAULT_MODEL_NAME}" ] && [ -z "${MODEL_REVISION:-}" ]; then
+    echo "ERROR: MODEL_REVISION is required when MODEL_NAME overrides ${_DEFAULT_MODEL_NAME}" >&2
+    exit 1
+fi
+MODEL_REVISION=${MODEL_REVISION:-"1f47e50cdbe801ad8a5174156ec3a0655108fb9f"}
 MODEL_SIZE=${MODEL_SIZE:-"llama3.1-8B"}
 TP=${TP:-1}
 HF_MODEL_DIR=${HF_MODEL_DIR:-"/model"}
@@ -83,6 +89,7 @@ else
     echo "[Step 1/4] Downloading HuggingFace model ..."
     python "${SCRIPT_DIR}/download_model.py" \
         --model_name "${MODEL_NAME}" \
+        --revision "${MODEL_REVISION}" \
         --output_dir "${HF_MODEL_DIR}"
 fi
 

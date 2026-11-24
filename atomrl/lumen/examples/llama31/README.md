@@ -65,7 +65,7 @@ PRECISION=fp8 MBS=2 GBS=128 SEQ_LEN=8192 TRAIN_STEPS=50 \
 | `MBS` / `GBS` | `2` / `128` | micro / global batch size |
 | `SEQ_LEN` | `8192` | sequence length |
 | `TRAIN_STEPS` | `50` | training iterations |
-| `TOKENIZER_DIR` | `examples/llama31/tokenizer` | HuggingFace tokenizer dir; fetched from `meta-llama/Llama-3.1-8B` on first run (gated: needs `HF_TOKEN`) |
+| `TOKENIZER_DIR` | `examples/llama31/tokenizer` | HuggingFace tokenizer dir; fetched from public `NousResearch/Meta-Llama-3.1-8B` on first run |
 | `RESULTS_DIR` | `examples/llama31/results` | logs + mock data output |
 
 FP8 mode enables the validated forward optimizations (fused quant+amax, fused

@@ -83,7 +83,7 @@ def _cleanup_stale_aiter_jit_locks():
 
 ### bench_kernel_launch.py
 
-**Features**: `quantized_linear` (7 scaling modes), `fused_moe_triton`, `fp8_activation_store`, attention backends, norm+GEMM pipeline.
+**Features**: `quantized_linear` (7 scaling modes), `fp8_activation_store`, attention backends, norm+GEMM pipeline.
 
 **Key pattern**: Use `cuda_timer_batch()` for very fast kernels where per-iteration event overhead matters.
 
@@ -147,7 +147,7 @@ def _cleanup_stale_aiter_jit_locks():
 ```bash
 python -m benchmarks.run_traces              # all trace groups
 python -m benchmarks.run_traces --only rope  # one group
-python -m benchmarks.run_traces --run trace_fused_moe  # one function
+python -m benchmarks.run_traces --run trace_scaling_modes  # one function
 python -m benchmarks.run_traces --list       # list available functions
 ```
 

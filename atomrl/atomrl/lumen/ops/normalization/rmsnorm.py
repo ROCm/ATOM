@@ -553,7 +553,7 @@ def rmsnorm_with_quant(
     elif scaling_type in ("blockwise", "blockwise2d"):
         return rmsnorm_blockwise(x, weight, eps, block_size, fp8_dtype)
     elif scaling_type == "mxfp8":
-        mxfp8_block = 32 if block_size > 64 else block_size
+        mxfp8_block = 32
         return rmsnorm_mxfp8(x, weight, eps, mxfp8_block, fp8_dtype)
     else:
         raise ValueError(f"Unknown scaling_type={scaling_type!r}")

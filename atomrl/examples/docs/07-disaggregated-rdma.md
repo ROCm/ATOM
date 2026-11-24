@@ -324,7 +324,7 @@ All components are installed from source. Both nodes execute the same cloning pr
 | AtomRL | `https://github.com/ROCm/ATOM.git` | `main` |
 | Lumen | `${WORK_ROOT}/ATOM/atomrl/lumen` | in-tree |
 | Megatron-LM | `https://github.com/ROCm/Megatron-LM.git` | `rocm_dev` |
-| aiter | `https://github.com/ROCm/aiter.git` | `ff745fb09d66` |
+| aiter | `https://github.com/ROCm/aiter.git` | `adbb6ac8b841` |
 | flash-attention | `https://github.com/ROCm/flash-attention.git` | `main` |
 
 ```bash
@@ -360,7 +360,7 @@ if [ ! -d "$AITER_HOST_DIR/.git" ]; then
   git clone https://github.com/ROCm/aiter.git "$AITER_HOST_DIR"
 fi
 cd "$AITER_HOST_DIR"
-git fetch --depth 1 origin ff745fb09d669f40cf81d15d3e7598b61fe2a61c
+git fetch --depth 1 origin adbb6ac8b84110134e0cf4dc513b250d2cc0a75c
 git checkout --detach FETCH_HEAD
 
 # flash-attention
@@ -1708,6 +1708,6 @@ checkpoints.
 - AtomRL: `https://github.com/ROCm/ATOM/tree/main/atomrl`
 - Lumen: `${WORK_ROOT}/ATOM/atomrl/lumen` (in-tree)
 - Megatron-LM (ROCm fork): `https://github.com/ROCm/Megatron-LM/tree/rocm_dev`
-- aiter: `https://github.com/ROCm/aiter/tree/ff745fb09d669f40cf81d15d3e7598b61fe2a61c`
+- aiter: `https://github.com/ROCm/aiter/tree/adbb6ac8b84110134e0cf4dc513b250d2cc0a75c`
 - flash-attention: `https://github.com/ROCm/flash-attention`
 - Qwen3-30B-A3B: `https://huggingface.co/Qwen/Qwen3-30B-A3B`

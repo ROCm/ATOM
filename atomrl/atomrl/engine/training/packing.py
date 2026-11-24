@@ -395,7 +395,7 @@ def _varlen_attention_forward(
 
     cu_seqlens, max_seqlen = ctx
 
-    from aiter import flash_attn_varlen_func
+    from aiter.ops.mha import flash_attn_varlen_func
 
     # HF passes QKV as (B, H, S, D) where B=1 for packed input
     # Transpose to (B, S, H, D) then flatten to (total_tokens, H, D)

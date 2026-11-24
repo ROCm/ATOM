@@ -29,7 +29,7 @@ class TestGetFp8AlignSize:
         assert get_fp8_align_size("mxfp8", block_size=128) == 32
 
     def test_mxfp8_block_size_64(self):
-        assert get_fp8_align_size("mxfp8", block_size=64) == 64
+        assert get_fp8_align_size("mxfp8", block_size=64) == 32
 
     def test_mxfp8_block_size_32(self):
         assert get_fp8_align_size("mxfp8", block_size=32) == 32
@@ -159,19 +159,12 @@ class TestRoundToMxfp8Regression:
 
     def test_end_to_end_round_to_mxfp8(self):
         """Call the real _round_to_mxfp8 and verify it returns correct shape
-        for both aligned and unaligned inputs.  Requires AITER ops; skip if
-        unavailable."""
-        try:
-            from atomrl.lumen.quantize.scaling_manager import _round_to_mxfp8
-        except ImportError:
-            pytest.skip("_round_to_mxfp8 not importable")
+        for both aligned and unaligned inputs."""
+        from atomrl.lumen.quantize.scaling_manager import _round_to_mxfp8
 
         for N in [64, 50]:
             t = torch.randn(4, N, dtype=torch.bfloat16, device="cuda")
-            try:
-                out = _round_to_mxfp8(t, block_size=32)
-            except (ImportError, RuntimeError):
-                pytest.skip("AITER/mxfp8 ops not available in this environment")
+            out = _round_to_mxfp8(t, block_size=32)
             assert out.shape == t.shape, f"expected shape {t.shape}, got {out.shape}"
             assert out.dtype == t.dtype
 
@@ -222,30 +215,24 @@ class TestQuantBlockwise2dPaddingRegression:
 
     def test_end_to_end_quant_blockwise_2d(self):
         """Call the real _quant_blockwise_2d with unaligned expert weights.
-        Requires triton + GPU; skip if unavailable."""
-        try:
-            from atomrl.lumen.ops.gemm.grouped_gemm import _quant_blockwise_2d
-        except ImportError:
-            pytest.skip("_quant_blockwise_2d not importable")
+        Requires triton + GPU."""
+        from atomrl.lumen.ops.gemm.grouped_gemm import _quant_blockwise_2d
+        from atomrl.lumen.quantize.config import _get_float8_e4m3
 
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
 
         E, K, N, bs = 2, 100, 200, 128
         w = torch.randn(E, K, N, device="cuda")
-        try:
-            w_fp8, _w_scales = _quant_blockwise_2d(
-                w, torch.float8_e4m3fnuz, block_size=bs
-            )
-        except (ImportError, RuntimeError) as e:
-            pytest.skip(f"Triton/AITER ops not available: {e}")
+        fp8_dtype = _get_float8_e4m3()
+        w_fp8, _w_scales = _quant_blockwise_2d(w, fp8_dtype, block_size=bs)
 
         assert w_fp8.shape == (
             E,
             K,
             N,
         ), f"output should be sliced back to original: {w_fp8.shape}"
-        assert w_fp8.dtype == torch.float8_e4m3fnuz
+        assert w_fp8.dtype == fp8_dtype
 
 
 # ---------------------------------------------------------------------------
@@ -272,13 +259,14 @@ class TestQuantizeInputMxfp8Padding:
             from atomrl.lumen.ops.quantize.linear import quantize_input
 
             x = torch.randn(64, 50, dtype=torch.bfloat16)
-            quantize_input(x, "mxfp8", torch.float8_e4m3fn, block_size=128)
+            desc = quantize_input(x, "mxfp8", torch.float8_e4m3fn, block_size=128)
 
             call_args = mock_fn.call_args
             input_tensor = call_args[0][0]
             assert (
                 input_tensor.size(-1) % 32 == 0
             ), f"K={input_tensor.size(-1)} should be aligned to 32"
+            assert desc.unpadded_shape == x.shape
 
     def test_unaligned_m_is_padded(self):
         """M=50 is not a multiple of 32; should be auto-padded."""
@@ -295,13 +283,14 @@ class TestQuantizeInputMxfp8Padding:
             from atomrl.lumen.ops.quantize.linear import quantize_input
 
             x = torch.randn(50, 64, dtype=torch.bfloat16)
-            quantize_input(x, "mxfp8", torch.float8_e4m3fn, block_size=128)
+            desc = quantize_input(x, "mxfp8", torch.float8_e4m3fn, block_size=128)
 
             call_args = mock_fn.call_args
             input_tensor = call_args[0][0]
             assert (
                 input_tensor.size(0) % 32 == 0
             ), f"M={input_tensor.size(0)} should be aligned to 32"
+            assert desc.unpadded_shape == x.shape
 
     def test_both_axes_unaligned_padded_shape_consistency(self):
         """Both M=50 and K=50 unaligned; verify output tensor dimensions are
@@ -323,7 +312,7 @@ class TestQuantizeInputMxfp8Padding:
             from atomrl.lumen.ops.quantize.linear import quantize_input
 
             x = torch.randn(50, 50, dtype=torch.bfloat16)
-            quantize_input(x, "mxfp8", torch.float8_e4m3fn, block_size=128)
+            desc = quantize_input(x, "mxfp8", torch.float8_e4m3fn, block_size=128)
 
             call_args = mock_fn.call_args
             input_tensor = call_args[0][0]
@@ -335,23 +324,51 @@ class TestQuantizeInputMxfp8Padding:
             ), f"K={input_tensor.size(-1)} not aligned"
             assert input_tensor.size(0) == 64
             assert input_tensor.size(-1) == 64
+            assert desc.unpadded_shape == x.shape
+
+    def test_gfx1250_mxfp8_k_is_padded_to_128(self):
+        from unittest.mock import patch
+
+        def fake_convert_to_mxfp8(tensor, block_size=32, axis=-1, float8_dtype_pt=None):
+            return (
+                torch.zeros_like(tensor, dtype=torch.float8_e4m3fn),
+                torch.ones(
+                    tensor.size(0), tensor.size(1) // block_size, dtype=torch.uint8
+                ),
+            )
+
+        with (
+            patch(
+                "atomrl.lumen.ops.quantize.linear._mxfp8_k_alignment",
+                return_value=128,
+            ),
+            patch(
+                "atomrl.lumen.ops.quantize.ops.convert_to_mxfp8",
+                side_effect=fake_convert_to_mxfp8,
+            ) as mock_fn,
+        ):
+            from atomrl.lumen.ops.quantize.linear import quantize_input
+
+            x = torch.randn(50, 50, dtype=torch.bfloat16)
+            desc = quantize_input(x, "mxfp8", torch.float8_e4m3fn, block_size=64)
+
+        input_tensor = mock_fn.call_args[0][0]
+        assert input_tensor.shape == (64, 128)
+        assert desc.scale.shape == (64, 4)
+        assert desc.unpadded_shape == x.shape
 
     def test_end_to_end_quantize_input_mxfp8(self):
-        """Call the real quantize_input with unaligned shapes on GPU.
-        Requires AITER ops + GPU; skip if unavailable."""
+        """Call the real quantize_input with unaligned shapes on GPU."""
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
 
-        try:
-            from atomrl.lumen.ops.quantize.linear import quantize_input
-        except ImportError:
-            pytest.skip("quantize_input not importable")
+        from atomrl.lumen.ops.quantize.linear import quantize_input
+        from atomrl.lumen.quantize.config import _get_float8_e4m3
 
+        fp8_dtype = _get_float8_e4m3()
         for M, K in [(64, 50), (50, 64), (50, 50)]:
             x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
-            try:
-                desc = quantize_input(x, "mxfp8", torch.float8_e4m3fn, block_size=128)
-            except (ImportError, RuntimeError) as e:
-                pytest.skip(f"AITER/mxfp8 ops not available: {e}")
+            desc = quantize_input(x, "mxfp8", fp8_dtype, block_size=128)
             assert desc.data.size(0) % 32 == 0
             assert desc.data.size(-1) % 32 == 0
+            assert desc.unpadded_shape == x.shape

@@ -19,7 +19,6 @@ import json
 import math
 import os
 import statistics
-import sys
 from collections.abc import Callable, Generator
 from dataclasses import dataclass, field
 
@@ -34,16 +33,14 @@ TRACE_DIR = os.path.join(os.path.dirname(__file__), "traces")
 
 def require_cuda():
     if not torch.cuda.is_available():
-        print("CUDA not available — skipping benchmark.", file=sys.stderr)
-        sys.exit(0)
+        raise RuntimeError("CUDA/ROCm GPU is required for this benchmark")
 
 
 def require_aiter():
     try:
         import aiter  # noqa: F401
-    except ImportError:
-        print("AITER not installed — skipping benchmark.", file=sys.stderr)
-        sys.exit(0)
+    except ImportError as exc:
+        raise RuntimeError("AITER is required for this benchmark") from exc
 
 
 # ---------------------------------------------------------------------------

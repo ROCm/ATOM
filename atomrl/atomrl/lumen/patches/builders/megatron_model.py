@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import torch
-from aiter.ops.triton.gemm.feed_forward import ff_a16w16_fused_gated
+import torch.nn.functional as F
 
 from atomrl.lumen.modules.attention_megatron import LumenDotProductAttention
 from atomrl.lumen.modules.attention_mla import LumenDotProductAttentionMLA
+from atomrl.lumen.ops.mlp.fused_mlp import fused_gated_mlp
 from atomrl.lumen.patches.registry import PatchPhase, register_patch
 
 GPT_LOCAL_SPEC_PATCHES = frozenset({"core_attention_spec", "norms_in_spec"})
@@ -244,53 +245,46 @@ def patch_fused_swiglu_mlp(model) -> None:
             continue
         if getattr(module.config, "add_bias_linear", False):
             continue
+        if getattr(module.config, "tensor_model_parallel_size", 1) != 1:
+            continue
+        if getattr(module.config, "activation_func", None) is not F.silu:
+            continue
+        if getattr(module.config, "activation_func_clamp_value", None) is not None:
+            continue
+        if getattr(module.config, "glu_linear_offset", 0.0) != 0.0:
+            continue
+        if getattr(module.config, "activation_func_fp8_input_store", False):
+            continue
+        if getattr(module.config, "cpu_offloading", False) and getattr(
+            module.config, "cpu_offloading_activations", False
+        ):
+            continue
 
         _orig_forward = module.forward
 
         def _make_fused_forward(mlp_module, orig_fwd):
-            _w_down_cache = [None]
-
             def _fused_forward(hidden_states, per_token_scale=None):
-                try:
-                    w_fc1 = mlp_module.linear_fc1.weight
-                    w_fc2 = mlp_module.linear_fc2.weight
-
-                    orig_shape = hidden_states.shape
-                    x_2d = hidden_states.reshape(-1, orig_shape[-1]).contiguous()
-
-                    m_dim = x_2d.shape[0]
-                    if m_dim > 64:
-                        return orig_fwd(hidden_states, per_token_scale=per_token_scale)
-
-                    x_bf16 = x_2d.bfloat16() if x_2d.dtype != torch.bfloat16 else x_2d
-                    w1_bf16 = (
-                        w_fc1.bfloat16() if w_fc1.dtype != torch.bfloat16 else w_fc1
-                    )
-
-                    w2_data = w_fc2.data if not hasattr(w_fc2, "data") else w_fc2
-                    w2_bf16 = (
-                        w2_data.bfloat16()
-                        if w2_data.dtype != torch.bfloat16
-                        else w2_data
-                    )
-                    if (
-                        _w_down_cache[0] is None
-                        or _w_down_cache[0].data_ptr() != w2_bf16.data_ptr()
-                    ):
-                        _w_down_cache[0] = w2_bf16.t().contiguous()
-                    w_down = _w_down_cache[0]
-
-                    out = ff_a16w16_fused_gated(
-                        x_bf16,
-                        w1_bf16,
-                        w_down,
-                        dtype=torch.bfloat16,
-                        activation="silu",
-                    )
-                    out = out.reshape(orig_shape[:-1] + (out.shape[-1],))
-                    return out, None
-                except (AttributeError, RuntimeError):
+                if per_token_scale is not None:
                     return orig_fwd(hidden_states, per_token_scale=per_token_scale)
+                w_fc1 = mlp_module.linear_fc1.weight
+                w_fc2 = mlp_module.linear_fc2.weight
+
+                orig_shape = hidden_states.shape
+                x_2d = hidden_states.reshape(-1, orig_shape[-1]).contiguous()
+
+                if x_2d.shape[0] > 64:
+                    return orig_fwd(hidden_states, per_token_scale=per_token_scale)
+
+                w_gate, w_up = w_fc1.chunk(2, dim=0)
+                out = fused_gated_mlp(
+                    x_2d,
+                    w_up,
+                    w_gate,
+                    w_fc2,
+                    activation="swiglu",
+                )
+                out = out.reshape(orig_shape[:-1] + (out.shape[-1],))
+                return out, None
 
             return _fused_forward
 

@@ -87,7 +87,8 @@ BF16 attention routes through AITER CK (`FlashAttnFunc`) as primary, Triton as f
 ## Grouped GEMM
 
 - BF16: `aiter.ops.triton.gmm`
-- FP8 per-token / mxfp8: fused MOE GEMM kernels (`moe_gemm_per_token`, `moe_gemm_mxfp8`)
+- FP8 per-token: per-expert `gemm_a8w8_per_token_scale`
+- MXFP8: per-expert `gemm_a8w8_mxfp8_bpreshuffle`
 - FP8 blockwise: `moe_gemm_a8w8_blockscale` with `RoutingData` (built from `group_sizes`)
 - Sequential fallback: iterates per-group when no fused kernel
 - wgrad: `ptgmm` (permuted-tensor GMM)
@@ -106,7 +107,6 @@ Layout adaptation: Lumen BHSD → AITER SBHD/THD via permute before/after kernel
 | Component | Kernel | Notes |
 |-----------|--------|-------|
 | Token sorting | `moe_align_block_size_triton` | Triton block-padded sort |
-| Fused GEMM | `fused_moe` (AITER) | End-to-end sort+GEMM+weight-mul |
 | TopK | `aiter.topk_softmax` | ASM-backed |
 | Permute | `aiter.moe_sorting_fwd` | |
 | Unpermute | `aiter.moe_sum` | |

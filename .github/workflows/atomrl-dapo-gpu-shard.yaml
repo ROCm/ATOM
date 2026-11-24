@@ -58,6 +58,7 @@ jobs:
       DATA_ROOT: ${{ inputs.data_root }}
       IMAGE_TAG: ${{ inputs.image_tag }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.id }}
       CONTAINER_NAME: atomrl-ex-${{ github.run_id }}-${{ matrix.id }}
+      ATOMRL_CONTAINER: atomrl-ex-${{ github.run_id }}-${{ matrix.id }}
 
     steps:
       - name: Checkout ATOM repository
@@ -131,6 +132,6 @@ jobs:
       - name: Clean up DAPO container
         if: always()
         run: |
-          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+          docker rm -f "$CONTAINER_NAME-release" 2>/dev/null || true
           docker rmi -f "$IMAGE_TAG" 2>/dev/null || true
           docker container prune -f || true

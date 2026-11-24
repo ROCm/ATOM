@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 from pathlib import Path
 
 import pytest
@@ -283,7 +284,7 @@ def test_image_references_follow_cli_then_site() -> None:
     "script", ["DAPO/run_dapo.sh", "GRPO/run_grpo.sh", "GRPO/run_grpo_dsv4.sh"]
 )
 def test_launchers_start_ray_nodes_and_take_extra_overrides(script: str) -> None:
-    text = (EXAMPLES_DIR / script).read_text()
+    text = (EXAMPLES_DIR / script).read_text(encoding="utf-8")
     assert 'case "${RAY_ROLE:-}" in' in text
     assert "ray start --head" in text and 'ray start --address="${HEAD_IP:?}' in text
     assert "${EXTRA_OVERRIDE:-}" in text
@@ -309,6 +310,7 @@ def test_remote_commands_report_status_on_exit() -> None:
     assert "trap" in argv[2] and "EXIT" in argv[2] and "exit 3" in argv[2]
 
 
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
 def test_local_host_runs_directly() -> None:
     r = Host("me", "local").run("echo hi; exit 4")
     assert (r.rc, r.out) == (4, "hi\n")
@@ -332,6 +334,11 @@ def test_site_file(tmp_path: Path) -> None:
 def test_the_template_site_file_loads() -> None:
     site = load_site(EXAMPLES_DIR / "site.example.yaml")
     assert len(site.hosts) == 2 and site.rdma is not None
+
+
+def test_site_container_prefix_can_be_scoped_by_environment(monkeypatch) -> None:
+    monkeypatch.setenv("ATOMRL_CONTAINER", "atomrl-ex-ci-123")
+    assert load_site().container == "atomrl-ex-ci-123"
 
 
 # ------------------------------------------------------------ suite, reports
@@ -400,6 +407,7 @@ def test_rdma_examples_skip_without_the_site_nic() -> None:
     assert out.status == "SKIP" and "rdma section" in out.reason
 
 
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
 def test_large_logs_come_back_as_an_excerpt(tmp_path: Path, monkeypatch) -> None:
     import examples.harness.runner as runner_mod
 

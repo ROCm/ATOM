@@ -8,7 +8,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ATOM_ROOT="$(cd "${SCRIPT_DIR}/../../../../.." && pwd)"
 IMAGE_NAME="${IMAGE_NAME:-atomrl-vllm-mi350:latest}"
-AITER_SHA="${AITER_SHA:-ff745fb09d669f40cf81d15d3e7598b61fe2a61c}"
+AITER_SHA="${AITER_SHA:-adbb6ac8b84110134e0cf4dc513b250d2cc0a75c}"
 MORI_SHA="${MORI_SHA:-9c42e3240b33359331b2cf2141b28886055da583}"
 
 echo "Building ${IMAGE_NAME}..."

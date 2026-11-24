@@ -70,11 +70,11 @@ Fused **quant → GEMM → dequant** pipeline. The 7 scaling modes cover all com
 
 | Scaling Type | Forward Kernel | Weight Gradient |
 |--------------|----------------|-----------------|
-| BF16 | `aiter.ops.triton.gmm.gmm` | `aiter.ops.triton.gmm.ptgmm` |
-| FP8 per-tensor | `moe_gemm_a8w8` (Triton) | BF16 fallback (`ptgmm`) |
-| FP8 blockwise | `moe_gemm_a8w8_blockscale` (Triton) | BF16 fallback |
-| FP8 per-token | `moe_gemm_per_token` (Triton) | BF16 fallback |
-| MXFP8 | `moe_gemm_mxfp8` (Triton) | BF16 fallback |
+| BF16 | `aiter.ops.triton.gemm.grouped.gmm` | `ptgmm` |
+| FP8 per-tensor | `moe_gemm_a8w8` (Triton) | AITER BF16 GEMM |
+| FP8 blockwise | `moe_gemm_a8w8_blockscale` (Triton) | AITER BF16 GEMM |
+| FP8 per-token | Per-expert `gemm_a8w8_per_token_scale` | AITER BF16 GEMM |
+| MXFP8 | Per-expert `gemm_a8w8_mxfp8_bpreshuffle` | AITER BF16 GEMM |
 
 ### Quantization Ops
 
@@ -118,7 +118,7 @@ Compatible with `torch.compile`.
 ## MoE Routing
 
 ```python
-from atomrl.lumen.ops.moe import fused_topk, fused_permute, fused_unpermute, fused_moe_triton
+from atomrl.lumen.ops.moe import fused_topk, fused_permute, fused_unpermute
 ```
 
 | Function | Kernel | Description |
@@ -126,7 +126,6 @@ from atomrl.lumen.ops.moe import fused_topk, fused_permute, fused_unpermute, fus
 | `fused_topk` | ASM (`topk_softmax`) | Fused softmax + top-k expert gating |
 | `fused_permute` | HIP/CK (`moe_sorting_fwd`) | Token-to-expert sort + pad |
 | `fused_unpermute` | ASM (`moe_sum`) | Scatter expert outputs back with weighted sum |
-| `fused_moe_triton` | Triton (align + GEMM) | End-to-end fused MoE in one call |
 
 The MoE pipeline: **gating** → **permute** → **grouped GEMM** → **unpermute**.
 

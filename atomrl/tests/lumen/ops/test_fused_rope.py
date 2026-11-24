@@ -4,8 +4,6 @@
 import pytest
 import torch
 
-pytest.importorskip("aiter")
-
 DEVICE = "cuda"
 _CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 

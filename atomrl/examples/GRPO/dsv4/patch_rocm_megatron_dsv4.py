@@ -21,44 +21,14 @@ Usage (inside container):
 from __future__ import annotations
 
 import ast
-import importlib.util
 import os
 import re
 import sys
-from functools import lru_cache
-from pathlib import Path
 
 CHECKPOINT_REPLAY_CAPABILITY = "ATOMRL_R3_CAPABILITY_CHECKPOINT_REPLAY_BACKWARD"
 ROUTER_REPLAY_FIFO_CAPABILITY = "ATOMRL_R3_CAPABILITY_ROUTER_REPLAY_FIFO"
 REPLAY_DIAGNOSTICS_CAPABILITY = "ATOMRL_R3_CAPABILITY_REPLAY_DIAGNOSTICS"
 STREAMED_ADAM_CAPABILITY = "ATOMRL_DSV4_CAPABILITY_STREAMED_ADAM"
-
-
-@lru_cache(maxsize=1)
-def _load_lumen_megatron_patcher():
-    """Load the canonical Megatron integration maintained by Lumen."""
-    candidates = []
-    if lumen_root := os.environ.get("LUMEN_ROOT"):
-        candidates.append(Path(lumen_root))
-    candidates.extend(
-        (
-            Path("/workspace/Lumen"),
-            Path(__file__).resolve().parents[4] / "Lumen",
-        )
-    )
-    for root in candidates:
-        path = root / "examples" / "dsv4" / "patch_rocm_megatron_dsv4.py"
-        if not path.is_file():
-            continue
-        spec = importlib.util.spec_from_file_location(
-            "_lumen_patch_rocm_megatron_dsv4", path
-        )
-        if spec is None or spec.loader is None:
-            continue
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
-    return None
 
 
 def _stamp_capabilities(content: str, markers: tuple[str, ...]) -> str:
@@ -752,10 +722,6 @@ def patch_router_replay_diagnostics(megatron_root: str) -> bool:
 
 
 def patch_transformer_block(megatron_root: str) -> bool:
-    canonical = _load_lumen_megatron_patcher()
-    if canonical is not None:
-        return canonical.patch_transformer_block(megatron_root)
-
     path = os.path.join(
         megatron_root, "megatron", "core", "transformer", "transformer_block.py"
     )
@@ -836,10 +802,6 @@ def patch_transformer_block(megatron_root: str) -> bool:
 
 
 def patch_transformer_layer(megatron_root: str) -> bool:
-    canonical = _load_lumen_megatron_patcher()
-    if canonical is not None:
-        return canonical.patch_transformer_layer(megatron_root)
-
     path = os.path.join(
         megatron_root, "megatron", "core", "transformer", "transformer_layer.py"
     )

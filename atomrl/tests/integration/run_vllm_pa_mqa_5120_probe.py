@@ -6,8 +6,8 @@ import argparse
 import math
 
 import torch
-from aiter import dtypes
-from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+from aiter.ops.triton.attention.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+from aiter.utility.dtypes import fp8
 
 BATCH_SIZE = 32
 NEXT_N = 1
@@ -66,7 +66,7 @@ def make_inputs() -> tuple[torch.Tensor, ...]:
         dtype=torch.uint8,
         device=device,
     )
-    q_fp8 = q_bits.view(dtypes.fp8)
+    q_fp8 = q_bits.view(fp8)
 
     kv_bits = torch.randint(
         1,
@@ -78,7 +78,7 @@ def make_inputs() -> tuple[torch.Tensor, ...]:
     kv_bits[..., HEAD_DIM:] = torch.tensor(
         [0, 0, 128, 63], dtype=torch.uint8, device=device
     )
-    kv_cache = kv_bits.view(dtypes.fp8)
+    kv_cache = kv_bits.view(fp8)
 
     weights = torch.ones(
         (BATCH_SIZE * NEXT_N, HEADS), dtype=torch.float32, device=device

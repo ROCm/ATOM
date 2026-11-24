@@ -16,14 +16,17 @@ from atomrl.lumen.models.utils import download_hf_model
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
+DEFAULT_MODEL = "Qwen/Qwen3-8B"
+DEFAULT_REVISION = "b968826d9c46dd6066d109eabc6255188de91218"
+
 
 def main():
     parser = argparse.ArgumentParser(description="Download model from HuggingFace")
     parser.add_argument(
         "--model_name",
         type=str,
-        default="Qwen/Qwen3-8B",
-        help="HuggingFace model name (e.g. Qwen/Qwen3-8B, Qwen/Qwen3-14B)",
+        default=DEFAULT_MODEL,
+        help="HuggingFace model name; custom repositories require --revision",
     )
     parser.add_argument(
         "--output_dir",
@@ -32,13 +35,28 @@ def main():
         help="Directory to save the downloaded model",
     )
     parser.add_argument(
+        "--revision",
+        default=None,
+        help="Immutable HuggingFace commit",
+    )
+    parser.add_argument(
         "--verify",
         action="store_true",
         default=False,
         help="Compute and print SHA-256 hashes of downloaded weight files.",
     )
     args = parser.parse_args()
-    download_hf_model(args.model_name, args.output_dir, verify=args.verify)
+    revision = args.revision
+    if revision is None:
+        if args.model_name != DEFAULT_MODEL:
+            parser.error("--revision is required with a custom --model_name")
+        revision = DEFAULT_REVISION
+    download_hf_model(
+        args.model_name,
+        args.output_dir,
+        verify=args.verify,
+        revision=revision,
+    )
 
 
 if __name__ == "__main__":

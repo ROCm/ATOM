@@ -28,7 +28,7 @@ and pre-eval step time of **4,730 ms** (1.19x vs local MLPerf reference at 3,967
 ### Prerequisites
 
 - **Docker image**: `lumen_unit_test:latest` (contains Megatron-LM-AMD, ROCm, RCCL)
-- **AITER**: official `ROCm/aiter.git` pinned at `ff745fb09d669f40cf81d15d3e7598b61fe2a61c`
+- **AITER**: official `ROCm/aiter.git` pinned at tested revision `adbb6ac8b84110134e0cf4dc513b250d2cc0a75c`
 - **GPUs**: 8x AMD MI300X (192 GB HBM each)
 - **Host RAM**: >= 256 GB (checkpoint loading uses mmap but still needs headroom)
 - **Disk**: ~300 GB free on `/data1/` (model ~140 GB, dataset ~30 GB, checkpoints/results)
@@ -47,7 +47,7 @@ python examples/llama2/scripts/convert_to_megatron.py \
     --out-dir /data1/lumen/megatron_ckpt_nous_tp1 \
     --tp 1
 
-# Fetch the public OpenLLaMA tokenizer, then download and preprocess the dataset
+# Fetch the public NousResearch Llama 2 tokenizer, then download and preprocess the dataset
 bash -c 'source examples/scripts/ensure_tokenizer.sh && example_tokenizer llama2 examples/llama2/tokenizer'
 python examples/llama2/scripts/download_dataset.py
 python examples/llama2/scripts/convert_dataset.py \
@@ -68,7 +68,7 @@ with all required environment variables, applies Megatron patches, and starts tr
 All speed and convergence optimizations are enabled by default (v47):
 - hipBLASLt for all GEMMs with `.t()` view (`LUMEN_PREFER_HIPBLASLT=1`)
 - Fused quant+amax, quant+scale, norm+quant, cast+transpose kernels
-- Fused SwiGLU fwd/bwd with fused amax (`LUMEN_FUSED_SWIGLU=1`; needs `swiglu_fwd`/`swiglu_bwd` in AITER, which the pinned official AITER does not carry, so the flag falls back to the unfused path)
+- Fused SwiGLU fwd/bwd through AITER's public fused SiLU-mul kernels (`LUMEN_FUSED_SWIGLU=1`)
 - Epoch-level data shuffling (`LUMEN_SHUFFLE_TRAIN=1`)
 - Aligned eval schedule every 192 steps (`LUMEN_EVAL_ALIGNED=1`)
 - Post-eval allocator fixes (eval recompute, warmup GC, cache clear)
@@ -152,7 +152,7 @@ See [Megatron Patches](#megatron-patches) below for the full patch catalog.
 | Fused quant+scale | `LUMEN_FUSED_QUANT_SCALE=1` | -206 ms/step (2.8%) |
 | Post-eval allocator fixes | `LUMEN_EVAL_RECOMPUTE=1`, `LUMEN_POST_EVAL_CACHE_CLEAR=1`, etc. | -11.1% total training time |
 | Backend caching + sync elimination | `LUMEN_SKIP_BACKEND_SYNC=1` | ~1-2% step time |
-| Fused SwiGLU fwd+bwd + fused amax | `LUMEN_FUSED_SWIGLU=1` | -696 ms/step from baseline; fused amax saves ~30-80 ms (v47). Measured with Lumen's swiglu kernels overlaid on AITER; the pinned official AITER lacks them and runs unfused |
+| Fused SwiGLU fwd+bwd + fused amax | `LUMEN_FUSED_SWIGLU=1` | Uses AITER's public fused SiLU-mul forward/backward kernels; performance must be re-recorded on the current merge candidate |
 | Fused RMSNorm + FP8 quant | `LUMEN_FUSED_NORM_QUANT=1` | ~0.2% step time |
 | Fused cast+transpose in backward | `LUMEN_FUSED_CAST_TRANSPOSE=1` | ~11 ms/step (consumed by hipBLASLt wgrad) |
 | Wgrad `.t()` view (v47) | Code-level | ~50 ms/step — eliminates grad transpose copy |
@@ -310,7 +310,7 @@ PRECISION=fp8 MBS=4 GBS=256 SEQ_LEN=4096 TRAIN_STEPS=50 \
 | `MBS` / `GBS` | `4` / `256` | micro / global batch size |
 | `SEQ_LEN` | `4096` | sequence length |
 | `TRAIN_STEPS` | `50` | training iterations |
-| `TOKENIZER_DIR` | `examples/llama2/tokenizer` | HuggingFace tokenizer dir; fetched from `meta-llama/Llama-2-7b-hf` on first run (gated: needs `HF_TOKEN`) |
+| `TOKENIZER_DIR` | `examples/llama2/tokenizer` | HuggingFace tokenizer dir; fetched from public `NousResearch/Llama-2-7b-hf` on first run |
 | `RESULTS_DIR` | `examples/llama2/results` | logs + mock data output |
 
 FP8 mode enables the validated forward optimizations (fused quant+amax, fused

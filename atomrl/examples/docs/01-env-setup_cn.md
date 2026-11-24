@@ -39,7 +39,7 @@ $DATA_ROOT/
 cd "$RL_ROOT"
 git clone -b main            https://github.com/ROCm/ATOM.git
 git init aiter && git -C aiter remote add origin https://github.com/ROCm/aiter.git
-git -C aiter fetch --depth 1 origin ff745fb09d669f40cf81d15d3e7598b61fe2a61c
+git -C aiter fetch --depth 1 origin adbb6ac8b84110134e0cf4dc513b250d2cc0a75c
 git -C aiter checkout --detach FETCH_HEAD
 
 # aiter 的 JIT 依赖 composable_kernel，必须补齐，
@@ -55,7 +55,7 @@ cd "$RL_ROOT"
 GHP=https://gh-proxy.com/https://github.com
 git -c http.version=HTTP/1.1 clone --depth 1 --single-branch -b main            "$GHP/ROCm/ATOM.git"
 git init aiter && git -C aiter remote add origin "$GHP/ROCm/aiter.git"
-git -C aiter -c http.version=HTTP/1.1 fetch --depth 1 origin ff745fb09d669f40cf81d15d3e7598b61fe2a61c
+git -C aiter -c http.version=HTTP/1.1 fetch --depth 1 origin adbb6ac8b84110134e0cf4dc513b250d2cc0a75c
 git -C aiter checkout --detach FETCH_HEAD
 cd "$RL_ROOT/aiter"
 git -c http.version=HTTP/1.1 -c url."$GHP/".insteadOf=https://github.com/ \
@@ -66,7 +66,7 @@ git -c http.version=HTTP/1.1 -c url."$GHP/".insteadOf=https://github.com/ \
 
 ```bash
 git -C "$RL_ROOT/ATOM" pull --ff-only origin main
-git -C "$RL_ROOT/aiter" fetch --depth 1 origin ff745fb09d669f40cf81d15d3e7598b61fe2a61c
+git -C "$RL_ROOT/aiter" fetch --depth 1 origin adbb6ac8b84110134e0cf4dc513b250d2cc0a75c
 git -C "$RL_ROOT/aiter" checkout --detach FETCH_HEAD
 git -C "$RL_ROOT/aiter"    submodule update --init --depth 1 3rdparty/composable_kernel
 ```

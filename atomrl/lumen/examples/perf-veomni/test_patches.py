@@ -49,7 +49,7 @@ def test_conv_uses_aiter_for_bf16_and_torch_otherwise():
 
 @_CUDA
 def test_triton_forward_routes_dit_attention_only():
-    pytest.importorskip("aiter.ops.triton.mha")
+    pytest.importorskip("aiter.ops.triton.attention.mha")
     from atomrl.lumen.config import LumenConfig
     from atomrl.lumen.ops.attention import hf_patch as sdpa
 

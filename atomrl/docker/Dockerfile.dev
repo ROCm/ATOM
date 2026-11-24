@@ -54,10 +54,12 @@ RUN set -eux; \
         else \
             rm -rf "${AITER_DIR}" && \
             git clone --depth=1 --branch "${AITER_REF}" "${AITER_REPO}" "${AITER_DIR}"; \
-        fi && \
-        pip install -r "${AITER_DIR}/requirements.txt" && \
-        pip install --no-build-isolation --no-deps -e "${AITER_DIR}"; \
-    fi
+        fi; \
+    fi; \
+    flydsl_site="$(python -c 'import site; print(site.getsitepackages()[0])')"; \
+    find "${flydsl_site}" -maxdepth 1 -iname 'flydsl*' -exec rm -rf {} +; \
+    pip install -r "${AITER_DIR}/requirements.txt"; \
+    pip install --no-build-isolation --no-deps -e "${AITER_DIR}"
 
 # Install ATOM and AtomRL as separate distributions. The AtomRL package owns
 # its RL-only dependencies (Ray and OmegaConf); they must not enter atom.

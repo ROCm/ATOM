@@ -172,28 +172,17 @@ class LumenFusedMoEAuxLoss(torch.autograd.Function):
         ctx.N = probs.shape[0]
         ctx.E = num_experts
 
-        try:
-            from aiter.ops.triton.moe.moe_aux_loss import moe_aux_loss_fwd
-        except ModuleNotFoundError:
-            return (probs.float().sum(dim=0) * tokens_per_expert.float()).sum() * C
-        return moe_aux_loss_fwd(probs.float(), tokens_per_expert.float(), C)
+        return (probs.float().sum(dim=0) * tokens_per_expert.float()).sum() * C
 
     @staticmethod
     def backward(ctx, grad_aux_loss: Tensor):
         (tokens_per_expert,) = ctx.saved_tensors
 
-        try:
-            from aiter.ops.triton.moe.moe_aux_loss import moe_aux_loss_bwd
-        except ModuleNotFoundError:
-            grad_probs = (
-                tokens_per_expert.float().unsqueeze(0).expand(ctx.N, ctx.E)
-                * ctx.C
-                * grad_aux_loss
-            )
-        else:
-            grad_probs = moe_aux_loss_bwd(
-                tokens_per_expert.float(), ctx.C, grad_aux_loss, ctx.N, ctx.E
-            )
+        grad_probs = (
+            tokens_per_expert.float().unsqueeze(0).expand(ctx.N, ctx.E)
+            * ctx.C
+            * grad_aux_loss
+        )
 
         return grad_probs, None, None, None, None, None
 

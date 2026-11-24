@@ -106,24 +106,29 @@ def download_hf_model(
     model_name: str,
     output_dir: str,
     verify: bool = False,
+    revision: str | None = None,
 ) -> str:
     """Download a model snapshot from HuggingFace Hub.
 
     Args:
-        model_name: Repository id (e.g. ``"meta-llama/Llama-2-7b-hf"``).
+        model_name: Repository id (e.g. ``"NousResearch/Llama-2-7b-hf"``).
         output_dir: Local directory to store the downloaded files.
         verify: If ``True``, print SHA-256 hashes of every downloaded file.
+        revision: Immutable HuggingFace commit to download.
 
     Returns:
         The *output_dir* path (for chaining).
     """
+    if not revision:
+        raise ValueError("revision must be an immutable HuggingFace commit")
     from huggingface_hub import snapshot_download
 
     os.makedirs(output_dir, exist_ok=True)
-    logger.info("Downloading %s to %s ...", model_name, output_dir)
+    logger.info("Downloading %s@%s to %s ...", model_name, revision, output_dir)
 
     snapshot_download(
         repo_id=model_name,
+        revision=revision,
         local_dir=output_dir,
         local_dir_use_symlinks=False,
     )

@@ -7,7 +7,7 @@ description: "Use when creating benchmarks, diagnosing perf results, or adding n
 
 ## Mission
 
-Benchmarks exercise **actual Lumen implementations**, not standalone PyTorch. Every test must import and call a Lumen API -- `_DeferredWgrad`, `FP8ParamManager`, `SdmaTpComm`, `quantized_linear`, `fused_moe_triton`, etc. If the test does not call Lumen code, it does not belong here.
+Benchmarks exercise **actual Lumen implementations**, not standalone PyTorch. Every test must import and call a Lumen API -- `_DeferredWgrad`, `FP8ParamManager`, `SdmaTpComm`, `quantized_linear`, `fused_topk`, etc. If the test does not call Lumen code, it does not belong here.
 
 ## Project Layout
 

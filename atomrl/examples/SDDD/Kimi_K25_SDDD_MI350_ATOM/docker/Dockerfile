@@ -79,7 +79,7 @@ RUN VLLM_DIR=$(python3 -c "import vllm, os; print(os.path.dirname(os.path.dirnam
 # ---- AITER: official ROCm GPU compute kernels ----
 # Must be installed FIRST — both ATOM and Lumen depend on it.
 ARG AITER_REPOSITORY=https://github.com/ROCm/aiter.git
-ARG AITER_SHA=ff745fb09d669f40cf81d15d3e7598b61fe2a61c
+ARG AITER_SHA=adbb6ac8b84110134e0cf4dc513b250d2cc0a75c
 RUN git clone "${AITER_REPOSITORY}" /root/aiter && \
     cd /root/aiter && \
     git checkout --detach "${AITER_SHA}" && \

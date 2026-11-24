@@ -10,7 +10,7 @@ Lumen's main entry point is `LumenConfig.enable()`. A single configuration coord
 from atomrl.lumen import LumenConfig
 
 # 1. Build or load your model as usual
-model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-2-7b-hf")
+model = AutoModelForCausalLM.from_pretrained("NousResearch/Llama-2-7b-hf")
 
 # 2. Configure the training optimization stack
 lumencfg = LumenConfig(

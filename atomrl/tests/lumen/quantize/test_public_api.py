@@ -3,8 +3,6 @@
 import ast
 from pathlib import Path
 
-import pytest
-
 ESTABLISHED_PUBLIC_API = {
     "assert_mxfp4_arch_supported",
     "disable",
@@ -42,7 +40,6 @@ def test_declared_exports_preserve_established_quantize_api() -> None:
 
 
 def test_star_import_preserves_established_quantize_api() -> None:
-    pytest.importorskip("triton")
     from atomrl.lumen import quantize
 
     namespace: dict[str, object] = {}

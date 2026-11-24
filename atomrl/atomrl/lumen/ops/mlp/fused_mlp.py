@@ -10,11 +10,14 @@ to AITER Triton kernels when available, with decomposed AITER GEMM fallback.
 import logging
 
 import torch
-from aiter.ops.triton.gemm.feed_forward import (
+from aiter.ops.triton.gemm.feed_forward.ff_a16w16_fused_gated import (
     ff_a16w16_fused_gated,
+)
+from aiter.ops.triton.gemm.feed_forward.ff_a16w16_fused_ungated import (
     ff_a16w16_fused_ungated,
 )
-from torch.nn.functional import gelu, relu, silu
+from torch.autograd.function import once_differentiable
+from torch.nn.functional import gelu, linear, relu, silu
 
 from atomrl.lumen.ops.quantize.linear import gemm_bf16, quantize_input
 
@@ -40,6 +43,33 @@ _ACTIVATION_FNS = {
 }
 
 
+def _needs_autograd(*tensors: torch.Tensor | None) -> bool:
+    return torch.is_grad_enabled() and any(
+        tensor is not None and tensor.requires_grad for tensor in tensors
+    )
+
+
+def _aiter_activation(x: torch.Tensor, activation: str) -> torch.Tensor:
+    name = _ACTIVATION_TO_AITER[activation]
+    if name == "silu":
+        return silu(x)
+    if name == "gelu":
+        return gelu(x)
+    if name == "relu":
+        return relu(x)
+    raise ValueError(f"Unsupported AITER activation: {activation}")
+
+
+def _activation_with_grad(
+    value: torch.Tensor, activation: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    with torch.enable_grad():
+        tracked = value.detach().requires_grad_(True)
+        activated = _aiter_activation(tracked, activation)
+        derivative = torch.autograd.grad(activated.sum(), tracked)[0]
+    return activated.detach(), derivative
+
+
 def _gemm(
     x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
@@ -48,6 +78,94 @@ def _gemm(
     x_2d = x.reshape(-1, orig_shape[-1]).contiguous()
     out = gemm_bf16(x_2d, w, bias)
     return out.reshape(orig_shape[:-1] + (out.shape[-1],))
+
+
+class _AITERFusedGatedMLP(torch.autograd.Function):
+    """AITER fused forward with explicit AITER GEMM backward."""
+
+    @staticmethod
+    def forward(ctx, x, w_up, w_gate, w_down, activation):
+        orig_shape = x.shape
+        x_2d = x.reshape(-1, orig_shape[-1]).contiguous()
+        w_combined = torch.cat([w_gate, w_up], dim=0)
+        out = ff_a16w16_fused_gated(
+            x_2d,
+            w_combined,
+            w_down.T.contiguous(),
+            dtype=x.dtype,
+            activation=_ACTIVATION_TO_AITER[activation],
+        )
+        ctx.save_for_backward(x_2d, w_up, w_gate, w_down)
+        ctx.activation = activation
+        ctx.x_shape = orig_shape
+        return out.reshape(orig_shape[:-1] + (out.shape[-1],))
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output):
+        x, w_up, w_gate, w_down = ctx.saved_tensors
+        grad = grad_output.reshape(-1, grad_output.shape[-1]).contiguous()
+
+        gate = gemm_bf16(x, w_gate)
+        up = gemm_bf16(x, w_up)
+        activated, activation_grad = _activation_with_grad(gate, ctx.activation)
+        hidden = activated * up
+
+        grad_hidden = gemm_bf16(grad, w_down.T.contiguous())
+        grad_gate = grad_hidden * up * activation_grad
+        grad_up = grad_hidden * activated
+
+        grad_x = gemm_bf16(grad_gate, w_gate.T.contiguous()) + gemm_bf16(
+            grad_up, w_up.T.contiguous()
+        )
+        grad_w_gate = gemm_bf16(grad_gate.T.contiguous(), x.T.contiguous())
+        grad_w_up = gemm_bf16(grad_up.T.contiguous(), x.T.contiguous())
+        grad_w_down = gemm_bf16(grad.T.contiguous(), hidden.T.contiguous())
+        return (
+            grad_x.reshape(ctx.x_shape),
+            grad_w_up,
+            grad_w_gate,
+            grad_w_down,
+            None,
+        )
+
+
+class _AITERFusedMLP(torch.autograd.Function):
+    """AITER fused ungated forward with explicit AITER GEMM backward."""
+
+    @staticmethod
+    def forward(ctx, x, w_up, w_down, activation):
+        orig_shape = x.shape
+        x_2d = x.reshape(-1, orig_shape[-1]).contiguous()
+        out = ff_a16w16_fused_ungated(
+            x_2d,
+            w_up,
+            w_down.T.contiguous(),
+            dtype=x.dtype,
+            activation=_ACTIVATION_TO_AITER[activation],
+        )
+        ctx.save_for_backward(x_2d, w_up, w_down)
+        ctx.activation = activation
+        ctx.x_shape = orig_shape
+        return out.reshape(orig_shape[:-1] + (out.shape[-1],))
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output):
+        x, w_up, w_down = ctx.saved_tensors
+        grad = grad_output.reshape(-1, grad_output.shape[-1]).contiguous()
+
+        pre_activation = gemm_bf16(x, w_up)
+        activated, activation_grad = _activation_with_grad(
+            pre_activation, ctx.activation
+        )
+        grad_hidden = gemm_bf16(grad, w_down.T.contiguous())
+        grad_pre_activation = grad_hidden * activation_grad
+
+        grad_x = gemm_bf16(grad_pre_activation, w_up.T.contiguous())
+        grad_w_up = gemm_bf16(grad_pre_activation.T.contiguous(), x.T.contiguous())
+        grad_w_down = gemm_bf16(grad.T.contiguous(), activated.T.contiguous())
+        return grad_x.reshape(ctx.x_shape), grad_w_up, grad_w_down, None
 
 
 def fused_gated_mlp(
@@ -62,26 +180,27 @@ def fused_gated_mlp(
 ) -> torch.Tensor:
     """Fused gated MLP: down(gate_act(gate(x)) * up(x)).
 
-    Dispatches to AITER ff_a16w16_fused_gated (single kernel) when
-    available and no bias is used.  Falls back to decomposed AITER
-    BF16 GEMMs otherwise.
+    Bias-free execution uses AITER ``ff_a16w16_fused_gated`` with an explicit
+    AITER GEMM backward. Biased training uses differentiable PyTorch linear
+    operations; biased inference uses decomposed AITER BF16 GEMMs.
     """
-    use_bias = bias_up is not None or bias_gate is not None or bias_down is not None
-    if not use_bias:
-        try:
-            aiter_act = _ACTIVATION_TO_AITER.get(activation, "silu")
-            orig_shape = x.shape
-            x_2d = x.reshape(-1, x.shape[-1]) if x.dim() > 2 else x
-            w_combined = torch.cat([w_gate, w_up], dim=0)
-            w_down_aiter = w_down.T
-            out = ff_a16w16_fused_gated(
-                x_2d, w_combined, w_down_aiter, dtype=x.dtype, activation=aiter_act
-            )
-            return out.reshape(orig_shape[:-1] + (out.shape[-1],))
-        except (RuntimeError, TypeError):
-            pass
+    act_fn = _ACTIVATION_FNS[activation]
+    if x.device.type != "cuda":
+        gate_out = linear(x, w_gate, bias_gate)
+        up_out = linear(x, w_up, bias_up)
+        return linear(act_fn(gate_out) * up_out, w_down, bias_down)
 
-    act_fn = _ACTIVATION_FNS.get(activation, silu)
+    use_bias = bias_up is not None or bias_gate is not None or bias_down is not None
+    if use_bias and _needs_autograd(
+        x, w_up, w_gate, w_down, bias_up, bias_gate, bias_down
+    ):
+        gate_out = linear(x, w_gate, bias_gate)
+        up_out = linear(x, w_up, bias_up)
+        return linear(act_fn(gate_out) * up_out, w_down, bias_down)
+
+    if not use_bias:
+        return _AITERFusedGatedMLP.apply(x, w_up, w_gate, w_down, activation)
+
     gate_out = _gemm(x, w_gate, bias_gate)
     up_out = _gemm(x, w_up, bias_up)
     hidden = act_fn(gate_out) * up_out
@@ -98,25 +217,21 @@ def fused_mlp(
 ) -> torch.Tensor:
     """Fused ungated MLP: down(act(up(x))).
 
-    Dispatches to AITER ff_a16w16_fused_ungated (single kernel) when
-    available and no bias is used.  Falls back to decomposed AITER
-    BF16 GEMMs otherwise.
+    Bias-free execution uses AITER ``ff_a16w16_fused_ungated`` with an explicit
+    AITER GEMM backward. Biased training uses differentiable PyTorch linear
+    operations; biased inference uses decomposed AITER BF16 GEMMs.
     """
-    use_bias = bias_up is not None or bias_down is not None
-    if not use_bias:
-        try:
-            aiter_act = _ACTIVATION_TO_AITER.get(activation, "gelu")
-            orig_shape = x.shape
-            x_2d = x.reshape(-1, x.shape[-1]) if x.dim() > 2 else x
-            w_down_aiter = w_down.T
-            out = ff_a16w16_fused_ungated(
-                x_2d, w_up, w_down_aiter, dtype=x.dtype, activation=aiter_act
-            )
-            return out.reshape(orig_shape[:-1] + (out.shape[-1],))
-        except (RuntimeError, TypeError):
-            pass
+    act_fn = _ACTIVATION_FNS[activation]
+    if x.device.type != "cuda":
+        return linear(act_fn(linear(x, w_up, bias_up)), w_down, bias_down)
 
-    act_fn = _ACTIVATION_FNS.get(activation, gelu)
+    use_bias = bias_up is not None or bias_down is not None
+    if use_bias and _needs_autograd(x, w_up, w_down, bias_up, bias_down):
+        return linear(act_fn(linear(x, w_up, bias_up)), w_down, bias_down)
+
+    if not use_bias:
+        return _AITERFusedMLP.apply(x, w_up, w_down, activation)
+
     hidden = act_fn(_gemm(x, w_up, bias_up))
     return _gemm(hidden, w_down, bias_down)
 

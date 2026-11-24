@@ -188,7 +188,9 @@ def load_site(path: str | Path | None = None) -> Site:
     return Site(
         data_root=data.get("data_root") or os.environ.get("DATA_ROOT"),
         docker=str(data.get("docker") or os.environ.get("DOCKER") or "docker"),
-        container=str(data.get("container") or "atomrl-ex"),
+        container=str(
+            data.get("container") or os.environ.get("ATOMRL_CONTAINER") or "atomrl-ex"
+        ),
         hosts=hosts,
         rdma=rdma,
         env={str(k): str(v) for k, v in (data.get("env") or {}).items()},

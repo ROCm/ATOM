@@ -382,7 +382,7 @@ except ImportError:  # pragma: no cover - flash_attn optional
     _flash_attn_func = None
 
     def _flash_attn_varlen_func(*args, **kwargs):
-        from aiter import flash_attn_varlen_func
+        from aiter.ops.mha import flash_attn_varlen_func
 
         return flash_attn_varlen_func(*args, **kwargs)
 

@@ -187,7 +187,9 @@ def test_grouped_gemm_wgrad(num_experts, tokens):
 # ===================================================================
 
 
-@pytest.mark.parametrize("scaling_type", ["blockwise", "blockwise2d"])
+@pytest.mark.parametrize(
+    "scaling_type", ["blockwise", "blockwise2d", "per_token", "mxfp8"]
+)
 @pytest.mark.parametrize("num_experts", [4])
 @pytest.mark.parametrize("tokens", [64, 256])
 def test_grouped_gemm_fp8_scaling(num_experts, tokens, scaling_type):
@@ -209,6 +211,77 @@ def test_grouped_gemm_fp8_scaling(num_experts, tokens, scaling_type):
     assert out_lumen.shape == (total_tokens, N)
     snr = compute_snr(out_ref, out_lumen)
     assert snr > 8, f"Grouped GEMM {scaling_type} SNR: {snr:.1f} dB (expected > 8)"
+
+
+@pytest.mark.parametrize("scaling_type", ["dynamic", "per_token", "mxfp8"])
+def test_grouped_gemm_prequantized_scales_are_token_aligned(scaling_type):
+    from atomrl.lumen.ops.quantize.linear import quantize_input
+    from atomrl.lumen.quantize.config import _get_float8_e4m3
+
+    device = "cuda"
+    fp8_dtype = _get_float8_e4m3()
+    group_sizes = torch.tensor([17, 13, 19, 15], device=device, dtype=torch.int32)
+    total_tokens = int(group_sizes.sum().item())
+    n = k = 128
+    lhs = torch.randn(total_tokens, k, device=device, dtype=torch.bfloat16) * 0.1
+    rhs = torch.randn(4, n, k, device=device, dtype=torch.bfloat16) * 0.02
+    reference = grouped_gemm_ref(lhs, rhs, group_sizes)
+
+    lhs_desc = quantize_input(lhs, scaling_type, fp8_dtype)
+    weight_descs = [quantize_input(weight, scaling_type, fp8_dtype) for weight in rhs]
+    grouped_weight = torch.stack(
+        [descriptor.data.T.contiguous() for descriptor in weight_descs]
+    )
+    grouped_weight_scale = torch.stack(
+        [descriptor.scale for descriptor in weight_descs]
+    )
+
+    result = grouped_gemm(
+        lhs_desc.data,
+        grouped_weight,
+        group_sizes,
+        scaling_type=scaling_type,
+        x_scale=lhs_desc.scale,
+        w_scale=grouped_weight_scale,
+    )
+    assert result.shape == reference.shape
+    assert compute_snr(reference, result) > 8
+
+
+def test_grouped_gemm_prequantized_mxfp8_slices_padded_width():
+    from atomrl.lumen.ops.quantize.linear import quantize_input
+    from atomrl.lumen.quantize.config import _get_float8_e4m3
+
+    arch = torch.cuda.get_device_properties(0).gcnArchName
+    if not arch.startswith(("gfx950", "gfx1250")):
+        pytest.skip(f"AITER native MXFP8 GEMM is unavailable on {arch}")
+
+    fp8_dtype = _get_float8_e4m3()
+    group_sizes = torch.tensor([17, 13, 19, 15], device="cuda", dtype=torch.int32)
+    lhs = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16) * 0.1
+    weights = torch.randn(4, 50, 128, device="cuda", dtype=torch.bfloat16) * 0.02
+    reference = grouped_gemm_ref(lhs, weights, group_sizes)
+
+    lhs_desc = quantize_input(lhs, "mxfp8", fp8_dtype)
+    weight_descs = [quantize_input(weight, "mxfp8", fp8_dtype) for weight in weights]
+    grouped_weight = torch.stack(
+        [descriptor.data.T.contiguous() for descriptor in weight_descs]
+    )
+    grouped_weight_scale = torch.stack(
+        [descriptor.scale for descriptor in weight_descs]
+    )
+    result = grouped_gemm(
+        lhs_desc.data,
+        grouped_weight,
+        group_sizes,
+        scaling_type="mxfp8",
+        x_scale=lhs_desc.scale,
+        w_scale=grouped_weight_scale,
+        output_features=50,
+    )
+
+    assert result.shape == (64, 50)
+    assert compute_snr(reference, result) > 8
 
 
 # ===================================================================

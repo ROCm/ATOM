@@ -10,8 +10,91 @@ on:
         default: atomrl:lumen-ci
 
 jobs:
+  lumen-unit:
+    name: Lumen GPU unit tests
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
+    runs-on: atom-mi355-8gpu.predownload
+    timeout-minutes: 120
+    concurrency:
+      group: lumen-readme-atom-mi355-8gpu.predownload
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    env:
+      CONTAINER_NAME: lumen_unit_${{ github.run_id }}_${{ github.run_attempt }}
+      LUMEN_IMAGE: ${{ inputs.image_tag }}-${{ github.run_id }}-${{ github.run_attempt }}-unit
+    steps:
+      - name: Restore workspace ownership
+        run: |
+          set -euo pipefail
+          workspace="${GITHUB_WORKSPACE:-$PWD}"
+          uid="$(id -u)"; gid="$(id -g)"
+          if [[ -d "$workspace" ]] && command -v sudo >/dev/null && sudo -n true 2>/dev/null; then
+            sudo chown -R "$uid:$gid" "$workspace" || true
+            sudo chmod -R u+rwX "$workspace" || true
+          fi
+
+      - uses: actions/checkout@v6
+        with:
+          clean: true
+
+      - name: Detect container engine
+        run: |
+          set -euo pipefail
+          if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
+            engine=docker
+          elif command -v podman >/dev/null && podman info >/dev/null 2>&1; then
+            engine=podman
+          else
+            echo "No usable Docker or Podman engine" >&2
+            exit 1
+          fi
+          engine_path="$(command -v "$engine")"
+          wrapper_dir="${RUNNER_TEMP}/lumen-container-bin"
+          mkdir -p "$wrapper_dir"
+          cp "$GITHUB_WORKSPACE/.github/scripts/lumen-docker-compat.py" "$wrapper_dir/docker"
+          chmod +x "$wrapper_dir/docker"
+          echo "CONTAINER_ENGINE=$engine" >> "$GITHUB_ENV"
+          echo "CONTAINER_ENGINE_PATH=$engine_path" >> "$GITHUB_ENV"
+          echo "PATH=$wrapper_dir:$PATH" >> "$GITHUB_ENV"
+
+      - name: Build unit validation image
+        run: |
+          set -euo pipefail
+          docker build --pull \
+            --build-arg AITER_REF=main \
+            --file atomrl/docker/Dockerfile.lumen \
+            --tag "$LUMEN_IMAGE" \
+            .
+
+      - name: Run Lumen GPU unit suite
+        run: |
+          set -euo pipefail
+          if [[ -f /etc/podinfo/gha-render-devices ]]; then
+            device_flag="$(cat /etc/podinfo/gha-render-devices)"
+          else
+            device_flag="--device=/dev/dri"
+          fi
+          group_flag="--group-add video"
+          [[ "$CONTAINER_ENGINE" == podman ]] && group_flag="--group-add keep-groups"
+          docker run --rm --name "$CONTAINER_NAME" \
+            --device=/dev/kfd $device_flag $group_flag --ipc=host --privileged \
+            --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+            --ulimit memlock=-1 --ulimit stack=67108864 \
+            -w /workspace/ATOM \
+            "$LUMEN_IMAGE" bash -lc \
+            "python3 -m pytest atomrl/tests/lumen -q"
+
+      - name: Clean up unit image
+        if: always()
+        run: |
+          engine="${CONTAINER_ENGINE:-docker}"
+          "$engine" rm -f "$CONTAINER_NAME" 2>/dev/null || true
+          "$engine" rmi -f "$LUMEN_IMAGE" 2>/dev/null || true
+
   lumen-case:
     name: Lumen case ${{ matrix.id }} (${{ matrix.name }})
+    needs: lumen-unit
     if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
     strategy:
       fail-fast: false
@@ -42,6 +125,7 @@ jobs:
     env:
       CONTAINER_NAME: lumen_readme_${{ github.run_id }}_${{ matrix.id }}
       LUMEN_IMAGE: ${{ inputs.image_tag }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.id }}
+      LUMEN_CI_USE_IMAGE_SOURCE: "1"
     steps:
       - name: Restore workspace ownership
         run: |
@@ -118,7 +202,7 @@ jobs:
             /models
           )
           if [[ "$MODEL_KIND" == llama2 ]]; then
-            variants=(meta-llama/Llama-2-7b-hf Llama-2-7b-hf llama2/Llama-2-7b-hf llama2-7b-hf)
+            variants=(NousResearch/Llama-2-7b-hf nousresearch/Llama-2-7b-hf Llama-2-7b-hf llama2/Llama-2-7b-hf llama2-7b-hf)
             basenames=(Llama-2-7b-hf llama2-7b-hf)
           elif [[ "$MODEL_KIND" == qwen3 ]]; then
             variants=(Qwen/Qwen3-8B Qwen3-8B qwen/Qwen3-8B qwen3-8b)
@@ -276,8 +360,9 @@ jobs:
             -w /workspace/ATOM/atomrl/lumen \
             "$LUMEN_IMAGE" bash -lc \
             "LUMEN_BUILD_EXTENSIONS=1 python -m pip install --no-build-isolation --no-deps -e /workspace/ATOM/atomrl &&
-             MODEL_PATH=/models/Qwen3-8B TRAIN_DATA_PATH=/ci-data/train.jsonl
-             VALID_DATA_PATH=/ci-data/valid.jsonl RESULTS_DIR=/results $CASE_COMMAND" \
+             MODEL_PATH=/models/Qwen3-8B TRAIN_DATA_PATH=/ci-data/train.jsonl \
+             VALID_DATA_PATH=/ci-data/valid.jsonl RESULTS_DIR=/results \
+             $CASE_COMMAND" \
             2>&1 | tee "$log_dir/run.log"
 
       - name: Upload case logs

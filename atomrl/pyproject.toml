@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "atomrl"
 version = "0.1.0"
-authors = [{ name = "ZhangDanyang-AMD" }]
+authors = [{ name = "Advanced Micro Devices, Inc." }]
 license = "MIT"
 license-files = ["LICENSE"]
 readme = "README.md"
