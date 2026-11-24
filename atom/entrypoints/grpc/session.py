@@ -93,9 +93,13 @@ class Session:
         self.preparing -= 1
         self._release()
 
-    def drop(self, client_id: int) -> None:
-        """Forgets a request whose submission failed before it reached the engine."""
-        request = self._pop(client_id)
+    def drop(self, client_id: int, seq) -> None:
+        """Forgets a request whose submission failed before it reached the engine, unless
+        it ended first and `client_id` names another request now."""
+        request = self.requests.get(client_id)
+        if request is None or request.seq is not seq:
+            return
+        self._pop(client_id)
         self.api.engine.io_processor.requests.pop(request.seq.id, None)
         self._release()
 
