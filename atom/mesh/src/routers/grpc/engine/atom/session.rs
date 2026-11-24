@@ -15,6 +15,7 @@ use futures::future::{BoxFuture, FutureExt, WeakShared};
 use futures::{stream, Stream, StreamExt};
 use http::StatusCode;
 use parking_lot::Mutex;
+use prost::Message as _;
 use serde_json::Value as Json;
 use tokio::runtime;
 use tokio::sync::{mpsc, oneshot};
@@ -44,7 +45,8 @@ const OPENING: Duration = Duration::from_secs(10);
 /// How often requests look for Sessions whose instance has no registered worker.
 const SWEEP: Duration = Duration::from_secs(1);
 
-/// The prompt bytes a Session may hold unsent; past them a request is refused with 503.
+/// The request bytes (prompt and RequestSpec) a Session may hold unsent, a dropped one's
+/// until the writer discards it; past them a request is refused with 503.
 const UNSENT_BYTES: usize = 256 << 20;
 
 /// The outputs a streamed request may leave unread; past them it fails and is aborted.
@@ -189,7 +191,7 @@ struct Session {
 
 enum Command {
     Submit(Box<pb::RequestSpec>, Vec<u32>),
-    /// A Submit whose prompt waits in `Routes::unsent` under this ticket.
+    /// A Submit whose prompt and bytes wait in `Routes::unsent` under this ticket.
     Queued(Box<pb::RequestSpec>, u64),
     Abort(u64),
 }
@@ -223,7 +225,7 @@ impl Session {
         stream: bool,
     ) -> Result<SessionStream, EngineError> {
         let mut routes = self.routes.lock();
-        let bytes = 4 * prompt.len();
+        let bytes = 4 * prompt.len() + spec.encoded_len();
         if !routes.unsent.is_empty() && routes.unsent_bytes + bytes > routes.unsent_budget {
             return Err(EngineError::Http {
                 status: StatusCode::SERVICE_UNAVAILABLE,
@@ -254,7 +256,8 @@ impl Session {
         }
         routes.next_ticket += 1;
         routes.unsent_bytes += bytes;
-        routes.unsent.insert(ticket, prompt);
+        let prompt = Some(prompt);
+        routes.unsent.insert(ticket, Unsent { prompt, bytes });
         routes.open.insert(seq_id, route);
         Ok(SessionStream {
             seq_id,
@@ -442,8 +445,8 @@ struct Routes {
     next_seq_id: u64,
     /// The call has ended; no request is routed after.
     closed: bool,
-    /// Prompts queued and not yet taken by the writer, by ticket, and their bytes.
-    unsent: HashMap<u64, Vec<u32>>,
+    /// Requests queued and not yet taken by the writer, by ticket, and their bytes.
+    unsent: HashMap<u64, Unsent>,
     unsent_bytes: usize,
     /// UNSENT_BYTES but in tests.
     unsent_budget: usize,
@@ -462,6 +465,13 @@ impl Default for Routes {
             next_ticket: 0,
         }
     }
+}
+
+/// A queued request's prompt, gone once its stream drops, and the bytes it holds of the
+/// budget, held until the writer takes its Queued with its spec.
+struct Unsent {
+    prompt: Option<Vec<u32>>,
+    bytes: usize,
 }
 
 /// Where a request's outputs go, and what its Complete reports.
@@ -607,13 +617,14 @@ impl Routes {
         Ok(overflowed)
     }
 
-    /// `commands` with each Queued's prompt taken; one whose prompt is gone is dropped.
+    /// `commands` with each Queued's prompt taken and its bytes released; one whose
+    /// prompt is gone is dropped.
     fn take_unsent(&mut self, commands: Vec<Command>) -> Vec<Command> {
         let take = |command| match command {
             Command::Queued(spec, ticket) => {
-                let prompt = self.unsent.remove(&ticket)?;
-                self.unsent_bytes -= 4 * prompt.len();
-                Some(Command::Submit(spec, prompt))
+                let unsent = self.unsent.remove(&ticket)?;
+                self.unsent_bytes -= unsent.bytes;
+                Some(Command::Submit(spec, unsent.prompt?))
             }
             command => Some(command),
         };
@@ -685,7 +696,7 @@ fn json(value: &pb::Value) -> Result<Json, String> {
 /// Dropped before its last message, it aborts the request.
 pub(crate) struct SessionStream {
     seq_id: u64,
-    /// Its prompt's ticket in `Routes::unsent` until the writer takes it.
+    /// Its ticket in `Routes::unsent` until the writer takes it.
     ticket: u64,
     rx: mpsc::Receiver<Output>,
     session: Session,
@@ -704,9 +715,10 @@ impl Drop for SessionStream {
         // Only its own route: once it has ended, a later request may hold its seq_id.
         self.rx.close();
         let mut routes = self.session.routes.lock();
-        // Never sent: its prompt is freed and its seq_id released, with nothing to abort.
-        if let Some(prompt) = routes.unsent.remove(&self.ticket) {
-            routes.unsent_bytes -= 4 * prompt.len();
+        // Never sent: its prompt is freed and its seq_id released, with nothing to abort;
+        // its spec stays queued, so its bytes stay held until the writer discards it.
+        if let Some(unsent) = routes.unsent.get_mut(&self.ticket) {
+            unsent.prompt = None;
             routes.open.remove(&self.seq_id);
             return;
         }
