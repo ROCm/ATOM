@@ -371,6 +371,7 @@ def _input_phase(sp: SeqShard, layer, embeddings: torch.Tensor):
     scales = torch.empty(
         (sp.padded, hidden // 32), dtype=torch.float8_e8m0fnu, device=dev
     )
+
     def run(coll):
         r = sp.shard(embeddings)
         x = layer.input_layernorm.forward_cuda(r)
@@ -385,15 +386,15 @@ def _input_phase(sp: SeqShard, layer, embeddings: torch.Tensor):
 def _o_proj_all_to_all(attn, attn_output: torch.Tensor, sp: SeqShard, coll):
     """This rank's heads of every token -> the whole o_proj of this rank's rows,
     through an all-to-all of the MXFP8 codes + scales."""
-    d = attn_output.shape[1]
+    from atom.models.minimax_m3.sp_layout import a2a_unpack
+
     w, rows = sp.world, sp.rows
     send_q, send_s = _quant(sp.pad(attn_output))
     recv_q = torch.empty_like(send_q)
     recv_s = torch.empty_like(send_s)
     coll.all_to_all([recv_q, recv_s], [send_q, send_s])
     # block r: rank r's heads of this rank's rows -> [rows, w * d], heads in rank order
-    x_q = recv_q.view(w, rows, d).transpose(0, 1).reshape(rows, w * d)
-    x_s = recv_s.view(w, rows, d // 32).transpose(0, 1).reshape(rows, w * d // 32)
+    x_q, x_s = a2a_unpack(recv_q, recv_s, w, rows)
     return attn.o_proj_full(x_q, x_scale=x_s)
 
 
@@ -511,22 +512,20 @@ def _shared_local(moe, chain: bool) -> bool:
 _side_stream: torch.cuda.Stream | None = None
 
 
-def _shared_owner_rows(sp: SeqShard, moe, inp: FfnInput, out: torch.Tensor, side: bool):
-    """Owner-local shared expert: the full shared MLP of this rank's own rows,
-    added to those rows of the TP partial ``out`` (the reduce-scatter sums the
-    other ranks' routed partials into it). Returns a callback that waits for and
-    adds the result when ``side`` ran it on a side stream next to the routed chain."""
+def _owner_rows(sp: SeqShard) -> tuple[int, int]:
+    """This rank's first row of the padded layout and how many of its rows are real."""
     start = sp.rank * sp.rows
-    n = min(sp.rows, max(0, sp.num_tokens - start))
+    return start, min(sp.rows, max(0, sp.num_tokens - start))
+
+
+def _shared_owner_rows_side(sp: SeqShard, moe, inp: FfnInput, out: torch.Tensor):
+    """Owner-local shared expert on a side stream next to the routed chain: the full
+    shared MLP of this rank's own rows, added to those rows of the TP partial
+    ``out``. Returns the callback that waits for and adds the result."""
+    start, n = _owner_rows(sp)
     if n == 0:
         return lambda: None
     codes, scales = inp.local
-    if not side:
-
-        def serial():
-            out[start : start + n] += moe.shared_full(codes[:n], scales[:n])
-
-        return serial
     cur = torch.cuda.current_stream()
     global _side_stream
     if _side_stream is None:
@@ -620,7 +619,7 @@ def _moe_chain(sp: SeqShard, moe, inp: FfnInput) -> torch.Tensor:
     q, s = inp.fp4
     assert t >= MIN_PREFILL_TOKENS, t
 
-    def chain(n: int, out: torch.Tensor | None) -> torch.Tensor:
+    def chain(n: int, out: torch.Tensor | None, **fuse) -> torch.Tensor:
         return a4w4_prefill_moe(
             (q[:n], s[:n]),
             w13,
@@ -633,28 +632,36 @@ def _moe_chain(sp: SeqShard, moe, inp: FfnInput) -> torch.Tensor:
             intermediate_size=w2.shape[2] * 2,
             num_experts=w13.shape[0],
             out=out,
+            **fuse,
         )
 
     if not _chain_warmed:
         _chain_warmed = True
+        # the one-row ``add`` builds the same (scale + add) reduce the steps run
+        dummy = torch.zeros((1, w2.shape[1]), dtype=torch.bfloat16, device=q.device)
         for n in _CHAIN_WARM_UP_TOKENS:
             if n <= sp.padded and n != t:
-                chain(n, None)
+                chain(n, None, scale=scale, add=dummy)
     out = torch.empty((sp.padded, w2.shape[1]), dtype=torch.bfloat16, device=q.device)
+    # The routed scale and the shared expert's output ride on the chain's final
+    # reduce (``reduce * scale + shared``) rather than two passes over ``out``.
     finish = None
+    shared, row0 = None, 0
     if inp.local is not None:
-        # launched first: it overlaps the routed chain on a side stream
-        finish = _shared_owner_rows(
-            sp, moe, inp, out, envs.ATOM_M3_SP_SHARED_LOCAL_SIDE
-        )
-    chain(t, out[:t])
+        if envs.ATOM_M3_SP_SHARED_LOCAL_SIDE:
+            # launched first: it overlaps the routed chain on a side stream
+            finish = _shared_owner_rows_side(sp, moe, inp, out)
+        else:
+            row0, n = _owner_rows(sp)
+            if n > 0:
+                codes, scales = inp.local
+                shared = moe.shared_full(codes[:n], scales[:n])
+    elif moe.shared_experts is not None:
+        shared = moe.shared_experts(inp.codes[:t], x_scale=inp.scales[:t])
+    chain(t, out[:t], scale=scale, add=shared, add_row0=row0)
     out[t:].zero_()
-    if scale != 1.0:
-        out[:t] *= scale
     if finish is not None:
         finish()
-    elif moe.shared_experts is not None:
-        out[:t] += moe.shared_experts(inp.codes[:t], x_scale=inp.scales[:t])
     return out
 
 

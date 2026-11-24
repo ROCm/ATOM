@@ -22,10 +22,6 @@ def _moe(value: float):
     return SimpleNamespace(shared_full=shared_full), calls
 
 
-def _inp(rows: int):
-    return sp.FfnInput(local=(torch.zeros(rows, H), torch.zeros(rows, H // 32)))
-
-
 @pytest.mark.parametrize(
     "tokens,rows,rank,start,n",
     [
@@ -35,18 +31,9 @@ def _inp(rows: int):
         (8, 3, 3, 9, 0),  # last rank: padding only
     ],
 )
-def test_owner_adds_to_its_own_rows_only(tokens, rows, rank, start, n):
-    world = 4
-    shard = sp.SeqShard(num_tokens=tokens, rows=rows, world=world, rank=rank)
-    moe, calls = _moe(2.0)
-    out = torch.ones(shard.padded, H, dtype=torch.bfloat16)
-    finish = sp._shared_owner_rows(shard, moe, _inp(rows), out, side=False)
-    assert calls == []  # serial: nothing runs before the routed chain
-    finish()
-    assert calls == ([n] if n else [])
-    expect = torch.ones(shard.padded, H, dtype=torch.bfloat16)
-    expect[start : start + n] += 2.0
-    assert torch.equal(out, expect)
+def test_owner_rows(tokens, rows, rank, start, n):
+    shard = sp.SeqShard(num_tokens=tokens, rows=rows, world=4, rank=rank)
+    assert sp._owner_rows(shard) == (start, n)
 
 
 def test_shared_local_gating(monkeypatch):
