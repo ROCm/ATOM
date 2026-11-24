@@ -1,0 +1,91 @@
+{
+  "lease": "Lb6034c",
+  "node": "pit2-p03-g48",
+  "harness_sha": "428707866883619601b2889e873c0094bcec354f",
+  "worker_image": "vllm/vllm-openai-rocm:minimax-m31-flash-75bc8cf1@sha256:f8e8ab239e5edb7c3070c5802fc7fc0cbb889513bf81183dfc98ce1c77e1dfe1",
+  "router_sha": "69ed5e77bcc93b9d51cb5cf1528badd0e703ed93",
+  "srt_sha": "85ecf60ac3931f38abdb0dd82f909f35057d5e12",
+  "layout": "P TP1/PP4, D TP1/DP4+EP4; single node8 GPUs",
+  "concurrency": 80,
+  "decode_max_num_seqs_per_rank": 20,
+  "decode_capture_max_tokens": 160,
+  "prefill_hip_order": "0,1,3,2",
+  "failing_pp3_pci": "0000:65:00.0",
+  "status": "warmup_failed; diagnostically stopped after repeated KV write timeouts",
+  "warmup_started_at_utc": "2026-11-24T13:54:46.783Z",
+  "first_transfer_failure_utc": "2026-11-24T13:59:02.805595Z",
+  "profiling_started": false,
+  "performance_valid": false,
+  "interactivity_tok_s_user": null,
+  "token_throughput_per_chip": null,
+  "failure_event_count": 53,
+  "failure_events_by_pp_rank": {
+    "3": 53
+  },
+  "failure_events_by_peer": {
+    "decode-peer-1": 35,
+    "decode-peer-2": 10,
+    "decode-peer-3": 8
+  },
+  "first_failed_batch": {
+    "pp_rank": 3,
+    "peer": "decode-peer-1",
+    "return_code": -1,
+    "elapsed_s": 30.04579829517752,
+    "descriptors": 35,
+    "bytes": 45588480
+  },
+  "failed_bytes_range": [
+    7598080,
+    15251246080
+  ],
+  "failed_descriptor_range": [
+    35,
+    178185
+  ],
+  "exported_record_counts": {
+    "warmup error": 457,
+    "warmup valid": 9
+  },
+  "protocol_probe_count": 5,
+  "probe_transfer_bytes": 101376000.0,
+  "probe_disconnect_gauges": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "exit_codes": {
+    "pool-workload.rc": 1,
+    "pool-exit.rc": 1,
+    "gpool-release.rc": 0,
+    "srt-exit-code.txt": 1
+  },
+  "stop_method": "Verified GNU timeout supervisor received SIGTERM; existing srt/pool cleanup traps completed. Original-order L4a09fd was left running.",
+  "cleanup": {
+    "srt_initial_remaining_count": 1,
+    "pool_fallback_removed_count": 1,
+    "final_matching_container_ids": [],
+    "final_container_query_exit": 0,
+    "normal_release_confirmed": true,
+    "initial_release_refused_until_vram_drained": true
+  },
+  "rdma_window": {
+    "baseline_utc": "2026-11-24T13:31:41.661941+00:00",
+    "last_active_utc": "2026-11-24T14:03:43.091357+00:00",
+    "nonzero_error_timeout_or_retransmit_deltas": {},
+    "traffic_continued_after_failure": true,
+    "caveat": "These host counters do not expose every request or completion state and cannot prove hardware health."
+  },
+  "comparison": "Original C40 failure was PP3 on g27/PCI15; this C80 failure is PP3 on g48/PCI65 despite remapping. This weakens a single fixed GPU explanation but changes in concurrency, scheduler limit and graph sizes prevent attributing it to one software cause.",
+  "next_investigation": "Compare the independent original-order C40 control; inspect descriptor construction and native Mooncake per-task completion versus batch counters/progress. No timeout increase or worker fix is claimed.",
+  "archive_sha256": "dc708711352464d9af78457cba871ce1856c70230f702667611d4360fdd4356c",
+  "prefill_log_sha256": "750d429e42ce73024dc1919b8ae5b24d7f5ac06c5a10cbfc258df65adaea4cfe",
+  "monitor_sha256": "fcaada25faf5b81362df440610fbcca502d56d9dde06d9cffeb686297af5010a"
+}
