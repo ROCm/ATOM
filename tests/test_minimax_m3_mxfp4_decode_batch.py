@@ -74,14 +74,16 @@ def test_the_scorer_buffers_are_one_workspace_and_a_map_per_decode_ubatch(
 )
 @pytest.mark.parametrize("q_rows", [6, 12])  # exactly the metadata's rows / a DP pad
 @pytest.mark.parametrize("token_tiled", [False, True])
+@pytest.mark.parametrize("reused", [False, True])  # a later layer reuses the selection
 def test_the_sparse_attention_runs_only_the_rows_the_metadata_covers(
-    monkeypatch, phase, kv, index, fp8_out, q_rows, token_tiled
+    monkeypatch, phase, kv, index, fp8_out, q_rows, token_tiled, reused
 ):
     """One row rule for decode and prefill. With the MXFP4 index the scorer, selector
     and attention get the rows the metadata covers; the pad rows past them are never
     read and the output is zero there. Another index cache keeps every row. An FP8
     output (an FP8 KV only) goes whole to its own PA, which writes its pad rows, and
-    is what the impl returns."""
+    is what the impl returns. The token-tiled kernel reads only topk_idx, so its steps
+    skip the page-16 table unless a later layer reuses the selection."""
     pytest.importorskip("aiter")
     from atom.model_ops import attention_mha
     from atom.model_ops.minimax_m3 import index_topk, sparse_attn
@@ -93,9 +95,13 @@ def test_the_sparse_attention_runs_only_the_rows_the_metadata_covers(
     def topk(idx_q, cache, block_table, *a, **kw):
         seq_lens = a[0] if phase == "decode" else a[1]
         seen["scorer"] = (idx_q.shape[0], seq_lens.shape[0], block_table.shape[0])
+        seen["emit"] = kw.get("emit_sparse_block_table")
         n = idx_q.shape[0] * heads
+        topk_idx = torch.zeros(heads, idx_q.shape[0], 2, dtype=torch.int32)
+        if seen["emit"] is False:
+            return topk_idx
         return (
-            torch.zeros(heads, idx_q.shape[0], 2, dtype=torch.int32),
+            topk_idx,
             torch.zeros(n, 2, dtype=torch.int32),
             torch.zeros(n, dtype=torch.int32),
         )
@@ -130,12 +136,14 @@ def test_the_sparse_attention_runs_only_the_rows_the_metadata_covers(
     torch.nn.Module.__init__(layer)
     layer.kv_cache_dtype, layer.index_cache_dtype = kv, index
     layer._sparse_pa_mxfp4, layer._select_page_kwargs = attend_fp4, {}
-    layer.skip_index_topk, layer.index_topk_cache_state = False, {}
+    layer.skip_index_topk = False
+    layer.index_topk_cache_state = {} if reused else None
     layer.indexer_cp_group = None
     layer.topk, layer.init_blocks, layer.local_blocks = 2, 1, 0
     layer.num_kv_heads, layer.scale = 1, 1.0
     layer.index_cache, layer.layer_num, layer.sparse_layer_ordinal = None, 0, 0
-    layer._tt_prefill = token_tiled  # the token-tiled prefill kernel's layer gate
+    # the token-tiled prefill kernel's layer gate (an FP8 KV only)
+    layer._tt_prefill = token_tiled and kv == "fp8"
     layer._index_q, layer._index_q_cache_key_info = torch.zeros(q_rows, heads, 8), None
 
     seq = torch.zeros(batch, dtype=torch.int32)
@@ -171,7 +179,10 @@ def test_the_sparse_attention_runs_only_the_rows_the_metadata_covers(
     assert (out[:rows] == 1).all() and (out[rows:] == 0).all()
     # an FP8 KV's bf16 prefill output is the token-tiled kernel's, unless rows are padded
     tt_served = token_tiled and phase == "prefill" and kv == "fp8" and not fp8_out
-    assert seen.get("token-tiled", False) == (tt_served and rows == batch * mq)
+    tt_served = tt_served and rows == batch * mq
+    assert seen.get("token-tiled", False) == tt_served
+    if phase == "prefill":
+        assert seen["emit"] == (not tt_served or reused)
 
 
 @pytest.mark.parametrize(

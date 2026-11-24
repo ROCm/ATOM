@@ -1727,9 +1727,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
 
     def _selection_triple(self, selected):
         """``(topk_idx, sparse_block_table, sparse_ctx)`` of the selector's result. With
-        an NVFP4 KV it emits only ``topk_idx`` (the attention reads the logical block ids,
-        no page-16 table), so the other two are None."""
-        return (selected, None, None) if self.kv_cache_dtype == "nvfp4" else selected
+        an NVFP4 KV, or for the token-tiled kernel, it emits only ``topk_idx`` (they read
+        the logical block ids, no page-16 table), so the other two are None."""
+        return selected if isinstance(selected, tuple) else (selected, None, None)
 
     def _metadata_rows(self, q, covered: int) -> int:
         """The rows of ``q`` this step's sparse metadata covers: what the selector writes
@@ -1779,6 +1779,14 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         # after the cache key: skip-index layers hold only the full shape; one entry
         # of `qo_indptr` per prefill token
         rows = self._metadata_rows(q, prefill_md.qo_indptr.shape[0])
+        # Decided before the selection: the token-tiled kernel (bf16 output only) reads
+        # topk_idx alone, so a selection no other layer reuses skips the page-16 table.
+        token_tiled = (
+            quantized_output is None
+            and self._tt_prefill
+            and tt_prefill.step_takes(prefill_md, rows)
+        )
+        page_table_unread = token_tiled and self.index_topk_cache_state is None
         cached_topk = self._load_cached_topk(sparse_metadata, topk_key)
         if cached_topk is None:
             if index_q is None:
@@ -1807,7 +1815,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 self.num_kv_heads,
                 self.scale,
                 # the NVFP4 attention reads the logical block ids, no page-16 table
-                emit_sparse_block_table=not nvfp4,
+                emit_sparse_block_table=not nvfp4 and not page_table_unread,
                 n_valid_column_per_row=sparse_metadata.n_valid_column_per_row,
                 index_scorer=self._index_scorer(sparse_metadata),
                 **self._select_page_kwargs,
@@ -1873,7 +1881,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                     v.dtype,
                     out=output[:rows],
                 )
-            elif self._tt_prefill and tt_prefill.step_takes(prefill_md, rows):
+            elif token_tiled:
                 tt_prefill.run(
                     q[:rows],
                     k_cache,
