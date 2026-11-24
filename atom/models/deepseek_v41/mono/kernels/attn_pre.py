@@ -113,7 +113,7 @@ from atom.mono.device.ops import (
     launcher,
     ld_f32,
     ld_i32,
-    rows_to_lds,
+    rows_to_lds_together,
     rsrc,
     traced,
     xshfl,
@@ -1421,9 +1421,16 @@ def load_seam_x8(c, t0=0, n=None):
         syncscope=rocdl.SyncScope.Workgroup, ordering=fx.AtomicOrdering.Acquire
     )
     x8 = plain(c["x8"], "poll") + fx.Int64(t0 * X8_WORDS * 4)
-    rows_to_lds(tid, x8, rows, X8_WORDS, c["xl"], lds_row(X8_WORDS))
     x8s = plain(c["x8s"], "poll") + fx.Int64(t0 * groups * 4)
-    rows_to_lds(tid, x8s, rows, groups, c["xsl"], lds_row(groups))
+    # the words' and the codes' loads out together: one round trip (the codes'
+    # in series after the words' stores was a second)
+    rows_to_lds_together(
+        tid,
+        [
+            (x8, rows, X8_WORDS, c["xl"], lds_row(X8_WORDS)),
+            (x8s, rows, groups, c["xsl"], lds_row(groups)),
+        ],
+    )
     gpu.barrier()
 
 

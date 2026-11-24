@@ -489,6 +489,31 @@ def rows_to_lds(tid, src, rows, row_words, dst, dst_row):
     )  # fmt: skip
 
 
+def rows_to_lds_together(tid, specs):
+    """``rows_to_lds`` of each (src, rows, row_words, dst, dst_row) in
+    ``specs``, every load issued before any lands in LDS: one round trip,
+    where ``rows_to_lds`` in turn waits for one's stores before the next's
+    loads. A side-effecting no-op after the loads keeps LLVM from sinking one
+    past the stores before it."""
+    loads = []
+    for src, rows, row_words, dst, dst_row in specs:
+        assert row_words % 4 == 0, row_words
+        n = rows * row_words // 4
+        for i in range(-(-n // THREADS)):
+            e = tid + THREADS * i
+            w = fx.Vector(ld_dev(src, fx.min(e, n - 1) * 4, 4))
+            loads.append((e, n, w, row_words, dst, dst_row))
+    llvm.InlineAsmOp(None, [], "", "", has_side_effects=True)
+    for e, n, w, row_words, dst, dst_row in loads:
+        _lds_put_if(e, n, w, dst + (e * 4 // row_words * dst_row + e * 4 % row_words))
+
+
+@traced
+def _lds_put_if(e, n, w, at):
+    if e < n:
+        fx.ptr_store(w, at)
+
+
 def mfma_bf16(a, b, c):
     return fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b, c]))
 
