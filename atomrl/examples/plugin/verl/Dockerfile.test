@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
+# verl + AtomRL plugin test image (atomrl_fsdp2 training + vLLM rollout).
+#
+# The default vLLM base supports the vLLM rollout case. For ATOM rollout,
+# provide a compatible public ATOM base through --build-arg BASE_IMAGE.
+#
+# Usage:
+#   docker build -f atomrl/examples/plugin/verl/Dockerfile.test -t atomrl-verl-plugin .
+#   docker run --rm --network=host --ipc=host \
+#     --device /dev/kfd --device /dev/dri --group-add video \
+#     --shm-size 64g --tmpfs /tmp/ray:size=1g \
+#     -v /path/to/data:/data -v /path/to/ATOM/atomrl:/workspace/ATOM/atomrl \
+#     -e DATA_ROOT=/data atomrl-verl-plugin
+
+ARG BASE_IMAGE=vllm/vllm-openai-rocm:v0.23.0
+FROM ${BASE_IMAGE}
+
+WORKDIR /workspace
+
+# ─── Update unified ATOM/AtomRL source ─────────────────────────────────────
+COPY . /workspace/ATOM
+RUN git config --global --add safe.directory /workspace/ATOM
+
+# ─── Detect torch install location (varies by base image) ───────────────────
+RUN TORCH_DIR=$(python3 -c "import torch, pathlib; print(pathlib.Path(torch.__file__).parent)") && \
+    cp -a "$TORCH_DIR" /tmp/_torch_rocm_backup
+
+# ─── Install verl + deps (pip will pull CUDA torch; we revert below) ────────
+RUN pip install --no-cache-dir verl 'transformers>=5.5.3,<5.11,!=5.6.0'
+
+# ─── Restore ROCm torch ─────────────────────────────────────────────────────
+RUN SITE=$(python3 -c "import sysconfig; print(sysconfig.get_path('purelib'))") && \
+    rm -rf "$SITE/torch" && \
+    mv /tmp/_torch_rocm_backup "$SITE/torch" && \
+    rm -rf "$SITE"/nvidia* "$SITE"/cuda*
+
+# ─── Remove verl hard-coded strategy assert for plugin extensibility ────────
+RUN VERL_CFG="$(pip show verl 2>/dev/null | awk '/^Location:/{print $2}')/verl/workers/config/engine.py" && \
+    sed -i 's/assert self\.strategy in \["fsdp", "fsdp2"\].*/# assert removed for plugin extensibility/' "$VERL_CFG"
+
+# ─── Install case dependencies, then ATOM without changing ROCm torch ──────
+RUN pip install --no-cache-dir amdsmi cachetools datasets accelerate \
+        "omegaconf>=2.3" safetensors peft pytest \
+        "math_verify[antlr4_13_2]" && \
+    LUMEN_BUILD_EXTENSIONS=1 pip install --no-build-isolation --no-deps -e /workspace/ATOM
+
+# ─── Verify ──────────────────────────────────────────────────────────────────
+RUN python3 -c "import torch; v=torch.__version__; print(f'torch={v}'); assert 'rocm' in v.lower() or 'hip' in v.lower() or 'git' in v, f'Expected ROCm torch, got {v}'"
+
+ENV DATA_ROOT=/data
+ENV PYTHONPATH="/workspace/ATOM/atomrl:${PYTHONPATH:-}"
+ENV PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /workspace/ATOM/atomrl
+
+CMD ["bash", "examples/plugin/verl/run.sh"]

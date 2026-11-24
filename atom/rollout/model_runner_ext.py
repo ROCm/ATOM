@@ -9,10 +9,9 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
-from aiter import init_dist_env
-from aiter.dist.parallel_state import get_tp_group
 from aiter.dist.utils import get_distributed_init_method
 
+from atom.distributed.pp_comm import init_pp_aware_dist_env
 from atom.model_engine.model_runner import ModelRunner
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.rollout.capabilities import CapabilityProviderMixin
@@ -167,14 +166,16 @@ class RLHFModelRunner(
             config.parallel_config.data_parallel_master_ip,
             dp_port,
         )
-        init_dist_env(
-            config.tensor_parallel_size,
-            rankID=rank,
+        init_pp_aware_dist_env(
+            tensor_model_parallel_size=config.tensor_parallel_size,
+            pipeline_model_parallel_size=1,
+            global_rank=rank,
+            world_size=config.tensor_parallel_size,
             backend="nccl",
             distributed_init_method=distributed_init_method,
-            data_parallel_size=1,
-            data_parallel_rank=0,
             local_rank=local_device_rank,
+            data_parallel_size=1,
+            disable_custom_all_reduce=config.disable_custom_all_reduce,
         )
 
         # DP is handled at the EngineCore level (DPEngineCoreProc), not
@@ -182,21 +183,6 @@ class RLHFModelRunner(
         # sync_dp_metadata) sees dp_size=1 and skips cross-DP collectives that
         # would fail on the isolated process group.
         config.parallel_config.data_parallel_size = 1
-
-        # aiter's init_dist_env creates a signal tensor on device=rankID
-        # (TP rank). When DP isolation remaps devices, recreate it on
-        # the correct device.
-        if config.tensor_parallel_size > 1:
-            tp_grp = get_tp_group()
-            ca_comm = tp_grp.device_communicator.ca_comm
-            signal = torch.zeros(
-                config.tensor_parallel_size * 64,
-                dtype=torch.int64,
-                device=self.device,
-            )
-            ca_comm.signal = signal
-            ca_comm.register_input_buffer(signal)
-            ca_comm.buffer = ca_comm._pool["input"].tensor
 
     _extract_mode: bool = False
 

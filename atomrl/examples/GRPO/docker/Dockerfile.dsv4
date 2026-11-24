@@ -1,0 +1,194 @@
+# syntax=docker/dockerfile:1.7
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
+#
+# DSV4-Flash trainer + rollout images for AtomRL GRPO.
+#
+# Both targets share the same vLLM base image to guarantee identical
+# Python (3.12) and PyTorch (2.11) across the Ray cluster.
+#
+# The trainer uses ROCm/Megatron-LM (rocm_dev) patched with DSV4 fields,
+# plus Lumen DSV4 spec, aiter, flash-attention, and tilelang from PyPI.
+#
+# Build (context = ATOM repository root):
+#
+#   docker build -f atomrl/examples/GRPO/docker/Dockerfile.dsv4 --target trainer \
+#     -t dsv4-flash:trainer .
+#
+#   docker build -f atomrl/examples/GRPO/docker/Dockerfile.dsv4 --target rollout \
+#     -t dsv4-flash:rollout .
+
+ARG BASE_IMAGE=vllm/vllm-openai-rocm:v0.25.1
+# ---- Stage 1: clone sources ----
+FROM alpine/git:latest AS sources
+
+ARG MEGATRON_REPOSITORY=https://github.com/ROCm/Megatron-LM.git
+ARG MEGATRON_REF=8dd45f5a51378ec1ee7937dee3c20d8626df4763
+ARG AITER_REPOSITORY=https://github.com/ROCm/aiter.git
+ARG AITER_SHA=ff745fb09d669f40cf81d15d3e7598b61fe2a61c
+ARG FLASH_ATTN_REPOSITORY=https://github.com/ROCm/flash-attention.git
+ARG FLASH_ATTN_REF=main
+
+# Build context is the ATOM repository root.
+COPY . /sources/ATOM
+
+RUN set -eux; \
+    git clone "${MEGATRON_REPOSITORY}" /sources/Megatron-LM; \
+    git -C /sources/Megatron-LM checkout "${MEGATRON_REF}"; \
+    git -C /sources/Megatron-LM submodule update --init --recursive; \
+    git clone "${AITER_REPOSITORY}" /sources/aiter; \
+    git -C /sources/aiter checkout --detach "${AITER_SHA}"; \
+    git -C /sources/aiter submodule update --init --recursive; \
+    git clone "${FLASH_ATTN_REPOSITORY}" /sources/flash-attention; \
+    git -C /sources/flash-attention checkout "${FLASH_ATTN_REF}"; \
+    git -C /sources/flash-attention submodule update --init --recursive; \
+    printf '%s\n' \
+      "AtomRL=$(git -C /sources/ATOM/atomrl rev-parse HEAD 2>/dev/null || echo local-working-tree)" \
+      "Lumen=in-tree" \
+      "Megatron-LM=$(git -C /sources/Megatron-LM rev-parse HEAD)" \
+      "aiter=$(git -C /sources/aiter rev-parse HEAD)" \
+      "flash-attention=$(git -C /sources/flash-attention rev-parse HEAD)" \
+      > /sources/SOURCE_VERSIONS
+
+# ---- Stage 2: trainer ----
+FROM ${BASE_IMAGE} AS trainer
+
+COPY --from=sources /sources /workspace
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# Disable ROCm apt source to avoid rccl version conflicts with the base image.
+RUN rm -f /etc/apt/sources.list.d/rocm.list /etc/apt/sources.list.d/amdgpu.list; \
+    apt-get update && apt-get install -y --no-install-recommends \
+      build-essential cmake git ninja-build && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir \
+      "ray[default]==2.56.1" \
+      "transformers>=5.2,<5.17,!=5.6.0" \
+      "datasets>=5.0" \
+      "accelerate>=1.14" \
+      "safetensors>=0.8" \
+      "omegaconf==2.3.1" \
+      "tokenizers>=0.22" \
+      "math_verify>=0.3" \
+      "antlr4-python3-runtime==4.9.3" \
+      "wandb>=0.28" \
+      "einops" \
+      "pybind11>=3.0" \
+      "tilelang"
+
+# aiter GPU kernels
+RUN cd /workspace/aiter && \
+    GPU_ARCHS=gfx942 pip install --no-cache-dir --no-build-isolation --no-deps -e . || true
+
+# flash-attention (ROCm)
+RUN cd /workspace/flash-attention && \
+    GPU_ARCHS=gfx942 pip install --no-cache-dir --no-build-isolation --no-deps -e . || true
+
+# Unified ATOM/AtomRL package (including atomrl.lumen). The case-owned
+# Transformers resolution intentionally overrides ATOM's 5.16.1 metadata pin.
+RUN LUMEN_BUILD_EXTENSIONS=1 pip install --no-cache-dir --no-build-isolation --no-deps \
+      -e /workspace/ATOM
+
+# Megatron-LM (ROCm fork) via .pth — no Miles dependency
+RUN SITE=$(python3 -c 'import site; print(site.getsitepackages()[0])') && \
+    printf '%s\n' /workspace/Megatron-LM > "${SITE}/megatron-lm-source.pth"
+
+# Patch ROCm Megatron to add DSV4 TransformerConfig fields + HC layer support
+RUN python3 /workspace/ATOM/atomrl/examples/GRPO/dsv4/patch_rocm_megatron_dsv4.py /workspace/Megatron-LM
+
+ENV PYTHONPATH="/workspace/Megatron-LM:/workspace/ATOM/atomrl:/workspace/aiter" \
+    PYTHONUNBUFFERED=1 \
+    TOKENIZERS_PARALLELISM=false \
+    HSA_NO_SCRATCH_RECLAIM=0 \
+    HSA_DISABLE_FRAGMENT_ALLOCATOR=0 \
+    PYTORCH_ALLOC_CONF=expandable_segments:True \
+    NCCL_TIMEOUT=7200 \
+    NCCL_CUMEM_ENABLE=0 \
+    NCCL_DMABUF_ENABLE=0 \
+    RAY_DEDUP_LOGS=0 \
+    RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0 \
+    RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1 \
+    RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES=1 \
+    RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES=1 \
+    LUMEN_DISABLE_HF_ATTN_PATCH=1 \
+    USE_ROCM_AITER_ROPE_BACKEND=0 \
+    TORCHDYNAMO_DISABLE=1 \
+    ATOM_DISABLE_VLLM_PLUGIN=1
+
+RUN python3 -c "\
+import sys; print(f'python: {sys.version}'); \
+import torch; print(f'torch: {torch.__version__}'); \
+import ray; print(f'ray: {ray.__version__}'); \
+import atomrl; print('atomrl: ok'); \
+from megatron.training import get_args; print('megatron.training: ok'); \
+print('trainer verification passed')"
+
+LABEL org.opencontainers.image.title="DSV4-Flash AtomRL trainer" \
+      org.opencontainers.image.description="Megatron TP4/PP4/EP4 DSV4 trainer (vLLM base for Python/PyTorch parity)"
+
+WORKDIR /workspace/ATOM/atomrl
+CMD ["/bin/bash"]
+
+
+# ---- Stage 4: rollout ----
+FROM ${BASE_IMAGE} AS rollout
+
+COPY --from=sources /sources/ATOM /workspace/ATOM
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# Preserve this case's Transformers resolution instead of ATOM's 5.16.1 pin;
+# the root editable install is intentionally --no-deps.
+RUN pip install --no-cache-dir \
+      "ray[default]==2.56.1" \
+      "transformers>=5.2,<5.17,!=5.6.0" \
+      "datasets>=5.0" \
+      "accelerate>=1.14" \
+      "safetensors>=0.8" \
+      "omegaconf==2.3.1" \
+      "tokenizers>=0.22" \
+      "math_verify>=0.3" \
+      "antlr4-python3-runtime==4.9.3" \
+      "wandb>=0.28" && \
+    LUMEN_BUILD_EXTENSIONS=1 pip install --no-cache-dir --no-build-isolation --no-deps \
+      -e /workspace/ATOM
+
+ENV PYTHONPATH="/workspace/ATOM/atomrl:${PYTHONPATH:-}" \
+    PYTHONUNBUFFERED=1 \
+    TOKENIZERS_PARALLELISM=false \
+    HIP_FORCE_DEV_KERNARG=1 \
+    HSA_NO_SCRATCH_RECLAIM=0 \
+    HSA_DISABLE_FRAGMENT_ALLOCATOR=0 \
+    PYTORCH_ALLOC_CONF=expandable_segments:True \
+    NCCL_TIMEOUT=7200 \
+    NCCL_CUMEM_ENABLE=0 \
+    NCCL_DMABUF_ENABLE=0 \
+    RAY_DEDUP_LOGS=0 \
+    RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0 \
+    RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1 \
+    RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES=1 \
+    RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES=1 \
+    LUMEN_DISABLE_HF_ATTN_PATCH=1 \
+    USE_ROCM_AITER_ROPE_BACKEND=0 \
+    VLLM_ROCM_USE_AITER=1 \
+    VLLM_USE_V1=1 \
+    VLLM_ENABLE_V1_MULTIPROCESSING=1 \
+    ATOM_DISABLE_VLLM_PLUGIN=1
+
+RUN python3 -c "\
+import sys; print(f'python: {sys.version}'); \
+import torch; print(f'torch: {torch.__version__}'); \
+import ray; print(f'ray: {ray.__version__}'); \
+import vllm; print(f'vllm: {vllm.__version__}'); \
+import atomrl; print('atomrl: ok'); \
+print('rollout verification passed')"
+
+LABEL org.opencontainers.image.title="DSV4-Flash AtomRL rollout" \
+      org.opencontainers.image.description="vLLM TP8 FP8 rollout for the three-node DSV4 GRPO flow"
+
+WORKDIR /workspace/ATOM/atomrl
+CMD ["/bin/bash"]

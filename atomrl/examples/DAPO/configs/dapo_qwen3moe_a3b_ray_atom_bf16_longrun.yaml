@@ -1,0 +1,236 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
+# ATOM BF16 rollout variant of dapo_qwen3moe_a3b_ray_vllm_verlref_longrun.yaml.
+#
+# The long-run partner of dapo_qwen3moe_a3b_ray_atom_bf16_4k_smoke.yaml, and it
+# stands in the same relation to the vLLM long run as that smoke does to the
+# vLLM smoke: byte-for-byte the vLLM config except generation_backend vllm ->
+# atom, an added atom_cfg block, and a checkpoint/wandb name of its own. The
+# vllm_cfg block is kept as-is because the ATOM path still reads the common
+# rollout knobs (sampling, sequence limits, IPC bucket, sleep) from it -- see
+# atomrl/trainer/rl_trainer.py::_setup_ray_atom_rollout.
+#
+# Requires MODE=atombf16, which additionally forces enable_sleep_mode=true +
+# sleep_level=2 on top of this file (the vLLM reference has sleep off).
+#
+# Why the long run is the interesting one here: a 3-step smoke at lr=1e-6 barely
+# moves the weights, so a rollout engine holding stale routed-expert weights
+# still scores close to a correct one. Only a run long enough for the policy to
+# move separates them. It is also past the point where ATOM overtakes vLLM
+# end-to-end -- ATOM pays about 2x on setup and earns it back at about 2x per
+# step, so it is behind for the first few steps only.
+#
+# Original header follows.
+#
+# Qwen3-30B-A3B-Base BF16 baseline for verl's FP8-E2E MoE reference experiment.
+#
+# Ports verl `recipe/low_precision/run_dapo_qwen3_moe_30b_megatron_fp8e2e.sh`
+# (docs/low_precision/fp8.md, "FP8 End-to-End -> Qwen3-30B-A3B MoE Model") onto
+# the AtomRL FSDP2 + colocated vLLM stack in BF16. verl's figure has three
+# curves -- BF16, FP8 E2E, FP8-rollout-only -- and this config targets the BF16
+# one, so it is the baseline the FP8 curves are judged against.
+#
+# Every hyper-parameter below is taken verbatim from that script:
+#   prompt/response 2048/20480, train_prompt_bsz 128, n 16, gen_prompt_bsz 384,
+#   mini_bsz == bsz (one update per rollout), grpo, token-mean, clip 0.2/0.28/10,
+#   lr 1e-6, wd 0.1, clip_grad 1.0, entropy_coeff 0, NO lr warmup
+#   (lr_warmup_steps_ratio=0.0), overlong_buffer 512/1.0, filter_groups acc/10,
+#   token-level TIS with C=2.0, temperature/top_p/top_k 1.0/1.0/-1, test_freq 10.
+#
+# The BF16 MoE router is deliberate, not an oversight -- verl leaves
+# `moe_router_dtype=fp32` commented out with the note that vLLM's Qwen3-MoE
+# router is BF16 and fp32 brought no accuracy gain. Our own A/B agreed (15k
+# tokens, no statistically significant difference), so the reproduction runs
+# BF16 on both sides: export ATOMRL_FP32_MOE_ROUTER=0. R3 is off for the same
+# reason -- verl's recipe does not have it, and this config exists to match.
+#
+# Deviations forced by hardware/stack, all of which change throughput rather
+# than the optimization problem:
+#   - 8xMI350X, not 2x8 H100. Same global batch, half the GPUs, so ~2x step time.
+#   - rollout TP=1 per colocated replica (verl uses gen_tp=2 across 16 GPUs).
+#     TP>1 and EP are refused outright on this path: the fused expert weights
+#     stop being shape-equal to the training side, so a weight sync would skip
+#     them (see atomrl/engine/inference/atom_moe_weight_sync.py).
+#   - gpu_memory_utilization 0.30, not verl's 0.5: verl offloads params/optimizer
+#     to CPU during generation, which the AtomRL Ray path cannot do, so the
+#     training memory stays resident and the rollout gets a smaller share.
+#   - Validation is greedy here; verl samples at temperature 0.6, top_p 1.0, n=1.
+#     Diagnostic only, does not touch training.
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 8
+
+controller:
+  ray:
+    enabled: true
+    fuse_actor_ref: false
+    actor:
+      num_workers: 8
+      dispatch_mode: dp_compute_proto
+
+policy:
+  model_name: "${oc.env:DATA_ROOT}/models/Qwen3-30B-A3B-Base"
+  training_backend: fsdp2
+  generation_backend: atom
+  max_total_sequence_length: 22528      # verl max_prompt 2048 + max_response 20480
+  max_response_length: 20480
+  train_global_batch_size: 2048         # verl train_prompt_bsz 128 x n 16
+  gen_batch_size: 384                   # verl gen_prompt_bsz = 128 * 3
+  train_micro_batch_size: 1             # verl ppo_micro_batch_size_per_gpu 1
+  max_token_len_per_gpu: 22528          # verl actor_ppo_max_token_len
+  learning_rate: 1.0e-6
+  lr_warmup_steps: 0                    # verl lr_warmup_steps_ratio 0.0 -> no warmup
+  weight_decay: 0.1
+  max_grad_norm: 1.0                    # verl clip_grad
+  lr_decay_style: constant
+  training:
+    optimizer_dtype: bf16               # COMPUTE dtype; master weights stay fp32
+    fsdp_cfg:
+      # verl sets param/optimizer/grad offload=True, which frees room for
+      # gpu_memory_utilization=0.5. FSDP2 CPU offload is broken in the AtomRL
+      # Ray worker path ("parameters should be materialized on CPU"), so we keep
+      # everything resident and give the rollout 0.30 instead.
+      param_offload: false
+      optimizer_offload: false
+      reshard_after_forward: true
+  generation:
+    atom_cfg:
+      transport: ray_http
+      tensor_parallel_size: 1
+      kv_cache_dtype: bf16
+      # 0.45, not the 0.30 the vLLM arm below uses -- see the 4k smoke config
+      # for the full account. In short: ATOM derives its KV pool as the
+      # utilization budget minus the resident 30B of weights, so 0.30 leaves
+      # 6.49GB (4433 blocks) to back a promised 256 concurrent sequences, and
+      # the scheduler preempts thousands of times per step to cope. This
+      # horizon felt it worst, because 20480-token responses need five times
+      # the KV of the 4k smoke: the 0.30 long run sat at 0.042-0.075 accuracy,
+      # 49-53% unparseable, pos_0_127/k3_kl climbing 0.165 -> 0.337, at 20-27
+      # min/step.
+      #
+      # Most of that was two bugs on the preempt/recompute path, since fixed
+      # (`atom/model_engine/scheduler.py`), so the setting is now about speed.
+      # The 60-step run at 0.45 went 0.1115 -> 0.4067 accuracy, 1318 -> 111
+      # unparseable of 6144, rollout_corr/k3_kl flat at ~0.0013, zero errors,
+      # 3-6 min/step -- tracking the vLLM baseline's quality (0.4172 / 100 at
+      # step 60) at roughly half its step time.
+      #
+      # Do not raise this further without re-checking headroom. The vLLM note
+      # below is a real warning: at 0.40 *that* engine died of allocator
+      # fragmentation 101 steps in. ATOM's ceiling is lower because sleep keeps
+      # its memory resident; measured peak here is ATOM ~124GB + trainer 76.9GB.
+      gpu_memory_utilization: 0.45
+      enable_prefix_caching: false
+      online_quant_config: {}
+    vllm_cfg:
+      transport: ray_http
+      ray_http_start_server: false
+      # verl uses 0.5, which it can afford because it offloads params/optimizer
+      # to CPU during generation; the AtomRL Ray path keeps them resident.
+      #
+      # 0.40 was tried and does not hold: vLLM takes ~101GB of the 252GiB card,
+      # the actor's allocator high-water mark reaches 117.6GB, and the ~33GB left
+      # is not enough for RCCL's buffers and the HSA runtime. A 101-step run died
+      # with HSA_STATUS_ERROR_OUT_OF_RESOURCES ("Available Free mem : 0 MB") in a
+      # collective. Live memory was flat throughout (allocated 42.8GB,
+      # max_allocated 75.6GB) -- the growth is allocator fragmentation, +0.086
+      # GB/step. At 0.30 the headroom is ~59GB instead.
+      gpu_memory_utilization: 0.30
+      max_model_len: 22528
+      dtype: bfloat16
+      enforce_eager: true
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 32768
+      max_num_seqs: 256
+      quantization: ""                  # BF16 baseline; verl's FP8 arm sets fp8
+      calculate_log_probs: true         # verl rollout.calculate_log_probs
+      enable_sleep_mode: false
+      update_weights_bucket_megabytes: 512
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1
+
+# BF16 router on both sides, matching verl. Also requires
+# ATOMRL_FP32_MOE_ROUTER=0 in the environment, which is what actually switches
+# the matmul precision; this block only controls Rollout Routing Replay.
+moe:
+  r3:
+    rollout_replay: false               # verl's recipe has no router replay
+
+algorithm:
+  name: dapo
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  loss_agg_mode: token-mean
+  dapo:
+    num_generations: 16                 # verl n_resp_per_prompt
+    kl_coeff: 0.0                       # verl use_kl_loss=False, kl_coef=0
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    clip_ratio_c: 10.0
+    dynamic_sampling: true
+    token_level_pg: true
+    overlong_reward_shaping: true
+    max_resp_len: 20480
+    filter_groups:
+      enable: true
+      metric: acc
+      max_num_gen_batches: 10
+    overlong_buffer:
+      enable: true
+      len: 512
+      penalty_factor: 1.0
+      log: false
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+  rollout_correction:
+    rollout_is: token                   # verl rollout_is=token
+    rollout_is_threshold: 2.0           # verl C=2
+    rollout_is_batch_normalize: false
+
+reward:
+  type: function
+  function: atomrl.rewards.math_reward.dapo_math_reward
+  # The directory name says 1024 because that was the budget it was filtered at,
+  # but re-filtering DAPO-Math-17k at verl's max_prompt_length=2048 removes
+  # nothing: 1,791,700 rows in, 1,791,700 out (AIME: 960 -> 960). No prompt in
+  # this dataset exceeds 1024 tokens under the Qwen3 tokenizer, so the two cuts
+  # are the same data and this file matches what verl trains on.
+  dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet"
+  shuffle: true
+  shuffle_seed: 10086
+
+# verl trainer.test_freq=10 on AIME-2024.
+val_dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/aime-2024.filtered.parquet"
+val_steps: 10
+val_batch_size: 0
+eval:
+  enabled: false
+  num_samples: 0
+
+checkpointing:
+  # verl save_freq=5 / max_actor_ckpt_to_keep=5. One FSDP2 checkpoint of this
+  # policy is ~342GB, so keep exactly one and delete it before writing the next.
+  # Point checkpoint_dir at a volume with >=400GB free, or raise save_steps out
+  # of reach to disable saving entirely (see the runbook, section 13.6).
+  checkpoint_dir: "${oc.env:SCRATCH_ROOT}/ckpts/atomrl-dapo/verlref-moe-a3b-bf16-atom"
+  save_steps: 5
+  save_total_limit: 1
+  resume: true
+
+logger:
+  wandb_enabled: true
+  log_interval: 1
+  wandb:
+    project: ATOMRL-MOE
+    name: verlref-moe-a3b-bf16-atom-B128-R20K-TIS
+
+num_training_steps: 1000
+seed: 10086

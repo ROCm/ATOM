@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+docs/superpowers/
+.eggs/
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.log
+.env
+wandb/
+outputs/
+checkpoints/
+docs/build/
+_site/
+results/
+benchmark_results/
+online_quant_info_*.json
+
+# Run artifacts written by the example launchers
+output/

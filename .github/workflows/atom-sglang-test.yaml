@@ -52,6 +52,8 @@ jobs:
             **/*.md
             docs/**
             .claude/**
+            atomrl/**
+            .github/workflows/atomrl-*.yaml
             atom/plugin/vllm/**
             atom/mesh/**
             .github/benchmark/models_atomesh.yaml

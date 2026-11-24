@@ -386,7 +386,7 @@ def test_the_id_is_released_so_it_can_be_reused_serially():
 
 
 def test_results_are_rpcresult_instances():
-    """The public API's return type, which LumenRL reads .ok/.value/.error off."""
+    """RpcResult is the public return contract for .ok/.value/.error."""
     mgr = _mgr(1)
 
     def broadcast_and_answer(cmd, **kw):
@@ -714,6 +714,18 @@ def test_a_raw_nonfinal_bucket_requires_an_owned_session():
     with pytest.raises(ValueError, match="weight_sync_session"):
         mgr.broadcast_utility_command_sync("update_weights_ipc", is_last=False)
     assert mgr.sent == []
+
+
+def test_weight_sync_abort_claim_is_once_per_outer_session():
+    mgr = _mgr(1)
+
+    with mgr.weight_sync_session():
+        assert mgr.claim_weight_sync_abort()
+        with mgr.weight_sync_session():
+            assert not mgr.claim_weight_sync_abort()
+
+    with mgr.weight_sync_session():
+        assert mgr.claim_weight_sync_abort()
 
 
 def test_overlapping_weight_sync_sessions_cannot_interleave_their_buckets():
