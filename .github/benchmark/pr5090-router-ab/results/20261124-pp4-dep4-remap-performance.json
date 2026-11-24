@@ -236,5 +236,16 @@
     "prefill_hip_order": "0,1,2,3",
     "status_at_20261124_0809_utc": "queued, no new lease",
     "purpose": "Distinguish GPU mapping dependence from transient/restart effects using the original order"
+  },
+  "decode_request_occupancy": {
+    "average_running_requests_by_decode_rank": {
+      "0": 2.2531,
+      "1": 2.2144,
+      "2": 2.2622,
+      "3": 2.2853
+    },
+    "max_num_seqs_per_rank": 5,
+    "basis": "AgentX server_metrics_export.csv, each series rounded to 4 decimals; descriptive occupancy indicator, not GPU utilization or proof of scaling.",
+    "csv_sha256": "8a6e9276de39e9709d3863b6df6712e03f0a8b13e6d8046caa2bc3d6aee36533"
   }
 }
