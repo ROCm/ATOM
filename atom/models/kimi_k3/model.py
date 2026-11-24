@@ -1830,7 +1830,7 @@ class KimiDecoderLayer(nn.Module):
         score weight. ``check_aggregate_source`` must have accepted
         ``next_layer`` first.
 
-        The bank holds one snapshot per ``maybe_close_block`` at or below this
+        The bank holds one snapshot per block closed at or below this
         layer. Only those are read: a caller may hand a fixed-size bank whose
         later slots are not yet written this step.
         """

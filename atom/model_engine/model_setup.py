@@ -115,9 +115,7 @@ def init_model_env(config: Config, rank: int) -> torch.device:
             backend="nccl",
             data_parallel_size=dp_size,
             prefill_context_model_parallel_size=config.pcp_group_size,
-            decode_context_parallel_size=getattr(
-                config, "decode_context_parallel_size", 1
-            ),
+            decode_context_parallel_size=config.decode_context_parallel_size,
         )
     else:
         # The group spans the devices that exist; apply_simulated_tp then
@@ -134,9 +132,7 @@ def init_model_env(config: Config, rank: int) -> torch.device:
             data_parallel_size=config.parallel_config.data_parallel_size,
             data_parallel_rank=config.parallel_config.data_parallel_rank,
             prefill_context_model_parallel_size=config.pcp_group_size,
-            decode_context_parallel_size=getattr(
-                config, "decode_context_parallel_size", 1
-            ),
+            decode_context_parallel_size=config.decode_context_parallel_size,
         )
         apply_simulated_tp(config)
     return device

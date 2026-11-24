@@ -21,9 +21,11 @@ decides which is which; the two paths hand each other the same tensors. A
 full-attention layer still runs K2 for everything after its attention
 (``_pre_o_core``), unless ``bind_model`` left it on the production path.
 
-The kernels write each block into a slot of a bank sized for the whole stack,
-as ``AttnRes.maybe_close_block`` does. ``_fallback`` calls the original layer
-forward on that bank, bypassing module hooks because mono records aux taps itself.
+The kernels write each block into a slot of a bank sized for the whole stack.
+The attention-residual close writes the same slots in its kernel, except for
+layer 0's ``AttnRes.maybe_close_block`` fallback. ``_fallback`` calls the original
+layer forward on that bank, bypassing module hooks because mono records aux taps
+itself.
 
 ATOM carries two pending adds between layers (an MoE layer defers its routed and
 its shared output separately); K2 all-reduces one MoE output, so a mono layer
