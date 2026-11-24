@@ -2218,11 +2218,24 @@ def log_route_report(stage: str) -> dict[str, Any]:
     changed = weights_changed()
     report["weights_changed"] = changed
     if changed:
+        now = _weights_now()
+        fields_ = ("storage", "shape", "dtype", "stride", "in-place writes")
+        detail = {
+            name: [
+                f
+                for f, a_, b_ in zip(
+                    fields_, _weight_marks.get(name, ()), now.get(name, ())
+                )
+                if a_ != b_
+            ]
+            or ["added or removed"]
+            for name in changed[:32]
+        }
         logger.error(
             "plugin_host: shared weights changed after the boot preparation "
             "(%s; every graph, prefill and decode must share one): %s",
             stage,
-            changed[:32],
+            detail,
         )
         if _strict:
             raise PluginContractError(f"shared weights changed: {changed[:8]}")
