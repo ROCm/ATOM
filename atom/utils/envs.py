@@ -1472,6 +1472,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PREFILL_DECODE_INTERVAL": lambda: int(
         os.getenv("ATOM_PREFILL_DECODE_INTERVAL", "0")
     ),
+    # Order of the waiting queue at prefill admission (`Scheduler._order_waiting`).
+    # "fcfs": arrival order. "cached_first": the fewest prompt tokens left to
+    # compute (prompt minus the HBM prefix hit or the offload tier's known
+    # prefix) first, ties by arrival; a request waiting
+    # ATOM_PREFILL_ORDER_MAX_WAIT_S or longer goes first, in arrival order.
+    "ATOM_PREFILL_ORDER": lambda: os.getenv("ATOM_PREFILL_ORDER", "fcfs").strip(),
+    "ATOM_PREFILL_ORDER_MAX_WAIT_S": lambda: _finite_float_env(
+        "ATOM_PREFILL_ORDER_MAX_WAIT_S", 60.0, allow_zero=True
+    ),
     # Memoise a waiting request's prefix walk across the per-tick probes (the
     # delayer, the DP chunk-cost estimate; `BlockManager.can_allocate_memoized`).
     # "0" re-walks every tick.
