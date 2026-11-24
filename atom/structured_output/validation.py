@@ -734,11 +734,11 @@ async def configure_tool_call_grammar(
     output stays unconstrained. A grammar error during decoding fails the
     request like any structured-output error.
     """
+    if not tools or parser_cls is None or not structured_output.available():
+        return False
     from atom.utils import envs
 
-    if not envs.ATOM_TOOL_CALL_GRAMMAR or not tools or parser_cls is None:
-        return False
-    if not structured_output.available():
+    if not envs.ATOM_TOOL_CALL_GRAMMAR:
         return False
     required_channel = sampling_params.required_channel
     reasoning_end = sampling_params.structured_reasoning_end
@@ -801,7 +801,6 @@ async def configure_request(
 ):
     if schema is None and not strict_schemas:
         return
-    require_available()
     validate_execution_options(
         config,
         sampling_params,

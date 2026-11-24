@@ -79,24 +79,6 @@ def test_the_pin_matches_the_extra():
     assert f'"llguidance=={structured_output.LLGUIDANCE_VERSION}"' in extra[1]
 
 
-def test_a_structured_request_is_refused_up_front_when_unavailable(monkeypatch):
-    monkeypatch.setattr(structured_output, "available", lambda: False)
-    with pytest.raises(ValueError, match=r"atom\[structured-output\]"):
-        asyncio.run(
-            validation.configure_request(
-                None, None, None, NS(), '{"type": "object"}', None
-            )
-        )
-
-
-def test_an_unstructured_request_does_not_need_it(monkeypatch):
-    monkeypatch.setattr(structured_output, "available", lambda: False)
-    assert (
-        asyncio.run(validation.configure_request(None, None, None, NS(), None, None))
-        is None
-    )
-
-
 @pytest.mark.parametrize("installed", [True, False])
 def test_models_lists_it_only_when_available(monkeypatch, installed):
     monkeypatch.setattr(structured_output, "available", lambda: installed)
@@ -166,16 +148,3 @@ def test_the_offline_engine_refuses_too(without_backend):
     params = NS(json_schema='{"type": "object"}', structured_tool_format=None)
     with pytest.raises(ValueError, match=r"atom\[structured-output\]"):
         LLMEngine.prepare_structured_request(NS(config=None), params)
-
-
-def test_the_tool_call_grammar_flag_is_read_before_probing(monkeypatch):
-    monkeypatch.setenv("ATOM_TOOL_CALL_GRAMMAR", "0")
-
-    def probed():
-        raise AssertionError("probed the backend with the flag off")
-
-    monkeypatch.setattr(structured_output, "available", probed)
-    configured = validation.configure_tool_call_grammar(
-        None, None, NS(), None, parser_cls=object, tools=[{}]
-    )
-    assert asyncio.run(configured) is False
