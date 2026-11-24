@@ -18,6 +18,7 @@ from atom.mono.runtime.abi import KernelAbi
 from atom.mono.runtime.compile import (
     _COMPILE_ONLY,
     compile_only,
+    kernel_names,
     kernel_resources,
     scratch_bytes,
 )
@@ -197,29 +198,10 @@ def test_bind_agreed_converts_other_failures_to_refusal():
 
 
 class _CompiledLauncher:
-    """A compiled launcher whose artifact is supplied by the test fixture."""
+    """A compiled launcher's complete MLIR module and synthetic metadata."""
 
-    def __init__(self, module_text):
-        self._mem_cache = {"key": type("Artifact", (), {"_ir_text": module_text})()}
-
-    def __call__(self, *args):  # already compiled: the compile-only call is a no-op
-        pass
-
-
-@pytest.fixture
-def compiled_launcher(monkeypatch):
-    """Exercise metadata and width decisions without a compiler dependency.
-
-    Only the MLIR-to-bytes boundary is mocked. The real parser is covered by
-    test_mono_code_object.py for both Binary and Fatbin assembly.
-    """
-    from atom.mono.runtime import compile as compile_module
-
-    code_objects = {}
-    monkeypatch.setattr(compile_module, "_code_object", code_objects.__getitem__)
-
-    def make(value: bytes, name: bytes = b"k_s6"):
-        elf = (
+    def __init__(self, value: bytes, name: bytes = b"k_s6", object_format="bin"):
+        self.elf = (
             b"\x7fELF\x02\x01"
             + b"\x9b.private_segment_fixed_size"
             + value
@@ -228,9 +210,32 @@ def compiled_launcher(monkeypatch):
             + name
             + b".kd\x00"
         )
-        key = f"test-code-object-{len(code_objects)}"
-        code_objects[key] = elf
-        return _CompiledLauncher(key)
+        escaped = "".join(f"\\{byte:02X}" for byte in self.elf)
+        prefix = "bin = " if object_format == "bin" else ""
+        self.object_text = (
+            f'#gpu.object<#rocdl.target<chip = "gfx950">, {prefix}"{escaped}">'
+        )
+        self.module_text = f"module {{ gpu.binary @m [{self.object_text}] }}"
+        self._mem_cache = {
+            "key": type("Artifact", (), {"_ir_text": self.module_text})()
+        }
+
+    def __call__(self, *args):  # already compiled: the compile-only call is a no-op
+        pass
+
+
+@pytest.fixture
+def compiled_launcher(monkeypatch):
+    """Mock only extraction so metadata and width tests also run without FlyDSL."""
+    from atom.mono.runtime import compile as compile_module
+
+    code_objects = {}
+    monkeypatch.setattr(compile_module, "_code_object", code_objects.__getitem__)
+
+    def make(value: bytes, name: bytes = b"k_s6"):
+        launcher = _CompiledLauncher(value, name)
+        code_objects[launcher.module_text] = launcher.elf
+        return launcher
 
     return make
 
@@ -250,10 +255,37 @@ def no_scratch(compiled_launcher):
     "value, size",
     [(b"\x00", 0), (b"\x24", 36), (b"\xcc\x90", 144), (b"\xcd\x14\x8c", 5260)],
 )
+@pytest.mark.parametrize("reader", ["metadata", "bin", "fatbin"])
 def test_scratch_bytes_reads_the_code_objects_private_segment(
-    compiled_launcher, value, size
+    request, reader, value, size
 ):
-    assert scratch_bytes(compiled_launcher(value)) == size
+    if reader == "metadata":
+        launcher = request.getfixturevalue("compiled_launcher")(value)
+    else:
+        pytest.importorskip("flydsl")
+        launcher = _CompiledLauncher(value, object_format=reader)
+        from atom.mono.runtime.compile import _code_object
+
+        assert _code_object(launcher.module_text) == launcher.elf
+    assert scratch_bytes(launcher) == size
+    assert kernel_names(launcher) == ["k_s6"]
+
+
+@pytest.mark.parametrize("object_format", ["bin", "fatbin"])
+def test_code_object_reads_first_binary_and_first_object(object_format):
+    pytest.importorskip("flydsl")
+    from atom.mono.runtime.compile import _code_object
+
+    first = _CompiledLauncher(b"\x00", b"first", object_format)
+    other_target = _CompiledLauncher(b"\x24", b"other_target", object_format)
+    other_binary = _CompiledLauncher(b"\x34", b"other_binary", object_format)
+    text = (
+        "module {"
+        f" gpu.binary @a [{first.object_text}, {other_target.object_text}]"
+        f" gpu.binary @b [{other_binary.object_text}]"
+        " }"
+    )
+    assert _code_object(text) == first.elf
 
 
 def _note(key: bytes, value: bytes) -> bytes:

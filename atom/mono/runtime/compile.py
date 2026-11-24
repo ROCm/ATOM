@@ -106,7 +106,7 @@ def launcher_resources(launcher) -> list[dict]:
 
 
 def _code_object(module_text: str) -> bytes:
-    """Read the ELF through MLIR for both Binary and default Fatbin objects."""
+    """Read the first binary's first object through MLIR (Binary or Fatbin)."""
     # Keep compiler imports lazy so host-only metadata readers need no FlyDSL.
     from flydsl._mlir import ir
     from flydsl._mlir.dialects import gpu
@@ -114,9 +114,11 @@ def _code_object(module_text: str) -> bytes:
     binaries = []
 
     def visit(op):
-        if op.name == "gpu.binary":
+        # Preserve the legacy reader's first-binary selection. FlyDSL selects
+        # binaries by launch symbol; this reader has no launch-symbol argument.
+        if op.name == "gpu.binary" and not binaries:
             objects = ir.ArrayAttr(op.attributes["objects"])
-            # Match FlyDSL's JIT selection; do not substitute another target.
+            # Within that binary, keep the first object; do not try other targets.
             binaries.append(gpu.ObjectAttr(objects[0]).object if len(objects) else None)
         return ir.WalkResult.ADVANCE
 
@@ -127,8 +129,6 @@ def _code_object(module_text: str) -> bytes:
 
     if not binaries:
         raise RuntimeError("no gpu.binary object in the compiled module")
-    if len(binaries) != 1:
-        raise RuntimeError("multiple gpu.binary objects in the compiled module")
     binary = binaries[0]
     if not isinstance(binary, (bytes, bytearray)) or not binary.startswith(b"\x7fELF"):
         raise RuntimeError("gpu.binary does not contain an ELF code object")
