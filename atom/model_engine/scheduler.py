@@ -2921,26 +2921,27 @@ class Scheduler:
 
         # Admission has finished, so scratch cannot take a request's slot.
         # Settle anchor cuts before totals, connector metadata and final flags.
-        for i, seq in enumerate(scheduled_seqs.values()):
-            start = seq.num_cached_tokens
-            end = start + int(num_scheduled_tokens[i])
-            planned_end = self.block_manager.plan_midstep(
-                seq,
-                start,
-                end,
-                cut_floor=(
-                    end
-                    if self._requires_atomic_prefill(seq)
-                    else _cut_floor(seq, start, start)
-                ),
-            )
-            num_scheduled_tokens[i] = planned_end - start
-            if (
-                self.advance_on_schedule
-                and seq.midstep_anchor_pos == planned_end
-                and not seq.midstep_reservations
-            ):
-                self.block_manager.checkpoint_when_scheduled(seq, planned_end)
+        if self.block_manager.plans_midstep:
+            for i, seq in enumerate(scheduled_seqs.values()):
+                start = seq.num_cached_tokens
+                end = start + int(num_scheduled_tokens[i])
+                planned_end = self.block_manager.plan_midstep(
+                    seq,
+                    start,
+                    end,
+                    cut_floor=(
+                        end
+                        if self._requires_atomic_prefill(seq)
+                        else _cut_floor(seq, start, start)
+                    ),
+                )
+                num_scheduled_tokens[i] = planned_end - start
+                if (
+                    self.advance_on_schedule
+                    and seq.midstep_anchor_pos == planned_end
+                    and not seq.midstep_reservations
+                ):
+                    self.block_manager.checkpoint_when_scheduled(seq, planned_end)
 
         total_tokens_num_prefill = sum(num_scheduled_tokens)
         if self._tick_cost_limit < math.inf:

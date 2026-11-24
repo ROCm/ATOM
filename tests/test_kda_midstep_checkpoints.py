@@ -349,6 +349,49 @@ def cpu_checkpoint_writer(monkeypatch, k3_modules):
     return k3_modules.writer.write_state_checkpoints
 
 
+@pytest.mark.parametrize("n", [0, 2])
+@pytest.mark.parametrize(
+    "hkv,d,ssm_blocks,conv_blocks",
+    [(1, 1, 1, 1), (1023, 1025, 1, 2), (1024, 1024, 1, 1), (1025, 2049, 2, 3)],
+)
+def test_checkpoint_writer_grid_boundaries(
+    n, hkv, d, ssm_blocks, conv_blocks, monkeypatch, k3_modules
+):
+    launches = []
+
+    class Kernel:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append((grid, kwargs["NBLK_SSM"]))
+
+            return launch
+
+    monkeypatch.setattr(k3_modules.writer, "_copy_checkpoints_kernel", Kernel())
+    monkeypatch.setattr(
+        k3_modules.writer.triton,
+        "cdiv",
+        lambda *args: pytest.fail("checkpoint launch must use host integer arithmetic"),
+    )
+    indices = torch.zeros(n, dtype=torch.int32)
+    state = torch.empty(4, 1, 1, hkv)
+    k3_modules.writer.write_state_checkpoints(
+        state,
+        state,
+        torch.empty(3, d),
+        torch.empty(4, d, 3),
+        indices,
+        indices,
+        indices,
+        indices,
+        indices,
+        indices,
+        indices,
+        chunk_size=1,
+        conv_state_len=3,
+    )
+    assert launches == ([((n, ssm_blocks + conv_blocks), ssm_blocks)] if n else [])
+
+
 def test_the_forward_writes_heads_ends_and_conv_windows(cpu_checkpoint_writer):
     mixed_qkv = torch.arange(8.0)[:, None].repeat(1, 3)[:, :2]  # padded rows
     conv_state = torch.zeros(6, 2, 4)  # [slots, D, kernel - 1 + num_spec]
@@ -522,7 +565,7 @@ def test_a_head_ends_on_the_state_a_forward_ending_there_would(k3_modules):
     batch = SimpleNamespace(state_save_all=[[True]], num_scheduled_tokens=lens)
     ckpt = k3_modules.builder._KimiMLAGDNCommon._checkpoint_targets(builder, batch)
 
-    out, last, head = attn._prefill_kda(stub, q, k, v, g, beta, initial, cu, ckpt)
+    out, last, head = attn._prefill_kda(stub, q, k, v, g, beta, initial, ckpt)
 
     want_out, want_last = stub._run_kda(q, k, v, g, beta, initial, cu, True)
     span = slice(300, 300 + at)

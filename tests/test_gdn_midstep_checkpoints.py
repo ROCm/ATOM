@@ -18,7 +18,9 @@ from types import SimpleNamespace
 import pytest
 from test_state_checkpoint import (
     BLOCK,
+    DEFAULT_STATE_RUNTIME,
     MIN_FORK,
+    PAGED_COPY_RUNTIME,
     PAGED_COPY_SPEC,
     PROMPT,
     demand_config,
@@ -61,6 +63,55 @@ def admitted(bm, tokens=PROMPT):
     seq = stateful_seq(list(tokens))
     bm.allocate(seq, bm.can_allocate(seq))
     return seq
+
+
+@pytest.mark.parametrize("advance", [False, True])
+@pytest.mark.parametrize(
+    "runtime,readable,chunk",
+    [
+        (StateRuntime(), False, 44),
+        (DEFAULT_STATE_RUNTIME, False, 36),
+        (PAGED_COPY_RUNTIME, False, 40),
+        (FORK_RUNTIME, True, 44),
+        (PAGED_RUNTIME, True, 44),
+    ],
+)
+def test_schedule_plans_only_readable_midstep_caches(
+    runtime, readable, chunk, advance, monkeypatch
+):
+    sched = make_scheduler(
+        demand_config(state_checkpoint_interval_tokens=-1, pool_entries={"state": 8}),
+        state_runtime=runtime,
+    )
+    sched.advance_on_schedule = advance
+    seqs = [stateful_seq([t + i * 1000 for t in PROMPT]) for i in range(2)]
+    for seq in seqs:
+        sched.add(seq)
+    bm = sched.block_manager
+    assert bm.plans_midstep is readable
+    plans = type(bm).plans_midstep.fget
+    checks = []
+
+    def checked(manager):
+        checks.append(manager)
+        return plans(manager)
+
+    monkeypatch.setattr(type(bm), "plans_midstep", property(checked))
+    plan = bm.plan_midstep
+    planned = []
+
+    def record(seq, start, end, **kwargs):
+        planned.append(seq)
+        return plan(seq, start, end, **kwargs)
+
+    monkeypatch.setattr(bm, "plan_midstep", record)
+    batch, active = sched.schedule()
+    assert list(active.values()) == seqs
+    assert batch.num_scheduled_tokens.tolist() == [chunk, chunk]
+    assert batch.total_tokens_num_prefill == 2 * chunk
+    assert checks == [bm]
+    assert planned == (seqs if readable else [])
+    assert all(bool(seq.midstep_reservations) is readable for seq in seqs)
 
 
 # ── the shared predicate ─────────────────────────────────────────────────────

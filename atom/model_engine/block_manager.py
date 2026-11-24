@@ -3101,6 +3101,10 @@ class BlockManager:
             return 0
         return snap_midstep_position(anchor, start, end, self.midstep_grid)
 
+    @property
+    def plans_midstep(self) -> bool:
+        return self._state_checkpoint_cache.readable_midstep
+
     def _midstep_applies(self, seq: Sequence) -> bool:
         cache = self._state_checkpoint_cache
         return cache.readable_midstep and cache.applies(seq)

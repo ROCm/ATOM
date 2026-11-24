@@ -167,8 +167,8 @@ def write_state_checkpoints(
     assert 0 < state_len <= conv_state.shape[2], "conv window wider than the pool"
     assert x.stride(-1) == 1, "conv input must be contiguous along the feature dim"
     BLOCK = 1024
-    nblk_ssm = triton.cdiv(hkv, BLOCK)
-    grid = (n, nblk_ssm + triton.cdiv(d, BLOCK))
+    nblk_ssm = (hkv + BLOCK - 1) // BLOCK
+    grid = (n, nblk_ssm + (d + BLOCK - 1) // BLOCK)
     _copy_checkpoints_kernel[grid](
         h,
         ssm_state,
