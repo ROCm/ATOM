@@ -253,6 +253,9 @@ def _hook_globals(G):
     UA = types.SimpleNamespace(**{k: G[k] for k in (
         "_reduce_segments_split_oneshot_kernel_gfx1250", "_GFX12_SPLIT_REDUCE_CONFIG",
         "_GFX12_SPLIT_REDUCE_ONESHOT_CONFIG")})
+    # aiter's (CHUNK, SPEC, warps) for a launch shape (AITER_GFX12_SPLIT_REDUCE_ONESHOT_AUTO),
+    # where aiter has it; else its fixed _GFX12_SPLIT_REDUCE_ONESHOT_CONFIG
+    oneshot_config = G.get("gfx12_split_reduce_oneshot_config")
     orig = G["_reduce_segments_split_gfx1250"]
 
     def _reduce_segments_split_gfx1250(
@@ -284,7 +287,17 @@ def _hook_globals(G):
         ):
             sb, _num_buf, _nw = UA._GFX12_SPLIT_REDUCE_CONFIG
             sb = min(sb, NUM_SEGMENTS)
-            chunk, spec, warps = UA._GFX12_SPLIT_REDUCE_ONESHOT_CONFIG
+            if oneshot_config is not None:
+                chunk, spec, warps = oneshot_config(
+                    params.num_tokens,
+                    params.num_query_heads,
+                    NUM_SEGMENTS,
+                    params.num_seqs,
+                    params.num_kv_heads,
+                    params.head_size_v,
+                )
+            else:
+                chunk, spec, warps = UA._GFX12_SPLIT_REDUCE_ONESHOT_CONFIG
             chunk = max(sb, min(chunk, NUM_SEGMENTS) // sb * sb)
             D = params.head_size_v
             if D % (32 * warps) == 0 and (D // (32 * warps)) * warps == D // 32:
