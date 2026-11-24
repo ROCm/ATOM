@@ -153,13 +153,17 @@ def mla_builder_cls():
         ),
         "atom.model_ops.attention_mla": _module(
             "atom.model_ops.attention_mla",
-            _MLA_MIN_HEADS=16,
             _MLA_SPLIT_BUDGET_AUTO=-1,
             MLAAttention=type("MLAAttention", (), {}),
             mla_dcp_kernel_num_heads=noop,
             mla_dcp_persistent_width=lambda *args, **kwargs: None,
             mla_dcp_sparse_prefill_num_heads=noop,
-            mla_kernel_num_heads=lambda heads: max(16, -(-heads // 16) * 16),
+            mla_dense_min_query_heads=lambda atom_config, num_heads, dcp_world_size: 16,
+            mla_kernel_num_heads=lambda num_heads, min_heads=16: (
+                min_heads
+                if num_heads <= min_heads
+                else max(16, -(-num_heads // 16) * 16)
+            ),
         ),
         "atom.model_ops.glm5_next.geometry": _module(
             "atom.model_ops.glm5_next.geometry",
@@ -285,7 +289,9 @@ def test_minimax_m3_builder_publishes_gqa_and_index_views_without_tp_collapse(
     assert len(transfer.block_regions) == 4 * 2 + 1
     # Every KV unit is one head-major run of the rank's one head; the indexer
     # keys are the same on every rank.
-    assert [page.head_major_runs for page in transfer.pages] == [(1, 1)] * 8 + [None]
+    assert [page.head_major_runs for page in transfer.pages] == [
+        (1, (128 * 128,))
+    ] * 4 + [(1, (128 * 4,))] * 4 + [None]
     index = transfer.pages[-1].unit_spec
     assert (index.layer, index.dim, index.dtype) == (0, 128, "torch.float8_e4m3fnuz")
     assert all(

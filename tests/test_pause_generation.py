@@ -177,6 +177,7 @@ def test_one_held_dp_rank_holds_every_rank():
         _report_backlog=False,
         pull_and_process_input_queue=lambda: True,
         _sync_dp_state=sync_dp_state,
+        _validate_dp_sync_interval=lambda interval: interval,
         _drain_kv_work_at_exit=lambda: None,
         scheduler=SimpleNamespace(
             heartbeat_throughput=lambda _: None,

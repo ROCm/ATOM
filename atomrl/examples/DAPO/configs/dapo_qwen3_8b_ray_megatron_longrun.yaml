@@ -1,0 +1,160 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
+# verl-aligned Ray online rollout — FORMAL LONG RUN (Qwen3-8B-Base, DAPO math).
+# MEGATRON training backend variant of dapo_qwen3_8b_ray_vllm_longrun.yaml.
+#
+# Scale/hyperparams aligned 1:1 to the FSDP BF16 formal long run:
+#   steps=1000, train_batch=32 x n=16 (=512), gen_batch=96,
+#   max_prompt=1024, max_response=20480, ppo_max_token/gpu=21504,
+#   overlong_buffer.len=512, rollout_is=token/2.0, lr=1e-6/warmup10/wd0.1,
+#   clip 0.2/0.28/10, token-mean, grpo, gpu_mem_util=0.30, max_num_seqs=64,
+#   max_num_batched_tokens=32768.
+#
+# Delta vs FSDP long run:
+#   - policy.training_backend: fsdp2 -> megatron_native (MegatronNativeEngine TE spec;
+#     TP/PP/CP default to 1 unless launch overrides them; distributed FP32 master + Adam)
+#   - vllm enable_sleep_mode: false（ROCm 7.2.3 cumem sleep broken；保持常驻）
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 8
+
+controller:
+  ray:
+    enabled: true
+    fuse_actor_ref: false
+    actor:
+      num_workers: 8
+      dispatch_mode: dp_compute_proto
+
+policy:
+  model_name: "${oc.env:DATA_ROOT}/models/Qwen3-8B-Base"
+  training_backend: megatron_native
+  generation_backend: vllm
+  max_total_sequence_length: 21504      # 1024 prompt + 20480 response
+  max_response_length: 20480
+  train_global_batch_size: 512          # 32 train prompts x 16 generations
+  gen_batch_size: 96                    # over-sample 96 prompts/round
+  train_micro_batch_size: 1
+  max_token_len_per_gpu: 21504          # verl ppo_max_token_len_per_gpu
+  learning_rate: 1.0e-6
+  lr_warmup_steps: 10
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  lr_decay_style: constant
+  training:
+    optimizer_dtype: bf16               # COMPUTE dtype (master weights stay fp32)
+    megatron_cfg:
+      use_distributed_optimizer: true
+      # Full activation recomputation: recompute one transformer layer at a time
+      # in backward -> bounds activation peak for long sequences.
+      recompute_granularity: full
+      recompute_method: uniform
+      recompute_num_layers: 1
+      # TE spec provides fused O(L) attention for resp=20480.
+      # Memory-efficient chunked/fused token log-prob (single [chunk,V] softmax
+      # buffer instead of full log_softmax + grad). Matches vime --log-probs-chunk-size.
+      log_probs_chunk_size: 1024
+      # Dynamic-batch packing: concat sequences into one TE packed-sequence forward
+      # so short responses keep GEMMs full -> faster train step.
+      # Matches vime --use-dynamic-batch-size --max-tokens-per-gpu.
+      enable_dynamic_batch: true
+      max_tokens_per_gpu: 21504
+    fsdp_cfg:
+      param_offload: false
+      optimizer_offload: false
+      reshard_after_forward: true
+  generation:
+    vllm_cfg:
+      transport: ray_http
+      ray_http_start_server: false
+      # With TE fused attention + chunked log-prob the Megatron training peak is small
+      # enough to keep the full 0.30 vLLM footprint (matches vime/FSDP longrun).
+      gpu_memory_utilization: 0.30
+      max_model_len: 21504
+      dtype: bfloat16
+      enforce_eager: true
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 32768
+      max_num_seqs: 64
+      quantization: ""
+      calculate_log_probs: true
+      # sleep DISABLED: vLLM cumem sleep is broken on this ROCm 7.2.3 image
+      # (discard is a no-op -> frees nothing; wake_up then re-maps and OOMs,
+      # cumem_allocator.cpp:151). We don't need sleep: training peak (~120GB) +
+      # resident vLLM (0.30 => ~86GB) < 288GB. Keeping vLLM resident is fine.
+      enable_sleep_mode: false
+      sleep_level: 2
+      update_weights_bucket_megabytes: 512
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1
+
+algorithm:
+  name: dapo
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  loss_agg_mode: token-mean
+  dapo:
+    num_generations: 16                 # verl rollout.n
+    kl_coeff: 0.0                        # verl formal: use_kl_loss=False
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    clip_ratio_c: 10.0
+    dynamic_sampling: true
+    token_level_pg: true
+    overlong_reward_shaping: true
+    max_resp_len: 20480
+    filter_groups:
+      enable: true
+      metric: acc
+      max_num_gen_batches: 10
+    overlong_buffer:
+      enable: true
+      len: 512
+      penalty_factor: 1.0
+      log: false
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+    rollout_is_batch_normalize: false
+
+reward:
+  type: function
+  function: atomrl.rewards.math_reward.dapo_math_reward
+  dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet"
+  shuffle: true
+  shuffle_seed: 10086
+
+# periodic validation on AIME (verl test_freq=10). NOTE: AtomRL val is greedy;
+# verl uses val_kwargs.temperature=0.6 — diagnostic only, does not affect training.
+val_dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/aime-2024.filtered.parquet"
+val_steps: 10                           # in-loop validation every 10 steps (Ray-aware)
+val_batch_size: 0                        # 0 = full validation set in one dataloader batch, matching verl
+eval:
+  enabled: false                        # disable EvalCallback (it fires at step 0);
+  num_samples: 0                        # 0 = full validation set, matching verl
+
+checkpointing:
+  checkpoint_dir: "${oc.env:DATA_ROOT}/ckpts/atomrl-dapo/longrun-ray-megatron-8b"
+  save_steps: 50
+  save_total_limit: 5
+  resume: true
+
+logger:
+  wandb_enabled: true
+  log_interval: 1
+  wandb:
+    project: AtomRL
+    name: longrun-ray-megatron-8b-verl-aligned
+
+num_training_steps: 1000
+seed: 10086

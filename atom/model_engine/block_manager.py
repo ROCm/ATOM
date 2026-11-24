@@ -313,10 +313,30 @@ class BlockManager:
         # `state_slots_per_req` is what a live request asks for.
         pool_entries: dict = getattr(config, "pool_entries", None) or {}
         pool_per_req: dict = getattr(config, "pool_entries_per_req", None) or {}
-        # Total capacity, kept so callers can tell "all slots busy" (transient)
-        # from "no slots were ever created" (permanent).
+        # Slots live requests can take (transfer slots are carved off below), kept
+        # so callers can tell "all slots busy" from "no slots were ever created".
         self.num_state_slots = int(pool_entries.get(STATE_SLOT_CLASS, 0))
         self.state_slots_per_req = int(pool_per_req.get(STATE_SLOT_CLASS, 1)) or 1
+        # A P/D producer's transfer slots, sized by the runner past the live ones:
+        # the top of the pool, where a finished request's state waits for its push.
+        self.num_state_transfer_slots = config.state_transfer_slots
+        if self.num_state_transfer_slots:
+            self.num_state_slots -= self.num_state_transfer_slots
+            logger.info(
+                "State pool: %d slots for live requests, %d P/D transfer slots",
+                self.num_state_slots,
+                self.num_state_transfer_slots,
+            )
+        self._free_transfer_slots: deque[int] = deque(
+            range(
+                self.num_state_slots,
+                self.num_state_slots + self.num_state_transfer_slots,
+            )
+        )
+        # Finished requests moved to a transfer slot, and those that kept
+        # their live slot because every transfer slot was taken.
+        self.transfer_slot_moves = 0
+        self.transfer_slots_full = 0
         # Tokens between rungs of the checkpoint ladder, shared by every
         # Pool.STATE class (--state-checkpoint-interval-tokens).
         #
@@ -414,6 +434,9 @@ class BlockManager:
         self._state_checkpoint_cache: StateCheckpointCache = (
             self.paged_state_checkpoints or self.state
         )
+        if self.num_state_transfer_slots:
+            # `deallocate` then hands a transfer slot back to its own list.
+            self.state.release_many = self._release_live_or_transfer_slots
         # Where a readable backend can snapshot inside a forward; see
         # `midstep_target_ok`. Zero for a backend that cannot.
         self.midstep_grid = state_runtime.transfer.midstep_grid
@@ -3789,6 +3812,41 @@ class BlockManager:
 
         seq.offload_joint.load_hash = -1
         seq.offload_joint.reset_joint()
+
+    def _release_live_or_transfer_slots(self, slots) -> None:
+        """Hand back live slots to the pool, transfer slots to their own list."""
+        for slot in slots or ():
+            if slot >= self.num_state_slots:
+                self._free_transfer_slots.append(slot)
+            elif slot >= 0:
+                self.state.release(slot)
+
+    def move_state_to_transfer_slot(self, seq: Sequence) -> tuple[int, int] | None:
+        """Re-home a finished P/D request's state in a transfer slot.
+
+        Returns ``(src, dst)``: the caller must copy slot ``src`` into ``dst``
+        before the next forward, which may reuse ``src``. None when every
+        transfer slot is taken: the request keeps its live slot.
+        """
+        if not self._free_transfer_slots:
+            self.transfer_slots_full += 1
+            return None
+        src = seq.state_slot
+        dst = self._free_transfer_slots.popleft()
+        self.state.release_many(seq.state_slots)
+        seq.state_slots = [dst]
+        self.transfer_slot_moves += 1
+        return src, dst
+
+    def transfer_slot_occupancy(self) -> dict[str, int]:
+        """Transfer slots in use and in total, and the moves made or missed."""
+        total = self.num_state_transfer_slots
+        return {
+            "transfer_slots_total": total,
+            "transfer_slots_used": total - len(self._free_transfer_slots),
+            "transfer_slot_moves": self.transfer_slot_moves,
+            "transfer_slots_full": self.transfer_slots_full,
+        }
 
     def can_append(
         self, seq: Sequence, num_new_tokens: int = 1, lookahead: int = 0

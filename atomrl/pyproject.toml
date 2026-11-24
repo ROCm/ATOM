@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atomrl"
+version = "0.1.0"
+authors = [{ name = "Advanced Micro Devices, Inc." }]
+license = "MIT"
+license-files = ["LICENSE"]
+readme = "README.md"
+description = "AMD-native reinforcement-learning post-training for LLMs"
+requires-python = ">=3.10"
+dependencies = [
+    "ray[default]>=2.9",
+    "omegaconf>=2.3,<2.4",
+]
+
+[project.urls]
+Homepage = "https://github.com/ROCm/ATOM/tree/main/atomrl"
+Repository = "https://github.com/ROCm/ATOM"
+Issues = "https://github.com/ROCm/ATOM/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["atomrl", "atomrl.*"]
+exclude = [
+    "atomrl.tests",
+    "atomrl.tests.*",
+]
+namespaces = false
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+atomrl = [
+    "lumen/csrc/*.c",
+    "lumen/csrc/*.cu",
+]

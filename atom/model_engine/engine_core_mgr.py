@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import asyncio
+import copy
 import hashlib
 import logging
 import multiprocessing
@@ -249,6 +250,45 @@ def _resolve_dp_engine_count(config: Config, logical: int) -> int:
         logical // visible,
     )
     return visible
+
+
+def layout_engines(config: Config) -> list[tuple[int, int]]:
+    """The (global_dp_rank, local_dp_rank) of every DP rank whose engines this
+    node runs. Under DP attention every TP rank becomes a DP rank of its own,
+    and ``config`` is rewritten to say so."""
+    pc = config.parallel_config
+    multinode = pc.is_multinode_dp
+    rank_assignments = iter_dp_rank_assignments(config)
+    if not config.enable_dp_attention:
+        assert not (
+            config.pipeline_parallel_size > 1 and pc.data_parallel_size > 1
+        ), "Pipeline parallel combined with data parallel is not supported yet."
+        return rank_assignments
+    assert (
+        config.pipeline_parallel_size == 1
+    ), "Pipeline parallel + DP-attention is not supported yet"
+    # One engine per assignment this node owns; on a single node that is
+    # the whole tp x dp grid. --fake-eplb may shrink it to the visible
+    # device count, taking the first N assignments.
+    count = _resolve_dp_engine_count(config, len(rank_assignments))
+    logger.info(f"Enable dp attention, using {count} data parallel ranks")
+    pc.data_parallel_size *= config.tensor_parallel_size
+    pc.data_parallel_size_local = count
+    if multinode:
+        pc.data_parallel_rank *= config.tensor_parallel_size
+    config.tensor_parallel_size = 1
+    return rank_assignments[:count]
+
+
+def engine_config(
+    config: Config, dp_rank: int, local_dp_rank: int, pp_rank: int = 0
+) -> Config:
+    """The Config of one EngineCore: one DP rank's (PP stage's) copy."""
+    rank_config = copy.deepcopy(config)
+    rank_config.parallel_config.data_parallel_rank = dp_rank
+    rank_config.parallel_config.data_parallel_rank_local = local_dp_rank
+    rank_config.parallel_config.pipeline_parallel_rank = pp_rank
+    return rank_config
 
 
 def _add_frame(seqs: list[Sequence]) -> bytes:
@@ -538,28 +578,8 @@ class CoreManager:
                 "two mappings have not been reconciled across nodes."
             )
 
-        rank_assignments = iter_dp_rank_assignments(config)
-        if config.enable_dp_attention:
-            assert pp_size == 1, "Pipeline parallel + DP-attention is not supported yet"
-            # One engine per assignment this node owns; on a single node that is
-            # the whole tp x dp grid. --fake-eplb may shrink it to the visible
-            # device count, taking the first N assignments.
-            local_engine_count = _resolve_dp_engine_count(config, len(rank_assignments))
-            logger.info(
-                f"Enable dp attention, using {local_engine_count} data parallel ranks"
-            )
-            # Under DP-attention every TP rank becomes its own DP rank.
-            config.parallel_config.data_parallel_size *= config.tensor_parallel_size
-            config.parallel_config.data_parallel_size_local = local_engine_count
-            if multinode:
-                config.parallel_config.data_parallel_rank *= config.tensor_parallel_size
-            config.tensor_parallel_size = 1
-        else:
-            dp_size = config.parallel_config.data_parallel_size
-            assert not (
-                pp_size > 1 and dp_size > 1
-            ), "Pipeline parallel combined with data parallel is not supported yet."
-            local_engine_count = len(rank_assignments) * pp_size
+        rank_assignments = layout_engines(config)
+        local_engine_count = len(rank_assignments) * pp_size
 
         global_engine_count = (
             config.parallel_config.data_parallel_size * pp_size
@@ -618,13 +638,7 @@ class CoreManager:
                     f"pp={pp_rank}) of {self.local_engine_count}"
                 )
 
-                # Create config for this (dp, pp) stage
-                import copy
-
-                rank_config = copy.deepcopy(config)
-                rank_config.parallel_config.data_parallel_rank = dp_rank
-                rank_config.parallel_config.data_parallel_rank_local = local_dp_rank
-                rank_config.parallel_config.pipeline_parallel_rank = pp_rank
+                rank_config = engine_config(config, dp_rank, local_dp_rank, pp_rank)
                 if self.pp_size > 1:
                     rank_config.parallel_config.pp_meta_addrs = self.pp_meta_addrs
                     rank_config.parallel_config.pp_token_addr = self.pp_token_addr
@@ -1063,7 +1077,7 @@ class CoreManager:
                     with self.ctx.socket(zmq.PAIR) as shutdown_sender:
                         shutdown_sender.connect(shutdown_path)
                         shutdown_sender.send(b"")
-                except Exception as e:
+                except (OSError, zmq.ZMQError) as e:
                     logger.debug(f"{self.label}: Error sending shutdown signal: {e}")
 
         for thread in self.output_threads:
@@ -2223,11 +2237,21 @@ class CoreManager:
             if not outer:
                 ctx.sync_id = uuid.uuid4().hex
                 ctx.failure = None
+                ctx.abort_sent = False
             ctx.active = True
             try:
                 yield
             finally:
                 ctx.active = outer
+
+    def claim_weight_sync_abort(self) -> bool:
+        """Return true once for the outer weight-sync session's abort."""
+        with self._weight_sync_lock:
+            ctx = self._weight_sync_context
+            if not getattr(ctx, "active", False) or getattr(ctx, "abort_sent", False):
+                return False
+            ctx.abort_sent = True
+            return True
 
     def _discard_failed_weight_sync(self, failed_cmd: str) -> None:
         """Fence every engine this reaches and drop the failed sync's scratch.
@@ -2822,5 +2846,5 @@ class DisaggCoreManager(CoreManager):
             try:
                 self._cu_shm.close()
                 self._cu_shm.unlink()
-            except Exception:
-                pass
+            except (BufferError, FileNotFoundError, OSError) as error:
+                logger.debug("Could not release CU shared memory: %s", error)

@@ -65,6 +65,7 @@ class EngineStats:
         "_cache_interval_wanted_tokens",
         "_cache_log_interval",
         "_pool_pressure",
+        "_pressure_logger",
         "_recent_cached_tokens",
         "_recent_hits",
         "_recent_reusable_tokens",
@@ -76,6 +77,7 @@ class EngineStats:
         "_throughput_last_log_time",
         "_throughput_steps",
         "_throughput_total_steps",
+        "_transfer_slot_occupancy",
         "block_manager",
         "cache_enabled",
         "distribution",
@@ -111,6 +113,7 @@ class EngineStats:
         cache_log_interval: int = 100,
         cache_hit_rate_window: int = 1000,
         pool_pressure: Callable[[], dict[str, int]] | None = None,
+        transfer_slot_occupancy: Callable[[], dict[str, int]] | None = None,
         throughput_log_interval_s: float = 10.0,
         throughput_log_interval_steps: int = 0,
     ):
@@ -136,6 +139,13 @@ class EngineStats:
         # behind it is O(free blocks), which is ~10k here and would be paid
         # once per request for a line printed once per `cache_log_interval`.
         self._pool_pressure = pool_pressure
+        # A P/D producer's transfer slots, when sized, get a line of their own.
+        self._transfer_slot_occupancy = transfer_slot_occupancy
+        self._pressure_logger = (
+            self._log_pressure
+            if transfer_slot_occupancy is None
+            else self._log_pressure_and_transfer_slots
+        )
         self.total_requests: int = 0
         self.total_cached_tokens: int = 0
         self.total_full_tokens: int = 0
@@ -599,7 +609,7 @@ class EngineStats:
                 f"total={self.total_offload_tokens}"
             )
         if self._pool_pressure is not None:
-            self._log_pressure(self._pool_pressure())
+            self._pressure_logger(self._pool_pressure())
 
     def _log_pools(self) -> None:
         """Each pool's hit rate against its own denominator.
@@ -703,6 +713,17 @@ class EngineStats:
             f"dropped: {p['checkpoints_dropped']}, "
             f"evicted: {p['checkpoints_evicted']}, "
             f"orphaned: {p['checkpoints_orphaned']}"
+        )
+
+    def _log_pressure_and_transfer_slots(self, p: dict[str, int]) -> None:
+        """`_log_pressure`, then a P/D producer's transfer slots: in use, the
+        moves made, and the finished requests that found every slot taken."""
+        self._log_pressure(p)
+        t = self._transfer_slot_occupancy()
+        logger.info(
+            "[Transfer Slots] "
+            f"{t['transfer_slots_used']}/{t['transfer_slots_total']} used, "
+            f"{t['transfer_slot_moves']} moved, {t['transfer_slots_full']} found full"
         )
 
     @classmethod

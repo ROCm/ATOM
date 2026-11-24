@@ -1,0 +1,211 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
+# DeepSeek-V4-Flash GRPO long run — Megatron-DSV4 TP4/PP4/EP4 + vLLM FP8 rollout (MI308X)
+#
+# Aligned with LMSYS MILES RL semantics:
+#   BF16 actor, FP8 rollout, GRPO 32x8 sampling, 4k response cap,
+#   global batch 256, no KL.
+#   https://www.lmsys.org/blog/2026-07-10-rocm-miles-dsv4/
+# The local MI308X memory layout intentionally remains TP4/PP4/EP4 instead of
+# the published MI355X TP1/PP4/EP4 layout.
+#
+# Training: Megatron-DSV4 (TP=4, PP=4, EP=4, ETP=1, 256 experts,
+#   sequence-parallel, distributed optimizer, flash attention,
+#   chunked log-prob, full optimizer CPU offload with BF16 moments and four
+#   256 MiB streamed-Adam staging buffers)
+#
+# PP layer distribution: first stage=11 layers, last stage=10 layers
+#
+# 3-node training/inference separation:
+#   Nodes 0-1: Megatron-DSV4 BF16 training (16 workers, TP=4, PP=4, EP=4)
+#   Node 2: vLLM inference (1 replica, TP=8, FP8 per-block, 8 GPUs)
+#
+# Rollout: vLLM AsyncLLM (FP8 per-block weights + FP8 KV cache, TP=8,
+#   enforce_eager, AITER kernels, gpu_memory_utilization=0.92)
+#
+# Weight sync: RDMA via RCCL (2048 MB buckets, 1200s timeout)
+
+cluster:
+  num_nodes: 3
+  gpus_per_node: 8
+  ray_address: "auto"
+
+weight_sync:
+  enabled: true
+  backend: rdma
+  shared_folder: "${oc.env:DATA_ROOT}/weight_sync/dsv4-flash"
+  bucket_size_mb: 2048
+  timeout_s: 7200
+  verify_full_load: true
+  fp8_quantization_location: inference
+  rdma:
+    backend: rccl
+    require_rdma: true
+    hca: ionic_0
+    interface: ens50f0
+    gid_index: 1
+    gdr_mode: auto
+    online_staging: cpu  # held FusedMoE modules (~12 GB) don't fit on the GPU
+
+controller:
+  ray:
+    enabled: true
+    fuse_actor_ref: false
+    actor:
+      num_workers: 16
+      dispatch_mode: dp_compute_proto
+      process_on_nodes: [8, 8]
+      topology_tags:
+        node_ips: "${oc.env:ACTOR_NODE_IPS}"   # comma-separated IPs of the two trainer nodes
+    rollout:
+      num_workers: 8
+      process_on_nodes: [8]
+      topology_tags:
+        node_ips: "${oc.env:ROLLOUT_NODE_IPS}"  # IP of the rollout node
+
+policy:
+  model_name: "${oc.env:DATA_ROOT}/models/DeepSeek-V4-Flash-BF16"
+  training_backend: megatron_lumen_dsv4
+  generation_backend: vllm
+  max_total_sequence_length: 16384           # MILES --context-length
+  max_response_length: 4096
+  train_global_batch_size: 256               # 32 prompts x 8 generations
+  # GRPO currently ignores gen_batch_size unless DAPO filter_groups is enabled;
+  # rollout prompts = train_global_batch_size / algorithm.grpo.num_generations.
+  gen_batch_size: 32
+  train_micro_batch_size: 1
+  max_token_len_per_gpu: 8192                # MILES --max-tokens-per-gpu
+  balance_batch: true
+  optimizer_type: adam
+  learning_rate: 1.0e-6
+  lr_warmup_steps: 0
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  lr_decay_style: constant
+  adam_beta1: 0.9
+  adam_beta2: 0.98
+  training:
+    optimizer_dtype: bf16
+    megatron_cfg:
+      tensor_model_parallel_size: 4
+      pipeline_model_parallel_size: 4
+      expert_model_parallel_size: 4
+      expert_tensor_parallel_size: 1
+      num_experts: 256
+      num_layers_in_first_pipeline_stage: 11
+      num_layers_in_last_pipeline_stage: 10
+      moe_grouped_gemm: true
+      moe_token_dispatcher_type: alltoall
+      use_distributed_optimizer: true
+      grad_reduce_in_fp32: true
+      attention_softmax_in_fp32: true
+      sequence_parallel: true
+      recompute_granularity: full
+      recompute_method: uniform
+      recompute_num_layers: 1
+      attention_backend: flash
+      use_packed_sequences: true
+      log_probs_chunk_size: 1024
+      numa_affinity: true
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 1.0
+      use_precision_aware_optimizer: true
+      streamed_optimizer_mode: adam
+      streamed_optimizer_chunk_size_mib: 256
+      streamed_optimizer_moment_dtype: bf16
+    fsdp_cfg:
+      param_offload: false
+      optimizer_offload: false
+      reshard_after_forward: true
+  generation:
+    vllm_cfg:
+      transport: ray_http
+      ray_http_start_server: true
+      tensor_parallel_size: 8
+      quantization: fp8_per_block
+      enforce_eager: true
+      disable_custom_all_reduce: true
+      moe_backend: auto                       # AITER when VLLM_ROCM_USE_AITER=1
+      linear_backend: auto
+      # DSV4's fp8_ds_mla attention layout requires FP8 KV cache; MILES does
+      # not override its inference rollout to BF16 KV.
+      kv_cache_dtype: fp8_e4m3
+      gpu_memory_utilization: 0.92
+      max_model_len: 16384
+      dtype: bfloat16
+      enable_chunked_prefill: true
+      enable_prefix_caching: false            # Match the passing standalone probe
+      max_num_batched_tokens: 8192
+      max_num_seqs: 48                       # maximum concurrent requests
+      calculate_log_probs: true
+      enable_sleep_mode: false
+      sleep_level: 0
+      update_weights_bucket_megabytes: 2048
+      temperature: 0.8
+      top_p: 1.0
+      top_k: -1
+
+algorithm:
+  name: grpo
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  loss_agg_mode: seq-mean-token-mean
+  clip_ratio_high: 0.28
+  grpo:
+    num_generations: 8
+    kl_coeff: 0.0
+    clip_ratio: 0.2
+
+quantization:
+  rollout:
+    precision: fp8
+  training:
+    fp8: null
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+    # Match the MILES DSV4 --use-tis recipe: clamp exp(train-rollout) at 2.0
+    # and apply it directly to the per-token GRPO loss without renormalization.
+    rollout_is_batch_normalize: false
+
+moe:
+  r3:
+    enabled: true
+    record_router_logits: false
+    replay_mode: hard_assignment
+
+reward:
+  type: function
+  function: atomrl.rewards.math_reward.dapo_math_reward
+  dataset: "${oc.env:DATA_ROOT}/data/dsv4-flash/dapo-math-17k/dapo-math-17k.jsonl"
+  shuffle: true
+  shuffle_seed: 10086
+
+val_dataset: "${oc.env:DATA_ROOT}/data/dsv4-flash/aime-2024/aime-2024.jsonl"
+val_steps: 5
+val_batch_size: 0
+eval:
+  enabled: true
+  num_samples: 0
+  num_generations: 8
+  temperature: 0.8
+  top_p: 0.7
+  top_k: -1
+
+checkpointing:
+  checkpoint_dir: "${oc.env:DATA_ROOT}/ckpts/dsv4-flash/longrun"
+  save_steps: 25
+  save_total_limit: 2
+  resume: true
+
+logger:
+  wandb_enabled: true
+  log_interval: 1
+  wandb:
+    project: AtomRL
+    name: dsv4-flash-grpo-vllm-200step-is-r3
+
+num_training_steps: 200
+seed: 10086

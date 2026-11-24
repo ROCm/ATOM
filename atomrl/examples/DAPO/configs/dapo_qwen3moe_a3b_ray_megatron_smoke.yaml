@@ -1,0 +1,141 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
+# MoE + Expert-Parallel SMOKE: Qwen3-30B-A3B-Base on Megatron-Native.
+#
+# Same verl-aligned Ray + colocated vLLM + ZMQ CUDA-IPC stack as the dense
+# megatron smoke, but the policy is a routed-expert Qwen3-MoE trained with
+# Expert Parallel (EP=8, TP=1, PP=1, CP=1 -> DP=8 for attention, experts sharded
+# across all 8 GPUs). Exercises: MoE decoder-block spec + grouped-GEMM experts,
+# HF<->Megatron MoE bridge, EP-aware weight sync to vLLM, and EP-lockstep
+# microbatching. Short horizon so it finishes fast on 8xMI355X (288GB).
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 8
+
+controller:
+  ray:
+    enabled: true
+    fuse_actor_ref: false
+    actor:
+      num_workers: 8
+      dispatch_mode: dp_compute_proto
+
+policy:
+  model_name: "${oc.env:DATA_ROOT}/models/Qwen3-30B-A3B-Base"
+  training_backend: megatron_native
+  generation_backend: vllm
+  max_total_sequence_length: 2048
+  max_response_length: 512
+  train_global_batch_size: 128         # 8 prompts x 16 generations (/8 actors = 16 rows each)
+  gen_batch_size: 24                   # over-sample prompts/round for filter_groups
+  train_micro_batch_size: 1
+  max_token_len_per_gpu: 2048
+  learning_rate: 1.0e-6
+  lr_warmup_steps: 10
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  lr_decay_style: constant
+  training:
+    optimizer_dtype: bf16
+    megatron_cfg:
+      use_distributed_optimizer: true
+      # ---- Expert Parallel: shard 128 experts across all 8 GPUs ----
+      tensor_model_parallel_size: 1
+      pipeline_model_parallel_size: 1
+      context_parallel_size: 1
+      expert_model_parallel_size: 8
+      # num_experts / moe_router_topk / moe_intermediate_size auto-detected from
+      # the HF config; SequentialMLP experts, aux-loss OFF (RL loss unchanged).
+      moe_grouped_gemm: false             # grouped_gemm (CUTLASS) unavailable on ROCm; use SequentialMLP
+      # Default NCCL alltoall. ENABLE_MORI=true sets type=flex (run_dapo.sh).
+      # Packed RL auto-derives moe_mori_max_tokens_per_rank from max_tokens_per_gpu.
+      moe_token_dispatcher_type: alltoall
+      moe_flex_dispatcher_backend: mori
+      moe_mori_max_tokens_per_rank: null
+      moe_mori_kernel_type: null
+      moe_aux_loss_coeff: 0.0
+      # fp32 router -> stable top-8 selection, lower train/rollout mismatch.
+      moe_router_dtype: fp32
+      # TE spec provides fused attention; bound log-prob memory by chunking.
+      log_probs_chunk_size: 1024
+      # Dynamic-batch packing through TE packed-sequence attention.
+      enable_dynamic_batch: true
+      max_tokens_per_gpu: 2048
+    fsdp_cfg:
+      param_offload: false
+      optimizer_offload: false
+  generation:
+    vllm_cfg:
+      transport: ray_http
+      ray_http_start_server: false
+      gpu_memory_utilization: 0.40
+      max_model_len: 2048
+      dtype: bfloat16
+      enforce_eager: true
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 4096
+      max_num_seqs: 64
+      quantization: ""
+      calculate_log_probs: true
+      enable_sleep_mode: false          # cumem sleep broken on ROCm 7.2.3
+      sleep_level: 2
+      update_weights_bucket_megabytes: 512
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1
+
+algorithm:
+  name: dapo
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  loss_agg_mode: token-mean
+  dapo:
+    num_generations: 16
+    kl_coeff: 0.0
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    clip_ratio_c: 10.0
+    dynamic_sampling: true
+    token_level_pg: true
+    overlong_reward_shaping: true
+    max_resp_len: 512
+    filter_groups:
+      enable: true
+      metric: acc
+      max_num_gen_batches: 10
+    overlong_buffer:
+      enable: true
+      len: 256
+      penalty_factor: 1.0
+      log: false
+
+reward:
+  type: function
+  function: atomrl.rewards.math_reward.dapo_math_reward
+  dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet"
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+    rollout_is_batch_normalize: false
+
+checkpointing:
+  checkpoint_dir: "${oc.env:DATA_ROOT}/ckpts/atomrl-dapo/megatron-moe-smoke"
+  save_steps: 5
+  save_total_limit: 5
+  resume: true
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 3
+seed: 10086

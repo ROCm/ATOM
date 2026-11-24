@@ -247,7 +247,7 @@ def test_draft_exports_zero_copy_mp_views_and_disables_tp_collapse():
     assert [(p.unit_spec.namespace, p.unit_spec.layer) for p in transfer.pages] == [
         ("draft", 9)
     ] * 2
-    assert {p.head_major_runs for p in transfer.pages} == {(1, 4)}
+    assert {p.head_major_runs for p in transfer.pages} == {(4, (128 * 128 * 2,))}
     assert [tuple(view.shape[:2]) for view in transfer.block_tensor_views] == [
         (2, 1),
         (2, 1),
@@ -695,3 +695,59 @@ def test_a_declared_scale_other_than_unit_is_refused():
 
     with pytest.raises(ValueError, match="declares a KV scale of 0.5"):
         draft_kv_builder(SimpleNamespace(), None, _Draft())
+
+
+@pytest.mark.parametrize(
+    "draft_kind", ["disabled", "pp_non_last", "shared", "independent"]
+)
+def test_serving_binding_uses_the_drafts_builder_before_target_fallback(draft_kind):
+    from atom.model_engine.kv_cache_binding import kv_cache_bindings
+
+    target, draft, shared = [_PagedAttention() for _ in range(3)]
+    norm = _Norm()
+    target.layer_num, draft.layer_num, shared.layer_num = 17, 29, 31
+    target_calls, draft_calls = [], []
+    tensors = {
+        target: torch.zeros(1),
+        draft: torch.ones(1),
+        shared: torch.full((1,), 2),
+    }
+
+    def target_bind(module):
+        target_calls.append(module)
+        return tensors.get(module)
+
+    def draft_bind(module):
+        draft_calls.append(module)
+        return tensors[draft] if module is draft else None
+
+    runner = SimpleNamespace(
+        model=SimpleNamespace(modules=lambda: [target, norm]),
+        config=SimpleNamespace(speculative_config=draft_kind != "disabled"),
+        attn_metadata_builder=SimpleNamespace(build_kv_cache_tensor=target_bind),
+    )
+    if draft_kind != "pp_non_last":
+        runner.drafter = SimpleNamespace(
+            model=SimpleNamespace(modules=lambda: [draft, shared])
+        )
+    if draft_kind == "independent":
+        runner.draft_kv_builder = SimpleNamespace(build_kv_cache_tensor=draft_bind)
+    bound = [
+        (module, tensor)
+        for module, tensor in kv_cache_bindings(runner)
+        if tensor is not None
+    ]
+    assert [module.layer_num for module, _ in bound] == (
+        [17] if draft_kind in ("disabled", "pp_non_last") else [17, 29, 31]
+    )
+    assert all(tensor is tensors[module] for module, tensor in bound)
+    assert (
+        target_calls
+        == {
+            "disabled": [target, norm],
+            "pp_non_last": [target, norm],
+            "shared": [target, norm, draft, shared],
+            "independent": [target, norm, shared],
+        }[draft_kind]
+    )
+    assert draft_calls == ([draft, shared] if draft_kind == "independent" else [])

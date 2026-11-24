@@ -105,14 +105,15 @@ check_relevant_paths() {
     return 0
   fi
 
-  local changed_files filter_result
+  local changed_files filter_result filter_status
   if ! changed_files="$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" --jq '.[].filename')"; then
     echo "Failed to query PR changed files; skipping heavy CI."
     emit_undecidable "files-query-failed"
     exit 0
   fi
 
-  if ! filter_result="$(
+  filter_status=0
+  filter_result="$(
     CHANGED_FILES="${changed_files}" python3 - <<'PY'
 import fnmatch
 import os
@@ -151,12 +152,17 @@ for path in relevant[:20]:
 if len(relevant) > 20:
     print(f"  ... {len(relevant) - 20} more relevant file(s)")
 
-sys.exit(0 if relevant else 1)
+# 0: relevant files; 1: nothing the include list names; 2: the rest ignored.
+included = not include_patterns or any(
+    matches(pattern, path) for pattern in include_patterns for path in files
+)
+sys.exit(0 if relevant else 2 if included else 1)
 PY
-  )"; then
+  )" || filter_status=$?
+  if [ "${filter_status}" -ne 0 ]; then
     echo "${filter_result}"
     local reason="ignored-paths-only"
-    if [ -n "${CI_GATE_PATHS_INCLUDE:-}" ] && [ -z "${CI_GATE_PATHS_IGNORE:-}" ]; then
+    if [ "${filter_status}" -eq 1 ]; then
       reason="paths-not-included"
     fi
     emit_decision "false" "${reason}"
