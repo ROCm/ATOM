@@ -614,6 +614,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # chain (0: gather bf16 rows and call the layer). _CHECK: log each layer's
     # cosine against the regular MoE once (debug; an extra bf16 gather).
     "ATOM_M3_SP_FLYDSL_MOE": lambda: os.getenv("ATOM_M3_SP_FLYDSL_MOE", "1") == "1",
+    # SP MoE layers: run the shared expert on this rank's own rows with its full
+    # weights (an unsharded MXFP8 copy, +3.1 GiB per rank at TP4) and gather only
+    # the routed MXFP4 rows + routing (3.3 KB/token instead of 9.6). Not bit-identical
+    # to the TP shared expert (one K=3072 sum instead of four bf16 partials): needs
+    # the accuracy gate. _SIDE=1 runs it on a side stream next to the routed chain
+    # (measured 40-50 us/layer slower than serial on MI355X TP4, so off).
+    "ATOM_M3_SP_SHARED_LOCAL": lambda: os.getenv("ATOM_M3_SP_SHARED_LOCAL", "0") == "1",
+    "ATOM_M3_SP_SHARED_LOCAL_SIDE": lambda: os.getenv(
+        "ATOM_M3_SP_SHARED_LOCAL_SIDE", "0"
+    )
+    == "1",
     "ATOM_M3_SP_MOE_CHECK": lambda: os.getenv("ATOM_M3_SP_MOE_CHECK", "0") == "1",
     # Smallest decode batch (requests) that takes the indexer-CP arm; a smaller
     # one scores on the TP path. Unset: 16 for an FP4/NVFP4 index cache (the CP

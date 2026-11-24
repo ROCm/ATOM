@@ -215,6 +215,97 @@ def _native_mxfp8(lin: nn.Module | None) -> bool:
     )
 
 
+class SharedFull(nn.Module):
+    """An unsharded copy of a layer's MXFP8 shared expert (``MiniMaxM3MLP``) that
+    runs on this rank's own rows (+3.1 GiB per rank at TP4 for 57 layers)."""
+
+    def __init__(
+        self,
+        shared: nn.Module,
+        hidden: int,
+        intermediate: int,
+        quant_config,
+        prefix: str,
+    ):
+        super().__init__()
+        from atom.model_ops.linear import ReplicatedLinear
+
+        self.gate_up_proj = ReplicatedLinear(
+            hidden,
+            2 * intermediate,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj",
+        )
+        self.down_proj = ReplicatedLinear(
+            intermediate,
+            hidden,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.down_proj",
+        )
+        self.swiglu_alpha = shared.swiglu_alpha
+        self.swiglu_beta = shared.swiglu_beta
+        self.swiglu_limit = shared.swiglu_limit
+        # The TP shard's parameters load the checkpoint; the same tensors fill the
+        # unsharded copy (gate then up, each ``rows`` of the 2 * intermediate).
+        for src, dst in (
+            (shared.gate_up_proj, self.gate_up_proj),
+            (shared.down_proj, self.down_proj),
+        ):
+            for name, p in src.named_parameters(recurse=False):
+                fp = getattr(dst, name, None)
+                loader = getattr(p, "weight_loader", None)
+                if (
+                    fp is None
+                    or loader is None
+                    or not hasattr(fp, "weight_loader_process")
+                ):
+                    continue
+
+                def both(param, loaded, *args, _loader=loader, _fp=fp, **kw):
+                    shard_id = args[0] if args else kw.get("loaded_shard_id")
+                    _loader(param, loaded, *args, **kw)
+                    if shard_id is None:
+                        _fp.weight_loader_process(_fp.data, loaded)
+                    else:
+                        rows = loaded.shape[0]
+                        _fp.weight_loader_process(
+                            _fp.data.narrow(0, shard_id * rows, rows), loaded
+                        )
+
+                p.weight_loader = both
+
+    def forward(self, x: torch.Tensor, x_scale: torch.Tensor) -> torch.Tensor:
+        from atom.model_ops.swiglu_oai import swiglu_oai_split
+
+        gate_up = self.gate_up_proj(x, x_scale=x_scale)
+        h = swiglu_oai_split(
+            gate_up,
+            alpha=self.swiglu_alpha,
+            beta=self.swiglu_beta,
+            limit=self.swiglu_limit,
+        )
+        return self.down_proj(h)
+
+
+def make_shared_full(shared: nn.Module | None, config, quant_config, prefix: str):
+    """``SharedFull`` of ``shared`` where owner-local shared experts can run, else None."""
+    if shared is None or not wanted() or not envs.ATOM_M3_SP_SHARED_LOCAL:
+        return None
+    if getattr(shared.gate_up_proj, "output_sizes", None) != getattr(
+        shared.gate_up_proj, "_ckpt_output_sizes", None
+    ) or getattr(shared.down_proj, "_k_padded", False):
+        return None  # a padded shard cannot be copied into the unsharded layout
+    return SharedFull(
+        shared,
+        config.hidden_size,
+        config.intermediate_size * config.n_shared_experts,
+        quant_config,
+        prefix,
+    )
+
+
 def _layer_supports_sp(layer: nn.Module) -> bool:
     attn = layer.self_attn
     linears = [attn.qkv_proj, attn.o_proj, getattr(attn, "o_proj_full", None)]
@@ -400,6 +491,62 @@ class FfnInput:
     rows: torch.Tensor | None = None
     fp4: tuple[torch.Tensor, torch.Tensor] | None = None
     routing: torch.Tensor | None = None
+    # SHARED_LOCAL: this rank's own rows' MXFP8 codes + scales (not gathered)
+    local: tuple[torch.Tensor, torch.Tensor] | None = None
+
+
+def _shared_local(moe, chain: bool) -> bool:
+    """The shared expert runs on this rank's own rows with its full weights, so
+    the MXFP8 rows are not gathered (only the MXFP4 rows + routing are)."""
+    from atom.utils.tbo.ubatching import tbo_active
+
+    return bool(
+        chain
+        and getattr(moe, "shared_full", None) is not None
+        and not envs.ATOM_M3_SP_MOE_CHECK
+        and not tbo_active()
+    )
+
+
+_side_stream: torch.cuda.Stream | None = None
+
+
+def _shared_owner_rows(sp: SeqShard, moe, inp: FfnInput, out: torch.Tensor, side: bool):
+    """Owner-local shared expert: the full shared MLP of this rank's own rows,
+    added to those rows of the TP partial ``out`` (the reduce-scatter sums the
+    other ranks' routed partials into it). Returns a callback that waits for and
+    adds the result when ``side`` ran it on a side stream next to the routed chain."""
+    start = sp.rank * sp.rows
+    n = min(sp.rows, max(0, sp.num_tokens - start))
+    if n == 0:
+        return lambda: None
+    codes, scales = inp.local
+    if not side:
+
+        def serial():
+            out[start : start + n] += moe.shared_full(codes[:n], scales[:n])
+
+        return serial
+    cur = torch.cuda.current_stream()
+    global _side_stream
+    if _side_stream is None:
+        _side_stream = torch.cuda.Stream()
+    ready = torch.cuda.Event()
+    ready.record(cur)
+    done = torch.cuda.Event()
+    with torch.cuda.stream(_side_stream):
+        _side_stream.wait_event(ready)
+        shared = moe.shared_full(codes[:n], scales[:n])
+        codes.record_stream(_side_stream)
+        scales.record_stream(_side_stream)
+        done.record(_side_stream)
+
+    def finish():
+        cur.wait_event(done)
+        shared.record_stream(cur)
+        out[start : start + n] += shared
+
+    return finish
 
 
 def _post_attention_phase(sp: SeqShard, layer, attn_output, residual):
@@ -409,7 +556,8 @@ def _post_attention_phase(sp: SeqShard, layer, attn_output, residual):
     dev = residual.device
     moe = layer.block_sparse_moe if layer.is_moe_layer else None
     chain = moe is not None and layer._sp_flydsl_moe
-    need_fp8 = moe is None or (chain and moe.shared_experts is not None)
+    local = _shared_local(moe, chain)
+    need_fp8 = moe is None or (chain and moe.shared_experts is not None and not local)
     need_rows = (moe is not None and not chain) or (chain and envs.ATOM_M3_SP_MOE_CHECK)
     inp = FfnInput()
     if need_fp8:
@@ -439,6 +587,8 @@ def _post_attention_phase(sp: SeqShard, layer, attn_output, residual):
         if need_fp8:
             outs += [inp.codes, inp.scales]
             ins += list(_quant(x))
+        elif local:
+            inp.local = _quant(x)
         if need_rows:
             outs.append(inp.rows)
             ins.append(x)
@@ -491,11 +641,19 @@ def _moe_chain(sp: SeqShard, moe, inp: FfnInput) -> torch.Tensor:
             if n <= sp.padded and n != t:
                 chain(n, None)
     out = torch.empty((sp.padded, w2.shape[1]), dtype=torch.bfloat16, device=q.device)
+    finish = None
+    if inp.local is not None:
+        # launched first: it overlaps the routed chain on a side stream
+        finish = _shared_owner_rows(
+            sp, moe, inp, out, envs.ATOM_M3_SP_SHARED_LOCAL_SIDE
+        )
     chain(t, out[:t])
     out[t:].zero_()
     if scale != 1.0:
         out[:t] *= scale
-    if moe.shared_experts is not None:
+    if finish is not None:
+        finish()
+    elif moe.shared_experts is not None:
         out[:t] += moe.shared_experts(inp.codes[:t], x_scale=inp.scales[:t])
     return out
 
