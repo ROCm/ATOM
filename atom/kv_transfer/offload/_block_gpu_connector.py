@@ -29,6 +29,7 @@ from atom.kv_transfer.offload.atom_lmcache_staging import (
     _StagingBuffer,
     _ThreadTransferState,
     memory_object_as_uint8,
+    memory_object_bytes,
     run_staged_pipeline,
 )
 from atom.utils import envs
@@ -46,6 +47,9 @@ logger = logging.getLogger("atom")
 # exist. Correctness is unaffected -- one stream is strictly more ordered than
 # two, and the terminal synchronize is unchanged.
 _SINGLE_STREAM = envs.OFFLOAD_SINGLE_STREAM
+# One host call per staging group instead of several per LMCache chunk (see
+# `_copy_group`): every tensor op hands the GIL to the forward thread.
+_BATCHED_HOST_COPY = envs.OFFLOAD_BATCHED_HOST_COPY
 
 # The default staging buffer is denominated in bytes, not in LMCache chunks --
 # see `_default_staging_buffer_chunks` for why. 48 MiB: on GLM-5.2, whose chunk
@@ -604,7 +608,11 @@ class BlockGPUConnector:
                     start=int(start),
                     end=int(end),
                     block_ids=block_ids,
-                    tensor=memory_object_as_uint8(memory_obj, nbytes),
+                    tensor=(
+                        memory_object_bytes(memory_obj, nbytes)
+                        if _BATCHED_HOST_COPY
+                        else memory_object_as_uint8(memory_obj, nbytes)
+                    ),
                     nbytes=nbytes,
                 )
             )
@@ -727,6 +735,55 @@ class BlockGPUConnector:
             stats[name] += 1
         return non_blocking
 
+    def _copy_group(
+        self,
+        group: _TransferGroup,
+        staging: torch.Tensor,
+        *,
+        to_staging: bool,
+        prepared_ids_active: bool,
+    ) -> None:
+        """Copy a whole staging group between its chunks and ``staging`` at once.
+
+        The per-chunk loops below make about three tensor calls per chunk, and
+        each releases the GIL and takes it back, so the forward thread is
+        handed the GIL about three times per chunk: 2343 chunks for a 300K
+        load at chunk 128. Here one ``split`` and one ``_foreach_copy_`` per
+        group. The copy policy is the per-chunk one, applied to the group: non
+        blocking only if every chunk's copy would be. Physical pinning is asked
+        once per backing allocation rather than once per chunk.
+        """
+        hosts = [chunk.tensor for chunk in group.chunks]
+        non_blocking = True
+        pinned: dict[int, bool] = {}
+        for host in hosts:
+            if host.device.type != "cpu":
+                continue
+            if staging.device.type != "cuda" or not prepared_ids_active:
+                non_blocking = False
+                break
+            allocation = host.untyped_storage().data_ptr()
+            if allocation not in pinned:
+                pinned[allocation] = bool(host.is_pinned())
+            if not pinned[allocation]:
+                non_blocking = False
+                break
+        stats = getattr(self._tls, "active_transfer_stats", None)
+        if stats is not None:
+            if non_blocking:
+                stats["async_host_copy_enabled"] = 1
+            name = (
+                "async_host_copy_chunks"
+                if non_blocking
+                else "blocking_host_copy_chunks"
+            )
+            stats[name] += len(hosts)
+        views = list(staging.split([chunk.nbytes for chunk in group.chunks]))
+        if to_staging:
+            torch._foreach_copy_(views, hosts, non_blocking=non_blocking)
+        else:
+            torch._foreach_copy_(hosts, views, non_blocking=non_blocking)
+
     def _slice_to_memory_objs(
         self,
         group: _TransferGroup,
@@ -734,6 +791,14 @@ class BlockGPUConnector:
         *,
         prepared_ids_active: bool = False,
     ) -> None:
+        if _BATCHED_HOST_COPY:
+            self._copy_group(
+                group,
+                src_buf,
+                to_staging=False,
+                prepared_ids_active=prepared_ids_active,
+            )
+            return
         offset = 0
         for chunk in group.chunks:
             chunk.tensor.copy_(
@@ -753,6 +818,14 @@ class BlockGPUConnector:
         *,
         prepared_ids_active: bool = False,
     ) -> None:
+        if _BATCHED_HOST_COPY:
+            self._copy_group(
+                group,
+                dst_buf,
+                to_staging=True,
+                prepared_ids_active=prepared_ids_active,
+            )
+            return
         offset = 0
         for chunk in group.chunks:
             dst_buf[offset : offset + chunk.nbytes].copy_(

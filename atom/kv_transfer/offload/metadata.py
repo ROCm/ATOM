@@ -165,6 +165,19 @@ class PrehashedSave:
     must_store_all: bool = False
 
 
+@dataclass(frozen=True)
+class PrehashedLoad:
+    """A load named by its LMCache chunk hashes instead of its token prefix.
+
+    ``hashes[i]`` is the chained hash of the chunk covering tokens
+    ``[start + i * chunk, start + (i + 1) * chunk)`` (``ATOM_OFFLOAD_PREHASHED_LOAD``);
+    ``start`` is the load's chunk-aligned HBM frontier.
+    """
+
+    start: int
+    hashes: tuple[int, ...]
+
+
 @dataclass
 class LMCacheReqMeta:
     """Everything the worker needs to load/save one request's KV this step."""
@@ -205,6 +218,8 @@ class LMCacheReqMeta:
     # Set instead of `token_ids` under ATOM_OFFLOAD_PREHASHED_SAVE: the save's
     # new chunks as LMCache chunk hashes (see `PrehashedSave`).
     prehashed_save: PrehashedSave | None = None
+    # Set instead of `token_ids` under ATOM_OFFLOAD_PREHASHED_LOAD.
+    prehashed_load: PrehashedLoad | None = None
 
 
 class LMCacheOffloadMetadata(ConnectorMetadata):
