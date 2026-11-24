@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import threading
 from enum import Enum
-from typing import Optional
+from typing import Any
 
 import msgspec
 
@@ -59,7 +59,7 @@ class MoRIIOAgentMetadata(
 
     engine_id: str
     agent_metadata: bytes
-    kv_caches_base_addr: Optional[list[int]] = None
+    kv_caches_base_addr: list[int] | None = None
     num_blocks: int = 0
     block_len: int = 0
     attn_backend_name: str = "aiter"
@@ -71,6 +71,11 @@ class MoRIIOAgentMetadata(
     # Region-mode layout (JSON list of [name, kind, unit_bytes, total_bytes,
     # reverse_indexed, chunk_bytes]), or None for per-layer registration.
     region_layout: str | None = None
+    # PAGE layout (``moriio_backend`` ``fabric``): the packed descriptor of the
+    # one buffer holding every PAGE region, and per region, in publication
+    # order, ``[offset in that buffer, bytes per block, semantic role]``.
+    page_desc: bytes | None = None
+    page_regions: list[list[Any]] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +125,7 @@ class _RoleManager:
     instead of accessing this class directly.
     """
 
-    _instance: Optional[_RoleManager] = None
+    _instance: _RoleManager | None = None
     _lock = threading.Lock()
 
     def __init__(self) -> None:

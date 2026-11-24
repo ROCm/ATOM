@@ -845,6 +845,9 @@ class ModelRunner:
     # past the target's launch (`prepare_model`).
     verify_head: VerifyHead | None = None
     spec_status_deferred = False
+    # ATOM_MORIIO_DIAG_POST_READY and ATOM_DRAFT_SLOT_CHECK, set in __init__.
+    _diag_post_ready: ClassVar[bool] = False
+    _draft_slot_check: Any = None
 
     def __init__(self, rank: int, config: Config):
         self.config = config
@@ -939,6 +942,17 @@ class ModelRunner:
         self.num_spec_tokens = (
             self.config.speculative_config.num_speculative_tokens if use_spec else 0
         )
+        self._diag_post_ready = envs.ATOM_MORIIO_DIAG_POST_READY
+        if use_spec and envs.ATOM_DRAFT_SLOT_CHECK:
+            from atom.spec_decode.slot_check import DraftSlotCheck
+
+            def describe(blocks: list[int]) -> str:
+                describe_blocks = getattr(get_kvconnector(), "describe_blocks", None)
+                return describe_blocks(blocks) if callable(describe_blocks) else "-"
+
+            self._draft_slot_check = DraftSlotCheck(
+                self.block_size, self.device, describe
+            )
 
         self._pp_pending_send: list = []
         self.tokenID_processor = tokenIDProcessor(
@@ -2297,7 +2311,19 @@ class ModelRunner:
                 )
         offsets, total = plan_regions(sizes)
         if buf is None:
-            buf = torch.zeros(total, dtype=torch.uint8, device=self.device)
+            # A connector whose peer maps this rank's KV pool allocates it in
+            # exportable memory, outside the torch allocator.
+            shared = (
+                KVConnectorFactory.allocate_kv_pool(self.config, total, self.device)
+                if self.config.kv_transfer_config
+                else None
+            )
+            self._kv_pool_outside_torch_bytes = 0 if shared is None else total
+            buf = (
+                shared
+                if shared is not None
+                else torch.zeros(total, dtype=torch.uint8, device=self.device)
+            )
         elif buf.numel() < total:
             raise ValueError(
                 f"the imported paged pool holds {buf.numel()} B but this side's "
@@ -2443,7 +2469,9 @@ class ModelRunner:
         # check must mirror that — otherwise it spuriously fires for any
         # backend that declares a per-request state pool (V4, GDN).
         post_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        actual_kv_bytes = post_alloc - pre_alloc
+        actual_kv_bytes = (
+            post_alloc - pre_alloc + getattr(self, "_kv_pool_outside_torch_bytes", 0)
+        )
         # Each sub-pool contributes `entry_bytes × entries`. The counts come
         # straight from the sizing plan — which already absorbed the pipeline-
         # parallel reconciliation — so this mirrors the budget by construction
@@ -3776,6 +3804,12 @@ class ModelRunner:
         # race the dummy's still-pending H2D copies.
         self._advance_forward_vars()
         self._gate_staging_reuse()
+        if self._diag_post_ready:
+            note = getattr(get_kvconnector(), "note_forward", None)
+            if callable(note):
+                note(batch, self.block_size, self.num_spec_tokens)
+        if self._draft_slot_check is not None:
+            self._draft_slot_check.begin_forward(batch)
         (
             input_ids,
             temperatures,

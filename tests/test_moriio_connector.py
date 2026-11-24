@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import ast
 import os
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -557,6 +559,20 @@ class ConnectorBehaviourTest(unittest.TestCase):
         self.assertIn("the producer sent no state digest", logs.output[0])
 
 
+class FakeEvent:
+    """Stands in for torch.cuda.Event; ``done`` is flipped by the test."""
+
+    def __init__(self, done: bool = False):
+        self.done = done
+        self.recorded = False
+
+    def record(self, stream=None):
+        self.recorded = True
+
+    def query(self):
+        return self.done
+
+
 class FakeStatus:
     """Stands in for mori's TransferStatus; ``state`` is flipped by the test."""
 
@@ -574,20 +590,6 @@ class FakeStatus:
 
     def Code(self):
         return self.state
-
-
-class FakeEvent:
-    """Stands in for torch.cuda.Event; ``done`` is flipped by the test."""
-
-    def __init__(self, done: bool = False):
-        self.done = done
-        self.recorded = False
-
-    def record(self):
-        self.recorded = True
-
-    def query(self):
-        return self.done
 
 
 class WritePathTest(unittest.TestCase):
@@ -652,6 +654,8 @@ class WritePathTest(unittest.TestCase):
             for name in names
         }
         conn._write_requests = queue.Queue()
+        conn._write_wakeup = threading.Event()
+        conn._write_service_stop = threading.Event()
         conn._pending_writes = []
         conn._write_handshakes = {}
         conn._sending_writes = {}
@@ -678,6 +682,16 @@ class WritePathTest(unittest.TestCase):
         conn._done_sending_lock = threading.Lock()
         conn._write_ids = {}
         conn._finished_writes = collections.deque()
+        # The prefill of the transfer push_request asks for has finished.
+        prefilled = FakeEvent()
+        prefilled.done = True
+        conn._kv_ready_events = {9: prefilled}
+        conn._kv_ready_batches = collections.deque()
+        conn._kv_ready_expired = {}
+        conn._kv_ready_lock = threading.Lock()
+        conn._diag_post_ready = False
+        conn._post_ready_forwards = {}
+        conn._gated_writes = collections.deque()
         conn._state_tensors = {}
         conn._num_state_slots = 0
         conn._built_state_sessions = {}
@@ -825,6 +839,7 @@ class WritePathTest(unittest.TestCase):
         conn.side_channel_port = 7401
         advertised = []
         conn._handshake_listener = lambda metadata, *_rest: advertised.append(metadata)
+        conn._start_write_service = lambda: None
         conn.register_kv_caches(kv_caches)
         conn._handshake_listener_thread.join(timeout=5)
         return advertised[0]
@@ -978,6 +993,227 @@ class WritePathTest(unittest.TestCase):
                 ]
             ),
         )
+
+    def wait_for(self, predicate, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while not predicate():
+            if time.monotonic() > deadline:
+                self.fail("timed out")
+            time.sleep(0.001)
+
+    def test_the_write_service_pushes_and_reports_without_an_engine_step(self):
+        conn = self.make(producer=True)
+        statuses = [FakeStatus()]
+        conn._write_target_ready = lambda request: True
+        conn._write_blocks = lambda request, engine_id: statuses
+        conn._start_write_service()
+        try:
+            conn._write_requests.put(self.push_request())
+            conn._write_wakeup.set()
+            self.wait_for(lambda: 9 in conn._sending_writes)
+            self.assertEqual(conn.sent, [])
+            statuses[0].state = "ok"
+            self.wait_for(lambda: conn.sent)
+            self.assertEqual(conn.done_sending, {9})
+            self.assertEqual(conn.sent[0][0][0], self.constants.WRITE_DONE)
+        finally:
+            conn._write_service_stop.set()
+            conn._write_wakeup.set()
+            conn._write_service_thread.join(timeout=5)
+        self.assertFalse(conn._write_service_thread.is_alive())
+
+    def test_a_push_waits_for_its_prefill_to_finish_on_the_gpu(self):
+        conn = self.make(producer=True)
+        statuses = [FakeStatus()]
+        conn._write_target_ready = lambda request: True
+        conn._write_blocks = lambda request, engine_id: statuses
+        event = FakeEvent()
+        conn._kv_ready_events[9] = event
+        conn._write_requests.put(self.push_request())
+
+        conn._service_write_requests()
+        self.assertEqual(conn._sending_writes, {})
+        self.assertEqual(len(conn._pending_writes), 1)
+
+        event.done = True
+        conn._service_write_requests()
+        self.assertIn(9, conn._sending_writes)
+        # Another consumer rank may still ask for this transfer.
+        self.assertIs(conn._kv_ready_events[9], event)
+
+    def test_a_push_waits_until_its_prefill_records_a_forward(self):
+        # The head rank returned the token, this rank's forward is not done.
+        conn = self.make(producer=True)
+        conn._kv_ready_events = {}
+        conn._write_target_ready = lambda request: True
+        conn._write_blocks = lambda request, engine_id: [FakeStatus()]
+        conn._write_requests.put(self.push_request())
+        conn._service_write_requests()
+        self.assertEqual(conn._sending_writes, {})
+        self.assertEqual(len(conn._pending_writes), 1)
+
+        with (
+            mock.patch("torch.cuda.Event", FakeEvent),
+            mock.patch("torch.cuda.current_stream", lambda: None),
+        ):
+            conn.record_kv_cache_ready([9])
+        conn._kv_ready_events[9].done = True
+        conn._service_write_requests()
+        self.assertIn(9, conn._sending_writes)
+
+    def test_a_push_whose_prefill_never_reports_fails_after_the_write_timeout(self):
+        conn = self.make(producer=True)
+        conn._kv_ready_events = {}
+        conn._write_target_ready = lambda request: True
+        conn._write_blocks = lambda request, engine_id: self.fail("pushed")
+        finished = []
+        conn._finish_write = lambda request, ok: finished.append(ok)
+        conn._pending_writes = [(self.push_request(), time.monotonic() - 601.0)]
+        with self.assertLogs("atom", "ERROR") as logs:
+            conn._service_write_requests()
+        self.assertEqual(finished, [False])
+        self.assertIn("no finished forward", logs.output[0])
+
+    def test_old_ready_events_expire_but_their_prefills_stay_finished(self):
+        conn = self.make(producer=True)
+        stale, kept = FakeEvent(), FakeEvent()
+        conn._kv_ready_events = {1: stale, 2: kept}
+        conn._kv_ready_batches.append((time.monotonic() - 1e6, stale, [1, 2]))
+        with (
+            mock.patch("torch.cuda.Event", FakeEvent),
+            mock.patch("torch.cuda.current_stream", lambda: None),
+        ):
+            conn.record_kv_cache_ready([2, 3])
+        self.assertNotIn(1, conn._kv_ready_events)
+        self.assertTrue(conn._source_ready(1))
+        # Re-recorded since, so the stale batch must not drop it.
+        self.assertIs(conn._kv_ready_events[2], conn._kv_ready_events[3])
+        self.assertNotIn(2, conn._kv_ready_expired)
+        self.assertFalse(conn._source_ready(2))
+
+    def post_ready_batch(self):
+        import types
+
+        # Transfer 9 decodes 4 tokens ending at position 6 with k = 3, so the
+        # draft writes through position 8: block indices 1..4 of a 3-block
+        # table. Transfer 3 has recorded no KV-ready event.
+        return types.SimpleNamespace(
+            req_ids=[3, 9],
+            num_scheduled_tokens=[5, 4],
+            context_lens=[5, 7],
+            num_rejected=[0, 1],
+            block_tables=[[1, 2, 3], [4, 5, 6]],
+            total_seqs_num_prefill=1,
+            is_dummy_run=False,
+        )
+
+    def test_the_diagnostic_logs_a_forward_after_the_kv_ready_event(self):
+        conn = self.make(producer=True)
+        conn._diag_post_ready = True
+        started = time.monotonic()
+        conn._write_ids = {9: None}
+        conn._sending_writes = {
+            9: (
+                [],
+                {
+                    "transfer_id": 9,
+                    "src_block_ids": [4, 5],
+                    "_page_stats": (started, 16, 2, 2),
+                },
+            )
+        }
+        with self.assertLogs("atom", "WARNING") as logs:
+            conn.note_forward(self.post_ready_batch(), 2, 3)
+        self.assertEqual(len(logs.output), 1)
+        line = logs.output[0]
+        self.assertIn("transfer 9: forward after its KV-ready event", line)
+        self.assertIn("positions 3..6, draft through 8, num_rejected 1", line)
+        self.assertIn("writes blocks [5, 6]", line)
+        self.assertIn("push in flight for", line)
+        self.assertIn("its 2 source blocks include [5]", line)
+        self.assertEqual(list(conn._post_ready_forwards), [9])
+
+    def test_the_diagnostic_is_silent_when_off(self):
+        conn = self.make(producer=True)
+        with self.assertNoLogs("atom", "WARNING"):
+            conn.note_forward(self.post_ready_batch(), 2, 3)
+        self.assertEqual(conn._post_ready_forwards, {})
+
+    def test_blocks_are_described_by_the_transfer_holding_them(self):
+        import types
+
+        producer = self.make(producer=True)
+        producer._sending_writes = {
+            9: ([], {"transfer_id": 9, "src_block_ids": [4, 5]})
+        }
+        producer._pending_writes = [({"transfer_id": 3, "src_block_ids": [7]}, 0.0)]
+        self.assertEqual(
+            producer.describe_blocks([5, 7, 8]),
+            "source of transfer 9 (pushing): [5]; source of transfer 3 (queued): [7]",
+        )
+        self.assertEqual(
+            producer.describe_blocks([1]), "no transfer in flight holds them"
+        )
+        consumer = self.make(producer=False)
+        consumer._awaiting_write = {
+            "d1": (0.0, types.SimpleNamespace(local_block_ids=[2, 6]))
+        }
+        self.assertEqual(consumer.describe_blocks([6]), "target of req d1's push: [6]")
+
+    def test_a_fabric_batch_never_writes_a_block_twice(self):
+        conn = self.make(producer=True)
+        conn._page_regions = [(0, 16, "k"), (1000, 4, "k_scale")]
+        remote = [(64, 16), (5000, 4)]
+        l_offs, r_offs, sizes = conn._page_batch(
+            [2, 3, 7], [3, 4, 0], remote, into_remote=True
+        )
+        self.assertEqual(l_offs, [32, 112, 1008, 1028])
+        self.assertEqual(r_offs, [112, 64, 5012, 5000])
+        self.assertEqual(sizes, [32, 16, 8, 4])
+        with self.assertRaisesRegex(ValueError, r"remote blocks \[4\] appear more"):
+            conn._page_batch([2, 3, 7], [4, 5, 4], remote, into_remote=True)
+        # A read writes the local blocks; a source read twice is allowed.
+        conn._page_batch([2, 3, 7], [4, 5, 4], remote, into_remote=False)
+        with self.assertRaisesRegex(ValueError, r"local blocks \[2\] appear more"):
+            conn._page_batch([2, 3, 2], [4, 5, 6], remote, into_remote=False)
+
+    def test_a_changed_source_reports_the_forwards_after_the_kv_ready_event(self):
+        conn = self.make(producer=True)
+        started = time.monotonic()
+        request = {"transfer_id": 9, "_page_stats": (started, 16, 2, 2)}
+        self.assertEqual(conn._post_ready_summary(request), "")
+        conn._diag_post_ready = True
+        self.assertIn("no forward ran it", conn._post_ready_summary(request))
+        conn._post_ready_forwards[9] = [started + 0.002]
+        self.assertIn(
+            "1 forward(s) ran it after its KV-ready event on this rank, at +2.00 ms",
+            conn._post_ready_summary(request),
+        )
+
+    def test_the_consumer_asks_for_a_push_once_earlier_forwards_finished(self):
+        conn = self.make(producer=False)
+        asked = []
+        conn._request_write = lambda req_id, meta: asked.append(req_id)
+        first, second = FakeEvent(), FakeEvent()
+        conn._gated_writes.append((first, [("d1", None), ("d2", None)]))
+        conn._gated_writes.append((second, [("d3", None)]))
+
+        conn._request_gated_writes()
+        self.assertEqual(asked, [])
+        second.done = True
+        conn._request_gated_writes()
+        # In order: a later step's requests wait behind an earlier step's.
+        self.assertEqual(asked, [])
+        first.done = True
+        conn._request_gated_writes()
+        self.assertEqual(asked, ["d1", "d2", "d3"])
+        self.assertFalse(conn._gated_writes)
+
+    def test_get_finished_leaves_pushes_to_the_write_service(self):
+        conn = self.make(producer=True)
+        conn._write_service_thread = threading.current_thread()
+        conn._service_write_requests = lambda: self.fail("served from the step")
+        conn.get_finished()
 
     def test_the_producer_refuses_a_short_source(self):
         conn = self.make(producer=True)
