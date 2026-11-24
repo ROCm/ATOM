@@ -215,13 +215,16 @@ def _flydsl_attention(
     (row, kv head), planned and scratch-cached like the FP8 sparse path's.
 
     ``quantized_output`` / ``output_scale``: o_proj's FP8 input, written by the
-    attention's epilogue instead of the BF16 output (one kv head a rank; rows
-    past q's are a padded token bucket's, written inert). FP32 ``[rows, 1]``
-    per-token descales are split as ``sparse_attn.sparse_pa_per_row`` splits the
-    FP8 path's: prefill rows (``quantized_direct``) one task a row, decode rows
-    a cluster of eight. E8M0 ``[rows, heads * D // 32]`` MXFP8 scales keep the
-    BF16 output's split: aiter writes them in every output mode, bit for bit the
-    BF16 output quantized as o_proj's ``quantize_fp8`` would."""
+    attention's epilogue instead of the BF16 output (rows past q's are a padded
+    token bucket's, written inert). FP32 ``[rows, 1]`` per-token descales (one
+    kv head a rank: a token's scale spans every head) are split as
+    ``sparse_attn.sparse_pa_per_row`` splits the FP8 path's: prefill rows
+    (``quantized_direct``) one task a row, decode rows a cluster of eight. E8M0
+    ``[rows, heads * D // 32]`` MXFP8 scales keep the BF16 output's split: aiter
+    writes them in every output mode, bit for bit the BF16 output quantized as
+    o_proj's ``quantize_fp8`` would. A group of 32 never spans two heads, so
+    with several kv heads the (row, kv head) sequences write the row-major
+    values and scales through ``[rows * Hkv, group * D // 32]`` views."""
     from aiter.ops.flydsl.pa_decode import pa_decode
     from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 
@@ -237,14 +240,21 @@ def _flydsl_attention(
     seqs = rows * num_kv_heads
     output = torch.empty_like(q)
     quant_args = {}
+    mxfp8 = quantized_output is not None and output_scale.dtype != torch.float32
     if quantized_output is not None:
-        assert num_kv_heads == 1, "per-token o_proj quantization needs one kv head"
+        assert (
+            mxfp8 or num_kv_heads == 1
+        ), "per-token o_proj quantization needs one kv head"
         quantized_view = quantized_output.view(-1, group, head_dim)
-        pad_rows = quantized_view.shape[0] - seqs
-        assert pad_rows >= 0 and output_scale.shape[0] == quantized_view.shape[0]
+        quant_seqs = quantized_view.shape[0]
+        pad_rows = quant_seqs - seqs
+        assert pad_rows >= 0 and output_scale.shape[0] * num_kv_heads == quant_seqs
         quant_args = {
             "quantized_output": quantized_view,
-            "output_scale": output_scale,
+            # A sequence's slice of its row's scales (MXFP8).
+            "output_scale": (
+                output_scale.view(quant_seqs, -1) if mxfp8 else output_scale
+            ),
             # Nothing reads the BF16 output.
             "store_output": False,
             "quantized_pad_rows": pad_rows,
@@ -269,8 +279,9 @@ def _flydsl_attention(
     if (
         quantized_direct
         # The BF16 output, or o_proj's MXFP8 input (E8M0 scales); the per-token
-        # FP32 FP8 output keeps the paged decode.
-        and (quantized_output is None or output_scale.dtype != torch.float32)
+        # FP32 FP8 output keeps the paged decode. The image's aiter pads the
+        # MXFP8 bucket for one kv head only (lifted by aiter m31-pa-mh-aiter).
+        and (quantized_output is None or (mxfp8 and num_kv_heads == 1))
         and envs.ATOM_M3_SPARSE_PREFILL_REUSE
         and rows >= envs.ATOM_M3_SPARSE_PREFILL_REUSE_MIN_ROWS
     ):
@@ -283,7 +294,7 @@ def _flydsl_attention(
             if quantized_output is not None:
                 mx_args = {
                     "quantized_output": quant_args["quantized_output"],
-                    "output_scale": output_scale,
+                    "output_scale": quant_args["output_scale"],
                     "quantized_pad_rows": quant_args["quantized_pad_rows"],
                 }
             reuse[0](
