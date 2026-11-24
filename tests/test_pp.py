@@ -6,7 +6,7 @@ import os
 import sys
 import tempfile
 import types
-from collections import deque
+from collections import deque, namedtuple
 from dataclasses import dataclass
 from unittest.mock import MagicMock
 
@@ -1311,3 +1311,87 @@ def test_hold_is_released_even_if_hashing_raises():
     with pytest.raises(RuntimeError, match="boom"):
         sched.register_prefill_hashes(batch, by_id.values())
     assert not sched._checkpoint_holds
+
+
+_TensorMetadata = namedtuple("_TensorMetadata", ["device", "dtype", "size"])
+
+
+def test_async_sends_pair_with_receives_over_a_pp4_prefill(monkeypatch):
+    """Replay M3.1 PP4's chunk heights (the 20352-token budget, two-request
+    batches, a short prefill) through every stage's async send and an
+    aiter-style receive: each stage receives exactly what its predecessor
+    posted, relayed aux columns included, and every payload stays referenced
+    until it is committed."""
+    import pickle
+
+    def split(tensor_dict):
+        meta, tensors = [], []
+        for key, value in tensor_dict.items():
+            meta.append(
+                (key, _TensorMetadata(value.device.type, value.dtype, value.size()))
+            )
+            tensors.append(value)
+        return meta, tensors
+
+    pp_size, hidden = 4, 8
+    aux_cols = [1, 3, 4]  # taps [3], [3, 17, 31], [3, 17, 31, 45] sent onward
+    links = {s: deque() for s in range(1, pp_size)}  # dst -> posted buffers
+    stage = {"rank": 0}
+
+    def isend(buf, dst, group):
+        assert dst == stage["rank"] + 1
+        links[dst].append(buf)
+        return MagicMock()
+
+    def recv(rank):
+        link = links[rank]
+        (size,) = link.popleft().tolist()
+        raw = link.popleft()
+        assert raw.numel() == size
+        out = {}
+        for key, md in pickle.loads(raw.numpy().tobytes()):
+            if md.size.numel() == 0:
+                out[key] = torch.empty(md.size, dtype=md.dtype)
+                continue
+            buf = link.popleft()
+            assert (buf.dtype, buf.shape) == (md.dtype, md.size), key
+            out[key] = buf
+        return out
+
+    monkeypatch.setattr(pp_comm, "_split_tensor_dict", split)
+    monkeypatch.setattr(pp_comm.torch.distributed, "isend", isend)
+    monkeypatch.setattr(pp_comm.envs, "ATOM_PP_SEND_ALLGATHER", False)
+    tp = MagicMock()
+    tp.world_size = 1
+    monkeypatch.setattr(pp_comm, "get_tp_group", lambda: tp)
+
+    heights = [205, 303, 300] + [20352] * 6 + [20272, 20352, 20327, 20352, 1200]
+    pending = {s: [] for s in range(pp_size - 1)}
+    for step, rows in enumerate(heights):
+        for s in range(pp_size):
+            grp = MagicMock(rank_in_group=s, world_size=pp_size)
+            grp.ranks = list(range(pp_size))
+            monkeypatch.setattr(pp_comm, "get_pp_group", lambda grp=grp: grp)
+            stage["rank"] = s
+            if s:
+                got = recv(s)
+                assert got["hidden_states"].shape == (rows, hidden)
+                assert got["residual"].shape == (rows, hidden)
+                assert got[pp_comm.PP_AUX_KEY].shape == (rows, aux_cols[s - 1] * hidden)
+                assert not links[s], "a stage received less than was posted"
+            if s == pp_size - 1:
+                continue
+            out = IntermediateTensors(
+                {
+                    "hidden_states": torch.full((rows, hidden), float(step)),
+                    "residual": torch.zeros(rows, hidden),
+                    pp_comm.PP_AUX_KEY: torch.ones(rows, aux_cols[s] * hidden),
+                }
+            )
+            # The previous step's payload is still held when it is committed.
+            assert all(w.payload is not None for w in pending[s])
+            pp_comm.commit_pp_send_work(pending[s])
+            pending[s] = pp_comm.async_send_intermediate_tensors(
+                out, owned=(pp_comm.PP_AUX_KEY,)
+            )
+    assert not any(links.values())
