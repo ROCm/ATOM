@@ -262,6 +262,9 @@ def test_scratch_bytes_reads_the_code_objects_private_segment(
     if reader == "metadata":
         launcher = request.getfixturevalue("compiled_launcher")(value)
     else:
+        # The current pre-checks unit-tests job does not install FlyDSL, so
+        # these Binary/Fatbin parameters skip in CI. They are exercised by
+        # manual runs in a FlyDSL-enabled environment, not a CI parser gate.
         pytest.importorskip("flydsl")
         launcher = _CompiledLauncher(value, object_format=reader)
         from atom.mono.runtime.compile import _code_object
@@ -273,6 +276,8 @@ def test_scratch_bytes_reads_the_code_objects_private_segment(
 
 @pytest.mark.parametrize("object_format", ["bin", "fatbin"])
 def test_code_object_reads_first_binary_and_first_object(object_format):
+    # Like the real-parser parameters above, this runs manually with FlyDSL;
+    # the current pre-checks unit-tests job skips it rather than guarding it.
     pytest.importorskip("flydsl")
     from atom.mono.runtime.compile import _code_object
 
