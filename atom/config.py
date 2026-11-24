@@ -2236,6 +2236,35 @@ def _hf_architecture_factor(hf_config) -> tuple:
     return (_hf_config_fields(hf_config), _hf_config_fields(text_config))
 
 
+def _pp_stage_factor(config) -> tuple[int, int, int, int] | None:
+    """``(pp_size, pp_rank, start_layer, end_layer)`` of this PP stage, or
+    None without pipeline parallelism, so those keys stay as they were.
+
+    A stage traces only its own slice of the model: ``make_layers`` builds
+    layers ``[start_layer, end_layer)`` from ``get_pp_indices``, which follows
+    ``VLLM_PP_LAYER_PARTITION``, and only the first stage embeds and only the
+    last applies the final norm. Every stage otherwise shares one key (only
+    the ``rank_<device>`` directory below it differs), so a new split or
+    pp_size reloads what the same device compiled for its old slice: a stage
+    moved from 11 to 13 layers failed its warmup inside the cached artifact
+    with ``too many values to unpack (expected 6)``.
+    """
+    pp_size = getattr(config, "pipeline_parallel_size", 1)
+    if pp_size <= 1:
+        return None
+    from atom.models.utils import get_pp_indices
+
+    pp_rank = config.parallel_config.pipeline_parallel_rank
+    # The layer count the model splits: its text config, which is the config
+    # itself once get_hf_config has flattened a multimodal checkpoint.
+    hf_config = config.hf_config
+    text_config = getattr(hf_config, "text_config", None) or hf_config
+    start_layer, end_layer = get_pp_indices(
+        text_config.num_hidden_layers, pp_rank, pp_size
+    )
+    return pp_size, pp_rank, start_layer, end_layer
+
+
 def _resolve_mono_poll_sleep_units(kv_copies: bool) -> None:
     """The Mono mailbox retry spacing of this deployment, fixed before this
     process or the workers it spawns import ``atom.mono.polling`` (which reads
@@ -3770,6 +3799,10 @@ class Config:
         if self.sequence_parallel_size > 1:
             # SP and PCP use the same rank dimension but different head shapes.
             factors.append(("sp", self.sequence_parallel_size))
+        # Each PP stage compiles only the layers it serves (_pp_stage_factor).
+        pp_stage = _pp_stage_factor(self)
+        if pp_stage is not None:
+            factors.append(("pp", *pp_stage))
         # MiniMax-M3 indexer-only CP changes the FUSED QKV OUTPUT WIDTH: index_q
         # is this rank's one head under TP and all `sparse_num_index_heads` of
         # them under CP (minimax_m3/model.py, linear.py), so the traced graph and the
