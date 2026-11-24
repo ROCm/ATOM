@@ -22,11 +22,12 @@ N, K = 64, 32
 class _Ring(types.SimpleNamespace):
     MAX_ROWS = 128
 
-    def __init__(self, supported=True):
-        super().__init__(calls=[], warmed=[], supported=supported)
+    def __init__(self, supported=True, rows=None):
+        # rows: the row counts the kernel's tiling takes (None: all of them)
+        super().__init__(calls=[], warmed=[], supported=supported, rows=rows)
 
     def ring_supported(self, m, n, k, device=None):
-        return self.supported
+        return self.supported and (self.rows is None or m in self.rows)
 
     def shuffle_weight_ring(self, w):
         return w.clone()
@@ -106,3 +107,20 @@ def test_no_ring_weight_unless_everything_fits(monkeypatch, enabled, ring, bias,
     assert head._ring_weight is None
     x = torch.randn(8, K).to(dtype)
     assert torch.equal(head.local_logits(x), x @ head.weight.T + 1.0)
+
+
+def test_rows_the_kernel_does_not_take_keep_tgemm(monkeypatch):
+    # aiter's tiling differs between 1..64 and 65..128 rows: a shard (N=64640,
+    # DeepSeek-V3's vocab at TP2) can be legal at 128 rows and not at 49..64.
+    # The head must ask per row count; calling the kernel there raises.
+    ring = _Ring(rows=set(range(1, 49)) | set(range(65, 129)))
+    head = _head(monkeypatch, ring)
+    head.process_weights_after_loading()
+    assert head._ring_weight is not None
+    for rows, ringed in ((48, True), (49, False), (64, False), (65, True)):
+        ring.calls.clear()
+        x = torch.randn(rows, K).bfloat16()
+        out = head.local_logits(x)
+        assert bool(ring.calls) == ringed, rows
+        want = x @ head.weight.T + (0.0 if ringed else 1.0)
+        assert torch.equal(out, want)

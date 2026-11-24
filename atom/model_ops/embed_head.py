@@ -2,6 +2,8 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 # Copyright (c) 2024-2025 ATOM Project Contributors
 
+import logging
+
 import torch
 import torch.nn.functional as F
 import triton
@@ -20,6 +22,8 @@ from atom.plugin import is_plugin_mode
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import ForwardContext, get_forward_context
+
+logger = logging.getLogger("atom")
 
 
 @triton.jit
@@ -337,21 +341,37 @@ class ParallelLMHead(VocabParallelEmbedding):
         """``ATOM_LM_HEAD_RING=1``: keep a tile-shuffled copy of this rank's
         bf16 shard for aiter's gfx950 small-M ring GEMM (``local_logits`` below
         takes it for the rows it covers; +1 weight shard of memory). Not an
-        in-place shuffle: the shard may be tied to the embedding table."""
+        in-place shuffle: the shard may be tied to the embedding table. The copy
+        is made once, here: an online weight update (RL sync) does not refresh
+        it."""
         self._ring_weight = None
+        self._ring_rows = frozenset()
         if not envs.ATOM_LM_HEAD_RING or self.bias is not None:
             return
         ring = _ring_module()
         w = self.weight.data
-        if (
-            ring is None
-            or w.dtype != torch.bfloat16
-            or w.dim() != 2
-            or not w.is_contiguous()
-            or not ring.ring_supported(ring.MAX_ROWS, *w.shape, w.device)
-        ):
+        if ring is None or w.dtype != torch.bfloat16 or w.dim() != 2:
+            logger.warning(
+                "ATOM_LM_HEAD_RING=1 ignored: no aiter ring GEMM or a non-bf16 head"
+            )
+            return
+        # Per row count, not only at the largest: the kernel's LDS ring depth
+        # differs between the 1..64 and 65..128 tilings, so a shard that fits at
+        # 128 rows (N=64640, DeepSeek-V3's vocab at TP2) can be illegal at 49..64.
+        rows = frozenset(
+            m
+            for m in range(1, ring.MAX_ROWS + 1)
+            if ring.ring_supported(m, *w.shape, w.device)
+        )
+        if not rows or not w.is_contiguous():
+            logger.warning(
+                "ATOM_LM_HEAD_RING=1 ignored: head shard %s not supported",
+                tuple(w.shape),
+            )
             return
         self._ring_weight = ring.shuffle_weight_ring(w)
+        self._ring_rows = rows
+        self._ring = ring
         # Compile every row tier now: a first call inside a CUDA-graph capture would bake the compile in.
         ring.warmup_ring(*w.shape, w.device, self._ring_weight)
 
@@ -366,9 +386,9 @@ class ParallelLMHead(VocabParallelEmbedding):
             and x.dtype == torch.bfloat16
             and x.is_contiguous()
             and x.data_ptr() % 16 == 0
-            and 0 < x.shape[0] <= _ring_module().MAX_ROWS
+            and x.shape[0] in self._ring_rows
         ):
-            return _ring_module().gemm_a16w16_ring(x, ring_weight)
+            return self._ring.gemm_a16w16_ring(x, ring_weight)
         return tgemm.mm(x, self.weight, self.bias, out=out)
 
     def argmax_of_logits(self, logits: torch.Tensor, *, out: torch.Tensor, draw=None):
