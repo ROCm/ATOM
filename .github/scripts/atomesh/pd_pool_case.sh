@@ -12,7 +12,6 @@ case "${case_name}" in
   pp4-dep4-perf) contract_file=single-node-pp4-dep4-performance.json; budget=120m ;;
   pp4-dep4-remap) contract_file=single-node-pp4-dep4-remap-performance.json; budget=120m ;;
   pp4-dep4-c80) contract_file=single-node-pp4-dep4-c80-performance.json; budget=120m ;;
-  tp4-c80) contract_file=single-node-tp4-c80-performance.json; budget=120m ;;
   *) exit 2 ;;
 esac
 export REPO_ROOT="${3:?checkout path}"

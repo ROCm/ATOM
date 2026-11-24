@@ -105,8 +105,8 @@
         "disable-uvicorn-access-log": true,
         "max-num-batched-tokens": 8192,
         "kv-transfer-config": "{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"kv_consumer\",\"kv_connector_extra_config\":{\"mooncake_protocol\":\"rdma\",\"num_workers\":10}}",
-        "max-num-seqs": 5,
-        "compilation-config": "{\"cudagraph_capture_sizes\":[8,16,24,32,40],\"max_cudagraph_capture_size\":40}",
+        "max-num-seqs": 20,
+        "compilation-config": "{\"cudagraph_capture_sizes\":[8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160],\"max_cudagraph_capture_size\":160}",
         "data-parallel-size": 4,
         "enable-expert-parallel": true,
         "all2all-backend": "allgather_reducescatter"
@@ -187,7 +187,7 @@
     "orchestration": "native srtctl SweepOrchestrator and DockerLauncher under an owned GPU-pool lease"
   },
   "functional_only": false,
-  "purpose": "One-node pp4-dep4 ATOMesh c80 full performance point paired on the same node with the other topology",
+  "purpose": "Single-node PP4 to DEP4 C80 full performance with decode max-num-seqs20 per rank; compare against existing SA TP C80 results without another TP GPU run",
   "layout": "single_node",
   "case_name": "pr5090-1p1d-pp4-dep4-c80-3600s",
   "router_build": {
@@ -226,9 +226,9 @@
     "engine_so_sha256": "540428ce937a5be29726195730246f053f88d3ddfabaa2af33ad79c7a92198a8"
   },
   "comparison_limits": [
-    "Pair both C80 topologies on the same actual node with independent leases and the same worker/router/srt/client versions.",
-    "PP4 versus TP4 requires the existing topology-specific worker flags; this is not an isolated router comparison.",
-    "Historical C40 values on other nodes are references, not a controlled same-node concurrency curve."
+    "Reuse the existing SA TP C80 result; no TP C80 experiment is authorized.",
+    "Record and disclose node/GPU-count, topology, software and workload differences from the SA result; no isolated router-gain claim.",
+    "C80 also changes decode max-num-seqs from 5 to 20 per DP rank and expands DSpark capture sizes to 160 tokens, as approved by the user."
   ],
   "prefill_device_order": [
     0,
@@ -238,8 +238,33 @@
   ],
   "concurrency_control": {
     "client_concurrency": 80,
-    "worker_max_num_seqs_unchanged": true,
-    "decode_max_num_seqs_per_rank": 5,
-    "note": "Only client concurrency increases for the PP4/DEP4 arm; keep D per-rank scheduler capacity at the existing value."
+    "decode_max_num_seqs_per_rank": 20,
+    "decode_dp_ranks": 4,
+    "decode_max_num_seqs_total": 80,
+    "num_speculative_tokens": 7,
+    "decode_cudagraph_capture_sizes": [
+      8,
+      16,
+      24,
+      32,
+      40,
+      48,
+      56,
+      64,
+      72,
+      80,
+      88,
+      96,
+      104,
+      112,
+      120,
+      128,
+      136,
+      144,
+      152,
+      160
+    ],
+    "decode_max_cudagraph_capture_size": 160,
+    "tp_c80_baseline": "Reuse existing SA submission result; do not run TP C80"
   }
 }
