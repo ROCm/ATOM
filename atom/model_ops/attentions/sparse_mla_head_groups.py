@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Independent head groups for small BF16 persistent sparse-prefill batches,
-and the work-plan helpers shared by every sparse-prefill planner."""
+and the work-plan granularity shared by the builder, the DCP rebuild and the
+sglang GLM-5.2 bridge."""
 
 import torch
 import triton
@@ -108,17 +109,18 @@ class SparsePrefillHeadGroups:
         q: torch.Tensor,
         output: torch.Tensor,
         kv_cache: torch.Tensor,
-        kv_granularity: int,
+        row_width: int,
     ) -> bool:
         """Whether this step's sparse-prefill call has the geometry above.
-        `kv_granularity` (the layer's row width) bounds each row's region."""
+        `row_width` (the layer's top-k output row width, `topk_out_width`)
+        bounds each row's region."""
         return (
             0 < q.shape[0] <= MAX_HEAD_GROUP_ROWS
             and q.dtype == kv_cache.dtype == torch.bfloat16
             and q.shape[1:] == (HEADS, Q_DIM)
             and output.shape[1:] == (HEADS, KV_LORA_RANK)
             and q.is_contiguous()
-            and kv_granularity == REGION
+            and row_width == REGION
         )
 
     def prepare(self, q, output, indptr, indices):

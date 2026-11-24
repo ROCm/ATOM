@@ -40,6 +40,7 @@ needs_atom_mla = pytest.mark.skipif(
 KV_LORA_RANK = 8
 QK_ROPE_HEAD_DIM = 4
 ENTRY = KV_LORA_RANK + QK_ROPE_HEAD_DIM
+# BF16 with 16 < heads < 128: the shape main's asm path padded to 128 heads.
 NUM_HEADS = 32
 
 
@@ -58,7 +59,7 @@ def _attn():
     self.num_heads = NUM_HEADS
     self.kv_lora_rank = KV_LORA_RANK
     self.qk_rope_head_dim = QK_ROPE_HEAD_DIM
-    self.dtype = torch.float32
+    self.dtype = torch.bfloat16
     self.kv_cache_dtype = "bf16"
     self.scale = 1.0
     self.sparse_prefill_head_groups = None
@@ -123,8 +124,8 @@ def test_sparse_prefill_does_not_read_the_dense_last_page_lens(monkeypatch):
         },
     )
 
-    q = torch.zeros(n_tokens, NUM_HEADS, ENTRY)
-    kv = torch.zeros(64 * 4, ENTRY)
+    q = torch.zeros(n_tokens, NUM_HEADS, ENTRY, dtype=torch.bfloat16)
+    kv = torch.zeros(64 * 4, ENTRY, dtype=torch.bfloat16)
     out = attn._forward_prefill_mla(q, kv, md)
 
     assert out.shape == (n_tokens, NUM_HEADS, KV_LORA_RANK)
