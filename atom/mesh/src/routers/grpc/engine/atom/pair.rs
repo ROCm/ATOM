@@ -4,7 +4,7 @@
 //! ATOM's own P/D flow over `atom.grpc.v1`: `AtomAdapter` fills a JSON view of the
 //! request fields it reads and writes, which each GenerateRequest then takes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::task::{Context, Poll};
@@ -43,8 +43,8 @@ pub(crate) struct AtomPairs {
     pub(super) info: RwLock<Arc<AtomPrefillInfo>>,
     /// The worker each URL's info was read for, and each instance's (its base URL):
     /// a worker registered again at that URL is another, whose info is read afresh.
-    /// Taken after `info`, as a read publishes both.
-    pub(super) read_for: RwLock<HashMap<String, Weak<dyn Worker>>>,
+    /// Taken after `info`, as a read publishes both. Each with its instance's base URL.
+    pub(super) read_for: RwLock<HashMap<String, (Weak<dyn Worker>, String)>>,
     /// Per instance, held while its GetServerInfo is read, so concurrent first pairs of
     /// its ranks read it once; it keeps a failed read's error, and when.
     reading: Mutex<HashMap<String, Arc<tokio::sync::Mutex<Option<Failed>>>>>,
@@ -66,8 +66,9 @@ impl AtomPairs {
         let mut read_for = HashMap::new();
         for worker in workers.get_prefill_workers().iter().filter(|w| is_atom(w)) {
             learn(&mut info, worker).await.map_err(|e| e.to_string())?;
-            read_for.insert(worker.url().to_string(), Arc::downgrade(worker));
-            read_for.insert(base_url(worker), Arc::downgrade(worker));
+            let read = (Arc::downgrade(worker), base_url(worker));
+            read_for.insert(worker.url().to_string(), read.clone());
+            read_for.insert(base_url(worker), read);
         }
         Ok(Self {
             info: RwLock::new(Arc::new(info)),
@@ -93,7 +94,9 @@ impl AtomPairs {
         let cached = || {
             let info = self.info.read().unwrap();
             let read_for = self.read_for.read().unwrap();
-            let read = read_for.get(url).is_some_and(|known| known.ptr_eq(&this));
+            let read = read_for
+                .get(url)
+                .is_some_and(|(known, _)| known.ptr_eq(&this));
             read.then(|| AtomAdapter::new(info.clone()))
         };
         if let Some(adapter) = cached() {
@@ -152,7 +155,7 @@ impl AtomPairs {
         let sibling = {
             let read_for = self.read_for.read().unwrap();
             let replaced = read_for.contains_key(url);
-            let sibling = read_for.get(&base).and_then(Weak::upgrade);
+            let sibling = read_for.get(&base).and_then(|(w, _)| w.upgrade());
             sibling.filter(|_| !replaced)
         };
         let registered = |w: &Arc<dyn Worker>| {
@@ -176,13 +179,22 @@ impl AtomPairs {
         let mut info = self.info.write().unwrap();
         let mut merged = AtomPrefillInfo::clone(&info);
         let mut read_for = self.read_for.write().unwrap();
-        // A URL no registered worker holds any more is forgotten, with its info.
-        read_for.retain(|_, w| w.upgrade().is_some_and(|w| registered(&w)));
+        // A URL no registered worker holds any more is forgotten, with its info; a removed
+        // rank's instance too, so a rank registered there again reads it afresh.
+        let mut removed = HashSet::new();
+        read_for.retain(|url, (w, base)| {
+            let kept = w.upgrade().is_some_and(|w| registered(&w));
+            if !kept && url != base {
+                removed.insert(base.clone());
+            }
+            kept
+        });
+        read_for.retain(|url, (_, base)| !(url == base && removed.contains(base)));
         if read_instance {
             // What was read replaces what every rank of this instance took before.
             let ranks: Vec<String> = read_for
                 .iter()
-                .filter(|(_, w)| w.upgrade().is_some_and(|w| base_url(&w) == base))
+                .filter(|(_, (_, rank_base))| *rank_base == base)
                 .map(|(rank, _)| rank.clone())
                 .collect();
             for rank in ranks {
@@ -200,9 +212,9 @@ impl AtomPairs {
         merged.tp_sizes.extend(learned.tp_sizes);
         merged.chunked_transfer.extend(learned.chunked_transfer);
         if read_instance {
-            read_for.insert(base, this.clone());
+            read_for.insert(base.clone(), (this.clone(), base.clone()));
         }
-        read_for.insert(url.to_string(), this);
+        read_for.insert(url.to_string(), (this, base));
         merged.tp_sizes.retain(|url, _| read_for.contains_key(url));
         merged
             .chunked_transfer

@@ -1264,6 +1264,48 @@ mod pairs {
         assert_eq!(reads, 1);
     }
 
+    #[tokio::test]
+    async fn a_rank_registered_again_after_another_prefill_s_read_reads_its_instance() {
+        let (_, p_url) = instance(Vec::new(), false, prefill_info(2, Some(template()))).await;
+        let (_, other_url) = instance(Vec::new(), false, prefill_info(2, None)).await;
+        let (replacement, replacement_url) =
+            instance(Vec::new(), false, prefill_info(4, None)).await;
+        let registry = Arc::new(WorkerRegistry::new());
+        let pairs = AtomPairs::new(registry.clone(), AtomPdRankMappingPolicy::Idx2Idx)
+            .await
+            .unwrap();
+        let old = ranks(&p_url, PREFILL).await;
+        for worker in &old {
+            registry.register(worker.clone());
+            pairs.adapter_for(worker).await.unwrap();
+        }
+
+        // Rank 1 is removed; another prefill's first read then prunes it.
+        registry.remove_by_url(old[1].url());
+        let other = worker(&other_url, PREFILL);
+        registry.register(other.clone());
+        pairs.adapter_for(&other).await.unwrap();
+        // The instance restarts; its rank 1 registers again beside the old rank 0, which
+        // read the instance.
+        let client = GrpcClient::connect(&replacement_url, "atom").await.unwrap();
+        let rank1: Arc<dyn Worker> = Arc::new(
+            DPAwareWorkerBuilder::new(&p_url, 1, 2)
+                .worker_type(PREFILL)
+                .connection_mode(ConnectionMode::Grpc { port: None })
+                .runtime_type(RuntimeType::Atom)
+                .grpc_client(client)
+                .build(),
+        );
+        registry.register(rank1.clone());
+        let info = pairs.adapter_for(&rank1).await.unwrap().prefill_info;
+        assert_eq!(info.tp_sizes.get(rank1.url()), Some(&4));
+        assert!(!info.chunked_transfer.contains_key(rank1.url()));
+        let reads = replacement
+            .server_info_reads
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(reads, 1);
+    }
+
     /// A read publishing while a pair finds its prefill already read cannot take that
     /// prefill's info from under it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
