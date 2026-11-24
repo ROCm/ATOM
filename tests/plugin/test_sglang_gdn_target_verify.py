@@ -167,7 +167,10 @@ def _verify_once(*, replay, cache_indices, core_attn_out, conv=None, replay_fn=N
             side_effect=lambda _A, a, b, _dt: (a.unsqueeze(0), b.unsqueeze(0)),
         ),
         patch(f"{_GDN}.fused_recurrent_gated_delta_rule", side_effect=fake_recurrent),
-        patch(f"{_GDN}.prepare_layer", return_value=(None, None, None, None)),
+        patch(
+            f"{_GDN}.prepare_layer",
+            return_value=(None, None, None, None, None, "s_waitcnt vmcnt(0)"),
+        ),
         patch(f"{_GDN}.replayssm_gated_delta_rule", side_effect=replay_fn),
     ):
         output = _make_impl().forward(

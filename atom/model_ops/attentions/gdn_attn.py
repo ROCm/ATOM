@@ -23,6 +23,7 @@ from atom.model_ops.fla_ops.index import prepare_chunk_offsets
 from atom.model_ops.fla_ops.replayssm import (
     replayssm_buffer_shapes,
     replayssm_commit,
+    replayssm_flush_wait,
     replayssm_materialize,
 )
 from atom.model_ops.gdn_midstep_snapshots import interior_state_snapshots
@@ -615,6 +616,7 @@ class GDNStateMixin(PoolRowsMixin):
             math.prod(sk) * rec_dtype.itemsize
             + math.prod(su) * rec_dtype.itemsize
             + math.prod(sg) * 4  # g stays fp32: it is exponentiated on rebuild
+            + sk[0] * 4  # one int32 flush arrival counter per value head
         )
         return self.num_state_layers() * per_layer
 
@@ -772,6 +774,10 @@ class GDNStateMixin(PoolRowsMixin):
         shapes = self._replayssm_buffer_shapes()
         if shapes is not None:
             sk, su, sg = shapes
+            self.replayssm_flush_wait = replayssm_flush_wait()
+            tensors["replayssm_flush_arrivals"] = torch.zeros(
+                (n, num_slots, sk[0]), dtype=torch.int32, device="cuda"
+            )
             rec_dtype = self.model_runner.config.torch_dtype
             tensors["replayssm_buf_k"] = torch.zeros(
                 (n, num_slots) + sk, dtype=rec_dtype, device="cuda"
@@ -1157,39 +1163,20 @@ class GDNStateMixin(PoolRowsMixin):
         )
 
     def warmup_per_req_cache(self) -> None:
-        """Run one checkpoint copy now, so the first real one is only a copy.
-
-        `execute_paged_state_copies` is reachable only from `build()`, so
-        everything it builds lazily -- the copy plan, the slot base table, the
-        tiling's upload, the pinned descriptor, and the Triton JIT of
-        `_copy_tiles_kernel` -- otherwise lands inside the batch of whichever
-        request first crosses a rung.
-
-        Slot 0 into the pool's first units. Both are real addresses, which is
-        the point: a warmup on scratch would compile a kernel and fill nothing.
-        The bytes it writes are read by nobody -- a KV block is written before
-        it is read, and this runs before any block has been handed out.
-        """
-        runtime = getattr(self.model_runner, "state_runtime", None)
-        spec = None if runtime is None else runtime.checkpoint_spec
-        if spec is None:
+        """Warm the shared self-copy and ReplaySSM's decode-image fold."""
+        super().warmup_per_req_cache()
+        if (
+            not self.replayssm
+            or self.model_runner.state_runtime.checkpoint_spec is None
+        ):
             return
-        plan = self._checkpoint_copy_plan()
-        if not plan.num_spans:
+        if not self._checkpoint_copy_plan().num_spans:
             return
-        staging = self._checkpoint_staging()
-        plan.write_descriptor(
-            staging.rows(0)[: plan.num_spans],
-            self._checkpoint_slot_bases()[:1],
-            self._page_unit_bases([list(range(spec.units_per_checkpoint))]),
+        # Compile the decode-image fold too; step -1 writes nothing.
+        idx = torch.zeros(
+            1, dtype=torch.int64, device=self.model_runner.mamba_v_cache.device
         )
-        launch_copy_descriptor(staging.upload(0, plan.num_spans), plan)
-        if self.replayssm:
-            # Compile the decode-image fold too; step -1 writes nothing.
-            idx = torch.zeros(
-                1, dtype=torch.int64, device=self.model_runner.mamba_v_cache.device
-            )
-            self._materialize(idx, idx, idx - 1)
+        self._materialize(idx, idx, idx - 1)
 
     def state_entry_views(self, slot: int) -> list[torch.Tensor]:
         """One contiguous slice per (cache, layer) — the slot's whole state.
@@ -2169,6 +2156,12 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
                 ),
                 replay_buf_g=(
                     runner.replayssm_buf_g[gdn_idx] if self.replayssm else None
+                ),
+                replay_flush_arrivals=(
+                    runner.replayssm_flush_arrivals[gdn_idx] if self.replayssm else None
+                ),
+                replay_flush_wait=(
+                    self.replayssm_flush_wait if self.replayssm else None
                 ),
                 # Slot-addressed recurrent state, not paged KV. It has to be
                 # registered (the linear-attention forward reads its state out

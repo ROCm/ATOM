@@ -460,7 +460,12 @@ def test_qwen_replay_uses_shared_record_dtype_and_preserves_state_dtype(monkeypa
     assert caches["replayssm_buf_g"].dtype == torch.float32
     allocated = sum(
         caches[name].numel() * caches[name].element_size()
-        for name in ("replayssm_buf_k", "replayssm_buf_u", "replayssm_buf_g")
+        for name in (
+            "replayssm_buf_k",
+            "replayssm_buf_u",
+            "replayssm_buf_g",
+            "replayssm_flush_arrivals",
+        )
     )
     assert qwen._replayssm_bytes_per_slot() * slots == allocated
 

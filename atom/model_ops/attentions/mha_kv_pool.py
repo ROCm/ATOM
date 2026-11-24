@@ -413,7 +413,9 @@ class MhaKvPool:
                     page = self.block_size if page_tokens is None else page_tokens[row]
                     if self.entry_tokens % page:
                         raise ValueError(f"{page}-token pages do not tile {name}")
-                    runs = (self.entry_tokens // page, self.num_kv_heads)
+                    count, heads = self.entry_tokens // page, self.num_kv_heads
+                    unit = view[row].stride(0) * view[row].element_size()
+                    runs = (heads, (unit // (count * heads),) * count)
                     layer = layers[row]
                     dim, dtype = (
                         (self.head_dim, self.kv_dtype)
