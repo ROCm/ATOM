@@ -13,7 +13,7 @@ import torch
 import triton
 from aiter.dist.parallel_state import get_tp_group
 
-from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_engine.kv_block import STATE_CHECKPOINT_CLASS, STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_cache import KEEP_NONE, KEEP_SETTLED, KEEP_SNAPSHOT
 from atom.model_engine.state_runtime import StateTransfer, midstep_checkpoint_targets
@@ -811,6 +811,18 @@ class GDNStateMixin(PoolRowsMixin):
             tensors["replayssm_write_pos"] = torch.zeros(
                 num_slots, dtype=torch.int32, device="cuda"
             )
+        if STATE_CHECKPOINT_CLASS in entries:
+            # PP: the checkpoint images' own store, one entry per image at this
+            # stage's image size (`ModelRunner._plan_pipeline_checkpoint_store`).
+            # The PAGE side of every copy is then an entry, not KV rows.
+            tensors["state_checkpoint_cache"] = torch.zeros(
+                (
+                    entries[STATE_CHECKPOINT_CLASS],
+                    self.model_runner.pool_plan.entry_bytes[STATE_CHECKPOINT_CLASS],
+                ),
+                dtype=torch.uint8,
+                device="cuda",
+            )
         self._assert_checkpoint_geometry_still_holds()
         return tensors
 
@@ -1029,6 +1041,15 @@ class GDNStateMixin(PoolRowsMixin):
     def _checkpoint_descriptor_device(self) -> torch.device:
         return self.model_runner.mamba_k_cache.device
 
+    def _checkpoint_unit_count(self) -> int:
+        """Unit ids an op may name: checkpoint-store entries when the plan has
+        a store (PP), else the scheduler's KV blocks."""
+        plan = getattr(self.model_runner, "pool_plan", None)
+        entries = {} if plan is None else plan.entries
+        if STATE_CHECKPOINT_CLASS in entries:
+            return int(entries[STATE_CHECKPOINT_CLASS])
+        return int(self.model_runner.config.num_kvcache_blocks)
+
     def _validate_paged_state_op(self, op) -> None:
         """Refuse an op this worker cannot honour, before it addresses memory.
 
@@ -1039,7 +1060,8 @@ class GDNStateMixin(PoolRowsMixin):
         Unit ids are checked against the **logical** block count, which is what
         `BlockPool` hands out and what `sub_pool_specs` priced. The tensor is
         shaped in physical blocks and K3's `block_ratio` is 128, so a check
-        against the physical count would admit ids 128x out of range.
+        against the physical count would admit ids 128x out of range. Under a
+        checkpoint store they are entries, checked against its entry count.
         """
         spec = self.model_runner.state_runtime.checkpoint_spec
         if spec is None:
@@ -1059,8 +1081,8 @@ class GDNStateMixin(PoolRowsMixin):
                 f"a checkpoint takes {spec.units_per_checkpoint} PAGE units but "
                 f"the op names {len(op.unit_ids)}"
             )
-        num_blocks = int(self.model_runner.config.num_kvcache_blocks)
-        if any(unit < 0 or unit >= num_blocks for unit in op.unit_ids):
+        num_units = self._checkpoint_unit_count()
+        if any(unit < 0 or unit >= num_units for unit in op.unit_ids):
             raise RuntimeError("state checkpoint PAGE unit is out of range")
 
     def execute_paged_state_copies(
@@ -1181,11 +1203,15 @@ class GDNStateMixin(PoolRowsMixin):
 
     def warmup_per_req_cache(self) -> None:
         """Warm the shared self-copy and ReplaySSM's decode-image fold."""
+        spec = self.model_runner.state_runtime.checkpoint_spec
+        plan = getattr(self.model_runner, "pool_plan", None)
+        store = None if plan is None else plan.entries.get(STATE_CHECKPOINT_CLASS)
+        # A PP checkpoint store with no entries (prefix caching off under PP)
+        # has no unit to aim at, and will never be copied to either.
+        if spec is not None and store is not None and store < spec.units_per_checkpoint:
+            return
         super().warmup_per_req_cache()
-        if (
-            not self.replayssm
-            or self.model_runner.state_runtime.checkpoint_spec is None
-        ):
+        if not self.replayssm or spec is None:
             return
         if not self._checkpoint_copy_plan().num_spans:
             return

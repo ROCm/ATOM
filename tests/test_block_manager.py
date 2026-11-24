@@ -1114,6 +1114,113 @@ def test_pp_stages_split_the_state_budget_by_image(monkeypatch):
     assert bm.state_offload._hash_cap == 682 - 682 // 32
 
 
+# ── PP: checkpoint images in a store of their own ──────────────────────────
+
+
+def _bm_with_checkpoints(store_entries=None):
+    """PAGE-copy checkpoints in a store of `store_entries` images, as under PP
+    (one entry an image), or with None in KV blocks (3 an image)."""
+    from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
+    from atom.model_engine.state_runtime import StateRuntime, StateTransfer
+
+    spec = PagedStateCheckpointSpec(10, 25, "kv-blocks", image_bytes=25)
+    entries = {"state": 4}
+    if store_entries is not None:
+        spec = PagedStateCheckpointSpec(32, 32, "store", image_bytes=25)
+        spec = spec.for_pipeline("pp2-joint:store", 1, 40)
+        entries["state_checkpoint"] = store_entries
+    cfg = MockConfig(
+        enable_prefix_caching=True,
+        num_kvcache_blocks=64,
+        kv_cache_block_size=4,
+        pool_entries=entries,
+        pool_entries_per_req={"state": 1},
+    )
+    return BlockManager(
+        cfg,
+        state_runtime=StateRuntime(
+            transfer=StateTransfer.copy(spec.layout_id), checkpoint_spec=spec
+        ),
+    )
+
+
+def _keep(bm, prefix_hash, slot=0):
+    """Store one image and let its copy ride a batch, as the scheduler does."""
+    store = bm.paged_state_checkpoints.store
+    assert store.begin_store(prefix_hash, src_slot=slot) is not None
+    store.complete_inflight()
+    assert store.contains(prefix_hash)
+
+
+def test_pp_images_live_in_their_store_and_evict_its_oldest():
+    bm = _bm_with_checkpoints(store_entries=2)
+    store = bm.paged_state_checkpoints.store
+    assert store.pool is bm.checkpoint_store_pool is not bm.kv
+    assert store.units_per_checkpoint == 1
+    for h in (11, 12, 13):
+        _keep(bm, h)
+
+    assert not store.contains(11) and store.contains(12) and store.contains(13)
+    assert bm.kv.num_free == bm.kv.num_usable_blocks
+    fates = bm.state_checkpoint_fates()
+    assert fates["checkpoints_evicted"] == 1
+    assert (fates["checkpoint_store_entries"], fates["checkpoint_store_used"]) == (2, 2)
+
+
+def test_kv_neither_counts_nor_spends_a_pp_image():
+    """In KV blocks a READY image is room for KV, and KV is room for one. In the
+    store neither lends to the other."""
+    bm = _bm_with_checkpoints(store_entries=3)
+    _keep(bm, 11)
+    for _ in range(bm.kv.num_usable_blocks - 1):
+        bm._fresh_block()
+
+    assert bm._has_page_units(1) and not bm._has_page_units(2)
+    assert bm._ensure_page_units(1) and not bm._ensure_page_units(2)
+    assert bm.paged_state_checkpoints.contains(11)
+    # The image still fits beside a request taking the last block, and not
+    # beside one that needs two.
+    assert bm._checkpoint_has_room(1) and not bm._checkpoint_has_room(2)
+
+
+def test_evicting_a_boundary_block_orphans_its_pp_image():
+    """The KV pool still settles the image at a boundary it evicts, and the
+    entry goes back to the store."""
+    bm = _bm_with_checkpoints(store_entries=2)
+    _keep(bm, 11)
+
+    bm._record_evicted(11)
+
+    assert not bm.paged_state_checkpoints.contains(11)
+    assert bm.checkpoint_store_pool.num_used == 0
+    assert bm.state_checkpoint_fates()["checkpoints_orphaned"] == 1
+
+
+def test_an_empty_store_keeps_nothing_and_costs_kv_nothing():
+    """Prefix caching off under PP: the layout stays, the store holds none."""
+    bm = _bm_with_checkpoints(store_entries=0)
+    assert bm.paged_state_checkpoints.store.begin_store(11, src_slot=0) is None
+    assert not bm._checkpoint_has_room()
+    assert bm._has_page_units(bm.kv.num_usable_blocks)
+
+
+def test_without_a_store_images_still_borrow_kv_blocks():
+    """Outside PP nothing moves: an image takes KV blocks, and a READY one
+    counts as room for KV, which may spend it."""
+    bm = _bm_with_checkpoints()
+    assert bm.checkpoint_store_pool is None
+    assert bm.paged_state_checkpoints.store.pool is bm.kv
+    _keep(bm, 11)
+
+    usable = bm.kv.num_usable_blocks  # less the padding block (#3508)
+    assert bm.kv.num_free == usable - 3
+    assert bm._has_page_units(usable) and not bm._has_page_units(usable + 1)
+    assert bm._checkpoint_has_room(usable - 3)
+    assert "checkpoint_store_entries" not in bm.state_checkpoint_fates()
+    assert bm._ensure_page_units(usable)
+    assert not bm.paged_state_checkpoints.contains(11)
+
+
 def test_a_multi_listing_two_offload_connectors_is_refused(monkeypatch):
     """The tier's bytes ride one connector's worker half and its completions
     ride that connector's `get_finished`, so two providers would each hold half

@@ -23,7 +23,7 @@ from atom.distributed.kv_events import (
 )
 from atom.kv_transfer.offload.load_math import chunk_floor, tier_load_tokens
 from atom.model_engine.block_pool import BlockPool
-from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_engine.kv_block import STATE_CHECKPOINT_CLASS, STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import (
     PagedStateCheckpointCoordinator,
     checkpoint_copy_ops_per_batch,
@@ -416,10 +416,23 @@ class BlockManager:
                 self.state_tier_capability.reason,
             )
         self.paged_state_checkpoints: PagedStateCheckpointCoordinator | None = None
+        # Under PP the images have a store of their own, one entry an image on
+        # every stage (`ModelRunner._plan_pipeline_checkpoint_store`), rather
+        # than borrowing KV blocks: the KV pool then neither lends to them nor
+        # spends them, and the two are sized apart.
+        self.checkpoint_store_pool: BlockPool | None = None
+        if checkpoint_spec is not None and STATE_CHECKPOINT_CLASS in pool_entries:
+            self.checkpoint_store_pool = BlockPool(
+                int(pool_entries[STATE_CHECKPOINT_CLASS])
+            )
         if checkpoint_spec is not None:
             enabled = self.enable_prefix_caching and self.num_state_slots > 0
             self.paged_state_checkpoints = PagedStateCheckpointCoordinator(
-                self.kv,
+                (
+                    self.kv
+                    if self.checkpoint_store_pool is None
+                    else self.checkpoint_store_pool
+                ),
                 checkpoint_spec,
                 enabled=enabled,
                 readable_midstep=state_runtime.transfer.readable_midstep,
@@ -654,6 +667,11 @@ class BlockManager:
                 continue
             for k, v in fates_fn().items():
                 totals[k] = totals.get(k, 0) + v
+        if self.checkpoint_store_pool is not None:
+            # Gauges, and only where there is a store: whether it is full is
+            # what says `checkpoints_evicted` is the store being too small.
+            totals["checkpoint_store_entries"] = self.checkpoint_store_pool.num_blocks
+            totals["checkpoint_store_used"] = self.checkpoint_store_pool.num_used
         return totals
 
     def _note_index_change(self, h: int) -> None:
@@ -764,26 +782,44 @@ class BlockManager:
         two gates in one pass agree on what is spendable.
 
         `True` when no PAGE-backed checkpoints exist at all: a fork checkpoint
-        costs the pool nothing, so there is nothing to gate.
+        costs the pool nothing, so there is nothing to gate. With a checkpoint
+        store the two questions go to two pools: the request's blocks to the
+        KV pool, the image to the store.
         """
         if self.paged_state_checkpoints is None:
             return True
+        units = self.paged_state_checkpoints.store.units_per_checkpoint
+        if not self._checkpoints_borrow_kv:
+            return self.kv.has_free(
+                live_blocks
+            ) and self.paged_state_checkpoints.has_available_units(
+                units, protected_hash=protected_hash
+            )
         return self.paged_state_checkpoints.has_available_units(
-            live_blocks + self.paged_state_checkpoints.store.units_per_checkpoint,
-            protected_hash=protected_hash,
+            live_blocks + units, protected_hash=protected_hash
+        )
+
+    @property
+    def _checkpoints_borrow_kv(self) -> bool:
+        """Whether PAGE checkpoint images live in KV blocks, so that a READY
+        unpinned one is room for KV and KV is room for one. False under a
+        checkpoint store, whose entries KV can neither take nor give."""
+        return (
+            self.paged_state_checkpoints is not None
+            and self.checkpoint_store_pool is None
         )
 
     def _has_page_units(
         self, count: int, protected_checkpoint_hash: int | None = None
     ) -> bool:
-        if self.paged_state_checkpoints is None:
+        if not self._checkpoints_borrow_kv:
             return self.kv.has_free(count)
         return self.paged_state_checkpoints.has_available_units(
             count, protected_hash=protected_checkpoint_hash
         )
 
     def _ensure_page_units(self, count: int) -> bool:
-        if self.paged_state_checkpoints is None:
+        if not self._checkpoints_borrow_kv:
             return self.kv.has_free(count)
         return self.paged_state_checkpoints.ensure_free_units(count)
 
