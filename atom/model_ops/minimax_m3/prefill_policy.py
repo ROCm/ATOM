@@ -7,6 +7,8 @@ from typing import NamedTuple
 SCORE_BLOCK_SIZE_Q = 128
 SCORE_CHUNK_CTAS_PER_CU = 8
 PREFILL_TOPK_MIN_BLOCK_SIZE_K = 128
+# gfx950: rows of <= 64 blocks sort one next_pow2(blocks) tile, up to 1.2x faster
+GFX950_PREFILL_TOPK_MIN_BLOCK_SIZE_K = 16
 PREFILL_TOPK_MAX_BLOCK_SIZE_K = 1024
 # Prefill launches one selector program per query token. One warp won all 28
 # measured (row width x warp count) cells; more only added cross-wave work.
