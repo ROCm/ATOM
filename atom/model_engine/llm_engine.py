@@ -579,9 +579,14 @@ class LLMEngine:
             # GPUs idle; see `OffloadSchedulerMixin._init_tier_hit_memo`.
             "lookups_skipped_by_memo",
             "suppressed_load_retries",
-            # Keyed blocks HBM evicted before a lazy demotion stored them
-            # (`LazySaveSchedulerMixin`); absent under the eager policy.
+            # Lazy demotions (`LazySaveSchedulerMixin`), absent under the eager
+            # policy: unsaved blocks HBM evicted for want of a clean one, unsaved
+            # blocks held back from eviction now, demotions reported failed.
             "lazy_evicted_unsaved",
+            "lazy_held_blocks",
+            "lazy_demotions_failed",
+            # Tier tokens pinned by lookups whose load is not dispatched yet.
+            "lookup_pinned_tokens",
         )
         offload_totals = {
             key: sum(int(stats.get(key, 0)) for stats in offload_rank_stats)

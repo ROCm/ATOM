@@ -1601,11 +1601,30 @@ turn. With 1.0-1.2 pools it computed 0.9-1.1x, and 1.3-2.4x when turns were
 so short that several admissions landed on each step and allocated more than
 the eviction window. Not measured on GPU.
 
-`lazy_evicted_unsaved` (`get_statistics`, summed in the engine's `offload`
-stats) counts keyed blocks HBM evicted before a demotion stored them, found
-when a request keys the block again. It is approximate: in that model it read
-up to about 20% above them. It does not count a block lost because its saved
-bit was stale, which on a mostly idle engine was the larger number.
+HBM evicts the blocks the tier holds before the ones it does not
+(write-back, `BlockPool.set_write_back`): an allocation passes over a keyed
+unsaved ("dirty") block to the next clean one, and the blocks it passed over
+are the first a demotion stores. A dirty block is lost only when no clean
+block with content is left; four demotions of a step's blocks are in flight
+at once. Without it, an admission that allocates a whole prompt at once, or a
+store that reports late, evicted keyed blocks no demotion had reached: on the
+M3.1 1P1D C192 trace replayed through the real scheduler at 1/8 scale
+(`tests/test_offload_lazy_save.py::_replay` is the small version), 9% of the
+previous turns' prefixes were recomputed and 57K blocks were evicted dirty,
+against 3.6% and 0.2K with write-back (stores reporting 2 steps late; 10.9%
+and 3.3% at 3 steps). A demotion succeeds only if the tier holds all of it
+(`PrehashedSave.must_store_all`): the worker skips chunks the tier already
+holds, and a refused chunk fails the demotion, whose blocks stay dirty and are
+retried after a 1 s pause, where a shorter success would have marked them
+saved.
+
+Counters (`get_statistics`, summed in the engine's `offload` stats and
+exported as `atom:lmcache_*`, see `docs/metrics_guide.md`):
+`lazy_evicted_unsaved` (dirty blocks evicted with nothing clean left),
+`lazy_held_blocks` (dirty blocks passed over now), `lazy_demotions_failed`,
+and, under either policy, `lookup_pinned_tokens` (tier tokens pinned by lookups
+whose load is not dispatched). A block whose tier copy LMCache evicted while HBM held it
+stays marked saved and is lost when HBM evicts it; no counter sees that.
 `lazy_save.py` lists when each happens.
 
 AOS1 follows the engine's location policy exactly. Submission passes
