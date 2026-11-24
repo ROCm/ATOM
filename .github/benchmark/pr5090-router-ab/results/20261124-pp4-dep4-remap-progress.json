@@ -103,5 +103,6 @@
     "A single remap run cannot distinguish mapping dependence, timing sensitivity, transient path failure or the effect of restarting.",
     "No confirmed hardware or router root cause."
   ],
-  "local_snapshot_sha256": "d637df7b66a29ae6ffbb5e3553579dc48b4b7cf215723b87b2a3cb15b88261d2"
+  "local_snapshot_sha256": "d637df7b66a29ae6ffbb5e3553579dc48b4b7cf215723b87b2a3cb15b88261d2",
+  "superseded_by": "20261124-pp4-dep4-remap-performance.json"
 }

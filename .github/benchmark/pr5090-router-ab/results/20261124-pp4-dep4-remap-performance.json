@@ -1,0 +1,240 @@
+{
+  "lease": "L1e57ce",
+  "node": "pit2-p03-g27",
+  "chips": 8,
+  "harness_sha": "4148dc59135de806c31a2ca2a0e5be27743db324",
+  "srt_sha": "85ecf60ac3931f38abdb0dd82f909f35057d5e12",
+  "router_sha": "69ed5e77bcc93b9d51cb5cf1528badd0e703ed93",
+  "worker_image": "vllm/vllm-openai-rocm:minimax-m31-flash-75bc8cf1@sha256:f8e8ab239e5edb7c3070c5802fc7fc0cbb889513bf81183dfc98ce1c77e1dfe1",
+  "concurrency": 40,
+  "requested_duration_s": 3600,
+  "send_duration_s": 3600.002,
+  "exit_codes": {
+    "pool-workload.rc": 0,
+    "pool-exit.rc": 0,
+    "gpool-release.rc": 0
+  },
+  "successful_profiling_records": 5687,
+  "accounting": {
+    "records_total": 6132,
+    "records_profiled": 5687,
+    "records_dropped_total": 445,
+    "records_warmup_dropped": 444,
+    "records_error_dropped": 412,
+    "error_categories": {
+      "InvalidInferenceResultError": 412
+    }
+  },
+  "interactivity_tok_s_user": 125.46912670025824,
+  "p90_full_response_itl_seconds": 0.007970088150760531,
+  "total_throughput_tok_s": 269651.38428770745,
+  "token_throughput_per_chip": 33706.42303596343,
+  "sa_record_duration_seconds": 3614.55345232,
+  "raw_record_sha256": "eaa35ed03a546d12cfc9bdc45b81e406f877349dae67b7cb9385c8123cbdd38f",
+  "method_source_commit": "3234f996c34453191c80269b74c3d9f0b3a9bf65",
+  "method": "SA successful profiling records: 1/P90(full-response ITL), input+output token rate/all P+D chips, including cached input; no intermediate rounding",
+  "formal_sa_submission": false,
+  "limits": "One c40 point, different node and P/D layout from TP4; cannot isolate router gain or compare equal-interactivity curves. One empty response and one drain cancellation retained. Warmup exports excluded from SA metrics. No accuracy or power validation, no formal SA submission; no claim that device remapping fixes the root cause.",
+  "profiling_control": {
+    "sent": 5689,
+    "completed": 5688,
+    "cancelled_at_30s_grace_deadline": 1,
+    "content_errors": 1,
+    "successful": 5687,
+    "send_start_utc": "2026-11-24T06:35:12.313Z",
+    "send_end_utc": "2026-11-24T07:35:12.315Z",
+    "drain_end_utc": "2026-11-24T07:35:42.314Z"
+  },
+  "record_counts": {
+    "warmup_valid": 33,
+    "warmup_error": 411,
+    "profiling_valid": 5687,
+    "profiling_error": 1,
+    "cancelled_record_exported": false
+  },
+  "shared_empty_response": {
+    "source_trace_id": "002001296e8a8c38ad9d7cc436d691afc602",
+    "turn_index": 121,
+    "source_outer_idx": 126,
+    "input_tokens": 381745,
+    "error": "InvalidInferenceResultError: no response with actual content",
+    "also_seen_in": [
+      "Ld48419",
+      "Lcb2ddc",
+      "Lb4c8c6"
+    ]
+  },
+  "worker_counters": {
+    "prefill": {
+      "vllm:mooncake_num_failed_transfers_total": {
+        "0": 0.0
+      },
+      "vllm:mooncake_num_failed_recvs_total": {
+        "0": 0.0
+      },
+      "vllm:mooncake_num_kv_expired_reqs_total": {
+        "0": 0.0
+      },
+      "vllm:num_requests_running": {
+        "0": 0.0
+      },
+      "vllm:num_requests_waiting": {
+        "0": 0.0
+      }
+    },
+    "decode": {
+      "vllm:mooncake_num_failed_transfers_total": {
+        "0": 0.0,
+        "1": 0.0,
+        "2": 0.0,
+        "3": 0.0
+      },
+      "vllm:mooncake_num_failed_recvs_total": {
+        "0": 0.0,
+        "1": 0.0,
+        "2": 0.0,
+        "3": 0.0
+      },
+      "vllm:mooncake_num_kv_expired_reqs_total": {
+        "0": 0.0,
+        "1": 0.0,
+        "2": 0.0,
+        "3": 0.0
+      },
+      "vllm:num_requests_running": {
+        "0": 0.0,
+        "1": 0.0,
+        "2": 0.0,
+        "3": 0.0
+      },
+      "vllm:num_requests_waiting": {
+        "0": 0.0,
+        "1": 0.0,
+        "2": 0.0,
+        "3": 0.0
+      }
+    }
+  },
+  "decode_external_kv_token_deltas_by_rank": {
+    "0": 88475930.0,
+    "1": 94913874.0,
+    "2": 92010609.0,
+    "3": 91758162.0
+  },
+  "client_warmup_plus_profile_reported_transfer_bytes": 16171713536000.0,
+  "protocol_probe": {
+    "response_count": 5,
+    "kv_transfer": {
+      "metric": "vllm:mooncake_bytes_transferred_sum",
+      "prefill_before": 0.0,
+      "prefill_after": 101376000.0,
+      "transferred_bytes_delta": 101376000.0,
+      "passed": true
+    },
+    "request_gauges_after_disconnect": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "native_submission_valid": true,
+  "gpu_placement": {
+    "prefill_parent": {
+      "mask": "0,1,3,2",
+      "pci_by_hip_ordinal": [
+        "0000:75:00.0",
+        "0000:05:00.0",
+        "0000:15:00.0",
+        "0000:65:00.0"
+      ]
+    },
+    "prefill_original-prefill": {
+      "mask": "0,1,2,3",
+      "pci_by_hip_ordinal": [
+        "0000:75:00.0",
+        "0000:05:00.0",
+        "0000:65:00.0",
+        "0000:15:00.0"
+      ]
+    },
+    "decode_parent": {
+      "mask": "4,5,6,7",
+      "pci_by_hip_ordinal": [
+        "0000:f5:00.0",
+        "0000:85:00.0",
+        "0000:e5:00.0",
+        "0000:95:00.0"
+      ]
+    }
+  },
+  "archive_sha256": "7058d9d76b697385416a0da375cdeb118616a7d64e5ed2b73cc8037538f2b965",
+  "cleanup": {
+    "srt_exit": 0,
+    "srt_remaining_containers_empty": true,
+    "pool_cleanup_containers_empty": true,
+    "release_log": "released L1e57ce (g27:0-7, held 1h29m)"
+  },
+  "root_cause": "Unresolved: the same-node device-remap run did not reproduce the PP3 write timeouts; a restored-original-order control is needed to distinguish mapping dependence from restart or transient effects.",
+  "rdma_counter_limit": "Snapshots through 07:12:19 UTC had no error/timeout increases. The 08:00 snapshot was after release and another lease had acquired the node, so its increments are excluded from this experiment.",
+  "comparison": {
+    "vllm-router": {
+      "lease": "Ld48419",
+      "node": "pit2-p03-g42",
+      "gpus": 8,
+      "p90_full_response_itl_seconds": 0.003054829549655558,
+      "interactivity_tok_s_user": 327.3505063851282,
+      "total_throughput_tok_s": 283638.29505437304,
+      "token_throughput_per_chip": 35454.78688179663,
+      "sa_record_duration_seconds": 3617.546815402,
+      "native_agentx_total_throughput_per_chip": 35454.70404225437,
+      "valid_profiling_records": 5936,
+      "profiling_errors": 1,
+      "warmup_records_excluded": 444,
+      "raw_record_sha256": "cdd55af0ca2b4d752e6539f33f3b96a4654063fae2131d633df1de0cdf8c67df",
+      "native_aggregate_sha256": "27429d68544389a9730e23a0b80703848f2ab0239720d0bef4f36187e0109a1b"
+    },
+    "atomesh": {
+      "lease": "Lcb2ddc",
+      "node": "pit2-p03-g42",
+      "gpus": 8,
+      "p90_full_response_itl_seconds": 0.003069298057926764,
+      "interactivity_tok_s_user": 325.8073934583843,
+      "total_throughput_tok_s": 284846.6901404733,
+      "token_throughput_per_chip": 35605.83626755916,
+      "sa_record_duration_seconds": 3606.515408318,
+      "native_agentx_total_throughput_per_chip": 35605.744007709916,
+      "valid_profiling_records": 5946,
+      "profiling_errors": 1,
+      "warmup_records_excluded": 444,
+      "raw_record_sha256": "e5a452590d2621d3f4a0da903048a3e75d5c1ccea1a8236805c34e79f2c829d8",
+      "native_aggregate_sha256": "6f2c61b189ce98f5a2452d5dd73c727ee47d08c876ca98c6531b7a2de2cb6df3"
+    }
+  },
+  "observed_relative_to_tp4_atomesh_pct": {
+    "interactivity_tok_s_user": -61.48978530891303,
+    "token_throughput_per_chip": -5.334555878206704
+  },
+  "client_freeze_matches_tp4_atomesh": true,
+  "client_package_count": 131,
+  "execution": {
+    "platform": "gpu-pool lease, SSH, Docker and real srtctl SweepOrchestrator",
+    "github_actions_run": null,
+    "slurm_experiment_job": null
+  },
+  "next_control": {
+    "queue_request": "Rffc4da",
+    "requested_node": "g27",
+    "case": "pp4-dep4-perf",
+    "harness_sha": "4148dc59135de806c31a2ca2a0e5be27743db324",
+    "prefill_hip_order": "0,1,2,3",
+    "status_at_20261124_0809_utc": "queued, no new lease",
+    "purpose": "Distinguish GPU mapping dependence from transient/restart effects using the original order"
+  }
+}
