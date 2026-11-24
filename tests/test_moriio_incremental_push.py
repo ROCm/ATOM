@@ -147,7 +147,9 @@ def ask_and_push(
             "decode"
         )
         p_conn.posted = []
-        p_conn._write_blocks(request, engine(rank))
+        [push] = p_conn._write_blocks(request, engine(rank))
+        while push.remaining:
+            push.post_next()
         assert len(p_conn.posted) == 1
         for _session, l_offs, r_offs, sizes in p_conn.posted:
             for lo, ro, n in zip(l_offs, r_offs, sizes):

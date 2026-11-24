@@ -1022,6 +1022,193 @@ class WritePathTest(unittest.TestCase):
         conn._service_write_requests()
         self.assertEqual(posted, [10, 12, 9])
 
+    def batched(self, conn, segments, batch, statuses, hook=None):
+        """Each push a `_BatchedPush` of ``segments[transfer id]`` segments,
+        ``batch`` at a time, as `_write_pages` returns it: not yet posted.
+        Every post appends
+        ``((transfer id, first, end), status)`` to ``statuses``, the status
+        in progress, after calling ``hook`` with the same triple."""
+        import sys
+
+        module = sys.modules[self.connector.__module__]
+        conn._kv_ready_events = dict.fromkeys(segments, conn._kv_ready_events[9])
+        conn._write_target_ready = lambda request: True
+
+        def write(request, engine_id):
+            tid = request["transfer_id"]
+
+            def post(lo, hi):
+                if hook is not None:
+                    hook((tid, lo, hi))
+                statuses.append(((tid, lo, hi), FakeStatus()))
+                return statuses[-1][1]
+
+            return [
+                module._BatchedPush(
+                    tid, post, segments[tid], batch, request.get("deadline")
+                )
+            ]
+
+        conn._write_blocks = write
+
+    def reports(self, conn):
+        """``(transfer id, ok)`` of every WRITE_DONE sent so far."""
+        sent = [self.msgpack.loads(frames[1]) for frames, _host, _port in conn.sent]
+        return [(int(r["decode_req_id"][1:]), r["ok"]) for r in sent]
+
+    def blocks_request(self, tid, blocks, **extra):
+        return self.push_request(
+            transfer_id=tid,
+            decode_req_id=f"d{tid}",
+            dst_block_ids=list(range(blocks)),
+            src_block_ids=list(range(blocks)),
+            **extra,
+        )
+
+    def test_big_pushes_are_posted_a_batch_at_a_time_fewest_left_first(self):
+        conn = self.make(producer=True)
+        statuses = []
+
+        def ask_during(post):
+            # One more push asked for while push 9 posts its second batch.
+            if post == (9, 4, 8):
+                conn._write_requests.put(self.blocks_request(12, 1))
+
+        self.batched(conn, {9: 18, 10: 2, 11: 9, 12: 1}, 4, statuses, ask_during)
+        for tid, blocks in ((9, 50), (10, 2), (11, 9)):
+            conn._write_requests.put(self.blocks_request(tid, blocks))
+        conn._service_write_requests()
+        # The push with the fewest segments left posts the next batch, a push
+        # asked for meanwhile included. No post is over 4 segments.
+        self.assertEqual(
+            [post for post, _ in statuses],
+            [
+                (10, 0, 2),
+                (11, 0, 4),
+                (11, 4, 8),
+                (11, 8, 9),
+                (9, 0, 4),
+                (9, 4, 8),
+                (12, 0, 1),
+                (9, 8, 12),
+                (9, 12, 16),
+                (9, 16, 18),
+            ],
+        )
+        self.assertEqual(conn._pending_writes, [])
+
+    def test_a_push_is_reported_only_once_every_batch_has_landed(self):
+        conn = self.make(producer=True)
+        statuses = []
+        self.batched(conn, {9: 10}, 4, statuses)
+        conn._write_requests.put(self.blocks_request(9, 5))
+        conn._service_write_requests()
+        self.assertEqual(
+            [post for post, _ in statuses], [(9, 0, 4), (9, 4, 8), (9, 8, 10)]
+        )
+        for _post, status in statuses[:2]:
+            status.state = "ok"
+        conn._service_write_requests()
+        self.assertEqual(conn.sent, [])
+        statuses[2][1].state = "ok"
+        conn._service_write_requests()
+        self.assertEqual(self.reports(conn), [(9, True)])
+        self.assertEqual(conn.done_sending, {9})
+
+    def test_batching_off_posts_each_push_whole(self):
+        conn = self.make(producer=True)
+        statuses = []
+        self.batched(conn, {9: 10, 10: 0}, 0, statuses)
+        conn._write_requests.put(self.blocks_request(9, 5))
+        conn._write_requests.put(self.blocks_request(10, 0))
+        conn._service_write_requests()
+        # An empty push has nothing to post and is done.
+        self.assertEqual([post for post, _ in statuses], [(9, 0, 10)])
+        self.assertEqual(self.reports(conn), [(10, True)])
+
+    def test_a_failed_batch_stops_the_push_and_fails_it_once_all_settle(self):
+        conn = self.make(producer=True)
+        statuses = []
+
+        def fail_first(post):
+            # The first batch fails while the second is being posted.
+            if post == (9, 4, 8):
+                statuses[0][1].state = "failed"
+
+        self.batched(conn, {9: 12}, 4, statuses, fail_first)
+        conn._write_requests.put(self.blocks_request(9, 6))
+        with self.assertLogs("atom", "ERROR"):
+            conn._service_write_requests()
+        # No third batch goes out, and the second, posted before the first
+        # failed, may still be writing: the consumer is told only once it
+        # has settled.
+        self.assertEqual([post for post, _ in statuses], [(9, 0, 4), (9, 4, 8)])
+        self.assertEqual(conn.sent, [])
+        statuses[1][1].state = "ok"
+        with self.assertLogs("atom", "ERROR"):
+            conn._service_write_requests()
+        self.assertEqual(self.reports(conn), [(9, False)])
+        self.assertEqual(conn.done_sending, {9})
+
+    def test_a_batch_that_cannot_be_posted_fails_the_push_once_the_rest_settle(self):
+        conn = self.make(producer=True)
+        statuses = []
+
+        def refuse(post):
+            if post == (9, 4, 8):
+                raise RuntimeError("no stream")
+
+        self.batched(conn, {9: 12, 10: 1}, 4, statuses, refuse)
+        conn._write_requests.put(self.blocks_request(9, 6))
+        with self.assertLogs("atom", "ERROR"):
+            conn._service_write_requests()
+        self.assertEqual([post for post, _ in statuses], [(9, 0, 4)])
+        self.assertEqual(conn.sent, [])
+        statuses[0][1].state = "ok"
+        with self.assertLogs("atom", "ERROR"):
+            conn._service_write_requests()
+        self.assertEqual(self.reports(conn), [(9, False)])
+        # The next push to the same consumer goes ahead.
+        conn._write_requests.put(self.blocks_request(10, 1))
+        conn._service_write_requests()
+        self.assertEqual(statuses[-1][0], (10, 0, 1))
+
+    def test_a_push_whose_first_batch_cannot_be_posted_fails_at_once(self):
+        conn = self.make(producer=True)
+        statuses = []
+
+        def refuse(post):
+            raise RuntimeError("no stream")
+
+        self.batched(conn, {9: 12}, 4, statuses, refuse)
+        conn._remote_agents = {"10.0.0.2:7400_dp0": {"agent"}}
+        conn._write_requests.put(self.blocks_request(9, 6))
+        with self.assertLogs("atom", "ERROR"):
+            conn._service_write_requests()
+        self.assertEqual(statuses, [])
+        self.assertEqual(self.reports(conn), [(9, False)])
+        self.assertEqual(conn.done_sending, {9})
+        # Re-handshaken by the next push, as for any failed one.
+        self.assertEqual(conn._remote_agents, {})
+
+    def test_no_batch_is_posted_past_the_consumers_deadline(self):
+        import time
+
+        conn = self.make(producer=True)
+        statuses = []
+        deadline = time.time() + 0.05
+        # The first batch is posted in time, the second would start late.
+        self.batched(conn, {9: 12}, 4, statuses, lambda post: time.sleep(0.1))
+        conn._write_requests.put(self.blocks_request(9, 6, deadline=deadline))
+        with self.assertLogs("atom", "ERROR") as logs:
+            conn._service_write_requests()
+        self.assertIn("deadline passed", logs.output[0])
+        self.assertEqual([post for post, _ in statuses], [(9, 0, 4)])
+        statuses[0][1].state = "ok"
+        with self.assertLogs("atom", "ERROR"):
+            conn._service_write_requests()
+        self.assertEqual(self.reports(conn), [(9, False)])
+
     def test_a_failed_push_still_frees_the_source(self):
         conn = self.make(producer=True)
         conn._remote_agents = {"10.0.0.2:7400_dp0": {"agent"}}

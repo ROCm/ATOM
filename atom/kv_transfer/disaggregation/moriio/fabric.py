@@ -11,10 +11,11 @@
   maps a peer's whole allocation per registered descriptor, so registering each
   PAGE region on its own would map the pool once per region.
 - Every PAGE region is addressed as (offset in the pool, bytes per block), and a
-  request moves as one ``batch_write`` on the single (local pool, remote pool)
+  request moves as ``batch_write``s on the single (local pool, remote pool)
   session. With ROCm/mori#1021 mori copies up to 512 segments per launch of its
   fabric copy kernel and runs them concurrently, so the destinations of one
-  batch must not overlap: no block may be written twice.
+  batch must not overlap: no block may be written twice. The segments come in
+  destination order, which mori's copy plan would otherwise sort them into.
 - A region sharded by block id (`KVTransferRegion.shard_units`: MiniMax-M3's
   index cache under ``ATOM_M3_INDEX_SHARD``) holds 1/n of the blocks on each
   rank; rank i pushes only its own (`shard_pairs`) into rank i, whose share is
@@ -199,8 +200,9 @@ def page_batch(
     dst_blocks: Sequence[int],
     local_num_blocks: int,
     remote_num_blocks: int,
-) -> tuple[list[int], list[int], list[int]]:
-    """Pool-relative ``(local offsets, remote offsets, sizes)`` of one push.
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Pool-relative ``(local offsets, remote offsets, sizes)`` of one push, in
+    destination order.
 
     Moves block ``src_blocks[i]`` of every local region, given as ``(offset in
     the pool, bytes per block)``, into block ``dst_blocks[i]`` of the remote
@@ -220,9 +222,8 @@ def page_batch(
     )
     run_src, run_dst, run_len = coalesce_contiguous(src, dst, np.ones_like(src))
     local_offs, remote_offs, sizes = [], [], []
-    for i, ((l_off, l_unit), (r_off, r_unit)) in enumerate(
-        zip(local_regions, remote_regions)
-    ):
+    for i in sorted(range(len(remote_regions)), key=lambda i: remote_regions[i][0]):
+        (l_off, l_unit), (r_off, r_unit) = local_regions[i], remote_regions[i]
         if l_unit != r_unit:
             raise ValueError(
                 f"PAGE region {i}: {l_unit} B per block here, {r_unit} B remote"
@@ -230,12 +231,13 @@ def page_batch(
         local_offs.append(l_off + run_src * l_unit)
         remote_offs.append(r_off + run_dst * l_unit)
         sizes.append(run_len * l_unit)
-    if not sizes:
-        return [], [], []
-    return (
-        np.concatenate(local_offs).tolist(),
-        np.concatenate(remote_offs).tolist(),
-        np.concatenate(sizes).tolist(),
+    return _concatenated(local_offs, remote_offs, sizes)
+
+
+def _concatenated(*columns: list[np.ndarray]) -> tuple[np.ndarray, ...]:
+    """Each column's arrays as one (empty without any)."""
+    return tuple(
+        np.concatenate(c) if c else np.empty(0, dtype=np.int64) for c in columns
     )
 
 
@@ -245,8 +247,9 @@ def _checked_blocks(
     local_num_blocks: int,
     remote_num_blocks: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """The block ids as arrays; raises unless they pair one to one, lie inside
-    their pools, and name no destination twice."""
+    """The block ids as arrays, the pairs in destination order; raises unless
+    they pair one to one, lie inside their pools, and name no destination
+    twice."""
     if len(src_blocks) != len(dst_blocks):
         raise ValueError(
             f"{len(src_blocks)} source blocks for {len(dst_blocks)} destinations"
@@ -270,7 +273,8 @@ def _checked_blocks(
             f"than once among the {dst.size} a fabric batch writes; its copies "
             "run concurrently, so they must not overlap"
         )
-    return src, dst
+    order = np.argsort(dst, kind="stable")
+    return src[order], dst[order]
 
 
 def unit_batch(
@@ -282,9 +286,9 @@ def unit_batch(
     dst_blocks: Sequence[int],
     local_num_blocks: int,
     remote_num_blocks: int,
-) -> tuple[list[int], list[int], list[int]]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Pool-relative ``(local offsets, remote offsets, sizes)`` of a push paired
-    by unit rather than by position.
+    by unit rather than by position, in destination order.
 
     Local region ``i`` lands in remote region ``targets[i]``; ``cuts[i]`` is
     its ``[src offset, dst offset, bytes]`` rows within one block
@@ -304,15 +308,17 @@ def unit_batch(
     src, dst = _checked_blocks(
         src_blocks, dst_blocks, local_num_blocks, remote_num_blocks
     )
-    local_offs, remote_offs, sizes = [], [], []
-    for i, ((l_off, l_unit), c, rows) in enumerate(zip(local_regions, targets, cuts)):
+    for i, c in enumerate(targets):
         if not 0 <= c < len(remote_regions):
             raise ValueError(
                 f"PAGE region {i} lands in remote region {c} of "
                 f"{len(remote_regions)}"
             )
+    local_offs, remote_offs, sizes = [], [], []
+    for i in sorted(range(len(targets)), key=lambda i: remote_regions[targets[i]][0]):
+        (l_off, l_unit), c = local_regions[i], targets[i]
         r_off, r_unit = remote_regions[c]
-        rows = np.asarray(rows, dtype=np.int64).reshape(-1, 3)
+        rows = np.asarray(cuts[i], dtype=np.int64).reshape(-1, 3)
         ends = np.cumsum(rows[:, 2])
         if (
             rows[:, 0].min() < 0
@@ -332,13 +338,7 @@ def unit_batch(
         local_offs.append(seg_src)
         remote_offs.append(seg_dst)
         sizes.append(seg_len)
-    if not sizes or src.size == 0:
-        return [], [], []
-    return (
-        np.concatenate(local_offs).tolist(),
-        np.concatenate(remote_offs).tolist(),
-        np.concatenate(sizes).tolist(),
-    )
+    return _concatenated(local_offs, remote_offs, sizes)
 
 
 def shard_pairs(

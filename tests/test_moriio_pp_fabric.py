@@ -3,7 +3,7 @@
 
 """MiniMax-M3.1 P/D from a PP4 x TP1 prefill into a TP4 decode over the fabric.
 
-- Placement, byte for byte: each P stage's real pools (the M3 builder's NVFP4
+- Placement, byte for byte, posted whole or in batches: each P stage's real pools (the M3 builder's NVFP4
   K/V and FP4 index, the DSpark draft on the last stage) are pushed into each
   of four TP4 decode ranks' real pools by `MoRIIOConnector._write_pages`, and
   every byte of each decode rank's blocks must be what a TP4 layout of the same
@@ -41,6 +41,7 @@ from test_moriio_fabric import (
     fabric_connector,
     handshake,
     kv_config,
+    post_whole,
 )
 from torch import nn
 
@@ -240,13 +241,18 @@ def pd(stack):
 SRC, DST = [5, 6, 2, 0], [3, 4, 9, 1]
 
 
-def push_all(stack, pd, verify=False, skip=()):
-    """Every stage pushes every D rank; returns the written-byte counts per D
-    rank and the stage connectors."""
+def push_all(stack, pd, verify=False, skip=(), batch=None):
+    """Every stage pushes every D rank, each push posted whole or ``batch``
+    segments at a time; returns the written-byte counts per D rank and the
+    stage connectors."""
     written = [torch.zeros(r.pool.numel(), dtype=torch.int32) for r in pd.ranks]
     consumers = [decode_connector(stack, r, i) for i, r in enumerate(pd.ranks)]
     producers = []
-    with mock.patch("torch.cuda.current_device", lambda: 0):
+    env = {} if batch is None else {"ATOM_MORIIO_PUSH_SEGMENT_BATCH": str(batch)}
+    with (
+        mock.patch("torch.cuda.current_device", lambda: 0),
+        mock.patch.dict("os.environ", env),
+    ):
         for s, side in enumerate(pd.stages):
             conn = stage_connector(stack, s, side)
             conn._verify_kv = verify
@@ -262,8 +268,15 @@ def push_all(stack, pd, verify=False, skip=()):
                 )
                 request = push_request(r)
                 conn.posted = []
-                conn._write_pages(request, engine(r), SRC[: len(DST)], DST)
-                assert len(conn.posted) == 1  # one batch per (stage, D rank)
+                post_whole(conn, request, engine(r), SRC[: len(DST)], DST)
+                sizes = [len(post[3]) for post in conn.posted]
+                if batch is None:
+                    assert len(sizes) == 1  # one post per (stage, D rank)
+                else:
+                    assert len(sizes) > 1 and max(sizes) <= batch
+                # In destination order, which mori's copy plan sorts them into.
+                r_offs = [off for post in conn.posted for off in post[2]]
+                assert r_offs == sorted(r_offs)
                 written[r] += apply_batch(conn.posted, side.pool, pd.ranks[r].pool)
                 if verify:
                     consumers[r][0].stage_reports = getattr(
@@ -273,9 +286,10 @@ def push_all(stack, pd, verify=False, skip=()):
 
 
 class TestPlacement:
-    def test_every_d_rank_holds_the_tp4_layout_of_the_same_kv(self, stack, pd):
+    @pytest.mark.parametrize("batch", [None, 7])
+    def test_every_d_rank_holds_the_tp4_layout_of_the_same_kv(self, stack, pd, batch):
         before = [r.pool.clone() for r in pd.ranks]
-        written, _, _ = push_all(stack, pd)
+        written, _, _ = push_all(stack, pd, batch=batch)
         payload, scale = stack.index_fp4.fp4_index_row_bytes(M31_INDEX_DIM)
         for r, rank in enumerate(pd.ranks):
             d_pool = rank.runner.attn_metadata_builder.kv_pools
@@ -322,8 +336,11 @@ class TestPlacement:
             untouched = expected == 0
             assert torch.equal(rank.pool[untouched], before[r][untouched])
 
-    def test_the_verify_digests_merge_over_stages_and_match(self, stack, pd, caplog):
-        _, _, consumers = push_all(stack, pd, verify=True)
+    @pytest.mark.parametrize("batch", [None, 7])
+    def test_the_verify_digests_merge_over_stages_and_match(
+        self, stack, pd, caplog, batch
+    ):
+        _, _, consumers = push_all(stack, pd, verify=True, batch=batch)
         for r, (consumer, _meta) in enumerate(consumers):
             prepare_consumer(consumer)
             consumer._verify_kv = True

@@ -242,7 +242,7 @@ def fabric_connector(stack, *, producer: bool, handle: bytes = b"\x01" * 64):
 
     def write(sizes, l_offs, r_offs, session):
         conn.posted.append((session, list(l_offs), list(r_offs), list(sizes)))
-        return "status"
+        return types.SimpleNamespace(Succeeded=lambda: True, Failed=lambda: False)
 
     conn.moriio_wrapper = types.SimpleNamespace(
         register_local_buffer=lambda ptr, size, device: packed_desc(ptr, size, handle),
@@ -252,6 +252,14 @@ def fabric_connector(stack, *, producer: bool, handle: bytes = b"\x01" * 64):
         write_remote_data_status=write,
     )
     return conn
+
+
+def post_whole(conn, request, engine_id, src, dst):
+    """`_write_pages`, every batch of the push posted."""
+    [push] = conn._write_pages(request, engine_id, src, dst)
+    while push.remaining:
+        push.post_next()
+    return push
 
 
 def handshake(stack, producer, consumer_meta):
@@ -400,8 +408,8 @@ class TestM31RegionCoverage:
         pool_d.copy_(torch.randint(0, 256, pool_d.shape, generator=generator))
         before = pool_d.clone()
         src, dst = [5, 6, 7, 1], [2, 3, 4, 9]
-        producer._write_pages(
-            {"transfer_id": 9, "decode_tp_size": TP}, "decode", src, dst
+        post_whole(
+            producer, {"transfer_id": 9, "decode_tp_size": TP}, "decode", src, dst
         )
         # One batch, one segment per region and run (5-7 -> 2-4, then 1 -> 9).
         [(session, _l_offs, _r_offs, sizes)] = producer.posted
@@ -542,8 +550,8 @@ class TestM31IndexShard:
         before = pool_d.clone()
         # Both ends allocate logical block j in lane j % 4.
         src, dst = [4, 1, 6, 3, 5], [8, 9, 2, 11, 1]
-        producer._write_pages(
-            {"transfer_id": 9, "decode_tp_size": TP}, "decode", src, dst
+        post_whole(
+            producer, {"transfer_id": 9, "decode_tp_size": TP}, "decode", src, dst
         )
         [(_session, _l, _r, sizes)] = producer.posted
         written = apply_batch(producer.posted, pool_p, pool_d)
@@ -602,8 +610,8 @@ class TestM31IndexShard:
             (rep, (pool_rp, pool_rd)),
             (shd, (pool_sp, pool_sd)),
         ):
-            producer._write_pages(
-                {"transfer_id": 9, "decode_tp_size": TP}, "decode", src, dst
+            post_whole(
+                producer, {"transfer_id": 9, "decode_tp_size": TP}, "decode", src, dst
             )
             apply_batch(producer.posted, pool_p, pool_d)
         for page_r, page_s in zip(tt_rd.pages, tt_sd.pages):
@@ -664,8 +672,8 @@ class TestM31IndexShard:
         generator = torch.Generator().manual_seed(1)
         pool_p.copy_(torch.randint(0, 256, pool_p.shape, generator=generator))
         src, dst = [4, 1, 6, 3, 5], [8, 9, 2, 11, 1]
-        producer._write_pages(
-            {"transfer_id": 9, "decode_tp_size": TP}, "decode", src, dst
+        post_whole(
+            producer, {"transfer_id": 9, "decode_tp_size": TP}, "decode", src, dst
         )
         apply_batch(producer.posted, pool_p, pool_d)
         assert consumer._page_digests(dst) == producer._page_digests(src)
@@ -717,17 +725,24 @@ class TestPageBatch:
         offs = stack.fabric.page_batch(
             [(0, 16), (1000, 4)], [(64, 16), (5000, 4)], [2, 3, 7], [3, 4, 0], 8, 8
         )
-        assert offs == (
-            [32, 112, 1008, 1028],
-            [64 + 48, 64, 5012, 5000],
-            [32, 16, 8, 4],
+        # In destination order, so mori's copy plan need not sort them.
+        assert tuple(column.tolist() for column in offs) == (
+            [112, 32, 1028, 1008],
+            [64, 64 + 48, 5000, 5012],
+            [16, 32, 4, 8],
         )
+
+    def test_regions_go_in_remote_offset_order(self, stack):
+        _, r_offs, _ = stack.fabric.page_batch(
+            [(0, 4), (100, 4)], [(500, 4), (0, 4)], [0, 1], [1, 0], 8, 8
+        )
+        assert r_offs.tolist() == [0, 4, 500, 504]
 
     def test_a_gap_on_either_side_splits_the_run(self, stack):
         _, _, sizes = stack.fabric.page_batch(
             [(0, 1)], [(0, 1)], [1, 2, 4, 5], [1, 2, 3, 4], 8, 8
         )
-        assert sizes == [2, 2]
+        assert sizes.tolist() == [2, 2]
 
     def test_refusals(self, stack):
         batch = partial(stack.fabric.page_batch, [(0, 4)], [(0, 4)])

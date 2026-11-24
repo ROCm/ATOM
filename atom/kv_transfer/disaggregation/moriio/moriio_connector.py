@@ -20,6 +20,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict, defaultdict, deque
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
@@ -1887,13 +1888,14 @@ class MoRIIOConnector(KVConnectorBase):
     def _write_pages(
         self, request: dict[str, Any], engine_id: str, src: list[int], dst: list[int]
     ) -> list[Any]:
-        """Push every PAGE region's source blocks into the consumer's, as one batch.
+        """Push every PAGE region's source blocks into the consumer's.
 
         Paired by position when both ends hold the same regions (one stage, the
         same TP); otherwise by unit (`_page_plan`): a PP stage writes the
         consumer's regions of its own layers, and a TP1 stage cuts each
-        consumer rank its KV heads. One batch per consumer rank, and the
-        stages' batches write disjoint regions.
+        consumer rank its KV heads. One push per consumer rank, and the
+        stages' pushes write disjoint regions. Returns the push as one status
+        (`_BatchedPush`), not yet posted.
         """
         decode_tp_size = int(request.get("decode_tp_size") or self.tp_size)
         local_regions = [entry[:2] for entry in self._page_regions]
@@ -1906,21 +1908,20 @@ class MoRIIOConnector(KVConnectorBase):
             engine_id, positional=plan is None
         )
         if plan is None:
-            # One batch: the whole regions' blocks, then each shard's own ones.
-            l_offs, r_offs, sizes = [], [], []
+            # The whole regions' blocks, then each shard's own ones.
+            parts = []
             for (rank, world), positions in self._page_shard_groups().items():
                 pairs = (src, dst) if world == 1 else shard_pairs(src, dst, rank, world)
-                for into, part in zip(
-                    (l_offs, r_offs, sizes),
+                parts.append(
                     page_batch(
                         [local_regions[i] for i in positions],
                         [remote_regions[i] for i in positions],
                         *pairs,
                         self.num_blocks // world,
                         remote_blocks // world,
-                    ),
-                ):
-                    into.extend(part)
+                    )
+                )
+            l_offs, r_offs, sizes = (np.concatenate(column) for column in zip(*parts))
         else:
             l_offs, r_offs, sizes = unit_batch(
                 local_regions,
@@ -1940,9 +1941,29 @@ class MoRIIOConnector(KVConnectorBase):
                 if plan is None
                 else self._plan_digests(plan, src)
             )
-        request["_page_stats"] = (time.monotonic(), sum(sizes), len(dst), len(sizes))
+        request["_page_stats"] = (
+            time.monotonic(),
+            int(sizes.sum()),
+            len(dst),
+            len(sizes),
+        )
+
+        def post(lo: int, hi: int) -> Any:
+            return self.moriio_wrapper.write_remote_data_status(
+                sizes[lo:hi].tolist(),
+                l_offs[lo:hi].tolist(),
+                r_offs[lo:hi].tolist(),
+                session,
+            )
+
         return [
-            self.moriio_wrapper.write_remote_data_status(sizes, l_offs, r_offs, session)
+            _BatchedPush(
+                request["transfer_id"],
+                post,
+                len(sizes),
+                envs.ATOM_MORIIO_PUSH_SEGMENT_BATCH,
+                request.get("deadline"),
+            )
         ]
 
     def _page_plan(
@@ -2058,9 +2079,9 @@ class MoRIIOConnector(KVConnectorBase):
 
         Three spans, all on this rank's monotonic clock: ``queue_ms`` from the
         WRITE_REQ's arrival on the listener to the step that took it up,
-        ``wait_ms`` from there to posting the batch (the handshake and the
-        prefill's KV-ready event), ``write_ms`` from posting to the step that
-        saw it settle. ``skipped``: the decode's own prefix-cache blocks left
+        ``wait_ms`` from there to posting its first batch (the handshake and
+        the prefill's KV-ready event), ``write_ms`` from there to the step that
+        saw its last settle. ``skipped``: the decode's own prefix-cache blocks left
         out of the push (ATOM_MORIIO_INCREMENTAL_PUSH). Pushes are served from
         ``get_finished``, once per engine step, so the first and the last
         include up to a step each; with ATOM_MORIIO_WRITE_THREAD, by a thread
@@ -2733,18 +2754,32 @@ class MoRIIOConnector(KVConnectorBase):
         Posting a push costs time in proportion to its segments (a 5K-block
         push from a TP1 stage to a TP4 consumer is ~1M of them, ~0.2 s per
         consumer rank), and every push behind it waits. So the smallest ready
-        push goes first, WRITE_REQs that arrived meanwhile join before each
-        pick, and pushes that have landed are reported between posts.
+        push starts first, and a fabric push is posted a batch at a time
+        (`_BatchedPush`): once every ready push has started, the one with the
+        fewest segments left posts its next batch. WRITE_REQs that arrived
+        meanwhile join before each pick, and pushes that have landed are
+        reported between posts.
         """
         self._accept_write_requests()
         self._forget_finished_writes()
         while True:
             ready = self._ready_writes()
-            if not ready:
-                break
-            entry = min(ready, key=lambda e: len(e[0]["dst_block_ids"]))
-            self._pending_writes = [e for e in self._pending_writes if e is not entry]
-            self._post_write(entry[0])
+            if ready:
+                entry = min(ready, key=lambda e: len(e[0]["dst_block_ids"]))
+                self._pending_writes = [
+                    e for e in self._pending_writes if e is not entry
+                ]
+                self._post_write(entry[0])
+            else:
+                started = [
+                    status
+                    for statuses, _ in self._sending_writes.values()
+                    for status in statuses
+                    if isinstance(status, _BatchedPush) and status.remaining
+                ]
+                if not started:
+                    break
+                min(started, key=lambda push: push.remaining).post_next()
             self._settle_writes()
             self._accept_write_requests()
         self._settle_writes()
@@ -3872,6 +3907,101 @@ class _PostFailed:
 
 
 _POST_FAILED = _PostFailed()
+
+
+class _BatchedPush:
+    """A fabric push posted ``batch`` segments at a time, standing as its one
+    transfer status.
+
+    Posting holds the pushing thread for time in proportion to the segments
+    (mori converts and plans every one of them on the host), so a push from a
+    TP1 stage into a TP4 consumer, ~1M segments, would hold back every other
+    push for ~0.2 s. `_service_write_requests` posts its batches
+    (`post_next`) in turn with the other pushes'.
+
+    It has settled once every batch is posted and has settled, and failed if
+    any batch did. Posting stops at a batch that has failed, a batch that
+    cannot be posted, or the consumer's deadline, past which no write may
+    start; the push then fails once the batches posted have settled.
+    """
+
+    def __init__(
+        self,
+        transfer_id: Any,
+        post: Callable[[int, int], Any],
+        total: int,
+        batch: int,
+        deadline: float | None,
+    ):
+        self._transfer_id = transfer_id
+        self._post = post
+        self._total = total
+        self._batch = batch if batch > 0 else max(total, 1)
+        self._deadline = deadline
+        self._posted = 0
+        self._statuses: list[Any] = []
+
+    @property
+    def remaining(self) -> int:
+        """Segments not yet posted."""
+        return self._total - self._posted
+
+    def post_next(self) -> None:
+        """Post the next batch, or stop posting."""
+        if any(status.Failed() for status in self._statuses):
+            why = "a batch failed"
+        elif self._deadline is not None and time.time() > float(self._deadline):
+            why = "the consumer's push deadline passed"
+        else:
+            why = None
+        if why is not None:
+            logger.error(
+                "transfer %s: %s with %d of %d segments posted; the push fails",
+                self._transfer_id,
+                why,
+                self._posted,
+                self._total,
+            )
+            self._stop()
+            return
+        end = min(self._posted + self._batch, self._total)
+        try:
+            status = self._post(self._posted, end)
+        except Exception:
+            logger.exception(
+                "transfer %s: could not post segments %d-%d of %d",
+                self._transfer_id,
+                self._posted,
+                end,
+                self._total,
+            )
+            self._stop()
+            return
+        self._statuses.append(status)
+        self._posted = end
+
+    def _stop(self) -> None:
+        self._statuses.append(_POST_FAILED)
+        self._posted = self._total
+
+    def Succeeded(self) -> bool:
+        return not self.remaining and all(s.Succeeded() for s in self._statuses)
+
+    def Failed(self) -> bool:
+        return (
+            not self.remaining
+            and all(s.Succeeded() or s.Failed() for s in self._statuses)
+            and any(s.Failed() for s in self._statuses)
+        )
+
+    def _first_failed(self) -> Any:
+        return next(s for s in self._statuses if s.Failed())
+
+    def Message(self) -> str:
+        return self._first_failed().Message()
+
+    def Code(self) -> Any:
+        return self._first_failed().Code()
 
 
 def _zmq_ctx(socket_type: int, addr: str):
