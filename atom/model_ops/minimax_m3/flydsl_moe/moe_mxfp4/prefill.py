@@ -6,6 +6,7 @@ aiter's scale sort, gemm1 (gate/up + SwiGLU-OAI + MXFP4 quant), gemm2
 """
 
 import functools
+import struct
 
 import torch
 
@@ -26,6 +27,11 @@ GEMM1_SWIGLU_LIMIT = 7.0
 _GEMM1_BLOCK_K = 256
 # gemm2's K pipeline is written for 3 K-steps of 256
 _GEMM2_INTERMEDIATE = 768
+
+
+def _f32_bits(x: float) -> int:
+    """The int32 bit pattern of ``x`` as an fp32 (kernel arguments are integers)."""
+    return struct.unpack("<i", struct.pack("<f", x))[0]
 
 
 def supports_shapes(hidden_size: int, intermediate_size: int) -> bool:
@@ -82,9 +88,15 @@ def a4w4_prefill_moe(
     intermediate_size: int,
     num_experts: int,
     out: torch.Tensor | None = None,
+    scale: float = 1.0,
+    add: torch.Tensor | None = None,
+    add_row0: int = 0,
 ) -> torch.Tensor:
     """``x_quant`` = (fp4 ``[M, H/2]``, e8m0 ``[M, H/32]``) of aiter's per-token
-    MXFP4 quant -> ``[M, H]`` bf16, on ``AiterMxfp4Experts``' weights."""
+    MXFP4 quant -> ``[M, H]`` bf16, on ``AiterMxfp4Experts``' weights.
+
+    ``scale`` and ``add`` (bf16 ``[R, H]``, added onto rows ``add_row0 .. +R``)
+    ride on the final reduce: ``out = reduce * scale + add``, one bf16 rounding."""
     from aiter import dtypes
     from aiter.ops.quant import mxfp4_moe_sort_hip
 
@@ -184,11 +196,26 @@ def a4w4_prefill_moe(
     )
     if out is None:
         out = torch.empty((n_tokens, hidden), dtype=torch.bfloat16, device=device)
+    fused = scale != 1.0 or add is not None
+    if add is None:
+        add_t, add_rows = out, 0  # never read: zero rows of range
+    else:
+        assert add.dtype == torch.bfloat16 and add.shape[1] == hidden, add.shape
+        assert (
+            add.is_contiguous()
+            and 0 <= add_row0
+            and add_row0 + add.shape[0] <= n_tokens
+        )
+        add_t, add_rows = add, add.shape[0]
     run_compiled(
-        _get_reduce_bf16(hidden, topk),
+        _get_reduce_bf16(hidden, topk, fused),
         partial.view(-1),
         out.view(-1),
+        add_t.view(-1),
         n_tokens,
+        add_row0,
+        add_rows,
+        _f32_bits(scale),
         stream,
     )
     return out
