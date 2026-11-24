@@ -182,6 +182,18 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
             .or_default()
             .clone();
         let _reconciling = reconciling.lock().await;
+        // Its template recorded first: a chat that finds the tokenizer finds that too.
+        let record_template = || {
+            if let Some(template) = &inline_template {
+                let templates = &app_context.tokenizer_inline_templates;
+                templates.write().insert(id.clone(), template.clone());
+            }
+            if let Some(path) = &chat_template {
+                let files = &app_context.tokenizer_template_files;
+                files.write().insert(id.clone(), path.clone());
+            }
+        };
+        record_template();
         let mut result = registry.load(&id, &name, &source, &loader).await;
         // Template precedence: a template file > a worker's inline template > none. Loaded
         // before with a lower one, or another worker's: load again.
@@ -210,6 +222,7 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                 let replacement = loader().await;
                 result = match replacement {
                     Ok(tokenizer) => {
+                        record_template();
                         // Lookups read the replaced entry until the new one is in.
                         let replaced = registry.get_by_id(loaded);
                         let swapping = &app_context.tokenizers_replaced;
@@ -231,14 +244,8 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                 };
             }
         }
-        if let (Ok(LoadOutcome::Loaded { id: loaded }), Some(template)) = (&result, inline_template)
-        {
-            let templates = &app_context.tokenizer_inline_templates;
-            templates.write().insert(loaded.clone(), template);
-        }
-        if let (Ok(LoadOutcome::Loaded { id: loaded }), Some(path)) = (&result, &chat_template) {
-            let files = &app_context.tokenizer_template_files;
-            files.write().insert(loaded.clone(), path.clone());
+        if !registry.contains_id(&id) {
+            app_context.forget_tokenizer(&id); // what it recorded for a tokenizer not loaded
         }
 
         match result {
@@ -740,6 +747,68 @@ mod tests {
         let recorded = templates.read().get(&entry.id).cloned().unwrap();
         assert_eq!(recorded, format!("{{{{ '{rendered}' }}}}"));
         assert_eq!((tokenizer.len(), templates.read().len()), (1, 1));
+    }
+
+    /// A replacement's template file is recorded before its tokenizer is visible: a
+    /// chat that finds the model's tokenizer finds the template it was loaded with.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_a_replacement_s_template_file_is_recorded_before_its_tokenizer() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let context = app_context();
+        let dir = tempfile::TempDir::new().unwrap();
+        let paths = ["first", "second"].map(|name| {
+            let file = dir.path().join(format!("{name}.jinja"));
+            std::fs::write(&file, format!("{name}: {{{{ messages[0].content }}}}")).unwrap();
+            file.to_str().unwrap().to_string()
+        });
+        let register = |path: &str| {
+            let config = TokenizerConfigRequest {
+                id: TokenizerRegistry::generate_id(),
+                name: "m".to_string(),
+                source: hf_tokenizer_path().to_string(),
+                chat_template_path: Some(path.to_string()),
+                inline_chat_template: None,
+                cache_config: None,
+                fail_on_duplicate: false,
+            };
+            let data = create_tokenizer_workflow_data(config, context.clone());
+            async move {
+                let mut workflow = WorkflowContext::new(WorkflowInstanceId::new(), data);
+                LoadTokenizerStep.execute(&mut workflow).await
+            }
+        };
+        register(&paths[0]).await.unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let (context, done) = (context.clone(), done.clone());
+            std::thread::spawn(move || {
+                let (registry, files) = (
+                    &context.tokenizer_registry,
+                    &context.tokenizer_template_files,
+                );
+                let mut unrecorded = 0;
+                while !done.load(Ordering::Relaxed) {
+                    let Some(seen) = registry.get_by_name("m") else {
+                        continue;
+                    };
+                    let recorded = files.read().contains_key(&seen.id);
+                    // The replaced one's record goes once it is no longer the model's.
+                    let current = registry.get_by_name("m").is_some_and(|e| e.id == seen.id);
+                    unrecorded += usize::from(!recorded && current);
+                }
+                unrecorded
+            })
+        };
+        for swap in 1..=20 {
+            register(&paths[swap % 2]).await.unwrap();
+        }
+        done.store(true, Ordering::Relaxed);
+        assert_eq!(
+            reader.join().unwrap(),
+            0,
+            "a tokenizer was seen before its file"
+        );
     }
 
     /// A model `--fastokens-models` lists encodes with fastokens, which leaves the
