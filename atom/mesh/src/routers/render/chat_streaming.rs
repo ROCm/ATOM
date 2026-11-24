@@ -3,6 +3,7 @@
 
 use std::{io, sync::Arc, time::Instant};
 
+use super::chat_aggregator::RELEASE;
 use axum::{body::Body, http::StatusCode, response::Response};
 use bytes::Bytes;
 use futures::StreamExt;
@@ -309,16 +310,38 @@ async fn run_chat_stream(
                 meta,
                 ..
             } => {
-                if let SequenceDecoderOutput::Text(text) = stop_decoder.flush() {
-                    if !text.is_empty() {
-                        let chunk = ChatCompletionStreamResponse::builder(request_id, model)
-                            .created(created)
-                            .add_choice_content(INDEX, "assistant", text)
-                            .maybe_system_fingerprint(system_fingerprint.clone())
-                            .build();
-                        format_sse_chunk_into(&mut sse_buffer, &chunk, null_usage);
-                        send_bytes(tx, &sse_buffer, "flushed content")?;
+                let mut text = match stop_decoder.flush() {
+                    SequenceDecoderOutput::Text(text) => text,
+                    _ => String::new(),
+                };
+                // The reasoning parser holds a last "<" or "</"; RELEASE frees it.
+                if let Some(parser) = &reasoning_parser {
+                    let released = parser
+                        .lock()
+                        .await
+                        .parse_reasoning_streaming_incremental(&format!("{text}{RELEASE}"));
+                    if let Ok(released) = released {
+                        let reasoning = released.reasoning_text.trim_end_matches(RELEASE);
+                        if !reasoning.is_empty() {
+                            let chunk = ChatCompletionStreamResponse::builder(request_id, model)
+                                .created(created)
+                                .add_choice_reasoning(INDEX, reasoning.to_string())
+                                .maybe_system_fingerprint(system_fingerprint.clone())
+                                .build();
+                            format_sse_chunk_into(&mut sse_buffer, &chunk, null_usage);
+                            send_bytes(tx, &sse_buffer, "released reasoning")?;
+                        }
+                        text = released.normal_text.trim_end_matches(RELEASE).to_string();
                     }
+                }
+                if !text.is_empty() {
+                    let chunk = ChatCompletionStreamResponse::builder(request_id, model)
+                        .created(created)
+                        .add_choice_content(INDEX, "assistant", text)
+                        .maybe_system_fingerprint(system_fingerprint.clone())
+                        .build();
+                    format_sse_chunk_into(&mut sse_buffer, &chunk, null_usage);
+                    send_bytes(tx, &sse_buffer, "flushed content")?;
                 }
 
                 prompt_tokens = usage.prompt_tokens;

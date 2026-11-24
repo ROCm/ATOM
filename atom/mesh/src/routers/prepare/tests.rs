@@ -1637,6 +1637,32 @@ mod h_prepare_chat_generate {
         assert_ne!(refused(), Some(http::StatusCode::SERVICE_UNAVAILABLE));
     }
 
+    /// An ATOM worker advertising no template has its chats served when the tokenizer
+    /// was loaded with a template file, which outranks the worker's.
+    #[test]
+    fn test_a_template_file_serves_chats_of_a_worker_without_a_template() {
+        use crate::core::{BasicWorkerBuilder, RuntimeType};
+
+        let registry = test_mocks::tokenizer_registry_with("m");
+        let components = test_mocks::app_context_with_tokenizer_registry(registry.clone());
+        let worker = BasicWorkerBuilder::new("grpc://atom:4")
+            .runtime_type(RuntimeType::Atom)
+            .model_id("m")
+            .build();
+        components.worker_registry.register(Arc::new(worker));
+        let status = || {
+            let chat = prepare_chat(chat_req(false), None, Some("m".into()), &components);
+            chat.err().map(|refused| refused.status())
+        };
+        assert_eq!(status(), Some(http::StatusCode::NOT_IMPLEMENTED));
+        let loaded = registry.get_by_name("m").unwrap().id;
+        components.tokenizer_template_files.write().insert(loaded);
+        // Past both template checks (the mock tokenizer then fails to render).
+        let served = status();
+        assert_ne!(served, Some(http::StatusCode::NOT_IMPLEMENTED));
+        assert_ne!(served, Some(http::StatusCode::SERVICE_UNAVAILABLE));
+    }
+
     #[test]
     fn test_prepare_generate_request_ids_unique_per_call() {
         let registry = test_mocks::tokenizer_registry_with("m");
@@ -1725,6 +1751,36 @@ mod i_atom_structured_output {
     }
 
     #[test]
+    fn an_atom_chats_reasoning_effort_reaches_its_kwargs_as_atoms_http_chat_applies_it() {
+        let toggle = (
+            "reasoning_toggle_json",
+            r#"["enable_thinking", false, true]"#,
+        );
+        let defaults = (
+            "default_chat_template_kwargs_json",
+            r#"{"enable_thinking": true}"#,
+        );
+        let kwargs = |effort: &str, labels: &[(&str, &str)]| {
+            let body = json!({
+                "model": "m", "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": effort,
+            });
+            let (payload, _) = prepared(body, RuntimeType::Atom, labels);
+            parsed(Some(
+                payload.structured_output.unwrap().chat_template_kwargs_json,
+            ))
+        };
+        // "none" switches reasoning off over a default that has it on, and sets no effort.
+        let off = Some(json!({"enable_thinking": false}));
+        assert_eq!(kwargs("none", &[toggle, defaults]), off);
+        assert_eq!(kwargs("none", &[toggle]), off);
+        // A template effort is `thinking_effort`; another one is dropped.
+        let high = Some(json!({"enable_thinking": true, "thinking_effort": "high"}));
+        assert_eq!(kwargs("high", &[toggle, defaults]), high);
+        assert_eq!(kwargs("medium", &[toggle]), Some(json!({})));
+    }
+
+    #[test]
     fn an_atom_chat_carries_its_fields_as_sent_its_kwargs_and_its_reasoning_opening() {
         let tool =
             |name: &str| json!({"type": "function", "function": {"name": name, "parameters": {}}});
@@ -1763,7 +1819,7 @@ mod i_atom_structured_output {
         assert_eq!(parsed(carried.response_format_json), Some(format));
         let message_tools = json!([[tool("lookup")], null]);
         assert_eq!(parsed(carried.message_tools_json), Some(message_tools));
-        let kwargs = json!({"flag": "request", "kept": 1, "reasoning_effort": "high"});
+        let kwargs = json!({"flag": "request", "kept": 1, "thinking_effort": "high"});
         assert_eq!(
             parsed(Some(carried.chat_template_kwargs_json)),
             Some(kwargs)
