@@ -863,6 +863,24 @@ fn requests_cancelled_while_the_writer_stalls_cannot_queue_without_bound() {
 }
 
 #[test]
+fn a_dropped_request_that_does_not_stream_keeps_its_seq_id_but_no_ids() {
+    let (commands, mut queued) = mpsc::unbounded_channel();
+    let (session, _) = Session::new(Arc::new(Mutex::new(Routes::default())), commands);
+    let dropped = session.submit(spec("dropped"), vec![1], false).unwrap();
+    let waiting: Vec<_> = std::iter::from_fn(|| queued.try_recv().ok()).collect();
+    session.routes.lock().take_unsent(waiting);
+    let seq_id = dropped.seq_id;
+    drop(dropped);
+
+    // Its Abort is not yet read: the steps before it still reach the request.
+    let message = Inbound::decode(step(&[(seq_id, vec![7; 64], 0)]).unwrap().frames);
+    session.routes.lock().route(&message.unwrap()).unwrap();
+    let routes = session.routes.lock();
+    assert!(routes.open[&seq_id].ids.is_empty());
+    assert_eq!(routes.open[&seq_id].completion_tokens, 64);
+}
+
+#[test]
 fn a_stream_left_unread_fails_alone_and_is_aborted_once_keeping_its_seq_id() {
     let (commands, mut queued) = mpsc::unbounded_channel();
     let routes = Arc::new(Mutex::new(Routes::default()));

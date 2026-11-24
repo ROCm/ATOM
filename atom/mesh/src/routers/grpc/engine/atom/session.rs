@@ -646,6 +646,9 @@ impl Routes {
                 if route.stream(chunk) {
                     overflowed.push(*seq_id);
                 }
+            } else if route.tx.is_closed() {
+                // A dropped request's ids, which its Abort ends, are read by no one.
+                route.ids = Vec::new();
             } else {
                 route.ids.extend(token_ids);
             }
