@@ -10,6 +10,7 @@ the *context* KV write: the target rows the drafter absorbs after every target
 forward.
 """
 
+import os
 from functools import cache
 
 import torch
@@ -20,8 +21,18 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE, fp8_groups
 from atom.model_ops.deepseek_v41.draft_block import DraftSrcIndices
 from atom.model_ops.deepseek_v41.mhc import write_stream_state
-from atom.model_ops.sparse_attn_v4 import sparse_attn
+from atom.model_ops.sparse_attn_v4 import sparse_attn, sparse_attn_two_buffers
 from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src
+
+# "1" reads the window and the block where they lie instead of `torch.cat` +
+# `sparse_attn` on the BF16 draft's concatenating path (default off in round 2:
+# every new path is a switch). Read at import; the two spellings write the same
+# bytes. Only beside the Triton `sparse_attn` (`ATOM_USE_TRITON_ATTN`, its
+# default): the torch fallback keeps its own path.
+_DRAFT_ATTN_NO_CAT = (
+    os.environ.get("ATOM_V41_DRAFT_ATTN_NO_CAT", "0") == "1"
+    and os.environ.get("ATOM_USE_TRITON_ATTN", "1") == "1"
+)
 
 
 def draft_attention(query, context_kv, draft_kv, sink, step, scale):
@@ -35,6 +46,20 @@ def draft_attention(query, context_kv, draft_kv, sink, step, scale):
     """
     src = step.src_indices
     if src is None:
+        if _DRAFT_ATTN_NO_CAT and query.is_cuda:
+            # The concatenating path's rows and arithmetic, read where the
+            # window and the block lie: the same bytes out, one launch fewer.
+            # `draft_step` / `_draft_step_kernel` lay the list out as the ring
+            # slots (their own index or -1), then the block rows.
+            return sparse_attn_two_buffers(
+                query,
+                context_kv,
+                draft_kv,
+                sink,
+                step.indices,
+                scale,
+                first_only=context_kv.shape[1],
+            )
         keys = torch.cat((context_kv, draft_kv), dim=1)
         return sparse_attn(query, keys, sink, step.indices, scale)
     # `DraftAttention.forward` hands over a GEMM output, the gathered window

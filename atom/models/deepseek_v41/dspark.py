@@ -33,6 +33,7 @@ from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
 from atom.model_ops.dspark_markov_argmax import (
+    dspark_markov_argmax_into,
     dspark_markov_argmax_tp,
     markov_weights_unsupported,
 )
@@ -231,6 +232,12 @@ class DeepseekV41DSpark(DSparkDraftModel):
             )
         self.config = args
         self.draft_kv_dtype = config.dspark.draft_kv_dtype
+        # Whether anything reads the confidence head: only the confidence
+        # schedule does (`DSparkProposer._propose`). ATOM_DSPARK_LEAN_HEAD
+        # skips the head while this is False.
+        self._confidence_consumed = bool(
+            getattr(config.dspark, "confidence_schedule", False)
+        )
         self.block_size = args.dspark_block_size
         self.window_size, self.vocab_size = args.sliding_window, args.vocab_size
         # Sized at the engine's batch bound, as the backbone's index buffers are.
@@ -772,6 +779,8 @@ class DeepseekV41DSpark(DSparkDraftModel):
             return self._head_and_sample_q(*out, anchor_ids)
         if self._sharded_markov_sample():
             return self._head_and_sample_sharded(*out, anchor_ids)
+        if envs.ATOM_DSPARK_LEAN_HEAD and self._lean_head_ok():
+            return self._head_and_sample_lean(*out, anchor_ids)
         return self._head_and_sample(*out, anchor_ids)
 
     def _head_and_sample_q(self, normed, hc_hidden, anchor_ids):
@@ -799,6 +808,63 @@ class DeepseekV41DSpark(DSparkDraftModel):
         prev_ids = torch.cat([anchor_ids[:, None], out_ids[:, :-1]], dim=1)
         confidence = self.mtp[-1].confidence_head(hc_hidden, markov.markov_w1(prev_ids))
         return out_ids, confidence
+
+    def _lean_head_ok(self) -> bool:
+        """The lean head needs the fused Markov op on a bias-free head."""
+        head = self.head
+        markov = self.mtp[-1].markov_head
+        return (
+            head is not None
+            and head.bias is None
+            and markov.fused_sample
+            and markov_weights_unsupported(
+                markov.markov_w1.weight, markov.markov_w2.weight
+            )
+            is None
+        )
+
+    def _head_and_sample_lean(self, normed, hc_hidden, anchor_ids):
+        """``_head_and_sample`` minus the launches nothing reads (ATOM_DSPARK_LEAN_HEAD).
+
+        The same head GEMM and the same five Markov positions on the same
+        operands, so the same ids, bit for bit. What is gone: the copy of the
+        anchors into column 0 (position 0 reads them where they are), the stack
+        of the ``W1[x]`` rows (each position writes its column), and, while
+        nothing consumes a confidence (`_confidence_consumed`), the confidence
+        head itself -- its cat, its GEMV (two launches), its sigmoid, and the
+        clone `DraftGraph.run` makes of its result. Then the second value is
+        None, which `DSparkProposer._propose` already takes.
+
+        """
+        B, T, _ = hc_hidden.shape
+        head, last = self.head, self.mtp[-1]
+        markov = last.markov_head
+        w1, w2 = markov.markov_w1.weight, markov.markov_w2.weight
+        base_logits = head.get_logits(normed).view(B, T, -1)
+        want_conf = self._confidence_consumed
+        # The W1[x_{k-1}] rows: the confidence head's input, a column a
+        # position; one scratch column when nobody reads them.
+        embeds = w1.new_empty(B, T if want_conf else 1, w1.shape[1])
+        out_ids = self._markov_block(base_logits, anchor_ids, w1, w2, embeds, want_conf)
+        confidence = last.confidence_head(hc_hidden, embeds) if want_conf else None
+        return out_ids, confidence
+
+    @staticmethod
+    def _markov_block(base_logits, anchor_ids, w1, w2, embeds, per_position):
+        """The block's ids ``[B, T]``, left to right; position k reads column
+        k - 1 (the anchors for k = 0) and writes column k."""
+        B, T, _ = base_logits.shape
+        out_ids = anchor_ids.new_empty(B, T)
+        for k in range(T):
+            dspark_markov_argmax_into(
+                base_logits[:, k],
+                anchor_ids if k == 0 else out_ids[:, k - 1],
+                w1,
+                w2,
+                out_ids[:, k],
+                embeds[:, k if per_position else 0],
+            )
+        return out_ids
 
     def _sharded_markov_sample(self) -> bool:
         """Whether the block is sampled off this rank's vocab shard.

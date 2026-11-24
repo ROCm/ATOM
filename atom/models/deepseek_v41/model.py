@@ -17,6 +17,7 @@ from atom.model_ops.deepseek_v41.mhc_pre_delayed import (
     pre_delayed,
 )
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
+from atom.model_ops.deepseek_v41.shared_act import log_once
 from atom.model_ops.embed_head import VocabParallelEmbedding
 from atom.model_ops.engram.device.layer import EngramOp
 from atom.model_ops.engram.device.staging import EngramStagedRows
@@ -92,6 +93,10 @@ class Block(nn.Module):
         # Set with the packs: attention's fused MXFP8 norm output, where the
         # HIP kernel can write row-major scales (`fuse_quant_supported`).
         self.hc_fuse_quant = False
+        # The same for the FFN seam (ATOM_DSV41_FFN_SEAM_QUANT): its one reader
+        # of the pair is the shared expert's gate_up_proj, which otherwise runs
+        # `quantize_fp8` on the BF16 rows -- one launch a layer.
+        self.hc_ffn_fuse_quant = False
         self.engram = None
         if spec.layer_id in config.engram_layer_ids:
             width = (
@@ -125,6 +130,24 @@ class Block(nn.Module):
             and self.attn.wqkv_a.native_a8_group_rows is not None
             and not self.attn.wqkv_a.runs_bf16
         )
+
+        self.hc_ffn_fuse_quant = (
+            envs.ATOM_DSV41_FFN_SEAM_QUANT
+            and self.hc_ffn_fn_packed is not None
+            and fuse_quant_supported()
+            and getattr(self.ffn, "accepts_x_quant", False)
+        )
+        if envs.ATOM_DSV41_FFN_SEAM_QUANT:
+            log_once(
+                f"ffn_seam_quant:{self.hc_ffn_fuse_quant}",
+                "dsv41 ffn seam quant: "
+                + (
+                    "fused into the mHC seam (ATOM_DSV41_FFN_SEAM_QUANT)"
+                    if self.hc_ffn_fuse_quant
+                    else "unfused (needs the HIP mHC seam and a standalone "
+                    "group-32 MXFP8 shared expert on the single-stream path)"
+                ),
+            )
 
     def attention_forward(self, normed, cache, step, rope):
         """Keep BF16 for auxiliary readers and reuse the optional QKV quant."""
@@ -184,6 +207,7 @@ class Block(nn.Module):
             **self.hc_options,
             norm_eps=self.ffn_norm.eps,
             w_preshuffle_bf16=hc_fn is not None,
+            fuse_quant=self.hc_ffn_fuse_quant,
             sublayer_output=output,
             post_mix=post,
             combination=comb,
@@ -214,7 +238,14 @@ class Block(nn.Module):
         normed, residual, pre, post, comb = self.prepare_ffn(
             output, residual, pre, post, comb
         )
-        return self.finish_ffn(self.ffn(normed), residual, pre, post, comb)
+        if isinstance(normed, tuple):
+            # A fused-quant seam: the BF16 rows for the router and the routed
+            # experts, their MXFP8 pair for the shared expert.
+            hidden, hidden_fp8, hidden_scale = normed
+            output = self.ffn(hidden, (hidden_fp8, hidden_scale))
+        else:
+            output = self.ffn(normed)
+        return self.finish_ffn(output, residual, pre, post, comb)
 
 
 class DeepseekV41ForCausalLM(nn.Module):

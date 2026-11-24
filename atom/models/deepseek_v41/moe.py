@@ -147,5 +147,16 @@ class MoE(V4MoE):
         v41_record_tbo_expert_output(routed)
         return routed, is_complete
 
-    def forward(self, hidden):
-        return super().forward(hidden.reshape(-1, hidden.shape[-1])).view_as(hidden)
+    def forward(self, hidden, hidden_quant=None):
+        """``hidden_quant``: the FFN seam's MXFP8 pair of ``hidden`` (E4M3
+        values, row-major group-32 E8M0 scales), `quantize_fp8(hidden)`'s
+        bytes; the shared expert's gate_up_proj reads it instead of
+        quantizing the rows again (`MoE.accepts_x_quant`)."""
+        rows = hidden.reshape(-1, hidden.shape[-1])
+        if hidden_quant is not None:
+            values, scales = hidden_quant
+            hidden_quant = (
+                values.reshape(rows.shape[0], -1),
+                scales.reshape(rows.shape[0], -1),
+            )
+        return super().forward(rows, hidden_quant).view_as(hidden)

@@ -65,6 +65,7 @@ from atom.distributed.pcp_utils import (
     pcp_pad_len,
     pcp_round_robin_split,
 )
+from atom.distributed.ulysses_sp import sp_is_enabled
 from atom.model_loader.loader import WeightsMapper
 from atom.model_loader.weight_utils import local_model_dir
 
@@ -81,6 +82,10 @@ from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
 from atom.model_ops.communication_op import (
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce_add,
+)
+from atom.model_ops.deepseek_v41.shared_act import (
+    shared_act_quant,
+    shared_act_quant_enabled,
 )
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.indexer import (
@@ -2807,11 +2812,17 @@ class Expert(nn.Module):
         self.use_fused_clamp_act_mul = shared_expert_fused_act_enabled(
             self.w2.input_size
         )
+        self.use_shared_act_quant = (
+            not self.use_fused_clamp_act_mul
+            and not self.w2.runs_bf16
+            and shared_act_quant_enabled(self.w2, swiglu_limit)
+        )
 
     def forward(
         self,
         x: torch.Tensor,  # [num_tokens, dim]
         weights: torch.Tensor | None = None,  # [num_tokens, 1]  optional gate
+        x_quant: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:  # [num_tokens, dim]
 
         dtype = x.dtype
@@ -2819,7 +2830,13 @@ class Expert(nn.Module):
         # aiter silu_and_mul's split([d, d], dim=-1) contract. The kernel does
         # silu/clamp/mul in fp32 internally regardless of input dtype, so we
         # feed the bf16 GEMM output directly.
-        combined = self.gate_up_proj(x)  # [num_tokens, 2*inter_dim_per_tp]
+        if x_quant is not None and self.gate_up_proj.native_a8_group_rows is not None:
+            combined = self.gate_up_proj(x_quant[0], x_scale=x_quant[1])
+        else:
+            combined = self.gate_up_proj(x)
+        if self.use_shared_act_quant and weights is None:
+            x_fp8, x_scale = shared_act_quant(combined, self.swiglu_limit)
+            return self.w2(x_fp8, x_scale=x_scale)
         # A BF16 w2 (no group32 FP8 GEMM here) takes no quantized input, and a
         # per-channel one quantizes its own.
         scale_kwargs = fused_scale_kwargs(
@@ -2997,8 +3014,12 @@ class MoE(nn.Module):
         # env threshold is positive AND we got an alt_stream from the model.
         # Per-call row gating happens inside the custom op dispatcher: a call
         # with more rows than its step's bound (set below) stays single-stream.
+        mega_v2 = (
+            get_current_atom_config().moe_backend == "mega" and not sp_is_enabled()
+        )
         self._use_dual_stream = (
-            self.shared_experts is not None
+            not mega_v2
+            and self.shared_experts is not None
             and self.alt_stream is not None
             and envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0
         )
@@ -3024,6 +3045,42 @@ class MoE(nn.Module):
             get_current_atom_config().compilation_config.static_forward_context[
                 prefix
             ] = self
+
+    def process_weights_after_loading(self):
+        """Static expert placement (ATOM_MOE_EXPERT_PLACEMENT): relabel the
+        router's per-expert tensors the way FusedMoE relabeled the expert
+        weights it loaded. The loader visits a parent before its children, so
+        this runs on the gate's checkpoint layout."""
+        perm = getattr(self.experts, "_static_placement", None)
+        if perm is None or getattr(self, "_static_placement_applied", False):
+            return
+        n = len(perm)
+        inverse = torch.empty(n, dtype=torch.long)
+        inverse[torch.tensor(perm, dtype=torch.long)] = torch.arange(n)
+        for name in ("weight", "e_score_correction_bias", "bias_vl"):
+            tensor = getattr(self.gate, name, None)
+            if tensor is None:
+                continue
+            data = tensor.data
+            if data.shape[0] != n:
+                raise RuntimeError(
+                    f"{self.prefix}: gate.{name} has {data.shape[0]} rows, "
+                    f"the placement has {n}"
+                )
+            data.copy_(data.index_select(0, inverse.to(data.device)))
+        tid2eid = getattr(self.gate, "tid2eid", None)
+        if tid2eid is not None:
+            table = torch.tensor(perm, dtype=tid2eid.dtype, device=tid2eid.device)
+            tid2eid.data.copy_(table[tid2eid.data.long()])
+        self._static_placement_applied = True
+        if self.layer_id == 0:
+            moved = sum(1 for e, p in enumerate(perm) if e != p)
+            logger.info(
+                "[PLACEMENT] static expert placement from %s: layer 0 moves %d of %d experts",
+                os.environ.get("ATOM_MOE_EXPERT_PLACEMENT"),
+                moved,
+                n,
+            )
 
     def _hash_topk(
         self,
@@ -3168,8 +3225,11 @@ class MoE(nn.Module):
     def single_stream_moe_forward(
         self,
         x: torch.Tensor,  # [num_tokens, dim]
+        x_quant: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:  # [num_tokens, dim]
         """Sequential: shared_experts → routed_experts → combine.
+
+        ``x_quant``: see `Expert.forward`; only the shared expert reads it.
 
         Where the routed combine adds the shared output
         (`FusedMoE.combine_accepts_shared`), it is handed down through
@@ -3178,7 +3238,11 @@ class MoE(nn.Module):
         `torch.compile` traces this method (the CUDA event is not traceable);
         the traced graph keeps the separate add in `combine_outputs`.
         """
-        shared = self.shared_experts(x) if self.shared_experts is not None else None
+        shared = (
+            self.shared_experts(x, x_quant=x_quant)
+            if self.shared_experts is not None
+            else None
+        )
         if (
             shared is not None
             and not torch.compiler.is_compiling()
@@ -3263,6 +3327,7 @@ class MoE(nn.Module):
     def forward(
         self,
         x: torch.Tensor,  # [num_tokens, dim]  hidden state (post ffn_norm)
+        x_quant: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:  # [num_tokens, dim]
         # Hash-layer routing reads `input_ids` from forward_context.context
         # inside `_hash_topk` (FusedMoE.custom_routing_function callback);
@@ -3271,9 +3336,22 @@ class MoE(nn.Module):
             x.dim() == 2 and x.shape[-1] == self.dim
         ), f"MoE expects 2D [num_tokens, {self.dim}], got {tuple(x.shape)}"
         if self._use_dual_stream or self._use_comm_fused_dispatch:
-            # Keep stream and comm-fused dispatch opaque to torch.compile.
+            # Keep stream and comm-fused dispatch opaque to torch.compile. The
+            # op carries one tensor: `x_quant` is dropped and the shared expert
+            # quantizes `x` itself (`accepts_x_quant` says so beforehand).
             return torch.ops.aiter.maybe_dual_stream_forward(x, self.prefix)
-        return self.single_stream_moe_forward(x)
+        return self.single_stream_moe_forward(x, x_quant)
+
+    @property
+    def accepts_x_quant(self) -> bool:
+        """Whether `forward` uses an ``x_quant`` pair: a standalone shared
+        expert whose gate_up_proj reads group-32 MXFP8, on the direct
+        (single-stream, not comm-fused) path."""
+        return (
+            self.shared_experts is not None
+            and self.shared_experts.gate_up_proj.native_a8_group_rows is not None
+            and not (self._use_dual_stream or self._use_comm_fused_dispatch)
+        )
 
 
 @dataclass

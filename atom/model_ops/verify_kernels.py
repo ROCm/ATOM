@@ -28,6 +28,7 @@ def _finish_request(
     last_checked,
     rejected,
     num_spec_steps,
+    BY_ROW: tl.constexpr = False,
 ):
     """The bonus token, the -1 tail, and the request's verdict.
 
@@ -41,7 +42,14 @@ def _finish_request(
     if rejected:
         bonus_token_id = INVALID_TOKEN
     else:
-        bonus_token_id = tl.load(bonus_token_ids_ptr + req_idx)
+        if BY_ROW:
+            # `bonus_token_ids_ptr` holds every row's pick: the bonus is its
+            # request's last row.
+            bonus_token_id = tl.load(
+                bonus_token_ids_ptr + tl.load(bonus_logits_indices_ptr + req_idx)
+            )
+        else:
+            bonus_token_id = tl.load(bonus_token_ids_ptr + req_idx)
         num_accepted += 1
     tl.store(row + num_draft_tokens, bonus_token_id)
     # The -1 tail is what downstream first-`-1` truncation reads under
