@@ -263,38 +263,9 @@ def _gluon_one_pass_max_rows(device_index: int | None) -> int:
     return max(1, cus * get_occupancy() // get_recommended_splits(1, 1))
 
 
-# The maskless fp8 kernel returns NaN for gqa=16 when the context needs exactly
-# 16 pages with a partial tail (241..255 tokens); gqa=8 is correct there, and
-# two 8-head queries of one request are the same arithmetic over the same KV.
-# Unconditional: the trigger is a sparse_ctx value, and reading it costs a sync.
-_ASM_NAN_GROUP = 16
-_ASM_SPLIT = 2
-
-# A maskless mtp>0 kernel is unreachable through the heuristic (a null qo_indptr
-# forces mtp=0, a non-null one forces msk=1), so name the row. An unlisted dtype
-# keeps the unsplit path rather than aborting inside aiter.
-_ASM_SPLIT_KERNELS = {
-    torch.bfloat16: "_ZN5aiter40pa_bf16_pertokenFp8_gqa8_1tg_4w_mtp_msk0E",
-    torch.float16: "_ZN5aiter40pa_fp16_pertokenFp8_gqa8_1tg_4w_mtp_msk0E",
-}
-
-
-# Every request contributes two queries, so the indptr is 2 * arange. Allocated
-# once past any batch (1 MiB) and narrowed per call: narrow raises where a slice
-# would hand the kernel a short tensor, and a pool that grew on demand would
-# allocate inside a graph capture.
-_SPLIT_INDPTR_ROWS = 1 << 18
-
-
-@functools.cache
-def _split_indptr(device: torch.device) -> torch.Tensor:
-    return torch.arange(
-        0,
-        (_SPLIT_INDPTR_ROWS + 1) * _ASM_SPLIT,
-        _ASM_SPLIT,
-        dtype=torch.int32,
-        device=device,
-    )
+# pa_fwd_asm puts one row on each grid-y slot; one launch of 65536 rows runs on
+# gfx950 and 131072 fails to launch, so larger selections go in slices.
+_ASM_MAX_ROWS = 1 << 16
 
 
 def _sparse_pa_ran_on_asm(
@@ -320,7 +291,7 @@ def _sparse_pa_ran_on_asm(
         run_pa_fwd_asm,
     )
 
-    rows, group, head_dim = q.shape
+    rows, group, _ = q.shape
     if (
         not pa_fwd_asm_supports_arch()
         or k_scale is None
@@ -330,30 +301,21 @@ def _sparse_pa_ran_on_asm(
     ):
         return False
 
-    kernel_name = _ASM_SPLIT_KERNELS.get(q.dtype) if group == _ASM_NAN_GROUP else None
-    qo_indptr, max_qlen = None, 1
-    if kernel_name:
-        # Rows 2b/2b+1 are request b's head halves -- the kernel's own
-        # q[b*qlen + i] layout, so one block-table row still serves both.
-        qo_indptr = _split_indptr(q.device).narrow(0, 0, rows + 1)
-        q = q.view(rows * _ASM_SPLIT, group // _ASM_SPLIT, head_dim)
-        out = out.view(q.shape)
-        max_qlen = _ASM_SPLIT
-
     pages, pbs = k_cache.shape[0], k_scale.shape[-1]
-    run_pa_fwd_asm(
-        q=q,
-        k_cache=k_cache,
-        v_cache=v_cache,
-        block_tables=sparse_bt,
-        context_lens=sparse_ctx,
-        k_scale=k_scale.view(pages, 1, pbs),
-        v_scale=v_scale.view(pages, 1, pbs),
-        out=out,
-        qo_indptr=qo_indptr,
-        max_qlen=max_qlen,
-        kernel_name=kernel_name,
-    )
+    k_scale = k_scale.view(pages, 1, pbs)
+    v_scale = v_scale.view(pages, 1, pbs)
+    for start in range(0, rows, _ASM_MAX_ROWS):
+        end = min(start + _ASM_MAX_ROWS, rows)
+        run_pa_fwd_asm(
+            q=q[start:end],
+            k_cache=k_cache,
+            v_cache=v_cache,
+            block_tables=sparse_bt[start:end],
+            context_lens=sparse_ctx[start:end],
+            k_scale=k_scale,
+            v_scale=v_scale,
+            out=out[start:end],
+        )
     return True
 
 

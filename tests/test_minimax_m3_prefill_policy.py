@@ -20,7 +20,9 @@ def default_config(arch, is_fp8, q_len, blocks, batch, heads):
         warps, stages = (4, 1) if is_fp8 else (8, 3)
     else:
         warps, stages = 4, 3
-    return PrefillScoreConfig(128, chunk_blocks, warps, stages, 1, False, False)
+    return PrefillScoreConfig(
+        128, chunk_blocks, warps, stages, 1, False, arch == "gfx950"
+    )
 
 
 MULTI_PLANE = PrefillScoreConfig(
