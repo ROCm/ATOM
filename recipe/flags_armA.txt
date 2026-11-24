@@ -1,0 +1,27 @@
+# arm A
+check_repo OK: /shared_nfs/ygan/work/max-int1 @ 60870c2b4 (clean)
+REPO=/shared_nfs/ygan/work/max-int1
+PYTHONPATH=/shared_nfs/ygan/attn-prefill/amdk_snapshot:/shared_nfs/ygan/work/max-int1
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE=/shared_nfs/ygan/max/gemm/configs/mx8_tuned_gemm_m31.csv
+AITER_CONFIG_GEMM_BF16=/shared_nfs/ygan/max/gemm/configs/bf16_tuned_gemm_m31.csv
+AITER_LOG_LEVEL=WARNING
+ATOM_AK_MXFP8_GEMM=1
+ATOM_ENABLE_METRICS_DEVICE_TIMER=1
+ATOM_FORCE_ATTN_TRITON=1
+ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4=0
+ATOM_M3_AK_DECODE=1
+ATOM_M3_AK_INSERT=1
+ATOM_M3_AK_MOE=1
+ATOM_M3_FUSED_DECODE=1
+ATOM_M3_PREFILL_ATTN=ak16
+ATOM_M3_PREFILL_FAST=1
+ATOM_M3_PREFILL_INSERT=amdk
+ATOM_M3_PREFILL_TOKEN_GRAPH=1
+ATOM_MONO_ENABLE=0
+ATOM_MONO_STATS_EVERY=200
+ATOM_PREFILL_DECODE_INTERVAL=16
+ATOM_PREFILL_DELAYER_TARGET_FILL=0.225
+ATOM_SCHED_DECODE_PREFILL_CAP=8192
+ATOM_SCHED_PREFILL_DUTY=0.3
+EXTRA=--cudagraph-capture-sizes [1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64] --dspark-config {"draft_kv_dtype":"fp8"} 
+print_env.sh: line 17: AL: unbound variable

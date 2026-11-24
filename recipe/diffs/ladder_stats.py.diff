@@ -1,0 +1,11 @@
+--- /shared_nfs/ygan/max/bin/ladder_stats.py	2026-11-18 22:13:41.410992318 +0000
++++ /shared_nfs/ygan/p1/milestone2/recipe/ladder_stats.py	2026-11-19 19:50:24.507062790 +0000
+@@ -33,7 +33,7 @@
+ import ast, datetime as dt, gzip, json, math, os, re, sys
+ from collections import defaultdict
+ 
+-D = "/shared_nfs/ygan/max"
++D = "/shared_nfs/ygan/p1/milestone2"
+ R = f"{D}/results"
+ SAVE = False  # --save: write results/TAG/ladder_stats.json (only for your own tags)
+ 

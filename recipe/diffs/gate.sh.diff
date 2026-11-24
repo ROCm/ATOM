@@ -1,0 +1,41 @@
+--- /shared_nfs/ygan/max/bin/gate.sh	2026-11-18 18:10:45.150798154 +0000
++++ /shared_nfs/ygan/p1/milestone2/recipe/gate.sh	2026-11-19 19:50:24.494762423 +0000
+@@ -27,7 +27,7 @@
+ shift; [ $# -gt 0 ] && shift
+ NODE=${NODE:-yg-di-35}
+ GTAG=${GTAG:-$(basename "$REPO")_$(date +%m%d-%H%M%S)}
+-OUT=$A/gates/$GTAG
++OUT=/shared_nfs/ygan/p1/milestone2/gates/$GTAG
+ 
+ if [ ! -f /.dockerenv ] && [ "${GATE_INNER:-}" != 1 ]; then
+   case "$NODE" in yg-di-04) CTR=${CTR:-acc04} ;; *) CTR=${CTR:-acc35} ;; esac
+@@ -92,11 +92,11 @@
+ for kv in "$@"; do case "$kv" in *=*) export "$kv" ;; esac; done
+ PORT=${PORT:-18430}; LONG=${LONG:-1}; GC=${GATE_CONC:-16}
+ TAG=gate_$GTAG
+-LOG=$D/logs/server_$TAG.log
++LOG=/shared_nfs/ygan/p1/milestone2/logs/server_$TAG.log
+ echo "### $(date -Is) leased GPUs ${HIP_VISIBLE_DEVICES:-?} on $(hostname -s); server log $LOG"
+ verdict() { echo "$1" | tee "$OUT/verdict.txt"; }
+ T0=$(date +%s)
+-AL=real CONC=$((GC / 2)) MAX_SEQS=$GC PORT=$PORT REPO=$REPO PYPATH_PRE=$PRE TAG=$TAG bash $B/serve.sh &
++AL=real CONC=$((GC / 2)) MAX_SEQS=$GC PORT=$PORT REPO=$REPO PYPATH_PRE=$PRE TAG=$TAG bash /shared_nfs/ygan/p1/milestone2/recipe/serve.sh &
+ SPID=$!
+ stop_server() {
+   pkill -f "server-port $PORT" 2>/dev/null
+@@ -115,7 +115,7 @@
+ LOADT=$(( $(date +%s) - T0 ))
+ if [ $ready != 1 ]; then
+   verdict "GATE $GTAG: ERROR server not ready after ${LOADT}s (see $LOG)"
+-  printf "%s\t%s\t%s\tERROR\tnot-ready\n" "$(date -Is)" "$GTAG" "$REPO" >> $A/gates/index.tsv
++  printf "%s\t%s\t%s\tERROR\tnot-ready\n" "$(date -Is)" "$GTAG" "$REPO" >> /shared_nfs/ygan/p1/milestone2/gates/index.tsv
+   exit 1
+ fi
+ echo "### server ready in ${LOADT}s"
+@@ -139,5 +139,5 @@
+ stop_server
+ rm -f "${OWNED[@]}"
+ echo "### server stopped; total lease $(( $(date +%s) - T0 ))s"
+-python3 $B/gate_verdict.py "$OUT" "$GTAG" "$REPO" "${PRE:-none}" "$*" > "$OUT/verdict.tmp"
++python3 /shared_nfs/ygan/p1/milestone2/recipe/gate_verdict.py "$OUT" "$GTAG" "$REPO" "${PRE:-none}" "$*" > "$OUT/verdict.tmp"
+ mv "$OUT/verdict.tmp" "$OUT/verdict.txt"; cat "$OUT/verdict.txt"
