@@ -2689,6 +2689,19 @@ class EPLBManager:
             self._log_frozen()
             while True:
                 yield
+        skip = envs.ATOM_EPLB_SKIP_STEPS
+        if skip > 0 and self.gate_permute is not None:
+            # What these steps counted is not the traffic to place for.
+            for _ in range(skip):
+                yield
+            self.gate_permute.reset_stats()
+            if self._ep_rank == 0:
+                logger.info(
+                    "%s the counts of the first %d prefill-bearing steps are "
+                    "dropped (ATOM_EPLB_SKIP_STEPS)",
+                    gate_permute.TAG,
+                    skip,
+                )
         for _ in range(self._first_rebalance_steps()):
             yield
         while True:
@@ -3009,6 +3022,8 @@ class EPLBManager:
 
         _t0 = _time.perf_counter()
         swaps = None
+        # ATOM_EPLB_MIN_SWAPS: the target layers' plan is below the bar.
+        small_plan = False
         budget = envs.ATOM_EPLB_SWAP_BUDGET
         budget_why = "normal"
         if self._budget_once is not None:
@@ -3027,7 +3042,39 @@ class EPLBManager:
                     eps=envs.ATOM_EPLB_SWAP_EPS,
                     layer_ids=sorted(self._moe_layers),
                     hot_first=self._hot_first(),
+                    tile_rows=envs.ATOM_EPLB_TILE_ROWS,
+                    cold_first=envs.ATOM_EPLB_COLD_FIRST,
+                    cold_first_min_swaps=envs.ATOM_EPLB_COLD_FIRST_MIN_SWAPS,
                 )
+                # A plan of fewer swaps than ATOM_EPLB_MIN_SWAPS is dropped:
+                # planned again with no swap allowed, which is the evaluation
+                # that moves nothing. The plan is the group's, so every rank
+                # decides alike.
+                min_swaps = envs.ATOM_EPLB_MIN_SWAPS
+                planned = sum(swaps.values())
+                small_plan = min_swaps > 0 and planned < min_swaps
+                if small_plan and planned > 0:
+                    p2l, l2p, logcnt, swaps = gate_permute.swap_rebalance(
+                        logical_load,
+                        dec_load,
+                        rows_per_step,
+                        self.live_metadata.physical_to_logical_map,
+                        num_gpus=ep_size,
+                        top_k=int(first_layer.top_k),
+                        budget=0,
+                        eps=envs.ATOM_EPLB_SWAP_EPS,
+                        layer_ids=sorted(self._moe_layers),
+                    )
+                    if _ep_rank == 0:
+                        logger.info(
+                            "%s rebalance #%d: a plan of %d swaps < "
+                            "ATOM_EPLB_MIN_SWAPS=%d is dropped (the target "
+                            "layers stay)",
+                            gate_permute.TAG,
+                            _rc,
+                            planned,
+                            min_swaps,
+                        )
             except Exception as exc:  # noqa: BLE001
                 # The plan is a function of the group's loads alone, so every
                 # rank fails here alike, with nothing switched anywhere.
@@ -3065,6 +3112,13 @@ class EPLBManager:
                     f"the draft layers' plan failed ({exc!r}); nothing moved"
                 )
                 return
+            # With the target layers staying (ATOM_EPLB_MIN_SWAPS), a draft
+            # plan of fewer swaps than ATOM_EPLB_MTP_MIN_SWAPS is dropped too.
+            mtp_min = envs.ATOM_EPLB_MTP_MIN_SWAPS
+            if small_plan and 0 < sum(mtp_plan["swaps"]) < mtp_min:
+                mtp_plan["p2l"] = mtp_plan["old"].clone()
+                mtp_plan["moved"] = [0] * len(mtp_plan["moved"])
+                mtp_plan["swaps"] = [0] * len(mtp_plan["swaps"])
         if gp is not None:
             # This rebalance is planned: what it was planned for, and the
             # start of the next window.
@@ -3307,6 +3361,7 @@ class EPLBManager:
             budget=envs.ATOM_EPLB_MTP_SWAP_BUDGET,
             eps=envs.ATOM_EPLB_SWAP_EPS,
             weights=(0.0, *gate_permute.SWAP_WEIGHTS[1:]),
+            tile_rows=envs.ATOM_EPLB_TILE_ROWS,
         )
         self._mtp_rows_at_last_solve = rows
         return {
