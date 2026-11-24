@@ -16,6 +16,24 @@ import torch
 
 SEAM = "v41.block.transition"
 WINDOW = "v41.moe_to_attn_qkv"
+# The window's contract, written here (its call sites: `begin` / `end` / `scope`);
+# the host declares it when it imports this module. The FFN's native combine is
+# inside the window, so the FFN stays native while the window has an owner.
+SPEC = {
+    "name": SEAM,
+    "contract": 1,
+    "kind": "region",
+    "form": "window",
+    "inputs": ("routed", "shared"),
+    "kwargs": (),
+    "returns": ("q_lora", "kv_pre"),
+    "key": (),
+    "graph": "capture_safe",
+    "target": "atom/plugin_transition.py",
+    "boundary": "collective+state",
+    "doc": "native MoE combine and mHC with paired pre/post callbacks",
+    "excludes": ("v41.block.ffn",),
+}
 
 
 @dataclass(frozen=True)

@@ -22,14 +22,6 @@ def _seam(
     )
 
 
-# Spans of exactly one module slot: a recipe may plan either spelling.
-_SLOTS = {
-    "v41.block.ffn": "layers.*.ffn",
-    "v41.moe.shared_expert": "layers.*.ffn.shared_experts",
-    "v41.mono.install": "mono",
-}
-
-
 # The module path each seam's call site is in (recipe reachability checks).
 _SCOPES = {
     "v41.block.ffn": "layers.*",
@@ -46,6 +38,17 @@ _SCOPES = {
 }
 
 
+# Alternative spans of the attention tail (not nested): the wider one makes the
+# narrower unreachable when its owner serves.
+_COVERS = {
+    "v41.attn.project_out": ("v41.attn.out",),
+    "v41.attn.out_full": ("v41.attn.out",),
+    "v41.attn.attend_out": ("v41.attn.attend",),
+}
+# The transition window spans the FFN's native combine: the FFN stays native.
+_EXCLUDES = {"v41.block.transition": ("v41.block.ffn",)}
+
+
 def specs() -> list[SeamSpec]:
     from dataclasses import replace
 
@@ -60,7 +63,7 @@ def specs() -> list[SeamSpec]:
             ("q_lora", "kv_pre"),
             (),
             "capture_safe",
-            _V41 + "runtime.py",
+            "atom/plugin_transition.py",
             boundary="collective+state",
             doc="native MoE combine and mHC with paired pre/post callbacks",
         ),
@@ -374,6 +377,11 @@ def specs() -> list[SeamSpec]:
         ),
     ]
     return [
-        replace(s, module_slot=_SLOTS.get(s.name), scope=_SCOPES.get(s.name))
+        replace(
+            s,
+            scope=_SCOPES.get(s.name),
+            covers=_COVERS.get(s.name, ()),
+            excludes=_EXCLUDES.get(s.name, ()),
+        )
         for s in out
     ]

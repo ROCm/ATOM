@@ -373,8 +373,8 @@ def mxfp4_default_backends(monkeypatch):
 
 
 # -- 9. The V4.1 seams the plugin host / recipe tests route -----------------------
-# ATOM declares no model's seams; plugin_poc's V4.1 model declares these through
-# entry point group `atom.seam_specs`. The tests declare the same specs here.
+# A model writes its seams' contracts at its call sites (plugin_poc's V4.1
+# model, ATOM's shared ops); the host and recipe tests declare the same specs.
 def _declare_v41_seams() -> None:
     import importlib.util
 
@@ -385,7 +385,8 @@ def _declare_v41_seams() -> None:
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    plugin_host.declare_seams(module.specs(), source="tests.plugin_v41_seams")
+    for spec in module.specs():
+        plugin_host.seam(spec, source="tests.plugin_v41_seams")
 
 
 _declare_v41_seams()

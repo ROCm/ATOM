@@ -170,6 +170,36 @@ from atom.utils.tbo import (
 )
 from atom.utils.tbo.ubatch_wrapper import UBatchWrapper
 
+# The `v41.spec.verify_sample` seam: its contract, written at its call site in this file.
+_SEAM_SPEC_VERIFY_SAMPLE = plugin_host.seam(
+    plugin_host.SeamSpec(
+        name="v41.spec.verify_sample",
+        contract=1,
+        kind="region",
+        form="call",
+        inputs=(
+            "logits",
+            "temperatures",
+            "target_logits_indices",
+            "bonus_logits_indices",
+            "cu_num_draft_tokens",
+        ),
+        kwargs=("all_greedy", "top_ks", "top_ps", "needs_independent_noise"),
+        returns=("bonus_token_ids", "target_token_ids", "target_logits"),
+        key=(
+            "logits",
+            "temperatures",
+            "target_logits_indices",
+            "bonus_logits_indices",
+            "cu_num_draft_tokens",
+        ),
+        graph="capture_safe",
+        doc="speculative verification + bonus sampling of a verify step",
+        target="atom/model_engine/model_runner.py",
+    ),
+    source="atom/model_engine/model_runner.py",
+)
+
 logger = logging.getLogger("atom")
 
 
@@ -980,6 +1010,10 @@ class ModelRunner:
         plugin_host.install_modules(self.model)
         if getattr(self, "drafter", None) is not None:
             plugin_host.install_modules(self.drafter.model, prefix="draft")
+        # The recipe against the seams the built model declared at its call
+        # sites: an unbound planned seam, a contract mismatch, an excluded or an
+        # unplanned inner seam refuses the start here.
+        plugin_host.check_plan()
 
         torch.set_default_device(self.device)
         self.async_execute_stream = torch.cuda.Stream(self.device)

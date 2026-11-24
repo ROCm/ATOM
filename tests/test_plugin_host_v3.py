@@ -11,6 +11,7 @@ seam's capability does not reach the capture state.
 import importlib
 import sys
 import types
+from pathlib import Path
 
 import pytest
 import torch
@@ -178,26 +179,16 @@ def test_context_reports_capture_bucket_and_valid_rows(monkeypatch):
     assert isinstance(host.context(), types.SimpleNamespace) is False
 
 
-# -- seam spec registry (M2) --------------------------------------------------
+# -- seams written at their call sites; the plan checked against the model ---
 
 
 @pytest.fixture
 def seam_table():
-    saved = (
-        dict(host._SEAM_SPECS),
-        dict(host._SEAM_SOURCES),
-        dict(host._SEAM_TO_SLOT),
-        dict(host._SLOT_TO_SEAM),
-        host._seam_sources_loaded,
-    )
+    saved = (dict(host._SEAM_SPECS), dict(host._SEAM_SOURCES))
     yield
-    for live, old in zip(
-        (host._SEAM_SPECS, host._SEAM_SOURCES, host._SEAM_TO_SLOT, host._SLOT_TO_SEAM),
-        saved,
-    ):
+    for live, old in zip((host._SEAM_SPECS, host._SEAM_SOURCES), saved):
         live.clear()
         live.update(old)
-    host._seam_sources_loaded = saved[4]
 
 
 _TOY = {
@@ -211,69 +202,141 @@ _TOY = {
     "key": ("x",),
     "graph": "capture_safe",
     "target": "toy/model.py",
-    "module_slot": "blocks.*.mix",
+    "scope": "blocks.*",
 }
 
 
-def test_the_v41_seams_are_declared_through_the_registry():
-    assert host._SEAM_SOURCES["v41.block.ffn"] == "tests.plugin_v41_seams"
-    assert host.SEAM_TO_MODULE_SLOT["v41.block.ffn"] == "layers.*.ffn"
-    assert host.MODULE_SLOT_TO_SEAM["mono"] == "v41.mono.install"
-    assert "v41.mono.install" in host.boot_only()
-
-
-def test_a_package_declares_a_seam_a_recipe_plans_and_a_plugin_serves(
-    seam_table, monkeypatch
-):
-    assert host.declare_seams([_TOY], source="toy") == ["toy.block.mix"]
-    assert host.declare_seams([_TOY], source="again") == []  # identical: a no-op
-    assert host.MODULE_SLOT_TO_SEAM["blocks.*.mix"] == "toy.block.mix"
-
+def _mix_owner(name, value=1, contract=1):
     def register(h):
         h.register(
-            seam="toy.block.mix", contract=1, owner="mix-p", impl=lambda x, **k: x + 1
+            seam="toy.block.mix",
+            contract=contract,
+            owner=name,
+            impl=lambda x, **k: x + value,
         )
 
-    monkeypatch.setattr(host, "_entry_points", lambda: {"mix-p": _EntryPoint(register)})
-    host.configure(_plan(seams={"toy.block.mix": ["mix-p"]}), kill_switch=False)
-    router = host.bind("toy.block.mix", lambda x: x)
-    assert router(1) == 2
+    return register
 
 
-@pytest.mark.parametrize(
-    "change, error",
-    [
-        ({"contract": 2}, "conflicts"),
-        ({"name": "Bad"}, "dotted lower-case"),
-        ({"key": ("z",)}, "key must name inputs"),
-        ({"parent": "toy.none"}, "parent"),
-        ({"graph": "sometimes"}, "graph"),
-    ],
-)
-def test_a_seam_spec_is_checked_and_one_name_has_one_contract(
-    seam_table, change, error
-):
-    host.declare_seams([_TOY], source="toy")
-    with pytest.raises(host.SeamConflict, match=error):
-        host.declare_seams([{**_TOY, **change}], source="other")
-
-
-def test_installed_packages_declare_seams_through_entry_points(seam_table, monkeypatch):
-    class _EP:
-        name = "toy"
-
-        def load(self):
-            return lambda: [_TOY]
-
-    host._seam_sources_loaded = False
-    monkeypatch.setattr(
-        host.metadata,
-        "entry_points",
-        lambda group=None: [_EP()] if group == host.SEAM_SPEC_GROUP else [],
+def test_the_v41_seams_are_written_at_their_call_sites():
+    root = Path(__file__).resolve().parents[1]
+    site = (root / "atom/model_ops/blockscale.py").read_text(encoding="utf-8")
+    assert "plugin_host.seam(" in site and 'name="v41.op.quant_fp8_g32"' in site
+    assert host.SEAMS["v41.block.transition"].target == "atom/plugin_transition.py"
+    assert host.SEAMS["v41.block.transition"].excludes == ("v41.block.ffn",)
+    assert (
+        "v41.mono.install" in host.boot_only() and "model.install" in host.boot_only()
     )
-    plan = _plan(seams={"toy.block.mix": []})  # the recipe parse loads them
-    assert "toy.block.mix" in host.SEAMS and plan is not None
-    assert host._SEAM_SOURCES["toy.block.mix"] == "atom.seam_specs:toy"
+
+
+def test_a_model_declares_its_seam_where_it_binds_it(seam_table, monkeypatch):
+    monkeypatch.setattr(
+        host, "_entry_points", lambda: {"mix-p": _EntryPoint(_mix_owner("mix-p"))}
+    )
+    # the recipe names a seam the model has not been built yet to declare
+    host.configure(_plan(seams={"toy.block.mix": ["mix-p"]}), kill_switch=False)
+    router = host.bind("toy.block.mix", lambda x: x, spec=_TOY)
+    assert router(1) == 2
+    assert host.bind("toy.block.mix", lambda x: x, spec=_TOY)(1) == 2  # every layer
+    host.check_plan()
+
+
+def test_one_seam_name_has_one_contract(seam_table):
+    host.seam(_TOY)
+    with pytest.raises(host.SeamConflict, match="conflicts"):
+        host.seam({**_TOY, "contract": 2})
+    with pytest.raises(host.SeamConflict, match="dotted lower-case"):
+        host.seam({**_TOY, "name": "Bad"})
+    with pytest.raises(host.SeamConflict, match="key must name inputs"):
+        host.seam({**_TOY, "name": "toy.other", "key": ("z",)})
+
+
+def test_an_owner_is_checked_when_the_model_declares_its_seam(seam_table, monkeypatch):
+    monkeypatch.setattr(
+        host,
+        "_entry_points",
+        lambda: {"mix-p": _EntryPoint(_mix_owner("mix-p", contract=2))},
+    )
+    host.configure(_plan(seams={"toy.block.mix": ["mix-p"]}), kill_switch=False)
+    with pytest.raises(host.PluginContractError, match="contract 2"):
+        host.bind("toy.block.mix", lambda x: x, spec=_TOY)
+
+
+def test_a_planned_seam_the_model_never_declares_refuses_the_start(
+    seam_table, monkeypatch
+):
+    monkeypatch.setattr(
+        host, "_entry_points", lambda: {"mix-p": _EntryPoint(_mix_owner("mix-p"))}
+    )
+    host.configure(_plan(seams={"toy.block.mix": ["mix-p"]}), kill_switch=False)
+    with pytest.raises(recipes.RecipeRefused, match="recipe-seam-unbound"):
+        host.check_plan()
+
+
+def test_required_contracts_and_excludes_are_checked_on_the_built_model(
+    seam_table, monkeypatch
+):
+    host.seam(_TOY)
+    host.seam({**_TOY, "name": "toy.block.window", "excludes": ("toy.block.mix",)})
+    eps = {
+        "mix-p": _EntryPoint(_mix_owner("mix-p")),
+        "win-p": _EntryPoint(
+            lambda h: h.register(
+                seam="toy.block.window",
+                contract=1,
+                owner="win-p",
+                impl=lambda x, **k: x,
+            )
+        ),
+    }
+    monkeypatch.setattr(host, "_entry_points", lambda: eps)
+    host.configure(
+        _plan(
+            seams={"toy.block.mix": ["mix-p"]}, requires={"seams": {"toy.block.mix": 2}}
+        ),
+        kill_switch=False,
+    )
+    with pytest.raises(recipes.RecipeRefused, match="recipe-contract-mismatch"):
+        host.check_plan()
+    host._reset_for_testing()
+    host.configure(
+        _plan(seams={"toy.block.mix": ["mix-p"], "toy.block.window": ["win-p"]}),
+        kill_switch=False,
+    )
+    with pytest.raises(recipes.RecipeRefused, match="recipe-excludes"):
+        host.check_plan()
+
+
+def test_outer_owners_shadow_nested_and_covered_ones(seam_table, monkeypatch):
+    host.seam(_TOY)
+    host.seam({**_TOY, "name": "toy.block.inner", "parent": "toy.block.mix"})
+    host.seam({**_TOY, "name": "toy.block.alt", "covers": ("toy.block.inner",)})
+
+    def reg(seam, owner):
+        return _EntryPoint(
+            lambda h: h.register(
+                seam=seam, contract=1, owner=owner, impl=lambda x, **k: x
+            )
+        )
+
+    eps = {
+        "o": reg("toy.block.mix", "o"),
+        "i": reg("toy.block.inner", "i"),
+        "a": reg("toy.block.alt", "a"),
+    }
+    monkeypatch.setattr(host, "_entry_points", lambda: eps)
+    seams = {"toy.block.mix": ["o"], "toy.block.inner": ["i"], "toy.block.alt": ["a"]}
+    host.configure(_plan(seams=seams), kill_switch=False)
+    assert sorted(host.check_plan()["shadowed"]) == [
+        ("toy.block.inner", "i", "toy.block.alt"),
+        ("toy.block.inner", "i", "toy.block.mix"),
+    ]
+    host._reset_for_testing()
+    host.configure(
+        _plan(seams=seams, defaults={"shadow_policy": "error"}), kill_switch=False
+    )
+    with pytest.raises(recipes.RecipeRefused, match="recipe-shadow"):
+        host.check_plan()
 
 
 # -- M4: method takeover, plugin_options, model.install -----------------------
@@ -355,7 +418,7 @@ def test_model_install_is_a_core_boot_hook():
 
 
 def test_route_report_names_unreached_planned_owners(seam_table, monkeypatch):
-    host.declare_seams([_TOY], source="toy")
+    host.seam(_TOY)
 
     def reg_a(h):
         h.register(
@@ -410,18 +473,22 @@ def test_owners_running_collectives_must_agree_across_ranks(monkeypatch):
     )
 
 
-def test_a_taken_over_module_needs_its_inner_seams_planned():
+def test_a_taken_over_module_needs_its_inner_seams_planned(seam_table, monkeypatch):
+    host.seam(_TOY)  # scope blocks.*
+
+    def reg(h):
+        h.register_module(
+            slot="blocks.*", owner="blk-p", factory=lambda m, c: m.forward
+        )
+
+    monkeypatch.setattr(host, "_entry_points", lambda: {"blk-p": _EntryPoint(reg)})
+    host.configure(_plan(modules={"blocks.*": ["blk-p"]}), kill_switch=False)
     with pytest.raises(recipes.RecipeRefused, match="recipe-inner-unplanned"):
-        _plan(modules={"layers.*.attn": ["attn-p"]})
-    inner = [
-        n
-        for n, s in host.SEAMS.items()
-        if s.scope and s.scope.startswith("layers.*.attn")
-    ]
-    plan = _plan(modules={"layers.*.attn": ["attn-p"]}, seams={n: [] for n in inner})
-    assert plan.modules["any"]["layers.*.attn"] == ("attn-p",)
-    # a method takeover replaces one method: no inner seam to plan
-    _plan(modules={"layers.*.attn:_wo_a": ["wo-p"]})
+        host.check_plan()
+    host._reset_for_testing()
+    plan = _plan(modules={"blocks.*": ["blk-p"]}, seams={"toy.block.mix": []})
+    host.configure(plan, kill_switch=False)
+    host.check_plan()
 
 
 def test_shared_weights_are_prepared_once_for_every_configuration():

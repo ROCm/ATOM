@@ -36,6 +36,25 @@ from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
 
+# The `v41.attn.qk_norm` seam: its contract, written at its call site in this file.
+_SEAM_ATTN_QK_NORM = plugin_host.seam(
+    plugin_host.SeamSpec(
+        name="v41.attn.qk_norm",
+        contract=1,
+        kind="op",
+        form="bind",
+        inputs=("q", "k", "q_weight", "k_weight", "eps_q"),
+        kwargs=("eps_k", "amax_floor"),
+        returns=("q_fp8", "q_scale", "k_out"),
+        key=("q", "k", "eps_q"),
+        graph="capture_safe",
+        doc="dual RMSNorm, q to MXFP8: the kernel DualRMSNormMXFP8 calls",
+        scope="layers.*.attn",
+        target="atom/model_ops/layernorm.py",
+    ),
+    source="atom/model_ops/layernorm.py",
+)
+
 
 def silu(input: Tensor, inplace: bool = False) -> Tensor:
     r"""Apply the Sigmoid Linear Unit (SiLU) function, element-wise.

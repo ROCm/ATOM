@@ -117,6 +117,40 @@ from atom.utils.forward_context import get_forward_context, pass_scheduled_token
 from atom.utils.tbo.ubatch_splitting import NUM_TBO_UBATCHES
 from atom.utils.tbo.ubatching import tbo_enabled, tbo_on_comm
 
+# The `v41.moe.topk` seam: its contract, written at its call site in this file.
+_SEAM_MOE_TOPK = plugin_host.seam(
+    plugin_host.SeamSpec(
+        name="v41.moe.topk",
+        contract=1,
+        kind="op",
+        form="call",
+        inputs=(
+            "topk_weights",
+            "topk_ids",
+            "router_logits",
+            "e_score_correction_bias",
+            "renormalize",
+            "route_scale",
+        ),
+        kwargs=("score_func", "num_valid_rows"),
+        returns=(),
+        key=(
+            "router_logits",
+            "topk_weights",
+            "topk_ids",
+            "e_score_correction_bias",
+            "renormalize",
+            "route_scale",
+        ),
+        graph="capture_safe",
+        parent="v41.block.ffn",
+        doc="topk_gating in FusedMoE.select_experts, in place",
+        scope="layers.*.ffn.experts",
+        target="atom/model_ops/moe.py",
+    ),
+    source="atom/model_ops/moe.py",
+)
+
 logger = logging.getLogger("atom")
 
 

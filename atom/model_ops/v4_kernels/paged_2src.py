@@ -77,6 +77,43 @@ except ImportError:
 from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops.triton.attention.pa_prefill_sparse import pa_prefill_sparse
 
+# The `v41.attn.attend` seam: its contract, written at its call site in this file.
+_SEAM_ATTN_ATTEND = plugin_host.seam(
+    plugin_host.SeamSpec(
+        name="v41.attn.attend",
+        contract=1,
+        kind="op",
+        form="call",
+        inputs=(
+            "q",
+            "unified_kv",
+            "kv_indices_prefix",
+            "kv_indptr_prefix",
+            "kv",
+            "kv_indices_extend",
+            "kv_indptr_extend",
+            "attn_sink",
+            "softmax_scale",
+        ),
+        kwargs=(
+            "out",
+            "unified_kv_rope",
+            "q_packed",
+            "q_rope",
+            "k_packed",
+            "k_rope",
+            "prefix",
+        ),
+        returns=("out",),
+        key=("q", "unified_kv", "kv", "attn_sink", "softmax_scale"),
+        graph="capture_safe",
+        doc="sparse_attn_v4_paged_2src; out= is written and returned",
+        scope="layers.*.attn",
+        target="atom/model_ops/v4_kernels/paged_2src.py",
+    ),
+    source="atom/model_ops/v4_kernels/paged_2src.py",
+)
+
 # Local head count the aiter asm fp8 prefill kernel ships for; anything else
 # raises there rather than dispatching, so we filter on it up front.
 _PREFILL_ASM_HEADS = 128

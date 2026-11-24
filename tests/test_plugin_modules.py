@@ -178,10 +178,9 @@ def test_v2_infers_plugins_and_nests_overlapping_owners():
         modules={"stack.*.attn": ["whole-attn"]},
     )
     assert set(plan.providers) == {"outer", "inner", "whole-attn"}
-    # Parent and child owners coexist (v1 refuses this as recipe-shadow).
-    assert plan.shadowed == (("v41.moe.shared_act", "inner", "outer"),)
-    # A seam that spans exactly one slot is planned under both spellings.
-    assert plan.modules["any"]["layers.*.ffn"] == ("outer",)
+    # Parent and child owners coexist; the shadowing is reported against the
+    # built model (plugin_host.check_plan).
+    assert plan.shadow_policy == "nested"
 
 
 def test_a_recipe_set_must_agree_on_options():
@@ -318,20 +317,6 @@ def test_owns_collectives_is_accepted_and_checked(monkeypatch):
             owner="x",
             owns_collectives=("teleport",),
         )
-
-
-def test_a_module_owner_on_a_seam_slot_registers_as_the_seam(monkeypatch):
-    _plugins(monkeypatch, whole=_module_owner("layers.*.ffn", "whole", value=9))
-    host.configure(_plan(modules={"layers.*.ffn": ["whole"]}), kill_switch=False)
-    assert host.owners("v41.block.ffn") == ("whole",)
-    ffn = FFN()
-    bound = host.bind(
-        "v41.block.ffn",
-        ffn.__call__,
-        capability={"flags": {"layer_id": 0, "module": ffn}},
-    )
-    # The seam's call site (Block._ffn) reaches the module owner's callable.
-    assert torch.equal(bound(torch.ones(2)), torch.full((2,), 9.0))
 
 
 # -- module takeover -------------------------------------------------------------

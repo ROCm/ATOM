@@ -64,6 +64,8 @@ from typing import Any
 
 import torch
 
+from atom.plugin_transition import SPEC as _transition_spec
+
 # `register_window` is part of the host API a plugin's register(host) calls.
 from atom.plugin_transition import Phases, register_window  # noqa: F401
 
@@ -118,42 +120,29 @@ class SeamSpec:
     # written for either convention registers alike.
     collectives: tuple[str, ...] = ()
     # The module path pattern the call site is in (``layers.*.ffn.shared_experts``):
-    # a recipe that plans an owner for an enclosing module slot must plan this
-    # seam too (reachability).
+    # a recipe that takes over an enclosing module must plan this seam too.
     scope: str | None = None
-    # The module slot this seam is exactly the span of (either spelling plans it).
-    module_slot: str | None = None
+    # Seams this span makes unreachable when its owner serves (alternative,
+    # overlapping spans of one region that are not nested as ``parent``).
+    covers: tuple[str, ...] = ()
+    # Seams that must stay native while this one has an owner (a window that
+    # spans another seam's native code, e.g. a cross-layer transition).
+    excludes: tuple[str, ...] = ()
 
 
 COLLECTIVES = ("tp_all_reduce", "ep_all_to_all", "dp_gather")
 
 
-def _seam(
-    name, contract, kind, form, inputs, kwargs, returns, key, graph, target, **kw
-):
-    return name, SeamSpec(
-        name, contract, kind, form, inputs, kwargs, returns, key, graph, target, **kw
-    )
-
-
-# The seam table is a registry: the host declares no model's seams (only its
-# own model-agnostic ``model.install``). A model package declares its own
-# (``declare_seams``; entry point group ``atom.seam_specs``).
-SEAM_SPEC_GROUP = "atom.seam_specs"
+# No seam registry: a seam's contract is written where the model calls it
+# (``bind(..., spec=)``, ``site(name, spec=)``, or ``seam(spec)`` next to a
+# ``call``), so a model hard-codes its own seams in its own code. The host
+# keeps what the built model declared and checks the plan against it once the
+# model is built (``check_plan``).
 _SEAM_SPECS: dict[str, SeamSpec] = {}
-_SEAM_SOURCES: dict[str, str] = {}  # seam -> who declared it
+_SEAM_SOURCES: dict[str, str] = {}  # seam -> the call site that declared it
 SEAMS = MappingProxyType(_SEAM_SPECS)
-_SEAM_TO_SLOT: dict[str, str] = {}
-_SLOT_TO_SEAM: dict[str, str] = {}
-# A recipe v2 names module slots (`nn.Module` paths, `*` per path segment) or
-# seams. A seam declared with a ``module_slot`` is the span of exactly that
-# slot, so either spelling plans the same owner.
-SEAM_TO_MODULE_SLOT = MappingProxyType(_SEAM_TO_SLOT)
-MODULE_SLOT_TO_SEAM = MappingProxyType(_SLOT_TO_SEAM)
 _NAME_RE = re.compile(r"^[a-z0-9_]+(\.[a-z0-9_]+)+$")
-# No model's seams are built in: a model package declares its own.
-_BUILTIN_SEAM_MODULES: tuple[str, ...] = ()
-# Model-agnostic seams of the host itself (frozen HOOK_API surface).
+# The host's own model-agnostic seam (frozen HOOK_API surface).
 MODEL_INSTALL = "model.install"
 
 
@@ -180,9 +169,6 @@ def _core_specs() -> list[SeamSpec]:
     ]
 
 
-_seam_sources_loaded = False
-
-
 def _hotplug_binds() -> frozenset[str]:
     """What a hot-plug boot binds whatever the boot plan owns: the seams the
     model calls through a ``bind`` made at build."""
@@ -193,19 +179,30 @@ def boot_only() -> frozenset[str]:
     return frozenset(n for n, s in _SEAM_SPECS.items() if s.boot_only)
 
 
+_TUPLE_FIELDS = (
+    "inputs",
+    "kwargs",
+    "returns",
+    "key",
+    "collectives",
+    "covers",
+    "excludes",
+)
+
+
 def _spec_of(raw: Any) -> SeamSpec:
     if isinstance(raw, SeamSpec):
         return raw
     if isinstance(raw, Mapping):
         fields_ = dict(raw)
-        for name in ("inputs", "kwargs", "returns", "key", "collectives"):
+        for name in _TUPLE_FIELDS:
             if name in fields_:
                 fields_[name] = tuple(fields_[name])
         return SeamSpec(**fields_)
     raise TypeError(f"a seam spec is a SeamSpec or a mapping, not {type(raw).__name__}")
 
 
-def _spec_error(spec: SeamSpec, known: Mapping[str, SeamSpec]) -> str | None:
+def _spec_error(spec: SeamSpec) -> str | None:
     if not isinstance(spec.name, str) or not _NAME_RE.match(spec.name):
         return f"name {spec.name!r} is not dotted lower-case"
     if not isinstance(spec.contract, int) or spec.contract < 1:
@@ -218,73 +215,55 @@ def _spec_error(spec: SeamSpec, known: Mapping[str, SeamSpec]) -> str | None:
         return f"graph {spec.graph!r}"
     if not set(spec.key) <= set(spec.inputs):
         return "key must name inputs"
-    if spec.parent is not None and spec.parent not in known:
-        return f"parent {spec.parent!r} is not declared"
     if not set(spec.collectives) <= set(COLLECTIVES):
         return f"collectives {spec.collectives!r} not in {COLLECTIVES}"
-    if spec.module_slot is not None and not _SLOT_RE.match(spec.module_slot):
-        return f"module_slot {spec.module_slot!r} is not a module path"
     return None
 
 
-def declare_seams(specs: Iterable[Any], *, source: str) -> list[str]:
-    """Add seams to the table (frozen HOOK_API surface). A spec already
-    declared identically is a no-op; the same name with another spec is
-    refused (``SeamConflict``) -- a seam has one contract per process.
-    Returns the names newly declared."""
-    batch = [_spec_of(raw) for raw in specs]
+def seam(spec: Any, *, source: str | None = None) -> str:
+    """Declare a seam where the model calls it (frozen HOOK_API surface) and
+    return its name. The same spec again (every layer's call site) is a no-op;
+    another spec under the same name is refused (``SeamConflict``): a seam has
+    one contract per process. Owners registered before the build are checked
+    against it now."""
+    spec = _spec_of(spec)
+    where = source or spec.target or "?"
+    error = _spec_error(spec)
+    if error is not None:
+        raise SeamConflict(f"{where}: seam {spec.name!r}: {error}")
     with _lock:
-        known = {**_SEAM_SPECS, **{s.name: s for s in batch}}
-        added = []
-        for spec in batch:
-            error = _spec_error(spec, known)
-            if error is not None:
-                raise SeamConflict(f"{source}: seam {spec.name!r}: {error}")
-            have = _SEAM_SPECS.get(spec.name)
-            if have is not None:
-                if have != spec:
-                    raise SeamConflict(
-                        f"{source}: seam {spec.name!r} conflicts with the spec "
-                        f"{_SEAM_SOURCES.get(spec.name)} declared"
-                    )
-                continue
-            slot = spec.module_slot
-            if slot is not None and _SLOT_TO_SEAM.get(slot, spec.name) != spec.name:
-                raise SeamConflict(f"{source}: slot {slot!r} is already a seam's span")
-            added.append(spec)
-        for spec in added:
-            _SEAM_SPECS[spec.name] = spec
-            _SEAM_SOURCES[spec.name] = source
-            if spec.module_slot is not None:
-                _SEAM_TO_SLOT[spec.name] = spec.module_slot
-                _SLOT_TO_SEAM[spec.module_slot] = spec.name
-    return [s.name for s in added]
+        have = _SEAM_SPECS.get(spec.name)
+        if have is not None:
+            if have != spec:
+                raise SeamConflict(
+                    f"{where}: seam {spec.name!r} conflicts with the spec "
+                    f"{_SEAM_SOURCES.get(spec.name)} declared"
+                )
+            return spec.name
+        _SEAM_SPECS[spec.name] = spec
+        _SEAM_SOURCES[spec.name] = where
+        for owner, route in _registered.get(spec.name, {}).items():
+            _check_route(spec, owner, route)
+    return spec.name
 
 
-def _load_builtin_seams() -> None:
-    declare_seams(_core_specs(), source="atom.plugin_host")
-    for name in _BUILTIN_SEAM_MODULES:
-        module = importlib.import_module(name)
-        declare_seams(module.specs(), source=name)
-
-
-def load_seam_specs() -> None:
-    """Declare the built-in and the installed (``atom.seam_specs``) seams, once.
-    An entry point gives a list of specs or a callable returning one; its
-    import must be pure (no GPU, no kernel build): the main process reads it
-    to check a recipe."""
-    global _seam_sources_loaded
-    if _seam_sources_loaded:
-        return
-    with _lock:
-        if _seam_sources_loaded:
-            return
-        _load_builtin_seams()
-        for ep in metadata.entry_points(group=SEAM_SPEC_GROUP):
-            loaded = ep.load()
-            declared = loaded() if callable(loaded) else loaded
-            declare_seams(declared, source=f"{SEAM_SPEC_GROUP}:{ep.name}")
-        _seam_sources_loaded = True
+def _check_route(spec: SeamSpec, owner: str, route) -> None:
+    """An owner registered before its seam was declared (the model is built
+    after configure): its contract and form are checked against the spec."""
+    if route.contract != spec.contract:
+        raise PluginContractError(
+            f"{owner}: registered {spec.name} contract {route.contract}, "
+            f"the model declares {spec.contract}"
+        )
+    if set(spec.collectives) - set(route.collectives):
+        raise PluginContractError(
+            f"{owner}: {spec.name} contains {sorted(spec.collectives)}"
+        )
+    if (spec.form == "window") != isinstance(route.impl, Phases):
+        raise PluginContractError(
+            f"{owner}: {spec.name} is a {spec.form} seam; "
+            "a window takes register_window, any other a plain impl"
+        )
 
 
 @dataclass(frozen=True)
@@ -349,6 +328,7 @@ class _Route:
     select: Callable[..., Any] | None
     graph: str
     collectives: tuple[str, ...] = ()
+    contract: int = 1
 
 
 _lock = threading.RLock()
@@ -430,32 +410,36 @@ def register(
     ``owns_collectives``: the collectives the owner runs itself inside the
     span. A seam's own ``collectives`` must be covered; no seam declares any,
     so the argument is accepted and recorded from either kind of plugin."""
-    if seam not in SEAMS:
-        load_seam_specs()
     with _lock:
         unknown = set(owns_collectives) - set(COLLECTIVES)
         if unknown:
             _refuse(seam, owner, "unknown-collective", f"{sorted(unknown)}")
+        if not isinstance(seam, str) or not _NAME_RE.match(seam):
+            _refuse(seam, owner, "unknown-seam", f"{seam!r} is not a seam name")
+        # The model declares its seams when it is built, after this: a known
+        # spec is checked here, an unknown one when the model declares it.
         spec = SEAMS.get(seam)
-        if spec is not None and set(spec.collectives) - set(owns_collectives):
-            _refuse(
-                seam,
-                owner,
-                "collectives-not-owned",
-                f"{seam} contains {sorted(spec.collectives)}",
-            )
-        spec = SEAMS.get(seam)
-        if spec is None:
-            _refuse(seam, owner, "unknown-seam", f"hook API {HOOK_API} has no {seam}")
-        if contract != spec.contract:
-            _refuse(seam, owner, "contract-mismatch", f"{contract} != {spec.contract}")
+        if spec is not None:
+            if set(spec.collectives) - set(owns_collectives):
+                _refuse(
+                    seam,
+                    owner,
+                    "collectives-not-owned",
+                    f"{seam} contains {sorted(spec.collectives)}",
+                )
+            if contract != spec.contract:
+                _refuse(
+                    seam, owner, "contract-mismatch", f"{contract} != {spec.contract}"
+                )
         if not api_satisfies(requires_api):
             _refuse(seam, owner, "api-mismatch", f"{requires_api} vs {HOOK_API}")
         if graph not in GRAPHS:
             _refuse(seam, owner, "graph-unsupported", f"{graph!r} not in {GRAPHS}")
-        if spec.form == "window":
-            if select is not None or not isinstance(impl, Phases):
+        if isinstance(impl, Phases):
+            if select is not None or (spec is not None and spec.form != "window"):
                 _refuse(seam, owner, "window-registration", "use register_window")
+        elif spec is not None and spec.form == "window":
+            _refuse(seam, owner, "window-registration", "use register_window")
         elif not callable(impl) or (select is not None and not callable(select)):
             _refuse(seam, owner, "not-callable", "impl and select must be callable")
         if _loading is not None and owner != _loading:
@@ -470,7 +454,7 @@ def register(
             _refusals.append(Registration(seam, owner, False, "not-planned"))
             return _refusals[-1]
         _registered.setdefault(seam, {})[owner] = _Route(
-            owner, impl, select, graph, tuple(owns_collectives)
+            owner, impl, select, graph, tuple(owns_collectives), contract
         )
         return Registration(seam, owner, True, "registered")
 
@@ -548,26 +532,6 @@ def register_module(
         slot = f"{slot}:{method}"
     if not callable(factory) or (select is not None and not callable(select)):
         _refuse(slot, owner, "not-callable", "factory and select must be callable")
-    seam = MODULE_SLOT_TO_SEAM.get(slot)
-    if seam is not None and SEAMS[seam].form == "bind":
-        built: dict[int, Callable[..., Any]] = {}
-
-        def impl(*inputs, capability, valid_rows=None, **kwargs):
-            module = capability.flags.get("module")
-            fn = built.get(id(module))
-            if fn is None:
-                fn = built[id(module)] = factory(module, capability)
-            return fn(*inputs, **kwargs)
-
-        return register(
-            seam=seam,
-            contract=contract,
-            impl=impl,
-            owner=owner,
-            select=select,
-            graph=graph,
-            requires_api=requires_api,
-        )
     with _lock:
         if not isinstance(slot, str) or not slot or not _SLOT_RE.match(slot):
             _refuse(slot, owner, "unknown-slot", f"{slot!r} is not a module path")
@@ -623,8 +587,6 @@ def _module_route_tables(plan, shorthand: bool):
     for key, table in getattr(plan, "modules", {}).items():
         tables[key] = {}
         for slot, owners in (table or {}).items():
-            if slot in MODULE_SLOT_TO_SEAM:
-                continue  # served as its seam
             missing = [o for o in owners if o not in _module_registered.get(slot, {})]
             if missing:
                 raise plugin_recipe.RecipeRefused(
@@ -1409,7 +1371,6 @@ def configure(
 
     global _plan, _kill_switch, _strict, _on_decline, _loading, _owned, _requested
     global _hotplug, _dev, _dev_roots
-    load_seam_specs()
     roots = _dev_roots_argument(dev_roots)
     dev = bool(dev)
     if roots and not dev:
@@ -2115,6 +2076,100 @@ def _decide(seam, routes, cap, inputs, kwargs, strict) -> tuple[Decision, Any]:
     return Decision(seam, "plugin", "selected", chosen.owner, declined, **where), chosen
 
 
+# -- the plan against the built model -----------------------------------------
+
+
+def _scope_inside(scope: str, slot: str) -> bool:
+    """Whether a seam's call-site module path lies in (or at) module ``slot``."""
+    have, want = scope.split("."), slot.split(".")
+    return len(have) >= len(want) and all(
+        h == w or fnmatch.fnmatchcase(h, w) or fnmatch.fnmatchcase(w, h)
+        for h, w in zip(have, want)
+    )
+
+
+def check_plan() -> dict[str, Any]:
+    """Once the model (and its drafter) are built and their modules installed:
+    the recipe against the seams the model declared at its call sites.
+
+    Refuses (``RecipeRefused``) a planned seam the model never declared
+    (``recipe-seam-unbound``), a required contract the model does not have
+    (``recipe-contract-mismatch``), an owned seam whose ``excludes`` is owned
+    too (``recipe-excludes``), a taken-over module whose inner seams the recipe
+    does not plan (``recipe-inner-unplanned``), and, under
+    ``shadow_policy: error``, an owner an outer owner (``parent`` / ``covers``)
+    makes unreachable (``recipe-shadow``). Returns the shadowed owners."""
+    from atom import plugin_recipe
+
+    plan = _plan
+    if plan is None or _kill_switch:
+        return {"shadowed": []}
+    owned: dict[str, set[str]] = {}
+    for table in _tables.values():
+        for name, routes in table.items():
+            if routes:
+                owned.setdefault(name, set()).update(r.owner for r in routes)
+    planned = set(owned) | set(getattr(plan, "native_seams", ()))
+    unbound = sorted(s for s in planned if s not in SEAMS)
+    if unbound:
+        raise plugin_recipe.RecipeRefused(
+            "recipe-seam-unbound",
+            f"the built model has no call site for {unbound}",
+        )
+    for name, contract in dict(plan.requires.get("seams", {}) or {}).items():
+        spec = SEAMS.get(name)
+        if spec is None:
+            raise plugin_recipe.RecipeRefused(
+                "recipe-seam-unbound", f"requires.seams: {name} has no call site"
+            )
+        if contract != spec.contract:
+            raise plugin_recipe.RecipeRefused(
+                "recipe-contract-mismatch",
+                f"{name}: recipe {contract} != model {spec.contract}",
+            )
+    for name in owned:
+        clash = [e for e in SEAMS[name].excludes if e in owned]
+        if clash:
+            raise plugin_recipe.RecipeRefused(
+                "recipe-excludes", f"{name} needs {clash} native, the recipe owns them"
+            )
+    shadowed = []
+    for name, owners in owned.items():
+        spec = SEAMS[name]
+        outers = [spec.parent] if spec.parent else []
+        outers += [s for s, sp in SEAMS.items() if name in sp.covers]
+        for outer in outers:
+            if outer not in owned:
+                continue
+            for owner in sorted(owners - owned[outer]):
+                shadowed.append((name, owner, outer))
+    if shadowed and getattr(plan, "shadow_policy", "nested") == "error":
+        raise plugin_recipe.RecipeRefused(
+            "recipe-shadow", f"outer owners make unreachable: {shadowed}"
+        )
+    for table in _module_tables.values():
+        for slot, routes in table.items():
+            path, _, method = slot.partition(":")
+            if not routes or (method and method != "forward"):
+                continue
+            missing = sorted(
+                n
+                for n, s in SEAMS.items()
+                if s.scope is not None
+                and _scope_inside(s.scope, path)
+                and n not in planned
+            )
+            if missing:
+                raise plugin_recipe.RecipeRefused(
+                    "recipe-inner-unplanned",
+                    f"modules[{slot}] takes over a module whose seams {missing} "
+                    "the recipe does not plan (list owners, or [] for native)",
+                )
+    if shadowed:
+        logger.info("plugin_host: owners shadowed by an outer owner: %s", shadowed)
+    return {"shadowed": shadowed}
+
+
 # -- recipe reachability: what each seam / module actually routed to ----------
 
 # (seam, "captured" | "eager") -> owner (or "native") -> buckets (captured) or
@@ -2451,8 +2506,11 @@ def bind(
     capability: Mapping[str, Any] | Callable[..., Any] | None = None,
     layer: str | None = None,
     fake: Callable[..., torch.Tensor] | None = None,
+    spec: Any = None,
 ) -> Callable[..., Any]:
     """At model build (after ``configure``): how the call site runs ``seam``.
+    ``spec`` is the seam's contract, written here at the call site (a model
+    hard-codes its own seams); a seam declared before may omit it.
 
     No planned owner: ``native`` itself, so the call site is today's call.
     Else a ``Router``; an ``opaque_op`` seam given ``layer`` and ``fake`` is
@@ -2460,13 +2518,11 @@ def bind(
     ``capability`` is ``{"quant": ..., "flags": {...}}`` or a callable taking
     the call's inputs and returning one.
     """
+    if spec is not None:
+        seam = globals()["seam"](spec)  # the module function, not the argument
     spec = SEAMS.get(seam)
     if spec is None:
-        load_seam_specs()
-        spec = SEAMS.get(seam)
-    if spec is None:
-        # No package declares it here: no plan can own it, the call site is native.
-        return native
+        raise KeyError(f"bind of {seam!r} without its spec (pass spec=)")
     if spec.form != "bind":
         raise KeyError(f"seam {seam!r} is a {spec.form} seam, not a bound one")
     _bound.add(seam)
@@ -2499,10 +2555,13 @@ def call(seam: str, native: Callable[..., Any], *inputs: Any, **kwargs: Any) -> 
     return _dispatch(seam, native, _call_capability.get(seam), inputs, kwargs)
 
 
-def site(name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    """Declare a whole module-level function as the native of call seam ``name``.
-    The seam is declared by its model package, possibly after this import: the
-    wrapper is native until a plan owns it."""
+def site(
+    name: str, spec: Any = None
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Declare a whole module-level function as the native of call seam
+    ``name``; ``spec`` is the seam's contract, written here."""
+    if spec is not None:
+        seam(spec)
     spec = SEAMS.get(name)
     if spec is not None and spec.form != "call":
         raise KeyError(f"seam {name!r} is a {spec.form} seam, not a call seam")
@@ -2739,6 +2798,7 @@ def _reset_for_testing() -> None:
         _counts.clear()
         _route_log.clear()
         _weight_marks.clear()
+
         _weight_models.clear()
         _warned_misses.clear()
         _plan, _owned, _last, _requested = None, frozenset(), None, None
@@ -2764,6 +2824,8 @@ def _configure_aiter(names: Iterable[str]) -> bool:
     return True
 
 
-# The built-in model seams are in the table from import on; installed
-# packages' (``atom.seam_specs``) once a recipe or a plan is read.
-_load_builtin_seams()
+# The host's own seam is declared from import on.
+for _spec in _core_specs():
+    seam(_spec, source="atom.plugin_host")
+# The transition window's contract (``atom.plugin_transition.SPEC``).
+seam(_transition_spec, source="atom/plugin_transition.py")

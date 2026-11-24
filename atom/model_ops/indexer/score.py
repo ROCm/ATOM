@@ -38,6 +38,25 @@ from atom.utils.region_graph import eager_region
 from .layout import MFMA, NATURAL
 from .rows import IndexCache, IndexRows
 
+# The `v41.attn.index_topk` seam: its contract, written at its call site in this file.
+_SEAM_ATTN_INDEX_TOPK = plugin_host.seam(
+    plugin_host.SeamSpec(
+        name="v41.attn.index_topk",
+        contract=1,
+        kind="op",
+        form="call",
+        inputs=("scores", "group", "row_ends", "out", "count", "stride0", "stride1"),
+        kwargs=("k", "stable", "row_starts", "plane_width"),
+        returns=(),
+        key=("scores", "group", "row_ends", "out", "count", "stride0", "stride1"),
+        graph="capture_safe",
+        doc="packed top_k_per_row_decode, in place into out",
+        scope="layers.*.attn.indexer",
+        target="atom/model_ops/indexer/score.py",
+    ),
+    source="atom/model_ops/indexer/score.py",
+)
+
 # gfx1250 scores the FP8 plane with FlyDSL's paged MQA logits (8-row pages
 # included); it reads the same packed preshuffled pages as the Triton kernel
 # and takes the same arguments.

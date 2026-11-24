@@ -110,7 +110,7 @@ def test_register_accepts_a_planned_owner(monkeypatch):
 @pytest.mark.parametrize(
     "kwargs, reason",
     [
-        ({"seam": "v41.attn.nope"}, "unknown-seam"),
+        ({"seam": "Not A Seam"}, "unknown-seam"),
         ({"contract": 9}, "contract-mismatch"),
         ({"requires_api": ">=4"}, "api-mismatch"),
         ({"requires_api": "nonsense"}, "api-mismatch"),
@@ -947,8 +947,6 @@ def test_a_recipe_resolves_to_a_deterministic_plan():
         (lambda d: d.update(schema="x"), "recipe-schema"),
         (lambda d: d.update(model_arch="Llama"), "recipe-model-mismatch"),
         (lambda d: d.update(requires={"atom_hook_api": ">=4"}), "recipe-pin-mismatch"),
-        (lambda d: d.update(requires={"seams": {OUT: 2}}), "recipe-contract-mismatch"),
-        (lambda d: d["plan"]["seams"].update({"v41.nope": []}), "recipe-unknown-seam"),
         (
             lambda d: d["plan"]["seams"].update({OUT: ["ghost"]}),
             "recipe-unknown-provider",
@@ -975,15 +973,6 @@ def test_two_owners_need_a_declared_partition():
         [_recipe({OUT: ["a", "b"]}, defaults={"allow_partition": True})]
     )
     assert plan.tables["any"][OUT] == ("a", "b")
-
-
-def test_a_region_owner_shadows_its_children_only_when_declared():
-    seams = {FFN: ["whole"], ACT: ["silu"], "v41.moe.topk": ["whole"]}
-    with pytest.raises(recipes.RecipeRefused) as refused:
-        recipes.resolve([_recipe(seams)])
-    assert refused.value.reason == "recipe-shadow"
-    plan = recipes.resolve([_recipe(seams, defaults={"shadow_policy": "shadow"})])
-    assert plan.shadowed == ((ACT, "silu", "whole"),)
 
 
 def test_a_recipe_set_must_agree_and_not_overlap():

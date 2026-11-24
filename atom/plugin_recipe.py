@@ -355,6 +355,13 @@ class Plan:
     aiter: tuple[str, ...]
     arms: Mapping[str, tuple[str, ...]]
     shadowed: tuple[tuple[str, str, str], ...] = ()
+    # How a nested / covered owner shadowed by an outer one is treated, checked
+    # against the built model (``plugin_host.check_plan``): nested (record),
+    # error (refuse).
+    shadow_policy: str = "nested"
+    # Seams the recipe plans with no owner ([]): native by decision, which
+    # counts as planned for a taken-over module's inner seams.
+    native_seams: tuple[str, ...] = ()
     strict_overlap: bool = False
     on_decline: str = "native"
     expect: Mapping[str, Any] = MappingProxyType({})
@@ -502,6 +509,9 @@ def _scope_inside(scope: str, slot: str) -> bool:
     )
 
 
+_SEAM_RE = re.compile(r"^[a-z0-9_]+(\.[a-z0-9_]+)+$")
+
+
 def _check_slot_pattern(slot: str) -> None:
     if not isinstance(slot, str) or not slot or not _SLOT_RE.match(slot):
         raise RecipeRefused("recipe-schema", f"invalid module slot pattern {slot!r}")
@@ -573,8 +583,9 @@ def _aiter_names(raw: Any, is_v2: bool) -> tuple[str, ...]:
 
 
 def _parse(document: Mapping[str, Any], *, model_arch: str | None) -> dict[str, Any]:
-    """One recipe document (v1 or v2), checked against this ATOM's contracts."""
-    plugin_host.load_seam_specs()
+    """One recipe document (v1 or v2). A seam's contract is the model's (it is
+    written at the model's call site): seams are checked against the built
+    model (``plugin_host.check_plan``), not here."""
     if not isinstance(document, Mapping):
         raise RecipeRefused("recipe-schema", "recipe must be a JSON object")
     schema = document.get("schema")
@@ -628,15 +639,12 @@ def _parse(document: Mapping[str, Any], *, model_arch: str | None) -> dict[str, 
         raise RecipeRefused(
             "recipe-schema", "requires.plugins maps provider -> 'sha256:<64 hex>'"
         )
-    for seam, contract in dict(requires.get("seams", {})).items():
-        spec = plugin_host.SEAMS.get(seam)
-        if spec is None:
-            raise RecipeRefused("recipe-unknown-seam", f"requires.seams: {seam}")
-        if contract != spec.contract:
-            raise RecipeRefused(
-                "recipe-contract-mismatch",
-                f"{seam}: recipe {contract} != ATOM {spec.contract}",
-            )
+    required = requires.get("seams", {})
+    if not isinstance(required, Mapping) or not all(
+        _SEAM_RE.match(str(k)) and isinstance(v, int) and v >= 1
+        for k, v in required.items()
+    ):
+        raise RecipeRefused("recipe-schema", "requires.seams maps seam -> contract")
 
     engine_opts = EngineOptions.from_mapping(document.get("engine"))
     model_opts = ModelOptions.from_mapping(document.get("model_options"))
@@ -705,23 +713,13 @@ def _parse(document: Mapping[str, Any], *, model_arch: str | None) -> dict[str, 
     table: dict[str, tuple[str, ...]] = {}
     module_table: dict[str, tuple[str, ...]] = {}
 
+    native_seams: list[str] = []
     for seam, owners in seams.items():
-        if seam not in plugin_host.SEAMS:
-            raise RecipeRefused("recipe-unknown-seam", seam)
+        if not isinstance(seam, str) or not _SEAM_RE.match(seam):
+            raise RecipeRefused("recipe-unknown-seam", f"{seam!r} is not a seam name")
         owners = _names(owners, f"plan.seams[{seam}]")
-        if (
-            owners
-            and plugin_host.SEAMS[seam].form == "window"
-            and (
-                len(owners) != 1
-                or seams.get("v41.block.ffn")
-                or raw_modules.get("layers.*.ffn")
-            )
-        ):
-            raise RecipeRefused(
-                "recipe-window-conflict",
-                "transition needs one owner and native FFN",
-            )
+        if not owners:
+            native_seams.append(seam)
         if len(set(owners)) != len(owners):
             raise RecipeRefused("recipe-schema", f"{seam}: an owner twice")
         for owner in owners:
@@ -748,9 +746,6 @@ def _parse(document: Mapping[str, Any], *, model_arch: str | None) -> dict[str, 
             )
         if owners:
             table[seam] = owners
-            alias = plugin_host.SEAM_TO_MODULE_SLOT.get(seam)
-            if alias is not None:
-                module_table.setdefault(alias, owners)
 
     for slot, owners in raw_modules.items():
         _check_slot_pattern(slot)
@@ -774,60 +769,12 @@ def _parse(document: Mapping[str, Any], *, model_arch: str | None) -> dict[str, 
             if ref.get("kind", "layer") != "layer":
                 raise RecipeRefused("recipe-conflict", f"{owner} is an AITER provider")
             serves = ref.get("serves")
-            seam_alias = plugin_host.MODULE_SLOT_TO_SEAM.get(slot)
-            if (
-                serves is not None
-                and slot not in serves
-                and (seam_alias is None or seam_alias not in serves)
-            ):
+            if serves is not None and slot not in serves:
                 raise RecipeRefused(
                     "recipe-plugin-drift", f"{owner} does not declare {slot}"
                 )
         if owners:
             module_table[slot] = owners
-            seam_alias = plugin_host.MODULE_SLOT_TO_SEAM.get(slot)
-            if seam_alias is not None and seam_alias not in table:
-                table[seam_alias] = owners
-
-    # A module owner at the outside: the seams inside that module must be
-    # planned too (owners, or [] for native), so the recipe says what runs
-    # when the module owner declines and what it makes unreachable.
-    for slot, owners in module_table.items():
-        path, _, method = slot.partition(":")
-        if (
-            not owners
-            or (method and method != "forward")
-            or path in plugin_host.MODULE_SLOT_TO_SEAM  # a seam: parent/child rules
-        ):
-            continue
-        missing = sorted(
-            name
-            for name, spec in plugin_host.SEAMS.items()
-            if spec.scope is not None
-            and spec.module_slot != path
-            and _scope_inside(spec.scope, path)
-            and name not in seams
-        )
-        if missing:
-            raise RecipeRefused(
-                "recipe-inner-unplanned",
-                f"modules[{slot}] takes over a module whose seams {missing} the "
-                "recipe does not plan (list owners, or [] for native)",
-            )
-
-    shadowed: list[tuple[str, str, str]] = []
-    for child, owners in table.items():
-        parent = plugin_host.SEAMS[child].parent
-        if parent in table:
-            for owner in owners:
-                if owner in table[parent]:
-                    continue
-                if shadow_policy == "error":
-                    raise RecipeRefused(
-                        "recipe-shadow",
-                        f"{parent} owner {table[parent][0]} shadows {child} owner {owner}",
-                    )
-                shadowed.append((child, owner, table[parent][0]))
 
     arms = document.get("arms", {})
     if not isinstance(arms, Mapping):
@@ -850,7 +797,8 @@ def _parse(document: Mapping[str, Any], *, model_arch: str | None) -> dict[str, 
         "plugins": plugins,
         "table": table,
         "module_table": module_table,
-        "shadowed": shadowed,
+        "shadow_policy": shadow_policy,
+        "native_seams": tuple(native_seams),
         "arms": {k: tuple(v) for k, v in arms.items()},
         "strict_overlap": bool(defaults.get("strict_overlap", False)),
         "on_decline": on_decline,
@@ -920,13 +868,15 @@ def resolve(
     arms.setdefault("plugin", everyone)
     arms.setdefault("identity", everyone)
     digests = tuple(sorted(r["digest"] for r in parsed))
+    # The contracts the recipes require (the model checks them once built).
     contracts = {
-        seam: plugin_host.SEAMS[seam].contract
-        for table in tables.values()
-        for seam in table
-        if seam in plugin_host.SEAMS
+        seam: contract
+        for r in parsed
+        for seam, contract in dict(r["requires"].get("seams", {})).items()
     }
-    shadowed = tuple(s for r in parsed for s in r["shadowed"])
+    native_seams = tuple(sorted({s for r in parsed for s in r["native_seams"]}))
+    policies = {r["shadow_policy"] for r in parsed}
+    shadow_policy = "error" if "error" in policies else first["shadow_policy"]
     schema_version = max(r["schema_version"] for r in parsed)
     id_payload: list[Any] = [
         digests,
@@ -958,7 +908,8 @@ def resolve(
         providers=tuple(providers),
         aiter=tuple(aiter),
         arms=MappingProxyType(arms),
-        shadowed=shadowed,
+        shadow_policy=shadow_policy,
+        native_seams=native_seams,
         strict_overlap=first["strict_overlap"],
         on_decline=first["on_decline"],
         expect=MappingProxyType(first["expect"]),
@@ -1166,8 +1117,13 @@ def engine_options_for(config: Any) -> EngineOptions:
 
 def check_runtime(plan: Plan, config: Any) -> None:
     """``runtime.expect``: the server must be the one the recipe was made for."""
+
+    def is_window(seam: str) -> bool:
+        spec = plugin_host.SEAMS.get(seam)
+        return spec is not None and spec.form == "window"
+
     has_transition = any(
-        isinstance(key, int) and table and table.get("v41.block.transition")
+        isinstance(key, int) and table and any(is_window(s) for s in table)
         for key, table in plan.tables.items()
     )
     if has_transition:
@@ -1259,15 +1215,13 @@ def main(argv: list[str] | None = None) -> int:
             served = set(filter(None, targets.split(",")))
             for table in plan.tables.values():
                 for seam, owners in (table or {}).items():
-                    slot = plugin_host.SEAM_TO_MODULE_SLOT.get(seam)
-                    if name in owners and seam not in served and slot not in served:
+                    if name in owners and seam not in served:
                         raise RecipeRefused(
                             "recipe-plugin-drift", f"installed {name} lacks {seam}"
                         )
             for table in plan.modules.values():
                 for slot, owners in (table or {}).items():
-                    seam = plugin_host.MODULE_SLOT_TO_SEAM.get(slot)
-                    if name in owners and slot not in served and seam not in served:
+                    if name in owners and slot not in served:
                         raise RecipeRefused(
                             "recipe-plugin-drift", f"installed {name} lacks {slot}"
                         )
