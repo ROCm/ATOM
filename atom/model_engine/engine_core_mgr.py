@@ -1205,6 +1205,10 @@ class CoreManager:
             # drives the pipeline downstream.
             logger.debug(f"{self.label}: Add {len(seqs)} requests to PP head 0")
             self._send_request(0, _add_frame(seqs))
+            # The pipeline is one DP rank; D reaches every stage through
+            # `remote_pp_size` (ATOM_PD_EARLY_HANDOFF).
+            for seq in seqs:
+                seq.pd_routed_dp_rank = 0
         elif self._routable_engine_count == 1:
             # Single routable engine, send all requests
             logger.debug(f"{self.label}: Add {len(seqs)} requests to DP rank 0")

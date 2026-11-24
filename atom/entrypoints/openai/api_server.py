@@ -982,7 +982,6 @@ def _early_handoff_params(
         **kv_transfer_params,
         "chunked_transfer": True,
         "transfer_id": f"early-{uuid.uuid4().hex}",
-        "pd_early_handoff": True,
     }
 
 
