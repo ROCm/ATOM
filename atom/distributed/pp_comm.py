@@ -66,6 +66,7 @@ def init_pp_aware_dist_env(
     prefill_context_model_parallel_size: int = 1,
     decode_context_parallel_size: int = 1,
     disable_custom_all_reduce: bool = False,
+    device_communicators: bool = True,
 ) -> None:
     """PP-aware distributed init (aiter's init_dist_env pins pp=1)."""
     set_custom_all_reduce(not disable_custom_all_reduce)
@@ -83,6 +84,7 @@ def init_pp_aware_dist_env(
         decode_context_model_parallel_size=decode_context_parallel_size,
         data_parallel_size=data_parallel_size,
         prefill_context_model_parallel_size=prefill_context_model_parallel_size,
+        device_communicators=device_communicators,
     )
 
     # No per-rank signal/input-buffer registration here (this used to copy

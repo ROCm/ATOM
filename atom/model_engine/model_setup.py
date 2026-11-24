@@ -42,10 +42,14 @@ logger = logging.getLogger("atom")
 ModelLoader = Callable[[Config, type, torch.device], nn.Module]
 
 
-def init_model_env(config: Config, rank: int) -> torch.device:
+def init_model_env(
+    config: Config, rank: int, *, device_communicators: bool = True
+) -> torch.device:
     """Set up this process for building its rank's model: the current
     config, its device and its parallel groups (their ranks decide what a
-    rank loads). Returns the device."""
+    rank loads). Returns the device. A process that only loads leaves the
+    groups' device communicators out (``device_communicators=False``; not
+    with PP)."""
     # Read just below (sp_is_enabled) and by model construction.
     set_current_atom_config(config)
     if sp_is_enabled():
@@ -111,6 +115,7 @@ def init_model_env(config: Config, rank: int) -> torch.device:
         prefill_context_model_parallel_size=config.pcp_group_size,
         decode_context_parallel_size=getattr(config, "decode_context_parallel_size", 1),
         disable_custom_all_reduce=config.disable_custom_all_reduce,
+        device_communicators=device_communicators,
     )
     if config.pipeline_parallel_size == 1:
         # The group spans the devices that exist; apply_simulated_tp then

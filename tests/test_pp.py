@@ -86,11 +86,11 @@ if "aiter" in _stubbed:
 
 
 @pytest.mark.parametrize(
-    "disabled,expected_enabled",
-    [(False, True), (True, False)],
+    "disabled,expected_enabled,device_communicators",
+    [(False, True, True), (True, False, False)],
 )
 def test_pp_init_applies_custom_all_reduce_policy_before_dist_init(
-    monkeypatch, disabled, expected_enabled
+    monkeypatch, disabled, expected_enabled, device_communicators
 ):
     events = []
     monkeypatch.setattr(
@@ -106,7 +106,9 @@ def test_pp_init_applies_custom_all_reduce_policy_before_dist_init(
     monkeypatch.setattr(
         pp_comm,
         "ensure_model_parallel_initialized",
-        lambda *_args, **_kwargs: events.append(("model_parallel", None)),
+        lambda *_args, **kwargs: events.append(
+            ("model_parallel", kwargs["device_communicators"])
+        ),
     )
 
     pp_comm.init_pp_aware_dist_env(
@@ -117,12 +119,13 @@ def test_pp_init_applies_custom_all_reduce_policy_before_dist_init(
         distributed_init_method="tcp://127.0.0.1:12345",
         local_rank=3,
         disable_custom_all_reduce=disabled,
+        device_communicators=device_communicators,
     )
 
     assert events == [
         ("custom_ar", expected_enabled),
         ("dist", 3),
-        ("model_parallel", None),
+        ("model_parallel", device_communicators),
     ]
 
 
