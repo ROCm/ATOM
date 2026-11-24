@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use crate::core::{HashRing, Worker};
 
 mod cache_aware;
+mod dp_load;
 mod dp_sticky;
 mod factory;
 mod power_of_two;
@@ -20,6 +21,7 @@ mod round_robin;
 pub mod tree;
 pub(crate) mod utils;
 pub use cache_aware::CacheAwarePolicy;
+pub use dp_load::{DpCharge, DpLoad, LeastLoad, LeastLoadPolicy, RankLoad};
 pub use dp_sticky::DpStickyPolicy;
 pub use factory::PolicyFactory;
 pub use power_of_two::PowerOfTwoPolicy;
