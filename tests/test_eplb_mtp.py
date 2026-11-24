@@ -23,7 +23,7 @@ try:
 except ImportError as _e:  # aiter/triton absent under bare non-GPU pytest
     skip_if_dependency_missing(_e, "requires full atom import env")
 
-from test_eplb_gate_permute import (  # noqa: E402
+from test_eplb_gate_permute import (
     EXPERTS,
     LAYERS,
     RANKS,
@@ -35,7 +35,7 @@ from test_eplb_gate_permute import (  # noqa: E402
     _skewed,
     clean_switches,  # noqa: F401  (autouse: every switch unset)
 )
-from test_eplb_rearm import _lines, _manager, _scripted_policy  # noqa: E402
+from test_eplb_rearm import _lines, _manager, _scripted_policy
 
 ROOT = Path(__file__).resolve().parent.parent
 # The draft layers have an expert count of their own: 8 over 4 ranks, where
@@ -381,7 +381,7 @@ def test_frozen_nothing_of_the_draft_sampler_runs(monkeypatch):
 
 
 def test_draft_loads_ride_the_main_collective_on_the_cpu_group(monkeypatch):
-    manager, draft = _mtp_manager(monkeypatch)
+    manager, _draft = _mtp_manager(monkeypatch)
     runtime, mtp = manager.gate_permute, manager.gate_permute.mtp
     mtp.dec_load.copy_(_skewed(4)[:, :DRAFT_EXPERTS])
     mtp.dec_raw[1, 1 + 3] = 7  # held by slot: folded before the reduce
@@ -419,7 +419,7 @@ def test_draft_loads_ride_the_main_collective_on_the_cpu_group(monkeypatch):
 
 # ---------------------------------------------------------------- plan
 def test_plan_balances_a_skewed_decode_load_within_the_budget(monkeypatch):
-    manager, draft = _mtp_manager(monkeypatch, ATOM_EPLB_SWAP_EPS=0.005)
+    manager, _draft = _mtp_manager(monkeypatch, ATOM_EPLB_SWAP_EPS=0.005)
     mtp = manager.gate_permute.mtp
     dec = torch.zeros((3, DRAFT_EXPERTS), dtype=torch.int64)
     dec[0] = torch.tensor([900, 800, 10, 10, 10, 10, 10, 10])  # rank 0 has it all
@@ -454,7 +454,7 @@ def test_plan_balances_a_skewed_decode_load_within_the_budget(monkeypatch):
 
 
 def test_plan_uses_the_draft_passes_own_operating_point(monkeypatch):
-    manager, draft = _mtp_manager(monkeypatch)
+    manager, _draft = _mtp_manager(monkeypatch)
     mtp = manager.gate_permute.mtp
     seen = []
     solve = gp.swap_rebalance
@@ -511,7 +511,7 @@ def test_draft_layer_moves_through_the_host_transport_with_its_gate(
     for new in (first, second):
         errors = []
 
-        def run(manager):
+        def run(manager, new=new, errors=errors):
             try:
                 manager._switch_mtp_layer(manager.gate_permute.mtp, index, new)
             except BaseException as exc:  # noqa: BLE001
@@ -573,9 +573,11 @@ def test_failed_draft_layer_switch_is_fatal(monkeypatch, caplog, stage):
         monkeypatch.setattr(eplb, "_migrate_single_layer", fail)
     else:
         monkeypatch.setattr(eplb, "move_from_buffer", fail)
-    with caplog.at_level(logging.ERROR, logger="atom"):
-        with pytest.raises(OSError, match=stage):
-            manager._switch_mtp_layer(mtp, 1, _cycle())
+    with (
+        caplog.at_level(logging.ERROR, logger="atom"),
+        pytest.raises(OSError, match=stage),
+    ):
+        manager._switch_mtp_layer(mtp, 1, _cycle())
     assert manager.rebalancing_stopped and manager._fatal
     (fatal,) = _lines(caplog, "FATAL")
     assert fatal.startswith(gp.TAG) and f"draft layer 41 failed at '{stage}'" in fatal
@@ -595,7 +597,7 @@ def test_rebalance_plans_and_moves_the_draft_layers_after_the_target_layers(
     manager, draft = _mtp_manager(
         monkeypatch, ATOM_EPLB_MAX_REBALANCES=2, ATOM_EPLB_DUMP_DIR=tmp_path
     )
-    runtime, mtp = manager.gate_permute, manager.gate_permute.mtp
+    runtime = manager.gate_permute
     # the scripted policy stands in for the target layers' plan
     calls = _scripted_policy(monkeypatch, [True, False, False, False])
 
@@ -672,8 +674,8 @@ def test_rebalance_plans_and_moves_the_draft_layers_after_the_target_layers(
 
 
 def test_evaluation_that_moves_neither_layer_set_is_idle(monkeypatch):
-    manager, draft = _mtp_manager(monkeypatch, ATOM_EPLB_MAX_REBALANCES=3)
-    runtime, mtp = manager.gate_permute, manager.gate_permute.mtp
+    manager, _draft = _mtp_manager(monkeypatch, ATOM_EPLB_MAX_REBALANCES=3)
+    runtime = manager.gate_permute
     # the real plans on loads that are even: the target layers' prefill picks
     # the same for every expert, the draft layers without a sample
     for _ in range(2):

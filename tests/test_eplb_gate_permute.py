@@ -43,7 +43,6 @@ SWITCHES = (
     "ATOM_EPLB_REARM_MIN_SAMPLES",
     "ATOM_EPLB_REARM_BUDGET",
     "ATOM_EPLB_FIRST_BUDGET",
-    "ATOM_EXPERT_PLACEMENT",
 )
 LAYERS, EXPERTS, RANKS, TOP_K = 3, 16, 4, 3
 PER = EXPERTS // RANKS
@@ -524,7 +523,7 @@ def test_swapped_experts_are_reached_through_the_permuted_gate(monkeypatch):
         old = envs[0].meta.physical_to_logical_map.clone()
         snapshot = [w.clone() for w in weights]
         for r, e in enumerate(envs):
-            plan, local, sends, recvs = eplb._plan_single_layer_migration(
+            plan, local, _sends, recvs = eplb._plan_single_layer_migration(
                 old_p2l_layer=old[0],
                 new_p2l_layer=p2l[0],
                 num_local_physical_experts=PER,
@@ -702,7 +701,7 @@ def test_swap_rebalance_moves_weights_maps_and_gate_as_one_plan(
 ):
     table = {f"layers.{i}.ffn.experts": list(range(EXPERTS))[::-1] for i in (0, 1)}
     (tmp_path / "ref.json").write_text(json.dumps(table))
-    manager, gates, layers = _bound_manager(
+    manager, gates, _layers = _bound_manager(
         monkeypatch,
         ATOM_EPLB_GATE_PERMUTE=1,
         ATOM_EPLB_SWAP_BUDGET=2,
@@ -761,7 +760,7 @@ def test_swap_rebalance_moves_weights_maps_and_gate_as_one_plan(
 
 def test_mode_line_names_the_switches(monkeypatch, caplog):
     with caplog.at_level(logging.INFO, logger="atom"):
-        manager, _, _ = _bound_manager(
+        _bound_manager(
             monkeypatch, ATOM_EPLB_GATE_PERMUTE=1, ATOM_EPLB_FIRST_REBALANCE_STEPS=7
         )
     (line,) = [r.getMessage() for r in caplog.records if "mode:" in r.getMessage()]
@@ -846,9 +845,11 @@ def test_failed_layer_switch_is_fatal_and_never_half_applied_silently(
         monkeypatch.setattr(eplb, "migrate_experts_chunk", fail)
     else:
         monkeypatch.setattr(eplb, "commit_experts_chunk", fail)
-    with caplog.at_level(logging.ERROR, logger="atom"):
-        with pytest.raises(OSError, match=stage):
-            _drain(manager._rebalance())
+    with (
+        caplog.at_level(logging.ERROR, logger="atom"),
+        pytest.raises(OSError, match=stage),
+    ):
+        _drain(manager._rebalance())
     assert manager.rebalancing_stopped
     (fatal,) = [r.getMessage() for r in caplog.records if "FATAL" in r.getMessage()]
     assert fatal.startswith(gp.TAG) and f"failed at '{stage}'" in fatal
@@ -990,7 +991,7 @@ def test_switches_default_off():
 
 
 def test_default_manager_has_no_gate_permute_and_keeps_the_gate(monkeypatch):
-    manager, gates, _ = _bound_manager(monkeypatch, policy="naive")
+    manager, _gates, _ = _bound_manager(monkeypatch, policy="naive")
     assert manager.gate_permute is None
     assert manager.monitor._logical_fold is None
     monkeypatch.setattr(eplb, "_MANAGER", manager)
@@ -1095,7 +1096,7 @@ def _place_experts(monkeypatch, gate_permute):
             calls.append(("shared", *a)) or ("w", "ids")
         ),
     }
-    exec(
+    exec(  # noqa: S102 -- the method's own source, run on stand-ins
         method_source("atom/model_ops/moe.py", "Mxfp4MoEMethod", "place_experts"),
         namespace,
     )
@@ -1137,7 +1138,7 @@ def _eplb_layer_end(monkeypatch, replay):
         "DeepseekV41RuntimeModel",
         "eplb_layer_end",
     )
-    exec(source.replace("@property\n", ""), namespace)
+    exec(source.replace("@property\n", ""), namespace)  # noqa: S102 -- as above
     return namespace["eplb_layer_end"](SimpleNamespace(replay=replay, decoder_start=20))
 
 
@@ -1207,9 +1208,7 @@ def test_swap_policy_needs_no_redundant_experts():
 
 
 # ---------------------------------------------------------------- logging
-def test_reference_table_follows_a_placement_loaded_at_start(tmp_path, monkeypatch):
-    from atom.model_ops.fused_moe import expert_placement
-
+def test_reference_table_follows_a_placement_loaded_at_start(tmp_path):
     layers = {i: _layer(i) for i in (0, 1)}
     reference = {"layers.0.ffn.experts": list(range(EXPERTS))[::-1]}
     loaded = {"layers.0.ffn.experts": ROLL.tolist()}
@@ -1217,8 +1216,9 @@ def test_reference_table_follows_a_placement_loaded_at_start(tmp_path, monkeypat
     got = gp.reference_ranks(str(tmp_path / "ref.json"), layers, EXPERTS, PER)
     assert sorted(got) == [0]
     assert got[0].tolist() == [(EXPERTS - 1 - e) // PER for e in range(EXPERTS)]
-    # checkpoint expert e is logical loaded[e] when a table renumbered the layer
-    monkeypatch.setattr(expert_placement, "_TABLE", loaded)
+    # checkpoint expert e is logical loaded[e] when a static placement renumbered
+    # the layer at load (FusedMoE._static_placement)
+    layers[0]._static_placement = loaded["layers.0.ffn.experts"]
     got = gp.reference_ranks(str(tmp_path / "ref.json"), layers, EXPERTS, PER)
     for e in range(EXPERTS):
         assert got[0][loaded["layers.0.ffn.experts"][e]] == (EXPERTS - 1 - e) // PER
@@ -1282,7 +1282,7 @@ def test_hot_first_rebalance_orders_every_rank_and_moves_gate_with_it(
 ):
     """ATOM_EPLB_HOT_FIRST: the plan also orders each rank's experts by load;
     weights, maps, gate rows and the fold index follow as for any other plan."""
-    manager, gates, layers = _bound_manager(
+    manager, gates, _layers = _bound_manager(
         monkeypatch,
         ATOM_EPLB_GATE_PERMUTE=1,
         ATOM_EPLB_SWAP_BUDGET=2,

@@ -41,7 +41,7 @@ def json_or_file(value: str):
     object passes the path."""
     import os
 
-    path = value[1:] if value.startswith("@") else value
+    path = value.removeprefix("@")
     if value.startswith("@") or os.path.isfile(path):
         with open(path) as f:
             return json.load(f)

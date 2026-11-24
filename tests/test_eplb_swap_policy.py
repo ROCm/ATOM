@@ -125,7 +125,7 @@ def test_budget_bounds_the_swaps_of_a_layer():
     pf, dec = skewed_loads(3, 384, seed=5)
     p2l = identity_p2l(3, 384)
     for budget in (0, 1, 5, 16):
-        new, l2p, logcnt, swaps = run_policy(pf, dec, p2l, budget=budget)
+        new, _l2p, _logcnt, swaps = run_policy(pf, dec, p2l, budget=budget)
         assert all(n <= budget for n in swaps.values())
         moved = (new != p2l).sum(dim=1)
         assert moved.tolist() == [2 * swaps[i] for i in range(3)]
@@ -346,15 +346,17 @@ def test_hot_first_orders_each_rank_and_keeps_its_experts():
     pf = torch.from_numpy(rng.pareto(1.2, (layers, experts)) * 1000).to(torch.int64)
     dec = torch.from_numpy(rng.pareto(1.5, (layers, experts)) * 100).to(torch.int64)
     old = torch.stack([torch.randperm(experts) for _ in range(layers)]).to(torch.int32)
-    kwargs = dict(num_gpus=ranks, top_k=6, budget=4, eps=0.005)
+    kwargs = {"num_gpus": ranks, "top_k": 6, "budget": 4, "eps": 0.005}
     plain, _, _, swaps = gp.swap_rebalance(pf, dec, 64.0, old, **kwargs)
-    hot, l2p, cnt, swaps_hot = gp.swap_rebalance(
+    hot, l2p, _cnt, swaps_hot = gp.swap_rebalance(
         pf, dec, 64.0, old, hot_first=True, **kwargs
     )
     assert swaps == swaps_hot
     assert hot.dtype == torch.int32 and tuple(l2p.shape) == (layers, experts, 1)
     for layer in range(layers):
-        key = gp.hot_key(pf[layer].numpy().astype(float), dec[layer].numpy().astype(float))
+        key = gp.hot_key(
+            pf[layer].numpy().astype(float), dec[layer].numpy().astype(float)
+        )
         row, base = hot[layer].numpy(), plain[layer].numpy()
         assert sorted(row.tolist()) == list(range(experts))
         assert np.array_equal(l2p[layer, :, 0].numpy()[row], np.arange(experts))
@@ -388,5 +390,14 @@ def test_order_within_ranks_is_stable_and_takes_one_kind_of_load():
     out = gp.order_within_ranks(p2l, key, 4, head=2)
     assert out.tolist() == [3, 2, 1, 0, 6, 4, 5, 7]
     assert gp.order_within_ranks(out, key, 4, head=2).tolist() == out.tolist()
-    assert gp.order_within_ranks(p2l, key, 4, head=9).tolist() == [3, 2, 1, 0, 6, 4, 5, 7]
+    assert gp.order_within_ranks(p2l, key, 4, head=9).tolist() == [
+        3,
+        2,
+        1,
+        0,
+        6,
+        4,
+        5,
+        7,
+    ]
     assert gp.order_within_ranks(p2l, key, 4, head=0).tolist() == p2l.tolist()

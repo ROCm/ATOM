@@ -4,10 +4,10 @@
 EPLB's default keeps the router on logical expert ids and remaps them to
 physical slots in a launch of its own, on every forward of every placed layer.
 With ``ATOM_EPLB_GATE_PERMUTE=1`` a rebalance instead moves the gate's rows
-(``weight`` and the routing biases, `expert_placement._GATE_ROWS`) together
-with the expert weights, in place, so the router emits physical ids directly --
-what ``ATOM_EXPERT_PLACEMENT`` does once at load. Nothing is then launched for
-EPLB in a decode graph.
+(``weight`` and the routing biases, `_GATE_ROWS`) together with the expert
+weights, in place, so the router emits physical ids directly -- what a static
+expert placement (``model_options.expert_placement``) does once at load.
+Nothing is then launched for EPLB in a decode graph.
 
 The load statistics are logical and come from two places:
 
@@ -35,7 +35,6 @@ from typing import Any
 import numpy as np
 import torch
 
-from atom.model_ops.fused_moe.expert_placement import _GATE_ROWS, placement_for
 from atom.utils import envs
 from atom.utils.graph_holders import register_graph_holder
 
@@ -50,6 +49,21 @@ except ImportError:
 logger = logging.getLogger("atom")
 
 TAG = "[EPLB-GP]"
+
+# The gate's per-expert tensors a placement moves, as the plugin model's static
+# expert placement relabels them at load (`PluginV4MoE.process_weights_after_loading`).
+_GATE_ROWS = ("weight", "e_score_correction_bias", "bias_vl")
+
+
+def _loaded_placement(layer: Any, num_logical: int) -> list[int] | None:
+    """Checkpoint expert -> logical id of a layer a static expert placement
+    renumbered at load (`FusedMoE.set_static_placement`), else None. A static
+    placement is not applied to a layer EPLB places."""
+    perm = getattr(layer, "_static_placement", None)
+    if perm is None or len(perm) != num_logical:
+        return None
+    return [int(p) for p in perm]
+
 
 # The swap objective's terms -- prefill rows, the decode active-expert proxy,
 # decode rows -- each a rank load whose mean over the ranks is 1, their weights,
@@ -363,7 +377,7 @@ def placement_metrics(
 
 
 def _mean(values) -> float:
-    values = [v for v in values if v == v]
+    values = [v for v in values if not np.isnan(v)]
     return float(np.mean(values)) if values else float("nan")
 
 
@@ -415,8 +429,8 @@ def reference_ranks(
 ) -> dict[int, np.ndarray]:
     """``ATOM_EPLB_REF_PLACEMENT`` as layer id -> [logical] -> rank, for the
     layers the table names. The table maps checkpoint expert ids to slots; a
-    layer ``ATOM_EXPERT_PLACEMENT`` renumbered at load has its logical ids
-    renumbered the same way here."""
+    layer a static expert placement renumbered at load has its logical ids
+    renumbered the same way here (`_loaded_placement`)."""
     with open(path) as f:
         table = json.load(f)
     out: dict[int, np.ndarray] = {}
@@ -426,7 +440,7 @@ def reference_ranks(
             continue
         if sorted(perm) != list(range(num_logical)):
             raise ValueError(f"{path}: {layer.prefix} is not a permutation")
-        loaded = placement_for(layer.prefix) or list(range(num_logical))
+        loaded = _loaded_placement(layer, num_logical) or list(range(num_logical))
         rk = np.empty(num_logical, dtype=np.int64)
         rk[np.asarray(loaded)] = np.asarray(perm) // per_rank
         out[layer_id] = rk

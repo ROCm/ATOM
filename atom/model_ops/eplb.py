@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from functools import wraps
 from typing import Any
 
-import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
 
@@ -4093,7 +4092,7 @@ def with_eplb_forward_monitor(fn):
     return wrapper
 
 
-def step_timer() -> "_StepTimer | None":
+def step_timer() -> _StepTimer | None:
     """The step timer, if ATOM_EPLB_STEP_TIMER is on and a forward has run."""
     return _STEP_TIMER[0] if _STEP_TIMER else None
 

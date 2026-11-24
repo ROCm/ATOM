@@ -4,9 +4,8 @@
 # (ATOM_EPLB_REARM_DRIFT), and the one-off swap budgets.
 
 import logging
-from types import SimpleNamespace
-
 import os
+from types import SimpleNamespace
 
 import pytest
 from import_guard import skip_if_dependency_missing
@@ -20,7 +19,7 @@ try:
 except ImportError as _e:  # aiter/triton absent under bare non-GPU pytest
     skip_if_dependency_missing(_e, "requires full atom import env")
 
-from test_eplb_gate_permute import (  # noqa: E402
+from test_eplb_gate_permute import (
     EXPERTS,
     LAYERS,
     RANKS,
@@ -1112,7 +1111,7 @@ def test_host_transport_moves_experts_between_ranks_through_files(
 
     # one rank end to end through `exchange`: writes once, cleans up
     t = eplb.HostExpertTransport("cpu", str(tmp_path / "solo"), 0)
-    send = [type("A", (), dict(logical_expert_id=3, peer_rank=1, local_slot=3))()]
+    send = [type("A", (), {"logical_expert_id": 3, "peer_rank": 1, "local_slot": 3})()]
     seen = []
     monkeypatch.setattr(
         torch.distributed,
@@ -1142,7 +1141,7 @@ def test_host_transport_stages_through_buffers_it_keeps(tmp_path, monkeypatch):
 
     def action(logical, slot):
         return type(
-            "A", (), dict(logical_expert_id=logical, peer_rank=0, local_slot=slot)
+            "A", (), {"logical_expert_id": logical, "peer_rank": 0, "local_slot": slot}
         )()
 
     def move(pairs):
@@ -1177,7 +1176,7 @@ def test_host_transport_stages_through_buffers_it_keeps(tmp_path, monkeypatch):
         assert side.stages_made == 2
         assert {n: s.data_ptr() for n, s in side._stages.items()} == addresses[side]
     assert os.listdir(tmp_path) == []
-    write_s, read_s, sent, received = sender.take_stats()
+    write_s, _read_s, sent, received = sender.take_stats()
     assert sent == 2 + 3 * 3 and received == 0 and write_s > 0
     assert taker.take_stats()[2:] == (0, 2 + 3 * 3)
     assert sender.bytes_moved == (2 + 9) * (40 + 12 + 40)
@@ -1192,7 +1191,7 @@ def test_host_transport_refuses_a_file_of_another_size(tmp_path, monkeypatch, si
     path = os.path.join(str(tmp_path), "x1_e7_0.bin")
     with open(path, "wb") as f:
         f.write(bytes(range(size)))
-    recv = [type("A", (), dict(logical_expert_id=7, peer_rank=1, local_slot=1))()]
+    recv = [type("A", (), {"logical_expert_id": 7, "peer_rank": 1, "local_slot": 1})()]
     with pytest.raises(
         RuntimeError, match=f"expert 7 part 0: {size} bytes on the host"
     ):
