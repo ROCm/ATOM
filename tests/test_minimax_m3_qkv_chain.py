@@ -158,3 +158,42 @@ def test_weight_cache_key_tracks_the_chain_flag():
     from atom.model_loader.weight_cache import key
 
     assert "ATOM_M3_QKV_CHAIN" in key._ENV_VARS
+
+
+def test_one_shot_activity_log(monkeypatch, caplog):
+    import logging
+
+    import atom.utils.forward_context as fc
+
+    st = {r: 0 for r in qkv_chain._REASONS}
+    st.update(calls=0, layers_on=3, layers_not_preshuffled=1, done=False)
+    monkeypatch.setattr(qkv_chain, "_stats", st)
+    monkeypatch.setattr(qkv_chain, "_LOG_AFTER", 5)
+    monkeypatch.setattr(
+        qkv_chain, "aiter_features", lambda: "qkv_chain_cooperative_insert"
+    )
+
+    def ctx(**kw):
+        base = {"is_prefill": False, "is_dummy_run": False, **kw}
+        return SimpleNamespace(context=SimpleNamespace(**base))
+
+    seq = [
+        (ctx(), 40, True),
+        (ctx(is_prefill=True), 40, False),
+        (ctx(is_dummy_run=True), 40, False),
+        (ctx(), 128, False),
+        (ctx(forward_mode=SimpleNamespace(token_graph=True)), 40, False),
+        (ctx(), 40, True),  # after the tally: counting stopped
+    ]
+    with caplog.at_level(logging.INFO, logger="atom"):
+        for c, rows, want in seq:
+            monkeypatch.setattr(fc, "get_forward_context", lambda c=c: c)
+            assert qkv_chain.take(rows) is want
+    msgs = [
+        r.getMessage() for r in caplog.records if "ATOM_M3_QKV_CHAIN" in r.getMessage()
+    ]
+    assert len(msgs) == 2
+    assert "3 layer(s) with the chain" in msgs[0] and "max_rows=64" in msgs[0]
+    assert "aiter features: qkv_chain_cooperative_insert" in msgs[0]
+    assert "taken=1, prefill=1, dummy=1, token_graph=1, out_of_window=1" in msgs[1]
+    assert st["calls"] == 5 and st["done"]

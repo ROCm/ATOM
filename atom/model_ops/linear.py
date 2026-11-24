@@ -1467,6 +1467,7 @@ class LinearBase(nn.Module):
                         self.weight_scale.data
                     )
                     qkv_chain.warm(self.weight, self._qkv_chain_scale)
+                    qkv_chain.note_layer(True)
                 else:
                     # the chain's GEMM reads the (16, 16)-preshuffled weight layout only
                     logger.warning(
@@ -1475,6 +1476,7 @@ class LinearBase(nn.Module):
                         self.prefix,
                     )
                     self._qkv_chain = False
+                    qkv_chain.note_layer(False)
             return
         if self.weight.numel() == 0:
             return

@@ -18,12 +18,15 @@ Techniques and the kernel's numerics (bitwise the unfused split-3 chain) are amd
 
 import functools
 import importlib.util
+import logging
 import threading
 
 import torch
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from atom.utils import envs
+
+logger = logging.getLogger("atom")
 
 N, K = 2560, 6144
 MIN_ROWS = 17
@@ -123,21 +126,96 @@ def linear_ok(linear) -> bool:
     )
 
 
+# One-shot activity log. Counters are plain Python ints touched only where Python runs (warm-up, eager steps and
+# CUDA-graph *capture*; a graph replay never enters Python), so the replay hot path costs nothing. The first call logs
+# the layer census and the row window; after _LOG_AFTER decisions the per-reason tally is logged once and counting stops.
+_LOG_AFTER = 1000
+_REASONS = ("taken", "prefill", "dummy", "token_graph", "out_of_window")
+_stats = {r: 0 for r in _REASONS}
+_stats.update(calls=0, layers_on=0, layers_not_preshuffled=0, done=False)
+
+
+def aiter_features() -> str:
+    """Which chain entries the installed aiter has (stage 1: ``qkv_chain_cooperative_insert``, 17-64 rows; the
+    65-128 row stage adds ``qkv_chain_insert``), for the one-shot log only."""
+    try:
+        import aiter.ops.flydsl.kernels.qkv_chain as k
+
+        names = (
+            "qkv_chain_cooperative_insert",
+            "qkv_chain_insert",
+            "qkv_chain_split_insert",
+        )
+        have = [n for n in names if hasattr(k, n)]
+    except Exception as e:  # log-only probe, never raises into the step
+        return f"unavailable ({type(e).__name__})"
+    try:
+        import aiter.ops.flydsl.kernels.mxfp8_quant_shuffled  # noqa: F401
+
+        have.append("mxfp8_quantize_shuffled")
+    except Exception:
+        pass
+    return ",".join(have) or "none"
+
+
+def note_layer(chain_on: bool) -> None:
+    """Load time (qkv linear prepare): count a chain layer, or one that fell back for lack of a preshuffled weight."""
+    _stats["layers_on" if chain_on else "layers_not_preshuffled"] += 1
+
+
+def _count(reason: str) -> None:
+    st = _stats
+    if st["done"]:
+        return
+    st[reason] += 1
+    st["calls"] += 1
+    if st["calls"] == 1:
+        logger.info(
+            "ATOM_M3_QKV_CHAIN active: %d layer(s) with the chain, %d layer(s) off (weight not preshuffled); "
+            "row window %d..%d rows (min_rows=%d, max_rows=%d); aiter features: %s; decode token-graph steps "
+            "are skipped",
+            st["layers_on"],
+            st["layers_not_preshuffled"],
+            MIN_ROWS,
+            max_rows(),
+            MIN_ROWS,
+            max_rows(),
+            aiter_features(),
+        )
+    if st["calls"] >= _LOG_AFTER:
+        st["done"] = True
+        logger.info(
+            "ATOM_M3_QKV_CHAIN decisions over the first %d python-side calls (warm-up/eager/capture; graph "
+            "replays are not counted): %s",
+            st["calls"],
+            ", ".join(f"{r}={st[r]}" for r in _REASONS),
+        )
+
+
 def take(m: int) -> bool:
     """Run time: this forward's qkv linear + insert take the chain.
 
     Never inside a token graph (TR_HYBRID decode, the level-3 default): replay runs the captured quantizer without
     the Python hand-off and the attention op (an eager region) would read the uncomputed QKV.
     """
-    if not (MIN_ROWS <= m <= max_rows()):
-        return False
     from atom.utils.forward_context import get_forward_context
 
     c = get_forward_context().context
-    if c is None or c.is_prefill or c.is_dummy_run:
+    if c is None or c.is_prefill:
+        _count("prefill")
+        return False
+    if c.is_dummy_run:
+        _count("dummy")
         return False
     mode = getattr(c, "forward_mode", None)
-    return not (mode is not None and getattr(mode, "token_graph", False))
+    if mode is not None and getattr(mode, "token_graph", False):
+        _count("token_graph")
+        return False
+    if not (MIN_ROWS <= m <= max_rows()):
+        _count("out_of_window")
+        return False
+    _count("taken")
+    return True
 
 
 def chain_weight_scale(weight_scale: torch.Tensor) -> torch.Tensor:
