@@ -1424,7 +1424,7 @@ check_mooncake_store_settings() {
       done
       ;;
   esac
-  if (( workers_on_a_node > 1 )); then
+  if (( workers_on_a_node > 1 )) && [[ "$(mooncake_setting MOONCAKE_STORE_SHARED_PREFILL 0)" != "1" ]]; then
     echo "[mooncake-store][FAIL] MOONCAKE_STORE=1 runs one Store per node for one prefill worker, whose GPUs its owners' NICs are placed around; pd_worker_layout ${layout} starts ${workers_on_a_node} prefill workers on one node" >&2
     exit 2
   fi
@@ -1471,12 +1471,6 @@ validate_mooncake_store_settings() {
     fi
   done < <(env)
   mooncake_store_requested || return 0
-  if [[ "${AGGREGATED:-0}" == "1" ]]; then
-    # start_prefill starts the Store, and an aggregated cell has no prefill:
-    # its server would run without the offload the case asked for.
-    echo "[mooncake-store][FAIL] MOONCAKE_STORE needs a P/D prefill; an aggregated cell starts none" >&2
-    exit 2
-  fi
   (
     apply_role_env "ATOMESH_PREFILL_ENV_" "${host_ip}"
     check_mooncake_store_settings
@@ -1874,12 +1868,19 @@ mooncake_store_launcher_config_json() {
   else
     printf '"mooncake_store.master":"%s:%s",' "${host_ip}" "${ATOMESH_MOONCAKE_MASTER_PORT}"
     printf '"mooncake_store.metadata":"http://%s:%s/metadata",' "${host_ip}" "${ATOMESH_MOONCAKE_METADATA_PORT}"
+    if [[ -n "$(mooncake_setting MOONCAKE_STORE_RDMA_DEVICES)" ]]; then
+      printf '"mooncake_store.rdma_devices":"%s",' "$(mooncake_setting MOONCAKE_STORE_RDMA_DEVICES)"
+    fi
     printf '"mooncake_store.owner_rdma_devices":"%s"}' "$(mooncake_owner_devices_csv)"
   fi
 }
 
 start_mooncake_store() {
   mooncake_store_requested || return 0
+  if mooncake_store_running && [[ "${mooncake_store_ready}" == "1" ]]; then
+    echo "[mooncake-store] reusing this node's Store for another worker"
+    return 0
+  fi
   check_mooncake_store_settings
   check_mooncake_owner_devices
   prepare_mooncake_store_memory
@@ -2155,6 +2156,11 @@ start_aggregated() {
   local dp_base_port="${4:-${DECODE_DP_BASE_PORT}}"
   apply_role_env "ATOMESH_DECODE_ENV_" "${host_ip}"
   reset_lmcache_disk
+  start_mooncake_store
+  local -a server_offload_env=()
+  if mooncake_store_running; then
+    server_offload_env=("${mooncake_store_prefill_env[@]}")
+  fi
   local max_conc
   max_conc="$(echo "${BENCH_MAX_CONCURRENCY}" | tr 'x,' '\n' | sort -n | tail -1)"
   local server_max_num_seqs="${MAX_NUM_SEQS}"
@@ -2195,8 +2201,8 @@ start_aggregated() {
     "${server_profiler_args[@]}"
     ${DECODE_SERVER_ARGS}
   )
-  dump_launch_info "SERVER" "${server_cmd[@]}"
-  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${ATOM_SOURCE_ENV[@]}" "${server_cache_env[@]}" "${server_dp_env[@]}" "${server_cmd[@]}"
+  dump_launch_info "SERVER" "${server_offload_env[@]}" "${server_cmd[@]}"
+  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${ATOM_SOURCE_ENV[@]}" "${server_cache_env[@]}" "${server_dp_env[@]}" "${server_offload_env[@]}" "${server_cmd[@]}"
 }
 
 start_router() {

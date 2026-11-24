@@ -2719,6 +2719,93 @@ models:
             extra_args: ""
 
 
+        # Single node, one DEP8 server with MegaMoE and a 256 GiB Store (owner on
+        # rdma7; GPU7's Store client uses rdma6 so no worker shares the owner's NIC).
+        - &dsv41f_agg_dep8
+          name: dsv41f-agg-dep8-mega-mcstore-c32
+          topology: agg
+          display_topology: AGG-DEP8-MEGA-MCSTORE
+          pd_worker_layout: single_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [1048576]
+          osl: 1024
+          concurrency: [32]
+          router:
+            policy: cache_aware
+          prefill: {}
+          server:
+            common_args:
+              max_num_seqs: 128
+              decode_max_num_seqs: 128
+              decode_max_num_batched_tokens: 16384
+          env:
+            prefill:
+              MOONCAKE_STORE: "1"
+              MOONCAKE_STORE_OWNERS: "1:256:rdma7"
+              MOONCAKE_STORE_RDMA_DEVICES: "rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma6"
+              MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: "${ATOMESH_MODEL_ROOT}/deepseek-ai/DeepSeek-V4.1-Flash"
+            decode:
+              HIP_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
+              ATOM_ENABLE_PREFILL_DELAYER: "0"
+              ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS: "20"
+          decode:
+            workers: 1
+            tp: 8
+            cudagraph: "[1,2,4,6,8,10,12,14,16,18,20,22,24,28,32,36,40,44,48,64,96,128]"
+            cudagraph_mode: FULL
+            compilation_level: 3
+            extra_args: "--enable-dp-attention --enable-expert-parallel --moe-backend mega --all2all-backend high-throughput --dp-load-balance share_cache"
+          benchmark: *agentic_1m_aiperf
+          run_eval: false
+
+        - <<: *dsv41f_agg_dep8
+          name: dsv41f-agg-dep8-mega-mcstore-c64
+          concurrency: [64]
+
+        - <<: *dsv41f_agg_dep8
+          name: dsv41f-agg-dep8-mega-mcstore-c128
+          concurrency: [128]
+
+        - <<: *dsv41f_agg_dep8
+          name: dsv41f-agg-dep8-mega-mcstore-c256
+          concurrency: [256]
+
+        # 2P1D: two DEP4 prefill servers on one node sharing that node's one Store
+        # (512 GiB on rdma7; both servers' Store clients use rdma0-3), DEP8 decode
+        # on the second node. No early handoff: two prefill servers.
+        - &dsv41f_2p1d
+          <<: *dsv41f_pd_base
+          name: dsv41f-2p1d-dep4x2-dep8-mcstore-c256
+          topology: 2p1d
+          display_topology: 2P1D-DEP4-DEP8-MEGA-MCSTORE
+          pd_worker_layout: prefill_single_node
+          nodes: "${ATOMESH_2P1D_NODES}"
+          concurrency: [256]
+          env:
+            common:
+              ATOM_ENABLE_PREFILL_DELAYER: "0"
+            prefill:
+              <<: *dsv41f_p_env
+              ATOM_PD_EARLY_HANDOFF: "0"
+              MOONCAKE_STORE_SHARED_PREFILL: "1"
+              MOONCAKE_STORE_OWNERS: "1:512:rdma7"
+              MOONCAKE_STORE_RDMA_DEVICES: "rdma0,rdma1,rdma2,rdma3"
+            decode: *dsv41f_d_8gpu_dep_env
+          prefill:
+            <<: *dsv41f_p
+            workers: 2
+          decode:
+            <<: *dsv41f_d_dep4
+            tp: 8
+
+        - <<: *dsv41f_2p1d
+          name: dsv41f-2p1d-dep4x2-dep8-mcstore-c384
+          concurrency: [384]
+
+        - <<: *dsv41f_2p1d
+          name: dsv41f-2p1d-dep4x2-dep8-mcstore-c512
+          concurrency: [512]
+
   # Bring-up model for the MoRI IO PD KV path. Text-only, ships a real
   # tokenizer.json so the router can register one, and its FP8 weights keep
   # quantization out of the picture -- but the KV path under test is the same
