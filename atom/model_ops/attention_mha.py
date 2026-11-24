@@ -1698,7 +1698,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         self._fused_x_scale = q_scale if fused else None
         if fused:
             if q_scale is None:
-                raise RuntimeError("an MXFP8 qkv reached the attention without its scales")
+                raise RuntimeError(
+                    "an MXFP8 qkv reached the attention without its scales"
+                )
             q_scale = None
         return super().forward_impl(
             q, k, v, position=position, q_scale=q_scale, qkv=qkv, **kwargs
@@ -1837,7 +1839,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             )  # fmt: skip
             if fused is not None:
                 q_out, index_q = fused
-                self._index_q = index_q.view(-1, self.num_idx_heads, self.index_head_dim)
+                self._index_q = index_q.view(
+                    -1, self.num_idx_heads, self.index_head_dim
+                )
                 self._index_q_cache_key_info = (
                     tuple(self._index_q.shape),
                     self._index_q.dtype,
@@ -2210,6 +2214,20 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 "sparse_layer_ordinal": self.sparse_layer_ordinal,
             }
 
+    @staticmethod
+    def _prefill_score_reserve() -> tuple[int, int] | None:
+        """The indexer's block-score bound: a step's rows by the longest
+        context's 128-blocks, so the warmup allocates it at full size."""
+        from atom.model_ops.minimax_m3.index_topk import SPARSE_BLOCK_SIZE
+
+        config = get_current_atom_config()
+        if not config.max_model_len:
+            return None
+        return (
+            config.max_num_batched_tokens,
+            -(-config.max_model_len // SPARSE_BLOCK_SIZE),
+        )
+
     @mark_trace(prefix="sparse_attention_prefill", torch_compile=False)
     def _sparse_prefill(
         self,
@@ -2318,6 +2336,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 n_valid_column_per_row=sparse_metadata.n_valid_column_per_row,
                 index_kv_scale=index_scale,
                 score_block_table=score_table,
+                score_reserve=self._prefill_score_reserve(),
                 **emit_kw,
             )
             # NVFP4 on gfx1250: the paged decode's compacted page-128 table,
