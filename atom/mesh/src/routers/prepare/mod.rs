@@ -35,8 +35,8 @@ pub(crate) mod tool_constraints;
 mod tests;
 
 use chat_template::{
-    atom_chat_render_gap, default_template_kwargs, merged_template_kwargs,
-    process_chat_messages_with_kwargs,
+    atom_chat_render_gap, atom_template_not_loaded, default_template_kwargs,
+    merged_template_kwargs, process_chat_messages_with_kwargs,
 };
 use generation_payload::{
     GenerationPayload, LogprobConfig, SamplingParams, StopConfig, StructuredOutput,
@@ -121,16 +121,35 @@ pub fn prepare_chat_declaring(
     })?;
     let workers = components.worker_registry.get_by_model(model_id_str);
     let configured_template = components.router_config.chat_template.is_some();
-    let entry = tokenizer_entry(model_id_str, components);
-    let built_in_encoder = entry
-        .as_ref()
-        .is_some_and(|entry| components.chats_without_template.read().contains(&entry.id));
+    // The entry, its mark and its worker template read under one lock, which a swap
+    // takes to forget the replaced entry's.
+    let (entry, built_in_encoder, loaded_template) = {
+        let marked = components.chats_without_template.read();
+        let entry = tokenizer_entry(model_id_str, components);
+        let built_in = entry
+            .as_ref()
+            .is_some_and(|entry| marked.contains(&entry.id));
+        let templates = components.tokenizer_inline_templates.read();
+        let loaded = entry.as_ref().and_then(|e| templates.get(&e.id).cloned());
+        (entry, built_in, loaded)
+    };
     if let Some(gap) = atom_chat_render_gap(&workers, configured_template, built_in_encoder) {
         return Err(error::not_implemented(
             "chat_template_unavailable",
             format!(
                 "Chats for model {model_id_str} are not served over gRPC: {gap}. Route its \
                  chats to ATOM over HTTP; completions are served over gRPC."
+            ),
+        ));
+    }
+    let loaded = loaded_template.as_deref();
+    if let Some(worker) = atom_template_not_loaded(&workers, configured_template, loaded) {
+        return Err(error::service_unavailable(
+            "chat_template_loading",
+            format!(
+                "The tokenizer of model {model_id_str} is not yet loaded with the chat \
+                 template of its ATOM worker {}; retry later.",
+                worker.url()
             ),
         ));
     }
@@ -147,7 +166,7 @@ pub fn prepare_chat_declaring(
     // Only ATOM reads the tools a message declares.
     let message_tools = atom
         .then(|| message_tools.unwrap_or_else(|| MessageTools::of(&req)))
-        .filter(|declared| !declared.is_empty());
+        .filter(|declared| !declared.is_empty() || declared.1.is_some());
 
     let template_kwargs = merged_template_kwargs(&body_ref, default_kwargs.as_ref());
     let processed = staged("template", || {
@@ -434,11 +453,18 @@ fn structured_output(
     kwargs: &HashMap<String, Value>,
     prompt_opens_reasoning: bool,
 ) -> Result<StructuredOutput, String> {
+    // Namespaced top-level tools go as sent: the typed ones lost their namespace.
+    let top_level = message_tools.and_then(|declared| declared.1.as_deref());
+    let tools_json = match top_level {
+        Some(sent) => Some(to_json(sent)?),
+        None => req.tools.as_ref().map(to_json).transpose()?,
+    };
     Ok(StructuredOutput {
-        tools_json: req.tools.as_ref().map(to_json).transpose()?,
+        tools_json,
         tool_choice_json: req.tool_choice.as_ref().map(to_json).transpose()?,
         response_format_json: req.response_format.as_ref().map(to_json).transpose()?,
         message_tools_json: message_tools
+            .filter(|declared| !declared.is_empty())
             .map(|declared| to_json(declared.0.as_ref()))
             .transpose()?,
         chat_template_kwargs_json: to_json(kwargs)?,

@@ -1052,6 +1052,47 @@ mod pairs {
         );
     }
 
+    /// Concurrent first pairs to a prefill that stops answering fail together, within
+    /// one health-check timeout, rather than one read's timeout after another.
+    #[tokio::test]
+    async fn concurrent_first_pairs_of_a_stalled_prefill_share_one_timeout() {
+        let fake = Arc::new(FakeAtom {
+            stall_server_info: true,
+            ..Default::default()
+        });
+        let url = serve(fake).await;
+        let health = HealthConfig {
+            timeout_secs: 1,
+            ..Default::default()
+        };
+        let stalled: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(&url)
+                .worker_type(PREFILL)
+                .connection_mode(ConnectionMode::Grpc { port: None })
+                .runtime_type(RuntimeType::Atom)
+                .health_config(health)
+                .build(),
+        );
+        let pairs = AtomPairs::new(
+            Arc::new(WorkerRegistry::new()),
+            AtomPdRankMappingPolicy::Idx2Idx,
+        )
+        .await
+        .unwrap();
+        let started = std::time::Instant::now();
+        let reads = (0..4).map(|_| pairs.adapter_for(&stalled));
+        let results = timeout(HANG, futures::future::join_all(reads)).await;
+        let elapsed = started.elapsed();
+        for result in results.unwrap() {
+            let error = result.err().unwrap();
+            assert!(
+                matches!(&error, EngineError::Http { status, .. } if *status == StatusCode::GATEWAY_TIMEOUT),
+                "{error}"
+            );
+        }
+        assert!(elapsed < Duration::from_millis(1800), "{elapsed:?}");
+    }
+
     #[tokio::test]
     async fn concurrent_first_pairs_of_a_prefill_read_its_info_once() {
         let (p, p_url) = instance(Vec::new(), false, prefill_info(2, None)).await;
@@ -1221,6 +1262,39 @@ mod pairs {
             .server_info_reads
             .load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(reads, 1);
+    }
+
+    /// A read publishing while a pair finds its prefill already read cannot take that
+    /// prefill's info from under it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cache_hit_takes_its_prefill_s_info_with_its_identity() {
+        let (_, p_url) = instance(Vec::new(), false, prefill_info(2, None)).await;
+        let pw = worker(&p_url, PREFILL);
+        let registry = Arc::new(WorkerRegistry::new());
+        registry.register(pw.clone());
+        let pairs = AtomPairs::new(registry, AtomPdRankMappingPolicy::Idx2Idx);
+        let pairs = Arc::new(pairs.await.unwrap());
+
+        // Another prefill's read is publishing, and prunes this one.
+        let hit = {
+            let mut publishing = pairs.info.write().unwrap();
+            let (hit_pairs, hit_worker) = (pairs.clone(), pw.clone());
+            let hit = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(hit_pairs.adapter_for(&hit_worker))
+            });
+            std::thread::sleep(Duration::from_millis(200));
+            pairs.read_for.write().unwrap().clear();
+            *publishing = Arc::default();
+            hit
+        };
+
+        let hit = tokio::task::spawn_blocking(move || hit.join().unwrap());
+        let info = hit.await.unwrap().unwrap().prefill_info;
+        assert_eq!(info.tp_sizes.get(&p_url), Some(&2));
     }
 
     #[tokio::test]

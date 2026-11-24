@@ -1,7 +1,10 @@
 //! Chat-template rendering helpers: turn `ChatMessage` lists into the JSON
 //! shape that HuggingFace chat templates consume.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use serde_json::{json, Value};
 
@@ -43,6 +46,34 @@ pub(crate) fn default_template_kwargs(
                 .map_err(|e| format!("Invalid {DEFAULT_TEMPLATE_KWARGS_LABEL} label {json}: {e}"))
         })
         .transpose()
+}
+
+/// An ATOM worker among `workers` advertising a chat template when none advertises
+/// `loaded`, the worker template the model's tokenizer was loaded with, and the router
+/// sets none (`configured`): the tokenizer is being loaded again with a live worker's
+/// template, or failed to be.
+pub(crate) fn atom_template_not_loaded<'a>(
+    workers: &'a [Arc<dyn Worker>],
+    configured: bool,
+    loaded: Option<&str>,
+) -> Option<&'a Arc<dyn Worker>> {
+    let loaded = loaded.filter(|_| !configured)?;
+    let advertising: Vec<_> = workers
+        .iter()
+        .filter_map(|worker| advertised_template(worker).map(|template| (worker, template)))
+        .collect();
+    if advertising.iter().any(|(_, template)| template == loaded) {
+        return None;
+    }
+    advertising.first().map(|(worker, _)| *worker)
+}
+
+/// The chat template `worker` advertises as an ATOM worker without a template file.
+fn advertised_template(worker: &Arc<dyn Worker>) -> Option<String> {
+    let metadata = worker.metadata();
+    let atom = metadata.runtime_type == RuntimeType::Atom && worker.chat_template().is_none();
+    atom.then(|| metadata.labels.get("chat_template").cloned())
+        .flatten()
 }
 
 /// Why atomesh cannot render chats as `workers`' ATOM worker does, if it cannot: the
@@ -116,6 +147,11 @@ pub(crate) fn merged_template_kwargs(
     combined_template_kwargs
 }
 
+/// The function name a tool declares as sent.
+fn sent_name(tool: &Value) -> Option<&str> {
+    tool.get("function")?.get("name")?.as_str()
+}
+
 /// As `process_chat_messages`, rendered with `template_kwargs`, the merged kwargs, and
 /// each message given its own `message_tools`, as ATOM's HTTP chat renders them.
 pub fn process_chat_messages_with_kwargs(
@@ -163,6 +199,23 @@ pub fn process_chat_messages_with_kwargs(
         })
         .transpose()
         .map_err(|e| format!("Failed to serialize tools: {}", e))?;
+    // Namespaced top-level tools render as sent, those `request` keeps by name.
+    let sent = message_tools.and_then(|declared| declared.1.as_deref());
+    let tools_json = match (tools_json, sent) {
+        (Some(_), Some(sent)) => {
+            let kept: HashSet<&str> = request
+                .tools
+                .iter()
+                .flatten()
+                .map(|tool| tool.function.name.as_str())
+                .collect();
+            let kept = sent
+                .iter()
+                .filter(|tool| sent_name(tool).is_some_and(|n| kept.contains(n)));
+            Some(kept.cloned().collect())
+        }
+        (typed, _) => typed,
+    };
 
     let final_template_kwargs = if template_kwargs.is_empty() {
         None
