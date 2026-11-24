@@ -655,6 +655,13 @@ mod coder {
             if !followers.into_iter().any(continues) {
                 return None;
             }
+            // Text after the call's `</function>` is not closed into its wrapper.
+            let after = rest
+                .split_once("</function>")
+                .map(|(_, after)| after.trim());
+            if after.is_some_and(|after| !after.is_empty()) {
+                return None;
+            }
             let mut closers = String::new();
             // Outside a value, a tag cut off is completed, so a bare call rereads whole.
             if rest.rfind("<parameter=") <= rest.rfind("</parameter>") {
@@ -945,6 +952,28 @@ mod coder {
                     assert_eq!(streamed, args, "{reply}");
                 }
             }
+        }
+
+        /// A cut-off wrapper is not closed past text that follows the call's `</function>`.
+        #[tokio::test]
+        async fn text_after_a_cut_off_wrapper_s_function_is_not_closed_into_the_call() {
+            let tool: Tool = serde_json::from_value(serde_json::json!({
+                "type": "function", "function": {"name": "get_weather", "parameters": {}},
+            }))
+            .unwrap();
+            let tools = [tool];
+            let reply = "Before <tool_call><function=get_weather><parameter=city>Paris</parameter></function> After";
+            let mut parser = QwenCoderParser::new();
+            parser.read_as_atom();
+            parser.parse_incremental(reply, &tools).await.unwrap();
+            assert_eq!(parser.end_of_input_closers(&tools), None);
+            let mut parser = QwenCoderParser::new();
+            parser.read_as_atom();
+            let (text, calls) = parser
+                .parse_complete_with_tools(reply, &tools)
+                .await
+                .unwrap();
+            assert!(text.ends_with(" After") && calls.len() == 1, "{text}");
         }
 
         #[test]
