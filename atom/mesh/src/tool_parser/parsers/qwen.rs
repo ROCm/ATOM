@@ -346,7 +346,7 @@ mod coder {
             }
 
             let tool_indices = helpers::get_tool_indices(tools);
-            let (mut first, mut parsed) = (None, Vec::new());
+            let (mut outside, mut end, mut parsed) = (String::new(), 0, Vec::new());
             for captures in self.extractor.captures_iter(text) {
                 let Some(content) = captures.get(1).or_else(|| captures.get(2)) else {
                     continue;
@@ -357,7 +357,9 @@ mod coder {
                         if captures.get(1).is_some()
                             || tool_indices.contains_key(&tool.function.name) =>
                     {
-                        first.get_or_insert(captures.get(0).unwrap().start());
+                        let call = captures.get(0).unwrap();
+                        outside.push_str(&text[end..call.start()]);
+                        end = call.end();
                         parsed.push(tool);
                     }
                     Ok(_) => {}
@@ -366,16 +368,16 @@ mod coder {
                     }
                 }
             }
-            let start = match self.bare_calls {
-                // Text ends where the first call does (a wrapped one at its wrapper); a
-                // `<function=` or `<tool_call>` prose quotes does not end it.
-                true => first,
-                false => text.find(self.tool_call_start_token),
-            };
-            match (start, parsed.is_empty()) {
-                (Some(start), false) => Ok((text[..start].to_string(), parsed)),
-                _ => Ok((text.to_string(), vec![])),
+            if parsed.is_empty() {
+                return Ok((text.to_string(), vec![]));
             }
+            let normal_text = match self.bare_calls {
+                // As ATOM reads it, a reply's text is all of it outside its calls (a
+                // wrapped one's from its wrapper); a `<function=` prose quotes stays.
+                true => outside + &text[end..],
+                false => text[..text.find(self.tool_call_start_token).unwrap_or(0)].to_string(),
+            };
+            Ok((normal_text, parsed))
         }
 
         /// Where the first call in `text` starts, and whether it is a bare `<function=...>`.
@@ -849,6 +851,26 @@ mod coder {
             assert_eq!((text.as_str(), calls.len()), (reply, 0));
             for size in 1..=9 {
                 assert_eq!(stream(reply, size).await, (reply.to_string(), 0));
+            }
+        }
+
+        /// A reply's text is all of it outside its calls, unary as streamed.
+        #[tokio::test]
+        async fn text_between_and_after_calls_is_text() {
+            let tool: Tool = serde_json::from_value(serde_json::json!({
+                "type": "function", "function": {"name": "get_weather", "parameters": {}},
+            }))
+            .unwrap();
+            let call = "<function=get_weather><parameter=city>Paris</parameter></function>";
+            let reply = format!("Before {call} Between <tool_call>{call}</tool_call> After");
+            let mut parser = QwenCoderParser::new();
+            parser.read_as_atom();
+            let unary = parser.parse_complete_with_tools(&reply, &[tool]).await;
+            let (text, calls) = unary.unwrap();
+            let outside = "Before  Between  After";
+            assert_eq!((text.as_str(), calls.len()), (outside, 2));
+            for size in 1..=9 {
+                assert_eq!(stream(&reply, size).await, (outside.to_string(), 2));
             }
         }
 

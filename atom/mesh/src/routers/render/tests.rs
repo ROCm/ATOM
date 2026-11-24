@@ -4997,6 +4997,15 @@ mod h_atom_native_tool_calls {
         assert_eq!(read_qwen_xml(reply, true).await, [text.clone(), text]);
     }
 
+    /// An ATOM reply's text is all of it outside its calls, unary as streamed.
+    #[tokio::test]
+    async fn an_atom_reply_s_text_after_its_call_is_kept() {
+        let reply =
+            "Before <function=get_weather><parameter=city>Paris</parameter></function> After";
+        let call = ("Before  After".to_string(), "get_weather".to_string());
+        assert_eq!(read_qwen_xml(reply, true).await, [call.clone(), call]);
+    }
+
     /// A MiniMax-M3 call cut off inside a parameter keeps its value, as ATOM's HTTP
     /// parser does at end of input.
     #[tokio::test]
