@@ -172,8 +172,8 @@ def _postprocess(runner, batch):
 def test_the_argmax_heads_ids_skip_the_sampler(monkeypatch, ids_head):
     """Under `ATOM_DP_LM_HEAD_MODE=argmax` the head output is fp32 greedy ids:
     postprocess, through the sampler bound at startup (`GreedyIdsOrSample`),
-    takes a fresh int32 copy (a replay's live in the graph pool) without
-    sampling; logits still go through the sampler."""
+    takes an int32 copy without sampling; logits still go through the
+    sampler."""
     runner = _postprocess_runner({10: (3,), 11: (1,)}, None)
     sampler = mock.Mock(return_value=torch.tensor([3, 1], dtype=torch.int32))
     runner.sampler = mod.GreedyIdsOrSample(sampler)
@@ -182,7 +182,9 @@ def test_the_argmax_heads_ids_skip_the_sampler(monkeypatch, ids_head):
     head = torch.tensor([3.0, 1.0, 2.0]) if ids_head else torch.eye(4)[[3, 1, 2]]
     fc = SimpleNamespace(spec_decode_metadata=None)
     monkeypatch.setattr(mod, "get_forward_context", lambda: fc)
-    out = runner.postprocess(_batch(), head, torch.zeros(2), None, None, True, None)
+    out = runner.postprocess(
+        _batch(), torch.zeros(2), None, None, True, mod.LmHeadOutput(None, head), None
+    )
     assert sampler.called is not ids_head
     ids = prepare.call_args.args[1]
     assert ids.dtype == torch.int32 and ids.tolist() == [3, 1]
