@@ -2,7 +2,7 @@
 
 High-performance model routing gateway for **PD (Prefill–Decode) disaggregated** LLM serving. It routes inference across heterogeneous worker fleets with cache-aware load balancing, a gRPC pipeline that keeps tokenization in Rust, and built-in reliability primitives.
 
-Atomesh can also run in an **ATOM standalone** mode. In this mode, Python owns the ATOM engine, tokenizer, and OpenAI-compatible serving semantics, while Atomesh provides the HTTP server, request routing, lifecycle management, observability, and PyO3 bridge. This allows the same Atomesh serving layer to support both distributed worker routing and a single-process ATOM deployment path.
+Atomesh can also run in an **ATOM standalone** mode. In this mode, Python owns the ATOM engine (LLMEngine and its CoreManager), while Atomesh serves the OpenAI API itself: it renders the chat template, tokenizes, detokenizes, runs the reasoning and tool-call parsers and writes the SSE, and hands token ids to the engine through a PyO3 token bridge (`routers/atom_bridge`, see `docs/atomesh_rust_frontend.md`). This allows the same Atomesh serving layer to support both distributed worker routing and a single-process ATOM deployment path.
 
 ## Features
 
@@ -137,9 +137,11 @@ image must provide `protoc` either way, for `smg-grpc-client`.
 
 ### ATOM standalone
 
-ATOM standalone mode starts the ATOM engine and tokenizer in Python, while Rust
-Mesh provides the HTTP server, lifecycle handling, observability, and PyO3
-request bridge. Enable the Atomesh entrypoint through
+ATOM standalone mode starts the ATOM engine in Python, while Rust Mesh serves
+the OpenAI API (template, tokenizer, parsers, SSE) and hands each request's
+token ids to the engine through the token bridge. A model whose chat template
+is Python (DeepSeek-V4's encoder, Kimi-K3's tokenizer) has its prompt rendered
+by ATOM instead. Enable the Atomesh entrypoint through
 `USE_ATOMESH_ENTRYPOINTS=1`:
 
 ```bash
