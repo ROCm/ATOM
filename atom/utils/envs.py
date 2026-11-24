@@ -431,6 +431,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Rows per rank of that small instance: 128, 256, 512 or 1024 (see docs).
     "ATOM_MEGA_DECODE_MTPR": lambda: _int_env("ATOM_MEGA_DECODE_MTPR", 128),
+    # DP engine loop: a rank votes "unfinished" only when a scheduling pass
+    # could produce a batch (`Scheduler.has_forward_work`). Finished requests
+    # awaiting their KV send (`deferred_free_blocks`), tier loads and lookups
+    # in flight then leave the group idle-polling instead of running DP dummy
+    # forwards back to back, which a new arrival had to wait out. Off by
+    # default; ignored with the prefill delayer on.
+    "ATOM_DP_IDLE_WHEN_BLOCKED": lambda: os.getenv("ATOM_DP_IDLE_WHEN_BLOCKED", "0")
+    == "1",
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
     # Match SGLang's gfx950 prefill fast path, with or without a cached prefix:
     # cast Q/K/V to FP8 and use AITER's head-dim-256 per-tensor FMHA kernel.

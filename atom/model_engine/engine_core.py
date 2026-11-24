@@ -1228,6 +1228,29 @@ class DPEngineCoreProc(EngineCore):
         self._init_prefill_delayer(config, self.dp_group)
         # `share_cache` routing reads each rank's own prefill backlog.
         self._report_backlog = config.dp_load_balance == "share_cache"
+        self._idle_when_blocked = self._resolve_idle_when_blocked()
+
+    def _resolve_idle_when_blocked(self) -> bool:
+        """`ATOM_DP_IDLE_WHEN_BLOCKED`: whether this rank reports work to its DP
+        group only when a pass could produce a batch (`has_forward_work`).
+        Off with a prefill delayer, whose cadence counts passes."""
+        if not envs.ATOM_DP_IDLE_WHEN_BLOCKED:
+            return False
+        if getattr(self.scheduler, "has_forward_work", None) is None:
+            logger.warning(
+                "%s: ATOM_DP_IDLE_WHEN_BLOCKED ignored: %s has no has_forward_work",
+                self.label,
+                type(self.scheduler).__name__,
+            )
+            return False
+        if getattr(self.scheduler, "prefill_delayer", None) is not None:
+            logger.warning(
+                "%s: ATOM_DP_IDLE_WHEN_BLOCKED ignored with the prefill delayer on",
+                self.label,
+            )
+            return False
+        logger.info("%s: ATOM_DP_IDLE_WHEN_BLOCKED on", self.label)
+        return True
 
     def _init_data_parallel(self, config: Config):
         dp_rank = config.parallel_config.data_parallel_rank
@@ -1277,7 +1300,16 @@ class DPEngineCoreProc(EngineCore):
                     or self._weight_sync_fenced
                     or self._generation_paused
                 )
-                local_unfinished = not self.scheduler.is_finished() and not local_held
+                # This rank's vote. By default any unfinished state,
+                # `deferred_free_blocks` included, so a group whose only work
+                # is waiting runs DP dummy forwards back to back. With
+                # ATOM_DP_IDLE_WHEN_BLOCKED only what a pass could forward
+                # (`has_forward_work`); the idle drain below advances the rest.
+                local_unfinished = (
+                    self.scheduler.has_forward_work()
+                    if getattr(self, "_idle_when_blocked", False)
+                    else not self.scheduler.is_finished()
+                ) and not local_held
 
                 # MAX-reduced: one held rank holds every rank of the group, so
                 # their forwards stay paired.
@@ -1304,10 +1336,15 @@ class DPEngineCoreProc(EngineCore):
                     self.scheduler.engine_stats.note_idle(now)
                     if self.scheduler.prefill_delayer is not None:
                         self.scheduler.prefill_delayer.notify_idle()
-                    if self.has_pending_kv_work():
+                    if self.has_pending_kv_work() or (
+                        getattr(self, "_idle_when_blocked", False)
+                        and self.scheduler.waiting
+                    ):
                         # Local RPCs only. Anything that reaches schedule()
                         # would run the delayer's cross-DP all_reduce off
                         # lockstep, so the idle drain must stay off that path.
+                        # A request blocked on its tier load is waiting too:
+                        # the poll is what settles it.
                         self._advance_idle_kv_transfer()
                     continue
 

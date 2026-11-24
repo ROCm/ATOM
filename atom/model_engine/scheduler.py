@@ -1779,6 +1779,60 @@ class Scheduler:
             and not self.deferred_free_blocks
         )
 
+    def has_forward_work(self) -> bool:
+        """Whether a scheduling pass on this rank may produce a batch now.
+
+        `is_finished` with three kinds of waiting taken out, none of which a
+        forward can advance (`ATOM_DP_IDLE_WHEN_BLOCKED`):
+        - `deferred_free_blocks`: finished requests whose KV a peer (D) or the
+          tier still reads; the idle drain polls them;
+        - a waiting request whose tier load is in flight (`_still_loading`);
+        - a waiting request whose async tier lookup is in flight, for at most
+          `OFFLOAD_LOOKUP_DEFER_S` from when it was first seen blocked here.
+        Sends this rank's waiting lookups first (`prefetch_lookups`, as
+        `_schedule` does), so a fresh request blocks on its lookup instead of
+        costing a pass. Local: no collective. A wrong True costs what the
+        pass cost before (a dummy forward); False only while every waiting
+        request is blocked on something that completes without a forward.
+        """
+        if self.running or self._rejected:
+            return True
+        if not self.waiting:
+            self._forward_blocked_since.clear()
+            return False
+        conn = self.kv_connector
+        if conn is not None:
+            prefetch = getattr(conn, "prefetch_lookups", None)
+            if prefetch is not None:
+                prefetch(
+                    itertools.islice(self.waiting, 0, envs.OFFLOAD_ASYNC_LOOKUP_DEPTH)
+                )
+        would_defer = getattr(conn, "lookup_would_defer", None)
+        now = time.monotonic()
+        blocked_since = self._forward_blocked_since
+        live = set()
+        for seq in self.waiting:
+            if seq.status == SequenceStatus.ABORTED:
+                return True  # reclaimed by a pass
+            if self._still_loading(seq):
+                continue
+            if would_defer is not None and would_defer(seq):
+                first = blocked_since.setdefault(seq.id, now)
+                live.add(seq.id)
+                if now - first <= envs.OFFLOAD_LOOKUP_DEFER_S:
+                    continue
+            return True
+        for sid in list(blocked_since):
+            if sid not in live:
+                del blocked_since[sid]
+        return False
+
+    @property
+    def _forward_blocked_since(self) -> dict:
+        """seq id -> when `has_forward_work` first saw it blocked on a lookup.
+        Created on first use, like `_detached_lookups`."""
+        return self.__dict__.setdefault("_forward_blocked_since_by_id", {})
+
     def add(self, seq: Sequence):
         tracing.enqueue(seq)
         self.metrics.enqueue(seq)
