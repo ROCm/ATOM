@@ -1040,13 +1040,14 @@ def layer_part(E, Ly, part):
 
     # ---- (design 7) the FFN / MoE block per row (TileRT F0 / top-k wave 0 / H / I / G / G' / J)
     if fx.const_expr(not DRS):
-        # the index chain's code (~35 KB, laid out past the layer loop's hot path) -> L2 again, 64 KB from its recorded
-        # entry PC, one CTA in 16 (a cluster's L2): the weight stream evicts it every layer and the index layers fetched it
-        # cold from HBM (single-GPU step, 909: sources / L20 -4.3, readers -3.0 us a layer, plain layers 0; no per-layer
-        # condition: reading the next row's lflags on every CTA cost the plain layers +0.4)
+        # the index chain's code (its compressor .. its scoring waits: ~94 KB, laid out past the layer loop's hot path) -> L2
+        # again, 96 KB from its recorded entry PC, one CTA in 16 (a cluster's L2): the weight stream evicts it every layer
+        # and the index layers fetched it cold from HBM (single-GPU step, 909, 64 KB: sources / L20 -4.3, readers -3.0 us a
+        # layer, plain layers 0; 96 KB against 64: sources -2.5, L20 -2.3, readers -0.8 more; no per-layer condition:
+        # reading the next row's lflags on every CTA cost the plain layers +0.4)
         if hx.unlikely(b % 16 == 0):
             hx.code_prefetch_from(hx.opaque_v(fx.thread_idx.x), fptr(fp, "cyc") + i64(CODE_END_OFF + 24),
-                                  fptr(fp, "cyc") + i64(CODE_END_OFF), 64)
+                                  fptr(fp, "cyc") + i64(CODE_END_OFF), 96)
     mfl = plog(DNF) + i64(par) * 40960
     cr = dict(t=t, b=b, w=w, l=l, sm=sm + FLO, rank=rank, recv=c["recv"], mflag=mfl, mtag=hx.epoch32(tep, Ly, 14),
               shact=mfl + i64(MS.SHACT), ids_lds=moe_ids == "ids", ids=fptr(fp, moe_ids), ktop=RTOPK,
