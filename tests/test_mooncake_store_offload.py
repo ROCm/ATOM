@@ -32,10 +32,12 @@ import pytest
 import torch
 from conftest import MockConfig, with_min_load
 
+from atom.config import KVCacheTensor
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.disaggregation.pp_kv_aggregator import PPKVAggregator
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
+    KVConnectorOutput,
     LoadOperationId,
     SaveOperationId,
     SaveSourceGroupId,
@@ -61,6 +63,7 @@ from atom.kv_transfer.offload.metadata import (
     LoadSpec,
     SaveSpec,
 )
+from atom.kv_transfer.offload.mooncake_store import async_lookup as async_lookup_mod
 from atom.kv_transfer.offload.mooncake_store import client as store_client
 from atom.kv_transfer.offload.mooncake_store import keys, nic
 from atom.kv_transfer.offload.mooncake_store import scheduler as scheduler_mod
@@ -375,6 +378,29 @@ class _FakeAiterDtypes:
         return {"fp8": _AITER_FP8[self._state.gfx], "bf16": torch.bfloat16}
 
 
+# Saves whose expected result is the serial path's own: the pipeline packs the
+# next window while a put is in flight, a GPU copy failure there drains and
+# claims after a fence, and it needs one save thread. Their pipelined
+# counterparts are in test_kv_store_save_pipeline.py.
+_SERIAL_SAVE_ONLY = {
+    "test_put_failure_is_quiescent_and_reports_every_chunk",
+    "test_gpu_copy_failure_claims_nothing",
+    "test_the_kv_budget_holds_back_a_staging_buffer_per_copy_thread",
+}
+
+
+@pytest.fixture(autouse=True, params=["serial", "pipelined"])
+def save_mode(request, monkeypatch):
+    """Every test once per save path (``ATOM_STORE_SAVE_BATCH_CHUNKS`` 0 / 64)."""
+    if request.param == "serial":
+        monkeypatch.delenv("ATOM_STORE_SAVE_BATCH_CHUNKS", raising=False)
+    elif request.node.originalname in _SERIAL_SAVE_ONLY:
+        pytest.skip("the serial save's contract")
+    else:
+        monkeypatch.setenv("ATOM_STORE_SAVE_BATCH_CHUNKS", "64")
+    return request.param
+
+
 @pytest.fixture(autouse=True)
 def aiter_arch(monkeypatch):
     """AITER's dtype table and arch detection, as on gfx950 to start.
@@ -399,6 +425,9 @@ def aiter_arch(monkeypatch):
 
 @pytest.fixture
 def cluster(monkeypatch):
+    # The flag is opt-in: every test here runs the default synchronous renewal
+    # unless it sets ATOM_STORE_ASYNC_RENEW itself.
+    monkeypatch.delenv("ATOM_STORE_ASYNC_RENEW", raising=False)
     cluster = FakeCluster()
     monkeypatch.setattr(store_client, "_new_distributed_store", cluster.new_store)
     monkeypatch.setattr(
@@ -1801,6 +1830,303 @@ def _arm_load(scheduler, seq, *, hbm, lmc, end=None):
         scheduler._looked_up_at[sid] = scheduler_mod.time.monotonic()
 
 
+def _install_future(scheduler, scheduler_clock, monkeypatch, future, submitted):
+    monkeypatch.setattr(
+        async_lookup_mod,
+        "time",
+        SimpleNamespace(monotonic=lambda: scheduler_clock.now),
+    )
+    scheduler._lookup_client.renew_executor.shutdown()
+    scheduler._lookup_client.renew_executor = SimpleNamespace(
+        submit=lambda fn, keys: submitted.append(keys) or future,
+        shutdown=lambda: None,
+    )
+
+
+@pytest.mark.parametrize("outcome", ["ready", "ready_polled_late", "timeout", "error"])
+@pytest.mark.parametrize("raw", ["1", "true"])
+def test_async_renewal_retains_load_then_always_dispatches_the_get(
+    cluster, scheduler_clock, monkeypatch, outcome, raw
+):
+    """No renewal outcome is a data-plane failure: the GET is dispatched.
+
+    A finished renewal (even polled long after), a timeout and an executor
+    error all dispatch like the synchronous path; none may reopen saves,
+    record a failed load attempt or count a load failure for a transfer that
+    never ran.
+    """
+    from concurrent.futures import Future
+
+    monkeypatch.setenv("ATOM_STORE_ASYNC_RENEW", raw)
+    scheduler = MooncakeStoreOffloadScheduler(_config("kv_consumer"))
+    assert scheduler._async_renew
+    bound = {
+        "_renew_before_load",
+        "_clear_pending_load",
+        "build_connector_meta",
+        "has_pending_work",
+    }
+    assert bound <= set(vars(scheduler))
+    seq = _seq(57, 50)
+    _arm_load(scheduler, seq, hbm=16, lmc=40)
+    scheduler_clock.now += 2.0
+    future = Future()
+    submitted = []
+    _install_future(scheduler, scheduler_clock, monkeypatch, future, submitted)
+    for name in ("_reopen_saves", "_record_failed_load_attempt"):
+        monkeypatch.setattr(
+            scheduler, name, lambda *a, _n=name: pytest.fail(f"{_n} must not run")
+        )
+    try:
+        spec = scheduler._load_specs[str(seq.id)]
+        assert scheduler.build_connector_meta().requests == []
+        assert scheduler.build_connector_meta().requests == []
+        assert len(submitted) == 1
+        assert scheduler._load_specs[str(seq.id)] is spec
+        assert scheduler._reqs_need_recv[str(seq.id)] is seq
+        assert scheduler.has_pending_work()
+        if outcome == "ready":
+            # A zero-hit renewal still dispatches the GET, whose failure has
+            # the existing all-rank completion contract.
+            future.set_result(0)
+        elif outcome == "ready_polled_late":
+            future.set_result(5)
+            scheduler_clock.now += 30.0
+        elif outcome == "timeout":
+            scheduler_clock.now += 1.01
+        else:
+            future.set_exception(RuntimeError("native RPC failed"))
+        [request] = scheduler.build_connector_meta().requests
+        assert request.load_operation == LoadOperationId(seq.id, 0)
+        assert not scheduler._reqs_need_recv
+        assert scheduler.build_connector_meta().requests == []
+        assert scheduler.get_statistics()["load_failures"] == 0
+        fallback = {"timeout": "timeout", "error": "error"}.get(outcome)
+        counters = scheduler._perf_counters
+        assert counters["renew_parked"] == 2
+        assert {
+            k: v for k, v in counters.items() if k.startswith("renew_fallback")
+        } == ({f"renew_fallback_{fallback}": 1} if fallback else {})
+    finally:
+        scheduler.close()
+
+
+def test_an_async_dispatched_load_keeps_reporting_work_until_its_terminal(
+    cluster, scheduler_clock, monkeypatch
+):
+    from concurrent.futures import Future
+
+    monkeypatch.setenv("ATOM_STORE_ASYNC_RENEW", "1")
+    scheduler = MooncakeStoreOffloadScheduler(_config("kv_consumer"))
+    seq = _seq(58, 50)
+    _arm_load(scheduler, seq, hbm=16, lmc=40)
+    scheduler_clock.now += 2.0
+    future = Future()
+    _install_future(scheduler, scheduler_clock, monkeypatch, future, [])
+    try:
+        assert scheduler.build_connector_meta().requests == []
+        assert scheduler.has_pending_work()  # parked: re-inserted
+        future.set_result(5)
+        [request] = scheduler.build_connector_meta().requests
+        assert not scheduler._reqs_need_recv
+        # Handed to workers: the drain keeps polling for its report.
+        assert scheduler.has_pending_work()
+        assert scheduler.load_finished(request.load_operation)
+        assert not scheduler.has_pending_work()
+    finally:
+        scheduler.close()
+
+
+@pytest.mark.parametrize("raw", [None, "", "0", "false", "off"])
+def test_async_renewal_off_by_default_keeps_the_synchronous_renewal(
+    cluster, scheduler_clock, monkeypatch, raw
+):
+    """Unset and explicitly disabled alike: the class's blocking renewal."""
+    if raw is not None:
+        monkeypatch.setenv("ATOM_STORE_ASYNC_RENEW", raw)
+    scheduler = MooncakeStoreOffloadScheduler(_config("kv_consumer"))
+    assert not scheduler._async_renew
+    # Off, the methods are the class's own: nothing is bound on the instance.
+    bound = {
+        "_renew_before_load",
+        "_clear_pending_load",
+        "build_connector_meta",
+        "has_pending_work",
+    }
+    assert not bound & set(vars(scheduler))
+    seq = _seq(57, 50)
+    _arm_load(scheduler, seq, hbm=16, lmc=40)
+    scheduler_clock.now += 2.0
+    renewals = []
+    monkeypatch.setattr(
+        scheduler._lookup_client,
+        "cancel_renewal",
+        lambda sid: pytest.fail("flag off must not touch renewal state"),
+    )
+    scheduler._lookup_client.renew_executor.shutdown()
+    scheduler._lookup_client.renew_executor = SimpleNamespace(
+        submit=lambda *a: pytest.fail("no async renewal when the flag is off"),
+        shutdown=lambda: None,
+    )
+    monkeypatch.setattr(
+        scheduler._lookup_client,
+        "renew",
+        lambda s, start, end: renewals.append((s, start, end)) or 0,
+    )
+    try:
+        [request] = scheduler.build_connector_meta().requests
+        assert renewals == [(seq, 16, 40)]
+        assert request.load_operation == LoadOperationId(seq.id, 0)
+        assert not scheduler._reqs_need_recv
+    finally:
+        scheduler.close()
+
+
+def test_flag_off_hot_paths_never_touch_renewal_state(
+    cluster, scheduler_clock, monkeypatch
+):
+    scheduler = MooncakeStoreOffloadScheduler(_config("kv_consumer"))
+    try:
+        monkeypatch.setattr(
+            scheduler._lookup_client,
+            "cancel_renewal",
+            lambda sid: pytest.fail("flag off must not touch renewal state"),
+        )
+        seq = _seq(58, 50)
+        _arm_load(scheduler, seq, hbm=16, lmc=40)  # a fresh hit: reuse path
+        spec = scheduler._load_specs[str(seq.id)]
+        assert scheduler._ensure_lookup_pin(seq, str(seq.id), spec) is True
+        scheduler._clear_pending_load(str(seq.id))
+    finally:
+        scheduler.close()
+
+
+def test_async_renewal_runs_on_the_real_renewal_executor(
+    cluster, scheduler_clock, monkeypatch
+):
+    """The scheduler builds its own renewal path: no executor stub."""
+    monkeypatch.setenv("ATOM_STORE_ASYNC_RENEW", "1")
+    scheduler = MooncakeStoreOffloadScheduler(_config("kv_consumer"))
+    seq = _seq(57, 50)
+    _arm_load(scheduler, seq, hbm=16, lmc=40)
+    scheduler_clock.now += 2.0
+    client = scheduler._lookup_client
+    snapshot, built = client.backend.renew_key_snapshot, []
+    monkeypatch.setattr(
+        client.backend,
+        "renew_key_snapshot",
+        lambda *a: built.append(a) or snapshot(*a),
+    )
+    try:
+        with client.backend_slot.take():  # the renewal waits behind this call
+            assert scheduler.build_connector_meta().requests == []
+            time.sleep(0.05)  # long enough for an unblocked renewal to finish
+            assert scheduler.build_connector_meta().requests == []
+            assert scheduler._perf_counters["renew_parked"] == 2
+            assert str(seq.id) in client._renewals
+            # One build, of the load's own range; parked retries do not rebuild.
+            assert built == [(seq, 16, 40)]
+        deadline = time.monotonic() + 5
+        while not (requests := scheduler.build_connector_meta().requests):
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+        [request] = requests
+        assert request.load_operation == LoadOperationId(seq.id, 0)
+        assert not client._renewals
+        assert not [k for k in scheduler._perf_counters if "fallback" in k]
+    finally:
+        scheduler.close()
+
+
+@pytest.mark.parametrize("pp", [1, 2])
+@pytest.mark.parametrize(
+    "num_tokens,start,end",
+    [
+        (50, 16, 40),
+        (200, 0, 200),
+        (200, 32, 33),
+        (64, 40, 16),  # start > end
+        (64, 32, 32),  # start == end
+        (10, 0, 5),  # shorter than one chunk
+        (50, 16, 400),  # runs past the end of the prompt
+        (200, 190, 400),
+    ],
+)
+def test_async_key_snapshot_asks_the_same_keys_as_the_synchronous_renew(
+    cluster, monkeypatch, pp, num_tokens, start, end
+):
+    scheduler = MooncakeStoreOffloadScheduler(_config("kv_consumer", pp=pp))
+    backend = scheduler._lookup_client.backend
+    asked = []
+    monkeypatch.setattr(
+        backend, "_exists_on", lambda pools, keys: asked.append(tuple(keys)) or []
+    )
+    try:
+        seq = _seq(70, num_tokens)
+        backend.renew(seq, start, end)
+        sync_asked, asked[:] = asked[:], []
+        backend.renew_keys(backend.renew_key_snapshot(seq, start, end))
+        assert asked == sync_asked
+        chunk = backend._chunk_tokens
+        if start // chunk < min(end // chunk, num_tokens // chunk):
+            assert sync_asked  # the comparison is not vacuous
+    finally:
+        scheduler.close()
+
+
+@pytest.mark.parametrize("flag", ["1", None])
+def test_real_multi_scheduler_takes_cancels_undispatched_loads_from_its_store_sub(
+    cluster, monkeypatch, flag
+):
+    from atom.kv_transfer.disaggregation.base import KVConnectorSchedulerBase
+    from atom.kv_transfer.disaggregation.multi import multi_connector as mc_module
+
+    if flag:
+        monkeypatch.setenv("ATOM_STORE_ASYNC_RENEW", flag)
+    store = MooncakeStoreOffloadScheduler(_config("kv_consumer"))
+    pd = SimpleNamespace(
+        is_offload=False, is_producer=False, cancels_undispatched_loads=False
+    )
+    assert KVConnectorSchedulerBase.cancels_undispatched_loads is False
+    monkeypatch.setattr(
+        mc_module, "_build_subconnectors", lambda config, role: [pd, store]
+    )
+    try:
+        multi = mc_module.MultiConnectorScheduler(SimpleNamespace())
+        assert store.cancels_undispatched_loads is bool(flag)
+        assert multi.cancels_undispatched_loads is bool(flag)
+    finally:
+        store.close()
+
+
+def test_a_failed_async_renewal_is_logged_exactly_once(
+    cluster, scheduler_clock, monkeypatch, caplog
+):
+    from concurrent.futures import Future
+
+    monkeypatch.setenv("ATOM_STORE_ASYNC_RENEW", "1")
+    scheduler = MooncakeStoreOffloadScheduler(_config("kv_consumer"))
+    seq = _seq(57, 50)
+    _arm_load(scheduler, seq, hbm=16, lmc=40)
+    scheduler_clock.now += 2.0
+    future = Future()
+    future.set_exception(RuntimeError("native RPC failed"))
+    _install_future(scheduler, scheduler_clock, monkeypatch, future, [])
+    try:
+        with caplog.at_level("WARNING", logger="atom"):
+            [request] = scheduler.build_connector_meta().requests
+        assert request.load_operation == LoadOperationId(seq.id, 0)
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        assert warnings[0].getMessage() == (
+            "Mooncake Store lease renewal failed; the load is dispatched "
+            "without it: native RPC failed"
+        )
+        assert scheduler._perf_counters["renew_fallback_error"] == 1
+    finally:
+        scheduler.close()
+
+
 def test_save_requests_carry_digests_not_tokens(cluster, make_worker):
     scheduler = MooncakeStoreOffloadScheduler(_config("kv_producer"))
     seq = _seq(6, 30)
@@ -1924,6 +2250,35 @@ def test_a_fresh_hit_is_loaded_without_asking_again(cluster, scheduler_clock):
     assert "52" not in scheduler._looked_up_at
 
 
+def test_a_fresh_hit_is_loaded_in_the_same_build_with_async_renewal(
+    cluster, scheduler_clock, monkeypatch
+):
+    monkeypatch.setenv("ATOM_STORE_ASYNC_RENEW", "1")
+    scheduler = MooncakeStoreOffloadScheduler(_config("kv_consumer"))
+    assert scheduler._async_renew
+    scheduler._min_load_tokens = 0
+    _store_chunks(cluster, _hashes(40), range(5))
+    seq = _seq(53, 41)
+    submitted = []
+    submit = scheduler._lookup_client.renew_executor.submit
+    monkeypatch.setattr(
+        scheduler._lookup_client.renew_executor,
+        "submit",
+        lambda *a, **k: submitted.append(a) or submit(*a, **k),
+    )
+    try:
+        assert _completed_match(scheduler, seq) == (40, True)
+        scheduler_clock.now += 0.5  # within the reuse window: no renewal
+        scheduler.update_state_after_alloc(seq)
+        [request] = scheduler.build_connector_meta().requests
+        assert request.load_spec.lmcache_cached_tokens == 40
+        assert submitted == []
+        assert scheduler._perf_counters.get("renew_parked", 0) == 0
+        assert not scheduler._lookup_client._renewals
+    finally:
+        scheduler.close()
+
+
 def _await_store_lookup(offload, seq):
     """Establish an actual asynchronous answer before testing load/forward work."""
     offload.offer_lookups([seq])
@@ -2005,6 +2360,106 @@ def _park_after_a_wait_for_blocks(cluster, scheduler_clock, store_engine, meanwh
     return seq, loads[0]
 
 
+@pytest.mark.parametrize("dispatched", [False, True])
+@pytest.mark.parametrize("expired", [False, True])
+def test_abort_pending_renewal_cancels_only_undispatched_load(
+    cluster, scheduler_clock, monkeypatch, store_engine, dispatched, expired
+):
+    """Abort through the real scheduler, before and after worker ownership."""
+    from concurrent.futures import Future
+
+    engine, offload = store_engine.engine, store_engine.offload
+    from atom.utils import envs
+
+    monkeypatch.setenv("ATOM_STORE_ASYNC_RENEW", "1")
+    # What __init__ binds with the flag on, for the already-built pair.
+    offload._async_renew = envs.ATOM_STORE_ASYNC_RENEW
+    offload.cancels_undispatched_loads = offload._async_renew
+    offload._pending_loads = {}
+    offload._renew_before_load = offload._renew_before_load_async
+    offload._clear_pending_load = offload._clear_pending_load_async
+    offload.build_connector_meta = offload._build_connector_meta_async
+    engine._finish_rejected_waiting = engine._finish_rejected_waiting_cancelling
+    assert offload._async_renew
+    _store_chunks(cluster, _hashes(40), range(5))
+    seq = Sequence(list(range(41)), BLOCK, sampling_params=SamplingParams())
+    engine.add(seq)
+    store_engine.withheld.on = True
+    _await_store_lookup(offload, seq)
+    engine.schedule()
+    assert offload.get_num_new_matched_tokens(seq) == (40, True)
+    scheduler_clock.now += 3.0
+    future = Future()
+    # A native renewal already running cannot be cancelled; its late result
+    # must not transfer ownership of this aborted request to a worker.
+    assert future.set_running_or_notify_cancel()
+    monkeypatch.setattr(
+        async_lookup_mod,
+        "time",
+        SimpleNamespace(monotonic=lambda: scheduler_clock.now),
+    )
+    offload._lookup_client.renew_executor.shutdown()
+    offload._lookup_client.renew_executor = SimpleNamespace(
+        submit=lambda fn, keys: future, shutdown=lambda: None
+    )
+    store_engine.withheld.on = False
+    batch, _ = engine.schedule()
+    sid = str(seq.id)
+    assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+    assert seq._counted_as_inflight_load
+    assert sid in offload._lookup_client._renewals
+    assert batch.connector_meta_output.requests == []
+    assert sid not in offload._active_load_operations
+    if expired:
+        scheduler_clock.now += 1.01
+    if dispatched:
+        if not expired:
+            future.set_result(5)
+        [load] = offload.build_connector_meta().requests
+        assert offload._active_load_operations[sid] == (seq, load.load_operation)
+
+    assert engine.abort_request(seq.id)
+    assert seq.status == SequenceStatus.FINISHED
+    if dispatched:
+        # Submitted DMA still owns the reservation until an exact terminal.
+        assert seq._counted_as_inflight_load
+        assert seq._awaiting_aborted_load_cleanup
+        assert seq.block_table
+        engine._update_from_kv_xfer_finished(
+            KVConnectorOutput(failed_loading={load.load_operation})
+        )
+    if not future.done():
+        future.set_result(5)
+    assert offload.build_connector_meta().requests == []
+    assert sid not in offload._reqs_need_recv
+    assert sid not in offload._load_specs
+    assert sid not in offload._lookup_client._renewals
+    assert not seq._counted_as_inflight_load
+    assert not seq.block_table
+    assert engine._num_parked_remote_kv == 0
+    assert sid not in offload._active_load_operations
+
+
+def test_abort_with_flag_off_never_asks_the_connector_to_cancel_a_load(
+    cluster, store_engine, monkeypatch
+):
+    engine, offload = store_engine.engine, store_engine.offload
+    assert not offload.cancels_undispatched_loads
+    monkeypatch.setattr(
+        offload,
+        "cancel_undispatched_load",
+        lambda seq: pytest.fail("flag off: abort must not ask to cancel"),
+    )
+    _store_chunks(cluster, _hashes(40), range(5))
+    seq = Sequence(list(range(41)), BLOCK, sampling_params=SamplingParams())
+    engine.add(seq)
+    _await_store_lookup(offload, seq)
+    engine.schedule()
+    seq._counted_as_inflight_load = True  # as parking leaves it
+    assert engine.abort_request(seq.id)
+    assert seq.status == SequenceStatus.FINISHED
+
+
 @pytest.mark.parametrize(
     "meanwhile", ["nothing", "evicted", "store_error", "lookups_paused"]
 )
@@ -2047,6 +2502,41 @@ def test_an_aborted_parked_load_frees_its_blocks_when_it_reports(
     assert engine.block_manager.kv.num_free == free
     assert engine._num_parked_remote_kv == 0
     assert not offload.has_pending_work()
+
+
+def test_an_abort_after_preempt_waits_for_the_second_load(
+    cluster, store_engine, make_worker
+):
+    # Restored, preempted, its HBM prefix evicted, parked for a second Store
+    # load, then aborted before that load reports: the worker is still
+    # writing into its blocks, whatever the first load left in its flags.
+    engine, offload = store_engine.engine, store_engine.offload
+    worker, _ = make_worker(namespace=offload._namespace)
+    _store_chunks(cluster, _hashes(40), range(5))
+    seq = Sequence(list(range(41)), BLOCK, sampling_params=SamplingParams())
+    engine.add(seq)
+    for load in (1, 2):
+        _await_store_lookup(offload, seq)
+        batch, _ = engine.schedule()
+        [request] = [r for r in batch.connector_meta_output.requests if r.load_spec]
+        assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+        if load == 2:
+            break
+        worker._do_load_req(request)
+        engine._update_from_kv_xfer_finished(worker.get_finished())
+        engine.schedule()  # the suffix
+        assert seq.offload_loaded
+        engine.running.remove(seq)
+        assert engine.preempt(seq)
+        engine.block_manager.clear_cache()
+    free = engine.block_manager.kv.num_free
+    assert engine.abort_request(seq.id)
+    assert seq.id in engine.deferred_free_blocks
+    assert engine.block_manager.kv.num_free == free
+    worker._do_load_req(request)
+    engine._update_from_kv_xfer_finished(worker.get_finished())
+    assert seq.id not in engine.deferred_free_blocks
+    assert engine._num_parked_remote_kv == 0
 
 
 def test_a_loaded_prefix_is_published_and_the_suffix_hashes_onto_it(
@@ -2336,7 +2826,9 @@ def test_a_chunk_the_lookup_has_no_answer_for_is_put(cluster, make_worker):
     assert _store(request.save_operation) in worker.get_finished().connector_completions
 
 
-def test_a_failed_put_after_held_chunks_reports_each_chunk_once(cluster, make_worker):
+def test_a_failed_put_after_held_chunks_reports_each_chunk_once(
+    cluster, make_worker, save_mode
+):
     worker, gpu = make_worker(save_slots=8)
     request = _save_req(37, 48)
     hashes = request.chunk_hashes
@@ -2345,9 +2837,13 @@ def test_a_failed_put_after_held_chunks_reports_each_chunk_once(cluster, make_wo
         objects[_key(hashes, index)] = b"held" * (CHUNK_BYTES // 4)
     worker._client._store.put_codes[_key(hashes, 3)] = store_client.NO_AVAILABLE_HANDLE
     reported = _counting_source_safe(worker, gpu)
+    store = cluster.store_of(MASTER)
+    asked_before = sum(1 for call in store.calls if call[0] == "exists")
     worker._do_save_req(request)
-    # Chunks 4-5 held, 2-3 read and put (3 refused), 0-1 never read: each
-    # source-safe once, so every PP stage reports the same set.
+    asked = sum(1 for call in store.calls if call[0] == "exists") - asked_before
+    # Chunks 4-5 held, 2-3 read and put (3 refused), 0-1 not put (and on the
+    # serial path never read): each source-safe once, so every PP stage
+    # reports the same set.
     assert sorted(reported) == list(range(6))
     operation = request.save_operation
     assert worker.get_finished().connector_completions == {
@@ -2355,7 +2851,15 @@ def test_a_failed_put_after_held_chunks_reports_each_chunk_once(cluster, make_wo
         _quiescent(operation),
         *(_safe(operation, index) for index in range(6)),
     }
-    assert worker._save_counts == {"lookups": 2, "put_chunks": 2, "held_chunks": 2}
+    # The lookahead queues the lowest window's lookup before the refused put
+    # returns, so the store gets that lookup; the save counts that window only
+    # if it gets there before it sees the failure.
+    if save_mode == "serial":
+        assert asked == 2 and worker._save_counts["lookups"] == 2
+    else:
+        assert asked == 3 and worker._save_counts["lookups"] in (2, 3)
+    assert worker._save_counts["put_chunks"] == 2
+    assert worker._save_counts["held_chunks"] == 2
     assert worker._pool.quarantined("save") == 0
 
 
@@ -3413,7 +3917,8 @@ def test_factory_builds_both_halves(cluster):
 def _kv_caches(num_blocks=8):
     # MLA-like: token-major rows, one plane per layer.
     return {
-        f"layer_{i}": SimpleNamespace(
+        f"layer_{i}": KVCacheTensor(
+            layer_num=i,
             k_cache=torch.zeros((num_blocks * BLOCK, 1, 8), dtype=torch.uint8),
             index_cache=None,
         )
@@ -4107,10 +4612,12 @@ def test_scattered_slots_fall_back_to_the_staging_copy(cluster, make_in_place_wo
     assert _store(request.save_operation) in worker.get_finished().connector_completions
 
 
-def test_in_place_pack_failure_claims_nothing(cluster, make_in_place_worker):
+def test_in_place_pack_failure_claims_nothing(cluster, make_in_place_worker, save_mode):
     worker, _gpu, codec, _stream = make_in_place_worker()
     codec.fail = True
     request = _save_req(44, 16)
+    if save_mode == "pipelined":
+        pytest.skip("the pipelined save drains instead: see the next test")
     with pytest.raises(RuntimeError, match="pack failed"):
         worker._do_save_req(request)
     completions = worker.get_finished().connector_completions
@@ -4119,6 +4626,36 @@ def test_in_place_pack_failure_claims_nothing(cluster, make_in_place_worker):
         for completion in completions
     )
     assert worker._pool.quarantined("save") == 0  # the fence held: released
+
+
+@pytest.mark.parametrize("fence_fails", [False, True])
+def test_a_pipelined_in_place_pack_failure_claims_after_a_fence(
+    cluster, make_in_place_worker, save_mode, monkeypatch, fence_fails
+):
+    if save_mode == "serial":
+        pytest.skip("the serial save raises: see the test above")
+    worker, _gpu, codec, _stream = make_in_place_worker()
+    codec.fail = True
+
+    def fence(device):
+        if fence_fails:
+            raise RuntimeError("fence failed")
+
+    monkeypatch.setattr(store_worker_mod, "_synchronize", fence)
+    request = _save_req(46, 16)
+    operation = request.save_operation
+    worker._do_save_req(request)  # drained, not raised
+    completions = worker.get_finished().connector_completions
+    assert _store(operation, False) in completions
+    if fence_fails:  # nothing proves the source idle: no claim at all
+        assert not any(
+            completion.channel
+            in (DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL, DENSE_PAGE_SOURCE_SAFE_CHANNEL)
+            for completion in completions
+        )
+    else:  # the fence held: quiescent, and both unread chunks safe
+        assert _quiescent(operation) in completions
+        assert {_safe(operation, index) for index in range(2)} <= completions
 
 
 def test_in_place_save_failure_reports_each_chunk_once(cluster, make_in_place_worker):
@@ -4441,3 +4978,18 @@ def test_pool_strided_view_preserves_alignment_gaps(cluster):
     assert pool.strided_view(list(reversed(slots))) is None
     pool.release(slots)
     pool.close()
+
+
+@pytest.mark.parametrize("flag", [True, False, None])
+def test_scheduler_binds_the_cancelling_abort_only_for_such_a_connector(
+    monkeypatch, flag
+):
+    import atom.utils.forward_context as fc
+
+    connector = (
+        None if flag is None else SimpleNamespace(cancels_undispatched_loads=flag)
+    )
+    monkeypatch.setattr(fc, "get_kvconnector", lambda role, config: connector)
+    engine = Scheduler(MockConfig(num_kvcache_blocks=8, max_model_len=64))
+    # Without such a connector the abort path is the class's method, not a wrapper.
+    assert ("_finish_rejected_waiting" in vars(engine)) is bool(flag)
