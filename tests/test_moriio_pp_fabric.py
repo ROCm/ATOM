@@ -633,3 +633,125 @@ def test_a_downstream_stage_polls_pushes_at_the_idle_cadence():
     ).read_text()
     body = source[source.index("def _downstream_busy_loop") :]
     assert 'getattr(connector, "pushes_from_worker_poll", False)' in body[:1500]
+
+
+# ---------------------------------------------------------------------------
+# ATOM_MORIIO_WRITE_THREAD on a PP x TP1 stage
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def stage_thread(write_path):
+    """A TP1 stage whose pushes into each D rank post and settle as the test
+    says, served by its push thread; stopped at the end."""
+    from test_moriio_fabric import FakeEvent, wait_for
+
+    started = []
+
+    def make(stage):
+        conn = tp1_stage(write_path, stage)
+        conn.statuses = {r: write_path.FakeStatus() for r in range(D_TP)}
+        conn._write_blocks = lambda request, engine_id: [
+            conn.statuses[request["decode_tp_rank"]]
+        ]
+        conn.event = FakeEvent()
+        conn._kv_ready_events = {9: conn.event}
+        with mock.patch("atexit.register"):
+            conn._start_push_thread()
+        started.append(conn)
+        return conn
+
+    def ask(conn, ranks):
+        for r in ranks:  # as the listener does
+            conn._write_requests.put(
+                write_path.push_request(decode_tp_size=D_TP, decode_tp_rank=r)
+            )
+            conn._push_wakeup.set()
+
+    yield types.SimpleNamespace(make=make, ask=ask, wait_for=wait_for)
+    for conn in started:
+        conn.stop_push_thread()
+        assert not conn._push_thread.is_alive()
+
+
+class TestPushThreadUnderPP:
+    def test_a_stage_pushes_into_every_d_rank_from_its_thread(self, stage_thread):
+        conn = stage_thread.make(2)
+        stage_thread.ask(conn, range(D_TP))
+        stage_thread.wait_for(lambda: len(conn._pending_writes) == D_TP)
+        # The KV-ready event still gates every push.
+        for _ in range(10):
+            conn._push_wakeup.set()
+            stage_thread.wait_for(lambda: not conn._push_wakeup.is_set())
+        assert conn._sending_writes == {} and conn.sent == []
+        conn.event.done = True
+        stage_thread.wait_for(lambda: len(conn._sending_writes) == D_TP)
+        for r in range(D_TP - 1):
+            conn.statuses[r].state = "ok"
+        stage_thread.wait_for(lambda: len(conn.sent) == D_TP - 1)
+        # The ready event stays for the push still in flight.
+        assert 9 in conn._kv_ready_events and conn._pushes_done == {9: D_TP - 1}
+        conn.statuses[D_TP - 1].state = "ok"
+        stage_thread.wait_for(lambda: len(conn.sent) == D_TP)
+        reports = [(msgpack.loads(f[1]), port) for f, _, port in conn.sent]
+        assert sorted(port for _, port in reports) == [7400, 7401, 7402, 7403]
+        assert all(
+            r == {"decode_req_id": "d1", "ok": True, "pp_rank": 2} for r, _ in reports
+        )
+        stage_thread.wait_for(lambda: 9 not in conn._kv_ready_events)
+        assert conn._pushes_done == {}
+        # A later stage never frees stage 0's block table.
+        assert conn.get_finished().finished_sending == set()
+
+    def test_stage_0_frees_its_blocks_only_on_the_last_release(self, stage_thread):
+        conn = stage_thread.make(0)
+        conn.event.done = True
+        for status in conn.statuses.values():
+            status.state = "ok"
+        stage_thread.ask(conn, range(D_TP))
+        stage_thread.wait_for(lambda: len(conn.sent) == D_TP)
+        assert conn.get_finished().finished_sending == set()
+        # RELEASEs arrive on the listener thread while the push thread runs.
+        for rank in (0, 1, 1, 2):
+            conn._record_release(9, D_TP, rank)
+        assert conn.get_finished().finished_sending == set()
+        conn._record_release(9, D_TP, 3)
+        assert conn.get_finished().finished_sending == {9}
+        conn._record_release(9, D_TP, 0)  # a late repeat frees nothing again
+        assert conn.get_finished().finished_sending == set()
+
+    def test_a_failed_push_is_reported_and_still_waits_for_the_releases(
+        self, stage_thread
+    ):
+        conn = stage_thread.make(0)
+        conn.event.done = True
+        conn.statuses[1].state = "failed"
+        for r in (0, 2, 3):
+            conn.statuses[r].state = "ok"
+        stage_thread.ask(conn, range(D_TP))
+        stage_thread.wait_for(lambda: len(conn.sent) == D_TP)
+        oks = {port: msgpack.loads(f[1])["ok"] for f, _, port in conn.sent}
+        assert oks == {7400: True, 7401: False, 7402: True, 7403: True}
+        assert conn.get_finished().finished_sending == set()
+        for rank in range(D_TP):
+            conn._record_release(9, D_TP, rank)
+        assert conn.get_finished().finished_sending == {9}
+
+    @pytest.mark.parametrize("flag", [False, True])
+    def test_downstream_stages_poll_every_ms_only_without_the_thread(self, stack, flag):
+        config = types.SimpleNamespace(
+            kv_transfer_config={"kv_role": "kv_producer"},
+            tensor_parallel_size=1,
+            pipeline_parallel_size=4,
+            parallel_config=types.SimpleNamespace(
+                data_parallel_size=1, data_parallel_rank=0
+            ),
+        )
+        envs = types.SimpleNamespace(ATOM_MORIIO_WRITE_THREAD=flag)
+        with (
+            mock.patch.object(stack.conn, "envs", envs),
+            mock.patch.object(stack.conn, "get_open_port", lambda: 1),
+            mock.patch.object(stack.conn, "get_ip", lambda: "10.0.0.1"),
+        ):
+            sched = stack.conn.MoRIIOConnectorScheduler(config)
+        assert sched.pushes_from_worker_poll is not flag

@@ -1230,3 +1230,176 @@ class TestWriteOrdering:
         draft_kv = body.index("drafter.compute_draft_kv(")
         assert draft_kv < body.index("self._record_kv_cache_ready(batch)")
         assert body.count("self._record_kv_cache_ready(batch)") == 2
+
+
+# ---------------------------------------------------------------------------
+# ATOM_MORIIO_WRITE_THREAD: pushes served on their own thread
+# ---------------------------------------------------------------------------
+
+
+def wait_for(predicate, timeout: float = 5.0) -> None:
+    import time
+
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < deadline, "timed out"
+        time.sleep(0.001)
+
+
+@pytest.fixture
+def push_thread(write_path):
+    """A producer whose pushes post and settle as the test says, and a way to
+    start its push thread; every thread started is stopped at the end."""
+    started = []
+
+    def make(statuses=None):
+        conn = write_path.make(producer=True)
+        conn._write_target_ready = lambda request: True
+        conn.statuses = statuses if statuses is not None else []
+        conn._write_blocks = lambda request, engine_id: conn.statuses
+        return conn
+
+    def start(conn):
+        with mock.patch("atexit.register"):
+            conn._start_push_thread()
+        started.append(conn)
+        return conn._push_thread
+
+    def ask(conn, **overrides):
+        # As the listener does.
+        conn._write_requests.put(write_path.push_request(**overrides))
+        conn._push_wakeup.set()
+
+    yield types.SimpleNamespace(
+        make=make, start=start, ask=ask, FakeStatus=write_path.FakeStatus
+    )
+    for conn in started:
+        conn.stop_push_thread()
+
+
+class TestPushThread:
+    def test_a_push_is_posted_and_reported_without_an_engine_step(self, push_thread):
+        conn = push_thread.make([push_thread.FakeStatus()])
+        # Settling is noticed by polling, not by a wakeup or the idle timeout.
+        conn._PUSH_IDLE_WAIT_S = 60.0
+        thread = push_thread.start(conn)
+        push_thread.ask(conn)
+        wait_for(lambda: conn._sending_writes)
+        # Neither reported nor released before the push settles.
+        assert conn.sent == [] and conn.done_sending == set()
+        conn.statuses[0].state = "ok"
+        wait_for(lambda: conn.sent)
+        [(frames, _host, _port)] = conn.sent
+        assert msgpack.loads(frames[1]) == {"decode_req_id": "d1", "ok": True}
+        # The scheduler gets the source back at the next step, as before.
+        assert conn.get_finished().finished_sending == {9}
+        conn.stop_push_thread()
+        assert not thread.is_alive()
+
+    def test_a_failed_push_is_reported_and_releases_the_source(self, push_thread):
+        conn = push_thread.make([push_thread.FakeStatus("failed")])
+        push_thread.start(conn)
+        push_thread.ask(conn)
+        wait_for(lambda: conn.sent)
+        [(frames, _host, _port)] = conn.sent
+        assert msgpack.loads(frames[1])["ok"] is False
+        assert conn.get_finished().finished_sending == {9}
+
+    def test_a_push_waits_for_its_prefills_kv_ready_event(self, push_thread):
+        conn = push_thread.make([push_thread.FakeStatus("ok")])
+        event = FakeEvent()
+        conn._kv_ready_events = {9: event}
+        push_thread.start(conn)
+        push_thread.ask(conn)
+        wait_for(lambda: conn._pending_writes)
+        # Many passes, each woken and done, and still nothing posted.
+        for _ in range(20):
+            conn._push_wakeup.set()
+            wait_for(lambda: not conn._push_wakeup.is_set())
+        assert conn._sending_writes == {} and conn.sent == []
+        event.done = True
+        wait_for(lambda: conn.sent)
+        assert conn.done_sending == {9}
+
+    def test_a_request_wakes_the_thread_before_its_idle_wait_ends(self, push_thread):
+        import time
+
+        conn = push_thread.make([push_thread.FakeStatus("ok")])
+        conn._PUSH_IDLE_WAIT_S = 60.0
+        push_thread.start(conn)
+        time.sleep(0.05)  # into its idle wait
+        push_thread.ask(conn)
+        wait_for(lambda: conn.sent, timeout=2.0)
+
+    def test_pushes_asked_for_together_each_get_one_report(self, push_thread):
+        conn = push_thread.make([push_thread.FakeStatus("ok")])
+        conn._kv_ready_events = {}
+        conn._kv_ready_expired = {i: None for i in range(10, 30)}
+        push_thread.start(conn)
+        for i in range(10, 30):
+            push_thread.ask(conn, transfer_id=i, decode_req_id=f"d{i}")
+        # A second ask while the first is served pushes nothing more.
+        push_thread.ask(conn, transfer_id=10, decode_req_id="d10")
+        wait_for(lambda: len(conn.sent) == 20)
+        wait_for(lambda: conn._write_requests.empty() and not conn._pending_writes)
+        reports = sorted(msgpack.loads(f[1])["decode_req_id"] for f, *_ in conn.sent)
+        assert reports == sorted(f"d{i}" for i in range(10, 30))
+        assert conn.get_finished().finished_sending == set(range(10, 30))
+
+    def test_get_finished_leaves_pushes_to_the_thread(self, push_thread):
+        import threading
+
+        conn = push_thread.make([push_thread.FakeStatus("ok")])
+        # The engine thread must not serve pushes alongside the push thread.
+        conn._push_thread = threading.current_thread()
+        push_thread.ask(conn)
+        assert conn.get_finished().finished_sending == set()
+        assert conn._write_requests.qsize() == 1 and conn.sent == []
+
+    def test_a_failed_thread_fails_the_next_step(self, push_thread):
+        conn = push_thread.make()
+
+        def broken():
+            raise RuntimeError("pass failed")
+
+        conn._service_write_requests = broken
+        thread = push_thread.start(conn)
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+        with pytest.raises(RuntimeError, match="push thread failed"):
+            conn.get_finished()
+
+    @pytest.mark.parametrize(
+        "producer, flag, starts", [(True, True, 1), (True, False, 0), (False, True, 0)]
+    )
+    def test_only_a_flagged_producer_starts_the_thread(
+        self, stack, write_path, producer, flag, starts
+    ):
+        conn = write_path.make(producer=producer)
+        conn.side_channel_port = 7401
+        conn._handshake_listener = lambda *args: None
+        started = []
+        conn._start_push_thread = lambda: started.append(1)
+        envs = types.SimpleNamespace(ATOM_MORIIO_WRITE_THREAD=flag)
+        with mock.patch.object(stack.conn, "envs", envs):
+            conn._start_handshake_listener(object())
+        conn._handshake_listener_thread.join(timeout=5)
+        assert len(started) == starts
+
+    def test_a_ready_event_is_recorded_before_a_push_can_see_it(self, write_path):
+        # The push thread queries the event as soon as it is published, and
+        # an event never recorded reports complete.
+        conn = write_path.make(producer=True)
+        conn._kv_ready_events = {}
+
+        class Recorded(FakeEvent):
+            def record(self, stream=None):
+                assert 9 not in conn._kv_ready_events
+                self.done = True
+
+        with (
+            mock.patch("torch.cuda.Event", Recorded),
+            mock.patch("torch.cuda.current_stream", lambda *a: None),
+        ):
+            conn.record_kv_cache_ready([9])
+        assert conn._kv_ready_events[9].done
