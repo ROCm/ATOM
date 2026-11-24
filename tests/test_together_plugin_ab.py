@@ -489,20 +489,3 @@ def test_real_tp4_window_capture(install, monkeypatch):
             graph.reset()
         dist.destroy_process_group(cpu)
         dist.destroy_process_group()
-
-
-def test_window_runtime_and_both_model_ends_are_wired():
-    # The model modules need AITER. Separately keep a CPU gate for call-site
-    # drift; the behavioral tests above exercise the host, not these imports.
-    model = Path(__file__).resolve().parents[1] / "atom/models/deepseek_v41_plugin"
-    runtime, attention, moe = [
-        (model / n).read_text(encoding="utf-8")
-        for n in ("runtime.py", "attention.py", "moe.py")
-    ]
-    assert "with plugin_transition.scope(" in runtime
-    assert attention.index("compressed = self._fork_compress(hidden") < attention.index(
-        "q_lora, kv_pre = plugin_transition.end("
-    )
-    assert moe.index("plugin_transition.begin(self.layer_id") < moe.index(
-        "return super().combine_outputs(routed, shared, prefix)"
-    )

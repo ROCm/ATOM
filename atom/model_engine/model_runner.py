@@ -1037,15 +1037,10 @@ class ModelRunner:
             installer = None
 
         def install_native(model, atom_config, drafter, **kwargs):
-            """The model's own installers (and V4.1's v41.mono.install seam)."""
+            """The model's own installers (its mono decode, where it has one)."""
             if installer is None:
                 return model
             install = resolve_obj_by_qualname(installer)
-            if mono_arch == "DeepseekV41ForCausalLM":
-                # Boot-only seam: a planned plugin may install its own instead.
-                return plugin_host.call(
-                    "v41.mono.install", install, model, atom_config, drafter, **kwargs
-                )
             return install(model, atom_config, drafter, **kwargs)
 
         # The generic boot hook (`model.install`): a planned plugin may wrap or

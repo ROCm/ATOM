@@ -263,7 +263,9 @@ def test_the_plugin_model_is_chosen_only_under_a_plan(monkeypatch):
     native = "atom.models.deepseek_v41.runtime.DeepseekV41RuntimeModel"
     assert host.model_class_for(ARCH, native) == native
     host.configure(_plan(model_options={"fused_attn": True}), kill_switch=False)
-    assert host.model_class_for(ARCH, native) == host.PLUGIN_MODEL_CLASSES[ARCH]
+    # ATOM has no plugin variant of its own: a plan without a target class
+    # builds ATOM's model; a plugin package's model comes from the recipe.
+    assert host.model_class_for(ARCH, native) == native
     assert host.model_class_for("Qwen3ForCausalLM", "q") == "q"
     assert host.model_options().fused_attn
     host._reset_for_testing()

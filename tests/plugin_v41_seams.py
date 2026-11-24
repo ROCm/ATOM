@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""The DeepSeek-V4.1 seams of the plugin model (``atom.models.deepseek_v41_plugin``).
+"""The DeepSeek-V4.1 seam specs ATOM's CPU tests declare (``conftest.py``).
 
-Declared to the host through the same path a plugin package uses
-(``plugin_host.declare_seams``, entry point group ``atom.seam_specs``): the host
-itself knows no model's seams. These move with the plugin model.
+ATOM declares no model's seams; plugin_poc's V4.1 model declares these through
+entry point group ``atom.seam_specs``. The host and recipe tests exercise the
+routing with this copy (the call sites they name are ATOM's shared ops).
 """
 
 from __future__ import annotations

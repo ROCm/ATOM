@@ -132,9 +132,9 @@ def _seam(
     )
 
 
-# The seam table is a registry: the host declares no model's seams. A model
-# package declares its own (``declare_seams``; entry point group
-# ``atom.seam_specs``), the V4.1 plugin model through ``atom.plugin_seams_v41``.
+# The seam table is a registry: the host declares no model's seams (only its
+# own model-agnostic ``model.install``). A model package declares its own
+# (``declare_seams``; entry point group ``atom.seam_specs``).
 SEAM_SPEC_GROUP = "atom.seam_specs"
 _SEAM_SPECS: dict[str, SeamSpec] = {}
 _SEAM_SOURCES: dict[str, str] = {}  # seam -> who declared it
@@ -147,7 +147,8 @@ _SLOT_TO_SEAM: dict[str, str] = {}
 SEAM_TO_MODULE_SLOT = MappingProxyType(_SEAM_TO_SLOT)
 MODULE_SLOT_TO_SEAM = MappingProxyType(_SLOT_TO_SEAM)
 _NAME_RE = re.compile(r"^[a-z0-9_]+(\.[a-z0-9_]+)+$")
-_BUILTIN_SEAM_MODULES = ("atom.plugin_seams_v41",)
+# No model's seams are built in: a model package declares its own.
+_BUILTIN_SEAM_MODULES: tuple[str, ...] = ()
 # Model-agnostic seams of the host itself (frozen HOOK_API surface).
 MODEL_INSTALL = "model.install"
 
@@ -883,23 +884,9 @@ def span_n(
 
 # -- recipe options and the plugin model ---------------------------------------
 
-# The model ATOM builds for an architecture while a plugin plan (or a hot-plug
-# boot) is in place: its own model with the seams in it. Without a plan ATOM's
-# own model is built, unchanged.
-PLUGIN_MODEL_CLASSES = MappingProxyType(
-    {
-        "DeepseekV41ForCausalLM": (
-            "atom.models.deepseek_v41_plugin.runtime.DeepseekV41PluginRuntimeModel"
-        ),
-    }
-)
-PLUGIN_DRAFT_CLASSES = MappingProxyType(
-    {
-        "DeepseekV41DSparkModel": (
-            "atom.models.deepseek_v41_plugin.dspark.DeepseekV41DSpark"
-        ),
-    }
-)
+# The model ATOM builds while a plugin plan is in place is the recipe's
+# ``model_options.target_model_cls`` / ``draft_model_cls`` (a plugin package's
+# model, with its seams in it); without them ATOM's own model, unchanged.
 
 
 def plugin_model_active() -> bool:
@@ -909,23 +896,17 @@ def plugin_model_active() -> bool:
 
 def model_class_for(arch: str, default: str) -> str:
     """The qualname to build for ``arch``: the recipe's
-    ``model_options.target_model_cls``, else the plugin variant, else ATOM's."""
+    ``model_options.target_model_cls``, else ATOM's."""
     if not plugin_model_active():
         return default
-    explicit = model_options().target_model_cls
-    if explicit:
-        return explicit
-    return PLUGIN_MODEL_CLASSES.get(arch, default)
+    return model_options().target_model_cls or default
 
 
 def draft_model_class_for(arch: str, default: str) -> str:
     """As `model_class_for`, for a draft architecture."""
     if not plugin_model_active():
         return default
-    explicit = model_options().draft_model_cls
-    if explicit:
-        return explicit
-    return PLUGIN_DRAFT_CLASSES.get(arch, default)
+    return model_options().draft_model_cls or default
 
 
 def model_options():
@@ -2365,8 +2346,14 @@ def bind(
     the call's inputs and returning one.
     """
     spec = SEAMS.get(seam)
-    if spec is None or spec.form != "bind":
-        raise KeyError(f"hook API {HOOK_API} has no bound seam {seam!r}")
+    if spec is None:
+        load_seam_specs()
+        spec = SEAMS.get(seam)
+    if spec is None:
+        # No package declares it here: no plan can own it, the call site is native.
+        return native
+    if spec.form != "bind":
+        raise KeyError(f"seam {seam!r} is a {spec.form} seam, not a bound one")
     _bound.add(seam)
     if seam not in _owned and not _hotplug:
         return native
@@ -2398,10 +2385,12 @@ def call(seam: str, native: Callable[..., Any], *inputs: Any, **kwargs: Any) -> 
 
 
 def site(name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    """Declare a whole module-level function as the native of call seam ``name``."""
+    """Declare a whole module-level function as the native of call seam ``name``.
+    The seam is declared by its model package, possibly after this import: the
+    wrapper is native until a plan owns it."""
     spec = SEAMS.get(name)
-    if spec is None or spec.form != "call":
-        raise KeyError(f"hook API {HOOK_API} has no call seam {name!r}")
+    if spec is not None and spec.form != "call":
+        raise KeyError(f"seam {name!r} is a {spec.form} seam, not a call seam")
 
     def decorate(native):
         @functools.wraps(native)
@@ -2583,9 +2572,14 @@ def _aiter_status() -> Any:
         return None
     status_fn = getattr(aiter_plugin, "status", None)
     try:
-        return _jsonable(status_fn()) if callable(status_fn) else None
+        full = status_fn() if callable(status_fn) else None
     except Exception as error:  # noqa: BLE001 -- status is best effort
         return f"error: {type(error).__name__}: {error}"
+    if not isinstance(full, Mapping):
+        return None
+    # The serving view only: what is enabled and whether routing is on.
+    keep = ("enabled", "excluded", "kill_switch", "config_source")
+    return _jsonable({k: full.get(k) for k in keep if k in full})
 
 
 def overhead_probe(

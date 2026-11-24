@@ -215,8 +215,8 @@ _TOY = {
 }
 
 
-def test_the_builtin_v41_seams_are_declared_through_the_registry():
-    assert host._SEAM_SOURCES["v41.block.ffn"] == "atom.plugin_seams_v41"
+def test_the_v41_seams_are_declared_through_the_registry():
+    assert host._SEAM_SOURCES["v41.block.ffn"] == "tests.plugin_v41_seams"
     assert host.SEAM_TO_MODULE_SLOT["v41.block.ffn"] == "layers.*.ffn"
     assert host.MODULE_SLOT_TO_SEAM["mono"] == "v41.mono.install"
     assert "v41.mono.install" in host.boot_only()
