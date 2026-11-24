@@ -497,6 +497,7 @@ mod tests {
         let v41_file = v41.path().join("tokenizer.json");
         let template = v41.path().join("template.jinja");
         std::fs::write(&template, "{{ messages }}").unwrap();
+        let glm = checkpoint("glm_moe_dsa");
         let llama = checkpoint("llama");
         let bare = tempfile::TempDir::new().unwrap();
         std::fs::copy(hf_tokenizer_path(), bare.path().join("tokenizer.json")).unwrap();
@@ -506,6 +507,7 @@ mod tests {
             (v41.path(), None, Some(ChatControls::DeepseekV41)),
             (v41_file.as_path(), None, Some(ChatControls::DeepseekV41)),
             (v41.path(), Some(&template), Some(ChatControls::DeepseekV41)),
+            (glm.path(), None, Some(ChatControls::Glm5)),
             (llama.path(), None, None),
             (bare.path(), None, None),
         ] {
