@@ -2869,14 +2869,19 @@ LEAD_GROUP = re.compile(r"^[\[(]([^\])]{0,60})[\])]")
 _ID_HEAD = (r"^([A-Z]+\d+[a-z]?)(?:-[\w-]+)?(?:\s*[/,]\s*[A-Z]+\d+[a-z]?)*"
             r"(?:\s*\([^)]{0,40}\))?[\s*`_]*")
 BARE_ID = re.compile(_ID_HEAD + r"(?::|—|–|--|-(?!\w)|\s+(?=[a-z])|(?!\w))")
-# After a citation, only the colon forms. `_publish.first_clause` strips `(?:-\d+)?` and
-# `[,:]` and nothing else, so `foo.py:563-569 A5: …` reaches the reader id-led while
-# `README.md:1084, B1-B2 stage before B3-B4` does not -- and B1..B7 and C1..C3 are this
-# codebase's own words (the KV-offload chunk groups at offload/README.md:1084, MTP4's
-# rows at glm52/mono/kernels/op.py:131, deepseek_v4's capture topology in session.py).
-# Reading them with BARE_ID refuses a lawful finding that merely cites a file and then
-# says "C1/C2 rows are swapped", and a refusal is fatal: the only way out is an untrue
-# `-- not reported:`, the trap this gate's own r41 item 1 exists to close.
+# After a citation, only the colon form. `_publish.first_clause` drops the citation, so
+# both `foo.py:563-569 A5: guard missing` and `README.md:1084, B1-B2 stage before B3-B4`
+# reach the reader with an id-shaped word in front -- it draws no distinction between
+# them and is not the thing that does. The distinction is what the reader sees: `A5:` is
+# a bare label, while `B1-B2 stage before B3-B4` is a sentence that happens to start with
+# one of this codebase's own words (the KV-offload chunk groups in
+# atom/kv_transfer/offload/README.md, the MTP4 rows in
+# atom/models/glm52/mono/kernels/op.py, deepseek_v4's capture topology in
+# atom/models/deepseek_v4/mono/session.py). Reading the sentence with BARE_ID refuses a
+# lawful finding, and a refusal here is fatal -- the only way out is an untrue
+# `-- not reported:`, which is the trap the UNREPORTED-FIRE hint below exists to close.
+# `_diff_vocabulary` covers the same class from the other side; this narrowing also
+# holds for a word the diff happens not to contain.
 CITED_ID = re.compile(_ID_HEAD + r":")
 
 
@@ -2888,8 +2893,9 @@ def _diff_vocabulary(diff_text):
     (atom/models/glm52/mono/kernels/op.py) and C3/C4 deepseek_v4's cuda-graph capture
     topology (atom/models/deepseek_v4/mono/session.py). No shape separates `C1` the rule
     from `C1` the row -- that is the lesson of the word lists this gate went through --
-    so ask the diff instead, which is the one thing that is not a guess. The same rule
-    r45 put on CLAIM_IDENT; it was applied there and not here.
+    so ask the diff instead, which is the one thing that is not a guess. `_mentions_symbol`
+    answers the neighbouring question the same way: by what the text actually says, never
+    by what a word looks like.
 
     Weighing the two errors: refusing a lawful finding is FATAL (the way out is an untrue
     `-- not reported:`), while shipping an id-led line is cosmetic. So a word the PR uses
