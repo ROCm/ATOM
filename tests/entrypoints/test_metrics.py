@@ -341,3 +341,26 @@ def test_snapshot_copy_does_not_hold_publication_lock(monkeypatch, operation):
     if operation == "read":
         assert result == ({"revision": 1}, 0, exporter.read()[2])
     assert exporter.read()[1] == 1
+
+
+def test_lazy_tier_and_lookup_pin_counters_are_exported():
+    exporter = AtomMetricsExporter()
+    exporter.update(
+        {
+            "enabled": True,
+            "offload": {
+                "lazy_evicted_unsaved": 5,
+                "lazy_demotions_failed": 2,
+                "lazy_held_blocks": 7,
+                "lookup_pinned_tokens": 384,
+            },
+        }
+    )
+    samples = _samples(exporter.render())
+    for name, value in (
+        ("atom:lmcache_lazy_evicted_unsaved_blocks_total", 5),
+        ("atom:lmcache_lazy_demotions_failed_total", 2),
+        ("atom:lmcache_lazy_held_blocks", 7),
+        ("atom:lmcache_lookup_pinned_tokens", 384),
+    ):
+        assert samples[(name, ())] == value

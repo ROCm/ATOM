@@ -344,6 +344,16 @@ class _AtomMetricsCollector:
                 "Number of tokens saved to LMCache.",
                 offload.get("saved_tokens", 0),
             ),
+            (
+                "atom:lmcache_lazy_evicted_unsaved_blocks",
+                "Lazy policy: unsaved blocks HBM evicted with no clean block left.",
+                offload.get("lazy_evicted_unsaved", 0),
+            ),
+            (
+                "atom:lmcache_lazy_demotions_failed",
+                "Lazy policy: demotions the CPU tier refused or failed.",
+                offload.get("lazy_demotions_failed", 0),
+            ),
         ):
             metric = CounterMetricFamily(name, documentation)
             metric.add_metric([], float(value))
@@ -359,6 +369,16 @@ class _AtomMetricsCollector:
                 "atom:lmcache_saves_pending",
                 "Number of LMCache saves currently in flight.",
                 offload.get("saves_pending", 0),
+            ),
+            (
+                "atom:lmcache_lazy_held_blocks",
+                "Lazy policy: unsaved free blocks held back from HBM eviction.",
+                offload.get("lazy_held_blocks", 0),
+            ),
+            (
+                "atom:lmcache_lookup_pinned_tokens",
+                "Tier tokens pinned by lookups whose load is not dispatched yet.",
+                offload.get("lookup_pinned_tokens", 0),
             ),
         ):
             metric = GaugeMetricFamily(name, documentation)
