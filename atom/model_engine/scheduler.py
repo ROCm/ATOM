@@ -1521,6 +1521,14 @@ class Scheduler:
             if seq.status == SequenceStatus.ABORTED:
                 examined += 1
                 continue
+            if self.block_manager.shared_prefix_pending(seq):
+                # Phase 2 parks it among the prefix waiters until its prefix
+                # lands from another rank's pool. Asking starts that copy, as
+                # a walk below would, so the probe reports what Phase 2 does.
+                lookup_skips -= 1
+                if lookup_skips < 0:
+                    break
+                continue
             if self._head_waits_on_tier_lookup(seq):
                 # Phase 2 skips it until its lookup answers (`prefix_waiters`),
                 # so reporting it prefillable would make the delayer count a

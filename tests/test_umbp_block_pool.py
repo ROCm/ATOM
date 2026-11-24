@@ -255,3 +255,38 @@ def test_a_reserved_null_block_needs_a_private_part():
         assert "block 0" in str(e)
     else:
         raise AssertionError("a share ratio of 1 must refuse a reserved block 0")
+
+
+class _ShortGrant:
+    """A client whose `allocate` grants nothing, as MORI's does when every free
+    slot stays pinned past its wait: it answers OK with fewer slots than
+    `min_count`."""
+
+    def __init__(self, client):
+        self._client = client
+
+    def __getattr__(self, name):
+        return getattr(self._client, name)
+
+    def allocate(self, pool_id, count, min_count):
+        return [], []
+
+
+def test_a_short_umbp_grant_drops_the_demotion(l1):
+    evicted = []
+    pool = make_split(l1, "a", 1, 2, evicted)
+    fill(pool, 11)
+    pool.umbp._client = _ShortGrant(pool.umbp._client)
+    pool.allocate(pool.pop())  # evicts 11; UMBP grants no block to keep it in
+    assert pool.take_block_copies() == ()
+    assert pool.demotions_dropped == 1 and pool.blocks_demoted == 0
+    assert evicted == [11]
+
+
+def test_a_short_umbp_grant_drops_the_write_through_copy(l1):
+    pool = make_split(l1, "a", 2, 2, placement="write_through")
+    pool.umbp._client = _ShortGrant(pool.umbp._client)
+    block_id = fill(pool, 11)
+    assert pool.take_block_copies() == ()
+    assert pool.demotions_dropped == 1 and pool.blocks_written_through == 0
+    assert pool.lookup(11) == block_id  # still served from the private part

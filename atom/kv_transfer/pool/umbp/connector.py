@@ -11,8 +11,10 @@ which block a request gets and what is evicted). Both are the same at every
 share ratio: a ratio of 1 only leaves the private part empty. Every per-step
 transfer hook is a no-op.
 
-Enabled through `kv_transfer_config` (`settings.py`), and combinable with a P/D
-or offload connector under `multi`.
+Enabled through `kv_transfer_config` (`settings.py`), on its own: DeepSeek-V4.1,
+the one model whose pool it can provide, refuses it under `multi`
+(`models/deepseek_v41/config.py`). `multi` forwards the pool hooks to the one
+sub-connector that provides a pool, for a model that composes them later.
 """
 
 from __future__ import annotations
@@ -40,24 +42,21 @@ _SUPPORTED_ARCHITECTURES = ("DeepseekV41ForCausalLM",)
 
 
 def _settings(config: Any) -> UmbpPoolSettings:
-    settings = UmbpPoolSettings.from_transfer_config(
-        getattr(config, "kv_transfer_config", None)
-    )
+    settings = UmbpPoolSettings.from_transfer_config(config.kv_transfer_config)
     _check_supported(config)
     return settings
 
 
 def _check_supported(config: Any) -> None:
     """Refuse at startup what would otherwise fail mid-serving."""
-    hf_config = getattr(config, "hf_config", None)
-    architectures = list(getattr(hf_config, "architectures", None) or ())
-    if hf_config is not None and not set(architectures) & set(_SUPPORTED_ARCHITECTURES):
+    architectures = list(config.hf_config.architectures or ())
+    if not set(architectures) & set(_SUPPORTED_ARCHITECTURES):
         raise ValueError(
             f"the umbp_pool connector supports {', '.join(_SUPPORTED_ARCHITECTURES)}, "
             f"not {architectures}"
         )
     # Under DP attention `tensor_parallel_size` is the attention TP of a rank.
-    if int(getattr(config, "tensor_parallel_size", 1) or 1) > 1:
+    if config.tensor_parallel_size > 1:
         raise ValueError(
             "the umbp_pool connector backs one runner per engine rank: use "
             "data-parallel attention (--enable-dp-attention), not tensor-"

@@ -404,6 +404,12 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
             "implement relocate_state_slots"
         )
 
+    def owned_pool_layout(self):
+        """`(arena, PAGE regions)` of a paged pool this builder allocated
+        itself rather than carving from the runner's buffer, or None. A
+        backend that allocates its own arena (DeepSeek-V4.1) implements it, so
+        a pool-providing connector learns where its blocks are."""
+
     def copy_paged_blocks(self, copies: Sequence[tuple[int, int]]) -> None:
         """Copy whole paged blocks `(source, destination)` on the compute
         stream, before the forward (a split pool demoting a private block into

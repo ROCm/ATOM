@@ -8,7 +8,7 @@ import types
 
 import pytest
 import test_umbp_l1_pool as umbp_tests
-from conftest import MockConfig
+from conftest import MockConfig, _MockHFConfig
 from test_umbp_l1_pool import make_pool
 
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
@@ -32,8 +32,14 @@ def transfer(**extra):
     }
 
 
-def config_with(kv_transfer_config):
-    return types.SimpleNamespace(kv_transfer_config=kv_transfer_config)
+def config_with(kv_transfer_config, architectures=("DeepseekV41ForCausalLM",), tp=1):
+    """A config the connector accepts unless told otherwise: DeepSeek-V4.1
+    under data-parallel attention."""
+    return MockConfig(
+        kv_transfer_config=kv_transfer_config,
+        hf_config=_MockHFConfig(list(architectures)),
+        tensor_parallel_size=tp,
+    )
 
 
 class TestSettings:
@@ -147,11 +153,7 @@ class TestProvidesThePool:
 
 class TestRefusedAtStartup:
     def config(self, architectures, tp=1):
-        return types.SimpleNamespace(
-            kv_transfer_config=transfer(),
-            hf_config=types.SimpleNamespace(architectures=architectures),
-            tensor_parallel_size=tp,
-        )
+        return config_with(transfer(), architectures, tp)
 
     def test_a_model_without_the_pool_layout(self):
         with pytest.raises(ValueError, match="supports"):
@@ -163,3 +165,39 @@ class TestRefusedAtStartup:
 
     def test_deepseek_v41_under_dp_attention(self):
         UmbpPoolConnectorScheduler(self.config(["DeepseekV41ForCausalLM"]))
+
+
+class TestShareCacheRouting:
+    """`--dp-load-balance share_cache` over a pool the ranks share: no offload
+    tier, but a rank loads a prefix another rank holds from its pool."""
+
+    def build(self, kv_transfer_config):
+        from threading import Lock
+
+        from atom.model_engine.dp_routing.backlog import BacklogLedger
+        from atom.model_engine.engine_core_mgr import CoreManager
+
+        mgr = CoreManager.__new__(CoreManager)
+        mgr.local_engine_count = mgr.global_engine_count = 2
+        mgr._rank_tokens = [0, 0]
+        mgr._seq_load = {}
+        mgr._lb_lock = Lock()
+        mgr._backlog = BacklogLedger(2)
+        mgr._dp_session_affinity_enabled = False
+        mgr._dp_lb_strategy = "share_cache"
+        mgr._dp_lb_req_equiv = 512
+        cfg = config_with(kv_transfer_config)
+        cfg.dp_load_balance = "share_cache"
+        cfg.enable_prefix_caching = True
+        return mgr._build_prefix_router(cfg)
+
+    def test_the_router_counts_on_other_ranks_pools(self):
+        from atom.model_engine.dp_routing.share_cache import ShareCacheRouter
+
+        router = self.build(transfer())
+        assert isinstance(router, ShareCacheRouter)
+        assert router.tier.loads and router.tier.min_load_tokens == 0
+
+    def test_without_fetching_there_is_nothing_to_route_on(self):
+        with pytest.raises(ValueError, match="shares and loads from"):
+            self.build(transfer(fetch=False))

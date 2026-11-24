@@ -470,8 +470,10 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
 
     def allocate_per_req_cache(self, entries):
         # The arena is allocated here rather than carved from the runner's
-        # paged buffer (`paged_pool_bytes` is zero), so this is where the
-        # runner's memory provider has to be asked for it.
+        # paged buffer (`paged_pool_bytes` is zero), so this is where a pool a
+        # KV connector provides has to be taken from. ATOM's own pool keeps
+        # the cache's allocations as they are.
+        memory = self.model_runner._kv_pool_memory()
         self.cache = PagedAttentionCache(
             self.geometry,
             self.num_blocks,
@@ -480,7 +482,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             max_tokens=self.max_num_batched_tokens,
             workspace=self.score_workspace,
             prefill_window_staging=self._prefill_window_staging,
-            allocate_backing=self.model_runner._kv_pool_memory().allocate,
+            allocate_backing=memory.allocate if memory.single_allocation else None,
         )
         self.copies = StateCopies(
             self.cache, self.model_runner.state_runtime.checkpoint_spec, self.max_bs
@@ -498,16 +500,16 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         from atom.kv_transfer.disaggregation.types import KVTransferRegion
 
         cache = self.cache
-        if cache is None:
+        # `arena` is the one allocation a connector's memory handed out (the
+        # BF16 arena, or the slab the quantized source buffers are cut from);
+        # None when the pool is ATOM's own.
+        if cache is None or cache.arena is None:
             return None
         regions = [
             KVTransferRegion(base, cache.num_pages * unit, unit)
             for base, unit in cache.unit_regions()
         ]
-        # The one allocation the pool memory handed out: the BF16 arena, or
-        # the slab the quantized pool's source buffers are cut from.
-        arena = cache.arena if cache.arena is not None else cache.backing
-        return arena, regions
+        return cache.arena, regions
 
     def copy_paged_blocks(self, copies):
         """Every region of a PAGE unit (`unit_regions`: its main pages and its

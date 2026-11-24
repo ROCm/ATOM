@@ -84,8 +84,7 @@ def _connect(settings: UmbpPoolSettings):
 
 def pool_id_for(config, settings: UmbpPoolSettings, rank: int = 0) -> str:
     """The name both processes of one engine rank know their pool by."""
-    parallel = getattr(config, "parallel_config", None)
-    dp_rank = getattr(parallel, "data_parallel_rank", 0) or 0
+    dp_rank = config.parallel_config.data_parallel_rank
     return f"{settings.namespace}:dp{dp_rank}:tp{rank}"
 
 
@@ -100,27 +99,16 @@ def share_group_for(config, settings: UmbpPoolSettings) -> str:
     """
     if settings.group:
         return settings.group
-    spec = getattr(config, "speculative_config", None)
+    spec = config.speculative_config
     facts = {
-        "model": str(getattr(config, "model", "")),
-        "kv_cache_dtype": str(getattr(config, "kv_cache_dtype", "")),
-        "index_cache_dtype": str(getattr(config, "index_cache_dtype", "")),
-        "block_size": int(getattr(config, "kv_cache_block_size", 0) or 0),
+        "model": str(config.model),
+        "kv_cache_dtype": str(config.kv_cache_dtype),
+        "index_cache_dtype": str(config.index_cache_dtype),
+        "block_size": int(config.kv_cache_block_size),
         "online_quant": json.dumps(
-            getattr(
-                getattr(config, "quant_config", None), "online_quant_config_raw", None
-            ),
-            sort_keys=True,
-            default=str,
+            config.quant_config.online_quant_config_raw, sort_keys=True, default=str
         ),
-        "draft": (
-            None
-            if spec is None
-            else [
-                str(spec.get(k) if isinstance(spec, dict) else getattr(spec, k, None))
-                for k in ("method", "model")
-            ]
-        ),
+        "draft": None if spec is None else [str(spec.method), str(spec.model)],
     }
     digest = hashlib.sha1(json.dumps(facts, sort_keys=True).encode()).hexdigest()
     return f"atom-{digest[:16]}"
@@ -203,6 +191,10 @@ class UmbpL1Pool(KVBlockPool):
         self._clear_generation = 0
 
     # ------------------------------- counts -------------------------------- #
+    @property
+    def num_usable_blocks(self) -> int:
+        return self.num_blocks  # UMBP's part reserves no block
+
     @property
     def num_free(self) -> int:
         return self.num_blocks - len(self._used)
@@ -868,6 +860,10 @@ class UmbpBlockPool(KVBlockPool):
 
     # ------------------------------- counts -------------------------------- #
     @property
+    def num_usable_blocks(self) -> int:
+        return self.private.num_usable_blocks + self.umbp.num_usable_blocks
+
+    @property
     def num_free(self) -> int:
         return self.private.num_free + self.umbp.num_free
 
@@ -973,12 +969,9 @@ class UmbpBlockPool(KVBlockPool):
         """Copy private block `block_id` (content `h`) into a UMBP block."""
         if self.umbp.lookup(h) != -1 or any(e[1] == h for e in self._unissued):
             return
-        try:
-            slot = self.umbp.pop()
-        except AssertionError:  # every UMBP block is held: skip this one
-            self.demotions_dropped += 1
+        slot = self._take_umbp_slot()
+        if slot is None:
             return
-        self.umbp.allocate(slot)
         self._copies.append((block_id, slot + self.offset))
         self._unissued.append(
             (slot, h, array.array("i", token_ids), self._clear_generation)
@@ -1029,16 +1022,27 @@ class UmbpBlockPool(KVBlockPool):
         """Keep the content `block_id` is about to lose in a UMBP block."""
         if self.umbp.lookup(h) != -1:
             return  # already in the UMBP part
-        if not self.umbp.num_free:
-            self.demotions_dropped += 1
+        slot = self._take_umbp_slot()
+        if slot is None:
             return
-        slot = self.umbp.pop()
-        self.umbp.allocate(slot)
         self._copies.append((block_id, slot + self.offset))
         self._unissued.append(
             (slot, h, array.array("i", token_ids), self._clear_generation)
         )
         self.blocks_demoted += 1
+
+    def _take_umbp_slot(self) -> int | None:
+        """A UMBP block, taken, for a copy out of the private part; None (a
+        dropped copy, counted) when UMBP grants none. It can grant fewer blocks
+        than asked even with some free: one that stays pinned past its wait is
+        not handed out, and `pop` then has nothing to give."""
+        try:
+            slot = self.umbp.pop()
+        except AssertionError:
+            self.demotions_dropped += 1
+            return None
+        self.umbp.allocate(slot)
+        return slot
 
     def _keep(self, slot: int, h: int, token_ids: array.array) -> None:
         """UMBP is reclaiming UMBP block `slot`: keep its content `h` in a

@@ -68,6 +68,12 @@ class KVBlockPool(ABC):
     # ------------------------------- counts -------------------------------- #
     @property
     @abstractmethod
+    def num_usable_blocks(self) -> int:
+        """Blocks that can be handed out: `num_blocks` less a reserved null
+        block, what capacity checks compare a request against."""
+
+    @property
+    @abstractmethod
     def num_free(self) -> int: ...
 
     @property
@@ -226,6 +232,11 @@ class KVPoolMemory(ABC):
     #: Whether other engine ranks can read and fill blocks of this pool.
     shares_blocks: bool = False
 
+    #: Whether the pool has to be one allocation, addressed by offset (a
+    #: backend that adopts it whole). A builder that allocates its arena in
+    #: parts takes them all from one `allocate` then.
+    single_allocation: bool = True
+
     @abstractmethod
     def allocate(self, nbytes: int, device: torch.device) -> torch.Tensor:
         """A zero-filled `uint8` buffer of `nbytes` on `device`."""
@@ -256,6 +267,8 @@ class KVPoolMemory(ABC):
 
 class LocalPoolMemory(KVPoolMemory):
     """The pool is a tensor this process allocates."""
+
+    single_allocation = False
 
     def allocate(self, nbytes: int, device: torch.device) -> torch.Tensor:
         import torch

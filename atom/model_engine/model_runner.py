@@ -871,6 +871,9 @@ class ModelRunner:
         self.tp_world_size = config.tp_world_size
         self.rank = rank
         self.label = f"Model Runner{rank}/{self.tp_world_size}"
+        # Where the paged pool's bytes come from, resolved on first use
+        # (`_kv_pool_memory`).
+        self._kv_pool_memory_provider = None
         self._dynamic_chunking = DynamicChunkingWorker(self)
         self.hf_text_config = get_hf_text_config(hf_config)
         if self.hf_text_config.model_type in ["llama"] and self.config.torch_dtype in [
@@ -2307,7 +2310,7 @@ class ModelRunner:
         """Where the paged pool's bytes come from: the KV connector's provider
         if it takes the pool over (`KVConnectorBase.kv_pool_memory`), else this
         process's own allocation."""
-        memory = getattr(self, "_kv_pool_memory_provider", None)
+        memory = self._kv_pool_memory_provider
         if memory is None:
             from atom.model_engine.kv_block_pool import make_pool_memory
 
@@ -2460,8 +2463,7 @@ class ModelRunner:
             # from the same provider in `allocate_per_req_cache` and names
             # its PAGE regions itself: its transfer tensors exist only under a
             # kv_transfer_config.
-            owned = getattr(self.attn_metadata_builder, "owned_pool_layout", None)
-            layout = owned() if callable(owned) else None
+            layout = self.attn_metadata_builder.owned_pool_layout()
             if layout is not None:
                 self._kv_pool_memory().bind_layout(*layout, num_kvcache_blocks)
         # The same count reaches the codecs, which likewise index by scheduler

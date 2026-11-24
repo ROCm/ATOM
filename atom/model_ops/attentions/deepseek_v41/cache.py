@@ -46,6 +46,21 @@ from .metadata import prepare_batch_step
 from .speculative import TentativeState
 
 
+def cut_slab(allocate, sizes, align=1):
+    """One allocation cut into consecutive views of `sizes`: `(slab, views)`.
+
+    Each view starts at a multiple of `align`; `allocate(n)` returns the slab
+    of `n` bytes. For a frontend that owns the pool as a single allocation
+    while the cache's quantized layout wants one source buffer per part.
+    """
+    starts, end = [], 0
+    for size in sizes:
+        starts.append(end)
+        end += -(-size // align) * align
+    slab = allocate(end)
+    return slab, tuple(slab[start : start + size] for start, size in zip(starts, sizes))
+
+
 class PagedAttentionCache:
     def _allocate_backing(self, size, device):
         """BF16's flat arena, or a frontend-owned slab for source buffers.
@@ -59,8 +74,8 @@ class PagedAttentionCache:
         elements.
 
         `allocate_backing` is that override for a caller that cannot subclass:
-        the serving cache takes its arena from the runner's `KVPoolMemory`, so
-        a pool another process owns (UMBP) backs PAGE and STATE alike.
+        a pool-providing KV connector's memory (UMBP), which then backs PAGE
+        and STATE alike. Without it the cache allocates as it always has.
         """
         if self._allocate_external is not None:
             self.arena = self._allocate_external(size, torch.device(device))
@@ -73,24 +88,20 @@ class PagedAttentionCache:
     def _allocate_buffers(self, sizes, device):
         """The quantized pool's separate source buffers.
 
-        Taken from one external arena when `allocate_backing` is set: a pool
-        another process manages is one allocation it addresses by offset, so
-        the buffers are aligned slices of it rather than allocations of their
-        own.
+        Cut from one arena when `allocate_backing` is set: a pool another
+        process manages is one allocation it addresses by offset, so the
+        buffers are aligned slices of it rather than allocations of their own.
         """
         if self._allocate_external is None:
             return tuple(
                 torch.zeros(size, dtype=torch.uint8, device=device) for size in sizes
             )
-        align = self._BUFFER_ALIGN
-        starts, end = [], 0
-        for size in sizes:
-            starts.append(end)
-            end += -(-size // align) * align
-        self.arena = self._allocate_external(end, torch.device(device))
-        return tuple(
-            self.arena[start : start + size] for start, size in zip(starts, sizes)
+        self.arena, views = cut_slab(
+            lambda n: self._allocate_external(n, torch.device(device)),
+            sizes,
+            self._BUFFER_ALIGN,
         )
+        return views
 
     def _allocate_quantized(self, device):
         g, pages, slots = self.geometry, self.num_pages, self.num_slots

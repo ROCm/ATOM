@@ -252,7 +252,7 @@ class KVConnectorFactory:
                 continue
             module, attr = target.split(":", 1)
             return getattr(importlib.import_module(module), attr)(
-                getattr(sub, "kv_transfer_config", None) or {}
+                sub.kv_transfer_config
             )
         return None
 
