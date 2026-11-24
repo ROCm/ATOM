@@ -373,6 +373,10 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """
         return StateTransfer.none()
 
+    def state_transfer_slots(self) -> int:
+        """State slots past the live ones, kept for a P/D producer's pushes."""
+        return 0
+
     def checkpoint_image_bytes(self) -> int | None:
         """Bytes of an Active Slot a checkpoint image has to hold.
 

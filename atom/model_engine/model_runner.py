@@ -59,6 +59,7 @@ from atom.kv_transfer.disaggregation import (
     KVConnectorOutput,
     kv_config_has_producer,
 )
+from atom.kv_transfer.disaggregation.factory import warn_unsized_state_transfer_slots
 from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
 from atom.model_engine.dynamic_chunking_worker import DynamicChunkingWorker
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
@@ -2122,6 +2123,16 @@ class ModelRunner:
         self.pool_plan = plan
         config.pool_entries = dict(plan.entries)
         config.pool_entries_per_req = dict(plan.entries_per_req)
+        # Read by BlockManager (shipped below) and by a producer's connector.
+        config.state_transfer_slots = self.attn_metadata_builder.state_transfer_slots()
+        warn_unsized_state_transfer_slots(
+            config.kv_transfer_config, config.state_transfer_slots
+        )
+        if config.state_transfer_slots:
+            # Main's dispatch otherwise; the RPC resolves the method by name.
+            self.process_kvconnector_output = (
+                self._process_kvconnector_output_relocating
+            )
         # Keep runtime state metadata out of Config.
         transfer = self.attn_metadata_builder.state_transfer()
         uses_paged_state = transfer.copies
@@ -2265,6 +2276,7 @@ class ModelRunner:
             "pool_entries": dict(plan.entries),
             "pool_entry_bytes": dict(plan.entry_bytes),
             "pool_entries_per_req": dict(plan.entries_per_req),
+            "state_transfer_slots": config.state_transfer_slots,
             "state_runtime": state_runtime.to_wire(),
         }
 
@@ -3891,11 +3903,26 @@ class ModelRunner:
 
     @torch.inference_mode()
     def process_kvconnector_output(self, connector_meta_output):
-        """Dispatch KV connector metadata to initiate async KV loading."""
+        """Dispatch KV connector metadata to initiate async KV loading. A P/D
+        producer with state transfer slots runs the relocating variant below."""
         if connector_meta_output is not None:
             connector = get_kvconnector()
             if connector is not None:
                 connector.start_load_kv(connector_meta_output)
+
+    @torch.inference_mode()
+    def _process_kvconnector_output_relocating(self, connector_meta_output):
+        """`process_kvconnector_output` for a producer with state transfer slots
+        (bound at sizing): copy the step's staged state, then dispatch."""
+        if connector_meta_output is not None:
+            connector = get_kvconnector()
+            stages = connector_meta_output.state_stages
+            if stages:
+                # Ahead of the next forward on this stream, which may reuse
+                # the live slots these copies read.
+                self.attn_metadata_builder.relocate_state_slots(list(stages.values()))
+                connector.note_state_stages(stages)
+            connector.start_load_kv(connector_meta_output)
 
     @torch.inference_mode()
     def async_proc_aggregation(self) -> KVConnectorOutput:
