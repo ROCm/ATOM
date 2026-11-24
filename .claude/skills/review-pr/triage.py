@@ -2863,9 +2863,12 @@ def _same_file(a, b):
 
 LEAD_NOISE = re.compile(r"^[\s*`_]+")
 LEAD_GROUP = re.compile(r"^[\[(]([^\])]{0,60})[\])]")
-BARE_ID = re.compile(r"^([A-Z]+\d+[a-z]?)(?:-[\w-]+)?(?:\s*[/,]\s*[A-Z]+\d+[a-z]?)*"
-                     r"(?:\s*\([^)]{0,40}\))?[\s*`_]*"
-                     r"(?::|—|–|--|-(?!\w)|\s+(?=[a-z])|(?!\w))")
+# The id itself, with the sub-type, the `A5/B1` list and the `(silent bypass)` aside it
+# can carry. Written once: the two readers below differ only in what they accept AFTER
+# it, and a second copy is a second thing to keep in step.
+_ID_HEAD = (r"^([A-Z]+\d+[a-z]?)(?:-[\w-]+)?(?:\s*[/,]\s*[A-Z]+\d+[a-z]?)*"
+            r"(?:\s*\([^)]{0,40}\))?[\s*`_]*")
+BARE_ID = re.compile(_ID_HEAD + r"(?::|—|–|--|-(?!\w)|\s+(?=[a-z])|(?!\w))")
 # After a citation, only the colon forms. `_publish.first_clause` strips `(?:-\d+)?` and
 # `[,:]` and nothing else, so `foo.py:563-569 A5: …` reaches the reader id-led while
 # `README.md:1084, B1-B2 stage before B3-B4` does not -- and B1..B7 and C1..C3 are this
@@ -2874,8 +2877,7 @@ BARE_ID = re.compile(r"^([A-Z]+\d+[a-z]?)(?:-[\w-]+)?(?:\s*[/,]\s*[A-Z]+\d+[a-z]
 # Reading them with BARE_ID refuses a lawful finding that merely cites a file and then
 # says "C1/C2 rows are swapped", and a refusal is fatal: the only way out is an untrue
 # `-- not reported:`, the trap this gate's own r41 item 1 exists to close.
-CITED_ID = re.compile(r"^([A-Z]+\d+[a-z]?)(?:-[\w-]+)?(?:\s*[/,]\s*[A-Z]+\d+[a-z]?)*"
-                      r"(?:\s*\([^)]{0,40}\))?[\s*`_]*:")
+CITED_ID = re.compile(_ID_HEAD + r":")
 
 
 def _rule_head(text):
