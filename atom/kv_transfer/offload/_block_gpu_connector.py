@@ -206,13 +206,14 @@ class BlockGPUConnector:
         virtual_block_size: int | None = None,
         source_safe_callback: Callable[[SaveSourceGroupId], None] | None = None,
         max_staging_bytes: int | None = None,
-        chunk_bytes: Callable[[int], int] | None = None,
     ) -> None:
         self.codec = codec
-        # Bytes a chunk of n blocks stages and stores: n of the codec's blocks,
-        # unless the codec's chunks are not uniform (a sharded index cache's,
-        # `hybrid/m3/codec.py`), whose own rule it is then.
-        self._chunk_bytes = chunk_bytes or (lambda n: n * codec.bytes_per_block)
+        # Bytes a chunk stores: its blocks' `bytes_per_block`, unless the codec
+        # sizes each chunk by its blocks (`chunk_nbytes`: a sharded index cache
+        # keeps only its own blocks' rows, `hybrid/m3/codec.py`), which then
+        # also lays out a group's staging buffer (`staging_layout`) and bounds
+        # a chunk of n blocks (`max_chunk_bytes`).
+        self._exact_chunks = callable(getattr(codec, "chunk_nbytes", None))
         self.physical_block_size = int(block_size)
         if self.physical_block_size <= 0:
             raise ValueError("ATOM LMCache connector: block_size must be > 0")
@@ -245,8 +246,10 @@ class BlockGPUConnector:
                 f"virtual_block_size={self.virtual_block_size}"
             )
         self._blocks_per_lmcache_chunk = self.chunk_size // self.block_size
-        self._gpu_staging_chunk_bytes = self._chunk_bytes(
-            self._blocks_per_lmcache_chunk
+        self._gpu_staging_chunk_bytes = (
+            codec.max_chunk_bytes(self._blocks_per_lmcache_chunk)
+            if self._exact_chunks
+            else self._blocks_per_lmcache_chunk * codec.bytes_per_block
         )
         if self._gpu_staging_chunk_bytes <= 0:
             raise ValueError(
@@ -582,6 +585,25 @@ class BlockGPUConnector:
             for start, end in zip(starts, ends, strict=True)
         ]
 
+    def chunk_nbytes(self, block_ids: list[int]) -> int:
+        """Bytes the chunk of ``block_ids`` stores (see ``__init__``)."""
+        if self._exact_chunks:
+            return int(self.codec.chunk_nbytes(block_ids))
+        return len(block_ids) * self.codec.bytes_per_block
+
+    def chunk_shapes(
+        self, starts: list[int], ends: list[int], **kwargs
+    ) -> list[torch.Size] | None:
+        """The exact LMCache allocation of each chunk ``[starts[i], ends[i])``
+        of ``block_ids``, or None when every chunk of a size is alike (the
+        metadata's ``get_shapes`` is then exact)."""
+        if not self._exact_chunks:
+            return None
+        return [
+            torch.Size((self.chunk_nbytes(ids),))
+            for ids in self._ranges_to_block_ids(starts, ends, **kwargs)
+        ]
+
     def _iter_transfer_chunks(
         self,
         memory_objs: list[Any],
@@ -596,7 +618,7 @@ class BlockGPUConnector:
             block_count = len(block_ids)
             if block_count == 0:
                 continue
-            nbytes = self._chunk_bytes(block_count)
+            nbytes = self.chunk_nbytes(block_ids)
             if nbytes > self._gpu_staging_chunk_bytes:
                 raise ValueError(
                     "ATOM LMCache connector: single MemoryObj exceeds bounded "
@@ -783,11 +805,32 @@ class BlockGPUConnector:
                 else "blocking_host_copy_chunks"
             )
             stats[name] += len(hosts)
-        views = list(staging.split([chunk.nbytes for chunk in group.chunks]))
+        hosts, views = self._group_pieces(group, staging, hosts)
         if to_staging:
             torch._foreach_copy_(views, hosts, non_blocking=non_blocking)
         else:
             torch._foreach_copy_(hosts, views, non_blocking=non_blocking)
+
+    def _group_pieces(
+        self, group: _TransferGroup, staging: torch.Tensor, hosts: list[torch.Tensor]
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """``(host pieces, staging pieces)`` to copy pairwise: a chunk's whole
+        bytes at its place in the group's buffer, or, for a codec with a
+        `staging_layout`, the pieces it puts where."""
+        if not self._exact_chunks:
+            return hosts, list(staging.split([chunk.nbytes for chunk in group.chunks]))
+        sizes, pieces = self.codec.staging_layout(self._group_block_ids(group))
+        views = staging[: sum(sizes)].split(sizes)
+        host_pieces: list[torch.Tensor] = [None] * len(sizes)  # type: ignore[list-item]
+        for host, chunk_pieces in zip(hosts, pieces):
+            if len(chunk_pieces) == 1:
+                host_pieces[chunk_pieces[0]] = host
+                continue
+            for index, part in zip(
+                chunk_pieces, host.split([sizes[i] for i in chunk_pieces])
+            ):
+                host_pieces[index] = part
+        return host_pieces, list(views)
 
     def _slice_to_memory_objs(
         self,
@@ -804,17 +847,23 @@ class BlockGPUConnector:
                 prepared_ids_active=prepared_ids_active,
             )
             return
-        offset = 0
-        for chunk in group.chunks:
-            chunk.tensor.copy_(
-                src_buf[offset : offset + chunk.nbytes],
+        hosts = [chunk.tensor for chunk in group.chunks]
+        if self._exact_chunks:
+            hosts, views = self._group_pieces(group, src_buf, hosts)
+        else:
+            views, offset = [], 0
+            for chunk in group.chunks:
+                views.append(src_buf[offset : offset + chunk.nbytes])
+                offset += chunk.nbytes
+        for host, view in zip(hosts, views):
+            host.copy_(
+                view,
                 non_blocking=self._non_blocking_memory_copy(
-                    chunk.tensor,
+                    host,
                     src_buf,
                     prepared_ids_active=prepared_ids_active,
                 ),
             )
-            offset += chunk.nbytes
 
     def _memory_objs_to_slice(
         self,
@@ -831,17 +880,23 @@ class BlockGPUConnector:
                 prepared_ids_active=prepared_ids_active,
             )
             return
-        offset = 0
-        for chunk in group.chunks:
-            dst_buf[offset : offset + chunk.nbytes].copy_(
-                chunk.tensor,
+        hosts = [chunk.tensor for chunk in group.chunks]
+        if self._exact_chunks:
+            hosts, views = self._group_pieces(group, dst_buf, hosts)
+        else:
+            views, offset = [], 0
+            for chunk in group.chunks:
+                views.append(dst_buf[offset : offset + chunk.nbytes])
+                offset += chunk.nbytes
+        for host, view in zip(hosts, views):
+            view.copy_(
+                host,
                 non_blocking=self._non_blocking_memory_copy(
-                    chunk.tensor,
+                    host,
                     dst_buf,
                     prepared_ids_active=prepared_ids_active,
                 ),
             )
-            offset += chunk.nbytes
 
     def _prepare_transfer(
         self,
