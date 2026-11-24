@@ -11,7 +11,7 @@ from conftest import gpu_stack_import
 dispatch = gpu_stack_import("atom.model_ops.fla_ops.replayssm_dispatch")
 
 
-def _args(heads=12, window=5, device="cpu", width=128):
+def _args(heads=12, window=5, device="cpu", width=128, ckpt_dtype=torch.float32):
     tokens, slots, cap = 2 * window, 3, 16
     args = {
         name: torch.randn(1, tokens, heads, width, device=device, dtype=torch.bfloat16)
@@ -24,7 +24,9 @@ def _args(heads=12, window=5, device="cpu", width=128):
         ],
         A_log=torch.zeros(heads, device=device),
         dt_bias=torch.zeros(heads * width, device=device),
-        ckpt=torch.randn(slots, heads, width, width, device=device) * 0.1,
+        ckpt=(torch.randn(slots, heads, width, width, device=device) * 0.1).to(
+            ckpt_dtype
+        ),
         buf_k=F.normalize(
             torch.randn(slots, heads, cap, width, device=device), dim=-1
         ).bfloat16(),
@@ -95,12 +97,16 @@ def test_old_aiter_import(monkeypatch):
         return original(name, *args, **kwargs)
 
     dispatch._get_aiter_replayssm.cache_clear()
+    dispatch._aiter_ckpt_dtypes.cache_clear()
     try:
         with monkeypatch.context() as patch:
             patch.setattr(builtins, "__import__", missing)
             assert dispatch._get_aiter_replayssm() is None
+            # No AITER ReplaySSM: only FP32 checkpoints are ever routed.
+            assert dispatch._aiter_ckpt_dtypes() == (torch.float32,)
     finally:
         dispatch._get_aiter_replayssm.cache_clear()
+        dispatch._aiter_ckpt_dtypes.cache_clear()
 
 
 def _entry():
@@ -314,7 +320,8 @@ def test_gpu_unsupported_metadata(case):
     _gpu()
     args = _args(device="cuda", width=64 if case == "width" else 128)
     if case == "checkpoint_dtype":
-        args["ckpt"] = args["ckpt"].bfloat16()
+        # No AITER takes an FP64 checkpoint, whatever it advertises.
+        args["ckpt"] = args["ckpt"].double()
     elif case == "checkpoint_layout":
         args["ckpt"] = args["ckpt"].transpose(-1, -2)
     elif case == "records_layout":
@@ -352,3 +359,73 @@ def test_gpu_unsupported_metadata(case):
             )
         )
     )
+
+
+_SUPPORTED_ARGS = (
+    "q",
+    "k",
+    "v",
+    "a",
+    "b",
+    "A_log",
+    "dt_bias",
+    "ckpt",
+    "buf_k",
+    "buf_u",
+    "buf_g",
+    "write_pos",
+    "slot_idx",
+    "cu_seqlens",
+    "max_query_len",
+    "o",
+)
+
+
+@pytest.mark.parametrize(
+    "advertised",
+    [(torch.float32,), (torch.float32, torch.float16, torch.bfloat16)],
+    ids=["fp32-only-aiter", "16bit-aiter"],
+)
+@pytest.mark.parametrize("ckpt_dtype", [torch.float16, torch.bfloat16])
+def test_gpu_16bit_checkpoint_follows_aiter(ckpt_dtype, advertised, monkeypatch):
+    _gpu()
+    args = _args(device="cuda", ckpt_dtype=ckpt_dtype)
+    monkeypatch.setattr(dispatch, "_aiter_ckpt_dtypes", lambda: advertised)
+    assert dispatch._supported(*(args[k] for k in _SUPPORTED_ARGS)) is (
+        ckpt_dtype in advertised
+    )
+
+
+@pytest.mark.parametrize("ckpt_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("heads", [12, 96])
+@pytest.mark.parametrize("fork", [False, True])
+def test_gpu_16bit_checkpoint_on_aiter(ckpt_dtype, heads, fork, monkeypatch):
+    _gpu()
+    if ckpt_dtype not in dispatch._aiter_ckpt_dtypes():
+        pytest.skip("this AITER ReplaySSM takes FP32 checkpoints only")
+    native = _entry()
+    monkeypatch.setenv("ATOM_USE_AITER_REPLAYSSM_KDA", "1")
+    torch.manual_seed(11)
+    args = _args(heads=heads, device="cuda", ckpt_dtype=ckpt_dtype)
+    fork_slots = torch.tensor([[2], [1]], device="cuda") if fork else None
+    expected = _reference(args, fork_slots)
+    calls = []
+    backend = dispatch._get_aiter_replayssm()
+
+    def counted(**kw):
+        calls.append(1)
+        return backend(**kw)
+
+    monkeypatch.setattr(dispatch, "_get_aiter_replayssm", lambda: counted)
+    native.replayssm_sigmoid_gating_delta_rule(**args, fork_slots=fork_slots)
+    assert calls == [1]
+    assert args["ckpt"].dtype == ckpt_dtype
+    # A flushed 16-bit checkpoint may differ from the reference by one unit in the last place.
+    ckpt_tol = {torch.float16: 1e-3, torch.bfloat16: 1e-2}[ckpt_dtype]
+    for key, want, atol, rtol in zip(
+        ("o", "ckpt", "buf_k", "buf_u", "buf_g"),
+        expected,
+        (2e-3, ckpt_tol, 1e-3, 2e-3, 1e-5),
+        (2e-2, ckpt_tol, 1e-2, 2e-2, 1e-5),
+    ):
+        torch.testing.assert_close(args[key], want, atol=atol, rtol=rtol)
