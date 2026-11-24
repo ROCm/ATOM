@@ -1,7 +1,7 @@
 //! PD load accounting and credential forwarding to prefill and decode workers.
 use super::*;
 use crate::{
-    core::{BasicWorkerBuilder, WorkerType},
+    core::{BasicWorkerBuilder, DPAwareWorkerBuilder, WorkerType},
     policies::{DpStickyPolicy, LoadBalancingPolicy, SelectWorkerInfo},
 };
 use axum::{routing::post, Router};
@@ -141,21 +141,30 @@ fn dispatch_with_headers(
     dispatch_with_policy(kind, p, d, streaming, headers, None, None)
 }
 
+/// A pool's policy and the binding its selection returned.
+type Placed = Option<(Arc<dyn LoadBalancingPolicy>, Option<u64>)>;
+
 fn dispatch_with_policy(
     kind: DispatchKind,
     p: &GatedServer,
     d: &GatedServer,
     streaming: bool,
     headers: Option<HeaderMap>,
-    prefill_policy: Option<Arc<dyn LoadBalancingPolicy>>,
-    decode_policy: Option<Arc<dyn LoadBalancingPolicy>>,
+    prefill_policy: Placed,
+    decode_policy: Placed,
 ) -> JoinHandle<Response> {
     let mut router = tests::create_test_pd_router();
-    if let Some(policy) = prefill_policy {
+    // As ATOM PD runs in CI; it maps only DP-aware workers.
+    router.atom_pd_rank_mapping_policy = AtomPdRankMappingPolicy::Idx2Idx;
+    let mut prefill_binding = None;
+    let mut decode_binding = None;
+    if let Some((policy, binding)) = prefill_policy {
         router.policy_registry.set_prefill_policy(policy);
+        prefill_binding = binding;
     }
-    if let Some(policy) = decode_policy {
+    if let Some((policy, binding)) = decode_policy {
         router.policy_registry.set_decode_policy(policy);
+        decode_binding = binding;
     }
     let prefill = p.worker.clone();
     let decode = d.worker.clone();
@@ -185,6 +194,8 @@ fn dispatch_with_policy(
                     decode,
                     prefill_policy: "round_robin",
                     decode_policy: "round_robin",
+                    prefill_binding,
+                    decode_binding,
                 },
                 headers.as_ref(),
             )
@@ -649,8 +660,8 @@ async fn dispatch_hooks_wait_until_the_new_decode_receives_a_request() {
             bootstrap_port: None,
         })
     };
-    let session_request = |p: &GatedServer, d: &GatedServer| {
-        let policy = Some(policy.clone());
+    let session_request = |p: &GatedServer, d: &GatedServer, binding: Option<u64>| {
+        let policy = Some((policy.clone(), binding));
         dispatch_with_policy(
             DispatchKind::Atom,
             p,
@@ -662,9 +673,10 @@ async fn dispatch_hooks_wait_until_the_new_decode_receives_a_request() {
         )
     };
 
-    assert_eq!(policy.select_worker(&decode, &info).await, Some(0));
+    let (selected, placed) = policy.select_with_decision(&decode, &info).await;
+    assert_eq!(selected, Some(0));
     let mut p = prefill().await;
-    let task = session_request(&p, &a);
+    let task = session_request(&p, &a, placed.binding);
     p.wait_entered().await;
     p.respond(prefill_response());
     a.wait_entered().await;
@@ -675,9 +687,10 @@ async fn dispatch_hooks_wait_until_the_new_decode_receives_a_request() {
     // A is down, so the session rebinds to B. Neither a failed prefill nor an
     // unexecuted reservation sends anything to B.
     a.worker.set_healthy(false);
-    assert_eq!(policy.select_worker(&decode, &info).await, Some(1));
+    let (selected, placed) = policy.select_with_decision(&decode, &info).await;
+    assert_eq!(selected, Some(1));
     let mut p = prefill().await;
-    let task = session_request(&p, &b);
+    let task = session_request(&p, &b, placed.binding);
     p.wait_entered().await;
     p.respond(StatusCode::SERVICE_UNAVAILABLE.into_response());
     assert!(result(task).await.status().is_server_error());
@@ -689,6 +702,8 @@ async fn dispatch_hooks_wait_until_the_new_decode_receives_a_request() {
             decode: b.worker.clone(),
             prefill_policy: "round_robin",
             decode_policy: "dp_sticky",
+            prefill_binding: None,
+            decode_binding: placed.binding,
         },
         Some(&headers),
     );
@@ -698,9 +713,10 @@ async fn dispatch_hooks_wait_until_the_new_decode_receives_a_request() {
     assert_eq!(decode_dispatches(), 1);
 
     // The first request B receives is compared against A.
-    assert_eq!(policy.select_worker(&decode, &info).await, Some(1));
+    let (selected, placed) = policy.select_with_decision(&decode, &info).await;
+    assert_eq!(selected, Some(1));
     let mut p = prefill().await;
-    let task = session_request(&p, &b);
+    let task = session_request(&p, &b, placed.binding);
     p.wait_entered().await;
     p.respond(prefill_response());
     b.wait_entered().await;
@@ -731,7 +747,8 @@ async fn a_decode_server_error_releases_the_session_binding_and_a_client_error_d
                 ..Default::default()
             };
 
-            assert_eq!(policy.select_worker(&decode, &info).await, Some(0));
+            let (selected, placed) = policy.select_with_decision(&decode, &info).await;
+            assert_eq!(selected, Some(0));
             let task = dispatch_with_policy(
                 kind,
                 &p,
@@ -739,7 +756,7 @@ async fn a_decode_server_error_releases_the_session_binding_and_a_client_error_d
                 false,
                 Some(headers.clone()),
                 None,
-                Some(policy.clone()),
+                Some((policy.clone(), placed.binding)),
             );
             p.wait_entered().await;
             p.respond(prefill_response());
@@ -780,16 +797,18 @@ async fn a_prefill_server_error_releases_only_the_prefill_binding() {
             ..Default::default()
         };
 
-        assert_eq!(prefill_policy.select_worker(&prefill, &info).await, Some(0));
-        assert_eq!(decode_policy.select_worker(&decode, &info).await, Some(0));
+        let (selected, prefill_placed) = prefill_policy.select_with_decision(&prefill, &info).await;
+        assert_eq!(selected, Some(0));
+        let (selected, decode_placed) = decode_policy.select_with_decision(&decode, &info).await;
+        assert_eq!(selected, Some(0));
         let task = dispatch_with_policy(
             kind,
             &p,
             &d,
             false,
             Some(headers.clone()),
-            Some(prefill_policy.clone()),
-            Some(decode_policy.clone()),
+            Some((prefill_policy.clone(), prefill_placed.binding)),
+            Some((decode_policy.clone(), decode_placed.binding)),
         );
         p.wait_entered().await;
         p.respond(StatusCode::SERVICE_UNAVAILABLE.into_response());
@@ -805,6 +824,58 @@ async fn a_prefill_server_error_releases_only_the_prefill_binding() {
         assert_eq!((selected, decision.branch), (Some(1), "rebind"), "{kind:?}");
         let (selected, decision) = decode_policy.select_with_decision(&decode, &info).await;
         assert_eq!((selected, decision.branch), (Some(0), "hit"), "{kind:?}");
+    }
+}
+
+#[tokio::test]
+async fn an_idx2idx_prefill_server_error_places_the_decode_session_again() {
+    for kind in [DispatchKind::Atom, DispatchKind::AtomChunked] {
+        let policy: Arc<dyn LoadBalancingPolicy> = Arc::new(DpStickyPolicy::new());
+        let (mut p, mut d) = servers().await;
+        let dp_worker = |server: &GatedServer, rank, role| -> Arc<dyn Worker> {
+            let url = server.worker.url().to_string();
+            Arc::new(DPAwareWorkerBuilder::new_with_type(url, rank, 2, role).build())
+        };
+        // The prefill runs on the decode's rank 0, as idx2idx maps it.
+        let prefill = dp_worker(
+            &p,
+            0,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        );
+        p.worker = prefill;
+        let decode = [
+            dp_worker(&d, 0, WorkerType::Decode),
+            dp_worker(&d, 1, WorkerType::Decode),
+        ];
+        d.worker = decode[0].clone();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", HeaderValue::from_static("session-1"));
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+
+        let (selected, placed) = policy.select_with_decision(&decode, &info).await;
+        assert_eq!(selected, Some(0));
+        let task = dispatch_with_policy(
+            kind,
+            &p,
+            &d,
+            false,
+            Some(headers.clone()),
+            None,
+            Some((policy.clone(), placed.binding)),
+        );
+        p.wait_entered().await;
+        p.respond(StatusCode::SERVICE_UNAVAILABLE.into_response());
+        assert!(result(task).await.status().is_server_error(), "{kind:?}");
+
+        // The retry places the decode session again, so its prefill maps to
+        // the other rank instead of the one that failed.
+        let (selected, decision) = policy.select_with_decision(&decode, &info).await;
+        assert_eq!((selected, decision.branch), (Some(1), "rebind"), "{kind:?}");
     }
 }
 

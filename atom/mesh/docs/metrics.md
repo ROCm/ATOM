@@ -143,18 +143,24 @@ workers, and on `affinity` that cache hits queue behind other requests.
 `dp_sticky` pins a session, identified by a non-empty `x-session-id` header,
 to a worker (URL and DP rank) in router memory:
 
-- `hit`: the pinned worker is healthy and its circuit breaker admits requests;
+- `hit`: the pinned worker is healthy and its circuit breaker admits requests,
+  and no request of the session has failed since it was last placed;
 - `new`: first request of the session; it goes to the worker with the fewest
   live sessions, ties broken by load;
-- `rebind`: the pinned worker is unhealthy, removed or circuit-open, or the
-  session's last request to it failed with a server error or got no response
-  (a retry included), so the session is placed again like a new one, away
-  from every worker it failed on since its last hit while another one is
-  healthy. HTTP, PD and ext_proc routing report failures; gRPC does not. For
-  HTTP and PD routing a body that breaks after a successful status is not a
-  failure; ext_proc also reports an upstream reset or timeout after the
+- `rebind`: the pinned worker is unhealthy, removed or circuit-open, or a
+  request placed on the current pin failed with a server error or got no
+  response, so the session's next request (a retry included) is placed again
+  like a new one, away from every worker it failed on since its last hit
+  while another one is healthy. The worker a failure counts against is the one
+  the request was sent to, after DP rank mapping; a request placed before the
+  session last moved does not count. Under `--atom-pd-rank-mapping-policy
+  idx2idx`, a failed prefill also releases the decode pin, although the decode
+  was never sent. HTTP, PD and ext_proc routing report failures; gRPC does not.
+  For HTTP and PD routing a body that breaks after a successful status is not
+  a failure; ext_proc also reports an upstream reset or timeout after the
   response started;
-- `expired`: the session was idle for more than 120 minutes and is reassigned.
+- `expired`: the session was idle for more than 120 minutes and is reassigned,
+  still away from the workers it failed on since its last hit.
 
 With N turns per session and stable workers, the hit rate approaches
 (N - 1) / N. `rebind` points at worker churn or failing requests; a router

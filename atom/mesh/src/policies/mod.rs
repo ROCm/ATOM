@@ -43,6 +43,11 @@ pub struct RouteDecision {
     /// when the selected worker is the best candidate, its KV event branches always;
     /// other policies leave it None.
     pub estimated_hit_ratio: Option<f64>,
+    /// The session binding the selection was placed on, for policies that pin
+    /// sessions. The router passes it back to [`LoadBalancingPolicy::on_dispatch`]
+    /// and [`LoadBalancingPolicy::on_dispatch_failed`], so a request placed
+    /// before its session moved cannot act on the new binding.
+    pub binding: Option<u64>,
 }
 
 impl RouteDecision {
@@ -51,6 +56,7 @@ impl RouteDecision {
             branch,
             match_ratio: None,
             estimated_hit_ratio: None,
+            binding: None,
         }
     }
 }
@@ -96,12 +102,14 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
 
     /// Called when a request is sent to `worker` in `pool`, not when the worker
     /// is selected or reserved. DP rank mapping runs after selection, so it can
-    /// differ from the selected worker.
+    /// differ from the selected worker. `binding` is the selection's
+    /// [`RouteDecision::binding`].
     fn on_dispatch(
         &self,
         _pool: &'static str,
         _headers: Option<&http::HeaderMap>,
         _worker: &Arc<dyn Worker>,
+        _binding: Option<u64>,
     ) {
         // Default: no-op for policies that do not track sessions
     }
@@ -109,13 +117,22 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Called when a request sent to `worker` fails with a server error or
     /// never gets a response. Client errors are not failures. The HTTP and PD
     /// routers and the ext_proc ingress report it; the gRPC routers do not.
+    /// `worker` is the worker the request was sent to, after DP rank mapping,
+    /// and `binding` the selection's [`RouteDecision::binding`]. Under ATOM PD
+    /// idx2idx rank mapping, a failed prefill is also reported to the decode
+    /// policy for the decode worker, although the decode was never sent.
     ///
     /// A response body that breaks after a successful status is not reported by
     /// the HTTP and PD routers. The worker still records that failure for its
     /// circuit breaker, and a worker that died fails the session's next
     /// request, which is reported. The ext_proc ingress also reports an
     /// upstream reset or timeout after the response started.
-    fn on_dispatch_failed(&self, _headers: Option<&http::HeaderMap>, _worker: &Arc<dyn Worker>) {
+    fn on_dispatch_failed(
+        &self,
+        _headers: Option<&http::HeaderMap>,
+        _worker: &Arc<dyn Worker>,
+        _binding: Option<u64>,
+    ) {
         // Default: no-op for policies that do not track sessions
     }
 
