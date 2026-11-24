@@ -1069,3 +1069,99 @@ def test_gfx1250_issue_341_tp4_launch_is_bit_exact(
         previous = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
     torch.cuda.synchronize()
     assert all(torch.equal(a, b) for a, b in zip(tuned, previous))
+
+
+class TestFp8PrefillRoutes:
+    """The FP8 index prefill routes of the TP1 gfx950 path: the fixed workspace's
+    view and aiter's FlyDSL scorer."""
+
+    @staticmethod
+    def _q(dtype=torch.bfloat16, tokens=8):
+        return torch.empty(tokens, 4, 128, device="meta", dtype=dtype)
+
+    @pytest.mark.parametrize(
+        "batch,q_len,blocks,want",
+        [
+            (1, 8192, 128, True),
+            (1, 8192, 127, False),
+            (2, 8192, 1024, False),  # ragged steps keep Triton
+            (1, 6143, 1023, False),
+            (1, 6144, 129, True),
+            (1, 1024, 1024, True),
+            (1, 8192, 8192, True),  # 1M context: a 1 GiB plane
+            (1, 32768, 8192, False),  # 4 GiB: past aiter's 32-bit addressing
+        ],
+    )
+    def test_flydsl_scorer_gate(self, batch, q_len, blocks, want):
+        q = self._q(tokens=q_len)
+        assert m._fp8_prefill_takes_flydsl(q, batch, q_len, blocks) is want
+
+    def test_flydsl_scorer_needs_a_bf16_query(self):
+        assert not m._fp8_prefill_takes_flydsl(self._q(torch.float16), 1, 8192, 4096)
+
+    def test_score_view_rows_are_four_aligned_and_bounded(self):
+        from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
+
+        ws = LogitsWorkspace(4 * 10 * 132, "cpu")
+        view = m._prefill_score_view(ws, 4, 10, 129)
+        assert view.shape == (4, 10, 129)
+        assert view.stride() == (10 * 132, 132, 1)
+        # the selectors flatten (heads, rows): still a view
+        assert view.view(40, 129).stride() == (132, 1)
+        assert m._prefill_score_view(ws, 4, 11, 129) is None  # past the capacity
+        assert m._prefill_score_view(None, 4, 10, 129) is None
+
+
+def _fp8_inputs(qlens, prefixes):
+    if m.get_gfx_runtime() != "gfx950":
+        pytest.skip("the FP8 index workspace routes are gfx950's")
+    kw = _inputs(qlens, prefixes, 4, "cuda")
+    kw["index_kv_cache"] = kw["index_kv_cache"].to(torch.float8_e4m3fn)
+    return kw
+
+
+def _workspace(kw):
+    from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
+
+    blocks = -(-kw["max_seq_len"] // SPARSE_BLOCK_SIZE)
+    ws = LogitsWorkspace(4 * kw["idx_q"].shape[0] * (-(-blocks // 4) * 4), "cuda")
+    ws._logits.fill_(3e38)  # stale cells must never reach a selection
+    return ws
+
+
+@gpu
+@pytest.mark.parametrize("bounded", [True, False])
+@pytest.mark.parametrize(
+    "qlens,prefixes",
+    [
+        ([8192], [24576]),  # FlyDSL (>= 6144 new tokens), aiter selector
+        ([2300], [131000]),  # FlyDSL (>= 1024 blocks), a padded row
+        ([3001, 2192], [100000, 0]),  # ragged: Triton into the workspace
+        ([1000], [3100]),  # 33 blocks in rows 36 wide: Triton scorer and selector
+    ],
+)
+def test_fp8_prefill_workspace_routes_keep_the_selection(qlens, prefixes, bounded):
+    """Scores into the fixed workspace (FlyDSL or Triton) select exactly what the
+    per-call Triton plane selects; without row bounds the Triton selector reads it."""
+    kw = _fp8_inputs(qlens, prefixes)
+    valid = m.build_n_valid_column_per_row(
+        kw["cu_seqlens_q"],
+        kw["prefix_lens"],
+        batch=len(qlens),
+        total_q=kw["idx_q"].shape[0],
+        num_idx_heads=4,
+        decode_max_q=0,
+    )
+    valid = valid if bounded else None
+    ref = m.minimax_m3_index_topk(
+        **kw, emit_sparse_block_table=True, n_valid_column_per_row=valid
+    )
+    got = m.minimax_m3_index_topk(
+        **kw,
+        emit_sparse_block_table=True,
+        n_valid_column_per_row=valid,
+        score_workspace=_workspace(kw),
+    )
+    torch.cuda.synchronize()
+    for a, b in zip(ref, got):
+        assert torch.equal(a, b)

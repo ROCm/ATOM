@@ -9,12 +9,16 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
+from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from atom.config import _is_minimax_m3_config, kv_cache_torch_dtype
 from atom.distributed.ulysses_sp import local_num_kv_heads
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
-from atom.model_ops.minimax_m3.index_buffers import allocate_index_scorers
+from atom.model_ops.minimax_m3.index_buffers import (
+    allocate_index_scorers,
+    allocate_prefill_scores,
+)
 from atom.model_ops.minimax_m3.sparse_attn import (
     ASM_PAGE_SIZE,
     make_sparse_decode_metadata,
@@ -301,6 +305,16 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             )
             if self._has_sparse_attention
             else {}
+        )
+        self._prefill_score_workspace = (
+            allocate_prefill_scores(
+                self.model_runner.config,
+                self.device,
+                num_idx_heads=self._num_idx_heads,
+                gfx=get_gfx_runtime(),
+            )
+            if self._has_sparse_attention
+            else None
         )
         self._pa_decode_bf16_asm_enabled = (
             use_pa_decode_bf16_asm() and model_runner.block_size == 256
@@ -982,6 +996,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 num_idx_heads=self._num_idx_heads,
                 index_scorer=self._index_scorers.get(""),
                 nvfp4_kv=self.model_runner.config.kv_cache_dtype == "nvfp4",
+                score_workspace=self._prefill_score_workspace,
             )
 
     def _refuse_ragged_on_rectangular_layers(
