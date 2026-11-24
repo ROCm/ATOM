@@ -421,21 +421,23 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
         """Admits and aborts what the client sends, until its side ends. Each submission
         is admitted in a task of its own, so an Abort is read while one is pending."""
         admissions: set[asyncio.Task] = set()
-        waiting: deque[frames.SubmitRequest] = deque()  # past SESSION_ADMISSIONS
+        # Past SESSION_ADMISSIONS, each with when it was read.
+        waiting: deque[tuple[frames.SubmitRequest, float]] = deque()
 
-        def admit(item: frames.SubmitRequest) -> None:
-            admission = asyncio.create_task(self._admit(session, item))
+        def admit(item: frames.SubmitRequest, received: float) -> None:
+            admission = asyncio.create_task(self._admit(session, item, received))
             admissions.add(admission)
             admission.add_done_callback(admitted)
 
         def admitted(admission: asyncio.Task) -> None:
             admissions.discard(admission)
             if waiting:
-                admit(waiting.popleft())
+                admit(*waiting.popleft())
 
         try:
             async for message in request_iterator:
                 kind, items = frames.decode_client(message.frames)
+                received = time.time()  # its requests' arrival, as HTTP's starts
                 if kind == "abort":
                     session.abort(items)
                     continue
@@ -453,10 +455,10 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
                         refused.append(_rejected(item.seq_id, in_flight))
                     elif len(admissions) < SESSION_ADMISSIONS:
                         session.admitting[item.seq_id] = item  # an Abort waits for it
-                        admit(item)
+                        admit(item, received)
                     elif len(waiting) < SESSION_WAITING:
                         session.admitting[item.seq_id] = item
-                        waiting.append(item)
+                        waiting.append((item, received))
                     else:
                         busy = v1.RejectedRequest.OVERLOADED
                         refused.append(
@@ -467,7 +469,7 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
                 await asyncio.wait(admissions)
         finally:
             try:  # a cancelled reader's admissions settle as a cancelled submission does
-                for item in waiting:  # never started: nothing of it to settle
+                for item, _ in waiting:  # never started: nothing of it to settle
                     session.admitting.pop(item.seq_id, None)
                     session.aborted_while_admitting.discard(item.seq_id)
                 waiting.clear()
@@ -478,11 +480,13 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
             finally:
                 session.outbox.put_nowait(None)
 
-    async def _admit(self, session, request: frames.SubmitRequest) -> None:
+    async def _admit(
+        self, session, request: frames.SubmitRequest, received: float
+    ) -> None:
         """`_submit`, refused alone; an Abort read meanwhile applies once it is added."""
         client_id = request.seq_id
         try:
-            await self._submit(session, request)
+            await self._submit(session, request, received)
         except Exception as error:  # noqa: BLE001 - refused as Generate is
             # One that ended first had its Completion; its seq_id may be another's now.
             if session.admitting.get(client_id) is request:
@@ -497,9 +501,12 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
         if aborted:
             session.abort([client_id])
 
-    async def _submit(self, session, request: frames.SubmitRequest) -> None:
+    async def _submit(
+        self, session, request: frames.SubmitRequest, received: float
+    ) -> None:
         """Admits one RequestSpec as Generate admits a request, under the Session's id
-        for it, with the structured fields PrepareStructuredOutput answered."""
+        for it, with the structured fields PrepareStructuredOutput answered. It arrived
+        at `received`, when the Session read it."""
         api, given = self.api, request.sampling_params
         seq_id = session.seq_id(request.seq_id)
         # Greedy siblings collapse to one, as Generate's admission collapses them.
@@ -570,7 +577,7 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
             session.abandon(preprocessing)
             return
         session.preparing -= 1
-        session.add(request.seq_id, seq, request.request_id)
+        session.add(request.seq_id, seq, request.request_id, received)
         try:
             api._validate_sequence_context_length(seq, params)
         except BaseException:
