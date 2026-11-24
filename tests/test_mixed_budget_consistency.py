@@ -9,7 +9,11 @@ from unittest.mock import Mock
 import pytest
 from conftest import MockConfig
 
-from atom.model_engine.block_manager import AdmissionProbe, BlockManager
+from atom.model_engine.block_manager import (
+    AdmissionProbe,
+    BlockManager,
+    JointBoundaryDecision,
+)
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 
@@ -114,6 +118,37 @@ def test_probe_demand_excludes_reserved_decode_pages(prefix):
     assert bm.can_allocate(next_seq) == -1
     bm.reserved_decode_blocks = 0
     assert bm.can_allocate(next_seq) == 0
+
+
+@pytest.mark.parametrize("record", [False, True])
+@pytest.mark.parametrize("reserved", [0, 1])
+def test_joint_admission_keeps_the_managers_decode_reservation(
+    monkeypatch, record, reserved
+):
+    bm = BlockManager(MockConfig(num_kvcache_blocks=3, enable_prefix_caching=True))
+    seq = Sequence(list(range(8)), block_size=4)
+    bm.reserved_decode_blocks = reserved
+    decision = JointBoundaryDecision(
+        boundary_tokens=4, boundary_hash=99, claim_tokens=4, state_from_hbm=True
+    )
+    monkeypatch.setattr(bm, "_joint_kv_boundary", lambda *a: decision)
+    # Three units fit the initial admission; protecting the boundary image
+    # leaves only two. A joint must not spend the running decode's third unit.
+    monkeypatch.setattr(
+        bm,
+        "_has_page_units",
+        lambda demand, protected=None: demand <= 3 - (protected == 99),
+    )
+    if record:
+        assert bm.can_allocate(seq, record=True) == 0
+    else:
+        probe = AdmissionProbe()
+        assert bm.can_allocate(seq, record=False, probe=probe) == 0
+        assert probe.num_new_blocks == 2
+        assert bm.record_allocation(seq, probe)
+    assert seq.offload_joint.boundary_tokens == (0 if reserved else 4)
+    assert bm.joint_boundaries == (0 if reserved else 1)
+    assert bm.reserved_decode_blocks == reserved
 
 
 def test_admissions_share_one_decode_reservation(monkeypatch):

@@ -46,7 +46,10 @@ def test_decode_rollback_and_positions(width, explicit, deferred, expected):
         "batch_id_per_q_token": SimpleNamespace(np=np.repeat(np.arange(2), width)),
     }
     lens = np.full(2, width, dtype=np.int32)
-    processor = SimpleNamespace(num_rejected=np.array([1, 2]), is_deferred_out=deferred)
+    processor = SimpleNamespace(
+        num_rejected=np.array([9, 9, 1, 2] if explicit else [1, 2]),
+        is_deferred_out=deferred,
+    )
     processor.verify_ctx_lens = tokenIDProcessor.verify_ctx_lens.__get__(processor)
     builder = SimpleNamespace(
         model_runner=SimpleNamespace(
@@ -75,6 +78,62 @@ def test_decode_rollback_and_positions(width, explicit, deferred, expected):
         [np.arange(ctx - 4, ctx - 4 + width) for ctx in expected]
     )
     np.testing.assert_array_equal(variables["positions"].np[: 2 * width], positions)
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_attention_constructor_binds_mixed_only_when_enabled(monkeypatch, mixed):
+    import atom.models.deepseek_v4 as model
+
+    config = SimpleNamespace(
+        enable_mixed_prefill_decode=mixed,
+        kv_cache_dtype="auto",
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    monkeypatch.setattr(model, "get_current_atom_config", lambda: config)
+    monkeypatch.setattr(model, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(model, "get_gfx_runtime", lambda: "gfx950")
+    for name in (
+        "MergedReplicatedLinear",
+        "ColumnParallelLinear",
+        "RowParallelLinear",
+        "RMSNorm",
+        "_V4RoPE",
+    ):
+        monkeypatch.setattr(model, name, lambda *a, **kw: torch.nn.Identity())
+    args = SimpleNamespace(
+        dim=4,
+        n_heads=2,
+        o_groups=1,
+        q_lora_rank=4,
+        o_lora_rank=2,
+        head_dim=4,
+        rope_head_dim=2,
+        window_size=4,
+        compress_ratios=[0],
+        norm_eps=1e-6,
+        scale_fmt=None,
+        quant_config=None,
+        rope_theta=10000,
+        max_seq_len=8,
+        rope_factor=1,
+        beta_fast=32,
+        beta_slow=1,
+    )
+    layer = model.DeepseekV4Attention(0, args, prefix="test.attention")
+    assert config.compilation_config.static_forward_context["test.attention"] is layer
+    if mixed:
+        assert layer.forward_impl.__self__ is layer
+        assert (
+            layer.forward_impl.__func__ is model.DeepseekV4Attention._forward_impl_mixed
+        )
+        assert (
+            layer.forward_impl_default.__func__
+            is model.DeepseekV4Attention.forward_impl
+        )
+    else:
+        assert "forward_impl" not in vars(layer)
+        assert "forward_impl_default" not in vars(layer)
+        assert layer.forward_impl.__func__ is model.DeepseekV4Attention.forward_impl
 
 
 @pytest.mark.parametrize("mixed", [False, True])
@@ -128,13 +187,24 @@ def test_attention_output_reuse_keeps_decode_input_intact(monkeypatch, bf16):
     fc = SimpleNamespace(context=ctx, attn_metadata=metadata)
     monkeypatch.setattr(model, "get_forward_context", lambda: fc)
     calls = []
+    decode_outputs = []
 
-    def attend(segment, positions, *, out, **kwargs):
+    def decode_kernel(query, *, out=None):
+        assert out is not None
+        decode_outputs.append(out)
+        return out.copy_(query + 10)
+
+    monkeypatch.setattr(model, "sparse_attn_v4_paged_decode", decode_kernel)
+
+    def attend(segment, positions, *, out, decode, **kwargs):
         sl = slice(0, 4) if ctx.is_prefill else slice(4, 6)
         incoming = segment.q_sa if bf16 else segment.q_packed
         torch.testing.assert_close(incoming, original[sl])
         calls.append(ctx.is_prefill)
-        out.copy_(incoming + 10)
+        if ctx.is_prefill:
+            out.copy_(incoming + 10)
+        else:
+            assert decode(incoming).data_ptr() == out.data_ptr()
 
     def norm(q, kv, positions, mixed=False):
         assert mixed is True
@@ -153,6 +223,12 @@ def test_attention_output_reuse_keeps_decode_input_intact(monkeypatch, bf16):
     )
     assert calls == [True, False]
     assert (out.data_ptr() == query.data_ptr()) == bf16
+    assert len(decode_outputs) == 1
+    assert decode_outputs[0].data_ptr() == out[4:].data_ptr()
+    assert (
+        decode_outputs[0].untyped_storage().data_ptr()
+        == out.untyped_storage().data_ptr()
+    )
     torch.testing.assert_close(out, (original + 10).reshape(6, 4))
     assert fc.attn_metadata is metadata and ctx.is_prefill
 

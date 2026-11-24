@@ -121,10 +121,10 @@ def test_lowering_keeps_the_running_decodes_page_reservation(seq_factory):
     _held_by_a_request(bm, 104)
     seq = seq_factory(list(range(64)))
     probe = _probe(5, new=4)
-    probe.reserved_decode_blocks = 1
+    bm.reserved_decode_blocks = 1
     assert not bm.lower_hit_to_chunk(seq, probe, CHUNK, 48)
     assert (probe.num_cached_blocks, probe.num_new_blocks) == (5, 4)
-    probe.reserved_decode_blocks = 0
+    bm.reserved_decode_blocks = 0
     assert bm.lower_hit_to_chunk(seq, probe, CHUNK, 48)
     assert (probe.num_cached_blocks, probe.num_new_blocks) == (4, 5)
 

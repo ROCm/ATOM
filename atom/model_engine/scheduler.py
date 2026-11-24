@@ -1098,7 +1098,7 @@ class Scheduler:
             self._finish_rejected_waiting = self._finish_rejected_waiting_cancelling
         # What a P/D receive's first decode takes past its prompt: T0 and the
         # `mtp_k` verify slots its handoff appends, then the reach past them
-        # that `can_append` checks before the step runs, as decode does below.
+        # that `append_blocks_needed` sizes before the step runs, as decode does below.
         decode_reach = max(1 + self.mtp_k, self.draft_lookahead)
         self.pd_admission = PdAdmissionController.from_config(
             config,

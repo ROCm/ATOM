@@ -152,7 +152,6 @@ class AdmissionProbe:
     num_cached_blocks: int = -1
     block_hashes: list[int] = field(default_factory=list)
     num_new_blocks: int | None = None
-    reserved_decode_blocks: int = 0
 
 
 # Evicted or remapped hashes kept for `_CachedWalk` revalidation; a memo
@@ -697,7 +696,8 @@ class BlockManager:
         (`draft_lookahead_blocks`) against the HBM-hit checkpoint, and when a
         joint needs more, `_fit_joint` charges that same demand plus the private
         tail against the checkpoint `allocate` will pin. `may_append` follows
-        `can_append`, and both ask about the same eligible set (`_is_evictable`:
+        `_has_page_units(append_blocks_needed(...))`. Both ask about the same
+        eligible set (`_is_evictable`:
         READY, unpinned): pins this pass's prefill admissions took -- a mixed
         step's -- are outside it for both, and nothing is consumed between the
         two (the scheduler's decode loop may preempt in between, which only
@@ -1272,7 +1272,6 @@ class BlockManager:
             )
         assert block_hashes is None, "the probe carries its own chain"
         probe.num_new_blocks = None
-        probe.reserved_decode_blocks = self.reserved_decode_blocks
         probe.num_cached_blocks = self._evaluate(
             seq,
             self._admission_walk,
@@ -1381,9 +1380,7 @@ class BlockManager:
         if record:
             self.record_allocation(
                 seq,
-                AdmissionProbe(
-                    num_cached_blocks, block_hashes, num_new_blocks, reserved
-                ),
+                AdmissionProbe(num_cached_blocks, block_hashes, num_new_blocks),
             )
         # After the refusal, not before it. The chain is O(prompt) xxhash plus
         # two temporaries per block, and a refused admission discards it — a
@@ -1448,7 +1445,7 @@ class BlockManager:
             return decision
         protected = decision.boundary_hash if decision.state_from_hbm else None
         if self._has_page_units(
-            num_new_blocks + extra + probe.reserved_decode_blocks, protected
+            num_new_blocks + extra + self.reserved_decode_blocks, protected
         ):
             return decision
         reason = (
@@ -1816,7 +1813,7 @@ class BlockManager:
                 in_use += 1
         demand = probe.num_new_blocks + in_use
         protected = chain[lowered - 1] if lowered else None
-        if not self._has_page_units(demand + probe.reserved_decode_blocks, protected):
+        if not self._has_page_units(demand + self.reserved_decode_blocks, protected):
             return False
         probe.num_cached_blocks = lowered
         probe.num_new_blocks = demand
@@ -3942,7 +3939,8 @@ class BlockManager:
 
         The target writes up to `len(seq) - 1`; the draft round writes
         `lookahead` positions past that (`draft_kv_lookahead`). Checking that
-        the pool has room (`can_append`) is not the same as allocating it: a
+        the pool has room (`_has_page_units(append_blocks_needed(...))`) is not
+        the same as allocating it: a
         position past the last allocated block reads block id 0 from the zeroed
         block-table tail, overwriting the padding block or unrelated live KV.
         """

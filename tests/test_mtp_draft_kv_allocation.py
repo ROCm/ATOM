@@ -15,8 +15,8 @@ ends at `C` writes up to `C + k - 2`, where
 
 A position whose block column is past the row's allocated blocks reads 0 from
 the zeroed block-table tail, and the write lands in physical block 0.
-`can_append` sizing the pool for the step is not the same as `may_append`
-allocating it -- the original probe below is that gap.
+Checking `append_blocks_needed` against the pool for the step is not the same
+as `may_append` allocating it -- the original probe below is that gap.
 
 These drive the real Scheduler / BlockManager through prefill and decode with
 deferred output (the default) and check the runner's arithmetic against the
@@ -117,7 +117,7 @@ def unallocated(step, block):
 
 
 def test_room_for_the_step_is_not_the_step_allocated():
-    """Length 16, one block: `can_append(seq, 4)` says yes, `may_append` keeps
+    """Length 16, one block: the append room check passes, `may_append` keeps
     the one block. The draft round past position 15 needs block 2."""
     bm = BlockManager(MockConfig(kv_cache_block_size=16, num_kvcache_blocks=8))
     seq = Sequence(list(range(16)), 16)
