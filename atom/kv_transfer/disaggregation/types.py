@@ -42,6 +42,24 @@ def kv_config_has_producer(kv_config: object) -> bool:
     return any(kv_config_has_producer(sub) for sub in kv_config.get("connectors", []))
 
 
+def produced_no_handoff(seq: object) -> bool:
+    """Whether a finishing request on a P/D producer has nothing to hand off.
+
+    True when it was aborted or rejected as unschedulable, or when its prompt
+    prefill never completed on this scheduler (`Sequence.prefill_completed`).
+    Both reasons end a request that is leaving the waiting queue, so it holds
+    no blocks: one that never ran has no KV and no first token, and one that
+    ran, was preempted and is then rejected has had its blocks freed. A
+    producer then publishes a cancellation and keeps no send claim.
+    """
+    reason = getattr(seq, "leave_reason", None) or ""
+    return (
+        reason == "aborted"
+        or reason.startswith("unschedulable")
+        or not getattr(seq, "prefill_completed", True)
+    )
+
+
 @dataclass(frozen=True)
 class SaveOperationId:
     """Exact identity of one scheduler-issued PAGE/SLOT save generation.
@@ -225,10 +243,37 @@ class KVTransferRegion:
     # makes equal-sized planes distinguishable across code versions.
     semantic_role: str | None = None
 
+    @staticmethod
+    def unit_offset(
+        index: int, total_bytes: int, unit_bytes: int, reverse_indexed: bool
+    ) -> int:
+        if reverse_indexed:
+            return total_bytes - (index + 1) * unit_bytes
+        return index * unit_bytes
+
+    @staticmethod
+    def chunk_sizes(total_bytes: int, unit_bytes: int, max_bytes: int) -> list[int]:
+        """Split a region into MR chunks, each <= ``max_bytes`` and, apart from
+        the last, a whole number of units, so no unit crosses an MR boundary.
+
+        A unit larger than ``max_bytes`` cannot be aligned and is left to
+        straddle.
+        """
+        sizes: list[int] = []
+        offset = 0
+        while offset < total_bytes:
+            remaining = total_bytes - offset
+            chunk = min(max_bytes, remaining)
+            if chunk < remaining and chunk >= unit_bytes > 0:
+                chunk -= chunk % unit_bytes
+            sizes.append(chunk)
+            offset += chunk
+        return sizes
+
     def unit_addr(self, index: int) -> int:
-        if self.reverse_indexed:
-            return self.base_addr + self.total_bytes - (index + 1) * self.unit_bytes
-        return self.base_addr + index * self.unit_bytes
+        return self.base_addr + self.unit_offset(
+            index, self.total_bytes, self.unit_bytes, self.reverse_indexed
+        )
 
 
 @dataclass(frozen=True)
