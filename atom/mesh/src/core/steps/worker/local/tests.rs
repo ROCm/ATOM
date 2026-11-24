@@ -528,6 +528,31 @@ async fn default_template_kwargs_join_the_request_kwargs_the_request_winning() {
     assert_eq!(rendered, "hello request: hi");
 }
 
+/// ATOM's HTTP chat sets `thinking_effort` from a reasoning effort it reads, over the
+/// defaults and the request's kwargs, and drops one its templates do not read.
+#[tokio::test]
+async fn a_reasoning_effort_overrides_the_default_thinking_effort_as_on_http() {
+    let template = "{{ thinking_effort }} {{ reasoning_effort }}: {{ messages[0].content }}";
+    let defaults = r#"{"thinking_effort": "low"}"#;
+    let url = serve_atom(model_info("atom-effort", template, defaults), 1).await;
+    let ctx = context();
+    register(&ctx, json!({ "url": url })).await.unwrap();
+    render(&ctx, "atom-effort", Value::Null).await;
+
+    for (effort, expected) in [("high", "high : hi"), ("medium", "low : hi")] {
+        let body = json!({
+            "model": "atom-effort",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": effort,
+            "chat_template_kwargs": {"thinking_effort": "low"},
+        });
+        let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+        let model = Some("atom-effort".into());
+        let (_, resp) = prepare_chat(Arc::new(request), None, model, &ctx).unwrap();
+        assert_eq!(resp.original_text.as_deref(), Some(expected), "{effort}");
+    }
+}
+
 #[tokio::test]
 async fn a_vllm_worker_is_still_detected_as_vllm() {
     let service = vllm::vllm_engine_server::VllmEngineServer::new(FakeVllm);

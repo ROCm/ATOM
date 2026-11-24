@@ -138,14 +138,21 @@ pub fn process_chat_messages(
     request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,
 ) -> Result<ProcessedMessages, String> {
-    process_chat_messages_with_defaults(request, tokenizer, None)
+    process_chat_messages_with_defaults(request, tokenizer, None, false)
 }
 
-/// As `process_chat_messages`, with the request's template kwargs over `default_kwargs`.
+/// The efforts ATOM's chat templates read (`VALID_TEMPLATE_EFFORTS` in
+/// atom/entrypoints/openai/reasoning.py); ATOM's HTTP chat drops any other.
+const ATOM_TEMPLATE_EFFORTS: [&str; 3] = ["low", "high", "max"];
+
+/// As `process_chat_messages`, with the request's template kwargs over `default_kwargs`;
+/// for an ATOM model (`atom`), its reasoning effort then over both as `thinking_effort`,
+/// as ATOM's HTTP chat applies it (`apply_reasoning_controls`).
 pub fn process_chat_messages_with_defaults(
     request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,
     default_kwargs: Option<&HashMap<String, Value>>,
+    atom: bool,
 ) -> Result<ProcessedMessages, String> {
     let any = tokenizer.as_any();
     let hf_tokenizer = any.downcast_ref::<HuggingFaceTokenizer>().or_else(|| {
@@ -181,7 +188,7 @@ pub fn process_chat_messages_with_defaults(
 
     let mut combined_template_kwargs = default_kwargs.cloned().unwrap_or_default();
 
-    if let Some(reasoning_effort) = &request.reasoning_effort {
+    if let (false, Some(reasoning_effort)) = (atom, &request.reasoning_effort) {
         combined_template_kwargs.insert(
             "reasoning_effort".to_string(),
             Value::String(reasoning_effort.clone()),
@@ -192,6 +199,11 @@ pub fn process_chat_messages_with_defaults(
         for (key, value) in template_kwargs {
             combined_template_kwargs.insert(key.clone(), value.clone());
         }
+    }
+    let effort = request.reasoning_effort.as_deref();
+    if let Some(effort) = effort.filter(|e| atom && ATOM_TEMPLATE_EFFORTS.contains(e)) {
+        let effort = Value::String(effort.to_string());
+        combined_template_kwargs.insert("thinking_effort".to_string(), effort);
     }
 
     let final_template_kwargs = if combined_template_kwargs.is_empty() {

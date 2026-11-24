@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::{
     app_context::AppContext,
+    core::worker::RuntimeType,
     protocols::{
         chat::ChatCompletionRequest,
         common::{InputIds, StringOrArray},
@@ -132,9 +133,12 @@ pub fn prepare_chat(
         .map_err(|e| error::internal_error("invalid_default_template_kwargs", e))?;
 
     let body_ref = filter_chat_request_by_tool_choice(&req);
+    let atom = workers
+        .iter()
+        .any(|worker| worker.metadata().runtime_type == RuntimeType::Atom);
 
     let processed =
-        process_chat_messages_with_defaults(&body_ref, &*tokenizer, default_kwargs.as_ref())
+        process_chat_messages_with_defaults(&body_ref, &*tokenizer, default_kwargs.as_ref(), atom)
             .map_err(|e| error::bad_request("process_messages_failed", e))?;
 
     let encoding = tokenizer
