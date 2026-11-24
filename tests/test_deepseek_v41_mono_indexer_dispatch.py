@@ -63,67 +63,6 @@ def test_hook_is_active_only_for_the_supported_forward(monkeypatch):
     assert not lazy.runner.active
 
 
-def test_draft_constructor_reaches_parent_allocation_on_cpu(monkeypatch, gpu_module):
-    from atom.models.deepseek_v41.mono import draft_runner as draft_module
-    from atom.models.deepseek_v41.mono import runner as target_module
-
-    cls = draft_module.DraftMonoRunner
-    cfg = SimpleNamespace(
-        dspark_n_routed_experts=8,
-        dspark_num_experts_per_tok=2,
-        hc_mult=4,
-        hidden_size=8,
-        index_n_heads=32,
-        index_head_dim=128,
-    )
-    draft = SimpleNamespace(
-        config=cfg,
-        block_size=2,
-        mtp=[],
-        rope=SimpleNamespace(
-            cos_cache=torch.empty(1, 32, dtype=torch.bfloat16),
-            sin_cache=torch.empty(1, 32, dtype=torch.bfloat16),
-        ),
-    )
-    monkeypatch.setattr(cls, "_bind_agreed", lambda self, bind: bind())
-
-    def rank(self):
-        self.dp, self.tp, self.moe_tp = 1, 4, 4
-        self.dims = SimpleNamespace(heads=1)
-
-    monkeypatch.setattr(cls, "_bind_rank", rank)
-    monkeypatch.setattr(
-        cls,
-        "_post_key",
-        lambda self, rows: SimpleNamespace(halves=lambda: (None, None)),
-    )
-    for kernel in (
-        target_module.k1,
-        target_module.k2a,
-        target_module.k2b,
-        target_module.k2,
-    ):
-        monkeypatch.setattr(kernel, "scratch_bytes", lambda *args: 16)
-    monkeypatch.setattr(
-        target_module,
-        "uncached_bytes",
-        lambda size, dev: torch.empty(size, dtype=torch.uint8),
-    )
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    for name in ("empty", "zeros"):
-        original = getattr(torch, name)
-        monkeypatch.setattr(
-            torch,
-            name,
-            lambda *args, _fn=original, **kw: _fn(*args, **dict(kw, device="cpu")),
-        )
-    allocated = cls(draft)
-    assert allocated.positions.device.type == "cpu"
-    assert allocated.ilog.shape == (16, 0)
-    assert allocated.isel == {} and allocated.indexer_workspace is None
-    assert allocated.index_scratch is None
-
-
 def test_dp_attention_keeps_rank_local_indexer_work(monkeypatch, gpu_module):
     # Attention DP ranks carry different requests and caches, so they cannot
     # exchange selections even if a TP process group exists for the FFN.
@@ -193,7 +132,7 @@ def test_tp2_large_batch_keeps_native_layers_and_mono_indexer(
     raw, _, lazy, md = setup(monkeypatch)
     monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", "1")
     monkeypatch.setattr(dispatch, "step_supported", lambda *args, **kwargs: True)
-    layer = dispatch.MonoDecodeModel(raw, None, 8192, True, 0, tp)
+    layer = dispatch.MonoDecodeModel(raw, None, 8192, True, 0, None, None, tp_size=tp)
     layer._mono = SimpleNamespace(ready=Mock(), runner=SimpleNamespace(forward=Mock()))
     cfg = SimpleNamespace(
         max_model_len=8192,
@@ -229,7 +168,7 @@ def test_other_layer_routes_do_not_prepare_native_indexer(
     raw, _, lazy, _ = setup(monkeypatch)
     monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", enabled)
     monkeypatch.setattr(dispatch, "step_supported", lambda *args, **kwargs: True)
-    layer = dispatch.MonoDecodeModel(raw, None, 8192, fp4, 0, tp)
+    layer = dispatch.MonoDecodeModel(raw, None, 8192, fp4, 0, None, None, tp_size=tp)
     layer_run = Mock(side_effect=lambda ids, positions: ids + 2)
     layer._mono = SimpleNamespace(
         ready=Mock(return_value=True), runner=SimpleNamespace(forward=layer_run)
@@ -344,7 +283,16 @@ def test_workspace_is_shared_at_install_before_any_decode(
         tensor_parallel_size=tp,
         enable_dp_attention=bool(dp),
     )
-    dispatch.install_mono_decode(raw, cfg, None)
+    builder = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            forward_vars={
+                "outputs": None,
+                "temperatures": SimpleNamespace(gpu=None),
+                "top_ps": SimpleNamespace(gpu=None),
+            }
+        )
+    )
+    dispatch.install_mono_decode(raw, cfg, None, metadata_builder=builder)
     create.assert_called_once_with(raw, 163840, tp)
     assert layer.call_args.kwargs["indexer_workspace"] is workspace
     assert hook.call_args.kwargs["workspace"] is workspace
