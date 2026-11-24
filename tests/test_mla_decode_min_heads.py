@@ -43,6 +43,7 @@ class _AiterShapeSupport:
         return SimpleNamespace(native=self.native, supported=self.supported)
 
 
+# aiter_shape, native, _layer and _set are reused by test_mla_page_size_guard.py.
 @pytest.fixture
 def aiter_shape(monkeypatch):
     fake = _AiterShapeSupport()

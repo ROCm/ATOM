@@ -1,22 +1,37 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Sparse MLA (DSA) runs only at ATOM_MLA_PAGE_SIZE=1: the indexer's top-k
-indices are token slots, which a paged MLA kernel would read as page ids."""
+indices are token slots, which a paged MLA kernel would read as page ids.
+
+Builds real MLAAttention layers against the stand-in AITER, so Pre Checkin
+(no AITER) runs this file."""
 
 import pytest
+from test_mla_decode_min_heads import _layer, _set, aiter_shape, native  # noqa: F401
 
 
 @pytest.mark.parametrize(
-    "page_size,is_sparse_mla,rejected",
-    [(1, True, False), (64, True, True), (64, False, False), (1, False, False)],
+    "sparse, changes, rejected",
+    [
+        (True, ["page size 64"], True),
+        # No segmented layout here, but sparse prefill still pages by the env.
+        (True, ["page size 64", "triton mla"], True),
+        (False, ["page size 64"], False),
+        (False, ["page size 64", "triton mla"], False),
+        (True, [], False),
+    ],
+    ids=["sparse-seg", "sparse-triton", "dense-seg", "dense-triton", "sparse-page1"],
 )
-def test_sparse_mla_requires_page_size_one(page_size, is_sparse_mla, rejected):
-    pytest.importorskip("triton", reason="attention_mla defines @triton.jit kernels")
-    pytest.importorskip("aiter", reason="attention_mla imports the AITER runtime")
-    from atom.model_ops.attention_mla import check_sparse_mla_page_size
-
-    kwargs = {"mla_page_size": page_size, "is_sparse_mla": is_sparse_mla}
+def test_sparse_layer_requires_page_size_one(
+    native, monkeypatch, sparse, changes, rejected  # noqa: F811
+):
+    _set(monkeypatch, native, "indexer")
+    for change in changes:
+        _set(monkeypatch, native, change)
     if rejected:
-        with pytest.raises(RuntimeError, match="ATOM_MLA_PAGE_SIZE=1"):
-            check_sparse_mla_page_size(**kwargs)
+        with pytest.raises(
+            RuntimeError, match="Sparse MLA requires ATOM_MLA_PAGE_SIZE=1"
+        ):
+            _layer(native, sparse=sparse)
     else:
-        check_sparse_mla_page_size(**kwargs)
+        _layer(native, sparse=sparse)
