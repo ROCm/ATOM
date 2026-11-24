@@ -1711,6 +1711,7 @@ mod i_atom_structured_output {
             .model_id("m")
             // An ATOM worker reporting none has its chats refused.
             .label("chat_template", "{{ messages }}");
+        test_mocks::app_context::loaded_with_worker_template(&ctx, "m", "{{ messages }}");
         for (key, value) in labels {
             worker = worker.label(*key, *value);
         }
@@ -1832,6 +1833,7 @@ mod i_atom_structured_output {
             .model_id("m")
             .label("chat_template", "{{ messages }}");
         ctx.worker_registry.register(Arc::new(worker.build()));
+        test_mocks::app_context::loaded_with_worker_template(&ctx, "m", "{{ messages }}");
         let raw = serde_json::to_vec(&body).unwrap();
         let declared = MessageTools::read(&raw).unwrap();
         let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
