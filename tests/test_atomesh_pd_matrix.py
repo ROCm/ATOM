@@ -142,6 +142,14 @@ class KvConnectorPlacementTest(unittest.TestCase):
         for role in ("common", "prefill", "decode"):
             self.assertEqual(cell["env"][role]["KV_CONNECTOR"], "moriio")
 
+    def test_launch_time_references_stay_for_the_launcher(self):
+        config = (
+            '{"proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},'
+            '"ib_device":"${WORKER_RDMA_DEVICES}"}'
+        )
+        cell = expand_cell(env={"decode": {"DECODE_KV_TRANSFER_CONFIG": config}})
+        self.assertEqual(cell["env"]["decode"]["DECODE_KV_TRANSFER_CONFIG"], config)
+
 
 class SetFilterTest(unittest.TestCase):
     def test_blank_and_all_mean_no_filter(self):
