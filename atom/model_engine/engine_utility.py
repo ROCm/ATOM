@@ -1082,7 +1082,15 @@ class EngineUtilityHandler:
 
     def _handle_set_offload_lookups(self, args: dict) -> dict:
         """Turn the offload tier's lookups for new requests on or off."""
-        enabled = bool((args or {}).get("enabled", True))
+        enabled = args.get("enabled") if isinstance(args, dict) else None
+        if not isinstance(enabled, bool):
+            # Not coerced: a missing value or "false" would switch lookups on.
+            reply = {
+                "cmd": "set_offload_lookups",
+                "error": f"enabled must be a bool, got {enabled!r}",
+            }
+            self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
+            return reply
         setter = getattr(
             getattr(self.scheduler, "kv_connector", None), "set_offload_lookups", None
         )

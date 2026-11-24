@@ -2,8 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """The runtime switch that stops an lmcache_mp tier's lookups for new requests
 (`POST /offload/lookups`): no lookup, no load plan and no admission wait once
-off, while an answer held from before still loads and a committed load still
-re-takes its pin."""
+off, while an answer held from before still loads and a load planned before
+the switch still re-takes its pin."""
 
 import queue
 import time
@@ -28,6 +28,9 @@ from atom.kv_transfer.offload.mp import lookup as mp_lookup
 from atom.kv_transfer.offload.mp import transfer
 from atom.kv_transfer.offload.mp.connector import (
     LMCacheMPConnectorScheduler as MPSchedulerShell,
+)
+from atom.kv_transfer.offload.mp.scheduler import (
+    LMCacheMPConnectorScheduler as MPScheduler,
 )
 from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.sequence import SequenceStatus
@@ -70,6 +73,21 @@ def test_lookups_are_on_until_switched_off(monkeypatch):
     sched, _, adapter = _scheduler(monkeypatch)
     sched.prefetch_lookups([_seq()])
     assert len(adapter._client.lookups) == 1
+
+
+def test_the_switch_adds_nothing_to_a_scheduler_until_it_is_switched_off(
+    monkeypatch,
+):
+    # The off checks live on the instance, so serving with lookups on runs
+    # the base methods as it did before the switch existed.
+    names = {"_lookup_wanted", "lookup_pending", "lookup_would_defer"}
+    assert not names & vars(MPScheduler).keys()
+    sched, _, _ = _scheduler(monkeypatch)
+    assert not names & vars(sched).keys()
+    sched.set_offload_lookups(False)
+    assert names <= vars(sched).keys()
+    sched.set_offload_lookups(True)
+    assert not names & vars(sched).keys()
 
 
 def test_switched_off_a_new_request_is_not_looked_up_and_leaves_no_state(
@@ -183,17 +201,26 @@ def test_a_plan_without_a_held_answer_is_dropped_by_the_switch(monkeypatch):
     assert adapter._client.lookups == []
 
 
-def test_a_committed_load_still_retakes_its_pin(monkeypatch):
-    # Only async lookups are off: a load planned from a remembered hit asks
-    # the tier again, synchronously, before it is dispatched.
+def test_a_load_planned_before_the_switch_retakes_its_pin_with_one_lookup(
+    monkeypatch,
+):
+    # The one lookup left once off. A load planned before the switch (here
+    # from a remembered hit, so with no answer held) asks the tier again,
+    # synchronously, when it is dispatched.
     sched, _, adapter = _scheduler(monkeypatch)
-    adapter.maybe_submit_lookup_request = lambda request_id, _tokens: (
-        adapter._lookup_results.__setitem__(request_id, HIT)
-    )
+    asked = []
+
+    def lookup(request_id, _tokens):
+        asked.append(request_id)
+        adapter._lookup_results[request_id] = HIT
+
+    adapter.maybe_submit_lookup_request = lookup
+    spec = LoadSpec(hbm_cached_tokens=0, lmcache_cached_tokens=HIT, can_load=True)
+    sched._load_specs["7"] = spec
     sched.set_offload_lookups(False)
 
-    spec = LoadSpec(hbm_cached_tokens=0, lmcache_cached_tokens=HIT, can_load=True)
     assert sched._ensure_lookup_pin(_seq(), "7", spec) is True
+    assert len(asked) == 1
 
 
 def test_the_mp_shell_forwards_the_switch_to_its_scheduler(monkeypatch):
@@ -221,6 +248,29 @@ def test_a_saving_scheduler_refuses_the_switch(monkeypatch):
     ],
 )
 def test_the_utility_command_reports_whether_the_connector_took_it(connector, applied):
+    assert _utility_replies(connector, enabled=False) == [
+        {
+            "cmd": "set_offload_lookups",
+            "result": {"enabled": False, "applied": applied},
+            "request_id": "u1",
+        }
+    ]
+
+
+@pytest.mark.parametrize("args", [{}, {"enabled": "false"}, {"enabled": 0}])
+def test_the_utility_command_rejects_an_enabled_that_is_not_a_bool(args):
+    # Coerced, a missing value or "false" would switch lookups on.
+    seen = []
+    connector = SimpleNamespace(
+        set_offload_lookups=lambda enabled: seen.append(enabled) or True
+    )
+    (reply,) = _utility_replies(connector, **args)
+    assert "enabled must be a bool" in reply["error"]
+    assert "result" not in reply
+    assert seen == []
+
+
+def _utility_replies(connector, **args):
     out = queue.Queue()
     handler = EngineUtilityHandler(
         _RunnerMgr(),
@@ -230,15 +280,9 @@ def test_the_utility_command_reports_whether_the_connector_took_it(connector, ap
     )
     handler.engine = _Engine()
     handler._execute_utility_command(
-        "set_offload_lookups", {"enabled": False, "request_id": "u1"}
+        "set_offload_lookups", {**args, "request_id": "u1"}
     )
-    assert _responses(out) == [
-        {
-            "cmd": "set_offload_lookups",
-            "result": {"enabled": False, "applied": applied},
-            "request_id": "u1",
-        }
-    ]
+    return _responses(out)
 
 
 @pytest.mark.parametrize(

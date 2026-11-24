@@ -317,9 +317,11 @@ A load-only tier (`kv_role: kv_consumer`) can stop being asked once what it
 holds is back in HBM, for example a recorded benchmark warmup after it was
 replayed: `POST /offload/lookups` with `{"enabled": false}` makes every DP
 engine start no tier lookup for new requests, and `true` resumes them. An
-answer a request already holds still loads. A lookup that no request has
-consumed yet, answered or still in flight, is released, so that request
-prefills its prompt and is not held back waiting for the tier. The call
+answer a request already holds still loads, and a load planned before the
+switch re-takes its pin with one synchronous lookup when it is dispatched. A
+lookup that no request has consumed yet, answered or still in flight, is
+released, so that request prefills its prompt and is not held back waiting
+for the tier. The call
 answers 409 with each engine's reply unless all of them applied it. A tier
 that saves refuses to switch off: without a lookup its saves would store
 every prompt from token 0.
