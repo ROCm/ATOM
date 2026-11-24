@@ -662,6 +662,9 @@ def layer_part(E, Ly, part):
         # (cold) the index chain and the Engram stages: unlikely, so block placement moves them past the layer loop's
         # hot path (the plain layers' C runs straight into D instead of jumping over ~8.7K instructions)
         if hx.unlikely(isidx):
+            pci = hx.getpc()   # the index chain's entry PC (its code -> L2 from every layer's MoE: see below)
+            if (b == 0) & (t == 0):
+                hx.gstore(fptr(fp, "cyc") + i64(CODE_END_OFF + 24), pci)
             # (contract 6.4) iq reads A2's q blocks + ss (the 40 q-block flags), iw / the compressor GEMM read axn (the 32
             # publishers' flags; layer 0: the entry front's, before the loop): LL waits, not the ATTN_A handoff
             lfl0 = ltab(fp, Ly, "lflags")()
@@ -1036,6 +1039,14 @@ def layer_part(E, Ly, part):
                               part2=plog(P2F), cnt2=lc + i64(LY.MIX_POST)), TR)
 
     # ---- (design 7) the FFN / MoE block per row (TileRT F0 / top-k wave 0 / H / I / G / G' / J)
+    if fx.const_expr(not DRS):
+        # the index chain's code (~35 KB, laid out past the layer loop's hot path) -> L2 again, 64 KB from its recorded
+        # entry PC, one CTA in 16 (a cluster's L2): the weight stream evicts it every layer and the index layers fetched it
+        # cold from HBM (single-GPU step, 909: sources / L20 -4.3, readers -3.0 us a layer, plain layers 0; no per-layer
+        # condition: reading the next row's lflags on every CTA cost the plain layers +0.4)
+        if hx.unlikely(b % 16 == 0):
+            hx.code_prefetch_from(hx.opaque_v(fx.thread_idx.x), fptr(fp, "cyc") + i64(CODE_END_OFF + 24),
+                                  fptr(fp, "cyc") + i64(CODE_END_OFF), 64)
     mfl = plog(DNF) + i64(par) * 40960
     cr = dict(t=t, b=b, w=w, l=l, sm=sm + FLO, rank=rank, recv=c["recv"], mflag=mfl, mtag=hx.epoch32(tep, Ly, 14),
               shact=mfl + i64(MS.SHACT), ids_lds=moe_ids == "ids", ids=fptr(fp, moe_ids), ktop=RTOPK,

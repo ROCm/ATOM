@@ -366,6 +366,21 @@ def code_prefetch_near(t, b, endp, kb, off=0, one_in=1, pc=None):
 
 
 @_ASTR.transform
+def code_prefetch_from(t, recp, endp, kb):
+    """Warm L2 with the code from the PC a stage recorded at recp (its entry, written by its first run) for kb KB, one
+    128-byte global_prefetch a line, the CTA's threads striding over it; bounded by the recorded end (endp): nothing
+    before both are recorded or on an implausible range."""
+    st = gload(recp, fx.Int64)
+    end = gload(endp, fx.Int64)
+    ok = (st > fx.Int64(0)) & (end > st) & (end - st < fx.Int64(512 * 1024))
+    nl = ok.select(fx.min((end - st) // 128, fx.Int64(kb * 8)), fx.Int64(0))
+    for j in range_constexpr((kb * 8 + 255) // 256):
+        i = fx.Int64(t) + fx.Int64(j * 256)
+        if i < nl:
+            prefetch(st + i * 128)
+
+
+@_ASTR.transform
 def code_end(t, b, endp):
     """Record this kernel's PC near its end for the next run's code_prefetch."""
     if (b == 0) & (t == 0):
