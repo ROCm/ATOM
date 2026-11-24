@@ -46,6 +46,7 @@ EXTENDED = {
     "v41.draft.markov",
     "v41.spec.verify_sample",
     "v41.block.mhc",
+    "v41.attn.query_rope_quant",
 }
 
 

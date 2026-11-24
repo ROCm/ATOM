@@ -179,6 +179,60 @@ def test_a_row_count_aiter_does_not_fuse_keeps_wq_b(fuse, monkeypatch):
     assert _plan(6) == ("G", None)
 
 
+def test_a_planned_owner_of_the_query_seam_answers_before_aiter(fuse, monkeypatch):
+    """`v41.attn.query_rope_quant`: the owner is asked through `explain` with
+    what exists before the norm ran; where it declines AITER's predicate
+    decides, and with neither wq_b keeps its launch."""
+    fuse("kv", "q")
+    asked = []
+
+    def explain(seam, *inputs, captured=False, bucket=None, **kwargs):
+        asked.append((seam, inputs, kwargs))
+        rows = inputs[4].numel()
+        return SimpleNamespace(route="plugin" if rows != 64 else "native")
+
+    monkeypatch.setattr(host, "owns", lambda seam, rows=None: seam == qpath.QUERY_SEAM)
+    monkeypatch.setattr(host, "explain", explain)
+    monkeypatch.setattr(qpath, "_aiter_rope_quant", lambda: (None, None))
+    assert _plan(6) == ("G", "G")
+    seam, inputs, kwargs = asked[-1]
+    assert seam == "v41.attn.query_rope_quant"
+    assert [inputs[i] for i in (0, 1, 7, 8)] == [None] * 4
+    assert inputs[2].shape == (64 * 512, 1280) and inputs[4].numel() == 6
+    assert kwargs == {"head_dim": 512, "rope_dim": 64, "fuse_cos": True}
+    assert _plan(64) == ("P", None)  # the owner declines, AITER has no op
+    monkeypatch.setattr(qpath, "_aiter_rope_quant", lambda: ("op", lambda *a: True))
+    assert _plan(64) == ("P", "G")  # the owner declines, AITER fuses
+
+
+def test_the_query_launch_without_an_owner_is_aiters_or_the_two_launches(
+    fuse, monkeypatch
+):
+    calls = []
+
+    def op(x, w, x_scale, w_scale, *rest, **form):
+        calls.append(("aiter", x, w, x_scale, w_scale, form))
+        return "y"
+
+    def unfused(x, x_scale, positions, q_fp8, q_scale):
+        calls.append(("unfused", x, x_scale, positions, q_fp8, q_scale))
+        return "y2"
+
+    args = ("x", "xs", "w", "ws", "pos", "cos", "sin", "q", "qs")
+    monkeypatch.setattr(qpath, "_aiter_rope_quant", lambda: (op, None))
+    assert (
+        qpath.rope_quant_gemm(*args, unfused=unfused, head_dim=512, rope_dim=64) == "y"
+    )
+    monkeypatch.setattr(qpath, "_aiter_rope_quant", lambda: (None, None))
+    assert (
+        qpath.rope_quant_gemm(*args, unfused=unfused, head_dim=512, rope_dim=64) == "y2"
+    )
+    assert calls == [
+        ("aiter", "x", "w", "xs", "ws", {"head_dim": 512, "rope_dim": 64}),
+        ("unfused", "x", "xs", "pos", "q", "qs"),
+    ]
+
+
 def test_a_half_left_behind_must_round_as_the_full_launch(fuse):
     """One item alone: the other half is launched by the program that runs it
     alone, and the item fuses only where that program has the same form."""

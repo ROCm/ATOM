@@ -379,7 +379,7 @@ class ModelOptions:
     # Launch fusions of the decode query path, by item name
     # (`atom.models.deepseek_v41_plugin.qpath_fuse`): "kv", the q/kv norm
     # also rotates, quantizes and stores the KV row; "q", wq_b also writes
-    # the rotated MXFP8 query.
+    # the rotated MXFP8 query (the `v41.attn.query_rope_quant` seam).
     qpath_fuse: tuple[str, ...] = ()
     # The RoPE / window launch runs the kernel `qpath_fuse` records its
     # rotation forms from (`atom.model_ops.deepseek_v41.rope_window_reference`).

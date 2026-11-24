@@ -127,7 +127,8 @@ weights layout, loader, runtime (graphs, bounded replay, guarded ops) and mono d
   used only for the very rows it was written with, so it is read whether the owner calls
   `single_stream_moe_forward` or the shared expert itself. `7`: the shared expert's
   `silu_and_mul` and the `quantize_fp8` in front of `w2` become AITER's `silu_mul_mxfp8`
-  (gfx950). Item 1 asks for the Mega-MHC launch `ffn_mhc_fuse_quant` asks for and item 7
+  (gfx950, an AITER that has the op; the same span is the `v41.moe.shared_act` seam, so a
+  plugin owner of that seam serves it on any AITER and the item stays off). Item 1 asks for the Mega-MHC launch `ffn_mhc_fuse_quant` asks for and item 7
   replaces the launches `shared_act_quant` replaces, by another kernel: a recipe that sets an
   item and that option is refused.
 - `model_options.attn_out_quant_fuse`: a decode step's MXFP8 sparse attention (gfx950, 64
@@ -138,13 +139,16 @@ weights layout, loader, runtime (graphs, bounded replay, guarded ops) and mono d
   of that seam, of `v41.attn.attend` or of `v41.attn.out_full` keeps its calls. The fused
   tail reads fp32 RoPE tables; the model's are BF16, so fp32 twins of them, value for value,
   are built with the model. Prefill, bounded replay, A8W4 and an AITER without the op are
-  unchanged.
+  unchanged; on such an AITER a plugin owner of `v41.attn.attend_out` serves the span and
+  the option stays off.
 - `model_options.qpath_fuse`: a list of items that move the two halves of a decode step's
   RoPE / window launch (`rope_quant_window`) onto the launches that produce their inputs; with
   both, that launch is gone. `"kv"`: the q/kv norm launch also rotates, MXFP8-quantizes and
   stores each normed KV row into the window (`dual_rmsnorm_mxfp8_kv_window`). `"q"`: `wq_b`
-  runs AITER's `gemm_a8w8_mxscale_bpreshuffle_rope_quant`, the tuned GEMM kernel of the row
-  count, whose epilogue also writes the rotated MXFP8 query. Decode steps of the MXFP8 KV and
+  runs the tuned GEMM kernel of the row count with an epilogue that also writes the rotated
+  MXFP8 query, through the `v41.attn.query_rope_quant` seam: a planned plugin owner serves
+  it, else AITER's `gemm_a8w8_mxscale_bpreshuffle_rope_quant` where the AITER in use has
+  it, else `wq_b` keeps its launch. Decode steps of the MXFP8 KV and
   window cache only (gfx950, 64 heads of 512, the native MXFP8 q/kv norm, all rows, no owner of
   `v41.attn.qk_norm`, not a step `fused_attn` serves); `wq_b` then runs ahead of the scorer.
   A half that is not fused runs the launch it has alone. The rotation is computed with explicit
@@ -236,16 +240,20 @@ def register(host):
 
 ## Seams of the plugin model
 
-`v41.block.ffn`, `v41.block.transition`, `v41.block.mhc`, `v41.attn.out`,
-`v41.attn.project_out`, `v41.attn.out_full`, `v41.attn.attend_out`, `v41.attn.qk_norm`,
-`v41.attn.attend`, `v41.attn.index_topk`, `v41.moe.shared_act`, `v41.moe.shared_expert`,
-`v41.moe.topk`, `v41.op.quant_fp8_g32`, `v41.draft.ctx`, `v41.draft.markov`,
-`v41.spec.verify_sample`, `v41.mono.install`. Unowned, each binds to its native (no
-Python on the hot path).
+`v41.block.ffn`, `v41.block.transition`, `v41.attn.out`, `v41.attn.project_out`,
+`v41.attn.out_full`, `v41.attn.attend_out`, `v41.attn.qk_norm`, `v41.attn.attend`,
+`v41.attn.index_topk`, `v41.moe.shared_act`, `v41.moe.shared_expert`, `v41.moe.topk`,
+`v41.op.quant_fp8_g32`, `v41.draft.ctx`, `v41.draft.markov`, `v41.spec.verify_sample`,
+`v41.mono.install`. Unowned, each binds to its native (no Python on the hot path).
+Two more are single launches: `v41.block.mhc` and `v41.attn.query_rope_quant`.
 
 `v41.block.mhc` is the HIP Mega-MHC launch of a sublayer seam (the arguments and the five
 results of AITER's `mega_mhc`); an owner selects the calls it serves and the rest stay
-AITER's.
+AITER's. `v41.attn.query_rope_quant` is `model_options.qpath_fuse` item `"q"`'s launch;
+the fused query path decides a step before the norm has run, so it asks the seam's owner
+through `explain` with the inputs that do not exist yet (`x_fp8`, `x_scale`, `q_fp8`,
+`q_scale`) as None, and an owner answers from the weight, its scale, the positions and
+the tables.
 
 Spans that contain other spans yield to a finer owner: fused attention (#3645) runs
 only where no plan owns `v41.attn.qk_norm` / `v41.attn.attend`; `v41.attn.out_full`

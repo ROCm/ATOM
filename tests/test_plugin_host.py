@@ -437,6 +437,15 @@ def test_select_reads_only_what_the_key_holds():
             "hc_sinkhorn_eps",
             "hc_post_mult_value",
         ),
+        # asked before x and the query buffers exist (`explain`, at plan time)
+        "v41.attn.query_rope_quant": (
+            "x_fp8",
+            "x_scale",
+            "w_scale",
+            "sin",
+            "q_fp8",
+            "q_scale",
+        ),
         "v41.attn.attend": (
             "kv_indices_prefix",
             "kv_indptr_prefix",

@@ -1021,7 +1021,6 @@ class Attention(nn.Module):
         else:
             qr, qr_scale, kv_normed = norm(q_lora, kv_pre)
         if q_fused:
-            rope_quant_gemm, _ = qpath_fuse._aiter_rope_quant()
             rows = lead.numel()
             query_fp8 = (
                 torch.empty(
@@ -1035,13 +1034,25 @@ class Attention(nn.Module):
                     device=qr.device,
                 ),
             )
+
+            def unfused(x_fp8, x_scale, positions, q_fp8, q_scale):
+                # What the two launches give: wq_b, then the query alone.
+                y = self.wq_b(x_fp8, x_scale=x_scale)
+                cache.rotate_query(
+                    y.view(*lead, self.heads, self.head_dim),
+                    rope,
+                    positions,
+                    (q_fp8, q_scale),
+                )
+                return y
+
             # wq_b's own GEMM call (`native_quant_linear`), by the kernel it
             # runs at this row count, with the query half of
             # `rope_quant_window` in its epilogue.
-            query = rope_quant_gemm(
+            query = qpath_fuse.rope_quant_gemm(
                 qr.view(rows, -1),
-                self.wq_b.weight,
                 qr_scale.view(rows, -1),
+                self.wq_b.weight,
                 self.wq_b.weight_scale,
                 step.positions,
                 cos,
@@ -1050,6 +1061,7 @@ class Attention(nn.Module):
                 query_fp8[1],
                 head_dim=self.head_dim,
                 rope_dim=rope.rope_dim,
+                unfused=unfused,
                 **q_form,
             ).view(*lead, self.heads, self.head_dim)
         else:

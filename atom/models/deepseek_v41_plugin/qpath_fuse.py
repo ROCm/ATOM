@@ -11,15 +11,17 @@ item names; empty (the default) leaves every path as it was and loads nothing.
 
   kv  the q/kv norm launch also runs each normed KV row through the KV half
       of `rope_quant_window` (`dual_rmsnorm_mxfp8_kv_window`).
-  q   `wq_b` runs AITER's `gemm_a8w8_mxscale_bpreshuffle_rope_quant`: the
-      tuned GEMM kernel of this row count, whose epilogue also writes the
-      rotated MXFP8 query attention reads.
+  q   `wq_b` runs the tuned GEMM kernel of this row count with an epilogue
+      that also writes the rotated MXFP8 query attention reads: the
+      `v41.attn.query_rope_quant` seam, served by a planned plugin owner or
+      by AITER's `gemm_a8w8_mxscale_bpreshuffle_rope_quant` where the
+      AITER in use has it.
 
 Both items serve a decode step of the MXFP8 cache only (FP8 KV and window,
 not packed), on gfx950, at V4.1-Flash widths, where the q/kv norm is the
 native MXFP8 one and no fused attention (`model_options.fused_attn`) serves
-the step; `q` further needs AITER's fused epilogue for the tuned kernel at
-this row count. Anything else -- prefill, bounded replay, other shapes or
+the step; `q` further needs a fused epilogue for the tuned kernel at this
+row count (the seam's owner, or AITER's). Anything else -- prefill, bounded replay, other shapes or
 arches, an item that is off -- keeps today's launches for that half.
 
 What the two launches give is fixed up to one thing, the rotation's rounding.
@@ -94,6 +96,8 @@ PROVEN_FINGERPRINTS = frozenset({"10aa874fab0393fd"})
 # Seams whose native body the fused path stands in for. An owner of any of
 # them keeps the calls it would have got.
 _SEAMS = ("v41.attn.qk_norm",)
+# Item q's launch: wq_b's GEMM that also writes the rotated MXFP8 query.
+QUERY_SEAM = "v41.attn.query_rope_quant"
 
 
 def items() -> tuple[str, ...]:
@@ -146,6 +150,97 @@ def _aiter_rope_quant():
     except (ImportError, TypeError, ValueError):
         return None, None
     return op, gemm_a8w8_mxscale_bpreshuffle_rope_quant_fuses
+
+
+def query_fuses(wq_b, rows, positions, cos, sin, fuse_cos) -> bool | None:
+    """Whether item q's launch serves this step: a planned owner of
+    `QUERY_SEAM` answers first (its select, asked through `explain` with what
+    exists before the norm ran -- the weight, its scale, the positions and
+    the tables), then AITER's own predicate. None: neither exists."""
+    from atom import plugin_host
+
+    weight, scale = wq_b.weight, wq_b.weight_scale
+    if plugin_host.owns(QUERY_SEAM):
+        captured, bucket = plugin_host._graph_state()
+        decision = plugin_host.explain(
+            QUERY_SEAM,
+            None,
+            None,
+            weight,
+            scale,
+            positions,
+            cos,
+            sin,
+            None,
+            None,
+            captured=captured,
+            bucket=bucket,
+            head_dim=HEAD_DIM,
+            rope_dim=ROPE_DIM,
+            fuse_cos=fuse_cos,
+        )
+        if decision.route == "plugin":
+            return True
+    op, fuses = _aiter_rope_quant()
+    if op is None:
+        return None
+    return bool(
+        fuses(
+            rows,
+            weight.shape[0],
+            weight.shape[1],
+            tuple(scale.shape),
+            HEAD_DIM,
+            ROPE_DIM,
+        )
+    )
+
+
+def rope_quant_gemm(
+    x_fp8,
+    x_scale,
+    w,
+    w_scale,
+    positions,
+    cos,
+    sin,
+    q_fp8,
+    q_scale,
+    *,
+    unfused,
+    **form,
+):
+    """Item q's launch through `QUERY_SEAM`: bf16 `[M, N]`, the rotated MXFP8
+    query written into `q_fp8` / `q_scale`. ``form``: `head_dim`, `rope_dim`
+    and, for form G, `fuse_cos=True` (the default form is left unnamed). An
+    owner that declines a call it accepted at plan time leaves it to AITER's
+    op, or, on an AITER without one, to ``unfused`` (the GEMM, then the
+    query's own rotate-and-quantize launch)."""
+    from atom import plugin_host
+
+    op, _ = _aiter_rope_quant()
+
+    def native(x_fp8, x_scale, w, w_scale, positions, cos, sin, q_fp8, q_scale, **form):
+        if op is None:
+            return unfused(x_fp8, x_scale, positions, q_fp8, q_scale)
+        return op(
+            x_fp8, w, x_scale, w_scale, positions, cos, sin, q_fp8, q_scale, **form
+        )
+
+    return plugin_host.call(
+        "v41.attn.query_rope_quant",
+        native,
+        x_fp8,
+        x_scale,
+        w,
+        w_scale,
+        positions,
+        cos,
+        sin,
+        q_fp8,
+        q_scale,
+        **form,
+    )
 
 
 @functools.lru_cache(maxsize=1)
@@ -382,23 +477,18 @@ def plan_forms(attn, hidden, cache, step, rope, queries):
         )
     q, q_why = False, "not fused"
     if enabled("q") and state[1]:
-        op, fuses = _aiter_rope_quant()
-        weight, scale = attn.wq_b.weight, attn.wq_b.weight_scale
         if rows < Q_MIN_ROWS:
             q_why = f"not fused (fewer than {Q_MIN_ROWS} rows)"
-        elif op is None:
-            q_why = "not fused (AITER has no fused epilogue with a rotation form)"
         else:
-            q = bool(
-                fuses(
-                    rows,
-                    weight.shape[0],
-                    weight.shape[1],
-                    tuple(scale.shape),
-                    HEAD_DIM,
-                    ROPE_DIM,
-                )
+            fuses = query_fuses(
+                attn.wq_b, rows, positions, tables[1], tables[2], full["q"] == "G"
             )
+            if fuses is None:
+                q_why = (
+                    "not fused (no plugin owner of the query seam, and AITER "
+                    "has no fused epilogue with a rotation form)"
+                )
+            q = bool(fuses)
     # A half that stays behind is launched by the program that runs it alone.
     # That program must round as the full launch does, or the pair is not
     # what the two launches give.

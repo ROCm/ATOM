@@ -322,6 +322,32 @@ SEAMS = MappingProxyType(
                 "into x_fp8/x_scale (wo_a's input pair); out is the BF16 scratch",
             ),
             _seam(
+                "v41.attn.query_rope_quant",
+                1,
+                "op",
+                "call",
+                (
+                    "x_fp8",
+                    "x_scale",
+                    "w",
+                    "w_scale",
+                    "positions",
+                    "cos",
+                    "sin",
+                    "q_fp8",
+                    "q_scale",
+                ),
+                ("head_dim", "rope_dim", "fuse_cos"),
+                ("y",),
+                ("positions", "w", "cos"),
+                "capture_safe",
+                _V41 + "qpath_fuse.py",
+                doc="wq_b's GEMM whose launch also writes the rotated MXFP8 query "
+                "into q_fp8/q_scale (model_options.qpath_fuse item q): bf16 [M, N]."
+                " Asked before the norm ran through explain(), with x_fp8, x_scale,"
+                " q_fp8 and q_scale None: a select answers from the rest",
+            ),
+            _seam(
                 "v41.moe.topk",
                 1,
                 "op",
