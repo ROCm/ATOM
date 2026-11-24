@@ -172,3 +172,12 @@ def test_eplb_collects_only_layers_before_declared_end():
     assert sorted(eplb.collect_ep_moe_layers(model)) == [3]
     model.eplb_layer_end = None
     assert sorted(eplb.collect_ep_moe_layers(model)) == [3, 4]
+
+
+def test_child_cannot_override_the_models_eplb_boundary():
+    model = _FakeTarget()
+    model.moe3.eplb_layer_end = 4
+    assert sorted(eplb.collect_ep_moe_layers(model)) == [3, 4]
+    model.eplb_layer_end = 4
+    model.moe3.eplb_layer_end = 3
+    assert sorted(eplb.collect_ep_moe_layers(model)) == [3]

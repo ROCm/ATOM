@@ -242,8 +242,8 @@ class _ExternalModuleLoader(importlib.abc.Loader):
 
 class _ExternalModuleFinder(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path, target=None):
-        if fullname in {"aiter", "triton"} or fullname.startswith(
-            ("aiter.", "triton.")
+        if fullname in {"aiter", "triton", "flydsl"} or fullname.startswith(
+            ("aiter.", "triton.", "flydsl.")
         ):
             return importlib.util.spec_from_loader(
                 fullname, _ExternalModuleLoader(), is_package=True
@@ -253,17 +253,18 @@ class _ExternalModuleFinder(importlib.abc.MetaPathFinder):
 
 @contextmanager
 def stubbed_external_kernel_modules():
-    """Serve every `aiter` / `triton` import from a stand-in: the names in
+    """Serve external AITER, Triton and FlyDSL kernel imports from stand-ins: the names in
     `_external_module_attributes` are real, any other attribute is a MagicMock."""
     # Torch imports its own optional Triton integration lazily. Resolve that
     # first so this test's deliberately small Triton stub cannot affect it.
     importlib.import_module("torch._dynamo.config")
+    importlib.import_module("torch._inductor.compile_fx")
 
-    prefixes = ("aiter", "triton")
+    prefixes = ("aiter", "triton", "flydsl")
     saved = {
         name: module
         for name, module in sys.modules.items()
-        if name in prefixes or name.startswith(("aiter.", "triton."))
+        if name in prefixes or name.startswith(("aiter.", "triton.", "flydsl."))
     }
     for name in saved:
         sys.modules.pop(name, None)
@@ -275,7 +276,7 @@ def stubbed_external_kernel_modules():
     finally:
         sys.meta_path.remove(finder)
         for name in list(sys.modules):
-            if name in prefixes or name.startswith(("aiter.", "triton.")):
+            if name in prefixes or name.startswith(("aiter.", "triton.", "flydsl.")):
                 sys.modules.pop(name, None)
         sys.modules.update(saved)
 

@@ -149,8 +149,14 @@ and optional target graphs; its draft
 windows, accepted-prefix state, calibration profile, supported scope and **quality
 limitations** are in [the DSpark guide](deepseek_v41_dspark.md). Packed
 speculative caches and multimodal speculation are rejected, as are
-PP/CP, DP without DP attention, decode TBO, KV transfer other than `lmcache_mp`, RapidServe
-and EPLB — all before loading. Plugin execution is no longer among them: V4.1
+PP/CP, DP without DP attention, decode TBO, KV transfer other than `lmcache_mp`,
+and RapidServe — all before loading. EPLB is supported with expert parallelism:
+under decoder bounded replay it places only layers before `decoder_start`
+(0..19 on V4.1-Flash), whose prefills run every row. Later layers keep the
+ordinary EP expert layout, without redundant slots, remapping, load recording
+or migration. Without decoder bounded replay, EPLB places all target MoE
+layers. V4.1 mono decode refuses EPLB because its kernel reads logical expert
+IDs directly. Plugin execution is no longer among them: V4.1
 runs on the vLLM plugin backend, described in
 [the plugin backend guide](vllm_plugin_backend_guide.md). `lmcache_mp` offloads PAGE units. With
 encoder SWA bounded replay (the default) it moves PAGE alone, and a tier load

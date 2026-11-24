@@ -254,20 +254,28 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         # Validate their final width here, before allocating model parameters.
         if getattr(config, "enable_tbo", False):
             validate_tbo_parallelism(config)
+        replay_requested = getattr(config, "enable_decoder_swa_bounded_replay", False)
+        reason = (
+            decoder_replay_unsupported(config.hf_config) if replay_requested else None
+        )
+        # Decide before constructing the MoE weights. The same boundary owns
+        # both their layout and the runtime model's EPLB collection contract.
+        self.replay = replay_requested and reason is None
+        if self.replay:
+            self.decoder_start = late_layer_start(config.hf_config) - 1
         super().__init__(
             config.hf_config,
             max_length=config.max_model_len,
             online_quant_config=config.online_quant_config,
+            eplb_layer_end=self.eplb_layer_end,
         )
         for i, layer in enumerate(self.layers):
             atom_config.compilation_config.static_forward_context[layer.layer_name] = (
                 layer,
                 self._rope(i),
             )
-        self.replay = False
         self.late_aux_layers, self.aux_buffers = (), None
-        if getattr(config, "enable_decoder_swa_bounded_replay", False):
-            reason = decoder_replay_unsupported(config.hf_config)
+        if replay_requested:
             if reason is None:
                 self._build_replay_stages(config)
             else:
