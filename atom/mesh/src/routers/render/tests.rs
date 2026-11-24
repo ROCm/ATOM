@@ -4352,36 +4352,39 @@ mod f_atom_reasoning_opener {
         assert_eq!(streamed("still planning", Some("<think>")).await, expected);
     }
 
+    /// Replayed 256 ids at a time, among them a reply whose closer the 256th id cuts
+    /// after its "<".
     #[tokio::test]
     async fn a_long_reply_arriving_in_its_complete_alone_is_split_as_when_streamed() {
-        let thought = "z".repeat(70_000);
-        let reply = format!("<think>{thought}</think>answer");
-        let ids = tokenizer()
-            .encode(&reply, false)
-            .unwrap()
-            .token_ids()
-            .to_vec();
-        let complete = chunks(&reply, false);
-        let stream = synthetic_single_stream(complete.into_iter().map(Ok).collect());
-        let resp = chat_streaming::process(stream, ctx(true, None), "regular");
-        let body = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
-        let (mut reasoning, mut content) = (String::new(), String::new());
-        for line in String::from_utf8_lossy(&body).lines() {
-            let Some(event) = line
-                .strip_prefix("data: ")
-                .and_then(|data| serde_json::from_str::<Value>(data).ok())
-            else {
-                continue;
-            };
-            let delta = &event["choices"][0]["delta"];
-            reasoning.push_str(delta["reasoning_content"].as_str().unwrap_or_default());
-            content.push_str(delta["content"].as_str().unwrap_or_default());
+        for thought in ["z".repeat(70_000), "z".repeat(248)] {
+            let reply = format!("<think>{thought}</think>answer");
+            let ids = tokenizer()
+                .encode(&reply, false)
+                .unwrap()
+                .token_ids()
+                .to_vec();
+            let complete = chunks(&reply, false);
+            let stream = synthetic_single_stream(complete.into_iter().map(Ok).collect());
+            let resp = chat_streaming::process(stream, ctx(true, None), "regular");
+            let body = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+            let (mut reasoning, mut content) = (String::new(), String::new());
+            for line in String::from_utf8_lossy(&body).lines() {
+                let Some(event) = line
+                    .strip_prefix("data: ")
+                    .and_then(|data| serde_json::from_str::<Value>(data).ok())
+                else {
+                    continue;
+                };
+                let delta = &event["choices"][0]["delta"];
+                reasoning.push_str(delta["reasoning_content"].as_str().unwrap_or_default());
+                content.push_str(delta["content"].as_str().unwrap_or_default());
+            }
+            assert!(ids.len() > 256);
+            assert_eq!(
+                (reasoning.len(), content.as_str()),
+                (thought.len(), "answer")
+            );
         }
-        assert!(ids.len() > 256);
-        assert_eq!(
-            (reasoning.len(), content.as_str()),
-            (thought.len(), "answer")
-        );
     }
 
     #[tokio::test]
@@ -4874,6 +4877,89 @@ mod h_atom_native_tool_calls {
         let quoted = "Use <function=search> here. \
                       <tool_call><function=get_weather><parameter=city>Paris</parameter></function></tool_call>";
         assert_eq!(cut_off_call(quoted).await, [expected.clone(), expected]);
+    }
+
+    /// A bare qwen_xml call cut off at its declared name, or inside the tag after it, is
+    /// kept, as ATOM's HTTP parser keeps it at end of input; a cut-off name is not.
+    #[tokio::test]
+    async fn a_bare_qwen_call_cut_off_after_its_name_is_kept() {
+        let expected = ("get_weather".to_string(), json!({}));
+        for reply in ["<function=get_weather>", "<function=get_weather><para"] {
+            let read = cut_off_call(reply).await;
+            assert_eq!(read, [expected.clone(), expected.clone()], "{reply}");
+        }
+        let reply = "<function=get_weather><parameter=city>Paris</parameter><para";
+        let paris = ("get_weather".to_string(), json!({"city": "Paris"}));
+        assert_eq!(cut_off_call(reply).await, [paris.clone(), paris]);
+        let none = (String::new(), Value::Null);
+        for reply in [
+            "<function=get_wea",
+            "<function=search>",
+            "<function=get_weather> so",
+        ] {
+            assert_eq!(cut_off_call(reply).await, [none.clone(), none.clone()]);
+        }
+    }
+
+    /// A qwen_xml reply read unary, then streamed, from an ATOM worker or not: (content,
+    /// names of the calls) of each.
+    async fn read_qwen_xml(reply: &str, reads_as_atom: bool) -> [(String, String); 2] {
+        let ids = tokenizer()
+            .encode(reply, false)
+            .unwrap()
+            .token_ids()
+            .to_vec();
+        let mut read = Vec::new();
+        for stream in [false, true] {
+            let mut ctx = ctx(stream, json!("auto"));
+            ctx.configured_tool_parser = Some("qwen_xml".to_string());
+            ctx.reads_as_atom = reads_as_atom;
+            let complete = TokenChunk::Complete {
+                token_ids: ids.clone(),
+                finish_reason: FinishReason::Stop,
+                matched_stop: None,
+                usage: Usage::default(),
+                logprobs: None,
+                input_logprobs: None,
+                meta: WorkerMeta::default(),
+            };
+            let stream_of = synthetic_single_stream(vec![Ok(complete)]);
+            let (mut content, mut names) = (String::new(), String::new());
+            let messages: Vec<Value> = if stream {
+                let resp = chat_streaming::process(stream_of, ctx, "regular");
+                let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+                let body = String::from_utf8_lossy(&body).into_owned();
+                (body.lines())
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+                    .map(|event| event["choices"][0]["delta"].clone())
+                    .collect()
+            } else {
+                let resp = chat_aggregator::process(stream_of, ctx).await;
+                let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+                let json: Value = serde_json::from_slice(&body).unwrap();
+                vec![json["choices"][0]["message"].clone()]
+            };
+            for message in messages {
+                content.push_str(message["content"].as_str().unwrap_or_default());
+                for call in message["tool_calls"].as_array().into_iter().flatten() {
+                    names.push_str(call["function"]["name"].as_str().unwrap_or_default());
+                }
+            }
+            read.push((content, names));
+        }
+        read.try_into().unwrap()
+    }
+
+    /// A bare qwen_xml call is a call in an ATOM worker's reply only: SGLang's and vLLM's
+    /// HTTP chats return it as text.
+    #[tokio::test]
+    async fn only_an_atom_reply_reads_a_bare_qwen_function_call_as_a_call() {
+        let reply = "Sure. <function=get_weather><parameter=city>Paris</parameter></function>";
+        let call = ("Sure. ".to_string(), "get_weather".to_string());
+        assert_eq!(read_qwen_xml(reply, true).await, [call.clone(), call]);
+        let text = (reply.to_string(), String::new());
+        assert_eq!(read_qwen_xml(reply, false).await, [text.clone(), text]);
     }
 
     /// A MiniMax-M3 call cut off inside a parameter keeps its value, as ATOM's HTTP

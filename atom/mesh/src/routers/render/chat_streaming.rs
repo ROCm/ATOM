@@ -19,7 +19,9 @@ use crate::{
         chat::{ChatCompletionRequest, ChatCompletionStreamResponse},
         common::{FunctionCallDelta, Tool, ToolCallDelta, ToolChoice, ToolChoiceValue, Usage},
     },
-    reasoning_parser::{ParserFactory as ReasoningParserFactory, ParserResult, ReasoningParser},
+    reasoning_parser::{
+        ParseError, ParserFactory as ReasoningParserFactory, ParserResult, ReasoningParser,
+    },
     routers::{
         prepare::{
             parser_factory_lookup::{check_reasoning_parser_availability, create_reasoning_parser},
@@ -38,7 +40,7 @@ use crate::{
     },
     tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoder},
     tool_parser::{
-        registry::{check_tool_parser_availability, create_tool_parser},
+        registry::{check_tool_parser_availability, create_reply_tool_parser},
         ParserFactory as ToolParserFactory, StreamingParseResult, ToolParser,
     },
 };
@@ -207,7 +209,8 @@ async fn run_chat_stream(
                 }
                 completion_tokens += token_ids.len() as u32;
 
-                let (chunk_text, _stopped) = process_chunk_tokens(&mut stop_decoder, &token_ids);
+                let (pieces, _stopped) = process_chunk_pieces(&mut stop_decoder, &token_ids);
+                let chunk_text = pieces.concat();
                 if chunk_text.is_empty() {
                     continue;
                 }
@@ -227,7 +230,7 @@ async fn run_chat_stream(
 
                 let in_reasoning = if reasoning_parser_available {
                     let (normal_text, reasoning_chunk, in_reasoning) = process_reasoning_stream(
-                        &delta,
+                        &pieces,
                         &mut reasoning_parser,
                         ctx.reasoning_parser_factory.as_ref(),
                         ctx.configured_reasoning_parser.as_deref(),
@@ -280,6 +283,7 @@ async fn run_chat_stream(
                             system_fingerprint.as_deref(),
                             history_tool_calls_count,
                             used_json_schema,
+                            ctx.reads_as_atom,
                         )
                         .await
                     };
@@ -368,6 +372,7 @@ async fn run_chat_stream(
                             system_fingerprint.as_deref(),
                             history_tool_calls_count,
                             used_json_schema,
+                            ctx.reads_as_atom,
                         )
                         .await
                     };
@@ -418,6 +423,7 @@ async fn run_chat_stream(
                 system_fingerprint.as_deref(),
                 history_tool_calls_count,
                 used_json_schema,
+                ctx.reads_as_atom,
             )
             .await;
             for c in chunks {
@@ -558,7 +564,16 @@ pub(super) fn process_chunk_tokens(
     stop_decoder: &mut StopSequenceDecoder,
     token_ids: &[u32],
 ) -> (String, bool) {
-    let mut chunk_text = String::new();
+    let (pieces, stopped) = process_chunk_pieces(stop_decoder, token_ids);
+    (pieces.concat(), stopped)
+}
+
+/// `process_chunk_tokens`, the text in the pieces the decoder wrote it in.
+fn process_chunk_pieces(
+    stop_decoder: &mut StopSequenceDecoder,
+    token_ids: &[u32],
+) -> (Vec<String>, bool) {
+    let mut pieces = Vec::new();
     for &token_id in token_ids {
         match stop_decoder.process_token(token_id).unwrap_or_else(|e| {
             debug!(
@@ -567,21 +582,21 @@ pub(super) fn process_chunk_tokens(
             );
             SequenceDecoderOutput::Held
         }) {
-            SequenceDecoderOutput::Text(t) => chunk_text.push_str(&t),
+            SequenceDecoderOutput::Text(t) => pieces.push(t),
             SequenceDecoderOutput::StoppedWithText(t) => {
-                chunk_text.push_str(&t);
-                return (chunk_text, true);
+                pieces.push(t);
+                return (pieces, true);
             }
-            SequenceDecoderOutput::Stopped => return (chunk_text, true),
+            SequenceDecoderOutput::Stopped => return (pieces, true),
             SequenceDecoderOutput::Held => {}
         }
     }
-    (chunk_text, false)
+    (pieces, false)
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn process_reasoning_stream(
-    delta: &str,
+    pieces: &[String],
     reasoning_parser: &mut Option<Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>>,
     factory: Option<&ReasoningParserFactory>,
     configured: Option<&str>,
@@ -594,7 +609,7 @@ async fn process_reasoning_stream(
     if reasoning_parser.is_none() {
         let factory = match factory {
             Some(f) => f,
-            None => return (delta.to_string(), None, false),
+            None => return (pieces.concat(), None, false),
         };
         match create_reasoning_parser(factory, configured, model) {
             Some(mut p) => {
@@ -605,17 +620,26 @@ async fn process_reasoning_stream(
                 }
                 *reasoning_parser = Some(Arc::new(tokio::sync::Mutex::new(p)));
             }
-            None => return (delta.to_string(), None, false),
+            None => return (pieces.concat(), None, false),
         }
     }
 
     let parser_arc = match reasoning_parser {
         Some(p) => p.clone(),
-        None => return (delta.to_string(), None, false),
+        None => return (pieces.concat(), None, false),
     };
     let (parse_result, in_reasoning) = {
         let mut parser = parser_arc.lock().await;
-        let result = parser.parse_reasoning_streaming_incremental(delta);
+        // Piece by piece, as the decoder wrote them: the parser holds a delimiter's start
+        // only when that is all it is given, so a piece of ids may end inside one.
+        let result = pieces
+            .iter()
+            .try_fold(ParserResult::default(), |mut read, piece| {
+                let piece = parser.parse_reasoning_streaming_incremental(piece)?;
+                read.normal_text.push_str(&piece.normal_text);
+                read.reasoning_text.push_str(&piece.reasoning_text);
+                Ok::<_, ParseError>(read)
+            });
         let in_reasoning = parser.is_in_reasoning();
         (result, in_reasoning)
     };
@@ -639,7 +663,7 @@ async fn process_reasoning_stream(
         }
         Err(e) => {
             warn!("Reasoning parsing error: {}", e);
-            (delta.to_string(), None, false)
+            (pieces.concat(), None, false)
         }
     }
 }
@@ -695,6 +719,7 @@ async fn process_tool_calls_stream(
     system_fingerprint: Option<&str>,
     history_tool_calls_count: usize,
     use_json_parser: bool,
+    reads_as_atom: bool,
 ) -> Vec<ChatCompletionStreamResponse> {
     let mut chunks = Vec::new();
     if tool_parser.is_none() {
@@ -707,7 +732,7 @@ async fn process_tool_calls_stream(
         } else {
             configured
         };
-        match create_tool_parser(factory, configured, model) {
+        match create_reply_tool_parser(factory, configured, model, reads_as_atom) {
             Some(p) => *tool_parser = Some(Arc::new(tokio::sync::Mutex::new(p))),
             None => return chunks,
         }

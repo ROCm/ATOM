@@ -317,9 +317,9 @@ pub(crate) fn template_fingerprint(file: Option<&str>, inline: Option<&str>) -> 
 }
 
 /// The chat template an ATOM worker serves, as its registration chose it: its own file,
-/// else the router's (`router_file`), else the one it advertised.
-pub(crate) fn served_template(worker: &dyn Worker, router_file: Option<&str>) -> u64 {
-    let file = worker.chat_template().or(router_file);
+/// else `fallback_file` (the router's), else the one it advertised.
+pub(crate) fn served_template(worker: &dyn Worker, fallback_file: Option<&str>) -> u64 {
+    let file = worker.chat_template().or(fallback_file);
     let labels = &worker.metadata().labels;
     let inline = file
         .is_none()
