@@ -1697,6 +1697,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # evicts it, so a chunk both tiers hold costs the tier no room
     # (lazy_save.py). Off by default.
     "ATOM_OFFLOAD_LAZY_EXCLUSIVE": lambda: _flag_env("ATOM_OFFLOAD_LAZY_EXCLUSIVE"),
+    # Seconds a KV aggregation may wait on a worker before the manager logs it
+    # and dumps the missing workers' and its own thread stacks (once per
+    # aggregation). Lower it to catch shorter pipeline stalls.
+    "ATOM_KV_AGG_STALL_S": lambda: _positive_float_env(
+        "ATOM_KV_AGG_STALL_S", "10"
+    ),
     # lmcache_mp sends tier lookups for the head of the waiting queue ahead of
     # admission; this is how many waiting requests per scheduling pass.
     "OFFLOAD_ASYNC_LOOKUP_DEPTH": lambda: _nonnegative_int_env(
