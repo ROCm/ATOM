@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """ATOM_PD_EARLY_HANDOFF: P answers the router at DP dispatch and pushes chunks.
 
 CPU only. Reuses the chunked-transfer protocol fixtures (real schedulers, real
