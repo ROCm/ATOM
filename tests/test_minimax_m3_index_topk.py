@@ -524,6 +524,7 @@ class TestSelectorDispatch:
             arch="gfx950",
             selector_rows=1,
             compute_units=256,
+            num_idx_heads=1,
         )
 
     def test_narrow_rows_stay_on_triton(self):
@@ -559,8 +560,35 @@ class TestSelectorDispatch:
                 arch="gfx1250",
                 selector_rows=selector_rows,
                 compute_units=256,
+                num_idx_heads=1,
             )
             == want
+        )
+
+    @pytest.mark.parametrize(
+        "width,selector_rows,heads,decode_max_q,want",
+        [
+            (159, 32768, 4, 0, False),
+            (160, 32768, 4, 0, True),
+            (160, 4095, 4, 0, False),
+            (160, 32768, 4, 4, False),  # decode keeps the width-only gate
+            (160, 32768, 1, 0, False),  # TP4 (one index head) keeps it too
+        ],
+    )
+    def test_gfx950_tp1_prefill_takes_aiter_from_160_blocks(
+        self, width, selector_rows, heads, decode_max_q, want
+    ):
+        assert (
+            m._aiter_selector_wins(
+                width,
+                emit=True,
+                arch="gfx950",
+                selector_rows=selector_rows,
+                compute_units=256,
+                num_idx_heads=heads,
+                decode_max_q=decode_max_q,
+            )
+            is want
         )
 
     @pytest.mark.parametrize(
@@ -580,10 +608,43 @@ class TestSelectorDispatch:
                 arch="gfx1250",
                 selector_rows=65536,
                 compute_units=256,
+                num_idx_heads=1,
                 decode_max_q=4,
             )
             is want
         )
+
+
+def test_aiter_support_is_asked_once_per_width_k_and_device(monkeypatch):
+    """Steps of any length share one cached answer per (width, k, device); bounds
+    shorter than the rows decline before the cache."""
+    asked, ran = [], []
+
+    def supported(score, bounds, idx, k):
+        asked.append(score.shape[1])
+        return score.shape[1] <= 512
+
+    monkeypatch.setattr(m, "_AITER_SERVES", {})
+    monkeypatch.setattr(
+        m, "_small_k_selector", lambda: (lambda *a: ran.append(a[0].shape), supported)
+    )
+
+    def select(heads, total_q, width, bounds=None):
+        meta = {"device": "meta"}
+        return m._select_with_aiter(
+            torch.empty(heads, total_q, width, **meta),
+            torch.empty(heads, total_q, TOPK, dtype=torch.int32, **meta),
+            torch.empty(bounds or heads * total_q, dtype=torch.int32, **meta),
+            TOPK,
+            0,
+            1,
+        )
+
+    assert [select(4, t, 300) for t in (1024, 2048, 3001)] == [True] * 3
+    assert [select(4, t, 600) for t in (1024, 2048)] == [False] * 2
+    assert asked == [300, 600] and len(m._AITER_SERVES) == 2
+    assert not select(1, 8, 300, bounds=4)  # decode bounds shorter than the rows
+    assert asked == [300, 600] and len(ran) == 3
 
 
 @gpu

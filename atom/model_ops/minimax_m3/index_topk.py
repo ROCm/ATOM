@@ -76,7 +76,8 @@ def _fp4_index_ops(index_scorer):
 @functools.cache
 def _small_k_selector():
     """aiter's per-row selector and its support predicate: the Triton selector's pins
-    and tie direction, in one pass (7us against 36us at a 1M context;
+    in one pass, though it breaks exact score ties by its own chunk order, not toward
+    the higher block id as Triton does (7us against 36us at a 1M context;
     `_aiter_selector_wins` says where). Imported on first use, like `flydsl_ops`; no
     fallback: an aiter without it (minimum #7014, see the configuration guide) fails here.
     """
@@ -846,6 +847,11 @@ _AITER_MIN_WIDTH = 1024
 _AITER_MIN_WIDTH_WITH_EMIT = 2048
 _GFX1250_AITER_MIN_WIDTH = 512
 _GFX1250_AITER_MIN_CELLS_PER_CU = 1 << 14
+# gfx950 TP1 prefill (4 index heads, >= 4096 rows): aiter + its emit is 1.07-1.52x the
+# fused Triton selector from 160 blocks; Triton wins below ~136.
+_GFX950_PREFILL_AITER_MIN_WIDTH = 160
+_GFX950_PREFILL_AITER_MIN_ROWS = 4096
+_GFX950_PREFILL_AITER_IDX_HEADS = 4
 
 
 def _aiter_selector_wins(
@@ -855,6 +861,7 @@ def _aiter_selector_wins(
     arch,
     selector_rows,
     compute_units,
+    num_idx_heads,
     decode_max_q=0,
 ):
     if arch == "gfx1250":
@@ -866,6 +873,14 @@ def _aiter_selector_wins(
             width >= _GFX1250_AITER_MIN_WIDTH
             and selector_rows * width >= compute_units * _GFX1250_AITER_MIN_CELLS_PER_CU
         )
+    if (
+        arch == "gfx950"
+        and decode_max_q == 0
+        and num_idx_heads == _GFX950_PREFILL_AITER_IDX_HEADS
+        and width >= _GFX950_PREFILL_AITER_MIN_WIDTH
+        and selector_rows >= _GFX950_PREFILL_AITER_MIN_ROWS
+    ):
+        return True
     return width >= (_AITER_MIN_WIDTH_WITH_EMIT if emit else _AITER_MIN_WIDTH)
 
 
@@ -1071,7 +1086,7 @@ def _launch_parallel_prefill_selector(
 
 # aiter's support predicate answers from shape, dtype and arch alone, but costs
 # 11.4us of Python to ask -- against 7-10us of device time for the selection
-# itself, on a path that runs once per sparse layer. Memoized on what it reads.
+# itself, on a path that runs once per sparse layer. Memoized per (width, k, device).
 _AITER_SERVES: dict[tuple, bool] = {}
 
 
@@ -1087,13 +1102,14 @@ def _select_with_aiter(
     """
     heads, total_q, max_block = score.shape
     rows = heads * total_q
+    # Decode tokens other than `max_query_len` per request give shorter bounds,
+    # which aiter declines; checked here, so the row count stays out of the key.
+    if n_valid_column_per_row.shape[0] != rows:
+        return False
     flat_score = score.view(rows, max_block)
     flat_idx = topk_idx.view(rows, topk)
-    # The bounds length is in the key, not assumed equal to `rows`: a caller
-    # whose decode tokens are not `max_query_len` per request hands a shorter
-    # one, and that has to keep declining rather than hit a cached yes.
     topk_per_row_small_k, topk_per_row_small_k_supported = _small_k_selector()
-    key = (rows, max_block, topk, n_valid_column_per_row.shape[0], score.device)
+    key = (max_block, topk, score.device)
     served = _AITER_SERVES.get(key)
     if served is None:
         served = _AITER_SERVES[key] = topk_per_row_small_k_supported(
@@ -1195,6 +1211,7 @@ def _launch_select(
         arch=arch,
         selector_rows=score.shape[0] * score.shape[1],
         compute_units=compute_units,
+        num_idx_heads=score.shape[0],
         decode_max_q=decode_max_q,
     )
     if take_aiter and _select_with_aiter(
