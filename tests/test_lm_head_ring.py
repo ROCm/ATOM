@@ -124,3 +124,15 @@ def test_rows_the_kernel_does_not_take_keep_tgemm(monkeypatch):
         assert bool(ring.calls) == ringed, rows
         want = x @ head.weight.T + (0.0 if ringed else 1.0)
         assert torch.equal(out, want)
+
+
+def test_misaligned_input_keeps_tgemm(monkeypatch):
+    # The kernel requires a 16-byte-aligned x (aiter raises otherwise): a view
+    # that starts one bf16 element into its storage is contiguous but not aligned.
+    ring = _Ring()
+    head = _head(monkeypatch, ring)
+    head.process_weights_after_loading()
+    x = torch.randn(8 * K + 8).bfloat16()[1 : 1 + 8 * K].view(8, K)
+    assert x.is_contiguous() and x.data_ptr() % 16 != 0
+    assert torch.equal(head.local_logits(x), x @ head.weight.T + 1.0)
+    assert ring.calls == []
