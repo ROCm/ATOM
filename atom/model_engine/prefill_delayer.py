@@ -280,6 +280,7 @@ class PrefillDelayer:
         # buffer / episode state
         "_rank",
         "_reduce_buf",
+        "_reduce_np",
         "_stall_count",
         "_stat_adapt_cycles",
         "_stat_adapt_hold_ticks",
@@ -433,6 +434,7 @@ class PrefillDelayer:
             dtype=torch.int64,
             device="cpu",
         )
+        self._reduce_np = self._reduce_buf.numpy()
         # adaptive admission state (see the module-level comment)
         self._adapt_dec_fit = _EwFit(_DEC_HALF_LIFE)
         self._adapt_pf_fit = _EwFit(_PF_HALF_LIFE)
@@ -625,22 +627,22 @@ class PrefillDelayer:
             and oldest_waiting_age_ms >= self.max_queue_ms
         )
 
-        self._reduce_buf[0] = 1 if prefillable else 0
+        self._reduce_np[0] = 1 if prefillable else 0
         # A blocked rank counts toward alignment but can admit none of its
         # pending tokens, so they must not fill the forward.
-        self._reduce_buf[1] = int(pending_tokens) if prefillable else 0
-        self._reduce_buf[2] = int(running_decode_batch)
-        self._reduce_buf[3] = 1 if kv_high else 0
-        self._reduce_buf[4] = 1 if kv_low else 0
-        self._reduce_buf[5] = 1 if has_partial else 0
-        self._reduce_buf[6] = 1 if queue_hot else 0
-        self._reduce_buf[7] = 1 if self._prefill_executed_since_last_decision else 0
-        self._reduce_buf[8] = int(arrived_requests)
-        self._reduce_buf[9] = 1 if blocked else 0
-        self._reduce_buf[10] = 1 if unreachable else 0
+        self._reduce_np[1] = int(pending_tokens) if prefillable else 0
+        self._reduce_np[2] = int(running_decode_batch)
+        self._reduce_np[3] = 1 if kv_high else 0
+        self._reduce_np[4] = 1 if kv_low else 0
+        self._reduce_np[5] = 1 if has_partial else 0
+        self._reduce_np[6] = 1 if queue_hot else 0
+        self._reduce_np[7] = 1 if self._prefill_executed_since_last_decision else 0
+        self._reduce_np[8] = int(arrived_requests)
+        self._reduce_np[9] = 1 if blocked else 0
+        self._reduce_np[10] = 1 if unreachable else 0
         if self._cost_slots:
-            self._reduce_buf[_FIXED_SLOTS : self._gate_at] = 0
-            self._reduce_buf[_FIXED_SLOTS + self._rank] = int(prefill_cost)
+            self._reduce_np[_FIXED_SLOTS : self._gate_at] = 0
+            self._reduce_np[_FIXED_SLOTS + self._rank] = int(prefill_cost)
         # one scheduler step since the previous decision (0: none yet, or untimed)
         step_s = 0.0
         if self._cost_gate:
@@ -659,8 +661,7 @@ class PrefillDelayer:
                     0 if prefillable else int(1000 * self._arrival_rate(now))
                 ),
             )
-            for offset, value in enumerate(gate):
-                self._reduce_buf[self._gate_at + offset] = value
+            self._reduce_np[self._gate_at : self._gate_at + len(gate)] = gate
         if self.admit_policy == "adaptive":
             if not self._cost_gate:
                 now_a = self._clock()
@@ -672,7 +673,7 @@ class PrefillDelayer:
             )
             t0_us, a_us = self._adapt_local_fits()
             at = self._adapt_at
-            buf = self._reduce_buf
+            buf = self._reduce_np
             buf[at] = int(w_eff) if prefillable else 0
             fitted = t0_us > 0 and a_us > 0
             buf[at + 1] = int(t0_us) if fitted else 0
