@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Shared in-container bootstrap for DSV4 GRPO finetune (source, do not execute).
 
 setup_dsv4_container_env() {

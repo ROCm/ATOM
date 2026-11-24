@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """LLaMA / GPT Megatron SOURCE patches (RMSNorm + apex FusedLayerNorm fix).
 
 FusedLayerNorm (apex) does not support RMSNorm, but several Megatron files

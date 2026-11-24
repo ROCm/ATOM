@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Frozen reference policy for KL and baseline log-prob targets."""
 
 from __future__ import annotations

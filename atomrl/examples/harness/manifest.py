@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Load and validate the ``examples.yaml`` descriptions.
 
 A description file has three top-level keys, all optional:

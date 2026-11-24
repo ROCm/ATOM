@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # DSV4 Flash 4-layer Megatron model + training args (sourced by run_dsv4_4layer_pretrain_inner.sh).
 #
 # Lumen pretrain smoke default GBS=8 (Miles GRPO smoke uses GBS=256 via rollout 32×8).

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Fully-async RL trainer with decoupled Rollouter and Trainer.
 
 Inspired by VERL's ``fully_async_policy`` — see

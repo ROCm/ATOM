@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Attributes GPU kernels back to the host op that launched them, so a kernel
 category can be turned into a list of operators to fuse rather than a total.
 

@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Add DSV4 support to ROCm/Megatron-LM (rocm_dev branch).
 
 Adds the minimal TransformerConfig fields and TransformerBlock/Layer hooks

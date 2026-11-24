@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Tune hipBLASLt GEMM solutions for Llama2-70B TP=1 FP8 training.
 
 Benchmarks all available hipBLASLt solutions for each core GEMM shape

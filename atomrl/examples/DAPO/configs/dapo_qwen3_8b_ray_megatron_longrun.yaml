@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # verl-aligned Ray online rollout — FORMAL LONG RUN (Qwen3-8B-Base, DAPO math).
 # MEGATRON training backend variant of dapo_qwen3_8b_ray_vllm_longrun.yaml.
 #

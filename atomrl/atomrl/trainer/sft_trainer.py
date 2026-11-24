@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Standalone SFT trainer for AtomRL.
 
 Launched via ``torchrun``, uses the same FSDP2Engine / MegatronEngine as RL

@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # DSV4 Megatron model + training args (sourced by run_dsv4_inner.sh).
 #
 # Profile via DSV4_PROFILE=4layer|flash (default 4layer).

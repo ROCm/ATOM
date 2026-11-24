@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """OBSOLETE — use ``install_swiglu_fp8()`` via ``import atomrl.lumen.models.megatron`` instead.
 
 Set ``LUMEN_FUSED_SWIGLU_QUANT=1`` when needed. The Lumen import path patches

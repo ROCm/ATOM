@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Launch DSV4 Flash 2-node GRPO finetune from the head node with identical env on both ranks.
 #
 # Usage (on head node):

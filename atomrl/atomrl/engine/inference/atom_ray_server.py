@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Ray-colocated ATOM rollout server for AtomRL.
 
 This mirrors the native Ray vLLM rollout path, but hosts ATOM's

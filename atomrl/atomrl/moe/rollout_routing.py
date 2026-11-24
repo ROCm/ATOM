@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Rollout Routing Replay (R3): train on the experts the rollout actually used.
 
 A routed-expert model picks top-k of N experts by comparing router logits, which

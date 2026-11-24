@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Eagle3 draft distillation for Kimi K2.5 (README.md). The smoke trains a
 # one-layer Eagle3 head on a Qwen3-8B teacher through plain HF forward, so it
 # checks the draft model, loss and optimizer path without vLLM, ATOM or

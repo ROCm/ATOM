@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Repository-wide entries and the images shared by the examples.
 # See README.md for the format; `bash examples/run.sh list` for everything.
 

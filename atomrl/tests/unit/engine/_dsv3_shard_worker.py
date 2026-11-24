@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """torchrun worker for the DSv3 parallelism tests. Not collected by pytest.
 
 Builds the tiny DSv3 model at the topology given by the ``DSV3_TP``/``DSV3_PP``/

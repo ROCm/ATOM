@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Megatron-Native Qwen3-30B-A3B DAPO long run at a 4k response budget.
 #
 # Purpose: reproduce the response-length trajectory in hours instead of days.

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Phase 1: Foundation Training (ATOM MXFP4 teacher, bs=8 perf test)
 # Dataset: perfectblend subset (~296K samples)
 # Steps: 37005 (1 epoch × ceil(296034/8))

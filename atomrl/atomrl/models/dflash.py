@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """DFlash draft model for speculative decoding.
 
 DFlash draft model.  DFlash uses multi-layer teacher hidden

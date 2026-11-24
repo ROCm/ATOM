@@ -1,5 +1,8 @@
 #!/bin/bash
-# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 #
 # Capture a rocprofv3 performance trace of Llama2-7B FSDP LoRA SFT, FP8
 # blockwise2d, on 8 GPUs. Only GLOBAL rank 0 is profiled. A short run is

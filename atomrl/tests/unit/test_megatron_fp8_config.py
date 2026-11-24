@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """B1: quant_config -> TransformerConfig FP8 fields.
 
 The engine hard-coded ``bf16=True`` with no FP8 reference at all. These pin the

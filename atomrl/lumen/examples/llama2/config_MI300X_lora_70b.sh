@@ -1,4 +1,8 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # TP=1 DP=8 config (v47) — LLaMA2-70B LoRA MLPerf (config_MI300X_lora_70b.sh).
 # Used by run_lora_finetune_llama2_70b.sh.
 # NousResearch/Llama-2-70b-hf, FP8 HYBRID + LoRA (attention-only), seed=1234.

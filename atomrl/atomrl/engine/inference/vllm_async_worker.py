@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Standalone vLLM v1 AsyncLLM rollout worker (online, concurrent) for AtomRL.
 
 This is the AsyncLLM counterpart of the inline offline-`LLM` worker embedded in

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """The slicing reduce-scatter copy-in must be bit-identical to torch._chunk_cat.
 
 Needs one GPU (the reference kernel is CUDA/HIP only) but no model and no

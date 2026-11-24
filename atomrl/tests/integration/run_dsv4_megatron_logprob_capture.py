@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Capture fixed-token DSV4 Megatron log-probs without rollout or training.
 
 Run this script twice with topology-specific configs, then use ``--compare`` to

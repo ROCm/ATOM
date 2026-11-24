@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Bake aiter's JIT kernels into the release image.
 #
 # `docker build` has no GPU, so the kernels cannot be compiled in the Dockerfile.

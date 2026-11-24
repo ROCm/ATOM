@@ -1,4 +1,8 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Qwen3-8B LoRA SFT with FSDP2 + MXFP4 on gfx950.
 #
 # Bash entry point for the MXFP4 SFT case. run_qwen3_fsdp.sh rejects

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Convert legacy Megatron checkpoint key format to mcore format.
 
 Legacy format:  model.language_model.{embedding,encoder,output_layer}

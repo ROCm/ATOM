@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """MoE diagnostics: load balancing, entropy, and lightweight router utilities."""
 
 from __future__ import annotations

@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # One-time setup inside the container: pinned sources, the RL stack (without touching the image's ROCm torch / vLLM /
 # triton), pinned models and the OCR dataset. Safe to rerun.
 # Lumen actor patches come from the in-tree atomrl/lumen checkout.

@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # End-to-end check of a built release image: start it the way the README tells a
 # customer to, run a smoke off the code baked into the image, and report the
 # health criteria from README §6.

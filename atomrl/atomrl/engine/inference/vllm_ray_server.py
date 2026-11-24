@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """verl-aligned Ray rollout server: vLLM AsyncLLM inside a Ray actor.
 
 This is AtomRL's port of verl's online rollout replica stack:

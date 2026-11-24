@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Launch Qwen3-8B RL training on vime with AtomRL plugin hooks.
 #
 # AtomRL hooks are injected via vime's --custom-*-path CLI arguments:

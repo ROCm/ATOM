@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Tune 2-node flash DSV4 BF16 GEMM gaps (lm_head, wq_b buckets, 7168-K).
 # cu_num auto-detected via get_cu_num() at merge time.
 #

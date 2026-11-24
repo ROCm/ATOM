@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Mixture-of-experts utilities: R3 routing, expert parallel, diagnostics."""
 
 from __future__ import annotations

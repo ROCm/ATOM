@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # AtomRL release image. This is the validated Dockerfile.dev stack with the
 # source revisions fixed for reproducibility. The root ATOM Dockerfile is built
 # first as rocm/atom-dev:latest; this file does not modify it.

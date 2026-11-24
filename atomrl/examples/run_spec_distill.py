@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Speculative Decoding Draft Model Distillation launcher for AtomRL.
 
 Trains Eagle3 or DFlash draft models on teacher hidden states, following the

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Real-checkpoint parity worker for DSv3. Not collected by pytest.
 
 Loads a real DeepSeek-V3 checkpoint twice -- once into the HF reference

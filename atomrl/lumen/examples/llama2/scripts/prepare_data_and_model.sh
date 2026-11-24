@@ -1,5 +1,8 @@
 #!/bin/bash
-# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 #
 # End-to-end data and model preparation for LLaMA2 SFT using Megatron-LM-AMD.
 #

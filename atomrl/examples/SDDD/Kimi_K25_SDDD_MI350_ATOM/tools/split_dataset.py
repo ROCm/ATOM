@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Split kimi-mtp-dataset into Phase 1 (perfectblend) and Phase 2 (mixed)."""
 
 import json

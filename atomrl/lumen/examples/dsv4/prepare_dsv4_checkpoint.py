@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Prepare HF → BF16 → Megatron torch_dist checkpoint for DSV4.
 
 Profile via ``DSV4_PROFILE=4layer|flash`` (default ``4layer``).

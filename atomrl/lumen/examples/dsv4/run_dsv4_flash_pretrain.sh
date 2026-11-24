@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # run_dsv4_flash_pretrain.sh — DSV4 Flash full model (43L) 2×8 MI300X/MI308X pretrain smoke.
 #
 # Native Megatron + Lumen get_dsv4_spec (no Miles train.py / Ray).

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Qwen3 MXFP4 training image: Lumen base + baked source + Qwen3 deps.
 #
 # Build:

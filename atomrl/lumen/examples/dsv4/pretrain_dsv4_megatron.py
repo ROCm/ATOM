@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Shared Megatron pretrain entry for DSV4 (4-layer and Flash full model).
 
 Uses ``megatron.training.pretrain`` with ``--spec atomrl.lumen.models.dsv4.megatron.spec get_dsv4_spec``.

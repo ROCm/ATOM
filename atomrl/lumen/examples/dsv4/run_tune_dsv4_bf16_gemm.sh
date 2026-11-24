@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Host wrapper: tune DSV4 BF16 GEMM on local gfx942 GPU (auto cu_num via get_cu_num).
 #
 # Usage:

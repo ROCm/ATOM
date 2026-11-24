@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Shared NFS preflight for 2-node DSV4 GRPO finetune launches.
 #
 # Ensures head and worker use identical torchrun args before any rank enters

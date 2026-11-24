@@ -1,5 +1,8 @@
 #!/bin/bash
-# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 #
 # LLaMA2-7B LoRA SFT — 8 GPUs, PyTorch FSDP backend.
 #

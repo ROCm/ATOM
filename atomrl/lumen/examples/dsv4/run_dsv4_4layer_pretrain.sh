@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # run_dsv4_4layer_pretrain.sh — DSV4 4-layer Megatron pretrain smoke (kernel validation only).
 #
 # For GRPO full finetune (recommended), use run_dsv4_4layer_finetune.sh instead.

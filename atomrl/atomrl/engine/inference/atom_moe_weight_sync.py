@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Coverage guard for AtomRL-to-ATOM weight synchronization.
 
 The trainer sends original fused-MoE parameter names and ATOM's public weight

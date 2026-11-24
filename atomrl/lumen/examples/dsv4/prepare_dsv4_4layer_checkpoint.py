@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Prepare HF → BF16 → Megatron torch_dist checkpoint for DSV4 4-layer pretrain smoke.
 
 Uses Miles ``convert_hf_to_torch_dist.py`` via shell (no ``train.py`` / Ray head).

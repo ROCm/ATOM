@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Architecture registry for the Megatron training path.
 
 Replaces the engine's inline ``_is_dsv4`` / ``_is_moe`` booleans, which needed

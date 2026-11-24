@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Stress the vLLM DSV4 sparse-decode kernel at the failing 5120 layout."""
 
 from __future__ import annotations

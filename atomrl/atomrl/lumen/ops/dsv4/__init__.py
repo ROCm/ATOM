@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Stateless DeepSeek-V4 operation wrappers and helpers.
 
 Exports are resolved lazily so importing this package does not load optional

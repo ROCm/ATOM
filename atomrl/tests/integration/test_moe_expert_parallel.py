@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Expert-parallel vs tensor-parallel-only parity (placeholder for multi-GPU CI)."""
 
 from __future__ import annotations

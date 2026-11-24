@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """On-Policy Distillation (OPD) trainer.
 
 Implements the DeepSeek-V4 style OPD training loop:

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Train/rollout mismatch metrics: check the math and the cancellation property.
 
 CPU-only, no model needed. Run: python -m atomrl.tests.test_mismatch_metrics

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Register DeepSeek-V4 mbridge handler for HF→torch_dist conversion."""
 
 from __future__ import annotations

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Megatron <-> Hugging Face weight bridges, one module per model family.
 
 ``core`` holds the streaming rule converter and the primitives every family

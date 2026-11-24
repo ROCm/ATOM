@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Lumen DSV4 4-layer GRPO full finetune on 8×MI308X.
 
 Uses Miles ``train.py`` (Ray + Megatron actor) with Lumen ``get_dsv4_spec``.

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Phase 2: Mixed Domain Training (v2, aligned with lightseekorg/kimi-k2.5-eagle3) — MI350
 #
 # Dataset: mixed corpus (~181K samples) — llava_instruct, smoltalk_cn,

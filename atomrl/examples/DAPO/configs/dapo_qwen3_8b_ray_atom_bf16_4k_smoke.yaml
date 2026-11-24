@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # ATOM BF16 rollout + BF16 actor smoke. Same 4k scale and runtime knobs as the
 # ATOM FP8 smoke; only online/rollout quantization is disabled.
 

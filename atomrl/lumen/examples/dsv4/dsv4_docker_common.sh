@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Shared Docker/bootstrap helpers for run_dsv4.sh (source, do not execute).
 
 dsv4_docker_bootstrap_setup() {

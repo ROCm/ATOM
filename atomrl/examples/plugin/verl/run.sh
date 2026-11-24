@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Launch Qwen3-8B GRPO on verl with AtomRL plugin (FSDP2 + ATOM).
 #
 # Prerequisites:

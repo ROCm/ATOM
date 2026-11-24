@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """DSV4 Megatron torch.profiler hook and operator-breakdown xlsx export.
 
 Env (rank 0 only, off unless ``LUMEN_PROF_START`` is set):

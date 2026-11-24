@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Merge gfx942 GEMM tune overlay into the shared runtime CSV.
 
 AITER lookup key is (gfx, cu_num, M, N, K, bias, dtype, outdtype, scaleAB, bpreshuffle).

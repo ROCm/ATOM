@@ -1,4 +1,8 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Runtime OS/system tunables matching MLPerf MI300X reference submission.
 # Run as root/sudo BEFORE launching training to reduce system jitter.
 

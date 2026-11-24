@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """One-step off-policy rollout: generate step s+1 while step s trains.
 
 With the rollout on its own GPUs (``controller.ray.rollout.num_workers > 0``)

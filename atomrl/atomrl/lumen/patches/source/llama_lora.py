@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """LLaMA LoRA / MLPerf finetune SOURCE patches (disk modifications).
 
 These patches are **opt-in** (``default=False``). Apply with::

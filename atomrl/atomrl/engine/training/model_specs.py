@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """The registered :class:`ModelSpec` entries.
 
 Separate from ``model_registry`` so the registry carries no bridge imports.

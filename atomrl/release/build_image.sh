@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Build the AtomRL release image from release/versions.env.
 #
 #   bash atomrl/release/build_image.sh                    # full image, incl. example 7

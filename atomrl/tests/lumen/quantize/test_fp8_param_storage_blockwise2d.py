@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 
 """FP8 param-storage (blockwise2d): storing the frozen weight as FP8 and feeding
 it via FP8StoredLinearFunction must match the per-step in-place-quant path."""

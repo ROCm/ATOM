@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """The dtype send_weights_rdma puts on the wire for an FSDP2 trainer's weights."""
 
 from __future__ import annotations

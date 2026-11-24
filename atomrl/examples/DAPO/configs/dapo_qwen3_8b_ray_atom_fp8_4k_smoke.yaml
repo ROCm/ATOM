@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # ATOM rollout fp8 end-to-end smoke: same scale as vLLM 4k smoke, no ckpt/eval.
 
 cluster:

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """FP8 BF16 keep-out resolution, and that no engine-config key is shadowed.
 
 Review feedback on #39. The duplicate-key test earns its place: #39 originally

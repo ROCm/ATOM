@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """HuggingFace-backed inference engine for rollout generation + log-prob computation.
 
 Used when ATOM is not available or when features ATOM doesn't expose

@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """vLLM AITER RMSNorm Patch (model-sensitive / T5-like) for the rollout side.
 
 Patches the *plain* (non-quant) AITER RMSNorm paths inside the container's

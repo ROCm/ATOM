@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Start the container used by every later step: vllm/vllm-openai-rocm:v0.27.0 with $WORK mounted at the same path.
 # Usage (host): WORK=/path/to/work bash launch_container.sh
 set -euo pipefail

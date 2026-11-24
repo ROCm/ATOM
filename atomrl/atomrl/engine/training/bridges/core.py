@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Shared machinery for the Megatron <-> Hugging Face weight bridges.
 
 A family's export direction is a list of :class:`Rule` objects. Each rule matches

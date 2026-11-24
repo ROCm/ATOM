@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Inner container entry for run_dsv4_flash_finetune.sh — 2-node native torchrun GRPO (no Ray).
 set -euo pipefail
 

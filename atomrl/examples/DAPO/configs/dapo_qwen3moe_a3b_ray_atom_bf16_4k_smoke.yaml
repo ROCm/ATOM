@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # ATOM BF16 rollout variant of dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml.
 #
 # Byte-for-byte that config except for two rollout-side edits: generation_backend

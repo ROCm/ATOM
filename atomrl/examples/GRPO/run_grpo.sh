@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Qwen3-30B-A3B DAPO RL — Megatron TP4/EP8 + ATOM BF16 (MI308X)
 #

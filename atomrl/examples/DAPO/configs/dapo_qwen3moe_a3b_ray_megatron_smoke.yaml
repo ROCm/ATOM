@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # MoE + Expert-Parallel SMOKE: Qwen3-30B-A3B-Base on Megatron-Native.
 #
 # Same verl-aligned Ray + colocated vLLM + ZMQ CUDA-IPC stack as the dense

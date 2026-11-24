@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Lazy subpackage re-exports (PEP 562).
 # Avoids eagerly importing GPU kernel code when only a single subpackage
 # (e.g. ops.quantize) is needed.

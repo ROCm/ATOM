@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Step time and optimizer-step cost from stack-free traces, read off PyTorch's
 own "Optimizer.step#<cls>.step" profiler range rather than off Python frames,
 so the figure is not inflated by stack sampling.

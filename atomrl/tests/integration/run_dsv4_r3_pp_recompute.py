@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Two-rank PP replay/recompute smoke for the patched Megatron RouterReplay."""
 
 from __future__ import annotations

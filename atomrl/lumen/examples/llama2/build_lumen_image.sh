@@ -1,4 +1,8 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Build a Docker image with the latest Lumen code baked in on top of the
 # base lumen/llama2:latest image. Run from the Lumen repo root or from anywhere.
 set -euo pipefail

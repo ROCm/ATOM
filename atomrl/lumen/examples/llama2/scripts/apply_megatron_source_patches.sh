@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Apply Lumen SOURCE patches to a Megatron-LM checkout (torch-less entry).
 #
 # Usage (source this file, do not execute directly):

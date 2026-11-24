@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # run_dsv4_4layer_finetune.sh — DSV4 4-layer GRPO full finetune on 8×MI308X.
 #
 # Full-parameter finetune (not Megatron pretrain / mock LM loss):

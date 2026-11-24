@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """VLLMHttpEngine: trainer-facing adapter over verl-style Ray rollout replicas.
 
 Wraps a :class:`VLLMReplicaManager` (colocated ``VLLMRayServer`` actors) and a

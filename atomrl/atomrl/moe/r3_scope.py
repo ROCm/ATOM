@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Production R3 is vLLM + hard-assignment expert ids only.
 
 ``assert_supported_r3`` fail-closes ATOM rollout and ``replay_mode=distribution``.

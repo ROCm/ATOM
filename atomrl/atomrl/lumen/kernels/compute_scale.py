@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 
 """Single-element Triton kernel to compute FP8 quantisation scale.
 

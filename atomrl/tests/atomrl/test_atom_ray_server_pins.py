@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """The engine kwargs ATOMRayServer supplies rather than inherit from ATOM.
 
 There is one left, `_pin_cudagraph_mode`, and it applies exactly when

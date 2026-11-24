@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """The reported DAPO loss must not depend on how the batch is sharded or packed.
 
 ``agg_loss`` already divides by the GLOBAL ``batch_num_tokens`` and scales by

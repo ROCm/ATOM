@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """KV Connector that writes hidden states via MORI-IO P2P GPU-to-GPU transfer.
 
 Drop-in replacement for MooncakeHiddenStatesConnector. Uses MoriIOStore

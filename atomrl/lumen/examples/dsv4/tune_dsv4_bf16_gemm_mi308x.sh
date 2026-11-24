@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Tune DSV4 BF16 GEMM on MI308X (gfx942). Run inside lumen/dsv4-lumen:mi308x.
 #
 # Env:

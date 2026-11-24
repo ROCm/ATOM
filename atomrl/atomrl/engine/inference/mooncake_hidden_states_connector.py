@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """KV Connector that writes hidden states directly to Mooncake.
 
 vLLM discovers this connector via ``kv_connector_module_path`` in the

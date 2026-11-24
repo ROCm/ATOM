@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # GRPO examples: training and rollout on separate nodes, weights over RDMA.
 # Alias 8 is example 8 of docs/07-disaggregated-rdma.md.
 

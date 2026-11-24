@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Example 6's long run (dapo_qwen3moe_a3b_ray_vllm_verlref_longrun.yaml), fully async.
 #
 # Same model, data and hyper-parameters as that config; only the layout and the

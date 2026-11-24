@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # vLLM fp8 end-to-end smoke: 4k response, 8 generations, reduced batch, no ckpt/eval.
 
 cluster:

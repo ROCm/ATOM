@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Convert HF LLaMA checkpoint to Megatron-LM-AMD format.
 
 Simplified version that skips RMSNorm and TE checks for compatibility

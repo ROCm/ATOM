@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Parallel layout for DeepSeek-V4-Flash full model on 2×8 MI300X/MI308X (16 GPUs).
 #
 # Defaults: TP=4 PP=4 EP=4 (11+11+11+10 layers). Override via env for bisect, e.g.:

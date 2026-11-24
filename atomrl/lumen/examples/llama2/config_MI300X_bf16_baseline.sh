@@ -1,4 +1,8 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # BF16 baseline config for diagnosing FP8/precision issues.
 # Same as config_MI300X_1x8x1.sh but with FP8 disabled, no synthetic
 # warmup, and standard-precision RoPE.

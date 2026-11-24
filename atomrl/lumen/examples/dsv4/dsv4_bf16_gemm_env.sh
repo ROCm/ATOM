@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # DSV4 BF16 tuned GEMM defaults — sourced from dsv4_paths.sh.
 #
 # CSV strategy: shared gfx942 runtime file configs/dsv4_bf16_tuned_gemm_mi308x.csv

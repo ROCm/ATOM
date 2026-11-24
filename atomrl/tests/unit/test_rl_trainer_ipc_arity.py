@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """The IPC receive call must not pass FP8 args a non-vLLM server cannot accept.
 
 ATOMRayServer.update_weights_from_ipc is (use_shm, version) -- no prequantized_fp8.

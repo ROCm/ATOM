@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """vLLM + ATOM teacher engine for speculative distillation.
 
 Launches a teacher model in a subprocess using vLLM with ATOM plugin

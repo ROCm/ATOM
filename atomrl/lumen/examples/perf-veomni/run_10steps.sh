@@ -1,4 +1,8 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # One 10-step Qwen-Image DiT SFT run on 8 GPUs.
 #
 #   run_10steps.sh baseline    [VeOmni CLI overrides...]   # no Lumen patch

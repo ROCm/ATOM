@@ -1,4 +1,7 @@
-# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Qwen3-8B training — PyTorch FSDP + Lumen FP8 blockwise2d or MXFP4.
 
 Supports both full-parameter causal-LM pretraining and LoRA SFT:

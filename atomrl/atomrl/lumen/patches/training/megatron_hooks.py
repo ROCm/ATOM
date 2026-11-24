@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """TRAINING-phase Megatron hooks (setup_model_and_optimizer / evaluate)."""
 
 from __future__ import annotations

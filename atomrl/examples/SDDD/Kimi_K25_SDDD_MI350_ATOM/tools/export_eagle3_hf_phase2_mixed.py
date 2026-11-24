@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Export AtomRL Eagle3 v2 checkpoint to HuggingFace safetensors format.
 
 Architecture aligned with lightseekorg/kimi-k2.5-eagle3:

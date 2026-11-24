@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Install the perf-veomni Lumen patches in the RL actor only.
 
 verl imports this module in every Ray process through ``VERL_USE_EXTERNAL_MODULES=lumen_training_patch``. Importing it only

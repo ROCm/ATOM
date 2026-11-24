@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Fused-MoE weight sync between a transformers-5.x trainer and vLLM.
 
 transformers 5.x stores Qwen3-MoE experts as fused 3D tensors, so the training

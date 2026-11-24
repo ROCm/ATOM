@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Quick HF-backend smoke test — single GPU, Qwen3-8B, 2 steps
 # Validates Eagle3 v3 architecture: 3 aux hidden states, YaRN-capable RoPE, fc called once.
 # No vLLM/Mooncake — pure HF teacher forward for fast iteration.

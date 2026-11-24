@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Resolution behaviour of the architecture registry.
 
 These pin the properties ``megatron_native_engine`` relies on: order is

@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Detect gfx942 GEMM cu_num for tune merge (source, do not execute).
 #
 # Priority: CU_NUM env > TARGET_CU env > docker aiter get_cu_num() > rocminfo.

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Eagle3 Mooncake store for speculative decoding hidden state transfer.
 
 Eagle3 Mooncake store. Provides async RDMA/TCP

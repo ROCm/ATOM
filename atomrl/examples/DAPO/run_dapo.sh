@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # 统一 DAPO 启动：MODE=bf16|fp8|atomfp8|atombf16, TRAIN_FP8=0|1, STEPS=N。路径取容器内 $RL_ROOT/$DATA_ROOT。
 set -uo pipefail
 : "${RL_ROOT:?}"; : "${DATA_ROOT:?}"

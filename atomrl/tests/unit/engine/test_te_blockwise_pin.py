@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """The blockwise-FP8 recipe requires a TE that carries the CDNA4 running-scale fix.
 
 A version gate rather than a functional probe: a synthetic GEMM with a large

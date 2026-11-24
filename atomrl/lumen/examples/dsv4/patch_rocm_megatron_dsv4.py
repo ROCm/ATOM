@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Deprecated alias for :mod:`patch_megatron_source`.
 
 Use ``examples/dsv4/patch_megatron_source.py`` or ``python3 -m atomrl.lumen.patches``.

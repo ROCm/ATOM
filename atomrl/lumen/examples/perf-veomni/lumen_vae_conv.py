@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Route a diffusers VAE's convolutions through Lumen's convolution API.
 
 Used by ``train_dit_lumen.py`` (LUMEN_PATCH=vae_conv / vae_conv_video),

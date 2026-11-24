@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """GRPO dense FP8 vs BF16 e2e checks (multi-GPU, FP8, slow)."""
 
 from __future__ import annotations

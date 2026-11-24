@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """One compact table for a whole matrix: steady step time, within-mode spread,
 gain against the control, peak memory and loss deviation, for every mode at
 once, with the steady figure at full precision.

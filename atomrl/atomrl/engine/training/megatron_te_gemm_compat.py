@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Reconcile megatron-core's ``te_general_gemm`` with newer TransformerEngine.
 
 ``megatron.core.extensions.transformer_engine.te_general_gemm`` calls TE's

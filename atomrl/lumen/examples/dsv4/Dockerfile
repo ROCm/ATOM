@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # DSV4 training image: Lumen base + bootstrap artifacts (TileKernels + pip deps).
 #
 # Build:

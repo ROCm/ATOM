@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # run_dsv4_4layer_profile.sh — capture torch.profiler on DSV4 4-layer Megatron pretrain
 # and write operator breakdown xlsx under examples/dsv4/results/.
 #

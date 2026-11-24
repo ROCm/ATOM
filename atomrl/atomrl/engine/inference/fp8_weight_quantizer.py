@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Actor-side FP8 per-block quantization for weight sync.
 
 Wraps the HF-named BF16 weight generator from ``get_per_tensor_param`` and

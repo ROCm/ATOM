@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """GRPO dense BF16 end-to-end smoke (multi-GPU, slow)."""
 
 from __future__ import annotations

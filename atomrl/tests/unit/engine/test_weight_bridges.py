@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Streaming weight bridges: GPT (Qwen3-shaped) round-trips, laziness and rule hygiene.
 
 Round-trips go HF -> Megatron through the (dict-based) load direction, then back

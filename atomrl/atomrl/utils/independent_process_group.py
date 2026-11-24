@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Create an isolated torch.distributed process group.
 
 The normal ``torch.distributed.new_group`` API can only add ranks from the

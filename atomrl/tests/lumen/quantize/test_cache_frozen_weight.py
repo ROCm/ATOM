@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 
 """cache_frozen_weight: a frozen weight's FP8 quant is cached on first forward
 and reused (skips per-forward re-quant), without changing numerics."""

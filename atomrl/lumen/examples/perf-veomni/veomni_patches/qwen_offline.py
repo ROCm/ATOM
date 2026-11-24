@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Make VeOmni's Qwen-Image ``offline_training`` runnable.
 
 A workaround for a VeOmni defect (present at 573848a), to be removed once it is

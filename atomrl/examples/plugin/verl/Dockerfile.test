@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # verl + AtomRL plugin test image (atomrl_fsdp2 training + vLLM rollout).
 #
 # The default vLLM base supports the vLLM rollout case. For ATOM rollout,

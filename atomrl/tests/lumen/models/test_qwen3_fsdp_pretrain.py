@@ -1,4 +1,7 @@
-# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Tests for the Qwen3 FSDP full-pretraining entrypoint."""
 
 import importlib.util

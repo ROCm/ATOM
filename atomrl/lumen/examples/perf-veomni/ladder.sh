@@ -1,4 +1,8 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # The measurement ladder: stock -> configuration only -> configuration + Lumen.
 #
 #   ladder.sh qwen      # Qwen-Image 1024 online training      (10 rungs)

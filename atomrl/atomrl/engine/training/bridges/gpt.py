@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Standard Megatron-Core GPTModel <-> Llama/Qwen-style HF weights.
 
 The default layout every family starts from: GQA attention with a fused QKV and

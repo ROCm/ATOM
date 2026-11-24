@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Phase 2: Mixed Domain Training (ATOM MXFP4 teacher, resume from Phase 1 HF)
 # Dataset: mixed corpus (~181K samples) — VL, Chinese, tool-call, agent, writing
 # Steps: 22609 (1 epoch × ceil(180870/8))

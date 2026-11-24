@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """ATOM fused-MoE weight-sync coverage checks.
 
 Run: python -m atomrl.tests.test_atom_moe_weight_sync

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """On-Policy Distillation (OPD) launcher for AtomRL.
 
 Implements DeepSeek-V4 style on-policy distillation: student rollout,

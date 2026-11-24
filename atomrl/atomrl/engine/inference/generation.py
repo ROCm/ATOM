@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Generation facade over :class:`~atomrl.engine.inference.atom_engine.AtomEngine`."""
 
 from __future__ import annotations

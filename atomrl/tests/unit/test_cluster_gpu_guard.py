@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 from examples.GRPO.dsv4.cluster_gpu_guard import (
     ProcessInfo,
     find_target_tree,

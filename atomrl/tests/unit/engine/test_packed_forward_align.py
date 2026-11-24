@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """The base packed forward must honour the run's token alignment.
 
 Dense models at pp=1/cp=1 bypass the pipeline forward and land here, so an FP8

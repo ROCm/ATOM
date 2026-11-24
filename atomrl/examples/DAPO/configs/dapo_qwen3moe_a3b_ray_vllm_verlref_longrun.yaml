@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Qwen3-30B-A3B-Base BF16 baseline for verl's FP8-E2E MoE reference experiment.
 #
 # Ports verl `recipe/low_precision/run_dapo_qwen3_moe_30b_megatron_fp8e2e.sh`

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """E2E test: MORI-IO P2P GPU-to-GPU hidden state transfer.
 
 Tests correctness (data integrity) and speed (latency + throughput).

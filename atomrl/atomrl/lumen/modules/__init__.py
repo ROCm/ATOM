@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 from atomrl.lumen.ops.normalization import LumenLayerNorm, LumenRMSNorm
 
 from .attention import LumenAttention

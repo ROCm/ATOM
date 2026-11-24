@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """OBSOLETE — use ``atomrl.lumen.models.megatron_patches.install_mlp_fp8_store()`` instead.
 
 Set ``LUMEN_MLP_FP8_STORE=1`` and import ``atomrl.lumen.models.megatron`` (or call

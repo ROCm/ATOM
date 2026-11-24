@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Grouped GEMM package.
 
 ``epilogue`` and ``fp8_output`` are optional. They are re-exported when those

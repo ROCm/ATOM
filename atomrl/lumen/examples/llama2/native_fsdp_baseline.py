@@ -1,4 +1,7 @@
-# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Native PyTorch FSDP baseline for Llama2 LoRA SFT (no Lumen quantization path).
 
 Mirrors atomrl.lumen.models.llama2.fsdp.sft.FSDPTrainer's BF16 path EXACTLY (model load,

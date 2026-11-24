@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Training loop BF16 vs configured FP8 training path (Lumen hooks when installed)."""
 
 from __future__ import annotations

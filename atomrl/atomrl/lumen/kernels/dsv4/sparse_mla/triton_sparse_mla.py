@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """DSV4 sparse MLA via aiter Triton kernels (MI308X-optimised).
 
 Layout adapter: Lumen uses [B,S,H,D] batched tensors; aiter expects flat [N,H,D].

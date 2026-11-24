@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Pre-quantized FP8 over the colocated CUDA-IPC weight-sync path.
 
 The separated RDMA path has had ``fp8_quantize`` since it was written; the

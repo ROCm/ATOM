@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Single-GPU check of Lumen's DiT SDPA route at both attention shapes.
 
 For each of Qwen-Image self-attention, Wan2.1 self-attention and Wan2.1 cross-

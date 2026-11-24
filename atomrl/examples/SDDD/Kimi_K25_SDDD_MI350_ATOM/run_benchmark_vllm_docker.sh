@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Benchmark Eagle3 Phase 1 model using vLLM with speculative decoding on MI350
+
 set -uo pipefail
 
 DOCKER_IMAGE="atomrl-vllm-mi350:latest"

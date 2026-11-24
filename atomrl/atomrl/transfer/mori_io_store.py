@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """P2P GPU-to-GPU hidden state transfer for Eagle3 SDDD.
 
 Replaces Mooncake TCP with direct GPU P2P copy via CUDA/HIP IPC.

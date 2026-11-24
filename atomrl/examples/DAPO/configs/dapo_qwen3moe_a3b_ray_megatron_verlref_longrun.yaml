@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Megatron-Native twin of dapo_qwen3moe_a3b_ray_vllm_verlref_longrun.yaml.
 #
 # Same verl FP8-E2E BF16 reference recipe, same 1000-step schedule, same data,

@@ -1,4 +1,8 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Extract validation loss from Lumen log and format as MLPerf eval_accuracy
 # for direct comparison with MLPerf reference results.
 #

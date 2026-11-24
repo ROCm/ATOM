@@ -1,4 +1,8 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 set -euo pipefail
 
 # LLaMA2-70B LoRA SFT — 8x MI300X (MLPerf-aligned, v47)

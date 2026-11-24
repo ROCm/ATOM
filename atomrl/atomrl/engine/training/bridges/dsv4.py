@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """DeepSeek-V4-Flash <-> Megatron-Core GPTModel weight conversion.
 
 Maps Hugging Face DeepSeek-V4-Flash weights to a Megatron-Core ``GPTModel``

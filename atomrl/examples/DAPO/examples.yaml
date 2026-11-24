@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # DAPO examples. `bash examples/run.sh list` shows them; `bash examples/run.sh <id>`
 # runs one. Aliases 1-7 and 9 are the numbers of the release table in
 # docs/08-release.md.

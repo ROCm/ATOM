@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """VeOmni DiT training entry point with Lumen op replacement.
 
 Mirrors tasks/train_dit.py, but wraps DiTTrainer._build_model so Lumen patches

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Export AtomRL Eagle3 v2 Phase 2 checkpoint to HuggingFace safetensors format.
 
 Uses the final checkpoint from phase2 training. Same architecture as phase1.

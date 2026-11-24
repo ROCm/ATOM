@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """One process on one GPU gets a single-rank process group.
 
 Without one, FSDP2 left the model unsharded and computing in the fp32 of its

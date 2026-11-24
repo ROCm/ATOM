@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Where the examples run: the hosts, the data, and how to reach each host.
 
 Without a site file the runner uses this machine alone, with ``DATA_ROOT`` from

@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Deprecated alias — use ``examples/dsv4/patch_megatron_source.py --tag llama`` instead.
 
 This script applied FusedLayerNorm + RMSNorm fixes directly. The logic now lives

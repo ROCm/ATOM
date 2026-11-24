@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # AtomRL as a plugin of other frameworks (verl/README.md, vime/README.md).
 # Each needs its framework's image; the run is skipped where it is absent.
 

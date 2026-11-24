@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 from collections.abc import Mapping
 
 import atomrl.engine.training.bridges.dsv4 as dsv4_bridge

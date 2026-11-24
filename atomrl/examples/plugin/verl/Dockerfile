@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Build a verl + AtomRL plugin image for Qwen3-8B GRPO (FSDP2 + ATOM).
 #
 # Usage:

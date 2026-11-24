@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # verl-aligned Ray online rollout — FP8 FORMAL LONG RUN (Qwen3-8B-Base, DAPO math).
 #
 # Strict per_block_fp8 reproduction of verl `rollout.quantization=fp8_per_block`,

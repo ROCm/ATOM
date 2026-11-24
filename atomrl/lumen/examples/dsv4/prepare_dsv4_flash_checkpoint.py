@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Prepare HF → BF16 → Megatron torch_dist for DSV4 Flash full model (43 layers).
 
 Uses Miles convert_hf_to_torch_dist.py. For 16-GPU training layout, convert with

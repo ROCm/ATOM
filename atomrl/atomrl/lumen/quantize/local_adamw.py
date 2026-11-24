@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Fused AdamW on FSDP2's local shards, without DTensor dispatch on every step.
 
 Under FSDP2 every parameter, gradient and optimizer state is a DTensor, and a

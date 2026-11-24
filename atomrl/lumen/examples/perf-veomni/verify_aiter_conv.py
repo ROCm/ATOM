@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Single-GPU check of Lumen's AITER-backed convolution in a real VAE.
 
 Encodes one input at the shape training uses through the stock BF16 VAE and

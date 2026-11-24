@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """DataProto.ragged must follow rows through every reindexing operation.
 
 R3 ships per-row MoE routing this way, and a silent misalignment there would not

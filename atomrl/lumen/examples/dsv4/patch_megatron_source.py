@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Apply Lumen SOURCE patches to a Megatron-LM checkout (torch-less host entry).
 
 Works on hosts without PyTorch (e.g. ``prepare_rocm_megatron.sh``) by stubbing

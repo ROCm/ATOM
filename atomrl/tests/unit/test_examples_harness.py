@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """examples/run.sh: descriptions, judging, command construction and reports.
 
 Nothing here touches Docker or a GPU; the runner is exercised through its

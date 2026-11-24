@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Isolated Megatron-to-vLLM RDMA weight synchronization validation.
 
 This initializes the training and rollout models but performs no RL rollout loop,

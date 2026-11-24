@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """One-command reproduction and regression runs for the AtomRL examples.
 
 Every example directory carries an ``examples.yaml`` that describes how to run

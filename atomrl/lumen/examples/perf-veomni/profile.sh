@@ -1,4 +1,8 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Profile one run of either model with VeOmni's built-in torch profiler.
 #
 #   profile.sh <qwen|wan> [VeOmni CLI overrides...]      # LUMEN_PATCH as exported

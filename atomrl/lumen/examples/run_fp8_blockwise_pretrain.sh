@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Run llama2-7b / llama31-8b / qwen3-8b Megatron pretrain smoke (FP8 blockwise).
 # TRAIN_STEPS defaults to 20. The inner scripts stay on delayed scaling; this
 # wrapper rewrites those flags to blockwise before launch.

@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """ATOM RDMA orchestration: rank layout and the guards around it.
 
 The rank arithmetic is the part most likely to be quietly wrong. Every rank must

@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Kimi K2.5 Eagle3 Two-Phase Training — Docker Launch (vLLM+ATOM, MI350)
 #

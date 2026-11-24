@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """MORI EP token dispatcher for Megatron MoE (Phase C).
 
 Uses ``mori.ops.EpDispatchCombineOp`` on the expert-parallel process group instead

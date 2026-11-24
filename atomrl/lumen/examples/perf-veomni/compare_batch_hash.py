@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Did two runs feed the model the same data in the same order?
 
 Reads the "[lumen] batch_hash rank=R call=N ... md5=H" lines train_dit_lumen.py

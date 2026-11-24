@@ -1,4 +1,7 @@
-# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Qwen3-30B-A3B MoE Training — FSDP2 (fully_shard) + 2D Parallelism (DP×EP).
 
 2D parallelism layout (world_size = dp_size × ep_size):

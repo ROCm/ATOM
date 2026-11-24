@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """AtomRL: High-performance RL post-training for LLMs on AMD GPUs."""
 
 from importlib.metadata import PackageNotFoundError, version

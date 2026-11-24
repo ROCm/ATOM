@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # ATOM vLLM nightly already contains the ROCm-compatible vLLM plugin stack.
 # Override with --build-arg BASE_IMAGE=... only for an explicitly validated pin.
 ARG BASE_IMAGE=rocm/atom-dev:vllm-latest

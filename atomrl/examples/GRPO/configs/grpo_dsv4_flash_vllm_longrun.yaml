@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # DeepSeek-V4-Flash GRPO long run — Megatron-DSV4 TP4/PP4/EP4 + vLLM FP8 rollout (MI308X)
 #
 # Aligned with LMSYS MILES RL semantics:

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Production recipe: Llama 3.1 8B GRPO on 1 node x 8 GPUs
 # FP8 end-to-end with TIS rollout correction
 

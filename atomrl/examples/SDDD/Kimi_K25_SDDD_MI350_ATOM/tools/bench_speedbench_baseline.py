@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """
 Benchmark baseline (no speculative decoding) with ATOM using SPEED-Bench dataset.
 Measures throughput only — no accept_length since there's no drafting.

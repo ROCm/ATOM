@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """torchrun worker: streaming Megatron-native export vs the original materializing copy.
 
 Not collected by pytest. Env:

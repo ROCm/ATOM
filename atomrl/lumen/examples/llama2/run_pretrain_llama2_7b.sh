@@ -1,4 +1,8 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 ###############################################################################
 # Lumen — Llama2-7B pretrain (BF16 or FP8 delayed/hybrid)
 #

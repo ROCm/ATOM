@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """DeepSeek-V3 family registry entry, config building, and rope/routing.
 
 Values are the real ``moonshotai/Kimi-K2-Base`` config, which reports

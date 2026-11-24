@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """One-shot report for a VeOmni torch-profiler trace of a host-bound step.
 
 Consolidates every analysis that was needed to explain a 4.6 s Qwen-Image step

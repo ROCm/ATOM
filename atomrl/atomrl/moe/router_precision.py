@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """FP32 MoE router for train/rollout expert-selection agreement.
 
 A routed-expert model picks top-k of N experts by comparing router logits. That

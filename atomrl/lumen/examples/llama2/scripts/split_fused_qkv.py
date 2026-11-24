@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Split fused-QKV LLaMA model into standard separate Q/K/V format.
 
 Converts regisss/llama2-70b-fused-qkv-mlperf (qkv_proj) to standard

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """``_check_fp8_usable``: refuse an FP8 request the run cannot honour.
 
 Both failure modes it covers are silent-or-misleading without it. A

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """MLA weight bridge: HF <-> Megatron round-trip on a real constructed model.
 
 Rather than asserting a hand-written name table, this builds a tiny DSv3-shaped

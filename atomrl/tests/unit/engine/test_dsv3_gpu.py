@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """DSv3 checks that need real GPUs: model parallelism, and real-checkpoint parity.
 
 Three properties the CPU tests structurally cannot reach:

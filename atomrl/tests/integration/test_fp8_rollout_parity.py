@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Rollout-side FP8 vs BF16 parity and TIS-style correction behavior."""
 
 from __future__ import annotations

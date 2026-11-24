@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Shared helpers for native GRPO finetune inner scripts (source, do not execute).
 
 # Finetune defaults: GBS=256, seq_len=4096 (Miles GRPO smoke: 32×8 rollout samples).

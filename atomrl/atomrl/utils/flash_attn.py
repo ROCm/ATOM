@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Flash attention utilities for Eagle3 diagonal attention.
 
 Wraps aiter Triton ``flash_attn_varlen_func`` with token packing/unpacking.

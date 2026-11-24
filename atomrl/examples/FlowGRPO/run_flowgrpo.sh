@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # verl-omni's official recipe examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr_veomni.sh (Qwen-Image
 # full-parameter FlowGRPO, Qwen3-VL-8B OCR reward, 300 steps, validation and checkpoint every 30) on one 8-GPU node.
 # Overrides: local paths, 8 GPUs, ROCm attention backends, and actor offload off (it fits in 288 GB; host-RAM bound

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Generate fake_rollout.pt for native DSV4 GRPO finetune (debug-train-only).
 
 Wraps Miles ``scripts.gen_fake_rollout_data`` when available; falls back to a

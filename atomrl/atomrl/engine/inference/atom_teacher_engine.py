@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """ATOM-based teacher inference engine for Eagle3 speculative distillation.
 
 Runs the teacher model in a **separate subprocess** on dedicated GPUs

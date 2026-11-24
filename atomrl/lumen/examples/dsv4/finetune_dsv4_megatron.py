@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Native torchrun GRPO finetune entry for DSV4 (debug-train-only, no Ray).
 
 Reads ``fake_rollout.pt``, runs GRPO policy loss updates via ``megatron.training.pretrain``

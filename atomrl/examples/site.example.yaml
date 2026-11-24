@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Template for examples/site.yaml (or any file passed with --site, or named by
 # $ATOMRL_SITE). Without a site file, run.sh uses this machine alone and takes
 # the data root from $DATA_ROOT.

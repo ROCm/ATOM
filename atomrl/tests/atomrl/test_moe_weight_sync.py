@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Fused-MoE weight sync: routing math and the silent-drop guard.
 
 CPU-only, no vLLM and no model needed. The fake FusedMoE mirrors the parts of

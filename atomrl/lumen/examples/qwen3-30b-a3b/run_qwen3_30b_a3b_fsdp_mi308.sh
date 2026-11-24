@@ -1,5 +1,8 @@
 #!/bin/bash
-# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 #
 # Qwen3-30B-A3B MoE Training — 2×MI308X nodes (16 GPUs), FSDP2 + DP=2 × EP=8.
 #

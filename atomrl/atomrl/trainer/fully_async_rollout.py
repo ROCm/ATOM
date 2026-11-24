@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Streaming rollout for fully asynchronous training (verl's fully_async_policy).
 
 The rollout pool generates prompt groups (one prompt x num_generations) one at a

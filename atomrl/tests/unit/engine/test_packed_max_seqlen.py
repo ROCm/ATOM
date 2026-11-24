@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """``_packed_max_seqlen`` must cover the trailing pad bin, not just real sequences.
 
 Megatron sizes the RoPE table from max_seqlen, then slices freqs[:len] for each

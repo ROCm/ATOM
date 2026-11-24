@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Generate the minimal Qwen-Image SFT smoke dataset.
 
 8 distinct 256x256 RGB PNGs plus a JSONL that cycles through them.

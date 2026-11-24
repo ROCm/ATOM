@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Build lumen/mxfp4-lumen:gfx950 from atomrl.lumen/tests:latest + baked Lumen source.
 set -euo pipefail
 

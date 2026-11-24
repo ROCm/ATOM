@@ -1,4 +1,8 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Compare Lumen vs MLPerf reference LLaMA2-70B LoRA finetune results.
 #
 # Extracts key metrics from training logs: loss, step time, memory, FP8 config.

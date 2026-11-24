@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Download the models and datasets of the DAPO and GRPO examples and filter the prompts.
 
 Runs inside the example image, which has huggingface_hub, datasets and transformers:

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Batched DSV4 DSA indexer via aiter ``dsv4_indexer`` ops.
 
 Matches the TileLang batched layout used by ``V4Indexer``:

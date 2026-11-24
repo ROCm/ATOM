@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
-# Copyright 2025 AtomRL Contributors
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 
 """Megatron-Core training engine for AtomRL (BF16, TP/PP/EP/DP).
 

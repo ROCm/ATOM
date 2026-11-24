@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # DeepSeek-V4-Flash GRPO RL — Megatron TP4/PP4/EP4 + vLLM FP8 (MI300X)
 #

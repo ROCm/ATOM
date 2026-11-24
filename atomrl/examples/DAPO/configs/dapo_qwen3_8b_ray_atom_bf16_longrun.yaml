@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Ray colocated ATOM BF16 rollout + BF16 actor formal long run.
 # Scale/hyperparameters match the ATOM FP8 formal run; only quantization is off.
 

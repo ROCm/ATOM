@@ -1,4 +1,8 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 ###############################################################################
 # Megatron pretrain body for the precision-comparison benchmark, shared by
 # every model and by the docker and native launchers.

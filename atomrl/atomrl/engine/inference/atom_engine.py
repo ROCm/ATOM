@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """ATOM-backed inference engine with subprocess isolation for RL training.
 
 Uses ATOM's ``LLMEngine`` and ``SamplingParams`` APIs for efficient generation.

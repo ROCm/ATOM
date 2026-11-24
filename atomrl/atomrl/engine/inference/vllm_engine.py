@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Native (upstream) vLLM rollout engine with subprocess isolation for RL.
 
 This is the vanilla-vLLM counterpart of :mod:`atomrl.engine.inference.atom_engine`.

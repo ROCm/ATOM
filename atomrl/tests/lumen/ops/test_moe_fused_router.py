@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Lumen-level unit tests for fused MoE router ops.
 
 Tests 1-7 map to the spec's Testing section:

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Compare FlowGRPO runs with each other and with the official verl-omni reference.
 
 Usage: python3 compare.py $WORK/runs/<run> [$WORK/runs/<run> ...]

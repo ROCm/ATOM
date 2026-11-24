@@ -1,4 +1,8 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Lumen LLaMA2-70B LoRA finetune — Docker launcher.
 #
 # Uses MI300X reference download scripts (regisss/ public repos) for

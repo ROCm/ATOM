@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """FSDP2 yields DTensor shards to weight sync; the export must write whole tensors."""
 
 from __future__ import annotations

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """R3 packing alignment and replay semantics.
 
 The alignment here is the one thing in R3 that fails silently: feed a token the

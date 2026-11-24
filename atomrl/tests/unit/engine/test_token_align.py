@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """``_token_align``: every token-count divisibility the forward has to pad for.
 
 RL token counts are whatever the rollout produced, so each requirement below is

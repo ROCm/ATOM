@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Shared helpers for DSV4 DSA indexer backends (TileLang / aiter)."""
 
 from __future__ import annotations

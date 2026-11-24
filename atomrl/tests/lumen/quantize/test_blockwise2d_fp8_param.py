@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 
 """Blockwise2DFP8Param / Blockwise2DFP8Gathered: the FSDP2 param-storage wrappers
 for a frozen blockwise2d base weight.

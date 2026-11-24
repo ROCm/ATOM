@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 # Source-build ROCm Apex and TransformerEngine at the pinned revisions.
 # Runs inside the image build; no GPU required, only the target arch.
 #

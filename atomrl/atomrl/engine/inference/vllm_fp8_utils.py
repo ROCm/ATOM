@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """vLLM online ``fp8_per_block`` support for AtomRL rollout (verl-free).
 
 This is a self-contained port of the *online per-block FP8* pieces of verl's
