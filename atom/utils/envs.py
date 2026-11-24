@@ -662,6 +662,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # occupancy in the block scorer, winning above ~1M batch*context tokens and
     # losing below. Unset leaves the config field alone.
     "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
+    # MiniMax-M3 prefill index selector: aiter's FlyDSL top-16 over the scorer's
+    # fp32 rows (gfx950, one wave per row, 2-4x faster than the Triton selector and
+    # 1.3-2.8x faster than topk_per_row_small_k at 32K-180K contexts). Same ids as the
+    # Triton selector, ties included. Used only when the installed aiter has it; 0
+    # keeps the previous Triton / topk_per_row_small_k selection.
+    "ATOM_M3_PREFILL_TOPK_FLYDSL": lambda: (
+        os.getenv("ATOM_M3_PREFILL_TOPK_FLYDSL", "1") == "1"
+    ),
     # Fused decode for measured model/deployment/step geometries. Unsupported
     # configurations and forwards keep the production path. 0 disables it.
     "ATOM_MONO_ENABLE": lambda: os.getenv("ATOM_MONO_ENABLE", "1") == "1",

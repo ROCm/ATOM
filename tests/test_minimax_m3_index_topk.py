@@ -1008,3 +1008,113 @@ def test_gfx1250_issue_341_tp4_launch_is_bit_exact(
         previous = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
     torch.cuda.synchronize()
     assert all(torch.equal(a, b) for a, b in zip(tuned, previous))
+
+
+class TestFlydslPrefillTopkGate:
+    """`_flydsl_prefill_topk_serves`: aiter's FlyDSL prefill top-16 takes only a prefill with
+    published bounds on the kernel's contract; everything else keeps the old selectors.
+    """
+
+    @pytest.fixture
+    def served(self, monkeypatch):
+        monkeypatch.setattr(m, "get_gfx_runtime", lambda: "gfx950")
+        monkeypatch.setattr(m.envs, "ATOM_M3_PREFILL_TOPK_FLYDSL", True, raising=False)
+        monkeypatch.setattr(m, "_flydsl_prefill_topk", lambda: object())
+
+        def call(width=900, rows=64, decode_max_q=0, emit=False, nvalid="ok", **over):
+            score = torch.zeros(1, rows, width)
+            idx = torch.zeros(1, rows, TOPK, dtype=torch.int32)
+            nv = torch.zeros(rows, dtype=torch.int32) if nvalid == "ok" else nvalid
+            kw = {"topk": TOPK, "decode_max_q": decode_max_q, "emit": emit}
+            kw.update(over)
+            return m._flydsl_prefill_topk_serves(score, idx, nv, **kw)
+
+        return call
+
+    def test_a_prefill_with_bounds_is_served(self, served):
+        assert served()
+        assert served(width=m._FLYDSL_PREFILL_TOPK_MAX_BLOCKS)
+
+    def test_declines_what_the_contract_does_not_cover(self, served):
+        assert not served(nvalid=None)  # no published bounds: Triton derives them
+        assert not served(decode_max_q=1)  # decode keeps its selectors
+        assert not served(topk=8)
+        assert not served(width=m._FLYDSL_PREFILL_TOPK_MAX_BLOCKS + 1)
+        assert not served(nvalid=torch.zeros(3, dtype=torch.int32))  # short bounds
+        assert not served(nvalid=torch.zeros(64, dtype=torch.int64))
+
+    def test_emission_needs_the_row_wide_enough_for_the_extra_launch(self, served):
+        assert not served(emit=True, width=m._AITER_MIN_WIDTH_WITH_EMIT - 1)
+        assert served(emit=True, width=m._AITER_MIN_WIDTH_WITH_EMIT)
+
+    def test_kill_switch_and_arch_and_missing_aiter_op(self, served, monkeypatch):
+        monkeypatch.setattr(m.envs, "ATOM_M3_PREFILL_TOPK_FLYDSL", False)
+        assert not served()
+        monkeypatch.setattr(m.envs, "ATOM_M3_PREFILL_TOPK_FLYDSL", True)
+        monkeypatch.setattr(m, "get_gfx_runtime", lambda: "gfx942")
+        assert not served()
+        monkeypatch.setattr(m, "get_gfx_runtime", lambda: "gfx950")
+        monkeypatch.setattr(m, "_flydsl_prefill_topk", lambda: None)
+        assert not served()
+
+
+def _select_definition(score, nvalid, init, local):
+    """The selection by its definition: a row's live blocks, the first `init` and the last
+    `local` forced in (local outranks init), best score first, ties to the larger block.
+    """
+    heads, rows, width = score.shape
+    s = score.clone()
+    blk = torch.arange(width, device=s.device)
+    nv = nvalid.view(heads, rows, 1).long()
+    s = torch.where(blk < init, torch.full_like(s, 1e30), s)
+    s = torch.where(blk >= nv - local, torch.full_like(s, 1e29), s)
+    s = torch.where(blk < nv, s, torch.full_like(s, float("-inf")))
+    order = torch.sort(s.flip(-1), dim=-1, descending=True, stable=True).indices
+    ids = (width - 1 - order)[..., :TOPK].int()
+    pos = torch.arange(TOPK, device=s.device)
+    return torch.where(pos < torch.minimum(nv, torch.tensor(width)), ids, -1)
+
+
+@gpu
+@pytest.mark.parametrize("quantum", [0.0, 0.25])  # 0.25: heavy score ties
+@pytest.mark.parametrize(
+    "qlens,prefixes,heads",
+    [([2048], [30000], 1), ([700, 300], [90000, 5000], 1), ([1024], [160000], 2)],
+)
+def test_flydsl_prefill_topk_matches_the_definition(
+    monkeypatch, qlens, prefixes, heads, quantum
+):
+    """Through `_launch_select`, ragged batches, init / local forced: ids equal the
+    definition exactly (the kernel is the one `_flydsl_prefill_topk` returns)."""
+    if m.get_gfx_runtime() != "gfx950" or m._flydsl_prefill_topk() is None:
+        pytest.skip("needs gfx950 and an aiter with the FlyDSL prefill top-16")
+    dev = "cuda"
+    kw = _inputs(qlens, prefixes, heads, dev)
+    total_q = sum(qlens)
+    width = -(-kw["max_seq_len"] // SPARSE_BLOCK_SIZE)
+    g = torch.Generator(device=dev).manual_seed(7)
+    score = torch.randn(heads, total_q, width, generator=g, device=dev) * 3
+    if quantum:
+        # + 0.0 turns the -0.0 that rounding makes into +0.0: the selectors order -0.0
+        # below +0.0 (by the score's bits), the definition below compares values
+        score = torch.round(score / quantum) * quantum + 0.0
+    cu, pre = kw["cu_seqlens_q"], kw["prefix_lens"]
+    bounds = m.build_n_valid_column_per_row(
+        cu, pre, batch=len(qlens), total_q=total_q, num_idx_heads=heads, decode_max_q=0
+    )
+    calls = []
+    real = m._flydsl_prefill_topk()
+    monkeypatch.setattr(
+        m, "_flydsl_prefill_topk", lambda: lambda *a: (calls.append(1), real(*a))[1]
+    )
+    topk_idx = torch.empty((heads, total_q, TOPK), dtype=torch.int32, device=dev)
+    _, emit_args = m._alloc_emit(total_q, heads, TOPK, kw["block_table"], False, dev, 8)
+    m._launch_select(
+        score, topk_idx, cu, pre, len(qlens), TOPK, INIT, LOCAL, kw["block_table"],
+        emit_args, heads, rows_per_req=max(qlens), decode_max_q=0,
+        block_size_k=_prefill_topk_block_size_k(width),
+        num_warps=m.PREFILL_TOPK_NUM_WARPS, emit=False,
+        block_page_stride=8, n_valid_column_per_row=bounds, pages_per_block=8,
+    )  # fmt: skip
+    assert calls
+    assert torch.equal(topk_idx, _select_definition(score, bounds, INIT, LOCAL))
