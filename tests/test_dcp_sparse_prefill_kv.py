@@ -833,7 +833,7 @@ def test_a_kv_prefill_projects_only_this_ranks_heads(monkeypatch, kv, env, group
     )
     seen = {}
 
-    def q_proj_and_k_up_proj(self, x, x_scale=None, group=False):
+    def q_proj_and_k_up_proj(self, x, x_scale=None, group=False, q_nope_out=None):
         seen["group"] = group
         raise _Stop
 
@@ -844,6 +844,7 @@ def test_a_kv_prefill_projects_only_this_ranks_heads(monkeypatch, kv, env, group
     a.layer_num = 0
     a.qrep_enabled = True
     a.dcp_prefill_qrep = env == "1"
+    a._kup_qpe_enabled = False
     with pytest.raises(_Stop):
         attention_mla.MLAAttention.forward_impl(a, torch.zeros(2, 8), None, None)
     assert seen == {"group": group}

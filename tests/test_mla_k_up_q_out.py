@@ -68,6 +68,7 @@ def projection(monkeypatch):
     layer.qk_nope_head_dim, layer.qk_rope_head_dim, layer.kv_lora_rank = 4, 2, 8
     layer.qk_head_dim = 6
     layer.qrep_enabled = False
+    layer.dcp_prefill_qrep = False
     layer.W_K = (torch.arange(3 * 8 * 4) % 3).reshape(3, 8, 4).to(torch.bfloat16)
     layer.W_K_scale = None
     layer.q_proj = lambda x, scale=None: x
