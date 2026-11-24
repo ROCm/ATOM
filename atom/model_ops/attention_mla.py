@@ -350,6 +350,15 @@ def check_kv_shuffled_supported(
         )
 
 
+def check_sparse_mla_page_size(*, mla_page_size: int, is_sparse_mla: bool) -> None:
+    # The indexer emits token slots; a paged kernel would read them as page ids.
+    if is_sparse_mla and mla_page_size > 1:
+        raise RuntimeError(
+            "Sparse MLA requires ATOM_MLA_PAGE_SIZE=1: its top-k indices are "
+            f"token slots, not pages (got {mla_page_size})."
+        )
+
+
 def mla_min_query_heads(kv_cache_dtype: str, block_width: int) -> int:
     """Query-head padding that lets aiter dispatch a NON-causal MLA decode.
 
@@ -889,6 +898,11 @@ class MLAAttention(nn.Module):
         # `_kv_b_proj_gather`. None = not asked yet.
         self._flydsl_gather_ok: bool | None = None
         self._flydsl_gather_fp8_ok: bool | None = None
+        # Not only under seg: sparse prefill passes this page size with the
+        # Triton MLA decode too.
+        check_sparse_mla_page_size(
+            mla_page_size=envs.ATOM_MLA_PAGE_SIZE, is_sparse_mla=self.is_sparse_mla
+        )
         if self.use_seg_mla:
             if envs.ATOM_MLA_PAGE_SIZE != _MLA_SEG_PAGE_SIZE:
                 raise RuntimeError(
