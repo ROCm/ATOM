@@ -236,6 +236,15 @@ def empty_token_ids(hidden: torch.Tensor) -> torch.Tensor:
     return torch.empty(hidden.shape[0], dtype=torch.int32, device=hidden.device)
 
 
+def _ring_module():
+    """aiter's gfx950 small-M BF16 ring GEMM, or None where aiter does not ship it."""
+    try:
+        from aiter.ops.flydsl import gemm_a16w16_ring
+    except ImportError:
+        return None
+    return gemm_a16w16_ring
+
+
 class ParallelLMHead(VocabParallelEmbedding):
     # the model's logits are this head of its final rows, so a decode verify
     # may take its argmax ids instead (``verify_head``); a head whose logits
@@ -324,9 +333,42 @@ class ParallelLMHead(VocabParallelEmbedding):
             return out.copy_(self._dp_sharded_logits(x, "argmax"))
         return self.argmax_of_logits(self.local_logits(x), out=out)
 
+    def process_weights_after_loading(self):
+        """``ATOM_LM_HEAD_RING=1``: keep a tile-shuffled copy of this rank's
+        bf16 shard for aiter's gfx950 small-M ring GEMM (``local_logits`` below
+        takes it for the rows it covers; +1 weight shard of memory). Not an
+        in-place shuffle: the shard may be tied to the embedding table."""
+        self._ring_weight = None
+        if not envs.ATOM_LM_HEAD_RING or self.bias is not None:
+            return
+        ring = _ring_module()
+        w = self.weight.data
+        if (
+            ring is None
+            or w.dtype != torch.bfloat16
+            or w.dim() != 2
+            or not w.is_contiguous()
+            or not ring.ring_supported(ring.MAX_ROWS, *w.shape, w.device)
+        ):
+            return
+        self._ring_weight = ring.shuffle_weight_ring(w)
+        # Compile every row tier now: a first call inside a CUDA-graph capture would bake the compile in.
+        ring.warmup_ring(*w.shape, w.device, self._ring_weight)
+
     def local_logits(self, x: torch.Tensor, out: torch.Tensor | None = None):
         """``x``'s logits over this rank's vocab shard [N, vocab/tp] (into
         ``out`` where given)."""
+        ring_weight = getattr(self, "_ring_weight", None)
+        if (
+            ring_weight is not None
+            and out is None
+            and x.dim() == 2
+            and x.dtype == torch.bfloat16
+            and x.is_contiguous()
+            and x.data_ptr() % 16 == 0
+            and 0 < x.shape[0] <= _ring_module().MAX_ROWS
+        ):
+            return _ring_module().gemm_a16w16_ring(x, ring_weight)
         return tgemm.mm(x, self.weight, self.bias, out=out)
 
     def argmax_of_logits(self, logits: torch.Tensor, *, out: torch.Tensor, draw=None):
