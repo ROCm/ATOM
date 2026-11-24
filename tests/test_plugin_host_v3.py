@@ -422,3 +422,18 @@ def test_a_taken_over_module_needs_its_inner_seams_planned():
     assert plan.modules["any"]["layers.*.attn"] == ("attn-p",)
     # a method takeover replaces one method: no inner seam to plan
     _plan(modules={"layers.*.attn:_wo_a": ["wo-p"]})
+
+
+def test_shared_weights_are_prepared_once_for_every_configuration():
+    net = _Net()
+    assert host.freeze_weights(net) == 0  # _Mix has no parameters
+    lin = torch.nn.Linear(2, 2)
+    model = torch.nn.Sequential(lin)
+    assert host.freeze_weights(model, None, prefixes=("", "draft")) == 2
+    assert host.weights_changed() == []
+    with torch.no_grad():
+        lin.weight.mul_(2)  # an owner re-preparing a shared weight in place
+    lin.bias = torch.nn.Parameter(torch.zeros(2))  # or swapping it
+    assert host.weights_changed() == ["0.bias", "0.weight"]
+    report = host.log_route_report("test")
+    assert "0.weight" in report["weights_changed"]

@@ -1079,6 +1079,10 @@ class ModelRunner:
                 self.label,
                 boot_prepare["native"],
             )
+        # One weight preparation for every graph, prefill and decode of this
+        # process: record it; the capture report names anything that changed.
+        drafter_model = getattr(getattr(self, "drafter", None), "model", None)
+        plugin_host.freeze_weights(self.model, drafter_model, prefixes=("", "draft"))
         self._maybe_warmup()
 
         # Restore the implicit CPU default. An explicit "cpu" leaves a

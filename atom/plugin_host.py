@@ -2158,9 +2158,74 @@ def route_report() -> dict[str, Any]:
     }
 
 
+# -- one weight preparation for every configuration of the process ------------
+
+# Every captured graph, prefill and decode of a process (and every arm) shares
+# one set of prepared weights: an owner may keep private copies, never change
+# the model's own parameters / buffers after the boot preparation.
+_weight_marks: dict[str, tuple] = {}
+_weight_models: list[tuple[Any, str]] = []
+
+
+def _weight_mark(tensor: torch.Tensor) -> tuple:
+    return (
+        tensor.data_ptr(),
+        tuple(tensor.shape),
+        tensor.dtype,
+        tuple(tensor.stride()),
+        tensor._version,
+    )
+
+
+def _weights_now() -> dict[str, tuple]:
+    marks = {}
+    for model, prefix in _weight_models:
+        for name, tensor in (*model.named_parameters(), *model.named_buffers()):
+            if isinstance(tensor, torch.Tensor) and tensor.device.type != "meta":
+                marks[f"{prefix}.{name}" if prefix else name] = _weight_mark(tensor)
+    return marks
+
+
+def freeze_weights(*models, prefixes: Iterable[str] = ()) -> int:
+    """After the load, the boot hook, module installs and ``prepare_plan``:
+    record every parameter and buffer (storage, layout, in-place version) of
+    ``models``. ``weights_changed`` names any that changed since. Returns the
+    number recorded."""
+    names = list(prefixes) or [""] * len(models)
+    _weight_models[:] = [(m, p) for m, p in zip(models, names) if m is not None]
+    _weight_marks.clear()
+    _weight_marks.update(_weights_now())
+    return len(_weight_marks)
+
+
+def weights_changed() -> list[str]:
+    """The recorded parameters / buffers whose storage, layout or contents
+    (in-place version) changed, appeared or went since ``freeze_weights``: a
+    configuration that re-prepared shared weights its siblings also read."""
+    if not _weight_models:
+        return []
+    now = _weights_now()
+    return sorted(
+        name
+        for name in set(now) | set(_weight_marks)
+        if now.get(name) != _weight_marks.get(name)
+    )
+
+
 def log_route_report(stage: str) -> dict[str, Any]:
     """Log ``route_report`` (after capture: every bucket's route is fixed)."""
     report = route_report()
+    changed = weights_changed()
+    report["weights_changed"] = changed
+    if changed:
+        logger.error(
+            "plugin_host: shared weights changed after the boot preparation "
+            "(%s; every graph, prefill and decode must share one): %s",
+            stage,
+            changed[:32],
+        )
+        if _strict:
+            raise PluginContractError(f"shared weights changed: {changed[:8]}")
     if _plan is not None:
         logger.info("plugin_host: routes after %s: %s", stage, report["routed"])
         if report["planned_but_unreached"]:
@@ -2623,6 +2688,8 @@ def _reset_for_testing() -> None:
         _refusals.clear()
         _counts.clear()
         _route_log.clear()
+        _weight_marks.clear()
+        _weight_models.clear()
         _warned_misses.clear()
         _plan, _owned, _last, _requested = None, frozenset(), None, None
         _kill_switch, _strict, _on_decline = False, False, "native"
