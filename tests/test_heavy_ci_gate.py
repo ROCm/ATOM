@@ -344,6 +344,85 @@ def test_paths_outside_include_remain_gated(tmp_path):
     assert result["smoke_requested"] == "false"
 
 
+@pytest.mark.parametrize(
+    "changed_files, reason",
+    [
+        ("atom/model_engine/scheduler.py", "paths-not-included"),
+        ("atom/plugin/sglang/model.py", "ignored-paths-only"),
+    ],
+)
+def test_include_and_ignore_report_why_nothing_is_relevant(
+    tmp_path, changed_files, reason
+):
+    result = _run_gate(
+        tmp_path,
+        review_decision="APPROVED",
+        changed_files=changed_files,
+        paths_ignore="atom/plugin/sglang/**",
+        paths_include="atom/plugin/**",
+    )
+
+    assert result["should_run"] == "false"
+    assert result["reason"] == reason
+
+
+def _workflow_gate_env(filename):
+    config = yaml.safe_load((REPO_ROOT / ".github/workflows" / filename).read_text())
+    return next(
+        step["env"]
+        for step in config["jobs"]["ci-gate"]["steps"]
+        if step.get("id") == "gate"
+    )
+
+
+@pytest.mark.parametrize(
+    "filename, changed_file, labels, should_run",
+    [
+        # Approval alone does not run a plugin's CI for a core-only change.
+        ("atom-vllm-test.yaml", "atom/model_engine/scheduler.py", (), "false"),
+        ("atom-sglang-test.yaml", "atom/model_engine/scheduler.py", (), "false"),
+        # Each plugin's own code runs only its own CI.
+        ("atom-vllm-test.yaml", "atom/plugin/vllm/model.py", (), "true"),
+        ("atom-sglang-test.yaml", "atom/plugin/vllm/model.py", (), "false"),
+        ("atom-sglang-test.yaml", "atom/plugin/sglang/model.py", (), "true"),
+        ("atom-vllm-test.yaml", "atom/plugin/sglang/model.py", (), "false"),
+        # Code both plugins share runs both.
+        ("atom-vllm-test.yaml", "atom/plugin/register.py", (), "true"),
+        ("atom-sglang-test.yaml", "atom/plugin/register.py", (), "true"),
+        ("atom-vllm-test.yaml", "docker/vllm_release.dockerfile", (), "true"),
+        ("atom-sglang-test.yaml", "docker/vllm_release.dockerfile", (), "false"),
+        # Scripts and files outside atom/plugin/ that the plugin CI runs.
+        ("atom-vllm-test.yaml", ".github/scripts/atom_oot_test.sh", (), "true"),
+        ("atom-vllm-test.yaml", ".github/scripts/check_mtp_acceptance.sh", (), "true"),
+        ("atom-sglang-test.yaml", ".github/scripts/atom_sglang_test.sh", (), "true"),
+        ("atom-sglang-test.yaml", ".github/workflows/docker-release.yaml", (), "true"),
+        # The plugin's label still asks for its CI on any change.
+        ("atom-vllm-test.yaml", "atom/model_engine/scheduler.py", ("ci:vllm",), "true"),
+        (
+            "atom-sglang-test.yaml",
+            "atom/model_engine/scheduler.py",
+            ("ci:sglang",),
+            "true",
+        ),
+    ],
+)
+def test_plugin_ci_runs_for_plugin_paths_or_its_label(
+    tmp_path, filename, changed_file, labels, should_run
+):
+    env = _workflow_gate_env(filename)
+    result = _run_gate(
+        tmp_path,
+        review_decision="APPROVED",
+        labels=labels,
+        allowed=env["CI_GATE_LABELS"],
+        changed_files=changed_file,
+        paths_ignore=env["CI_GATE_PATHS_IGNORE"],
+        paths_include=env["CI_GATE_PATHS_INCLUDE"],
+    )
+
+    assert result["should_run"] == should_run
+
+
 def _previous_run(**updates):
     return {
         "id": 100,
