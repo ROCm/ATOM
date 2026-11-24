@@ -2880,12 +2880,45 @@ BARE_ID = re.compile(_ID_HEAD + r"(?::|—|–|--|-(?!\w)|\s+(?=[a-z])|(?!\w))")
 CITED_ID = re.compile(_ID_HEAD + r":")
 
 
-def _rule_head(text):
+def _diff_vocabulary(diff_text):
+    """-> the id-shaped words the code under review uses as its own.
+
+    Eleven of the 54 ids are also this codebase's vocabulary: B1..B7 are the KV-offload
+    chunk groups (atom/kv_transfer/offload/README.md), C1/C2 the MTP4 rows
+    (atom/models/glm52/mono/kernels/op.py) and C3/C4 deepseek_v4's cuda-graph capture
+    topology (atom/models/deepseek_v4/mono/session.py). No shape separates `C1` the rule
+    from `C1` the row -- that is the lesson of the word lists this gate went through --
+    so ask the diff instead, which is the one thing that is not a guess. The same rule
+    r45 put on CLAIM_IDENT; it was applied there and not here.
+
+    Weighing the two errors: refusing a lawful finding is FATAL (the way out is an untrue
+    `-- not reported:`), while shipping an id-led line is cosmetic. So a word the PR uses
+    itself stops being read as an id.
+
+    `.claude/` is excluded on purpose. rules.md names every id, so a PR that touches the
+    skill -- this one does -- would otherwise put all 54 in the vocabulary and switch the
+    whole gate off, silently, in exactly the reviews most likely to exercise it.
+    """
+    vocab, path = set(), None
+    for ln in diff_text.splitlines():
+        m = re.match(r"^diff --git a/\S+ b/(\S+)", ln)
+        if m:
+            path = m.group(1)
+            continue
+        if path is None or path.startswith(".claude/") or ln[:3] in ("+++", "---"):
+            continue
+        if ln[:1] in ("+", "-", " "):
+            vocab.update(re.findall(r"\b[A-Z]+\d+[a-z]?\b", ln))
+    return vocab
+
+
+def _rule_head(text, vocab=frozenset()):
     """-> the rule id this finding opens with, through whatever sits in front of it.
 
     One reader for both callers -- the one that registers the claim and the one that
     refuses to ship the id -- so they cannot disagree about what counts. `FP8:`, `TP8:`,
-    `MI300:` and `GPU0:` share the shape and none of them is a rule.
+    `MI300:` and `GPU0:` share the shape and none of them is a rule, and neither is a
+    word the diff itself uses (`vocab`, from `_diff_vocabulary`).
     """
     rest = text
     cited = False                            # has a citation been stepped over already?
@@ -2893,7 +2926,8 @@ def _rule_head(text):
         rest = LEAD_NOISE.sub("", rest)
         m = (CITED_ID if cited else BARE_ID).match(rest)
         if m:
-            return m.group(1) if m.group(1) in REFUSED_IDS else None
+            rid = m.group(1)
+            return rid if rid in REFUSED_IDS and rid not in vocab else None
         citation = CITATION.match(rest)
         if citation:
             # Strip exactly what `_publish.first_clause` strips after the citation: the
@@ -2910,7 +2944,8 @@ def _rule_head(text):
             return None
         inner = g.group(1).strip(" *`_")
         members = [part.strip() for part in re.split(r"[/,]", inner)]
-        rid = next((part for part in members if part in REFUSED_IDS), None)
+        rid = next((part for part in members
+                    if part in REFUSED_IDS and part not in vocab), None)
         if rid:  # `[B1]` is the id itself, not a tag over it.
             return rid
         rest = rest[g.end():]
@@ -3170,6 +3205,9 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
     Three things are checkable, and only three. Whether a finding is CORRECT is not one
     of them -- that is what a human reads the card for."""
     touched = set(re.findall(r"^diff --git a/\S+ b/(\S+)", diff_text, re.M))
+    # One vocabulary for both id readers below, built once. See _diff_vocabulary:
+    # a word this PR's own code uses is not read as a rule id.
+    vocab = _diff_vocabulary(diff_text)
     # Every FIRE has to reach the card. Checking only that findings trace back to work
     # left the inverse open: a review can adjudicate nine rules FIRE, report none of
     # them, and pass. FIRE means it goes in the card; if it is not going in, the verdict
@@ -3196,7 +3234,7 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
             findings.append((m.group(1), m.group(2).strip()))
     reported = set()
     for _, text in findings:
-        rid = _rule_head(text)
+        rid = _rule_head(text, vocab)
         if rid:
             reported.add(rid)
         # SKILL.md's output rules say, in as many words, "Do NOT use rule codes (B1, D4,
@@ -3262,7 +3300,7 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
                              f"cites only {cited[0]} and nothing this PR changes"))
         # Does anything already adjudicated mention this? Match on the rule id if the
         # finding carries one, else on a distinctive token from the text.
-        rid = _rule_head(text)
+        rid = _rule_head(text, vocab)
         if rid:
             # SKILL.md: "Do NOT use rule codes (B1, D4, A1...) in output -- they are
             # internal labels only." Parsing one here as a claim made the gate accept

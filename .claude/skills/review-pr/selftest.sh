@@ -512,6 +512,42 @@ t "an A5: card against an A5 FIRE is refused for the id, not for tracing" \
   "$(_card_kinds "$_CARD_ID" "$_V_PATH" "$_DIFF")" "RULE-CODE-IN-CARD"
 t "the same card without the id traces by path" \
   "$(_card_kinds "$_CARD_PATH" "$_V_PATH" "$_DIFF")" ""
+# Eleven of the 54 ids are also this codebase's vocabulary: B1..B7 are the KV-offload
+# chunk groups, C1/C2 the MTP4 rows, C3/C4 deepseek_v4's capture topology. No shape
+# separates `B1` the rule from `B1` the chunk group, so the diff decides. Refusing a
+# lawful finding is fatal -- the way out is an untrue `-- not reported:` -- while
+# shipping an id-led line is cosmetic, so a word the PR uses itself is not read as an id.
+_DIFF_B1='diff --git a/atom/kv_transfer/offload/README.md b/atom/kv_transfer/offload/README.md
+--- a/atom/kv_transfer/offload/README.md
++++ b/atom/kv_transfer/offload/README.md
+@@ -1084,2 +1084,2 @@
+-SAVE chunk staging is tail-to-head. For B1-B8 the order is B7-B8, B5-B6, B3-B4, B1-B2.
++SAVE chunk staging is tail-to-head. For B1-B8 the new order is B7-B8, B5-B6, B1-B2.'
+_CARD_B1='## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ B1-B2 stage before B3-B4, breaking the tail-to-head order. **Author must** fix it.'
+t "a finding using a word the diff uses is not read as a rule id" \
+  "$(_card_kinds "$_CARD_B1" "" "$_DIFF_B1" | grep -c RULE-CODE-IN-CARD)" "0"
+# And the exclusion that keeps this from switching the gate off: rules.md names every
+# id, so a PR touching the skill -- this one does -- would put all 54 in the vocabulary.
+# .claude/ contributes nothing, in exactly the reviews most likely to exercise the gate.
+_DIFF_SKILL='diff --git a/.claude/skills/review-pr/rules.md b/.claude/skills/review-pr/rules.md
+--- a/.claude/skills/review-pr/rules.md
++++ b/.claude/skills/review-pr/rules.md
+@@ -1,1 +1,1 @@
+-| B1 | Silent bypass | x |
++| B1 | Silent bypass, reworded | x |'
+t "but a diff that only touches the skill contributes no vocabulary" \
+  "$(python3 -c '
+import sys; sys.path.insert(0, sys.argv[1]); import triage
+print(len(triage._diff_vocabulary(sys.argv[2])))' "$S" "$_DIFF_SKILL")" "0"
+t "so a rule-id card is still refused when the skill is what changed" \
+  "$(_card_kinds "$_CARD_ID" "$_V_PATH" "$_DIFF_SKILL" | grep -c RULE-CODE-IN-CARD)" "1"
 # Before any of this, such a FIRE had no legal card at all: name the id and the
 # no-rule-codes gate refuses it, drop the id and UNREPORTED-FIRE fires, and both are
 # fatal -- the only way out was an untrue `-- not reported:`.
