@@ -261,9 +261,14 @@ impl LoadBalancingPolicy for AgenticPolicy {
             (Some(device), Some((tokens, provider))) if provider.store_weight() > 0.0 => {
                 let weight = provider.store_weight();
                 let cached = provider.cached_tokens(tokens, workers, &device).await;
+                let prompt = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
                 let credited = device.iter().zip(&cached).map(|(&device, &cached)| {
                     let device = device?;
-                    let loaded = cached.map_or(0, |cached| cached.saturating_sub(device));
+                    // A store that does not answer (its lookup timed out, or its
+                    // breaker is open) is taken to hold the prompt: one that serves
+                    // holds most of it, and counting none would charge the worker
+                    // the whole prompt until its prefill ends.
+                    let loaded = cached.unwrap_or(prompt).saturating_sub(device);
                     Some(device + (weight * f64::from(loaded)).round() as u32)
                 });
                 Some(credited.collect::<Vec<_>>())
@@ -571,8 +576,6 @@ mod tests {
             (0.0, Some(90), (Some(0), "hit", Some(0.4), Some(60))),
             (1.0, Some(90), (Some(1), "hit", Some(0.9), Some(10))),
             (0.5, Some(90), (Some(1), "hit", Some(0.45), Some(55))),
-            // A store that does not answer adds nothing.
-            (1.0, None, (Some(0), "hit", Some(0.4), Some(60))),
         ] {
             let policy = agentic(512, None);
             policy.set_kv_events(Arc::new(Stored(
@@ -585,6 +588,28 @@ mod tests {
                 "weight {weight}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_store_that_does_not_answer_is_taken_to_hold_the_prompt() {
+        let workers = workers();
+        let tokens: Vec<u32> = (0..100).collect();
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        // a's device holds 40 of the 100 tokens, b's none, and the store both read
+        // does not answer: a keeps its lead, and is charged the 60 it would load at
+        // half, not all 60.
+        let policy = agentic(512, None);
+        policy.set_kv_events(Arc::new(Stored(vec![(40, None), (0, None)], 0.5)));
+        let hit = (Some(0), "hit", Some(0.7), Some(30));
+        assert_eq!(decide(&policy, &workers, &info).await, hit);
+        // With nothing on a device, the workers tie and each is charged half.
+        let policy = agentic(512, None);
+        policy.set_kv_events(Arc::new(Stored(vec![(0, None), (0, None)], 0.5)));
+        let (_, branch, ratio, charge) = decide(&policy, &workers, &info).await;
+        assert_eq!((branch, ratio, charge), ("hit", Some(0.5), Some(50)));
     }
 
     #[tokio::test]
