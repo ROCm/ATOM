@@ -445,13 +445,27 @@ mod coder {
                 // Look for tool call start
                 if !self.in_tool_call {
                     if let Some((s, bare)) = self.call_start(&self.buffer) {
-                        normal_text.push_str(&self.buffer[..s]);
                         // A bare call keeps its `<function=`, read as the name next.
                         let opener = if bare {
                             0
                         } else {
                             self.tool_call_start_token.len()
                         };
+                        // As ATOM reads it, a `<tool_call>` no `<function=` follows is text.
+                        let rest = self.buffer[s + opener..].trim_start();
+                        if self.bare_calls && !bare && !rest.starts_with(BARE_CALL_START) {
+                            let quoted = match BARE_CALL_START.starts_with(rest) {
+                                true => s,
+                                false => s + opener,
+                            };
+                            normal_text.push_str(&self.buffer[..quoted]);
+                            self.buffer.drain(..quoted);
+                            if quoted == s {
+                                break;
+                            }
+                            continue;
+                        }
+                        normal_text.push_str(&self.buffer[..s]);
                         self.buffer = self.buffer[s + opener..].to_string();
                         self.in_tool_call = true;
                         self.bare_call = bare;
@@ -770,6 +784,34 @@ mod coder {
                 .await
                 .unwrap();
             assert_eq!((text.as_str(), calls.len()), (prose, 1));
+            for size in 1..=9 {
+                let (streamed, calls) = stream(&reply, size).await;
+                assert_eq!((streamed.as_str(), calls), (prose, 1), "{size}-byte pieces");
+            }
+        }
+
+        /// What `reply` streams in `size`-byte pieces, then at end of input, read as ATOM
+        /// with get_weather declared: (text, calls named).
+        async fn stream(reply: &str, size: usize) -> (String, usize) {
+            let tool: Tool = serde_json::from_value(serde_json::json!({
+                "type": "function", "function": {"name": "get_weather", "parameters": {}},
+            }))
+            .unwrap();
+            let tools = [tool];
+            let mut parser = QwenCoderParser::new();
+            parser.read_as_atom();
+            let mut read = Vec::new();
+            for piece in reply.as_bytes().chunks(size) {
+                let piece = std::str::from_utf8(piece).unwrap();
+                read.push(parser.parse_incremental(piece, &tools).await.unwrap());
+            }
+            if let Some(closers) = parser.end_of_input_closers(&tools) {
+                read.push(parser.parse_incremental(&closers, &tools).await.unwrap());
+            }
+            let calls = read.iter().flat_map(|result| &result.calls);
+            let calls = calls.filter(|call| call.name.is_some()).count();
+            let text: String = read.iter().map(|result| &*result.normal_text).collect();
+            (text, calls)
         }
 
         #[test]

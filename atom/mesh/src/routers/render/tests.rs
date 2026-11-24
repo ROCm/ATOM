@@ -4962,6 +4962,17 @@ mod h_atom_native_tool_calls {
         assert_eq!(read_qwen_xml(reply, false).await, [text.clone(), text]);
     }
 
+    /// An ATOM reply's text streams as it reads unary: prose quoting `<tool_call>`
+    /// before a bare call stays text.
+    #[tokio::test]
+    async fn an_atom_reply_s_text_streams_as_it_reads_unary() {
+        let reply = "Use <tool_call> as the wrapper. \
+                     <function=get_weather><parameter=city>Paris</parameter></function>";
+        let prose = "Use <tool_call> as the wrapper. ".to_string();
+        let call = (prose, "get_weather".to_string());
+        assert_eq!(read_qwen_xml(reply, true).await, [call.clone(), call]);
+    }
+
     /// A MiniMax-M3 call cut off inside a parameter keeps its value, as ATOM's HTTP
     /// parser does at end of input.
     #[tokio::test]
