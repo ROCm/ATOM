@@ -184,6 +184,33 @@ def _draft_ids_trial(proc):
     return bool((proc.recv_draft_token_ids() == GOOD).all())
 
 
+def _owned_draft_ids_trial(proc, fence=True):
+    """The ids in a buffer the drafter owns (a mono draft head's): no hold can
+    keep it, the next pass rewrites it in place -- after
+    `await_draft_ids_copy`, as `propose_draft_token_ids` runs it."""
+    torch.cuda.synchronize()
+    owned = _fresh((BS, NUM_SPEC), torch.int32)
+    _block_copy_stream(proc)
+    proc.send_draft_token_ids_to_cpu(owned)
+    if fence:
+        proc.await_draft_ids_copy(torch.cuda.current_stream())
+    owned.fill_(STALE)  # the next draft pass
+    return bool((proc.recv_draft_token_ids() == GOOD).all())
+
+
+def test_the_next_draft_pass_waits_for_a_fixed_buffers_copy():
+    proc = _processor()
+    bad = sum(not _owned_draft_ids_trial(proc) for _ in range(TRIALS))
+    assert bad == 0, f"{bad}/{TRIALS} copies read the next pass's ids"
+
+
+def test_without_the_fence_a_fixed_buffer_races():
+    """Positive control: unfenced, the next pass overtakes the late copy."""
+    proc = _processor()
+    bad = sum(not _owned_draft_ids_trial(proc, fence=False) for _ in range(TRIALS))
+    assert bad > 0, "no copy read the rewritten buffer: nothing here races"
+
+
 def _record_fresh_ell(vs):
     ell = _fresh(BS, torch.int64)
     vs.set_last_ell(ell)

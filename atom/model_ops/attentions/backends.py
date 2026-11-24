@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2024-2025 ATOM Project Contributors
 
 import logging
 from abc import ABC, abstractmethod
@@ -197,6 +198,22 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         once a step, before its input ids, from the batch and the forwards
         before it, alike on every TP rank."""
         return False
+
+    def settles_spec_status(self, batch: ScheduledBatch, max_seqlen_q: int) -> bool:
+        """True when this builder stages the step before the previous verify's
+        host-side status and restages what the status moves once it is taken
+        (`take_spec_status`): the wait then overlaps the staging and the rest
+        of the step's preparation. Asked once a step, before its input ids;
+        ignored when the step `consumes_device_verdict`."""
+        return False
+
+    def take_spec_status(self, processor) -> None:
+        """Take the previous verify's host-side status, owed by this step
+        (`tokenIDProcessor.take_deferred_spec_status`): where the runner ends
+        the step's preparation, before the target's launch, so everything
+        before it overlaps the wait. A builder that `settles_spec_status`
+        finishes the step there (its heads, and what reads them)."""
+        processor.take_deferred_spec_status()
 
     def close(self):
         """Release backend-owned host workers and mapped resources."""
