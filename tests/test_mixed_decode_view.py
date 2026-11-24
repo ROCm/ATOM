@@ -37,7 +37,17 @@ def make_batch(num_spec_step=1, block_rows=None):
 
 def test_decode_slice_owns_all_row_fields_and_counts():
     batch = make_batch()
+    batch.num_rejected = np.array([9, 9, 1, 2, 0], dtype=np.int32)
+    batch.num_bonus = np.array([9, 9, 2, 1, 0], dtype=np.int32)
+    batch.scheduled_spec_decode_tokens = np.arange(15).reshape(5, 3)
     child = batch.slice_rows(2, 5)
+    assert child.num_rejected.tolist() == [1, 2, 0]
+    assert child.num_bonus.tolist() == [2, 1, 0]
+    assert child.scheduled_spec_decode_tokens.tolist() == [
+        [6, 7, 8],
+        [9, 10, 11],
+        [12, 13, 14],
+    ]
     assert isinstance(child, ScheduledBatch)
     assert child.req_ids == batch.req_ids[2:]
     assert child.block_tables == [[72], [73], [74]]

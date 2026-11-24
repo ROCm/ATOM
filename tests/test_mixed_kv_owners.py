@@ -4,13 +4,14 @@
 """KV ownership must survive admission, transfer completion and preemption."""
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
+import numpy as np
 import pytest
 from conftest import MockConfig
-from test_mixed_chunk_decode_pressure import _finish_step
 from test_scheduler import _ConnectorNamespace, _OffloadMixinStub
 
-from atom.model_engine.scheduler import PrefillLimits, Scheduler
+from atom.model_engine.scheduler import PrefillLimits, ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 
 
@@ -18,29 +19,40 @@ class OffloadConnector(_OffloadMixinStub):
     _do_load = False
 
 
-def scheduler(mixed=True, *, pages=20, width=1, prefix=False, offload=False):
-    sched = Scheduler(
-        MockConfig(
-            enable_mixed_prefill_decode=mixed,
-            enable_prefix_caching=prefix,
-            kv_cache_block_size=16,
-            num_kvcache_blocks=pages,
-            max_num_seqs=8,
-            max_num_batched_tokens=32,
-            max_model_len=256,
-            speculative_config=(
-                SimpleNamespace(
-                    num_speculative_tokens=width - 1, use_dspark=lambda: True
-                )
-                if width > 1
-                else None
-            ),
-        )
-    )
+def scheduler(
+    mixed=True,
+    *,
+    pages=20,
+    width=1,
+    prefix=False,
+    offload=False,
+    connector=True,
+    **overrides,
+):
+    values = {
+        "enable_mixed_prefill_decode": mixed,
+        "enable_prefix_caching": prefix,
+        "kv_cache_block_size": 16,
+        "num_kvcache_blocks": pages,
+        "max_num_seqs": 8,
+        "max_num_batched_tokens": 32,
+        "max_model_len": 256,
+        "speculative_config": (
+            SimpleNamespace(num_speculative_tokens=width - 1, use_dspark=lambda: True)
+            if width > 1
+            else None
+        ),
+    }
+    values.update(overrides)
+    sched = Scheduler(MockConfig(**values))
     sched.kv_connector = (
         OffloadConnector()
         if offload
-        else _ConnectorNamespace(is_producer=False, is_offload=False)
+        else (
+            _ConnectorNamespace(is_producer=False, is_offload=False)
+            if connector
+            else None
+        )
     )
     return sched
 
@@ -410,3 +422,191 @@ def test_waiting_victim_order_and_readmission(failed):
     assert sched._num_parked_remote_kv == 0
     ids = [s.id for s in sched.running] + [s.id for s in sched.waiting]
     assert len(ids) == len(set(ids))
+
+
+def _older_decode(sched, block_size, width, remote):
+    seq = Sequence(
+        [11] * (block_size - 3 * width),
+        block_size=block_size,
+        kv_transfer_params={"first_token_id": 42} if remote else None,
+    )
+    assert sched.block_manager.allocate(seq, 0)
+    if remote:
+        sched.kv_connector = _ConnectorNamespace(is_producer=False, is_offload=False)
+        seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+        sched.add(seq)
+        sched._count_inflight_load(seq)
+        sched.finished_recving_kv_req_ids.append(str(seq.id))
+        batch, _ = sched.schedule()
+        assert batch.req_ids == [seq.id] and batch.total_seqs_num_decode == 1
+    else:
+        seq.num_cached_tokens = len(seq)
+        for _ in range(width):
+            seq.append_token(42)
+        seq.type = SequenceType.DECODE
+        seq.status = SequenceStatus.RUNNING
+        seq.prefill_completed = True
+        sched.running.append(seq)
+    assert len(seq) == block_size - 2 * width
+    assert len(seq.block_table) == 1
+    return seq
+
+
+def _finish_step(sched, batch, scheduled, width):
+    # Use real postprocess for chunk completion. Model generation is simulated
+    # by accepting the entire decode window; there is no GPU in this test.
+    lengths = {seq.id: len(seq) for seq in scheduled.values()}
+    for seq in scheduled.values():
+        seq.num_placeholder_tokens = 0
+    sched.postprocess(
+        list(scheduled.values()),
+        ScheduledBatchOutput(
+            req_ids=[],
+            token_ids=[],
+            num_rejected=None,
+            num_bonus=None,
+            draft_token_ids=None,
+        ),
+        batch=batch,
+    )
+    for seq in scheduled.values():
+        if seq.is_partial_prefill:
+            continue
+        seq.num_cached_tokens = lengths[seq.id]
+        for _ in range(lengths[seq.id] + width - len(seq)):
+            seq.append_token(42)
+        seq.spec_token_ids = np.full(width - 1, 42, dtype=np.int32)
+
+
+@pytest.mark.parametrize(
+    "block_size,pages,prompt,width",
+    [(16, 5, 64, 1), (256, 9, 2000, 1), (256, 9, 2000, 8)],
+)
+@pytest.mark.parametrize("prefix", [False, True])
+@pytest.mark.parametrize("remote", [False, True])
+def test_decode_growth_preempts_newer_prompt_like_mixed_off(
+    block_size, pages, prompt, width, prefix, remote
+):
+    for mixed in (False, True):
+        sched = scheduler(
+            mixed,
+            pages=pages,
+            width=width,
+            prefix=prefix,
+            connector=False,
+            kv_cache_block_size=block_size,
+            max_num_seqs=4,
+            max_num_batched_tokens=16 if block_size == 16 else 128,
+            max_model_len=4096,
+        )
+        older = _older_decode(sched, block_size, width, remote)
+        received_pages = list(older.block_table)
+        newer = Sequence([22] * prompt, block_size=block_size)
+        sched.add(newer)
+        partial_ticks = 0
+        for _ in range(64):
+            result = sched.schedule()
+            if sched.total_preemptions:
+                break
+            assert result is not None
+            batch, scheduled = result
+            _finish_step(sched, batch, scheduled, width)
+            partial_ticks += newer.is_partial_prefill
+        else:
+            pytest.fail("decode did not reach the expected KV boundary")
+        assert partial_ticks >= 2
+        assert older.status == SequenceStatus.RUNNING
+        assert list(older.block_table[:1]) == received_pages
+        assert newer in sched.waiting and not newer.block_table
+        assert sched.total_preemptions == 1
+        assert sched._partial_prefill_count == 0
+        assert result[0].req_ids == [older.id]
+
+
+def test_pressured_partial_is_not_reported_as_prefill_work():
+    sched = scheduler(
+        pages=5,
+        connector=False,
+        max_num_seqs=4,
+        max_num_batched_tokens=16,
+        max_model_len=4096,
+    )
+    older = _older_decode(sched, 16, 1, False)
+    newer = Sequence([22] * 64, block_size=16)
+    sched.add(newer)
+    for _ in range(2):
+        batch, scheduled = sched.schedule()
+        assert batch.is_mixed
+        _finish_step(sched, batch, scheduled, 1)
+    assert older in sched.running and newer.is_partial_prefill
+    assert sched.block_manager.kv.num_free == 0
+    limits = sched._prefill_limits()
+    assert limits.reserved_decode_blocks == 1
+    assert limits.tokens == 0  # caller suppresses admission probes under pressure
+    assert sched._probe_local_prefill_work(limits) == (False, 0)
+    assert sched._estimate_prefill_chunk_cost(limits) == 0
+
+
+@pytest.mark.parametrize("prefix", [False, True])
+@pytest.mark.parametrize("width", [1, 8])
+@pytest.mark.parametrize("receives", [1, 2])
+def test_promoted_remote_decodes_keep_their_append_pages(prefix, width, receives):
+    sched = scheduler(
+        pages=2 * receives,
+        width=width,
+        prefix=prefix,
+        max_num_seqs=4,
+        max_num_batched_tokens=64,
+        max_model_len=128,
+    )
+    # Deliberately put the local request first. The real ready-receive ordering
+    # and promotion paths must protect all newly promoted rows before admission.
+    prompt_len = 16 - sched.draft_lookahead
+    local = Sequence([99] * (16 * receives - sched.draft_lookahead), block_size=16)
+    sched.add(local)
+    remote = [receive(sched, token=10 + i) for i in range(receives)]
+    assert all(len(seq.block_table) == 1 for seq in remote)
+    received_pages = {seq.id: list(seq.block_table) for seq in remote}
+
+    batch, scheduled = sched.schedule()
+
+    assert sched.total_preemptions == 0
+    assert set(scheduled) == {seq.id for seq in remote}
+    assert batch.total_seqs_num_decode == receives
+    assert batch.total_seqs_num_prefill == 0
+    assert local in sched.waiting and not local.block_table
+    for seq in remote:
+        assert seq.status == SequenceStatus.RUNNING
+        assert list(seq.block_table[:1]) == received_pages[seq.id]
+        assert len(seq.block_table) == 2
+        assert seq.prefill_completed
+        assert seq.token_ids[prompt_len] == 42
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("receiving", [False, True])
+def test_pure_decode_skips_prefill_reservation(monkeypatch, mixed, receiving):
+    sched = Scheduler(MockConfig(enable_mixed_prefill_decode=mixed))
+    seq = Sequence([3] * 4, block_size=4)
+    assert sched.block_manager.allocate(seq, 0)
+    seq.num_cached_tokens = 4
+    seq.append_token(4)
+    seq.type = SequenceType.DECODE
+    seq.status = SequenceStatus.RUNNING
+    sched.running.append(seq)
+    if receiving:
+        sched.kv_connector = _ConnectorNamespace(is_producer=False, is_offload=False)
+        remote = Sequence([9] * 4, block_size=4)
+        sched.add(remote)
+        assert sched.block_manager.allocate(remote, 0)
+        remote.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+        sched._count_inflight_load(remote)
+    reserve = Mock(
+        side_effect=AssertionError("pure decode has no prefill to reserve for")
+    )
+    monkeypatch.setattr(sched, "_prefill_limits", reserve)
+
+    batch, _ = sched.schedule()
+
+    assert batch.total_seqs_num_decode == 1
+    reserve.assert_not_called()

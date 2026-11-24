@@ -753,3 +753,91 @@ def test_large_batch_contexts_have_finite_buckets_through_exposition(
     assert values[(f"atom:{phase}_context_tokens_bucket", bucket_labels)] == 1
     assert values[(f"atom:{phase}_context_tokens_sum", labels)] == total
     assert values[(f"atom:{phase}_context_tokens_count", labels)] == 1
+
+
+@pytest.mark.parametrize("request_context_enabled", [False, True])
+def test_a_real_mixed_step_records_each_rows_own_metric(
+    request_context_enabled, monkeypatch
+):
+    """A mixed batch the scheduler really builds, recorded by a real
+    `SchedulerMetrics`: the single-chunk prefill lands in the prefill metrics
+    and each decode row's context in the decode ones. Aggregate metrics remain
+    available with per-request context gauges either disabled or enabled."""
+    from prometheus_client import CollectorRegistry
+
+    from atom.observability import tracing
+    from atom.sampling_params import SamplingParams
+
+    sched = Scheduler(
+        MockConfig(
+            enable_mixed_prefill_decode=True,
+            num_kvcache_blocks=20,
+            max_num_seqs=4,
+            max_num_batched_tokens=256,
+        )
+    )
+    decodes = [
+        Sequence(list(range(n)), 4, sampling_params=SamplingParams()) for n in (6, 10)
+    ]
+    for seq in decodes:
+        sched.add(seq)
+    sched.schedule()
+    for seq in decodes:
+        seq.num_cached_tokens = seq.num_prompt_tokens
+        seq.append_token(99)
+    prefill = Sequence(list(range(10, 23)), 4, sampling_params=SamplingParams())
+    sched.add(prefill)
+    batch, _ = sched.schedule()
+    assert batch.is_mixed and batch.req_ids == [
+        prefill.id,
+        *(seq.id for seq in decodes),
+    ]
+
+    registry = CollectorRegistry()
+    metrics = SchedulerMetrics(
+        registry=registry, request_context_enabled=request_context_enabled
+    )
+    for seq in (prefill, *decodes):
+        seq.queue_timing = None
+        metrics.enqueue(seq)
+    for seq in decodes:
+        seq.queue_timing.prefill_observed = True
+    seqs = {seq.id: seq for seq in (prefill, *decodes)}
+    metrics.record_forward(batch, seqs)
+    traced = []
+    monkeypatch.setattr(tracing, "_ENABLED", True)
+    monkeypatch.setattr(
+        tracing, "forward", lambda seq, *, is_decode: traced.append((seq, is_decode))
+    )
+    tracing.record_forward(batch, seqs)
+    assert traced == [(prefill, False), *((seq, True) for seq in decodes)]
+
+    def value(name, **labels):
+        labels = {"dp_rank": "0", "engine_role": "default", **labels}
+        return registry.get_sample_value(name, labels)
+
+    # The 13-token prompt is the request whose prefill is measured...
+    assert value("atom:prefill_request_tokens_count") == 1
+    assert value("atom:prefill_request_tokens_sum") == 13
+    assert value("atom:prefill_context_tokens_sum") == 13
+    # The two decode contexts contribute 7 + 11 tokens, excluding prefill.
+    assert value("atom:decode_context_tokens_sum") == 18
+    assert value("atom:decode_batch_size_sum") == 2
+    assert all(seq.queue_timing.decode_context_observed for seq in decodes)
+    assert not prefill.queue_timing.decode_context_observed
+    gauges = {
+        (s.name, s.labels["sequence_id"]): s.value
+        for metric in registry.collect()
+        for s in metric.samples
+        if s.name.endswith("request_context_tokens")
+    }
+    if request_context_enabled:
+        assert gauges == {
+            **{
+                ("atom:decode_request_context_tokens", str(seq.id)): len(seq)
+                for seq in decodes
+            },
+            ("atom:prefill_request_context_tokens", str(prefill.id)): 13,
+        }
+    else:
+        assert gauges == {}

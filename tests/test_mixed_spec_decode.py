@@ -725,24 +725,6 @@ def test_carrier_spans_cover_the_whole_batch():
     assert slots.tolist() == [11, 12, 21, 22, 0, 0]
 
 
-def test_batch_slice_preserves_spec_fields():
-    from test_mixed_decode_view import make_batch
-
-    batch = make_batch()
-    batch.num_rejected = np.array([9, 9, 1, 2, 0], dtype=np.int32)
-    batch.num_bonus = np.array([9, 9, 2, 1, 0], dtype=np.int32)
-    batch.scheduled_spec_decode_tokens = np.arange(15).reshape(5, 3)
-    child = batch.slice_rows(2, 5)
-    assert child.num_rejected.tolist() == [1, 2, 0]
-    assert child.num_bonus.tolist() == [2, 1, 0]
-    assert child.scheduled_spec_decode_tokens.tolist() == [
-        [6, 7, 8],
-        [9, 10, 11],
-        [12, 13, 14],
-    ]
-    np.testing.assert_array_equal(child.scheduled_tokens, batch.scheduled_tokens[16:])
-
-
 # ── token inputs: the mixed branch of prepare_input_ids, end to end ─────────
 
 

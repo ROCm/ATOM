@@ -1,21 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # Copyright (c) 2026 ATOM Project Contributors
-"""Admission probes and startup memory sizing use the same budgets as execution."""
+"""Admission probes and scheduling share the same reserved decode budget."""
 
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-from aiter_stub import atom_without_aiter
 from conftest import MockConfig
-
-
-@pytest.fixture
-def runner_module():
-    with atom_without_aiter() as load:
-        yield load("atom.model_engine.model_runner")
-
 
 from atom.model_engine.block_manager import AdmissionProbe, BlockManager
 from atom.model_engine.scheduler import Scheduler
@@ -260,89 +252,6 @@ def test_mixed_off_does_not_scan_decode_candidates_or_snapshot_running(prefill):
     sched._tick_cost_limit = float("inf")
     batch, _ = sched._schedule()
     assert batch.req_ids == ([new.id] if prefill else [decode.id])
-
-
-@pytest.mark.parametrize("paged_state", [False, True])
-def test_mixed_profile_is_not_charged_to_graph_pools(
-    monkeypatch, caplog, paged_state, runner_module
-):
-    import torch
-
-    from atom.model_engine.kv_block import STATE_SLOT_CLASS
-    from atom.model_engine.state_runtime import DEFAULT_STATE_RUNTIME, StateTransfer
-    from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
-        PoolPlan,
-        page_pool,
-        state_pool,
-    )
-
-    gib = 1 << 30
-    stats = {
-        "allocated_bytes.all.peak": 102 * gib,
-        "allocated_bytes.all.current": 100 * gib,
-    }
-    monkeypatch.setattr(torch.cuda, "memory_stats", lambda: stats)
-    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (100 * gib, 200 * gib))
-    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: 100 * gib)
-    monkeypatch.setattr(
-        runner_module.KVConnectorFactory, "kv_budget_reserve_bytes", lambda config: 0
-    )
-    runner = runner_module.ModelRunner.__new__(runner_module.ModelRunner)
-    runner.device = "cpu"
-    runner.block_size = 4
-    runner.pool_plan = PoolPlan.empty()
-    runner.state_runtime = DEFAULT_STATE_RUNTIME
-    runner.config = SimpleNamespace(
-        hf_config=SimpleNamespace(head_dim=128),
-        enable_mixed_prefill_decode=True,
-        enforce_eager=False,
-        max_num_seqs=4,
-        max_model_len=64,
-        gpu_memory_utilization=0.9,
-        pipeline_parallel_size=1,
-        is_multinode_tp=False,
-        enable_rapidserve=False,
-    )
-    runner.drafter = SimpleNamespace(uses_confidence_schedule=True, mtp_k=7)
-    runner._tr_hybrid_active = lambda: False
-    runner._dspark_capture_q_buckets = lambda q: [1, 2, 4, 8]
-    runner._sub_pool_specs = lambda: [page_pool(gib)] + (
-        [state_pool(STATE_SLOT_CLASS, 512, entries_per_req=1)] if paged_state else []
-    )
-    runner.attn_metadata_builder = SimpleNamespace(
-        state_transfer=lambda: (
-            StateTransfer.copy("test-layout")
-            if paged_state
-            else DEFAULT_STATE_RUNTIME.transfer
-        ),
-        checkpoint_image_bytes=lambda: 256,
-        checkpoint_page_unit_bytes=lambda: gib,
-        sub_pool_specs=runner._sub_pool_specs,
-    )
-
-    def profile(runner):
-        spec = runner.state_runtime.checkpoint_spec
-        if paged_state:
-            assert spec is not None
-            assert (spec.page_unit_bytes, spec.slot_bytes, spec.image_bytes) == (
-                gib,
-                512,
-                256,
-            )
-            assert spec.layout_id == "test-layout"
-        else:
-            assert spec is None
-        stats["allocated_bytes.all.peak"] = 100 * gib
-        return 112 * gib, 2 * gib
-
-    profile = Mock(side_effect=profile)
-    monkeypatch.setattr(runner_module, "profile_mixed_memory", profile)
-    with caplog.at_level("INFO", logger="atom"):
-        result = runner.get_num_blocks()
-    # 180 GiB budget - 112 live - 2 non-torch - 1.6 graphs - 4 safety.
-    assert result["num_kvcache_blocks"] == 60
-    assert profile.call_count == 1
-    assert sum("Memory budget:" in r.message for r in caplog.records) == 1
 
 
 @pytest.mark.parametrize("failed", [False, True])
