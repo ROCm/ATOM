@@ -1097,6 +1097,7 @@ mod f_response_context {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         }
     }
 
@@ -1144,6 +1145,7 @@ mod f_response_context {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         };
         assert_eq!(ctx.headers.as_ref().unwrap().get("x-trace").unwrap(), "abc");
     }
@@ -1166,6 +1168,7 @@ mod f_response_context {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         };
         assert!(ctx.processed_messages.is_none());
     }
@@ -1226,7 +1229,9 @@ mod h_prepare_chat_generate {
     use crate::protocols::generate::GenerateRequest;
     use crate::routers::prepare::generation_payload::GenerationPayload;
     use crate::routers::prepare::response_context::{ProtocolRequest, ResponseContext};
-    use crate::routers::prepare::{lookup_tokenizer, prepare_chat, prepare_generate};
+    use crate::routers::prepare::{
+        lookup_tokenizer, prepare_chat, prepare_chat_with, prepare_generate,
+    };
     use crate::routers::test_mocks;
 
     fn chat_req(stream: bool) -> Arc<ChatCompletionRequest> {
@@ -1278,6 +1283,39 @@ mod h_prepare_chat_generate {
             pm.text
         );
         assert_eq!(payload.text, pm.text);
+    }
+
+    #[test]
+    fn test_only_a_router_that_asks_reads_the_prompts_opener() {
+        // The test template renders `user: <content>`, so this prompt ends
+        // on `<think>`.
+        let opened = || {
+            Arc::new(ChatCompletionRequest {
+                model: "m".to_string(),
+                messages: vec![ChatMessage::User {
+                    content: MessageContent::Text("hi <think>".to_string()),
+                    name: None,
+                }],
+                ..Default::default()
+            })
+        };
+        let components = test_mocks::app_context_with_hf_tokenizer("m");
+        let (_, grpc) = prepare_chat(opened(), None, Some("m".into()), components.as_ref())
+            .expect("HF tokenizer must succeed");
+        assert_eq!(
+            grpc.prompt_opener, None,
+            "gRPC routing keeps its parsers' start"
+        );
+        let (_, bridge) = prepare_chat_with(
+            opened(),
+            None,
+            Some("m".into()),
+            components.as_ref(),
+            None,
+            true,
+        )
+        .expect("HF tokenizer must succeed");
+        assert_eq!(bridge.prompt_opener.as_deref(), Some("<think>"));
     }
 
     #[test]

@@ -465,10 +465,10 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
                             frames.Rejection(item.seq_id, SESSION_BUSY, busy)
                         )
                 session.reject(refused)
-            while admissions:  # the client's side ended: what it sent is admitted first
-                await asyncio.wait(admissions)
         finally:
-            try:  # a cancelled reader's admissions settle as a cancelled submission does
+            # Its side ended or it was cancelled: the Session ends, and its admissions
+            # settle as a cancelled submission does, not after admitting what close aborts.
+            try:
                 for item, _ in waiting:  # never started: nothing of it to settle
                     session.admitting.pop(item.seq_id, None)
                     session.aborted_while_admitting.discard(item.seq_id)

@@ -399,10 +399,13 @@ impl PDRouter {
         };
 
         let policies = Arc::new(PolicyRegistryAdapter::new(policy_registry.clone()));
-        let planner: Arc<dyn PdPlanner> = Arc::new(DefaultPlanner::new(
-            Arc::new(WorkerRegistryAdapter::new(worker_registry.clone())),
-            policies.clone(),
-        ));
+        let planner: Arc<dyn PdPlanner> = Arc::new(
+            DefaultPlanner::new(
+                Arc::new(WorkerRegistryAdapter::new(worker_registry.clone())),
+                policies.clone(),
+            )
+            .with_prefill_on_decode_rank(ctx.router_config.prefill_on_decode_rank()),
+        );
 
         Ok(PDRouter {
             worker_registry,
@@ -435,6 +438,9 @@ impl PDRouter {
                 "PD execution requires a pair",
             ));
         };
+        // Under idx2idx the planner selects decode first, and a prefill idx2idx keeps unless
+        // none is available, when this keeps the selected one too. It moves a prefill only
+        // if health or membership changed since planning.
         let prefill = if matches!(self.backend, BackendType::Atom) {
             self.apply_atom_pd_rank_mapping_policy(prefill, &decode)
         } else {
