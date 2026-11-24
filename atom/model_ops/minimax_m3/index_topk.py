@@ -24,6 +24,7 @@ attention kernels in ``sparse_attn``.
 """
 
 import functools
+import logging
 
 import torch
 
@@ -45,6 +46,8 @@ PREFILL_TOPK_NUM_WARPS = _prefill_policy.PREFILL_TOPK_NUM_WARPS
 from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
 from atom.model_ops.minimax_m3.mxfp4_pages import page_views
 from atom.model_ops.minimax_m3.nvfp4_pages import index_page_views as nvfp4_page_views
+
+logger = logging.getLogger("atom")
 
 
 @functools.cache
@@ -1583,7 +1586,8 @@ def minimax_m3_index_topk(
     (`_aiter_selector_wins`); omitted, the Triton one runs, which derives the
     same bound in registers.
     ``score_workspace`` is the FP8 index's fixed plane (`allocate_prefill_scores`):
-    the scorer writes into it, aiter's FlyDSL one where `_fp8_prefill_takes_flydsl`.
+    the scorer writes into it, aiter's FlyDSL one where `_fp8_prefill_takes_flydsl`;
+    a `_fused_prefill_takes` step is scored and selected by aiter's fused kernel.
     """
     total_q, num_idx_heads, _ = idx_q.shape
     assert (
@@ -1592,6 +1596,31 @@ def minimax_m3_index_topk(
     batch = cu_seqlens_q.shape[0] - 1
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
     _require_packable(max_block)
+
+    if _fused_prefill_takes(
+        idx_q,
+        batch,
+        max_query_len,
+        max_block,
+        topk,
+        init_blocks,
+        local_blocks,
+        emit_sparse_block_table,
+        pages_per_block,
+        block_page_stride,
+        score_workspace,
+    ):
+        return _fused_prefill_index_topk(
+            idx_q,
+            index_kv_cache,
+            block_table,
+            cu_seqlens_q,
+            prefix_lens,
+            max_query_len,
+            max_block,
+            topk,
+            sm_scale,
+        )
 
     score_out = _prefill_score_view(score_workspace, num_idx_heads, total_q, max_block)
     if index_scorer is not None:
@@ -1714,6 +1743,128 @@ def _fp8_prefill_takes_flydsl(idx_q, batch, max_query_len, max_block):
         and heads * total_q * width < _FLYDSL_PREFILL_MAX_CELLS
         and idx_q.dtype == torch.bfloat16
     )
+
+
+# aiter's fused FP8 index scorer + per-chunk top-16, then the merge below, on
+# single-request steps of >= 4096 new tokens over >= 576 blocks (~72K context and up).
+_FUSED_MIN_QUERY = 4096
+_FUSED_MIN_BLOCKS = 576
+_FUSED_CHUNKS = 8  # a row's block chunks, each keeping its top-16 keys
+
+
+@functools.cache
+def _fused_index_topk_ops():
+    """aiter's fused FP8 index scorer + per-chunk top-16, or None (logged once)."""
+    try:
+        from aiter.ops import m3_fused_index_topk
+    except ImportError as e:
+        logger.info(
+            "FP8 index prefill keeps the scorer + selector (no fused op: %s)", e
+        )
+        return None
+    return m3_fused_index_topk if m3_fused_index_topk.is_supported() else None
+
+
+def _fused_prefill_takes(
+    idx_q,
+    batch,
+    max_query_len,
+    max_block,
+    topk,
+    init_blocks,
+    local_blocks,
+    emit,
+    pages_per_block,
+    block_page_stride,
+    score_workspace,
+) -> bool:
+    """The kernel's shape (top-16, one local block, the page-16 emit) on the steps it
+    wins, on the workspace path only (gfx950, FP8 index, 4 index heads)."""
+    return (
+        score_workspace is not None
+        and emit
+        and batch == 1
+        and max_query_len >= _FUSED_MIN_QUERY
+        and max_block >= _FUSED_MIN_BLOCKS
+        and topk == 16
+        and init_blocks == 0
+        and local_blocks == 1
+        and pages_per_block == block_page_stride == PAGES_PER_SPARSE_BLOCK
+        and idx_q.dtype == torch.bfloat16
+        and _fused_index_topk_ops() is not None
+    )
+
+
+@functools.cache
+def _fused_score_scale(sm_scale: float) -> float:
+    """The Triton scorer's scale: fp32(sm_scale) * fp32(log2 e), rounded to fp32."""
+    import numpy as np
+
+    return float(np.float32(sm_scale) * np.float32(1.4426950409))
+
+
+def _fused_prefill_index_topk(
+    idx_q,
+    index_kv_cache,
+    block_table,
+    cu_seqlens_q,
+    prefix_lens,
+    max_query_len,
+    max_block,
+    topk,
+    sm_scale,
+):
+    """`(topk_idx, sparse_bt, sparse_ctx)`: each block chunk's top-16 keys from aiter,
+    then `_prefill_merge_topk_kernel`; the Triton selector's selection, bit for bit."""
+    total_q, heads, _ = idx_q.shape
+    batch = cu_seqlens_q.shape[0] - 1
+    chunk_blocks = triton.cdiv(max_block, _FUSED_CHUNKS)
+    num_partial = _FUSED_CHUNKS * 16
+    partial = torch.empty(
+        (heads, total_q, num_partial), dtype=torch.int64, device=idx_q.device
+    )
+    _fused_index_topk_ops().fused_index_topk_partial(
+        idx_q,
+        index_kv_cache,
+        partial,
+        block_table,
+        cu_seqlens_q,
+        prefix_lens,
+        max_query_len,
+        _FUSED_CHUNKS,
+        chunk_blocks,
+        _fused_score_scale(sm_scale),
+    )
+    topk_idx = torch.empty(
+        (heads, total_q, topk), dtype=torch.int32, device=idx_q.device
+    )
+    emit_out, emit_args = _alloc_emit(
+        total_q, heads, topk, block_table, True, idx_q.device
+    )
+    sparse_bt, sparse_ctx, stride_bt_b, stride_sbt_n = emit_args
+    _prefill_merge_topk_kernel[(max_query_len, batch, heads)](
+        partial,
+        topk_idx,
+        cu_seqlens_q,
+        prefix_lens,
+        topk,
+        num_partial,
+        *partial.stride(),
+        *topk_idx.stride(),
+        block_table,
+        sparse_bt,
+        sparse_ctx,
+        stride_bt_b,
+        stride_sbt_n,
+        NUM_KV_HEADS=heads,
+        SPARSE_BLOCK=SPARSE_BLOCK_SIZE,
+        BLOCK_SIZE_T=triton.next_power_of_2(topk),
+        MERGE_SIZE=triton.next_power_of_2(num_partial),
+        pages_per_block=PAGES_PER_SPARSE_BLOCK,
+        block_page_stride=PAGES_PER_SPARSE_BLOCK,
+        num_warps=1,
+    )
+    return (topk_idx, *emit_out)
 
 
 def _triton_prefill_score(
