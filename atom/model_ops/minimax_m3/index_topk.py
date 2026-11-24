@@ -966,6 +966,49 @@ def _require_packable(max_block: int) -> None:
         )
 
 
+# Per (device, stream) flat FP32 buffer behind the prefill block scores.
+_PREFILL_SCORE_WORKSPACE: dict[tuple[int, int], torch.Tensor] = {}
+
+
+def prefill_score_buffer(
+    num_idx_heads: int,
+    total_q: int,
+    max_block: int,
+    device: torch.device,
+    reserve: tuple[int, int] | None = None,
+) -> torch.Tensor:
+    """The ``[num_idx_heads, total_q, max_block]`` FP32 block scores.
+
+    Its width follows the longest context in the batch, so a fresh tensor a
+    layer grows with every new longest prompt: 64 MiB at the warmup's 16K
+    context, 2.5 GiB at 640K, 4 GiB at 1M (4 heads x 32768 rows). The warmup
+    that sizes the KV cache never saw those sizes, and each new maximum leaves
+    the caching allocator one more segment it cannot reuse for the next, larger
+    one, so its reserve creeps toward the device limit as prompts get longer.
+
+    With ``reserve`` = (rows, blocks), the batch and context bounds, the first
+    call allocates the buffer at that bound -- the warmup's forward, so the KV
+    budget covers it -- and every later call reuses it. One buffer per stream,
+    since layers on one stream run in order. Under graph capture the scores
+    stay a tensor of their own, as before.
+    """
+    shape = (num_idx_heads, total_q, max_block)
+    if reserve is None or torch.cuda.is_current_stream_capturing():
+        return torch.empty(shape, dtype=torch.float32, device=device)
+    need = num_idx_heads * total_q * max_block
+    key = (device.index, torch.cuda.current_stream(device).cuda_stream)
+    flat = _PREFILL_SCORE_WORKSPACE.get(key)
+    if flat is None or flat.numel() < need:
+        rows, blocks = reserve
+        flat = torch.empty(
+            max(need, num_idx_heads * rows * blocks),
+            dtype=torch.float32,
+            device=device,
+        )
+        _PREFILL_SCORE_WORKSPACE[key] = flat
+    return flat[:need].view(shape)
+
+
 def _alloc_emit(
     total_q,
     num_idx_heads,
@@ -2178,6 +2221,7 @@ def minimax_m3_index_topk(
     n_valid_column_per_row: torch.Tensor | None = None,
     index_kv_scale: torch.Tensor | None = None,
     emit_pages_per_block: int = PAGES_PER_SPARSE_BLOCK,
+    score_reserve: tuple[int, int] | None = None,
 ):
     """Index block-score + top-k selection. block_size_q == 1 (per-token).
 
@@ -2212,6 +2256,8 @@ def minimax_m3_index_topk(
     ``[total_q * num_kv_heads, topk]`` instead, the one
     ``sparse_attn_nvfp4.nvfp4_page_table`` builds. Rows past
     ``cu_seqlens_q[-1]`` are not written, as for the page-16 table.
+    ``score_reserve``: (rows, blocks) to size the score buffer at once, see
+    :func:`prefill_score_buffer`.
     """
     total_q, num_idx_heads, head_dim = idx_q.shape
     assert (
@@ -2221,10 +2267,8 @@ def minimax_m3_index_topk(
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
     _require_packable(max_block)
 
-    score = torch.empty(
-        (num_idx_heads, total_q, max_block),
-        dtype=torch.float32,
-        device=idx_q.device,
+    score = prefill_score_buffer(
+        num_idx_heads, total_q, max_block, idx_q.device, score_reserve
     )
     arch = get_gfx_runtime()
     is_fp8 = index_kv_cache.dtype in _FP8_DTYPES
@@ -2315,7 +2359,6 @@ def minimax_m3_index_topk(
             num_warps=score_num_warps,
             num_stages=score_num_stages,
         )
-
 
     topk_idx = torch.empty(
         (num_idx_heads, total_q, topk), dtype=torch.int32, device=idx_q.device
