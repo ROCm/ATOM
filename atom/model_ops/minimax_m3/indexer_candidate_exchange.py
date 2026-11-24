@@ -30,6 +30,28 @@ from atom.model_ops.minimax_m3.index_topk import (
 LOCAL_TOPK_TILE = 512
 
 
+def _scan_width(local, topk):
+    """The tile a shard's selection scans its ``local`` blocks in: never
+    narrower than the top-k it selects (the first ``tl.topk`` runs before any
+    ``tl.cat``)."""
+    return max(
+        16,
+        triton.next_power_of_2(topk),
+        min(triton.next_power_of_2(local), LOCAL_TOPK_TILE),
+    )
+
+
+def exchange_variants(max_local, topk):
+    """One ``LOCAL_BLOCKS`` per ``_select_exchange_merge`` build a decode with up
+    to ``max_local`` local blocks reaches: its scan width, and the class Triton
+    specializes the integer on (1, a multiple of 16, any other)."""
+    picked = {}
+    for local in range(1, max_local + 1):
+        cls = 1 if local == 1 else 16 if local % 16 == 0 else 0
+        picked.setdefault((_scan_width(local, topk), cls), local)
+    return list(picked.values())
+
+
 @triton.jit
 def _force(score, block, valid, local_start, INIT_BLOCKS: tl.constexpr):
     """Lift the always-selected blocks above every scored one.
@@ -320,11 +342,7 @@ def local_candidate_keys(
         # shipped config and costs it exactly nothing; it is here so the
         # function is correct for the topk its own guard admits (<= 512), rather
         # than only for the one value production happens to pass.
-        width = max(
-            16,
-            triton.next_power_of_2(topk),
-            min(triton.next_power_of_2(local), LOCAL_TOPK_TILE),
-        )
+        width = _scan_width(local, topk)
         _local_topk[(tokens, heads)](
             scores,
             keys,
@@ -558,6 +576,47 @@ def _select_exchange_merge(
         )
 
 
+_prewarmed = set()
+
+
+def _prewarm_exchange(args, kw, max_local):
+    """Build and load every ``_select_exchange_merge`` this call's geometry can
+    reach, the first time it is seen outside a graph capture (the capture
+    warmup, at startup).
+
+    The kernel specializes on the query length and on the context through
+    ``BLOCK_SIZE_K`` and ``LOCAL_BLOCKS``, so an eager decode -- every decode of
+    a P/D producer, which runs q=1 against graphs recorded at q=mtp_k+1, and a
+    batch past the capture ladder -- otherwise JIT-builds and loads a new code
+    object mid-serving: with the KV pool and a long prefill's buffers holding
+    the device, and the peers polling the mailbox (a load that failed there
+    took a producer rank down, "device kernel image is invalid"). q=1 is built
+    whatever this call's query length: it is the producer's decode, which
+    capture never runs. Rank-local (``warmup`` launches nothing), so no peer
+    waits on it.
+    """
+    key = tuple(
+        (k, v)
+        for k, v in kw.items()
+        if k not in ("QUERY_LEN", "LOCAL_BLOCKS", "GLOBAL_BLOCKS", "BLOCK_SIZE_K")
+    ) + (args[0].device, max_local)
+    for query_len in dict.fromkeys((kw["QUERY_LEN"], 1)):
+        if (key, query_len) in _prewarmed:
+            continue
+        for local in exchange_variants(max_local, kw["TOPK"]):
+            _select_exchange_merge.warmup(
+                *args,
+                grid=(1,),
+                **{
+                    **kw,
+                    "QUERY_LEN": query_len,
+                    "LOCAL_BLOCKS": local,
+                    "BLOCK_SIZE_K": _scan_width(local, kw["TOPK"]),
+                },
+            )._init_handles()
+        _prewarmed.add((key, query_len))
+
+
 def select_exchanged_candidates(
     scores,
     seq_lens,
@@ -594,40 +653,40 @@ def select_exchanged_candidates(
     output, _ = _alloc_emit(
         tokens, 1, topk, block_table, True, scores.device, pages_per_block
     )
+    args = (
+        scores,
+        seq_lens,
+        mailbox.peers,
+        mailbox.send_calls,
+        mailbox.recv_calls,
+        mailbox.timeouts,
+        indices,
+        block_table,
+        output[0],
+        output[1],
+    )
+    kw = {
+        "QUERY_LEN": max_query_len,
+        "LOCAL_BLOCKS": local,
+        "GLOBAL_BLOCKS": global_blocks,
+        "RANK": rank,
+        "WORLD": world_size,
+        "TOPK": topk,
+        "INIT_BLOCKS": init_blocks,
+        "LOCAL_KEEP": local_blocks,
+        "BLOCK_SIZE_K": _scan_width(local, topk),
+        "BLOCK_SIZE_T": triton.next_power_of_2(topk),
+        "CANDIDATES": triton.next_power_of_2(world_size * topk),
+        "MAX_ROWS": mailbox.max_rows,
+        "SLOT_KEYS": mailbox.MAX_TOPK,
+        "TABLE_STRIDE": block_table.stride(0),
+        "SBT_STRIDE": output[0].stride(0),
+        "PAGES_PER_BLOCK": pages_per_block,
+        "MAX_POLLS": mailbox.MAX_POLLS,
+        "num_warps": DECODE_TOPK_NUM_WARPS,
+    }
+    if not torch.cuda.is_current_stream_capturing():
+        _prewarm_exchange(args, kw, triton.cdiv(global_blocks, world_size))
     if tokens:
-        width = max(
-            16,
-            triton.next_power_of_2(topk),
-            min(triton.next_power_of_2(local), LOCAL_TOPK_TILE),
-        )
-        _select_exchange_merge[(tokens * heads,)](
-            scores,
-            seq_lens,
-            mailbox.peers,
-            mailbox.send_calls,
-            mailbox.recv_calls,
-            mailbox.timeouts,
-            indices,
-            block_table,
-            output[0],
-            output[1],
-            QUERY_LEN=max_query_len,
-            LOCAL_BLOCKS=local,
-            GLOBAL_BLOCKS=global_blocks,
-            RANK=rank,
-            WORLD=world_size,
-            TOPK=topk,
-            INIT_BLOCKS=init_blocks,
-            LOCAL_KEEP=local_blocks,
-            BLOCK_SIZE_K=width,
-            BLOCK_SIZE_T=triton.next_power_of_2(topk),
-            CANDIDATES=triton.next_power_of_2(world_size * topk),
-            MAX_ROWS=mailbox.max_rows,
-            SLOT_KEYS=mailbox.MAX_TOPK,
-            TABLE_STRIDE=block_table.stride(0),
-            SBT_STRIDE=output[0].stride(0),
-            PAGES_PER_BLOCK=pages_per_block,
-            MAX_POLLS=mailbox.MAX_POLLS,
-            num_warps=DECODE_TOPK_NUM_WARPS,
-        )
+        _select_exchange_merge[(tokens * heads,)](*args, **kw)
     return indices, *output
