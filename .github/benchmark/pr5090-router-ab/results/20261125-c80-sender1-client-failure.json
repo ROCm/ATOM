@@ -1,0 +1,47 @@
+{
+  "lease": "Lb262e1",
+  "node": "pit2-p03-g48",
+  "gpu_ids": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "harness_sha": "f5d05574703eca2182f7f62a31abe9ca30b1560d",
+  "classification": "client_scenario_validation_before_warmup",
+  "failure": "AgentX 1.0.14 requires benchmark duration >=900s; requested 300s",
+  "protocol_probes": 5,
+  "kv_transfer": {
+    "metric": "vllm:mooncake_bytes_transferred_sum",
+    "prefill_before": 0.0,
+    "prefill_after": 101376000.0,
+    "transferred_bytes_delta": 101376000.0,
+    "passed": true
+  },
+  "disconnect_gauges": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "warmup_started": false,
+  "performance_result": null,
+  "sender_hypothesis": "inconclusive; load did not start",
+  "exit_codes": {
+    "pool-workload.rc": "1",
+    "pool-exit.rc": "1",
+    "gpool-release.rc": "0"
+  },
+  "remaining_run_containers": [],
+  "archive_sha256": "025093ad040cae06c0867133336903748867bcd7ee67423db1d5bea211a21cb3"
+}

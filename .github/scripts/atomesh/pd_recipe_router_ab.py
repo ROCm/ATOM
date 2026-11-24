@@ -291,7 +291,14 @@ def verify_kv_transfer(workers, output):
     return record
 
 
+def validate_client_contract(contract):
+    # AgentX 1.0.14 requires this window even for runs marked diagnostic_only.
+    if not contract.get("functional_only") and contract["duration"] < 900:
+        raise ValueError("AgentX requires a benchmark duration of at least 900 seconds")
+
+
 def benchmark(contract, args):
+    validate_client_contract(contract)
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     if (contract.get("functional_only") or contract.get("verify_pd")) and shutil.which(

@@ -15,6 +15,7 @@ from pd_recipe_router_ab import (
     prefill_failure_probe,
     request,
     transferred_bytes,
+    validate_client_contract,
     verify_kv_transfer,
     worker_plan,
 )
@@ -102,11 +103,42 @@ class RecipeWorkerTest(unittest.TestCase):
 
 
 class FunctionalOnlyTest(unittest.TestCase):
+    def test_committed_client_contracts_respect_agentx_minimum(self):
+        for path in (ROOT / ".github/benchmark/pr5090-router-ab").glob("*.json"):
+            contract = json.loads(path.read_text())
+            if "agentx_version" in contract:
+                with self.subTest(contract=path.name):
+                    validate_client_contract(contract)
+
+    def test_short_agentx_window_rejected_before_requests_or_client_setup(self):
+        for duration in (300, 899):
+            with (
+                self.subTest(duration=duration),
+                tempfile.TemporaryDirectory() as temporary,
+                patch("pd_recipe_router_ab.scrape") as scrape,
+                patch("pd_recipe_router_ab.subprocess.run") as run,
+                patch("pd_recipe_router_ab.shutil.which", return_value=None),
+                patch(
+                    "pd_recipe_router_ab.functional_probe",
+                    side_effect=AssertionError("contacted workers before validation"),
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "at least 900"):
+                    benchmark(
+                        SINGLE_NODE | {"functional_only": False, "duration": duration},
+                        SimpleNamespace(
+                            output=temporary, router="http://router", workers=["p", "d"]
+                        ),
+                    )
+                scrape.assert_not_called()
+                run.assert_not_called()
+
     def test_dependency_drift_stops_before_performance(self):
         locked = b"agentx-harness==1.0.14\nrequests==2.32.5\n"
         contract = SINGLE_NODE | {
             "functional_only": False,
             "verify_pd": True,
+            "duration": 3600,
             "client_constraints": {"sha256": hashlib.sha256(locked).hexdigest()},
         }
         with (

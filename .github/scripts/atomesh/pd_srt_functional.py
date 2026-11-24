@@ -11,6 +11,8 @@ from pathlib import Path
 
 import yaml
 
+from pd_recipe_router_ab import validate_client_contract
+
 
 def prefill_remap_preamble(order):
     if (
@@ -32,6 +34,7 @@ def prefill_remap_preamble(order):
 def configurations(
     contract, model_path, run_dir, experiment_dir, fabric, uid, router_image
 ):
+    validate_client_contract(contract)
     arm = contract.get("router_arm", "atomesh")
     if arm not in {"atomesh", "baseline"}:
         raise ValueError(f"Unsupported router arm: {arm}")

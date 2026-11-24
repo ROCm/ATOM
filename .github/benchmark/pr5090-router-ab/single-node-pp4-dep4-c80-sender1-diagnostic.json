@@ -156,7 +156,7 @@
     "AIPERF_REQUIRED_SERVER_METRIC_PREFIX": "vllm:"
   },
   "concurrency": 80,
-  "duration": 300,
+  "duration": 900,
   "agentx_version": "1.0.14",
   "dataset": "semianalysis_cc_traces_weka_062126",
   "frontend": {
@@ -187,7 +187,7 @@
     "orchestration": "native srtctl SweepOrchestrator and DockerLauncher under an owned GPU-pool lease"
   },
   "functional_only": false,
-  "purpose": "Diagnose PP3 timeouts relative to failed Lb6034c on g48: P sender10->1, C80/DEP4 maxseq20/capture160/remapped P retained, 300s post-warmup observation",
+  "purpose": "Diagnose PP3 timeouts relative to failed Lb6034c on g48: P sender10->1, C80/DEP4 maxseq20/capture160/remapped P retained, 900s post-warmup observation",
   "layout": "single_node",
   "case_name": "pr5090-1p1d-pp4-dep4-c80-sender1-diagnostic",
   "router_build": {
@@ -217,7 +217,7 @@
     "sha256": "286771817a9d892fffe64319804bb6991fabe372b2df46be3372ee794953b02a",
     "paired_run": "Lb4c8c6"
   },
-  "budget_rationale": "60min total for same-image startup, C80 warmup, 300s diagnostic observation and cleanup.",
+  "budget_rationale": "60min total for same-image startup, C80 warmup, 900s diagnostic observation and cleanup.",
   "transport_adjustment": {
     "reason": "The first full-run attempt failed before measurement because the local HIP IPC fast path returned invalid device context. De-prioritize HIP for buffers also registered with RDMA.",
     "setting": "MC_DISABLE_HIP=1 on both roles",
@@ -273,6 +273,7 @@
     "node": "g48",
     "worker_change": "Only P Mooncake num_workers10->1; D num_workers10, maxseq20 and capture160 retained",
     "prediction": "Disappearance implicates sender concurrency or queue pressure; persistence weakens that explanation; neither outcome alone identifies the root cause.",
-    "measurement": "300s diagnostic after the same C80 warmup, not a full SA result"
-  }
+    "measurement": "900s diagnostic after the same C80 warmup, not a full SA result"
+  },
+  "client_duration_constraint": "AgentX 1.0.14 requires duration >=900s; retain diagnostic_only and do not use unsafe-override."
 }

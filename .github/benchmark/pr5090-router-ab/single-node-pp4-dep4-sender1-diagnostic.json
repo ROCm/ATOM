@@ -156,7 +156,7 @@
     "AIPERF_REQUIRED_SERVER_METRIC_PREFIX": "vllm:"
   },
   "concurrency": 40,
-  "duration": 300,
+  "duration": 900,
   "agentx_version": "1.0.14",
   "dataset": "semianalysis_cc_traces_weka_062126",
   "frontend": {
@@ -187,7 +187,7 @@
     "orchestration": "native srtctl SweepOrchestrator and DockerLauncher under an owned GPU-pool lease"
   },
   "functional_only": false,
-  "purpose": "Diagnose PP3 transfer timeouts by serializing each producer connector to one sender; C40 original GPU order with 300s post-warmup observation, not an SA performance result",
+  "purpose": "Diagnose PP3 transfer timeouts by serializing each producer connector to one sender; C40 original GPU order with 900s post-warmup observation, not an SA performance result",
   "layout": "single_node",
   "case_name": "pr5090-1p1d-pp4-dep4-c40-sender1-diagnostic",
   "router_build": {
@@ -217,7 +217,7 @@
     "sha256": "286771817a9d892fffe64319804bb6991fabe372b2df46be3372ee794953b02a",
     "paired_run": "Lb4c8c6"
   },
-  "budget_rationale": "60min diagnostic budget: same-model startup about24min, C40 warmup, 300s observation and cleanup; no 3600s SA performance claim.",
+  "budget_rationale": "60min diagnostic budget: same-model startup about24min, C40 warmup, 900s observation and cleanup; no 3600s SA performance claim.",
   "transport_adjustment": {
     "reason": "The first full-run attempt failed before measurement because the local HIP IPC fast path returned invalid device context. De-prioritize HIP for buffers also registered with RDMA.",
     "setting": "MC_DISABLE_HIP=1 on both roles",
@@ -238,7 +238,8 @@
     "reference_lease": "L4a09fd",
     "worker_parameter_change": "Prefill Mooncake num_workers10 ->1; decode num_workers10 unchanged",
     "prediction": "Disappearance of timeouts implicates sender concurrency or reduced queue pressure; persistence weakens the concurrency-only hypothesis. Neither outcome alone proves a root cause.",
-    "observation_window": "Same C40 warmup trigger, then only300s profiling; retain failures and do not publish as a full SA point"
+    "observation_window": "Same C40 warmup trigger, then only900s profiling; retain failures and do not publish as a full SA point"
   },
-  "diagnostic_only": true
+  "diagnostic_only": true,
+  "client_duration_constraint": "AgentX 1.0.14 requires duration >=900s; retain diagnostic_only and do not use unsafe-override."
 }
