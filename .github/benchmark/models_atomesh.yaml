@@ -2394,6 +2394,7 @@ models:
               OFFLOAD_LOAD_WORKERS: "1"
               ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS: "20"
               ATOM_PD_EARLY_HANDOFF: "1"
+              ATOM_DP_IDLE_WHEN_BLOCKED: "1"
               MOONCAKE_STORE: "1"
               # 256 GiB on NUMA1's rdma7, which no prefill rank uses (E19).
               MOONCAKE_STORE_OWNERS: "1:256:rdma7"

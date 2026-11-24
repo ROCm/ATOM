@@ -60,6 +60,9 @@ logger = logging.getLogger("atom")
 # would fire one worker RPC round per spin; 1ms matches the PP head's existing
 # idle token-poll timeout and is far below any transfer latency.
 KV_IDLE_DRAIN_INTERVAL_S = 0.001
+# ATOM_DP_IDLE_WHEN_BLOCKED: how long a DP loop whose only work is blocked on a
+# tier lookup or load yields before it votes again.
+BLOCKED_IDLE_SLEEP_S = 0.0005
 # How long a busy loop that finds its engine held sleeps before it looks again.
 HELD_POLL_S = 0.01
 
@@ -1336,16 +1339,20 @@ class DPEngineCoreProc(EngineCore):
                     self.scheduler.engine_stats.note_idle(now)
                     if self.scheduler.prefill_delayer is not None:
                         self.scheduler.prefill_delayer.notify_idle()
-                    if self.has_pending_kv_work() or (
-                        getattr(self, "_idle_when_blocked", False)
-                        and self.scheduler.waiting
-                    ):
+                    blocked = getattr(
+                        self, "_idle_when_blocked", False
+                    ) and bool(self.scheduler.waiting)
+                    if self.has_pending_kv_work() or blocked:
                         # Local RPCs only. Anything that reaches schedule()
                         # would run the delayer's cross-DP all_reduce off
                         # lockstep, so the idle drain must stay off that path.
                         # A request blocked on its tier load is waiting too:
                         # the poll is what settles it.
                         self._advance_idle_kv_transfer()
+                    if blocked:
+                        # Its lookup / load threads share this process's
+                        # GIL; a hot spin here would slow what it waits on.
+                        time.sleep(BLOCKED_IDLE_SLEEP_S)
                     continue
 
                 self.scheduler.engine_stats.note_busy(now)

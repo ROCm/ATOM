@@ -311,3 +311,22 @@ def test_default_is_off(monkeypatch):
     p.scheduler = _sched()
     p.scheduler.prefill_delayer = None
     assert p._resolve_idle_when_blocked() is False
+
+
+def test_blocked_rank_yields_the_gil_between_polls(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(ec.time, "sleep", sleeps.append)
+    s = _sched(waiting=[_seq(4, SequenceStatus.WAITING_FOR_REMOTE_KVS)])
+    script = {2: lambda: s.finished_recving_kv_req_ids.append(4)}
+    Loop(s, enabled=True, last=4, script=script).run(monkeypatch)
+    assert sleeps == [ec.BLOCKED_IDLE_SLEEP_S] * 2  # the two blocked passes
+
+
+def test_deferred_frees_alone_do_not_sleep(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(ec.time, "sleep", sleeps.append)
+    s = _sched(deferred={1: object()})
+    Loop(s, enabled=True, last=3, script={3: s.deferred_free_blocks.clear}).run(
+        monkeypatch
+    )
+    assert sleeps == []
