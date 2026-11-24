@@ -454,3 +454,18 @@ def test_otel_version_environment(monkeypatch):
     assert _get_envs().ATOM_TRACE_VERSION == "unknown"
     monkeypatch.setenv("ATOM_TRACE_VERSION", "build-test")
     assert _get_envs().ATOM_TRACE_VERSION == "build-test"
+
+
+@pytest.mark.parametrize("name", ["ATOM_WARMUP_STEPS", "ATOM_WARMUP_PROMPTS"])
+def test_warmup_shapes_read_as_request_count_and_tokens(monkeypatch, name):
+    monkeypatch.setenv(name, "2x8192, 65536,")
+    assert getattr(_get_envs(), name) == [(2, 8192), (1, 65536)]
+    monkeypatch.delenv(name)
+    assert getattr(_get_envs(), name) == []
+
+
+@pytest.mark.parametrize("value", ["8k", "0x4096", "2x"])
+def test_a_malformed_warmup_shape_names_the_variable(monkeypatch, value):
+    monkeypatch.setenv("ATOM_WARMUP_STEPS", value)
+    with pytest.raises(ValueError, match="ATOM_WARMUP_STEPS"):
+        _ = _get_envs().ATOM_WARMUP_STEPS

@@ -1456,6 +1456,36 @@ class ModelRunner:
                 f"Using {num_seqs} seq(s) with length {seq_len} for warmup."
             )
 
+        self.forward(self._warmup_batch(num_seqs, seq_len))
+        self.tokenID_processor.clean()
+        # Kernels tuned per step size (GEMM rows keyed on M) are built on first
+        # use: the listed steps build theirs here, not in a request's forward.
+        for count, tokens in self.warmup_steps():
+            t0 = time.time()
+            self.forward(self._warmup_batch(count, tokens))
+            self.tokenID_processor.clean()
+            logger.info(
+                f"{self.label}: warmup step {count}x{tokens} {time.time() - t0:.2f} seconds"
+            )
+        torch.cuda.empty_cache()
+        logger.info(
+            f"{self.label}: warmup_model {time.time() - start_time:.2f} seconds with {num_seqs} reqs {num_seqs * seq_len} tokens"
+        )
+
+    def warmup_steps(self) -> list[tuple[int, int]]:
+        """(requests, tokens each) of the startup dummy forwards after the
+        first: `ATOM_WARMUP_STEPS`, each within the warmup token budget."""
+        steps = envs.ATOM_WARMUP_STEPS
+        limit = self.warmup_max_tokens()
+        for count, tokens in steps:
+            if count * tokens > limit or count > self.config.max_num_seqs:
+                raise ValueError(
+                    f"ATOM_WARMUP_STEPS {count}x{tokens} exceeds the warmup budget "
+                    f"of {limit} tokens or {self.config.max_num_seqs} requests"
+                )
+        return steps
+
+    def _warmup_batch(self, num_seqs: int, seq_len: int) -> ScheduledBatch:
         seqs = [
             Sequence(
                 [0] * seq_len,
@@ -1470,7 +1500,7 @@ class ModelRunner:
         num_scheduled_tokens = np.array([seq_len] * num_seqs, dtype=np.int32)
         total_tokens_num = int(num_scheduled_tokens.sum())
 
-        dummy_batch = ScheduledBatch(
+        return ScheduledBatch(
             seqs=seqs,
             num_scheduled_tokens=num_scheduled_tokens,
             total_tokens_num=total_tokens_num,
@@ -1478,12 +1508,6 @@ class ModelRunner:
             total_seqs_num=num_seqs,
             total_seqs_num_prefill=num_seqs,
             is_dummy_run=True,
-        )
-        self.forward(dummy_batch)
-        self.tokenID_processor.clean()
-        torch.cuda.empty_cache()
-        logger.info(
-            f"{self.label}: warmup_model {time.time() - start_time:.2f} seconds with {num_seqs} reqs {total_tokens_num} tokens"
         )
 
     def profile_dynamic_chunking(self):

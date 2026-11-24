@@ -91,6 +91,24 @@ def _optional_int_env(name: str, *, min_value: int | None = None) -> int | None:
     return value
 
 
+def _warmup_shapes_env(name: str) -> list[tuple[int, int]]:
+    """Comma list of [Kx]TOKENS as (K, TOKENS) pairs; unset or empty reads as []."""
+    shapes = []
+    for item in os.getenv(name, "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        count, _, tokens = item.rpartition("x")
+        try:
+            shape = (int(count) if count else 1, int(tokens))
+        except ValueError as exc:
+            raise ValueError(f"{name}: {item!r} is not [Kx]TOKENS") from exc
+        if min(shape) < 1:
+            raise ValueError(f"{name}: {item!r} needs K and TOKENS of at least 1")
+        shapes.append(shape)
+    return shapes
+
+
 def _non_negative_or_none(value: int | None) -> int | None:
     """A negative value clamps to 0; None stays None."""
     return None if value is None else max(0, value)
@@ -1418,6 +1436,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # PP stage boundary over HIP IPC (`pp_ipc.py`) on a MiniMax-M3 P/D prefill
     # producer with one rank a stage on gfx950; 0 keeps NCCL everywhere.
     "ATOM_PP_IPC": lambda: os.getenv("ATOM_PP_IPC", "1") == "1",
+    # Startup dummy forwards at [Kx]TOKENS steps besides the max_num_batched_tokens
+    # one, building per-step-size kernels before the first request. Empty: none.
+    "ATOM_WARMUP_STEPS": lambda: _warmup_shapes_env("ATOM_WARMUP_STEPS"),
+    # [Kx]TOKENS random-token prompts the API server completes before it serves:
+    # builds the attention, KV write and sampling kernels. Empty: none.
+    "ATOM_WARMUP_PROMPTS": lambda: _warmup_shapes_env("ATOM_WARMUP_PROMPTS"),
     # Engram: read the n-gram tables with a device kernel over UVA instead of
     # gathering them on the host. Each rank's shard stays in host memory,
     # page-locked (`engram.host_memory.pin_rows`), not copied to HBM; the

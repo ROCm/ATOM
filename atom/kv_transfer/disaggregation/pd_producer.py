@@ -119,6 +119,18 @@ def mooncake_pd_producer_configured(config) -> bool:
     return bool(mooncake_producer_connectors(config))
 
 
+def moriio_pd_producer_configured(config) -> bool:
+    transfer_config = getattr(config, "kv_transfer_config", None)
+    if (
+        isinstance(transfer_config, dict)
+        and transfer_config
+        and "kv_connector" not in transfer_config
+    ):
+        # `create_connector` builds MoRI-IO for a config that names none.
+        return transfer_config.get("kv_role", "kv_producer") == "kv_producer"
+    return bool(_producer_connectors(config, frozenset({"moriio"})))
+
+
 def mooncake_producer_connectors(config) -> tuple[dict, ...]:
     """Configured ``kv_producer`` entries of the Mooncake connector."""
     return _producer_connectors(config, _MOONCAKE_CONNECTORS)

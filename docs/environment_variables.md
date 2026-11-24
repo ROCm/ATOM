@@ -127,6 +127,17 @@ cannot affect a server that does not use the feature.
 |----------|------|---------|-------------|
 | **ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR** | float | 0.75 | Blend from the initial chunk (`0`) to the equal-latency chunk (`1`). Must be in `[0, 1]` when dynamic chunking is enabled. |
 
+## Startup warmup
+
+Kernels that FlyDSL and Triton build on first use (GEMM configs tuned per step size, attention and index kernels per context range) otherwise stall the first request that reaches each one; under PP the stages build them one after another.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_WARMUP_STEPS** | str | "" (none) | Startup dummy forwards after the `--max-num-batched-tokens` one, a comma list of `[Kx]TOKENS` steps (K requests of TOKENS tokens each, e.g. `8192,4x4096`). Each runs every stage's GEMMs, norms and MoE at that step size before the KV cache is sized, so the kernels a step of that size selects are built at startup. A step past the warmup token budget (`--max-num-batched-tokens`, divided over DP or PCP ranks) or with more requests than `--max-num-seqs` is an error. Dummy forwards skip attention: `ATOM_WARMUP_PROMPTS` covers it. |
+| **ATOM_WARMUP_PROMPTS** | str | "" (none) | Random-token prompts the API server completes before it serves, a comma list of `[Kx]TOKENS` (K concurrent prompts of TOKENS tokens, one output token each, e.g. `2x8192,65536`). They run what the dummy forwards skip: attention and the index at each context length, the KV write, sampling and a drafter's step. The server answers its first request only after they complete. Ignored on a MoRI-IO producer (logged), which keeps the blocks of every prefill it completes for a decoder. |
+
+A MiniMax-M3.1 PP4 x TP1 P/D producer at `--max-num-batched-tokens 8192` takes `ATOM_WARMUP_STEPS=1024,1536,2048,2560,3072,4096` and `ATOM_WARMUP_PROMPTS=1000,2048,4096,8192,2x4096,131072`. With the FlyDSL and Triton disk caches warm from an earlier run, no first request from 600 to 131,072 tokens then waits on a kernel build: each is within 40 ms of its repeat (2 x 4096 tokens take 0.17 or 0.23 s, first or repeated alike), where the first 2048-token one took 9.9 s without the warmup. The server is ready about 12 s later. With cold caches, Triton kernels specialized on lengths these prompts do not hit still build on the first request that reaches them, 0.25-1.1 s each.
+
 ## Model loading
 
 | Variable | Type | Default | Description |

@@ -102,3 +102,50 @@ def test_a_block_drafter_warms_up_on_no_more_sequences_than_a_step_holds(
     runner.forward = lambda batch: rows.append(batch.total_seqs_num)
     runner.warmup_model()
     assert rows == [1]
+
+
+def _stage(monkeypatch, max_num_batched_tokens=16384):
+    monkeypatch.setattr(runner_module.torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        runner_module.torch.cuda, "reset_peak_memory_stats", lambda: None
+    )
+    monkeypatch.setattr(
+        runner_module, "get_dp_group", lambda: SimpleNamespace(world_size=1)
+    )
+    runner = object.__new__(runner_module.ModelRunner)
+    runner.config = SimpleNamespace(
+        max_model_len=1 << 20,
+        max_num_seqs=8,
+        max_num_batched_tokens=max_num_batched_tokens,
+        enable_dp_attention=False,
+        prefill_context_parallel_size=1,
+        speculative_config=None,
+    )
+    runner.block_size, runner.label = 16, "stage"
+    runner.tokenID_processor = SimpleNamespace(clean=lambda: None)
+    return runner
+
+
+def test_the_listed_warmup_steps_follow_the_budget_step(monkeypatch):
+    monkeypatch.setenv("ATOM_WARMUP_STEPS", "8192,4x4096,12288")
+    runner = _stage(monkeypatch)
+    steps = []
+    runner.forward = lambda batch: steps.append(
+        (batch.total_seqs_num, batch.total_tokens_num, batch.is_dummy_run)
+    )
+    runner.warmup_model()
+    assert steps == [
+        (1, 16384, True),
+        (1, 8192, True),
+        (4, 16384, True),
+        (1, 12288, True),
+    ]
+
+
+@pytest.mark.parametrize("step", ["2x8193", "9x16"])
+def test_a_warmup_step_past_the_budget_is_refused(monkeypatch, step):
+    monkeypatch.setenv("ATOM_WARMUP_STEPS", step)
+    runner = _stage(monkeypatch)
+    runner.forward = lambda batch: None
+    with pytest.raises(ValueError, match="ATOM_WARMUP_STEPS"):
+        runner.warmup_model()

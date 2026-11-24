@@ -3822,6 +3822,7 @@ def main():
     _setup_reasoning_and_tools(args)
 
     engine = engine_args.create_engine(tokenizer=tokenizer)
+    _run_warmup_prompts(engine)
     _setup_stream_dispatch(args)
 
     # Wire the batched stream-flush hook: per-seq stream callbacks only buffer
@@ -3834,6 +3835,38 @@ def main():
     if args.api_server_count > 1:
         _start_frontend_workers(args)
     _serve(args)
+
+
+def _run_warmup_prompts(engine) -> None:
+    """`ATOM_WARMUP_PROMPTS`: complete random-token prompts before serving, so
+    no real request builds the kernels its attention, KV write or sampling run."""
+    shapes = envs.ATOM_WARMUP_PROMPTS
+    if not shapes:
+        return
+    from atom.kv_transfer.disaggregation.pd_producer import (
+        moriio_pd_producer_configured,
+    )
+
+    if moriio_pd_producer_configured(engine.config):
+        # MoRI-IO holds every prefill's blocks for a decoder; none pulls these.
+        logger.warning("ATOM_WARMUP_PROMPTS is ignored on a MoRI-IO producer")
+        return
+    import random
+
+    rng = random.Random(0)
+    vocab = len(engine.tokenizer)
+    keep = engine.core_mgr.keep_finished_outputs
+    params = SamplingParams(max_tokens=1, temperature=0.0, ignore_eos=True)
+    try:
+        for count, tokens in shapes:
+            prompts = [
+                [rng.randrange(vocab) for _ in range(tokens)] for _ in range(count)
+            ]
+            t0 = time.time()
+            engine.generate(prompts, params)
+            logger.info(f"Warmup prompts {count}x{tokens}: {time.time() - t0:.2f} s")
+    finally:
+        engine.core_mgr.keep_finished_outputs = keep
 
 
 def _setup_frontend(args) -> None:
