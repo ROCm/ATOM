@@ -111,6 +111,7 @@ MERGE_STAT_WORDS = HEAD_TILE * CHUNKS
 MERGE_SUM_WORDS = HEAD_TILE * CHUNKS
 MERGE_TREE_WORDS = SLICE // 16 * 64 * 4
 MERGE_OUT_WORDS = HEAD_TILE * SLICE
+PV_GROUP = 4  # the PV's 16-slot blocks a branch (``_merge_pv``)
 
 
 def merge_groups(tokens) -> int:
@@ -872,9 +873,14 @@ def _merge_softmax(c, t, tile, hg, mh, meta, sink2):
 def _merge_pv(c, meta, mh):
     """P V of the slice: wave w the 16 dims 16 (w % 4) .. over key half w // 4,
     a 16-slot block an MFMA (A = V^T by a transposing LDS read, B = P; a head
-    past the group zero), a block without a key skipped (the wave's
-    condition: the slots holding keys are a prefix of the selection's and of
-    the window's, which a block does not straddle, so its first slot says)."""
+    past the group zero), PV_GROUP blocks a branch: a group's LDS reads issue
+    together, one LDS round trip a group, not a block (20 a wave serially
+    before). A group without a key is skipped (the wave's condition: the slots
+    holding keys are a prefix of the selection's and of the window's, which a
+    block does not straddle, so its first slot says; a group inside one of
+    them likewise its first block). A block without a key in a taken group
+    adds exact +0 products (V +0 at its slots, ``_merge_values_land``; P +0,
+    exp2 of NEG - m): acc unchanged."""
     lane = c["lane"]
     wave, att = c["wave"], c["att"]
     g, n = lane // 16, lane % 16
@@ -884,31 +890,52 @@ def _merge_pv(c, meta, mh):
     tr = ((2 * db + n % 4 // 2) * ATTENTION_KEYS_MAX + 4 * g + n // 4) * 4 + n % 2 * 2
     nn = fx.min(n, mh - 1)
     blocks = ATTENTION_KEYS_MAX // 16 // 2
+    sb = c["sel_slots"] // 16  # the first window block
     acc = fx.Vector.filled(4, 0.0, fx.Float32)
-    for b in range_constexpr(blocks):
-        kb = kh * blocks + b
+    for b0 in range_constexpr(0, blocks, PV_GROUP):
+        bs = list(range(b0, min(b0 + PV_GROUP, blocks)))
         nxt = acc
-        if _slot_valid(meta, kb * 16):
-            av = rocdl.ds_read_tr16_b64(
-                fx.Vector.make_type(4, fx.BFloat16),
-                fx.to_llvm_ptr(att["vt"] + (tr + kb * 16 * 4)),
-            ).result
-            pw = fx.Vector(
-                fx.ptr_load(
-                    att["p"] + (nn * P_ROW + (kb * 16 + 4 * g) // 2),
-                    result_type=fx.Vector.make_type(2, fx.Int32),
+        # one condition a group inside the selection or the window (either
+        # key half's: kh 0 or 1), its first block's; a group across their
+        # boundary takes any block's. (An OR of a group's four held the
+        # kernel's SGPRs, at their 104, to 36 B of scratch: refused.)
+        has_key = _slot_valid(meta, (kh * blocks + bs[0]) * 16)
+        if const_expr(any(h * blocks + b0 < sb <= h * blocks + bs[-1] for h in (0, 1))):
+            for b in bs[1:]:
+                has_key = has_key | _slot_valid(meta, (kh * blocks + b) * 16)
+        if has_key:
+            ops = []
+            for b in bs:
+                kb = kh * blocks + b
+                av = rocdl.ds_read_tr16_b64(
+                    fx.Vector.make_type(4, fx.BFloat16),
+                    fx.to_llvm_ptr(att["vt"] + (tr + kb * 16 * 4)),
+                ).result
+                pw = fx.Vector(
+                    fx.ptr_load(
+                        att["p"] + (nn * P_ROW + (kb * 16 + 4 * g) // 2),
+                        result_type=fx.Vector.make_type(2, fx.Int32),
+                    )
                 )
-            )
+                ops.append((av, pw))
+            group_acc = acc
+            # the head mask's compare in the group: not held over the loop
             live = n < mh
-            pw = fx.Vector.from_elements(
-                [live.select(pw[e], fx.Int32(0)) for e in range(2)], fx.Int32
-            )
-            nxt = fx.Vector(
-                rocdl.mfma_f32_16x16x16bf16_1k(
-                    T.vec(4, T.f32),
-                    [fx.Vector(av).bitcast(fx.Int16), pw.bitcast(fx.Int16), acc],
+            for av, pw in ops:
+                pw = fx.Vector.from_elements(
+                    [live.select(pw[e], fx.Int32(0)) for e in range(2)], fx.Int32
                 )
-            )
+                group_acc = fx.Vector(
+                    rocdl.mfma_f32_16x16x16bf16_1k(
+                        T.vec(4, T.f32),
+                        [
+                            fx.Vector(av).bitcast(fx.Int16),
+                            pw.bitcast(fx.Int16),
+                            group_acc,
+                        ],
+                    )
+                )
+            nxt = group_acc
         acc = nxt
     return acc
 
