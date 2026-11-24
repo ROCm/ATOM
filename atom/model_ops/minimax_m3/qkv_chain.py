@@ -10,7 +10,7 @@ E8M0 scales), and the attention op's ``rope_cache`` runs aiter's one-launch ``qk
 GEMM + q / k / index RMSNorm + partial RoPE + NVFP4 K / V / index-K insert) on the parked codes. Both decisions are taken
 at run time inside the two custom ops (concrete row count and forward context) by the same predicate ``take``, so the
 compiled graph is the same for every row count; the codes travel from the linear to the attention op through
-``_PENDING`` (same forward, same stream, consumed by the next attention op of the same layer).
+a per-thread hand-off slot (same forward, same stream, consumed by the next attention op of the same layer).
 
 Techniques and the kernel's numerics (bitwise the unfused split-3 chain) are amd-kernels'
 ``mxfp8_qkv_norm_rope_nvfp4_insert``, ported into aiter (aiter.ops.flydsl.kernels.qkv_chain).
@@ -18,6 +18,7 @@ Techniques and the kernel's numerics (bitwise the unfused split-3 chain) are amd
 
 import functools
 import importlib.util
+import threading
 
 import torch
 from aiter.jit.utils.torch_guard import torch_compile_guard
@@ -31,7 +32,17 @@ SPLIT_MAX_ROWS = (
     128  # the split-3 GEMM + reduce-insert chain (aiter ``qkv_chain_insert``)
 )
 
-_PENDING = None  # (rows, codes, scales, weight, chain_scale) of the last qkv_front that took the chain
+# (rows, codes, scales, weight, chain_scale) of the last qkv_front that took the chain, per thread: TBO decode runs
+# its two micro-batches in two threads, each doing linear -> attention for its own layer.
+_STATE = threading.local()
+
+
+def _get():
+    return getattr(_STATE, "pending", None)
+
+
+def _set(value):
+    _STATE.pending = value
 
 
 def enabled() -> bool:
@@ -100,14 +111,33 @@ def layer_ok(
     )
 
 
+def linear_ok(linear) -> bool:
+    """Static eligibility of the qkv linear's weight path: a native group32 (1x32) MXFP8 weight with its own FP8 GEMM
+    (``_qkv_chain_scale`` exists only on that path); online-requantized, per-token, 32x32, MXFP4 or BF16-fallback
+    weights keep their existing linear."""
+    return (
+        getattr(linear, "native_a8_group_rows", None) == 1
+        and getattr(linear, "params_dtype", None) == torch.float8_e4m3fn
+        and not getattr(linear, "runs_bf16", False)
+        and getattr(linear, "bias", None) is None
+    )
+
+
 def take(m: int) -> bool:
-    """Run time: this forward's qkv linear + insert take the chain."""
+    """Run time: this forward's qkv linear + insert take the chain.
+
+    Never inside a token graph (TR_HYBRID decode, the level-3 default): replay runs the captured quantizer without
+    the Python hand-off and the attention op (an eager region) would read the uncomputed QKV.
+    """
     if not (MIN_ROWS <= m <= max_rows()):
         return False
     from atom.utils.forward_context import get_forward_context
 
     c = get_forward_context().context
-    return not (c is None or c.is_prefill or c.is_dummy_run)
+    if c is None or c.is_prefill or c.is_dummy_run:
+        return False
+    mode = getattr(c, "forward_mode", None)
+    return not (mode is not None and getattr(mode, "token_graph", False))
 
 
 def chain_weight_scale(weight_scale: torch.Tensor) -> torch.Tensor:
@@ -134,21 +164,20 @@ def qkv_front(
     chain_scale: torch.Tensor,
     weight_preshuffled: bool,
 ) -> torch.Tensor:
-    """The qkv linear of a chain-eligible layer. Chain rows: MXFP8 quant only, codes parked in ``_PENDING``, the returned
+    """The qkv linear of a chain-eligible layer. Chain rows: MXFP8 quant only, codes parked in the hand-off slot, the returned
     qkv is NOT computed (the attention op's chain never reads it). Other rows: today's linear.
     """
-    global _PENDING
     x2 = x.reshape(-1, K)
     m = x2.shape[0]
-    if take(m):
+    if weight_preshuffled and take(m):
         from aiter.ops.flydsl.kernels.mxfp8_quant_shuffled import (
             mxfp8_quantize_shuffled,
         )
 
         codes, scales = mxfp8_quantize_shuffled(x2, code_rows(m))
-        _PENDING = (m, codes, scales, weight, chain_scale)
+        _set((m, codes, scales, weight, chain_scale))
         return torch.empty((*x.shape[:-1], N), dtype=torch.bfloat16, device=x.device)
-    _PENDING = None
+    _set(None)
     from atom.model_ops.blockscale import native_quant_linear
 
     return native_quant_linear(
@@ -164,8 +193,8 @@ def qkv_front(
 
 def pop(m: int):
     """The attention op's side: the parked codes of this layer's linear (or None = today's path)."""
-    global _PENDING
-    p, _PENDING = _PENDING, None
+    p = _get()
+    _set(None)
     if p is None:
         return None
     assert p[0] == m, f"qkv_chain: parked codes for {p[0]} rows, attention has {m}"

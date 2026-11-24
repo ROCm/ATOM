@@ -89,13 +89,13 @@ def test_layer_ok(monkeypatch):
 
 
 def test_pop_hands_off_once_and_checks_rows():
-    qkv_chain._PENDING = (40, "codes", "scales", "w", "s")
+    qkv_chain._set((40, "codes", "scales", "w", "s"))
     assert qkv_chain.pop(40)[0] == 40
     assert qkv_chain.pop(40) is None  # consumed
-    qkv_chain._PENDING = (40, "codes", "scales", "w", "s")
+    qkv_chain._set((40, "codes", "scales", "w", "s"))
     with pytest.raises(AssertionError):
         qkv_chain.pop(48)
-    qkv_chain._PENDING = None
+    qkv_chain._set(None)
 
 
 def test_front_fake_shape():
@@ -103,3 +103,58 @@ def test_front_fake_shape():
     w = torch.zeros((2560, 6144), dtype=torch.uint8)
     y = qkv_chain._front_fake(x, w, None, None, False)
     assert y.shape == (3, 2560) and y.dtype == torch.bfloat16
+
+
+def test_take_refuses_token_graph(monkeypatch):
+    import atom.utils.forward_context as fc
+
+    for token_graph, want in ((True, False), (False, True)):
+        ctx = SimpleNamespace(
+            context=SimpleNamespace(
+                is_prefill=False,
+                is_dummy_run=False,
+                forward_mode=SimpleNamespace(token_graph=token_graph),
+            )
+        )
+        monkeypatch.setattr(fc, "get_forward_context", lambda ctx=ctx: ctx)
+        assert qkv_chain.take(40) is want
+
+
+def test_linear_ok_requires_native_1x32_mxfp8():
+    ok = SimpleNamespace(
+        native_a8_group_rows=1,
+        params_dtype=torch.float8_e4m3fn,
+        runs_bf16=False,
+        bias=None,
+    )
+    assert qkv_chain.linear_ok(ok)
+    for field, bad in (
+        ("native_a8_group_rows", None),  # online requant / generic path
+        ("native_a8_group_rows", 32),  # 32x32 source
+        ("params_dtype", torch.bfloat16),
+        ("params_dtype", torch.float4_e2m1fn_x2),  # MXFP4 weights
+        ("runs_bf16", True),
+        ("bias", object()),
+    ):
+        assert not qkv_chain.linear_ok(
+            SimpleNamespace(**{**ok.__dict__, field: bad})
+        ), field
+    assert not qkv_chain.linear_ok(SimpleNamespace())
+
+
+def test_handoff_is_per_thread():
+    import threading
+
+    qkv_chain._set((40, "codes", "scales", "w", "s"))
+    seen = []
+    t = threading.Thread(target=lambda: seen.append(qkv_chain.pop(40)))
+    t.start()
+    t.join()
+    assert seen == [None]  # another thread (TBO micro-batch) never sees it
+    assert qkv_chain.pop(40)[0] == 40
+
+
+def test_weight_cache_key_tracks_the_chain_flag():
+    from atom.model_loader.weight_cache import key
+
+    assert "ATOM_M3_QKV_CHAIN" in key._ENV_VARS

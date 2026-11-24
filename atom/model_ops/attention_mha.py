@@ -1598,16 +1598,26 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
 
         layer = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"]
         k_cache = layer.k_cache
-        sparse_metadata = getattr(fwd_ctx.attn_metadata, "sparse_attention_metadata", None)
+        sparse_metadata = getattr(
+            fwd_ctx.attn_metadata, "sparse_attention_metadata", None
+        )
         if sparse_metadata is None:
             sparse_metadata = fwd_ctx.attn_metadata
         num_tokens = q.shape[0]
-        q_out = torch.empty((num_tokens, self.num_heads * self.head_dim), dtype=torch.bfloat16, device=q.device)
+        q_out = torch.empty(
+            (num_tokens, self.num_heads * self.head_dim),
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
         cos_sin_cache = _minimax_m3_cos_sin_cache(self.rotary_emb, q_out)
-        index_q = torch.empty((num_tokens, self.index_q_size), dtype=torch.float8_e4m3fn, device=q.device)
+        index_q = torch.empty(
+            (num_tokens, self.index_q_size), dtype=torch.float8_e4m3fn, device=q.device
+        )
         # ATOM's NVFP4 pools as the kernel's page views (same bytes): K side then V side per block, one index page each
         kv_pages = torch.as_strided(
-            k_cache, (k_cache.shape[0], 2 * self.num_kv_heads, 128, 72), (k_cache.stride(0), 128 * 72, 72, 1)
+            k_cache,
+            (k_cache.shape[0], 2 * self.num_kv_heads, 128, 72),
+            (k_cache.stride(0), 128 * 72, 72, 1),
         )
         qkv_chain.run_chain(
             pend,

@@ -53,6 +53,8 @@ _ENV_VARS = (
     "ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE",
     "ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE",
     "ATOM_GROUP32_WEIGHT_PRESHUFFLE",
+    # Whether the MiniMax-M3 qkv linear keeps a chain-layout weight scale after loading.
+    "ATOM_M3_QKV_CHAIN",
     "ATOM_MOE_GU_ITLV",
     "ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM",
     "ATOM_USE_TRITON_GEMM",
