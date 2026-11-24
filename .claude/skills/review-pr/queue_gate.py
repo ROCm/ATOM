@@ -32,7 +32,7 @@ import time
 
 # watchdog.py sits next to this file; sys.path[0] is the script's own directory, so this picks
 # up the sibling rather than any installed package of the same name.
-from watchdog import GitHub
+from watchdog import WORKFLOW, GitHub
 
 AVG_REVIEW_MINUTES = 50      # measured: a full review is about this
 MAX_WAIT_HOURS = 8           # refuse beyond this rather than accept it; see below
@@ -74,7 +74,8 @@ def tunable(env, name, default):
 def survey(api, repo, own_run_id, now):
     """How many reviews are running, and how long the waiting ones have waited."""
     running, waiting = 0, []
-    for run in api.in_progress_runs(repo):
+    # Only this workflow: survey counts reviews, not whatever else holds the box.
+    for run in api.in_progress_runs(repo, WORKFLOW):
         if run["id"] == own_run_id:
             continue
         review = next((j for j in api.jobs(repo, run["id"]) if j["name"] == "review"), None)
