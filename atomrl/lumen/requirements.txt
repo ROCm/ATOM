@@ -1,0 +1,38 @@
+# =============================================================================
+# Lumen test dependencies
+# =============================================================================
+
+# Test framework
+pytest>=7.0
+pytest-xdist
+
+# Lumen core (editable install handled by Dockerfile / setup.py)
+# torch>=2.0
+# triton
+
+# Quantization reference (torchao MX-format / FP8 primitives)
+torchao>=0.8
+
+# AITER — Dockerfile.dev / Dockerfile.lumen update the public ROCm/aiter main checkout
+# Megatron-LM — installed from git clone in Dockerfile (not on PyPI)
+# vLLM and MORI — inherited from rocm/atom-dev:vllm-latest; do not reinstall here
+# Ray and OmegaConf — AtomRL runtime dependencies owned by atomrl/pyproject.toml
+
+# HuggingFace (model/dataset download helpers)
+huggingface_hub>=0.20
+datasets>=2.16
+transformers>=4.38
+# Llama2 examples use the public SentencePiece tokenizer. Keep these explicit
+# because the development image installs this file with --no-deps.
+sentencepiece>=0.1.99
+protobuf>=7.36.1
+regex>=2023.0.0
+
+# LoRA (via HuggingFace PEFT)
+peft>=0.9
+
+# Build/version metadata used by editable source installs
+setuptools-scm
+
+# Utilities
+numpy>=1.26.0

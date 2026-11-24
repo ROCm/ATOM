@@ -439,9 +439,7 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
                 state=state,
                 activation_dtype=layer.dt_bias.dtype,
             )
-            # RTP-LLM MTP prefill has no FlyDSL accuracy or perf data under
-            # ReplaySSM yet, so it stays on Triton there.
-            prefill = policy.prefill and not metadata.replayssm
+            prefill = policy.prefill
             layer.gdn_flydsl_policy = GDNFlyDSLPolicy(
                 prefill=prefill,
                 decode=(

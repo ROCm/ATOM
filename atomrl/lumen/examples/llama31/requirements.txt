@@ -1,0 +1,7 @@
+git+https://github.com/mlcommons/logging.git@5.1.0-rc4
+git+https://github.com/NVIDIA/mlperf-common.git@68cf1d0d5e3de3351e66abb696d0e2d011aabf47
+transformers>=4.43.0
+datasets
+peft
+huggingface_hub>=0.24.0
+numpy>=1.26.0

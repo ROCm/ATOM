@@ -1,0 +1,178 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
+# Qwen3-30B-A3B GRPO long run — Megatron TP4/EP8 + vLLM BF16 rollout (MI308X)
+#
+# Aligned with LMSYS MILES RL:
+#   GRPO 32x8 sampling, 8k response cap, global batch 256, no KL, TP4/EP8
+#   https://www.lmsys.org/blog/2026-03-17-rocm-miles-rl-amd/#performance
+#
+# Training: Megatron-Core GPTModel (TP=4, EP=8, sequence-parallel,
+#   distributed optimizer, flash attention, chunked log-prob,
+#   torch RMSNorm — no apex/TE)
+#
+# 2-node training/inference separation:
+#   Node 0: vLLM inference (4 replicas x TP=2, 8 GPUs)
+#   Node 1: Megatron training (8 workers, TP=4, EP=8)
+#
+# FP8 per_block_fp8 is NOT used (Qwen3-30B-A3B MoE intermediate=768 causes
+# garbled output with 128x128 block quantization). BF16 weights + FP8 KV cache.
+#
+# MILES reference performance (8xMI300X):
+#   Mean step 388.50s, AIME accuracy 0.665 -> 0.729
+
+cluster:
+  num_nodes: 2
+  gpus_per_node: 8
+  ray_address: "auto"
+
+weight_sync:
+  backend: rdma                    # shared_folder | rdma
+  shared_folder: "${oc.env:DATA_ROOT}/weight_sync/qwen3-30b-a3b"
+  bucket_size_mb: 1024
+  timeout_s: 600
+  verify_full_load: true
+  rdma:
+    backend: rccl
+    require_rdma: true
+    hca: mlx5_0
+    interface: ens11np0
+    gid_index: 3
+    gdr_mode: auto
+
+controller:
+  ray:
+    enabled: true
+    fuse_actor_ref: false
+    actor:
+      num_workers: 8
+      dispatch_mode: dp_compute_proto
+      process_on_nodes: [8]
+    rollout:
+      num_workers: 8
+      process_on_nodes: [8]
+
+policy:
+  model_name: "${oc.env:DATA_ROOT}/models/Qwen3-30B-A3B"
+  training_backend: megatron
+  generation_backend: vllm
+  max_total_sequence_length: 9216        # 1024 prompt + 8192 response
+  max_response_length: 8192             # MILES: 8k response cap
+  train_global_batch_size: 256          # MILES: 32 prompts x 8 generations = 256
+  gen_batch_size: 32                    # MILES rollout batch: 32 prompts
+  train_micro_batch_size: 1
+  max_token_len_per_gpu: 16384           # Stability margin for 192 GiB MI308X allocator/NCCL workspace
+  balance_batch: true                    # MILES: --balance-data
+  learning_rate: 1.0e-6
+  lr_warmup_steps: 10
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  lr_decay_style: constant
+  adam_beta1: 0.9
+  adam_beta2: 0.98                        # MILES: --adam-beta2 0.98
+  training:
+    optimizer_dtype: bf16
+    megatron_cfg:
+      tensor_model_parallel_size: 4
+      expert_model_parallel_size: 8      # 128 experts / 8 = 16 experts per GPU
+      expert_tensor_parallel_size: 1    # MILES: ETP=1 (MoE layers no TP, dense layers TP=4)
+      num_experts: 128
+      moe_grouped_gemm: false             # grouped_gemm (CUTLASS) unavailable on ROCm; use SequentialMLP
+      moe_token_dispatcher_type: alltoall # Variable-length packed batches require uneven EP token splits
+      moe_flex_dispatcher_backend: mori
+      moe_mori_max_tokens_per_rank: null
+      moe_mori_kernel_type: null
+      use_distributed_optimizer: true
+      grad_reduce_in_fp32: true            # MILES: --accumulate-allreduce-grads-in-fp32
+      attention_softmax_in_fp32: true      # MILES train/infer numerical alignment
+      sequence_parallel: true
+      recompute_granularity: full
+      recompute_method: uniform
+      recompute_num_layers: 1
+      attention_backend: flash
+      use_packed_sequences: true        # MILES packed path; EP all-to-all supports variable token counts
+      log_probs_chunk_size: 1024
+      optimizer_cpu_offload: true
+    fsdp_cfg:
+      param_offload: false
+      optimizer_offload: false
+      reshard_after_forward: true
+  generation:
+    vllm_cfg:
+      transport: ray_http
+      ray_http_start_server: false
+      tensor_parallel_size: 2            # TP=2: 8 GPUs / 2 = 4 replicas
+      kv_cache_dtype: auto               # MILES BF16 baseline; FP8 KV amplifies long-context mismatch
+      gpu_memory_utilization: 0.70       # MILES vLLM baseline
+      max_model_len: 9216
+      dtype: bfloat16
+      enforce_eager: false
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 16384
+      max_num_seqs: 64
+      quantization: ""
+      calculate_log_probs: true
+      enable_sleep_mode: false           # rollout has a dedicated 8-GPU node
+      sleep_level: 0
+      update_weights_bucket_megabytes: 2048
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1
+
+algorithm:
+  name: grpo
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  loss_agg_mode: token-mean
+  clip_ratio_high: 0.28                   # MILES: --eps-clip-high 0.28 (asymmetric clip)
+  grpo:
+    num_generations: 8
+    kl_coeff: 0.0
+    clip_ratio: 0.2
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+    rollout_is_batch_normalize: true      # MILES MIS/TIS keeps corrected gradient scale stable
+
+moe:
+  r3:
+    enabled: true
+    record_router_logits: false          # MILES R3 transports top-k expert ids, not logits
+    replay_mode: hard_assignment         # replay rollout expert ids; recompute router weights
+
+reward:
+  type: function
+  function: atomrl.rewards.math_reward.dapo_math_reward
+  dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-30b-a3b-maxprompt1024/dapo-math-17k.filtered.parquet"
+  shuffle: true
+  shuffle_seed: 10086
+
+val_dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-30b-a3b-maxprompt1024/aime-2024.filtered.parquet"
+val_steps: 10
+val_batch_size: 0
+eval:
+  enabled: false
+  num_samples: 0
+
+checkpointing:
+  checkpoint_dir: "${oc.env:DATA_ROOT}/ckpts/qwen3-30b-a3b-ep8/longrun"
+  save_steps: 5
+  save_total_limit: 3
+  resume: true
+
+logger:
+  wandb_enabled: true
+  log_interval: 1
+  wandb:
+    project: AtomRL
+    name: qwen3-30b-a3b-vllm-miles-200step-formal-r3-from0
+
+num_training_steps: 200
+seed: 10086

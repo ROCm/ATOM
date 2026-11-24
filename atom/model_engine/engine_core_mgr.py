@@ -1077,7 +1077,7 @@ class CoreManager:
                     with self.ctx.socket(zmq.PAIR) as shutdown_sender:
                         shutdown_sender.connect(shutdown_path)
                         shutdown_sender.send(b"")
-                except Exception as e:
+                except (OSError, zmq.ZMQError) as e:
                     logger.debug(f"{self.label}: Error sending shutdown signal: {e}")
 
         for thread in self.output_threads:
@@ -2237,11 +2237,21 @@ class CoreManager:
             if not outer:
                 ctx.sync_id = uuid.uuid4().hex
                 ctx.failure = None
+                ctx.abort_sent = False
             ctx.active = True
             try:
                 yield
             finally:
                 ctx.active = outer
+
+    def claim_weight_sync_abort(self) -> bool:
+        """Return true once for the outer weight-sync session's abort."""
+        with self._weight_sync_lock:
+            ctx = self._weight_sync_context
+            if not getattr(ctx, "active", False) or getattr(ctx, "abort_sent", False):
+                return False
+            ctx.abort_sent = True
+            return True
 
     def _discard_failed_weight_sync(self, failed_cmd: str) -> None:
         """Fence every engine this reaches and drop the failed sync's scratch.
@@ -2836,5 +2846,5 @@ class DisaggCoreManager(CoreManager):
             try:
                 self._cu_shm.close()
                 self._cu_shm.unlink()
-            except Exception:
-                pass
+            except (BufferError, FileNotFoundError, OSError) as error:
+                logger.debug("Could not release CU shared memory: %s", error)

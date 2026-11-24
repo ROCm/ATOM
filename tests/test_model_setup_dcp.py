@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Run the real setup functions while recording only device/process boundaries."""
 
 import ast
-import builtins
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -42,20 +43,18 @@ def _initialize(pp, dcp, pp_rank=0):
         "set_custom_all_reduce": lambda enabled: None,
         "init_distributed_environment": lambda **kwargs: None,
         "ensure_model_parallel_initialized": lambda *args, **kwargs: calls.append(
-            ("pp", kwargs["decode_context_model_parallel_size"])
+            (
+                "pp" if args[1] > 1 else "non_pp",
+                kwargs["decode_context_model_parallel_size"],
+            )
         ),
     }
     pp_init = _source_function(
         "atom/distributed/pp_comm.py", "init_pp_aware_dist_env", pp_namespace
     )
 
-    def source_import(name, globals=None, locals=None, fromlist=(), level=0):
-        if name == "atom.distributed.pp_comm":
-            return SimpleNamespace(init_pp_aware_dist_env=pp_init)
-        return builtins.__import__(name, globals, locals, fromlist, level)
-
     namespace = {
-        "__builtins__": dict(vars(builtins), __import__=source_import),
+        "init_pp_aware_dist_env": pp_init,
         "logger": logger,
         "os": SimpleNamespace(environ={}),
         "torch": SimpleNamespace(
@@ -72,9 +71,6 @@ def _initialize(pp, dcp, pp_rank=0):
         "raise_timeout_if_dp_spans_nodes": lambda config: None,
         "raise_timeout_if_tp_spans_nodes": lambda config: None,
         "apply_simulated_tp": lambda config: None,
-        "init_dist_env": lambda *args, **kwargs: calls.append(
-            ("non_pp", kwargs["decode_context_parallel_size"])
-        ),
     }
     init = _source_function(
         "atom/model_engine/model_setup.py", "init_model_env", namespace
@@ -85,6 +81,7 @@ def _initialize(pp, dcp, pp_rank=0):
         pcp_group_size=1,
         pipeline_parallel_size=pp,
         decode_context_parallel_size=dcp,
+        disable_custom_all_reduce=False,
         master_addr="127.0.0.1",
         port=0,
         parallel_config=SimpleNamespace(

@@ -1,0 +1,331 @@
+name: AtomRL Lumen GPU shard (internal)
+
+on:
+  workflow_call:
+    inputs:
+      image_tag:
+        description: "Local Lumen GPU validation image tag"
+        required: false
+        type: string
+        default: atomrl:lumen-ci
+
+jobs:
+  lumen-case:
+    name: Lumen case ${{ matrix.id }} (${{ matrix.name }})
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - {id: unit, name: gpu-unit-tests, runner: atom-mi355-8gpu.predownload, execution: unit, model: none, data: none, command: "python3 -m pytest atomrl/tests/lumen -q"}
+          - {id: 1, name: llama2-bf16-megatron, runner: atom-mi355-8gpu.predownload, execution: host, model: none, data: none, command: "PRECISION=bf16 TRAIN_STEPS=20 bash examples/llama2/run_pretrain_llama2_7b.sh"}
+          - {id: 2, name: llama2-fp8-delayed-megatron, runner: atom-mi355-8gpu.predownload, execution: host, model: none, data: none, command: "TRAIN_STEPS=20 bash examples/llama2/run_pretrain_llama2_7b.sh"}
+          - {id: 3, name: llama2-fp8-blockwise-megatron, runner: atom-mi355-8gpu.predownload, execution: host, model: none, data: none, command: "MODEL=llama2 TRAIN_STEPS=20 bash examples/run_fp8_blockwise_pretrain.sh"}
+          - {id: 4, name: llama2-fp8-blockwise-fsdp, runner: atom-mi355-8gpu.predownload, execution: host, model: llama2, data: npy, command: "MODE=fp8_blockwise SEQ_LEN=2048 TRAIN_STEPS=20 bash examples/llama2/run_fsdp_lora_7b.sh"}
+          - {id: 5, name: llama31-bf16-megatron, runner: atom-mi355-8gpu.predownload, execution: host, model: none, data: none, command: "PRECISION=bf16 TRAIN_STEPS=20 bash examples/llama31/run_pretrain_llama31_8b.sh"}
+          - {id: 6, name: llama31-fp8-delayed-megatron, runner: atom-mi355-8gpu.predownload, execution: host, model: none, data: none, command: "TRAIN_STEPS=20 bash examples/llama31/run_pretrain_llama31_8b.sh"}
+          - {id: 7, name: llama31-fp8-blockwise-megatron, runner: atom-mi355-8gpu.predownload, execution: host, model: none, data: none, command: "MODEL=llama31 TRAIN_STEPS=20 bash examples/run_fp8_blockwise_pretrain.sh"}
+          - {id: 8, name: qwen3-bf16-megatron, runner: atom-mi355-8gpu.predownload, execution: host, model: none, data: none, command: "PRECISION=bf16 TRAIN_STEPS=20 bash examples/qwen3/run_pretrain_qwen3_8b.sh"}
+          - {id: 9, name: qwen3-fp8-delayed-megatron, runner: atom-mi355-8gpu.predownload, execution: host, model: none, data: none, command: "TRAIN_STEPS=20 bash examples/qwen3/run_pretrain_qwen3_8b.sh"}
+          - {id: 10, name: qwen3-fp8-blockwise-megatron, runner: atom-mi355-8gpu.predownload, execution: host, model: none, data: none, command: "MODEL=qwen3 TRAIN_STEPS=20 bash examples/run_fp8_blockwise_pretrain.sh"}
+          - {id: 11, name: qwen3-fp8-blockwise-fsdp, runner: atom-mi355-8gpu.predownload, execution: host, model: qwen3, data: alpaca, command: "MAX_STEPS=20 EVAL_INTERVAL=20 bash examples/qwen3/run_qwen3_fsdp.sh"}
+          - {id: 12, name: qwen3-mxfp4-megatron, runner: atom-mi355-8gpu.predownload, execution: host, model: none, data: none, command: "TRAIN_STEPS=20 bash examples/qwen3/run_pretrain_qwen3_8b_mxfp4.sh"}
+          - {id: 13, name: qwen3-mxfp4-fsdp2-lora, runner: atom-mi355-8gpu.predownload, execution: container, model: qwen3, data: alpaca, command: "TRAIN_STEPS=20 WARMUP_STEPS=2 bash examples/qwen3/run_qwen3_fsdp_mxfp4_sft.sh"}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    concurrency:
+      group: lumen-readme-${{ matrix.runner }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      actions: read
+    env:
+      CONTAINER_NAME: lumen_readme_${{ github.run_id }}_${{ matrix.id }}
+      LUMEN_IMAGE: ${{ inputs.image_tag }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.id }}
+      LUMEN_CI_USE_IMAGE_SOURCE: "1"
+    steps:
+      - name: Restore workspace ownership
+        run: |
+          set -euo pipefail
+          workspace="${GITHUB_WORKSPACE:-$PWD}"
+          uid="$(id -u)"; gid="$(id -g)"
+          if [[ -d "$workspace" ]] && command -v sudo >/dev/null && sudo -n true 2>/dev/null; then
+            sudo chown -R "$uid:$gid" "$workspace" || true
+            sudo chmod -R u+rwX "$workspace" || true
+          fi
+
+      - uses: actions/checkout@v6
+        with:
+          clean: true
+
+      - name: Detect container engine
+        run: |
+          set -euo pipefail
+          if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
+            engine=docker
+          elif command -v podman >/dev/null && podman info >/dev/null 2>&1; then
+            engine=podman
+          else
+            echo "No usable Docker or Podman engine" >&2
+            exit 1
+          fi
+          engine_path="$(command -v "$engine")"
+          wrapper_dir="${RUNNER_TEMP}/lumen-container-bin"
+          mkdir -p "$wrapper_dir"
+          cp "$GITHUB_WORKSPACE/.github/scripts/lumen-docker-compat.py" "$wrapper_dir/docker"
+          chmod +x "$wrapper_dir/docker"
+          echo "CONTAINER_ENGINE=$engine" >> "$GITHUB_ENV"
+          echo "CONTAINER_ENGINE_PATH=$engine_path" >> "$GITHUB_ENV"
+          echo "PATH=$wrapper_dir:$PATH" >> "$GITHUB_ENV"
+          export CONTAINER_ENGINE_PATH="$engine_path"
+          export PATH="$wrapper_dir:$PATH"
+          docker version
+          echo "Container launcher wrapper delegates docker to $engine_path with Podman group translation"
+
+      - name: Build case validation image
+        run: |
+          set -euo pipefail
+          docker build --pull \
+            --build-arg AITER_REF=main \
+            --file atomrl/docker/Dockerfile.lumen \
+            --tag "$LUMEN_IMAGE" \
+            .
+
+      - name: Clean stale case container
+        run: |
+          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+          docker container prune -f || true
+
+      - name: Run Lumen GPU unit suite
+        if: matrix.execution == 'unit'
+        run: |
+          set -euo pipefail
+          if [[ -f /etc/podinfo/gha-render-devices ]]; then
+            device_flag="$(cat /etc/podinfo/gha-render-devices)"
+          else
+            device_flag="--device=/dev/dri"
+          fi
+          group_flag="--group-add video"
+          [[ "$CONTAINER_ENGINE" == podman ]] && group_flag="--group-add keep-groups"
+          docker run --rm --name "$CONTAINER_NAME" \
+            --device=/dev/kfd $device_flag $group_flag --ipc=host --privileged \
+            --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+            --ulimit memlock=-1 --ulimit stack=67108864 \
+            -w /workspace/ATOM \
+            "$LUMEN_IMAGE" bash -lc \
+            "python3 -m pytest atomrl/tests/lumen -q"
+
+      - name: Resolve shared model
+        if: matrix.model != 'none'
+        env:
+          MODEL_KIND: ${{ matrix.model }}
+        run: |
+          set -euo pipefail
+          model_dir_is_complete() {
+            [[ -f "$1/config.json" ]] || return 1
+            compgen -G "$1/*.safetensors" >/dev/null ||
+              compgen -G "$1/*.bin" >/dev/null ||
+              [[ -f "$1/model.safetensors.index.json" ]] ||
+              [[ -f "$1/pytorch_model.bin.index.json" ]]
+          }
+          roots=(
+            /share_nfs/models
+            /mnt/dcgpuval
+            /shared/data/WRH/models
+            /shared_nfs/models
+            /data/pretrained_model
+            /data/models
+            /models
+          )
+          if [[ "$MODEL_KIND" == llama2 ]]; then
+            variants=(NousResearch/Llama-2-7b-hf nousresearch/Llama-2-7b-hf Llama-2-7b-hf llama2/Llama-2-7b-hf llama2-7b-hf)
+            basenames=(Llama-2-7b-hf llama2-7b-hf)
+          elif [[ "$MODEL_KIND" == qwen3 ]]; then
+            variants=(Qwen/Qwen3-8B Qwen3-8B qwen/Qwen3-8B qwen3-8b)
+            basenames=(Qwen3-8B qwen3-8b)
+          else
+            echo "Unknown model kind: $MODEL_KIND" >&2
+            exit 2
+          fi
+          resolved=""
+          for root in "${roots[@]}"; do
+            [[ -d "$root" ]] || continue
+            for relative in "${variants[@]}"; do
+              candidate="$root/$relative"
+              if model_dir_is_complete "$candidate"; then
+                resolved="$candidate"
+                break 2
+              fi
+            done
+            while IFS= read -r candidate; do
+              if model_dir_is_complete "$candidate"; then
+                resolved="$candidate"
+                break 2
+              fi
+            done < <(find "$root" -maxdepth 4 -type d \( \
+              -name "${basenames[0]}" -o -name "${basenames[1]}" \) -print 2>/dev/null)
+          done
+          if [[ -z "$resolved" ]]; then
+            echo "ERROR: no complete $MODEL_KIND model found; downloads are disabled." >&2
+            echo "Searched shared roots:" >&2
+            printf '  - %s\n' "${roots[@]}" >&2
+            echo "Accepted relative variants:" >&2
+            printf '  - %s\n' "${variants[@]}" >&2
+            exit 1
+          fi
+          echo "RESOLVED_MODEL_PATH=$resolved" >> "$GITHUB_ENV"
+          echo "Resolved $MODEL_KIND model: $resolved"
+
+      - name: Generate deterministic smoke data
+        if: matrix.data != 'none'
+        env:
+          DATA_KIND: ${{ matrix.data }}
+        run: |
+          set -euo pipefail
+          data_dir="${RUNNER_TEMP}/lumen-ci-data-${{ matrix.id }}"
+          rm -rf "$data_dir"
+          mkdir -p "$data_dir"
+          DATA_DIR="$data_dir" python3 - <<'PY'
+          import json
+          import os
+          import struct
+          import sys
+          from array import array
+          from pathlib import Path
+
+          root = Path(os.environ["DATA_DIR"])
+          kind = os.environ["DATA_KIND"]
+
+          def write_npy(path: Path, rows: int, columns: int) -> None:
+              shape = (rows, columns)
+              header = repr(
+                  {"descr": "<i4", "fortran_order": False, "shape": shape}
+              )
+              padding = (16 - ((10 + len(header) + 1) % 16)) % 16
+              encoded = (header + " " * padding + "\n").encode("latin1")
+              with path.open("wb") as output:
+                  output.write(b"\x93NUMPY\x01\x00")
+                  output.write(struct.pack("<H", len(encoded)))
+                  output.write(encoded)
+                  for row in range(rows):
+                      values = array(
+                          "i", ((row * 17 + column) % 30000 + 1 for column in range(columns))
+                      )
+                      if sys.byteorder != "little":
+                          values.byteswap()
+                      values.tofile(output)
+
+          if kind == "npy":
+              write_npy(root / "train.npy", rows=256, columns=2049)
+              write_npy(root / "validation.npy", rows=64, columns=2049)
+          elif kind == "alpaca":
+              for filename, count in (("train.jsonl", 256), ("valid.jsonl", 64)):
+                  with (root / filename).open("w", encoding="utf-8") as output:
+                      for index in range(count):
+                          json.dump(
+                              {
+                                  "instruction": f"Add {index} and {index + 1}.",
+                                  "input": "",
+                                  "output": str(index + index + 1),
+                              },
+                              output,
+                          )
+                          output.write("\n")
+          else:
+              raise SystemExit(f"unknown data kind: {kind}")
+          PY
+          echo "LUMEN_CI_DATA_DIR=$data_dir" >> "$GITHUB_ENV"
+          echo "Generated deterministic $DATA_KIND data in $data_dir"
+
+      - name: Run host launcher case
+        if: matrix.execution == 'host'
+        env:
+          CASE_COMMAND: ${{ matrix.command }}
+          MODEL_KIND: ${{ matrix.model }}
+          DATA_KIND: ${{ matrix.data }}
+          HF_TOKEN: ${{ secrets.AMD_HF_TOKEN }}
+        run: |
+          set -euo pipefail
+          log_dir="$GITHUB_WORKSPACE/lumen-ci-logs/case-${{ matrix.id }}"
+          result_dir="${RUNNER_TEMP}/lumen-ci-results/case-${{ matrix.id }}"
+          mkdir -p "$log_dir" "$result_dir"
+          export IMAGE="$LUMEN_IMAGE"
+          export CONTAINER_NAME="$CONTAINER_NAME"
+          export RESULTS_DIR="$result_dir"
+          export HOST_RESULTS="$result_dir"
+          export LOG_DIR="$result_dir"
+          if [[ "$MODEL_KIND" != none ]]; then
+            export HOST_MODEL="$RESOLVED_MODEL_PATH"
+          fi
+          if [[ "$DATA_KIND" == npy ]]; then
+            export HOST_DATA="$LUMEN_CI_DATA_DIR"
+          elif [[ "$DATA_KIND" == alpaca ]]; then
+            export HOST_DATA="$LUMEN_CI_DATA_DIR"
+            export TRAIN_FILE=train.jsonl
+            export VAL_FILE=valid.jsonl
+          fi
+          cd "$GITHUB_WORKSPACE/atomrl/lumen"
+          bash -c "$CASE_COMMAND" 2>&1 | tee "$log_dir/run.log"
+
+      - name: Run native case in pinned container
+        if: matrix.execution == 'container'
+        env:
+          CASE_COMMAND: ${{ matrix.command }}
+          HF_TOKEN: ${{ secrets.AMD_HF_TOKEN }}
+        run: |
+          set -euo pipefail
+          log_dir="$GITHUB_WORKSPACE/lumen-ci-logs/case-${{ matrix.id }}"
+          result_dir="${RUNNER_TEMP}/lumen-ci-results/case-${{ matrix.id }}"
+          mkdir -p "$log_dir" "$result_dir"
+          if [[ -f /etc/podinfo/gha-render-devices ]]; then
+            device_flag="$(cat /etc/podinfo/gha-render-devices)"
+          else
+            device_flag="--device=/dev/dri"
+          fi
+          group_flag="--group-add video"
+          [[ "$CONTAINER_ENGINE" == podman ]] && group_flag="--group-add keep-groups"
+          docker run --rm --name "$CONTAINER_NAME" \
+            --device=/dev/kfd $device_flag $group_flag --ipc=host --privileged \
+            --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+            --ulimit memlock=-1 --ulimit stack=67108864 \
+            -e HF_TOKEN="${HF_TOKEN:-}" \
+            -v "$GITHUB_WORKSPACE:/workspace/ATOM" \
+            -v "$RESOLVED_MODEL_PATH:/models/Qwen3-8B:ro" \
+            -v "$LUMEN_CI_DATA_DIR:/ci-data:ro" \
+            -v "$result_dir:/results" \
+            -w /workspace/ATOM/atomrl/lumen \
+            "$LUMEN_IMAGE" bash -lc \
+            "LUMEN_BUILD_EXTENSIONS=1 python -m pip install --no-build-isolation --no-deps -e /workspace/ATOM/atomrl &&
+             MODEL_PATH=/models/Qwen3-8B TRAIN_DATA_PATH=/ci-data/train.jsonl \
+             VALID_DATA_PATH=/ci-data/valid.jsonl RESULTS_DIR=/results \
+             $CASE_COMMAND" \
+            2>&1 | tee "$log_dir/run.log"
+
+      - name: Upload case logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: lumen-readme-case-${{ matrix.id }}-${{ github.run_id }}
+          path: lumen-ci-logs/case-${{ matrix.id }}
+          if-no-files-found: warn
+
+      - name: Robust cleanup
+        if: always()
+        run: |
+          engine="${CONTAINER_ENGINE:-}"
+          if [[ -z "$engine" ]]; then
+            command -v podman >/dev/null && engine=podman
+            [[ -z "$engine" ]] && command -v docker >/dev/null && engine=docker
+          fi
+          [[ -n "$engine" ]] || exit 0
+          "$engine" rm -f "$CONTAINER_NAME" 2>/dev/null || true
+          "$engine" rmi -f "$LUMEN_IMAGE" 2>/dev/null || true
+          for dev in /dev/kfd /dev/dri/renderD*; do
+            [[ -e "$dev" ]] && fuser "$dev" 2>/dev/null | xargs -r kill -9 || true
+          done
+          workspace="${GITHUB_WORKSPACE:-$PWD}"
+          if [[ -d "$workspace" ]] && command -v sudo >/dev/null && sudo -n true 2>/dev/null; then
+            sudo chown -R "$(id -u):$(id -g)" "$workspace" || true
+            sudo chmod -R u+rwX "$workspace" || true
+          fi

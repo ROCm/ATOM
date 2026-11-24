@@ -1,0 +1,192 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
+# ATOM BF16 rollout variant of dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml.
+#
+# Byte-for-byte that config except for two rollout-side edits: generation_backend
+# vllm -> atom, and an added atom_cfg block mirroring the 8B ATOM BF16 smoke.
+# The vllm_cfg block is kept as-is because the ATOM path still reads the common
+# rollout knobs (sampling, sequence limits, IPC bucket, sleep) from it -- see
+# atomrl/trainer/rl_trainer.py::_setup_ray_atom_rollout.
+#
+# Requires MODE=atombf16, which additionally forces enable_sleep_mode=true +
+# sleep_level=2 on top of this file (the vLLM reference has sleep off).
+#
+# Original header follows.
+#
+# Chain smoke for dapo_qwen3moe_a3b_ray_vllm_verlref_longrun.yaml.
+#
+# Same recipe as the verl FP8-E2E BF16 reference port, shrunk on the two axes
+# that only cost wall clock: response horizon 20480 -> 4096 and prompt batch
+# 128 -> 8 (gen 384 -> 24, keeping verl's 1:3 train:gen ratio and n=16). The
+# prompt budget stays at verl's 2048, so this exercises the same dataset and the
+# same packing/varlen paths as the long run.
+#
+# Everything that defines the optimization problem is untouched: grpo,
+# token-mean, clip 0.2/0.28/10, lr 1e-6 with NO warmup, wd 0.1, clip_grad 1.0,
+# entropy_coeff 0, overlong_buffer 512/1.0, filter_groups acc/10, token-level
+# TIS at C=2.0, temperature/top_p/top_k 1.0/1.0/-1, BF16 MoE router, R3 off.
+#
+# Run with ATOMRL_FP32_MOE_ROUTER=0 -- that env var, not this file, is what
+# puts the router matmul in BF16 to match verl.
+#
+# Expect a HIGHER rollout_corr/kl than the R3+fp32-router MoE smoke: verl's own
+# writeup says "rollout & training distribution mismatch is in general higher
+# for MoE, rollout correction required even for BF16", and this config
+# deliberately has neither of our two mismatch reducers.
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 8
+
+controller:
+  ray:
+    enabled: true
+    fuse_actor_ref: false
+    actor:
+      num_workers: 8
+      dispatch_mode: dp_compute_proto
+
+policy:
+  model_name: "${oc.env:DATA_ROOT}/models/Qwen3-30B-A3B-Base"
+  training_backend: fsdp2
+  generation_backend: atom
+  max_total_sequence_length: 6144       # verl's 2048 prompt + 4096 response
+  max_response_length: 4096
+  train_global_batch_size: 128          # 8 prompts x 16 generations
+  gen_batch_size: 24                    # 8 * 3, verl's train:gen ratio
+  train_micro_batch_size: 1
+  max_token_len_per_gpu: 6144
+  learning_rate: 1.0e-6
+  lr_warmup_steps: 0
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  lr_decay_style: constant
+  training:
+    optimizer_dtype: bf16
+    fsdp_cfg:
+      param_offload: false
+      optimizer_offload: false
+      reshard_after_forward: true
+  generation:
+    atom_cfg:
+      transport: ray_http
+      tensor_parallel_size: 1
+      kv_cache_dtype: bf16
+      # A throughput knob. It was briefly believed to be a correctness one, and
+      # the record of why is worth keeping.
+      #
+      # ATOM sizes its KV pool as `utilization x total` MINUS everything already
+      # resident -- the full 30B of BF16 weights (57.5GB), non-torch (16.5GB)
+      # and a safety margin. 0.30 leaves 6.85GB, i.e. 4675 blocks, to back the
+      # 256 concurrent sequences `vllm_cfg.max_num_seqs` promises; 0.45 leaves
+      # 50.05GB / 34164 blocks. Admission does not bridge that gap -- with
+      # prefix caching off `can_allocate` only checks that the PROMPT fits and
+      # reserves nothing for decode -- so at 0.30 all 256 are admitted and the
+      # pool is exhausted a few hundred tokens in, and the scheduler falls back
+      # on preemption: ~2600 of them per replica per step, against zero at 0.45.
+      #
+      # That should have cost only time, and did not, because two bugs sat on
+      # ATOM's preempt/recompute path (both fixed in `atom/model_engine/
+      # scheduler.py`): the deferred-output EOS placeholder was left in the
+      # token stream, and a chunked recompute was judged finished at
+      # `num_prompt_tokens`. 6144 requests at 0.30 scored 0.0449 accuracy with
+      # 47.4% unparseable answers against vLLM's 0.1090 / 21.6%. `--check` never
+      # saw it: it reads rollout_corr/k3_kl and entropy, and both stay in
+      # tolerance while the generations rot.
+      #
+      # With those fixed, 0.30 costs only what it should. Measured at 6144
+      # requests / max_num_seqs=256, one step:
+      #   0.30  0.1055 / 22.5% / gen 177.2s
+      #   0.45  0.1073 / 23.4% / gen 108.6s
+      #   vLLM at the same 0.45: 0.1113 / 20.2% / gen 151.2s
+      # So this stays at 0.45 for the 1.6x, not because 0.30 is unsafe.
+      gpu_memory_utilization: 0.45
+      enable_prefix_caching: false
+      online_quant_config: {}
+    vllm_cfg:
+      transport: ray_http
+      ray_http_start_server: false
+      gpu_memory_utilization: 0.30
+      max_model_len: 6144
+      dtype: bfloat16
+      enforce_eager: true
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 8192
+      max_num_seqs: 256
+      quantization: ""
+      calculate_log_probs: true
+      enable_sleep_mode: false
+      update_weights_bucket_megabytes: 512
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1
+
+moe:
+  r3:
+    rollout_replay: false
+
+algorithm:
+  name: dapo
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  loss_agg_mode: token-mean
+  dapo:
+    num_generations: 16
+    kl_coeff: 0.0
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    clip_ratio_c: 10.0
+    dynamic_sampling: true
+    token_level_pg: true
+    overlong_reward_shaping: true
+    max_resp_len: 4096
+    filter_groups:
+      enable: true
+      metric: acc
+      max_num_gen_batches: 10
+    overlong_buffer:
+      enable: true
+      len: 512
+      penalty_factor: 1.0
+      log: false
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+    rollout_is_batch_normalize: false
+
+reward:
+  type: function
+  function: atomrl.rewards.math_reward.dapo_math_reward
+  # Same file as the long run; verl's 2048 prompt budget filters nothing extra
+  # out of DAPO-Math-17k, see the note there.
+  dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet"
+  shuffle: true
+  shuffle_seed: 10086
+
+val_dataset: ""
+val_steps: 0
+val_batch_size: 0
+eval:
+  enabled: false
+  num_samples: 0
+
+checkpointing:
+  checkpoint_dir: ""
+  save_steps: 1000
+  save_total_limit: 0
+  resume: false
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 3
+seed: 10086

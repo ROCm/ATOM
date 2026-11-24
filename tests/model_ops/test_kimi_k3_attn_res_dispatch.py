@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """An active count reaches each existing attention-residual op and launch."""
 
 import inspect

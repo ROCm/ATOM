@@ -627,6 +627,9 @@ def test_ensure_flydsl_policy_binds_qwen4_impls_once(monkeypatch):
         "atom.model_ops.fla_ops.gdn_flydsl.select_policy",
         _select_policy,
     )
+    monkeypatch.setattr(
+        "atom.model_ops.fla_ops.gdn_flydsl._validated_on_gfx942", lambda: True
+    )
     state = torch.zeros(2, 24, 128, 128)
     first = attention_gdn._ensure_flydsl_policy(state)
     second = attention_gdn._ensure_flydsl_policy(state)
@@ -646,7 +649,7 @@ def test_gfx950_keeps_flydsl_prefill_off(monkeypatch):
         lambda **kwargs: GDNFlyDSLPolicy(prefill=True, decode=False),
     )
     monkeypatch.setattr(
-        attention_gdn, "_flydsl_prefill_supported", lambda device: False
+        "atom.model_ops.fla_ops.gdn_flydsl._validated_on_gfx942", lambda: False
     )
     state = torch.zeros(2, 24, 128, 128)
     policy = attention_gdn._ensure_flydsl_policy(state)
