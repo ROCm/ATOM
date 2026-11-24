@@ -17,6 +17,7 @@ from torch import nn
 from atom.config import Config, get_current_atom_config
 from atom.model_ops.base_attention import LinearAttention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
+from atom.model_ops.fused_moe.expert_layout import zero_pad_tail
 from atom.model_ops.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -225,7 +226,7 @@ def install_stacked_expert_loaders(experts: FusedMoE) -> None:
             # The checkpoint has routed rows only. A fused shared expert is
             # loaded separately into the tail and must survive either order.
             target = param.data[: stacked.shape[0]].narrow(1, half * physical, physical)
-            target.zero_()
+            zero_pad_tail(target, 1, logical)
             target[:, :logical].copy_(
                 source.to(device=target.device, dtype=target.dtype)
             )
@@ -243,7 +244,7 @@ def install_stacked_expert_loaders(experts: FusedMoE) -> None:
             )
         source = loaded_weight[expert_slice].narrow(2, tp_rank * logical, logical)
         target = param.data[: source.shape[0]]
-        target.zero_()
+        zero_pad_tail(target, 2, logical)
         target[:, :, :logical].copy_(source.to(device=param.device, dtype=param.dtype))
 
     def wrap(param: nn.Parameter, stacked_loader):
